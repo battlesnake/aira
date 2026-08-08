@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -153,31 +154,88 @@ func TestRecordsSkipLocalTicketFindingsAndUseCanonicalIDOrder(t *testing.T) {
 	if err != nil || len(rows) != 3 {
 		t.Fatalf("local invalid files wedged list: rows=%#v err=%v", rows, err)
 	}
-	if _, err := s.List("AIRA-999"); err != nil {
-		t.Fatalf("missing plural exact selector = %v", err)
+	rows, err = s.List("AIRA-99")
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("malformed plural exact selector = rows=%#v err=%v", rows, err)
+	}
+	if _, err := s.Get("AIRA-99"); codeOf(err) != "E_CONFIG_INVALID" {
+		t.Fatalf("singular malformed selector = %v", err)
+	}
+	duplicate, err := domain.RenderTicket(domain.Ticket{Schema: 1, ID: "AIRA-1", Project: "query-project", Title: "duplicate", Status: domain.StatusPlanned, Kind: domain.KindFeature, Severity: domain.SeverityP2}, "body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.root, ".aira", "tickets", "duplicate.md"), duplicate, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = s.Find("")
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("duplicate pair find = rows=%#v err=%v", rows, err)
+	}
+	count, err := s.Count("", "status")
+	if err != nil || count.Total != 2 {
+		t.Fatalf("duplicate pair count = %#v err=%v", count, err)
 	}
 }
 
 func TestCountAgreesWithListWhenIndexIsStale(t *testing.T) {
 	s := queryTestStore(t)
-	ticket, err := s.CreateTicket(context.Background(), testCreateInput("count me", "body"))
+	first, err := s.CreateTicket(context.Background(), testCreateInput("first", "body"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := domain.RenderTicket(func() domain.Ticket { ticket.Title = "edited"; return ticket }(), "body")
+	second, err := s.CreateTicket(context.Background(), testCreateInput("second", "body"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(s.root, ".aira", "tickets", ticket.ID+".md"), data, 0o644); err != nil {
+	_, err = s.CreateTicket(context.Background(), testCreateInput("third", "body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateTicket(context.Background(), first.ID, func(ticket domain.Ticket) (domain.Ticket, error) {
+		ticket.Status = domain.StatusInProgress
+		return ticket, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(s.root, ".aira", "tickets", second.ID+".md")); err != nil {
+		t.Fatal(err)
+	}
+	unindexed := domain.Ticket{Schema: 1, ID: "AIRA-90", Project: "query-project", Title: "new", Status: domain.StatusDone, Kind: domain.KindBug, Severity: domain.SeverityP1}
+	data, err := domain.RenderTicket(unindexed, "body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.root, ".aira", "tickets", unindexed.ID+".md"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.root, ".aira", "tickets", "AIRA-91.md"), []byte("malformed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := s.List("")
 	if err != nil {
 		t.Fatal(err)
 	}
+	want := map[string]int{"in-progress": 1, "planned": 1, "done": 1}
+	listDistribution := map[string]int{}
+	for _, row := range rows {
+		listDistribution[string(row.Ticket.Status)]++
+		if len(row.Warnings) != 1 || row.Warnings[0] != "W_STALE_INDEX" {
+			t.Fatalf("stale list row = %#v", row)
+		}
+	}
+	if len(rows) != 3 || !reflect.DeepEqual(listDistribution, want) {
+		t.Fatalf("stale list distribution = %#v, rows=%#v", listDistribution, rows)
+	}
 	count, err := s.Count("", "status")
-	if err != nil || count.Total != len(rows) || count.Warnings == nil {
+	if err != nil || count.Total != 3 || !reflect.DeepEqual(count.Distribution, want) || len(count.Warnings) != 1 || count.Warnings[0] != "W_STALE_INDEX" {
 		t.Fatalf("stale count/list disagreement: rows=%d count=%#v err=%v", len(rows), count, err)
+	}
+	if exact, err := s.List(unindexed.ID); err != nil || len(exact) != 1 || len(exact[0].Warnings) != 1 {
+		t.Fatalf("unindexed exact selector = %#v, %v", exact, err)
+	}
+	if exact, err := s.List("AIRA-91"); err != nil || len(exact) != 0 {
+		t.Fatalf("malformed exact selector in stale test = %#v, %v", exact, err)
 	}
 }
 

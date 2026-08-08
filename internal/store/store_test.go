@@ -1153,8 +1153,15 @@ func TestCheckReportsMalformedAndSymlinkedTicketsWithoutWedge(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(ticketsDir, "AIRA-99.md")); err != nil {
 		t.Fatal(err)
 	}
+	duplicate, err := domain.RenderTicket(domain.Ticket{Schema: 1, ID: "AIRA-1", Project: "aira", Title: "duplicate", Status: domain.StatusPlanned, Kind: domain.KindFeature, Severity: domain.SeverityP2}, "body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ticketsDir, "duplicate.md"), duplicate, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	rows, err := s.List("")
-	if err != nil || len(rows) != 1 {
+	if err != nil || len(rows) != 0 {
 		t.Fatalf("list with local findings: rows=%#v err=%v", rows, err)
 	}
 	report, err := s.Check(context.Background())
@@ -1170,6 +1177,33 @@ func TestCheckReportsMalformedAndSymlinkedTicketsWithoutWedge(t *testing.T) {
 	}
 	if !seen["E_CONFIG_INVALID"] {
 		t.Fatalf("local config finding missing: %#v", report.Findings)
+	}
+	if !seen["E_DUPLICATE_ID"] || report.Dimensions["ticket-file-integrity"] != "fail" {
+		t.Fatalf("duplicate finding/dimension missing: %#v", report)
+	}
+}
+
+func TestRebuildRecoversCounterFromMalformedTicketFilename(t *testing.T) {
+	base := persistentTemp(t, "rebuild-malformed-filename")
+	root := filepath.Join(base, "repo")
+	ticketsDir := filepath.Join(root, ".aira", "tickets")
+	if err := os.MkdirAll(ticketsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "init")
+	if err := os.WriteFile(filepath.Join(ticketsDir, "AIRA-88.md"), []byte("malformed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := testStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	if err := s.Rebuild(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.AllocateID(context.Background(), "AIRA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "AIRA-89" {
+		t.Fatalf("counter after malformed filename = %s, want AIRA-89", id)
 	}
 }
 

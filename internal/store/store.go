@@ -836,6 +836,12 @@ func (s *Store) Rebuild(ctx context.Context) error {
 			if err := s.recordScanFinding(ctx, entry, finding); err != nil {
 				return err
 			}
+			if id, ok := ticketIDFromFilename(finding.Subject); ok {
+				prefix, number := splitTicketID(id)
+				if int64(number) > maxima[prefix] {
+					maxima[prefix] = int64(number)
+				}
+			}
 		}
 		scanned = append(scanned, tickets...)
 		for _, ticket := range tickets {
@@ -1670,7 +1676,8 @@ func scanTickets(root, worktreeID string) ([]scannedTicket, []CheckFinding, erro
 	if err != nil {
 		return nil, nil, err
 	}
-	seen := map[string]bool{}
+	seen := map[string]string{}
+	resultByID := map[string]int{}
 	var result []scannedTicket
 	var findings []CheckFinding
 	for _, entry := range entries {
@@ -1691,17 +1698,37 @@ func scanTickets(root, worktreeID string) ([]scannedTicket, []CheckFinding, erro
 			findings = append(findings, scanFinding(root, path, err))
 			continue
 		}
-		if seen[ticket.ID] {
-			return nil, nil, fmt.Errorf("E_DUPLICATE_ID: %s in worktree %s", ticket.ID, worktreeID)
+		if prior, ok := seen[ticket.ID]; ok {
+			findings = append(findings, scanFinding(root, path, fmt.Errorf("E_DUPLICATE_ID: %s and %s in worktree %s", repoPath(root, prior), repoPath(root, path), worktreeID)))
+			if index, ok := resultByID[ticket.ID]; ok {
+				result = append(result[:index], result[index+1:]...)
+				delete(resultByID, ticket.ID)
+				for id, currentIndex := range resultByID {
+					if currentIndex > index {
+						resultByID[id] = currentIndex - 1
+					}
+				}
+			}
+			continue
 		}
+		seen[ticket.ID] = path
 		if filepath.Base(path) != ticket.ID+".md" {
 			findings = append(findings, scanFinding(root, path, fmt.Errorf("E_CONFIG_INVALID: filename/frontmatter mismatch %s", repoPath(root, path))))
 			continue
 		}
-		seen[ticket.ID] = true
+		resultByID[ticket.ID] = len(result)
 		result = append(result, scannedTicket{WorktreeID: worktreeID, Path: path, Ticket: ticket, Body: body, Digest: digestBytes(data)})
 	}
 	return result, findings, nil
+}
+
+func ticketIDFromFilename(path string) (string, bool) {
+	base := filepath.Base(filepath.FromSlash(path))
+	if !strings.HasSuffix(base, ".md") {
+		return "", false
+	}
+	id := strings.TrimSuffix(base, ".md")
+	return id, domain.ValidateID(id) == nil
 }
 
 func scanFinding(root, path string, err error) CheckFinding {

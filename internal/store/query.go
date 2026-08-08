@@ -211,7 +211,7 @@ func (s *Store) List(selector string) ([]TicketRecord, error) {
 	}
 	if sel.ExactID != "" {
 		record, err := s.exactRecord(sel.ExactID, sel.ExactPath)
-		if ErrorCode(err) == "E_NOT_FOUND" {
+		if ErrorCode(err) == "E_NOT_FOUND" || ErrorCode(err) == "E_CONFIG_INVALID" {
 			return []TicketRecord{}, nil
 		}
 		if err != nil {
@@ -237,10 +237,11 @@ func (s *Store) records(filter selectorFilter) ([]TicketRecord, error) {
 	if err != nil {
 		return nil, err
 	}
+	stale := indexStale(indexed, tickets)
 	result := make([]TicketRecord, 0, len(tickets))
 	for _, scanned := range tickets {
 		record := TicketRecord{Ticket: scanned.Ticket, Body: scanned.Body, Path: repoPath(s.root, scanned.Path), WorktreeID: s.worktreeID, Digest: scanned.Digest}
-		if indexedDigest, ok := indexed[scanned.Ticket.ID]; ok && indexedDigest != scanned.Digest {
+		if stale || indexed[scanned.Ticket.ID] != scanned.Digest {
 			record.Warnings = []string{"W_STALE_INDEX"}
 		}
 		if matchesTerms(record, filter.Terms) {
@@ -274,6 +275,8 @@ func (s *Store) exactRecord(id, anchor string) (TicketRecord, error) {
 	var indexedDigest string
 	err = s.db.QueryRow(`SELECT digest FROM tickets WHERE project_id=? AND worktree_id=? AND id=?`, s.projectID, s.worktreeID, id).Scan(&indexedDigest)
 	if err == nil && indexedDigest != record.Digest {
+		record.Warnings = []string{"W_STALE_INDEX"}
+	} else if errors.Is(err, sql.ErrNoRows) {
 		record.Warnings = []string{"W_STALE_INDEX"}
 	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return TicketRecord{}, err
@@ -363,36 +366,16 @@ func (s *Store) Count(selector, by string) (CountResult, error) {
 	if !validDistributionField(by) {
 		return CountResult{}, fmt.Errorf("E_SELECTOR_INVALID: unsupported distribution field %q", by)
 	}
-	sel, err := parseSelector(selector)
-	if err != nil {
-		return CountResult{}, err
-	}
-	if canAggregateCount(sel, by) {
-		stale, scannedFindings, err := s.indexState()
-		if err != nil {
-			return CountResult{}, err
-		}
-		if stale || scannedFindings {
-			rows, err := s.List(selector)
-			if err != nil {
-				return CountResult{}, err
-			}
-			result := countRows(rows, by)
-			if stale {
-				result.Warnings = []string{"W_STALE_INDEX"}
-			}
-			return result, nil
-		}
-		return s.aggregateCount(sel, by)
-	}
 	rows, err := s.List(selector)
 	if err != nil {
 		return CountResult{}, err
 	}
-	result := CountResult{Total: len(rows), By: by, Distribution: map[string]int{}}
+	result := countRows(rows, by)
 	for _, row := range rows {
-		for _, value := range distributionValues(row, by) {
-			result.Distribution[value]++
+		for _, warning := range row.Warnings {
+			if !containsString(result.Warnings, warning) {
+				result.Warnings = append(result.Warnings, warning)
+			}
 		}
 	}
 	return result, nil
@@ -408,17 +391,9 @@ func countRows(rows []TicketRecord, by string) CountResult {
 	return result
 }
 
-func (s *Store) indexState() (stale, scannedFindings bool, err error) {
-	indexed, err := s.indexedDigests()
-	if err != nil {
-		return false, false, err
-	}
-	tickets, findings, err := scanTickets(s.root, s.worktreeID)
-	if err != nil {
-		return false, false, err
-	}
-	scannedFindings = len(findings) > 0
+func indexStale(indexed map[string]string, tickets []scannedTicket) bool {
 	seen := make(map[string]bool, len(tickets))
+	stale := false
 	for _, ticket := range tickets {
 		seen[ticket.Ticket.ID] = true
 		if indexed[ticket.Ticket.ID] != ticket.Digest {
@@ -430,69 +405,16 @@ func (s *Store) indexState() (stale, scannedFindings bool, err error) {
 			stale = true
 		}
 	}
-	return stale, scannedFindings, nil
+	return stale
 }
 
-func canAggregateCount(sel selector, by string) bool {
-	if by != "status" && by != "kind" && by != "severity" && by != "hold" {
-		return false
-	}
-	if sel.ExactPath != "" {
-		return false
-	}
-	for _, term := range sel.Terms {
-		switch term.Field {
-		case "id", "status", "kind", "severity":
-		case "hold":
-			return false
-		default:
-			return false
+func containsString(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
 		}
 	}
-	return true
-}
-
-func (s *Store) aggregateCount(sel selector, by string) (CountResult, error) {
-	column := by
-	selectColumn := column
-	if by == "hold" {
-		selectColumn = "hold"
-	}
-	query := "SELECT " + selectColumn + ", COUNT(*) FROM tickets WHERE project_id=? AND worktree_id=?"
-	args := []any{s.projectID, s.worktreeID}
-	if sel.ExactID != "" {
-		query += " AND id=?"
-		args = append(args, sel.ExactID)
-	}
-	for _, term := range sel.Terms {
-		if term.Field == "id" || term.Field == "status" || term.Field == "kind" || term.Field == "severity" {
-			query += " AND " + term.Field + "=?"
-			args = append(args, term.Value)
-		}
-	}
-	query += " GROUP BY " + selectColumn
-	rows, err := s.db.Query(query, args...)
-	if err != nil {
-		return CountResult{}, err
-	}
-	defer rows.Close()
-	result := CountResult{By: by, Distribution: map[string]int{}}
-	for rows.Next() {
-		var value string
-		var count int
-		if by == "hold" {
-			var hold int
-			if err := rows.Scan(&hold, &count); err != nil {
-				return CountResult{}, err
-			}
-			value = strconv.FormatBool(hold != 0)
-		} else if err := rows.Scan(&value, &count); err != nil {
-			return CountResult{}, err
-		}
-		result.Distribution[value] = count
-		result.Total += count
-	}
-	return result, rows.Err()
+	return false
 }
 
 func validDistributionField(field string) bool {

@@ -184,7 +184,19 @@ func Init(ctx context.Context, cwd string, args map[string]any) (InitResult, err
 	if err := s.Close(); err != nil {
 		return InitResult{}, err
 	}
-	return InitResult{Root: ".", Config: ".aira/config", Project: slug, Prefixes: prefixes, Created: true}, nil
+	cwdAbs, err := filepath.Abs(cwd)
+	if err != nil {
+		return InitResult{}, err
+	}
+	relRoot, err := filepath.Rel(cwdAbs, root)
+	if err != nil {
+		return InitResult{}, err
+	}
+	relConfig, err := filepath.Rel(cwdAbs, configPath)
+	if err != nil {
+		return InitResult{}, err
+	}
+	return InitResult{Root: filepath.ToSlash(relRoot), Config: filepath.ToSlash(relConfig), Project: slug, Prefixes: prefixes, Created: true}, nil
 }
 
 func findConfig(root string) (string, error) {

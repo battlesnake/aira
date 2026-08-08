@@ -739,7 +739,7 @@ committed into git.
 | DB placement | One machine-wide DB under the XDG/OS state directory, with project/worktree keys, a machine-level rebuild lock, and a sibling registry breadcrumb. |
 | Lease TTL/heartbeat | Defaults: TTL 15 minutes, heartbeat 30 seconds; bounded config overrides. |
 | Stable-code catalog | Phase-1 `E_`, `W_`, and `U_` codes are listed in §8 and generated surfaces consume the dispatch table. |
-| `aira check` exit codes | 0 pass, 1 fail, 2 invalid invocation/config, 3 unevaluated, 4 store/reconcile error; fail wins over unevaluated. |
+| `aira check` exit codes | 0 pass (deferred/not-applicable dimensions do not force 3), 1 fail, 2 invalid invocation/config, 3 runtime `unevaluated`, 4 store/reconcile error; fail wins over runtime unevaluated. |
 | Reconcile trigger/scope | Every command uses the fast pending-intent/target-digest/journal-tail path; full scans are for explicit reconcile/check/rebuild/recovery. Default full scope is current project/all its worktrees/refs/common dir, `--all` for machine-wide. |
 
 ## 13. Verification plan before Phase-1 code

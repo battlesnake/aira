@@ -59,3 +59,30 @@ func TestInitPrefixConflictDoesNotLeaveConfigScaffold(t *testing.T) {
 		t.Fatalf("conflicting init left config: %v", err)
 	}
 }
+
+func TestInitFromSubdirectoryReportsPathsRelativeToCWD(t *testing.T) {
+	root := t.TempDir()
+	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
+	}
+	cwd := filepath.Join(root, "subdir")
+	if err := os.Mkdir(cwd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	result, err := Init(context.Background(), cwd, map[string]any{"project": "demo", "prefixes": "DEMO"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRoot, err := filepath.Rel(cwd, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantConfig, err := filepath.Rel(cwd, filepath.Join(root, ".aira", "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Root != filepath.ToSlash(wantRoot) || result.Config != filepath.ToSlash(wantConfig) {
+		t.Fatalf("subdir init paths = %#v, want root=%q config=%q", result, wantRoot, wantConfig)
+	}
+}

@@ -15,7 +15,7 @@ var ExitCodes = map[string]int{
 	"E_CONFIG_MISSING": 2, "E_CONFIG_INVALID": 2, "E_NOT_PROJECT": 2,
 	"E_ID_INVALID": 2, "E_SELECTOR_INVALID": 2, "E_NOT_FOUND": 2,
 	"E_SELECTOR_AMBIGUOUS": 2, "E_UNKNOWN_VERB": 2,
-	"E_ALREADY_INITIALIZED": 1,
+	"E_ALREADY_INITIALIZED": 2,
 	"E_DB_BUSY":             4, "E_DB_CORRUPT": 4, "E_RECEIPT_IO": 4,
 	"E_RECONCILE_REQUIRED": 4, "E_GIT_SCAN": 4, "E_INTERNAL": 4,
 	"E_JOURNAL_CORRUPT": 4,
@@ -57,6 +57,11 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 	if err := ctx.Err(); err != nil {
 		report.Verdict = "unevaluated"
 		report.Unevaluated = true
+		for dimension, value := range report.Dimensions {
+			if value == "pass" {
+				report.Dimensions[dimension] = "unevaluated"
+			}
+		}
 		report.UnevaluatedFindings = []CheckFinding{{Code: "U_CHECK_UNEVALUATED", Subject: "check", Message: err.Error(), Kind: "unevaluated"}}
 		return report, nil
 	}
@@ -208,7 +213,11 @@ func (s *Store) checkDuplicateIDs(ctx context.Context, report *CheckReport) erro
 		}
 		for _, finding := range scanFindings {
 			finding.Subject = filepath.ToSlash(filepath.Join(repoPath(s.root, entry.Root), finding.Subject))
-			addFinding(report, finding, "ticket-file-integrity")
+			dimension := "ticket-file-integrity"
+			if finding.Code == "E_DUPLICATE_ID" {
+				dimension = "duplicate-id"
+			}
+			addFinding(report, finding, dimension)
 		}
 		for _, ticket := range tickets {
 			if prior, ok := seen[ticket.Ticket.ID]; ok && prior != ticket.Path {

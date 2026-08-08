@@ -72,4 +72,18 @@ func TestCancelledCheckProducesRuntimeUnevaluatedExitThree(t *testing.T) {
 	if !report.Unevaluated || report.Dimensions["relation-integrity"] != "deferred" {
 		t.Fatalf("runtime unevaluated report = %#v", report)
 	}
+	for _, dimension := range []string{
+		"allocated-id-file", "duplicate-id", "stale-index", "orphan-worktree",
+		"ticket-file-integrity", "reconcile-integrity", "rebuild-integrity",
+	} {
+		if report.Dimensions[dimension] != "unevaluated" {
+			t.Fatalf("cancelled dimension %q = %q, want unevaluated", dimension, report.Dimensions[dimension])
+		}
+	}
+}
+
+func TestAlreadyInitializedUsesInvalidInvocationExitCode(t *testing.T) {
+	if got := store.ExitForCode("E_ALREADY_INITIALIZED"); got != 2 {
+		t.Fatalf("already initialized exit=%d, want 2", got)
+	}
 }
