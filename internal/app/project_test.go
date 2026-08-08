@@ -31,8 +31,11 @@ func TestInitCreatesRegisteredProjectAndRefusesOverwrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer opened.Close()
-	if _, err := Init(context.Background(), root, map[string]any{"project": "demo", "prefixes": "DEMO"}); !strings.Contains(err.Error(), "E_CONFIG_INVALID") {
+	if _, err := Init(context.Background(), root, map[string]any{"project": "demo", "prefixes": "DEMO"}); !strings.Contains(err.Error(), "E_ALREADY_INITIALIZED") {
 		t.Fatalf("second init error = %v", err)
+	}
+	if filepath.IsAbs(result.Root) || filepath.IsAbs(result.Config) || result.Root != "." || result.Config != ".aira/config" {
+		t.Fatalf("init leaked absolute paths: %#v", result)
 	}
 }
 

@@ -131,9 +131,12 @@ func (t Ticket) Validate() error {
 	if !validStatus(t.Status) || !validKind(t.Kind) || !validSeverity(t.Severity) {
 		return errors.New("E_CONFIG_INVALID: ticket enum is invalid")
 	}
-	for _, label := range t.Labels {
+	for i, label := range t.Labels {
 		if label == "" || label != strings.ToLower(label) {
 			return errors.New("E_CONFIG_INVALID: labels must be non-empty lowercase strings")
+		}
+		if i > 0 && t.Labels[i-1] >= label {
+			return errors.New("E_CONFIG_INVALID: labels must be unique and sorted")
 		}
 	}
 	for _, r := range t.Relations {

@@ -594,6 +594,7 @@ Every response has a stable `code`, a human message, structured details, and a
 | `E_DUPLICATE_ID` | More than one ticket definition has the same ID. | integrity fail |
 | `E_ID_UNRESOLVED` | An allocation receipt has neither a ticket nor retirement. | integrity fail |
 | `E_NOT_FOUND` | A singular selector found no ticket. | error |
+| `E_ALREADY_INITIALIZED` | `aira init` found an existing complete project config and refused to overwrite it. | error |
 | `E_SELECTOR_INVALID` | Selector syntax is invalid. | error |
 | `E_SELECTOR_AMBIGUOUS` | A singular selector resolved to multiple tickets. | integrity fail |
 | `E_RELATION_TARGET_MISSING` | A relation points at no existing ticket. | integrity fail |
@@ -626,16 +627,21 @@ agent guide are generated from it; they are not separately transcribed.
 
 | Exit | Meaning |
 |---:|---|
-| 0 | All selected checks are `pass`; warnings may be present. |
+| 0 | All selected applicable checks are `pass`; warnings may be present. |
 | 1 | At least one selected check is `fail` or a fail-closed integrity error exists. |
 | 2 | Invocation, selector, or config syntax is invalid; no check verdict is claimed. |
-| 3 | At least one selected check is `unevaluated`, with no `fail`. |
+| 3 | At least one selected runtime check is `unevaluated`, with no `fail`. |
 | 4 | Store/reconciliation failed before the requested checks could be evaluated. |
 
-If both `fail` and `unevaluated` occur, exit 1 wins. An unrun check cannot
-produce exit 0. `W_AREA_OVERLAP`, `W_ORPHAN_WORKTREE`, and `W_STALE_INDEX` are
-visible warnings and do not fail the default check; a future project policy may
-promote them.
+If both `fail` and runtime `unevaluated` occur, exit 1 wins. An applicable
+check that should have run but could not establish a result is runtime
+`unevaluated` and therefore cannot produce exit 0. A check explicitly marked
+`deferred`/not-applicable because its feature is not built in this milestone is
+reported honestly as `deferred` and does not force exit 3; in M2,
+`relation-integrity` is such a dimension. Thus deferred/not-applicable is not
+the same state as runtime `unevaluated`. `W_AREA_OVERLAP`, `W_ORPHAN_WORKTREE`,
+and `W_STALE_INDEX` are visible warnings and do not fail the default check; a
+future project policy may promote them.
 
 ## 9. Phase-1 database shape
 

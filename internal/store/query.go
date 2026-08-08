@@ -211,6 +211,9 @@ func (s *Store) List(selector string) ([]TicketRecord, error) {
 	}
 	if sel.ExactID != "" {
 		record, err := s.exactRecord(sel.ExactID, sel.ExactPath)
+		if ErrorCode(err) == "E_NOT_FOUND" {
+			return []TicketRecord{}, nil
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -222,8 +225,6 @@ func (s *Store) List(selector string) ([]TicketRecord, error) {
 func (s *Store) Find(selector string) ([]TicketRecord, error) { return s.List(selector) }
 
 type selectorFilter struct {
-	ID    string
-	Path  string
 	Terms []queryTerm
 }
 
@@ -232,21 +233,13 @@ func (s *Store) records(filter selectorFilter) ([]TicketRecord, error) {
 	if err != nil {
 		return nil, err
 	}
-	tickets, err := scanTickets(s.root, s.worktreeID)
+	tickets, _, err := scanTickets(s.root, s.worktreeID)
 	if err != nil {
 		return nil, err
 	}
 	result := make([]TicketRecord, 0, len(tickets))
 	for _, scanned := range tickets {
-		data, err := readRegularTicket(scanned.Path)
-		if err != nil {
-			return nil, err
-		}
-		_, body, err := domain.ParseTicket(data)
-		if err != nil {
-			return nil, err
-		}
-		record := TicketRecord{Ticket: scanned.Ticket, Body: body, Path: repoPath(s.root, scanned.Path), WorktreeID: s.worktreeID, Digest: scanned.Digest}
+		record := TicketRecord{Ticket: scanned.Ticket, Body: scanned.Body, Path: repoPath(s.root, scanned.Path), WorktreeID: s.worktreeID, Digest: scanned.Digest}
 		if indexedDigest, ok := indexed[scanned.Ticket.ID]; ok && indexedDigest != scanned.Digest {
 			record.Warnings = []string{"W_STALE_INDEX"}
 		}
@@ -275,7 +268,7 @@ func (s *Store) exactRecord(id, anchor string) (TicketRecord, error) {
 		return TicketRecord{}, err
 	}
 	if ticket.ID != id || filepath.Base(path) != id+".md" {
-		return TicketRecord{}, fmt.Errorf("E_CONFIG_INVALID: filename/frontmatter mismatch %s", path)
+		return TicketRecord{}, fmt.Errorf("E_CONFIG_INVALID: filename/frontmatter mismatch %s", repoPath(s.root, path))
 	}
 	record := TicketRecord{Ticket: ticket, Body: body, Path: repoPath(s.root, path), WorktreeID: s.worktreeID, Digest: digestBytes(data)}
 	var indexedDigest string
@@ -319,7 +312,7 @@ func readRegularTicket(path string) ([]byte, error) {
 		return nil, err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("E_CONFIG_INVALID: ticket path is not a regular file: %s", path)
+		return nil, errors.New("E_CONFIG_INVALID: ticket path is not a regular file")
 	}
 	return os.ReadFile(path)
 }
@@ -336,9 +329,6 @@ func matchesTerms(record TicketRecord, terms []queryTerm) bool {
 			matched = string(record.Ticket.Kind) == term.Value
 		case "severity":
 			matched = string(record.Ticket.Severity) == term.Value
-		case "hold":
-			want, err := strconv.ParseBool(strings.ToLower(term.Value))
-			matched = err == nil && record.Ticket.Hold == want
 		case "project":
 			matched = record.Ticket.Project == term.Value
 		case "assignee":
@@ -362,21 +352,11 @@ func matchesTerms(record TicketRecord, terms []queryTerm) bool {
 	return true
 }
 
-func singular(rows []TicketRecord) (TicketRecord, error) {
-	switch len(rows) {
-	case 0:
-		return TicketRecord{}, errors.New("E_NOT_FOUND: selector matched no tickets")
-	case 1:
-		return rows[0], nil
-	default:
-		return TicketRecord{}, errors.New("E_SELECTOR_AMBIGUOUS: selector matched multiple tickets")
-	}
-}
-
 type CountResult struct {
 	Total        int            `json:"total"`
 	Distribution map[string]int `json:"distribution,omitempty"`
 	By           string         `json:"by"`
+	Warnings     []string       `json:"-"`
 }
 
 func (s *Store) Count(selector, by string) (CountResult, error) {
@@ -388,6 +368,21 @@ func (s *Store) Count(selector, by string) (CountResult, error) {
 		return CountResult{}, err
 	}
 	if canAggregateCount(sel, by) {
+		stale, scannedFindings, err := s.indexState()
+		if err != nil {
+			return CountResult{}, err
+		}
+		if stale || scannedFindings {
+			rows, err := s.List(selector)
+			if err != nil {
+				return CountResult{}, err
+			}
+			result := countRows(rows, by)
+			if stale {
+				result.Warnings = []string{"W_STALE_INDEX"}
+			}
+			return result, nil
+		}
 		return s.aggregateCount(sel, by)
 	}
 	rows, err := s.List(selector)
@@ -401,6 +396,41 @@ func (s *Store) Count(selector, by string) (CountResult, error) {
 		}
 	}
 	return result, nil
+}
+
+func countRows(rows []TicketRecord, by string) CountResult {
+	result := CountResult{Total: len(rows), By: by, Distribution: map[string]int{}}
+	for _, row := range rows {
+		for _, value := range distributionValues(row, by) {
+			result.Distribution[value]++
+		}
+	}
+	return result
+}
+
+func (s *Store) indexState() (stale, scannedFindings bool, err error) {
+	indexed, err := s.indexedDigests()
+	if err != nil {
+		return false, false, err
+	}
+	tickets, findings, err := scanTickets(s.root, s.worktreeID)
+	if err != nil {
+		return false, false, err
+	}
+	scannedFindings = len(findings) > 0
+	seen := make(map[string]bool, len(tickets))
+	for _, ticket := range tickets {
+		seen[ticket.Ticket.ID] = true
+		if indexed[ticket.Ticket.ID] != ticket.Digest {
+			stale = true
+		}
+	}
+	for id := range indexed {
+		if !seen[id] {
+			stale = true
+		}
+	}
+	return stale, scannedFindings, nil
 }
 
 func canAggregateCount(sel selector, by string) bool {

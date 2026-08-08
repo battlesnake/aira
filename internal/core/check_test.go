@@ -19,7 +19,7 @@ func TestCheckExitCodesForPassFailUnevaluatedAndStoreError(t *testing.T) {
 	}
 	var passReport store.CheckReport
 	marshalRoundTrip(t, pass.Data, &passReport)
-	if passReport.Dimensions["relation-integrity"] != "unevaluated" {
+	if passReport.Dimensions["relation-integrity"] != "deferred" {
 		t.Fatalf("relation dimension = %#v", passReport.Dimensions)
 	}
 
@@ -45,6 +45,9 @@ func TestCheckExitCodesForPassFailUnevaluatedAndStoreError(t *testing.T) {
 	if len(orphanReport.Warnings) != 1 || orphanReport.Warnings[0].Code != "W_ORPHAN_WORKTREE" {
 		t.Fatalf("orphan warning = %#v", orphanReport.Warnings)
 	}
+	if orphanReport.Dimensions["orphan-worktree"] != "warning" {
+		t.Fatalf("orphan dimension = %#v", orphanReport.Dimensions)
+	}
 
 	errorStore := coreTestStore(t)
 	if err := errorStore.Close(); err != nil {
@@ -53,5 +56,20 @@ func TestCheckExitCodesForPassFailUnevaluatedAndStoreError(t *testing.T) {
 	storeError := New(errorStore).Do(context.Background(), Request{Verb: "check"})
 	if storeError.Exit != 4 || storeError.OK || storeError.Code == "PASS" {
 		t.Fatalf("store-error check = %#v", storeError)
+	}
+}
+
+func TestCancelledCheckProducesRuntimeUnevaluatedExitThree(t *testing.T) {
+	s := coreTestStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	response := New(s).Do(ctx, Request{Verb: "check"})
+	if response.Code != "UNEVALUATED" || response.Exit != 3 || !response.OK {
+		t.Fatalf("cancelled check = %#v", response)
+	}
+	var report store.CheckReport
+	marshalRoundTrip(t, response.Data, &report)
+	if !report.Unevaluated || report.Dimensions["relation-integrity"] != "deferred" {
+		t.Fatalf("runtime unevaluated report = %#v", report)
 	}
 }

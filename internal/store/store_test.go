@@ -1132,6 +1132,47 @@ func TestScanRefMaxIgnoresBrokenRefWarning(t *testing.T) {
 	}
 }
 
+func TestCheckReportsMalformedAndSymlinkedTicketsWithoutWedge(t *testing.T) {
+	base := persistentTemp(t, "local-ticket-findings")
+	root := filepath.Join(base, "repo")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := testStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	if _, err := s.CreateTicket(context.Background(), domain.CreateTicketInput{Title: "valid", Kind: domain.KindFeature, Severity: domain.SeverityP2}); err != nil {
+		t.Fatal(err)
+	}
+	ticketsDir := filepath.Join(root, ".aira", "tickets")
+	if err := os.WriteFile(filepath.Join(ticketsDir, "notes.md"), []byte("not frontmatter\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(base, "outside.md")
+	if err := os.WriteFile(outside, []byte("not frontmatter\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(ticketsDir, "AIRA-99.md")); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.List("")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("list with local findings: rows=%#v err=%v", rows, err)
+	}
+	report, err := s.Check(context.Background())
+	if err != nil || report.Verdict != "fail" || len(report.Findings) < 2 {
+		t.Fatalf("check with local findings: report=%#v err=%v", report, err)
+	}
+	if report.Dimensions["ticket-file-integrity"] != "fail" {
+		t.Fatalf("ticket-file dimension = %#v", report.Dimensions)
+	}
+	seen := map[string]bool{}
+	for _, finding := range report.Findings {
+		seen[finding.Code] = true
+	}
+	if !seen["E_CONFIG_INVALID"] {
+		t.Fatalf("local config finding missing: %#v", report.Findings)
+	}
+}
+
 func writeJSONL(t *testing.T, path string, values ...any) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

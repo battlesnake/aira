@@ -119,7 +119,7 @@ func TestReadSurfacesStaleIndexWarningFromCurrentFile(t *testing.T) {
 	}
 }
 
-func TestRecordsRefuseSymlinkedTicketAndUseCanonicalIDOrder(t *testing.T) {
+func TestRecordsSkipLocalTicketFindingsAndUseCanonicalIDOrder(t *testing.T) {
 	s := queryTestStore(t)
 	for _, id := range []string{"AIRA-10", "AIRA-2", "AIRA-1"} {
 		ticket := domain.Ticket{Schema: 1, ID: id, Project: "query-project", Title: id, Status: domain.StatusPlanned, Kind: domain.KindFeature, Severity: domain.SeverityP2}
@@ -146,8 +146,38 @@ func TestRecordsRefuseSymlinkedTicketAndUseCanonicalIDOrder(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(s.root, ".aira", "tickets", "AIRA-99.md")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.List(""); codeOf(err) != "E_CONFIG_INVALID" {
-		t.Fatalf("symlink list code = %q, err=%v", codeOf(err), err)
+	if err := os.WriteFile(filepath.Join(s.root, ".aira", "tickets", "notes.md"), []byte("notes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = s.List("")
+	if err != nil || len(rows) != 3 {
+		t.Fatalf("local invalid files wedged list: rows=%#v err=%v", rows, err)
+	}
+	if _, err := s.List("AIRA-999"); err != nil {
+		t.Fatalf("missing plural exact selector = %v", err)
+	}
+}
+
+func TestCountAgreesWithListWhenIndexIsStale(t *testing.T) {
+	s := queryTestStore(t)
+	ticket, err := s.CreateTicket(context.Background(), testCreateInput("count me", "body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := domain.RenderTicket(func() domain.Ticket { ticket.Title = "edited"; return ticket }(), "body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.root, ".aira", "tickets", ticket.ID+".md"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.List("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	count, err := s.Count("", "status")
+	if err != nil || count.Total != len(rows) || count.Warnings == nil {
+		t.Fatalf("stale count/list disagreement: rows=%d count=%#v err=%v", len(rows), count, err)
 	}
 }
 

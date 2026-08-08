@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"aira/internal/domain"
@@ -14,7 +15,8 @@ var ExitCodes = map[string]int{
 	"E_CONFIG_MISSING": 2, "E_CONFIG_INVALID": 2, "E_NOT_PROJECT": 2,
 	"E_ID_INVALID": 2, "E_SELECTOR_INVALID": 2, "E_NOT_FOUND": 2,
 	"E_SELECTOR_AMBIGUOUS": 2, "E_UNKNOWN_VERB": 2,
-	"E_DB_BUSY": 4, "E_DB_CORRUPT": 4, "E_RECEIPT_IO": 4,
+	"E_ALREADY_INITIALIZED": 1,
+	"E_DB_BUSY":             4, "E_DB_CORRUPT": 4, "E_RECEIPT_IO": 4,
 	"E_RECONCILE_REQUIRED": 4, "E_GIT_SCAN": 4, "E_INTERNAL": 4,
 	"E_JOURNAL_CORRUPT": 4,
 }
@@ -49,21 +51,28 @@ type CheckReport struct {
 func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 	report := CheckReport{Verdict: "pass", Dimensions: map[string]string{
 		"allocated-id-file": "pass", "duplicate-id": "pass", "stale-index": "pass",
-		"orphan-worktree": "pass", "relation-integrity": "unevaluated",
+		"orphan-worktree": "pass", "ticket-file-integrity": "pass", "reconcile-integrity": "pass",
+		"rebuild-integrity": "pass", "relation-integrity": "deferred",
 	}}
+	if err := ctx.Err(); err != nil {
+		report.Verdict = "unevaluated"
+		report.Unevaluated = true
+		report.UnevaluatedFindings = []CheckFinding{{Code: "U_CHECK_UNEVALUATED", Subject: "check", Message: err.Error(), Kind: "unevaluated"}}
+		return report, nil
+	}
 	if err := s.checkStaleIndex(&report); err != nil {
 		return CheckReport{}, err
 	}
 	if err := s.reconcile(ctx); err != nil {
 		if isIntegrityError(err) {
-			report.Findings = append(report.Findings, s.findingFromError(err, "reconcile"))
+			addFinding(&report, s.findingFromError(err, "reconcile"), "reconcile-integrity")
 		} else {
 			return CheckReport{}, err
 		}
 	}
 	if err := s.Rebuild(ctx); err != nil {
 		if isIntegrityError(err) {
-			report.Findings = append(report.Findings, s.findingFromError(err, "rebuild"))
+			addFinding(&report, s.findingFromError(err, "rebuild"), "rebuild-integrity")
 		} else {
 			return CheckReport{}, err
 		}
@@ -90,6 +99,10 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 					Message: "allocation has no materialised ticket file", Kind: "fail",
 				})
 			} else if err != nil {
+				if ErrorCode(err) != "E_CONFIG_INVALID" {
+					_ = rows.Close()
+					return CheckReport{}, err
+				}
 				report.Dimensions["allocated-id-file"] = "fail"
 				report.Findings = append(report.Findings, s.findingFromError(err, fmt.Sprintf("%s-%d", prefix, number)))
 			} else if ticket, _, parseErr := domain.ParseTicket(data); parseErr != nil || ticket.ID != fmt.Sprintf("%s-%d", prefix, number) {
@@ -124,7 +137,7 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 		}
 		if active == 0 || fileMissing(root) {
 			warning := CheckFinding{Code: "W_ORPHAN_WORKTREE", Subject: id, Message: repoPath(s.root, root), Kind: "warning"}
-			report.Warnings = append(report.Warnings, warning)
+			addWarning(&report, warning, "orphan-worktree")
 		}
 	}
 	if err := worktrees.Err(); err != nil {
@@ -133,7 +146,6 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 	}
 	_ = worktrees.Close()
 
-	report.UnevaluatedFindings = append(report.UnevaluatedFindings, CheckFinding{Code: "U_CHECK_UNEVALUATED", Subject: "relation-integrity", Message: "relations are not built in Phase 1", Kind: "unevaluated"})
 	if len(report.Findings) > 0 {
 		report.Verdict = "fail"
 	}
@@ -153,14 +165,18 @@ func (s *Store) checkStaleIndex(report *CheckReport) error {
 		}
 		data, err := readRegularTicket(path)
 		if errors.Is(err, os.ErrNotExist) {
-			report.Warnings = append(report.Warnings, CheckFinding{Code: "W_STALE_INDEX", Subject: id, Message: "indexed ticket file is missing", Kind: "warning"})
+			addWarning(report, CheckFinding{Code: "W_STALE_INDEX", Subject: id, Message: "indexed ticket file is missing", Kind: "warning"}, "stale-index")
 			continue
 		}
 		if err != nil {
+			if ErrorCode(err) == "E_CONFIG_INVALID" {
+				addFinding(report, s.findingFromError(err, id), "ticket-file-integrity")
+				continue
+			}
 			return err
 		}
 		if digestBytes(data) != digest {
-			report.Warnings = append(report.Warnings, CheckFinding{Code: "W_STALE_INDEX", Subject: id, Message: "indexed digest differs from ticket file", Kind: "warning"})
+			addWarning(report, CheckFinding{Code: "W_STALE_INDEX", Subject: id, Message: "indexed digest differs from ticket file", Kind: "warning"}, "stale-index")
 		}
 	}
 	return rows.Err()
@@ -182,14 +198,17 @@ func (s *Store) checkDuplicateIDs(ctx context.Context, report *CheckReport) erro
 	}
 	seen := map[string]string{}
 	for _, entry := range entries {
-		tickets, err := scanTickets(entry.Root, entry.WorktreeID)
+		tickets, scanFindings, err := scanTickets(entry.Root, entry.WorktreeID)
 		if err != nil {
-			if isIntegrityError(err) {
-				report.Dimensions["duplicate-id"] = "fail"
-				report.Findings = append(report.Findings, s.findingFromError(err, repoPath(s.root, entry.Root)))
-				continue
+			if !isIntegrityError(err) {
+				return err
 			}
-			return err
+			addFinding(report, s.findingFromError(err, repoPath(s.root, entry.Root)), "duplicate-id")
+			continue
+		}
+		for _, finding := range scanFindings {
+			finding.Subject = filepath.ToSlash(filepath.Join(repoPath(s.root, entry.Root), finding.Subject))
+			addFinding(report, finding, "ticket-file-integrity")
 		}
 		for _, ticket := range tickets {
 			if prior, ok := seen[ticket.Ticket.ID]; ok && prior != ticket.Path {
@@ -206,10 +225,34 @@ func (s *Store) checkDuplicateIDs(ctx context.Context, report *CheckReport) erro
 func isIntegrityError(err error) bool {
 	code := ErrorCode(err)
 	switch code {
-	case "E_DUPLICATE_ID", "E_ID_UNRESOLVED", "E_RELATION_TARGET_MISSING", "E_RELATION_INVALID", "E_WRITE_CONFLICT", "E_TRANSITION_INVALID", "E_PATH_INTENT_UNRESOLVED", "E_JOURNAL_CORRUPT", "E_SELECTOR_AMBIGUOUS":
+	case "E_CONFIG_INVALID", "E_DUPLICATE_ID", "E_ID_UNRESOLVED", "E_RELATION_TARGET_MISSING", "E_RELATION_INVALID", "E_WRITE_CONFLICT", "E_TRANSITION_INVALID", "E_PATH_INTENT_UNRESOLVED", "E_JOURNAL_CORRUPT", "E_SELECTOR_AMBIGUOUS":
 		return true
 	default:
 		return false
+	}
+}
+
+func addFinding(report *CheckReport, finding CheckFinding, dimension string) {
+	for _, existing := range report.Findings {
+		if existing.Code == finding.Code && existing.Subject == finding.Subject {
+			return
+		}
+	}
+	report.Findings = append(report.Findings, finding)
+	if dimension != "" {
+		report.Dimensions[dimension] = "fail"
+	}
+}
+
+func addWarning(report *CheckReport, warning CheckFinding, dimension string) {
+	for _, existing := range report.Warnings {
+		if existing.Code == warning.Code && existing.Subject == warning.Subject {
+			return
+		}
+	}
+	report.Warnings = append(report.Warnings, warning)
+	if dimension != "" {
+		report.Dimensions[dimension] = "warning"
 	}
 }
 

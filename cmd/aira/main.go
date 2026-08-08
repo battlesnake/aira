@@ -26,7 +26,7 @@ func Run(argv []string, stdout, stderr io.Writer) int {
 	verb := strings.ToLower(args[0])
 	positional, options, err := parseArgs(verb, args[1:])
 	if err != nil {
-		response := core.Response{Code: "E_SELECTOR_INVALID", Error: err.Error()}
+		response := core.Response{Code: "E_SELECTOR_INVALID", Error: err.Error(), Exit: store.ExitForCode("E_SELECTOR_INVALID")}
 		return render(response, jsonOutput, stdout, stderr)
 	}
 
@@ -214,10 +214,16 @@ func renderHuman(response core.Response, out io.Writer) {
 			data, _ := json.Marshal(report)
 			_, _ = fmt.Fprintf(out, "verdict: %s\n%s\n", strings.ToLower(response.Code), data)
 		}
+		for _, warning := range response.Warnings {
+			_, _ = fmt.Fprintf(out, "warning: %s\n", warning)
+		}
 		return
 	}
 	data, _ := json.MarshalIndent(response.Data, "", "  ")
 	_, _ = fmt.Fprintln(out, string(data))
+	for _, warning := range response.Warnings {
+		_, _ = fmt.Fprintf(out, "warning: %s\n", warning)
+	}
 }
 
 func appErrorCode(err error) string {

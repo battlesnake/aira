@@ -123,7 +123,7 @@ func Init(ctx context.Context, cwd string, args map[string]any) (InitResult, err
 	}
 	configPath := filepath.Join(root, ".aira", "config")
 	if _, err := os.Stat(configPath); err == nil {
-		return InitResult{}, errors.New("E_CONFIG_INVALID: .aira/config already exists; refusing to overwrite")
+		return InitResult{}, errors.New("E_ALREADY_INITIALIZED: .aira/config already exists")
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return InitResult{}, err
 	}
@@ -184,7 +184,7 @@ func Init(ctx context.Context, cwd string, args map[string]any) (InitResult, err
 	if err := s.Close(); err != nil {
 		return InitResult{}, err
 	}
-	return InitResult{Root: root, Config: configPath, Project: slug, Prefixes: prefixes, Created: true}, nil
+	return InitResult{Root: ".", Config: ".aira/config", Project: slug, Prefixes: prefixes, Created: true}, nil
 }
 
 func findConfig(root string) (string, error) {

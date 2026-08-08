@@ -100,7 +100,11 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 		data, warnings = wrapped.Data, wrapped.Warnings
 	}
 	if report, ok := data.(store.CheckReport); ok {
-		return Response{OK: true, Code: strings.ToUpper(report.Verdict), Data: report, Warnings: warnings, Exit: exitCode(report)}
+		code := strings.ToUpper(report.Verdict)
+		if report.Unevaluated {
+			code = "UNEVALUATED"
+		}
+		return Response{OK: true, Code: code, Data: report, Warnings: warnings, Exit: exitCode(report)}
 	}
 	return Response{OK: true, Code: "OK", Data: data, Warnings: warnings}
 }
@@ -157,7 +161,8 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			return handlerData{Data: data, Warnings: recordWarnings(rows)}, nil
 		}},
 		"count": {Name: "count", Usage: "count [query] --by F", Run: func(ctx context.Context, args map[string]any) (any, error) {
-			return c.store.Count(stringArg(args, "query"), stringArg(args, "by"))
+			result, err := c.store.Count(stringArg(args, "query"), stringArg(args, "by"))
+			return handlerData{Data: result, Warnings: result.Warnings}, err
 		}},
 		"set": {Name: "set", Usage: "set <selector> <field=value>", Run: func(ctx context.Context, args map[string]any) (any, error) {
 			record, err := c.store.Get(stringArg(args, "selector"))
@@ -333,6 +338,9 @@ func exitCode(report store.CheckReport) int {
 	case "unevaluated":
 		return 3
 	default:
+		if report.Unevaluated {
+			return 3
+		}
 		return 0
 	}
 }

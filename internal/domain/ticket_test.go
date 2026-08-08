@@ -2,7 +2,10 @@
 
 package domain
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestTicketRoundTripAndCanonicalRelationOrder(t *testing.T) {
 	ticket := Ticket{
@@ -67,5 +70,17 @@ func TestRenderTicketDeduplicatesSortedLabels(t *testing.T) {
 	}
 	if len(parsed.Labels) != 2 || parsed.Labels[0] != "a" || parsed.Labels[1] != "z" {
 		t.Fatalf("labels = %#v", parsed.Labels)
+	}
+}
+
+func TestParseTicketRejectsNonCanonicalLabels(t *testing.T) {
+	ticket := Ticket{Schema: 1, ID: "AIRA-1", Project: "aira", Title: "labels", Status: StatusPlanned, Kind: KindFeature, Severity: SeverityP2, Labels: []string{"z", "a", "z"}}
+	data, err := json.Marshal(ticket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(append([]byte("---\n"), data...), []byte("\n---\nbody\n")...)
+	if _, _, err := ParseTicket(data); err == nil {
+		t.Fatal("non-canonical labels parsed successfully")
 	}
 }

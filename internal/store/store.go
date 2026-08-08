@@ -108,6 +108,7 @@ type scannedTicket struct {
 	WorktreeID string
 	Path       string
 	Ticket     domain.Ticket
+	Body       string
 	Digest     string
 }
 
@@ -827,9 +828,14 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		if err := s.markWorktreeActive(ctx, entry, valid); err != nil {
 			return err
 		}
-		tickets, err := scanTickets(entry.Root, entry.WorktreeID)
+		tickets, scanFindings, err := scanTickets(entry.Root, entry.WorktreeID)
 		if err != nil {
 			return err
+		}
+		for _, finding := range scanFindings {
+			if err := s.recordScanFinding(ctx, entry, finding); err != nil {
+				return err
+			}
 		}
 		scanned = append(scanned, tickets...)
 		for _, ticket := range tickets {
@@ -1640,17 +1646,33 @@ func sortedKeys(values map[string]bool) []string {
 	return keys
 }
 
-func scanTickets(root, worktreeID string) ([]scannedTicket, error) {
+func (s *Store) recordScanFinding(ctx context.Context, entry registryEntry, finding CheckFinding) error {
+	rootPath := repoPath(s.root, entry.Root)
+	subject := filepath.ToSlash(filepath.Join(rootPath, finding.Subject))
+	if rootPath == "." {
+		subject = finding.Subject
+	}
+	return s.withImmediate(ctx, func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx, `INSERT INTO findings(project_id, finding_key, code, subject, details, created_at)
+				VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(project_id, finding_key) DO UPDATE SET details=excluded.details`,
+			s.projectID, "scan:"+entry.WorktreeID+":"+finding.Code+":"+digestBytes([]byte(subject)), finding.Code, subject,
+			finding.Message, time.Now().UTC().Format(time.RFC3339Nano))
+		return err
+	})
+}
+
+func scanTickets(root, worktreeID string) ([]scannedTicket, []CheckFinding, error) {
 	dir := filepath.Join(root, ".aira", "tickets")
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	seen := map[string]bool{}
 	var result []scannedTicket
+	var findings []CheckFinding
 	for _, entry := range entries {
 		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") || !strings.HasSuffix(entry.Name(), ".md") {
 			continue
@@ -1658,22 +1680,37 @@ func scanTickets(root, worktreeID string) ([]scannedTicket, error) {
 		path := filepath.Join(dir, entry.Name())
 		data, err := readRegularTicket(path)
 		if err != nil {
-			return nil, err
+			if ErrorCode(err) == "E_CONFIG_INVALID" {
+				findings = append(findings, scanFinding(root, path, err))
+				continue
+			}
+			return nil, nil, err
 		}
-		ticket, _, err := domain.ParseTicket(data)
+		ticket, body, err := domain.ParseTicket(data)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", path, err)
+			findings = append(findings, scanFinding(root, path, err))
+			continue
 		}
 		if seen[ticket.ID] {
-			return nil, fmt.Errorf("E_DUPLICATE_ID: %s in worktree %s", ticket.ID, worktreeID)
+			return nil, nil, fmt.Errorf("E_DUPLICATE_ID: %s in worktree %s", ticket.ID, worktreeID)
 		}
 		if filepath.Base(path) != ticket.ID+".md" {
-			return nil, fmt.Errorf("E_CONFIG_INVALID: filename/frontmatter mismatch %s", path)
+			findings = append(findings, scanFinding(root, path, fmt.Errorf("E_CONFIG_INVALID: filename/frontmatter mismatch %s", repoPath(root, path))))
+			continue
 		}
 		seen[ticket.ID] = true
-		result = append(result, scannedTicket{WorktreeID: worktreeID, Path: path, Ticket: ticket, Digest: digestBytes(data)})
+		result = append(result, scannedTicket{WorktreeID: worktreeID, Path: path, Ticket: ticket, Body: body, Digest: digestBytes(data)})
 	}
-	return result, nil
+	return result, findings, nil
+}
+
+func scanFinding(root, path string, err error) CheckFinding {
+	code := ErrorCode(err)
+	if code == "E_INTERNAL" {
+		code = "E_CONFIG_INVALID"
+	}
+	detail := strings.TrimSpace(strings.TrimPrefix(err.Error(), code+":"))
+	return CheckFinding{Code: code, Subject: repoPath(root, path), Message: code + ": " + detail, Kind: "fail"}
 }
 
 func scanRefMax(root string) (map[string]int64, error) {
