@@ -6,7 +6,25 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"aira/internal/domain"
 )
+
+var ExitCodes = map[string]int{
+	"E_CONFIG_MISSING": 2, "E_CONFIG_INVALID": 2, "E_NOT_PROJECT": 2,
+	"E_ID_INVALID": 2, "E_SELECTOR_INVALID": 2, "E_NOT_FOUND": 2,
+	"E_SELECTOR_AMBIGUOUS": 2, "E_UNKNOWN_VERB": 2,
+	"E_DB_BUSY": 4, "E_DB_CORRUPT": 4, "E_RECEIPT_IO": 4,
+	"E_RECONCILE_REQUIRED": 4, "E_GIT_SCAN": 4, "E_INTERNAL": 4,
+	"E_JOURNAL_CORRUPT": 4,
+}
+
+func ExitForCode(code string) int {
+	if exit, ok := ExitCodes[code]; ok {
+		return exit
+	}
+	return 1
+}
 
 type CheckFinding struct {
 	Code    string `json:"code"`
@@ -16,10 +34,12 @@ type CheckFinding struct {
 }
 
 type CheckReport struct {
-	Verdict     string         `json:"verdict"`
-	Findings    []CheckFinding `json:"findings,omitempty"`
-	Warnings    []CheckFinding `json:"warnings,omitempty"`
-	Unevaluated bool           `json:"unevaluated,omitempty"`
+	Verdict             string            `json:"verdict"`
+	Dimensions          map[string]string `json:"dimensions"`
+	Findings            []CheckFinding    `json:"findings,omitempty"`
+	Warnings            []CheckFinding    `json:"warnings,omitempty"`
+	UnevaluatedFindings []CheckFinding    `json:"unevaluated_findings,omitempty"`
+	Unevaluated         bool              `json:"unevaluated,omitempty"`
 }
 
 // Check runs the explicit full consistency pass. Known integrity findings are
@@ -27,17 +47,23 @@ type CheckReport struct {
 // returned as an error so the adapter can use exit 4 rather than claiming a
 // verdict it did not establish.
 func (s *Store) Check(ctx context.Context) (CheckReport, error) {
-	report := CheckReport{Verdict: "pass"}
+	report := CheckReport{Verdict: "pass", Dimensions: map[string]string{
+		"allocated-id-file": "pass", "duplicate-id": "pass", "stale-index": "pass",
+		"orphan-worktree": "pass", "relation-integrity": "unevaluated",
+	}}
+	if err := s.checkStaleIndex(&report); err != nil {
+		return CheckReport{}, err
+	}
 	if err := s.reconcile(ctx); err != nil {
 		if isIntegrityError(err) {
-			report.Findings = append(report.Findings, findingFromError(err, "reconcile"))
+			report.Findings = append(report.Findings, s.findingFromError(err, "reconcile"))
 		} else {
-			return CheckReport{}, fmt.Errorf("E_RECONCILE_REQUIRED: %w", err)
+			return CheckReport{}, err
 		}
 	}
 	if err := s.Rebuild(ctx); err != nil {
 		if isIntegrityError(err) {
-			report.Findings = append(report.Findings, findingFromError(err, "rebuild"))
+			report.Findings = append(report.Findings, s.findingFromError(err, "rebuild"))
 		} else {
 			return CheckReport{}, err
 		}
@@ -56,14 +82,22 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 			return CheckReport{}, err
 		}
 		if state == "allocated" {
-			if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			data, err := readRegularTicket(path)
+			if errors.Is(err, os.ErrNotExist) {
+				report.Dimensions["allocated-id-file"] = "fail"
 				report.Findings = append(report.Findings, CheckFinding{
 					Code: "E_ID_UNRESOLVED", Subject: fmt.Sprintf("%s-%d", prefix, number),
 					Message: "allocation has no materialised ticket file", Kind: "fail",
 				})
 			} else if err != nil {
-				_ = rows.Close()
-				return CheckReport{}, err
+				report.Dimensions["allocated-id-file"] = "fail"
+				report.Findings = append(report.Findings, s.findingFromError(err, fmt.Sprintf("%s-%d", prefix, number)))
+			} else if ticket, _, parseErr := domain.ParseTicket(data); parseErr != nil || ticket.ID != fmt.Sprintf("%s-%d", prefix, number) {
+				report.Dimensions["allocated-id-file"] = "fail"
+				if parseErr == nil {
+					parseErr = fmt.Errorf("E_ID_UNRESOLVED: allocation file contains %s", ticket.ID)
+				}
+				report.Findings = append(report.Findings, s.findingFromError(parseErr, fmt.Sprintf("%s-%d", prefix, number)))
 			}
 		}
 	}
@@ -73,55 +107,24 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 	}
 	_ = rows.Close()
 
-	// A rebuild updates rows it can still see but intentionally leaves stale rows
-	// as evidence. Surface those rows with the stable warning rather than letting
-	// a read silently pretend the derived index is authoritative.
-	indexed, err := s.db.Query(`SELECT id, path, digest FROM tickets WHERE project_id=? AND worktree_id=?`, s.projectID, s.worktreeID)
-	if err != nil {
+	if err := s.checkDuplicateIDs(ctx, &report); err != nil {
 		return CheckReport{}, err
 	}
-	for indexed.Next() {
-		var id, path, digest string
-		if err := indexed.Scan(&id, &path, &digest); err != nil {
-			_ = indexed.Close()
-			return CheckReport{}, err
-		}
-		data, err := os.ReadFile(path)
-		if errors.Is(err, os.ErrNotExist) {
-			report.Warnings = append(report.Warnings, CheckFinding{Code: "W_STALE_INDEX", Subject: id, Message: "indexed ticket file is missing", Kind: "warning"})
-			continue
-		}
-		if err != nil {
-			_ = indexed.Close()
-			return CheckReport{}, err
-		}
-		if digestBytes(data) != digest {
-			report.Warnings = append(report.Warnings, CheckFinding{Code: "W_STALE_INDEX", Subject: id, Message: "indexed digest differs from ticket file", Kind: "warning"})
-		}
-	}
-	if err := indexed.Err(); err != nil {
-		_ = indexed.Close()
-		return CheckReport{}, err
-	}
-	_ = indexed.Close()
 
-	worktrees, err := s.db.Query(`SELECT worktree_id, root FROM worktrees WHERE project_id=?`, s.projectID)
+	worktrees, err := s.db.Query(`SELECT worktree_id, root, active FROM worktrees WHERE project_id=?`, s.projectID)
 	if err != nil {
 		return CheckReport{}, err
 	}
 	for worktrees.Next() {
 		var id, root string
-		if err := worktrees.Scan(&id, &root); err != nil {
+		var active int
+		if err := worktrees.Scan(&id, &root, &active); err != nil {
 			_ = worktrees.Close()
 			return CheckReport{}, err
 		}
-		if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
-			warning := CheckFinding{Code: "W_ORPHAN_WORKTREE", Subject: id, Message: root, Kind: "warning"}
+		if active == 0 || fileMissing(root) {
+			warning := CheckFinding{Code: "W_ORPHAN_WORKTREE", Subject: id, Message: repoPath(s.root, root), Kind: "warning"}
 			report.Warnings = append(report.Warnings, warning)
-			report.Unevaluated = true
-		} else if err != nil {
-			_ = worktrees.Close()
-			return CheckReport{}, err
 		}
 	}
 	if err := worktrees.Err(); err != nil {
@@ -130,39 +133,74 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 	}
 	_ = worktrees.Close()
 
-	findings, err := s.db.Query(`SELECT code, subject, details FROM findings WHERE project_id=? ORDER BY finding_key`, s.projectID)
-	if err != nil {
-		return CheckReport{}, err
-	}
-	for findings.Next() {
-		var code, subject, details string
-		if err := findings.Scan(&code, &subject, &details); err != nil {
-			_ = findings.Close()
-			return CheckReport{}, err
-		}
-		if code == "E_GIT_SCAN" {
-			report.Unevaluated = true
-			report.Warnings = append(report.Warnings, CheckFinding{Code: "W_ORPHAN_WORKTREE", Subject: subject, Message: details, Kind: "warning"})
-			continue
-		}
-		if strings.HasPrefix(code, "W_") {
-			report.Warnings = append(report.Warnings, CheckFinding{Code: code, Subject: subject, Message: details, Kind: "warning"})
-		} else {
-			report.Findings = append(report.Findings, CheckFinding{Code: code, Subject: subject, Message: details, Kind: "fail"})
-		}
-	}
-	if err := findings.Err(); err != nil {
-		_ = findings.Close()
-		return CheckReport{}, err
-	}
-	_ = findings.Close()
-
+	report.UnevaluatedFindings = append(report.UnevaluatedFindings, CheckFinding{Code: "U_CHECK_UNEVALUATED", Subject: "relation-integrity", Message: "relations are not built in Phase 1", Kind: "unevaluated"})
 	if len(report.Findings) > 0 {
 		report.Verdict = "fail"
-	} else if report.Unevaluated {
-		report.Verdict = "unevaluated"
 	}
 	return report, nil
+}
+
+func (s *Store) checkStaleIndex(report *CheckReport) error {
+	rows, err := s.db.Query(`SELECT id, path, digest FROM tickets WHERE project_id=? AND worktree_id=?`, s.projectID, s.worktreeID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, path, digest string
+		if err := rows.Scan(&id, &path, &digest); err != nil {
+			return err
+		}
+		data, err := readRegularTicket(path)
+		if errors.Is(err, os.ErrNotExist) {
+			report.Warnings = append(report.Warnings, CheckFinding{Code: "W_STALE_INDEX", Subject: id, Message: "indexed ticket file is missing", Kind: "warning"})
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if digestBytes(data) != digest {
+			report.Warnings = append(report.Warnings, CheckFinding{Code: "W_STALE_INDEX", Subject: id, Message: "indexed digest differs from ticket file", Kind: "warning"})
+		}
+	}
+	return rows.Err()
+}
+
+func fileMissing(path string) bool {
+	_, err := os.Stat(path)
+	return errors.Is(err, os.ErrNotExist)
+}
+
+func (s *Store) checkDuplicateIDs(ctx context.Context, report *CheckReport) error {
+	registry, err := readRegistry(s.registryPath)
+	if err != nil {
+		return err
+	}
+	entries, err := discoverWorktrees(s.root, s.projectID, registry)
+	if err != nil {
+		return err
+	}
+	seen := map[string]string{}
+	for _, entry := range entries {
+		tickets, err := scanTickets(entry.Root, entry.WorktreeID)
+		if err != nil {
+			if isIntegrityError(err) {
+				report.Dimensions["duplicate-id"] = "fail"
+				report.Findings = append(report.Findings, s.findingFromError(err, repoPath(s.root, entry.Root)))
+				continue
+			}
+			return err
+		}
+		for _, ticket := range tickets {
+			if prior, ok := seen[ticket.Ticket.ID]; ok && prior != ticket.Path {
+				report.Dimensions["duplicate-id"] = "fail"
+				report.Findings = append(report.Findings, CheckFinding{Code: "E_DUPLICATE_ID", Subject: ticket.Ticket.ID, Message: repoPath(s.root, prior) + " and " + repoPath(s.root, ticket.Path), Kind: "fail"})
+			} else {
+				seen[ticket.Ticket.ID] = ticket.Path
+			}
+		}
+	}
+	return nil
 }
 
 func isIntegrityError(err error) bool {
@@ -177,6 +215,12 @@ func isIntegrityError(err error) bool {
 
 func findingFromError(err error, subject string) CheckFinding {
 	return CheckFinding{Code: ErrorCode(err), Subject: subject, Message: err.Error(), Kind: "fail"}
+}
+
+func (s *Store) findingFromError(err error, subject string) CheckFinding {
+	finding := findingFromError(err, subject)
+	finding.Message = strings.ReplaceAll(finding.Message, s.root+string(os.PathSeparator), "")
+	return finding
 }
 
 // ErrorCode extracts the stable catalog prefix from errors returned across the

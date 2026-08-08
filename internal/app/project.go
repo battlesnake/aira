@@ -150,19 +150,35 @@ func Init(ctx context.Context, cwd string, args map[string]any) (InitResult, err
 	if err := os.MkdirAll(filepath.Join(root, ".aira", "tickets"), 0o755); err != nil {
 		return InitResult{}, err
 	}
-	if err := writeConfig(configPath, data); err != nil {
-		return InitResult{}, err
-	}
-	project, err := Discover(ctx, root)
+	common, err := gitValue(ctx, root, "--git-common-dir")
 	if err != nil {
-		return InitResult{}, err
+		return InitResult{}, errors.New("E_NOT_PROJECT: git common directory is unavailable")
 	}
+	common = absoluteGitPath(root, strings.TrimSpace(common))
+	gitDir, err := gitValue(ctx, root, "--git-dir")
+	if err != nil {
+		return InitResult{}, errors.New("E_NOT_PROJECT: worktree git directory is unavailable")
+	}
+	gitDir = absoluteGitPath(root, strings.TrimSpace(gitDir))
+	canonicalCommon, err := filepath.EvalSymlinks(common)
+	if err != nil {
+		canonicalCommon = common
+	}
+	canonicalGitDir, err := filepath.EvalSymlinks(gitDir)
+	if err != nil {
+		canonicalGitDir = gitDir
+	}
+	state := stateDir()
 	s, err := store.Open(ctx, store.Options{
-		Root: project.Root, CommonDir: project.CommonDir,
-		DBPath: filepath.Join(project.StateDir, "state.db"), RegistryPath: filepath.Join(project.StateDir, "registry.jsonl"),
-		ProjectID: project.ProjectID, WorktreeID: project.WorktreeID, ProjectSlug: slug, Prefixes: prefixes,
+		Root: root, CommonDir: common,
+		DBPath: filepath.Join(state, "state.db"), RegistryPath: filepath.Join(state, "registry.jsonl"),
+		ProjectID: hashID(canonicalCommon), WorktreeID: hashID(canonicalGitDir), ProjectSlug: slug, Prefixes: prefixes,
 	})
 	if err != nil {
+		return InitResult{}, err
+	}
+	if err := writeConfig(configPath, data); err != nil {
+		_ = s.Close()
 		return InitResult{}, err
 	}
 	if err := s.Close(); err != nil {

@@ -80,6 +80,11 @@ type AllocationReceipt struct {
 	State      string `json:"state"`
 }
 
+type EventKey struct {
+	ProjectID string `json:"project_id"`
+	Seq       int64  `json:"seq"`
+}
+
 type registryEntry struct {
 	ProjectID  string   `json:"project_id"`
 	CommonDir  string   `json:"common_dir"`
@@ -348,17 +353,22 @@ func (s *Store) AllocateID(ctx context.Context, prefix string) (string, error) {
 }
 
 func (s *Store) CreateTicket(ctx context.Context, input domain.CreateTicketInput) (domain.Ticket, error) {
+	ticket, _, err := s.CreateTicketWithEvent(ctx, input)
+	return ticket, err
+}
+
+func (s *Store) CreateTicketWithEvent(ctx context.Context, input domain.CreateTicketInput) (domain.Ticket, EventKey, error) {
 	intent, err := s.prepareCreate(ctx, input)
 	if err != nil {
-		return domain.Ticket{}, err
+		return domain.Ticket{}, EventKey{}, err
 	}
 	if err := s.appendReceiptIfMissing(intent.Receipt); err != nil {
-		return domain.Ticket{}, err
+		return domain.Ticket{}, EventKey{}, err
 	}
 	if err := s.materialiseIntent(ctx, intent); err != nil {
-		return domain.Ticket{}, err
+		return domain.Ticket{}, EventKey{}, err
 	}
-	return intent.Ticket, nil
+	return intent.Ticket, EventKey{ProjectID: intent.ProjectID, Seq: intent.Seq}, nil
 }
 
 func (s *Store) prepareCreate(ctx context.Context, input domain.CreateTicketInput) (Intent, error) {
@@ -466,43 +476,47 @@ func (s *Store) preparePathMutation(ctx context.Context, path, precondition stri
 }
 
 func (s *Store) UpdateTicket(ctx context.Context, id string, update func(domain.Ticket) (domain.Ticket, error)) error {
-	return s.UpdateTicketContent(ctx, id, func(ticket domain.Ticket, body string) (domain.Ticket, string, error) {
+	_, err := s.UpdateTicketContent(ctx, id, func(ticket domain.Ticket, body string) (domain.Ticket, string, error) {
 		updated, err := update(ticket)
 		return updated, body, err
 	})
+	return err
 }
 
 // UpdateTicketContent performs one optimistic frontmatter/body mutation and
 // keeps the existing SQLite → file → journal protocol intact.
-func (s *Store) UpdateTicketContent(ctx context.Context, id string, update func(domain.Ticket, string) (domain.Ticket, string, error)) error {
+func (s *Store) UpdateTicketContent(ctx context.Context, id string, update func(domain.Ticket, string) (domain.Ticket, string, error)) (EventKey, error) {
 	path := s.ticketPath(id)
-	data, err := os.ReadFile(path)
+	data, err := readRegularTicket(path)
 	if err != nil {
-		return err
+		return EventKey{}, err
 	}
 	ticket, body, err := domain.ParseTicket(data)
 	if err != nil {
-		return err
+		return EventKey{}, err
 	}
 	updated, body, err := update(ticket, body)
 	if err != nil {
-		return err
+		return EventKey{}, err
 	}
 	if updated.Status != ticket.Status {
 		if err := domain.ValidateTransition(ticket.Status, updated.Status); err != nil {
-			return err
+			return EventKey{}, err
 		}
 	}
 	newData, err := domain.RenderTicket(updated, body)
 	if err != nil {
-		return err
+		return EventKey{}, err
 	}
 	intent, err := s.preparePathMutation(ctx, path, digestBytes(data), newData, "ticket.update")
 	if err != nil {
-		return err
+		return EventKey{}, err
 	}
 	intent.Ticket = updated
-	return s.materialiseIntent(ctx, intent)
+	if err := s.materialiseIntent(ctx, intent); err != nil {
+		return EventKey{}, err
+	}
+	return EventKey{ProjectID: intent.ProjectID, Seq: intent.Seq}, nil
 }
 
 func (s *Store) materialiseIntent(ctx context.Context, intent Intent) error {
@@ -810,6 +824,9 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		if gitErr != nil {
 			return gitErr
 		}
+		if err := s.markWorktreeActive(ctx, entry, valid); err != nil {
+			return err
+		}
 		tickets, err := scanTickets(entry.Root, entry.WorktreeID)
 		if err != nil {
 			return err
@@ -936,6 +953,14 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (s *Store) markWorktreeActive(ctx context.Context, entry registryEntry, active bool) error {
+	if entry.WorktreeID == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE worktrees SET active=?, updated_at=? WHERE project_id=? AND worktree_id=?`, boolInt(active), time.Now().UTC().Format(time.RFC3339Nano), s.projectID, entry.WorktreeID)
+	return err
 }
 
 func receiptKey(project, id string, seq int64) string {
@@ -1631,7 +1656,7 @@ func scanTickets(root, worktreeID string) ([]scannedTicket, error) {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
-		data, err := os.ReadFile(path)
+		data, err := readRegularTicket(path)
 		if err != nil {
 			return nil, err
 		}

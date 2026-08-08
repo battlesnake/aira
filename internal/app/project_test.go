@@ -35,3 +35,24 @@ func TestInitCreatesRegisteredProjectAndRefusesOverwrite(t *testing.T) {
 		t.Fatalf("second init error = %v", err)
 	}
 }
+
+func TestInitPrefixConflictDoesNotLeaveConfigScaffold(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", state)
+	first := t.TempDir()
+	second := t.TempDir()
+	for _, root := range []string{first, second} {
+		if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := Init(context.Background(), first, map[string]any{"project": "first", "prefixes": "SHARED"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Init(context.Background(), second, map[string]any{"project": "second", "prefixes": "SHARED"}); !strings.Contains(err.Error(), "E_PREFIX_OWNERSHIP_CONFLICT") {
+		t.Fatalf("prefix conflict = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(second, ".aira", "config")); !os.IsNotExist(err) {
+		t.Fatalf("conflicting init left config: %v", err)
+	}
+}

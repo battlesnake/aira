@@ -10,6 +10,7 @@ import (
 
 	"aira/internal/app"
 	"aira/internal/core"
+	"aira/internal/store"
 )
 
 func main() { os.Exit(Run(os.Args[1:], os.Stdout, os.Stderr)) }
@@ -45,11 +46,16 @@ func Run(argv []string, stdout, stderr io.Writer) int {
 
 	request, err := buildRequest(verb, positional, options)
 	if err != nil {
-		return render(core.Response{Code: "E_SELECTOR_INVALID", Error: err.Error(), Exit: 2}, jsonOutput, stdout, stderr)
+		code := store.ErrorCode(err)
+		if code == "E_INTERNAL" {
+			code = "E_SELECTOR_INVALID"
+		}
+		return render(core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
 	}
 	s, _, err := app.Open(context.Background(), ".")
 	if err != nil {
-		return render(core.Response{Code: appErrorCode(err), Error: err.Error()}, jsonOutput, stdout, stderr)
+		code := appErrorCode(err)
+		return render(core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
 	}
 	defer s.Close()
 	dispatcher := core.New(s)
@@ -172,7 +178,7 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			return core.Request{}, fmt.Errorf("check accepts no positional arguments")
 		}
 	default:
-		return core.Request{}, fmt.Errorf("unknown verb %q", verb)
+		return core.Request{}, fmt.Errorf("E_UNKNOWN_VERB: unknown verb %q", verb)
 	}
 	return core.Request{Verb: verb, Args: args}, nil
 }
@@ -215,23 +221,9 @@ func renderHuman(response core.Response, out io.Writer) {
 }
 
 func appErrorCode(err error) string {
-	message := err.Error()
-	if idx := strings.IndexByte(message, ':'); idx >= 0 {
-		message = message[:idx]
-	}
-	if strings.HasPrefix(message, "E_") {
-		return message
-	}
-	return "E_INTERNAL"
+	return store.ErrorCode(err)
 }
 
 func exitForError(code string) int {
-	switch code {
-	case "E_CONFIG_MISSING", "E_CONFIG_INVALID", "E_NOT_PROJECT", "E_SELECTOR_INVALID", "E_NOT_FOUND", "E_SELECTOR_AMBIGUOUS":
-		return 2
-	case "E_DB_BUSY", "E_DB_CORRUPT", "E_RECONCILE_REQUIRED", "E_INTERNAL", "E_JOURNAL_CORRUPT":
-		return 4
-	default:
-		return 1
-	}
+	return store.ExitForCode(code)
 }

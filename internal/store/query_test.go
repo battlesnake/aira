@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -36,7 +38,7 @@ func TestGetAndFindUsePhaseOneSelectors(t *testing.T) {
 		t.Fatalf("anchor lookup = %#v, %v", anchor, err)
 	}
 
-	rows, err := s.Find(`kind:bug severity:P1 hold:true`)
+	rows, err := s.Find(`kind:bug severity:P1`)
 	if err != nil || len(rows) != 1 || rows[0].Ticket.ID != second.ID {
 		t.Fatalf("field query = %#v, %v", rows, err)
 	}
@@ -46,6 +48,15 @@ func TestGetAndFindUsePhaseOneSelectors(t *testing.T) {
 	}
 	if _, err := s.Find("status:"); codeOf(err) != "E_SELECTOR_INVALID" {
 		t.Fatalf("invalid query code = %q, err=%v", codeOf(err), err)
+	}
+	if _, err := s.Find(`kind=bug`); codeOf(err) != "E_SELECTOR_INVALID" {
+		t.Fatalf("equals query code = %q, err=%v", codeOf(err), err)
+	}
+	if _, err := s.Find(`hold:true`); codeOf(err) != "E_SELECTOR_INVALID" {
+		t.Fatalf("hold query code = %q, err=%v", codeOf(err), err)
+	}
+	if _, err := s.Find(`text:queue`); codeOf(err) != "E_SELECTOR_INVALID" {
+		t.Fatalf("unquoted text query code = %q, err=%v", codeOf(err), err)
 	}
 }
 
@@ -59,8 +70,84 @@ func TestSingularSelectorsRefuseZeroAndMultipleMatches(t *testing.T) {
 	if _, err := s.Get("AIRA-999"); codeOf(err) != "E_NOT_FOUND" {
 		t.Fatalf("missing selector code = %q, err=%v", codeOf(err), err)
 	}
-	if _, err := s.Get(`kind:feature`); codeOf(err) != "E_SELECTOR_AMBIGUOUS" {
-		t.Fatalf("ambiguous selector code = %q, err=%v", codeOf(err), err)
+	for _, selector := range []string{"kind:feature", ""} {
+		if _, err := s.Get(selector); codeOf(err) != "E_SELECTOR_INVALID" {
+			t.Fatalf("singular selector %q code = %q, err=%v", selector, codeOf(err), err)
+		}
+	}
+}
+
+func TestAnchorReadUsesCurrentFileWithoutIndex(t *testing.T) {
+	s := queryTestStore(t)
+	ticket := domain.Ticket{Schema: 1, ID: "AIRA-77", Project: "query-project", Title: "hand edited", Status: domain.StatusPlanned, Kind: domain.KindFeature, Severity: domain.SeverityP2}
+	data, err := domain.RenderTicket(ticket, "from file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(s.root, ".aira", "tickets", "AIRA-77.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(".aira/tickets/AIRA-77.md")
+	if err != nil || got.Ticket.ID != "AIRA-77" || got.Body != "from file\n" {
+		t.Fatalf("unindexed anchor = %#v, %v", got, err)
+	}
+}
+
+func TestReadSurfacesStaleIndexWarningFromCurrentFile(t *testing.T) {
+	s := queryTestStore(t)
+	ticket, err := s.CreateTicket(context.Background(), testCreateInput("indexed", "original"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(s.root, ".aira", "tickets", ticket.ID+".md")
+	updated := ticket
+	updated.Title = "hand edited"
+	data, err := domain.RenderTicket(updated, "changed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(ticket.ID)
+	if err != nil || len(got.Warnings) != 1 || got.Warnings[0] != "W_STALE_INDEX" || got.Ticket.Title != "hand edited" {
+		t.Fatalf("stale read = %#v, %v", got, err)
+	}
+}
+
+func TestRecordsRefuseSymlinkedTicketAndUseCanonicalIDOrder(t *testing.T) {
+	s := queryTestStore(t)
+	for _, id := range []string{"AIRA-10", "AIRA-2", "AIRA-1"} {
+		ticket := domain.Ticket{Schema: 1, ID: id, Project: "query-project", Title: id, Status: domain.StatusPlanned, Kind: domain.KindFeature, Severity: domain.SeverityP2}
+		data, err := domain.RenderTicket(ticket, "body")
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(s.root, ".aira", "tickets", id+".md")
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := s.List("")
+	if err != nil || len(rows) != 3 || rows[0].Ticket.ID != "AIRA-1" || rows[1].Ticket.ID != "AIRA-2" || rows[2].Ticket.ID != "AIRA-10" {
+		t.Fatalf("canonical rows = %#v, %v", rows, err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside.md")
+	if err := os.WriteFile(outside, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(s.root, ".aira", "tickets", "AIRA-99.md")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.List(""); codeOf(err) != "E_CONFIG_INVALID" {
+		t.Fatalf("symlink list code = %q, err=%v", codeOf(err), err)
 	}
 }
 
@@ -87,7 +174,7 @@ func codeOf(err error) string {
 	if err == nil {
 		return ""
 	}
-	for _, code := range []string{"E_NOT_FOUND", "E_SELECTOR_INVALID", "E_SELECTOR_AMBIGUOUS"} {
+	for _, code := range []string{"E_NOT_FOUND", "E_SELECTOR_INVALID", "E_SELECTOR_AMBIGUOUS", "E_CONFIG_INVALID"} {
 		if strings.Contains(err.Error(), code) {
 			return code
 		}

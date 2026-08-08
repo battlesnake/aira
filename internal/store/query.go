@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +27,7 @@ type TicketRecord struct {
 	Path       string        `json:"path"`
 	WorktreeID string        `json:"worktree_id"`
 	Digest     string        `json:"digest,omitempty"`
+	Warnings   []string      `json:"-"`
 }
 
 type selector struct {
@@ -41,8 +43,6 @@ type queryTerm struct {
 }
 
 // ParseSelector implements the Phase-1 exact selector and plural query grammar.
-// Both ':' (the design grammar) and '=' (the CLI's field=value spelling) are
-// accepted for field terms.
 func ParseSelector(raw string) (string, error) {
 	sel, err := parseSelector(raw)
 	if err != nil {
@@ -95,17 +95,18 @@ func parseTerms(raw string) ([]queryTerm, error) {
 			break
 		}
 		start := pos
-		for pos < len(raw) && raw[pos] != ' ' && raw[pos] != ':' && raw[pos] != '=' {
+		for pos < len(raw) && raw[pos] != ' ' && raw[pos] != ':' {
 			pos++
 		}
 		if pos == start {
 			return nil, errors.New("missing query field")
 		}
 		field := strings.ToLower(raw[start:pos])
-		if pos >= len(raw) || (raw[pos] != ':' && raw[pos] != '=') {
-			return nil, errors.New("query term requires ':' or '='")
+		if pos >= len(raw) || raw[pos] != ':' {
+			return nil, errors.New("query term requires ':'")
 		}
 		pos++
+		quotedText := field == "text" && pos < len(raw) && raw[pos] == '"'
 		value, next, err := queryValue(raw, pos)
 		if err != nil {
 			return nil, err
@@ -115,6 +116,9 @@ func parseTerms(raw string) ([]queryTerm, error) {
 			return nil, errors.New("query value is empty")
 		}
 		if field == "text" {
+			if !quotedText {
+				return nil, errors.New("text query value must be quoted")
+			}
 			terms = append(terms, queryTerm{Field: "text", Value: value, Text: true})
 			continue
 		}
@@ -175,32 +179,27 @@ func queryValue(raw string, pos int) (string, int, error) {
 
 func validQueryField(field string) bool {
 	switch field {
-	case "id", "status", "kind", "severity", "assignee", "milestone", "label", "project", "hold":
+	case "id", "status", "kind", "severity", "assignee", "milestone", "label", "project":
 		return true
 	default:
 		return false
 	}
 }
 
-// Get resolves one exact selector. Query-shaped selectors are accepted for
-// compatibility with the CLI, but cardinality is always checked explicitly.
+// Get resolves only an exact ID or exact file anchor. Plural query grammar is
+// deliberately not accepted by singular commands.
 func (s *Store) Get(selector string) (TicketRecord, error) {
+	if strings.TrimSpace(selector) == "" {
+		return TicketRecord{}, errors.New("E_SELECTOR_INVALID: singular selector is empty")
+	}
 	sel, err := parseSelector(selector)
 	if err != nil {
 		return TicketRecord{}, err
 	}
-	if sel.ExactID != "" {
-		rows, err := s.records(selectorFilter{ID: sel.ExactID, Path: sel.ExactPath})
-		if err != nil {
-			return TicketRecord{}, err
-		}
-		return singular(rows)
+	if sel.ExactID == "" {
+		return TicketRecord{}, errors.New("E_SELECTOR_INVALID: singular selector must be an exact ID or file anchor")
 	}
-	rows, err := s.records(selectorFilter{Terms: sel.Terms})
-	if err != nil {
-		return TicketRecord{}, err
-	}
-	return singular(rows)
+	return s.exactRecord(sel.ExactID, sel.ExactPath)
 }
 
 // List returns all current-worktree matches. It does not apply the output cap;
@@ -210,8 +209,14 @@ func (s *Store) List(selector string) ([]TicketRecord, error) {
 	if err != nil {
 		return nil, err
 	}
-	filter := selectorFilter{ID: sel.ExactID, Path: sel.ExactPath, Terms: sel.Terms}
-	return s.records(filter)
+	if sel.ExactID != "" {
+		record, err := s.exactRecord(sel.ExactID, sel.ExactPath)
+		if err != nil {
+			return nil, err
+		}
+		return []TicketRecord{record}, nil
+	}
+	return s.records(selectorFilter{Terms: sel.Terms})
 }
 
 func (s *Store) Find(selector string) ([]TicketRecord, error) { return s.List(selector) }
@@ -223,74 +228,100 @@ type selectorFilter struct {
 }
 
 func (s *Store) records(filter selectorFilter) ([]TicketRecord, error) {
-	query := `SELECT id, path, digest, status, hold, title, kind, severity FROM tickets WHERE project_id=? AND worktree_id=?`
-	args := []any{s.projectID, s.worktreeID}
-	if filter.ID != "" {
-		query += ` AND id=?`
-		args = append(args, filter.ID)
-	}
-	if filter.Path != "" {
-		query += ` AND path=?`
-		args = append(args, filepath.Join(s.root, filepath.FromSlash(filter.Path)))
-	}
-	for _, term := range filter.Terms {
-		switch term.Field {
-		case "id", "status", "kind", "severity":
-			query += ` AND ` + term.Field + `=?`
-			args = append(args, term.Value)
-		case "hold":
-			value, err := strconv.ParseBool(strings.ToLower(term.Value))
-			if err != nil {
-				return nil, errors.New("E_SELECTOR_INVALID: hold must be true or false")
-			}
-			query += ` AND hold=?`
-			args = append(args, boolInt(value))
-		case "assignee", "milestone":
-			// These fields are not in the index table yet; filter after parsing.
-		case "label", "project", "text":
-			// Filter after parsing to keep the index schema intentionally small.
-		}
-	}
-	query += ` ORDER BY id`
-	rows, err := s.db.Query(query, args...)
+	indexed, err := s.indexedDigests()
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var result []TicketRecord
-	for rows.Next() {
-		var record TicketRecord
-		var hold int
-		if err := rows.Scan(&record.Ticket.ID, &record.Path, &record.Digest, &record.Ticket.Status, &hold,
-			&record.Ticket.Title, &record.Ticket.Kind, &record.Ticket.Severity); err != nil {
-			return nil, err
-		}
-		record.Ticket.Schema = 1
-		record.Ticket.Project = s.projectSlug
-		record.Ticket.Hold = hold != 0
-		record.WorktreeID = s.worktreeID
-		data, err := os.ReadFile(record.Path)
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, errors.New("E_RECONCILE_REQUIRED: indexed ticket file is missing")
-		}
+	tickets, err := scanTickets(s.root, s.worktreeID)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]TicketRecord, 0, len(tickets))
+	for _, scanned := range tickets {
+		data, err := readRegularTicket(scanned.Path)
 		if err != nil {
 			return nil, err
 		}
-		parsed, body, err := domain.ParseTicket(data)
+		_, body, err := domain.ParseTicket(data)
 		if err != nil {
 			return nil, err
 		}
-		record.Ticket = parsed
-		record.Body = body
-		record.Digest = digestBytes(data)
+		record := TicketRecord{Ticket: scanned.Ticket, Body: body, Path: repoPath(s.root, scanned.Path), WorktreeID: s.worktreeID, Digest: scanned.Digest}
+		if indexedDigest, ok := indexed[scanned.Ticket.ID]; ok && indexedDigest != scanned.Digest {
+			record.Warnings = []string{"W_STALE_INDEX"}
+		}
 		if matchesTerms(record, filter.Terms) {
 			result = append(result, record)
 		}
 	}
-	if err := rows.Err(); err != nil {
+	sortRecords(result)
+	return result, nil
+}
+
+func (s *Store) exactRecord(id, anchor string) (TicketRecord, error) {
+	path := filepath.Join(s.root, ".aira", "tickets", id+".md")
+	if anchor != "" {
+		path = filepath.Join(s.root, filepath.FromSlash(anchor))
+	}
+	data, err := readRegularTicket(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return TicketRecord{}, errors.New("E_NOT_FOUND: selector matched no tickets")
+	}
+	if err != nil {
+		return TicketRecord{}, err
+	}
+	ticket, body, err := domain.ParseTicket(data)
+	if err != nil {
+		return TicketRecord{}, err
+	}
+	if ticket.ID != id || filepath.Base(path) != id+".md" {
+		return TicketRecord{}, fmt.Errorf("E_CONFIG_INVALID: filename/frontmatter mismatch %s", path)
+	}
+	record := TicketRecord{Ticket: ticket, Body: body, Path: repoPath(s.root, path), WorktreeID: s.worktreeID, Digest: digestBytes(data)}
+	var indexedDigest string
+	err = s.db.QueryRow(`SELECT digest FROM tickets WHERE project_id=? AND worktree_id=? AND id=?`, s.projectID, s.worktreeID, id).Scan(&indexedDigest)
+	if err == nil && indexedDigest != record.Digest {
+		record.Warnings = []string{"W_STALE_INDEX"}
+	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return TicketRecord{}, err
+	}
+	return record, nil
+}
+
+func (s *Store) indexedDigests() (map[string]string, error) {
+	rows, err := s.db.Query(`SELECT id, digest FROM tickets WHERE project_id=? AND worktree_id=?`, s.projectID, s.worktreeID)
+	if err != nil {
 		return nil, err
 	}
-	return result, nil
+	defer rows.Close()
+	result := map[string]string{}
+	for rows.Next() {
+		var id, digest string
+		if err := rows.Scan(&id, &digest); err != nil {
+			return nil, err
+		}
+		result[id] = digest
+	}
+	return result, rows.Err()
+}
+
+func repoPath(root, path string) string {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return filepath.ToSlash(path)
+	}
+	return filepath.ToSlash(rel)
+}
+
+func readRegularTicket(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("E_CONFIG_INVALID: ticket path is not a regular file: %s", path)
+	}
+	return os.ReadFile(path)
 }
 
 func matchesTerms(record TicketRecord, terms []queryTerm) bool {
@@ -352,6 +383,13 @@ func (s *Store) Count(selector, by string) (CountResult, error) {
 	if !validDistributionField(by) {
 		return CountResult{}, fmt.Errorf("E_SELECTOR_INVALID: unsupported distribution field %q", by)
 	}
+	sel, err := parseSelector(selector)
+	if err != nil {
+		return CountResult{}, err
+	}
+	if canAggregateCount(sel, by) {
+		return s.aggregateCount(sel, by)
+	}
 	rows, err := s.List(selector)
 	if err != nil {
 		return CountResult{}, err
@@ -363,6 +401,68 @@ func (s *Store) Count(selector, by string) (CountResult, error) {
 		}
 	}
 	return result, nil
+}
+
+func canAggregateCount(sel selector, by string) bool {
+	if by != "status" && by != "kind" && by != "severity" && by != "hold" {
+		return false
+	}
+	if sel.ExactPath != "" {
+		return false
+	}
+	for _, term := range sel.Terms {
+		switch term.Field {
+		case "id", "status", "kind", "severity":
+		case "hold":
+			return false
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Store) aggregateCount(sel selector, by string) (CountResult, error) {
+	column := by
+	selectColumn := column
+	if by == "hold" {
+		selectColumn = "hold"
+	}
+	query := "SELECT " + selectColumn + ", COUNT(*) FROM tickets WHERE project_id=? AND worktree_id=?"
+	args := []any{s.projectID, s.worktreeID}
+	if sel.ExactID != "" {
+		query += " AND id=?"
+		args = append(args, sel.ExactID)
+	}
+	for _, term := range sel.Terms {
+		if term.Field == "id" || term.Field == "status" || term.Field == "kind" || term.Field == "severity" {
+			query += " AND " + term.Field + "=?"
+			args = append(args, term.Value)
+		}
+	}
+	query += " GROUP BY " + selectColumn
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return CountResult{}, err
+	}
+	defer rows.Close()
+	result := CountResult{By: by, Distribution: map[string]int{}}
+	for rows.Next() {
+		var value string
+		var count int
+		if by == "hold" {
+			var hold int
+			if err := rows.Scan(&hold, &count); err != nil {
+				return CountResult{}, err
+			}
+			value = strconv.FormatBool(hold != 0)
+		} else if err := rows.Scan(&value, &count); err != nil {
+			return CountResult{}, err
+		}
+		result.Distribution[value] = count
+		result.Total += count
+	}
+	return result, rows.Err()
 }
 
 func validDistributionField(field string) bool {
@@ -407,5 +507,12 @@ func distributionValues(row TicketRecord, by string) []string {
 }
 
 func sortRecords(records []TicketRecord) {
-	sort.SliceStable(records, func(i, j int) bool { return records[i].Ticket.ID < records[j].Ticket.ID })
+	sort.SliceStable(records, func(i, j int) bool {
+		leftPrefix, leftNumber := splitTicketID(records[i].Ticket.ID)
+		rightPrefix, rightNumber := splitTicketID(records[j].Ticket.ID)
+		if leftPrefix != rightPrefix {
+			return leftPrefix < rightPrefix
+		}
+		return leftNumber < rightNumber
+	})
 }

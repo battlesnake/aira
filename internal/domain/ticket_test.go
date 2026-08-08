@@ -54,3 +54,18 @@ func TestStatusTransitionGraph(t *testing.T) {
 		t.Fatal("backward transition unexpectedly allowed")
 	}
 }
+
+func TestRenderTicketDeduplicatesSortedLabels(t *testing.T) {
+	ticket := Ticket{Schema: 1, ID: "AIRA-1", Project: "aira", Title: "labels", Status: StatusPlanned, Kind: KindFeature, Severity: SeverityP2, Labels: []string{"z", "a", "z", "a"}}
+	data, err := RenderTicket(ticket, "body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, _, err := ParseTicket(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Labels) != 2 || parsed.Labels[0] != "a" || parsed.Labels[1] != "z" {
+		t.Fatalf("labels = %#v", parsed.Labels)
+	}
+}

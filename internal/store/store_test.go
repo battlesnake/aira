@@ -515,6 +515,13 @@ func TestRebuildSkipsStaleRegistryWorktree(t *testing.T) {
 	if err := s.Rebuild(context.Background()); err != nil {
 		t.Fatalf("rebuild with stale registry worktree: %v", err)
 	}
+	var active int
+	if err := s.db.QueryRow(`SELECT active FROM worktrees WHERE project_id=? AND worktree_id=?`, s.projectID, "removed").Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 0 {
+		t.Fatalf("stale worktree active=%d, want inactive", active)
+	}
 	id, err := s.AllocateID(context.Background(), "AIRA")
 	if err != nil {
 		t.Fatal(err)
@@ -1092,6 +1099,18 @@ func TestReconcileContinuesAfterConflictAndRecordsFinding(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("finding count = %d, want 1", count)
+	}
+	if err := os.WriteFile(first.Path, first.Intended, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	report, err := s.Check(context.Background())
+	if err != nil {
+		t.Fatalf("check after conflict resolution: %v", err)
+	}
+	for _, finding := range report.Findings {
+		if finding.Code == "E_WRITE_CONFLICT" {
+			t.Fatalf("resolved conflict remained current: %#v", report)
+		}
 	}
 }
 

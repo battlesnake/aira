@@ -29,8 +29,26 @@ type Response struct {
 
 type Initializer func(context.Context, map[string]any) (any, error)
 
+type Store interface {
+	AllocateID(context.Context, string) (string, error)
+	CreateTicketWithEvent(context.Context, domain.CreateTicketInput) (domain.Ticket, store.EventKey, error)
+	Get(string) (store.TicketRecord, error)
+	List(string) ([]store.TicketRecord, error)
+	Count(string, string) (store.CountResult, error)
+	SetTicket(context.Context, string, string, string) (store.EventKey, error)
+	MoveTicket(context.Context, string, domain.Status) (store.EventKey, error)
+	Reconcile(context.Context) error
+	Rebuild(context.Context) error
+	Check(context.Context) (store.CheckReport, error)
+}
+
+type handlerData struct {
+	Data     any
+	Warnings []string
+}
+
 type Core struct {
-	store       *store.Store
+	store       Store
 	initializer Initializer
 	verbs       map[string]verbSpec
 }
@@ -43,13 +61,13 @@ type verbSpec struct {
 
 const ListLimit = store.ListLimit
 
-func New(s *store.Store) *Core {
+func New(s Store) *Core {
 	c := &Core{store: s}
 	c.verbs = c.dispatchTable()
 	return c
 }
 
-func NewWithInitializer(s *store.Store, initializer Initializer) *Core {
+func NewWithInitializer(s Store, initializer Initializer) *Core {
 	c := New(s)
 	c.initializer = initializer
 	return c
@@ -69,17 +87,22 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 	}
 	spec, ok := c.verbs[verb]
 	if !ok {
-		return Response{Code: "E_SELECTOR_INVALID", Error: fmt.Sprintf("unknown verb %q", req.Verb)}
+		code := "E_UNKNOWN_VERB"
+		return Response{Code: code, Error: fmt.Sprintf("unknown verb %q", req.Verb), Exit: store.ExitForCode(code)}
 	}
 	data, err := spec.Run(ctx, req.Args)
 	if err != nil {
 		code := store.ErrorCode(err)
 		return Response{Code: code, Error: err.Error(), Exit: errorExit(code)}
 	}
-	if report, ok := data.(store.CheckReport); ok {
-		return Response{OK: true, Code: strings.ToUpper(report.Verdict), Data: report, Exit: exitCode(report)}
+	warnings := []string(nil)
+	if wrapped, ok := data.(handlerData); ok {
+		data, warnings = wrapped.Data, wrapped.Warnings
 	}
-	return Response{OK: true, Code: "OK", Data: data}
+	if report, ok := data.(store.CheckReport); ok {
+		return Response{OK: true, Code: strings.ToUpper(report.Verdict), Data: report, Warnings: warnings, Exit: exitCode(report)}
+	}
+	return Response{OK: true, Code: "OK", Data: data, Warnings: warnings}
 }
 
 func (c *Core) dispatchTable() map[string]verbSpec {
@@ -98,18 +121,23 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 		}},
 		"create": {Name: "create", Usage: "create <title> [--kind K --severity S --label L --body B]", Run: func(ctx context.Context, args map[string]any) (any, error) {
 			input := domain.CreateTicketInput{Title: stringArg(args, "title"), Body: stringArg(args, "body"), Kind: domain.Kind(stringArg(args, "kind")), Severity: domain.Severity(stringArg(args, "severity")), Labels: stringSlice(args, "labels")}
-			ticket, err := c.store.CreateTicket(ctx, input)
+			ticket, event, err := c.store.CreateTicketWithEvent(ctx, input)
 			if err != nil {
 				return nil, err
 			}
-			return map[string]any{"id": ticket.ID, "path": ".aira/tickets/" + ticket.ID + ".md", "ticket": ticket}, nil
+			return mutationData(map[string]any{"id": ticket.ID, "path": ".aira/tickets/" + ticket.ID + ".md", "ticket": ticket}, event), nil
 		}},
 		"show": {Name: "show", Usage: "show <selector>", Run: func(_ context.Context, args map[string]any) (any, error) {
 			record, err := c.store.Get(stringArg(args, "selector"))
 			if err != nil {
 				return nil, err
 			}
-			return projectRecord(record, stringSlice(args, "fields")), nil
+			fields := stringSlice(args, "fields")
+			projected := projectRecord(record, fields)
+			if len(fields) == 0 {
+				projected["body"] = record.Body
+			}
+			return handlerData{Data: projected, Warnings: record.Warnings}, nil
 		}},
 		"list": {Name: "list", Usage: "list [query] [--by F] [--fields F,...]", Run: func(_ context.Context, args map[string]any) (any, error) {
 			rows, err := c.store.List(stringArg(args, "query"))
@@ -126,7 +154,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				data["distribution"] = distribution(rows, by)
 				data["truncated"] = true
 			}
-			return data, nil
+			return handlerData{Data: data, Warnings: recordWarnings(rows)}, nil
 		}},
 		"count": {Name: "count", Usage: "count [query] --by F", Run: func(ctx context.Context, args map[string]any) (any, error) {
 			return c.store.Count(stringArg(args, "query"), stringArg(args, "by"))
@@ -140,31 +168,35 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			if field == "" {
 				return nil, fmt.Errorf("E_SELECTOR_INVALID: set requires field=value")
 			}
-			if err := c.store.SetTicket(ctx, record.Ticket.ID, field, value); err != nil {
+			event, err := c.store.SetTicket(ctx, record.Ticket.ID, field, value)
+			if err != nil {
 				return nil, err
 			}
 			updated, err := c.store.Get(record.Ticket.ID)
 			if err != nil {
 				return nil, err
 			}
-			return projectRecord(updated, nil), nil
+			return mutationData(projectRecord(updated, nil), event), nil
 		}},
 		"mv": {Name: "mv", Usage: "mv <selector> <status>", Run: func(ctx context.Context, args map[string]any) (any, error) {
 			record, err := c.store.Get(stringArg(args, "selector"))
 			if err != nil {
 				return nil, err
 			}
-			if err := c.store.MoveTicket(ctx, record.Ticket.ID, domain.Status(stringArg(args, "status"))); err != nil {
+			event, err := c.store.MoveTicket(ctx, record.Ticket.ID, domain.Status(stringArg(args, "status")))
+			if err != nil {
 				return nil, err
 			}
-			return map[string]any{"id": record.Ticket.ID, "status": stringArg(args, "status")}, nil
+			return mutationData(map[string]any{"id": record.Ticket.ID, "status": stringArg(args, "status")}, event), nil
 		}},
 		"reconcile": {Name: "reconcile", Usage: "reconcile [--rebuild]", Run: func(ctx context.Context, args map[string]any) (any, error) {
 			if err := c.store.Reconcile(ctx); err != nil {
 				return nil, err
 			}
-			if err := c.store.Rebuild(ctx); err != nil {
-				return nil, err
+			if boolArg(args, "rebuild") {
+				if err := c.store.Rebuild(ctx); err != nil {
+					return nil, err
+				}
 			}
 			return map[string]any{"reconciled": true}, nil
 		}},
@@ -197,6 +229,9 @@ func boolArg(args map[string]any, key string) bool {
 }
 
 func stringSlice(args map[string]any, key string) []string {
+	if args == nil {
+		return nil
+	}
 	value := args[key]
 	switch values := value.(type) {
 	case []string:
@@ -236,6 +271,7 @@ func projectRecord(record store.TicketRecord, fields []string) map[string]any {
 		"hold": record.Ticket.Hold, "relations": record.Ticket.Relations, "body": record.Body, "path": record.Path,
 	}
 	if len(fields) == 0 {
+		delete(all, "body")
 		return all
 	}
 	result := make(map[string]any, len(fields))
@@ -302,12 +338,26 @@ func exitCode(report store.CheckReport) int {
 }
 
 func errorExit(code string) int {
-	switch code {
-	case "E_CONFIG_MISSING", "E_CONFIG_INVALID", "E_NOT_PROJECT", "E_SELECTOR_INVALID", "E_NOT_FOUND", "E_SELECTOR_AMBIGUOUS":
-		return 2
-	case "E_DB_BUSY", "E_DB_CORRUPT", "E_RECONCILE_REQUIRED", "E_INTERNAL", "E_JOURNAL_CORRUPT":
-		return 4
-	default:
-		return 1
+	return store.ExitForCode(code)
+}
+
+func mutationData(data map[string]any, event store.EventKey) map[string]any {
+	data["project_id"] = event.ProjectID
+	data["seq"] = event.Seq
+	data["event"] = event
+	return data
+}
+
+func recordWarnings(records []store.TicketRecord) []string {
+	seen := map[string]bool{}
+	var result []string
+	for _, record := range records {
+		for _, warning := range record.Warnings {
+			if !seen[warning] {
+				seen[warning] = true
+				result = append(result, warning)
+			}
+		}
 	}
+	return result
 }

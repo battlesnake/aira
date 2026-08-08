@@ -177,11 +177,7 @@ func validRelation(k RelationKind) bool {
 
 func RenderTicket(ticket Ticket, body string) ([]byte, error) {
 	ticket.Schema = 1
-	ticket.Labels = append([]string(nil), ticket.Labels...)
-	if ticket.Labels == nil {
-		ticket.Labels = []string{}
-	}
-	sort.Strings(ticket.Labels)
+	ticket.Labels = uniqueSortedLabels(ticket.Labels)
 	ticket.Relations = append([]Relation(nil), ticket.Relations...)
 	if ticket.Relations == nil {
 		ticket.Relations = []Relation{}
@@ -210,6 +206,21 @@ func RenderTicket(ticket Ticket, body string) ([]byte, error) {
 		return nil, err
 	}
 	return bytes.Join([][]byte{[]byte("---\n"), header, []byte("\n---\n"), []byte(body)}, nil), nil
+}
+
+func uniqueSortedLabels(labels []string) []string {
+	if len(labels) == 0 {
+		return []string{}
+	}
+	copyLabels := append([]string(nil), labels...)
+	sort.Strings(copyLabels)
+	result := copyLabels[:0]
+	for _, label := range copyLabels {
+		if len(result) == 0 || result[len(result)-1] != label {
+			result = append(result, label)
+		}
+	}
+	return result
 }
 
 func ParseTicket(data []byte) (Ticket, string, error) {

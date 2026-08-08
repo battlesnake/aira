@@ -4,6 +4,8 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+
+	"aira/internal/store"
 )
 
 func TestCheckExitCodesForPassFailUnevaluatedAndStoreError(t *testing.T) {
@@ -14,6 +16,11 @@ func TestCheckExitCodesForPassFailUnevaluatedAndStoreError(t *testing.T) {
 	pass := New(passStore).Do(context.Background(), Request{Verb: "check"})
 	if pass.Code != "PASS" || pass.Exit != 0 {
 		t.Fatalf("pass check = %#v", pass)
+	}
+	var passReport store.CheckReport
+	marshalRoundTrip(t, pass.Data, &passReport)
+	if passReport.Dimensions["relation-integrity"] != "unevaluated" {
+		t.Fatalf("relation dimension = %#v", passReport.Dimensions)
 	}
 
 	failStore := coreTestStore(t)
@@ -30,8 +37,13 @@ func TestCheckExitCodesForPassFailUnevaluatedAndStoreError(t *testing.T) {
 		t.Fatal(err)
 	}
 	unevaluated := New(orphanStore).Do(context.Background(), Request{Verb: "check"})
-	if unevaluated.Code != "UNEVALUATED" || unevaluated.Exit != 3 {
-		t.Fatalf("unevaluated check = %#v", unevaluated)
+	if unevaluated.Code != "PASS" || unevaluated.Exit != 0 {
+		t.Fatalf("orphan check = %#v", unevaluated)
+	}
+	var orphanReport store.CheckReport
+	marshalRoundTrip(t, unevaluated.Data, &orphanReport)
+	if len(orphanReport.Warnings) != 1 || orphanReport.Warnings[0].Code != "W_ORPHAN_WORKTREE" {
+		t.Fatalf("orphan warning = %#v", orphanReport.Warnings)
 	}
 
 	errorStore := coreTestStore(t)

@@ -11,11 +11,11 @@ import (
 
 // SetTicket applies the CLI's field=value mutation vocabulary. The selector
 // is resolved by the caller so this method only accepts an exact ticket ID.
-func (s *Store) SetTicket(ctx context.Context, id, field, value string) error {
+func (s *Store) SetTicket(ctx context.Context, id, field, value string) (EventKey, error) {
 	field = strings.ToLower(strings.TrimSpace(field))
 	value = strings.TrimSpace(value)
 	if value == "" && field != "body" && field != "title" {
-		return errors.New("E_CONFIG_INVALID: empty set value")
+		return EventKey{}, errors.New("E_CONFIG_INVALID: empty set value")
 	}
 	return s.UpdateTicketContent(ctx, id, func(ticket domain.Ticket, body string) (domain.Ticket, string, error) {
 		switch field {
@@ -55,12 +55,12 @@ func (s *Store) SetTicket(ctx context.Context, id, field, value string) error {
 	})
 }
 
-func (s *Store) MoveTicket(ctx context.Context, id string, status domain.Status) error {
-	return s.UpdateTicket(ctx, id, func(ticket domain.Ticket) (domain.Ticket, error) {
+func (s *Store) MoveTicket(ctx context.Context, id string, status domain.Status) (EventKey, error) {
+	return s.UpdateTicketContent(ctx, id, func(ticket domain.Ticket, body string) (domain.Ticket, string, error) {
 		if err := domain.ValidateTransition(ticket.Status, status); err != nil {
-			return domain.Ticket{}, err
+			return domain.Ticket{}, "", err
 		}
 		ticket.Status = status
-		return ticket, nil
+		return ticket, body, nil
 	})
 }
