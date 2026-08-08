@@ -82,7 +82,7 @@ Run **output blobs** (§14): machine-local gitignored files, capped + zstd-compr
 
 ### 5.4 Remote-ready seam (design now, build local)
 
-`core.Do(req) → resp` speaks serializable JSON (same protocol in-process / Unix socket / TCP+auth, byte-identical interface, no local-store assumptions); `Store` is an interface (local SQLite / remote RPC). `seq` is **per-machine**; across machines they interleave (fine — say so). Reconciliation is in-process in Phase 1; a client/server reconcile protocol is an open question (§21), not a v1 commitment.
+`core.Do(req) → resp` speaks serializable JSON (same protocol in-process / Unix socket / TCP+auth, byte-identical interface, no local-store assumptions); `Store` is an interface (local SQLite / remote RPC). `seq` is **per-project** in Phase 1, keyed as `(project_id, seq)`; cross-project ordering is deliberately not promised. Across machines, project streams may interleave. Reconciliation is in-process in Phase 1; a client/server reconcile protocol is an open question (§21), not a v1 commitment.
 
 ## 6. Data model
 
@@ -99,7 +99,7 @@ Closed, small enums (overloaded string fields caused real an earlier project bug
 - **ComputeEvent / QuotaSnapshot** — §12. *Operational telemetry.*
 - **TestReport** (+ per-test results) — `{id, ticket?, phase?, commit, branch, worktree-id, agent/session, at, run-ref?, suite-id, runner/config/env-digest, shard, retry-index, parser-complete(bool), coverage?, results:[{name, outcome(pass|fail|skip|error), duration, message?}]}`. The identity fields (suite/config/shard/retry/parser-complete) are what make flakiness and ratchet comparisons *valid* — same-test-same-commit differing under different config is concurrency-sensitivity, not flakiness; a passed *retry* is not a first-pass. *Operational telemetry (a pinned ratchet baseline is promoted to audit, §5.3).*
 - **Run** — `{id, ticket?, phase?, label, argv, prefix, cwd, env-digest, tool?, merge_streams, buffering(none|realtime|pty), status(running|exited|killed|oom-killed|lost), exit, signal, started/ended, cpu_user, cpu_sys, peak_rss?, output-refs{out,err|log[, in]}}`. `killed` = via `aira run-kill`; `oom-killed` = cgroup `memory.events oom_kill` fired; `lost` = supervisor/AIRA died without an exit record. *Metadata: telemetry (DB); blobs: local+capped.*
-- **Event** — the mutation log: `{seq, at, actor, verb, target, payload-digest}`. `seq` (per-machine, monotonic, **append-only and gap-detectable** — not "tamper-resistant": daemonless the caller writes it) is the **ordering authority**; `at` (wall clock) is advisory. On DB loss, `seq` resumes above the max found by scanning the common-dir journals (§7 discipline).
+- **Event** — the mutation log: `{project-id, seq, at, actor, verb, target, payload-digest}`. `seq` (per-project, monotonic, **append-only and gap-detectable** — not "tamper-resistant": daemonless the caller writes it) is the **ordering authority** within that project's journal; `at` (wall clock) is advisory. The event key is `(project_id, seq)`, and on DB loss each project's `seq` resumes above the max found by scanning its common-dir journal (§7 discipline).
 
 ## 7. ID allocation
 
@@ -127,7 +127,7 @@ Typed findings make review output survive by construction. **Cross-ticket aggreg
 
 ## 11. Timestamps and the event log
 
-**Every significant state-changing call is journaled** (append-only, common-dir, §5.3), stamped at ingress. Honest framing: **daemonless, AIRA runs in the caller's own process**, so the timestamp reads the caller's clock — there is no distinct clock authority until the daemon/remote phase; the value is one capture point + a monotonic `seq`. **`seq` (per-machine, monotonic, gap-detectable) is the ordering authority; `at` (wall clock) is advisory.** **The journal records *significant* mutations** (allocations, status transitions, claims/releases/steals, finding/link/relation writes, **attestations**) — **not** high-frequency heartbeats (ephemeral DB refresh) nor per-run/per-`spend` telemetry detail (DB-only), which would swamp it; read verbs are timestamped cheaply but not journaled. On DB loss, `seq` and the counter resume above the max found by scanning the journals.
+**Every significant state-changing call is journaled** (append-only, common-dir, §5.3), stamped at ingress. Honest framing: **daemonless, AIRA runs in the caller's own process**, so the timestamp reads the caller's clock — there is no distinct clock authority until the daemon/remote phase; the value is one capture point + a monotonic `seq`. **`seq` (per-project, monotonic, gap-detectable) is the ordering authority within that project's journal; the event key is `(project_id, seq)`; `at` (wall clock) is advisory.** **The journal records *significant* mutations** (allocations, status transitions, claims/releases/steals, finding/link/relation writes, **attestations**) — **not** high-frequency heartbeats (ephemeral DB refresh) nor per-run/per-`spend` telemetry detail (DB-only), which would swamp it; read verbs are timestamped cheaply but not journaled. On DB loss, each project's `seq` and the counter resume above the max found by scanning its journals.
 
 ## 12. Compute telemetry (phase- and model-attributed)
 

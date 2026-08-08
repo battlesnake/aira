@@ -132,10 +132,19 @@ their branch projections concurrently.
    `fsync` it. A second short DB transaction marks the event journaled. Repeating
    this step is idempotent by the key and digest.
 
+Lock ordering is explicit: AIRA never holds a common-dir append lock across a DB
+transaction. The append lock is released after the durable frame write and
+before the DB transaction that marks it journaled; rebuild records recovered
+receipt work, commits/releases the DB writer transaction, and appends those
+receipts afterward under the common-dir lock.
+
 Pure DB mutations, including leases and heartbeats, use the same DB event/outbox
 sequence and journal step but have no git-file materialisation step. `seq` is
 monotonic within a project's journal; the event identity is the composite
 `(project_id, seq)`, and Phase 1 promises no total ordering between projects.
+This deliberately narrows and supersedes the parent v4 wording of a
+per-machine scalar `seq`: independent project journal recovery must not collide
+or require a dead machine-wide registry to restore ordering.
 
 The journal record is canonical JSONL with a framing prefix containing `project`, `seq`, and
 the SHA-256 of the canonical JSON payload. A partial final line is not treated as
@@ -161,15 +170,19 @@ materialise/retire resolution, so recovery never depends on an evicted payload.
 For a project, the physical audit paths are
 `<git-common-dir>/aira/journal.jsonl`,
 `<git-common-dir>/aira/receipts.jsonl`, and lock files under
-`<git-common-dir>/aira/locks/`, including the hash-named physical path lock.
-These paths are outside every worktree and therefore outside the commit graph.
+`<git-common-dir>/aira/locks/`, including
+`path-<sha256(project_id || worktree_id || relative_path)>.lock`. The path lock
+hashes exactly the same triple as the unresolved-intent unique key, so sibling
+worktrees sharing a relative path do not recouple. These paths are outside every
+worktree and therefore outside the commit graph.
 
 ### Crash matrix and reconciler action
 
 | Crash point | Reconciler action |
 |---|---|
 | Before the first DB commit | A file already present is treated as git-authoritative and imported with a new sequence; no uncommitted intent exists. |
-| After intent commit, before file rename | If the path is absent, or its digest still equals the recorded precondition, replay the intended bytes. If it already equals the intended digest, finalise it. Any other digest is a conflict: do not overwrite, leave the intent pending, and require explicit materialise/retire resolution. An allocated ID remains a visible pending receipt until materialised or retired. |
+| After intent commit, before receipt append | Append the missing allocation receipt first. If that append fails, leave the intent pending and retry from this stage; never materialise the ticket without the receipt. |
+| After receipt append, before file rename | If the path is absent, or its digest still equals the recorded precondition, replay the intended bytes. If it already equals the intended digest, finalise it. Any other digest is a conflict: do not overwrite, leave the intent pending, and require explicit materialise/retire resolution. An allocated ID remains a visible pending receipt until materialised or retired. |
 | During temp write | Ignore an unrenamed temp file after recording its digest if recoverable; replay from the outbox. |
 | After rename, before materialised commit | Verify the digest, rebuild/index the file, and mark the outbox materialised. A different digest is a conflict; never overwrite it. |
 | After materialised commit, before journal append | Append the missing event from the DB event row, then mark journaled. |
@@ -177,8 +190,10 @@ These paths are outside every worktree and therefore outside the commit graph.
 | After journal append, before journaled mark | Keyed replay observes the existing frame and marks it journaled. |
 | DB loss | Recreate the schema, scan common-dir journals/receipts, all registered worktree files, and all refs, then rebuild index, counters, and reconciliation findings. |
 
-The reconciler is idempotent. It never invents a relation to a missing ticket,
-never silently drops a receipt, and never turns an unrun repair into `pass`.
+The reconciler is idempotent and always resumes the §2 pipeline from the first
+incomplete stage, including the receipt stage; it never jumps directly to file
+materialisation. It never invents a relation to a missing ticket, never silently
+drops a receipt, and never turns an unrun repair into `pass`.
 
 ## 3. Machine database and project/worktree discovery
 
@@ -300,8 +315,10 @@ has exactly these Phase-1 fields:
 `id`, `project`, `title`, `status`, `kind`, `severity`, `assignee`,
 `milestone`, `labels`, `hold`, and `relations` are required. `assignee`,
 `milestone`, and `labels` may be empty/null as shown. Status and severity are
-closed enums from the parent spec. Phase 1 permits exactly the parent kinds
-`feature`, `spike`, and `requirement-work`; unknown kinds are refused. Labels are sorted,
+closed enums from the parent spec. Phase 1 permits `feature`, `bug`, `chore`,
+`spike`, and `requirement-work`; unknown kinds are refused. This Phase-1
+extension makes durable bug work and maintenance work first-class without
+claiming that v4 §6 already enumerates the kind set. Labels are sorted,
 unique, lowercase strings. The body may be empty but must end in one newline.
 
 Timestamps are not copied into the file: event `seq` is the ordering authority,
@@ -410,7 +427,15 @@ transaction is held:
 6. writes counters strictly above those maxima, imports the index, and records
    reconciliation findings before committing the rebuild. Importing any
    git-authoritative ticket ID also bumps its prefix counter to at least `N+1`
-   and synthesises a recovered receipt if no receipt exists.
+   and records a recovered-receipt work item if no receipt exists. If an
+   imported file unambiguously matches a pending allocation's project,
+   worktree, ID, path, and digest, reconciliation auto-adopts it and marks the
+   allocation materialised; only ambiguous cases require manual `--retire`.
+   After the DB
+   writer transaction commits and releases, the reconciler appends those
+   synthesised receipts under the common-dir append lock. If it crashes in that
+   interval, the committed recovered-receipt work item is retried by the next
+   rebuild.
 
 The writer transaction blocks normal allocators during the scan; a concurrent
 writer is expected to receive retryable `E_DB_BUSY`. The machine-level lock
@@ -579,7 +604,7 @@ Every response has a stable `code`, a human message, structured details, and a
 | `E_TRANSITION_INVALID` | A requested status edge is not in the Phase-1 transition graph. | integrity fail |
 | `E_PATH_INTENT_UNRESOLVED` | A path intent needs explicit materialise/retire resolution. | integrity fail |
 | `E_JOURNAL_CORRUPT` | A journal frame is missing, partial, or checksum-invalid. | integrity fail |
-| `E_RECONCILE_REQUIRED` | An operation cannot proceed until a repair is resolved. | integrity fail |
+| `E_RECONCILE_REQUIRED` | An operation cannot proceed until a repair is resolved. | error, retryable |
 | `E_CLOCK_UNAVAILABLE` | No cross-process monotonic clock is available. | unevaluated/error |
 | `E_LEASE_HELD` | Another live holder owns the ticket. | error |
 | `E_LEASE_TOKEN` | The supplied holder token does not match. | integrity fail |
@@ -619,7 +644,9 @@ are:
 
 - `projects(project_id, slug, common_dir, config_digest, ...)`;
 - `worktrees(worktree_id, project_id, git_dir, root, active, ...)`;
-- `prefix_ownership(prefix PRIMARY KEY, project_id, registered_seq)`;
+- `prefix_ownership(prefix PRIMARY KEY, project_id, registered_seq)` where
+  `registered_seq` is the append offset in the machine registry breadcrumb, not
+  a project event sequence;
 - `id_counters(project_id, prefix, next_number)`;
 - `event_counters(project_id, next_seq)`;
 - `allocations(project_id, prefix, number, worktree_id, state, seq, ...)`;
@@ -627,7 +654,7 @@ are:
   derived index of branch-local projections;
 - `relations(project_id, worktree_id, kind, from_id, to_id, canonical_file,
   ...)` as a derived index;
-- `leases(project_id, ticket_id PRIMARY KEY, token_hash, holder, worktree_id,
+- `leases(project_id, ticket_id, PRIMARY KEY(project_id, ticket_id), token_hash, holder, worktree_id,
   generation, boot_id, last_heartbeat_mono_ns, ttl_ns, ...)`;
 - `area_hints(project_id, ticket_id, glob, ...)`;
 - `outbox(project_id, seq, worktree_id, path, verb, precondition_digest,
@@ -673,6 +700,7 @@ as satisfied.
 | `aira claim/release/heartbeat` | Perform token-protected lease CAS operations. |
 | `aira touch <ID> <glob...>` | Replace the invoking holder's advisory area hints; overlap emits `W_AREA_OVERLAP`. |
 | `aira link <ID> <relation> <ID>` | Validate both current-worktree tickets and update only the canonical lower-ID file. |
+| `aira reconcile resolve <seq> --materialise\|--retire` | Resolve a wedged path intent explicitly; adopt a validated current file or abandon the intended mutation/retire its new ID. |
 | `aira ready <ID>` / `aira ready --list` | Return derived readiness, blockers, and verdict evidence. |
 | `aira reconcile [--all] [--rebuild]` | Run the full project or machine scan and report repairs/findings; never silently delete content. |
 | `aira check [--all]` | Reconcile, evaluate integrity checks, emit structured verdicts, and use the §8 exit codes. |
