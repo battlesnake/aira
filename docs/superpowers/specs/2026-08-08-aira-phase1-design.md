@@ -26,7 +26,8 @@ selection.
 ### Spike
 
 The disposable harness was outside the worktree at
-`/tmp/aira-sqlite-spike`. Each worker was a separate short-lived process. It
+`~/tmp/aira-sqlite-spike`. Each worker was a
+separate short-lived process. It
 opened the same database in WAL mode, set `busy_timeout=5000`, executed an
 explicit `BEGIN IMMEDIATE`, selected `MAX(id)+1`, held the write transaction for
 25 ms, inserted the ID, and committed. The verifier required one row per worker,
@@ -35,13 +36,13 @@ all IDs distinct, and `MAX(id)` equal to the worker count.
 Successful build command:
 
 ```text
-whale-run /home/user/.local/bin/go build -buildvcs=false -o /tmp/aira-sqlite-spike/probe .
+whale-run /home/user/.local/bin/go build -buildvcs=false -o ~/tmp/aira-sqlite-spike/probe .
 ```
 
 Single contention run:
 
 ```text
-whale-run /tmp/aira-sqlite-spike/run.sh /tmp/aira-sqlite-spike/coordination.db 32
+whale-run ~/tmp/aira-sqlite-spike/run.sh ~/tmp/aira-sqlite-spike/coordination.db 32
 ```
 
 Result:
@@ -53,7 +54,7 @@ SPIKE_PASS workers=32 rows=32
 Repeat command:
 
 ```text
-whale-run /bin/sh -c 'i=1; while [ "$i" -le 8 ]; do /tmp/aira-sqlite-spike/run.sh "/tmp/aira-sqlite-spike/repeat-$i.db" 32; i=$((i + 1)); done'
+whale-run /bin/sh -c 'i=1; while [ "$i" -le 8 ]; do ~/tmp/aira-sqlite-spike/run.sh ~/tmp/aira-sqlite-spike/repeat-$i.db 32; i=$((i + 1)); done'
 ```
 
 Result: eight `SPIKE_PASS workers=32 rows=32` lines, with no `database is
@@ -76,7 +77,7 @@ There are two authorities with different scopes:
    never a second steady-state copy of ticket content.
 2. **Mutation sequencing and coordination authority:** SQLite is authoritative
    for committed coordination mutations, the machine-wide ID counter, lease CAS,
-   pending materialisation intents, and the per-machine event `seq`. The
+   pending materialisation intents, and the per-project event `seq`. The
    common-dir journal and receipts are durable append-only audit projections of
    those committed SQLite decisions.
 
@@ -87,52 +88,88 @@ conflict instead of overwriting user content.
 
 ### Mutation protocol
 
-Every mutation that changes a git file follows this sequence:
+Every mutation that changes a git file follows this sequence. A physical target
+is keyed as `(project_id, worktree_id, relative_path)`; thus two AIRA writers
+cannot race one checkout's path, while independent sibling worktrees can evolve
+their branch projections concurrently.
 
-1. Discover the project and worktree; load and validate config; reconcile the
-   relevant project scope before acting.
+1. Discover the project and worktree; load and validate config; run the fast
+   pre-command reconciliation path described in §8 before acting.
 2. Parse the existing canonical file, validate the requested change, validate
    relation targets, and compute the new exact file bytes and SHA-256 digest.
 3. Open the machine DB and execute `BEGIN IMMEDIATE`. In that transaction,
    allocate `seq`, apply the coordination change, reserve/update any ID or lease,
-   and insert an outbox row containing project, path, precondition digest,
-   intended digest, intended bytes, verb, actor, and event payload digest.
-   Commit. No git file is changed while this transaction is open.
-4. Write the intended file to a same-directory temporary file, `fsync` it,
-   atomically rename it into place, and `fsync` the directory. A file delete is
-   represented by an explicit tombstone state in the outbox; Phase 1 does not
-   silently delete a ticket file.
-5. Open a new `BEGIN IMMEDIATE`, verify the file digest and precondition, mark
-   the outbox materialised, update the rebuildable index, and commit. If the
-   precondition no longer holds, leave the intent pending and report
-   `E_WRITE_CONFLICT`.
-6. Append the canonical event record identified by `(project, seq, digest)` to
+   and insert an outbox row containing project, worktree, path, precondition
+   digest, intended digest, intended bytes, verb, actor, and event payload digest.
+   A partial unique index permits at most one unresolved outbox intent for the
+   physical `(project_id, worktree_id, relative_path)`. A second writer receives
+   retryable `E_PATH_INTENT_BUSY`, re-reads the path and retries after the first
+   intent resolves. Commit. No git file is changed while this transaction is
+   open. The DB uses `PRAGMA synchronous=FULL` in addition to WAL and the busy
+   timeout, so the committed counter/receipt cannot be rolled back by a power
+   cut after the durable file write.
+4. Immediately after the step-3 commit, append the allocation receipt (when this
+   is an allocation) to the common-dir `receipts.jsonl` under its append lock,
+   flush, and `fsync` it. If this projection fails, stop with `E_RECEIPT_IO` and
+   leave the durable pending intent for reconciliation; do not materialise the
+   ticket as if the receipt existed.
+5. Acquire the physical path lock, re-read the on-disk target digest immediately
+   before replacing it, and require it to equal the recorded precondition. If it
+   differs, abort without writing and leave the intent pending with
+   `E_WRITE_CONFLICT`. Otherwise write the intended file to a same-directory
+   temporary whose name begins with `.<basename>.aira-tmp-` and has no `.md`
+   suffix, `fsync` it, atomically rename it into place, and `fsync` the directory.
+   A file delete is represented by an explicit tombstone state in the outbox;
+   Phase 1 does not silently delete a ticket file.
+6. Open a new `BEGIN IMMEDIATE`, verify the final file digest, mark the outbox
+   materialised, update the rebuildable index, and commit. If a conflict remains,
+   the intent is resolved only by the explicit `aira reconcile resolve <seq>
+   --materialise|--retire` verb. `--materialise` validates and adopts the current
+   file; `--retire` abandons the intended mutation and, for a new allocation,
+   permanently retires its ID. Both resolutions emit their own event.
+7. Append the canonical event record identified by `(project, seq, digest)` to
    the project repository's common-dir journal under its append lock, flush and
    `fsync` it. A second short DB transaction marks the event journaled. Repeating
    this step is idempotent by the key and digest.
 
 Pure DB mutations, including leases and heartbeats, use the same DB event/outbox
-sequence and journal step but have no git-file materialisation step.
+sequence and journal step but have no git-file materialisation step. `seq` is
+monotonic within a project's journal; the event identity is the composite
+`(project_id, seq)`, and Phase 1 promises no total ordering between projects.
 
-The journal record is canonical JSONL with a framing prefix containing `seq` and
+The journal record is canonical JSONL with a framing prefix containing `project`, `seq`, and
 the SHA-256 of the canonical JSON payload. A partial final line is not treated as
 an event: the reconciler preserves the corrupt tail as evidence, emits
 `E_JOURNAL_CORRUPT`, and replays the complete event from the DB outbox. A
 checksum mismatch before the final record stops replay at that point and is
 reported; the reconciler never skips an unknown middle record.
 
+Concurrent appenders take the common-dir append lock only for one framed record.
+Physical append order is not the logical order: records are unordered and
+idempotent by `(project_id, seq, digest)`, while `seq` is the logical ordering
+key within that project's journal. Reconciliation indexes the set, reports
+missing/duplicate keys, and does not wait for a contiguous physical file. A
+partial final frame can therefore be re-emitted safely; a corrupt middle frame
+remains a fail-closed journal finding.
+
+After an intent is materialised, its event is durably journaled, and the
+resolution is committed, a cleanup transaction sets `outbox.intended_bytes` to
+NULL while retaining the intended digest, precondition, event key, and
+resolution metadata. Pending or conflicted intents retain their bytes until
+materialise/retire resolution, so recovery never depends on an evicted payload.
+
 For a project, the physical audit paths are
 `<git-common-dir>/aira/journal.jsonl`,
-`<git-common-dir>/aira/receipts.jsonl`, and the sibling lock files used for
-append and rebuild. These paths are outside every worktree and therefore outside
-the commit graph.
+`<git-common-dir>/aira/receipts.jsonl`, and lock files under
+`<git-common-dir>/aira/locks/`, including the hash-named physical path lock.
+These paths are outside every worktree and therefore outside the commit graph.
 
 ### Crash matrix and reconciler action
 
 | Crash point | Reconciler action |
 |---|---|
 | Before the first DB commit | A file already present is treated as git-authoritative and imported with a new sequence; no uncommitted intent exists. |
-| After intent commit, before file rename | Replay the intended bytes if the path is absent and the precondition still matches; otherwise record `E_WRITE_CONFLICT`. An allocated ID becomes a visible pending receipt until materialised or retired. |
+| After intent commit, before file rename | If the path is absent, or its digest still equals the recorded precondition, replay the intended bytes. If it already equals the intended digest, finalise it. Any other digest is a conflict: do not overwrite, leave the intent pending, and require explicit materialise/retire resolution. An allocated ID remains a visible pending receipt until materialised or retired. |
 | During temp write | Ignore an unrenamed temp file after recording its digest if recoverable; replay from the outbox. |
 | After rename, before materialised commit | Verify the digest, rebuild/index the file, and mark the outbox materialised. A different digest is a conflict; never overwrite it. |
 | After materialised commit, before journal append | Append the missing event from the DB event row, then mark journaled. |
@@ -154,7 +191,13 @@ all worktrees. Its location is:
    `aira` child.
 
 The path is derived, never configured in a committed project file. The DB uses
-WAL, `busy_timeout=5000`, foreign keys, and a schema version. A machine DB row
+WAL, `PRAGMA synchronous=FULL`, `busy_timeout=5000`, foreign keys, and a schema
+version. A machine-level append-only registry breadcrumb is kept beside the DB
+at `$XDG_STATE_HOME/aira/registry.jsonl` (or the equivalent fallback state
+directory). Each registration appends the project ID, common-dir, known
+worktree roots, and owned prefixes. The breadcrumb is not a second live DB: it
+is the recovery inventory when the DB is lost, and stale paths remain evidence.
+A machine DB row
 keys every project by a canonical project identity and every worktree by its
 stable git worktree identity.
 
@@ -176,10 +219,13 @@ The common-dir path is local identity, not a remote identity. A project may be
 registered explicitly with `aira init`; commands refuse to guess when two
 configs or two git roots could be the current project.
 
-`git worktree list --porcelain` is the authoritative enumeration of sibling
-worktrees for this local clone. Missing paths remain registered as historical
-worktrees until reconciliation records them as inactive; their receipts remain
-searchable.
+`git worktree list --porcelain` plus the registry breadcrumb is the authoritative
+enumeration of sibling worktrees for this local clone. Missing paths remain
+registered as historical worktrees until reconciliation records them as
+inactive; their receipts remain searchable. When DB recovery rediscovers a
+prefix that conflicts with the breadcrumb, it records
+`E_PREFIX_OWNERSHIP_CONFLICT` and a reconciliation finding; it never silently
+adopts the later project.
 
 ### Prefix ownership
 
@@ -241,7 +287,7 @@ has exactly these Phase-1 fields:
   "project": "aira",
   "title": "Implement the ready queue",
   "status": "planned",
-  "kind": "task",
+  "kind": "feature",
   "severity": "P2",
   "assignee": null,
   "milestone": null,
@@ -254,8 +300,8 @@ has exactly these Phase-1 fields:
 `id`, `project`, `title`, `status`, `kind`, `severity`, `assignee`,
 `milestone`, `labels`, `hold`, and `relations` are required. `assignee`,
 `milestone`, and `labels` may be empty/null as shown. Status and severity are
-closed enums from the parent spec. Phase 1 permits `kind` values `task`,
-`bug`, `design`, and `chore`; unknown kinds are refused. Labels are sorted,
+closed enums from the parent spec. Phase 1 permits exactly the parent kinds
+`feature`, `spike`, and `requirement-work`; unknown kinds are refused. Labels are sorted,
 unique, lowercase strings. The body may be empty but must end in one newline.
 
 Timestamps are not copied into the file: event `seq` is the ordering authority,
@@ -282,6 +328,40 @@ its own inverse. A duplicate relation is rejected with `E_RELATION_EXISTS`;
 removing the relation edits only its canonical-side file. A missing target or a
 relation whose stored side is not the lower ID is an integrity failure, not an
 automatic rewrite.
+
+### Multi-worktree ticket identity
+
+The logical ticket identity is `(project_id, id)`. The same relative
+`.aira/tickets/AIRA-42.md` path in multiple worktrees is therefore one logical
+ticket with several branch-local projections, not duplicate definitions. The
+derived index is keyed by `(project_id, worktree_id, id)` and stores each
+projection's digest, status, and path. Singular commands and the ready queue
+operate on the invoking worktree's projection by default; `--all-worktrees` is
+an explicit cross-worktree query.
+
+`E_DUPLICATE_ID` is reserved for two files defining one ID inside the same
+worktree. Divergent contents for the same logical ticket across worktrees emit
+`W_WORKTREE_DIVERGENCE` during full reconciliation and never refuse either
+branch. Cross-worktree digest differences cannot become file precondition
+conflicts because preconditions are scoped to the invoking worktree.
+
+### Status transitions
+
+Structural status transitions are fail-closed. The allowed graph is:
+
+```text
+draft       → planned | retired | superseded
+planned     → in-progress | retired | superseded
+in-progress → in-review | planned | retired | superseded
+in-review   → in-progress | done | retired | superseded
+done        → retired | superseded
+retired     → (terminal)
+superseded  → (terminal)
+```
+
+An absent or invalid edge returns `E_TRANSITION_INVALID`; policy gates remain
+advisory in Phase 1. `hold=true` is orthogonal to status and is what keeps a
+valid ticket out of the ready queue without inventing a second blocked status.
 
 ## 5. IDs and counter rebuild
 
@@ -310,9 +390,13 @@ timed-out allocation succeeded; it reconciles by receipt/sequence before retry.
 
 ### Multi-worktree rebuild
 
-When the DB is absent, corrupt, or explicitly rebuilt, AIRA acquires the
-common-dir `rebuild.lock`, opens a new DB, starts `BEGIN IMMEDIATE`, and while
-holding that writer transaction:
+When the DB is absent or corrupt, AIRA acquires the machine-level
+`<state-dir>/rebuild.lock` beside `state.db`, reconstructs the schema and
+registry inventory, then starts `BEGIN IMMEDIATE`. A per-project explicit
+rebuild acquires the same machine lock but deletes and reinserts only that
+project's DB rows. Common-dir locks are used only for journal/receipt appends;
+they do not guard machine-wide DB creation or rebuild. While the writer
+transaction is held:
 
 1. enumerates every worktree from `git worktree list --porcelain` and scans each
    existing `.aira/tickets/` working tree, including uncommitted files;
@@ -324,12 +408,15 @@ holding that writer transaction:
 5. computes each prefix's maximum from all working-tree files, committed refs,
    receipts, and journal allocations;
 6. writes counters strictly above those maxima, imports the index, and records
-   reconciliation findings before committing the rebuild.
+   reconciliation findings before committing the rebuild. Importing any
+   git-authoritative ticket ID also bumps its prefix counter to at least `N+1`
+   and synthesises a recovered receipt if no receipt exists.
 
-The writer transaction blocks normal allocators during the scan, and
-`rebuild.lock` serialises bootstrap/rebuild attempts when the DB itself is
-missing. Scanning working trees is mandatory: refs alone cannot see a sibling's
-uncommitted `AIRA-50`, and a single-checkout maximum can re-mint it.
+The writer transaction blocks normal allocators during the scan; a concurrent
+writer is expected to receive retryable `E_DB_BUSY`. The machine-level lock
+serialises bootstrap/rebuild attempts across projects. Scanning working trees
+is mandatory: refs alone cannot see a sibling's uncommitted `AIRA-50`, and a
+single-checkout maximum can re-mint it.
 
 ## 6. Selectors and anchors
 
@@ -360,7 +447,9 @@ value := bare | quoted
 ```
 
 Bare values contain `[A-Za-z0-9._/-]+`; quoted values use JSON string escaping.
-Terms are ANDed. No implicit fuzzy title matching exists in Phase 1.
+Terms are ANDed. `text:` is a case-insensitive naive Unicode substring search
+over the current ticket's title plus body; it is not FTS, tokenisation, regex,
+or fuzzy matching. No other implicit title matching exists in Phase 1.
 
 A selector is **ambiguous** exactly when it resolves to more than one distinct
 ticket identity in a command requiring one result, or when one exact ID/file
@@ -377,8 +466,12 @@ choosing a row.
 
 `aira claim` creates a 32-byte token from `crypto/rand`, returns it once as a
 base64url string, and stores only `SHA-256(token)` in the DB. The client may
-save the clear token in a mode-0600 local lease file, but it is not committed or
-journaled. Release, heartbeat, and steal must present the token; a ticket ID,
+save the clear token in a mode-0600 local lease file at
+`$XDG_STATE_HOME/aira/leases/<project-id>/<worktree-id>/<ticket-id>.token`, or
+`$HOME/.local/state/aira/leases/...` on the fallback path. The file is not
+committed or journaled. Release and heartbeat require the current holder token;
+claim returns a new token, and `--steal` returns a new token without presenting
+the incumbent's token, winning only on the expired-lease predicate. A ticket ID,
 worktree ID, PID, or actor name alone cannot release or refresh another holder's
 lease. The holder record also contains project, ticket, worktree ID, actor, and a
 generation number for audit/debugging. This is unforgeable within the Phase-1
@@ -425,13 +518,24 @@ that warning to its own policy; AIRA does not create hard file leases.
 
 ### Trigger and scope
 
-With no daemon in Phase 1, reconciliation runs:
+With no daemon in Phase 1, every command first runs a **fast path** limited to
+the current project's pending intents, the target-file digest/stat for the
+operation, the current journal/receipt tail, and machine-DB health. A mismatch
+escalates to a full project reconcile and may return retryable
+`E_RECONCILE_REQUIRED`; it never silently proceeds on a stale projection.
 
-- before every mutating command and before a singular read that relies on
-  integrity;
-- after a failed materialisation or journal append;
-- at explicit `aira reconcile`;
-- as the first stage of `aira check`.
+The full scan runs:
+
+- after a failed materialisation or journal append when the fast path cannot
+  establish a safe repair;
+- at explicit `aira reconcile` or `aira reconcile --rebuild`;
+- as the first stage of `aira check`;
+- during machine DB creation/recovery.
+
+The full scan is not performed before every ordinary `set`/`link` operation at
+large worktree counts. A rebuild holds `BEGIN IMMEDIATE` while scanning git and
+therefore intentionally starves writers; concurrent writers receive
+retryable `E_DB_BUSY` rather than observing a half-rebuilt index.
 
 The default scope is the discovered project: all registered worktrees for its
 common git directory, their current `.aira/tickets/` trees, reachable refs,
@@ -441,9 +545,10 @@ filesystem paths outside registered project/worktree roots.
 
 Reconciliation checks pending outbox intents, duplicate/malformed IDs, file and
 index digests, relation targets and canonical-side placement, journal continuity,
-receipt/file resolution, prefix ownership, orphan worktrees, and expired lease
-metadata. It may rebuild derived index rows and append reconciliation findings;
-it does not delete user files or silently repair a conflicting file.
+receipt/file resolution, prefix ownership, orphan worktrees, cross-worktree
+divergence, and expired lease metadata. It may rebuild derived index rows and
+append reconciliation findings; it does not delete user files or silently repair
+a conflicting file.
 
 ### Stable code catalog
 
@@ -458,6 +563,8 @@ Every response has a stable `code`, a human message, structured details, and a
 | `E_PREFIX_OWNERSHIP_CONFLICT` | A prefix is registered to another project on this machine. | error |
 | `E_DB_BUSY` | The SQLite writer lock exceeded the 5-second busy timeout. | error, retryable |
 | `E_DB_CORRUPT` | The DB cannot be opened or schema integrity fails. | error |
+| `E_RECEIPT_IO` | The common-dir receipt could not be durably appended. | error, retryable |
+| `E_PATH_INTENT_BUSY` | Another unresolved AIRA mutation owns this physical path. | error, retryable |
 | `E_ID_INVALID` | ID or prefix grammar is invalid. | error |
 | `E_DUPLICATE_ID` | More than one ticket definition has the same ID. | integrity fail |
 | `E_ID_UNRESOLVED` | An allocation receipt has neither a ticket nor retirement. | integrity fail |
@@ -469,6 +576,8 @@ Every response has a stable `code`, a human message, structured details, and a
 | `E_RELATION_EXISTS` | The canonical relation already exists. | error |
 | `E_CROSS_PROJECT_RELATION` | Phase-1 relation endpoints are not in one project. | error |
 | `E_WRITE_CONFLICT` | The file changed after the intent precondition. | integrity fail |
+| `E_TRANSITION_INVALID` | A requested status edge is not in the Phase-1 transition graph. | integrity fail |
+| `E_PATH_INTENT_UNRESOLVED` | A path intent needs explicit materialise/retire resolution. | integrity fail |
 | `E_JOURNAL_CORRUPT` | A journal frame is missing, partial, or checksum-invalid. | integrity fail |
 | `E_RECONCILE_REQUIRED` | An operation cannot proceed until a repair is resolved. | integrity fail |
 | `E_CLOCK_UNAVAILABLE` | No cross-process monotonic clock is available. | unevaluated/error |
@@ -478,6 +587,8 @@ Every response has a stable `code`, a human message, structured details, and a
 | `W_AREA_OVERLAP` | Advisory area hints overlap a live claim. | warning |
 | `W_ORPHAN_WORKTREE` | A registered worktree path is missing or inactive. | warning |
 | `W_STALE_INDEX` | A derived index row was rebuilt from git content. | warning |
+| `W_WORKTREE_DIVERGENCE` | Branch-local projections of one logical ticket differ. | warning |
+| `W_RECOVERED_ID` | A git-authoritative ID was imported and its counter/receipt was recovered. | warning |
 | `U_CHECK_UNEVALUATED` | A requested check could not establish a verdict. | unevaluated |
 | `E_INTERNAL` | An unexpected internal or filesystem error occurred. | error |
 
@@ -510,17 +621,21 @@ are:
 - `worktrees(worktree_id, project_id, git_dir, root, active, ...)`;
 - `prefix_ownership(prefix PRIMARY KEY, project_id, registered_seq)`;
 - `id_counters(project_id, prefix, next_number)`;
+- `event_counters(project_id, next_seq)`;
 - `allocations(project_id, prefix, number, worktree_id, state, seq, ...)`;
-- `tickets(project_id, id, path, digest, status, hold, ...)` as a derived index;
-- `relations(project_id, kind, from_id, to_id, canonical_file, ...)` as a
-  derived index;
+- `tickets(project_id, worktree_id, id, path, digest, status, hold, ...)` as a
+  derived index of branch-local projections;
+- `relations(project_id, worktree_id, kind, from_id, to_id, canonical_file,
+  ...)` as a derived index;
 - `leases(project_id, ticket_id PRIMARY KEY, token_hash, holder, worktree_id,
   generation, boot_id, last_heartbeat_mono_ns, ttl_ns, ...)`;
 - `area_hints(project_id, ticket_id, glob, ...)`;
-- `outbox(seq PRIMARY KEY, project_id, verb, path, precondition_digest, intended_digest,
-  intended_bytes, materialised, journaled, ...)`;
-- `events(seq PRIMARY KEY, project_id, at_wall, actor, verb, target,
-  payload_digest, journaled, ...)`;
+- `outbox(project_id, seq, worktree_id, path, verb, precondition_digest,
+  intended_digest, intended_bytes, materialised, resolution, journaled,
+  PRIMARY KEY(project_id, seq))`
+  with a partial unique index on unresolved `(project_id, worktree_id, path)`;
+- `events(project_id, seq, at_wall, actor, verb, target,
+  payload_digest, journaled, PRIMARY KEY(project_id, seq))`;
 - `findings(project_id, id, subtype, code, subject, ...)` for reconciliation
   findings in Phase 1.
 
@@ -543,13 +658,40 @@ The ready query folds Phase-1 integrity checks and returns `unevaluated` when
 reconciliation could not establish the graph. It never treats an absent blocker
 as satisfied.
 
-## 11. §21 closure matrix
+## 11. Phase-1 CLI and output contract
+
+| Command | Phase-1 behaviour |
+|---|---|
+| `aira init` | Create `.aira/config` and required directories, register the project and prefixes, and refuse to overwrite an existing config. |
+| `aira id <prefix>` | Atomically allocate an ID and durable receipt without creating a ticket file; an unresolved allocation must later be materialised or retired. |
+| `aira new <title>` / `aira create` | Allocate an ID, create one canonical ticket file, and return the ID plus path and event sequence. |
+| `aira ls [query]` / `aira list` | List current-worktree projections, with explicit `--all-worktrees` for cross-worktree results. |
+| `aira count [query] --by <field>` | Return counts/distributions before row fetch; no silent result cap. |
+| `aira show <ID>` / `aira get` | Show one exact current-worktree ticket and its derived inverse relations. |
+| `aira set <ID> <field> <value>` | Perform an optimistic, path-serialised frontmatter/body mutation. |
+| `aira mv <ID> <status>` | Apply the status graph; invalid edges return `E_TRANSITION_INVALID`. |
+| `aira claim/release/heartbeat` | Perform token-protected lease CAS operations. |
+| `aira touch <ID> <glob...>` | Replace the invoking holder's advisory area hints; overlap emits `W_AREA_OVERLAP`. |
+| `aira link <ID> <relation> <ID>` | Validate both current-worktree tickets and update only the canonical lower-ID file. |
+| `aira ready <ID>` / `aira ready --list` | Return derived readiness, blockers, and verdict evidence. |
+| `aira reconcile [--all] [--rebuild]` | Run the full project or machine scan and report repairs/findings; never silently delete content. |
+| `aira check [--all]` | Reconcile, evaluate integrity checks, emit structured verdicts, and use the §8 exit codes. |
+| `aira backlog` | Render an on-demand Markdown view to stdout, sorted by status rank then ID, with ID, title, status, assignee, and blockers. It never writes `BACKLOG.md`. |
+| `aira stats` | Emit live, as-of-stamped status/WIP/ready/blocked/live-lease/area-overlap/receipt distributions, each with its universe and verdict; no stored metric numeral. `--json` selects machine-readable output. |
+
+All mutating commands return the event key, stable code, and structured details.
+Human output is bounded and deterministic; JSON output is the canonical adapter
+shape. `backlog` and `stats` are queries over current state, not generated files
+committed into git.
+
+## 12. §21 closure matrix
 
 | §21 deliverable | Phase-1 decision |
 |---|---|
-| DB ↔ git-file ↔ journal ordering and crash recovery | SQLite commits intent/coordination/seq first; an atomic git-file write follows; index/outbox is marked materialised; common-dir journal is appended and fsynced; the reconciler replays each missing stage idempotently and records conflicts. Git is content authority, SQLite is transactional coordination/sequence authority, journal is durable audit projection. |
-| ID atomicity | `modernc.org/sqlite v1.54.0`, WAL, `busy_timeout=5000`, explicit `BEGIN IMMEDIATE`; counter and receipt commit in one transaction. |
-| Multi-worktree counter rebuild | Under `rebuild.lock` plus a DB writer transaction, scan every registered worktree's working tree, all common-dir receipts/journals, and all refs. Working-tree scanning sees uncommitted sibling IDs. |
+| DB ↔ git-file ↔ journal ordering and crash recovery | SQLite commits intent/coordination/seq first with `synchronous=FULL`; the receipt is appended immediately; a path-locked precondition check precedes atomic rename; index/outbox is marked materialised; common-dir journal is appended and fsynced; the reconciler replays each missing stage idempotently and requires explicit materialise/retire on conflicts. Git is content authority, SQLite is transactional coordination authority, journal is durable audit projection. |
+| ID atomicity | `modernc.org/sqlite v1.54.0`, WAL, `synchronous=FULL`, `busy_timeout=5000`, explicit `BEGIN IMMEDIATE`; counter and DB receipt commit together, followed immediately by durable common-dir receipt append. |
+| Multi-worktree counter rebuild | Under the machine-level state lock plus a DB writer transaction, scan every breadcrumb/worktree working tree, all common-dir receipts/journals, and all refs. Working-tree scanning sees uncommitted sibling IDs; importing any ID bumps the counter and synthesises a receipt. |
+| Multi-worktree ticket identity | `(project_id, id)` is logical identity; `(project_id, worktree_id, id)` is the derived projection index. Same-path sibling copies are normal; same-worktree duplicate definitions fail, cross-worktree divergence warns. |
 | Lease atomicity | Claim, heartbeat, release, and expired steal are single `BEGIN IMMEDIATE` CAS transactions with generation and expiry predicates. |
 | Unforgeable holder identity | 32-byte `crypto/rand` token; only its SHA-256 is stored; every holder mutation requires the clear token. |
 | Monotonic clock | Linux `CLOCK_MONOTONIC` via pure-Go syscall plus boot ID; no wall-clock fallback; unsupported platforms return `E_CLOCK_UNAVAILABLE`. |
@@ -558,15 +700,15 @@ as satisfied.
 | `.aira` frontmatter/config | Strict canonical JSON with schema 1, committed config, one ticket per Markdown file, fixed fields, no unknown keys, atomic file replacement. |
 | Canonical relation side | One relation row in the lower-ID ticket file; `from`/`to` preserve direction; inverse is derived. |
 | Git commit semantics | AIRA writes and fsyncs the working tree; the agent commits. Receipts, journal, and operational DB state live outside the commit graph in the git common dir/machine state. |
-| Project/worktree discovery | Nearest config + git top-level/common-dir/per-worktree git-dir; project and worktree IDs are hashes of canonical git identities. |
+| Project/worktree discovery | Nearest config + git top-level/common-dir/per-worktree git-dir plus an append-only machine registry breadcrumb; project and worktree IDs are hashes of canonical git identities. |
 | Prefix ownership uniqueness | Machine DB enforces `prefix → exactly one project_id`; conflicts refuse rather than guess. |
-| DB placement | One machine-wide DB under the XDG/OS state directory, with project/worktree keys. |
+| DB placement | One machine-wide DB under the XDG/OS state directory, with project/worktree keys, a machine-level rebuild lock, and a sibling registry breadcrumb. |
 | Lease TTL/heartbeat | Defaults: TTL 15 minutes, heartbeat 30 seconds; bounded config overrides. |
 | Stable-code catalog | Phase-1 `E_`, `W_`, and `U_` codes are listed in §8 and generated surfaces consume the dispatch table. |
 | `aira check` exit codes | 0 pass, 1 fail, 2 invalid invocation/config, 3 unevaluated, 4 store/reconcile error; fail wins over unevaluated. |
-| Reconcile trigger/scope | Before mutating/integrity-sensitive commands, after failed writes, explicit command, and first in `aira check`; default current project/all its worktrees/refs/common dir, `--all` for machine-wide. |
+| Reconcile trigger/scope | Every command uses the fast pending-intent/target-digest/journal-tail path; full scans are for explicit reconcile/check/rebuild/recovery. Default full scope is current project/all its worktrees/refs/common dir, `--all` for machine-wide. |
 
-## 12. Verification plan before Phase-1 code
+## 13. Verification plan before Phase-1 code
 
 The approved implementation plan must begin with tests for:
 
@@ -581,7 +723,16 @@ The approved implementation plan must begin with tests for:
 5. forged/mismatched lease tokens, heartbeat-vs-steal races, and reboot/boot-ID
    expiry;
 6. `aira check` verdict/exit combinations, proving an unevaluated check never
-   exits green.
+   exits green;
+7. WAL checkpoint behaviour, kill-during-COMMIT recovery, and the documented
+   local-filesystem requirement that excludes NFS/unsupported `-shm` locking;
+8. two same-worktree writers to one canonical relation file, proving the
+   unresolved-intent refusal and immediate precondition check prevent lost
+   updates;
+9. DB-loss recovery from the registry breadcrumb with two projects rebuilding
+   concurrently, proving the machine lock and composite event key;
+10. CLI snapshots for `init`, `id`, `new`, `touch`, `reconcile`, `backlog`, and
+    `stats`, including stable codes and output bounds.
 
 No Phase-1 implementation code is part of this document or the current plan
 handoff.

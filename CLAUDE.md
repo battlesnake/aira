@@ -16,9 +16,26 @@ Before changing anything:
 4. Check the backlog and prerequisites. A ticket blocked by an unlanded
    prerequisite is not ready to build.
 
-Temporary stashes must have named refs, for example:
-`git stash push -m "aira/<ticket>/<purpose>"`. Prefer a second worktree to a
-stash when parallel work is possible.
+Temporary stashes must use an explicit ref, never the shared repo-global stash
+stack. If a stash is unavoidable:
+
+```bash
+stash_ref=refs/agent-stash/aira/<ticket>/<unique-purpose>
+sha=$(git stash create "aira/<ticket>/<purpose>")
+test -n "$sha" && git update-ref "$stash_ref" "$sha"
+```
+
+Restore with `git stash apply "$sha"`, then remove only the named ref with
+`git update-ref -d "$stash_ref"`. Prefer a second worktree when parallel work
+is possible.
+
+## Persistent scratch
+
+Never do scratch work in `/tmp`: it is reboot-volatile. Disposable probes,
+measurement harnesses, captured logs, and intermediate generated files belong
+under `~/tmp/`, outside every worktree. A published measurement must still have
+a committed, executable reproduction. The repository root and feature
+worktrees contain only intentional project files.
 
 ## Development loop
 
