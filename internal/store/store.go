@@ -835,6 +835,9 @@ func (s *Store) Rebuild(ctx context.Context) error {
 			if event.ProjectID != s.projectID {
 				continue
 			}
+			if event.PayloadDigest != digestBytes([]byte(event.Verb+"\x00"+event.Target)) {
+				return fmt.Errorf("E_JOURNAL_CORRUPT: event %s/%d has invalid payload digest", event.ProjectID, event.Seq)
+			}
 			var existing eventRecord
 			err := conn.QueryRowContext(ctx, `SELECT project_id, seq, at_wall, actor, verb, target, payload_digest FROM events WHERE project_id=? AND seq=?`, event.ProjectID, event.Seq).
 				Scan(&existing.ProjectID, &existing.Seq, &existing.At, &existing.Actor, &existing.Verb, &existing.Target, &existing.PayloadDigest)
@@ -1450,6 +1453,14 @@ func addDiscoveredWorktree(byRoot map[string]registryEntry, projectID, root stri
 	if _, ok := byRoot[absolute]; ok {
 		return nil
 	}
+	if candidateInfo, err := os.Stat(absolute); err == nil {
+		for existingRoot := range byRoot {
+			existingInfo, err := os.Stat(existingRoot)
+			if err == nil && os.SameFile(existingInfo, candidateInfo) {
+				return nil
+			}
+		}
+	}
 	byRoot[absolute] = registryEntry{ProjectID: projectID, WorktreeID: "worktree-" + digestBytes([]byte(absolute))[:16], Root: absolute}
 	return nil
 }
@@ -1474,6 +1485,7 @@ func isNotGitRepository(output string) bool {
 
 func runGit(root string, args ...string) (string, string, error) {
 	cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -1499,16 +1511,13 @@ func validGitRoot(root string) (bool, string, error) {
 		}
 		return false, "", fmt.Errorf("E_GIT_SCAN: rev-parse: %w: %s", err, strings.TrimSpace(stderr))
 	}
-	resolvedRoot, err := filepath.EvalSymlinks(root)
+	topPath := strings.TrimSpace(top)
+	topInfo, err := os.Stat(topPath)
 	if err != nil {
-		return false, "", fmt.Errorf("E_GIT_SCAN: resolve worktree root: %w", err)
+		return false, "", fmt.Errorf("E_GIT_SCAN: stat git top-level %q: %w", topPath, err)
 	}
-	resolvedTop, err := filepath.EvalSymlinks(strings.TrimSpace(top))
-	if err != nil {
-		return false, "", fmt.Errorf("E_GIT_SCAN: resolve git top-level %q: %w", strings.TrimSpace(top), err)
-	}
-	if filepath.Clean(resolvedTop) != filepath.Clean(resolvedRoot) {
-		return false, fmt.Sprintf("git top-level %q does not equal root %q after symlink resolution", resolvedTop, resolvedRoot), nil
+	if !os.SameFile(info, topInfo) {
+		return false, fmt.Sprintf("git top-level %q does not identify root %q", topPath, root), nil
 	}
 	return true, "", nil
 }

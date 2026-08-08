@@ -571,18 +571,117 @@ func TestRebuildScansSymlinkedGitWorktree(t *testing.T) {
 	if err := os.Symlink(realRoot, linkedRoot); err != nil {
 		t.Fatal(err)
 	}
-	writeTicketFile(t, filepath.Join(realRoot, ".aira", "tickets", "AIRA-22.md"), "AIRA-22")
+	writeTicketFile(t, filepath.Join(realRoot, ".aira", "tickets", "AIRA-24.md"), "AIRA-24")
+	gitRun(t, realRoot, "add", ".")
+	gitRun(t, realRoot, "-c", "user.name=AIRA", "-c", "user.email=aira@example.invalid", "commit", "-m", "seed")
+	if err := os.Remove(filepath.Join(realRoot, ".aira", "tickets", "AIRA-24.md")); err != nil {
+		t.Fatal(err)
+	}
+	writeTicketFile(t, filepath.Join(realRoot, ".aira", "tickets", "AIRA-23.md"), "AIRA-23")
 	s := openTestStore(t, linkedRoot, filepath.Join(base, "common"), filepath.Join(base, "state"), "main", "AIRA")
 	if err := s.Rebuild(context.Background()); err != nil {
 		t.Fatalf("rebuild through symlink: %v", err)
 	}
-	var count int
-	if err := s.db.QueryRow(`SELECT count(*) FROM tickets WHERE project_id=? AND worktree_id=? AND id=?`, s.projectID, "main", "AIRA-22").Scan(&count); err != nil {
+	id, err := s.AllocateID(context.Background(), "AIRA")
+	if err != nil {
+		t.Fatalf("allocate after symlink rebuild: %v", err)
+	}
+	if id != "AIRA-25" {
+		t.Fatalf("symlinked ref was not scanned; allocated %s, want AIRA-25", id)
+	}
+	var skipped, indexed int
+	if err := s.db.QueryRow(`SELECT count(*) FROM findings WHERE project_id=? AND code=?`, s.projectID, "E_GIT_SCAN").Scan(&skipped); err != nil {
 		t.Fatal(err)
 	}
-	if count != 1 {
-		t.Fatalf("symlinked registry entry scanned %d tickets, want 1", count)
+	if err := s.db.QueryRow(`SELECT count(*) FROM tickets WHERE project_id=? AND id=?`, s.projectID, "AIRA-23").Scan(&indexed); err != nil {
+		t.Fatal(err)
 	}
+	if skipped != 0 {
+		t.Fatalf("symlinked root recorded %d skip findings, want 0", skipped)
+	}
+	if indexed != 1 {
+		t.Fatalf("symlinked worktree indexed AIRA-23 %d times, want 1", indexed)
+	}
+}
+
+func TestRunGitForcesEnglishLocale(t *testing.T) {
+	base := persistentTemp(t, "run-git-locale")
+	root := filepath.Join(base, "root")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapper := filepath.Join(base, "git")
+	script := "#!/bin/sh\nif [ \"$LC_ALL\" = C ] && [ \"$LANG\" = C ]; then\n  echo 'fatal: not a git repository' >&2\nelse\n  echo 'fatal: kein Git-Repository' >&2\nfi\nexit 128\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", base+string(os.PathListSeparator)+filepath.Dir(gitPath))
+	_, stderr, err := runGit(root, "rev-parse", "--show-toplevel")
+	if err == nil || !isNotGitRepository(stderr) {
+		t.Fatalf("runGit stderr = %q, err = %v; want English not-a-repository classification", stderr, err)
+	}
+}
+
+func TestDiscoverWorktreesDeduplicatesResolvedIdentity(t *testing.T) {
+	base := persistentTemp(t, "discover-worktree-dedup")
+	realRoot := filepath.Join(base, "real")
+	linkedRoot := filepath.Join(base, "linked")
+	if err := os.MkdirAll(realRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, realRoot, "init")
+	if err := os.Symlink(realRoot, linkedRoot); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := discoverWorktrees(linkedRoot, "project-aira", []registryEntry{{
+		ProjectID: "project-aira", WorktreeID: "registered", Root: linkedRoot,
+	}})
+	if err != nil {
+		t.Fatalf("discover worktrees: %v", err)
+	}
+	if len(entries) != 1 || entries[0].WorktreeID != "registered" {
+		t.Fatalf("discovered worktrees = %#v, want only registered symlink entry", entries)
+	}
+}
+
+func TestValidGitRootAcceptsCaseInsensitiveAlias(t *testing.T) {
+	base := persistentTemp(t, "valid-git-root-case")
+	root := filepath.Join(base, "MixedCase")
+	alias := filepath.Join(base, "mixedcase")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aliasInfo, err := os.Stat(alias)
+	if err != nil || !os.SameFile(aliasInfo, mustStat(t, root)) {
+		t.Skip("filesystem is case-sensitive; WSL/DrvFs alias unavailable")
+	}
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapper := filepath.Join(base, "git")
+	script := "#!/bin/sh\nif [ \"$1\" = -C ] && [ \"$3\" = rev-parse ]; then\n  echo '" + alias + "'\n  exit 0\nfi\nexec " + gitPath + " \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", base+string(os.PathListSeparator)+filepath.Dir(gitPath))
+	valid, _, err := validGitRoot(root)
+	if err != nil || !valid {
+		t.Fatalf("validGitRoot case-insensitive alias = valid %v, err %v; want valid", valid, err)
+	}
+}
+
+func mustStat(t *testing.T, path string) os.FileInfo {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info
 }
 
 func TestRebuildAbortsOnGitRootFailure(t *testing.T) {
@@ -668,6 +767,24 @@ func TestRebuildRejectsCorruptJournalPayloadDigest(t *testing.T) {
 	err := s.Rebuild(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "E_JOURNAL_CORRUPT") {
 		t.Fatalf("corrupt journal digest = %v, want E_JOURNAL_CORRUPT", err)
+	}
+}
+
+func TestRebuildRejectsCorruptNonAllocationJournalPayloadDigest(t *testing.T) {
+	base := persistentTemp(t, "rebuild-corrupt-nonallocation-journal-digest")
+	root := filepath.Join(base, "main")
+	common := filepath.Join(base, "common")
+	state := filepath.Join(base, "state")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := openTestStore(t, root, common, state, "main", "AIRA")
+	writeJSONL(t, filepath.Join(common, "aira", "journal.jsonl"), eventRecord{
+		ProjectID: "project-aira", Seq: 45, Verb: "ticket.update", Target: "AIRA-34", PayloadDigest: "corrupt-digest",
+	})
+	err := s.Rebuild(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "E_JOURNAL_CORRUPT") {
+		t.Fatalf("corrupt non-allocation journal digest = %v, want E_JOURNAL_CORRUPT", err)
 	}
 }
 
