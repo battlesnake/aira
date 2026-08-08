@@ -757,6 +757,8 @@ func (s *Store) Rebuild(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// These JSONL reads intentionally remain lock-free during Rebuild. A concurrent
+	// append may be observed as a benign torn tail and repaired on the next run.
 	receipts, err := readReceipts(filepath.Join(s.auditDir, "receipts.jsonl"))
 	if err != nil {
 		return err
@@ -791,12 +793,9 @@ func (s *Store) Rebuild(ctx context.Context) error {
 	}
 	var scanned []scannedTicket
 	for _, entry := range entries {
-		valid, reason := validGitRoot(entry.Root)
-		if !valid {
-			if err := s.recordRebuildFinding(ctx, entry, reason); err != nil {
-				return err
-			}
-			continue
+		valid, reason, gitErr := validGitRoot(entry.Root)
+		if gitErr != nil {
+			return gitErr
 		}
 		tickets, err := scanTickets(entry.Root, entry.WorktreeID)
 		if err != nil {
@@ -808,6 +807,12 @@ func (s *Store) Rebuild(ctx context.Context) error {
 			if int64(number) > maxima[prefix] {
 				maxima[prefix] = int64(number)
 			}
+		}
+		if !valid {
+			if err := s.recordRebuildFinding(ctx, entry, reason); err != nil {
+				return err
+			}
+			continue
 		}
 		refMax, err := scanRefMax(entry.Root)
 		if err != nil {
@@ -958,6 +963,9 @@ func ensureAllocationEvent(ctx context.Context, conn *sql.Conn, project, id, wor
 		if fromJournal.Target != id {
 			return fmt.Errorf("E_JOURNAL_CORRUPT: duplicate project/seq %s/%d has target %s and %s", project, seq, fromJournal.Target, id)
 		}
+		if fromJournal.PayloadDigest != digestBytes([]byte(fromJournal.Verb+"\x00"+fromJournal.Target)) {
+			return fmt.Errorf("E_JOURNAL_CORRUPT: event %s/%d has invalid payload digest", project, seq)
+		}
 		verb, target, payload = fromJournal.Verb, fromJournal.Target, fromJournal.PayloadDigest
 	} else {
 		var existing eventRecord
@@ -970,8 +978,12 @@ func ensureAllocationEvent(ctx context.Context, conn *sql.Conn, project, id, wor
 			}
 		} else if err != nil {
 			return err
-		} else if existing.Verb != verb || existing.Target != target || existing.PayloadDigest != payload {
+		} else if existing.Target != id {
 			return fmt.Errorf("E_JOURNAL_CORRUPT: duplicate project/seq %s/%d has different payload", project, seq)
+		} else if existing.PayloadDigest != digestBytes([]byte(existing.Verb+"\x00"+existing.Target)) {
+			return fmt.Errorf("E_JOURNAL_CORRUPT: event %s/%d has invalid payload digest", project, seq)
+		} else {
+			verb, target, payload = existing.Verb, existing.Target, existing.PayloadDigest
 		}
 	}
 	_, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO outbox(project_id,seq,worktree_id,path,verb,precondition_digest,intended_digest,intended_bytes,materialised,journaled,allocation_id)
@@ -1469,25 +1481,36 @@ func runGit(root string, args ...string) (string, string, error) {
 	return stdout.String(), stderr.String(), err
 }
 
-func validGitRoot(root string) (bool, string) {
+func validGitRoot(root string) (bool, string, error) {
 	info, err := os.Stat(root)
 	if errors.Is(err, os.ErrNotExist) {
-		return false, "worktree root does not exist"
+		return false, "worktree root does not exist", nil
 	}
 	if err != nil {
-		return false, fmt.Sprintf("stat worktree root: %v", err)
+		return false, "", fmt.Errorf("E_GIT_SCAN: stat worktree root: %w", err)
 	}
 	if !info.IsDir() {
-		return false, "worktree root is not a directory"
+		return false, "worktree root is not a directory", nil
 	}
 	top, stderr, err := runGit(root, "rev-parse", "--show-toplevel")
 	if err != nil {
-		return false, fmt.Sprintf("rev-parse: %v: %s", err, strings.TrimSpace(stderr))
+		if isNotGitRepository(stderr) {
+			return false, fmt.Sprintf("rev-parse: %v: %s", err, strings.TrimSpace(stderr)), nil
+		}
+		return false, "", fmt.Errorf("E_GIT_SCAN: rev-parse: %w: %s", err, strings.TrimSpace(stderr))
 	}
-	if filepath.Clean(strings.TrimSpace(top)) != filepath.Clean(root) {
-		return false, fmt.Sprintf("git top-level %q does not equal root %q", strings.TrimSpace(top), root)
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return false, "", fmt.Errorf("E_GIT_SCAN: resolve worktree root: %w", err)
 	}
-	return true, ""
+	resolvedTop, err := filepath.EvalSymlinks(strings.TrimSpace(top))
+	if err != nil {
+		return false, "", fmt.Errorf("E_GIT_SCAN: resolve git top-level %q: %w", strings.TrimSpace(top), err)
+	}
+	if filepath.Clean(resolvedTop) != filepath.Clean(resolvedRoot) {
+		return false, fmt.Sprintf("git top-level %q does not equal root %q after symlink resolution", resolvedTop, resolvedRoot), nil
+	}
+	return true, "", nil
 }
 
 func readReceipts(path string) ([]AllocationReceipt, error) {

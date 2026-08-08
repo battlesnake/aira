@@ -539,7 +539,6 @@ func TestRebuildRetriesMissingRecoveredReceipt(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, ".aira", "tickets"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	gitRun(t, root, "init")
 	writeTicketFile(t, filepath.Join(root, ".aira", "tickets", "AIRA-7.md"), "AIRA-7")
 	s := openTestStore(t, root, common, state, "main", "AIRA")
 	if _, err := s.db.Exec(`INSERT INTO allocations(project_id,prefix,number,worktree_id,state,path,seq) VALUES(?,?,?,?,?,?,?)`, "project-aira", "AIRA", 7, "main", "recovered", filepath.Join(root, ".aira", "tickets", "AIRA-7.md"), 12); err != nil {
@@ -551,6 +550,124 @@ func TestRebuildRetriesMissingRecoveredReceipt(t *testing.T) {
 	receipts, err := os.ReadFile(filepath.Join(common, "aira", "receipts.jsonl"))
 	if err != nil || !strings.Contains(string(receipts), "AIRA-7") {
 		t.Fatalf("missing retryable recovered receipt: %v %q", err, receipts)
+	}
+	id, err := s.AllocateID(context.Background(), "AIRA")
+	if err != nil {
+		t.Fatalf("allocate after non-git rebuild: %v", err)
+	}
+	if id != "AIRA-8" {
+		t.Fatalf("working-tree ticket was not folded by non-git rebuild; allocated %s, want AIRA-8", id)
+	}
+}
+
+func TestRebuildScansSymlinkedGitWorktree(t *testing.T) {
+	base := persistentTemp(t, "rebuild-symlink-worktree")
+	realRoot := filepath.Join(base, "real")
+	linkedRoot := filepath.Join(base, "linked")
+	if err := os.MkdirAll(filepath.Join(realRoot, ".aira", "tickets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, realRoot, "init")
+	if err := os.Symlink(realRoot, linkedRoot); err != nil {
+		t.Fatal(err)
+	}
+	writeTicketFile(t, filepath.Join(realRoot, ".aira", "tickets", "AIRA-22.md"), "AIRA-22")
+	s := openTestStore(t, linkedRoot, filepath.Join(base, "common"), filepath.Join(base, "state"), "main", "AIRA")
+	if err := s.Rebuild(context.Background()); err != nil {
+		t.Fatalf("rebuild through symlink: %v", err)
+	}
+	var count int
+	if err := s.db.QueryRow(`SELECT count(*) FROM tickets WHERE project_id=? AND worktree_id=? AND id=?`, s.projectID, "main", "AIRA-22").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("symlinked registry entry scanned %d tickets, want 1", count)
+	}
+}
+
+func TestRebuildAbortsOnGitRootFailure(t *testing.T) {
+	base := persistentTemp(t, "rebuild-git-root-failure")
+	root := filepath.Join(base, "repo")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "init")
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapper := filepath.Join(base, "git")
+	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"rev-parse\" ]; then\n    echo 'fatal: planted git failure' >&2\n    exit 128\n  fi\ndone\nexec "+gitPath+" \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", base+string(os.PathListSeparator)+os.Getenv("PATH"))
+	s := openTestStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"), "main", "AIRA")
+	err = s.Rebuild(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "E_GIT_SCAN") {
+		t.Fatalf("genuine git-root failure = %v, want E_GIT_SCAN", err)
+	}
+}
+
+func TestRebuildAcceptsExistingTicketCreateEvent(t *testing.T) {
+	base := persistentTemp(t, "rebuild-ticket-create-event")
+	root := filepath.Join(base, "main")
+	common := filepath.Join(base, "common")
+	state := filepath.Join(base, "state")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := openTestStore(t, root, common, state, "main", "AIRA")
+	receipt := AllocationReceipt{ProjectID: "project-aira", WorktreeID: "main", ID: "AIRA-31", Path: filepath.Join(root, ".aira", "tickets", "AIRA-31.md"), Seq: 42, State: "allocated"}
+	writeJSONL(t, filepath.Join(common, "aira", "receipts.jsonl"), receipt)
+	digest := digestBytes([]byte("ticket.create\x00" + receipt.ID))
+	if _, err := s.db.Exec(`INSERT INTO events(project_id,seq,at_wall,actor,verb,target,payload_digest,journaled) VALUES(?,?,?,?,?,?,?,0)`,
+		receipt.ProjectID, receipt.Seq, time.Now().UTC().Format(time.RFC3339Nano), "aira", "ticket.create", receipt.ID, digest); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rebuild(context.Background()); err != nil {
+		t.Fatalf("rebuild accepted ticket.create event: %v", err)
+	}
+}
+
+func TestRebuildRejectsDivergentExistingAllocationEvent(t *testing.T) {
+	base := persistentTemp(t, "rebuild-divergent-event")
+	root := filepath.Join(base, "main")
+	common := filepath.Join(base, "common")
+	state := filepath.Join(base, "state")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := openTestStore(t, root, common, state, "main", "AIRA")
+	receipt := AllocationReceipt{ProjectID: "project-aira", WorktreeID: "main", ID: "AIRA-32", Path: filepath.Join(root, ".aira", "tickets", "AIRA-32.md"), Seq: 43, State: "allocated"}
+	writeJSONL(t, filepath.Join(common, "aira", "receipts.jsonl"), receipt)
+	digest := digestBytes([]byte("ticket.create\x00AIRA-999"))
+	if _, err := s.db.Exec(`INSERT INTO events(project_id,seq,at_wall,actor,verb,target,payload_digest,journaled) VALUES(?,?,?,?,?,?,?,0)`,
+		receipt.ProjectID, receipt.Seq, time.Now().UTC().Format(time.RFC3339Nano), "aira", "ticket.create", "AIRA-999", digest); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Rebuild(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "E_JOURNAL_CORRUPT") {
+		t.Fatalf("divergent existing event = %v, want E_JOURNAL_CORRUPT", err)
+	}
+}
+
+func TestRebuildRejectsCorruptJournalPayloadDigest(t *testing.T) {
+	base := persistentTemp(t, "rebuild-corrupt-journal-digest")
+	root := filepath.Join(base, "main")
+	common := filepath.Join(base, "common")
+	state := filepath.Join(base, "state")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := openTestStore(t, root, common, state, "main", "AIRA")
+	receipt := AllocationReceipt{ProjectID: "project-aira", WorktreeID: "main", ID: "AIRA-33", Path: filepath.Join(root, ".aira", "tickets", "AIRA-33.md"), Seq: 44, State: "allocated"}
+	writeJSONL(t, filepath.Join(common, "aira", "receipts.jsonl"), receipt)
+	writeJSONL(t, filepath.Join(common, "aira", "journal.jsonl"), eventRecord{
+		ProjectID: receipt.ProjectID, Seq: receipt.Seq, Verb: "ticket.create", Target: receipt.ID, PayloadDigest: "corrupt-digest",
+	})
+	err := s.Rebuild(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "E_JOURNAL_CORRUPT") {
+		t.Fatalf("corrupt journal digest = %v, want E_JOURNAL_CORRUPT", err)
 	}
 }
 
