@@ -1,0 +1,318 @@
+package app
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+
+	"aira/internal/domain"
+	"aira/internal/store"
+)
+
+type Config struct {
+	Schema  int           `json:"schema"`
+	Project ProjectConfig `json:"project"`
+	Lease   LeaseConfig   `json:"lease"`
+}
+
+type ProjectConfig struct {
+	Slug     string   `json:"slug"`
+	Prefixes []string `json:"prefixes"`
+}
+
+type LeaseConfig struct {
+	TTLSeconds       int `json:"ttl_seconds"`
+	HeartbeatSeconds int `json:"heartbeat_seconds"`
+}
+
+type Project struct {
+	Root       string
+	CommonDir  string
+	GitDir     string
+	ProjectID  string
+	WorktreeID string
+	ConfigPath string
+	Config     Config
+	StateDir   string
+}
+
+type InitResult struct {
+	Root     string   `json:"root"`
+	Config   string   `json:"config"`
+	Project  string   `json:"project"`
+	Prefixes []string `json:"prefixes"`
+	Created  bool     `json:"created"`
+}
+
+func Discover(ctx context.Context, cwd string) (Project, error) {
+	root, err := gitValue(ctx, cwd, "--show-toplevel")
+	if err != nil {
+		return Project{}, errors.New("E_NOT_PROJECT: current directory is not a git worktree")
+	}
+	root, err = filepath.Abs(strings.TrimSpace(root))
+	if err != nil {
+		return Project{}, err
+	}
+	common, err := gitValue(ctx, root, "--git-common-dir")
+	if err != nil {
+		return Project{}, errors.New("E_NOT_PROJECT: git common directory is unavailable")
+	}
+	common = absoluteGitPath(root, strings.TrimSpace(common))
+	gitDir, err := gitValue(ctx, root, "--git-dir")
+	if err != nil {
+		return Project{}, errors.New("E_NOT_PROJECT: worktree git directory is unavailable")
+	}
+	gitDir = absoluteGitPath(root, strings.TrimSpace(gitDir))
+	configPath, err := findConfig(root)
+	if err != nil {
+		return Project{}, err
+	}
+	config, err := readConfig(configPath)
+	if err != nil {
+		return Project{}, err
+	}
+	canonicalCommon, err := filepath.EvalSymlinks(common)
+	if err != nil {
+		canonicalCommon = common
+	}
+	canonicalGitDir, err := filepath.EvalSymlinks(gitDir)
+	if err != nil {
+		canonicalGitDir = gitDir
+	}
+	return Project{
+		Root: root, CommonDir: common, GitDir: gitDir,
+		ProjectID: hashID(canonicalCommon), WorktreeID: hashID(canonicalGitDir),
+		ConfigPath: configPath, Config: config, StateDir: stateDir(),
+	}, nil
+}
+
+func Open(ctx context.Context, cwd string) (*store.Store, Project, error) {
+	project, err := Discover(ctx, cwd)
+	if err != nil {
+		return nil, Project{}, err
+	}
+	s, err := store.Open(ctx, store.Options{
+		Root: project.Root, CommonDir: project.CommonDir,
+		DBPath:       filepath.Join(project.StateDir, "state.db"),
+		RegistryPath: filepath.Join(project.StateDir, "registry.jsonl"),
+		ProjectID:    project.ProjectID, WorktreeID: project.WorktreeID,
+		ProjectSlug: project.Config.Project.Slug, Prefixes: project.Config.Project.Prefixes,
+	})
+	if err != nil {
+		return nil, Project{}, err
+	}
+	return s, project, nil
+}
+
+func Init(ctx context.Context, cwd string, args map[string]any) (InitResult, error) {
+	root, err := gitValue(ctx, cwd, "--show-toplevel")
+	if err != nil {
+		return InitResult{}, errors.New("E_NOT_PROJECT: aira init requires a git repository")
+	}
+	root, err = filepath.Abs(strings.TrimSpace(root))
+	if err != nil {
+		return InitResult{}, err
+	}
+	configPath := filepath.Join(root, ".aira", "config")
+	if _, err := os.Stat(configPath); err == nil {
+		return InitResult{}, errors.New("E_CONFIG_INVALID: .aira/config already exists; refusing to overwrite")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return InitResult{}, err
+	}
+	slug := stringArg(args, "project")
+	if slug == "" {
+		slug = strings.ToLower(filepath.Base(root))
+	}
+	prefixes := stringSlice(args, "prefixes")
+	if len(prefixes) == 0 {
+		prefixes = []string{"AIRA"}
+	}
+	for i := range prefixes {
+		prefixes[i] = strings.ToUpper(prefixes[i])
+	}
+	config := Config{Schema: 1, Project: ProjectConfig{Slug: slug, Prefixes: prefixes}, Lease: LeaseConfig{TTLSeconds: 900, HeartbeatSeconds: 30}}
+	if err := validateConfig(config); err != nil {
+		return InitResult{}, err
+	}
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return InitResult{}, err
+	}
+	data = append(data, '\n')
+	if err := os.MkdirAll(filepath.Join(root, ".aira", "tickets"), 0o755); err != nil {
+		return InitResult{}, err
+	}
+	if err := writeConfig(configPath, data); err != nil {
+		return InitResult{}, err
+	}
+	project, err := Discover(ctx, root)
+	if err != nil {
+		return InitResult{}, err
+	}
+	s, err := store.Open(ctx, store.Options{
+		Root: project.Root, CommonDir: project.CommonDir,
+		DBPath: filepath.Join(project.StateDir, "state.db"), RegistryPath: filepath.Join(project.StateDir, "registry.jsonl"),
+		ProjectID: project.ProjectID, WorktreeID: project.WorktreeID, ProjectSlug: slug, Prefixes: prefixes,
+	})
+	if err != nil {
+		return InitResult{}, err
+	}
+	if err := s.Close(); err != nil {
+		return InitResult{}, err
+	}
+	return InitResult{Root: root, Config: configPath, Project: slug, Prefixes: prefixes, Created: true}, nil
+}
+
+func findConfig(root string) (string, error) {
+	current := root
+	for {
+		path := filepath.Join(current, ".aira", "config")
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", errors.New("E_CONFIG_MISSING: no .aira/config was found")
+		}
+		current = parent
+	}
+}
+
+func readConfig(path string) (Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Config{}, fmt.Errorf("E_CONFIG_INVALID: %w", err)
+	}
+	var config Config
+	dec := json.NewDecoder(strings.NewReader(string(data)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&config); err != nil {
+		return Config{}, fmt.Errorf("E_CONFIG_INVALID: %w", err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return Config{}, errors.New("E_CONFIG_INVALID: config contains multiple JSON values")
+		}
+		return Config{}, fmt.Errorf("E_CONFIG_INVALID: %w", err)
+	}
+	if err := validateConfig(config); err != nil {
+		return Config{}, err
+	}
+	return config, nil
+}
+
+func validateConfig(config Config) error {
+	if config.Schema != 1 {
+		return errors.New("E_CONFIG_INVALID: unsupported config schema")
+	}
+	if err := domain.ValidateProjectSlug(config.Project.Slug); err != nil {
+		return err
+	}
+	if len(config.Project.Prefixes) == 0 {
+		return errors.New("E_CONFIG_INVALID: config has no prefixes")
+	}
+	seen := map[string]bool{}
+	for _, prefix := range config.Project.Prefixes {
+		if len(prefix) < 2 || prefix != strings.ToUpper(prefix) {
+			return fmt.Errorf("E_CONFIG_INVALID: invalid prefix %q", prefix)
+		}
+		for _, r := range prefix {
+			if r < 'A' || r > 'Z' {
+				return fmt.Errorf("E_CONFIG_INVALID: invalid prefix %q", prefix)
+			}
+		}
+		if seen[prefix] {
+			return fmt.Errorf("E_CONFIG_INVALID: duplicate prefix %q", prefix)
+		}
+		seen[prefix] = true
+	}
+	if config.Lease.TTLSeconds != 0 && (config.Lease.TTLSeconds < 60 || config.Lease.TTLSeconds > 86400) {
+		return errors.New("E_CONFIG_INVALID: lease ttl is outside the permitted range")
+	}
+	if config.Lease.HeartbeatSeconds != 0 && config.Lease.TTLSeconds != 0 && config.Lease.HeartbeatSeconds >= config.Lease.TTLSeconds {
+		return errors.New("E_CONFIG_INVALID: heartbeat must be shorter than ttl")
+	}
+	return nil
+}
+
+func writeConfig(path string, data []byte) error {
+	tmp := path + ".aira-tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func gitValue(ctx context.Context, dir string, args ...string) (string, error) {
+	commandArgs := append([]string{"-C", dir, "rev-parse"}, args...)
+	command := exec.CommandContext(ctx, "git", commandArgs...)
+	output, err := command.Output()
+	if err != nil {
+		return "", err
+	}
+	return string(output), nil
+}
+
+func absoluteGitPath(root, path string) string {
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path)
+	}
+	return filepath.Clean(filepath.Join(root, path))
+}
+
+func hashID(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
+
+func stateDir() string {
+	if value := os.Getenv("XDG_STATE_HOME"); value != "" {
+		return filepath.Join(value, "aira")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "aira-state")
+	}
+	return filepath.Join(home, ".local", "state", "aira")
+}
+
+func stringArg(args map[string]any, key string) string {
+	value, _ := args[key].(string)
+	return value
+}
+
+func stringSlice(args map[string]any, key string) []string {
+	value := args[key]
+	switch values := value.(type) {
+	case []string:
+		return values
+	case []any:
+		result := make([]string, 0, len(values))
+		for _, item := range values {
+			if value, ok := item.(string); ok {
+				result = append(result, value)
+			}
+		}
+		return result
+	case string:
+		if values == "" {
+			return nil
+		}
+		return strings.Split(values, ",")
+	default:
+		return nil
+	}
+}

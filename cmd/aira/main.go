@@ -1,9 +1,237 @@
-// Package main is the Phase-1 build entrypoint. The command dispatch table is
-// introduced with the CLI slice after the first store build-gate milestone.
 package main
 
-import "fmt"
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"strings"
 
-func main() {
-	fmt.Println("aira: Phase-1 store milestone; CLI dispatch is pending")
+	"aira/internal/app"
+	"aira/internal/core"
+)
+
+func main() { os.Exit(Run(os.Args[1:], os.Stdout, os.Stderr)) }
+
+// Run is the deliberately small CLI adapter: argv parsing, core request
+// construction, and rendering. It contains no ticket or consistency logic.
+func Run(argv []string, stdout, stderr io.Writer) int {
+	args, jsonOutput := removeJSON(argv)
+	if len(args) == 0 || args[0] == "help" || args[0] == "--help" {
+		response := core.New(nil).Do(context.Background(), core.Request{Verb: "help"})
+		return render(response, jsonOutput, stdout, stderr)
+	}
+	verb := strings.ToLower(args[0])
+	positional, options, err := parseArgs(verb, args[1:])
+	if err != nil {
+		response := core.Response{Code: "E_SELECTOR_INVALID", Error: err.Error()}
+		return render(response, jsonOutput, stdout, stderr)
+	}
+
+	if verb == "init" {
+		requestArgs := map[string]any{}
+		if value := options["project"]; value != "" {
+			requestArgs["project"] = value
+		}
+		if value := options["prefixes"]; value != "" {
+			requestArgs["prefixes"] = value
+		}
+		dispatcher := core.NewWithInitializer(nil, func(ctx context.Context, initArgs map[string]any) (any, error) {
+			return app.Init(ctx, ".", initArgs)
+		})
+		return render(dispatcher.Do(context.Background(), core.Request{Verb: "init", Args: requestArgs}), jsonOutput, stdout, stderr)
+	}
+
+	request, err := buildRequest(verb, positional, options)
+	if err != nil {
+		return render(core.Response{Code: "E_SELECTOR_INVALID", Error: err.Error(), Exit: 2}, jsonOutput, stdout, stderr)
+	}
+	s, _, err := app.Open(context.Background(), ".")
+	if err != nil {
+		return render(core.Response{Code: appErrorCode(err), Error: err.Error()}, jsonOutput, stdout, stderr)
+	}
+	defer s.Close()
+	dispatcher := core.New(s)
+	return render(dispatcher.Do(context.Background(), request), jsonOutput, stdout, stderr)
+}
+
+func removeJSON(argv []string) ([]string, bool) {
+	result := make([]string, 0, len(argv))
+	jsonOutput := false
+	for _, arg := range argv {
+		if arg == "--json" {
+			jsonOutput = true
+		} else {
+			result = append(result, arg)
+		}
+	}
+	return result, jsonOutput
+}
+
+func parseArgs(verb string, argv []string) ([]string, map[string]string, error) {
+	options := map[string]string{}
+	var positional []string
+	for i := 0; i < len(argv); i++ {
+		arg := argv[i]
+		if !strings.HasPrefix(arg, "--") {
+			positional = append(positional, arg)
+			continue
+		}
+		name := strings.TrimPrefix(arg, "--")
+		if name == "rebuild" {
+			options[name] = "true"
+			continue
+		}
+		if i+1 >= len(argv) || strings.HasPrefix(argv[i+1], "--") {
+			return nil, nil, fmt.Errorf("option --%s requires a value", name)
+		}
+		i++
+		if name == "label" {
+			if options["labels"] != "" {
+				options["labels"] += ","
+			}
+			options["labels"] += argv[i]
+		} else if name == "prefix" {
+			if options["prefixes"] != "" {
+				options["prefixes"] += ","
+			}
+			options["prefixes"] += argv[i]
+		} else if name == "fields" {
+			if options["fields"] != "" {
+				options["fields"] += ","
+			}
+			options["fields"] += argv[i]
+		} else {
+			options[name] = argv[i]
+		}
+	}
+	allowed := map[string]map[string]bool{
+		"init":   {"project": true, "prefixes": true},
+		"create": {"kind": true, "severity": true, "labels": true, "body": true},
+		"new":    {"kind": true, "severity": true, "labels": true, "body": true},
+		"list":   {"by": true, "fields": true}, "ls": {"by": true, "fields": true},
+		"count": {"by": true}, "reconcile": {"rebuild": true},
+	}
+	for name := range options {
+		if !allowed[verb][name] {
+			return nil, nil, fmt.Errorf("option --%s is not valid for %s", name, verb)
+		}
+	}
+	return positional, options, nil
+}
+
+func buildRequest(verb string, positional []string, options map[string]string) (core.Request, error) {
+	args := map[string]any{}
+	switch verb {
+	case "id":
+		if len(positional) != 1 {
+			return core.Request{}, fmt.Errorf("id requires <prefix>")
+		}
+		args["prefix"] = positional[0]
+	case "create", "new":
+		if len(positional) == 0 {
+			return core.Request{}, fmt.Errorf("create requires one title")
+		}
+		args["title"] = strings.Join(positional, " ")
+		args["kind"], args["severity"], args["body"], args["labels"] = options["kind"], options["severity"], options["body"], splitComma(options["labels"])
+	case "show", "get":
+		if len(positional) != 1 {
+			return core.Request{}, fmt.Errorf("show requires <selector>")
+		}
+		args["selector"] = positional[0]
+	case "list", "ls":
+		args["query"] = strings.Join(positional, " ")
+		args["by"], args["fields"] = options["by"], splitComma(options["fields"])
+	case "count":
+		if options["by"] == "" {
+			return core.Request{}, fmt.Errorf("count requires --by <field>")
+		}
+		args["query"], args["by"] = strings.Join(positional, " "), options["by"]
+	case "set":
+		if len(positional) != 2 {
+			return core.Request{}, fmt.Errorf("set requires <selector> <field=value>")
+		}
+		field, value, ok := strings.Cut(positional[1], "=")
+		if !ok || field == "" {
+			return core.Request{}, fmt.Errorf("set requires <field=value>")
+		}
+		args["selector"], args["field"], args["value"] = positional[0], field, value
+	case "mv":
+		if len(positional) != 2 {
+			return core.Request{}, fmt.Errorf("mv requires <selector> <status>")
+		}
+		args["selector"], args["status"] = positional[0], positional[1]
+	case "reconcile":
+		if len(positional) != 0 {
+			return core.Request{}, fmt.Errorf("reconcile accepts no positional arguments")
+		}
+		args["rebuild"] = options["rebuild"] == "true"
+	case "check":
+		if len(positional) != 0 {
+			return core.Request{}, fmt.Errorf("check accepts no positional arguments")
+		}
+	default:
+		return core.Request{}, fmt.Errorf("unknown verb %q", verb)
+	}
+	return core.Request{Verb: verb, Args: args}, nil
+}
+
+func splitComma(value string) []string {
+	if value == "" {
+		return nil
+	}
+	return strings.Split(value, ",")
+}
+
+func render(response core.Response, jsonOutput bool, stdout, stderr io.Writer) int {
+	if jsonOutput {
+		data, _ := json.Marshal(response)
+		_, _ = fmt.Fprintln(stdout, string(data))
+	} else if response.OK {
+		renderHuman(response, stdout)
+	} else if response.Error != "" {
+		_, _ = fmt.Fprintln(stderr, response.Error)
+	}
+	if response.Exit != 0 {
+		return response.Exit
+	}
+	if response.OK {
+		return 0
+	}
+	return exitForError(response.Code)
+}
+
+func renderHuman(response core.Response, out io.Writer) {
+	if response.Code == "PASS" || response.Code == "FAIL" || response.Code == "UNEVALUATED" {
+		if report, ok := response.Data.(interface{}); ok {
+			data, _ := json.Marshal(report)
+			_, _ = fmt.Fprintf(out, "verdict: %s\n%s\n", strings.ToLower(response.Code), data)
+		}
+		return
+	}
+	data, _ := json.MarshalIndent(response.Data, "", "  ")
+	_, _ = fmt.Fprintln(out, string(data))
+}
+
+func appErrorCode(err error) string {
+	message := err.Error()
+	if idx := strings.IndexByte(message, ':'); idx >= 0 {
+		message = message[:idx]
+	}
+	if strings.HasPrefix(message, "E_") {
+		return message
+	}
+	return "E_INTERNAL"
+}
+
+func exitForError(code string) int {
+	switch code {
+	case "E_CONFIG_MISSING", "E_CONFIG_INVALID", "E_NOT_PROJECT", "E_SELECTOR_INVALID", "E_NOT_FOUND", "E_SELECTOR_AMBIGUOUS":
+		return 2
+	case "E_DB_BUSY", "E_DB_CORRUPT", "E_RECONCILE_REQUIRED", "E_INTERNAL", "E_JOURNAL_CORRUPT":
+		return 4
+	default:
+		return 1
+	}
 }

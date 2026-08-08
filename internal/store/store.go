@@ -384,6 +384,10 @@ func (s *Store) prepareCreate(ctx context.Context, input domain.CreateTicketInpu
 		id := fmt.Sprintf("%s-%d", prefix, number)
 		ticket := domain.Ticket{Schema: 1, ID: id, Project: s.projectSlug, Title: input.Title,
 			Status: domain.StatusPlanned, Kind: input.Kind, Severity: input.Severity, Labels: input.Labels}
+		if ticket.Labels == nil {
+			ticket.Labels = []string{}
+		}
+		ticket.Relations = []domain.Relation{}
 		data, err := domain.RenderTicket(ticket, input.Body)
 		if err != nil {
 			return err
@@ -462,6 +466,15 @@ func (s *Store) preparePathMutation(ctx context.Context, path, precondition stri
 }
 
 func (s *Store) UpdateTicket(ctx context.Context, id string, update func(domain.Ticket) (domain.Ticket, error)) error {
+	return s.UpdateTicketContent(ctx, id, func(ticket domain.Ticket, body string) (domain.Ticket, string, error) {
+		updated, err := update(ticket)
+		return updated, body, err
+	})
+}
+
+// UpdateTicketContent performs one optimistic frontmatter/body mutation and
+// keeps the existing SQLite → file → journal protocol intact.
+func (s *Store) UpdateTicketContent(ctx context.Context, id string, update func(domain.Ticket, string) (domain.Ticket, string, error)) error {
 	path := s.ticketPath(id)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -471,7 +484,7 @@ func (s *Store) UpdateTicket(ctx context.Context, id string, update func(domain.
 	if err != nil {
 		return err
 	}
-	updated, err := update(ticket)
+	updated, body, err := update(ticket, body)
 	if err != nil {
 		return err
 	}
