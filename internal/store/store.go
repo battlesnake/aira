@@ -32,27 +32,33 @@ var (
 )
 
 type Options struct {
-	Root         string
-	CommonDir    string
-	DBPath       string
-	RegistryPath string
-	ProjectID    string
-	WorktreeID   string
-	ProjectSlug  string
-	Prefixes     []string
+	Root          string
+	CommonDir     string
+	DBPath        string
+	RegistryPath  string
+	ProjectID     string
+	WorktreeID    string
+	ProjectSlug   string
+	Prefixes      []string
+	LeaseStateDir string
+	LeaseTTLNS    uint64
+	Clock         Clock
 }
 
 type Store struct {
-	db           *sql.DB
-	root         string
-	commonDir    string
-	auditDir     string
-	dbPath       string
-	registryPath string
-	projectID    string
-	worktreeID   string
-	projectSlug  string
-	prefixes     map[string]bool
+	db            *sql.DB
+	root          string
+	commonDir     string
+	auditDir      string
+	dbPath        string
+	registryPath  string
+	projectID     string
+	worktreeID    string
+	projectSlug   string
+	prefixes      map[string]bool
+	leaseStateDir string
+	leaseTTLNS    uint64
+	clock         Clock
 	// beforeMaterialise is intentionally nil in production; tests use it to
 	// observe the receipt-before-file ordering at the crash boundary.
 	beforeMaterialise func(Intent) error
@@ -155,6 +161,16 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		db: db, root: root, commonDir: common, auditDir: filepath.Join(common, "aira"),
 		dbPath: dbPath, registryPath: registry, projectID: opts.ProjectID,
 		worktreeID: opts.WorktreeID, projectSlug: opts.ProjectSlug, prefixes: map[string]bool{},
+		leaseStateDir: opts.LeaseStateDir, leaseTTLNS: opts.LeaseTTLNS, clock: opts.Clock,
+	}
+	if s.leaseStateDir == "" {
+		s.leaseStateDir = defaultLeaseStateDir()
+	}
+	if s.leaseTTLNS == 0 {
+		s.leaseTTLNS = defaultLeaseTTLNS
+	}
+	if s.clock == nil {
+		s.clock = systemClock{}
 	}
 	for _, prefix := range opts.Prefixes {
 		if !validPrefix(prefix) {
@@ -228,6 +244,17 @@ func (s *Store) initDB(ctx context.Context) error {
             project_id TEXT NOT NULL, finding_key TEXT NOT NULL, code TEXT NOT NULL,
             subject TEXT NOT NULL, details TEXT NOT NULL, created_at TEXT NOT NULL,
             PRIMARY KEY(project_id, finding_key)
+	        )`,
+		`CREATE TABLE IF NOT EXISTS leases (
+            project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, state TEXT NOT NULL,
+            generation INTEGER NOT NULL, holder_token_hash TEXT, boot_id TEXT,
+            last_heartbeat_mono_ns INTEGER, ttl_ns INTEGER, actor TEXT, worktree_id TEXT,
+            PRIMARY KEY(project_id, ticket_id),
+            CHECK (state IN ('free', 'held')),
+            CHECK ((state = 'free' AND holder_token_hash IS NULL AND boot_id IS NULL AND
+                    last_heartbeat_mono_ns IS NULL AND ttl_ns IS NULL AND actor IS NULL AND worktree_id IS NULL)
+                OR (state = 'held' AND holder_token_hash IS NOT NULL AND boot_id IS NOT NULL AND
+                    last_heartbeat_mono_ns IS NOT NULL AND ttl_ns IS NOT NULL AND actor IS NOT NULL AND worktree_id IS NOT NULL))
         )`,
 	}
 	for _, statement := range statements {
@@ -438,6 +465,10 @@ func (s *Store) defaultPrefix() (string, error) {
 }
 
 func (s *Store) preparePathMutation(ctx context.Context, path, precondition string, intended []byte, verb string) (Intent, error) {
+	return s.preparePathMutationEvent(ctx, path, precondition, intended, verb, filepath.Base(path))
+}
+
+func (s *Store) preparePathMutationEvent(ctx context.Context, path, precondition string, intended []byte, verb, target string) (Intent, error) {
 	path, err := filepath.Abs(path)
 	if err != nil {
 		return Intent{}, err
@@ -466,7 +497,7 @@ func (s *Store) preparePathMutation(ctx context.Context, path, precondition stri
 			}
 			return err
 		}
-		if err := insertEvent(ctx, conn, s.projectID, seq, verb, filepath.Base(path)); err != nil {
+		if err := insertEvent(ctx, conn, s.projectID, seq, verb, target); err != nil {
 			return err
 		}
 		intent = Intent{ProjectID: s.projectID, WorktreeID: s.worktreeID, Seq: seq, Path: path,
@@ -1132,9 +1163,13 @@ func nextSequence(ctx context.Context, conn *sql.Conn, project string) (int64, e
 }
 
 func insertEvent(ctx context.Context, conn *sql.Conn, project string, seq int64, verb, target string) error {
+	return insertEventActor(ctx, conn, project, seq, "aira", verb, target)
+}
+
+func insertEventActor(ctx context.Context, conn *sql.Conn, project string, seq int64, actor, verb, target string) error {
 	payload := digestBytes([]byte(verb + "\x00" + target))
 	_, err := conn.ExecContext(ctx, `INSERT INTO events(project_id, seq, at_wall, actor, verb, target, payload_digest)
-        VALUES(?, ?, ?, 'aira', ?, ?, ?)`, project, seq, time.Now().UTC().Format(time.RFC3339Nano), verb, target, payload)
+        VALUES(?, ?, ?, ?, ?, ?, ?)`, project, seq, time.Now().UTC().Format(time.RFC3339Nano), actor, verb, target, payload)
 	return err
 }
 

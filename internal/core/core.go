@@ -37,6 +37,14 @@ type Store interface {
 	Count(string, string) (store.CountResult, error)
 	SetTicket(context.Context, string, string, string) (store.EventKey, error)
 	MoveTicket(context.Context, string, domain.Status) (store.EventKey, error)
+	Claim(context.Context, string, bool, string) (store.LeaseClaim, error)
+	Release(context.Context, string, string) (store.EventKey, error)
+	Heartbeat(context.Context, string, string) (domain.Lease, error)
+	LeaseToken(string) (string, error)
+	Link(context.Context, string, domain.RelationKind, string) (store.EventKey, error)
+	Unlink(context.Context, string, domain.RelationKind, string) (store.EventKey, error)
+	Relations(string) ([]domain.RelationView, error)
+	Ready(string) ([]store.ReadyRecord, error)
 	Reconcile(context.Context) error
 	Rebuild(context.Context) error
 	Check(context.Context) (store.CheckReport, error)
@@ -142,6 +150,107 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				projected["body"] = record.Body
 			}
 			return handlerData{Data: projected, Warnings: record.Warnings}, nil
+		}},
+		"claim": {Name: "claim", Usage: "claim <id> [--steal --actor NAME]", Run: func(ctx context.Context, args map[string]any) (any, error) {
+			record, err := c.store.Get(stringArg(args, "selector"))
+			if err != nil {
+				return nil, err
+			}
+			claim, err := c.store.Claim(ctx, record.Ticket.ID, boolArg(args, "steal"), stringArg(args, "actor"))
+			if err != nil {
+				return nil, err
+			}
+			return claim, nil
+		}},
+		"release": {Name: "release", Usage: "release <id>", Run: func(ctx context.Context, args map[string]any) (any, error) {
+			record, err := c.store.Get(stringArg(args, "selector"))
+			if err != nil {
+				return nil, err
+			}
+			token := stringArg(args, "token")
+			if token == "" {
+				token, err = c.store.LeaseToken(record.Ticket.ID)
+				if err != nil {
+					return nil, err
+				}
+			}
+			event, err := c.store.Release(ctx, record.Ticket.ID, token)
+			return mutationData(map[string]any{"id": record.Ticket.ID, "released": true}, event), err
+		}},
+		"heartbeat": {Name: "heartbeat", Usage: "heartbeat <id>", Run: func(ctx context.Context, args map[string]any) (any, error) {
+			record, err := c.store.Get(stringArg(args, "selector"))
+			if err != nil {
+				return nil, err
+			}
+			token := stringArg(args, "token")
+			if token == "" {
+				token, err = c.store.LeaseToken(record.Ticket.ID)
+				if err != nil {
+					return nil, err
+				}
+			}
+			lease, err := c.store.Heartbeat(ctx, record.Ticket.ID, token)
+			return lease, err
+		}},
+		"link": {Name: "link", Usage: "link <from> <kind> <to> | link ls <id>", Run: func(ctx context.Context, args map[string]any) (any, error) {
+			if boolArg(args, "list") {
+				return c.store.Relations(stringArg(args, "selector"))
+			}
+			from, err := c.store.Get(stringArg(args, "from"))
+			if err != nil {
+				return nil, err
+			}
+			to, err := c.store.Get(stringArg(args, "to"))
+			if err != nil {
+				return nil, err
+			}
+			event, err := c.store.Link(ctx, from.Ticket.ID, domain.RelationKind(stringArg(args, "kind")), to.Ticket.ID)
+			if err != nil {
+				return nil, err
+			}
+			return mutationData(map[string]any{"from": from.Ticket.ID, "kind": stringArg(args, "kind"), "to": to.Ticket.ID}, event), nil
+		}},
+		"unlink": {Name: "unlink", Usage: "unlink <from> <kind> <to>", Run: func(ctx context.Context, args map[string]any) (any, error) {
+			from, err := c.store.Get(stringArg(args, "from"))
+			if err != nil {
+				return nil, err
+			}
+			to, err := c.store.Get(stringArg(args, "to"))
+			if err != nil {
+				return nil, err
+			}
+			event, err := c.store.Unlink(ctx, from.Ticket.ID, domain.RelationKind(stringArg(args, "kind")), to.Ticket.ID)
+			if err != nil {
+				return nil, err
+			}
+			return mutationData(map[string]any{"from": from.Ticket.ID, "kind": stringArg(args, "kind"), "to": to.Ticket.ID}, event), nil
+		}},
+		"ready": {Name: "ready", Usage: "ready [<selector>]", Run: func(_ context.Context, args map[string]any) (any, error) {
+			selector := stringArg(args, "selector")
+			if selector != "" {
+				record, err := c.store.Get(selector)
+				if err != nil {
+					return nil, err
+				}
+				selector = record.Ticket.ID
+			}
+			rows, err := c.store.Ready(selector)
+			if err != nil {
+				return nil, err
+			}
+			if selector != "" {
+				if len(rows) != 1 {
+					return nil, fmt.Errorf("E_NOT_FOUND: ready selector matched no ticket")
+				}
+				return rows[0], nil
+			}
+			data := map[string]any{"total": len(rows), "rows": projectReadyRecords(rows)}
+			if len(rows) > ListLimit {
+				data["rows"] = projectReadyRecords(rows[:ListLimit])
+				data["distribution"] = readyDistribution(rows)
+				data["truncated"] = true
+			}
+			return data, nil
 		}},
 		"list": {Name: "list", Usage: "list [query] [--by F] [--fields F,...]", Run: func(_ context.Context, args map[string]any) (any, error) {
 			rows, err := c.store.List(stringArg(args, "query"))
@@ -275,6 +384,9 @@ func projectRecord(record store.TicketRecord, fields []string) map[string]any {
 		"assignee": record.Ticket.Assignee, "milestone": record.Ticket.Milestone, "labels": record.Ticket.Labels,
 		"hold": record.Ticket.Hold, "relations": record.Ticket.Relations, "body": record.Body, "path": record.Path,
 	}
+	if record.Relations != nil {
+		all["relations"] = record.Relations
+	}
 	if len(fields) == 0 {
 		delete(all, "body")
 		return all
@@ -285,6 +397,30 @@ func projectRecord(record store.TicketRecord, fields []string) map[string]any {
 		if value, ok := all[field]; ok {
 			result[field] = value
 		}
+	}
+	return result
+}
+
+func projectReadyRecord(record store.ReadyRecord) map[string]any {
+	result := projectRecord(record.Ticket, nil)
+	result["ready"] = record.Ready
+	result["blockers"] = record.Blockers
+	result["verdict"] = record.Verdict
+	return result
+}
+
+func projectReadyRecords(records []store.ReadyRecord) []map[string]any {
+	result := make([]map[string]any, 0, len(records))
+	for _, record := range records {
+		result = append(result, projectReadyRecord(record))
+	}
+	return result
+}
+
+func readyDistribution(records []store.ReadyRecord) map[string]int {
+	result := map[string]int{}
+	for _, record := range records {
+		result[string(record.Ticket.Ticket.Status)]++
 	}
 	return result
 }

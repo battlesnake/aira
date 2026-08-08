@@ -45,12 +45,17 @@ const (
 type RelationKind string
 
 const (
-	RelationBlocks     RelationKind = "blocks"
-	RelationParent     RelationKind = "parent"
-	RelationRelates    RelationKind = "relates"
-	RelationDuplicates RelationKind = "duplicates"
-	RelationSupersedes RelationKind = "supersedes"
-	RelationResolves   RelationKind = "resolves"
+	RelationBlocks       RelationKind = "blocks"
+	RelationBlockedBy    RelationKind = "blocked-by"
+	RelationParent       RelationKind = "parent"
+	RelationChild        RelationKind = "child"
+	RelationRelates      RelationKind = "relates"
+	RelationDuplicates   RelationKind = "duplicates"
+	RelationDuplicatedBy RelationKind = "duplicated-by"
+	RelationSupersedes   RelationKind = "supersedes"
+	RelationSupersededBy RelationKind = "superseded-by"
+	RelationResolves     RelationKind = "resolves"
+	RelationResolvedBy   RelationKind = "resolved-by"
 )
 
 type Relation struct {
@@ -176,6 +181,102 @@ func validRelation(k RelationKind) bool {
 	default:
 		return false
 	}
+}
+
+// ValidRelationKind reports whether k is one of the six writable, forward
+// relation kinds. Inverse kinds are query projections and cannot be stored.
+func ValidRelationKind(k RelationKind) bool { return validRelation(k) }
+
+// Inverse returns the derived query kind for a stored forward relation.
+func (k RelationKind) Inverse() RelationKind {
+	switch k {
+	case RelationBlocks:
+		return RelationBlockedBy
+	case RelationParent:
+		return RelationChild
+	case RelationRelates:
+		return RelationRelates
+	case RelationDuplicates:
+		return RelationDuplicatedBy
+	case RelationSupersedes:
+		return RelationSupersededBy
+	case RelationResolves:
+		return RelationResolvedBy
+	default:
+		return ""
+	}
+}
+
+func (k RelationKind) IsForward() bool { return validRelation(k) }
+
+// CanonicalRelationOwner is the lower-ID endpoint according to the Phase-1
+// prefix/numeric ordering. It is the only ticket file allowed to store a
+// relation between from and to.
+func CanonicalRelationOwner(from, to string) string {
+	if idLess(from, to) {
+		return from
+	}
+	return to
+}
+
+// IDLess exposes the canonical ticket ordering to storage projections without
+// exposing the parser internals used to implement it.
+func IDLess(a, b string) bool { return idLess(a, b) }
+
+// RelationView is a stored relation or its pure derived inverse as presented
+// from a ticket. It deliberately has no storage marker: inverse rows are not
+// persisted and cannot be mistaken for canonical content.
+type RelationView struct {
+	Kind RelationKind `json:"kind"`
+	From string       `json:"from"`
+	To   string       `json:"to"`
+}
+
+// Lease is a sum type. A free lease has no holder data; a held lease carries
+// every field required to evaluate liveness. The database serialises this
+// value but is never the source of its liveness semantics.
+type Lease struct {
+	TicketID string     `json:"ticket_id"`
+	State    LeaseState `json:"state"`
+}
+
+type LeaseState interface{ leaseState() }
+
+type FreeLease struct {
+	Generation uint64 `json:"generation"`
+}
+
+func (FreeLease) leaseState() {}
+
+type HeldLease struct {
+	HolderTokenHash     [32]byte `json:"-"`
+	BootID              string   `json:"boot_id"`
+	LastHeartbeatMonoNS uint64   `json:"last_heartbeat_mono_ns"`
+	TTLNS               uint64   `json:"ttl_ns"`
+	Generation          uint64   `json:"generation"`
+	Actor               string   `json:"actor"`
+	Worktree            string   `json:"worktree"`
+}
+
+func (HeldLease) leaseState() {}
+
+// IsLive is a pure function of the held state and the supplied clock sample.
+// It intentionally uses subtraction to make expiry safe across uint64 wrap.
+func (h HeldLease) IsLive(bootID string, monoNowNS uint64) bool {
+	if h.BootID == "" || bootID == "" || h.BootID != bootID || monoNowNS < h.LastHeartbeatMonoNS {
+		return false
+	}
+	return monoNowNS-h.LastHeartbeatMonoNS < h.TTLNS
+}
+
+func (l Lease) Held() (HeldLease, bool) {
+	h, ok := l.State.(HeldLease)
+	return h, ok
+}
+
+func (l Lease) Free() (FreeLease, bool) {
+	f, ok := l.State.(FreeLease)
+	return f, ok
 }
 
 func RenderTicket(ticket Ticket, body string) ([]byte, error) {

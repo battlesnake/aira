@@ -52,7 +52,7 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 	report := CheckReport{Verdict: "pass", Dimensions: map[string]string{
 		"allocated-id-file": "pass", "duplicate-id": "pass", "stale-index": "pass",
 		"orphan-worktree": "pass", "ticket-file-integrity": "pass", "reconcile-integrity": "pass",
-		"rebuild-integrity": "pass", "relation-integrity": "deferred",
+		"rebuild-integrity": "pass", "relation-integrity": "pass", "lease-integrity": "pass",
 	}}
 	if err := ctx.Err(); err != nil {
 		report.Verdict = "unevaluated"
@@ -128,6 +128,16 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 	if err := s.checkDuplicateIDs(ctx, &report); err != nil {
 		return CheckReport{}, err
 	}
+	if relationFindings, err := s.relationFindings(); err != nil {
+		return CheckReport{}, err
+	} else {
+		for _, finding := range relationFindings {
+			switch finding.Code {
+			case "E_RELATION_TARGET_MISSING", "E_RELATION_INVALID":
+				addFinding(&report, finding, "relation-integrity")
+			}
+		}
+	}
 
 	worktrees, err := s.db.Query(`SELECT worktree_id, root, active FROM worktrees WHERE project_id=?`, s.projectID)
 	if err != nil {
@@ -151,8 +161,20 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 	}
 	_ = worktrees.Close()
 
+	if err := s.leaseFileOrphanWarnings(ctx, &report); err != nil {
+		if ErrorCode(err) == "E_CLOCK_UNAVAILABLE" {
+			report.Dimensions["lease-integrity"] = "unevaluated"
+			report.Unevaluated = true
+			report.UnevaluatedFindings = append(report.UnevaluatedFindings, CheckFinding{Code: "E_CLOCK_UNAVAILABLE", Subject: "leases", Message: err.Error(), Kind: "unevaluated"})
+		} else {
+			return CheckReport{}, err
+		}
+	}
+
 	if len(report.Findings) > 0 {
 		report.Verdict = "fail"
+	} else if report.Unevaluated {
+		report.Verdict = "unevaluated"
 	}
 	return report, nil
 }

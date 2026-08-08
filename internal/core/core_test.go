@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os/exec"
+	"path/filepath"
 	"testing"
 
 	"aira/internal/store"
@@ -116,6 +117,59 @@ func TestDispatchesAllMilestoneVerbsThroughCore(t *testing.T) {
 	}
 }
 
+func TestDispatchesM3CoordinationVerbsThroughCore(t *testing.T) {
+	s := coreTestStore(t)
+	c := New(s)
+	create := func(title string) string {
+		response := c.Do(context.Background(), Request{Verb: "create", Args: map[string]any{"title": title}})
+		if !response.OK {
+			t.Fatalf("create %s: %#v", title, response)
+		}
+		var data map[string]any
+		marshalRoundTrip(t, response.Data, &data)
+		return data["id"].(string)
+	}
+	prerequisite, dependent := create("prerequisite"), create("dependent")
+	claim := c.Do(context.Background(), Request{Verb: "claim", Args: map[string]any{"selector": dependent, "actor": "core"}})
+	if !claim.OK {
+		t.Fatalf("claim: %#v", claim)
+	}
+	heartbeat := c.Do(context.Background(), Request{Verb: "heartbeat", Args: map[string]any{"selector": dependent}})
+	if !heartbeat.OK {
+		t.Fatalf("heartbeat: %#v", heartbeat)
+	}
+	link := c.Do(context.Background(), Request{Verb: "link", Args: map[string]any{"from": prerequisite, "kind": "blocks", "to": dependent}})
+	if !link.OK || link.Code != "OK" {
+		t.Fatalf("link: %#v", link)
+	}
+	list := c.Do(context.Background(), Request{Verb: "link", Args: map[string]any{"list": true, "selector": dependent}})
+	if !list.OK {
+		t.Fatalf("link ls: %#v", list)
+	}
+	var views []map[string]any
+	marshalRoundTrip(t, list.Data, &views)
+	if len(views) != 1 || views[0]["kind"] != "blocked-by" {
+		t.Fatalf("derived link view = %#v", views)
+	}
+	ready := c.Do(context.Background(), Request{Verb: "ready", Args: map[string]any{}})
+	if !ready.OK {
+		t.Fatalf("ready: %#v", ready)
+	}
+	var readyData struct {
+		Total int `json:"total"`
+	}
+	marshalRoundTrip(t, ready.Data, &readyData)
+	if readyData.Total != 1 {
+		t.Fatalf("ready total = %#v", readyData)
+	}
+	if response := c.Do(context.Background(), Request{Verb: "release", Args: map[string]any{"selector": dependent}}); !response.OK {
+		t.Fatalf("release: %#v", response)
+	}
+	if response := c.Do(context.Background(), Request{Verb: "unlink", Args: map[string]any{"from": prerequisite, "kind": "blocks", "to": dependent}}); !response.OK {
+		t.Fatalf("unlink: %#v", response)
+	}
+}
+
 func TestListOverflowIncludesDistributionAndTotal(t *testing.T) {
 	s := coreTestStore(t)
 	c := New(s)
@@ -166,7 +220,7 @@ func coreTestStore(t *testing.T) *store.Store {
 	s, err := store.Open(context.Background(), store.Options{
 		Root: base, CommonDir: base + "/common", DBPath: base + "/state/state.db",
 		RegistryPath: base + "/state/registry.jsonl", ProjectID: "project-core",
-		WorktreeID: "main", ProjectSlug: "core-project", Prefixes: []string{"AIRA"},
+		WorktreeID: "main", ProjectSlug: "core-project", Prefixes: []string{"AIRA"}, LeaseStateDir: filepath.Join(base, "lease-state"),
 	})
 	if err != nil {
 		t.Fatal(err)

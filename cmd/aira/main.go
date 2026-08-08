@@ -85,7 +85,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 			continue
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "rebuild" {
+		if name == "rebuild" || name == "steal" {
 			options[name] = "true"
 			continue
 		}
@@ -118,6 +118,8 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"new":    {"kind": true, "severity": true, "labels": true, "body": true},
 		"list":   {"by": true, "fields": true}, "ls": {"by": true, "fields": true},
 		"count": {"by": true}, "reconcile": {"rebuild": true},
+		"claim":   {"steal": true, "actor": true},
+		"release": {"token": true}, "heartbeat": {"token": true},
 	}
 	for name := range options {
 		if !allowed[verb][name] {
@@ -168,6 +170,36 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			return core.Request{}, fmt.Errorf("mv requires <selector> <status>")
 		}
 		args["selector"], args["status"] = positional[0], positional[1]
+	case "claim":
+		if len(positional) != 1 {
+			return core.Request{}, fmt.Errorf("claim requires <id>")
+		}
+		args["selector"], args["steal"], args["actor"] = positional[0], options["steal"] == "true", options["actor"]
+	case "release", "heartbeat":
+		if len(positional) != 1 {
+			return core.Request{}, fmt.Errorf("%s requires <id>", verb)
+		}
+		args["selector"], args["token"] = positional[0], options["token"]
+	case "link":
+		if len(positional) == 2 && positional[0] == "ls" {
+			args["list"], args["selector"] = true, positional[1]
+		} else if len(positional) == 3 {
+			args["from"], args["kind"], args["to"] = positional[0], positional[1], positional[2]
+		} else {
+			return core.Request{}, fmt.Errorf("link requires <from> <kind> <to> or ls <id>")
+		}
+	case "unlink":
+		if len(positional) != 3 {
+			return core.Request{}, fmt.Errorf("unlink requires <from> <kind> <to>")
+		}
+		args["from"], args["kind"], args["to"] = positional[0], positional[1], positional[2]
+	case "ready":
+		if len(positional) > 1 {
+			return core.Request{}, fmt.Errorf("ready accepts at most one selector")
+		}
+		if len(positional) == 1 {
+			args["selector"] = positional[0]
+		}
 	case "reconcile":
 		if len(positional) != 0 {
 			return core.Request{}, fmt.Errorf("reconcile accepts no positional arguments")

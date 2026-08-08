@@ -19,7 +19,7 @@ func TestCheckExitCodesForPassFailUnevaluatedAndStoreError(t *testing.T) {
 	}
 	var passReport store.CheckReport
 	marshalRoundTrip(t, pass.Data, &passReport)
-	if passReport.Dimensions["relation-integrity"] != "deferred" {
+	if passReport.Dimensions["relation-integrity"] != "pass" {
 		t.Fatalf("relation dimension = %#v", passReport.Dimensions)
 	}
 
@@ -69,7 +69,7 @@ func TestCancelledCheckProducesRuntimeUnevaluatedExitThree(t *testing.T) {
 	}
 	var report store.CheckReport
 	marshalRoundTrip(t, response.Data, &report)
-	if !report.Unevaluated || report.Dimensions["relation-integrity"] != "deferred" {
+	if !report.Unevaluated || report.Dimensions["relation-integrity"] != "unevaluated" {
 		t.Fatalf("runtime unevaluated report = %#v", report)
 	}
 	for _, dimension := range []string{

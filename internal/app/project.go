@@ -105,6 +105,7 @@ func Open(ctx context.Context, cwd string) (*store.Store, Project, error) {
 		RegistryPath: filepath.Join(project.StateDir, "registry.jsonl"),
 		ProjectID:    project.ProjectID, WorktreeID: project.WorktreeID,
 		ProjectSlug: project.Config.Project.Slug, Prefixes: project.Config.Project.Prefixes,
+		LeaseTTLNS: leaseTTLNS(project.Config),
 	})
 	if err != nil {
 		return nil, Project{}, err
@@ -173,6 +174,7 @@ func Init(ctx context.Context, cwd string, args map[string]any) (InitResult, err
 		Root: root, CommonDir: common,
 		DBPath: filepath.Join(state, "state.db"), RegistryPath: filepath.Join(state, "registry.jsonl"),
 		ProjectID: hashID(canonicalCommon), WorktreeID: hashID(canonicalGitDir), ProjectSlug: slug, Prefixes: prefixes,
+		LeaseTTLNS: leaseTTLNS(config),
 	})
 	if err != nil {
 		return InitResult{}, err
@@ -197,6 +199,13 @@ func Init(ctx context.Context, cwd string, args map[string]any) (InitResult, err
 		return InitResult{}, err
 	}
 	return InitResult{Root: filepath.ToSlash(relRoot), Config: filepath.ToSlash(relConfig), Project: slug, Prefixes: prefixes, Created: true}, nil
+}
+
+func leaseTTLNS(config Config) uint64 {
+	if config.Lease.TTLSeconds <= 0 {
+		return 0
+	}
+	return uint64(config.Lease.TTLSeconds) * 1000 * 1000 * 1000
 }
 
 func findConfig(root string) (string, error) {

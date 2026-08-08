@@ -22,12 +22,13 @@ const ListLimit = 50
 // metadata. Body is intentionally kept out of domain.Ticket because it is file
 // content, not frontmatter state.
 type TicketRecord struct {
-	Ticket     domain.Ticket `json:"ticket"`
-	Body       string        `json:"body,omitempty"`
-	Path       string        `json:"path"`
-	WorktreeID string        `json:"worktree_id"`
-	Digest     string        `json:"digest,omitempty"`
-	Warnings   []string      `json:"-"`
+	Ticket     domain.Ticket         `json:"ticket"`
+	Body       string                `json:"body,omitempty"`
+	Path       string                `json:"path"`
+	WorktreeID string                `json:"worktree_id"`
+	Digest     string                `json:"digest,omitempty"`
+	Warnings   []string              `json:"-"`
+	Relations  []domain.RelationView `json:"relations,omitempty"`
 }
 
 type selector struct {
@@ -272,6 +273,11 @@ func (s *Store) exactRecord(id, anchor string) (TicketRecord, error) {
 		return TicketRecord{}, fmt.Errorf("E_CONFIG_INVALID: filename/frontmatter mismatch %s", repoPath(s.root, path))
 	}
 	record := TicketRecord{Ticket: ticket, Body: body, Path: repoPath(s.root, path), WorktreeID: s.worktreeID, Digest: digestBytes(data)}
+	if relations, relationErr := s.derivedRelationViews(id); relationErr != nil {
+		return TicketRecord{}, relationErr
+	} else {
+		record.Relations = relations
+	}
 	var indexedDigest string
 	err = s.db.QueryRow(`SELECT digest FROM tickets WHERE project_id=? AND worktree_id=? AND id=?`, s.projectID, s.worktreeID, id).Scan(&indexedDigest)
 	if err == nil && indexedDigest != record.Digest {
