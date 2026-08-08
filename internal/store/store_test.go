@@ -344,10 +344,11 @@ func TestRebuildScansSiblingWorkingTreeAndCommittedRef(t *testing.T) {
 		t.Fatal(err)
 	}
 	gitRun(t, mainRoot, "init")
-	writeTicketFile(t, filepath.Join(mainRoot, ".aira", "tickets", "AIRA-30.md"), "AIRA-30")
+	gitRun(t, sibling, "init")
+	writeTicketFile(t, filepath.Join(mainRoot, ".aira", "tickets", "AIRA-50.md"), "AIRA-50")
 	gitRun(t, mainRoot, "add", ".")
 	gitRun(t, mainRoot, "-c", "user.name=AIRA", "-c", "user.email=aira@example.invalid", "commit", "-m", "seed")
-	if err := os.Remove(filepath.Join(mainRoot, ".aira", "tickets", "AIRA-30.md")); err != nil {
+	if err := os.Remove(filepath.Join(mainRoot, ".aira", "tickets", "AIRA-50.md")); err != nil {
 		t.Fatal(err)
 	}
 	writeTicketFile(t, filepath.Join(sibling, ".aira", "tickets", "AIRA-40.md"), "AIRA-40")
@@ -363,8 +364,8 @@ func TestRebuildScansSiblingWorkingTreeAndCommittedRef(t *testing.T) {
 	if err != nil {
 		t.Fatalf("allocate after rebuild: %v", err)
 	}
-	if id != "AIRA-41" {
-		t.Fatalf("rebuilt next ID = %s, want AIRA-41", id)
+	if id != "AIRA-51" {
+		t.Fatalf("rebuilt next ID = %s, want AIRA-51", id)
 	}
 }
 
@@ -386,7 +387,9 @@ func TestRebuildScansReceiptOnlyAndJournalHighWaterMarks(t *testing.T) {
 	}
 	receipt := AllocationReceipt{ProjectID: "project-aira", WorktreeID: "burned", ID: "AIRA-99", Path: filepath.Join(root, ".aira", "tickets", "AIRA-99.md"), Seq: 41, State: "allocated"}
 	writeJSONL(t, filepath.Join(common, "aira", "receipts.jsonl"), receipt)
-	writeJSONL(t, filepath.Join(common, "aira", "journal.jsonl"), eventRecord{ProjectID: "project-aira", Seq: 41, Verb: "id.allocate", Target: "AIRA-99", PayloadDigest: digestBytes([]byte("id.allocate\x00AIRA-99"))})
+	writeJSONL(t, filepath.Join(common, "aira", "journal.jsonl"),
+		eventRecord{ProjectID: "project-aira", Seq: 41, Verb: "id.allocate", Target: "AIRA-99", PayloadDigest: digestBytes([]byte("id.allocate\x00AIRA-99"))},
+		eventRecord{ProjectID: "project-aira", Seq: 60, Verb: "ticket.update", Target: "AIRA-99", PayloadDigest: digestBytes([]byte("ticket.update\x00AIRA-99"))})
 	recovered := openTestStore(t, root, common, state, "main", "AIRA")
 	if err := recovered.Rebuild(context.Background()); err != nil {
 		t.Fatalf("rebuild from audit: %v", err)
@@ -402,8 +405,129 @@ func TestRebuildScansReceiptOnlyAndJournalHighWaterMarks(t *testing.T) {
 	if err := recovered.db.QueryRow(`SELECT seq FROM allocations WHERE project_id=? AND prefix=? AND number=?`, "project-aira", "AIRA", 100).Scan(&seq); err != nil {
 		t.Fatal(err)
 	}
-	if seq != 42 {
-		t.Fatalf("rebuilt journal HWM allocated seq %d, want 42", seq)
+	if seq != 61 {
+		t.Fatalf("rebuilt journal HWM allocated seq %d, want 61", seq)
+	}
+}
+
+func TestRebuildIsIdempotentForExistingUnjournaledAllocationEvent(t *testing.T) {
+	base := persistentTemp(t, "rebuild-event-retry")
+	root := filepath.Join(base, "main")
+	common := filepath.Join(base, "common")
+	state := filepath.Join(base, "state")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := openTestStore(t, root, common, state, "main", "AIRA")
+	receipt := AllocationReceipt{ProjectID: "project-aira", WorktreeID: "main", ID: "AIRA-12", Path: filepath.Join(root, ".aira", "tickets", "AIRA-12.md"), Seq: 42, State: "allocated"}
+	writeJSONL(t, filepath.Join(common, "aira", "receipts.jsonl"), receipt)
+	digest := digestBytes([]byte("id.allocate\x00AIRA-12"))
+	if _, err := s.db.Exec(`INSERT INTO events(project_id,seq,at_wall,actor,verb,target,payload_digest,journaled) VALUES(?,?,?,?,?,?,?,0)`,
+		"project-aira", receipt.Seq, time.Now().UTC().Format(time.RFC3339Nano), "aira", "id.allocate", receipt.ID, digest); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rebuild(context.Background()); err != nil {
+		t.Fatalf("first rebuild: %v", err)
+	}
+	if err := s.Rebuild(context.Background()); err != nil {
+		t.Fatalf("second rebuild: %v", err)
+	}
+	var events, allocations int
+	if err := s.db.QueryRow(`SELECT count(*) FROM events WHERE project_id=? AND seq=?`, receipt.ProjectID, receipt.Seq).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM allocations WHERE project_id=? AND seq=?`, receipt.ProjectID, receipt.Seq).Scan(&allocations); err != nil {
+		t.Fatal(err)
+	}
+	if events != 1 || allocations != 1 {
+		t.Fatalf("rebuild retry counts = events %d, allocations %d; want 1, 1", events, allocations)
+	}
+}
+
+func TestRebuildToleratesTornReceiptAndJournalTails(t *testing.T) {
+	base := persistentTemp(t, "rebuild-torn-tail")
+	root := filepath.Join(base, "main")
+	common := filepath.Join(base, "common")
+	state := filepath.Join(base, "state")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := openTestStore(t, root, common, state, "main", "AIRA")
+	_ = s.Close()
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		_ = os.Remove(filepath.Join(state, "state.db"+suffix))
+	}
+	audit := filepath.Join(common, "aira")
+	receiptPath := filepath.Join(audit, "receipts.jsonl")
+	journalPath := filepath.Join(audit, "journal.jsonl")
+	receipt := AllocationReceipt{ProjectID: "project-aira", WorktreeID: "burned", ID: "AIRA-99", Path: filepath.Join(root, ".aira", "tickets", "AIRA-99.md"), Seq: 41, State: "allocated"}
+	writeJSONL(t, receiptPath, receipt)
+	appendFileBytes(t, receiptPath, []byte(`{"project_id":"project-aira","id":"AIRA-100"`))
+	event41 := eventRecord{ProjectID: "project-aira", Seq: 41, Verb: "id.allocate", Target: "AIRA-99", PayloadDigest: digestBytes([]byte("id.allocate\x00AIRA-99"))}
+	event60 := eventRecord{ProjectID: "project-aira", Seq: 60, Verb: "ticket.update", Target: "AIRA-99", PayloadDigest: digestBytes([]byte("ticket.update\x00AIRA-99"))}
+	writeJSONL(t, journalPath, event41, event60)
+	appendFileBytes(t, journalPath, []byte(`{"project_id":"project-aira","seq":61,"verb":"ticket.update"`))
+	recovered := openTestStore(t, root, common, state, "main", "AIRA")
+	if err := recovered.Rebuild(context.Background()); err != nil {
+		t.Fatalf("rebuild with torn tails: %v", err)
+	}
+	id, err := recovered.AllocateID(context.Background(), "AIRA")
+	if err != nil {
+		t.Fatalf("allocate after torn-tail rebuild: %v", err)
+	}
+	if id != "AIRA-100" {
+		t.Fatalf("valid receipt was not used; allocated %s, want AIRA-100", id)
+	}
+	var seq int64
+	if err := recovered.db.QueryRow(`SELECT seq FROM allocations WHERE project_id=? AND prefix=? AND number=?`, "project-aira", "AIRA", 100).Scan(&seq); err != nil {
+		t.Fatal(err)
+	}
+	if seq != 61 {
+		t.Fatalf("valid journal HWM was not used; allocated seq %d, want 61", seq)
+	}
+	for _, tail := range []struct {
+		path string
+		data []byte
+	}{
+		{receiptPath, []byte(`{"project_id":"project-aira","id":"AIRA-100"`)},
+		{journalPath, []byte(`{"project_id":"project-aira","seq":61,"verb":"ticket.update"`)},
+	} {
+		evidence := tail.path + ".torn-tail-" + digestBytes(tail.data)[:16]
+		if _, err := os.Stat(evidence); err != nil {
+			t.Fatalf("missing torn-tail evidence %s: %v", evidence, err)
+		}
+	}
+}
+
+func TestRebuildSkipsStaleRegistryWorktree(t *testing.T) {
+	base := persistentTemp(t, "rebuild-stale-worktree")
+	root := filepath.Join(base, "main")
+	stale := filepath.Join(base, "removed")
+	if err := os.MkdirAll(filepath.Join(root, ".aira", "tickets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "init")
+	writeTicketFile(t, filepath.Join(root, ".aira", "tickets", "AIRA-3.md"), "AIRA-3")
+	s := openTestStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"), "main", "AIRA")
+	if err := s.RegisterWorktree(context.Background(), "removed", stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rebuild(context.Background()); err != nil {
+		t.Fatalf("rebuild with stale registry worktree: %v", err)
+	}
+	id, err := s.AllocateID(context.Background(), "AIRA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "AIRA-4" {
+		t.Fatalf("live worktree was not rebuilt after stale entry; allocated %s, want AIRA-4", id)
+	}
+	var findings int
+	if err := s.db.QueryRow(`SELECT count(*) FROM findings WHERE project_id=? AND code=?`, s.projectID, "E_GIT_SCAN").Scan(&findings); err != nil {
+		t.Fatal(err)
+	}
+	if findings != 1 {
+		t.Fatalf("stale worktree findings = %d, want 1", findings)
 	}
 }
 
@@ -415,6 +539,7 @@ func TestRebuildRetriesMissingRecoveredReceipt(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, ".aira", "tickets"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	gitRun(t, root, "init")
 	writeTicketFile(t, filepath.Join(root, ".aira", "tickets", "AIRA-7.md"), "AIRA-7")
 	s := openTestStore(t, root, common, state, "main", "AIRA")
 	if _, err := s.db.Exec(`INSERT INTO allocations(project_id,prefix,number,worktree_id,state,path,seq) VALUES(?,?,?,?,?,?,?)`, "project-aira", "AIRA", 7, "main", "recovered", filepath.Join(root, ".aira", "tickets", "AIRA-7.md"), 12); err != nil {
@@ -455,6 +580,41 @@ func TestRebuildIncludesUnregisteredGitWorktree(t *testing.T) {
 	}
 	if id != "AIRA-56" {
 		t.Fatalf("unregistered worktree rebuilt next ID %s, want AIRA-56", id)
+	}
+}
+
+func TestRebuildScansCommittedDeletedRefAboveWorktree(t *testing.T) {
+	base := persistentTemp(t, "rebuild-git-ref-hwm")
+	mainRoot := filepath.Join(base, "main")
+	sibling := filepath.Join(base, "sibling")
+	if err := os.MkdirAll(filepath.Join(mainRoot, ".aira", "tickets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(sibling, ".aira", "tickets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, mainRoot, "init")
+	gitRun(t, sibling, "init")
+	writeTicketFile(t, filepath.Join(mainRoot, ".aira", "tickets", "AIRA-60.md"), "AIRA-60")
+	gitRun(t, mainRoot, "add", ".")
+	gitRun(t, mainRoot, "-c", "user.name=AIRA", "-c", "user.email=aira@example.invalid", "commit", "-m", "seed")
+	if err := os.Remove(filepath.Join(mainRoot, ".aira", "tickets", "AIRA-60.md")); err != nil {
+		t.Fatal(err)
+	}
+	writeTicketFile(t, filepath.Join(sibling, ".aira", "tickets", "AIRA-55.md"), "AIRA-55")
+	s := openTestStore(t, mainRoot, filepath.Join(base, "common"), filepath.Join(base, "state"), "main", "AIRA")
+	if err := s.RegisterWorktree(context.Background(), "sibling-id", sibling); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rebuild(context.Background()); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	id, err := s.AllocateID(context.Background(), "AIRA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "AIRA-61" {
+		t.Fatalf("committed deleted ref rebuilt next ID %s, want AIRA-61", id)
 	}
 }
 
@@ -567,6 +727,33 @@ func TestWriteAtomicReplaysStaleTemp(t *testing.T) {
 	}
 }
 
+func TestWriteAtomicDoesNotFollowTempSymlink(t *testing.T) {
+	base := persistentTemp(t, "symlink-temp")
+	path := filepath.Join(base, "nested", "ticket.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(base, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("preserve"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tmp := filepath.Join(filepath.Dir(path), ".ticket.md.aira-tmp-9")
+	if err := os.Symlink(sentinel, tmp); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAtomic(path, []byte("ticket"), 9); err != nil {
+		t.Fatalf("materialise through symlink temp: %v", err)
+	}
+	data, err := os.ReadFile(sentinel)
+	if err != nil || string(data) != "preserve" {
+		t.Fatalf("sentinel = %q, err=%v; symlink was followed", data, err)
+	}
+	data, err = os.ReadFile(path)
+	if err != nil || string(data) != "ticket" {
+		t.Fatalf("ticket = %q, err=%v", data, err)
+	}
+}
+
 func TestJournalDedupRejectsDifferentPayload(t *testing.T) {
 	base := persistentTemp(t, "journal-digest")
 	path := filepath.Join(base, "journal.jsonl")
@@ -674,7 +861,7 @@ func TestReconcileContinuesAfterConflictAndRecordsFinding(t *testing.T) {
 	}
 }
 
-func TestScanRefMaxReportsBrokenGitRef(t *testing.T) {
+func TestScanRefMaxIgnoresBrokenRefWarning(t *testing.T) {
 	base := persistentTemp(t, "broken-ref")
 	root := filepath.Join(base, "repo")
 	if err := os.MkdirAll(root, 0o755); err != nil {
@@ -687,21 +874,47 @@ func TestScanRefMaxReportsBrokenGitRef(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, ".git", "refs", "heads", "broken"), []byte("deadbeef\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := scanRefMax(root); err == nil {
-		t.Fatal("broken git ref was silently ignored")
+	if _, err := scanRefMax(root); err != nil {
+		t.Fatalf("exit-0 broken-ref warning should be ignored: %v", err)
 	}
 }
 
-func writeJSONL(t *testing.T, path string, value any) {
+func writeJSONL(t *testing.T, path string, values ...any) {
 	t.Helper()
-	data, err := json.Marshal(value)
-	if err != nil {
-		t.Fatal(err)
-	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range values {
+		data, err := json.Marshal(value)
+		if err != nil {
+			_ = f.Close()
+			t.Fatal(err)
+		}
+		if _, err := f.Write(append(data, '\n')); err != nil {
+			_ = f.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func appendFileBytes(t *testing.T, path string, data []byte) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
 }

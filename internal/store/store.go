@@ -642,6 +642,16 @@ func (s *Store) recordFinding(ctx context.Context, intent Intent, cause error) e
 	})
 }
 
+func (s *Store) recordRebuildFinding(ctx context.Context, entry registryEntry, reason string) error {
+	return s.withImmediate(ctx, func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx, `INSERT INTO findings(project_id, finding_key, code, subject, details, created_at)
+			VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(project_id, finding_key) DO UPDATE SET details=excluded.details`,
+			s.projectID, "rebuild:git-root:"+digestBytes([]byte(entry.Root)), "E_GIT_SCAN", entry.Root,
+			reason, time.Now().UTC().Format(time.RFC3339Nano))
+		return err
+	})
+}
+
 func (s *Store) reconcile(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx, `SELECT project_id, seq, worktree_id, path, verb, precondition_digest,
 		intended_digest, intended_bytes, materialised, journaled, allocation_id FROM outbox
@@ -781,6 +791,13 @@ func (s *Store) Rebuild(ctx context.Context) error {
 	}
 	var scanned []scannedTicket
 	for _, entry := range entries {
+		valid, reason := validGitRoot(entry.Root)
+		if !valid {
+			if err := s.recordRebuildFinding(ctx, entry, reason); err != nil {
+				return err
+			}
+			continue
+		}
 		tickets, err := scanTickets(entry.Root, entry.WorktreeID)
 		if err != nil {
 			return err
@@ -943,9 +960,18 @@ func ensureAllocationEvent(ctx context.Context, conn *sql.Conn, project, id, wor
 		}
 		verb, target, payload = fromJournal.Verb, fromJournal.Target, fromJournal.PayloadDigest
 	} else {
-		if _, err := conn.ExecContext(ctx, `INSERT INTO events(project_id,seq,at_wall,actor,verb,target,payload_digest,journaled) VALUES(?,?,?,'aira',?,?,?,0)`,
-			project, seq, time.Now().UTC().Format(time.RFC3339Nano), verb, target, payload); err != nil {
+		var existing eventRecord
+		err := conn.QueryRowContext(ctx, `SELECT project_id, seq, at_wall, actor, verb, target, payload_digest FROM events WHERE project_id=? AND seq=?`, project, seq).
+			Scan(&existing.ProjectID, &existing.Seq, &existing.At, &existing.Actor, &existing.Verb, &existing.Target, &existing.PayloadDigest)
+		if errors.Is(err, sql.ErrNoRows) {
+			if _, err := conn.ExecContext(ctx, `INSERT INTO events(project_id,seq,at_wall,actor,verb,target,payload_digest,journaled) VALUES(?,?,?,'aira',?,?,?,0)`,
+				project, seq, time.Now().UTC().Format(time.RFC3339Nano), verb, target, payload); err != nil {
+				return err
+			}
+		} else if err != nil {
 			return err
+		} else if existing.Verb != verb || existing.Target != target || existing.PayloadDigest != payload {
+			return fmt.Errorf("E_JOURNAL_CORRUPT: duplicate project/seq %s/%d has different payload", project, seq)
 		}
 	}
 	_, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO outbox(project_id,seq,worktree_id,path,verb,precondition_digest,intended_digest,intended_bytes,materialised,journaled,allocation_id)
@@ -1113,7 +1139,20 @@ func writeAtomic(path string, data []byte, seq int64) error {
 		return err
 	}
 	tmp := filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".aira-tmp-"+strconv.FormatInt(seq, 10))
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	var f *os.File
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		f, err = os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY|unix.O_NOFOLLOW, 0o644)
+		if err == nil {
+			break
+		}
+		if (!errors.Is(err, os.ErrExist) && !errors.Is(err, unix.ELOOP)) || attempt == 1 {
+			return err
+		}
+		if removeErr := os.Remove(tmp); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return removeErr
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -1278,19 +1317,7 @@ func repairJSONLTail(f *os.File) error {
 	}
 	tail := append([]byte(nil), data[cut:]...)
 	if len(tail) > 0 {
-		evidence := f.Name() + ".torn-tail-" + digestBytes(tail)[:16]
-		evidenceFile, err := os.OpenFile(evidence, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-		if err == nil {
-			if _, writeErr := evidenceFile.Write(tail); writeErr != nil {
-				_ = evidenceFile.Close()
-				return writeErr
-			}
-			if syncErr := evidenceFile.Sync(); syncErr != nil {
-				_ = evidenceFile.Close()
-				return syncErr
-			}
-			_ = evidenceFile.Close()
-		} else if !errors.Is(err, os.ErrExist) {
+		if err := preserveTornTail(f.Name(), tail); err != nil {
 			return err
 		}
 	}
@@ -1301,6 +1328,26 @@ func repairJSONLTail(f *os.File) error {
 		return err
 	}
 	return f.Sync()
+}
+
+func preserveTornTail(path string, tail []byte) error {
+	evidence := path + ".torn-tail-" + digestBytes(tail)[:16]
+	evidenceFile, err := os.OpenFile(evidence, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if errors.Is(err, os.ErrExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := evidenceFile.Write(tail); err != nil {
+		_ = evidenceFile.Close()
+		return err
+	}
+	if err := evidenceFile.Sync(); err != nil {
+		_ = evidenceFile.Close()
+		return err
+	}
+	return evidenceFile.Close()
 }
 
 func unlockFile(f *os.File) {
@@ -1353,15 +1400,18 @@ func discoverWorktrees(root, projectID string, registry []registryEntry) ([]regi
 	if _, ok := byRoot[absoluteRoot]; !ok {
 		byRoot[absoluteRoot] = registryEntry{ProjectID: projectID, WorktreeID: "current", Root: absoluteRoot}
 	}
-	out, err := exec.Command("git", "-C", absoluteRoot, "worktree", "list", "--porcelain").CombinedOutput()
+	if _, err := os.Stat(absoluteRoot); err != nil {
+		return sortedRegistryEntries(byRoot), nil
+	}
+	out, stderr, err := runGit(absoluteRoot, "worktree", "list", "--porcelain")
 	if err != nil {
-		if isNotGitRepository(string(out)) {
+		if isNotGitRepository(stderr) {
 			return sortedRegistryEntries(byRoot), nil
 		}
-		return nil, fmt.Errorf("E_GIT_SCAN: worktree list: %w: %s", err, strings.TrimSpace(string(out)))
+		return nil, fmt.Errorf("E_GIT_SCAN: worktree list: %w: %s", err, strings.TrimSpace(stderr))
 	}
 	var worktreeRoot string
-	for _, line := range strings.Split(string(out), "\n") {
+	for _, line := range strings.Split(out, "\n") {
 		switch {
 		case strings.HasPrefix(line, "worktree "):
 			worktreeRoot = strings.TrimSpace(strings.TrimPrefix(line, "worktree "))
@@ -1410,24 +1460,45 @@ func isNotGitRepository(output string) bool {
 	return strings.Contains(output, "not a git repository") || strings.Contains(output, "not a git work tree")
 }
 
-func readReceipts(path string) ([]AllocationReceipt, error) {
-	f, err := os.Open(path)
+func runGit(root string, args ...string) (string, string, error) {
+	cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return stdout.String(), stderr.String(), err
+}
+
+func validGitRoot(root string) (bool, string) {
+	info, err := os.Stat(root)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return false, "worktree root does not exist"
 	}
+	if err != nil {
+		return false, fmt.Sprintf("stat worktree root: %v", err)
+	}
+	if !info.IsDir() {
+		return false, "worktree root is not a directory"
+	}
+	top, stderr, err := runGit(root, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return false, fmt.Sprintf("rev-parse: %v: %s", err, strings.TrimSpace(stderr))
+	}
+	if filepath.Clean(strings.TrimSpace(top)) != filepath.Clean(root) {
+		return false, fmt.Sprintf("git top-level %q does not equal root %q", strings.TrimSpace(top), root)
+	}
+	return true, ""
+}
+
+func readReceipts(path string) ([]AllocationReceipt, error) {
+	records, err := readJSONLRecords(path)
 	if err != nil {
 		return nil, fmt.Errorf("E_RECEIPT_IO: %w", err)
 	}
-	defer f.Close()
-	dec := json.NewDecoder(f)
 	var receipts []AllocationReceipt
-	for {
+	for _, record := range records {
 		var receipt AllocationReceipt
-		err := dec.Decode(&receipt)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
+		if err := json.Unmarshal(record, &receipt); err != nil {
 			return nil, fmt.Errorf("E_RECEIPT_IO: malformed receipts: %w", err)
 		}
 		receipts = append(receipts, receipt)
@@ -1436,24 +1507,15 @@ func readReceipts(path string) ([]AllocationReceipt, error) {
 }
 
 func readJournal(path string) ([]eventRecord, error) {
-	f, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
+	records, err := readJSONLRecords(path)
 	if err != nil {
 		return nil, fmt.Errorf("E_JOURNAL_CORRUPT: %w", err)
 	}
-	defer f.Close()
-	dec := json.NewDecoder(f)
 	var events []eventRecord
 	seen := map[string]eventRecord{}
-	for {
+	for _, record := range records {
 		var event eventRecord
-		err := dec.Decode(&event)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
+		if err := json.Unmarshal(record, &event); err != nil {
 			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: %w", err)
 		}
 		key := fmt.Sprintf("%s\x00%d", event.ProjectID, event.Seq)
@@ -1464,6 +1526,39 @@ func readJournal(path string) ([]eventRecord, error) {
 		events = append(events, event)
 	}
 	return events, nil
+}
+
+func readJSONLRecords(path string) ([][]byte, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	lines := bytes.Split(data, []byte{'\n'})
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		tail := lines[len(lines)-1]
+		if len(bytes.TrimSpace(tail)) > 0 && !json.Valid(tail) {
+			if err := preserveTornTail(path, tail); err != nil {
+				return nil, err
+			}
+			lines = lines[:len(lines)-1]
+		}
+	}
+	records := make([][]byte, 0, len(lines))
+	for _, line := range lines {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		var record json.RawMessage
+		if err := json.Unmarshal(line, &record); err != nil {
+			return nil, fmt.Errorf("malformed JSONL record: %w", err)
+		}
+		records = append(records, append([]byte(nil), record...))
+	}
+	return records, nil
 }
 
 func sortedKeys(values map[string]bool) []string {
@@ -1513,25 +1608,23 @@ func scanTickets(root, worktreeID string) ([]scannedTicket, error) {
 
 func scanRefMax(root string) (map[string]int64, error) {
 	result := map[string]int64{}
-	cmd := exec.Command("git", "-C", root, "for-each-ref", "--format=%(refname)")
-	out, err := cmd.CombinedOutput()
+	out, stderr, err := runGit(root, "for-each-ref", "--format=%(refname)")
 	if err != nil {
-		if isNotGitRepository(string(out)) {
+		if isNotGitRepository(stderr) {
 			return result, nil
 		}
-		return nil, fmt.Errorf("E_GIT_SCAN: for-each-ref: %w: %s", err, strings.TrimSpace(string(out)))
+		return nil, fmt.Errorf("E_GIT_SCAN: for-each-ref: %w: %s", err, strings.TrimSpace(stderr))
 	}
-	for _, ref := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for _, ref := range strings.Split(strings.TrimSpace(out), "\n") {
 		if ref == "" {
 			continue
 		}
-		list := exec.Command("git", "-C", root, "ls-tree", "-r", "--name-only", ref, "--", ".aira/tickets")
-		paths, err := list.CombinedOutput()
+		paths, stderr, err := runGit(root, "ls-tree", "-r", "--name-only", ref, "--", ".aira/tickets")
 		if err != nil {
-			if isNotGitRepository(string(paths)) {
+			if isNotGitRepository(stderr) {
 				return result, nil
 			}
-			return nil, fmt.Errorf("E_GIT_SCAN: ls-tree %s: %w: %s", ref, err, strings.TrimSpace(string(paths)))
+			return nil, fmt.Errorf("E_GIT_SCAN: ls-tree %s: %w: %s", ref, err, strings.TrimSpace(stderr))
 		}
 		for _, path := range strings.Split(strings.TrimSpace(string(paths)), "\n") {
 			base := filepath.Base(path)
