@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -23,6 +24,7 @@ type ReadyRecord struct {
 	Ready    bool                  `json:"ready"`
 	Blockers []domain.RelationView `json:"blockers,omitempty"`
 	Verdict  string                `json:"verdict"`
+	Findings []CheckFinding        `json:"findings,omitempty"`
 }
 
 func relationSubject(r domain.Relation) string {
@@ -254,46 +256,149 @@ func satisfied(status domain.Status) bool {
 }
 
 func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
-	var rows []TicketRecord
-	var err error
-	if strings.TrimSpace(selector) == "" {
-		rows, err = s.List("")
-	} else {
-		var row TicketRecord
-		row, err = s.Get(selector)
-		if err == nil {
-			rows = []TicketRecord{row}
-		}
-	}
+	sel, err := parseSelector(selector)
 	if err != nil {
 		return nil, err
 	}
-	result := make([]ReadyRecord, 0, len(rows))
+	hasSelector := strings.TrimSpace(selector) != ""
+	if hasSelector && sel.ExactID == "" {
+		return nil, errors.New("E_SELECTOR_INVALID: ready requires an exact ID or file anchor")
+	}
+
+	tickets, scanFindings, err := scanTickets(s.root, s.worktreeID)
+	if err != nil {
+		return nil, err
+	}
+	indexed, err := s.indexedDigests()
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]TicketRecord, 0, len(tickets))
+	for _, scanned := range tickets {
+		if hasSelector && (scanned.Ticket.ID != sel.ExactID || (sel.ExactPath != "" && filepath.ToSlash(repoPath(s.root, scanned.Path)) != sel.ExactPath)) {
+			continue
+		}
+		row := TicketRecord{Ticket: scanned.Ticket, Body: scanned.Body, Path: repoPath(s.root, scanned.Path), WorktreeID: s.worktreeID, Digest: scanned.Digest}
+		if indexed[scanned.Ticket.ID] != scanned.Digest {
+			row.Warnings = []string{"W_STALE_INDEX"}
+		}
+		rows = append(rows, row)
+	}
+	if hasSelector && len(rows) == 0 {
+		for _, finding := range scanFindings {
+			if findingPathMatchesSelector(finding.Subject, sel) {
+				rows = append(rows, TicketRecord{Path: finding.Subject, WorktreeID: s.worktreeID})
+				break
+			}
+		}
+		if len(rows) == 0 {
+			return nil, errors.New("E_NOT_FOUND: selector matched no tickets")
+		}
+	}
+
+	relations, byID, relationFindings, err := scanStoredRelationsAt(s.root, s.worktreeID)
+	if err != nil {
+		return nil, err
+	}
+	findings := append(append([]CheckFinding(nil), scanFindings...), relationFindings...)
+	result := make([]ReadyRecord, 0, len(rows)+len(findings))
 	for _, row := range rows {
-		views, err := s.Relations(row.Ticket.ID)
-		if err != nil {
-			return nil, err
-		}
+		rowFindings := findingsForReadyRow(row, findings, relations)
 		blockers := make([]domain.RelationView, 0)
-		for _, view := range views {
-			if view.Kind != domain.RelationBlockedBy {
-				continue
-			}
-			prerequisite, err := s.Get(view.To)
-			if err != nil {
-				return nil, errors.New("E_RELATION_TARGET_MISSING: blocked-by prerequisite is missing")
-			}
-			if !satisfied(prerequisite.Ticket.Status) {
-				blockers = append(blockers, view)
+		if row.Ticket.ID != "" {
+			for _, relation := range relations {
+				if relation.Relation.Kind != domain.RelationBlocks || relation.Relation.To != row.Ticket.ID {
+					continue
+				}
+				view := domain.RelationView{Kind: domain.RelationBlockedBy, From: row.Ticket.ID, To: relation.Relation.From}
+				prerequisite, ok := byID[relation.Relation.From]
+				if !ok {
+					rowFindings = appendUniqueFinding(rowFindings, CheckFinding{Code: "E_RELATION_TARGET_MISSING", Subject: row.Ticket.ID, Message: "blocked-by prerequisite is missing", Kind: "fail"})
+				} else if !satisfied(prerequisite.Status) {
+					blockers = append(blockers, view)
+				}
 			}
 		}
-		isReady := workable(row.Ticket.Status) && !row.Ticket.Hold && len(blockers) == 0
-		item := ReadyRecord{Ticket: row, Ready: isReady, Blockers: blockers, Verdict: "pass"}
-		if selector != "" || isReady {
+		isReady := row.Ticket.ID != "" && workable(row.Ticket.Status) && !row.Ticket.Hold && len(blockers) == 0 && len(rowFindings) == 0
+		verdict := "pass"
+		if len(rowFindings) > 0 {
+			verdict = "fail"
+		}
+		item := ReadyRecord{Ticket: row, Ready: isReady, Blockers: blockers, Verdict: verdict, Findings: rowFindings}
+		if hasSelector || isReady || len(rowFindings) > 0 {
 			result = append(result, item)
 		}
 	}
+	if !hasSelector {
+		for _, finding := range findings {
+			if finding.Code == "E_RELATION_INVALID" || finding.Code == "E_CONFIG_INVALID" {
+				if !findingAlreadyRepresented(result, finding) {
+					result = append(result, ReadyRecord{Ticket: TicketRecord{Path: finding.Subject, WorktreeID: s.worktreeID}, Ready: false, Verdict: "fail", Findings: []CheckFinding{finding}})
+				}
+			}
+		}
+	}
+	sortReadyRecords(result)
 	return result, nil
+}
+
+func findingPathMatchesSelector(path string, sel selector) bool {
+	if sel.ExactPath != "" {
+		return filepath.ToSlash(path) == sel.ExactPath
+	}
+	return filepath.Base(filepath.FromSlash(path)) == sel.ExactID+".md"
+}
+
+func findingsForReadyRow(row TicketRecord, findings []CheckFinding, relations []storedRelation) []CheckFinding {
+	var result []CheckFinding
+	for _, finding := range findings {
+		relatedMissingTarget := false
+		if finding.Code == "E_RELATION_TARGET_MISSING" && row.Ticket.ID != "" {
+			for _, relation := range relations {
+				if relation.Owner == row.Ticket.ID && (relation.Relation.From == finding.Subject || relation.Relation.To == finding.Subject) {
+					relatedMissingTarget = true
+					break
+				}
+			}
+		}
+		if finding.Subject == row.Path || finding.Subject == row.Ticket.ID || relatedMissingTarget {
+			result = appendUniqueFinding(result, finding)
+		}
+	}
+	return result
+}
+
+func appendUniqueFinding(findings []CheckFinding, finding CheckFinding) []CheckFinding {
+	for _, existing := range findings {
+		if existing.Code == finding.Code && existing.Subject == finding.Subject && existing.Message == finding.Message {
+			return findings
+		}
+	}
+	return append(findings, finding)
+}
+
+func findingAlreadyRepresented(rows []ReadyRecord, finding CheckFinding) bool {
+	for _, row := range rows {
+		for _, existing := range row.Findings {
+			if existing.Code == finding.Code && existing.Subject == finding.Subject && existing.Message == finding.Message {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func sortReadyRecords(rows []ReadyRecord) {
+	sort.Slice(rows, func(i, j int) bool {
+		left, right := rows[i].Ticket.Ticket.ID, rows[j].Ticket.Ticket.ID
+		if left == "" || right == "" {
+			if left == right {
+				return rows[i].Ticket.Path < rows[j].Ticket.Path
+			}
+			return left != ""
+		}
+		return domain.IDLess(left, right)
+	})
 }
 
 func (s *Store) relationFindings() ([]CheckFinding, error) {

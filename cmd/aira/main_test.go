@@ -35,3 +35,17 @@ func TestHumanRenderingIncludesWarnings(t *testing.T) {
 		t.Fatalf("human warning output = %q", stdout.String())
 	}
 }
+
+func TestReadyListFlagParsesAsBoolean(t *testing.T) {
+	positional, options, err := parseArgs("ready", []string{"--list"})
+	if err != nil {
+		t.Fatalf("ready --list parse: %v", err)
+	}
+	if len(positional) != 0 || options["list"] != "true" {
+		t.Fatalf("ready --list args = positional=%#v options=%#v", positional, options)
+	}
+	request, err := buildRequest("ready", positional, options)
+	if err != nil || request.Args["selector"] != nil {
+		t.Fatalf("ready --list request = %#v err=%v", request, err)
+	}
+}

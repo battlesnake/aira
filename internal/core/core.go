@@ -225,15 +225,8 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return mutationData(map[string]any{"from": from.Ticket.ID, "kind": stringArg(args, "kind"), "to": to.Ticket.ID}, event), nil
 		}},
-		"ready": {Name: "ready", Usage: "ready [<selector>]", Run: func(_ context.Context, args map[string]any) (any, error) {
+		"ready": {Name: "ready", Usage: "ready [<selector>] | ready --list", Run: func(_ context.Context, args map[string]any) (any, error) {
 			selector := stringArg(args, "selector")
-			if selector != "" {
-				record, err := c.store.Get(selector)
-				if err != nil {
-					return nil, err
-				}
-				selector = record.Ticket.ID
-			}
 			rows, err := c.store.Ready(selector)
 			if err != nil {
 				return nil, err
@@ -242,7 +235,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				if len(rows) != 1 {
 					return nil, fmt.Errorf("E_NOT_FOUND: ready selector matched no ticket")
 				}
-				return rows[0], nil
+				return handlerData{Data: rows[0], Warnings: readyWarnings(rows)}, nil
 			}
 			data := map[string]any{"total": len(rows), "rows": projectReadyRecords(rows)}
 			if len(rows) > ListLimit {
@@ -250,7 +243,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				data["distribution"] = readyDistribution(rows)
 				data["truncated"] = true
 			}
-			return data, nil
+			return handlerData{Data: data, Warnings: readyWarnings(rows)}, nil
 		}},
 		"list": {Name: "list", Usage: "list [query] [--by F] [--fields F,...]", Run: func(_ context.Context, args map[string]any) (any, error) {
 			rows, err := c.store.List(stringArg(args, "query"))
@@ -402,11 +395,36 @@ func projectRecord(record store.TicketRecord, fields []string) map[string]any {
 }
 
 func projectReadyRecord(record store.ReadyRecord) map[string]any {
+	if record.Ticket.Ticket.ID == "" {
+		return map[string]any{"path": record.Ticket.Path, "ready": record.Ready, "blockers": record.Blockers, "verdict": record.Verdict, "findings": record.Findings}
+	}
 	result := projectRecord(record.Ticket, nil)
 	result["ready"] = record.Ready
 	result["blockers"] = record.Blockers
 	result["verdict"] = record.Verdict
+	if len(record.Findings) > 0 {
+		result["findings"] = record.Findings
+	}
 	return result
+}
+
+func readyWarnings(rows []store.ReadyRecord) []string {
+	var warnings []string
+	for _, row := range rows {
+		for _, finding := range row.Findings {
+			seen := false
+			for _, warning := range warnings {
+				if warning == finding.Code {
+					seen = true
+					break
+				}
+			}
+			if !seen {
+				warnings = append(warnings, finding.Code)
+			}
+		}
+	}
+	return warnings
 }
 
 func projectReadyRecords(records []store.ReadyRecord) []map[string]any {

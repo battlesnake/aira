@@ -84,3 +84,48 @@ func TestParseTicketRejectsNonCanonicalLabels(t *testing.T) {
 		t.Fatal("non-canonical labels parsed successfully")
 	}
 }
+
+func TestParseTicketRejectsNonCanonicalRelations(t *testing.T) {
+	cases := []struct {
+		name      string
+		ticketID  string
+		relations []Relation
+	}{
+		{
+			name:     "duplicate",
+			ticketID: "AIRA-1",
+			relations: []Relation{
+				{Kind: RelationBlocks, From: "AIRA-1", To: "AIRA-2"},
+				{Kind: RelationBlocks, From: "AIRA-1", To: "AIRA-2"},
+			},
+		},
+		{
+			name:     "unsorted",
+			ticketID: "AIRA-1",
+			relations: []Relation{
+				{Kind: RelationRelates, From: "AIRA-1", To: "AIRA-3"},
+				{Kind: RelationBlocks, From: "AIRA-1", To: "AIRA-2"},
+			},
+		},
+		{
+			name:     "wrong canonical side",
+			ticketID: "AIRA-2",
+			relations: []Relation{
+				{Kind: RelationBlocks, From: "AIRA-2", To: "AIRA-1"},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ticket := Ticket{Schema: 1, ID: tc.ticketID, Project: "aira", Title: "relations", Status: StatusPlanned, Kind: KindFeature, Severity: SeverityP2, Relations: tc.relations}
+			data, err := json.Marshal(ticket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data = append(append([]byte("---\n"), data...), []byte("\n---\nbody\n")...)
+			if _, _, err := ParseTicket(data); err == nil {
+				t.Fatal("non-canonical relations parsed successfully")
+			}
+		})
+	}
+}

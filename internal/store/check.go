@@ -266,6 +266,9 @@ func isIntegrityError(err error) bool {
 func addFinding(report *CheckReport, finding CheckFinding, dimension string) {
 	for _, existing := range report.Findings {
 		if existing.Code == finding.Code && existing.Subject == finding.Subject {
+			if dimension != "" {
+				report.Dimensions[dimension] = "fail"
+			}
 			return
 		}
 	}

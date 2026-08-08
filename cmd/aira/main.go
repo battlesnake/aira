@@ -85,7 +85,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 			continue
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "rebuild" || name == "steal" {
+		if name == "rebuild" || name == "steal" || (name == "list" && verb == "ready") {
 			options[name] = "true"
 			continue
 		}
@@ -120,6 +120,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"count": {"by": true}, "reconcile": {"rebuild": true},
 		"claim":   {"steal": true, "actor": true},
 		"release": {"token": true}, "heartbeat": {"token": true},
+		"ready": {"list": true},
 	}
 	for name := range options {
 		if !allowed[verb][name] {
@@ -196,6 +197,9 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 	case "ready":
 		if len(positional) > 1 {
 			return core.Request{}, fmt.Errorf("ready accepts at most one selector")
+		}
+		if options["list"] == "true" && len(positional) > 0 {
+			return core.Request{}, fmt.Errorf("ready --list accepts no selector")
 		}
 		if len(positional) == 1 {
 			args["selector"] = positional[0]

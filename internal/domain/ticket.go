@@ -144,12 +144,34 @@ func (t Ticket) Validate() error {
 			return errors.New("E_CONFIG_INVALID: labels must be unique and sorted")
 		}
 	}
-	for _, r := range t.Relations {
+	for i, r := range t.Relations {
 		if !validRelation(r.Kind) || r.From == r.To || ValidateID(r.From) != nil || ValidateID(r.To) != nil {
 			return errors.New("E_RELATION_INVALID: invalid relation")
 		}
+		if CanonicalRelationOwner(r.From, r.To) != t.ID {
+			return errors.New("E_RELATION_INVALID: relation is not stored on its canonical lower-ID ticket")
+		}
+		if i > 0 {
+			previous := t.Relations[i-1]
+			if relationLess(r, previous) {
+				return errors.New("E_RELATION_INVALID: relations must be sorted")
+			}
+			if r == previous {
+				return errors.New("E_RELATION_INVALID: relations must be unique")
+			}
+		}
 	}
 	return nil
+}
+
+func relationLess(a, b Relation) bool {
+	if a.Kind != b.Kind {
+		return a.Kind < b.Kind
+	}
+	if a.From != b.From {
+		return idLess(a.From, b.From)
+	}
+	return idLess(a.To, b.To)
 }
 
 func validStatus(s Status) bool {

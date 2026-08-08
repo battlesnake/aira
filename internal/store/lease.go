@@ -130,7 +130,10 @@ func leaseFromRow(ticketID string, row leaseRow) (domain.Lease, error) {
 		}
 		return domain.Lease{TicketID: ticketID, State: domain.FreeLease{Generation: uint64(row.generation)}}, nil
 	}
-	if row.state != "held" || !row.holderTokenHash.Valid || !row.bootID.Valid || !row.lastHeartbeatMonoNS.Valid || !row.ttlNS.Valid || !row.actor.Valid || !row.worktree.Valid {
+	if row.state != "held" || row.generation < 1 || !row.holderTokenHash.Valid || strings.TrimSpace(row.holderTokenHash.String) == "" ||
+		!row.bootID.Valid || strings.TrimSpace(row.bootID.String) == "" || !row.lastHeartbeatMonoNS.Valid || row.lastHeartbeatMonoNS.Int64 < 0 ||
+		!row.ttlNS.Valid || row.ttlNS.Int64 <= 0 || !row.actor.Valid || strings.TrimSpace(row.actor.String) == "" ||
+		!row.worktree.Valid || strings.TrimSpace(row.worktree.String) == "" {
 		return domain.Lease{}, errors.New("E_CONFIG_INVALID: malformed held lease")
 	}
 	hashBytes, err := base64.RawURLEncoding.DecodeString(row.holderTokenHash.String)
@@ -174,6 +177,7 @@ func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor st
 		return LeaseClaim{}, err
 	}
 	var result LeaseClaim
+	result.Token = clear
 	err = s.withImmediate(ctx, func(conn *sql.Conn) error {
 		row, rowErr := readLeaseRow(ctx, conn, s.projectID, ticketID)
 		if errors.Is(rowErr, sql.ErrNoRows) {
@@ -247,19 +251,26 @@ func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor st
 			return err
 		}
 		result.Event = EventKey{ProjectID: s.projectID, Seq: seq}
+		if err := s.saveLeaseToken(ticketID, clear); err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {
-		return LeaseClaim{}, err
-	}
-	result.Token = clear
-	if err := s.saveLeaseToken(ticketID, clear); err != nil {
+		s.removeLeaseTokenIf(ticketID, clear)
 		return LeaseClaim{}, err
 	}
 	if err := s.journalEvent(ctx, s.projectID, result.Event.Seq); err != nil {
-		return LeaseClaim{}, err
+		return result, err
 	}
 	return result, nil
+}
+
+func (s *Store) removeLeaseTokenIf(ticketID, token string) {
+	current, err := s.LeaseToken(ticketID)
+	if err == nil && current == token {
+		_ = os.Remove(s.leaseTokenPath(ticketID))
+	}
 }
 
 func (s *Store) saveLeaseToken(ticketID, token string) error {
@@ -283,19 +294,19 @@ func (s *Store) saveLeaseToken(ticketID, token string) error {
 }
 
 func (s *Store) Release(ctx context.Context, ticketID, token string) (EventKey, error) {
+	if token == "" {
+		return EventKey{}, ErrLeaseToken
+	}
 	bootID, monoNS, err := s.sampleClock()
 	if err != nil {
 		return EventKey{}, err
 	}
-	hash := sha256.Sum256([]byte{})
-	if token != "" {
-		var tokenBytes []byte
-		tokenBytes, err = base64.RawURLEncoding.DecodeString(token)
-		if err != nil || len(tokenBytes) != 32 {
-			return EventKey{}, ErrLeaseToken
-		}
-		hash = sha256.Sum256(tokenBytes)
+	var tokenBytes []byte
+	tokenBytes, err = base64.RawURLEncoding.DecodeString(token)
+	if err != nil || len(tokenBytes) != 32 {
+		return EventKey{}, ErrLeaseToken
 	}
+	hash := sha256.Sum256(tokenBytes)
 	var event EventKey
 	err = s.withImmediate(ctx, func(conn *sql.Conn) error {
 		row, err := readLeaseRow(ctx, conn, s.projectID, ticketID)

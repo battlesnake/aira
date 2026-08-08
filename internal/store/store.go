@@ -251,10 +251,13 @@ func (s *Store) initDB(ctx context.Context) error {
             last_heartbeat_mono_ns INTEGER, ttl_ns INTEGER, actor TEXT, worktree_id TEXT,
             PRIMARY KEY(project_id, ticket_id),
             CHECK (state IN ('free', 'held')),
-            CHECK ((state = 'free' AND holder_token_hash IS NULL AND boot_id IS NULL AND
+            CHECK ((state = 'free' AND generation >= 0 AND holder_token_hash IS NULL AND boot_id IS NULL AND
                     last_heartbeat_mono_ns IS NULL AND ttl_ns IS NULL AND actor IS NULL AND worktree_id IS NULL)
-                OR (state = 'held' AND holder_token_hash IS NOT NULL AND boot_id IS NOT NULL AND
-                    last_heartbeat_mono_ns IS NOT NULL AND ttl_ns IS NOT NULL AND actor IS NOT NULL AND worktree_id IS NOT NULL))
+                OR (state = 'held' AND generation >= 1 AND holder_token_hash IS NOT NULL AND length(trim(holder_token_hash)) > 0 AND
+                    boot_id IS NOT NULL AND length(trim(boot_id)) > 0 AND
+                    last_heartbeat_mono_ns IS NOT NULL AND last_heartbeat_mono_ns >= 0 AND
+                    ttl_ns IS NOT NULL AND ttl_ns > 0 AND actor IS NOT NULL AND length(trim(actor)) > 0 AND
+                    worktree_id IS NOT NULL AND length(trim(worktree_id)) > 0))
         )`,
 	}
 	for _, statement := range statements {
