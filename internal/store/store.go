@@ -53,6 +53,9 @@ type Store struct {
 	worktreeID   string
 	projectSlug  string
 	prefixes     map[string]bool
+	// beforeMaterialise is intentionally nil in production; tests use it to
+	// observe the receipt-before-file ordering at the crash boundary.
+	beforeMaterialise func(Intent) error
 }
 
 type Intent struct {
@@ -104,7 +107,7 @@ type scannedTicket struct {
 }
 
 func Open(ctx context.Context, opts Options) (*Store, error) {
-	if opts.Root == "" || opts.DBPath == "" || opts.RegistryPath == "" || opts.ProjectID == "" || opts.WorktreeID == "" {
+	if opts.Root == "" || opts.CommonDir == "" || opts.DBPath == "" || opts.RegistryPath == "" || opts.ProjectID == "" || opts.WorktreeID == "" {
 		return nil, errors.New("E_CONFIG_INVALID: store options are incomplete")
 	}
 	root, err := filepath.Abs(opts.Root)
@@ -135,7 +138,8 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	if err := os.MkdirAll(filepath.Join(common, "aira", "locks"), 0o755); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", dbPath)
+	dsn := dbPath + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=foreign_keys(ON)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -167,17 +171,6 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) initDB(ctx context.Context) error {
-	pragmas := []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA synchronous=FULL",
-		"PRAGMA busy_timeout=5000",
-		"PRAGMA foreign_keys=ON",
-	}
-	for _, pragma := range pragmas {
-		if _, err := s.db.ExecContext(ctx, pragma); err != nil {
-			return err
-		}
-	}
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS projects (
             project_id TEXT PRIMARY KEY, slug TEXT NOT NULL, common_dir TEXT NOT NULL,
@@ -233,7 +226,7 @@ func (s *Store) initDB(ctx context.Context) error {
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
-			return err
+			return translateDBError(err)
 		}
 	}
 	return nil
@@ -329,15 +322,19 @@ func (s *Store) AllocateID(ctx context.Context, prefix string) (string, error) {
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO outbox(project_id, seq, worktree_id, path, verb,
             precondition_digest, intended_digest, intended_bytes, allocation_id)
-            VALUES(?, ?, ?, ?, 'id.allocate', '', '', NULL, ?)`, s.projectID, seq, s.worktreeID, path, id); err != nil {
+			VALUES(?, ?, ?, ?, 'id.allocate', '', '', NULL, ?)`, s.projectID, seq, s.worktreeID, path, id); err != nil {
 			return err
 		}
-		return insertEvent(ctx, conn, s.projectID, seq, "id.allocate", id)
+		if err := insertEvent(ctx, conn, s.projectID, seq, "id.allocate", id); err != nil {
+			return err
+		}
+		receipt = AllocationReceipt{ProjectID: s.projectID, WorktreeID: s.worktreeID, ID: id, Path: path,
+			Seq: seq, At: time.Now().UTC().Format(time.RFC3339Nano), State: "allocated"}
+		return nil
 	})
 	if err != nil {
 		return "", err
 	}
-	receipt = AllocationReceipt{ProjectID: s.projectID, WorktreeID: s.worktreeID, ID: id, Path: s.ticketPath(id), Seq: receiptSeq(ctx, s, id), At: time.Now().UTC().Format(time.RFC3339Nano), State: "allocated"}
 	if err := s.appendReceiptIfMissing(receipt); err != nil {
 		return "", err
 	}
@@ -374,13 +371,17 @@ func (s *Store) prepareCreate(ctx context.Context, input domain.CreateTicketInpu
 	if input.Severity == "" {
 		input.Severity = domain.SeverityP2
 	}
+	prefix, err := s.defaultPrefix()
+	if err != nil {
+		return Intent{}, err
+	}
 	var intent Intent
-	err := s.withImmediate(ctx, func(conn *sql.Conn) error {
-		number, err := nextNumber(ctx, conn, s.projectID, "AIRA")
+	err = s.withImmediate(ctx, func(conn *sql.Conn) error {
+		number, err := nextNumber(ctx, conn, s.projectID, prefix)
 		if err != nil {
 			return err
 		}
-		id := fmt.Sprintf("AIRA-%d", number)
+		id := fmt.Sprintf("%s-%d", prefix, number)
 		ticket := domain.Ticket{Schema: 1, ID: id, Project: s.projectSlug, Title: input.Title,
 			Status: domain.StatusPlanned, Kind: input.Kind, Severity: input.Severity, Labels: input.Labels}
 		data, err := domain.RenderTicket(ticket, input.Body)
@@ -394,7 +395,7 @@ func (s *Store) prepareCreate(ctx context.Context, input domain.CreateTicketInpu
 		path := s.ticketPath(id)
 		digest := digestBytes(data)
 		if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq)
-            VALUES(?, 'AIRA', ?, ?, 'allocated', ?, ?)`, s.projectID, number, s.worktreeID, path, seq); err != nil {
+            VALUES(?, ?, ?, ?, 'allocated', ?, ?)`, s.projectID, prefix, number, s.worktreeID, path, seq); err != nil {
 			return err
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO outbox(project_id, seq, worktree_id, path, verb,
@@ -411,6 +412,14 @@ func (s *Store) prepareCreate(ctx context.Context, input domain.CreateTicketInpu
 		return nil
 	})
 	return intent, err
+}
+
+func (s *Store) defaultPrefix() (string, error) {
+	prefixes := sortedKeys(s.prefixes)
+	if len(prefixes) == 0 {
+		return "", errors.New("E_CONFIG_INVALID: no owned ticket prefix")
+	}
+	return prefixes[0], nil
 }
 
 func (s *Store) preparePathMutation(ctx context.Context, path, precondition string, intended []byte, verb string) (Intent, error) {
@@ -466,6 +475,11 @@ func (s *Store) UpdateTicket(ctx context.Context, id string, update func(domain.
 	if err != nil {
 		return err
 	}
+	if updated.Status != ticket.Status {
+		if err := domain.ValidateTransition(ticket.Status, updated.Status); err != nil {
+			return err
+		}
+	}
 	newData, err := domain.RenderTicket(updated, body)
 	if err != nil {
 		return err
@@ -482,7 +496,7 @@ func (s *Store) materialiseIntent(ctx context.Context, intent Intent) error {
 	if len(intent.Intended) == 0 {
 		return nil
 	}
-	lock, err := acquireLock(s.pathLock(intent.Path))
+	lock, err := acquireLock(s.pathLockFor(intent.WorktreeID, intent.Path))
 	if err != nil {
 		return err
 	}
@@ -491,12 +505,26 @@ func (s *Store) materialiseIntent(ctx context.Context, intent Intent) error {
 	if err != nil {
 		return err
 	}
+	if current == digestBytes(intent.Intended) {
+		if err := s.markMaterialised(ctx, intent); err != nil {
+			return err
+		}
+		return s.journalEvent(ctx, intent.ProjectID, intent.Seq)
+	}
 	if current != intent.Precondition {
 		return fmt.Errorf("%w: %s", ErrWriteConflict, intent.Path)
+	}
+	if s.beforeMaterialise != nil {
+		if err := s.beforeMaterialise(intent); err != nil {
+			return err
+		}
 	}
 	if err := writeAtomic(intent.Path, intent.Intended, intent.Seq); err != nil {
 		return err
 	}
+	// The path flock coordinates AIRA writers. A non-cooperative user editing
+	// the file directly during this window cannot be made into a POSIX CAS;
+	// rename therefore accepts the documented limitation of check-then-rename.
 	if err := s.markMaterialised(ctx, intent); err != nil {
 		return err
 	}
@@ -509,17 +537,17 @@ func (s *Store) markMaterialised(ctx context.Context, intent Intent) error {
 		return err
 	}
 	return s.withImmediate(ctx, func(conn *sql.Conn) error {
-		if _, err := conn.ExecContext(ctx, `UPDATE outbox SET materialised=1 WHERE project_id=? AND seq=? AND materialised=0 AND resolution IS NULL`, s.projectID, intent.Seq); err != nil {
+		if _, err := conn.ExecContext(ctx, `UPDATE outbox SET materialised=1 WHERE project_id=? AND seq=? AND materialised=0 AND resolution IS NULL`, intent.ProjectID, intent.Seq); err != nil {
 			return err
 		}
-		if _, err := conn.ExecContext(ctx, `UPDATE allocations SET state='materialised' WHERE project_id=? AND prefix=? AND number=?`, s.projectID, prefixOf(ticket.ID), numberOf(ticket.ID)); err != nil {
+		if _, err := conn.ExecContext(ctx, `UPDATE allocations SET state='materialised' WHERE project_id=? AND prefix=? AND number=?`, intent.ProjectID, prefixOf(ticket.ID), numberOf(ticket.ID)); err != nil {
 			return err
 		}
 		_, err := conn.ExecContext(ctx, `INSERT INTO tickets(project_id, worktree_id, id, path, digest, status, hold, title, kind, severity)
             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(project_id, worktree_id, id) DO UPDATE SET path=excluded.path, digest=excluded.digest,
             status=excluded.status, hold=excluded.hold, title=excluded.title, kind=excluded.kind, severity=excluded.severity`,
-			s.projectID, s.worktreeID, ticket.ID, intent.Path, digestBytes(intent.Intended), ticket.Status, boolInt(ticket.Hold), ticket.Title, ticket.Kind, ticket.Severity)
+			intent.ProjectID, intent.WorktreeID, ticket.ID, intent.Path, digestBytes(intent.Intended), ticket.Status, boolInt(ticket.Hold), ticket.Title, ticket.Kind, ticket.Severity)
 		return err
 	})
 }
@@ -598,10 +626,26 @@ func (s *Store) appendReceiptIfMissing(receipt AllocationReceipt) error {
 	return nil
 }
 
+func (s *Store) intentMaterialised(ctx context.Context, intent Intent) (bool, error) {
+	var materialised int
+	err := s.db.QueryRowContext(ctx, `SELECT materialised FROM outbox WHERE project_id=? AND seq=?`, intent.ProjectID, intent.Seq).Scan(&materialised)
+	return materialised != 0, err
+}
+
+func (s *Store) recordFinding(ctx context.Context, intent Intent, cause error) error {
+	return s.withImmediate(ctx, func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx, `INSERT INTO findings(project_id, finding_key, code, subject, details, created_at)
+			VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(project_id, finding_key) DO UPDATE SET details=excluded.details`,
+			intent.ProjectID, fmt.Sprintf("reconcile:%s:%d", intent.WorktreeID, intent.Seq), "E_WRITE_CONFLICT", intent.Path,
+			cause.Error(), time.Now().UTC().Format(time.RFC3339Nano))
+		return err
+	})
+}
+
 func (s *Store) reconcile(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx, `SELECT project_id, seq, worktree_id, path, verb, precondition_digest,
-		intended_digest, intended_bytes, materialised, allocation_id FROM outbox
-		WHERE project_id=? AND materialised=0 AND resolution IS NULL ORDER BY seq`, s.projectID)
+		intended_digest, intended_bytes, materialised, journaled, allocation_id FROM outbox
+		WHERE project_id=? AND worktree_id=? AND resolution IS NULL AND (materialised=0 OR journaled=0) ORDER BY seq`, s.projectID, s.worktreeID)
 	if err != nil {
 		return err
 	}
@@ -609,16 +653,17 @@ func (s *Store) reconcile(ctx context.Context) error {
 	for rows.Next() {
 		var intent Intent
 		var materialised int
+		var journaled int
 		var intended []byte
 		var verb string
 		var intendedDigest string
 		if err := rows.Scan(&intent.ProjectID, &intent.Seq, &intent.WorktreeID, &intent.Path, &verb,
-			&intent.Precondition, &intendedDigest, &intended, &materialised, &intent.AllocationID); err != nil {
+			&intent.Precondition, &intendedDigest, &intended, &materialised, &journaled, &intent.AllocationID); err != nil {
 			return err
 		}
 		_ = verb
 		_ = intendedDigest
-		_ = materialised
+		_ = journaled
 		intent.Intended = intended
 		pending = append(pending, intent)
 	}
@@ -629,6 +674,7 @@ func (s *Store) reconcile(ctx context.Context) error {
 	if err := rows.Close(); err != nil {
 		return err
 	}
+	var firstErr error
 	for _, intent := range pending {
 		// Replay always resumes at the first incomplete stage. In particular,
 		// an allocation receipt is repaired before any file materialisation.
@@ -637,6 +683,14 @@ func (s *Store) reconcile(ctx context.Context) error {
 				ID: intent.AllocationID, Path: intent.Path, Seq: intent.Seq, State: "allocated"}); err != nil {
 				return err
 			}
+		}
+		if materialised, err := s.intentMaterialised(ctx, intent); err != nil {
+			return err
+		} else if materialised {
+			if err := s.journalEvent(ctx, intent.ProjectID, intent.Seq); err != nil {
+				return err
+			}
+			continue
 		}
 		if len(intent.Intended) == 0 {
 			if err := s.markReceiptOnly(ctx, intent.ProjectID, intent.Seq); err != nil {
@@ -666,9 +720,15 @@ func (s *Store) reconcile(ctx context.Context) error {
 			}
 			continue
 		}
-		return fmt.Errorf("%w: pending intent %s", ErrWriteConflict, intent.Path)
+		conflict := fmt.Errorf("%w: pending intent %s", ErrWriteConflict, intent.Path)
+		if err := s.recordFinding(ctx, intent, conflict); err != nil {
+			return err
+		}
+		if firstErr == nil {
+			firstErr = conflict
+		}
 	}
-	return nil
+	return firstErr
 }
 
 func (s *Store) Reconcile(ctx context.Context) error { return s.reconcile(ctx) }
@@ -683,55 +743,135 @@ func (s *Store) Rebuild(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	entries, err = discoverWorktrees(s.root, s.projectID, entries)
+	if err != nil {
+		return err
+	}
+	receipts, err := readReceipts(filepath.Join(s.auditDir, "receipts.jsonl"))
+	if err != nil {
+		return err
+	}
+	journal, err := readJournal(filepath.Join(s.auditDir, "journal.jsonl"))
+	if err != nil {
+		return err
+	}
+	receiptKeys := make(map[string]bool, len(receipts))
+	maxima := map[string]int64{}
+	maxSeq := int64(0)
+	for _, receipt := range receipts {
+		if receipt.ProjectID != s.projectID {
+			continue
+		}
+		if domain.ValidateID(receipt.ID) != nil {
+			continue
+		}
+		prefix, number := splitTicketID(receipt.ID)
+		if int64(number) > maxima[prefix] {
+			maxima[prefix] = int64(number)
+		}
+		if receipt.Seq > maxSeq {
+			maxSeq = receipt.Seq
+		}
+		receiptKeys[receiptKey(receipt.ProjectID, receipt.ID, receipt.Seq)] = true
+	}
+	for _, event := range journal {
+		if event.ProjectID == s.projectID && event.Seq > maxSeq {
+			maxSeq = event.Seq
+		}
+	}
+	var scanned []scannedTicket
+	for _, entry := range entries {
+		tickets, err := scanTickets(entry.Root, entry.WorktreeID)
+		if err != nil {
+			return err
+		}
+		scanned = append(scanned, tickets...)
+		for _, ticket := range tickets {
+			prefix, number := splitTicketID(ticket.Ticket.ID)
+			if int64(number) > maxima[prefix] {
+				maxima[prefix] = int64(number)
+			}
+		}
+		refMax, err := scanRefMax(entry.Root)
+		if err != nil {
+			return err
+		}
+		for prefix, number := range refMax {
+			if number > maxima[prefix] {
+				maxima[prefix] = number
+			}
+		}
+	}
 	var recovered []AllocationReceipt
 	err = s.withImmediate(ctx, func(conn *sql.Conn) error {
-		maxima := map[string]int64{}
-		for _, entry := range entries {
-			if entry.ProjectID != s.projectID {
+		if _, err := conn.ExecContext(ctx, `INSERT INTO event_counters(project_id,next_seq) VALUES(?,?)
+			ON CONFLICT(project_id) DO UPDATE SET next_seq=CASE WHEN event_counters.next_seq < excluded.next_seq THEN excluded.next_seq ELSE event_counters.next_seq END`,
+			s.projectID, maxSeq+1); err != nil {
+			return err
+		}
+		for _, event := range journal {
+			if event.ProjectID != s.projectID {
 				continue
 			}
-			tickets, err := scanTickets(entry.Root, entry.WorktreeID)
-			if err != nil {
+			var existing eventRecord
+			err := conn.QueryRowContext(ctx, `SELECT project_id, seq, at_wall, actor, verb, target, payload_digest FROM events WHERE project_id=? AND seq=?`, event.ProjectID, event.Seq).
+				Scan(&existing.ProjectID, &existing.Seq, &existing.At, &existing.Actor, &existing.Verb, &existing.Target, &existing.PayloadDigest)
+			if errors.Is(err, sql.ErrNoRows) {
+				if _, err := conn.ExecContext(ctx, `INSERT INTO events(project_id,seq,at_wall,actor,verb,target,payload_digest,journaled) VALUES(?,?,?,?,?,?,?,1)`,
+					event.ProjectID, event.Seq, event.At, event.Actor, event.Verb, event.Target, event.PayloadDigest); err != nil {
+					return err
+				}
+			} else if err != nil {
+				return err
+			} else if existing.PayloadDigest != event.PayloadDigest || existing.Verb != event.Verb || existing.Target != event.Target {
+				return fmt.Errorf("E_JOURNAL_CORRUPT: duplicate project/seq %s/%d has different payload", event.ProjectID, event.Seq)
+			}
+		}
+		for _, receipt := range receipts {
+			if receipt.ProjectID != s.projectID || domain.ValidateID(receipt.ID) != nil || receipt.Seq <= 0 {
+				continue
+			}
+			if err := ensureReceiptAllocation(ctx, conn, receipt, journal); err != nil {
 				return err
 			}
-			for _, scanned := range tickets {
-				prefix, number := splitTicketID(scanned.Ticket.ID)
-				if int64(number) > maxima[prefix] {
-					maxima[prefix] = int64(number)
-				}
-				if _, err := conn.ExecContext(ctx, `INSERT INTO tickets(project_id, worktree_id, id, path, digest, status, hold, title, kind, severity)
+		}
+		for _, ticket := range scanned {
+			prefix, number := splitTicketID(ticket.Ticket.ID)
+			if _, err := conn.ExecContext(ctx, `INSERT INTO tickets(project_id, worktree_id, id, path, digest, status, hold, title, kind, severity)
                     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(project_id, worktree_id, id) DO UPDATE SET path=excluded.path, digest=excluded.digest,
                     status=excluded.status, hold=excluded.hold, title=excluded.title, kind=excluded.kind, severity=excluded.severity`,
-					s.projectID, scanned.WorktreeID, scanned.Ticket.ID, scanned.Path, scanned.Digest,
-					scanned.Ticket.Status, boolInt(scanned.Ticket.Hold), scanned.Ticket.Title, scanned.Ticket.Kind, scanned.Ticket.Severity); err != nil {
-					return err
-				}
-				var exists int
-				err := conn.QueryRowContext(ctx, `SELECT 1 FROM allocations WHERE project_id=? AND prefix=? AND number=?`, s.projectID, prefix, number).Scan(&exists)
-				if errors.Is(err, sql.ErrNoRows) {
-					seq, err := nextSequence(ctx, conn, s.projectID)
-					if err != nil {
-						return err
-					}
-					if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq)
-                        VALUES(?, ?, ?, ?, 'recovered', ?, ?)`, s.projectID, prefix, number, scanned.WorktreeID, scanned.Path, seq); err != nil {
-						return err
-					}
-					recovered = append(recovered, AllocationReceipt{ProjectID: s.projectID, WorktreeID: scanned.WorktreeID,
-						ID: scanned.Ticket.ID, Path: scanned.Path, Seq: seq, State: "recovered"})
-				} else if err != nil {
-					return err
-				}
-			}
-			refMax, err := scanRefMax(entry.Root)
-			if err != nil {
+				s.projectID, ticket.WorktreeID, ticket.Ticket.ID, ticket.Path, ticket.Digest,
+				ticket.Ticket.Status, boolInt(ticket.Ticket.Hold), ticket.Ticket.Title, ticket.Ticket.Kind, ticket.Ticket.Severity); err != nil {
 				return err
 			}
-			for prefix, number := range refMax {
-				if number > maxima[prefix] {
-					maxima[prefix] = number
+			var allocationSeq int64
+			var allocationWorktree, allocationPath, allocationState string
+			err := conn.QueryRowContext(ctx, `SELECT seq, worktree_id, path, state FROM allocations WHERE project_id=? AND prefix=? AND number=?`,
+				s.projectID, prefix, number).Scan(&allocationSeq, &allocationWorktree, &allocationPath, &allocationState)
+			if errors.Is(err, sql.ErrNoRows) {
+				allocationSeq, err = nextSequence(ctx, conn, s.projectID)
+				if err != nil {
+					return err
 				}
+				allocationWorktree, allocationPath, allocationState = ticket.WorktreeID, ticket.Path, "recovered"
+				if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq)
+                        VALUES(?, ?, ?, ?, ?, ?, ?)`, s.projectID, prefix, number, allocationWorktree, allocationState, allocationPath, allocationSeq); err != nil {
+					return err
+				}
+				recovered = append(recovered, AllocationReceipt{ProjectID: s.projectID, WorktreeID: allocationWorktree,
+					ID: ticket.Ticket.ID, Path: allocationPath, Seq: allocationSeq, State: "recovered"})
+				if err := ensureRecoveredEvent(ctx, conn, ticket.Ticket.ID, ticket.WorktreeID, ticket.Path, allocationSeq, s.projectID, journal); err != nil {
+					return err
+				}
+			} else if err != nil {
+				return err
+			} else if !receiptKeys[receiptKey(s.projectID, ticket.Ticket.ID, allocationSeq)] {
+				recovered = append(recovered, AllocationReceipt{ProjectID: s.projectID, WorktreeID: allocationWorktree,
+					ID: ticket.Ticket.ID, Path: allocationPath, Seq: allocationSeq, State: "recovered"})
+			}
+			if allocationSeq > maxSeq {
+				maxSeq = allocationSeq
 			}
 		}
 		for prefix, maxNumber := range maxima {
@@ -741,6 +881,11 @@ func (s *Store) Rebuild(ctx context.Context) error {
 				s.projectID, prefix, maxNumber+1); err != nil {
 				return err
 			}
+		}
+		if _, err := conn.ExecContext(ctx, `INSERT INTO event_counters(project_id,next_seq) VALUES(?,?)
+			ON CONFLICT(project_id) DO UPDATE SET next_seq=CASE WHEN event_counters.next_seq < excluded.next_seq THEN excluded.next_seq ELSE event_counters.next_seq END`,
+			s.projectID, maxSeq+1); err != nil {
+			return err
 		}
 		return nil
 	})
@@ -755,6 +900,59 @@ func (s *Store) Rebuild(ctx context.Context) error {
 	return nil
 }
 
+func receiptKey(project, id string, seq int64) string {
+	return fmt.Sprintf("%s\x00%s\x00%d", project, id, seq)
+}
+
+func journalEventFor(journal []eventRecord, project string, seq int64) (eventRecord, bool) {
+	for _, event := range journal {
+		if event.ProjectID == project && event.Seq == seq {
+			return event, true
+		}
+	}
+	return eventRecord{}, false
+}
+
+func ensureReceiptAllocation(ctx context.Context, conn *sql.Conn, receipt AllocationReceipt, journal []eventRecord) error {
+	prefix, number := splitTicketID(receipt.ID)
+	var allocationSeq int64
+	err := conn.QueryRowContext(ctx, `SELECT seq FROM allocations WHERE project_id=? AND prefix=? AND number=?`, receipt.ProjectID, prefix, number).Scan(&allocationSeq)
+	if errors.Is(err, sql.ErrNoRows) {
+		allocationSeq = receipt.Seq
+		_, err = conn.ExecContext(ctx, `INSERT INTO allocations(project_id,prefix,number,worktree_id,state,path,seq) VALUES(?,?,?,?,?,?,?)`,
+			receipt.ProjectID, prefix, number, receipt.WorktreeID, receipt.State, receipt.Path, allocationSeq)
+	} else if err == nil && allocationSeq != receipt.Seq {
+		return fmt.Errorf("E_JOURNAL_CORRUPT: receipt %s has seq %d but allocation has seq %d", receipt.ID, receipt.Seq, allocationSeq)
+	}
+	if err != nil {
+		return err
+	}
+	return ensureAllocationEvent(ctx, conn, receipt.ProjectID, receipt.ID, receipt.WorktreeID, receipt.Path, receipt.Seq, journal)
+}
+
+func ensureRecoveredEvent(ctx context.Context, conn *sql.Conn, id, worktreeID, path string, seq int64, project string, journal []eventRecord) error {
+	return ensureAllocationEvent(ctx, conn, project, id, worktreeID, path, seq, journal)
+}
+
+func ensureAllocationEvent(ctx context.Context, conn *sql.Conn, project, id, worktreeID, path string, seq int64, journal []eventRecord) error {
+	fromJournal, journaled := journalEventFor(journal, project, seq)
+	verb, target, payload := "id.allocate", id, digestBytes([]byte("id.allocate\x00"+id))
+	if fromJournal.ProjectID != "" {
+		if fromJournal.Target != id {
+			return fmt.Errorf("E_JOURNAL_CORRUPT: duplicate project/seq %s/%d has target %s and %s", project, seq, fromJournal.Target, id)
+		}
+		verb, target, payload = fromJournal.Verb, fromJournal.Target, fromJournal.PayloadDigest
+	} else {
+		if _, err := conn.ExecContext(ctx, `INSERT INTO events(project_id,seq,at_wall,actor,verb,target,payload_digest,journaled) VALUES(?,?,?,'aira',?,?,?,0)`,
+			project, seq, time.Now().UTC().Format(time.RFC3339Nano), verb, target, payload); err != nil {
+			return err
+		}
+	}
+	_, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO outbox(project_id,seq,worktree_id,path,verb,precondition_digest,intended_digest,intended_bytes,materialised,journaled,allocation_id)
+		VALUES(?, ?, ?, ?, ?, '', '', NULL, 1, ?, ?)`, project, seq, worktreeID, path, verb, boolInt(journaled), id)
+	return err
+}
+
 func (s *Store) withImmediate(ctx context.Context, fn func(*sql.Conn) error) error {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
@@ -765,14 +963,34 @@ func (s *Store) withImmediate(ctx context.Context, fn func(*sql.Conn) error) err
 		return translateDBError(err)
 	}
 	if err := fn(conn); err != nil {
-		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		if rollbackErr := rollbackConn(conn); rollbackErr != nil {
+			discardConn(conn)
+			return translateDBError(fmt.Errorf("%w; rollback failed: %v", err, rollbackErr))
+		}
 		return translateDBError(err)
 	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
-		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		if rollbackErr := rollbackConn(conn); rollbackErr != nil {
+			discardConn(conn)
+			return translateDBError(fmt.Errorf("%w; rollback failed: %v", err, rollbackErr))
+		}
 		return translateDBError(err)
 	}
 	return nil
+}
+
+func rollbackConn(conn *sql.Conn) error {
+	_, err := conn.ExecContext(context.Background(), "ROLLBACK")
+	return err
+}
+
+func discardConn(conn *sql.Conn) {
+	_ = conn.Raw(func(driverConn any) error {
+		if closer, ok := driverConn.(io.Closer); ok {
+			return closer.Close()
+		}
+		return nil
+	})
 }
 
 func translateDBError(err error) error {
@@ -834,14 +1052,12 @@ func (s *Store) ticketPath(id string) string {
 }
 
 func (s *Store) pathLock(path string) string {
-	triple := s.projectID + "\x00" + s.worktreeID + "\x00" + path
-	return filepath.Join(s.auditDir, "locks", "path-"+digestBytes([]byte(triple))+".lock")
+	return s.pathLockFor(s.worktreeID, path)
 }
 
-func receiptSeq(ctx context.Context, s *Store, id string) int64 {
-	var seq int64
-	_ = s.db.QueryRowContext(ctx, `SELECT seq FROM allocations WHERE project_id=? AND prefix=? AND number=?`, s.projectID, prefixOf(id), numberOf(id)).Scan(&seq)
-	return seq
+func (s *Store) pathLockFor(worktreeID, path string) string {
+	triple := s.projectID + "\x00" + worktreeID + "\x00" + path
+	return filepath.Join(s.auditDir, "locks", "path-"+digestBytes([]byte(triple))+".lock")
 }
 
 func prefixOf(id string) string { return id[:strings.LastIndexByte(id, '-')] }
@@ -897,7 +1113,7 @@ func writeAtomic(path string, data []byte, seq int64) error {
 		return err
 	}
 	tmp := filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".aira-tmp-"+strconv.FormatInt(seq, 10))
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
 	}
@@ -1000,6 +1216,9 @@ func appendEventIfMissing(path string, event eventRecord, lockPath string) error
 			return fmt.Errorf("E_JOURNAL_CORRUPT: %w", err)
 		}
 		if existing.ProjectID == event.ProjectID && existing.Seq == event.Seq {
+			if existing.PayloadDigest != event.PayloadDigest || existing.Verb != event.Verb || existing.Target != event.Target {
+				return fmt.Errorf("E_JOURNAL_CORRUPT: duplicate project/seq %s/%d has different payload", event.ProjectID, event.Seq)
+			}
 			return nil
 		}
 	}
@@ -1057,6 +1276,24 @@ func repairJSONLTail(f *os.File) error {
 	} else {
 		cut++
 	}
+	tail := append([]byte(nil), data[cut:]...)
+	if len(tail) > 0 {
+		evidence := f.Name() + ".torn-tail-" + digestBytes(tail)[:16]
+		evidenceFile, err := os.OpenFile(evidence, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			if _, writeErr := evidenceFile.Write(tail); writeErr != nil {
+				_ = evidenceFile.Close()
+				return writeErr
+			}
+			if syncErr := evidenceFile.Sync(); syncErr != nil {
+				_ = evidenceFile.Close()
+				return syncErr
+			}
+			_ = evidenceFile.Close()
+		} else if !errors.Is(err, os.ErrExist) {
+			return err
+		}
+	}
 	if err := f.Truncate(int64(cut)); err != nil {
 		return err
 	}
@@ -1094,6 +1331,139 @@ func readRegistry(path string) ([]registryEntry, error) {
 		entries = append(entries, entry)
 	}
 	return entries, nil
+}
+
+func discoverWorktrees(root, projectID string, registry []registryEntry) ([]registryEntry, error) {
+	byRoot := map[string]registryEntry{}
+	for _, entry := range registry {
+		if entry.ProjectID != projectID || entry.Root == "" {
+			continue
+		}
+		absolute, err := filepath.Abs(entry.Root)
+		if err != nil {
+			return nil, err
+		}
+		entry.Root = absolute
+		byRoot[absolute] = entry
+	}
+	absoluteRoot, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := byRoot[absoluteRoot]; !ok {
+		byRoot[absoluteRoot] = registryEntry{ProjectID: projectID, WorktreeID: "current", Root: absoluteRoot}
+	}
+	out, err := exec.Command("git", "-C", absoluteRoot, "worktree", "list", "--porcelain").CombinedOutput()
+	if err != nil {
+		if isNotGitRepository(string(out)) {
+			return sortedRegistryEntries(byRoot), nil
+		}
+		return nil, fmt.Errorf("E_GIT_SCAN: worktree list: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	var worktreeRoot string
+	for _, line := range strings.Split(string(out), "\n") {
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			worktreeRoot = strings.TrimSpace(strings.TrimPrefix(line, "worktree "))
+		case line == "" && worktreeRoot != "":
+			if err := addDiscoveredWorktree(byRoot, projectID, worktreeRoot); err != nil {
+				return nil, err
+			}
+			worktreeRoot = ""
+		}
+	}
+	if worktreeRoot != "" {
+		if err := addDiscoveredWorktree(byRoot, projectID, worktreeRoot); err != nil {
+			return nil, err
+		}
+	}
+	return sortedRegistryEntries(byRoot), nil
+}
+
+func addDiscoveredWorktree(byRoot map[string]registryEntry, projectID, root string) error {
+	absolute, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	if _, ok := byRoot[absolute]; ok {
+		return nil
+	}
+	byRoot[absolute] = registryEntry{ProjectID: projectID, WorktreeID: "worktree-" + digestBytes([]byte(absolute))[:16], Root: absolute}
+	return nil
+}
+
+func sortedRegistryEntries(byRoot map[string]registryEntry) []registryEntry {
+	roots := make([]string, 0, len(byRoot))
+	for root := range byRoot {
+		roots = append(roots, root)
+	}
+	sort.Strings(roots)
+	entries := make([]registryEntry, 0, len(roots))
+	for _, root := range roots {
+		entries = append(entries, byRoot[root])
+	}
+	return entries
+}
+
+func isNotGitRepository(output string) bool {
+	output = strings.ToLower(output)
+	return strings.Contains(output, "not a git repository") || strings.Contains(output, "not a git work tree")
+}
+
+func readReceipts(path string) ([]AllocationReceipt, error) {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("E_RECEIPT_IO: %w", err)
+	}
+	defer f.Close()
+	dec := json.NewDecoder(f)
+	var receipts []AllocationReceipt
+	for {
+		var receipt AllocationReceipt
+		err := dec.Decode(&receipt)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("E_RECEIPT_IO: malformed receipts: %w", err)
+		}
+		receipts = append(receipts, receipt)
+	}
+	return receipts, nil
+}
+
+func readJournal(path string) ([]eventRecord, error) {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("E_JOURNAL_CORRUPT: %w", err)
+	}
+	defer f.Close()
+	dec := json.NewDecoder(f)
+	var events []eventRecord
+	seen := map[string]eventRecord{}
+	for {
+		var event eventRecord
+		err := dec.Decode(&event)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: %w", err)
+		}
+		key := fmt.Sprintf("%s\x00%d", event.ProjectID, event.Seq)
+		if prior, ok := seen[key]; ok && (prior.PayloadDigest != event.PayloadDigest || prior.Verb != event.Verb || prior.Target != event.Target) {
+			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: duplicate project/seq %s/%d has different payload", event.ProjectID, event.Seq)
+		}
+		seen[key] = event
+		events = append(events, event)
+	}
+	return events, nil
 }
 
 func sortedKeys(values map[string]bool) []string {
@@ -1144,18 +1514,24 @@ func scanTickets(root, worktreeID string) ([]scannedTicket, error) {
 func scanRefMax(root string) (map[string]int64, error) {
 	result := map[string]int64{}
 	cmd := exec.Command("git", "-C", root, "for-each-ref", "--format=%(refname)")
-	out, err := cmd.Output()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return result, nil
+		if isNotGitRepository(string(out)) {
+			return result, nil
+		}
+		return nil, fmt.Errorf("E_GIT_SCAN: for-each-ref: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	for _, ref := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if ref == "" {
 			continue
 		}
 		list := exec.Command("git", "-C", root, "ls-tree", "-r", "--name-only", ref, "--", ".aira/tickets")
-		paths, err := list.Output()
+		paths, err := list.CombinedOutput()
 		if err != nil {
-			continue
+			if isNotGitRepository(string(paths)) {
+				return result, nil
+			}
+			return nil, fmt.Errorf("E_GIT_SCAN: ls-tree %s: %w: %s", ref, err, strings.TrimSpace(string(paths)))
 		}
 		for _, path := range strings.Split(strings.TrimSpace(string(paths)), "\n") {
 			base := filepath.Base(path)
