@@ -150,15 +150,17 @@ Legacy missing-kind ⇒ `ticket` is applied **only for prefixes still registered
 `ticket`**; a missing-kind receipt for a prefix registered `requirement` is a
 conflict (`E_JOURNAL_CORRUPT`), not a silent downgrade.
 
-**Transactional prefix-registry migration (Sol P0; M5 F1 class).** Kind-tagging
-`prefix_ownership` and `s.prefixes` needs an **explicit transactional schema
-migration + backfill** — `CREATE TABLE IF NOT EXISTS` does **not** add a column
-to an existing table, so a bare `DEFAULT 'ticket'` never reaches pre-M9 rows.
-The migration adds the kind column in a transaction, backfills existing rows to
-`ticket`, and is crash-atomic (the exact M5 F1 lesson). The durable registry
-breadcrumb encodes `Prefixes []string`; add a **legacy decoder** (old = bare
-strings ⇒ `ticket`; new = kind-tagged) plus a migration test, or DB-loss recovery
-loses prefix kind.
+**Transactional schema migration (Sol P0; M5 F1 class).** Kind-tagging needs an
+**explicit transactional schema migration + backfill** for **both** the
+`prefix_ownership` table **and the `allocations` table** — `CREATE TABLE IF NOT
+EXISTS` does **not** add a column to an existing table, so a bare `DEFAULT
+'ticket'` never reaches pre-M9 rows in *either* table, and an existing DB with
+allocated tickets would otherwise fail or lose kind semantics on the
+`allocations` side. The migration, in one transaction, adds the `kind` column to
+both tables, backfills existing rows to `ticket`, and is crash-atomic (the exact
+M5 F1 lesson). The durable registry breadcrumb encodes `Prefixes []string`; add a
+**legacy decoder** (old = bare strings ⇒ `ticket`; new = kind-tagged) plus a
+migration test, or DB-loss recovery loses prefix kind.
 
 **Recovery invariant enforced everywhere (Sol P1).** Prefix-kind consistency is
 enforced not only in `AllocateID` but during **DB rebuild** and **imported-
@@ -259,12 +261,14 @@ requirement registry** → `U_TRACE_EMPTY`/`unevaluated` (the exact Phase-0
    `requirement` (not the default ticket); a pre-M9 receipt with no `kind` field
    for a *ticket*-registered prefix rebuilds as `ticket` (back-compat); `kind`↔
    `path` mismatch is rejected.
-1c. **Transactional prefix migration (Sol P0; M5 F1 class):** an existing pre-M9
-   DB (populated `prefix_ownership` with no kind column, bare-string registry
-   breadcrumbs) upgrades atomically — the column is added + existing rows
-   backfilled to `ticket` in a transaction, the legacy `[]string` breadcrumb
-   decodes to `ticket`, and a crash mid-migration leaves a recoverable DB
-   (reproduce both windows).
+1c. **Transactional schema migration (Sol P0; M5 F1 class):** an existing pre-M9
+   DB — with **both** a populated `prefix_ownership` (no kind column, bare-string
+   registry breadcrumbs) **and a populated `allocations` table of allocated
+   tickets** (no kind column) — upgrades atomically: the `kind` column is added +
+   existing rows backfilled to `ticket` in **both** tables in one transaction, the
+   legacy `[]string` breadcrumb decodes to `ticket`, and a crash mid-migration
+   leaves a recoverable DB (reproduce both migration crash windows, for both
+   tables).
 1d. **Kind-consistency / `E_JOURNAL_CORRUPT`:** a receipt/event/DB/path kind that
    disagrees with the prefix registry is rejected as `E_JOURNAL_CORRUPT` (no
    silent winner) — asserted at `AllocateID`, at DB rebuild, and at imported-
