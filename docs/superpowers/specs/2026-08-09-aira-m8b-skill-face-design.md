@@ -55,14 +55,21 @@ Both artifacts must state, from generated `store` data, that responses carry
   *is* the `aira` binary; the Skill instructs the host to invoke `aira <verb>`,
   the already-proven CLI face over `core.Do`. M8b does not add a fourth dispatch
   path. Per Sol's P0, "invokable/installable" is **not** claimed from request
-  parity alone: it is proven by an **end-to-end invocation test** that executes
-  each documented argv through the real program entry (`Run`) against a temp
-  project and asserts it reaches core with a sane stable code and exit — not a
-  parse error — plus the request-parity test below.
-- **No change to the MCP face.** M8a's union-schema grouped MCP tools stay as-is
-  (they work and are tested). The new operation metadata is *added* to the shared
-  table and *consumed* by the Skill; MCP may adopt it later. Both faces still
-  derive from the one table, so they cannot drift.
+  parity alone: it is proven by a **full-coverage end-to-end invocation test**
+  that executes **every** documented argv through the real program entry (`Run`)
+  against an isolated temp project and asserts each **reaches core** — i.e.
+  returns a stable AIRA `code` and a sane exit, and is *not* a parse or
+  argument-construction failure. A domain outcome such as `E_NOT_FOUND` counts
+  as reaching core (it proves the argv was well-formed and dispatched); a
+  selector/parse error does not. This runs alongside the full request-parity test.
+- **MCP grouped-tool *schemas* are unchanged, but the MCP generator adopts the
+  shared `Include` predicate.** M8a's union-schema grouped MCP tools keep their
+  shape (they work and are tested); M8b only replaces the MCP generator's current
+  `MCPTool != ""` membership filter with the single `Include` predicate (§ inv 1)
+  so both runtime face generators — not merely the coverage tests — decide
+  inclusion from one source. The new operation metadata is *added* to the shared
+  table and *consumed* by the Skill; MCP tool schemas may adopt operation
+  granularity later. Both faces derive from the one table, so they cannot drift.
 - **No hand-authored per-action examples/guidance** beyond the single authored
   preamble. Examples are generated from the operation arg specs.
 - **No new safety enforcement.** `Safety` is descriptive metadata for warnings
@@ -74,11 +81,12 @@ Both artifacts must state, from generated `store` data, that responses carry
 1. **One authority, one inclusion predicate.** The Skill action catalog and the
    guide are derived solely from the dispatch table `core.Do` uses, via
    `DispatchDescriptors()`. A **single** `Include` predicate (a descriptor field
-   set on the table, not inferred from `MCPTool`) decides membership and is used
-   by both the MCP and Skill coverage tests, so Skill coverage is not silently
-   coupled to MCP metadata. A verb surfaced for dispatch but missing required
-   Skill metadata (`Summary`, valid `Safety`, and — if grouped — `Operations`
-   covering every discriminator value) is a build-failing condition.
+   set on the table, not inferred from `MCPTool`) decides membership and is
+   applied by **both runtime face generators** (the MCP `tools/list` generator
+   and the Skill generator) as well as the coverage tests, so Skill coverage is
+   not silently coupled to MCP metadata. A verb surfaced for dispatch but missing
+   required Skill metadata (`Summary`, valid `Safety`, and — if grouped —
+   `Operations` covering every discriminator value) is a build-failing condition.
 2. **Operation-level correctness.** For grouped verbs the catalog has one action
    per operation, each with only the args that operation uses, correct per-op
    requiredness, correct per-op safety, and a valid example. No union-derived
@@ -97,21 +105,35 @@ Both artifacts must state, from generated `store` data, that responses carry
    `id` is `mutate`, confirmed by Sol), `lease` means lease acquire/renew/release,
    `reconcile` means rebuild/heal/check. Asserted against a golden per-operation
    table.
-5. **Metadata tied to behaviour (anti-drift).** Extending the M8a instrumented
-   arg-accessor drift test, each operation is exercised with its discriminator
-   and probe inputs; the args the handler actually **reads** for that operation
-   must equal the args that operation **declares**. Operation metadata cannot
-   silently diverge from handler logic.
+5. **Metadata tied to behaviour (anti-drift), discriminator-aware.** Extending
+   the M8a instrumented arg-accessor drift test, each operation is exercised with
+   its **discriminator** set to that operation's value plus probe inputs; the
+   args the handler **reads**, *minus the structural discriminator* (`subverb`
+   for `find`, `list` for `link`), must equal the args that operation
+   **declares**. Discriminators are structural: they are excluded from an
+   `OperationSpec.Args` and from the manifest `args[]`, and are encoded only by
+   the action's `command` (positional `find add …`, `link ls …`). Operation
+   metadata cannot silently diverge from handler logic.
 6. **Deterministic, artifact-scoped version.** Generation uses no clock/random.
-   The manifest `version` is a hash over the **canonical generated artifact
-   bytes** (manifest sans the version field + SKILL.md), so it changes on any
-   generator, template, preamble, manifest-schema, response-contract, or CLI-
-   grammar change that alters output — not only on descriptor edits. Re-running
-   `skill install` on an unchanged binary is byte-identical (idempotent).
-7. **Generated, not authored, honesty text.** The stable-code list, verdict set,
-   and exit-code map in both artifacts are generated from `store` (the codes/exit
-   map), so they cannot drift from the implementation. A string-only authored
-   claim of exit codes is not permitted.
+   `SKILL.md` and the guide **do not embed the version**. The hash input is a
+   fixed framing: `canonicalJSON(manifest with the version field omitted)` byte-
+   concatenated with the `SKILL.md` bytes, where `canonicalJSON` is Go
+   `encoding/json` marshaling of the manifest struct (deterministic field order;
+   map keys, e.g. the exit map, emitted in sorted order). `version =
+   hex(sha256(hashInput))`; the manifest's `version` field is then set to it.
+   The version therefore changes on any generator, template, preamble, manifest-
+   schema, response-contract, or CLI-grammar change that alters output — not only
+   on descriptor edits — and re-running `skill install` on an unchanged binary is
+   byte-identical (idempotent).
+7. **Generated, not authored, honesty text — one exported source.** The stable-
+   code list, verdict set, exit-code map, and the `unevaluated`-is-not-pass fact
+   come from a **single exported `core` function** (`core.ResponseContract()`)
+   that composes `store`'s codes/exit map with `core`'s verdict→code→exit
+   behaviour (which lives in `Do`). Both artifacts render from it, and a test
+   cross-checks the contract against **actual `Response` behaviour** (drive a
+   check that returns `unevaluated`, assert `Response.Code=="UNEVALUATED"`,
+   `Exit==3`, not pass). A string-only authored claim of exit codes is not
+   permitted.
 8. **Guide-only does not satisfy the deliverable.** `skill install` must emit the
    manifest with the host/entrypoint contract and the enumerable per-operation
    action catalog, and the end-to-end invocation test must pass; prose alone
@@ -135,10 +157,20 @@ type OperationSpec struct {
     Name    string      // discriminator value, e.g. "add", "ls", "list"
     Summary string
     Safety  SafetyClass
-    Args    []OperationArg // arg name + per-operation requiredness
-    Example []ExampleArg   // canonical args for a valid example of this op
+    Args    []OperationArg // NON-discriminator arg names + per-operation requiredness
+    Example []ExampleArg   // canonical (CLI-shaped) args for a valid example
 }
 ```
+
+**Examples are canonical CLI args, not MCP-input args.** The Skill's entrypoint
+is the CLI, so an operation's `Args` and `Example` reference the verb's existing
+CLI `ArgSpec`s (a subset), and the example is expressed in **canonical request
+form** — the same form the M8a MCP↔CLI parity test uses. Crucially there is no
+separate `line` at this level: `find add`'s canonical arg is `file` with value
+`x.go:12`, so the shared renderer emits `--file x.go:12` with **no special-case
+encoding**. The MCP-only split of `file`+`line` into a combined value is an MCP
+*input* concern and stays in the MCP handler; the Skill never reproduces it, so
+there is no hard-coded generator exception to drift (closes Sol's encoding P1).
 
 `DispatchDescriptors()` deep-copies `Operations` (like it already deep-copies
 `Enum`) so the projection stays immutable. A consistency test requires every
@@ -173,12 +205,15 @@ A generator takes `[]DispatchDescriptor` and produces, deterministically:
 - for each action, the arg contract and a **valid example** built as canonical
   request args, then **rendered to CLI argv via a shared renderer** so the
   documented `command` is exactly what the CLI parses (guaranteeing invariant 3);
-- the response-contract section from `store` (stable codes + exit map + verdicts
-  + the `unevaluated` statements);
+- the response-contract section from the single exported `core.ResponseContract()`
+  (stable codes + exit map + verdicts + the `unevaluated` statements), which
+  composes `store`'s codes/exit map with `core`'s verdict→code→exit behaviour;
 - the manifest struct and the SKILL.md / guide Markdown.
 
 The example renderer and the CLI parser are inverse projections of the same arg
 specs; the parity test (invariant 3) proves round-trip identity for every action.
+The renderer is the *only* canonical-args→argv projection; the generator contains
+no per-verb argv special-cases.
 
 ### 4.3 The `skill` face (`cmd/aira/skill.go`)
 
@@ -242,22 +277,29 @@ logic lives in it.
 4. **Skill↔CLI parity, full coverage.** For **every** action, the generated
    `command` parsed by the CLI argv builder yields byte-identical `core.Request`
    to the MCP path — including `find add`'s `--file path:line` and `link ls`.
-5. **Per-operation drift (behaviour-tied).** Extend the M8a instrumented
-   arg-accessor test: per operation, handler-read args == declared op args.
+5. **Per-operation drift (behaviour-tied, discriminator-aware).** Extend the M8a
+   instrumented arg-accessor test: per operation, (handler-read args − structural
+   discriminator) == declared op args. Assert the discriminator (`subverb`/`list`)
+   is absent from every `OperationSpec.Args` and manifest `args[]`.
 6. **Manifest artifact + host contract.** `skill install` writes an
    `aira.skill.json` that parses, declares the entrypoint + discovery contract,
    carries generated `response_contract`, and enumerates every action with
    args+safety+command; a guide-only variant (no manifest) fails.
-7. **End-to-end invocation.** For representative documented actions across
-   read/mutate/lease/reconcile, execute the generated argv through `Run` against
-   an isolated temp project (own `XDG_STATE_HOME`); assert it reaches core with a
-   stable code + sane exit (not `E_SELECTOR_INVALID`/parse error).
+7. **End-to-end invocation (full coverage).** For **every** documented action,
+   execute the generated argv through `Run` against an isolated temp project (own
+   `XDG_STATE_HOME`); assert it reaches core — a stable AIRA `code` and sane exit,
+   not a parse/argument-construction failure (`E_SELECTOR_INVALID` etc). A domain
+   `E_NOT_FOUND` counts as reaching core; the test asserts the failure class, not
+   a specific domain success, so no elaborate per-action fixture is required.
 8. **Determinism / idempotency.** Two installs into the same dir on the same
    binary are byte-identical with equal versions; a metadata/generator change
    changes the version and the diff is the expected one.
-9. **Generated honesty content.** Both artifacts contain the stable-code list,
-   verdict set, exit map, and the explicit "`unevaluated` is not a pass / not
-   zero" statement, generated from `store`; removing the source data or the
+9. **Generated honesty content + behaviour cross-check.** Both artifacts contain
+   the stable-code list, verdict set, exit map, and the explicit "`unevaluated`
+   is not a pass / not zero" statement, rendered from `core.ResponseContract()`.
+   A cross-check test drives a real `unevaluated` check through `Do` and asserts
+   the actual `Response.Code`/`Exit` match what the contract (and thus the
+   generated text) claims; a mismatch fails. Removing the source data or the
    statement fails.
 10. **Face wiring / exits.** `skill guide` exits 0 with Markdown; `skill install
     <newdir>` exits 0 writing both files; unknown subcommand and install into a
