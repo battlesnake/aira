@@ -310,7 +310,10 @@ func (s *Store) initDB(ctx context.Context) error {
 	if err := s.ensureOutboxKind(ctx); err != nil {
 		return err
 	}
-	return s.ensureFindingsSchema(ctx)
+	if err := s.ensureFindingsSchema(ctx); err != nil {
+		return err
+	}
+	return s.ensureSearchFTS(ctx)
 }
 
 func (s *Store) ensureAreaHintsGeneration(ctx context.Context) error {
@@ -379,6 +382,16 @@ func hasTable(ctx context.Context, db interface {
 	}
 	defer rows.Close()
 	return rows.Next()
+}
+
+func (s *Store) ensureSearchFTS(ctx context.Context) error {
+	if hasTable(ctx, s.db, "search_fts") {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `CREATE VIRTUAL TABLE search_fts USING fts5(
+		kind UNINDEXED, ref_id UNINDEXED, worktree_id UNINDEXED, content
+	)`)
+	return translateDBError(err)
 }
 
 // findingsSchemaCurrent reports whether the findings schema is already at the
@@ -1238,6 +1251,9 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		if _, err := conn.ExecContext(ctx, `DELETE FROM relations WHERE project_id=?`, s.projectID); err != nil {
 			return err
 		}
+		if _, err := conn.ExecContext(ctx, `DELETE FROM search_fts`); err != nil {
+			return err
+		}
 		for _, entry := range entries {
 			if _, err := conn.ExecContext(ctx, `DELETE FROM findings WHERE project_id=? AND worktree_id=? AND subtype='review'`, s.projectID, entry.WorktreeID); err != nil {
 				return err
@@ -1247,6 +1263,9 @@ func (s *Store) Rebuild(ctx context.Context) error {
 			if err := upsertReviewFinding(ctx, conn, s.projectID, finding.WorktreeID, finding.Path, finding.Finding, finding.Digest); err != nil {
 				return err
 			}
+		}
+		if err := insertSearchRows(ctx, conn, scanned, scannedFindings); err != nil {
+			return err
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO event_counters(project_id,next_seq) VALUES(?,?)
 			ON CONFLICT(project_id) DO UPDATE SET next_seq=CASE WHEN event_counters.next_seq < excluded.next_seq THEN excluded.next_seq ELSE event_counters.next_seq END`,

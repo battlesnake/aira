@@ -95,3 +95,21 @@ func TestFindingRequestsMirrorSubverbSurface(t *testing.T) {
 		t.Fatalf("find set request=%#v", set)
 	}
 }
+
+func TestGrepRequestParsesQueryAndOptions(t *testing.T) {
+	positional, options, err := parseArgs("grep", []string{`alpha AND beta`, "--kind", "finding", "--by", "kind", "--fields", "id,snippet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := buildRequest("grep", positional, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Args["query"] != `alpha AND beta` || request.Args["kind"] != "finding" || request.Args["by"] != "kind" {
+		t.Fatalf("grep request = %#v", request)
+	}
+	fields, ok := request.Args["fields"].([]string)
+	if !ok || len(fields) != 2 || fields[1] != "snippet" {
+		t.Fatalf("grep fields = %#v", request.Args["fields"])
+	}
+}

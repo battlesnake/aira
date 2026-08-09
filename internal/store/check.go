@@ -20,7 +20,7 @@ var ExitCodes = map[string]int{
 	"E_DB_BUSY":             4, "E_DB_CORRUPT": 4, "E_RECEIPT_IO": 4,
 	"E_RECONCILE_REQUIRED": 4, "E_GIT_SCAN": 4, "E_INTERNAL": 4,
 	"E_JOURNAL_CORRUPT": 4,
-	"E_FINDING_INVALID": 2, "E_WAIVER_REASON_REQUIRED": 2,
+	"E_FINDING_INVALID": 2, "E_WAIVER_REASON_REQUIRED": 2, "E_QUERY_INVALID": 2,
 }
 
 func ExitForCode(code string) int {

@@ -37,6 +37,7 @@ type Store interface {
 	List(string) ([]store.TicketRecord, error)
 	AddFinding(context.Context, domain.ReviewFindingInput) (domain.Finding, store.EventKey, error)
 	ListFindings(string) ([]store.FindingRecord, error)
+	Search(context.Context, string, string) ([]store.SearchResult, error)
 	GetFinding(string) (store.FindingRecord, error)
 	SetFinding(context.Context, string, domain.Disposition, string, string) (store.EventKey, error)
 	Count(string, string) (store.CountResult, error)
@@ -161,6 +162,26 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				projected["body"] = record.Body
 			}
 			return handlerData{Data: projected, Warnings: record.Warnings}, nil
+		}},
+		"grep": {Name: "grep", Usage: "grep <query> [--kind ticket|finding --by kind --fields F,...]", Run: func(ctx context.Context, args map[string]any) (any, error) {
+			rows, err := c.store.Search(ctx, stringArg(args, "query"), stringArg(args, "kind"))
+			if err != nil {
+				if store.ErrorCode(err) == "E_INDEX_UNEVALUATED" {
+					return handlerData{Data: map[string]any{"total": 0, "rows": []map[string]any{}, "unevaluated": true}, Verdict: "unevaluated"}, nil
+				}
+				return nil, err
+			}
+			by := stringArg(args, "by")
+			if by != "" && by != "kind" {
+				return nil, fmt.Errorf("E_SELECTOR_INVALID: unsupported grep distribution field %q", by)
+			}
+			data := map[string]any{"total": len(rows), "rows": projectSearchResults(rows, stringSlice(args, "fields"))}
+			if len(rows) > ListLimit {
+				data["rows"] = projectSearchResults(rows[:ListLimit], stringSlice(args, "fields"))
+				data["distribution"] = searchDistribution(rows)
+				data["truncated"] = true
+			}
+			return handlerData{Data: data}, nil
 		}},
 		"find": {Name: "find", Usage: "find add|ls|show|set ...", Run: func(ctx context.Context, args map[string]any) (any, error) {
 			subverb := strings.ToLower(stringArg(args, "subverb"))
@@ -489,6 +510,34 @@ func projectFindingRecords(records []store.FindingRecord, fields []string) []map
 	result := make([]map[string]any, 0, len(records))
 	for _, record := range records {
 		result = append(result, projectFindingRecord(record, fields))
+	}
+	return result
+}
+
+func projectSearchResults(records []store.SearchResult, fields []string) []map[string]any {
+	result := make([]map[string]any, 0, len(records))
+	for _, record := range records {
+		all := map[string]any{"kind": record.Kind, "id": record.ID, "snippet": record.Snippet, "rank": record.Rank}
+		if len(fields) == 0 {
+			result = append(result, all)
+			continue
+		}
+		projected := make(map[string]any, len(fields))
+		for _, field := range fields {
+			field = strings.TrimSpace(field)
+			if value, ok := all[field]; ok {
+				projected[field] = value
+			}
+		}
+		result = append(result, projected)
+	}
+	return result
+}
+
+func searchDistribution(records []store.SearchResult) map[string]int {
+	result := map[string]int{}
+	for _, record := range records {
+		result[record.Kind]++
 	}
 	return result
 }

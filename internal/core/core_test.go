@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -831,6 +832,61 @@ func TestListOverflowIncludesDistributionAndTotal(t *testing.T) {
 	marshalRoundTrip(t, response.Data, &data)
 	if len(data.Rows) != ListLimit || data.Total != ListLimit+1 || len(data.Distribution) == 0 {
 		t.Fatalf("overflow data = rows=%d total=%d distribution=%v", len(data.Rows), data.Total, data.Distribution)
+	}
+}
+
+func TestGrepOverflowProjectsFieldsAndDistributesByKind(t *testing.T) {
+	s := coreTestStore(t)
+	c := New(s)
+	ids := make([]string, 0, 26)
+	for i := 0; i < 26; i++ {
+		response := c.Do(context.Background(), Request{Verb: "create", Args: map[string]any{
+			"title": "grep overflow", "body": "common needle", "kind": "feature", "severity": "P2",
+		}})
+		if !response.OK {
+			t.Fatalf("create %d: %#v", i, response)
+		}
+		var created map[string]any
+		marshalRoundTrip(t, response.Data, &created)
+		ids = append(ids, created["id"].(string))
+	}
+	for i := 0; i < 25; i++ {
+		response := c.Do(context.Background(), Request{Verb: "find", Args: map[string]any{
+			"subverb": "add", "ticket": ids[i], "category": "bug", "severity": "P1",
+			"verdict": "confirmed", "source": "review", "message": fmt.Sprintf("common needle %d", i),
+		}})
+		if !response.OK {
+			t.Fatalf("finding %d: %#v", i, response)
+		}
+	}
+	response := c.Do(context.Background(), Request{Verb: "grep", Args: map[string]any{
+		"query": "needle", "by": "kind", "fields": []string{"kind", "id", "snippet", "rank"},
+	}})
+	if !response.OK {
+		t.Fatalf("grep: %#v", response)
+	}
+	var data struct {
+		Rows         []map[string]any `json:"rows"`
+		Total        int              `json:"total"`
+		Distribution map[string]int   `json:"distribution"`
+		Truncated    bool             `json:"truncated"`
+	}
+	marshalRoundTrip(t, response.Data, &data)
+	if len(data.Rows) != ListLimit || data.Total != ListLimit+1 || !data.Truncated || len(data.Distribution) != 2 {
+		t.Fatalf("grep overflow = %#v", data)
+	}
+	for _, row := range data.Rows {
+		if len(row) != 4 {
+			t.Fatalf("grep fields projection = %#v", row)
+		}
+	}
+}
+
+func TestGrepMalformedQueryUsesQueryError(t *testing.T) {
+	c := New(coreTestStore(t))
+	response := c.Do(context.Background(), Request{Verb: "grep", Args: map[string]any{"query": `"unterminated`}})
+	if response.OK || response.Code != "E_QUERY_INVALID" || response.Exit != 2 {
+		t.Fatalf("malformed grep response = %#v", response)
 	}
 }
 
