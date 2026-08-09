@@ -234,7 +234,7 @@ func (s *Store) records(filter selectorFilter) ([]TicketRecord, error) {
 	if err != nil {
 		return nil, err
 	}
-	tickets, _, err := scanTickets(s.root, s.worktreeID, s.projectSlug)
+	tickets, _, _, err := scanTickets(s.root, s.worktreeID, s.projectSlug)
 	if err != nil {
 		return nil, err
 	}

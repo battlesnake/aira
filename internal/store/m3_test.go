@@ -808,10 +808,11 @@ func TestReadyTreatsDanglingRelationOwnerSymlinkAsUnevaluated(t *testing.T) {
 func TestReadyFindingAttributionUsesExactRelationEndpoints(t *testing.T) {
 	s, _, _ := m3Store(t)
 	short := m3Ticket(t, s, "short ID")
-	target := m3Ticket(t, s, "relation target")
 	long := domain.Ticket{Schema: 1, ID: "AIRA-10", Project: "aira", Title: "long ID", Status: domain.StatusPlanned,
 		Kind: domain.KindFeature, Severity: domain.SeverityP2, Labels: []string{}, Relations: []domain.Relation{{
-			Kind: domain.RelationBlocks, From: "AIRA-10", To: target.ID,
+			// AIRA-10 is the canonical owner; the missing AIRA-11 endpoint
+			// produces a relation-level finding without excluding this file.
+			Kind: domain.RelationBlocks, From: "AIRA-10", To: "AIRA-11",
 		}}}
 	data := rawM3Ticket(t, long, "body\n")
 	if err := os.WriteFile(filepath.Join(s.root, ".aira", "tickets", long.ID+".md"), data, 0o644); err != nil {

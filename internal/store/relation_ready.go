@@ -37,7 +37,7 @@ func relationSubject(r domain.Relation) string {
 func relationEndpointKey(project, id string) string { return project + "\x00" + id }
 
 func scanStoredRelationsAt(root, worktreeID, project string) ([]storedRelation, map[string]domain.Ticket, []CheckFinding, error) {
-	tickets, scanFindings, err := scanTickets(root, worktreeID, project)
+	tickets, scanFindings, _, err := scanTickets(root, worktreeID, project)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -181,6 +181,9 @@ func (s *Store) Unlink(ctx context.Context, from string, kind domain.RelationKin
 	path := s.ticketPath(owner)
 	data, err := readRegularTicket(path)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return EventKey{}, errors.New("E_NOT_FOUND: canonical relation owner file is missing")
+		}
 		return EventKey{}, err
 	}
 	ticket, body, err := domain.ParseTicket(data)
@@ -379,7 +382,7 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 		return nil, errors.New("E_SELECTOR_INVALID: ready requires an exact ID or file anchor")
 	}
 
-	tickets, scanFindings, err := scanTickets(s.root, s.worktreeID, s.projectSlug)
+	tickets, scanFindings, excludedTicketPaths, err := scanTickets(s.root, s.worktreeID, s.projectSlug)
 	if err != nil {
 		return nil, err
 	}
@@ -423,7 +426,7 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 		return nil, err
 	}
 	canonicalEndpointFindings := canonicalFindingsForIndexedRelations(s.root, scanFindings, indexedRelations, byID)
-	canonicalScanFinding, graphUnevaluated := canonicalScanUnevaluatedFinding(scanFindings)
+	canonicalScanFinding, graphUnevaluated := canonicalScanUnevaluatedFinding(excludedTicketPaths)
 	for i := range indexFindings {
 		// The canonical files determine readiness. A stale derived row is
 		// surfaced here as a warning, but must not make a canonical-ready
@@ -504,34 +507,21 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 	return result, nil
 }
 
-func canonicalScanUnevaluatedFinding(scanFindings []CheckFinding) (CheckFinding, bool) {
-	paths := make([]string, 0)
-	seen := make(map[string]bool)
-	for _, finding := range scanFindings {
-		if finding.Kind != "fail" || !unparseableTicketScanCode(finding.Code) || seen[finding.Subject] {
-			continue
-		}
-		seen[finding.Subject] = true
-		paths = append(paths, finding.Subject)
+func canonicalScanUnevaluatedFinding(excludedTicketPaths map[string]struct{}) (CheckFinding, bool) {
+	paths := make([]string, 0, len(excludedTicketPaths))
+	for path := range excludedTicketPaths {
+		paths = append(paths, path)
 	}
+	sort.Strings(paths)
 	if len(paths) == 0 {
 		return CheckFinding{}, false
 	}
 	return CheckFinding{
 		Code:    "U_RELATION_GRAPH_UNESTABLISHED",
 		Subject: "ready",
-		Message: fmt.Sprintf("readiness cannot be established: unparseable ticket file(s) %s prevent establishing the blocker graph; any such file may declare a blocks relation to this ticket", strings.Join(paths, ", ")),
+		Message: fmt.Sprintf("readiness cannot be established: excluded ticket file(s) %s prevent establishing the blocker graph; any such file may declare a blocks relation to this ticket", strings.Join(paths, ", ")),
 		Kind:    "unevaluated",
 	}, true
-}
-
-func unparseableTicketScanCode(code string) bool {
-	switch code {
-	case "E_CONFIG_INVALID", "E_DUPLICATE_ID", "E_ID_INVALID":
-		return true
-	default:
-		return false
-	}
 }
 
 // canonicalFindingsForIndexedRelations uses the disposable index only as an

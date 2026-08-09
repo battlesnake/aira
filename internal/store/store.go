@@ -928,7 +928,7 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		if err := s.markWorktreeActive(ctx, entry, valid); err != nil {
 			return err
 		}
-		tickets, scanFindings, err := scanTickets(entry.Root, entry.WorktreeID, s.projectSlug)
+		tickets, scanFindings, _, err := scanTickets(entry.Root, entry.WorktreeID, s.projectSlug)
 		if err != nil {
 			return err
 		}
@@ -1780,19 +1780,26 @@ func (s *Store) recordScanFinding(ctx context.Context, entry registryEntry, find
 	})
 }
 
-func scanTickets(root, worktreeID, project string) ([]scannedTicket, []CheckFinding, error) {
+// scanTickets returns the canonical tickets, scan findings, and the exact set
+// of ticket paths excluded from the canonical scan. Readiness uses that set as
+// its graph-establishment boundary, independent of the finding code catalog.
+func scanTickets(root, worktreeID, project string) ([]scannedTicket, []CheckFinding, map[string]struct{}, error) {
 	dir := filepath.Join(root, ".aira", "tickets")
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	seen := map[string]string{}
 	resultByID := map[string]int{}
 	var result []scannedTicket
 	var findings []CheckFinding
+	excludedTicketPaths := make(map[string]struct{})
+	exclude := func(path string) {
+		excludedTicketPaths[repoPath(root, path)] = struct{}{}
+	}
 	for _, entry := range entries {
 		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") || !strings.HasSuffix(entry.Name(), ".md") {
 			continue
@@ -1802,13 +1809,15 @@ func scanTickets(root, worktreeID, project string) ([]scannedTicket, []CheckFind
 		if err != nil {
 			if ErrorCode(err) == "E_CONFIG_INVALID" {
 				findings = append(findings, scanFinding(root, path, err))
+				exclude(path)
 				continue
 			}
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		ticket, body, err := domain.ParseTicket(data)
 		if err != nil {
 			findings = append(findings, scanFinding(root, path, err))
+			exclude(path)
 			continue
 		}
 		if ticket.Project != project {
@@ -1816,6 +1825,8 @@ func scanTickets(root, worktreeID, project string) ([]scannedTicket, []CheckFind
 		}
 		if prior, ok := seen[ticket.ID]; ok {
 			findings = append(findings, scanFinding(root, path, fmt.Errorf("E_DUPLICATE_ID: %s and %s in worktree %s", repoPath(root, prior), repoPath(root, path), worktreeID)))
+			exclude(prior)
+			exclude(path)
 			if index, ok := resultByID[ticket.ID]; ok {
 				result = append(result[:index], result[index+1:]...)
 				delete(resultByID, ticket.ID)
@@ -1830,12 +1841,13 @@ func scanTickets(root, worktreeID, project string) ([]scannedTicket, []CheckFind
 		seen[ticket.ID] = path
 		if filepath.Base(path) != ticket.ID+".md" {
 			findings = append(findings, scanFinding(root, path, fmt.Errorf("E_CONFIG_INVALID: filename/frontmatter mismatch %s", repoPath(root, path))))
+			exclude(path)
 			continue
 		}
 		resultByID[ticket.ID] = len(result)
 		result = append(result, scannedTicket{WorktreeID: worktreeID, Root: root, Path: path, Ticket: ticket, Body: body, Digest: digestBytes(data)})
 	}
-	return result, findings, nil
+	return result, findings, excludedTicketPaths, nil
 }
 
 func ticketIDFromFilename(path string) (string, bool) {

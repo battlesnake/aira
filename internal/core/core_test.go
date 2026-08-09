@@ -141,6 +141,162 @@ func TestReadyCleanProjectListRemainsPassThroughCore(t *testing.T) {
 	}
 }
 
+func TestReadyInvalidRelationOwnerRemainsUnevaluatedAfterRebuildThroughCore(t *testing.T) {
+	s, base := coreTestStoreWithRoot(t)
+	c := New(s)
+	create := func(title string) string {
+		t.Helper()
+		response := c.Do(context.Background(), Request{Verb: "create", Args: map[string]any{"title": title}})
+		if !response.OK {
+			t.Fatalf("create %s: %#v", title, response)
+		}
+		var data map[string]any
+		marshalRoundTrip(t, response.Data, &data)
+		return data["id"].(string)
+	}
+
+	owner, dependent := create("invalid relation owner"), create("dependent")
+	if response := c.Do(context.Background(), Request{Verb: "link", Args: map[string]any{
+		"from": owner, "kind": "blocks", "to": dependent,
+	}}); !response.OK {
+		t.Fatalf("link: %#v", response)
+	}
+
+	ownerPath := filepath.Join(base, ".aira", "tickets", owner+".md")
+	data, err := os.ReadFile(ownerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket, _, err := domain.ParseTicket(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket.Relations = append(ticket.Relations, domain.Relation{Kind: domain.RelationBlocks, From: owner, To: owner})
+	// Bypass RenderTicket's validation to model a hand-edited invalid file.
+	writeCoreTicketFile(t, ownerPath, ticket)
+
+	assertDependentUnevaluated := func(phase string, requireGraphFinding bool) {
+		t.Helper()
+		response := c.Do(context.Background(), Request{Verb: "ready", Args: map[string]any{"selector": dependent}})
+		if !response.OK || response.Code != "UNEVALUATED" || response.Exit != 3 {
+			t.Fatalf("%s ready response = %#v", phase, response)
+		}
+		var record store.ReadyRecord
+		marshalRoundTrip(t, response.Data, &record)
+		if record.Ticket.Ticket.ID != dependent || record.Ready || record.Verdict != "unevaluated" {
+			t.Fatalf("%s dependent record = %#v", phase, record)
+		}
+		foundGraphFinding := false
+		for _, finding := range record.Findings {
+			if finding.Code == "U_RELATION_GRAPH_UNESTABLISHED" {
+				foundGraphFinding = true
+				if !strings.Contains(finding.Message, ".aira/tickets/"+owner+".md") {
+					t.Fatalf("%s graph finding does not name owner: %#v", phase, finding)
+				}
+			}
+		}
+		if requireGraphFinding && !foundGraphFinding {
+			t.Fatalf("%s dependent findings = %#v", phase, record.Findings)
+		}
+
+		list := c.Do(context.Background(), Request{Verb: "ready", Args: map[string]any{"list": true}})
+		if !list.OK || (list.Code != "UNEVALUATED" && list.Code != "FAIL") || (list.Code == "UNEVALUATED" && list.Exit != 3) || (list.Code == "FAIL" && list.Exit != 1) {
+			t.Fatalf("%s ready --list response = %#v", phase, list)
+		}
+		var listData struct {
+			Rows []map[string]any `json:"rows"`
+		}
+		marshalRoundTrip(t, list.Data, &listData)
+		for _, row := range listData.Rows {
+			if row["id"] == dependent {
+				if row["ready"] != false || row["verdict"] != "unevaluated" {
+					t.Fatalf("%s dependent list row = %#v", phase, row)
+				}
+				return
+			}
+		}
+		t.Fatalf("%s ready --list omitted dependent: %#v", phase, listData.Rows)
+	}
+
+	assertDependentUnevaluated("before check", false)
+	check := c.Do(context.Background(), Request{Verb: "check"})
+	if !check.OK || check.Code != "FAIL" || check.Exit != 1 {
+		t.Fatalf("check response = %#v", check)
+	}
+	assertDependentUnevaluated("after check rebuild", true)
+}
+
+func TestReadyProjectMismatchDoesNotMakeUnrelatedTicketUnevaluatedThroughCore(t *testing.T) {
+	s, base := coreTestStoreWithRoot(t)
+	c := New(s)
+	create := c.Do(context.Background(), Request{Verb: "create", Args: map[string]any{"title": "unrelated ready"}})
+	if !create.OK {
+		t.Fatalf("create: %#v", create)
+	}
+	var created map[string]any
+	marshalRoundTrip(t, create.Data, &created)
+	readyID := created["id"].(string)
+
+	mismatch := coreRawTicket("AIRA-2", "project mismatch")
+	mismatch.Project = "other-project"
+	writeCoreTicketFile(t, filepath.Join(base, ".aira", "tickets", mismatch.ID+".md"), mismatch)
+
+	response := c.Do(context.Background(), Request{Verb: "ready", Args: map[string]any{"selector": readyID}})
+	if !response.OK || response.Code != "PASS" || response.Exit != 0 {
+		t.Fatalf("unrelated ready response with project mismatch = %#v", response)
+	}
+	var record store.ReadyRecord
+	marshalRoundTrip(t, response.Data, &record)
+	if !record.Ready || record.Verdict != "pass" {
+		t.Fatalf("unrelated ready record with project mismatch = %#v", record)
+	}
+}
+
+func TestReadyAllInvalidRelationsIsNotPassThroughCore(t *testing.T) {
+	// An all-invalid-relations project has no valid graph rows; fail or
+	// unevaluated is honest, but pass/exit 0 would be vacuous.
+	s, base := coreTestStoreWithRoot(t)
+	ticket := coreRawTicket("AIRA-1", "invalid relation only")
+	ticket.Relations = []domain.Relation{{Kind: domain.RelationBlocks, From: ticket.ID, To: ticket.ID}}
+	writeCoreTicketFile(t, filepath.Join(base, ".aira", "tickets", ticket.ID+".md"), ticket)
+
+	response := New(s).Do(context.Background(), Request{Verb: "ready", Args: map[string]any{"list": true}})
+	if !response.OK || response.Code == "PASS" || response.Exit == 0 {
+		t.Fatalf("all-invalid-relations ready response = %#v", response)
+	}
+}
+
+func TestCoreUnlinkMissingCanonicalOwnerReturnsNotFound(t *testing.T) {
+	s, base := coreTestStoreWithRoot(t)
+	c := New(s)
+	create := func(title string) string {
+		t.Helper()
+		response := c.Do(context.Background(), Request{Verb: "create", Args: map[string]any{"title": title}})
+		if !response.OK {
+			t.Fatalf("create %s: %#v", title, response)
+		}
+		var data map[string]any
+		marshalRoundTrip(t, response.Data, &data)
+		return data["id"].(string)
+	}
+	owner, target := create("missing canonical owner"), create("unlink target")
+	if response := c.Do(context.Background(), Request{Verb: "link", Args: map[string]any{
+		"from": owner, "kind": "blocks", "to": target,
+	}}); !response.OK {
+		t.Fatalf("link: %#v", response)
+	}
+	if err := os.Remove(filepath.Join(base, ".aira", "tickets", owner+".md")); err != nil {
+		t.Fatal(err)
+	}
+
+	response := c.Do(context.Background(), Request{Verb: "unlink", Args: map[string]any{
+		"from": owner, "kind": "blocks", "to": target,
+	}})
+	if response.OK || response.Code != "E_NOT_FOUND" || response.Exit != 2 {
+		t.Fatalf("unlink missing owner response = %#v", response)
+	}
+}
+
 func TestCoreDanglingRelationContractThroughDispatch(t *testing.T) {
 	s, base := coreTestStoreWithRoot(t)
 	c := New(s)

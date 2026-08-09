@@ -234,7 +234,7 @@ func (s *Store) checkDuplicateIDs(ctx context.Context, report *CheckReport) erro
 	projections := map[string]projection{}
 	for _, entry := range entries {
 		seen := map[string]string{}
-		tickets, scanFindings, err := scanTickets(entry.Root, entry.WorktreeID, s.projectSlug)
+		tickets, scanFindings, _, err := scanTickets(entry.Root, entry.WorktreeID, s.projectSlug)
 		if err != nil {
 			if !isIntegrityError(err) {
 				return err
