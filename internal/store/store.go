@@ -273,13 +273,44 @@ func (s *Store) initDB(ctx context.Context) error {
 	        )`,
 		`CREATE TABLE IF NOT EXISTS area_hints (
             project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, worktree_id TEXT NOT NULL,
-            glob TEXT NOT NULL, PRIMARY KEY(project_id, ticket_id, worktree_id, glob)
+            generation INTEGER NOT NULL DEFAULT 0, glob TEXT NOT NULL,
+            PRIMARY KEY(project_id, ticket_id, worktree_id, glob)
         )`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return translateDBError(err)
 		}
+	}
+	return s.ensureAreaHintsGeneration(ctx)
+}
+
+func (s *Store) ensureAreaHintsGeneration(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(area_hints)`)
+	if err != nil {
+		return translateDBError(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return err
+		}
+		if name == "generation" {
+			return rows.Err()
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE area_hints ADD COLUMN generation INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return translateDBError(err)
 	}
 	return nil
 }

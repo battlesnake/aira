@@ -32,17 +32,24 @@ type liveAreaClaim struct {
 	globs    []string
 }
 
+type liveAreaLease struct {
+	worktree   string
+	generation uint64
+}
+
 // NormalizeAreaGlob converts a hint to a repo-relative slash form. Leading
-// "./" and repeated separators are cleaned, Windows separators are converted
-// to '/', and traversal/absolute patterns, malformed glob classes, empty
-// patterns, NULs, and invalid UTF-8 are rejected. A wildcard never crosses a
-// slash unless it is the complete ** segment.
+// "./" and repeated separators are cleaned, while Windows-qualified and
+// backslash-containing patterns, traversal/absolute patterns, malformed glob
+// classes, empty patterns, NULs, and invalid UTF-8 are rejected. A wildcard
+// never crosses a slash unless it is the complete ** segment.
 func NormalizeAreaGlob(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" || strings.IndexByte(raw, 0) >= 0 || !utf8.ValidString(raw) {
 		return "", fmt.Errorf("E_GLOB_INVALID: empty, NUL, or invalid UTF-8 glob")
 	}
-	raw = strings.ReplaceAll(raw, `\`, "/")
+	if strings.Contains(raw, `\`) || isWindowsDriveQualified(raw) {
+		return "", fmt.Errorf("E_GLOB_INVALID: glob must be repo-relative: %q", raw)
+	}
 	if strings.HasPrefix(raw, "/") {
 		return "", fmt.Errorf("E_GLOB_INVALID: glob must be repo-relative: %q", raw)
 	}
@@ -64,6 +71,10 @@ func NormalizeAreaGlob(raw string) (string, error) {
 		}
 	}
 	return cleaned, nil
+}
+
+func isWindowsDriveQualified(raw string) bool {
+	return len(raw) >= 2 && ((raw[0] >= 'A' && raw[0] <= 'Z') || (raw[0] >= 'a' && raw[0] <= 'z')) && raw[1] == ':'
 }
 
 // NormalizeAreaGlobs normalises, sorts, and deduplicates a replacement set.
@@ -400,11 +411,14 @@ func (s *Store) Touch(ctx context.Context, ticketID, token string, rawGlobs []st
 		if held.HolderTokenHash() != tokenHash {
 			return ErrLeaseToken
 		}
+		if s.worktreeID != held.Worktree() {
+			return ErrLeaseToken
+		}
 		if _, err := conn.ExecContext(ctx, `DELETE FROM area_hints WHERE project_id=? AND ticket_id=? AND worktree_id=?`, s.projectID, ticketID, s.worktreeID); err != nil {
 			return err
 		}
 		for _, glob := range globs {
-			if _, err := conn.ExecContext(ctx, `INSERT INTO area_hints(project_id, ticket_id, worktree_id, glob) VALUES(?, ?, ?, ?)`, s.projectID, ticketID, s.worktreeID, glob); err != nil {
+			if _, err := conn.ExecContext(ctx, `INSERT INTO area_hints(project_id, ticket_id, worktree_id, generation, glob) VALUES(?, ?, ?, ?, ?)`, s.projectID, ticketID, s.worktreeID, int64(held.Generation()), glob); err != nil {
 				return err
 			}
 		}
@@ -424,11 +438,7 @@ func (s *Store) Touch(ctx context.Context, ticketID, token string, rawGlobs []st
 func liveAreaClaims(ctx context.Context, queryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }, projectID, bootID string, monoNS uint64) ([]liveAreaClaim, error) {
-	type liveLease struct {
-		ticketID string
-		worktree string
-	}
-	leases := map[string]liveLease{}
+	leases := map[string]liveAreaLease{}
 	rows, err := queryer.QueryContext(ctx, `SELECT ticket_id, state, generation, holder_token_hash, boot_id,
         last_heartbeat_mono_ns, ttl_ns, actor, worktree_id FROM leases WHERE project_id=? AND state='held'`, projectID)
 	if err != nil {
@@ -448,7 +458,7 @@ func liveAreaClaims(ctx context.Context, queryer interface {
 		}
 		held, ok := lease.Held()
 		if ok && held.IsLive(bootID, monoNS) {
-			leases[ticketID] = liveLease{ticketID: ticketID, worktree: held.Worktree()}
+			leases[ticketID] = liveAreaLease{worktree: held.Worktree(), generation: held.Generation()}
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -457,19 +467,24 @@ func liveAreaClaims(ctx context.Context, queryer interface {
 	}
 	_ = rows.Close()
 
-	hintRows, err := queryer.QueryContext(ctx, `SELECT ticket_id, worktree_id, glob FROM area_hints WHERE project_id=? ORDER BY ticket_id, worktree_id, glob`, projectID)
+	hintRows, err := queryer.QueryContext(ctx, `SELECT ticket_id, worktree_id, generation, glob FROM area_hints WHERE project_id=? ORDER BY ticket_id, worktree_id, generation, glob`, projectID)
 	if err != nil {
 		return nil, err
 	}
 	claims := map[string]*liveAreaClaim{}
 	for hintRows.Next() {
 		var ticketID, worktree, glob string
-		if err := hintRows.Scan(&ticketID, &worktree, &glob); err != nil {
+		var generation int64
+		if err := hintRows.Scan(&ticketID, &worktree, &generation, &glob); err != nil {
 			_ = hintRows.Close()
 			return nil, err
 		}
+		if generation < 0 {
+			_ = hintRows.Close()
+			return nil, errors.New("E_CONFIG_INVALID: negative area hint generation")
+		}
 		lease, ok := leases[ticketID]
-		if !ok || lease.worktree != worktree {
+		if !ok || lease.worktree != worktree || lease.generation != uint64(generation) {
 			continue // stale after release or an expired/stealing lease.
 		}
 		key := ticketID + "\x00" + worktree

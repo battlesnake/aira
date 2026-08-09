@@ -41,7 +41,7 @@ func TestAreaGlobOverlapTable(t *testing.T) {
 }
 
 func TestNormalizeAreaGlobSortsDeduplicatesAndRejectsInvalid(t *testing.T) {
-	got, err := NormalizeAreaGlobs([]string{"./z\\file.go", "src/**", "src/**", "./a/b"})
+	got, err := NormalizeAreaGlobs([]string{"./z/file.go", "src/**", "src/**", "./a/b"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,10 +49,103 @@ func TestNormalizeAreaGlobSortsDeduplicatesAndRejectsInvalid(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("normalized globs=%#v, want %#v", got, want)
 	}
-	for _, glob := range []string{"", "../secret", "/absolute", "a/[broken"} {
+	for _, glob := range []string{"", "../secret", "/absolute", "a/[broken", `C:\repo\secret`, `C:secret`, `a\b`} {
 		if _, err := NormalizeAreaGlobs([]string{glob}); ErrorCode(err) != "E_GLOB_INVALID" {
 			t.Fatalf("invalid glob %q error=%v, want E_GLOB_INVALID", glob, err)
 		}
+	}
+}
+
+func TestTouchRejectsTokenFromNonHolderWorktreeWithoutWritingHint(t *testing.T) {
+	s, clock, base := m3Store(t)
+	other, err := Open(context.Background(), Options{
+		Root: base, CommonDir: filepath.Join(base, "common"), DBPath: filepath.Join(base, "state", "state.db"),
+		RegistryPath: filepath.Join(base, "state", "registry.jsonl"), LeaseStateDir: filepath.Join(base, "other-state"),
+		ProjectID: s.projectID, WorktreeID: "worktree-b", ProjectSlug: "aira", Prefixes: []string{"AIRA"}, Clock: clock, LeaseTTLNS: 900,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Close() })
+	ticket := m3Ticket(t, s, "holder worktree")
+	claim, err := s.Claim(context.Background(), ticket.ID, false, "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := other.Touch(context.Background(), ticket.ID, claim.Token, []string{"src/**"}); ErrorCode(err) != "E_LEASE_TOKEN" {
+		t.Fatalf("cross-worktree token error=%v, want E_LEASE_TOKEN", err)
+	}
+	var count int
+	if err := s.db.QueryRow(`SELECT count(*) FROM area_hints WHERE project_id=? AND ticket_id=?`, s.projectID, ticket.ID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("cross-worktree Touch wrote %d orphaned hint rows", count)
+	}
+}
+
+func TestTouchHintsAreBoundToLeaseGeneration(t *testing.T) {
+	s, clock, base := m3Store(t)
+	other, err := Open(context.Background(), Options{
+		Root: base, CommonDir: filepath.Join(base, "common"), DBPath: filepath.Join(base, "state", "state.db"),
+		RegistryPath: filepath.Join(base, "state", "registry.jsonl"), LeaseStateDir: filepath.Join(base, "other-state"),
+		ProjectID: s.projectID, WorktreeID: "worktree-b", ProjectSlug: "aira", Prefixes: []string{"AIRA"}, Clock: clock, LeaseTTLNS: 900,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Close() })
+	oldOwner, newOwner := m3Ticket(t, s, "old owner"), m3Ticket(t, other, "new owner")
+	oldClaim, err := s.Claim(context.Background(), oldOwner.ID, false, "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Touch(context.Background(), oldOwner.ID, oldClaim.Token, []string{"src/**"}); err != nil {
+		t.Fatal(err)
+	}
+	oldHeld, _ := oldClaim.Lease.Held()
+	var storedGeneration int64
+	if err := s.db.QueryRow(`SELECT generation FROM area_hints WHERE project_id=? AND ticket_id=?`, s.projectID, oldOwner.ID).Scan(&storedGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if storedGeneration != int64(oldHeld.Generation()) {
+		t.Fatalf("stored hint generation=%d, want %d", storedGeneration, oldHeld.Generation())
+	}
+	if _, err := s.Release(context.Background(), oldOwner.ID, oldClaim.Token); err != nil {
+		t.Fatal(err)
+	}
+	clock.mono = 200
+	newClaim, err := s.Claim(context.Background(), oldOwner.ID, false, "new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newHeld, _ := newClaim.Lease.Held()
+	if newHeld.Generation() == oldHeld.Generation() {
+		t.Fatalf("reclaim reused lease generation %d", newHeld.Generation())
+	}
+
+	otherClaim, err := other.Claim(context.Background(), newOwner.ID, false, "other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := other.Touch(context.Background(), newOwner.ID, otherClaim.Token, []string{"src/main.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Warnings) != 0 {
+		t.Fatalf("old-generation hint revived after reclaim: %#v", result.Warnings)
+	}
+
+	if _, err := s.Touch(context.Background(), oldOwner.ID, newClaim.Token, []string{"src/**"}); err != nil {
+		t.Fatal(err)
+	}
+	result, err = other.Touch(context.Background(), newOwner.ID, otherClaim.Token, []string{"src/main.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Warnings) != 1 || result.Warnings[0].Code != "W_AREA_OVERLAP" {
+		t.Fatalf("current-generation overlap warnings=%#v", result.Warnings)
 	}
 }
 
@@ -81,7 +174,7 @@ func TestTouchAuthenticatesHolderReplacesHintsAndDoesNotExtendLease(t *testing.T
 		t.Fatalf("wrong token error=%v, want E_LEASE_TOKEN", err)
 	}
 	clock.mono = 200
-	result, err := s.Touch(context.Background(), ticket.ID, claim.Token, []string{"./z\\file.go", "src/**", "src/**"})
+	result, err := s.Touch(context.Background(), ticket.ID, claim.Token, []string{"./z/file.go", "src/**", "src/**"})
 	if err != nil {
 		t.Fatalf("touch: %v", err)
 	}
@@ -269,5 +362,28 @@ func TestCheckReportsAreaOverlapAsWarningOnly(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("overlap check warnings=%#v", report.Warnings)
+	}
+}
+
+func TestCheckMarksAreaOverlapUnevaluatedWhenClockUnavailable(t *testing.T) {
+	s, clock, _ := m3Store(t)
+	m3Ticket(t, s, "clock unavailable area")
+	clock.err = errors.New("no monotonic clock")
+
+	report, err := s.Check(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Dimensions["area-overlap"] != "unevaluated" {
+		t.Fatalf("area-overlap dimension=%q, want unevaluated; report=%#v", report.Dimensions["area-overlap"], report)
+	}
+	found := false
+	for _, finding := range report.UnevaluatedFindings {
+		if finding.Code == "E_CLOCK_UNAVAILABLE" && finding.Subject == "area-overlap" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing area-overlap clock finding: %#v", report.UnevaluatedFindings)
 	}
 }
