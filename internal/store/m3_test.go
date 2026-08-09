@@ -721,6 +721,30 @@ func TestReadyCanonicalReadinessIgnoresDivergenceForDeletedRelationOwner(t *test
 	}
 }
 
+func TestReadyTreatsDanglingRelationOwnerSymlinkAsUnevaluated(t *testing.T) {
+	s, _, _ := m3Store(t)
+	prerequisite := m3Ticket(t, s, "dangling relation owner")
+	dependent := m3Ticket(t, s, "dependent")
+	if _, err := s.Link(context.Background(), prerequisite.ID, domain.RelationBlocks, dependent.ID); err != nil {
+		t.Fatal(err)
+	}
+	ownerPath := filepath.Join(s.root, ".aira", "tickets", prerequisite.ID+".md")
+	if err := os.Remove(ownerPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(s.root, "missing-owner.md"), ownerPath); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.Ready(dependent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Ready || rows[0].Verdict != "unevaluated" || !hasFinding(rows[0].Findings, "U_RELATION_OWNER_UNREADABLE") {
+		t.Fatalf("dangling relation owner affected canonical readiness: %#v", rows)
+	}
+}
+
 func TestReadyFindingAttributionUsesExactRelationEndpoints(t *testing.T) {
 	s, _, _ := m3Store(t)
 	short := m3Ticket(t, s, "short ID")

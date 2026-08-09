@@ -481,7 +481,7 @@ func canonicalFindingsForIndexedRelations(root string, scanFindings []CheckFindi
 			continue
 		}
 		path := repoPath(root, relation.Path)
-		if _, err := os.Stat(repoAbsolutePath(root, relation.Path)); errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Lstat(repoAbsolutePath(root, relation.Path)); errors.Is(err, os.ErrNotExist) {
 			// The canonical owner file is gone. The authoritative scan therefore
 			// considers this relation deleted; the derived row is only a warning.
 			continue

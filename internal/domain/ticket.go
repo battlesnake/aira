@@ -258,7 +258,7 @@ type RelationView struct {
 // every field required to evaluate liveness. The database serialises this
 // value but is never the source of its liveness semantics.
 type Lease struct {
-	TicketID string `json:"ticket_id"`
+	ticketID string
 	state    LeaseState
 }
 
@@ -324,7 +324,7 @@ func NewLease(ticketID string, state LeaseState) (Lease, error) {
 	default:
 		return Lease{}, errors.New("E_CONFIG_INVALID: missing or unknown lease state")
 	}
-	return Lease{TicketID: ticketID, state: state}, nil
+	return Lease{ticketID: ticketID, state: state}, nil
 }
 
 // NewHeldLease constructs a held state after validating every field required
@@ -394,6 +394,8 @@ func (l Lease) Valid() bool {
 	}
 }
 
+func (l Lease) TicketID() string { return l.ticketID }
+
 func (l Lease) Held() (HeldLease, bool) {
 	h, ok := l.state.(HeldLease)
 	if !ok || !h.valid() {
@@ -417,7 +419,7 @@ func (l Lease) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		TicketID string     `json:"ticket_id"`
 		State    LeaseState `json:"state"`
-	}{TicketID: l.TicketID, State: l.state})
+	}{TicketID: l.TicketID(), State: l.state})
 }
 
 func RenderTicket(ticket Ticket, body string) ([]byte, error) {

@@ -76,6 +76,45 @@ func TestLeaseStateIsSealedBehindValidatedLeaseConstructor(t *testing.T) {
 	}
 }
 
+type leaseTicketIDGetter interface {
+	TicketID() string
+}
+
+var _ leaseTicketIDGetter = Lease{}
+
+func TestLeaseTicketIDIsSealedAndGetterPreservesConstruction(t *testing.T) {
+	typ := reflect.TypeOf(Lease{})
+	field, ok := typ.FieldByName("ticketID")
+	if !ok || field.PkgPath == "" {
+		t.Fatal("Lease ticket ID is not sealed")
+	}
+	hash := bytes.Repeat([]byte{0x42}, 32)
+	held, err := NewHeldLease(hash, "boot-a", 100, 900, 1, "actor", "worktree")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := NewLease("AIRA-1", held)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.TicketID() != "AIRA-1" || !lease.Valid() {
+		t.Fatalf("lease ID or validity = %q/%v", lease.TicketID(), lease.Valid())
+	}
+	data, err := json.Marshal(lease)
+	if err != nil {
+		t.Fatalf("marshal lease: %v", err)
+	}
+	var encoded struct {
+		TicketID string `json:"ticket_id"`
+	}
+	if err := json.Unmarshal(data, &encoded); err != nil {
+		t.Fatalf("decode lease JSON %q: %v", data, err)
+	}
+	if encoded.TicketID != "AIRA-1" {
+		t.Fatalf("marshaled ticket_id = %q", encoded.TicketID)
+	}
+}
+
 func TestHeldLeaseFieldsAreSealedAndGettersPreserveConstruction(t *testing.T) {
 	typ := reflect.TypeOf(HeldLease{})
 	for i := 0; i < typ.NumField(); i++ {
