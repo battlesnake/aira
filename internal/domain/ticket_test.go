@@ -15,7 +15,8 @@ func TestLeaseConstructorsRejectIllegalHeldStatesAndNilLeaseIsNeither(t *testing
 	if err != nil {
 		t.Fatalf("valid held lease rejected: %v", err)
 	}
-	if lease := (Lease{TicketID: "AIRA-1", State: valid}); !lease.Valid() {
+	lease, err := NewLease("AIRA-1", valid)
+	if err != nil || !lease.Valid() {
 		t.Fatal("validated held lease is not valid")
 	}
 	for name, args := range map[string]struct {
@@ -52,12 +53,26 @@ func TestLeaseConstructorsRejectIllegalHeldStatesAndNilLeaseIsNeither(t *testing
 	if _, ok := zero.Free(); ok {
 		t.Fatal("nil-state lease reports Free")
 	}
-	invalid := Lease{TicketID: "AIRA-1", State: HeldLease{}}
-	if invalid.Valid() {
-		t.Fatal("unvalidated held lease is valid")
+	if invalid, err := NewLease("AIRA-1", HeldLease{}); err == nil || invalid.Valid() {
+		t.Fatal("constructor accepted unvalidated held lease")
 	}
-	if _, ok := invalid.Held(); ok {
-		t.Fatal("unvalidated held lease reports Held")
+}
+
+func TestLeaseStateIsSealedBehindValidatedLeaseConstructor(t *testing.T) {
+	typ, ok := reflect.TypeOf(Lease{}).FieldByName("State")
+	if ok && typ.PkgPath == "" {
+		t.Fatal("Lease.State is exported and permits direct state injection")
+	}
+	hash := bytes.Repeat([]byte{0x42}, 32)
+	held, err := NewHeldLease(hash, "boot-a", 100, 900, 1, "actor", "worktree")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewLease("AIRA-1", held); err != nil {
+		t.Fatalf("validated lease rejected: %v", err)
+	}
+	if _, err := NewLease("AIRA-1", HeldLease{}); err == nil {
+		t.Fatal("constructor accepted an illegal held state")
 	}
 }
 
@@ -89,7 +104,11 @@ func TestHeldLeaseJSONPreservesPreSealingShapeWithoutTokenHash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := json.Marshal(Lease{TicketID: "AIRA-1", State: held})
+	lease, err := NewLease("AIRA-1", held)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(lease)
 	if err != nil {
 		t.Fatalf("marshal lease: %v", err)
 	}

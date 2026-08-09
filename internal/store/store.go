@@ -118,6 +118,7 @@ type eventRecord struct {
 
 type scannedTicket struct {
 	WorktreeID string
+	Root       string
 	Path       string
 	Ticket     domain.Ticket
 	Body       string
@@ -927,7 +928,7 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		if err := s.markWorktreeActive(ctx, entry, valid); err != nil {
 			return err
 		}
-		tickets, scanFindings, err := scanTickets(entry.Root, entry.WorktreeID)
+		tickets, scanFindings, err := scanTickets(entry.Root, entry.WorktreeID, s.projectSlug)
 		if err != nil {
 			return err
 		}
@@ -1017,7 +1018,7 @@ func (s *Store) Rebuild(ctx context.Context) error {
 				ticket.Ticket.Status, boolInt(ticket.Ticket.Hold), ticket.Ticket.Title, ticket.Ticket.Kind, ticket.Ticket.Severity); err != nil {
 				return err
 			}
-			if err := replaceRelationIndex(ctx, conn, s.projectID, ticket.WorktreeID, ticket.Ticket, s.root, ticket.Path); err != nil {
+			if err := replaceRelationIndex(ctx, conn, s.projectID, ticket.WorktreeID, ticket.Ticket, ticket.Root, ticket.Path); err != nil {
 				return err
 			}
 			var allocationSeq int64
@@ -1779,7 +1780,7 @@ func (s *Store) recordScanFinding(ctx context.Context, entry registryEntry, find
 	})
 }
 
-func scanTickets(root, worktreeID string) ([]scannedTicket, []CheckFinding, error) {
+func scanTickets(root, worktreeID, project string) ([]scannedTicket, []CheckFinding, error) {
 	dir := filepath.Join(root, ".aira", "tickets")
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -1810,6 +1811,9 @@ func scanTickets(root, worktreeID string) ([]scannedTicket, []CheckFinding, erro
 			findings = append(findings, scanFinding(root, path, err))
 			continue
 		}
+		if ticket.Project != project {
+			findings = append(findings, scanFinding(root, path, fmt.Errorf("E_PROJECT_MISMATCH: ticket project %q does not match configured project %q", ticket.Project, project)))
+		}
 		if prior, ok := seen[ticket.ID]; ok {
 			findings = append(findings, scanFinding(root, path, fmt.Errorf("E_DUPLICATE_ID: %s and %s in worktree %s", repoPath(root, prior), repoPath(root, path), worktreeID)))
 			if index, ok := resultByID[ticket.ID]; ok {
@@ -1829,7 +1833,7 @@ func scanTickets(root, worktreeID string) ([]scannedTicket, []CheckFinding, erro
 			continue
 		}
 		resultByID[ticket.ID] = len(result)
-		result = append(result, scannedTicket{WorktreeID: worktreeID, Path: path, Ticket: ticket, Body: body, Digest: digestBytes(data)})
+		result = append(result, scannedTicket{WorktreeID: worktreeID, Root: root, Path: path, Ticket: ticket, Body: body, Digest: digestBytes(data)})
 	}
 	return result, findings, nil
 }

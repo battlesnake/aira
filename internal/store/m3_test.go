@@ -379,6 +379,64 @@ func TestReadyIsUnevaluatedWhenIndexedPrerequisiteOwnerIsMalformed(t *testing.T)
 	}
 }
 
+func TestReadyIsUnevaluatedWhenIndexedOwnerExistsButIsDuplicateOrHasMalformedID(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, root string, owner domain.Ticket)
+	}{
+		{
+			name: "duplicate id",
+			setup: func(t *testing.T, root string, owner domain.Ticket) {
+				path := filepath.Join(root, ".aira", "tickets", "duplicate.md")
+				if err := os.WriteFile(path, rawM3Ticket(t, owner, "duplicate\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "malformed id",
+			setup: func(t *testing.T, root string, owner domain.Ticket) {
+				owner.ID = "not-a-ticket-id"
+				path := filepath.Join(root, ".aira", "tickets", "AIRA-1.md")
+				if err := os.WriteFile(path, rawM3Ticket(t, owner, "malformed id\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _ := m3Store(t)
+			owner := m3Ticket(t, s, "owner")
+			dependent := m3Ticket(t, s, "dependent")
+			if _, err := s.Link(context.Background(), owner.ID, domain.RelationBlocks, dependent.ID); err != nil {
+				t.Fatal(err)
+			}
+			tc.setup(t, s.root, owner)
+
+			rows, err := s.Ready(dependent.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) != 1 || rows[0].Ready || rows[0].Verdict != "unevaluated" || !hasFinding(rows[0].Findings, "U_RELATION_OWNER_UNREADABLE") {
+				t.Fatalf("unusable indexed owner was treated as absent: %#v", rows)
+			}
+			wantUnderlying := "E_DUPLICATE_ID"
+			if tc.name == "malformed id" {
+				wantUnderlying = "E_ID_INVALID"
+			}
+			foundUnderlying := false
+			for _, finding := range rows[0].Findings {
+				if finding.Code == "U_RELATION_OWNER_UNREADABLE" && strings.Contains(finding.Message, wantUnderlying) {
+					foundUnderlying = true
+				}
+			}
+			if !foundUnderlying {
+				t.Fatalf("owner diagnosis did not retain underlying %s: %#v", wantUnderlying, rows[0].Findings)
+			}
+		})
+	}
+}
+
 func TestReadyUnevaluatedWhenStaleIndexOwnerIsMalformedAfterRelationRemoval(t *testing.T) {
 	s, _, _ := m3Store(t)
 	prerequisite := m3Ticket(t, s, "removed relation owner")
@@ -431,6 +489,43 @@ func TestRelationEndpointsMustShareProjectSlug(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].Ready || !hasFinding(rows[0].Findings, "E_CROSS_PROJECT_RELATION") {
 		t.Fatalf("cross-project relation was accepted: %#v", rows)
+	}
+}
+
+func TestReadyFailsClosedForMismatchedProjectAndKeepsFindingAttribution(t *testing.T) {
+	s, _, _ := m3Store(t)
+	owner := m3Ticket(t, s, "owner")
+	dependent := m3Ticket(t, s, "dependent")
+	if _, err := s.Link(context.Background(), owner.ID, domain.RelationBlocks, dependent.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.root, ".aira", "tickets", owner.ID+".md"), []byte("malformed owner\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dependent.Project = "other-project"
+	dependentPath := filepath.Join(s.root, ".aira", "tickets", dependent.ID+".md")
+	if err := os.WriteFile(dependentPath, rawM3Ticket(t, dependent, "mismatched project\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.Ready(dependent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Ready || rows[0].Verdict != "fail" || !hasFinding(rows[0].Findings, "E_PROJECT_MISMATCH") {
+		t.Fatalf("mismatched project was not fail-closed: %#v", rows)
+	}
+	for _, finding := range rows[0].Findings {
+		if finding.Code == "E_PROJECT_MISMATCH" && finding.Subject != filepath.ToSlash(filepath.Join(".aira", "tickets", dependent.ID+".md")) {
+			t.Fatalf("mismatched project finding was attributed to %q, want dependent path", finding.Subject)
+		}
+	}
+	report, err := s.Check(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Dimensions["ticket-file-integrity"] != "fail" || !hasFinding(report.Findings, "E_PROJECT_MISMATCH") {
+		t.Fatalf("mismatched project check report = %#v", report)
 	}
 }
 
@@ -504,6 +599,69 @@ func TestRelationIndexCanonicalFileIsRepoRelativeAcrossRootSpellings(t *testing.
 	}
 	if len(rows) != 1 || rows[0].Ready || rows[0].Verdict != "unevaluated" || !hasFinding(rows[0].Findings, "U_RELATION_OWNER_UNREADABLE") {
 		t.Fatalf("reopened root lost malformed-owner attribution: %#v", rows)
+	}
+}
+
+func TestRebuildUsesEachWorktreeRootForRelationIndexAndAttribution(t *testing.T) {
+	base := persistentTemp(t, "rebuild-relation-roots")
+	mainRoot := filepath.Join(base, "main")
+	worktreeRoot := filepath.Join(base, "worktree")
+	for _, root := range []string{mainRoot, worktreeRoot} {
+		if err := os.MkdirAll(filepath.Join(root, ".aira", "tickets"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		gitRun(t, root, "init")
+	}
+	owner := domain.Ticket{Schema: 1, ID: "AIRA-1", Project: "aira", Title: "owner", Status: domain.StatusPlanned, Kind: domain.KindFeature, Severity: domain.SeverityP2, Labels: []string{}, Relations: []domain.Relation{{Kind: domain.RelationBlocks, From: "AIRA-1", To: "AIRA-2"}}}
+	dependent := domain.Ticket{Schema: 1, ID: "AIRA-2", Project: "aira", Title: "dependent", Status: domain.StatusPlanned, Kind: domain.KindFeature, Severity: domain.SeverityP2, Labels: []string{}, Relations: []domain.Relation{}}
+	for _, ticket := range []domain.Ticket{owner, dependent} {
+		if err := os.WriteFile(filepath.Join(worktreeRoot, ".aira", "tickets", ticket.ID+".md"), rawM3Ticket(t, ticket, "body\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s := openTestStore(t, mainRoot, filepath.Join(base, "common"), filepath.Join(base, "state"), "main", "AIRA")
+	if err := s.RegisterWorktree(context.Background(), "W", worktreeRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rebuild(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	wantPath := filepath.ToSlash(filepath.Join(".aira", "tickets", "AIRA-1.md"))
+	var canonicalFile string
+	if err := s.db.QueryRow(`SELECT canonical_file FROM relations WHERE project_id=? AND worktree_id=? AND from_id=? AND to_id=?`, s.projectID, "W", owner.ID, dependent.ID).Scan(&canonicalFile); err != nil {
+		t.Fatal(err)
+	}
+	if canonicalFile != wantPath {
+		t.Fatalf("worktree relation canonical_file = %q, want %q", canonicalFile, wantPath)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := Open(context.Background(), Options{
+		Root: worktreeRoot, CommonDir: filepath.Join(base, "common"),
+		DBPath: filepath.Join(base, "state", "state.db"), RegistryPath: filepath.Join(base, "state", "registry.jsonl"),
+		LeaseStateDir: filepath.Join(base, "lease-state"), ProjectID: "project-aira", WorktreeID: "W",
+		ProjectSlug: "aira", Prefixes: []string{"AIRA"}, Clock: &m3Clock{boot: "boot-a", mono: 100}, LeaseTTLNS: 900,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	rows, err := w.Ready(dependent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Ready || len(rows[0].Blockers) != 1 || hasFinding(rows[0].Findings, "E_RELATION_INDEX_DIVERGENCE") {
+		t.Fatalf("worktree readiness attribution = %#v", rows)
+	}
+	report, err := w.Check(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Dimensions["relation-integrity"] != "pass" || hasFinding(report.Findings, "E_RELATION_INDEX_DIVERGENCE") {
+		t.Fatalf("worktree check relation attribution = %#v", report)
 	}
 }
 

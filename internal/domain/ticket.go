@@ -258,8 +258,8 @@ type RelationView struct {
 // every field required to evaluate liveness. The database serialises this
 // value but is never the source of its liveness semantics.
 type Lease struct {
-	TicketID string     `json:"ticket_id"`
-	State    LeaseState `json:"state"`
+	TicketID string `json:"ticket_id"`
+	state    LeaseState
 }
 
 type LeaseState interface{ leaseState() }
@@ -305,6 +305,26 @@ func (h HeldLease) MarshalJSON() ([]byte, error) {
 // the generation after release.
 func NewFreeLease(generation uint64) (FreeLease, error) {
 	return FreeLease{Generation: generation}, nil
+}
+
+// NewLease constructs a lease only from a validated state. State is private so
+// callers cannot inject an arbitrary or zero-value HeldLease through a struct
+// literal; readers use Held and Free to inspect the sum type.
+func NewLease(ticketID string, state LeaseState) (Lease, error) {
+	if err := ValidateID(ticketID); err != nil {
+		return Lease{}, err
+	}
+	switch value := state.(type) {
+	case FreeLease:
+		_ = value
+	case HeldLease:
+		if !value.valid() {
+			return Lease{}, errors.New("E_CONFIG_INVALID: invalid lease state")
+		}
+	default:
+		return Lease{}, errors.New("E_CONFIG_INVALID: missing or unknown lease state")
+	}
+	return Lease{TicketID: ticketID, state: state}, nil
 }
 
 // NewHeldLease constructs a held state after validating every field required
@@ -364,7 +384,7 @@ func (h HeldLease) IsLive(bootID string, monoNowNS uint64) bool {
 
 // Valid reports whether the lease contains a valid sum-type state.
 func (l Lease) Valid() bool {
-	switch state := l.State.(type) {
+	switch state := l.state.(type) {
 	case FreeLease:
 		return true
 	case HeldLease:
@@ -375,7 +395,7 @@ func (l Lease) Valid() bool {
 }
 
 func (l Lease) Held() (HeldLease, bool) {
-	h, ok := l.State.(HeldLease)
+	h, ok := l.state.(HeldLease)
 	if !ok || !h.valid() {
 		return HeldLease{}, false
 	}
@@ -383,11 +403,21 @@ func (l Lease) Held() (HeldLease, bool) {
 }
 
 func (l Lease) Free() (FreeLease, bool) {
-	f, ok := l.State.(FreeLease)
+	f, ok := l.state.(FreeLease)
 	if !ok {
 		return FreeLease{}, false
 	}
 	return f, ok
+}
+
+func (l Lease) MarshalJSON() ([]byte, error) {
+	if !l.Valid() {
+		return nil, errors.New("E_CONFIG_INVALID: cannot marshal invalid lease")
+	}
+	return json.Marshal(struct {
+		TicketID string     `json:"ticket_id"`
+		State    LeaseState `json:"state"`
+	}{TicketID: l.TicketID, State: l.state})
 }
 
 func RenderTicket(ticket Ticket, body string) ([]byte, error) {

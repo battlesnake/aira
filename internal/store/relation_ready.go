@@ -34,8 +34,8 @@ func relationSubject(r domain.Relation) string {
 
 func relationEndpointKey(project, id string) string { return project + "\x00" + id }
 
-func scanStoredRelationsAt(root, worktreeID string) ([]storedRelation, map[string]domain.Ticket, []CheckFinding, error) {
-	tickets, scanFindings, err := scanTickets(root, worktreeID)
+func scanStoredRelationsAt(root, worktreeID, project string) ([]storedRelation, map[string]domain.Ticket, []CheckFinding, error) {
+	tickets, scanFindings, err := scanTickets(root, worktreeID, project)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -86,7 +86,7 @@ func endpointHasOtherProject(byID map[string]domain.Ticket, id, project string) 
 }
 
 func (s *Store) scanStoredRelations() ([]storedRelation, map[string]domain.Ticket, []CheckFinding, error) {
-	return scanStoredRelationsAt(s.root, s.worktreeID)
+	return scanStoredRelationsAt(s.root, s.worktreeID, s.projectSlug)
 }
 
 func relationIntegrityError(findings []CheckFinding) error {
@@ -295,7 +295,7 @@ func (s *Store) indexedRelations() ([]storedRelation, error) {
 }
 
 func (s *Store) relationIndexDivergence() ([]CheckFinding, error) {
-	canonical, _, _, err := scanStoredRelationsAt(s.root, s.worktreeID)
+	canonical, _, _, err := scanStoredRelationsAt(s.root, s.worktreeID, s.projectSlug)
 	if err != nil {
 		return nil, err
 	}
@@ -362,7 +362,7 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 		return nil, errors.New("E_SELECTOR_INVALID: ready requires an exact ID or file anchor")
 	}
 
-	tickets, scanFindings, err := scanTickets(s.root, s.worktreeID)
+	tickets, scanFindings, err := scanTickets(s.root, s.worktreeID, s.projectSlug)
 	if err != nil {
 		return nil, err
 	}
@@ -393,7 +393,7 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 		}
 	}
 
-	relations, byID, relationFindings, err := scanStoredRelationsAt(s.root, s.worktreeID)
+	relations, byID, relationFindings, err := scanStoredRelationsAt(s.root, s.worktreeID, s.projectSlug)
 	if err != nil {
 		return nil, err
 	}
@@ -481,18 +481,24 @@ func canonicalFindingsForIndexedRelations(root string, scanFindings []CheckFindi
 			continue
 		}
 		path := repoPath(root, relation.Path)
-		malformed := false
+		if _, err := os.Stat(repoAbsolutePath(root, relation.Path)); errors.Is(err, os.ErrNotExist) {
+			// The canonical owner file is gone. The authoritative scan therefore
+			// considers this relation deleted; the derived row is only a warning.
+			continue
+		}
+		underlying := ""
 		for _, finding := range scanFindings {
-			if finding.Code == "E_CONFIG_INVALID" && finding.Subject == path {
-				malformed = true
+			if finding.Subject == path || strings.Contains(finding.Message, path) {
+				underlying = finding.Code + ": " + finding.Message
 				break
 			}
 		}
-		if !malformed {
-			continue
+		message := "readiness cannot be established: relation owner file is present but unusable"
+		if underlying != "" {
+			message += " (" + underlying + ")"
 		}
 		finding := CheckFinding{Code: "U_RELATION_OWNER_UNREADABLE", Subject: relationSubject(relation.Relation),
-			Message: "readiness cannot be established: relation owner file is malformed", Kind: "unevaluated"}
+			Message: message, Kind: "unevaluated"}
 		for _, endpoint := range []string{relation.Relation.From, relation.Relation.To} {
 			if _, ok := byID[relationEndpointKey(relation.Project, endpoint)]; ok {
 				result[endpoint] = appendUniqueFinding(result[endpoint], finding)
@@ -581,7 +587,7 @@ func (s *Store) relationFindings() ([]CheckFinding, error) {
 	}
 	var findings []CheckFinding
 	for _, entry := range entries {
-		_, _, entryFindings, err := scanStoredRelationsAt(entry.Root, entry.WorktreeID)
+		_, _, entryFindings, err := scanStoredRelationsAt(entry.Root, entry.WorktreeID, s.projectSlug)
 		if err != nil {
 			return nil, err
 		}

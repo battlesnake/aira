@@ -143,7 +143,7 @@ func leaseFromRow(ticketID string, row leaseRow) (domain.Lease, error) {
 		if err != nil {
 			return domain.Lease{}, err
 		}
-		return domain.Lease{TicketID: ticketID, State: free}, nil
+		return domain.NewLease(ticketID, free)
 	}
 	if row.state != "held" || row.generation < 1 || !row.holderTokenHash.Valid || strings.TrimSpace(row.holderTokenHash.String) == "" ||
 		!row.bootID.Valid || strings.TrimSpace(row.bootID.String) == "" || !row.lastHeartbeatMonoNS.Valid || row.lastHeartbeatMonoNS.Int64 < 0 ||
@@ -162,7 +162,7 @@ func leaseFromRow(ticketID string, row leaseRow) (domain.Lease, error) {
 	if err != nil {
 		return domain.Lease{}, err
 	}
-	return domain.Lease{TicketID: ticketID, State: held}, nil
+	return domain.NewLease(ticketID, held)
 }
 
 func readLeaseRow(ctx context.Context, conn interface {
@@ -227,7 +227,10 @@ func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor st
 			if err != nil {
 				return err
 			}
-			result.Lease = domain.Lease{TicketID: ticketID, State: held}
+			result.Lease, err = domain.NewLease(ticketID, held)
+			if err != nil {
+				return err
+			}
 		} else {
 			if rowErr != nil {
 				return rowErr
@@ -274,7 +277,10 @@ func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor st
 			if err != nil {
 				return err
 			}
-			result.Lease = domain.Lease{TicketID: ticketID, State: held}
+			result.Lease, err = domain.NewLease(ticketID, held)
+			if err != nil {
+				return err
+			}
 		}
 		seq, err := nextSequence(ctx, conn, s.projectID)
 		if err != nil {
@@ -490,7 +496,10 @@ func (s *Store) Heartbeat(ctx context.Context, ticketID, token string) (domain.L
 		if err != nil {
 			return err
 		}
-		result = domain.Lease{TicketID: ticketID, State: held}
+		result, err = domain.NewLease(ticketID, held)
+		if err != nil {
+			return err
+		}
 		return nil
 	})
 	return result, err
@@ -503,7 +512,7 @@ func (s *Store) GetLease(ctx context.Context, ticketID string) (domain.Lease, er
 		if freeErr != nil {
 			return domain.Lease{}, freeErr
 		}
-		return domain.Lease{TicketID: ticketID, State: free}, nil
+		return domain.NewLease(ticketID, free)
 	}
 	if err != nil {
 		return domain.Lease{}, err
