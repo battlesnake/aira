@@ -190,11 +190,16 @@ func TestSkillExamplesReachCoreFromRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A command "reached core" iff its JSON response carries a stable code that
-	// is not a pre-core parse / argument-construction failure. E_NOT_FOUND and
-	// other domain outcomes count as reaching core; the denylist is exactly the
-	// construction-failure codes the spec (§6.7) says must be rejected.
-	preCore := map[string]bool{
+	// A documented example is acceptable iff its JSON response carries a stable
+	// code that is NOT an input-validation / argument-construction failure. Such
+	// failures are emitted both pre-core (the CLI parser, e.g. `find bogus`) and
+	// inside core (selector/query validation in store, e.g. `list ticket`); the
+	// same code (E_SELECTOR_INVALID) can come from either layer, so we do not try
+	// to distinguish the layer — a well-formed, working example must not produce
+	// any of these at all. Genuine domain outcomes (E_NOT_FOUND, E_LEASE_HELD, …)
+	// and successes are accepted. This is the "reaches core and works" property of
+	// spec §6.7, made precise.
+	inputInvalid := map[string]bool{
 		"E_SELECTOR_INVALID": true, "E_QUERY_INVALID": true, "E_ARGUMENT_INVALID": true,
 		"E_UNKNOWN_VERB": true, "E_ID_INVALID": true, "E_GLOB_INVALID": true,
 		"E_SELECTOR_AMBIGUOUS": true,
@@ -210,19 +215,23 @@ func TestSkillExamplesReachCoreFromRun(t *testing.T) {
 		}
 		return response.Code, exit
 	}
-	// Negative control: a deliberately malformed command must be classified as
-	// NOT reaching core, proving the detector below is load-bearing rather than
-	// admitting parse errors (the M8a-era porous-substring bug).
-	if code, _ := codeOf([]string{"list", "ticket"}); !preCore[code] {
-		t.Fatalf("negative control failed: malformed 'list ticket' produced code=%q, detector is not load-bearing", code)
+	// Load-bearing negative controls: a malformed command rejected pre-core at
+	// CLI construction (`find bogus`) AND one that dispatches into core but is
+	// rejected by query validation (`list ticket`) must BOTH be classified
+	// invalid. This proves the detector is not the M8a-era porous-substring check
+	// that admitted parse errors.
+	for _, control := range [][]string{{"find", "bogus"}, {"list", "ticket"}} {
+		if code, _ := codeOf(control); !inputInvalid[code] {
+			t.Fatalf("negative control %v produced code=%q, not classified invalid — detector is not load-bearing", control, code)
+		}
 	}
 	for _, action := range artifacts.Actions {
 		code, exit := codeOf(action.Argv)
 		if code == "" {
 			t.Fatalf("action %s/%s produced no stable code", action.Verb, action.Operation)
 		}
-		if preCore[code] {
-			t.Fatalf("action %s/%s did not reach core: code=%q exit=%d command=%q", action.Verb, action.Operation, code, exit, action.Command)
+		if inputInvalid[code] {
+			t.Fatalf("action %s/%s is not a working command: code=%q exit=%d command=%q", action.Verb, action.Operation, code, exit, action.Command)
 		}
 		if exit < 0 || exit > 4 {
 			t.Fatalf("action %s/%s has insane exit=%d", action.Verb, action.Operation, exit)
