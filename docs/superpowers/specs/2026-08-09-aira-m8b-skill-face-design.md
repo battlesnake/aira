@@ -20,12 +20,17 @@ generated artifacts, plus the descriptor metadata those artifacts honestly need.
 M8b delivers:
 
 1. **Operation-aware descriptor metadata.** The dispatch table gains, per verb:
-   a one-line `Summary`, a `Safety` class, an explicit `Include` flag, and —
-   for verbs whose handler branches on a discriminator (`find`, `link`) — a set
-   of `Operations`, each naming the discriminator value, its own `Summary`,
-   `Safety`, the subset of args it uses with per-operation requiredness, and a
-   canonical example. Single-shape verbs carry no `Operations` (the verb *is*
-   the operation). All of this is surfaced through `DispatchDescriptors()`.
+   a one-line `Summary`, a `Safety` class, an explicit `Include` flag, an
+   explicit `Example` argv, and — for verbs whose handler branches on a
+   discriminator (`find`, `link`) — a set of `Operations`, each naming the
+   discriminator value, its own `Summary`, `Safety`, the args it uses with
+   per-operation requiredness, and its own explicit `Example` argv. A
+   **single-shape verb carries no `Operations` and uses its verb-level
+   `Example`/`Summary`/`Safety`**; a **grouped verb** leaves the verb-level
+   `Example` empty and supplies one per `Operation`. The generator normalises
+   both into a flat action list (see §4.2), so every action — however derived —
+   has exactly one example. All of this is surfaced through
+   `DispatchDescriptors()`.
 
 2. **An installable Skill package** emitted by a new `aira skill` face:
    - `aira skill install <dir>` writes `<dir>/SKILL.md` (agent-facing, with
@@ -36,10 +41,13 @@ M8b delivers:
      invokes it; per-action argv template), a **deterministic version** that is
      a hash of the *generated artifact bytes* (not just the descriptor input),
      a structured **response contract** (stable codes + verdicts + the exit-code
-     map, all generated from `store`), and an `actions[]` catalog with one entry
-     **per operation**, each carrying its own `{summary, safety, args[], command}`.
-   - Every action's catalog entry, safety, and example command is **generated
-     from `DispatchDescriptors()`**; nothing per-action is authored by hand.
+     map, from `core.ResponseContract()`), and an `actions[]` catalog with one
+     entry **per operation**, each carrying its own `{summary, safety, args[],
+     command}`.
+   - Every action's catalog entry, safety, and arg contract is **derived from
+     `DispatchDescriptors()`**, and its `command` is `aira <verb>` prefixed to
+     the descriptor's explicit, machine-verified example argv; no per-action
+     prose is authored by hand and the generator synthesises no argv.
 
 3. **A generated agent guide** emitted by `aira skill guide` (stdout): the same
    operation-level content as one Markdown document, a small authored preamble
@@ -70,8 +78,10 @@ Both artifacts must state, from generated `store` data, that responses carry
   inclusion from one source. The new operation metadata is *added* to the shared
   table and *consumed* by the Skill; MCP tool schemas may adopt operation
   granularity later. Both faces derive from the one table, so they cannot drift.
-- **No hand-authored per-action examples/guidance** beyond the single authored
-  preamble. Examples are generated from the operation arg specs.
+- **No hand-authored per-action prose/guidance** beyond the single authored
+  preamble. Each action's example is an explicit argv carried as descriptor data
+  (not free prose) and is machine-verified by the parity + E2E tests, so it
+  cannot drift or lie; the generator synthesises no argv itself.
 - **No new safety enforcement.** `Safety` is descriptive metadata for warnings
   and schemas; enforcement stays in store/domain.
 - **No telemetry, daemon, or traceability graph.** Phase 3+.
@@ -150,6 +160,8 @@ Add to `verbSpec` and mirror into `DispatchDescriptor`:
 - `Summary string`
 - `Safety SafetyClass`
 - `Include bool` (the single membership predicate for generated faces)
+- `Example []string` (verb-level explicit CLI argv after the verb; used by
+  single-shape verbs; empty for grouped verbs, which carry per-operation examples)
 - `Operations []OperationSpec` (empty for single-shape verbs)
 
 ```go
@@ -208,9 +220,12 @@ write):
 
 A generator takes `[]DispatchDescriptor` and produces, deterministically:
 
-- the ordered per-operation **action list** (single-shape verb → one action;
-  grouped verb → one action per `OperationSpec`), de-aliased (`new`/`get`/`ls`
-  never duplicate an action; `help` excluded);
+- the ordered **action list** via one normalisation: for each `Include`
+  descriptor, if `len(Operations) > 0` emit one action per `OperationSpec`
+  (using its `Summary`/`Safety`/`Args`/`Example`); otherwise emit one action for
+  the verb (using the verb-level `Summary`/`Safety`/`Args`/`Example`).
+  De-aliased (`new`/`get`/`ls` never duplicate an action; `help` excluded). Every
+  emitted action thus has exactly one example, one safety class, and one arg set;
 - for each action, the arg contract (from `Args`) and the documented `command`,
   formed by prefixing `aira <verb>` to the operation's explicit, machine-verified
   `Example` argv (invariant 3 proves that argv parses to the canonical request);
@@ -257,13 +272,15 @@ logic lives in it.
 }
 ```
 
-`response_contract` fields are generated from `store`.
+`response_contract` fields come from the single exported `core.ResponseContract()`
+(which composes `store`'s codes/exit map with `core`'s verdict→code→exit
+behaviour), cross-checked against real `Do()` output (invariant 7, §6.9).
 
 ## 5. Risks and mitigations
 
 | Risk | Mitigation |
 |---|---|
-| Grouped-verb example invalid (union args) | Per-operation actions with per-op arg subsets + requiredness; example rendered through the shared CLI renderer; per-operation parity test. |
+| Grouped-verb example invalid (union args) | Per-operation actions with per-op arg subsets + requiredness; each op's explicit example argv machine-verified by the per-operation parity + E2E tests. |
 | Per-operation safety lies (`find ls` marked mutate) | Per-operation `Safety`; golden per-operation safety table (invariant 4). |
 | Operation metadata drifts from handler | Per-operation instrumented arg-accessor drift test: handler reads for an operation == that operation's declared args (invariant 5). |
 | Generated text drifts from dispatch table | Golden action-set == `Include` set; per-action arg/summary goldens; consistency test fails on missing metadata. |
@@ -276,9 +293,13 @@ logic lives in it.
 ## 6. Tests (TDD; every confirmed counterexample becomes a regression test)
 
 1. **Descriptor consistency (fail-closed).** Every `Include` descriptor has a
-   non-empty `Summary` + valid `Safety`; grouped verbs enumerate `Operations`
-   covering all discriminator values; each op has valid `Safety` + a usable
-   example. Injected empty value / missing operation fails. (Proven load-bearing.)
+   non-empty `Summary` + valid `Safety`; a **single-shape** verb has a non-empty
+   verb-level `Example`; a **grouped** verb enumerates `Operations` covering all
+   discriminator values, each with valid `Safety` + a non-empty `Example`, and
+   an empty verb-level `Example`. Equivalently: **every normalised action has
+   exactly one non-empty example, one valid safety, one summary.** An injected
+   empty value / missing operation / example on the wrong level fails. (Proven
+   load-bearing.)
 2. **Per-operation safety golden.** The action→`Safety` map equals §4.1 exactly;
    any add/remove/reclassify fails until the table is updated.
 3. **Action-set drift.** Generated Skill action set and guide section set each
