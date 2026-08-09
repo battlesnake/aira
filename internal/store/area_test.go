@@ -56,6 +56,19 @@ func TestNormalizeAreaGlobSortsDeduplicatesAndRejectsInvalid(t *testing.T) {
 	}
 }
 
+func TestAreaWarningsForClaimMatchesExactEndpoint(t *testing.T) {
+	claims := []liveAreaClaim{
+		{ticketID: "AIRA-1", worktree: "w", globs: []string{"src/**"}},
+		{ticketID: "XAIRA-1", worktree: "w", globs: []string{"src/**"}},
+		{ticketID: "OTHER-1", worktree: "other", globs: []string{"src/file.go"}},
+	}
+
+	warnings := areaWarningsForClaim(claims, "AIRA-1", "w")
+	if len(warnings) != 1 || warnings[0].Subject != "AIRA-1@w <-> OTHER-1@other" {
+		t.Fatalf("warnings=%#v, want only the exact AIRA-1@w endpoint", warnings)
+	}
+}
+
 func TestTouchRejectsTokenFromNonHolderWorktreeWithoutWritingHint(t *testing.T) {
 	s, clock, base := m3Store(t)
 	other, err := Open(context.Background(), Options{

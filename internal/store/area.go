@@ -516,9 +516,11 @@ func liveAreaClaims(ctx context.Context, queryer interface {
 
 func areaWarningsForClaim(claims []liveAreaClaim, ticketID, worktree string) []CheckFinding {
 	all := areaOverlapWarnings(claims)
+	endpoint := ticketID + "@" + worktree
 	var result []CheckFinding
 	for _, warning := range all {
-		if strings.Contains(warning.Subject, ticketID+"@"+worktree) {
+		parts := strings.Split(warning.Subject, " <-> ")
+		if len(parts) == 2 && (parts[0] == endpoint || parts[1] == endpoint) {
 			result = append(result, warning)
 		}
 	}
@@ -537,6 +539,7 @@ func areaOverlapWarnings(claims []liveAreaClaim) []CheckFinding {
 			for _, leftGlob := range left.globs {
 				for _, rightGlob := range right.globs {
 					overlap, err := AreaGlobsOverlap(leftGlob, rightGlob)
+					// A descending range matches nothing, so dropping that pair loses no real overlap.
 					if err == nil && overlap {
 						overlaps = append(overlaps, leftGlob+" <-> "+rightGlob)
 					}

@@ -181,7 +181,7 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 	}
 	if warnings, err := s.areaOverlapWarnings(ctx); err != nil {
 		if ErrorCode(err) == "E_CLOCK_UNAVAILABLE" {
-			report.Dimensions["lease-integrity"] = "unevaluated"
+			report.Dimensions["area-overlap"] = "unevaluated"
 			report.Unevaluated = true
 			report.UnevaluatedFindings = append(report.UnevaluatedFindings, CheckFinding{Code: "E_CLOCK_UNAVAILABLE", Subject: "area-overlap", Message: err.Error(), Kind: "unevaluated"})
 		} else {

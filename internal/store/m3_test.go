@@ -27,6 +27,22 @@ type m3Clock struct {
 
 func (c *m3Clock) Now() (string, uint64, error) { return c.boot, c.mono, c.err }
 
+type countingClock struct {
+	boot   string
+	mono   uint64
+	calls  int
+	failAt int
+	err    error
+}
+
+func (c *countingClock) Now() (string, uint64, error) {
+	c.calls++
+	if c.calls == c.failAt {
+		return "", 0, c.err
+	}
+	return c.boot, c.mono, nil
+}
+
 type lockAwareClock struct {
 	boot          string
 	staleMono     uint64
@@ -160,6 +176,30 @@ func TestLeaseBootChangeExpiresAndClockUnavailableRefuses(t *testing.T) {
 	}
 	if report.Dimensions["lease-integrity"] != "unevaluated" || !hasFinding(report.UnevaluatedFindings, "E_CLOCK_UNAVAILABLE") {
 		t.Fatalf("clock-unavailable check = %#v", report)
+	}
+}
+
+func TestCheckKeepsLeaseIntegrityEvaluatedWhenAreaClockUnavailable(t *testing.T) {
+	s, clock, _ := m3Store(t)
+	ticket := m3Ticket(t, s, "counting check clock")
+	if _, err := s.Claim(context.Background(), ticket.ID, false, "owner"); err != nil {
+		t.Fatal(err)
+	}
+
+	counting := &countingClock{boot: clock.boot, mono: clock.mono, failAt: 2, err: errors.New("no monotonic clock")}
+	s.clock = counting
+	report, err := s.Check(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counting.calls != 2 {
+		t.Fatalf("Check clock samples=%d, want 2", counting.calls)
+	}
+	if report.Dimensions["area-overlap"] != "unevaluated" {
+		t.Fatalf("area-overlap dimension=%q, want unevaluated; report=%#v", report.Dimensions["area-overlap"], report)
+	}
+	if report.Dimensions["lease-integrity"] != "pass" {
+		t.Fatalf("lease-integrity dimension=%q, want evaluated pass; report=%#v", report.Dimensions["lease-integrity"], report)
 	}
 }
 
