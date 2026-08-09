@@ -154,23 +154,32 @@ Add to `verbSpec` and mirror into `DispatchDescriptor`:
 
 ```go
 type OperationSpec struct {
-    Name    string      // discriminator value, e.g. "add", "ls", "list"
+    Name    string         // discriminator value, e.g. "add", "ls", "list"
     Summary string
     Safety  SafetyClass
-    Args    []OperationArg // NON-discriminator arg names + per-operation requiredness
-    Example []ExampleArg   // canonical (CLI-shaped) args for a valid example
+    Args    []OperationArg // every NON-discriminator canonical arg the handler
+                           // reads for this op, + per-operation requiredness
+    Example []string       // explicit CLI argv AFTER the verb, e.g.
+                           // {"add","AIRA-1","--category","bug","--file","x.go:12"}
 }
 ```
 
-**Examples are canonical CLI args, not MCP-input args.** The Skill's entrypoint
-is the CLI, so an operation's `Args` and `Example` reference the verb's existing
-CLI `ArgSpec`s (a subset), and the example is expressed in **canonical request
-form** — the same form the M8a MCP↔CLI parity test uses. Crucially there is no
-separate `line` at this level: `find add`'s canonical arg is `file` with value
-`x.go:12`, so the shared renderer emits `--file x.go:12` with **no special-case
-encoding**. The MCP-only split of `file`+`line` into a combined value is an MCP
-*input* concern and stays in the MCP handler; the Skill never reproduces it, so
-there is no hard-coded generator exception to drift (closes Sol's encoding P1).
+**`Args` is the full canonical contract; `Example` is an explicit, machine-
+verified argv — not renderer-synthesised.** The `find add` handler really reads
+both `file` **and** `line` (`--file x.go:12` is parsed by the CLI into canonical
+`file:"x.go", line:12`), so `find add`'s `Args` declares **both** `file` and
+`line` (invariant 5 requires it — Sol's P0). There is no general canonical-args
+→ argv renderer that could emit the composite `--file path:line` without a
+special case, so M8b does **not** rely on synthesis: each operation supplies its
+own `Example` argv as data, and the parity test (invariant 3) parses that argv
+through the *real* CLI (`buildRequest`) and asserts the resulting `core.Request`
+equals the MCP path's, while the E2E test (§6.7) runs it through `Run`. An
+example argv therefore cannot silently drift or lie — a wrong one fails a test —
+which is a stronger guarantee than synthesising a syntactically-valid-but-wrong
+command. The generated per-action text names every declared arg (including
+`line`) and states the composite `--file path:line` encoding (there is no
+`--line` flag). The MCP tool separately accepts `file`+`line` as two inputs and
+combines them; that split stays an MCP *input* concern.
 
 `DispatchDescriptors()` deep-copies `Operations` (like it already deep-copies
 `Enum`) so the projection stays immutable. A consistency test requires every
@@ -202,18 +211,18 @@ A generator takes `[]DispatchDescriptor` and produces, deterministically:
 - the ordered per-operation **action list** (single-shape verb → one action;
   grouped verb → one action per `OperationSpec`), de-aliased (`new`/`get`/`ls`
   never duplicate an action; `help` excluded);
-- for each action, the arg contract and a **valid example** built as canonical
-  request args, then **rendered to CLI argv via a shared renderer** so the
-  documented `command` is exactly what the CLI parses (guaranteeing invariant 3);
+- for each action, the arg contract (from `Args`) and the documented `command`,
+  formed by prefixing `aira <verb>` to the operation's explicit, machine-verified
+  `Example` argv (invariant 3 proves that argv parses to the canonical request);
 - the response-contract section from the single exported `core.ResponseContract()`
   (stable codes + exit map + verdicts + the `unevaluated` statements), which
   composes `store`'s codes/exit map with `core`'s verdict→code→exit behaviour;
 - the manifest struct and the SKILL.md / guide Markdown.
 
-The example renderer and the CLI parser are inverse projections of the same arg
-specs; the parity test (invariant 3) proves round-trip identity for every action.
-The renderer is the *only* canonical-args→argv projection; the generator contains
-no per-verb argv special-cases.
+Each operation's `Example` argv is validated by the parity test (parse through
+the real CLI `buildRequest` → `core.Request` equal to the MCP path) and the E2E
+test (`Run`); the generator never synthesises argv, so it contains no per-verb
+special-cases and no example can silently drift.
 
 ### 4.3 The `skill` face (`cmd/aira/skill.go`)
 
