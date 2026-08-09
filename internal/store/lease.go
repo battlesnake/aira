@@ -85,6 +85,13 @@ func (s *Store) leaseTokenPath(id string) string {
 	return filepath.Join(s.leaseStateDir, "leases", s.projectID, s.worktreeID, id+".token")
 }
 
+func (s *Store) leaseTokenLock(id string) string {
+	// Key the lock by the actual token path. This reuses the common path-lock
+	// mechanism and also coordinates cooperating claimants sharing one token
+	// directory.
+	return s.pathLockFor("lease-token", s.leaseTokenPath(id))
+}
+
 // LeaseToken reads the local clear token. It is intentionally outside the DB
 // and is never included in an event or ticket file.
 func (s *Store) LeaseToken(id string) (string, error) {
@@ -169,10 +176,6 @@ func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor st
 	if _, err := s.Get(ticketID); err != nil {
 		return LeaseClaim{}, err
 	}
-	bootID, monoNS, err := s.sampleClock()
-	if err != nil {
-		return LeaseClaim{}, err
-	}
 	if actor == "" {
 		actor = "aira"
 	}
@@ -189,7 +192,20 @@ func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor st
 	}
 	var result LeaseClaim
 	result.Token = clear
+	tokenLock, err := acquireLock(s.leaseTokenLock(ticketID))
+	if err != nil {
+		_ = os.Remove(tokenTemp)
+		return LeaseClaim{}, err
+	}
+	defer unlockFile(tokenLock)
 	err = s.withImmediate(ctx, func(conn *sql.Conn) error {
+		// A contender may have waited for BEGIN IMMEDIATE. Sample only after
+		// the writer lock is acquired so its sample cannot predate the lease
+		// that it is about to inspect.
+		bootID, monoNS, err := s.sampleClock()
+		if err != nil {
+			return err
+		}
 		row, rowErr := readLeaseRow(ctx, conn, s.projectID, ticketID)
 		if errors.Is(rowErr, sql.ErrNoRows) {
 			if _, err := conn.ExecContext(ctx, `INSERT INTO leases(project_id, ticket_id, state, generation,
@@ -225,7 +241,7 @@ func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor st
 			if isHeld {
 				updateResult, err = conn.ExecContext(ctx, `UPDATE leases SET state='held', generation=?, holder_token_hash=?, boot_id=?,
                     last_heartbeat_mono_ns=?, ttl_ns=?, actor=?, worktree_id=? WHERE project_id=? AND ticket_id=? AND state='held' AND generation=?
-					AND (boot_id<>? OR ? < last_heartbeat_mono_ns OR ? - last_heartbeat_mono_ns >= ttl_ns)`,
+					AND (boot_id<>? OR (? >= last_heartbeat_mono_ns AND ? - last_heartbeat_mono_ns >= ttl_ns))`,
 					int64(generation), base64.RawURLEncoding.EncodeToString(hash[:]), bootID, int64(monoNS), int64(s.leaseTTLNS), actor,
 					s.worktreeID, s.projectID, ticketID, row.generation, bootID, int64(monoNS), int64(monoNS))
 			} else {
@@ -273,7 +289,12 @@ func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor st
 		_ = os.Remove(tokenTemp)
 		return LeaseClaim{}, err
 	}
-	if err := s.commitLeaseToken(ticketID, tokenTemp); err != nil {
+	held, ok := result.Lease.Held()
+	if !ok {
+		_ = os.Remove(tokenTemp)
+		return LeaseClaim{}, errors.New("E_CONFIG_INVALID: claim committed a non-held lease")
+	}
+	if err := s.commitLeaseToken(ctx, ticketID, tokenTemp, held.Generation, hash); err != nil {
 		return result, err
 	}
 	if err := s.journalEvent(ctx, s.projectID, result.Event.Seq); err != nil {
@@ -298,8 +319,18 @@ func (s *Store) writeLeaseTokenTemp(ticketID, token string) (string, error) {
 	return tmp, nil
 }
 
-func (s *Store) commitLeaseToken(ticketID, tempPath string) error {
+func (s *Store) commitLeaseToken(ctx context.Context, ticketID, tempPath string, generation uint64, hash [32]byte) error {
 	path := s.leaseTokenPath(ticketID)
+	lease, err := s.GetLease(ctx, ticketID)
+	if err != nil {
+		_ = os.Remove(tempPath)
+		return err
+	}
+	held, ok := lease.Held()
+	if !ok || held.Generation != generation || held.HolderTokenHash != hash {
+		_ = os.Remove(tempPath)
+		return ErrLeaseHeld
+	}
 	if err := os.Rename(tempPath, path); err != nil {
 		_ = os.Remove(tempPath)
 		return err
@@ -311,18 +342,25 @@ func (s *Store) Release(ctx context.Context, ticketID, token string) (EventKey, 
 	if token == "" {
 		return EventKey{}, ErrLeaseToken
 	}
-	bootID, monoNS, err := s.sampleClock()
-	if err != nil {
-		return EventKey{}, err
-	}
 	var tokenBytes []byte
+	var err error
 	tokenBytes, err = base64.RawURLEncoding.DecodeString(token)
 	if err != nil || len(tokenBytes) != 32 {
 		return EventKey{}, ErrLeaseToken
 	}
 	hash := sha256.Sum256(tokenBytes)
 	var event EventKey
+	var releasedGeneration uint64
+	tokenLock, err := acquireLock(s.leaseTokenLock(ticketID))
+	if err != nil {
+		return EventKey{}, err
+	}
+	defer unlockFile(tokenLock)
 	err = s.withImmediate(ctx, func(conn *sql.Conn) error {
+		bootID, monoNS, err := s.sampleClock()
+		if err != nil {
+			return err
+		}
 		row, err := readLeaseRow(ctx, conn, s.projectID, ticketID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrLeaseExpired
@@ -342,6 +380,7 @@ func (s *Store) Release(ctx context.Context, ticketID, token string) (EventKey, 
 			return ErrLeaseToken
 		}
 		generation := held.Generation + 1
+		releasedGeneration = generation
 		sqlResult, err := conn.ExecContext(ctx, `UPDATE leases SET state='free', generation=?, holder_token_hash=NULL, boot_id=NULL,
                 last_heartbeat_mono_ns=NULL, ttl_ns=NULL, actor=NULL, worktree_id=NULL
                 WHERE project_id=? AND ticket_id=? AND state='held' AND generation=? AND holder_token_hash=? AND boot_id=?
@@ -377,17 +416,18 @@ func (s *Store) Release(ctx context.Context, ticketID, token string) (EventKey, 
 	if err := s.journalEvent(ctx, s.projectID, event.Seq); err != nil {
 		return EventKey{}, err
 	}
-	if current, readErr := s.LeaseToken(ticketID); readErr == nil && current == token {
-		_ = os.Remove(s.leaseTokenPath(ticketID))
+	current, readErr := s.GetLease(ctx, ticketID)
+	if readErr == nil {
+		if free, ok := current.Free(); ok && free.Generation == releasedGeneration {
+			if data, fileErr := os.ReadFile(s.leaseTokenPath(ticketID)); fileErr == nil && strings.TrimSpace(string(data)) == token {
+				_ = os.Remove(s.leaseTokenPath(ticketID))
+			}
+		}
 	}
 	return event, nil
 }
 
 func (s *Store) Heartbeat(ctx context.Context, ticketID, token string) (domain.Lease, error) {
-	bootID, monoNS, err := s.sampleClock()
-	if err != nil {
-		return domain.Lease{}, err
-	}
 	tokenBytes, err := base64.RawURLEncoding.DecodeString(token)
 	if err != nil || len(tokenBytes) != 32 {
 		return domain.Lease{}, ErrLeaseToken
@@ -395,6 +435,10 @@ func (s *Store) Heartbeat(ctx context.Context, ticketID, token string) (domain.L
 	hash := sha256.Sum256(tokenBytes)
 	var result domain.Lease
 	err = s.withImmediate(ctx, func(conn *sql.Conn) error {
+		bootID, monoNS, err := s.sampleClock()
+		if err != nil {
+			return err
+		}
 		row, err := readLeaseRow(ctx, conn, s.projectID, ticketID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrLeaseExpired

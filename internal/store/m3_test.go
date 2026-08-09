@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -172,7 +173,7 @@ func TestConcurrentExpiredClaimersHaveOneWinnerAndNextGeneration(t *testing.T) {
 		other, err := Open(context.Background(), Options{
 			Root: base, CommonDir: filepath.Join(base, "common"),
 			DBPath: filepath.Join(base, "state", "state.db"), RegistryPath: filepath.Join(base, "state", "registry.jsonl"),
-			LeaseStateDir: filepath.Join(base, "lease-state-"+worktree), ProjectID: "project-aira", WorktreeID: worktree,
+			LeaseStateDir: filepath.Join(base, "lease-state"), ProjectID: "project-aira", WorktreeID: worktree,
 			ProjectSlug: "aira", Prefixes: []string{"AIRA"}, Clock: clock, LeaseTTLNS: 900,
 		})
 		if err != nil {
@@ -328,14 +329,64 @@ func TestRelationsDerivedIndexMaterialisesAndRebuilds(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("relations index count = %d, want 1", count)
 	}
+	if err := os.Remove(filepath.Join(s.root, ".aira", "tickets", from.ID+".md")); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.Rebuild(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM relations WHERE project_id=? AND worktree_id=?`, s.projectID, s.worktreeID).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 1 {
-		t.Fatalf("rebuilt relations index count = %d, want 1", count)
+	if count != 0 {
+		t.Fatalf("rebuilt relations index count = %d, want stale row deleted", count)
+	}
+}
+
+func TestReadyUsesCanonicalRelationsAndReportsStaleIndex(t *testing.T) {
+	s, _, _ := m3Store(t)
+	prerequisite := m3Ticket(t, s, "prerequisite")
+	dependent := m3Ticket(t, s, "dependent")
+	if _, err := s.Link(context.Background(), prerequisite.ID, domain.RelationBlocks, dependent.ID); err != nil {
+		t.Fatal(err)
+	}
+	withoutRelation := rawM3Ticket(t, domain.Ticket{Schema: 1, ID: prerequisite.ID, Project: prerequisite.Project,
+		Title: prerequisite.Title, Status: prerequisite.Status, Kind: prerequisite.Kind, Severity: prerequisite.Severity,
+		Labels: []string{}, Relations: nil}, "body\n")
+	if err := os.WriteFile(filepath.Join(s.root, ".aira", "tickets", prerequisite.ID+".md"), withoutRelation, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.Ready(dependent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || !rows[0].Ready || len(rows[0].Blockers) != 0 || !hasFinding(rows[0].Findings, "E_RELATION_INDEX_DIVERGENCE") {
+		t.Fatalf("stale relation index affected ready result: %#v", rows)
+	}
+	report, err := s.Check(context.Background())
+	if err != nil || report.Dimensions["relation-integrity"] != "fail" || !hasFinding(report.Findings, "E_RELATION_INDEX_DIVERGENCE") {
+		t.Fatalf("check did not report stale relation index: report=%#v err=%v", report, err)
+	}
+}
+
+func TestReadyFindingAttributionUsesExactRelationEndpoints(t *testing.T) {
+	s, _, _ := m3Store(t)
+	short := m3Ticket(t, s, "short ID")
+	target := m3Ticket(t, s, "relation target")
+	long := domain.Ticket{Schema: 1, ID: "AIRA-10", Project: "aira", Title: "long ID", Status: domain.StatusPlanned,
+		Kind: domain.KindFeature, Severity: domain.SeverityP2, Labels: []string{}, Relations: []domain.Relation{{
+			Kind: domain.RelationBlocks, From: "AIRA-10", To: target.ID,
+		}}}
+	data := rawM3Ticket(t, long, "body\n")
+	if err := os.WriteFile(filepath.Join(s.root, ".aira", "tickets", long.ID+".md"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.Ready(short.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || !rows[0].Ready || len(rows[0].Findings) != 0 {
+		t.Fatalf("substring relation finding was attributed to %s: %#v", short.ID, rows)
 	}
 }
 
@@ -374,13 +425,13 @@ func TestHeartbeatAndStealRaceHasOneStateTransition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stealClock := &m3Clock{boot: heartbeatClock.boot, mono: 110}
+	stealClock := &m3Clock{boot: heartbeatClock.boot, mono: 1000}
 	stealer, err := Open(context.Background(), Options{Root: base, CommonDir: filepath.Join(base, "common"), DBPath: filepath.Join(base, "state", "state.db"), RegistryPath: filepath.Join(base, "state", "registry.jsonl"), LeaseStateDir: filepath.Join(base, "steal-state"), ProjectID: s.projectID, WorktreeID: "stealer", ProjectSlug: "aira", Prefixes: []string{"AIRA"}, Clock: stealClock, LeaseTTLNS: 900})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer stealer.Close()
-	heartbeatClock.mono = 109
+	heartbeatClock.mono = 1000
 	start := make(chan struct{})
 	type outcome struct {
 		heartbeat bool
@@ -413,6 +464,72 @@ func TestHeartbeatAndStealRaceHasOneStateTransition(t *testing.T) {
 	}
 	if wins != 1 {
 		t.Fatalf("heartbeat/steal race had %d successful transitions: %#v", wins, got)
+	}
+}
+
+func TestReleaseAndStealRacePreservesWinningToken(t *testing.T) {
+	s, releaseClock, base := m3Store(t)
+	ticket := m3Ticket(t, s, "release token race")
+	claim, err := s.Claim(context.Background(), ticket.ID, false, "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stealClock := &m3Clock{boot: releaseClock.boot, mono: 1000}
+	stealer, err := Open(context.Background(), Options{
+		Root: base, CommonDir: filepath.Join(base, "common"), DBPath: filepath.Join(base, "state", "state.db"),
+		RegistryPath: filepath.Join(base, "state", "registry.jsonl"), LeaseStateDir: filepath.Join(base, "lease-state"),
+		ProjectID: s.projectID, WorktreeID: s.worktreeID, ProjectSlug: "aira", Prefixes: []string{"AIRA"},
+		Clock: stealClock, LeaseTTLNS: 900,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stealer.Close()
+	type outcome struct {
+		name  string
+		err   error
+		claim LeaseClaim
+	}
+	results := make(chan outcome, 2)
+	start := make(chan struct{})
+	go func() {
+		<-start
+		_, err := s.Release(context.Background(), ticket.ID, claim.Token)
+		results <- outcome{name: "release", err: err}
+	}()
+	go func() {
+		<-start
+		got, err := stealer.Claim(context.Background(), ticket.ID, true, "stealer")
+		results <- outcome{name: "steal", err: err, claim: got}
+	}()
+	close(start)
+	var steal outcome
+	for i := 0; i < 2; i++ {
+		got := <-results
+		if got.name == "steal" {
+			steal = got
+		} else if got.err != nil && ErrorCode(got.err) != "E_LEASE_TOKEN" && ErrorCode(got.err) != "E_LEASE_EXPIRED" {
+			t.Fatalf("unexpected release race error: %v", got.err)
+		}
+	}
+	if steal.err != nil {
+		t.Fatalf("stealer lost the release race: %v", steal.err)
+	}
+	lease, err := s.GetLease(context.Background(), ticket.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	winnerBytes, err := base64.RawURLEncoding.DecodeString(steal.claim.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	winnerHash := sha256.Sum256(winnerBytes)
+	held, ok := lease.Held()
+	if !ok || (held.Generation != 2 && held.Generation != 3) || held.HolderTokenHash != winnerHash {
+		t.Fatalf("final lease/token generation = %#v", lease)
+	}
+	if token, err := s.LeaseToken(ticket.ID); err != nil || token != steal.claim.Token {
+		t.Fatalf("final token = %q err=%v want stealer token", token, err)
 	}
 }
 

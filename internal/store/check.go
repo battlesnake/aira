@@ -68,6 +68,13 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 	if err := s.checkStaleIndex(&report); err != nil {
 		return CheckReport{}, err
 	}
+	if findings, err := s.relationIndexDivergence(); err != nil {
+		return CheckReport{}, err
+	} else {
+		for _, finding := range findings {
+			addFinding(&report, finding, "relation-integrity")
+		}
+	}
 	if err := s.reconcile(ctx); err != nil {
 		if isIntegrityError(err) {
 			addFinding(&report, s.findingFromError(err, "reconcile"), "reconcile-integrity")

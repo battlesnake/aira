@@ -339,10 +339,14 @@ func TestConcurrentLeaseClaimersAcrossShortLivedProcesses(t *testing.T) {
 		root := os.Getenv("AIRA_LEASE_ROOT")
 		state := os.Getenv("AIRA_LEASE_STATE")
 		worktree := os.Getenv("AIRA_LEASE_WORKTREE")
+		tokenWorktree := os.Getenv("AIRA_LEASE_TOKEN_WORKTREE")
+		if tokenWorktree == "" {
+			tokenWorktree = worktree
+		}
 		s, err := Open(context.Background(), Options{
 			Root: root, CommonDir: os.Getenv("AIRA_LEASE_COMMON"), DBPath: filepath.Join(state, "state.db"),
-			RegistryPath: filepath.Join(state, "registry.jsonl"), LeaseStateDir: filepath.Join(state, "lease-state-"+worktree),
-			ProjectID: "project-aira", WorktreeID: worktree, ProjectSlug: "aira", Prefixes: []string{"AIRA"}, LeaseTTLNS: 900_000_000_000,
+			RegistryPath: filepath.Join(state, "registry.jsonl"), LeaseStateDir: filepath.Join(state, "lease-state"),
+			ProjectID: "project-aira", WorktreeID: tokenWorktree, ProjectSlug: "aira", Prefixes: []string{"AIRA"}, LeaseTTLNS: 900_000_000_000,
 		})
 		if err != nil {
 			os.Stderr.WriteString(err.Error())
@@ -386,7 +390,7 @@ func TestConcurrentLeaseClaimersAcrossShortLivedProcesses(t *testing.T) {
 		go func(worktree string) {
 			defer wg.Done()
 			cmd := exec.Command(os.Args[0], "-test.run=^TestConcurrentLeaseClaimersAcrossShortLivedProcesses$", "-test.v=false")
-			cmd.Env = append(os.Environ(), "AIRA_LEASE_WORKER=1", "AIRA_LEASE_ROOT="+root, "AIRA_LEASE_COMMON="+filepath.Join(base, "common"), "AIRA_LEASE_STATE="+filepath.Join(base, "state"), "AIRA_LEASE_WORKTREE="+worktree, "AIRA_LEASE_TICKET="+ticket.ID)
+			cmd.Env = append(os.Environ(), "AIRA_LEASE_WORKER=1", "AIRA_LEASE_ROOT="+root, "AIRA_LEASE_COMMON="+filepath.Join(base, "common"), "AIRA_LEASE_STATE="+filepath.Join(base, "state"), "AIRA_LEASE_WORKTREE="+worktree, "AIRA_LEASE_TOKEN_WORKTREE=lease-worker-shared", "AIRA_LEASE_TICKET="+ticket.ID)
 			out, err := cmd.CombinedOutput()
 			if err != nil {
 				errs <- errors.New(string(out))
@@ -414,6 +418,14 @@ func TestConcurrentLeaseClaimersAcrossShortLivedProcesses(t *testing.T) {
 	}
 	if wins != 1 || held != workers-1 {
 		t.Fatalf("process lease outcomes: wins=%d held=%d", wins, held)
+	}
+	lease, err := s.GetLease(context.Background(), ticket.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	heldLease, ok := lease.Held()
+	if !ok || heldLease.Generation != 2 {
+		t.Fatalf("final process lease = %#v, want one steal at generation 2", lease)
 	}
 }
 

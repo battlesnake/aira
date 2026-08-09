@@ -272,6 +272,10 @@ func relationIndexKey(relation storedRelation) string {
 	return string(relation.Relation.Kind) + "\x00" + relation.Relation.From + "\x00" + relation.Relation.To
 }
 
+func relationIndexRecordKey(relation storedRelation) string {
+	return relationIndexKey(relation) + "\x00" + relation.Owner + "\x00" + filepath.Clean(relation.Path)
+}
+
 func (s *Store) indexedRelations() ([]storedRelation, error) {
 	rows, err := s.db.Query(`SELECT kind, from_id, to_id, canonical_file FROM relations WHERE project_id=? AND worktree_id=?`, s.projectID, s.worktreeID)
 	if err != nil {
@@ -287,6 +291,56 @@ func (s *Store) indexedRelations() ([]storedRelation, error) {
 		result = append(result, storedRelation{Owner: strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)), Path: path, Relation: domain.Relation{Kind: domain.RelationKind(kind), From: from, To: to}})
 	}
 	return result, rows.Err()
+}
+
+func (s *Store) relationIndexDivergence() ([]CheckFinding, error) {
+	canonical, _, _, err := scanStoredRelationsAt(s.root, s.worktreeID)
+	if err != nil {
+		return nil, err
+	}
+	indexed, err := s.indexedRelations()
+	if err != nil {
+		return nil, err
+	}
+	expected := make(map[string]storedRelation, len(canonical))
+	for _, relation := range canonical {
+		expected[relationIndexRecordKey(relation)] = relation
+	}
+	actual := make(map[string]storedRelation, len(indexed))
+	for _, relation := range indexed {
+		actual[relationIndexRecordKey(relation)] = relation
+	}
+	var findings []CheckFinding
+	for key, relation := range expected {
+		if _, ok := actual[key]; !ok {
+			findings = append(findings, CheckFinding{Code: "E_RELATION_INDEX_DIVERGENCE", Subject: relationSubject(relation.Relation),
+				Message: "canonical relation is missing from the derived index", Kind: relationIndexFindingKind(relation)})
+		}
+	}
+	for key, relation := range actual {
+		if _, ok := expected[key]; !ok {
+			findings = append(findings, CheckFinding{Code: "E_RELATION_INDEX_DIVERGENCE", Subject: relationSubject(relation.Relation),
+				Message: "derived relation index row is absent from canonical files", Kind: relationIndexFindingKind(relation)})
+		}
+	}
+	sort.Slice(findings, func(i, j int) bool {
+		if findings[i].Subject != findings[j].Subject {
+			return findings[i].Subject < findings[j].Subject
+		}
+		return findings[i].Message < findings[j].Message
+	})
+	return findings, nil
+}
+
+func relationIndexFindingKind(relation storedRelation) string {
+	data, err := readRegularTicket(relation.Path)
+	if err != nil {
+		return "fail"
+	}
+	if _, _, err := domain.ParseTicket(data); err != nil {
+		return "fail"
+	}
+	return "warning"
 }
 
 func workable(status domain.Status) bool {
@@ -342,23 +396,29 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 	if err != nil {
 		return nil, err
 	}
-	indexedRelations, err := s.indexedRelations()
+	indexFindings, err := s.relationIndexDivergence()
 	if err != nil {
 		return nil, err
 	}
-	observedRelations := make(map[string]bool, len(relations))
-	for _, relation := range relations {
-		observedRelations[relationIndexKey(relation)] = true
-	}
-	for _, relation := range indexedRelations {
-		if !observedRelations[relationIndexKey(relation)] {
-			relations = append(relations, relation)
+	for i := range indexFindings {
+		// The canonical files determine readiness. A stale derived row is
+		// surfaced here as a warning, but must not make a canonical-ready
+		// ticket fail or become blocked.
+		if indexFindings[i].Kind != "fail" {
+			indexFindings[i].Kind = "warning"
 		}
 	}
-	findings := append(append([]CheckFinding(nil), scanFindings...), relationFindings...)
+	findings := append(append(append([]CheckFinding(nil), scanFindings...), relationFindings...), indexFindings...)
 	result := make([]ReadyRecord, 0, len(rows)+len(findings))
 	for _, row := range rows {
 		rowFindings := findingsForReadyRow(row, findings, relations)
+		hasFailFinding := false
+		for _, finding := range rowFindings {
+			if finding.Kind == "fail" {
+				hasFailFinding = true
+				break
+			}
+		}
 		blockers := make([]domain.RelationView, 0)
 		if row.Ticket.ID != "" {
 			for _, relation := range relations {
@@ -368,20 +428,15 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 				view := domain.RelationView{Kind: domain.RelationBlockedBy, From: row.Ticket.ID, To: relation.Relation.From}
 				prerequisite, ok := byID[relationEndpointKey(row.Ticket.Project, relation.Relation.From)]
 				if !ok {
-					ownerObserved := observedRelations[relationIndexKey(relation)]
-					if !ownerObserved && relation.Path != "" {
-						rowFindings = appendUniqueFinding(rowFindings, CheckFinding{Code: "E_RELATION_UNOBSERVABLE", Subject: row.Ticket.ID, Message: "blocking prerequisite or relation owner cannot be observed", Kind: "fail"})
-					} else {
-						rowFindings = appendUniqueFinding(rowFindings, CheckFinding{Code: "E_RELATION_TARGET_MISSING", Subject: row.Ticket.ID, Message: "blocked-by prerequisite is missing", Kind: "fail"})
-					}
+					rowFindings = appendUniqueFinding(rowFindings, CheckFinding{Code: "E_RELATION_TARGET_MISSING", Subject: row.Ticket.ID, Message: "blocked-by prerequisite is missing", Kind: "fail"})
 				} else if !satisfied(prerequisite.Status) {
 					blockers = append(blockers, view)
 				}
 			}
 		}
-		isReady := row.Ticket.ID != "" && workable(row.Ticket.Status) && !row.Ticket.Hold && len(blockers) == 0 && len(rowFindings) == 0
+		isReady := row.Ticket.ID != "" && workable(row.Ticket.Status) && !row.Ticket.Hold && len(blockers) == 0 && !hasFailFinding
 		verdict := "pass"
-		if len(rowFindings) > 0 {
+		if hasFailFinding {
 			verdict = "fail"
 		}
 		item := ReadyRecord{Ticket: row, Ready: isReady, Blockers: blockers, Verdict: verdict, Findings: rowFindings}
@@ -421,12 +476,20 @@ func findingsForReadyRow(row TicketRecord, findings []CheckFinding, relations []
 				}
 			}
 		}
-		relatedEndpoint := strings.Contains(finding.Subject, row.Ticket.ID) && (finding.Code == "E_CROSS_PROJECT_RELATION" || finding.Code == "E_RELATION_INVALID")
+		relatedEndpoint := relationFindingHasEndpoint(finding, row.Ticket.ID)
 		if finding.Subject == row.Path || finding.Subject == row.Ticket.ID || relatedMissingTarget || relatedEndpoint {
 			result = appendUniqueFinding(result, finding)
 		}
 	}
 	return result
+}
+
+func relationFindingHasEndpoint(finding CheckFinding, id string) bool {
+	if finding.Code != "E_CROSS_PROJECT_RELATION" && finding.Code != "E_RELATION_INVALID" && finding.Code != "E_RELATION_INDEX_DIVERGENCE" {
+		return false
+	}
+	parts := strings.Split(finding.Subject, ":")
+	return len(parts) == 3 && (parts[0] == id || parts[2] == id)
 }
 
 func appendUniqueFinding(findings []CheckFinding, finding CheckFinding) []CheckFinding {

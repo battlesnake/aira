@@ -963,6 +963,12 @@ func (s *Store) Rebuild(ctx context.Context) error {
 	}
 	var recovered []AllocationReceipt
 	err = s.withImmediate(ctx, func(conn *sql.Conn) error {
+		// Relations are a disposable projection of every scanned canonical
+		// ticket. Clear the project slice first so rows owned by removed or
+		// malformed files cannot survive a rebuild.
+		if _, err := conn.ExecContext(ctx, `DELETE FROM relations WHERE project_id=?`, s.projectID); err != nil {
+			return err
+		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO event_counters(project_id,next_seq) VALUES(?,?)
 			ON CONFLICT(project_id) DO UPDATE SET next_seq=CASE WHEN event_counters.next_seq < excluded.next_seq THEN excluded.next_seq ELSE event_counters.next_seq END`,
 			s.projectID, maxSeq+1); err != nil {
@@ -1250,7 +1256,7 @@ func (s *Store) pathLock(path string) string {
 
 func (s *Store) pathLockFor(worktreeID, path string) string {
 	triple := s.projectID + "\x00" + worktreeID + "\x00" + path
-	return filepath.Join(s.auditDir, "locks", "path-"+digestBytes([]byte(triple))+".lock")
+	return filepath.Join(s.commonDir, "aira", "locks", "path-"+digestBytes([]byte(triple))+".lock")
 }
 
 func prefixOf(id string) string { return id[:strings.LastIndexByte(id, '-')] }
