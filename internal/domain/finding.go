@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"path"
 	"regexp"
 	"strconv"
@@ -82,6 +83,7 @@ type ReconciliationFindingInput struct {
 }
 
 var findingTokenPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+var findingCodePattern = regexp.MustCompile(`^E_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*$`)
 
 func NewReviewFinding(input ReviewFindingInput) (Finding, error) {
 	input.TicketID = strings.TrimSpace(input.TicketID)
@@ -118,7 +120,7 @@ func NewReconciliationFinding(input ReconciliationFindingInput) (Finding, error)
 	input.Subject = strings.TrimSpace(input.Subject)
 	input.Details = strings.TrimSpace(input.Details)
 	input.TicketID = strings.TrimSpace(input.TicketID)
-	if input.Code == "" || !strings.HasPrefix(input.Code, "E_") {
+	if !findingCodePattern.MatchString(input.Code) {
 		return Finding{}, errors.New("E_FINDING_INVALID: reconciliation code is invalid")
 	}
 	if input.Subject == "" || input.Details == "" {
@@ -129,13 +131,17 @@ func NewReconciliationFinding(input ReconciliationFindingInput) (Finding, error)
 			return Finding{}, errors.New("E_FINDING_INVALID: reconciliation ticket is invalid")
 		}
 	}
-	hash := sha256.Sum256([]byte(input.Code + "\x00" + input.Subject + "\x00" + input.TicketID))
 	return Finding{
 		Subtype: FindingSubtypeReconciliation,
-		Key:     "r-" + hex.EncodeToString(hash[:]),
+		Key:     reconciliationFindingKey(input.Code, input.Subject, input.TicketID),
 		Code:    input.Code, Subject: input.Subject, Details: input.Details, Message: input.Details,
 		TicketID: input.TicketID, Disposition: DispositionOpen,
 	}, nil
+}
+
+func reconciliationFindingKey(code, subject, ticketID string) string {
+	hash := sha256.Sum256([]byte(encodeFindingComponents(code, subject, ticketID)))
+	return "r-" + hex.EncodeToString(hash[:])
 }
 
 func (f Finding) Validate() error {
@@ -227,16 +233,26 @@ func CanonicalFindingFile(raw string) (string, error) {
 }
 
 // ReviewFindingKey is the stable identity derivation. Mutable content is
-// deliberately absent from the NUL-separated canonical tuple.
+// deliberately absent from the length-prefixed canonical tuple.
 func ReviewFindingKey(input ReviewFindingInput) string {
 	file, _ := CanonicalFindingFile(input.File)
 	line := ""
 	if file != "" {
 		line = strconv.Itoa(input.Line)
 	}
-	canonical := strings.Join([]string{strings.TrimSpace(input.TicketID), strings.ToLower(strings.TrimSpace(input.Source)), strings.ToLower(strings.TrimSpace(input.Category)), file, line, strings.TrimSpace(input.RequirementID)}, "\x00")
+	canonical := encodeFindingComponents(strings.TrimSpace(input.TicketID), strings.ToLower(strings.TrimSpace(input.Source)), strings.ToLower(strings.TrimSpace(input.Category)), file, line, strings.TrimSpace(input.RequirementID))
 	hash := sha256.Sum256([]byte(canonical))
 	return "f-" + strings.TrimSpace(input.TicketID) + "-" + strings.ToLower(strings.TrimSpace(input.Source)) + "-" + strings.ToLower(strings.TrimSpace(input.Category)) + "-" + hex.EncodeToString(hash[:])
+}
+
+func encodeFindingComponents(components ...string) string {
+	var encoded strings.Builder
+	for _, component := range components {
+		encoded.WriteString(strconv.Itoa(len(component)))
+		encoded.WriteByte(0)
+		encoded.WriteString(component)
+	}
+	return encoded.String()
 }
 
 type findingFrontmatter struct {
@@ -293,6 +309,13 @@ func ParseFinding(data []byte) (Finding, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&front); err != nil {
 		return Finding{}, fmt.Errorf("E_FINDING_INVALID: %w", err)
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return Finding{}, errors.New("E_FINDING_INVALID: trailing content in finding frontmatter")
+		}
+		return Finding{}, fmt.Errorf("E_FINDING_INVALID: trailing content in finding frontmatter: %w", err)
 	}
 	body := string(rest[idx+len(marker):])
 	if !strings.HasSuffix(body, "\n") {

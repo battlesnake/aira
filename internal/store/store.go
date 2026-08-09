@@ -68,6 +68,9 @@ type Store struct {
 	// afterLeaseBegin is a test-only observation hook for the lease clock
 	// sampling boundary; production leaves it nil.
 	afterLeaseBegin func()
+	// beforeRebuildFindingReconstruct is a test-only seam for the finding
+	// scan/reconstruct race boundary; production leaves it nil.
+	beforeRebuildFindingReconstruct func()
 }
 
 type Intent struct {
@@ -297,6 +300,9 @@ func (s *Store) initDB(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return translateDBError(err)
 		}
+	}
+	if err := s.ensureAreaHintsGeneration(ctx); err != nil {
+		return err
 	}
 	if err := s.ensureOutboxKind(ctx); err != nil {
 		return err
@@ -901,6 +907,11 @@ func (s *Store) recordRebuildFinding(ctx context.Context, entry registryEntry, r
 }
 
 func (s *Store) reconcile(ctx context.Context) error {
+	findingLock, err := s.acquireFindingMutationLock()
+	if err != nil {
+		return err
+	}
+	defer unlockFile(findingLock)
 	rows, err := s.db.QueryContext(ctx, `SELECT project_id, seq, worktree_id, path, verb, kind, precondition_digest,
 		intended_digest, intended_bytes, materialised, journaled, allocation_id FROM outbox
 		WHERE project_id=? AND (worktree_id=? OR path='') AND resolution IS NULL AND (materialised=0 OR journaled=0) ORDER BY seq`, s.projectID, s.worktreeID)
@@ -1054,6 +1065,11 @@ func (s *Store) Rebuild(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	findingLock, err := s.acquireFindingMutationLock()
+	if err != nil {
+		return err
+	}
+	defer unlockFile(findingLock)
 	receiptKeys := make(map[string]bool, len(receipts))
 	maxima := map[string]int64{}
 	maxSeq := int64(0)
@@ -1135,6 +1151,9 @@ func (s *Store) Rebuild(ctx context.Context) error {
 				maxima[prefix] = number
 			}
 		}
+	}
+	if s.beforeRebuildFindingReconstruct != nil {
+		s.beforeRebuildFindingReconstruct()
 	}
 	var recovered []AllocationReceipt
 	err = s.withImmediate(ctx, func(conn *sql.Conn) error {

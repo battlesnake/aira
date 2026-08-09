@@ -41,6 +41,10 @@ type scannedFinding struct {
 	Digest     string
 }
 
+func (s *Store) acquireFindingMutationLock() (*os.File, error) {
+	return acquireLock(filepath.Join(s.commonDir, "aira", "locks", "finding-rebuild.lock"))
+}
+
 func (s *Store) markFindingMaterialised(ctx context.Context, intent Intent) error {
 	finding, err := domain.ParseFinding(intent.Intended)
 	if err != nil {
@@ -82,6 +86,11 @@ func (s *Store) prepareFindingMutation(ctx context.Context, path, precondition s
 }
 
 func (s *Store) AddFinding(ctx context.Context, input domain.ReviewFindingInput) (domain.Finding, EventKey, error) {
+	findingLock, err := s.acquireFindingMutationLock()
+	if err != nil {
+		return domain.Finding{}, EventKey{}, err
+	}
+	defer unlockFile(findingLock)
 	finding, err := domain.NewReviewFinding(input)
 	if err != nil {
 		return domain.Finding{}, EventKey{}, err
@@ -115,6 +124,11 @@ func (s *Store) AddFinding(ctx context.Context, input domain.ReviewFindingInput)
 }
 
 func (s *Store) SetFinding(ctx context.Context, key string, disposition domain.Disposition, reason, actor string) (EventKey, error) {
+	findingLock, err := s.acquireFindingMutationLock()
+	if err != nil {
+		return EventKey{}, err
+	}
+	defer unlockFile(findingLock)
 	record, err := s.GetFinding(key)
 	if err != nil {
 		return EventKey{}, err
@@ -187,12 +201,12 @@ func (s *Store) GetFinding(key string) (FindingRecord, error) {
 }
 
 func (s *Store) indexedFinding(key, worktree string) (domain.Finding, error) {
-	row := s.db.QueryRow(`SELECT subtype,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,finding_key,code,subject,details,message FROM findings WHERE project_id=? AND worktree_id=? AND finding_key=?`, s.projectID, worktree, key)
+	row := s.db.QueryRow(`SELECT subtype,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,finding_key,code,subject,details,canonical_file,message FROM findings WHERE project_id=? AND worktree_id=? AND finding_key=?`, s.projectID, worktree, key)
 	return scanFindingRow(row)
 }
 
 func (s *Store) dbFinding(key string) (FindingRecord, error) {
-	row := s.db.QueryRow(`SELECT worktree_id,subtype,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,finding_key,code,subject,details,message FROM findings WHERE project_id=? AND finding_key=? ORDER BY CASE WHEN subtype='reconciliation' THEN 0 ELSE 1 END, worktree_id LIMIT 1`, s.projectID, key)
+	row := s.db.QueryRow(`SELECT worktree_id,subtype,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,finding_key,code,subject,details,canonical_file,message FROM findings WHERE project_id=? AND finding_key=? ORDER BY CASE WHEN subtype='reconciliation' THEN 0 ELSE 1 END, worktree_id LIMIT 1`, s.projectID, key)
 	var worktree string
 	finding, err := scanFindingRowWithWorktree(row, &worktree)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -262,7 +276,7 @@ func (s *Store) ListFindings(query string) ([]FindingRecord, error) {
 		}
 	}
 	if subtype == domain.FindingSubtypeReconciliation || subtype == domain.FindingSubtypeAny {
-		rows, err := s.db.Query(`SELECT worktree_id,subtype,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,finding_key,code,subject,details,message FROM findings WHERE project_id=? AND subtype='reconciliation'`, s.projectID)
+		rows, err := s.db.Query(`SELECT worktree_id,subtype,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,finding_key,code,subject,details,canonical_file,message FROM findings WHERE project_id=? AND subtype='reconciliation'`, s.projectID)
 		if err != nil {
 			return nil, err
 		}
@@ -291,7 +305,7 @@ func (s *Store) ListFindings(query string) ([]FindingRecord, error) {
 }
 
 func (s *Store) indexedFindings(worktree string) map[string]domain.Finding {
-	rows, err := s.db.Query(`SELECT subtype,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,finding_key,code,subject,details,message FROM findings WHERE project_id=? AND worktree_id=? AND subtype='review'`, s.projectID, worktree)
+	rows, err := s.db.Query(`SELECT subtype,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,finding_key,code,subject,details,canonical_file,message FROM findings WHERE project_id=? AND worktree_id=? AND subtype='review'`, s.projectID, worktree)
 	if err != nil {
 		return map[string]domain.Finding{}
 	}
@@ -435,17 +449,20 @@ func scanFindingRow(row interface{ Scan(...any) error }) (domain.Finding, error)
 }
 
 func scanFindingRowWithWorktree(row interface{ Scan(...any) error }, worktree *string) (domain.Finding, error) {
-	var subtype, ticket, category, severity, verdict, disposition, source, file, requirement, reason, actor, key, code, subject, details, message string
+	var subtype, ticket, category, severity, verdict, disposition, source, file, requirement, reason, actor, key, code, subject, details, canonicalFile, message string
 	var line int
 	args := []any{}
 	if worktree != nil {
 		args = append(args, worktree)
 	}
-	args = append(args, &subtype, &ticket, &category, &severity, &verdict, &disposition, &source, &file, &line, &requirement, &reason, &actor, &key, &code, &subject, &details, &message)
+	args = append(args, &subtype, &ticket, &category, &severity, &verdict, &disposition, &source, &file, &line, &requirement, &reason, &actor, &key, &code, &subject, &details, &canonicalFile, &message)
 	if err := row.Scan(args...); err != nil {
 		return domain.Finding{}, err
 	}
 	if subtype == string(domain.FindingSubtypeReview) {
+		if code != "" || subject != "" || details != "" {
+			return domain.Finding{}, errors.New("E_FINDING_INVALID: review index row contains reconciliation fields")
+		}
 		finding, err := domain.NewReviewFinding(domain.ReviewFindingInput{TicketID: ticket, Category: category, Severity: domain.Severity(severity), Verdict: domain.Verdict(verdict), Source: source, Message: message, RequirementID: requirement, File: file, Line: line, Disposition: domain.Disposition(disposition), WaiverReason: reason, WaiverActor: actor})
 		if err != nil {
 			return domain.Finding{}, err
@@ -461,7 +478,7 @@ func scanFindingRowWithWorktree(row interface{ Scan(...any) error }, worktree *s
 			return domain.Finding{}, err
 		}
 		finding.Key = key
-		if finding.Disposition != domain.DispositionOpen || message != details || category != "" || source != "" || verdict != "" || severity != "" || file != "" || line != 0 || requirement != "" || reason != "" || actor != "" {
+		if finding.Disposition != domain.DispositionOpen || message != details || category != "" || source != "" || verdict != "" || severity != "" || file != "" || line != 0 || requirement != "" || reason != "" || actor != "" || canonicalFile != "" {
 			return domain.Finding{}, errors.New("E_FINDING_INVALID: reconciliation index row contains review fields")
 		}
 		return finding, nil
@@ -517,7 +534,7 @@ func (s *Store) findingIndexDivergence() ([]CheckFinding, error) {
 		}
 	}
 	actual := map[string]domain.Finding{}
-	rows, err := s.db.Query(`SELECT worktree_id,subtype,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,finding_key,code,subject,details,message FROM findings WHERE project_id=? AND subtype='review'`, s.projectID)
+	rows, err := s.db.Query(`SELECT worktree_id,subtype,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,finding_key,code,subject,details,canonical_file,message FROM findings WHERE project_id=? AND subtype='review'`, s.projectID)
 	if err != nil {
 		return nil, err
 	}

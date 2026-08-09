@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"aira/internal/domain"
 )
@@ -288,6 +289,103 @@ func TestFindingReadbackRejectsCorruptReviewRow(t *testing.T) {
 	}
 	if _, err := s.GetFinding("bad"); ErrorCode(err) != "E_FINDING_INVALID" {
 		t.Fatalf("corrupt readback error=%v", err)
+	}
+}
+
+func TestFindingReadbackRejectsSubtypeSpecificFields(t *testing.T) {
+	base := persistentTemp(t, "finding-subtype-readback")
+	root := filepath.Join(base, "main")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := testStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	insert := func(key, subtype, code, subject, details, category string) {
+		t.Helper()
+		_, err := s.db.Exec(`INSERT INTO findings(project_id,worktree_id,finding_key,subtype,code,subject,details,created_at,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,canonical_file,message) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			s.projectID, s.worktreeID, key, subtype, code, subject, details, "now", "", category, "", "", "open", "", "", 0, "", "", "", "", details)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	review, err := domain.NewReviewFinding(reviewFindingInput("details"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.db.Exec(`INSERT INTO findings(project_id,worktree_id,finding_key,subtype,code,subject,details,created_at,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,canonical_file,message) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		s.projectID, s.worktreeID, review.Key, "review", "E_GIT_SCAN", ".git", "details", "now", review.TicketID, review.Category, review.Severity, review.Verdict, review.Disposition, review.Source, review.File, review.Line, review.RequirementID, review.WaiverReason, review.WaiverActor, review.File, review.Message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insert("r-bad-reconciliation-fields", "reconciliation", "E_GIT_SCAN", ".git", "details", "category")
+	if _, err := s.indexedFinding(review.Key, s.worktreeID); ErrorCode(err) != "E_FINDING_INVALID" {
+		t.Fatalf("indexedFinding(review) error=%v, want E_FINDING_INVALID", err)
+	}
+	if _, err := s.GetFinding("r-bad-reconciliation-fields"); ErrorCode(err) != "E_FINDING_INVALID" {
+		t.Fatalf("GetFinding(reconciliation) error=%v, want E_FINDING_INVALID", err)
+	}
+}
+
+func TestFindingMutationSerialisesWithRebuildScanAndReconstruct(t *testing.T) {
+	base := persistentTemp(t, "finding-rebuild-race")
+	root := filepath.Join(base, "main")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := testStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	old, _, err := s.AddFinding(context.Background(), reviewFindingInput("old content"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanned := make(chan struct{})
+	release := make(chan struct{})
+	s.beforeRebuildFindingReconstruct = func() {
+		close(scanned)
+		<-release
+	}
+	rebuildDone := make(chan error, 1)
+	go func() { rebuildDone <- s.Rebuild(context.Background()) }()
+	select {
+	case <-scanned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Rebuild did not reach the finding scan/reconstruct boundary")
+	}
+	mutationDone := make(chan error, 1)
+	updatedInput := reviewFindingInput("new content")
+	go func() {
+		_, _, mutationErr := s.AddFinding(context.Background(), updatedInput)
+		mutationDone <- mutationErr
+	}()
+	select {
+	case mutationErr := <-mutationDone:
+		close(release)
+		<-rebuildDone
+		t.Fatalf("finding mutation completed while Rebuild held the scan snapshot: %v", mutationErr)
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(release)
+	if err := <-rebuildDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-mutationDone; err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(s.findingPath(old.Key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotFile, err := domain.ParseFinding(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotFile.Message != "new content" {
+		t.Fatalf("canonical finding message=%q", gotFile.Message)
+	}
+	var indexedMessage string
+	if err := s.db.QueryRow(`SELECT message FROM findings WHERE project_id=? AND worktree_id=? AND finding_key=?`, s.projectID, s.worktreeID, old.Key).Scan(&indexedMessage); err != nil {
+		t.Fatal(err)
+	}
+	if indexedMessage != "new content" {
+		t.Fatalf("indexed finding message=%q", indexedMessage)
 	}
 }
 

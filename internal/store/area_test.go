@@ -11,6 +11,32 @@ import (
 	"testing"
 )
 
+func TestOpenMigratesPreTouchAreaHintsGeneration(t *testing.T) {
+	base := persistentTemp(t, "area-hints-migration")
+	root := filepath.Join(base, "main")
+	state := filepath.Join(base, "state")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(state, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(state, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE area_hints (project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, worktree_id TEXT NOT NULL, glob TEXT NOT NULL, PRIMARY KEY(project_id,ticket_id,worktree_id,glob))`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s := openTestStore(t, root, filepath.Join(base, "common"), state, "main", "AIRA")
+	if _, err := s.areaOverlapWarnings(context.Background()); err != nil {
+		t.Fatalf("area overlap query on pre-touch database: %v", err)
+	}
+}
+
 func TestAreaGlobOverlapTable(t *testing.T) {
 	cases := []struct {
 		left, right string
