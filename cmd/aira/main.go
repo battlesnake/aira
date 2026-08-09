@@ -22,6 +22,9 @@ func Run(argv []string, stdout, stderr io.Writer) int {
 	if len(argv) > 0 && strings.ToLower(argv[0]) == "mcp" {
 		return runMCP(context.Background(), os.Stdin, stdout, stderr)
 	}
+	if len(argv) > 0 && strings.ToLower(argv[0]) == "skill" {
+		return runSkill(argv[1:], stdout, stderr)
+	}
 	args, jsonOutput := removeJSON(argv)
 	if len(args) == 0 || args[0] == "help" || args[0] == "--help" {
 		response := core.New(nil).Do(context.Background(), core.Request{Verb: "help"})
@@ -142,6 +145,16 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 func buildRequest(verb string, positional []string, options map[string]string) (core.Request, error) {
 	args := map[string]any{}
 	switch verb {
+	case "init":
+		if len(positional) != 0 {
+			return core.Request{}, fmt.Errorf("init accepts no positional arguments")
+		}
+		if options["project"] != "" {
+			args["project"] = options["project"]
+		}
+		if options["prefixes"] != "" {
+			args["prefixes"] = splitComma(options["prefixes"])
+		}
 	case "id":
 		if len(positional) != 1 {
 			return core.Request{}, fmt.Errorf("id requires <prefix>")

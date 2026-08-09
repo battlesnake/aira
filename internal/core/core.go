@@ -101,14 +101,55 @@ type ArgSpec struct {
 	Description string   `json:"description"`
 }
 
+// SafetyClass describes the operational effect of a dispatch action. It is
+// deliberately closed so generated faces cannot silently invent a new class.
+type SafetyClass string
+
+const (
+	SafetyRead      SafetyClass = "read"
+	SafetyMutate    SafetyClass = "mutate"
+	SafetyLease     SafetyClass = "lease"
+	SafetyReconcile SafetyClass = "reconcile"
+)
+
+// Valid reports whether s is one of the closed safety classes.
+func (s SafetyClass) Valid() bool {
+	switch s {
+	case SafetyRead, SafetyMutate, SafetyLease, SafetyReconcile:
+		return true
+	default:
+		return false
+	}
+}
+
+func ValidSafetyClass(s SafetyClass) bool { return s.Valid() }
+
+type OperationArg struct {
+	Name     string `json:"name"`
+	Required bool   `json:"required"`
+}
+
+type OperationSpec struct {
+	Name    string         `json:"name"`
+	Summary string         `json:"summary"`
+	Safety  SafetyClass    `json:"safety"`
+	Args    []OperationArg `json:"args"`
+	Example []string       `json:"example"`
+}
+
 // DispatchDescriptor is the read-only metadata projection used by generated
 // faces. The handler itself is deliberately not exported.
 type DispatchDescriptor struct {
-	Name         string    `json:"name"`
-	Usage        string    `json:"usage"`
-	Args         []ArgSpec `json:"args"`
-	MCPTool      string    `json:"mcp_tool,omitempty"`
-	MCPOperation string    `json:"mcp_operation,omitempty"`
+	Name         string          `json:"name"`
+	Usage        string          `json:"usage"`
+	Args         []ArgSpec       `json:"args"`
+	MCPTool      string          `json:"mcp_tool,omitempty"`
+	MCPOperation string          `json:"mcp_operation,omitempty"`
+	Summary      string          `json:"summary"`
+	Safety       SafetyClass     `json:"safety"`
+	Include      bool            `json:"include"`
+	Example      []string        `json:"example"`
+	Operations   []OperationSpec `json:"operations,omitempty"`
 }
 
 type Core struct {
@@ -123,6 +164,11 @@ type verbSpec struct {
 	Args         []ArgSpec
 	MCPTool      string
 	MCPOperation string
+	Summary      string
+	Safety       SafetyClass
+	Include      bool
+	Example      []string
+	Operations   []OperationSpec
 	Run          func(context.Context, *argAccessor) (any, error)
 }
 
@@ -180,6 +226,19 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 	return Response{OK: true, Code: "OK", Data: data, Warnings: warnings}
 }
 
+// copyExample deep-copies an example argv while preserving the nil-vs-empty
+// distinction: a nil example means "no example declared" (a generator error for
+// an included action), whereas a non-nil but empty example is a deliberate,
+// valid example for an argument-less verb such as `check` (`aira check`). A
+// plain append([]string(nil), ...) would collapse an empty slice back to nil
+// and lose that distinction.
+func copyExample(example []string) []string {
+	if example == nil {
+		return nil
+	}
+	return append([]string{}, example...)
+}
+
 // DispatchDescriptors returns a stable, detached view of the exact dispatch
 // table used by Do. Callers cannot mutate the table through this projection.
 func (c *Core) DispatchDescriptors() []DispatchDescriptor {
@@ -190,14 +249,24 @@ func (c *Core) DispatchDescriptors() []DispatchDescriptor {
 			args[i] = arg
 			args[i].Enum = append([]string(nil), arg.Enum...)
 		}
-		result = append(result, DispatchDescriptor{Name: spec.Name, Usage: spec.Usage, Args: args, MCPTool: spec.MCPTool, MCPOperation: spec.MCPOperation})
+		operations := make([]OperationSpec, len(spec.Operations))
+		for i, operation := range spec.Operations {
+			operations[i] = operation
+			operations[i].Args = append([]OperationArg(nil), operation.Args...)
+			operations[i].Example = copyExample(operation.Example)
+		}
+		result = append(result, DispatchDescriptor{
+			Name: spec.Name, Usage: spec.Usage, Args: args, MCPTool: spec.MCPTool,
+			MCPOperation: spec.MCPOperation, Summary: spec.Summary, Safety: spec.Safety,
+			Include: spec.Include, Example: copyExample(spec.Example), Operations: operations,
+		})
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result
 }
 
 func (c *Core) dispatchTable() map[string]verbSpec {
-	return map[string]verbSpec{
+	verbs := map[string]verbSpec{
 		"help": {Name: "help", Usage: "help", Run: func(_ context.Context, _ *argAccessor) (any, error) { return c.Help(), nil }},
 		"init": {Name: "init", Usage: "init", Args: []ArgSpec{stringSpec("project", false, false, "Project slug"), listSpec("prefixes", false, false, "ID prefixes")}, MCPTool: "aira_init", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			if c.initializer == nil {
@@ -502,6 +571,64 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			return c.store.Check(ctx)
 		}},
 	}
+	applyDispatchMetadata(verbs)
+	return verbs
+}
+
+func applyDispatchMetadata(verbs map[string]verbSpec) {
+	metadata := map[string]verbMetadata{
+		"init":      {summary: "Initialise AIRA for the current project", safety: SafetyReconcile, example: []string{"--project", "demo", "--prefix", "AIRA"}},
+		"id":        {summary: "Allocate the next ticket identifier", safety: SafetyMutate, example: []string{"AIRA"}},
+		"create":    {summary: "Create a ticket", safety: SafetyMutate, example: []string{"AIRA ticket", "--kind", "feature", "--severity", "P1", "--body", "body", "--label", "label"}},
+		"show":      {summary: "Show one ticket", safety: SafetyRead, example: []string{"AIRA-1", "--fields", "id"}},
+		"grep":      {summary: "Search indexed tickets and findings", safety: SafetyRead, example: []string{"ticket", "--kind", "ticket", "--by", "kind", "--fields", "id"}},
+		"import":    {summary: "Import findings from a JSONL file", safety: SafetyMutate, example: []string{"findings.jsonl", "--strict"}},
+		"claim":     {summary: "Claim a ticket lease", safety: SafetyLease, example: []string{"AIRA-1", "--steal", "--actor", "codex"}},
+		"release":   {summary: "Release a ticket lease", safety: SafetyLease, example: []string{"AIRA-1", "--token", "token"}},
+		"heartbeat": {summary: "Renew a ticket lease", safety: SafetyLease, example: []string{"AIRA-1", "--token", "token"}},
+		"touch":     {summary: "Record ticket area ownership", safety: SafetyMutate, example: []string{"AIRA-1", "**/*.go", "--token", "token"}},
+		"unlink":    {summary: "Remove a ticket relation", safety: SafetyMutate, example: []string{"AIRA-1", "blocks", "AIRA-2"}},
+		"ready":     {summary: "List tickets ready to work on", safety: SafetyRead, example: []string{"--list"}},
+		"list":      {summary: "List tickets", safety: SafetyRead, example: []string{"ticket", "--by", "status", "--fields", "id"}},
+		"count":     {summary: "Count tickets by a dimension", safety: SafetyRead, example: []string{"ticket", "--by", "status"}},
+		"set":       {summary: "Set a ticket field", safety: SafetyMutate, example: []string{"AIRA-1", "status=planned"}},
+		"mv":        {summary: "Move a ticket to a new status", safety: SafetyMutate, example: []string{"AIRA-1", "planned"}},
+		"reconcile": {summary: "Reconcile derived project state", safety: SafetyReconcile, example: []string{"--rebuild"}},
+		"check":     {summary: "Check project consistency", safety: SafetyReconcile, example: []string{}},
+	}
+	metadata["find"] = verbMetadata{summary: "Manage review findings", safety: SafetyMutate, operations: []OperationSpec{
+		{Name: "add", Summary: "Add a review finding", Safety: SafetyMutate, Args: []OperationArg{
+			{Name: "ticket", Required: true}, {Name: "category"}, {Name: "severity"}, {Name: "verdict"}, {Name: "source"}, {Name: "message"},
+			{Name: "file"}, {Name: "line"}, {Name: "requirement"},
+		}, Example: []string{"add", "AIRA-1", "--category", "bug", "--severity", "P1", "--verdict", "confirmed", "--source", "codex", "--message", "bad", "--file", "x.go:12", "--requirement", "REQ-1"}},
+		{Name: "ls", Summary: "List review findings", Safety: SafetyRead, Args: []OperationArg{{Name: "query"}, {Name: "by"}, {Name: "fields"}}, Example: []string{"ls", "subtype:any", "--by", "source", "--fields", "id"}},
+		{Name: "show", Summary: "Show one review finding", Safety: SafetyRead, Args: []OperationArg{{Name: "selector", Required: true}}, Example: []string{"show", "f-1"}},
+		{Name: "set", Summary: "Set a review finding disposition", Safety: SafetyMutate, Args: []OperationArg{{Name: "selector", Required: true}, {Name: "disposition"}, {Name: "reason"}, {Name: "actor"}}, Example: []string{"set", "f-1", "--disposition", "waived", "--reason", "accepted", "--actor", "human"}},
+	}}
+	metadata["link"] = verbMetadata{summary: "Manage ticket relations", safety: SafetyMutate, operations: []OperationSpec{
+		{Name: "link", Summary: "Create a ticket relation", Safety: SafetyMutate, Args: []OperationArg{{Name: "from", Required: true}, {Name: "kind", Required: true}, {Name: "to", Required: true}}, Example: []string{"AIRA-1", "blocks", "AIRA-2"}},
+		{Name: "list", Summary: "List ticket relations", Safety: SafetyRead, Args: []OperationArg{{Name: "selector", Required: true}}, Example: []string{"ls", "AIRA-1"}},
+	}}
+	for name, spec := range verbs {
+		if name == "help" {
+			continue
+		}
+		entry, ok := metadata[name]
+		if !ok {
+			panic("missing dispatch metadata for " + name)
+		}
+		spec.Summary, spec.Safety, spec.Include = entry.summary, entry.safety, true
+		spec.Example = copyExample(entry.example)
+		spec.Operations = append([]OperationSpec(nil), entry.operations...)
+		verbs[name] = spec
+	}
+}
+
+type verbMetadata struct {
+	summary    string
+	safety     SafetyClass
+	example    []string
+	operations []OperationSpec
 }
 
 func (c *Core) Help() []map[string]string {

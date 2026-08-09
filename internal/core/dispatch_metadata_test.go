@@ -41,6 +41,49 @@ func TestDispatchMetadataMatchesInstrumentedHandlerReads(t *testing.T) {
 				read[key] = true
 			}
 		}
+		if len(descriptor.Operations) > 0 {
+			discriminator := ""
+			if name == "find" {
+				discriminator = "subverb"
+			} else if name == "link" {
+				discriminator = "list"
+			}
+			if discriminator == "" {
+				t.Fatalf("grouped verb %q has no discriminator", name)
+			}
+			for _, operation := range descriptor.Operations {
+				declaredOperation := map[string]bool{}
+				for _, arg := range operation.Args {
+					if arg.Name == discriminator {
+						t.Fatalf("operation %q/%q declares discriminator %q", name, operation.Name, discriminator)
+					}
+					declaredOperation[arg.Name] = true
+				}
+				operationRead := map[string]bool{}
+				for _, values := range metadataProbeInputs(name) {
+					matches := false
+					switch discriminator {
+					case "subverb":
+						matches = values[discriminator] == operation.Name
+					case "list":
+						matches = (operation.Name == "list" && values[discriminator] == true) || (operation.Name == "link" && values[discriminator] == false)
+					}
+					if !matches {
+						continue
+					}
+					args := newArgAccessor(values)
+					_, _ = spec.Run(context.Background(), args)
+					for key := range args.reads {
+						operationRead[key] = true
+					}
+				}
+				delete(operationRead, discriminator)
+				if !reflect.DeepEqual(sortedKeys(operationRead), sortedKeys(declaredOperation)) {
+					t.Fatalf("operation %q/%q recorded reads=%v, declared args=%v", name, operation.Name, sortedKeys(operationRead), sortedKeys(declaredOperation))
+				}
+			}
+			continue
+		}
 		if !reflect.DeepEqual(sortedKeys(read), sortedKeys(declared)) {
 			t.Fatalf("verb %q recorded reads=%v, declared args=%v", name, sortedKeys(read), sortedKeys(declared))
 		}
@@ -178,6 +221,18 @@ func TestDispatchDescriptorsAreStableReadOnlyCopies(t *testing.T) {
 	}
 	if got.Args[0].Name == "changed" || got.Args[1].Enum[0] == "changed" {
 		t.Fatalf("descriptor view aliases dispatch metadata: %#v", got.Args[0])
+	}
+	first = c.DispatchDescriptors()
+	for i := range first {
+		if first[i].Name == "find" {
+			first[i].Operations[0].Summary = "changed"
+			first[i].Operations[0].Example[0] = "changed"
+		}
+	}
+	second = c.DispatchDescriptors()
+	find, ok := descriptorByName(second, "find")
+	if !ok || find.Operations[0].Summary == "changed" || find.Operations[0].Example[0] == "changed" {
+		t.Fatal("operation metadata aliases dispatch metadata")
 	}
 }
 

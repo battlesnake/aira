@@ -76,6 +76,9 @@ func newMCPServer(provider mcpProvider) *mcpServer {
 	descriptors := core.New(nil).DispatchDescriptors()
 	grouped := map[string][]core.DispatchDescriptor{}
 	for _, descriptor := range descriptors {
+		if !descriptor.Include {
+			continue
+		}
 		if descriptor.MCPTool != "" {
 			grouped[descriptor.MCPTool] = append(grouped[descriptor.MCPTool], descriptor)
 		}
