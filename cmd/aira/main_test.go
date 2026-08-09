@@ -113,3 +113,18 @@ func TestGrepRequestParsesQueryAndOptions(t *testing.T) {
 		t.Fatalf("grep fields = %#v", request.Args["fields"])
 	}
 }
+
+func TestShowRequestAcceptsFieldsConsumedByCore(t *testing.T) {
+	positional, options, err := parseArgs("show", []string{"AIRA-1", "--fields", "id,title"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := buildRequest("show", positional, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields, ok := request.Args["fields"].([]string)
+	if !ok || len(fields) != 2 || fields[1] != "title" {
+		t.Fatalf("show fields=%#v", request.Args["fields"])
+	}
+}

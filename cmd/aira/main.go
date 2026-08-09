@@ -19,6 +19,9 @@ func main() { os.Exit(Run(os.Args[1:], os.Stdout, os.Stderr)) }
 // Run is the deliberately small CLI adapter: argv parsing, core request
 // construction, and rendering. It contains no ticket or consistency logic.
 func Run(argv []string, stdout, stderr io.Writer) int {
+	if len(argv) > 0 && strings.ToLower(argv[0]) == "mcp" {
+		return runMCP(context.Background(), os.Stdin, stdout, stderr)
+	}
 	args, jsonOutput := removeJSON(argv)
 	if len(args) == 0 || args[0] == "help" || args[0] == "--help" {
 		response := core.New(nil).Do(context.Background(), core.Request{Verb: "help"})
@@ -37,7 +40,7 @@ func Run(argv []string, stdout, stderr io.Writer) int {
 			requestArgs["project"] = value
 		}
 		if value := options["prefixes"]; value != "" {
-			requestArgs["prefixes"] = value
+			requestArgs["prefixes"] = splitComma(value)
 		}
 		dispatcher := core.NewWithInitializer(nil, func(ctx context.Context, initArgs map[string]any) (any, error) {
 			return app.Init(ctx, ".", initArgs)
@@ -117,7 +120,8 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"init":   {"project": true, "prefixes": true},
 		"create": {"kind": true, "severity": true, "labels": true, "body": true},
 		"new":    {"kind": true, "severity": true, "labels": true, "body": true},
-		"list":   {"by": true, "fields": true}, "ls": {"by": true, "fields": true},
+		"show":   {"fields": true}, "get": {"fields": true},
+		"list": {"by": true, "fields": true}, "ls": {"by": true, "fields": true},
 		"grep":   {"kind": true, "by": true, "fields": true},
 		"import": {"strict": true},
 		"count":  {"by": true}, "reconcile": {"rebuild": true},
@@ -154,6 +158,7 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			return core.Request{}, fmt.Errorf("show requires <selector>")
 		}
 		args["selector"] = positional[0]
+		args["fields"] = splitComma(options["fields"])
 	case "find":
 		if len(positional) == 0 {
 			return core.Request{}, fmt.Errorf("find requires add|ls|show|set")
