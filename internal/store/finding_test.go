@@ -276,6 +276,96 @@ func TestLegacyFindingsMigrationIsIdempotentAndTyped(t *testing.T) {
 	}
 }
 
+func TestFindingsMigrationCrashAfterCreateIsAtomicAndReentrant(t *testing.T) {
+	base := persistentTemp(t, "finding-migration-crash-create")
+	root := filepath.Join(base, "main")
+	state := filepath.Join(base, "state")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	createLegacyFindingsDB(t, filepath.Join(state, "state.db"))
+
+	db, err := sql.Open("sqlite", filepath.Join(state, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Store{db: db, findingsMigrationHook: func(statement string) error {
+		if statement == "after-create" {
+			return errors.New("injected migration crash after create")
+		}
+		return nil
+	}}
+	err = s.ensureFindingsSchema(context.Background())
+	if err == nil {
+		t.Fatal("migration unexpectedly completed; crash hook was not exercised")
+	}
+	_ = s.Close()
+
+	reopened := openTestStore(t, root, filepath.Join(base, "common"), state, "main", "AIRA")
+	assertLegacyFindingSurvivedMigration(t, reopened)
+}
+
+func TestFindingsMigrationCrashAfterDropIsAtomicAndReentrant(t *testing.T) {
+	base := persistentTemp(t, "finding-migration-crash-drop")
+	root := filepath.Join(base, "main")
+	state := filepath.Join(base, "state")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	createLegacyFindingsDB(t, filepath.Join(state, "state.db"))
+
+	db, err := sql.Open("sqlite", filepath.Join(state, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Store{db: db, findingsMigrationHook: func(statement string) error {
+		if statement == "after-drop" {
+			return errors.New("injected migration crash after drop")
+		}
+		return nil
+	}}
+	err = s.ensureFindingsSchema(context.Background())
+	if err == nil {
+		t.Fatal("migration unexpectedly completed; crash hook was not exercised")
+	}
+	_ = s.Close()
+
+	reopened := openTestStore(t, root, filepath.Join(base, "common"), state, "main", "AIRA")
+	assertLegacyFindingSurvivedMigration(t, reopened)
+}
+
+func createLegacyFindingsDB(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE findings (project_id TEXT NOT NULL, finding_key TEXT NOT NULL, code TEXT NOT NULL, subject TEXT NOT NULL, details TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(project_id,finding_key)); INSERT INTO findings VALUES ('project-aira','legacy','E_OLD','subject','details','now')`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertLegacyFindingSurvivedMigration(t *testing.T, s *Store) {
+	t.Helper()
+	var count int
+	if err := s.db.QueryRow(`SELECT count(*) FROM findings WHERE finding_key='legacy'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("legacy row lost after migration crash recovery: count=%d", count)
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='findings_m5'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("orphan findings_m5 table remains after migration recovery")
+	}
+}
+
 func TestFindingReadbackRejectsCorruptReviewRow(t *testing.T) {
 	base := persistentTemp(t, "finding-readback")
 	root := filepath.Join(base, "main")
@@ -471,5 +561,48 @@ func TestMalformedFindingIsUnevaluatedAndSurvivesRebuild(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("malformed finding disappeared from query: %#v", rows)
+	}
+}
+
+func TestMalformedFindingMatchesExplicitReviewFilter(t *testing.T) {
+	base := persistentTemp(t, "finding-malformed-review-filter")
+	root := filepath.Join(base, "main")
+	path := filepath.Join(root, ".aira", "findings", "f-bad.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := testStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	if err := os.WriteFile(path, []byte("not frontmatter\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.ListFindings("subtype:review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || !rows[0].Unevaluated || rows[0].Path != ".aira/findings/f-bad.md" {
+		t.Fatalf("malformed review finding hidden by subtype filter: %#v", rows)
+	}
+}
+
+func TestGetFindingWarnsOnDispositionOnlyIndexDivergence(t *testing.T) {
+	base := persistentTemp(t, "finding-stale-disposition")
+	root := filepath.Join(base, "main")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := testStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	finding, _, err := s.AddFinding(context.Background(), reviewFindingInput("same content"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE findings SET disposition=? WHERE project_id=? AND worktree_id=? AND finding_key=?`, domain.DispositionFixed, s.projectID, s.worktreeID, finding.Key); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetFinding(finding.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Warnings) != 1 || got.Warnings[0] != "W_STALE_INDEX" {
+		t.Fatalf("disposition-only index divergence warnings=%#v", got.Warnings)
 	}
 }

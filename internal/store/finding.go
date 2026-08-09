@@ -190,7 +190,7 @@ func (s *Store) GetFinding(key string) (FindingRecord, error) {
 		}
 		record := FindingRecord{Finding: finding, Path: repoPath(s.root, path), WorktreeID: s.worktreeID, Digest: digestBytes(data)}
 		indexed, indexErr := s.indexedFinding(key, s.worktreeID)
-		if errors.Is(indexErr, sql.ErrNoRows) || indexErr == nil && indexed.Message != finding.Message {
+		if errors.Is(indexErr, sql.ErrNoRows) || indexErr == nil && !sameFindingContent(indexed, finding) {
 			record.Warnings = []string{"W_STALE_INDEX"}
 		} else if indexErr != nil {
 			return FindingRecord{}, indexErr
@@ -324,7 +324,7 @@ func matchesFindingTerms(record FindingRecord, terms []queryTerm) bool {
 		var matched bool
 		switch term.Field {
 		case "subtype":
-			matched = term.Value == string(domain.FindingSubtypeAny) || string(record.Finding.Subtype) == term.Value
+			matched = record.Unevaluated && term.Value == string(domain.FindingSubtypeReview) || term.Value == string(domain.FindingSubtypeAny) || string(record.Finding.Subtype) == term.Value
 		case "ticket":
 			matched = record.Finding.TicketID == term.Value
 		case "category":

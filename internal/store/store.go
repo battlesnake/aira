@@ -71,6 +71,9 @@ type Store struct {
 	// beforeRebuildFindingReconstruct is a test-only seam for the finding
 	// scan/reconstruct race boundary; production leaves it nil.
 	beforeRebuildFindingReconstruct func()
+	// findingsMigrationHook is a test-only seam for crash points between
+	// transactional schema-migration statements; production leaves it nil.
+	findingsMigrationHook func(string) error
 }
 
 type Intent struct {
@@ -367,7 +370,45 @@ func hasTableColumn(ctx context.Context, db interface {
 	return false
 }
 
+func hasTable(ctx context.Context, db interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, table string) bool {
+	rows, err := db.QueryContext(ctx, `SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`, table)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	return rows.Next()
+}
+
+// findingsSchemaCurrent reports whether the findings schema is already at the
+// M5 target (all typed columns, composite PK, no orphan rebuild table) using
+// only reads. When true, ensureFindingsSchema is a pure no-op and must NOT open
+// a write transaction — every Open would otherwise take the write lock, adding
+// needless contention for the common already-migrated case.
+func (s *Store) findingsSchemaCurrent(ctx context.Context) bool {
+	for _, name := range []string{
+		"worktree_id", "subtype", "ticket_id", "category", "severity", "verdict",
+		"disposition", "source", "file", "line", "requirement_id", "waiver_reason",
+		"waiver_actor", "canonical_file", "message",
+	} {
+		if !hasTableColumn(ctx, s.db, "findings", name) {
+			return false
+		}
+	}
+	return findingsHasCompositePrimaryKey(ctx, s.db) && !hasTable(ctx, s.db, "findings_m5")
+}
+
 func (s *Store) ensureFindingsSchema(ctx context.Context) error {
+	if s.findingsSchemaCurrent(ctx) {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return translateDBError(err)
+	}
+	defer tx.Rollback()
+
 	columns := []struct{ name, definition string }{
 		{"worktree_id", `TEXT NOT NULL DEFAULT ''`},
 		{"subtype", `TEXT NOT NULL DEFAULT 'reconciliation'`},
@@ -380,18 +421,36 @@ func (s *Store) ensureFindingsSchema(ctx context.Context) error {
 		{"message", `TEXT NOT NULL DEFAULT ''`},
 	}
 	for _, column := range columns {
-		if hasTableColumn(ctx, s.db, "findings", column.name) {
+		if hasTableColumn(ctx, tx, "findings", column.name) {
 			continue
 		}
-		if _, err := s.db.ExecContext(ctx, `ALTER TABLE findings ADD COLUMN `+column.name+` `+column.definition); err != nil {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE findings ADD COLUMN `+column.name+` `+column.definition); err != nil {
 			return translateDBError(err)
 		}
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE findings SET subtype=COALESCE(NULLIF(subtype,''),'reconciliation'), message=CASE WHEN message='' THEN details ELSE message END, disposition=CASE WHEN disposition='' THEN 'open' ELSE disposition END`); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE findings SET subtype=COALESCE(NULLIF(subtype,''),'reconciliation'), message=CASE WHEN message='' THEN details ELSE message END, disposition=CASE WHEN disposition='' THEN 'open' ELSE disposition END`); err != nil {
 		return translateDBError(err)
 	}
-	if !findingsHasCompositePrimaryKey(ctx, s.db) {
-		if _, err := s.db.ExecContext(ctx, `CREATE TABLE findings_m5 (
+	if findingsHasCompositePrimaryKey(ctx, tx) {
+		// If a process died after DROP and before RENAME, initDB has already
+		// recreated an empty modern findings table. Recover any copied rows
+		// before removing the orphan instead of accepting silent data loss.
+		if hasTable(ctx, tx, "findings_m5") {
+			if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO findings(project_id,worktree_id,finding_key,subtype,code,subject,details,created_at,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,canonical_file,message) SELECT project_id,worktree_id,finding_key,subtype,code,subject,details,created_at,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,canonical_file,message FROM findings_m5`); err != nil {
+				return translateDBError(err)
+			}
+			if _, err := tx.ExecContext(ctx, `DROP TABLE findings_m5`); err != nil {
+				return translateDBError(err)
+			}
+		}
+	} else {
+		// Clear a table left by an interrupted prior attempt before starting
+		// the rebuild. The transaction keeps the legacy table authoritative
+		// until the replacement is completely ready.
+		if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS findings_m5`); err != nil {
+			return translateDBError(err)
+		}
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE findings_m5 (
 			project_id TEXT NOT NULL, worktree_id TEXT NOT NULL DEFAULT '', finding_key TEXT NOT NULL,
 			subtype TEXT NOT NULL DEFAULT 'reconciliation', code TEXT NOT NULL DEFAULT '', subject TEXT NOT NULL DEFAULT '', details TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
 			ticket_id TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT '', severity TEXT NOT NULL DEFAULT '', verdict TEXT NOT NULL DEFAULT '', disposition TEXT NOT NULL DEFAULT 'open', source TEXT NOT NULL DEFAULT '', file TEXT NOT NULL DEFAULT '', line INTEGER NOT NULL DEFAULT 0, requirement_id TEXT NOT NULL DEFAULT '', waiver_reason TEXT NOT NULL DEFAULT '', waiver_actor TEXT NOT NULL DEFAULT '', canonical_file TEXT NOT NULL DEFAULT '', message TEXT NOT NULL DEFAULT '',
@@ -399,17 +458,33 @@ func (s *Store) ensureFindingsSchema(ctx context.Context) error {
 		)`); err != nil {
 			return translateDBError(err)
 		}
-		if _, err := s.db.ExecContext(ctx, `INSERT INTO findings_m5(project_id,worktree_id,finding_key,subtype,code,subject,details,created_at,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,canonical_file,message) SELECT project_id,worktree_id,finding_key,subtype,code,subject,details,created_at,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,canonical_file,message FROM findings`); err != nil {
+		if err := s.runFindingsMigrationHook("after-create"); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO findings_m5(project_id,worktree_id,finding_key,subtype,code,subject,details,created_at,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,canonical_file,message) SELECT project_id,worktree_id,finding_key,subtype,code,subject,details,created_at,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,canonical_file,message FROM findings`); err != nil {
 			return translateDBError(err)
 		}
-		if _, err := s.db.ExecContext(ctx, `DROP TABLE findings`); err != nil {
+		if _, err := tx.ExecContext(ctx, `DROP TABLE findings`); err != nil {
 			return translateDBError(err)
 		}
-		if _, err := s.db.ExecContext(ctx, `ALTER TABLE findings_m5 RENAME TO findings`); err != nil {
+		if err := s.runFindingsMigrationHook("after-drop"); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE findings_m5 RENAME TO findings`); err != nil {
 			return translateDBError(err)
 		}
 	}
+	if err := tx.Commit(); err != nil {
+		return translateDBError(err)
+	}
 	return nil
+}
+
+func (s *Store) runFindingsMigrationHook(statement string) error {
+	if s.findingsMigrationHook == nil {
+		return nil
+	}
+	return s.findingsMigrationHook(statement)
 }
 
 func findingsHasCompositePrimaryKey(ctx context.Context, db interface {
