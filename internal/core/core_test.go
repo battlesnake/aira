@@ -52,6 +52,143 @@ func TestReadyVerdictExitPrecedence(t *testing.T) {
 	}
 }
 
+func TestReadyAllMalformedProjectIsUnevaluatedThroughCore(t *testing.T) {
+	cases := []struct {
+		name      string
+		setup     func(t *testing.T, base string)
+		wantPaths []string
+	}{
+		{
+			name: "duplicate ids",
+			setup: func(t *testing.T, base string) {
+				ticket := coreRawTicket("AIRA-1", "duplicate owner")
+				writeCoreTicketFile(t, filepath.Join(base, ".aira", "tickets", "AIRA-1.md"), ticket)
+				writeCoreTicketFile(t, filepath.Join(base, ".aira", "tickets", "duplicate.md"), ticket)
+			},
+			wantPaths: []string{".aira/tickets/duplicate.md"},
+		},
+		{
+			name: "invalid id",
+			setup: func(t *testing.T, base string) {
+				writeCoreTicketFile(t, filepath.Join(base, ".aira", "tickets", "AIRA-1.md"), coreRawTicket("not-a-ticket-id", "invalid id"))
+			},
+			wantPaths: []string{".aira/tickets/AIRA-1.md"},
+		},
+		{
+			name: "unparseable file",
+			setup: func(t *testing.T, base string) {
+				path := filepath.Join(base, ".aira", "tickets", "AIRA-1.md")
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("malformed\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantPaths: []string{".aira/tickets/AIRA-1.md"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, base := coreTestStoreWithRoot(t)
+			tc.setup(t, base)
+			c := New(s)
+			for _, args := range []map[string]any{{"list": true}, {}} {
+				response := c.Do(context.Background(), Request{Verb: "ready", Args: args})
+				if !response.OK || response.Code != "UNEVALUATED" || response.Exit != 3 {
+					t.Fatalf("ready args=%#v response = %#v", args, response)
+				}
+				var data struct {
+					Rows  []map[string]any `json:"rows"`
+					Total int              `json:"total"`
+				}
+				marshalRoundTrip(t, response.Data, &data)
+				if data.Total != 1 || len(data.Rows) != 1 {
+					t.Fatalf("ready args=%#v data = %#v", args, data)
+				}
+				findingData, ok := data.Rows[0]["findings"].([]any)
+				if !ok || len(findingData) != 1 {
+					t.Fatalf("ready args=%#v findings = %#v", args, data.Rows[0]["findings"])
+				}
+				var finding struct {
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				}
+				marshalRoundTrip(t, findingData[0], &finding)
+				if finding.Code != "U_RELATION_GRAPH_UNESTABLISHED" {
+					t.Fatalf("ready args=%#v finding = %#v", args, finding)
+				}
+				for _, path := range tc.wantPaths {
+					if !strings.Contains(finding.Message, path) {
+						t.Fatalf("ready args=%#v finding message %q does not name %q", args, finding.Message, path)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestReadyCleanProjectListRemainsPassThroughCore(t *testing.T) {
+	s := coreTestStore(t)
+	c := New(s)
+	create := c.Do(context.Background(), Request{Verb: "create", Args: map[string]any{"title": "clean"}})
+	if !create.OK {
+		t.Fatalf("create: %#v", create)
+	}
+	response := c.Do(context.Background(), Request{Verb: "ready", Args: map[string]any{"list": true}})
+	if !response.OK || response.Code != "PASS" || response.Exit != 0 {
+		t.Fatalf("clean ready --list response = %#v", response)
+	}
+}
+
+func TestCoreDanglingRelationContractThroughDispatch(t *testing.T) {
+	s, base := coreTestStoreWithRoot(t)
+	c := New(s)
+	create := func(title string) string {
+		t.Helper()
+		response := c.Do(context.Background(), Request{Verb: "create", Args: map[string]any{"title": title}})
+		if !response.OK {
+			t.Fatalf("create %s: %#v", title, response)
+		}
+		var data map[string]any
+		marshalRoundTrip(t, response.Data, &data)
+		return data["id"].(string)
+	}
+	owner, target := create("dangling owner"), create("dangling target")
+	if response := c.Do(context.Background(), Request{Verb: "link", Args: map[string]any{
+		"from": owner, "kind": "blocks", "to": target,
+	}}); !response.OK {
+		t.Fatalf("link: %#v", response)
+	}
+	if err := os.Remove(filepath.Join(base, ".aira", "tickets", target+".md")); err != nil {
+		t.Fatal(err)
+	}
+
+	if response := c.Do(context.Background(), Request{Verb: "show", Args: map[string]any{"selector": owner}}); !response.OK {
+		t.Fatalf("show owner with dangling relation: %#v", response)
+	}
+	if response := c.Do(context.Background(), Request{Verb: "set", Args: map[string]any{
+		"selector": owner, "field": "label", "value": "edited",
+	}}); !response.OK {
+		t.Fatalf("set owner with dangling relation: %#v", response)
+	}
+	if response := c.Do(context.Background(), Request{Verb: "mv", Args: map[string]any{
+		"selector": owner, "status": "in-progress",
+	}}); !response.OK {
+		t.Fatalf("mv owner with dangling relation: %#v", response)
+	}
+	if response := c.Do(context.Background(), Request{Verb: "link", Args: map[string]any{
+		"from": owner, "kind": "blocks", "to": "AIRA-999",
+	}}); response.OK || response.Code != "E_NOT_FOUND" || response.Exit == 0 {
+		t.Fatalf("link missing target response = %#v", response)
+	}
+	if response := c.Do(context.Background(), Request{Verb: "unlink", Args: map[string]any{
+		"from": owner, "kind": "blocks", "to": target,
+	}}); !response.OK {
+		t.Fatalf("unlink dangling relation: %#v", response)
+	}
+}
+
 type readyRecordsStore struct {
 	Store
 	records []store.ReadyRecord
@@ -530,6 +667,27 @@ func marshalRoundTrip(t *testing.T, value any, target any) {
 		t.Fatal(err)
 	}
 	if err := json.Unmarshal(data, target); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func coreRawTicket(id, title string) domain.Ticket {
+	return domain.Ticket{Schema: 1, ID: id, Project: "core-project", Title: title,
+		Status: domain.StatusPlanned, Kind: domain.KindFeature, Severity: domain.SeverityP2, Labels: []string{}}
+}
+
+func writeCoreTicketFile(t *testing.T, path string, ticket domain.Ticket) {
+	t.Helper()
+	data, err := json.Marshal(ticket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := append([]byte("---\n"), data...)
+	content = append(content, []byte("\n---\nbody\n")...)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, content, 0o644); err != nil {
 		t.Fatal(err)
 	}
 }

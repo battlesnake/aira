@@ -229,6 +229,9 @@ func (s *Store) Relations(id string) ([]domain.RelationView, error) {
 }
 
 func (s *Store) derivedRelationViews(id string) ([]domain.RelationView, error) {
+	// Relation integrity is surfaced as non-fatal W_RELATION_* warnings here;
+	// Fable's final-gate decision enforces it for relation-creating writes and
+	// check/ready, but not for reads or edits.
 	views, _, err := s.derivedRelationViewsWithWarnings(id)
 	return views, err
 }
@@ -476,12 +479,26 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 	}
 	if !hasSelector {
 		for _, finding := range findings {
+			// With no valid rows, an unparseable file leaves the blocker graph
+			// unevaluated; do not let its per-file fail projection mask that
+			// overall verdict. Valid rows retain their existing degradation.
+			if finding.Code == "E_CONFIG_INVALID" && graphUnevaluated && len(rows) == 0 {
+				continue
+			}
 			if finding.Code == "E_RELATION_INVALID" || finding.Code == "E_CROSS_PROJECT_RELATION" || finding.Code == "E_RELATION_UNOBSERVABLE" || finding.Code == "E_CONFIG_INVALID" {
 				if !findingAlreadyRepresented(result, finding) {
 					result = append(result, ReadyRecord{Ticket: TicketRecord{Path: finding.Subject, WorktreeID: s.worktreeID}, Ready: false, Verdict: "fail", Findings: []CheckFinding{finding}})
 				}
 			}
 		}
+	}
+	if graphUnevaluated && !hasSelector && !findingAlreadyRepresented(result, canonicalScanFinding) {
+		result = append(result, ReadyRecord{
+			Ticket:   TicketRecord{Path: canonicalScanFinding.Subject, WorktreeID: s.worktreeID},
+			Ready:    false,
+			Verdict:  "unevaluated",
+			Findings: []CheckFinding{canonicalScanFinding},
+		})
 	}
 	sortReadyRecords(result)
 	return result, nil
