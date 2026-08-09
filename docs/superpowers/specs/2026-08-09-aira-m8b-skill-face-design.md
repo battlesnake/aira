@@ -53,7 +53,7 @@ M8b delivers:
    operation-level content as one Markdown document, a small authored preamble
    (what AIRA is + the honesty contract) followed by fully generated sections.
 
-Both artifacts must state, from generated `store` data, that responses carry
+Both artifacts must state, from `core.ResponseContract()`, that responses carry
 **stable AIRA codes**, that verdicts are `pass`/`fail`/`unevaluated`, that
 **`unevaluated` is not a pass and not zero**, and the exit-code mapping.
 
@@ -286,7 +286,7 @@ behaviour), cross-checked against real `Do()` output (invariant 7, §6.9).
 | Generated text drifts from dispatch table | Golden action-set == `Include` set; per-action arg/summary goldens; consistency test fails on missing metadata. |
 | "Includable" silently coupled to MCP | Explicit `Include` field; one shared predicate for both faces (invariant 1). |
 | Version churns / misses generator changes | Version = hash of generated artifact bytes; idempotency golden (invariant 6). |
-| Exit/stable-code prose drifts from `store` | Generated from `store`; not authored (invariant 7). |
+| Exit/stable-code prose drifts from implementation | Sourced from the single exported `core.ResponseContract()` and cross-checked against real `Do()` output; not authored (invariant 7, §6.9). |
 | "Installable/invokable" unproven | End-to-end test runs each documented argv through `Run` against a temp project; asserts stable code + sane exit, not a parse error (invariant 8). |
 | Guide-only masquerades as deliverable | Manifest presence + host/entrypoint contract + full enumeration asserted; prose alone fails. |
 
