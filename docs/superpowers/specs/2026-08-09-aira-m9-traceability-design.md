@@ -46,24 +46,28 @@ dimension resolves to exactly one verdict per the crisp contract:
 | A `covers:`/`verifies:` annotation targets a requirement ID that does not exist | `E_TRACE_DANGLING` | **fail** | `check` **fails** (a broken reference), but no write is refused |
 | An **established** requirement whose status expects an edge lacks `covers` / `verifies` | `W_TRACE_UNCOVERED` / `W_TRACE_UNVERIFIED` | **warning** | overall **stays pass**; a warning is never a fail and never `unevaluated` |
 | The scan cannot run/complete, the worktree snapshot is uncertain, **or the requirement registry is empty** | `U_TRACE_UNSCANNED` / `U_TRACE_EMPTY` | **unevaluated** | dimension `unevaluated`; **never a vacuous pass** |
-| A requirement **node** file is unreadable / ID-mismatched (its own integrity, not an edge) | `E_REQUIREMENT_INVALID` (node-integrity) + the node is treated as **unestablished** | node → **unevaluated**, not "missing" | that node's edges resolve to `unevaluated`, **not** `E_TRACE_DANGLING` (Sol P0 honesty) |
+| A requirement **node** file is unreadable / ID-mismatched (its own integrity, not an edge) | `E_REQUIREMENT_INVALID` (node-integrity, a **`fail` finding** — a broken entity, exactly like a malformed ticket) | overall **fail** (any `Findings` entry forces fail, as today — intended) | edges pointing at that node resolve to **`unevaluated`**, **not** `E_TRACE_DANGLING` (Sol P0 honesty) |
 
 Key honesty rules:
 - A **dangling edge** (annotation → truly-absent requirement) is a `fail` — the
   traceability analogue of a relation to a non-existent ticket — but unlike M3
   integrity it refuses **no** operation (the annotation lives in code, not an
   AIRA write).
-- A **malformed requirement node** is *not* a dangling edge. An annotation that
-  points at a requirement whose *file* is unreadable/ID-mismatched resolves to
-  `unevaluated` (we cannot establish the node), and the node emits its own
-  `E_REQUIREMENT_INVALID`. "Missing node" (`fail`) and "unreadable node"
-  (`unevaluated`) are distinguished.
-- **Warnings never flip the overall verdict to fail, and are never reported as
-  unevaluated.** Mixed states coexist (a run can hold a fail edge, a warning, and
-  an unevaluated node simultaneously); the overall verdict follows the existing
-  `check` precedence (any fail → fail; else any unevaluated → surfaced as
-  unevaluated dimension; warnings are orthogonal), asserted by a mixed-precedence
-  test.
+- A **malformed requirement node** is *not* a dangling edge. The node itself is a
+  concrete broken entity → an `E_REQUIREMENT_INVALID` **`fail`** finding (forcing
+  overall `fail`, exactly as a malformed ticket does; this "any `Findings` entry ⇒
+  overall fail" behaviour is intended, Sol P1). Separately, any annotation that
+  points at that unreadable node resolves to **`unevaluated`** (we cannot
+  establish the node) rather than `E_TRACE_DANGLING`. So: a *missing* node makes
+  its edges **dangling/fail**; an *unreadable* node is a node **fail** whose edges
+  are **unevaluated** — the two are never conflated.
+- **Verdict folding (Sol-endorsed):** one overall precedence `fail > unevaluated >
+  pass`, with **independent per-dimension values preserved** (traceability is not
+  split into a separate report to avoid masking). **Warnings never flip the
+  overall verdict to fail, and are never reported as unevaluated.** Mixed states
+  coexist; a mixed-precedence test asserts that an unrelated integrity `fail` and
+  a traceability `unevaluated`/`warning` remain simultaneously visible in their
+  own dimensions.
 
 ### 3.1 Status → edge expectation (Sol P1)
 
@@ -91,22 +95,45 @@ allocation **materialises to a ticket file**: `check` (`check.go:119-149`) reads
 each allocation and, if `state='allocated'`, demands a materialised **ticket**
 file and parses `path` as a ticket (`E_ID_UNRESOLVED: allocation file contains …`).
 
-M9 adds an **entity kind** to allocation:
-- Add a `kind TEXT NOT NULL DEFAULT 'ticket'` column to `allocations` (default
-  preserves every existing row and back-compat).
-- `AllocateID` becomes kind-aware (`AllocateID(ctx, kind, prefix)`, with a
-  `kind='ticket'` shim for existing callers, or a dedicated
-  `AllocateRequirementID`); the materialisation update and the crash-recovery
-  reconstruction (`store.go:~1340`) carry the kind.
-- `check`'s allocation verification branches on kind: a `kind='requirement'`
+M9 adds an **entity kind** to allocation. Crucially, `kind` must be durable
+**everywhere the allocation is reconstructed from**, not just the DB column — the
+DB is rebuildable from the git-common-dir receipts/journal, so a `kind` that lives
+only in the DB would be lost on rebuild and a requirement allocation would come
+back as the default ticket (Sol P0 recovery).
+
+- **DB:** add `kind TEXT NOT NULL DEFAULT 'ticket'` to `allocations` (default
+  preserves every existing row).
+- **Durable receipt + event:** add `Kind` to `AllocationReceipt` (currently
+  `{ProjectID, WorktreeID, ID, Path, Seq, At, State}`) and to the allocation
+  event, **set at allocate time**. On read, a **missing `Kind` defaults to
+  `ticket`** (back-compat for every pre-M9 receipt/event). `ensureReceiptAllocation`
+  and `ensureAllocationEvent` (and the `store.go:~1340` reconstruction) carry and
+  restore `kind`; DB rebuild from receipts reconstructs the correct kind. **`kind`
+  ↔ `path` is validated** at materialise (a `requirement` allocation must
+  materialise under `.aira/requirements/`, a `ticket` under `.aira/tickets/`).
+- **`AllocateID`** becomes kind-aware (derives kind from the prefix registry, see
+  below; existing callers unchanged). The materialisation update carries the kind.
+- **`check`'s allocation verification** branches on kind: a `kind='requirement'`
   allocation must materialise to `.aira/requirements/<ID>.md` parsed as a
-  **requirement** (not a ticket); the "no materialised ticket file" /
-  `E_ID_UNRESOLVED` messages become kind-correct.
+  **requirement**; the "no materialised ticket file" / `E_ID_UNRESOLVED` messages
+  become kind-correct.
+
+**Namespace / prefix registry (Sol P0 namespace).** Allocation identity stays
+`(project, prefix, number)`; kind is a **property of the prefix**, because
+**prefixes are disjoint by kind** — a prefix belongs to exactly one kind. The
+current ticket-oriented registry (`s.prefixes map[string]bool`, the
+`prefix_ownership` table, and the registry entry's `Prefixes []string`) becomes
+**kind-tagged**: each registered prefix records its kind, a prefix may not be
+re-registered under a different kind, and `AllocateID` looks up the kind from the
+prefix. The migration **registers `AR` as a `requirement` prefix** and seeds its
+high-water so `req add` yields `AR-8` (a kind column alone does not register the
+prefix — Sol).
 
 This is the `make id`→`aira id` generalisation the repo flagged; it is
-correctness-critical (allocation/recovery/materialisation) → adversarial
-verification with durable crash-window counterexamples (mirrors the M5 F1
-migration work).
+correctness-critical (allocation/recovery/materialisation/prefix-ownership) →
+adversarial verification with durable crash-window counterexamples incl. a
+**DB-loss-then-rebuild** test that asserts a requirement allocation returns as a
+requirement, not a ticket (mirrors the M5 F1 migration work).
 
 ### 4.2 Requirement entity (`internal/domain`)
 
@@ -126,11 +153,16 @@ enforced** (the file `AR-3.md` must contain `id: "AR-3"`).
   files (mirrors findings).
 - **Migration:** `aira req import <REQUIREMENTS.md>` (a deterministic one-time
   seed, mirroring `aira import` for findings) parses the seed table and, for each
-  `AR-N`, writes `.aira/requirements/AR-N.md` **preserving the ID** and registers
-  a `kind='requirement'` allocation at number N so the high-water mark advances
-  (next `aira req add` → `AR-8`). Idempotent (re-import of an unchanged row is a
-  no-op; a changed row is surfaced, never silently overwritten). This is the only
-  way existing IDs enter — `req add` alone cannot recreate `AR-1..7`.
+  `AR-N`, materialises `.aira/requirements/AR-N.md` **preserving the ID** and
+  registers a `kind='requirement'` allocation at number N so the high-water mark
+  advances (next `aira req add` → `AR-8`). **It uses the same atomic
+  file/outbox/allocation/receipt/journal protocol as ticket creation** (Sol P1),
+  so a crash mid-import can never leave (i) a materialised requirement file with
+  no durable allocation evidence, or (ii) an allocation whose receipt/journal
+  lost its `kind`. Idempotent (re-import of an unchanged row is a no-op; a changed
+  row is surfaced, never silently overwritten). Import-specific crash-window tests
+  cover the die-points; allocator-unit tests do not. This is the only way existing
+  IDs enter — `req add` alone cannot recreate `AR-1..7`.
 
 ### 4.4 The `aira req` verb (`internal/core`)
 
@@ -185,17 +217,25 @@ requirement registry** → `U_TRACE_EMPTY`/`unevaluated` (the exact Phase-0
    `.aira/requirements/<ID>.md` and `check` accepts it; a ticket allocation is
    unaffected; **crash-window** counterexamples (die between allocate and
    materialise, both directions) recover correctly — reproduced end-to-end.
+1b. **Durable-kind recovery (Sol P0):** allocate a requirement ID, **drop the DB
+   and rebuild from receipts/journal**, and assert the allocation returns as
+   `requirement` (not the default ticket); a pre-M9 receipt with no `kind` field
+   rebuilds as `ticket` (back-compat); `kind`↔`path` mismatch is rejected.
 2. Requirement entity round-trip: `NewRequirement` validates the status enum +
    non-empty text + ID shape; `ParseRequirement`∘render == identity with
    **JSON-in-`---`** frontmatter; malformed frontmatter and filename↔id mismatch
    are refused writes.
 3. Store CRUD + index + reconcile rebuild; status transition validates the enum.
 4. Migration: `req import REQUIREMENTS.md` seeds `AR-1..7` with preserved IDs,
-   advances the allocator (next `req add` → `AR-8`), is idempotent, and never
-   silently overwrites a changed row.
-5. Allocator namespace/path: requirement and ticket prefixes do not collide;
-   allocation `path`/`kind` are correct; a spy asserts `req add` uses the
-   allocator (no hand-picked ID).
+   advances the allocator (next `req add` → `AR-8`), is idempotent, never
+   silently overwrites a changed row, and — **import-specific crash-window tests
+   (Sol P1)** — a crash at each die-point leaves no materialised requirement
+   without durable allocation evidence and no allocation whose receipt/journal
+   lost `kind`.
+5. Allocator namespace/path: ticket and requirement prefixes are **disjoint by
+   kind** (a prefix cannot be re-registered under a different kind); allocation
+   `path`/`kind` are correct; a spy asserts `req add` uses the allocator (no
+   hand-picked ID).
 
 **9b**
 6. Edge discovery: fixture set (single, multi-ID, whitespace, string-literal
@@ -210,9 +250,12 @@ requirement registry** → `U_TRACE_EMPTY`/`unevaluated` (the exact Phase-0
 10. Malformed-node resolution: an annotation to a requirement whose file is
     unreadable/ID-mismatched ⇒ `unevaluated` + `E_REQUIREMENT_INVALID`, **not**
     `E_TRACE_DANGLING`.
-11. Mixed precedence: a run holding a dangling `fail`, a `built`-uncovered
-    warning, and an unreadable-node `unevaluated` ⇒ overall **fail**, warning not
-    reclassified, unevaluated surfaced.
+11. Mixed precedence (Sol): a run holding an **unrelated integrity fail** (e.g. a
+    duplicate-id in a different dimension), a `built`-uncovered traceability
+    warning, and a traceability `unevaluated` ⇒ overall **fail** by precedence,
+    but **all three dimension values remain independently visible** (the
+    traceability warning/unevaluated is neither masked by nor reclassified as the
+    unrelated fail).
 12. Advisory, not integrity: a dangling annotation does not refuse a `req`/ticket
     write; only `check` surfaces it.
 
