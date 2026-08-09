@@ -11,15 +11,26 @@ M9 makes the **requirement** a first-class git-durable entity and turns the
 `covers:`/`verifies:` annotation convention into an enforced — but **advisory** —
 traceability graph check. It is Phase 3's data-model foundation.
 
-It builds in **two phases** (each gated), because the allocator work is
-correctness-critical and independent of the scan:
+It builds as **three separately-gated milestones** (Sol-recommended split — the
+allocator work is correctness-critical and independent, and must land and be
+gated *before* anything depends on it):
 
-- **9a — foundation:** make the ID allocator entity-kind-aware, add the
-  Requirement entity + store CRUD + index + reconcile, and **migrate the seed
-  `AR-1..7` requirements** into `.aira/requirements/` with preserved IDs.
-- **9b — traceability check:** discover `covers:`/`verifies:` edges from code and
-  fold a traceability dimension into `aira check` with the honest tri-state
-  verdict contract.
+- **M9a — entity-kind-aware ID allocation infrastructure** *(gated + merged
+  first)*: make allocation kind-aware end to end — durable `kind` in the receipt
+  and authenticated event, a kind-tagged prefix registry with a **transactional**
+  schema migration/backfill, kind↔path validation, and prefix-kind consistency
+  enforced on allocate, rebuild, and import (disagreement ⇒ `E_JOURNAL_CORRUPT`).
+  Correctness-critical → full two-loop + DB-loss-rebuild + crash-window
+  counterexamples. Built by Opus directly (crash-recovery core).
+- **M9b — requirement entity + CRUD + `AR-1..7` import migration** *(after 9a)*:
+  the Requirement domain type, store CRUD, and the atomic `req import` seed.
+- **M9c — covers/verifies traceability graph check** *(after 9b)*: edge discovery
+  + the check dimension + the §3 verdict contract. Sol judged the check folding +
+  verdict contract "otherwise sound."
+
+§§3–5 below are the whole design; the **M9a slice is §4.1 plus its tests
+(§7.1/1b/5)**. This document is the shared design; each milestone is planned,
+gated, and merged on its own.
 
 ## 2. Non-goals / explicit deferrals
 
@@ -129,6 +140,32 @@ prefix. The migration **registers `AR` as a `requirement` prefix** and seeds its
 high-water so `req add` yields `AR-8` (a kind column alone does not register the
 prefix — Sol).
 
+**Kind consistency + authority (Sol P0).** The **prefix registry is the
+authority** for a prefix's kind. `kind` is redundantly present on the receipt,
+event, and DB row *for recovery*, and is **included in the event's authenticated
+payload/digest** so a lost/tampered kind is detectable. On any read/rebuild, the
+kind from prefix-registry, receipt, event, and path are **cross-validated**; a
+disagreement is **`E_JOURNAL_CORRUPT`** — the code never silently picks a winner.
+Legacy missing-kind ⇒ `ticket` is applied **only for prefixes still registered as
+`ticket`**; a missing-kind receipt for a prefix registered `requirement` is a
+conflict (`E_JOURNAL_CORRUPT`), not a silent downgrade.
+
+**Transactional prefix-registry migration (Sol P0; M5 F1 class).** Kind-tagging
+`prefix_ownership` and `s.prefixes` needs an **explicit transactional schema
+migration + backfill** — `CREATE TABLE IF NOT EXISTS` does **not** add a column
+to an existing table, so a bare `DEFAULT 'ticket'` never reaches pre-M9 rows.
+The migration adds the kind column in a transaction, backfills existing rows to
+`ticket`, and is crash-atomic (the exact M5 F1 lesson). The durable registry
+breadcrumb encodes `Prefixes []string`; add a **legacy decoder** (old = bare
+strings ⇒ `ticket`; new = kind-tagged) plus a migration test, or DB-loss recovery
+loses prefix kind.
+
+**Recovery invariant enforced everywhere (Sol P1).** Prefix-kind consistency is
+enforced not only in `AllocateID` but during **DB rebuild** and **imported-
+allocation registration** too, because allocation identity stays
+`(project, prefix, number)`; a manually-introduced or recovered mismatched
+allocation must be caught (`E_JOURNAL_CORRUPT`), not pass through.
+
 This is the `make id`→`aira id` generalisation the repo flagged; it is
 correctness-critical (allocation/recovery/materialisation/prefix-ownership) →
 adversarial verification with durable crash-window counterexamples incl. a
@@ -220,7 +257,19 @@ requirement registry** → `U_TRACE_EMPTY`/`unevaluated` (the exact Phase-0
 1b. **Durable-kind recovery (Sol P0):** allocate a requirement ID, **drop the DB
    and rebuild from receipts/journal**, and assert the allocation returns as
    `requirement` (not the default ticket); a pre-M9 receipt with no `kind` field
-   rebuilds as `ticket` (back-compat); `kind`↔`path` mismatch is rejected.
+   for a *ticket*-registered prefix rebuilds as `ticket` (back-compat); `kind`↔
+   `path` mismatch is rejected.
+1c. **Transactional prefix migration (Sol P0; M5 F1 class):** an existing pre-M9
+   DB (populated `prefix_ownership` with no kind column, bare-string registry
+   breadcrumbs) upgrades atomically — the column is added + existing rows
+   backfilled to `ticket` in a transaction, the legacy `[]string` breadcrumb
+   decodes to `ticket`, and a crash mid-migration leaves a recoverable DB
+   (reproduce both windows).
+1d. **Kind-consistency / `E_JOURNAL_CORRUPT`:** a receipt/event/DB/path kind that
+   disagrees with the prefix registry is rejected as `E_JOURNAL_CORRUPT` (no
+   silent winner) — asserted at `AllocateID`, at DB rebuild, and at imported-
+   allocation registration; a missing-kind receipt for a `requirement`-registered
+   prefix is a conflict, not a silent ticket downgrade.
 2. Requirement entity round-trip: `NewRequirement` validates the status enum +
    non-empty text + ID shape; `ParseRequirement`∘render == identity with
    **JSON-in-`---`** frontmatter; malformed frontmatter and filename↔id mismatch
