@@ -271,13 +271,13 @@ type FreeLease struct {
 func (FreeLease) leaseState() {}
 
 type HeldLease struct {
-	HolderTokenHash     [32]byte `json:"-"`
-	BootID              string   `json:"boot_id"`
-	LastHeartbeatMonoNS uint64   `json:"last_heartbeat_mono_ns"`
-	TTLNS               uint64   `json:"ttl_ns"`
-	Generation          uint64   `json:"generation"`
-	Actor               string   `json:"actor"`
-	Worktree            string   `json:"worktree"`
+	holderTokenHash     [32]byte
+	bootID              string
+	lastHeartbeatMonoNS uint64
+	ttlNS               uint64
+	generation          uint64
+	actor               string
+	worktree            string
 }
 
 func (HeldLease) leaseState() {}
@@ -317,23 +317,31 @@ func NewHeldLease(holderTokenHash []byte, bootID string, lastHeartbeatMonoNS uin
 		return HeldLease{}, errors.New("E_CONFIG_INVALID: empty lease token hash")
 	}
 	return HeldLease{
-		HolderTokenHash: hash, BootID: bootID, LastHeartbeatMonoNS: lastHeartbeatMonoNS,
-		TTLNS: uint64(ttlNS), Generation: generation, Actor: actor, Worktree: worktree,
+		holderTokenHash: hash, bootID: bootID, lastHeartbeatMonoNS: lastHeartbeatMonoNS,
+		ttlNS: uint64(ttlNS), generation: generation, actor: actor, worktree: worktree,
 	}, nil
 }
 
+func (h HeldLease) HolderTokenHash() [32]byte   { return h.holderTokenHash }
+func (h HeldLease) BootID() string              { return h.bootID }
+func (h HeldLease) LastHeartbeatMonoNS() uint64 { return h.lastHeartbeatMonoNS }
+func (h HeldLease) TTLNS() uint64               { return h.ttlNS }
+func (h HeldLease) Generation() uint64          { return h.generation }
+func (h HeldLease) Actor() string               { return h.actor }
+func (h HeldLease) Worktree() string            { return h.worktree }
+
 func (h HeldLease) valid() bool {
-	return h.HolderTokenHash != ([32]byte{}) && len(h.BootID) > 0 && h.TTLNS > 0 && h.Generation > 0 &&
-		strings.TrimSpace(h.BootID) != "" && strings.TrimSpace(h.Actor) != "" && strings.TrimSpace(h.Worktree) != ""
+	return h.holderTokenHash != ([32]byte{}) && len(h.bootID) > 0 && h.ttlNS > 0 && h.generation > 0 &&
+		strings.TrimSpace(h.bootID) != "" && strings.TrimSpace(h.actor) != "" && strings.TrimSpace(h.worktree) != ""
 }
 
 // IsLive is a pure function of the held state and the supplied clock sample.
 // It intentionally uses subtraction to make expiry safe across uint64 wrap.
 func (h HeldLease) IsLive(bootID string, monoNowNS uint64) bool {
-	if !h.valid() || h.BootID == "" || bootID == "" || h.BootID != bootID || monoNowNS < h.LastHeartbeatMonoNS {
+	if !h.valid() || h.bootID == "" || bootID == "" || h.bootID != bootID || monoNowNS < h.lastHeartbeatMonoNS {
 		return false
 	}
-	return monoNowNS-h.LastHeartbeatMonoNS < h.TTLNS
+	return monoNowNS-h.lastHeartbeatMonoNS < h.ttlNS
 }
 
 // Valid reports whether the lease contains a valid sum-type state.

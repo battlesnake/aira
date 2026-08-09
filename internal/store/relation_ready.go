@@ -15,6 +15,7 @@ import (
 
 type storedRelation struct {
 	Owner    string
+	Project  string
 	Path     string
 	Relation domain.Relation
 }
@@ -69,7 +70,7 @@ func scanStoredRelationsAt(root, worktreeID string) ([]storedRelation, map[strin
 			if domain.CanonicalRelationOwner(relation.From, relation.To) != ticket.Ticket.ID {
 				findings = append(findings, CheckFinding{Code: "E_RELATION_INVALID", Subject: relationSubject(relation), Message: "relation is not stored on its canonical lower-ID ticket", Kind: "fail"})
 			}
-			relations = append(relations, storedRelation{Owner: ticket.Ticket.ID, Path: ticket.Path, Relation: relation})
+			relations = append(relations, storedRelation{Owner: ticket.Ticket.ID, Project: ticket.Ticket.Project, Path: ticket.Path, Relation: relation})
 		}
 	}
 	return relations, byID, findings, nil
@@ -272,8 +273,8 @@ func relationIndexKey(relation storedRelation) string {
 	return string(relation.Relation.Kind) + "\x00" + relation.Relation.From + "\x00" + relation.Relation.To
 }
 
-func relationIndexRecordKey(relation storedRelation) string {
-	return relationIndexKey(relation) + "\x00" + relation.Owner + "\x00" + filepath.Clean(relation.Path)
+func relationIndexRecordKey(root string, relation storedRelation) string {
+	return relationIndexKey(relation) + "\x00" + relation.Owner + "\x00" + repoPath(root, relation.Path)
 }
 
 func (s *Store) indexedRelations() ([]storedRelation, error) {
@@ -288,7 +289,7 @@ func (s *Store) indexedRelations() ([]storedRelation, error) {
 		if err := rows.Scan(&kind, &from, &to, &path); err != nil {
 			return nil, err
 		}
-		result = append(result, storedRelation{Owner: strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)), Path: path, Relation: domain.Relation{Kind: domain.RelationKind(kind), From: from, To: to}})
+		result = append(result, storedRelation{Owner: strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)), Project: s.projectSlug, Path: path, Relation: domain.Relation{Kind: domain.RelationKind(kind), From: from, To: to}})
 	}
 	return result, rows.Err()
 }
@@ -304,23 +305,23 @@ func (s *Store) relationIndexDivergence() ([]CheckFinding, error) {
 	}
 	expected := make(map[string]storedRelation, len(canonical))
 	for _, relation := range canonical {
-		expected[relationIndexRecordKey(relation)] = relation
+		expected[relationIndexRecordKey(s.root, relation)] = relation
 	}
 	actual := make(map[string]storedRelation, len(indexed))
 	for _, relation := range indexed {
-		actual[relationIndexRecordKey(relation)] = relation
+		actual[relationIndexRecordKey(s.root, relation)] = relation
 	}
 	var findings []CheckFinding
 	for key, relation := range expected {
 		if _, ok := actual[key]; !ok {
 			findings = append(findings, CheckFinding{Code: "E_RELATION_INDEX_DIVERGENCE", Subject: relationSubject(relation.Relation),
-				Message: "canonical relation is missing from the derived index", Kind: relationIndexFindingKind(relation)})
+				Message: "canonical relation is missing from the derived index", Kind: relationIndexFindingKind(s.root, relation)})
 		}
 	}
 	for key, relation := range actual {
 		if _, ok := expected[key]; !ok {
 			findings = append(findings, CheckFinding{Code: "E_RELATION_INDEX_DIVERGENCE", Subject: relationSubject(relation.Relation),
-				Message: "derived relation index row is absent from canonical files", Kind: relationIndexFindingKind(relation)})
+				Message: "derived relation index row is absent from canonical files", Kind: relationIndexFindingKind(s.root, relation)})
 		}
 	}
 	sort.Slice(findings, func(i, j int) bool {
@@ -332,8 +333,8 @@ func (s *Store) relationIndexDivergence() ([]CheckFinding, error) {
 	return findings, nil
 }
 
-func relationIndexFindingKind(relation storedRelation) string {
-	data, err := readRegularTicket(relation.Path)
+func relationIndexFindingKind(root string, relation storedRelation) string {
+	data, err := readRegularTicket(repoAbsolutePath(root, relation.Path))
 	if err != nil {
 		return "fail"
 	}
@@ -404,7 +405,7 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 	if err != nil {
 		return nil, err
 	}
-	canonicalEndpointFindings := canonicalFindingsForIndexedRelations(s.root, scanFindings, indexedRelations)
+	canonicalEndpointFindings := canonicalFindingsForIndexedRelations(s.root, scanFindings, indexedRelations, byID)
 	for i := range indexFindings {
 		// The canonical files determine readiness. A stale derived row is
 		// surfaced here as a warning, but must not make a canonical-ready
@@ -417,13 +418,6 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 		rowFindings := findingsForReadyRow(row, findings, relations)
 		for _, finding := range canonicalEndpointFindings[row.Ticket.ID] {
 			rowFindings = appendUniqueFinding(rowFindings, finding)
-		}
-		hasFailFinding := false
-		for _, finding := range rowFindings {
-			if finding.Kind == "fail" {
-				hasFailFinding = true
-				break
-			}
 		}
 		blockers := make([]domain.RelationView, 0)
 		if row.Ticket.ID != "" {
@@ -440,10 +434,22 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 				}
 			}
 		}
-		isReady := row.Ticket.ID != "" && workable(row.Ticket.Status) && !row.Ticket.Hold && len(blockers) == 0 && !hasFailFinding
+		hasFailFinding := false
+		hasUnevaluatedFinding := false
+		for _, finding := range rowFindings {
+			switch finding.Kind {
+			case "fail":
+				hasFailFinding = true
+			case "unevaluated":
+				hasUnevaluatedFinding = true
+			}
+		}
+		isReady := row.Ticket.ID != "" && workable(row.Ticket.Status) && !row.Ticket.Hold && len(blockers) == 0 && !hasFailFinding && !hasUnevaluatedFinding
 		verdict := "pass"
 		if hasFailFinding {
 			verdict = "fail"
+		} else if hasUnevaluatedFinding {
+			verdict = "unevaluated"
 		}
 		item := ReadyRecord{Ticket: row, Ready: isReady, Blockers: blockers, Verdict: verdict, Findings: rowFindings}
 		if hasSelector || isReady || len(rowFindings) > 0 {
@@ -463,20 +469,34 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 	return result, nil
 }
 
-// canonicalFindingsForIndexedRelations uses the disposable index only to
-// attribute an existing canonical scan failure to affected endpoints. The
-// canonical failure remains the readiness cause; a missing canonical file has
-// no scan finding and therefore cannot be promoted by this helper.
-func canonicalFindingsForIndexedRelations(root string, scanFindings []CheckFinding, indexed []storedRelation) map[string][]CheckFinding {
+// canonicalFindingsForIndexedRelations uses the disposable index only as an
+// uncertainty hint. It never promotes an index row into a readiness failure:
+// a missing owner file means the relation is gone, while a present malformed
+// owner file means the relation cannot currently be evaluated.
+func canonicalFindingsForIndexedRelations(root string, scanFindings []CheckFinding, indexed []storedRelation, byID map[string]domain.Ticket) map[string][]CheckFinding {
 	result := make(map[string][]CheckFinding)
 	for _, relation := range indexed {
+		owner := domain.CanonicalRelationOwner(relation.Relation.From, relation.Relation.To)
+		if _, ok := byID[relationEndpointKey(relation.Project, owner)]; ok {
+			continue
+		}
 		path := repoPath(root, relation.Path)
+		malformed := false
 		for _, finding := range scanFindings {
-			if finding.Subject != path {
-				continue
+			if finding.Code == "E_CONFIG_INVALID" && finding.Subject == path {
+				malformed = true
+				break
 			}
-			result[relation.Relation.From] = appendUniqueFinding(result[relation.Relation.From], finding)
-			result[relation.Relation.To] = appendUniqueFinding(result[relation.Relation.To], finding)
+		}
+		if !malformed {
+			continue
+		}
+		finding := CheckFinding{Code: "U_RELATION_OWNER_UNREADABLE", Subject: relationSubject(relation.Relation),
+			Message: "readiness cannot be established: relation owner file is malformed", Kind: "unevaluated"}
+		for _, endpoint := range []string{relation.Relation.From, relation.Relation.To} {
+			if _, ok := byID[relationEndpointKey(relation.Project, endpoint)]; ok {
+				result[endpoint] = appendUniqueFinding(result[endpoint], finding)
+			}
 		}
 	}
 	return result
@@ -597,7 +617,7 @@ func (s *Store) leaseFileOrphanWarnings(ctx context.Context, report *CheckReport
 		}
 		var active int
 		var root string
-		err = s.db.QueryRowContext(ctx, `SELECT active, root FROM worktrees WHERE project_id=? AND worktree_id=?`, s.projectID, held.Worktree).Scan(&active, &root)
+		err = s.db.QueryRowContext(ctx, `SELECT active, root FROM worktrees WHERE project_id=? AND worktree_id=?`, s.projectID, held.Worktree()).Scan(&active, &root)
 		if errors.Is(err, sql.ErrNoRows) || active == 0 || fileMissing(root) {
 			addWarning(report, CheckFinding{Code: "W_ORPHAN_WORKTREE", Subject: ticketID, Message: "live lease holder worktree is missing or inactive", Kind: "warning"}, "orphan-worktree")
 		} else if err != nil {

@@ -78,7 +78,7 @@ func TestLeaseSumTypeLivenessAndCASPredicates(t *testing.T) {
 		t.Fatal(err)
 	}
 	held, ok := claim.Lease.Held()
-	if !ok || !held.IsLive(clock.boot, clock.mono) || held.Actor != "alice" || held.Worktree != "worktree-a" {
+	if !ok || !held.IsLive(clock.boot, clock.mono) || held.Actor() != "alice" || held.Worktree() != "worktree-a" {
 		t.Fatalf("held sum type = %#v", claim.Lease)
 	}
 	if claim.Token == "" || claim.Token == "expired" {
@@ -113,7 +113,7 @@ func TestLeaseSumTypeLivenessAndCASPredicates(t *testing.T) {
 		t.Fatal(err)
 	}
 	newHeld, _ := stolen.Lease.Held()
-	if newHeld.Generation != held.Generation+1 || stolen.Token == claim.Token || newHeld.Actor != "bob" {
+	if newHeld.Generation() != held.Generation()+1 || stolen.Token == claim.Token || newHeld.Actor() != "bob" {
 		t.Fatalf("steal generation/token = old=%#v new=%#v", held, newHeld)
 	}
 	clock.boot = "boot-b"
@@ -228,12 +228,12 @@ func TestConcurrentExpiredClaimersHaveOneWinnerAndNextGeneration(t *testing.T) {
 			if !ok {
 				t.Fatal("winning claim was not held")
 			}
-			winningGeneration = held.Generation
+			winningGeneration = held.Generation()
 		} else if ErrorCode(result.err) != "E_LEASE_HELD" {
 			t.Fatalf("losing claim error = %v", result.err)
 		}
 	}
-	if wins != 1 || winningGeneration == firstHeld.Generation || winningGeneration != 2 {
+	if wins != 1 || winningGeneration == firstHeld.Generation() || winningGeneration != 2 {
 		t.Fatalf("concurrent claim outcomes: wins=%d generation=%d first=%#v", wins, winningGeneration, first.Lease)
 	}
 }
@@ -289,7 +289,7 @@ func TestStalePreLockClockCannotProduceSecondWinner(t *testing.T) {
 			t.Fatal(err)
 		}
 		held, ok := lease.Held()
-		if !ok || held.Generation != 1 {
+		if !ok || held.Generation() != 1 {
 			t.Fatalf("stale pre-lock contender changed lease generation: %#v", lease)
 		}
 	})
@@ -305,7 +305,7 @@ func TestStalePreLockClockCannotProduceSecondWinner(t *testing.T) {
 			t.Fatal(err)
 		}
 		held, ok := lease.Held()
-		if !ok || held.Generation != 1 {
+		if !ok || held.Generation() != 1 {
 			t.Fatalf("stale in-lock contender changed lease generation: %#v", lease)
 		}
 	})
@@ -360,7 +360,7 @@ func TestLeaseSchemaAndRowValidationRejectCorruption(t *testing.T) {
 	}
 }
 
-func TestReadyFailsClosedWhenIndexedPrerequisiteOwnerIsMalformed(t *testing.T) {
+func TestReadyIsUnevaluatedWhenIndexedPrerequisiteOwnerIsMalformed(t *testing.T) {
 	s, _, _ := m3Store(t)
 	prerequisite := m3Ticket(t, s, "prerequisite")
 	dependent := m3Ticket(t, s, "dependent")
@@ -374,8 +374,35 @@ func TestReadyFailsClosedWhenIndexedPrerequisiteOwnerIsMalformed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0].Ready || rows[0].Verdict != "fail" || len(rows[0].Findings) == 0 {
-		t.Fatalf("malformed prerequisite was treated as ready: %#v", rows)
+	if len(rows) != 1 || rows[0].Ready || rows[0].Verdict != "unevaluated" || !hasFinding(rows[0].Findings, "U_RELATION_OWNER_UNREADABLE") {
+		t.Fatalf("malformed prerequisite readiness was over-asserted: %#v", rows)
+	}
+}
+
+func TestReadyUnevaluatedWhenStaleIndexOwnerIsMalformedAfterRelationRemoval(t *testing.T) {
+	s, _, _ := m3Store(t)
+	prerequisite := m3Ticket(t, s, "removed relation owner")
+	dependent := m3Ticket(t, s, "dependent")
+	if _, err := s.Link(context.Background(), prerequisite.ID, domain.RelationBlocks, dependent.ID); err != nil {
+		t.Fatal(err)
+	}
+	withoutRelation := rawM3Ticket(t, domain.Ticket{Schema: 1, ID: prerequisite.ID, Project: prerequisite.Project,
+		Title: prerequisite.Title, Status: prerequisite.Status, Kind: prerequisite.Kind, Severity: prerequisite.Severity,
+		Labels: []string{}, Relations: nil}, "body\n")
+	ownerPath := filepath.Join(s.root, ".aira", "tickets", prerequisite.ID+".md")
+	if err := os.WriteFile(ownerPath, withoutRelation, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ownerPath, []byte("malformed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.Ready(dependent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Ready || rows[0].Verdict != "unevaluated" || hasFinding(rows[0].Findings, "E_RELATION_INDEX_DIVERGENCE") == false || hasFinding(rows[0].Findings, "U_RELATION_OWNER_UNREADABLE") == false {
+		t.Fatalf("stale malformed owner was treated as a definite result: %#v", rows)
 	}
 }
 
@@ -432,6 +459,51 @@ func TestRelationsDerivedIndexMaterialisesAndRebuilds(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("rebuilt relations index count = %d, want stale row deleted", count)
+	}
+}
+
+func TestRelationIndexCanonicalFileIsRepoRelativeAcrossRootSpellings(t *testing.T) {
+	s, _, base := m3Store(t)
+	prerequisite := m3Ticket(t, s, "relative index owner")
+	dependent := m3Ticket(t, s, "relative index dependent")
+	if _, err := s.Link(context.Background(), prerequisite.ID, domain.RelationBlocks, dependent.ID); err != nil {
+		t.Fatal(err)
+	}
+	var canonicalFile string
+	if err := s.db.QueryRow(`SELECT canonical_file FROM relations WHERE project_id=? AND worktree_id=?`, s.projectID, s.worktreeID).Scan(&canonicalFile); err != nil {
+		t.Fatal(err)
+	}
+	wantPath := filepath.ToSlash(filepath.Join(".aira", "tickets", prerequisite.ID+".md"))
+	if canonicalFile != wantPath || filepath.IsAbs(filepath.FromSlash(canonicalFile)) {
+		t.Fatalf("canonical relation path = %q, want repo-relative %q", canonicalFile, wantPath)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	alias := base + "-alias"
+	if err := os.Symlink(base, alias); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(context.Background(), Options{
+		Root: alias, CommonDir: filepath.Join(alias, "common"),
+		DBPath: filepath.Join(alias, "state", "state.db"), RegistryPath: filepath.Join(alias, "state", "registry.jsonl"),
+		LeaseStateDir: filepath.Join(alias, "lease-state"), ProjectID: "project-aira", WorktreeID: "worktree-a",
+		ProjectSlug: "aira", Prefixes: []string{"AIRA"}, Clock: &m3Clock{boot: "boot-a", mono: 100}, LeaseTTLNS: 900,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := os.WriteFile(filepath.Join(alias, ".aira", "tickets", prerequisite.ID+".md"), []byte("malformed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := reopened.Ready(dependent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Ready || rows[0].Verdict != "unevaluated" || !hasFinding(rows[0].Findings, "U_RELATION_OWNER_UNREADABLE") {
+		t.Fatalf("reopened root lost malformed-owner attribution: %#v", rows)
 	}
 }
 
@@ -647,7 +719,7 @@ func TestReleaseAndStealRacePreservesWinningToken(t *testing.T) {
 	}
 	winnerHash := sha256.Sum256(winnerBytes)
 	held, ok := lease.Held()
-	if !ok || (held.Generation != 2 && held.Generation != 3) || held.HolderTokenHash != winnerHash {
+	if !ok || (held.Generation() != 2 && held.Generation() != 3) || held.HolderTokenHash() != winnerHash {
 		t.Fatalf("final lease/token generation = %#v", lease)
 	}
 	if token, err := s.LeaseToken(ticket.ID); err != nil || token != steal.claim.Token {

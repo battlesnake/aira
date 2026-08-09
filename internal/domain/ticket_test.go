@@ -5,6 +5,7 @@ package domain
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -51,12 +52,34 @@ func TestLeaseConstructorsRejectIllegalHeldStatesAndNilLeaseIsNeither(t *testing
 	if _, ok := zero.Free(); ok {
 		t.Fatal("nil-state lease reports Free")
 	}
-	invalid := Lease{TicketID: "AIRA-1", State: HeldLease{BootID: "boot-a", TTLNS: 900, Generation: 1, Actor: "actor", Worktree: "worktree"}}
+	invalid := Lease{TicketID: "AIRA-1", State: HeldLease{}}
 	if invalid.Valid() {
 		t.Fatal("unvalidated held lease is valid")
 	}
 	if _, ok := invalid.Held(); ok {
 		t.Fatal("unvalidated held lease reports Held")
+	}
+}
+
+func TestHeldLeaseFieldsAreSealedAndGettersPreserveConstruction(t *testing.T) {
+	typ := reflect.TypeOf(HeldLease{})
+	for i := 0; i < typ.NumField(); i++ {
+		if typ.Field(i).PkgPath == "" {
+			t.Fatalf("HeldLease field %q is exported", typ.Field(i).Name)
+		}
+	}
+	hash := bytes.Repeat([]byte{0x42}, 32)
+	held, err := NewHeldLease(hash, "boot-a", 100, 900, 7, "actor", "worktree")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held.Generation() != 7 || held.BootID() != "boot-a" || held.LastHeartbeatMonoNS() != 100 || held.TTLNS() != 900 || held.Actor() != "actor" || held.Worktree() != "worktree" {
+		t.Fatalf("held getters = generation %d boot %q heartbeat %d ttl %d actor %q worktree %q", held.Generation(), held.BootID(), held.LastHeartbeatMonoNS(), held.TTLNS(), held.Actor(), held.Worktree())
+	}
+	returnedHash := held.HolderTokenHash()
+	returnedHash[0] = 0
+	if held.HolderTokenHash()[0] == 0 || !held.IsLive("boot-a", 100) {
+		t.Fatal("getter exposed mutable held lease state")
 	}
 }
 

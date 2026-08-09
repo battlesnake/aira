@@ -243,7 +243,7 @@ func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor st
 			if isHeld && !steal {
 				return ErrLeaseExpired
 			}
-			generation := currentHeld.Generation + 1
+			generation := currentHeld.Generation() + 1
 			if !isHeld {
 				free, _ := current.Free()
 				generation = free.Generation + 1
@@ -309,7 +309,7 @@ func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor st
 		_ = os.Remove(tokenTemp)
 		return LeaseClaim{}, errors.New("E_CONFIG_INVALID: claim committed a non-held lease")
 	}
-	if err := s.commitLeaseToken(ctx, ticketID, tokenTemp, held.Generation, hash); err != nil {
+	if err := s.commitLeaseToken(ctx, ticketID, tokenTemp, held.Generation(), hash); err != nil {
 		return result, err
 	}
 	if err := s.journalEvent(ctx, s.projectID, result.Event.Seq); err != nil {
@@ -342,7 +342,7 @@ func (s *Store) commitLeaseToken(ctx context.Context, ticketID, tempPath string,
 		return err
 	}
 	held, ok := lease.Held()
-	if !ok || held.Generation != generation || held.HolderTokenHash != hash {
+	if !ok || held.Generation() != generation || held.HolderTokenHash() != hash {
 		_ = os.Remove(tempPath)
 		return ErrLeaseHeld
 	}
@@ -391,10 +391,10 @@ func (s *Store) Release(ctx context.Context, ticketID, token string) (EventKey, 
 		if !ok || !held.IsLive(bootID, monoNS) {
 			return ErrLeaseExpired
 		}
-		if held.HolderTokenHash != hash {
+		if held.HolderTokenHash() != hash {
 			return ErrLeaseToken
 		}
-		generation := held.Generation + 1
+		generation := held.Generation() + 1
 		releasedGeneration = generation
 		sqlResult, err := conn.ExecContext(ctx, `UPDATE leases SET state='free', generation=?, holder_token_hash=NULL, boot_id=NULL,
                 last_heartbeat_mono_ns=NULL, ttl_ns=NULL, actor=NULL, worktree_id=NULL
@@ -414,7 +414,7 @@ func (s *Store) Release(ctx context.Context, ticketID, token string) (EventKey, 
 		if err != nil {
 			return err
 		}
-		if err := insertEventActor(ctx, conn, s.projectID, seq, held.Actor, "lease.release", ticketID); err != nil {
+		if err := insertEventActor(ctx, conn, s.projectID, seq, held.Actor(), "lease.release", ticketID); err != nil {
 			return err
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO outbox(project_id, seq, worktree_id, path, verb,
@@ -469,7 +469,7 @@ func (s *Store) Heartbeat(ctx context.Context, ticketID, token string) (domain.L
 		if !ok || !held.IsLive(bootID, monoNS) {
 			return ErrLeaseExpired
 		}
-		if held.HolderTokenHash != hash {
+		if held.HolderTokenHash() != hash {
 			return ErrLeaseToken
 		}
 		sqlResult, err := conn.ExecContext(ctx, `UPDATE leases SET last_heartbeat_mono_ns=?
@@ -485,7 +485,8 @@ func (s *Store) Heartbeat(ctx context.Context, ticketID, token string) (domain.L
 			}
 			return ErrLeaseExpired
 		}
-		held, err = domain.NewHeldLease(held.HolderTokenHash[:], held.BootID, monoNS, int64(held.TTLNS), held.Generation, held.Actor, held.Worktree)
+		heldHash := held.HolderTokenHash()
+		held, err = domain.NewHeldLease(heldHash[:], held.BootID(), monoNS, int64(held.TTLNS()), held.Generation(), held.Actor(), held.Worktree())
 		if err != nil {
 			return err
 		}

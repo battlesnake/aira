@@ -438,6 +438,11 @@ func readyVerdict(rows []store.ReadyRecord) string {
 			return "fail"
 		}
 	}
+	for _, row := range rows {
+		if row.Verdict == "unevaluated" {
+			return "unevaluated"
+		}
+	}
 	return "pass"
 }
 

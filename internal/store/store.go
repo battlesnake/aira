@@ -624,17 +624,18 @@ func (s *Store) markMaterialised(ctx context.Context, intent Intent) error {
 		if err != nil {
 			return err
 		}
-		return replaceRelationIndex(ctx, conn, intent.ProjectID, intent.WorktreeID, ticket, intent.Path)
+		return replaceRelationIndex(ctx, conn, intent.ProjectID, intent.WorktreeID, ticket, s.root, intent.Path)
 	})
 }
 
-func replaceRelationIndex(ctx context.Context, conn *sql.Conn, projectID, worktreeID string, ticket domain.Ticket, path string) error {
-	if _, err := conn.ExecContext(ctx, `DELETE FROM relations WHERE project_id=? AND worktree_id=? AND canonical_file=?`, projectID, worktreeID, path); err != nil {
+func replaceRelationIndex(ctx context.Context, conn *sql.Conn, projectID, worktreeID string, ticket domain.Ticket, root, path string) error {
+	canonicalFile := repoPath(root, path)
+	if _, err := conn.ExecContext(ctx, `DELETE FROM relations WHERE project_id=? AND worktree_id=? AND canonical_file=?`, projectID, worktreeID, canonicalFile); err != nil {
 		return err
 	}
 	for _, relation := range ticket.Relations {
 		if _, err := conn.ExecContext(ctx, `INSERT INTO relations(project_id, worktree_id, kind, from_id, to_id, canonical_file)
-			VALUES(?, ?, ?, ?, ?, ?)`, projectID, worktreeID, relation.Kind, relation.From, relation.To, path); err != nil {
+			VALUES(?, ?, ?, ?, ?, ?)`, projectID, worktreeID, relation.Kind, relation.From, relation.To, canonicalFile); err != nil {
 			return err
 		}
 	}
@@ -1016,7 +1017,7 @@ func (s *Store) Rebuild(ctx context.Context) error {
 				ticket.Ticket.Status, boolInt(ticket.Ticket.Hold), ticket.Ticket.Title, ticket.Ticket.Kind, ticket.Ticket.Severity); err != nil {
 				return err
 			}
-			if err := replaceRelationIndex(ctx, conn, s.projectID, ticket.WorktreeID, ticket.Ticket, ticket.Path); err != nil {
+			if err := replaceRelationIndex(ctx, conn, s.projectID, ticket.WorktreeID, ticket.Ticket, s.root, ticket.Path); err != nil {
 				return err
 			}
 			var allocationSeq int64

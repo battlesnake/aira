@@ -25,6 +25,38 @@ func TestReadyIntegrityFailureHasFailureVerdictAndExit(t *testing.T) {
 	}
 }
 
+func TestReadyVerdictExitPrecedence(t *testing.T) {
+	for name, records := range map[string][]store.ReadyRecord{
+		"unevaluated over pass": {
+			{Ticket: store.TicketRecord{Ticket: domain.Ticket{ID: "AIRA-1"}}, Ready: false, Verdict: "pass"},
+			{Ticket: store.TicketRecord{Ticket: domain.Ticket{ID: "AIRA-2"}}, Ready: false, Verdict: "unevaluated"},
+		},
+		"fail over unevaluated": {
+			{Ticket: store.TicketRecord{Ticket: domain.Ticket{ID: "AIRA-1"}}, Ready: false, Verdict: "unevaluated"},
+			{Ticket: store.TicketRecord{Ticket: domain.Ticket{ID: "AIRA-2"}}, Ready: false, Verdict: "fail"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := New(readyRecordsStore{Store: coreTestStore(t), records: records})
+			response := c.Do(context.Background(), Request{Verb: "ready", Args: map[string]any{}})
+			wantCode, wantExit := "UNEVALUATED", 3
+			if name == "fail over unevaluated" {
+				wantCode, wantExit = "FAIL", 1
+			}
+			if response.Code != wantCode || response.Exit != wantExit {
+				t.Fatalf("ready precedence response = %#v, want %s/%d", response, wantCode, wantExit)
+			}
+		})
+	}
+}
+
+type readyRecordsStore struct {
+	Store
+	records []store.ReadyRecord
+}
+
+func (s readyRecordsStore) Ready(string) ([]store.ReadyRecord, error) { return s.records, nil }
+
 func TestDoUsesOneSerializableDispatchSurface(t *testing.T) {
 	s := coreTestStore(t)
 	c := New(s)

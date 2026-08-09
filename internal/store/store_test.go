@@ -424,7 +424,7 @@ func TestConcurrentLeaseClaimersAcrossShortLivedProcesses(t *testing.T) {
 		t.Fatal(err)
 	}
 	heldLease, ok := lease.Held()
-	if !ok || heldLease.Generation != 2 {
+	if !ok || heldLease.Generation() != 2 {
 		t.Fatalf("final process lease = %#v, want one steal at generation 2", lease)
 	}
 }

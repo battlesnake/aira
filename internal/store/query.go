@@ -308,11 +308,21 @@ func (s *Store) indexedDigests() (map[string]string, error) {
 }
 
 func repoPath(root, path string) string {
+	if !filepath.IsAbs(filepath.FromSlash(path)) {
+		return filepath.ToSlash(filepath.Clean(filepath.FromSlash(path)))
+	}
 	rel, err := filepath.Rel(root, path)
 	if err != nil {
 		return filepath.ToSlash(path)
 	}
 	return filepath.ToSlash(rel)
+}
+
+func repoAbsolutePath(root, path string) string {
+	if filepath.IsAbs(filepath.FromSlash(path)) {
+		return filepath.FromSlash(path)
+	}
+	return filepath.Join(root, filepath.FromSlash(path))
 }
 
 func readRegularTicket(path string) ([]byte, error) {
