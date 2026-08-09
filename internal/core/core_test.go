@@ -217,6 +217,88 @@ func TestDispatchesM3CoordinationVerbsThroughCore(t *testing.T) {
 	}
 }
 
+func TestLeaseJSONShapeThroughCoreClaimAndHeartbeat(t *testing.T) {
+	s := coreTestStore(t)
+	c := New(s)
+	created := c.Do(context.Background(), Request{Verb: "create", Args: map[string]any{"title": "lease JSON"}})
+	if !created.OK {
+		t.Fatalf("create: %#v", created)
+	}
+	var createdData map[string]any
+	marshalRoundTrip(t, created.Data, &createdData)
+	id := createdData["id"].(string)
+
+	claim := c.Do(context.Background(), Request{Verb: "claim", Args: map[string]any{"selector": id, "actor": "core"}})
+	if !claim.OK {
+		t.Fatalf("claim: %#v", claim)
+	}
+	assertHeldLeaseJSON(t, claim.Data, "lease")
+
+	heartbeat := c.Do(context.Background(), Request{Verb: "heartbeat", Args: map[string]any{"selector": id}})
+	if !heartbeat.OK {
+		t.Fatalf("heartbeat: %#v", heartbeat)
+	}
+	assertHeldLeaseJSON(t, heartbeat.Data, "")
+}
+
+func assertHeldLeaseJSON(t *testing.T, value any, nestedLeaseKey string) {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal lease response: %v", err)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil {
+		t.Fatalf("decode lease response %q: %v", data, err)
+	}
+	if nestedLeaseKey != "" {
+		leaseData, ok := object[nestedLeaseKey]
+		if !ok {
+			t.Fatalf("lease response has no %q: %s", nestedLeaseKey, data)
+		}
+		var leaseObject map[string]json.RawMessage
+		if err := json.Unmarshal(leaseData, &leaseObject); err != nil {
+			t.Fatalf("decode nested lease %q: %v", leaseData, err)
+		}
+		object = leaseObject
+	}
+	var stateHolder struct {
+		TicketID string                     `json:"ticket_id"`
+		State    map[string]json.RawMessage `json:"state"`
+	}
+	leaseData, err := json.Marshal(object)
+	if err != nil {
+		t.Fatalf("remarshal lease response: %v", err)
+	}
+	if err := json.Unmarshal(leaseData, &stateHolder); err != nil {
+		t.Fatalf("decode lease: %v", err)
+	}
+	if stateHolder.TicketID == "" || len(stateHolder.State) != 6 {
+		t.Fatalf("lease JSON shape = %s", leaseData)
+	}
+	var state struct {
+		BootID              string `json:"boot_id"`
+		LastHeartbeatMonoNS uint64 `json:"last_heartbeat_mono_ns"`
+		TTLNS               uint64 `json:"ttl_ns"`
+		Generation          uint64 `json:"generation"`
+		Actor               string `json:"actor"`
+		Worktree            string `json:"worktree"`
+	}
+	stateData, err := json.Marshal(stateHolder.State)
+	if err != nil {
+		t.Fatalf("remarshal state: %v", err)
+	}
+	if err := json.Unmarshal(stateData, &state); err != nil {
+		t.Fatalf("decode state: %v", err)
+	}
+	if state.BootID == "" || state.LastHeartbeatMonoNS == 0 || state.TTLNS == 0 || state.Generation == 0 || state.Actor == "" || state.Worktree == "" {
+		t.Fatalf("held state JSON = %s", stateData)
+	}
+	if _, ok := stateHolder.State["holder_token_hash"]; ok {
+		t.Fatalf("lease JSON exposed holder token hash: %s", leaseData)
+	}
+}
+
 func TestListOverflowIncludesDistributionAndTotal(t *testing.T) {
 	s := coreTestStore(t)
 	c := New(s)

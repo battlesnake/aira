@@ -282,6 +282,24 @@ type HeldLease struct {
 
 func (HeldLease) leaseState() {}
 
+func (h HeldLease) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		BootID              string `json:"boot_id"`
+		LastHeartbeatMonoNS uint64 `json:"last_heartbeat_mono_ns"`
+		TTLNS               uint64 `json:"ttl_ns"`
+		Generation          uint64 `json:"generation"`
+		Actor               string `json:"actor"`
+		Worktree            string `json:"worktree"`
+	}{
+		BootID:              h.BootID(),
+		LastHeartbeatMonoNS: h.LastHeartbeatMonoNS(),
+		TTLNS:               h.TTLNS(),
+		Generation:          h.Generation(),
+		Actor:               h.Actor(),
+		Worktree:            h.Worktree(),
+	})
+}
+
 // NewFreeLease constructs the free state. Generation zero is the initial
 // state for a ticket that has never been claimed; subsequent free states carry
 // the generation after release.

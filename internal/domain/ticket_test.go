@@ -83,6 +83,52 @@ func TestHeldLeaseFieldsAreSealedAndGettersPreserveConstruction(t *testing.T) {
 	}
 }
 
+func TestHeldLeaseJSONPreservesPreSealingShapeWithoutTokenHash(t *testing.T) {
+	hash := bytes.Repeat([]byte{0x42}, 32)
+	held, err := NewHeldLease(hash, "boot-a", 100, 900, 7, "actor", "worktree")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(Lease{TicketID: "AIRA-1", State: held})
+	if err != nil {
+		t.Fatalf("marshal lease: %v", err)
+	}
+	var encoded struct {
+		TicketID string                     `json:"ticket_id"`
+		State    map[string]json.RawMessage `json:"state"`
+	}
+	if err := json.Unmarshal(data, &encoded); err != nil {
+		t.Fatalf("decode lease JSON %q: %v", data, err)
+	}
+	if encoded.TicketID != "AIRA-1" {
+		t.Fatalf("ticket_id = %q", encoded.TicketID)
+	}
+	if len(encoded.State) != 6 {
+		t.Fatalf("held state fields = %#v, want exactly the six public lease fields", encoded.State)
+	}
+	var state struct {
+		BootID              string `json:"boot_id"`
+		LastHeartbeatMonoNS uint64 `json:"last_heartbeat_mono_ns"`
+		TTLNS               uint64 `json:"ttl_ns"`
+		Generation          uint64 `json:"generation"`
+		Actor               string `json:"actor"`
+		Worktree            string `json:"worktree"`
+	}
+	stateData, err := json.Marshal(encoded.State)
+	if err != nil {
+		t.Fatalf("remarshal held state: %v", err)
+	}
+	if err := json.Unmarshal(stateData, &state); err != nil {
+		t.Fatalf("decode held state: %v", err)
+	}
+	if state.BootID != "boot-a" || state.LastHeartbeatMonoNS != 100 || state.TTLNS != 900 || state.Generation != 7 || state.Actor != "actor" || state.Worktree != "worktree" {
+		t.Fatalf("held state = %#v", state)
+	}
+	if _, ok := encoded.State["holder_token_hash"]; ok {
+		t.Fatalf("held state exposed holder token hash: %s", data)
+	}
+}
+
 func TestTicketRoundTripAndCanonicalRelationOrder(t *testing.T) {
 	ticket := Ticket{
 		ID:       "AIRA-42",
