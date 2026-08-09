@@ -272,10 +272,21 @@ func validateConfig(config Config) error {
 		}
 		seen[prefix] = true
 	}
-	if config.Lease.TTLSeconds != 0 && (config.Lease.TTLSeconds < 60 || config.Lease.TTLSeconds > 86400) {
+	ttlSeconds := config.Lease.TTLSeconds
+	if ttlSeconds == 0 {
+		ttlSeconds = 900
+	}
+	if ttlSeconds <= 0 || ttlSeconds < 60 || ttlSeconds > 86400 {
 		return errors.New("E_CONFIG_INVALID: lease ttl is outside the permitted range")
 	}
-	if config.Lease.HeartbeatSeconds != 0 && config.Lease.TTLSeconds != 0 && config.Lease.HeartbeatSeconds >= config.Lease.TTLSeconds {
+	heartbeatSeconds := config.Lease.HeartbeatSeconds
+	if heartbeatSeconds == 0 {
+		heartbeatSeconds = 30
+	}
+	if heartbeatSeconds <= 0 {
+		return errors.New("E_CONFIG_INVALID: heartbeat must be positive")
+	}
+	if heartbeatSeconds >= ttlSeconds {
 		return errors.New("E_CONFIG_INVALID: heartbeat must be shorter than ttl")
 	}
 	return nil

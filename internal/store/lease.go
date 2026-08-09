@@ -16,6 +16,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// covers: AR-5, AR-6, AR-7
+
 const (
 	defaultLeaseTTLNS = uint64(15 * 60 * 1000 * 1000 * 1000)
 	maxInt64Uint      = uint64(^uint64(0) >> 1)
@@ -179,7 +181,7 @@ func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor st
 	if err := domain.ValidateID(ticketID); err != nil {
 		return LeaseClaim{}, err
 	}
-	if _, err := s.Get(ticketID); err != nil {
+	if err := s.ticketExists(ticketID); err != nil {
 		return LeaseClaim{}, err
 	}
 	if actor == "" {
@@ -329,14 +331,29 @@ func (s *Store) writeLeaseTokenTemp(ticketID, token string) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", err
 	}
-	tmp := path + ".tmp-" + token
-	if err := os.WriteFile(tmp, []byte(token+"\n"), 0o600); err != nil {
+	file, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-")
+	if err != nil {
+		return "", err
+	}
+	tmp := file.Name()
+	removeTemp := true
+	defer func() {
+		if removeTemp {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if _, err := file.WriteString(token + "\n"); err != nil {
+		_ = file.Close()
 		return "", err
 	}
 	if err := os.Chmod(tmp, 0o600); err != nil {
-		_ = os.Remove(tmp)
+		_ = file.Close()
 		return "", err
 	}
+	if err := file.Close(); err != nil {
+		return "", err
+	}
+	removeTemp = false
 	return tmp, nil
 }
 
@@ -360,6 +377,12 @@ func (s *Store) commitLeaseToken(ctx context.Context, ticketID, tempPath string,
 }
 
 func (s *Store) Release(ctx context.Context, ticketID, token string) (EventKey, error) {
+	if err := domain.ValidateID(ticketID); err != nil {
+		return EventKey{}, err
+	}
+	if err := s.ticketExists(ticketID); err != nil {
+		return EventKey{}, err
+	}
 	if token == "" {
 		return EventKey{}, ErrLeaseToken
 	}
@@ -449,6 +472,12 @@ func (s *Store) Release(ctx context.Context, ticketID, token string) (EventKey, 
 }
 
 func (s *Store) Heartbeat(ctx context.Context, ticketID, token string) (domain.Lease, error) {
+	if err := domain.ValidateID(ticketID); err != nil {
+		return domain.Lease{}, err
+	}
+	if err := s.ticketExists(ticketID); err != nil {
+		return domain.Lease{}, err
+	}
 	tokenBytes, err := base64.RawURLEncoding.DecodeString(token)
 	if err != nil || len(tokenBytes) != 32 {
 		return domain.Lease{}, ErrLeaseToken

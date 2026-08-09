@@ -13,6 +13,8 @@ import (
 	"aira/internal/domain"
 )
 
+// covers: AR-5, AR-6, AR-7
+
 type storedRelation struct {
 	Owner    string
 	Project  string
@@ -57,14 +59,14 @@ func scanStoredRelationsAt(root, worktreeID, project string) ([]storedRelation, 
 				if endpointHasOtherProject(byID, relation.From, ticket.Ticket.Project) {
 					findings = append(findings, CheckFinding{Code: "E_CROSS_PROJECT_RELATION", Subject: relationSubject(relation), Message: "relation source ticket belongs to another project", Kind: "fail"})
 				} else {
-					findings = append(findings, CheckFinding{Code: "E_RELATION_TARGET_MISSING", Subject: relation.From, Message: "relation source ticket is missing", Kind: "fail"})
+					findings = append(findings, CheckFinding{Code: "E_RELATION_TARGET_MISSING", Subject: relationSubject(relation), Message: "relation source ticket is missing", Kind: "fail"})
 				}
 			}
 			if _, ok := byID[toKey]; !ok {
 				if endpointHasOtherProject(byID, relation.To, ticket.Ticket.Project) {
 					findings = append(findings, CheckFinding{Code: "E_CROSS_PROJECT_RELATION", Subject: relationSubject(relation), Message: "relation target ticket belongs to another project", Kind: "fail"})
 				} else {
-					findings = append(findings, CheckFinding{Code: "E_RELATION_TARGET_MISSING", Subject: relation.To, Message: "relation target ticket is missing", Kind: "fail"})
+					findings = append(findings, CheckFinding{Code: "E_RELATION_TARGET_MISSING", Subject: relationSubject(relation), Message: "relation target ticket is missing", Kind: "fail"})
 				}
 			}
 			if domain.CanonicalRelationOwner(relation.From, relation.To) != ticket.Ticket.ID {
@@ -89,9 +91,12 @@ func (s *Store) scanStoredRelations() ([]storedRelation, map[string]domain.Ticke
 	return scanStoredRelationsAt(s.root, s.worktreeID, s.projectSlug)
 }
 
-func relationIntegrityError(findings []CheckFinding) error {
+func relationIntegrityError(findings []CheckFinding, id string) error {
 	for _, finding := range findings {
-		if finding.Code == "E_RELATION_TARGET_MISSING" || finding.Code == "E_RELATION_INVALID" || finding.Code == "E_CROSS_PROJECT_RELATION" || finding.Code == "E_RELATION_UNOBSERVABLE" {
+		if finding.Code != "E_RELATION_TARGET_MISSING" && finding.Code != "E_RELATION_INVALID" && finding.Code != "E_CROSS_PROJECT_RELATION" && finding.Code != "E_RELATION_UNOBSERVABLE" {
+			continue
+		}
+		if finding.Subject == id || relationFindingHasEndpoint(finding, id) {
 			return fmt.Errorf("%s: %s", finding.Code, finding.Message)
 		}
 	}
@@ -184,12 +189,6 @@ func (s *Store) Unlink(ctx context.Context, from string, kind domain.RelationKin
 	if !kind.IsForward() {
 		return EventKey{}, errors.New("E_RELATION_INVALID: inverse relation kinds are query-only")
 	}
-	if _, err := s.Get(from); err != nil {
-		return EventKey{}, err
-	}
-	if _, err := s.Get(to); err != nil {
-		return EventKey{}, errors.New("E_RELATION_TARGET_MISSING: relation target ticket does not exist")
-	}
 	owner := domain.CanonicalRelationOwner(from, to)
 	path := s.ticketPath(owner)
 	data, err := readRegularTicket(path)
@@ -246,7 +245,7 @@ func (s *Store) derivedRelationViews(id string) ([]domain.RelationView, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := relationIntegrityError(findings); err != nil {
+	if err := relationIntegrityError(findings, id); err != nil {
 		return nil, err
 	}
 	views := make([]domain.RelationView, 0)
@@ -406,6 +405,7 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 		return nil, err
 	}
 	canonicalEndpointFindings := canonicalFindingsForIndexedRelations(s.root, scanFindings, indexedRelations, byID)
+	canonicalScanFinding, graphUnevaluated := canonicalScanUnevaluatedFinding(scanFindings)
 	for i := range indexFindings {
 		// The canonical files determine readiness. A stale derived row is
 		// surfaced here as a warning, but must not make a canonical-ready
@@ -418,6 +418,9 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 		rowFindings := findingsForReadyRow(row, findings, relations)
 		for _, finding := range canonicalEndpointFindings[row.Ticket.ID] {
 			rowFindings = appendUniqueFinding(rowFindings, finding)
+		}
+		if graphUnevaluated && row.Ticket.ID != "" {
+			rowFindings = appendUniqueFinding(rowFindings, canonicalScanFinding)
 		}
 		blockers := make([]domain.RelationView, 0)
 		if row.Ticket.ID != "" {
@@ -467,6 +470,36 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 	}
 	sortReadyRecords(result)
 	return result, nil
+}
+
+func canonicalScanUnevaluatedFinding(scanFindings []CheckFinding) (CheckFinding, bool) {
+	paths := make([]string, 0)
+	seen := make(map[string]bool)
+	for _, finding := range scanFindings {
+		if finding.Kind != "fail" || !unparseableTicketScanCode(finding.Code) || seen[finding.Subject] {
+			continue
+		}
+		seen[finding.Subject] = true
+		paths = append(paths, finding.Subject)
+	}
+	if len(paths) == 0 {
+		return CheckFinding{}, false
+	}
+	return CheckFinding{
+		Code:    "U_RELATION_GRAPH_UNESTABLISHED",
+		Subject: "ready",
+		Message: fmt.Sprintf("readiness cannot be established: unparseable ticket file(s) %s prevent establishing the blocker graph; any such file may declare a blocks relation to this ticket", strings.Join(paths, ", ")),
+		Kind:    "unevaluated",
+	}, true
+}
+
+func unparseableTicketScanCode(code string) bool {
+	switch code {
+	case "E_CONFIG_INVALID", "E_DUPLICATE_ID", "E_ID_INVALID":
+		return true
+	default:
+		return false
+	}
 }
 
 // canonicalFindingsForIndexedRelations uses the disposable index only as an
@@ -536,7 +569,7 @@ func findingsForReadyRow(row TicketRecord, findings []CheckFinding, relations []
 }
 
 func relationFindingHasEndpoint(finding CheckFinding, id string) bool {
-	if finding.Code != "E_CROSS_PROJECT_RELATION" && finding.Code != "E_RELATION_INVALID" && finding.Code != "E_RELATION_INDEX_DIVERGENCE" {
+	if finding.Code != "E_RELATION_TARGET_MISSING" && finding.Code != "E_CROSS_PROJECT_RELATION" && finding.Code != "E_RELATION_INVALID" && finding.Code != "E_RELATION_INDEX_DIVERGENCE" && finding.Code != "E_RELATION_UNOBSERVABLE" {
 		return false
 	}
 	parts := strings.Split(finding.Subject, ":")
@@ -631,9 +664,4 @@ func (s *Store) leaseFileOrphanWarnings(ctx context.Context, report *CheckReport
 		}
 	}
 	return rows.Err()
-}
-
-func (s *Store) relationPathExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
 }

@@ -1,3 +1,5 @@
+// verifies: AR-5, AR-6, AR-7
+
 package store
 
 import (
@@ -377,6 +379,64 @@ func TestReadyIsUnevaluatedWhenIndexedPrerequisiteOwnerIsMalformed(t *testing.T)
 	if len(rows) != 1 || rows[0].Ready || rows[0].Verdict != "unevaluated" || !hasFinding(rows[0].Findings, "U_RELATION_OWNER_UNREADABLE") {
 		t.Fatalf("malformed prerequisite readiness was over-asserted: %#v", rows)
 	}
+}
+
+func TestReadyUnevaluatedFromCanonicalScanBeforeAndAfterRebuild(t *testing.T) {
+	s, _, _ := m3Store(t)
+	prerequisite := m3Ticket(t, s, "canonical scan prerequisite")
+	dependent := m3Ticket(t, s, "canonical scan dependent")
+	if prerequisite.ID != "AIRA-1" || dependent.ID != "AIRA-2" {
+		t.Fatalf("test requires deterministic IDs, got %s and %s", prerequisite.ID, dependent.ID)
+	}
+	if _, err := s.Link(context.Background(), prerequisite.ID, domain.RelationBlocks, dependent.ID); err != nil {
+		t.Fatal(err)
+	}
+	ownerPath := filepath.Join(s.root, ".aira", "tickets", prerequisite.ID+".md")
+	if err := os.WriteFile(ownerPath, []byte("malformed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	assertUnevaluated := func(phase string, rows []ReadyRecord) {
+		t.Helper()
+		var found bool
+		for _, row := range rows {
+			if row.Ticket.Ticket.ID != dependent.ID {
+				continue
+			}
+			found = true
+			if row.Ready || row.Verdict != "unevaluated" || !hasFinding(row.Findings, "U_RELATION_GRAPH_UNESTABLISHED") {
+				t.Fatalf("%s readiness = %#v", phase, row)
+			}
+		}
+		if !found {
+			t.Fatalf("%s omitted dependent from ready output: %#v", phase, rows)
+		}
+	}
+
+	selected, err := s.Ready(dependent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertUnevaluated("selected before rebuild", selected)
+	listed, err := s.Ready("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertUnevaluated("list before rebuild", listed)
+
+	if _, err := s.Check(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	selected, err = s.Ready(dependent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertUnevaluated("selected after rebuild", selected)
+	listed, err = s.Ready("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertUnevaluated("list after rebuild", listed)
 }
 
 func TestReadyIsUnevaluatedWhenIndexedOwnerExistsButIsDuplicateOrHasMalformedID(t *testing.T) {
@@ -977,6 +1037,26 @@ func TestLeaseHeartbeatIsDBOnlyAndReleaseFreesSumType(t *testing.T) {
 	}
 }
 
+func TestLeaseTokenTempFilenameDoesNotContainClearToken(t *testing.T) {
+	s, _, _ := m3Store(t)
+	token := "clear-token-must-not-leak"
+	tempPath, err := s.writeLeaseTokenTemp("AIRA-1", token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(tempPath) })
+	if strings.Contains(filepath.Base(tempPath), token) {
+		t.Fatalf("lease token leaked in temp filename %q", tempPath)
+	}
+	data, err := os.ReadFile(tempPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(data)) != token {
+		t.Fatalf("temp token contents = %q", data)
+	}
+}
+
 func TestReleaseWithEmptyTokenReturnsTokenError(t *testing.T) {
 	s, clock, _ := m3Store(t)
 	ticket := m3Ticket(t, s, "empty release token")
@@ -1034,6 +1114,80 @@ func TestCanonicalRelationsDerivedInverseAndDuplicate(t *testing.T) {
 	views, err = s.Relations(first.ID)
 	if err != nil || len(views) != 0 {
 		t.Fatalf("relation removal = views=%#v err=%v", views, err)
+	}
+}
+
+func TestDanglingRelationDoesNotBrickUnrelatedTicketOrLease(t *testing.T) {
+	s, clock, _ := m3Store(t)
+	owner := m3Ticket(t, s, "dangling relation owner")
+	target := m3Ticket(t, s, "dangling relation target")
+	unrelated := m3Ticket(t, s, "unrelated ticket")
+	if _, err := s.Link(context.Background(), owner.ID, domain.RelationBlocks, target.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(s.root, ".aira", "tickets", target.ID+".md")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.Get(unrelated.ID); err != nil {
+		t.Fatalf("unrelated Get failed: %v", err)
+	}
+	claim, err := s.Claim(context.Background(), unrelated.ID, false, "holder")
+	if err != nil {
+		t.Fatalf("unrelated Claim failed: %v", err)
+	}
+	clock.mono = 200
+	if _, err := s.Heartbeat(context.Background(), unrelated.ID, claim.Token); err != nil {
+		t.Fatalf("unrelated Heartbeat failed: %v", err)
+	}
+	if _, err := s.Release(context.Background(), unrelated.ID, claim.Token); err != nil {
+		t.Fatalf("unrelated Release failed: %v", err)
+	}
+}
+
+func TestLeaseVerbsUseTicketExistenceNotRelationIntegrity(t *testing.T) {
+	s, clock, _ := m3Store(t)
+	owner := m3Ticket(t, s, "lease relation owner")
+	target := m3Ticket(t, s, "lease relation target")
+	if _, err := s.Link(context.Background(), owner.ID, domain.RelationBlocks, target.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(s.root, ".aira", "tickets", target.ID+".md")); err != nil {
+		t.Fatal(err)
+	}
+
+	claim, err := s.Claim(context.Background(), owner.ID, false, "holder")
+	if err != nil {
+		t.Fatalf("claim of existing ticket with broken relation failed: %v", err)
+	}
+	clock.mono = 200
+	if _, err := s.Heartbeat(context.Background(), owner.ID, claim.Token); err != nil {
+		t.Fatalf("heartbeat of existing ticket with broken relation failed: %v", err)
+	}
+	if _, err := s.Release(context.Background(), owner.ID, claim.Token); err != nil {
+		t.Fatalf("release of existing ticket with broken relation failed: %v", err)
+	}
+}
+
+func TestUnlinkRepairsRelationWithMissingTarget(t *testing.T) {
+	s, _, _ := m3Store(t)
+	owner := m3Ticket(t, s, "repair owner")
+	target := m3Ticket(t, s, "repair target")
+	if _, err := s.Link(context.Background(), owner.ID, domain.RelationBlocks, target.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(s.root, ".aira", "tickets", target.ID+".md")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Unlink(context.Background(), owner.ID, domain.RelationBlocks, target.ID); err != nil {
+		t.Fatalf("unlink missing target failed: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(s.root, ".aira", "tickets", owner.ID+".md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), `"kind":"blocks"`) {
+		t.Fatalf("unlink left dangling relation in owner file: %s", data)
 	}
 }
 

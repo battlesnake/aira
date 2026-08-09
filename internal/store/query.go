@@ -290,6 +290,16 @@ func (s *Store) exactRecord(id, anchor string) (TicketRecord, error) {
 	return record, nil
 }
 
+// ticketExists validates only the ticket file itself. Lease coordination uses
+// this lighter check so an unrelated relation-integrity finding cannot block it.
+func (s *Store) ticketExists(id string) error {
+	_, err := readRegularTicket(s.ticketPath(id))
+	if errors.Is(err, os.ErrNotExist) {
+		return errors.New("E_NOT_FOUND: selector matched no tickets")
+	}
+	return err
+}
+
 func (s *Store) indexedDigests() (map[string]string, error) {
 	rows, err := s.db.Query(`SELECT id, digest FROM tickets WHERE project_id=? AND worktree_id=?`, s.projectID, s.worktreeID)
 	if err != nil {

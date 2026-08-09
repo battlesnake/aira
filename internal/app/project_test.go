@@ -86,3 +86,35 @@ func TestInitFromSubdirectoryReportsPathsRelativeToCWD(t *testing.T) {
 		t.Fatalf("subdir init paths = %#v, want root=%q config=%q", result, wantRoot, wantConfig)
 	}
 }
+
+func TestValidateConfigRejectsInvalidLeaseTiming(t *testing.T) {
+	base := Config{
+		Schema:  1,
+		Project: ProjectConfig{Slug: "demo", Prefixes: []string{"DEMO"}},
+		Lease:   LeaseConfig{TTLSeconds: 900, HeartbeatSeconds: 30},
+	}
+	for name, config := range map[string]Config{
+		"negative heartbeat": func() Config {
+			config := base
+			config.Lease.HeartbeatSeconds = -1
+			return config
+		}(),
+		"negative ttl": func() Config {
+			config := base
+			config.Lease.TTLSeconds = -1
+			return config
+		}(),
+		"heartbeat exceeds effective default ttl": func() Config {
+			config := base
+			config.Lease.TTLSeconds = 0
+			config.Lease.HeartbeatSeconds = 3600
+			return config
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateConfig(config); err == nil || !strings.HasPrefix(err.Error(), "E_CONFIG_INVALID:") {
+				t.Fatalf("validateConfig(%s) = %v", name, err)
+			}
+		})
+	}
+}

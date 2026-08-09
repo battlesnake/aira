@@ -609,7 +609,7 @@ Every response has a stable `code`, a human message, structured details, and a
 | `E_CLOCK_UNAVAILABLE` | No cross-process monotonic clock is available. | unevaluated/error |
 | `E_LEASE_HELD` | Another live holder owns the ticket. | error |
 | `E_LEASE_TOKEN` | The supplied holder token does not match. | integrity fail |
-| `E_LEASE_EXPIRED` | The supplied heartbeat/release token is stale. | error |
+| `E_LEASE_EXPIRED` | A plain claim found an expired lease and needs `--steal`, or the supplied heartbeat/release token is for a never-claimed or expired lease. | error |
 | `W_AREA_OVERLAP` | Advisory area hints overlap a live claim. | warning |
 | `W_ORPHAN_WORKTREE` | A registered worktree path is missing or inactive. | warning |
 | `W_STALE_INDEX` | A derived index row was rebuilt from git content. | warning |
@@ -690,6 +690,13 @@ response for the query with `ready=false`, not a failed database operation.
 The ready query folds Phase-1 integrity checks and returns `unevaluated` when
 reconciliation could not establish the graph. It never treats an absent blocker
 as satisfied.
+
+Accepted M1 design note: deleted-blocker asymmetry is decided by the lower-ID
+canonical relation owner. If the owner-side file is missing, the relation is
+deleted and the dependent may be `ready` with a warning; if the dependent-side
+file is missing, the owner still declares a relation to a missing ticket and
+the integrity result is `fail`. This is an intentional consequence of storing
+relations on the lower-ID canonical ticket.
 
 ## 11. Phase-1 CLI and output contract
 
