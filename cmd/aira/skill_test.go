@@ -22,20 +22,22 @@ func TestSkillExamplesBuildCLIRequestsForEveryAction(t *testing.T) {
 	}
 	for _, action := range artifacts.Actions {
 		t.Run(action.Verb+"/"+action.Operation, func(t *testing.T) {
-			fields := strings.Fields(action.Command)
-			if len(fields) < 2 || fields[0] != "aira" {
-				t.Fatalf("command=%q", action.Command)
+			// Use the exact Argv tokens, not a re-split of the shell-quoted
+			// Command, so a metacharacter-bearing token (e.g. touch's glob) is
+			// tested as it is actually dispatched.
+			argv := action.Argv
+			if len(argv) < 1 || argv[0] != action.Verb {
+				t.Fatalf("argv=%v verb=%q", argv, action.Verb)
 			}
-			verb := fields[1]
-			positional, options, err := parseArgs(verb, fields[2:])
+			positional, options, err := parseArgs(argv[0], argv[1:])
 			if err != nil {
 				t.Fatal(err)
 			}
-			request, err := buildRequest(verb, positional, options)
+			request, err := buildRequest(argv[0], positional, options)
 			if err != nil {
-				t.Fatalf("command=%q: %v", action.Command, err)
+				t.Fatalf("argv=%v: %v", argv, err)
 			}
-			if request.Verb != verb {
+			if request.Verb != argv[0] {
 				t.Fatalf("request=%#v", request)
 			}
 		})
@@ -53,12 +55,12 @@ func TestSkillExamplesMatchMCPRequestsForEveryAction(t *testing.T) {
 	})
 	for _, action := range artifacts.Actions {
 		t.Run(action.Verb+"/"+action.Operation, func(t *testing.T) {
-			fields := strings.Fields(action.Command)
-			positional, options, err := parseArgs(fields[1], fields[2:])
+			argv := action.Argv
+			positional, options, err := parseArgs(argv[0], argv[1:])
 			if err != nil {
 				t.Fatal(err)
 			}
-			cli, err := buildRequest(fields[1], positional, options)
+			cli, err := buildRequest(argv[0], positional, options)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -188,12 +190,39 @@ func TestSkillExamplesReachCoreFromRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, action := range artifacts.Actions {
-		fields := strings.Fields(action.Command)
+	// A command "reached core" iff its JSON response carries a stable code that
+	// is not a pre-core parse / argument-construction failure. E_NOT_FOUND and
+	// other domain outcomes count as reaching core; the denylist is exactly the
+	// construction-failure codes the spec (§6.7) says must be rejected.
+	preCore := map[string]bool{
+		"E_SELECTOR_INVALID": true, "E_QUERY_INVALID": true, "E_ARGUMENT_INVALID": true,
+		"E_UNKNOWN_VERB": true, "E_ID_INVALID": true, "E_GLOB_INVALID": true,
+		"E_SELECTOR_AMBIGUOUS": true,
+	}
+	codeOf := func(argv []string) (string, int) {
 		var stdout, stderr bytes.Buffer
-		exit := Run(fields[1:], &stdout, &stderr)
-		if strings.Contains(stdout.String()+stderr.String(), "requires <") || strings.Contains(stdout.String()+stderr.String(), "option --") || strings.Contains(stdout.String()+stderr.String(), "requires one") {
-			t.Fatalf("action %s/%s did not reach core: exit=%d stdout=%q stderr=%q", action.Verb, action.Operation, exit, stdout.String(), stderr.String())
+		exit := Run(append(append([]string{}, argv...), "--json"), &stdout, &stderr)
+		var response struct {
+			Code string `json:"code"`
+		}
+		if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+			t.Fatalf("argv=%v: non-JSON response stdout=%q stderr=%q", argv, stdout.String(), stderr.String())
+		}
+		return response.Code, exit
+	}
+	// Negative control: a deliberately malformed command must be classified as
+	// NOT reaching core, proving the detector below is load-bearing rather than
+	// admitting parse errors (the M8a-era porous-substring bug).
+	if code, _ := codeOf([]string{"list", "ticket"}); !preCore[code] {
+		t.Fatalf("negative control failed: malformed 'list ticket' produced code=%q, detector is not load-bearing", code)
+	}
+	for _, action := range artifacts.Actions {
+		code, exit := codeOf(action.Argv)
+		if code == "" {
+			t.Fatalf("action %s/%s produced no stable code", action.Verb, action.Operation)
+		}
+		if preCore[code] {
+			t.Fatalf("action %s/%s did not reach core: code=%q exit=%d command=%q", action.Verb, action.Operation, code, exit, action.Command)
 		}
 		if exit < 0 || exit > 4 {
 			t.Fatalf("action %s/%s has insane exit=%d", action.Verb, action.Operation, exit)

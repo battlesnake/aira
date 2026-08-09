@@ -10,13 +10,17 @@ import (
 )
 
 // SkillAction is the operation-level projection shared by the manifest and
-// the generated guide.
+// the generated guide. Argv carries the exact tokens after `aira` (verb plus
+// the example arguments); Command is the human-readable, shell-safe rendering
+// of `aira` + Argv. Programmatic hosts should invoke Argv directly to avoid any
+// shell-quoting ambiguity.
 type SkillAction struct {
 	Verb      string      `json:"verb"`
 	Operation string      `json:"operation"`
 	Summary   string      `json:"summary"`
 	Safety    SafetyClass `json:"safety"`
 	Args      []ArgSpec   `json:"args"`
+	Argv      []string    `json:"argv"`
 	Command   string      `json:"command"`
 }
 
@@ -66,28 +70,37 @@ func GenerateSkillArtifacts(descriptors []DispatchDescriptor) (SkillArtifacts, e
 		Actions:          actions,
 	}
 	skillMD := []byte(renderSkillMarkdown(actions, contract))
-	versionInput, err := json.Marshal(struct {
-		Name             string               `json:"name"`
-		Entrypoint       SkillEntrypoint      `json:"entrypoint"`
-		Discovery        SkillDiscovery       `json:"discovery"`
-		ResponseContract ResponseContractSpec `json:"response_contract"`
-		Actions          []SkillAction        `json:"actions"`
-	}{
-		Name: manifest.Name, Entrypoint: manifest.Entrypoint, Discovery: manifest.Discovery,
-		ResponseContract: manifest.ResponseContract, Actions: manifest.Actions,
-	})
+	guide := []byte(renderGuideMarkdown(actions, contract))
+	version, err := skillVersion(manifest, skillMD, guide)
 	if err != nil {
-		return SkillArtifacts{}, fmt.Errorf("marshal manifest for version: %w", err)
+		return SkillArtifacts{}, err
 	}
-	hashInput := append(append([]byte(nil), versionInput...), skillMD...)
-	digest := sha256.Sum256(hashInput)
-	manifest.Version = hex.EncodeToString(digest[:])
+	manifest.Version = version
 	manifestJSON, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return SkillArtifacts{}, fmt.Errorf("marshal manifest: %w", err)
 	}
 	manifestJSON = append(manifestJSON, '\n')
-	return SkillArtifacts{SkillMD: skillMD, Guide: []byte(renderGuideMarkdown(actions, contract)), ManifestJSON: manifestJSON, Manifest: manifest, Actions: actions}, nil
+	return SkillArtifacts{SkillMD: skillMD, Guide: guide, ManifestJSON: manifestJSON, Manifest: manifest, Actions: actions}, nil
+}
+
+// skillVersion hashes the canonical generated artifact bytes: the manifest with
+// its Version field cleared, concatenated with the SKILL.md and guide bytes.
+// Marshalling the real manifest struct (rather than a parallel copy) means a
+// new manifest field is automatically covered; including the guide means a
+// guide-only change still changes the version.
+func skillVersion(manifest SkillManifest, skillMD, guide []byte) (string, error) {
+	manifest.Version = ""
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		return "", fmt.Errorf("marshal manifest for version: %w", err)
+	}
+	hashInput := make([]byte, 0, len(manifestBytes)+len(skillMD)+len(guide))
+	hashInput = append(hashInput, manifestBytes...)
+	hashInput = append(hashInput, skillMD...)
+	hashInput = append(hashInput, guide...)
+	digest := sha256.Sum256(hashInput)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 // GenerateSkill is the concise alias used by callers that need the complete
@@ -110,23 +123,32 @@ func normaliseSkillActions(descriptors []DispatchDescriptor) ([]SkillAction, err
 			if descriptor.Example == nil {
 				return nil, fmt.Errorf("descriptor %q has no verb example", descriptor.Name)
 			}
-			action := SkillAction{Verb: descriptor.Name, Operation: descriptor.Name, Summary: descriptor.Summary, Safety: descriptor.Safety, Args: copyArgSpecs(descriptor.Args), Command: commandFor(descriptor.Name, descriptor.Example)}
+			action := SkillAction{Verb: descriptor.Name, Operation: descriptor.Name, Summary: descriptor.Summary, Safety: descriptor.Safety, Args: copyArgSpecs(descriptor.Args), Argv: argvFor(descriptor.Name, descriptor.Example), Command: commandFor(descriptor.Name, descriptor.Example)}
 			if err := validateAction(action); err != nil {
 				return nil, err
 			}
 			key := action.Verb + "\x00" + action.Operation
-			if !seen[key] {
-				actions = append(actions, action)
-				seen[key] = true
+			if seen[key] {
+				return nil, fmt.Errorf("duplicate skill action %q", key)
 			}
+			actions = append(actions, action)
+			seen[key] = true
 			continue
 		}
 		if descriptor.Example != nil {
 			return nil, fmt.Errorf("grouped descriptor %q has a verb example", descriptor.Name)
 		}
-		if expected := groupedOperationNames(descriptor); expected != nil {
+		// The set of operations a grouped verb must cover is the discriminator
+		// arg's enum where it has one (find's `subverb`), so growing the enum
+		// without adding an OperationSpec fails closed rather than silently
+		// omitting an action. Discriminators without an enum (link's bool) fall
+		// back to the explicit expected set.
+		if expected := expectedGroupedOperations(descriptor); expected != nil {
 			got := make(map[string]bool, len(descriptor.Operations))
 			for _, operation := range descriptor.Operations {
+				if got[operation.Name] {
+					return nil, fmt.Errorf("grouped descriptor %q declares duplicate operation %q", descriptor.Name, operation.Name)
+				}
 				got[operation.Name] = true
 			}
 			for name := range expected {
@@ -146,18 +168,37 @@ func normaliseSkillActions(descriptors []DispatchDescriptor) ([]SkillAction, err
 			if err != nil {
 				return nil, err
 			}
-			action := SkillAction{Verb: descriptor.Name, Operation: operation.Name, Summary: operation.Summary, Safety: operation.Safety, Args: args, Command: commandFor(descriptor.Name, operation.Example)}
+			action := SkillAction{Verb: descriptor.Name, Operation: operation.Name, Summary: operation.Summary, Safety: operation.Safety, Args: args, Argv: argvFor(descriptor.Name, operation.Example), Command: commandFor(descriptor.Name, operation.Example)}
 			if err := validateAction(action); err != nil {
 				return nil, err
 			}
 			key := action.Verb + "\x00" + action.Operation
-			if !seen[key] {
-				actions = append(actions, action)
-				seen[key] = true
+			if seen[key] {
+				return nil, fmt.Errorf("duplicate skill action %q", key)
 			}
+			actions = append(actions, action)
+			seen[key] = true
 		}
 	}
 	return actions, nil
+}
+
+// expectedGroupedOperations returns the authoritative operation-name set a
+// grouped verb must cover. When the discriminator arg carries an enum, that
+// enum is the single source of truth (growing it forces a new OperationSpec);
+// otherwise the explicit fallback set is used.
+func expectedGroupedOperations(descriptor DispatchDescriptor) map[string]bool {
+	disc := discriminatorName(descriptor)
+	for _, arg := range descriptor.Args {
+		if arg.Name == disc && len(arg.Enum) > 0 {
+			set := make(map[string]bool, len(arg.Enum))
+			for _, value := range arg.Enum {
+				set[value] = true
+			}
+			return set
+		}
+	}
+	return groupedOperationNames(descriptor)
 }
 
 func operationArgs(descriptor DispatchDescriptor, operation OperationSpec) ([]ArgSpec, error) {
@@ -224,9 +265,42 @@ func copyArgSpecs(args []ArgSpec) []ArgSpec {
 	return result
 }
 
+// argvFor is the exact token list after `aira` for an action: the verb plus its
+// example arguments. This is what a programmatic host should pass to the binary,
+// with no shell-quoting round-trip.
+func argvFor(verb string, example []string) []string {
+	return append([]string{verb}, example...)
+}
+
+// commandFor renders a shell-safe, copy-pasteable command. Each token that
+// contains a shell metacharacter (glob, space, quote, …) is single-quoted, so
+// e.g. a `**/*.go` area glob is passed literally rather than being expanded by
+// the shell into a different request than the tested argv.
 func commandFor(verb string, example []string) string {
 	parts := append([]string{"aira", verb}, example...)
-	return strings.Join(parts, " ")
+	quoted := make([]string, len(parts))
+	for i, part := range parts {
+		quoted[i] = shellQuote(part)
+	}
+	return strings.Join(quoted, " ")
+}
+
+func shellQuote(token string) string {
+	if token == "" {
+		return "''"
+	}
+	safe := true
+	for _, r := range token {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || strings.ContainsRune("_./:=-", r) {
+			continue
+		}
+		safe = false
+		break
+	}
+	if safe {
+		return token
+	}
+	return "'" + strings.ReplaceAll(token, "'", `'\''`) + "'"
 }
 
 func renderSkillMarkdown(actions []SkillAction, contract ResponseContractSpec) string {
@@ -248,7 +322,7 @@ func renderMarkdownBody(title string, actions []SkillAction, contract ResponseCo
 	fmt.Fprintf(&out, "Responses carry stable AIRA codes. Verdicts are `%s`, `%s`, and `%s`. `unevaluated` is not a pass and not zero.\n\n", contract.Verdicts[0], contract.Verdicts[1], contract.Verdicts[2])
 	out.WriteString("Stable codes: `")
 	out.WriteString(strings.Join(contract.StableCodes, "`, `"))
-	out.WriteString("`.\n\nExit codes:\n\n")
+	fmt.Fprintf(&out, "`.\n\nThis list is the documented vocabulary, not exhaustive: any error response still carries a stable `E_`/`W_`/`U_` code, and a code not listed here exits with the default exit `%d`.\n\nExit codes:\n\n", contract.DefaultExit)
 	for _, code := range sortedContractCodes(contract.ExitCodes) {
 		fmt.Fprintf(&out, "- `%s`: `%d`\n", code, contract.ExitCodes[code])
 	}

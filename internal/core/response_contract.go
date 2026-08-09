@@ -7,25 +7,33 @@ import (
 )
 
 // ResponseContractSpec is the transport-neutral response contract projected
-// by generated faces. ExitCodes includes both store errors and core verdicts.
+// by generated faces. ExitCodes lists the documented codes and their exits;
+// DefaultExit is applied to any error code not listed, so the vocabulary is
+// never presented as exhaustive.
 type ResponseContractSpec struct {
 	StableCodes       []string       `json:"stable_codes"`
 	Verdicts          []string       `json:"verdicts"`
 	UnevaluatedIsPass bool           `json:"unevaluated_is_pass"`
 	ExitCodes         map[string]int `json:"exit_codes"`
+	DefaultExit       int            `json:"default_exit"`
 }
 
 // ResponseContract is the single source for stable response and exit facts
-// rendered by the Skill and guide artifacts.
+// rendered by the Skill and guide artifacts. The verdict exits are derived
+// from verdictExit — the same function Do uses — so the contract cannot drift
+// from real dispatch behaviour.
 func ResponseContract() ResponseContractSpec {
 	exitCodes := make(map[string]int, len(store.ExitCodes)+4)
 	for code, exit := range store.ExitCodes {
 		exitCodes[code] = exit
 	}
-	exitCodes["OK"] = 0
-	exitCodes["PASS"] = 0
-	exitCodes["FAIL"] = 1
-	exitCodes["UNEVALUATED"] = 3
+	// Verdict codes are not error codes and are not in store.ExitCodes; derive
+	// their exits from the authoritative verdictExit so a change there cannot
+	// leave this contract lying.
+	exitCodes["OK"] = verdictExit("")
+	exitCodes["PASS"] = verdictExit("pass")
+	exitCodes["FAIL"] = verdictExit("fail")
+	exitCodes["UNEVALUATED"] = verdictExit("unevaluated")
 	stableCodes := make([]string, 0, len(exitCodes))
 	for code := range exitCodes {
 		stableCodes = append(stableCodes, code)
@@ -36,5 +44,6 @@ func ResponseContract() ResponseContractSpec {
 		Verdicts:          []string{"pass", "fail", "unevaluated"},
 		UnevaluatedIsPass: false,
 		ExitCodes:         exitCodes,
+		DefaultExit:       store.ExitForCode("E_CODE_NOT_IN_MAP_SENTINEL"),
 	}
 }

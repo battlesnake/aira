@@ -126,10 +126,12 @@ Both artifacts must state, from `core.ResponseContract()`, that responses carry
    metadata cannot silently diverge from handler logic.
 6. **Deterministic, artifact-scoped version.** Generation uses no clock/random.
    `SKILL.md` and the guide **do not embed the version**. The hash input is a
-   fixed framing: `canonicalJSON(manifest with the version field omitted)` byte-
-   concatenated with the `SKILL.md` bytes, where `canonicalJSON` is Go
-   `encoding/json` marshaling of the manifest struct (deterministic field order;
-   map keys, e.g. the exit map, emitted in sorted order). `version =
+   fixed framing: `canonicalJSON(manifest with the version field cleared)` byte-
+   concatenated with the `SKILL.md` bytes **and the guide bytes**, where
+   `canonicalJSON` is Go `encoding/json` marshaling of the real manifest struct
+   (so a new manifest field is covered automatically; deterministic field order;
+   map keys, e.g. the exit map, emitted in sorted order). Including the guide
+   bytes means a guide-only template change still changes the version. `version =
    hex(sha256(hashInput))`; the manifest's `version` field is then set to it.
    The version therefore changes on any generator, template, preamble, manifest-
    schema, response-contract, or CLI-grammar change that alters output — not only
@@ -139,11 +141,16 @@ Both artifacts must state, from `core.ResponseContract()`, that responses carry
    code list, verdict set, exit-code map, and the `unevaluated`-is-not-pass fact
    come from a **single exported `core` function** (`core.ResponseContract()`)
    that composes `store`'s codes/exit map with `core`'s verdict→code→exit
-   behaviour (which lives in `Do`). Both artifacts render from it, and a test
-   cross-checks the contract against **actual `Response` behaviour** (drive a
-   check that returns `unevaluated`, assert `Response.Code=="UNEVALUATED"`,
-   `Exit==3`, not pass). A string-only authored claim of exit codes is not
-   permitted.
+   behaviour (the verdict exits are taken from `verdictExit`, the same function
+   `Do` uses, not re-hardcoded). Both artifacts render from it, and a test
+   cross-checks the contract against **actual `Response` behaviour** for **pass,
+   fail, and unevaluated** (drive each verdict through `Do`, assert the code and
+   exit match the contract). The code list is **explicitly non-exhaustive**: the
+   contract carries a `default_exit` and both artifacts state that any error code
+   not listed still carries a stable prefix and exits with the default, so an
+   emittable-but-unlisted domain code (e.g. `E_LEASE_TOKEN`) is not presented as
+   impossible. The known domain-operation codes are registered in `store.ExitCodes`
+   so they are listed. A string-only authored claim of exit codes is not permitted.
 8. **Guide-only does not satisfy the deliverable.** `skill install` must emit the
    manifest with the host/entrypoint contract and the enumerable per-operation
    action catalog, and the end-to-end invocation test must pass; prose alone
