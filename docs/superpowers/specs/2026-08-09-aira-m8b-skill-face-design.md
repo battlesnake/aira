@@ -1,233 +1,284 @@
 # AIRA M8b — Skill face and generated agent guide over `core.Do`
 
-Status: plan (author: Opus, owner-delegated). Completes Phase 2. Prerequisite
-M8a (typed argument model + descriptor-generated MCP face) is landed on master
-at `ae2b34d`.
+Status: plan (author: Opus, owner-delegated), revised after Sol plan-review
+BLOCK (all P0s absorbed below). Gemini unavailable this round (free-tier quota).
+Completes Phase 2. Prerequisite M8a (typed argument model + descriptor-generated
+MCP face) is landed on master at `ae2b34d`.
 
 ## 1. Scope
 
 M8b adds the **Skill face** — the third thin adapter named in the whole-product
 design (`CLI, MCP, Skill, daemon, TUI are thin faces over one core`) — and the
-**generated agent guide** that the repository contract calls for
-(`Generated help, MCP schemas, and the agent guide come from dispatch tables`).
+**generated agent guide** the repository contract calls for (`Generated help,
+MCP schemas, and the agent guide come from dispatch tables`).
 
 The single behavioural authority remains `core.Do`. M8b adds **no** new verbs,
 no store behaviour, and no second command implementation. It is a *projection*
-of the existing dispatch descriptors into two generated artifacts plus a small
-amount of descriptor metadata those artifacts honestly require.
+of the dispatch descriptors — refined to **operation** granularity — into two
+generated artifacts, plus the descriptor metadata those artifacts honestly need.
 
 M8b delivers:
 
-1. **A minimal descriptor metadata extension.** Each dispatchable verb gains a
-   `SafetyClass` and a one-line `Summary`. These are the two facts the Skill and
-   guide must state that the current descriptor cannot derive: whether an action
-   mutates state / takes a lease (so the Skill can warn), and a concise
-   human/agent instruction. Both are surfaced through `DispatchDescriptors()`.
+1. **Operation-aware descriptor metadata.** The dispatch table gains, per verb:
+   a one-line `Summary`, a `Safety` class, an explicit `Include` flag, and —
+   for verbs whose handler branches on a discriminator (`find`, `link`) — a set
+   of `Operations`, each naming the discriminator value, its own `Summary`,
+   `Safety`, the subset of args it uses with per-operation requiredness, and a
+   canonical example. Single-shape verbs carry no `Operations` (the verb *is*
+   the operation). All of this is surfaced through `DispatchDescriptors()`.
 
-2. **An installable Skill package,** emitted by a new `aira skill` face:
-   - `aira skill install <dir>` writes a self-contained Skill package into
-     `<dir>`: a `SKILL.md` (agent-facing instructions with `name`/`description`
-     frontmatter) and a machine-readable `aira.skill.json` manifest.
-   - The manifest declares Skill identity, a **deterministic content version**
-     (a hash over the descriptor surface, so the version changes iff the surface
-     changes), the invokable entrypoint (the `aira` binary) and, for every
-     canonical action, its argument contract, safety class, and the exact
-     command shape (`aira <verb> …`) that reaches `core.Do`.
-   - The action catalog, argument contract, safety warnings, and examples are
-     **generated from `DispatchDescriptors()`**. No action is authored by hand.
+2. **An installable Skill package** emitted by a new `aira skill` face:
+   - `aira skill install <dir>` writes `<dir>/SKILL.md` (agent-facing, with
+     `name`/`description` frontmatter) and `<dir>/aira.skill.json` (machine
+     manifest).
+   - The manifest declares Skill identity, an explicit **host/entrypoint
+     contract** (entrypoint = the `aira` binary; how a host discovers and
+     invokes it; per-action argv template), a **deterministic version** that is
+     a hash of the *generated artifact bytes* (not just the descriptor input),
+     a structured **response contract** (stable codes + verdicts + the exit-code
+     map, all generated from `store`), and an `actions[]` catalog with one entry
+     **per operation**, each carrying its own `{summary, safety, args[], command}`.
+   - Every action's catalog entry, safety, and example command is **generated
+     from `DispatchDescriptors()`**; nothing per-action is authored by hand.
 
-3. **A generated agent guide,** emitted by `aira skill guide` (to stdout): the
-   same descriptor-derived content rendered as a single Markdown document for
-   agents that consume prose rather than a package. It carries a small authored
-   preamble (what AIRA is, the honesty contract) followed by fully generated
-   per-action sections.
+3. **A generated agent guide** emitted by `aira skill guide` (stdout): the same
+   operation-level content as one Markdown document, a small authored preamble
+   (what AIRA is + the honesty contract) followed by fully generated sections.
 
-Both artifacts must state the two non-negotiable honesty facts: responses carry
-**stable AIRA codes**, and **`unevaluated` is not a pass** (and not zero).
+Both artifacts must state, from generated `store` data, that responses carry
+**stable AIRA codes**, that verdicts are `pass`/`fail`/`unevaluated`, that
+**`unevaluated` is not a pass and not zero**, and the exit-code mapping.
 
 ## 2. Non-goals / explicit deferrals
 
-- **No runtime Skill execution engine.** AIRA's Skill entrypoint *is* the `aira`
-  CLI; the Skill package instructs the host to invoke `aira <verb>`, which is
-  already the CLI face over `core.Do`. M8b does not add an in-process action
-  dispatcher distinct from the CLI — that would be a fourth surface able to
-  drift. "Invokable" is satisfied by the entrypoint being the real binary whose
-  every action is proven, by test, to build the same canonical `core.Request`
-  as the CLI and MCP faces.
-- **No per-verb hand-authored examples or long-form guidance strings** beyond
-  the generated ones and the single authored preamble. Examples are generated
-  from the argument specs (positional order + one representative value per
-  required arg). This keeps the artifacts un-driftable.
-- **No new safety enforcement.** `SafetyClass` is descriptive metadata for
-  warnings and schemas; it does not gate execution. Enforcement (confirmation
-  prompts, lease checks) already lives in the store/domain layers.
-- **No telemetry, no daemon, no traceability graph.** Those are Phase 3+.
+- **No in-process Skill runtime distinct from the CLI.** AIRA's Skill entrypoint
+  *is* the `aira` binary; the Skill instructs the host to invoke `aira <verb>`,
+  the already-proven CLI face over `core.Do`. M8b does not add a fourth dispatch
+  path. Per Sol's P0, "invokable/installable" is **not** claimed from request
+  parity alone: it is proven by an **end-to-end invocation test** that executes
+  each documented argv through the real program entry (`Run`) against a temp
+  project and asserts it reaches core with a sane stable code and exit — not a
+  parse error — plus the request-parity test below.
+- **No change to the MCP face.** M8a's union-schema grouped MCP tools stay as-is
+  (they work and are tested). The new operation metadata is *added* to the shared
+  table and *consumed* by the Skill; MCP may adopt it later. Both faces still
+  derive from the one table, so they cannot drift.
+- **No hand-authored per-action examples/guidance** beyond the single authored
+  preamble. Examples are generated from the operation arg specs.
+- **No new safety enforcement.** `Safety` is descriptive metadata for warnings
+  and schemas; enforcement stays in store/domain.
+- **No telemetry, daemon, or traceability graph.** Phase 3+.
 
 ## 3. Invariants
 
-1. **One authority.** The Skill action catalog and the agent guide are derived
-   solely from the same dispatch table `core.Do` uses, via
-   `DispatchDescriptors()`. There is no second registry of actions, arguments,
-   or safety facts. A verb surfaced for dispatch but missing required Skill
-   metadata is a build-failing condition (golden/consistency test), not a silent
-   omission.
-2. **Face parity.** For every generated Skill action, the command shape it
-   documents, when parsed by the CLI argv builder, must produce byte-identical
-   `core.Request` to the MCP face for the same operation. This is the M8a MCP↔CLI
-   parity guarantee extended to Skill↔CLI, proven by a table test mirroring
-   `TestMCPGroupedOperationsBuildTheSameCanonicalRequestsAsCLI`.
-3. **Honest safety.** Every mutating or lease-taking action is marked as such in
-   both artifacts. A read-only action is never marked mutating and vice-versa.
-   The `SafetyClass` of each verb is asserted against a golden table so a future
-   verb cannot be added without a deliberate, reviewed safety classification.
-4. **Deterministic generation.** Generation uses no clock and no randomness. The
-   manifest version is a stable hash of the descriptor surface. Re-running
-   `aira skill install` on an unchanged binary into an unchanged directory
-   produces byte-identical output (idempotent; golden-testable). A metadata
-   change produces an expected, reviewable diff.
-5. **Guide-only does not satisfy the deliverable.** `aira skill install` must
-   emit *both* the human-facing `SKILL.md` and the machine-readable manifest
-   with the entrypoint identity and enumerable action catalog. A test asserts the
-   manifest exists, parses, declares the entrypoint, and enumerates every
-   includable canonical action; prose alone fails.
-6. **Coverage is the canonical includable set.** The Skill actions and guide
-   sections cover exactly the canonical verbs that reach `core.Do` and are
-   marked includable (the same set the MCP face exposes, de-aliased: `new`/`get`/
-   `ls` do not create duplicate actions; `help` is not an action). A drift test
-   asserts the action set equals the includable verb set.
+1. **One authority, one inclusion predicate.** The Skill action catalog and the
+   guide are derived solely from the dispatch table `core.Do` uses, via
+   `DispatchDescriptors()`. A **single** `Include` predicate (a descriptor field
+   set on the table, not inferred from `MCPTool`) decides membership and is used
+   by both the MCP and Skill coverage tests, so Skill coverage is not silently
+   coupled to MCP metadata. A verb surfaced for dispatch but missing required
+   Skill metadata (`Summary`, valid `Safety`, and — if grouped — `Operations`
+   covering every discriminator value) is a build-failing condition.
+2. **Operation-level correctness.** For grouped verbs the catalog has one action
+   per operation, each with only the args that operation uses, correct per-op
+   requiredness, correct per-op safety, and a valid example. No union-derived
+   action is emitted for a grouped verb.
+3. **Face parity, full coverage.** For **every** generated action (every
+   operation, not a representative sample), the `command` it documents, parsed by
+   the CLI argv builder, produces byte-identical `core.Request` to the MCP face
+   for the same operation — including special encodings (`find add` uses
+   `--file path:line`, there is no `--line` CLI option; `link ls` uses the
+   positional `ls` form). This extends the M8a MCP↔CLI parity guarantee to
+   Skill↔CLI at operation granularity.
+4. **Honest, per-operation safety.** Every mutating / lease-taking / read
+   operation is marked truthfully. `find ls`/`find show`/`link ls` are `read`;
+   `find add`/`find set` are `mutate`. `mutate` means *any durable state write*
+   (tickets, findings, relations, **allocator/outbox/event/receipt** — hence
+   `id` is `mutate`, confirmed by Sol), `lease` means lease acquire/renew/release,
+   `reconcile` means rebuild/heal/check. Asserted against a golden per-operation
+   table.
+5. **Metadata tied to behaviour (anti-drift).** Extending the M8a instrumented
+   arg-accessor drift test, each operation is exercised with its discriminator
+   and probe inputs; the args the handler actually **reads** for that operation
+   must equal the args that operation **declares**. Operation metadata cannot
+   silently diverge from handler logic.
+6. **Deterministic, artifact-scoped version.** Generation uses no clock/random.
+   The manifest `version` is a hash over the **canonical generated artifact
+   bytes** (manifest sans the version field + SKILL.md), so it changes on any
+   generator, template, preamble, manifest-schema, response-contract, or CLI-
+   grammar change that alters output — not only on descriptor edits. Re-running
+   `skill install` on an unchanged binary is byte-identical (idempotent).
+7. **Generated, not authored, honesty text.** The stable-code list, verdict set,
+   and exit-code map in both artifacts are generated from `store` (the codes/exit
+   map), so they cannot drift from the implementation. A string-only authored
+   claim of exit codes is not permitted.
+8. **Guide-only does not satisfy the deliverable.** `skill install` must emit the
+   manifest with the host/entrypoint contract and the enumerable per-operation
+   action catalog, and the end-to-end invocation test must pass; prose alone
+   fails.
 
 ## 4. Design
 
 ### 4.1 Descriptor metadata
 
-`ArgSpec` is unchanged. Add to `verbSpec` and mirror into `DispatchDescriptor`:
+`ArgSpec` is unchanged. Add a closed `SafetyClass` string type in
+`internal/core` (`read`, `mutate`, `lease`, `reconcile`) with a validated set.
+Add to `verbSpec` and mirror into `DispatchDescriptor`:
 
-- `Summary string` — one concise line ("Create a ticket and return its ID").
-- `Safety SafetyClass` — a closed enum:
-  `read` (no state change), `mutate` (writes tickets/findings/relations),
-  `lease` (acquires/renews/releases a lease), `reconcile` (rebuild/heal/check).
+- `Summary string`
+- `Safety SafetyClass`
+- `Include bool` (the single membership predicate for generated faces)
+- `Operations []OperationSpec` (empty for single-shape verbs)
 
-`SafetyClass` is a new closed string type in `internal/core` with a small
-validated set. Every dispatchable verb (except `help`) must set both fields;
-`DispatchDescriptors()` carries them; a consistency test fails if any includable
-descriptor has an empty `Summary` or an unset/invalid `Safety`.
-
-Classification (authoritative table, asserted by golden test):
-
-| verb | safety | note |
-|---|---|---|
-| `init` | reconcile | creates project scaffolding + index |
-| `id` | mutate | advances a persistent allocator — not a free read |
-| `create` | mutate | |
-| `show`, `list`, `count`, `grep`, `ready` | read | |
-| `find` | mutate | `add`/`set` mutate; `ls`/`show` read — the tool is grouped, classified by its most-privileged operation with a per-operation note in the generated text |
-| `set`, `mv` | mutate | |
-| `claim`, `release`, `heartbeat` | lease | |
-| `touch` | mutate | area hints; requires lease ownership |
-| `link`, `unlink` | mutate | |
-| `import` | mutate | |
-| `reconcile`, `check` | reconcile | |
-
-`id` is reclassified `mutate` (it advances a persistent allocator — an agent must
-know it is not a free read). Grouped tools (`find`, `link`, `transition`) are
-classified by their most-privileged operation and the generated per-action text
-states the read/write split explicitly. The plan-review gate should confirm this
-classification before build.
-
-### 4.2 The `skill` face
-
-`cmd/aira/skill.go`, dispatched from `Run` exactly like `mcp`:
-
-```
-if argv[0] == "skill" { return runSkill(argv[1:], stdout, stderr) }
+```go
+type OperationSpec struct {
+    Name    string      // discriminator value, e.g. "add", "ls", "list"
+    Summary string
+    Safety  SafetyClass
+    Args    []OperationArg // arg name + per-operation requiredness
+    Example []ExampleArg   // canonical args for a valid example of this op
+}
 ```
 
-Subcommands:
+`DispatchDescriptors()` deep-copies `Operations` (like it already deep-copies
+`Enum`) so the projection stays immutable. A consistency test requires every
+`Include` descriptor to have non-empty `Summary` and valid `Safety`; every
+grouped verb (`find`, `link`) to enumerate `Operations` covering all its
+discriminator values; and every operation to have valid `Safety` + a usable
+example.
 
-- `skill guide` → render the agent guide Markdown to stdout, exit 0.
-- `skill install <dir>` → create `<dir>` if absent, write `<dir>/SKILL.md` and
-  `<dir>/aira.skill.json`, print the written paths + version, exit 0. Refuse
-  (stable error, non-zero exit) if `<dir>` exists as a non-directory, or if a
-  target file exists and differs and `--force` was not given (idempotent
-  overwrite of identical content is allowed).
-- `skill` with no/unknown subcommand → usage to stderr, non-zero exit.
+**Authoritative safety table** (golden-tested; `mutate` = any durable-state
+write):
 
-The generator lives in `internal/core` (or a small `internal/core`-adjacent
-generator that takes `[]DispatchDescriptor`), so it is unit-testable without the
-filesystem and shared by both subcommands. `cmd/aira/skill.go` is a thin
-adapter: it calls the generator and writes bytes. No dispatch logic in the face.
+| action | safety |
+|---|---|
+| `init` | reconcile |
+| `id` | mutate |
+| `create`, `set`, `mv`, `touch`, `unlink`, `import` | mutate |
+| `link` (create-relation form) | mutate |
+| `link ls` | read |
+| `show`, `list`, `count`, `grep`, `ready` | read |
+| `find add`, `find set` | mutate |
+| `find ls`, `find show` | read |
+| `claim`, `release`, `heartbeat` | lease |
+| `reconcile`, `check` | reconcile |
 
-### 4.3 Generated content contract
+### 4.2 Generator (`internal/core`, filesystem-free)
 
-Per includable canonical action, both artifacts state: canonical name, one-line
-summary, safety class (with the grouped read/write note where relevant), the
-argument list (name, kind, required, positional-vs-option, enum values where
-closed, description), the concrete command example, and — once, in a shared
-"Response contract" section — that every response carries a stable `code`, that
-verdicts are `pass`/`fail`/`unevaluated`, that `unevaluated` is neither pass nor
-zero, and the exit-code mapping.
+A generator takes `[]DispatchDescriptor` and produces, deterministically:
 
-The manifest (`aira.skill.json`) is the machine-readable projection: identity
-(`name: "aira"`, `entrypoint: "aira"`), `version` (descriptor-surface hash),
-`response_contract` (stable-codes + unevaluated note as structured fields), and
-`actions[]` each with `{verb, summary, safety, command, args[]}`. It is the
-enumerable catalog invariant 5/6 test against.
+- the ordered per-operation **action list** (single-shape verb → one action;
+  grouped verb → one action per `OperationSpec`), de-aliased (`new`/`get`/`ls`
+  never duplicate an action; `help` excluded);
+- for each action, the arg contract and a **valid example** built as canonical
+  request args, then **rendered to CLI argv via a shared renderer** so the
+  documented `command` is exactly what the CLI parses (guaranteeing invariant 3);
+- the response-contract section from `store` (stable codes + exit map + verdicts
+  + the `unevaluated` statements);
+- the manifest struct and the SKILL.md / guide Markdown.
+
+The example renderer and the CLI parser are inverse projections of the same arg
+specs; the parity test (invariant 3) proves round-trip identity for every action.
+
+### 4.3 The `skill` face (`cmd/aira/skill.go`)
+
+Dispatched from `Run` exactly like `mcp`:
+
+```
+if strings.ToLower(argv[0]) == "skill" { return runSkill(argv[1:], stdout, stderr) }
+```
+
+- `skill guide` → guide Markdown to stdout, exit 0.
+- `skill install <dir> [--force]` → create `<dir>` if absent; write `SKILL.md` +
+  `aira.skill.json`; print written paths + version; exit 0. Refuse with a stable
+  error + non-zero exit if `<dir>` is a non-directory, or a target file exists
+  and differs without `--force` (idempotent identical overwrite allowed).
+- unknown/missing subcommand → usage to stderr, non-zero exit.
+
+The face is a thin adapter: it calls the generator and writes bytes; no dispatch
+logic lives in it.
+
+### 4.4 Manifest (`aira.skill.json`)
+
+```
+{
+  "name": "aira",
+  "version": "<hash of canonical generated artifact bytes>",
+  "entrypoint": { "type": "cli", "command": "aira", "invocation": "aira <verb> [args]" },
+  "discovery": { "skill_file": "SKILL.md", "install_target": "<dir>" },
+  "response_contract": { "stable_codes": [...], "verdicts": ["pass","fail","unevaluated"],
+                         "unevaluated_is_pass": false, "exit_codes": { "OK":0, ... } },
+  "actions": [ { "verb": "...", "operation": "...", "summary": "...", "safety": "...",
+                 "command": "aira ...", "args": [ {name,kind,required,positional,enum} ] } ]
+}
+```
+
+`response_contract` fields are generated from `store`.
 
 ## 5. Risks and mitigations
 
 | Risk | Mitigation |
 |---|---|
-| Generated Skill/guide silently falls out of sync with the dispatch table | Golden tests on the action-name set, per-action arg descriptions, safety table, and manifest; a fail-closed consistency test requires every includable verb to carry `Summary`+`Safety`. |
-| A future verb ships without a safety classification | `DispatchDescriptors()` consistency test fails on empty/invalid `Safety`; safety golden table must be updated deliberately. |
-| Skill documents a command the CLI would parse differently → agent runs the wrong request | Skill↔CLI parity table test builds each generated command through the CLI argv path and asserts identical `core.Request`, extending the M8a MCP↔CLI parity guarantee. |
-| Manifest version churns on every build (non-determinism) | Version is a deterministic hash of the descriptor surface; no clock/random; idempotency golden test. |
-| "Guide-only" output masquerading as the deliverable | Install-artifact test asserts manifest presence, parseability, entrypoint declaration, and full action enumeration; prose alone fails. |
-| Grouped-tool safety (`find` add vs ls) misleads | Classified by most-privileged operation; generated per-action text states the read/write split; golden-tested. |
+| Grouped-verb example invalid (union args) | Per-operation actions with per-op arg subsets + requiredness; example rendered through the shared CLI renderer; per-operation parity test. |
+| Per-operation safety lies (`find ls` marked mutate) | Per-operation `Safety`; golden per-operation safety table (invariant 4). |
+| Operation metadata drifts from handler | Per-operation instrumented arg-accessor drift test: handler reads for an operation == that operation's declared args (invariant 5). |
+| Generated text drifts from dispatch table | Golden action-set == `Include` set; per-action arg/summary goldens; consistency test fails on missing metadata. |
+| "Includable" silently coupled to MCP | Explicit `Include` field; one shared predicate for both faces (invariant 1). |
+| Version churns / misses generator changes | Version = hash of generated artifact bytes; idempotency golden (invariant 6). |
+| Exit/stable-code prose drifts from `store` | Generated from `store`; not authored (invariant 7). |
+| "Installable/invokable" unproven | End-to-end test runs each documented argv through `Run` against a temp project; asserts stable code + sane exit, not a parse error (invariant 8). |
+| Guide-only masquerades as deliverable | Manifest presence + host/entrypoint contract + full enumeration asserted; prose alone fails. |
 
 ## 6. Tests (TDD; every confirmed counterexample becomes a regression test)
 
-1. **Descriptor consistency (fail-closed).** Every includable descriptor has a
-   non-empty `Summary` and a valid `Safety`; `help` is exempt; an injected empty
-   value fails. (Proven load-bearing by temporarily blanking one.)
-2. **Safety golden table.** `verb → SafetyClass` matches the authoritative table
-   in §4.1 exactly; adding/removing a verb or changing a class fails until the
-   table is updated.
-3. **Action-set drift.** The generated Skill action set and guide section set
-   each equal the includable canonical verb set (de-aliased, `help` excluded) —
-   mirrors the MCP `tools/list` golden.
-4. **Skill↔CLI parity.** For a representative command per action (including
-   grouped `find`/`link`/`set`/`mv`), the generated `command` parsed by the CLI
-   argv builder yields byte-identical `core.Request` to the MCP path.
-5. **Manifest artifact.** `skill install` writes a `aira.skill.json` that parses,
-   declares `entrypoint: "aira"`, carries the response-contract fields, and
-   enumerates every includable action with args+safety; a guide-only variant
-   (SKILL.md but no manifest) fails this test.
-6. **Determinism / idempotency.** Two installs into the same dir on the same
-   binary produce byte-identical files and equal versions; a metadata change
-   changes the version and the diff is the expected one (golden on version-hash
-   input).
-7. **Honesty content.** Both `SKILL.md` and the guide contain the stable-codes
-   statement and the explicit "`unevaluated` is not a pass / not zero" statement;
-   removing it from the generator fails the test.
-8. **Face wiring / exits.** `skill guide` exits 0 and prints Markdown to stdout;
-   `skill install <newdir>` exits 0 and writes both files; unknown subcommand and
-   install into a non-directory path yield a stable error and non-zero exit;
-   re-install of identical content without `--force` succeeds (idempotent), a
-   differing target without `--force` fails.
-9. **Build constraint.** The new face compiles into the existing static/no-cgo
-   binary; generation requires no daemon, network, or external process.
+1. **Descriptor consistency (fail-closed).** Every `Include` descriptor has a
+   non-empty `Summary` + valid `Safety`; grouped verbs enumerate `Operations`
+   covering all discriminator values; each op has valid `Safety` + a usable
+   example. Injected empty value / missing operation fails. (Proven load-bearing.)
+2. **Per-operation safety golden.** The action→`Safety` map equals §4.1 exactly;
+   any add/remove/reclassify fails until the table is updated.
+3. **Action-set drift.** Generated Skill action set and guide section set each
+   equal the operation-expanded `Include` set (de-aliased, `help` excluded).
+4. **Skill↔CLI parity, full coverage.** For **every** action, the generated
+   `command` parsed by the CLI argv builder yields byte-identical `core.Request`
+   to the MCP path — including `find add`'s `--file path:line` and `link ls`.
+5. **Per-operation drift (behaviour-tied).** Extend the M8a instrumented
+   arg-accessor test: per operation, handler-read args == declared op args.
+6. **Manifest artifact + host contract.** `skill install` writes an
+   `aira.skill.json` that parses, declares the entrypoint + discovery contract,
+   carries generated `response_contract`, and enumerates every action with
+   args+safety+command; a guide-only variant (no manifest) fails.
+7. **End-to-end invocation.** For representative documented actions across
+   read/mutate/lease/reconcile, execute the generated argv through `Run` against
+   an isolated temp project (own `XDG_STATE_HOME`); assert it reaches core with a
+   stable code + sane exit (not `E_SELECTOR_INVALID`/parse error).
+8. **Determinism / idempotency.** Two installs into the same dir on the same
+   binary are byte-identical with equal versions; a metadata/generator change
+   changes the version and the diff is the expected one.
+9. **Generated honesty content.** Both artifacts contain the stable-code list,
+   verdict set, exit map, and the explicit "`unevaluated` is not a pass / not
+   zero" statement, generated from `store`; removing the source data or the
+   statement fails.
+10. **Face wiring / exits.** `skill guide` exits 0 with Markdown; `skill install
+    <newdir>` exits 0 writing both files; unknown subcommand and install into a
+    non-directory yield a stable error + non-zero exit; identical re-install
+    without `--force` succeeds, a differing target without `--force` fails.
+11. **Build constraint.** The new face compiles into the static/no-cgo binary;
+    generation needs no daemon, network, or external process.
 
 ## 7. Expected yield
 
-Agents gain a discoverable, installable Skill whose action catalog, argument
-contract, and safety warnings are provably truthful to the verbs that exist and
-provably build the same core requests as the CLI and MCP faces — plus a
-generated agent guide that cannot silently diverge from the implementation. This
-closes the third face named in the whole-product design and completes Phase 2
-(findings + surfaces + import + all three thin faces over one core).
+Agents gain a discoverable, installable Skill whose per-operation action catalog,
+argument contract, and safety warnings are provably truthful to the operations
+that exist, provably build the same core requests as the CLI and MCP faces, and
+provably *invoke* successfully end-to-end — plus a generated agent guide that
+cannot silently diverge from the implementation or lie about exit/stable codes.
+This closes the third face named in the whole-product design and completes
+Phase 2 (findings + surfaces + import + all three thin faces over one core).
 
 ## 8. Out-of-scope confirmation
 
-M8b does not add runner, telemetry, gates, traceability enforcement, or any new
-store behaviour. It does not hand-author per-action guidance. It does not enforce
-safety at execution time. Those remain Phase 3+ and the store/domain layers.
+M8b does not add runner, telemetry, gates, traceability enforcement, MCP-schema
+changes, or any new store behaviour. It does not hand-author per-action guidance,
+add a second dispatch path, or enforce safety at execution time. Those remain
+Phase 3+ and the store/domain layers.
