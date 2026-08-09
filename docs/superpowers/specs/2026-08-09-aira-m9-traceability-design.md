@@ -1,220 +1,240 @@
 # AIRA M9 — requirements + covers/verifies traceability graph
 
-Status: plan (author: Opus, owner-delegated). First milestone of Phase 3
-(traceability + gates + runner-lite). Builds on Phase 2 (merged to master
-`52ec856`).
+Status: plan (author: Opus, owner-delegated), revised after Sol plan-review
+BLOCK (all P0/P1/P2 absorbed). First milestone of Phase 3. Builds on master
+`52ec856`. Correctness-critical (entity-kind-aware allocation touches crash
+recovery), so the full two-loop adversarial process applies.
 
 ## 1. Scope
 
 M9 makes the **requirement** a first-class git-durable entity and turns the
-existing `covers:`/`verifies:` annotation convention into an enforced — but
-**advisory** — traceability graph check. It is the data-model foundation the
-rest of Phase 3 (gates, review-depth) builds on, so the data model is weighted
-heaviest.
+`covers:`/`verifies:` annotation convention into an enforced — but **advisory** —
+traceability graph check. It is Phase 3's data-model foundation.
 
-Today (Phase 0 convention): a manual `REQUIREMENTS.md` table holds `AR-N`
-requirement IDs and statuses; code carries `// covers: AR-5, AR-6` and tests
-carry `// verifies: AR-5`. The enforcing graph check was deliberately deferred
-to Phase 3 (an empty graph must not pass vacuously — `REQUIREMENTS.md:11`).
+It builds in **two phases** (each gated), because the allocator work is
+correctness-critical and independent of the scan:
 
-M9 delivers:
-
-1. **A Requirement entity** — git-durable, one file per requirement in
-   `.aira/requirements/<ID>.md` (consistent with tickets and review findings;
-   one file per entity is merge-safe by construction). Fields: `id` (own prefix,
-   e.g. `AR`), `text`, `status` ∈ {`built`, `partial`, `designed`, `planned`,
-   `boundary`, `retired`, `superseded`}. The requirement file is the **node**;
-   `covers`/`verifies` **edges are not stored on it** — they live in the code as
-   annotations and are discovered by scanning, exactly as the convention already
-   works. IDs are allocated through the existing `aira id <prefix>` allocator
-   (no hand-picked IDs).
-
-2. **The traceability graph check** — a pass that scans tracked source for
-   `covers: <ID>[, <ID>…]` and tracked tests for `verifies: <ID>[, <ID>…]`,
-   resolves each edge against the requirement registry, and reports:
-   - a `covers`/`verifies` edge whose target requirement does not exist
-     (**dangling edge**);
-   - a requirement with no `covers` edge (**uncovered**) or no `verifies` edge
-     (**unverified**);
-   - a `built`/`partial` requirement whose edge set contradicts its status
-     (e.g. `built` with zero `covers`).
-
-   The check is **fail-closed in the honesty sense and advisory in enforcement**
-   (spec §4.5/§9/§15, lines 30/163/207): a graph it cannot establish (scan
-   error, unreadable file) reads `unevaluated`, and an **empty graph is never a
-   vacuous pass**; but a dangling/uncovered edge is a **warning / `unevaluated`
-   surfaced at `aira check`**, not an integrity refusal — traceability edges may
-   dangle transiently mid-refactor. This is distinct from the ticket/relation
-   graph, which is fail-closed *integrity* (M3).
-
-3. **The `aira req` face** — `req add|ls|show|set` (grouped like `find`), plus
-   the traceability report folded into `aira check` (and queryable). Generated
-   through `core.Do` and surfaced on all three faces via the M8 dispatch
-   descriptors (a new grouped verb → one MCP tool + Skill actions, automatically).
+- **9a — foundation:** make the ID allocator entity-kind-aware, add the
+  Requirement entity + store CRUD + index + reconcile, and **migrate the seed
+  `AR-1..7` requirements** into `.aira/requirements/` with preserved IDs.
+- **9b — traceability check:** discover `covers:`/`verifies:` edges from code and
+  fold a traceability dimension into `aira check` with the honest tri-state
+  verdict contract.
 
 ## 2. Non-goals / explicit deferrals
 
-- **No gates, no ratchet, no proven-to-fire, no attestations** — that is M10.
-- **No `review`/review-depth** — that is M11. **No runner** — M12.
+- **No gates/ratchet/proven-to-fire/attestations** (M10), **no review/
+  review-depth** (M11), **no runner** (M12).
 - **No blocking enforcement.** Traceability compliance is advisory in Phases 1–3;
-  whether a dangling edge ever *blocks a merge* follows the later
-  advisory→hardening path and is out of scope.
-- **No migration of the seed `REQUIREMENTS.md` table into `.aira/requirements/`
-  as a silent data change.** M9 provides `aira req add` (allocating via `aira id`)
-  and an `aira req import` path is **deferred**; the seed remains the human
-  registry until requirements are deliberately created. (`REQUIREMENTS.md` is a
-  rendered/seed doc, not the DB authority — mirrors `BACKLOG.md`.)
-- **No new annotation syntax.** The scanner reads the existing
-  `covers:`/`verifies:` comment convention verbatim; it does not invent tags.
-- **The one-file-per vs single-registry question (spec §21) is decided here as
-  one-file-per** for merge-safety/consistency; this is a deliberate, reviewed
-  choice, not left open.
+  whether a dangling edge ever *blocks a merge* is out of scope.
+- **No new annotation syntax.** The scanner reads the existing `covers:`/
+  `verifies:` comment convention verbatim.
+- **The migration is NOT deferred** (Sol P1): the live tree already has
+  `covers: AR-5/6/7`, so without seeded `AR-*` requirement nodes the check would
+  be useless (empty→`unevaluated`) or every real annotation would dangle. 9a
+  migrates `AR-1..7` with their existing IDs.
 
-## 3. Invariants
+## 3. The two failure senses and the verdict contract (Sol P0/P1)
 
-1. **One authority.** Requirement *content* is the git file under
-   `.aira/requirements/`; the DB is a rebuildable index (reconciler rebuilds it),
-   exactly as for tickets/findings. No authoritative content in the DB.
-2. **IDs via the allocator.** Requirement IDs come from `aira id <prefix>`; M9
-   never hand-picks an ID. The requirement prefix is registered like a ticket
-   prefix.
-3. **Edges are discovered, not stored.** The graph edges come from scanning the
-   `covers:`/`verifies:` annotations in tracked files; the requirement node file
-   does not duplicate them (no second registry to drift).
-4. **Fail-closed honesty.** The graph check reads `unevaluated` when it cannot
-   establish its result (scan/read error) and **never reports a vacuous pass on
-   an empty or unscannable graph**. A resolved-clean graph reports `pass`; a
-   graph with dangling/uncovered/unverified/status-contradicting edges reports
-   the specific advisory findings and an overall non-pass (`fail` for a dangling
-   edge — a broken reference — vs advisory warning/`unevaluated` for
-   uncovered/unverified, per §4.5 below).
-5. **Advisory, not integrity.** No requirement or annotation state refuses a
-   ticket/finding/relation operation. The traceability findings surface at
-   `aira check`; they do not block edits (distinct from the fail-closed
-   ticket/relation integrity graph).
-6. **Reconciler-safe.** A requirement write leaves a rebuildable index; the
-   reconciler is the safety net. A requirement file with invalid frontmatter is a
-   refused *write* (integrity of the entity itself) but a *surfaced* check finding
-   if it appears out-of-band — never a silent skip.
-7. **Determinism + stable codes.** The scan is deterministic (sorted file
-   iteration); every check finding carries a stable code (`E_*`/`W_*`/`U_*`) and
-   the report distinguishes `pass`/`fail`/`unevaluated` exactly as `aira check`
-   already does.
+AIRA has two senses of "block" (spec §4.5). M9 traceability is **advisory in
+enforcement** (surfaced at `aira check`, never refuses an operation) but
+**fail-closed in honesty** (never a vacuous pass). The traceability check
+dimension resolves to exactly one verdict per the crisp contract:
 
-## 4. Design
+| Situation | Code | Dimension | Effect on overall `check` |
+|---|---|---|---|
+| A `covers:`/`verifies:` annotation targets a requirement ID that does not exist | `E_TRACE_DANGLING` | **fail** | `check` **fails** (a broken reference), but no write is refused |
+| An **established** requirement whose status expects an edge lacks `covers` / `verifies` | `W_TRACE_UNCOVERED` / `W_TRACE_UNVERIFIED` | **warning** | overall **stays pass**; a warning is never a fail and never `unevaluated` |
+| The scan cannot run/complete, the worktree snapshot is uncertain, **or the requirement registry is empty** | `U_TRACE_UNSCANNED` / `U_TRACE_EMPTY` | **unevaluated** | dimension `unevaluated`; **never a vacuous pass** |
+| A requirement **node** file is unreadable / ID-mismatched (its own integrity, not an edge) | `E_REQUIREMENT_INVALID` (node-integrity) + the node is treated as **unestablished** | node → **unevaluated**, not "missing" | that node's edges resolve to `unevaluated`, **not** `E_TRACE_DANGLING` (Sol P0 honesty) |
 
-### 4.1 Requirement entity (`internal/domain`)
+Key honesty rules:
+- A **dangling edge** (annotation → truly-absent requirement) is a `fail` — the
+  traceability analogue of a relation to a non-existent ticket — but unlike M3
+  integrity it refuses **no** operation (the annotation lives in code, not an
+  AIRA write).
+- A **malformed requirement node** is *not* a dangling edge. An annotation that
+  points at a requirement whose *file* is unreadable/ID-mismatched resolves to
+  `unevaluated` (we cannot establish the node), and the node emits its own
+  `E_REQUIREMENT_INVALID`. "Missing node" (`fail`) and "unreadable node"
+  (`unevaluated`) are distinguished.
+- **Warnings never flip the overall verdict to fail, and are never reported as
+  unevaluated.** Mixed states coexist (a run can hold a fail edge, a warning, and
+  an unevaluated node simultaneously); the overall verdict follows the existing
+  `check` precedence (any fail → fail; else any unevaluated → surfaced as
+  unevaluated dimension; warnings are orthogonal), asserted by a mixed-precedence
+  test.
 
-`Requirement{ID, Text, Status}` with a validated constructor
-(`NewRequirement`) mirroring `NewReviewFinding`: closed `Status` enum, non-empty
-text, ID shape validated against the registered prefix. The git file is
-`.aira/requirements/<ID>.md` with YAML frontmatter (`id`, `status`) + the text
-as the body — parsed by a `ParseRequirement` mirroring `ParseTicket`. (The
-Phase-1 `ParseTicket` EOF-trailing-content hardening, task #8, is a *shared*
-parser concern; if the requirement parser reuses the ticket front-matter reader
-it inherits any fix — noted, not conflated into M9.)
+### 3.1 Status → edge expectation (Sol P1)
 
-### 4.2 Store (`internal/store`)
+Only some statuses expect edges; the rest are **exempt** (no warning):
 
-- `AddRequirement`, `GetRequirement`, `ListRequirements`, `SetRequirement`
-  (status transition), each with an event/receipt like tickets/findings,
-  project+worktree-scoped in the index.
-- `TraceabilityGraph(ctx)` — scans tracked files (via the existing git-scan
-  path used by `check`) for `covers:`/`verifies:` annotations, resolves against
-  the requirement set, and returns a structured result: per-requirement
-  `{covered bool, verified bool}` and a list of dangling edges
-  `{file, line, kind, target}`. Uses the same scan infrastructure as the ticket
-  reconciler so it shares freshness/error semantics; a scan error →
-  `unevaluated`.
+| status | expects `covers` | expects `verifies` |
+|---|---|---|
+| `built` | yes | yes |
+| `partial` | yes | no (soft) |
+| `designed`, `planned` | no | no |
+| `boundary` (deliberately out-of-scope) | exempt | exempt |
+| `retired`, `superseded` | exempt | exempt |
 
-### 4.3 Check integration (`internal/store/check.go`)
+`W_TRACE_UNCOVERED`/`W_TRACE_UNVERIFIED` fire only for a status that expects the
+missing edge. A `built` requirement with zero `covers` warns; a `planned` one
+does not. This table is golden-tested.
 
-Fold a **traceability dimension** into `CheckReport` (a new dimension key like
-the existing lease/area-overlap dimensions). It emits:
-- `E_TRACE_DANGLING` (**fail**) — a `covers:`/`verifies:` annotation targets a
-  requirement that does not exist (a broken reference is a real defect, but still
-  advisory — it does not refuse any operation; it fails the *check*, matching how
-  duplicate-ID is a check `fail`).
-- `W_TRACE_UNCOVERED` / `W_TRACE_UNVERIFIED` (**warning**) — a requirement with
-  no `covers`/`verifies` edge (advisory; a mid-refactor or not-yet-built
-  requirement).
-- `U_TRACE_UNSCANNED` (**unevaluated**) — the scan could not run/complete.
+## 4. Design — 9a foundation
 
-An **empty requirement set** yields the traceability dimension `unevaluated`
-(nothing to establish), **never a vacuous pass** — the exact Phase-0 concern.
+### 4.1 Entity-kind-aware allocation (Sol P0; correctness-critical)
+
+Today `AllocateID(ctx, prefix)` and the `allocations` table
+(`project_id, prefix, number, worktree_id, state, path, seq, …`) assume the
+allocation **materialises to a ticket file**: `check` (`check.go:119-149`) reads
+each allocation and, if `state='allocated'`, demands a materialised **ticket**
+file and parses `path` as a ticket (`E_ID_UNRESOLVED: allocation file contains …`).
+
+M9 adds an **entity kind** to allocation:
+- Add a `kind TEXT NOT NULL DEFAULT 'ticket'` column to `allocations` (default
+  preserves every existing row and back-compat).
+- `AllocateID` becomes kind-aware (`AllocateID(ctx, kind, prefix)`, with a
+  `kind='ticket'` shim for existing callers, or a dedicated
+  `AllocateRequirementID`); the materialisation update and the crash-recovery
+  reconstruction (`store.go:~1340`) carry the kind.
+- `check`'s allocation verification branches on kind: a `kind='requirement'`
+  allocation must materialise to `.aira/requirements/<ID>.md` parsed as a
+  **requirement** (not a ticket); the "no materialised ticket file" /
+  `E_ID_UNRESOLVED` messages become kind-correct.
+
+This is the `make id`→`aira id` generalisation the repo flagged; it is
+correctness-critical (allocation/recovery/materialisation) → adversarial
+verification with durable crash-window counterexamples (mirrors the M5 F1
+migration work).
+
+### 4.2 Requirement entity (`internal/domain`)
+
+`Requirement{ID, Text, Status}` + validated `NewRequirement` (mirrors
+`NewReviewFinding`): closed `Status` enum {built, partial, designed, planned,
+boundary, retired, superseded}, non-empty text, ID shape validated against the
+registered `AR` prefix. Git file `.aira/requirements/<ID>.md` with **JSON
+frontmatter inside `---`** (Sol P2 — the repo format, *not* YAML), reusing the
+existing ticket/finding frontmatter reader (`internal/store/query.go:152` style)
+and a `ParseRequirement` mirroring `ParseTicket`. **Filename↔`id` identity is
+enforced** (the file `AR-3.md` must contain `id: "AR-3"`).
+
+### 4.3 Store + migration (`internal/store`)
+
+- `AddRequirement`/`GetRequirement`/`ListRequirements`/`SetRequirement`, each
+  with an event/receipt, project+worktree-scoped index, reconciler rebuild from
+  files (mirrors findings).
+- **Migration:** `aira req import <REQUIREMENTS.md>` (a deterministic one-time
+  seed, mirroring `aira import` for findings) parses the seed table and, for each
+  `AR-N`, writes `.aira/requirements/AR-N.md` **preserving the ID** and registers
+  a `kind='requirement'` allocation at number N so the high-water mark advances
+  (next `aira req add` → `AR-8`). Idempotent (re-import of an unchanged row is a
+  no-op; a changed row is surfaced, never silently overwritten). This is the only
+  way existing IDs enter — `req add` alone cannot recreate `AR-1..7`.
 
 ### 4.4 The `aira req` verb (`internal/core`)
 
-Grouped verb `req` with operations `add|ls|show|set`, MCP tool `aira_req`,
-discriminator `subverb` — modelled on `find` so it inherits the M8 descriptor
-generation, the arg-accessor drift test, and the Skill/MCP faces for free. `set`
-performs a status transition (validated closed enum). The traceability report is
-reachable via `aira check` (folded dimension) and, optionally, a read-only
-`req ls --trace`/projection that surfaces `covered`/`verified` per requirement.
+Grouped verb `req` with operations `add|ls|show|set|import`, MCP tool
+`aira_req`, discriminator `subverb` — modelled on `find` so it inherits the M8
+descriptor-generated MCP + Skill faces, the arg-accessor drift test, and Skill↔
+CLI parity with zero bespoke wiring. `add` allocates via §4.1; `set` is a
+validated status transition.
 
-### 4.5 The two failure senses (explicit)
+## 5. Design — 9b traceability check
 
-A **dangling** `covers:`/`verifies:` (annotation → missing requirement) is a
-`fail` of `aira check` — it is a concrete broken reference, the traceability
-analogue of a relation to a non-existent ticket, *except* it does not refuse the
-write that introduced it (the annotation lives in code, not in an AIRA
-operation). An **uncovered/unverified** requirement is a `warning` +
-`unevaluated`-leaning advisory: it may be legitimately mid-flight. The scan
-failing is `unevaluated`. This tri-state is the honesty contract applied to
-traceability.
+### 5.1 Edge discovery (code-only, coherent snapshot; Sol P1)
 
-## 5. Risks and mitigations
+Edges are **discovered from code annotations only**, never stored on the
+requirement node (no second registry to drift). The scanner:
+- reuses the **same tracked-file git snapshot** the ticket reconciler already
+  uses, so it shares freshness/scope/exclusion semantics and is a single coherent
+  view; on any snapshot uncertainty (scan error, concurrent mutation detected,
+  file unreadable) it yields `U_TRACE_UNSCANNED`/`unevaluated` rather than a
+  partial result;
+- matches `covers:`/`verifies:` only in a comment position, parses one-or-many
+  comma-separated IDs with whitespace tolerance, and must **not** match the token
+  inside a string literal — a tested fixture set (single, multi-ID, whitespace,
+  string-literal-non-match, non-annotation lines) pins this deterministically.
+
+### 5.2 Resolution + check integration (`internal/store/check.go`)
+
+A new **traceability dimension** in `CheckReport` emits the §3 codes. It resolves
+each discovered edge against the established requirement set, applies the §3.1
+status table, and folds into the existing verdict precedence. An **empty
+requirement registry** → `U_TRACE_EMPTY`/`unevaluated` (the exact Phase-0
+"empty graph must not pass vacuously" concern), asserted load-bearing.
+
+## 6. Risks and mitigations
 
 | Risk | Mitigation |
 |---|---|
-| Empty/absent graph passes vacuously (the Phase-0 concern) | Empty requirement set → traceability dimension `unevaluated`, never `pass`; asserted by test. |
-| Scan can't establish edges but reports pass | Scan/read error → `U_TRACE_UNSCANNED` / `unevaluated`; asserted by an injected scan-failure test. |
-| Traceability wrongly blocks an operation | It is advisory-only: check-surfaced findings, never an integrity refusal; a test asserts a dangling annotation does not refuse `req`/ticket writes. |
-| Edges drift between a stored copy and the code | Edges are *only* discovered from code annotations; never stored on the requirement — no second registry. |
-| Annotation parsing misreads (e.g. `covers:` in a string literal, multiple IDs, trailing content) | Deterministic, tested annotation parser with a fixture set incl. multi-ID, whitespace, and non-annotation lines; a comment-only match rule. |
-| Requirement file with malformed frontmatter silently ignored | Parse error is a refused write and a surfaced check finding, never a silent skip (mirrors ticket parsing). |
-| Hand-picked requirement IDs | `aira req add` allocates via `aira id <prefix>`; a test asserts the path goes through the allocator. |
+| Allocator generalisation corrupts the ticket allocation/recovery path | `kind` defaults to `ticket`; existing rows/callers unchanged; crash-window counterexamples for a `requirement` allocation that dies pre/post materialisation, reproduced end-to-end (two-loop). |
+| Empty/unscannable graph passes vacuously | Empty registry → `U_TRACE_EMPTY`; scan/read/snapshot uncertainty → `U_TRACE_UNSCANNED`; both asserted not-pass. |
+| Malformed requirement node reported as a dangling edge | Node integrity (`E_REQUIREMENT_INVALID`) is distinct from edge dangling; an annotation to an unreadable node → `unevaluated`, not `fail` (tested). |
+| Warning wrongly flips overall check to fail / labelled unevaluated | Verdict precedence test with a mixed fail+warning+unevaluated run asserts warnings are orthogonal. |
+| Migration can't preserve `AR-1..7` / breaks the live annotations | `req import` seeds nodes with preserved IDs + advances the allocator high-water; without it the graph is empty/unevaluated (never a false pass); idempotent, never silent-overwrite. |
+| Frontmatter format drift (YAML vs the repo's JSON-in-`---`) | Reuse the existing frontmatter reader; filename↔id identity enforced. |
+| Edges drift from a stored copy | Edges discovered from code only; never stored on the node. |
+| Traceability wrongly refuses an operation | Advisory-only; a test asserts a dangling annotation does not refuse `req`/ticket writes — only `check` surfaces it. |
+| Hand-picked requirement IDs | `req add` allocates via the kind-aware allocator; a spy asserts no hand-picked path. |
 
-## 6. Tests (TDD; every confirmed counterexample becomes a regression test)
+## 7. Tests (TDD; every confirmed counterexample becomes a regression test)
 
-1. **Requirement entity**: `NewRequirement` validates status enum, non-empty
-   text, ID shape; round-trips through `.aira/requirements/<ID>.md`
-   (`ParseRequirement`∘render == identity); malformed frontmatter is refused.
-2. **Store CRUD + index**: add/ls/show/set with events/receipts, project+worktree
-   scoped; reconciler rebuilds the requirement index from files; a status
-   transition validates the closed enum.
-3. **Scan / edge discovery**: fixture files with `covers:`/`verifies:` (single,
-   multi-ID, whitespace variants, a `covers:` inside a string that must NOT
-   match) produce exactly the expected edge set, deterministically.
-4. **Graph resolution — dangling**: an annotation targeting a missing requirement
-   → `E_TRACE_DANGLING`, check verdict `fail`; reproduced end-to-end via `Run`.
-5. **Graph resolution — uncovered/unverified**: a requirement with no covers/no
-   verifies → `W_TRACE_UNCOVERED`/`W_TRACE_UNVERIFIED` warnings, not a `fail`.
-6. **Fail-closed honesty**: empty requirement set → traceability dimension
-   `unevaluated`, NOT `pass` (proven load-bearing by asserting it is not pass);
-   an injected scan failure → `U_TRACE_UNSCANNED`/`unevaluated`.
-7. **Advisory, not integrity**: a dangling annotation present does not refuse a
-   `req add`/`req set`/ticket write; only `check` surfaces it.
-8. **ID allocation**: `req add` obtains its ID from the allocator; a spy asserts
-   no hand-picked ID path.
-9. **Face generation**: `aira_req` MCP tool + Skill actions are generated from the
-   descriptor (the M8 golden/drift/parity tests extend to `req` with zero bespoke
-   wiring); `req`'s per-operation arg reads match its declared metadata.
-10. **Build constraint**: compiles into the static/no-cgo binary; the scan needs
-    no daemon/network.
+**9a**
+1. Kind-aware allocation: a `requirement` allocation materialises to
+   `.aira/requirements/<ID>.md` and `check` accepts it; a ticket allocation is
+   unaffected; **crash-window** counterexamples (die between allocate and
+   materialise, both directions) recover correctly — reproduced end-to-end.
+2. Requirement entity round-trip: `NewRequirement` validates the status enum +
+   non-empty text + ID shape; `ParseRequirement`∘render == identity with
+   **JSON-in-`---`** frontmatter; malformed frontmatter and filename↔id mismatch
+   are refused writes.
+3. Store CRUD + index + reconcile rebuild; status transition validates the enum.
+4. Migration: `req import REQUIREMENTS.md` seeds `AR-1..7` with preserved IDs,
+   advances the allocator (next `req add` → `AR-8`), is idempotent, and never
+   silently overwrites a changed row.
+5. Allocator namespace/path: requirement and ticket prefixes do not collide;
+   allocation `path`/`kind` are correct; a spy asserts `req add` uses the
+   allocator (no hand-picked ID).
 
-## 7. Expected yield
+**9b**
+6. Edge discovery: fixture set (single, multi-ID, whitespace, string-literal
+   non-match, non-annotation lines) → exactly the expected edges, deterministic.
+7. Dangling: annotation → absent requirement ⇒ `E_TRACE_DANGLING`, `check`
+   verdict **fail**, reproduced end-to-end via `Run`.
+8. Uncovered/unverified honour §3.1: `built` w/o covers ⇒ `W_TRACE_UNCOVERED`
+   (warning, overall pass); `planned`/`boundary`/`retired` w/o edges ⇒ **no**
+   warning.
+9. Honesty: empty registry ⇒ `U_TRACE_EMPTY`/`unevaluated` (proven not-pass);
+   injected scan failure ⇒ `U_TRACE_UNSCANNED`/`unevaluated`.
+10. Malformed-node resolution: an annotation to a requirement whose file is
+    unreadable/ID-mismatched ⇒ `unevaluated` + `E_REQUIREMENT_INVALID`, **not**
+    `E_TRACE_DANGLING`.
+11. Mixed precedence: a run holding a dangling `fail`, a `built`-uncovered
+    warning, and an unreadable-node `unevaluated` ⇒ overall **fail**, warning not
+    reclassified, unevaluated surfaced.
+12. Advisory, not integrity: a dangling annotation does not refuse a `req`/ticket
+    write; only `check` surfaces it.
 
-Requirements become a real, ID-allocated, git-durable entity, and the
-`covers:`/`verifies:` convention becomes a checkable — but honestly advisory —
-traceability graph: broken references fail `check`, uncovered/unverified
-requirements warn, and an unscannable or empty graph reads `unevaluated` instead
-of a vacuous green. This is the data-model foundation for M10 gates (which attach
-to requirements/steps) and M11 review-depth, and it lets AIRA answer "what is
-untraced?" over its own codebase — dogfooding the traceability assistant.
+**Both**
+13. Face generation: `aira_req` MCP tool + Skill actions generated from the
+    descriptor (M8 golden/drift/parity extend to `req` with zero bespoke wiring).
+14. Build constraint: static/no-cgo; scan needs no daemon/network.
 
-## 8. Out-of-scope confirmation
+## 8. Expected yield
+
+Requirements become a real, allocator-issued, git-durable entity with a
+kind-aware allocator that no longer assumes tickets; the `AR-1..7` seed is
+migrated so the existing annotations resolve; and the `covers:`/`verifies:`
+convention becomes an honest advisory graph check: broken references fail
+`check`, status-appropriate gaps warn, unreadable nodes and empty/unscannable
+graphs read `unevaluated` — never a vacuous green. This is the foundation for
+M10 gates and M11 review-depth, and lets AIRA answer "what is untraced?" over its
+own codebase.
+
+## 9. Out-of-scope confirmation
 
 M9 adds no gates, attestations, ratchets, review emission, runner, or blocking
-enforcement, and no new store behaviour beyond the requirement entity + the
-read-only traceability scan folded into `check`. Those remain M10–M12.
+enforcement. Its only new store behaviour is the kind-aware allocator, the
+requirement entity + migration, and the read-only traceability scan folded into
+`check`. Those extensions remain M10–M12.
