@@ -111,6 +111,12 @@ func (mcpUnevaluatedStore) Check(context.Context) (store.CheckReport, error) {
 	return store.CheckReport{Verdict: "unevaluated", Unevaluated: true}, nil
 }
 
+type mcpImportStore struct{ core.Store }
+
+func (mcpImportStore) ImportFindingsFile(context.Context, string, bool) (store.ImportSummary, error) {
+	return store.ImportSummary{}, nil
+}
+
 func TestMCPToolCallRetainsUnevaluatedVerdictAndExit(t *testing.T) {
 	server := newMCPServer(func(context.Context, core.Request) (*core.Core, func(), error) {
 		return core.New(mcpUnevaluatedStore{}), func() {}, nil
@@ -138,6 +144,74 @@ func TestMCPInvalidTypedArgumentsDoNotInvokeCore(t *testing.T) {
 	}
 	if called || !strings.Contains(out.String(), `"code":"E_ARGUMENT_INVALID"`) {
 		t.Fatalf("invalid args invoked core or lost stable error: called=%v output=%s", called, out.String())
+	}
+}
+
+func TestMCPExplicitNullIDIsRequestButMissingIDIsNotification(t *testing.T) {
+	server := newMCPServer(func(context.Context, core.Request) (*core.Core, func(), error) {
+		return core.New(nil), func() {}, nil
+	})
+	input := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":null,"method":"tools/list"}`,
+		`{"jsonrpc":"2.0","method":"tools/list"}`,
+	}, "\n") + "\n"
+	var out bytes.Buffer
+	if err := server.Serve(context.Background(), strings.NewReader(input), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("responses=%q", out.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &response); err != nil {
+		t.Fatal(err)
+	}
+	if id, present := response["id"]; !present || id != nil {
+		t.Fatalf("explicit null id response=%#v", response)
+	}
+}
+
+func TestMCPFramingHandlesLargeRequestAndContinues(t *testing.T) {
+	server := newMCPServer(func(context.Context, core.Request) (*core.Core, func(), error) {
+		return core.New(mcpImportStore{}), func() {}, nil
+	})
+	large := strings.Repeat("x", 1024*1024+1)
+	input := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"aira_import","arguments":{"file":%q}}}
+{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+`, large)
+	var out bytes.Buffer
+	if err := server.Serve(context.Background(), strings.NewReader(input), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("responses=%d output prefix=%q", len(lines), out.String()[:min(len(out.String()), 200)])
+	}
+	for i, line := range lines {
+		var response mcpResponse
+		if err := json.Unmarshal([]byte(line), &response); err != nil {
+			t.Fatalf("response %d: %v", i, err)
+		}
+		if response.JSONRPC != "2.0" {
+			t.Fatalf("response %d=%#v", i, response)
+		}
+	}
+}
+
+func TestMCPRejectsUndeclaredLinkArgumentBeforeCore(t *testing.T) {
+	called := false
+	server := newMCPServer(func(context.Context, core.Request) (*core.Core, func(), error) {
+		called = true
+		return nil, nil, errors.New("E_INTERNAL: provider should not be reached")
+	})
+	message := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"aira_link","arguments":{"operation":"link","from":"AIRA-1","kind":"blocks","to":"AIRA-2","list":true}}}` + "\n"
+	var out bytes.Buffer
+	if err := server.Serve(context.Background(), strings.NewReader(message), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if called || !strings.Contains(out.String(), `"code":"E_ARGUMENT_INVALID"`) || !strings.Contains(out.String(), `unknown argument \"list\"`) {
+		t.Fatalf("hidden arg reached core or wrong error: called=%v output=%s", called, out.String())
 	}
 }
 

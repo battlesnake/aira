@@ -1,13 +1,18 @@
 package core
 
 import (
+	"context"
 	"reflect"
 	"sort"
 	"testing"
+
+	"aira/internal/domain"
+	"aira/internal/store"
 )
 
-func TestDispatchMetadataCoversEveryHandlerAndConsumedArgument(t *testing.T) {
-	c := New(nil)
+func TestDispatchMetadataMatchesInstrumentedHandlerReads(t *testing.T) {
+	initializer := func(context.Context, map[string]any) (any, error) { return nil, nil }
+	c := NewWithInitializer(metadataProbeStore{}, initializer)
 	descriptors := c.DispatchDescriptors()
 	if len(descriptors) != len(c.verbs) {
 		t.Fatalf("descriptor count=%d, dispatch count=%d", len(descriptors), len(c.verbs))
@@ -27,12 +32,129 @@ func TestDispatchMetadataCoversEveryHandlerAndConsumedArgument(t *testing.T) {
 			}
 			declared[arg.Name] = true
 		}
-		for _, consumed := range spec.Consumed {
-			if !declared[consumed] {
-				t.Fatalf("verb %q consumes undeclared arg %q", name, consumed)
+
+		read := map[string]bool{}
+		for _, values := range metadataProbeInputs(name) {
+			args := newArgAccessor(values)
+			_, _ = spec.Run(context.Background(), args)
+			for key := range args.reads {
+				read[key] = true
 			}
 		}
+		if !reflect.DeepEqual(sortedKeys(read), sortedKeys(declared)) {
+			t.Fatalf("verb %q recorded reads=%v, declared args=%v", name, sortedKeys(read), sortedKeys(declared))
+		}
 	}
+}
+
+func metadataProbeInputs(name string) []map[string]any {
+	values := map[string]any{
+		"project": "project", "prefixes": []string{"AIRA"}, "prefix": "AIRA",
+		"title": "title", "body": "body", "kind": "feature", "severity": "P1", "labels": []string{"label"},
+		"selector": "AIRA-1", "query": "query", "by": "kind", "fields": []string{"id"},
+		"file": "findings.jsonl", "strict": true, "subverb": "add", "ticket": "AIRA-1",
+		"category": "bug", "verdict": "confirmed", "source": "codex", "message": "message",
+		"line": 1, "requirement": "REQ-1", "disposition": "fixed", "reason": "reason", "actor": "actor",
+		"steal": true, "token": "token", "globs": []string{"**/*.go"}, "list": true,
+		"from": "AIRA-1", "to": "AIRA-2", "field": "title", "value": "new", "status": "planned", "rebuild": true,
+	}
+	switch name {
+	case "find":
+		values = cloneMetadataInputs(values, "by", "subtype")
+		return []map[string]any{
+			cloneMetadataInputs(values, "subverb", "add"),
+			cloneMetadataInputs(values, "subverb", "ls"),
+			cloneMetadataInputs(values, "subverb", "show"),
+			cloneMetadataInputs(values, "subverb", "set"),
+		}
+	case "link":
+		return []map[string]any{
+			cloneMetadataInputs(values, "list", false),
+			cloneMetadataInputs(values, "list", true),
+		}
+	default:
+		return []map[string]any{values}
+	}
+}
+
+func cloneMetadataInputs(values map[string]any, key string, value any) map[string]any {
+	clone := make(map[string]any, len(values)+1)
+	for name, item := range values {
+		clone[name] = item
+	}
+	clone[key] = value
+	return clone
+}
+
+func sortedKeys(values map[string]bool) []string {
+	result := make([]string, 0, len(values))
+	for key := range values {
+		result = append(result, key)
+	}
+	sort.Strings(result)
+	return result
+}
+
+type metadataProbeStore struct{}
+
+func (metadataProbeStore) AllocateID(context.Context, string) (string, error) { return "AIRA-1", nil }
+func (metadataProbeStore) CreateTicketWithEvent(context.Context, domain.CreateTicketInput) (domain.Ticket, store.EventKey, error) {
+	return domain.Ticket{ID: "AIRA-1"}, store.EventKey{}, nil
+}
+func (metadataProbeStore) Get(string) (store.TicketRecord, error) {
+	return store.TicketRecord{Ticket: domain.Ticket{ID: "AIRA-1"}}, nil
+}
+func (metadataProbeStore) List(string) ([]store.TicketRecord, error) { return nil, nil }
+func (metadataProbeStore) AddFinding(context.Context, domain.ReviewFindingInput) (domain.Finding, store.EventKey, error) {
+	return domain.Finding{Key: "F-1"}, store.EventKey{}, nil
+}
+func (metadataProbeStore) ListFindings(string) ([]store.FindingRecord, error) { return nil, nil }
+func (metadataProbeStore) ImportFindingsFile(context.Context, string, bool) (store.ImportSummary, error) {
+	return store.ImportSummary{}, nil
+}
+func (metadataProbeStore) Search(context.Context, string, string) ([]store.SearchResult, error) {
+	return nil, nil
+}
+func (metadataProbeStore) GetFinding(string) (store.FindingRecord, error) {
+	return store.FindingRecord{}, nil
+}
+func (metadataProbeStore) SetFinding(context.Context, string, domain.Disposition, string, string) (store.EventKey, error) {
+	return store.EventKey{}, nil
+}
+func (metadataProbeStore) Count(string, string) (store.CountResult, error) {
+	return store.CountResult{}, nil
+}
+func (metadataProbeStore) SetTicket(context.Context, string, string, string) (store.EventKey, error) {
+	return store.EventKey{}, nil
+}
+func (metadataProbeStore) MoveTicket(context.Context, string, domain.Status) (store.EventKey, error) {
+	return store.EventKey{}, nil
+}
+func (metadataProbeStore) Claim(context.Context, string, bool, string) (store.LeaseClaim, error) {
+	return store.LeaseClaim{}, nil
+}
+func (metadataProbeStore) Release(context.Context, string, string) (store.EventKey, error) {
+	return store.EventKey{}, nil
+}
+func (metadataProbeStore) Heartbeat(context.Context, string, string) (domain.Lease, error) {
+	return domain.Lease{}, nil
+}
+func (metadataProbeStore) Touch(context.Context, string, string, []string) (store.AreaTouchResult, error) {
+	return store.AreaTouchResult{}, nil
+}
+func (metadataProbeStore) LeaseToken(string) (string, error) { return "token", nil }
+func (metadataProbeStore) Link(context.Context, string, domain.RelationKind, string) (store.EventKey, error) {
+	return store.EventKey{}, nil
+}
+func (metadataProbeStore) Unlink(context.Context, string, domain.RelationKind, string) (store.EventKey, error) {
+	return store.EventKey{}, nil
+}
+func (metadataProbeStore) Relations(string) ([]domain.RelationView, error) { return nil, nil }
+func (metadataProbeStore) Ready(string) ([]store.ReadyRecord, error)       { return nil, nil }
+func (metadataProbeStore) Reconcile(context.Context) error                 { return nil }
+func (metadataProbeStore) Rebuild(context.Context) error                   { return nil }
+func (metadataProbeStore) Check(context.Context) (store.CheckReport, error) {
+	return store.CheckReport{}, nil
 }
 
 func TestDispatchDescriptorsAreStableReadOnlyCopies(t *testing.T) {

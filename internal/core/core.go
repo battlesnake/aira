@@ -31,6 +31,23 @@ type Response struct {
 
 type Initializer func(context.Context, map[string]any) (any, error)
 
+type argAccessor struct {
+	values map[string]any
+	reads  map[string]struct{}
+}
+
+func newArgAccessor(values map[string]any) *argAccessor {
+	return &argAccessor{values: values, reads: make(map[string]struct{})}
+}
+
+func (a *argAccessor) record(key string) any {
+	a.reads[key] = struct{}{}
+	if a.values == nil {
+		return nil
+	}
+	return a.values[key]
+}
+
 type Store interface {
 	AllocateID(context.Context, string) (string, error)
 	CreateTicketWithEvent(context.Context, domain.CreateTicketInput) (domain.Ticket, store.EventKey, error)
@@ -106,8 +123,7 @@ type verbSpec struct {
 	Args         []ArgSpec
 	MCPTool      string
 	MCPOperation string
-	Consumed     []string
-	Run          func(context.Context, map[string]any) (any, error)
+	Run          func(context.Context, *argAccessor) (any, error)
 }
 
 const ListLimit = store.ListLimit
@@ -141,7 +157,7 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 		code := "E_UNKNOWN_VERB"
 		return Response{Code: code, Error: fmt.Sprintf("unknown verb %q", req.Verb), Exit: store.ExitForCode(code)}
 	}
-	data, err := spec.Run(ctx, req.Args)
+	data, err := spec.Run(ctx, newArgAccessor(req.Args))
 	if err != nil {
 		code := store.ErrorCode(err)
 		return Response{Code: code, Error: err.Error(), Exit: errorExit(code)}
@@ -182,19 +198,19 @@ func (c *Core) DispatchDescriptors() []DispatchDescriptor {
 
 func (c *Core) dispatchTable() map[string]verbSpec {
 	return map[string]verbSpec{
-		"help": {Name: "help", Usage: "help", Consumed: []string{}, Run: func(context.Context, map[string]any) (any, error) { return c.Help(), nil }},
-		"init": {Name: "init", Usage: "init", Args: []ArgSpec{stringSpec("project", false, false, "Project slug"), listSpec("prefixes", false, false, "ID prefixes")}, MCPTool: "aira_init", Consumed: []string{"project", "prefixes"}, Run: func(ctx context.Context, args map[string]any) (any, error) {
+		"help": {Name: "help", Usage: "help", Run: func(_ context.Context, _ *argAccessor) (any, error) { return c.Help(), nil }},
+		"init": {Name: "init", Usage: "init", Args: []ArgSpec{stringSpec("project", false, false, "Project slug"), listSpec("prefixes", false, false, "ID prefixes")}, MCPTool: "aira_init", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			if c.initializer == nil {
 				return nil, fmt.Errorf("E_CONFIG_INVALID: init is unavailable without a project initializer")
 			}
-			return c.initializer(ctx, args)
+			return c.initializer(ctx, map[string]any{"project": stringArg(args, "project"), "prefixes": stringSlice(args, "prefixes")})
 		}},
-		"id": {Name: "id", Usage: "id <prefix>", Args: []ArgSpec{stringSpec("prefix", true, true, "ID prefix")}, MCPTool: "aira_id", Consumed: []string{"prefix"}, Run: func(ctx context.Context, args map[string]any) (any, error) {
+		"id": {Name: "id", Usage: "id <prefix>", Args: []ArgSpec{stringSpec("prefix", true, true, "ID prefix")}, MCPTool: "aira_id", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			prefix := stringArg(args, "prefix")
 			id, err := c.store.AllocateID(ctx, prefix)
 			return map[string]any{"id": id}, err
 		}},
-		"create": {Name: "create", Usage: "create <title> [--kind K --severity S --label L --body B]", Args: []ArgSpec{stringSpec("title", true, true, "Ticket title"), stringSpec("kind", false, false, "Ticket kind", "feature", "bug", "chore", "spike", "requirement-work"), stringSpec("severity", false, false, "Ticket severity", "P0", "P1", "P2"), stringSpec("body", false, false, "Ticket body"), listSpec("labels", false, false, "Ticket labels")}, MCPTool: "aira_create", Consumed: []string{"title", "body", "kind", "severity", "labels"}, Run: func(ctx context.Context, args map[string]any) (any, error) {
+		"create": {Name: "create", Usage: "create <title> [--kind K --severity S --label L --body B]", Args: []ArgSpec{stringSpec("title", true, true, "Ticket title"), stringSpec("kind", false, false, "Ticket kind", "feature", "bug", "chore", "spike", "requirement-work"), stringSpec("severity", false, false, "Ticket severity", "P0", "P1", "P2"), stringSpec("body", false, false, "Ticket body"), listSpec("labels", false, false, "Ticket labels")}, MCPTool: "aira_create", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			input := domain.CreateTicketInput{Title: stringArg(args, "title"), Body: stringArg(args, "body"), Kind: domain.Kind(stringArg(args, "kind")), Severity: domain.Severity(stringArg(args, "severity")), Labels: stringSlice(args, "labels")}
 			ticket, event, err := c.store.CreateTicketWithEvent(ctx, input)
 			if err != nil {
@@ -202,7 +218,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return mutationData(map[string]any{"id": ticket.ID, "path": ".aira/tickets/" + ticket.ID + ".md", "ticket": ticket}, event), nil
 		}},
-		"show": {Name: "show", Usage: "show <selector>", Args: []ArgSpec{stringSpec("selector", true, true, "Exact ticket selector"), listSpec("fields", false, false, "Optional projected fields")}, MCPTool: "aira_get", Consumed: []string{"selector", "fields"}, Run: func(_ context.Context, args map[string]any) (any, error) {
+		"show": {Name: "show", Usage: "show <selector>", Args: []ArgSpec{stringSpec("selector", true, true, "Exact ticket selector"), listSpec("fields", false, false, "Optional projected fields")}, MCPTool: "aira_get", Run: func(_ context.Context, args *argAccessor) (any, error) {
 			record, err := c.store.Get(stringArg(args, "selector"))
 			if err != nil {
 				return nil, err
@@ -214,7 +230,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return handlerData{Data: projected, Warnings: record.Warnings}, nil
 		}},
-		"grep": {Name: "grep", Usage: "grep <query> [--kind ticket|finding --by kind --fields F,...]", Args: []ArgSpec{stringSpec("query", true, true, "Search query"), stringSpec("kind", false, false, "Result kind", "ticket", "finding"), stringSpec("by", false, false, "Distribution field", "kind"), listSpec("fields", false, false, "Optional projected fields")}, MCPTool: "aira_grep", Consumed: []string{"query", "kind", "by", "fields"}, Run: func(ctx context.Context, args map[string]any) (any, error) {
+		"grep": {Name: "grep", Usage: "grep <query> [--kind ticket|finding --by kind --fields F,...]", Args: []ArgSpec{stringSpec("query", true, true, "Search query"), stringSpec("kind", false, false, "Result kind", "ticket", "finding"), stringSpec("by", false, false, "Distribution field", "kind"), listSpec("fields", false, false, "Optional projected fields")}, MCPTool: "aira_grep", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			rows, err := c.store.Search(ctx, stringArg(args, "query"), stringArg(args, "kind"))
 			if err != nil {
 				if store.ErrorCode(err) == "E_INDEX_UNEVALUATED" {
@@ -234,7 +250,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return handlerData{Data: data}, nil
 		}},
-		"import": {Name: "import", Usage: "import <file> [--strict]", Args: []ArgSpec{stringSpec("file", true, true, "Findings file"), boolSpec("strict", false, false, "Reject partial imports")}, MCPTool: "aira_import", Consumed: []string{"file", "strict"}, Run: func(ctx context.Context, args map[string]any) (any, error) {
+		"import": {Name: "import", Usage: "import <file> [--strict]", Args: []ArgSpec{stringSpec("file", true, true, "Findings file"), boolSpec("strict", false, false, "Reject partial imports")}, MCPTool: "aira_import", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			summary, err := c.store.ImportFindingsFile(ctx, stringArg(args, "file"), boolArg(args, "strict"))
 			if err != nil {
 				return nil, err
@@ -249,7 +265,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return handlerData{Data: summary, Verdict: verdict}, nil
 		}},
-		"find": {Name: "find", Usage: "find add|ls|show|set ...", Args: []ArgSpec{stringSpec("subverb", true, true, "Finding operation", "add", "ls", "show", "set"), stringSpec("ticket", false, true, "Ticket ID"), stringSpec("category", false, false, "Finding category"), stringSpec("severity", false, false, "Finding severity", "P0", "P1", "P2"), stringSpec("verdict", false, false, "Finding verdict", "confirmed", "refuted", "plausible"), stringSpec("source", false, false, "Finding source"), stringSpec("message", false, false, "Finding message"), stringSpec("file", false, false, "Finding file"), stringSpec("line", false, false, "Finding line"), stringSpec("requirement", false, false, "Requirement ID"), stringSpec("query", false, false, "Finding query"), stringSpec("by", false, false, "Distribution field"), listSpec("fields", false, false, "Optional projected fields"), stringSpec("selector", false, true, "Finding selector"), stringSpec("disposition", false, false, "Finding disposition", "open", "fixed", "waived"), stringSpec("reason", false, false, "Waiver reason"), stringSpec("actor", false, false, "Waiver actor")}, MCPTool: "aira_finding", MCPOperation: "subverb", Consumed: []string{"subverb", "ticket", "category", "severity", "verdict", "source", "message", "file", "line", "requirement", "query", "by", "fields", "selector", "disposition", "reason", "actor"}, Run: func(ctx context.Context, args map[string]any) (any, error) {
+		"find": {Name: "find", Usage: "find add|ls|show|set ...", Args: []ArgSpec{stringSpec("subverb", true, true, "Finding operation", "add", "ls", "show", "set"), stringSpec("ticket", false, true, "Ticket ID"), stringSpec("category", false, false, "Finding category"), stringSpec("severity", false, false, "Finding severity", "P0", "P1", "P2"), stringSpec("verdict", false, false, "Finding verdict", "confirmed", "refuted", "plausible"), stringSpec("source", false, false, "Finding source"), stringSpec("message", false, false, "Finding message"), stringSpec("file", false, false, "Finding file"), stringSpec("line", false, false, "Finding line"), stringSpec("requirement", false, false, "Requirement ID"), stringSpec("query", false, false, "Finding query"), stringSpec("by", false, false, "Distribution field"), listSpec("fields", false, false, "Optional projected fields"), stringSpec("selector", false, true, "Finding selector"), stringSpec("disposition", false, false, "Finding disposition", "open", "fixed", "waived"), stringSpec("reason", false, false, "Waiver reason"), stringSpec("actor", false, false, "Waiver actor")}, MCPTool: "aira_finding", MCPOperation: "subverb", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			subverb := strings.ToLower(stringArg(args, "subverb"))
 			switch subverb {
 			case "add":
@@ -304,7 +320,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				return nil, fmt.Errorf("E_UNKNOWN_VERB: unknown find sub-verb %q", subverb)
 			}
 		}},
-		"claim": {Name: "claim", Usage: "claim <id> [--steal --actor NAME]", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), boolSpec("steal", false, false, "Steal an expired lease"), stringSpec("actor", false, false, "Lease actor")}, MCPTool: "aira_claim", Consumed: []string{"selector", "steal", "actor"}, Run: func(ctx context.Context, args map[string]any) (any, error) {
+		"claim": {Name: "claim", Usage: "claim <id> [--steal --actor NAME]", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), boolSpec("steal", false, false, "Steal an expired lease"), stringSpec("actor", false, false, "Lease actor")}, MCPTool: "aira_claim", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			record, err := c.store.Get(stringArg(args, "selector"))
 			if err != nil {
 				return nil, err
@@ -315,7 +331,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return claim, nil
 		}},
-		"release": {Name: "release", Usage: "release <id>", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), stringSpec("token", false, false, "Lease token")}, MCPTool: "aira_release", Consumed: []string{"selector", "token"}, Run: func(ctx context.Context, args map[string]any) (any, error) {
+		"release": {Name: "release", Usage: "release <id>", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), stringSpec("token", false, false, "Lease token")}, MCPTool: "aira_release", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			record, err := c.store.Get(stringArg(args, "selector"))
 			if err != nil {
 				return nil, err
@@ -330,7 +346,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			event, err := c.store.Release(ctx, record.Ticket.ID, token)
 			return mutationData(map[string]any{"id": record.Ticket.ID, "released": true}, event), err
 		}},
-		"heartbeat": {Name: "heartbeat", Usage: "heartbeat <id>", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), stringSpec("token", false, false, "Lease token")}, MCPTool: "aira_heartbeat", Consumed: []string{"selector", "token"}, Run: func(ctx context.Context, args map[string]any) (any, error) {
+		"heartbeat": {Name: "heartbeat", Usage: "heartbeat <id>", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), stringSpec("token", false, false, "Lease token")}, MCPTool: "aira_heartbeat", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			record, err := c.store.Get(stringArg(args, "selector"))
 			if err != nil {
 				return nil, err
@@ -345,7 +361,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			lease, err := c.store.Heartbeat(ctx, record.Ticket.ID, token)
 			return lease, err
 		}},
-		"touch": {Name: "touch", Usage: "touch <id> <glob...>", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), stringSpec("token", false, false, "Lease token"), listSpec("globs", false, true, "Area globs")}, MCPTool: "aira_touch", Consumed: []string{"selector", "token", "globs"}, Run: func(ctx context.Context, args map[string]any) (any, error) {
+		"touch": {Name: "touch", Usage: "touch <id> <glob...>", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), stringSpec("token", false, false, "Lease token"), listSpec("globs", false, true, "Area globs")}, MCPTool: "aira_touch", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			record, err := c.store.Get(stringArg(args, "selector"))
 			if err != nil {
 				return nil, err
@@ -367,7 +383,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return handlerData{Data: result, Warnings: warnings}, nil
 		}},
-		"link": {Name: "link", Usage: "link <from> <kind> <to> | link ls <id>", Args: []ArgSpec{boolSpec("list", false, false, "List relations"), stringSpec("selector", false, true, "Ticket selector"), stringSpec("from", false, true, "Source ticket"), stringSpec("kind", false, true, "Relation kind", "blocks", "blocked-by", "parent", "child", "relates", "duplicates", "duplicated-by", "supersedes", "superseded-by", "resolves", "resolved-by"), stringSpec("to", false, true, "Target ticket")}, MCPTool: "aira_link", MCPOperation: "link", Consumed: []string{"list", "selector", "from", "kind", "to"}, Run: func(ctx context.Context, args map[string]any) (any, error) {
+		"link": {Name: "link", Usage: "link <from> <kind> <to> | link ls <id>", Args: []ArgSpec{boolSpec("list", false, false, "List relations"), stringSpec("selector", false, true, "Ticket selector"), stringSpec("from", false, true, "Source ticket"), stringSpec("kind", false, true, "Relation kind", "blocks", "blocked-by", "parent", "child", "relates", "duplicates", "duplicated-by", "supersedes", "superseded-by", "resolves", "resolved-by"), stringSpec("to", false, true, "Target ticket")}, MCPTool: "aira_link", MCPOperation: "link", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			if boolArg(args, "list") {
 				return c.store.Relations(stringArg(args, "selector"))
 			}
@@ -385,7 +401,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return mutationData(map[string]any{"from": from.Ticket.ID, "kind": stringArg(args, "kind"), "to": to.Ticket.ID}, event), nil
 		}},
-		"unlink": {Name: "unlink", Usage: "unlink <from> <kind> <to>", Args: []ArgSpec{stringSpec("from", true, true, "Source ticket"), stringSpec("kind", true, true, "Relation kind", "blocks", "blocked-by", "parent", "child", "relates", "duplicates", "duplicated-by", "supersedes", "superseded-by", "resolves", "resolved-by"), stringSpec("to", true, true, "Target ticket")}, MCPTool: "aira_link", MCPOperation: "unlink", Consumed: []string{"from", "kind", "to"}, Run: func(ctx context.Context, args map[string]any) (any, error) {
+		"unlink": {Name: "unlink", Usage: "unlink <from> <kind> <to>", Args: []ArgSpec{stringSpec("from", true, true, "Source ticket"), stringSpec("kind", true, true, "Relation kind", "blocks", "blocked-by", "parent", "child", "relates", "duplicates", "duplicated-by", "supersedes", "superseded-by", "resolves", "resolved-by"), stringSpec("to", true, true, "Target ticket")}, MCPTool: "aira_link", MCPOperation: "unlink", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			from, err := relationSelectorID(stringArg(args, "from"))
 			if err != nil {
 				return nil, err
@@ -400,7 +416,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return mutationData(map[string]any{"from": from, "kind": stringArg(args, "kind"), "to": to}, event), nil
 		}},
-		"ready": {Name: "ready", Usage: "ready [<selector>] | ready --list", Args: []ArgSpec{stringSpec("selector", false, true, "Optional ticket selector"), boolSpec("list", false, false, "Return ready list")}, MCPTool: "aira_ready", Consumed: []string{"selector", "list"}, Run: func(_ context.Context, args map[string]any) (any, error) {
+		"ready": {Name: "ready", Usage: "ready [<selector>] | ready --list", Args: []ArgSpec{stringSpec("selector", false, true, "Optional ticket selector")}, MCPTool: "aira_ready", Run: func(_ context.Context, args *argAccessor) (any, error) {
 			selector := stringArg(args, "selector")
 			rows, err := c.store.Ready(selector)
 			if err != nil {
@@ -420,7 +436,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return handlerData{Data: data, Warnings: readyWarnings(rows), Verdict: readyVerdict(rows)}, nil
 		}},
-		"list": {Name: "list", Usage: "list [query] [--by F] [--fields F,...]", Args: []ArgSpec{stringSpec("query", false, true, "Ticket query"), stringSpec("by", false, false, "Distribution field"), listSpec("fields", false, false, "Optional projected fields")}, MCPTool: "aira_list", Consumed: []string{"query", "by", "fields"}, Run: func(_ context.Context, args map[string]any) (any, error) {
+		"list": {Name: "list", Usage: "list [query] [--by F] [--fields F,...]", Args: []ArgSpec{stringSpec("query", false, true, "Ticket query"), stringSpec("by", false, false, "Distribution field"), listSpec("fields", false, false, "Optional projected fields")}, MCPTool: "aira_list", Run: func(_ context.Context, args *argAccessor) (any, error) {
 			rows, err := c.store.List(stringArg(args, "query"))
 			if err != nil {
 				return nil, err
@@ -437,11 +453,11 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return handlerData{Data: data, Warnings: recordWarnings(rows)}, nil
 		}},
-		"count": {Name: "count", Usage: "count [query] --by F", Args: []ArgSpec{stringSpec("query", false, true, "Ticket query"), stringSpec("by", true, false, "Count dimension")}, MCPTool: "aira_count", Consumed: []string{"query", "by"}, Run: func(ctx context.Context, args map[string]any) (any, error) {
+		"count": {Name: "count", Usage: "count [query] --by F", Args: []ArgSpec{stringSpec("query", false, true, "Ticket query"), stringSpec("by", true, false, "Count dimension")}, MCPTool: "aira_count", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			result, err := c.store.Count(stringArg(args, "query"), stringArg(args, "by"))
 			return handlerData{Data: result, Warnings: result.Warnings}, err
 		}},
-		"set": {Name: "set", Usage: "set <selector> <field=value>", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), stringSpec("field", true, true, "Ticket field"), stringSpec("value", true, true, "New field value")}, MCPTool: "aira_transition", MCPOperation: "set", Consumed: []string{"selector", "field", "value"}, Run: func(ctx context.Context, args map[string]any) (any, error) {
+		"set": {Name: "set", Usage: "set <selector> <field=value>", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), stringSpec("field", true, true, "Ticket field"), stringSpec("value", true, true, "New field value")}, MCPTool: "aira_transition", MCPOperation: "set", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			record, err := c.store.Get(stringArg(args, "selector"))
 			if err != nil {
 				return nil, err
@@ -460,7 +476,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return mutationData(projectRecord(updated, nil), event), nil
 		}},
-		"mv": {Name: "mv", Usage: "mv <selector> <status>", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), stringSpec("status", true, true, "Target status", "draft", "planned", "in-progress", "in-review", "done", "retired", "superseded")}, MCPTool: "aira_transition", MCPOperation: "mv", Consumed: []string{"selector", "status"}, Run: func(ctx context.Context, args map[string]any) (any, error) {
+		"mv": {Name: "mv", Usage: "mv <selector> <status>", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), stringSpec("status", true, true, "Target status", "draft", "planned", "in-progress", "in-review", "done", "retired", "superseded")}, MCPTool: "aira_transition", MCPOperation: "mv", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			record, err := c.store.Get(stringArg(args, "selector"))
 			if err != nil {
 				return nil, err
@@ -471,7 +487,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return mutationData(map[string]any{"id": record.Ticket.ID, "status": stringArg(args, "status")}, event), nil
 		}},
-		"reconcile": {Name: "reconcile", Usage: "reconcile [--rebuild]", Args: []ArgSpec{boolSpec("rebuild", false, false, "Rebuild derived indexes")}, MCPTool: "aira_reconcile", Consumed: []string{"rebuild"}, Run: func(ctx context.Context, args map[string]any) (any, error) {
+		"reconcile": {Name: "reconcile", Usage: "reconcile [--rebuild]", Args: []ArgSpec{boolSpec("rebuild", false, false, "Rebuild derived indexes")}, MCPTool: "aira_reconcile", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			if err := c.store.Reconcile(ctx); err != nil {
 				return nil, err
 			}
@@ -482,7 +498,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return map[string]any{"reconciled": true}, nil
 		}},
-		"check": {Name: "check", Usage: "check", Args: []ArgSpec{}, MCPTool: "aira_check", Consumed: []string{}, Run: func(ctx context.Context, _ map[string]any) (any, error) {
+		"check": {Name: "check", Usage: "check", Args: []ArgSpec{}, MCPTool: "aira_check", Run: func(ctx context.Context, _ *argAccessor) (any, error) {
 			return c.store.Check(ctx)
 		}},
 	}
@@ -497,11 +513,11 @@ func (c *Core) Help() []map[string]string {
 	return result
 }
 
-func stringArg(args map[string]any, key string) string {
+func stringArg(args *argAccessor, key string) string {
 	if args == nil {
 		return ""
 	}
-	value, _ := args[key].(string)
+	value, _ := args.record(key).(string)
 	return value
 }
 
@@ -517,17 +533,18 @@ func listSpec(name string, required, positional bool, description string) ArgSpe
 	return ArgSpec{Name: name, Kind: ArgKindStringList, Required: required, Positional: positional, Description: description}
 }
 
-func intArg(args map[string]any, key string) int {
+func intArg(args *argAccessor, key string) int {
 	if args == nil {
 		return 0
 	}
-	if value, ok := args[key].(int); ok {
+	value := args.record(key)
+	if value, ok := value.(int); ok {
 		return value
 	}
-	if value, ok := args[key].(float64); ok {
+	if value, ok := value.(float64); ok {
 		return int(value)
 	}
-	if value, ok := args[key].(string); ok {
+	if value, ok := value.(string); ok {
 		parsed, _ := strconv.Atoi(value)
 		return parsed
 	}
@@ -548,16 +565,19 @@ func relationSelectorID(raw string) (string, error) {
 	return id, nil
 }
 
-func boolArg(args map[string]any, key string) bool {
-	value, _ := args[key].(bool)
+func boolArg(args *argAccessor, key string) bool {
+	if args == nil {
+		return false
+	}
+	value, _ := args.record(key).(bool)
 	return value
 }
 
-func stringSlice(args map[string]any, key string) []string {
+func stringSlice(args *argAccessor, key string) []string {
 	if args == nil {
 		return nil
 	}
-	value := args[key]
+	value := args.record(key)
 	switch values := value.(type) {
 	case []string:
 		return values

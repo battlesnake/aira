@@ -8,7 +8,6 @@ import (
 	"io"
 	"sort"
 	"strconv"
-	"strings"
 
 	"aira/internal/core"
 	"aira/internal/store"
@@ -34,8 +33,9 @@ type mcpToolBinding struct {
 }
 
 type mcpOperation struct {
-	descriptor core.DispatchDescriptor
-	operation  string
+	descriptor   core.DispatchDescriptor
+	operation    string
+	declaredArgs []core.ArgSpec
 }
 
 type mcpInputSchema struct {
@@ -104,7 +104,7 @@ func makeToolBinding(name string, descriptors []core.DispatchDescriptor) mcpTool
 			if arg.Name == "subverb" {
 				if operation == "" || operation == "subverb" {
 					for _, value := range arg.Enum {
-						operations[value] = mcpOperation{descriptor: descriptor, operation: value}
+						operations[value] = makeMCPOperation(descriptor, value)
 					}
 				}
 				multiple = true
@@ -116,17 +116,17 @@ func makeToolBinding(name string, descriptors []core.DispatchDescriptor) mcpTool
 			allArgs[arg.Name] = arg
 		}
 		if operation != "" && operation != "subverb" {
-			operations[operation] = mcpOperation{descriptor: descriptor, operation: operation}
+			operations[operation] = makeMCPOperation(descriptor, operation)
 		}
 	}
 	// `link ls <id>` is the third operation of the grouped link tool.
 	if link, ok := descriptorNamed(descriptors, "link"); ok {
 		if _, exists := operations["list"]; !exists {
-			operations["list"] = mcpOperation{descriptor: link, operation: "list"}
+			operations["list"] = makeMCPOperation(link, "list")
 		}
 	}
 	if !multiple && len(operations) == 0 {
-		operations[""] = mcpOperation{descriptor: descriptors[0]}
+		operations[""] = makeMCPOperation(descriptors[0], "")
 	}
 	if len(operations) > 1 {
 		allArgs["operation"] = core.ArgSpec{Name: "operation", Kind: core.ArgKindString, Required: true, Enum: sortedOperationNames(operations), Description: "Operation"}
@@ -154,7 +154,7 @@ func makeToolBinding(name string, descriptors []core.DispatchDescriptor) mcpTool
 	schema := mcpInputSchema{Type: "object", Properties: properties}
 	if len(operations) == 1 {
 		for _, operation := range operations {
-			for _, arg := range operation.descriptor.Args {
+			for _, arg := range operation.declaredArgs {
 				if arg.Required {
 					schema.Required = append(schema.Required, arg.Name)
 				}
@@ -172,6 +172,17 @@ func makeToolBinding(name string, descriptors []core.DispatchDescriptor) mcpTool
 		tool:        mcpTool{Name: name, Description: description, InputSchema: schema},
 		byOperation: operations,
 	}
+}
+
+func makeMCPOperation(descriptor core.DispatchDescriptor, operation string) mcpOperation {
+	declared := make([]core.ArgSpec, 0, len(descriptor.Args))
+	for _, arg := range descriptor.Args {
+		if arg.Name == "subverb" || (descriptor.Name == "link" && arg.Name == "list") {
+			continue
+		}
+		declared = append(declared, arg)
+	}
+	return mcpOperation{descriptor: descriptor, operation: operation, declaredArgs: declared}
 }
 
 func descriptorNamed(descriptors []core.DispatchDescriptor, name string) (core.DispatchDescriptor, bool) {
@@ -195,24 +206,31 @@ func sortedOperationNames(operations map[string]mcpOperation) []string {
 // Serve implements the minimal line-delimited JSON-RPC stdio lifecycle. It
 // intentionally writes no diagnostics to stdout.
 func (s *mcpServer) Serve(ctx context.Context, input io.Reader, output, diagnostics io.Writer) error {
-	scanner := bufio.NewScanner(input)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		response, respond := s.handle(ctx, line)
-		if !respond {
-			continue
+	reader := bufio.NewReader(input)
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			response, respond := s.handle(ctx, []byte(line))
+			if !respond {
+				if err == io.EOF {
+					return nil
+				}
+				continue
+			}
+			if err := writeMCP(output, response); err != nil {
+				return err
+			}
 		}
-		if err := writeMCP(output, response); err != nil {
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			if diagnostics != nil {
+				_, _ = fmt.Fprintf(diagnostics, "aira mcp: %v\n", err)
+			}
 			return err
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		if diagnostics != nil {
-			_, _ = fmt.Fprintf(diagnostics, "aira mcp: %v\n", err)
-		}
-		return err
-	}
-	return nil
 }
 
 func (s *mcpServer) handle(ctx context.Context, line []byte) (mcpResponse, bool) {
@@ -288,24 +306,21 @@ func decodeMCPRequest(binding mcpToolBinding, values map[string]json.RawMessage)
 	}
 	args := map[string]any{}
 	allowed := map[string]core.ArgSpec{}
-	for _, arg := range bindingOperation.descriptor.Args {
-		if arg.Name != "subverb" {
-			allowed[arg.Name] = arg
-		}
+	for _, arg := range bindingOperation.declaredArgs {
+		allowed[arg.Name] = arg
 	}
 	for name := range values {
 		if name == "operation" {
-			continue
+			if len(binding.byOperation) > 1 {
+				continue
+			}
+			return core.Request{}, fmt.Errorf("E_ARGUMENT_INVALID: unknown argument %q", name)
 		}
 		if _, ok := allowed[name]; !ok {
 			return core.Request{}, fmt.Errorf("E_ARGUMENT_INVALID: unknown argument %q", name)
 		}
 	}
-	for _, arg := range bindingOperation.descriptor.Args {
-		if arg.Name == "subverb" {
-			args[arg.Name] = operation
-			continue
-		}
+	for _, arg := range bindingOperation.declaredArgs {
 		raw, present := values[arg.Name]
 		if !present {
 			if arg.Required {
@@ -318,6 +333,9 @@ func decodeMCPRequest(binding mcpToolBinding, values map[string]json.RawMessage)
 			return core.Request{}, err
 		}
 		args[arg.Name] = value
+	}
+	if bindingOperation.descriptor.MCPOperation == "subverb" {
+		args["subverb"] = operation
 	}
 	if bindingOperation.descriptor.Name == "link" && operation == "list" {
 		args["list"] = true
@@ -420,7 +438,7 @@ func requestID(raw json.RawMessage) any {
 }
 
 func hasRequestID(raw json.RawMessage) bool {
-	return len(raw) > 0 && strings.TrimSpace(string(raw)) != "null"
+	return len(raw) > 0
 }
 
 func writeMCP(output io.Writer, response mcpResponse) error {
