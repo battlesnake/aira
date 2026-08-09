@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 
 	"aira/internal/app"
@@ -122,6 +123,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"release": {"token": true}, "heartbeat": {"token": true},
 		"touch": {"token": true},
 		"ready": {"list": true},
+		"find":  {"category": true, "severity": true, "verdict": true, "source": true, "message": true, "file": true, "requirement": true, "by": true, "fields": true, "disposition": true, "reason": true, "actor": true},
 	}
 	for name := range options {
 		if !allowed[verb][name] {
@@ -150,6 +152,45 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			return core.Request{}, fmt.Errorf("show requires <selector>")
 		}
 		args["selector"] = positional[0]
+	case "find":
+		if len(positional) == 0 {
+			return core.Request{}, fmt.Errorf("find requires add|ls|show|set")
+		}
+		subverb := strings.ToLower(positional[0])
+		args["subverb"] = subverb
+		switch subverb {
+		case "add":
+			if len(positional) != 2 {
+				return core.Request{}, fmt.Errorf("find add requires <ticket-id>")
+			}
+			args["ticket"], args["category"], args["severity"], args["verdict"], args["source"], args["message"] = positional[1], options["category"], options["severity"], options["verdict"], options["source"], options["message"]
+			args["requirement"] = options["requirement"]
+			if rawFile := options["file"]; rawFile != "" {
+				idx := strings.LastIndexByte(rawFile, ':')
+				if idx <= 0 || idx == len(rawFile)-1 {
+					return core.Request{}, fmt.Errorf("find add --file requires path:line")
+				}
+				line, err := strconv.Atoi(rawFile[idx+1:])
+				if err != nil || line <= 0 {
+					return core.Request{}, fmt.Errorf("find add --file requires a positive line")
+				}
+				args["file"], args["line"] = rawFile[:idx], line
+			}
+		case "ls", "list":
+			args["query"], args["by"], args["fields"] = strings.Join(positional[1:], " "), options["by"], splitComma(options["fields"])
+		case "show":
+			if len(positional) != 2 {
+				return core.Request{}, fmt.Errorf("find show requires <id>")
+			}
+			args["selector"] = positional[1]
+		case "set":
+			if len(positional) != 2 {
+				return core.Request{}, fmt.Errorf("find set requires <id>")
+			}
+			args["selector"], args["disposition"], args["reason"], args["actor"] = positional[1], options["disposition"], options["reason"], options["actor"]
+		default:
+			return core.Request{}, fmt.Errorf("find requires add|ls|show|set")
+		}
 	case "list", "ls":
 		args["query"] = strings.Join(positional, " ")
 		args["by"], args["fields"] = options["by"], splitComma(options["fields"])

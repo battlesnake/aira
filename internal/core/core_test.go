@@ -28,6 +28,67 @@ func TestReadyIntegrityFailureHasFailureVerdictAndExit(t *testing.T) {
 	}
 }
 
+func TestCoreFindingVerbsUseDistinctQueryAndFileMutationPath(t *testing.T) {
+	s, base := coreTestStoreWithRoot(t)
+	c := New(s)
+	added := c.Do(context.Background(), Request{Verb: "find", Args: map[string]any{
+		"subverb": "add", "ticket": "AIRA-1", "category": "flaky-test", "severity": "P1",
+		"verdict": "confirmed", "source": "codex", "message": "race in worker", "file": "worker.go", "line": 7,
+	}})
+	if !added.OK {
+		t.Fatalf("find add: %#v", added)
+	}
+	var addedData map[string]any
+	marshalRoundTrip(t, added.Data, &addedData)
+	id, ok := addedData["id"].(string)
+	if !ok || id == "" {
+		t.Fatalf("find add data=%#v", addedData)
+	}
+	listed := c.Do(context.Background(), Request{Verb: "find", Args: map[string]any{"subverb": "ls", "query": "category:flaky-test text:\"worker\"", "by": "category"}})
+	if !listed.OK {
+		t.Fatalf("find ls: %#v", listed)
+	}
+	var listData struct {
+		Total int              `json:"total"`
+		Rows  []map[string]any `json:"rows"`
+	}
+	marshalRoundTrip(t, listed.Data, &listData)
+	if listData.Total != 1 || len(listData.Rows) != 1 {
+		t.Fatalf("find ls data=%#v", listData)
+	}
+	set := c.Do(context.Background(), Request{Verb: "find", Args: map[string]any{"subverb": "set", "selector": id, "disposition": "waived", "reason": "accepted risk", "actor": "reviewer"}})
+	if !set.OK {
+		t.Fatalf("find set: %#v", set)
+	}
+	if _, err := os.Stat(filepath.Join(base, ".aira", "findings", id+".md")); err != nil {
+		t.Fatal(err)
+	}
+	shown := c.Do(context.Background(), Request{Verb: "find", Args: map[string]any{"subverb": "show", "selector": id}})
+	if !shown.OK {
+		t.Fatalf("find show: %#v", shown)
+	}
+	var shownData map[string]any
+	marshalRoundTrip(t, shown.Data, &shownData)
+	if shownData["disposition"] != "waived" || shownData["waiver_reason"] != "accepted risk" {
+		t.Fatalf("find show data=%#v", shownData)
+	}
+}
+
+func TestCoreFindingWaiverRequiresReasonAndUsesExitTwo(t *testing.T) {
+	s, _ := coreTestStoreWithRoot(t)
+	c := New(s)
+	added := c.Do(context.Background(), Request{Verb: "find", Args: map[string]any{"subverb": "add", "ticket": "AIRA-1", "category": "bug", "severity": "P2", "verdict": "plausible", "source": "human", "message": "needs review"}})
+	if !added.OK {
+		t.Fatalf("find add: %#v", added)
+	}
+	var data map[string]any
+	marshalRoundTrip(t, added.Data, &data)
+	response := c.Do(context.Background(), Request{Verb: "find", Args: map[string]any{"subverb": "set", "selector": data["id"], "disposition": "waived"}})
+	if response.OK || response.Code != "E_WAIVER_REASON_REQUIRED" || response.Exit != 2 {
+		t.Fatalf("missing waiver reason response=%#v", response)
+	}
+}
+
 func TestReadyVerdictExitPrecedence(t *testing.T) {
 	for name, records := range map[string][]store.ReadyRecord{
 		"unevaluated over pass": {

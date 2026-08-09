@@ -35,6 +35,10 @@ type Store interface {
 	CreateTicketWithEvent(context.Context, domain.CreateTicketInput) (domain.Ticket, store.EventKey, error)
 	Get(string) (store.TicketRecord, error)
 	List(string) ([]store.TicketRecord, error)
+	AddFinding(context.Context, domain.ReviewFindingInput) (domain.Finding, store.EventKey, error)
+	ListFindings(string) ([]store.FindingRecord, error)
+	GetFinding(string) (store.FindingRecord, error)
+	SetFinding(context.Context, string, domain.Disposition, string, string) (store.EventKey, error)
 	Count(string, string) (store.CountResult, error)
 	SetTicket(context.Context, string, string, string) (store.EventKey, error)
 	MoveTicket(context.Context, string, domain.Status) (store.EventKey, error)
@@ -157,6 +161,61 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				projected["body"] = record.Body
 			}
 			return handlerData{Data: projected, Warnings: record.Warnings}, nil
+		}},
+		"find": {Name: "find", Usage: "find add|ls|show|set ...", Run: func(ctx context.Context, args map[string]any) (any, error) {
+			subverb := strings.ToLower(stringArg(args, "subverb"))
+			switch subverb {
+			case "add":
+				finding, event, err := c.store.AddFinding(ctx, domain.ReviewFindingInput{
+					TicketID: stringArg(args, "ticket"), Category: stringArg(args, "category"),
+					Severity: domain.Severity(stringArg(args, "severity")), Verdict: domain.Verdict(stringArg(args, "verdict")),
+					Source: stringArg(args, "source"), Message: stringArg(args, "message"), File: stringArg(args, "file"),
+					Line: intArg(args, "line"), RequirementID: stringArg(args, "requirement"),
+				})
+				if err != nil {
+					return nil, err
+				}
+				return mutationData(map[string]any{"id": finding.Key, "finding": finding}, event), nil
+			case "ls", "list":
+				rows, err := c.store.ListFindings(stringArg(args, "query"))
+				if err != nil {
+					return nil, err
+				}
+				by := stringArg(args, "by")
+				if by == "" {
+					by = "subtype"
+				}
+				if !store.ValidFindingDistributionField(by) {
+					return nil, fmt.Errorf("E_SELECTOR_INVALID: unsupported finding distribution field %q", by)
+				}
+				data := map[string]any{"total": len(rows), "rows": projectFindingRecords(rows, stringSlice(args, "fields"))}
+				if len(rows) > ListLimit {
+					data["rows"] = projectFindingRecords(rows[:ListLimit], stringSlice(args, "fields"))
+					data["distribution"] = findingDistribution(rows, by)
+					data["truncated"] = true
+				}
+				return handlerData{Data: data, Warnings: findingRecordWarnings(rows)}, nil
+			case "show":
+				record, err := c.store.GetFinding(stringArg(args, "selector"))
+				if err != nil {
+					return nil, err
+				}
+				return handlerData{Data: projectFindingRecord(record, nil), Warnings: record.Warnings}, nil
+			case "set":
+				key := stringArg(args, "selector")
+				disposition := domain.Disposition(stringArg(args, "disposition"))
+				event, err := c.store.SetFinding(ctx, key, disposition, stringArg(args, "reason"), stringArg(args, "actor"))
+				if err != nil {
+					return nil, err
+				}
+				updated, err := c.store.GetFinding(key)
+				if err != nil {
+					return nil, err
+				}
+				return mutationData(projectFindingRecord(updated, nil), event), nil
+			default:
+				return nil, fmt.Errorf("E_UNKNOWN_VERB: unknown find sub-verb %q", subverb)
+			}
 		}},
 		"claim": {Name: "claim", Usage: "claim <id> [--steal --actor NAME]", Run: func(ctx context.Context, args map[string]any) (any, error) {
 			record, err := c.store.Get(stringArg(args, "selector"))
@@ -359,6 +418,19 @@ func stringArg(args map[string]any, key string) string {
 	return value
 }
 
+func intArg(args map[string]any, key string) int {
+	if args == nil {
+		return 0
+	}
+	if value, ok := args[key].(int); ok {
+		return value
+	}
+	if value, ok := args[key].(float64); ok {
+		return int(value)
+	}
+	return 0
+}
+
 func relationSelectorID(raw string) (string, error) {
 	if strings.TrimSpace(raw) == "" {
 		return "", errors.New("E_SELECTOR_INVALID: relation selector is empty")
@@ -409,6 +481,88 @@ func projectRecords(records []store.TicketRecord, fields []string) []map[string]
 	result := make([]map[string]any, 0, len(records))
 	for _, record := range records {
 		result = append(result, projectRecord(record, fields))
+	}
+	return result
+}
+
+func projectFindingRecords(records []store.FindingRecord, fields []string) []map[string]any {
+	result := make([]map[string]any, 0, len(records))
+	for _, record := range records {
+		result = append(result, projectFindingRecord(record, fields))
+	}
+	return result
+}
+
+func projectFindingRecord(record store.FindingRecord, fields []string) map[string]any {
+	finding := record.Finding
+	all := map[string]any{
+		"id": finding.Key, "subtype": finding.Subtype, "ticket": finding.TicketID, "category": finding.Category,
+		"severity": finding.Severity, "verdict": finding.Verdict, "source": finding.Source,
+		"message": finding.Message, "requirement": finding.RequirementID, "file": finding.File, "line": finding.Line,
+		"disposition": finding.Disposition, "waiver_reason": finding.WaiverReason, "waiver_actor": finding.WaiverActor,
+		"code": finding.Code, "subject": finding.Subject, "details": finding.Details, "path": record.Path,
+		"worktree_id": record.WorktreeID,
+	}
+	if record.Unevaluated {
+		all["unevaluated"] = true
+		all["error"] = record.Error
+	}
+	if len(fields) == 0 {
+		return all
+	}
+	result := make(map[string]any, len(fields))
+	for _, field := range fields {
+		if value, ok := all[strings.TrimSpace(field)]; ok {
+			result[strings.TrimSpace(field)] = value
+		}
+	}
+	return result
+}
+
+func findingDistribution(records []store.FindingRecord, by string) map[string]int {
+	result := map[string]int{}
+	for _, record := range records {
+		for _, value := range storeFindingDistributionValues(record.Finding, by) {
+			result[value]++
+		}
+	}
+	return result
+}
+
+func storeFindingDistributionValues(finding domain.Finding, by string) []string {
+	value := ""
+	switch by {
+	case "subtype":
+		value = string(finding.Subtype)
+	case "category":
+		value = finding.Category
+	case "source":
+		value = finding.Source
+	case "verdict":
+		value = string(finding.Verdict)
+	case "disposition":
+		value = string(finding.Disposition)
+	case "severity":
+		value = string(finding.Severity)
+	case "ticket":
+		value = finding.TicketID
+	}
+	if value == "" {
+		value = "(none)"
+	}
+	return []string{value}
+}
+
+func findingRecordWarnings(records []store.FindingRecord) []string {
+	seen := map[string]bool{}
+	var result []string
+	for _, record := range records {
+		for _, warning := range record.Warnings {
+			if !seen[warning] {
+				seen[warning] = true
+				result = append(result, warning)
+			}
+		}
 	}
 	return result
 }

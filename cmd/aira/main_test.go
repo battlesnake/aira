@@ -71,3 +71,27 @@ func TestTouchRequestAcceptsZeroOrMoreGlobsAndTokenOption(t *testing.T) {
 		t.Fatalf("touch clear request=%#v err=%v", clearRequest, err)
 	}
 }
+
+func TestFindingRequestsMirrorSubverbSurface(t *testing.T) {
+	request, err := buildRequest("find", []string{"add", "AIRA-7"}, map[string]string{"category": "bug", "severity": "P1", "verdict": "confirmed", "source": "codex", "message": "bad", "file": "x.go:12"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Args["subverb"] != "add" || request.Args["ticket"] != "AIRA-7" || request.Args["line"] != 12 {
+		t.Fatalf("find add request=%#v", request)
+	}
+	ls, err := buildRequest("find", []string{"ls", "subtype:any"}, map[string]string{"by": "source"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ls.Args["subverb"] != "ls" || ls.Args["query"] != "subtype:any" || ls.Args["by"] != "source" {
+		t.Fatalf("find ls request=%#v", ls)
+	}
+	set, err := buildRequest("find", []string{"set", "f-id"}, map[string]string{"disposition": "waived", "reason": "accepted", "actor": "human"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set.Args["selector"] != "f-id" || set.Args["disposition"] != "waived" {
+		t.Fatalf("find set request=%#v", set)
+	}
+}

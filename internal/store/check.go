@@ -20,6 +20,7 @@ var ExitCodes = map[string]int{
 	"E_DB_BUSY":             4, "E_DB_CORRUPT": 4, "E_RECEIPT_IO": 4,
 	"E_RECONCILE_REQUIRED": 4, "E_GIT_SCAN": 4, "E_INTERNAL": 4,
 	"E_JOURNAL_CORRUPT": 4,
+	"E_FINDING_INVALID": 2, "E_WAIVER_REASON_REQUIRED": 2,
 }
 
 func ExitForCode(code string) int {
@@ -53,7 +54,7 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 	report := CheckReport{Verdict: "pass", Dimensions: map[string]string{
 		"allocated-id-file": "pass", "duplicate-id": "pass", "stale-index": "pass",
 		"orphan-worktree": "pass", "ticket-file-integrity": "pass", "reconcile-integrity": "pass",
-		"rebuild-integrity": "pass", "relation-integrity": "pass", "lease-integrity": "pass", "area-overlap": "pass",
+		"rebuild-integrity": "pass", "relation-integrity": "pass", "finding-integrity": "pass", "lease-integrity": "pass", "area-overlap": "pass",
 	}}
 	if err := ctx.Err(); err != nil {
 		report.Verdict = "unevaluated"
@@ -74,6 +75,17 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 	} else {
 		for _, finding := range findings {
 			addFinding(&report, finding, "relation-integrity")
+		}
+	}
+	if findings, err := s.findingIndexDivergence(); err != nil {
+		return CheckReport{}, err
+	} else {
+		for _, finding := range findings {
+			dimension := "finding-integrity"
+			if finding.Kind == "unevaluated" {
+				dimension = "finding-integrity"
+			}
+			addFinding(&report, finding, dimension)
 		}
 	}
 	if err := s.reconcile(ctx); err != nil {
@@ -285,7 +297,7 @@ func (s *Store) checkDuplicateIDs(ctx context.Context, report *CheckReport) erro
 func isIntegrityError(err error) bool {
 	code := ErrorCode(err)
 	switch code {
-	case "E_CONFIG_INVALID", "E_DUPLICATE_ID", "E_ID_UNRESOLVED", "E_RELATION_TARGET_MISSING", "E_RELATION_INVALID", "E_CROSS_PROJECT_RELATION", "E_RELATION_UNOBSERVABLE", "E_WRITE_CONFLICT", "E_TRANSITION_INVALID", "E_PATH_INTENT_UNRESOLVED", "E_JOURNAL_CORRUPT", "E_SELECTOR_AMBIGUOUS":
+	case "E_CONFIG_INVALID", "E_FINDING_INVALID", "E_DUPLICATE_ID", "E_ID_UNRESOLVED", "E_RELATION_TARGET_MISSING", "E_RELATION_INVALID", "E_CROSS_PROJECT_RELATION", "E_RELATION_UNOBSERVABLE", "E_WRITE_CONFLICT", "E_TRANSITION_INVALID", "E_PATH_INTENT_UNRESOLVED", "E_JOURNAL_CORRUPT", "E_SELECTOR_AMBIGUOUS":
 		return true
 	default:
 		return false
@@ -293,6 +305,19 @@ func isIntegrityError(err error) bool {
 }
 
 func addFinding(report *CheckReport, finding CheckFinding, dimension string) {
+	if finding.Kind == "unevaluated" {
+		for _, existing := range report.UnevaluatedFindings {
+			if existing.Code == finding.Code && existing.Subject == finding.Subject {
+				return
+			}
+		}
+		report.UnevaluatedFindings = append(report.UnevaluatedFindings, finding)
+		report.Unevaluated = true
+		if dimension != "" {
+			report.Dimensions[dimension] = "unevaluated"
+		}
+		return
+	}
 	for _, existing := range report.Findings {
 		if existing.Code == finding.Code && existing.Subject == finding.Subject {
 			if dimension != "" {

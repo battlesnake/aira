@@ -87,6 +87,10 @@ func anchorID(raw string) (string, bool) {
 }
 
 func parseTerms(raw string) ([]queryTerm, error) {
+	return parseTermsWithValidator(raw, validQueryField)
+}
+
+func parseTermsWithValidator(raw string, validator func(string) bool) ([]queryTerm, error) {
 	var terms []queryTerm
 	for pos := 0; pos < len(raw); {
 		for pos < len(raw) && raw[pos] == ' ' {
@@ -123,7 +127,7 @@ func parseTerms(raw string) ([]queryTerm, error) {
 			terms = append(terms, queryTerm{Field: "text", Value: value, Text: true})
 			continue
 		}
-		if !validQueryField(field) {
+		if !validator(field) {
 			return nil, fmt.Errorf("unknown query field %q", field)
 		}
 		terms = append(terms, queryTerm{Field: field, Value: value})

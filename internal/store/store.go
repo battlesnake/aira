@@ -75,12 +75,21 @@ type Intent struct {
 	WorktreeID   string
 	Seq          int64
 	Path         string
+	Kind         IntentKind
 	Precondition string
 	Intended     []byte
 	Ticket       domain.Ticket
+	Finding      domain.Finding
 	AllocationID string
 	Receipt      AllocationReceipt
 }
+
+type IntentKind string
+
+const (
+	IntentKindTicketFile  IntentKind = "ticket-file"
+	IntentKindFindingFile IntentKind = "finding-file"
+)
 
 type AllocationReceipt struct {
 	ProjectID  string `json:"project_id"`
@@ -230,6 +239,7 @@ func (s *Store) initDB(ctx context.Context) error {
             path TEXT NOT NULL, verb TEXT NOT NULL, precondition_digest TEXT NOT NULL,
             intended_digest TEXT NOT NULL, intended_bytes BLOB, materialised INTEGER NOT NULL DEFAULT 0,
             resolution TEXT, journaled INTEGER NOT NULL DEFAULT 0, allocation_id TEXT NOT NULL DEFAULT '',
+            kind TEXT NOT NULL DEFAULT 'ticket-file',
             PRIMARY KEY(project_id, seq)
         )`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS unresolved_path_intent
@@ -253,9 +263,15 @@ func (s *Store) initDB(ctx context.Context) error {
 	            PRIMARY KEY(project_id, worktree_id, kind, from_id, to_id)
 	        )`,
 		`CREATE TABLE IF NOT EXISTS findings (
-            project_id TEXT NOT NULL, finding_key TEXT NOT NULL, code TEXT NOT NULL,
-            subject TEXT NOT NULL, details TEXT NOT NULL, created_at TEXT NOT NULL,
-            PRIMARY KEY(project_id, finding_key)
+			project_id TEXT NOT NULL, worktree_id TEXT NOT NULL DEFAULT '', finding_key TEXT NOT NULL,
+			subtype TEXT NOT NULL DEFAULT 'reconciliation', code TEXT NOT NULL DEFAULT '',
+			subject TEXT NOT NULL DEFAULT '', details TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+			ticket_id TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT '', severity TEXT NOT NULL DEFAULT '',
+			verdict TEXT NOT NULL DEFAULT '', disposition TEXT NOT NULL DEFAULT 'open', source TEXT NOT NULL DEFAULT '',
+			file TEXT NOT NULL DEFAULT '', line INTEGER NOT NULL DEFAULT 0, requirement_id TEXT NOT NULL DEFAULT '',
+			waiver_reason TEXT NOT NULL DEFAULT '', waiver_actor TEXT NOT NULL DEFAULT '', canonical_file TEXT NOT NULL DEFAULT '',
+			message TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY(project_id, worktree_id, finding_key)
 	        )`,
 		`CREATE TABLE IF NOT EXISTS leases (
             project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, state TEXT NOT NULL,
@@ -282,7 +298,10 @@ func (s *Store) initDB(ctx context.Context) error {
 			return translateDBError(err)
 		}
 	}
-	return s.ensureAreaHintsGeneration(ctx)
+	if err := s.ensureOutboxKind(ctx); err != nil {
+		return err
+	}
+	return s.ensureFindingsSchema(ctx)
 }
 
 func (s *Store) ensureAreaHintsGeneration(ctx context.Context) error {
@@ -313,6 +332,106 @@ func (s *Store) ensureAreaHintsGeneration(ctx context.Context) error {
 		return translateDBError(err)
 	}
 	return nil
+}
+
+func (s *Store) ensureOutboxKind(ctx context.Context) error {
+	if hasTableColumn(ctx, s.db, "outbox", "kind") {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `ALTER TABLE outbox ADD COLUMN kind TEXT NOT NULL DEFAULT 'ticket-file'`)
+	return translateDBError(err)
+}
+
+func hasTableColumn(ctx context.Context, db interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, table, wanted string) bool {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk) == nil && name == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Store) ensureFindingsSchema(ctx context.Context) error {
+	columns := []struct{ name, definition string }{
+		{"worktree_id", `TEXT NOT NULL DEFAULT ''`},
+		{"subtype", `TEXT NOT NULL DEFAULT 'reconciliation'`},
+		{"ticket_id", `TEXT NOT NULL DEFAULT ''`}, {"category", `TEXT NOT NULL DEFAULT ''`},
+		{"severity", `TEXT NOT NULL DEFAULT ''`}, {"verdict", `TEXT NOT NULL DEFAULT ''`},
+		{"disposition", `TEXT NOT NULL DEFAULT 'open'`}, {"source", `TEXT NOT NULL DEFAULT ''`},
+		{"file", `TEXT NOT NULL DEFAULT ''`}, {"line", `INTEGER NOT NULL DEFAULT 0`},
+		{"requirement_id", `TEXT NOT NULL DEFAULT ''`}, {"waiver_reason", `TEXT NOT NULL DEFAULT ''`},
+		{"waiver_actor", `TEXT NOT NULL DEFAULT ''`}, {"canonical_file", `TEXT NOT NULL DEFAULT ''`},
+		{"message", `TEXT NOT NULL DEFAULT ''`},
+	}
+	for _, column := range columns {
+		if hasTableColumn(ctx, s.db, "findings", column.name) {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE findings ADD COLUMN `+column.name+` `+column.definition); err != nil {
+			return translateDBError(err)
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE findings SET subtype=COALESCE(NULLIF(subtype,''),'reconciliation'), message=CASE WHEN message='' THEN details ELSE message END, disposition=CASE WHEN disposition='' THEN 'open' ELSE disposition END`); err != nil {
+		return translateDBError(err)
+	}
+	if !findingsHasCompositePrimaryKey(ctx, s.db) {
+		if _, err := s.db.ExecContext(ctx, `CREATE TABLE findings_m5 (
+			project_id TEXT NOT NULL, worktree_id TEXT NOT NULL DEFAULT '', finding_key TEXT NOT NULL,
+			subtype TEXT NOT NULL DEFAULT 'reconciliation', code TEXT NOT NULL DEFAULT '', subject TEXT NOT NULL DEFAULT '', details TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+			ticket_id TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT '', severity TEXT NOT NULL DEFAULT '', verdict TEXT NOT NULL DEFAULT '', disposition TEXT NOT NULL DEFAULT 'open', source TEXT NOT NULL DEFAULT '', file TEXT NOT NULL DEFAULT '', line INTEGER NOT NULL DEFAULT 0, requirement_id TEXT NOT NULL DEFAULT '', waiver_reason TEXT NOT NULL DEFAULT '', waiver_actor TEXT NOT NULL DEFAULT '', canonical_file TEXT NOT NULL DEFAULT '', message TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY(project_id, worktree_id, finding_key)
+		)`); err != nil {
+			return translateDBError(err)
+		}
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO findings_m5(project_id,worktree_id,finding_key,subtype,code,subject,details,created_at,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,canonical_file,message) SELECT project_id,worktree_id,finding_key,subtype,code,subject,details,created_at,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,canonical_file,message FROM findings`); err != nil {
+			return translateDBError(err)
+		}
+		if _, err := s.db.ExecContext(ctx, `DROP TABLE findings`); err != nil {
+			return translateDBError(err)
+		}
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE findings_m5 RENAME TO findings`); err != nil {
+			return translateDBError(err)
+		}
+	}
+	return nil
+}
+
+func findingsHasCompositePrimaryKey(ctx context.Context, db interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}) bool {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(findings)`)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	project, worktree, key := 0, 0, 0
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk) != nil {
+			return false
+		}
+		switch name {
+		case "project_id":
+			project = pk
+		case "worktree_id":
+			worktree = pk
+		case "finding_key":
+			key = pk
+		}
+	}
+	return project > 0 && worktree > 0 && key > 0
 }
 
 func (s *Store) register(ctx context.Context) error {
@@ -499,7 +618,7 @@ func (s *Store) prepareCreate(ctx context.Context, input domain.CreateTicketInpu
 			return err
 		}
 		intent = Intent{ProjectID: s.projectID, WorktreeID: s.worktreeID, Seq: seq, Path: path,
-			Precondition: "", Intended: data, Ticket: ticket, AllocationID: id,
+			Kind: IntentKindTicketFile, Precondition: "", Intended: data, Ticket: ticket, AllocationID: id,
 			Receipt: AllocationReceipt{ProjectID: s.projectID, WorktreeID: s.worktreeID, ID: id, Path: path, Seq: seq, State: "allocated"}}
 		return nil
 	})
@@ -519,6 +638,10 @@ func (s *Store) preparePathMutation(ctx context.Context, path, precondition stri
 }
 
 func (s *Store) preparePathMutationEvent(ctx context.Context, path, precondition string, intended []byte, verb, target string) (Intent, error) {
+	return s.preparePathMutationEventKind(ctx, path, precondition, intended, verb, target, IntentKindTicketFile)
+}
+
+func (s *Store) preparePathMutationEventKind(ctx context.Context, path, precondition string, intended []byte, verb, target string, kind IntentKind) (Intent, error) {
 	path, err := filepath.Abs(path)
 	if err != nil {
 		return Intent{}, err
@@ -540,8 +663,8 @@ func (s *Store) preparePathMutationEvent(ctx context.Context, path, precondition
 		}
 		digest := digestBytes(intended)
 		if _, err := conn.ExecContext(ctx, `INSERT INTO outbox(project_id, seq, worktree_id, path, verb,
-            precondition_digest, intended_digest, intended_bytes)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, s.projectID, seq, s.worktreeID, path, verb, precondition, digest, intended); err != nil {
+            precondition_digest, intended_digest, intended_bytes, kind)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`, s.projectID, seq, s.worktreeID, path, verb, precondition, digest, intended, kind); err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "unique") {
 				return ErrPathIntentBusy
 			}
@@ -551,7 +674,7 @@ func (s *Store) preparePathMutationEvent(ctx context.Context, path, precondition
 			return err
 		}
 		intent = Intent{ProjectID: s.projectID, WorktreeID: s.worktreeID, Seq: seq, Path: path,
-			Precondition: precondition, Intended: intended}
+			Kind: kind, Precondition: precondition, Intended: intended}
 		return nil
 	})
 	return intent, err
@@ -641,6 +764,13 @@ func (s *Store) materialiseIntent(ctx context.Context, intent Intent) error {
 }
 
 func (s *Store) markMaterialised(ctx context.Context, intent Intent) error {
+	if intent.Kind == IntentKindFindingFile {
+		return s.markFindingMaterialised(ctx, intent)
+	}
+	return s.markTicketMaterialised(ctx, intent)
+}
+
+func (s *Store) markTicketMaterialised(ctx context.Context, intent Intent) error {
 	ticket, _, err := domain.ParseTicket(intent.Intended)
 	if err != nil {
 		return err
@@ -760,26 +890,18 @@ func (s *Store) intentMaterialised(ctx context.Context, intent Intent) (bool, er
 
 func (s *Store) recordFinding(ctx context.Context, intent Intent, cause error) error {
 	return s.withImmediate(ctx, func(conn *sql.Conn) error {
-		_, err := conn.ExecContext(ctx, `INSERT INTO findings(project_id, finding_key, code, subject, details, created_at)
-			VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(project_id, finding_key) DO UPDATE SET details=excluded.details`,
-			intent.ProjectID, fmt.Sprintf("reconcile:%s:%d", intent.WorktreeID, intent.Seq), "E_WRITE_CONFLICT", intent.Path,
-			cause.Error(), time.Now().UTC().Format(time.RFC3339Nano))
-		return err
+		return upsertReconciliationFinding(ctx, conn, intent.ProjectID, intent.WorktreeID, fmt.Sprintf("reconcile:%s:%d", intent.WorktreeID, intent.Seq), "E_WRITE_CONFLICT", intent.Path, cause.Error())
 	})
 }
 
 func (s *Store) recordRebuildFinding(ctx context.Context, entry registryEntry, reason string) error {
 	return s.withImmediate(ctx, func(conn *sql.Conn) error {
-		_, err := conn.ExecContext(ctx, `INSERT INTO findings(project_id, finding_key, code, subject, details, created_at)
-			VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(project_id, finding_key) DO UPDATE SET details=excluded.details`,
-			s.projectID, "rebuild:git-root:"+digestBytes([]byte(entry.Root)), "E_GIT_SCAN", entry.Root,
-			reason, time.Now().UTC().Format(time.RFC3339Nano))
-		return err
+		return upsertReconciliationFinding(ctx, conn, s.projectID, entry.WorktreeID, "rebuild:git-root:"+digestBytes([]byte(entry.Root)), "E_GIT_SCAN", entry.Root, reason)
 	})
 }
 
 func (s *Store) reconcile(ctx context.Context) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT project_id, seq, worktree_id, path, verb, precondition_digest,
+	rows, err := s.db.QueryContext(ctx, `SELECT project_id, seq, worktree_id, path, verb, kind, precondition_digest,
 		intended_digest, intended_bytes, materialised, journaled, allocation_id FROM outbox
 		WHERE project_id=? AND (worktree_id=? OR path='') AND resolution IS NULL AND (materialised=0 OR journaled=0) ORDER BY seq`, s.projectID, s.worktreeID)
 	if err != nil {
@@ -792,8 +914,9 @@ func (s *Store) reconcile(ctx context.Context) error {
 		var journaled int
 		var intended []byte
 		var verb string
+		var kind IntentKind
 		var intendedDigest string
-		if err := rows.Scan(&intent.ProjectID, &intent.Seq, &intent.WorktreeID, &intent.Path, &verb,
+		if err := rows.Scan(&intent.ProjectID, &intent.Seq, &intent.WorktreeID, &intent.Path, &verb, &kind,
 			&intent.Precondition, &intendedDigest, &intended, &materialised, &journaled, &intent.AllocationID); err != nil {
 			return err
 		}
@@ -801,6 +924,7 @@ func (s *Store) reconcile(ctx context.Context) error {
 		_ = intendedDigest
 		_ = journaled
 		intent.Intended = intended
+		intent.Kind = kind
 		pending = append(pending, intent)
 	}
 	if err := rows.Err(); err != nil {
@@ -955,6 +1079,7 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		}
 	}
 	var scanned []scannedTicket
+	var scannedFindings []scannedFinding
 	for _, entry := range entries {
 		valid, reason, gitErr := validGitRoot(entry.Root)
 		if gitErr != nil {
@@ -978,6 +1103,16 @@ func (s *Store) Rebuild(ctx context.Context) error {
 				}
 			}
 		}
+		findingScan, err := scanFindingFiles(entry.Root, entry.WorktreeID)
+		if err != nil {
+			return err
+		}
+		for _, finding := range findingScan.invalid {
+			if err := s.recordScanFinding(ctx, entry, finding); err != nil {
+				return err
+			}
+		}
+		scannedFindings = append(scannedFindings, findingScan.valid...)
 		scanned = append(scanned, tickets...)
 		for _, ticket := range tickets {
 			prefix, number := splitTicketID(ticket.Ticket.ID)
@@ -1008,6 +1143,16 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		// malformed files cannot survive a rebuild.
 		if _, err := conn.ExecContext(ctx, `DELETE FROM relations WHERE project_id=?`, s.projectID); err != nil {
 			return err
+		}
+		for _, entry := range entries {
+			if _, err := conn.ExecContext(ctx, `DELETE FROM findings WHERE project_id=? AND worktree_id=? AND subtype='review'`, s.projectID, entry.WorktreeID); err != nil {
+				return err
+			}
+		}
+		for _, finding := range scannedFindings {
+			if err := upsertReviewFinding(ctx, conn, s.projectID, finding.WorktreeID, finding.Path, finding.Finding, finding.Digest); err != nil {
+				return err
+			}
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO event_counters(project_id,next_seq) VALUES(?,?)
 			ON CONFLICT(project_id) DO UPDATE SET next_seq=CASE WHEN event_counters.next_seq < excluded.next_seq THEN excluded.next_seq ELSE event_counters.next_seq END`,
@@ -1807,11 +1952,7 @@ func (s *Store) recordScanFinding(ctx context.Context, entry registryEntry, find
 		subject = finding.Subject
 	}
 	return s.withImmediate(ctx, func(conn *sql.Conn) error {
-		_, err := conn.ExecContext(ctx, `INSERT INTO findings(project_id, finding_key, code, subject, details, created_at)
-				VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(project_id, finding_key) DO UPDATE SET details=excluded.details`,
-			s.projectID, "scan:"+entry.WorktreeID+":"+finding.Code+":"+digestBytes([]byte(subject)), finding.Code, subject,
-			finding.Message, time.Now().UTC().Format(time.RFC3339Nano))
-		return err
+		return upsertReconciliationFinding(ctx, conn, s.projectID, entry.WorktreeID, "scan:"+entry.WorktreeID+":"+finding.Code+":"+digestBytes([]byte(subject)), finding.Code, subject, finding.Message)
 	})
 }
 
