@@ -11,9 +11,15 @@ message). Returns matching entities ranked by relevance, with a snippet, over th
 distribution contract. Backed by a rebuildable SQLite FTS5 index (git files remain authoritative).
 
 ## Data model + index (non-authoritative, rebuildable)
-- A standalone FTS5 table, e.g. `search_fts(kind UNINDEXED, ref_id UNINDEXED, worktree_id UNINDEXED,
+- A standalone FTS5 table, e.g. `search_fts(project_id UNINDEXED, kind UNINDEXED, ref_id UNINDEXED, worktree_id UNINDEXED,
   content)` — `content` = ticket `Title+"\n"+Body` for a ticket, the message for a review finding;
   kind ∈ {ticket, finding}. Git files are the sole authority; the FTS table is a rebuildable index.
+- The FTS cache is scoped by both `project_id` and `worktree_id`: rebuild/rescan replacement deletes only
+  the current project slice (and, for a grep rescan, the current worktree slice), and MATCH queries include
+  the current project/worktree predicates. This is required because the state DB is machine-wide.
+- A single grep holds a brief shared writer lock across its canonical scan, project/worktree index replacement,
+  and MATCH query. A concurrent AIRA mutation therefore lands either before that grep's snapshot or after it;
+  a mutation that lands between two greps is intentionally reflected by the next grep (advisory eventual freshness).
 - **Correctness requirement (the thing to get right): `grep` results MUST reflect the CURRENT git
   files** — never stale, never missing a just-written ticket/finding. Two acceptable approaches (pick
   one, justify): (a) maintain the FTS row incrementally on every ticket/finding mutation (delete the

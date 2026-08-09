@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"aira/internal/domain"
 )
@@ -104,7 +105,7 @@ func TestSearchIsWorktreeScopedAndRebuildRemovesStaleRows(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(other.root, ".aira", "tickets", otherTicket.ID+".md")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := main.db.Exec(`INSERT INTO search_fts(kind,ref_id,worktree_id,content) VALUES('ticket','stale','main','stale row')`); err != nil {
+	if _, err := main.db.Exec(`INSERT INTO search_fts(project_id,kind,ref_id,worktree_id,content) VALUES(?,?,?,?,?)`, main.projectID, "ticket", "stale", "main", "stale row"); err != nil {
 		t.Fatal(err)
 	}
 	if err := main.Rebuild(context.Background()); err != nil {
@@ -116,6 +117,66 @@ func TestSearchIsWorktreeScopedAndRebuildRemovesStaleRows(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("stale FTS row survived rebuild: %d", count)
+	}
+}
+
+func TestSearchFTSIsProjectScopedAcrossRebuildAndMatch(t *testing.T) {
+	base := t.TempDir()
+	common := filepath.Join(base, "common")
+	state := filepath.Join(base, "state")
+	projectA, err := Open(context.Background(), Options{
+		Root: filepath.Join(base, "project-a"), CommonDir: common, DBPath: filepath.Join(state, "state.db"),
+		RegistryPath: filepath.Join(state, "registry.jsonl"), ProjectID: "project-a", WorktreeID: "main",
+		ProjectSlug: "project-a", Prefixes: []string{"AIRA"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectB, err := Open(context.Background(), Options{
+		Root: filepath.Join(base, "project-b"), CommonDir: common, DBPath: filepath.Join(state, "state.db"),
+		RegistryPath: filepath.Join(state, "registry.jsonl"), ProjectID: "project-b", WorktreeID: "main",
+		ProjectSlug: "project-b", Prefixes: []string{"BIRA"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = projectA.Close(); _ = projectB.Close() })
+	if _, err := projectA.CreateTicket(context.Background(), testCreateInput("A ticket", "projectaonly")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := projectB.CreateTicket(context.Background(), domain.CreateTicketInput{Title: "B ticket", Body: "projectbonly", Kind: domain.KindFeature, Severity: domain.SeverityP2}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := projectB.Search(context.Background(), "projectbonly", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := projectA.Rebuild(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var projectBRows int
+	if err := projectA.db.QueryRow(`SELECT count(*) FROM search_fts WHERE project_id=?`, projectB.projectID).Scan(&projectBRows); err != nil {
+		t.Fatalf("project-scoped FTS schema/query: %v", err)
+	}
+	if projectBRows != 1 {
+		t.Fatalf("project A rebuild erased project B FTS rows: %d", projectBRows)
+	}
+
+	called := false
+	projectA.beforeSearchQuery = func() error {
+		called = true
+		_, err := projectA.db.Exec(`INSERT INTO search_fts(project_id,kind,ref_id,worktree_id,content) VALUES(?,?,?,?,?)`,
+			projectB.projectID, "ticket", "BIRA-1", projectB.worktreeID, "crossprojectonly")
+		return err
+	}
+	rows, err := projectA.Search(context.Background(), "crossprojectonly", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("search query seam was not reached")
+	}
+	if len(rows) != 0 {
+		t.Fatalf("project A grep returned project B rows: %#v", rows)
 	}
 }
 
@@ -155,7 +216,84 @@ func TestRebuildReconstructsSearchRowsAfterCanonicalRemoval(t *testing.T) {
 
 func TestSearchRejectsMalformedFTSQuery(t *testing.T) {
 	s := queryTestStore(t)
-	if _, err := s.Search(context.Background(), `"unterminated`, ""); ErrorCode(err) != "E_QUERY_INVALID" {
-		t.Fatalf("malformed query error = %v", err)
+	for _, query := range []string{`"unterminated`, `nosuch:term`, `alpha AND (`} {
+		if _, err := s.Search(context.Background(), query, ""); ErrorCode(err) != "E_QUERY_INVALID" || ExitForCode(ErrorCode(err)) != 2 {
+			t.Fatalf("malformed query %q error = %v", query, err)
+		}
+	}
+}
+
+func TestSearchKeepsOneGrepSnapshotAgainstMutation(t *testing.T) {
+	s := queryTestStore(t)
+	ticket, err := s.CreateTicket(context.Background(), testCreateInput("snapshot", "oldsearchcontent"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mutationAtWrite := make(chan struct{})
+	allowWrite := make(chan struct{})
+	mutationDone := make(chan error, 1)
+	allowClosed := false
+	s.beforeMaterialise = func(intent Intent) error {
+		if intent.Kind != IntentKindTicketFile || intent.Ticket.ID != ticket.ID {
+			return nil
+		}
+		close(mutationAtWrite)
+		<-allowWrite
+		return nil
+	}
+	interleaved := false
+	s.beforeSearchReconcileCommit = func() {
+		go func() {
+			_, mutationErr := s.SetTicket(context.Background(), ticket.ID, "body", "newsearchcontent")
+			mutationDone <- mutationErr
+		}()
+		select {
+		case <-mutationAtWrite:
+			interleaved = true
+			close(allowWrite)
+			allowClosed = true
+			if mutationErr := <-mutationDone; mutationErr != nil {
+				t.Errorf("concurrent mutation: %v", mutationErr)
+			}
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+	rows, err := s.Search(context.Background(), "oldsearchcontent", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case mutationErr := <-mutationDone:
+		if mutationErr != nil {
+			t.Fatal(mutationErr)
+		}
+	default:
+		if !allowClosed {
+			close(allowWrite)
+		}
+		if mutationErr := <-mutationDone; mutationErr != nil {
+			t.Fatal(mutationErr)
+		}
+	}
+	if interleaved {
+		t.Fatalf("mutation interleaved with grep snapshot; rows=%#v", rows)
+	}
+	if len(rows) != 1 || rows[0].ID != ticket.ID {
+		t.Fatalf("snapshot result = %#v", rows)
+	}
+	s.beforeSearchReconcileCommit = nil
+	if rows, err := s.Search(context.Background(), "newsearchcontent", ""); err != nil || len(rows) != 1 {
+		t.Fatalf("next grep did not reflect eventual mutation: %#v, %v", rows, err)
+	}
+}
+
+func TestSearchRealIndexFailureIsUnevaluated(t *testing.T) {
+	s := queryTestStore(t)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Search(context.Background(), "anything", ""); ErrorCode(err) != "E_INDEX_UNEVALUATED" || ExitForCode(ErrorCode(err)) != 3 {
+		t.Fatalf("closed search store error = %v", err)
 	}
 }

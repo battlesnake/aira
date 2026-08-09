@@ -74,6 +74,12 @@ type Store struct {
 	// findingsMigrationHook is a test-only seam for crash points between
 	// transactional schema-migration statements; production leaves it nil.
 	findingsMigrationHook func(string) error
+	// beforeSearchQuery is a test-only seam between search index replacement
+	// and the MATCH query; production leaves it nil.
+	beforeSearchQuery func() error
+	// beforeSearchReconcileCommit is a test-only seam after the canonical scan
+	// and before its replacement transaction; production leaves it nil.
+	beforeSearchReconcileCommit func()
 }
 
 type Intent struct {
@@ -385,11 +391,18 @@ func hasTable(ctx context.Context, db interface {
 }
 
 func (s *Store) ensureSearchFTS(ctx context.Context) error {
-	if hasTable(ctx, s.db, "search_fts") {
+	if hasTable(ctx, s.db, "search_fts") && hasTableColumn(ctx, s.db, "search_fts", "project_id") && hasTableColumn(ctx, s.db, "search_fts", "worktree_id") {
 		return nil
 	}
+	if hasTable(ctx, s.db, "search_fts") {
+		// The FTS table is disposable. Drop the pre-M6 schema rather than
+		// attempting to ALTER a virtual table; the next search/rebuild repopulates it.
+		if _, err := s.db.ExecContext(ctx, `DROP TABLE search_fts`); err != nil {
+			return translateDBError(err)
+		}
+	}
 	_, err := s.db.ExecContext(ctx, `CREATE VIRTUAL TABLE search_fts USING fts5(
-		kind UNINDEXED, ref_id UNINDEXED, worktree_id UNINDEXED, content
+		project_id UNINDEXED, kind UNINDEXED, ref_id UNINDEXED, worktree_id UNINDEXED, content
 	)`)
 	return translateDBError(err)
 }
@@ -822,6 +835,11 @@ func (s *Store) materialiseIntent(ctx context.Context, intent Intent) error {
 	if len(intent.Intended) == 0 {
 		return nil
 	}
+	searchLock, err := s.acquireSearchLock()
+	if err != nil {
+		return err
+	}
+	defer unlockFile(searchLock)
 	lock, err := acquireLock(s.pathLockFor(intent.WorktreeID, intent.Path))
 	if err != nil {
 		return err
@@ -1158,6 +1176,11 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		return err
 	}
 	defer unlockFile(findingLock)
+	searchLock, err := s.acquireSearchLock()
+	if err != nil {
+		return err
+	}
+	defer unlockFile(searchLock)
 	receiptKeys := make(map[string]bool, len(receipts))
 	maxima := map[string]int64{}
 	maxSeq := int64(0)
@@ -1251,7 +1274,7 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		if _, err := conn.ExecContext(ctx, `DELETE FROM relations WHERE project_id=?`, s.projectID); err != nil {
 			return err
 		}
-		if _, err := conn.ExecContext(ctx, `DELETE FROM search_fts`); err != nil {
+		if _, err := conn.ExecContext(ctx, `DELETE FROM search_fts WHERE project_id=?`, s.projectID); err != nil {
 			return err
 		}
 		for _, entry := range entries {
@@ -1264,7 +1287,7 @@ func (s *Store) Rebuild(ctx context.Context) error {
 				return err
 			}
 		}
-		if err := insertSearchRows(ctx, conn, scanned, scannedFindings); err != nil {
+		if err := insertSearchRows(ctx, conn, s.projectID, scanned, scannedFindings); err != nil {
 			return err
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO event_counters(project_id,next_seq) VALUES(?,?)

@@ -884,9 +884,11 @@ func TestGrepOverflowProjectsFieldsAndDistributesByKind(t *testing.T) {
 
 func TestGrepMalformedQueryUsesQueryError(t *testing.T) {
 	c := New(coreTestStore(t))
-	response := c.Do(context.Background(), Request{Verb: "grep", Args: map[string]any{"query": `"unterminated`}})
-	if response.OK || response.Code != "E_QUERY_INVALID" || response.Exit != 2 {
-		t.Fatalf("malformed grep response = %#v", response)
+	for _, query := range []string{`"unterminated`, "nosuch:term", "alpha AND ("} {
+		response := c.Do(context.Background(), Request{Verb: "grep", Args: map[string]any{"query": query}})
+		if response.OK || response.Code != "E_QUERY_INVALID" || response.Exit != 2 {
+			t.Fatalf("malformed grep %q response = %#v", query, response)
+		}
 	}
 }
 

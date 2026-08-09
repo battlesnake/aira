@@ -5,9 +5,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"aira/internal/domain"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // SearchResult is the small, transport-neutral result returned by grep.
@@ -23,6 +27,10 @@ var ErrSearchUnevaluated = errors.New("E_INDEX_UNEVALUATED: search index could n
 // Search reconciles the disposable FTS cache from the current canonical files
 // before every query. Git files therefore remain authoritative even after
 // direct edits, interrupted mutations, or removal of an indexed entity.
+// The scan, replacement, and MATCH query share a brief search writer lock with
+// AIRA mutations and other greps, so one grep observes one canonical snapshot.
+// A mutation that lands after this lock is released is intentionally reflected
+// by the next grep: freshness across separate greps is advisory/eventual.
 func (s *Store) Search(ctx context.Context, query, kind string) ([]SearchResult, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
@@ -31,13 +39,23 @@ func (s *Store) Search(ctx context.Context, query, kind string) ([]SearchResult,
 	if kind != "" && kind != "ticket" && kind != "finding" {
 		return nil, fmt.Errorf("E_QUERY_INVALID: unsupported grep kind %q", kind)
 	}
+	lock, err := s.acquireSearchLock()
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrSearchUnevaluated, err)
+	}
+	defer unlockFile(lock)
 	if err := s.reconcileSearchIndex(ctx); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrSearchUnevaluated, err)
 	}
+	if s.beforeSearchQuery != nil {
+		if err := s.beforeSearchQuery(); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrSearchUnevaluated, err)
+		}
+	}
 
 	sqlQuery := `SELECT kind, ref_id, snippet(search_fts, 3, '[', ']', '…', 32), bm25(search_fts)
-		FROM search_fts WHERE search_fts MATCH ? AND worktree_id=?`
-	args := []any{query, s.worktreeID}
+		FROM search_fts WHERE search_fts MATCH ? AND project_id=? AND worktree_id=?`
+	args := []any{query, s.projectID, s.worktreeID}
 	if kind != "" {
 		sqlQuery += ` AND kind=?`
 		args = append(args, kind)
@@ -45,7 +63,7 @@ func (s *Store) Search(ctx context.Context, query, kind string) ([]SearchResult,
 	sqlQuery += ` ORDER BY bm25(search_fts) ASC, kind ASC, ref_id ASC`
 	rows, err := s.db.QueryContext(ctx, sqlQuery, args...)
 	if err != nil {
-		if isFTSQueryError(err) {
+		if isFTSUserQueryError(err) {
 			return nil, fmt.Errorf("E_QUERY_INVALID: %w", err)
 		}
 		return nil, fmt.Errorf("%w: %v", ErrSearchUnevaluated, err)
@@ -60,15 +78,20 @@ func (s *Store) Search(ctx context.Context, query, kind string) ([]SearchResult,
 		result = append(result, row)
 	}
 	if err := rows.Err(); err != nil {
+		if isFTSUserQueryError(err) {
+			return nil, fmt.Errorf("E_QUERY_INVALID: %w", err)
+		}
 		return nil, fmt.Errorf("%w: %v", ErrSearchUnevaluated, err)
 	}
 	return result, nil
 }
 
-func isFTSQueryError(err error) bool {
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "fts5") || strings.Contains(message, "malformed match") ||
-		strings.Contains(message, "unterminated") || strings.Contains(message, "syntax error")
+func isFTSUserQueryError(err error) bool {
+	var sqliteErr *sqlite.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	return sqliteErr.Code()&0xff == sqlite3.SQLITE_ERROR
 }
 
 func (s *Store) reconcileSearchIndex(ctx context.Context) error {
@@ -80,18 +103,25 @@ func (s *Store) reconcileSearchIndex(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if s.beforeSearchReconcileCommit != nil {
+		s.beforeSearchReconcileCommit()
+	}
 	return s.withImmediate(ctx, func(conn *sql.Conn) error {
-		if _, err := conn.ExecContext(ctx, `DELETE FROM search_fts WHERE worktree_id=?`, s.worktreeID); err != nil {
+		if _, err := conn.ExecContext(ctx, `DELETE FROM search_fts WHERE project_id=? AND worktree_id=?`, s.projectID, s.worktreeID); err != nil {
 			return err
 		}
-		return insertSearchRows(ctx, conn, tickets, findings.valid)
+		return insertSearchRows(ctx, conn, s.projectID, tickets, findings.valid)
 	})
 }
 
-func insertSearchRows(ctx context.Context, conn *sql.Conn, tickets []scannedTicket, findings []scannedFinding) error {
+func (s *Store) acquireSearchLock() (*os.File, error) {
+	return acquireLock(filepath.Join(filepath.Dir(s.dbPath), "search-rebuild.lock"))
+}
+
+func insertSearchRows(ctx context.Context, conn *sql.Conn, projectID string, tickets []scannedTicket, findings []scannedFinding) error {
 	for _, ticket := range tickets {
-		if _, err := conn.ExecContext(ctx, `INSERT INTO search_fts(kind,ref_id,worktree_id,content) VALUES(?,?,?,?)`,
-			"ticket", ticket.Ticket.ID, ticket.WorktreeID, ticket.Ticket.Title+"\n"+ticket.Body); err != nil {
+		if _, err := conn.ExecContext(ctx, `INSERT INTO search_fts(project_id,kind,ref_id,worktree_id,content) VALUES(?,?,?,?,?)`,
+			projectID, "ticket", ticket.Ticket.ID, ticket.WorktreeID, ticket.Ticket.Title+"\n"+ticket.Body); err != nil {
 			return err
 		}
 	}
@@ -99,8 +129,8 @@ func insertSearchRows(ctx context.Context, conn *sql.Conn, tickets []scannedTick
 		if finding.Finding.Subtype != domain.FindingSubtypeReview {
 			continue
 		}
-		if _, err := conn.ExecContext(ctx, `INSERT INTO search_fts(kind,ref_id,worktree_id,content) VALUES(?,?,?,?)`,
-			"finding", finding.Finding.Key, finding.WorktreeID, finding.Finding.Message); err != nil {
+		if _, err := conn.ExecContext(ctx, `INSERT INTO search_fts(project_id,kind,ref_id,worktree_id,content) VALUES(?,?,?,?,?)`,
+			projectID, "finding", finding.Finding.Key, finding.WorktreeID, finding.Finding.Message); err != nil {
 			return err
 		}
 	}
