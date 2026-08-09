@@ -5,6 +5,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -216,19 +217,19 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			return mutationData(map[string]any{"from": from.Ticket.ID, "kind": stringArg(args, "kind"), "to": to.Ticket.ID}, event), nil
 		}},
 		"unlink": {Name: "unlink", Usage: "unlink <from> <kind> <to>", Run: func(ctx context.Context, args map[string]any) (any, error) {
-			from, err := c.store.Get(stringArg(args, "from"))
+			from, err := relationSelectorID(stringArg(args, "from"))
 			if err != nil {
 				return nil, err
 			}
-			to, err := c.store.Get(stringArg(args, "to"))
+			to, err := relationSelectorID(stringArg(args, "to"))
 			if err != nil {
 				return nil, err
 			}
-			event, err := c.store.Unlink(ctx, from.Ticket.ID, domain.RelationKind(stringArg(args, "kind")), to.Ticket.ID)
+			event, err := c.store.Unlink(ctx, from, domain.RelationKind(stringArg(args, "kind")), to)
 			if err != nil {
 				return nil, err
 			}
-			return mutationData(map[string]any{"from": from.Ticket.ID, "kind": stringArg(args, "kind"), "to": to.Ticket.ID}, event), nil
+			return mutationData(map[string]any{"from": from, "kind": stringArg(args, "kind"), "to": to}, event), nil
 		}},
 		"ready": {Name: "ready", Usage: "ready [<selector>] | ready --list", Run: func(_ context.Context, args map[string]any) (any, error) {
 			selector := stringArg(args, "selector")
@@ -333,6 +334,20 @@ func stringArg(args map[string]any, key string) string {
 	}
 	value, _ := args[key].(string)
 	return value
+}
+
+func relationSelectorID(raw string) (string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return "", errors.New("E_SELECTOR_INVALID: relation selector is empty")
+	}
+	id, err := store.ParseSelector(raw)
+	if err != nil {
+		return "", err
+	}
+	if err := domain.ValidateID(id); err != nil {
+		return "", errors.New("E_SELECTOR_INVALID: relation selector must be an exact ID or file anchor")
+	}
+	return id, nil
 }
 
 func boolArg(args map[string]any, key string) bool {

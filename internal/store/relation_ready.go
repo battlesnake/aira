@@ -91,18 +91,6 @@ func (s *Store) scanStoredRelations() ([]storedRelation, map[string]domain.Ticke
 	return scanStoredRelationsAt(s.root, s.worktreeID, s.projectSlug)
 }
 
-func relationIntegrityError(findings []CheckFinding, id string) error {
-	for _, finding := range findings {
-		if finding.Code != "E_RELATION_TARGET_MISSING" && finding.Code != "E_RELATION_INVALID" && finding.Code != "E_CROSS_PROJECT_RELATION" && finding.Code != "E_RELATION_UNOBSERVABLE" {
-			continue
-		}
-		if finding.Subject == id || relationFindingHasEndpoint(finding, id) {
-			return fmt.Errorf("%s: %s", finding.Code, finding.Message)
-		}
-	}
-	return nil
-}
-
 func (s *Store) Link(ctx context.Context, from string, kind domain.RelationKind, to string) (EventKey, error) {
 	if err := domain.ValidateID(from); err != nil {
 		return EventKey{}, err
@@ -241,13 +229,16 @@ func (s *Store) Relations(id string) ([]domain.RelationView, error) {
 }
 
 func (s *Store) derivedRelationViews(id string) ([]domain.RelationView, error) {
+	views, _, err := s.derivedRelationViewsWithWarnings(id)
+	return views, err
+}
+
+func (s *Store) derivedRelationViewsWithWarnings(id string) ([]domain.RelationView, []string, error) {
 	relations, _, findings, err := s.scanStoredRelations()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if err := relationIntegrityError(findings, id); err != nil {
-		return nil, err
-	}
+	warnings := relationIntegrityWarnings(findings, id)
 	views := make([]domain.RelationView, 0)
 	for _, relation := range relations {
 		if relation.Relation.From == id {
@@ -265,7 +256,31 @@ func (s *Store) derivedRelationViews(id string) ([]domain.RelationView, error) {
 		}
 		return domain.IDLess(views[i].To, views[j].To)
 	})
-	return views, nil
+	return views, warnings, nil
+}
+
+func relationIntegrityWarnings(findings []CheckFinding, id string) []string {
+	var warnings []string
+	for _, finding := range findings {
+		if finding.Subject != id && !relationFindingHasEndpoint(finding, id) {
+			continue
+		}
+		var warning string
+		switch finding.Code {
+		case "E_RELATION_TARGET_MISSING":
+			warning = "W_RELATION_TARGET_MISSING"
+		case "E_RELATION_INVALID":
+			warning = "W_RELATION_INVALID"
+		case "E_CROSS_PROJECT_RELATION":
+			warning = "W_CROSS_PROJECT_RELATION"
+		case "E_RELATION_UNOBSERVABLE":
+			warning = "W_RELATION_UNOBSERVABLE"
+		}
+		if warning != "" && !containsString(warnings, warning) {
+			warnings = append(warnings, warning)
+		}
+	}
+	return warnings
 }
 
 func relationIndexKey(relation storedRelation) string {

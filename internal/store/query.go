@@ -273,21 +273,31 @@ func (s *Store) exactRecord(id, anchor string) (TicketRecord, error) {
 		return TicketRecord{}, fmt.Errorf("E_CONFIG_INVALID: filename/frontmatter mismatch %s", repoPath(s.root, path))
 	}
 	record := TicketRecord{Ticket: ticket, Body: body, Path: repoPath(s.root, path), WorktreeID: s.worktreeID, Digest: digestBytes(data)}
-	if relations, relationErr := s.derivedRelationViews(id); relationErr != nil {
+	if relations, relationWarnings, relationErr := s.derivedRelationViewsWithWarnings(id); relationErr != nil {
 		return TicketRecord{}, relationErr
 	} else {
 		record.Relations = relations
+		record.Warnings = appendUniqueStrings(record.Warnings, relationWarnings...)
 	}
 	var indexedDigest string
 	err = s.db.QueryRow(`SELECT digest FROM tickets WHERE project_id=? AND worktree_id=? AND id=?`, s.projectID, s.worktreeID, id).Scan(&indexedDigest)
 	if err == nil && indexedDigest != record.Digest {
-		record.Warnings = []string{"W_STALE_INDEX"}
+		record.Warnings = appendUniqueStrings(record.Warnings, "W_STALE_INDEX")
 	} else if errors.Is(err, sql.ErrNoRows) {
-		record.Warnings = []string{"W_STALE_INDEX"}
+		record.Warnings = appendUniqueStrings(record.Warnings, "W_STALE_INDEX")
 	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return TicketRecord{}, err
 	}
 	return record, nil
+}
+
+func appendUniqueStrings(values []string, additions ...string) []string {
+	for _, addition := range additions {
+		if !containsString(values, addition) {
+			values = append(values, addition)
+		}
+	}
+	return values
 }
 
 // ticketExists validates only the ticket file itself. Lease coordination uses

@@ -3,8 +3,10 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"aira/internal/domain"
@@ -217,6 +219,132 @@ func TestDispatchesM3CoordinationVerbsThroughCore(t *testing.T) {
 	}
 }
 
+func TestCoreUnlinkRepairsMissingTargetThroughDispatch(t *testing.T) {
+	s, base := coreTestStoreWithRoot(t)
+	c := New(s)
+	create := func(title string) string {
+		response := c.Do(context.Background(), Request{Verb: "create", Args: map[string]any{"title": title}})
+		if !response.OK {
+			t.Fatalf("create %s: %#v", title, response)
+		}
+		var data map[string]any
+		marshalRoundTrip(t, response.Data, &data)
+		return data["id"].(string)
+	}
+	owner, target := create("repair owner"), create("repair target")
+	if response := c.Do(context.Background(), Request{Verb: "link", Args: map[string]any{
+		"from": owner, "kind": "blocks", "to": target,
+	}}); !response.OK {
+		t.Fatalf("link: %#v", response)
+	}
+	if err := os.Remove(filepath.Join(base, ".aira", "tickets", target+".md")); err != nil {
+		t.Fatal(err)
+	}
+
+	response := c.Do(context.Background(), Request{Verb: "unlink", Args: map[string]any{
+		"from": owner, "kind": "blocks", "to": target,
+	}})
+	if !response.OK {
+		t.Fatalf("dispatch unlink repair: %#v", response)
+	}
+	data, err := os.ReadFile(filepath.Join(base, ".aira", "tickets", owner+".md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), `"kind":"blocks"`) {
+		t.Fatalf("unlink left relation in owner file: %s", data)
+	}
+	show := c.Do(context.Background(), Request{Verb: "show", Args: map[string]any{"selector": owner}})
+	if !show.OK {
+		t.Fatalf("show after repair: %#v", show)
+	}
+}
+
+func TestCoreOwnerReadAndEditRemainAvailableWithMissingRelationTarget(t *testing.T) {
+	s, base := coreTestStoreWithRoot(t)
+	c := New(s)
+	create := func(title string) string {
+		response := c.Do(context.Background(), Request{Verb: "create", Args: map[string]any{"title": title}})
+		if !response.OK {
+			t.Fatalf("create %s: %#v", title, response)
+		}
+		var data map[string]any
+		marshalRoundTrip(t, response.Data, &data)
+		return data["id"].(string)
+	}
+	owner, target, unrelated, replacement := create("owner"), create("target"), create("unrelated"), create("replacement")
+	if response := c.Do(context.Background(), Request{Verb: "link", Args: map[string]any{
+		"from": owner, "kind": "blocks", "to": target,
+	}}); !response.OK {
+		t.Fatalf("link: %#v", response)
+	}
+	if err := os.Remove(filepath.Join(base, ".aira", "tickets", target+".md")); err != nil {
+		t.Fatal(err)
+	}
+
+	show := c.Do(context.Background(), Request{Verb: "show", Args: map[string]any{"selector": owner}})
+	if !show.OK || len(show.Warnings) == 0 || show.Warnings[0] != "W_RELATION_TARGET_MISSING" {
+		t.Fatalf("owner show with dangling relation: %#v", show)
+	}
+	var shown map[string]any
+	marshalRoundTrip(t, show.Data, &shown)
+	if relations, ok := shown["relations"].([]any); !ok || len(relations) != 1 {
+		t.Fatalf("owner show did not retain dangling relation view: %#v", shown)
+	}
+	if response := c.Do(context.Background(), Request{Verb: "show", Args: map[string]any{"selector": unrelated}}); !response.OK {
+		t.Fatalf("unrelated show: %#v", response)
+	}
+	if response := c.Do(context.Background(), Request{Verb: "link", Args: map[string]any{
+		"from": owner, "kind": "blocks", "to": replacement,
+	}}); !response.OK {
+		t.Fatalf("owner link: %#v", response)
+	}
+	if response := c.Do(context.Background(), Request{Verb: "set", Args: map[string]any{
+		"selector": owner, "field": "label", "value": "repairable",
+	}}); !response.OK {
+		t.Fatalf("owner set: %#v", response)
+	}
+	if response := c.Do(context.Background(), Request{Verb: "mv", Args: map[string]any{
+		"selector": owner, "status": "in-progress",
+	}}); !response.OK {
+		t.Fatalf("owner mv: %#v", response)
+	}
+}
+
+func TestCoreOwnerLeaseVerbsRemainAvailableWithMissingRelationTarget(t *testing.T) {
+	s, clock, base := coreTestStoreWithClock(t)
+	c := New(s)
+	create := func(title string) string {
+		response := c.Do(context.Background(), Request{Verb: "create", Args: map[string]any{"title": title}})
+		if !response.OK {
+			t.Fatalf("create %s: %#v", title, response)
+		}
+		var data map[string]any
+		marshalRoundTrip(t, response.Data, &data)
+		return data["id"].(string)
+	}
+	owner, target := create("lease owner"), create("lease target")
+	if response := c.Do(context.Background(), Request{Verb: "link", Args: map[string]any{
+		"from": owner, "kind": "blocks", "to": target,
+	}}); !response.OK {
+		t.Fatalf("link: %#v", response)
+	}
+	claim := c.Do(context.Background(), Request{Verb: "claim", Args: map[string]any{"selector": owner, "actor": "holder"}})
+	if !claim.OK {
+		t.Fatalf("claim: %#v", claim)
+	}
+	if err := os.Remove(filepath.Join(base, ".aira", "tickets", target+".md")); err != nil {
+		t.Fatal(err)
+	}
+	clock.mono = 200
+	if response := c.Do(context.Background(), Request{Verb: "heartbeat", Args: map[string]any{"selector": owner}}); !response.OK {
+		t.Fatalf("heartbeat: %#v", response)
+	}
+	if response := c.Do(context.Background(), Request{Verb: "release", Args: map[string]any{"selector": owner}}); !response.OK {
+		t.Fatalf("release: %#v", response)
+	}
+}
+
 func TestLeaseJSONShapeThroughCoreClaimAndHeartbeat(t *testing.T) {
 	s := coreTestStore(t)
 	c := New(s)
@@ -341,8 +469,45 @@ func TestCheckVerdictPrecedence(t *testing.T) {
 }
 
 func coreTestStore(t *testing.T) *store.Store {
+	s, _ := coreTestStoreWithRoot(t)
+	return s
+}
+
+func coreTestStoreWithRoot(t *testing.T) (*store.Store, string) {
 	t.Helper()
 	base := t.TempDir()
+	return coreTestStoreAt(t, base)
+}
+
+func coreTestStoreWithClock(t *testing.T) (*store.Store, *testCoreClock, string) {
+	t.Helper()
+	base := t.TempDir()
+	if err := exec.Command("git", "-C", base, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
+	}
+	clock := &testCoreClock{boot: "boot-core", mono: 100}
+	s, err := store.Open(context.Background(), store.Options{
+		Root: base, CommonDir: base + "/common", DBPath: base + "/state/state.db",
+		RegistryPath: base + "/state/registry.jsonl", ProjectID: "project-core",
+		WorktreeID: "main", ProjectSlug: "core-project", Prefixes: []string{"AIRA"}, Clock: clock, LeaseTTLNS: 900,
+		LeaseStateDir: filepath.Join(base, "lease-state"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s, clock, base
+}
+
+type testCoreClock struct {
+	boot string
+	mono uint64
+}
+
+func (c *testCoreClock) Now() (string, uint64, error) { return c.boot, c.mono, nil }
+
+func coreTestStoreAt(t *testing.T, base string) (*store.Store, string) {
+	t.Helper()
 	if err := exec.Command("git", "-C", base, "init", "-q").Run(); err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +520,7 @@ func coreTestStore(t *testing.T) *store.Store {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	return s
+	return s, base
 }
 
 func marshalRoundTrip(t *testing.T, value any, target any) {
