@@ -28,7 +28,6 @@ type ImportSummary struct {
 	Total    int          `json:"total"`
 }
 
-const maxLineLength = 8 * 1024 * 1024
 
 type rawFinding struct {
 	Subtype      string `json:"subtype"`
@@ -65,71 +64,65 @@ func (s *Store) ImportFindingsFile(ctx context.Context, path string, strict bool
 }
 
 func (s *Store) ImportFindings(ctx context.Context, r io.Reader, strict bool) (ImportSummary, error) {
-	scanner := bufio.NewScanner(r)
-	buf := make([]byte, 0, bufio.MaxScanTokenSize)
-	scanner.Buffer(buf, maxLineLength)
+	reader := bufio.NewReader(r)
 
+	type validRecord struct {
+		input   domain.ReviewFindingInput
+		line    int
+		existed bool
+	}
 	var (
-		validInputs []struct {
-			input domain.ReviewFindingInput
-			line  int
-		}
+		valid []validRecord
 		skips []ImportSkip
 		total int
 	)
 
-	// Pass 1: parse and validate all non-blank lines.
-	for lineNum := 1; scanner.Scan(); lineNum++ {
-		line := scanner.Text()
-		// Trim whitespace; if empty, skip (not a record).
-		if strings.TrimSpace(line) == "" {
-			continue
+	// Pass 1: read every line (bufio.Reader has no fixed line-length limit, so a
+	// long line is never silently dropped), parse + validate, and probe the
+	// target with the NORMALISED key so imported-vs-updated is accurate and a
+	// pre-existing corrupt target is caught here — before any write — rather than
+	// mid-pass-2 (which would leave partial state in strict mode).
+	lineNum := 0
+	for {
+		lineNum++
+		line, readErr := reader.ReadString('\n')
+		if strings.TrimSpace(line) != "" {
+			total++
+			input, key, err := parseAndValidate(line, lineNum)
+			if err != nil {
+				skips = append(skips, ImportSkip{Line: lineNum, Error: err.Error()})
+			} else if _, gerr := s.GetFinding(key); gerr != nil && ErrorCode(gerr) != "E_NOT_FOUND" {
+				skips = append(skips, ImportSkip{Line: lineNum, Error: fmt.Sprintf("E_IMPORT_INVALID: line %d: existing finding at target is unreadable: %v", lineNum, gerr)})
+			} else {
+				valid = append(valid, validRecord{input: input, line: lineNum, existed: gerr == nil})
+			}
 		}
-		total++
-		input, err := parseAndValidate(line, lineNum)
-		if err != nil {
-			skips = append(skips, ImportSkip{Line: lineNum, Error: err.Error()})
-			continue
+		if readErr != nil {
+			if readErr == io.EOF {
+				break
+			}
+			return ImportSummary{}, fmt.Errorf("E_IMPORT_INVALID: read error near line %d: %v", lineNum, readErr)
 		}
-		validInputs = append(validInputs, struct {
-			input domain.ReviewFindingInput
-			line  int
-		}{input: input, line: lineNum})
 	}
 
-	if err := scanner.Err(); err != nil {
-		return ImportSummary{}, fmt.Errorf("scanning input: %w", err)
-	}
-
-	// In strict mode any skip is an error – import nothing. The skip error
-	// already carries the E_IMPORT_INVALID code + line number.
+	// Strict mode: any skip means import nothing. The skip error already carries
+	// the E_IMPORT_INVALID code + line number.
 	if strict && len(skips) > 0 {
 		return ImportSummary{}, errors.New(skips[0].Error)
 	}
 
-	// Pass 2: import valid records.
-	imported := 0
-	updated := 0
-	for _, rec := range validInputs {
-		key := domain.ReviewFindingKey(rec.input)
-		_, err := s.GetFinding(key)
-		existed := err == nil
-		if err != nil && ErrorCode(err) != "E_NOT_FOUND" {
-			return ImportSummary{}, fmt.Errorf("unexpected store error: %w", err)
-		}
-
+	// Pass 2: import the validated records. A pre-existing corrupt target was
+	// already caught in pass 1, so a failure here is a fresh runtime/IO error.
+	imported, updated := 0, 0
+	for _, rec := range valid {
 		if _, _, err := s.AddFinding(ctx, rec.input); err != nil {
 			if strict {
-				return ImportSummary{}, fmt.Errorf("import error on validated record line %d: %w", rec.line, err)
+				return ImportSummary{}, fmt.Errorf("E_IMPORT_INVALID: import failed on validated record line %d: %w", rec.line, err)
 			}
-			skips = append(skips, ImportSkip{
-				Line:  rec.line,
-				Error: fmt.Sprintf("E_ADD_FAILED: line %d: %v", rec.line, err.Error()),
-			})
+			skips = append(skips, ImportSkip{Line: rec.line, Error: fmt.Sprintf("E_IMPORT_INVALID: line %d: %v", rec.line, err)})
 			continue
 		}
-
-		if existed {
+		if rec.existed {
 			updated++
 		} else {
 			imported++
@@ -139,34 +132,29 @@ func (s *Store) ImportFindings(ctx context.Context, r io.Reader, strict bool) (I
 	if skips == nil {
 		skips = []ImportSkip{}
 	}
-
-	return ImportSummary{
-		Imported: imported,
-		Updated:  updated,
-		Skipped:  skips,
-		Total:    total,
-	}, nil
+	return ImportSummary{Imported: imported, Updated: updated, Skipped: skips, Total: total}, nil
 }
 
-// parseAndValidate decodes a line into a domain.ReviewFindingInput and validates it.
-func parseAndValidate(line string, lineNum int) (domain.ReviewFindingInput, error) {
+// parseAndValidate decodes a line into a domain.ReviewFindingInput, validates it,
+// and returns the NORMALISED content key (what AddFinding will write under).
+func parseAndValidate(line string, lineNum int) (domain.ReviewFindingInput, string, error) {
 	var raw rawFinding
 	dec := json.NewDecoder(strings.NewReader(line))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&raw); err != nil {
-		return domain.ReviewFindingInput{}, fmt.Errorf("E_IMPORT_INVALID: line %d: JSON decode error: %w", lineNum, err)
+		return domain.ReviewFindingInput{}, "", fmt.Errorf("E_IMPORT_INVALID: line %d: JSON decode error: %w", lineNum, err)
 	}
 	// Ensure no additional data follows the JSON object.
 	_, err := dec.Token()
 	if err == nil {
-		return domain.ReviewFindingInput{}, fmt.Errorf("E_IMPORT_INVALID: line %d: trailing content after JSON object", lineNum)
+		return domain.ReviewFindingInput{}, "", fmt.Errorf("E_IMPORT_INVALID: line %d: trailing content after JSON object", lineNum)
 	}
 	if err != io.EOF {
-		return domain.ReviewFindingInput{}, fmt.Errorf("E_IMPORT_INVALID: line %d: %w", lineNum, err)
+		return domain.ReviewFindingInput{}, "", fmt.Errorf("E_IMPORT_INVALID: line %d: %w", lineNum, err)
 	}
 
 	if raw.Subtype != "" && raw.Subtype != "review" {
-		return domain.ReviewFindingInput{}, fmt.Errorf("E_IMPORT_INVALID: line %d: only subtype review may be imported, got %q", lineNum, raw.Subtype)
+		return domain.ReviewFindingInput{}, "", fmt.Errorf("E_IMPORT_INVALID: line %d: only subtype review may be imported, got %q", lineNum, raw.Subtype)
 	}
 
 	disposition := raw.Disposition
@@ -189,9 +177,10 @@ func parseAndValidate(line string, lineNum int) (domain.ReviewFindingInput, erro
 		WaiverActor:  raw.WaiverActor,
 	}
 
-	if _, err := domain.NewReviewFinding(input); err != nil {
-		return domain.ReviewFindingInput{}, fmt.Errorf("E_IMPORT_INVALID: line %d: %w", lineNum, err)
+	finding, err := domain.NewReviewFinding(input)
+	if err != nil {
+		return domain.ReviewFindingInput{}, "", fmt.Errorf("E_IMPORT_INVALID: line %d: %w", lineNum, err)
 	}
 
-	return input, nil
+	return input, finding.Key, nil
 }

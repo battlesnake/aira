@@ -123,3 +123,41 @@ func TestImportFindingsStrictAbortsAndImportsNothing(t *testing.T) {
 		t.Fatalf("strict import wrote %d findings, want 0 (import nothing on any bad record)", len(rows))
 	}
 }
+
+func TestImportFindingsLongLineNotSilentlyDropped(t *testing.T) {
+	s := importTestStore(t, "import-longline")
+	// A ~9MB message exceeds the old 8MB Scanner limit; bufio.Reader must still
+	// read it (never silently drop), and a record AFTER it must still import.
+	huge := strings.Repeat("x", 9*1024*1024)
+	jsonl := `{"ticket":"AIRA-1","category":"correctness","severity":"P1","verdict":"confirmed","source":"codex","message":"` + huge + `"}` + "\n" +
+		`{"ticket":"AIRA-2","category":"perf","severity":"P2","verdict":"plausible","source":"gemini","message":"after the huge line"}` + "\n"
+	sum, err := s.ImportFindings(context.Background(), strings.NewReader(jsonl), false)
+	if err != nil {
+		t.Fatalf("import with huge line: %v", err)
+	}
+	if sum.Imported != 2 || len(sum.Skipped) != 0 || sum.Total != 2 {
+		t.Fatalf("summary = %#v, want imported=2 skipped=0 total=2 (huge line + following record both imported)", sum)
+	}
+}
+
+func TestImportFindingsNormalizedKeyCountsAsUpdate(t *testing.T) {
+	s := importTestStore(t, "import-normkey")
+	// Same finding identity written two ways: an un-normalised file path
+	// (./sub/../a.go) and its canonical form (a.go). The second import must
+	// count as an UPDATE (same normalised key), not a new import.
+	first := `{"ticket":"AIRA-1","category":"correctness","severity":"P1","verdict":"confirmed","source":"codex","message":"m","file":"./sub/../a.go","line":3}` + "\n"
+	if sum, err := s.ImportFindings(context.Background(), strings.NewReader(first), false); err != nil || sum.Imported != 1 {
+		t.Fatalf("first = %#v err=%v, want imported=1", sum, err)
+	}
+	second := `{"ticket":"AIRA-1","category":"correctness","severity":"P1","verdict":"confirmed","source":"codex","message":"m","file":"a.go","line":3}` + "\n"
+	sum, err := s.ImportFindings(context.Background(), strings.NewReader(second), false)
+	if err != nil {
+		t.Fatalf("second import: %v", err)
+	}
+	if sum.Imported != 0 || sum.Updated != 1 {
+		t.Fatalf("second = %#v, want imported=0 updated=1 (normalised key matches)", sum)
+	}
+	if rows, _ := s.ListFindings(""); len(rows) != 1 {
+		t.Fatalf("normalised key created %d findings, want 1", len(rows))
+	}
+}
