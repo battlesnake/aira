@@ -133,7 +133,7 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 	} else {
 		for _, finding := range relationFindings {
 			switch finding.Code {
-			case "E_RELATION_TARGET_MISSING", "E_RELATION_INVALID":
+			case "E_RELATION_TARGET_MISSING", "E_RELATION_INVALID", "E_CROSS_PROJECT_RELATION", "E_RELATION_UNOBSERVABLE":
 				addFinding(&report, finding, "relation-integrity")
 			}
 		}
@@ -223,8 +223,10 @@ func (s *Store) checkDuplicateIDs(ctx context.Context, report *CheckReport) erro
 	if err != nil {
 		return err
 	}
-	seen := map[string]string{}
+	type projection struct{ path, digest string }
+	projections := map[string]projection{}
 	for _, entry := range entries {
+		seen := map[string]string{}
 		tickets, scanFindings, err := scanTickets(entry.Root, entry.WorktreeID)
 		if err != nil {
 			if !isIntegrityError(err) {
@@ -248,6 +250,11 @@ func (s *Store) checkDuplicateIDs(ctx context.Context, report *CheckReport) erro
 			} else {
 				seen[ticket.Ticket.ID] = ticket.Path
 			}
+			if prior, ok := projections[ticket.Ticket.ID]; ok && prior.digest != ticket.Digest {
+				addWarning(report, CheckFinding{Code: "W_WORKTREE_DIVERGENCE", Subject: ticket.Ticket.ID, Message: repoPath(s.root, prior.path) + " and " + repoPath(s.root, ticket.Path) + " differ across worktrees", Kind: "warning"}, "duplicate-id")
+			} else if !ok {
+				projections[ticket.Ticket.ID] = projection{path: ticket.Path, digest: ticket.Digest}
+			}
 		}
 	}
 	return nil
@@ -256,7 +263,7 @@ func (s *Store) checkDuplicateIDs(ctx context.Context, report *CheckReport) erro
 func isIntegrityError(err error) bool {
 	code := ErrorCode(err)
 	switch code {
-	case "E_CONFIG_INVALID", "E_DUPLICATE_ID", "E_ID_UNRESOLVED", "E_RELATION_TARGET_MISSING", "E_RELATION_INVALID", "E_WRITE_CONFLICT", "E_TRANSITION_INVALID", "E_PATH_INTENT_UNRESOLVED", "E_JOURNAL_CORRUPT", "E_SELECTOR_AMBIGUOUS":
+	case "E_CONFIG_INVALID", "E_DUPLICATE_ID", "E_ID_UNRESOLVED", "E_RELATION_TARGET_MISSING", "E_RELATION_INVALID", "E_CROSS_PROJECT_RELATION", "E_RELATION_UNOBSERVABLE", "E_WRITE_CONFLICT", "E_TRANSITION_INVALID", "E_PATH_INTENT_UNRESOLVED", "E_JOURNAL_CORRUPT", "E_SELECTOR_AMBIGUOUS":
 		return true
 	default:
 		return false

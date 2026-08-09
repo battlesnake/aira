@@ -18,6 +18,7 @@ import (
 
 const (
 	defaultLeaseTTLNS = uint64(15 * 60 * 1000 * 1000 * 1000)
+	maxInt64Uint      = uint64(^uint64(0) >> 1)
 )
 
 var (
@@ -108,6 +109,9 @@ func (s *Store) sampleClock() (string, uint64, error) {
 	if boot == "" {
 		return "", 0, ErrClockUnavailable
 	}
+	if mono > maxInt64Uint {
+		return "", 0, fmt.Errorf("%w: monotonic sample exceeds SQLite INTEGER", ErrClockUnavailable)
+	}
 	return boot, mono, nil
 }
 
@@ -176,6 +180,13 @@ func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor st
 	if err != nil {
 		return LeaseClaim{}, err
 	}
+	if s.leaseTTLNS > maxInt64Uint {
+		return LeaseClaim{}, fmt.Errorf("%w: lease TTL exceeds SQLite INTEGER", ErrClockUnavailable)
+	}
+	tokenTemp, err := s.writeLeaseTokenTemp(ticketID, clear)
+	if err != nil {
+		return LeaseClaim{}, err
+	}
 	var result LeaseClaim
 	result.Token = clear
 	err = s.withImmediate(ctx, func(conn *sql.Conn) error {
@@ -214,9 +225,9 @@ func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor st
 			if isHeld {
 				updateResult, err = conn.ExecContext(ctx, `UPDATE leases SET state='held', generation=?, holder_token_hash=?, boot_id=?,
                     last_heartbeat_mono_ns=?, ttl_ns=?, actor=?, worktree_id=? WHERE project_id=? AND ticket_id=? AND state='held' AND generation=?
-                    AND (boot_id<>? OR ? >= last_heartbeat_mono_ns + ttl_ns)`,
+					AND (boot_id<>? OR ? < last_heartbeat_mono_ns OR ? - last_heartbeat_mono_ns >= ttl_ns)`,
 					int64(generation), base64.RawURLEncoding.EncodeToString(hash[:]), bootID, int64(monoNS), int64(s.leaseTTLNS), actor,
-					s.worktreeID, s.projectID, ticketID, row.generation, bootID, int64(monoNS))
+					s.worktreeID, s.projectID, ticketID, row.generation, bootID, int64(monoNS), int64(monoNS))
 			} else {
 				updateResult, err = conn.ExecContext(ctx, `UPDATE leases SET state='held', generation=?, holder_token_hash=?, boot_id=?,
                     last_heartbeat_mono_ns=?, ttl_ns=?, actor=?, worktree_id=? WHERE project_id=? AND ticket_id=? AND state='free' AND generation=?`,
@@ -251,14 +262,19 @@ func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor st
 			return err
 		}
 		result.Event = EventKey{ProjectID: s.projectID, Seq: seq}
-		if err := s.saveLeaseToken(ticketID, clear); err != nil {
-			return err
+		if s.beforeLeaseCommit != nil {
+			if err := s.beforeLeaseCommit(); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
 	if err != nil {
-		s.removeLeaseTokenIf(ticketID, clear)
+		_ = os.Remove(tokenTemp)
 		return LeaseClaim{}, err
+	}
+	if err := s.commitLeaseToken(ticketID, tokenTemp); err != nil {
+		return result, err
 	}
 	if err := s.journalEvent(ctx, s.projectID, result.Event.Seq); err != nil {
 		return result, err
@@ -266,28 +282,26 @@ func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor st
 	return result, nil
 }
 
-func (s *Store) removeLeaseTokenIf(ticketID, token string) {
-	current, err := s.LeaseToken(ticketID)
-	if err == nil && current == token {
-		_ = os.Remove(s.leaseTokenPath(ticketID))
-	}
-}
-
-func (s *Store) saveLeaseToken(ticketID, token string) error {
+func (s *Store) writeLeaseTokenTemp(ticketID, token string) (string, error) {
 	path := s.leaseTokenPath(ticketID)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
+		return "", err
 	}
-	tmp := path + ".tmp"
+	tmp := path + ".tmp-" + token
 	if err := os.WriteFile(tmp, []byte(token+"\n"), 0o600); err != nil {
-		return err
+		return "", err
 	}
 	if err := os.Chmod(tmp, 0o600); err != nil {
 		_ = os.Remove(tmp)
-		return err
+		return "", err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	return tmp, nil
+}
+
+func (s *Store) commitLeaseToken(ticketID, tempPath string) error {
+	path := s.leaseTokenPath(ticketID)
+	if err := os.Rename(tempPath, path); err != nil {
+		_ = os.Remove(tempPath)
 		return err
 	}
 	return nil
@@ -331,8 +345,8 @@ func (s *Store) Release(ctx context.Context, ticketID, token string) (EventKey, 
 		sqlResult, err := conn.ExecContext(ctx, `UPDATE leases SET state='free', generation=?, holder_token_hash=NULL, boot_id=NULL,
                 last_heartbeat_mono_ns=NULL, ttl_ns=NULL, actor=NULL, worktree_id=NULL
                 WHERE project_id=? AND ticket_id=? AND state='held' AND generation=? AND holder_token_hash=? AND boot_id=?
-                AND ? < last_heartbeat_mono_ns + ttl_ns`,
-			int64(generation), s.projectID, ticketID, row.generation, base64.RawURLEncoding.EncodeToString(hash[:]), bootID, int64(monoNS))
+				AND ? >= last_heartbeat_mono_ns AND ? - last_heartbeat_mono_ns < ttl_ns`,
+			int64(generation), s.projectID, ticketID, row.generation, base64.RawURLEncoding.EncodeToString(hash[:]), bootID, int64(monoNS), int64(monoNS))
 		if err != nil {
 			return err
 		}
@@ -401,8 +415,8 @@ func (s *Store) Heartbeat(ctx context.Context, ticketID, token string) (domain.L
 		}
 		sqlResult, err := conn.ExecContext(ctx, `UPDATE leases SET last_heartbeat_mono_ns=?
                 WHERE project_id=? AND ticket_id=? AND state='held' AND generation=? AND holder_token_hash=? AND boot_id=?
-                AND ? < last_heartbeat_mono_ns + ttl_ns`, int64(monoNS), s.projectID, ticketID, row.generation,
-			base64.RawURLEncoding.EncodeToString(hash[:]), bootID, int64(monoNS))
+				AND ? >= last_heartbeat_mono_ns AND ? - last_heartbeat_mono_ns < ttl_ns`, int64(monoNS), s.projectID, ticketID, row.generation,
+			base64.RawURLEncoding.EncodeToString(hash[:]), bootID, int64(monoNS), int64(monoNS))
 		if err != nil {
 			return err
 		}

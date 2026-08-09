@@ -62,6 +62,9 @@ type Store struct {
 	// beforeMaterialise is intentionally nil in production; tests use it to
 	// observe the receipt-before-file ordering at the crash boundary.
 	beforeMaterialise func(Intent) error
+	// beforeLeaseCommit is a test-only crash hook for the DB/token ordering
+	// boundary; production leaves it nil.
+	beforeLeaseCommit func() error
 }
 
 type Intent struct {
@@ -238,8 +241,13 @@ func (s *Store) initDB(ctx context.Context) error {
             project_id TEXT NOT NULL, worktree_id TEXT NOT NULL, id TEXT NOT NULL,
             path TEXT NOT NULL, digest TEXT NOT NULL, status TEXT NOT NULL, hold INTEGER NOT NULL,
             title TEXT NOT NULL, kind TEXT NOT NULL, severity TEXT NOT NULL,
-            PRIMARY KEY(project_id, worktree_id, id)
-        )`,
+	            PRIMARY KEY(project_id, worktree_id, id)
+	        )`,
+		`CREATE TABLE IF NOT EXISTS relations (
+	            project_id TEXT NOT NULL, worktree_id TEXT NOT NULL, kind TEXT NOT NULL,
+	            from_id TEXT NOT NULL, to_id TEXT NOT NULL, canonical_file TEXT NOT NULL,
+	            PRIMARY KEY(project_id, worktree_id, kind, from_id, to_id)
+	        )`,
 		`CREATE TABLE IF NOT EXISTS findings (
             project_id TEXT NOT NULL, finding_key TEXT NOT NULL, code TEXT NOT NULL,
             subject TEXT NOT NULL, details TEXT NOT NULL, created_at TEXT NOT NULL,
@@ -253,7 +261,7 @@ func (s *Store) initDB(ctx context.Context) error {
             CHECK (state IN ('free', 'held')),
             CHECK ((state = 'free' AND generation >= 0 AND holder_token_hash IS NULL AND boot_id IS NULL AND
                     last_heartbeat_mono_ns IS NULL AND ttl_ns IS NULL AND actor IS NULL AND worktree_id IS NULL)
-                OR (state = 'held' AND generation >= 1 AND holder_token_hash IS NOT NULL AND length(trim(holder_token_hash)) > 0 AND
+	                OR (state = 'held' AND generation >= 1 AND holder_token_hash IS NOT NULL AND length(holder_token_hash) = 43 AND
                     boot_id IS NOT NULL AND length(trim(boot_id)) > 0 AND
                     last_heartbeat_mono_ns IS NOT NULL AND last_heartbeat_mono_ns >= 0 AND
                     ttl_ns IS NOT NULL AND ttl_ns > 0 AND actor IS NOT NULL AND length(trim(actor)) > 0 AND
@@ -610,8 +618,24 @@ func (s *Store) markMaterialised(ctx context.Context, intent Intent) error {
             ON CONFLICT(project_id, worktree_id, id) DO UPDATE SET path=excluded.path, digest=excluded.digest,
             status=excluded.status, hold=excluded.hold, title=excluded.title, kind=excluded.kind, severity=excluded.severity`,
 			intent.ProjectID, intent.WorktreeID, ticket.ID, intent.Path, digestBytes(intent.Intended), ticket.Status, boolInt(ticket.Hold), ticket.Title, ticket.Kind, ticket.Severity)
-		return err
+		if err != nil {
+			return err
+		}
+		return replaceRelationIndex(ctx, conn, intent.ProjectID, intent.WorktreeID, ticket, intent.Path)
 	})
+}
+
+func replaceRelationIndex(ctx context.Context, conn *sql.Conn, projectID, worktreeID string, ticket domain.Ticket, path string) error {
+	if _, err := conn.ExecContext(ctx, `DELETE FROM relations WHERE project_id=? AND worktree_id=? AND canonical_file=?`, projectID, worktreeID, path); err != nil {
+		return err
+	}
+	for _, relation := range ticket.Relations {
+		if _, err := conn.ExecContext(ctx, `INSERT INTO relations(project_id, worktree_id, kind, from_id, to_id, canonical_file)
+			VALUES(?, ?, ?, ?, ?, ?)`, projectID, worktreeID, relation.Kind, relation.From, relation.To, path); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) markReceiptOnly(ctx context.Context, projectID string, seq int64) error {
@@ -717,7 +741,7 @@ func (s *Store) recordRebuildFinding(ctx context.Context, entry registryEntry, r
 func (s *Store) reconcile(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx, `SELECT project_id, seq, worktree_id, path, verb, precondition_digest,
 		intended_digest, intended_bytes, materialised, journaled, allocation_id FROM outbox
-		WHERE project_id=? AND worktree_id=? AND resolution IS NULL AND (materialised=0 OR journaled=0) ORDER BY seq`, s.projectID, s.worktreeID)
+		WHERE project_id=? AND (worktree_id=? OR path='') AND resolution IS NULL AND (materialised=0 OR journaled=0) ORDER BY seq`, s.projectID, s.worktreeID)
 	if err != nil {
 		return err
 	}
@@ -805,12 +829,49 @@ func (s *Store) reconcile(ctx context.Context) error {
 
 func (s *Store) Reconcile(ctx context.Context) error { return s.reconcile(ctx) }
 
+// replayUnjournaledEvents closes the crash window shared by all materialised
+// mutations: the DB event is durable, but the common journal append may not
+// have happened yet. Empty-path lease events are intentionally project-wide so
+// any registered worktree can re-drive them.
+func (s *Store) replayUnjournaledEvents(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT project_id, seq FROM outbox
+		WHERE project_id=? AND materialised=1 AND journaled=0 ORDER BY seq`, s.projectID)
+	if err != nil {
+		return err
+	}
+	var keys []EventKey
+	for rows.Next() {
+		var key EventKey
+		if err := rows.Scan(&key.ProjectID, &key.Seq); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, key := range keys {
+		if err := s.journalEvent(ctx, key.ProjectID, key.Seq); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) Rebuild(ctx context.Context) error {
 	lock, err := acquireLock(filepath.Join(filepath.Dir(s.dbPath), "rebuild.lock"))
 	if err != nil {
 		return err
 	}
 	defer lock.Close()
+	if err := s.replayUnjournaledEvents(ctx); err != nil {
+		return err
+	}
 	entries, err := readRegistry(s.registryPath)
 	if err != nil {
 		return err
@@ -944,6 +1005,9 @@ func (s *Store) Rebuild(ctx context.Context) error {
                     status=excluded.status, hold=excluded.hold, title=excluded.title, kind=excluded.kind, severity=excluded.severity`,
 				s.projectID, ticket.WorktreeID, ticket.Ticket.ID, ticket.Path, ticket.Digest,
 				ticket.Ticket.Status, boolInt(ticket.Ticket.Hold), ticket.Ticket.Title, ticket.Ticket.Kind, ticket.Ticket.Severity); err != nil {
+				return err
+			}
+			if err := replaceRelationIndex(ctx, conn, s.projectID, ticket.WorktreeID, ticket.Ticket, ticket.Path); err != nil {
 				return err
 			}
 			var allocationSeq int64

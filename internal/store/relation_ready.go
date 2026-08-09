@@ -31,6 +31,8 @@ func relationSubject(r domain.Relation) string {
 	return r.From + ":" + string(r.Kind) + ":" + r.To
 }
 
+func relationEndpointKey(project, id string) string { return project + "\x00" + id }
+
 func scanStoredRelationsAt(root, worktreeID string) ([]storedRelation, map[string]domain.Ticket, []CheckFinding, error) {
 	tickets, scanFindings, err := scanTickets(root, worktreeID)
 	if err != nil {
@@ -38,7 +40,7 @@ func scanStoredRelationsAt(root, worktreeID string) ([]storedRelation, map[strin
 	}
 	byID := make(map[string]domain.Ticket, len(tickets))
 	for _, ticket := range tickets {
-		byID[ticket.Ticket.ID] = ticket.Ticket
+		byID[relationEndpointKey(ticket.Ticket.Project, ticket.Ticket.ID)] = ticket.Ticket
 	}
 	findings := append([]CheckFinding(nil), scanFindings...)
 	var relations []storedRelation
@@ -48,11 +50,21 @@ func scanStoredRelationsAt(root, worktreeID string) ([]storedRelation, map[strin
 				findings = append(findings, CheckFinding{Code: "E_RELATION_INVALID", Subject: relationSubject(relation), Message: "relation kind or endpoints are invalid", Kind: "fail"})
 				continue
 			}
-			if _, ok := byID[relation.From]; !ok {
-				findings = append(findings, CheckFinding{Code: "E_RELATION_TARGET_MISSING", Subject: relation.From, Message: "relation source ticket is missing", Kind: "fail"})
+			fromKey := relationEndpointKey(ticket.Ticket.Project, relation.From)
+			toKey := relationEndpointKey(ticket.Ticket.Project, relation.To)
+			if _, ok := byID[fromKey]; !ok {
+				if endpointHasOtherProject(byID, relation.From, ticket.Ticket.Project) {
+					findings = append(findings, CheckFinding{Code: "E_CROSS_PROJECT_RELATION", Subject: relationSubject(relation), Message: "relation source ticket belongs to another project", Kind: "fail"})
+				} else {
+					findings = append(findings, CheckFinding{Code: "E_RELATION_TARGET_MISSING", Subject: relation.From, Message: "relation source ticket is missing", Kind: "fail"})
+				}
 			}
-			if _, ok := byID[relation.To]; !ok {
-				findings = append(findings, CheckFinding{Code: "E_RELATION_TARGET_MISSING", Subject: relation.To, Message: "relation target ticket is missing", Kind: "fail"})
+			if _, ok := byID[toKey]; !ok {
+				if endpointHasOtherProject(byID, relation.To, ticket.Ticket.Project) {
+					findings = append(findings, CheckFinding{Code: "E_CROSS_PROJECT_RELATION", Subject: relationSubject(relation), Message: "relation target ticket belongs to another project", Kind: "fail"})
+				} else {
+					findings = append(findings, CheckFinding{Code: "E_RELATION_TARGET_MISSING", Subject: relation.To, Message: "relation target ticket is missing", Kind: "fail"})
+				}
 			}
 			if domain.CanonicalRelationOwner(relation.From, relation.To) != ticket.Ticket.ID {
 				findings = append(findings, CheckFinding{Code: "E_RELATION_INVALID", Subject: relationSubject(relation), Message: "relation is not stored on its canonical lower-ID ticket", Kind: "fail"})
@@ -63,13 +75,22 @@ func scanStoredRelationsAt(root, worktreeID string) ([]storedRelation, map[strin
 	return relations, byID, findings, nil
 }
 
+func endpointHasOtherProject(byID map[string]domain.Ticket, id, project string) bool {
+	for key, ticket := range byID {
+		if ticket.ID == id && key != relationEndpointKey(project, id) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Store) scanStoredRelations() ([]storedRelation, map[string]domain.Ticket, []CheckFinding, error) {
 	return scanStoredRelationsAt(s.root, s.worktreeID)
 }
 
 func relationIntegrityError(findings []CheckFinding) error {
 	for _, finding := range findings {
-		if finding.Code == "E_RELATION_TARGET_MISSING" || finding.Code == "E_RELATION_INVALID" {
+		if finding.Code == "E_RELATION_TARGET_MISSING" || finding.Code == "E_RELATION_INVALID" || finding.Code == "E_CROSS_PROJECT_RELATION" || finding.Code == "E_RELATION_UNOBSERVABLE" {
 			return fmt.Errorf("%s: %s", finding.Code, finding.Message)
 		}
 	}
@@ -247,6 +268,27 @@ func (s *Store) derivedRelationViews(id string) ([]domain.RelationView, error) {
 	return views, nil
 }
 
+func relationIndexKey(relation storedRelation) string {
+	return string(relation.Relation.Kind) + "\x00" + relation.Relation.From + "\x00" + relation.Relation.To
+}
+
+func (s *Store) indexedRelations() ([]storedRelation, error) {
+	rows, err := s.db.Query(`SELECT kind, from_id, to_id, canonical_file FROM relations WHERE project_id=? AND worktree_id=?`, s.projectID, s.worktreeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []storedRelation
+	for rows.Next() {
+		var kind, from, to, path string
+		if err := rows.Scan(&kind, &from, &to, &path); err != nil {
+			return nil, err
+		}
+		result = append(result, storedRelation{Owner: strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)), Path: path, Relation: domain.Relation{Kind: domain.RelationKind(kind), From: from, To: to}})
+	}
+	return result, rows.Err()
+}
+
 func workable(status domain.Status) bool {
 	return status == domain.StatusPlanned || status == domain.StatusInProgress
 }
@@ -300,6 +342,19 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 	if err != nil {
 		return nil, err
 	}
+	indexedRelations, err := s.indexedRelations()
+	if err != nil {
+		return nil, err
+	}
+	observedRelations := make(map[string]bool, len(relations))
+	for _, relation := range relations {
+		observedRelations[relationIndexKey(relation)] = true
+	}
+	for _, relation := range indexedRelations {
+		if !observedRelations[relationIndexKey(relation)] {
+			relations = append(relations, relation)
+		}
+	}
 	findings := append(append([]CheckFinding(nil), scanFindings...), relationFindings...)
 	result := make([]ReadyRecord, 0, len(rows)+len(findings))
 	for _, row := range rows {
@@ -311,9 +366,14 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 					continue
 				}
 				view := domain.RelationView{Kind: domain.RelationBlockedBy, From: row.Ticket.ID, To: relation.Relation.From}
-				prerequisite, ok := byID[relation.Relation.From]
+				prerequisite, ok := byID[relationEndpointKey(row.Ticket.Project, relation.Relation.From)]
 				if !ok {
-					rowFindings = appendUniqueFinding(rowFindings, CheckFinding{Code: "E_RELATION_TARGET_MISSING", Subject: row.Ticket.ID, Message: "blocked-by prerequisite is missing", Kind: "fail"})
+					ownerObserved := observedRelations[relationIndexKey(relation)]
+					if !ownerObserved && relation.Path != "" {
+						rowFindings = appendUniqueFinding(rowFindings, CheckFinding{Code: "E_RELATION_UNOBSERVABLE", Subject: row.Ticket.ID, Message: "blocking prerequisite or relation owner cannot be observed", Kind: "fail"})
+					} else {
+						rowFindings = appendUniqueFinding(rowFindings, CheckFinding{Code: "E_RELATION_TARGET_MISSING", Subject: row.Ticket.ID, Message: "blocked-by prerequisite is missing", Kind: "fail"})
+					}
 				} else if !satisfied(prerequisite.Status) {
 					blockers = append(blockers, view)
 				}
@@ -331,7 +391,7 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 	}
 	if !hasSelector {
 		for _, finding := range findings {
-			if finding.Code == "E_RELATION_INVALID" || finding.Code == "E_CONFIG_INVALID" {
+			if finding.Code == "E_RELATION_INVALID" || finding.Code == "E_CROSS_PROJECT_RELATION" || finding.Code == "E_RELATION_UNOBSERVABLE" || finding.Code == "E_CONFIG_INVALID" {
 				if !findingAlreadyRepresented(result, finding) {
 					result = append(result, ReadyRecord{Ticket: TicketRecord{Path: finding.Subject, WorktreeID: s.worktreeID}, Ready: false, Verdict: "fail", Findings: []CheckFinding{finding}})
 				}
@@ -361,7 +421,8 @@ func findingsForReadyRow(row TicketRecord, findings []CheckFinding, relations []
 				}
 			}
 		}
-		if finding.Subject == row.Path || finding.Subject == row.Ticket.ID || relatedMissingTarget {
+		relatedEndpoint := strings.Contains(finding.Subject, row.Ticket.ID) && (finding.Code == "E_CROSS_PROJECT_RELATION" || finding.Code == "E_RELATION_INVALID")
+		if finding.Subject == row.Path || finding.Subject == row.Ticket.ID || relatedMissingTarget || relatedEndpoint {
 			result = appendUniqueFinding(result, finding)
 		}
 	}

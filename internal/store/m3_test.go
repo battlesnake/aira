@@ -141,6 +141,20 @@ func TestLeaseBootChangeExpiresAndClockUnavailableRefuses(t *testing.T) {
 	}
 }
 
+func TestLeaseClockAndTTLOverflowAreUnavailable(t *testing.T) {
+	s, clock, _ := m3Store(t)
+	ticket := m3Ticket(t, s, "clock bounds")
+	clock.mono = ^uint64(0)
+	if _, err := s.Claim(context.Background(), ticket.ID, false, "owner"); ErrorCode(err) != "E_CLOCK_UNAVAILABLE" {
+		t.Fatalf("overflowing monotonic sample error = %v", err)
+	}
+	clock.mono = 100
+	s.leaseTTLNS = ^uint64(0)
+	if _, err := s.Claim(context.Background(), ticket.ID, false, "owner"); ErrorCode(err) != "E_CLOCK_UNAVAILABLE" {
+		t.Fatalf("overflowing lease TTL error = %v", err)
+	}
+}
+
 func TestConcurrentExpiredClaimersHaveOneWinnerAndNextGeneration(t *testing.T) {
 	s, clock, base := m3Store(t)
 	ticket := m3Ticket(t, s, "concurrent expired lease")
@@ -207,8 +221,8 @@ func TestConcurrentExpiredClaimersHaveOneWinnerAndNextGeneration(t *testing.T) {
 func TestLeaseSchemaAndRowValidationRejectCorruption(t *testing.T) {
 	s, _, _ := m3Store(t)
 	_, err := s.db.Exec(`INSERT INTO leases(project_id, ticket_id, state, generation, holder_token_hash, boot_id,
-        last_heartbeat_mono_ns, ttl_ns, actor, worktree_id)
-        VALUES(?, ?, 'held', 0, '', '', -1, 0, '', '')`, s.projectID, "AIRA-999")
+	        last_heartbeat_mono_ns, ttl_ns, actor, worktree_id)
+	        VALUES(?, ?, 'held', 0, '', '', -1, 0, '', '')`, s.projectID, "AIRA-999")
 	if err == nil {
 		t.Fatal("lease CHECK accepted illegal held row")
 	}
@@ -216,6 +230,12 @@ func TestLeaseSchemaAndRowValidationRejectCorruption(t *testing.T) {
         VALUES(?, ?, 'free', -1)`, s.projectID, "AIRA-998")
 	if err == nil {
 		t.Fatal("lease CHECK accepted negative free generation")
+	}
+	_, err = s.db.Exec(`INSERT INTO leases(project_id, ticket_id, state, generation, holder_token_hash, boot_id,
+	        last_heartbeat_mono_ns, ttl_ns, actor, worktree_id)
+	        VALUES(?, ?, 'held', 1, 'x', 'boot', 0, 1, 'actor', 'worktree')`, s.projectID, "AIRA-997")
+	if err == nil {
+		t.Fatal("lease CHECK accepted a nonempty malformed holder hash")
 	}
 
 	hash := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
@@ -244,6 +264,187 @@ func TestLeaseSchemaAndRowValidationRejectCorruption(t *testing.T) {
 				t.Fatal("leaseFromRow accepted illegal lease row")
 			}
 		})
+	}
+}
+
+func TestReadyFailsClosedWhenIndexedPrerequisiteOwnerIsMalformed(t *testing.T) {
+	s, _, _ := m3Store(t)
+	prerequisite := m3Ticket(t, s, "prerequisite")
+	dependent := m3Ticket(t, s, "dependent")
+	if _, err := s.Link(context.Background(), prerequisite.ID, domain.RelationBlocks, dependent.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.root, ".aira", "tickets", prerequisite.ID+".md"), []byte("malformed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.Ready(dependent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Ready || rows[0].Verdict != "fail" || len(rows[0].Findings) == 0 {
+		t.Fatalf("malformed prerequisite was treated as ready: %#v", rows)
+	}
+}
+
+func TestRelationEndpointsMustShareProjectSlug(t *testing.T) {
+	s, _, _ := m3Store(t)
+	from := m3Ticket(t, s, "from")
+	to := m3Ticket(t, s, "to")
+	if _, err := s.Link(context.Background(), from.ID, domain.RelationBlocks, to.ID); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(s.root, ".aira", "tickets", to.ID+".md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := rawM3Ticket(t, domain.Ticket{Schema: 1, ID: to.ID, Project: "other-project", Title: to.Title,
+		Status: to.Status, Kind: to.Kind, Severity: to.Severity, Labels: []string{}, Relations: nil}, "body\n")
+	if string(data) == string(updated) {
+		t.Fatal("test did not change endpoint project")
+	}
+	if err := os.WriteFile(filepath.Join(s.root, ".aira", "tickets", to.ID+".md"), updated, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.Ready(from.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Ready || !hasFinding(rows[0].Findings, "E_CROSS_PROJECT_RELATION") {
+		t.Fatalf("cross-project relation was accepted: %#v", rows)
+	}
+}
+
+func TestRelationsDerivedIndexMaterialisesAndRebuilds(t *testing.T) {
+	s, _, _ := m3Store(t)
+	from := m3Ticket(t, s, "from")
+	to := m3Ticket(t, s, "to")
+	if _, err := s.Link(context.Background(), from.ID, domain.RelationBlocks, to.ID); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM relations WHERE project_id=? AND worktree_id=?`, s.projectID, s.worktreeID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("relations index count = %d, want 1", count)
+	}
+	if err := s.Rebuild(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM relations WHERE project_id=? AND worktree_id=?`, s.projectID, s.worktreeID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("rebuilt relations index count = %d, want 1", count)
+	}
+}
+
+func TestCanonicalRelationOrderingAcrossPrefixes(t *testing.T) {
+	s, _, _ := m3Store(t)
+	if err := os.MkdirAll(filepath.Join(s.root, ".aira", "tickets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	low := domain.Ticket{Schema: 1, ID: "AIRA-10", Project: "aira", Title: "low", Status: domain.StatusPlanned, Kind: domain.KindFeature, Severity: domain.SeverityP2, Labels: []string{}, Relations: []domain.Relation{}}
+	high := domain.Ticket{Schema: 1, ID: "ZZ-2", Project: "aira", Title: "high", Status: domain.StatusPlanned, Kind: domain.KindFeature, Severity: domain.SeverityP2, Labels: []string{}, Relations: []domain.Relation{}}
+	for _, ticket := range []domain.Ticket{low, high} {
+		data, err := domain.RenderTicket(ticket, "body\n")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(s.root, ".aira", "tickets", ticket.ID+".md"), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.Link(context.Background(), high.ID, domain.RelationBlocks, low.ID); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(s.root, ".aira", "tickets", low.ID+".md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"from":"ZZ-2"`) {
+		t.Fatalf("cross-prefix relation was not stored on canonical owner: %s", data)
+	}
+}
+
+func TestHeartbeatAndStealRaceHasOneStateTransition(t *testing.T) {
+	s, heartbeatClock, base := m3Store(t)
+	ticket := m3Ticket(t, s, "heartbeat race")
+	claim, err := s.Claim(context.Background(), ticket.ID, false, "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stealClock := &m3Clock{boot: heartbeatClock.boot, mono: 110}
+	stealer, err := Open(context.Background(), Options{Root: base, CommonDir: filepath.Join(base, "common"), DBPath: filepath.Join(base, "state", "state.db"), RegistryPath: filepath.Join(base, "state", "registry.jsonl"), LeaseStateDir: filepath.Join(base, "steal-state"), ProjectID: s.projectID, WorktreeID: "stealer", ProjectSlug: "aira", Prefixes: []string{"AIRA"}, Clock: stealClock, LeaseTTLNS: 900})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stealer.Close()
+	heartbeatClock.mono = 109
+	start := make(chan struct{})
+	type outcome struct {
+		heartbeat bool
+		steal     bool
+		err       error
+	}
+	results := make(chan outcome, 2)
+	go func() {
+		<-start
+		_, err := s.Heartbeat(context.Background(), ticket.ID, claim.Token)
+		results <- outcome{heartbeat: err == nil, err: err}
+	}()
+	go func() {
+		<-start
+		_, err := stealer.Claim(context.Background(), ticket.ID, true, "stealer")
+		results <- outcome{steal: err == nil, err: err}
+	}()
+	close(start)
+	var got []outcome
+	for i := 0; i < 2; i++ {
+		got = append(got, <-results)
+	}
+	wins := 0
+	for _, result := range got {
+		if result.heartbeat || result.steal {
+			wins++
+		} else if ErrorCode(result.err) != "E_LEASE_EXPIRED" && ErrorCode(result.err) != "E_LEASE_HELD" && ErrorCode(result.err) != "E_LEASE_TOKEN" {
+			t.Fatalf("unexpected race loser error: %v", result.err)
+		}
+	}
+	if wins != 1 {
+		t.Fatalf("heartbeat/steal race had %d successful transitions: %#v", wins, got)
+	}
+}
+
+func TestLeaseEventRebuildRecoversAfterJournalAppendFailure(t *testing.T) {
+	s, _, base := m3Store(t)
+	ticket := m3Ticket(t, s, "journal lease")
+	badAudit := filepath.Join(base, "audit-file")
+	if err := os.WriteFile(badAudit, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.auditDir = badAudit
+	if _, err := s.Claim(context.Background(), ticket.ID, false, "owner"); err == nil {
+		t.Fatal("claim unexpectedly succeeded with a broken journal path")
+	}
+	recovered, err := Open(context.Background(), Options{Root: base, CommonDir: filepath.Join(base, "common"), DBPath: filepath.Join(base, "state", "state.db"), RegistryPath: filepath.Join(base, "state", "registry.jsonl"), LeaseStateDir: filepath.Join(base, "recovered-state"), ProjectID: s.projectID, WorktreeID: "recovery", ProjectSlug: "aira", Prefixes: []string{"AIRA"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	if err := recovered.Rebuild(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var journaled int
+	if err := recovered.db.QueryRow(`SELECT journaled FROM events WHERE project_id=? AND verb='lease.claim'`, s.projectID).Scan(&journaled); err != nil {
+		t.Fatal(err)
+	}
+	if journaled != 1 {
+		t.Fatalf("recovered lease event journaled=%d", journaled)
+	}
+	data, err := os.ReadFile(filepath.Join(base, "common", "aira", "journal.jsonl"))
+	if err != nil || !strings.Contains(string(data), `"verb":"lease.claim"`) {
+		t.Fatalf("recovered journal = %q, err=%v", data, err)
 	}
 }
 
@@ -483,6 +684,24 @@ func TestClaimTokenSaveFailureDoesNotCommitLease(t *testing.T) {
 	}
 	if _, held := lease.Held(); held {
 		t.Fatalf("token-save failure stranded committed lease: %#v", lease)
+	}
+}
+
+func TestFailedClaimLeavesIncumbentTokenUntouched(t *testing.T) {
+	s, clock, _ := m3Store(t)
+	ticket := m3Ticket(t, s, "incumbent token")
+	incumbent, err := s.Claim(context.Background(), ticket.ID, false, "incumbent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.beforeLeaseCommit = func() error { return errors.New("forced claim rollback") }
+	clock.mono = 1000
+	if _, err := s.Claim(context.Background(), ticket.ID, true, "contender"); err == nil {
+		t.Fatal("forced failed claim unexpectedly succeeded")
+	}
+	got, err := s.LeaseToken(ticket.ID)
+	if err != nil || got != incumbent.Token {
+		t.Fatalf("failed claim clobbered incumbent token: got=%q err=%v want=%q", got, err, incumbent.Token)
 	}
 }
 

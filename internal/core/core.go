@@ -53,6 +53,7 @@ type Store interface {
 type handlerData struct {
 	Data     any
 	Warnings []string
+	Verdict  string
 }
 
 type Core struct {
@@ -104,8 +105,9 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 		return Response{Code: code, Error: err.Error(), Exit: errorExit(code)}
 	}
 	warnings := []string(nil)
+	verdict := ""
 	if wrapped, ok := data.(handlerData); ok {
-		data, warnings = wrapped.Data, wrapped.Warnings
+		data, warnings, verdict = wrapped.Data, wrapped.Warnings, wrapped.Verdict
 	}
 	if report, ok := data.(store.CheckReport); ok {
 		code := strings.ToUpper(report.Verdict)
@@ -113,6 +115,9 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 			code = "UNEVALUATED"
 		}
 		return Response{OK: true, Code: code, Data: report, Warnings: warnings, Exit: exitCode(report)}
+	}
+	if verdict != "" {
+		return Response{OK: true, Code: strings.ToUpper(verdict), Data: data, Warnings: warnings, Exit: verdictExit(verdict)}
 	}
 	return Response{OK: true, Code: "OK", Data: data, Warnings: warnings}
 }
@@ -235,7 +240,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				if len(rows) != 1 {
 					return nil, fmt.Errorf("E_NOT_FOUND: ready selector matched no ticket")
 				}
-				return handlerData{Data: rows[0], Warnings: readyWarnings(rows)}, nil
+				return handlerData{Data: rows[0], Warnings: readyWarnings(rows), Verdict: readyVerdict(rows)}, nil
 			}
 			data := map[string]any{"total": len(rows), "rows": projectReadyRecords(rows)}
 			if len(rows) > ListLimit {
@@ -243,7 +248,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				data["distribution"] = readyDistribution(rows)
 				data["truncated"] = true
 			}
-			return handlerData{Data: data, Warnings: readyWarnings(rows)}, nil
+			return handlerData{Data: data, Warnings: readyWarnings(rows), Verdict: readyVerdict(rows)}, nil
 		}},
 		"list": {Name: "list", Usage: "list [query] [--by F] [--fields F,...]", Run: func(_ context.Context, args map[string]any) (any, error) {
 			rows, err := c.store.List(stringArg(args, "query"))
@@ -427,6 +432,15 @@ func readyWarnings(rows []store.ReadyRecord) []string {
 	return warnings
 }
 
+func readyVerdict(rows []store.ReadyRecord) string {
+	for _, row := range rows {
+		if row.Verdict == "fail" {
+			return "fail"
+		}
+	}
+	return "pass"
+}
+
 func projectReadyRecords(records []store.ReadyRecord) []map[string]any {
 	result := make([]map[string]any, 0, len(records))
 	for _, record := range records {
@@ -497,6 +511,16 @@ func exitCode(report store.CheckReport) int {
 		}
 		return 0
 	}
+}
+
+func verdictExit(verdict string) int {
+	if verdict == "fail" {
+		return 1
+	}
+	if verdict == "unevaluated" {
+		return 3
+	}
+	return 0
 }
 
 func errorExit(code string) int {

@@ -7,8 +7,23 @@ import (
 	"path/filepath"
 	"testing"
 
+	"aira/internal/domain"
 	"aira/internal/store"
 )
+
+type readyFailureStore struct{ Store }
+
+func (readyFailureStore) Ready(string) ([]store.ReadyRecord, error) {
+	return []store.ReadyRecord{{Ticket: store.TicketRecord{Ticket: domain.Ticket{ID: "AIRA-1"}}, Ready: false, Verdict: "fail", Findings: []store.CheckFinding{{Code: "E_RELATION_UNOBSERVABLE", Kind: "fail"}}}}, nil
+}
+
+func TestReadyIntegrityFailureHasFailureVerdictAndExit(t *testing.T) {
+	c := New(readyFailureStore{Store: coreTestStore(t)})
+	response := c.Do(context.Background(), Request{Verb: "ready", Args: map[string]any{"selector": "AIRA-1"}})
+	if response.Code != "FAIL" || response.Exit != 1 || !response.OK {
+		t.Fatalf("ready integrity response = %#v", response)
+	}
+}
 
 func TestDoUsesOneSerializableDispatchSurface(t *testing.T) {
 	s := coreTestStore(t)

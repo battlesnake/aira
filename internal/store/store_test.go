@@ -5,6 +5,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"os"
@@ -330,6 +331,115 @@ func TestConcurrentAllocationsAcrossShortLivedProcesses(t *testing.T) {
 	}
 	if len(seen) != workers {
 		t.Fatalf("got %d process IDs, want %d", len(seen), workers)
+	}
+}
+
+func TestConcurrentLeaseClaimersAcrossShortLivedProcesses(t *testing.T) {
+	if os.Getenv("AIRA_LEASE_WORKER") == "1" {
+		root := os.Getenv("AIRA_LEASE_ROOT")
+		state := os.Getenv("AIRA_LEASE_STATE")
+		worktree := os.Getenv("AIRA_LEASE_WORKTREE")
+		s, err := Open(context.Background(), Options{
+			Root: root, CommonDir: os.Getenv("AIRA_LEASE_COMMON"), DBPath: filepath.Join(state, "state.db"),
+			RegistryPath: filepath.Join(state, "registry.jsonl"), LeaseStateDir: filepath.Join(state, "lease-state-"+worktree),
+			ProjectID: "project-aira", WorktreeID: worktree, ProjectSlug: "aira", Prefixes: []string{"AIRA"}, LeaseTTLNS: 900_000_000_000,
+		})
+		if err != nil {
+			os.Stderr.WriteString(err.Error())
+			os.Exit(2)
+		}
+		_, err = s.Claim(context.Background(), os.Getenv("AIRA_LEASE_TICKET"), true, worktree)
+		_ = s.Close()
+		if err == nil {
+			os.Stdout.WriteString("won")
+			os.Exit(0)
+		}
+		if ErrorCode(err) == "E_LEASE_HELD" {
+			os.Stdout.WriteString("held")
+			os.Exit(0)
+		}
+		os.Stderr.WriteString(err.Error())
+		os.Exit(3)
+	}
+
+	base := persistentTemp(t, "lease-process")
+	root := filepath.Join(base, "main")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := testStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	ticket, err := s.CreateTicket(context.Background(), domain.CreateTicketInput{Title: "process lease", Kind: domain.KindFeature, Severity: domain.SeverityP2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	if _, err := s.db.Exec(`INSERT INTO leases(project_id,ticket_id,state,generation,holder_token_hash,boot_id,last_heartbeat_mono_ns,ttl_ns,actor,worktree_id) VALUES(?,?, 'held', 1, ?, 'old-boot', 0, 1, 'old', 'old-worktree')`, s.projectID, ticket.ID, hash); err != nil {
+		t.Fatal(err)
+	}
+	const workers = 8
+	outputs := make(chan string, workers)
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		worktree := "lease-worker-" + strconv.Itoa(i)
+		wg.Add(1)
+		go func(worktree string) {
+			defer wg.Done()
+			cmd := exec.Command(os.Args[0], "-test.run=^TestConcurrentLeaseClaimersAcrossShortLivedProcesses$", "-test.v=false")
+			cmd.Env = append(os.Environ(), "AIRA_LEASE_WORKER=1", "AIRA_LEASE_ROOT="+root, "AIRA_LEASE_COMMON="+filepath.Join(base, "common"), "AIRA_LEASE_STATE="+filepath.Join(base, "state"), "AIRA_LEASE_WORKTREE="+worktree, "AIRA_LEASE_TICKET="+ticket.ID)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				errs <- errors.New(string(out))
+				return
+			}
+			outputs <- strings.TrimSpace(string(out))
+		}(worktree)
+	}
+	wg.Wait()
+	close(outputs)
+	close(errs)
+	for err := range errs {
+		t.Fatalf("process lease error: %v", err)
+	}
+	wins, held := 0, 0
+	for output := range outputs {
+		switch output {
+		case "won":
+			wins++
+		case "held":
+			held++
+		default:
+			t.Fatalf("unexpected process lease output %q", output)
+		}
+	}
+	if wins != 1 || held != workers-1 {
+		t.Fatalf("process lease outcomes: wins=%d held=%d", wins, held)
+	}
+}
+
+func TestSameIDProjectionAcrossWorktreesIsNotDuplicate(t *testing.T) {
+	base := persistentTemp(t, "worktree-projection")
+	mainRoot := filepath.Join(base, "main")
+	sibling := filepath.Join(base, "sibling")
+	for _, root := range []string{mainRoot, sibling} {
+		if err := os.MkdirAll(filepath.Join(root, ".aira", "tickets"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		gitRun(t, root, "init")
+		writeTicketFile(t, filepath.Join(root, ".aira", "tickets", "AIRA-42.md"), "AIRA-42")
+	}
+	s := testStore(t, mainRoot, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	if err := s.RegisterWorktree(context.Background(), "sibling", sibling); err != nil {
+		t.Fatal(err)
+	}
+	report, err := s.Check(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, finding := range report.Findings {
+		if finding.Code == "E_DUPLICATE_ID" {
+			t.Fatalf("same logical projection reported duplicate: %#v", report)
+		}
 	}
 }
 
