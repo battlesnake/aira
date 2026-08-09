@@ -85,6 +85,60 @@ func TestMCPLifecycleAndProtocolErrors(t *testing.T) {
 	}
 }
 
+func TestMCPPingReturnsEmptyResult(t *testing.T) {
+	server := newMCPServer(func(context.Context, core.Request) (*core.Core, func(), error) {
+		return core.New(nil), func() {}, nil
+	})
+	var out bytes.Buffer
+	if err := server.Serve(context.Background(), strings.NewReader(`{"jsonrpc":"2.0","id":9,"method":"ping"}
+`), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	var response mcpResponse
+	if err := json.Unmarshal(out.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error != nil {
+		t.Fatalf("ping returned an error: %s", out.String())
+	}
+	var result map[string]any
+	if err := json.Unmarshal(response.Result, &result); err != nil {
+		t.Fatalf("ping result is not an object: %s", out.String())
+	}
+	if len(result) != 0 {
+		t.Fatalf("ping result is not empty: %s", out.String())
+	}
+}
+
+func TestMCPBlankLinesAreSkippedWithoutError(t *testing.T) {
+	server := newMCPServer(func(context.Context, core.Request) (*core.Core, func(), error) {
+		return core.New(nil), func() {}, nil
+	})
+	// Interleave blank and whitespace-only lines between real requests; a
+	// keep-alive newline must not produce a spurious parse-error frame.
+	input := "\n   \n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n\n\t\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n   \n"
+	var out, diag bytes.Buffer
+	if err := server.Serve(context.Background(), strings.NewReader(input), &out, &diag); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected exactly 2 responses for 2 requests, got %d: %q", len(lines), out.String())
+	}
+	for i, line := range lines {
+		var response mcpResponse
+		if err := json.Unmarshal([]byte(line), &response); err != nil {
+			t.Fatalf("response %d: %v", i, err)
+		}
+		if response.Error != nil {
+			t.Fatalf("blank line produced a protocol error: %s", line)
+		}
+	}
+	if diag.Len() != 0 {
+		t.Fatalf("blank line leaked a diagnostic: %q", diag.String())
+	}
+}
+
 type mcpErrorStore struct{ core.Store }
 
 func (mcpErrorStore) Check(context.Context) (store.CheckReport, error) {

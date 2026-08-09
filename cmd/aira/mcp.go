@@ -8,6 +8,7 @@ import (
 	"io"
 	"sort"
 	"strconv"
+	"strings"
 
 	"aira/internal/core"
 	"aira/internal/store"
@@ -209,7 +210,7 @@ func (s *mcpServer) Serve(ctx context.Context, input io.Reader, output, diagnost
 	reader := bufio.NewReader(input)
 	for {
 		line, err := reader.ReadString('\n')
-		if len(line) > 0 {
+		if len(strings.TrimSpace(line)) > 0 {
 			response, respond := s.handle(ctx, []byte(line))
 			if !respond {
 				if err == io.EOF {
@@ -256,6 +257,9 @@ func (s *mcpServer) handle(ctx context.Context, line []byte) (mcpResponse, bool)
 		return resultResponse(id, map[string]any{"tools": s.tools}), hasRequestID(request.ID)
 	case "tools/call":
 		return s.call(ctx, id, request.Params), hasRequestID(request.ID)
+	case "ping":
+		// MCP hosts may ping for liveness; answer with an empty result.
+		return resultResponse(id, map[string]any{}), hasRequestID(request.ID)
 	default:
 		return protocolResponse(id, -32601, "method not found", nil), hasRequestID(request.ID)
 	}
