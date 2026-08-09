@@ -661,21 +661,40 @@ func (s *Store) leaseFileOrphanWarnings(ctx context.Context, report *CheckReport
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	type liveLease struct {
+		ticketID string
+		lease    domain.Lease
+	}
+	var liveLeases []liveLease
 	for rows.Next() {
 		var ticketID string
 		var row leaseRow
 		if err := rows.Scan(&ticketID, &row.generation, &row.holderTokenHash, &row.bootID, &row.lastHeartbeatMonoNS, &row.ttlNS, &row.actor, &row.worktree); err != nil {
+			_ = rows.Close()
 			return err
 		}
+		row.state = "held"
 		lease, err := leaseFromRow(ticketID, row)
 		if err != nil {
+			_ = rows.Close()
 			return err
 		}
 		held, _ := lease.Held()
 		if !held.IsLive(bootID, monoNS) {
 			continue
 		}
+		liveLeases = append(liveLeases, liveLease{ticketID: ticketID, lease: lease})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, item := range liveLeases {
+		ticketID, lease := item.ticketID, item.lease
+		held, _ := lease.Held()
 		var active int
 		var root string
 		err = s.db.QueryRowContext(ctx, `SELECT active, root FROM worktrees WHERE project_id=? AND worktree_id=?`, s.projectID, held.Worktree()).Scan(&active, &root)
@@ -685,5 +704,5 @@ func (s *Store) leaseFileOrphanWarnings(ctx context.Context, report *CheckReport
 			return err
 		}
 	}
-	return rows.Err()
+	return nil
 }

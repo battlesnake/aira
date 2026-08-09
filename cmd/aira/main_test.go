@@ -49,3 +49,25 @@ func TestReadyListFlagParsesAsBoolean(t *testing.T) {
 		t.Fatalf("ready --list request = %#v err=%v", request, err)
 	}
 }
+
+func TestTouchRequestAcceptsZeroOrMoreGlobsAndTokenOption(t *testing.T) {
+	positional, options, err := parseArgs("touch", []string{"AIRA-1", "src/**", "--token", "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := buildRequest("touch", positional, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Args["selector"] != "AIRA-1" || request.Args["token"] != "token" {
+		t.Fatalf("touch request identity/token=%#v", request.Args)
+	}
+	globs, ok := request.Args["globs"].([]string)
+	if !ok || len(globs) != 1 || globs[0] != "src/**" {
+		t.Fatalf("touch request globs=%#v", request.Args["globs"])
+	}
+	clearRequest, err := buildRequest("touch", []string{"AIRA-1"}, map[string]string{})
+	if err != nil || len(clearRequest.Args["globs"].([]string)) != 0 {
+		t.Fatalf("touch clear request=%#v err=%v", clearRequest, err)
+	}
+}

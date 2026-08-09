@@ -16,6 +16,7 @@ var ExitCodes = map[string]int{
 	"E_ID_INVALID": 2, "E_SELECTOR_INVALID": 2, "E_NOT_FOUND": 2,
 	"E_SELECTOR_AMBIGUOUS": 2, "E_UNKNOWN_VERB": 2,
 	"E_ALREADY_INITIALIZED": 2,
+	"E_GLOB_INVALID":        2,
 	"E_DB_BUSY":             4, "E_DB_CORRUPT": 4, "E_RECEIPT_IO": 4,
 	"E_RECONCILE_REQUIRED": 4, "E_GIT_SCAN": 4, "E_INTERNAL": 4,
 	"E_JOURNAL_CORRUPT": 4,
@@ -52,7 +53,7 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 	report := CheckReport{Verdict: "pass", Dimensions: map[string]string{
 		"allocated-id-file": "pass", "duplicate-id": "pass", "stale-index": "pass",
 		"orphan-worktree": "pass", "ticket-file-integrity": "pass", "reconcile-integrity": "pass",
-		"rebuild-integrity": "pass", "relation-integrity": "pass", "lease-integrity": "pass",
+		"rebuild-integrity": "pass", "relation-integrity": "pass", "lease-integrity": "pass", "area-overlap": "pass",
 	}}
 	if err := ctx.Err(); err != nil {
 		report.Verdict = "unevaluated"
@@ -175,6 +176,19 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 			report.UnevaluatedFindings = append(report.UnevaluatedFindings, CheckFinding{Code: "E_CLOCK_UNAVAILABLE", Subject: "leases", Message: err.Error(), Kind: "unevaluated"})
 		} else {
 			return CheckReport{}, err
+		}
+	}
+	if warnings, err := s.areaOverlapWarnings(ctx); err != nil {
+		if ErrorCode(err) == "E_CLOCK_UNAVAILABLE" {
+			report.Dimensions["lease-integrity"] = "unevaluated"
+			report.Unevaluated = true
+			report.UnevaluatedFindings = append(report.UnevaluatedFindings, CheckFinding{Code: "E_CLOCK_UNAVAILABLE", Subject: "area-hints", Message: err.Error(), Kind: "unevaluated"})
+		} else {
+			return CheckReport{}, err
+		}
+	} else {
+		for _, warning := range warnings {
+			addWarning(&report, warning, "area-overlap")
 		}
 	}
 

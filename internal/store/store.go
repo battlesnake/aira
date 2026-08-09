@@ -270,6 +270,10 @@ func (s *Store) initDB(ctx context.Context) error {
                     last_heartbeat_mono_ns IS NOT NULL AND last_heartbeat_mono_ns >= 0 AND
                     ttl_ns IS NOT NULL AND ttl_ns > 0 AND actor IS NOT NULL AND length(trim(actor)) > 0 AND
                     worktree_id IS NOT NULL AND length(trim(worktree_id)) > 0))
+	        )`,
+		`CREATE TABLE IF NOT EXISTS area_hints (
+            project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, worktree_id TEXT NOT NULL,
+            glob TEXT NOT NULL, PRIMARY KEY(project_id, ticket_id, worktree_id, glob)
         )`,
 	}
 	for _, statement := range statements {

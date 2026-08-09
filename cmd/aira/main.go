@@ -120,6 +120,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"count": {"by": true}, "reconcile": {"rebuild": true},
 		"claim":   {"steal": true, "actor": true},
 		"release": {"token": true}, "heartbeat": {"token": true},
+		"touch": {"token": true},
 		"ready": {"list": true},
 	}
 	for name := range options {
@@ -181,6 +182,12 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			return core.Request{}, fmt.Errorf("%s requires <id>", verb)
 		}
 		args["selector"], args["token"] = positional[0], options["token"]
+	case "touch":
+		if len(positional) < 1 {
+			return core.Request{}, fmt.Errorf("touch requires <id> [<glob>...]")
+		}
+		args["selector"], args["token"] = positional[0], options["token"]
+		args["globs"] = positional[1:]
 	case "link":
 		if len(positional) == 2 && positional[0] == "ls" {
 			args["list"], args["selector"] = true, positional[1]

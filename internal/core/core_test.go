@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -456,6 +457,32 @@ func TestDispatchesAllMilestoneVerbsThroughCore(t *testing.T) {
 	}
 	if help := c.Do(context.Background(), Request{Verb: "help"}); !help.OK || len(help.Data.([]map[string]string)) < 10 {
 		t.Fatalf("generated help = %#v", help)
+	}
+}
+
+func TestTouchDispatchUsesHolderTokenAndReturnsHintsAndWarnings(t *testing.T) {
+	s := coreTestStore(t)
+	c := New(s)
+	created := c.Do(context.Background(), Request{Verb: "create", Args: map[string]any{"title": "touch dispatch"}})
+	if !created.OK {
+		t.Fatalf("create: %#v", created)
+	}
+	var createdData map[string]any
+	marshalRoundTrip(t, created.Data, &createdData)
+	id := createdData["id"].(string)
+	if claim := c.Do(context.Background(), Request{Verb: "claim", Args: map[string]any{"selector": id}}); !claim.OK {
+		t.Fatalf("claim: %#v", claim)
+	}
+	touch := c.Do(context.Background(), Request{Verb: "touch", Args: map[string]any{
+		"selector": id, "globs": []any{"./z.go", "src/**", "src/**"},
+	}})
+	if !touch.OK || touch.Code != "OK" || len(touch.Warnings) != 0 {
+		t.Fatalf("touch response=%#v", touch)
+	}
+	var result store.AreaTouchResult
+	marshalRoundTrip(t, touch.Data, &result)
+	if result.ID != id || !reflect.DeepEqual(result.Hints, []string{"src/**", "z.go"}) {
+		t.Fatalf("touch result=%#v", result)
 	}
 }
 

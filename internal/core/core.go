@@ -41,6 +41,7 @@ type Store interface {
 	Claim(context.Context, string, bool, string) (store.LeaseClaim, error)
 	Release(context.Context, string, string) (store.EventKey, error)
 	Heartbeat(context.Context, string, string) (domain.Lease, error)
+	Touch(context.Context, string, string, []string) (store.AreaTouchResult, error)
 	LeaseToken(string) (string, error)
 	Link(context.Context, string, domain.RelationKind, string) (store.EventKey, error)
 	Unlink(context.Context, string, domain.RelationKind, string) (store.EventKey, error)
@@ -197,6 +198,28 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			lease, err := c.store.Heartbeat(ctx, record.Ticket.ID, token)
 			return lease, err
+		}},
+		"touch": {Name: "touch", Usage: "touch <id> <glob...>", Run: func(ctx context.Context, args map[string]any) (any, error) {
+			record, err := c.store.Get(stringArg(args, "selector"))
+			if err != nil {
+				return nil, err
+			}
+			token := stringArg(args, "token")
+			if token == "" {
+				token, err = c.store.LeaseToken(record.Ticket.ID)
+				if err != nil {
+					return nil, err
+				}
+			}
+			result, err := c.store.Touch(ctx, record.Ticket.ID, token, stringSlice(args, "globs"))
+			if err != nil {
+				return nil, err
+			}
+			warnings := make([]string, 0, len(result.Warnings))
+			for _, warning := range result.Warnings {
+				warnings = append(warnings, warning.Code)
+			}
+			return handlerData{Data: result, Warnings: warnings}, nil
 		}},
 		"link": {Name: "link", Usage: "link <from> <kind> <to> | link ls <id>", Run: func(ctx context.Context, args map[string]any) (any, error) {
 			if boolArg(args, "list") {
