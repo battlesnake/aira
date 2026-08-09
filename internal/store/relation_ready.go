@@ -400,18 +400,24 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 	if err != nil {
 		return nil, err
 	}
+	indexedRelations, err := s.indexedRelations()
+	if err != nil {
+		return nil, err
+	}
+	canonicalEndpointFindings := canonicalFindingsForIndexedRelations(s.root, scanFindings, indexedRelations)
 	for i := range indexFindings {
 		// The canonical files determine readiness. A stale derived row is
 		// surfaced here as a warning, but must not make a canonical-ready
 		// ticket fail or become blocked.
-		if indexFindings[i].Kind != "fail" {
-			indexFindings[i].Kind = "warning"
-		}
+		indexFindings[i].Kind = "warning"
 	}
 	findings := append(append(append([]CheckFinding(nil), scanFindings...), relationFindings...), indexFindings...)
 	result := make([]ReadyRecord, 0, len(rows)+len(findings))
 	for _, row := range rows {
 		rowFindings := findingsForReadyRow(row, findings, relations)
+		for _, finding := range canonicalEndpointFindings[row.Ticket.ID] {
+			rowFindings = appendUniqueFinding(rowFindings, finding)
+		}
 		hasFailFinding := false
 		for _, finding := range rowFindings {
 			if finding.Kind == "fail" {
@@ -455,6 +461,25 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 	}
 	sortReadyRecords(result)
 	return result, nil
+}
+
+// canonicalFindingsForIndexedRelations uses the disposable index only to
+// attribute an existing canonical scan failure to affected endpoints. The
+// canonical failure remains the readiness cause; a missing canonical file has
+// no scan finding and therefore cannot be promoted by this helper.
+func canonicalFindingsForIndexedRelations(root string, scanFindings []CheckFinding, indexed []storedRelation) map[string][]CheckFinding {
+	result := make(map[string][]CheckFinding)
+	for _, relation := range indexed {
+		path := repoPath(root, relation.Path)
+		for _, finding := range scanFindings {
+			if finding.Subject != path {
+				continue
+			}
+			result[relation.Relation.From] = appendUniqueFinding(result[relation.Relation.From], finding)
+			result[relation.Relation.To] = appendUniqueFinding(result[relation.Relation.To], finding)
+		}
+	}
+	return result
 }
 
 func findingPathMatchesSelector(path string, sel selector) bool {

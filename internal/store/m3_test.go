@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"aira/internal/domain"
@@ -23,6 +24,24 @@ type m3Clock struct {
 }
 
 func (c *m3Clock) Now() (string, uint64, error) { return c.boot, c.mono, c.err }
+
+type lockAwareClock struct {
+	boot          string
+	staleMono     uint64
+	liveMono      uint64
+	lockAcquired  *atomic.Bool
+	sampledBefore *atomic.Bool
+}
+
+func (c *lockAwareClock) Now() (string, uint64, error) {
+	if c.lockAcquired != nil && !c.lockAcquired.Load() {
+		if c.sampledBefore != nil {
+			c.sampledBefore.Store(true)
+		}
+		return c.boot, c.staleMono, nil
+	}
+	return c.boot, c.liveMono, nil
+}
 
 func m3Store(t *testing.T) (*Store, *m3Clock, string) {
 	t.Helper()
@@ -219,6 +238,79 @@ func TestConcurrentExpiredClaimersHaveOneWinnerAndNextGeneration(t *testing.T) {
 	}
 }
 
+func TestStalePreLockClockCannotProduceSecondWinner(t *testing.T) {
+	const (
+		leaseTTL  = uint64(15 * 60 * 1_000_000_000)
+		heartbeat = uint64(1_000_000_000_000)
+	)
+	claimLiveLease := func(t *testing.T) (*Store, string, string) {
+		t.Helper()
+		s, clock, base := m3Store(t)
+		ticket := m3Ticket(t, s, "stale pre-lock clock")
+		s.leaseTTLNS = leaseTTL
+		clock.mono = heartbeat
+		if _, err := s.Claim(context.Background(), ticket.ID, false, "incumbent"); err != nil {
+			t.Fatal(err)
+		}
+		return s, ticket.ID, base
+	}
+
+	openContender := func(t *testing.T, base, worktree string, clock Clock) *Store {
+		t.Helper()
+		contender, err := Open(context.Background(), Options{
+			Root: base, CommonDir: filepath.Join(base, "common"),
+			DBPath: filepath.Join(base, "state", "state.db"), RegistryPath: filepath.Join(base, "state", "registry.jsonl"),
+			LeaseStateDir: filepath.Join(base, "lease-state"), ProjectID: "project-aira", WorktreeID: worktree,
+			ProjectSlug: "aira", Prefixes: []string{"AIRA"}, Clock: clock, LeaseTTLNS: leaseTTL,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = contender.Close() })
+		return contender
+	}
+
+	t.Run("sample after writer lock", func(t *testing.T) {
+		s, ticketID, base := claimLiveLease(t)
+		acquired := &atomic.Bool{}
+		sampledBefore := &atomic.Bool{}
+		clock := &lockAwareClock{boot: "boot-a", staleMono: heartbeat - 1, liveMono: heartbeat + 1, lockAcquired: acquired, sampledBefore: sampledBefore}
+		contender := openContender(t, base, "worktree-b", clock)
+		contender.afterLeaseBegin = func() { acquired.Store(true) }
+
+		if _, err := contender.Claim(context.Background(), ticketID, true, "contender"); ErrorCode(err) != "E_LEASE_HELD" {
+			t.Fatalf("live incumbent claim result = %v", err)
+		}
+		if sampledBefore.Load() {
+			t.Fatal("clock was sampled before the writer lock; stale sample was not eliminated")
+		}
+		lease, err := s.GetLease(context.Background(), ticketID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held, ok := lease.Held()
+		if !ok || held.Generation != 1 {
+			t.Fatalf("stale pre-lock contender changed lease generation: %#v", lease)
+		}
+	})
+
+	t.Run("stale in-lock sample is rejected by CAS", func(t *testing.T) {
+		s, ticketID, base := claimLiveLease(t)
+		contender := openContender(t, base, "worktree-c", &m3Clock{boot: "boot-a", mono: heartbeat - 1})
+		if _, err := contender.Claim(context.Background(), ticketID, true, "contender"); ErrorCode(err) != "E_LEASE_HELD" {
+			t.Fatalf("stale in-lock claim result = %v", err)
+		}
+		lease, err := s.GetLease(context.Background(), ticketID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held, ok := lease.Held()
+		if !ok || held.Generation != 1 {
+			t.Fatalf("stale in-lock contender changed lease generation: %#v", lease)
+		}
+	})
+}
+
 func TestLeaseSchemaAndRowValidationRejectCorruption(t *testing.T) {
 	s, _, _ := m3Store(t)
 	_, err := s.db.Exec(`INSERT INTO leases(project_id, ticket_id, state, generation, holder_token_hash, boot_id,
@@ -239,7 +331,7 @@ func TestLeaseSchemaAndRowValidationRejectCorruption(t *testing.T) {
 		t.Fatal("lease CHECK accepted a nonempty malformed holder hash")
 	}
 
-	hash := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	hash := base64.RawURLEncoding.EncodeToString([]byte(strings.Repeat("x", 32)))
 	valid := leaseRow{
 		state: "held", generation: 1,
 		holderTokenHash:     sql.NullString{String: hash, Valid: true},
@@ -366,6 +458,36 @@ func TestReadyUsesCanonicalRelationsAndReportsStaleIndex(t *testing.T) {
 	report, err := s.Check(context.Background())
 	if err != nil || report.Dimensions["relation-integrity"] != "fail" || !hasFinding(report.Findings, "E_RELATION_INDEX_DIVERGENCE") {
 		t.Fatalf("check did not report stale relation index: report=%#v err=%v", report, err)
+	}
+}
+
+func TestReadyCanonicalReadinessIgnoresDivergenceForDeletedRelationOwner(t *testing.T) {
+	s, _, _ := m3Store(t)
+	prerequisite := m3Ticket(t, s, "deleted relation owner")
+	dependent := m3Ticket(t, s, "dependent")
+	if _, err := s.Link(context.Background(), prerequisite.ID, domain.RelationBlocks, dependent.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(s.root, ".aira", "tickets", prerequisite.ID+".md")); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.Ready(dependent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || !rows[0].Ready || rows[0].Verdict != "pass" {
+		t.Fatalf("deleted relation owner affected canonical readiness: %#v", rows)
+	}
+	var finding *CheckFinding
+	for i := range rows[0].Findings {
+		if rows[0].Findings[i].Code == "E_RELATION_INDEX_DIVERGENCE" {
+			finding = &rows[0].Findings[i]
+			break
+		}
+	}
+	if finding == nil || finding.Kind != "warning" {
+		t.Fatalf("stale index divergence was not surfaced as warning: %#v", rows[0].Findings)
 	}
 }
 

@@ -3,9 +3,62 @@
 package domain
 
 import (
+	"bytes"
 	"encoding/json"
 	"testing"
 )
+
+func TestLeaseConstructorsRejectIllegalHeldStatesAndNilLeaseIsNeither(t *testing.T) {
+	hash := bytes.Repeat([]byte{0x42}, 32)
+	valid, err := NewHeldLease(hash, "boot-a", 100, 900, 1, "actor", "worktree")
+	if err != nil {
+		t.Fatalf("valid held lease rejected: %v", err)
+	}
+	if lease := (Lease{TicketID: "AIRA-1", State: valid}); !lease.Valid() {
+		t.Fatal("validated held lease is not valid")
+	}
+	for name, args := range map[string]struct {
+		hash       []byte
+		boot       string
+		heartbeat  uint64
+		ttl        int64
+		generation uint64
+		actor      string
+		worktree   string
+	}{
+		"zero generation":   {hash: hash, boot: "boot-a", heartbeat: 100, ttl: 900, generation: 0, actor: "actor", worktree: "worktree"},
+		"zero ttl":          {hash: hash, boot: "boot-a", heartbeat: 100, ttl: 0, generation: 1, actor: "actor", worktree: "worktree"},
+		"negative ttl":      {hash: hash, boot: "boot-a", heartbeat: 100, ttl: -1, generation: 1, actor: "actor", worktree: "worktree"},
+		"empty holder hash": {hash: nil, boot: "boot-a", heartbeat: 100, ttl: 900, generation: 1, actor: "actor", worktree: "worktree"},
+		"empty boot":        {hash: hash, boot: "", heartbeat: 100, ttl: 900, generation: 1, actor: "actor", worktree: "worktree"},
+		"empty actor":       {hash: hash, boot: "boot-a", heartbeat: 100, ttl: 900, generation: 1, actor: "", worktree: "worktree"},
+		"empty worktree":    {hash: hash, boot: "boot-a", heartbeat: 100, ttl: 900, generation: 1, actor: "actor", worktree: ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := NewHeldLease(args.hash, args.boot, args.heartbeat, args.ttl, args.generation, args.actor, args.worktree); err == nil {
+				t.Fatal("illegal held lease was accepted")
+			}
+		})
+	}
+
+	var zero Lease
+	if zero.Valid() {
+		t.Fatal("zero lease is valid")
+	}
+	if _, ok := zero.Held(); ok {
+		t.Fatal("nil-state lease reports Held")
+	}
+	if _, ok := zero.Free(); ok {
+		t.Fatal("nil-state lease reports Free")
+	}
+	invalid := Lease{TicketID: "AIRA-1", State: HeldLease{BootID: "boot-a", TTLNS: 900, Generation: 1, Actor: "actor", Worktree: "worktree"}}
+	if invalid.Valid() {
+		t.Fatal("unvalidated held lease is valid")
+	}
+	if _, ok := invalid.Held(); ok {
+		t.Fatal("unvalidated held lease reports Held")
+	}
+}
 
 func TestTicketRoundTripAndCanonicalRelationOrder(t *testing.T) {
 	ticket := Ticket{

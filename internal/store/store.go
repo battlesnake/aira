@@ -65,6 +65,9 @@ type Store struct {
 	// beforeLeaseCommit is a test-only crash hook for the DB/token ordering
 	// boundary; production leaves it nil.
 	beforeLeaseCommit func() error
+	// afterLeaseBegin is a test-only observation hook for the lease clock
+	// sampling boundary; production leaves it nil.
+	afterLeaseBegin func()
 }
 
 type Intent struct {

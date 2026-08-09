@@ -139,7 +139,11 @@ func leaseFromRow(ticketID string, row leaseRow) (domain.Lease, error) {
 		if row.holderTokenHash.Valid || row.bootID.Valid || row.lastHeartbeatMonoNS.Valid || row.ttlNS.Valid || row.actor.Valid || row.worktree.Valid {
 			return domain.Lease{}, errors.New("E_CONFIG_INVALID: free lease carries holder state")
 		}
-		return domain.Lease{TicketID: ticketID, State: domain.FreeLease{Generation: uint64(row.generation)}}, nil
+		free, err := domain.NewFreeLease(uint64(row.generation))
+		if err != nil {
+			return domain.Lease{}, err
+		}
+		return domain.Lease{TicketID: ticketID, State: free}, nil
 	}
 	if row.state != "held" || row.generation < 1 || !row.holderTokenHash.Valid || strings.TrimSpace(row.holderTokenHash.String) == "" ||
 		!row.bootID.Valid || strings.TrimSpace(row.bootID.String) == "" || !row.lastHeartbeatMonoNS.Valid || row.lastHeartbeatMonoNS.Int64 < 0 ||
@@ -153,10 +157,12 @@ func leaseFromRow(ticketID string, row leaseRow) (domain.Lease, error) {
 	}
 	var hash [32]byte
 	copy(hash[:], hashBytes)
-	return domain.Lease{TicketID: ticketID, State: domain.HeldLease{
-		HolderTokenHash: hash, BootID: row.bootID.String, LastHeartbeatMonoNS: uint64(row.lastHeartbeatMonoNS.Int64),
-		TTLNS: uint64(row.ttlNS.Int64), Generation: uint64(row.generation), Actor: row.actor.String, Worktree: row.worktree.String,
-	}}, nil
+	held, err := domain.NewHeldLease(hash[:], row.bootID.String, uint64(row.lastHeartbeatMonoNS.Int64), row.ttlNS.Int64,
+		uint64(row.generation), row.actor.String, row.worktree.String)
+	if err != nil {
+		return domain.Lease{}, err
+	}
+	return domain.Lease{TicketID: ticketID, State: held}, nil
 }
 
 func readLeaseRow(ctx context.Context, conn interface {
@@ -199,6 +205,9 @@ func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor st
 	}
 	defer unlockFile(tokenLock)
 	err = s.withImmediate(ctx, func(conn *sql.Conn) error {
+		if s.afterLeaseBegin != nil {
+			s.afterLeaseBegin()
+		}
 		// A contender may have waited for BEGIN IMMEDIATE. Sample only after
 		// the writer lock is acquired so its sample cannot predate the lease
 		// that it is about to inspect.
@@ -214,8 +223,11 @@ func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor st
 				base64.RawURLEncoding.EncodeToString(hash[:]), bootID, int64(monoNS), int64(s.leaseTTLNS), actor, s.worktreeID); err != nil {
 				return err
 			}
-			result.Lease = domain.Lease{TicketID: ticketID, State: domain.HeldLease{HolderTokenHash: hash,
-				BootID: bootID, LastHeartbeatMonoNS: monoNS, TTLNS: s.leaseTTLNS, Generation: 1, Actor: actor, Worktree: s.worktreeID}}
+			held, err := domain.NewHeldLease(hash[:], bootID, monoNS, int64(s.leaseTTLNS), 1, actor, s.worktreeID)
+			if err != nil {
+				return err
+			}
+			result.Lease = domain.Lease{TicketID: ticketID, State: held}
 		} else {
 			if rowErr != nil {
 				return rowErr
@@ -258,8 +270,11 @@ func (s *Store) Claim(ctx context.Context, ticketID string, steal bool, actor st
 			} else if affected != 1 {
 				return ErrLeaseHeld
 			}
-			result.Lease = domain.Lease{TicketID: ticketID, State: domain.HeldLease{HolderTokenHash: hash,
-				BootID: bootID, LastHeartbeatMonoNS: monoNS, TTLNS: s.leaseTTLNS, Generation: generation, Actor: actor, Worktree: s.worktreeID}}
+			held, err := domain.NewHeldLease(hash[:], bootID, monoNS, int64(s.leaseTTLNS), generation, actor, s.worktreeID)
+			if err != nil {
+				return err
+			}
+			result.Lease = domain.Lease{TicketID: ticketID, State: held}
 		}
 		seq, err := nextSequence(ctx, conn, s.projectID)
 		if err != nil {
@@ -470,7 +485,10 @@ func (s *Store) Heartbeat(ctx context.Context, ticketID, token string) (domain.L
 			}
 			return ErrLeaseExpired
 		}
-		held.LastHeartbeatMonoNS = monoNS
+		held, err = domain.NewHeldLease(held.HolderTokenHash[:], held.BootID, monoNS, int64(held.TTLNS), held.Generation, held.Actor, held.Worktree)
+		if err != nil {
+			return err
+		}
 		result = domain.Lease{TicketID: ticketID, State: held}
 		return nil
 	})
@@ -480,7 +498,11 @@ func (s *Store) Heartbeat(ctx context.Context, ticketID, token string) (domain.L
 func (s *Store) GetLease(ctx context.Context, ticketID string) (domain.Lease, error) {
 	row, err := readLeaseRow(ctx, s.db, s.projectID, ticketID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return domain.Lease{TicketID: ticketID, State: domain.FreeLease{}}, nil
+		free, freeErr := domain.NewFreeLease(0)
+		if freeErr != nil {
+			return domain.Lease{}, freeErr
+		}
+		return domain.Lease{TicketID: ticketID, State: free}, nil
 	}
 	if err != nil {
 		return domain.Lease{}, err

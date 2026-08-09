@@ -376,7 +376,7 @@ func TestConcurrentLeaseClaimersAcrossShortLivedProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hash := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	hash := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
 	if _, err := s.db.Exec(`INSERT INTO leases(project_id,ticket_id,state,generation,holder_token_hash,boot_id,last_heartbeat_mono_ns,ttl_ns,actor,worktree_id) VALUES(?,?, 'held', 1, ?, 'old-boot', 0, 1, 'old', 'old-worktree')`, s.projectID, ticket.ID, hash); err != nil {
 		t.Fatal(err)
 	}
