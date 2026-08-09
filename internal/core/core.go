@@ -37,6 +37,7 @@ type Store interface {
 	List(string) ([]store.TicketRecord, error)
 	AddFinding(context.Context, domain.ReviewFindingInput) (domain.Finding, store.EventKey, error)
 	ListFindings(string) ([]store.FindingRecord, error)
+	ImportFindingsFile(context.Context, string, bool) (store.ImportSummary, error)
 	Search(context.Context, string, string) ([]store.SearchResult, error)
 	GetFinding(string) (store.FindingRecord, error)
 	SetFinding(context.Context, string, domain.Disposition, string, string) (store.EventKey, error)
@@ -182,6 +183,21 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				data["truncated"] = true
 			}
 			return handlerData{Data: data}, nil
+		}},
+		"import": {Name: "import", Usage: "import <file> [--strict]", Run: func(ctx context.Context, args map[string]any) (any, error) {
+			summary, err := c.store.ImportFindingsFile(ctx, stringArg(args, "file"), boolArg(args, "strict"))
+			if err != nil {
+				return nil, err
+			}
+			// Partial import (some records skipped) is surfaced honestly: the
+			// summary lists every skip and the verdict is fail so the nonzero
+			// exit makes the caller notice the invalid records; a fully-clean
+			// import passes.
+			verdict := "pass"
+			if len(summary.Skipped) > 0 {
+				verdict = "fail"
+			}
+			return handlerData{Data: summary, Verdict: verdict}, nil
 		}},
 		"find": {Name: "find", Usage: "find add|ls|show|set ...", Run: func(ctx context.Context, args map[string]any) (any, error) {
 			subverb := strings.ToLower(stringArg(args, "subverb"))

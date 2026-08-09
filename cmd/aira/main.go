@@ -86,7 +86,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 			continue
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "rebuild" || name == "steal" || (name == "list" && verb == "ready") {
+		if name == "rebuild" || name == "steal" || name == "strict" || (name == "list" && verb == "ready") {
 			options[name] = "true"
 			continue
 		}
@@ -118,8 +118,9 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"create": {"kind": true, "severity": true, "labels": true, "body": true},
 		"new":    {"kind": true, "severity": true, "labels": true, "body": true},
 		"list":   {"by": true, "fields": true}, "ls": {"by": true, "fields": true},
-		"grep":  {"kind": true, "by": true, "fields": true},
-		"count": {"by": true}, "reconcile": {"rebuild": true},
+		"grep":   {"kind": true, "by": true, "fields": true},
+		"import": {"strict": true},
+		"count":  {"by": true}, "reconcile": {"rebuild": true},
 		"claim":   {"steal": true, "actor": true},
 		"release": {"token": true}, "heartbeat": {"token": true},
 		"touch": {"token": true},
@@ -200,6 +201,11 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			return core.Request{}, fmt.Errorf("grep requires <query>")
 		}
 		args["query"], args["kind"], args["by"], args["fields"] = strings.Join(positional, " "), options["kind"], options["by"], splitComma(options["fields"])
+	case "import":
+		if len(positional) != 1 {
+			return core.Request{}, fmt.Errorf("import requires <file>")
+		}
+		args["file"], args["strict"] = positional[0], options["strict"] == "true"
 	case "count":
 		if options["by"] == "" {
 			return core.Request{}, fmt.Errorf("count requires --by <field>")
