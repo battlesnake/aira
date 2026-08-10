@@ -3,10 +3,119 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func openStoreWithRequirementPrefix(t *testing.T, root, common, state string) *Store {
+	t.Helper()
+	s, err := Open(context.Background(), Options{
+		Root: root, CommonDir: common, DBPath: filepath.Join(state, "state.db"),
+		RegistryPath: filepath.Join(state, "registry.jsonl"), ProjectID: "project-aira",
+		WorktreeID: filepath.Base(root), ProjectSlug: "aira",
+		Prefixes: []string{"AIRA"}, RequirementPrefixes: []string{"AR"},
+	})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+func TestAllocateRequirementIDRecordsKindAndPath(t *testing.T) {
+	base := persistentTemp(t, "alloc-req-kind")
+	root := filepath.Join(base, "main")
+	common := filepath.Join(base, "common")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := openStoreWithRequirementPrefix(t, root, common, filepath.Join(base, "state"))
+
+	id, err := s.AllocateID(context.Background(), "AR")
+	if err != nil {
+		t.Fatalf("allocate AR: %v", err)
+	}
+	if id != "AR-1" {
+		t.Fatalf("id=%s, want AR-1", id)
+	}
+	var kind, path string
+	if err := s.db.QueryRow(`SELECT kind, path FROM allocations WHERE prefix='AR' AND number=1`).Scan(&kind, &path); err != nil {
+		t.Fatal(err)
+	}
+	if kind != kindRequirement {
+		t.Fatalf("allocation kind=%q, want requirement", kind)
+	}
+	if !strings.Contains(filepath.ToSlash(path), ".aira/requirements/AR-1.md") {
+		t.Fatalf("allocation path=%q, want under .aira/requirements/", path)
+	}
+
+	// The durable receipt carries the kind so DB-loss recovery can restore it.
+	receiptFound := false
+	for _, line := range readReceiptLines(t, common) {
+		var r AllocationReceipt
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			t.Fatal(err)
+		}
+		if r.ID == "AR-1" {
+			if r.Kind != kindRequirement {
+				t.Fatalf("receipt kind=%q, want requirement", r.Kind)
+			}
+			receiptFound = true
+		}
+	}
+	if !receiptFound {
+		t.Fatal("no durable receipt carrying kind for AR-1")
+	}
+
+	// A ticket prefix still allocates a ticket-kind allocation under .aira/tickets/.
+	tid, err := s.AllocateID(context.Background(), "AIRA")
+	if err != nil {
+		t.Fatalf("allocate AIRA: %v", err)
+	}
+	var tkind, tpath string
+	if err := s.db.QueryRow(`SELECT kind, path FROM allocations WHERE prefix='AIRA' AND number=1`).Scan(&tkind, &tpath); err != nil {
+		t.Fatal(err)
+	}
+	if tid != "AIRA-1" || tkind != kindTicket || !strings.Contains(filepath.ToSlash(tpath), ".aira/tickets/") {
+		t.Fatalf("ticket allocation id=%q kind=%q path=%q", tid, tkind, tpath)
+	}
+}
+
+func TestDisjointPrefixKindsRejected(t *testing.T) {
+	base := persistentTemp(t, "disjoint-prefix")
+	root := filepath.Join(base, "main")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Open(context.Background(), Options{
+		Root: root, CommonDir: filepath.Join(base, "common"), DBPath: filepath.Join(base, "state", "state.db"),
+		RegistryPath: filepath.Join(base, "state", "registry.jsonl"), ProjectID: "project-aira",
+		WorktreeID: "main", ProjectSlug: "aira",
+		Prefixes: []string{"AIRA"}, RequirementPrefixes: []string{"AIRA"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "E_PREFIX_OWNERSHIP_CONFLICT") {
+		t.Fatalf("expected disjoint-kind conflict, got %v", err)
+	}
+}
+
+func readReceiptLines(t *testing.T, common string) []string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(common, "aira", "receipts.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lines []string
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
 
 // createLegacyAllocationDB builds a pre-M9 database whose allocations and
 // prefix_ownership tables have no entity-kind column, populated with a ticket

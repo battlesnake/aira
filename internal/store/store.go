@@ -40,7 +40,11 @@ type Options struct {
 	WorktreeID    string
 	ProjectSlug   string
 	Prefixes      []string
-	LeaseStateDir string
+	// RequirementPrefixes registers requirement-kind ID prefixes (e.g. "AR").
+	// They must be disjoint from Prefixes (ticket-kind); a prefix belongs to
+	// exactly one kind.
+	RequirementPrefixes []string
+	LeaseStateDir       string
 	LeaseTTLNS    uint64
 	Clock         Clock
 }
@@ -55,7 +59,7 @@ type Store struct {
 	projectID     string
 	worktreeID    string
 	projectSlug   string
-	prefixes      map[string]bool
+	prefixes      map[string]string // prefix -> entity kind (ticket|requirement)
 	leaseStateDir string
 	leaseTTLNS    uint64
 	clock         Clock
@@ -114,6 +118,9 @@ type AllocationReceipt struct {
 	Seq        int64  `json:"seq"`
 	At         string `json:"at"`
 	State      string `json:"state"`
+	// Kind is the entity kind of the allocation. A pre-M9 receipt has no kind
+	// field, which decodes to "" and is normalised to ticket on read.
+	Kind string `json:"kind,omitempty"`
 }
 
 type EventKey struct {
@@ -122,12 +129,17 @@ type EventKey struct {
 }
 
 type registryEntry struct {
-	ProjectID  string   `json:"project_id"`
-	CommonDir  string   `json:"common_dir"`
-	WorktreeID string   `json:"worktree_id"`
-	Root       string   `json:"root"`
-	Prefixes   []string `json:"prefixes"`
-	At         string   `json:"at"`
+	ProjectID  string `json:"project_id"`
+	CommonDir  string `json:"common_dir"`
+	WorktreeID string `json:"worktree_id"`
+	Root       string `json:"root"`
+	// Prefixes lists ticket-kind prefixes; RequirementPrefixes lists
+	// requirement-kind prefixes. A pre-M9 breadcrumb has no requirement_prefixes
+	// field, which decodes to nil ⇒ every recorded prefix is ticket-kind (the
+	// legacy decoder). omitempty keeps old-shaped output when there are none.
+	Prefixes            []string `json:"prefixes"`
+	RequirementPrefixes []string `json:"requirement_prefixes,omitempty"`
+	At                  string   `json:"at"`
 }
 
 type eventRecord struct {
@@ -191,7 +203,7 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	s := &Store{
 		db: db, root: root, commonDir: common, auditDir: filepath.Join(common, "aira"),
 		dbPath: dbPath, registryPath: registry, projectID: opts.ProjectID,
-		worktreeID: opts.WorktreeID, projectSlug: opts.ProjectSlug, prefixes: map[string]bool{},
+		worktreeID: opts.WorktreeID, projectSlug: opts.ProjectSlug, prefixes: map[string]string{},
 		leaseStateDir: opts.LeaseStateDir, leaseTTLNS: opts.LeaseTTLNS, clock: opts.Clock,
 	}
 	if s.leaseStateDir == "" {
@@ -208,7 +220,21 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 			_ = db.Close()
 			return nil, fmt.Errorf("E_ID_INVALID: invalid prefix %q", prefix)
 		}
-		s.prefixes[strings.ToUpper(prefix)] = true
+		s.prefixes[strings.ToUpper(prefix)] = kindTicket
+	}
+	for _, prefix := range opts.RequirementPrefixes {
+		if !validPrefix(prefix) {
+			_ = db.Close()
+			return nil, fmt.Errorf("E_ID_INVALID: invalid prefix %q", prefix)
+		}
+		up := strings.ToUpper(prefix)
+		if existing, dup := s.prefixes[up]; dup && existing != kindRequirement {
+			// Prefixes are disjoint by kind: a prefix may not be both a ticket
+			// and a requirement prefix.
+			_ = db.Close()
+			return nil, fmt.Errorf("E_PREFIX_OWNERSHIP_CONFLICT: prefix %q registered as both ticket and requirement", up)
+		}
+		s.prefixes[up] = kindRequirement
 	}
 	if err := s.initDB(ctx); err != nil {
 		_ = db.Close()
@@ -602,7 +628,8 @@ func findingsHasCompositePrimaryKey(ctx context.Context, db interface {
 func (s *Store) register(ctx context.Context) error {
 	entry := registryEntry{
 		ProjectID: s.projectID, CommonDir: s.commonDir, WorktreeID: s.worktreeID,
-		Root: s.root, Prefixes: sortedKeys(s.prefixes), At: time.Now().UTC().Format(time.RFC3339Nano),
+		Root: s.root, Prefixes: s.prefixesByKind(kindTicket), RequirementPrefixes: s.prefixesByKind(kindRequirement),
+		At: time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	// The breadcrumb is written before the DB transaction. A stale breadcrumb is
 	// recoverable evidence; a DB row without a breadcrumb is not recoverable after DB loss.
@@ -621,17 +648,22 @@ func (s *Store) register(ctx context.Context) error {
 			s.projectID, s.worktreeID, s.root, now); err != nil {
 			return err
 		}
-		for prefix := range s.prefixes {
-			var owner string
-			err := conn.QueryRowContext(ctx, `SELECT project_id FROM prefix_ownership WHERE prefix=?`, prefix).Scan(&owner)
+		for prefix, kind := range s.prefixes {
+			var owner, ownerKind string
+			err := conn.QueryRowContext(ctx, `SELECT project_id, kind FROM prefix_ownership WHERE prefix=?`, prefix).Scan(&owner, &ownerKind)
 			if err == nil && owner != s.projectID {
 				return fmt.Errorf("E_PREFIX_OWNERSHIP_CONFLICT: %s owned by %s", prefix, owner)
+			}
+			if err == nil && normaliseKind(ownerKind) != kind {
+				// A prefix's kind is immutable: it may not be re-registered under
+				// a different entity kind (disjoint-by-kind, enforced durably).
+				return fmt.Errorf("E_PREFIX_OWNERSHIP_CONFLICT: %s registered as %s, cannot re-register as %s", prefix, normaliseKind(ownerKind), kind)
 			}
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
-			if _, err := conn.ExecContext(ctx, `INSERT INTO prefix_ownership(prefix, project_id, registered_seq)
-                VALUES(?, ?, 0) ON CONFLICT(prefix) DO NOTHING`, prefix, s.projectID); err != nil {
+			if _, err := conn.ExecContext(ctx, `INSERT INTO prefix_ownership(prefix, project_id, registered_seq, kind)
+                VALUES(?, ?, 0, ?) ON CONFLICT(prefix) DO NOTHING`, prefix, s.projectID, kind); err != nil {
 				return err
 			}
 			if _, err := conn.ExecContext(ctx, `INSERT INTO id_counters(project_id, prefix, next_number)
@@ -652,7 +684,8 @@ func (s *Store) RegisterWorktree(ctx context.Context, worktreeID, root string) e
 	}
 	entry := registryEntry{
 		ProjectID: s.projectID, CommonDir: s.commonDir, WorktreeID: worktreeID,
-		Root: root, Prefixes: sortedKeys(s.prefixes), At: time.Now().UTC().Format(time.RFC3339Nano),
+		Root: root, Prefixes: s.prefixesByKind(kindTicket), RequirementPrefixes: s.prefixesByKind(kindRequirement),
+		At: time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	if err := appendJSONLine(s.registryPath, entry, s.registryPath+".lock"); err != nil {
 		return err
@@ -667,7 +700,8 @@ func (s *Store) RegisterWorktree(ctx context.Context, worktreeID, root string) e
 
 func (s *Store) AllocateID(ctx context.Context, prefix string) (string, error) {
 	prefix = strings.ToUpper(prefix)
-	if !validPrefix(prefix) || !s.prefixes[prefix] {
+	kind, owned := s.prefixes[prefix]
+	if !validPrefix(prefix) || !owned {
 		return "", fmt.Errorf("E_ID_INVALID: unowned prefix %q", prefix)
 	}
 	var id string
@@ -682,9 +716,9 @@ func (s *Store) AllocateID(ctx context.Context, prefix string) (string, error) {
 		if err != nil {
 			return err
 		}
-		path := s.ticketPath(id)
-		if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq)
-            VALUES(?, ?, ?, ?, 'allocated', ?, ?)`, s.projectID, prefix, number, s.worktreeID, path, seq); err != nil {
+		path := s.entityPathForKind(kind, id)
+		if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, kind)
+            VALUES(?, ?, ?, ?, 'allocated', ?, ?, ?)`, s.projectID, prefix, number, s.worktreeID, path, seq, kind); err != nil {
 			return err
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO outbox(project_id, seq, worktree_id, path, verb,
@@ -696,7 +730,7 @@ func (s *Store) AllocateID(ctx context.Context, prefix string) (string, error) {
 			return err
 		}
 		receipt = AllocationReceipt{ProjectID: s.projectID, WorktreeID: s.worktreeID, ID: id, Path: path,
-			Seq: seq, At: time.Now().UTC().Format(time.RFC3339Nano), State: "allocated"}
+			Seq: seq, At: time.Now().UTC().Format(time.RFC3339Nano), State: "allocated", Kind: kind}
 		return nil
 	})
 	if err != nil {
@@ -791,7 +825,9 @@ func (s *Store) prepareCreate(ctx context.Context, input domain.CreateTicketInpu
 }
 
 func (s *Store) defaultPrefix() (string, error) {
-	prefixes := sortedKeys(s.prefixes)
+	// Ticket creation must never draw a requirement-kind prefix, so restrict the
+	// default to ticket-kind prefixes.
+	prefixes := s.prefixesByKind(kindTicket)
 	if len(prefixes) == 0 {
 		return "", errors.New("E_CONFIG_INVALID: no owned ticket prefix")
 	}
