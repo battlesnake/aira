@@ -74,6 +74,9 @@ type Store struct {
 	// findingsMigrationHook is a test-only seam for crash points between
 	// transactional schema-migration statements; production leaves it nil.
 	findingsMigrationHook func(string) error
+	// allocationMigrationHook is a test-only seam for crash points between the
+	// two-table entity-kind schema migration statements; production leaves it nil.
+	allocationMigrationHook func(string) error
 	// beforeSearchQuery is a test-only seam between search index replacement
 	// and the MATCH query; production leaves it nil.
 	beforeSearchQuery func() error
@@ -232,7 +235,8 @@ func (s *Store) initDB(ctx context.Context) error {
             PRIMARY KEY(project_id, worktree_id)
         )`,
 		`CREATE TABLE IF NOT EXISTS prefix_ownership (
-            prefix TEXT PRIMARY KEY, project_id TEXT NOT NULL, registered_seq INTEGER NOT NULL
+            prefix TEXT PRIMARY KEY, project_id TEXT NOT NULL, registered_seq INTEGER NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'ticket'
         )`,
 		`CREATE TABLE IF NOT EXISTS event_counters (
             project_id TEXT PRIMARY KEY, next_seq INTEGER NOT NULL
@@ -244,7 +248,8 @@ func (s *Store) initDB(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS allocations (
             project_id TEXT NOT NULL, prefix TEXT NOT NULL, number INTEGER NOT NULL,
             worktree_id TEXT NOT NULL, state TEXT NOT NULL, path TEXT NOT NULL,
-            seq INTEGER NOT NULL, PRIMARY KEY(project_id, prefix, number)
+            seq INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'ticket',
+            PRIMARY KEY(project_id, prefix, number)
         )`,
 		`CREATE TABLE IF NOT EXISTS outbox (
             project_id TEXT NOT NULL, seq INTEGER NOT NULL, worktree_id TEXT NOT NULL,
@@ -316,6 +321,9 @@ func (s *Store) initDB(ctx context.Context) error {
 	if err := s.ensureOutboxKind(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureAllocationKind(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureFindingsSchema(ctx); err != nil {
 		return err
 	}
@@ -358,6 +366,56 @@ func (s *Store) ensureOutboxKind(ctx context.Context) error {
 	}
 	_, err := s.db.ExecContext(ctx, `ALTER TABLE outbox ADD COLUMN kind TEXT NOT NULL DEFAULT 'ticket-file'`)
 	return translateDBError(err)
+}
+
+// allocationKindSchemaCurrent reports, using only reads, whether both
+// kind-bearing tables already carry the entity-kind column, so an
+// already-migrated Open takes no write lock (the M5 ensureFindingsSchema lesson).
+func (s *Store) allocationKindSchemaCurrent(ctx context.Context) bool {
+	return hasTableColumn(ctx, s.db, "allocations", "kind") &&
+		hasTableColumn(ctx, s.db, "prefix_ownership", "kind")
+}
+
+// ensureAllocationKind adds the entity-kind column to the allocations and
+// prefix_ownership tables and backfills existing rows to 'ticket'. A single
+// transaction covers BOTH tables so the upgrade is crash-atomic: a process that
+// dies mid-migration leaves either the fully pre-M9 schema or the fully migrated
+// one, never one table ahead of the other. CREATE TABLE IF NOT EXISTS never
+// alters an existing table, so a pre-M9 database reaches these columns only
+// here (the M5 F1 non-transactional-migration lesson applied to two tables).
+func (s *Store) ensureAllocationKind(ctx context.Context) error {
+	if s.allocationKindSchemaCurrent(ctx) {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return translateDBError(err)
+	}
+	defer tx.Rollback()
+	if !hasTableColumn(ctx, tx, "allocations", "kind") {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE allocations ADD COLUMN kind TEXT NOT NULL DEFAULT 'ticket'`); err != nil {
+			return translateDBError(err)
+		}
+	}
+	if err := s.runAllocationMigrationHook("after-allocations"); err != nil {
+		return err
+	}
+	if !hasTableColumn(ctx, tx, "prefix_ownership", "kind") {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE prefix_ownership ADD COLUMN kind TEXT NOT NULL DEFAULT 'ticket'`); err != nil {
+			return translateDBError(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return translateDBError(err)
+	}
+	return nil
+}
+
+func (s *Store) runAllocationMigrationHook(statement string) error {
+	if s.allocationMigrationHook == nil {
+		return nil
+	}
+	return s.allocationMigrationHook(statement)
 }
 
 func hasTableColumn(ctx context.Context, db interface {
