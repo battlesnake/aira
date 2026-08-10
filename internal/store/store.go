@@ -431,6 +431,9 @@ func (s *Store) ensureAllocationKind(ctx context.Context) error {
 			return translateDBError(err)
 		}
 	}
+	if err := s.runAllocationMigrationHook("after-prefix-ownership"); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return translateDBError(err)
 	}
@@ -1432,29 +1435,46 @@ func (s *Store) Rebuild(ctx context.Context) error {
 				return err
 			}
 			var allocationSeq int64
-			var allocationWorktree, allocationPath, allocationState string
-			err := conn.QueryRowContext(ctx, `SELECT seq, worktree_id, path, state FROM allocations WHERE project_id=? AND prefix=? AND number=?`,
-				s.projectID, prefix, number).Scan(&allocationSeq, &allocationWorktree, &allocationPath, &allocationState)
+			var allocationWorktree, allocationPath, allocationState, allocationKind string
+			err := conn.QueryRowContext(ctx, `SELECT seq, worktree_id, path, state, kind FROM allocations WHERE project_id=? AND prefix=? AND number=?`,
+				s.projectID, prefix, number).Scan(&allocationSeq, &allocationWorktree, &allocationPath, &allocationState, &allocationKind)
 			if errors.Is(err, sql.ErrNoRows) {
+				// A scanned file lives under .aira/tickets/, so it is ticket-kind by
+				// path. Cross-validate before manufacturing a durable recovery:
+				// refuse a requirement-prefixed ID masquerading as a ticket file
+				// rather than poisoning the append-only journal with a mis-kinded
+				// "recovered" receipt.
+				reconciledKind, kindErr := s.reconcileAllocationKind(prefix, kindTicket, ticket.Path)
+				if kindErr != nil {
+					return kindErr
+				}
 				allocationSeq, err = nextSequence(ctx, conn, s.projectID)
 				if err != nil {
 					return err
 				}
 				allocationWorktree, allocationPath, allocationState = ticket.WorktreeID, ticket.Path, "recovered"
-				if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq)
-                        VALUES(?, ?, ?, ?, ?, ?, ?)`, s.projectID, prefix, number, allocationWorktree, allocationState, allocationPath, allocationSeq); err != nil {
+				if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, kind)
+                        VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, s.projectID, prefix, number, allocationWorktree, allocationState, allocationPath, allocationSeq, reconciledKind); err != nil {
 					return err
 				}
 				recovered = append(recovered, AllocationReceipt{ProjectID: s.projectID, WorktreeID: allocationWorktree,
-					ID: ticket.Ticket.ID, Path: allocationPath, Seq: allocationSeq, State: "recovered"})
+					ID: ticket.Ticket.ID, Path: allocationPath, Seq: allocationSeq, State: "recovered", Kind: reconciledKind})
 				if err := ensureRecoveredEvent(ctx, conn, ticket.Ticket.ID, ticket.WorktreeID, ticket.Path, allocationSeq, s.projectID, journal); err != nil {
 					return err
 				}
 			} else if err != nil {
 				return err
-			} else if !receiptKeys[receiptKey(s.projectID, ticket.Ticket.ID, allocationSeq)] {
-				recovered = append(recovered, AllocationReceipt{ProjectID: s.projectID, WorktreeID: allocationWorktree,
-					ID: ticket.Ticket.ID, Path: allocationPath, Seq: allocationSeq, State: "recovered"})
+			} else {
+				// An allocation row already exists; a scanned ticket file for the
+				// same ID must not disagree with the recorded kind (e.g. a fake
+				// ticket file shadowing a real requirement allocation).
+				if _, kindErr := s.reconcileAllocationKind(prefix, normaliseKind(allocationKind), ticket.Path); kindErr != nil {
+					return kindErr
+				}
+				if !receiptKeys[receiptKey(s.projectID, ticket.Ticket.ID, allocationSeq)] {
+					recovered = append(recovered, AllocationReceipt{ProjectID: s.projectID, WorktreeID: allocationWorktree,
+						ID: ticket.Ticket.ID, Path: allocationPath, Seq: allocationSeq, State: "recovered", Kind: normaliseKind(allocationKind)})
+				}
 			}
 			if allocationSeq > maxSeq {
 				maxSeq = allocationSeq
@@ -1544,7 +1564,15 @@ func (s *Store) reconcileAllocationKind(prefix, receiptKind, path string) (strin
 	if !validAllocationKind(kind) {
 		return "", fmt.Errorf("E_JOURNAL_CORRUPT: allocation for prefix %s has invalid kind %q", prefix, receiptKind)
 	}
-	if pathKind := kindForPath(path); pathKind != "" && pathKind != kind {
+	// The path is a durable, self-describing kind witness: a real allocation
+	// always materialises under an entity directory. A path under neither
+	// directory cannot corroborate the kind, so it is refused rather than
+	// silently accepted (which would let a rewritten path pass unchecked).
+	pathKind := kindForPath(path)
+	if pathKind == "" {
+		return "", fmt.Errorf("E_JOURNAL_CORRUPT: allocation for prefix %s has a path outside the entity directories: %q", prefix, path)
+	}
+	if pathKind != kind {
 		return "", fmt.Errorf("E_JOURNAL_CORRUPT: allocation kind %s disagrees with path %s", kind, path)
 	}
 	if registered, ok := s.prefixes[prefix]; ok && registered != kind {

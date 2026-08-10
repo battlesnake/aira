@@ -11,6 +11,144 @@ import (
 	"testing"
 )
 
+// writeTicketFileFor materialises a valid ticket file at .aira/tickets/<id>.md
+// under root, used to inject a scanned file whose prefix kind disagrees with its
+// directory. It reuses the shared writeTicketFile(path,id) helper.
+func writeTicketFileFor(t *testing.T, root, id string) {
+	t.Helper()
+	dir := filepath.Join(root, ".aira", "tickets")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTicketFile(t, filepath.Join(dir, id+".md"), id)
+}
+
+// TestRebuildRejectsRequirementPrefixTicketFile is the F1 regression: a
+// requirement-prefixed ID sitting as a ticket file must be refused at the FIRST
+// Rebuild (E_JOURNAL_CORRUPT), not silently recovered as a ticket — and it must
+// not poison the append-only receipts with a mis-kinded recovered entry.
+func TestRebuildRejectsRequirementPrefixTicketFile(t *testing.T) {
+	base := persistentTemp(t, "rebuild-req-as-ticket")
+	root := filepath.Join(base, "main")
+	common := filepath.Join(base, "common")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := openStoreWithRequirementPrefix(t, root, common, filepath.Join(base, "state"))
+	writeTicketFileFor(t, root, "AR-1")
+	if err := s.Rebuild(context.Background()); err == nil || !strings.Contains(err.Error(), "E_JOURNAL_CORRUPT") {
+		t.Fatalf("rebuild should reject a requirement-prefix ticket file, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(common, "aira", "receipts.jsonl")); err == nil {
+		for _, line := range readReceiptLines(t, common) {
+			var r AllocationReceipt
+			if err := json.Unmarshal([]byte(line), &r); err != nil {
+				t.Fatal(err)
+			}
+			if r.ID == "AR-1" {
+				t.Fatalf("rebuild poisoned the append-only receipts with a recovered AR-1: %s", line)
+			}
+		}
+	}
+}
+
+// TestRebuildRejectsTicketFileShadowingRequirement is the F1 variant: a real
+// requirement allocation plus a fake same-ID ticket file must be caught.
+func TestRebuildRejectsTicketFileShadowingRequirement(t *testing.T) {
+	base := persistentTemp(t, "rebuild-shadow")
+	root := filepath.Join(base, "main")
+	common := filepath.Join(base, "common")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := openStoreWithRequirementPrefix(t, root, common, filepath.Join(base, "state"))
+	if _, err := s.AllocateID(context.Background(), "AR"); err != nil {
+		t.Fatal(err)
+	}
+	writeTicketFileFor(t, root, "AR-1")
+	if err := s.Rebuild(context.Background()); err == nil || !strings.Contains(err.Error(), "E_JOURNAL_CORRUPT") {
+		t.Fatalf("rebuild should reject a ticket file shadowing a requirement allocation, got %v", err)
+	}
+}
+
+// TestAllocationKindMigrationCrashAfterPrefixOwnershipIsAtomicAndReentrant is
+// F4: the second migration crash window (after both ALTERs, before commit).
+func TestAllocationKindMigrationCrashAfterPrefixOwnershipIsAtomicAndReentrant(t *testing.T) {
+	base := persistentTemp(t, "alloc-kind-crash2")
+	dbPath := filepath.Join(base, "state.db")
+	createLegacyAllocationDB(t, dbPath)
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	crashed := &Store{db: db, allocationMigrationHook: func(statement string) error {
+		if statement == "after-prefix-ownership" {
+			return errors.New("injected crash after prefix_ownership alter")
+		}
+		return nil
+	}}
+	if err := crashed.ensureAllocationKind(context.Background()); err == nil {
+		t.Fatal("migration unexpectedly completed; crash hook not exercised")
+	}
+	if hasTableColumn(context.Background(), db, "allocations", "kind") ||
+		hasTableColumn(context.Background(), db, "prefix_ownership", "kind") {
+		t.Fatal("crash after the prefix_ownership ALTER left a table migrated (not atomic)")
+	}
+	recovered := &Store{db: db}
+	if err := recovered.ensureAllocationKind(context.Background()); err != nil {
+		t.Fatalf("re-run after crash failed: %v", err)
+	}
+	assertAllocationKindMigrated(t, db)
+	_ = db.Close()
+}
+
+// TestRebuildRecoversRequirementAllocationKindAfterWholeDBLoss is F5: strengthen
+// kind recovery to whole-DB-file loss, exercising the fresh-Open migration +
+// register + counter interplay, not just a row delete.
+func TestRebuildRecoversRequirementAllocationKindAfterWholeDBLoss(t *testing.T) {
+	base := persistentTemp(t, "rebuild-req-kind-dbloss")
+	root := filepath.Join(base, "main")
+	state := filepath.Join(base, "state")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	opts := Options{
+		Root: root, CommonDir: filepath.Join(base, "common"), DBPath: filepath.Join(state, "state.db"),
+		RegistryPath: filepath.Join(state, "registry.jsonl"), ProjectID: "project-aira",
+		WorktreeID: "main", ProjectSlug: "aira",
+		Prefixes: []string{"AIRA"}, RequirementPrefixes: []string{"AR"},
+	}
+	s, err := Open(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AllocateID(context.Background(), "AR"); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+	matches, _ := filepath.Glob(filepath.Join(state, "state.db*"))
+	for _, m := range matches {
+		if err := os.Remove(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s2, err := Open(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("reopen after whole-DB loss: %v", err)
+	}
+	defer s2.Close()
+	if err := s2.Rebuild(context.Background()); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	var kind string
+	if err := s2.db.QueryRow(`SELECT kind FROM allocations WHERE prefix='AR' AND number=1`).Scan(&kind); err != nil {
+		t.Fatalf("AR-1 not recovered after whole-DB loss: %v", err)
+	}
+	if kind != kindRequirement {
+		t.Fatalf("recovered kind=%q, want requirement", kind)
+	}
+}
+
 func openStoreWithRequirementPrefix(t *testing.T, root, common, state string) *Store {
 	t.Helper()
 	s, err := Open(context.Background(), Options{
@@ -132,11 +270,17 @@ func TestRebuildRecoversRequirementAllocationKind(t *testing.T) {
 func TestReconcileAllocationKindRejectsDisagreement(t *testing.T) {
 	s := &Store{prefixes: map[string]string{"AR": kindRequirement, "AIRA": kindTicket}}
 	corrupt := []struct{ name, prefix, kind, path string }{
+		// path disagrees with the claimed kind
 		{"path-requirement-kind-ticket", "AR", "ticket", "/x/.aira/requirements/AR-1.md"},
 		{"path-ticket-kind-requirement", "AR", "requirement", "/x/.aira/tickets/AR-1.md"},
-		{"prefix-requirement-kind-ticket", "AR", "ticket", ""},
-		{"prefix-ticket-kind-requirement", "AIRA", "requirement", ""},
-		{"invalid-kind", "AR", "banana", ""},
+		// prefix registry (authority) disagrees with the claimed kind
+		{"prefix-requirement-kind-ticket", "AR", "ticket", "/x/.aira/tickets/AR-1.md"},
+		{"prefix-ticket-kind-requirement", "AIRA", "requirement", "/x/.aira/requirements/AIRA-1.md"},
+		// a path outside the entity directories cannot corroborate the kind
+		{"empty-path", "AR", "requirement", ""},
+		{"unknown-dir-path", "AR", "requirement", "/tmp/x"},
+		// an invalid kind is refused, never coerced
+		{"invalid-kind", "AR", "banana", "/x/.aira/tickets/AR-1.md"},
 	}
 	for _, tc := range corrupt {
 		if _, err := s.reconcileAllocationKind(tc.prefix, tc.kind, tc.path); err == nil || !strings.Contains(err.Error(), "E_JOURNAL_CORRUPT") {
