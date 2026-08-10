@@ -29,8 +29,43 @@ gated *before* anything depends on it):
   verdict contract "otherwise sound."
 
 §§3–5 below are the whole design; the **M9a slice is §4.1 plus its tests
-(§7.1/1b/5)**. This document is the shared design; each milestone is planned,
-gated, and merged on its own.
+(§7.1/1b/1c/1d/5)**. This document is the shared design; each milestone is
+planned, gated, and merged on its own.
+
+### 0.1 Accepted build-gate deviations (M9a)
+
+The M9a build-gate (Sol + Fable) accepted two deviations from §4.1 **on the
+record** (a coverage gap is written down and accepted, never silent):
+
+- **(A) check.go kind-branching + materialise `kind`↔`path` validation are
+  deferred to M9b.** Safe on master today because nothing sets
+  `Options.RequirementPrefixes` outside tests (`internal/app/project.go` never
+  plumbs it) and `AllocateID` refuses unowned prefixes, so **no requirement
+  allocation can exist in production M9a** and none reaches `check`. **Hard
+  constraint on M9b:** M9b MUST land the `check` kind-branch (a requirement
+  allocation is verified against a `.aira/requirements/` file, never parsed as a
+  ticket / false-failed as "no materialised ticket file") **in the same change
+  that plumbs `RequirementPrefixes` into app config** — the two may never land
+  apart, or the F3 false-fail becomes reachable.
+- **(B) `kind` is not (yet) in the event's authenticated digest.** §4.1 asked for
+  it; M9a instead authenticates kind via the 3-way cross-validation
+  (prefix-registry / durable receipt / path) with `E_JOURNAL_CORRUPT` on
+  disagreement. Load-bearing assumption (must hold): **the rebuilding store
+  always re-derives prefix→kind from in-repo config at every `Open`** (see F6
+  below), restoring the registry leg for genuine DB loss; receipts are
+  integrity-checksummed; and in production M9a no store registers a requirement
+  prefix, so no requirement receipt can exist. This leaves one narrow residual
+  (a single receipt line losing its `kind` field *and* having its `path`
+  rewritten, in a store that has not registered the prefix). **M9b SHALL add a
+  versioned kind-inclusive digest for new `id.allocate` events (legacy events
+  validated by the existing `verb\x00id` digest)** — cheap and forward-compatible
+  — closing the residual once requirement allocations exist in production.
+
+**(F6) The registry breadcrumb `RequirementPrefixes` is encode-only.** No code
+path reads breadcrumb prefixes back (only `Root`/`WorktreeID` are consumed from
+`readRegistry`); the durable authority for prefix→kind after DB loss is
+**Options/config**, re-derived at every `Open`. This is the assumption (B) rests
+on, recorded here explicitly.
 
 ## 2. Non-goals / explicit deferrals
 
