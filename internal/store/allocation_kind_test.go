@@ -102,6 +102,107 @@ func TestDisjointPrefixKindsRejected(t *testing.T) {
 	}
 }
 
+func TestRebuildRecoversRequirementAllocationKind(t *testing.T) {
+	base := persistentTemp(t, "rebuild-req-kind")
+	root := filepath.Join(base, "main")
+	common := filepath.Join(base, "common")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := openStoreWithRequirementPrefix(t, root, common, filepath.Join(base, "state"))
+	if _, err := s.AllocateID(context.Background(), "AR"); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate DB loss of the allocation index; the durable receipts survive.
+	if _, err := s.db.Exec(`DELETE FROM allocations`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rebuild(context.Background()); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	var kind string
+	if err := s.db.QueryRow(`SELECT kind FROM allocations WHERE prefix='AR' AND number=1`).Scan(&kind); err != nil {
+		t.Fatalf("AR-1 allocation not recovered: %v", err)
+	}
+	if kind != kindRequirement {
+		t.Fatalf("recovered kind=%q, want requirement (would default to ticket without durable receipt kind)", kind)
+	}
+}
+
+func TestReconcileAllocationKindRejectsDisagreement(t *testing.T) {
+	s := &Store{prefixes: map[string]string{"AR": kindRequirement, "AIRA": kindTicket}}
+	corrupt := []struct{ name, prefix, kind, path string }{
+		{"path-requirement-kind-ticket", "AR", "ticket", "/x/.aira/requirements/AR-1.md"},
+		{"path-ticket-kind-requirement", "AR", "requirement", "/x/.aira/tickets/AR-1.md"},
+		{"prefix-requirement-kind-ticket", "AR", "ticket", ""},
+		{"prefix-ticket-kind-requirement", "AIRA", "requirement", ""},
+		{"invalid-kind", "AR", "banana", ""},
+	}
+	for _, tc := range corrupt {
+		if _, err := s.reconcileAllocationKind(tc.prefix, tc.kind, tc.path); err == nil || !strings.Contains(err.Error(), "E_JOURNAL_CORRUPT") {
+			t.Fatalf("%s: expected E_JOURNAL_CORRUPT, got %v", tc.name, err)
+		}
+	}
+	// Consistent cases pass, including a legacy (empty-kind) ticket receipt.
+	if _, err := s.reconcileAllocationKind("AR", "requirement", "/x/.aira/requirements/AR-1.md"); err != nil {
+		t.Fatalf("consistent requirement rejected: %v", err)
+	}
+	if _, err := s.reconcileAllocationKind("AIRA", "", "/x/.aira/tickets/AIRA-1.md"); err != nil {
+		t.Fatalf("legacy ticket (empty kind) rejected: %v", err)
+	}
+}
+
+func TestRebuildRejectsKindCorruptedReceipt(t *testing.T) {
+	base := persistentTemp(t, "rebuild-corrupt-kind")
+	root := filepath.Join(base, "main")
+	common := filepath.Join(base, "common")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := openStoreWithRequirementPrefix(t, root, common, filepath.Join(base, "state"))
+	if _, err := s.AllocateID(context.Background(), "AR"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM allocations`); err != nil {
+		t.Fatal(err)
+	}
+	// Tamper the durable receipt: claim AR-1 is a ticket while its path (a
+	// requirement path) is unchanged, so rebuild must detect the disagreement.
+	tamperReceiptKind(t, filepath.Join(common, "aira", "receipts.jsonl"), "AR-1", "ticket")
+	if err := s.Rebuild(context.Background()); err == nil || !strings.Contains(err.Error(), "E_JOURNAL_CORRUPT") {
+		t.Fatalf("rebuild should reject kind-corrupted receipt, got %v", err)
+	}
+}
+
+func tamperReceiptKind(t *testing.T, path, id, newKind string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var r AllocationReceipt
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			t.Fatal(err)
+		}
+		if r.ID == id {
+			r.Kind = newKind
+		}
+		b, err := json.Marshal(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, string(b))
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(out, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func readReceiptLines(t *testing.T, common string) []string {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join(common, "aira", "receipts.jsonl"))

@@ -1414,7 +1414,7 @@ func (s *Store) Rebuild(ctx context.Context) error {
 			if receipt.ProjectID != s.projectID || domain.ValidateID(receipt.ID) != nil || receipt.Seq <= 0 {
 				continue
 			}
-			if err := ensureReceiptAllocation(ctx, conn, receipt, journal); err != nil {
+			if err := s.ensureReceiptAllocation(ctx, conn, receipt, journal); err != nil {
 				return err
 			}
 		}
@@ -1507,21 +1507,50 @@ func journalEventFor(journal []eventRecord, project string, seq int64) (eventRec
 	return eventRecord{}, false
 }
 
-func ensureReceiptAllocation(ctx context.Context, conn *sql.Conn, receipt AllocationReceipt, journal []eventRecord) error {
+func (s *Store) ensureReceiptAllocation(ctx context.Context, conn *sql.Conn, receipt AllocationReceipt, journal []eventRecord) error {
 	prefix, number := splitTicketID(receipt.ID)
+	kind, err := s.reconcileAllocationKind(prefix, receipt.Kind, receipt.Path)
+	if err != nil {
+		return err
+	}
 	var allocationSeq int64
-	err := conn.QueryRowContext(ctx, `SELECT seq FROM allocations WHERE project_id=? AND prefix=? AND number=?`, receipt.ProjectID, prefix, number).Scan(&allocationSeq)
+	var allocationKind string
+	err = conn.QueryRowContext(ctx, `SELECT seq, kind FROM allocations WHERE project_id=? AND prefix=? AND number=?`, receipt.ProjectID, prefix, number).Scan(&allocationSeq, &allocationKind)
 	if errors.Is(err, sql.ErrNoRows) {
 		allocationSeq = receipt.Seq
-		_, err = conn.ExecContext(ctx, `INSERT INTO allocations(project_id,prefix,number,worktree_id,state,path,seq) VALUES(?,?,?,?,?,?,?)`,
-			receipt.ProjectID, prefix, number, receipt.WorktreeID, receipt.State, receipt.Path, allocationSeq)
-	} else if err == nil && allocationSeq != receipt.Seq {
-		return fmt.Errorf("E_JOURNAL_CORRUPT: receipt %s has seq %d but allocation has seq %d", receipt.ID, receipt.Seq, allocationSeq)
+		_, err = conn.ExecContext(ctx, `INSERT INTO allocations(project_id,prefix,number,worktree_id,state,path,seq,kind) VALUES(?,?,?,?,?,?,?,?)`,
+			receipt.ProjectID, prefix, number, receipt.WorktreeID, receipt.State, receipt.Path, allocationSeq, kind)
+	} else if err == nil {
+		if allocationSeq != receipt.Seq {
+			return fmt.Errorf("E_JOURNAL_CORRUPT: receipt %s has seq %d but allocation has seq %d", receipt.ID, receipt.Seq, allocationSeq)
+		}
+		if normaliseKind(allocationKind) != kind {
+			return fmt.Errorf("E_JOURNAL_CORRUPT: receipt %s kind %s but allocation row kind %s", receipt.ID, kind, normaliseKind(allocationKind))
+		}
 	}
 	if err != nil {
 		return err
 	}
 	return ensureAllocationEvent(ctx, conn, receipt.ProjectID, receipt.ID, receipt.WorktreeID, receipt.Path, receipt.Seq, journal)
+}
+
+// reconcileAllocationKind cross-validates the entity kind claimed by the durable
+// receipt, the entity kind implied by the allocation path, and the authoritative
+// kind from the prefix registry, returning the single agreed kind or
+// E_JOURNAL_CORRUPT on any disagreement. A pre-M9 receipt (no kind) normalises to
+// ticket, which agrees with its ticket path and a ticket-registered prefix.
+func (s *Store) reconcileAllocationKind(prefix, receiptKind, path string) (string, error) {
+	kind := normaliseKind(receiptKind)
+	if !validAllocationKind(kind) {
+		return "", fmt.Errorf("E_JOURNAL_CORRUPT: allocation for prefix %s has invalid kind %q", prefix, receiptKind)
+	}
+	if pathKind := kindForPath(path); pathKind != "" && pathKind != kind {
+		return "", fmt.Errorf("E_JOURNAL_CORRUPT: allocation kind %s disagrees with path %s", kind, path)
+	}
+	if registered, ok := s.prefixes[prefix]; ok && registered != kind {
+		return "", fmt.Errorf("E_JOURNAL_CORRUPT: prefix %s is registered as %s but allocation kind is %s", prefix, registered, kind)
+	}
+	return kind, nil
 }
 
 func ensureRecoveredEvent(ctx context.Context, conn *sql.Conn, id, worktreeID, path string, seq int64, project string, journal []eventRecord) error {
