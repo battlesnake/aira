@@ -2,6 +2,11 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -126,5 +131,62 @@ func TestShowRequestAcceptsFieldsConsumedByCore(t *testing.T) {
 	fields, ok := request.Args["fields"].([]string)
 	if !ok || len(fields) != 2 || fields[1] != "title" {
 		t.Fatalf("show fields=%#v", request.Args["fields"])
+	}
+}
+
+func TestRunDelimiterKeepsChildOptionTokensVerbatim(t *testing.T) {
+	target, options, err := parseArgs("run", []string{"--merge", "--", "tool", "--child-option", "--json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := buildRequest("run", target, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := core.Request{Verb: "run", Args: map[string]any{
+		"argv": []string{"tool", "--child-option", "--json"}, "prefix": []string(nil), "cwd": "",
+		"env": []string{}, "merge": true, "stdin": "", "store_stdin": false,
+	}}
+	if !reflect.DeepEqual(request, want) {
+		t.Fatalf("request=%#v, want=%#v", request, want)
+	}
+	if _, _, err := parseArgs("run", []string{"tool", "--child-option"}); err == nil || !strings.HasPrefix(err.Error(), "E_RUN_ARGUMENT_INVALID:") {
+		t.Fatalf("missing delimiter error=%v", err)
+	}
+}
+
+func TestCLIRunRealCgroupOrClearSkip(t *testing.T) {
+	dir := t.TempDir()
+	if err := exec.Command("git", "init", dir).Run(); err != nil {
+		t.Fatal(err)
+	}
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldWD)
+	oldState := os.Getenv("XDG_STATE_HOME")
+	if err := os.Setenv("XDG_STATE_HOME", filepath.Join(dir, "state")); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Setenv("XDG_STATE_HOME", oldState)
+	var initOut, initErr bytes.Buffer
+	if exit := Run([]string{"init", "--project", "demo", "--prefix", "AIRA"}, &initOut, &initErr); exit != 0 {
+		t.Fatalf("init exit=%d stdout=%q stderr=%q", exit, initOut.String(), initErr.String())
+	}
+	var stdout, stderr bytes.Buffer
+	exit := Run([]string{"run", "--json", "--merge", "--", "/bin/sh", "-c", "printf cli-run"}, &stdout, &stderr)
+	var response core.Response
+	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+		t.Fatalf("run response=%q stderr=%q err=%v", stdout.String(), stderr.String(), err)
+	}
+	if response.Code == "E_RUN_SCOPE_UNAVAILABLE" {
+		t.Skipf("real CLI runner requires delegated writable cgroup-v2: %s", response.Error)
+	}
+	if exit != 0 || response.Code != "OK" {
+		t.Fatalf("run exit=%d response=%+v stderr=%q", exit, response, stderr.String())
 	}
 }

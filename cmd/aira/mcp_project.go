@@ -8,6 +8,8 @@ import (
 	"aira/internal/core"
 )
 
+const mcpOutputCap = 64 * 1024
+
 func runMCP(ctx context.Context, input io.Reader, output, diagnostics io.Writer) int {
 	server := newMCPServer(func(requestContext context.Context, request core.Request) (*core.Core, func(), error) {
 		if request.Verb == "init" {
@@ -15,11 +17,11 @@ func runMCP(ctx context.Context, input io.Reader, output, diagnostics io.Writer)
 				return app.Init(initContext, ".", args)
 			}), func() {}, nil
 		}
-		s, _, err := app.Open(requestContext, ".")
+		s, project, err := app.Open(requestContext, ".")
 		if err != nil {
 			return nil, nil, err
 		}
-		return core.New(s), func() { _ = s.Close() }, nil
+		return core.NewWithRunnerOutputCap(s, project.Runner, mcpOutputCap), func() { _ = s.Close() }, nil
 	})
 	if err := server.Serve(ctx, input, output, diagnostics); err != nil {
 		return 1

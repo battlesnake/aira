@@ -116,6 +116,36 @@ type Request struct {
 	TermGrace  time.Duration
 }
 
+// OutputRequest describes one bounded, cursor-based read from a captured
+// stream. MaxBytes is an observation cap imposed by a caller (the MCP face
+// uses it to keep JSON responses bounded); zero means unbounded.
+type OutputRequest struct {
+	RunID    string
+	Stream   string
+	From     int64
+	Tail     int64
+	Full     bool
+	Follow   bool
+	MaxBytes int64
+}
+
+// OutputChunk is deliberately byte-oriented. encoding/json base64-encodes
+// Bytes, so the same object is safe for arbitrary output over MCP.
+type OutputChunk struct {
+	RunID       string      `json:"run_id"`
+	Stream      string      `json:"stream"`
+	Encoding    string      `json:"encoding"`
+	Offset      int64       `json:"offset"`
+	NextOffset  int64       `json:"next_offset"`
+	TotalBytes  int64       `json:"total_bytes"`
+	Bytes       []byte      `json:"bytes"`
+	Complete    bool        `json:"complete"`
+	Truncated   bool        `json:"truncated"`
+	OutputState OutputState `json:"output_state"`
+	RunStatus   Status      `json:"run_status"`
+	ErrorCodes  []string    `json:"error_codes,omitempty"`
+}
+
 type Config struct {
 	CommonDir    string
 	OutputDir    string

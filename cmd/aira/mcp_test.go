@@ -37,7 +37,7 @@ func TestMCPToolListIsGeneratedAndStable(t *testing.T) {
 	for _, tool := range result.Tools {
 		got = append(got, tool.Name)
 	}
-	want := []string{"aira_check", "aira_claim", "aira_count", "aira_create", "aira_finding", "aira_get", "aira_grep", "aira_heartbeat", "aira_id", "aira_import", "aira_init", "aira_link", "aira_list", "aira_ready", "aira_reconcile", "aira_release", "aira_requirement", "aira_touch", "aira_transition"}
+	want := []string{"aira_check", "aira_claim", "aira_count", "aira_create", "aira_finding", "aira_get", "aira_grep", "aira_heartbeat", "aira_id", "aira_import", "aira_init", "aira_link", "aira_list", "aira_ready", "aira_reconcile", "aira_release", "aira_requirement", "aira_run", "aira_run_kill", "aira_run_output", "aira_touch", "aira_transition"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("tools=%v, want=%v", got, want)
 	}
@@ -310,6 +310,23 @@ func TestMCPGroupedOperationsBuildTheSameCanonicalRequestsAsCLI(t *testing.T) {
 				t.Fatalf("MCP request=%#v, CLI request=%#v", got, tc.cli)
 			}
 		})
+	}
+}
+
+func TestMCPRunnerLaunchMatchesCLIRequestAndPreservesTargetOptions(t *testing.T) {
+	cli := mustCLIRequest(t, "run", []string{"tool", "--child-option", "--json"}, map[string]string{"merge": "true"})
+	var got core.Request
+	server := newMCPServer(func(_ context.Context, request core.Request) (*core.Core, func(), error) {
+		got = request
+		return nil, nil, errors.New("E_INTERNAL: parity probe")
+	})
+	message := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"aira_run","arguments":{"argv":["tool","--child-option","--json"],"merge":true}}}` + "\n"
+	var out bytes.Buffer
+	if err := server.Serve(context.Background(), strings.NewReader(message), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, cli) {
+		t.Fatalf("MCP request=%#v, CLI request=%#v", got, cli)
 	}
 }
 

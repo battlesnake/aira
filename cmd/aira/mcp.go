@@ -353,6 +353,9 @@ func decodeMCPRequest(binding mcpToolBinding, values map[string]json.RawMessage)
 			}
 			continue
 		}
+		if string(raw) == "null" && !arg.Required && (bindingOperation.descriptor.Name == "run" || bindingOperation.descriptor.Name == "run-log") {
+			continue
+		}
 		value, err := decodeMCPValue(arg, raw)
 		if err != nil {
 			return core.Request{}, err
@@ -370,6 +373,47 @@ func decodeMCPRequest(binding mcpToolBinding, values map[string]json.RawMessage)
 		// canonical add request, even when it is empty.
 		if _, present := args["requirement"]; !present {
 			args["requirement"] = ""
+		}
+	}
+	// Optional runner fields have explicit zero values in the canonical core
+	// request, matching the CLI adapter and making face parity structural.
+	switch bindingOperation.descriptor.Name {
+	case "run":
+		// nil preserves the configured project prefix; an argv array supplied
+		// by the caller remains an explicit per-run override.
+		if _, ok := args["prefix"]; !ok {
+			args["prefix"] = []string(nil)
+		}
+		if _, ok := args["env"]; !ok {
+			args["env"] = []string{}
+		}
+		if _, ok := args["cwd"]; !ok {
+			args["cwd"] = ""
+		}
+		if _, ok := args["merge"]; !ok {
+			args["merge"] = false
+		}
+		if _, ok := args["stdin"]; !ok {
+			args["stdin"] = ""
+		}
+		if _, ok := args["store_stdin"]; !ok {
+			args["store_stdin"] = false
+		}
+	case "run-log":
+		if _, ok := args["stream"]; !ok {
+			args["stream"] = ""
+		}
+		if _, ok := args["follow"]; !ok {
+			args["follow"] = false
+		}
+		if _, ok := args["from"]; !ok {
+			args["from"] = ""
+		}
+		if _, ok := args["tail"]; !ok {
+			args["tail"] = ""
+		}
+		if _, ok := args["full"]; !ok {
+			args["full"] = false
 		}
 	}
 	return core.Request{Verb: bindingOperation.descriptor.Name, Args: args}, nil

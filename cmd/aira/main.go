@@ -11,6 +11,7 @@ import (
 
 	"aira/internal/app"
 	"aira/internal/core"
+	"aira/internal/runner"
 	"aira/internal/store"
 )
 
@@ -33,7 +34,11 @@ func Run(argv []string, stdout, stderr io.Writer) int {
 	verb := strings.ToLower(args[0])
 	positional, options, err := parseArgs(verb, args[1:])
 	if err != nil {
-		response := core.Response{Code: "E_SELECTOR_INVALID", Error: err.Error(), Exit: store.ExitForCode("E_SELECTOR_INVALID")}
+		code := store.ErrorCode(err)
+		if code == "E_INTERNAL" {
+			code = "E_SELECTOR_INVALID"
+		}
+		response := core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
 		return render(response, jsonOutput, stdout, stderr)
 	}
 
@@ -59,20 +64,42 @@ func Run(argv []string, stdout, stderr io.Writer) int {
 		}
 		return render(core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
 	}
-	s, _, err := app.Open(context.Background(), ".")
+	s, project, err := app.Open(context.Background(), ".")
 	if err != nil {
 		code := appErrorCode(err)
 		return render(core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
 	}
 	defer s.Close()
-	dispatcher := core.New(s)
-	return render(dispatcher.Do(context.Background(), request), jsonOutput, stdout, stderr)
+	dispatcher := core.NewWithRunnerInput(s, project.Runner, os.Stdin)
+	response := dispatcher.Do(context.Background(), request)
+	if verb == "run-log" && !jsonOutput {
+		return renderRunLog(response, stdout, stderr)
+	}
+	return render(response, jsonOutput, stdout, stderr)
 }
 
 func removeJSON(argv []string) ([]string, bool) {
 	result := make([]string, 0, len(argv))
 	jsonOutput := false
-	for _, arg := range argv {
+	end := len(argv)
+	if len(argv) > 0 && strings.EqualFold(argv[0], "run") {
+		for i := 1; i < len(argv); i++ {
+			if argv[i] == "--" {
+				end = i
+				break
+			}
+		}
+	}
+	for i, arg := range argv {
+		if i >= end {
+			if len(argv) > 0 && strings.EqualFold(argv[0], "run") && arg == "--json" {
+				// The token remains in the child argv verbatim, but still acts as
+				// the outer adapter's output selector for deterministic diagnostics.
+				jsonOutput = true
+			}
+			result = append(result, arg)
+			continue
+		}
 		if arg == "--json" {
 			jsonOutput = true
 		} else {
@@ -83,6 +110,9 @@ func removeJSON(argv []string) ([]string, bool) {
 }
 
 func parseArgs(verb string, argv []string) ([]string, map[string]string, error) {
+	if verb == "run" {
+		return parseRunArgs(argv)
+	}
 	options := map[string]string{}
 	var positional []string
 	for i := 0; i < len(argv); i++ {
@@ -92,11 +122,14 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 			continue
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "rebuild" || name == "steal" || name == "strict" || (name == "list" && verb == "ready") {
+		if name == "rebuild" || name == "steal" || name == "strict" || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && verb == "run-log") {
 			options[name] = "true"
 			continue
 		}
 		if i+1 >= len(argv) || strings.HasPrefix(argv[i+1], "--") {
+			if verb == "run-log" {
+				return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: option --%s requires a value", name)
+			}
 			return nil, nil, fmt.Errorf("option --%s requires a value", name)
 		}
 		i++
@@ -130,17 +163,92 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"count":  {"by": true}, "reconcile": {"rebuild": true},
 		"claim":   {"steal": true, "actor": true},
 		"release": {"token": true}, "heartbeat": {"token": true},
-		"touch": {"token": true},
-		"ready": {"list": true},
-		"find":  {"category": true, "severity": true, "verdict": true, "source": true, "message": true, "file": true, "requirement": true, "by": true, "fields": true, "disposition": true, "reason": true, "actor": true},
-		"req":   {"status": true, "fields": true},
+		"touch":    {"token": true},
+		"ready":    {"list": true},
+		"find":     {"category": true, "severity": true, "verdict": true, "source": true, "message": true, "file": true, "requirement": true, "by": true, "fields": true, "disposition": true, "reason": true, "actor": true},
+		"req":      {"status": true, "fields": true},
+		"run-kill": {},
+		"run-log":  {"stream": true, "from": true, "tail": true, "follow": true, "full": true},
 	}
 	for name := range options {
 		if !allowed[verb][name] {
+			if verb == "run-log" {
+				return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: option --%s is not valid for %s", name, verb)
+			}
 			return nil, nil, fmt.Errorf("option --%s is not valid for %s", name, verb)
 		}
 	}
 	return positional, options, nil
+}
+
+func parseRunArgs(argv []string) ([]string, map[string]string, error) {
+	options := map[string]string{}
+	delimiter := -1
+	for i, arg := range argv {
+		if arg == "--" {
+			delimiter = i
+			break
+		}
+	}
+	if delimiter < 0 {
+		return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: run requires the standalone -- launch delimiter")
+	}
+	for i := 0; i < delimiter; i++ {
+		arg := argv[i]
+		if !strings.HasPrefix(arg, "--") || arg == "--" {
+			return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: run options must precede the launch delimiter")
+		}
+		name := strings.TrimPrefix(arg, "--")
+		if name == "merge" || name == "store-stdin" {
+			options[name] = "true"
+			continue
+		}
+		if i+1 >= delimiter || strings.HasPrefix(argv[i+1], "--") {
+			return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: option --%s requires a value", name)
+		}
+		i++
+		value := argv[i]
+		switch name {
+		case "prefix", "env":
+			options[name] = appendDelimited(options[name], value)
+		case "cwd", "stdin":
+			if options[name] != "" {
+				return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: option --%s may occur once", name)
+			}
+			options[name] = value
+		default:
+			return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: option --%s is not valid for run", name)
+		}
+	}
+	target := append([]string(nil), argv[delimiter+1:]...)
+	if len(target) == 0 {
+		return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: run target argv is empty")
+	}
+	return target, options, nil
+}
+
+const optionListSeparator = "\x00"
+
+func appendDelimited(existing, value string) string {
+	if existing == "" {
+		return value
+	}
+	return existing + optionListSeparator + value
+}
+
+func splitOptionList(value string) []string {
+	if value == "" {
+		return nil
+	}
+	return strings.Split(value, optionListSeparator)
+}
+
+func canonicalOptionList(value string) []string {
+	values := splitOptionList(value)
+	if values == nil {
+		return []string{}
+	}
+	return values
 }
 
 func buildRequest(verb string, positional []string, options map[string]string) (core.Request, error) {
@@ -156,6 +264,34 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		if options["prefixes"] != "" {
 			args["prefixes"] = splitComma(options["prefixes"])
 		}
+	case "run":
+		if len(positional) == 0 {
+			return core.Request{}, fmt.Errorf("E_RUN_ARGUMENT_INVALID: run target argv is empty")
+		}
+		args["argv"] = append([]string(nil), positional...)
+		// nil means “use the configured project prefix”; a non-nil token list
+		// is an explicit per-run override.
+		args["prefix"] = splitOptionList(options["prefix"])
+		args["cwd"] = options["cwd"]
+		args["env"] = canonicalOptionList(options["env"])
+		args["merge"] = options["merge"] == "true"
+		args["stdin"] = options["stdin"]
+		args["store_stdin"] = options["store-stdin"] == "true"
+	case "run-kill":
+		if len(positional) != 1 {
+			return core.Request{}, fmt.Errorf("E_RUN_ARGUMENT_INVALID: run-kill requires <run-id>")
+		}
+		args["run_id"] = positional[0]
+	case "run-log":
+		if len(positional) != 1 {
+			return core.Request{}, fmt.Errorf("E_RUN_ARGUMENT_INVALID: run-log requires <run-id>")
+		}
+		args["run_id"] = positional[0]
+		args["stream"] = options["stream"]
+		args["follow"] = options["follow"] == "true"
+		args["from"] = options["from"]
+		args["tail"] = options["tail"]
+		args["full"] = options["full"] == "true"
 	case "id":
 		if len(positional) != 1 {
 			return core.Request{}, fmt.Errorf("id requires <prefix>")
@@ -374,6 +510,30 @@ func renderHuman(response core.Response, out io.Writer) {
 	for _, warning := range response.Warnings {
 		_, _ = fmt.Fprintf(out, "warning: %s\n", warning)
 	}
+}
+
+func renderRunLog(response core.Response, stdout, stderr io.Writer) int {
+	if chunk, ok := response.Data.(*runner.OutputChunk); ok && chunk != nil {
+		_, _ = stdout.Write(chunk.Bytes)
+		metadata := map[string]any{
+			"run_id": chunk.RunID, "stream": chunk.Stream, "offset": chunk.Offset,
+			"next_offset": chunk.NextOffset, "total_bytes": chunk.TotalBytes,
+			"complete": chunk.Complete, "truncated": chunk.Truncated,
+			"output_state": chunk.OutputState, "run_status": chunk.RunStatus,
+			"error_codes": chunk.ErrorCodes,
+		}
+		data, _ := json.Marshal(metadata)
+		_, _ = fmt.Fprintln(stderr, string(data))
+	} else if response.Error != "" {
+		_, _ = fmt.Fprintln(stderr, response.Error)
+	}
+	if response.Exit != 0 {
+		return response.Exit
+	}
+	if !response.OK {
+		return exitForError(response.Code)
+	}
+	return 0
 }
 
 func appErrorCode(err error) string {

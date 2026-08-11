@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"aira/internal/domain"
+	"aira/internal/runner"
 	"aira/internal/store"
 )
 
@@ -21,6 +22,12 @@ type Config struct {
 	Schema  int           `json:"schema"`
 	Project ProjectConfig `json:"project"`
 	Lease   LeaseConfig   `json:"lease"`
+	Run     RunConfig     `json:"run,omitempty"`
+}
+
+type RunConfig struct {
+	Prefix       []string `json:"prefix,omitempty"`
+	CgroupParent string   `json:"cgroup_parent,omitempty"`
 }
 
 type ProjectConfig struct {
@@ -43,6 +50,7 @@ type Project struct {
 	ConfigPath string
 	Config     Config
 	StateDir   string
+	Runner     *runner.Runner `json:"-"`
 }
 
 type InitResult struct {
@@ -112,6 +120,17 @@ func Open(ctx context.Context, cwd string) (*store.Store, Project, error) {
 	if err != nil {
 		return nil, Project{}, err
 	}
+	execution, err := runner.New(runner.Config{
+		CommonDir:    project.CommonDir,
+		OutputDir:    filepath.Join(project.CommonDir, "aira", "runs", "output"),
+		CgroupParent: project.Config.Run.CgroupParent,
+		Prefix:       project.Config.Run.Prefix,
+	})
+	if err != nil {
+		_ = s.Close()
+		return nil, Project{}, err
+	}
+	project.Runner = execution
 	return s, project, nil
 }
 

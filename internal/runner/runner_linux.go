@@ -954,6 +954,107 @@ func (r *Runner) Get(id string) (*RunRecord, error) {
 	return &record, nil
 }
 
+// ReadOutput reads captured bytes without decoding or normalising them. The
+// returned cursor always advances by the number of bytes returned, including
+// when the server-side cap makes the response truncated.
+func (r *Runner) ReadOutput(ctx context.Context, req OutputRequest) (*OutputChunk, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(req.RunID) == "" {
+		return nil, launchErr("E_RUN_ARGUMENT_INVALID", errors.New("run id is required"))
+	}
+	if req.From < 0 || req.Tail < 0 || req.MaxBytes < 0 {
+		return nil, launchErr("E_RUN_ARGUMENT_INVALID", errors.New("output offsets and limits must be non-negative"))
+	}
+	record, err := r.Get(req.RunID)
+	if err != nil {
+		return nil, err
+	}
+	if req.Follow && req.MaxBytes == 0 {
+		for !record.Status.Terminal() {
+			timer := time.NewTimer(200 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+			record, err = r.Get(req.RunID)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	stream := req.Stream
+	if stream == "merged" {
+		stream = "log"
+	}
+	if stream == "" {
+		if len(record.OutputRefs) == 1 {
+			for name := range record.OutputRefs {
+				stream = name
+			}
+		} else {
+			return nil, launchErr("E_RUN_ARGUMENT_INVALID", errors.New("separate output requires --stream out or err"))
+		}
+	}
+	ref, ok := record.OutputRefs[stream]
+	if !ok {
+		return nil, launchErr("E_RUN_ARGUMENT_INVALID", fmt.Errorf("unknown output stream %q", req.Stream))
+	}
+	chunk := &OutputChunk{
+		RunID: req.RunID, Stream: stream, Encoding: "base64", OutputState: ref.State,
+		RunStatus: record.Status, ErrorCodes: append([]string(nil), record.ErrorCodes...),
+	}
+	if ref.State == OutputEvicted || ref.State == OutputUnavail || ref.Path == "" {
+		chunk.OutputState = OutputUnavail
+		chunk.ErrorCodes = appendUnique(chunk.ErrorCodes, "U_RUN_OUTPUT_UNAVAILABLE")
+		return nil, launchErr("U_RUN_OUTPUT_UNAVAILABLE", errors.New("captured output is unavailable"))
+	}
+	file, err := os.Open(ref.Path)
+	if err != nil {
+		chunk.OutputState = OutputUnavail
+		chunk.ErrorCodes = appendUnique(chunk.ErrorCodes, "U_RUN_OUTPUT_UNAVAILABLE")
+		return nil, launchErr("U_RUN_OUTPUT_UNAVAILABLE", err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, launchErr("U_RUN_OUTPUT_UNAVAILABLE", err)
+	}
+	total := info.Size()
+	start := req.From
+	if req.Tail > 0 && req.From == 0 {
+		start = total - req.Tail
+		if start < 0 {
+			start = 0
+		}
+	}
+	if start > total {
+		return nil, launchErr("E_RUN_ARGUMENT_INVALID", fmt.Errorf("output offset %d exceeds total %d", start, total))
+	}
+	if _, err := file.Seek(start, io.SeekStart); err != nil {
+		return nil, launchErr("U_RUN_OUTPUT_UNAVAILABLE", err)
+	}
+	limit := total - start
+	if req.MaxBytes > 0 && limit > req.MaxBytes {
+		limit = req.MaxBytes
+		chunk.Truncated = true
+	}
+	data := make([]byte, limit)
+	if _, err := io.ReadFull(file, data); err != nil {
+		return nil, launchErr("U_RUN_OUTPUT_UNAVAILABLE", err)
+	}
+	chunk.Offset, chunk.NextOffset, chunk.TotalBytes, chunk.Bytes = start, start+int64(len(data)), total, data
+	chunk.Truncated = chunk.Truncated || chunk.NextOffset < total
+	chunk.Complete = record.Status.Terminal() && ref.State == OutputComplete && !chunk.Truncated
+	if !record.Status.Terminal() || ref.State != OutputComplete {
+		chunk.OutputState = OutputPartial
+	}
+	return chunk, nil
+}
+
 func (r *Runner) Reconcile(ctx context.Context) ([]RunRecord, error) {
 	events, err := r.ledger.read()
 	if err != nil {

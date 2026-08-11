@@ -7,11 +7,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
 
 	"aira/internal/domain"
+	"aira/internal/runner"
 	"aira/internal/store"
 )
 
@@ -87,6 +89,30 @@ type handlerData struct {
 	Verdict  string
 }
 
+type outputReadData struct {
+	Chunk *runner.OutputChunk
+	Err   error
+}
+
+func runnerError(code string, err error) error {
+	if err == nil {
+		err = errors.New(code)
+	}
+	return fmt.Errorf("%s: %w", code, err)
+}
+
+func nonNegativeInt(args *argAccessor, name string) (int64, error) {
+	raw := stringArg(args, name)
+	if raw == "" {
+		return 0, nil
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < 0 {
+		return 0, runnerError("E_RUN_ARGUMENT_INVALID", fmt.Errorf("%s must be a non-negative integer", name))
+	}
+	return value, nil
+}
+
 // ArgKind is the intentionally small transport-neutral argument vocabulary
 // shared by the CLI and generated protocol faces.
 type ArgKind string
@@ -115,12 +141,13 @@ const (
 	SafetyMutate    SafetyClass = "mutate"
 	SafetyLease     SafetyClass = "lease"
 	SafetyReconcile SafetyClass = "reconcile"
+	SafetyExecute   SafetyClass = "execute"
 )
 
 // Valid reports whether s is one of the closed safety classes.
 func (s SafetyClass) Valid() bool {
 	switch s {
-	case SafetyRead, SafetyMutate, SafetyLease, SafetyReconcile:
+	case SafetyRead, SafetyMutate, SafetyLease, SafetyReconcile, SafetyExecute:
 		return true
 	default:
 		return false
@@ -159,8 +186,22 @@ type DispatchDescriptor struct {
 
 type Core struct {
 	store       Store
+	runner      Runner
 	initializer Initializer
+	stdin       io.Reader
+	outputCap   int64
 	verbs       map[string]verbSpec
+}
+
+// Runner is the transport-neutral execution seam. The faces never call the
+// concrete runner directly; they construct core.Request values and dispatch
+// through this interface.
+type Runner interface {
+	Launch(context.Context, runner.Request) (*runner.RunRecord, error)
+	Kill(context.Context, string) (*runner.RunRecord, error)
+	Get(string) (*runner.RunRecord, error)
+	ReadOutput(context.Context, runner.OutputRequest) (*runner.OutputChunk, error)
+	Reconcile(context.Context) ([]runner.RunRecord, error)
 }
 
 type verbSpec struct {
@@ -185,8 +226,32 @@ func New(s Store) *Core {
 	return c
 }
 
+func NewWithRunner(s Store, execution Runner) *Core {
+	c := &Core{store: s, runner: execution}
+	c.verbs = c.dispatchTable()
+	return c
+}
+
+func NewWithRunnerInput(s Store, execution Runner, stdin io.Reader) *Core {
+	c := NewWithRunner(s, execution)
+	c.stdin = stdin
+	return c
+}
+
+func NewWithRunnerOutputCap(s Store, execution Runner, cap int64) *Core {
+	c := NewWithRunner(s, execution)
+	c.outputCap = cap
+	return c
+}
+
 func NewWithInitializer(s Store, initializer Initializer) *Core {
 	c := New(s)
+	c.initializer = initializer
+	return c
+}
+
+func NewWithInitializerAndRunner(s Store, execution Runner, initializer Initializer) *Core {
+	c := NewWithRunner(s, execution)
 	c.initializer = initializer
 	return c
 }
@@ -218,6 +283,18 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 	if wrapped, ok := data.(handlerData); ok {
 		data, warnings, verdict = wrapped.Data, wrapped.Warnings, wrapped.Verdict
 	}
+	if output, ok := data.(outputReadData); ok {
+		if output.Err != nil {
+			code := store.ErrorCode(output.Err)
+			return Response{OK: false, Code: code, Data: output.Chunk, Error: output.Err.Error(), Exit: store.ExitForCode(code)}
+		}
+		data = output.Chunk
+	}
+	if record, ok := runRecord(data); ok {
+		if code := runRecordCode(record); code != "" {
+			return Response{OK: false, Code: code, Data: data, Error: code, Exit: store.ExitForCode(code)}
+		}
+	}
 	if report, ok := data.(store.CheckReport); ok {
 		code := strings.ToUpper(report.Verdict)
 		if report.Unevaluated {
@@ -229,6 +306,34 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 		return Response{OK: true, Code: strings.ToUpper(verdict), Data: data, Warnings: warnings, Exit: verdictExit(verdict)}
 	}
 	return Response{OK: true, Code: "OK", Data: data, Warnings: warnings}
+}
+
+func runRecord(data any) (runner.RunRecord, bool) {
+	switch value := data.(type) {
+	case runner.RunRecord:
+		return value, true
+	case *runner.RunRecord:
+		if value != nil {
+			return *value, true
+		}
+	}
+	return runner.RunRecord{}, false
+}
+
+func runRecordCode(record runner.RunRecord) string {
+	if len(record.ErrorCodes) > 0 {
+		return record.ErrorCodes[0]
+	}
+	if record.Status == runner.StatusKilled {
+		return "E_RUN_KILLED"
+	}
+	if record.Status == runner.StatusExited && record.ExitCode != nil && *record.ExitCode != 0 {
+		return "E_RUN_FAILED"
+	}
+	if record.Status == runner.StatusLost {
+		return "U_RUN_EXIT_UNKNOWN"
+	}
+	return ""
 }
 
 // copyExample deep-copies an example argv while preserving the nil-vs-empty
@@ -610,6 +715,74 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return mutationData(map[string]any{"id": record.Ticket.ID, "status": stringArg(args, "status")}, event), nil
 		}},
+		"run": {Name: "run", Usage: "run [options] -- <argv...>", Args: []ArgSpec{
+			listSpec("argv", true, true, "Exact target argv after the launch delimiter"),
+			listSpec("prefix", false, false, "Optional exact launch-prefix argv"),
+			stringSpec("cwd", false, false, "Launch working directory"),
+			listSpec("env", false, false, "Exact KEY=VALUE environment overrides"),
+			boolSpec("merge", false, false, "Capture stdout and stderr as one kernel stream"),
+			stringSpec("stdin", false, false, "Launch-time stdin file or -"),
+			boolSpec("store_stdin", false, false, "Persist supplied launch stdin"),
+		}, MCPTool: "aira_run", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+			request := runner.Request{
+				Argv: stringSlice(args, "argv"), Cwd: stringArg(args, "cwd"), Env: stringSlice(args, "env"),
+				Prefix: stringSlice(args, "prefix"), Merge: boolArg(args, "merge"), StdinPath: stringArg(args, "stdin"),
+				StoreStdin: boolArg(args, "store_stdin"),
+			}
+			if request.StdinPath == "-" {
+				request.Stdin = c.stdin
+			}
+			if c.runner == nil {
+				return nil, runnerError("E_RUN_SCOPE_UNAVAILABLE", errors.New("runner is unavailable"))
+			}
+			stdinPath := request.StdinPath
+			if stdinPath == "-" {
+				if c.stdin == nil {
+					return nil, runnerError("E_RUN_STDIN_INVALID", errors.New("stdin '-' is unavailable on this face"))
+				}
+			}
+			record, err := c.runner.Launch(ctx, request)
+			if err != nil {
+				return nil, err
+			}
+			return record, nil
+		}},
+		"run-kill": {Name: "run-kill", Usage: "run-kill <run-id>", Args: []ArgSpec{stringSpec("run_id", true, true, "Run identifier")}, MCPTool: "aira_run_kill", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+			runID := stringArg(args, "run_id")
+			if c.runner == nil {
+				return nil, runnerError("E_RUN_SCOPE_UNAVAILABLE", errors.New("runner is unavailable"))
+			}
+			return c.runner.Kill(ctx, runID)
+		}},
+		"run-log": {Name: "run-log", Usage: "run-log <run-id> [--stream out|err|merged] [--follow --from N --tail N --full]", Args: []ArgSpec{
+			stringSpec("run_id", true, true, "Run identifier"),
+			stringSpec("stream", false, false, "Captured stream", "out", "err", "merged"),
+			boolSpec("follow", false, false, "Observe until terminal"),
+			stringSpec("from", false, false, "Byte offset"),
+			stringSpec("tail", false, false, "Number of bytes from the end"),
+			boolSpec("full", false, false, "Opt into the complete selected output"),
+		}, MCPTool: "aira_run_output", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+			runID := stringArg(args, "run_id")
+			stream := stringArg(args, "stream")
+			follow := boolArg(args, "follow")
+			full := boolArg(args, "full")
+			from, err := nonNegativeInt(args, "from")
+			tail, tailErr := nonNegativeInt(args, "tail")
+			if err != nil {
+				return nil, err
+			}
+			if tailErr != nil {
+				return nil, tailErr
+			}
+			if c.runner == nil {
+				return nil, runnerError("E_RUN_SCOPE_UNAVAILABLE", errors.New("runner is unavailable"))
+			}
+			chunk, readErr := c.runner.ReadOutput(ctx, runner.OutputRequest{
+				RunID: runID, Stream: stream, From: from,
+				Tail: tail, Full: full, Follow: follow, MaxBytes: c.outputCap,
+			})
+			return outputReadData{Chunk: chunk, Err: readErr}, nil
+		}},
 		"reconcile": {Name: "reconcile", Usage: "reconcile [--rebuild]", Args: []ArgSpec{boolSpec("rebuild", false, false, "Rebuild derived indexes")}, MCPTool: "aira_reconcile", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			if err := c.store.Reconcile(ctx); err != nil {
 				return nil, err
@@ -619,10 +792,33 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 					return nil, err
 				}
 			}
-			return map[string]any{"reconciled": true}, nil
+			data := map[string]any{"reconciled": true}
+			if c.runner != nil {
+				runs, err := c.runner.Reconcile(ctx)
+				if err != nil {
+					return nil, err
+				}
+				data["runs"] = runs
+			}
+			return data, nil
 		}},
 		"check": {Name: "check", Usage: "check", Args: []ArgSpec{}, MCPTool: "aira_check", Run: func(ctx context.Context, _ *argAccessor) (any, error) {
-			return c.store.Check(ctx)
+			report, err := c.store.Check(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if c.runner != nil {
+				runs, reconcileErr := c.runner.Reconcile(ctx)
+				if reconcileErr != nil {
+					return nil, reconcileErr
+				}
+				for _, run := range runs {
+					if run.Status == runner.StatusStarting || run.Status == runner.StatusRunning {
+						report.Warnings = append(report.Warnings, store.CheckFinding{Code: "U_RUN_RECONCILE_REQUIRED", Subject: run.ID, Message: "live run scope is orphaned and remains explicitly killable", Kind: "warning"})
+					}
+				}
+			}
+			return report, nil
 		}},
 	}
 	applyDispatchMetadata(verbs)
@@ -647,6 +843,9 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		"count":     {summary: "Count tickets by a dimension", safety: SafetyRead, example: []string{"kind:feature", "--by", "status"}},
 		"set":       {summary: "Set a ticket field", safety: SafetyMutate, example: []string{"AIRA-1", "status=planned"}},
 		"mv":        {summary: "Move a ticket to a new status", safety: SafetyMutate, example: []string{"AIRA-1", "planned"}},
+		"run":       {summary: "Launch a foreground subprocess in an owned scope", safety: SafetyExecute, example: []string{"--merge", "--", "printf", "hello"}},
+		"run-kill":  {summary: "Kill an owned run scope", safety: SafetyExecute, example: []string{"RUN-1"}},
+		"run-log":   {summary: "Read captured run output", safety: SafetyRead, example: []string{"RUN-1", "--stream", "out"}},
 		"reconcile": {summary: "Reconcile derived project state", safety: SafetyReconcile, example: []string{"--rebuild"}},
 		"check":     {summary: "Check project consistency", safety: SafetyReconcile, example: []string{}},
 	}
