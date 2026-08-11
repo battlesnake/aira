@@ -46,9 +46,12 @@ equivalent subsection naming the invariant and test affected.
 1. **`kind` enum is `{checkable, manual}` in M10a.** `ratchet` is not a decodable
    kind until the Phase-4 ratchet milestone; a gate file declaring `ratchet` is
    `E_GATE_KIND_INVALID` in M10a (an honest "not yet supported", never a silent
-   pass). The enum is designed to extend by adding the value; the versioned
-   decoder makes that a normal schema evolution. Affected invariant: design §8.1
-   (three verdicts) is unaffected — a rejected definition never yields a pass.
+   pass). Adding `ratchet` in Phase 4 **requires a `schema_version` bump**, not a
+   bare enum widening — catalog registration of the ratchet codes (deviation §2.3)
+   must **not** be read as forward-compatibility of the enum, and the versioned
+   decoder must gate the new value on the new schema version. Affected invariant:
+   design §8.1 (three verdicts) is unaffected — a rejected definition never yields
+   a pass. (Sol P1-6.)
 2. **No subprocess execution in M10a.** The only checker is `check-dimension`,
    which folds an existing deterministic `aira check` dimension. Command-backed
    evaluation is M10b. Affected invariant: design §8.7 (non-empty evidence) is
@@ -94,10 +97,17 @@ the rest are recorded as deferrals.
    allowed with a max-age proof. **No `periodic`** in M10 (needs the Phase-5
    daemon scheduler). Max age of a one-time proof: **7 days** default,
    per-gate-configurable.
-7. **Proof expiry.** Default `max_age` = **7 days**. A current `every-evaluation`
-   canary **replaces** proof each evaluation (staleness impossible while the
-   canary keeps firing). An `on-demand` proof decays to `U_GATE_PROOF_STALE`
-   past `max_age`. A failed canary can never refresh proof.
+7. **Proof expiry and proof scope.** Default `max_age` = **7 days**. Proof is
+   scoped by `(gate-definition digest, evaluator version, lane, config digest,
+   canary ID, **canary-declaration/seed digest**, **canary-tree digest**)` — the
+   seed/declaration digest is included so that **editing the committed canary seed
+   under the same ID immediately invalidates prior proof** (without it an on-demand
+   proof would wrongly survive a weakened canary for 7 days). For an
+   `every-evaluation` gate, `gate run` **requires a current canary-health = pass in
+   the same run**; a canary `fail`/`unevaluated` result makes the gate not-pass in
+   that evaluation regardless of any prior proof (a prior proof cannot rescue a
+   currently-broken guard). An `on-demand` proof decays to `U_GATE_PROOF_STALE`
+   past `max_age`. A failed canary can never refresh or preserve proof. (Sol P1-3.)
 8. **Manual authenticity.** **AIRA-issued HMAC-SHA-256** record bound to
    actor/session/subject/lane/challenge-nonce is sufficient for M10's local
    threat model. No external/device/TTY signature in M10. Generated guidance
@@ -166,14 +176,22 @@ faces are descriptor entries consumed by `core.Do`.
 - `gate.go` — `GateDefinition` (closed enums, tagged kind payload
   `Checkable`/`Manual`, `AppliesTo` selector, `Lane`, `ProofPolicy`, `CanaryIDs`,
   `Enabled`/`Advisory`/`AdvisoryInReady`), constructors that **reject illegal
-  states** (two payloads, no payload, unknown kind incl. `ratchet` in M10a,
-  bad selector, unknown checker id, filename≠id, canary ref to another gate).
+  states**: two payloads, no payload, unknown kind incl. `ratchet` in M10a, bad
+  selector, unknown checker id, filename≠id, canary ref to another gate, **an
+  empty `canary_ids` set** (a trustworthy gate must declare a known-bad proof
+  path — design §4.1), and a **`check-dimension` checker whose target dimension is
+  `gates` itself or the aggregate `check`** (would recurse / double-count — reject
+  at load; the checker targets exactly one non-gate dimension — Sol P1-4).
   `RenderGate`/`ParseGate` = JSON-in-`---` frontmatter, canonical field order,
   `schema_version` with a versioned decoder (unknown required version → invalid).
 - `canary.go` — `CanaryDeclaration` (`Mode` ∈ {fixture, attestation-challenge}
   in M10a, `Seed` typed ref, `ExpectedGateResult`, `LaneBinding`, `Isolation`,
   `Cadence` ∈ {on-demand, every-evaluation}, `Description`), constructor
-  validation, round-trip.
+  validation, round-trip. **A proof-eligible canary (any mode that produces
+  proof-of-fire) whose `ExpectedGateResult` is not `fail` is `E_GATE_CANARY_INVALID`**
+  — proof requires a known-bad input that is *expected to fail* the gate (Sol P1-6).
+  A `canary_declaration_digest` over the canonical declaration (incl. the resolved
+  seed content digest) is part of the proof scope (§3 decision 7).
 - `verdict.go` — the §6.1 per-gate verdict fold: `(predicate, proofState,
   canaryHealth, evidenceAvail) → (verdict ∈ pass|fail|unevaluated, code, trusted,
   suspect)`. Pure function, table-tested. `trusted` derived, never caller-set;
@@ -188,32 +206,59 @@ faces are descriptor entries consumed by `core.Do`.
   **attestation**, and **proof-of-fire** records under
   `$(git-common-dir)/aira/gates/`. **Reuse the M12 framed+checksummed+fsynced
   ledger pattern and the M9a per-record CAS/reconcile**; add HMAC-SHA-256 over the
-  canonical payload with a machine-local 0600 project key, a previous-record digest
-  chain, and a one-time nonce. Rebuild reproduces the authenticated record or fails
-  `E_JOURNAL_CORRUPT`; a tampered tag / duplicate nonce / reordered record /
-  changed subject is rejected. SQLite has **no authority to mint** a record.
+  canonical payload with a machine-local 0600 project key and a one-time nonce.
+  **The ledger is one totally-ordered authenticated chain (Sol P0-1):** a genesis
+  record, a strictly-monotonic authenticated `seq` on every record, each record
+  binding the previous record digest, and a **durable, authenticated head/commit
+  marker** written+fsynced after each append. Verification checks the chain from
+  genesis to the durable head; **a valid-suffix truncation (records removed from
+  the tail) is detected because the head no longer matches the last chained record**
+  — it is `E_JOURNAL_CORRUPT`, never a silent reversion to an older record. The
+  projection derives "latest" strictly by **authenticated `seq` order, never by
+  timestamp** (a removed later `fail`/canary-non-fire cannot resurrect an earlier
+  `pass`). Rebuild reproduces the authenticated records or fails `E_JOURNAL_CORRUPT`;
+  a tampered tag / duplicate nonce / reordered record / changed subject / truncated
+  suffix is rejected. SQLite has **no authority to mint** a record.
 - `gate_index.go` — rebuildable DB projection: `gates` (definitions discovered by
   scanning `.aira/gates/*.json` on a coherent `git ls-files` snapshot, mirroring
-  the M9c requirement scan), `gate_results` latest-by-subject, `gate_proofs`,
-  `gate_attestations`. Disposable — DELETE-per-project + reinsert on Rebuild.
-  Duplicate gate id → fail closed.
-- `gate_eval.go` — the `check-dimension` checker + evaluation protocol (design §5):
-  load+validate definition/canary → resolve subject commit/tree + lane digest →
-  evaluate the named `aira check` dimension as the predicate → run the fixture
-  canary in an **isolated boundary** (materialise the seed tree under a temp dir,
-  run the same dimension, assert the expected `fail`; caller worktree byte-for-byte
-  unchanged) → if the canary fired, append proof-of-fire → fold → append result +
-  update index. Manual gates: no valid attestation → `unevaluated` + emit review
-  request (`gate review`), `attest` consumes an AIRA challenge and appends an
-  authenticated attestation.
+  the M9c requirement scan), `gate_results` **latest-by-subject selected by
+  authenticated `seq`** (not timestamp), `gate_proofs`, `gate_attestations`.
+  Disposable — DELETE-per-project + reinsert on Rebuild. Duplicate gate id → fail
+  closed.
+- `gate_eval.go` — the `check-dimension` checker + evaluation protocol (design §5).
+  **The checker takes an explicit immutable `EvaluationRoot` (a resolved tree/
+  snapshot) and MUST read only from it** — it never reaches back to the caller
+  worktree or the common-dir for content (Sol P0-2). Protocol: load+validate
+  definition/canary → resolve subject commit/tree + lane digest → evaluate the
+  named single non-gate `check` dimension against the **subject** `EvaluationRoot`
+  as the predicate → run the fixture canary by **materialising the seed tree in an
+  isolated temp boundary and evaluating the SAME dimension against the FIXTURE
+  `EvaluationRoot`** (not the caller root), asserting the expected `fail`. The
+  proof-of-fire is bound to the **canary-tree digest** and a **target-subject scope
+  distinct from the fixture scope**, so a fixture proof can never be mis-bound to
+  the real subject. Isolation hardening: reject symlink / `.git` / parent (`..`)
+  escapes out of the fixture root; the caller worktree is byte-for-byte unchanged.
+  A **canary non-fire is `E_GATE_CANARY_DID_NOT_FIRE`, gate fail, fail-closed** —
+  never a warning or unevaluated; a canary that cannot establish a result is
+  `U_GATE_CANARY_UNEVALUATED`. If the canary fired, append proof-of-fire → fold →
+  append result + update index. Manual gates: no valid attestation → `unevaluated`
+  + emit review request (`gate review`); `attest` consumes an AIRA challenge and
+  appends an authenticated attestation. **A distinct-root sentinel test** (fixture
+  and caller trees each carry a different marker) proves the evaluator actually
+  consumed the fixture, not the caller repo.
 - `check.go` — register the full `E_GATE_*`/`U_GATE_*`/`W_GATE_*` catalog (design
   §6.2, incl. the Phase-4 ratchet codes per deviation §2.3); add the `gates`
   dimension to `CheckReport` (fail→Findings, warn→Warnings, unevaluated→
   UnevaluatedFindings+Unevaluated bit; precedence fail>unevaluated>pass preserved).
   `ready` folding (design §6.4): fail/unevaluated → `ready=false` (respecting
   `advisory_in_ready`), warnings shown but not unready, "N failed, M unevaluated,
-  K passed" summary. **`check` stays read-only** — a test asserts no evaluator
-  runs and no write happens.
+  K passed" summary. **`check` is STRICTLY read-only (Sol P1-5):** it folds the
+  latest durable gate result via a read-only verify-and-project path and **never
+  runs an evaluator, acquires a write lock, rebuilds SQLite, creates the HMAC key,
+  or heals in place**. A missing/stale projection is `U_GATE_NO_RESULT`; a
+  corrupt/unverifiable audit chain is an integrity `unevaluated`/`E_JOURNAL_CORRUPT`
+  finding — never a silent repair and never a pass. Tests assert `check` performs
+  no evaluator subprocess, no write, and no key creation.
 
 ### 4.3 faces — descriptor entries (design §7)
 
@@ -239,7 +284,45 @@ correctness-critical set — **HMAC chain integrity, nonce/replay, rebuild
 determinism, canary isolation, proof freshness, and the read-only `check`
 guarantee** — gets the full adversarial two-loop.
 
+**Mandatory regression tests from the Sol plan-review (each finding → a test):**
+
+- **T-trunc (P0-1):** append `pass` then `fail`/canary-non-fire; delete the tail
+  record(s) from the ledger; rebuild/verify must report `E_JOURNAL_CORRUPT` (head
+  ≠ last chained record), NOT surface the earlier `pass`. Also: latest-by-`seq`
+  never picks a lower-`seq` record even if it has a later timestamp.
+- **T-fixture-sentinel (P0-2):** fixture tree and caller worktree carry different
+  sentinels; assert the canary evaluation consumed the FIXTURE sentinel; assert
+  the caller worktree is byte-for-byte unchanged; assert `.git`/symlink/`..`
+  escape out of the fixture root is refused; assert proof is bound to the
+  canary-tree digest and cannot satisfy the real subject scope.
+- **T-seed-invalidates (P1-3):** an on-demand proof is invalidated the moment the
+  committed canary seed/declaration digest changes under the same canary ID; an
+  `every-evaluation` gate whose current canary `fail`s/`unevaluated`s does not pass
+  on a prior proof.
+- **T-no-recursion (P1-4):** a gate whose `check-dimension` checker targets `gates`
+  or the aggregate `check` is rejected at load; a valid checker's findings are not
+  double-counted in the `gates` dimension.
+- **T-check-readonly (P1-5):** `aira check` on a project with gates performs no
+  evaluator run, no DB write, no rebuild, and no HMAC-key creation (assert the key
+  file does not appear); a missing projection yields `U_GATE_NO_RESULT`, a corrupt
+  chain yields an integrity finding — never a heal or a pass.
+- **T-constructor (P1-6):** empty `canary_ids` rejected; a proof-eligible canary
+  with `expected_gate_result != fail` rejected; the ratchet codes are registered
+  but no M10a path emits them; a `ratchet` kind is `E_GATE_KIND_INVALID` and adding
+  it later is gated on a `schema_version` bump.
+
 ## 5. Process
+
+**Sol plan-review status: DONE — verdict BLOCK, 6 findings (2 P0, 4 P1), ALL
+incorporated above** (thread `019ff196-ed53-7812-95fe-5dd8a9f80bce`): P0-1 ledger
+suffix-truncation → total-ordered authenticated-`seq` chain + durable head (§4.2);
+P0-2 canary must provably consume the fixture root → explicit `EvaluationRoot` +
+canary-tree-bound proof + escape guard + sentinel test (§4.2); P1-3 proof binds
+seed/declaration digest + every-evaluation requires current canary health (§3.7);
+P1-4 checker rejects `gates`/aggregate targets (§4.1); P1-5 `check` strictly
+read-only, no key/rebuild/heal (§4.2); P1-6 reject empty `canary_ids` + non-`fail`
+proof canary + ratchet needs schema bump (§2.1, §4.1). Each has a mandatory
+regression test in §4.4.
 
 design (this plan) → **Sol plan-review** (the delicate parts: HMAC record chain +
 nonce/replay, canary isolation, proof-freshness fold, the read-only-`check`
