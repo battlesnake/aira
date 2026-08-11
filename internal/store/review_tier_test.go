@@ -125,6 +125,12 @@ func TestReviewPolicyLoadRejectsMalformedPresenceAndDefaultsAbsent(t *testing.T)
 	cases := []string{
 		`{"default_tier":0}`,
 		`{"default_tier":4}`,
+		`{"default_tier":3,"path_tiers":[{"glob":"internal/store/**"}]}`,
+		`{"default_tier":3,"path_tiers":[{"glob":"x","tier":null}]}`,
+		`{"default_tier":3,"path_tiers":[{"glob":"x","tier":5}]}`,
+		`{"default_tier":3,"path_tiers":[{"tier":1}]}`,
+		`{"default_tier":3,"path_tiers":[{"glob":null,"tier":1}]}`,
+		`{"default_tier":3,"path_tiers":[{"glob":"x","tier":1,"extra":true}]}`,
 		`{"default_tier":2,"path_tiers":null}`,
 		`{"default_tier":2,"kind_floor":{"bug":null}}`,
 		`{"default_tier":2,"kind_floor":{"typo":1}}`,
@@ -140,6 +146,28 @@ func TestReviewPolicyLoadRejectsMalformedPresenceAndDefaultsAbsent(t *testing.T)
 	}
 	if _, err := LoadReviewPolicy(json.RawMessage(`null`)); err == nil {
 		t.Fatal("review:null was accepted")
+	}
+}
+
+func TestReviewPolicyPreservesExplicitZeroPathTier(t *testing.T) {
+	policy, err := LoadReviewPolicy(json.RawMessage(`{"default_tier":3,"path_tiers":[{"glob":"docs/**","tier":0}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := RecommendReviewTier([]string{"docs/x.md"}, "feature", "P2", policy)
+	if err != nil || got.Tier != 0 {
+		t.Fatalf("recommendation=%#v err=%v, want explicit tier 0", got, err)
+	}
+}
+
+func TestRecommendReviewTierMatchedLowPlusUnmatchedUsesDefault(t *testing.T) {
+	policy := reviewTierPolicy(2, ReviewPathTier{Glob: "docs/**", Tier: 0})
+	got, err := RecommendReviewTier([]string{"docs/x.md", "internal/unknown.go"}, "feature", "P2", policy)
+	if err != nil || got.Tier != 2 {
+		t.Fatalf("recommendation=%#v err=%v, want unmatched default tier 2", got, err)
+	}
+	if !containsReviewBasis(got.Basis, "path internal/unknown.go unmatched ⇒ default_tier") {
+		t.Fatalf("basis=%#v missing unmatched contribution", got.Basis)
 	}
 }
 

@@ -443,14 +443,13 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return handlerData{Data: projected, Warnings: record.Warnings}, nil
 		}},
-		"review": {Name: "review", Usage: "review <selector> [--paths a,b]", Args: []ArgSpec{stringSpec("selector", true, true, "Exact ticket selector"), listSpec("paths", false, false, "Optional paths under review"), listSpec("fields", false, false, "Optional projected fields")}, MCPTool: "aira_review", Run: func(_ context.Context, args *argAccessor) (any, error) {
+		"review": {Name: "review", Usage: "review <selector> [--paths a,b]", Args: []ArgSpec{stringSpec("selector", true, true, "Exact ticket selector"), listSpec("paths", false, false, "Optional paths under review")}, MCPTool: "aira_review", Run: func(_ context.Context, args *argAccessor) (any, error) {
 			selector := stringArg(args, "selector")
 			pathsProvided := args.present("paths")
 			var argumentPaths []string
 			if pathsProvided {
 				argumentPaths = stringSlice(args, "paths")
 			}
-			_ = stringSlice(args, "fields")
 			rs, ok := c.store.(reviewStore)
 			if !ok {
 				return nil, errors.New("E_CONFIG_INVALID: review store is unavailable")

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"sort"
 	"strings"
 
@@ -75,8 +74,8 @@ func LoadReviewPolicy(raw json.RawMessage) (ReviewPolicy, error) {
 		if bytes.Equal(bytes.TrimSpace(rawValue), []byte("null")) {
 			return ReviewPolicy{}, errors.New("E_CONFIG_INVALID: review.path_tiers must not be null")
 		}
-		var rules []ReviewPathTier
-		if err := decodeReviewJSON(rawValue, &rules); err != nil {
+		rules, err := decodeReviewPathTiers(rawValue)
+		if err != nil {
 			return ReviewPolicy{}, fmt.Errorf("E_CONFIG_INVALID: invalid review.path_tiers: %w", err)
 		}
 		policy.PathTiers = rules
@@ -98,20 +97,41 @@ func LoadReviewPolicy(raw json.RawMessage) (ReviewPolicy, error) {
 	return ValidateReviewPolicy(policy)
 }
 
-func decodeReviewJSON(raw json.RawMessage, target any) error {
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
-		return err
+func decodeReviewPathTiers(raw json.RawMessage) ([]ReviewPathTier, error) {
+	var rawRules []json.RawMessage
+	if err := json.Unmarshal(raw, &rawRules); err != nil || rawRules == nil && !bytes.Equal(bytes.TrimSpace(raw), []byte("[]")) {
+		return nil, errors.New("path_tiers must be an array")
 	}
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		if err == nil {
-			return errors.New("multiple JSON values")
+	rules := make([]ReviewPathTier, 0, len(rawRules))
+	for index, rawRule := range rawRules {
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(rawRule, &object); err != nil || object == nil {
+			return nil, fmt.Errorf("path_tiers[%d] must be an object", index)
 		}
-		return err
+		for key := range object {
+			if key != "glob" && key != "tier" {
+				return nil, fmt.Errorf("path_tiers[%d] has unknown field %q", index, key)
+			}
+		}
+		rawGlob, hasGlob := object["glob"]
+		if !hasGlob || bytes.Equal(bytes.TrimSpace(rawGlob), []byte("null")) {
+			return nil, fmt.Errorf("path_tiers[%d].glob must be present and non-null", index)
+		}
+		var glob string
+		if err := json.Unmarshal(rawGlob, &glob); err != nil {
+			return nil, fmt.Errorf("path_tiers[%d].glob must be a string", index)
+		}
+		rawTier, hasTier := object["tier"]
+		if !hasTier || bytes.Equal(bytes.TrimSpace(rawTier), []byte("null")) {
+			return nil, fmt.Errorf("path_tiers[%d].tier must be present and non-null", index)
+		}
+		tier, err := decodeReviewInt(rawTier, fmt.Sprintf("review.path_tiers[%d].tier", index))
+		if err != nil {
+			return nil, err
+		}
+		rules = append(rules, ReviewPathTier{Glob: glob, Tier: tier})
 	}
-	return nil
+	return rules, nil
 }
 
 func decodeReviewInt(raw json.RawMessage, field string) (int, error) {

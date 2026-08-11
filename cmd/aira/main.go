@@ -159,7 +159,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"init":   {"project": true, "prefixes": true},
 		"create": {"kind": true, "severity": true, "labels": true, "body": true},
 		"new":    {"kind": true, "severity": true, "labels": true, "body": true},
-		"show":   {"fields": true}, "get": {"fields": true}, "review": {"paths": true, "fields": true},
+		"show":   {"fields": true}, "get": {"fields": true}, "review": {"paths": true},
 		"list": {"by": true, "fields": true}, "ls": {"by": true, "fields": true},
 		"grep":   {"kind": true, "by": true, "fields": true},
 		"import": {"strict": true},
@@ -322,9 +322,6 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		args["selector"] = positional[0]
 		if rawPaths, provided := options["paths"]; provided {
 			args["paths"] = splitComma(rawPaths)
-		}
-		if rawFields, provided := options["fields"]; provided {
-			args["fields"] = splitComma(rawFields)
 		}
 	case "find":
 		if len(positional) == 0 {
