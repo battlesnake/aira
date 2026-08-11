@@ -1,0 +1,19 @@
+# Useful correctness and maintainability checks for the small AIRA codebase.
+# revive/gocritic are intentionally omitted: their style opinions are noisy
+# for the existing code and are not useful as a merge gate yet.
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - errcheck
+    - gofmt
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+    - misspell
+
+issues:
+  exclude-use-default: true
