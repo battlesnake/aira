@@ -16,8 +16,8 @@ func TestSkillMetadataNormalisesEveryIncludedAction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(artifacts.Actions) != 43 {
-		t.Fatalf("actions=%d, want 43", len(artifacts.Actions))
+	if len(artifacts.Actions) != 44 {
+		t.Fatalf("actions=%d, want 44", len(artifacts.Actions))
 	}
 	for _, action := range artifacts.Actions {
 		if action.Summary == "" || !action.Safety.Valid() || !strings.HasPrefix(action.Command, "aira ") {
@@ -69,7 +69,7 @@ func TestSkillGeneratorFailsClosedForIncompleteMetadata(t *testing.T) {
 
 func TestSkillSafetyGolden(t *testing.T) {
 	want := map[string]SafetyClass{
-		"init": SafetyReconcile, "id": SafetyMutate, "create": SafetyMutate, "show": SafetyRead,
+		"init": SafetyReconcile, "id": SafetyMutate, "create": SafetyMutate, "show": SafetyRead, "review": SafetyRead,
 		"grep": SafetyRead, "import": SafetyMutate, "claim": SafetyLease, "release": SafetyLease,
 		"heartbeat": SafetyLease, "touch": SafetyMutate, "unlink": SafetyMutate, "ready": SafetyRead,
 		"list": SafetyRead, "count": SafetyRead, "set": SafetyMutate, "mv": SafetyMutate,

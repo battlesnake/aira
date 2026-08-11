@@ -23,7 +23,8 @@ var ExitCodes = map[string]int{
 	"E_FINDING_INVALID": 2, "E_WAIVER_REASON_REQUIRED": 2, "E_QUERY_INVALID": 2,
 	"E_REQUIREMENT_INVALID": 2,
 	"E_IMPORT_INVALID":      2, "E_ARGUMENT_INVALID": 2,
-	"E_INDEX_UNEVALUATED": 3,
+	"E_INDEX_UNEVALUATED":          3,
+	"U_REVIEW_SECTION_UNEVALUATED": 3,
 	// Runner-lite lifecycle and containment codes. These are deliberately kept
 	// in the single catalog so every face gets the same exit contract.
 	"E_RUN_ARGUMENT_INVALID": 2, "E_RUN_PREFIX_INVALID": 2, "E_RUN_CWD_INVALID": 2,

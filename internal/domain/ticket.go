@@ -192,9 +192,15 @@ func validKind(k Kind) bool {
 	}
 }
 
+// ValidKind reports whether k is one of the ticket kinds in the domain.
+func ValidKind(k Kind) bool { return validKind(k) }
+
 func validSeverity(s Severity) bool {
 	return s == SeverityP0 || s == SeverityP1 || s == SeverityP2
 }
+
+// ValidSeverity reports whether s is one of the ticket severities in the domain.
+func ValidSeverity(s Severity) bool { return validSeverity(s) }
 
 func validRelation(k RelationKind) bool {
 	switch k {

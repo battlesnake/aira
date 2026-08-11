@@ -45,9 +45,12 @@ type Options struct {
 	// They must be disjoint from Prefixes (ticket-kind); a prefix belongs to
 	// exactly one kind.
 	RequirementPrefixes []string
-	LeaseStateDir       string
-	LeaseTTLNS          uint64
-	Clock               Clock
+	// ReviewPolicy is validated eagerly by Open. A zero policy means the
+	// project has no review block and therefore defaults to tier 3.
+	ReviewPolicy  ReviewPolicy
+	LeaseStateDir string
+	LeaseTTLNS    uint64
+	Clock         Clock
 }
 
 type Store struct {
@@ -60,6 +63,7 @@ type Store struct {
 	projectID     string
 	worktreeID    string
 	projectSlug   string
+	reviewPolicy  ReviewPolicy
 	prefixes      map[string]string // prefix -> entity kind (ticket|requirement)
 	leaseStateDir string
 	leaseTTLNS    uint64
@@ -171,6 +175,10 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	if opts.Root == "" || opts.CommonDir == "" || opts.DBPath == "" || opts.RegistryPath == "" || opts.ProjectID == "" || opts.WorktreeID == "" {
 		return nil, errors.New("E_CONFIG_INVALID: store options are incomplete")
 	}
+	reviewPolicy, err := ValidateReviewPolicy(opts.ReviewPolicy)
+	if err != nil {
+		return nil, err
+	}
 	root, err := filepath.Abs(opts.Root)
 	if err != nil {
 		return nil, err
@@ -209,7 +217,7 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	s := &Store{
 		db: db, root: root, commonDir: common, auditDir: filepath.Join(common, "aira"),
 		dbPath: dbPath, registryPath: registry, projectID: opts.ProjectID,
-		worktreeID: opts.WorktreeID, projectSlug: opts.ProjectSlug, prefixes: map[string]string{},
+		worktreeID: opts.WorktreeID, projectSlug: opts.ProjectSlug, reviewPolicy: reviewPolicy, prefixes: map[string]string{},
 		leaseStateDir: opts.LeaseStateDir, leaseTTLNS: opts.LeaseTTLNS, clock: opts.Clock,
 	}
 	if s.leaseStateDir == "" {

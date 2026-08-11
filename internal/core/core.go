@@ -51,6 +51,15 @@ func (a *argAccessor) record(key string) any {
 	return a.values[key]
 }
 
+func (a *argAccessor) present(key string) bool {
+	a.reads[key] = struct{}{}
+	if a.values == nil {
+		return false
+	}
+	_, ok := a.values[key]
+	return ok
+}
+
 type Store interface {
 	AllocateID(context.Context, string) (string, error)
 	CreateTicketWithEvent(context.Context, domain.CreateTicketInput) (domain.Ticket, store.EventKey, error)
@@ -82,6 +91,12 @@ type Store interface {
 	Reconcile(context.Context) error
 	Rebuild(context.Context) error
 	Check(context.Context) (store.CheckReport, error)
+}
+
+type reviewStore interface {
+	Store
+	TicketAreaGlobs(string) ([]string, error)
+	ReviewPolicy() store.ReviewPolicy
 }
 
 type gateStore interface {
@@ -427,6 +442,78 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				projected["body"] = record.Body
 			}
 			return handlerData{Data: projected, Warnings: record.Warnings}, nil
+		}},
+		"review": {Name: "review", Usage: "review <selector> [--paths a,b]", Args: []ArgSpec{stringSpec("selector", true, true, "Exact ticket selector"), listSpec("paths", false, false, "Optional paths under review"), listSpec("fields", false, false, "Optional projected fields")}, MCPTool: "aira_review", Run: func(_ context.Context, args *argAccessor) (any, error) {
+			selector := stringArg(args, "selector")
+			pathsProvided := args.present("paths")
+			var argumentPaths []string
+			if pathsProvided {
+				argumentPaths = stringSlice(args, "paths")
+			}
+			_ = stringSlice(args, "fields")
+			rs, ok := c.store.(reviewStore)
+			if !ok {
+				return nil, errors.New("E_CONFIG_INVALID: review store is unavailable")
+			}
+			record, err := c.store.Get(selector)
+			if err != nil {
+				return nil, err
+			}
+			pathsSource := "area-hints"
+			paths := argumentPaths
+			if pathsProvided {
+				pathsSource = "arg"
+			} else {
+				paths, err = rs.TicketAreaGlobs(record.Ticket.ID)
+				if err != nil {
+					return nil, err
+				}
+			}
+			normalizedPaths := make([]string, 0, len(paths))
+			for _, rawPath := range paths {
+				path, normalizeErr := store.NormalizeAreaGlob(rawPath)
+				if normalizeErr != nil {
+					return nil, normalizeErr
+				}
+				normalizedPaths = append(normalizedPaths, path)
+			}
+			if len(normalizedPaths) == 0 && pathsSource == "area-hints" {
+				pathsSource = "none"
+			}
+			recommendation, err := store.RecommendReviewTier(normalizedPaths, string(record.Ticket.Kind), string(record.Ticket.Severity), rs.ReviewPolicy())
+			if err != nil {
+				return nil, err
+			}
+			recommendation.PathsSource = pathsSource
+			findings, findingsErr := c.store.ListFindings("ticket:" + record.Ticket.ID + " disposition:open")
+			findingData := any(projectFindingRecords(findings, nil))
+			if findingsErr != nil {
+				findingData = map[string]any{"unevaluated": true, "code": "U_REVIEW_SECTION_UNEVALUATED"}
+			}
+			relations, relationsErr := c.store.Relations(record.Ticket.ID)
+			relationData := any(relations)
+			if relationsErr != nil {
+				relationData = map[string]any{"unevaluated": true, "code": "U_REVIEW_SECTION_UNEVALUATED"}
+			}
+			routing := [4][]string{
+				{"self-review"},
+				{"codex"},
+				{"codex", "fable-final"},
+				{"codex", "fable-final", "additional-lineage"},
+			}
+			return map[string]any{
+				"ticket": map[string]any{
+					"id": record.Ticket.ID, "title": record.Ticket.Title, "kind": record.Ticket.Kind,
+					"severity": record.Ticket.Severity, "status": record.Ticket.Status,
+					"milestone": record.Ticket.Milestone, "labels": record.Ticket.Labels,
+				},
+				"paths":              map[string]any{"source": pathsSource, "values": normalizedPaths},
+				"tier":               map[string]any{"recommended": recommendation.Tier, "basis": recommendation.Basis, "default_tier": *rs.ReviewPolicy().DefaultTier},
+				"routing":            append([]string(nil), routing[recommendation.Tier]...),
+				"findings":           findingData,
+				"relations":          relationData,
+				"report_instruction": `aira find add <id> --source codex --verdict confirmed|refuted|plausible --category <cat> --severity P0|P1|P2 --message "<...>" [--file path:line]`,
+			}, nil
 		}},
 		"grep": {Name: "grep", Usage: "grep <query> [--kind ticket|finding --by kind --fields F,...]", Args: []ArgSpec{stringSpec("query", true, true, "Search query"), stringSpec("kind", false, false, "Result kind", "ticket", "finding"), stringSpec("by", false, false, "Distribution field", "kind"), listSpec("fields", false, false, "Optional projected fields")}, MCPTool: "aira_grep", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			rows, err := c.store.Search(ctx, stringArg(args, "query"), stringArg(args, "kind"))
@@ -935,6 +1022,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		"id":        {summary: "Allocate the next ticket identifier", safety: SafetyMutate, example: []string{"AIRA"}},
 		"create":    {summary: "Create a ticket", safety: SafetyMutate, example: []string{"AIRA ticket", "--kind", "feature", "--severity", "P1", "--body", "body", "--label", "label"}},
 		"show":      {summary: "Show one ticket", safety: SafetyRead, example: []string{"AIRA-1", "--fields", "id"}},
+		"review":    {summary: "Assemble a review briefing", safety: SafetyRead, example: []string{"AIRA-1", "--paths", "internal/store/gate.go,docs/x.md"}},
 		"grep":      {summary: "Search indexed tickets and findings", safety: SafetyRead, example: []string{"ticket", "--kind", "ticket", "--by", "kind", "--fields", "id"}},
 		"import":    {summary: "Import findings from a JSONL file", safety: SafetyMutate, example: []string{"findings.jsonl", "--strict"}},
 		"claim":     {summary: "Claim a ticket lease", safety: SafetyLease, example: []string{"AIRA-1", "--steal", "--actor", "codex"}},

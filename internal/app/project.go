@@ -31,9 +31,10 @@ type RunConfig struct {
 }
 
 type ProjectConfig struct {
-	Slug                string   `json:"slug"`
-	Prefixes            []string `json:"prefixes"`
-	RequirementPrefixes []string `json:"requirement_prefixes,omitempty"`
+	Slug                string          `json:"slug"`
+	Prefixes            []string        `json:"prefixes"`
+	RequirementPrefixes []string        `json:"requirement_prefixes,omitempty"`
+	Review              json.RawMessage `json:"review,omitempty"`
 }
 
 type LeaseConfig struct {
@@ -109,6 +110,10 @@ func Open(ctx context.Context, cwd string) (*store.Store, Project, error) {
 	if err != nil {
 		return nil, Project{}, err
 	}
+	reviewPolicy, err := store.LoadReviewPolicy(project.Config.Project.Review)
+	if err != nil {
+		return nil, Project{}, err
+	}
 	s, err := store.Open(ctx, store.Options{
 		Root: project.Root, CommonDir: project.CommonDir,
 		DBPath:       filepath.Join(project.StateDir, "state.db"),
@@ -116,6 +121,7 @@ func Open(ctx context.Context, cwd string) (*store.Store, Project, error) {
 		ProjectID:    project.ProjectID, WorktreeID: project.WorktreeID,
 		ProjectSlug: project.Config.Project.Slug, Prefixes: project.Config.Project.Prefixes,
 		RequirementPrefixes: project.Config.Project.RequirementPrefixes,
+		ReviewPolicy:        reviewPolicy,
 		LeaseTTLNS:          leaseTTLNS(project.Config),
 	})
 	if err != nil {
@@ -198,11 +204,16 @@ func Init(ctx context.Context, cwd string, args map[string]any) (InitResult, err
 		canonicalGitDir = gitDir
 	}
 	state := stateDir()
+	reviewPolicy, err := store.LoadReviewPolicy(config.Project.Review)
+	if err != nil {
+		return InitResult{}, err
+	}
 	s, err := store.Open(ctx, store.Options{
 		Root: root, CommonDir: common,
 		DBPath: filepath.Join(state, "state.db"), RegistryPath: filepath.Join(state, "registry.jsonl"),
 		ProjectID: hashID(canonicalCommon), WorktreeID: hashID(canonicalGitDir), ProjectSlug: slug, Prefixes: prefixes,
-		LeaseTTLNS: leaseTTLNS(config),
+		ReviewPolicy: reviewPolicy,
+		LeaseTTLNS:   leaseTTLNS(config),
 	})
 	if err != nil {
 		return InitResult{}, err
@@ -280,6 +291,9 @@ func validateConfig(config Config) error {
 		return errors.New("E_CONFIG_INVALID: unsupported config schema")
 	}
 	if err := domain.ValidateProjectSlug(config.Project.Slug); err != nil {
+		return err
+	}
+	if _, err := store.LoadReviewPolicy(config.Project.Review); err != nil {
 		return err
 	}
 	if len(config.Project.Prefixes) == 0 {
