@@ -18,9 +18,10 @@ matrix. It does not implement Go code.
 These are deliberate M12 decisions and boundaries, not missing work:
 
 - M12 is **daemonless**. A foreground caller owns the child, drains its pipes,
-  waits for it, and writes the terminal record. The daemon is **only** the
-  Phase-5 detached-run supervisor. M12 has no detach mode and does not create
-  a supervisor merely to make foreground launch work.
+  waits for it, and writes the terminal record. There is **no supervisor**:
+  the daemon is **only** the Phase-5 detached-run supervisor. If the
+  foreground parent dies, the run is `lost`, while its durable cgroup scope
+  reference remains operator-killable by run ID.
 - M12 captures to files and makes those files the live observation source.
   It does not implement Phase-5 tee-to-a-live-reader-with-supervisor. A
   `run-log --follow` reader can observe the files while the foreground caller
@@ -33,12 +34,27 @@ These are deliberate M12 decisions and boundaries, not missing work:
   status and exit evidence satisfy the honesty rules below.
 - M12 has no live stdin push. `--stdin` is a launch-time source only;
   `run-input` is deferred until the Phase-5 supervisor/control-plane work.
-- The recommended durability boundary is an append-only common-dir run
-  ledger with a SQLite projection. This intentionally elevates the small
-  lifecycle record above ordinary retention-capped telemetry so DB loss and
-  an interrupted foreground parent cannot manufacture a green result. The
-  architect must still confirm this against the whole-product “Run metadata is
-  DB-only telemetry” default; the conflict is listed explicitly in §12.
+- The durability boundary is an append-only **common-dir run ledger** with a
+  SQLite projection. This intentionally elevates the small lifecycle record
+  above ordinary retention-capped telemetry so DB loss and an interrupted
+  foreground parent cannot manufacture a green result. Capture files are
+  machine-local files, never ledger or SQLite blobs.
+- The launch prefix default is **empty**, meaning a bare exec. `agentmux` and
+  `whale` are optional configured prefixes only; an arbitrary
+  work-submitting/migrating prefix is outside the M12 contract. The residual
+  guarantee is bounded to AIRA's owned cgroup subtree (§5.4).
+- The only supported scope prerequisites are a cgroup-v2 unified mount, a
+  delegated writable parent, `clone3` with `CLONE_INTO_CGROUP`, and writable
+  `cgroup.kill`, on kernel 5.14 or newer. Every capability is probed before
+  launch; any missing capability hard-fails with `E_RUN_SCOPE_UNAVAILABLE`.
+- Run IDs use a local `RUN-n` counter, not the git ticket allocator. The
+  environment digest uses the specified length-prefixed encoding (§3.2),
+  disk-full is detected from `ENOSPC`/capture write failures and requires
+  successful close+fsync for `capture_complete`, and `run-log --follow` polls
+  approximately every 200 ms until terminal.
+- The run face returns an AIRA exit class; the exact child exit code is always
+  preserved in the Run record and response data. It is not replaced by the
+  AIRA class.
 
 Any implementation that changes one of these boundaries must add an equivalent
 accepted-deviation section to its implementation plan and name the affected
@@ -59,8 +75,10 @@ M12 provides exactly four connected capabilities:
 
 The M12 success condition is stronger than “a command ran”: an agent can
 identify the exact argv/cwd/environment identity, locate the raw output, kill
-the whole owned scope, and distinguish an established exit 0 from a killed,
-lost, or capture-corrupted result.
+the whole owned scope, and distinguish an established launch-process exit 0
+from a killed, lost, scope-integrity, or capture-corrupted result. M12 reports
+the **launch process's own wait status**. It does not claim that arbitrary
+descendant work outside the owned subtree succeeded.
 
 ### 1.1 Explicit non-goals / deferrals
 
@@ -82,8 +100,9 @@ lost, or capture-corrupted result.
   prevent a launch, AIRA returns a stable failure before launching.
 - No promise that capture files survive machine loss or arbitrary retention;
   they are machine-local blobs, not git content and not SQLite blobs.
-- No claim that a process which escaped an explicitly approved future
-  unscoped fallback can be killed safely. M12's default is fail-closed.
+- No claim that a deliberately migrated descendant can be killed safely or
+  that its work succeeded. M12 has no unscoped fallback; its containment and
+  clean-success guarantee is bounded to the AIRA-owned cgroup subtree.
 
 ## 2. Terms, identities, and closed states
 
@@ -133,17 +152,15 @@ The launch is the concatenation:
 effective_argv = launch_prefix_without_its_optional_separator + target_argv
 ```
 
-The default prefix is the configured design default from §14:
-
-```
-agentmux whale run --
-```
-
-An empty configured prefix means a bare target exec. The default does not make
-agentmux a dependency: if the configured prefix is unavailable, launch fails
-honestly; AIRA does not silently fall back to bare execution. A prefix such as
-`agentmux` or `whale` may create another wrapper/scope, but AIRA's outer
-scope remains authoritative for `run-kill`.
+The default prefix is **empty**, so the default is a bare target exec. A
+configured prefix such as `agentmux whale run --` is optional; `agentmux` and
+`whale` are examples of configured wrappers, not AIRA dependencies. If a
+configured prefix is unavailable, launch fails honestly; AIRA does not
+silently fall back to bare execution. A configured prefix is in-contract only
+when it remains inside AIRA's scope and does not submit work elsewhere or
+deliberately migrate descendants. Arbitrary work-submitting prefixes are
+outside the M12 contract. AIRA's outer scope remains authoritative for
+`run-kill`, but that authority is bounded to its owned subtree (§5.4).
 
 The prefix is represented as argv tokens after one explicit config parse, not
 as a shell string. A configured final standalone `--` is a delimiter and is
@@ -179,9 +196,13 @@ the same token validation. Neither face can request a shell wrapper implicitly.
   the caller's stdin during the foreground launch. Neither form creates a
   post-launch input endpoint.
 - The Run record stores an environment digest, never the environment values.
-  The digest binds the execution identity without making routine secrets part
-  of the run ledger. The exact canonicalisation is an architect decision in
-  §12; until fixed, no consumer may compare digests as if they were stable.
+  Canonical encoding is length-prefixed and byte-oriented: after rejecting
+  duplicate keys, sort entries by key and concatenate, for each entry,
+  `uvarint(len(key)) || key || uvarint(len(value)) || value`; hash the exact
+  concatenation with SHA-256. This prevents delimiter collisions from LF,
+  NUL, or `=` in testable byte inputs. A NUL in an actual OS environment
+  entry is rejected as an invalid launch environment, but the encoder's unit
+  contract still covers arbitrary bytes.
 
 ### 3.3 No approval prompt
 
@@ -248,7 +269,9 @@ signal:
 4. Do not acknowledge bytes that were not durably accepted by the file
    protocol. Do not silently discard the remainder, substitute a zero-length
    file, or report complete output.
-5. On a capture failure, request an AIRA-owned scope kill if processes remain,
+5. `capture_complete=true` is permitted only after every capture file has
+   reached EOF, closed successfully, and passed the required fsync. On a
+   capture failure, request an AIRA-owned scope kill if processes remain,
    continue only the bounded cleanup needed to avoid a pipe deadlock, and
    terminally record the capture error. If a wait result was not established,
    status is `killed` or `lost`, never `exited` with a fake 0.
@@ -283,6 +306,34 @@ out in the record and retention policy.
 There is no M12 `run-input`, FIFO, socket, or MCP argument that can push bytes
 after launch.
 
+### 4.5 Launch exit versus lingering pipe holders
+
+The launch process's wait does not by itself complete a run. A descendant may
+inherit stdout/stderr and keep a pipe open after the launch process exits. M12
+uses the finite `run.capture_descendant_grace` parameter (default: 2 seconds,
+configurable before launch):
+
+1. Record the launch process's exact wait result, but continue draining and
+   writing while waiting for pipe EOF and scope quiescence.
+2. During the grace, continue reading all available bytes. A live reader is
+   irrelevant; the capture workers remain the drain authority.
+3. If the scope or pipe holders remain when the grace expires, invoke the
+   terminal scope-kill protocol (§6.3), verify the scope is empty, and continue
+   draining until EOF or until a capture failure makes further persistence
+   impossible. After a capture failure, bytes may be discarded solely to
+   unblock the pipe, with `capture_complete=false` and an explicit marker.
+4. Preserve the launch process's exit code X, but add
+   `E_RUN_DESCENDANT_KILLED` and `scope_integrity=descendant-killed` when an
+   in-scope descendant had to be killed. This is not a clean run even if all
+   bytes eventually close and fsync successfully.
+5. If the scope empties but a pipe remains open, or a known member disappears
+   into another cgroup, stop waiting after the same finite bound, mark
+   `handoff-unverified`/`migrated`, and never claim clean success. An escaped
+   process is outside AIRA's kill guarantee.
+
+This timeout prevents a descendant-held fd from turning foreground completion
+into an unbounded wait while preserving the no-backpressure drain rule.
+
 ## 5. Scoped cgroup-v2 kill
 
 ### 5.1 Ownership rule
@@ -293,63 +344,77 @@ its descendants. AIRA never derives kill authority from a prefix-specific
 name such as `whale.slice`, never kills a shared slice, and never assumes that
 the main PID is the whole run.
 
-Nested cgroups made by a prefix remain inside AIRA's scope subtree where the
-delegation rules allow them; killing the AIRA parent scope must cover the
-subtree. A prefix that deliberately moves a process outside the owned
-subtree is not a supported escape hatch and must be surfaced as a scope
-integrity failure if detectable.
+`clone3` with `CLONE_INTO_CGROUP` closes the placement race, and ordinary
+`setsid`, double-fork, and reparent operations do not escape a cgroup. That is
+not an assertion that a privileged or delegated descendant cannot deliberately
+write itself into another cgroup, invoke `systemd-run`, or create a nested
+container. The M12 containment and kill guarantee is **bounded to AIRA's
+owned cgroup subtree**. The reported wait result is the launch process's own
+result; AIRA never claims that an escaped descendant tree succeeded.
+
+A detectable migration, or an empty scope with an unverifiable handoff, is a
+scope-integrity finding and is not a silent clean run. A configured prefix is
+therefore in-contract only when it does not submit work elsewhere or migrate
+descendants. The empty/bare default sharply limits this residual threat, but
+cannot eliminate a deliberately privileged escape that AIRA cannot observe.
 
 ### 5.2 Creation and delegation mechanism
 
 The platform adapter is Linux cgroup-v2 only for M12 and uses pure Go plus
-syscalls/filesystem operations; it does not use cgo, libsystemd, or a shell
-helper. The design requires:
+syscalls/filesystem operations; it does not use cgo, libsystemd, a shell, or a
+helper that moves a process after launch. M12 supports **exactly** this
+containment capability set:
 
-1. Detect a unified cgroup-v2 mount and a configured/delegated parent in which
-   the AIRA process can create a child cgroup and write the required control
-   files.
-2. Create a unique per-run child scope directory under that parent, with
-   restrictive permissions and a recorded scope identity/path.
-3. Start the launch-prefix process directly into that cgroup using the
-   strongest kernel-supported child-placement mechanism available to the
-   implementation (the preferred mechanism is a syscall path that accepts a
-   cgroup fd at child creation). A post-start move that leaves a window for
-   descendants to escape is not sufficient as the only mechanism.
-4. Verify the launched process identity and cgroup membership before declaring
-   the run `running`.
-5. On `run-kill`, signal the scope's members with a bounded TERM grace period,
-   then use the cgroup-v2 whole-scope kill operation for the final guarantee.
-   The operation is idempotent and must cover descendants created after the
-   first signal.
-6. After the cgroup reports empty, remove the per-run scope. Removal is
-   cleanup, not evidence of exit success; an absent scope with no wait record
-   means `lost`.
+1. A cgroup-v2 unified mount is present.
+2. A delegated writable parent is available to AIRA, including permission to
+   create the per-run child and inspect its membership/events.
+3. `clone3` is available and accepts `CLONE_INTO_CGROUP` with the scope fd,
+   providing placement at child creation. The minimum supported kernel is
+   5.14.
+4. The created scope exposes a writable `cgroup.kill` and AIRA can use it for
+   whole-scope kill.
 
-The exact parent path, delegation setup, minimum kernel/syscall support, and
-whether an administrator/systemd user delegation is required are intentionally
-not hidden. They are load-bearing open decisions in §12. M12 must probe them
-and return a stable result, not print an implementation detail and proceed.
+AIRA probes **each** capability before launch. It then reserves the run ID,
+creates the private scope, durably records its scope reference (§7.3), and
+only then invokes `clone3` with `CLONE_INTO_CGROUP`. The launched process and
+all ordinary descendants inherit the scope. A post-start fork+move,
+process-group, main-PID, `setsid`, or other fallback path does not exist.
+
+On `run-kill`, AIRA records durable kill intent, uses a bounded TERM grace
+period for observed members, then uses writable `cgroup.kill` for the final
+whole-scope action. It verifies the scope is empty before recording `killed`.
+After any terminal operation, an empty scope is removed. Removal is cleanup,
+not evidence of exit success; an absent scope with no authoritative wait
+record means `lost` or a scope-integrity outcome.
 
 ### 5.3 cgroup-v2 unavailable: fail closed
 
-If cgroup-v2 is not mounted, the parent is not delegated, creation or child
-placement cannot be verified, or the required whole-scope kill operation is
-unavailable, M12 **does not launch by default**. It returns
-`E_RUN_SCOPE_UNAVAILABLE`/`E_RUN_SCOPE_INVALID` with infrastructure exit class
-4. There is no silent process-group or main-PID fallback, because that would
-contradict the run-kill contract for `setsid`, double-fork, and descendants.
+If **any one** of the unified-mount, delegated-parent, clone3/
+`CLONE_INTO_CGROUP`, kernel-minimum, scope-creation, or writable
+`cgroup.kill` probes fails, M12 returns `E_RUN_SCOPE_UNAVAILABLE` with
+infrastructure exit class 4 and launches nothing. There is no fork+move,
+process-group, main-PID, systemd-scope, or other unsafe fallback path anywhere
+in M12. An unscoped mode would be a different milestone and is not implied by
+this design.
 
-If the architect later wants an explicitly opt-in unscoped mode, it must be a
-separate state and contract (`scope=unscoped`, a warning/failure code, and
-`run-kill` refusing to claim descendant safety). It is not part of M12's
-default runner-lite scope and cannot be smuggled in as “fallback”.
+### 5.4 Scope-integrity result
+
+The scope guarantee has a bounded threat model. `scope_integrity` is closed:
+`contained | handoff-unverified | migrated | descendant-killed`. Clean
+success requires `contained`; `handoff-unverified` is used when the scope
+empties without enough evidence to distinguish normal descendant exit from an
+unobservable handoff, and `migrated` is used when a known member is observed
+outside the owned subtree. Both are surfaced as stable scope-integrity
+findings and prevent clean success. `descendant-killed` records the honest
+outcome when the launch process exited but lingering in-scope descendants had
+to be killed after the bounded pipe-drain grace.
 
 ## 6. Exit-code fidelity, verdicts, and honesty
 
 ### 6.1 The authoritative result
 
-The child wait result, not the last log line and not the AIRA process's own
-exit alone, establishes the Run's `exit_code`:
+The launch-process wait result, not the last log line and not the AIRA
+process's own exit alone, establishes the Run's `exit_code`:
 
 - normal child exit: record its exact non-negative integer;
 - signal termination: record `signal`, leave `exit_code` absent;
@@ -367,8 +432,8 @@ M12 does not wire that gate, but it must not make a false green input possible.
 The AIRA response exit is an AIRA exit *class*, not a promise to mirror an
 arbitrary child's numeric exit. Normal child non-zero is returned as a stable
 run-failure class while the exact child code remains in `data.run.exit_code`.
-MCP receives both values. A future shell-pass-through policy must be an
-explicit face decision, not an accidental consequence of `Response.Exit`.
+MCP receives both values. This is resolved policy for M12; there is no
+shell-pass-through mode.
 
 ### 6.2 Run outcome table
 
@@ -380,17 +445,50 @@ explicit face decision, not an accidental consequence of `Response.Exit`.
 | Wait/terminal result cannot be established | `lost` | `U_RUN_EXIT_UNKNOWN` | 3 | Unevaluated; never green. |
 | Capture writer hits disk full | `killed`/`exited` | `E_RUN_OUTPUT_DISK_FULL` | 4 | Output is partial/error-marked; even a known child code is not clean evidence. |
 | Capture reader/protocol crashes before capture is established | `killed`/`lost` | `E_RUN_CAPTURE_FAILED` | 4 | Exit status is not established by inference; no clean run evidence. |
+| Scope handoff or known migration is detected | `exited` | `E_RUN_SCOPE_HANDOFF`/`E_RUN_SCOPE_MIGRATION` | 4 | Launch exit may be factual; descendant success and containment are not established. |
+| Lingering in-scope descendant is killed after grace | `exited` | `E_RUN_DESCENDANT_KILLED` | 4 | Launch exit is factual; scope cleanup was forced and the run is not clean. |
 | cgroup boundary unavailable before launch | no launched run | `E_RUN_SCOPE_UNAVAILABLE` | 4 | Fail closed; no unsafe execution occurred. |
 | Requested run ID/output cannot be found | n/a | `E_RUN_NOT_FOUND` | 2 | Invocation/selector failure. |
 | Output was evicted or unreadable | terminal status unchanged | `U_RUN_OUTPUT_UNAVAILABLE` | 3 | Metadata may remain, but output-dependent evaluation is unevaluated. |
 
-The exact code names are proposed additions to the single
+The exact code names are required additions to the single
 `internal/store.ExitCodes` catalog. No runner adapter may invent aliases.
 `OK` is the normal response code; `U_*` is never converted to warning/pass or
 exit 0. If an implementation needs a more specific code, it must preserve the
 same meaning and exit class in the generated response contract.
 
-### 6.3 Stable code registration
+### 6.3 Terminal-state arbitration
+
+The foreground waiter and `run-kill` are concurrent writers. Exactly one
+terminal state may win. Each run has a per-run lock (or an equivalent durable
+compare-and-swap on the lifecycle state), and the terminal record has a
+unique terminal slot:
+
+1. The waiter publishes a `wait-observed` result through the per-run lock/CAS
+   immediately at reap, before doing capture finalisation. That publication
+   is the wait-result ordering fact and is also durably appended. If it has
+   reaped a normal exit before a kill intent linearizes, it owns the terminal
+   slot and appends `exited` once, even if terminal-file finalisation is still
+   pending.
+2. `run-kill` acquires the same lock and, before sending TERM or invoking
+   `cgroup.kill`, appends and fsyncs a durable `kill-intent` record. The
+   successful durable append is the kill linearization point. If the waiter
+   already published a wait result whose reap preceded that point, `exited`
+   stands and kill reports the race without changing the terminal record.
+3. Otherwise the kill intent blocks the waiter from committing `exited`.
+   `run-kill` performs the bounded grace and whole-scope `cgroup.kill`, then
+   verifies the scope is empty. Only after both conditions does it acquire the
+   terminal slot and append `killed` once.
+4. If AIRA dies after kill intent but before terminal completion, reconcile
+   resumes the intent and completes the kill/empty-scope proof, or records
+   `lost`/`U_RUN_RECONCILE_REQUIRED` if that proof cannot be established. It
+   never appends `killed` merely because intent exists.
+
+The lock/CAS and ledger uniqueness check reject a second terminal append as a
+journal integrity failure. No path appends both `exited` and `killed`, and no
+path fabricates an exit code for a kill or lost outcome.
+
+### 6.4 Stable code registration
 
 The implementation plan must add at least these entries to
 `internal/store.ExitCodes` and therefore to `core.ResponseContract()`:
@@ -399,7 +497,7 @@ The implementation plan must add at least these entries to
 |---|---|---:|
 | Invocation | `E_RUN_ARGUMENT_INVALID`, `E_RUN_PREFIX_INVALID`, `E_RUN_CWD_INVALID`, `E_RUN_ENV_INVALID`, `E_RUN_STDIN_INVALID`, `E_RUN_NOT_FOUND` | 2 |
 | Established operation failure | `E_RUN_FAILED`, `E_RUN_KILLED` | 1 |
-| Capture/scope infrastructure | `E_RUN_OUTPUT_OPEN`, `E_RUN_OUTPUT_DISK_FULL`, `E_RUN_CAPTURE_FAILED`, `E_RUN_SCOPE_UNAVAILABLE`, `E_RUN_SCOPE_INVALID`, `E_RUN_LAUNCH_FAILED` | 4 |
+| Capture/scope infrastructure | `E_RUN_OUTPUT_OPEN`, `E_RUN_OUTPUT_DISK_FULL`, `E_RUN_CAPTURE_FAILED`, `E_RUN_SCOPE_UNAVAILABLE`, `E_RUN_SCOPE_INVALID`, `E_RUN_SCOPE_HANDOFF`, `E_RUN_SCOPE_MIGRATION`, `E_RUN_DESCENDANT_KILLED`, `E_RUN_LAUNCH_FAILED` | 4 |
 | Unevaluated/lost | `U_RUN_EXIT_UNKNOWN`, `U_RUN_OUTPUT_UNAVAILABLE`, `U_RUN_RECONCILE_REQUIRED` | 3 |
 
 The `E_RUN_LAUNCH_FAILED` classification must distinguish “AIRA could not
@@ -412,13 +510,13 @@ store/ledger failures not specific to a runner condition.
 
 ### 7.1 Run record
 
-The closed, versioned Run record is the protocol object, whether its authority
-is ultimately the common-dir ledger or another durable home:
+The closed, versioned Run record is the protocol object and is authoritative in
+the common-dir ledger:
 
 | Field | Contract |
 |---|---|
 | `schema_version` | Versioned record format; unknown versions are not silently parsed. |
-| `id` | Stable run identity; exact allocator scheme remains open in §12. |
+| `id` | Stable local `RUN-n` identity allocated by the run counter, not the git ticket allocator. |
 | `argv` | Exact target token array, binary-safe as the transport permits. |
 | `cwd` | Effective absolute/normalised launch directory, with no semantic substitution. |
 | `env_digest` | Digest of the effective environment; values are not persisted in the run record. |
@@ -426,27 +524,31 @@ is ultimately the common-dir ledger or another durable home:
 | `cgroup_scope` | Opaque scope reference/path, parent identity, and placement verification state. |
 | `started_at`, `ended_at` | Wall-clock timestamps; lifecycle ordering comes from record sequence, not wall time. |
 | `status` | Closed enum from §2.2. |
+| `scope_integrity` | Closed result from §5.4: `contained`, `handoff-unverified`, `migrated`, or `descendant-killed`. |
 | `exit_code` | Exact normal child code when established; absent otherwise. |
 | `signal` | Terminating signal when independently established; absent for AIRA-killed/lost results without wait evidence. |
 | `output_refs` | `out` + `err`, or `log`, and optional `in`; each has path/opaque ref, byte count, digest if complete, and capture state. |
 | `capture_complete` | Explicit all-stream completion boolean; false/unknown is not a green result. |
+| `capture_forced_closed` | Whether the descendant grace expired and scope kill was needed to reach pipe EOF; distinct from byte completeness. |
 | `stdin_stored` | Whether `RUN-n.in` exists; false by default. |
 | `scope_kill` | Requested/started/completed, grace outcome, and actor/at when applicable. |
+| `kill_intent` | Durable intent sequence and completion/empty-scope proof; it arbitrates the terminal slot. |
 | `error_codes` | Stable ordered codes and machine-readable error markers; no driver-string parsing by consumers. |
 | `pid_identity` | Ephemeral launch PID plus process start identity while useful; never the sole kill authority. |
 
 The record does not contain telemetry, rusage, a test report, gate verdict,
 secret environment values, or an implicit “green” field.
 
-### 7.2 Proposed durability split
+### 7.2 Durability split
 
-The recommended M12 layout is:
+The decided M12 layout is:
 
 - **Run ledger — common-dir audit class:** append-only, canonical records under
   the machine's git common-dir AIRA area. It contains `starting`/`running`,
   terminal lifecycle facts, capture error facts, scope refs, and record
   digests. It is the authority for reconstructing whether AIRA established an
-  exit result. The ledger is machine-local and outside the commit graph.
+  exit result. The local `RUN-n` counter reservation is lock-protected in this
+  same machine-shared run area and is outside the git commit graph.
 - **Run output — machine-local files:** a gitignored run directory, with
   `RUN-n.out`, `RUN-n.err`, `RUN-n.log`, and optional `RUN-n.in`. Raw bytes are
   not in git, the ledger, or SQLite. Output refs point to these files and
@@ -456,59 +558,82 @@ The recommended M12 layout is:
   mint a terminal success or repair a missing ledger record.
 
 This follows AIRA's content-truth/rebuildable-index layering for lifecycle
-facts, while keeping high-volume bytes out of both content and DB. It is a
-deliberate exception to the top-level operational-telemetry default and is
-therefore an architect decision, not an unmentioned implementation detail.
-
-If the architect instead chooses DB-authoritative run metadata, the design
-must specify an equally durable crash/DB-loss protocol before implementation;
-“reconcile from a PID” is not enough to reconstruct a missing wait status and
-must produce `lost`, never exit 0.
+facts, while keeping high-volume bytes out of both content and DB. It is the
+decided M12 exception to the top-level operational-telemetry default.
 
 ### 7.3 Write and crash protocol
 
-The proposed foreground sequence is:
+The common-dir ledger uses canonical record framing mirroring AIRA's journal:
 
-1. Validate argv, prefix, cwd, env, stdin, merge mode, and cgroup capability.
-2. Allocate a run ID and create the per-run output directory/files without
-   exposing the run as successful. Record `starting` durably.
-3. Create and verify the private cgroup scope; append its opaque reference.
-4. Start the launch prefix/target into that scope, record PID identity, and
-   append `running` only after membership and pipe setup are verified.
+```
+uvarint(payload_length) || canonical_payload || sha256(canonical_payload)
+```
+
+The length prefix is unambiguous, the payload has canonical field ordering,
+and the checksum covers the complete payload. Every append is lock-protected,
+written, fsynced, and followed by an fsync of the ledger directory. A torn
+length/payload/checksum frame is not skipped: the ledger is corrupt and the
+runner fails closed. The per-run terminal slot is unique in the ledger.
+
+The foreground sequence is:
+
+1. Validate argv, prefix, cwd, env, stdin, merge mode, and all four cgroup
+   capabilities. Do not allocate a child or enter a fallback path on failure.
+2. Reserve the next local `RUN-n` counter value and the intended unique scope
+   reference. Append and fsync a `scope-reserved`/`starting` record **before
+   creating a child**. Create output files and fsync their directory.
+3. Create the private cgroup scope. Append and fsync `scope-created` with the
+   actual scope reference **before `clone3`**. A crash after scope creation is
+   therefore recoverable from a durable orphan-scope record, not an untracked
+   live child.
+4. Create the pipes and invoke `clone3` with `CLONE_INTO_CGROUP` and the scope
+   fd. Record PID identity and append/fsync `running` only after membership and
+   fd setup are verified.
 5. Drain stdout/stderr (or the merged pipe) independently to files while a
-   wait operation observes the child. Write capture error markers immediately
-   and never overwrite already-recorded bytes.
-6. Reap the launch process, wait for all capture readers to reach EOF, close and
-   sync output files, and verify the scope is empty.
-7. Append exactly one terminal `exited`, `killed`, or `lost` ledger record with
-   exit/signal, capture state, error codes, timestamps, and output refs. Remove
-   the empty scope after the record has the required facts.
+   wait operation observes the launch process. Write capture error markers
+   immediately and never overwrite already-recorded bytes.
+6. Reap the launch process. Apply the finite descendant pipe grace (§4.5),
+   close and fsync output files, and verify scope state. If kill is needed,
+   use the terminal arbitration protocol (§6.3).
+7. Append and fsync exactly one terminal `exited`, `killed`, or `lost` record
+   with exit/signal, scope integrity, capture state, error codes, timestamps,
+   and output refs. Fsync the ledger directory, then remove the verified-empty
+   scope. Scope removal never substitutes for the terminal record.
 8. Update/rebuild the SQLite projection from the ledger. A projection failure
    does not turn a factual terminal record into a fake success.
 
-Crash windows are explicit:
+Crash and reconcile windows are explicit:
 
-- before child launch: `starting` with no child is a failed launch or an
-  incomplete record, not a running/successful run;
-- after child launch but before terminal record: reconcile may find a live
-  scope and leave `running`, or an empty scope and mark `lost`; it may not
-  infer exit 0;
+- after ID reservation or scope reservation: reconcile can finish/clean an
+  empty orphan scope; a live scope is surfaced as killable by its run ID;
+- after scope creation but before `clone3`: the durable scope-created record
+  identifies the empty orphan for cleanup;
+- after `clone3` but before `running`: the durable scope ref permits reconcile
+  to find a live child; absent wait evidence is never exit 0;
+- after child launch but before terminal record: reconcile finds a live scope
+  and reports it killable, or an empty scope and records `lost`/scope
+  integrity, but never infers exit 0;
 - after terminal ledger append but before DB projection: replay the ledger;
 - after DB loss: rebuild the projection from the ledger and output refs;
-- after ledger corruption/loss: report stable journal/reconcile failure or
-  `U_RUN_RECONCILE_REQUIRED`; never manufacture a terminal result.
+- after a torn/partial terminal frame: report `U_RUN_RECONCILE_REQUIRED`/
+  `lost`, never green;
+- after ledger loss or checksum corruption: fail closed with the existing
+  journal/receipt infrastructure code. SQLite cannot repair or override the
+  missing authoritative ledger.
 
-`run-kill` uses the durable scope ref, not only the PID, so a separate AIRA
-process can kill a still-live foreground run after its original caller has
-failed. If the parent died and no one reaped the child, a later observer may
-only be able to establish `lost`; the minimal-supervisor question is open in
-§12.
+Reconcile enumerates all durable scope references, not just DB rows. A live
+scope whose run has no terminal record because the foreground parent died is
+reported as an orphan/killable run; an operator uses `run-kill <run-id>` (or
+the equivalent explicit reconcile kill action) to complete the cgroup kill.
+Reconcile does not silently kill every orphan and does not mark one clean.
+Once the scope is empty without a wait record, the run remains `lost` or has a
+scope-integrity finding.
 
 ## 8. `run-log` protocol
 
 ### 8.1 CLI view and follow
 
-`aira run-log <run-id>` views the captured output. The proposed options are:
+`aira run-log <run-id>` views the captured output. The options are:
 
 ```
 --stream out|err|merged
@@ -525,13 +650,12 @@ bytes, not decoded text; status/metadata belongs in the structured response or
 diagnostic channel so binary output is not corrupted.
 
 `--follow` reads the append-only capture file, emits new bytes, and polls the
-run ledger/status until terminal. It needs no daemon and does not hold a child
-pipe. If the run becomes `lost`, the follow ends with that status and a stable
-non-success result. If output is partial, it says so. A follow reader ending
-does not close or influence the writer.
-
-How long a follow may wait, polling interval, and whether a bounded timeout is
-required are open in §12; no choice may change the no-daemon guarantee.
+run ledger/status approximately every **200 ms** until terminal. It needs no
+daemon and does not hold a child pipe. If the run becomes `lost`, the follow
+ends with that status and a stable non-success result. If output is partial,
+it says so. A follow reader ending does not close or influence the writer.
+There is no follow timeout in M12: it polls until terminal or caller
+cancellation, and cancellation does not alter the run.
 
 ### 8.2 MCP output and overflow discipline
 
@@ -621,47 +745,75 @@ Parity tests must prove:
 ## 10. Invariants
 
 1. **AIRA owns the scope.** Every launched M12 run has one verified private
-   cgroup-v2 scope containing the prefix/target tree, or launch fails closed.
+   cgroup-v2 scope containing the launch process/target tree, or launch fails
+   closed; the guarantee is bounded to that subtree.
 2. **Kill is whole-scope.** `run-kill` never kills only the main PID and never
    names a shared prefix-owned slice.
-3. **No unsafe fallback is silent.** Missing cgroup-v2/delegation/placement or
-   whole-scope kill support is a stable failure; any future unscoped mode must
-   be explicit and non-green.
-4. **Exact argv survives.** Target tokens, including `--`-prefixed tokens,
+3. **Exact capability set.** Unified cgroup-v2, delegated writable parent,
+   kernel >=5.14, clone3+`CLONE_INTO_CGROUP`, and writable `cgroup.kill` are
+   all required and individually probed before launch.
+4. **No unsafe fallback exists.** M12 has no fork+move, process-group,
+   main-PID, systemd-scope, or other fallback path.
+5. **Bounded containment claim.** `setsid`, double-fork, and reparent do not
+   escape; deliberate cgroup migration can. A detectable migration or
+   unverifiable handoff is a scope-integrity finding and never clean success.
+6. **Exact argv survives.** Target tokens, including `--`-prefixed tokens,
    reach the child without shell reparsing or option loss.
-5. **cwd/env fidelity.** The child receives the selected cwd and effective
+7. **cwd/env fidelity.** The child receives the selected cwd and effective
    environment; the record binds them with a digest and does not claim a
    different cwd/env.
-6. **No prompt.** The runner never waits for an interactive approval or
+8. **Length-prefixed env identity.** Duplicate keys are rejected and the
+   sorted-key uvarint length/key/value encoding is hashed exactly; delimiters
+   cannot create digest collisions.
+9. **No prompt.** The runner never waits for an interactive approval or
    hidden stdin response.
-7. **Every pipe drains.** Capture continues to files whether or not a live
+10. **Every pipe drains.** Capture continues to files whether or not a live
    `run-log` reader exists; a reader cannot create child backpressure.
-8. **Raw bytes remain raw.** Capture and MCP base64 transport do not corrupt,
+11. **Raw bytes remain raw.** Capture and MCP base64 transport do not corrupt,
    decode, trim, reorder, or text-normalise bytes.
-9. **Merge means dup2.** Merged output comes from one exec-time kernel stream,
+12. **Merge means dup2.** Merged output comes from one exec-time kernel stream,
    never post-hoc file concatenation.
-10. **Disk-full is visible.** Any incomplete write/close/sync marks the run
+13. **Disk-full is visible.** Any `ENOSPC` or incomplete write/close/sync marks
+    the run with a stable error; `capture_complete` requires EOF, successful
+    close, and successful fsync.
+14. **Descendant grace is finite.** A launch exit with lingering pipe holders
+    waits only `run.capture_descendant_grace`, then whole-scope-kills and
+    continues draining honestly; it never hangs on pipe EOF.
+15. **Disk/capture errors are non-green.** Any incomplete capture marks the run
     with a stable error and prevents clean-run consumers from treating it as
     success.
-11. **stdin is opt-in to storage.** Launch input may be supplied without being
+16. **stdin is opt-in to storage.** Launch input may be supplied without being
     stored; input persistence requires explicit `--store-stdin`.
-12. **Exit 0 is earned.** Only `exited` + established `exit_code=0` + complete
-    capture + complete terminal ledger can represent a clean run.
-13. **Lost never becomes zero.** A missing wait, crashed capture protocol,
+17. **Exit 0 is earned.** Only `exited` + established launch-process
+    `exit_code=0` + contained scope + complete capture + complete terminal
+    ledger can represent a clean run.
+18. **Lost never becomes zero.** A missing wait, crashed capture protocol,
     removed scope without a wait record, or DB/ledger ambiguity is `lost`/
     unevaluated, never inferred success.
-14. **Terminal facts are immutable.** Reconcile can add findings or rebuild a
+19. **One terminal winner.** A per-run lock/CAS, durable pre-signal kill
+    intent, and one linearization rule permit exactly one terminal record;
+    `exited` wins only if its wait was published before kill linearization,
+    otherwise `killed` requires cgroup.kill completion plus empty scope.
+20. **Terminal facts are immutable.** Reconcile can add findings or rebuild a
     projection, but cannot invent or rewrite an exit result.
-15. **DB is not authority if the ledger decision stands.** SQLite loss or a
-    stale projection is repaired from the durable lifecycle record; a DB row
-    alone cannot mint a Run.
-16. **Output truncation is explicit.** CLI and MCP identify partial ranges,
+21. **Ledger is durable authority.** Length/checksum framing, record fsync, and
+    directory fsync protect the common-dir ledger; a torn terminal record is
+    lost/unevaluated and ledger corruption fails closed.
+22. **DB is not authority.** SQLite loss is rebuilt from the ledger; a DB row
+    alone cannot mint a Run or repair a missing authoritative record.
+23. **Orphans remain killable.** Durable scope refs are enumerated by
+    reconcile; a parent-death live scope is surfaced by run ID for explicit
+    `run-kill`, not silently abandoned or auto-marked clean.
+24. **Scope handoff is visible.** A migrated/unknown descendant or an empty
+    scope with unverifiable handoff produces a scope-integrity code/finding;
+    AIRA reports only the launch process's wait status.
+25. **Output truncation is explicit.** CLI and MCP identify partial ranges,
     caps, offsets, eviction, and read errors; an empty/short response never
     masquerades as complete output.
-17. **No deferred feature leaks in.** M12 descriptors expose no detach,
+26. **No deferred feature leaks in.** M12 descriptors expose no detach,
     run-input, telemetry/gate auto-wiring, live supervisor tee, PTY, rusage,
     or report option.
-18. **Faces cannot drift.** CLI, MCP, Skill, help, stable codes, and examples
+27. **Faces cannot drift.** CLI, MCP, Skill, help, stable codes, and examples
     come from the same dispatch/response contracts.
 
 ## 11. Tests (TDD; every confirmed counterexample becomes a regression test)
@@ -669,10 +821,11 @@ Parity tests must prove:
 ### 11.1 Launch and argument fidelity
 
 1. Bare prefix launches the exact argv and empty prefix means no wrapper.
-2. Default prefix is tokenised as `agentmux whale run` with one delimiter and
-   the target is appended exactly once.
+2. The default is empty/bare; a configured `agentmux whale run --` prefix is
+   used only when explicitly configured and is appended exactly once.
 3. A configured prefix with shell metacharacters is passed as tokens or
-   rejected; no shell expands it.
+   rejected; no shell expands it, and an arbitrary work-submitting prefix is
+   outside the in-contract guarantee.
 4. CLI parsing preserves a child argument beginning with `--` after the one
    launch delimiter and rejects missing/ambiguous delimiter forms.
 5. MCP argv arrays and equivalent CLI argv construct byte-for-byte equivalent
@@ -680,7 +833,12 @@ Parity tests must prove:
 6. Cwd is exact, a nonexistent cwd returns `E_RUN_CWD_INVALID`, and no
    project-root substitution occurs.
 7. Inherited and explicit environment values reach the child; empty values
-   survive; the record contains only the agreed digest.
+   survive; duplicate keys are rejected; the record contains only the agreed
+   digest.
+7a. The canonical environment encoder uses sorted-key
+    `uvarint(len(key))||key||uvarint(len(value))||value` entries and SHA-256;
+    environments containing LF, NUL, or `=` in test byte inputs have distinct
+    digests and cannot collide.
 8. Launch never presents an approval prompt and a command needing interactive
    approval receives closed/null stdin unless `--stdin` was supplied.
 9. Prefix-not-found, target-not-found, invalid env, and invalid stdin produce
@@ -700,8 +858,13 @@ Parity tests must prove:
 15. Short writes, close errors, sync errors, quota/ENOSPC, and output-open
     failures produce the exact stable capture code, partial markers, and no
     clean success.
-16. Disk-full handling drains/cleans without deadlock, kills the remaining
-    scope when required, and never reports a fake exit 0.
+16. Disk-full/ENOSPC handling drains/cleans without deadlock, requires
+    successful close+fsync for `capture_complete`, kills the remaining scope
+    when required, and never reports a fake exit 0.
+16a. A launch process that exits while a descendant holds a capture fd waits
+    only `run.capture_descendant_grace`, then whole-scope-kills, keeps draining
+    to avoid deadlock, and records launch exit X plus the forced descendant
+    outcome/capture state.
 17. stdin is absent/closed by default; file and `-` sources work only at
     launch; `--store-stdin` alone is rejected; stored input is exact and
     explicitly referenced.
@@ -710,8 +873,11 @@ Parity tests must prove:
 
 18. A run's cgroup is private, recorded, verified before `running`, and removed
     only after it is empty.
-19. A prefix wrapper plus child plus grandchild all appear inside the AIRA
-    scope, including a child that calls `setsid`.
+19. A configured in-contract wrapper plus child plus grandchild all appear
+    inside the AIRA scope, including a child that calls `setsid`.
+19a. A fixture that deliberately migrates a known member to another delegated
+     cgroup produces `E_RUN_SCOPE_MIGRATION`; an empty scope with an
+     unobservable handoff produces `E_RUN_SCOPE_HANDOFF`; neither is clean.
 20. `run-kill` kills the whole scope, not just the main PID; descendants cannot
     keep running through the grace/final-kill race.
 21. Killing an already exited run is idempotent and does not change an
@@ -719,131 +885,149 @@ Parity tests must prove:
     linearisation and no fake exit code.
 22. PID reuse and a stale PID cannot make `run-kill` target an unrelated
     process; scope identity remains the authority.
-23. Missing cgroup-v2 mount, missing delegation, denied creation, unavailable
-    child placement, and unavailable whole-scope kill all fail closed with
-    stable infrastructure outcomes and no unsafe launch.
+23. Missing cgroup-v2 unified mount fails closed with
+    `E_RUN_SCOPE_UNAVAILABLE` and no launch.
+23a. A non-delegated/unwritable parent fails closed with the same code and no
+     launch.
+23b. Missing/denied `clone3` or `CLONE_INTO_CGROUP` fails closed with the same
+     code and no launch.
+23c. Kernel below 5.14 fails closed with the same code and no launch.
+23d. Missing/denied writable `cgroup.kill` fails closed with the same code and
+     no launch.
+23e. Scope creation or membership verification failure fails closed with the
+     same code and no launch; no process-group or PID fallback is attempted.
 24. Scope cleanup failure is visible and does not make a complete run appear
     incomplete or vice versa.
 
 ### 11.4 Exit honesty and recovery
 
 25. Child exit 0 records exact zero only after wait, full drain, output close,
-    and terminal ledger completion.
+    successful fsync, contained scope, and terminal ledger completion.
 26. Child exit 7 records `status=exited`, `exit_code=7`, `E_RUN_FAILED`, and
     never collapses the child code to zero.
 27. AIRA scope kill records `status=killed`, stable kill code, and no invented
     normal exit code.
 28. Parent/capture/wait failure records `lost` or the explicitly established
     killed state; no missing result becomes `exited/0`.
+28a. If waiter and `run-kill` race, the per-run lock/CAS and durable kill
+     intent produce exactly one terminal record: pre-intent published wait
+     wins; otherwise killed requires cgroup.kill plus empty-scope proof.
 29. A running child after the foreground parent dies remains killable by its
     cgroup ref; once its scope empties without a wait record, reconcile marks
     the result lost rather than successful.
+29a. Parent death after ID/scope reservation is reconciled as an empty orphan
+     or recoverable scope reference, never as a run success.
+29b. Parent death after scope creation but before clone3 is reconciled and
+     cleans the empty scope without losing the durable reservation.
+29c. Parent death after clone3 but before `running` leaves a durable live
+     scope killable by run ID and no fabricated exit.
+29d. Parent death during `running`/capture leaves the live scope killable and
+     the eventual result lost unless a wait record exists.
+29e. Parent death after wait but before the terminal append preserves the
+     wait only if durably published; otherwise reconcile reports lost.
+29f. Parent death after kill intent causes reconcile to complete the kill and
+     empty-scope proof or report `U_RUN_RECONCILE_REQUIRED`, never infer killed.
 30. A DB projection dropped after terminal ledger append rebuilds the exact
     Run and status from the ledger.
-31. A crash is injected at every lifecycle write boundary; reconcile repairs
+31. Every ledger frame has canonical length/checksum validation; a torn
+    payload/checksum or partial terminal frame fails closed as
+    `U_RUN_RECONCILE_REQUIRED`/lost, and each record plus its directory was
+    fsynced before the next launch step.
+32. A crash is injected at every lifecycle write boundary; reconcile repairs
     only the projection/documented derived side and emits stable findings for
     incomplete authority records.
-32. A malformed, reordered, or missing ledger record returns journal/reconcile
+33. A scope is reserved and durably recorded before clone3; an orphan scope
+    after a crash is discoverable and recoverable from the ledger.
+34. A malformed, reordered, or missing ledger record returns journal/reconcile
     failure or `U_RUN_RECONCILE_REQUIRED`, never a green record.
-33. Output-file eviction/unreadability preserves metadata but returns explicit
+35. Output-file eviction/unreadability preserves metadata but returns explicit
     `U_RUN_OUTPUT_UNAVAILABLE` for output-dependent reads.
 
 ### 11.5 `run-log` and overflow
 
-34. CLI view supports exact stream selection, byte offsets, tail/full policy,
+36. CLI view supports exact stream selection, byte offsets, tail/full policy,
     and binary output without metadata bytes contaminating stdout.
-35. CLI follow observes appended data without a daemon, terminates at terminal
-    state, and reports lost/partial output honestly.
-36. MCP output caps are deterministic; every clipped response includes
+37. CLI follow observes appended data without a daemon, polls approximately
+    every 200 ms until terminal, and reports lost/partial output honestly.
+38. MCP output caps are deterministic; every clipped response includes
     `truncated`, total/returned bytes, next offset, and output state.
-37. Repeated MCP offset requests reconstruct exactly the stored byte stream;
+39. Repeated MCP offset requests reconstruct exactly the stored byte stream;
     an empty response is distinguishable from EOF and unavailable output.
-38. MCP follow is bounded/cursor-based and never becomes an unbounded JSON
+40. MCP follow is bounded/cursor-based and never becomes an unbounded JSON
     response or hidden subscription.
 
 ### 11.6 Faces, descriptors, and static build
 
-39. Dispatch metadata covers `run`, `run-kill`, and `run-log` with correct
+41. Dispatch metadata covers `run`, `run-kill`, and `run-log` with correct
     safety, examples, requiredness, and no Phase-5 args.
-40. Generated MCP tool list contains exactly `aira_run`, `aira_run_output`,
+42. Generated MCP tool list contains exactly `aira_run`, `aira_run_output`,
     and `aira_run_kill` in addition to existing tools; no aliases leak.
-41. CLI↔core↔MCP parity covers launch, merge, stdin, output cursor/follow, and
+43. CLI↔core↔MCP parity covers launch, merge, stdin, output cursor/follow, and
     kill arguments using real entrypoints.
-42. Stable code/exit mapping appears identically in CLI, MCP, Skill, and guide
+44. Stable code/exit mapping appears identically in CLI, MCP, Skill, and guide
     response contracts; `U_*` exits 3 and never pass/0.
-43. The ordinary foreground path works with no daemon and no network.
-44. The static, no-cgo build remains valid; Linux cgroup support is isolated
+45. The ordinary foreground path works with no daemon and no network.
+46. The static, no-cgo build remains valid; Linux cgroup support is isolated
     behind the platform boundary and unsupported platforms fail honestly.
 
 ## 12. Risks and mitigations
 
 | Risk | Mitigation |
 |---|---|
-| Prefix creates a nested/shared scope and kill reaches too little or too much | AIRA creates/verifies its own private parent scope; kill uses that scope recursively, never a prefix name; test wrapper/grandchild/setsid cases. |
-| Post-start cgroup movement races with an early child | Require a verified child-placement mechanism with no descendant escape window; otherwise fail closed. |
-| cgroup permissions vary across desktops/containers | Probe delegation before launch, document the required parent, and return stable infrastructure failure rather than pretending PID kill is scoped. |
-| A foreground parent dies while the child survives | Persist scope refs before launch, make another AIRA process able to kill the scope, and classify an unreaped result as `lost`; keep the minimal-supervisor question open. |
-| A pipe reader blocks behind a live consumer | No child-facing live tee exists in M12; drain workers write files independently of `run-log`. |
+| Prefix creates a nested/shared scope and kill reaches too little or too much | Empty/bare is the default; configured prefixes are contract-bound; AIRA creates/verifies its private parent and reports migration/handoff instead of claiming escaped work succeeded. |
+| A descendant deliberately migrates out of the scope | `clone3` closes ordinary placement races, but the threat model is bounded; detectable migration and unverifiable handoff are stable scope-integrity findings, never clean success. |
+| cgroup permissions vary across desktops/containers | Probe unified mount, delegated parent, kernel/clone3 placement, and writable `cgroup.kill` separately; any failure returns `E_RUN_SCOPE_UNAVAILABLE` with no launch. |
+| A foreground parent dies while the child survives | No supervisor; durable pre-clone scope refs let reconcile surface the live scope as killable by run ID, while missing wait evidence remains `lost`. |
+| Waiter and `run-kill` race | Per-run lock/CAS plus durable pre-signal kill intent gives one linearization point and exactly one terminal record. |
+| A pipe reader blocks behind a live consumer | No child-facing live tee exists; drain workers persist independently, and a finite 2-second descendant grace leads to whole-scope kill and continued draining. |
 | Separate streams are incorrectly merged later | `--merge` changes fd topology before exec; tests assert ordering and refs. |
-| Disk-full produces partial but green output | Treat every write/close/sync failure as a stable run error, mark partial, and exclude it from clean-run consumers. |
+| Disk-full produces partial but green output | `ENOSPC`/write errors are stable failures; `capture_complete` requires EOF, successful close, and fsync, and partial output is excluded from clean-run consumers. |
 | Binary output is corrupted by text/MCP handling | Raw file bytes, CLI byte output, MCP base64 with offsets and counts. |
 | stdin leaks secrets or hangs on a prompt | Closed/null stdin by default, launch-only explicit source, `store-stdin` opt-in, no prompt path. |
-| DB loss invents or erases a run result | Common-dir lifecycle authority/projection replay proposal; missing wait evidence becomes lost, not exit 0. |
+| DB loss invents or erases a run result | Common-dir framed/checksummed ledger is authoritative; projection replay rebuilds DB, while ledger loss/corruption fails closed and missing wait evidence becomes lost. |
+| Ledger crash leaves an untracked scope | Reserve ID/scope ref and fsync the ledger before scope creation/clone3; reconcile enumerates durable orphan refs and both ledger/file directories are fsynced. |
+| Environment delimiter collision changes identity | Sorted-key uvarint length/key/value encoding plus SHA-256 and duplicate-key rejection; collision fixtures cover LF/NUL/`=`. |
 | Output retention makes `run-log` lie | Keep metadata and explicit eviction state; return `U_RUN_OUTPUT_UNAVAILABLE`, never an empty successful log. |
 | CLI/MCP/Skill options drift into Phase 5 | One dispatch table, generated schemas/help, parity tests, and a descriptor test that rejects deferred options. |
-| Child non-zero and AIRA failure exits are confused | Preserve exact child `exit_code` in Run data and use stable AIRA exit classes for the face; document the distinction. |
+| Child non-zero and AIRA failure exits are confused | Preserve exact launch-process `exit_code` in Run data and use resolved stable AIRA exit classes for the face. |
 
-## 13. Open decisions for the architect
+## 13. Resolved architect decisions applied
 
-These are intentionally not resolved unilaterally. Each changes a load-bearing
-part of the M12 contract.
+The following decisions are closed for this design and must not be reopened by
+an implementation plan:
 
-1. **cgroup-v2 layout and delegation assumptions:** What parent hierarchy may
-   AIRA create under on supported machines? Is a systemd user delegation an
-   allowed prerequisite, or must M12 support a directly delegated subtree?
-   Which kernel minimum and child-placement syscall path are supported, and
-   which cgroup files are required for recursive kill and cleanup?
-2. **Launch-prefix default:** Is `agentmux whale run --` the shipped default
-   exactly, including its one trailing delimiter, and is an unavailable
-   default a launch failure rather than a bare-exec fallback? Is per-run
-   prefix override allowed, or config-only?
-3. **Run ID scheme:** Should IDs use the AIRA allocator plus a run prefix, or
-   a local `RUN-n` counter? How are IDs collision-safe across worktrees, and
-   does the filename remain `RUN-n.out` when the public ID is not `RUN-n`?
-4. **Environment digest:** What canonical byte representation is hashed?
-   Sorted `KEY=VALUE` entries, duplicate-key rejection, locale/encoding rules,
-   and whether any volatile variables are excluded must be fixed before
-   consumers compare lane identity.
-5. **Disk-full detection:** Is an immediate write/close/sync error sufficient,
-   or must M12 preflight quota/free space and/or use filesystem project quotas?
-   What durability level does “written” mean before the terminal record is
-   allowed to claim `capture_complete`?
-6. **`run-log --follow` without a daemon:** What polling interval and maximum
-   wait/timeout should the CLI use? Does `--follow` run until terminal by
-   default, or require an explicit timeout? How does a follow detect a lost
-   parent while the cgroup is still live?
-7. **Minimal supervisor for foreground kill-after-parent-exit:** Is the
-   no-supervisor foreground rule absolute, accepting `lost` after parent death,
-   or is a tiny non-detached reaper allowed solely to preserve wait/kill
-   ownership? Any supervisor here must not quietly become Phase-5 detach or
-   change the owner decision that the daemon is only the detached-run
-   supervisor.
-8. **Run lifecycle authority:** Does the proposed common-dir audit ledger
-   become the accepted M12 exception, or does the architect require DB-only
-   metadata with a different durable crash protocol? If common-dir is chosen,
-   what record authentication/locking/fsync rules and retention apply?
-9. **Capture-file retention/eviction:** What directory, byte cap, TTL, and
-   eviction order apply? Are active-run and live-follow files protected? Does
-   eviction delete raw data or only compress it, and which metadata proves the
-   file was evicted rather than never captured?
-10. **MCP/CLI response exit policy:** Should `aira run` return AIRA class 1
-    for a known child non-zero, mirror the child's numeric exit for CLI only,
-    or expose both through a future explicit mode? The Run record must retain
-    exact child status under all choices.
-11. **Environment option surface:** Are explicit env overrides part of M12,
-    or is faithful inheritance plus a configured environment the whole scope?
-    If overrides are included, what syntax and secret-handling guidance does
-    each face use?
-12. **Run output default selection:** For separate out/err, should
-    `run-log <id>` require `--stream`, present a structured two-stream view,
-    or choose stdout by default? The choice must not imply cross-stream order.
+1. **Scope capability:** M12 requires a cgroup-v2 unified mount, delegated
+   writable parent, kernel 5.14+, clone3 with `CLONE_INTO_CGROUP`, and writable
+   `cgroup.kill`; each is probed independently and any failure hard-fails with
+   `E_RUN_SCOPE_UNAVAILABLE`.
+2. **Threat model and prefix:** the default prefix is empty/bare. `agentmux`
+   and `whale` are optional configured prefixes; arbitrary work-submitting or
+   migrating prefixes are out of contract. Containment and clean success are
+   bounded to AIRA's owned subtree, with migration/handoff findings.
+3. **Run IDs:** use a local `RUN-n` counter, not the git allocator.
+4. **Environment identity:** use sorted-key length-prefixed uvarint encoding
+   followed by SHA-256, rejecting duplicate keys.
+5. **Lifecycle authority:** use the common-dir framed/checksummed ledger as
+   authority, SQLite as a rebuildable projection, and machine-local capture
+   files outside both.
+6. **Ledger durability:** reserve the ID and durable scope reference before
+   clone3; fsync every ledger record and its directory; torn/corrupt ledger
+   data fails closed.
+7. **Terminal arbitration:** a per-run lock/CAS and durable pre-signal
+   kill-intent record provide one linearization point and exactly one terminal
+   record.
+8. **Supervisor ownership:** M12 has no supervisor. Parent death yields
+   `lost`; reconcile enumerates the durable scope and exposes it for explicit
+   `run-kill`.
+9. **Descendant completion:** `run.capture_descendant_grace` is finite and
+   defaults to 2 seconds; lingering pipe holders trigger whole-scope kill and
+   honest forced-cleanup metadata.
+10. **Capture durability:** `ENOSPC` and write/close/fsync errors fail the run;
+    `capture_complete` requires EOF, successful close, and successful fsync.
+11. **Follow and face exits:** `run-log --follow` polls about every 200 ms
+    until terminal; CLI/MCP return AIRA exit classes while preserving the
+    exact launch-process child exit code in Run data.
+12. **Retention boundary:** M12 does not silently evict or compress capture
+    bytes. Any external retention action must leave an explicit unavailable
+    state and `U_RUN_OUTPUT_UNAVAILABLE`; active runs and follow readers are
+    not candidates for external deletion.
