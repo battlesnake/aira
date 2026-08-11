@@ -106,8 +106,9 @@ type Intent struct {
 type IntentKind string
 
 const (
-	IntentKindTicketFile  IntentKind = "ticket-file"
-	IntentKindFindingFile IntentKind = "finding-file"
+	IntentKindTicketFile      IntentKind = "ticket-file"
+	IntentKindFindingFile     IntentKind = "finding-file"
+	IntentKindRequirementFile IntentKind = "requirement-file"
 )
 
 type AllocationReceipt struct {
@@ -300,6 +301,11 @@ func (s *Store) initDB(ctx context.Context) error {
             title TEXT NOT NULL, kind TEXT NOT NULL, severity TEXT NOT NULL,
 	            PRIMARY KEY(project_id, worktree_id, id)
 	        )`,
+		`CREATE TABLE IF NOT EXISTS requirements (
+            project_id TEXT NOT NULL, worktree_id TEXT NOT NULL, id TEXT NOT NULL,
+            path TEXT NOT NULL, digest TEXT NOT NULL, status TEXT NOT NULL, text TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY(project_id, worktree_id, id)
+        )`,
 		`CREATE TABLE IF NOT EXISTS relations (
 	            project_id TEXT NOT NULL, worktree_id TEXT NOT NULL, kind TEXT NOT NULL,
 	            from_id TEXT NOT NULL, to_id TEXT NOT NULL, canonical_file TEXT NOT NULL,
@@ -973,10 +979,18 @@ func (s *Store) materialiseIntent(ctx context.Context, intent Intent) error {
 }
 
 func (s *Store) markMaterialised(ctx context.Context, intent Intent) error {
-	if intent.Kind == IntentKindFindingFile {
+	// Dispatch on the exact intent kind; an unknown kind is a programming error
+	// and must never silently fall through to ticket materialisation.
+	switch intent.Kind {
+	case IntentKindTicketFile:
+		return s.markTicketMaterialised(ctx, intent)
+	case IntentKindFindingFile:
 		return s.markFindingMaterialised(ctx, intent)
+	case IntentKindRequirementFile:
+		return s.markRequirementMaterialised(ctx, intent)
+	default:
+		return fmt.Errorf("E_INTERNAL: unknown intent kind %q", intent.Kind)
 	}
-	return s.markTicketMaterialised(ctx, intent)
 }
 
 func (s *Store) markTicketMaterialised(ctx context.Context, intent Intent) error {
