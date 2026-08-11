@@ -21,6 +21,7 @@ var ExitCodes = map[string]int{
 	"E_RECONCILE_REQUIRED": 4, "E_GIT_SCAN": 4, "E_INTERNAL": 4,
 	"E_JOURNAL_CORRUPT": 4,
 	"E_FINDING_INVALID": 2, "E_WAIVER_REASON_REQUIRED": 2, "E_QUERY_INVALID": 2,
+	"E_REQUIREMENT_INVALID": 2,
 	"E_IMPORT_INVALID": 2, "E_ARGUMENT_INVALID": 2,
 	"E_INDEX_UNEVALUATED": 3,
 	// Domain-operation failure codes. These already exited 1 via the default
@@ -116,40 +117,53 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 		}
 	}
 
-	rows, err := s.db.Query(`SELECT prefix, number, path, state FROM allocations WHERE project_id=?`, s.projectID)
+	rows, err := s.db.Query(`SELECT prefix, number, path, state, kind FROM allocations WHERE project_id=?`, s.projectID)
 	if err != nil {
 		return CheckReport{}, err
 	}
 	for rows.Next() {
 		var prefix string
 		var number int64
-		var path, state string
-		if err := rows.Scan(&prefix, &number, &path, &state); err != nil {
+		var path, state, kind string
+		if err := rows.Scan(&prefix, &number, &path, &state, &kind); err != nil {
 			_ = rows.Close()
 			return CheckReport{}, err
 		}
-		if state == "allocated" {
-			data, err := readRegularTicket(path)
-			if errors.Is(err, os.ErrNotExist) {
-				report.Dimensions["allocated-id-file"] = "fail"
-				report.Findings = append(report.Findings, CheckFinding{
-					Code: "E_ID_UNRESOLVED", Subject: fmt.Sprintf("%s-%d", prefix, number),
-					Message: "allocation has no materialised ticket file", Kind: "fail",
-				})
-			} else if err != nil {
-				if ErrorCode(err) != "E_CONFIG_INVALID" {
-					_ = rows.Close()
-					return CheckReport{}, err
-				}
-				report.Dimensions["allocated-id-file"] = "fail"
-				report.Findings = append(report.Findings, s.findingFromError(err, fmt.Sprintf("%s-%d", prefix, number)))
-			} else if ticket, _, parseErr := domain.ParseTicket(data); parseErr != nil || ticket.ID != fmt.Sprintf("%s-%d", prefix, number) {
-				report.Dimensions["allocated-id-file"] = "fail"
-				if parseErr == nil {
-					parseErr = fmt.Errorf("E_ID_UNRESOLVED: allocation file contains %s", ticket.ID)
-				}
-				report.Findings = append(report.Findings, s.findingFromError(parseErr, fmt.Sprintf("%s-%d", prefix, number)))
+		if state != "allocated" {
+			continue
+		}
+		id := fmt.Sprintf("%s-%d", prefix, number)
+		// An allocation is resolved by the entity file of its own kind: a
+		// requirement allocation must point at a materialised requirement file,
+		// not a ticket file. Verifying the wrong kind would falsely fail every
+		// crash-window requirement allocation.
+		if normaliseKind(kind) == kindRequirement {
+			if hardErr := s.checkAllocatedRequirementFile(&report, id, path); hardErr != nil {
+				_ = rows.Close()
+				return CheckReport{}, hardErr
 			}
+			continue
+		}
+		data, err := readRegularTicket(path)
+		if errors.Is(err, os.ErrNotExist) {
+			report.Dimensions["allocated-id-file"] = "fail"
+			report.Findings = append(report.Findings, CheckFinding{
+				Code: "E_ID_UNRESOLVED", Subject: id,
+				Message: "allocation has no materialised ticket file", Kind: "fail",
+			})
+		} else if err != nil {
+			if ErrorCode(err) != "E_CONFIG_INVALID" {
+				_ = rows.Close()
+				return CheckReport{}, err
+			}
+			report.Dimensions["allocated-id-file"] = "fail"
+			report.Findings = append(report.Findings, s.findingFromError(err, id))
+		} else if ticket, _, parseErr := domain.ParseTicket(data); parseErr != nil || ticket.ID != id {
+			report.Dimensions["allocated-id-file"] = "fail"
+			if parseErr == nil {
+				parseErr = fmt.Errorf("E_ID_UNRESOLVED: allocation file contains %s", ticket.ID)
+			}
+			report.Findings = append(report.Findings, s.findingFromError(parseErr, id))
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -259,6 +273,40 @@ func (s *Store) checkStaleIndex(report *CheckReport) error {
 func fileMissing(path string) bool {
 	_, err := os.Stat(path)
 	return errors.Is(err, os.ErrNotExist)
+}
+
+// checkAllocatedRequirementFile verifies that a crash-window requirement
+// allocation resolves to a materialised requirement file of the same ID. It
+// records fail findings on the report and returns a non-nil error only for a
+// genuine IO fault that must abort the check.
+func (s *Store) checkAllocatedRequirementFile(report *CheckReport, id, path string) error {
+	data, err := readRegularRequirement(path)
+	if errors.Is(err, os.ErrNotExist) {
+		report.Dimensions["allocated-id-file"] = "fail"
+		report.Findings = append(report.Findings, CheckFinding{
+			Code: "E_ID_UNRESOLVED", Subject: id,
+			Message: "allocation has no materialised requirement file", Kind: "fail",
+		})
+		return nil
+	}
+	if err != nil {
+		// A non-regular file (E_REQUIREMENT_INVALID) is a fail finding; a genuine
+		// IO error aborts the check.
+		if ErrorCode(err) != "E_REQUIREMENT_INVALID" {
+			return err
+		}
+		report.Dimensions["allocated-id-file"] = "fail"
+		report.Findings = append(report.Findings, s.findingFromError(err, id))
+		return nil
+	}
+	if requirement, parseErr := domain.ParseRequirement(data); parseErr != nil || requirement.ID != id {
+		report.Dimensions["allocated-id-file"] = "fail"
+		if parseErr == nil {
+			parseErr = fmt.Errorf("E_ID_UNRESOLVED: allocation file contains %s", requirement.ID)
+		}
+		report.Findings = append(report.Findings, s.findingFromError(parseErr, id))
+	}
+	return nil
 }
 
 func (s *Store) checkDuplicateIDs(ctx context.Context, report *CheckReport) error {

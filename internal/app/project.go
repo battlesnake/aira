@@ -24,8 +24,9 @@ type Config struct {
 }
 
 type ProjectConfig struct {
-	Slug     string   `json:"slug"`
-	Prefixes []string `json:"prefixes"`
+	Slug                string   `json:"slug"`
+	Prefixes            []string `json:"prefixes"`
+	RequirementPrefixes []string `json:"requirement_prefixes,omitempty"`
 }
 
 type LeaseConfig struct {
@@ -105,7 +106,8 @@ func Open(ctx context.Context, cwd string) (*store.Store, Project, error) {
 		RegistryPath: filepath.Join(project.StateDir, "registry.jsonl"),
 		ProjectID:    project.ProjectID, WorktreeID: project.WorktreeID,
 		ProjectSlug: project.Config.Project.Slug, Prefixes: project.Config.Project.Prefixes,
-		LeaseTTLNS: leaseTTLNS(project.Config),
+		RequirementPrefixes: project.Config.Project.RequirementPrefixes,
+		LeaseTTLNS:          leaseTTLNS(project.Config),
 	})
 	if err != nil {
 		return nil, Project{}, err
