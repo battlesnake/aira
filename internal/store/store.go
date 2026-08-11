@@ -1287,6 +1287,11 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		return err
 	}
 	defer unlockFile(findingLock)
+	requirementLock, err := s.acquireRequirementMutationLock()
+	if err != nil {
+		return err
+	}
+	defer unlockFile(requirementLock)
 	searchLock, err := s.acquireSearchLock()
 	if err != nil {
 		return err
@@ -1318,6 +1323,7 @@ func (s *Store) Rebuild(ctx context.Context) error {
 	}
 	var scanned []scannedTicket
 	var scannedFindings []scannedFinding
+	var scannedRequirements []scannedRequirement
 	for _, entry := range entries {
 		valid, reason, gitErr := validGitRoot(entry.Root)
 		if gitErr != nil {
@@ -1351,9 +1357,33 @@ func (s *Store) Rebuild(ctx context.Context) error {
 			}
 		}
 		scannedFindings = append(scannedFindings, findingScan.valid...)
+		requirementScan, err := scanRequirements(entry.Root, entry.WorktreeID)
+		if err != nil {
+			return err
+		}
+		for _, invalid := range requirementScan.invalid {
+			if err := s.recordScanFinding(ctx, entry, invalid); err != nil {
+				return err
+			}
+			// A malformed file still claims its ID: advance the high-water so the
+			// broken node's ID is never reallocated (mirrors the ticket scan).
+			if id, ok := ticketIDFromFilename(invalid.Subject); ok {
+				prefix, number := splitTicketID(id)
+				if int64(number) > maxima[prefix] {
+					maxima[prefix] = int64(number)
+				}
+			}
+		}
+		scannedRequirements = append(scannedRequirements, requirementScan.valid...)
 		scanned = append(scanned, tickets...)
 		for _, ticket := range tickets {
 			prefix, number := splitTicketID(ticket.Ticket.ID)
+			if int64(number) > maxima[prefix] {
+				maxima[prefix] = int64(number)
+			}
+		}
+		for _, req := range requirementScan.valid {
+			prefix, number := splitTicketID(req.Requirement.ID)
 			if int64(number) > maxima[prefix] {
 				maxima[prefix] = int64(number)
 			}
@@ -1386,6 +1416,12 @@ func (s *Store) Rebuild(ctx context.Context) error {
 			return err
 		}
 		if _, err := conn.ExecContext(ctx, `DELETE FROM search_fts WHERE project_id=?`, s.projectID); err != nil {
+			return err
+		}
+		// The requirement index is a disposable projection of the scanned
+		// requirement files; clear the project slice so a removed file's row
+		// cannot survive a rebuild.
+		if _, err := conn.ExecContext(ctx, `DELETE FROM requirements WHERE project_id=?`, s.projectID); err != nil {
 			return err
 		}
 		for _, entry := range entries {
@@ -1488,6 +1524,60 @@ func (s *Store) Rebuild(ctx context.Context) error {
 				if !receiptKeys[receiptKey(s.projectID, ticket.Ticket.ID, allocationSeq)] {
 					recovered = append(recovered, AllocationReceipt{ProjectID: s.projectID, WorktreeID: allocationWorktree,
 						ID: ticket.Ticket.ID, Path: allocationPath, Seq: allocationSeq, State: "recovered", Kind: normaliseKind(allocationKind)})
+				}
+			}
+			if allocationSeq > maxSeq {
+				maxSeq = allocationSeq
+			}
+		}
+		for _, req := range scannedRequirements {
+			prefix, number := splitTicketID(req.Requirement.ID)
+			if _, err := conn.ExecContext(ctx, `INSERT INTO requirements(project_id, worktree_id, id, path, digest, status, text)
+                    VALUES(?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(project_id, worktree_id, id) DO UPDATE SET path=excluded.path, digest=excluded.digest,
+                    status=excluded.status, text=excluded.text`,
+				s.projectID, req.WorktreeID, req.Requirement.ID, req.Path, req.Digest,
+				string(req.Requirement.Status), req.Requirement.Text); err != nil {
+				return err
+			}
+			var allocationSeq int64
+			var allocationWorktree, allocationPath, allocationState, allocationKind string
+			err := conn.QueryRowContext(ctx, `SELECT seq, worktree_id, path, state, kind FROM allocations WHERE project_id=? AND prefix=? AND number=?`,
+				s.projectID, prefix, number).Scan(&allocationSeq, &allocationWorktree, &allocationPath, &allocationState, &allocationKind)
+			if errors.Is(err, sql.ErrNoRows) {
+				// A scanned file lives under .aira/requirements/, so it is
+				// requirement-kind by path. Cross-validate before manufacturing a
+				// durable recovery: refuse a ticket-prefixed ID masquerading as a
+				// requirement file rather than poisoning the append-only journal.
+				reconciledKind, kindErr := s.reconcileAllocationKind(prefix, kindRequirement, req.Path)
+				if kindErr != nil {
+					return kindErr
+				}
+				allocationSeq, err = nextSequence(ctx, conn, s.projectID)
+				if err != nil {
+					return err
+				}
+				allocationWorktree, allocationPath, allocationState = req.WorktreeID, req.Path, "recovered"
+				if _, err := conn.ExecContext(ctx, `INSERT INTO allocations(project_id, prefix, number, worktree_id, state, path, seq, kind)
+                        VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, s.projectID, prefix, number, allocationWorktree, allocationState, allocationPath, allocationSeq, reconciledKind); err != nil {
+					return err
+				}
+				recovered = append(recovered, AllocationReceipt{ProjectID: s.projectID, WorktreeID: allocationWorktree,
+					ID: req.Requirement.ID, Path: allocationPath, Seq: allocationSeq, State: "recovered", Kind: reconciledKind})
+				if err := ensureRecoveredEvent(ctx, conn, req.Requirement.ID, req.WorktreeID, req.Path, allocationSeq, s.projectID, reconciledKind, journal); err != nil {
+					return err
+				}
+			} else if err != nil {
+				return err
+			} else {
+				// An allocation row already exists; a scanned requirement file for
+				// the same ID must not disagree with the recorded kind.
+				if _, kindErr := s.reconcileAllocationKind(prefix, normaliseKind(allocationKind), req.Path); kindErr != nil {
+					return kindErr
+				}
+				if !receiptKeys[receiptKey(s.projectID, req.Requirement.ID, allocationSeq)] {
+					recovered = append(recovered, AllocationReceipt{ProjectID: s.projectID, WorktreeID: allocationWorktree,
+						ID: req.Requirement.ID, Path: allocationPath, Seq: allocationSeq, State: "recovered", Kind: normaliseKind(allocationKind)})
 				}
 			}
 			if allocationSeq > maxSeq {

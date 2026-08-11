@@ -7,10 +7,73 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"aira/internal/domain"
 )
+
+// scannedRequirement is a valid requirement file discovered during a Rebuild
+// scan, mirroring scannedTicket/scannedFinding.
+type scannedRequirement struct {
+	WorktreeID  string
+	Root        string
+	Path        string
+	Requirement domain.Requirement
+	Digest      string
+}
+
+type requirementScanResult struct {
+	valid   []scannedRequirement
+	invalid []CheckFinding
+}
+
+// scanRequirements walks .aira/requirements/ and separates valid nodes from
+// malformed ones, mirroring scanFindingFiles. A malformed or unreadable file is
+// surfaced as a reconciliation finding and is NEVER added to the valid set, so it
+// cannot poison the requirement index or manufacture a receipt/allocation.
+func scanRequirements(root, worktree string) (requirementScanResult, error) {
+	dir := filepath.Join(root, ".aira", "requirements")
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return requirementScanResult{}, nil
+	}
+	if err != nil {
+		return requirementScanResult{}, err
+	}
+	result := requirementScanResult{}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, readErr := readRegularRequirement(path)
+		if readErr != nil {
+			result.invalid = append(result.invalid, CheckFinding{Code: "E_REQUIREMENT_INVALID", Subject: repoPath(root, path), Message: readErr.Error(), Kind: "unevaluated"})
+			continue
+		}
+		requirement, parseErr := domain.ParseRequirement(data)
+		if parseErr != nil || requirement.ID+".md" != entry.Name() {
+			message := "E_REQUIREMENT_INVALID: filename/frontmatter mismatch"
+			if parseErr != nil {
+				message = parseErr.Error()
+			}
+			result.invalid = append(result.invalid, CheckFinding{Code: "E_REQUIREMENT_INVALID", Subject: repoPath(root, path), Message: message, Kind: "unevaluated"})
+			continue
+		}
+		result.valid = append(result.valid, scannedRequirement{WorktreeID: worktree, Root: root, Path: path, Requirement: requirement, Digest: digestBytes(data)})
+	}
+	sort.Slice(result.valid, func(i, j int) bool {
+		pi, ni := splitTicketID(result.valid[i].Requirement.ID)
+		pj, nj := splitTicketID(result.valid[j].Requirement.ID)
+		if pi != pj {
+			return pi < pj
+		}
+		return ni < nj
+	})
+	sort.Slice(result.invalid, func(i, j int) bool { return result.invalid[i].Subject < result.invalid[j].Subject })
+	return result, nil
+}
 
 // RequirementRecord is a requirement plus its indexed git location.
 type RequirementRecord struct {
