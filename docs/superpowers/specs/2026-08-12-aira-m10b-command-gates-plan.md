@@ -71,6 +71,65 @@ overrides it only where it names a real seam.
    (gate_id/subject/verdict). Schema bump: gate `schema_version` → 2 for
    command-bearing fields (M10a stays valid at v1).
 
+## 1b. Sol plan-review resolutions (verdict BLOCK — all incorporated)
+
+Thread `019ff2a2`. These OVERRIDE the §1 decisions where they conflict; each gets
+a mandatory regression test.
+
+- **R1 (P0, overrides §1.1 timeout):** the timeout must NOT call `killScope`
+  directly — that bypasses durable `KillIntent` and the arbitration, and drops
+  `monitorScopeMembership` migration evidence. Factor ONE shared kill path used by
+  both `Kill()` and the timeout: publish durable kill intent FIRST → kill scope →
+  record `E_RUN_TIMEOUT` → merge monitor + capture evidence → commit via the
+  existing `appendTerminalLocked` CAS. A run that exited cleanly just before the
+  deadline keeps its clean-exit terminal (not rewritten to killed); a genuinely
+  timed-out run can never be read later as a clean success. Test: timeout-vs-exit
+  race yields exactly one terminal record with correct arbitration; a timed-out run
+  is `killed`+`E_RUN_TIMEOUT`, never `CleanSuccess()`.
+- **R2 (P0, overrides §1.2 env):** in Go, `cmd.Env == nil` means INHERIT. So
+  `ExplicitEnv` must set `cmd.Env` to a **non-nil** slice (empty slice for empty
+  env), built from the canonicalised/validated allow-listed `KEY=VALUE` set, and
+  the recorded `EnvDigest` must be over THAT exact child set (not
+  `effectiveEnvironment`, which includes inherited vars). The command evaluator
+  ALWAYS sets `ExplicitEnv=true`. Tests: empty allow-list → truly empty child env
+  (a probe var set in the parent is ABSENT in the child); digest = exact set;
+  an unlisted inherited var never reaches the child.
+- **R3 (P0, overrides §1.6 proof):** `DigestGate` binds only serialized
+  `GateDefinition` fields, and the effective `EnvDigest` is evaluation-time data
+  absent from proof validation → changing an allowed env VALUE would reuse an old
+  proof. Fix: (a) embed the **canonical command lane** (argv, cwd policy,
+  env-allow-list, timeout, cap, parser, predicate) as real serialized fields of the
+  definition so `DigestGate` binds them (not a free-form `Lane.ConfigDigest`); and
+  (b) record the run's effective `env_digest` in the result + proof-of-fire records,
+  and have `GateCheck` recompute the current allow-listed env digest **read-only**
+  (read the allow-list from the definition + the current values) and downgrade to
+  `U_GATE_PROOF_STALE` on mismatch. Test: editing an allowed env value or any lane
+  field invalidates a prior command-gate pass at `gate check`.
+- **R4 (P1, overrides §1.4 admissibility):** do NOT rely on `CleanSuccess()` alone —
+  it ignores `CaptureForcedClosed` and `OutputRefs` states (an evicted/partial
+  output could slip through) and it cannot distinguish a clean NON-zero exit (→
+  `fail`) from an unevaluable run. Add a dedicated admissibility predicate that
+  requires `CaptureForcedClosed==false` and every consumed `OutputRef.State ==
+  complete`, classifies exit==0 (candidate pass) vs clean exit!=0 (`fail`) vs
+  non-admissible (unevaluated), and makes `ReadOutput` reject `Truncated`/incomplete/
+  byte-count-mismatch BEFORE the parser runs. Tests: evicted/partial/forced-closed →
+  unevaluated; clean nonzero → `E_GATE_COMMAND_FAILED`.
+- **R5 (P1, overrides §1.5 mutation isolation):** `copyFixtureSeed` was written for
+  small fixture file-maps and rejects `.git`; it is unsuitable for a full subject
+  repo and must not tempt a caller-tree fallback. Specify a dedicated isolated
+  **subject snapshot**: materialise the tracked files (coherent `git ls-files`
+  snapshot, like M9c) into a temp dir, `git init` it, apply the typed mutation,
+  validate symlink/path escapes, and **hard-fail** (`U_GATE_MUTATION_APPLY_FAILED`)
+  if materialisation is unavailable — never run in the caller tree. Test: mutation
+  runs only in the snapshot; caller tree byte-for-byte unchanged; unavailable
+  materialisation → unevaluated, not pass.
+- **R6 (P1, parser completeness):** requiring package terminal events still permits
+  `run(TestX)` → package `pass` with no terminal event for `TestX` (count>0 but
+  `TestX` never terminated). Require EVERY discovered test/subtest to reach a valid
+  terminal action (`pass`/`fail`/`skip`) with balanced start→terminal transitions;
+  an unterminated discovered test → `U_GATE_PARSER_INCOMPLETE`. Test: that exact
+  case.
+
 ## 2. Build map
 
 - **`internal/runner/` (small M12 extension, its own adversarial care):**
