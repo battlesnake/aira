@@ -131,6 +131,7 @@ func Open(ctx context.Context, cwd string) (*store.Store, Project, error) {
 		_ = s.Close()
 		return nil, Project{}, err
 	}
+	s.SetRunner(execution)
 	project.Runner = execution
 	project.GateAudit, err = store.OpenGateAudit(project.CommonDir, false)
 	if err != nil {

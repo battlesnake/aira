@@ -128,7 +128,9 @@ func (s *Store) canaryFor(def gate.GateDefinition) (gate.CanaryDeclaration, erro
 		data, err := os.ReadFile(path)
 		if err == nil {
 			var declaration gate.CanaryDeclaration
-			if err := json.Unmarshal(data, &declaration); err != nil {
+			decoder := json.NewDecoder(bytes.NewReader(data))
+			decoder.DisallowUnknownFields()
+			if err := decoder.Decode(&declaration); err != nil {
 				return gate.CanaryDeclaration{}, fmt.Errorf("E_GATE_CANARY_INVALID: %w", err)
 			}
 			if err := gate.ValidateCanary(declaration); err != nil {

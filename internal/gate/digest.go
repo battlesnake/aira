@@ -17,6 +17,10 @@ func DigestFields(fields ...string) string {
 }
 
 func DigestGate(g GateDefinition) (string, error) {
+	if g.Command != nil {
+		command := g.Command.Normalized()
+		g.Command = &command
+	}
 	data, err := json.Marshal(g)
 	if err != nil {
 		return "", err

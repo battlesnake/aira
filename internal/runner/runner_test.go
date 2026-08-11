@@ -421,6 +421,126 @@ func TestRealCgroupIntegrationOrClearSkip(t *testing.T) {
 	}
 }
 
+func TestRealCgroupTimeoutUsesDurableKillAndKillsGrandchild(t *testing.T) {
+	r := realRunner(t)
+	record, err := r.Launch(context.Background(), Request{
+		Argv:    []string{"/bin/sh", "-c", "setsid sh -c 'sleep 30' & sleep 30"},
+		Timeout: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != StatusKilled || !containsString(record.ErrorCodes, "E_RUN_TIMEOUT") || record.CleanSuccess() {
+		t.Fatalf("timeout record=%+v", record)
+	}
+	if !record.KillIntent.Present || !record.KillIntent.Completed || !record.ScopeKill.Completed {
+		t.Fatalf("timeout did not retain durable kill evidence: %+v", record)
+	}
+	if got := terminalRecords(t, r); got != 1 {
+		t.Fatalf("terminal records=%d", got)
+	}
+}
+
+func TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration(t *testing.T) {
+	r := realRunner(t)
+	exited, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/sh", "-c", "printf ok"}, Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exited.Status != StatusExited || exited.CleanSuccess() && containsString(exited.ErrorCodes, "E_RUN_TIMEOUT") {
+		t.Fatalf("natural exit was rewritten by timeout: %+v", exited)
+	}
+	if got := terminalRecords(t, r); got != 1 {
+		t.Fatalf("natural terminal records=%d", got)
+	}
+
+	r = realRunner(t)
+	timedOut, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/sh", "-c", "sleep 30"}, Timeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if timedOut.Status != StatusKilled || !containsString(timedOut.ErrorCodes, "E_RUN_TIMEOUT") || timedOut.CleanSuccess() {
+		t.Fatalf("timeout arbitration record=%+v", timedOut)
+	}
+	if got := terminalRecords(t, r); got != 1 {
+		t.Fatalf("timeout terminal records=%d", got)
+	}
+
+	r = realRunner(t)
+	nearDeadline, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/sh", "-c", "sleep 0.04"}, Timeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	switch nearDeadline.Status {
+	case StatusExited:
+		if nearDeadline.ExitCode == nil || *nearDeadline.ExitCode != 0 || containsString(nearDeadline.ErrorCodes, "E_RUN_TIMEOUT") || !nearDeadline.CleanSuccess() {
+			t.Fatalf("near-deadline clean exit evidence=%+v", nearDeadline)
+		}
+	case StatusKilled:
+		if !containsString(nearDeadline.ErrorCodes, "E_RUN_TIMEOUT") || nearDeadline.CleanSuccess() || !nearDeadline.KillIntent.Present || !nearDeadline.KillIntent.Completed {
+			t.Fatalf("near-deadline timeout evidence=%+v", nearDeadline)
+		}
+	default:
+		t.Fatalf("near-deadline run did not arbitrate to a terminal state: %+v", nearDeadline)
+	}
+	if got := terminalRecords(t, r); got != 1 {
+		t.Fatalf("near-deadline terminal records=%d", got)
+	}
+}
+
+func TestRealCgroupExplicitEmptyEnvironmentIsExactAndDigested(t *testing.T) {
+	const probe = "AIRA_M10B_PARENT_ONLY"
+	if err := os.Setenv(probe, "must-not-leak"); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Unsetenv(probe)
+	r := realRunner(t)
+	record, err := r.Launch(context.Background(), Request{Argv: []string{"/usr/bin/env"}, ExplicitEnv: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != StatusExited || record.ExitCode == nil || *record.ExitCode != 0 {
+		t.Fatalf("explicit-env record=%+v", record)
+	}
+	data, err := os.ReadFile(record.OutputRefs["out"].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != 0 || strings.Contains(string(data), probe+"=") {
+		t.Fatalf("explicit empty environment leaked values: %q", data)
+	}
+	want, err := EnvDigest(nil)
+	if err != nil || record.EnvDigest != want {
+		t.Fatalf("env digest=%s want %s (err=%v)", record.EnvDigest, want, err)
+	}
+}
+
+func TestRealCgroupExplicitNonemptyEnvironmentIsCanonicalAndDigested(t *testing.T) {
+	r := realRunner(t)
+	record, err := r.Launch(context.Background(), Request{
+		Argv:        []string{"/usr/bin/env"},
+		Env:         []string{"Z_LAST=last", "A_FIRST=first"},
+		ExplicitEnv: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != StatusExited || record.ExitCode == nil || *record.ExitCode != 0 {
+		t.Fatalf("explicit-env record=%+v", record)
+	}
+	data, err := os.ReadFile(record.OutputRefs["out"].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "A_FIRST=first\nZ_LAST=last\n" {
+		t.Fatalf("explicit nonempty environment=%q", data)
+	}
+	want, err := EnvDigest([]EnvEntry{{Key: []byte("Z_LAST"), Value: []byte("last")}, {Key: []byte("A_FIRST"), Value: []byte("first")}})
+	if err != nil || record.EnvDigest != want {
+		t.Fatalf("env digest=%s want %s (err=%v)", record.EnvDigest, want, err)
+	}
+}
+
 func realRunner(t *testing.T) *Runner {
 	t.Helper()
 	r, err := New(Config{CommonDir: t.TempDir(), Grace: time.Second, TermGrace: 100 * time.Millisecond})
@@ -576,4 +696,13 @@ func TestCaptureCodeDistinguishesENOSPC(t *testing.T) {
 	if got := captureCode(syscall.ENOSPC); got != "E_RUN_OUTPUT_DISK_FULL" {
 		t.Fatal(got)
 	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

@@ -75,6 +75,32 @@ func effectiveEnvironment(overrides []string) ([]string, []EnvEntry, error) {
 	return result, entries, nil
 }
 
+func explicitEnvironment(values []string) ([]string, []EnvEntry, error) {
+	seen := make(map[string]struct{}, len(values))
+	keys := make([]string, 0, len(values))
+	parsed := make(map[string]string, len(values))
+	for _, item := range values {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok || key == "" || strings.ContainsRune(key, 0) || strings.ContainsRune(value, 0) {
+			return nil, nil, fmt.Errorf("E_RUN_ENV_INVALID: invalid explicit environment entry")
+		}
+		if _, exists := seen[key]; exists {
+			return nil, nil, fmt.Errorf("E_RUN_ENV_INVALID: duplicate explicit environment key %q", key)
+		}
+		seen[key] = struct{}{}
+		parsed[key] = value
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	env := make([]string, 0, len(keys))
+	entries := make([]EnvEntry, 0, len(keys))
+	for _, key := range keys {
+		env = append(env, key+"="+parsed[key])
+		entries = append(entries, EnvEntry{Key: []byte(key), Value: []byte(parsed[key])})
+	}
+	return env, entries, nil
+}
+
 func validatePrefix(prefix []string) ([]string, error) {
 	prefix = append([]string(nil), prefix...)
 	if len(prefix) == 0 {

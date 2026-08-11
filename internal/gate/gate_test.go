@@ -1,6 +1,7 @@
 package gate
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -25,7 +26,7 @@ func TestGateConstructorRejectsIllegalStates(t *testing.T) {
 		{"two payloads", func(g *GateDefinition) { g.Manual = &Manual{} }, "E_GATE_INVALID"},
 		{"no payload", func(g *GateDefinition) { g.Checkable = nil }, "E_GATE_INVALID"},
 		{"ratchet kind", func(g *GateDefinition) { g.Kind = Kind("ratchet") }, "E_GATE_KIND_INVALID"},
-		{"unknown checker", func(g *GateDefinition) { g.Lane.Checker = "command" }, "E_GATE_INVALID"},
+		{"unknown checker", func(g *GateDefinition) { g.Lane.Checker = "unknown" }, "E_GATE_INVALID"},
 		{"recursive gates dimension", func(g *GateDefinition) { g.Checkable.Dimension = "gates" }, "E_GATE_INVALID"},
 		{"recursive aggregate dimension", func(g *GateDefinition) { g.Checkable.Dimension = "check" }, "E_GATE_INVALID"},
 		{"bad id", func(g *GateDefinition) { g.ID = "Bad_gate" }, "E_GATE_INVALID"},
@@ -41,6 +42,167 @@ func TestGateConstructorRejectsIllegalStates(t *testing.T) {
 				t.Fatalf("error=%v, want %s", err, tt.want)
 			}
 		})
+	}
+}
+
+func validCommandGate() GateDefinition {
+	return GateDefinition{
+		SchemaVersion: 2, ID: "unit-command", Name: "Unit command", Kind: KindCheckable,
+		AppliesTo: AppliesTo{All: true}, Lane: Lane{Name: "local", Checker: string(CheckerCommand), EvaluatorVersion: "1"},
+		ProofPolicy: ProofPolicy{Mode: ProofRequired, MaxAgeSecs: 3600, RequireCurrentCanary: true},
+		CanaryIDs:   []string{"unit-command-canary"}, Command: &Command{Argv: []string{"/bin/true"}, Cwd: "root", EnvAllow: []string{"PATH"}, TimeoutMS: 1000, Predicate: CommandPredicateExitZero}, Enabled: true,
+	}
+}
+
+func TestCommandGateValidationAndCanonicalDefault(t *testing.T) {
+	g := validCommandGate()
+	if err := ValidateGate(g, g.ID+".json"); err != nil {
+		t.Fatal(err)
+	}
+	rendered, err := RenderGate(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseGate(rendered, g.ID+".json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Command == nil || parsed.Command.OutputCapBytes != DefaultOutputCapBytes {
+		t.Fatalf("parsed command=%#v", parsed.Command)
+	}
+	first, err := DigestGate(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.Command.OutputCapBytes = DefaultOutputCapBytes
+	second, err := DigestGate(g)
+	if err != nil || first != second {
+		t.Fatalf("default cap changed digest: %s/%s err=%v", first, second, err)
+	}
+}
+
+func TestCommandGateValidationRejectsUnsafeOrIncompleteFields(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*GateDefinition)
+	}{
+		{"empty argv", func(g *GateDefinition) { g.Command.Argv = nil }},
+		{"relative executable without path", func(g *GateDefinition) { g.Command.Argv = []string{"go"}; g.Command.EnvAllow = nil }},
+		{"bad cwd", func(g *GateDefinition) { g.Command.Cwd = "../outside" }},
+		{"bad env", func(g *GateDefinition) { g.Command.EnvAllow = []string{"BAD-NAME"} }},
+		{"unsorted env", func(g *GateDefinition) { g.Command.EnvAllow = []string{"PATH", "AIRA_TEST"} }},
+		{"bad cap", func(g *GateDefinition) { g.Command.OutputCapBytes = 100 }},
+		{"bad predicate", func(g *GateDefinition) { g.Command.Predicate = "anything" }},
+		{"tests green parser missing", func(g *GateDefinition) { g.Command.Predicate = CommandPredicateTestsGreen; g.Command.Parser = "" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := validCommandGate()
+			tt.edit(&g)
+			if err := ValidateGate(g, g.ID+".json"); err == nil {
+				t.Fatal("invalid command accepted")
+			}
+		})
+	}
+}
+
+func TestParseGoTestJSONRequiresEveryDiscoveredTestTerminal(t *testing.T) {
+	data := strings.Join([]string{
+		`{"Action":"start","Package":"example.test"}`,
+		`{"Action":"run","Package":"example.test","Test":"TestX"}`,
+		`{"Action":"pass","Package":"example.test"}`,
+		"",
+	}, "\n")
+	got, err := ParseGoTestJSONV1([]byte(data))
+	if err == nil || got.Complete || got.DiscoveredCount != 1 {
+		t.Fatalf("unterminated test result=%#v err=%v", got, err)
+	}
+}
+
+func TestParseGoTestJSONStrictEventsAndTestsGreenInputs(t *testing.T) {
+	valid := strings.Join([]string{
+		`{"Action":"start","Package":"example.test"}`,
+		`{"Action":"run","Package":"example.test","Test":"TestX"}`,
+		`{"Action":"pass","Package":"example.test","Test":"TestX","Elapsed":0.01}`,
+		`{"Action":"pass","Package":"example.test","Elapsed":0.01}`,
+		"",
+	}, "\n")
+	got, err := ParseGoTestJSONV1([]byte(valid))
+	if err != nil || !got.Complete || got.DiscoveredCount != 1 {
+		t.Fatalf("valid result=%#v err=%v", got, err)
+	}
+	for _, input := range []string{
+		strings.Replace(valid, `{"Action":"pass","Package":"example.test","Elapsed":0.01}`, `{"Action":"wat","Package":"example.test"}`, 1),
+		strings.TrimSuffix(valid, "\n"),
+		"\n" + valid,
+	} {
+		if parsed, err := ParseGoTestJSONV1([]byte(input)); err == nil || parsed.Complete {
+			t.Fatalf("invalid JSON stream accepted: %#v err=%v", parsed, err)
+		}
+	}
+}
+
+func TestParseGoTestJSONRecordsFailedTestAndPackageOutcomes(t *testing.T) {
+	data := strings.Join([]string{
+		`{"Action":"start","Package":"example.test"}`,
+		`{"Action":"run","Package":"example.test","Test":"TestX"}`,
+		`{"Action":"fail","Package":"example.test","Test":"TestX"}`,
+		`{"Action":"fail","Package":"example.test"}`,
+		"",
+	}, "\n")
+	got, err := ParseGoTestJSONV1([]byte(data))
+	if err != nil || !got.Complete || got.DiscoveredCount != 1 || got.FailedCount != 2 {
+		t.Fatalf("failed outcomes=%#v err=%v", got, err)
+	}
+
+	green := strings.Join([]string{
+		`{"Action":"start","Package":"example.test"}`,
+		`{"Action":"run","Package":"example.test","Test":"TestX"}`,
+		`{"Action":"pass","Package":"example.test","Test":"TestX"}`,
+		`{"Action":"pass","Package":"example.test"}`,
+		"",
+	}, "\n")
+	got, err = ParseGoTestJSONV1([]byte(green))
+	if err != nil || !got.Complete || got.DiscoveredCount != 1 || got.FailedCount != 0 {
+		t.Fatalf("green outcomes=%#v err=%v", got, err)
+	}
+
+	packageFailure := strings.Join([]string{
+		`{"Action":"start","Package":"example.test"}`,
+		`{"Action":"fail","Package":"example.test"}`,
+		"",
+	}, "\n")
+	got, err = ParseGoTestJSONV1([]byte(packageFailure))
+	if err != nil || !got.Complete || got.DiscoveredCount != 0 || got.FailedCount != 1 {
+		t.Fatalf("package failure=%#v err=%v", got, err)
+	}
+}
+
+func TestMutationSeedIsClosedAndRequiresFail(t *testing.T) {
+	base := CanaryDeclaration{SchemaVersion: 1, ID: "mutate", GateID: "unit-command", Mode: CanaryMutation, ExpectedGateResult: VerdictFail, LaneBinding: "local", Isolation: IsolationTempGit, Cadence: CadenceOnDemand,
+		Mutation: &MutationSeed{SchemaVersion: 1, Kind: "go-inject-failing-test", Seed: 9, PkgDir: ".", TestName: "TestInjected", ExpectedResult: VerdictFail}}
+	if err := ValidateCanary(base); err != nil {
+		t.Fatal(err)
+	}
+	for _, edit := range []func(*CanaryDeclaration){
+		func(c *CanaryDeclaration) { c.Mode = CanaryMode("arbitrary") },
+		func(c *CanaryDeclaration) { c.Mutation.Kind = "patch" },
+		func(c *CanaryDeclaration) { c.Mutation.ExpectedResult = VerdictPass },
+	} {
+		copy := base
+		mutation := *base.Mutation
+		copy.Mutation = &mutation
+		edit(&copy)
+		if err := ValidateCanary(copy); err == nil {
+			t.Fatal("invalid mutation accepted")
+		}
+	}
+	data, err := json.Marshal(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "patch") {
+		t.Fatal("unexpected patch field")
 	}
 }
 

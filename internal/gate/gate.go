@@ -12,7 +12,7 @@ import (
 	"strings"
 )
 
-const CurrentSchemaVersion = 1
+const CurrentSchemaVersion = 2
 
 type Kind string
 
@@ -41,6 +41,7 @@ type GateDefinition struct {
 	CanaryIDs       []string    `json:"canary_ids"`
 	Checkable       *Checkable  `json:"checkable,omitempty"`
 	Manual          *Manual     `json:"manual,omitempty"`
+	Command         *Command    `json:"command,omitempty"`
 	Enabled         bool        `json:"enabled"`
 	Advisory        bool        `json:"advisory"`
 	AdvisoryInReady bool        `json:"advisory_in_ready"`
@@ -86,7 +87,7 @@ var slugPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`)
 func (g GateDefinition) Validate(filename string) error { return ValidateGate(g, filename) }
 
 func ValidateGate(g GateDefinition, filename string) error {
-	if g.SchemaVersion != CurrentSchemaVersion {
+	if g.SchemaVersion != 1 && g.SchemaVersion != CurrentSchemaVersion {
 		return fmt.Errorf("E_GATE_INVALID: unsupported schema_version %d", g.SchemaVersion)
 	}
 	if !slugPattern.MatchString(g.ID) {
@@ -107,7 +108,7 @@ func ValidateGate(g GateDefinition, filename string) error {
 	if g.Lane.Name == "" || g.Lane.Checker == "" {
 		return errors.New("E_GATE_INVALID: lane name and checker are required")
 	}
-	if g.Lane.Checker != string(CheckerDimension) && g.Lane.Checker != string(CheckerManual) {
+	if g.Lane.Checker != string(CheckerDimension) && g.Lane.Checker != string(CheckerManual) && g.Lane.Checker != string(CheckerCommand) {
 		return fmt.Errorf("E_GATE_INVALID: unknown checker %q", g.Lane.Checker)
 	}
 	if g.ProofPolicy.Mode != ProofRequired || g.ProofPolicy.MaxAgeSecs < 0 {
@@ -119,10 +120,20 @@ func ValidateGate(g GateDefinition, filename string) error {
 	if hasDuplicate(g.CanaryIDs) {
 		return errors.New("E_GATE_CANARY_INVALID: duplicate canary id")
 	}
-	if (g.Checkable == nil) == (g.Manual == nil) {
+	payloads := 0
+	if g.Checkable != nil {
+		payloads++
+	}
+	if g.Manual != nil {
+		payloads++
+	}
+	if g.Command != nil {
+		payloads++
+	}
+	if payloads != 1 {
 		return errors.New("E_GATE_INVALID: exactly one kind payload is required")
 	}
-	if g.Kind == KindCheckable && g.Checkable == nil {
+	if g.Kind == KindCheckable && g.Checkable == nil && g.Command == nil {
 		return errors.New("E_GATE_INVALID: checkable payload is required")
 	}
 	if g.Kind == KindManual && g.Manual == nil {
@@ -141,6 +152,19 @@ func ValidateGate(g GateDefinition, filename string) error {
 	}
 	if g.Manual != nil && g.Lane.Checker != string(CheckerManual) {
 		return errors.New("E_GATE_INVALID: manual gates require manual-attestation checker")
+	}
+	if g.Command != nil {
+		if g.SchemaVersion < 2 {
+			return errors.New("E_GATE_INVALID: command gates require schema_version 2")
+		}
+		if g.Kind != KindCheckable || g.Lane.Checker != string(CheckerCommand) {
+			return errors.New("E_GATE_INVALID: command payload requires a command checkable gate")
+		}
+		if err := g.Command.Validate(); err != nil {
+			return err
+		}
+	} else if g.Lane.Checker == string(CheckerCommand) {
+		return errors.New("E_GATE_INVALID: command checker requires command payload")
 	}
 	return nil
 }
@@ -186,6 +210,10 @@ func hasDuplicate(values []string) bool {
 
 // RenderGate writes the stable JSON-in-frontmatter representation.
 func RenderGate(g GateDefinition) ([]byte, error) {
+	if g.Command != nil {
+		command := g.Command.Normalized()
+		g.Command = &command
+	}
 	if err := ValidateGate(g, g.ID+".json"); err != nil {
 		return nil, err
 	}
@@ -211,6 +239,10 @@ func ParseGate(data []byte, filename string) (GateDefinition, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&g); err != nil {
 		return GateDefinition{}, fmt.Errorf("E_GATE_INVALID: %w", err)
+	}
+	if g.Command != nil {
+		command := g.Command.Normalized()
+		g.Command = &command
 	}
 	if err := ValidateGate(g, filename); err != nil {
 		return GateDefinition{}, err

@@ -104,16 +104,18 @@ type EnvEntry struct {
 }
 
 type Request struct {
-	Argv       []string
-	Cwd        string
-	Env        []string // exact KEY=VALUE overrides; inherited environment is retained
-	Prefix     []string
-	Merge      bool
-	StdinPath  string // empty means null stdin; "-" means the caller's stdin
-	Stdin      io.Reader
-	StoreStdin bool
-	Grace      time.Duration
-	TermGrace  time.Duration
+	Argv        []string
+	Cwd         string
+	Env         []string // exact KEY=VALUE overrides; inherited environment is retained
+	Timeout     time.Duration
+	ExplicitEnv bool // when true, Env is the complete child environment
+	Prefix      []string
+	Merge       bool
+	StdinPath   string // empty means null stdin; "-" means the caller's stdin
+	Stdin       io.Reader
+	StoreStdin  bool
+	Grace       time.Duration
+	TermGrace   time.Duration
 }
 
 // OutputRequest describes one bounded, cursor-based read from a captured

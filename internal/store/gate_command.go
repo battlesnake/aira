@@ -1,0 +1,474 @@
+package store
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"go/ast"
+	"go/format"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"aira/internal/gate"
+	"aira/internal/runner"
+)
+
+type trackedSnapshotFile struct {
+	path string
+	data []byte
+	mode os.FileMode
+}
+
+func (s *Store) evaluateChecker(ctx context.Context, def gate.GateDefinition, root string) (DimensionEvaluation, error) {
+	switch def.Lane.Checker {
+	case string(gate.CheckerDimension):
+		if def.Checkable == nil {
+			return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_EVIDENCE_UNAVAILABLE"}, errors.New("U_GATE_EVIDENCE_UNAVAILABLE: checkable payload is missing")
+		}
+		return EvaluateDimension(root, def.Checkable.Dimension)
+	case string(gate.CheckerCommand):
+		return s.runCommandChecker(ctx, def, root)
+	default:
+		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_COMMAND_RUN_UNEVALUATED"}, fmt.Errorf("E_GATE_INVALID: unsupported checker %q", def.Lane.Checker)
+	}
+}
+
+func (s *Store) runCommandChecker(ctx context.Context, def gate.GateDefinition, sourceRoot string) (DimensionEvaluation, error) {
+	if def.Command == nil {
+		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_COMMAND_RUN_UNEVALUATED"}, errors.New("U_GATE_COMMAND_RUN_UNEVALUATED: command payload is missing")
+	}
+	if s.runner == nil {
+		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_COMMAND_RUN_UNEVALUATED"}, errors.New("U_GATE_COMMAND_RUN_UNEVALUATED: runner is unavailable")
+	}
+	command := def.Command.Normalized()
+	if err := command.Validate(); err != nil {
+		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_COMMAND_RUN_UNEVALUATED"}, err
+	}
+	snapshot, cleanup, err := materializeTrackedSnapshot(sourceRoot)
+	if err != nil {
+		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_COMMAND_RUN_UNEVALUATED"}, fmt.Errorf("U_GATE_COMMAND_RUN_UNEVALUATED: materialize subject: %w", err)
+	}
+	defer cleanup()
+	rootDigest, err := digestTrackedRoot(snapshot)
+	if err != nil {
+		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_COMMAND_RUN_UNEVALUATED", Root: EvaluationRoot{Path: snapshot}}, err
+	}
+	cwd, err := resolveCommandCwd(snapshot, command.Cwd)
+	if err != nil {
+		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_COMMAND_RUN_UNEVALUATED", Root: EvaluationRoot{Path: snapshot, Digest: rootDigest}}, err
+	}
+	env, entries, err := allowListedEnvironment(command.EnvAllow)
+	if err != nil {
+		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_COMMAND_RUN_UNEVALUATED", Root: EvaluationRoot{Path: snapshot, Digest: rootDigest}}, err
+	}
+	envDigest, err := runner.EnvDigest(entries)
+	if err != nil {
+		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_COMMAND_RUN_UNEVALUATED", Root: EvaluationRoot{Path: snapshot, Digest: rootDigest}}, err
+	}
+	record, launchErr := s.runner.Launch(ctx, runner.Request{Argv: command.Argv, Cwd: cwd, Env: env, ExplicitEnv: true, Timeout: time.Duration(command.TimeoutMS) * time.Millisecond})
+	base := DimensionEvaluation{Root: EvaluationRoot{Path: snapshot, Digest: rootDigest}}
+	if launchErr != nil || record == nil {
+		base.Predicate, base.Evidence, base.Code = gate.PredicateUnevaluated, false, "U_GATE_COMMAND_RUN_UNEVALUATED"
+		if record != nil {
+			base.RunID = record.ID
+		}
+		return base, fmt.Errorf("%s: %w", base.Code, launchErr)
+	}
+	base.RunID = record.ID
+	authoritativeEnvDigest, err := commandEnvDigestForRecord(envDigest, *record)
+	if err != nil {
+		base.Predicate, base.Evidence, base.Code = gate.PredicateUnevaluated, false, "U_GATE_COMMAND_RUN_UNEVALUATED"
+		return base, fmt.Errorf("%s: %w", base.Code, err)
+	}
+	base.EnvDigest = authoritativeEnvDigest
+	if hasRunnerCode(record, "E_RUN_TIMEOUT") {
+		base.Predicate, base.Evidence, base.Code = gate.PredicateUnevaluated, false, "U_GATE_COMMAND_TIMEOUT"
+		return base, nil
+	}
+	admissible, cleanExit, reason := admissibleCommandRun(*record)
+	if !admissible {
+		base.Predicate, base.Evidence, base.Code = gate.PredicateUnevaluated, false, "U_GATE_COMMAND_RUN_UNEVALUATED"
+		if reason != "" {
+			base.Code = reason
+		}
+		return base, nil
+	}
+	if hasRunnerCodeExcept(record, "E_RUN_FAILED") {
+		base.Predicate, base.Evidence, base.Code = gate.PredicateUnevaluated, false, "U_GATE_COMMAND_RUN_UNEVALUATED"
+		return base, nil
+	}
+	out, err := readCompleteOutput(ctx, s.runner, *record, "out")
+	if err != nil {
+		base.Predicate, base.Evidence, base.Code = gate.PredicateUnevaluated, false, "U_GATE_COMMAND_RUN_UNEVALUATED"
+		return base, err
+	}
+	stderr, err := readCompleteOutput(ctx, s.runner, *record, "err")
+	if err != nil {
+		base.Predicate, base.Evidence, base.Code = gate.PredicateUnevaluated, false, "U_GATE_COMMAND_RUN_UNEVALUATED"
+		return base, err
+	}
+	if int64(len(out))+int64(len(stderr)) > command.OutputCapBytes {
+		base.Predicate, base.Evidence, base.Code = gate.PredicateUnevaluated, false, "U_GATE_OUTPUT_OVERFLOW"
+		return base, nil
+	}
+	if command.Predicate == gate.CommandPredicateTestsGreen {
+		predicate, code := classifyTestsGreen(cleanExit, out)
+		if code != "" {
+			base.Predicate, base.Evidence, base.Code = predicate, predicate != gate.PredicateUnevaluated, code
+			return base, nil
+		}
+	}
+	if !cleanExit {
+		base.Predicate, base.Evidence, base.Code = gate.PredicateFail, true, "E_GATE_COMMAND_FAILED"
+		return base, nil
+	}
+	base.Predicate, base.Evidence = gate.PredicatePass, true
+	return base, nil
+}
+
+func commandEnvDigestForRecord(constructed string, record runner.RunRecord) (string, error) {
+	if record.EnvDigest != constructed {
+		return "", fmt.Errorf("runner env digest %q differs from constructed child environment %q", record.EnvDigest, constructed)
+	}
+	return record.EnvDigest, nil
+}
+
+func classifyTestsGreen(cleanExit bool, output []byte) (gate.PredicateState, string) {
+	if !cleanExit {
+		return gate.PredicateFail, "E_GATE_COMMAND_FAILED"
+	}
+	parsed, parseErr := gate.ParseGoTestJSONV1(output)
+	if parseErr != nil {
+		return gate.PredicateUnevaluated, "U_GATE_PARSER_INCOMPLETE"
+	}
+	if parsed.FailedCount != 0 {
+		return gate.PredicateFail, "E_GATE_COMMAND_FAILED"
+	}
+	if parsed.DiscoveredCount == 0 {
+		return gate.PredicateUnevaluated, "U_GATE_PARSER_INCOMPLETE"
+	}
+	return gate.PredicatePass, ""
+}
+
+func allowListedEnvironment(names []string) ([]string, []runner.EnvEntry, error) {
+	values := make([]string, 0, len(names))
+	entries := make([]runner.EnvEntry, 0, len(names))
+	for _, name := range names {
+		if value, ok := os.LookupEnv(name); ok {
+			values = append(values, name+"="+value)
+			entries = append(entries, runner.EnvEntry{Key: []byte(name), Value: []byte(value)})
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool { return string(entries[i].Key) < string(entries[j].Key) })
+	sort.Strings(values)
+	return values, entries, nil
+}
+
+func currentCommandEnvDigest(command gate.Command) (string, error) {
+	if err := command.Validate(); err != nil {
+		return "", err
+	}
+	_, entries, err := allowListedEnvironment(command.EnvAllow)
+	if err != nil {
+		return "", err
+	}
+	return runner.EnvDigest(entries)
+}
+
+func resolveCommandCwd(root, cwd string) (string, error) {
+	path := root
+	if cwd != "root" {
+		path = filepath.Join(root, filepath.FromSlash(cwd))
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("U_GATE_COMMAND_RUN_UNEVALUATED: evaluation root: %w", err)
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("E_GATE_INVALID: command cwd: %w", err)
+	}
+	rel, err := filepath.Rel(resolvedRoot, resolved)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", errors.New("E_GATE_INVALID: command cwd escapes evaluation root")
+	}
+	info, err := os.Stat(resolved)
+	if err != nil || !info.IsDir() {
+		return "", errors.New("E_GATE_INVALID: command cwd is not a directory")
+	}
+	return resolved, nil
+}
+
+func allOutputsComplete(record runner.RunRecord) bool {
+	if len(record.OutputRefs) == 0 {
+		return false
+	}
+	for _, ref := range record.OutputRefs {
+		if ref.State != runner.OutputComplete || ref.Path == "" || ref.Bytes < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// admissibleCommandRun deliberately does not delegate to CleanSuccess: command
+// gates also consume each output reference and must reject forced capture
+// closure before any parser sees bytes.
+func admissibleCommandRun(record runner.RunRecord) (admissible, cleanExit bool, reason string) {
+	if record.CaptureForcedClosed || record.Status != runner.StatusExited || record.ExitCode == nil || record.ScopeIntegrity != runner.ScopeContained || !record.CaptureComplete || !record.TerminalComplete || !allOutputsComplete(record) {
+		return false, false, "U_GATE_COMMAND_RUN_UNEVALUATED"
+	}
+	for _, code := range record.ErrorCodes {
+		if code != "E_RUN_FAILED" {
+			return false, false, "U_GATE_COMMAND_RUN_UNEVALUATED"
+		}
+	}
+	return true, *record.ExitCode == 0, ""
+}
+
+func readCompleteOutput(ctx context.Context, execution *runner.Runner, record runner.RunRecord, stream string) ([]byte, error) {
+	ref, ok := record.OutputRefs[stream]
+	if !ok || ref.State != runner.OutputComplete {
+		return nil, errors.New("U_GATE_COMMAND_RUN_UNEVALUATED: output is incomplete")
+	}
+	chunk, err := execution.ReadOutput(ctx, runner.OutputRequest{RunID: record.ID, Stream: stream, Full: true})
+	if err != nil || chunk == nil || chunk.Truncated || !chunk.Complete || chunk.OutputState != runner.OutputComplete || chunk.TotalBytes != ref.Bytes || chunk.NextOffset != ref.Bytes {
+		if err == nil {
+			err = errors.New("output byte count or completion evidence did not match")
+		}
+		return nil, fmt.Errorf("U_GATE_COMMAND_RUN_UNEVALUATED: %w", err)
+	}
+	return chunk.Bytes, nil
+}
+
+func hasRunnerCode(record *runner.RunRecord, code string) bool {
+	for _, existing := range record.ErrorCodes {
+		if existing == code {
+			return true
+		}
+	}
+	return false
+}
+
+func hasRunnerCodeExcept(record *runner.RunRecord, allowed string) bool {
+	for _, code := range record.ErrorCodes {
+		if code != allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func materializeTrackedSnapshot(sourceRoot string) (string, func(), error) {
+	paths, err := trackedSnapshotPaths(sourceRoot)
+	if err != nil {
+		return "", func() {}, err
+	}
+	first, err := readTrackedSnapshot(sourceRoot, paths)
+	if err != nil {
+		return "", func() {}, err
+	}
+	second, err := readTrackedSnapshot(sourceRoot, paths)
+	if err != nil || len(first) != len(second) {
+		return "", func() {}, errors.New("tracked snapshot changed during materialisation")
+	}
+	for i := range first {
+		if first[i].path != second[i].path || first[i].mode.Perm() != second[i].mode.Perm() || !bytes.Equal(first[i].data, second[i].data) {
+			return "", func() {}, errors.New("tracked snapshot changed during materialisation")
+		}
+	}
+	dir, err := os.MkdirTemp("", "aira-gate-subject-")
+	if err != nil {
+		return "", func() {}, err
+	}
+	cleanup := func() { _ = os.RemoveAll(dir) }
+	for _, file := range first {
+		path := filepath.Join(dir, filepath.FromSlash(file.path))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			cleanup()
+			return "", func() {}, err
+		}
+		if err := os.WriteFile(path, file.data, file.mode.Perm()); err != nil {
+			cleanup()
+			return "", func() {}, err
+		}
+		if err := os.Chmod(path, file.mode.Perm()); err != nil {
+			cleanup()
+			return "", func() {}, err
+		}
+	}
+	if _, stderr, err := runGit(dir, "init", "-q"); err != nil {
+		cleanup()
+		return "", func() {}, fmt.Errorf("git init: %w: %s", err, strings.TrimSpace(stderr))
+	}
+	if _, stderr, err := runGit(dir, "add", "-A"); err != nil {
+		cleanup()
+		return "", func() {}, fmt.Errorf("git add: %w: %s", err, strings.TrimSpace(stderr))
+	}
+	return dir, cleanup, nil
+}
+
+func trackedSnapshotPaths(root string) ([]string, error) {
+	out, stderr, err := runGit(root, "ls-files", "-z", "--cached", "--")
+	if err != nil {
+		return nil, fmt.Errorf("git ls-files: %w: %s", err, strings.TrimSpace(stderr))
+	}
+	paths := make([]string, 0)
+	for _, raw := range bytes.Split([]byte(out), []byte{0}) {
+		path := filepath.ToSlash(string(raw))
+		if path == "" {
+			continue
+		}
+		if !safeSnapshotPath(path) {
+			return nil, fmt.Errorf("invalid tracked path %q", path)
+		}
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func readTrackedSnapshot(root string, paths []string) ([]trackedSnapshotFile, error) {
+	files := make([]trackedSnapshotFile, 0, len(paths))
+	for _, path := range paths {
+		absolute := filepath.Join(root, filepath.FromSlash(path))
+		info, err := os.Lstat(absolute)
+		if err != nil || !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("tracked path %s is unavailable or not regular", path)
+		}
+		data, err := os.ReadFile(absolute)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, trackedSnapshotFile{path: path, data: data, mode: info.Mode()})
+	}
+	return files, nil
+}
+
+func safeSnapshotPath(path string) bool {
+	clean := filepath.ToSlash(filepath.Clean(filepath.FromSlash(path)))
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") || filepath.IsAbs(filepath.FromSlash(path)) {
+		return false
+	}
+	for _, part := range strings.Split(clean, "/") {
+		if part == ".git" || part == ".." || part == "." || part == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func digestTrackedRoot(root string) (string, error) {
+	paths, err := trackedSnapshotPaths(root)
+	if err != nil {
+		return "", err
+	}
+	files, err := readTrackedSnapshot(root, paths)
+	if err != nil {
+		return "", err
+	}
+	return digestSnapshotFiles(files), nil
+}
+
+func digestSnapshotFiles(files []trackedSnapshotFile) string {
+	var data bytes.Buffer
+	for _, file := range files {
+		data.WriteString(file.path)
+		data.WriteByte(0)
+		data.Write(file.data)
+		data.WriteByte(0)
+	}
+	return sha256Hex(data.Bytes())
+}
+
+func sha256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func applyMutation(root string, mutation gate.MutationSeed) error {
+	switch mutation.Kind {
+	case "go-inject-failing-test":
+		return injectFailingTest(root, mutation)
+	case "go-negate-assertion":
+		return negateAssertion(root, mutation)
+	default:
+		return errors.New("unsupported mutation kind")
+	}
+}
+
+func injectFailingTest(root string, mutation gate.MutationSeed) error {
+	packageDir := filepath.Join(root, filepath.FromSlash(mutation.PkgDir))
+	entries, err := os.ReadDir(packageDir)
+	if err != nil {
+		return err
+	}
+	packageName := ""
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || entry.Name() == "aira_m10b_mutation_test.go" {
+			continue
+		}
+		file, parseErr := parser.ParseFile(token.NewFileSet(), filepath.Join(packageDir, entry.Name()), nil, 0)
+		if parseErr == nil {
+			packageName = file.Name.Name
+			break
+		}
+	}
+	if packageName == "" {
+		return errors.New("package source is unavailable")
+	}
+	path := filepath.Join(packageDir, "aira_m10b_mutation_test.go")
+	content := fmt.Sprintf("package %s\n\nimport \"testing\"\n\nfunc %s(t *testing.T) {\n\tt.Fatal(\"AIRA mutation\")\n}\n", packageName, mutation.TestName)
+	return os.WriteFile(path, []byte(content), 0o644)
+}
+
+func negateAssertion(root string, mutation gate.MutationSeed) error {
+	path := filepath.Join(root, filepath.FromSlash(mutation.File))
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return errors.New("mutation file is unavailable")
+	}
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
+	if err != nil {
+		return err
+	}
+	var target *ast.FuncDecl
+	for _, declaration := range file.Decls {
+		if function, ok := declaration.(*ast.FuncDecl); ok && function.Name.Name == mutation.Test {
+			target = function
+			break
+		}
+	}
+	if target == nil || target.Body == nil {
+		return errors.New("mutation test function is unavailable")
+	}
+	occurrence := 0
+	var selected *ast.IfStmt
+	ast.Inspect(target.Body, func(node ast.Node) bool {
+		if statement, ok := node.(*ast.IfStmt); ok {
+			occurrence++
+			if occurrence == mutation.Occurrence {
+				selected = statement
+				return false
+			}
+		}
+		return selected == nil
+	})
+	if selected == nil {
+		return errors.New("assertion occurrence is unavailable")
+	}
+	selected.Cond = &ast.UnaryExpr{OpPos: selected.Cond.Pos(), Op: token.NOT, X: selected.Cond}
+	var output bytes.Buffer
+	if err := format.Node(&output, fset, file); err != nil {
+		return err
+	}
+	return os.WriteFile(path, output.Bytes(), info.Mode().Perm())
+}

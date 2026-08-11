@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"aira/internal/domain"
+	"aira/internal/runner"
 	"golang.org/x/sys/unix"
 	_ "modernc.org/sqlite"
 )
@@ -63,6 +64,7 @@ type Store struct {
 	leaseStateDir string
 	leaseTTLNS    uint64
 	clock         Clock
+	runner        *runner.Runner
 	// beforeMaterialise is intentionally nil in production; tests use it to
 	// observe the receipt-before-file ordering at the crash boundary.
 	beforeMaterialise func(Intent) error
@@ -252,6 +254,10 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+// SetRunner attaches the only process-execution seam used by command gates.
+// The store never falls back to os/exec for gate commands.
+func (s *Store) SetRunner(execution *runner.Runner) { s.runner = execution }
 
 func (s *Store) initDB(ctx context.Context) error {
 	statements := []string{

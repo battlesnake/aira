@@ -155,6 +155,27 @@ func TestRunDelimiterKeepsChildOptionTokensVerbatim(t *testing.T) {
 	}
 }
 
+func TestGateCommandFieldsReachCoreRequest(t *testing.T) {
+	positional, options, err := parseArgs("gate", []string{"add", "unit-tests", "--checker", "command", "--predicate", "tests-green", "--argv", "/bin/go", "--argv", "test", "--argv", "--literal,comma", "--cwd", "root", "--env-allow", "PATH", "--timeout-ms", "1000", "--output-cap-bytes", "4096", "--parser", "go-test-json-v1", "--mutation-kind", "go-inject-failing-test", "--mutation-pkgdir", ".", "--mutation-testname", "TestInjected"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := buildRequest("gate", positional, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Args["checker"] != "command" || request.Args["predicate"] != "tests-green" || request.Args["cwd"] != "root" || request.Args["parser"] != "go-test-json-v1" {
+		t.Fatalf("request=%#v", request)
+	}
+	argv, ok := request.Args["argv"].([]string)
+	if !ok || len(argv) != 3 || argv[2] != "--literal,comma" {
+		t.Fatalf("argv=%#v", request.Args["argv"])
+	}
+	if got := request.Args["env_allow"].([]string); len(got) != 1 || got[0] != "PATH" {
+		t.Fatalf("env_allow=%#v", request.Args["env_allow"])
+	}
+}
+
 func TestCLIRunRealCgroupOrClearSkip(t *testing.T) {
 	dir := t.TempDir()
 	if err := exec.Command("git", "init", dir).Run(); err != nil {

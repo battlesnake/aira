@@ -126,7 +126,8 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 			options[name] = "true"
 			continue
 		}
-		if i+1 >= len(argv) || strings.HasPrefix(argv[i+1], "--") {
+		gateListValue := verb == "gate" && (name == "argv" || name == "env-allow")
+		if i+1 >= len(argv) || (strings.HasPrefix(argv[i+1], "--") && !gateListValue) {
 			if verb == "run-log" {
 				return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: option --%s requires a value", name)
 			}
@@ -148,6 +149,8 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 				options["fields"] += ","
 			}
 			options["fields"] += argv[i]
+		} else if name == "argv" || name == "env-allow" {
+			options[name] = appendDelimited(options[name], argv[i])
 		} else {
 			options[name] = argv[i]
 		}
@@ -169,7 +172,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"req":      {"status": true, "fields": true},
 		"run-kill": {},
 		"run-log":  {"stream": true, "from": true, "tail": true, "follow": true, "full": true},
-		"gate":     {"gate_id": true, "canary_id": true, "verdict": true, "actor": true},
+		"gate":     {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-seed": true, "mutation-expected-result": true},
 	}
 	for name := range options {
 		if !allowed[verb][name] {
@@ -492,6 +495,17 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			args["canary_id"] = positional[1]
 		default:
 			return core.Request{}, fmt.Errorf("unknown gate operation %q", args["subverb"])
+		}
+		for option, argument := range map[string]string{"checker": "checker", "predicate": "predicate", "cwd": "cwd", "timeout-ms": "timeout_ms", "output-cap-bytes": "output_cap_bytes", "parser": "parser", "mutation-kind": "mutation_kind", "mutation-file": "mutation_file", "mutation-test": "mutation_test", "mutation-occurrence": "mutation_occurrence", "mutation-pkgdir": "mutation_pkgdir", "mutation-testname": "mutation_testname", "mutation-seed": "mutation_seed", "mutation-expected-result": "mutation_expected_result"} {
+			if value := options[option]; value != "" {
+				args[argument] = value
+			}
+		}
+		if value := options["argv"]; value != "" {
+			args["argv"] = splitOptionList(value)
+		}
+		if value := options["env-allow"]; value != "" {
+			args["env_allow"] = splitOptionList(value)
 		}
 	default:
 		return core.Request{}, fmt.Errorf("E_UNKNOWN_VERB: unknown verb %q", verb)

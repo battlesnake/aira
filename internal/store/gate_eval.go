@@ -26,6 +26,9 @@ type DimensionEvaluation struct {
 	Findings  []CheckFinding
 	Evidence  bool
 	Root      EvaluationRoot
+	Code      string
+	EnvDigest string
+	RunID     string
 }
 
 func gateResultFields(def gate.GateDefinition, definitionDigest, declarationDigest, subjectScope, canaryTreeDigest, proofSeq string) map[string]string {
@@ -43,7 +46,11 @@ func gateResultFields(def gate.GateDefinition, definitionDigest, declarationDige
 func appendCanaryUnevaluated(audit *GateAudit, def gate.GateDefinition, definitionDigest, declarationDigest, subject string, runErr error) (GateAuditRecord, error) {
 	fields := gateResultFields(def, definitionDigest, declarationDigest, subject, "", "")
 	fields["gate_id"], fields["subject"] = def.ID, subject
-	fields["verdict"], fields["code"], fields["trusted"], fields["suspect"] = gate.VerdictUnevaluated, "U_GATE_CANARY_UNEVALUATED", "false", "true"
+	code := "U_GATE_CANARY_UNEVALUATED"
+	if candidate := ErrorCode(runErr); strings.HasPrefix(candidate, "U_GATE_") {
+		code = candidate
+	}
+	fields["verdict"], fields["code"], fields["trusted"], fields["suspect"] = gate.VerdictUnevaluated, code, "false", "true"
 	fields["at"], fields["error"] = time.Now().UTC().Format(time.RFC3339Nano), runErr.Error()
 	return audit.Append("result", fields)
 }
@@ -174,7 +181,7 @@ func (s *Store) RunGate(ctx context.Context, id string) (GateCheckResult, error)
 	if err != nil {
 		return GateCheckResult{}, err
 	}
-	subjectEval, subjectErr := EvaluateDimension(s.root, def.Checkable.Dimension)
+	subjectEval, subjectErr := s.evaluateChecker(ctx, def, s.root)
 	if subjectErr != nil && subjectEval.Predicate != gate.PredicateUnevaluated {
 		return GateCheckResult{}, subjectErr
 	}
@@ -182,7 +189,7 @@ func (s *Store) RunGate(ctx context.Context, id string) (GateCheckResult, error)
 	if declarationErr != nil {
 		return GateCheckResult{}, declarationErr
 	}
-	canaryEval, canaryRoot, err := s.runFixtureCanary(ctx, canary, def)
+	canaryEval, canaryRoot, err := s.runCanary(ctx, canary, def)
 	if err != nil {
 		subject := subjectEval.Root.Digest
 		if subject == "" {
@@ -196,7 +203,11 @@ func (s *Store) RunGate(ctx context.Context, id string) (GateCheckResult, error)
 		if appendErr != nil {
 			return GateCheckResult{}, appendErr
 		}
-		return GateCheckResult{GateID: def.ID, Kind: string(def.Kind), Subject: subject, Verdict: gate.VerdictUnevaluated, Code: "U_GATE_CANARY_UNEVALUATED", Suspect: true, Seq: record.Seq}, err
+		code := "U_GATE_CANARY_UNEVALUATED"
+		if candidate := ErrorCode(err); strings.HasPrefix(candidate, "U_GATE_") {
+			code = candidate
+		}
+		return GateCheckResult{GateID: def.ID, Kind: string(def.Kind), Subject: subject, Verdict: gate.VerdictUnevaluated, Code: code, Suspect: true, Seq: record.Seq}, err
 	}
 	canaryHealth := gate.CanaryUnevaluated
 	if canaryEval.Predicate == gate.PredicateFail {
@@ -211,7 +222,11 @@ func (s *Store) RunGate(ctx context.Context, id string) (GateCheckResult, error)
 	proof := gate.ProofMissing
 	proofSeq := ""
 	if canaryHealth == gate.CanaryPass {
-		proofRecord, appendErr := audit.Append("proof-of-fire", map[string]string{"gate_id": def.ID, "canary_id": canary.ID, "definition_digest": found.Digest, "declaration_digest": declarationDigest, "canary_tree_digest": canaryRoot.Digest, "subject_scope": subjectEval.Root.Digest, "lane": def.Lane.Name, "evaluator_version": def.Lane.EvaluatorVersion})
+		proofFields := map[string]string{"gate_id": def.ID, "canary_id": canary.ID, "definition_digest": found.Digest, "declaration_digest": declarationDigest, "canary_tree_digest": canaryRoot.Digest, "subject_scope": subjectEval.Root.Digest, "lane": def.Lane.Name, "evaluator_version": def.Lane.EvaluatorVersion}
+		if subjectEval.EnvDigest != "" {
+			proofFields["env_digest"] = subjectEval.EnvDigest
+		}
+		proofRecord, appendErr := audit.Append("proof-of-fire", proofFields)
 		err = appendErr
 		if err != nil {
 			return GateCheckResult{}, err
@@ -220,7 +235,13 @@ func (s *Store) RunGate(ctx context.Context, id string) (GateCheckResult, error)
 		proof = gate.ProofValid
 	}
 	fold := gate.FoldVerdict(subjectEval.Predicate, proof, canaryHealth, gate.EvidenceAvailable)
+	if subjectEval.Code != "" && subjectEval.Predicate == gate.PredicateUnevaluated {
+		fold.Code = subjectEval.Code
+	}
 	fields := gateResultFields(def, found.Digest, declarationDigest, subjectEval.Root.Digest, canaryRoot.Digest, proofSeq)
+	if subjectEval.EnvDigest != "" {
+		fields["env_digest"] = subjectEval.EnvDigest
+	}
 	fields["gate_id"], fields["subject"] = def.ID, subjectEval.Root.Digest
 	fields["verdict"], fields["code"] = fold.Verdict, fold.Code
 	fields["trusted"], fields["suspect"] = fmt.Sprintf("%t", fold.Trusted), fmt.Sprintf("%t", fold.Suspect)
@@ -413,7 +434,7 @@ func (s *Store) GateAction(ctx context.Context, operation, gateID, canaryID stri
 				if canaryErr != nil {
 					return nil, canaryErr
 				}
-				evaluation, root, runErr := s.runFixtureCanary(ctx, canary, definition.Definition)
+				evaluation, root, runErr := s.runCanary(ctx, canary, definition.Definition)
 				if runErr != nil {
 					return nil, runErr
 				}
@@ -426,9 +447,18 @@ func (s *Store) GateAction(ctx context.Context, operation, gateID, canaryID stri
 	}
 }
 
-func (s *Store) runFixtureCanary(ctx context.Context, c gate.CanaryDeclaration, def gate.GateDefinition) (DimensionEvaluation, EvaluationRoot, error) {
+// GateActionWithFields is the transport-parity seam for the extended gate
+// descriptors. Gate files remain the authenticated source of truth; fields are
+// passed through for callers that materialize content changes and are not used
+// to mint a verdict directly.
+func (s *Store) GateActionWithFields(ctx context.Context, operation, gateID, canaryID string, fields map[string]any) (any, error) {
+	_ = fields
+	return s.GateAction(ctx, operation, gateID, canaryID)
+}
+
+func (s *Store) runCanary(ctx context.Context, c gate.CanaryDeclaration, def gate.GateDefinition) (DimensionEvaluation, EvaluationRoot, error) {
 	_ = ctx
-	if c.Mode != gate.CanaryFixture {
+	if c.Mode != gate.CanaryFixture && c.Mode != gate.CanaryMutation {
 		return DimensionEvaluation{}, EvaluationRoot{}, errors.New("E_GATE_CANARY_INVALID: M10a evaluation requires fixture canary")
 	}
 	dir, err := os.MkdirTemp("", "aira-gate-canary-")
@@ -466,8 +496,32 @@ func (s *Store) runFixtureCanary(ctx context.Context, c gate.CanaryDeclaration, 
 	if err := cmd.Run(); err != nil {
 		return DimensionEvaluation{}, EvaluationRoot{}, fmt.Errorf("U_GATE_CANARY_UNEVALUATED: git add: %w", err)
 	}
-	evaluation, err := EvaluateDimension(dir, def.Checkable.Dimension)
+	if c.Mode == gate.CanaryMutation {
+		if c.Mutation == nil {
+			return DimensionEvaluation{}, EvaluationRoot{}, errors.New("U_GATE_MUTATION_APPLY_FAILED: mutation seed is missing")
+		}
+		mutationRoot, mutationCleanup, materializeErr := materializeTrackedSnapshot(s.root)
+		if materializeErr != nil {
+			return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_MUTATION_APPLY_FAILED"}, EvaluationRoot{}, fmt.Errorf("U_GATE_MUTATION_APPLY_FAILED: %w", materializeErr)
+		}
+		defer mutationCleanup()
+		if mutationErr := applyMutation(mutationRoot, *c.Mutation); mutationErr != nil {
+			return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_MUTATION_APPLY_FAILED"}, EvaluationRoot{Path: mutationRoot}, fmt.Errorf("U_GATE_MUTATION_APPLY_FAILED: %w", mutationErr)
+		}
+		if _, stderr, gitErr := runGit(mutationRoot, "add", "-A"); gitErr != nil {
+			return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_MUTATION_APPLY_FAILED"}, EvaluationRoot{Path: mutationRoot}, fmt.Errorf("U_GATE_MUTATION_APPLY_FAILED: git add: %w: %s", gitErr, stderr)
+		}
+		evaluation, err := s.evaluateChecker(ctx, def, mutationRoot)
+		return evaluation, evaluation.Root, err
+	}
+	evaluation, err := s.evaluateChecker(ctx, def, dir)
 	return evaluation, evaluation.Root, err
+}
+
+// runFixtureCanary is retained as a compatibility seam for M10a tests and
+// delegates to the mode-dispatched implementation.
+func (s *Store) runFixtureCanary(ctx context.Context, c gate.CanaryDeclaration, def gate.GateDefinition) (DimensionEvaluation, EvaluationRoot, error) {
+	return s.runCanary(ctx, c, def)
 }
 
 func safeFixturePath(path string) bool {
@@ -563,12 +617,19 @@ func (s *Store) GateCheck(ctx context.Context) (GateCheckReport, error) {
 		return GateCheckReport{}, err
 	}
 	for _, d := range discovered {
-		record, ok := latest[d.Definition.ID+"\x00"+subjectDigest]
+		currentSubjectDigest := subjectDigest
+		if d.Definition.Lane.Checker == string(gate.CheckerCommand) {
+			currentSubjectDigest, err = digestTrackedRoot(s.root)
+			if err != nil {
+				return GateCheckReport{}, err
+			}
+		}
+		record, ok := latest[d.Definition.ID+"\x00"+currentSubjectDigest]
 		if !ok {
-			report.Results = append(report.Results, GateCheckResult{GateID: d.Definition.ID, Kind: string(d.Definition.Kind), Subject: subjectDigest, Verdict: gate.VerdictUnevaluated, Code: "U_GATE_NO_RESULT", Suspect: true})
+			report.Results = append(report.Results, GateCheckResult{GateID: d.Definition.ID, Kind: string(d.Definition.Kind), Subject: currentSubjectDigest, Verdict: gate.VerdictUnevaluated, Code: "U_GATE_NO_RESULT", Suspect: true})
 			continue
 		}
-		result := GateCheckResult{GateID: d.Definition.ID, Kind: string(d.Definition.Kind), Subject: subjectDigest, Verdict: record.Fields["verdict"], Code: record.Fields["code"], Trusted: record.Fields["trusted"] == "true", Suspect: record.Fields["suspect"] == "true", Seq: record.Seq}
+		result := GateCheckResult{GateID: d.Definition.ID, Kind: string(d.Definition.Kind), Subject: currentSubjectDigest, Verdict: record.Fields["verdict"], Code: record.Fields["code"], Trusted: record.Fields["trusted"] == "true", Suspect: record.Fields["suspect"] == "true", Seq: record.Seq}
 		if result.Verdict == gate.VerdictPass {
 			canary, canaryErr := s.canaryFor(d.Definition)
 			declarationDigest, digestErr := canary.DeclarationDigest()
@@ -576,7 +637,7 @@ func (s *Store) GateCheck(ctx context.Context) (GateCheckReport, error) {
 			bindingMismatch := canaryErr != nil || digestErr != nil || definitionErr != nil ||
 				currentDefinitionDigest != record.Fields["definition_digest"] ||
 				declarationDigest != record.Fields["declaration_digest"] ||
-				record.Fields["subject_scope"] != subjectDigest ||
+				record.Fields["subject_scope"] != currentSubjectDigest ||
 				record.Fields["lane"] != d.Definition.Lane.Name ||
 				record.Fields["evaluator_version"] != d.Definition.Lane.EvaluatorVersion ||
 				record.Fields["canary_tree_digest"] == ""
@@ -596,7 +657,13 @@ func (s *Store) GateCheck(ctx context.Context) (GateCheckReport, error) {
 					}
 					if linked == nil {
 						result.Verdict, result.Code, result.Trusted, result.Suspect = gate.VerdictUnevaluated, "U_GATE_UNPROVEN", false, true
-					} else if linked.Fields["gate_id"] != d.Definition.ID || linked.Fields["canary_id"] != canary.ID || linked.Fields["definition_digest"] != record.Fields["definition_digest"] || linked.Fields["declaration_digest"] != record.Fields["declaration_digest"] || linked.Fields["canary_tree_digest"] != record.Fields["canary_tree_digest"] || linked.Fields["subject_scope"] != subjectDigest || linked.Fields["lane"] != d.Definition.Lane.Name || linked.Fields["evaluator_version"] != d.Definition.Lane.EvaluatorVersion {
+					} else if linked.Fields["gate_id"] != d.Definition.ID || linked.Fields["canary_id"] != canary.ID || linked.Fields["definition_digest"] != record.Fields["definition_digest"] || linked.Fields["declaration_digest"] != record.Fields["declaration_digest"] || linked.Fields["canary_tree_digest"] != record.Fields["canary_tree_digest"] || linked.Fields["subject_scope"] != currentSubjectDigest || linked.Fields["lane"] != d.Definition.Lane.Name || linked.Fields["evaluator_version"] != d.Definition.Lane.EvaluatorVersion || (d.Definition.Command != nil && linked.Fields["env_digest"] != record.Fields["env_digest"]) {
+						result.Verdict, result.Code, result.Trusted, result.Suspect = gate.VerdictUnevaluated, "U_GATE_PROOF_STALE", false, true
+					}
+				}
+				if result.Verdict == gate.VerdictPass && d.Definition.Command != nil {
+					currentEnvDigest, envErr := currentCommandEnvDigest(*d.Definition.Command)
+					if envErr != nil || currentEnvDigest != record.Fields["env_digest"] {
 						result.Verdict, result.Code, result.Trusted, result.Suspect = gate.VerdictUnevaluated, "U_GATE_PROOF_STALE", false, true
 					}
 				}

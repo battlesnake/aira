@@ -95,7 +95,13 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		}
 		return nil, launchErr("E_RUN_CWD_INVALID", statErr)
 	}
-	env, entries, err := effectiveEnvironment(req.Env)
+	var env []string
+	var entries []EnvEntry
+	if req.ExplicitEnv {
+		env, entries, err = explicitEnvironment(req.Env)
+	} else {
+		env, entries, err = effectiveEnvironment(req.Env)
+	}
 	if err != nil {
 		return nil, launchErr("E_RUN_ENV_INVALID", err)
 	}
@@ -219,7 +225,37 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	}
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()
-	waitErr := <-waitCh
+	var waitErr error
+	timedOut := false
+	var timeoutKill killAttempt
+	if req.Timeout > 0 {
+		timer := time.NewTimer(req.Timeout)
+		select {
+		case waitErr = <-waitCh:
+		case <-timer.C:
+			attempt, killErr := r.killWithIntent(ctx, id, "run-timeout")
+			timeoutKill = attempt
+			if killErr != nil || !attempt.IntentPublished {
+				// A wait result published before the deadline wins. Otherwise retain
+				// the timeout as unevaluated evidence and let the terminal CAS below
+				// arbitrate against any concurrent external kill.
+				timedOut = killErr != nil || !attempt.WaitPublished
+			} else {
+				timedOut = true
+			}
+			if !timedOut {
+				waitErr = <-waitCh
+			}
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	} else {
+		waitErr = <-waitCh
+	}
 	if scopeVerified {
 		close(monitorStop)
 	}
@@ -229,7 +265,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	}
 	waitExit, waitSignal := waitEvidence(cmd.ProcessState, waitErr)
 	current, currentErr := r.ledger.current(id)
-	if currentErr == nil && !current.KillIntent.Present {
+	if currentErr == nil && !current.KillIntent.Present && !timedOut {
 		waitLock, lockErr := lockFile(filepath.Join(filepath.Dir(r.ledger.ledger), id+".lock"))
 		if lockErr != nil {
 			return nil, launchErr("U_RUN_RECONCILE_REQUIRED", lockErr)
@@ -294,7 +330,18 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		record.ScopeIntegrity = ScopeHandoffUnverified
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_SCOPE_HANDOFF")
 	}
-	if !scopeVerified {
+	if timedOut {
+		record.Status = StatusKilled
+		record.ExitCode, record.Signal = nil, ""
+		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_TIMEOUT")
+		if timeoutKill.Kill.Completed {
+			record.ScopeKill = ScopeKill{Requested: true, Started: true, Completed: true, GraceMS: r.termGrace.Milliseconds(), Actor: "run-timeout", At: nowString(r.now)}
+			record.KillIntent = KillIntent{Present: true, Sequence: timeoutKill.IntentSequence, Completed: true, Empty: true}
+		} else {
+			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
+			record.ScopeIntegrity = ScopeHandoffUnverified
+		}
+	} else if !scopeVerified {
 		record.Status = StatusLost
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
 	} else if waitExit != nil || waitSignal != "" {
@@ -368,6 +415,9 @@ func mergeEvidence(base, candidate RunRecord) RunRecord {
 	}
 	if candidate.ScopeKill.Requested {
 		base.ScopeKill = candidate.ScopeKill
+	}
+	if candidate.KillIntent.Present {
+		base.KillIntent = candidate.KillIntent
 	}
 	for _, code := range candidate.ErrorCodes {
 		base.ErrorCodes = appendUnique(base.ErrorCodes, code)
@@ -748,14 +798,14 @@ func monitorScopeMembership(scope Scope, pid int, stop <-chan struct{}, result c
 				return
 			}
 			members, err := scope.Members()
-			if err == nil && !containsPID(members, pid) {
+			if err == nil && !containsPID(members, pid) && processLive(pid) {
 				result <- true
 				return
 			}
 		case <-events:
 			if processExists(pid) {
 				members, err := scope.Members()
-				if err == nil && !containsPID(members, pid) {
+				if err == nil && !containsPID(members, pid) && processLive(pid) {
 					result <- true
 					return
 				}
@@ -810,6 +860,32 @@ func scopeMembershipEvents(scope Scope, stop <-chan struct{}) <-chan struct{} {
 func processExists(pid int) bool {
 	_, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
 	return err == nil
+}
+
+// processLive reports whether pid is a live, schedulable task rather than a
+// zombie or dead one. A process is removed from cgroup.procs the moment it
+// exits, but its /proc/<pid> entry lingers as a zombie until the parent reaps
+// it. Treating "present in /proc but absent from cgroup.procs" as a migration
+// therefore mis-flags a normal exit — especially for multi-process children
+// like `go test` that fork a compiler and a test binary. A genuine migration
+// keeps the task alive in another cgroup, so only a live state is a migration.
+func processLive(pid int) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return false
+	}
+	// Format: "pid (comm) state ...". comm can contain spaces and parentheses,
+	// so scan to the last ')' and read the state field two bytes after it.
+	i := strings.LastIndexByte(string(data), ')')
+	if i < 0 || i+2 >= len(data) {
+		return false
+	}
+	switch data[i+2] {
+	case 'Z', 'X', 'x':
+		return false
+	default:
+		return true
+	}
 }
 
 func containsPID(pids []int, pid int) bool {
@@ -876,25 +952,34 @@ func (r *Runner) killScope(ctx context.Context, scope Scope, id, actor string) (
 	return killResult{Started: true, Completed: true, Empty: true}, nil
 }
 
-func (r *Runner) Kill(ctx context.Context, id string) (*RunRecord, error) {
-	// Durable intent is the kill linearization point. A published wait result
-	// wins the race and is never replaced by this operation.
+type killAttempt struct {
+	Current         RunRecord
+	Kill            killResult
+	WaitPublished   bool
+	IntentPublished bool
+	IntentSequence  uint64
+}
+
+// killWithIntent is the shared durable kill path. It publishes KillIntent
+// before touching the scope, and leaves terminal publication to the caller so
+// Launch can merge monitor and capture evidence before its terminal CAS.
+func (r *Runner) killWithIntent(ctx context.Context, id, actor string) (killAttempt, error) {
 	lock, err := lockFile(filepath.Join(filepath.Dir(r.ledger.ledger), id+".lock"))
 	if err != nil {
-		return nil, err
+		return killAttempt{}, err
 	}
 	defer unlockFile(lock)
 	events, err := r.ledger.read()
 	if err != nil {
-		return nil, err
+		return killAttempt{}, err
 	}
 	runs, err := replay(events)
 	if err != nil {
-		return nil, err
+		return killAttempt{}, err
 	}
 	current := runs[id]
 	if current.Status.Terminal() {
-		return &current, nil
+		return killAttempt{Current: current}, nil
 	}
 	waitPublished := false
 	for _, event := range events {
@@ -904,26 +989,49 @@ func (r *Runner) Kill(ctx context.Context, id string) (*RunRecord, error) {
 		}
 	}
 	if waitPublished && !current.KillIntent.Present {
-		return &current, nil
-	}
-	scope, err := r.backend.Open(ctx, current.CgroupScope)
-	if err != nil {
-		return nil, launchErr("E_RUN_SCOPE_INVALID", err)
+		return killAttempt{Current: current, WaitPublished: true}, nil
 	}
 	if !current.KillIntent.Present {
 		current.KillIntent = KillIntent{Present: true}
 		current.ScopeKill.Requested = true
 		event, appendErr := r.append(ledgerEvent{Kind: "kill-intent", Run: current})
 		if appendErr != nil {
-			return nil, appendErr
+			return killAttempt{}, appendErr
 		}
 		current = event.Run
 	}
-	kill, killErr := r.killScope(ctx, scope, id, "run-kill")
-	if killErr != nil {
-		return nil, launchErr("U_RUN_RECONCILE_REQUIRED", killErr)
+	attempt := killAttempt{Current: current, IntentPublished: current.KillIntent.Present, IntentSequence: current.KillIntent.Sequence}
+	scope, err := r.backend.Open(ctx, current.CgroupScope)
+	if err != nil {
+		return attempt, launchErr("E_RUN_SCOPE_INVALID", err)
 	}
-	if !kill.Completed {
+	kill, killErr := r.killScope(ctx, scope, id, actor)
+	if killErr != nil {
+		return attempt, launchErr("U_RUN_RECONCILE_REQUIRED", killErr)
+	}
+	attempt.Kill = kill
+	attempt.Current = current
+	if kill.Completed {
+		_ = scope.Remove()
+	}
+	return attempt, nil
+}
+
+func (r *Runner) Kill(ctx context.Context, id string) (*RunRecord, error) {
+	attempt, err := r.killWithIntent(ctx, id, "run-kill")
+	if err != nil {
+		return nil, err
+	}
+	current := attempt.Current
+	if !attempt.IntentPublished || current.Status.Terminal() {
+		return &current, nil
+	}
+	lock, err := lockFile(filepath.Join(filepath.Dir(r.ledger.ledger), id+".lock"))
+	if err != nil {
+		return nil, err
+	}
+	defer unlockFile(lock)
+	if !attempt.Kill.Completed {
 		current.Status, current.EndedAt = StatusLost, nowString(r.now)
 		current.ErrorCodes = appendUnique(current.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
 		current.TerminalComplete = true
@@ -941,7 +1049,6 @@ func (r *Runner) Kill(ctx context.Context, id string) (*RunRecord, error) {
 	if _, err := r.appendTerminalLocked(current.ID, current); err != nil {
 		return nil, launchErr("U_RUN_RECONCILE_REQUIRED", err)
 	}
-	_ = scope.Remove()
 	_ = r.ledger.project(ctx)
 	return &current, nil
 }
@@ -953,6 +1060,11 @@ func (r *Runner) Get(id string) (*RunRecord, error) {
 	}
 	return &record, nil
 }
+
+// Probe reports whether this runner can establish delegated cgroup-v2 scope.
+// Callers use it to skip real-cgroup integration tests without weakening the
+// fail-closed execution path.
+func (r *Runner) Probe(ctx context.Context) error { return r.backend.Probe(ctx) }
 
 // ReadOutput reads captured bytes without decoding or normalising them. The
 // returned cursor always advances by the number of bytes returned, including
