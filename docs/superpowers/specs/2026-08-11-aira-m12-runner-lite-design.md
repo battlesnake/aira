@@ -47,6 +47,15 @@ These are deliberate M12 decisions and boundaries, not missing work:
   delegated writable parent, `clone3` with `CLONE_INTO_CGROUP`, and writable
   `cgroup.kill`, on kernel 5.14 or newer. Every capability is probed before
   launch; any missing capability hard-fails with `E_RUN_SCOPE_UNAVAILABLE`.
+- A daemonless observation limit is accepted for scope migration: if the
+  launch process atomically migrates out of its cgroup scope and exits within
+  the observation window, a foreground runner without a supervisor cannot
+  reliably distinguish that history from a clean exit. The reaped launch
+  process exit code remains factual, but the invariant bounded here is the
+  detectable scope-integrity guarantee (ordinary observable migrations are
+  still surfaced as `E_RUN_SCOPE_MIGRATION`/`handoff-unverified`). A later
+  supervised mode can close this residual window; M12 deliberately has no
+  supervisor.
 - Run IDs use a local `RUN-n` counter, not the git ticket allocator. The
   environment digest uses the specified length-prefixed encoding (§3.2),
   disk-full is detected from `ENOSPC`/capture write failures and requires

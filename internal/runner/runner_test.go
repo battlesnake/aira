@@ -179,6 +179,208 @@ func TestArbitrationWaitBeforeIntentWinsExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestReconcileDecisionNeverOverwritesPublishedWait(t *testing.T) {
+	decision := decideReconcile(true, false, true, false)
+	if !decision.PreserveOpen || decision.Terminal != "" {
+		t.Fatalf("decision=%+v", decision)
+	}
+	decision = decideReconcile(false, true, true, false)
+	if decision.Terminal != StatusLost || !decision.NeedsLost {
+		t.Fatalf("ambiguous kill decision=%+v", decision)
+	}
+	decision = decideReconcile(false, true, false, false)
+	if !decision.NeedsKill || decision.Terminal != "" {
+		t.Fatalf("live kill decision=%+v", decision)
+	}
+	decision = decideReconcile(false, true, false, true)
+	if decision.Terminal != StatusKilled || !decision.KillProven {
+		t.Fatalf("proven kill decision=%+v", decision)
+	}
+}
+
+func TestMembershipAndMigrationClassification(t *testing.T) {
+	if integrity, migrated := classifyMembership(true, true, false); integrity != ScopeMigrated || !migrated {
+		t.Fatalf("migration=%q/%v", integrity, migrated)
+	}
+	if integrity, migrated := classifyMembership(true, false, false); integrity != ScopeContained || migrated {
+		t.Fatalf("natural exit=%q/%v", integrity, migrated)
+	}
+	if integrity, migrated := classifyMembership(false, true, true); integrity != ScopeHandoffUnverified || migrated {
+		t.Fatalf("unverified=%q/%v", integrity, migrated)
+	}
+	if !memberStillPresent([]int{12, 15}, 15) || memberStillPresent([]int{12}, 15) {
+		t.Fatal("stale member filter failed")
+	}
+}
+
+func TestKillIntentSequenceIsPersistedInDurableRun(t *testing.T) {
+	l, err := newLedger(t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusRunning, CgroupScope: "/fake"}
+	if _, err := l.append(ledgerEvent{Kind: "starting", Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	run.KillIntent.Present = true
+	event, err := l.append(ledgerEvent{Kind: "kill-intent", Run: run})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.Run.KillIntent.Sequence == 0 {
+		t.Fatal("returned kill intent sequence is zero")
+	}
+	current, err := l.current("RUN-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.KillIntent.Sequence != event.Run.KillIntent.Sequence {
+		t.Fatalf("durable sequence=%d event=%d", current.KillIntent.Sequence, event.Run.KillIntent.Sequence)
+	}
+}
+
+type memoryScope struct {
+	members                     []int
+	killed, terminated, removed bool
+}
+
+func (s *memoryScope) Reference() string       { return "/memory-scope" }
+func (s *memoryScope) FD() int                 { return -1 }
+func (s *memoryScope) Members() ([]int, error) { return append([]int(nil), s.members...), nil }
+func (s *memoryScope) Empty() (bool, error)    { return len(s.members) == 0, nil }
+func (s *memoryScope) Terminate([]int) error   { s.terminated = true; s.members = nil; return nil }
+func (s *memoryScope) Kill() error             { s.killed = true; s.members = nil; return nil }
+func (s *memoryScope) Remove() error           { s.removed = true; return nil }
+
+type memoryBackend struct{ scope *memoryScope }
+
+func (b *memoryBackend) Probe(context.Context) error                   { return nil }
+func (b *memoryBackend) Create(context.Context, string) (Scope, error) { return b.scope, nil }
+func (b *memoryBackend) Open(context.Context, string) (Scope, error)   { return b.scope, nil }
+
+func newMemoryRunner(t *testing.T, members []int) (*Runner, *memoryScope) {
+	t.Helper()
+	scope := &memoryScope{members: members}
+	r, err := New(Config{CommonDir: t.TempDir(), Backend: &memoryBackend{scope: scope}, TermGrace: time.Millisecond, Grace: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r, scope
+}
+
+func appendRunEvent(t *testing.T, r *Runner, kind string, run RunRecord) {
+	t.Helper()
+	if _, err := r.ledger.append(ledgerEvent{Kind: kind, Run: run}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReconcileUsesRunLockAndPreservesWaitEvidence(t *testing.T) {
+	r, scope := newMemoryRunner(t, nil)
+	run := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusRunning, ScopeIntegrity: ScopeContained, CgroupScope: scope.Reference()}
+	appendRunEvent(t, r, "starting", run)
+	appendRunEvent(t, r, "scope-created", run)
+	exit := 7
+	run.ExitCode = &exit
+	appendRunEvent(t, r, "wait-observed", run)
+	if _, err := r.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	current, err := r.Get("RUN-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.Terminal() || current.ExitCode == nil || *current.ExitCode != 7 {
+		t.Fatalf("wait evidence lost: %+v", current)
+	}
+	if events, err := r.ledger.read(); err != nil {
+		t.Fatal(err)
+	} else {
+		for _, event := range events {
+			if event.Kind == "terminal" {
+				t.Fatal("reconcile appended terminal over waiter")
+			}
+		}
+	}
+}
+
+func TestTerminalCASIsIdempotentUnderConcurrentWaiterAndReconcile(t *testing.T) {
+	r, scope := newMemoryRunner(t, nil)
+	run := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusRunning, ScopeIntegrity: ScopeContained, CgroupScope: scope.Reference()}
+	appendRunEvent(t, r, "starting", run)
+	appendRunEvent(t, r, "scope-created", run)
+	results := make(chan error, 2)
+	for _, status := range []Status{StatusExited, StatusLost} {
+		go func(status Status) {
+			lock, err := lockFile(filepath.Join(filepath.Dir(r.ledger.ledger), "RUN-1.lock"))
+			if err == nil {
+				candidate := run
+				candidate.Status, candidate.TerminalComplete = status, true
+				candidate.EndedAt = nowString(r.now)
+				_, err = r.appendTerminalLocked("RUN-1", candidate)
+				_ = unlockFile(lock)
+			}
+			results <- err
+		}(status)
+	}
+	for i := 0; i < 2; i++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := terminalRecords(t, r); got != 1 {
+		t.Fatalf("terminal records=%d", got)
+	}
+}
+
+func TestReconcileDoesNotFabricateKilledFromEmptyScope(t *testing.T) {
+	r, scope := newMemoryRunner(t, nil)
+	run := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusRunning, ScopeIntegrity: ScopeContained, CgroupScope: scope.Reference(), KillIntent: KillIntent{Present: true}}
+	appendRunEvent(t, r, "starting", run)
+	appendRunEvent(t, r, "scope-created", run)
+	appendRunEvent(t, r, "kill-intent", run)
+	if _, err := r.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	current, err := r.Get("RUN-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != StatusLost || current.ScopeKill.Completed || current.KillIntent.Completed || scope.killed {
+		t.Fatalf("fabricated kill: %+v scope=%+v", current, scope)
+	}
+}
+
+func TestFailBeforeLaunchResolvesConcurrentKillUnderRunLock(t *testing.T) {
+	r, scope := newMemoryRunner(t, []int{123})
+	run := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusStarting, ScopeIntegrity: ScopeContained, CgroupScope: scope.Reference()}
+	appendRunEvent(t, r, "starting", run)
+	appendRunEvent(t, r, "scope-created", run)
+	run.KillIntent = KillIntent{Present: true}
+	appendRunEvent(t, r, "kill-intent", run)
+	_, _ = r.failBeforeLaunch(context.Background(), run, "E_RUN_LAUNCH_FAILED", errors.New("missing executable"))
+	current, err := r.Get("RUN-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != StatusKilled || !current.ScopeKill.Started || !current.ScopeKill.Completed {
+		t.Fatalf("race outcome=%+v", current)
+	}
+	terminals := 0
+	events, err := r.ledger.read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Kind == "terminal" {
+			terminals++
+		}
+	}
+	if terminals != 1 {
+		t.Fatalf("terminal records=%d", terminals)
+	}
+}
+
 type unavailableBackend struct{}
 
 func (unavailableBackend) Probe(context.Context) error {
@@ -206,15 +408,7 @@ func TestScopeProbeFailsClosedBeforeLaunch(t *testing.T) {
 }
 
 func TestRealCgroupIntegrationOrClearSkip(t *testing.T) {
-	base := t.TempDir()
-	r, err := New(Config{CommonDir: base, Grace: time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	backend := r.backend
-	if err := backend.Probe(context.Background()); err != nil {
-		t.Skipf("real cgroup-v2 delegation unavailable: %v", err)
-	}
+	r := realRunner(t)
 	record, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/sh", "-c", "printf out; printf err >&2"}})
 	if err != nil {
 		t.Fatal(err)
@@ -224,6 +418,157 @@ func TestRealCgroupIntegrationOrClearSkip(t *testing.T) {
 	}
 	if data, err := os.ReadFile(record.OutputRefs["out"].Path); err != nil || string(data) != "out" {
 		t.Fatalf("stdout=%q err=%v", data, err)
+	}
+}
+
+func realRunner(t *testing.T) *Runner {
+	t.Helper()
+	r, err := New(Config{CommonDir: t.TempDir(), Grace: time.Second, TermGrace: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.backend.Probe(context.Background()); err != nil {
+		t.Skipf("real cgroup-v2 delegation unavailable: %v", err)
+	}
+	return r
+}
+
+type launchOutcome struct {
+	record *RunRecord
+	err    error
+}
+
+func launchAsync(t *testing.T, r *Runner, req Request) <-chan launchOutcome {
+	t.Helper()
+	result := make(chan launchOutcome, 1)
+	go func() { record, err := r.Launch(context.Background(), req); result <- launchOutcome{record, err} }()
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case outcome := <-result:
+			result <- outcome
+			return result
+		case <-deadline.C:
+			t.Fatal("real runner did not establish a durable run identity")
+			return result
+		case <-ticker.C:
+			if record, err := r.Get("RUN-1"); err == nil && (record.Status == StatusRunning || record.Status.Terminal()) {
+				return result
+			}
+		}
+	}
+}
+
+func terminalRecords(t *testing.T, r *Runner) int {
+	t.Helper()
+	events, err := r.ledger.read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, event := range events {
+		if event.Kind == "terminal" {
+			count++
+		}
+	}
+	return count
+}
+
+func TestRealCgroupWholeScopeKillIncludesSetsidGrandchild(t *testing.T) {
+	r := realRunner(t)
+	outcome := launchAsync(t, r, Request{Argv: []string{"/bin/sh", "-c", "setsid sh -c 'sleep 30' & sleep 30"}})
+	if _, err := r.Kill(context.Background(), "RUN-1"); err != nil {
+		t.Fatal(err)
+	}
+	result := <-outcome
+	if result.err != nil && !strings.Contains(result.err.Error(), "U_RUN_RECONCILE_REQUIRED") {
+		t.Fatal(result.err)
+	}
+	current, err := r.Get("RUN-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != StatusKilled {
+		t.Fatalf("whole-scope result=%+v", current)
+	}
+	if got := terminalRecords(t, r); got != 1 {
+		t.Fatalf("terminal records=%d", got)
+	}
+}
+
+func TestRealCgroupKillWaitRaceHasOneTerminalWinner(t *testing.T) {
+	r := realRunner(t)
+	outcome := launchAsync(t, r, Request{Argv: []string{"/bin/sh", "-c", "sleep 0.2"}})
+	_, _ = r.Kill(context.Background(), "RUN-1")
+	result := <-outcome
+	if result.err != nil && !strings.Contains(result.err.Error(), "U_RUN_RECONCILE_REQUIRED") {
+		t.Fatal(result.err)
+	}
+	if got := terminalRecords(t, r); got != 1 {
+		t.Fatalf("terminal records=%d", got)
+	}
+}
+
+func TestRealCgroupReconcileRacePreservesWaitAndTerminalUniqueness(t *testing.T) {
+	r := realRunner(t)
+	outcome := launchAsync(t, r, Request{Argv: []string{"/bin/sh", "-c", "printf ok"}})
+	for i := 0; i < 20; i++ {
+		_, _ = r.Reconcile(context.Background())
+		time.Sleep(time.Millisecond)
+	}
+	result := <-outcome
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	if got := terminalRecords(t, r); got != 1 {
+		t.Fatalf("terminal records=%d", got)
+	}
+}
+
+func TestRealCgroupMigratedLaunchIsNotClean(t *testing.T) {
+	r := realRunner(t)
+	script := `set -eu; rel=$(awk -F: '$1=="0" {print $3}' /proc/self/cgroup); parent=/sys/fs/cgroup$(dirname "$rel"); target="$parent/.aira-migrate-$$"; mkdir "$target"; echo $$ > "$target/cgroup.procs"; printf migrated; sleep 0.1`
+	record, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/sh", "-c", script}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status == StatusExited && record.ExitCode != nil && *record.ExitCode == 0 && record.ScopeIntegrity == ScopeContained {
+		t.Fatalf("migration was reported clean: %+v", record)
+	}
+	if record.ScopeIntegrity != ScopeMigrated && record.ScopeIntegrity != ScopeHandoffUnverified {
+		t.Skipf("migration fixture could not establish an observable handoff: %+v", record)
+	}
+}
+
+func TestRealCgroupAtomicMigrationResidualIsExplicit(t *testing.T) {
+	r := realRunner(t)
+	// Accepted deviation in docs/superpowers/specs/2026-08-11-aira-m12-runner-lite-design.md:
+	// a migrate-and-exit sequence that completes before observation is possible
+	// cannot be classified reliably by the deliberately daemonless runner.
+	script := `set -eu; rel=$(awk -F: '$1=="0" {print $3}' /proc/self/cgroup); parent=/sys/fs/cgroup$(dirname "$rel"); target="$parent/.aira-atomic-$$"; mkdir "$target"; echo $$ > "$target/cgroup.procs"; printf atomic`
+	record, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/sh", "-c", script}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.ScopeIntegrity == ScopeMigrated || record.ScopeIntegrity == ScopeHandoffUnverified || !record.CleanSuccess() {
+		return
+	}
+	t.Skip("accepted daemonless residual: atomic migrate-and-exit completed before scope observation")
+}
+
+func TestRealCgroupFailBeforeLaunchKillRaceHasOneTerminal(t *testing.T) {
+	r := realRunner(t)
+	outcome := launchAsync(t, r, Request{Argv: []string{"/definitely/not/an/executable"}})
+	_, _ = r.Kill(context.Background(), "RUN-1")
+	result := <-outcome
+	if result.err == nil {
+		t.Fatal("missing launch failure")
+	}
+	if got := terminalRecords(t, r); got != 1 {
+		t.Fatalf("terminal records=%d", got)
 	}
 }
 

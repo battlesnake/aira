@@ -217,8 +217,9 @@ func (b *linuxScopeBackend) Open(ctx context.Context, reference string) (Scope, 
 	return &linuxScope{path: path, fd: fd}, nil
 }
 
-func (s *linuxScope) Reference() string { return s.path }
-func (s *linuxScope) FD() int           { return int(s.fd.Fd()) }
+func (s *linuxScope) Reference() string  { return s.path }
+func (s *linuxScope) FD() int            { return int(s.fd.Fd()) }
+func (s *linuxScope) EventsPath() string { return filepath.Join(s.path, "cgroup.events") }
 func (s *linuxScope) Members() ([]int, error) {
 	data, err := os.ReadFile(filepath.Join(s.path, "cgroup.procs"))
 	if err != nil {
@@ -248,13 +249,23 @@ func (s *linuxScope) Empty() (bool, error) {
 	return false, errors.New("cgroup.events lacks populated")
 }
 func (s *linuxScope) Terminate(pids []int) error {
+	// Never trust a stale Members() result. Refresh immediately before each
+	// signal so an exited PID cannot be reused as the grace-period target.
 	for _, pid := range pids {
+		current, err := s.Members()
+		if err != nil {
+			return err
+		}
+		if !memberStillPresent(current, pid) {
+			continue
+		}
 		if err := unix.Kill(pid, unix.SIGTERM); err != nil && !errors.Is(err, unix.ESRCH) {
 			return err
 		}
 	}
 	return nil
 }
+func memberStillPresent(current []int, pid int) bool { return containsPID(current, pid) }
 func (s *linuxScope) Kill() error {
 	f, err := os.OpenFile(filepath.Join(s.path, "cgroup.kill"), os.O_WRONLY, 0)
 	if err != nil {

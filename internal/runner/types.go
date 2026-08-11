@@ -143,6 +143,12 @@ type Scope interface {
 	Remove() error
 }
 
+type killResult struct {
+	Started   bool
+	Completed bool
+	Empty     bool
+}
+
 type LaunchError struct {
 	Code string
 	Err  error

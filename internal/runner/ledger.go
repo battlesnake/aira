@@ -167,6 +167,15 @@ func (l *ledger) append(event ledgerEvent) (ledgerEvent, error) {
 		}
 	}
 	event.SchemaVersion = ledgerSchema
+	// The event sequence is part of the durable Run identity for kill intent;
+	// write it into the payload before marshaling, not only into the returned
+	// caller snapshot.
+	if event.Kind == "kill-intent" && event.Run.KillIntent.Present && event.Run.KillIntent.Sequence == 0 {
+		event.Run.KillIntent.Sequence = event.Sequence
+	}
+	if event.Kind == "kill-intent" && event.Run.KillIntent.Present {
+		event.Run.ScopeKill.Requested = true
+	}
 	payload, err := json.Marshal(event)
 	if err != nil {
 		return event, err

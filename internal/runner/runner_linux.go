@@ -15,6 +15,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type Runner struct {
@@ -127,11 +129,11 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	}
 
 	if err := os.MkdirAll(r.outputDir, 0o755); err != nil {
-		return r.failBeforeLaunch(record, "E_RUN_OUTPUT_OPEN", err)
+		return r.failBeforeLaunch(ctx, record, "E_RUN_OUTPUT_OPEN", err)
 	}
 	paths, files, err := openOutputs(r.outputDir, id, req.Merge)
 	if err != nil {
-		return r.failBeforeLaunch(record, "E_RUN_OUTPUT_OPEN", err)
+		return r.failBeforeLaunch(ctx, record, "E_RUN_OUTPUT_OPEN", err)
 	}
 	defer func() {
 		for _, f := range files {
@@ -142,12 +144,12 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		record.OutputRefs[key] = OutputRef{Path: path, State: OutputPartial}
 	}
 	if err := syncDir(r.outputDir); err != nil {
-		return r.failBeforeLaunch(record, "E_RUN_OUTPUT_OPEN", err)
+		return r.failBeforeLaunch(ctx, record, "E_RUN_OUTPUT_OPEN", err)
 	}
 
 	scope, err := r.backend.Create(ctx, id)
 	if err != nil {
-		return r.failBeforeLaunch(record, "E_RUN_SCOPE_UNAVAILABLE", err)
+		return r.failBeforeLaunch(ctx, record, "E_RUN_SCOPE_UNAVAILABLE", err)
 	}
 	record.CgroupScope = scope.Reference()
 	if _, err := r.append(ledgerEvent{Kind: "scope-created", Run: record}); err != nil {
@@ -166,8 +168,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: scope.FD()}
 	stdinClose, stdinStore, err := setupStdin(cmd, req, filepath.Join(r.outputDir, id+".in"))
 	if err != nil {
-		_ = scope.Remove()
-		return r.failBeforeLaunch(record, "E_RUN_STDIN_INVALID", err)
+		return r.failBeforeLaunch(ctx, record, "E_RUN_STDIN_INVALID", err)
 	}
 	if stdinClose != nil {
 		defer stdinClose()
@@ -175,17 +176,15 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	record.StdinStored = stdinStore
 	readers, writers, err := setupPipes(cmd, req.Merge)
 	if err != nil {
-		_ = scope.Remove()
-		return r.failBeforeLaunch(record, "E_RUN_CAPTURE_FAILED", err)
+		return r.failBeforeLaunch(ctx, record, "E_RUN_CAPTURE_FAILED", err)
 	}
 	if err := cmd.Start(); err != nil {
 		closePipes(readers, writers)
-		_ = scope.Remove()
 		code := "E_RUN_LAUNCH_FAILED"
 		if strings.Contains(err.Error(), "clone3") || errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.ENOSYS) {
 			code = "E_RUN_SCOPE_UNAVAILABLE"
 		}
-		return r.failBeforeLaunch(record, code, err)
+		return r.failBeforeLaunch(ctx, record, code, err)
 	}
 	for _, w := range writers {
 		_ = w.Close()
@@ -208,6 +207,11 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	} else if _, err := r.append(ledgerEvent{Kind: "scope-integrity", Run: record}); err != nil {
 		return nil, launchErr("E_RUN_RECONCILE_REQUIRED", err)
 	}
+	monitorStop := make(chan struct{})
+	monitorResult := make(chan bool, 1)
+	if scopeVerified {
+		go monitorScopeMembership(scope, cmd.Process.Pid, monitorStop, monitorResult)
+	}
 
 	captureCh := make(chan captureResult, len(readers))
 	for name, rd := range readers {
@@ -216,6 +220,13 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()
 	waitErr := <-waitCh
+	if scopeVerified {
+		close(monitorStop)
+	}
+	migrated := false
+	if scopeVerified {
+		migrated = <-monitorResult
+	}
 	waitExit, waitSignal := waitEvidence(cmd.ProcessState, waitErr)
 	current, currentErr := r.ledger.current(id)
 	if currentErr == nil && !current.KillIntent.Present {
@@ -224,7 +235,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 			return nil, launchErr("U_RUN_RECONCILE_REQUIRED", lockErr)
 		}
 		current, currentErr = r.ledger.current(id)
-		if currentErr == nil && !current.KillIntent.Present {
+		if currentErr == nil && !current.Status.Terminal() && !current.KillIntent.Present {
 			if scopeVerified {
 				current.Status = StatusRunning
 			}
@@ -262,7 +273,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if !record.CaptureComplete || forced {
 		members, membersErr := scope.Members()
 		if membersErr == nil && len(members) > 0 {
-			if err := r.killScope(ctx, scope, id, "capture"); err == nil {
+			if kill, err := r.killScope(ctx, scope, id, "capture"); err == nil && kill.Completed {
 				record.ScopeIntegrity = ScopeDescendantKilled
 				record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_DESCENDANT_KILLED")
 				record.ScopeKill = ScopeKill{Requested: true, Started: true, Completed: true, GraceMS: r.termGrace.Milliseconds(), Actor: "aira", At: nowString(r.now)}
@@ -273,7 +284,10 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		}
 	}
 	empty, emptyErr := scope.Empty()
-	if emptyErr != nil {
+	if migrated {
+		record.ScopeIntegrity = ScopeMigrated
+		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_SCOPE_MIGRATION")
+	} else if emptyErr != nil {
 		record.ScopeIntegrity = ScopeHandoffUnverified
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_SCOPE_HANDOFF")
 	} else if !empty {
@@ -307,11 +321,21 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		_ = unlockFile(terminalLock)
 		return &latest, nil
 	}
+	latest = mergeEvidence(latest, record)
 	if latestErr == nil && latest.KillIntent.Present && !latest.KillIntent.Completed {
+		latest.TerminalComplete = false
+		if _, err := r.append(ledgerEvent{Kind: "capture-finalized", Run: latest}); err != nil {
+			_ = unlockFile(terminalLock)
+			return nil, launchErr("U_RUN_RECONCILE_REQUIRED", err)
+		}
 		_ = unlockFile(terminalLock)
 		return &latest, launchErr("U_RUN_RECONCILE_REQUIRED", errors.New("kill intent won before terminal evidence"))
 	}
-	if _, err := r.append(ledgerEvent{Kind: "terminal", Run: record}); err != nil {
+	latest.Status = record.Status
+	latest.ExitCode, latest.Signal = record.ExitCode, record.Signal
+	latest.EndedAt, latest.TerminalComplete = record.EndedAt, true
+	committed, err := r.appendTerminalLocked(id, latest)
+	if err != nil {
 		_ = unlockFile(terminalLock)
 		return nil, launchErr("U_RUN_RECONCILE_REQUIRED", err)
 	}
@@ -320,7 +344,73 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		_ = scope.Remove()
 	}
 	_ = r.ledger.project(ctx)
-	return &record, nil
+	return &committed, nil
+}
+
+func mergeEvidence(base, candidate RunRecord) RunRecord {
+	if base.ID == "" {
+		base = candidate
+	}
+	if candidate.CgroupScope != "" {
+		base.CgroupScope = candidate.CgroupScope
+	}
+	if candidate.PIDIdentity.PID != 0 {
+		base.PIDIdentity = candidate.PIDIdentity
+	}
+	if candidate.OutputRefs != nil {
+		base.OutputRefs = cloneOutputRefs(candidate.OutputRefs)
+	}
+	base.CaptureComplete = candidate.CaptureComplete
+	base.CaptureForcedClosed = candidate.CaptureForcedClosed
+	base.StdinStored = base.StdinStored || candidate.StdinStored
+	if candidate.ScopeIntegrity != ScopeContained {
+		base.ScopeIntegrity = candidate.ScopeIntegrity
+	}
+	if candidate.ScopeKill.Requested {
+		base.ScopeKill = candidate.ScopeKill
+	}
+	for _, code := range candidate.ErrorCodes {
+		base.ErrorCodes = appendUnique(base.ErrorCodes, code)
+	}
+	return base
+}
+
+func cloneOutputRefs(refs map[string]OutputRef) map[string]OutputRef {
+	copy := make(map[string]OutputRef, len(refs))
+	for key, ref := range refs {
+		copy[key] = ref
+	}
+	return copy
+}
+
+// appendTerminalLocked is the single terminal CAS. Callers must hold the
+// per-run lock. It rereads authoritative state, returns an existing terminal
+// unchanged, and treats a duplicate-terminal race as an idempotent read rather
+// than surfacing journal corruption to the caller.
+func (r *Runner) appendTerminalLocked(id string, candidate RunRecord) (RunRecord, error) {
+	latest, err := r.ledger.current(id)
+	if err != nil {
+		return RunRecord{}, err
+	}
+	if latest.Status.Terminal() {
+		return latest, nil
+	}
+	terminal := mergeEvidence(latest, candidate)
+	if candidate.Status.Terminal() {
+		terminal.Status = candidate.Status
+		terminal.ExitCode, terminal.Signal = candidate.ExitCode, candidate.Signal
+		terminal.EndedAt, terminal.TerminalComplete = candidate.EndedAt, candidate.TerminalComplete
+	}
+	event, err := r.append(ledgerEvent{Kind: "terminal", Run: terminal})
+	if err != nil && strings.Contains(err.Error(), "duplicate terminal record") {
+		if existing, readErr := r.ledger.current(id); readErr == nil && existing.Status.Terminal() {
+			return existing, nil
+		}
+	}
+	if err != nil {
+		return RunRecord{}, err
+	}
+	return event.Run, nil
 }
 
 func (r *Runner) intendedScope(id string) string {
@@ -337,16 +427,77 @@ func (r *Runner) intendedScope(id string) string {
 	return id
 }
 
-func (r *Runner) failBeforeLaunch(record RunRecord, code string, err error) (*RunRecord, error) {
-	record.Status = StatusLost
-	record.ErrorCodes = appendUnique(record.ErrorCodes, code)
-	record.EndedAt = nowString(r.now)
-	record.TerminalComplete = true
-	_, appendErr := r.append(ledgerEvent{Kind: "terminal", Run: record})
-	if appendErr != nil {
+func (r *Runner) failBeforeLaunch(ctx context.Context, record RunRecord, code string, err error) (*RunRecord, error) {
+	lock, lockErr := lockFile(filepath.Join(filepath.Dir(r.ledger.ledger), record.ID+".lock"))
+	if lockErr != nil {
+		return nil, launchErr("U_RUN_RECONCILE_REQUIRED", lockErr)
+	}
+	defer unlockFile(lock)
+	events, readErr := r.ledger.read()
+	if readErr != nil {
+		return nil, launchErr("U_RUN_RECONCILE_REQUIRED", readErr)
+	}
+	runs, replayErr := replay(events)
+	if replayErr != nil {
+		return nil, launchErr("U_RUN_RECONCILE_REQUIRED", replayErr)
+	}
+	current := runs[record.ID]
+	if current.Status.Terminal() {
+		return nil, launchErr(code, err)
+	}
+	current = mergeEvidence(current, record)
+	current.ErrorCodes = appendUnique(current.ErrorCodes, code)
+	// Persist preparation evidence before resolving a concurrent kill intent,
+	// so the kill winner does not lose output refs, stdin, or error facts.
+	if _, appendErr := r.append(ledgerEvent{Kind: "failure-observed", Run: current}); appendErr != nil {
 		return nil, launchErr("U_RUN_RECONCILE_REQUIRED", appendErr)
 	}
+	if current.KillIntent.Present && !current.KillIntent.Completed {
+		scope, openErr := r.backend.Open(ctx, current.CgroupScope)
+		if openErr == nil {
+			result, killErr := r.killScope(ctx, scope, current.ID, "run-kill")
+			if killErr == nil && result.Started && result.Completed {
+				current.Status, current.EndedAt = StatusKilled, nowString(r.now)
+				current.ScopeKill.Started, current.ScopeKill.Completed, current.ScopeKill.Actor, current.ScopeKill.At, current.ScopeKill.GraceMS = true, true, "run-kill", current.EndedAt, r.termGrace.Milliseconds()
+				current.KillIntent.Completed, current.KillIntent.Empty = true, true
+				current.ErrorCodes = appendUnique(current.ErrorCodes, "E_RUN_KILLED")
+				current.TerminalComplete = true
+				if _, appendErr := r.appendTerminalLocked(current.ID, current); appendErr != nil {
+					return nil, launchErr("U_RUN_RECONCILE_REQUIRED", appendErr)
+				}
+				_ = scope.Remove()
+				return nil, launchErr(code, err)
+			}
+		}
+		current.Status, current.EndedAt = StatusLost, nowString(r.now)
+		current.ErrorCodes = appendUnique(current.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
+		current.TerminalComplete = true
+		if _, appendErr := r.appendTerminalLocked(current.ID, current); appendErr != nil {
+			return nil, launchErr("U_RUN_RECONCILE_REQUIRED", appendErr)
+		}
+		r.removeEmptyScope(ctx, current.CgroupScope)
+		return nil, launchErr(code, err)
+	}
+	current.Status, current.EndedAt = StatusLost, nowString(r.now)
+	current.TerminalComplete = true
+	if _, appendErr := r.appendTerminalLocked(current.ID, current); appendErr != nil {
+		return nil, launchErr("U_RUN_RECONCILE_REQUIRED", appendErr)
+	}
+	r.removeEmptyScope(ctx, current.CgroupScope)
 	return nil, launchErr(code, err)
+}
+
+func (r *Runner) removeEmptyScope(ctx context.Context, reference string) {
+	if reference == "" {
+		return
+	}
+	scope, err := r.backend.Open(ctx, reference)
+	if err != nil {
+		return
+	}
+	if empty, emptyErr := scope.Empty(); emptyErr == nil && empty {
+		_ = scope.Remove()
+	}
 }
 
 func openOutputs(dir, id string, merge bool) (map[string]string, map[string]*os.File, error) {
@@ -577,6 +728,90 @@ func processStartTick(pid int) uint64 {
 	_, _ = fmt.Sscanf(fields[19], "%d", &tick)
 	return tick
 }
+
+func monitorScopeMembership(scope Scope, pid int, stop <-chan struct{}, result chan<- bool) {
+	// This detects a live launch process observed outside the scope. A process
+	// that migrates and exits between two samples is inherently unobservable
+	// without a supervisor; such descendant/handoff limits remain non-green
+	// whenever the scope/pipe evidence is incomplete.
+	ticker := time.NewTicker(2 * time.Millisecond)
+	defer ticker.Stop()
+	events := scopeMembershipEvents(scope, stop)
+	for {
+		select {
+		case <-stop:
+			result <- false
+			return
+		case <-ticker.C:
+			if !processExists(pid) {
+				result <- false
+				return
+			}
+			members, err := scope.Members()
+			if err == nil && !containsPID(members, pid) {
+				result <- true
+				return
+			}
+		case <-events:
+			if processExists(pid) {
+				members, err := scope.Members()
+				if err == nil && !containsPID(members, pid) {
+					result <- true
+					return
+				}
+			}
+		}
+	}
+}
+
+type scopeEvents interface{ EventsPath() string }
+
+func scopeMembershipEvents(scope Scope, stop <-chan struct{}) <-chan struct{} {
+	result := make(chan struct{}, 1)
+	source, ok := scope.(scopeEvents)
+	if !ok {
+		return result
+	}
+	fd, err := unix.InotifyInit1(unix.IN_NONBLOCK | unix.IN_CLOEXEC)
+	if err != nil {
+		return result
+	}
+	if _, err := unix.InotifyAddWatch(fd, source.EventsPath(), unix.IN_MODIFY|unix.IN_CLOSE_WRITE|unix.IN_ATTRIB); err != nil {
+		_ = unix.Close(fd)
+		return result
+	}
+	go func() {
+		defer unix.Close(fd)
+		buffer := make([]byte, 4096)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			n, readErr := unix.Read(fd, buffer)
+			if n > 0 {
+				select {
+				case result <- struct{}{}:
+				default:
+				}
+			}
+			if readErr != nil && !errors.Is(readErr, unix.EAGAIN) && !errors.Is(readErr, unix.EINTR) {
+				return
+			}
+			if n == 0 || errors.Is(readErr, unix.EAGAIN) {
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+	return result
+}
+
+func processExists(pid int) bool {
+	_, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
+	return err == nil
+}
+
 func containsPID(pids []int, pid int) bool {
 	for _, p := range pids {
 		if p == pid {
@@ -601,6 +836,14 @@ func containsPrefix(values []string, prefix string) bool {
 	}
 	return false
 }
+func hasEvent(events []ledgerEvent, id, kind string) bool {
+	for _, event := range events {
+		if event.Run.ID == id && event.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
 func captureCode(err error) string {
 	if errors.Is(err, syscall.ENOSPC) {
 		return "E_RUN_OUTPUT_DISK_FULL"
@@ -608,35 +851,32 @@ func captureCode(err error) string {
 	return "E_RUN_CAPTURE_FAILED"
 }
 
-func (r *Runner) killScope(ctx context.Context, scope Scope, id, actor string) error {
+func (r *Runner) killScope(ctx context.Context, scope Scope, id, actor string) (killResult, error) {
 	pids, err := scope.Members()
 	if err != nil {
-		return err
+		return killResult{}, err
+	}
+	if len(pids) == 0 {
+		empty, emptyErr := scope.Empty()
+		return killResult{Empty: empty && emptyErr == nil}, emptyErr
 	}
 	if err := scope.Terminate(pids); err != nil {
-		return err
+		return killResult{}, err
 	}
-	if err := waitEmpty(ctx, scope, r.termGrace); err == nil {
-		return nil
-	}
+	// Always execute the final cgroup.kill after the TERM grace. This makes
+	// Started/Completed auditable and prevents an empty scope alone from being
+	// mistaken for proof that this kill operation won.
+	_ = waitEmpty(ctx, scope, r.termGrace)
 	if err := scope.Kill(); err != nil {
-		return err
+		return killResult{Started: true}, err
 	}
-	return waitEmpty(ctx, scope, r.grace)
+	if err := waitEmpty(ctx, scope, r.grace); err != nil {
+		return killResult{Started: true}, err
+	}
+	return killResult{Started: true, Completed: true, Empty: true}, nil
 }
 
 func (r *Runner) Kill(ctx context.Context, id string) (*RunRecord, error) {
-	record, err := r.ledger.current(id)
-	if err != nil {
-		return nil, err
-	}
-	if record.Status.Terminal() {
-		return &record, nil
-	}
-	scope, err := r.backend.Open(ctx, record.CgroupScope)
-	if err != nil {
-		return nil, launchErr("E_RUN_SCOPE_INVALID", err)
-	}
 	// Durable intent is the kill linearization point. A published wait result
 	// wins the race and is never replaced by this operation.
 	lock, err := lockFile(filepath.Join(filepath.Dir(r.ledger.ledger), id+".lock"))
@@ -666,6 +906,10 @@ func (r *Runner) Kill(ctx context.Context, id string) (*RunRecord, error) {
 	if waitPublished && !current.KillIntent.Present {
 		return &current, nil
 	}
+	scope, err := r.backend.Open(ctx, current.CgroupScope)
+	if err != nil {
+		return nil, launchErr("E_RUN_SCOPE_INVALID", err)
+	}
 	if !current.KillIntent.Present {
 		current.KillIntent = KillIntent{Present: true}
 		current.ScopeKill.Requested = true
@@ -673,18 +917,28 @@ func (r *Runner) Kill(ctx context.Context, id string) (*RunRecord, error) {
 		if appendErr != nil {
 			return nil, appendErr
 		}
-		current.KillIntent.Sequence = event.Sequence
+		current = event.Run
 	}
-	if err := r.killScope(ctx, scope, id, "run-kill"); err != nil {
-		return nil, launchErr("U_RUN_RECONCILE_REQUIRED", err)
+	kill, killErr := r.killScope(ctx, scope, id, "run-kill")
+	if killErr != nil {
+		return nil, launchErr("U_RUN_RECONCILE_REQUIRED", killErr)
+	}
+	if !kill.Completed {
+		current.Status, current.EndedAt = StatusLost, nowString(r.now)
+		current.ErrorCodes = appendUnique(current.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
+		current.TerminalComplete = true
+		if _, appendErr := r.appendTerminalLocked(current.ID, current); appendErr != nil {
+			return nil, launchErr("U_RUN_RECONCILE_REQUIRED", appendErr)
+		}
+		return &current, launchErr("U_RUN_RECONCILE_REQUIRED", errors.New("kill intent could not be proven"))
 	}
 	current.Status, current.EndedAt = StatusKilled, nowString(r.now)
 	current.ExitCode, current.Signal = nil, ""
-	current.ScopeKill.Started, current.ScopeKill.Completed, current.ScopeKill.Actor, current.ScopeKill.At = true, true, "run-kill", current.EndedAt
+	current.ScopeKill.Started, current.ScopeKill.Completed, current.ScopeKill.Actor, current.ScopeKill.At, current.ScopeKill.GraceMS = true, true, "run-kill", current.EndedAt, r.termGrace.Milliseconds()
 	current.KillIntent.Completed, current.KillIntent.Empty = true, true
 	current.ErrorCodes = appendUnique(current.ErrorCodes, "E_RUN_KILLED")
 	current.TerminalComplete = true
-	if _, err := r.append(ledgerEvent{Kind: "terminal", Run: current}); err != nil {
+	if _, err := r.appendTerminalLocked(current.ID, current); err != nil {
 		return nil, launchErr("U_RUN_RECONCILE_REQUIRED", err)
 	}
 	_ = scope.Remove()
@@ -715,51 +969,89 @@ func (r *Runner) Reconcile(ctx context.Context) ([]RunRecord, error) {
 		return nil, err
 	}
 	result := make([]RunRecord, 0, len(runs))
-	for _, record := range runs {
-		if record.Status.Terminal() {
-			result = append(result, record)
+	for id := range runs {
+		lock, lockErr := lockFile(filepath.Join(filepath.Dir(r.ledger.ledger), id+".lock"))
+		if lockErr != nil {
+			return nil, lockErr
+		}
+		freshEvents, readErr := r.ledger.read()
+		if readErr != nil {
+			_ = unlockFile(lock)
+			return nil, readErr
+		}
+		freshRuns, replayErr := replay(freshEvents)
+		if replayErr != nil {
+			_ = unlockFile(lock)
+			return nil, replayErr
+		}
+		record, ok := freshRuns[id]
+		if !ok {
+			_ = unlockFile(lock)
 			continue
 		}
+		if record.Status.Terminal() {
+			result = append(result, record)
+			_ = unlockFile(lock)
+			continue
+		}
+		waitObserved := hasEvent(freshEvents, id, "wait-observed")
 		scope, openErr := r.backend.Open(ctx, record.CgroupScope)
 		if openErr != nil {
-			record.Status = StatusLost
+			decision := decideReconcile(waitObserved, record.KillIntent.Present, true, false)
+			if decision.PreserveOpen {
+				result = append(result, record)
+				_ = unlockFile(lock)
+				continue
+			}
+			record.Status, record.EndedAt = StatusLost, nowString(r.now)
 			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
-			record.EndedAt = nowString(r.now)
 			record.TerminalComplete = true
-			_, err = r.append(ledgerEvent{Kind: "terminal", Run: record})
-			if err != nil {
+			if _, err = r.appendTerminalLocked(id, record); err != nil {
+				_ = unlockFile(lock)
 				return nil, err
 			}
 			result = append(result, record)
+			_ = unlockFile(lock)
 			continue
 		}
 		empty, emptyErr := scope.Empty()
-		if emptyErr != nil || !empty {
+		if emptyErr != nil {
 			result = append(result, record)
+			_ = unlockFile(lock)
 			continue
 		}
-		if record.KillIntent.Present && !record.KillIntent.Completed {
-			record.Status = StatusKilled
-			record.KillIntent.Completed, record.KillIntent.Empty = true, true
-			record.ScopeKill.Completed = true
-			record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_KILLED")
-			record.EndedAt, record.TerminalComplete = nowString(r.now), true
-			if _, err = r.append(ledgerEvent{Kind: "terminal", Run: record}); err != nil {
-				return nil, err
+		decision := decideReconcile(waitObserved, record.KillIntent.Present, empty, false)
+		if decision.PreserveOpen {
+			result = append(result, record)
+			_ = unlockFile(lock)
+			continue
+		}
+		if decision.NeedsKill {
+			kill, killErr := r.killScope(ctx, scope, id, "reconcile")
+			if killErr != nil || !kill.Completed {
+				result = append(result, record)
+				_ = unlockFile(lock)
+				continue
 			}
-			_ = scope.Remove()
-			result = append(result, record)
-			continue
+			record.Status, record.EndedAt = StatusKilled, nowString(r.now)
+			record.ScopeKill.Started, record.ScopeKill.Completed, record.ScopeKill.Actor, record.ScopeKill.At, record.ScopeKill.GraceMS = true, true, "reconcile", record.EndedAt, r.termGrace.Milliseconds()
+			record.KillIntent.Completed, record.KillIntent.Empty = true, true
+			record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_KILLED")
+			record.TerminalComplete = true
+		} else {
+			record.Status, record.EndedAt = StatusLost, nowString(r.now)
+			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_EXIT_UNKNOWN")
+			record.TerminalComplete = true
 		}
-		record.Status = StatusLost
-		record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_EXIT_UNKNOWN")
-		record.EndedAt = nowString(r.now)
-		record.TerminalComplete = true
-		if _, err = r.append(ledgerEvent{Kind: "terminal", Run: record}); err != nil {
+		if _, err = r.appendTerminalLocked(id, record); err != nil {
+			_ = unlockFile(lock)
 			return nil, err
 		}
-		_ = scope.Remove()
+		if empty, emptyErr := scope.Empty(); emptyErr == nil && empty {
+			_ = scope.Remove()
+		}
 		result = append(result, record)
+		_ = unlockFile(lock)
 	}
 	if err := r.ledger.rebuild(ctx); err != nil {
 		return nil, err
