@@ -8,17 +8,17 @@ export PATH := $(GO_BIN):/home/user/.local/bin:$(PATH)
 .PHONY: fmt fmt-check vet lint build test race cover fuzz tidy ci install-hooks
 
 fmt:
-	@files="$$(find . -type f -name '*.go' -not -path './vendor/*')"; \
+	@files="$$(find . -type f -name '*.go' -not -path './vendor/*' -not -path './.worktrees/*')"; \
 	if [ -n "$$files" ]; then gofmt -w $$files; fi
 	@if command -v goimports >/dev/null 2>&1; then \
-		files="$$(find . -type f -name '*.go' -not -path './vendor/*')"; \
+		files="$$(find . -type f -name '*.go' -not -path './vendor/*' -not -path './.worktrees/*')"; \
 		if [ -n "$$files" ]; then goimports -w $$files; fi; \
 	else \
 		echo "goimports is not installed; run: go install golang.org/x/tools/cmd/goimports@latest"; \
 	fi
 
 fmt-check:
-	@files="$$(find . -type f -name '*.go' -not -path './vendor/*')"; \
+	@files="$$(find . -type f -name '*.go' -not -path './vendor/*' -not -path './.worktrees/*')"; \
 	if [ -n "$$files" ] && gofmt -l $$files | grep -q .; then \
 		echo "gofmt check failed; run 'make fmt'" >&2; \
 		gofmt -l $$files; \
