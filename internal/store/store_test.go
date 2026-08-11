@@ -22,16 +22,7 @@ import (
 
 func persistentTemp(t *testing.T, name string) string {
 	t.Helper()
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	base := filepath.Join(home, "tmp", "aira-go-tests", name+"-"+strconv.FormatInt(time.Now().UnixNano(), 10))
-	if err := os.MkdirAll(base, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(base) })
-	return base
+	return t.TempDir()
 }
 
 func testStore(t *testing.T, root, common, state string) *Store {

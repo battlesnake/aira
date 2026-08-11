@@ -113,14 +113,7 @@ func mcpProbeValues(action core.SkillAction, cli core.Request) map[string]json.R
 }
 
 func TestSkillFaceInstallGuideAndRefusalRules(t *testing.T) {
-	if err := os.MkdirAll("/home/user/tmp", 0o755); err != nil {
-		t.Fatal(err)
-	}
-	dir, err := os.MkdirTemp("/home/user/tmp", "aira-skill-test-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 	var guide bytes.Buffer
 	if exit := Run([]string{"skill", "guide"}, &guide, &bytes.Buffer{}); exit != 0 || !strings.Contains(guide.String(), "# AIRA Agent Guide") {
 		t.Fatalf("guide exit=%d output=%q", exit, guide.String())
@@ -157,14 +150,7 @@ func TestSkillFaceInstallGuideAndRefusalRules(t *testing.T) {
 }
 
 func TestSkillExamplesReachCoreFromRun(t *testing.T) {
-	if err := os.MkdirAll("/home/user/tmp", 0o755); err != nil {
-		t.Fatal(err)
-	}
-	dir, err := os.MkdirTemp("/home/user/tmp", "aira-skill-e2e-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 	if err := exec.Command("git", "init", dir).Run(); err != nil {
 		t.Fatal(err)
 	}
