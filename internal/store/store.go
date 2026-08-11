@@ -735,7 +735,7 @@ func (s *Store) AllocateID(ctx context.Context, prefix string) (string, error) {
 			VALUES(?, ?, ?, ?, 'id.allocate', '', '', NULL, ?)`, s.projectID, seq, s.worktreeID, path, id); err != nil {
 			return err
 		}
-		if err := insertEvent(ctx, conn, s.projectID, seq, "id.allocate", id); err != nil {
+		if err := insertAllocationEvent(ctx, conn, s.projectID, seq, "id.allocate", id, kind); err != nil {
 			return err
 		}
 		receipt = AllocationReceipt{ProjectID: s.projectID, WorktreeID: s.worktreeID, ID: id, Path: path,
@@ -1410,7 +1410,7 @@ func (s *Store) Rebuild(ctx context.Context) error {
 			if event.ProjectID != s.projectID {
 				continue
 			}
-			if event.PayloadDigest != digestBytes([]byte(event.Verb+"\x00"+event.Target)) {
+			if !validJournalEventDigest(event.Verb, event.Target, event.PayloadDigest) {
 				return fmt.Errorf("E_JOURNAL_CORRUPT: event %s/%d has invalid payload digest", event.ProjectID, event.Seq)
 			}
 			var existing eventRecord
@@ -1473,7 +1473,7 @@ func (s *Store) Rebuild(ctx context.Context) error {
 				}
 				recovered = append(recovered, AllocationReceipt{ProjectID: s.projectID, WorktreeID: allocationWorktree,
 					ID: ticket.Ticket.ID, Path: allocationPath, Seq: allocationSeq, State: "recovered", Kind: reconciledKind})
-				if err := ensureRecoveredEvent(ctx, conn, ticket.Ticket.ID, ticket.WorktreeID, ticket.Path, allocationSeq, s.projectID, journal); err != nil {
+				if err := ensureRecoveredEvent(ctx, conn, ticket.Ticket.ID, ticket.WorktreeID, ticket.Path, allocationSeq, s.projectID, reconciledKind, journal); err != nil {
 					return err
 				}
 			} else if err != nil {
@@ -1565,7 +1565,7 @@ func (s *Store) ensureReceiptAllocation(ctx context.Context, conn *sql.Conn, rec
 	if err != nil {
 		return err
 	}
-	return ensureAllocationEvent(ctx, conn, receipt.ProjectID, receipt.ID, receipt.WorktreeID, receipt.Path, receipt.Seq, journal)
+	return ensureAllocationEvent(ctx, conn, receipt.ProjectID, receipt.ID, receipt.WorktreeID, receipt.Path, receipt.Seq, kind, journal)
 }
 
 // reconcileAllocationKind cross-validates the entity kind claimed by the durable
@@ -1595,18 +1595,24 @@ func (s *Store) reconcileAllocationKind(prefix, receiptKind, path string) (strin
 	return kind, nil
 }
 
-func ensureRecoveredEvent(ctx context.Context, conn *sql.Conn, id, worktreeID, path string, seq int64, project string, journal []eventRecord) error {
-	return ensureAllocationEvent(ctx, conn, project, id, worktreeID, path, seq, journal)
+func ensureRecoveredEvent(ctx context.Context, conn *sql.Conn, id, worktreeID, path string, seq int64, project, kind string, journal []eventRecord) error {
+	return ensureAllocationEvent(ctx, conn, project, id, worktreeID, path, seq, kind, journal)
 }
 
-func ensureAllocationEvent(ctx context.Context, conn *sql.Conn, project, id, worktreeID, path string, seq int64, journal []eventRecord) error {
+// ensureAllocationEvent validates or reconstructs the allocation event for a
+// recovered allocation. kind is the already-reconciled entity kind (from
+// reconcileAllocationKind); the payload digest is validated strictly against it,
+// so a journal event whose kind-inclusive digest disagrees with the reconciled
+// kind — a coordinated tamper of DB/receipt/path/registry that missed the
+// journal — is caught as E_JOURNAL_CORRUPT.
+func ensureAllocationEvent(ctx context.Context, conn *sql.Conn, project, id, worktreeID, path string, seq int64, kind string, journal []eventRecord) error {
 	fromJournal, journaled := journalEventFor(journal, project, seq)
-	verb, target, payload := "id.allocate", id, digestBytes([]byte("id.allocate\x00"+id))
+	verb, target, payload := "id.allocate", id, allocationEventDigest("id.allocate", id, kind)
 	if fromJournal.ProjectID != "" {
 		if fromJournal.Target != id {
 			return fmt.Errorf("E_JOURNAL_CORRUPT: duplicate project/seq %s/%d has target %s and %s", project, seq, fromJournal.Target, id)
 		}
-		if fromJournal.PayloadDigest != digestBytes([]byte(fromJournal.Verb+"\x00"+fromJournal.Target)) {
+		if fromJournal.PayloadDigest != allocationEventDigest(fromJournal.Verb, fromJournal.Target, kind) {
 			return fmt.Errorf("E_JOURNAL_CORRUPT: event %s/%d has invalid payload digest", project, seq)
 		}
 		verb, target, payload = fromJournal.Verb, fromJournal.Target, fromJournal.PayloadDigest
@@ -1623,7 +1629,7 @@ func ensureAllocationEvent(ctx context.Context, conn *sql.Conn, project, id, wor
 			return err
 		} else if existing.Target != id {
 			return fmt.Errorf("E_JOURNAL_CORRUPT: duplicate project/seq %s/%d has different payload", project, seq)
-		} else if existing.PayloadDigest != digestBytes([]byte(existing.Verb+"\x00"+existing.Target)) {
+		} else if existing.PayloadDigest != allocationEventDigest(existing.Verb, existing.Target, kind) {
 			return fmt.Errorf("E_JOURNAL_CORRUPT: event %s/%d has invalid payload digest", project, seq)
 		} else {
 			verb, target, payload = existing.Verb, existing.Target, existing.PayloadDigest
@@ -1730,6 +1736,49 @@ func insertEventActor(ctx context.Context, conn *sql.Conn, project string, seq i
 	_, err := conn.ExecContext(ctx, `INSERT INTO events(project_id, seq, at_wall, actor, verb, target, payload_digest)
         VALUES(?, ?, ?, ?, ?, ?, ?)`, project, seq, time.Now().UTC().Format(time.RFC3339Nano), actor, verb, target, payload)
 	return err
+}
+
+// allocationEventDigest binds the entity kind into an allocation-bearing event's
+// authenticated payload digest. A ticket allocation keeps the pre-M9 two-part
+// digest — kind is the legacy default, so existing ticket journals validate
+// unchanged — while any non-ticket kind gets an explicit three-part digest, so
+// the journal is an independent cross-check source for kind. A kind tamper that
+// changes the DB/receipt/path/registry but leaves the journal is then caught as a
+// digest disagreement in ensureAllocationEvent. digestBytes is unkeyed, so this
+// detects inconsistent corruption/tamper across sources, not a fully consistent
+// rewrite of every source (an unkeyed hash cannot, and that is out of scope).
+func allocationEventDigest(verb, id, kind string) string {
+	if normaliseKind(kind) == kindTicket {
+		return digestBytes([]byte(verb + "\x00" + id))
+	}
+	return digestBytes([]byte(verb + "\x00" + id + "\x00" + normaliseKind(kind)))
+}
+
+// insertAllocationEvent writes an allocation-bearing event with the kind-inclusive
+// payload digest. Used by every path that establishes an allocation's kind
+// (id.allocate, requirement.create, requirement.import); ticket.create keeps the
+// plain insertEvent, which allocationEventDigest reproduces byte-for-byte.
+func insertAllocationEvent(ctx context.Context, conn *sql.Conn, project string, seq int64, verb, id, kind string) error {
+	payload := allocationEventDigest(verb, id, kind)
+	_, err := conn.ExecContext(ctx, `INSERT INTO events(project_id, seq, at_wall, actor, verb, target, payload_digest)
+        VALUES(?, ?, ?, 'aira', ?, ?, ?)`, project, seq, time.Now().UTC().Format(time.RFC3339Nano), verb, id, payload)
+	return err
+}
+
+// validJournalEventDigest is the weak, kind-agnostic well-formedness gate used
+// when replaying the journal into the events index. It accepts the legacy
+// two-part digest for any event, and the three-part kind-inclusive digest only
+// for allocation-bearing verbs (the only non-ticket kind is requirement). The
+// strict binding against the reconciled kind is enforced in ensureAllocationEvent.
+func validJournalEventDigest(verb, target, digest string) bool {
+	if digest == digestBytes([]byte(verb+"\x00"+target)) {
+		return true
+	}
+	switch verb {
+	case "id.allocate", "requirement.create", "requirement.import":
+		return digest == digestBytes([]byte(verb+"\x00"+target+"\x00"+kindRequirement))
+	}
+	return false
 }
 
 func (s *Store) ticketPath(id string) string {

@@ -158,7 +158,7 @@ func (s *Store) prepareCreateRequirement(ctx context.Context, input domain.Requi
             VALUES(?, ?, ?, ?, 'requirement.create', '', ?, ?, ?, ?)`, s.projectID, seq, s.worktreeID, path, digest, data, id, string(IntentKindRequirementFile)); err != nil {
 			return err
 		}
-		if err := insertEvent(ctx, conn, s.projectID, seq, "requirement.create", id); err != nil {
+		if err := insertAllocationEvent(ctx, conn, s.projectID, seq, "requirement.create", id, kindRequirement); err != nil {
 			return err
 		}
 		intent = Intent{ProjectID: s.projectID, WorktreeID: s.worktreeID, Seq: seq, Path: path,
