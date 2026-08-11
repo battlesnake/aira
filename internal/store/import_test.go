@@ -70,12 +70,12 @@ func TestImportFindingsUpdateExistingContent(t *testing.T) {
 func mixedImportJSONL() string {
 	return strings.Join([]string{
 		`{"ticket":"AIRA-1","category":"correctness","severity":"P1","verdict":"confirmed","source":"codex","message":"good one"}`, // 1 valid
-		`not json at all`,                             // 2 bad JSON
+		`not json at all`, // 2 bad JSON
 		`{"ticket":"AIRA-2","category":"perf","severity":"P9","verdict":"confirmed","source":"codex","message":"bad severity"}`, // 3 invalid enum
-		``,                                            // 4 blank (ignored)
-		`{"ticket":"","category":"x","severity":"P1","verdict":"confirmed","source":"codex","message":"no ticket"}`, // 5 empty ticket
+		``, // 4 blank (ignored)
+		`{"ticket":"","category":"x","severity":"P1","verdict":"confirmed","source":"codex","message":"no ticket"}`,                             // 5 empty ticket
 		`{"subtype":"reconciliation","ticket":"AIRA-3","category":"x","severity":"P1","verdict":"confirmed","source":"aira","message":"recon"}`, // 6 wrong subtype
-		`{"ticket":"AIRA-4","category":"style","severity":"P2","verdict":"plausible","source":"human","message":"another good"}`, // 7 valid
+		`{"ticket":"AIRA-4","category":"style","severity":"P2","verdict":"plausible","source":"human","message":"another good"}`,                // 7 valid
 	}, "\n") + "\n"
 }
 

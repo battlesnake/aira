@@ -47,11 +47,11 @@ func (s *Store) requirementPath(id string) string {
 // the path is under neither entity directory. Used to cross-validate a durable
 // receipt/allocation path against the authoritative prefix kind.
 func kindForPath(path string) string {
-	normalised := filepath.ToSlash(path)
+	parent := filepath.ToSlash(filepath.Dir(filepath.Clean(path)))
 	switch {
-	case strings.Contains(normalised, ".aira/requirements/"):
+	case parent == ".aira/requirements" || strings.HasSuffix(parent, "/.aira/requirements"):
 		return kindRequirement
-	case strings.Contains(normalised, ".aira/tickets/"):
+	case parent == ".aira/tickets" || strings.HasSuffix(parent, "/.aira/tickets"):
 		return kindTicket
 	default:
 		return ""

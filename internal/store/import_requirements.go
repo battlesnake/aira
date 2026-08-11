@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -186,6 +187,13 @@ func allRequirementTableDashes(cells []string) bool {
 		return false
 	}
 	for _, cell := range cells {
+		cell = strings.TrimSpace(cell)
+		if strings.HasPrefix(cell, ":") {
+			cell = strings.TrimPrefix(cell, ":")
+		}
+		if strings.HasSuffix(cell, ":") {
+			cell = strings.TrimSuffix(cell, ":")
+		}
 		if cell == "" || strings.Trim(cell, "-") != "" {
 			return false
 		}
@@ -258,12 +266,27 @@ func (s *Store) importRequirementRow(ctx context.Context, row importedRequiremen
 		}
 		return "repaired", nil
 	}
+	if currentDigest == row.Digest && !indexed {
+		completed, ok, err := s.completedRequirementImport(ctx, path, row.Digest)
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			completed.Intended = row.Data
+			if err := s.markRequirementMaterialised(ctx, completed); err != nil {
+				return "", err
+			}
+			if err := s.journalEvent(ctx, completed.ProjectID, completed.Seq); err != nil {
+				return "", err
+			}
+			return "repaired", nil
+		}
+	}
 	if currentDigest == row.Digest && indexed && !hasPending {
 		return "unchanged", nil
 	}
 	if currentDigest == "" || previouslyIntended || !indexed {
-		intent, err := s.preparePathMutationEventKind(ctx, path, currentDigest, row.Data,
-			"requirement.import", row.ID, IntentKindRequirementFile)
+		intent, err := s.prepareRequirementImportMutation(ctx, path, currentDigest, row.Data, row.ID)
 		if err != nil {
 			return "", err
 		}
@@ -273,8 +296,7 @@ func (s *Store) importRequirementRow(ctx context.Context, row importedRequiremen
 		return "repaired", nil
 	}
 
-	intent, err := s.preparePathMutationEventKind(ctx, path, currentDigest, row.Data,
-		"requirement.import", row.ID, IntentKindRequirementFile)
+	intent, err := s.prepareRequirementImportMutation(ctx, path, currentDigest, row.Data, row.ID)
 	if err != nil {
 		return "", err
 	}
@@ -324,6 +346,27 @@ func (s *Store) hasRequirementImportDigest(ctx context.Context, path, digest str
 	return found == 1, nil
 }
 
+func (s *Store) completedRequirementImport(ctx context.Context, path, digest string) (Intent, bool, error) {
+	var intent Intent
+	var kind string
+	var materialised int
+	err := s.db.QueryRowContext(ctx, `SELECT project_id, worktree_id, seq, path, kind, materialised
+		FROM outbox WHERE project_id=? AND path=? AND verb='requirement.import' AND intended_digest=?
+		AND materialised=1 AND resolution IS NULL ORDER BY seq DESC LIMIT 1`, s.projectID, path, digest).Scan(
+		&intent.ProjectID, &intent.WorktreeID, &intent.Seq, &intent.Path, &kind, &materialised)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Intent{}, false, nil
+	}
+	if err != nil {
+		return Intent{}, false, err
+	}
+	if kind != string(IntentKindRequirementFile) || materialised != 1 {
+		return Intent{}, false, fmt.Errorf("E_JOURNAL_CORRUPT: completed requirement import has kind %q", kind)
+	}
+	intent.Kind = IntentKindRequirementFile
+	return intent, true, nil
+}
+
 func (s *Store) pendingRequirementImport(ctx context.Context, id, path string) (Intent, bool, error) {
 	var intent Intent
 	var kind string
@@ -368,6 +411,12 @@ func (s *Store) registerImportedRequirement(ctx context.Context, row importedReq
 		if err := insertAllocationEvent(ctx, conn, s.projectID, seq, "requirement.import", row.ID, kindRequirement); err != nil {
 			return err
 		}
+		if _, err := conn.ExecContext(ctx, `INSERT INTO id_counters(project_id, prefix, next_number)
+            VALUES(?, ?, ?) ON CONFLICT(project_id, prefix) DO UPDATE SET next_number=
+            CASE WHEN id_counters.next_number < excluded.next_number THEN excluded.next_number ELSE id_counters.next_number END`,
+			s.projectID, row.Prefix, row.Number+1); err != nil {
+			return err
+		}
 		intent = Intent{ProjectID: s.projectID, WorktreeID: s.worktreeID, Seq: seq, Path: path,
 			Kind: IntentKindRequirementFile, Precondition: "", Intended: row.Data, AllocationID: row.ID}
 		return nil
@@ -379,6 +428,46 @@ func (s *Store) registerImportedRequirement(ctx context.Context, row importedReq
 		Path: path, Seq: intent.Seq, State: "allocated", Kind: kindRequirement}
 	intent.Receipt = receipt
 	return intent, receipt, nil
+}
+
+func (s *Store) prepareRequirementImportMutation(ctx context.Context, path, precondition string, intended []byte, target string) (Intent, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return Intent{}, err
+	}
+	var intent Intent
+	err = s.withImmediate(ctx, func(conn *sql.Conn) error {
+		var existing int
+		err := conn.QueryRowContext(ctx, `SELECT 1 FROM outbox WHERE project_id=? AND worktree_id=? AND path=? AND materialised=0 AND resolution IS NULL LIMIT 1`,
+			s.projectID, s.worktreeID, path).Scan(&existing)
+		if err == nil {
+			return ErrPathIntentBusy
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		seq, err := nextSequence(ctx, conn, s.projectID)
+		if err != nil {
+			return err
+		}
+		digest := digestBytes(intended)
+		if _, err := conn.ExecContext(ctx, `INSERT INTO outbox(project_id, seq, worktree_id, path, verb,
+            precondition_digest, intended_digest, intended_bytes, kind)
+            VALUES(?, ?, ?, ?, 'requirement.import', ?, ?, ?, ?)`, s.projectID, seq, s.worktreeID, path,
+			precondition, digest, intended, string(IntentKindRequirementFile)); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "unique") {
+				return ErrPathIntentBusy
+			}
+			return err
+		}
+		if err := insertAllocationEvent(ctx, conn, s.projectID, seq, "requirement.import", target, kindRequirement); err != nil {
+			return err
+		}
+		intent = Intent{ProjectID: s.projectID, WorktreeID: s.worktreeID, Seq: seq, Path: path,
+			Kind: IntentKindRequirementFile, Precondition: precondition, Intended: intended}
+		return nil
+	})
+	return intent, err
 }
 
 func (s *Store) advanceImportedRequirementCounters(ctx context.Context, maxima map[string]int64) error {

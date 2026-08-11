@@ -32,21 +32,21 @@ var (
 )
 
 type Options struct {
-	Root          string
-	CommonDir     string
-	DBPath        string
-	RegistryPath  string
-	ProjectID     string
-	WorktreeID    string
-	ProjectSlug   string
-	Prefixes      []string
+	Root         string
+	CommonDir    string
+	DBPath       string
+	RegistryPath string
+	ProjectID    string
+	WorktreeID   string
+	ProjectSlug  string
+	Prefixes     []string
 	// RequirementPrefixes registers requirement-kind ID prefixes (e.g. "AR").
 	// They must be disjoint from Prefixes (ticket-kind); a prefix belongs to
 	// exactly one kind.
 	RequirementPrefixes []string
 	LeaseStateDir       string
-	LeaseTTLNS    uint64
-	Clock         Clock
+	LeaseTTLNS          uint64
+	Clock               Clock
 }
 
 type Store struct {

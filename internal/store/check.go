@@ -22,14 +22,14 @@ var ExitCodes = map[string]int{
 	"E_JOURNAL_CORRUPT": 4,
 	"E_FINDING_INVALID": 2, "E_WAIVER_REASON_REQUIRED": 2, "E_QUERY_INVALID": 2,
 	"E_REQUIREMENT_INVALID": 2,
-	"E_IMPORT_INVALID": 2, "E_ARGUMENT_INVALID": 2,
+	"E_IMPORT_INVALID":      2, "E_ARGUMENT_INVALID": 2,
 	"E_INDEX_UNEVALUATED": 3,
 	// Domain-operation failure codes. These already exited 1 via the default
 	// below; registering them here documents them so generated response
 	// contracts (e.g. the Skill face) do not present an incomplete vocabulary.
 	"E_LEASE_TOKEN": 1, "E_LEASE_HELD": 1, "E_LEASE_EXPIRED": 1, "E_TOKEN_WORKTREE": 1,
 	"E_TRANSITION_INVALID": 1,
-	"E_RELATION_INVALID": 1, "E_RELATION_EXISTS": 1, "E_CROSS_PROJECT_RELATION": 1,
+	"E_RELATION_INVALID":   1, "E_RELATION_EXISTS": 1, "E_CROSS_PROJECT_RELATION": 1,
 	"E_RELATION_TARGET_MISSING": 1, "E_RELATION_UNOBSERVABLE": 1,
 	"E_WRITE_CONFLICT": 1, "E_PROJECT_MISMATCH": 1,
 	"E_ID_UNRESOLVED": 1, "E_DUPLICATE_ID": 1, "E_PREFIX_OWNERSHIP_CONFLICT": 1,

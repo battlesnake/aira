@@ -89,7 +89,9 @@ func TestRebuildRejectsKindDowngradedAllocationEvent(t *testing.T) {
 // is accepted only for allocation-bearing verbs; everything else is refused.
 func TestValidJournalEventDigestGate(t *testing.T) {
 	d0 := func(verb, target string) string { return digestBytes([]byte(verb + "\x00" + target)) }
-	d1req := func(verb, target string) string { return digestBytes([]byte(verb + "\x00" + target + "\x00requirement")) }
+	d1req := func(verb, target string) string {
+		return digestBytes([]byte(verb + "\x00" + target + "\x00requirement"))
+	}
 
 	// Legacy D0 is accepted for an ordinary (non-allocation) verb.
 	if !validJournalEventDigest("ticket.update", "AIRA-1", d0("ticket.update", "AIRA-1")) {

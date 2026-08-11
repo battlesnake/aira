@@ -28,7 +28,6 @@ type ImportSummary struct {
 	Total    int          `json:"total"`
 }
 
-
 type rawFinding struct {
 	Subtype      string `json:"subtype"`
 	Ticket       string `json:"ticket"`
@@ -163,18 +162,18 @@ func parseAndValidate(line string, lineNum int) (domain.ReviewFindingInput, stri
 	}
 
 	input := domain.ReviewFindingInput{
-		TicketID:     raw.Ticket,
-		Category:     raw.Category,
-		Severity:     domain.Severity(raw.Severity),
-		Verdict:      domain.Verdict(raw.Verdict),
-		Source:       raw.Source,
-		Message:      raw.Message,
-		File:         raw.File,
-		Line:         raw.Line,
+		TicketID:      raw.Ticket,
+		Category:      raw.Category,
+		Severity:      domain.Severity(raw.Severity),
+		Verdict:       domain.Verdict(raw.Verdict),
+		Source:        raw.Source,
+		Message:       raw.Message,
+		File:          raw.File,
+		Line:          raw.Line,
 		RequirementID: raw.Requirement,
-		Disposition:  domain.Disposition(disposition),
-		WaiverReason: raw.WaiverReason,
-		WaiverActor:  raw.WaiverActor,
+		Disposition:   domain.Disposition(disposition),
+		WaiverReason:  raw.WaiverReason,
+		WaiverActor:   raw.WaiverActor,
 	}
 
 	finding, err := domain.NewReviewFinding(input)

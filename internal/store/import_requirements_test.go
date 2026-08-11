@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -224,6 +225,134 @@ func TestImportRequirementsUpdatesChangedContentWithoutReplacementID(t *testing.
 	}
 }
 
+func TestImportRequirementsUpdateUsesKindInclusiveEventDigest(t *testing.T) {
+	base := persistentTemp(t, "import-requirements-event-digest")
+	root := filepath.Join(base, "main")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := openStoreWithRequirementPrefix(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	input := filepath.Join(base, "REQUIREMENTS.md")
+	writeRequirementImportFile(t, input, "| AR-1 | Original. | designed | — | — |\n")
+	if _, err := s.ImportRequirements(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
+	writeRequirementImportFile(t, input, "| AR-1 | Revised. | built | — | — |\n")
+	if _, err := s.ImportRequirements(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
+
+	var payload string
+	if err := s.db.QueryRow(`SELECT payload_digest FROM events WHERE project_id=? AND verb='requirement.import' AND target='AR-1' ORDER BY seq DESC LIMIT 1`, s.projectID).Scan(&payload); err != nil {
+		t.Fatal(err)
+	}
+	want := allocationEventDigest("requirement.import", "AR-1", kindRequirement)
+	if payload != want {
+		t.Fatalf("update payload digest=%q, want D1 %q", payload, want)
+	}
+	if err := s.Rebuild(context.Background()); err != nil {
+		t.Fatalf("rebuild after update event: %v", err)
+	}
+}
+
+func TestRegisterImportedRequirementAdvancesCounterInRegistrationTransaction(t *testing.T) {
+	base := persistentTemp(t, "import-requirements-counter-crash")
+	root := filepath.Join(base, "main")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := openStoreWithRequirementPrefix(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	rows, err := parseRequirementTable([]byte("| ID | Requirement | Status | Implemented-by | Verified-by |\n|---|---|---|---|---|\n| AR-1 | One. | designed | — | — |\n| AR-2 | Two. | designed | — | — |\n| AR-3 | Three. | designed | — | — |\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if _, _, err := s.registerImportedRequirement(context.Background(), row, s.requirementPath(row.ID)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var next int64
+	if err := s.db.QueryRow(`SELECT next_number FROM id_counters WHERE project_id=? AND prefix='AR'`, s.projectID).Scan(&next); err != nil {
+		t.Fatal(err)
+	}
+	if next < 4 {
+		t.Fatalf("counter next_number=%d after per-row registration, want >=4", next)
+	}
+}
+
+func TestImportRequirementsAcceptsAlignedSeparator(t *testing.T) {
+	base := persistentTemp(t, "import-requirements-aligned-separator")
+	root := filepath.Join(base, "main")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := openStoreWithRequirementPrefix(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	input := filepath.Join(base, "REQUIREMENTS.md")
+	if err := os.WriteFile(input, []byte("| ID | Requirement | Status | Implemented-by | Verified-by |\n|:---:|:---|---:|:---:|:---|\n| AR-1 | Aligned. | designed | — | — |\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := s.ImportRequirements(context.Background(), input)
+	if err != nil {
+		t.Fatalf("aligned separator import: %v", err)
+	}
+	if !reflect.DeepEqual(summary.Created, []string{"AR-1"}) {
+		t.Fatalf("summary=%+v", summary)
+	}
+}
+
+func TestKindForPathUsesImmediateEntityDirectory(t *testing.T) {
+	root := filepath.Join(string(filepath.Separator), "tmp", ".aira", "requirements", "nested-repo")
+	ticketPath := filepath.Join(root, ".aira", "tickets", "AIRA-1.md")
+	if got := kindForPath(ticketPath); got != kindTicket {
+		t.Fatalf("kindForPath(%q)=%q, want %q", ticketPath, got, kindTicket)
+	}
+	s := &Store{prefixes: map[string]string{"AIRA": kindTicket}}
+	if got, err := s.reconcileAllocationKind("AIRA", kindTicket, ticketPath); err != nil || got != kindTicket {
+		t.Fatalf("reconcileAllocationKind=%q, err=%v", got, err)
+	}
+	if got := kindForPath(filepath.Join(root, ".aira", "requirements", "AR-1.md")); got != kindRequirement {
+		t.Fatalf("requirement kindForPath=%q, want %q", got, kindRequirement)
+	}
+}
+
+func TestImportRequirementsRepairsMissingIndexWithoutNewEvent(t *testing.T) {
+	base := persistentTemp(t, "import-requirements-index-only")
+	root := filepath.Join(base, "main")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := openStoreWithRequirementPrefix(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	input := filepath.Join(base, "REQUIREMENTS.md")
+	writeRequirementImportFile(t, input, "| AR-1 | Keep file and outbox. | designed | — | — |\n")
+	if _, err := s.ImportRequirements(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
+	var before int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM events WHERE project_id=? AND verb='requirement.import' AND target='AR-1'`, s.projectID).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM requirements WHERE project_id=? AND worktree_id=? AND id='AR-1'`, s.projectID, s.worktreeID); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := s.ImportRequirements(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(summary.Repaired, []string{"AR-1"}) {
+		t.Fatalf("summary=%+v", summary)
+	}
+	var after int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM events WHERE project_id=? AND verb='requirement.import' AND target='AR-1'`, s.projectID).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("requirement.import events=%d after index repair, want %d", after, before)
+	}
+	if _, err := s.GetRequirement("AR-1"); err != nil {
+		t.Fatalf("index was not restored: %v", err)
+	}
+}
+
 func TestImportRequirementsMalformedRowMakesNoWrites(t *testing.T) {
 	base := persistentTemp(t, "import-requirements-malformed")
 	root := filepath.Join(base, "main")
@@ -269,7 +398,7 @@ func TestParseRealRequirementsRegistry(t *testing.T) {
 		t.Fatalf("parsed %d rows, want 7", len(rows))
 	}
 	for i, row := range rows {
-		wantID := "AR-" + string(rune('1'+i))
+		wantID := "AR-" + strconv.Itoa(i+1)
 		if row.ID != wantID || row.Status != domain.RequirementDesigned {
 			t.Fatalf("row %d=%+v, want %s designed", i, row, wantID)
 		}
