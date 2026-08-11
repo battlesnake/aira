@@ -1518,8 +1518,15 @@ func (s *Store) Rebuild(ctx context.Context) error {
 				// An allocation row already exists; a scanned ticket file for the
 				// same ID must not disagree with the recorded kind (e.g. a fake
 				// ticket file shadowing a real requirement allocation).
-				if _, kindErr := s.reconcileAllocationKind(prefix, normaliseKind(allocationKind), ticket.Path); kindErr != nil {
+				reconciledKind, kindErr := s.reconcileAllocationKind(prefix, normaliseKind(allocationKind), ticket.Path)
+				if kindErr != nil {
 					return kindErr
+				}
+				// Validate (or reconstruct) the allocation event against the
+				// reconciled kind even when the receipt is absent, so a mis-kinded
+				// or downgraded journal event cannot survive a rebuild undetected.
+				if err := ensureRecoveredEvent(ctx, conn, ticket.Ticket.ID, ticket.WorktreeID, ticket.Path, allocationSeq, s.projectID, reconciledKind, journal); err != nil {
+					return err
 				}
 				if !receiptKeys[receiptKey(s.projectID, ticket.Ticket.ID, allocationSeq)] {
 					recovered = append(recovered, AllocationReceipt{ProjectID: s.projectID, WorktreeID: allocationWorktree,
@@ -1572,8 +1579,15 @@ func (s *Store) Rebuild(ctx context.Context) error {
 			} else {
 				// An allocation row already exists; a scanned requirement file for
 				// the same ID must not disagree with the recorded kind.
-				if _, kindErr := s.reconcileAllocationKind(prefix, normaliseKind(allocationKind), req.Path); kindErr != nil {
+				reconciledKind, kindErr := s.reconcileAllocationKind(prefix, normaliseKind(allocationKind), req.Path)
+				if kindErr != nil {
 					return kindErr
+				}
+				// Validate (or reconstruct) the allocation event against the
+				// reconciled kind even when the receipt is absent, so a mis-kinded
+				// or downgraded journal event cannot survive a rebuild undetected.
+				if err := ensureRecoveredEvent(ctx, conn, req.Requirement.ID, req.WorktreeID, req.Path, allocationSeq, s.projectID, reconciledKind, journal); err != nil {
+					return err
 				}
 				if !receiptKeys[receiptKey(s.projectID, req.Requirement.ID, allocationSeq)] {
 					recovered = append(recovered, AllocationReceipt{ProjectID: s.projectID, WorktreeID: allocationWorktree,

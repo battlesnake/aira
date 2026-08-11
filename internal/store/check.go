@@ -133,6 +133,19 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 			continue
 		}
 		id := fmt.Sprintf("%s-%d", prefix, number)
+		// Integrity: the allocation's recorded kind must agree with the directory
+		// kind of its path, and the kind must be a known value. A corrupt row (a
+		// kind/path disagreement, an unknown kind, or a path outside the entity
+		// directories) is an integrity fault — never resolve it against the wrong
+		// entity type, which would let a mis-placed file falsely satisfy the check.
+		if pathKind := kindForPath(path); pathKind == "" || pathKind != normaliseKind(kind) {
+			report.Dimensions["allocated-id-file"] = "fail"
+			report.Findings = append(report.Findings, CheckFinding{
+				Code: "E_JOURNAL_CORRUPT", Subject: id,
+				Message: fmt.Sprintf("allocation kind %q disagrees with path %s", normaliseKind(kind), path), Kind: "fail",
+			})
+			continue
+		}
 		// An allocation is resolved by the entity file of its own kind: a
 		// requirement allocation must point at a materialised requirement file,
 		// not a ticket file. Verifying the wrong kind would falsely fail every

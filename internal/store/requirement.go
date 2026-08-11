@@ -43,9 +43,13 @@ func scanRequirements(root, worktree string) (requirementScanResult, error) {
 	}
 	result := requirementScanResult{}
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" {
+		if filepath.Ext(entry.Name()) != ".md" {
 			continue
 		}
+		// A directory (or any non-regular entry) shaped like an entity file — e.g.
+		// "AR-5.md" — must NOT be silently skipped: readRegularRequirement flags it
+		// as invalid, which records a finding and advances the ID high-water so the
+		// broken node's ID is never reallocated over the directory.
 		path := filepath.Join(dir, entry.Name())
 		data, readErr := readRegularRequirement(path)
 		if readErr != nil {
