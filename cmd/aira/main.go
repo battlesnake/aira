@@ -133,6 +133,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"touch": {"token": true},
 		"ready": {"list": true},
 		"find":  {"category": true, "severity": true, "verdict": true, "source": true, "message": true, "file": true, "requirement": true, "by": true, "fields": true, "disposition": true, "reason": true, "actor": true},
+		"req":   {"status": true, "fields": true},
 	}
 	for name := range options {
 		if !allowed[verb][name] {
@@ -210,6 +211,41 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			args["selector"], args["disposition"], args["reason"], args["actor"] = positional[1], options["disposition"], options["reason"], options["actor"]
 		default:
 			return core.Request{}, fmt.Errorf("find requires add|ls|show|set")
+		}
+	case "req":
+		if len(positional) == 0 {
+			return core.Request{}, fmt.Errorf("req requires add|ls|show|set|import")
+		}
+		subverb := strings.ToLower(positional[0])
+		args["subverb"] = subverb
+		switch subverb {
+		case "add":
+			if len(positional) < 2 {
+				return core.Request{}, fmt.Errorf("req add requires <text>")
+			}
+			args["text"], args["status"] = strings.Join(positional[1:], " "), options["status"]
+		case "ls":
+			if len(positional) != 1 {
+				return core.Request{}, fmt.Errorf("req ls accepts no positional arguments")
+			}
+			args["fields"] = splitComma(options["fields"])
+		case "show":
+			if len(positional) != 2 {
+				return core.Request{}, fmt.Errorf("req show requires <selector>")
+			}
+			args["selector"] = positional[1]
+		case "set":
+			if len(positional) != 2 {
+				return core.Request{}, fmt.Errorf("req set requires <selector>")
+			}
+			args["selector"], args["status"] = positional[1], options["status"]
+		case "import":
+			if len(positional) != 2 {
+				return core.Request{}, fmt.Errorf("req import requires <file>")
+			}
+			args["file"] = positional[1]
+		default:
+			return core.Request{}, fmt.Errorf("req requires add|ls|show|set|import")
 		}
 	case "list", "ls":
 		args["query"] = strings.Join(positional, " ")

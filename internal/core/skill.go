@@ -139,7 +139,7 @@ func normaliseSkillActions(descriptors []DispatchDescriptor) ([]SkillAction, err
 			return nil, fmt.Errorf("grouped descriptor %q has a verb example", descriptor.Name)
 		}
 		// The set of operations a grouped verb must cover is the discriminator
-		// arg's enum where it has one (find's `subverb`), so growing the enum
+		// arg's enum where it has one (find/req's `subverb`), so growing the enum
 		// without adding an OperationSpec fails closed rather than silently
 		// omitting an action. Discriminators without an enum (link's bool) fall
 		// back to the explicit expected set.
@@ -235,6 +235,8 @@ func groupedOperationNames(descriptor DispatchDescriptor) map[string]bool {
 	switch descriptor.Name {
 	case "find":
 		return map[string]bool{"add": true, "ls": true, "show": true, "set": true}
+	case "req":
+		return map[string]bool{"add": true, "ls": true, "show": true, "set": true, "import": true}
 	case "link":
 		return map[string]bool{"link": true, "list": true}
 	default:

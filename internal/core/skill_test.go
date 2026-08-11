@@ -16,8 +16,8 @@ func TestSkillMetadataNormalisesEveryIncludedAction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(artifacts.Actions) != 24 {
-		t.Fatalf("actions=%d, want 24", len(artifacts.Actions))
+	if len(artifacts.Actions) != 29 {
+		t.Fatalf("actions=%d, want 29", len(artifacts.Actions))
 	}
 	for _, action := range artifacts.Actions {
 		if action.Summary == "" || !action.Safety.Valid() || !strings.HasPrefix(action.Command, "aira ") {
@@ -75,6 +75,7 @@ func TestSkillSafetyGolden(t *testing.T) {
 		"list": SafetyRead, "count": SafetyRead, "set": SafetyMutate, "mv": SafetyMutate,
 		"reconcile": SafetyReconcile, "check": SafetyReconcile,
 		"find/add": SafetyMutate, "find/ls": SafetyRead, "find/show": SafetyRead, "find/set": SafetyMutate,
+		"req/add": SafetyMutate, "req/ls": SafetyRead, "req/show": SafetyRead, "req/set": SafetyMutate, "req/import": SafetyMutate,
 		"link/link": SafetyMutate, "link/list": SafetyRead,
 	}
 	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
@@ -84,7 +85,7 @@ func TestSkillSafetyGolden(t *testing.T) {
 	got := map[string]SafetyClass{}
 	for _, action := range artifacts.Actions {
 		key := action.Verb
-		if action.Verb == "find" || action.Verb == "link" {
+		if action.Verb == "find" || action.Verb == "req" || action.Verb == "link" {
 			key += "/" + action.Operation
 		}
 		got[key] = action.Safety
@@ -110,7 +111,7 @@ func TestSkillActionSetIsCanonicalAndDealiased(t *testing.T) {
 			}
 		}
 	}
-	for _, name := range []string{"find/add", "find/ls", "find/show", "find/set", "link/link", "link/list", "unlink/unlink"} {
+	for _, name := range []string{"find/add", "find/ls", "find/show", "find/set", "req/add", "req/ls", "req/show", "req/set", "req/import", "link/link", "link/list", "unlink/unlink"} {
 		if !got[name] {
 			t.Fatalf("missing action %q", name)
 		}
@@ -165,6 +166,10 @@ func TestResponseContractMatchesUnevaluatedDo(t *testing.T) {
 
 type unevaluatedContractStore struct{ metadataProbeStore }
 
+func (unevaluatedContractStore) ImportRequirements(context.Context, string) (store.ImportRequirementsSummary, error) {
+	return store.ImportRequirementsSummary{}, nil
+}
+
 func (unevaluatedContractStore) Check(context.Context) (store.CheckReport, error) {
 	return store.CheckReport{Verdict: "unevaluated", Unevaluated: true}, nil
 }
@@ -173,6 +178,10 @@ type verdictStore struct {
 	metadataProbeStore
 	verdict     string
 	unevaluated bool
+}
+
+func (verdictStore) ImportRequirements(context.Context, string) (store.ImportRequirementsSummary, error) {
+	return store.ImportRequirementsSummary{}, nil
 }
 
 func (v verdictStore) Check(context.Context) (store.CheckReport, error) {

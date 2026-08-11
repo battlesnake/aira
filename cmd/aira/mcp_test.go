@@ -37,7 +37,7 @@ func TestMCPToolListIsGeneratedAndStable(t *testing.T) {
 	for _, tool := range result.Tools {
 		got = append(got, tool.Name)
 	}
-	want := []string{"aira_check", "aira_claim", "aira_count", "aira_create", "aira_finding", "aira_get", "aira_grep", "aira_heartbeat", "aira_id", "aira_import", "aira_init", "aira_link", "aira_list", "aira_ready", "aira_reconcile", "aira_release", "aira_touch", "aira_transition"}
+	want := []string{"aira_check", "aira_claim", "aira_count", "aira_create", "aira_finding", "aira_get", "aira_grep", "aira_heartbeat", "aira_id", "aira_import", "aira_init", "aira_link", "aira_list", "aira_ready", "aira_reconcile", "aira_release", "aira_requirement", "aira_touch", "aira_transition"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("tools=%v, want=%v", got, want)
 	}
@@ -285,6 +285,10 @@ func TestMCPGroupedOperationsBuildTheSameCanonicalRequestsAsCLI(t *testing.T) {
 		{name: "finding ls", tool: "aira_finding", arguments: map[string]any{"operation": "ls", "query": "subtype:any", "by": "source", "fields": []any{"id"}}, cli: mustCLIRequest(t, "find", []string{"ls", "subtype:any"}, map[string]string{"by": "source", "fields": "id"})},
 		{name: "finding show", tool: "aira_finding", arguments: map[string]any{"operation": "show", "selector": "f-1"}, cli: mustCLIRequest(t, "find", []string{"show", "f-1"}, nil)},
 		{name: "finding set", tool: "aira_finding", arguments: map[string]any{"operation": "set", "selector": "f-1", "disposition": "waived", "reason": "accepted", "actor": "human"}, cli: mustCLIRequest(t, "find", []string{"set", "f-1"}, map[string]string{"disposition": "waived", "reason": "accepted", "actor": "human"})},
+		{name: "requirement add", tool: "aira_requirement", arguments: map[string]any{"operation": "add", "text": "The system must remain correct.", "status": "planned"}, cli: mustCLIRequest(t, "req", []string{"add", "The system must remain correct."}, map[string]string{"status": "planned"})},
+		{name: "requirement ls", tool: "aira_requirement", arguments: map[string]any{"operation": "ls", "fields": []any{"id"}}, cli: mustCLIRequest(t, "req", []string{"ls"}, map[string]string{"fields": "id"})},
+		{name: "requirement show", tool: "aira_requirement", arguments: map[string]any{"operation": "show", "selector": "AR-1"}, cli: mustCLIRequest(t, "req", []string{"show", "AR-1"}, nil)},
+		{name: "requirement set", tool: "aira_requirement", arguments: map[string]any{"operation": "set", "selector": "AR-1", "status": "built"}, cli: mustCLIRequest(t, "req", []string{"set", "AR-1"}, map[string]string{"status": "built"})},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

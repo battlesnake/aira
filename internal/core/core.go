@@ -55,6 +55,11 @@ type Store interface {
 	List(string) ([]store.TicketRecord, error)
 	AddFinding(context.Context, domain.ReviewFindingInput) (domain.Finding, store.EventKey, error)
 	ListFindings(string) ([]store.FindingRecord, error)
+	AddRequirement(context.Context, domain.RequirementInput) (domain.Requirement, store.EventKey, error)
+	GetRequirement(string) (store.RequirementRecord, error)
+	ListRequirements() ([]store.RequirementRecord, error)
+	SetRequirement(context.Context, string, domain.RequirementStatus) (store.EventKey, error)
+	ImportRequirements(context.Context, string) (store.ImportRequirementsSummary, error)
 	ImportFindingsFile(context.Context, string, bool) (store.ImportSummary, error)
 	Search(context.Context, string, string) ([]store.SearchResult, error)
 	GetFinding(string) (store.FindingRecord, error)
@@ -389,6 +394,55 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				return nil, fmt.Errorf("E_UNKNOWN_VERB: unknown find sub-verb %q", subverb)
 			}
 		}},
+		"req": {Name: "req", Usage: "req add|ls|show|set|import ...", Args: []ArgSpec{stringSpec("subverb", true, true, "Requirement operation", "add", "ls", "show", "set", "import"), stringSpec("text", false, true, "Requirement statement"), stringSpec("status", false, false, "Requirement status", "built", "partial", "designed", "planned", "boundary", "retired", "superseded"), listSpec("fields", false, false, "Optional projected fields"), stringSpec("selector", false, true, "Requirement selector"), stringSpec("file", false, true, "Requirements registry file")}, MCPTool: "aira_requirement", MCPOperation: "subverb", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+			subverb := strings.ToLower(stringArg(args, "subverb"))
+			switch subverb {
+			case "add":
+				requirement, event, err := c.store.AddRequirement(ctx, domain.RequirementInput{Text: stringArg(args, "text"), Status: domain.RequirementStatus(stringArg(args, "status"))})
+				if err != nil {
+					return nil, err
+				}
+				return mutationData(map[string]any{"id": requirement.ID, "requirement": requirement}, event), nil
+			case "ls":
+				rows, err := c.store.ListRequirements()
+				if err != nil {
+					return nil, err
+				}
+				fields := stringSlice(args, "fields")
+				data := map[string]any{"total": len(rows), "rows": projectRequirementRecords(rows, fields)}
+				if len(rows) > ListLimit {
+					data["rows"] = projectRequirementRecords(rows[:ListLimit], fields)
+					data["distribution"] = requirementDistribution(rows, "status")
+					data["truncated"] = true
+				}
+				return handlerData{Data: data}, nil
+			case "show":
+				record, err := c.store.GetRequirement(stringArg(args, "selector"))
+				if err != nil {
+					return nil, err
+				}
+				return projectRequirementRecord(record, nil), nil
+			case "set":
+				selector := stringArg(args, "selector")
+				event, err := c.store.SetRequirement(ctx, selector, domain.RequirementStatus(stringArg(args, "status")))
+				if err != nil {
+					return nil, err
+				}
+				updated, err := c.store.GetRequirement(selector)
+				if err != nil {
+					return nil, err
+				}
+				return mutationData(projectRequirementRecord(updated, nil), event), nil
+			case "import":
+				summary, err := c.store.ImportRequirements(ctx, stringArg(args, "file"))
+				if err != nil {
+					return nil, err
+				}
+				return summary, nil
+			default:
+				return nil, fmt.Errorf("E_UNKNOWN_VERB: unknown req sub-verb %q", subverb)
+			}
+		}},
 		"claim": {Name: "claim", Usage: "claim <id> [--steal --actor NAME]", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), boolSpec("steal", false, false, "Steal an expired lease"), stringSpec("actor", false, false, "Lease actor")}, MCPTool: "aira_claim", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			record, err := c.store.Get(stringArg(args, "selector"))
 			if err != nil {
@@ -605,6 +659,13 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		{Name: "show", Summary: "Show one review finding", Safety: SafetyRead, Args: []OperationArg{{Name: "selector", Required: true}}, Example: []string{"show", "f-1"}},
 		{Name: "set", Summary: "Set a review finding disposition", Safety: SafetyMutate, Args: []OperationArg{{Name: "selector", Required: true}, {Name: "disposition"}, {Name: "reason"}, {Name: "actor"}}, Example: []string{"set", "f-1", "--disposition", "waived", "--reason", "accepted", "--actor", "human"}},
 	}}
+	metadata["req"] = verbMetadata{summary: "Manage requirements", safety: SafetyMutate, operations: []OperationSpec{
+		{Name: "add", Summary: "Add a requirement", Safety: SafetyMutate, Args: []OperationArg{{Name: "text", Required: true}, {Name: "status"}}, Example: []string{"add", "The system must remain correct.", "--status", "planned"}},
+		{Name: "ls", Summary: "List requirements", Safety: SafetyRead, Args: []OperationArg{{Name: "fields"}}, Example: []string{"ls", "--fields", "id"}},
+		{Name: "show", Summary: "Show one requirement", Safety: SafetyRead, Args: []OperationArg{{Name: "selector", Required: true}}, Example: []string{"show", "AR-1"}},
+		{Name: "set", Summary: "Set a requirement status", Safety: SafetyMutate, Args: []OperationArg{{Name: "selector", Required: true}, {Name: "status", Required: true}}, Example: []string{"set", "AR-1", "--status", "built"}},
+		{Name: "import", Summary: "Import a requirements registry preserving IDs", Safety: SafetyMutate, Args: []OperationArg{{Name: "file", Required: true}}, Example: []string{"import", "REQUIREMENTS.md"}},
+	}}
 	metadata["link"] = verbMetadata{summary: "Manage ticket relations", safety: SafetyMutate, operations: []OperationSpec{
 		{Name: "link", Summary: "Create a ticket relation", Safety: SafetyMutate, Args: []OperationArg{{Name: "from", Required: true}, {Name: "kind", Required: true}, {Name: "to", Required: true}}, Example: []string{"AIRA-1", "blocks", "AIRA-2"}},
 		{Name: "list", Summary: "List ticket relations", Safety: SafetyRead, Args: []OperationArg{{Name: "selector", Required: true}}, Example: []string{"ls", "AIRA-1"}},
@@ -743,6 +804,14 @@ func projectFindingRecords(records []store.FindingRecord, fields []string) []map
 	return result
 }
 
+func projectRequirementRecords(records []store.RequirementRecord, fields []string) []map[string]any {
+	result := make([]map[string]any, 0, len(records))
+	for _, record := range records {
+		result = append(result, projectRequirementRecord(record, fields))
+	}
+	return result
+}
+
 func projectSearchResults(records []store.SearchResult, fields []string) []map[string]any {
 	result := make([]map[string]any, 0, len(records))
 	for _, record := range records {
@@ -797,12 +866,39 @@ func projectFindingRecord(record store.FindingRecord, fields []string) map[strin
 	return result
 }
 
+func projectRequirementRecord(record store.RequirementRecord, fields []string) map[string]any {
+	requirement := record.Requirement
+	all := map[string]any{"id": requirement.ID, "status": requirement.Status, "text": requirement.Text, "path": record.Path}
+	if len(fields) == 0 {
+		return all
+	}
+	result := make(map[string]any, len(fields))
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if value, ok := all[field]; ok {
+			result[field] = value
+		}
+	}
+	return result
+}
+
 func findingDistribution(records []store.FindingRecord, by string) map[string]int {
 	result := map[string]int{}
 	for _, record := range records {
 		for _, value := range storeFindingDistributionValues(record.Finding, by) {
 			result[value]++
 		}
+	}
+	return result
+}
+
+func requirementDistribution(records []store.RequirementRecord, by string) map[string]int {
+	result := map[string]int{}
+	if by != "status" {
+		return result
+	}
+	for _, record := range records {
+		result[string(record.Requirement.Status)]++
 	}
 	return result
 }

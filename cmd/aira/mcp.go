@@ -179,10 +179,28 @@ func makeToolBinding(name string, descriptors []core.DispatchDescriptor) mcpTool
 }
 
 func makeMCPOperation(descriptor core.DispatchDescriptor, operation string) mcpOperation {
+	operationArgs := map[string]bool{}
+	operationRequired := map[string]bool{}
+	for _, spec := range descriptor.Operations {
+		if spec.Name != operation {
+			continue
+		}
+		for _, arg := range spec.Args {
+			operationArgs[arg.Name] = true
+			operationRequired[arg.Name] = arg.Required
+		}
+		break
+	}
 	declared := make([]core.ArgSpec, 0, len(descriptor.Args))
 	for _, arg := range descriptor.Args {
 		if arg.Name == "subverb" || (descriptor.Name == "link" && arg.Name == "list") {
 			continue
+		}
+		if len(operationArgs) > 0 {
+			if !operationArgs[arg.Name] {
+				continue
+			}
+			arg.Required = operationRequired[arg.Name]
 		}
 		declared = append(declared, arg)
 	}

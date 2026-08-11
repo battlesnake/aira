@@ -43,7 +43,7 @@ func TestDispatchMetadataMatchesInstrumentedHandlerReads(t *testing.T) {
 		}
 		if len(descriptor.Operations) > 0 {
 			discriminator := ""
-			if name == "find" {
+			if name == "find" || name == "req" {
 				discriminator = "subverb"
 			} else if name == "link" {
 				discriminator = "list"
@@ -94,7 +94,7 @@ func metadataProbeInputs(name string) []map[string]any {
 	values := map[string]any{
 		"project": "project", "prefixes": []string{"AIRA"}, "prefix": "AIRA",
 		"title": "title", "body": "body", "kind": "feature", "severity": "P1", "labels": []string{"label"},
-		"selector": "AIRA-1", "query": "query", "by": "kind", "fields": []string{"id"},
+		"selector": "AIRA-1", "query": "query", "by": "kind", "fields": []string{"id"}, "text": "requirement text",
 		"file": "findings.jsonl", "strict": true, "subverb": "add", "ticket": "AIRA-1",
 		"category": "bug", "verdict": "confirmed", "source": "codex", "message": "message",
 		"line": 1, "requirement": "REQ-1", "disposition": "fixed", "reason": "reason", "actor": "actor",
@@ -102,13 +102,14 @@ func metadataProbeInputs(name string) []map[string]any {
 		"from": "AIRA-1", "to": "AIRA-2", "field": "title", "value": "new", "status": "planned", "rebuild": true,
 	}
 	switch name {
-	case "find":
+	case "find", "req":
 		values = cloneMetadataInputs(values, "by", "subtype")
 		return []map[string]any{
 			cloneMetadataInputs(values, "subverb", "add"),
 			cloneMetadataInputs(values, "subverb", "ls"),
 			cloneMetadataInputs(values, "subverb", "show"),
 			cloneMetadataInputs(values, "subverb", "set"),
+			cloneMetadataInputs(values, "subverb", "import"),
 		}
 	case "link":
 		return []map[string]any{
@@ -152,6 +153,19 @@ func (metadataProbeStore) AddFinding(context.Context, domain.ReviewFindingInput)
 	return domain.Finding{Key: "F-1"}, store.EventKey{}, nil
 }
 func (metadataProbeStore) ListFindings(string) ([]store.FindingRecord, error) { return nil, nil }
+func (metadataProbeStore) AddRequirement(context.Context, domain.RequirementInput) (domain.Requirement, store.EventKey, error) {
+	return domain.Requirement{ID: "AR-1"}, store.EventKey{}, nil
+}
+func (metadataProbeStore) GetRequirement(string) (store.RequirementRecord, error) {
+	return store.RequirementRecord{Requirement: domain.Requirement{ID: "AR-1"}}, nil
+}
+func (metadataProbeStore) ListRequirements() ([]store.RequirementRecord, error) { return nil, nil }
+func (metadataProbeStore) SetRequirement(context.Context, string, domain.RequirementStatus) (store.EventKey, error) {
+	return store.EventKey{}, nil
+}
+func (metadataProbeStore) ImportRequirements(context.Context, string) (store.ImportRequirementsSummary, error) {
+	return store.ImportRequirementsSummary{}, nil
+}
 func (metadataProbeStore) ImportFindingsFile(context.Context, string, bool) (store.ImportSummary, error) {
 	return store.ImportSummary{}, nil
 }
@@ -243,7 +257,7 @@ func TestCanonicalDispatchNamesAndAliases(t *testing.T) {
 		got = append(got, descriptor.Name)
 	}
 	sort.Strings(got)
-	want := []string{"check", "claim", "count", "create", "find", "grep", "heartbeat", "help", "id", "import", "init", "link", "list", "mv", "ready", "reconcile", "release", "set", "show", "touch", "unlink"}
+	want := []string{"check", "claim", "count", "create", "find", "grep", "heartbeat", "help", "id", "import", "init", "link", "list", "mv", "ready", "reconcile", "release", "req", "set", "show", "touch", "unlink"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("dispatch names=%v, want=%v", got, want)
 	}
