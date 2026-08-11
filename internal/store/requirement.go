@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"aira/internal/domain"
@@ -15,6 +17,24 @@ type RequirementRecord struct {
 	Requirement domain.Requirement
 	Path        string
 	Digest      string
+}
+
+// acquireRequirementMutationLock serialises requirement-file writes against the
+// Rebuild requirement-scan, mirroring acquireFindingMutationLock. Global lock
+// order is rebuild.lock > findingLock > requirementLock > searchLock > pathLock.
+func (s *Store) acquireRequirementMutationLock() (*os.File, error) {
+	return acquireLock(filepath.Join(s.commonDir, "aira", "locks", "requirement-rebuild.lock"))
+}
+
+func readRegularRequirement(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("E_REQUIREMENT_INVALID: requirement path is not a regular file")
+	}
+	return os.ReadFile(path)
 }
 
 func (s *Store) defaultRequirementPrefix() (string, error) {
@@ -29,6 +49,11 @@ func (s *Store) defaultRequirementPrefix() (string, error) {
 // file in one crash-safe flow, mirroring CreateTicketWithEvent. It does not call
 // the public AllocateID (which would create a separate allocation/outbox/receipt).
 func (s *Store) AddRequirement(ctx context.Context, input domain.RequirementInput) (domain.Requirement, EventKey, error) {
+	reqLock, err := s.acquireRequirementMutationLock()
+	if err != nil {
+		return domain.Requirement{}, EventKey{}, err
+	}
+	defer unlockFile(reqLock)
 	intent, requirement, err := s.prepareCreateRequirement(ctx, input)
 	if err != nil {
 		return domain.Requirement{}, EventKey{}, err
@@ -40,6 +65,51 @@ func (s *Store) AddRequirement(ctx context.Context, input domain.RequirementInpu
 		return domain.Requirement{}, EventKey{}, err
 	}
 	return requirement, EventKey{ProjectID: intent.ProjectID, Seq: intent.Seq}, nil
+}
+
+// SetRequirement changes a requirement's status in place, preserving the
+// on-disk statement body verbatim (the file is the text authority — a direct
+// edit is respected). It mirrors SetFinding: a path mutation through the
+// generalized write protocol, not an allocation. Requirements have no
+// transition graph, so any valid target status is accepted.
+func (s *Store) SetRequirement(ctx context.Context, id string, status domain.RequirementStatus) (EventKey, error) {
+	reqLock, err := s.acquireRequirementMutationLock()
+	if err != nil {
+		return EventKey{}, err
+	}
+	defer unlockFile(reqLock)
+	// GetRequirement gives a clean E_NOT_FOUND when the requirement is not indexed.
+	if _, err := s.GetRequirement(id); err != nil {
+		return EventKey{}, err
+	}
+	path := s.requirementPath(id)
+	oldData, err := readRegularRequirement(path)
+	if err != nil {
+		return EventKey{}, err
+	}
+	old, err := domain.ParseRequirement(oldData)
+	if err != nil {
+		return EventKey{}, err
+	}
+	if old.ID != id {
+		return EventKey{}, errors.New("E_REQUIREMENT_INVALID: requirement identity changed at existing path")
+	}
+	updated, err := domain.NewRequirement(domain.RequirementInput{ID: old.ID, Text: old.Text, Status: status})
+	if err != nil {
+		return EventKey{}, err
+	}
+	newData, err := domain.RenderRequirement(updated)
+	if err != nil {
+		return EventKey{}, err
+	}
+	intent, err := s.preparePathMutationEventKind(ctx, path, digestBytes(oldData), newData, "requirement.set", updated.ID, IntentKindRequirementFile)
+	if err != nil {
+		return EventKey{}, err
+	}
+	if err := s.materialiseIntent(ctx, intent); err != nil {
+		return EventKey{}, err
+	}
+	return EventKey{ProjectID: intent.ProjectID, Seq: intent.Seq}, nil
 }
 
 func (s *Store) prepareCreateRequirement(ctx context.Context, input domain.RequirementInput) (Intent, domain.Requirement, error) {
