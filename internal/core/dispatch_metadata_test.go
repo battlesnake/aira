@@ -47,6 +47,8 @@ func TestDispatchMetadataMatchesInstrumentedHandlerReads(t *testing.T) {
 				discriminator = "subverb"
 			} else if name == "link" {
 				discriminator = "list"
+			} else if name == "gate" {
+				discriminator = "subverb"
 			}
 			if discriminator == "" {
 				t.Fatalf("grouped verb %q has no discriminator", name)
@@ -115,6 +117,20 @@ func metadataProbeInputs(name string) []map[string]any {
 		return []map[string]any{
 			cloneMetadataInputs(values, "list", false),
 			cloneMetadataInputs(values, "list", true),
+		}
+	case "gate":
+		return []map[string]any{
+			cloneMetadataInputs(values, "subverb", "add"),
+			cloneMetadataInputs(values, "subverb", "ls"),
+			cloneMetadataInputs(values, "subverb", "show"),
+			cloneMetadataInputs(values, "subverb", "set"),
+			cloneMetadataInputs(values, "subverb", "run"),
+			cloneMetadataInputs(values, "subverb", "check"),
+			cloneMetadataInputs(values, "subverb", "attest"),
+			cloneMetadataInputs(values, "subverb", "prove"),
+			cloneMetadataInputs(values, "subverb", "review"),
+			cloneMetadataInputs(values, "subverb", "canary-run"),
+			cloneMetadataInputs(values, "subverb", "canary-show"),
 		}
 	default:
 		return []map[string]any{values}
@@ -257,7 +273,7 @@ func TestCanonicalDispatchNamesAndAliases(t *testing.T) {
 		got = append(got, descriptor.Name)
 	}
 	sort.Strings(got)
-	want := []string{"check", "claim", "count", "create", "find", "grep", "heartbeat", "help", "id", "import", "init", "link", "list", "mv", "ready", "reconcile", "release", "req", "run", "run-kill", "run-log", "set", "show", "touch", "unlink"}
+	want := []string{"check", "claim", "count", "create", "find", "gate", "grep", "heartbeat", "help", "id", "import", "init", "link", "list", "mv", "ready", "reconcile", "release", "req", "run", "run-kill", "run-log", "set", "show", "touch", "unlink"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("dispatch names=%v, want=%v", got, want)
 	}

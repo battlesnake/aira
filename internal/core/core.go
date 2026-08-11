@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"aira/internal/domain"
+	"aira/internal/gate"
 	"aira/internal/runner"
 	"aira/internal/store"
 )
@@ -81,6 +82,20 @@ type Store interface {
 	Reconcile(context.Context) error
 	Rebuild(context.Context) error
 	Check(context.Context) (store.CheckReport, error)
+}
+
+type gateStore interface {
+	ListGates() ([]gate.GateDefinition, error)
+	GateCheck(context.Context) (store.GateCheckReport, error)
+	RunGate(context.Context, string) (store.GateCheckResult, error)
+}
+
+type gateAttestationStore interface {
+	AttestGate(context.Context, string, string, string) (store.GateCheckResult, error)
+}
+
+type gateActionStore interface {
+	GateAction(context.Context, string, string, string) (any, error)
 }
 
 type handlerData struct {
@@ -820,6 +835,76 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return report, nil
 		}},
+		"gate": {Name: "gate", Usage: "gate <operation> [args]", Args: []ArgSpec{
+			stringSpec("subverb", true, true, "Gate operation", "add", "ls", "show", "set", "run", "check", "attest", "prove", "review", "canary-run", "canary-show"),
+			stringSpec("gate_id", false, true, "Gate identifier"), stringSpec("canary_id", false, true, "Canary identifier"), stringSpec("verdict", false, false, "Attestation verdict", "pass", "fail"), stringSpec("actor", false, false, "Attestation actor"),
+		}, MCPTool: "aira_gate", MCPOperation: "subverb", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+			subverb := strings.ToLower(stringArg(args, "subverb"))
+			switch subverb {
+			case "show", "add", "set", "run", "attest", "prove", "review":
+				_ = stringArg(args, "gate_id")
+				if subverb == "attest" {
+					_ = stringArg(args, "verdict")
+					_ = stringArg(args, "actor")
+				}
+			case "canary-run", "canary-show":
+				_ = stringArg(args, "canary_id")
+			}
+			gs, ok := c.store.(gateStore)
+			if !ok {
+				return nil, fmt.Errorf("E_CONFIG_INVALID: gate store is unavailable")
+			}
+			switch subverb {
+			case "ls":
+				return gs.ListGates()
+			case "show":
+				id := stringArg(args, "gate_id")
+				gates, err := gs.ListGates()
+				if err != nil {
+					return nil, err
+				}
+				for _, item := range gates {
+					if item.ID == id {
+						return item, nil
+					}
+				}
+				return nil, fmt.Errorf("E_NOT_FOUND: gate %s", id)
+			case "run":
+				id := stringArg(args, "gate_id")
+				if id == "" {
+					return nil, errors.New("E_GATE_INVALID: gate run requires a gate id")
+				}
+				result, err := gs.RunGate(ctx, id)
+				if err != nil {
+					return nil, err
+				}
+				return handlerData{Data: result, Verdict: result.Verdict}, nil
+			case "check":
+				report, err := gs.GateCheck(ctx)
+				if err != nil {
+					return nil, err
+				}
+				return handlerData{Data: report, Verdict: report.Verdict}, nil
+			case "attest":
+				as, ok := c.store.(gateAttestationStore)
+				if !ok {
+					return nil, errors.New("E_GATE_ATTESTATION_INVALID: attestation is unavailable")
+				}
+				result, err := as.AttestGate(ctx, stringArg(args, "gate_id"), stringArg(args, "verdict"), stringArg(args, "actor"))
+				if err != nil {
+					return nil, err
+				}
+				return handlerData{Data: result, Verdict: result.Verdict}, nil
+			case "add", "set", "prove", "review", "canary-run", "canary-show":
+				actionStore, ok := c.store.(gateActionStore)
+				if !ok {
+					return nil, errors.New("E_GATE_INVALID: gate action is unavailable")
+				}
+				return actionStore.GateAction(ctx, subverb, stringArg(args, "gate_id"), stringArg(args, "canary_id"))
+			default:
+				return nil, fmt.Errorf("E_GATE_INVALID: unknown gate operation %q", subverb)
+			}
+		}},
 	}
 	applyDispatchMetadata(verbs)
 	return verbs
@@ -848,6 +933,19 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		"run-log":   {summary: "Read captured run output", safety: SafetyRead, example: []string{"RUN-1", "--stream", "out"}},
 		"reconcile": {summary: "Reconcile derived project state", safety: SafetyReconcile, example: []string{"--rebuild"}},
 		"check":     {summary: "Check project consistency", safety: SafetyReconcile, example: []string{}},
+		"gate": {summary: "Manage proof-backed gates", safety: SafetyRead, operations: []OperationSpec{
+			{Name: "add", Summary: "Add a gate definition", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"add", "traceability"}},
+			{Name: "ls", Summary: "List gate definitions", Safety: SafetyRead, Args: nil, Example: []string{"ls"}},
+			{Name: "show", Summary: "Show a gate definition", Safety: SafetyRead, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"show", "traceability"}},
+			{Name: "set", Summary: "Set gate policy", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"set", "traceability"}},
+			{Name: "run", Summary: "Evaluate a gate", Safety: SafetyReconcile, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"run", "traceability"}},
+			{Name: "check", Summary: "Read the latest gate result", Safety: SafetyRead, Args: nil, Example: []string{"check"}},
+			{Name: "attest", Summary: "Answer a manual gate challenge", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}, {Name: "verdict", Required: true}, {Name: "actor", Required: true}}, Example: []string{"attest", "review", "--verdict", "pass", "--actor", "human"}},
+			{Name: "prove", Summary: "Record proof of fire", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"prove", "traceability"}},
+			{Name: "review", Summary: "Request manual gate review", Safety: SafetyRead, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"review", "review"}},
+			{Name: "canary-run", Summary: "Run a named canary", Safety: SafetyReconcile, Args: []OperationArg{{Name: "canary_id", Required: true}}, Example: []string{"canary-run", "fixture"}},
+			{Name: "canary-show", Summary: "Show a canary declaration", Safety: SafetyRead, Args: []OperationArg{{Name: "canary_id", Required: true}}, Example: []string{"canary-show", "fixture"}},
+		}},
 	}
 	metadata["find"] = verbMetadata{summary: "Manage review findings", safety: SafetyMutate, operations: []OperationSpec{
 		{Name: "add", Summary: "Add a review finding", Safety: SafetyMutate, Args: []OperationArg{

@@ -503,6 +503,38 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 			Findings: []CheckFinding{canonicalScanFinding},
 		})
 	}
+	if gateReport, gateErr := s.GateCheck(context.Background()); gateErr != nil {
+		if hasSelector {
+			result = append(result, ReadyRecord{Ticket: TicketRecord{Path: repoPath(s.root, s.root)}, Ready: false, Verdict: "unevaluated", Findings: []CheckFinding{{Code: "U_GATE_EVIDENCE_UNAVAILABLE", Subject: "gates", Message: gateErr.Error(), Kind: "unevaluated"}}})
+		}
+	} else if len(gateReport.Results) > 0 {
+		definitions, _ := s.discoverGates()
+		advisory := map[string]bool{}
+		for _, definition := range definitions {
+			advisory[definition.Definition.ID] = definition.Definition.AdvisoryInReady
+		}
+		for i := range result {
+			for _, gateResult := range gateReport.Results {
+				if advisory[gateResult.GateID] {
+					continue
+				}
+				if gateResult.Verdict != "fail" && gateResult.Verdict != "unevaluated" {
+					continue
+				}
+				code := gateResult.Code
+				if code == "" {
+					code = "E_GATE_FAILED"
+				}
+				result[i].Findings = appendUniqueFinding(result[i].Findings, CheckFinding{Code: code, Subject: gateResult.GateID, Message: "gate " + gateResult.GateID + " is " + gateResult.Verdict, Kind: gateResult.Verdict})
+				result[i].Ready = false
+				if gateResult.Verdict == "fail" {
+					result[i].Verdict = "fail"
+				} else if result[i].Verdict != "fail" {
+					result[i].Verdict = "unevaluated"
+				}
+			}
+		}
+	}
 	sortReadyRecords(result)
 	return result, nil
 }

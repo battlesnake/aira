@@ -50,7 +50,8 @@ type Project struct {
 	ConfigPath string
 	Config     Config
 	StateDir   string
-	Runner     *runner.Runner `json:"-"`
+	Runner     *runner.Runner   `json:"-"`
+	GateAudit  *store.GateAudit `json:"-"`
 }
 
 type InitResult struct {
@@ -131,6 +132,11 @@ func Open(ctx context.Context, cwd string) (*store.Store, Project, error) {
 		return nil, Project{}, err
 	}
 	project.Runner = execution
+	project.GateAudit, err = store.OpenGateAudit(project.CommonDir, false)
+	if err != nil {
+		_ = s.Close()
+		return nil, Project{}, err
+	}
 	return s, project, nil
 }
 

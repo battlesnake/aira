@@ -343,7 +343,25 @@ func (s *Store) initDB(ctx context.Context) error {
             project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, worktree_id TEXT NOT NULL,
             generation INTEGER NOT NULL DEFAULT 0, glob TEXT NOT NULL,
             PRIMARY KEY(project_id, ticket_id, worktree_id, glob)
-        )`,
+	        )`,
+		`CREATE TABLE IF NOT EXISTS gates (
+		    project_id TEXT NOT NULL, gate_id TEXT NOT NULL, definition_digest TEXT NOT NULL,
+		    definition_json TEXT NOT NULL, PRIMARY KEY(project_id, gate_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS gate_results (
+		    project_id TEXT NOT NULL, gate_id TEXT NOT NULL, subject TEXT NOT NULL,
+		    seq INTEGER NOT NULL, verdict TEXT NOT NULL, code TEXT NOT NULL,
+		    trusted INTEGER NOT NULL, suspect INTEGER NOT NULL, record_json TEXT NOT NULL,
+		    PRIMARY KEY(project_id, gate_id, subject)
+		)`,
+		`CREATE TABLE IF NOT EXISTS gate_proofs (
+		    project_id TEXT NOT NULL, seq INTEGER NOT NULL, gate_id TEXT NOT NULL,
+		    record_json TEXT NOT NULL, PRIMARY KEY(project_id, seq)
+		)`,
+		`CREATE TABLE IF NOT EXISTS gate_attestations (
+		    project_id TEXT NOT NULL, seq INTEGER NOT NULL, gate_id TEXT NOT NULL,
+		    record_json TEXT NOT NULL, PRIMARY KEY(project_id, seq)
+		)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -1623,6 +1641,9 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		if err := s.appendReceiptIfMissing(receipt); err != nil {
 			return err
 		}
+	}
+	if err := s.rebuildGateProjection(ctx); err != nil {
+		return err
 	}
 	return nil
 }

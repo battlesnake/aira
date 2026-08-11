@@ -47,6 +47,13 @@ var ExitCodes = map[string]int{
 	"E_TRACE_DANGLING":    1,
 	"W_TRACE_UNCOVERED":   0, "W_TRACE_UNVERIFIED": 0,
 	"U_TRACE_UNSCANNED": 3, "U_TRACE_EMPTY": 3,
+	"E_GATE_INVALID": 2, "E_GATE_KIND_INVALID": 2, "E_GATE_CANARY_INVALID": 2,
+	"E_GATE_ATTESTATION_INVALID": 2, "E_GATE_BASELINE_INVALID": 2,
+	"E_GATE_FAILED": 1, "E_GATE_RATCHET_REGRESSED": 1, "E_GATE_CANARY_DID_NOT_FIRE": 1,
+	"W_GATE_DISABLED": 0, "W_GATE_PROOF_EXPIRING": 0,
+	"U_GATE_NO_RESULT": 3, "U_GATE_UNPROVEN": 3, "U_GATE_PROOF_STALE": 3,
+	"U_GATE_PROOF_UNAVAILABLE": 3, "U_GATE_EVIDENCE_UNAVAILABLE": 3,
+	"U_GATE_BASELINE_MISSING": 3, "U_GATE_INCOMPARABLE": 3, "U_GATE_CANARY_UNEVALUATED": 3,
 }
 
 func ExitForCode(code string) int {
@@ -81,7 +88,7 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 		"allocated-id-file": "pass", "duplicate-id": "pass", "stale-index": "pass",
 		"orphan-worktree": "pass", "ticket-file-integrity": "pass", "reconcile-integrity": "pass",
 		"rebuild-integrity": "pass", "relation-integrity": "pass", "finding-integrity": "pass", "lease-integrity": "pass", "area-overlap": "pass",
-		"traceability": "pass",
+		"traceability": "pass", "gates": "pass",
 	}}
 	if err := ctx.Err(); err != nil {
 		report.Verdict = "unevaluated"
@@ -115,6 +122,9 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 			addFinding(&report, finding, dimension)
 		}
 	}
+	// `check` may refresh disposable SQLite projections from durable truth, but
+	// it never mints gate trust: no gate evaluator, audit append, or HMAC-key
+	// creation occurs on this path.
 	if err := s.reconcile(ctx); err != nil {
 		if isIntegrityError(err) {
 			addFinding(&report, s.findingFromError(err, "reconcile"), "reconcile-integrity")
@@ -259,6 +269,9 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 		for _, warning := range warnings {
 			addWarning(&report, warning, "area-overlap")
 		}
+	}
+	if err := s.checkGatesReadOnly(&report); err != nil {
+		return CheckReport{}, err
 	}
 
 	if len(report.Findings) > 0 {

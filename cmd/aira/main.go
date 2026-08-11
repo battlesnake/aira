@@ -169,6 +169,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"req":      {"status": true, "fields": true},
 		"run-kill": {},
 		"run-log":  {"stream": true, "from": true, "tail": true, "follow": true, "full": true},
+		"gate":     {"gate_id": true, "canary_id": true, "verdict": true, "actor": true},
 	}
 	for name := range options {
 		if !allowed[verb][name] {
@@ -462,6 +463,35 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 	case "check":
 		if len(positional) != 0 {
 			return core.Request{}, fmt.Errorf("check accepts no positional arguments")
+		}
+	case "gate":
+		if len(positional) == 0 {
+			return core.Request{}, fmt.Errorf("gate requires an operation")
+		}
+		args["subverb"] = strings.ToLower(positional[0])
+		switch args["subverb"] {
+		case "ls", "check":
+			if len(positional) != 1 {
+				return core.Request{}, fmt.Errorf("gate %s accepts no positional arguments", args["subverb"])
+			}
+		case "add", "show", "set", "run", "attest", "prove", "review":
+			if len(positional) != 2 {
+				return core.Request{}, fmt.Errorf("gate %s requires <gate-id>", args["subverb"])
+			}
+			args["gate_id"] = positional[1]
+			if args["subverb"] == "attest" {
+				if options["verdict"] == "" || options["actor"] == "" {
+					return core.Request{}, fmt.Errorf("gate attest requires --verdict and --actor")
+				}
+				args["verdict"], args["actor"] = options["verdict"], options["actor"]
+			}
+		case "canary-run", "canary-show":
+			if len(positional) != 2 {
+				return core.Request{}, fmt.Errorf("gate %s requires <canary-id>", args["subverb"])
+			}
+			args["canary_id"] = positional[1]
+		default:
+			return core.Request{}, fmt.Errorf("unknown gate operation %q", args["subverb"])
 		}
 	default:
 		return core.Request{}, fmt.Errorf("E_UNKNOWN_VERB: unknown verb %q", verb)
