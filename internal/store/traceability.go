@@ -1,0 +1,417 @@
+package store
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"aira/internal/domain"
+)
+
+const (
+	traceCovers   = "covers"
+	traceVerifies = "verifies"
+)
+
+type traceEdge struct {
+	Kind string
+	ID   string
+	Path string
+	Line int
+}
+
+type traceScanResult struct {
+	Edges []traceEdge
+}
+
+type traceSnapshotFile struct {
+	Path        string
+	Data        []byte
+	Requirement bool
+}
+
+type traceSnapshot struct {
+	Files []traceSnapshotFile
+}
+
+// scanTraceability discovers annotation edges from the tracked-file snapshot.
+// Parsing the Go syntax first is intentional: a string containing
+// "covers: AR-1" is data, not an annotation.
+func scanTraceability(root string) (traceScanResult, error) {
+	snapshot, err := captureTraceSnapshot(root, nil)
+	if err != nil {
+		return traceScanResult{}, err
+	}
+	return parseTraceabilitySnapshot(root, snapshot)
+}
+
+func captureTraceSnapshot(root string, hook func()) (traceSnapshot, error) {
+	paths, err := trackedTracePaths(root)
+	if err != nil {
+		return traceSnapshot{}, err
+	}
+	first, err := readTraceSnapshotFiles(root, paths)
+	if err != nil {
+		return traceSnapshot{}, err
+	}
+	if hook != nil {
+		hook()
+	}
+	secondPaths, err := trackedTracePaths(root)
+	if err != nil {
+		return traceSnapshot{}, err
+	}
+	if !sameStrings(paths, secondPaths) {
+		return traceSnapshot{}, errors.New("U_TRACE_UNSCANNED: tracked-file set changed during snapshot")
+	}
+	second, err := readTraceSnapshotFiles(root, secondPaths)
+	if err != nil {
+		return traceSnapshot{}, err
+	}
+	if len(first) != len(second) {
+		return traceSnapshot{}, errors.New("U_TRACE_UNSCANNED: tracked-file snapshot changed during read")
+	}
+	for i := range first {
+		if first[i].Path != second[i].Path || first[i].Requirement != second[i].Requirement || !bytes.Equal(first[i].Data, second[i].Data) {
+			return traceSnapshot{}, fmt.Errorf("U_TRACE_UNSCANNED: tracked file %s changed during snapshot", first[i].Path)
+		}
+	}
+	return traceSnapshot{Files: first}, nil
+}
+
+func trackedTracePaths(root string) ([]string, error) {
+	if err := validateTraceRequirementsDirectory(root); err != nil {
+		return nil, err
+	}
+	out, stderr, err := runGit(root, "ls-files", "-z", "--cached", "--")
+	if err != nil {
+		return nil, fmt.Errorf("U_TRACE_UNSCANNED: tracked-file snapshot: %w: %s", err, strings.TrimSpace(stderr))
+	}
+	var paths []string
+	for _, raw := range bytes.Split([]byte(out), []byte{0}) {
+		path := filepath.ToSlash(string(raw))
+		if path == "" {
+			continue
+		}
+		if strings.HasSuffix(path, ".go") && !strings.HasPrefix(path, "vendor/") {
+			paths = append(paths, path)
+			continue
+		}
+		if strings.HasPrefix(path, ".aira/requirements/") && strings.HasSuffix(path, ".md") {
+			paths = append(paths, path)
+		}
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func validateTraceRequirementsDirectory(root string) error {
+	_, err := os.ReadDir(filepath.Join(root, ".aira", "requirements"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("U_TRACE_UNSCANNED: read requirements directory: %w", err)
+	}
+	return nil
+}
+
+func readTraceSnapshotFiles(root string, paths []string) ([]traceSnapshotFile, error) {
+	files := make([]traceSnapshotFile, 0, len(paths))
+	for _, path := range paths {
+		absolute := filepath.Join(root, filepath.FromSlash(path))
+		info, err := os.Lstat(absolute)
+		if err != nil {
+			return nil, fmt.Errorf("U_TRACE_UNSCANNED: read tracked file %s: %w", path, err)
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("U_TRACE_UNSCANNED: tracked file %s is not regular", path)
+		}
+		data, err := os.ReadFile(absolute)
+		if err != nil {
+			return nil, fmt.Errorf("U_TRACE_UNSCANNED: read tracked file %s: %w", path, err)
+		}
+		files = append(files, traceSnapshotFile{Path: path, Data: data, Requirement: strings.HasPrefix(path, ".aira/requirements/")})
+	}
+	return files, nil
+}
+
+func sameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func parseTraceabilitySnapshot(root string, snapshot traceSnapshot) (traceScanResult, error) {
+	result := traceScanResult{}
+	for _, tracked := range snapshot.Files {
+		if tracked.Requirement {
+			continue
+		}
+		path := filepath.Join(root, filepath.FromSlash(tracked.Path))
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, path, tracked.Data, parser.ParseComments)
+		if err != nil {
+			return traceScanResult{}, fmt.Errorf("U_TRACE_UNSCANNED: parse %s: %w", repoPath(root, path), err)
+		}
+		isTest := strings.HasSuffix(path, "_test.go")
+		for _, group := range file.Comments {
+			for _, comment := range group.List {
+				line := fset.Position(comment.Pos()).Line
+				kind, ids, ok, parseErr := parseTraceComment(comment.Text)
+				if parseErr != nil {
+					return traceScanResult{}, fmt.Errorf("U_TRACE_UNSCANNED: %s:%d: %w", repoPath(root, path), line, parseErr)
+				}
+				if !ok || (kind == traceCovers && isTest) || (kind == traceVerifies && !isTest) {
+					continue
+				}
+				for _, id := range ids {
+					result.Edges = append(result.Edges, traceEdge{Kind: kind, ID: id, Path: repoPath(root, path), Line: line})
+				}
+			}
+		}
+	}
+	sort.Slice(result.Edges, func(i, j int) bool {
+		left, right := result.Edges[i], result.Edges[j]
+		if left.Path != right.Path {
+			return left.Path < right.Path
+		}
+		if left.Line != right.Line {
+			return left.Line < right.Line
+		}
+		if left.Kind != right.Kind {
+			return left.Kind < right.Kind
+		}
+		return left.ID < right.ID
+	})
+	return result, nil
+}
+
+func parseTraceComment(raw string) (string, []string, bool, error) {
+	text := strings.TrimSpace(raw)
+	switch {
+	case strings.HasPrefix(text, "//"):
+		text = strings.TrimSpace(strings.TrimPrefix(text, "//"))
+	case strings.HasPrefix(text, "/*"):
+		text = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(text, "/*"), "*/"))
+	}
+	for strings.HasPrefix(text, "*") {
+		text = strings.TrimSpace(strings.TrimPrefix(text, "*"))
+	}
+	colon := strings.IndexByte(text, ':')
+	if colon < 0 {
+		return "", nil, false, nil
+	}
+	kind := strings.TrimSpace(text[:colon])
+	if kind != traceCovers && kind != traceVerifies {
+		return "", nil, false, nil
+	}
+	parts := strings.Split(text[colon+1:], ",")
+	if len(parts) == 0 {
+		return "", nil, false, fmt.Errorf("%s annotation has no requirement IDs", kind)
+	}
+	ids := make([]string, 0, len(parts))
+	for _, part := range parts {
+		id := strings.TrimSpace(part)
+		if id == "" {
+			return "", nil, false, fmt.Errorf("%s annotation has an empty requirement ID", kind)
+		}
+		if err := domain.ValidateID(id); err != nil {
+			return "", nil, false, fmt.Errorf("%s annotation has invalid requirement ID %q", kind, id)
+		}
+		ids = append(ids, id)
+	}
+	return kind, ids, true, nil
+}
+
+type traceRequirement struct {
+	status domain.RequirementStatus
+	path   string
+}
+
+func (s *Store) checkTraceability(report *CheckReport) error {
+	registry, err := readRegistry(s.registryPath)
+	if err != nil {
+		addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_UNSCANNED", Subject: "traceability", Message: err.Error(), Kind: "unevaluated"})
+		return nil
+	}
+	if len(s.prefixesByKind(kindRequirement)) == 0 {
+		_, stderr, gitErr := runGit(s.root, "rev-parse", "--show-toplevel")
+		if gitErr != nil && isNotGitRepository(stderr) {
+			// A non-git ticket-only fixture has no tracked-file graph to
+			// evaluate. Real projects are git worktrees; an explicit annotation
+			// in one will reach U_TRACE_EMPTY below.
+			return nil
+		}
+	}
+	var entries []registryEntry
+	if len(s.prefixesByKind(kindRequirement)) == 0 {
+		// With no requirement namespace, only the current worktree can request
+		// the explicit no-registry diagnosis. Stale registry worktrees are an
+		// existing non-traceability warning and must not manufacture a trace
+		// snapshot failure in a ticket-only project.
+		entries = []registryEntry{{ProjectID: s.projectID, WorktreeID: s.worktreeID, Root: s.root}}
+	} else {
+		entries, err = discoverWorktrees(s.root, s.projectID, registry)
+		if err != nil {
+			addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_UNSCANNED", Subject: "traceability", Message: err.Error(), Kind: "unevaluated"})
+			return nil
+		}
+	}
+
+	type capturedWorktree struct {
+		entry    registryEntry
+		snapshot traceSnapshot
+	}
+	captured := make([]capturedWorktree, 0, len(entries))
+	hook := s.traceabilitySnapshotHook
+	s.traceabilitySnapshotHook = nil
+	for _, entry := range entries {
+		snapshot, snapshotErr := captureTraceSnapshot(entry.Root, hook)
+		hook = nil
+		if snapshotErr != nil {
+			addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_UNSCANNED", Subject: repoPath(s.root, entry.Root), Message: snapshotErr.Error(), Kind: "unevaluated"})
+			return nil
+		}
+		captured = append(captured, capturedWorktree{entry: entry, snapshot: snapshot})
+	}
+
+	requirements := make(map[string]traceRequirement)
+	malformed := make(map[string]string)
+	var edges []traceEdge
+	for _, worktree := range captured {
+		result, parseErr := parseTraceabilitySnapshot(worktree.entry.Root, worktree.snapshot)
+		if parseErr != nil {
+			addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_UNSCANNED", Subject: repoPath(s.root, worktree.entry.Root), Message: parseErr.Error(), Kind: "unevaluated"})
+			return nil
+		}
+		edges = append(edges, result.Edges...)
+		for _, tracked := range worktree.snapshot.Files {
+			if !tracked.Requirement {
+				continue
+			}
+			subject := filepath.ToSlash(filepath.Join(repoPath(s.root, worktree.entry.Root), tracked.Path))
+			requirement, parseErr := domain.ParseRequirement(tracked.Data)
+			filenameID := strings.TrimSuffix(filepath.Base(filepath.FromSlash(tracked.Path)), ".md")
+			if parseErr != nil || requirement.ID != filenameID {
+				message := "E_REQUIREMENT_INVALID: filename/frontmatter mismatch"
+				if parseErr != nil {
+					message = parseErr.Error()
+				}
+				addFinding(report, CheckFinding{Code: "E_REQUIREMENT_INVALID", Subject: subject, Message: message, Kind: "fail"}, "")
+				if id, ok := ticketIDFromFilename(filenameID + ".md"); ok {
+					malformed[id] = subject
+				}
+				if parseErr == nil {
+					malformed[requirement.ID] = subject
+				}
+				continue
+			}
+			requirements[requirement.ID] = traceRequirement{status: requirement.Status, path: subject}
+		}
+	}
+
+	if len(s.prefixesByKind(kindRequirement)) == 0 {
+		addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_EMPTY", Subject: "traceability", Message: "requirement registry is empty", Kind: "unevaluated"})
+		return nil
+	}
+	if len(requirements) == 0 && len(malformed) == 0 {
+		addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_EMPTY", Subject: "traceability", Message: "requirement registry is empty", Kind: "unevaluated"})
+		return nil
+	}
+	if len(requirements) == 0 && len(malformed) > 0 {
+		addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_UNSCANNED", Subject: "traceability", Message: "requirement registry contains no readable nodes", Kind: "unevaluated"})
+	}
+	return resolveTraceabilityEdges(report, edges, requirements, malformed)
+}
+
+func resolveTraceabilityEdges(report *CheckReport, edges []traceEdge, requirements map[string]traceRequirement, malformed map[string]string) error {
+	covers := make(map[string]bool)
+	verifies := make(map[string]bool)
+	for _, edge := range edges {
+		subject := fmt.Sprintf("%s:%d", edge.Path, edge.Line)
+		switch {
+		case malformed[edge.ID] != "":
+			addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_UNSCANNED", Subject: subject, Message: fmt.Sprintf("requirement %s is unreadable at %s", edge.ID, malformed[edge.ID]), Kind: "unevaluated"})
+		case requirements[edge.ID].path == "":
+			addFinding(report, CheckFinding{Code: "E_TRACE_DANGLING", Subject: subject, Message: fmt.Sprintf("%s annotation references absent requirement %s", edge.Kind, edge.ID), Kind: "fail"}, "traceability")
+		case edge.Kind == traceCovers:
+			covers[edge.ID] = true
+		case edge.Kind == traceVerifies:
+			verifies[edge.ID] = true
+		}
+	}
+
+	ids := make([]string, 0, len(requirements))
+	for id := range requirements {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		requirement := requirements[id]
+		switch requirement.status {
+		case domain.RequirementBuilt:
+			if !covers[id] {
+				addTraceWarning(report, CheckFinding{Code: "W_TRACE_UNCOVERED", Subject: id, Message: "built requirement has no covers annotation", Kind: "warning"})
+			}
+			if !verifies[id] {
+				addTraceWarning(report, CheckFinding{Code: "W_TRACE_UNVERIFIED", Subject: id, Message: "built requirement has no verifies annotation", Kind: "warning"})
+			}
+		case domain.RequirementPartial:
+			if !covers[id] {
+				addTraceWarning(report, CheckFinding{Code: "W_TRACE_UNCOVERED", Subject: id, Message: "partial requirement has no covers annotation", Kind: "warning"})
+			}
+		}
+	}
+	return nil
+}
+
+func traceDimensionRank(value string) int {
+	switch value {
+	case "fail":
+		return 3
+	case "unevaluated":
+		return 2
+	case "warning":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func addTraceUnevaluated(report *CheckReport, finding CheckFinding) {
+	for _, existing := range report.UnevaluatedFindings {
+		if existing.Code == finding.Code && existing.Subject == finding.Subject {
+			return
+		}
+	}
+	report.UnevaluatedFindings = append(report.UnevaluatedFindings, finding)
+	report.Unevaluated = true
+	if traceDimensionRank(report.Dimensions["traceability"]) < traceDimensionRank("unevaluated") {
+		report.Dimensions["traceability"] = "unevaluated"
+	}
+}
+
+func addTraceWarning(report *CheckReport, warning CheckFinding) {
+	for _, existing := range report.Warnings {
+		if existing.Code == warning.Code && existing.Subject == warning.Subject {
+			return
+		}
+	}
+	report.Warnings = append(report.Warnings, warning)
+	if traceDimensionRank(report.Dimensions["traceability"]) < traceDimensionRank("warning") {
+		report.Dimensions["traceability"] = "warning"
+	}
+}

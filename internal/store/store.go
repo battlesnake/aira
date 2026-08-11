@@ -87,6 +87,9 @@ type Store struct {
 	// beforeSearchReconcileCommit is a test-only seam after the canonical scan
 	// and before its replacement transaction; production leaves it nil.
 	beforeSearchReconcileCommit func()
+	// traceabilitySnapshotHook is a test-only seam used to reproduce a mutation
+	// during the tracked-file snapshot validation window.
+	traceabilitySnapshotHook func()
 }
 
 type Intent struct {

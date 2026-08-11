@@ -35,6 +35,9 @@ var ExitCodes = map[string]int{
 	"E_ID_UNRESOLVED": 1, "E_DUPLICATE_ID": 1, "E_PREFIX_OWNERSHIP_CONFLICT": 1,
 	"E_PATH_INTENT_BUSY": 1, "E_PATH_INTENT_UNRESOLVED": 1,
 	"E_CLOCK_UNAVAILABLE": 1,
+	"E_TRACE_DANGLING":    1,
+	"W_TRACE_UNCOVERED":   0, "W_TRACE_UNVERIFIED": 0,
+	"U_TRACE_UNSCANNED": 3, "U_TRACE_EMPTY": 3,
 }
 
 func ExitForCode(code string) int {
@@ -69,6 +72,7 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 		"allocated-id-file": "pass", "duplicate-id": "pass", "stale-index": "pass",
 		"orphan-worktree": "pass", "ticket-file-integrity": "pass", "reconcile-integrity": "pass",
 		"rebuild-integrity": "pass", "relation-integrity": "pass", "finding-integrity": "pass", "lease-integrity": "pass", "area-overlap": "pass",
+		"traceability": "pass",
 	}}
 	if err := ctx.Err(); err != nil {
 		report.Verdict = "unevaluated"
@@ -115,6 +119,9 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 		} else {
 			return CheckReport{}, err
 		}
+	}
+	if err := s.checkTraceability(&report); err != nil {
+		return CheckReport{}, err
 	}
 
 	rows, err := s.db.Query(`SELECT prefix, number, path, state, kind FROM allocations WHERE project_id=?`, s.projectID)

@@ -14,8 +14,8 @@ func TestCheckExitCodesForPassFailUnevaluatedAndStoreError(t *testing.T) {
 		t.Fatalf("create healthy ticket: %#v", response)
 	}
 	pass := New(passStore).Do(context.Background(), Request{Verb: "check"})
-	if pass.Code != "PASS" || pass.Exit != 0 {
-		t.Fatalf("pass check = %#v", pass)
+	if pass.Code != "UNEVALUATED" || pass.Exit != 3 {
+		t.Fatalf("empty requirement registry check = %#v", pass)
 	}
 	var passReport store.CheckReport
 	marshalRoundTrip(t, pass.Data, &passReport)
@@ -28,7 +28,7 @@ func TestCheckExitCodesForPassFailUnevaluatedAndStoreError(t *testing.T) {
 		t.Fatal(err)
 	}
 	fail := New(failStore).Do(context.Background(), Request{Verb: "check"})
-	if fail.Code != "FAIL" || fail.Exit != 1 {
+	if fail.Code != "UNEVALUATED" || fail.Exit != 1 {
 		t.Fatalf("fail check = %#v", fail)
 	}
 
@@ -37,7 +37,7 @@ func TestCheckExitCodesForPassFailUnevaluatedAndStoreError(t *testing.T) {
 		t.Fatal(err)
 	}
 	unevaluated := New(orphanStore).Do(context.Background(), Request{Verb: "check"})
-	if unevaluated.Code != "PASS" || unevaluated.Exit != 0 {
+	if unevaluated.Code != "UNEVALUATED" || unevaluated.Exit != 3 {
 		t.Fatalf("orphan check = %#v", unevaluated)
 	}
 	var orphanReport store.CheckReport

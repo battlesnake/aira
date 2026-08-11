@@ -283,7 +283,7 @@ func TestReadyInvalidRelationOwnerRemainsUnevaluatedAfterRebuildThroughCore(t *t
 
 	assertDependentUnevaluated("before check", false)
 	check := c.Do(context.Background(), Request{Verb: "check"})
-	if !check.OK || check.Code != "FAIL" || check.Exit != 1 {
+	if !check.OK || check.Code != "UNEVALUATED" || check.Exit != 1 {
 		t.Fatalf("check response = %#v", check)
 	}
 	assertDependentUnevaluated("after check rebuild", true)
