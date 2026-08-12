@@ -23,7 +23,11 @@ func (s Status) Terminal() bool { return s == StatusExited || s == StatusKilled 
 type ScopeIntegrity string
 
 const (
-	ScopeContained         ScopeIntegrity = "contained"
+	ScopeContained ScopeIntegrity = "contained"
+	// ScopeUnverified means clone placement succeeded, but the leader was
+	// never positively observed in cgroup.procs before it exited. It is not
+	// evidence of migration, and it is deliberately not positive containment.
+	ScopeUnverified        ScopeIntegrity = "unverified"
 	ScopeHandoffUnverified ScopeIntegrity = "handoff-unverified"
 	ScopeMigrated          ScopeIntegrity = "migrated"
 	ScopeDescendantKilled  ScopeIntegrity = "descendant-killed"

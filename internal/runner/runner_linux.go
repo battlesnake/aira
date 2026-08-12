@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -201,12 +202,21 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		_ = w.Close()
 	}
 	record.PIDIdentity = PIDIdentity{PID: cmd.Process.Pid, StartTick: processStartTick(cmd.Process.Pid)}
+	identityValid := record.PIDIdentity.StartTick != 0
 	members, memberErr := scope.Members()
-	scopeVerified := memberErr == nil && containsPID(members, cmd.Process.Pid)
+	scopeVerified := identityValid && memberErr == nil && containsPID(members, cmd.Process.Pid)
 	// A live process absent from cgroup.procs is the one case that proves an
 	// escape. Do this check before waiting so an already-observable migration
 	// cannot be mistaken for the harmless post-exit empty state.
-	initialMigrated := memberErr == nil && !scopeVerified && processLive(cmd.Process.Pid)
+	//
+	// A descendant can instead migrate after the leader's last observation,
+	// close its inherited capture fds, and outlive the leader. Once the leader
+	// exits and this scope becomes empty, this daemonless runner has no
+	// authoritative descendant inventory; that containment residual is tracked
+	// by task #20 (cgroup namespace or supervisor mitigation). Such an
+	// unobservable descendant must never be used to claim additional positive
+	// containment, but is not retroactively reported as leader migration.
+	initialMigrated := identityValid && memberErr == nil && !scopeVerified && processLive(record.PIDIdentity)
 	if scopeVerified {
 		record.Status = StatusRunning
 	}
@@ -219,7 +229,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	}
 	monitorStop := make(chan struct{})
 	monitorResult := make(chan bool, 1)
-	go monitorScopeMembership(scope, cmd.Process.Pid, monitorStop, monitorResult)
+	go monitorScopeMembership(scope, record.PIDIdentity, monitorStop, monitorResult)
 
 	captureCh := make(chan captureResult, len(readers))
 	for name, rd := range readers {
@@ -267,12 +277,12 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	}
 	waitExit, waitSignal := waitEvidence(cmd.ProcessState, waitErr)
 	waitObserved := waitExit != nil || waitSignal != ""
-	placedThenExited := placementGuaranteed && memberErr == nil && waitObserved && !migrated
-	if !scopeVerified && !placedThenExited && !migrated {
+	unobservedPlacedExit := placementGuaranteed && identityValid && memberErr == nil && !scopeVerified && waitObserved && !migrated
+	if !scopeVerified && !unobservedPlacedExit && !migrated {
 		// A failed membership observation is not itself an escape: a successful
 		// CLONE_INTO_CGROUP placement followed by a real wait exit leaves the
-		// scope empty by design. Without that wait evidence, however, retain the
-		// conservative invalid-scope result.
+		// scope empty by design. Without that wait evidence, or without a valid
+		// process identity, retain the conservative invalid-scope result.
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_SCOPE_INVALID")
 	}
 	current, currentErr := r.ledger.current(id)
@@ -337,6 +347,11 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if migrated {
 		record.ScopeIntegrity = ScopeMigrated
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_SCOPE_MIGRATION")
+	} else if unobservedPlacedExit && record.ScopeIntegrity == ScopeContained {
+		// Placement proves where the leader started, not that it remained there.
+		// This honest third state is distinct from both observed containment and a
+		// live migration: daemonless observation cannot classify migrate-and-exit.
+		record.ScopeIntegrity = ScopeUnverified
 	} else if emptyErr != nil {
 		record.ScopeIntegrity = ScopeHandoffUnverified
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_SCOPE_HANDOFF")
@@ -355,7 +370,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
 			record.ScopeIntegrity = ScopeHandoffUnverified
 		}
-	} else if waitObserved && (scopeVerified || placedThenExited) {
+	} else if waitObserved && (scopeVerified || unobservedPlacedExit) {
 		record.Status = StatusExited
 		record.ExitCode, record.Signal = waitExit, waitSignal
 	} else if !scopeVerified {
@@ -371,7 +386,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if record.Status == StatusExited && record.ExitCode != nil && *record.ExitCode != 0 {
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_FAILED")
 	}
-	if record.ScopeIntegrity != ScopeContained && !containsPrefix(record.ErrorCodes, "E_RUN_SCOPE_") {
+	if record.ScopeIntegrity != ScopeContained && record.ScopeIntegrity != ScopeUnverified && !containsPrefix(record.ErrorCodes, "E_RUN_SCOPE_") {
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_SCOPE_HANDOFF")
 	}
 	record.EndedAt = nowString(r.now)
@@ -783,20 +798,14 @@ func processStartTick(pid int) uint64 {
 	if err != nil {
 		return 0
 	}
-	closeParen := strings.LastIndexByte(string(data), ')')
-	if closeParen < 0 {
+	tick, ok := processStartTickFromStat(data)
+	if !ok {
 		return 0
 	}
-	fields := strings.Fields(string(data)[closeParen+2:])
-	if len(fields) < 20 {
-		return 0
-	}
-	var tick uint64
-	_, _ = fmt.Sscanf(fields[19], "%d", &tick)
 	return tick
 }
 
-func monitorScopeMembership(scope Scope, pid int, stop <-chan struct{}, result chan<- bool) {
+func monitorScopeMembership(scope Scope, identity PIDIdentity, stop <-chan struct{}, result chan<- bool) {
 	// This detects a live launch process observed outside the scope. A process
 	// that migrates and exits between two samples is inherently unobservable
 	// without a supervisor; such descendant/handoff limits remain non-green
@@ -810,19 +819,19 @@ func monitorScopeMembership(scope Scope, pid int, stop <-chan struct{}, result c
 			result <- false
 			return
 		case <-ticker.C:
-			if !processExists(pid) {
+			if !processIdentityMatches(identity) {
 				result <- false
 				return
 			}
 			members, err := scope.Members()
-			if err == nil && !containsPID(members, pid) && processLive(pid) {
+			if err == nil && !containsPID(members, identity.PID) && processLive(identity) {
 				result <- true
 				return
 			}
 		case <-events:
-			if processExists(pid) {
+			if processIdentityMatches(identity) {
 				members, err := scope.Members()
-				if err == nil && !containsPID(members, pid) && processLive(pid) {
+				if err == nil && !containsPID(members, identity.PID) && processLive(identity) {
 					result <- true
 					return
 				}
@@ -874,11 +883,6 @@ func scopeMembershipEvents(scope Scope, stop <-chan struct{}) <-chan struct{} {
 	return result
 }
 
-func processExists(pid int) bool {
-	_, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
-	return err == nil
-}
-
 // processLive reports whether pid is a live, schedulable task rather than a
 // zombie or dead one. A process is removed from cgroup.procs the moment it
 // exits, but its /proc/<pid> entry lingers as a zombie until the parent reaps
@@ -886,9 +890,15 @@ func processExists(pid int) bool {
 // therefore mis-flags a normal exit — especially for multi-process children
 // like `go test` that fork a compiler and a test binary. A genuine migration
 // keeps the task alive in another cgroup, so only a live state is a migration.
-func processLive(pid int) bool {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+// The recorded start tick is part of every observation so a reused PID cannot
+// be mistaken for the launch process.
+func processLive(identity PIDIdentity) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", identity.PID))
 	if err != nil {
+		return false
+	}
+	startTick, ok := processStartTickFromStat(data)
+	if !ok || identity.PID <= 0 || identity.StartTick == 0 || startTick != identity.StartTick {
 		return false
 	}
 	// Format: "pid (comm) state ...". comm can contain spaces and parentheses,
@@ -903,6 +913,32 @@ func processLive(pid int) bool {
 	default:
 		return true
 	}
+}
+
+func processIdentityMatches(identity PIDIdentity) bool {
+	if identity.PID <= 0 || identity.StartTick == 0 {
+		return false
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", identity.PID))
+	if err != nil {
+		return false
+	}
+	startTick, ok := processStartTickFromStat(data)
+	return ok && startTick == identity.StartTick
+}
+
+func processStartTickFromStat(data []byte) (uint64, bool) {
+	text := string(data)
+	closeParen := strings.LastIndexByte(text, ')')
+	if closeParen < 0 {
+		return 0, false
+	}
+	fields := strings.Fields(text[closeParen+2:])
+	if len(fields) < 20 {
+		return 0, false
+	}
+	tick, err := strconv.ParseUint(fields[19], 10, 64)
+	return tick, err == nil
 }
 
 func containsPID(pids []int, pid int) bool {

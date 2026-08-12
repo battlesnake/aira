@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -153,7 +154,7 @@ func TestCleanSuccessRequiresAllEvidence(t *testing.T) {
 	if !r.CleanSuccess() {
 		t.Fatal("complete evidence did not earn success")
 	}
-	for _, mutate := range []func(*RunRecord){func(r *RunRecord) { r.Status = StatusKilled }, func(r *RunRecord) { r.CaptureComplete = false }, func(r *RunRecord) { r.TerminalComplete = false }, func(r *RunRecord) { r.ScopeIntegrity = ScopeHandoffUnverified }, func(r *RunRecord) { r.ErrorCodes = []string{"E_RUN_CAPTURE_FAILED"} }} {
+	for _, mutate := range []func(*RunRecord){func(r *RunRecord) { r.Status = StatusKilled }, func(r *RunRecord) { r.CaptureComplete = false }, func(r *RunRecord) { r.TerminalComplete = false }, func(r *RunRecord) { r.ScopeIntegrity = ScopeUnverified }, func(r *RunRecord) { r.ScopeIntegrity = ScopeHandoffUnverified }, func(r *RunRecord) { r.ErrorCodes = []string{"E_RUN_CAPTURE_FAILED"} }} {
 		copy := r
 		mutate(&copy)
 		if copy.CleanSuccess() {
@@ -210,6 +211,20 @@ func TestMembershipAndMigrationClassification(t *testing.T) {
 	}
 	if !memberStillPresent([]int{12, 15}, 15) || memberStillPresent([]int{12}, 15) {
 		t.Fatal("stale member filter failed")
+	}
+	if ScopeUnverified == ScopeContained || ScopeUnverified == ScopeMigrated {
+		t.Fatal("unverified containment state aliases a different integrity state")
+	}
+}
+
+func TestProcessIdentityRejectsReusedPIDStartTick(t *testing.T) {
+	identity := PIDIdentity{PID: os.Getpid(), StartTick: processStartTick(os.Getpid())}
+	if identity.StartTick == 0 || !processIdentityMatches(identity) || !processLive(identity) {
+		t.Fatalf("current process identity was not recognized: %+v", identity)
+	}
+	identity.StartTick++
+	if processIdentityMatches(identity) || processLive(identity) {
+		t.Fatalf("stale start tick was accepted: %+v", identity)
 	}
 }
 
@@ -421,7 +436,7 @@ func TestRealCgroupIntegrationOrClearSkip(t *testing.T) {
 	}
 }
 
-func TestRealCgroupPlacedThenExitedFastIsContainedAndCaptured(t *testing.T) {
+func TestRealCgroupPlacedThenExitedFastIsHonestAndCaptured(t *testing.T) {
 	r := realRunner(t)
 	record, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/true"}})
 	if err != nil {
@@ -430,7 +445,8 @@ func TestRealCgroupPlacedThenExitedFastIsContainedAndCaptured(t *testing.T) {
 	if record.Status != StatusExited || record.ExitCode == nil || *record.ExitCode != 0 {
 		t.Fatalf("fast exit record=%+v", record)
 	}
-	if record.ScopeIntegrity != ScopeContained || !record.CaptureComplete || record.CaptureForcedClosed || len(record.ErrorCodes) != 0 {
+	assertHonestExitScope(t, r, record)
+	if !record.CaptureComplete || record.CaptureForcedClosed || len(record.ErrorCodes) != 0 {
 		t.Fatalf("fast placed exit was not clean: %+v", record)
 	}
 	for _, name := range []string{"out", "err"} {
@@ -470,6 +486,7 @@ func TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration(t *testing.T) {
 	if exited.Status != StatusExited || exited.CleanSuccess() && containsString(exited.ErrorCodes, "E_RUN_TIMEOUT") {
 		t.Fatalf("natural exit was rewritten by timeout: %+v", exited)
 	}
+	assertHonestExitScope(t, r, exited)
 	if got := terminalRecords(t, r); got != 1 {
 		t.Fatalf("natural terminal records=%d", got)
 	}
@@ -522,6 +539,7 @@ func TestRealCgroupExplicitEmptyEnvironmentIsExactAndDigested(t *testing.T) {
 	if record.Status != StatusExited || record.ExitCode == nil || *record.ExitCode != 0 {
 		t.Fatalf("explicit-env record=%+v", record)
 	}
+	assertHonestExitScope(t, r, record)
 	data, err := os.ReadFile(record.OutputRefs["out"].Path)
 	if err != nil {
 		t.Fatal(err)
@@ -683,6 +701,87 @@ func TestRealCgroupMigratedLaunchIsNotClean(t *testing.T) {
 	}
 }
 
+func TestRealCgroupDescendantMigrationBeforeLeaderExitResidual(t *testing.T) {
+	r := realRunner(t)
+	proofDir := t.TempDir()
+	t.Cleanup(func() {
+		pidData, _ := os.ReadFile(filepath.Join(proofDir, "pid"))
+		targetData, _ := os.ReadFile(filepath.Join(proofDir, "target"))
+		pid, err := strconv.Atoi(strings.TrimSpace(string(pidData)))
+		target := strings.TrimSpace(string(targetData))
+		if err == nil && pid > 0 {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+		if target != "" {
+			deadline := time.Now().Add(time.Second)
+			for time.Now().Before(deadline) {
+				if data, readErr := os.ReadFile(filepath.Join(target, "cgroup.procs")); readErr == nil && len(strings.TrimSpace(string(data))) == 0 {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			_ = os.Remove(target)
+		}
+	})
+	script := `set -eu
+rel=$(awk -F: '$1=="0" {print $3}' /proc/self/cgroup)
+parent=/sys/fs/cgroup$(dirname "$rel")
+target="$parent/.aira-descendant-$$"
+mkdir "$target"
+proof=$(pwd)
+printf '%s\n' "$target" > "$proof/target"
+sh -c 'target=$1; proof=$2; printf "%s\n" "$$" > "$proof/pid"; echo $$ > "$target/cgroup.procs"; printf migrated > "$proof/migrated"; exec 1>&- 2>&-; exec sleep 30' sh "$target" "$proof" &
+exit 0`
+	record, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/sh", "-c", script}, Cwd: proofDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := strings.TrimSpace(string(waitForFixtureFile(t, filepath.Join(proofDir, "target"))))
+	pidText := strings.TrimSpace(string(waitForFixtureFile(t, filepath.Join(proofDir, "pid"))))
+	if string(waitForFixtureFile(t, filepath.Join(proofDir, "migrated"))) != "migrated" {
+		t.Fatal("migration fixture did not publish its migration marker")
+	}
+	pid, err := strconv.Atoi(pidText)
+	if err != nil || pid <= 0 {
+		t.Fatalf("migration fixture published invalid pid %q: %v", pidText, err)
+	}
+	if target == "" || filepath.Dir(target) != filepath.Dir(record.CgroupScope) || target == record.CgroupScope {
+		t.Fatalf("migration fixture target is not a sibling cgroup: target=%q scope=%q", target, record.CgroupScope)
+	}
+	membersData, err := os.ReadFile(filepath.Join(target, "cgroup.procs"))
+	if err != nil {
+		t.Fatalf("migration fixture sibling membership unavailable: %v", err)
+	}
+	var siblingMembers []int
+	for _, field := range strings.Fields(string(membersData)) {
+		member, parseErr := strconv.Atoi(field)
+		if parseErr != nil {
+			t.Fatalf("invalid sibling cgroup member %q: %v", field, parseErr)
+		}
+		siblingMembers = append(siblingMembers, member)
+	}
+	if !containsPID(siblingMembers, pid) {
+		t.Fatalf("migration fixture pid %d is not in sibling cgroup %q: %v", pid, target, siblingMembers)
+	}
+	identity := PIDIdentity{PID: pid, StartTick: processStartTick(pid)}
+	if identity.StartTick == 0 || !processLive(identity) {
+		t.Fatalf("migration fixture descendant is not alive with matching identity: %+v", identity)
+	}
+	if record.Status != StatusExited || record.ExitCode == nil || *record.ExitCode != 0 {
+		t.Fatalf("descendant migration record=%+v", record)
+	}
+	if record.ScopeIntegrity == ScopeMigrated && record.CleanSuccess() {
+		t.Fatal("impossible migrated clean success")
+	}
+	if record.CleanSuccess() {
+		assertHonestExitScope(t, r, record)
+		t.Skip("leader containment observed; descendant containment not attestable after scope exit — daemonless residual, see task #20 (cgroup-namespace / supervisor mitigation)")
+	}
+	if record.ScopeIntegrity == ScopeContained && len(record.ErrorCodes) == 0 {
+		t.Fatalf("fixture was proven escaped but record was unexpectedly clean: %+v", record)
+	}
+}
+
 func TestRealCgroupAtomicMigrationResidualIsExplicit(t *testing.T) {
 	r := realRunner(t)
 	// Accepted deviation in docs/superpowers/specs/2026-08-11-aira-m12-runner-lite-design.md:
@@ -725,4 +824,38 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func assertHonestExitScope(t *testing.T, r *Runner, record *RunRecord) {
+	t.Helper()
+	events, err := r.ledger.read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed := hasEvent(events, record.ID, "running")
+	switch record.ScopeIntegrity {
+	case ScopeContained:
+		if !observed {
+			t.Fatalf("contained without positive running observation: %+v", record)
+		}
+	case ScopeUnverified:
+		if observed {
+			t.Fatalf("unverified despite positive running observation: %+v", record)
+		}
+	default:
+		t.Fatalf("unexpected fast-exit integrity=%q record=%+v", record.ScopeIntegrity, record)
+	}
+}
+
+func waitForFixtureFile(t *testing.T, path string) []byte {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
+			return data
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("migration fixture did not establish proof file %q", path)
+	return nil
 }
