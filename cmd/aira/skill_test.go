@@ -128,7 +128,7 @@ func TestSkillFaceInstallGuideAndRefusalRules(t *testing.T) {
 		t.Fatal(err)
 	}
 	var parsed core.SkillManifest
-	if err := json.Unmarshal(manifest, &parsed); err != nil || len(parsed.Actions) != 44 || parsed.Version == "" {
+	if err := json.Unmarshal(manifest, &parsed); err != nil || len(parsed.Actions) != 48 || parsed.Version == "" {
 		t.Fatalf("manifest err=%v value=%#v", err, parsed)
 	}
 	if exit := Run([]string{"skill", "install", installDir}, &out, &stderr); exit != 0 {
@@ -192,7 +192,13 @@ func TestSkillExamplesReachCoreFromRun(t *testing.T) {
 	}
 	codeOf := func(argv []string) (string, int) {
 		var stdout, stderr bytes.Buffer
-		exit := Run(append(append([]string{}, argv...), "--json"), &stdout, &stderr)
+		fullArgv := append(append([]string{}, argv...), "--json")
+		var exit int
+		if len(argv) >= 2 && argv[0] == "test-report" && argv[1] == "add" {
+			exit = runWithInput(fullArgv, &stdout, &stderr, strings.NewReader(`<testsuite tests="1"><testcase classname="guide" name="Example"/></testsuite>`))
+		} else {
+			exit = Run(fullArgv, &stdout, &stderr)
+		}
 		var response struct {
 			Code string `json:"code"`
 		}

@@ -117,13 +117,60 @@ type GoTestJSONResult struct {
 	FailedCount     int
 }
 
-type goTestEvent struct {
+// GoTestEvent is the strict line-level event shape shared by command gates
+// and the test-report ingester. Keeping decoding here prevents the two
+// consumers from accepting different go test -json grammars.
+type GoTestEvent struct {
 	Time    string  `json:"Time,omitempty"`
 	Action  string  `json:"Action"`
 	Package string  `json:"Package"`
 	Test    string  `json:"Test,omitempty"`
 	Elapsed float64 `json:"Elapsed,omitempty"`
 	Output  string  `json:"Output,omitempty"`
+}
+
+// DecodeGoTestJSONEvents decodes the strict JSONL envelope and event
+// vocabulary. It intentionally does not decide whether an otherwise valid
+// stream is complete; callers apply their own terminal-state policy.
+func DecodeGoTestJSONEvents(data []byte) ([]GoTestEvent, error) {
+	if !utf8Valid(data) {
+		return nil, errors.New("parser malformed: output is not UTF-8")
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
+	var events []GoTestEvent
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			return nil, errors.New("parser malformed: blank event line")
+		}
+		var event GoTestEvent
+		decoder := json.NewDecoder(bytes.NewReader(line))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&event); err != nil || event.Action == "" || event.Package == "" {
+			return nil, errors.New("parser malformed: malformed event")
+		}
+		var extra any
+		if err := decoder.Decode(&extra); err != io.EOF {
+			return nil, errors.New("parser malformed: multiple JSON values")
+		}
+		if event.Test != "" && (event.Action == "start" || event.Action == "package-terminal") {
+			return nil, errors.New("parser malformed: package event has test")
+		}
+		switch event.Action {
+		case "start", "run", "pause", "cont", "output", "bench", "pass", "fail", "skip":
+		default:
+			return nil, fmt.Errorf("parser malformed: unknown action %q", event.Action)
+		}
+		events = append(events, event)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, errors.New("parser malformed: partial or oversized final line")
+	}
+	if len(data) == 0 {
+		return nil, errors.New("parser malformed: empty stream")
+	}
+	return events, nil
 }
 
 type testEventState struct {
@@ -153,16 +200,14 @@ func ParseGoTestJSONV1(data []byte) (GoTestJSONResult, error) {
 		if len(line) == 0 {
 			return result, errors.New("parser incomplete: blank event line")
 		}
-		var event goTestEvent
-		decoder := json.NewDecoder(bytes.NewReader(line))
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&event); err != nil || event.Action == "" || event.Package == "" {
+		// The shared decoder owns envelope strictness. This gate parser keeps
+		// its existing completeness semantics and state-machine diagnostics.
+		var event GoTestEvent
+		decoded, decodeErr := DecodeGoTestJSONEvents(append(append([]byte(nil), line...), '\n'))
+		if decodeErr != nil {
 			return result, errors.New("parser incomplete: malformed event")
 		}
-		var extra any
-		if err := decoder.Decode(&extra); err != io.EOF {
-			return result, errors.New("parser incomplete: multiple JSON values")
-		}
+		event = decoded[0]
 		if _, ok := packages[event.Package]; !ok {
 			packages[event.Package] = event.Package
 		}

@@ -91,6 +91,11 @@ type Store interface {
 	Reconcile(context.Context) error
 	Rebuild(context.Context) error
 	Check(context.Context) (store.CheckReport, error)
+	AddTestReport(context.Context, domain.TestReportInput) (store.TestReportAddResult, error)
+	ListTestReports(string) ([]domain.TestReport, error)
+	GetTestReport(string) (domain.TestReport, error)
+	FlakyTests(string) ([]domain.FlakyTest, error)
+	ReconcileFlaky(context.Context) error
 }
 
 type reviewStore interface {
@@ -121,6 +126,7 @@ type handlerData struct {
 	Data     any
 	Warnings []string
 	Verdict  string
+	Code     string
 }
 
 type outputReadData struct {
@@ -314,8 +320,12 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 	}
 	warnings := []string(nil)
 	verdict := ""
+	handlerCode := ""
 	if wrapped, ok := data.(handlerData); ok {
-		data, warnings, verdict = wrapped.Data, wrapped.Warnings, wrapped.Verdict
+		data, warnings, verdict, handlerCode = wrapped.Data, wrapped.Warnings, wrapped.Verdict, wrapped.Code
+	}
+	if handlerCode != "" {
+		return Response{OK: false, Code: handlerCode, Data: data, Error: handlerCode, Exit: store.ExitForCode(handlerCode)}
 	}
 	if output, ok := data.(outputReadData); ok {
 		if output.Err != nil {
@@ -651,6 +661,64 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				return summary, nil
 			default:
 				return nil, fmt.Errorf("E_UNKNOWN_VERB: unknown req sub-verb %q", subverb)
+			}
+		}},
+		"test-report": {Name: "test-report", Usage: "test-report add|ls|show|flaky ...", Args: []ArgSpec{
+			stringSpec("subverb", true, true, "Test report operation", "add", "ls", "show", "flaky"),
+			stringSpec("format", false, false, "Report format", "go-json", "junit"), stringSpec("selector", false, true, "Report or test selector"),
+			stringSpec("explain", false, false, "Explain one flaky test"), stringSpec("ticket", false, false, "Ticket ID"), stringSpec("phase", false, false, "Work phase"),
+			stringSpec("commit", false, false, "Commit identity"), stringSpec("branch", false, false, "Branch identity"), stringSpec("suite", false, false, "Suite identity"),
+			stringSpec("config", false, false, "Opaque test configuration"), stringSpec("env_digest", false, false, "Environment digest"),
+			stringSpec("shard", false, false, "Shard i/n"), stringSpec("retry", false, false, "Retry index"),
+			stringSpec("raw", false, false, "Raw report bytes"),
+		}, MCPTool: "aira_test_report", MCPOperation: "subverb", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+			subverb := strings.ToLower(stringArg(args, "subverb"))
+			switch subverb {
+			case "add":
+				input := domain.TestReportInput{Format: stringArg(args, "format"), TicketID: stringArg(args, "ticket"), Phase: stringArg(args, "phase"), Commit: stringArg(args, "commit"), Branch: stringArg(args, "branch"), SuiteID: stringArg(args, "suite"), Config: stringArg(args, "config"), EnvDigest: stringArg(args, "env_digest"), Shard: stringArg(args, "shard"), RetryIndex: intArg(args, "retry")}
+				if raw := args.record("raw"); raw != nil {
+					switch value := raw.(type) {
+					case []byte:
+						input.Raw = value
+					case string:
+						input.Raw = []byte(value)
+					}
+				}
+				return c.store.AddTestReport(ctx, input)
+			case "ls", "list":
+				reports, err := c.store.ListTestReports(stringArg(args, "selector"))
+				if err != nil {
+					return nil, err
+				}
+				return map[string]any{"total": len(reports), "rows": reports}, nil
+			case "show":
+				return c.store.GetTestReport(stringArg(args, "selector"))
+			case "flaky":
+				explain := stringArg(args, "explain")
+				selectorArg := stringArg(args, "selector")
+				selector := explain
+				if selector == "" {
+					selector = selectorArg
+				}
+				tests, err := c.store.FlakyTests(selector)
+				if err != nil {
+					return nil, err
+				}
+				if selector != "" && len(tests) == 1 && tests[0].State == domain.FlakyStateUnevaluated {
+					return handlerData{Data: tests[0], Code: "U_TESTREPORT_INCOMPARABLE"}, nil
+				}
+				if selector == "" {
+					flaky := make([]domain.FlakyTest, 0, len(tests))
+					for _, test := range tests {
+						if test.State == domain.FlakyStateFlaky {
+							flaky = append(flaky, test)
+						}
+					}
+					tests = flaky
+				}
+				return map[string]any{"total": len(tests), "rows": tests}, nil
+			default:
+				return nil, fmt.Errorf("E_ARGUMENT_INVALID: unknown test-report sub-verb %q", subverb)
 			}
 		}},
 		"claim": {Name: "claim", Usage: "claim <id> [--steal --actor NAME]", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), boolSpec("steal", false, false, "Steal an expired lease"), stringSpec("actor", false, false, "Lease actor")}, MCPTool: "aira_claim", Run: func(ctx context.Context, args *argAccessor) (any, error) {
@@ -1039,6 +1107,12 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		"run-log":   {summary: "Read captured run output", safety: SafetyRead, example: []string{"RUN-1", "--stream", "out"}},
 		"reconcile": {summary: "Reconcile derived project state", safety: SafetyReconcile, example: []string{"--rebuild"}},
 		"check":     {summary: "Check project consistency", safety: SafetyReconcile, example: []string{}},
+		"test-report": {summary: "Archive and compare test reports", safety: SafetyRead, operations: []OperationSpec{
+			{Name: "add", Summary: "Ingest a test report", Safety: SafetyMutate, Args: []OperationArg{{Name: "format", Required: true}, {Name: "raw", Required: true}, {Name: "ticket"}, {Name: "phase"}, {Name: "commit"}, {Name: "branch"}, {Name: "suite"}, {Name: "config"}, {Name: "env_digest"}, {Name: "shard"}, {Name: "retry"}}, Example: []string{"add", "--format", "go-json"}},
+			{Name: "ls", Summary: "List archived test reports", Safety: SafetyRead, Args: []OperationArg{{Name: "selector"}}, Example: []string{"ls"}},
+			{Name: "show", Summary: "Show one archived test report", Safety: SafetyRead, Args: []OperationArg{{Name: "selector", Required: true}}, Example: []string{"show", "TR-1"}},
+			{Name: "flaky", Summary: "Compute three-state flaky evidence", Safety: SafetyRead, Args: []OperationArg{{Name: "selector"}, {Name: "explain"}}, Example: []string{"flaky", "--explain", "pkg/Test"}},
+		}},
 		"gate": {summary: "Manage proof-backed gates", safety: SafetyRead, operations: []OperationSpec{
 			{Name: "add", Summary: "Add a gate definition", Safety: SafetyMutate, Args: gateDefinitionOperationArgs(), Example: []string{"add", "unit-tests", "--checker", "command", "--predicate", "tests-green", "--argv", "/usr/local/bin/go", "--argv", "test", "--argv", "-json", "--argv", "./...", "--cwd", "root", "--env-allow", "PATH", "--timeout-ms", "60000", "--output-cap-bytes", "8388608", "--parser", "go-test-json-v1"}},
 			{Name: "ls", Summary: "List gate definitions", Safety: SafetyRead, Args: nil, Example: []string{"ls"}},

@@ -43,7 +43,7 @@ func TestDispatchMetadataMatchesInstrumentedHandlerReads(t *testing.T) {
 		}
 		if len(descriptor.Operations) > 0 {
 			discriminator := ""
-			if name == "find" || name == "req" {
+			if name == "find" || name == "req" || name == "test-report" {
 				discriminator = "subverb"
 			} else if name == "link" {
 				discriminator = "list"
@@ -102,6 +102,7 @@ func metadataProbeInputs(name string) []map[string]any {
 		"line": 1, "requirement": "REQ-1", "disposition": "fixed", "reason": "reason", "actor": "actor",
 		"steal": true, "token": "token", "globs": []string{"**/*.go"}, "list": true,
 		"from": "AIRA-1", "to": "AIRA-2", "field": "title", "value": "new", "status": "planned", "rebuild": true,
+		"format": "go-json", "raw": []byte("{}"), "explain": "pkg/Test", "suite": "unit", "runner": "go", "config": "race", "env_digest": "env", "shard": "1/1", "retry": "0", "agent": "codex", "session": "s",
 	}
 	switch name {
 	case "find", "req":
@@ -131,6 +132,13 @@ func metadataProbeInputs(name string) []map[string]any {
 			cloneMetadataInputs(values, "subverb", "review"),
 			cloneMetadataInputs(values, "subverb", "canary-run"),
 			cloneMetadataInputs(values, "subverb", "canary-show"),
+		}
+	case "test-report":
+		return []map[string]any{
+			cloneMetadataInputs(values, "subverb", "add"),
+			cloneMetadataInputs(values, "subverb", "ls"),
+			cloneMetadataInputs(values, "subverb", "show"),
+			cloneMetadataInputs(values, "subverb", "flaky"),
 		}
 	default:
 		return []map[string]any{values}
@@ -229,6 +237,15 @@ func (metadataProbeStore) Rebuild(context.Context) error                   { ret
 func (metadataProbeStore) Check(context.Context) (store.CheckReport, error) {
 	return store.CheckReport{}, nil
 }
+func (metadataProbeStore) AddTestReport(context.Context, domain.TestReportInput) (store.TestReportAddResult, error) {
+	return store.TestReportAddResult{}, nil
+}
+func (metadataProbeStore) ListTestReports(string) ([]domain.TestReport, error) { return nil, nil }
+func (metadataProbeStore) GetTestReport(string) (domain.TestReport, error) {
+	return domain.TestReport{}, nil
+}
+func (metadataProbeStore) FlakyTests(string) ([]domain.FlakyTest, error) { return nil, nil }
+func (metadataProbeStore) ReconcileFlaky(context.Context) error          { return nil }
 
 func TestDispatchDescriptorsAreStableReadOnlyCopies(t *testing.T) {
 	c := New(nil)
@@ -273,7 +290,7 @@ func TestCanonicalDispatchNamesAndAliases(t *testing.T) {
 		got = append(got, descriptor.Name)
 	}
 	sort.Strings(got)
-	want := []string{"check", "claim", "count", "create", "find", "gate", "grep", "heartbeat", "help", "id", "import", "init", "link", "list", "mv", "ready", "reconcile", "release", "req", "review", "run", "run-kill", "run-log", "set", "show", "touch", "unlink"}
+	want := []string{"check", "claim", "count", "create", "find", "gate", "grep", "heartbeat", "help", "id", "import", "init", "link", "list", "mv", "ready", "reconcile", "release", "req", "review", "run", "run-kill", "run-log", "set", "show", "test-report", "touch", "unlink"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("dispatch names=%v, want=%v", got, want)
 	}

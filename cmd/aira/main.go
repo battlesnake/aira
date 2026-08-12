@@ -20,6 +20,10 @@ func main() { os.Exit(Run(os.Args[1:], os.Stdout, os.Stderr)) }
 // Run is the deliberately small CLI adapter: argv parsing, core request
 // construction, and rendering. It contains no ticket or consistency logic.
 func Run(argv []string, stdout, stderr io.Writer) int {
+	return runWithInput(argv, stdout, stderr, os.Stdin)
+}
+
+func runWithInput(argv []string, stdout, stderr io.Writer, stdin io.Reader) int {
 	if len(argv) > 0 && strings.ToLower(argv[0]) == "mcp" {
 		return runMCP(context.Background(), os.Stdin, stdout, stderr)
 	}
@@ -64,13 +68,30 @@ func Run(argv []string, stdout, stderr io.Writer) int {
 		}
 		return render(core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
 	}
+	if verb == "test-report" && len(positional) > 0 && strings.EqualFold(positional[0], "add") {
+		path := "-"
+		if len(positional) == 2 {
+			path = positional[1]
+		}
+		var data []byte
+		if path == "-" {
+			data, err = io.ReadAll(stdin)
+		} else {
+			data, err = os.ReadFile(path)
+		}
+		if err != nil {
+			code := "E_TESTREPORT_INVALID"
+			return render(core.Response{Code: code, Error: fmt.Sprintf("%s: %v", code, err), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
+		}
+		request.Args["raw"] = data
+	}
 	s, project, err := app.Open(context.Background(), ".")
 	if err != nil {
 		code := appErrorCode(err)
 		return render(core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
 	}
 	defer s.Close()
-	dispatcher := core.NewWithRunnerInput(s, project.Runner, os.Stdin)
+	dispatcher := core.NewWithRunnerInput(s, project.Runner, stdin)
 	response := dispatcher.Do(context.Background(), request)
 	if verb == "run-log" && !jsonOutput {
 		return renderRunLog(response, stdout, stderr)
@@ -149,7 +170,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 				options["fields"] += ","
 			}
 			options["fields"] += argv[i]
-		} else if name == "argv" || name == "env-allow" {
+		} else if name == "argv" || name == "env-allow" || (name == "config-env" && verb == "test-report") {
 			options[name] = appendDelimited(options[name], argv[i])
 		} else {
 			options[name] = argv[i]
@@ -166,13 +187,14 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"count":  {"by": true}, "reconcile": {"rebuild": true},
 		"claim":   {"steal": true, "actor": true},
 		"release": {"token": true}, "heartbeat": {"token": true},
-		"touch":    {"token": true},
-		"ready":    {"list": true},
-		"find":     {"category": true, "severity": true, "verdict": true, "source": true, "message": true, "file": true, "requirement": true, "by": true, "fields": true, "disposition": true, "reason": true, "actor": true},
-		"req":      {"status": true, "fields": true},
-		"run-kill": {},
-		"run-log":  {"stream": true, "from": true, "tail": true, "follow": true, "full": true},
-		"gate":     {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-seed": true, "mutation-expected-result": true},
+		"touch":       {"token": true},
+		"ready":       {"list": true},
+		"find":        {"category": true, "severity": true, "verdict": true, "source": true, "message": true, "file": true, "requirement": true, "by": true, "fields": true, "disposition": true, "reason": true, "actor": true},
+		"req":         {"status": true, "fields": true},
+		"test-report": {"format": true, "explain": true, "ticket": true, "phase": true, "commit": true, "branch": true, "suite": true, "config": true, "config-env": true, "shard": true, "retry": true},
+		"run-kill":    {},
+		"run-log":     {"stream": true, "from": true, "tail": true, "follow": true, "full": true},
+		"gate":        {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-seed": true, "mutation-expected-result": true},
 	}
 	for name := range options {
 		if !allowed[verb][name] {
@@ -396,6 +418,71 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			args["file"] = positional[1]
 		default:
 			return core.Request{}, fmt.Errorf("req requires add|ls|show|set|import")
+		}
+	case "test-report":
+		if len(positional) == 0 {
+			return core.Request{}, fmt.Errorf("test-report requires add|ls|show|flaky")
+		}
+		subverb := strings.ToLower(positional[0])
+		args["subverb"] = subverb
+		switch subverb {
+		case "add":
+			if len(positional) > 2 {
+				return core.Request{}, fmt.Errorf("test-report add accepts an optional report file")
+			}
+			if options["format"] == "" {
+				return core.Request{}, fmt.Errorf("test-report add requires --format go-json|junit")
+			}
+		case "ls", "list":
+			if len(positional) != 1 {
+				return core.Request{}, fmt.Errorf("test-report ls accepts no positional selector")
+			}
+		case "show":
+			if len(positional) != 2 {
+				return core.Request{}, fmt.Errorf("test-report show requires <report-id>")
+			}
+			args["selector"] = positional[1]
+		case "flaky":
+			if len(positional) > 2 {
+				return core.Request{}, fmt.Errorf("test-report flaky accepts at most one test selector")
+			}
+			if len(positional) == 2 {
+				args["selector"] = positional[1]
+			}
+			if options["explain"] != "" {
+				args["explain"] = options["explain"]
+			}
+		default:
+			return core.Request{}, fmt.Errorf("test-report requires add|ls|show|flaky")
+		}
+		for option, argument := range map[string]string{"format": "format", "ticket": "ticket", "phase": "phase", "commit": "commit", "branch": "branch", "suite": "suite", "config": "config", "shard": "shard", "retry": "retry"} {
+			if options[option] != "" {
+				args[argument] = options[option]
+			}
+		}
+		if rawRetry := options["retry"]; rawRetry != "" {
+			value, err := strconv.Atoi(rawRetry)
+			if err != nil || value < 0 {
+				return core.Request{}, fmt.Errorf("E_ARGUMENT_INVALID: --retry must be a non-negative integer")
+			}
+		}
+		if subverb == "add" {
+			args["raw"] = ""
+		}
+		if rawEnv := options["config-env"]; rawEnv != "" {
+			entries := make([]runner.EnvEntry, 0)
+			for _, item := range splitOptionList(rawEnv) {
+				key, value, ok := strings.Cut(item, "=")
+				if !ok || key == "" {
+					return core.Request{}, fmt.Errorf("E_ARGUMENT_INVALID: --config-env requires K=V")
+				}
+				entries = append(entries, runner.EnvEntry{Key: []byte(key), Value: []byte(value)})
+			}
+			digest, err := runner.EnvDigest(entries)
+			if err != nil {
+				return core.Request{}, err
+			}
+			args["env_digest"] = digest
 		}
 	case "list", "ls":
 		args["query"] = strings.Join(positional, " ")

@@ -31,10 +31,16 @@ type RunConfig struct {
 }
 
 type ProjectConfig struct {
-	Slug                string          `json:"slug"`
-	Prefixes            []string        `json:"prefixes"`
-	RequirementPrefixes []string        `json:"requirement_prefixes,omitempty"`
-	Review              json.RawMessage `json:"review,omitempty"`
+	Slug                string            `json:"slug"`
+	Prefixes            []string          `json:"prefixes"`
+	RequirementPrefixes []string          `json:"requirement_prefixes,omitempty"`
+	Review              json.RawMessage   `json:"review,omitempty"`
+	TestReports         TestReportsConfig `json:"test_reports,omitempty"`
+}
+
+type TestReportsConfig struct {
+	MaxReports int `json:"max_reports,omitempty"`
+	MaxAgeDays int `json:"max_age_days,omitempty"`
 }
 
 type LeaseConfig struct {
@@ -122,6 +128,8 @@ func Open(ctx context.Context, cwd string) (*store.Store, Project, error) {
 		ProjectSlug: project.Config.Project.Slug, Prefixes: project.Config.Project.Prefixes,
 		RequirementPrefixes: project.Config.Project.RequirementPrefixes,
 		ReviewPolicy:        reviewPolicy,
+		MaxReports:          project.Config.Project.TestReports.MaxReports,
+		MaxAgeDays:          project.Config.Project.TestReports.MaxAgeDays,
 		LeaseTTLNS:          leaseTTLNS(project.Config),
 	})
 	if err != nil {
@@ -298,6 +306,9 @@ func validateConfig(config Config) error {
 	}
 	if len(config.Project.Prefixes) == 0 {
 		return errors.New("E_CONFIG_INVALID: config has no prefixes")
+	}
+	if config.Project.TestReports.MaxReports < 0 || config.Project.TestReports.MaxAgeDays < 0 {
+		return errors.New("E_CONFIG_INVALID: test report retention values must be non-negative")
 	}
 	seen := map[string]bool{}
 	for _, prefix := range config.Project.Prefixes {

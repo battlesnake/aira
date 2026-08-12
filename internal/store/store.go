@@ -50,6 +50,8 @@ type Options struct {
 	ReviewPolicy  ReviewPolicy
 	LeaseStateDir string
 	LeaseTTLNS    uint64
+	MaxReports    int
+	MaxAgeDays    int
 	Clock         Clock
 }
 
@@ -67,6 +69,8 @@ type Store struct {
 	prefixes      map[string]string // prefix -> entity kind (ticket|requirement)
 	leaseStateDir string
 	leaseTTLNS    uint64
+	maxReports    int
+	maxAgeDays    int
 	clock         Clock
 	runner        *runner.Runner
 	// beforeMaterialise is intentionally nil in production; tests use it to
@@ -96,6 +100,9 @@ type Store struct {
 	// traceabilitySnapshotHook is a test-only seam used to reproduce a mutation
 	// during the tracked-file snapshot validation window.
 	traceabilitySnapshotHook func()
+	// testReportInsertHook is a test-only crash seam for proving report/result
+	// atomicity. Production leaves it nil.
+	testReportInsertHook func(int) error
 }
 
 type Intent struct {
@@ -218,7 +225,15 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		db: db, root: root, commonDir: common, auditDir: filepath.Join(common, "aira"),
 		dbPath: dbPath, registryPath: registry, projectID: opts.ProjectID,
 		worktreeID: opts.WorktreeID, projectSlug: opts.ProjectSlug, reviewPolicy: reviewPolicy, prefixes: map[string]string{},
-		leaseStateDir: opts.LeaseStateDir, leaseTTLNS: opts.LeaseTTLNS, clock: opts.Clock,
+		leaseStateDir: opts.LeaseStateDir, leaseTTLNS: opts.LeaseTTLNS,
+		maxReports: opts.MaxReports, maxAgeDays: opts.MaxAgeDays, clock: opts.Clock,
+	}
+	if s.maxReports == 0 {
+		s.maxReports = 5000
+	}
+	if s.maxReports < 1 || s.maxAgeDays < 0 {
+		_ = db.Close()
+		return nil, errors.New("E_CONFIG_INVALID: test report retention is invalid")
 	}
 	if s.leaseStateDir == "" {
 		s.leaseStateDir = defaultLeaseStateDir()
@@ -375,6 +390,28 @@ func (s *Store) initDB(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS gate_attestations (
 		    project_id TEXT NOT NULL, seq INTEGER NOT NULL, gate_id TEXT NOT NULL,
 		    record_json TEXT NOT NULL, PRIMARY KEY(project_id, seq)
+		)`,
+		`CREATE TABLE IF NOT EXISTS test_report_counter (
+		    project_id TEXT PRIMARY KEY, next_number INTEGER NOT NULL, next_seq INTEGER NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS test_reports (
+		    project_id TEXT NOT NULL, id TEXT NOT NULL, ticket_id TEXT NOT NULL DEFAULT '',
+		    phase TEXT NOT NULL DEFAULT '', "commit" TEXT NOT NULL DEFAULT '', branch TEXT NOT NULL DEFAULT '',
+		    worktree_id TEXT NOT NULL DEFAULT '', agent TEXT NOT NULL DEFAULT '', session TEXT NOT NULL DEFAULT '',
+		    at TEXT NOT NULL, run_ref TEXT NOT NULL DEFAULT '', suite_id TEXT NOT NULL DEFAULT '',
+		    runner TEXT NOT NULL DEFAULT '', config TEXT NOT NULL DEFAULT '', env_digest TEXT NOT NULL DEFAULT '',
+		    shard TEXT NOT NULL, retry_index INTEGER NOT NULL DEFAULT 0, parser_complete INTEGER NOT NULL,
+		    coverage_pct REAL, lines_covered INTEGER, lines_total INTEGER, format TEXT NOT NULL,
+		    source_digest TEXT NOT NULL, at_seq INTEGER NOT NULL, pinned INTEGER NOT NULL DEFAULT 0,
+		    PRIMARY KEY(project_id, id),
+		    UNIQUE(project_id, source_digest, format, "commit", suite_id, config, env_digest, shard, retry_index),
+		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS test_report_results (
+		    project_id TEXT NOT NULL, report_id TEXT NOT NULL, name TEXT NOT NULL,
+		    outcome TEXT NOT NULL, duration_ns INTEGER, message TEXT NOT NULL DEFAULT '',
+		    PRIMARY KEY(project_id, report_id, name),
+		    FOREIGN KEY(project_id, report_id) REFERENCES test_reports(project_id, id) ON DELETE CASCADE
 		)`,
 	}
 	for _, statement := range statements {

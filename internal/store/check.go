@@ -23,7 +23,9 @@ var ExitCodes = map[string]int{
 	"E_FINDING_INVALID": 2, "E_WAIVER_REASON_REQUIRED": 2, "E_QUERY_INVALID": 2,
 	"E_REQUIREMENT_INVALID": 2,
 	"E_IMPORT_INVALID":      2, "E_ARGUMENT_INVALID": 2,
+	"E_TESTREPORT_INVALID": 2, "E_TESTREPORT_FLAKY": 1,
 	"E_INDEX_UNEVALUATED":          3,
+	"U_TESTREPORT_INCOMPARABLE":    3,
 	"U_REVIEW_SECTION_UNEVALUATED": 3,
 	// Runner-lite lifecycle and containment codes. These are deliberately kept
 	// in the single catalog so every face gets the same exit contract.
@@ -135,6 +137,28 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 		} else {
 			return CheckReport{}, err
 		}
+	}
+	if err := s.ReconcileFlaky(ctx); err != nil {
+		return CheckReport{}, err
+	}
+	flakyRows, err := s.db.QueryContext(ctx, `SELECT code,subject,details FROM findings WHERE project_id=? AND subtype='reconciliation' AND code=? ORDER BY subject`, s.projectID, "E_TESTREPORT_FLAKY")
+	if err != nil {
+		return CheckReport{}, err
+	}
+	for flakyRows.Next() {
+		var code, subject, details string
+		if err := flakyRows.Scan(&code, &subject, &details); err != nil {
+			_ = flakyRows.Close()
+			return CheckReport{}, err
+		}
+		addFinding(&report, CheckFinding{Code: code, Subject: subject, Message: details, Kind: "fail"}, "test-reports")
+	}
+	if err := flakyRows.Err(); err != nil {
+		_ = flakyRows.Close()
+		return CheckReport{}, err
+	}
+	if err := flakyRows.Close(); err != nil {
+		return CheckReport{}, err
 	}
 	if err := s.Rebuild(ctx); err != nil {
 		if isIntegrityError(err) {
