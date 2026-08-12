@@ -28,7 +28,8 @@ func parseGoTestJSON(data []byte) (parsedTestReport, error) {
 	paused := map[string]bool{}
 	packageStarted := map[string]bool{}
 	packageTerminal := map[string]bool{}
-	packageFailure := false
+	packageRuns := map[string]int{}
+	packageFailure := map[string]bool{}
 	var results []domain.TestResult
 	malformed := func(message string) (parsedTestReport, error) {
 		return parsedTestReport{}, fmt.Errorf("E_TESTREPORT_INVALID: go-json %s", message)
@@ -49,6 +50,7 @@ func parseGoTestJSON(data []byte) (parsedTestReport, error) {
 				return malformed("invalid test start")
 			}
 			started[key] = true
+			packageRuns[event.Package]++
 		case "pause", "cont":
 			key := event.Package + "\x00" + event.Test
 			if !started[key] || terminal[key] || event.Test == "" || paused[key] == (event.Action == "pause") {
@@ -88,9 +90,7 @@ func parseGoTestJSON(data []byte) (parsedTestReport, error) {
 				}
 			}
 			packageTerminal[event.Package] = true
-			if event.Action == "fail" {
-				packageFailure = true
-			}
+			packageFailure[event.Package] = event.Action == "fail"
 		default:
 			return malformed("unknown action")
 		}
@@ -98,9 +98,12 @@ func parseGoTestJSON(data []byte) (parsedTestReport, error) {
 	if len(packageStarted) == 0 {
 		return malformed("no package")
 	}
-	complete := !packageFailure
+	complete := true
 	for pkg := range packageStarted {
 		if !packageTerminal[pkg] {
+			complete = false
+		}
+		if packageFailure[pkg] && packageRuns[pkg] == 0 {
 			complete = false
 		}
 	}

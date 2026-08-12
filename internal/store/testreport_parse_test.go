@@ -14,10 +14,10 @@ const completeGoJSON = `{"Action":"start","Package":"example/pkg"}
 {"Action":"fail","Package":"example/pkg","Test":"TestFail","Elapsed":0.002}
 {"Action":"run","Package":"example/pkg","Test":"TestSkip"}
 {"Action":"skip","Package":"example/pkg","Test":"TestSkip"}
-{"Action":"pass","Package":"example/pkg"}
+{"Action":"fail","Package":"example/pkg"}
 `
 
-func TestParseGoTestJSONRoundTripAndTruncation(t *testing.T) {
+func TestParseGoTestJSONPackageFailureIsCompleteAndTruncation(t *testing.T) {
 	parsed, err := parseGoTestJSON([]byte(completeGoJSON))
 	if err != nil || !parsed.Complete {
 		t.Fatalf("complete parse = %#v, %v", parsed, err)
@@ -25,7 +25,7 @@ func TestParseGoTestJSONRoundTripAndTruncation(t *testing.T) {
 	if len(parsed.Results) != 3 || parsed.Results[0].Outcome != domain.OutcomePass || parsed.Results[1].Outcome != domain.OutcomeFail || parsed.Results[2].Outcome != domain.OutcomeSkip {
 		t.Fatalf("results = %#v", parsed.Results)
 	}
-	truncated := strings.TrimSuffix(completeGoJSON, `{"Action":"pass","Package":"example/pkg"}
+	truncated := strings.TrimSuffix(completeGoJSON, `{"Action":"fail","Package":"example/pkg"}
 `)
 	truncated = strings.TrimSuffix(truncated, "\n")
 	parsed, err = parseGoTestJSON([]byte(truncated))
@@ -36,6 +36,20 @@ func TestParseGoTestJSONRoundTripAndTruncation(t *testing.T) {
 `
 	if _, err := parseGoTestJSON([]byte(bad)); ErrorCode(err) != "E_TESTREPORT_INVALID" {
 		t.Fatalf("bad action error = %v", err)
+	}
+	if _, err := parseGoTestJSON([]byte("not json\n")); ErrorCode(err) != "E_TESTREPORT_INVALID" {
+		t.Fatalf("bad line error = %v", err)
+	}
+}
+
+func TestParseGoTestJSONCompileFailureIsIncomplete(t *testing.T) {
+	data := `{"Action":"start","Package":"example/pkg"}
+{"Action":"output","Package":"example/pkg","Output":"build failed"}
+{"Action":"fail","Package":"example/pkg"}
+`
+	parsed, err := parseGoTestJSON([]byte(data))
+	if err != nil || parsed.Complete || len(parsed.Results) != 0 {
+		t.Fatalf("compile failure parse = %#v, %v; want incomplete with no results", parsed, err)
 	}
 }
 

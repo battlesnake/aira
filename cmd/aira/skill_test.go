@@ -195,7 +195,27 @@ func TestSkillExamplesReachCoreFromRun(t *testing.T) {
 		fullArgv := append(append([]string{}, argv...), "--json")
 		var exit int
 		if len(argv) >= 2 && argv[0] == "test-report" && argv[1] == "add" {
-			exit = runWithInput(fullArgv, &stdout, &stderr, strings.NewReader(`<testsuite tests="1"><testcase classname="guide" name="Example"/></testsuite>`))
+			format := ""
+			for index := 2; index+1 < len(argv); index++ {
+				if argv[index] == "--format" {
+					format = strings.ToLower(argv[index+1])
+					break
+				}
+			}
+			var body string
+			switch format {
+			case "go-json":
+				body = `{"Action":"start","Package":"guide"}
+{"Action":"run","Package":"guide","Test":"Example"}
+{"Action":"pass","Package":"guide","Test":"Example"}
+{"Action":"pass","Package":"guide"}
+`
+			case "junit":
+				body = `<testsuite tests="1"><testcase classname="guide" name="Example"/></testsuite>`
+			default:
+				t.Fatalf("test-report add example has unsupported format %q: argv=%v", format, argv)
+			}
+			exit = runWithInput(fullArgv, &stdout, &stderr, strings.NewReader(body))
 		} else {
 			exit = Run(fullArgv, &stdout, &stderr)
 		}

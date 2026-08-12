@@ -30,9 +30,9 @@ func TestAddTestReportIsIdempotentAndAllocatesTRLocally(t *testing.T) {
 	if !second.Idempotent || second.ID != "TR-1" || second.Report.AtSeq != 1 {
 		t.Fatalf("second result = %#v", second)
 	}
-	distinct := reportInput(strings.Replace(completeGoJSON, `{"Action":"pass","Package":"example/pkg"}
+	distinct := reportInput(strings.Replace(completeGoJSON, `{"Action":"fail","Package":"example/pkg"}
 `, `{"Action":"output","Package":"example/pkg","Output":"diagnostic"}
-{"Action":"pass","Package":"example/pkg"}
+{"Action":"fail","Package":"example/pkg"}
 `, 1), "race")
 	third, err := s.AddTestReport(context.Background(), distinct)
 	if err != nil {
@@ -74,6 +74,29 @@ func TestAddTestReportMalformedAndMidInsertFailureAreAtomic(t *testing.T) {
 	}
 }
 
+func TestAddTestReportMalformedJUnitIsAtomic(t *testing.T) {
+	base := t.TempDir()
+	s := testStore(t, base, base+"/common", base+"/state")
+	input := domain.TestReportInput{
+		Format: "junit", Commit: "commit-a", SuiteID: "suite-a", Config: "cfg-a",
+		EnvDigest: "env-a", Shard: "1/1",
+		Raw: []byte(`<testsuite tests="2"><testcase classname="pkg" name="first"/><testcase`),
+	}
+	if _, err := s.AddTestReport(context.Background(), input); ErrorCode(err) != "E_TESTREPORT_INVALID" {
+		t.Fatalf("malformed junit error = %v", err)
+	}
+	var reports, results int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM test_reports WHERE project_id=?`, s.projectID).Scan(&reports); err != nil {
+		t.Fatalf("report count: %v", err)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM test_report_results WHERE project_id=?`, s.projectID).Scan(&results); err != nil {
+		t.Fatalf("result count: %v", err)
+	}
+	if reports != 0 || results != 0 {
+		t.Fatalf("malformed junit left rows: reports=%d results=%d", reports, results)
+	}
+}
+
 func TestIncompleteGoJSONIsStored(t *testing.T) {
 	base := t.TempDir()
 	s := testStore(t, base, base+"/common", base+"/state")
@@ -95,6 +118,10 @@ func TestReportDomainValidationRejectsEmptyComparableShardOnlyAfterDefault(t *te
 }
 
 func addJUnitEvidence(t *testing.T, s *Store, outcome string, commit, suite, config, env, shard string, retry int) TestReportAddResult {
+	return addJUnitEvidenceVariant(t, s, outcome, commit, suite, config, env, shard, retry, "default")
+}
+
+func addJUnitEvidenceVariant(t *testing.T, s *Store, outcome string, commit, suite, config, env, shard string, retry int, variant string) TestReportAddResult {
 	t.Helper()
 	marker := ""
 	switch outcome {
@@ -107,12 +134,32 @@ func addJUnitEvidence(t *testing.T, s *Store, outcome string, commit, suite, con
 	case "skip":
 		marker = `<skipped/>`
 	}
-	raw := []byte(`<testsuite tests="1"><testcase classname="pkg" name="TestCell">` + marker + `</testcase></testsuite>`)
+	raw := []byte(`<testsuite tests="1" name="` + variant + `"><testcase classname="pkg" name="TestCell">` + marker + `</testcase></testsuite>`)
 	result, err := s.AddTestReport(context.Background(), domain.TestReportInput{Format: "junit", Commit: commit, SuiteID: suite, Config: config, EnvDigest: env, Shard: shard, RetryIndex: retry, Raw: raw})
 	if err != nil {
 		t.Fatalf("add %s: %v", outcome, err)
 	}
 	return result
+}
+
+func TestFlakyTestsSkipOnlyAndAgreeingPassHaveExactStates(t *testing.T) {
+	skipBase := t.TempDir()
+	skip := testStore(t, skipBase, skipBase+"/common", skipBase+"/state")
+	addJUnitEvidenceVariant(t, skip, "skip", "commit-a", "suite-a", "cfg-a", "env-a", "1/1", 0, "skip-1")
+	addJUnitEvidenceVariant(t, skip, "skip", "commit-a", "suite-a", "cfg-a", "env-a", "1/1", 0, "skip-2")
+	got, err := skip.FlakyTests("pkg/TestCell")
+	if err != nil || len(got) != 1 || got[0].State != domain.FlakyStateUnevaluated || len(got[0].Cells) != 1 || got[0].Cells[0].State != domain.FlakyStateUnevaluated {
+		t.Fatalf("skip-only state = %#v, %v", got, err)
+	}
+
+	passBase := t.TempDir()
+	pass := testStore(t, passBase, passBase+"/common", passBase+"/state")
+	addJUnitEvidenceVariant(t, pass, "pass", "commit-a", "suite-a", "cfg-a", "env-a", "1/1", 0, "pass-1")
+	addJUnitEvidenceVariant(t, pass, "pass", "commit-a", "suite-a", "cfg-a", "env-a", "1/1", 0, "pass-2")
+	got, err = pass.FlakyTests("pkg/TestCell")
+	if err != nil || len(got) != 1 || got[0].State != domain.FlakyStateClean || len(got[0].Cells) != 1 || got[0].Cells[0].State != domain.FlakyStateClean {
+		t.Fatalf("agreeing-pass state = %#v, %v", got, err)
+	}
 }
 
 func TestFlakyTestsThreeStateAndFullIdentityComparability(t *testing.T) {
