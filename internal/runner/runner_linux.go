@@ -127,7 +127,9 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		return nil, launchErr("E_RUN_RECONCILE_REQUIRED", err)
 	}
 	started := nowString(r.now)
-	record := RunRecord{SchemaVersion: ledgerSchema, ID: id, Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, LaunchPrefix: append([]string(nil), prefix...), StartedAt: started, Status: StatusStarting, ScopeIntegrity: ScopeContained, OutputRefs: map[string]OutputRef{}}
+	// Containment is not an initial assumption. Until the leader is positively
+	// observed in cgroup.procs, the durable record must remain non-contained.
+	record := RunRecord{SchemaVersion: ledgerSchema, ID: id, Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, LaunchPrefix: append([]string(nil), prefix...), StartedAt: started, Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}}
 	// The intended scope reference is durable before scope creation. It is not
 	// used as kill authority until the actual scope-created record is present.
 	record.CgroupScope = r.intendedScope(id)
@@ -218,6 +220,9 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	// containment, but is not retroactively reported as leader migration.
 	initialMigrated := identityValid && memberErr == nil && !scopeVerified && processLive(record.PIDIdentity)
 	if scopeVerified {
+		// This is the sole positive-containment assignment: the running event
+		// records that the leader was actually observed in cgroup.procs.
+		record.ScopeIntegrity = ScopeContained
 		record.Status = StatusRunning
 	}
 	if scopeVerified {
@@ -277,13 +282,15 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	}
 	waitExit, waitSignal := waitEvidence(cmd.ProcessState, waitErr)
 	waitObserved := waitExit != nil || waitSignal != ""
-	unobservedPlacedExit := placementGuaranteed && identityValid && memberErr == nil && !scopeVerified && waitObserved && !migrated
-	if !scopeVerified && !unobservedPlacedExit && !migrated {
+	var unobservedPlacedExit bool
+	var scopeCode string
+	record.ScopeIntegrity, unobservedPlacedExit, scopeCode = classifyLaunchScopeIntegrity(scopeVerified, placementGuaranteed, identityValid, waitObserved, migrated, memberErr)
+	if scopeCode != "" {
 		// A failed membership observation is not itself an escape: a successful
 		// CLONE_INTO_CGROUP placement followed by a real wait exit leaves the
 		// scope empty by design. Without that wait evidence, or without a valid
 		// process identity, retain the conservative invalid-scope result.
-		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_SCOPE_INVALID")
+		record.ErrorCodes = appendUnique(record.ErrorCodes, scopeCode)
 	}
 	current, currentErr := r.ledger.current(id)
 	if currentErr == nil && !current.KillIntent.Present && !timedOut {
@@ -347,17 +354,17 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if migrated {
 		record.ScopeIntegrity = ScopeMigrated
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_SCOPE_MIGRATION")
-	} else if unobservedPlacedExit && record.ScopeIntegrity == ScopeContained {
-		// Placement proves where the leader started, not that it remained there.
-		// This honest third state is distinct from both observed containment and a
-		// live migration: daemonless observation cannot classify migrate-and-exit.
-		record.ScopeIntegrity = ScopeUnverified
 	} else if emptyErr != nil {
 		record.ScopeIntegrity = ScopeHandoffUnverified
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_SCOPE_HANDOFF")
 	} else if !empty {
 		record.ScopeIntegrity = ScopeHandoffUnverified
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_SCOPE_HANDOFF")
+	} else if unobservedPlacedExit {
+		// Placement proves where the leader started, not that it remained there.
+		// This honest third state is distinct from both observed containment and a
+		// live migration: daemonless observation cannot classify migrate-and-exit.
+		record.ScopeIntegrity = ScopeUnverified
 	}
 	if timedOut {
 		record.Status = StatusKilled
@@ -442,7 +449,11 @@ func mergeEvidence(base, candidate RunRecord) RunRecord {
 	base.CaptureComplete = candidate.CaptureComplete
 	base.CaptureForcedClosed = candidate.CaptureForcedClosed
 	base.StdinStored = base.StdinStored || candidate.StdinStored
-	if candidate.ScopeIntegrity != ScopeContained {
+	if candidate.ScopeIntegrity != "" {
+		// Candidate integrity is classified from this launch's observation. It
+		// must be allowed to upgrade the pre-observation HandoffUnverified state
+		// during timeout/exit arbitration; otherwise a clean observed exit can
+		// finalize with a bare handoff value and no corresponding error.
 		base.ScopeIntegrity = candidate.ScopeIntegrity
 	}
 	if candidate.ScopeKill.Requested {
@@ -793,6 +804,22 @@ func waitEvidence(state *os.ProcessState, waitErr error) (*int, string) {
 	}
 	return nil, ""
 }
+
+func classifyLaunchScopeIntegrity(scopeVerified, placementGuaranteed, identityValid, waitObserved, migrated bool, memberErr error) (ScopeIntegrity, bool, string) {
+	if migrated {
+		return ScopeMigrated, false, ""
+	}
+	if scopeVerified {
+		return ScopeContained, false, ""
+	}
+	if placementGuaranteed && identityValid && memberErr == nil && waitObserved {
+		// Placement plus a real wait exit, without positive membership evidence,
+		// is honest only as unverified—not as positive containment.
+		return ScopeUnverified, true, ""
+	}
+	return ScopeHandoffUnverified, false, "E_RUN_SCOPE_INVALID"
+}
+
 func processStartTick(pid int) uint64 {
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {

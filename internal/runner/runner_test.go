@@ -228,6 +228,34 @@ func TestProcessIdentityRejectsReusedPIDStartTick(t *testing.T) {
 	}
 }
 
+func TestFailedMembershipObservationCannotClaimContained(t *testing.T) {
+	memberErr := errors.New("cgroup.procs read failed")
+	integrity, unobserved, code := classifyLaunchScopeIntegrity(false, true, true, true, false, memberErr)
+	if integrity == ScopeContained || integrity != ScopeHandoffUnverified {
+		t.Fatalf("membership failure claimed unexpected integrity=%q", integrity)
+	}
+	if unobserved || code != "E_RUN_SCOPE_INVALID" {
+		t.Fatalf("membership failure classification unobserved=%v code=%q", unobserved, code)
+	}
+
+	integrity, unobserved, code = classifyLaunchScopeIntegrity(false, true, false, true, false, nil)
+	if integrity == ScopeContained || integrity != ScopeHandoffUnverified {
+		t.Fatalf("invalid start identity claimed unexpected integrity=%q", integrity)
+	}
+	if unobserved || code != "E_RUN_SCOPE_INVALID" {
+		t.Fatalf("invalid start identity classification unobserved=%v code=%q", unobserved, code)
+	}
+}
+
+func TestObservedContainmentUpgradesPreObservationEvidence(t *testing.T) {
+	base := RunRecord{ID: "RUN-1", ScopeIntegrity: ScopeHandoffUnverified}
+	candidate := RunRecord{ID: "RUN-1", ScopeIntegrity: ScopeContained}
+	merged := mergeEvidence(base, candidate)
+	if merged.ScopeIntegrity != ScopeContained {
+		t.Fatalf("observed containment did not win evidence merge: %q", merged.ScopeIntegrity)
+	}
+}
+
 func TestKillIntentSequenceIsPersistedInDurableRun(t *testing.T) {
 	l, err := newLedger(t.TempDir(), "")
 	if err != nil {
@@ -510,6 +538,7 @@ func TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration(t *testing.T) {
 	}
 	switch nearDeadline.Status {
 	case StatusExited:
+		assertHonestExitScope(t, r, nearDeadline)
 		if nearDeadline.ExitCode == nil || *nearDeadline.ExitCode != 0 || containsString(nearDeadline.ErrorCodes, "E_RUN_TIMEOUT") || !nearDeadline.CleanSuccess() {
 			t.Fatalf("near-deadline clean exit evidence=%+v", nearDeadline)
 		}
