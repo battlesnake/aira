@@ -256,6 +256,45 @@ func TestObservedContainmentUpgradesPreObservationEvidence(t *testing.T) {
 	}
 }
 
+func TestHandoffIntegrityAlwaysHasScopeOrReconcileErrorAndIsInadmissible(t *testing.T) {
+	representatives := []RunRecord{
+		{Status: StatusExited, ScopeIntegrity: ScopeHandoffUnverified, ErrorCodes: []string{"E_RUN_SCOPE_INVALID"}},
+		{Status: StatusExited, ScopeIntegrity: ScopeHandoffUnverified, ErrorCodes: []string{"E_RUN_SCOPE_HANDOFF"}},
+		{Status: StatusKilled, ScopeIntegrity: ScopeHandoffUnverified, ErrorCodes: []string{"U_RUN_RECONCILE_REQUIRED"}},
+		{Status: StatusExited, ScopeIntegrity: ScopeHandoffUnverified, ErrorCodes: []string{"E_RUN_CAPTURE_FAILED", "E_RUN_SCOPE_HANDOFF"}},
+	}
+	for _, record := range representatives {
+		if !hasScopeReconcileError(record.ErrorCodes) {
+			t.Fatalf("handoff record lacks scope/reconcile error: %+v", record)
+		}
+		if commandRecordAdmissibleForTest(record) {
+			t.Fatalf("handoff record was gate-admissible: %+v", record)
+		}
+	}
+	fixed := ensureTerminalScopeEvidence(RunRecord{Status: StatusExited, ScopeIntegrity: ScopeHandoffUnverified})
+	if !hasScopeReconcileError(fixed.ErrorCodes) || commandRecordAdmissibleForTest(fixed) {
+		t.Fatalf("bare terminal handoff was not repaired: %+v", fixed)
+	}
+}
+
+func TestTerminalCASRepairsBareHandoffEvidence(t *testing.T) {
+	r, scope := newMemoryRunner(t, nil)
+	run := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, CgroupScope: scope.Reference()}
+	appendRunEvent(t, r, "starting", run)
+	lock, err := lockFile(filepath.Join(filepath.Dir(r.ledger.ledger), "RUN-1.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := r.appendTerminalLocked("RUN-1", RunRecord{ID: "RUN-1", Status: StatusExited, ScopeIntegrity: ScopeHandoffUnverified, TerminalComplete: true})
+	_ = unlockFile(lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed.ScopeIntegrity != ScopeHandoffUnverified || !hasScopeReconcileError(committed.ErrorCodes) {
+		t.Fatalf("terminal CAS left bare handoff evidence: %+v", committed)
+	}
+}
+
 func TestKillIntentSequenceIsPersistedInDurableRun(t *testing.T) {
 	l, err := newLedger(t.TempDir(), "")
 	if err != nil {
@@ -887,4 +926,21 @@ func waitForFixtureFile(t *testing.T, path string) []byte {
 	}
 	t.Fatalf("migration fixture did not establish proof file %q", path)
 	return nil
+}
+
+func commandRecordAdmissibleForTest(record RunRecord) bool {
+	if record.CaptureForcedClosed || record.Status != StatusExited || record.ExitCode == nil || record.ScopeIntegrity != ScopeContained || !record.CaptureComplete || !record.TerminalComplete || len(record.OutputRefs) == 0 {
+		return false
+	}
+	for _, ref := range record.OutputRefs {
+		if ref.State != OutputComplete || ref.Path == "" || ref.Bytes < 0 {
+			return false
+		}
+	}
+	for _, code := range record.ErrorCodes {
+		if code != "E_RUN_FAILED" {
+			return false
+		}
+	}
+	return true
 }

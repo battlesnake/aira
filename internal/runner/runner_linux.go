@@ -393,7 +393,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if record.Status == StatusExited && record.ExitCode != nil && *record.ExitCode != 0 {
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_FAILED")
 	}
-	if record.ScopeIntegrity != ScopeContained && record.ScopeIntegrity != ScopeUnverified && !containsPrefix(record.ErrorCodes, "E_RUN_SCOPE_") {
+	if record.ScopeIntegrity != ScopeContained && record.ScopeIntegrity != ScopeUnverified && !hasScopeReconcileError(record.ErrorCodes) {
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_SCOPE_HANDOFF")
 	}
 	record.EndedAt = nowString(r.now)
@@ -468,6 +468,26 @@ func mergeEvidence(base, candidate RunRecord) RunRecord {
 	return base
 }
 
+func hasScopeReconcileError(codes []string) bool {
+	for _, code := range codes {
+		switch code {
+		case "E_RUN_SCOPE_INVALID", "E_RUN_SCOPE_HANDOFF", "U_RUN_RECONCILE_REQUIRED":
+			return true
+		}
+	}
+	return false
+}
+
+// ScopeHandoffUnverified never appears on a clean record: it always carries a
+// scope/reconcile error (E_RUN_SCOPE_INVALID | E_RUN_SCOPE_HANDOFF |
+// U_RUN_RECONCILE_REQUIRED). Only ScopeContained is gate-admissible.
+func ensureTerminalScopeEvidence(record RunRecord) RunRecord {
+	if record.Status.Terminal() && record.ScopeIntegrity == ScopeHandoffUnverified && !hasScopeReconcileError(record.ErrorCodes) {
+		record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
+	}
+	return record
+}
+
 func cloneOutputRefs(refs map[string]OutputRef) map[string]OutputRef {
 	copy := make(map[string]OutputRef, len(refs))
 	for key, ref := range refs {
@@ -494,6 +514,7 @@ func (r *Runner) appendTerminalLocked(id string, candidate RunRecord) (RunRecord
 		terminal.ExitCode, terminal.Signal = candidate.ExitCode, candidate.Signal
 		terminal.EndedAt, terminal.TerminalComplete = candidate.EndedAt, candidate.TerminalComplete
 	}
+	terminal = ensureTerminalScopeEvidence(terminal)
 	event, err := r.append(ledgerEvent{Kind: "terminal", Run: terminal})
 	if err != nil && strings.Contains(err.Error(), "duplicate terminal record") {
 		if existing, readErr := r.ledger.current(id); readErr == nil && existing.Status.Terminal() {
