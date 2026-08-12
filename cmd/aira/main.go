@@ -194,7 +194,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"test-report": {"format": true, "explain": true, "ticket": true, "phase": true, "commit": true, "branch": true, "suite": true, "config": true, "config-env": true, "shard": true, "retry": true},
 		"run-kill":    {},
 		"run-log":     {"stream": true, "from": true, "tail": true, "follow": true, "full": true},
-		"gate":        {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-seed": true, "mutation-expected-result": true},
+		"gate":        {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "reason": true, "report": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-seed": true, "mutation-expected-result": true},
 	}
 	for name := range options {
 		if !allowed[verb][name] {
@@ -590,6 +590,27 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 				return core.Request{}, fmt.Errorf("gate %s requires <canary-id>", args["subverb"])
 			}
 			args["canary_id"] = positional[1]
+		case "baseline-pin", "baseline-show":
+			if len(positional) != 2 {
+				return core.Request{}, fmt.Errorf("gate %s requires <gate-id>", args["subverb"])
+			}
+			args["gate_id"] = positional[1]
+			if args["subverb"] == "baseline-pin" && options["report"] == "" {
+				return core.Request{}, fmt.Errorf("gate baseline-pin requires --report <TR-id>[,<TR-id>…]")
+			}
+		case "baseline":
+			if len(positional) < 3 || (positional[1] != "pin" && positional[1] != "show") || len(positional) != 3 {
+				return core.Request{}, fmt.Errorf("gate baseline requires pin|show <gate-id>")
+			}
+			if positional[1] == "pin" && options["report"] == "" {
+				return core.Request{}, fmt.Errorf("gate baseline pin requires --report <TR-id>[,<TR-id>…]")
+			}
+			if positional[1] == "pin" {
+				args["subverb"] = "baseline-pin"
+			} else {
+				args["subverb"] = "baseline-show"
+			}
+			args["gate_id"] = positional[2]
 		default:
 			return core.Request{}, fmt.Errorf("unknown gate operation %q", args["subverb"])
 		}
@@ -597,6 +618,15 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			if value := options[option]; value != "" {
 				args[argument] = value
 			}
+		}
+		if options["report"] != "" {
+			args["report"] = options["report"]
+		}
+		if options["reason"] != "" {
+			args["reason"] = options["reason"]
+		}
+		if options["actor"] != "" {
+			args["actor"] = options["actor"]
 		}
 		if value := options["argv"]; value != "" {
 			args["argv"] = splitOptionList(value)

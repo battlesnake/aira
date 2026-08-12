@@ -19,12 +19,14 @@ type Kind string
 const (
 	KindCheckable Kind = "checkable"
 	KindManual    Kind = "manual"
+	KindRatchet   Kind = "ratchet"
 )
 
 type Checker string
 
 const CheckerDimension Checker = "check-dimension"
 const CheckerManual Checker = "manual-attestation"
+const CheckerRatchet Checker = "ratchet"
 
 type ProofMode string
 
@@ -42,6 +44,7 @@ type GateDefinition struct {
 	Checkable       *Checkable  `json:"checkable,omitempty"`
 	Manual          *Manual     `json:"manual,omitempty"`
 	Command         *Command    `json:"command,omitempty"`
+	Ratchet         *Ratchet    `json:"ratchet,omitempty"`
 	Enabled         bool        `json:"enabled"`
 	Advisory        bool        `json:"advisory"`
 	AdvisoryInReady bool        `json:"advisory_in_ready"`
@@ -82,6 +85,54 @@ type Manual struct {
 	PromptID      string   `json:"prompt_id,omitempty"`
 }
 
+// Ratchet is committed policy. The mutable baseline is deliberately kept in
+// the authenticated audit class instead of in the gate definition.
+type Ratchet struct {
+	Metric            string        `json:"metric"`
+	Comparator        string        `json:"comparator"`
+	ComparisonKey     ComparisonKey `json:"comparison_key"`
+	BaselineSelection string        `json:"baseline_selection"`
+}
+
+type ComparisonKey struct {
+	SuiteID   string `json:"suite_id"`
+	Config    string `json:"config"`
+	EnvDigest string `json:"env_digest"`
+	Shard     string `json:"shard"`
+}
+
+var ratchetShardPattern = regexp.MustCompile(`^[1-9][0-9]*/[1-9][0-9]*$`)
+
+func (r Ratchet) Validate() error {
+	if strings.TrimSpace(r.Metric) == "" {
+		return errors.New("E_GATE_INVALID: ratchet metric is required")
+	}
+	if strings.TrimSpace(r.Comparator) == "" {
+		return errors.New("E_GATE_INVALID: ratchet comparator is required")
+	}
+	if r.Comparator != "no-new-failures" && r.Comparator != "coverage-drop" {
+		return fmt.Errorf("E_GATE_INVALID: unsupported ratchet comparator %q", r.Comparator)
+	}
+	selection := strings.ToLower(strings.TrimSpace(r.BaselineSelection))
+	if !strings.Contains(selection, "active") || !strings.Contains(selection, "pin") {
+		return errors.New("E_GATE_INVALID: ratchet baseline_selection must be active-explicitly-pinned")
+	}
+	key := r.ComparisonKey
+	if strings.TrimSpace(key.SuiteID) == "" || strings.TrimSpace(key.Config) == "" || strings.TrimSpace(key.EnvDigest) == "" || strings.TrimSpace(key.Shard) == "" {
+		return errors.New("E_GATE_INVALID: ratchet comparison_key requires suite_id, config, env_digest, and shard")
+	}
+	if !ratchetShardPattern.MatchString(key.Shard) {
+		return fmt.Errorf("E_GATE_INVALID: ratchet comparison_key shard %q must be i/n", key.Shard)
+	}
+	if r.Comparator == "coverage-drop" && r.Metric != "coverage" {
+		return errors.New("E_GATE_INVALID: coverage-drop ratchet requires coverage metric")
+	}
+	if r.Comparator == "no-new-failures" && r.Metric != "tests" && r.Metric != "test-failures" {
+		return errors.New("E_GATE_INVALID: no-new-failures ratchet requires tests metric")
+	}
+	return nil
+}
+
 var slugPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`)
 
 func (g GateDefinition) Validate(filename string) error { return ValidateGate(g, filename) }
@@ -99,7 +150,7 @@ func ValidateGate(g GateDefinition, filename string) error {
 	if strings.TrimSpace(g.Name) == "" {
 		return errors.New("E_GATE_INVALID: name is required")
 	}
-	if g.Kind != KindCheckable && g.Kind != KindManual {
+	if g.Kind != KindCheckable && g.Kind != KindManual && g.Kind != KindRatchet {
 		return fmt.Errorf("E_GATE_KIND_INVALID: unsupported gate kind %q", g.Kind)
 	}
 	if !validSelector(g.AppliesTo) {
@@ -108,7 +159,7 @@ func ValidateGate(g GateDefinition, filename string) error {
 	if g.Lane.Name == "" || g.Lane.Checker == "" {
 		return errors.New("E_GATE_INVALID: lane name and checker are required")
 	}
-	if g.Lane.Checker != string(CheckerDimension) && g.Lane.Checker != string(CheckerManual) && g.Lane.Checker != string(CheckerCommand) {
+	if g.Lane.Checker != string(CheckerDimension) && g.Lane.Checker != string(CheckerManual) && g.Lane.Checker != string(CheckerCommand) && g.Lane.Checker != string(CheckerRatchet) {
 		return fmt.Errorf("E_GATE_INVALID: unknown checker %q", g.Lane.Checker)
 	}
 	if g.ProofPolicy.Mode != ProofRequired || g.ProofPolicy.MaxAgeSecs < 0 {
@@ -130,6 +181,9 @@ func ValidateGate(g GateDefinition, filename string) error {
 	if g.Command != nil {
 		payloads++
 	}
+	if g.Ratchet != nil {
+		payloads++
+	}
 	if payloads != 1 {
 		return errors.New("E_GATE_INVALID: exactly one kind payload is required")
 	}
@@ -138,6 +192,16 @@ func ValidateGate(g GateDefinition, filename string) error {
 	}
 	if g.Kind == KindManual && g.Manual == nil {
 		return errors.New("E_GATE_INVALID: manual payload is required")
+	}
+	if g.Kind == KindRatchet {
+		if g.Ratchet == nil || g.Lane.Checker != string(CheckerRatchet) {
+			return errors.New("E_GATE_INVALID: ratchet gates require ratchet checker and payload")
+		}
+		if err := g.Ratchet.Validate(); err != nil {
+			return err
+		}
+	} else if g.Ratchet != nil || g.Lane.Checker == string(CheckerRatchet) {
+		return errors.New("E_GATE_INVALID: ratchet payload requires a ratchet gate")
 	}
 	if g.Checkable != nil {
 		if g.Lane.Checker != string(CheckerDimension) {

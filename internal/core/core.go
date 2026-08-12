@@ -96,6 +96,8 @@ type Store interface {
 	GetTestReport(string) (domain.TestReport, error)
 	FlakyTests(string) ([]domain.FlakyTest, error)
 	ReconcileFlaky(context.Context) error
+	PinGateBaseline(context.Context, string, []string, string, string) (store.GateBaseline, error)
+	ShowGateBaseline(string) (store.GateBaseline, error)
 }
 
 type reviewStore interface {
@@ -994,9 +996,9 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			return report, nil
 		}},
 		"gate": {Name: "gate", Usage: "gate <operation> [args]", Args: []ArgSpec{
-			stringSpec("subverb", true, true, "Gate operation", "add", "ls", "show", "set", "run", "check", "attest", "prove", "review", "canary-run", "canary-show"),
-			stringSpec("gate_id", false, true, "Gate identifier"), stringSpec("canary_id", false, true, "Canary identifier"), stringSpec("verdict", false, false, "Attestation verdict", "pass", "fail"), stringSpec("actor", false, false, "Attestation actor"),
-			stringSpec("checker", false, false, "Gate checker", "check-dimension", "command", "manual-attestation"), stringSpec("predicate", false, false, "Command predicate", "exit-zero", "tests-green"),
+			stringSpec("subverb", true, true, "Gate operation", "add", "ls", "show", "set", "run", "check", "attest", "prove", "review", "canary-run", "canary-show", "baseline-pin", "baseline-show"),
+			stringSpec("gate_id", false, true, "Gate identifier"), stringSpec("canary_id", false, true, "Canary identifier"), stringSpec("verdict", false, false, "Attestation verdict", "pass", "fail"), stringSpec("actor", false, false, "Attestation actor"), stringSpec("reason", false, false, "Baseline pin reason"), stringSpec("report", false, false, "Comma-separated test report IDs"),
+			stringSpec("checker", false, false, "Gate checker", "check-dimension", "command", "manual-attestation", "ratchet"), stringSpec("predicate", false, false, "Command predicate", "exit-zero", "tests-green"),
 			listSpec("argv", false, false, "Exact command argv tokens"), stringSpec("cwd", false, false, "Command root or relative subdirectory"), listSpec("env_allow", false, false, "Allow-listed environment names"),
 			stringSpec("timeout_ms", false, false, "Command timeout in milliseconds"), stringSpec("output_cap_bytes", false, false, "Combined output cap in bytes"), stringSpec("parser", false, false, "Command output parser", "go-test-json-v1"),
 			stringSpec("mutation_kind", false, false, "Typed mutation kind", "go-negate-assertion", "go-inject-failing-test"), stringSpec("mutation_file", false, false, "Mutation target file"), stringSpec("mutation_test", false, false, "Mutation target test"),
@@ -1004,10 +1006,15 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 		}, MCPTool: "aira_gate", MCPOperation: "subverb", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			subverb := strings.ToLower(stringArg(args, "subverb"))
 			switch subverb {
-			case "show", "add", "set", "run", "attest", "prove", "review":
+			case "show", "add", "set", "run", "attest", "prove", "review", "baseline-pin", "baseline-show":
 				_ = stringArg(args, "gate_id")
 				if subverb == "attest" {
 					_ = stringArg(args, "verdict")
+					_ = stringArg(args, "actor")
+				}
+				if subverb == "baseline-pin" {
+					_ = stringArg(args, "report")
+					_ = stringArg(args, "reason")
 					_ = stringArg(args, "actor")
 				}
 			case "canary-run", "canary-show":
@@ -1055,6 +1062,13 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 					return nil, err
 				}
 				return handlerData{Data: report, Verdict: report.Verdict}, nil
+			case "baseline-pin":
+				if stringArg(args, "gate_id") == "" || stringArg(args, "report") == "" {
+					return nil, errors.New("E_GATE_BASELINE_INVALID: baseline pin requires gate id and report")
+				}
+				return c.store.PinGateBaseline(ctx, stringArg(args, "gate_id"), strings.Split(stringArg(args, "report"), ","), stringArg(args, "actor"), stringArg(args, "reason"))
+			case "baseline-show":
+				return c.store.ShowGateBaseline(stringArg(args, "gate_id"))
 			case "attest":
 				as, ok := c.store.(gateAttestationStore)
 				if !ok {
@@ -1125,6 +1139,8 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 			{Name: "review", Summary: "Request manual gate review", Safety: SafetyRead, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"review", "review"}},
 			{Name: "canary-run", Summary: "Run a named canary", Safety: SafetyReconcile, Args: append([]OperationArg{{Name: "canary_id", Required: true}}, mutationOperationArgs()...), Example: []string{"canary-run", "unit-tests-mutation", "--mutation-kind", "go-inject-failing-test", "--mutation-pkgdir", ".", "--mutation-testname", "TestInjected"}},
 			{Name: "canary-show", Summary: "Show a canary declaration", Safety: SafetyRead, Args: append([]OperationArg{{Name: "canary_id", Required: true}}, mutationOperationArgs()...), Example: []string{"canary-show", "unit-tests-mutation"}},
+			{Name: "baseline-pin", Summary: "Pin a durable ratchet baseline", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}, {Name: "report", Required: true}, {Name: "reason"}, {Name: "actor"}}, Example: []string{"baseline-pin", "unit-tests", "--report", "TR-1", "--actor", "release-bot"}},
+			{Name: "baseline-show", Summary: "Show the active ratchet baseline", Safety: SafetyRead, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"baseline-show", "unit-tests"}},
 		}},
 	}
 	metadata["find"] = verbMetadata{summary: "Manage review findings", safety: SafetyMutate, operations: []OperationSpec{

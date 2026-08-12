@@ -234,7 +234,7 @@ func (s *Store) RunGate(ctx context.Context, id string) (GateCheckResult, error)
 		proofSeq = strconv.FormatUint(proofRecord.Seq, 10)
 		proof = gate.ProofValid
 	}
-	fold := gate.FoldVerdict(subjectEval.Predicate, proof, canaryHealth, gate.EvidenceAvailable)
+	fold := gate.FoldVerdictWithCode(subjectEval.Predicate, subjectEval.Code, proof, canaryHealth, gate.EvidenceAvailable)
 	if subjectEval.Code != "" && subjectEval.Predicate == gate.PredicateUnevaluated {
 		fold.Code = subjectEval.Code
 	}
@@ -458,6 +458,18 @@ func (s *Store) GateActionWithFields(ctx context.Context, operation, gateID, can
 
 func (s *Store) runCanary(ctx context.Context, c gate.CanaryDeclaration, def gate.GateDefinition) (DimensionEvaluation, EvaluationRoot, error) {
 	_ = ctx
+	if c.Mode == gate.CanarySyntheticRatchet {
+		if err := gate.ValidateCanary(c); err != nil {
+			return DimensionEvaluation{}, EvaluationRoot{}, err
+		}
+		comparison := compareNoNewFailures(RatchetSnapshot{FailingSet: append([]string(nil), c.BaselineFailing...)}, c.CurrentFailing, map[string]struct{}{})
+		digest, err := c.DeclarationDigest()
+		if err != nil {
+			return DimensionEvaluation{}, EvaluationRoot{}, err
+		}
+		root := EvaluationRoot{Digest: digest}
+		return DimensionEvaluation{Predicate: comparison.Predicate, Code: comparison.Code, Evidence: true, Root: root}, root, nil
+	}
 	if c.Mode != gate.CanaryFixture && c.Mode != gate.CanaryMutation {
 		return DimensionEvaluation{}, EvaluationRoot{}, errors.New("E_GATE_CANARY_INVALID: M10a evaluation requires fixture canary")
 	}

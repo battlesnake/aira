@@ -14,6 +14,7 @@ const (
 	CanaryFixture              CanaryMode = "fixture"
 	CanaryAttestationChallenge CanaryMode = "attestation-challenge"
 	CanaryMutation             CanaryMode = "mutation"
+	CanarySyntheticRatchet     CanaryMode = "synthetic-ratchet"
 )
 
 type Cadence string
@@ -40,6 +41,9 @@ type CanaryDeclaration struct {
 	Seed               Seed          `json:"seed"`
 	Mutation           *MutationSeed `json:"mutation,omitempty"`
 	ExpectedGateResult string        `json:"expected_gate_result"`
+	Expected           string        `json:"expected,omitempty"`
+	BaselineFailing    []string      `json:"baseline_failing,omitempty"`
+	CurrentFailing     []string      `json:"current_failing,omitempty"`
 	LaneBinding        string        `json:"lane_binding"`
 	Isolation          Isolation     `json:"isolation"`
 	Cadence            Cadence       `json:"cadence"`
@@ -67,10 +71,47 @@ func ValidateCanary(c CanaryDeclaration) error {
 	if !slugPattern.MatchString(c.ID) || !slugPattern.MatchString(c.GateID) {
 		return errors.New("E_GATE_CANARY_INVALID: invalid id")
 	}
-	if c.Mode != CanaryFixture && c.Mode != CanaryAttestationChallenge && c.Mode != CanaryMutation {
+	if c.Mode != CanaryFixture && c.Mode != CanaryAttestationChallenge && c.Mode != CanaryMutation && c.Mode != CanarySyntheticRatchet {
 		return fmt.Errorf("E_GATE_CANARY_INVALID: unsupported mode %q", c.Mode)
 	}
-	if c.ExpectedGateResult != VerdictFail {
+	if c.Mode == CanarySyntheticRatchet {
+		if c.Expected != "regressed" && c.ExpectedGateResult != "regressed" {
+			return errors.New("E_GATE_CANARY_INVALID: synthetic-ratchet expected must be regressed")
+		}
+		if len(c.CurrentFailing) == 0 {
+			return errors.New("E_GATE_CANARY_INVALID: synthetic-ratchet current_failing is empty")
+		}
+		baseline := make(map[string]struct{}, len(c.BaselineFailing))
+		for _, name := range c.BaselineFailing {
+			if strings.TrimSpace(name) == "" {
+				return errors.New("E_GATE_CANARY_INVALID: synthetic-ratchet baseline name is empty")
+			}
+			if _, exists := baseline[name]; exists {
+				return errors.New("E_GATE_CANARY_INVALID: synthetic-ratchet duplicate baseline name")
+			}
+			baseline[name] = struct{}{}
+		}
+		seenCurrent := map[string]struct{}{}
+		introduced := false
+		for _, name := range c.CurrentFailing {
+			if strings.TrimSpace(name) == "" {
+				return errors.New("E_GATE_CANARY_INVALID: synthetic-ratchet current name is empty")
+			}
+			if _, exists := seenCurrent[name]; exists {
+				return errors.New("E_GATE_CANARY_INVALID: synthetic-ratchet duplicate current name")
+			}
+			seenCurrent[name] = struct{}{}
+			if _, exists := baseline[name]; !exists {
+				introduced = true
+			}
+		}
+		if !introduced {
+			return errors.New("E_GATE_CANARY_INVALID: synthetic-ratchet current_failing introduces no new name")
+		}
+		if c.ExpectedGateResult != "" && c.ExpectedGateResult != VerdictFail && c.ExpectedGateResult != "regressed" {
+			return errors.New("E_GATE_CANARY_INVALID: synthetic-ratchet expected_gate_result must be fail when present")
+		}
+	} else if c.ExpectedGateResult != VerdictFail {
 		return errors.New("E_GATE_CANARY_INVALID: proof-eligible canary must expect fail")
 	}
 	if c.LaneBinding == "" {

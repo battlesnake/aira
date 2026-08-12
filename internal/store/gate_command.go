@@ -35,6 +35,8 @@ func (s *Store) evaluateChecker(ctx context.Context, def gate.GateDefinition, ro
 		return EvaluateDimension(root, def.Checkable.Dimension)
 	case string(gate.CheckerCommand):
 		return s.runCommandChecker(ctx, def, root)
+	case string(gate.CheckerRatchet):
+		return s.evaluateRatchet(ctx, def, root)
 	default:
 		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_COMMAND_RUN_UNEVALUATED"}, fmt.Errorf("E_GATE_INVALID: unsupported checker %q", def.Lane.Checker)
 	}

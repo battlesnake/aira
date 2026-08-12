@@ -391,6 +391,17 @@ func (s *Store) initDB(ctx context.Context) error {
 		    project_id TEXT NOT NULL, seq INTEGER NOT NULL, gate_id TEXT NOT NULL,
 		    record_json TEXT NOT NULL, PRIMARY KEY(project_id, seq)
 		)`,
+		`CREATE TABLE IF NOT EXISTS gate_baselines (
+		    project_id TEXT NOT NULL, gate_id TEXT NOT NULL, baseline_seq INTEGER NOT NULL,
+		    comparator TEXT NOT NULL, comparator_version TEXT NOT NULL, comparison_key TEXT NOT NULL,
+		    source_commit TEXT NOT NULL, snapshot_digest TEXT NOT NULL, snapshot_json TEXT NOT NULL,
+		    valid INTEGER NOT NULL DEFAULT 1,
+		    PRIMARY KEY(project_id, baseline_seq)
+		)`,
+		`CREATE TABLE IF NOT EXISTS gate_baseline_active (
+		    project_id TEXT NOT NULL, gate_id TEXT NOT NULL, active_baseline_seq INTEGER NOT NULL,
+		    PRIMARY KEY(project_id, gate_id)
+		)`,
 		`CREATE TABLE IF NOT EXISTS test_report_counter (
 		    project_id TEXT PRIMARY KEY, next_number INTEGER NOT NULL, next_seq INTEGER NOT NULL
 		)`,
