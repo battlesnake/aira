@@ -421,6 +421,26 @@ func TestRealCgroupIntegrationOrClearSkip(t *testing.T) {
 	}
 }
 
+func TestRealCgroupPlacedThenExitedFastIsContainedAndCaptured(t *testing.T) {
+	r := realRunner(t)
+	record, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/true"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != StatusExited || record.ExitCode == nil || *record.ExitCode != 0 {
+		t.Fatalf("fast exit record=%+v", record)
+	}
+	if record.ScopeIntegrity != ScopeContained || !record.CaptureComplete || record.CaptureForcedClosed || len(record.ErrorCodes) != 0 {
+		t.Fatalf("fast placed exit was not clean: %+v", record)
+	}
+	for _, name := range []string{"out", "err"} {
+		ref := record.OutputRefs[name]
+		if ref.State != OutputComplete || ref.Bytes != 0 {
+			t.Fatalf("%s capture=%+v", name, ref)
+		}
+	}
+}
+
 func TestRealCgroupTimeoutUsesDurableKillAndKillsGrandchild(t *testing.T) {
 	r := realRunner(t)
 	record, err := r.Launch(context.Background(), Request{

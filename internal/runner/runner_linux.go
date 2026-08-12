@@ -192,17 +192,21 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		}
 		return r.failBeforeLaunch(ctx, record, code, err)
 	}
+	// UseCgroupFD makes Go launch this child with clone3 and
+	// CLONE_INTO_CGROUP. A successful Start therefore proves placement at
+	// creation time; cgroup.procs is only a later observation and may already
+	// be empty when a very short-lived child has exited.
+	placementGuaranteed := true
 	for _, w := range writers {
 		_ = w.Close()
 	}
 	record.PIDIdentity = PIDIdentity{PID: cmd.Process.Pid, StartTick: processStartTick(cmd.Process.Pid)}
 	members, memberErr := scope.Members()
 	scopeVerified := memberErr == nil && containsPID(members, cmd.Process.Pid)
-	if !scopeVerified {
-		// The process may have exited between Start and this check. Its wait is
-		// still observed below, but containment was not proven before running.
-		record.ErrorCodes = append(record.ErrorCodes, "E_RUN_SCOPE_INVALID")
-	}
+	// A live process absent from cgroup.procs is the one case that proves an
+	// escape. Do this check before waiting so an already-observable migration
+	// cannot be mistaken for the harmless post-exit empty state.
+	initialMigrated := memberErr == nil && !scopeVerified && processLive(cmd.Process.Pid)
 	if scopeVerified {
 		record.Status = StatusRunning
 	}
@@ -215,9 +219,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	}
 	monitorStop := make(chan struct{})
 	monitorResult := make(chan bool, 1)
-	if scopeVerified {
-		go monitorScopeMembership(scope, cmd.Process.Pid, monitorStop, monitorResult)
-	}
+	go monitorScopeMembership(scope, cmd.Process.Pid, monitorStop, monitorResult)
 
 	captureCh := make(chan captureResult, len(readers))
 	for name, rd := range readers {
@@ -256,14 +258,23 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	} else {
 		waitErr = <-waitCh
 	}
-	if scopeVerified {
-		close(monitorStop)
-	}
-	migrated := false
-	if scopeVerified {
-		migrated = <-monitorResult
+	close(monitorStop)
+	migrated := initialMigrated
+	// Always join the monitor, even when the initial observation already found
+	// a live escape, so its event watcher cannot outlive this launch.
+	if <-monitorResult {
+		migrated = true
 	}
 	waitExit, waitSignal := waitEvidence(cmd.ProcessState, waitErr)
+	waitObserved := waitExit != nil || waitSignal != ""
+	placedThenExited := placementGuaranteed && memberErr == nil && waitObserved && !migrated
+	if !scopeVerified && !placedThenExited && !migrated {
+		// A failed membership observation is not itself an escape: a successful
+		// CLONE_INTO_CGROUP placement followed by a real wait exit leaves the
+		// scope empty by design. Without that wait evidence, however, retain the
+		// conservative invalid-scope result.
+		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_SCOPE_INVALID")
+	}
 	current, currentErr := r.ledger.current(id)
 	if currentErr == nil && !current.KillIntent.Present && !timedOut {
 		waitLock, lockErr := lockFile(filepath.Join(filepath.Dir(r.ledger.ledger), id+".lock"))
@@ -295,14 +306,17 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 			record.ErrorCodes = appendUnique(record.ErrorCodes, captureCode(result.Err))
 		}
 	}
-	record.CaptureComplete = capComplete && len(record.ErrorCodes) == 0
+	// Capture completion is evidence about the pipes only. Scope/lifecycle
+	// errors must not turn a fully drained (including zero-byte) capture into
+	// E_RUN_CAPTURE_FAILED; drain reports real read/write/disk failures itself.
+	record.CaptureComplete = capComplete
 	record.CaptureForcedClosed = forced
 	if forced {
 		for _, rd := range readers {
 			_ = rd.Close()
 		}
 	}
-	if len(record.ErrorCodes) != 0 && !forced && !containsPrefix(record.ErrorCodes, "E_RUN_CAPTURE_FAILED") && !containsPrefix(record.ErrorCodes, "E_RUN_OUTPUT_DISK_FULL") {
+	if !capComplete && !forced && !containsPrefix(record.ErrorCodes, "E_RUN_CAPTURE_FAILED") && !containsPrefix(record.ErrorCodes, "E_RUN_OUTPUT_DISK_FULL") {
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_CAPTURE_FAILED")
 	}
 
@@ -341,10 +355,13 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
 			record.ScopeIntegrity = ScopeHandoffUnverified
 		}
+	} else if waitObserved && (scopeVerified || placedThenExited) {
+		record.Status = StatusExited
+		record.ExitCode, record.Signal = waitExit, waitSignal
 	} else if !scopeVerified {
 		record.Status = StatusLost
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
-	} else if waitExit != nil || waitSignal != "" {
+	} else if waitObserved {
 		record.Status = StatusExited
 		record.ExitCode, record.Signal = waitExit, waitSignal
 	} else {
