@@ -32,7 +32,7 @@ type DimensionEvaluation struct {
 }
 
 func gateResultFields(def gate.GateDefinition, definitionDigest, declarationDigest, subjectScope, canaryTreeDigest, proofSeq string) map[string]string {
-	return map[string]string{
+	fields := map[string]string{
 		"definition_digest":  definitionDigest,
 		"declaration_digest": declarationDigest,
 		"canary_tree_digest": canaryTreeDigest,
@@ -41,6 +41,11 @@ func gateResultFields(def gate.GateDefinition, definitionDigest, declarationDige
 		"evaluator_version":  def.Lane.EvaluatorVersion,
 		"proof_seq":          proofSeq,
 	}
+	if def.Kind == gate.KindRatchet {
+		fields["comparator_version"] = ratchetComparatorVersion
+		fields["config_digest"] = def.Lane.ConfigDigest
+	}
+	return fields
 }
 
 func appendCanaryUnevaluated(audit *GateAudit, def gate.GateDefinition, definitionDigest, declarationDigest, subject string, runErr error) (GateAuditRecord, error) {
@@ -223,6 +228,10 @@ func (s *Store) RunGate(ctx context.Context, id string) (GateCheckResult, error)
 	proofSeq := ""
 	if canaryHealth == gate.CanaryPass {
 		proofFields := map[string]string{"gate_id": def.ID, "canary_id": canary.ID, "definition_digest": found.Digest, "declaration_digest": declarationDigest, "canary_tree_digest": canaryRoot.Digest, "subject_scope": subjectEval.Root.Digest, "lane": def.Lane.Name, "evaluator_version": def.Lane.EvaluatorVersion}
+		if def.Kind == gate.KindRatchet {
+			proofFields["comparator_version"] = ratchetComparatorVersion
+			proofFields["config_digest"] = def.Lane.ConfigDigest
+		}
 		if subjectEval.EnvDigest != "" {
 			proofFields["env_digest"] = subjectEval.EnvDigest
 		}
@@ -653,6 +662,9 @@ func (s *Store) GateCheck(ctx context.Context) (GateCheckReport, error) {
 				record.Fields["lane"] != d.Definition.Lane.Name ||
 				record.Fields["evaluator_version"] != d.Definition.Lane.EvaluatorVersion ||
 				record.Fields["canary_tree_digest"] == ""
+			if d.Definition.Kind == gate.KindRatchet {
+				bindingMismatch = bindingMismatch || record.Fields["comparator_version"] != ratchetComparatorVersion || record.Fields["config_digest"] != d.Definition.Lane.ConfigDigest
+			}
 			if bindingMismatch {
 				result.Verdict, result.Code, result.Trusted, result.Suspect = gate.VerdictUnevaluated, "U_GATE_PROOF_STALE", false, true
 			} else {
@@ -669,7 +681,7 @@ func (s *Store) GateCheck(ctx context.Context) (GateCheckReport, error) {
 					}
 					if linked == nil {
 						result.Verdict, result.Code, result.Trusted, result.Suspect = gate.VerdictUnevaluated, "U_GATE_UNPROVEN", false, true
-					} else if linked.Fields["gate_id"] != d.Definition.ID || linked.Fields["canary_id"] != canary.ID || linked.Fields["definition_digest"] != record.Fields["definition_digest"] || linked.Fields["declaration_digest"] != record.Fields["declaration_digest"] || linked.Fields["canary_tree_digest"] != record.Fields["canary_tree_digest"] || linked.Fields["subject_scope"] != currentSubjectDigest || linked.Fields["lane"] != d.Definition.Lane.Name || linked.Fields["evaluator_version"] != d.Definition.Lane.EvaluatorVersion || (d.Definition.Command != nil && linked.Fields["env_digest"] != record.Fields["env_digest"]) {
+					} else if linked.Fields["gate_id"] != d.Definition.ID || linked.Fields["canary_id"] != canary.ID || linked.Fields["definition_digest"] != record.Fields["definition_digest"] || linked.Fields["declaration_digest"] != record.Fields["declaration_digest"] || linked.Fields["canary_tree_digest"] != record.Fields["canary_tree_digest"] || linked.Fields["subject_scope"] != currentSubjectDigest || linked.Fields["lane"] != d.Definition.Lane.Name || linked.Fields["evaluator_version"] != d.Definition.Lane.EvaluatorVersion || (d.Definition.Command != nil && linked.Fields["env_digest"] != record.Fields["env_digest"]) || (d.Definition.Kind == gate.KindRatchet && (linked.Fields["comparator_version"] != ratchetComparatorVersion || linked.Fields["config_digest"] != d.Definition.Lane.ConfigDigest)) {
 						result.Verdict, result.Code, result.Trusted, result.Suspect = gate.VerdictUnevaluated, "U_GATE_PROOF_STALE", false, true
 					}
 				}

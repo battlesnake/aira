@@ -127,6 +127,10 @@ func (s *Store) evaluateRatchet(ctx context.Context, def gate.GateDefinition, ro
 		}
 		return evaluation, err
 	}
+	if def.Ratchet == nil || baseline.ComparisonKey != def.Ratchet.ComparisonKey || baseline.Comparator != def.Ratchet.Comparator || baseline.ComparatorVersion != ratchetComparatorVersion || baseline.Lane != def.Lane.Name {
+		evaluation.Predicate, evaluation.Code, evaluation.Evidence = gate.PredicateUnevaluated, "U_GATE_PROOF_STALE", false
+		return evaluation, nil
+	}
 	subjectCommit := s.gitValue(ctx, "HEAD")
 	reports, err := s.loadAllTestReports(ctx, s.db)
 	if err != nil {
@@ -147,6 +151,8 @@ func (s *Store) evaluateRatchet(ctx context.Context, def gate.GateDefinition, ro
 		return evaluation, nil
 	}
 	currentFailing := map[string]struct{}{}
+	type outcomes struct{ pass, fail bool }
+	currentOutcomes := map[string]outcomes{}
 	currentPcts := make([]float64, 0, len(selected))
 	for _, report := range selected {
 		if !report.ParserComplete || len(report.Results) == 0 {
@@ -158,6 +164,18 @@ func (s *Store) evaluateRatchet(ctx context.Context, def gate.GateDefinition, ro
 				evaluation.Predicate, evaluation.Code, evaluation.Evidence = gate.PredicateUnevaluated, "U_GATE_INCOMPARABLE", false
 				return evaluation, nil
 			}
+			outcome := currentOutcomes[result.Name]
+			switch result.Outcome {
+			case domain.OutcomePass:
+				outcome.pass = true
+			case domain.OutcomeFail, domain.OutcomeError:
+				outcome.fail = true
+			}
+			if outcome.pass && outcome.fail {
+				evaluation.Predicate, evaluation.Code, evaluation.Evidence = gate.PredicateUnevaluated, "U_GATE_INCOMPARABLE", false
+				return evaluation, nil
+			}
+			currentOutcomes[result.Name] = outcome
 			if result.Outcome == domain.OutcomeFail || result.Outcome == domain.OutcomeError {
 				currentFailing[result.Name] = struct{}{}
 			}

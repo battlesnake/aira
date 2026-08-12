@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"aira/internal/domain"
 	"aira/internal/gate"
@@ -15,7 +16,7 @@ import (
 func ratchetTestGate(t *testing.T, root string) gate.GateDefinition {
 	t.Helper()
 	definition := gate.GateDefinition{SchemaVersion: 2, ID: "ratchet", Name: "Ratchet", Kind: gate.KindRatchet,
-		AppliesTo: gate.AppliesTo{All: true}, Lane: gate.Lane{Name: "local", Checker: string(gate.CheckerRatchet), EvaluatorVersion: "1"},
+		AppliesTo: gate.AppliesTo{All: true}, Lane: gate.Lane{Name: "local", Checker: string(gate.CheckerRatchet), EvaluatorVersion: "1", ConfigDigest: "lane-config-v1"},
 		ProofPolicy: gate.ProofPolicy{Mode: gate.ProofRequired, RequireCurrentCanary: true}, CanaryIDs: []string{"ratchet-canary"},
 		Ratchet: &gate.Ratchet{Metric: "tests", Comparator: "no-new-failures", BaselineSelection: "active-explicitly-pinned", ComparisonKey: gate.ComparisonKey{SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1"}}, Enabled: true}
 	data, err := gate.RenderGate(definition)
@@ -134,6 +135,20 @@ func TestRatchetNoNewFailuresSetDifferenceAndCellFlakyExclusion(t *testing.T) {
 	}
 }
 
+func TestRatchetFlakyExclusionIsDerivedForTheTargetCell(t *testing.T) {
+	key := gate.ComparisonKey{SuiteID: "unit", Config: "cfg-a", EnvDigest: "env", Shard: "1/1"}
+	reports := []domain.TestReport{
+		{ID: "other-pass", Commit: "other", SuiteID: key.SuiteID, Config: key.Config, EnvDigest: key.EnvDigest, Shard: key.Shard, ParserComplete: true, Results: []domain.TestResult{{Name: "B", Outcome: domain.OutcomePass}}},
+		{ID: "other-fail", Commit: "other", SuiteID: key.SuiteID, Config: key.Config, EnvDigest: key.EnvDigest, Shard: key.Shard, ParserComplete: true, Results: []domain.TestResult{{Name: "B", Outcome: domain.OutcomeFail}}},
+		{ID: "target-fail-1", Commit: "target", SuiteID: key.SuiteID, Config: key.Config, EnvDigest: key.EnvDigest, Shard: key.Shard, ParserComplete: true, Results: []domain.TestResult{{Name: "B", Outcome: domain.OutcomeFail}}},
+		{ID: "target-fail-2", Commit: "target", SuiteID: key.SuiteID, Config: key.Config, EnvDigest: key.EnvDigest, Shard: key.Shard, ParserComplete: true, Results: []domain.TestResult{{Name: "B", Outcome: domain.OutcomeFail}}},
+	}
+	excluded := (&Store{}).flakyExclusions(reports, key, "target", []string{"B"})
+	if _, ok := excluded["B"]; ok {
+		t.Fatalf("different-cell flaky history excluded clean target-cell regression: %#v", excluded)
+	}
+}
+
 func TestRatchetCoverageMissingAndDropAreIncomparableOrRegression(t *testing.T) {
 	value := 80.0
 	baseline := RatchetSnapshot{Coverage: &domain.Coverage{Pct: &value}}
@@ -221,11 +236,263 @@ func TestRatchetRunGateCarriesRegressionCode(t *testing.T) {
 
 func addRatchetReportWithResults(t *testing.T, s *Store, commit string, results []domain.TestResult) domain.TestReport {
 	t.Helper()
-	added, err := s.AddTestReport(context.Background(), domain.TestReportInput{Format: "junit", Commit: commit, SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1", ParserComplete: true, Results: results})
+	return addRatchetReportInput(t, s, domain.TestReportInput{Format: "junit", Commit: commit, SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1", ParserComplete: true, Results: results})
+}
+
+func addRatchetReportInput(t *testing.T, s *Store, input domain.TestReportInput) domain.TestReport {
+	t.Helper()
+	added, err := s.AddTestReport(context.Background(), input)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return added.Report
+}
+
+func newRatchetStoreFixture(t *testing.T) (*Store, gate.GateDefinition, string) {
+	t.Helper()
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	definition := ratchetTestGate(t, root)
+	gitRun(t, root, "init", "-q")
+	gitRun(t, root, "config", "user.email", "aira@example.test")
+	gitRun(t, root, "config", "user.name", "AIRA")
+	gitRun(t, root, "add", ".")
+	gitRun(t, root, "commit", "-qm", "ratchet fixture")
+	s := testStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	return s, definition, root
+}
+
+func newRatchetEvaluationFixture(t *testing.T) (*Store, gate.GateDefinition, string) {
+	t.Helper()
+	s, definition, root := newRatchetStoreFixture(t)
+	commit := s.gitValue(context.Background(), "HEAD")
+	baseline := addRatchetReportWithResults(t, s, commit, []domain.TestResult{{Name: "A", Outcome: domain.OutcomeFail}})
+	if _, err := s.PinGateBaseline(context.Background(), definition.ID, []string{baseline.ID}, "test", "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	return s, definition, root
+}
+
+func ratchetCommitCurrent(t *testing.T, root string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(root, "current.txt"), []byte(time.Now().UTC().String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "add", ".")
+	gitRun(t, root, "commit", "-qm", "current")
+}
+
+func TestRatchetConflictingSameCellCurrentReportsAreIncomparable(t *testing.T) {
+	s, definition, _ := newRatchetEvaluationFixture(t)
+	commit := s.gitValue(context.Background(), "HEAD")
+	addRatchetReportWithResults(t, s, commit, []domain.TestResult{{Name: "A", Outcome: domain.OutcomeFail}, {Name: "B", Outcome: domain.OutcomeFail}})
+	addRatchetReportWithResults(t, s, commit, []domain.TestResult{{Name: "A", Outcome: domain.OutcomePass}, {Name: "B", Outcome: domain.OutcomePass}})
+	result, err := s.RunGate(context.Background(), definition.ID)
+	if err != nil || result.Verdict != gate.VerdictUnevaluated || result.Code != "U_GATE_INCOMPARABLE" {
+		t.Fatalf("conflicting current reports result=%#v err=%v", result, err)
+	}
+}
+
+func TestRatchetBaselineDriftFromCurrentGatePolicyIsProofStale(t *testing.T) {
+	s, definition, root := newRatchetEvaluationFixture(t)
+	drifted := definition
+	ratchet := *definition.Ratchet
+	ratchet.ComparisonKey.Config = "cfg-b"
+	drifted.Ratchet = &ratchet
+	rendered, err := gate.RenderGate(drifted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".aira", "gates", drifted.ID+".json"), rendered, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.RunGate(context.Background(), definition.ID)
+	if err != nil || result.Verdict != gate.VerdictUnevaluated || result.Code != "U_GATE_PROOF_STALE" {
+		t.Fatalf("drifted policy result=%#v err=%v", result, err)
+	}
+}
+
+func TestRatchetParserIncompleteMatchingReportIsIncomparable(t *testing.T) {
+	s, definition, _ := newRatchetEvaluationFixture(t)
+	commit := s.gitValue(context.Background(), "HEAD")
+	addRatchetReportInput(t, s, domain.TestReportInput{Format: "junit", Commit: commit, SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1", ParserComplete: false, SourceDigest: "incomplete-current", Results: []domain.TestResult{{Name: "A", Outcome: domain.OutcomePass}}})
+	result, err := s.RunGate(context.Background(), definition.ID)
+	if err != nil || result.Verdict != gate.VerdictUnevaluated || result.Code != "U_GATE_INCOMPARABLE" {
+		t.Fatalf("parser-incomplete current evidence was filtered: result=%#v err=%v", result, err)
+	}
+}
+
+func TestRatchetPassDoesNotRebaseline(t *testing.T) {
+	s, definition, _ := newRatchetEvaluationFixture(t)
+	before, err := s.ShowGateBaseline(definition.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.RunGate(context.Background(), definition.ID)
+	if err != nil || result.Verdict != gate.VerdictPass {
+		t.Fatalf("pass result=%#v err=%v", result, err)
+	}
+	after, err := s.ShowGateBaseline(definition.ID)
+	if err != nil || after.Seq != before.Seq || after.SnapshotDigest != before.SnapshotDigest {
+		t.Fatalf("pass mutated baseline before=%#v after=%#v err=%v", before, after, err)
+	}
+}
+
+func TestRatchetProofBindsComparatorVersionAndLaneConfigDigest(t *testing.T) {
+	s, definition, _ := newRatchetEvaluationFixture(t)
+	result, err := s.RunGate(context.Background(), definition.ID)
+	if err != nil || result.Verdict != gate.VerdictPass {
+		t.Fatalf("initial result=%#v err=%v", result, err)
+	}
+	records, err := mustReadGateAudit(s.commonDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resultRecord, proofRecord *GateAuditRecord
+	for i := range records {
+		if records[i].Type == "result" && records[i].Fields["gate_id"] == definition.ID {
+			candidate := records[i]
+			resultRecord = &candidate
+		}
+		if records[i].Type == "proof-of-fire" && records[i].Fields["gate_id"] == definition.ID {
+			candidate := records[i]
+			proofRecord = &candidate
+		}
+	}
+	if resultRecord == nil || proofRecord == nil || proofRecord.Fields["comparator_version"] != ratchetComparatorVersion || proofRecord.Fields["config_digest"] != definition.Lane.ConfigDigest || resultRecord.Fields["comparator_version"] != ratchetComparatorVersion || resultRecord.Fields["config_digest"] != definition.Lane.ConfigDigest {
+		t.Fatalf("ratchet proof/result binding result=%#v proof=%#v", resultRecord, proofRecord)
+	}
+	fields := cloneFields(resultRecord.Fields)
+	delete(fields, "comparator_version")
+	delete(fields, "config_digest")
+	fields["at"] = time.Now().UTC().Format(time.RFC3339Nano)
+	audit, err := OpenGateAudit(s.commonDir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := audit.Append("result", fields); err != nil {
+		t.Fatal(err)
+	}
+	checked, err := s.GateCheck(context.Background())
+	if err != nil || len(checked.Results) != 1 || checked.Results[0].Verdict != gate.VerdictUnevaluated || checked.Results[0].Code != "U_GATE_PROOF_STALE" {
+		t.Fatalf("missing ratchet proof binding was trusted: report=%#v err=%v", checked, err)
+	}
+}
+
+func TestRatchetPinRejectsUnsafeEvidence(t *testing.T) {
+	tests := []struct {
+		name  string
+		build func(t *testing.T, s *Store, commit string) []string
+	}{
+		{name: "retry", build: func(t *testing.T, s *Store, commit string) []string {
+			report := addRatchetReportInput(t, s, domain.TestReportInput{Format: "junit", Commit: commit, SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1", RetryIndex: 1, ParserComplete: true, Results: []domain.TestResult{{Name: "A", Outcome: domain.OutcomeFail}}})
+			return []string{report.ID}
+		}},
+		{name: "parser-incomplete", build: func(t *testing.T, s *Store, commit string) []string {
+			report := addRatchetReportInput(t, s, domain.TestReportInput{Format: "junit", Commit: commit, SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1", ParserComplete: false, Results: []domain.TestResult{{Name: "A", Outcome: domain.OutcomeFail}}})
+			return []string{report.ID}
+		}},
+		{name: "zero-discovered", build: func(t *testing.T, s *Store, commit string) []string {
+			report := addRatchetReportInput(t, s, domain.TestReportInput{Format: "junit", Commit: commit, SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1", ParserComplete: true})
+			return []string{report.ID}
+		}},
+		{name: "duplicate-id", build: func(t *testing.T, s *Store, commit string) []string {
+			report := addRatchetReport(t, s, commit, "A")
+			return []string{report.ID, report.ID}
+		}},
+		{name: "mixed-cell", build: func(t *testing.T, s *Store, commit string) []string {
+			one := addRatchetReport(t, s, commit, "A")
+			two := addRatchetReportInput(t, s, domain.TestReportInput{Format: "junit", Commit: commit, SuiteID: "unit", Config: "cfg-b", EnvDigest: "env", Shard: "1/1", ParserComplete: true, Results: []domain.TestResult{{Name: "A", Outcome: domain.OutcomeFail}}})
+			return []string{one.ID, two.ID}
+		}},
+		{name: "mixed-commit", build: func(t *testing.T, s *Store, commit string) []string {
+			one := addRatchetReport(t, s, commit, "A")
+			two := addRatchetReport(t, s, "other-commit", "A")
+			return []string{one.ID, two.ID}
+		}},
+		{name: "differing-coverage", build: func(t *testing.T, s *Store, commit string) []string {
+			one := addRatchetReportInput(t, s, domain.TestReportInput{Format: "junit", Commit: commit, SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1", ParserComplete: true, Coverage: &domain.Coverage{Pct: floatPtr(80)}, Results: []domain.TestResult{{Name: "A", Outcome: domain.OutcomeFail}}})
+			two := addRatchetReportInput(t, s, domain.TestReportInput{Format: "junit", Commit: commit, SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1", ParserComplete: true, Coverage: &domain.Coverage{Pct: floatPtr(81)}, Results: []domain.TestResult{{Name: "A", Outcome: domain.OutcomeFail}}})
+			return []string{one.ID, two.ID}
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, definition, _ := newRatchetStoreFixture(t)
+			commit := s.gitValue(context.Background(), "HEAD")
+			ids := tc.build(t, s, commit)
+			if _, err := s.PinGateBaseline(context.Background(), definition.ID, ids, "test", tc.name); ErrorCode(err) != "E_GATE_BASELINE_INVALID" {
+				t.Fatalf("pin err=%v code=%q", err, ErrorCode(err))
+			}
+		})
+	}
+}
+
+func floatPtr(value float64) *float64 { return &value }
+
+func ratchetCoverageFixture(t *testing.T) (*Store, gate.GateDefinition, string, string) {
+	t.Helper()
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	definition := ratchetTestGate(t, root)
+	ratchet := *definition.Ratchet
+	ratchet.Metric, ratchet.Comparator = "coverage", "coverage-drop"
+	definition.Ratchet = &ratchet
+	rendered, err := gate.RenderGate(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".aira", "gates", definition.ID+".json"), rendered, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "init", "-q")
+	gitRun(t, root, "config", "user.email", "aira@example.test")
+	gitRun(t, root, "config", "user.name", "AIRA")
+	gitRun(t, root, "add", ".")
+	gitRun(t, root, "commit", "-qm", "coverage baseline")
+	s := testStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	baseCommit := s.gitValue(context.Background(), "HEAD")
+	baseline := addRatchetReportInput(t, s, domain.TestReportInput{Format: "junit", Commit: baseCommit, SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1", ParserComplete: true, Coverage: &domain.Coverage{Pct: floatPtr(80)}, Results: []domain.TestResult{{Name: "A", Outcome: domain.OutcomePass}}})
+	if _, err := s.PinGateBaseline(context.Background(), definition.ID, []string{baseline.ID}, "test", "coverage"); err != nil {
+		t.Fatal(err)
+	}
+	ratchetCommitCurrent(t, root)
+	return s, definition, root, s.gitValue(context.Background(), "HEAD")
+}
+
+func TestRatchetCoverageIsEvaluatedThroughRunGate(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		pcts   []float64
+		wantV  string
+		wantCd string
+	}{
+		{name: "drop", pcts: []float64{75}, wantV: gate.VerdictFail, wantCd: "E_GATE_RATCHET_REGRESSED"},
+		{name: "increase", pcts: []float64{85}, wantV: gate.VerdictPass, wantCd: ""},
+		{name: "missing", pcts: []float64{-1}, wantV: gate.VerdictUnevaluated, wantCd: "U_GATE_INCOMPARABLE"},
+		{name: "multiple-distinct", pcts: []float64{75, 76}, wantV: gate.VerdictUnevaluated, wantCd: "U_GATE_INCOMPARABLE"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, definition, _, commit := ratchetCoverageFixture(t)
+			if tc.name == "missing" {
+				addRatchetReportInput(t, s, domain.TestReportInput{Format: "junit", Commit: commit, SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1", ParserComplete: true, Results: []domain.TestResult{{Name: "A", Outcome: domain.OutcomePass}}})
+			} else {
+				for _, pct := range tc.pcts {
+					addRatchetReportInput(t, s, domain.TestReportInput{Format: "junit", Commit: commit, SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1", ParserComplete: true, SourceDigest: fmt.Sprintf("coverage-%g", pct), Coverage: &domain.Coverage{Pct: floatPtr(pct)}, Results: []domain.TestResult{{Name: "A", Outcome: domain.OutcomePass}}})
+				}
+			}
+			result, err := s.RunGate(context.Background(), definition.ID)
+			if err != nil || result.Verdict != tc.wantV || result.Code != tc.wantCd {
+				t.Fatalf("result=%#v err=%v", result, err)
+			}
+		})
+	}
 }
 
 func TestRatchetRunGateMissingBaselineIsUnevaluated(t *testing.T) {
