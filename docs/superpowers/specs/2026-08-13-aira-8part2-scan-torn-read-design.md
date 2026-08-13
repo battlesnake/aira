@@ -1,7 +1,9 @@
 # #8-part2 — coherent, torn-read-safe working-tree scans (never a fake fail / false-pass / fake-zero)
 
-Status: PLAN v6 (incorporates Sol plan-review r1–r5 + a full live-read site enumeration; CENTRAL scanner
-fix + per-caller handling for ALL read AND mutation callers). Awaiting Sol plan-gate → build. Branch
+Status: PLAN v7 — BUILD-READY (Sol plan-review r1–r6; design confirmed sound). Central scanner fix with
+a signature-level `inconclusive` outcome → compiler-enforced per-caller completeness across ~20 read +
+mutation sites (incl. lease/area gates via `ticketExists`). This is a LARGE, systemic, correctness-
+critical milestone — the build is a dedicated effort, not a marathon-tail rush. Branch
 `codex-aira-8part2` off master `4374992`.
 Task #8 part 2 (part 1 — ParseTicket/ParseRequirement trailing content — landed `8183345`).
 Class: **crash-recovery + readiness correctness → the two-loop is mandatory** (CLAUDE.md).
@@ -27,12 +29,24 @@ tears a read or changes the directory mid-scan. Three honesty violations result:
   (store.go:1539-1549); List/Search/ListFindings scan live (query.go:241, search.go:98, finding.go:259)
   — a torn/vanished entity silently becomes an **absent** result.
 
-**Live-read site enumeration (the complete surface this plan must cover):** the shared readers/scanners
-are called from Rebuild (store.go:1459/1474/1484/2565), Ready (relation_ready.go:40/146/182/225/318/357/
-385/416/677), Check (check.go:239/349/378/420), List (query.go:241/265/310), Search (search.go:98/102),
-ListFindings (finding.go:259), and the finding/requirement CRUD read-backs. Because they funnel through
-the SHARED readers/scanners, the fix is centralised there; each caller then handles one new
-`inconclusive` outcome.
+**Completeness is COMPILER-ENFORCED (the key structural property).** `stableReadFile` and the scanners
+gain a new `inconclusive` outcome in their RETURN SIGNATURE (e.g. `readRegular*` → `(data, outcome,
+err)`; scanners → an added `inconclusive` set/flag). Changing the signature makes EVERY call site a
+compile error until it explicitly handles the new outcome — so no caller can be silently missed (this
+is why the endless round-by-round caller discovery converges: the type system enumerates the set). The
+build handles each per a small **contract**: a **read** caller maps `inconclusive` → its
+`U_INDEX_UNESTABLISHED`/`unevaluated` dimension; a **mutation** caller returns `U_INDEX_UNESTABLISHED`
+**before any write**.
+
+**Known caller surface (from a full grep; the compiler will confirm exhaustiveness):** Rebuild
+(store.go:1459/1474/1484/2565), Ready (relation_ready.go:40/146/182/225/231/318/357/385/416/677), Check
+ALL dimensions (check.go:116/123/239/270/349/378/420), List/records + `exactRecord`/`show`
+(query.go:241/260/265/309-314), `derivedRelationViewsWithWarnings` (relation_ready.go:243→90 via
+`exactRecord` and `Relations`), Search (search.go:98/102), ListFindings (finding.go:259), the mutation
+callers `Link`/`Unlink`/`Relations`/ticket-update/finding+requirement CRUD (relation_ready.go:121/160,
+store.go:1029, finding.go:104/156/181, requirement.go:153), AND the indirect mutation gates via
+`ticketExists` (query.go:309-314): `Touch` (area.go:378) and lease `Claim`/`Release`/`Heartbeat`
+(lease.go:184/383/478) — all abort before their writes on inconclusive.
 
 AIRA's rule: a check that cannot establish its result reports **unevaluated** — never a fake pass,
 zero, **or fail**.
@@ -157,6 +171,14 @@ single new outcome to handle:
 - **R16 (mutation callers abort — Sol r5 P1).** `Link`/`Unlink`/`Relations`/ticket-update/finding+
   requirement CRUD read-backs return `U_INDEX_UNESTABLISHED` BEFORE `materialiseIntent` on an
   inconclusive read — a write never proceeds from partial/torn data.
+- **R17 (compiler-enforced completeness — Sol r6).** The `inconclusive` outcome is added to the shared
+  readers'/scanners' RETURN SIGNATURES, so every call site is a compile error until handled — this
+  closes the caller set by construction. Additionally-named sites from r6: `check.go:239`
+  (allocated-id-file dimension) → unevaluated; `exactRecord`/`show` + `Relations` →
+  `derivedRelationViewsWithWarnings` (relation_ready.go:243→90) → `U_`/unevaluated, never a partial
+  relation view; the indirect mutation gates via `ticketExists` (query.go:309-314) — `Touch`
+  (area.go:378) and lease `Claim`/`Release`/`Heartbeat` (lease.go:184/383/478) — abort before their
+  writes. `Relations` covers BOTH its reads (relation_ready.go:225 and :231-243).
 
 ## 3. Tests (must FAIL against today's code)
 
