@@ -225,6 +225,14 @@ func TestCLIRunRealCgroupOrClearSkip(t *testing.T) {
 	if exit != 0 || response.Code != "OK" {
 		t.Fatalf("run exit=%d response=%+v stderr=%q", exit, response, stderr.String())
 	}
+	stdout.Reset()
+	stderr.Reset()
+	if exit := Run([]string{"run", "--", "/bin/sh", "-c", "printf cli-run"}, &stdout, &stderr); exit != 0 {
+		t.Fatalf("text run exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "cli-run\n{") || stderr.Len() != 0 {
+		t.Fatalf("text run did not tee before summary: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
 }
 
 func TestReviewConfiguredPolicyRealCLIIntegration(t *testing.T) {

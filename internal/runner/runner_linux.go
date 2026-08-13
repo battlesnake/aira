@@ -21,14 +21,15 @@ import (
 )
 
 type Runner struct {
-	ledger    *ledger
-	outputDir string
-	backend   ScopeBackend
-	prefix    []string
-	grace     time.Duration
-	termGrace time.Duration
-	now       func() time.Time
-	mu        sync.Mutex
+	ledger      *ledger
+	outputDir   string
+	backend     ScopeBackend
+	prefix      []string
+	grace       time.Duration
+	termGrace   time.Duration
+	now         func() time.Time
+	mu          sync.Mutex
+	appendFault func(ledgerEvent) error
 }
 
 func New(cfg Config) (*Runner, error) {
@@ -62,6 +63,11 @@ func New(cfg Config) (*Runner, error) {
 func (r *Runner) append(event ledgerEvent) (ledgerEvent, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.appendFault != nil {
+		if err := r.appendFault(event); err != nil {
+			return event, err
+		}
+	}
 	return r.ledger.append(event)
 }
 
@@ -73,6 +79,12 @@ func launchErr(code string, err error) error {
 }
 
 func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
+	var liveStreams map[string]*liveStream
+	defer func() {
+		for _, stream := range liveStreams {
+			stream.gate.disable()
+		}
+	}()
 	if len(req.Argv) == 0 || req.Argv[0] == "" {
 		return nil, launchErr("E_RUN_ARGUMENT_INVALID", errors.New("target argv is empty"))
 	}
@@ -237,18 +249,40 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	go monitorScopeMembership(scope, record.PIDIdentity, monitorStop, monitorResult)
 
 	captureCh := make(chan captureResult, len(readers))
-	for name, rd := range readers {
-		go drain(name, rd, files[name], captureCh)
+	liveStreams = make(map[string]*liveStream)
+	if req.Merge {
+		if req.LiveStdout != nil {
+			liveStreams["log"] = newLiveStream(req.LiveStdout)
+		}
+	} else {
+		if req.LiveStdout != nil {
+			liveStreams["out"] = newLiveStream(req.LiveStdout)
+		}
+		if req.LiveStderr != nil {
+			liveStreams["err"] = newLiveStream(req.LiveStderr)
+		}
 	}
-	waitCh := make(chan error, 1)
-	go func() { waitCh <- cmd.Wait() }()
+	for name, rd := range readers {
+		go drain(name, rd, files[name], captureCh, liveStreams[name])
+	}
+	type waitOutcome struct {
+		err   error
+		state *os.ProcessState
+	}
+	waitCh := make(chan waitOutcome, 1)
+	go func() {
+		err := cmd.Wait()
+		waitCh <- waitOutcome{err: err, state: cmd.ProcessState}
+	}()
 	var waitErr error
+	var waitState *os.ProcessState
 	timedOut := false
 	var timeoutKill killAttempt
 	if req.Timeout > 0 {
 		timer := time.NewTimer(req.Timeout)
 		select {
-		case waitErr = <-waitCh:
+		case outcome := <-waitCh:
+			waitErr, waitState = outcome.err, outcome.state
 		case <-timer.C:
 			attempt, killErr := r.killWithIntent(ctx, id, "run-timeout")
 			timeoutKill = attempt
@@ -261,7 +295,8 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 				timedOut = true
 			}
 			if !timedOut {
-				waitErr = <-waitCh
+				outcome := <-waitCh
+				waitErr, waitState = outcome.err, outcome.state
 			}
 		}
 		if !timer.Stop() {
@@ -271,7 +306,8 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 			}
 		}
 	} else {
-		waitErr = <-waitCh
+		outcome := <-waitCh
+		waitErr, waitState = outcome.err, outcome.state
 	}
 	close(monitorStop)
 	migrated := initialMigrated
@@ -280,7 +316,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if <-monitorResult {
 		migrated = true
 	}
-	waitExit, waitSignal := waitEvidence(cmd.ProcessState, waitErr)
+	waitExit, waitSignal := waitEvidence(waitState, waitErr)
 	waitObserved := waitExit != nil || waitSignal != ""
 	var unobservedPlacedExit bool
 	var scopeCode string
@@ -331,6 +367,38 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if forced {
 		for _, rd := range readers {
 			_ = rd.Close()
+		}
+	}
+	finishLive := func() {
+		if len(liveStreams) == 0 {
+			return
+		}
+		disable := func() {
+			for _, stream := range liveStreams {
+				stream.gate.disable()
+			}
+		}
+		if forced || ctx.Err() != nil {
+			disable()
+			return
+		}
+		writersDone := make(chan struct{})
+		stopJoin := make(chan struct{})
+		go func() {
+			for _, stream := range liveStreams {
+				select {
+				case <-stream.done:
+				case <-stopJoin:
+					return
+				}
+			}
+			close(writersDone)
+		}()
+		select {
+		case <-writersDone:
+		case <-ctx.Done():
+			close(stopJoin)
+			disable()
 		}
 	}
 	if !capComplete && !forced && !containsPrefix(record.ErrorCodes, "E_RUN_CAPTURE_FAILED") && !containsPrefix(record.ErrorCodes, "E_RUN_OUTPUT_DISK_FULL") {
@@ -409,6 +477,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	latest, latestErr := r.ledger.current(id)
 	if latestErr == nil && latest.Status.Terminal() {
 		_ = unlockFile(terminalLock)
+		finishLive()
 		return &latest, nil
 	}
 	latest = mergeEvidence(latest, record)
@@ -434,6 +503,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	}
 	_ = unlockFile(terminalLock)
 	_ = r.ledger.project(ctx)
+	finishLive()
 	return &committed, nil
 }
 
@@ -704,10 +774,15 @@ type captureResult struct {
 	Err    error
 }
 
-func drain(name string, rd *os.File, dst *os.File, out chan<- captureResult) {
+func drain(name string, rd *os.File, dst *os.File, out chan<- captureResult, streams ...*liveStream) {
+	var live *liveStream
+	if len(streams) > 0 {
+		live = streams[0]
+	}
 	h := sha256.New()
 	var count int64
 	var firstErr error
+	var pendingDropped int64
 	buf := make([]byte, 32*1024)
 	for {
 		n, readErr := rd.Read(buf)
@@ -718,6 +793,15 @@ func drain(name string, rd *os.File, dst *os.File, out chan<- captureResult) {
 				} else {
 					_, _ = h.Write(buf[:n])
 					count += int64(n)
+					if live != nil {
+						chunk := liveChunk{data: append([]byte(nil), buf[:n]...), droppedBefore: pendingDropped}
+						select {
+						case live.ch <- chunk:
+							pendingDropped = 0
+						default:
+							pendingDropped += int64(n)
+						}
+					}
 				}
 			}
 		}
@@ -740,19 +824,12 @@ func drain(name string, rd *os.File, dst *os.File, out chan<- captureResult) {
 		result.State = OutputPartial
 	}
 	out <- result
-}
-func writeAll(w io.Writer, data []byte) error {
-	for len(data) > 0 {
-		n, err := w.Write(data)
-		if err != nil {
-			return err
-		}
-		if n <= 0 {
-			return io.ErrShortWrite
-		}
-		data = data[n:]
+	if live != nil {
+		// Channel close publishes finalDropped to the writer after its range
+		// terminates. The drain never waits on the live queue.
+		live.finalDropped = pendingDropped
+		close(live.ch)
 	}
-	return nil
 }
 
 func collectCapture(ctx context.Context, ch <-chan captureResult, count int, grace time.Duration) ([]captureResult, bool, bool) {

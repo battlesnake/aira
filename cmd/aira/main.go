@@ -119,10 +119,18 @@ func runWithInput(argv []string, stdout, stderr io.Writer, stdin io.Reader) int 
 		return render(core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
 	}
 	defer s.Close()
-	dispatcher := core.NewWithRunnerInput(s, project.Runner, stdin)
+	faceStdout := &lineTrackingWriter{w: stdout}
+	dispatcher := core.NewWithRunnerFace(s, project.Runner, stdin, core.FaceOutput{
+		Stdout: faceStdout,
+		Stderr: stderr,
+		Live:   verb == "run" && !jsonOutput,
+	})
 	response := dispatcher.Do(context.Background(), request)
 	if verb == "run-log" && !jsonOutput {
 		return renderRunLog(response, stdout, stderr)
+	}
+	if verb == "run" && !jsonOutput && response.OK && faceStdout.needsSeparator() {
+		_, _ = io.WriteString(stdout, "\n")
 	}
 	return render(response, jsonOutput, stdout, stderr)
 }
@@ -770,6 +778,25 @@ func render(response core.Response, jsonOutput bool, stdout, stderr io.Writer) i
 		return 0
 	}
 	return exitForError(response.Code)
+}
+
+type lineTrackingWriter struct {
+	w     io.Writer
+	wrote bool
+	last  byte
+}
+
+func (w *lineTrackingWriter) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	if n > 0 {
+		w.wrote = true
+		w.last = p[n-1]
+	}
+	return n, err
+}
+
+func (w *lineTrackingWriter) needsSeparator() bool {
+	return w.wrote && w.last != '\n'
 }
 
 func renderHuman(response core.Response, out io.Writer) {

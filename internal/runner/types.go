@@ -126,6 +126,8 @@ type Request struct {
 	StoreStdin  bool
 	Grace       time.Duration
 	TermGrace   time.Duration
+	LiveStdout  io.Writer // optional best-effort foreground tee sink
+	LiveStderr  io.Writer // optional best-effort foreground tee sink
 }
 
 // OutputRequest describes one bounded, cursor-based read from a captured

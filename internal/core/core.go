@@ -241,7 +241,17 @@ type Core struct {
 	initializer Initializer
 	stdin       io.Reader
 	outputCap   int64
+	face        FaceOutput
 	verbs       map[string]verbSpec
+}
+
+// FaceOutput is fixed when a Core is constructed. Live output is deliberately
+// a face concern: MCP and JSON faces leave Live false so their protocols are
+// never contaminated by child bytes.
+type FaceOutput struct {
+	Stdout io.Writer
+	Stderr io.Writer
+	Live   bool
 }
 
 // Runner is the transport-neutral execution seam. The faces never call the
@@ -284,8 +294,14 @@ func NewWithRunner(s Store, execution Runner) *Core {
 }
 
 func NewWithRunnerInput(s Store, execution Runner, stdin io.Reader) *Core {
-	c := NewWithRunner(s, execution)
+	c := NewWithRunnerFace(s, execution, stdin, FaceOutput{})
+	return c
+}
+
+func NewWithRunnerFace(s Store, execution Runner, stdin io.Reader, face FaceOutput) *Core {
+	c := &Core{store: s, runner: execution, face: face}
 	c.stdin = stdin
+	c.verbs = c.dispatchTable()
 	return c
 }
 
@@ -1079,6 +1095,14 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				Argv: stringSlice(args, "argv"), Cwd: stringArg(args, "cwd"), Env: stringSlice(args, "env"),
 				Prefix: stringSlice(args, "prefix"), Merge: boolArg(args, "merge"), StdinPath: stringArg(args, "stdin"),
 				StoreStdin: boolArg(args, "store_stdin"),
+			}
+			if c.face.Live {
+				if request.Merge {
+					request.LiveStdout = c.face.Stdout
+				} else {
+					request.LiveStdout = c.face.Stdout
+					request.LiveStderr = c.face.Stderr
+				}
 			}
 			if request.StdinPath == "-" {
 				request.Stdin = c.stdin
