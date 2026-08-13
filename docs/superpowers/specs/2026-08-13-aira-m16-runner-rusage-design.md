@@ -1,6 +1,8 @@
 # M16 — cgroup resource accounting at exit (peak_rss · CPU · oom-killed)
 
-Status: PLAN v2 (incorporates Sol plan-review r1: 3×P0 + 4×P1). Awaiting Sol re-review → gate → build.
+Status: PLAN v3 (incorporates Sol plan-review r1 + r2). r2: snapshot BEFORE the terminal CAS (not before
+remove); every child-ran removal site (normal/kill/reconcile), pre-launch→nil; run-log code scoped to
+run/run-kill; OOM test sets up its own constrained parent. Awaiting Sol re-review → gate → build.
 Branch `codex-aira-m16` off master `0f4ca96`. Phase 5 (full subprocess runner), first cut. Spec §14
 ("Resource accounting from the cgroup, at exit") + §101 (`cpu_user/cpu_sys/peak_rss?/status(...|oom-killed)`).
 Class: **runner + cgroup correctness → the two-loop is mandatory; real-cgroup verification is load-bearing**
@@ -49,10 +51,14 @@ the §17 estimate-vs-actual gauge + `MemoryMax` tuning (both OUT of scope).
 7. **Terminal-CAS carries usage (Sol P0-3).** `mergeEvidence` (runner_linux.go:436-468) merges the
    non-nil usage pointers; every terminal winner — normal, `killed`, `oom-killed`, timeout, and the
    already-terminal CAS return (:503-509) — carries its snapshot.
-8. **Faces.** `aira run`/`aira_run` return the full record (get the fields). `run-log`/`aira_run_output`
-   return `OutputChunk`, whose schema has only `RunStatus`/`ErrorCodes` (types.go:141-152; `ReadOutput`
-   :1219-1222) — **add nullable `peak_rss`/`cpu_user`/`cpu_sys` to the chunk/envelope** (Sol P1-3) so
-   run-log surfaces them. Plus the `oom-killed` status.
+8. **Faces.** `aira run`/`aira_run` return the full record ⇒ they get the fields AND the top-level
+   `E_RUN_OOM_KILLED` code. `run-log`/`aira_run_output` return `OutputChunk` (Core.Do unwraps it and
+   returns `OK`, core.go:341-363), whose schema has only `RunStatus`/`ErrorCodes` (types.go:141-152;
+   `ReadOutput` :1219-1222) — **add nullable `peak_rss`/`cpu_user`/`cpu_sys` to the chunk** (Sol P1-3) so
+   run-log surfaces them, and the chunk's `RunStatus` carries `oom-killed`. **The top-level
+   `E_RUN_OOM_KILLED` response-code guarantee is scoped to `run`/`run-kill` (the record-returning verbs);
+   `run-log` is a read op whose top-level code reflects the READ (OK), with the run's status+metrics in the
+   chunk (Sol P1) — documented, not silently OK.**
 9. Real-cgroup tests (load-bearing) + Opus real-cgroup verification.
 
 **OUT (written-down deferrals / later Phase-5 milestones):**
@@ -64,12 +70,23 @@ the §17 estimate-vs-actual gauge + `MemoryMax` tuning (both OUT of scope).
 
 ## 2. Design
 
-### 2.1 Read placement
-The scope object (`scope`, with `.Members()/.Empty()/.Remove()`; `record.CgroupScope` = `scope.Reference()`,
-runner_linux.go:163) is alive until removal. Snapshot usage into the record immediately before each
-removal: (a) the normal path just before `scope.Remove()` (:~426); (b) inside/around `killWithIntent`
-before it removes the scope (:1105-1117). Both are already under the per-run lock. A crash path where the
-scope was already reconciled/removed ⇒ usage nil (honest), not a crash.
+### 2.1 Read placement — snapshot into the CANDIDATE, BEFORE the terminal CAS (Sol P0)
+"Just before `scope.Remove()`" is too late: the normal path commits the terminal record via
+`appendTerminalLocked` at runner_linux.go:~410-423, unlocks, and only then removes the scope (:429-430) —
+and the CAS returns an already-terminal record unchanged (:503-509), so a post-commit read cannot land in
+the record. Therefore: **read usage into the candidate `record`/`latest` BEFORE the terminal CAS, merge it
+in, commit, THEN remove** — all under the per-run lock the path already holds. The cgroup files stay valid
+after `cgroup.kill` (processes gone) and before `rmdir` (Sol-confirmed), so the kill path
+(`killWithIntent` :1067-1117, holding the lock) snapshots before its removal too, threaded through
+`attempt.Current` and the timeout path.
+
+**Every child-ran removal site (Sol P1).** Snapshot at each site where a real child ran before the scope
+is removed: the normal terminal path, `killWithIntent` (run-kill + timeout), and **reconcile**
+(:1344-1365, which kills+terminalizes+removes an orphan). **Pre-launch / setup-failure removals**
+(:165/:582/:613 — the child never ran) ⇒ usage stays **nil** (a just-created cgroup's setup-peak is NOT
+the child's usage; nil is the honest value); no snapshot there. A crash path where the scope was already
+removed ⇒ nil (honest), not a crash. Every one of these paths writes a terminal record; each must carry
+its snapshot BEFORE the CAS (the early-terminal return cannot merge a later candidate — Sol P1).
 
 ### 2.2 Parsing (cgroup-v2)
 - `memory.peak`: single integer (bytes); absent (pre-5.19) ⇒ `PeakRSS` nil.
@@ -98,6 +115,13 @@ the terminal-complete CAS (Sol — highest structural risk).
 - **R8 (run-log surfaces metrics — Sol P1-3).** `OutputChunk` gains nullable metrics.
 - **R9 (no fallback for absent memory.peak — Sol-confirmed sound).** Absent ⇒ unevaluated; consistent
   with M14.
+- **R10 (snapshot before the CAS at every child-ran removal — Sol r2 P0/P1).** Read usage into the
+  candidate BEFORE `appendTerminalLocked`, at the normal-exit, `killWithIntent` (run-kill+timeout), and
+  reconcile (:1344-1365) paths; every terminal writer carries its snapshot before the CAS (the early
+  return :503-509 can't merge later). Pre-launch/setup-failure removals (:165/:582/:613, child never ran)
+  ⇒ nil. Test 11 asserts metrics are RETAINED across each terminal race, not merely a terminal count.
+- **R11 (run-log code scope — Sol r2 P1).** The `E_RUN_OOM_KILLED` top-level code is scoped to
+  `run`/`run-kill`; `run-log`'s top-level code reflects the read (OK) with status+metrics in the chunk.
 
 ## 4. Tests
 
@@ -110,12 +134,17 @@ the terminal-complete CAS (Sol — highest structural risk).
 6. Response contract: an `oom-killed` record → `runRecordCode` = `E_RUN_OOM_KILLED` (not `OK`).
 
 **Real-cgroup (SKIP in sandbox; Opus under whale-run — load-bearing):**
-7. A mem-hog under a **`cgroup_parent` (RunConfig) whose `memory.max` is low** (the existing config path,
-   no new feature) ⇒ kernel OOM ⇒ status `oom-killed`, `memory.events.oom_kill>0` (the discriminator).
+7. **OOM discriminator (Sol P1-4).** The test itself creates a dedicated WRITABLE parent cgroup under
+   `whale.slice`, enables the memory controller on it (`+memory` in the grandparent's
+   `cgroup.subtree_control`), sets a LOW `memory.max`, and points the run's `RunConfig.cgroup_parent` at
+   it (config only SELECTS the parent — it does not set `memory.max`, Sol P1); the run's child scope
+   inherits the hierarchical limit and a mem-hog OOMs ⇒ status `oom-killed`, `memory.events.oom_kill>0`.
+   The test must NOT constrain the test process itself (only the run's scope).
 8. A CPU-burning command ⇒ **`CPUUser > 0`** (NOT `CPUSys>0` — system time can legitimately be 0, Sol P1-4).
 9. A memory-allocating command ⇒ `PeakRSS` populated > 0.
 10. A **run-killed** run ⇒ usage still snapshotted (read before `killWithIntent` removes the scope) AND
-    status `killed`, NOT `oom-killed` (Sol P0-2 discriminator).
+    status `killed`, NOT `oom-killed` (Sol P0-2 discriminator). Allow nil metrics on an unsupported
+    kernel / read failure (assert the STATUS + the no-mis-tag, tolerate nil usage).
 11. #17 non-regression: `contained`/`unverified`/`exited`/`killed` classifications + terminal-CAS
     unchanged when usage reading is added.
 
