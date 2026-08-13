@@ -33,6 +33,10 @@ type FindingSetInput struct {
 	Actor       string
 }
 
+// FindingCountResult is kept as a named compatibility alias for callers that
+// want to distinguish the finding read while retaining the CountResult shape.
+type FindingCountResult = CountResult
+
 type scannedFinding struct {
 	WorktreeID string
 	Root       string
@@ -301,6 +305,31 @@ func (s *Store) ListFindings(query string) ([]FindingRecord, error) {
 		}
 	}
 	sort.SliceStable(result, func(i, j int) bool { return result[i].Finding.Key < result[j].Finding.Key })
+	return result, nil
+}
+
+// CountFindings counts every finding matching query and distributes the
+// result by one supported finding field. It deliberately shares ListFindings
+// so the gauge and CLI use the same live, uncapped read semantics.
+func (s *Store) CountFindings(query, by string) (FindingCountResult, error) {
+	if !validFindingDistributionField(by) {
+		return FindingCountResult{}, fmt.Errorf("E_SELECTOR_INVALID: unsupported finding distribution field %q", by)
+	}
+	rows, err := s.ListFindings(query)
+	if err != nil {
+		return FindingCountResult{}, err
+	}
+	result := FindingCountResult{Total: len(rows), By: by, Distribution: map[string]int{}}
+	for _, row := range rows {
+		for _, value := range findingDistributionValues(row.Finding, by) {
+			result.Distribution[value]++
+		}
+		for _, warning := range row.Warnings {
+			if !containsString(result.Warnings, warning) {
+				result.Warnings = append(result.Warnings, warning)
+			}
+		}
+	}
 	return result, nil
 }
 

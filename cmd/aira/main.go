@@ -171,7 +171,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 			continue
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "rebuild" || name == "steal" || name == "strict" || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && verb == "run-log") || (name == "reasoning-subset" && verb == "spend") {
+		if name == "rebuild" || name == "steal" || name == "strict" || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && verb == "run-log") || (name == "reasoning-subset" && verb == "spend") || (name == "all" && verb == "test-report") {
 			options[name] = "true"
 			continue
 		}
@@ -219,9 +219,10 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"ready":       {"list": true},
 		"find":        {"category": true, "severity": true, "verdict": true, "source": true, "message": true, "file": true, "requirement": true, "by": true, "fields": true, "disposition": true, "reason": true, "actor": true},
 		"req":         {"status": true, "fields": true},
-		"test-report": {"format": true, "explain": true, "ticket": true, "phase": true, "commit": true, "branch": true, "suite": true, "config": true, "config-env": true, "shard": true, "retry": true},
+		"test-report": {"format": true, "explain": true, "all": true, "ticket": true, "phase": true, "commit": true, "branch": true, "suite": true, "config": true, "config-env": true, "shard": true, "retry": true},
 		"spend":       {"provider": true, "model": true, "source": true, "ticket": true, "phase": true, "at": true, "session": true, "agent": true, "total": true, "cost-usd": true, "usage-file": true, "bucket": true, "reasoning-subset": true, "by": true},
 		"quota":       {"provider": true, "source": true, "at": true, "window": true, "used": true, "limit": true, "remaining": true, "reset-at": true},
+		"insights":    {},
 		"run-kill":    {},
 		"run-log":     {"stream": true, "from": true, "tail": true, "follow": true, "full": true},
 		"gate":        {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "reason": true, "report": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-seed": true, "mutation-expected-result": true},
@@ -500,6 +501,30 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		default:
 			return core.Request{}, fmt.Errorf("quota requires add|ls")
 		}
+	case "insights":
+		args["subverb"] = "show"
+		if len(positional) == 0 {
+			break
+		}
+		switch strings.ToLower(positional[0]) {
+		case "ls":
+			if len(positional) != 1 {
+				return core.Request{}, fmt.Errorf("insights ls accepts no positional arguments")
+			}
+			args["subverb"] = "ls"
+		case "show":
+			if len(positional) > 2 {
+				return core.Request{}, fmt.Errorf("insights show accepts at most one gauge name")
+			}
+			if len(positional) == 2 {
+				args["name"] = positional[1]
+			}
+		default:
+			if len(positional) != 1 {
+				return core.Request{}, fmt.Errorf("insights accepts ls|show <name> or a gauge name")
+			}
+			args["name"] = positional[0]
+		}
 	case "test-report":
 		if len(positional) == 0 {
 			return core.Request{}, fmt.Errorf("test-report requires add|ls|show|flaky")
@@ -533,6 +558,7 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			if options["explain"] != "" {
 				args["explain"] = options["explain"]
 			}
+			args["all"] = options["all"] == "true"
 		default:
 			return core.Request{}, fmt.Errorf("test-report requires add|ls|show|flaky")
 		}

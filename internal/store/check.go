@@ -27,6 +27,7 @@ var ExitCodes = map[string]int{
 	"E_TESTREPORT_INVALID": 2, "E_TESTREPORT_FLAKY": 1,
 	"E_INDEX_UNEVALUATED":          3,
 	"U_COMPUTE_UNEVALUATED":        3,
+	"U_INSIGHT_UNEVALUATED":        3,
 	"U_TESTREPORT_INCOMPARABLE":    3,
 	"U_REVIEW_SECTION_UNEVALUATED": 3,
 	// Runner-lite lifecycle and containment codes. These are deliberately kept

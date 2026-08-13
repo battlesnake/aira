@@ -25,6 +25,74 @@ type QuotaSnapshotAddResult struct {
 	Remaining    int                  `json:"remaining"`
 }
 
+// ComputePhaseSummary is the live, NULL-aware aggregate used by the spend
+// face and review-loop economics. Nil means the source had no established
+// value for that field; it is not an observed zero.
+type ComputePhaseSummary struct {
+	Phase      string   `json:"phase"`
+	Events     int      `json:"events"`
+	FreshInput *int64   `json:"fresh_input,omitempty"`
+	CacheRead  *int64   `json:"cache_read,omitempty"`
+	CacheWrite *int64   `json:"cache_write,omitempty"`
+	Output     *int64   `json:"output,omitempty"`
+	Reasoning  *int64   `json:"reasoning,omitempty"`
+	CostUSD    *float64 `json:"cost_usd,omitempty"`
+	AtSeq      int64    `json:"at_seq"`
+}
+
+// SpendByPhase performs the complete phase aggregate in one SQLite read
+// transaction. SQLite SUM intentionally supplies the present-only semantics:
+// a NULL result means every value in that column was absent.
+func (s *Store) SpendByPhase(ctx context.Context, query string) ([]ComputePhaseSummary, error) {
+	filters, err := computeFilters(query)
+	if err != nil {
+		return nil, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	where := "project_id=?"
+	args := []any{s.projectID}
+	for _, filter := range filters {
+		column := map[string]string{"ticket": "ticket_id", "phase": "phase", "provider": "provider"}[filter.field]
+		where += " AND " + column + "=?"
+		args = append(args, filter.value)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT phase,COUNT(*),SUM(fresh_input),SUM(cache_read),SUM(cache_write),SUM(output),SUM(reasoning),SUM(cost_usd),MAX(at_seq)
+		FROM compute_events WHERE `+where+` GROUP BY phase ORDER BY phase`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []ComputePhaseSummary
+	for rows.Next() {
+		var summary ComputePhaseSummary
+		var fresh, cacheRead, cacheWrite, output, reasoning sql.NullInt64
+		var cost sql.NullFloat64
+		if err := rows.Scan(&summary.Phase, &summary.Events, &fresh, &cacheRead, &cacheWrite, &output, &reasoning, &cost, &summary.AtSeq); err != nil {
+			return nil, err
+		}
+		summary.FreshInput, summary.CacheRead, summary.CacheWrite = nullInt64(fresh), nullInt64(cacheRead), nullInt64(cacheWrite)
+		summary.Output, summary.Reasoning, summary.CostUSD = nullInt64(output), nullInt64(reasoning), nullFloat64(cost)
+		result = append(result, summary)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// ListComputeSpendByPhase is the descriptive alias used by callers that
+// treat this aggregate as a list operation.
+func (s *Store) ListComputeSpendByPhase(ctx context.Context, query string) ([]ComputePhaseSummary, error) {
+	return s.SpendByPhase(ctx, query)
+}
+
 func (s *Store) AddComputeEvent(ctx context.Context, input domain.ComputeEventInput) (ComputeEventAddResult, error) {
 	input.TicketID = strings.TrimSpace(input.TicketID)
 	input.Phase = strings.TrimSpace(input.Phase)
@@ -240,6 +308,13 @@ func nullInt64(value sql.NullInt64) *int64 {
 		return nil
 	}
 	return &value.Int64
+}
+
+func nullFloat64(value sql.NullFloat64) *float64 {
+	if !value.Valid {
+		return nil
+	}
+	return &value.Float64
 }
 
 // ReconcileComputeConservation maintains a disposable projection. It is

@@ -25,6 +25,61 @@ type TestReportAddResult struct {
 	Idempotent   bool              `json:"idempotent,omitempty"`
 }
 
+// FlakyCellSummary is the uncapped cell-state aggregate behind both the
+// flaky face and the flaky-rate gauge. Denominator is Flaky+Clean; cells with
+// insufficient evidence remain visible in Unevaluated but are excluded.
+type FlakyCellSummary struct {
+	Total       int   `json:"total_cells"`
+	Flaky       int   `json:"flaky_cells"`
+	Clean       int   `json:"clean_cells"`
+	Unevaluated int   `json:"unevaluated_cells"`
+	Denominator int   `json:"denominator"`
+	AtSeq       int64 `json:"at_seq"`
+}
+
+// FlakyCells reads report headers and results in one SQLite transaction and
+// then reuses computeFlakyTests, the same cell evaluator as FlakyTests.
+func (s *Store) FlakyCellSummary(ctx context.Context) (FlakyCellSummary, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return FlakyCellSummary{}, err
+	}
+	defer tx.Rollback()
+	reports, err := s.loadAllTestReports(ctx, tx)
+	if err != nil {
+		return FlakyCellSummary{}, err
+	}
+	var summary FlakyCellSummary
+	for _, report := range reports {
+		if report.AtSeq > summary.AtSeq {
+			summary.AtSeq = report.AtSeq
+		}
+	}
+	for _, test := range computeFlakyTests(reports) {
+		for _, cell := range test.Cells {
+			summary.Total++
+			switch cell.State {
+			case domain.FlakyStateFlaky:
+				summary.Flaky++
+			case domain.FlakyStateClean:
+				summary.Clean++
+			case domain.FlakyStateUnevaluated:
+				summary.Unevaluated++
+			}
+		}
+	}
+	summary.Denominator = summary.Flaky + summary.Clean
+	if err := tx.Commit(); err != nil {
+		return FlakyCellSummary{}, err
+	}
+	return summary, nil
+}
+
+// FlakyCellStateSummary is a concise alias for the --all read API.
+func (s *Store) FlakyCellStateSummary(ctx context.Context) (FlakyCellSummary, error) {
+	return s.FlakyCellSummary(ctx)
+}
+
 func (s *Store) AddTestReport(ctx context.Context, rawInput domain.TestReportInput) (TestReportAddResult, error) {
 	input := rawInput.Normalized()
 	if input.Shard == "" {

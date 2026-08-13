@@ -77,6 +77,9 @@ type Store interface {
 	GetFinding(string) (store.FindingRecord, error)
 	SetFinding(context.Context, string, domain.Disposition, string, string) (store.EventKey, error)
 	Count(string, string) (store.CountResult, error)
+	CountFindings(string, string) (store.FindingCountResult, error)
+	ComputeGauge(string) (store.GaugeResult, error)
+	ComputeAllGauges() ([]store.GaugeResult, error)
 	SetTicket(context.Context, string, string, string) (store.EventKey, error)
 	MoveTicket(context.Context, string, domain.Status) (store.EventKey, error)
 	Claim(context.Context, string, bool, string) (store.LeaseClaim, error)
@@ -95,9 +98,11 @@ type Store interface {
 	ListTestReports(string) ([]domain.TestReport, error)
 	GetTestReport(string) (domain.TestReport, error)
 	FlakyTests(string) ([]domain.FlakyTest, error)
+	FlakyCellSummary(context.Context) (store.FlakyCellSummary, error)
 	ReconcileFlaky(context.Context) error
 	AddComputeEvent(context.Context, domain.ComputeEventInput) (store.ComputeEventAddResult, error)
 	ListComputeEvents(string) ([]domain.ComputeEvent, error)
+	SpendByPhase(context.Context, string) ([]store.ComputePhaseSummary, error)
 	AddQuotaSnapshot(context.Context, domain.QuotaSnapshotInput) (store.QuotaSnapshotAddResult, error)
 	ListQuotaSnapshots(string) ([]domain.QuotaSnapshot, error)
 	PinGateBaseline(context.Context, string, []string, string, string) (store.GateBaseline, error)
@@ -592,7 +597,17 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 					return nil, fmt.Errorf("E_SELECTOR_INVALID: unsupported finding distribution field %q", by)
 				}
 				data := map[string]any{"total": len(rows), "rows": projectFindingRecords(rows, stringSlice(args, "fields"))}
-				if len(rows) > ListLimit {
+				if stringArg(args, "by") != "" {
+					count, countErr := c.store.CountFindings(stringArg(args, "query"), by)
+					if countErr != nil {
+						return nil, countErr
+					}
+					data["total"], data["distribution"] = count.Total, count.Distribution
+					if len(rows) > ListLimit {
+						data["rows"] = projectFindingRecords(rows[:ListLimit], stringSlice(args, "fields"))
+						data["truncated"] = true
+					}
+				} else if len(rows) > ListLimit {
 					data["rows"] = projectFindingRecords(rows[:ListLimit], stringSlice(args, "fields"))
 					data["distribution"] = findingDistribution(rows, by)
 					data["truncated"] = true
@@ -675,6 +690,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			store, ok := c.store.(interface {
 				AddComputeEvent(context.Context, domain.ComputeEventInput) (store.ComputeEventAddResult, error)
 				ListComputeEvents(string) ([]domain.ComputeEvent, error)
+				SpendByPhase(context.Context, string) ([]store.ComputePhaseSummary, error)
 			})
 			if !ok {
 				return nil, errors.New("E_COMPUTE_INVALID: compute store is unavailable")
@@ -702,6 +718,17 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				}
 				return handlerData{Data: result, Warnings: warnings}, nil
 			case "ls", "list":
+				if by := stringArg(args, "by"); by == "phase" {
+					rows, err := store.SpendByPhase(ctx, stringArg(args, "query"))
+					if err != nil {
+						return nil, err
+					}
+					total := 0
+					for _, row := range rows {
+						total += row.Events
+					}
+					return map[string]any{"total": total, "rows": rows}, nil
+				}
 				rows, err := store.ListComputeEvents(stringArg(args, "query"))
 				if err != nil {
 					return nil, err
@@ -755,6 +782,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 		}},
 		"test-report": {Name: "test-report", Usage: "test-report add|ls|show|flaky ...", Args: []ArgSpec{
 			stringSpec("subverb", true, true, "Test report operation", "add", "ls", "show", "flaky"),
+			boolSpec("all", false, false, "Return the complete flaky cell-state summary"),
 			stringSpec("format", false, false, "Report format", "go-json", "junit"), stringSpec("selector", false, true, "Report or test selector"),
 			stringSpec("explain", false, false, "Explain one flaky test"), stringSpec("ticket", false, false, "Ticket ID"), stringSpec("phase", false, false, "Work phase"),
 			stringSpec("commit", false, false, "Commit identity"), stringSpec("branch", false, false, "Branch identity"), stringSpec("suite", false, false, "Suite identity"),
@@ -784,8 +812,15 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			case "show":
 				return c.store.GetTestReport(stringArg(args, "selector"))
 			case "flaky":
-				explain := stringArg(args, "explain")
 				selectorArg := stringArg(args, "selector")
+				explain := stringArg(args, "explain")
+				if boolArg(args, "all") {
+					summary, err := c.store.FlakyCellSummary(ctx)
+					if err != nil {
+						return nil, err
+					}
+					return summary, nil
+				}
 				selector := explain
 				if selector == "" {
 					selector = selectorArg
@@ -810,6 +845,46 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			default:
 				return nil, fmt.Errorf("E_ARGUMENT_INVALID: unknown test-report sub-verb %q", subverb)
 			}
+		}},
+		"insights": {Name: "insights", Usage: "insights [ls|show <name>]", Args: []ArgSpec{
+			stringSpec("subverb", false, true, "Insight operation", "ls", "show"),
+			stringSpec("name", false, true, "Gauge name"),
+		}, MCPTool: "aira_insights", MCPOperation: "subverb", Run: func(_ context.Context, args *argAccessor) (any, error) {
+			operation := strings.ToLower(stringArg(args, "subverb"))
+			if operation == "" {
+				operation = "show"
+			}
+			if operation == "ls" {
+				return store.GaugeRegistryRows(), nil
+			}
+			if operation != "show" {
+				return nil, fmt.Errorf("E_UNKNOWN_VERB: unknown insights sub-verb %q", operation)
+			}
+			if _, ok := c.store.(interface {
+				ComputeGauge(string) (store.GaugeResult, error)
+			}); !ok {
+				return nil, errors.New("E_CONFIG_INVALID: insight store is unavailable")
+			}
+			if stringArg(args, "name") == "" {
+				all, err := c.store.ComputeAllGauges()
+				if err != nil {
+					return nil, err
+				}
+				for _, gauge := range all {
+					if gauge.Unevaluated {
+						return handlerData{Data: all, Verdict: "unevaluated"}, nil
+					}
+				}
+				return all, nil
+			}
+			result, err := c.store.ComputeGauge(stringArg(args, "name"))
+			if err != nil {
+				return nil, err
+			}
+			if result.Unevaluated {
+				return handlerData{Data: result, Verdict: "unevaluated"}, nil
+			}
+			return result, nil
 		}},
 		"claim": {Name: "claim", Usage: "claim <id> [--steal --actor NAME]", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), boolSpec("steal", false, false, "Steal an expired lease"), stringSpec("actor", false, false, "Lease actor")}, MCPTool: "aira_claim", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			record, err := c.store.Get(stringArg(args, "selector"))
@@ -937,7 +1012,17 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				by = "status"
 			}
 			data := map[string]any{"total": len(rows), "rows": projectRecords(rows, stringSlice(args, "fields"))}
-			if len(rows) > ListLimit {
+			if stringArg(args, "by") != "" {
+				count, countErr := c.store.Count(stringArg(args, "query"), by)
+				if countErr != nil {
+					return nil, countErr
+				}
+				data["total"], data["distribution"] = count.Total, count.Distribution
+				if len(rows) > ListLimit {
+					data["rows"] = projectRecords(rows[:ListLimit], stringSlice(args, "fields"))
+					data["truncated"] = true
+				}
+			} else if len(rows) > ListLimit {
 				data["rows"] = projectRecords(rows[:ListLimit], stringSlice(args, "fields"))
 				data["distribution"] = distribution(rows, by)
 				data["truncated"] = true
@@ -1209,11 +1294,15 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		"run-log":   {summary: "Read captured run output", safety: SafetyRead, example: []string{"RUN-1", "--stream", "out"}},
 		"reconcile": {summary: "Reconcile derived project state", safety: SafetyReconcile, example: []string{"--rebuild"}},
 		"check":     {summary: "Check project consistency", safety: SafetyReconcile, example: []string{}},
+		"insights": {summary: "Read honest drillable insight gauges", safety: SafetyRead, operations: []OperationSpec{
+			{Name: "ls", Summary: "List registered insight gauges", Safety: SafetyRead, Args: nil, Example: []string{"ls"}},
+			{Name: "show", Summary: "Compute one or all live insight gauges", Safety: SafetyRead, Args: []OperationArg{{Name: "name"}}, Example: []string{"show", "reviewer-verdict-ratio"}},
+		}},
 		"test-report": {summary: "Archive and compare test reports", safety: SafetyRead, operations: []OperationSpec{
 			{Name: "add", Summary: "Ingest a test report", Safety: SafetyMutate, Args: []OperationArg{{Name: "format", Required: true}, {Name: "raw", Required: true}, {Name: "ticket"}, {Name: "phase"}, {Name: "commit"}, {Name: "branch"}, {Name: "suite"}, {Name: "config"}, {Name: "env_digest"}, {Name: "shard"}, {Name: "retry"}}, Example: []string{"add", "--format", "go-json"}},
 			{Name: "ls", Summary: "List archived test reports", Safety: SafetyRead, Args: []OperationArg{{Name: "selector"}}, Example: []string{"ls"}},
 			{Name: "show", Summary: "Show one archived test report", Safety: SafetyRead, Args: []OperationArg{{Name: "selector", Required: true}}, Example: []string{"show", "TR-1"}},
-			{Name: "flaky", Summary: "Compute three-state flaky evidence", Safety: SafetyRead, Args: []OperationArg{{Name: "selector"}, {Name: "explain"}}, Example: []string{"flaky", "--explain", "pkg/Test"}},
+			{Name: "flaky", Summary: "Compute three-state flaky evidence", Safety: SafetyRead, Args: []OperationArg{{Name: "selector"}, {Name: "explain"}, {Name: "all"}}, Example: []string{"flaky", "--all"}},
 		}},
 		"gate": {summary: "Manage proof-backed gates", safety: SafetyRead, operations: []OperationSpec{
 			{Name: "add", Summary: "Add a gate definition", Safety: SafetyMutate, Args: gateDefinitionOperationArgs(), Example: []string{"add", "unit-tests", "--checker", "command", "--predicate", "tests-green", "--argv", "/usr/local/bin/go", "--argv", "test", "--argv", "-json", "--argv", "./...", "--cwd", "root", "--env-allow", "PATH", "--timeout-ms", "60000", "--output-cap-bytes", "8388608", "--parser", "go-test-json-v1"}},
