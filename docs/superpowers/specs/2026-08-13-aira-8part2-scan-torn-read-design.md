@@ -1,7 +1,8 @@
 # #8-part2 — coherent, torn-read-safe working-tree scans (never a fake fail / false-pass / fake-zero)
 
-Status: PLAN v5 (incorporates Sol plan-review r1–r4 + a full live-read site enumeration; reframed around
-a CENTRAL scanner fix). Awaiting Sol plan-gate → build. Branch `codex-aira-8part2` off master `4374992`.
+Status: PLAN v6 (incorporates Sol plan-review r1–r5 + a full live-read site enumeration; CENTRAL scanner
+fix + per-caller handling for ALL read AND mutation callers). Awaiting Sol plan-gate → build. Branch
+`codex-aira-8part2` off master `4374992`.
 Task #8 part 2 (part 1 — ParseTicket/ParseRequirement trailing content — landed `8183345`).
 Class: **crash-recovery + readiness correctness → the two-loop is mandatory** (CLAUDE.md).
 
@@ -87,14 +88,24 @@ single new outcome to handle:
      no raw owner-file reread). Any inconclusive read anywhere in the path →
      `U_RELATION_GRAPH_UNESTABLISHED` (the existing honest surface, relation_ready.go:429/542-556); an
      index-divergence-only inconclusive degrades to the existing non-blocking warning (:430-434).
-   - **Check:** `checkStaleIndex` (check.go:349) and `checkAllocatedRequirementFile` (check.go:378)
-     read live BEFORE Rebuild; they use the stable readers and map inconclusive → an `unevaluated`
-     dimension (never a fake `E_CONFIG_INVALID`/`E_REQUIREMENT_INVALID`, never a hard error). Check
-     converts a `U_INDEX_UNESTABLISHED` from Rebuild into an unevaluated report (branch before
-     `CheckReport{}`, check.go:188-193).
-   - **List/Search/ListFindings:** map the scanners' inconclusive signal → a retryable `U_INDEX_
-     UNESTABLISHED` result (never an empty/fake-zero list). Because the fix is central, this is a small
-     per-caller branch — so the earlier D5 residual is now largely CLOSED, not deferred.
+   - **Check — ALL live-scan dimensions (Sol r5 P0):** not only `checkStaleIndex` (check.go:349) and
+     `checkAllocatedRequirementFile` (check.go:378), but also `relationIndexDivergence` (check.go:116),
+     `findingIndexDivergence` (check.go:123), `relationFindings` (~check.go:270), and `checkDuplicateIDs`
+     (check.go:420) — which reach `scanStoredRelationsAt`/`scanFindingFiles`/`scanTickets`. EACH threads
+     the `inconclusive` result → marks its dimension `unevaluated` (never a partial-graph false-pass,
+     never a fabricated divergence finding, never a raced-file omission/hard-error). Check converts a
+     `U_INDEX_UNESTABLISHED` from Rebuild into an unevaluated report (branch before `CheckReport{}`,
+     check.go:188-193).
+   - **List/Search/ListFindings:** map the scanners' inconclusive signal → a retryable
+     `U_INDEX_UNESTABLISHED` result (never an empty/fake-zero list). Central fix → small per-caller
+     branch; the earlier D5 residual is CLOSED, not deferred.
+   - **Mutation callers (Sol r5 P1) — abort before `materialiseIntent`:** `Link` (relation_ready.go:121
+     →`scanStoredRelations`:90, mutates at :160-165), `Unlink`, `Relations`, ticket updates
+     (store.go:1029), and the finding/requirement CRUD read-backs (finding.go:104/156/181,
+     requirement.go:153, relation_ready.go:146/182/225) must, on an inconclusive scan/read, RETURN
+     `U_INDEX_UNESTABLISHED` (retryable) BEFORE any write — a mutation must never authorise a
+     duplicate/wrong-side decision from partial/torn data. Documented as an operation-level retry
+     contract; the caller retries once the external write settles.
 5. **Self-heal (folds in the discovered no-prune gap):** on a fully-stable scan, full-replace the
    worktree's `scan:` reconciliation findings — `DELETE ... WHERE project_id=? AND worktree_id=? AND
    subtype='reconciliation' AND substr(finding_key,1,?)=?` with the exact `scan:<worktree>:` prefix
@@ -139,6 +150,13 @@ single new outcome to handle:
 - **R13** Check's own live readers (`checkStaleIndex`, `checkAllocatedRequirementFile`) are in the
   stable-read contract (inconclusive → unevaluated, never fake-fail/hard-error).
 - **R14** List/Search/ListFindings map inconclusive → `U_INDEX_UNESTABLISHED` (fake-zero closed).
+- **R15 (ALL Check dimensions — Sol r5 P0).** `relationIndexDivergence`/`findingIndexDivergence`/
+  `relationFindings`/`checkDuplicateIDs` (check.go:116/123/270/420) each thread inconclusive → their
+  dimension `unevaluated`; never a partial-graph false-pass, fabricated divergence, or raced-file
+  omission/hard-error.
+- **R16 (mutation callers abort — Sol r5 P1).** `Link`/`Unlink`/`Relations`/ticket-update/finding+
+  requirement CRUD read-backs return `U_INDEX_UNESTABLISHED` BEFORE `materialiseIntent` on an
+  inconclusive read — a write never proceeds from partial/torn data.
 
 ## 3. Tests (must FAIL against today's code)
 
@@ -167,6 +185,12 @@ A one-time "swap at read start" is NOT valid (both new reads would see identical
 11. **Retry resolves a transient tear invisibly:** one mid-read swap that stabilises → normal Rebuild.
 12. **Phase-B atomicity:** an injected failure between projection-replace and finding-record leaves the
     prior consistent state (no new-projection/stale-findings pairing).
+13. **Check dimensions torn (Sol r5 P0):** a torn read during `relationIndexDivergence`/
+    `findingIndexDivergence`/`relationFindings`/`checkDuplicateIDs` → that dimension is `unevaluated`,
+    never a false-pass/fabricated-divergence/omission (a discriminator per dimension).
+14. **Mutation pre-write abort (Sol r5 P1):** a torn relation scan during `Link` → `U_INDEX_
+    UNESTABLISHED` and NO `materialiseIntent` write (fails today — Link would authorise from partial
+    data); same for a ticket-update read-back.
 
 ## 4. Files
 
