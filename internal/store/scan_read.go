@@ -43,7 +43,7 @@ const (
 func scanEntityNames(entries []os.DirEntry) map[string]struct{} {
 	result := make(map[string]struct{})
 	for _, entry := range entries {
-		if !entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") && strings.HasSuffix(entry.Name(), ".md") {
+		if !strings.HasPrefix(entry.Name(), ".") && strings.HasSuffix(entry.Name(), ".md") {
 			result[entry.Name()] = struct{}{}
 		}
 	}
@@ -66,7 +66,12 @@ func sameScanEntityNames(left, right map[string]struct{}) bool {
 // are identical. A transient mismatch is retried a bounded number of times;
 // a vanished file is inconclusive rather than an I/O failure. O_NOFOLLOW is
 // used for both opens so a path swapped to a symlink after Lstat is never
-// followed.
+// followed. This retains the inherent residual shared by the traceability and
+// gate scanners: an external writer can truncate a file to a stable partial
+// prefix and pause longer than the retry window, making identical partial
+// reads indistinguishable from a stable file. Working-tree authority cannot
+// eliminate that case without requiring the external writer to use atomic
+// replacement.
 func stableReadFile(path string) ([]byte, scanReadOutcome, error) {
 	if _, err := os.Lstat(path); err != nil {
 		if errors.Is(err, os.ErrNotExist) {

@@ -476,7 +476,7 @@ func scanFindingFiles(root, worktree string) (findingScanResult, bool, error) {
 	firstNames := scanEntityNames(entries)
 	result := findingScanResult{}
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" {
+		if strings.HasPrefix(entry.Name(), ".") || filepath.Ext(entry.Name()) != ".md" {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
@@ -485,6 +485,9 @@ func scanFindingFiles(root, worktree string) (findingScanResult, bool, error) {
 			return findingScanResult{}, true, nil
 		}
 		if readErr != nil {
+			if ErrorCode(readErr) != "E_FINDING_INVALID" {
+				return findingScanResult{}, false, readErr
+			}
 			result.invalid = append(result.invalid, CheckFinding{Code: "E_FINDING_INVALID", Subject: repoPath(root, path), Message: readErr.Error(), Kind: "unevaluated"})
 			continue
 		}

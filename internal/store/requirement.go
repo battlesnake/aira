@@ -59,6 +59,9 @@ func scanRequirements(root, worktree string) (requirementScanResult, bool, error
 			return requirementScanResult{}, true, nil
 		}
 		if readErr != nil {
+			if ErrorCode(readErr) != "E_REQUIREMENT_INVALID" {
+				return requirementScanResult{}, false, readErr
+			}
 			result.invalid = append(result.invalid, CheckFinding{Code: "E_REQUIREMENT_INVALID", Subject: repoPath(root, path), Message: readErr.Error(), Kind: "unevaluated"})
 			continue
 		}

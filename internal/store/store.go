@@ -2619,7 +2619,7 @@ func scanTickets(root, worktreeID, project string) ([]scannedTicket, []CheckFind
 		excludedTicketPaths[repoPath(root, path)] = struct{}{}
 	}
 	for _, entry := range entries {
-		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") || !strings.HasSuffix(entry.Name(), ".md") {
+		if strings.HasPrefix(entry.Name(), ".") || !strings.HasSuffix(entry.Name(), ".md") {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())

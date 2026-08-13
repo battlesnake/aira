@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -64,6 +65,127 @@ func TestStableReadPersistentTearIsInconclusive(t *testing.T) {
 	if err != nil || outcome != scanReadInconclusive || data != nil {
 		t.Fatalf("persistent tear = %q, %v, %v", data, outcome, err)
 	}
+}
+
+func TestStablePartialReadDocumentsAcceptedResidual(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "partial.md")
+	partial := []byte("---\npartial")
+	if err := os.WriteFile(path, partial, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// This is intentionally not a fail-before discriminator. If an external
+	// writer leaves the same partial prefix in place longer than the bounded
+	// retry window, the double-read cannot distinguish it from stable content.
+	// Eliminating that residual requires atomic replacement by the external
+	// writer, which working-tree authority cannot mandate.
+	data, outcome, err := stableReadFile(path)
+	if err != nil || outcome != scanReadStable || string(data) != string(partial) {
+		t.Fatalf("stable partial residual = %q, %v, %v", data, outcome, err)
+	}
+}
+
+func TestRebuildGenuineReadErrorsDoNotBecomeInvalidFindings(t *testing.T) {
+	for _, kind := range []string{"finding", "requirement"} {
+		t.Run(kind, func(t *testing.T) {
+			base := t.TempDir()
+			root := filepath.Join(base, "main")
+			s := testStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
+			var path string
+			if kind == "finding" {
+				path = filepath.Join(root, ".aira", "findings", "f-io.md")
+			} else {
+				path = filepath.Join(root, ".aira", "requirements", "AR-io.md")
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("unreadable"), 0o000); err != nil {
+				t.Fatal(err)
+			}
+			defer os.Chmod(path, 0o644)
+			if err := s.Rebuild(context.Background()); err == nil {
+				t.Fatal("Rebuild unexpectedly succeeded on unreadable entity")
+			}
+			code := "E_FINDING_INVALID"
+			if kind == "requirement" {
+				code = "E_REQUIREMENT_INVALID"
+			}
+			var count int
+			if err := s.db.QueryRow("SELECT count(*) FROM findings WHERE project_id=? AND worktree_id=? AND code=?", s.projectID, s.worktreeID, code).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count != 0 {
+				t.Fatalf("genuine %s IO error fabricated %s finding: %d", kind, code, count)
+			}
+		})
+	}
+}
+
+func TestDirectoryShapedEntitiesAreNotSilentlyDropped(t *testing.T) {
+	t.Run("ticket", func(t *testing.T) {
+		base := t.TempDir()
+		root := filepath.Join(base, "main")
+		s := testStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
+		ticket, err := s.CreateTicket(context.Background(), domain.CreateTicketInput{Title: "directory ticket", Kind: domain.KindFeature, Severity: domain.SeverityP2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := s.ticketPath(ticket.ID)
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Rebuild(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		var count int
+		if err := s.db.QueryRow("SELECT count(*) FROM findings WHERE project_id=? AND worktree_id=? AND code='E_CONFIG_INVALID'", s.projectID, s.worktreeID).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count == 0 {
+			t.Fatal("directory-shaped ticket was silently dropped")
+		}
+		rows, err := s.Ready(ticket.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) == 0 || rows[0].Ready {
+			t.Fatalf("directory-shaped ticket false-passed Ready: %#v", rows)
+		}
+	})
+
+	t.Run("finding", func(t *testing.T) {
+		base := t.TempDir()
+		root := filepath.Join(base, "main")
+		s := testStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
+		ticket, err := s.CreateTicket(context.Background(), domain.CreateTicketInput{Title: "finding owner", Kind: domain.KindFeature, Severity: domain.SeverityP2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		finding, _, err := s.AddFinding(context.Background(), domain.ReviewFindingInput{TicketID: ticket.ID, Category: "bug", Severity: domain.SeverityP2, Verdict: domain.VerdictConfirmed, Source: "test", Message: "directory"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := s.findingPath(finding.Key)
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Rebuild(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		var count int
+		if err := s.db.QueryRow("SELECT count(*) FROM findings WHERE project_id=? AND worktree_id=? AND code='E_FINDING_INVALID'", s.projectID, s.worktreeID).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count == 0 {
+			t.Fatal("directory-shaped finding was silently dropped")
+		}
+	})
 }
 
 func TestRebuildPersistentTornTicketPreservesIndexAndFindingState(t *testing.T) {
@@ -228,6 +350,34 @@ func TestRebuildPhaseBFailureRollsBackProjectionAndFindings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	other, err := s.CreateTicket(context.Background(), domain.CreateTicketInput{Title: "relation target", Kind: domain.KindFeature, Severity: domain.SeverityP2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Link(context.Background(), ticket.ID, domain.RelationBlocks, other.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Search(context.Background(), "prior", "ticket"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec("INSERT INTO requirements(project_id,worktree_id,id,path,digest,status,text) VALUES(?,?,?,?,?,?,?)", s.projectID, s.worktreeID, "AR-1", ".aira/requirements/AR-1.md", "digest", "planned", "pre-existing requirement"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.withImmediate(context.Background(), func(conn *sql.Conn) error {
+		return upsertReconciliationFinding(context.Background(), conn, s.projectID, s.worktreeID, "compute:keep", "E_COMPUTE_CONSERVATION", "compute", "pre-existing reconciliation")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var beforeRelations, beforeFTS, beforeRequirements int
+	if err := s.db.QueryRow("SELECT count(*) FROM relations WHERE project_id=? AND worktree_id=?", s.projectID, s.worktreeID).Scan(&beforeRelations); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow("SELECT count(*) FROM search_fts WHERE project_id=? AND worktree_id=?", s.projectID, s.worktreeID).Scan(&beforeFTS); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow("SELECT count(*) FROM requirements WHERE project_id=? AND worktree_id=?", s.projectID, s.worktreeID).Scan(&beforeRequirements); err != nil {
+		t.Fatal(err)
+	}
 	path := filepath.Join(root, ".aira", "tickets", "AIRA-88.md")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
@@ -252,6 +402,26 @@ func TestRebuildPhaseBFailureRollsBackProjectionAndFindings(t *testing.T) {
 	if count != 0 {
 		t.Fatalf("deferred finding escaped rollback: %d", count)
 	}
+	var afterRelations, afterFTS, afterRequirements int
+	if err := s.db.QueryRow("SELECT count(*) FROM relations WHERE project_id=? AND worktree_id=?", s.projectID, s.worktreeID).Scan(&afterRelations); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow("SELECT count(*) FROM search_fts WHERE project_id=? AND worktree_id=?", s.projectID, s.worktreeID).Scan(&afterFTS); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow("SELECT count(*) FROM requirements WHERE project_id=? AND worktree_id=?", s.projectID, s.worktreeID).Scan(&afterRequirements); err != nil {
+		t.Fatal(err)
+	}
+	if afterRelations != beforeRelations || afterFTS != beforeFTS || afterRequirements != beforeRequirements {
+		t.Fatalf("projection rollback incomplete: relations %d/%d FTS %d/%d requirements %d/%d", afterRelations, beforeRelations, afterFTS, beforeFTS, afterRequirements, beforeRequirements)
+	}
+	var details string
+	if err := s.db.QueryRow("SELECT details FROM findings WHERE project_id=? AND worktree_id=? AND finding_key=?", s.projectID, s.worktreeID, "compute:keep").Scan(&details); err != nil {
+		t.Fatal(err)
+	}
+	if details != "pre-existing reconciliation" {
+		t.Fatalf("pre-existing reconciliation row changed: %q", details)
+	}
 }
 
 func TestMutationAbortsBeforeLinkWriteOnTornRead(t *testing.T) {
@@ -268,6 +438,11 @@ func TestMutationAbortsBeforeLinkWriteOnTornRead(t *testing.T) {
 	}
 	path := s.ticketPath(from.ID)
 	first, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetPath := s.ticketPath(to.ID)
+	targetBefore, err := os.ReadFile(targetPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,6 +467,13 @@ func TestMutationAbortsBeforeLinkWriteOnTornRead(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("ticket update wrote an outbox intent before abort: %d", count)
+	}
+	targetAfter, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(targetAfter) != string(targetBefore) {
+		t.Fatal("target ticket bytes changed despite aborted Link")
 	}
 }
 
