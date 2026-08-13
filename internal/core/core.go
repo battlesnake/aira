@@ -382,6 +382,9 @@ func runRecordCode(record runner.RunRecord) string {
 	if record.Status == runner.StatusKilled {
 		return "E_RUN_KILLED"
 	}
+	if record.Status == runner.StatusOOMKilled {
+		return "E_RUN_OOM_KILLED"
+	}
 	if record.Status == runner.StatusExited && record.ExitCode != nil && *record.ExitCode != 0 {
 		return "E_RUN_FAILED"
 	}

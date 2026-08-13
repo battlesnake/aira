@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"aira/internal/domain"
+	"aira/internal/store"
 )
 
 func TestInsightsFacesListSingleAndDefaultAll(t *testing.T) {
@@ -16,8 +17,11 @@ func TestInsightsFacesListSingleAndDefaultAll(t *testing.T) {
 	}
 	var rows []map[string]any
 	marshalRoundTrip(t, listed.Data, &rows)
-	if len(rows) != 6 {
-		t.Fatalf("insights registry=%#v", rows)
+	// Registry-driven so adding a gauge can't silently break this face test again
+	// (it went stale at 6 when M15b added ratchet-status + traceability-status → 8,
+	// undetected because the merge gate ran store+cmd but not ./internal/core/...).
+	if want := len(store.GaugeRegistryRows()); len(rows) != want || want == 0 {
+		t.Fatalf("insights registry: got %d rows, want %d: %#v", len(rows), want, rows)
 	}
 	shown := c.Do(context.Background(), Request{Verb: "insights", Args: map[string]any{"subverb": "show", "name": "reviewer-verdict-ratio"}})
 	if !shown.OK || shown.Code != "UNEVALUATED" || shown.Exit != 3 {

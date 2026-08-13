@@ -390,6 +390,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		record.Status = StatusLost
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_EXIT_UNKNOWN")
 	}
+	mergeUsage(&record, timeoutKill.Current)
 	if record.Status == StatusExited && record.ExitCode != nil && *record.ExitCode != 0 {
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_FAILED")
 	}
@@ -402,6 +403,9 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if lockErr != nil {
 		return nil, launchErr("U_RUN_RECONCILE_REQUIRED", lockErr)
 	}
+	usage := snapshotUsage(&record, scope.Reference())
+	record.Status = classifyOOMKilled(record.Status, usage, timedOut || (record.Status == StatusKilled && record.KillIntent.Present))
+	record.EndedAt = nowString(r.now)
 	latest, latestErr := r.ledger.current(id)
 	if latestErr == nil && latest.Status.Terminal() {
 		_ = unlockFile(terminalLock)
@@ -425,10 +429,10 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		_ = unlockFile(terminalLock)
 		return nil, launchErr("U_RUN_RECONCILE_REQUIRED", err)
 	}
-	_ = unlockFile(terminalLock)
 	if empty, err := scope.Empty(); err == nil && empty {
 		_ = scope.Remove()
 	}
+	_ = unlockFile(terminalLock)
 	_ = r.ledger.project(ctx)
 	return &committed, nil
 }
@@ -462,6 +466,7 @@ func mergeEvidence(base, candidate RunRecord) RunRecord {
 	if candidate.KillIntent.Present {
 		base.KillIntent = candidate.KillIntent
 	}
+	mergeUsage(&base, candidate)
 	for _, code := range candidate.ErrorCodes {
 		base.ErrorCodes = appendUnique(base.ErrorCodes, code)
 	}
@@ -494,6 +499,32 @@ func cloneOutputRefs(refs map[string]OutputRef) map[string]OutputRef {
 		copy[key] = ref
 	}
 	return copy
+}
+
+func mergeUsage(base *RunRecord, candidate RunRecord) {
+	if candidate.PeakRSS != nil {
+		base.PeakRSS = candidate.PeakRSS
+	}
+	if candidate.CPUUser != nil {
+		base.CPUUser = candidate.CPUUser
+	}
+	if candidate.CPUSys != nil {
+		base.CPUSys = candidate.CPUSys
+	}
+}
+
+func snapshotUsage(record *RunRecord, scopePath string) cgroupUsage {
+	usage := readCgroupUsage(scopePath)
+	if usage.PeakRSS != nil {
+		record.PeakRSS = usage.PeakRSS
+	}
+	if usage.CPUUser != nil {
+		record.CPUUser = usage.CPUUser
+	}
+	if usage.CPUSys != nil {
+		record.CPUSys = usage.CPUSys
+	}
+	return usage
 }
 
 // appendTerminalLocked is the single terminal CAS. Callers must hold the
@@ -1107,11 +1138,15 @@ func (r *Runner) killWithIntent(ctx context.Context, id, actor string) (killAtte
 		return attempt, launchErr("E_RUN_SCOPE_INVALID", err)
 	}
 	kill, killErr := r.killScope(ctx, scope, id, actor)
+	// cgroup usage remains readable after cgroup.kill and before removal.
+	// Carry this snapshot to the caller so its terminal candidate, not a
+	// post-removal read, owns the evidence.
+	snapshotUsage(&current, scope.Reference())
+	attempt.Current = current
 	if killErr != nil {
 		return attempt, launchErr("U_RUN_RECONCILE_REQUIRED", killErr)
 	}
 	attempt.Kill = kill
-	attempt.Current = current
 	if kill.Completed {
 		_ = scope.Remove()
 	}
@@ -1136,10 +1171,11 @@ func (r *Runner) Kill(ctx context.Context, id string) (*RunRecord, error) {
 		current.Status, current.EndedAt = StatusLost, nowString(r.now)
 		current.ErrorCodes = appendUnique(current.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
 		current.TerminalComplete = true
-		if _, appendErr := r.appendTerminalLocked(current.ID, current); appendErr != nil {
+		committed, appendErr := r.appendTerminalLocked(current.ID, current)
+		if appendErr != nil {
 			return nil, launchErr("U_RUN_RECONCILE_REQUIRED", appendErr)
 		}
-		return &current, launchErr("U_RUN_RECONCILE_REQUIRED", errors.New("kill intent could not be proven"))
+		return &committed, launchErr("U_RUN_RECONCILE_REQUIRED", errors.New("kill intent could not be proven"))
 	}
 	current.Status, current.EndedAt = StatusKilled, nowString(r.now)
 	current.ExitCode, current.Signal = nil, ""
@@ -1147,11 +1183,12 @@ func (r *Runner) Kill(ctx context.Context, id string) (*RunRecord, error) {
 	current.KillIntent.Completed, current.KillIntent.Empty = true, true
 	current.ErrorCodes = appendUnique(current.ErrorCodes, "E_RUN_KILLED")
 	current.TerminalComplete = true
-	if _, err := r.appendTerminalLocked(current.ID, current); err != nil {
+	committed, err := r.appendTerminalLocked(current.ID, current)
+	if err != nil {
 		return nil, launchErr("U_RUN_RECONCILE_REQUIRED", err)
 	}
 	_ = r.ledger.project(ctx)
-	return &current, nil
+	return &committed, nil
 }
 
 func (r *Runner) Get(id string) (*RunRecord, error) {
@@ -1218,7 +1255,8 @@ func (r *Runner) ReadOutput(ctx context.Context, req OutputRequest) (*OutputChun
 	}
 	chunk := &OutputChunk{
 		RunID: req.RunID, Stream: stream, Encoding: "base64", OutputState: ref.State,
-		RunStatus: record.Status, ErrorCodes: append([]string(nil), record.ErrorCodes...),
+		RunStatus: record.Status, PeakRSS: record.PeakRSS, CPUUser: record.CPUUser, CPUSys: record.CPUSys,
+		ErrorCodes: append([]string(nil), record.ErrorCodes...),
 	}
 	if ref.State == OutputEvicted || ref.State == OutputUnavail || ref.Path == "" {
 		chunk.OutputState = OutputUnavail
@@ -1357,6 +1395,8 @@ func (r *Runner) Reconcile(ctx context.Context) ([]RunRecord, error) {
 			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_EXIT_UNKNOWN")
 			record.TerminalComplete = true
 		}
+		usage := snapshotUsage(&record, scope.Reference())
+		record.Status = classifyOOMKilled(record.Status, usage, record.Status == StatusKilled && record.KillIntent.Present)
 		if _, err = r.appendTerminalLocked(id, record); err != nil {
 			_ = unlockFile(lock)
 			return nil, err

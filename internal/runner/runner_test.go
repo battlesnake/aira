@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -102,7 +103,8 @@ func TestLedgerProjectionRebuildsAfterDBLoss(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusExited, ScopeIntegrity: ScopeContained, TerminalComplete: true}
+	peak, user, sys := int64(1000), int64(12), int64(4)
+	run := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusExited, ScopeIntegrity: ScopeContained, TerminalComplete: true, PeakRSS: &peak, CPUUser: &user, CPUSys: &sys}
 	if _, err := l.append(ledgerEvent{Kind: "terminal", Run: run}); err != nil {
 		t.Fatal(err)
 	}
@@ -117,6 +119,18 @@ func TestLedgerProjectionRebuildsAfterDBLoss(t *testing.T) {
 	}
 	if _, err := os.Stat(l.projection); err != nil {
 		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", l.projection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var gotPeak, gotUser, gotSys sql.NullInt64
+	if err := db.QueryRow(`SELECT peak_rss,cpu_user,cpu_sys FROM runs WHERE id=?`, "RUN-1").Scan(&gotPeak, &gotUser, &gotSys); err != nil {
+		t.Fatal(err)
+	}
+	if !gotPeak.Valid || gotPeak.Int64 != peak || !gotUser.Valid || gotUser.Int64 != user || !gotSys.Valid || gotSys.Int64 != sys {
+		t.Fatalf("projected usage peak=%v user=%v sys=%v", gotPeak, gotUser, gotSys)
 	}
 }
 
@@ -160,6 +174,20 @@ func TestCleanSuccessRequiresAllEvidence(t *testing.T) {
 		if copy.CleanSuccess() {
 			t.Fatalf("incomplete record earned success: %+v", copy)
 		}
+	}
+}
+
+func TestUsageEvidenceMergesOnlyEvaluatedMetrics(t *testing.T) {
+	base := RunRecord{}
+	peak, user := int64(100), int64(7)
+	mergeUsage(&base, RunRecord{PeakRSS: &peak, CPUUser: &user})
+	if base.PeakRSS == nil || *base.PeakRSS != 100 || base.CPUUser == nil || *base.CPUUser != 7 || base.CPUSys != nil {
+		t.Fatalf("initial usage merge=%+v", base)
+	}
+	sys := int64(9)
+	mergeUsage(&base, RunRecord{CPUSys: &sys})
+	if base.PeakRSS == nil || *base.PeakRSS != 100 || base.CPUUser == nil || *base.CPUUser != 7 || base.CPUSys == nil || *base.CPUSys != 9 {
+		t.Fatalf("partial usage merge=%+v", base)
 	}
 }
 

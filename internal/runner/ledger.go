@@ -351,13 +351,55 @@ func (l *ledger) project(ctx context.Context) error {
 	if _, err = db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, terminal INTEGER NOT NULL, record_json BLOB NOT NULL)`); err != nil {
 		return err
 	}
+	for _, column := range []string{"peak_rss", "cpu_user", "cpu_sys"} {
+		if err := ensureRunColumn(ctx, db, column); err != nil {
+			return err
+		}
+	}
 	for _, r := range runs {
 		data, _ := json.Marshal(r)
-		if _, err = db.ExecContext(ctx, `INSERT INTO runs(id,status,terminal,record_json) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,terminal=excluded.terminal,record_json=excluded.record_json`, r.ID, r.Status, r.Status.Terminal(), data); err != nil {
+		if _, err = db.ExecContext(ctx, `INSERT INTO runs(id,status,terminal,record_json,peak_rss,cpu_user,cpu_sys) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,terminal=excluded.terminal,record_json=excluded.record_json,peak_rss=excluded.peak_rss,cpu_user=excluded.cpu_user,cpu_sys=excluded.cpu_sys`, r.ID, r.Status, r.Status.Terminal(), data, nullableMetric(r.PeakRSS), nullableMetric(r.CPUUser), nullableMetric(r.CPUSys)); err != nil {
 			return err
 		}
 	}
 	return db.Close()
+}
+
+func ensureRunColumn(ctx context.Context, db *sql.DB, name string) error {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(runs)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var cid int
+		var column, columnType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &column, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return err
+		}
+		if column == name {
+			found = true
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	_, err = db.ExecContext(ctx, `ALTER TABLE runs ADD COLUMN `+name+` INTEGER`)
+	return err
+}
+
+func nullableMetric(value *int64) any {
+	if value == nil {
+		return nil
+	}
+	return *value
 }
 
 func (l *ledger) rebuild(ctx context.Context) error { return l.project(ctx) }

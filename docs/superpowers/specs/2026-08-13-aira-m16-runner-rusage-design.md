@@ -195,3 +195,14 @@ the terminal-complete CAS (Sol — highest structural risk).
 
 - estimate-vs-actual gauge + MemoryMax tuning; live-tee I/O, `--realtime`/`--pty`, telemetry/gate
   auto-wiring, `--detach`+daemon (blocked on the daemon decision), `run-input`.
+- **Memory-controller enablement for `peak_rss` (surfaced by real-cgroup verification).** `memory.peak`
+  exists on a run cgroup ONLY if its parent delegates the `+memory` controller in `cgroup.subtree_control`.
+  The default ambient parent (e.g. a `whale-run`/`agentmux` scope that holds the caller process) often
+  does NOT — cgroup-v2's no-internal-process rule forbids enabling `+memory` on a cgroup that holds
+  processes — so in the common case `peak_rss` is **honestly nil** (CPU accounting via `cpu.stat` is a
+  core stat and works regardless; OOM classification works wherever `+memory` is present). Making
+  `peak_rss` populate by default would require AIRA to interpose an OWNED intermediate cgroup (no direct
+  processes) with `+memory` enabled between the ambient parent and each run scope — a runner-setup /
+  cgroup-controller-management change, out of this "read the stats" milestone. Filed as a follow-up. The
+  real-cgroup tests enable `+memory` on a purpose-built parent (under the scope's parent, since the
+  scope itself holds the test process) to exercise the reading.

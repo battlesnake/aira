@@ -11,14 +11,17 @@ import (
 type Status string
 
 const (
-	StatusStarting Status = "starting"
-	StatusRunning  Status = "running"
-	StatusExited   Status = "exited"
-	StatusKilled   Status = "killed"
-	StatusLost     Status = "lost"
+	StatusStarting  Status = "starting"
+	StatusRunning   Status = "running"
+	StatusExited    Status = "exited"
+	StatusKilled    Status = "killed"
+	StatusLost      Status = "lost"
+	StatusOOMKilled Status = "oom-killed"
 )
 
-func (s Status) Terminal() bool { return s == StatusExited || s == StatusKilled || s == StatusLost }
+func (s Status) Terminal() bool {
+	return s == StatusExited || s == StatusKilled || s == StatusLost || s == StatusOOMKilled
+}
 
 type ScopeIntegrity string
 
@@ -93,6 +96,9 @@ type RunRecord struct {
 	ScopeKill           ScopeKill            `json:"scope_kill"`
 	KillIntent          KillIntent           `json:"kill_intent"`
 	ErrorCodes          []string             `json:"error_codes,omitempty"`
+	PeakRSS             *int64               `json:"peak_rss,omitempty"`
+	CPUUser             *int64               `json:"cpu_user,omitempty"`
+	CPUSys              *int64               `json:"cpu_sys,omitempty"`
 	PIDIdentity         PIDIdentity          `json:"pid_identity,omitempty"`
 	TerminalComplete    bool                 `json:"terminal_complete"`
 }
@@ -149,6 +155,9 @@ type OutputChunk struct {
 	Truncated   bool        `json:"truncated"`
 	OutputState OutputState `json:"output_state"`
 	RunStatus   Status      `json:"run_status"`
+	PeakRSS     *int64      `json:"peak_rss,omitempty"`
+	CPUUser     *int64      `json:"cpu_user,omitempty"`
+	CPUSys      *int64      `json:"cpu_sys,omitempty"`
 	ErrorCodes  []string    `json:"error_codes,omitempty"`
 }
 

@@ -1,0 +1,4 @@
+usage_usec 1540
+user_usec 1200
+system_usec 340
+nr_periods 3
