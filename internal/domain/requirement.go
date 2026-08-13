@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -119,6 +120,13 @@ func ParseRequirement(data []byte) (Requirement, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&front); err != nil {
 		return Requirement{}, fmt.Errorf("E_REQUIREMENT_INVALID: %s", err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return Requirement{}, errors.New("E_REQUIREMENT_INVALID: trailing content in requirement frontmatter")
+		}
+		return Requirement{}, fmt.Errorf("E_REQUIREMENT_INVALID: trailing content in requirement frontmatter: %w", err)
 	}
 	body := string(rest[idx+len(marker):])
 	if !strings.HasSuffix(body, "\n") {

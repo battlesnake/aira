@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 )
@@ -45,6 +46,24 @@ func TestRequirementRoundTrip(t *testing.T) {
 		}
 		if got.ID != req.ID || got.Status != req.Status || got.Text != req.Text || got.Schema != 1 {
 			t.Fatalf("round-trip mismatch for %s: got %#v want %#v", status, got, req)
+		}
+	}
+}
+
+func TestParseRequirementRejectsTrailingFrontmatterContent(t *testing.T) {
+	requirement, err := NewRequirement(RequirementInput{ID: "AR-3", Text: "A requirement", Status: RequirementBuilt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := RenderRequirement(requirement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := []byte("\n---\n")
+	for _, trailing := range [][]byte{[]byte("  GARBAGE"), []byte(` {"schema":1}`)} {
+		bad := bytes.Replace(data, marker, append(append([]byte{}, trailing...), marker...), 1)
+		if _, err := ParseRequirement(bad); err == nil || !strings.Contains(err.Error(), "E_REQUIREMENT_INVALID") {
+			t.Fatalf("ParseRequirement trailing frontmatter content %q: expected E_REQUIREMENT_INVALID, got %v", trailing, err)
 		}
 	}
 }

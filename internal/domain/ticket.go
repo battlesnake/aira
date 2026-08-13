@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"sort"
 	"strings"
@@ -491,6 +492,13 @@ func ParseTicket(data []byte) (Ticket, string, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&ticket); err != nil {
 		return Ticket{}, "", fmt.Errorf("E_CONFIG_INVALID: %w", err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return Ticket{}, "", errors.New("E_CONFIG_INVALID: trailing content in ticket frontmatter")
+		}
+		return Ticket{}, "", fmt.Errorf("E_CONFIG_INVALID: trailing content in ticket frontmatter: %w", err)
 	}
 	if err := ticket.Validate(); err != nil {
 		return Ticket{}, "", err

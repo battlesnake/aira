@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -217,6 +218,24 @@ func TestTicketRoundTripAndCanonicalRelationOrder(t *testing.T) {
 	}
 	if len(got.Relations) != 2 || got.Relations[0].Kind != RelationBlocks {
 		t.Fatalf("relations were not canonicalised: %#v", got.Relations)
+	}
+}
+
+func TestParseTicketRejectsTrailingFrontmatterContent(t *testing.T) {
+	ticket := Ticket{
+		ID: "AIRA-42", Project: "aira", Title: "trailing content",
+		Status: StatusPlanned, Kind: KindFeature, Severity: SeverityP2,
+	}
+	data, err := RenderTicket(ticket, "Body\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := []byte("\n---\n")
+	for _, trailing := range [][]byte{[]byte("  GARBAGE"), []byte(` {"schema":1}`)} {
+		bad := bytes.Replace(data, marker, append(append([]byte{}, trailing...), marker...), 1)
+		if _, _, err := ParseTicket(bad); err == nil || !strings.Contains(err.Error(), "E_CONFIG_INVALID") {
+			t.Fatalf("ParseTicket trailing frontmatter content %q: expected E_CONFIG_INVALID, got %v", trailing, err)
+		}
 	}
 }
 
