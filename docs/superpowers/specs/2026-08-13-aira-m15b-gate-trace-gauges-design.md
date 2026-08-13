@@ -1,7 +1,9 @@
 # M15b — gate + traceability insight gauges (`ratchet-status`, `traceability-status`)
 
-Status: PLAN v4 (incorporates Sol plan-review r1–r3). r3 confirmed R6 precedence + buckets closed;
-this revises only the traceability scan-core CONTRACT to be lossless. Awaiting Sol re-review → gate → build.
+Status: PLAN v5 (incorporates Sol plan-review r1–r4). r3 confirmed R6 precedence + buckets closed;
+r4 confirmed edge+valid-node data sufficient. v5 enriches the malformed-node + unevaluated contract
+(Message, alias IDs[], last-occurrence-wins, diagnostic payload) so M9c findings reproduce exactly.
+Awaiting Sol re-review → gate → build.
 Milestone: Phase 4, follows M15 (insights framework). Branch `codex-aira-m15b` off master `ccb7325`.
 Depends on: M15 (gauge framework), M13b (ratchet gate), M9c (covers/verifies traceability).
 
@@ -126,34 +128,48 @@ return `GaugeResult{Value, Breakdown, Unevaluated, UnevaluatedReason, Universe, 
   its exact findings and would lose malformed nodes whose filename yields no ID) — shared by BOTH
   `checkTraceability` and the gauge:
   ```
-  type malformedNode struct { Subject string; ID string } // ID "" when the filename yields no valid ID
+  // One per malformed requirement FILE (unique Subject). IDs is the ordered alias set used for edge
+  // resolution: {filename-derived ID if the filename is a valid ID} ∪ {frontmatter requirement.ID if
+  // the frontmatter parsed}. May be empty (invalid filename AND parse error) — the node still counts
+  // in the gauge universe by Subject. Message is the exact E_REQUIREMENT_INVALID finding text.
+  type malformedNode struct { Subject string; IDs []string; Message string }
+  // Carries the exact diagnostic so checkTraceability reproduces the finding verbatim.
+  type traceUnevaluated struct { Code string; Subject string; Message string }
   type traceScan struct {
       edges        []traceEdge                 // ORDERED raw (path,line,kind,id) — lossless for check findings
       requirements map[string]traceRequirement // valid nodes: id -> {status, path}
-      malformed    []malformedNode             // ORDERED, keyed by UNIQUE file Subject (collapse-free; ID optional)
+      malformed    []malformedNode             // ORDERED, one per file (unique Subject), collapse-free
       unevaluated  *traceUnevaluated           // genuine scan failure / empty registry ONLY (NOT all-malformed)
   }
   func (s *Store) scanTraceabilityGraph() (traceScan, error)
   ```
   It runs the identical registry-read + `discoverWorktrees` + `captureTraceSnapshot` +
-  `parseTraceabilitySnapshot` scan.
+  `parseTraceabilitySnapshot` scan. The exact insertion contract (matching traceability.go:306-320):
+  `Message` = `parseErr.Error()` when the frontmatter failed to parse, else
+  `"E_REQUIREMENT_INVALID: filename/frontmatter mismatch"`; `IDs` = the filename-derived ID (when
+  `ticketIDFromFilename` succeeds) plus, when the frontmatter parsed, `requirement.ID`.
   - **`checkTraceability` refactor (M9c findings byte-for-byte preserved — HARD constraint):** on
-    `unevaluated` emit the matching `U_TRACE_*`/return exactly as today (preserve the no-prefix/non-git
-    early returns traceability.go:250-265 and the empty-registry returns :327/331); else emit the
-    per-node `E_REQUIREMENT_INVALID` findings from `malformed` **in order** (same subject, :306-320),
-    emit the all-nodes-malformed `U_TRACE_UNSCANNED` diagnostic when `len(requirements)==0 &&
-    len(malformed)>0` (:330-335), then call **`resolveTraceabilityEdges(report, edges, requirements,
-    malformedIDMap)` UNCHANGED** (build `malformedIDMap` = id->subject from the id-bearing `malformed`
-    entries, matching today). The existing M9c traceability tests guard exact output; the builder must
-    not alter `resolveTraceabilityEdges` nor finding order/subjects.
+    `unevaluated` emit its `{Code, Subject, Message}` verbatim (preserve the no-prefix/non-git early
+    returns traceability.go:250-265 and the empty-registry returns :327/331); else emit the per-node
+    `E_REQUIREMENT_INVALID` findings from `malformed` **in order** using each node's `Subject` +
+    `Message` (:306-313), emit the all-nodes-malformed `U_TRACE_UNSCANNED` diagnostic when
+    `len(requirements)==0 && len(malformed)>0` (:330-335), then call **`resolveTraceabilityEdges(report,
+    edges, requirements, malformedIDMap)` UNCHANGED**. Build `malformedIDMap` (`id -> Subject`) by
+    iterating `malformed` in order and inserting every `ID` in each node's `IDs` → its `Subject`,
+    **last-occurrence-wins** (reproduces today's last-write-wins map, :314-319). The existing M9c
+    traceability tests guard exact output; the builder must not alter `resolveTraceabilityEdges` nor
+    finding order/subjects/messages.
   - **gauge derivation:** fold covers/verifies from `edges` with the identical switch as
     `resolveTraceabilityEdges` (traceability.go:345-354) — via a shared pure helper if it can be
     extracted without changing `check` findings, else a faithful re-walk; `dangling` = edges whose ID
-    is neither in `requirements` nor `malformed`. Per valid requirement → bucket by (status,covers,
-    verifies); per `malformed` node → a per-item `unevaluated` cell keyed by its `Subject` (ID-less
-    nodes included). **Universe = len(requirements) + len(malformed)** (breakdown key = requirement ID
-    for valid nodes, `Subject` for malformed nodes). No findings round-trip.
-- **`unevaluated` signal (gauge-level) is set ONLY for a genuine scan failure:** registry unreadable
+    is in neither `requirements` nor the union of all `malformed[*].IDs` (matches the resolver's
+    dangling precedence — a malformed-ID edge is `U_TRACE_UNSCANNED`, not dangling). Per valid
+    requirement → bucket by (status,covers,verifies); per `malformed` node (one per file) → a per-item
+    `unevaluated` cell keyed by its `Subject` (ID-less nodes included). **Universe = len(requirements) +
+    len(malformed)** (breakdown key = requirement ID for valid nodes, `Subject` for malformed nodes).
+    No findings round-trip.
+- **`unevaluated` signal (gauge-level) is set ONLY for a genuine scan failure**, and carries the exact
+  `{Code, Subject, Message}` so `check` reproduces the finding verbatim: registry unreadable
   (traceability.go:246), `discoverWorktrees` error (:268), snapshot tore (:285), parse error (:297),
   or empty requirement registry (U_TRACE_EMPTY, :327/331). It is **NOT** set for the
   "all-discovered-nodes-malformed" case (:334 — enumeration succeeded), which the gauge represents as
@@ -313,9 +329,10 @@ TDD. Regression-shaped where a naive impl would pass; property-shaped for invari
   `insightRegistry` entries; two `init()` wirings.
 - `internal/store/traceability.go`: extract the pure `scanTraceabilityGraph()` scan-core returning
   LOSSLESS ordered `edges` + valid `requirements` (with status) + ordered `malformed` nodes
-  (Subject-keyed, ID optional) + `unevaluated` signal, called by BOTH `checkTraceability` and the
-  gauge (R9/R11); `resolveTraceabilityEdges` UNCHANGED; `checkTraceability`'s M9c findings preserved
-  byte-for-byte (existing tests guard it).
+  (`{Subject, IDs []string, Message}`, one per file) + an `unevaluated` `{Code, Subject, Message}`
+  signal, called by BOTH `checkTraceability` and the gauge (R9/R11); `resolveTraceabilityEdges`
+  UNCHANGED (fed a last-occurrence-wins id→subject map rebuilt from `malformed[*].IDs`);
+  `checkTraceability`'s M9c findings preserved byte-for-byte (existing tests guard it).
 - `internal/store/insights_test.go` (+ traceability seam test): §4 unit tests.
 - `docs/.../2026-08-13-aira-m15b-gate-trace-gauges-design.md` (this file).
 - No faces edits (registry-generic). A parity/coverage assertion confirms both gauges appear in
