@@ -682,9 +682,21 @@ func realRunner(t *testing.T) *Runner {
 		t.Fatal(err)
 	}
 	if err := r.backend.Probe(context.Background()); err != nil {
-		t.Skipf("real cgroup-v2 delegation unavailable: %v", err)
+		skipOrFailRealCgroup(t, "real cgroup-v2 delegation unavailable: %v", err)
 	}
 	return r
+}
+
+// AIRA_REAL_CGROUP=1 makes real-cgroup verification fail closed: delegation,
+// controller setup, and fixture dependencies become fatal instead of skips.
+// Leave it unset in environments such as this sandbox where cgroup-v2 is
+// intentionally read-only.
+func skipOrFailRealCgroup(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if os.Getenv("AIRA_REAL_CGROUP") == "1" {
+		t.Fatalf(format, args...)
+	}
+	t.Skipf(format, args...)
 }
 
 type launchOutcome struct {

@@ -4,10 +4,10 @@ package runner
 
 import (
 	"context"
-	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -20,10 +20,10 @@ func TestRealCgroupOOMUsageClassifiesPositiveOOM(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := r.Probe(context.Background()); err != nil {
-		t.Skipf("real writable cgroup-v2 delegation unavailable: %v", err)
+		skipOrFailRealCgroup(t, "real writable cgroup-v2 delegation unavailable: %v", err)
 	}
 	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("python3 is unavailable for the OOM fixture")
+		skipOrFailRealCgroup(t, "python3 is unavailable for the OOM fixture")
 	}
 	record, err := r.Launch(context.Background(), Request{Argv: []string{"python3", "-c", "x=bytearray(64*1024*1024); x[0]=1"}})
 	if err != nil {
@@ -57,10 +57,10 @@ func TestRealCgroupPeakRSSUsageIsPositive(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := r.Probe(context.Background()); err != nil {
-		t.Skipf("real writable cgroup-v2 delegation unavailable: %v", err)
+		skipOrFailRealCgroup(t, "real writable cgroup-v2 delegation unavailable: %v", err)
 	}
 	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("python3 is unavailable for the memory fixture")
+		skipOrFailRealCgroup(t, "python3 is unavailable for the memory fixture")
 	}
 	record, err := r.Launch(context.Background(), Request{Argv: []string{"python3", "-c", "x=bytearray(8*1024*1024); x[-1]=1"}})
 	if err != nil {
@@ -74,6 +74,9 @@ func TestRealCgroupPeakRSSUsageIsPositive(t *testing.T) {
 func TestRealCgroupRunKillSnapshotsUsageWithoutOOMMisclassification(t *testing.T) {
 	r := realRunner(t)
 	outcome := launchAsync(t, r, Request{Argv: []string{"/bin/sh", "-c", "while :; do :; done"}})
+	// Give the child enough time to accrue measurable user time before the
+	// cgroup.kill/removal path is exercised.
+	time.Sleep(20 * time.Millisecond)
 	_, killErr := r.Kill(context.Background(), "RUN-1")
 	if killErr != nil && !strings.Contains(killErr.Error(), "U_RUN_RECONCILE_REQUIRED") {
 		t.Fatal(killErr)
@@ -89,11 +92,10 @@ func TestRealCgroupRunKillSnapshotsUsageWithoutOOMMisclassification(t *testing.T
 	if record.Status != StatusKilled || record.Status == StatusOOMKilled {
 		t.Fatalf("run-kill status=%+v", record)
 	}
-	// Unsupported memory.peak or an individual read failure is explicitly
-	// allowed to leave usage nil; when CPU accounting is available it must be
-	// retained across the kill-before-remove path.
-	if record.CPUUser != nil && *record.CPUUser < 0 {
-		t.Fatalf("invalid retained CPU usage=%+v", record)
+	// cpu.stat is a core cgroup-v2 file. A nil/zero value means the usage
+	// snapshot was lost before or during the kill terminal CAS.
+	if record.CPUUser == nil || *record.CPUUser <= 0 {
+		t.Fatalf("run-kill lost positive CPU usage: %+v", record)
 	}
 }
 
@@ -105,14 +107,6 @@ func TestRealCgroupUsageRetainedAcrossTerminalRaces(t *testing.T) {
 	}{
 		{name: "normal", req: Request{Argv: []string{"/bin/sh", "-c", "i=0; while [ $i -lt 3000000 ]; do i=$((i+1)); done"}}},
 		{name: "timeout", req: Request{Argv: []string{"/bin/sh", "-c", "while :; do :; done"}, Timeout: 50 * time.Millisecond}},
-		{name: "reconcile", req: Request{Argv: []string{"/bin/sh", "-c", "i=0; while [ $i -lt 3000000 ]; do i=$((i+1)); done"}}, act: func(t *testing.T, r *Runner) {
-			for i := 0; i < 20; i++ {
-				if _, err := r.Reconcile(context.Background()); err != nil && !errors.Is(err, context.Canceled) {
-					t.Fatal(err)
-				}
-				time.Sleep(time.Millisecond)
-			}
-		}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -140,6 +134,67 @@ func TestRealCgroupUsageRetainedAcrossTerminalRaces(t *testing.T) {
 	}
 }
 
+func TestRealCgroupReconcileOrphanTerminalizationRetainsUsage(t *testing.T) {
+	r := realRunner(t)
+	scope, err := r.backend.Create(context.Background(), "RUN-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	marker := filepath.Join(t.TempDir(), "release")
+	cmd := exec.Command("/bin/sh", "-c", `
+while [ ! -f "$1" ]; do
+  i=$((i+1))
+done
+i=0
+while [ $i -lt 10000000 ]; do
+  i=$((i+1))
+done
+`, "sh", marker)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	if err := os.WriteFile(filepath.Join(scope.Reference(), "cgroup.procs"), []byte(strconv.Itoa(pid)), 0o644); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(marker, []byte("release"), 0o644); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reconcile needs a genuinely orphaned, empty scope: no live process, no
+	// wait-observed event, and no terminal event. This drives the exact
+	// reconcile terminalization branch rather than the live-scope preserve path.
+	run := RunRecord{
+		SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusRunning,
+		ScopeIntegrity: ScopeContained, CgroupScope: scope.Reference(),
+	}
+	appendRunEvent(t, r, "starting", run)
+	appendRunEvent(t, r, "scope-created", run)
+	appendRunEvent(t, r, "running", run)
+
+	if _, err := r.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	record, err := r.Get("RUN-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != StatusLost {
+		t.Fatalf("reconcile did not terminalize orphan as lost: %+v", record)
+	}
+	if record.CPUUser == nil || *record.CPUUser <= 0 {
+		t.Fatalf("reconcile orphan lost positive CPU usage: %+v", record)
+	}
+}
+
 // writableMemoryParent creates a memory-controller-enabled parent cgroup so a
 // child run gets memory.peak/memory.events. memMax is the memory.max value
 // ("max" = unbounded, just enables the controller for peak measurement; a low
@@ -149,11 +204,11 @@ func writableMemoryParent(t *testing.T, memMax string) string {
 	t.Helper()
 	mount, err := unifiedMount()
 	if err != nil {
-		t.Skipf("cgroup-v2 unavailable: %v", err)
+		skipOrFailRealCgroup(t, "cgroup-v2 unavailable: %v", err)
 	}
 	current, err := currentCgroupPath(mount)
 	if err != nil {
-		t.Skipf("current cgroup unavailable: %v", err)
+		skipOrFailRealCgroup(t, "current cgroup unavailable: %v", err)
 	}
 	// The test process lives in `current`, so cgroup-v2's no-internal-process rule
 	// forbids enabling +memory in current's OWN subtree_control. Create the parent
@@ -164,22 +219,21 @@ func writableMemoryParent(t *testing.T, memMax string) string {
 	name := ".aira-m16-" + strings.NewReplacer("/", "_", " ", "_").Replace(t.Name())
 	parent := filepath.Join(host, name)
 	if err := os.Mkdir(parent, 0o755); err != nil {
-		t.Skipf("cannot create memory parent under %s: %v", host, err)
+		skipOrFailRealCgroup(t, "cannot create memory parent under %s: %v", host, err)
 	}
 	t.Cleanup(func() {
 		_ = os.WriteFile(filepath.Join(parent, "cgroup.kill"), []byte("1"), 0o644)
 		_ = os.Remove(parent)
 	})
 	if err := os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"), []byte("+memory"), 0o644); err != nil {
-		t.Skipf("memory controller not available under %s: %v", host, err)
+		skipOrFailRealCgroup(t, "memory controller not available under %s: %v", host, err)
 	}
 	// Disable swap so a constrained child that exceeds memory.max is OOM-killed
-	// rather than silently swapping (WSL2 has swap). Best-effort: harmless for the
-	// unbounded ("max") peak case, and if the swap controller is unavailable the
-	// constrained OOM test skips below on a non-OOM outcome.
+	// rather than silently swapping (WSL2 has swap). Best-effort and harmless for
+	// the unbounded ("max") peak case.
 	_ = os.WriteFile(filepath.Join(parent, "memory.swap.max"), []byte("0"), 0o644)
 	if err := os.WriteFile(filepath.Join(parent, "memory.max"), []byte(memMax), 0o644); err != nil {
-		t.Skipf("memory.max is not writable: %v", err)
+		skipOrFailRealCgroup(t, "memory.max is not writable: %v", err)
 	}
 	return parent
 }
