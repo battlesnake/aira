@@ -5,8 +5,8 @@
   §20/§21 (phasing).
 - **Depends on:** M12 runner-lite (launch + file-direct capture + `run-log`), unchanged
   capture/digest semantics.
-- **Review:** Sol plan-review r1 → REVISE (2×P0 lifecycle+race, 4×P1); this is **v2** with the
-  resolutions incorporated (§8 tracks each).
+- **Review:** Sol plan-review r1 → REVISE (2×P0 lifecycle+race, 4×P1), r2 → REVISE (2×P0
+  final-sentinel-loss + I3 over-claim, 2×P1/P2); this is **v3** (§8 tracks each round).
 
 ## 0. Context — the gap
 
@@ -50,17 +50,21 @@ default of a foreground human run; `--detach` (deferred) is the opt-out.
 - **I2 — capture bytes + digest unchanged vs. no-tee.** Same argv with `LiveStdout==nil` and
   with any live sink produce byte-identical capture files and identical `OutputRef.Digest`. The
   elision marker never enters the capture path.
-- **I3 — live accountability (not zero-loss).** Live bytes written to a sink are an **in-order
-  subsequence** of the child's bytes, and `Σ(live bytes) + Σ(marker elided counts) == total
-  captured bytes`. This holds deterministically under any scheduling. **Zero elision is only
-  asserted under a lock-step sink** that accepts each chunk before the next is produced (a
-  bounded non-blocking queue may legitimately elide during a producer burst even when the sink
-  is ultimately fast — so "fast sink ⇒ no marker" is *not* an invariant).
-- **I4 — no post-return live writes on the normal path.** When all drains reach EOF within the
-  capture grace, `Launch` joins every live-writer goroutine before returning; therefore no child
-  byte lands on the caller's sink after the run summary. On the **forced-close path** (§3.3,
-  grace expired — already `CaptureForcedClosed`) at most **one in-flight chunk** may still reach
-  the caller after return; this is bounded, confined to that abnormal condition, and documented.
+- **I3 — live accountability on normal writable completion (not zero-loss, scoped).** *When the
+  run completes normally and the live sink stayed writable*, live bytes written are an **in-order
+  subsequence** of the child's bytes and `Σ(live bytes) + Σ(marker elided counts) == total
+  captured bytes`. **Zero elision is only asserted under a lock-step sink** (a bounded
+  non-blocking queue may legitimately elide during a producer burst even when the sink is
+  ultimately fast — "fast sink ⇒ no marker" is *not* an invariant). **On forced-close (§3.2) or a
+  live-sink write error, the live stream is explicitly `live-truncated` / unaccountable** — it
+  ends (best-effort) with a `[aira: live view ended — output complete via run-log]` terminal
+  marker and the byte equation is *not* claimed. The capture file's completeness + digest (I1/I2)
+  hold on **all** paths regardless.
+- **I4 — post-return live writes are bounded.** When the normal-path join **completes**, no child
+  byte lands on the caller's sink after the run summary. When the join is **cut short by `ctx`
+  cancellation**, or on the **forced-close path** (grace expired — already `CaptureForcedClosed`),
+  `Launch` disables the per-stream live gate (§3.3) before returning; at most **one in-flight
+  chunk per stream** may still reach the caller. Bounded, confined to those conditions, documented.
 - **I5 — race-free accounting.** All elision accounting is producer-local; the writer only reads
   fields off received values. `go test -race` on the runner package is clean.
 - **I6 — merge fidelity.** A `--merge` run tees the single kernel-ordered merged stream to
@@ -83,15 +87,20 @@ after the successful capture write, hand the live path a value on a **bounded ch
   int64`. Send is `select { case ch <- liveChunk{cp, pendingDropped}: pendingDropped = 0;
   default: pendingDropped += int64(n) }`. The capture loop **never** blocks on the live path,
   and only the producer touches `pendingDropped` (no shared counter → I5).
-- **Trailing drop** — after the read loop ends, if `pendingDropped > 0` the drain sends a final
-  `liveChunk{nil, pendingDropped}` (best-effort, non-blocking is fine since the writer is
-  draining) then `close(ch)`.
-- **Writer** — for each received `liveChunk`: if `droppedBefore > 0`, `writeAll(live, marker(
-  droppedBefore))`; if `len(data) > 0`, `writeAll(live, data)`. **`writeAll`** (handles legal
-  short writes with nil error — P1). On a live write **error** (e.g. `EPIPE`) or after the gate
-  is disabled (§3.3), set a local `off` flag and stop writing, but **keep draining the channel**
-  so the producer's non-blocking send path never wedges. Marker text is the fixed greppable
-  string above.
+- **Trailing drop (BLOCKING final sentinel — Sol r2 P0).** The read loop ends → drain finishes the
+  capture (`dst.Sync/Close`) → **sends `captureResult` first** (capture is accounted; nothing below
+  can delay it). *Then*, if `pendingDropped > 0`, it does a **blocking** `ch <- liveChunk{nil,
+  pendingDropped}` and finally `close(ch)`. The blocking send cannot stall capture or the child
+  (both already done) and cannot deadlock because the writer **keeps ranging the channel until
+  close even after gate-off / write-error** (load-bearing rule below). A non-blocking final send
+  would silently lose the last count when the queue is full → I3 violation; hence blocking.
+- **Writer** — ranges the channel **to close**. For each `liveChunk`: if `droppedBefore > 0`,
+  `writeAll(live, marker(droppedBefore))`; if `len(data) > 0`, `writeAll(live, data)` — via
+  **`writeAll`** (handles legal short writes with nil error — r1 P1). On a live write **error**
+  (e.g. `EPIPE`) or once the gate is disabled (§3.3), set a local `off` flag, emit the
+  `live-truncated` terminal marker best-effort, and **stop writing but keep draining the channel
+  to close** (so the producer's blocking final send and non-blocking sends never wedge). Marker
+  text is the fixed greppable string above.
 - **Ordering** — capture-write precedes live-send for the same chunk, the channel is FIFO, and a
   single writer serialises the sink; so the live view is a monotonic in-order subsequence with
   each gap's marker emitted immediately before the next surviving chunk (I3).
@@ -101,11 +110,13 @@ after the successful capture write, hand the live path a value on a **bounded ch
 `Launch` already spawns the drains (`:241`) and barriers on `collectCapture` (`:316`).
 
 - **Normal path** (`collectCapture` returns `forced == false`, i.e. every drain EOF'd and closed
-  its live channel): `Launch` **joins all live-writer goroutines** (a `sync.WaitGroup`) before
-  returning. Guarantees I4 (no post-return writes). The join can block only if the caller's own
-  sink is wedged — this is correct foreground backpressure (identical to `foo | tee f` when the
-  reader stops) and is releasable / interruptible by `ctx` cancellation (timeout, Ctrl-C), which
-  is teardown.
+  its live channel): `Launch` joins all live-writer goroutines but **bounded by `ctx`** —
+  `select { case <-writersDone: case <-ctx.Done(): disable all gates; mark live-abandonment }`
+  (Sol r2 P1: a bare `WaitGroup.Wait()` on an arbitrary wedged `io.Writer` is *not* interruptible).
+  If the join completes, I4's zero-post-return-write guarantee holds. If `ctx` cancels first
+  (timeout, Ctrl-C — teardown), the gates are disabled (≤1 in-flight chunk per stream) and the run
+  is classified live-abandoned. The join blocks *only* while the caller's own sink is wedged —
+  correct foreground backpressure (identical to `foo | tee f` when the reader stops).
 - **Forced-close path** (`forced == true`, grace expired because a descendant holds a pipe open
   so a drain cannot EOF — pre-existing M12 leak): `Launch` does **not** block on the live writers.
   Before returning it **disables the live gate** (an atomic flag on the sink wrapper) so all
@@ -115,12 +126,16 @@ after the successful capture write, hand the live path a value on a **bounded ch
 
 ### 3.3 Live-sink gate (bounds the forced-close residual)
 
-Each live sink is wrapped in a tiny runner-owned `liveGate{ w io.Writer; off atomic.Bool }`.
-The writer goroutine calls `gate.write(p)` = `if gate.off.Load() { return }` then `writeAll(w,
-p)`. `Launch`'s forced-close path calls `gate.disable()` (sets `off`) on each gate. This never
-blocks (no mutex around the in-flight write — a mutex would re-introduce the wedged-sink hang);
-the bound is "≤1 in-flight chunk after disable", which is the honest, achievable guarantee for
-an arbitrary `io.Writer`.
+Each stream has its **own** runner-owned `liveGate{ w io.Writer; off atomic.Bool }` (never a
+shared/aliased gate — Sol r2 P2). The writer calls `gate.write(p)` = `if gate.off.Load() {
+return }` then `writeAll(w, p)`. `Launch` (forced-close path, or ctx-cancel during the join)
+calls `gate.disable()` (sets `off`) on each gate. This never blocks (no mutex around the
+in-flight write — a mutex would re-introduce the wedged-sink hang); because one writer serialises
+its own gate, the next `gate.write` after `disable()` sees `off` and returns, so the bound is
+**≤1 in-flight `writeAll` (one logical chunk, ≤32 KiB) per stream**. The CLI passes **distinct**
+writers per stream (`os.Stdout`/`os.Stderr`); merged uses a single sink. If a caller aliases the
+*same* sink to both streams in separate mode, live ordering/interleaving is unspecified (capture
+is unaffected); AIRA's own faces never do this.
 
 ### 3.4 Request / face wiring (immutable at construction — P1)
 
@@ -150,11 +165,13 @@ on the durable record.
 
 Runner-level (`internal/runner`, no hardware dependence — sink fakes: `lockStepSink`,
 `blockingSink` (releasable), `shortWriteSink`, `errorSink`, `bytes.Buffer`):
-- **T1 (I1 discriminator)** — `blockingSink` as `LiveStdout`; child writes ≫ `liveQueueDepth`×chunk
-  then touches a `DONE` file and exits 0. Run `Launch` in a goroutine; assert `DONE` appears within
-  a short timeout **and** the capture file at the known path is byte-complete *while the sink is
-  still blocked*; then release the sink, join, assert `exited`/0 and digest == hash(expected).
-  *Fails against `MultiWriter`.*
+- **T1 (I1 discriminator, synchronised — Sol r2 P1)** — `blockingSink` as `LiveStdout`; child does
+  **direct unbuffered** writes ≫ pipe buffer + `liveQueueDepth`×chunk (so `MultiWriter` would
+  deadlock the child), then touches a `DONE` file and exits 0. Run `Launch` in a goroutine; **poll
+  the capture file at the known path until its size == expected N** (with a bounded timeout) *while
+  the sink is still blocked* — do **not** treat `DONE` alone as proof the drain finished the file.
+  Then release the sink, join, assert `exited`/0 and digest == hash(expected). *Under `MultiWriter`
+  the file never reaches N (child blocked) → poll times out → fails.*
 - **T2 (I2)** — argv run A `LiveStdout=nil`, run B `bytes.Buffer`; capture files byte-equal +
   digests equal.
 - **T3 (I3 accountability)** — ~1 MiB mixed binary through (a) a `lockStepSink` → assert **zero**
@@ -163,6 +180,10 @@ Runner-level (`internal/runner`, no hardware dependence — sink fakes: `lockSte
 - **T4 (elision + marker placement)** — forced overflow via a gated slow sink; assert ≥1 marker with
   a non-zero count, drop/accept/drop sequence places each marker immediately before the right
   surviving chunk, and the capture file is complete (marker only on the live path).
+- **T4b (trailing-drop not lost — Sol r2 P0)** — a sink that stays blocked until *after* the child
+  exits, with drops ending while the queue is full; release the sink, join, and assert the final
+  marker's elided count is present so `received + Σelided == captured` (the blocking final sentinel
+  did not fall through). *Fails if the final sentinel send is non-blocking.*
 - **T5 (I6 merge)** — `--merge`: merged sink gets the merged stream; a stderr sink gets nothing.
 - **T6 (short write + error)** — `shortWriteSink` delivers all bytes (writeAll); `errorSink`
   (returns EPIPE mid-run) does not stall the child and the capture stays complete.
@@ -211,7 +232,22 @@ live; `--json` clean; a real slow-consumer harness confirms I1 on the built bina
 (later); genuine cross-process `run-log --follow` (rides the supervisor); deadline-bounded
 live-writer abandon (I4 hardening, candidate M18).
 
-## 8. Sol plan-review r1 resolutions
+## 8. Sol plan-review resolutions
+
+### r2
+- **P0 trailing-sentinel loss** → §3.1: the final `pendingDropped` sentinel is a **blocking** send
+  ordered *after* `captureResult`, relying on the writer's "keep draining to close" rule; T4b.
+- **P0 I3 over-claim (forced-close / EPIPE discard)** → I3 rescoped to *normal writable
+  completion*; forced-close/error end the live stream as explicit `live-truncated`/unaccountable
+  (I1/I2 still hold on all paths).
+- **P1 join not ctx-interruptible** → §3.2 `select { writersDone / ctx.Done() }`, gates disabled +
+  live-abandonment on cancel (folded into I4).
+- **P1 T1 synchronisation** → T1 polls the capture-file *size* while the sink is blocked; direct
+  unbuffered child writes exceeding the pipe buffer.
+- **P2 aliased-sink / gate bound** → §3.3 per-stream gates, distinct writers per stream, aliasing
+  caveat; bound stated as ≤1 in-flight `writeAll` per stream.
+
+### r1 resolutions
 
 - **P0 lifecycle** → §3.2/§3.3: normal path joins unconditionally (I4, zero post-return writes);
   forced-close disables a non-blocking gate (≤1 in-flight chunk). No lingering-goroutine "accepted
