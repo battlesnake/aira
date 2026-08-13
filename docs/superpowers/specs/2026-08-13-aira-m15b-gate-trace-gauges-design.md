@@ -1,6 +1,6 @@
 # M15b — gate + traceability insight gauges (`ratchet-status`, `traceability-status`)
 
-Status: PLAN v2 (incorporates Sol plan-review round 1: P0 + 3×P1). Awaiting Sol re-review → gate → build.
+Status: PLAN v3 (incorporates Sol plan-review r1 P0+3×P1 and r2 4×P1). Awaiting Sol re-review → gate → build.
 Milestone: Phase 4, follows M15 (insights framework). Branch `codex-aira-m15b` off master `ccb7325`.
 Depends on: M15 (gauge framework), M13b (ratchet gate), M9c (covers/verifies traceability).
 
@@ -69,24 +69,32 @@ return `GaugeResult{Value, Breakdown, Unevaluated, UnevaluatedReason, Universe, 
 - **Evaluate each** with `s.evaluateRatchet(ctx, def, s.root)` — the **same root `RunGate` uses**
   (`s.root`, populated by `store.Open`/app wiring, Sol-confirmed) — yielding `(eval
   DimensionEvaluation, err error)`.
-- **Classify (R6, closed set + error paths).** Follow `RunGate`'s tolerate-if-unevaluated
-  pattern: an `err` is tolerated when `eval.Predicate == Unevaluated` (use `eval.Code`); otherwise
-  classify by the **stable code** of `err` (`ErrorCode(err)`). Classification is over the union of
-  `eval.Code` and any returned error code:
+- **Classify (R6, closed set + explicit precedence).** The precedence is grounded in
+  `evaluateRatchet`'s actual returns (gate_ratchet.go:111-203): **it sets `eval.Predicate` on every
+  path EXCEPT line 128** (a `ResolveGateBaseline` error that is not `U_GATE_BASELINE_MISSING` — i.e.
+  `E_JOURNAL_CORRUPT`/audit-IO — returns a bare error with empty `Predicate`). The report-load error
+  (line 137) and unknown-comparator (line 199) both **set** `Predicate` (masking the underlying error
+  into `U_GATE_INCOMPARABLE`/`E_GATE_INVALID`, exactly as `RunGate` tolerates them). So:
+  > **Rule:** classify by `eval.Code` whenever `eval.Predicate != ""` (Pass/Fail/Unevaluated are all
+  > usable). ONLY when `eval.Predicate == ""` AND `err != nil` classify by `ErrorCode(err)`.
+
   | bucket | condition |
   |---|---|
-  | `pass` | `eval.Predicate == Pass`, no error |
-  | `regressed` | `E_GATE_RATCHET_REGRESSED` |
-  | `baseline_missing` | `U_GATE_BASELINE_MISSING` |
-  | `incomparable` | `U_GATE_INCOMPARABLE` |
-  | `proof_stale` | `U_GATE_PROOF_STALE` |
-  | `evidence_unavailable` | `U_GATE_EVIDENCE_UNAVAILABLE` |
-  | `invalid` | `E_GATE_INVALID`, `E_GATE_BASELINE_INVALID` |
-  | `corrupt` | `E_JOURNAL_CORRUPT` (from read-only audit verification, gate_audit.go:355-366 via ResolveGateBaseline) |
-  | `unclassified` | ANY other code (returned error OR eval code) — **carries the raw stable code**, never `pass` |
+  | `pass` | `eval.Predicate == Pass` |
+  | `regressed` | `eval.Predicate == Fail` (Code `E_GATE_RATCHET_REGRESSED`, gate_ratchet.go:83/106) |
+  | `baseline_missing` | `eval.Code == U_GATE_BASELINE_MISSING` |
+  | `incomparable` | `eval.Code == U_GATE_INCOMPARABLE` (also masks a report-load `E_INTERNAL`, line 137 — deliberate, matches `gate run`) |
+  | `proof_stale` | `eval.Code == U_GATE_PROOF_STALE` |
+  | `evidence_unavailable` | `eval.Code == U_GATE_EVIDENCE_UNAVAILABLE` |
+  | `invalid` | `eval.Code == E_GATE_INVALID` |
+  | `corrupt` | bare error (`Predicate==""`), `ErrorCode(err) == E_JOURNAL_CORRUPT` |
+  | `unclassified` | any other `eval.Code`, OR bare-error `ErrorCode(err)` not above (incl. `E_INTERNAL` from a non-prefixed audit/IO error) — **carries the raw stable code**, never `pass` |
+  - `E_GATE_BASELINE_INVALID` is NOT reachable from `evaluateRatchet`/`ResolveGateBaseline` (baseline
+    decode errors wrap to `U_GATE_BASELINE_MISSING`, gate_ratchet.go:434-440; it is emitted only by
+    baseline pin/derivation, :297-390). It is intentionally omitted from the closed set; if it ever
+    surfaces it lands in `unclassified` carrying its code (defensive, documented-unreachable-today).
   - One gate's error/corrupt status NEVER aborts the gauge and NEVER fails/passes the other gates —
-    it is that gate's own cell bucket. A returned error with an empty/unusable eval → classify by
-    `ErrorCode(err)` into `corrupt`/`invalid`/`unclassified` as above.
+    it is that gate's own cell bucket.
 - **Value** = distribution `map[bucket]int` over the ratchet gates. **Breakdown** = per-gate
   `GaugeCell` keyed by gate ID: `{Value: bucket, Fields: {code, tracked_worktree_digest,
   baseline_seq?}}`. A per-gate unevaluated STATUS is a **real bucket**, not gauge-level unevaluated.
@@ -107,29 +115,48 @@ return `GaugeResult{Value, Breakdown, Unevaluated, UnevaluatedReason, Universe, 
 
 ### 2.2 `traceability-status`
 
-- **Match `aira check`.** `checkTraceability` (traceability.go:244-289) discovers and scans ALL
-  registered/discovered worktrees; `EvaluateDimension(root)` scans only one root — so a single-root
-  helper could NOT reproduce `check` (Sol P1). The gauge therefore uses the **same multi-worktree
-  computation** `aira check` uses, via a shared seam:
-  - Extract `func (s *Store) traceabilityReport() (*CheckReport, error)` (or equivalent) — the
-    multi-worktree scan+resolve core that `checkTraceability` currently performs inline — and have
-    BOTH `checkTraceability` (writing into the caller's report) and the gauge call it. The gauge
-    runs it into its own throwaway `*CheckReport` and derives the distribution from that report's
-    **stable-coded** findings + the requirement universe. Reading stable codes (`W_TRACE_UNCOVERED`,
-    `W_TRACE_UNVERIFIED`, `E_TRACE_DANGLING`, `U_TRACE_*`) is acceptable because those are AIRA's
-    contract AND the identical scan guarantees parity with `check` by construction. (A pure
-    per-requirement `traceabilityStatuses()` returning statuses directly is an acceptable
-    alternative if the builder finds it cleaner and keeps the shared-code / no-drift property.)
-- **Per-requirement buckets (R6, closed set), faithful to traceability.go's real classification:**
-  | bucket | source condition |
+- **Match `aira check` via a PURE STATUS SEAM (mandatory — Sol P1c/P1d).** `checkTraceability`
+  (traceability.go:244-337) scans ALL discovered worktrees; `EvaluateDimension(root)` scans one, so
+  single-root can't reproduce `check`. AND a findings-only derivation is **not faithful**: no finding
+  carries a requirement's lifecycle status, so `not_built` needs `traceRequirement.status` directly
+  (traceability.go:364), and a covered non-built requirement (which emits no warning) would be
+  indistinguishable from `covered_verified`. Therefore extract a **pure scan-core** shared by BOTH
+  `checkTraceability` and the gauge — no findings round-trip:
+  ```
+  type traceScan struct {
+      requirements map[string]traceRequirement // id -> {status, path}  (valid nodes)
+      malformed    map[string]string           // id -> subject         (E_REQUIREMENT_INVALID nodes)
+      covers       map[string]bool             // id -> covered
+      verifies     map[string]bool             // id -> verified
+      dangling     []string                    // annotation subjects → absent requirement
+      unevaluated  *traceUnevaluated           // set ONLY for a genuine scan failure (see below)
+  }
+  func (s *Store) scanTraceabilityGraph() (traceScan, error)
+  ```
+  It runs the identical registry-read + `discoverWorktrees` + `captureTraceSnapshot` +
+  `parseTraceabilitySnapshot` + covers/verifies edge-folding that `checkTraceability`/
+  `resolveTraceabilityEdges` do today. `checkTraceability` is refactored to CALL it and translate to
+  its existing findings (M9c behaviour byte-for-byte preserved — guarded by the existing traceability
+  tests + the drift test). The gauge derives its distribution from `traceScan` directly.
+- **`unevaluated` signal (gauge-level) is set ONLY for a genuine scan failure:** registry unreadable
+  (traceability.go:246), `discoverWorktrees` error (:268), snapshot tore (:285), parse error (:297),
+  or empty requirement registry (U_TRACE_EMPTY, :327/331). It is **NOT** set for the
+  "all-discovered-nodes-malformed" case (:334 — enumeration succeeded), which the gauge represents as
+  per-item `unevaluated` buckets (R11).
+- **Per-requirement buckets (R6, closed set), derived from `(status, covers, verifies)` exactly as
+  traceability.go:362-377 classifies:**
+  | bucket | condition |
   |---|---|
-  | `covered_verified` | built requirement with a `covers:` AND a `verifies:` (no W_TRACE_* for it) |
-  | `unverified` | `W_TRACE_UNVERIFIED` (traceability.go:370): built, covered, not verified |
-  | `uncovered` | `W_TRACE_UNCOVERED` (traceability.go:367/374): built/partial, not covered |
-  | `not_built` | requirement not in a *built* status (no coverage expectation) — match the real status gate |
-  | `unevaluated` | requirement node malformed (`E_REQUIREMENT_INVALID`, traceability.go:313) or its edges `U_TRACE_*` — real per-item bucket |
-- **`dangling` count** (top-level `Value`/`Fields` field, not a per-requirement bucket):
-  `E_TRACE_DANGLING` (traceability.go:349) annotations pointing at an absent requirement.
+  | `covered_verified` | `status==Built` && covers && verifies |
+  | `unverified` | `status==Built` && covers && !verifies (`W_TRACE_UNVERIFIED`) |
+  | `uncovered` | (`status==Built` or `Partial`) && !covers (`W_TRACE_UNCOVERED`) |
+  | `partial_covered` | `status==Partial` && covers (satisfied; Partial has no verify expectation) |
+  | `not_built` | `status ∉ {Built, Partial}` (no coverage expectation) — from `traceRequirement.status` |
+  | `unevaluated` | node in `malformed` (per-item; enumeration succeeded but the file is unreadable) |
+  A `Built` requirement that is both uncovered and unverified buckets as `uncovered` (the headline —
+  no coverage at all); this is stated so the mapping is deterministic and exhaustive.
+- **`dangling` count** (top-level `Fields` field, not a per-requirement bucket): `len(traceScan.
+  dangling)` — annotations pointing at an absent requirement (`E_TRACE_DANGLING`, traceability.go:349).
 - **Value** = distribution `map[bucket]int` (+ `dangling` count in `Fields`); **Breakdown** =
   per-requirement `GaugeCell` keyed by requirement ID (`{Value: bucket}`).
 - **Universe:** `Count` = number of requirements across the scanned worktrees; `Scope = "project"`
@@ -138,10 +165,12 @@ return `GaugeResult{Value, Breakdown, Unevaluated, UnevaluatedReason, Universe, 
 - **Watermark honesty (R4):** traceability has **NO monotone watermark** (a live snapshot). `as_of`
   carries ONLY the wall-clock scan marker `insightScanID()` (+ optional tracked digests) and
   **fabricates no sequence**. No cross-call monotonicity claimed.
-- **Unevaluated (R2/R3):** empty requirement registry (`U_TRACE_EMPTY`, gate_eval.go:120 /
-  traceability.go:327) ⇒ gauge `Unevaluated`, reason `"no requirements"`. Torn snapshot / unreadable
-  registry (`U_TRACE_UNSCANNED`) ⇒ gauge `Unevaluated`, reason cites the tear — **never** a
-  partial/fake distribution.
+- **Unevaluated (R2/R3/R11):** gauge-level `Unevaluated` iff `traceScan.unevaluated` is set (genuine
+  scan failure or empty registry, per the signal bullet above) — reason cites the specific cause;
+  never a partial/fake distribution. The **all-nodes-malformed** case (requirements empty, malformed
+  non-empty) is NOT gauge-unevaluated — it is an evaluated gauge whose distribution is entirely
+  per-item `unevaluated` buckets (universe = malformed count), so N malformed requirements are
+  surfaced, not hidden (R11).
 - **Read-only:** pure scan; writes nothing.
 
 ### 2.3 Drilldown reproduces the value (R-drill)
@@ -173,23 +202,37 @@ Each gauge carries a `GaugeDrilldown{Verb, Query}` pointer for auditability:
 - **R2 (empty universe → gauge-unevaluated, not fake 0).** Zero ratchet gates / empty requirement
   registry ⇒ gauge-level `Unevaluated`. Per-item unevaluated statuses are real buckets inside an
   evaluated gauge. (Consistent with existing gauges, insights.go:257-259/373-375.)
-- **R3 (torn scan → unevaluated).** `U_TRACE_UNSCANNED` ⇒ gauge `Unevaluated` citing the tear.
+- **R3 (genuine scan failure → gauge-unevaluated).** Gauge-level `Unevaluated` iff the traceability
+  scan-core sets its `unevaluated` signal (registry unreadable / `discoverWorktrees` error / snapshot
+  tore / parse error / empty registry). Distinct from per-node malformed (R11).
 - **R4 (watermark honesty).** ratchet-status: monotone gate-audit `Seq` + `test_report_at_seq`.
   traceability-status: wall-clock scan marker only; no fabricated sequence.
 - **R5 (scope — REVISED per Sol P1).** ratchet-status = `project`; traceability-status = `project`
   (multi-worktree, matching `aira check`) — NOT current-worktree as v1 had it.
-- **R6 (exhaustive closed classification, incl. error paths — EXPANDED per Sol P1).** Every code the
-  evaluators can emit — including `evaluateRatchet`'s **returned error** codes (`E_JOURNAL_CORRUPT`
-  from read-only audit verification; report-loading errors returned alongside `U_GATE_INCOMPARABLE`,
-  gate_ratchet.go:135-138) — maps to exactly one named bucket; unrecognised codes → `unclassified`
-  carrying the raw code. Never silently dropped, never miscounted as `pass`, never aborts the gauge.
+- **R6 (exhaustive closed classification with explicit precedence — per Sol P1a/P1b).** Precedence
+  (grounded in gate_ratchet.go:111-203): classify by `eval.Code` whenever `eval.Predicate != ""`;
+  only the single bare-error path (line 128, empty Predicate) uses `ErrorCode(err)`. The report-load
+  `E_INTERNAL` (line 137) and unknown-comparator `E_GATE_INVALID` (line 199) are masked into
+  `U_GATE_INCOMPARABLE`/`E_GATE_INVALID` by the evaluator (Predicate set) — so they bucket as
+  `incomparable`/`invalid`, matching `gate run`. The bare-error path buckets `E_JOURNAL_CORRUPT`→
+  `corrupt`, else (incl. non-prefixed → `E_INTERNAL`)→`unclassified` carrying the raw code.
+  `E_GATE_BASELINE_INVALID` is documented-unreachable (omitted from the closed set; falls to
+  `unclassified` if it ever appears). Never silently dropped, never `pass`, never aborts the gauge.
 - **R7 (live vs stored).** ratchet-status live-evaluates (`evaluateRatchet`), NOT the stored gate
   projection. Documented; `gate check` is the separate stored+reconciled view.
 - **R8 (only pure evaluators are gauge-safe).** command/dimension gate-status excluded (D1).
-- **R9 (no traceability drift — STRENGTHENED per Sol P1).** The gauge calls the SAME multi-worktree
-  scan+resolve seam as `checkTraceability`; a drift test asserts the gauge's per-requirement statuses
-  are consistent with `aira check`'s traceability findings for the same fixture, **including a
-  sibling-worktree fixture** (so the multi-worktree universe is exercised, not just single-root).
+- **R9 (no traceability drift — via a PURE STATUS SEAM, per Sol P1c).** The gauge and
+  `checkTraceability` share the pure `scanTraceabilityGraph()` scan-core (requirements+status /
+  malformed / covers / verifies / dangling / unevaluated-signal) — NOT a findings round-trip (which
+  cannot reconstruct `not_built` from `status`). `checkTraceability` keeps its exact M9c findings
+  (regression-guarded). A drift test asserts the gauge's per-requirement buckets are consistent with
+  `aira check`'s traceability outcome for the same fixture, **including a sibling-worktree fixture**.
+- **R11 (malformed-node ≠ scan-tear — per Sol P1d).** A node that enumerated but failed to parse
+  (`E_REQUIREMENT_INVALID`) is a **per-item `unevaluated` bucket** (the requirement is known to exist,
+  unreadable); the gauge stays evaluated (universe counts it). Only a genuine scan failure (R3) makes
+  the gauge unevaluated. The existing all-nodes-malformed `U_TRACE_UNSCANNED` finding (traceability.go:
+  334) is a `check`-side diagnostic; the gauge represents that same state as an all-`unevaluated`
+  distribution over the malformed nodes, never as gauge-level unevaluated.
 - **R10 (digest naming — per Sol P1).** `digestEvaluationRoot` hashes the **tracked working-tree**
   contents of `git ls-files --cached` paths (gate_eval.go:63-78), NOT the committed HEAD tree. The
   `as_of` key is named `tracked_worktree_digest` and described accurately.
@@ -208,17 +251,24 @@ TDD. Regression-shaped where a naive impl would pass; property-shaped for invari
 4. **`ratchet-status` READ-ONLY (load-bearing, R1):** fresh project, **no gate operation performed**;
    compute gauge; assert `hmac.key` and the audit ledger do NOT exist under the common-dir gates dir,
    SQLite unchanged.
-5. **`ratchet-status` error-path (R6, discriminating):** induce a gate whose `ResolveGateBaseline`
-   verification yields `E_JOURNAL_CORRUPT` (corrupt a baseline record's digest) → that gate's cell =
-   `corrupt` carrying `E_JOURNAL_CORRUPT`; the gauge still returns and other gates are unaffected;
-   assert it is NOT folded into `pass`. Also a code outside the closed set → `unclassified` carrying
-   the raw code. (A naive `default: pass` classifier fails both.)
-6. `traceability-status` fixture with covered_verified / unverified / uncovered / not_built + a
-   dangling annotation → distribution + `dangling` count; universe = requirement count, scope
-   `project`, `as_of` has `trace_scan` and **no** sequence key.
+5. **`ratchet-status` error-path (R6, discriminating):** (a) induce a gate whose
+   `ResolveGateBaseline` audit verification yields a bare `E_JOURNAL_CORRUPT` (corrupt an audit
+   record so `audit.Read()` fails, the empty-Predicate line-128 path) → that gate's cell = `corrupt`
+   carrying `E_JOURNAL_CORRUPT`; the gauge still returns and OTHER gates are unaffected; assert NOT
+   folded into `pass`. (b) A report-load failure (Predicate set → `U_GATE_INCOMPARABLE`) buckets as
+   `incomparable`, NOT `unclassified` — proves the precedence rule. (A naive `default: pass` or a
+   naive "any err → unclassified" classifier fails one of these.)
+6. `traceability-status` fixture exercising ALL buckets — `covered_verified` / `unverified` /
+   `uncovered` / `partial_covered` / `not_built` + a malformed node (per-item `unevaluated`) + a
+   dangling annotation → distribution + `dangling` count; universe = requirement count (incl.
+   malformed), scope `project`, `as_of` has `trace_scan` and **no** sequence key. Assert a
+   Built+uncovered+unverified requirement buckets as `uncovered` (deterministic headline).
 7. `traceability-status` empty registry → gauge `Unevaluated` ("no requirements").
-8. `traceability-status` torn snapshot (induce `U_TRACE_UNSCANNED`) → gauge `Unevaluated` (reason
-   cites tear), NOT a distribution.
+8. `traceability-status` genuine scan failure (registry unreadable / snapshot tear, `unevaluated`
+   signal) → gauge `Unevaluated` (reason cites the cause), NOT a distribution.
+8b. **R11 discriminating:** all-nodes-malformed project (≥1 requirement file, all unparseable) →
+   gauge **evaluated**, distribution == {`unevaluated`: N}, universe N — NOT gauge-level unevaluated
+   (a naive "U_TRACE_UNSCANNED → gauge unevaluated" mapping fails this).
 9. **`traceability-status` drift/parity (R9):** gauge per-requirement statuses consistent with
    `aira check` traceability dimension for the same fixture, **including a sibling worktree** with
    its own requirements/annotations (exercises the multi-worktree universe).
@@ -239,9 +289,10 @@ TDD. Regression-shaped where a naive impl would pass; property-shaped for invari
 
 - `internal/store/insights.go`: `computeRatchetStatus`, `computeTraceabilityStatus`; two
   `insightRegistry` entries; two `init()` wirings.
-- `internal/store/traceability.go`: extract the shared multi-worktree traceability seam
-  (`traceabilityReport()` or a pure `traceabilityStatuses()`) called by BOTH `checkTraceability` and
-  the gauge (R9) — no forked covers/verifies logic; guard against regressing M9c `check` behaviour.
+- `internal/store/traceability.go`: extract the pure `scanTraceabilityGraph()` scan-core (returning
+  requirements+status / malformed / covers / verifies / dangling / unevaluated-signal) called by BOTH
+  `checkTraceability` and the gauge (R9/R11) — no findings round-trip, no forked covers/verifies
+  logic; `checkTraceability`'s M9c findings preserved byte-for-byte (existing tests guard it).
 - `internal/store/insights_test.go` (+ traceability seam test): §4 unit tests.
 - `docs/.../2026-08-13-aira-m15b-gate-trace-gauges-design.md` (this file).
 - No faces edits (registry-generic). A parity/coverage assertion confirms both gauges appear in
