@@ -1,9 +1,11 @@
 # M15b — gate + traceability insight gauges (`ratchet-status`, `traceability-status`)
 
-Status: PLAN v6 (incorporates Sol plan-review r1–r5). r3 confirmed R6 precedence + buckets closed;
-r4 confirmed edge+valid-node data sufficient; r5 confirmed the enriched payload sufficient. v6 fixes
-the last case: the all-malformed check diagnostic keys on the ID-BEARING map (an ID-less-malformed-only
-project keeps U_TRACE_EMPTY). Awaiting Sol re-review → gate → build.
+Status: APPROVED (Sol plan-review, 5 rounds → APPROVE-PLAN on v6). Building.
+v-history: r1 P0+3×P1 (read-only invariant, error codes, trace scope, digest naming); r2 4×P1
+(precedence, error paths, findings-not-faithful, malformed vs scan-tear); r3 confirmed R6 precedence +
+buckets closed + seam lossiness; r4 confirmed edge+valid-node sufficient + malformed-node payload gaps;
+r5 the ID-less-malformed diagnostic compat. Now implementing via TDD; Sol build-review → Opus
+real-common-dir e2e → merge.
 Milestone: Phase 4, follows M15 (insights framework). Branch `codex-aira-m15b` off master `ccb7325`.
 Depends on: M15 (gauge framework), M13b (ratchet gate), M9c (covers/verifies traceability).
 
