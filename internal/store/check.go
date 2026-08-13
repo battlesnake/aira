@@ -22,9 +22,11 @@ var ExitCodes = map[string]int{
 	"E_JOURNAL_CORRUPT": 4,
 	"E_FINDING_INVALID": 2, "E_WAIVER_REASON_REQUIRED": 2, "E_QUERY_INVALID": 2,
 	"E_REQUIREMENT_INVALID": 2,
-	"E_IMPORT_INVALID":      2, "E_ARGUMENT_INVALID": 2,
+	"E_COMPUTE_INVALID":     2, "E_COMPUTE_PROVIDER_UNKNOWN": 2, "E_COMPUTE_CONSERVATION": 0,
+	"E_IMPORT_INVALID": 2, "E_ARGUMENT_INVALID": 2,
 	"E_TESTREPORT_INVALID": 2, "E_TESTREPORT_FLAKY": 1,
 	"E_INDEX_UNEVALUATED":          3,
+	"U_COMPUTE_UNEVALUATED":        3,
 	"U_TESTREPORT_INCOMPARABLE":    3,
 	"U_REVIEW_SECTION_UNEVALUATED": 3,
 	// Runner-lite lifecycle and containment codes. These are deliberately kept
@@ -94,7 +96,7 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 		"allocated-id-file": "pass", "duplicate-id": "pass", "stale-index": "pass",
 		"orphan-worktree": "pass", "ticket-file-integrity": "pass", "reconcile-integrity": "pass",
 		"rebuild-integrity": "pass", "relation-integrity": "pass", "finding-integrity": "pass", "lease-integrity": "pass", "area-overlap": "pass",
-		"traceability": "pass", "gates": "pass",
+		"traceability": "pass", "gates": "pass", "compute": "pass",
 	}}
 	if err := ctx.Err(); err != nil {
 		report.Verdict = "unevaluated"
@@ -139,6 +141,28 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 		}
 	}
 	if err := s.ReconcileFlaky(ctx); err != nil {
+		return CheckReport{}, err
+	}
+	if err := s.ReconcileComputeConservation(ctx); err != nil {
+		return CheckReport{}, err
+	}
+	computeRows, err := s.db.QueryContext(ctx, `SELECT code,subject,details FROM findings WHERE project_id=? AND subtype='reconciliation' AND code=? ORDER BY subject`, s.projectID, "E_COMPUTE_CONSERVATION")
+	if err != nil {
+		return CheckReport{}, err
+	}
+	for computeRows.Next() {
+		var code, subject, details string
+		if err := computeRows.Scan(&code, &subject, &details); err != nil {
+			_ = computeRows.Close()
+			return CheckReport{}, err
+		}
+		addWarning(&report, CheckFinding{Code: code, Subject: subject, Message: details, Kind: "warning"}, "compute")
+	}
+	if err := computeRows.Err(); err != nil {
+		_ = computeRows.Close()
+		return CheckReport{}, err
+	}
+	if err := computeRows.Close(); err != nil {
 		return CheckReport{}, err
 	}
 	flakyRows, err := s.db.QueryContext(ctx, `SELECT code,subject,details FROM findings WHERE project_id=? AND subtype='reconciliation' AND code=? ORDER BY subject`, s.projectID, "E_TESTREPORT_FLAKY")

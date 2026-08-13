@@ -43,7 +43,7 @@ func TestDispatchMetadataMatchesInstrumentedHandlerReads(t *testing.T) {
 		}
 		if len(descriptor.Operations) > 0 {
 			discriminator := ""
-			if name == "find" || name == "req" || name == "test-report" {
+			if name == "find" || name == "req" || name == "test-report" || name == "spend" || name == "quota" {
 				discriminator = "subverb"
 			} else if name == "link" {
 				discriminator = "list"
@@ -103,6 +103,7 @@ func metadataProbeInputs(name string) []map[string]any {
 		"steal": true, "token": "token", "globs": []string{"**/*.go"}, "list": true,
 		"from": "AIRA-1", "to": "AIRA-2", "field": "title", "value": "new", "status": "planned", "rebuild": true,
 		"format": "go-json", "raw": []byte("{}"), "explain": "pkg/Test", "suite": "unit", "runner": "go", "config": "race", "env_digest": "env", "shard": "1/1", "retry": "0", "agent": "codex", "session": "s",
+		"provider": "openai", "model": "gpt-test", "at": "2026-01-01T00:00:00Z", "window": "day", "used": "1", "limit": "2", "remaining": "1", "reset-at": "2026-01-02T00:00:00Z", "total": "1", "cost-usd": "0", "reasoning-subset": true, "bucket": []string{},
 	}
 	switch name {
 	case "find", "req":
@@ -142,6 +143,10 @@ func metadataProbeInputs(name string) []map[string]any {
 			cloneMetadataInputs(values, "subverb", "show"),
 			cloneMetadataInputs(values, "subverb", "flaky"),
 		}
+	case "spend":
+		return []map[string]any{cloneMetadataInputs(values, "subverb", "add"), cloneMetadataInputs(values, "subverb", "ls")}
+	case "quota":
+		return []map[string]any{cloneMetadataInputs(values, "subverb", "add"), cloneMetadataInputs(values, "subverb", "ls")}
 	default:
 		return []map[string]any{values}
 	}
@@ -255,6 +260,14 @@ func (metadataProbeStore) GetTestReport(string) (domain.TestReport, error) {
 }
 func (metadataProbeStore) FlakyTests(string) ([]domain.FlakyTest, error) { return nil, nil }
 func (metadataProbeStore) ReconcileFlaky(context.Context) error          { return nil }
+func (metadataProbeStore) AddComputeEvent(context.Context, domain.ComputeEventInput) (store.ComputeEventAddResult, error) {
+	return store.ComputeEventAddResult{}, nil
+}
+func (metadataProbeStore) ListComputeEvents(string) ([]domain.ComputeEvent, error) { return nil, nil }
+func (metadataProbeStore) AddQuotaSnapshot(context.Context, domain.QuotaSnapshotInput) (store.QuotaSnapshotAddResult, error) {
+	return store.QuotaSnapshotAddResult{}, nil
+}
+func (metadataProbeStore) ListQuotaSnapshots(string) ([]domain.QuotaSnapshot, error) { return nil, nil }
 
 func TestDispatchDescriptorsAreStableReadOnlyCopies(t *testing.T) {
 	c := New(nil)
@@ -299,7 +312,7 @@ func TestCanonicalDispatchNamesAndAliases(t *testing.T) {
 		got = append(got, descriptor.Name)
 	}
 	sort.Strings(got)
-	want := []string{"check", "claim", "count", "create", "find", "gate", "grep", "heartbeat", "help", "id", "import", "init", "link", "list", "mv", "ready", "reconcile", "release", "req", "review", "run", "run-kill", "run-log", "set", "show", "test-report", "touch", "unlink"}
+	want := []string{"check", "claim", "count", "create", "find", "gate", "grep", "heartbeat", "help", "id", "import", "init", "link", "list", "mv", "quota", "ready", "reconcile", "release", "req", "review", "run", "run-kill", "run-log", "set", "show", "spend", "test-report", "touch", "unlink"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("dispatch names=%v, want=%v", got, want)
 	}

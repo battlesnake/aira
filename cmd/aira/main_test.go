@@ -101,6 +101,21 @@ func TestFindingRequestsMirrorSubverbSurface(t *testing.T) {
 	}
 }
 
+func TestSpendRequestPreservesRepeatedBuckets(t *testing.T) {
+	positional, options, err := parseArgs("spend", []string{"add", "--provider", "openai", "--model", "gpt", "--source", "manual", "--bucket", "fresh_input=1", "--bucket", "output=0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := buildRequest("spend", positional, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buckets, ok := request.Args["bucket"].([]string)
+	if !ok || len(buckets) != 2 || buckets[0] != "fresh_input=1" || buckets[1] != "output=0" {
+		t.Fatalf("bucket request = %#v", request.Args)
+	}
+}
+
 func TestGrepRequestParsesQueryAndOptions(t *testing.T) {
 	positional, options, err := parseArgs("grep", []string{`alpha AND beta`, "--kind", "finding", "--by", "kind", "--fields", "id,snippet"})
 	if err != nil {

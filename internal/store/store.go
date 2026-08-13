@@ -47,32 +47,38 @@ type Options struct {
 	RequirementPrefixes []string
 	// ReviewPolicy is validated eagerly by Open. A zero policy means the
 	// project has no review block and therefore defaults to tier 3.
-	ReviewPolicy  ReviewPolicy
-	LeaseStateDir string
-	LeaseTTLNS    uint64
-	MaxReports    int
-	MaxAgeDays    int
-	Clock         Clock
+	ReviewPolicy      ReviewPolicy
+	LeaseStateDir     string
+	LeaseTTLNS        uint64
+	MaxReports        int
+	MaxAgeDays        int
+	MaxComputeEvents  int
+	MaxComputeAgeDays int
+	MaxQuotaSnapshots int
+	Clock             Clock
 }
 
 type Store struct {
-	db            *sql.DB
-	root          string
-	commonDir     string
-	auditDir      string
-	dbPath        string
-	registryPath  string
-	projectID     string
-	worktreeID    string
-	projectSlug   string
-	reviewPolicy  ReviewPolicy
-	prefixes      map[string]string // prefix -> entity kind (ticket|requirement)
-	leaseStateDir string
-	leaseTTLNS    uint64
-	maxReports    int
-	maxAgeDays    int
-	clock         Clock
-	runner        *runner.Runner
+	db                *sql.DB
+	root              string
+	commonDir         string
+	auditDir          string
+	dbPath            string
+	registryPath      string
+	projectID         string
+	worktreeID        string
+	projectSlug       string
+	reviewPolicy      ReviewPolicy
+	prefixes          map[string]string // prefix -> entity kind (ticket|requirement)
+	leaseStateDir     string
+	leaseTTLNS        uint64
+	maxReports        int
+	maxAgeDays        int
+	maxComputeEvents  int
+	maxComputeAgeDays int
+	maxQuotaSnapshots int
+	clock             Clock
+	runner            *runner.Runner
 	// beforeMaterialise is intentionally nil in production; tests use it to
 	// observe the receipt-before-file ordering at the crash boundary.
 	beforeMaterialise func(Intent) error
@@ -226,14 +232,22 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		dbPath: dbPath, registryPath: registry, projectID: opts.ProjectID,
 		worktreeID: opts.WorktreeID, projectSlug: opts.ProjectSlug, reviewPolicy: reviewPolicy, prefixes: map[string]string{},
 		leaseStateDir: opts.LeaseStateDir, leaseTTLNS: opts.LeaseTTLNS,
-		maxReports: opts.MaxReports, maxAgeDays: opts.MaxAgeDays, clock: opts.Clock,
+		maxReports: opts.MaxReports, maxAgeDays: opts.MaxAgeDays,
+		maxComputeEvents: opts.MaxComputeEvents, maxComputeAgeDays: opts.MaxComputeAgeDays,
+		maxQuotaSnapshots: opts.MaxQuotaSnapshots, clock: opts.Clock,
 	}
 	if s.maxReports == 0 {
 		s.maxReports = 5000
 	}
-	if s.maxReports < 1 || s.maxAgeDays < 0 {
+	if s.maxComputeEvents == 0 {
+		s.maxComputeEvents = 20000
+	}
+	if s.maxQuotaSnapshots == 0 {
+		s.maxQuotaSnapshots = 5000
+	}
+	if s.maxReports < 1 || s.maxAgeDays < 0 || s.maxComputeEvents < 1 || s.maxComputeAgeDays < 0 || s.maxQuotaSnapshots < 1 {
 		_ = db.Close()
-		return nil, errors.New("E_CONFIG_INVALID: test report retention is invalid")
+		return nil, errors.New("E_CONFIG_INVALID: telemetry retention is invalid")
 	}
 	if s.leaseStateDir == "" {
 		s.leaseStateDir = defaultLeaseStateDir()
@@ -423,6 +437,30 @@ func (s *Store) initDB(ctx context.Context) error {
 		    outcome TEXT NOT NULL, duration_ns INTEGER, message TEXT NOT NULL DEFAULT '',
 		    PRIMARY KEY(project_id, report_id, name),
 		    FOREIGN KEY(project_id, report_id) REFERENCES test_reports(project_id, id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS compute_event_counter (
+		    project_id TEXT PRIMARY KEY, next_number INTEGER NOT NULL, next_seq INTEGER NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS compute_events (
+		    project_id TEXT NOT NULL, id TEXT NOT NULL, ticket_id TEXT NOT NULL DEFAULT '',
+		    phase TEXT NOT NULL DEFAULT '', model TEXT NOT NULL, provider TEXT NOT NULL,
+		    at TEXT NOT NULL, session TEXT NOT NULL DEFAULT '', agent TEXT NOT NULL DEFAULT '',
+		    source TEXT NOT NULL, fresh_input INTEGER, cache_read INTEGER, cache_write INTEGER,
+		    output INTEGER, reasoning INTEGER, reported_total INTEGER, cost_usd REAL,
+		    conservation TEXT NOT NULL, reasoning_subset INTEGER NOT NULL DEFAULT 0,
+		    at_seq INTEGER NOT NULL,
+		    PRIMARY KEY(project_id, id),
+		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS quota_snapshot_counter (
+		    project_id TEXT PRIMARY KEY, next_number INTEGER NOT NULL, next_seq INTEGER NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS quota_snapshots (
+		    project_id TEXT NOT NULL, id TEXT NOT NULL, provider TEXT NOT NULL, at TEXT NOT NULL,
+		    window TEXT NOT NULL DEFAULT '', used INTEGER, limit_value INTEGER, remaining INTEGER,
+		    reset_at TEXT NOT NULL DEFAULT '', source TEXT NOT NULL, at_seq INTEGER NOT NULL,
+		    PRIMARY KEY(project_id, id),
+		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
 	}
 	for _, statement := range statements {

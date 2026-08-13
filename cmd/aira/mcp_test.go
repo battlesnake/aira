@@ -37,7 +37,7 @@ func TestMCPToolListIsGeneratedAndStable(t *testing.T) {
 	for _, tool := range result.Tools {
 		got = append(got, tool.Name)
 	}
-	want := []string{"aira_check", "aira_claim", "aira_count", "aira_create", "aira_finding", "aira_gate", "aira_get", "aira_grep", "aira_heartbeat", "aira_id", "aira_import", "aira_init", "aira_link", "aira_list", "aira_ready", "aira_reconcile", "aira_release", "aira_requirement", "aira_review", "aira_run", "aira_run_kill", "aira_run_output", "aira_test_report", "aira_touch", "aira_transition"}
+	want := []string{"aira_check", "aira_claim", "aira_count", "aira_create", "aira_finding", "aira_gate", "aira_get", "aira_grep", "aira_heartbeat", "aira_id", "aira_import", "aira_init", "aira_link", "aira_list", "aira_quota", "aira_ready", "aira_reconcile", "aira_release", "aira_requirement", "aira_review", "aira_run", "aira_run_kill", "aira_run_output", "aira_spend", "aira_test_report", "aira_touch", "aira_transition"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("tools=%v, want=%v", got, want)
 	}

@@ -11,6 +11,7 @@ import (
 
 	"aira/internal/app"
 	"aira/internal/core"
+	"aira/internal/domain"
 	"aira/internal/runner"
 	"aira/internal/store"
 )
@@ -85,6 +86,33 @@ func runWithInput(argv []string, stdout, stderr io.Writer, stdin io.Reader) int 
 		}
 		request.Args["raw"] = data
 	}
+	if verb == "spend" && len(positional) > 0 && strings.EqualFold(positional[0], "add") {
+		bucketValues := splitOptionList(options["bucket"])
+		usageFile := options["usage-file"]
+		if usageFile != "" && len(bucketValues) > 0 {
+			code := store.ErrorCode(fmt.Errorf("%s: --usage-file and --bucket are mutually exclusive", domain.ComputeCodeInvalid))
+			return render(core.Response{Code: code, Error: fmt.Sprintf("%s: --usage-file and --bucket are mutually exclusive", code), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
+		}
+		var data []byte
+		if usageFile != "" {
+			data, err = os.ReadFile(usageFile)
+		} else {
+			data, err = io.ReadAll(stdin)
+		}
+		if err != nil {
+			code := domain.ComputeCodeInvalid
+			return render(core.Response{Code: code, Error: fmt.Sprintf("%s: %v", code, err), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
+		}
+		if len(bucketValues) > 0 {
+			if strings.TrimSpace(string(data)) != "" {
+				code := domain.ComputeCodeInvalid
+				return render(core.Response{Code: code, Error: code + ": payload and --bucket are mutually exclusive", Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
+			}
+			request.Args["bucket"] = bucketValues
+		} else {
+			request.Args["raw"] = data
+		}
+	}
 	s, project, err := app.Open(context.Background(), ".")
 	if err != nil {
 		code := appErrorCode(err)
@@ -143,7 +171,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 			continue
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "rebuild" || name == "steal" || name == "strict" || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && verb == "run-log") {
+		if name == "rebuild" || name == "steal" || name == "strict" || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && verb == "run-log") || (name == "reasoning-subset" && verb == "spend") {
 			options[name] = "true"
 			continue
 		}
@@ -170,7 +198,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 				options["fields"] += ","
 			}
 			options["fields"] += argv[i]
-		} else if name == "argv" || name == "env-allow" || (name == "config-env" && verb == "test-report") {
+		} else if name == "argv" || name == "env-allow" || (name == "config-env" && verb == "test-report") || (name == "bucket" && verb == "spend") {
 			options[name] = appendDelimited(options[name], argv[i])
 		} else {
 			options[name] = argv[i]
@@ -192,6 +220,8 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"find":        {"category": true, "severity": true, "verdict": true, "source": true, "message": true, "file": true, "requirement": true, "by": true, "fields": true, "disposition": true, "reason": true, "actor": true},
 		"req":         {"status": true, "fields": true},
 		"test-report": {"format": true, "explain": true, "ticket": true, "phase": true, "commit": true, "branch": true, "suite": true, "config": true, "config-env": true, "shard": true, "retry": true},
+		"spend":       {"provider": true, "model": true, "source": true, "ticket": true, "phase": true, "at": true, "session": true, "agent": true, "total": true, "cost-usd": true, "usage-file": true, "bucket": true, "reasoning-subset": true, "by": true},
+		"quota":       {"provider": true, "source": true, "at": true, "window": true, "used": true, "limit": true, "remaining": true, "reset-at": true},
 		"run-kill":    {},
 		"run-log":     {"stream": true, "from": true, "tail": true, "follow": true, "full": true},
 		"gate":        {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "reason": true, "report": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-seed": true, "mutation-expected-result": true},
@@ -418,6 +448,57 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			args["file"] = positional[1]
 		default:
 			return core.Request{}, fmt.Errorf("req requires add|ls|show|set|import")
+		}
+	case "spend":
+		if len(positional) == 0 {
+			return core.Request{}, fmt.Errorf("spend requires add|ls")
+		}
+		subverb := strings.ToLower(positional[0])
+		args["subverb"] = subverb
+		switch subverb {
+		case "add":
+			if len(positional) != 1 {
+				return core.Request{}, fmt.Errorf("spend add accepts no positional arguments")
+			}
+			for option, argument := range map[string]string{"provider": "provider", "model": "model", "source": "source", "ticket": "ticket", "phase": "phase", "at": "at", "session": "session", "agent": "agent", "total": "total", "cost-usd": "cost-usd"} {
+				if value, ok := options[option]; ok {
+					args[argument] = value
+				}
+			}
+			args["reasoning-subset"] = options["reasoning-subset"] == "true"
+			if value, ok := options["bucket"]; ok {
+				args["bucket"] = splitOptionList(value)
+			}
+		case "ls", "list":
+			if len(positional) > 1 {
+				args["query"] = strings.Join(positional[1:], " ")
+			}
+			args["by"] = options["by"]
+		default:
+			return core.Request{}, fmt.Errorf("spend requires add|ls")
+		}
+	case "quota":
+		if len(positional) == 0 {
+			return core.Request{}, fmt.Errorf("quota requires add|ls")
+		}
+		subverb := strings.ToLower(positional[0])
+		args["subverb"] = subverb
+		switch subverb {
+		case "add":
+			if len(positional) != 1 {
+				return core.Request{}, fmt.Errorf("quota add accepts no positional arguments")
+			}
+			for option, argument := range map[string]string{"provider": "provider", "source": "source", "at": "at", "window": "window", "used": "used", "limit": "limit", "remaining": "remaining", "reset-at": "reset-at"} {
+				if value, ok := options[option]; ok {
+					args[argument] = value
+				}
+			}
+		case "ls", "list":
+			if len(positional) > 1 {
+				args["query"] = strings.Join(positional[1:], " ")
+			}
+		default:
+			return core.Request{}, fmt.Errorf("quota requires add|ls")
 		}
 	case "test-report":
 		if len(positional) == 0 {

@@ -96,6 +96,10 @@ type Store interface {
 	GetTestReport(string) (domain.TestReport, error)
 	FlakyTests(string) ([]domain.FlakyTest, error)
 	ReconcileFlaky(context.Context) error
+	AddComputeEvent(context.Context, domain.ComputeEventInput) (store.ComputeEventAddResult, error)
+	ListComputeEvents(string) ([]domain.ComputeEvent, error)
+	AddQuotaSnapshot(context.Context, domain.QuotaSnapshotInput) (store.QuotaSnapshotAddResult, error)
+	ListQuotaSnapshots(string) ([]domain.QuotaSnapshot, error)
 	PinGateBaseline(context.Context, string, []string, string, string) (store.GateBaseline, error)
 	ShowGateBaseline(string) (store.GateBaseline, error)
 }
@@ -665,6 +669,90 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				return nil, fmt.Errorf("E_UNKNOWN_VERB: unknown req sub-verb %q", subverb)
 			}
 		}},
+		"spend": {Name: "spend", Usage: "spend add|ls ...", Args: []ArgSpec{
+			stringSpec("subverb", true, true, "Spend operation", "add", "ls"), stringSpec("provider", false, false, "LLM provider"), stringSpec("model", false, false, "Model"), stringSpec("source", false, false, "Ingest source"), stringSpec("ticket", false, false, "Ticket ID"), stringSpec("phase", false, false, "Work phase"), stringSpec("at", false, false, "Timestamp"), stringSpec("session", false, false, "Session"), stringSpec("agent", false, false, "Agent"), stringSpec("total", false, false, "Reported total"), stringSpec("cost-usd", false, false, "Caller-supplied cost"), stringSpec("query", false, false, "Event query"), stringSpec("by", false, false, "Live distribution field"), boolSpec("reasoning-subset", false, false, "Reasoning is a subset of output"), listSpec("bucket", false, false, "Explicit disjoint bucket K=V"), stringSpec("raw", false, false, "Provider usage payload"), stringSpec("usage-file", false, false, "Provider usage file"),
+		}, MCPTool: "aira_spend", MCPOperation: "subverb", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+			store, ok := c.store.(interface {
+				AddComputeEvent(context.Context, domain.ComputeEventInput) (store.ComputeEventAddResult, error)
+				ListComputeEvents(string) ([]domain.ComputeEvent, error)
+			})
+			if !ok {
+				return nil, errors.New("E_COMPUTE_INVALID: compute store is unavailable")
+			}
+			subverb := strings.ToLower(stringArg(args, "subverb"))
+			switch subverb {
+			case "add":
+				raw, err := usageArgs(args, stringArg(args, "provider"))
+				if err != nil {
+					return nil, err
+				}
+				input := domain.ComputeEventInput{TicketID: stringArg(args, "ticket"), Phase: stringArg(args, "phase"), Model: stringArg(args, "model"), Provider: stringArg(args, "provider"), At: stringArg(args, "at"), Session: stringArg(args, "session"), Agent: stringArg(args, "agent"), Source: stringArg(args, "source"), Raw: raw}
+				if cost, present, err := optionalFloatArg(args, "cost-usd"); err != nil {
+					return nil, err
+				} else if present {
+					input.CostUSD = &cost
+				}
+				result, err := store.AddComputeEvent(ctx, input)
+				if err != nil {
+					return nil, err
+				}
+				warnings := []string{}
+				if result.Event.Conservation == domain.ConservationMismatch {
+					warnings = append(warnings, domain.ComputeCodeConservation)
+				}
+				return handlerData{Data: result, Warnings: warnings}, nil
+			case "ls", "list":
+				rows, err := store.ListComputeEvents(stringArg(args, "query"))
+				if err != nil {
+					return nil, err
+				}
+				data := map[string]any{"total": len(rows), "rows": rows}
+				if by := stringArg(args, "by"); by != "" {
+					distribution, err := computeDistribution(rows, by)
+					if err != nil {
+						return nil, err
+					}
+					data["distribution"] = distribution
+				}
+				return data, nil
+			default:
+				return nil, fmt.Errorf("E_UNKNOWN_VERB: unknown spend sub-verb %q", subverb)
+			}
+		}},
+		"quota": {Name: "quota", Usage: "quota add|ls ...", Args: []ArgSpec{
+			stringSpec("subverb", true, true, "Quota operation", "add", "ls"), stringSpec("provider", false, false, "Provider"), stringSpec("source", false, false, "Ingest source"), stringSpec("at", false, false, "Timestamp"), stringSpec("window", false, false, "Quota window"), stringSpec("used", false, false, "Used tokens"), stringSpec("limit", false, false, "Limit tokens"), stringSpec("remaining", false, false, "Remaining tokens"), stringSpec("reset-at", false, false, "Reset timestamp"), stringSpec("query", false, false, "Snapshot query"),
+		}, MCPTool: "aira_quota", MCPOperation: "subverb", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+			store, ok := c.store.(interface {
+				AddQuotaSnapshot(context.Context, domain.QuotaSnapshotInput) (store.QuotaSnapshotAddResult, error)
+				ListQuotaSnapshots(string) ([]domain.QuotaSnapshot, error)
+			})
+			if !ok {
+				return nil, errors.New("E_COMPUTE_INVALID: quota store is unavailable")
+			}
+			subverb := strings.ToLower(stringArg(args, "subverb"))
+			switch subverb {
+			case "add":
+				input := domain.QuotaSnapshotInput{Provider: stringArg(args, "provider"), Source: stringArg(args, "source"), At: stringArg(args, "at"), Window: stringArg(args, "window"), ResetAt: stringArg(args, "reset-at")}
+				for name, dst := range map[string]**int64{"used": &input.Used, "limit": &input.Limit, "remaining": &input.Remaining} {
+					value, present, err := optionalIntArg(args, name)
+					if err != nil {
+						return nil, err
+					}
+					if present {
+						*dst = &value
+					}
+				}
+				return store.AddQuotaSnapshot(ctx, input)
+			case "ls", "list":
+				rows, err := store.ListQuotaSnapshots(stringArg(args, "query"))
+				if err != nil {
+					return nil, err
+				}
+				return map[string]any{"total": len(rows), "rows": rows}, nil
+			default:
+				return nil, fmt.Errorf("E_UNKNOWN_VERB: unknown quota sub-verb %q", subverb)
+			}
+		}},
 		"test-report": {Name: "test-report", Usage: "test-report add|ls|show|flaky ...", Args: []ArgSpec{
 			stringSpec("subverb", true, true, "Test report operation", "add", "ls", "show", "flaky"),
 			stringSpec("format", false, false, "Report format", "go-json", "junit"), stringSpec("selector", false, true, "Report or test selector"),
@@ -1142,6 +1230,14 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 			{Name: "baseline-pin", Summary: "Pin a durable ratchet baseline", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}, {Name: "report", Required: true}, {Name: "reason"}, {Name: "actor"}}, Example: []string{"baseline-pin", "unit-tests", "--report", "TR-1", "--actor", "release-bot"}},
 			{Name: "baseline-show", Summary: "Show the active ratchet baseline", Safety: SafetyRead, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"baseline-show", "unit-tests"}},
 		}},
+		"spend": {summary: "Record and list raw compute events", safety: SafetyMutate, operations: []OperationSpec{
+			{Name: "add", Summary: "Ingest one compute event", Safety: SafetyMutate, Args: []OperationArg{{Name: "provider", Required: true}, {Name: "model", Required: true}, {Name: "source", Required: true}, {Name: "ticket"}, {Name: "phase"}, {Name: "at"}, {Name: "session"}, {Name: "agent"}, {Name: "raw"}, {Name: "usage-file"}, {Name: "bucket"}, {Name: "total"}, {Name: "cost-usd"}, {Name: "reasoning-subset"}}, Example: []string{"add", "--provider", "openai", "--model", "gpt-5", "--source", "manual", "--bucket", "fresh_input=700", "--bucket", "cache_read=300", "--bucket", "output=200", "--total", "1200", "--reasoning-subset"}},
+			{Name: "ls", Summary: "List raw compute events", Safety: SafetyRead, Args: []OperationArg{{Name: "query"}, {Name: "by"}}, Example: []string{"ls", "provider:openai", "--by", "phase"}},
+		}},
+		"quota": {summary: "Record and list raw quota snapshots", safety: SafetyMutate, operations: []OperationSpec{
+			{Name: "add", Summary: "Record one quota snapshot", Safety: SafetyMutate, Args: []OperationArg{{Name: "provider", Required: true}, {Name: "source"}, {Name: "at"}, {Name: "used"}, {Name: "limit"}, {Name: "remaining"}, {Name: "reset-at"}, {Name: "window"}}, Example: []string{"add", "--provider", "openai", "--source", "manual", "--used", "10", "--limit", "100"}},
+			{Name: "ls", Summary: "List raw quota snapshots", Safety: SafetyRead, Args: []OperationArg{{Name: "query"}}, Example: []string{"ls", "provider:openai"}},
+		}},
 	}
 	metadata["find"] = verbMetadata{summary: "Manage review findings", safety: SafetyMutate, operations: []OperationSpec{
 		{Name: "add", Summary: "Add a review finding", Safety: SafetyMutate, Args: []OperationArg{
@@ -1200,6 +1296,137 @@ func stringArg(args *argAccessor, key string) string {
 	}
 	value, _ := args.record(key).(string)
 	return value
+}
+
+func usageArgs(args *argAccessor, provider string) (domain.RawUsage, error) {
+	reasoningSubset := boolArg(args, "reasoning-subset")
+	_ = args.record("usage-file")
+	rawValue := args.record("raw")
+	bucketValues := stringSlice(args, "bucket")
+	hasPayload := false
+	var payload []byte
+	switch value := rawValue.(type) {
+	case []byte:
+		payload = value
+		hasPayload = len(value) > 0
+	case string:
+		payload = []byte(value)
+		hasPayload = strings.TrimSpace(value) != ""
+	}
+	if hasPayload && len(bucketValues) > 0 {
+		return domain.RawUsage{}, errors.New(domain.ComputeCodeInvalid + ": payload and --bucket are mutually exclusive")
+	}
+	var raw domain.RawUsage
+	if hasPayload {
+		parsed, err := domain.ParseUsagePayload(provider, payload)
+		if err != nil {
+			return domain.RawUsage{}, err
+		}
+		raw = parsed
+	} else if len(bucketValues) > 0 {
+		buckets := domain.ComputeBuckets{}
+		seen := map[string]bool{}
+		for _, item := range bucketValues {
+			key, value, ok := strings.Cut(item, "=")
+			if !ok || key == "" || seen[key] {
+				return domain.RawUsage{}, errors.New(domain.ComputeCodeInvalid + ": bucket must be a unique K=V")
+			}
+			seen[key] = true
+			parsed, err := strconv.ParseInt(value, 10, 64)
+			if err != nil || parsed < 0 {
+				return domain.RawUsage{}, errors.New(domain.ComputeCodeInvalid + ": bucket values must be non-negative int64")
+			}
+			cell := &parsed
+			switch key {
+			case "fresh_input":
+				buckets.FreshInput = cell
+			case "cache_read":
+				buckets.CacheRead = cell
+			case "cache_write":
+				buckets.CacheWrite = cell
+			case "output":
+				buckets.Output = cell
+			case "reasoning":
+				buckets.Reasoning = cell
+			default:
+				return domain.RawUsage{}, fmt.Errorf("%s: unknown bucket %q", domain.ComputeCodeInvalid, key)
+			}
+		}
+		raw.Buckets, raw.ReasoningSubset = &buckets, reasoningSubset
+	} else {
+		return domain.RawUsage{}, errors.New(domain.ComputeCodeInvalid + ": exactly one usage input is required")
+	}
+	if total, present, err := optionalIntArg(args, "total"); err != nil {
+		return domain.RawUsage{}, err
+	} else if present {
+		raw.ReportedTotal = &total
+	}
+	return raw, nil
+}
+
+func optionalIntArg(args *argAccessor, name string) (int64, bool, error) {
+	if !args.present(name) {
+		return 0, false, nil
+	}
+	value := args.values[name]
+	var text string
+	switch typed := value.(type) {
+	case string:
+		text = typed
+	case int:
+		return int64(typed), true, nil
+	case int64:
+		return typed, true, nil
+	case float64:
+		if typed != float64(int64(typed)) {
+			return 0, true, fmt.Errorf("%s: %s must be an integer", domain.ComputeCodeInvalid, name)
+		}
+		return int64(typed), true, nil
+	default:
+		return 0, true, fmt.Errorf("%s: %s must be an integer", domain.ComputeCodeInvalid, name)
+	}
+	parsed, err := strconv.ParseInt(text, 10, 64)
+	if err != nil || parsed < 0 {
+		return 0, true, fmt.Errorf("%s: %s must be a non-negative int64", domain.ComputeCodeInvalid, name)
+	}
+	return parsed, true, nil
+}
+
+func optionalFloatArg(args *argAccessor, name string) (float64, bool, error) {
+	if !args.present(name) {
+		return 0, false, nil
+	}
+	value := stringArg(args, name)
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil || parsed < 0 {
+		return 0, true, fmt.Errorf("%s: %s must be a non-negative number", domain.ComputeCodeInvalid, name)
+	}
+	return parsed, true, nil
+}
+
+func computeDistribution(rows []domain.ComputeEvent, by string) (map[string]int, error) {
+	if by != "provider" && by != "ticket" && by != "phase" && by != "conservation" {
+		return nil, fmt.Errorf("E_SELECTOR_INVALID: unsupported compute distribution field %q", by)
+	}
+	result := map[string]int{}
+	for _, row := range rows {
+		value := ""
+		switch by {
+		case "provider":
+			value = row.Provider
+		case "ticket":
+			value = row.TicketID
+		case "phase":
+			value = row.Phase
+		case "conservation":
+			value = string(row.Conservation)
+		}
+		if value == "" {
+			value = "(none)"
+		}
+		result[value]++
+	}
+	return result, nil
 }
 
 func stringSpec(name string, required, positional bool, description string, enum ...string) ArgSpec {
