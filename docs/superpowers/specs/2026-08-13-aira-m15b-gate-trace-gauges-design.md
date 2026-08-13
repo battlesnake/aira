@@ -1,9 +1,9 @@
 # M15b — gate + traceability insight gauges (`ratchet-status`, `traceability-status`)
 
-Status: PLAN v5 (incorporates Sol plan-review r1–r4). r3 confirmed R6 precedence + buckets closed;
-r4 confirmed edge+valid-node data sufficient. v5 enriches the malformed-node + unevaluated contract
-(Message, alias IDs[], last-occurrence-wins, diagnostic payload) so M9c findings reproduce exactly.
-Awaiting Sol re-review → gate → build.
+Status: PLAN v6 (incorporates Sol plan-review r1–r5). r3 confirmed R6 precedence + buckets closed;
+r4 confirmed edge+valid-node data sufficient; r5 confirmed the enriched payload sufficient. v6 fixes
+the last case: the all-malformed check diagnostic keys on the ID-BEARING map (an ID-less-malformed-only
+project keeps U_TRACE_EMPTY). Awaiting Sol re-review → gate → build.
 Milestone: Phase 4, follows M15 (insights framework). Branch `codex-aira-m15b` off master `ccb7325`.
 Depends on: M15 (gauge framework), M13b (ratchet gate), M9c (covers/verifies traceability).
 
@@ -153,7 +153,10 @@ return `GaugeResult{Value, Breakdown, Unevaluated, UnevaluatedReason, Universe, 
     returns traceability.go:250-265 and the empty-registry returns :327/331); else emit the per-node
     `E_REQUIREMENT_INVALID` findings from `malformed` **in order** using each node's `Subject` +
     `Message` (:306-313), emit the all-nodes-malformed `U_TRACE_UNSCANNED` diagnostic when
-    `len(requirements)==0 && len(malformed)>0` (:330-335), then call **`resolveTraceabilityEdges(report,
+    `len(requirements)==0 && len(malformedIDMap)>0` — **keyed on the ID-BEARING map, not the file
+    slice** (Sol r5: today's malformed map is ID-keyed, so a project whose ONLY malformed file has an
+    invalid filename AND unparsable content has an empty map and keeps `U_TRACE_EMPTY` at :330-332, NOT
+    `U_TRACE_UNSCANNED` at :334-335). Then call **`resolveTraceabilityEdges(report,
     edges, requirements, malformedIDMap)` UNCHANGED**. Build `malformedIDMap` (`id -> Subject`) by
     iterating `malformed` in order and inserting every `ID` in each node's `IDs` → its `Subject`,
     **last-occurrence-wins** (reproduces today's last-write-wins map, :314-319). The existing M9c
@@ -307,6 +310,12 @@ TDD. Regression-shaped where a naive impl would pass; property-shaped for invari
 8b. **R11 discriminating:** all-nodes-malformed project (≥1 requirement file, all unparseable) →
    gauge **evaluated**, distribution == {`unevaluated`: N}, universe N — NOT gauge-level unevaluated
    (a naive "U_TRACE_UNSCANNED → gauge unevaluated" mapping fails this).
+8c. **M9c compatibility (Sol r5, discriminating):** a project whose ONLY malformed requirement file
+   has an invalid filename AND unparsable content (no derivable ID) → `aira check` STILL emits
+   `U_TRACE_EMPTY` (not `U_TRACE_UNSCANNED`), proving the diagnostic keys on the ID-bearing map; AND
+   the gauge is evaluated with that file as a per-item `unevaluated` cell keyed by `Subject`, universe
+   1 (the gauge counts the ID-less file even though the check diagnostic does not). A naive
+   `len(malformedSlice)>0` predicate flips the check finding and fails this.
 9. **`traceability-status` drift/parity (R9):** gauge per-requirement statuses consistent with
    `aira check` traceability dimension for the same fixture, **including a sibling worktree** with
    its own requirements/annotations (exercises the multi-worktree universe).
