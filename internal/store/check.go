@@ -26,6 +26,7 @@ var ExitCodes = map[string]int{
 	"E_IMPORT_INVALID": 2, "E_ARGUMENT_INVALID": 2,
 	"E_TESTREPORT_INVALID": 2, "E_TESTREPORT_FLAKY": 1,
 	"E_INDEX_UNEVALUATED":          3,
+	"U_INDEX_UNESTABLISHED":        3,
 	"U_COMPUTE_UNEVALUATED":        3,
 	"U_INSIGHT_UNEVALUATED":        3,
 	"U_TESTREPORT_INCOMPARABLE":    3,
@@ -113,15 +114,29 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 	if err := s.checkStaleIndex(&report); err != nil {
 		return CheckReport{}, err
 	}
-	if findings, err := s.relationIndexDivergence(); err != nil {
-		return CheckReport{}, err
-	} else {
-		for _, finding := range findings {
-			addFinding(&report, finding, "relation-integrity")
+	relationSnapshot, err := scanRelationSnapshotAt(s.root, s.worktreeID, s.projectSlug)
+	if err != nil {
+		if isUnestablishedError(err) {
+			addUnestablishedCheckFinding(&report, "relation-integrity", err)
+		} else {
+			return CheckReport{}, err
+		}
+	}
+	if err == nil {
+		if findings, divergenceErr := s.relationIndexDivergence(relationSnapshot); divergenceErr != nil {
+			return CheckReport{}, divergenceErr
+		} else {
+			for _, finding := range findings {
+				addFinding(&report, finding, "relation-integrity")
+			}
 		}
 	}
 	if findings, err := s.findingIndexDivergence(); err != nil {
-		return CheckReport{}, err
+		if isUnestablishedError(err) {
+			addUnestablishedCheckFinding(&report, "finding-integrity", err)
+		} else {
+			return CheckReport{}, err
+		}
 	} else {
 		for _, finding := range findings {
 			dimension := "finding-integrity"
@@ -186,7 +201,9 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 		return CheckReport{}, err
 	}
 	if err := s.Rebuild(ctx); err != nil {
-		if isIntegrityError(err) {
+		if ErrorCode(err) == "U_INDEX_UNESTABLISHED" {
+			addUnestablishedCheckFinding(&report, "rebuild-integrity", err)
+		} else if isIntegrityError(err) {
 			addFinding(&report, s.findingFromError(err, "rebuild"), "rebuild-integrity")
 		} else {
 			return CheckReport{}, err
@@ -236,7 +253,19 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 			}
 			continue
 		}
-		data, err := readRegularTicket(path)
+		if _, statErr := os.Lstat(path); statErr != nil {
+			if errors.Is(statErr, os.ErrNotExist) {
+				report.Dimensions["allocated-id-file"] = "fail"
+				report.Findings = append(report.Findings, CheckFinding{Code: "E_ID_UNRESOLVED", Subject: id, Message: "allocation has no materialised ticket file", Kind: "fail"})
+				continue
+			}
+			return CheckReport{}, statErr
+		}
+		data, outcome, err := readRegularTicket(path)
+		if outcome == scanReadInconclusive {
+			addFinding(&report, CheckFinding{Code: "U_INDEX_UNESTABLISHED", Subject: id, Message: "working-tree ticket read was inconclusive", Kind: "unevaluated"}, "allocated-id-file")
+			continue
+		}
 		if errors.Is(err, os.ErrNotExist) {
 			report.Dimensions["allocated-id-file"] = "fail"
 			report.Findings = append(report.Findings, CheckFinding{
@@ -268,7 +297,11 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 		return CheckReport{}, err
 	}
 	if relationFindings, err := s.relationFindings(); err != nil {
-		return CheckReport{}, err
+		if isUnestablishedError(err) {
+			addUnestablishedCheckFinding(&report, "relation-integrity", err)
+		} else {
+			return CheckReport{}, err
+		}
 	} else {
 		for _, finding := range relationFindings {
 			switch finding.Code {
@@ -346,7 +379,18 @@ func (s *Store) checkStaleIndex(report *CheckReport) error {
 		if err := rows.Scan(&id, &path, &digest); err != nil {
 			return err
 		}
-		data, err := readRegularTicket(path)
+		if _, statErr := os.Lstat(path); statErr != nil {
+			if errors.Is(statErr, os.ErrNotExist) {
+				addWarning(report, CheckFinding{Code: "W_STALE_INDEX", Subject: id, Message: "indexed ticket file is missing", Kind: "warning"}, "stale-index")
+				continue
+			}
+			return statErr
+		}
+		data, outcome, err := readRegularTicket(path)
+		if outcome == scanReadInconclusive {
+			addFinding(report, CheckFinding{Code: "U_INDEX_UNESTABLISHED", Subject: id, Message: "working-tree ticket read was inconclusive", Kind: "unevaluated"}, "stale-index")
+			continue
+		}
 		if errors.Is(err, os.ErrNotExist) {
 			addWarning(report, CheckFinding{Code: "W_STALE_INDEX", Subject: id, Message: "indexed ticket file is missing", Kind: "warning"}, "stale-index")
 			continue
@@ -375,7 +419,19 @@ func fileMissing(path string) bool {
 // records fail findings on the report and returns a non-nil error only for a
 // genuine IO fault that must abort the check.
 func (s *Store) checkAllocatedRequirementFile(report *CheckReport, id, path string) error {
-	data, err := readRegularRequirement(path)
+	if _, statErr := os.Lstat(path); statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			report.Dimensions["allocated-id-file"] = "fail"
+			report.Findings = append(report.Findings, CheckFinding{Code: "E_ID_UNRESOLVED", Subject: id, Message: "allocation has no materialised requirement file", Kind: "fail"})
+			return nil
+		}
+		return statErr
+	}
+	data, outcome, err := readRegularRequirement(path)
+	if outcome == scanReadInconclusive {
+		addFinding(report, CheckFinding{Code: "U_INDEX_UNESTABLISHED", Subject: id, Message: "working-tree requirement read was inconclusive", Kind: "unevaluated"}, "allocated-id-file")
+		return nil
+	}
 	if errors.Is(err, os.ErrNotExist) {
 		report.Dimensions["allocated-id-file"] = "fail"
 		report.Findings = append(report.Findings, CheckFinding{
@@ -417,7 +473,11 @@ func (s *Store) checkDuplicateIDs(ctx context.Context, report *CheckReport) erro
 	projections := map[string]projection{}
 	for _, entry := range entries {
 		seen := map[string]string{}
-		tickets, scanFindings, _, err := scanTickets(entry.Root, entry.WorktreeID, s.projectSlug)
+		tickets, scanFindings, _, inconclusive, err := scanTickets(entry.Root, entry.WorktreeID, s.projectSlug)
+		if inconclusive {
+			addFinding(report, CheckFinding{Code: "U_INDEX_UNESTABLISHED", Subject: entry.WorktreeID, Message: "working-tree ticket scan was inconclusive", Kind: "unevaluated"}, "duplicate-id")
+			continue
+		}
 		if err != nil {
 			if !isIntegrityError(err) {
 				return err
@@ -458,6 +518,15 @@ func isIntegrityError(err error) bool {
 	default:
 		return false
 	}
+}
+
+func isUnestablishedError(err error) bool {
+	code := ErrorCode(err)
+	return code == "U_INDEX_UNESTABLISHED" || code == "U_RELATION_GRAPH_UNESTABLISHED"
+}
+
+func addUnestablishedCheckFinding(report *CheckReport, dimension string, err error) {
+	addFinding(report, CheckFinding{Code: "U_INDEX_UNESTABLISHED", Subject: dimension, Message: err.Error(), Kind: "unevaluated"}, dimension)
 }
 
 func addFinding(report *CheckReport, finding CheckFinding, dimension string) {

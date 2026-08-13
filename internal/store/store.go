@@ -112,6 +112,9 @@ type Store struct {
 	// findingScanHook is a test-only seam fired once per finding-file scan, used
 	// to prove a gauge reads findings a single time. Production leaves it nil.
 	findingScanHook func()
+	// rebuildPhaseBHook is a test-only failure seam inside the atomic rebuild
+	// transaction, after projection replacement and before deferred findings.
+	rebuildPhaseBHook func() error
 }
 
 type Intent struct {
@@ -1026,7 +1029,10 @@ func (s *Store) UpdateTicket(ctx context.Context, id string, update func(domain.
 // keeps the existing SQLite → file → journal protocol intact.
 func (s *Store) UpdateTicketContent(ctx context.Context, id string, update func(domain.Ticket, string) (domain.Ticket, string, error)) (EventKey, error) {
 	path := s.ticketPath(id)
-	data, err := readRegularTicket(path)
+	data, outcome, err := readRegularTicket(path)
+	if outcome == scanReadInconclusive {
+		return EventKey{}, indexUnestablishedError()
+	}
 	if err != nil {
 		return EventKey{}, err
 	}
@@ -1243,7 +1249,7 @@ func (s *Store) recordFinding(ctx context.Context, intent Intent, cause error) e
 
 func (s *Store) recordRebuildFinding(ctx context.Context, entry registryEntry, reason string) error {
 	return s.withImmediate(ctx, func(conn *sql.Conn) error {
-		return upsertReconciliationFinding(ctx, conn, s.projectID, entry.WorktreeID, "rebuild:git-root:"+digestBytes([]byte(entry.Root)), "E_GIT_SCAN", entry.Root, reason)
+		return recordRebuildFindingConn(ctx, conn, s.projectID, entry, reason)
 	})
 }
 
@@ -1448,6 +1454,14 @@ func (s *Store) Rebuild(ctx context.Context) error {
 	var scanned []scannedTicket
 	var scannedFindings []scannedFinding
 	var scannedRequirements []scannedRequirement
+	var deferredScanFindings []struct {
+		entry   registryEntry
+		finding CheckFinding
+	}
+	var deferredRebuildFindings []struct {
+		entry  registryEntry
+		reason string
+	}
 	for _, entry := range entries {
 		valid, reason, gitErr := validGitRoot(entry.Root)
 		if gitErr != nil {
@@ -1456,14 +1470,18 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		if err := s.markWorktreeActive(ctx, entry, valid); err != nil {
 			return err
 		}
-		tickets, scanFindings, _, err := scanTickets(entry.Root, entry.WorktreeID, s.projectSlug)
+		tickets, scanFindings, _, inconclusive, err := scanTickets(entry.Root, entry.WorktreeID, s.projectSlug)
 		if err != nil {
 			return err
 		}
+		if inconclusive {
+			return indexUnestablishedError()
+		}
 		for _, finding := range scanFindings {
-			if err := s.recordScanFinding(ctx, entry, finding); err != nil {
-				return err
-			}
+			deferredScanFindings = append(deferredScanFindings, struct {
+				entry   registryEntry
+				finding CheckFinding
+			}{entry: entry, finding: finding})
 			if id, ok := ticketIDFromFilename(finding.Subject); ok {
 				prefix, number := splitTicketID(id)
 				if int64(number) > maxima[prefix] {
@@ -1471,24 +1489,32 @@ func (s *Store) Rebuild(ctx context.Context) error {
 				}
 			}
 		}
-		findingScan, err := scanFindingFiles(entry.Root, entry.WorktreeID)
+		findingScan, inconclusive, err := scanFindingFiles(entry.Root, entry.WorktreeID)
 		if err != nil {
 			return err
+		}
+		if inconclusive {
+			return indexUnestablishedError()
 		}
 		for _, finding := range findingScan.invalid {
-			if err := s.recordScanFinding(ctx, entry, finding); err != nil {
-				return err
-			}
+			deferredScanFindings = append(deferredScanFindings, struct {
+				entry   registryEntry
+				finding CheckFinding
+			}{entry: entry, finding: finding})
 		}
 		scannedFindings = append(scannedFindings, findingScan.valid...)
-		requirementScan, err := scanRequirements(entry.Root, entry.WorktreeID)
+		requirementScan, inconclusive, err := scanRequirements(entry.Root, entry.WorktreeID)
 		if err != nil {
 			return err
 		}
+		if inconclusive {
+			return indexUnestablishedError()
+		}
 		for _, invalid := range requirementScan.invalid {
-			if err := s.recordScanFinding(ctx, entry, invalid); err != nil {
-				return err
-			}
+			deferredScanFindings = append(deferredScanFindings, struct {
+				entry   registryEntry
+				finding CheckFinding
+			}{entry: entry, finding: invalid})
 			// A malformed file still claims its ID: advance the high-water so the
 			// broken node's ID is never reallocated (mirrors the ticket scan).
 			if id, ok := ticketIDFromFilename(invalid.Subject); ok {
@@ -1513,9 +1539,10 @@ func (s *Store) Rebuild(ctx context.Context) error {
 			}
 		}
 		if !valid {
-			if err := s.recordRebuildFinding(ctx, entry, reason); err != nil {
-				return err
-			}
+			deferredRebuildFindings = append(deferredRebuildFindings, struct {
+				entry  registryEntry
+				reason string
+			}{entry: entry, reason: reason})
 			continue
 		}
 		refMax, err := scanRefMax(entry.Root)
@@ -1550,6 +1577,26 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		}
 		for _, entry := range entries {
 			if _, err := conn.ExecContext(ctx, `DELETE FROM findings WHERE project_id=? AND worktree_id=? AND subtype='review'`, s.projectID, entry.WorktreeID); err != nil {
+				return err
+			}
+			prefix := "scan:" + entry.WorktreeID + ":"
+			if _, err := conn.ExecContext(ctx, `DELETE FROM findings WHERE project_id=? AND worktree_id=? AND subtype='reconciliation' AND substr(finding_key,1,?)=?`, s.projectID, entry.WorktreeID, len(prefix), prefix); err != nil {
+				return err
+			}
+		}
+		if s.rebuildPhaseBHook != nil {
+			if err := s.rebuildPhaseBHook(); err != nil {
+				return err
+			}
+			s.rebuildPhaseBHook = nil
+		}
+		for _, deferred := range deferredScanFindings {
+			if err := recordScanFindingConn(ctx, conn, s.projectID, s.root, deferred.entry, deferred.finding); err != nil {
+				return err
+			}
+		}
+		for _, deferred := range deferredRebuildFindings {
+			if err := recordRebuildFindingConn(ctx, conn, s.projectID, deferred.entry, deferred.reason); err != nil {
 				return err
 			}
 		}
@@ -2527,28 +2574,42 @@ func sortedKeys(values map[string]bool) []string {
 }
 
 func (s *Store) recordScanFinding(ctx context.Context, entry registryEntry, finding CheckFinding) error {
-	rootPath := repoPath(s.root, entry.Root)
+	return s.withImmediate(ctx, func(conn *sql.Conn) error {
+		return recordScanFindingConn(ctx, conn, s.projectID, s.root, entry, finding)
+	})
+}
+
+func recordScanFindingConn(ctx context.Context, conn *sql.Conn, project, root string, entry registryEntry, finding CheckFinding) error {
+	rootPath := repoPath(root, entry.Root)
 	subject := filepath.ToSlash(filepath.Join(rootPath, finding.Subject))
 	if rootPath == "." {
 		subject = finding.Subject
 	}
-	return s.withImmediate(ctx, func(conn *sql.Conn) error {
-		return upsertReconciliationFinding(ctx, conn, s.projectID, entry.WorktreeID, "scan:"+entry.WorktreeID+":"+finding.Code+":"+digestBytes([]byte(subject)), finding.Code, subject, finding.Message)
-	})
+	return upsertReconciliationFinding(ctx, conn, project, entry.WorktreeID, "scan:"+entry.WorktreeID+":"+finding.Code+":"+digestBytes([]byte(subject)), finding.Code, subject, finding.Message)
+}
+
+func recordRebuildFindingConn(ctx context.Context, conn *sql.Conn, project string, entry registryEntry, reason string) error {
+	return upsertReconciliationFinding(ctx, conn, project, entry.WorktreeID, "rebuild:git-root:"+digestBytes([]byte(entry.Root)), "E_GIT_SCAN", entry.Root, reason)
 }
 
 // scanTickets returns the canonical tickets, scan findings, and the exact set
 // of ticket paths excluded from the canonical scan. Readiness uses that set as
 // its graph-establishment boundary, independent of the finding code catalog.
-func scanTickets(root, worktreeID, project string) ([]scannedTicket, []CheckFinding, map[string]struct{}, error) {
+func scanTickets(root, worktreeID, project string) ([]scannedTicket, []CheckFinding, map[string]struct{}, bool, error) {
+	if scanTicketsHook != nil {
+		scanTicketsHook()
+	}
 	dir := filepath.Join(root, ".aira", "tickets")
 	entries, err := os.ReadDir(dir)
+	directoryMissing := false
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil, nil, nil
+		entries = nil
+		directoryMissing = true
 	}
-	if err != nil {
-		return nil, nil, nil, err
+	if err != nil && !directoryMissing {
+		return nil, nil, nil, false, err
 	}
+	firstNames := scanEntityNames(entries)
 	seen := map[string]string{}
 	resultByID := map[string]int{}
 	var result []scannedTicket
@@ -2562,14 +2623,17 @@ func scanTickets(root, worktreeID, project string) ([]scannedTicket, []CheckFind
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
-		data, err := readRegularTicket(path)
+		data, outcome, err := readRegularTicket(path)
+		if outcome == scanReadInconclusive {
+			return nil, nil, nil, true, nil
+		}
 		if err != nil {
 			if ErrorCode(err) == "E_CONFIG_INVALID" {
 				findings = append(findings, scanFinding(root, path, err))
 				exclude(path)
 				continue
 			}
-			return nil, nil, nil, err
+			return nil, nil, nil, false, err
 		}
 		ticket, body, err := domain.ParseTicket(data)
 		if err != nil {
@@ -2604,7 +2668,20 @@ func scanTickets(root, worktreeID, project string) ([]scannedTicket, []CheckFind
 		resultByID[ticket.ID] = len(result)
 		result = append(result, scannedTicket{WorktreeID: worktreeID, Root: root, Path: path, Ticket: ticket, Body: body, Digest: digestBytes(data)})
 	}
-	return result, findings, excludedTicketPaths, nil
+	secondEntries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		if directoryMissing {
+			return result, findings, excludedTicketPaths, false, nil
+		}
+		return nil, nil, nil, true, nil
+	}
+	if err != nil {
+		return nil, nil, nil, false, err
+	}
+	if !sameScanEntityNames(firstNames, scanEntityNames(secondEntries)) {
+		return nil, nil, nil, true, nil
+	}
+	return result, findings, excludedTicketPaths, false, nil
 }
 
 func ticketIDFromFilename(path string) (string, bool) {

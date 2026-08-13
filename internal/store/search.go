@@ -45,6 +45,9 @@ func (s *Store) Search(ctx context.Context, query, kind string) ([]SearchResult,
 	}
 	defer unlockFile(lock)
 	if err := s.reconcileSearchIndex(ctx); err != nil {
+		if ErrorCode(err) == "U_INDEX_UNESTABLISHED" {
+			return nil, err
+		}
 		return nil, fmt.Errorf("%w: %v", ErrSearchUnevaluated, err)
 	}
 	if s.beforeSearchQuery != nil {
@@ -95,13 +98,19 @@ func isFTSUserQueryError(err error) bool {
 }
 
 func (s *Store) reconcileSearchIndex(ctx context.Context) error {
-	tickets, _, _, err := scanTickets(s.root, s.worktreeID, s.projectSlug)
+	tickets, _, _, inconclusive, err := scanTickets(s.root, s.worktreeID, s.projectSlug)
 	if err != nil {
 		return err
 	}
-	findings, err := s.scanFindingFiles(s.root, s.worktreeID)
+	if inconclusive {
+		return indexUnestablishedError()
+	}
+	findings, inconclusive, err := s.scanFindingFiles(s.root, s.worktreeID)
 	if err != nil {
 		return err
+	}
+	if inconclusive {
+		return indexUnestablishedError()
 	}
 	if s.beforeSearchReconcileCommit != nil {
 		s.beforeSearchReconcileCommit()

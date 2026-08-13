@@ -195,7 +195,10 @@ func TestRebuildReconstructsSearchRowsAfterCanonicalRemoval(t *testing.T) {
 	if err := os.Remove(filepath.Join(s.root, ".aira", "tickets", ticket.ID+".md")); err != nil {
 		t.Fatal(err)
 	}
-	findings, err := scanFindingFiles(s.root, s.worktreeID)
+	findings, inconclusive, err := scanFindingFiles(s.root, s.worktreeID)
+	if inconclusive {
+		t.Fatal("finding scan unexpectedly inconclusive")
+	}
 	if err != nil || len(findings.valid) != 1 {
 		t.Fatalf("finding scan before removal = %#v, %v", findings, err)
 	}

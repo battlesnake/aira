@@ -32,15 +32,18 @@ type requirementScanResult struct {
 // malformed ones, mirroring scanFindingFiles. A malformed or unreadable file is
 // surfaced as a reconciliation finding and is NEVER added to the valid set, so it
 // cannot poison the requirement index or manufacture a receipt/allocation.
-func scanRequirements(root, worktree string) (requirementScanResult, error) {
+func scanRequirements(root, worktree string) (requirementScanResult, bool, error) {
 	dir := filepath.Join(root, ".aira", "requirements")
 	entries, err := os.ReadDir(dir)
+	directoryMissing := false
 	if errors.Is(err, os.ErrNotExist) {
-		return requirementScanResult{}, nil
+		entries = nil
+		directoryMissing = true
 	}
-	if err != nil {
-		return requirementScanResult{}, err
+	if err != nil && !directoryMissing {
+		return requirementScanResult{}, false, err
 	}
+	firstNames := scanEntityNames(entries)
 	result := requirementScanResult{}
 	for _, entry := range entries {
 		if filepath.Ext(entry.Name()) != ".md" {
@@ -51,7 +54,10 @@ func scanRequirements(root, worktree string) (requirementScanResult, error) {
 		// as invalid, which records a finding and advances the ID high-water so the
 		// broken node's ID is never reallocated over the directory.
 		path := filepath.Join(dir, entry.Name())
-		data, readErr := readRegularRequirement(path)
+		data, outcome, readErr := readRegularRequirement(path)
+		if outcome == scanReadInconclusive {
+			return requirementScanResult{}, true, nil
+		}
 		if readErr != nil {
 			result.invalid = append(result.invalid, CheckFinding{Code: "E_REQUIREMENT_INVALID", Subject: repoPath(root, path), Message: readErr.Error(), Kind: "unevaluated"})
 			continue
@@ -67,6 +73,19 @@ func scanRequirements(root, worktree string) (requirementScanResult, error) {
 		}
 		result.valid = append(result.valid, scannedRequirement{WorktreeID: worktree, Root: root, Path: path, Requirement: requirement, Digest: digestBytes(data)})
 	}
+	secondEntries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		if directoryMissing {
+			return result, false, nil
+		}
+		return requirementScanResult{}, true, nil
+	}
+	if err != nil {
+		return requirementScanResult{}, false, err
+	}
+	if !sameScanEntityNames(firstNames, scanEntityNames(secondEntries)) {
+		return requirementScanResult{}, true, nil
+	}
 	sort.Slice(result.valid, func(i, j int) bool {
 		pi, ni := splitTicketID(result.valid[i].Requirement.ID)
 		pj, nj := splitTicketID(result.valid[j].Requirement.ID)
@@ -76,7 +95,7 @@ func scanRequirements(root, worktree string) (requirementScanResult, error) {
 		return ni < nj
 	})
 	sort.Slice(result.invalid, func(i, j int) bool { return result.invalid[i].Subject < result.invalid[j].Subject })
-	return result, nil
+	return result, false, nil
 }
 
 // RequirementRecord is a requirement plus its indexed git location.
@@ -93,15 +112,18 @@ func (s *Store) acquireRequirementMutationLock() (*os.File, error) {
 	return acquireLock(filepath.Join(s.commonDir, "aira", "locks", "requirement-rebuild.lock"))
 }
 
-func readRegularRequirement(path string) ([]byte, error) {
+func readRegularRequirement(path string) ([]byte, scanReadOutcome, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, scanReadInconclusive, nil
+		}
+		return nil, scanReadStable, err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, errors.New("E_REQUIREMENT_INVALID: requirement path is not a regular file")
+		return nil, scanReadStable, errors.New("E_REQUIREMENT_INVALID: requirement path is not a regular file")
 	}
-	return os.ReadFile(path)
+	return stableReadFile(path)
 }
 
 func (s *Store) defaultRequirementPrefix() (string, error) {
@@ -150,7 +172,10 @@ func (s *Store) SetRequirement(ctx context.Context, id string, status domain.Req
 		return EventKey{}, err
 	}
 	path := s.requirementPath(id)
-	oldData, err := readRegularRequirement(path)
+	oldData, outcome, err := readRegularRequirement(path)
+	if outcome == scanReadInconclusive {
+		return EventKey{}, indexUnestablishedError()
+	}
 	if err != nil {
 		return EventKey{}, err
 	}

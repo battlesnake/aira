@@ -238,9 +238,12 @@ func (s *Store) records(filter selectorFilter) ([]TicketRecord, error) {
 	if err != nil {
 		return nil, err
 	}
-	tickets, _, _, err := scanTickets(s.root, s.worktreeID, s.projectSlug)
+	tickets, _, _, inconclusive, err := scanTickets(s.root, s.worktreeID, s.projectSlug)
 	if err != nil {
 		return nil, err
+	}
+	if inconclusive {
+		return nil, indexUnestablishedError()
 	}
 	stale := indexStale(indexed, tickets)
 	result := make([]TicketRecord, 0, len(tickets))
@@ -262,9 +265,15 @@ func (s *Store) exactRecord(id, anchor string) (TicketRecord, error) {
 	if anchor != "" {
 		path = filepath.Join(s.root, filepath.FromSlash(anchor))
 	}
-	data, err := readRegularTicket(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return TicketRecord{}, errors.New("E_NOT_FOUND: selector matched no tickets")
+	if _, statErr := os.Lstat(path); statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			return TicketRecord{}, errors.New("E_NOT_FOUND: selector matched no tickets")
+		}
+		return TicketRecord{}, statErr
+	}
+	data, outcome, err := readRegularTicket(path)
+	if outcome == scanReadInconclusive {
+		return TicketRecord{}, indexUnestablishedError()
 	}
 	if err != nil {
 		return TicketRecord{}, err
@@ -307,7 +316,19 @@ func appendUniqueStrings(values []string, additions ...string) []string {
 // ticketExists validates only the ticket file itself. Lease coordination uses
 // this lighter check so an unrelated relation-integrity finding cannot block it.
 func (s *Store) ticketExists(id string) error {
-	_, err := readRegularTicket(s.ticketPath(id))
+	if _, statErr := os.Lstat(s.ticketPath(id)); statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			return errors.New("E_NOT_FOUND: selector matched no tickets")
+		}
+		return statErr
+	}
+	_, outcome, err := readRegularTicket(s.ticketPath(id))
+	if outcome == scanReadInconclusive {
+		if errors.Is(err, os.ErrNotExist) {
+			return errors.New("E_NOT_FOUND: selector matched no tickets")
+		}
+		return indexUnestablishedError()
+	}
 	if errors.Is(err, os.ErrNotExist) {
 		return errors.New("E_NOT_FOUND: selector matched no tickets")
 	}
@@ -349,15 +370,18 @@ func repoAbsolutePath(root, path string) string {
 	return filepath.Join(root, filepath.FromSlash(path))
 }
 
-func readRegularTicket(path string) ([]byte, error) {
+func readRegularTicket(path string) ([]byte, scanReadOutcome, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, scanReadInconclusive, nil
+		}
+		return nil, scanReadStable, err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, errors.New("E_CONFIG_INVALID: ticket path is not a regular file")
+		return nil, scanReadStable, errors.New("E_CONFIG_INVALID: ticket path is not a regular file")
 	}
-	return os.ReadFile(path)
+	return stableReadFile(path)
 }
 
 func matchesTerms(record TicketRecord, terms []queryTerm) bool {

@@ -69,15 +69,18 @@ func (s *Store) findingPath(key string) string {
 	return filepath.Join(s.root, ".aira", "findings", key+".md")
 }
 
-func readRegularFinding(path string) ([]byte, error) {
+func readRegularFinding(path string) ([]byte, scanReadOutcome, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, scanReadInconclusive, nil
+		}
+		return nil, scanReadStable, err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, errors.New("E_FINDING_INVALID: finding path is not a regular file")
+		return nil, scanReadStable, errors.New("E_FINDING_INVALID: finding path is not a regular file")
 	}
-	return os.ReadFile(path)
+	return stableReadFile(path)
 }
 
 func (s *Store) prepareFindingMutation(ctx context.Context, path, precondition string, intended []byte, verb string, finding domain.Finding) (Intent, error) {
@@ -101,7 +104,14 @@ func (s *Store) AddFinding(ctx context.Context, input domain.ReviewFindingInput)
 	}
 	path := s.findingPath(finding.Key)
 	var oldDigest string
-	if data, readErr := readRegularFinding(path); readErr == nil {
+	if _, statErr := os.Lstat(path); statErr == nil {
+		data, outcome, readErr := readRegularFinding(path)
+		if outcome == scanReadInconclusive {
+			return domain.Finding{}, EventKey{}, indexUnestablishedError()
+		}
+		if readErr != nil {
+			return domain.Finding{}, EventKey{}, readErr
+		}
 		old, parseErr := domain.ParseFinding(data)
 		if parseErr != nil {
 			return domain.Finding{}, EventKey{}, parseErr
@@ -110,8 +120,8 @@ func (s *Store) AddFinding(ctx context.Context, input domain.ReviewFindingInput)
 			return domain.Finding{}, EventKey{}, errors.New("E_FINDING_INVALID: finding identity changed at existing path")
 		}
 		oldDigest = digestBytes(data)
-	} else if !errors.Is(readErr, os.ErrNotExist) {
-		return domain.Finding{}, EventKey{}, readErr
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return domain.Finding{}, EventKey{}, statErr
 	}
 	data, err := domain.RenderFinding(finding)
 	if err != nil {
@@ -153,7 +163,10 @@ func (s *Store) SetFinding(ctx context.Context, key string, disposition domain.D
 		return EventKey{}, err
 	}
 	path := s.findingPath(updated.Key)
-	oldData, err := readRegularFinding(path)
+	oldData, outcome, err := readRegularFinding(path)
+	if outcome == scanReadInconclusive {
+		return EventKey{}, indexUnestablishedError()
+	}
 	if err != nil {
 		return EventKey{}, err
 	}
@@ -178,9 +191,15 @@ func (s *Store) GetFinding(key string) (FindingRecord, error) {
 	}
 	if strings.HasPrefix(key, "f-") {
 		path := s.findingPath(key)
-		data, err := readRegularFinding(path)
-		if errors.Is(err, os.ErrNotExist) {
-			return FindingRecord{}, errors.New("E_NOT_FOUND: selector matched no findings")
+		if _, statErr := os.Lstat(path); statErr != nil {
+			if errors.Is(statErr, os.ErrNotExist) {
+				return FindingRecord{}, errors.New("E_NOT_FOUND: selector matched no findings")
+			}
+			return FindingRecord{}, statErr
+		}
+		data, outcome, err := readRegularFinding(path)
+		if outcome == scanReadInconclusive {
+			return FindingRecord{}, indexUnestablishedError()
 		}
 		if err != nil {
 			return FindingRecord{}, err
@@ -256,9 +275,12 @@ func (s *Store) ListFindings(query string) ([]FindingRecord, error) {
 	}
 	var result []FindingRecord
 	if subtype == domain.FindingSubtypeReview || subtype == domain.FindingSubtypeAny {
-		findings, err := s.scanFindingFiles(s.root, s.worktreeID)
+		findings, inconclusive, err := s.scanFindingFiles(s.root, s.worktreeID)
 		if err != nil {
 			return nil, err
+		}
+		if inconclusive {
+			return nil, indexUnestablishedError()
 		}
 		indexed := s.indexedFindings(s.worktreeID)
 		for _, scanned := range findings.valid {
@@ -433,29 +455,35 @@ type findingScanResult struct {
 	invalid []CheckFinding
 }
 
-func (s *Store) scanFindingFiles(root, worktree string) (findingScanResult, error) {
+func (s *Store) scanFindingFiles(root, worktree string) (findingScanResult, bool, error) {
 	if s.findingScanHook != nil {
 		s.findingScanHook()
 	}
 	return scanFindingFiles(root, worktree)
 }
 
-func scanFindingFiles(root, worktree string) (findingScanResult, error) {
+func scanFindingFiles(root, worktree string) (findingScanResult, bool, error) {
 	dir := filepath.Join(root, ".aira", "findings")
 	entries, err := os.ReadDir(dir)
+	directoryMissing := false
 	if errors.Is(err, os.ErrNotExist) {
-		return findingScanResult{}, nil
+		entries = nil
+		directoryMissing = true
 	}
-	if err != nil {
-		return findingScanResult{}, err
+	if err != nil && !directoryMissing {
+		return findingScanResult{}, false, err
 	}
+	firstNames := scanEntityNames(entries)
 	result := findingScanResult{}
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
-		data, readErr := readRegularFinding(path)
+		data, outcome, readErr := readRegularFinding(path)
+		if outcome == scanReadInconclusive {
+			return findingScanResult{}, true, nil
+		}
 		if readErr != nil {
 			result.invalid = append(result.invalid, CheckFinding{Code: "E_FINDING_INVALID", Subject: repoPath(root, path), Message: readErr.Error(), Kind: "unevaluated"})
 			continue
@@ -471,9 +499,22 @@ func scanFindingFiles(root, worktree string) (findingScanResult, error) {
 		}
 		result.valid = append(result.valid, scannedFinding{WorktreeID: worktree, Root: root, Path: path, Finding: finding, Digest: digestBytes(data)})
 	}
+	secondEntries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		if directoryMissing {
+			return result, false, nil
+		}
+		return findingScanResult{}, true, nil
+	}
+	if err != nil {
+		return findingScanResult{}, false, err
+	}
+	if !sameScanEntityNames(firstNames, scanEntityNames(secondEntries)) {
+		return findingScanResult{}, true, nil
+	}
 	sort.Slice(result.valid, func(i, j int) bool { return result.valid[i].Finding.Key < result.valid[j].Finding.Key })
 	sort.Slice(result.invalid, func(i, j int) bool { return result.invalid[i].Subject < result.invalid[j].Subject })
-	return result, nil
+	return result, false, nil
 }
 
 func scanFindingRow(row interface{ Scan(...any) error }) (domain.Finding, error) {
@@ -553,9 +594,12 @@ func (s *Store) findingIndexDivergence() ([]CheckFinding, error) {
 	expected := map[string]domain.Finding{}
 	var findings []CheckFinding
 	for _, entry := range entries {
-		result, scanErr := scanFindingFiles(entry.Root, entry.WorktreeID)
+		result, inconclusive, scanErr := scanFindingFiles(entry.Root, entry.WorktreeID)
 		if scanErr != nil {
 			return nil, scanErr
+		}
+		if inconclusive {
+			return nil, indexUnestablishedError()
 		}
 		for _, invalid := range result.invalid {
 			invalid.Subject = filepath.ToSlash(filepath.Join(repoPath(s.root, entry.Root), invalid.Subject))

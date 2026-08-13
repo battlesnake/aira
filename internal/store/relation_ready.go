@@ -30,16 +30,31 @@ type ReadyRecord struct {
 	Findings []CheckFinding        `json:"findings,omitempty"`
 }
 
+// relationScanSnapshot is the single live working-tree observation used by a
+// readiness decision. Every derived relation and finding below comes from the
+// same ticket scan.
+type relationScanSnapshot struct {
+	tickets            []scannedTicket
+	relations          []storedRelation
+	byID               map[string]domain.Ticket
+	scanFindings       []CheckFinding
+	findings           []CheckFinding
+	excludedTicketPath map[string]struct{}
+}
+
 func relationSubject(r domain.Relation) string {
 	return r.From + ":" + string(r.Kind) + ":" + r.To
 }
 
 func relationEndpointKey(project, id string) string { return project + "\x00" + id }
 
-func scanStoredRelationsAt(root, worktreeID, project string) ([]storedRelation, map[string]domain.Ticket, []CheckFinding, error) {
-	tickets, scanFindings, _, err := scanTickets(root, worktreeID, project)
+func scanRelationSnapshotAt(root, worktreeID, project string) (relationScanSnapshot, error) {
+	tickets, scanFindings, excluded, inconclusive, err := scanTickets(root, worktreeID, project)
 	if err != nil {
-		return nil, nil, nil, err
+		return relationScanSnapshot{}, err
+	}
+	if inconclusive {
+		return relationScanSnapshot{}, relationGraphUnestablishedError()
 	}
 	byID := make(map[string]domain.Ticket, len(tickets))
 	for _, ticket := range tickets {
@@ -75,7 +90,15 @@ func scanStoredRelationsAt(root, worktreeID, project string) ([]storedRelation, 
 			relations = append(relations, storedRelation{Owner: ticket.Ticket.ID, Project: ticket.Ticket.Project, Path: ticket.Path, Relation: relation})
 		}
 	}
-	return relations, byID, findings, nil
+	return relationScanSnapshot{tickets: tickets, relations: relations, byID: byID, scanFindings: scanFindings, findings: findings, excludedTicketPath: excluded}, nil
+}
+
+func scanStoredRelationsAt(root, worktreeID, project string) ([]storedRelation, map[string]domain.Ticket, []CheckFinding, error) {
+	snapshot, err := scanRelationSnapshotAt(root, worktreeID, project)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return snapshot.relations, snapshot.byID, snapshot.findings, nil
 }
 
 func endpointHasOtherProject(byID map[string]domain.Ticket, id, project string) bool {
@@ -103,10 +126,16 @@ func (s *Store) Link(ctx context.Context, from string, kind domain.RelationKind,
 	}
 	fromTicket, err := s.Get(from)
 	if err != nil {
+		if isUnestablishedError(err) {
+			return EventKey{}, indexUnestablishedError()
+		}
 		return EventKey{}, err
 	}
 	toTicket, err := s.Get(to)
 	if err != nil {
+		if isUnestablishedError(err) {
+			return EventKey{}, indexUnestablishedError()
+		}
 		if ErrorCode(err) == "E_NOT_FOUND" {
 			return EventKey{}, errors.New("E_RELATION_TARGET_MISSING: relation target ticket does not exist")
 		}
@@ -120,6 +149,9 @@ func (s *Store) Link(ctx context.Context, from string, kind domain.RelationKind,
 	}
 	relations, _, findings, err := s.scanStoredRelations()
 	if err != nil {
+		if isUnestablishedError(err) {
+			return EventKey{}, indexUnestablishedError()
+		}
 		return EventKey{}, err
 	}
 	for _, finding := range findings {
@@ -143,7 +175,16 @@ func (s *Store) Link(ctx context.Context, from string, kind domain.RelationKind,
 	}
 	owner := domain.CanonicalRelationOwner(from, to)
 	path := s.ticketPath(owner)
-	data, err := readRegularTicket(path)
+	if _, statErr := os.Lstat(path); statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			return EventKey{}, errors.New("E_NOT_FOUND: canonical relation owner file is missing")
+		}
+		return EventKey{}, statErr
+	}
+	data, outcome, err := readRegularTicket(path)
+	if outcome == scanReadInconclusive {
+		return EventKey{}, indexUnestablishedError()
+	}
 	if err != nil {
 		return EventKey{}, err
 	}
@@ -177,9 +218,24 @@ func (s *Store) Unlink(ctx context.Context, from string, kind domain.RelationKin
 	if !kind.IsForward() {
 		return EventKey{}, errors.New("E_RELATION_INVALID: inverse relation kinds are query-only")
 	}
+	if _, _, _, err := s.scanStoredRelations(); err != nil {
+		if isUnestablishedError(err) {
+			return EventKey{}, indexUnestablishedError()
+		}
+		return EventKey{}, err
+	}
 	owner := domain.CanonicalRelationOwner(from, to)
 	path := s.ticketPath(owner)
-	data, err := readRegularTicket(path)
+	if _, statErr := os.Lstat(path); statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			return EventKey{}, errors.New("E_NOT_FOUND: canonical relation owner file is missing")
+		}
+		return EventKey{}, statErr
+	}
+	data, outcome, err := readRegularTicket(path)
+	if outcome == scanReadInconclusive {
+		return EventKey{}, indexUnestablishedError()
+	}
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return EventKey{}, errors.New("E_NOT_FOUND: canonical relation owner file is missing")
@@ -222,7 +278,16 @@ func (s *Store) Relations(id string) ([]domain.RelationView, error) {
 	if err := domain.ValidateID(id); err != nil {
 		return nil, err
 	}
-	if _, err := readRegularTicket(s.ticketPath(id)); err != nil {
+	path := s.ticketPath(id)
+	if _, statErr := os.Lstat(path); statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			return nil, errors.New("E_NOT_FOUND: selector matched no tickets")
+		}
+		return nil, statErr
+	}
+	if _, outcome, err := readRegularTicket(path); outcome == scanReadInconclusive {
+		return nil, indexUnestablishedError()
+	} else if err != nil {
 		if os.IsNotExist(err) {
 			return nil, errors.New("E_NOT_FOUND: selector matched no tickets")
 		}
@@ -242,6 +307,9 @@ func (s *Store) derivedRelationViews(id string) ([]domain.RelationView, error) {
 func (s *Store) derivedRelationViewsWithWarnings(id string) ([]domain.RelationView, []string, error) {
 	relations, _, findings, err := s.scanStoredRelations()
 	if err != nil {
+		if isUnestablishedError(err) {
+			return nil, nil, relationGraphUnestablishedError()
+		}
 		return nil, nil, err
 	}
 	warnings := relationIntegrityWarnings(findings, id)
@@ -314,11 +382,8 @@ func (s *Store) indexedRelations() ([]storedRelation, error) {
 	return result, rows.Err()
 }
 
-func (s *Store) relationIndexDivergence() ([]CheckFinding, error) {
-	canonical, _, _, err := scanStoredRelationsAt(s.root, s.worktreeID, s.projectSlug)
-	if err != nil {
-		return nil, err
-	}
+func (s *Store) relationIndexDivergence(snapshot relationScanSnapshot) ([]CheckFinding, error) {
+	canonical := snapshot.relations
 	indexed, err := s.indexedRelations()
 	if err != nil {
 		return nil, err
@@ -335,13 +400,13 @@ func (s *Store) relationIndexDivergence() ([]CheckFinding, error) {
 	for key, relation := range expected {
 		if _, ok := actual[key]; !ok {
 			findings = append(findings, CheckFinding{Code: "E_RELATION_INDEX_DIVERGENCE", Subject: relationSubject(relation.Relation),
-				Message: "canonical relation is missing from the derived index", Kind: relationIndexFindingKind(s.root, relation)})
+				Message: "canonical relation is missing from the derived index", Kind: relationIndexFindingKind(s.root, snapshot, relation)})
 		}
 	}
 	for key, relation := range actual {
 		if _, ok := expected[key]; !ok {
 			findings = append(findings, CheckFinding{Code: "E_RELATION_INDEX_DIVERGENCE", Subject: relationSubject(relation.Relation),
-				Message: "derived relation index row is absent from canonical files", Kind: relationIndexFindingKind(s.root, relation)})
+				Message: "derived relation index row is absent from canonical files", Kind: relationIndexFindingKind(s.root, snapshot, relation)})
 		}
 	}
 	sort.Slice(findings, func(i, j int) bool {
@@ -353,12 +418,8 @@ func (s *Store) relationIndexDivergence() ([]CheckFinding, error) {
 	return findings, nil
 }
 
-func relationIndexFindingKind(root string, relation storedRelation) string {
-	data, err := readRegularTicket(repoAbsolutePath(root, relation.Path))
-	if err != nil {
-		return "fail"
-	}
-	if _, _, err := domain.ParseTicket(data); err != nil {
+func relationIndexFindingKind(root string, snapshot relationScanSnapshot, relation storedRelation) string {
+	if _, ok := snapshot.byID[relationEndpointKey(relation.Project, relation.Owner)]; !ok {
 		return "fail"
 	}
 	return "warning"
@@ -382,10 +443,13 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 		return nil, errors.New("E_SELECTOR_INVALID: ready requires an exact ID or file anchor")
 	}
 
-	tickets, scanFindings, excludedTicketPaths, err := scanTickets(s.root, s.worktreeID, s.projectSlug)
+	snapshot, err := scanRelationSnapshotAt(s.root, s.worktreeID, s.projectSlug)
 	if err != nil {
 		return nil, err
 	}
+	tickets := snapshot.tickets
+	scanFindings := snapshot.scanFindings
+	excludedTicketPaths := snapshot.excludedTicketPath
 	indexed, err := s.indexedDigests()
 	if err != nil {
 		return nil, err
@@ -413,11 +477,8 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 		}
 	}
 
-	relations, byID, relationFindings, err := scanStoredRelationsAt(s.root, s.worktreeID, s.projectSlug)
-	if err != nil {
-		return nil, err
-	}
-	indexFindings, err := s.relationIndexDivergence()
+	relations, byID, relationFindings := snapshot.relations, snapshot.byID, snapshot.findings
+	indexFindings, err := s.relationIndexDivergence(snapshot)
 	if err != nil {
 		return nil, err
 	}

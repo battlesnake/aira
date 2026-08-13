@@ -1137,6 +1137,9 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			if boolArg(args, "rebuild") {
 				if err := c.store.Rebuild(ctx); err != nil {
+					if store.ErrorCode(err) == "U_INDEX_UNESTABLISHED" {
+						return handlerData{Data: map[string]any{"reconciled": true}, Verdict: "unevaluated"}, nil
+					}
 					return nil, err
 				}
 			}
