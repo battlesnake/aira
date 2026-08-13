@@ -227,7 +227,7 @@ func NormalizeUsage(provider string, raw RawUsage) (ComputeBuckets, *int64, Cons
 		if err := validateBuckets(buckets); err != nil {
 			return ComputeBuckets{}, nil, ConservationUnevaluated, err
 		}
-		return conserve(buckets, raw.ReportedTotal, raw.ReasoningSubset, true)
+		return conserve(buckets, raw.ReportedTotal, EffectiveReasoningSubset(provider, raw), true)
 	}
 	var buckets ComputeBuckets
 	var total *int64
@@ -258,6 +258,8 @@ func NormalizeUsage(provider string, raw RawUsage) (ComputeBuckets, *int64, Cons
 	case "codex":
 		buckets.Output = cloneInt64(raw.CodexOutputTokens)
 		buckets.Reasoning = cloneInt64(raw.CodexReasoningOutputTokens)
+		// Codex's cache-write count is already disjoint from input.
+		buckets.CacheWrite = cloneInt64(raw.CodexCacheWriteInputTokens)
 		total = firstInt64(raw.ReportedTotal, raw.CodexTotalTokens)
 		if raw.CodexInputTokens != nil && raw.CodexCachedInputTokens != nil {
 			if *raw.CodexCachedInputTokens <= *raw.CodexInputTokens {
@@ -267,9 +269,7 @@ func NormalizeUsage(provider string, raw RawUsage) (ComputeBuckets, *int64, Cons
 				return buckets, total, ConservationMismatch, nil
 			}
 		}
-		// Codex's cache-write count is already disjoint from input.
-		buckets.CacheWrite = cloneInt64(raw.CodexCacheWriteInputTokens)
-		complete = raw.CodexInputTokens != nil && raw.CodexCachedInputTokens != nil && raw.CodexOutputTokens != nil
+		complete = raw.CodexInputTokens != nil && raw.CodexCachedInputTokens != nil && raw.CodexCacheWriteInputTokens != nil && raw.CodexOutputTokens != nil
 		subset = true
 	case "gemini":
 		buckets.Output = cloneInt64(raw.CandidatesTokenCount)
@@ -291,6 +291,21 @@ func NormalizeUsage(provider string, raw RawUsage) (ComputeBuckets, *int64, Cons
 		return ComputeBuckets{}, nil, ConservationUnevaluated, fmt.Errorf("%s: provider %q requires explicit disjoint buckets", ComputeCodeProviderUnknown, provider)
 	}
 	return conserve(buckets, total, subset, complete)
+}
+
+// EffectiveReasoningSubset is the contract used by NormalizeUsage and must
+// travel with a persisted event. Explicit buckets carry their own contract;
+// provider-native OpenAI and Codex reasoning counts are subsets of output.
+func EffectiveReasoningSubset(provider string, raw RawUsage) bool {
+	if raw.Buckets != nil {
+		return raw.ReasoningSubset
+	}
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "openai", "codex":
+		return true
+	default:
+		return false
+	}
 }
 
 func firstInt64(values ...*int64) *int64 {

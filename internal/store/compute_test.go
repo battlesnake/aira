@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"aira/internal/domain"
@@ -38,6 +39,46 @@ func TestComputeMismatchIsStoredAndRaisesWarningFinding(t *testing.T) {
 	}
 	if report.Verdict != "pass" || len(report.Warnings) == 0 || report.Warnings[0].Code != domain.ComputeCodeConservation {
 		t.Fatalf("check = %#v", report)
+	}
+}
+
+func TestCodexDriftStoresCacheWriteOnMismatchEvent(t *testing.T) {
+	base := t.TempDir()
+	s := testStore(t, base, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	result, err := s.AddComputeEvent(context.Background(), domain.ComputeEventInput{
+		Model: "codex-test", Provider: "codex", Source: "codex", Raw: domain.RawUsage{
+			CodexInputTokens: computeI64(100), CodexCachedInputTokens: computeI64(120),
+			CodexCacheWriteInputTokens: computeI64(4), CodexOutputTokens: computeI64(20), CodexTotalTokens: computeI64(0),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Event.Conservation != domain.ConservationMismatch || result.Event.Buckets.CacheWrite == nil || *result.Event.Buckets.CacheWrite != 4 {
+		t.Fatalf("codex drift event=%#v", result.Event)
+	}
+	rows, err := s.ListComputeEvents("")
+	if err != nil || len(rows) != 1 || rows[0].Buckets.CacheWrite == nil || *rows[0].Buckets.CacheWrite != 4 {
+		t.Fatalf("stored codex drift rows=%#v err=%v", rows, err)
+	}
+}
+
+func TestExplicitAdditiveReasoningFindingUsesStoredContract(t *testing.T) {
+	base := t.TempDir()
+	s := testStore(t, base, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	_, err := s.AddComputeEvent(context.Background(), computeInput(domain.RawUsage{
+		Buckets:       &domain.ComputeBuckets{Output: computeI64(10), Reasoning: computeI64(5)},
+		ReportedTotal: computeI64(10), ReasoningSubset: false,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	findings, err := s.ListFindings("subtype:reconciliation")
+	if err != nil || len(findings) != 1 {
+		t.Fatalf("findings=%#v err=%v", findings, err)
+	}
+	if !strings.Contains(findings[0].Finding.Details, "present_sum=15") {
+		t.Fatalf("finding details=%q", findings[0].Finding.Details)
 	}
 }
 

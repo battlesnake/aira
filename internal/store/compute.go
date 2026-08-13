@@ -47,6 +47,7 @@ func (s *Store) AddComputeEvent(ctx context.Context, input domain.ComputeEventIn
 	if err != nil {
 		return ComputeEventAddResult{}, err
 	}
+	reasoningSubset := domain.EffectiveReasoningSubset(input.Provider, input.Raw)
 	if input.At == "" {
 		input.At = timeNow()
 	}
@@ -60,12 +61,12 @@ func (s *Store) AddComputeEvent(ctx context.Context, input domain.ComputeEventIn
 			ID: fmt.Sprintf("CE-%d", number), TicketID: input.TicketID, Phase: input.Phase,
 			Model: input.Model, Provider: input.Provider, At: input.At, Session: input.Session,
 			Agent: input.Agent, Source: input.Source, Buckets: buckets, ReportedTotal: total,
-			CostUSD: cloneFloat64(input.CostUSD), ReasoningSubset: input.Raw.ReasoningSubset, Conservation: conservation, AtSeq: sequence,
+			CostUSD: cloneFloat64(input.CostUSD), ReasoningSubset: reasoningSubset, Conservation: conservation, AtSeq: sequence,
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO compute_events(project_id,id,ticket_id,phase,model,provider,at,session,agent,source,fresh_input,cache_read,cache_write,output,reasoning,reported_total,cost_usd,conservation,reasoning_subset,at_seq)
 			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.projectID, event.ID, event.TicketID, event.Phase,
 			event.Model, event.Provider, event.At, event.Session, event.Agent, event.Source,
-			optionalInt64(event.Buckets.FreshInput), optionalInt64(event.Buckets.CacheRead), optionalInt64(event.Buckets.CacheWrite), optionalInt64(event.Buckets.Output), optionalInt64(event.Buckets.Reasoning), optionalInt64(event.ReportedTotal), optionalFloat64(event.CostUSD), event.Conservation, boolInt(input.Raw.ReasoningSubset), event.AtSeq); err != nil {
+			optionalInt64(event.Buckets.FreshInput), optionalInt64(event.Buckets.CacheRead), optionalInt64(event.Buckets.CacheWrite), optionalInt64(event.Buckets.Output), optionalInt64(event.Buckets.Reasoning), optionalInt64(event.ReportedTotal), optionalFloat64(event.CostUSD), event.Conservation, boolInt(event.ReasoningSubset), event.AtSeq); err != nil {
 			return err
 		}
 		evicted, err := s.evictComputeEvents(ctx, conn)
@@ -262,7 +263,7 @@ func (s *Store) reconcileComputeConservationConn(ctx context.Context, conn *sql.
 		if err != nil {
 			return err
 		}
-		sum, ok := domain.PresentBucketSum(event.Buckets, computeReasoningSubset(event.Provider, event))
+		sum, ok := domain.PresentBucketSum(event.Buckets, event.ReasoningSubset)
 		sumText := fmt.Sprintf("%d", sum)
 		if !ok {
 			sumText = "overflow"
@@ -277,13 +278,6 @@ func (s *Store) reconcileComputeConservationConn(ctx context.Context, conn *sql.
 		}
 	}
 	return rows.Err()
-}
-
-func computeReasoningSubset(provider string, event domain.ComputeEvent) bool {
-	if provider == "openai" || provider == "codex" {
-		return true
-	}
-	return event.ReasoningSubset
 }
 
 func valueOrZero(value *int64) int64 {

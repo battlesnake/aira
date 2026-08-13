@@ -87,6 +87,72 @@ func TestSkillExamplesMatchMCPRequestsForEveryAction(t *testing.T) {
 	}
 }
 
+func TestComputeFacesT12SpendQuotaExamplesHaveCLIParityAndValidGuideCommands(t *testing.T) {
+	descriptors := core.New(nil).DispatchDescriptors()
+	artifacts, err := core.GenerateSkillArtifacts(descriptors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := newMCPServer(func(_ context.Context, request core.Request) (*core.Core, func(), error) {
+		return nil, nil, fmt.Errorf("probe for %s", request.Verb)
+	})
+	want := map[string]bool{"spend/add": true, "quota/add": true}
+	seen := map[string]bool{}
+	for _, action := range artifacts.Actions {
+		key := action.Verb + "/" + action.Operation
+		if !want[key] {
+			continue
+		}
+		seen[key] = true
+		positional, options, err := parseArgs(action.Argv[0], action.Argv[1:])
+		if err != nil {
+			t.Fatalf("%s descriptor example parse: %v", key, err)
+		}
+		cli, err := buildRequest(action.Argv[0], positional, options)
+		if err != nil {
+			t.Fatalf("%s descriptor example request: %v", key, err)
+		}
+		tool, ok := server.byName[toolForVerb(descriptors, action.Verb)]
+		if !ok {
+			t.Fatalf("%s has no MCP binding", key)
+		}
+		values := mcpProbeValues(action, cli)
+		values["operation"], err = json.Marshal(action.Operation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mcpRequest, err := decodeMCPRequest(tool, values)
+		if err != nil {
+			t.Fatalf("%s MCP request: %v", key, err)
+		}
+		if !reflect.DeepEqual(cli, mcpRequest) {
+			t.Fatalf("%s CLI=%#v MCP=%#v", key, cli, mcpRequest)
+		}
+
+		guideMarker := "Command: `" + action.Command + "`"
+		if !strings.Contains(string(artifacts.Guide), guideMarker) {
+			t.Fatalf("%s guide is missing command %q", key, action.Command)
+		}
+		guideArgv := strings.Fields(action.Command)
+		if len(guideArgv) < 3 || guideArgv[0] != "aira" {
+			t.Fatalf("%s guide command is not a valid aira invocation: %q", key, action.Command)
+		}
+		guidePositional, guideOptions, err := parseArgs(guideArgv[1], guideArgv[2:])
+		if err != nil {
+			t.Fatalf("%s guide parse: %v", key, err)
+		}
+		guideRequest, err := buildRequest(guideArgv[1], guidePositional, guideOptions)
+		if err != nil || !reflect.DeepEqual(cli, guideRequest) {
+			t.Fatalf("%s guide request=%#v CLI=%#v err=%v", key, guideRequest, cli, err)
+		}
+	}
+	for key := range want {
+		if !seen[key] {
+			t.Fatalf("missing T12 action %s", key)
+		}
+	}
+}
+
 func toolForVerb(descriptors []core.DispatchDescriptor, verb string) string {
 	for _, descriptor := range descriptors {
 		if descriptor.Name == verb {

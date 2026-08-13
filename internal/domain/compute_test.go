@@ -122,6 +122,18 @@ func TestCodexUsageShapeIsDedicated(t *testing.T) {
 	}
 }
 
+func TestCodexWithoutCacheWriteIsUnevaluated(t *testing.T) {
+	_, _, state, err := NormalizeUsage("codex", RawUsage{
+		CodexInputTokens: i64(100), CodexCachedInputTokens: i64(20), CodexOutputTokens: i64(30), CodexTotalTokens: i64(130),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != ConservationUnevaluated {
+		t.Fatalf("codex without cache_write state=%s, want %s", state, ConservationUnevaluated)
+	}
+}
+
 func TestComputePhaseValidation(t *testing.T) {
 	if err := (ComputeEventInput{Provider: "openai", Model: "gpt", Source: "manual", Phase: "unknown"}).Validate(); err == nil || !strings.HasPrefix(err.Error(), ComputeCodeInvalid) {
 		t.Fatalf("phase validation = %v", err)
