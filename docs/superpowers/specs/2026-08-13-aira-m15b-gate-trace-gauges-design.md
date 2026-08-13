@@ -1,6 +1,7 @@
 # M15b — gate + traceability insight gauges (`ratchet-status`, `traceability-status`)
 
-Status: PLAN v3 (incorporates Sol plan-review r1 P0+3×P1 and r2 4×P1). Awaiting Sol re-review → gate → build.
+Status: PLAN v4 (incorporates Sol plan-review r1–r3). r3 confirmed R6 precedence + buckets closed;
+this revises only the traceability scan-core CONTRACT to be lossless. Awaiting Sol re-review → gate → build.
 Milestone: Phase 4, follows M15 (insights framework). Branch `codex-aira-m15b` off master `ccb7325`.
 Depends on: M15 (gauge framework), M13b (ratchet gate), M9c (covers/verifies traceability).
 
@@ -120,24 +121,38 @@ return `GaugeResult{Value, Breakdown, Unevaluated, UnevaluatedReason, Universe, 
   single-root can't reproduce `check`. AND a findings-only derivation is **not faithful**: no finding
   carries a requirement's lifecycle status, so `not_built` needs `traceRequirement.status` directly
   (traceability.go:364), and a covered non-built requirement (which emits no warning) would be
-  indistinguishable from `covered_verified`. Therefore extract a **pure scan-core** shared by BOTH
-  `checkTraceability` and the gauge — no findings round-trip:
+  indistinguishable from `covered_verified`. Therefore extract a **pure scan-core** that returns
+  **LOSSLESS ORDERED raw data** (Sol P1: a digested shape would stop `checkTraceability` reconstructing
+  its exact findings and would lose malformed nodes whose filename yields no ID) — shared by BOTH
+  `checkTraceability` and the gauge:
   ```
+  type malformedNode struct { Subject string; ID string } // ID "" when the filename yields no valid ID
   type traceScan struct {
-      requirements map[string]traceRequirement // id -> {status, path}  (valid nodes)
-      malformed    map[string]string           // id -> subject         (E_REQUIREMENT_INVALID nodes)
-      covers       map[string]bool             // id -> covered
-      verifies     map[string]bool             // id -> verified
-      dangling     []string                    // annotation subjects → absent requirement
-      unevaluated  *traceUnevaluated           // set ONLY for a genuine scan failure (see below)
+      edges        []traceEdge                 // ORDERED raw (path,line,kind,id) — lossless for check findings
+      requirements map[string]traceRequirement // valid nodes: id -> {status, path}
+      malformed    []malformedNode             // ORDERED, keyed by UNIQUE file Subject (collapse-free; ID optional)
+      unevaluated  *traceUnevaluated           // genuine scan failure / empty registry ONLY (NOT all-malformed)
   }
   func (s *Store) scanTraceabilityGraph() (traceScan, error)
   ```
   It runs the identical registry-read + `discoverWorktrees` + `captureTraceSnapshot` +
-  `parseTraceabilitySnapshot` + covers/verifies edge-folding that `checkTraceability`/
-  `resolveTraceabilityEdges` do today. `checkTraceability` is refactored to CALL it and translate to
-  its existing findings (M9c behaviour byte-for-byte preserved — guarded by the existing traceability
-  tests + the drift test). The gauge derives its distribution from `traceScan` directly.
+  `parseTraceabilitySnapshot` scan.
+  - **`checkTraceability` refactor (M9c findings byte-for-byte preserved — HARD constraint):** on
+    `unevaluated` emit the matching `U_TRACE_*`/return exactly as today (preserve the no-prefix/non-git
+    early returns traceability.go:250-265 and the empty-registry returns :327/331); else emit the
+    per-node `E_REQUIREMENT_INVALID` findings from `malformed` **in order** (same subject, :306-320),
+    emit the all-nodes-malformed `U_TRACE_UNSCANNED` diagnostic when `len(requirements)==0 &&
+    len(malformed)>0` (:330-335), then call **`resolveTraceabilityEdges(report, edges, requirements,
+    malformedIDMap)` UNCHANGED** (build `malformedIDMap` = id->subject from the id-bearing `malformed`
+    entries, matching today). The existing M9c traceability tests guard exact output; the builder must
+    not alter `resolveTraceabilityEdges` nor finding order/subjects.
+  - **gauge derivation:** fold covers/verifies from `edges` with the identical switch as
+    `resolveTraceabilityEdges` (traceability.go:345-354) — via a shared pure helper if it can be
+    extracted without changing `check` findings, else a faithful re-walk; `dangling` = edges whose ID
+    is neither in `requirements` nor `malformed`. Per valid requirement → bucket by (status,covers,
+    verifies); per `malformed` node → a per-item `unevaluated` cell keyed by its `Subject` (ID-less
+    nodes included). **Universe = len(requirements) + len(malformed)** (breakdown key = requirement ID
+    for valid nodes, `Subject` for malformed nodes). No findings round-trip.
 - **`unevaluated` signal (gauge-level) is set ONLY for a genuine scan failure:** registry unreadable
   (traceability.go:246), `discoverWorktrees` error (:268), snapshot tore (:285), parse error (:297),
   or empty requirement registry (U_TRACE_EMPTY, :327/331). It is **NOT** set for the
@@ -158,10 +173,12 @@ return `GaugeResult{Value, Breakdown, Unevaluated, UnevaluatedReason, Universe, 
 - **`dangling` count** (top-level `Fields` field, not a per-requirement bucket): `len(traceScan.
   dangling)` — annotations pointing at an absent requirement (`E_TRACE_DANGLING`, traceability.go:349).
 - **Value** = distribution `map[bucket]int` (+ `dangling` count in `Fields`); **Breakdown** =
-  per-requirement `GaugeCell` keyed by requirement ID (`{Value: bucket}`).
-- **Universe:** `Count` = number of requirements across the scanned worktrees; `Scope = "project"`
-  (matches `check`'s multi-worktree discovery); `AsOf = {trace_scan: insightScanID()}` (+ optionally
-  a per-worktree tracked digest). No sequence.
+  `GaugeCell` keyed by requirement ID for valid nodes, and by `Subject` for malformed nodes (which may
+  lack an ID) — `{Value: bucket}`.
+- **Universe:** `Count = len(traceScan.requirements) + len(traceScan.malformed)` (every enumerated
+  requirement node, valid or malformed); `Scope = "project"` (matches `check`'s multi-worktree
+  discovery); `AsOf = {trace_scan: insightScanID()}` (+ optionally a per-worktree tracked digest). No
+  sequence.
 - **Watermark honesty (R4):** traceability has **NO monotone watermark** (a live snapshot). `as_of`
   carries ONLY the wall-clock scan marker `insightScanID()` (+ optional tracked digests) and
   **fabricates no sequence**. No cross-call monotonicity claimed.
@@ -221,12 +238,15 @@ Each gauge carries a `GaugeDrilldown{Verb, Query}` pointer for auditability:
 - **R7 (live vs stored).** ratchet-status live-evaluates (`evaluateRatchet`), NOT the stored gate
   projection. Documented; `gate check` is the separate stored+reconciled view.
 - **R8 (only pure evaluators are gauge-safe).** command/dimension gate-status excluded (D1).
-- **R9 (no traceability drift — via a PURE STATUS SEAM, per Sol P1c).** The gauge and
-  `checkTraceability` share the pure `scanTraceabilityGraph()` scan-core (requirements+status /
-  malformed / covers / verifies / dangling / unevaluated-signal) — NOT a findings round-trip (which
-  cannot reconstruct `not_built` from `status`). `checkTraceability` keeps its exact M9c findings
-  (regression-guarded). A drift test asserts the gauge's per-requirement buckets are consistent with
-  `aira check`'s traceability outcome for the same fixture, **including a sibling-worktree fixture**.
+- **R9 (no traceability drift — via a LOSSLESS scan-core seam, per Sol P1c/P1).** The gauge and
+  `checkTraceability` share the pure `scanTraceabilityGraph()` returning ORDERED raw `edges`, valid
+  `requirements` (with status), ordered `malformed` nodes keyed by unique `Subject`, and an
+  `unevaluated` signal — NOT a findings round-trip (can't reconstruct `not_built` from `status`) and
+  NOT a digested map (would lose edge IDs/kinds/lines/order and ID-less malformed nodes).
+  `checkTraceability` reconstructs its exact M9c findings from this (order/subjects preserved;
+  `resolveTraceabilityEdges` unchanged, fed the id→subject map) — regression-guarded by the existing
+  traceability tests. A drift test asserts the gauge's buckets are consistent with `aira check`'s
+  traceability outcome for the same fixture, **including a sibling-worktree fixture**.
 - **R11 (malformed-node ≠ scan-tear — per Sol P1d).** A node that enumerated but failed to parse
   (`E_REQUIREMENT_INVALID`) is a **per-item `unevaluated` bucket** (the requirement is known to exist,
   unreadable); the gauge stays evaluated (universe counts it). Only a genuine scan failure (R3) makes
@@ -260,9 +280,11 @@ TDD. Regression-shaped where a naive impl would pass; property-shaped for invari
    naive "any err → unclassified" classifier fails one of these.)
 6. `traceability-status` fixture exercising ALL buckets — `covered_verified` / `unverified` /
    `uncovered` / `partial_covered` / `not_built` + a malformed node (per-item `unevaluated`) + a
-   dangling annotation → distribution + `dangling` count; universe = requirement count (incl.
-   malformed), scope `project`, `as_of` has `trace_scan` and **no** sequence key. Assert a
-   Built+uncovered+unverified requirement buckets as `uncovered` (deterministic headline).
+   dangling annotation → distribution + `dangling` count; universe = `len(requirements)+len(malformed)`,
+   scope `project`, `as_of` has `trace_scan` and **no** sequence key. Assert a Built+uncovered+unverified
+   requirement buckets as `uncovered` (deterministic headline). **Includes an ID-less malformed node
+   (invalid filename):** its breakdown cell is keyed by `Subject` and it counts in the universe —
+   proves collapse-free, no node lost (a naive `map[id]` seam drops it).
 7. `traceability-status` empty registry → gauge `Unevaluated` ("no requirements").
 8. `traceability-status` genuine scan failure (registry unreadable / snapshot tear, `unevaluated`
    signal) → gauge `Unevaluated` (reason cites the cause), NOT a distribution.
@@ -289,10 +311,11 @@ TDD. Regression-shaped where a naive impl would pass; property-shaped for invari
 
 - `internal/store/insights.go`: `computeRatchetStatus`, `computeTraceabilityStatus`; two
   `insightRegistry` entries; two `init()` wirings.
-- `internal/store/traceability.go`: extract the pure `scanTraceabilityGraph()` scan-core (returning
-  requirements+status / malformed / covers / verifies / dangling / unevaluated-signal) called by BOTH
-  `checkTraceability` and the gauge (R9/R11) — no findings round-trip, no forked covers/verifies
-  logic; `checkTraceability`'s M9c findings preserved byte-for-byte (existing tests guard it).
+- `internal/store/traceability.go`: extract the pure `scanTraceabilityGraph()` scan-core returning
+  LOSSLESS ordered `edges` + valid `requirements` (with status) + ordered `malformed` nodes
+  (Subject-keyed, ID optional) + `unevaluated` signal, called by BOTH `checkTraceability` and the
+  gauge (R9/R11); `resolveTraceabilityEdges` UNCHANGED; `checkTraceability`'s M9c findings preserved
+  byte-for-byte (existing tests guard it).
 - `internal/store/insights_test.go` (+ traceability seam test): §4 unit tests.
 - `docs/.../2026-08-13-aira-m15b-gate-trace-gauges-design.md` (this file).
 - No faces edits (registry-generic). A parity/coverage assertion confirms both gauges appear in
