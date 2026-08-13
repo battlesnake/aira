@@ -241,33 +241,65 @@ type traceRequirement struct {
 	path   string
 }
 
-func (s *Store) checkTraceability(report *CheckReport) error {
+// malformedNode is deliberately file-shaped rather than ID-shaped. A malformed
+// requirement can have no trustworthy ID, but it is still an enumerated node
+// for the traceability gauge. IDs preserves the aliases used by check's
+// resolver, in discovery order, without collapsing distinct files.
+type malformedNode struct {
+	Subject string
+	IDs     []string
+	Message string
+}
+
+type traceUnevaluated struct {
+	Code    string
+	Subject string
+	Message string
+}
+
+type traceScan struct {
+	edges        []traceEdge
+	requirements map[string]traceRequirement
+	malformed    []malformedNode
+	unevaluated  *traceUnevaluated
+}
+
+func traceScanFailure(code, subject, message string) traceScan {
+	return traceScan{requirements: map[string]traceRequirement{}, unevaluated: &traceUnevaluated{Code: code, Subject: subject, Message: message}}
+}
+
+func appendTraceAlias(ids []string, id string) []string {
+	if id == "" {
+		return ids
+	}
+	for _, existing := range ids {
+		if existing == id {
+			return ids
+		}
+	}
+	return append(ids, id)
+}
+
+// scanTraceabilityGraph is the lossless, pure status seam shared by check and
+// the traceability gauge. It intentionally retains ordered raw edges and
+// malformed files instead of deriving a result from findings.
+func (s *Store) scanTraceabilityGraph() (traceScan, error) {
 	registry, err := readRegistry(s.registryPath)
 	if err != nil {
-		addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_UNSCANNED", Subject: "traceability", Message: err.Error(), Kind: "unevaluated"})
-		return nil
+		return traceScanFailure("U_TRACE_UNSCANNED", "traceability", err.Error()), nil
 	}
+
+	var entries []registryEntry
 	if len(s.prefixesByKind(kindRequirement)) == 0 {
 		_, stderr, gitErr := runGit(s.root, "rev-parse", "--show-toplevel")
 		if gitErr != nil && isNotGitRepository(stderr) {
-			// A non-git ticket-only fixture has no tracked-file graph to
-			// evaluate. Real projects are git worktrees; an explicit annotation
-			// in one will reach U_TRACE_EMPTY below.
-			return nil
+			return traceScanFailure("U_TRACE_EMPTY", "traceability", "requirement registry is empty"), nil
 		}
-	}
-	var entries []registryEntry
-	if len(s.prefixesByKind(kindRequirement)) == 0 {
-		// With no requirement namespace, only the current worktree can request
-		// the explicit no-registry diagnosis. Stale registry worktrees are an
-		// existing non-traceability warning and must not manufacture a trace
-		// snapshot failure in a ticket-only project.
 		entries = []registryEntry{{ProjectID: s.projectID, WorktreeID: s.worktreeID, Root: s.root}}
 	} else {
 		entries, err = discoverWorktrees(s.root, s.projectID, registry)
 		if err != nil {
-			addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_UNSCANNED", Subject: "traceability", Message: err.Error(), Kind: "unevaluated"})
-			return nil
+			return traceScanFailure("U_TRACE_UNSCANNED", "traceability", err.Error()), nil
 		}
 	}
 
@@ -282,22 +314,18 @@ func (s *Store) checkTraceability(report *CheckReport) error {
 		snapshot, snapshotErr := captureTraceSnapshot(entry.Root, hook)
 		hook = nil
 		if snapshotErr != nil {
-			addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_UNSCANNED", Subject: repoPath(s.root, entry.Root), Message: snapshotErr.Error(), Kind: "unevaluated"})
-			return nil
+			return traceScanFailure("U_TRACE_UNSCANNED", repoPath(s.root, entry.Root), snapshotErr.Error()), nil
 		}
 		captured = append(captured, capturedWorktree{entry: entry, snapshot: snapshot})
 	}
 
-	requirements := make(map[string]traceRequirement)
-	malformed := make(map[string]string)
-	var edges []traceEdge
+	scan := traceScan{requirements: make(map[string]traceRequirement), malformed: []malformedNode{}}
 	for _, worktree := range captured {
 		result, parseErr := parseTraceabilitySnapshot(worktree.entry.Root, worktree.snapshot)
 		if parseErr != nil {
-			addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_UNSCANNED", Subject: repoPath(s.root, worktree.entry.Root), Message: parseErr.Error(), Kind: "unevaluated"})
-			return nil
+			return traceScanFailure("U_TRACE_UNSCANNED", repoPath(s.root, worktree.entry.Root), parseErr.Error()), nil
 		}
-		edges = append(edges, result.Edges...)
+		scan.edges = append(scan.edges, result.Edges...)
 		for _, tracked := range worktree.snapshot.Files {
 			if !tracked.Requirement {
 				continue
@@ -310,31 +338,70 @@ func (s *Store) checkTraceability(report *CheckReport) error {
 				if parseErr != nil {
 					message = parseErr.Error()
 				}
-				addFinding(report, CheckFinding{Code: "E_REQUIREMENT_INVALID", Subject: subject, Message: message, Kind: "fail"}, "")
-				if id, ok := ticketIDFromFilename(filenameID + ".md"); ok {
-					malformed[id] = subject
+				ids := []string{}
+				if id, ok := ticketIDFromFilename(tracked.Path); ok {
+					ids = appendTraceAlias(ids, id)
 				}
 				if parseErr == nil {
-					malformed[requirement.ID] = subject
+					ids = appendTraceAlias(ids, requirement.ID)
 				}
+				scan.malformed = append(scan.malformed, malformedNode{Subject: subject, IDs: ids, Message: message})
 				continue
 			}
-			requirements[requirement.ID] = traceRequirement{status: requirement.Status, path: subject}
+			scan.requirements[requirement.ID] = traceRequirement{status: requirement.Status, path: subject}
 		}
 	}
 
+	malformedIDMap := make(map[string]string)
+	for _, node := range scan.malformed {
+		for _, id := range node.IDs {
+			malformedIDMap[id] = node.Subject
+		}
+	}
+	if len(s.prefixesByKind(kindRequirement)) == 0 || (len(scan.requirements) == 0 && len(scan.malformed) == 0) {
+		scan.unevaluated = &traceUnevaluated{Code: "U_TRACE_EMPTY", Subject: "traceability", Message: "requirement registry is empty"}
+	}
+	return scan, nil
+}
+
+func (s *Store) checkTraceability(report *CheckReport) error {
+	_, err := readRegistry(s.registryPath)
+	if err != nil {
+		addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_UNSCANNED", Subject: "traceability", Message: err.Error(), Kind: "unevaluated"})
+		return nil
+	}
 	if len(s.prefixesByKind(kindRequirement)) == 0 {
+		_, stderr, gitErr := runGit(s.root, "rev-parse", "--show-toplevel")
+		if gitErr != nil && isNotGitRepository(stderr) {
+			// A non-git ticket-only fixture has no tracked-file graph to
+			// evaluate. Real projects are git worktrees; an explicit annotation
+			// in one will reach U_TRACE_EMPTY below.
+			return nil
+		}
+	}
+	scan, scanErr := s.scanTraceabilityGraph()
+	if scanErr != nil {
+		return scanErr
+	}
+	if scan.unevaluated != nil {
+		addTraceUnevaluated(report, CheckFinding{Code: scan.unevaluated.Code, Subject: scan.unevaluated.Subject, Message: scan.unevaluated.Message, Kind: "unevaluated"})
+		return nil
+	}
+	malformed := make(map[string]string)
+	for _, node := range scan.malformed {
+		addFinding(report, CheckFinding{Code: "E_REQUIREMENT_INVALID", Subject: node.Subject, Message: node.Message, Kind: "fail"}, "")
+		for _, id := range node.IDs {
+			malformed[id] = node.Subject
+		}
+	}
+	if len(scan.requirements) == 0 && len(malformed) == 0 {
 		addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_EMPTY", Subject: "traceability", Message: "requirement registry is empty", Kind: "unevaluated"})
 		return nil
 	}
-	if len(requirements) == 0 && len(malformed) == 0 {
-		addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_EMPTY", Subject: "traceability", Message: "requirement registry is empty", Kind: "unevaluated"})
-		return nil
-	}
-	if len(requirements) == 0 && len(malformed) > 0 {
+	if len(scan.requirements) == 0 && len(malformed) > 0 {
 		addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_UNSCANNED", Subject: "traceability", Message: "requirement registry contains no readable nodes", Kind: "unevaluated"})
 	}
-	return resolveTraceabilityEdges(report, edges, requirements, malformed)
+	return resolveTraceabilityEdges(report, scan.edges, scan.requirements, malformed)
 }
 
 func resolveTraceabilityEdges(report *CheckReport, edges []traceEdge, requirements map[string]traceRequirement, malformed map[string]string) error {

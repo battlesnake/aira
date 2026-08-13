@@ -171,6 +171,24 @@ func TestTraceabilityMalformedRequirementFailsButItsEdgesAreUnevaluated(t *testi
 	}
 }
 
+func TestScanTraceabilityGraphRetainsIDLessMalformedNode(t *testing.T) {
+	s, root := newTraceabilityStore(t)
+	if err := os.MkdirAll(filepath.Join(root, ".aira", "requirements"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".aira", "requirements", "bad.md"), []byte("not requirement frontmatter\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "add", ".")
+	scan, err := s.scanTraceabilityGraph()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scan.unevaluated != nil || len(scan.malformed) != 1 || scan.malformed[0].Subject != ".aira/requirements/bad.md" || len(scan.malformed[0].IDs) != 0 {
+		t.Fatalf("lossless malformed scan=%#v", scan)
+	}
+}
+
 func TestTraceabilityMixedPrecedencePreservesWarningAndUnevaluated(t *testing.T) {
 	s, root := newTraceabilityStore(t)
 	addTraceRequirement(t, s, domain.RequirementBuilt) // AR-1: malformed node below.

@@ -2,12 +2,14 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
 	"aira/internal/domain"
+	"aira/internal/gate"
 )
 
 // GaugeKind is the small vocabulary used by the structured insight face.
@@ -55,6 +57,7 @@ type GaugeResult struct {
 	Kind              GaugeKind                       `json:"kind"`
 	Value             any                             `json:"value,omitempty"`
 	Breakdown         map[string]GaugeCell            `json:"breakdown,omitempty"`
+	Fields            map[string]any                  `json:"fields,omitempty"`
 	Distributions     map[string]map[string]GaugeCell `json:"distributions,omitempty"`
 	Unevaluated       bool                            `json:"unevaluated"`
 	UnevaluatedReason string                          `json:"unevaluated_reason,omitempty"`
@@ -102,6 +105,8 @@ var insightRegistry = []Gauge{
 	{Name: "wip", Title: "Non-terminal work in progress", Kind: GaugeKindDistribution},
 	{Name: "review-loop-economics", Title: "Compute tokens and cost by phase", Kind: GaugeKindDistribution},
 	{Name: "quota-burn", Title: "Latest quota use and burn by provider", Kind: GaugeKindRate},
+	{Name: "ratchet-status", Title: "Live ratchet gate status", Kind: GaugeKindDistribution},
+	{Name: "traceability-status", Title: "Requirement traceability status", Kind: GaugeKindDistribution},
 }
 
 func init() {
@@ -119,6 +124,10 @@ func init() {
 			insightRegistry[i].Compute = computeReviewLoopEconomics
 		case "quota-burn":
 			insightRegistry[i].Compute = computeQuotaBurn
+		case "ratchet-status":
+			insightRegistry[i].Compute = computeRatchetStatus
+		case "traceability-status":
+			insightRegistry[i].Compute = computeTraceabilityStatus
 		}
 	}
 }
@@ -434,6 +443,185 @@ func computeQuotaBurn(s *Store) (GaugeResult, error) {
 			}
 		}
 		result.Breakdown[provider] = cell
+	}
+	return result, nil
+}
+
+func ratchetStatus(eval DimensionEvaluation, evalErr error) (string, string) {
+	code := eval.Code
+	if eval.Predicate != "" {
+		switch code {
+		case "":
+			switch eval.Predicate {
+			case gate.PredicatePass:
+				return "pass", code
+			case gate.PredicateFail:
+				return "regressed", code
+			}
+		case "E_GATE_RATCHET_REGRESSED":
+			return "regressed", code
+		case "U_GATE_BASELINE_MISSING":
+			return "baseline_missing", code
+		case "U_GATE_INCOMPARABLE":
+			return "incomparable", code
+		case "U_GATE_PROOF_STALE":
+			return "proof_stale", code
+		case "U_GATE_EVIDENCE_UNAVAILABLE":
+			return "evidence_unavailable", code
+		case "E_GATE_INVALID":
+			return "invalid", code
+		default:
+			return "unclassified", code
+		}
+		return "unclassified", code
+	}
+	if evalErr != nil {
+		code = ErrorCode(evalErr)
+		if code == "E_JOURNAL_CORRUPT" {
+			return "corrupt", code
+		}
+		return "unclassified", code
+	}
+	return "unclassified", code
+}
+
+func gateAuditSeq(commonDir string) (uint64, bool) {
+	audit, err := OpenGateAudit(commonDir, false)
+	if err != nil {
+		return 0, false
+	}
+	records, err := audit.Read()
+	if err != nil || len(records) == 0 {
+		return 0, false
+	}
+	return records[len(records)-1].Seq, true
+}
+
+func testReportSeq(s *Store) (int64, bool, error) {
+	var seq sql.NullInt64
+	if err := s.db.QueryRow(`SELECT MAX(at_seq) FROM test_reports WHERE project_id=?`, s.projectID).Scan(&seq); err != nil {
+		return 0, false, err
+	}
+	return seq.Int64, seq.Valid, nil
+}
+
+func computeRatchetStatus(s *Store) (GaugeResult, error) {
+	const name = "ratchet-status"
+	const title = "Live ratchet gate status"
+	gates, err := s.ListGates()
+	if err != nil {
+		return GaugeResult{}, err
+	}
+	ratchets := make([]gate.GateDefinition, 0, len(gates))
+	for _, def := range gates {
+		if def.Kind == gate.KindRatchet {
+			ratchets = append(ratchets, def)
+		}
+	}
+	asOf := map[string]any{}
+	if seq, ok := gateAuditSeq(s.commonDir); ok {
+		asOf["gate_audit_seq"] = seq
+	}
+	if seq, ok, seqErr := testReportSeq(s); seqErr != nil {
+		return GaugeResult{}, seqErr
+	} else if ok {
+		asOf["test_report_at_seq"] = seq
+	}
+	if digest, digestErr := digestEvaluationRoot(s.root); digestErr == nil {
+		asOf["tracked_worktree_digest"] = digest
+	}
+	universe := gaugeUniverse(len(ratchets), "project", asOf)
+	drilldown := GaugeDrilldown{Verb: "gate", Query: "check"}
+	if len(ratchets) == 0 {
+		return unevaluatedGauge(name, title, GaugeKindDistribution, "no ratchet gates configured", universe, drilldown), nil
+	}
+
+	result := GaugeResult{Name: name, Title: title, Kind: GaugeKindDistribution, Value: map[string]int{}, Breakdown: map[string]GaugeCell{}, Universe: universe, Drilldown: drilldown}
+	for _, def := range ratchets {
+		eval, evalErr := s.evaluateRatchet(context.Background(), def, s.root)
+		bucket, code := ratchetStatus(eval, evalErr)
+		result.Value.(map[string]int)[bucket]++
+		fields := map[string]GaugeCell{"code": {Value: code}, "tracked_worktree_digest": {Value: eval.Root.Digest}}
+		if baseline, baselineErr := s.ResolveGateBaseline(def.ID); baselineErr == nil {
+			fields["baseline_seq"] = GaugeCell{Value: baseline.Seq}
+		}
+		result.Breakdown[def.ID] = GaugeCell{Value: bucket, Fields: fields, Drilldown: &drilldown}
+	}
+	return result, nil
+}
+
+func traceabilityBucket(requirement traceRequirement, covered, verified bool) string {
+	switch requirement.status {
+	case domain.RequirementBuilt:
+		if !covered {
+			return "uncovered"
+		}
+		if !verified {
+			return "unverified"
+		}
+		return "covered_verified"
+	case domain.RequirementPartial:
+		if covered {
+			return "partial_covered"
+		}
+		return "uncovered"
+	default:
+		return "not_built"
+	}
+}
+
+func computeTraceabilityStatus(s *Store) (GaugeResult, error) {
+	const name = "traceability-status"
+	const title = "Requirement traceability status"
+	scanID := insightScanID()
+	drilldown := GaugeDrilldown{Verb: "check", Query: ""}
+	scan, err := s.scanTraceabilityGraph()
+	if err != nil {
+		return GaugeResult{}, err
+	}
+	count := len(scan.requirements) + len(scan.malformed)
+	universe := gaugeUniverse(count, "project", map[string]any{"trace_scan": scanID})
+	if scan.unevaluated != nil {
+		reason := scan.unevaluated.Message
+		if scan.unevaluated.Code == "U_TRACE_EMPTY" {
+			reason = "no requirements"
+		}
+		return unevaluatedGauge(name, title, GaugeKindDistribution, reason, universe, drilldown), nil
+	}
+
+	covers := map[string]bool{}
+	verifies := map[string]bool{}
+	malformedIDs := map[string]bool{}
+	for _, node := range scan.malformed {
+		for _, id := range node.IDs {
+			malformedIDs[id] = true
+		}
+	}
+	dangling := 0
+	for _, edge := range scan.edges {
+		switch {
+		case malformedIDs[edge.ID]:
+		case scan.requirements[edge.ID].path == "":
+			dangling++
+		case edge.Kind == traceCovers:
+			covers[edge.ID] = true
+		case edge.Kind == traceVerifies:
+			verifies[edge.ID] = true
+		}
+	}
+
+	result := GaugeResult{Name: name, Title: title, Kind: GaugeKindDistribution, Value: map[string]int{}, Breakdown: map[string]GaugeCell{}, Fields: map[string]any{"dangling": dangling}, Universe: universe, Drilldown: drilldown}
+	for id, requirement := range scan.requirements {
+		bucket := traceabilityBucket(requirement, covers[id], verifies[id])
+		result.Value.(map[string]int)[bucket]++
+		result.Breakdown[id] = GaugeCell{Value: bucket, Drilldown: &drilldown}
+	}
+	for _, node := range scan.malformed {
+		result.Value.(map[string]int)["unevaluated"]++
+		cell := gaugeCellUnevaluated(node.Message)
+		cell.Value = "unevaluated"
+		cell.Drilldown = &drilldown
+		result.Breakdown[node.Subject] = cell
 	}
 	return result, nil
 }
