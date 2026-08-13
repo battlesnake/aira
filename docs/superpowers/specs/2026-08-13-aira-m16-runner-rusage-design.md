@@ -1,8 +1,9 @@
 # M16 — cgroup resource accounting at exit (peak_rss · CPU · oom-killed)
 
-Status: PLAN v3 (incorporates Sol plan-review r1 + r2). r2: snapshot BEFORE the terminal CAS (not before
-remove); every child-ran removal site (normal/kill/reconcile), pre-launch→nil; run-log code scoped to
-run/run-kill; OOM test sets up its own constrained parent. Awaiting Sol re-review → gate → build.
+Status: PLAN v4 (incorporates Sol plan-review r1–r3). r3: the Kill→lost terminal path snapshots too;
+lock held through snapshot→CAS→remove; OOM is an auxiliary positive-only refinement (memory.events
+unreadable → base status, never a fake oom-killed); runRecordCode oom-killed precedence specified.
+Awaiting Sol re-review → gate → build.
 Branch `codex-aira-m16` off master `0f4ca96`. Phase 5 (full subprocess runner), first cut. Spec §14
 ("Resource accounting from the cgroup, at exit") + §101 (`cpu_user/cpu_sys/peak_rss?/status(...|oom-killed)`).
 Class: **runner + cgroup correctness → the two-loop is mandatory; real-cgroup verification is load-bearing**
@@ -36,14 +37,23 @@ the §17 estimate-vs-actual gauge + `MemoryMax` tuning (both OUT of scope).
 3. **New `RunRecord` fields** `PeakRSS`, `CPUUser`, `CPUSys` (all `*int64`, µs for CPU; nil =
    **unevaluated**, mirroring M14's nullable-bucket discipline). Persisted in the ledger JSON + DB
    projection; nil serialises absent, never `0`.
-4. **New status `oom-killed` (`StatusOOMKilled`)** — `Terminal()` includes it. Classification:
-   `memory.events.oom_kill > 0` (a KERNEL OOM) ⇒ `oom-killed`; an explicit `run-kill`/timeout
-   (`KillIntent.Present`) ⇒ `killed`; else `exited`. A userspace SIGKILL does not increment the cgroup
-   `oom_kill` counter, so the two are mutually exclusive — **this kernel behaviour is proven by the
-   real-cgroup OOM test (Sol P1-4), the discriminator**.
-5. **Response-contract integration (Sol P1-1).** Add stable code `E_RUN_OOM_KILLED`; `core.runRecordCode`
-   (core.go:378-390) maps `oom-killed → E_RUN_OOM_KILLED`; register it in check.go's code table
-   (:36-42) so an OOM run does NOT return `OK`.
+4. **New status `oom-killed` (`StatusOOMKilled`)** — `Terminal()` includes it. **The base status is the
+   observed wait/kill result (`exited`/`killed`/`lost`); `oom-killed` is an AUXILIARY POSITIVE-ONLY
+   refinement** applied only when `memory.events.oom_kill > 0` is POSITIVELY read (Sol r3 P1-honesty).
+   A userspace `run-kill`/timeout SIGKILL does not increment the cgroup `oom_kill` counter, so a real
+   kernel OOM is distinguishable — **proven by the real-cgroup OOM test (the discriminator)**. If
+   `memory.events` is **unreadable**, the base status stands (it honestly reports the exit signal) and
+   `oom-killed` is NOT fabricated — the absence of `oom-killed` means "OOM not positively observed",
+   never a claim of "definitely not OOM". Precedence: `oom_kill>0` ⇒ `oom-killed`; explicit
+   `run-kill`/timeout (`KillIntent.Present`) ⇒ `killed`; else the existing `exited`/`lost`. Tested with a
+   `memory.events` read failure (base status retained, no fake `oom-killed`, no crash).
+5. **Response-contract integration (Sol P1-1, r3 P1).** Add stable code `E_RUN_OOM_KILLED`;
+   `core.runRecordCode` (core.go:378-390) maps `oom-killed → E_RUN_OOM_KILLED`; register it in
+   check.go's code table (:36-42) so an OOM run does NOT return `OK`. **Precedence:** `runRecordCode`
+   today returns the first `ErrorCodes` entry before inspecting status — place `oom-killed` at the SAME
+   precedence position as the existing terminal statuses (`killed`/`lost`), so an `oom-killed` record
+   maps to `E_RUN_OOM_KILLED` consistently; a test covers an `oom-killed` record BOTH with and without a
+   co-occurring scope/capture `ErrorCode` and asserts the documented precedence.
 6. **Usage-read failures never fail the run or the gate (Sol P1-2).** A failed/absent stat leaves the
    field **nil** and emits **NO** `ErrorCodes` entry (any `ErrorCodes` entry makes `CleanSuccess` false,
    types.go:100-102, failing `runRecordCode` + rejecting command gates, gate_command.go:226-235). The nil
@@ -80,13 +90,18 @@ after `cgroup.kill` (processes gone) and before `rmdir` (Sol-confirmed), so the 
 (`killWithIntent` :1067-1117, holding the lock) snapshots before its removal too, threaded through
 `attempt.Current` and the timeout path.
 
-**Every child-ran removal site (Sol P1).** Snapshot at each site where a real child ran before the scope
-is removed: the normal terminal path, `killWithIntent` (run-kill + timeout), and **reconcile**
-(:1344-1365, which kills+terminalizes+removes an orphan). **Pre-launch / setup-failure removals**
+**Every child-ran TERMINAL path (Sol P1, r3 P1).** Snapshot into the candidate before the CAS at each
+path where a real child ran: the normal terminal path; `killWithIntent` (run-kill + timeout);
+**reconcile** (:1344-1365, kills+terminalizes+removes an orphan — it already holds the scope handle+lock:
+opens :1312, kills :1344, CAS :1360, removes :1365, unlocks :1368); and the **`Kill` → `lost`** path
+(:1135-1142, when `killWithIntent` cannot prove completion — the scope may still exist): attempt the
+snapshot; if the scope is unavailable, nil (honest). **Pre-launch / setup-failure removals**
 (:165/:582/:613 — the child never ran) ⇒ usage stays **nil** (a just-created cgroup's setup-peak is NOT
-the child's usage; nil is the honest value); no snapshot there. A crash path where the scope was already
-removed ⇒ nil (honest), not a crash. Every one of these paths writes a terminal record; each must carry
-its snapshot BEFORE the CAS (the early-terminal return cannot merge a later candidate — Sol P1).
+the child's usage). A crash path where the scope was already removed ⇒ nil, not a crash. **Lock
+discipline (Sol r3 P1):** on the normal path the per-run lock currently unlocks at :428 BEFORE
+`scope.Remove()` (:429-430); the build MUST hold the lock through snapshot → CAS → removal (move the
+unlock after removal), matching reconcile's ordering. Every terminal writer carries its snapshot BEFORE
+the CAS (the early-terminal return :503-509 cannot merge a later candidate).
 
 ### 2.2 Parsing (cgroup-v2)
 - `memory.peak`: single integer (bytes); absent (pre-5.19) ⇒ `PeakRSS` nil.
@@ -131,7 +146,11 @@ the terminal-complete CAS (Sol — highest structural risk).
 3. `memory.events` `oom_kill>0` ⇒ OOM; `0`/absent ⇒ not OOM.
 4. Classification precedence: `oom_kill>0`→oom-killed; `run-kill`/timeout→killed; clean→exited.
 5. One file's read error leaves ONLY that metric nil (others populated).
-6. Response contract: an `oom-killed` record → `runRecordCode` = `E_RUN_OOM_KILLED` (not `OK`).
+6. Response contract: an `oom-killed` record → `runRecordCode` = `E_RUN_OOM_KILLED` (not `OK`), BOTH with
+   and without a co-occurring scope/capture `ErrorCode` (asserts the documented precedence, Sol r3 P1).
+6b. **`memory.events` read failure (honesty, Sol r3 P1):** a signal-KILL exit whose `memory.events` is
+   unreadable → the base wait status is retained, `oom-killed` is NOT fabricated, and it does not crash —
+   the absence of `oom-killed` is "not positively observed", never "definitely not OOM".
 
 **Real-cgroup (SKIP in sandbox; Opus under whale-run — load-bearing):**
 7. **OOM discriminator (Sol P1-4).** The test itself creates a dedicated WRITABLE parent cgroup under
@@ -145,8 +164,10 @@ the terminal-complete CAS (Sol — highest structural risk).
 10. A **run-killed** run ⇒ usage still snapshotted (read before `killWithIntent` removes the scope) AND
     status `killed`, NOT `oom-killed` (Sol P0-2 discriminator). Allow nil metrics on an unsupported
     kernel / read failure (assert the STATUS + the no-mis-tag, tolerate nil usage).
-11. #17 non-regression: `contained`/`unverified`/`exited`/`killed` classifications + terminal-CAS
-    unchanged when usage reading is added.
+11. #17 non-regression + metrics-across-races: `contained`/`unverified`/`exited`/`killed` classifications
+    + terminal-CAS unchanged when usage reading is added, AND metrics are RETAINED across each terminal
+    race (normal, run-kill, timeout, reconcile, and the `Kill`→`lost` path) — asserting the actual
+    metric values survive, not merely a terminal count (Sol r3 P1).
 
 ## 5. Files
 
