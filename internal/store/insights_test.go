@@ -216,18 +216,26 @@ func TestEconomicsCostOnlyPhaseTokenCellUnevaluated(t *testing.T) {
 	}
 }
 
-// TestReviewerReadsFindingsOnceUniverseMatchesCells verifies Sol P1-2: the
-// reviewer gauge reads findings once, so the universe count always equals the
-// sum of the per-source cell counts (a torn multi-scan would violate this).
-func TestReviewerReadsFindingsOnceUniverseMatchesCells(t *testing.T) {
+// TestReviewerReadsFindingsExactlyOnce verifies Sol P1-2 discriminatingly: the
+// reviewer gauge scans finding files EXACTLY ONCE. The pre-fix code scanned once
+// for the source distribution plus once per source for verdicts (N+1 scans),
+// which a concurrent mutation could tear; this asserts the single-scan fix and
+// fails against that multi-scan implementation.
+func TestReviewerReadsFindingsExactlyOnce(t *testing.T) {
 	base := t.TempDir()
 	s := testStore(t, base, base+"/common", base+"/state")
 	insightFinding(t, s, "codex", domain.VerdictConfirmed, "c1")
 	insightFinding(t, s, "codex", domain.VerdictRefuted, "c2")
 	insightFinding(t, s, "fable", domain.VerdictConfirmed, "c3")
+	scans := 0
+	s.findingScanHook = func() { scans++ }
+	defer func() { s.findingScanHook = nil }()
 	result, err := s.ComputeGauge("reviewer-verdict-ratio")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if scans != 1 {
+		t.Fatalf("reviewer gauge scanned findings %d times, want exactly 1 (the pre-fix multi-scan was N+1)", scans)
 	}
 	sum := 0
 	for _, cell := range result.Breakdown {

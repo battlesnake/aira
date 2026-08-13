@@ -434,6 +434,9 @@ type findingScanResult struct {
 }
 
 func (s *Store) scanFindingFiles(root, worktree string) (findingScanResult, error) {
+	if s.findingScanHook != nil {
+		s.findingScanHook()
+	}
 	return scanFindingFiles(root, worktree)
 }
 

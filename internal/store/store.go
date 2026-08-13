@@ -109,6 +109,9 @@ type Store struct {
 	// testReportInsertHook is a test-only crash seam for proving report/result
 	// atomicity. Production leaves it nil.
 	testReportInsertHook func(int) error
+	// findingScanHook is a test-only seam fired once per finding-file scan, used
+	// to prove a gauge reads findings a single time. Production leaves it nil.
+	findingScanHook func()
 }
 
 type Intent struct {
