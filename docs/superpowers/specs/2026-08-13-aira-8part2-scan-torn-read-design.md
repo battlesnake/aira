@@ -1,6 +1,8 @@
 # #8-part2 — crash-recovery scan torn-read race (honest, never a fake fail / false-pass / fake-zero)
 
-Status: PLAN v2 (incorporates Sol plan-review r1: 2×P0 + 2×P1 + P2). Awaiting Sol re-review → gate → build.
+Status: PLAN v3 (incorporates Sol plan-review r1 + r2: read-only scan phase, Ready single-snapshot,
+structured unevaluated contract, exact self-heal predicate, alternating-payload test seam).
+Awaiting Sol re-review → gate → build.
 Branch `codex-aira-8part2` off master `4374992`. Task #8 part 2 (part 1 landed `8183345`).
 Class: **crash-recovery correctness → the two-loop is mandatory** (CLAUDE.md).
 
@@ -63,9 +65,10 @@ fully-stable scan — it makes the scan-finding **self-heal safe to fix here** (
    proceeds exactly as today.
 3. **Genuinely-malformed *stable* file STILL reports** (`E_*_INVALID`) — byte-identical reads parse
    malformed both times; the fix must not mask real corruption (false-negative guard).
-4. **`Ready` (Sol P0-1):** unify its scans so a torn read in EITHER the ticket or the relation scan
-   propagates to `graphUnevaluated` → `U_RELATION_GRAPH_UNESTABLISHED` (never a false-pass). Scan once
-   and share the snapshot, or union the exclusions from `scanStoredRelationsAt`.
+4. **`Ready` (Sol P0-1/P0-2):** scan tickets ONCE and derive both ticket rows and relations from that
+   single snapshot (remove the second `scanStoredRelationsAt` scan) — union-of-exclusions is
+   insufficient because two individually-stable scans can read different atomic versions. A torn read
+   in that one scan → `U_RELATION_GRAPH_UNESTABLISHED` (never a false-pass).
 5. **Scan-finding self-heal (Sol P1; folds in D1 safely):** on a fully-stable scan, **full-replace**
    the worktree's `scan:` reconciliation findings (delete the worktree's scan reconciliation rows, then
    re-insert the current scan's set) so a fixed file's finding CLEARS — and any pre-existing spurious
@@ -96,18 +99,49 @@ fully-stable scan — it makes the scan-finding **self-heal safe to fix here** (
 after N attempts still unequal/vanished → `inconclusive`. A genuine IO error (EACCES, etc.) → `err`
 (today's behaviour, D3). No sleep-free busy loop; backoff is bounded and tiny (Rebuild is not hot).
 
-### 2.2 Rebuild (store.go:1382) two-phase
-- **Phase A (scan, read-only):** run `scanTickets`/`scanFindingFiles`/`scanRequirements` using
-  `stableReadFile`. Collect `valid`, genuine-malformed `findings`, and an `inconclusive` set.
-- **If `inconclusive` non-empty → return `U_INDEX_UNESTABLISHED`** (transient, retryable) — do NOT
-  enter the mutation transaction. Prior index intact.
-- **Phase B (mutate, as today) + self-heal:** full-replace projections (store.go:1539-1549) AND
-  full-replace the worktree's `scan:` reconciliation findings (IN-5). Genuine findings recorded.
+### 2.2 Rebuild (store.go:1382) — genuinely read-only scan, then mutate
+Sol P0-1: Rebuild mutates BEFORE the scan today (`replayUnjournaledEvents` store.go:1388;
+`markWorktreeActive` store.go:1456; scan findings recorded incrementally in their own transactions
+store.go:1463-1482 / finding.go:528). So "abort → intact" requires restructuring:
+- **Pre-scan idempotent ops stay** (`replayUnjournaledEvents`, `markWorktreeActive`) — they are
+  idempotent (journal replay re-runs to the same state; active-mark is metadata), so running them and
+  then aborting is safe: the next Rebuild re-runs them identically and neither corrupts the ticket/
+  finding/relation projections. (The plan asserts + a test confirms idempotency-across-abort.)
+- **Phase A (scan) is READ-ONLY:** `scanTickets`/`scanFindingFiles`/`scanRequirements` use
+  `stableReadFile` and collect `valid`, genuine-malformed `findings`, and the `inconclusive` set
+  **in memory** — NO `recordScanFinding`/DB write during the scan (move the incremental recording at
+  store.go:1463-1482 into Phase B).
+- **If `inconclusive` non-empty → return `U_INDEX_UNESTABLISHED`** (transient) BEFORE Phase B — the
+  ticket/finding/relation projections and the scan reconciliation findings are untouched (prior
+  last-known-good), and NO finding is recorded.
+- **Phase B (mutate; only on a fully-stable scan):** the existing full-replace of projections
+  (store.go:1539-1549), the deferred recording of genuine findings, AND the scan-finding self-heal:
+  ```sql
+  DELETE FROM findings WHERE project_id=? AND worktree_id=? AND subtype='reconciliation'
+    AND substr(finding_key,1,?) = ?   -- ? = len('scan:'+worktree+':'), 'scan:'+worktree+':'
+  ```
+  (Sol P1: an exact `scan:<worktree>:` prefix — NOT project/worktree/subtype alone, which would clobber
+  the compute/flaky/conservation reconciliation rows at compute.go:328 / testreport.go:507.) Then
+  re-insert the current scan's findings. Safe because it runs only post-stable-scan.
 
-### 2.3 Ready (relation_ready.go:378)
-Make the ticket + relation scans share one stable snapshot (or union both exclusion sets). Any
-inconclusive read → `graphUnevaluated=true` → `U_RELATION_GRAPH_UNESTABLISHED` (the existing honest
-surface, relation_ready.go:429/542-556). Never compute readiness from a partial graph.
+### 2.3 Ready (relation_ready.go:378) — ONE shared snapshot (Sol P0-2)
+"Union the exclusions" is insufficient: two individually-STABLE scans can read DIFFERENT atomic
+versions of a ticket (the ticket scan at store.go:385 sees A with a `blocks` edge; the separate
+`scanStoredRelationsAt` at store.go:416 reads A after an atomic rewrite WITHOUT it) → a false-pass with
+NO inconclusive read. Fix: **scan tickets ONCE and derive both the ticket rows AND the relations from
+that single snapshot** (relations are embedded in the parsed ticket, relation_ready.go:16-40) — remove
+the second `scanStoredRelationsAt` scan. Any inconclusive read in that one scan →
+`U_RELATION_GRAPH_UNESTABLISHED` (relation_ready.go:429/542-556). Never compute readiness from two
+skewed scans or a partial graph.
+
+### 2.4 Caller contract — U_INDEX_UNESTABLISHED as a structured UNEVALUATED result (Sol P1)
+Returning the code as a bare error yields `CheckReport{}`+error, not the UNEVALUATED report/data
+contract (`Check` maps only `isIntegrityError` today, check.go:188-193; the core `reconcile --rebuild`
+path returns the raw error, core.go:1134-1143). So: `Check` converts a `U_INDEX_UNESTABLISHED` from
+Rebuild into an **unevaluated** report (the ticket/relation/readiness dimensions become `unevaluated`,
+never a partial pass), and the `reconcile`/rebuild handler returns a structured unevaluated result with
+that code. Faces render it as a transient, retryable `unevaluated` (exit per the U_ class), NOT a hard
+failure. Tested.
 
 ## 3. §1b — resolutions (r1 incorporated)
 
@@ -130,13 +164,28 @@ surface, relation_ready.go:429/542-556). Never compute readiness from a partial 
 - **R7 (accepted residual).** A writer that pauses between the two reads with byte-identical partial
   content is indistinguishable from stable (same residual as the existing gate/trace tear-checks);
   sub-millisecond, external non-atomic writers do not pause mid-write. Written down.
+- **R8 (Rebuild scan phase is read-only — Sol P0-1).** No `recordScanFinding`/projection write during
+  Phase A; findings collected in memory, recorded only in Phase B on a stable scan. Pre-scan
+  `replayUnjournaledEvents`/`markWorktreeActive` are idempotent, so running-then-aborting is safe
+  (asserted + tested for idempotency across an abort).
+- **R9 (Ready uses ONE snapshot — Sol P0-2).** Ready derives ticket rows AND relations from a single
+  ticket scan; the second `scanStoredRelationsAt` is removed. Closes the two-stable-scans version-skew
+  false-pass, not just the inconclusive case.
+- **R10 (structured unevaluated contract — Sol P1).** `U_INDEX_UNESTABLISHED` surfaces as an
+  UNEVALUATED report/handler result (Check + reconcile), never a bare error or partial pass.
+- **R11 (exact self-heal predicate — Sol P1).** DELETE targets only `subtype='reconciliation'` rows
+  whose `finding_key` has the exact `scan:<worktree>:` prefix; compute/flaky/conservation rows are
+  untouched.
 
 ## 4. Tests (Sol P2 — must FAIL against today's single-read code)
 
-To exercise TODAY's bug, drive a concurrent write synchronized with the reader via a test seam placed
-so it fires for BOTH the current single read and the new double read (e.g. a `scanReadHook` invoked at
-the START of a read, which the test uses to swap the file bytes; on today's single-read path this
-produces the torn finding, and the test asserts that today FAILS).
+To exercise TODAY's bug the seam must make the TWO reads observe DIFFERENT bytes (a genuine tear): a
+`scanReadHook`/injected reader that returns **payload A on read-invocation 1 and payload B on
+invocation 2** (a per-invocation sequencer, synchronized), then stabilises. On today's single-read path
+the reader sees one torn payload → records a finding (test asserts today FAILS); on the fixed
+double-read the two differing reads → `inconclusive`. A one-time "swap at read start" is NOT a valid
+discriminator (both new reads would see identical post-swap bytes → a stable malformed file, not a
+tear) — the sequencer is mandatory.
 1. **Torn ticket → no fake finding + no index mutation (fail-before):** valid committed ticket; hook
    swaps bytes at read time → today records a spurious `E_CONFIG_INVALID`; fixed → Rebuild returns
    `U_INDEX_UNESTABLISHED`, records NO finding, and the prior index is unchanged.
