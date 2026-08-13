@@ -59,6 +59,22 @@ git-file content in the working tree*, and agents' **uncommitted** entities are 
 state; a committed-snapshot fix would drop them. So the fix keeps working-tree semantics and makes a
 raced scan **honest** (candidate B of `~/tmp/aira-design/8part2-rebuild-race-analysis.md`).
 
+**Accepted policy boundary — the atomic-external-writer contract (Sol build-review P1-2).** The
+double-read tear-check detects a file whose bytes CHANGE between the two observations. It cannot detect
+a writer that leaves a file at a **stable partial state** (truncate-then-stall for longer than the
+bounded retry window): both reads see the same partial bytes and the read is accepted as stable. This
+residual is **inherent to working-tree authority** — the only ways to eliminate it are (a) require the
+committed/staged tree as the recovery source (rejected in §0.1), or (b) require every external writer to
+replace files atomically, which AIRA cannot enforce on `git`/editors/other tools. AIRA therefore adopts
+the same assumption its OWN writes satisfy (`writeAtomic` — temp+rename) and that the existing
+`captureTraceSnapshot`/`discoverGates` tear-checks already rely on: **external writers of `.aira/**`
+files are expected to write atomically; a non-atomic external writer that leaves a stable-partial file
+is outside AIRA's honesty contract.** This is an explicitly accepted, reviewer-acknowledged residual
+(peer of the runner descendant-escape residual, task #20), documented on `stableReadFile` and pinned by
+a documenting test. A stable-partial that is malformed self-heals when the writer completes (the scan
+self-heals scan findings); a stable-partial that parses is indistinguishable from the file's true
+current state.
+
 ## 0.2 Approach — a central torn-read-safe scan contract, per-caller inconclusive handling
 
 Rather than a bespoke fix per site, make the SHARED readers/scanners coherent, and give every caller a

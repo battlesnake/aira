@@ -436,17 +436,17 @@ func TestMutationAbortsBeforeLinkWriteOnTornRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := s.ticketPath(from.ID)
-	first, err := os.ReadFile(path)
+	ownerPath := s.ticketPath(from.ID)
+	ownerBefore, err := os.ReadFile(ownerPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	targetPath := s.ticketPath(to.ID)
-	targetBefore, err := os.ReadFile(targetPath)
+	tornPath := s.ticketPath(to.ID)
+	tornBefore, err := os.ReadFile(tornPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	installAlternatingScanHook(t, path, first, []byte("torn"))
+	installAlternatingScanHook(t, tornPath, tornBefore, []byte("torn"))
 	if _, err := s.Link(context.Background(), from.ID, domain.RelationBlocks, to.ID); ErrorCode(err) != "U_INDEX_UNESTABLISHED" {
 		t.Fatalf("torn link error = %v", err)
 	}
@@ -457,6 +457,14 @@ func TestMutationAbortsBeforeLinkWriteOnTornRead(t *testing.T) {
 	if count != 0 {
 		t.Fatalf("link wrote an outbox intent before abort: %d", count)
 	}
+	ownerAfterLink, err := os.ReadFile(ownerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(ownerAfterLink) != string(ownerBefore) {
+		t.Fatal("canonical owner ticket bytes changed despite aborted Link")
+	}
+	installAlternatingScanHook(t, ownerPath, ownerBefore, []byte("torn"))
 	if _, err := s.UpdateTicketContent(context.Background(), from.ID, func(ticket domain.Ticket, body string) (domain.Ticket, string, error) {
 		return ticket, body + " update", nil
 	}); ErrorCode(err) != "U_INDEX_UNESTABLISHED" {
@@ -467,13 +475,6 @@ func TestMutationAbortsBeforeLinkWriteOnTornRead(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("ticket update wrote an outbox intent before abort: %d", count)
-	}
-	targetAfter, err := os.ReadFile(targetPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(targetAfter) != string(targetBefore) {
-		t.Fatal("target ticket bytes changed despite aborted Link")
 	}
 }
 
