@@ -82,6 +82,12 @@ func TestRatchetStatusFreshProjectIsReadOnly(t *testing.T) {
 		commonDir = filepath.Join(root, commonDir)
 	}
 	auditDir := filepath.Join(commonDir, "aira", "gates")
+	// The gates DIRECTORY itself must not exist: a regression that opened the
+	// audit writable would MkdirAll it (creating the dir, before any file), and
+	// checking only for files would miss that. Assert the directory is absent.
+	if _, err := os.Stat(auditDir); !os.IsNotExist(err) {
+		t.Fatalf("ratchet gauge created gate audit directory %s: err=%v", auditDir, err)
+	}
 	for _, name := range []string{"hmac.key", "audit.bin", "HEAD"} {
 		if _, err := os.Stat(filepath.Join(auditDir, name)); !os.IsNotExist(err) {
 			t.Fatalf("ratchet gauge created gate audit %s: err=%v", name, err)
