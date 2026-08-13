@@ -174,6 +174,13 @@ constraints to honour in the M18b plan:**
 
 ## 8. Sol plan-review resolutions
 
+### r3 — APPROVE-PLAN
+Sol confirmed all r2 P0/P1 closed. **Builder implementation-notes (from Sol):**
+- Keep the injected `env'` and the `applied` result together through launch construction:
+  `cmd.Env = env'` while `EnvDigest` continues over the **untouched** `entries`.
+- T1 must assert **no tactic variables were injected on the no-op path** (do NOT assume the
+  parent/test process had no pre-existing `LD_PRELOAD` — check the delta, not an empty value).
+
 ### r2
 - **P0 Buffering set-early + mergeEvidence** → §3.2 + §5: `record.Buffering` set (explicit `none`
   for plain/gate, never `""`) before the `starting` event; `mergeEvidence` carries it forward so no
