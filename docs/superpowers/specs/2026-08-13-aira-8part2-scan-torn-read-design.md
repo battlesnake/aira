@@ -1,8 +1,8 @@
 # #8-part2 — crash-recovery scan torn-read race (honest, never a fake fail / false-pass / fake-zero)
 
-Status: PLAN v3 (incorporates Sol plan-review r1 + r2: read-only scan phase, Ready single-snapshot,
-structured unevaluated contract, exact self-heal predicate, alternating-payload test seam).
-Awaiting Sol re-review → gate → build.
+Status: PLAN v4 (incorporates Sol plan-review r1–r3). r3: defer recordRebuildFinding too;
+relationIndexDivergence hidden rescan → one coherent Ready snapshot; handler shapes; live-query
+readers (List/Search/ListFindings) = reviewer-accepted residual D5. Awaiting Sol re-review → gate → build.
 Branch `codex-aira-8part2` off master `4374992`. Task #8 part 2 (part 1 landed `8183345`).
 Class: **crash-recovery correctness → the two-loop is mandatory** (CLAUDE.md).
 
@@ -77,7 +77,23 @@ fully-stable scan — it makes the scan-finding **self-heal safe to fix here** (
    finding).
 6. Deterministic tests that genuinely FAIL against today's single-read code (Sol P2 — see §4).
 
+**Honesty-contract boundary (this increment).** Sol's review established that torn-read/version-skew
+is *systemic*: every live-scan consumer is independently vulnerable. This increment makes the
+**index-reconstruction (`Rebuild`) and the readiness graph (`Ready`, incl. `relationIndexDivergence`)**
+torn-read-safe and coherent — the two consumers where a torn read causes a fake-FAIL, a false-PASS, or
+a corrupted stored index. The **direct live-entity-query readers** (`List`/records query.go:241-254,
+`Search` search.go:98-114, `ListFindings` finding.go:258-279) each do their OWN live scan and can still
+omit a single inconclusive entity → a fake-zero *for that query* (D5). That is a genuinely separate,
+broader change (a shared coherent-snapshot layer for every reader) and is a **written-down,
+reviewer-accepted residual**, not a silent gap — filed as D5. Rationale for the split: these are
+individual-entity reads (not graph integrity), the window is the same narrow external-writer race, and
+the stored index they'd otherwise be bypassed by is now torn-read-safe.
+
 **OUT (written-down deferrals / follow-ups):**
+- **D5 — coherent-snapshot layer for the direct live-query readers** (`List`/`Search`/`ListFindings`):
+  a concurrent external write racing one of these live queries can drop the inconclusive entity to
+  absent (fake-zero for that query). Fix = route every live reader through one torn-read-safe coherent
+  snapshot (or propagate a retryable `U_`). Reviewer-accepted residual of this increment; filed.
 - **D2 — per-entity carry-forward of prior projection rows across an inconclusive scan.** Superseded:
   abort-on-inconclusive (IN-2) preserves the WHOLE prior index, so no entity silently drops. A
   finer-grained "update the clean entities, freeze only the raced one" is a future optimisation, not a
@@ -100,17 +116,21 @@ after N attempts still unequal/vanished → `inconclusive`. A genuine IO error (
 (today's behaviour, D3). No sleep-free busy loop; backoff is bounded and tiny (Rebuild is not hot).
 
 ### 2.2 Rebuild (store.go:1382) — genuinely read-only scan, then mutate
-Sol P0-1: Rebuild mutates BEFORE the scan today (`replayUnjournaledEvents` store.go:1388;
-`markWorktreeActive` store.go:1456; scan findings recorded incrementally in their own transactions
-store.go:1463-1482 / finding.go:528). So "abort → intact" requires restructuring:
-- **Pre-scan idempotent ops stay** (`replayUnjournaledEvents`, `markWorktreeActive`) — they are
-  idempotent (journal replay re-runs to the same state; active-mark is metadata), so running them and
-  then aborting is safe: the next Rebuild re-runs them identically and neither corrupts the ticket/
-  finding/relation projections. (The plan asserts + a test confirms idempotency-across-abort.)
-- **Phase A (scan) is READ-ONLY:** `scanTickets`/`scanFindingFiles`/`scanRequirements` use
-  `stableReadFile` and collect `valid`, genuine-malformed `findings`, and the `inconclusive` set
-  **in memory** — NO `recordScanFinding`/DB write during the scan (move the incremental recording at
-  store.go:1463-1482 into Phase B).
+Sol P0-1/r3: Rebuild mutates BEFORE the scan today (`replayUnjournaledEvents` store.go:1388;
+`markWorktreeActive` store.go:1456; scan findings store.go:1463-1482 / finding.go:528; AND
+`recordRebuildFinding` for invalid git roots store.go:1515-1518, own tx store.go:1244). So "abort →
+intact" requires restructuring:
+- **Guarantee scope:** an abort leaves the **projections and reconciliation findings** exactly as they
+  were (last-known-good). The pre-scan `replayUnjournaledEvents` (idempotent journal replay,
+  store.go:1166-1182) and `markWorktreeActive` are allowed before the abort: replay re-runs to the same
+  state, and `markWorktreeActive` only touches worktree `active`/`updated_at` metadata (store.go:1754-
+  1759) — NOT the entity projections. The plan explicitly accepts + tests that `updated_at` may advance
+  on an aborted Rebuild (metadata, not a projection lie); everything else is untouched.
+- **Phase A (scan) is READ-ONLY over projections/findings:** `scanTickets`/`scanFindingFiles`/
+  `scanRequirements` use `stableReadFile` and collect `valid`, genuine-malformed `findings`, invalid-
+  git-root findings, and the `inconclusive` set **in memory** — NO `recordScanFinding` AND NO
+  `recordRebuildFinding` DB write during the scan (move BOTH the incremental recording at
+  store.go:1463-1482 and the `E_GIT_SCAN` recording at store.go:1515-1518 into Phase B).
 - **If `inconclusive` non-empty → return `U_INDEX_UNESTABLISHED`** (transient) BEFORE Phase B — the
   ticket/finding/relation projections and the scan reconciliation findings are untouched (prior
   last-known-good), and NO finding is recorded.
@@ -133,15 +153,27 @@ that single snapshot** (relations are embedded in the parsed ticket, relation_re
 the second `scanStoredRelationsAt` scan. Any inconclusive read in that one scan →
 `U_RELATION_GRAPH_UNESTABLISHED` (relation_ready.go:429/542-556). Never compute readiness from two
 skewed scans or a partial graph.
+- **`relationIndexDivergence` (Sol r3 P0-2) is a HIDDEN third scan:** called at relation_ready.go:420,
+  it internally re-runs `scanStoredRelationsAt` (relation_ready.go:317-320) → another live ticket
+  scan. Refactor it to **accept the canonical relations from the single snapshot** rather than
+  rescanning. `relationIndexFindingKind` (relation_ready.go:356-364) rereads owner files to classify
+  divergence — it must consume the same snapshot bytes (or, since it only downgrades a stale derived
+  row to a **warning** that never fails/blocks a canonical-ready ticket per relation_ready.go:430-434,
+  an inconclusive read there degrades to that same warning, never a false-pass). The invariant: **every
+  live read in the `Ready` path comes from ONE coherent snapshot.**
 
 ### 2.4 Caller contract — U_INDEX_UNESTABLISHED as a structured UNEVALUATED result (Sol P1)
 Returning the code as a bare error yields `CheckReport{}`+error, not the UNEVALUATED report/data
 contract (`Check` maps only `isIntegrityError` today, check.go:188-193; the core `reconcile --rebuild`
-path returns the raw error, core.go:1134-1143). So: `Check` converts a `U_INDEX_UNESTABLISHED` from
-Rebuild into an **unevaluated** report (the ticket/relation/readiness dimensions become `unevaluated`,
-never a partial pass), and the `reconcile`/rebuild handler returns a structured unevaluated result with
-that code. Faces render it as a transient, retryable `unevaluated` (exit per the U_ class), NOT a hard
-failure. Tested.
+path returns the raw error, core.go:1134-1143). Exact handler shapes (Sol r3 P1-2):
+- **`Check`** branches explicitly on a `U_INDEX_UNESTABLISHED` Rebuild return BEFORE returning
+  `CheckReport{}` — producing an **unevaluated** report (the ticket/relation/readiness dimensions are
+  `unevaluated`, never a partial pass).
+- **`reconcile`/rebuild handler** returns `handlerData{Verdict:"unevaluated", Data:…}` (a structured
+  SUCCESSFUL response per core.go:353-363), NOT `handlerData.Code=U_…` (which yields `OK:false`,
+  core.go:338-339).
+- **All non-`U_INDEX_UNESTABLISHED` Rebuild failures stay HARD errors** (unchanged).
+Faces render the transient code as a retryable `unevaluated`. Tested in both directions.
 
 ## 3. §1b — resolutions (r1 incorporated)
 
@@ -176,6 +208,18 @@ failure. Tested.
 - **R11 (exact self-heal predicate — Sol P1).** DELETE targets only `subtype='reconciliation'` rows
   whose `finding_key` has the exact `scan:<worktree>:` prefix; compute/flaky/conservation rows are
   untouched.
+- **R12 (all pre-projection Rebuild writes deferred — Sol r3 P0-1).** BOTH `recordScanFinding` AND
+  `recordRebuildFinding` (E_GIT_SCAN invalid-root, store.go:1515) are collected in memory and recorded
+  only in Phase B. The abort-intact guarantee is scoped to projections + reconciliation findings;
+  `markWorktreeActive`'s `updated_at` may advance on an abort (metadata, accepted + tested).
+- **R13 (ONE coherent snapshot for the whole Ready path — Sol r3 P0-2).** `Ready` +
+  `relationIndexDivergence` + `relationIndexFindingKind` all consume a single ticket snapshot; no
+  hidden `scanStoredRelationsAt` rescan. An inconclusive read anywhere in that path →
+  `U_RELATION_GRAPH_UNESTABLISHED`, and an index-divergence-only inconclusive degrades to the existing
+  warning that never fails/blocks a canonical-ready ticket (relation_ready.go:430-434).
+- **R14 (live-query residual is a stated boundary — Sol r3 P1).** `List`/`Search`/`ListFindings` remain
+  outside this increment's honesty contract (D5), a reviewer-accepted written-down residual, with a
+  test documenting the boundary.
 
 ## 4. Tests (Sol P2 — must FAIL against today's single-read code)
 
@@ -202,6 +246,15 @@ tear) — the sequencer is mandatory.
    clean Rebuild → the finding is CLEARED (fails today — no prune).
 7. **Retry resolves a transient tear invisibly:** a single mid-read swap that then stabilises → the
    retry reaches a stable read → normal Rebuild, no `U_`, correct final content.
+8. **Ready path uses ONE snapshot (Sol r3 P0-2):** a scan-count hook asserts the whole `Ready` path
+   (rows + relations + `relationIndexDivergence`) performs exactly ONE ticket scan — proving the hidden
+   `scanStoredRelationsAt` rescan is gone (fails against today's multi-scan code).
+9. **Abort-intact for pre-scan mutations (Sol r3 P0-1):** an earlier invalid git root plus a later
+   inconclusive worktree → Rebuild returns `U_INDEX_UNESTABLISHED` and records NO `E_GIT_SCAN` finding
+   (proves `recordRebuildFinding` was deferred); a second clean Rebuild then records it.
+10. **Live-query boundary (D5, documented):** a test asserting the CURRENT `List`/`Search` behaviour on
+    a torn live read, marking it the reviewer-accepted residual so a future D5 fix has a pinned starting
+    point (not a fail-before test — it documents the accepted boundary).
 
 ## 5. Files
 
