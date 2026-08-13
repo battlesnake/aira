@@ -7,7 +7,8 @@
   capture/digest semantics.
 - **Review:** Sol plan-review r1 → REVISE (2×P0 lifecycle+race, 4×P1), r2 → REVISE (2×P0
   final-sentinel-loss + I3 over-claim, 2×P1/P2), r3 → REVISE (1×P1 blocking-sentinel double-leak,
-  1×P1 banner over-claim, 1×P2); this is **v4** (§8 tracks each round).
+  1×P1 banner over-claim, 1×P2), r4 → **APPROVE-PLAN** conditional on one I3 wording-precision fix
+  (capture partial-vs-complete honesty), applied here. This is **v5 — approved to build** (§8).
 
 ## 0. Context — the gap
 
@@ -59,8 +60,10 @@ default of a foreground human run; `--detach` (deferred) is the opt-out.
   ultimately fast — "fast sink ⇒ no marker" is *not* an invariant). **On forced-close (§3.2) or a
   live-sink write error the live stream simply stops** (gate off / sink broken) and the byte
   equation is *not* claimed; there is no completeness banner (which would lie on partial paths).
-  The capture file's completeness + digest (I1/I2) hold on **all** paths regardless, and the run
-  record's `CaptureForcedClosed` / error codes carry the abnormal truth.
+  The live path is **independent of capture**: it never causes or worsens partiality. Capture keeps
+  its M12 semantics — it accurately records complete-vs-partial state (`CaptureComplete` /
+  `CaptureForcedClosed` / error codes may report a *partial* result on forced-close, disk-full, or
+  descendant leakage), and **when it reports complete, its bytes + digest are authoritative** (I1/I2).
 - **I4 — post-return live writes are bounded; the drain never leaks.** When the normal-path join
   **completes**, no child byte lands on the caller's sink after the run summary. When the join is
   **cut short by `ctx` cancellation**, or on the **forced-close path** (grace expired — already
@@ -250,6 +253,15 @@ live; `--json` clean; a real slow-consumer harness confirms I1 on the built bina
 live-writer abandon (I4 hardening, candidate M18).
 
 ## 8. Sol plan-review resolutions
+
+### r4 — APPROVE-PLAN (conditional, applied)
+- **P1 I3 completeness over-claim** → I3 reworded: the live path is independent of capture and never
+  causes/worsens partiality; capture keeps M12 complete-vs-partial semantics; bytes/digest are
+  authoritative only when capture reports complete. Sol confirmed the r3 sentinel protocol, drain
+  lifecycle, writer-linger scope, and I4/accountability consistency are sound.
+- **Builder implementation-notes (from Sol, not plan defects):** `finalDropped` must be a per-stream
+  state object, written before `close(ch)`, never read before the writer's `range` terminates; T8b
+  must verify drain exit independently of the writer.
 
 ### r3
 - **P1 blocking-sentinel double-leak** → §3.1: final count published **out-of-band** (`finalDropped`
