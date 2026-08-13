@@ -191,26 +191,46 @@ func insightScanID() string { return timeNow() }
 func computeReviewerVerdictRatio(s *Store) (GaugeResult, error) {
 	const name = "reviewer-verdict-ratio"
 	const title = "Reviewer verdict kill-rate by source"
-	sources, err := s.CountFindings("", "source")
+	// Read every finding ONCE and derive source+verdict counts in memory
+	// (Sol build-review P1-2: multiple scans could tear the universe vs the
+	// per-source cell counts). Unevaluable records (malformed finding files,
+	// or an empty source) are EXCLUDED from the distribution and never invent a
+	// "(none)" source cell (P1-3) — they are surfaced only as an overall reason.
+	rows, err := s.ListFindings("")
 	if err != nil {
 		return GaugeResult{}, err
 	}
 	scanID := insightScanID()
-	universe := gaugeUniverse(sources.Total, "current-worktree", map[string]any{"findings_scan": scanID})
+	sourceVerdicts := map[string]map[string]int{}
+	evaluable, excluded := 0, 0
+	for _, row := range rows {
+		if row.Unevaluated || strings.TrimSpace(row.Finding.Source) == "" {
+			excluded++
+			continue
+		}
+		evaluable++
+		source := row.Finding.Source
+		if sourceVerdicts[source] == nil {
+			sourceVerdicts[source] = map[string]int{}
+		}
+		sourceVerdicts[source][string(row.Finding.Verdict)]++
+	}
+	universe := gaugeUniverse(evaluable, "current-worktree", map[string]any{"findings_scan": scanID})
 	result := GaugeResult{
 		Name: name, Title: title, Kind: GaugeKindRatio, Breakdown: map[string]GaugeCell{},
 		Universe: universe, Drilldown: GaugeDrilldown{Verb: "find ls", Query: "--by source"},
 	}
-	if sources.Total == 0 {
-		result.Unevaluated, result.UnevaluatedReason = true, "no findings"
+	if excluded > 0 {
+		result.UnevaluatedReason = fmt.Sprintf("%d unevaluable finding(s) excluded from the distribution", excluded)
+	}
+	if evaluable == 0 {
+		result.Unevaluated = true
+		if result.UnevaluatedReason == "" {
+			result.UnevaluatedReason = "no findings"
+		}
 		return result, nil
 	}
-	for source := range sources.Distribution {
-		verdicts, countErr := s.CountFindings("source:"+source, "verdict")
-		if countErr != nil {
-			return GaugeResult{}, countErr
-		}
-		counts := verdicts.Distribution
+	for source, counts := range sourceVerdicts {
 		confirmed, refuted, plausible := counts["confirmed"], counts["refuted"], counts["plausible"]
 		cell := GaugeCell{Counts: map[string]int{"confirmed": confirmed, "refuted": refuted, "plausible": plausible}, Count: confirmed + refuted + plausible,
 			Drilldown: &GaugeDrilldown{Verb: "find ls", Query: fmt.Sprintf("source:%s --by verdict", source)}}
@@ -340,8 +360,11 @@ func computeReviewLoopEconomics(s *Store) (GaugeResult, error) {
 			cell.CostUSD = *row.CostUSD
 			cell.Fields["cost_usd"] = GaugeCell{Value: *row.CostUSD}
 		}
-		if present == 0 && row.CostUSD == nil {
-			cell.Unevaluated, cell.UnevaluatedReason = true, "all compute buckets and cost were absent"
+		if present == 0 {
+			// The phase cell is a token aggregate: with zero present token
+			// buckets it is unevaluated regardless of cost (cost remains an
+			// independently-evaluated field above, per Sol build-review P1-1).
+			cell.Unevaluated, cell.UnevaluatedReason = true, "all compute token buckets were absent for the phase"
 		}
 		cell.Drilldown = &GaugeDrilldown{Verb: "spend ls", Query: "--by phase"}
 		result.Breakdown[row.Phase] = cell
@@ -367,7 +390,10 @@ func computeQuotaBurn(s *Store) (GaugeResult, error) {
 		}
 	}
 	result := GaugeResult{Name: "quota-burn", Title: "Latest quota use and burn by provider", Kind: GaugeKindRate,
-		Breakdown: map[string]GaugeCell{}, Universe: gaugeUniverse(len(rows), "project", map[string]any{"quota_at_seq": watermark}),
+		Breakdown: map[string]GaugeCell{},
+		// Universe counts DISTINCT PROVIDERS (what the gauge evaluates — the
+		// latest snapshot per provider), not the raw snapshot count (Sol P2-1).
+		Universe:  gaugeUniverse(len(latest), "project", map[string]any{"quota_at_seq": watermark}),
 		Drilldown: GaugeDrilldown{Verb: "quota ls", Query: ""}}
 	if len(rows) == 0 {
 		result.Unevaluated, result.UnevaluatedReason = true, "no quota snapshots"

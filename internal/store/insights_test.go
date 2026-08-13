@@ -2,7 +2,10 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"aira/internal/domain"
@@ -184,5 +187,141 @@ func TestCountFindingsIsUncappedForDrilldown(t *testing.T) {
 	result, err := s.CountFindings("", "source")
 	if err != nil || result.Total != 60 || len(result.Distribution) != 60 {
 		t.Fatalf("uncapped findings=%#v err=%v", result, err)
+	}
+}
+
+// TestEconomicsCostOnlyPhaseTokenCellUnevaluated verifies Sol build-review P1-1:
+// a phase whose events carry cost but no token buckets has an unevaluated token
+// cell (never a fake 0 tokens) while cost stays an independently-evaluated field.
+func TestEconomicsCostOnlyPhaseTokenCellUnevaluated(t *testing.T) {
+	base := t.TempDir()
+	s := testStore(t, base, base+"/common", base+"/state")
+	cost := 1.25
+	if _, err := s.AddComputeEvent(context.Background(), domain.ComputeEventInput{
+		Phase: "plan", Model: "manual", Provider: "mystery", Source: "manual",
+		Raw: domain.RawUsage{Buckets: &domain.ComputeBuckets{}}, CostUSD: &cost,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.ComputeGauge("review-loop-economics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cell := result.Breakdown["plan"]
+	if !cell.Unevaluated || cell.UnevaluatedReason == "" {
+		t.Fatalf("cost-only phase token cell must be unevaluated: %#v", cell)
+	}
+	if cell.Fields["cost_usd"].Unevaluated || cell.Fields["cost_usd"].Value != cost {
+		t.Fatalf("cost field must be evaluated: %#v", cell.Fields["cost_usd"])
+	}
+}
+
+// TestReviewerReadsFindingsOnceUniverseMatchesCells verifies Sol P1-2: the
+// reviewer gauge reads findings once, so the universe count always equals the
+// sum of the per-source cell counts (a torn multi-scan would violate this).
+func TestReviewerReadsFindingsOnceUniverseMatchesCells(t *testing.T) {
+	base := t.TempDir()
+	s := testStore(t, base, base+"/common", base+"/state")
+	insightFinding(t, s, "codex", domain.VerdictConfirmed, "c1")
+	insightFinding(t, s, "codex", domain.VerdictRefuted, "c2")
+	insightFinding(t, s, "fable", domain.VerdictConfirmed, "c3")
+	result, err := s.ComputeGauge("reviewer-verdict-ratio")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := 0
+	for _, cell := range result.Breakdown {
+		sum += cell.Count
+	}
+	if sum != result.Universe.Count || result.Universe.Count != 3 {
+		t.Fatalf("universe %d != sum of source cell counts %d", result.Universe.Count, sum)
+	}
+}
+
+// TestReviewerExcludesMalformedFindingNoNoneSource verifies Sol P1-3: a
+// malformed finding file is excluded from the distribution (never fabricates a
+// "(none)"/empty source cell) and is surfaced as an overall reason.
+func TestReviewerExcludesMalformedFindingNoNoneSource(t *testing.T) {
+	base := t.TempDir()
+	s := testStore(t, base, base+"/common", base+"/state")
+	insightFinding(t, s, "codex", domain.VerdictConfirmed, "good")
+	dir := filepath.Join(base, ".aira", "findings")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "f-broken.md"), []byte("not valid frontmatter\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.ComputeGauge("reviewer-verdict-ratio")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for source := range result.Breakdown {
+		if source == "" || source == "(none)" {
+			t.Fatalf("malformed finding fabricated a source cell %q", source)
+		}
+	}
+	if _, ok := result.Breakdown["codex"]; !ok {
+		t.Fatalf("valid codex finding missing: %#v", result.Breakdown)
+	}
+	if result.Universe.Count != 1 || result.UnevaluatedReason == "" {
+		t.Fatalf("malformed exclusion not surfaced: universe=%d reason=%q", result.Universe.Count, result.UnevaluatedReason)
+	}
+}
+
+// TestQuotaBurnUniverseCountsProviders verifies Sol P2-1: the quota universe
+// counts distinct providers (what the gauge evaluates), not raw snapshots.
+func TestQuotaBurnUniverseCountsProviders(t *testing.T) {
+	base := t.TempDir()
+	s := testStore(t, base, base+"/common", base+"/state")
+	if _, err := s.AddQuotaSnapshot(context.Background(), domain.QuotaSnapshotInput{Provider: "openai", Source: "manual", Used: insightI64(10)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AddQuotaSnapshot(context.Background(), domain.QuotaSnapshotInput{Provider: "openai", Source: "manual", Used: insightI64(20)}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.ComputeGauge("quota-burn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Universe.Count != 1 {
+		t.Fatalf("two snapshots one provider => universe should be 1 provider, got %d", result.Universe.Count)
+	}
+}
+
+// TestInsightDrilldownReproducesValueUncapped verifies Sol P2-2: each gauge's
+// emitted drilldown reproduces the gauge's value via the uncapped read, with
+// >50 rows (a 50-capped ls would diverge).
+func TestInsightDrilldownReproducesValueUncapped(t *testing.T) {
+	base := t.TempDir()
+	s := testStore(t, base, base+"/common", base+"/state")
+	confirmed, refuted := 0, 0
+	for i := 0; i < 60; i++ {
+		v := domain.VerdictConfirmed
+		if i%2 == 0 {
+			v, refuted = domain.VerdictRefuted, refuted+1
+		} else {
+			confirmed++
+		}
+		insightFinding(t, s, "codex", v, fmt.Sprintf("cat-%02d", i))
+	}
+	result, err := s.ComputeGauge("reviewer-verdict-ratio")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cell := result.Breakdown["codex"]
+	q := strings.Fields(cell.Drilldown.Query) // "source:codex --by verdict"
+	drill, err := s.CountFindings(q[0], q[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if drill.Total <= 50 {
+		t.Fatalf("expected >50 rows to prove the uncapped path, got %d", drill.Total)
+	}
+	if drill.Distribution["confirmed"] != cell.Counts["confirmed"] || drill.Distribution["refuted"] != cell.Counts["refuted"] {
+		t.Fatalf("drilldown %#v does not reproduce cell counts %#v", drill.Distribution, cell.Counts)
+	}
+	if cell.Counts["confirmed"] != confirmed || cell.Counts["refuted"] != refuted {
+		t.Fatalf("cell counts %#v want confirmed=%d refuted=%d", cell.Counts, confirmed, refuted)
 	}
 }
