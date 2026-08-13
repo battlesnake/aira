@@ -68,12 +68,24 @@ func TestRatchetStatusFreshProjectIsReadOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	gitRun(t, root, "init", "-q")
+	ratchetTestGate(t, root)
 	s := testStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
-	if _, err := s.ComputeGauge("ratchet-status"); err != nil {
+	result, err := s.ComputeGauge("ratchet-status")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(base, "common", "aira", "gates")); !os.IsNotExist(err) {
-		t.Fatalf("ratchet gauge created gate audit directory: err=%v", err)
+	if result.Universe.Count != 1 || result.Breakdown["ratchet"].Value != "baseline_missing" {
+		t.Fatalf("ratchet gate was not evaluated: %#v", result)
+	}
+	commonDir := s.gitValue(context.Background(), "--git-common-dir")
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(root, commonDir)
+	}
+	auditDir := filepath.Join(commonDir, "aira", "gates")
+	for _, name := range []string{"hmac.key", "audit.bin", "HEAD"} {
+		if _, err := os.Stat(filepath.Join(auditDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("ratchet gauge created gate audit %s: err=%v", name, err)
+		}
 	}
 }
 
@@ -145,7 +157,7 @@ func TestRatchetStatusPassAndBaselineMissing(t *testing.T) {
 	if result.Unevaluated || result.Universe.Count != 2 || distribution["pass"] != 1 || distribution["baseline_missing"] != 1 || len(result.Breakdown) != 2 {
 		t.Fatalf("ratchet status=%#v", result)
 	}
-	if result.Universe.Scope != "project" || result.Universe.AsOf["gate_audit_seq"] == nil || result.Universe.AsOf["test_report_at_seq"] == nil {
+	if result.Universe.Scope != "project" || result.Universe.AsOf["gate_audit_seq"] == nil || result.Universe.AsOf["test_report_at_seq"] == nil || result.Universe.AsOf["tracked_worktree_digest"] == nil || result.Universe.AsOf["tracked_worktree_digest"] == "" {
 		t.Fatalf("ratchet watermarks=%#v", result.Universe)
 	}
 }
@@ -173,6 +185,44 @@ func TestRatchetStatusClassifierIsClosedAndUsesBareErrorOnly(t *testing.T) {
 	}
 	if bucket, code := ratchetStatus(DimensionEvaluation{}, errors.New("some unprefixed failure")); bucket != "unclassified" || code != "E_INTERNAL" {
 		t.Fatalf("bare unknown classification=%q/%q", bucket, code)
+	}
+}
+
+func TestRatchetStatusRealCorruptAuditIsCorruptBucket(t *testing.T) {
+	s, definition, _ := newRatchetEvaluationFixture(t)
+	audit, err := OpenGateAudit(s.commonDir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := audit.Read()
+	if err != nil || len(records) == 0 {
+		t.Fatalf("read audit: records=%#v err=%v", records, err)
+	}
+	rewriteAuditRecordFrame(t, audit, records[0].Seq, func(record *GateAuditRecord) {
+		record.Fields["tampered"] = "true"
+	})
+	result, err := s.ComputeGauge("ratchet-status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cell := result.Breakdown[definition.ID]
+	if cell.Value != "corrupt" || cell.Fields["code"].Value != "E_JOURNAL_CORRUPT" {
+		t.Fatalf("real corrupt audit classification=%#v", result)
+	}
+}
+
+func TestRatchetStatusRealReportLoadFailureIsIncomparable(t *testing.T) {
+	s, definition, _ := newRatchetEvaluationFixture(t)
+	if _, err := s.db.Exec(`UPDATE test_reports SET coverage_pct=? WHERE project_id=?`, "not-a-number", s.projectID); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.ComputeGauge("ratchet-status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cell := result.Breakdown[definition.ID]
+	if cell.Value != "incomparable" || cell.Fields["code"].Value != "U_GATE_INCOMPARABLE" {
+		t.Fatalf("real report-load classification=%#v", result)
 	}
 }
 
@@ -230,6 +280,91 @@ func TestTraceabilityStatusScanTearIsGaugeUnevaluated(t *testing.T) {
 	result, err := s.ComputeGauge("traceability-status")
 	if err != nil || !result.Unevaluated || result.Value != nil || !strings.Contains(result.UnevaluatedReason, "changed during snapshot") {
 		t.Fatalf("scan tear gauge=%#v err=%v", result, err)
+	}
+}
+
+func TestTraceabilityStatusIncludesRegisteredSiblingWorktree(t *testing.T) {
+	s, mainRoot := newTraceabilityStore(t)
+	sibling := filepath.Join(filepath.Dir(mainRoot), "sibling")
+	if err := os.MkdirAll(sibling, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, sibling, "init", "-q")
+	addTraceRequirement(t, s, domain.RequirementBuilt)
+	writeTraceSource(t, mainRoot, "implementation.go", "package mainfixture\n// covers: AR-1\nfunc implementation() {}\n")
+	writeTraceSource(t, mainRoot, "implementation_test.go", "package mainfixture\n// verifies: AR-1\nfunc TestImplementation(t *testing.T) {}\n")
+	siblingRequirement, err := domain.NewRequirement(domain.RequirementInput{ID: "AR-2", Text: "Sibling requirement.", Status: domain.RequirementBuilt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := domain.RenderRequirement(siblingRequirement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(sibling, ".aira", "requirements"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sibling, ".aira", "requirements", "AR-2.md"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sibling, "implementation.go"), []byte("package siblingfixture\n// covers: AR-2\nfunc implementation() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sibling, "implementation_test.go"), []byte("package siblingfixture\n// verifies: AR-2\nfunc TestImplementation(t *testing.T) {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, sibling, "add", ".")
+	if err := s.RegisterWorktree(context.Background(), "sibling", sibling); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.ComputeGauge("traceability-status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	distribution := result.Value.(map[string]int)
+	if result.Universe.Scope != "project" || result.Universe.Count != 2 || distribution["covered_verified"] != 2 || len(result.Breakdown) != 2 {
+		t.Fatalf("sibling trace gauge=%#v", result)
+	}
+	report := runTraceabilityCheck(t, s)
+	if report.Dimensions["traceability"] != "pass" || hasFinding(report.Warnings, "W_TRACE_UNVERIFIED") || hasFinding(report.Warnings, "W_TRACE_UNCOVERED") {
+		t.Fatalf("sibling trace check=%#v", report)
+	}
+	for _, id := range []string{"AR-1", "AR-2"} {
+		if result.Breakdown[id].Value != "covered_verified" {
+			t.Fatalf("sibling requirement %s gauge cell=%#v", id, result.Breakdown[id])
+		}
+	}
+}
+
+func TestRatchetStatusCoverageDropIsRegressed(t *testing.T) {
+	s, definition, root := newRatchetStoreFixture(t)
+	coverage := definition
+	coverage.ID = "coverage-ratchet"
+	coverage.Name = "Coverage Ratchet"
+	coverage.Ratchet = &gate.Ratchet{Metric: "coverage", Comparator: "coverage-drop", BaselineSelection: "active-explicitly-pinned", ComparisonKey: definition.Ratchet.ComparisonKey}
+	data, err := gate.RenderGate(coverage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".aira", "gates", coverage.ID+".json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	basePct := 80.0
+	commit := s.gitValue(context.Background(), "HEAD")
+	baseline := addRatchetReportInput(t, s, domain.TestReportInput{Format: "junit", Commit: commit, SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1", ParserComplete: true, Coverage: &domain.Coverage{Pct: &basePct}, Results: []domain.TestResult{{Name: "A", Outcome: domain.OutcomePass}}})
+	if _, err := s.PinGateBaseline(context.Background(), coverage.ID, []string{baseline.ID}, "test", "coverage"); err != nil {
+		t.Fatal(err)
+	}
+	ratchetCommitCurrent(t, root)
+	currentPct := 75.0
+	currentCommit := s.gitValue(context.Background(), "HEAD")
+	addRatchetReportInput(t, s, domain.TestReportInput{Format: "junit", Commit: currentCommit, SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1", ParserComplete: true, Coverage: &domain.Coverage{Pct: &currentPct}, Results: []domain.TestResult{{Name: "A", Outcome: domain.OutcomePass}}})
+	result, err := s.ComputeGauge("ratchet-status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Breakdown[coverage.ID].Value != "regressed" || result.Breakdown[coverage.ID].Fields["code"].Value != "E_GATE_RATCHET_REGRESSED" {
+		t.Fatalf("coverage drop gauge=%#v", result)
 	}
 }
 

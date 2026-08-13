@@ -323,7 +323,8 @@ func (s *Store) scanTraceabilityGraph() (traceScan, error) {
 	for _, worktree := range captured {
 		result, parseErr := parseTraceabilitySnapshot(worktree.entry.Root, worktree.snapshot)
 		if parseErr != nil {
-			return traceScanFailure("U_TRACE_UNSCANNED", repoPath(s.root, worktree.entry.Root), parseErr.Error()), nil
+			scan.unevaluated = &traceUnevaluated{Code: "U_TRACE_UNSCANNED", Subject: repoPath(s.root, worktree.entry.Root), Message: parseErr.Error()}
+			return scan, nil
 		}
 		scan.edges = append(scan.edges, result.Edges...)
 		for _, tracked := range worktree.snapshot.Files {
@@ -383,16 +384,16 @@ func (s *Store) checkTraceability(report *CheckReport) error {
 	if scanErr != nil {
 		return scanErr
 	}
-	if scan.unevaluated != nil {
-		addTraceUnevaluated(report, CheckFinding{Code: scan.unevaluated.Code, Subject: scan.unevaluated.Subject, Message: scan.unevaluated.Message, Kind: "unevaluated"})
-		return nil
-	}
 	malformed := make(map[string]string)
 	for _, node := range scan.malformed {
 		addFinding(report, CheckFinding{Code: "E_REQUIREMENT_INVALID", Subject: node.Subject, Message: node.Message, Kind: "fail"}, "")
 		for _, id := range node.IDs {
 			malformed[id] = node.Subject
 		}
+	}
+	if scan.unevaluated != nil {
+		addTraceUnevaluated(report, CheckFinding{Code: scan.unevaluated.Code, Subject: scan.unevaluated.Subject, Message: scan.unevaluated.Message, Kind: "unevaluated"})
+		return nil
 	}
 	if len(scan.requirements) == 0 && len(malformed) == 0 {
 		addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_EMPTY", Subject: "traceability", Message: "requirement registry is empty", Kind: "unevaluated"})

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -310,6 +311,62 @@ func TestTraceabilityNoRequirementPrefixIsUnevaluated(t *testing.T) {
 	report := runTraceabilityCheck(t, s)
 	if report.Verdict != "unevaluated" || report.Dimensions["traceability"] != "unevaluated" || !hasFinding(report.UnevaluatedFindings, "U_TRACE_EMPTY") {
 		t.Fatalf("report=%#v, want empty-registry unevaluated", report)
+	}
+}
+
+func TestTraceabilityNoRequirementPrefixPreservesMalformedFinding(t *testing.T) {
+	base := persistentTemp(t, "trace-no-requirement-prefix-malformed")
+	root := filepath.Join(base, "main")
+	if err := os.MkdirAll(filepath.Join(root, ".aira", "requirements"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "init", "-q")
+	s := testStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	if err := os.WriteFile(filepath.Join(root, ".aira", "requirements", "AR-1.md"), []byte("not requirement frontmatter\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "add", ".")
+	report := runTraceabilityCheck(t, s)
+	if len(report.Findings) != 1 || report.Findings[0].Code != "E_REQUIREMENT_INVALID" || report.Findings[0].Subject != ".aira/requirements/AR-1.md" || report.Findings[0].Message != "E_REQUIREMENT_INVALID: missing requirement frontmatter" {
+		t.Fatalf("no-prefix malformed findings=%#v", report.Findings)
+	}
+	if len(report.UnevaluatedFindings) != 1 || report.UnevaluatedFindings[0].Code != "U_TRACE_EMPTY" || report.UnevaluatedFindings[0].Subject != "traceability" || report.UnevaluatedFindings[0].Message != "requirement registry is empty" {
+		t.Fatalf("no-prefix empty diagnostic=%#v", report.UnevaluatedFindings)
+	}
+	result, err := s.ComputeGauge("traceability-status")
+	if err != nil || !result.Unevaluated || result.UnevaluatedReason != "no requirements" {
+		t.Fatalf("no-prefix malformed gauge=%#v err=%v", result, err)
+	}
+}
+
+func TestTraceabilityCheckGoldenFindingsRemainByteForByte(t *testing.T) {
+	s, root := newTraceabilityStore(t)
+	addTraceRequirement(t, s, domain.RequirementBuilt)
+	malformed, err := domain.NewRequirement(domain.RequirementInput{ID: "AR-3", Text: "Mismatched frontmatter.", Status: domain.RequirementBuilt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := domain.RenderRequirement(malformed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".aira", "requirements", "AR-2.md"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeTraceSource(t, root, "implementation.go", "package example\n// covers: AR-1, AR-2, AR-999\nfunc implementation() {}\n")
+	writeTraceSource(t, root, "implementation_test.go", "package example\n// verifies: AR-1, AR-3\nfunc TestImplementation(t *testing.T) {}\n")
+	gitRun(t, root, "add", ".")
+	report := runTraceabilityCheck(t, s)
+	wantFindings := []CheckFinding{
+		{Code: "E_REQUIREMENT_INVALID", Subject: ".aira/requirements/AR-2.md", Message: "E_REQUIREMENT_INVALID: filename/frontmatter mismatch", Kind: "fail"},
+		{Code: "E_TRACE_DANGLING", Subject: "implementation.go:2", Message: "covers annotation references absent requirement AR-999", Kind: "fail"},
+	}
+	wantUnevaluated := []CheckFinding{
+		{Code: "U_TRACE_UNSCANNED", Subject: "implementation.go:2", Message: "requirement AR-2 is unreadable at .aira/requirements/AR-2.md", Kind: "unevaluated"},
+		{Code: "U_TRACE_UNSCANNED", Subject: "implementation_test.go:2", Message: "requirement AR-3 is unreadable at .aira/requirements/AR-2.md", Kind: "unevaluated"},
+	}
+	if !reflect.DeepEqual(report.Findings, wantFindings) || !reflect.DeepEqual(report.UnevaluatedFindings, wantUnevaluated) {
+		t.Fatalf("golden trace findings=%#v unevaluated=%#v\nwant findings=%#v unevaluated=%#v", report.Findings, report.UnevaluatedFindings, wantFindings, wantUnevaluated)
 	}
 }
 
