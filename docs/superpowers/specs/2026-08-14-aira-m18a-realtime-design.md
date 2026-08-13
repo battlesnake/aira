@@ -6,8 +6,9 @@
 - **Design authority:** [`2026-08-07-aira-design.md`](2026-08-07-aira-design.md) §14 line 150,
   §11 (the Run `buffering(none|realtime|pty)` field).
 - **Depends on:** M12 capture, M17 live-tee.
-- **Review:** Sol plan-review r1 → REVISE (P2 split-pty + P1 env_digest + P1 realtime-honesty);
-  this is **v2** (§8 tracks resolutions).
+- **Review:** Sol plan-review r1 → REVISE (P2 split-pty + P1 env_digest + P1 realtime-honesty),
+  r2 → REVISE (P0 Buffering-set-early + mergeEvidence, P1 wording, P1 preserve-user-preload); this
+  is **v3** (§8 tracks resolutions).
 
 ## 0. Context — the gap
 
@@ -40,16 +41,19 @@ out+err — is the harder cut and lands in M18b, §7.)
 - **I1 — realtime does not alter the captured record.** Same child: `RUN-n.out`/`RUN-n.err`
   exist (streams stay separate), `CaptureComplete`, digest over the exact captured bytes. The
   tactic changes flush *timing*, not the file contents/semantics.
-- **I2 — `env_digest` is the USER-environment digest, tactic-orthogonal.** `EnvDigest` is taken
-  over the user's env (`entries`) **before** the stdbuf vars are appended to `cmd.Env`, so a
+- **I2 — `env_digest` is the BASE (user) environment digest, tactic-orthogonal.** `EnvDigest` is
+  taken over the user's env (`entries`) **before** the stdbuf vars are appended to `cmd.Env`, so a
   plain run and a `--realtime` run with the same user env have **identical `env_digest`**; the
-  child *actually* runs with the injected vars. `buffering` is the separate dimension recording
-  the tactic. (A consumer needing the exact child env combines `env_digest` + `buffering`.)
+  child *actually* runs with the injected vars. `buffering` is the separate recorded dimension.
+  This is a **base-environment digest plus a tactic marker** — it does *not* reconstruct the exact
+  child environment (the injected `libstdbuf.so` path is host-dependent and the injected overrides
+  are not themselves recorded); it identifies the user's declared env + that realtime was applied.
 - **I3 — honest buffering = injection applied, not effect proven.** `buffering=realtime` means
-  the stdbuf injection was **eligible and applied** (a `libstdbuf.so` was located and the vars
-  set); it is *not* a claim the child changed buffering (static/musl/non-glibc/`setuid`/secure-
-  exec binaries ignore `LD_PRELOAD`; AIRA cannot and does not prove effect). No locatable
-  `libstdbuf.so` ⇒ `buffering=none`, no `LD_PRELOAD` set — never a fake `realtime`.
+  the stdbuf injection was **eligible and applied** (a readable `libstdbuf.so` was located and the
+  vars set); it is *not* a claim the child changed buffering (static/musl/non-glibc/`setuid`/
+  secure-exec binaries ignore `LD_PRELOAD`; AIRA cannot and does not prove effect). No locatable
+  `libstdbuf.so` ⇒ `buffering=none` and the child env is left **exactly as the user gave it**
+  (any user `LD_PRELOAD` unchanged) — never a fake `realtime`, never a clobbered preload.
 - **I4 — no gate-lane leak.** The gate command-lane path constructs `runner.Request` without
   `Realtime`, so gate runs record `buffering=none` and their `env_digest` equals the plain
   digest (proof-binding is unaffected).
@@ -66,9 +70,11 @@ digest reflects user intent; the child runs with the tactic (I2).
 `stdbufInjection`:
 - `path := locateLibstdbuf()` — probe, in order: `/usr/lib/*/coreutils/libstdbuf.so`,
   `/usr/libexec/coreutils/libstdbuf.so`, `/usr/lib/coreutils/libstdbuf.so`, then the directory
-  of `stdbuf` resolved on `PATH` (`<dir>/../lib*/coreutils/libstdbuf.so`). Overridable by a test
-  seam (`locateLibstdbufFn`). Returns "" if none found.
-- If `path == ""` → return `env` unchanged and signal `applied=false` → `buffering=none`.
+  of `stdbuf` resolved on `PATH` (`<dir>/../lib*/coreutils/libstdbuf.so`). Each candidate is
+  accepted **only if it stats as an existing regular, readable file** (never a bare constructed
+  path). Overridable by a test seam (`locateLibstdbufFn`). Returns "" if none valid.
+- If `path == ""` → return `env` **unchanged** (any user `LD_PRELOAD` preserved) and signal
+  `applied=false` → `buffering=none`.
 - Else set (replacing any existing same-key): `_STDBUF_O=L`, `_STDBUF_E=L`, `PYTHONUNBUFFERED=1`,
   and `LD_PRELOAD=<path>` **prepended** to any user `LD_PRELOAD` (`<path>:<existing>`). Return
   `applied=true` → `buffering=realtime`.
@@ -77,6 +83,12 @@ digest reflects user intent; the child runs with the tactic (I2).
 
 - `Request.Realtime bool`; `RunRecord.Buffering string` (persisted in the ledger). The record's
   `Buffering` is set from `applied` (`realtime` iff injected, else `none`).
+- **Set `Buffering` BEFORE the first `starting` ledger event, and copy it in `mergeEvidence`
+  (Sol r2 P0).** Compute `applied` at env setup and assign `record.Buffering` (an explicit
+  `none` for plain/gate runs, never `""`) before any event serialises the record — otherwise a
+  terminal/reconcile path that rebuilds via `mergeEvidence` (which does not currently copy this
+  field) drops it. Add `Buffering` to the fields `mergeEvidence` carries forward so it survives
+  every terminal CAS and reconcile.
 - CLI (`cmd/aira/main.go`) + MCP (`aira_run`): a `--realtime` bool flag, help/schema from the
   dispatch table. (`--pty` is added in M18b; if both are wired later, M18b refuses the combo.)
 
@@ -97,8 +109,11 @@ and one new recorded field.
   impl that folds the stdbuf vars into the digest.*
 - **T3 (I1 separate + complete)** — `--realtime` run of a child writing to both stdout and stderr
   → `RUN-n.out` and `RUN-n.err` present, both `CaptureComplete`, digests over captured bytes.
-- **T4 (I3 prepend)** — user sets `LD_PRELOAD=/x.so`; `--realtime` → child `LD_PRELOAD` is
-  `<libstdbuf>:/x.so` (prepended, not clobbered).
+- **T4 (I3 prepend + no-op preserve)** — **unit-test `stdbufInjection` directly** (input env →
+  output env; avoids launching a child with a bogus preload): with a user `LD_PRELOAD=/x.so` and a
+  located libstdbuf → output `LD_PRELOAD` is `<libstdbuf>:/x.so` (prepended, not clobbered); with
+  the seam returning "" → the env is returned unchanged (user `LD_PRELOAD=/x.so` preserved, no
+  `_STDBUF_*` added). *Fails an impl that clobbers or drops the user preload on the no-op path.*
 - **T5 (I4 gate)** — a command-gate run records `buffering=none` and its `env_digest` equals the
   same command's plain digest (proof-binding unaffected).
 - Real-process e2e (Opus): `aira run --realtime -- <glibc tool that block-buffers on a pipe>`
@@ -110,7 +125,8 @@ and one new recorded field.
 - `internal/runner/types.go` — `Request.Realtime`, `RunRecord.Buffering`.
 - `internal/runner/env.go` — `stdbufInjection(env) (env', applied)`, `locateLibstdbuf()` +
   `locateLibstdbufFn` seam.
-- `internal/runner/runner_linux.go` — Launch: post-digest injection; set `record.Buffering`.
+- `internal/runner/runner_linux.go` — Launch: post-digest injection; set `record.Buffering` before
+  the `starting` event; add `Buffering` to `mergeEvidence`'s carried-forward fields.
 - `internal/runner/ledger.go` — persist `Buffering`.
 - `internal/core/core.go` — `run` handler: `Realtime` arg → `Request`.
 - `cmd/aira/main.go` — `--realtime` flag for `run`.
@@ -150,9 +166,26 @@ constraints to honour in the M18b plan:**
   pty allocation failure is fail-closed (`E_RUN_PTY_UNAVAILABLE`), never a downgrade.
 - **Containment:** the pty child is still `clone3`'d into the scope (`UseCgroupFD`) and
   `run-kill`-able; `Setsid`/`Setctty` compose with it.
+- **Termios transformation (Sol r2):** a pty applies terminal output processing — notably `ONLCR`
+  (`\n`→`\r\n`), plus other `c_oflag` cooking. The M18b plan MUST decide the captured stream: set
+  the pts to raw/output-raw (`cfmakeraw`/clear `OPOST`) for byte-faithful capture, OR accept the
+  transformed bytes as the defined stream — and the digest/capture tests must assert *that*
+  defined stream, not assume pipe-identical bytes.
 
-## 8. Sol plan-review r1 resolutions
+## 8. Sol plan-review resolutions
 
+### r2
+- **P0 Buffering set-early + mergeEvidence** → §3.2 + §5: `record.Buffering` set (explicit `none`
+  for plain/gate, never `""`) before the `starting` event; `mergeEvidence` carries it forward so no
+  terminal/reconcile merge drops it.
+- **P1 I2 overreach** → I2 reworded to "base-environment digest plus a tactic marker"; does not
+  reconstruct the exact host-dependent child env.
+- **P1 preserve user preload + validate path** → I3/§3.1: no-op leaves the env (incl. any user
+  `LD_PRELOAD`) unchanged; `locateLibstdbuf` accepts only an existing regular/readable file; T4 is
+  now a direct `stdbufInjection` unit test (prepend + no-op-preserve), not a child launch.
+- **M18b §7 termios** → added the `ONLCR`/`OPOST` transformation constraint for the M18b plan.
+
+### r1
 - **P2 split pty** → M18a = `--realtime` + `buffering` field; `--pty` deferred to M18b (§7) with
   the pty design + all r1 pty constraints (P0 stdin, P0 Ctty, P1 EIO) recorded for its own cycle.
 - **P1 env_digest** → I2 + §3.1: user-env digest taken before injection; documented as
