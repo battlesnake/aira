@@ -169,6 +169,10 @@ func TestCommandCheckerStoresAuthoritativeRunnerEnvDigest(t *testing.T) {
 	if evaluation.EnvDigest == "" || evaluation.EnvDigest != record.EnvDigest {
 		t.Fatalf("evaluation env digest=%q record=%q", evaluation.EnvDigest, record.EnvDigest)
 	}
+	wantDigest, err := runner.EnvDigest([]runner.EnvEntry{{Key: []byte(name), Value: []byte("runner-value")}})
+	if err != nil || record.Buffering != "none" || record.EnvDigest != wantDigest {
+		t.Fatalf("gate buffering=%q digest=%q want=%q err=%v", record.Buffering, record.EnvDigest, wantDigest, err)
+	}
 }
 
 func TestCommandGateProofBindsCurrentEnvironmentAndLaneReadOnly(t *testing.T) {

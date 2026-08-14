@@ -393,6 +393,9 @@ func decodeMCPRequest(binding mcpToolBinding, values map[string]json.RawMessage)
 		if _, ok := args["merge"]; !ok {
 			args["merge"] = false
 		}
+		if _, ok := args["realtime"]; !ok {
+			args["realtime"] = false
+		}
 		if _, ok := args["stdin"]; !ok {
 			args["stdin"] = ""
 		}

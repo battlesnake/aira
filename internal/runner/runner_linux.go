@@ -122,6 +122,14 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if err != nil {
 		return nil, launchErr("E_RUN_ENV_INVALID", err)
 	}
+	buffering := "none"
+	if req.Realtime {
+		var applied bool
+		env, applied = stdbufInjection(env)
+		if applied {
+			buffering = "realtime"
+		}
+	}
 	if req.StoreStdin && req.StdinPath == "" && req.Stdin == nil {
 		return nil, launchErr("E_RUN_STDIN_INVALID", errors.New("store-stdin requires a launch source"))
 	}
@@ -141,7 +149,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	started := nowString(r.now)
 	// Containment is not an initial assumption. Until the leader is positively
 	// observed in cgroup.procs, the durable record must remain non-contained.
-	record := RunRecord{SchemaVersion: ledgerSchema, ID: id, Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, LaunchPrefix: append([]string(nil), prefix...), StartedAt: started, Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}}
+	record := RunRecord{SchemaVersion: ledgerSchema, ID: id, Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, Buffering: buffering, LaunchPrefix: append([]string(nil), prefix...), StartedAt: started, Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}}
 	// The intended scope reference is durable before scope creation. It is not
 	// used as kill authority until the actual scope-created record is present.
 	record.CgroupScope = r.intendedScope(id)
@@ -519,6 +527,9 @@ func mergeEvidence(base, candidate RunRecord) RunRecord {
 	}
 	if candidate.OutputRefs != nil {
 		base.OutputRefs = cloneOutputRefs(candidate.OutputRefs)
+	}
+	if candidate.Buffering != "" {
+		base.Buffering = candidate.Buffering
 	}
 	base.CaptureComplete = candidate.CaptureComplete
 	base.CaptureForcedClosed = candidate.CaptureForcedClosed

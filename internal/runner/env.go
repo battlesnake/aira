@@ -6,9 +6,90 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 )
+
+var locateLibstdbufFn = locateLibstdbuf
+
+func locateLibstdbuf() string {
+	candidates := make([]string, 0)
+	if matches, err := filepath.Glob("/usr/lib/*/coreutils/libstdbuf.so"); err == nil {
+		candidates = append(candidates, matches...)
+	}
+	candidates = append(candidates,
+		"/usr/libexec/coreutils/libstdbuf.so",
+		"/usr/lib/coreutils/libstdbuf.so",
+	)
+	if stdbuf, err := exec.LookPath("stdbuf"); err == nil {
+		dir := filepath.Dir(stdbuf)
+		if matches, globErr := filepath.Glob(filepath.Join(dir, "..", "lib*", "coreutils", "libstdbuf.so")); globErr == nil {
+			candidates = append(candidates, matches...)
+		}
+	}
+	for _, candidate := range candidates {
+		info, err := os.Stat(candidate)
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		file, err := os.Open(candidate)
+		if err != nil {
+			continue
+		}
+		_ = file.Close()
+		return candidate
+	}
+	return ""
+}
+
+func stdbufInjection(env []string) (out []string, applied bool) {
+	path := locateLibstdbufFn()
+	if path == "" {
+		return env, false
+	}
+
+	preload := ""
+	for _, item := range env {
+		key, value, ok := strings.Cut(item, "=")
+		if ok && key == "LD_PRELOAD" {
+			preload = value
+			break
+		}
+	}
+	if preload != "" {
+		preload = path + ":" + preload
+	} else {
+		preload = path
+	}
+	values := map[string]string{
+		"_STDBUF_O":        "L",
+		"_STDBUF_E":        "L",
+		"PYTHONUNBUFFERED": "1",
+		"LD_PRELOAD":       preload,
+	}
+	keys := []string{"_STDBUF_O", "_STDBUF_E", "PYTHONUNBUFFERED", "LD_PRELOAD"}
+	seen := make(map[string]bool, len(keys))
+	out = make([]string, 0, len(env)+len(keys))
+	for _, item := range env {
+		key, _, ok := strings.Cut(item, "=")
+		if value, replace := values[key]; ok && replace {
+			if !seen[key] {
+				out = append(out, key+"="+value)
+				seen[key] = true
+			}
+			continue
+		}
+		out = append(out, item)
+	}
+	for _, key := range keys {
+		if !seen[key] {
+			out = append(out, key+"="+values[key])
+		}
+	}
+	return out, true
+}
 
 func EnvDigest(entries []EnvEntry) (string, error) {
 	seen := make(map[string]struct{}, len(entries))

@@ -1088,12 +1088,13 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("cwd", false, false, "Launch working directory"),
 			listSpec("env", false, false, "Exact KEY=VALUE environment overrides"),
 			boolSpec("merge", false, false, "Capture stdout and stderr as one kernel stream"),
+			boolSpec("realtime", false, false, "Apply realtime stdio buffering when libstdbuf is available"),
 			stringSpec("stdin", false, false, "Launch-time stdin file or -"),
 			boolSpec("store_stdin", false, false, "Persist supplied launch stdin"),
 		}, MCPTool: "aira_run", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			request := runner.Request{
 				Argv: stringSlice(args, "argv"), Cwd: stringArg(args, "cwd"), Env: stringSlice(args, "env"),
-				Prefix: stringSlice(args, "prefix"), Merge: boolArg(args, "merge"), StdinPath: stringArg(args, "stdin"),
+				Prefix: stringSlice(args, "prefix"), Merge: boolArg(args, "merge"), Realtime: boolArg(args, "realtime"), StdinPath: stringArg(args, "stdin"),
 				StoreStdin: boolArg(args, "store_stdin"),
 			}
 			if c.face.Live {

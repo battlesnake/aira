@@ -314,13 +314,13 @@ func TestMCPGroupedOperationsBuildTheSameCanonicalRequestsAsCLI(t *testing.T) {
 }
 
 func TestMCPRunnerLaunchMatchesCLIRequestAndPreservesTargetOptions(t *testing.T) {
-	cli := mustCLIRequest(t, "run", []string{"tool", "--child-option", "--json"}, map[string]string{"merge": "true"})
+	cli := mustCLIRequest(t, "run", []string{"tool", "--child-option", "--json"}, map[string]string{"merge": "true", "realtime": "true"})
 	var got core.Request
 	server := newMCPServer(func(_ context.Context, request core.Request) (*core.Core, func(), error) {
 		got = request
 		return nil, nil, errors.New("E_INTERNAL: parity probe")
 	})
-	message := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"aira_run","arguments":{"argv":["tool","--child-option","--json"],"merge":true}}}` + "\n"
+	message := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"aira_run","arguments":{"argv":["tool","--child-option","--json"],"merge":true,"realtime":true}}}` + "\n"
 	var out bytes.Buffer
 	if err := server.Serve(context.Background(), strings.NewReader(message), &out, &bytes.Buffer{}); err != nil {
 		t.Fatal(err)

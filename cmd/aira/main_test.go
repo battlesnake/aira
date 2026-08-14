@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -11,7 +12,25 @@ import (
 	"testing"
 
 	"aira/internal/core"
+	"aira/internal/runner"
 )
+
+type requestCaptureRunner struct {
+	request runner.Request
+}
+
+func (r *requestCaptureRunner) Launch(_ context.Context, request runner.Request) (*runner.RunRecord, error) {
+	r.request = request
+	return &runner.RunRecord{ID: "RUN-1", Status: runner.StatusExited}, nil
+}
+func (*requestCaptureRunner) Kill(context.Context, string) (*runner.RunRecord, error) {
+	return nil, nil
+}
+func (*requestCaptureRunner) Get(string) (*runner.RunRecord, error) { return nil, nil }
+func (*requestCaptureRunner) ReadOutput(context.Context, runner.OutputRequest) (*runner.OutputChunk, error) {
+	return nil, nil
+}
+func (*requestCaptureRunner) Reconcile(context.Context) ([]runner.RunRecord, error) { return nil, nil }
 
 func TestCheckInvalidInvocationUsesExitTwoWithoutOpeningStore(t *testing.T) {
 	var stdout, stderr bytes.Buffer
@@ -160,13 +179,29 @@ func TestRunDelimiterKeepsChildOptionTokensVerbatim(t *testing.T) {
 	}
 	want := core.Request{Verb: "run", Args: map[string]any{
 		"argv": []string{"tool", "--child-option", "--json"}, "prefix": []string(nil), "cwd": "",
-		"env": []string{}, "merge": true, "stdin": "", "store_stdin": false,
+		"env": []string{}, "merge": true, "realtime": false, "stdin": "", "store_stdin": false,
 	}}
 	if !reflect.DeepEqual(request, want) {
 		t.Fatalf("request=%#v, want=%#v", request, want)
 	}
 	if _, _, err := parseArgs("run", []string{"tool", "--child-option"}); err == nil || !strings.HasPrefix(err.Error(), "E_RUN_ARGUMENT_INVALID:") {
 		t.Fatalf("missing delimiter error=%v", err)
+	}
+}
+
+func TestRunRealtimeFlagReachesRunnerHandler(t *testing.T) {
+	positional, options, err := parseArgs("run", []string{"--realtime", "--", "tool"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := buildRequest("run", positional, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := &requestCaptureRunner{}
+	response := core.NewWithRunnerFace(nil, capture, nil, core.FaceOutput{}).Do(context.Background(), request)
+	if !response.OK || !capture.request.Realtime {
+		t.Fatalf("response=%+v runner request=%+v", response, capture.request)
 	}
 }
 

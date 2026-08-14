@@ -81,6 +81,7 @@ type RunRecord struct {
 	Argv                []string             `json:"argv"`
 	Cwd                 string               `json:"cwd"`
 	EnvDigest           string               `json:"env_digest"`
+	Buffering           string               `json:"buffering"`
 	LaunchPrefix        []string             `json:"launch_prefix,omitempty"`
 	CgroupScope         string               `json:"cgroup_scope,omitempty"`
 	StartedAt           string               `json:"started_at"`
@@ -121,6 +122,7 @@ type Request struct {
 	ExplicitEnv bool // when true, Env is the complete child environment
 	Prefix      []string
 	Merge       bool
+	Realtime    bool
 	StdinPath   string // empty means null stdin; "-" means the caller's stdin
 	Stdin       io.Reader
 	StoreStdin  bool

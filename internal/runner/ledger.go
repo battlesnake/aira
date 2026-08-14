@@ -248,6 +248,7 @@ func (l *ledger) read() ([]ledgerEvent, error) {
 		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
 			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: trailing ledger payload")
 		}
+		normalizeBuffering(&event.Run)
 		prior = event.Sequence
 		events = append(events, event)
 	}
@@ -284,6 +285,7 @@ func replay(events []ledgerEvent) (map[string]RunRecord, error) {
 	runs := make(map[string]RunRecord)
 	terminals := make(map[string]bool)
 	for _, e := range events {
+		normalizeBuffering(&e.Run)
 		if e.Run.ID == "" {
 			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: empty run id")
 		}
@@ -302,6 +304,12 @@ func replay(events []ledgerEvent) (map[string]RunRecord, error) {
 		runs[e.Run.ID] = e.Run
 	}
 	return runs, nil
+}
+
+func normalizeBuffering(record *RunRecord) {
+	if record.Buffering == "" {
+		record.Buffering = "none"
+	}
 }
 
 func (l *ledger) current(id string) (RunRecord, error) {

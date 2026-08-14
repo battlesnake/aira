@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -9,6 +10,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"syscall"
@@ -42,6 +44,78 @@ func TestEnvDigestUsesSortedLengthPrefixedBytes(t *testing.T) {
 	}
 	if _, err := EnvDigest([]EnvEntry{{Key: []byte("A")}, {Key: []byte("A"), Value: []byte("x")}}); err == nil || !strings.Contains(err.Error(), "E_RUN_ENV_INVALID") {
 		t.Fatalf("duplicate env accepted: %v", err)
+	}
+}
+
+func TestStdbufInjectionPrependsAndNoOpPreservesEnvironment(t *testing.T) {
+	previous := locateLibstdbufFn
+	t.Cleanup(func() { locateLibstdbufFn = previous })
+	locateLibstdbufFn = func() string { return "/usr/lib/coreutils/libstdbuf.so" }
+	got, applied := stdbufInjection([]string{"PATH=/bin", "LD_PRELOAD=/x.so", "_STDBUF_O=B"})
+	if !applied {
+		t.Fatal("stdbuf injection was not applied")
+	}
+	toMap := func(entries []string) map[string]string {
+		t.Helper()
+		result := make(map[string]string, len(entries))
+		for _, entry := range entries {
+			key, value, ok := strings.Cut(entry, "=")
+			if !ok || key == "" {
+				t.Fatalf("invalid environment entry %q", entry)
+			}
+			if _, exists := result[key]; exists {
+				t.Fatalf("duplicate environment key %q in %q", key, entries)
+			}
+			result[key] = value
+		}
+		return result
+	}
+	want := map[string]string{"PATH": "/bin", "LD_PRELOAD": "/usr/lib/coreutils/libstdbuf.so:/x.so", "_STDBUF_O": "L", "_STDBUF_E": "L", "PYTHONUNBUFFERED": "1"}
+	if gotMap := toMap(got); !reflect.DeepEqual(gotMap, want) {
+		t.Fatalf("injected environment=%q want map=%v", got, want)
+	}
+
+	input := []string{"PATH=/bin", "LD_PRELOAD=/x.so"}
+	locateLibstdbufFn = func() string { return "" }
+	got, applied = stdbufInjection(input)
+	if applied || !reflect.DeepEqual(toMap(got), toMap(input)) {
+		t.Fatalf("no-op environment=%q applied=%v want unchanged map=%v", got, applied, toMap(input))
+	}
+}
+
+func TestLedgerRoundTripPreservesBuffering(t *testing.T) {
+	l, err := newLedger(t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusStarting, ScopeIntegrity: ScopeContained, Buffering: "realtime"}
+	if _, err := l.append(ledgerEvent{Kind: "starting", Run: run}); err != nil {
+		t.Fatal(err)
+	}
+	events, err := l.read()
+	if err != nil || len(events) != 1 {
+		t.Fatalf("ledger events=%d err=%v", len(events), err)
+	}
+	if events[0].Run.Buffering != "realtime" {
+		t.Fatalf("ledger buffering=%q events=%+v", events[0].Run.Buffering, events)
+	}
+}
+
+func TestLegacyLedgerRecordDefaultsBufferingToNone(t *testing.T) {
+	l, err := newLedger(t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := []byte(`{"schema_version":1,"sequence":1,"kind":"starting","run":{"schema_version":1,"id":"RUN-legacy","argv":["/bin/true"],"cwd":"/tmp","env_digest":"digest","status":"starting","scope_integrity":"handoff-unverified","started_at":"2026-08-14T00:00:00Z","capture_complete":false,"capture_forced_closed":false,"stdin_stored":false,"scope_kill":{"requested":false,"started":false,"completed":false},"kill_intent":{"present":false,"completed":false,"empty_scope":false},"terminal_complete":false}}`)
+	if err := os.WriteFile(l.ledger, frame(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	record, err := l.current("RUN-legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Buffering != "none" {
+		t.Fatalf("legacy buffering=%q record=%+v", record.Buffering, record)
 	}
 }
 
@@ -276,11 +350,14 @@ func TestFailedMembershipObservationCannotClaimContained(t *testing.T) {
 }
 
 func TestObservedContainmentUpgradesPreObservationEvidence(t *testing.T) {
-	base := RunRecord{ID: "RUN-1", ScopeIntegrity: ScopeHandoffUnverified}
-	candidate := RunRecord{ID: "RUN-1", ScopeIntegrity: ScopeContained}
+	base := RunRecord{ID: "RUN-1", Buffering: "none", ScopeIntegrity: ScopeHandoffUnverified}
+	candidate := RunRecord{ID: "RUN-1", Buffering: "realtime", ScopeIntegrity: ScopeContained}
 	merged := mergeEvidence(base, candidate)
 	if merged.ScopeIntegrity != ScopeContained {
 		t.Fatalf("observed containment did not win evidence merge: %q", merged.ScopeIntegrity)
+	}
+	if merged.Buffering != "realtime" {
+		t.Fatalf("buffering evidence was not carried forward: %q", merged.Buffering)
 	}
 }
 
@@ -672,6 +749,143 @@ func TestRealCgroupExplicitNonemptyEnvironmentIsCanonicalAndDigested(t *testing.
 	want, err := EnvDigest([]EnvEntry{{Key: []byte("Z_LAST"), Value: []byte("last")}, {Key: []byte("A_FIRST"), Value: []byte("first")}})
 	if err != nil || record.EnvDigest != want {
 		t.Fatalf("env digest=%s want %s (err=%v)", record.EnvDigest, want, err)
+	}
+}
+
+func TestRealCgroupRealtimeHonestyAndChildEnvironment(t *testing.T) {
+	lib := realtimeFixtureLib(t)
+	previous := locateLibstdbufFn
+	t.Cleanup(func() { locateLibstdbufFn = previous })
+	probe := realtimeEnvProbe()
+	env := []string{"PATH=/usr/bin:/bin", "LD_PRELOAD=" + lib}
+
+	locateLibstdbufFn = func() string { return lib }
+	withInjection, err := realRunner(t).Launch(context.Background(), Request{Argv: probe, Env: env, ExplicitEnv: true, Realtime: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withInjection.Buffering != "realtime" {
+		t.Fatalf("realtime buffering=%q record=%+v", withInjection.Buffering, withInjection)
+	}
+	data, err := os.ReadFile(withInjection.OutputRefs["out"].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"LD_PRELOAD=" + lib + ":" + lib + "\n", "_STDBUF_O=L\n", "_STDBUF_E=L\n", "PYTHONUNBUFFERED=1\n"} {
+		if !strings.Contains(string(data), expected) {
+			t.Fatalf("injected child environment=%q missing %q", data, expected)
+		}
+	}
+}
+
+func TestRealCgroupRealtimeNoOpPreservesEnvironment(t *testing.T) {
+	lib := realtimeFixtureLib(t)
+	previous := locateLibstdbufFn
+	t.Cleanup(func() { locateLibstdbufFn = previous })
+	locateLibstdbufFn = func() string { return "" }
+	request := Request{Argv: realtimeEnvProbe(), Env: []string{"PATH=/usr/bin:/bin", "LD_PRELOAD=" + lib}, ExplicitEnv: true}
+	plain, err := realRunner(t).Launch(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Realtime = true
+	withoutInjection, err := realRunner(t).Launch(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withoutInjection.Buffering != "none" {
+		t.Fatalf("no-op buffering=%q record=%+v", withoutInjection.Buffering, withoutInjection)
+	}
+	data, err := os.ReadFile(withoutInjection.OutputRefs["out"].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plainData, err := os.ReadFile(plain.OutputRefs["out"].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"_STDBUF_O=", "_STDBUF_E=", "PYTHONUNBUFFERED="} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("no-op child environment=%q contains tactic variable %q", data, forbidden)
+		}
+	}
+	if !bytes.Equal(data, plainData) {
+		t.Fatalf("no-op child environment changed from plain baseline: plain=%q no-op=%q", plainData, data)
+	}
+}
+
+func realtimeFixtureLib(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "libstdbuf.so")
+	if err := os.WriteFile(path, []byte("not a shared object"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func realtimeEnvProbe() []string {
+	return []string{"/bin/sh", "-c", "[ -n \"${LD_PRELOAD+x}\" ] && printf 'LD_PRELOAD=%s\\n' \"$LD_PRELOAD\"; [ -n \"${_STDBUF_O+x}\" ] && printf '_STDBUF_O=%s\\n' \"$_STDBUF_O\"; [ -n \"${_STDBUF_E+x}\" ] && printf '_STDBUF_E=%s\\n' \"$_STDBUF_E\"; [ -n \"${PYTHONUNBUFFERED+x}\" ] && printf 'PYTHONUNBUFFERED=%s\\n' \"$PYTHONUNBUFFERED\""}
+}
+
+func TestRealCgroupRealtimeKeepsDigestOrthogonalToInjection(t *testing.T) {
+	lib := realtimeFixtureLib(t)
+	previous := locateLibstdbufFn
+	t.Cleanup(func() { locateLibstdbufFn = previous })
+	locateLibstdbufFn = func() string { return lib }
+	request := Request{Argv: []string{"/bin/sh", "-c", "printf 'LD_PRELOAD=%s\\n_STDBUF_O=%s\\n' \"$LD_PRELOAD\" \"$_STDBUF_O\""}, Env: []string{"PATH=/usr/bin:/bin", "AIRA_REALTIME_TEST=1"}, ExplicitEnv: true}
+	plain, err := realRunner(t).Launch(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Realtime = true
+	realtime, err := realRunner(t).Launch(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain.EnvDigest != realtime.EnvDigest {
+		t.Fatalf("plain digest=%q realtime digest=%q", plain.EnvDigest, realtime.EnvDigest)
+	}
+	if realtime.Buffering != "realtime" {
+		t.Fatalf("realtime record=%+v", realtime)
+	}
+	plainData, err := os.ReadFile(plain.OutputRefs["out"].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	realtimeData, err := os.ReadFile(realtime.OutputRefs["out"].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plainData), "_STDBUF_O=L") || !strings.Contains(string(realtimeData), "_STDBUF_O=L") {
+		t.Fatalf("plain=%q realtime=%q", plainData, realtimeData)
+	}
+}
+
+func TestRealCgroupRealtimePreservesSeparateCaptureAndDigests(t *testing.T) {
+	lib := realtimeFixtureLib(t)
+	previous := locateLibstdbufFn
+	t.Cleanup(func() { locateLibstdbufFn = previous })
+	locateLibstdbufFn = func() string { return lib }
+	record, err := realRunner(t).Launch(context.Background(), Request{Argv: []string{"/bin/sh", "-c", "printf out; printf err >&2"}, Realtime: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Buffering != "realtime" || !record.CaptureComplete {
+		t.Fatalf("realtime capture record=%+v", record)
+	}
+	for stream, want := range map[string][]byte{"out": []byte("out"), "err": []byte("err")} {
+		ref, ok := record.OutputRefs[stream]
+		if !ok || ref.Path == "" || ref.State != OutputComplete {
+			t.Fatalf("stream %s ref=%+v record=%+v", stream, ref, record)
+		}
+		data, readErr := os.ReadFile(ref.Path)
+		if readErr != nil || (stream == "out" && !bytes.Equal(data, want)) || (stream == "err" && !bytes.HasSuffix(data, want)) {
+			t.Fatalf("stream %s data=%q err=%v", stream, data, readErr)
+		}
+		digest := sha256.Sum256(data)
+		if ref.Digest != hex.EncodeToString(digest[:]) || ref.Bytes != int64(len(data)) {
+			t.Fatalf("stream %s ref=%+v data=%q", stream, ref, data)
+		}
 	}
 }
 
