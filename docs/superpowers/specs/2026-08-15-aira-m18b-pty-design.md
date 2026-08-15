@@ -1,6 +1,6 @@
 # AIRA M18b — `--pty` buffering tactic (real-TTY capture)
 
-Status: PLAN (v2 — Sol plan-review r1 fixes: TIOCGPTPEER+CLOEXEC slave, kill-members-before-drain-join + bounded, record pty post-Start, pty-code only for parent-side setup, /dev/tty bounded-not-prevented, errors.Is(EIO))
+Status: PLAN (v3 — Sol r2 fixes: close-master-to-unblock the bounded drain, TIOCGPTPEER-only fail-closed (no racy path fallback), cgroup.kill+populated=0 not "reap")
 Date: 2026-08-15
 Milestone: #28 — Phase 5 · M18b — `--pty` buffering tactic (pty capture)
 Depends on: M12 capture, M17 live-tee, M18a `buffering` field (all landed, master `d08a102`)
@@ -69,10 +69,13 @@ setup, stdin no-deadlock, termios output processing) and gets its own two-loop.
   killable), never an unkillable hang. We do not claim to prevent a `/dev/tty` block, only to
   bound it.
 - **I5 — EIO=EOF drain is complete and leak-free.** Ordering: `Start` → **close the parent's
-  copy of the pts (slave)** → drain the master. The drain processes `n>0` **even when**
-  `readErr == EIO`, maps **only** `EIO` → clean EOF/`CaptureComplete`, keeps the master open
-  until drain completion, and treats **every other** read error as `partial`
-  (`CaptureIncomplete`). No slave fd lingers after `Start` (else the master never EIOs → hang).
+  copy of the pts (slave)** → `cgroup.kill`+`populated=0` → drain the master. The drain processes
+  `n>0` **even when** `errors.Is(readErr, unix.EIO)`, maps **only** `EIO` → clean
+  EOF/`CaptureComplete`, and treats **every other** read error as `partial` (`CaptureIncomplete`).
+  On the normal path the master closes after `EIO`; on the bounded-join cutoff the master is
+  **closed to unblock** the drain and the capture is `partial`. The `O_CLOEXEC` slave means no
+  slave fd lingers in the child beyond fd 1/2 (else the master never EIOs → the bounded cutoff
+  then applies rather than an unbounded hang).
 - **I6 — one merged stream, no gate-lane leak.** `--pty` writes exactly one `RUN-n.log`;
   `merge_streams=true`; `Buffering=pty`. The gate command-lane constructs `runner.Request`
   without `PTY`, so gate runs stay `buffering=none`, pipe-captured, digest unchanged.
@@ -87,13 +90,13 @@ A new `internal/runner/pty_linux.go` (build-tagged `linux`) exposes `allocatePTY
 slave *os.File, err error)`:
 1. `ptmx := unix.Open("/dev/ptmx", O_RDWR|O_NOCTTY|O_CLOEXEC, 0)` → master.
 2. `unix.IoctlSetPointerInt(ptmx, TIOCSPTLCK, 0)` (unlockpt).
-3. **Obtain the slave via `TIOCGPTPEER` (Sol r1 P2), not a path** — `slaveFD, err :=
+3. **Obtain the slave via `TIOCGPTPEER` ONLY (Sol r1 P2 + r2 P1)** — `slaveFD, err :=
    unix.IoctlRetInt(ptmx, TIOCGPTPEER)` with `O_RDWR|O_NOCTTY|O_CLOEXEC` on the returned fd.
-   `TIOCGPTPEER` (Linux 4.13+) returns the peer of *this* master atomically and race-free (no
-   assumption that `/dev/ptmx` and `/dev/pts` reference the same devpts instance). If
-   `TIOCGPTPEER` is unavailable (`ENOTTY`/old kernel), fall back to opening `/dev/pts/<N>`
-   (`TIOCGPTN`) with `O_RDWR|O_NOCTTY|O_CLOEXEC` **and validate** it (`fstat` same rdev / it is a
-   tty) before use.
+   `TIOCGPTPEER` (Linux 4.13+, universal on any realistic target) returns the peer of *this*
+   master atomically and race-free. If it is unavailable (`ENOTTY`/pre-4.13) we **fail closed**
+   `E_RUN_PTY_UNAVAILABLE` — we do **not** fall back to opening `/dev/pts/<N>` by path, because
+   with multiple devpts mounts a reused index could attach the *wrong* master's slave (Sol r2);
+   we never risk the wrong terminal.
 4. **The slave is `O_CLOEXEC`** so the parent's original slave fd is *not* inherited by the
    child (only Go's dup'd fd 1/2 are); this is load-bearing for the EIO drain (§3.3, Sol r1 P0).
 5. Put the **pts** in output-raw: `t, _ := unix.IoctlGetTermios(pts, TCGETS)`; clear `OPOST`
@@ -128,15 +131,19 @@ reference is closed — including any held by a **descendant** that inherited fd
 1. `Start` succeeds → record `Buffering="pty"` (§3.4).
 2. after the leader is waited, the parent closes its original pts `*os.File` (the `O_CLOEXEC`
    slave means it was never inherited beyond Go's dup'd child fds).
-3. **kill + reap the remaining scope members** before joining the master drain — the child is
-   `clone3`'d into the scope, so the existing terminal path can enumerate + `killScope` any
-   descendant still holding a slave fd; once they die the last slave ref closes and the master
-   `EIO`s.
-4. the M17 decoupled drain reads the master into the capture file + tee; the join is **bounded /
-   cancellable** (ctx-bound, as M17): if the master still has not `EIO`'d within the bound, the
-   drain stops and the capture is marked **`CaptureIncomplete`/`partial`** — never an unbounded
-   hang, never a false `complete`.
-5. the master is closed after drain completion.
+3. **`cgroup.kill` the scope, then wait for `cgroup.events` `populated=0`** before joining the
+   master drain (Sol r2 P2). Only the direct child is `wait(2)`-reaped; grandchildren are not
+   waitable (AIRA is not a subreaper) but `cgroup.kill` + `populated=0` guarantees every scope
+   member is **dead**, which is what matters — a dead descendant's slave fd is closed by the
+   kernel, so the last slave reference goes away and the master `EIO`s. (We say "killed", not
+   "reaped", for grandchildren.)
+4. the M17 decoupled drain reads the master into the capture file + tee. The join is **bounded /
+   cancellable**: on the deadline we **atomically mark the capture `CaptureIncomplete`/`partial`,
+   then CLOSE the master to unblock the goroutine blocked in `master.Read`** (a ctx expiry alone
+   does not interrupt a blocking `Read` — Sol r2 P1), then join the drain; the read error the
+   close induces is the *expected* incomplete-termination signal, not a new failure. Never an
+   unbounded hang, never a false `complete`.
+5. on the normal path the master is closed after the drain reaches `EIO`.
 
 ### 3.3 EIO→EOF in the drain
 
