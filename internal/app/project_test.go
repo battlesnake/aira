@@ -62,6 +62,9 @@ func TestOpenWiresNonemptyWorktreeOwnerIntoRunner(t *testing.T) {
 	if owner == "" || owner != project.WorktreeID {
 		t.Fatalf("runner owner=%q worktree=%q", owner, project.WorktreeID)
 	}
+	if got := project.Runner.ReportMaxBytes(); got != 32<<20 {
+		t.Fatalf("default run report cap=%d want=%d", got, 32<<20)
+	}
 }
 
 func TestRunAdmissionConfigParsesBytesAndDuration(t *testing.T) {
@@ -84,15 +87,16 @@ func TestRunAdmissionConfigParsesBytesAndDuration(t *testing.T) {
 
 func TestRunAdmissionConfigRejectsMalformedAndHalfConfig(t *testing.T) {
 	for name, run := range map[string]RunConfig{
-		"slice only":        {Slice: "whale.slice"},
-		"headroom only":     {MemoryHeadroom: "4G"},
-		"zero":              {Slice: "whale.slice", MemoryHeadroom: "0"},
-		"negative":          {Slice: "whale.slice", MemoryHeadroom: "-1"},
-		"malformed":         {Slice: "whale.slice", MemoryHeadroom: "4GB"},
-		"overflow":          {Slice: "whale.slice", MemoryHeadroom: "9223372036854775807G"},
-		"zero duration":     {Slice: "whale.slice", MemoryHeadroom: "4G", AdmissionMaxWait: "0s"},
-		"negative duration": {Slice: "whale.slice", MemoryHeadroom: "4G", AdmissionMaxWait: "-1s"},
-		"bad duration":      {Slice: "whale.slice", MemoryHeadroom: "4G", AdmissionMaxWait: "soon"},
+		"slice only":          {Slice: "whale.slice"},
+		"headroom only":       {MemoryHeadroom: "4G"},
+		"zero":                {Slice: "whale.slice", MemoryHeadroom: "0"},
+		"negative":            {Slice: "whale.slice", MemoryHeadroom: "-1"},
+		"malformed":           {Slice: "whale.slice", MemoryHeadroom: "4GB"},
+		"overflow":            {Slice: "whale.slice", MemoryHeadroom: "9223372036854775807G"},
+		"zero duration":       {Slice: "whale.slice", MemoryHeadroom: "4G", AdmissionMaxWait: "0s"},
+		"negative duration":   {Slice: "whale.slice", MemoryHeadroom: "4G", AdmissionMaxWait: "-1s"},
+		"bad duration":        {Slice: "whale.slice", MemoryHeadroom: "4G", AdmissionMaxWait: "soon"},
+		"negative report cap": {ReportMaxBytes: -1},
 	} {
 		t.Run(name, func(t *testing.T) {
 			base := Config{Schema: 1, Project: ProjectConfig{Slug: "demo", Prefixes: []string{"DEMO"}}, Lease: LeaseConfig{TTLSeconds: 900, HeartbeatSeconds: 30}, Run: run}

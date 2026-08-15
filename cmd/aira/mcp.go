@@ -408,6 +408,17 @@ func decodeMCPRequest(binding mcpToolBinding, values map[string]json.RawMessage)
 		if _, ok := args["no_admit"]; !ok {
 			args["no_admit"] = false
 		}
+		for _, name := range []string{"ticket", "phase", "label", "tool", "report", "suite", "shard", "retry", "usage", "provider"} {
+			if _, ok := args[name]; !ok {
+				args[name] = ""
+			}
+		}
+		if _, ok := args["config_env"]; !ok {
+			args["config_env"] = []string{}
+		}
+		if _, ok := args["strict_wiring"]; !ok {
+			args["strict_wiring"] = false
+		}
 	case "run-log":
 		if _, ok := args["stream"]; !ok {
 			args["stream"] = ""
@@ -465,7 +476,9 @@ func decodeMCPValue(arg core.ArgSpec, raw json.RawMessage) (any, error) {
 	}
 	if len(arg.Enum) > 0 {
 		stringValue, ok := value.(string)
-		if !ok || !contains(arg.Enum, stringValue) {
+		// An optional enum permits the empty (absent) value; a present value must match.
+		// This mirrors the CLI, which does not enum-reject an omitted optional flag.
+		if !ok || (!(stringValue == "" && !arg.Required) && !contains(arg.Enum, stringValue)) {
 			return nil, fmt.Errorf("E_ARGUMENT_INVALID: argument %q is outside its closed enum", arg.Name)
 		}
 	}

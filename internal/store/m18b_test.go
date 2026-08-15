@@ -7,3 +7,17 @@ func TestPTYUnavailableHasStableFailureExit(t *testing.T) {
 		t.Fatalf("E_RUN_PTY_UNAVAILABLE exit=%d want 1", got)
 	}
 }
+
+func TestM19ExitCodeRegistration(t *testing.T) {
+	want := map[string]int{
+		"E_RUN_WIRING_INCOMPLETE":       4,
+		"E_RUN_USAGE_PROVIDER_REQUIRED": 2,
+		"E_RUN_CONFIG_ENV_INVALID":      2,
+		"U_RUN_REPORT_TOO_LARGE":        3,
+	}
+	for code, exit := range want {
+		if got := ExitForCode(code); got != exit {
+			t.Fatalf("%s exit=%d want=%d", code, got, exit)
+		}
+	}
+}

@@ -290,7 +290,7 @@ func parseRunArgs(argv []string) ([]string, map[string]string, error) {
 			return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: run options must precede the launch delimiter")
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "merge" || name == "realtime" || name == "pty" || name == "store-stdin" || name == "no-admit" {
+		if name == "merge" || name == "realtime" || name == "pty" || name == "store-stdin" || name == "no-admit" || name == "strict-wiring" {
 			options[name] = "true"
 			continue
 		}
@@ -300,9 +300,9 @@ func parseRunArgs(argv []string) ([]string, map[string]string, error) {
 		i++
 		value := argv[i]
 		switch name {
-		case "prefix", "env":
+		case "prefix", "env", "config-env":
 			options[name] = appendDelimited(options[name], value)
-		case "cwd", "stdin":
+		case "cwd", "stdin", "ticket", "phase", "label", "tool", "report", "suite", "shard", "retry", "usage", "provider":
 			if options[name] != "" {
 				return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: option --%s may occur once", name)
 			}
@@ -371,6 +371,18 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		args["stdin"] = options["stdin"]
 		args["store_stdin"] = options["store-stdin"] == "true"
 		args["no_admit"] = options["no-admit"] == "true"
+		args["ticket"] = options["ticket"]
+		args["phase"] = options["phase"]
+		args["label"] = options["label"]
+		args["tool"] = options["tool"]
+		args["report"] = options["report"]
+		args["suite"] = options["suite"]
+		args["config_env"] = canonicalOptionList(options["config-env"])
+		args["shard"] = options["shard"]
+		args["retry"] = options["retry"]
+		args["usage"] = options["usage"]
+		args["provider"] = options["provider"]
+		args["strict_wiring"] = options["strict-wiring"] == "true"
 	case "git":
 		if len(positional) == 0 {
 			return core.Request{}, fmt.Errorf("E_GIT_ARG_INVALID: git requires clone|fetch|push|ls-remote")

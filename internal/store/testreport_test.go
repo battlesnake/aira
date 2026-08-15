@@ -110,6 +110,29 @@ func TestIncompleteGoJSONIsStored(t *testing.T) {
 	}
 }
 
+func TestForcedParserIncompleteCannotBeFlippedTrueByRawParser(t *testing.T) {
+	base := t.TempDir()
+	s := testStore(t, base, base+"/common", base+"/state")
+	input := reportInput(completeGoJSON, "forced-incomplete")
+	input.ForceParserIncomplete = true
+	result, err := s.AddTestReport(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Report.ParserComplete || len(result.Report.Results) == 0 {
+		t.Fatalf("forced-incomplete report=%+v", result.Report)
+	}
+	complete := reportInput(completeGoJSON, "complete-twin")
+	complete.Commit, complete.SuiteID, complete.Config, complete.EnvDigest, complete.Shard = input.Commit, input.SuiteID, input.Config, input.EnvDigest, input.Shard
+	completeResult, err := s.AddTestReport(context.Background(), complete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completeResult.ID == result.ID || !completeResult.Report.ParserComplete {
+		t.Fatalf("forced-incomplete source collided with complete source: forced=%+v complete=%+v", result, completeResult)
+	}
+}
+
 func TestReportDomainValidationRejectsEmptyComparableShardOnlyAfterDefault(t *testing.T) {
 	input := domain.TestReportInput{Format: "junit", SuiteID: "suite", Config: "cfg", Results: []domain.TestResult{{Name: "x", Outcome: domain.OutcomePass}}}
 	if err := input.Validate(); err == nil {

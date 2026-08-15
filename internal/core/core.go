@@ -238,14 +238,15 @@ type DispatchDescriptor struct {
 }
 
 type Core struct {
-	store       Store
-	runner      Runner
-	gitops      GitOps
-	initializer Initializer
-	stdin       io.Reader
-	outputCap   int64
-	face        FaceOutput
-	verbs       map[string]verbSpec
+	store          Store
+	runner         Runner
+	gitops         GitOps
+	initializer    Initializer
+	stdin          io.Reader
+	outputCap      int64
+	reportMaxBytes int64
+	face           FaceOutput
+	verbs          map[string]verbSpec
 }
 
 // FaceOutput is fixed when a Core is constructed. Live output is deliberately
@@ -290,13 +291,13 @@ type verbSpec struct {
 const ListLimit = store.ListLimit
 
 func New(s Store) *Core {
-	c := &Core{store: s}
+	c := &Core{store: s, reportMaxBytes: defaultRunReportMaxBytes}
 	c.verbs = c.dispatchTable()
 	return c
 }
 
 func NewWithRunner(s Store, execution Runner) *Core {
-	c := &Core{store: s, runner: execution}
+	c := &Core{store: s, runner: execution, reportMaxBytes: runnerReportMaxBytes(execution)}
 	c.verbs = c.dispatchTable()
 	return c
 }
@@ -307,7 +308,7 @@ func NewWithRunnerInput(s Store, execution Runner, stdin io.Reader) *Core {
 }
 
 func NewWithRunnerFace(s Store, execution Runner, stdin io.Reader, face FaceOutput) *Core {
-	c := &Core{store: s, runner: execution, face: face}
+	c := &Core{store: s, runner: execution, face: face, reportMaxBytes: runnerReportMaxBytes(execution)}
 	c.stdin = stdin
 	c.verbs = c.dispatchTable()
 	return c
@@ -404,6 +405,12 @@ func runRecord(data any) (runner.RunRecord, bool) {
 	case *runner.RunRecord:
 		if value != nil {
 			return *value, true
+		}
+	case runResponseData:
+		return value.RunRecord, true
+	case *runResponseData:
+		if value != nil {
+			return value.RunRecord, true
 		}
 	}
 	return runner.RunRecord{}, false
@@ -1143,12 +1150,32 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("stdin", false, false, "Launch-time stdin file or -"),
 			boolSpec("store_stdin", false, false, "Persist supplied launch stdin"),
 			boolSpec("no_admit", false, false, "Bypass configured memory admission"),
+			stringSpec("ticket", false, false, "Ticket ID"),
+			stringSpec("phase", false, false, "Work phase"),
+			stringSpec("label", false, false, "Run label"),
+			stringSpec("tool", false, false, "Tool/model identity"),
+			stringSpec("report", false, false, "Captured test report format", "go-json", "junit"),
+			stringSpec("suite", false, false, "Test suite identity"),
+			listSpec("config_env", false, false, "Environment-scoped test configuration K=V"),
+			stringSpec("shard", false, false, "Test shard i/n"),
+			stringSpec("retry", false, false, "Test retry index"),
+			stringSpec("usage", false, false, "Provider usage JSON file"),
+			stringSpec("provider", false, false, "Usage provider"),
+			boolSpec("strict_wiring", false, false, "Fail a successful child when telemetry wiring is incomplete"),
 		}, MCPTool: "aira_run", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			request := runner.Request{
 				Argv: stringSlice(args, "argv"), Cwd: stringArg(args, "cwd"), Env: stringSlice(args, "env"),
+				Ticket: stringArg(args, "ticket"), Phase: stringArg(args, "phase"), Label: stringArg(args, "label"), Tool: stringArg(args, "tool"),
 				Prefix: stringSlice(args, "prefix"), Merge: boolArg(args, "merge"), Realtime: boolArg(args, "realtime"), PTY: boolArg(args, "pty"), StdinPath: stringArg(args, "stdin"),
 				StoreStdin: boolArg(args, "store_stdin"), NoAdmit: boolArg(args, "no_admit"),
 			}
+			// Record all transport-neutral wiring arguments even when the runner is
+			// unavailable; dispatch metadata and generated faces share this handler.
+			for _, name := range []string{"report", "suite", "shard", "retry", "usage", "provider"} {
+				_ = stringArg(args, name)
+			}
+			_ = stringSlice(args, "config_env")
+			_ = boolArg(args, "strict_wiring")
 			if request.PTY {
 				request.Merge = true
 			}
@@ -1176,7 +1203,12 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			if err != nil {
 				return nil, err
 			}
-			return record, nil
+			wiring := c.wireTerminalRun(ctx, args, *record)
+			data := runResponseData{RunRecord: *record, Wiring: wiring}
+			if boolArg(args, "strict_wiring") && runRecordCode(*record) == "" && !wiring.WiringComplete {
+				return handlerData{Data: data, Code: "E_RUN_WIRING_INCOMPLETE"}, nil
+			}
+			return data, nil
 		}},
 		"run-kill": {Name: "run-kill", Usage: "run-kill <run-id> [--steal]", Args: []ArgSpec{stringSpec("run_id", true, true, "Run identifier"), boolSpec("steal", false, false, "Override foreign run ownership")}, MCPTool: "aira_run_kill", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			runID := stringArg(args, "run_id")

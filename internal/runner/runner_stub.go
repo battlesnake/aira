@@ -12,13 +12,20 @@ import (
 // Execution remains deliberately unavailable because runner scopes require
 // Linux cgroup v2.
 type Runner struct {
-	ledger    *ledger
-	outputDir string
-	owner     string
-	backend   ScopeBackend
+	ledger         *ledger
+	outputDir      string
+	owner          string
+	backend        ScopeBackend
+	reportMaxBytes int64
 }
 
 func New(cfg Config) (*Runner, error) {
+	if cfg.ReportMaxBytes == 0 {
+		cfg.ReportMaxBytes = DefaultReportMaxBytes
+	}
+	if cfg.ReportMaxBytes < 0 {
+		return nil, &LaunchError{Code: "E_CONFIG_INVALID", Err: errors.New("report max bytes must be non-negative")}
+	}
 	l, err := newLedger(cfg.CommonDir, cfg.OutputDir)
 	if err != nil {
 		return nil, err
@@ -31,8 +38,10 @@ func New(cfg Config) (*Runner, error) {
 	if backend == nil {
 		backend = newDefaultBackend(cfg.CgroupParent)
 	}
-	return &Runner{ledger: l, outputDir: output, owner: cfg.Owner, backend: backend}, nil
+	return &Runner{ledger: l, outputDir: output, owner: cfg.Owner, backend: backend, reportMaxBytes: cfg.ReportMaxBytes}, nil
 }
+
+func (r *Runner) ReportMaxBytes() int64 { return r.reportMaxBytes }
 
 func nonLinuxRunError() error {
 	return &LaunchError{Code: "E_RUN_SCOPE_UNAVAILABLE", Err: errors.New("cgroup-v2 runner is supported only on Linux")}

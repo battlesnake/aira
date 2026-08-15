@@ -63,6 +63,7 @@ type ComputeEvent struct {
 	Session         string         `json:"session,omitempty"`
 	Agent           string         `json:"agent,omitempty"`
 	Source          string         `json:"source"`
+	Resources       ResourceUsage  `json:"resources"`
 	Buckets         ComputeBuckets `json:"buckets"`
 	ReportedTotal   *int64         `json:"reported_total,omitempty"`
 	CostUSD         *float64       `json:"cost_usd,omitempty"`
@@ -82,6 +83,15 @@ type ComputeEventInput struct {
 	Source   string
 	Raw      RawUsage
 	CostUSD  *float64
+}
+
+// ResourceUsage contains process/cgroup observations. Nil means the runner
+// could not establish that metric; it never means an observed zero.
+type ResourceUsage struct {
+	WallMS  *int64 `json:"wall_ms,omitempty"`
+	CPUUser *int64 `json:"cpu_user,omitempty"`
+	CPUSys  *int64 `json:"cpu_sys,omitempty"`
+	PeakRSS *int64 `json:"peak_rss,omitempty"`
 }
 
 type QuotaSnapshot struct {
@@ -113,6 +123,9 @@ type QuotaSnapshotInput struct {
 // field from another provider.  Buckets is used by the explicit disjoint
 // bucket escape hatch for unknown providers.
 type RawUsage struct {
+	// Runner/cgroup observations are orthogonal to token authority.
+	Resources ResourceUsage
+
 	// Anthropic.
 	InputTokens              *int64
 	CacheReadInputTokens     *int64
@@ -154,6 +167,19 @@ func (b ComputeBuckets) clone() ComputeBuckets {
 	return ComputeBuckets{FreshInput: cloneInt64(b.FreshInput), CacheRead: cloneInt64(b.CacheRead), CacheWrite: cloneInt64(b.CacheWrite), Output: cloneInt64(b.Output), Reasoning: cloneInt64(b.Reasoning)}
 }
 
+func (r ResourceUsage) clone() ResourceUsage {
+	return ResourceUsage{WallMS: cloneInt64(r.WallMS), CPUUser: cloneInt64(r.CPUUser), CPUSys: cloneInt64(r.CPUSys), PeakRSS: cloneInt64(r.PeakRSS)}
+}
+
+// HasUsage reports whether the raw value contains any token authority.
+func (r RawUsage) HasUsage() bool {
+	return r.InputTokens != nil || r.CacheReadInputTokens != nil || r.CacheCreationInputTokens != nil || r.OutputTokens != nil ||
+		r.PromptTokens != nil || r.CachedTokens != nil || r.CompletionTokens != nil || r.ReasoningTokens != nil || r.TotalTokens != nil ||
+		r.PromptTokenCount != nil || r.CachedContentTokenCount != nil || r.CandidatesTokenCount != nil || r.ThoughtsTokenCount != nil || r.TotalTokenCount != nil ||
+		r.CodexInputTokens != nil || r.CodexCachedInputTokens != nil || r.CodexCacheWriteInputTokens != nil || r.CodexOutputTokens != nil || r.CodexReasoningOutputTokens != nil || r.CodexTotalTokens != nil ||
+		r.Buckets != nil || r.ReportedTotal != nil
+}
+
 func cloneInt64(value *int64) *int64 {
 	if value == nil {
 		return nil
@@ -163,14 +189,22 @@ func cloneInt64(value *int64) *int64 {
 }
 
 func (e ComputeEventInput) Validate() error {
-	if strings.TrimSpace(e.Provider) == "" || strings.TrimSpace(e.Model) == "" || strings.TrimSpace(e.Source) == "" {
+	if strings.TrimSpace(e.Model) == "" || strings.TrimSpace(e.Source) == "" || (strings.TrimSpace(e.Provider) == "" && strings.TrimSpace(e.Source) != "run") {
 		return errors.New(ComputeCodeInvalid + ": provider, model, and source are required")
+	}
+	if strings.TrimSpace(e.Provider) == "" && e.Raw.HasUsage() {
+		return errors.New(ComputeCodeInvalid + ": provider is required for token usage")
 	}
 	if err := ValidatePhase(e.Phase); err != nil {
 		return err
 	}
 	if e.CostUSD != nil && (*e.CostUSD < 0 || math.IsNaN(*e.CostUSD) || math.IsInf(*e.CostUSD, 0)) {
 		return errors.New(ComputeCodeInvalid + ": cost_usd must be finite and non-negative")
+	}
+	for name, value := range map[string]*int64{"wall_ms": e.Raw.Resources.WallMS, "cpu_user": e.Raw.Resources.CPUUser, "cpu_sys": e.Raw.Resources.CPUSys, "peak_rss": e.Raw.Resources.PeakRSS} {
+		if value != nil && *value < 0 {
+			return fmt.Errorf("%s: %s must be non-negative", ComputeCodeInvalid, name)
+		}
 	}
 	return nil
 }
@@ -179,7 +213,7 @@ func (e ComputeEvent) Validate() error {
 	if e.ID == "" || e.At == "" || e.AtSeq < 1 {
 		return errors.New(ComputeCodeInvalid + ": compute event identity is incomplete")
 	}
-	if err := (ComputeEventInput{TicketID: e.TicketID, Phase: e.Phase, Model: e.Model, Provider: e.Provider, At: e.At, Session: e.Session, Agent: e.Agent, Source: e.Source, CostUSD: e.CostUSD}).Validate(); err != nil {
+	if err := (ComputeEventInput{TicketID: e.TicketID, Phase: e.Phase, Model: e.Model, Provider: e.Provider, At: e.At, Session: e.Session, Agent: e.Agent, Source: e.Source, Raw: RawUsage{Resources: e.Resources}, CostUSD: e.CostUSD}).Validate(); err != nil {
 		return err
 	}
 	if err := validateBuckets(e.Buckets); err != nil {

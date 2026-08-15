@@ -367,6 +367,81 @@ func TestObservedContainmentUpgradesPreObservationEvidence(t *testing.T) {
 	}
 }
 
+func TestMergeEvidenceCarriesNonEmptyRunMetadata(t *testing.T) {
+	base := RunRecord{ID: "RUN-1", Ticket: "AIRA-1", Phase: "implement", Label: "unit", Tool: "go"}
+	got := mergeEvidence(base, RunRecord{ID: "RUN-1"})
+	if got.Ticket != base.Ticket || got.Phase != base.Phase || got.Label != base.Label || got.Tool != base.Tool {
+		t.Fatalf("empty candidate erased metadata: got=%+v base=%+v", got, base)
+	}
+
+	want := RunRecord{ID: "RUN-1", Ticket: "AIRA-2", Phase: "work-review", Label: "review", Tool: "codex"}
+	got = mergeEvidence(base, want)
+	if got.Ticket != want.Ticket || got.Phase != want.Phase || got.Label != want.Label || got.Tool != want.Tool {
+		t.Fatalf("non-empty candidate metadata was not carried: got=%+v want=%+v", got, want)
+	}
+}
+
+func TestRunMetadataIsLedgeredWithoutChangingEnvironmentDigest(t *testing.T) {
+	entries := []EnvEntry{{Key: []byte("A"), Value: []byte("one")}}
+	wantDigest, err := EnvDigest(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := Request{Ticket: "AIRA-1", Phase: "implement", Label: "unit", Tool: "go"}
+	record := RunRecord{
+		SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusStarting,
+		Ticket: request.Ticket, Phase: request.Phase, Label: request.Label, Tool: request.Tool,
+		EnvDigest: wantDigest,
+	}
+	l, err := newLedger(t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.append(ledgerEvent{Kind: "starting", Run: record}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := l.current("RUN-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Ticket != request.Ticket || got.Phase != request.Phase || got.Label != request.Label || got.Tool != request.Tool {
+		t.Fatalf("first ledger event lost metadata: %+v", got)
+	}
+	if got.EnvDigest != wantDigest {
+		t.Fatalf("metadata changed env digest: got=%q want=%q", got.EnvDigest, wantDigest)
+	}
+}
+
+func TestLaunchStartingEventCarriesMetadataOrthogonally(t *testing.T) {
+	r, _ := newMemoryRunner(t, nil)
+	stop := errors.New("stop after first ledger event")
+	var starting RunRecord
+	r.appendFault = func(event ledgerEvent) error {
+		if event.Kind == "starting" {
+			starting = event.Run
+			return stop
+		}
+		return nil
+	}
+	request := Request{
+		Argv: []string{"/bin/true"}, Env: []string{"A=one"}, ExplicitEnv: true,
+		Ticket: "AIRA-1", Phase: "implement", Label: "unit", Tool: "go",
+	}
+	if _, err := r.Launch(context.Background(), request); !errors.Is(err, stop) {
+		t.Fatalf("launch error=%v want injected stop", err)
+	}
+	wantDigest, err := EnvDigest([]EnvEntry{{Key: []byte("A"), Value: []byte("one")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if starting.Ticket != request.Ticket || starting.Phase != request.Phase || starting.Label != request.Label || starting.Tool != request.Tool {
+		t.Fatalf("starting event metadata=%+v request=%+v", starting, request)
+	}
+	if starting.EnvDigest != wantDigest {
+		t.Fatalf("metadata-bearing env digest=%q want=%q", starting.EnvDigest, wantDigest)
+	}
+}
+
 func TestHandoffIntegrityAlwaysHasScopeOrReconcileErrorAndIsInadmissible(t *testing.T) {
 	representatives := []RunRecord{
 		{Status: StatusExited, ScopeIntegrity: ScopeHandoffUnverified, ErrorCodes: []string{"E_RUN_SCOPE_INVALID"}},

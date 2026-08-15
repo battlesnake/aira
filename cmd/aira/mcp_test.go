@@ -383,6 +383,28 @@ func TestMCPRunnerPTYMatchesCLIRequest(t *testing.T) {
 	}
 }
 
+func TestMCPRunnerTelemetryArgumentsMatchCLIRequest(t *testing.T) {
+	options := map[string]string{
+		"ticket": "AIRA-1", "phase": "implement", "label": "unit", "tool": "codex",
+		"report": "go-json", "suite": "unit", "config-env": appendDelimited("B=two", "A=one"),
+		"shard": "1/2", "retry": "3", "usage": "usage.json", "provider": "codex", "strict-wiring": "true",
+	}
+	cli := mustCLIRequest(t, "run", []string{"tool", "--child"}, options)
+	var got core.Request
+	server := newMCPServer(func(_ context.Context, request core.Request) (*core.Core, func(), error) {
+		got = request
+		return nil, nil, errors.New("E_INTERNAL: parity probe")
+	})
+	message := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"aira_run","arguments":{"argv":["tool","--child"],"ticket":"AIRA-1","phase":"implement","label":"unit","tool":"codex","report":"go-json","suite":"unit","config_env":["B=two","A=one"],"shard":"1/2","retry":"3","usage":"usage.json","provider":"codex","strict_wiring":true}}}` + "\n"
+	var out bytes.Buffer
+	if err := server.Serve(context.Background(), strings.NewReader(message), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, cli) {
+		t.Fatalf("MCP request=%#v, CLI request=%#v", got, cli)
+	}
+}
+
 func TestChangingDispatchArgumentChangesGeneratedToolSchema(t *testing.T) {
 	descriptors := core.New(nil).DispatchDescriptors()
 	var show core.DispatchDescriptor

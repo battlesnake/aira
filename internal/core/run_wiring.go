@@ -1,0 +1,301 @@
+package core
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"aira/internal/domain"
+	"aira/internal/runner"
+	"aira/internal/store"
+)
+
+const defaultRunReportMaxBytes = runner.DefaultReportMaxBytes
+
+const (
+	codeReportNotRequested      = "U_RUN_REPORT_NOT_REQUESTED"
+	codeComputeNotRequested     = "U_RUN_COMPUTE_NOT_REQUESTED"
+	codeReportCaptureIncomplete = "U_RUN_REPORT_CAPTURE_INCOMPLETE"
+	codeUsageRead               = "E_RUN_USAGE_READ"
+)
+
+type runResponseData struct {
+	runner.RunRecord
+	Wiring runWiring `json:"wiring"`
+}
+
+type runWiring struct {
+	Report             runReportWiring    `json:"report"`
+	Compute            runComputeWiring   `json:"compute"`
+	TestsGreenObserved runObservation     `json:"tests_green_observed"`
+	WiringComplete     bool               `json:"wiring_complete"`
+	Warnings           []runWiringWarning `json:"warnings"`
+}
+
+type runReportWiring struct {
+	ID             string `json:"id,omitempty"`
+	ParserComplete bool   `json:"parser_complete,omitempty"`
+	Comparable     bool   `json:"comparable,omitempty"`
+	Code           string `json:"code"`
+	testCount      int
+}
+
+type runComputeWiring struct {
+	ID     string `json:"id,omitempty"`
+	Tokens string `json:"tokens"`
+	Code   string `json:"code"`
+}
+
+type runObservation struct {
+	Observed bool   `json:"observed,omitempty"`
+	Not      string `json:"not,omitempty"`
+}
+
+type runWiringWarning struct {
+	Action  string `json:"action"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type reportMaxBytesRunner interface{ ReportMaxBytes() int64 }
+
+type testReportContextStore interface {
+	TestReportContext(context.Context) store.TestReportContext
+}
+
+func runnerReportMaxBytes(execution Runner) int64 {
+	if configured, ok := execution.(reportMaxBytesRunner); ok && configured.ReportMaxBytes() > 0 {
+		return configured.ReportMaxBytes()
+	}
+	return defaultRunReportMaxBytes
+}
+
+func (c *Core) wireTerminalRun(ctx context.Context, args *argAccessor, record runner.RunRecord) runWiring {
+	wiring := runWiring{
+		Report:         runReportWiring{Code: codeReportNotRequested},
+		Compute:        runComputeWiring{Tokens: "unevaluated", Code: codeComputeNotRequested},
+		WiringComplete: true,
+		Warnings:       []runWiringWarning{},
+	}
+	reportRequested := strings.TrimSpace(stringArg(args, "report")) != ""
+	toolRequested := strings.TrimSpace(stringArg(args, "tool")) != ""
+	if !record.Status.Terminal() {
+		wiring.WiringComplete = false
+		wiring.warn("run", "U_RUN_EXIT_UNKNOWN", "run did not return terminal evidence")
+	} else {
+		if reportRequested {
+			c.wireRunReport(ctx, args, record, &wiring)
+		}
+		if toolRequested {
+			c.wireRunCompute(ctx, args, record, &wiring)
+		}
+	}
+	wiring.TestsGreenObserved = observeTestsGreen(record, reportRequested, wiring.Report)
+	return wiring
+}
+
+func (w *runWiring) warn(action, code, message string) {
+	w.WiringComplete = false
+	w.Warnings = append(w.Warnings, runWiringWarning{Action: action, Code: code, Message: message})
+}
+
+func (c *Core) wireRunReport(ctx context.Context, args *argAccessor, record runner.RunRecord, wiring *runWiring) {
+	wiring.Report.Code = "OK"
+	config, err := runConfigDigest(stringSlice(args, "config_env"))
+	if err != nil {
+		wiring.Report.Code = "E_RUN_CONFIG_ENV_INVALID"
+		wiring.warn("report", wiring.Report.Code, err.Error())
+		return
+	}
+	retry, err := runRetryIndex(stringArg(args, "retry"))
+	if err != nil {
+		wiring.Report.Code = "E_RUN_ARGUMENT_INVALID"
+		wiring.warn("report", wiring.Report.Code, err.Error())
+		return
+	}
+	stream := "out"
+	if record.Merge {
+		stream = "merged"
+	}
+	chunk, err := c.runner.ReadOutput(ctx, runner.OutputRequest{RunID: record.ID, Stream: stream, Full: true, MaxBytes: c.reportMaxBytes})
+	if err != nil {
+		wiring.Report.Code = store.ErrorCode(err)
+		wiring.warn("report", wiring.Report.Code, err.Error())
+		return
+	}
+	input := domain.TestReportInput{
+		Format: stringArg(args, "report"), Raw: append([]byte(nil), chunk.Bytes...),
+		TicketID: record.Ticket, Phase: record.Phase, RunRef: record.ID,
+		SuiteID: stringArg(args, "suite"), Config: config, Shard: stringArg(args, "shard"), RetryIndex: retry,
+		EnvDigest: record.EnvDigest, At: record.EndedAt, Runner: record.Tool,
+	}
+	if contextual, ok := c.store.(testReportContextStore); ok {
+		identity := contextual.TestReportContext(ctx)
+		input.Commit, input.Branch, input.WorktreeID = identity.Commit, identity.Branch, identity.WorktreeID
+	}
+	forcedIncomplete := !record.CaptureComplete || chunk.Truncated
+	input.ForceParserIncomplete = forcedIncomplete
+	if chunk.Truncated {
+		input.Raw = nil
+		input.SourceDigest = digestBytes(append([]byte("aira:run-report:too-large\x00"), chunk.Bytes...))
+		input.ParserComplete = false
+		wiring.Report.Code = "U_RUN_REPORT_TOO_LARGE"
+		wiring.warn("report", wiring.Report.Code, fmt.Sprintf("captured report exceeds %d bytes", c.reportMaxBytes))
+	} else if !record.CaptureComplete {
+		wiring.Report.Code = codeReportCaptureIncomplete
+		wiring.warn("report", wiring.Report.Code, "captured output is incomplete")
+	}
+	added, addErr := c.store.AddTestReport(ctx, input)
+	if addErr != nil && store.ErrorCode(addErr) == "E_TESTREPORT_INVALID" && !chunk.Truncated {
+		// M19 keeps an honestly parser-incomplete observation even when the raw
+		// parser cannot recover results. M13's direct add semantics remain strict.
+		input.Raw = nil
+		input.SourceDigest = digestBytes(append([]byte("aira:run-report:parser-incomplete\x00"), chunk.Bytes...))
+		input.Results = nil
+		input.ParserComplete = false
+		input.ForceParserIncomplete = true
+		added, addErr = c.store.AddTestReport(ctx, input)
+	}
+	if addErr != nil {
+		wiring.Report.Code = store.ErrorCode(addErr)
+		wiring.warn("report", wiring.Report.Code, addErr.Error())
+		return
+	}
+	report := added.Report
+	effectiveComplete := report.ParserComplete && record.CaptureComplete && !chunk.Truncated
+	wiring.Report.ID = added.ID
+	wiring.Report.testCount = len(report.Results)
+	wiring.Report.ParserComplete = effectiveComplete
+	wiring.Report.Comparable = effectiveComplete && report.Commit != "" && report.SuiteID != "" && report.Config != "" && report.EnvDigest != "" && report.Shard != ""
+	if !effectiveComplete && wiring.Report.Code == "OK" {
+		wiring.Report.Code = "U_TESTREPORT_INCOMPARABLE"
+	}
+	if effectiveComplete && !wiring.Report.Comparable {
+		wiring.Report.Code = "U_TESTREPORT_INCOMPARABLE"
+	}
+}
+
+func runConfigDigest(values []string) (string, error) {
+	if len(values) == 0 {
+		return "", nil
+	}
+	entries := make([]runner.EnvEntry, 0, len(values))
+	for _, item := range values {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok || key == "" {
+			return "", errors.New("E_RUN_CONFIG_ENV_INVALID: --config-env requires K=V")
+		}
+		entries = append(entries, runner.EnvEntry{Key: []byte(key), Value: []byte(value)})
+	}
+	digest, err := runner.EnvDigest(entries)
+	if err != nil {
+		return "", fmt.Errorf("E_RUN_CONFIG_ENV_INVALID: %s", strings.TrimPrefix(err.Error(), "E_RUN_ENV_INVALID: "))
+	}
+	return digest, nil
+}
+
+func runRetryIndex(raw string) (int, error) {
+	if strings.TrimSpace(raw) == "" {
+		return 0, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 {
+		return 0, errors.New("E_RUN_ARGUMENT_INVALID: --retry must be a non-negative integer")
+	}
+	return value, nil
+}
+
+func digestBytes(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func (c *Core) wireRunCompute(ctx context.Context, args *argAccessor, record runner.RunRecord, wiring *runWiring) {
+	provider := strings.ToLower(strings.TrimSpace(stringArg(args, "provider")))
+	usagePath := strings.TrimSpace(stringArg(args, "usage"))
+	raw := domain.RawUsage{}
+	usageAuthoritative := false
+	warningCode, warningMessage := "", ""
+	if usagePath != "" {
+		switch {
+		case usagePath == "-":
+			warningCode, warningMessage = "E_RUN_ARGUMENT_INVALID", "--usage requires a file and does not accept -"
+		case provider == "":
+			warningCode, warningMessage = "E_RUN_USAGE_PROVIDER_REQUIRED", "--usage requires --provider"
+		default:
+			payload, err := os.ReadFile(usagePath)
+			if err != nil {
+				warningCode, warningMessage = codeUsageRead, err.Error()
+			} else if parsed, err := domain.ParseUsagePayload(provider, payload); err != nil {
+				warningCode, warningMessage = store.ErrorCode(err), err.Error()
+			} else if !parsed.HasUsage() {
+				warningCode, warningMessage = domain.ComputeCodeInvalid, "usage payload established no token buckets"
+			} else if _, _, _, err := domain.NormalizeUsage(provider, parsed); err != nil {
+				warningCode, warningMessage = store.ErrorCode(err), err.Error()
+			} else {
+				raw, usageAuthoritative = parsed, true
+			}
+		}
+	}
+	input := domain.ComputeEventInput{
+		TicketID: record.Ticket, Phase: record.Phase, Model: record.Tool, Provider: provider,
+		At: record.EndedAt, Source: "run", Raw: raw,
+	}
+	input.Raw.Resources = domain.ResourceUsage{WallMS: runWallMS(record), CPUUser: record.CPUUser, CPUSys: record.CPUSys, PeakRSS: record.PeakRSS}
+	added, err := c.store.AddComputeEvent(ctx, input)
+	if err != nil {
+		wiring.Compute.Code = store.ErrorCode(err)
+		wiring.warn("compute", wiring.Compute.Code, err.Error())
+		return
+	}
+	wiring.Compute.ID = added.ID
+	if usageAuthoritative {
+		wiring.Compute.Tokens, wiring.Compute.Code = "authoritative", "OK"
+	} else {
+		wiring.Compute.Tokens, wiring.Compute.Code = "unevaluated", "U_COMPUTE_UNEVALUATED"
+	}
+	if warningCode != "" {
+		wiring.Compute.Code = warningCode
+		wiring.warn("compute", warningCode, warningMessage)
+	}
+}
+
+func runWallMS(record runner.RunRecord) *int64 {
+	started, startErr := time.Parse(time.RFC3339Nano, record.StartedAt)
+	ended, endErr := time.Parse(time.RFC3339Nano, record.EndedAt)
+	if startErr != nil || endErr != nil || ended.Before(started) {
+		return nil
+	}
+	value := ended.Sub(started).Milliseconds()
+	return &value
+}
+
+func observeTestsGreen(record runner.RunRecord, reportRequested bool, report runReportWiring) runObservation {
+	if record.ExitCode == nil || *record.ExitCode != 0 {
+		return runObservation{Not: "exit-nonzero"}
+	}
+	if !reportRequested || report.ID == "" {
+		return runObservation{Not: "no-report"}
+	}
+	if report.Code == "U_RUN_REPORT_TOO_LARGE" {
+		return runObservation{Not: "report-too-large"}
+	}
+	if !report.ParserComplete {
+		return runObservation{Not: "parse-incomplete"}
+	}
+	// The report result count is deliberately carried separately from the
+	// response shape to avoid presenting individual test names in wiring.
+	// Comparable reports with no tests are marked by the report helper below.
+	if reportTestCount(report) == 0 {
+		return runObservation{Not: "zero-tests"}
+	}
+	return runObservation{Observed: true}
+}
+
+func reportTestCount(report runReportWiring) int { return report.testCount }

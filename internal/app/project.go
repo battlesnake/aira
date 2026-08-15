@@ -67,6 +67,7 @@ type RunConfig struct {
 	Slice            string   `json:"slice,omitempty"`
 	MemoryHeadroom   string   `json:"memory_headroom,omitempty"`
 	AdmissionMaxWait string   `json:"admission_max_wait,omitempty"`
+	ReportMaxBytes   int64    `json:"report_max_bytes,omitempty"`
 }
 
 type ProjectConfig struct {
@@ -204,6 +205,7 @@ func OpenWithDiagnostics(ctx context.Context, cwd string, diagnostics io.Writer)
 		MemoryReserve:    memoryReserve,
 		AdmissionMaxWait: admissionMaxWait,
 		Diagnostics:      diagnostics,
+		ReportMaxBytes:   project.Config.Run.ReportMaxBytes,
 	})
 	if err != nil {
 		_ = s.Close()
@@ -374,6 +376,9 @@ func validateConfig(config Config) error {
 	}
 	if config.Project.TestReports.MaxReports < 0 || config.Project.TestReports.MaxAgeDays < 0 || config.Project.Compute.MaxEvents < 0 || config.Project.Compute.MaxAgeDays < 0 || config.Project.Compute.MaxQuotaSnapshots < 0 {
 		return errors.New("E_CONFIG_INVALID: test report retention values must be non-negative")
+	}
+	if config.Run.ReportMaxBytes < 0 {
+		return errors.New("E_CONFIG_INVALID: run.report_max_bytes must be non-negative")
 	}
 	seen := map[string]bool{}
 	for _, prefix := range config.Project.Prefixes {

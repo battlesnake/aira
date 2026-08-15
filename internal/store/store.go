@@ -454,6 +454,7 @@ func (s *Store) initDB(ctx context.Context) error {
 		    source TEXT NOT NULL, fresh_input INTEGER, cache_read INTEGER, cache_write INTEGER,
 		    output INTEGER, reasoning INTEGER, reported_total INTEGER, cost_usd REAL,
 		    conservation TEXT NOT NULL, reasoning_subset INTEGER NOT NULL DEFAULT 0,
+		    wall_ms INTEGER, cpu_user INTEGER, cpu_sys INTEGER, peak_rss INTEGER,
 		    at_seq INTEGER NOT NULL,
 		    PRIMARY KEY(project_id, id),
 		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
@@ -471,6 +472,14 @@ func (s *Store) initDB(ctx context.Context) error {
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			return translateDBError(err)
+		}
+	}
+	for _, column := range []string{"wall_ms", "cpu_user", "cpu_sys", "peak_rss"} {
+		if hasTableColumn(ctx, s.db, "compute_events", column) {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE compute_events ADD COLUMN `+column+` INTEGER`); err != nil {
 			return translateDBError(err)
 		}
 	}

@@ -164,6 +164,27 @@ func TestSkillManifestAndVersionAreDeterministic(t *testing.T) {
 	}
 }
 
+func TestM19RunArgumentsReachGeneratedSkillAction(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"ticket": true, "phase": true, "label": true, "tool": true, "report": true, "suite": true, "config_env": true, "shard": true, "retry": true, "usage": true, "provider": true, "strict_wiring": true}
+	for _, action := range artifacts.Actions {
+		if action.Verb != "run" {
+			continue
+		}
+		for _, arg := range action.Args {
+			delete(want, arg.Name)
+		}
+		if len(want) != 0 {
+			t.Fatalf("generated run action is missing M19 args: %v", want)
+		}
+		return
+	}
+	t.Fatal("generated skill has no run action")
+}
+
 func TestResponseContractMatchesUnevaluatedDo(t *testing.T) {
 	contract := ResponseContract()
 	if contract.UnevaluatedIsPass || !reflect.DeepEqual(contract.Verdicts, []string{"pass", "fail", "unevaluated"}) || contract.ExitCodes["UNEVALUATED"] != 3 {

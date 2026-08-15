@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -13,6 +14,23 @@ func computeI64(value int64) *int64 { return &value }
 
 func computeInput(raw domain.RawUsage) domain.ComputeEventInput {
 	return domain.ComputeEventInput{Model: "gpt-test", Provider: "openai", Source: "manual", Raw: raw}
+}
+
+func TestRunResourceOnlyComputeEventPersistsNilTokenBuckets(t *testing.T) {
+	base := t.TempDir()
+	s := testStore(t, base, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	resources := domain.ResourceUsage{WallMS: computeI64(1250), CPUUser: computeI64(12), CPUSys: computeI64(3), PeakRSS: computeI64(4096)}
+	result, err := s.AddComputeEvent(context.Background(), domain.ComputeEventInput{Model: "codex", Source: "run", Raw: domain.RawUsage{Resources: resources}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Event.Provider != "" || result.Event.Conservation != domain.ConservationUnevaluated || result.Event.Buckets.FreshInput != nil || result.Event.Buckets.CacheRead != nil || result.Event.Buckets.CacheWrite != nil || result.Event.Buckets.Output != nil || result.Event.Buckets.Reasoning != nil {
+		t.Fatalf("resource-only event fabricated token authority: %+v", result.Event)
+	}
+	rows, err := s.ListComputeEvents("")
+	if err != nil || len(rows) != 1 || !reflect.DeepEqual(rows[0].Resources, resources) {
+		t.Fatalf("stored resources=%+v err=%v", rows, err)
+	}
 }
 
 func TestComputeMismatchIsStoredAndRaisesWarningFinding(t *testing.T) {

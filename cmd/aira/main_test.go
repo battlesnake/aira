@@ -194,6 +194,8 @@ func TestRunDelimiterKeepsChildOptionTokensVerbatim(t *testing.T) {
 	want := core.Request{Verb: "run", Args: map[string]any{
 		"argv": []string{"tool", "--child-option", "--json"}, "prefix": []string(nil), "cwd": "",
 		"env": []string{}, "merge": true, "realtime": false, "pty": false, "stdin": "", "store_stdin": false, "no_admit": false,
+		"ticket": "", "phase": "", "label": "", "tool": "", "report": "", "suite": "", "config_env": []string{},
+		"shard": "", "retry": "", "usage": "", "provider": "", "strict_wiring": false,
 	}}
 	if !reflect.DeepEqual(request, want) {
 		t.Fatalf("request=%#v, want=%#v", request, want)
@@ -277,6 +279,29 @@ func TestRunNoAdmitFlagReachesRunnerHandler(t *testing.T) {
 	response := core.NewWithRunnerFace(nil, capture, nil, core.FaceOutput{}).Do(context.Background(), request)
 	if !response.OK || !capture.request.NoAdmit {
 		t.Fatalf("response=%+v runner request=%+v", response, capture.request)
+	}
+}
+
+func TestRunTelemetryOptionsReachCanonicalCoreRequest(t *testing.T) {
+	argv := []string{"--ticket", "AIRA-1", "--phase", "implement", "--label", "unit", "--tool", "codex", "--report", "go-json", "--suite", "unit", "--config-env", "B=two", "--config-env", "A=one", "--shard", "1/2", "--retry", "3", "--usage", "usage.json", "--provider", "codex", "--strict-wiring", "--", "tool", "--child"}
+	positional, options, err := parseArgs("run", argv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := buildRequest("run", positional, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]any{"ticket": "AIRA-1", "phase": "implement", "label": "unit", "tool": "codex", "report": "go-json", "suite": "unit", "shard": "1/2", "retry": "3", "usage": "usage.json", "provider": "codex", "strict_wiring": true} {
+		if !reflect.DeepEqual(request.Args[key], want) {
+			t.Fatalf("%s=%#v want %#v request=%#v", key, request.Args[key], want, request.Args)
+		}
+	}
+	if got := request.Args["config_env"]; !reflect.DeepEqual(got, []string{"B=two", "A=one"}) {
+		t.Fatalf("config_env=%#v", got)
+	}
+	if got := request.Args["argv"]; !reflect.DeepEqual(got, []string{"tool", "--child"}) {
+		t.Fatalf("child argv=%#v", got)
 	}
 }
 

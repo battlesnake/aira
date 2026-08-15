@@ -38,6 +38,7 @@ type Runner struct {
 	clock              Clock
 	sliceMemory        func(path string) (cur, max int64, ok bool, reason string)
 	diagnostics        io.Writer
+	reportMaxBytes     int64
 	reserveIDFn        func() (string, error)
 	openOutputsFn      func(string, string, bool) (map[string]string, map[string]*os.File, error)
 	setupStdinFn       func(*exec.Cmd, Request, string) (func(), bool, error)
@@ -49,6 +50,12 @@ type Runner struct {
 }
 
 func New(cfg Config) (*Runner, error) {
+	if cfg.ReportMaxBytes == 0 {
+		cfg.ReportMaxBytes = DefaultReportMaxBytes
+	}
+	if cfg.ReportMaxBytes < 0 {
+		return nil, &LaunchError{"E_CONFIG_INVALID", errors.New("report max bytes must be non-negative")}
+	}
 	if cfg.AdmissionMaxWait == 0 {
 		cfg.AdmissionMaxWait = 30 * time.Minute
 	}
@@ -96,8 +103,10 @@ func New(cfg Config) (*Runner, error) {
 	}
 	return &Runner{ledger: l, outputDir: output, owner: cfg.Owner, backend: backend, prefix: prefix, grace: grace, termGrace: termGrace, now: cfg.Now,
 		memorySlice: strings.TrimSpace(cfg.MemorySlice), memoryReserve: cfg.MemoryReserve, admissionMaxWait: cfg.AdmissionMaxWait,
-		pollInterval: cfg.PollInterval, clock: cfg.Clock, sliceMemory: cfg.sliceMemoryFn, diagnostics: cfg.Diagnostics}, nil
+		pollInterval: cfg.PollInterval, clock: cfg.Clock, sliceMemory: cfg.sliceMemoryFn, diagnostics: cfg.Diagnostics, reportMaxBytes: cfg.ReportMaxBytes}, nil
 }
+
+func (r *Runner) ReportMaxBytes() int64 { return r.reportMaxBytes }
 
 func (r *Runner) append(event ledgerEvent) (ledgerEvent, error) {
 	r.mu.Lock()
@@ -234,7 +243,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		started := nowString(r.now)
 		// Containment is not an initial assumption. Until the leader is positively
 		// observed in cgroup.procs, the durable record must remain non-contained.
-		record = RunRecord{SchemaVersion: ledgerSchema, ID: id, Owner: r.owner, Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, Buffering: buffering, Merge: req.Merge, Admission: admission.state, AdmissionReason: admission.reason, AdmissionWaitedMS: admission.waitedMS, LaunchPrefix: append([]string(nil), prefix...), StartedAt: started, Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}}
+		record = RunRecord{SchemaVersion: ledgerSchema, ID: id, Owner: r.owner, Ticket: req.Ticket, Phase: req.Phase, Label: req.Label, Tool: req.Tool, Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, Buffering: buffering, Merge: req.Merge, Admission: admission.state, AdmissionReason: admission.reason, AdmissionWaitedMS: admission.waitedMS, LaunchPrefix: append([]string(nil), prefix...), StartedAt: started, Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}}
 		// The intended scope reference is durable before scope creation. It is not
 		// used as kill authority until the actual scope-created record is present.
 		record.CgroupScope = r.intendedScope(id)
@@ -718,6 +727,18 @@ func mergeEvidence(base, candidate RunRecord) RunRecord {
 	}
 	if candidate.StolenBy != "" {
 		base.StolenBy = candidate.StolenBy
+	}
+	if candidate.Ticket != "" {
+		base.Ticket = candidate.Ticket
+	}
+	if candidate.Phase != "" {
+		base.Phase = candidate.Phase
+	}
+	if candidate.Label != "" {
+		base.Label = candidate.Label
+	}
+	if candidate.Tool != "" {
+		base.Tool = candidate.Tool
 	}
 	if candidate.PIDIdentity.PID != 0 {
 		base.PIDIdentity = candidate.PIDIdentity

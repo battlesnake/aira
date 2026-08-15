@@ -25,6 +25,18 @@ type TestReportAddResult struct {
 	Idempotent   bool              `json:"idempotent,omitempty"`
 }
 
+type TestReportContext struct {
+	Commit     string
+	Branch     string
+	WorktreeID string
+}
+
+// TestReportContext returns the same git/worktree identity AddTestReport uses
+// for omitted provenance, allowing run wiring to construct a complete input.
+func (s *Store) TestReportContext(ctx context.Context) TestReportContext {
+	return TestReportContext{Commit: s.gitValue(ctx, "HEAD"), Branch: s.gitValue(ctx, "--abbrev-ref", "HEAD"), WorktreeID: s.worktreeID}
+}
+
 // FlakyCellSummary is the uncapped cell-state aggregate behind both the
 // flaky face and the flaky-rate gauge. Denominator is Flaky+Clean; cells with
 // insufficient evidence remain visible in Unevaluated but are excluded.
@@ -93,6 +105,9 @@ func (s *Store) AddTestReport(ctx context.Context, rawInput domain.TestReportInp
 		input.Results = parsed.Results
 		input.ParserComplete = parsed.Complete
 	}
+	if input.ForceParserIncomplete {
+		input.ParserComplete = false
+	}
 	if input.SourceDigest == "" {
 		payload := input.Raw
 		if payload == nil {
@@ -103,20 +118,27 @@ func (s *Store) AddTestReport(ctx context.Context, rawInput domain.TestReportInp
 				Results                                   []domain.TestResult
 			}{input.Format, input.Commit, input.SuiteID, input.Config, input.EnvDigest, input.Shard, input.RetryIndex, input.Results})
 		}
+		if input.ForceParserIncomplete {
+			payload = append([]byte("aira:test-report:forced-incomplete\x00"), payload...)
+		}
 		digest := sha256.Sum256(payload)
 		input.SourceDigest = hex.EncodeToString(digest[:])
 	}
 	if input.At == "" {
 		input.At = timeNow()
 	}
+	identity := TestReportContext{}
+	if input.Commit == "" || input.Branch == "" || input.WorktreeID == "" {
+		identity = s.TestReportContext(ctx)
+	}
 	if input.Commit == "" {
-		input.Commit = s.gitValue(ctx, "HEAD")
+		input.Commit = identity.Commit
 	}
 	if input.Branch == "" {
-		input.Branch = s.gitValue(ctx, "--abbrev-ref", "HEAD")
+		input.Branch = identity.Branch
 	}
 	if input.WorktreeID == "" {
-		input.WorktreeID = s.worktreeID
+		input.WorktreeID = identity.WorktreeID
 	}
 	if err := input.Validate(); err != nil {
 		return TestReportAddResult{}, err

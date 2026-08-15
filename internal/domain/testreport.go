@@ -76,11 +76,14 @@ type TestReportInput struct {
 	Shard          string
 	RetryIndex     int
 	ParserComplete bool
-	Coverage       *Coverage
-	Format         string
-	SourceDigest   string
-	Raw            []byte
-	Results        []TestResult
+	// ForceParserIncomplete is a caller-established upper bound on parser
+	// completeness (for example, an incomplete or capped runner capture).
+	ForceParserIncomplete bool
+	Coverage              *Coverage
+	Format                string
+	SourceDigest          string
+	Raw                   []byte
+	Results               []TestResult
 }
 
 var shardPattern = regexp.MustCompile(`^[1-9][0-9]*/[1-9][0-9]*$`)

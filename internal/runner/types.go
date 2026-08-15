@@ -81,6 +81,10 @@ type RunRecord struct {
 	ID                  string               `json:"id"`
 	Owner               string               `json:"owner,omitempty"`
 	StolenBy            string               `json:"stolen_by,omitempty"`
+	Ticket              string               `json:"ticket,omitempty"`
+	Phase               string               `json:"phase,omitempty"`
+	Label               string               `json:"label,omitempty"`
+	Tool                string               `json:"tool,omitempty"`
 	Argv                []string             `json:"argv"`
 	Cwd                 string               `json:"cwd"`
 	EnvDigest           string               `json:"env_digest"`
@@ -123,6 +127,10 @@ type EnvEntry struct {
 
 type Request struct {
 	Argv        []string
+	Ticket      string
+	Phase       string
+	Label       string
+	Tool        string
 	Cwd         string
 	Env         []string // exact KEY=VALUE overrides; inherited environment is retained
 	Timeout     time.Duration
@@ -198,7 +206,10 @@ type Config struct {
 	Clock            Clock
 	sliceMemoryFn    func(path string) (cur, max int64, ok bool, reason string)
 	Diagnostics      io.Writer
+	ReportMaxBytes   int64
 }
+
+const DefaultReportMaxBytes int64 = 32 << 20
 
 type ScopeBackend interface {
 	Probe(context.Context) error
