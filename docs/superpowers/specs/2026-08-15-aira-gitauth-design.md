@@ -1,6 +1,6 @@
 # AIRA #30 — `aira git`: non-interactive git network ops with SSH→gh-credential auth fallback
 
-Status: PLAN (v5 — Sol round-4 fixes: universal single-push-destination guard, no push.default reimpl, explicit clone-fallback URL)
+Status: PLAN (v6 — Sol round-5 fixes: probe the effective PUSH URL, copy all remote.* settings, FALLBACK_BLOCKED reasons, config-env-aware rewrite scan)
 Date: 2026-08-15
 Milestone: #30 — Runner git-op command with SSH→gh-credential auth fallback
 Depends on: nothing unlanded (master `1e84128`)
@@ -106,9 +106,10 @@ residual is a config change landing *between* them (§3.2).
 
 ### 3.1 The probe and the classification
 
-The probe is a read-only `git ls-remote --heads <remote>` (clone: the URL) under
-BatchMode SSH, using the remote's effective ssh endpoint. It authenticates with no
-side-effect. **Both the probe AND (for reporting) the committed op are classified** by
+The probe is a read-only `git ls-remote --heads <effective-URL>` under BatchMode SSH,
+where the effective URL is resolved **per verb** (§8.2) — push probes the effective
+*push* URL, fetch/ls-remote the effective *fetch* URL, clone the URL argument — so the
+probe endpoint is exactly the op endpoint. It authenticates with no side-effect. **Both the probe AND (for reporting) the committed op are classified** by
 the conservative SSH-auth classifier (§6.1). Outcomes:
 
 - Probe exits 0 → SSH auth works → run the real op over SSH (remote name, unchanged).
@@ -177,19 +178,26 @@ git \
   unique suffix, or refuse) has **no pre-existing config**, so `remote.aira-fallback.url`
   has exactly one value — the fallback provably uses our canonical HTTPS URL, never the
   original (fixes the multi-value append bug).
-- **Fetch refspecs are copied** from `remote.<name>.fetch` (`git config --get-all`) so
-  `git fetch aira-fallback` updates `refs/remotes/<name>/*` exactly as `git fetch <name>`
-  would (a bare synthetic remote with no fetch refspec would update only `FETCH_HEAD`).
+- **All `remote.<name>.*` settings are copied** to `remote.aira-fallback.*` **verbatim
+  (every key, preserving multi-values) except `url`/`pushurl`** (which we set) — so
+  `fetch` refspecs (tracking `refs/remotes/<name>/*`), `tagOpt`, `prune`, `pruneTags`,
+  `partialclonefilter`/`promisor`, and any other fetch controls are preserved, and the
+  fallback fetch changes the *same* local refs/tags as native `git fetch <name>` (Sol
+  round-5 P1). If a copied key's semantics cannot be faithfully replicated on a renamed
+  remote (e.g. one that names `<name>` itself), we refuse `E_GIT_FALLBACK_BLOCKED`
+  reason=`unsupported-remote-config` rather than silently diverge; a native-vs-fallback
+  ref/tag equivalence test guards this.
 - **push refspec (fallback only).** We do **not** reimplement `push.default` for the
   synthetic remote (Sol round-4: `simple`/`current`/`matching`/`nothing`/triangular all
   differ — synthesising "current→upstream" would push the wrong branch or wrongly reject).
   Instead: an **explicit** refspec from the caller is used verbatim; else a configured
   `remote.<name>.push` refspec is copied to the synthetic remote; else — a no-refspec
-  fallback push that would rely on `push.default` — we **refuse** `E_GIT_ARG_INVALID`
-  ("explicit refspec required for a fallback push; e.g. `aira git push origin
-  HEAD:<branch>`"). The exceptional (ssh-down) path asks the caller to be explicit rather
-  than let us guess git's push semantics. (The **native** push keeps full `push.default`
-  — §5.2.)
+  fallback push that would rely on `push.default` — we **refuse** `E_GIT_FALLBACK_BLOCKED`
+  reason=`explicit-refspec-required` (Sol round-5: it is not an *invalid arg* — the push
+  is perfectly valid natively; it is only the *fallback* that cannot replicate
+  `push.default`; the message suggests `aira git push origin HEAD:<branch>`). The
+  exceptional (ssh-down) path asks the caller to be explicit rather than let us guess git's
+  push semantics. (The **native** push keeps full `push.default` — §5.2.)
 - `credential.helper=` (empty) **first clears** any inherited/system helper so a stray
   interactive helper cannot hang or leak; the second sets **only** gh.
 - Nothing is written to `.git/config` (all `-c`, ephemeral). `clone` has no remote — it
@@ -344,7 +352,7 @@ New stable codes (registered in `internal/store/check.go` exit-code map):
 | `E_GIT_SSH_UNAVAILABLE`   | 1 | ssh binary absent, or `GIT_SSH_COMMAND`/ssh cannot be invoked at all |
 | `E_GIT_GH_UNAVAILABLE`    | 1 | fallback needed but `gh` missing or `gh auth status` non-zero |
 | `E_GIT_AUTH_FAILED`       | 1 | SSH auth failed and no usable fallback (non-github host, or gh unavailable) |
-| `E_GIT_FALLBACK_BLOCKED`  | 1 | fallback candidate, but an effective `url.*.insteadOf` would rewrite the canonical HTTPS URL — refused rather than run over an unverifiable transport |
+| `E_GIT_FALLBACK_BLOCKED`  | 1 | a fallback was needed but cannot be synthesised honestly — `reason` ∈ {`insteadof-rewrite` (a rule would rewrite our canonical HTTPS), `multiple-destinations`, `explicit-refspec-required` (no-refspec fallback push that would rely on `push.default`), `unsupported-remote-config` (a `remote.<name>.*` setting we cannot faithfully replicate)} |
 | `E_GIT_REMOTE_UNSUPPORTED`| 1 | remote scheme/host not a supported network target (local/file/git:// ) |
 | `E_GIT_REMOTE_UNRESOLVED` | 1 | could not resolve the target URL (no such remote / no upstream) |
 | `E_GIT_TIMEOUT`           | 3 | op exceeded `git.op_timeout_seconds`; child process-group killed |
@@ -357,14 +365,30 @@ Exit-code choice mirrors the runner family (auth/failed = 1, timeout = 3, arg/co
 ## 8. Target-URL resolution and the strict URL grammar
 
 - `clone <url> [dir]` — URL is the first positional. Host/scheme parsed from it.
-- `push [remote] [refspec…]` — the reported/classified endpoint is git's **effective
-  push URL** (after `insteadOf`/`pushInsteadOf`, honouring `pushurl`); fetch/ls-remote
-  use the **effective fetch URL** (`git ls-remote --get-url <remote>`). Remote name
-  defaults to `origin`; empty/no-such-remote → `E_GIT_REMOTE_UNRESOLVED`. (v1 does **not**
-  consult the branch's configured upstream; `origin` default + explicit `[remote]` arg
-  covers the cases. Upstream-derivation is D3.) Auth is a property of (transport, host),
-  so the SSH probe reads a read-only endpoint on the effective host regardless of push
-  vs fetch.
+- `push [remote] [refspec…]` — the probed, classified, and reported endpoint is the
+  **effective PUSH URL** (Sol round-5: `git ls-remote <remote>` uses the *fetch* URL, so
+  a `pushurl` that differs would make us probe the wrong endpoint). fetch/ls-remote use
+  the **effective FETCH URL**. Remote name defaults to `origin`; empty/no-such-remote →
+  `E_GIT_REMOTE_UNRESOLVED`. (v1 does **not** consult the branch's upstream; `origin`
+  default + explicit `[remote]` arg covers the cases — D3.)
+
+### 8.2 Effective-URL resolution (per verb, `insteadOf`-aware)
+
+The effective URL is resolved deterministically, in the **same config environment the op
+child will run in** (same `GIT_CONFIG_*`, same cwd), so it observes exactly the rules the
+op will (Sol round-5 P2 — covers a clone's inherited `GIT_CONFIG_COUNT`/custom paths):
+
+1. Raw URL: fetch/ls-remote → `git ls-remote --get-url <remote>` (git applies `insteadOf`);
+   push → `git remote get-url --push <remote>` (single, per the §5.0 push-destination
+   guard); clone → the URL argument.
+2. `insteadOf`/`pushInsteadOf` application: we enumerate the rules once (§5.1) and apply
+   git's **longest-matching-prefix** rewrite ourselves — for a push, `pushInsteadOf`
+   takes precedence over `insteadOf`; longest matching `<base>` wins; no match →
+   passthrough. **This pure string rewrite is the only git behaviour we reimplement** (it
+   is fully specified and side-effect-free — unlike `push.default`, which we never
+   reimplement). The result is the effective URL used for probe, host classification, and
+   the reported `url`/`auth`. The SSH probe is a read-only `git ls-remote` of that exact
+   effective (post-rewrite) URL, so probe endpoint == op endpoint per verb.
 - **Remote-name grammar + arg option-injection is closed** (Sol rounds 2–3): because the
   remote name is interpolated into config-query keys (`remote.<name>.fetch`, `--get-all
   remote.<name>.url`), it is validated against a **deliberately narrow grammar** —
@@ -500,6 +524,18 @@ Pure-unit (no network, `internal/gitremote`):
 - **Clone fallback (§5.3)**: clone uses the **explicit canonical HTTPS URL** (not a
   synthetic remote); the argv is `... clone https://github.com/owner/repo.git [dir]` with
   the two credential `-c` lines; rewrite-safety enumerates only global/system insteadOf.
+- **Push probes the PUSH URL (§8.2)**: a remote whose `pushurl` differs (different host)
+  from its fetch URL → the probe/classification/report use the **push** URL; a stub
+  proving `ls-remote --get-url` (fetch) is *not* what push probes.
+- **Effective-URL rewrite resolution (§8.2)**: longest-matching-prefix `insteadOf`
+  application, `pushInsteadOf` precedence for push, no-match passthrough — table-driven;
+  and the enumeration runs in the op child's config env (a `GIT_CONFIG_*`-injected rule
+  is observed).
+- **All-settings copy (§5)**: a remote with `tagOpt`/`prune`/`fetch` → the synthetic
+  fallback argv copies each verbatim (except url/pushurl); a native-vs-fallback stub
+  asserts identical resulting ref/tag update set.
+- **Refspec-less fallback push** → `E_GIT_FALLBACK_BLOCKED` reason=`explicit-refspec-
+  required` (**not** `E_GIT_ARG_INVALID`), op never runs.
 - **Remote-name grammar**: names with `-`-lead, `=`, `..`, control chars → `E_GIT_ARG_INVALID`.
 - **Rewrite-safety (§5.1)**: a simulated `url."git@github.com:".insteadOf=
   "https://github.com/"` (an "always-ssh" rule) whose value prefixes our canonical HTTPS
