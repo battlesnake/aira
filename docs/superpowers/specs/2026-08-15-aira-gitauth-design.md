@@ -1,6 +1,6 @@
 # AIRA #30 — `aira git`: non-interactive git network ops with SSH→gh-credential auth fallback
 
-Status: PLAN (v4 — incorporates Sol round-3 findings: synthetic single-URL fallback remote + single-destination guard)
+Status: PLAN (v5 — Sol round-4 fixes: universal single-push-destination guard, no push.default reimpl, explicit clone-fallback URL)
 Date: 2026-08-15
 Milestone: #30 — Runner git-op command with SSH→gh-credential auth fallback
 Depends on: nothing unlanded (master `1e84128`)
@@ -180,36 +180,53 @@ git \
 - **Fetch refspecs are copied** from `remote.<name>.fetch` (`git config --get-all`) so
   `git fetch aira-fallback` updates `refs/remotes/<name>/*` exactly as `git fetch <name>`
   would (a bare synthetic remote with no fetch refspec would update only `FETCH_HEAD`).
-- **push** copies `remote.<name>.push` refspecs if present; since push.default consults
-  `branch.<b>.remote=<name>` (the *original* name, not the synthetic), a no-refspec push
-  is resolved to a **concrete** refspec ourselves — the current branch to its configured
-  upstream on `<name>` (`refs/heads/<B>:refs/heads/<upstream>`); if there is no
-  configured push refspec and no upstream to resolve, we refuse `E_GIT_ARG_INVALID`
-  ("explicit refspec required for a fallback push of a branch with no upstream") rather
-  than guess. (Native, non-fallback push keeps full push.default semantics — §5.2.)
+- **push refspec (fallback only).** We do **not** reimplement `push.default` for the
+  synthetic remote (Sol round-4: `simple`/`current`/`matching`/`nothing`/triangular all
+  differ — synthesising "current→upstream" would push the wrong branch or wrongly reject).
+  Instead: an **explicit** refspec from the caller is used verbatim; else a configured
+  `remote.<name>.push` refspec is copied to the synthetic remote; else — a no-refspec
+  fallback push that would rely on `push.default` — we **refuse** `E_GIT_ARG_INVALID`
+  ("explicit refspec required for a fallback push; e.g. `aira git push origin
+  HEAD:<branch>`"). The exceptional (ssh-down) path asks the caller to be explicit rather
+  than let us guess git's push semantics. (The **native** push keeps full `push.default`
+  — §5.2.)
 - `credential.helper=` (empty) **first clears** any inherited/system helper so a stray
   interactive helper cannot hang or leak; the second sets **only** gh.
 - Nothing is written to `.git/config` (all `-c`, ephemeral). `clone` has no remote — it
   takes the explicit canonical URL directly.
 
-### 5.0 Single-destination requirement (fallback only)
+### 5.0 Single-destination requirement for **push** (native AND fallback)
 
-The fallback overrides one destination, so it requires the remote to resolve to a
-**single** endpoint. Before falling back we read `git config --get-all
-remote.<name>.url` and `git remote get-url --push --all <name>`; if the remote has
-**more than one distinct fetch URL, or more than one push URL, or its URLs disagree on
-`owner/repo`**, the fallback is refused `E_GIT_FALLBACK_BLOCKED`
-(reason=`multiple-destinations`) — we will not silently pick one or push to several over
-mixed transports. (The *native* path — ssh works, or native https — runs the user's
-multi-URL remote as-is and reports best-effort; the restriction is only on synthesising
-a fallback.) Multi-destination fallback is D7 (deferred, documented).
+A `git push <remote>` with multiple `pushurl`/`url` values pushes to **all** of them —
+several remote side-effects over possibly different transports, only one of which was
+probed. That breaks "one transport, at most once" and cannot be honestly reported as a
+single transport (Sol round-4: labelling it "best-effort" weakens the invariant rather
+than satisfying it). So **every push** — native or fallback — first checks `git remote
+get-url --push --all <remote>`: **more than one push destination → refuse**
+`E_GIT_REMOTE_UNSUPPORTED` (reason=`multiple-destinations`). For a fallback specifically
+we additionally require the (single) URL set to agree on one `owner/repo`; disagreement →
+`E_GIT_FALLBACK_BLOCKED`. `fetch` is unaffected: git fetches from a single (first) URL,
+so it has one transport, reported honestly. Multi-destination push is **D7 (deferred,
+refused honestly in v1)**.
 
 ### 5.2 Native path takes no overrides
 
 When SSH auth works (or the remote is native HTTPS with gh serving credentials), the op
 runs with the **real remote name and zero URL/refspec overrides** — full native
-`push.default`/tracking semantics. Only the two `credential.helper` `-c` lines are added
-on the native-HTTPS-github case (to supply the gh credential); nothing else changes.
+`push.default`/tracking semantics (subject to the §5.0 single-push-destination guard).
+Only the two `credential.helper` `-c` lines are added on the native-HTTPS-github case
+(to supply the gh credential); nothing else changes.
+
+### 5.3 Clone is special (no remote to synthesise)
+
+`clone` has no in-repo remote config, so the synthetic-remote mechanism does not apply
+(`git clone aira-fallback` is meaningless — Sol round-4). Clone works directly off the
+URL argument: probe `git ls-remote <url>`; native `git clone <url> [dir]`; **fallback
+`git -c credential.helper= -c credential.helper="!gh auth git-credential" clone
+https://github.com/<owner>/<repo>.git [dir]`** using the canonical URL we construct,
+gated by the same rewrite-safety check (§5.1) — which for a fresh clone enumerates only
+global/system `insteadOf` (there is no repo-local config yet). A test proves the
+post-rewrite effective clone URL is our canonical HTTPS.
 
 ### 5.1 Rewrite-safety check — never claim `https-gh` over an unknown transport
 
@@ -472,12 +489,17 @@ Pure-unit (no network, `internal/gitremote`):
   `credential.helper` `-c` lines; **no `git config` write** ever appears (the seam records
   every argv). A stub with the original remote holding a *second* url value proves the
   synthetic remote is used (not the appended-override that the multi-value bug would hit).
-- **Single-destination guard (§5.0)**: a remote with two distinct fetch URLs, or a
-  `--push --all` returning two, or fetch/push URLs disagreeing on owner/repo →
-  `E_GIT_FALLBACK_BLOCKED` reason=`multiple-destinations`, op never runs.
-- **Fallback push refspec**: no-refspec push with a resolvable upstream → concrete
-  `refs/heads/B:refs/heads/<upstream>`; no upstream and no configured push refspec →
-  `E_GIT_ARG_INVALID` (never a guessed destination).
+- **Single-destination push guard (§5.0)**: a `--push --all` returning two destinations
+  → `E_GIT_REMOTE_UNSUPPORTED` reason=`multiple-destinations` **on the native path too**
+  (not just fallback), op never runs; a fallback whose URLs disagree on owner/repo →
+  `E_GIT_FALLBACK_BLOCKED`.
+- **Fallback push refspec**: explicit caller refspec → used verbatim; configured
+  `remote.<name>.push` → copied to the synthetic remote; **neither** (would rely on
+  `push.default`) → `E_GIT_ARG_INVALID` — asserts we do **not** synthesise a
+  push.default-derived refspec.
+- **Clone fallback (§5.3)**: clone uses the **explicit canonical HTTPS URL** (not a
+  synthetic remote); the argv is `... clone https://github.com/owner/repo.git [dir]` with
+  the two credential `-c` lines; rewrite-safety enumerates only global/system insteadOf.
 - **Remote-name grammar**: names with `-`-lead, `=`, `..`, control chars → `E_GIT_ARG_INVALID`.
 - **Rewrite-safety (§5.1)**: a simulated `url."git@github.com:".insteadOf=
   "https://github.com/"` (an "always-ssh" rule) whose value prefixes our canonical HTTPS
@@ -532,14 +554,16 @@ on the network.
   scoping them is a possible future.
 - **D6 credential caching / ssh-agent management** — out of scope; we consume whatever
   ssh/gh already provide, non-interactively.
-- **D7 multi-destination remotes** — a remote with several fetch/push URLs runs natively
-  but is refused for *fallback synthesis* (`E_GIT_FALLBACK_BLOCKED`); coherent
-  multi-destination fallback is out of v1.
+- **D7 multi-destination push** — a remote with several push destinations is refused for
+  *every* push (`E_GIT_REMOTE_UNSUPPORTED`), native and fallback alike; coherent
+  multi-destination push is out of v1. (Multi-URL *fetch* runs — git uses the first URL.)
 
 ## 13. Invariants (for the build review to attack in both directions)
 
-1. A **mutating** op (`push`) runs **at most once**, over exactly one transport
-   (probe-then-commit). No stderr-scrape-and-retry on the mutation path.
+1. A **mutating** op (`push`) runs **at most once**, over exactly one transport, to
+   **exactly one destination** (probe-then-commit; multi-destination push refused §5.0).
+   No stderr-scrape-and-retry on the mutation path; no `push.default` reimplementation
+   (fallback push requires an explicit/configured refspec).
 2. The gh fallback fires **only** on a positively-classified SSH-auth failure to a
    github.com host (strict grammar) with `gh_fallback` enabled and gh present+authed
    **for github.com**; every other failure surfaces its own code and does **not** fall back.
