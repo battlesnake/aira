@@ -265,6 +265,13 @@ admission state; `runner.New` default max-wait honoured.
 
 ## 8. Sol plan-review resolutions
 
+### r4 — APPROVE-PLAN (build-ready)
+Sol confirmed r3 closed. **Single most important builder note:** the closure-local
+`defer releaseAdmit()` is only a leak backstop — Go evaluates `return r.failBeforeLaunch(...)`
+*before* deferred unlocks run, so **every failure path must explicitly call the idempotent
+`releaseAdmit()` BEFORE invoking `failBeforeLaunch`/terminal arbitration** (the defer then no-ops).
+This preserves the lock-order invariant and keeps terminal work from blocking sibling admissions.
+
 ### r3 — build-ready after these
 - **P0 locked-recheck discards reason** → §3.4: a `!ok2` recheck under the lock releases + fails open
   immediately (`unevaluated` + the read's reason), not poll-to-timeout. T12.
