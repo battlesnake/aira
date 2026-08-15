@@ -1,12 +1,26 @@
 # M20 — Detached-run supervisor shim (`aira run --detach`)
 
-Status: PLAN v3 (post Sol rounds 1–2). Phase 5. Resolves the design-authority
+Status: PLAN v4 (post Sol rounds 1–3). Phase 5. Resolves the design-authority
 "decide shim-vs-daemon first" open question (§21) and delivers `--detach`
 (§14 line 153).
 
 Design authority: [`2026-08-07-aira-design.md`](2026-08-07-aira-design.md) §5.2,
 §14, §20/§21. Builds on the foreground runner (M12/M16/M17/M18a/M18b/M19), the
 run-kill ownership guard (#27), and the memory-admission gate (#29).
+
+**v4 changelog (Sol round 3):** a durable **`quiesce-forced`** event is written
+**before** the forced `cgroup.kill`, so no finalization race can lose the forced
+outcome (P0-1). A **single shared `finalizeDetachedTerminal`** (usage snapshot +
+output digest + evidence) is used by both the shim and Reconcile, so whoever wins
+the CAS produces an identical complete terminal (P0-2). The `leader-exited`
+evidence gains a monotonic **`LeaderExitObserved`** flag with presence-bearing
+`ExitCode`/`Signal`, and `mergeEvidence` carries it on the flag (a clean `exit 0`
+no longer collapses to `lost` — P0-3). Liveness is **three-valued**
+(alive/dead/**unknown**); boot_id read-failure → unknown→preserve, and →
+`E_RUN_IDENTITY_UNAVAILABLE` at identity creation (P1). The stalled-supervisor
+recovery claim is corrected to **manual** (no `--steal` reuse; fenced lease
+deferred, P1). run-kill/Reconcile use **bounded** flock acquisition with
+`U_RUN_LAUNCH_STALLED`, never a false kill over a stuck launch (P1).
 
 **v3 changelog (Sol round 2):** the per-run flock is **held across
 Create→Start→`running`** so run-kill can never inject intent into the launch race
@@ -184,26 +198,38 @@ robust: a stalled shim cannot backpressure/SIGPIPE the child.
   re-opens to `stat` + `digestFile`.
 - **`leader-exited` evidence, then quiesce, then finalise** (P0-3/P0-4). After
   `waitpid(leader)` the shim first appends a durable `leader-exited` evidence event
-  (exit code + signal). Because dup2-direct has **no pipe-EOF barrier**, a
-  descendant that inherited the capture fd may still be writing, so the shim
-  **waits (bounded, reusing the M18b quiesce with the run-kill ctx) for the scope
-  to become `populated==0`**; on timeout it best-effort `cgroup.kill`s and
-  re-waits (recording `forcedQuiesce`). **It never terminalizes while the scope is
-  non-empty** (P0-4):
-  - Scope empties **cleanly** (no forced kill) → snapshot usage → finalise refs
-    (digest, `complete`) → terminalize from the evidence: `exited N` (or `killed`
-    if a `KillIntent` completed), `ScopeContained`.
-  - Scope empties only **after a forced `cgroup.kill`** → same finalise, but the
-    outcome is recorded as forced: `ScopeIntegrity = ScopeDescendantKilled` +
-    `U_RUN_QUIESCE_FORCED`, with the leader's exit preserved as **evidence**
-    (`exit_code` set) — `CleanSuccess()` is **false** (it requires
-    `ScopeContained` + no error codes). We never report a clean `exited` when we
-    force-killed surviving workload (P0-3).
+  (`LeaderExitObserved=true`, presence-bearing `exit_code`/`signal` — §4). Because
+  dup2-direct has **no pipe-EOF barrier**, a descendant that inherited the capture
+  fd may still be writing, so the shim **waits (bounded, reusing the M18b quiesce
+  with the run-kill ctx) for the scope to become `populated==0`**. **It never
+  terminalizes while the scope is non-empty** (P0-4):
+  - Scope empties **cleanly** (no forced kill) → `finalizeDetachedTerminal`
+    (below) → `exited N` (or `killed` if a `KillIntent` completed),
+    `ScopeContained`.
+  - Quiesce times out with descendants still present → **the shim durably appends
+    a `quiesce-forced` event BEFORE issuing `cgroup.kill`** (Sol P0-1 r3), then
+    kills and re-waits. Because the forced-quiesce fact is durable *before* the
+    scope can empty, **any** finalizer (shim or a racing Reconcile) incorporates
+    it: the outcome is `ScopeIntegrity = ScopeDescendantKilled` +
+    `U_RUN_QUIESCE_FORCED`, leader exit preserved as **evidence** —
+    `CleanSuccess()` is **false**. We never report a clean `exited` when we
+    force-killed surviving workload (P0-3), and never *lose* the forced fact to a
+    finalization race.
   - Scope **never** empties (a D-state uninterruptible descendant, #20 family) →
-    the run stays **non-terminal** with the durable `leader-exited` evidence +
-    `OutputPartial` + `U_RUN_CAPTURE_INCOMPLETE`; it remains **killable** (non-
-    terminal) and a later Reconcile finalises from the evidence once the scope
-    empties. Never a terminal `exited` over live descendants.
+    the run stays **non-terminal** with the durable evidence + `OutputPartial` +
+    `U_RUN_CAPTURE_INCOMPLETE`; it remains **killable** and a later Reconcile
+    finalises from the evidence once the scope empties. Never a terminal `exited`
+    over live descendants.
+- **One shared finalizer** (Sol P0-2 r3): `finalizeDetachedTerminal(record, scope,
+  evidence)` — used by **both** the shim (post-quiesce) and Reconcile (evidence +
+  empty scope) — re-checks scope-empty under the per-run flock, snapshots cgroup
+  usage (readable until the empty cgroup is removed), stats + `digestFile`s the
+  capture files → `OutputComplete`, folds the `quiesce-forced` fact, builds the
+  terminal from the evidence, and only then `appendTerminalLocked` + removes the
+  empty scope. Whoever wins the CAS produces an **identical, complete** terminal
+  — no usage/digest is discarded by a Reconcile that beats the shim. (A
+  re-population between the empty-check and the CAS is closed by re-checking empty
+  under the same held flock immediately before the CAS.)
 - Byte cap: "complete up to the disk-eviction cap"; §19 head+tail elision applies
   at **read** time (`run-log`). Eviction/truncation → `evicted`/`unavailable`
   (`U_RUN_OUTPUT_UNAVAILABLE`), never fake `complete`. Hard mid-run cap → §9 D2.
@@ -221,22 +247,41 @@ Additive `RunRecord` fields (JSON-additive; legacy → zero on read):
   supervisor **lease** (§6). (`PIDIdentity` continues to hold the child leader.)
 
 `PIDIdentity` gains `BootID string` (from `/proc/sys/kernel/random/boot_id`),
-applied to **both** the leader and the supervisor (P1). `processLive` returns
-**dead** on a boot_id mismatch (survives a reboot/PID-reuse) or a `/proc` **zombie
-(Z)** state — hardening the existing leader-liveness primitive too.
+applied to **both** the leader and the supervisor (P1 r2). Liveness is now
+**three-valued** `alive | dead | unknown` (Sol P1 r3), replacing the boolean:
+- **alive** — boot_id present + matches the running kernel, pid present, `/proc`
+  state not zombie(Z).
+- **dead** — boot_id present but **mismatches** (survives a reboot / cross-boot PID
+  collision), or the pid is absent, or `/proc` state is **zombie(Z)**.
+- **unknown** — boot_id unreadable at check time, or the record's boot_id is empty
+  (a legacy/pre-M20 record). Reconcile treats **unknown as preserve** (never
+  fabricate `dead`) and surfaces it as **unevaluated**, never terminalizing on it.
 
-New durable ledger event kind **`leader-exited`** — evidence `{exit_code, signal}`
-written immediately after `waitpid`, **before** quiesce/terminal. It is *not*
-terminal; it is the authoritative exit fact that lets either the shim (post-
-quiesce) or Reconcile (if the shim dies/wedges) finalise the run with the **real**
-exit rather than `U_RUN_EXIT_UNKNOWN` (P0-4, P1 wedged-shim).
+At **identity creation** (the shim stamping `SupervisorPID` before `reserveID`), an
+unreadable boot_id **aborts before reservation** with `E_RUN_IDENTITY_UNAVAILABLE`
+(the lease would otherwise be unreliable; boot_id is virtually always readable, so
+this is a safety net, not a common path).
+
+Two new durable, **non-terminal** ledger event kinds:
+- **`leader-exited`** — the authoritative exit fact, written immediately after
+  `waitpid`, **before** quiesce/terminal: `LeaderExitObserved bool` (a **monotonic**
+  presence flag) + presence-bearing `ExitCode *int` + `Signal string`. It lets
+  either the shim (post-quiesce) or Reconcile (if the shim dies/wedges) finalise
+  with the **real** exit rather than `U_RUN_EXIT_UNKNOWN`.
+- **`quiesce-forced`** — written *before* a forced `cgroup.kill` (§3), so the
+  forced-quiesce outcome cannot be lost to a finalization race.
 
 New terminal status `cancelled` (`Status.Terminal()==true`): the launch handshake
 was abandoned before any child started (§2.1); asserts **no child ran**.
 
-`mergeEvidence` carries `Detached`, `SupervisorPID`, and the leader-exited
-evidence **monotonically** (field-loss trap — M16/#27). `Request` gains
-`Detach bool`. New config `run.detach_ready_timeout` (§2.1).
+`mergeEvidence` carries `Detached`, `SupervisorPID`, and — critically — the
+leader-exit evidence **on the monotonic `LeaderExitObserved` flag, not on a
+non-zero exit** (Sol P0-3 r3 — the recurring field-loss trap: a clean `exit 0`
+would otherwise collapse to "no exit observed" and mislabel `lost`). When
+`candidate.LeaderExitObserved`, `base` takes `LeaderExitObserved=true` and the
+presence-bearing `ExitCode`/`Signal`. A replay + both-terminalizer test asserts
+`exit 0` survives. `Request` gains `Detach bool`. New config
+`run.detach_ready_timeout` (§2.1).
 
 ---
 
@@ -278,24 +323,44 @@ re-read), decides by the **`leader-exited` evidence first**, then the supervisor
 lease:
 
 1. **`leader-exited` evidence present** (the shim reached `waitpid`):
-   - scope **empty** → **terminalize from the evidence** (`exited N` / `killed` /
-     `+forced-quiesce` integrity), finalising usage/digest if not done —
-     **regardless of supervisor liveness**. This both avoids racing a live shim to
-     a wrong `lost` (P0-4) and finishes a shim that recorded the exit then wedged
-     (P1). No fabricated exit.
+   - scope **empty** → **`finalizeDetachedTerminal`** (§3 — the shared finalizer:
+     snapshot usage + stat/digest outputs + fold the `quiesce-forced` fact + build
+     the terminal from the evidence, then CAS) — **regardless of supervisor
+     liveness**. This avoids racing a live shim to a wrong `lost` (P0-4), finishes
+     a shim that recorded the exit then wedged (P1), and (via the shared finalizer,
+     Sol P0-2 r3) never discards usage/digest the shim would have collected. No
+     fabricated exit.
    - scope **non-empty** → descendants still live → **preserve** (quiescing);
      `run-kill` can target it.
 2. **No `leader-exited` evidence:**
    - `SupervisorPID` **alive** → **preserve** (admitting / launching / pre-
      waitpid). Narrow residual: alive shim + empty scope + no evidence (a shim
      wedged in the tiny window before it records the exit) → preserve **and
-     surface `U_RUN_SUPERVISOR_STALLED`** on `reconcile`/`get` (never a fake exit);
-     operator recovery is `run-kill --steal` (an empty scope kills nothing and
-     terminalizes). An expiring fenced lease is deferred (§9 D4).
+     surface `U_RUN_SUPERVISOR_STALLED`** on `reconcile`/`get` (never a fake exit).
+     v1 has **no automated recovery** for this rare state (Sol P1 r3 — `--steal`
+     only overrides *ownership* for a cgroup-kill; it kills neither the
+     outside-scope shim nor an empty cgroup, so it is **not** recovery here);
+     manual recovery is to kill the wedged shim (its pid is in `SupervisorPID`),
+     after which Reconcile sees a dead supervisor + empty scope → `lost`. An
+     expiring **fenced** lease + a guarded supervisor-abandon operation are
+     deferred (§9 D4).
+   - `SupervisorPID` **unknown** (boot_id unreadable / legacy record) → **preserve
+     + unevaluated** (§4) — never terminalized on unknown liveness.
    - `SupervisorPID` **dead** → existing scope-emptiness terminalization: scope
      non-empty → preserve `running` (unsupervised child; later reconcile
      terminalizes when it empties, still no evidence → `lost`); scope empty/absent
      → `lost` + `U_RUN_EXIT_UNKNOWN` (no fake exit/usage; `peak_rss` unevaluated).
+
+**Bounded lock acquisition** (Sol P1 r3). The shim holds the per-run flock across
+the launch section (§6.1); `cmd.Start` returns after fork+execve dispatch (fast),
+but a pathological `execve`/exe-lookup on a stuck FS (NFS/FUSE) could block it.
+Therefore the operations that contend for the flock — **`run-kill` and
+Reconcile** — acquire it with a **bounded** wait (non-blocking + deadline, the #29
+`LOCK_NB` precedent); on timeout they return an honest diagnostic
+`U_RUN_LAUNCH_STALLED` (never a false kill-success, never a fabricated terminal,
+never an infinite block). `run-kill` **never** reports success while it could not
+acquire the lock or prove scope termination. A stuck-FS launch stall is a
+documented residual surfaced by this diagnostic.
 
 Foreground Reconcile is unchanged (no `SupervisorPID`/evidence; scope-emptiness
 authority as today). The descendant-migration residual (#20) is unchanged by
@@ -382,16 +447,21 @@ drives the real CLI `config→launcher→shim→runner→ledger` path.
 3. dup2-direct faithful; `--merge` kernel-ordered via one OFD; digest+`complete`
    only after clean scope-empty quiesce.
 4. **Forced quiesce** (P0-3): leader exits 0 but a descendant lingers and is
-   `cgroup.kill`ed → outcome `ScopeDescendantKilled`+`U_RUN_QUIESCE_FORCED`,
-   `CleanSuccess()==false`, leader exit preserved as evidence.
+   `cgroup.kill`ed → the `quiesce-forced` event is durable **before** the kill →
+   outcome `ScopeDescendantKilled`+`U_RUN_QUIESCE_FORCED`, `CleanSuccess()==false`,
+   leader exit preserved as evidence — **even when a racing Reconcile finalizes**
+   the run instead of the shim (the forced fact is never lost, Sol P0-1 r3).
 5. **Never terminal over a non-empty scope** (P0-4): a run whose scope cannot be
    quiesced stays non-terminal + killable; ordinary `run-kill` still targets it.
 6. **Supervisor-lease + exit-evidence Reconcile**: (a) queued run, live shim →
    preserved not lost; (b) Reconcile after child-exit with `leader-exited`
-   evidence + empty scope → terminalizes with the **real** `exit_code` (never
-   `lost`), whether or not the shim is alive; (c) dead shim + empty scope + no
+   evidence + empty scope → `finalizeDetachedTerminal` produces the **real**
+   `exit_code` **plus usage + digest** (never `lost`, never a usage/digest-stripped
+   terminal), whether or not the shim is alive, and identically to the shim
+   (shared-finalizer equivalence, Sol P0-2 r3); (c) dead shim + empty scope + no
    evidence → `lost`+`U_RUN_EXIT_UNKNOWN`; (d) alive shim + empty scope + no
-   evidence → preserved + `U_RUN_SUPERVISOR_STALLED`.
+   evidence → preserved + `U_RUN_SUPERVISOR_STALLED`; (e) **unknown** liveness
+   (boot_id unreadable / legacy record) → preserved + unevaluated, never `lost`.
 7. **Create/Start race** (P0-1): `run-kill` intent injected concurrently with the
    flock-held launch section → either no child starts (intent seen) or the child
    starts and is cgroup-killed; never a started-but-unkilled child under a killed
@@ -400,14 +470,24 @@ drives the real CLI `config→launcher→shim→runner→ledger` path.
    missing ACK → shim terminalizes (`cancelled`, or `killed` if intent recorded,
    never erasing an accepted kill) with **no** child; handle printed **before**
    ACK; normal ACK → run proceeds.
-9. **boot_id / zombie liveness** (P1): a recycled pid+start-tick with a different
-   `boot_id` reads **dead**; a zombie reads dead.
-10. Normal-path faithfulness: exit N → `exit_code=N`, `status=exited`,
+9. **Three-valued liveness** (P1 r2/r3): a recycled pid+start-tick with a different
+   `boot_id` reads **dead**; a zombie reads dead; an **unreadable** boot_id reads
+   **unknown** (→ preserve, not dead); an unreadable boot_id at identity creation →
+   `E_RUN_IDENTITY_UNAVAILABLE` before reserve.
+10. **Field-loss trap: clean exit 0 survives** (P0-3 r3) — a `leader-exited`
+    evidence with `exit_code=0`, `LeaderExitObserved=true` survives `replay` and is
+    finalized as `exited 0` (not collapsed to `lost`) by **both** the shim and
+    Reconcile terminalizers.
+11. Normal-path faithfulness: exit N → `exit_code=N`, `status=exited`,
     `peak_rss`/`cpu_*` from cgroup-at-exit, `terminal_complete=true`.
-11. Flag rejection matrix (§5): each → `E_RUN_ARGUMENT_INVALID` synchronously, no
+12. **Bounded-lock launch-stall** (P1 r3): a run-kill/Reconcile that cannot acquire
+    the per-run flock within the bound → `U_RUN_LAUNCH_STALLED`, never a false
+    kill-success or fabricated terminal.
+13. Flag rejection matrix (§5): each → `E_RUN_ARGUMENT_INVALID` synchronously, no
     id; wiring block unreachable on detach.
-12. mergeEvidence monotonic carry of `Detached`/`SupervisorPID`/leader-evidence.
-13. Control file `0600`, deleted before Start. `__supervise` hidden; MCP/skill
+14. mergeEvidence monotonic carry of `Detached`/`SupervisorPID`/leader-evidence
+    (incl. `LeaderExitObserved` gating, not non-zero-exit).
+15. Control file `0600`, deleted before Start. `__supervise` hidden; MCP/skill
     parity for `detach`.
 
 **Sol build-review checklist (false-fail AND false-pass):**
@@ -437,8 +517,11 @@ drives the real CLI `config→launcher→shim→runner→ledger` path.
   child-runs and Reconcile-finalises-from-evidence.
 
 **New stable codes:** `E_RUN_DETACH_FAILED` (supervisor unspawnable or no
-readiness), `U_RUN_DETACH_CANCELLED` (handshake abandoned, no child ran),
-`U_RUN_QUIESCE_FORCED` (surviving descendants force-killed after leader exit),
-`U_RUN_CAPTURE_INCOMPLETE` (dup2-direct capture could not quiesce),
-`U_RUN_SUPERVISOR_STALLED` (alive supervisor, empty scope, no exit evidence). All
-other failures reuse the existing `E_RUN_*`/`U_RUN_*` taxonomy via the relay.
+readiness), `E_RUN_IDENTITY_UNAVAILABLE` (boot_id unreadable at identity creation
+→ abort before reserve), `U_RUN_DETACH_CANCELLED` (handshake abandoned, no child
+ran), `U_RUN_QUIESCE_FORCED` (surviving descendants force-killed after leader
+exit), `U_RUN_CAPTURE_INCOMPLETE` (dup2-direct capture could not quiesce),
+`U_RUN_SUPERVISOR_STALLED` (alive supervisor, empty scope, no exit evidence),
+`U_RUN_LAUNCH_STALLED` (bounded per-run flock acquisition timed out — a launch may
+be stuck; never a false kill/terminal). All other failures reuse the existing
+`E_RUN_*`/`U_RUN_*` taxonomy via the relay.
