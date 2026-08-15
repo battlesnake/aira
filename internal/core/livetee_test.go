@@ -56,6 +56,18 @@ func TestRunnerFaceDefaultsAndJSONStyleFaceSuppressLiveSinks(t *testing.T) {
 	}
 }
 
+func TestRunnerPTYForcesMergedRequestAndSingleLiveSink(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	fake := &faceRunner{}
+	core := NewWithRunnerFace(nil, fake, nil, FaceOutput{Stdout: &stdout, Stderr: &stderr, Live: true})
+	response := core.Do(context.Background(), Request{Verb: "run", Args: map[string]any{
+		"argv": []string{"child"}, "merge": false, "pty": true,
+	}})
+	if !response.OK || !fake.request.PTY || !fake.request.Merge || fake.request.LiveStdout != &stdout || fake.request.LiveStderr != nil {
+		t.Fatalf("PTY face response=%+v request=%+v", response, fake.request)
+	}
+}
+
 type killFaceRunner struct {
 	faceRunner
 	steal  bool

@@ -290,7 +290,7 @@ func parseRunArgs(argv []string) ([]string, map[string]string, error) {
 			return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: run options must precede the launch delimiter")
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "merge" || name == "realtime" || name == "store-stdin" || name == "no-admit" {
+		if name == "merge" || name == "realtime" || name == "pty" || name == "store-stdin" || name == "no-admit" {
 			options[name] = "true"
 			continue
 		}
@@ -367,6 +367,7 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		args["env"] = canonicalOptionList(options["env"])
 		args["merge"] = options["merge"] == "true"
 		args["realtime"] = options["realtime"] == "true"
+		args["pty"] = options["pty"] == "true"
 		args["stdin"] = options["stdin"]
 		args["store_stdin"] = options["store-stdin"] == "true"
 		args["no_admit"] = options["no-admit"] == "true"

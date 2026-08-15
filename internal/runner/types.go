@@ -85,6 +85,7 @@ type RunRecord struct {
 	Cwd                 string               `json:"cwd"`
 	EnvDigest           string               `json:"env_digest"`
 	Buffering           string               `json:"buffering"`
+	Merge               bool                 `json:"merge_streams"`
 	Admission           string               `json:"admission"`
 	AdmissionReason     string               `json:"admission_reason,omitempty"`
 	AdmissionWaitedMS   int64                `json:"admission_waited_ms"`
@@ -129,6 +130,7 @@ type Request struct {
 	Prefix      []string
 	Merge       bool
 	Realtime    bool
+	PTY         bool
 	StdinPath   string // empty means null stdin; "-" means the caller's stdin
 	Stdin       io.Reader
 	StoreStdin  bool

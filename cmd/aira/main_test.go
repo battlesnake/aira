@@ -193,7 +193,7 @@ func TestRunDelimiterKeepsChildOptionTokensVerbatim(t *testing.T) {
 	}
 	want := core.Request{Verb: "run", Args: map[string]any{
 		"argv": []string{"tool", "--child-option", "--json"}, "prefix": []string(nil), "cwd": "",
-		"env": []string{}, "merge": true, "realtime": false, "stdin": "", "store_stdin": false, "no_admit": false,
+		"env": []string{}, "merge": true, "realtime": false, "pty": false, "stdin": "", "store_stdin": false, "no_admit": false,
 	}}
 	if !reflect.DeepEqual(request, want) {
 		t.Fatalf("request=%#v, want=%#v", request, want)
@@ -244,6 +244,22 @@ func TestRunRealtimeFlagReachesRunnerHandler(t *testing.T) {
 	capture := &requestCaptureRunner{}
 	response := core.NewWithRunnerFace(nil, capture, nil, core.FaceOutput{}).Do(context.Background(), request)
 	if !response.OK || !capture.request.Realtime {
+		t.Fatalf("response=%+v runner request=%+v", response, capture.request)
+	}
+}
+
+func TestRunPTYFlagReachesRunnerHandlerAndForcesMerge(t *testing.T) {
+	positional, options, err := parseArgs("run", []string{"--pty", "--", "tool"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := buildRequest("run", positional, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := &requestCaptureRunner{}
+	response := core.NewWithRunnerFace(nil, capture, nil, core.FaceOutput{}).Do(context.Background(), request)
+	if !response.OK || !capture.request.PTY || !capture.request.Merge {
 		t.Fatalf("response=%+v runner request=%+v", response, capture.request)
 	}
 }

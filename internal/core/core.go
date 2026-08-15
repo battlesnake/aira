@@ -1139,14 +1139,18 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			listSpec("env", false, false, "Exact KEY=VALUE environment overrides"),
 			boolSpec("merge", false, false, "Capture stdout and stderr as one kernel stream"),
 			boolSpec("realtime", false, false, "Apply realtime stdio buffering when libstdbuf is available"),
+			boolSpec("pty", false, false, "Capture through a controlling PTY and merge stdout with stderr"),
 			stringSpec("stdin", false, false, "Launch-time stdin file or -"),
 			boolSpec("store_stdin", false, false, "Persist supplied launch stdin"),
 			boolSpec("no_admit", false, false, "Bypass configured memory admission"),
 		}, MCPTool: "aira_run", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			request := runner.Request{
 				Argv: stringSlice(args, "argv"), Cwd: stringArg(args, "cwd"), Env: stringSlice(args, "env"),
-				Prefix: stringSlice(args, "prefix"), Merge: boolArg(args, "merge"), Realtime: boolArg(args, "realtime"), StdinPath: stringArg(args, "stdin"),
+				Prefix: stringSlice(args, "prefix"), Merge: boolArg(args, "merge"), Realtime: boolArg(args, "realtime"), PTY: boolArg(args, "pty"), StdinPath: stringArg(args, "stdin"),
 				StoreStdin: boolArg(args, "store_stdin"), NoAdmit: boolArg(args, "no_admit"),
+			}
+			if request.PTY {
+				request.Merge = true
 			}
 			if c.face.Live {
 				if request.Merge {

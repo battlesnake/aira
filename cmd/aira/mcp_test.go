@@ -64,6 +64,22 @@ func TestMCPRunKillDeclaresStealBoolean(t *testing.T) {
 	}
 }
 
+func TestMCPRunDeclaresPTYBoolean(t *testing.T) {
+	server := newMCPServer(nil)
+	binding, ok := server.byName["aira_run"]
+	if !ok {
+		t.Fatal("missing aira_run tool")
+	}
+	schema, ok := binding.tool.InputSchema.(mcpInputSchema)
+	if !ok {
+		t.Fatalf("run schema type=%T", binding.tool.InputSchema)
+	}
+	property, ok := schema.Properties["pty"]
+	if !ok || property.Type != "boolean" {
+		t.Fatalf("run pty property=%+v present=%v", property, ok)
+	}
+}
+
 func TestMCPLifecycleAndProtocolErrors(t *testing.T) {
 	server := newMCPServer(func(context.Context, core.Request) (*core.Core, func(), error) {
 		return core.New(nil), func() {}, nil
@@ -341,6 +357,23 @@ func TestMCPRunnerLaunchMatchesCLIRequestAndPreservesTargetOptions(t *testing.T)
 		return nil, nil, errors.New("E_INTERNAL: parity probe")
 	})
 	message := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"aira_run","arguments":{"argv":["tool","--child-option","--json"],"merge":true,"realtime":true}}}` + "\n"
+	var out bytes.Buffer
+	if err := server.Serve(context.Background(), strings.NewReader(message), &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, cli) {
+		t.Fatalf("MCP request=%#v, CLI request=%#v", got, cli)
+	}
+}
+
+func TestMCPRunnerPTYMatchesCLIRequest(t *testing.T) {
+	cli := mustCLIRequest(t, "run", []string{"tool"}, map[string]string{"pty": "true"})
+	var got core.Request
+	server := newMCPServer(func(_ context.Context, request core.Request) (*core.Core, func(), error) {
+		got = request
+		return nil, nil, errors.New("E_INTERNAL: parity probe")
+	})
+	message := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"aira_run","arguments":{"argv":["tool"],"pty":true}}}` + "\n"
 	var out bytes.Buffer
 	if err := server.Serve(context.Background(), strings.NewReader(message), &out, &bytes.Buffer{}); err != nil {
 		t.Fatal(err)

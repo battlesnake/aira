@@ -42,6 +42,7 @@ type Runner struct {
 	openOutputsFn      func(string, string, bool) (map[string]string, map[string]*os.File, error)
 	setupStdinFn       func(*exec.Cmd, Request, string) (func(), bool, error)
 	setupPipesFn       func(*exec.Cmd, bool) (map[string]*os.File, map[string]*os.File, error)
+	allocatePTYFn      func() (*os.File, *os.File, error)
 	startFn            func(*exec.Cmd) error
 	lockAttemptFn      func(string) (*admitLock, error)
 	failBeforeLaunchFn func(context.Context, RunRecord, string, error) (*RunRecord, error)
@@ -126,6 +127,12 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if len(req.Argv) == 0 || req.Argv[0] == "" {
 		return nil, launchErr("E_RUN_ARGUMENT_INVALID", errors.New("target argv is empty"))
 	}
+	if req.PTY && req.Realtime {
+		return nil, launchErr("E_RUN_ARGUMENT_INVALID", errors.New("pty and realtime buffering are mutually exclusive"))
+	}
+	if req.PTY {
+		req.Merge = true
+	}
 	prefix, err := effectivePrefix(r.prefix, req.Prefix)
 	if err != nil {
 		return nil, launchErr("E_RUN_PREFIX_INVALID", err)
@@ -161,7 +168,11 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		return nil, launchErr("E_RUN_ENV_INVALID", err)
 	}
 	buffering := "none"
-	if req.Realtime {
+	if req.PTY {
+		// A PTY tactic is only established when Start successfully performs
+		// Setsid+Setctty. Pre-Start ledger events must not claim it.
+		buffering = ""
+	} else if req.Realtime {
 		var applied bool
 		env, applied = stdbufInjection(env)
 		if applied {
@@ -223,7 +234,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		started := nowString(r.now)
 		// Containment is not an initial assumption. Until the leader is positively
 		// observed in cgroup.procs, the durable record must remain non-contained.
-		record = RunRecord{SchemaVersion: ledgerSchema, ID: id, Owner: r.owner, Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, Buffering: buffering, Admission: admission.state, AdmissionReason: admission.reason, AdmissionWaitedMS: admission.waitedMS, LaunchPrefix: append([]string(nil), prefix...), StartedAt: started, Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}}
+		record = RunRecord{SchemaVersion: ledgerSchema, ID: id, Owner: r.owner, Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, Buffering: buffering, Merge: req.Merge, Admission: admission.state, AdmissionReason: admission.reason, AdmissionWaitedMS: admission.waitedMS, LaunchPrefix: append([]string(nil), prefix...), StartedAt: started, Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}}
 		// The intended scope reference is durable before scope creation. It is not
 		// used as kill authority until the actual scope-created record is present.
 		record.CgroupScope = r.intendedScope(id)
@@ -271,6 +282,11 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		cmd = exec.Command(effectiveArgv[0], effectiveArgv[1:]...)
 		cmd.Dir, cmd.Env = cwd, env
 		cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: scope.FD()}
+		if req.PTY {
+			cmd.SysProcAttr.Setsid = true
+			cmd.SysProcAttr.Setctty = true
+			cmd.SysProcAttr.Ctty = controllingTTYFD(false)
+		}
 		var stdinStore bool
 		setupInput := setupStdin
 		if r.setupStdinFn != nil {
@@ -282,14 +298,26 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 			return r.failLaunchPrep(ctx, record, "E_RUN_STDIN_INVALID", err)
 		}
 		record.StdinStored = stdinStore
-		setupCapture := setupPipes
-		if r.setupPipesFn != nil {
-			setupCapture = r.setupPipesFn
+		if req.PTY {
+			allocate := allocatePTY
+			if r.allocatePTYFn != nil {
+				allocate = r.allocatePTYFn
+			}
+			readers, writers, err = setupPTYCapture(cmd, allocate)
+		} else {
+			setupCapture := setupPipes
+			if r.setupPipesFn != nil {
+				setupCapture = r.setupPipesFn
+			}
+			readers, writers, err = setupCapture(cmd, req.Merge)
 		}
-		readers, writers, err = setupCapture(cmd, req.Merge)
 		if err != nil {
 			releaseAdmit()
-			return r.failLaunchPrep(ctx, record, "E_RUN_CAPTURE_FAILED", err)
+			code := "E_RUN_CAPTURE_FAILED"
+			if req.PTY {
+				code = "E_RUN_PTY_UNAVAILABLE"
+			}
+			return r.failLaunchPrep(ctx, record, code, err)
 		}
 		startCommand := func(command *exec.Cmd) error { return command.Start() }
 		if r.startFn != nil {
@@ -303,6 +331,9 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 			}
 			releaseAdmit()
 			return r.failLaunchPrep(ctx, record, code, err)
+		}
+		if req.PTY {
+			record.Buffering = "pty"
 		}
 		// A sibling may recheck as soon as the child is successfully placed.
 		releaseAdmit()
@@ -367,7 +398,11 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		}
 	}
 	for name, rd := range readers {
-		go drain(name, rd, files[name], captureCh, liveStreams[name])
+		var captureReader io.ReadCloser = rd
+		if req.PTY {
+			captureReader = &ptyReader{ReadCloser: rd}
+		}
+		go drain(name, captureReader, files[name], captureCh, liveStreams[name])
 	}
 	type waitOutcome struct {
 		err   error
@@ -453,7 +488,46 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		_ = unlockFile(waitLock)
 	}
 
-	captures, forced, capComplete := collectCapture(ctx, captureCh, len(readers), r.grace)
+	var captures []captureResult
+	var forced, capComplete bool
+	var ptyCleanupErr error
+	if req.PTY {
+		completeness := &captureCompleteness{}
+		killAlreadyQuiesced := timedOut && timeoutKill.Kill.Completed
+		if currentErr == nil && current.KillIntent.Completed && current.ScopeKill.Completed {
+			killAlreadyQuiesced = true
+		}
+		var hadDescendants bool
+		if killAlreadyQuiesced {
+			// A timeout or external run-kill has already executed cgroup.kill and
+			// proved populated=0. Killed capture is intentionally partial.
+			completeness.markIncomplete()
+		} else {
+			hadDescendants, ptyCleanupErr = r.quiescePTYScope(ctx, scope)
+		}
+		closers := make([]io.Closer, 0, len(readers))
+		for _, rd := range readers {
+			closers = append(closers, rd)
+		}
+		if ptyCleanupErr != nil {
+			completeness.markIncomplete()
+			for _, rd := range closers {
+				_ = rd.Close()
+			}
+			record.ScopeIntegrity = ScopeHandoffUnverified
+			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
+		}
+		captures, forced = collectPTYCapture(ctx, captureCh, len(readers), r.grace, closers, completeness)
+		forced = forced || ptyCleanupErr != nil
+		capComplete = completeness.complete()
+		if hadDescendants && ptyCleanupErr == nil {
+			record.ScopeIntegrity = ScopeDescendantKilled
+			record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_DESCENDANT_KILLED")
+			record.ScopeKill = ScopeKill{Requested: true, Started: true, Completed: true, GraceMS: r.grace.Milliseconds(), Actor: "aira", At: nowString(r.now)}
+		}
+	} else {
+		captures, forced, capComplete = collectCapture(ctx, captureCh, len(readers), r.grace)
+	}
 	for _, result := range captures {
 		if ref, ok := record.OutputRefs[result.Name]; ok {
 			ref.Bytes, ref.Digest, ref.State = result.Bytes, result.Digest, result.State
@@ -463,7 +537,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 			record.ErrorCodes = appendUnique(record.ErrorCodes, captureCode(result.Err))
 		}
 	}
-	// Capture completion is evidence about the pipes only. Scope/lifecycle
+	// Capture completion is evidence about the capture streams only. Scope/lifecycle
 	// errors must not turn a fully drained (including zero-byte) capture into
 	// E_RUN_CAPTURE_FAILED; drain reports real read/write/disk failures itself.
 	record.CaptureComplete = capComplete
@@ -582,6 +656,9 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if latestErr == nil && latest.Status.Terminal() {
 		_ = unlockFile(terminalLock)
 		finishLive()
+		if ptyCleanupErr != nil {
+			return &latest, launchErr("U_RUN_RECONCILE_REQUIRED", ptyCleanupErr)
+		}
 		return &latest, nil
 	}
 	latest = mergeEvidence(latest, record)
@@ -608,6 +685,9 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	_ = unlockFile(terminalLock)
 	_ = r.ledger.project(ctx)
 	finishLive()
+	if ptyCleanupErr != nil {
+		return &committed, launchErr("U_RUN_RECONCILE_REQUIRED", ptyCleanupErr)
+	}
 	return &committed, nil
 }
 
@@ -633,6 +713,7 @@ func mergeEvidence(base, candidate RunRecord) RunRecord {
 	if candidate.Buffering != "" {
 		base.Buffering = candidate.Buffering
 	}
+	base.Merge = base.Merge || candidate.Merge
 	if candidate.Admission != "" {
 		base.Admission = candidate.Admission
 		base.AdmissionReason = candidate.AdmissionReason
@@ -882,6 +963,34 @@ func setupPipes(cmd *exec.Cmd, merge bool) (map[string]*os.File, map[string]*os.
 	cmd.Stdout, cmd.Stderr = writers["out"], writers["err"]
 	return readers, writers, nil
 }
+
+func setupPTYCapture(cmd *exec.Cmd, allocate func() (*os.File, *os.File, error)) (map[string]*os.File, map[string]*os.File, error) {
+	master, slave, err := allocate()
+	if err != nil {
+		return nil, nil, err
+	}
+	if master == nil || slave == nil {
+		if master != nil {
+			_ = master.Close()
+		}
+		if slave != nil {
+			_ = slave.Close()
+		}
+		return nil, nil, errors.New("pty allocator returned an incomplete pair")
+	}
+	cmd.Stdout, cmd.Stderr = slave, slave
+	return map[string]*os.File{"log": master}, map[string]*os.File{"log": slave}, nil
+}
+
+// controllingTTYFD returns the child-side fd index used by SysProcAttr.Ctty.
+// PTY stdin is intentionally deferred; the second branch documents the future
+// topology without enabling it.
+func controllingTTYFD(ptyStdin bool) int {
+	if ptyStdin {
+		return 0
+	}
+	return 1
+}
 func closePipes(readers, writers map[string]*os.File) {
 	for _, f := range readers {
 		_ = f.Close()
@@ -899,7 +1008,7 @@ type captureResult struct {
 	Err    error
 }
 
-func drain(name string, rd *os.File, dst *os.File, out chan<- captureResult, streams ...*liveStream) {
+func drain(name string, rd io.ReadCloser, dst *os.File, out chan<- captureResult, streams ...*liveStream) {
 	var live *liveStream
 	if len(streams) > 0 {
 		live = streams[0]
@@ -955,6 +1064,24 @@ func drain(name string, rd *os.File, dst *os.File, out chan<- captureResult, str
 		live.finalDropped = pendingDropped
 		close(live.ch)
 	}
+}
+
+// quiescePTYScope removes every possible descendant slave reference before the
+// master drain is joined. cgroup.kill is intentional even when the leader was
+// the last observed member; waitEmpty is bounded by both ctx and runner grace.
+func (r *Runner) quiescePTYScope(ctx context.Context, scope Scope) (bool, error) {
+	members, membersErr := scope.Members()
+	hadDescendants := len(members) > 0
+	if err := scope.Kill(); err != nil {
+		return hadDescendants, err
+	}
+	if err := waitEmpty(ctx, scope, r.grace); err != nil {
+		return hadDescendants, err
+	}
+	if membersErr != nil {
+		return false, membersErr
+	}
+	return hadDescendants, nil
 }
 
 func collectCapture(ctx context.Context, ch <-chan captureResult, count int, grace time.Duration) ([]captureResult, bool, bool) {
