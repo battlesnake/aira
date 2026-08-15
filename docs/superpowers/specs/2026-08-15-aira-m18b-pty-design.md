@@ -231,6 +231,14 @@ sandbox with no devpts → `E_RUN_PTY_UNAVAILABLE` (fail-closed, honest).
 - **D3 effect proof** — `buffering=pty` = a verified controlling TTY was provided, not a claim
   the child line-buffered (it may `setvbuf` to full). Mirrors M18a I3 honesty.
 - **D4 non-Linux** — Linux-only (devpts), consistent with the runner.
+- **D5 D-state drain residual (accepted boundary, Sol build-review)** — on a forced/bounded
+  abandon the runner closes both the master reader and the capture-file writer, terminating a
+  drain blocked on read or on a *terminable* write before the terminal CAS. A drain stuck in a
+  truly-uninterruptible (D-state) capture-file write cannot be terminated by any means; its
+  goroutine/descriptor persist until the kernel I/O completes. That stream's `OutputRef` keeps
+  its initialised `OutputPartial` state (no digest is ever published for it), so no evidence is
+  falsely frozen — the residual is a bounded, rare resource leak, not a correctness violation.
+  This is the same unpreventable-D-state class as the never-hang contract's best-effort bound.
 
 ## 7. Invariants for the build review to attack (both directions)
 

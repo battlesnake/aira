@@ -40,7 +40,7 @@ func (c *captureCompleteness) observe(result captureResult) {
 
 // collectPTYCapture bounds the master join. The incomplete transition occurs
 // before Close unblocks Read, so a racing late EIO can never restore complete.
-func collectPTYCapture(ctx context.Context, ch <-chan captureResult, count int, grace time.Duration, readers []io.Closer, completeness *captureCompleteness) ([]captureResult, bool) {
+func collectPTYCapture(ctx context.Context, ch <-chan captureResult, count int, grace time.Duration, closers []io.Closer, completeness *captureCompleteness) ([]captureResult, bool) {
 	result := make([]captureResult, 0, count)
 	timer := time.NewTimer(grace)
 	defer timer.Stop()
@@ -63,16 +63,18 @@ func collectPTYCapture(ctx context.Context, ch <-chan captureResult, count int, 
 		return result, false
 	}
 	completeness.markIncomplete()
-	for _, reader := range readers {
-		_ = reader.Close()
+	// Close BOTH the master readers AND the capture-file writers: closing the master
+	// unblocks a drain blocked in master.Read; closing the capture file unblocks a
+	// drain blocked WRITING its sink (both then return EBADF and the goroutine exits).
+	for _, closer := range closers {
+		_ = closer.Close()
 	}
-	// Closing the pty master interrupts a blocking master.Read — but the drain
-	// goroutine could instead be blocked WRITING the capture file (a stuck/full
-	// sink), which the reader close does not unblock. So this SECOND join is ALSO
-	// bounded: on its deadline we stop waiting rather than hang Launch forever. A
-	// drain still blocked is left to finish on its own (captureCh is buffered, so
+	// A truly-uninterruptible (D-state) write cannot be unblocked even by closing the
+	// fd. So this SECOND join is ALSO bounded: on its deadline we stop waiting rather
+	// than hang Launch forever. Such a drain is abandoned (captureCh is buffered, so
 	// its eventual send never blocks); its stream's OutputRef keeps the initialised
-	// OutputPartial state, which is honest.
+	// OutputPartial state — no digest is ever published for it, so no evidence is
+	// falsely frozen. This is the documented D-state residual.
 	secondary := time.NewTimer(grace)
 	defer secondary.Stop()
 	for len(result) < count {

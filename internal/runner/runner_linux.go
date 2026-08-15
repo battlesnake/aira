@@ -509,9 +509,20 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		} else {
 			hadDescendants, ptyCleanupErr = r.quiescePTYScope(ctx, scope)
 		}
-		closers := make([]io.Closer, 0, len(readers))
+		// On a forced/bounded abandon, collectPTYCapture closes BOTH the master
+		// readers AND the capture-file writers so a drain goroutine blocked on either
+		// side (read of the master, or WRITE of the capture file) is terminated —
+		// with EBADF — before the terminal CAS, rather than left running to mutate the
+		// capture file behind its published OutputRef or leak a descriptor/goroutine
+		// (Sol build-review). Only a truly-uninterruptible (D-state) write cannot be
+		// terminated by any means; that stream keeps its initialised OutputPartial
+		// state (no digest is ever published for it, so no evidence is falsely frozen).
+		closers := make([]io.Closer, 0, len(readers)+len(files))
 		for _, rd := range readers {
 			closers = append(closers, rd)
+		}
+		for _, wf := range files {
+			closers = append(closers, wf)
 		}
 		if ptyCleanupErr != nil {
 			completeness.markIncomplete()
