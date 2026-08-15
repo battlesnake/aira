@@ -7,7 +7,9 @@
 - **Depends on:** M12 runner (Kill/killWithIntent/ledger), the worktree-identity primitive
   (`hashID(canonicalGitDir)`, `app.Open`).
 - **Review:** Sol plan-review r1 → REVISE (0×P0; P1 atomicity/steal-durability/structured-payload/
-  owner-wiring, P2 terminal-idempotency/spy-test/per-event-owner); this is **v2** (§8).
+  owner-wiring, P2 terminal-idempotency/spy-test/per-event-owner), r2 → REVISE (P1 reconcile-not-a-
+  killWithIntent-caller, P1 steal-field-loss→monotonic StolenBy; P2 unknown-id, lock-file side
+  effect); this is **v3** (§8).
 
 ## 0. Context — the failure this guards
 
@@ -38,20 +40,28 @@ persisted durably in `KillIntent`; fail-open on unevaluated ownership.
   external-kill/capture-finalized/reconcile), not only via `mergeEvidence` — a full-record replay
   never drops it.
 - **I2 — foreign kill refused ATOMICALLY, non-destructively.** Inside `killWithIntent`, under the
-  per-run lock, after replaying `current` and **before** appending kill-intent or touching the
-  scope: a clearly-foreign user kill returns `E_RUN_FOREIGN_OWNER` with **zero** backend
-  `Open/Terminate/Kill/Remove` and the record byte-identical (no kill-intent event, no status
-  change). Atomic — not dependent on `Owner` immutability between a separate read and the mutation.
-- **I3 — `--steal` overrides, durably.** With `steal`, the foreign run is killed; the override
-  `{steal, caller_owner}` is persisted in `KillIntent` **before** the scope action, so it survives a
-  crash/reconcile (unlike `ScopeKill.Actor`, which recovery overwrites).
+  per-run lock, after looking up `current` (existing run) and **before** appending kill-intent or
+  touching the scope: a clearly-foreign user kill returns `E_RUN_FOREIGN_OWNER` with **zero** backend
+  `Open/Terminate/Kill/Remove`, **no ledger append**, and the record byte-identical (no kill-intent,
+  no status change). Atomic — not dependent on `Owner` immutability between a separate read and the
+  mutation. (Acquiring the per-run `lockFile` may create a benign lock file — that is the only fs
+  side effect; there is no *kill/ledger* mutation.)
+- **I3 — `--steal` overrides, durably (monotonic).** With `steal`, the foreign run is killed and the
+  override is recorded in a **top-level monotonic `RunRecord.StolenBy`** (the stealing worktree id),
+  carried by `mergeEvidence` exactly like `Owner` — so a concurrent timeout/reconcile that *replaces*
+  the nested `KillIntent` cannot erase it (nested `KillIntent.Steal` would be lost when timeout
+  rebuilds the intent or `mergeEvidence` replaces the whole nested value — Sol r2). `ScopeKill.Actor`
+  remains the physical executor.
 - **I4 — fail-open on unevaluated ownership.** `record.Owner==""` (pre-#27 legacy, persists
   indefinitely) → allow. `r.owner==""` is **dead in production** (`app.Open` always supplies a
   nonempty hash); it stays fail-open only for tests, and an **app-level wiring test** asserts
   production always wires a nonempty `Owner` (so a wiring regression fails a test, not silently).
 - **I5 — same-owner + non-user paths unaffected.** Killing your own run is byte-for-byte current
-  behaviour. Timeout completion, `failBeforeLaunch`, and `Reconcile` terminalisation **bypass** the
-  guard (crash-recovery/lifecycle duties, not user kills) via an explicit policy arg.
+  behaviour. **Only `timeout` and user `Kill` call `killWithIntent`**; `timeout` passes
+  `Enforce:false`. `Reconcile` and `failBeforeLaunch` complete kills via `killScope` **directly**
+  (they already hold the per-run lock) and never call `killWithIntent`, so they bypass the guard by
+  construction — the policy is **not** threaded into them (that would risk recursive lock
+  acquisition — Sol r2).
 - **I6 — terminal foreign runs return idempotently.** An already-terminal run is returned as-is
   **before** ownership enforcement (nothing destructive to authorise; a steal is meaningless).
 - **I7 — honest refusal surfacing.** `E_RUN_FOREIGN_OWNER` is a **refusal, exit 1** (like a lease/
@@ -72,19 +82,24 @@ field-loss trap is worse here because replay replaces whole records.
 
 `killWithIntent(ctx, id, actor string, policy killPolicy)` where
 `killPolicy{ Enforce bool; Steal bool; CallerOwner string }`.
-- Callers: timeout (`runner_linux.go:390`) and `Reconcile` → `policy{Enforce:false}` (bypass —
-  I5). `Kill` (`:1352`) → `policy{Enforce: !steal, Steal: steal, CallerOwner: r.owner}`.
-- Inside `killWithIntent`, holding the per-run lock, after `current := replay(id)`:
-  1. if `current.Status.Terminal()` → return it idempotently (I6), before enforcement.
-  2. if `policy.Enforce && current.Owner != "" && policy.CallerOwner != "" && current.Owner !=
+- **Only two callers:** timeout (`runner_linux.go:390`) → `policy{Enforce:false}`; user `Kill`
+  (`:1352`) → `policy{Enforce: !steal, Steal: steal, CallerOwner: r.owner}`. `Reconcile`/
+  `failBeforeLaunch` do **not** call `killWithIntent` (they `killScope` directly under the lock they
+  already hold — do not change them, do not risk recursive locking).
+- Inside `killWithIntent`, holding the per-run lock, after the run lookup:
+  1. `current, ok := r.ledger.current(id)` (or the existing replay) — **if the id is unknown
+     (`!ok`)** return a not-found error **before** any terminal/enforcement logic (the current code
+     otherwise proceeds from a zero record and can append a malformed intent — Sol r2 P2).
+  2. if `current.Status.Terminal()` → return it idempotently (I6), before enforcement.
+  3. if `policy.Enforce && current.Owner != "" && policy.CallerOwner != "" && current.Owner !=
      policy.CallerOwner` → return `(&current, &ForeignOwnerError{RunID:id, Owner:current.Owner,
      CallerOwner:policy.CallerOwner})` with **no** intent append and **no** scope call (I2).
-  3. else proceed with the existing durable kill path; if `policy.Steal`, set
-     `current.KillIntent.Steal = true`, `current.KillIntent.CallerOwner = policy.CallerOwner`
-     **before** the scope action (persisted in the intent → survives recovery — I3). Keep
-     `ScopeKill.Actor` for the physical executor.
-- `KillIntent` gains `Steal bool json:"steal,omitempty"` + `CallerOwner string
-  json:"caller_owner,omitempty"`.
+  4. else proceed with the existing durable kill path; if `policy.Steal`, set the **top-level
+     monotonic** `current.StolenBy = policy.CallerOwner` **before** the scope action, so it is
+     recorded on the intent/terminal events and carried by `mergeEvidence` (survives a
+     timeout/reconcile that rebuilds `KillIntent`). Keep `ScopeKill.Actor` for the executor. This
+     works even if a `KillIntent` is already present (the `if !KillIntent.Present` append-skip would
+     otherwise drop a nested steal field — the top-level `StolenBy` sidesteps that entirely).
 
 ### 3.3 Faces + structured refusal
 
@@ -112,8 +127,11 @@ counting `Open/Terminate/Kill/Remove`):
 - **T2 (I2, decisive)** — B kills A's `RUN-1` (no steal): `E_RUN_FOREIGN_OWNER`; assert **exact**
   record + ledger-event-count equality (snapshot before/after) and **zero** backend Open/Terminate/
   Kill/Remove. *Fails any unguarded Kill.*
-- **T3 (I3)** — B `Kill(steal=true)` → A's run killed (`E_RUN_KILLED`); `KillIntent.Steal==true`,
-  `CallerOwner=="B"`, and it survives a simulated reconcile replay.
+- **T3 (I3, monotonic steal)** — B `Kill(steal=true)` → A's run killed (`E_RUN_KILLED`);
+  `StolenBy=="B"`; and specifically: a **timeout intent already present → a foreign `--steal`
+  augmentation → a terminal merge / reconcile replay retains `StolenBy`** (a nested `KillIntent.Steal`
+  would be erased by the timeout intent rebuild / `mergeEvidence` nested-replace). Also a steal on a
+  run whose `KillIntent.Present` is already true still records `StolenBy`.
 - **T4 (I4)** — `Owner==""` legacy record → allowed; `r.owner==""` runner → allowed (documented
   test-only). Plus an **app-level test**: `app.Open` yields a runner whose `Owner` is a nonempty
   hash (a wiring regression fails here).
@@ -129,12 +147,14 @@ run-kill --steal RUN-1` → killed; A killing its own run works.
 
 ## 5. Files
 
-- `internal/runner/types.go` — `RunRecord.Owner`; `Config.Owner`; `KillIntent.{Steal,CallerOwner}`;
+- `internal/runner/types.go` — `RunRecord.Owner`; `RunRecord.StolenBy`; `Config.Owner`;
   `ForeignOwnerError` type; `killPolicy`.
-- `internal/runner/runner_linux.go` — `r.owner`; stamp in `Launch` (+ every full-record append) +
-  `mergeEvidence` carry; `killWithIntent` policy arg + the atomic guard (terminal-idempotent →
-  enforce → steal-persist); `Kill(ctx,id,steal)`; timeout/reconcile callers pass `Enforce:false`.
-- `internal/runner/ledger.go` — persist `Owner` + the `KillIntent` steal fields.
+- `internal/runner/runner_linux.go` — `r.owner`; stamp `Owner` in `Launch` (+ every full-record
+  append) + carry `Owner` **and** `StolenBy` in `mergeEvidence`; `killWithIntent` policy arg + the
+  atomic guard (unknown-id → not-found → terminal-idempotent → enforce → steal-`StolenBy`); the
+  timeout caller passes `Enforce:false`; `Kill(ctx,id,steal)`. `Reconcile`/`failBeforeLaunch`
+  unchanged (never call `killWithIntent`).
+- `internal/runner/ledger.go` — persist `Owner` + `StolenBy`.
 - `internal/app/project.go` — `runner.New(Config{… Owner: project.WorktreeID})`.
 - `internal/core/core.go` — `run-kill` `steal` arg; `errors.As(*ForeignOwnerError)` → `handlerData`.
 - `internal/store/check.go` — register `E_RUN_FOREIGN_OWNER` (exit 1).
@@ -157,7 +177,22 @@ run-kill --steal RUN-1` → killed; A killing its own run works.
 Unforgeable owner tokens; whale-run/systemd-scope guarding (route via `aira run`); a richer
 `--steal` audit trail (journal event) beyond the `KillIntent` record.
 
-## 8. Sol plan-review r1 resolutions
+## 8. Sol plan-review resolutions
+
+### r2
+- **P1 reconcile not a killWithIntent caller** → §3.2/I5: only timeout + user Kill call
+  `killWithIntent`; `Reconcile`/`failBeforeLaunch` use `killScope` directly and are left unchanged
+  (no policy threading → no recursive-lock risk).
+- **P1 steal field-loss** → I3/§3.2 step 4: a **top-level monotonic `RunRecord.StolenBy`** carried by
+  `mergeEvidence` (survives timeout intent-rebuild + nested-replace + the `!KillIntent.Present`
+  append-skip); dropped the nested `KillIntent.Steal/CallerOwner`. T3 tests the timeout→steal→
+  reconcile-retains path.
+- **P2 unknown id** → §3.2 step 1: `!ok` on the run lookup → not-found before any terminal/enforce
+  (no malformed intent from a zero record).
+- **P2 lock-file side effect** → I2: non-destructive = no kill/ledger mutation; the per-run lock file
+  is a benign fs side effect.
+
+### r1 resolutions
 
 - **P1 atomicity** → §3.2: guard moved inside `killWithIntent` under the per-run lock, after replay,
   before intent/scope; `killPolicy` arg so timeout/reconcile bypass (I2 atomic, I5).
