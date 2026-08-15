@@ -62,12 +62,13 @@ func (c *GitConfig) UnmarshalJSON(data []byte) error {
 }
 
 type RunConfig struct {
-	Prefix           []string `json:"prefix,omitempty"`
-	CgroupParent     string   `json:"cgroup_parent,omitempty"`
-	Slice            string   `json:"slice,omitempty"`
-	MemoryHeadroom   string   `json:"memory_headroom,omitempty"`
-	AdmissionMaxWait string   `json:"admission_max_wait,omitempty"`
-	ReportMaxBytes   int64    `json:"report_max_bytes,omitempty"`
+	Prefix             []string `json:"prefix,omitempty"`
+	CgroupParent       string   `json:"cgroup_parent,omitempty"`
+	Slice              string   `json:"slice,omitempty"`
+	MemoryHeadroom     string   `json:"memory_headroom,omitempty"`
+	AdmissionMaxWait   string   `json:"admission_max_wait,omitempty"`
+	DetachReadyTimeout string   `json:"detach_ready_timeout,omitempty"`
+	ReportMaxBytes     int64    `json:"report_max_bytes,omitempty"`
 }
 
 type ProjectConfig struct {
@@ -195,17 +196,23 @@ func OpenWithDiagnostics(ctx context.Context, cwd string, diagnostics io.Writer)
 		_ = s.Close()
 		return nil, Project{}, err
 	}
+	detachReadyTimeout, err := parsedDetachReadyTimeout(project.Config.Run)
+	if err != nil {
+		_ = s.Close()
+		return nil, Project{}, err
+	}
 	execution, err := runner.New(runner.Config{
-		CommonDir:        project.CommonDir,
-		OutputDir:        filepath.Join(project.CommonDir, "aira", "runs", "output"),
-		Owner:            project.WorktreeID,
-		CgroupParent:     project.Config.Run.CgroupParent,
-		Prefix:           project.Config.Run.Prefix,
-		MemorySlice:      project.Config.Run.Slice,
-		MemoryReserve:    memoryReserve,
-		AdmissionMaxWait: admissionMaxWait,
-		Diagnostics:      diagnostics,
-		ReportMaxBytes:   project.Config.Run.ReportMaxBytes,
+		CommonDir:          project.CommonDir,
+		OutputDir:          filepath.Join(project.CommonDir, "aira", "runs", "output"),
+		Owner:              project.WorktreeID,
+		CgroupParent:       project.Config.Run.CgroupParent,
+		Prefix:             project.Config.Run.Prefix,
+		MemorySlice:        project.Config.Run.Slice,
+		MemoryReserve:      memoryReserve,
+		AdmissionMaxWait:   admissionMaxWait,
+		DetachReadyTimeout: detachReadyTimeout,
+		Diagnostics:        diagnostics,
+		ReportMaxBytes:     project.Config.Run.ReportMaxBytes,
 	})
 	if err != nil {
 		_ = s.Close()
@@ -380,6 +387,9 @@ func validateConfig(config Config) error {
 	if config.Run.ReportMaxBytes < 0 {
 		return errors.New("E_CONFIG_INVALID: run.report_max_bytes must be non-negative")
 	}
+	if _, err := parsedDetachReadyTimeout(config.Run); err != nil {
+		return err
+	}
 	seen := map[string]bool{}
 	for _, prefix := range config.Project.Prefixes {
 		if len(prefix) < 2 || prefix != strings.ToUpper(prefix) {
@@ -469,6 +479,18 @@ func parsedRunAdmission(config RunConfig) (int64, time.Duration, error) {
 		}
 	}
 	return reserve, maxWait, nil
+}
+
+func parsedDetachReadyTimeout(config RunConfig) (time.Duration, error) {
+	value := strings.TrimSpace(config.DetachReadyTimeout)
+	if value == "" {
+		return 0, nil
+	}
+	timeout, err := time.ParseDuration(value)
+	if err != nil || timeout <= 0 {
+		return 0, errors.New("E_CONFIG_INVALID: run.detach_ready_timeout must be a positive duration")
+	}
+	return timeout, nil
 }
 
 func parseByteCount(value string) (int64, error) {

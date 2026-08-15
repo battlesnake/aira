@@ -16,12 +16,13 @@ const (
 	StatusRunning   Status = "running"
 	StatusExited    Status = "exited"
 	StatusKilled    Status = "killed"
+	StatusCancelled Status = "cancelled"
 	StatusLost      Status = "lost"
 	StatusOOMKilled Status = "oom-killed"
 )
 
 func (s Status) Terminal() bool {
-	return s == StatusExited || s == StatusKilled || s == StatusLost || s == StatusOOMKilled
+	return s == StatusExited || s == StatusKilled || s == StatusCancelled || s == StatusLost || s == StatusOOMKilled
 }
 
 type ScopeIntegrity string
@@ -72,6 +73,7 @@ type KillIntent struct {
 type PIDIdentity struct {
 	PID       int    `json:"pid,omitempty"`
 	StartTick uint64 `json:"start_tick,omitempty"`
+	BootID    string `json:"boot_id,omitempty"`
 }
 
 // RunRecord is the durable protocol object. It intentionally contains no
@@ -112,6 +114,11 @@ type RunRecord struct {
 	CPUUser             *int64               `json:"cpu_user,omitempty"`
 	CPUSys              *int64               `json:"cpu_sys,omitempty"`
 	PIDIdentity         PIDIdentity          `json:"pid_identity,omitempty"`
+	Detached            bool                 `json:"detached,omitempty"`
+	SupervisorPID       PIDIdentity          `json:"supervisor_pid,omitempty"`
+	LeaderExitObserved  bool                 `json:"leader_exit_observed,omitempty"`
+	QuiesceForced       bool                 `json:"quiesce_forced,omitempty"`
+	QuiesceKillProven   bool                 `json:"quiesce_kill_proven,omitempty"`
 	TerminalComplete    bool                 `json:"terminal_complete"`
 }
 
@@ -126,7 +133,7 @@ type EnvEntry struct {
 }
 
 type Request struct {
-	Argv        []string
+	Argv        []string `json:"argv"`
 	Ticket      string
 	Phase       string
 	Label       string
@@ -139,14 +146,34 @@ type Request struct {
 	Merge       bool
 	Realtime    bool
 	PTY         bool
-	StdinPath   string // empty means null stdin; "-" means the caller's stdin
-	Stdin       io.Reader
+	StdinPath   string    // empty means null stdin; "-" means the caller's stdin
+	Stdin       io.Reader `json:"-"`
 	StoreStdin  bool
 	Grace       time.Duration
 	TermGrace   time.Duration
-	LiveStdout  io.Writer // optional best-effort foreground tee sink
-	LiveStderr  io.Writer // optional best-effort foreground tee sink
+	LiveStdout  io.Writer `json:"-"` // optional best-effort foreground tee sink
+	LiveStderr  io.Writer `json:"-"` // optional best-effort foreground tee sink
 	NoAdmit     bool      // bypass the configured memory-admission gate
+	Detach      bool      `json:"detach,omitempty"`
+	detachReady *detachSignal
+	detachAck   io.ReadCloser
+	detachRunID string
+}
+
+type DetachLaunch struct {
+	Record   RunRecord
+	complete func(bool) error
+}
+
+func NewDetachLaunch(record RunRecord, complete func(bool) error) *DetachLaunch {
+	return &DetachLaunch{Record: record, complete: complete}
+}
+
+func (d *DetachLaunch) Complete(delivered bool) error {
+	if d == nil || d.complete == nil {
+		return nil
+	}
+	return d.complete(delivered)
 }
 
 // Clock is the admission loop's time seam. After must deliver after d in the
@@ -190,23 +217,24 @@ type OutputChunk struct {
 }
 
 type Config struct {
-	CommonDir        string
-	OutputDir        string
-	Owner            string
-	CgroupParent     string
-	Prefix           []string
-	Grace            time.Duration
-	TermGrace        time.Duration
-	Now              func() time.Time
-	Backend          ScopeBackend // nil selects the Linux cgroup-v2 backend
-	MemorySlice      string
-	MemoryReserve    int64
-	AdmissionMaxWait time.Duration
-	PollInterval     time.Duration
-	Clock            Clock
-	sliceMemoryFn    func(path string) (cur, max int64, ok bool, reason string)
-	Diagnostics      io.Writer
-	ReportMaxBytes   int64
+	CommonDir          string
+	OutputDir          string
+	Owner              string
+	CgroupParent       string
+	Prefix             []string
+	Grace              time.Duration
+	TermGrace          time.Duration
+	Now                func() time.Time
+	Backend            ScopeBackend // nil selects the Linux cgroup-v2 backend
+	MemorySlice        string
+	MemoryReserve      int64
+	AdmissionMaxWait   time.Duration
+	PollInterval       time.Duration
+	Clock              Clock
+	sliceMemoryFn      func(path string) (cur, max int64, ok bool, reason string)
+	Diagnostics        io.Writer
+	ReportMaxBytes     int64
+	DetachReadyTimeout time.Duration
 }
 
 const DefaultReportMaxBytes int64 = 32 << 20

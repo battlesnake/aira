@@ -85,6 +85,18 @@ func TestRunAdmissionConfigParsesBytesAndDuration(t *testing.T) {
 	}
 }
 
+func TestM20DetachReadyTimeoutConfig(t *testing.T) {
+	timeout, err := parsedDetachReadyTimeout(RunConfig{DetachReadyTimeout: "45s"})
+	if err != nil || timeout != 45*time.Second {
+		t.Fatalf("timeout=%s err=%v", timeout, err)
+	}
+	for _, value := range []string{"0s", "-1s", "later"} {
+		if _, err := parsedDetachReadyTimeout(RunConfig{DetachReadyTimeout: value}); err == nil {
+			t.Fatalf("invalid timeout %q accepted", value)
+		}
+	}
+}
+
 func TestRunAdmissionConfigRejectsMalformedAndHalfConfig(t *testing.T) {
 	for name, run := range map[string]RunConfig{
 		"slice only":          {Slice: "whale.slice"},
@@ -97,6 +109,7 @@ func TestRunAdmissionConfigRejectsMalformedAndHalfConfig(t *testing.T) {
 		"negative duration":   {Slice: "whale.slice", MemoryHeadroom: "4G", AdmissionMaxWait: "-1s"},
 		"bad duration":        {Slice: "whale.slice", MemoryHeadroom: "4G", AdmissionMaxWait: "soon"},
 		"negative report cap": {ReportMaxBytes: -1},
+		"bad detach timeout":  {DetachReadyTimeout: "later"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			base := Config{Schema: 1, Project: ProjectConfig{Slug: "demo", Prefixes: []string{"DEMO"}}, Lease: LeaseConfig{TTLSeconds: 900, HeartbeatSeconds: 30}, Run: run}

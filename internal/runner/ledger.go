@@ -24,14 +24,17 @@ import (
 const ledgerSchema = 1
 
 type ledgerEvent struct {
-	SchemaVersion int       `json:"schema_version"`
-	Sequence      uint64    `json:"sequence"`
-	Kind          string    `json:"kind"`
-	Run           RunRecord `json:"run"`
-	WaitExit      *int      `json:"wait_exit,omitempty"`
-	WaitSignal    string    `json:"wait_signal,omitempty"`
-	WaitObserved  bool      `json:"wait_observed,omitempty"`
-	KillCompleted bool      `json:"kill_completed,omitempty"`
+	SchemaVersion      int       `json:"schema_version"`
+	Sequence           uint64    `json:"sequence"`
+	Kind               string    `json:"kind"`
+	Run                RunRecord `json:"run"`
+	WaitExit           *int      `json:"wait_exit,omitempty"`
+	WaitSignal         string    `json:"wait_signal,omitempty"`
+	WaitObserved       bool      `json:"wait_observed,omitempty"`
+	KillCompleted      bool      `json:"kill_completed,omitempty"`
+	LeaderExitObserved bool      `json:"leader_exit_observed,omitempty"`
+	ExitCode           *int      `json:"exit_code,omitempty"`
+	Signal             string    `json:"signal,omitempty"`
 }
 
 type ledger struct {
@@ -70,11 +73,42 @@ func lockFile(path string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
+	unix.CloseOnExec(int(f.Fd()))
 	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
 		_ = f.Close()
 		return nil, err
 	}
 	return f, nil
+}
+
+func lockFileBounded(path string, timeout time.Duration) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	unix.CloseOnExec(int(f.Fd()))
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		err = unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			return f, nil
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) && !errors.Is(err, unix.EINTR) {
+			_ = f.Close()
+			return nil, err
+		}
+		if time.Now().After(deadline) {
+			_ = f.Close()
+			return nil, &LaunchError{Code: "U_RUN_LAUNCH_STALLED", Err: errors.New("timed out acquiring the per-run launch lock")}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func unlockFile(f *os.File) error {
@@ -302,6 +336,24 @@ func replay(events []ledgerEvent) (map[string]RunRecord, error) {
 		}
 		if prior, ok := runs[e.Run.ID]; ok && e.Run.Status == StatusStarting && prior.Status != StatusStarting {
 			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: lifecycle reordered")
+		}
+		if e.Kind == "leader-exited" {
+			prior := runs[e.Run.ID]
+			candidate := prior
+			candidate.LeaderExitObserved = e.LeaderExitObserved
+			candidate.ExitCode, candidate.Signal = e.ExitCode, e.Signal
+			if !prior.LeaderExitObserved && (!candidate.LeaderExitObserved || (candidate.ExitCode == nil && candidate.Signal == "")) {
+				return nil, fmt.Errorf("E_JOURNAL_CORRUPT: invalid leader-exited payload for %s", e.Run.ID)
+			}
+			runs[e.Run.ID] = mergeEvidence(prior, candidate)
+			continue
+		}
+		if e.Kind == "quiesce-forced" {
+			prior := runs[e.Run.ID]
+			candidate := e.Run
+			candidate.QuiesceForced = true
+			runs[e.Run.ID] = mergeEvidence(prior, candidate)
+			continue
 		}
 		runs[e.Run.ID] = e.Run
 	}

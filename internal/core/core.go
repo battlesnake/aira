@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"aira/internal/domain"
 	"aira/internal/gate"
@@ -25,12 +26,13 @@ type Request struct {
 }
 
 type Response struct {
-	OK       bool     `json:"ok"`
-	Code     string   `json:"code"`
-	Data     any      `json:"data,omitempty"`
-	Error    string   `json:"error,omitempty"`
-	Warnings []string `json:"warnings,omitempty"`
-	Exit     int      `json:"exit,omitempty"`
+	OK         bool             `json:"ok"`
+	Code       string           `json:"code"`
+	Data       any              `json:"data,omitempty"`
+	Error      string           `json:"error,omitempty"`
+	Warnings   []string         `json:"warnings,omitempty"`
+	Exit       int              `json:"exit,omitempty"`
+	AfterWrite func(bool) error `json:"-"`
 }
 
 type Initializer func(context.Context, map[string]any) (any, error)
@@ -269,6 +271,15 @@ type Runner interface {
 	Reconcile(context.Context) ([]runner.RunRecord, error)
 }
 
+type detachedRunner interface {
+	LaunchDetached(context.Context, runner.Request) (*runner.DetachLaunch, error)
+}
+
+type pendingDetachData struct {
+	record runner.RunRecord
+	launch *runner.DetachLaunch
+}
+
 // GitOps is the transport-neutral git network-operation seam.
 type GitOps interface {
 	Run(context.Context, gitremote.Request) (*gitremote.Result, error)
@@ -367,6 +378,14 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 	if wrapped, ok := data.(handlerData); ok {
 		data, warnings, verdict, handlerCode, handlerError = wrapped.Data, wrapped.Warnings, wrapped.Verdict, wrapped.Code, wrapped.Error
 	}
+	var afterWrite func(bool) error
+	if pending, ok := data.(pendingDetachData); ok {
+		data = runResponseData{RunRecord: pending.record, Wiring: runWiring{
+			Report: runReportWiring{Code: codeReportNotRequested}, Compute: runComputeWiring{Tokens: "unevaluated", Code: codeComputeNotRequested},
+			TestsGreenObserved: runObservation{Not: "detached-unevaluated"}, WiringComplete: false, Warnings: []runWiringWarning{},
+		}}
+		afterWrite = pending.launch.Complete
+	}
 	if handlerCode != "" {
 		if handlerError == "" {
 			handlerError = handlerCode
@@ -395,7 +414,7 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 	if verdict != "" {
 		return Response{OK: true, Code: strings.ToUpper(verdict), Data: data, Warnings: warnings, Exit: verdictExit(verdict)}
 	}
-	return Response{OK: true, Code: "OK", Data: data, Warnings: warnings}
+	return Response{OK: true, Code: "OK", Data: data, Warnings: warnings, AfterWrite: afterWrite}
 }
 
 func runRecord(data any) (runner.RunRecord, bool) {
@@ -433,6 +452,18 @@ func runRecordCode(record runner.RunRecord) string {
 		return "U_RUN_EXIT_UNKNOWN"
 	}
 	return ""
+}
+
+func parseRunTimeout(value string) (time.Duration, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, nil
+	}
+	timeout, err := time.ParseDuration(value)
+	if err != nil || timeout <= 0 {
+		return 0, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("timeout must be a positive duration"))
+	}
+	return timeout, nil
 }
 
 // copyExample deep-copies an example argv while preserving the nil-vs-empty
@@ -496,12 +527,19 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return mutationData(map[string]any{"id": ticket.ID, "path": ".aira/tickets/" + ticket.ID + ".md", "ticket": ticket}, event), nil
 		}},
-		"show": {Name: "show", Usage: "show <selector>", Args: []ArgSpec{stringSpec("selector", true, true, "Exact ticket selector"), listSpec("fields", false, false, "Optional projected fields")}, MCPTool: "aira_get", Run: func(_ context.Context, args *argAccessor) (any, error) {
-			record, err := c.store.Get(stringArg(args, "selector"))
+		"show": {Name: "show", Usage: "show <selector>", Args: []ArgSpec{stringSpec("selector", true, true, "Exact ticket or run selector"), listSpec("fields", false, false, "Optional projected ticket fields")}, MCPTool: "aira_get", Run: func(_ context.Context, args *argAccessor) (any, error) {
+			selector := stringArg(args, "selector")
+			fields := stringSlice(args, "fields")
+			if strings.HasPrefix(selector, "RUN-") && c.runner != nil {
+				if len(fields) != 0 {
+					return nil, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("run records do not support ticket field projection"))
+				}
+				return c.runner.Get(selector)
+			}
+			record, err := c.store.Get(selector)
 			if err != nil {
 				return nil, err
 			}
-			fields := stringSlice(args, "fields")
 			projected := projectRecord(record, fields)
 			if len(fields) == 0 {
 				projected["body"] = record.Body
@@ -1147,9 +1185,13 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			boolSpec("merge", false, false, "Capture stdout and stderr as one kernel stream"),
 			boolSpec("realtime", false, false, "Apply realtime stdio buffering when libstdbuf is available"),
 			boolSpec("pty", false, false, "Capture through a controlling PTY and merge stdout with stderr"),
+			boolSpec("detach", false, false, "Return a handle while a per-run supervisor owns the child"),
+			boolSpec("follow", false, false, "Keep the launching face attached to the run"),
 			stringSpec("stdin", false, false, "Launch-time stdin file or -"),
+			boolSpec("no_stdin", false, false, "Explicitly launch with null stdin"),
 			boolSpec("store_stdin", false, false, "Persist supplied launch stdin"),
 			boolSpec("no_admit", false, false, "Bypass configured memory admission"),
+			stringSpec("timeout", false, false, "Positive run timeout duration"),
 			stringSpec("ticket", false, false, "Ticket ID"),
 			stringSpec("phase", false, false, "Work phase"),
 			stringSpec("label", false, false, "Run label"),
@@ -1164,11 +1206,20 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("provider", false, false, "Usage provider"),
 			boolSpec("strict_wiring", false, false, "Fail a successful child when telemetry wiring is incomplete"),
 		}, MCPTool: "aira_run", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+			timeout, err := parseRunTimeout(stringArg(args, "timeout"))
+			if err != nil {
+				return nil, err
+			}
+			noStdin := boolArg(args, "no_stdin")
+			if noStdin && stringArg(args, "stdin") != "" {
+				return nil, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("no_stdin and stdin are mutually exclusive"))
+			}
 			request := runner.Request{
 				Argv: stringSlice(args, "argv"), Cwd: stringArg(args, "cwd"), Env: stringSlice(args, "env"),
 				Ticket: stringArg(args, "ticket"), Phase: stringArg(args, "phase"), Label: stringArg(args, "label"), Tool: stringArg(args, "tool"),
 				Prefix: stringSlice(args, "prefix"), Merge: boolArg(args, "merge"), Realtime: boolArg(args, "realtime"), PTY: boolArg(args, "pty"), StdinPath: stringArg(args, "stdin"),
-				StoreStdin: boolArg(args, "store_stdin"), NoAdmit: boolArg(args, "no_admit"),
+				StoreStdin: boolArg(args, "store_stdin"), NoAdmit: boolArg(args, "no_admit"), Timeout: timeout,
+				Detach: boolArg(args, "detach"),
 			}
 			// Record all transport-neutral wiring arguments even when the runner is
 			// unavailable; dispatch metadata and generated faces share this handler.
@@ -1177,6 +1228,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			_ = stringSlice(args, "config_env")
 			_ = boolArg(args, "strict_wiring")
+			follow := boolArg(args, "follow")
 			if request.PTY {
 				request.Merge = true
 			}
@@ -1190,6 +1242,29 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			if request.StdinPath == "-" {
 				request.Stdin = c.stdin
+			}
+			if request.Detach {
+				if follow || request.PTY || request.StdinPath == "-" {
+					return nil, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("detach is incompatible with follow, pty, and stdin '-'"))
+				}
+				wiringSet := stringArg(args, "report") != "" || stringArg(args, "report_stream") != "" || stringArg(args, "suite") != "" ||
+					stringArg(args, "shard") != "" || stringArg(args, "retry") != "" || stringArg(args, "usage") != "" || stringArg(args, "provider") != "" ||
+					stringArg(args, "tool") != "" || len(stringSlice(args, "config_env")) != 0 || boolArg(args, "strict_wiring")
+				if wiringSet {
+					return nil, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("detached telemetry wiring is deferred"))
+				}
+				if c.runner == nil {
+					return nil, runnerError("E_RUN_SCOPE_UNAVAILABLE", errors.New("runner is unavailable"))
+				}
+				detacher, ok := c.runner.(detachedRunner)
+				if !ok {
+					return nil, runnerError("E_RUN_SCOPE_UNAVAILABLE", errors.New("detached runner is unavailable"))
+				}
+				launch, err := detacher.LaunchDetached(ctx, request)
+				if err != nil {
+					return nil, err
+				}
+				return pendingDetachData{record: launch.Record, launch: launch}, nil
 			}
 			if c.runner == nil {
 				return nil, runnerError("E_RUN_SCOPE_UNAVAILABLE", errors.New("runner is unavailable"))
@@ -1299,6 +1374,14 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				}
 				for _, run := range runs {
 					if run.Status == runner.StatusStarting || run.Status == runner.StatusRunning {
+						if run.Detached {
+							for _, code := range run.ErrorCodes {
+								if code == "U_RUN_SUPERVISOR_STALLED" || code == "U_RUN_LAUNCH_STALLED" || code == "U_RUN_CAPTURE_INCOMPLETE" {
+									report.Warnings = append(report.Warnings, store.CheckFinding{Code: code, Subject: run.ID, Message: "detached run requires operator attention", Kind: "warning"})
+								}
+							}
+							continue
+						}
 						report.Warnings = append(report.Warnings, store.CheckFinding{Code: "U_RUN_RECONCILE_REQUIRED", Subject: run.ID, Message: "live run scope is orphaned and remains explicitly killable", Kind: "warning"})
 					}
 				}
@@ -1432,7 +1515,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 			{Name: "push", Summary: "Push explicit refs", Safety: SafetyExecute, Args: []OperationArg{{Name: "remote"}, {Name: "refspecs"}}, Example: []string{"push", "origin", "--", "HEAD:main"}},
 			{Name: "ls-remote", Summary: "List remote refs", Safety: SafetyExecute, Args: []OperationArg{{Name: "remote"}, {Name: "refspecs"}}, Example: []string{"ls-remote", "origin"}},
 		}},
-		"run":       {summary: "Launch a foreground subprocess in an owned scope", safety: SafetyExecute, example: []string{"--merge", "--", "printf", "hello"}},
+		"run":       {summary: "Launch a subprocess in an owned scope", safety: SafetyExecute, example: []string{"--merge", "--", "printf", "hello"}},
 		"run-kill":  {summary: "Kill an owned run scope", safety: SafetyExecute, example: []string{"RUN-1"}},
 		"run-log":   {summary: "Read captured run output", safety: SafetyRead, example: []string{"RUN-1", "--stream", "out"}},
 		"reconcile": {summary: "Reconcile derived project state", safety: SafetyReconcile, example: []string{"--rebuild"}},

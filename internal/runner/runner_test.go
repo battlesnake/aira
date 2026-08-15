@@ -327,11 +327,16 @@ func TestMembershipAndMigrationClassification(t *testing.T) {
 
 func TestProcessIdentityRejectsReusedPIDStartTick(t *testing.T) {
 	identity := PIDIdentity{PID: os.Getpid(), StartTick: processStartTick(os.Getpid())}
-	if identity.StartTick == 0 || !processIdentityMatches(identity) || !processLive(identity) {
+	bootID, err := currentBootID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity.BootID = bootID
+	if identity.StartTick == 0 || !processIdentityMatches(identity) || processLive(identity) != processAlive {
 		t.Fatalf("current process identity was not recognized: %+v", identity)
 	}
 	identity.StartTick++
-	if processIdentityMatches(identity) || processLive(identity) {
+	if processIdentityMatches(identity) || processLive(identity) == processAlive {
 		t.Fatalf("stale start tick was accepted: %+v", identity)
 	}
 }
@@ -1175,7 +1180,12 @@ exit 0`
 		t.Fatalf("migration fixture pid %d is not in sibling cgroup %q: %v", pid, target, siblingMembers)
 	}
 	identity := PIDIdentity{PID: pid, StartTick: processStartTick(pid)}
-	if identity.StartTick == 0 || !processLive(identity) {
+	bootID, bootErr := currentBootID()
+	if bootErr != nil {
+		t.Fatal(bootErr)
+	}
+	identity.BootID = bootID
+	if identity.StartTick == 0 || processLive(identity) != processAlive {
 		t.Fatalf("migration fixture descendant is not alive with matching identity: %+v", identity)
 	}
 	if record.Status != StatusExited || record.ExitCode == nil || *record.ExitCode != 0 {

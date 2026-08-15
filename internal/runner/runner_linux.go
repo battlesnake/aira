@@ -39,6 +39,8 @@ type Runner struct {
 	sliceMemory        func(path string) (cur, max int64, ok bool, reason string)
 	diagnostics        io.Writer
 	reportMaxBytes     int64
+	detachReadyTimeout time.Duration
+	runLockTimeout     time.Duration
 	reserveIDFn        func() (string, error)
 	openOutputsFn      func(string, string, bool) (map[string]string, map[string]*os.File, error)
 	setupStdinFn       func(*exec.Cmd, Request, string) (func(), bool, error)
@@ -52,6 +54,12 @@ type Runner struct {
 func New(cfg Config) (*Runner, error) {
 	if cfg.ReportMaxBytes == 0 {
 		cfg.ReportMaxBytes = DefaultReportMaxBytes
+	}
+	if cfg.DetachReadyTimeout == 0 {
+		cfg.DetachReadyTimeout = 60 * time.Second
+	}
+	if cfg.DetachReadyTimeout <= 0 {
+		return nil, &LaunchError{"E_CONFIG_INVALID", errors.New("detach ready timeout must be positive")}
 	}
 	if cfg.ReportMaxBytes < 0 {
 		return nil, &LaunchError{"E_CONFIG_INVALID", errors.New("report max bytes must be non-negative")}
@@ -103,7 +111,12 @@ func New(cfg Config) (*Runner, error) {
 	}
 	return &Runner{ledger: l, outputDir: output, owner: cfg.Owner, backend: backend, prefix: prefix, grace: grace, termGrace: termGrace, now: cfg.Now,
 		memorySlice: strings.TrimSpace(cfg.MemorySlice), memoryReserve: cfg.MemoryReserve, admissionMaxWait: cfg.AdmissionMaxWait,
-		pollInterval: cfg.PollInterval, clock: cfg.Clock, sliceMemory: cfg.sliceMemoryFn, diagnostics: cfg.Diagnostics, reportMaxBytes: cfg.ReportMaxBytes}, nil
+		pollInterval: cfg.PollInterval, clock: cfg.Clock, sliceMemory: cfg.sliceMemoryFn, diagnostics: cfg.Diagnostics, reportMaxBytes: cfg.ReportMaxBytes,
+		detachReadyTimeout: cfg.DetachReadyTimeout, runLockTimeout: defaultRunLockTimeout}, nil
+}
+
+func (r *Runner) boundedRunLock(path string) (*os.File, error) {
+	return lockFileBounded(path, r.runLockTimeout)
 }
 
 func (r *Runner) ReportMaxBytes() int64 { return r.reportMaxBytes }
@@ -138,6 +151,9 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	}
 	if req.PTY && req.Realtime {
 		return nil, launchErr("E_RUN_ARGUMENT_INVALID", errors.New("pty and realtime buffering are mutually exclusive"))
+	}
+	if req.Detach && (req.PTY || req.StdinPath == "-") {
+		return nil, launchErr("E_RUN_ARGUMENT_INVALID", errors.New("detach is incompatible with pty and stdin '-'"))
 	}
 	if req.PTY {
 		req.Merge = true
@@ -200,8 +216,18 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if err != nil {
 		return nil, err
 	}
+	bootID, err := readBootIDFn()
+	if err != nil || strings.TrimSpace(bootID) == "" {
+		if err == nil {
+			err = errors.New("kernel boot_id is empty")
+		}
+		return nil, launchErr("E_RUN_IDENTITY_UNAVAILABLE", err)
+	}
 	if err := r.backend.Probe(ctx); err != nil {
 		return nil, launchErr("E_RUN_SCOPE_UNAVAILABLE", err)
+	}
+	if req.Detach {
+		return r.launchDetachedValidated(ctx, req, prefix, cwd, env, envDigest, buffering, effectiveArgv, bootID)
 	}
 	admission, err := r.admit(ctx, req)
 	if err != nil {
@@ -243,7 +269,14 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		started := nowString(r.now)
 		// Containment is not an initial assumption. Until the leader is positively
 		// observed in cgroup.procs, the durable record must remain non-contained.
-		record = RunRecord{SchemaVersion: ledgerSchema, ID: id, Owner: r.owner, Ticket: req.Ticket, Phase: req.Phase, Label: req.Label, Tool: req.Tool, Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, Buffering: buffering, Merge: req.Merge, Admission: admission.state, AdmissionReason: admission.reason, AdmissionWaitedMS: admission.waitedMS, LaunchPrefix: append([]string(nil), prefix...), StartedAt: started, Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}}
+		record = RunRecord{SchemaVersion: ledgerSchema, ID: id, Owner: r.owner, Ticket: req.Ticket, Phase: req.Phase, Label: req.Label, Tool: req.Tool, Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, Buffering: buffering, Merge: req.Merge, Admission: admission.state, AdmissionReason: admission.reason, AdmissionWaitedMS: admission.waitedMS, LaunchPrefix: append([]string(nil), prefix...), StartedAt: started, Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}, Detached: req.Detach}
+		if req.Detach {
+			record.SupervisorPID = PIDIdentity{PID: os.Getpid(), StartTick: processStartTick(os.Getpid()), BootID: bootID}
+			if record.SupervisorPID.StartTick == 0 {
+				releaseAdmit()
+				return nil, launchErr("E_RUN_IDENTITY_UNAVAILABLE", errors.New("supervisor start tick is unavailable"))
+			}
+		}
 		// The intended scope reference is durable before scope creation. It is not
 		// used as kill authority until the actual scope-created record is present.
 		record.CgroupScope = r.intendedScope(id)
@@ -363,7 +396,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	for _, w := range writers {
 		_ = w.Close()
 	}
-	record.PIDIdentity = PIDIdentity{PID: cmd.Process.Pid, StartTick: processStartTick(cmd.Process.Pid)}
+	record.PIDIdentity = PIDIdentity{PID: cmd.Process.Pid, StartTick: processStartTick(cmd.Process.Pid), BootID: bootID}
 	identityValid := record.PIDIdentity.StartTick != 0
 	members, memberErr := scope.Members()
 	scopeVerified := identityValid && memberErr == nil && containsPID(members, cmd.Process.Pid)
@@ -378,7 +411,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	// by task #20 (cgroup namespace or supervisor mitigation). Such an
 	// unobservable descendant must never be used to claim additional positive
 	// containment, but is not retroactively reported as leader migration.
-	initialMigrated := identityValid && memberErr == nil && !scopeVerified && processLive(record.PIDIdentity)
+	initialMigrated := identityValid && memberErr == nil && !scopeVerified && processLive(record.PIDIdentity) == processAlive
 	if scopeVerified {
 		// This is the sole positive-containment assignment: the running event
 		// records that the leader was actually observed in cgroup.procs.
@@ -715,69 +748,6 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	return &committed, nil
 }
 
-func mergeEvidence(base, candidate RunRecord) RunRecord {
-	if base.ID == "" {
-		base = candidate
-	}
-	if candidate.CgroupScope != "" {
-		base.CgroupScope = candidate.CgroupScope
-	}
-	if candidate.Owner != "" {
-		base.Owner = candidate.Owner
-	}
-	if candidate.StolenBy != "" {
-		base.StolenBy = candidate.StolenBy
-	}
-	if candidate.Ticket != "" {
-		base.Ticket = candidate.Ticket
-	}
-	if candidate.Phase != "" {
-		base.Phase = candidate.Phase
-	}
-	if candidate.Label != "" {
-		base.Label = candidate.Label
-	}
-	if candidate.Tool != "" {
-		base.Tool = candidate.Tool
-	}
-	if candidate.PIDIdentity.PID != 0 {
-		base.PIDIdentity = candidate.PIDIdentity
-	}
-	if candidate.OutputRefs != nil {
-		base.OutputRefs = cloneOutputRefs(candidate.OutputRefs)
-	}
-	if candidate.Buffering != "" {
-		base.Buffering = candidate.Buffering
-	}
-	base.Merge = base.Merge || candidate.Merge
-	if candidate.Admission != "" {
-		base.Admission = candidate.Admission
-		base.AdmissionReason = candidate.AdmissionReason
-		base.AdmissionWaitedMS = candidate.AdmissionWaitedMS
-	}
-	base.CaptureComplete = candidate.CaptureComplete
-	base.CaptureForcedClosed = candidate.CaptureForcedClosed
-	base.StdinStored = base.StdinStored || candidate.StdinStored
-	if candidate.ScopeIntegrity != "" {
-		// Candidate integrity is classified from this launch's observation. It
-		// must be allowed to upgrade the pre-observation HandoffUnverified state
-		// during timeout/exit arbitration; otherwise a clean observed exit can
-		// finalize with a bare handoff value and no corresponding error.
-		base.ScopeIntegrity = candidate.ScopeIntegrity
-	}
-	if candidate.ScopeKill.Requested {
-		base.ScopeKill = candidate.ScopeKill
-	}
-	if candidate.KillIntent.Present {
-		base.KillIntent = candidate.KillIntent
-	}
-	mergeUsage(&base, candidate)
-	for _, code := range candidate.ErrorCodes {
-		base.ErrorCodes = appendUnique(base.ErrorCodes, code)
-	}
-	return base
-}
-
 func hasScopeReconcileError(codes []string) bool {
 	for _, code := range codes {
 		switch code {
@@ -792,30 +762,11 @@ func hasScopeReconcileError(codes []string) bool {
 // scope/reconcile error (E_RUN_SCOPE_INVALID | E_RUN_SCOPE_HANDOFF |
 // U_RUN_RECONCILE_REQUIRED). Only ScopeContained is gate-admissible.
 func ensureTerminalScopeEvidence(record RunRecord) RunRecord {
-	if record.Status.Terminal() && record.ScopeIntegrity == ScopeHandoffUnverified && !hasScopeReconcileError(record.ErrorCodes) {
+	noDetachedChild := record.Detached && record.PIDIdentity.PID == 0 && (record.Status == StatusCancelled || record.Status == StatusKilled)
+	if record.Status.Terminal() && !noDetachedChild && record.ScopeIntegrity == ScopeHandoffUnverified && !hasScopeReconcileError(record.ErrorCodes) {
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
 	}
 	return record
-}
-
-func cloneOutputRefs(refs map[string]OutputRef) map[string]OutputRef {
-	copy := make(map[string]OutputRef, len(refs))
-	for key, ref := range refs {
-		copy[key] = ref
-	}
-	return copy
-}
-
-func mergeUsage(base *RunRecord, candidate RunRecord) {
-	if candidate.PeakRSS != nil {
-		base.PeakRSS = candidate.PeakRSS
-	}
-	if candidate.CPUUser != nil {
-		base.CPUUser = candidate.CPUUser
-	}
-	if candidate.CPUSys != nil {
-		base.CPUSys = candidate.CPUSys
-	}
 }
 
 func snapshotUsage(record *RunRecord, scopePath string) cgroupUsage {
@@ -975,6 +926,35 @@ func openOutputs(dir, id string, merge bool) (map[string]string, map[string]*os.
 		paths[name], files[name] = path, f
 	}
 	return paths, files, nil
+}
+
+func closeOutputFiles(files map[string]*os.File) {
+	seen := make(map[*os.File]struct{}, len(files))
+	for _, file := range files {
+		if file == nil {
+			continue
+		}
+		if _, ok := seen[file]; ok {
+			continue
+		}
+		seen[file] = struct{}{}
+		_ = file.Close()
+	}
+}
+
+func detachedOutputFiles(files map[string]*os.File, merge bool) (*os.File, *os.File, error) {
+	if merge {
+		file := files["log"]
+		if file == nil {
+			return nil, nil, errors.New("merged output file is missing")
+		}
+		return file, file, nil
+	}
+	out, errFile := files["out"], files["err"]
+	if out == nil || errFile == nil {
+		return nil, nil, errors.New("separate output files are missing")
+	}
+	return out, errFile, nil
 }
 
 func setupPipes(cmd *exec.Cmd, merge bool) (map[string]*os.File, map[string]*os.File, error) {
@@ -1208,12 +1188,12 @@ func waitEvidence(state *os.ProcessState, waitErr error) (*int, string) {
 	if state == nil {
 		return nil, ""
 	}
+	if status, ok := state.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+		return nil, status.Signal().String()
+	}
 	if state.Exited() {
 		code := state.ExitCode()
 		return &code, ""
-	}
-	if status, ok := state.Sys().(syscall.WaitStatus); ok && status.Signaled() {
-		return nil, status.Signal().String()
 	}
 	if waitErr == nil {
 		code := state.ExitCode()
@@ -1237,8 +1217,40 @@ func classifyLaunchScopeIntegrity(scopeVerified, placementGuaranteed, identityVa
 	return ScopeHandoffUnverified, false, "E_RUN_SCOPE_INVALID"
 }
 
+var (
+	readBootIDFn   = currentBootID
+	readProcStatFn = func(pid int) ([]byte, error) { return os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)) }
+)
+
+func currentBootID() (string, error) {
+	data, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if err != nil {
+		return "", err
+	}
+	bootID := strings.TrimSpace(string(data))
+	if bootID == "" {
+		return "", errors.New("kernel boot_id is empty")
+	}
+	return bootID, nil
+}
+
+func currentPIDIdentity() (PIDIdentity, error) {
+	bootID, err := readBootIDFn()
+	if err != nil || strings.TrimSpace(bootID) == "" {
+		if err == nil {
+			err = errors.New("kernel boot_id is empty")
+		}
+		return PIDIdentity{}, launchErr("E_RUN_IDENTITY_UNAVAILABLE", err)
+	}
+	identity := PIDIdentity{PID: os.Getpid(), StartTick: processStartTick(os.Getpid()), BootID: bootID}
+	if identity.StartTick == 0 {
+		return PIDIdentity{}, launchErr("E_RUN_IDENTITY_UNAVAILABLE", errors.New("process start tick is unavailable"))
+	}
+	return identity, nil
+}
+
 func processStartTick(pid int) uint64 {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	data, err := readProcStatFn(pid)
 	if err != nil {
 		return 0
 	}
@@ -1268,14 +1280,14 @@ func monitorScopeMembership(scope Scope, identity PIDIdentity, stop <-chan struc
 				return
 			}
 			members, err := scope.Members()
-			if err == nil && !containsPID(members, identity.PID) && processLive(identity) {
+			if err == nil && !containsPID(members, identity.PID) && processLive(identity) == processAlive {
 				result <- true
 				return
 			}
 		case <-events:
 			if processIdentityMatches(identity) {
 				members, err := scope.Members()
-				if err == nil && !containsPID(members, identity.PID) && processLive(identity) {
+				if err == nil && !containsPID(members, identity.PID) && processLive(identity) == processAlive {
 					result <- true
 					return
 				}
@@ -1327,8 +1339,8 @@ func scopeMembershipEvents(scope Scope, stop <-chan struct{}) <-chan struct{} {
 	return result
 }
 
-// processLive reports whether pid is a live, schedulable task rather than a
-// zombie or dead one. A process is removed from cgroup.procs the moment it
+// processLive reports alive, dead, or unknown for the recorded boot-aware
+// identity. A process is removed from cgroup.procs the moment it
 // exits, but its /proc/<pid> entry lingers as a zombie until the parent reaps
 // it. Treating "present in /proc but absent from cgroup.procs" as a migration
 // therefore mis-flags a normal exit — especially for multi-process children
@@ -1336,26 +1348,50 @@ func scopeMembershipEvents(scope Scope, stop <-chan struct{}) <-chan struct{} {
 // keeps the task alive in another cgroup, so only a live state is a migration.
 // The recorded start tick is part of every observation so a reused PID cannot
 // be mistaken for the launch process.
-func processLive(identity PIDIdentity) bool {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", identity.PID))
+type processLiveness uint8
+
+const (
+	processUnknown processLiveness = iota
+	processAlive
+	processDead
+)
+
+func processLive(identity PIDIdentity) processLiveness {
+	bootID, err := readBootIDFn()
+	if err != nil || bootID == "" || identity.BootID == "" {
+		return processUnknown
+	}
+	if identity.PID <= 0 || identity.StartTick == 0 {
+		return processUnknown
+	}
+	if bootID != identity.BootID {
+		return processDead
+	}
+	data, err := readProcStatFn(identity.PID)
 	if err != nil {
-		return false
+		if errors.Is(err, os.ErrNotExist) {
+			return processDead
+		}
+		return processUnknown
 	}
 	startTick, ok := processStartTickFromStat(data)
-	if !ok || identity.PID <= 0 || identity.StartTick == 0 || startTick != identity.StartTick {
-		return false
+	if !ok {
+		return processUnknown
+	}
+	if startTick != identity.StartTick {
+		return processDead
 	}
 	// Format: "pid (comm) state ...". comm can contain spaces and parentheses,
 	// so scan to the last ')' and read the state field two bytes after it.
 	i := strings.LastIndexByte(string(data), ')')
 	if i < 0 || i+2 >= len(data) {
-		return false
+		return processUnknown
 	}
 	switch data[i+2] {
 	case 'Z', 'X', 'x':
-		return false
+		return processDead
 	default:
-		return true
+		return processAlive
 	}
 }
 
@@ -1363,7 +1399,10 @@ func processIdentityMatches(identity PIDIdentity) bool {
 	if identity.PID <= 0 || identity.StartTick == 0 {
 		return false
 	}
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", identity.PID))
+	if processLive(identity) != processAlive {
+		return false
+	}
+	data, err := readProcStatFn(identity.PID)
 	if err != nil {
 		return false
 	}
@@ -1392,14 +1431,6 @@ func containsPID(pids []int, pid int) bool {
 		}
 	}
 	return false
-}
-func appendUnique(values []string, value string) []string {
-	for _, existing := range values {
-		if existing == value {
-			return values
-		}
-	}
-	return append(values, value)
 }
 func containsPrefix(values []string, prefix string) bool {
 	for _, value := range values {
@@ -1461,7 +1492,7 @@ type killAttempt struct {
 // before touching the scope, and leaves terminal publication to the caller so
 // Launch can merge monitor and capture evidence before its terminal CAS.
 func (r *Runner) killWithIntent(ctx context.Context, id, actor string, policy killPolicy) (killAttempt, error) {
-	lock, err := lockFile(filepath.Join(filepath.Dir(r.ledger.ledger), id+".lock"))
+	lock, err := r.boundedRunLock(filepath.Join(filepath.Dir(r.ledger.ledger), id+".lock"))
 	if err != nil {
 		return killAttempt{}, err
 	}
@@ -1516,6 +1547,9 @@ func (r *Runner) killWithIntent(ctx context.Context, id, actor string, policy ki
 	attempt := killAttempt{Current: current, IntentPublished: current.KillIntent.Present, IntentSequence: current.KillIntent.Sequence}
 	scope, err := r.backend.Open(ctx, current.CgroupScope)
 	if err != nil {
+		if current.Detached && current.Status == StatusStarting {
+			return attempt, nil
+		}
 		return attempt, launchErr("E_RUN_SCOPE_INVALID", err)
 	}
 	kill, killErr := r.killScope(ctx, scope, id, actor)
@@ -1528,7 +1562,7 @@ func (r *Runner) killWithIntent(ctx context.Context, id, actor string, policy ki
 		return attempt, launchErr("U_RUN_RECONCILE_REQUIRED", killErr)
 	}
 	attempt.Kill = kill
-	if kill.Completed {
+	if kill.Completed && !current.Detached {
 		_ = scope.Remove()
 	}
 	return attempt, nil
@@ -1548,7 +1582,10 @@ func (r *Runner) Kill(ctx context.Context, id string, steal bool) (*RunRecord, e
 	if !attempt.IntentPublished || current.Status.Terminal() {
 		return &current, nil
 	}
-	lock, err := lockFile(filepath.Join(filepath.Dir(r.ledger.ledger), id+".lock"))
+	if current.Detached {
+		return r.finishDetachedKill(ctx, id, attempt)
+	}
+	lock, err := r.boundedRunLock(filepath.Join(filepath.Dir(r.ledger.ledger), id+".lock"))
 	if err != nil {
 		return nil, err
 	}
@@ -1577,10 +1614,74 @@ func (r *Runner) Kill(ctx context.Context, id string, steal bool) (*RunRecord, e
 	return &committed, nil
 }
 
+func (r *Runner) finishDetachedKill(ctx context.Context, id string, attempt killAttempt) (*RunRecord, error) {
+	lock, err := r.boundedRunLock(filepath.Join(filepath.Dir(r.ledger.ledger), id+".lock"))
+	if err != nil {
+		return nil, err
+	}
+	current, err := r.ledger.current(id)
+	if err != nil {
+		_ = unlockFile(lock)
+		return nil, err
+	}
+	if current.Status.Terminal() {
+		_ = unlockFile(lock)
+		return &current, nil
+	}
+	if attempt.Kill.Completed {
+		current.ScopeKill.Started, current.ScopeKill.Completed, current.ScopeKill.Actor, current.ScopeKill.At, current.ScopeKill.GraceMS = true, true, "run-kill", nowString(r.now), r.termGrace.Milliseconds()
+		current.KillIntent.Completed, current.KillIntent.Empty = true, true
+		current.ErrorCodes = appendUnique(current.ErrorCodes, "E_RUN_KILLED")
+		if _, err := r.append(ledgerEvent{Kind: "kill-completed", Run: current}); err != nil {
+			_ = unlockFile(lock)
+			return nil, launchErr("U_RUN_RECONCILE_REQUIRED", err)
+		}
+	}
+	_ = unlockFile(lock)
+	waitBound := r.grace + r.termGrace
+	if admissionBound := 2*r.pollInterval + time.Second; admissionBound > waitBound {
+		waitBound = admissionBound
+	}
+	deadline := time.NewTimer(waitBound)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		latest, getErr := r.ledger.current(id)
+		if getErr != nil {
+			return nil, getErr
+		}
+		if latest.Status.Terminal() {
+			return &latest, nil
+		}
+		select {
+		case <-ctx.Done():
+			latest.ErrorCodes = appendUnique(latest.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
+			return &latest, launchErr("U_RUN_RECONCILE_REQUIRED", ctx.Err())
+		case <-deadline.C:
+			latest.ErrorCodes = appendUnique(latest.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
+			return &latest, launchErr("U_RUN_RECONCILE_REQUIRED", errors.New("supervisor has not finalized the completed kill"))
+		case <-ticker.C:
+		}
+	}
+}
+
 func (r *Runner) Get(id string) (*RunRecord, error) {
 	record, err := r.ledger.current(id)
 	if err != nil {
 		return nil, err
+	}
+	if record.Detached && !record.Status.Terminal() && !record.LeaderExitObserved {
+		switch processLive(record.SupervisorPID) {
+		case processAlive:
+			if scope, openErr := r.backend.Open(context.Background(), record.CgroupScope); openErr == nil {
+				if empty, emptyErr := scope.Empty(); emptyErr == nil && empty {
+					record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_SUPERVISOR_STALLED")
+				}
+			}
+		case processUnknown:
+			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
+		}
 	}
 	return &record, nil
 }
@@ -1708,9 +1809,12 @@ func (r *Runner) Reconcile(ctx context.Context) ([]RunRecord, error) {
 	}
 	result := make([]RunRecord, 0, len(runs))
 	for id := range runs {
-		lock, lockErr := lockFile(filepath.Join(filepath.Dir(r.ledger.ledger), id+".lock"))
+		lock, lockErr := r.boundedRunLock(filepath.Join(filepath.Dir(r.ledger.ledger), id+".lock"))
 		if lockErr != nil {
-			return nil, lockErr
+			record := runs[id]
+			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_LAUNCH_STALLED")
+			result = append(result, record)
+			continue
 		}
 		freshEvents, readErr := r.ledger.read()
 		if readErr != nil {
@@ -1729,6 +1833,16 @@ func (r *Runner) Reconcile(ctx context.Context) ([]RunRecord, error) {
 		}
 		if record.Status.Terminal() {
 			result = append(result, record)
+			_ = unlockFile(lock)
+			continue
+		}
+		if record.Detached {
+			detached, reconcileErr := r.reconcileDetachedLocked(ctx, record)
+			if reconcileErr != nil {
+				_ = unlockFile(lock)
+				return nil, reconcileErr
+			}
+			result = append(result, detached)
 			_ = unlockFile(lock)
 			continue
 		}
@@ -1797,4 +1911,60 @@ func (r *Runner) Reconcile(ctx context.Context) ([]RunRecord, error) {
 		return nil, err
 	}
 	return result, nil
+}
+
+func (r *Runner) reconcileDetachedLocked(ctx context.Context, record RunRecord) (RunRecord, error) {
+	scope, openErr := r.backend.Open(ctx, record.CgroupScope)
+	empty := true
+	if openErr == nil {
+		var emptyErr error
+		empty, emptyErr = scope.Empty()
+		if emptyErr != nil {
+			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
+			return record, nil
+		}
+	}
+	if record.LeaderExitObserved {
+		if !empty {
+			return record, nil
+		}
+		finalized, err := r.finalizeDetachedTerminalLocked(ctx, record.ID, scope)
+		if err != nil {
+			var launch *LaunchError
+			if errors.As(err, &launch) && launch.Code == "U_RUN_CAPTURE_INCOMPLETE" {
+				record.ErrorCodes = appendUnique(record.ErrorCodes, launch.Code)
+				return record, nil
+			}
+			return RunRecord{}, err
+		}
+		return *finalized, nil
+	}
+	switch processLive(record.SupervisorPID) {
+	case processAlive:
+		if empty {
+			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_SUPERVISOR_STALLED")
+		}
+		return record, nil
+	case processUnknown:
+		record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
+		return record, nil
+	case processDead:
+		if !empty {
+			return record, nil
+		}
+		record.Status, record.EndedAt = StatusLost, nowString(r.now)
+		record.ExitCode, record.Signal = nil, ""
+		record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_EXIT_UNKNOWN")
+		record.TerminalComplete = true
+		committed, err := r.appendTerminalLocked(record.ID, record)
+		if err != nil {
+			return RunRecord{}, err
+		}
+		if scope != nil {
+			_ = scope.Remove()
+		}
+		return committed, nil
+	default:
+		return record, nil
+	}
 }

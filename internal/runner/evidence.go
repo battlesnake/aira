@@ -1,0 +1,113 @@
+package runner
+
+func mergeEvidence(base, candidate RunRecord) RunRecord {
+	if base.ID == "" {
+		base = candidate
+	}
+	if candidate.CgroupScope != "" {
+		base.CgroupScope = candidate.CgroupScope
+	}
+	if candidate.Owner != "" {
+		base.Owner = candidate.Owner
+	}
+	if candidate.StolenBy != "" {
+		base.StolenBy = candidate.StolenBy
+	}
+	if candidate.Ticket != "" {
+		base.Ticket = candidate.Ticket
+	}
+	if candidate.Phase != "" {
+		base.Phase = candidate.Phase
+	}
+	if candidate.Label != "" {
+		base.Label = candidate.Label
+	}
+	if candidate.Tool != "" {
+		base.Tool = candidate.Tool
+	}
+	if candidate.PIDIdentity.PID != 0 {
+		base.PIDIdentity = candidate.PIDIdentity
+	}
+	base.Detached = base.Detached || candidate.Detached
+	if base.SupervisorPID.PID == 0 && candidate.SupervisorPID.PID != 0 {
+		base.SupervisorPID = candidate.SupervisorPID
+	}
+	if candidate.LeaderExitObserved {
+		if !base.LeaderExitObserved {
+			base.LeaderExitObserved = true
+			base.ExitCode, base.Signal = candidate.ExitCode, candidate.Signal
+		} else if exitEvidenceConflicts(base.ExitCode, base.Signal, candidate.ExitCode, candidate.Signal) {
+			base.ErrorCodes = appendUnique(base.ErrorCodes, "U_RUN_EXIT_CONFLICT")
+		}
+	}
+	base.QuiesceForced = base.QuiesceForced || candidate.QuiesceForced
+	base.QuiesceKillProven = base.QuiesceKillProven || candidate.QuiesceKillProven
+	if candidate.OutputRefs != nil {
+		base.OutputRefs = cloneOutputRefs(candidate.OutputRefs)
+	}
+	if candidate.Buffering != "" {
+		base.Buffering = candidate.Buffering
+	}
+	base.Merge = base.Merge || candidate.Merge
+	if candidate.Admission != "" {
+		base.Admission = candidate.Admission
+		base.AdmissionReason = candidate.AdmissionReason
+		base.AdmissionWaitedMS = candidate.AdmissionWaitedMS
+	}
+	base.CaptureComplete = candidate.CaptureComplete
+	base.CaptureForcedClosed = candidate.CaptureForcedClosed
+	base.StdinStored = base.StdinStored || candidate.StdinStored
+	if candidate.ScopeIntegrity != "" {
+		base.ScopeIntegrity = candidate.ScopeIntegrity
+	}
+	if candidate.ScopeKill.Requested {
+		base.ScopeKill = candidate.ScopeKill
+	}
+	if candidate.KillIntent.Present {
+		base.KillIntent = candidate.KillIntent
+	}
+	mergeUsage(&base, candidate)
+	for _, code := range candidate.ErrorCodes {
+		base.ErrorCodes = appendUnique(base.ErrorCodes, code)
+	}
+	return base
+}
+
+func exitEvidenceConflicts(baseExit *int, baseSignal string, candidateExit *int, candidateSignal string) bool {
+	if candidateExit == nil && candidateSignal == "" {
+		return false
+	}
+	if (baseExit == nil) != (candidateExit == nil) || baseSignal != candidateSignal {
+		return true
+	}
+	return baseExit != nil && *baseExit != *candidateExit
+}
+
+func cloneOutputRefs(refs map[string]OutputRef) map[string]OutputRef {
+	copy := make(map[string]OutputRef, len(refs))
+	for key, ref := range refs {
+		copy[key] = ref
+	}
+	return copy
+}
+
+func mergeUsage(base *RunRecord, candidate RunRecord) {
+	if candidate.PeakRSS != nil {
+		base.PeakRSS = candidate.PeakRSS
+	}
+	if candidate.CPUUser != nil {
+		base.CPUUser = candidate.CPUUser
+	}
+	if candidate.CPUSys != nil {
+		base.CPUSys = candidate.CPUSys
+	}
+}
+
+func appendUnique(values []string, value string) []string {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}

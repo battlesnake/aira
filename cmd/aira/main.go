@@ -25,6 +25,9 @@ func Run(argv []string, stdout, stderr io.Writer) int {
 }
 
 func runWithInput(argv []string, stdout, stderr io.Writer, stdin io.Reader) int {
+	if len(argv) > 0 && argv[0] == "__supervise" {
+		return runSupervisor(argv[1:], stderr)
+	}
 	if len(argv) > 0 && strings.ToLower(argv[0]) == "mcp" {
 		return runMCP(context.Background(), os.Stdin, stdout, stderr)
 	}
@@ -133,6 +136,73 @@ func runWithInput(argv []string, stdout, stderr io.Writer, stdin io.Reader) int 
 		_, _ = io.WriteString(stdout, "\n")
 	}
 	return render(response, jsonOutput, stdout, stderr)
+}
+
+func runSupervisor(argv []string, diagnostics io.Writer) int {
+	readyForFailure := supervisorReadyFD(argv)
+	values := map[string]string{}
+	for i := 0; i < len(argv); i += 2 {
+		if i+1 >= len(argv) || !strings.HasPrefix(argv[i], "--") {
+			writeSupervisorFailure(readyForFailure, "E_RUN_ARGUMENT_INVALID", "malformed supervisor arguments")
+			return store.ExitForCode("E_RUN_ARGUMENT_INVALID")
+		}
+		name := strings.TrimPrefix(argv[i], "--")
+		if name != "control" && name != "ready-fd" && name != "ack-fd" {
+			writeSupervisorFailure(readyForFailure, "E_RUN_ARGUMENT_INVALID", "malformed supervisor arguments")
+			return store.ExitForCode("E_RUN_ARGUMENT_INVALID")
+		}
+		if _, exists := values[name]; exists {
+			writeSupervisorFailure(readyForFailure, "E_RUN_ARGUMENT_INVALID", "duplicate supervisor argument")
+			return store.ExitForCode("E_RUN_ARGUMENT_INVALID")
+		}
+		values[name] = argv[i+1]
+	}
+	readyFD, readyErr := strconv.Atoi(values["ready-fd"])
+	ackFD, ackErr := strconv.Atoi(values["ack-fd"])
+	if values["control"] == "" || readyErr != nil || ackErr != nil || readyFD < 0 || ackFD < 0 {
+		writeSupervisorFailure(readyFD, "E_RUN_ARGUMENT_INVALID", "malformed supervisor arguments")
+		return store.ExitForCode("E_RUN_ARGUMENT_INVALID")
+	}
+	request, err := runner.ConsumeDetachControl(values["control"])
+	if err != nil {
+		writeSupervisorFailure(readyFD, "E_RUN_ARGUMENT_INVALID", err.Error())
+		return store.ExitForCode("E_RUN_ARGUMENT_INVALID")
+	}
+	s, project, err := app.OpenWithDiagnostics(context.Background(), ".", diagnostics)
+	if err != nil {
+		writeSupervisorFailure(readyFD, "E_RUN_DETACH_FAILED", err.Error())
+		return store.ExitForCode("E_RUN_DETACH_FAILED")
+	}
+	defer s.Close()
+	if err := project.Runner.SuperviseRequest(context.Background(), request, readyFD, ackFD); err != nil {
+		return store.ExitForCode(store.ErrorCode(err))
+	}
+	return 0
+}
+
+func supervisorReadyFD(argv []string) int {
+	for i := 0; i+1 < len(argv); i++ {
+		if argv[i] != "--ready-fd" {
+			continue
+		}
+		fd, err := strconv.Atoi(argv[i+1])
+		if err == nil && fd >= 0 {
+			return fd
+		}
+	}
+	return -1
+}
+
+func writeSupervisorFailure(fd int, code, message string) {
+	if fd < 0 {
+		return
+	}
+	f := os.NewFile(uintptr(fd), "detach-ready")
+	if f == nil {
+		return
+	}
+	_ = json.NewEncoder(f).Encode(map[string]string{"code": code, "error": message})
+	_ = f.Close()
 }
 
 func removeJSON(argv []string) ([]string, bool) {
@@ -290,7 +360,7 @@ func parseRunArgs(argv []string) ([]string, map[string]string, error) {
 			return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: run options must precede the launch delimiter")
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "merge" || name == "realtime" || name == "pty" || name == "store-stdin" || name == "no-admit" || name == "strict-wiring" {
+		if name == "merge" || name == "realtime" || name == "pty" || name == "detach" || name == "follow" || name == "no-stdin" || name == "store-stdin" || name == "no-admit" || name == "strict-wiring" {
 			options[name] = "true"
 			continue
 		}
@@ -302,7 +372,7 @@ func parseRunArgs(argv []string) ([]string, map[string]string, error) {
 		switch name {
 		case "prefix", "env", "config-env":
 			options[name] = appendDelimited(options[name], value)
-		case "cwd", "stdin", "ticket", "phase", "label", "tool", "report", "report-stream", "suite", "shard", "retry", "usage", "provider":
+		case "cwd", "stdin", "timeout", "ticket", "phase", "label", "tool", "report", "report-stream", "suite", "shard", "retry", "usage", "provider":
 			if options[name] != "" {
 				return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: option --%s may occur once", name)
 			}
@@ -368,9 +438,13 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		args["merge"] = options["merge"] == "true"
 		args["realtime"] = options["realtime"] == "true"
 		args["pty"] = options["pty"] == "true"
+		args["detach"] = options["detach"] == "true"
+		args["follow"] = options["follow"] == "true"
 		args["stdin"] = options["stdin"]
+		args["no_stdin"] = options["no-stdin"] == "true"
 		args["store_stdin"] = options["store-stdin"] == "true"
 		args["no_admit"] = options["no-admit"] == "true"
+		args["timeout"] = options["timeout"]
 		args["ticket"] = options["ticket"]
 		args["phase"] = options["phase"]
 		args["label"] = options["label"]
@@ -848,13 +922,28 @@ func splitComma(value string) []string {
 }
 
 func render(response core.Response, jsonOutput bool, stdout, stderr io.Writer) int {
+	var writeErr error
 	if jsonOutput {
 		data, _ := json.Marshal(response)
-		_, _ = fmt.Fprintln(stdout, string(data))
+		_, writeErr = fmt.Fprintln(stdout, string(data))
 	} else if response.OK {
-		renderHuman(response, stdout)
+		writeErr = renderHuman(response, stdout)
 	} else if response.Error != "" {
 		_, _ = fmt.Fprintln(stderr, response.Error)
+	}
+	if writeErr == nil && response.OK {
+		if flusher, ok := stdout.(interface{ Flush() error }); ok {
+			writeErr = flusher.Flush()
+		}
+	}
+	if response.AfterWrite != nil {
+		if err := response.AfterWrite(response.OK && writeErr == nil); err != nil {
+			_, _ = fmt.Fprintf(stderr, "E_RUN_DETACH_FAILED: %v\n", err)
+			return exitForError("E_RUN_DETACH_FAILED")
+		}
+	}
+	if writeErr != nil {
+		return exitForError("E_RUN_DETACH_FAILED")
 	}
 	if response.Exit != 0 {
 		return response.Exit
@@ -884,22 +973,31 @@ func (w *lineTrackingWriter) needsSeparator() bool {
 	return w.wrote && w.last != '\n'
 }
 
-func renderHuman(response core.Response, out io.Writer) {
+func renderHuman(response core.Response, out io.Writer) error {
 	if response.Code == "PASS" || response.Code == "FAIL" || response.Code == "UNEVALUATED" {
 		if report, ok := response.Data.(interface{}); ok {
 			data, _ := json.Marshal(report)
-			_, _ = fmt.Fprintf(out, "verdict: %s\n%s\n", strings.ToLower(response.Code), data)
+			if _, err := fmt.Fprintf(out, "verdict: %s\n%s\n", strings.ToLower(response.Code), data); err != nil {
+				return err
+			}
 		}
 		for _, warning := range response.Warnings {
-			_, _ = fmt.Fprintf(out, "warning: %s\n", warning)
+			if _, err := fmt.Fprintf(out, "warning: %s\n", warning); err != nil {
+				return err
+			}
 		}
-		return
+		return nil
 	}
 	data, _ := json.MarshalIndent(response.Data, "", "  ")
-	_, _ = fmt.Fprintln(out, string(data))
-	for _, warning := range response.Warnings {
-		_, _ = fmt.Fprintf(out, "warning: %s\n", warning)
+	if _, err := fmt.Fprintln(out, string(data)); err != nil {
+		return err
 	}
+	for _, warning := range response.Warnings {
+		if _, err := fmt.Fprintf(out, "warning: %s\n", warning); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func renderRunLog(response core.Response, stdout, stderr io.Writer) int {

@@ -31,6 +31,8 @@ type admissionResult struct {
 	lock     *admitLock
 }
 
+var errDetachKillIntent = errors.New("detached run has a pending kill intent")
+
 type admitLock struct {
 	mu   sync.Mutex
 	file *os.File
@@ -76,6 +78,15 @@ func (r *Runner) admit(ctx context.Context, req Request) (admissionResult, error
 	for {
 		if err := ctx.Err(); err != nil {
 			return admissionResult{}, err
+		}
+		if req.Detach {
+			current, currentErr := r.ledger.current(req.detachRunID)
+			if currentErr != nil {
+				return admissionResult{}, launchErr("U_RUN_RECONCILE_REQUIRED", currentErr)
+			}
+			if currentErr == nil && current.Detached && current.KillIntent.Present {
+				return admissionResult{}, errDetachKillIntent
+			}
 		}
 		cur, max, ok, reason := r.sliceMemory(path)
 		if !ok {

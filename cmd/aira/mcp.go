@@ -60,10 +60,11 @@ type mcpRequest struct {
 }
 
 type mcpResponse struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      any             `json:"id"`
-	Result  json.RawMessage `json:"result,omitempty"`
-	Error   *mcpRPCError    `json:"error,omitempty"`
+	JSONRPC    string          `json:"jsonrpc"`
+	ID         any             `json:"id"`
+	Result     json.RawMessage `json:"result,omitempty"`
+	Error      *mcpRPCError    `json:"error,omitempty"`
+	afterWrite func(bool) error
 }
 
 type mcpRPCError struct {
@@ -399,14 +400,26 @@ func decodeMCPRequest(binding mcpToolBinding, values map[string]json.RawMessage)
 		if _, ok := args["pty"]; !ok {
 			args["pty"] = false
 		}
+		if _, ok := args["detach"]; !ok {
+			args["detach"] = false
+		}
+		if _, ok := args["follow"]; !ok {
+			args["follow"] = false
+		}
 		if _, ok := args["stdin"]; !ok {
 			args["stdin"] = ""
+		}
+		if _, ok := args["no_stdin"]; !ok {
+			args["no_stdin"] = false
 		}
 		if _, ok := args["store_stdin"]; !ok {
 			args["store_stdin"] = false
 		}
 		if _, ok := args["no_admit"]; !ok {
 			args["no_admit"] = false
+		}
+		if _, ok := args["timeout"]; !ok {
+			args["timeout"] = ""
 		}
 		for _, name := range []string{"ticket", "phase", "label", "tool", "report", "report_stream", "suite", "shard", "retry", "usage", "provider"} {
 			if _, ok := args[name]; !ok {
@@ -501,7 +514,9 @@ func toolResponse(id any, response core.Response) mcpResponse {
 		"structuredContent": response,
 		"content":           []map[string]string{{"type": "text", "text": string(encoded)}},
 	}
-	return resultResponse(id, result)
+	value := resultResponse(id, result)
+	value.afterWrite = response.AfterWrite
+	return value
 }
 
 func stableArgumentData(message string) map[string]any {
@@ -538,5 +553,15 @@ func writeMCP(output io.Writer, response mcpResponse) error {
 		return err
 	}
 	_, err = fmt.Fprintf(output, "%s\n", encoded)
+	if err == nil {
+		if flusher, ok := output.(interface{ Flush() error }); ok {
+			err = flusher.Flush()
+		}
+	}
+	if response.afterWrite != nil {
+		if afterErr := response.afterWrite(err == nil); err == nil {
+			err = afterErr
+		}
+	}
 	return err
 }

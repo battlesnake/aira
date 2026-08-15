@@ -51,6 +51,18 @@ func (r *Runner) Launch(context.Context, Request) (*RunRecord, error) {
 	return nil, nonLinuxRunError()
 }
 
+func (r *Runner) LaunchDetached(context.Context, Request) (*DetachLaunch, error) {
+	return nil, nonLinuxRunError()
+}
+
+func (r *Runner) Supervise(context.Context, string, int, int) error {
+	return nonLinuxRunError()
+}
+
+func (r *Runner) SuperviseRequest(context.Context, Request, int, int) error {
+	return nonLinuxRunError()
+}
+
 func (r *Runner) Kill(context.Context, string, bool) (*RunRecord, error) {
 	return nil, nonLinuxRunError()
 }
