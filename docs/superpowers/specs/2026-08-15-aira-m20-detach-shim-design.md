@@ -1,8 +1,8 @@
 # M20 — Detached-run supervisor shim (`aira run --detach`)
 
-Status: PLAN v5 (post Sol rounds 1–4). Phase 5. Resolves the design-authority
-"decide shim-vs-daemon first" open question (§21) and delivers `--detach`
-(§14 line 153).
+Status: **PLAN APPROVED** (v6, Sol plan-review 6 rounds → APPROVE-PLAN). Phase 5.
+Resolves the design-authority "decide shim-vs-daemon first" open question (§21) and
+delivers `--detach` (§14 line 153). Build-ready.
 
 Design authority: [`2026-08-07-aira-design.md`](2026-08-07-aira-design.md) §5.2,
 §14, §20/§21. Builds on the foreground runner (M12/M16/M17/M18a/M18b/M19), the
