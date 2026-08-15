@@ -41,6 +41,10 @@ var ExitCodes = map[string]int{
 	"E_RUN_SCOPE_UNAVAILABLE": 4, "E_RUN_SCOPE_INVALID": 4, "E_RUN_SCOPE_HANDOFF": 4,
 	"E_RUN_SCOPE_MIGRATION": 4, "E_RUN_DESCENDANT_KILLED": 4, "E_RUN_LAUNCH_FAILED": 4,
 	"U_RUN_EXIT_UNKNOWN": 3, "U_RUN_OUTPUT_UNAVAILABLE": 3, "U_RUN_RECONCILE_REQUIRED": 3,
+	// Bounded git network/auth operations.
+	"E_GIT_SSH_UNAVAILABLE": 1, "E_GIT_GH_UNAVAILABLE": 1, "E_GIT_AUTH_FAILED": 1,
+	"E_GIT_FALLBACK_BLOCKED": 1, "E_GIT_REMOTE_UNSUPPORTED": 1, "E_GIT_REMOTE_UNRESOLVED": 1,
+	"E_GIT_TIMEOUT": 3, "E_GIT_FAILED": 1, "E_GIT_ARG_INVALID": 2,
 	// Domain-operation failure codes. These already exited 1 via the default
 	// below; registering them here documents them so generated response
 	// contracts (e.g. the Skill face) do not present an incomplete vocabulary.

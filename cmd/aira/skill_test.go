@@ -194,7 +194,7 @@ func TestSkillFaceInstallGuideAndRefusalRules(t *testing.T) {
 		t.Fatal(err)
 	}
 	var parsed core.SkillManifest
-	if err := json.Unmarshal(manifest, &parsed); err != nil || len(parsed.Actions) != 56 || parsed.Version == "" {
+	if err := json.Unmarshal(manifest, &parsed); err != nil || len(parsed.Actions) != 60 || parsed.Version == "" {
 		t.Fatalf("manifest err=%v value=%#v", err, parsed)
 	}
 	if exit := Run([]string{"skill", "install", installDir}, &out, &stderr); exit != 0 {
@@ -253,7 +253,8 @@ func TestSkillExamplesReachCoreFromRun(t *testing.T) {
 	// spec §6.7, made precise.
 	inputInvalid := map[string]bool{
 		"E_SELECTOR_INVALID": true, "E_QUERY_INVALID": true, "E_ARGUMENT_INVALID": true,
-		"E_UNKNOWN_VERB": true, "E_ID_INVALID": true, "E_GLOB_INVALID": true,
+		"E_GIT_ARG_INVALID": true,
+		"E_UNKNOWN_VERB":    true, "E_ID_INVALID": true, "E_GLOB_INVALID": true,
 		"E_SELECTOR_AMBIGUOUS": true,
 	}
 	codeOf := func(argv []string) (string, int) {

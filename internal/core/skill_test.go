@@ -16,8 +16,8 @@ func TestSkillMetadataNormalisesEveryIncludedAction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(artifacts.Actions) != 56 {
-		t.Fatalf("actions=%d, want 56", len(artifacts.Actions))
+	if len(artifacts.Actions) != 60 {
+		t.Fatalf("actions=%d, want 60", len(artifacts.Actions))
 	}
 	for _, action := range artifacts.Actions {
 		if action.Summary == "" || !action.Safety.Valid() || !strings.HasPrefix(action.Command, "aira ") {
@@ -77,6 +77,7 @@ func TestSkillSafetyGolden(t *testing.T) {
 		"insights/ls": SafetyRead, "insights/show": SafetyRead,
 		"test-report/add": SafetyMutate, "test-report/ls": SafetyRead, "test-report/show": SafetyRead, "test-report/flaky": SafetyRead,
 		"run": SafetyExecute, "run-kill": SafetyExecute, "run-log": SafetyRead,
+		"git/clone": SafetyExecute, "git/fetch": SafetyExecute, "git/push": SafetyExecute, "git/ls-remote": SafetyExecute,
 		"find/add": SafetyMutate, "find/ls": SafetyRead, "find/show": SafetyRead, "find/set": SafetyMutate,
 		"req/add": SafetyMutate, "req/ls": SafetyRead, "req/show": SafetyRead, "req/set": SafetyMutate, "req/import": SafetyMutate,
 		"link/link": SafetyMutate, "link/list": SafetyRead,
@@ -95,7 +96,7 @@ func TestSkillSafetyGolden(t *testing.T) {
 	got := map[string]SafetyClass{}
 	for _, action := range artifacts.Actions {
 		key := action.Verb
-		if action.Verb == "find" || action.Verb == "req" || action.Verb == "link" || action.Verb == "gate" || action.Verb == "test-report" || action.Verb == "spend" || action.Verb == "quota" || action.Verb == "insights" {
+		if action.Verb == "find" || action.Verb == "req" || action.Verb == "link" || action.Verb == "gate" || action.Verb == "test-report" || action.Verb == "spend" || action.Verb == "quota" || action.Verb == "insights" || action.Verb == "git" {
 			key += "/" + action.Operation
 		}
 		got[key] = action.Safety
@@ -121,7 +122,7 @@ func TestSkillActionSetIsCanonicalAndDealiased(t *testing.T) {
 			}
 		}
 	}
-	for _, name := range []string{"find/add", "find/ls", "find/show", "find/set", "req/add", "req/ls", "req/show", "req/set", "req/import", "link/link", "link/list", "unlink/unlink"} {
+	for _, name := range []string{"find/add", "find/ls", "find/show", "find/set", "req/add", "req/ls", "req/show", "req/set", "req/import", "link/link", "link/list", "unlink/unlink", "git/clone", "git/fetch", "git/push", "git/ls-remote"} {
 		if !got[name] {
 			t.Fatalf("missing action %q", name)
 		}

@@ -21,7 +21,7 @@ func runMCP(ctx context.Context, input io.Reader, output, diagnostics io.Writer)
 		if err != nil {
 			return nil, nil, err
 		}
-		return core.NewWithRunnerOutputCap(s, project.Runner, mcpOutputCap), func() { _ = s.Close() }, nil
+		return core.NewWithRunnerOutputCap(s, project.Runner, mcpOutputCap).WithGitOps(project.GitOps), func() { _ = s.Close() }, nil
 	})
 	if err := server.Serve(ctx, input, output, diagnostics); err != nil {
 		return 1

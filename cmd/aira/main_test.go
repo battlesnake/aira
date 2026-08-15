@@ -203,6 +203,35 @@ func TestRunDelimiterKeepsChildOptionTokensVerbatim(t *testing.T) {
 	}
 }
 
+func TestGitCLIRequestGrammarIsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		argv []string
+		want map[string]any
+	}{
+		{argv: []string{"clone", "git@github.com:o/r.git", "dst"}, want: map[string]any{"subverb": "clone", "url": "git@github.com:o/r.git", "dir": "dst"}},
+		{argv: []string{"fetch"}, want: map[string]any{"subverb": "fetch"}},
+		{argv: []string{"push", "origin", "--", "HEAD:main"}, want: map[string]any{"subverb": "push", "remote": "origin", "refspecs": []string{"HEAD:main"}}},
+	} {
+		positional, options, err := parseArgs("git", tc.argv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request, err := buildRequest("git", positional, options)
+		if err != nil || !reflect.DeepEqual(request.Args, tc.want) {
+			t.Fatalf("argv=%v request=%+v error=%v", tc.argv, request, err)
+		}
+	}
+	for _, argv := range [][]string{{"pull"}, {"clone"}, {"clone", "a", "b", "c"}, {"push", "origin", "--force"}} {
+		positional, options, err := parseArgs("git", argv)
+		if err == nil {
+			_, err = buildRequest("git", positional, options)
+		}
+		if err == nil {
+			t.Fatalf("argv=%v was accepted", argv)
+		}
+	}
+}
+
 func TestRunRealtimeFlagReachesRunnerHandler(t *testing.T) {
 	positional, options, err := parseArgs("run", []string{"--realtime", "--", "tool"})
 	if err != nil {

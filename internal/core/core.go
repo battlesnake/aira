@@ -14,6 +14,7 @@ import (
 
 	"aira/internal/domain"
 	"aira/internal/gate"
+	"aira/internal/gitremote"
 	"aira/internal/runner"
 	"aira/internal/store"
 )
@@ -138,6 +139,7 @@ type handlerData struct {
 	Warnings []string
 	Verdict  string
 	Code     string
+	Error    string
 }
 
 type outputReadData struct {
@@ -238,6 +240,7 @@ type DispatchDescriptor struct {
 type Core struct {
 	store       Store
 	runner      Runner
+	gitops      GitOps
 	initializer Initializer
 	stdin       io.Reader
 	outputCap   int64
@@ -263,6 +266,11 @@ type Runner interface {
 	Get(string) (*runner.RunRecord, error)
 	ReadOutput(context.Context, runner.OutputRequest) (*runner.OutputChunk, error)
 	Reconcile(context.Context) ([]runner.RunRecord, error)
+}
+
+// GitOps is the transport-neutral git network-operation seam.
+type GitOps interface {
+	Run(context.Context, gitremote.Request) (*gitremote.Result, error)
 }
 
 type verbSpec struct {
@@ -311,6 +319,12 @@ func NewWithRunnerOutputCap(s Store, execution Runner, cap int64) *Core {
 	return c
 }
 
+// WithGitOps attaches git network operations to a runner-bearing face.
+func (c *Core) WithGitOps(g GitOps) *Core {
+	c.gitops = g
+	return c
+}
+
 func NewWithInitializer(s Store, initializer Initializer) *Core {
 	c := New(s)
 	c.initializer = initializer
@@ -348,11 +362,15 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 	warnings := []string(nil)
 	verdict := ""
 	handlerCode := ""
+	handlerError := ""
 	if wrapped, ok := data.(handlerData); ok {
-		data, warnings, verdict, handlerCode = wrapped.Data, wrapped.Warnings, wrapped.Verdict, wrapped.Code
+		data, warnings, verdict, handlerCode, handlerError = wrapped.Data, wrapped.Warnings, wrapped.Verdict, wrapped.Code, wrapped.Error
 	}
 	if handlerCode != "" {
-		return Response{OK: false, Code: handlerCode, Data: data, Error: handlerCode, Exit: store.ExitForCode(handlerCode)}
+		if handlerError == "" {
+			handlerError = handlerCode
+		}
+		return Response{OK: false, Code: handlerCode, Data: data, Error: handlerError, Exit: store.ExitForCode(handlerCode)}
 	}
 	if output, ok := data.(outputReadData); ok {
 		if output.Err != nil {
@@ -1082,6 +1100,38 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return mutationData(map[string]any{"id": record.Ticket.ID, "status": stringArg(args, "status")}, event), nil
 		}},
+		"git": {Name: "git", Usage: "git clone|fetch|push|ls-remote ...", Args: []ArgSpec{
+			stringSpec("subverb", true, true, "Git network operation", "clone", "fetch", "push", "ls-remote"),
+			stringSpec("remote", false, true, "Remote name (defaults to origin)"),
+			stringSpec("url", false, true, "Clone URL"),
+			listSpec("refspecs", false, true, "Exact refspecs"),
+			stringSpec("dir", false, true, "Optional clone destination directory"),
+		}, MCPTool: "aira_git", MCPOperation: "subverb", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+			subverb := strings.ToLower(strings.TrimSpace(stringArg(args, "subverb")))
+			switch subverb {
+			case "clone", "fetch", "push", "ls-remote":
+			default:
+				return nil, fmt.Errorf("%s: unknown git operation %q", gitremote.CodeArgInvalid, subverb)
+			}
+			request := gitremote.Request{Verb: subverb}
+			if subverb == "clone" {
+				request.URL, request.Dir = stringArg(args, "url"), stringArg(args, "dir")
+			} else {
+				request.Remote, request.Refspecs = stringArg(args, "remote"), stringSlice(args, "refspecs")
+			}
+			if c.gitops == nil {
+				return nil, fmt.Errorf("%s: git ops unavailable on this face", gitremote.CodeSSHUnavailable)
+			}
+			if c.face.Live {
+				request.LiveStdout, request.LiveStderr = c.face.Stdout, c.face.Stderr
+			}
+			result, err := c.gitops.Run(ctx, request)
+			var gitErr *gitremote.Error
+			if errors.As(err, &gitErr) {
+				return handlerData{Code: gitErr.Code(), Data: gitErr.Data(), Error: gitErr.Error()}, nil
+			}
+			return result, err
+		}},
 		"run": {Name: "run", Usage: "run [options] -- <argv...>", Args: []ArgSpec{
 			listSpec("argv", true, true, "Exact target argv after the launch delimiter"),
 			listSpec("prefix", false, false, "Optional exact launch-prefix argv"),
@@ -1330,6 +1380,12 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		"count":     {summary: "Count tickets by a dimension", safety: SafetyRead, example: []string{"kind:feature", "--by", "status"}},
 		"set":       {summary: "Set a ticket field", safety: SafetyMutate, example: []string{"AIRA-1", "status=planned"}},
 		"mv":        {summary: "Move a ticket to a new status", safety: SafetyMutate, example: []string{"AIRA-1", "planned"}},
+		"git": {summary: "Run a bounded authenticated git network operation", safety: SafetyExecute, operations: []OperationSpec{
+			{Name: "clone", Summary: "Clone a remote repository", Safety: SafetyExecute, Args: []OperationArg{{Name: "url", Required: true}, {Name: "dir"}}, Example: []string{"clone", "file:///repo", "repo"}},
+			{Name: "fetch", Summary: "Fetch remote refs", Safety: SafetyExecute, Args: []OperationArg{{Name: "remote"}, {Name: "refspecs"}}, Example: []string{"fetch", "origin"}},
+			{Name: "push", Summary: "Push explicit refs", Safety: SafetyExecute, Args: []OperationArg{{Name: "remote"}, {Name: "refspecs"}}, Example: []string{"push", "origin", "--", "HEAD:main"}},
+			{Name: "ls-remote", Summary: "List remote refs", Safety: SafetyExecute, Args: []OperationArg{{Name: "remote"}, {Name: "refspecs"}}, Example: []string{"ls-remote", "origin"}},
+		}},
 		"run":       {summary: "Launch a foreground subprocess in an owned scope", safety: SafetyExecute, example: []string{"--merge", "--", "printf", "hello"}},
 		"run-kill":  {summary: "Kill an owned run scope", safety: SafetyExecute, example: []string{"RUN-1"}},
 		"run-log":   {summary: "Read captured run output", safety: SafetyRead, example: []string{"RUN-1", "--stream", "out"}},

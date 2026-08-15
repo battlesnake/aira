@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"aira/internal/domain"
+	"aira/internal/gitremote"
 	"aira/internal/runner"
 	"aira/internal/store"
 )
@@ -25,6 +26,39 @@ type Config struct {
 	Project ProjectConfig `json:"project"`
 	Lease   LeaseConfig   `json:"lease"`
 	Run     RunConfig     `json:"run,omitempty"`
+	Git     GitConfig     `json:"git,omitempty"`
+}
+
+type GitConfig struct {
+	GhFallback               *bool `json:"gh_fallback,omitempty"`
+	SSHConnectTimeoutSeconds int   `json:"ssh_connect_timeout_seconds,omitempty"`
+	OpTimeoutSeconds         int   `json:"op_timeout_seconds,omitempty"`
+	sshTimeoutPresent        bool
+	opTimeoutPresent         bool
+}
+
+// UnmarshalJSON preserves the distinction between an absent timeout (default)
+// and an explicitly configured zero (invalid).
+func (c *GitConfig) UnmarshalJSON(data []byte) error {
+	type wire struct {
+		GhFallback               *bool `json:"gh_fallback,omitempty"`
+		SSHConnectTimeoutSeconds *int  `json:"ssh_connect_timeout_seconds,omitempty"`
+		OpTimeoutSeconds         *int  `json:"op_timeout_seconds,omitempty"`
+	}
+	var value wire
+	dec := json.NewDecoder(strings.NewReader(string(data)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&value); err != nil {
+		return err
+	}
+	c.GhFallback = value.GhFallback
+	if value.SSHConnectTimeoutSeconds != nil {
+		c.SSHConnectTimeoutSeconds, c.sshTimeoutPresent = *value.SSHConnectTimeoutSeconds, true
+	}
+	if value.OpTimeoutSeconds != nil {
+		c.OpTimeoutSeconds, c.opTimeoutPresent = *value.OpTimeoutSeconds, true
+	}
+	return nil
 }
 
 type RunConfig struct {
@@ -69,8 +103,9 @@ type Project struct {
 	ConfigPath string
 	Config     Config
 	StateDir   string
-	Runner     *runner.Runner   `json:"-"`
-	GateAudit  *store.GateAudit `json:"-"`
+	Runner     *runner.Runner    `json:"-"`
+	GitOps     *gitremote.Client `json:"-"`
+	GateAudit  *store.GateAudit  `json:"-"`
 }
 
 type InitResult struct {
@@ -176,6 +211,7 @@ func OpenWithDiagnostics(ctx context.Context, cwd string, diagnostics io.Writer)
 	}
 	s.SetRunner(execution)
 	project.Runner = execution
+	project.GitOps = gitremote.New(resolvedGitConfig(project.Config.Git))
 	project.GateAudit, err = store.OpenGateAudit(project.CommonDir, false)
 	if err != nil {
 		_ = s.Close()
@@ -374,7 +410,36 @@ func validateConfig(config Config) error {
 	if _, _, err := parsedRunAdmission(config.Run); err != nil {
 		return err
 	}
+	if (config.Git.sshTimeoutPresent && config.Git.SSHConnectTimeoutSeconds <= 0) || (!config.Git.sshTimeoutPresent && config.Git.SSHConnectTimeoutSeconds < 0) {
+		return errors.New("E_CONFIG_INVALID: git.ssh_connect_timeout_seconds must be positive when configured")
+	}
+	if (config.Git.opTimeoutPresent && config.Git.OpTimeoutSeconds <= 0) || (!config.Git.opTimeoutPresent && config.Git.OpTimeoutSeconds < 0) {
+		return errors.New("E_CONFIG_INVALID: git.op_timeout_seconds must be positive when configured")
+	}
+	maxDurationSeconds := int64((1<<63 - 1) / time.Second)
+	if int64(config.Git.SSHConnectTimeoutSeconds) > maxDurationSeconds || int64(config.Git.OpTimeoutSeconds) > maxDurationSeconds {
+		return errors.New("E_CONFIG_INVALID: git timeout exceeds time.Duration")
+	}
 	return nil
+}
+
+func resolvedGitConfig(config GitConfig) gitremote.Config {
+	fallback := true
+	if config.GhFallback != nil {
+		fallback = *config.GhFallback
+	}
+	sshSeconds := config.SSHConnectTimeoutSeconds
+	if sshSeconds == 0 && !config.sshTimeoutPresent {
+		sshSeconds = 10
+	}
+	opSeconds := config.OpTimeoutSeconds
+	if opSeconds == 0 && !config.opTimeoutPresent {
+		opSeconds = 120
+	}
+	return gitremote.Config{
+		GhFallback: fallback, SSHConnectTimeout: time.Duration(sshSeconds) * time.Second,
+		OpTimeout: time.Duration(opSeconds) * time.Second,
+	}
 }
 
 func parsedRunAdmission(config RunConfig) (int64, time.Duration, error) {

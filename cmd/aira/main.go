@@ -123,13 +123,13 @@ func runWithInput(argv []string, stdout, stderr io.Writer, stdin io.Reader) int 
 	dispatcher := core.NewWithRunnerFace(s, project.Runner, stdin, core.FaceOutput{
 		Stdout: faceStdout,
 		Stderr: stderr,
-		Live:   verb == "run" && !jsonOutput,
-	})
+		Live:   (verb == "run" || verb == "git") && !jsonOutput,
+	}).WithGitOps(project.GitOps)
 	response := dispatcher.Do(context.Background(), request)
 	if verb == "run-log" && !jsonOutput {
 		return renderRunLog(response, stdout, stderr)
 	}
-	if verb == "run" && !jsonOutput && response.OK && faceStdout.needsSeparator() {
+	if (verb == "run" || verb == "git") && !jsonOutput && response.OK && faceStdout.needsSeparator() {
 		_, _ = io.WriteString(stdout, "\n")
 	}
 	return render(response, jsonOutput, stdout, stderr)
@@ -170,6 +170,9 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 	if verb == "run" {
 		return parseRunArgs(argv)
 	}
+	if verb == "git" {
+		return parseGitArgs(argv)
+	}
 	options := map[string]string{}
 	var positional []string
 	for i := 0; i < len(argv); i++ {
@@ -187,6 +190,9 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		if i+1 >= len(argv) || (strings.HasPrefix(argv[i+1], "--") && !gateListValue) {
 			if verb == "run-log" {
 				return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: option --%s requires a value", name)
+			}
+			if verb == "git" {
+				return nil, nil, fmt.Errorf("E_GIT_ARG_INVALID: option --%s is not permitted", name)
 			}
 			return nil, nil, fmt.Errorf("option --%s requires a value", name)
 		}
@@ -231,6 +237,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"spend":       {"provider": true, "model": true, "source": true, "ticket": true, "phase": true, "at": true, "session": true, "agent": true, "total": true, "cost-usd": true, "usage-file": true, "bucket": true, "reasoning-subset": true, "by": true},
 		"quota":       {"provider": true, "source": true, "at": true, "window": true, "used": true, "limit": true, "remaining": true, "reset-at": true},
 		"insights":    {},
+		"git":         {},
 		"run-kill":    {"steal": true},
 		"run-log":     {"stream": true, "from": true, "tail": true, "follow": true, "full": true},
 		"gate":        {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "reason": true, "report": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-seed": true, "mutation-expected-result": true},
@@ -240,10 +247,29 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 			if verb == "run-log" {
 				return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: option --%s is not valid for %s", name, verb)
 			}
+			if verb == "git" {
+				return nil, nil, fmt.Errorf("E_GIT_ARG_INVALID: option --%s is not valid for git", name)
+			}
 			return nil, nil, fmt.Errorf("option --%s is not valid for %s", name, verb)
 		}
 	}
 	return positional, options, nil
+}
+
+func parseGitArgs(argv []string) ([]string, map[string]string, error) {
+	positionals := make([]string, 0, len(argv))
+	boundary := false
+	for _, arg := range argv {
+		if !boundary && arg == "--" {
+			boundary = true
+			continue
+		}
+		if !boundary && strings.HasPrefix(arg, "--") {
+			return nil, nil, fmt.Errorf("E_GIT_ARG_INVALID: git options are not permitted")
+		}
+		positionals = append(positionals, arg)
+	}
+	return positionals, map[string]string{}, nil
 }
 
 func parseRunArgs(argv []string) ([]string, map[string]string, error) {
@@ -344,6 +370,48 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		args["stdin"] = options["stdin"]
 		args["store_stdin"] = options["store-stdin"] == "true"
 		args["no_admit"] = options["no-admit"] == "true"
+	case "git":
+		if len(positional) == 0 {
+			return core.Request{}, fmt.Errorf("E_GIT_ARG_INVALID: git requires clone|fetch|push|ls-remote")
+		}
+		subverb := strings.ToLower(positional[0])
+		args["subverb"] = subverb
+		// A standalone "--" separates the remote from refspecs; the real CLI strips it in
+		// parseGitArgs, so tolerate it here too and keep buildRequest delimiter-agnostic.
+		{
+			filtered := make([]string, 0, len(positional))
+			filtered = append(filtered, positional[0])
+			for _, p := range positional[1:] {
+				if p != "--" {
+					filtered = append(filtered, p)
+				}
+			}
+			positional = filtered
+		}
+		switch subverb {
+		case "clone":
+			if len(positional) < 2 || len(positional) > 3 {
+				return core.Request{}, fmt.Errorf("E_GIT_ARG_INVALID: git clone requires <url> [dir]")
+			}
+			args["url"] = positional[1]
+			if len(positional) == 3 {
+				args["dir"] = positional[2]
+			}
+		case "fetch", "push", "ls-remote":
+			if len(positional) > 1 {
+				args["remote"] = positional[1]
+			}
+			if len(positional) > 2 {
+				args["refspecs"] = append([]string(nil), positional[2:]...)
+			}
+		default:
+			return core.Request{}, fmt.Errorf("E_GIT_ARG_INVALID: unknown git operation %q", subverb)
+		}
+		for _, value := range positional[1:] {
+			if strings.HasPrefix(value, "-") {
+				return core.Request{}, fmt.Errorf("E_GIT_ARG_INVALID: git arguments may not begin with '-'")
+			}
+		}
 	case "run-kill":
 		if len(positional) != 1 {
 			return core.Request{}, fmt.Errorf("E_RUN_ARGUMENT_INVALID: run-kill requires <run-id>")

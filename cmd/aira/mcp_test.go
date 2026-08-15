@@ -37,7 +37,7 @@ func TestMCPToolListIsGeneratedAndStable(t *testing.T) {
 	for _, tool := range result.Tools {
 		got = append(got, tool.Name)
 	}
-	want := []string{"aira_check", "aira_claim", "aira_count", "aira_create", "aira_finding", "aira_gate", "aira_get", "aira_grep", "aira_heartbeat", "aira_id", "aira_import", "aira_init", "aira_insights", "aira_link", "aira_list", "aira_quota", "aira_ready", "aira_reconcile", "aira_release", "aira_requirement", "aira_review", "aira_run", "aira_run_kill", "aira_run_output", "aira_spend", "aira_test_report", "aira_touch", "aira_transition"}
+	want := []string{"aira_check", "aira_claim", "aira_count", "aira_create", "aira_finding", "aira_gate", "aira_get", "aira_git", "aira_grep", "aira_heartbeat", "aira_id", "aira_import", "aira_init", "aira_insights", "aira_link", "aira_list", "aira_quota", "aira_ready", "aira_reconcile", "aira_release", "aira_requirement", "aira_review", "aira_run", "aira_run_kill", "aira_run_output", "aira_spend", "aira_test_report", "aira_touch", "aira_transition"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("tools=%v, want=%v", got, want)
 	}
@@ -305,6 +305,10 @@ func TestMCPGroupedOperationsBuildTheSameCanonicalRequestsAsCLI(t *testing.T) {
 		{name: "requirement ls", tool: "aira_requirement", arguments: map[string]any{"operation": "ls", "fields": []any{"id"}}, cli: mustCLIRequest(t, "req", []string{"ls"}, map[string]string{"fields": "id"})},
 		{name: "requirement show", tool: "aira_requirement", arguments: map[string]any{"operation": "show", "selector": "AR-1"}, cli: mustCLIRequest(t, "req", []string{"show", "AR-1"}, nil)},
 		{name: "requirement set", tool: "aira_requirement", arguments: map[string]any{"operation": "set", "selector": "AR-1", "status": "built"}, cli: mustCLIRequest(t, "req", []string{"set", "AR-1"}, map[string]string{"status": "built"})},
+		{name: "git clone", tool: "aira_git", arguments: map[string]any{"operation": "clone", "url": "git@github.com:o/r.git", "dir": "repo"}, cli: mustCLIRequest(t, "git", []string{"clone", "git@github.com:o/r.git", "repo"}, nil)},
+		{name: "git fetch", tool: "aira_git", arguments: map[string]any{"operation": "fetch", "remote": "origin"}, cli: mustCLIRequest(t, "git", []string{"fetch", "origin"}, nil)},
+		{name: "git push", tool: "aira_git", arguments: map[string]any{"operation": "push", "remote": "origin", "refspecs": []any{"HEAD:main"}}, cli: mustCLIRequest(t, "git", []string{"push", "origin", "--", "HEAD:main"}, nil)},
+		{name: "git ls-remote", tool: "aira_git", arguments: map[string]any{"operation": "ls-remote", "remote": "origin"}, cli: mustCLIRequest(t, "git", []string{"ls-remote", "origin"}, nil)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

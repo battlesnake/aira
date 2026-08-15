@@ -43,7 +43,7 @@ func TestDispatchMetadataMatchesInstrumentedHandlerReads(t *testing.T) {
 		}
 		if len(descriptor.Operations) > 0 {
 			discriminator := ""
-			if name == "find" || name == "req" || name == "test-report" || name == "spend" || name == "quota" || name == "insights" {
+			if name == "find" || name == "req" || name == "test-report" || name == "spend" || name == "quota" || name == "insights" || name == "git" {
 				discriminator = "subverb"
 			} else if name == "link" {
 				discriminator = "list"
@@ -104,7 +104,8 @@ func metadataProbeInputs(name string) []map[string]any {
 		"from": "AIRA-1", "to": "AIRA-2", "field": "title", "value": "new", "status": "planned", "rebuild": true,
 		"format": "go-json", "raw": []byte("{}"), "explain": "pkg/Test", "all": true, "suite": "unit", "runner": "go", "config": "race", "env_digest": "env", "shard": "1/1", "retry": "0", "agent": "codex", "session": "s",
 		"provider": "openai", "model": "gpt-test", "at": "2026-01-01T00:00:00Z", "window": "day", "used": "1", "limit": "2", "remaining": "1", "reset-at": "2026-01-02T00:00:00Z", "total": "1", "cost-usd": "0", "reasoning-subset": true, "bucket": []string{},
-		"name": "reviewer-verdict-ratio",
+		"name":   "reviewer-verdict-ratio",
+		"remote": "origin", "url": "git@github.com:owner/repo.git", "refspecs": []string{"HEAD:main"}, "dir": "repo",
 	}
 	switch name {
 	case "find", "req":
@@ -150,6 +151,13 @@ func metadataProbeInputs(name string) []map[string]any {
 		return []map[string]any{cloneMetadataInputs(values, "subverb", "add"), cloneMetadataInputs(values, "subverb", "ls")}
 	case "insights":
 		return []map[string]any{cloneMetadataInputs(values, "subverb", "ls"), cloneMetadataInputs(values, "subverb", "show")}
+	case "git":
+		return []map[string]any{
+			cloneMetadataInputs(values, "subverb", "clone"),
+			cloneMetadataInputs(values, "subverb", "fetch"),
+			cloneMetadataInputs(values, "subverb", "push"),
+			cloneMetadataInputs(values, "subverb", "ls-remote"),
+		}
 	default:
 		return []map[string]any{values}
 	}
@@ -328,7 +336,7 @@ func TestCanonicalDispatchNamesAndAliases(t *testing.T) {
 		got = append(got, descriptor.Name)
 	}
 	sort.Strings(got)
-	want := []string{"check", "claim", "count", "create", "find", "gate", "grep", "heartbeat", "help", "id", "import", "init", "insights", "link", "list", "mv", "quota", "ready", "reconcile", "release", "req", "review", "run", "run-kill", "run-log", "set", "show", "spend", "test-report", "touch", "unlink"}
+	want := []string{"check", "claim", "count", "create", "find", "gate", "git", "grep", "heartbeat", "help", "id", "import", "init", "insights", "link", "list", "mv", "quota", "ready", "reconcile", "release", "req", "review", "run", "run-kill", "run-log", "set", "show", "spend", "test-report", "touch", "unlink"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("dispatch names=%v, want=%v", got, want)
 	}

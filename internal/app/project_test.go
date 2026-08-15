@@ -182,3 +182,66 @@ func TestValidateConfigRejectsInvalidLeaseTiming(t *testing.T) {
 		})
 	}
 }
+
+func TestGitConfigPresenceDefaultsAndExplicitFalse(t *testing.T) {
+	base := `{"schema":1,"project":{"slug":"demo","prefixes":["DEMO"]},"lease":{"ttl_seconds":900,"heartbeat_seconds":30}`
+	for _, tc := range []struct {
+		name, suffix string
+		fallback     bool
+		ssh, op      time.Duration
+	}{
+		{name: "block absent", suffix: `}`, fallback: true, ssh: 10 * time.Second, op: 120 * time.Second},
+		{name: "fields absent", suffix: `,"git":{}}`, fallback: true, ssh: 10 * time.Second, op: 120 * time.Second},
+		{name: "explicit false", suffix: `,"git":{"gh_fallback":false,"ssh_connect_timeout_seconds":3,"op_timeout_seconds":9}}`, fallback: false, ssh: 3 * time.Second, op: 9 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config")
+			if err := os.WriteFile(path, []byte(base+tc.suffix), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			config, err := readConfig(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := resolvedGitConfig(config.Git)
+			if got.GhFallback != tc.fallback || got.SSHConnectTimeout != tc.ssh || got.OpTimeout != tc.op {
+				t.Fatalf("resolved=%+v", got)
+			}
+		})
+	}
+}
+
+func TestGitConfigExplicitNonpositiveTimeoutFailsEagerly(t *testing.T) {
+	base := `{"schema":1,"project":{"slug":"demo","prefixes":["DEMO"]},"lease":{"ttl_seconds":900,"heartbeat_seconds":30},"git":`
+	for _, block := range []string{
+		`{"ssh_connect_timeout_seconds":0}}`, `{"ssh_connect_timeout_seconds":-1}}`,
+		`{"op_timeout_seconds":0}}`, `{"op_timeout_seconds":-1}}`,
+	} {
+		path := filepath.Join(t.TempDir(), "config")
+		if err := os.WriteFile(path, []byte(base+block), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readConfig(path); err == nil || !strings.HasPrefix(err.Error(), "E_CONFIG_INVALID:") {
+			t.Fatalf("block=%s error=%v", block, err)
+		}
+	}
+}
+
+func TestOpenBuildsGitOpsFromProjectConfig(t *testing.T) {
+	root := t.TempDir()
+	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	if _, err := Init(context.Background(), root, map[string]any{"project": "demo", "prefixes": "DEMO"}); err != nil {
+		t.Fatal(err)
+	}
+	opened, project, err := Open(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	if project.GitOps == nil {
+		t.Fatal("Open left GitOps nil")
+	}
+}
