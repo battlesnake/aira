@@ -6,7 +6,8 @@
   Task #29.
 - **Depends on:** M12 runner (Launch/scope/lockFile), M16 cgroup-read pattern.
 - **Review:** Sol plan-review r1 → REVISE (0×P0; P1 placement/timer/herd/reader-tests; P2
-  reason/diagnostic-writer/units); this is **v2** (§8 tracks resolutions). Correctness-critical
+  reason/diagnostic-writer/units), r2 → REVISE (P0 blocking-flock liveness; P1 lock-window/release/
+  order; P2 MCP-no-record); this is **v3** (§8 tracks resolutions). Correctness-critical
   (cross-session coordination) → full two-loop.
 
 ## 0. Context — the failure this fixes
@@ -57,9 +58,9 @@ slice control.
 ## 2. Invariants (each → a discriminating test)
 
 - **I1 — never strand / fail-open, loudly.** `run.slice` unset ⇒ `disabled`; configured but
-  unresolvable/unreadable/unbounded/malformed ⇒ `unevaluated` + a set `AdmissionReason`
-  (`slice-not-found|read-error|unbounded|parse-error`) + a diagnostic **warning**; in every such
-  case `Launch` proceeds **immediately** and never fails the run by itself.
+  unresolvable/unreadable/unbounded/malformed/lock-error ⇒ `unevaluated` + a set `AdmissionReason`
+  (`slice-not-found|read-error|unbounded|parse-error|lock-error`) + a diagnostic **warning**; in
+  every such case `Launch` proceeds **immediately** and never fails the run by itself.
 - **I2 — gate holds under pressure, releases on relief, before any side effect.** When `free <
   reserve`, `Launch` creates **no id, no `starting` event, no output dir, no scope**; it polls;
   once `free ≥ reserve` it takes the slice lock, rechecks, and launches (`waited`,
@@ -127,32 +128,50 @@ else:
     cur,max,ok,reason := sliceMemory(path)
     if !ok → Admission=unevaluated,reason; warn(); break        // fail-open
     if max-cur >= reserve:
-        // serialized admission
-        lock := flockMachineWide(canonical(path))               // auto-released on death
-        cur2,max2,ok2,_ := sliceMemory(path)
-        if ok2 && max2-cur2 >= reserve:
-            Admission = (waited? "waited":"immediate"); AdmissionWaitedMS = since(start)
-            // hold `lock` through scope-create + child Start below; release after Start
-            break
-        unlock(lock); // sibling took the headroom → keep waiting
-    if clock.Now().Sub(start) >= AdmissionMaxWait → Admission=timeout; warn(); break
+        lock, err := tryFlockNB(canonical(path))                // LOCK_NB, non-blocking
+        if err != nil → Admission=unevaluated,reason=lock-error; warn(); break   // open/flock error → fail-open loud
+        if lock == nil:                                          // held by a sibling → contend, keep polling
+            // fall through to deadline + sleep
+        else:
+            cur2,max2,ok2,_ := sliceMemory(path)                // serialized recheck under the lock
+            if ok2 && max2-cur2 >= reserve:
+                Admission=(waited?"waited":"immediate"); AdmissionWaitedMS=since(start)
+                admitLock = lock                                // carried OUT of the loop (see lock window)
+                break
+            unlock(lock)                                        // headroom gone under our lock → keep waiting
+    if clock.Now().Sub(start) >= AdmissionMaxWait → Admission=timeout (unlocked); warn(); break
     waited = true; notePeriodically(cur,max)
     clock.sleep(min(pollInterval±jitter, remaining), ctx)        // ctx-cancellable
 ```
 
+- **Non-blocking lock (Sol r2 P0).** The lock is `LOCK_NB` *inside* the deadline/ctx loop — never a
+  blocking `flock` (a live holder stuck in launch-prep must not block siblings past `AdmissionMaxWait`).
+  Contention (`EWOULDBLOCK`, `lock==nil`) is treated like "no headroom yet": keep polling until relief
+  or the deadline. A lock-dir/open/`flock` *error* fails **open loudly** (`unevaluated`, `lock-error`),
+  never a launch failure. At the deadline, proceed **unlocked** with `timeout`.
+- **Lock window + release (Sol r2 P1).** Because id/`starting`/scope come *after* admission, the
+  `admitLock` returned by the gate is held across **all of launch-prep** — id reservation, ledger
+  `starting`, output setup, scope create, pipe/stdin setup, and `Start` — so a sibling's recheck sees
+  this job's child placed in the slice. Release **once, idempotently, immediately after a successful
+  `Start`** and **on every pre-Start error path before it enters `failBeforeLaunch`** (a function-wide
+  `defer unlock` is WRONG — it would hold the admission lock through the child's whole lifetime and the
+  terminal CAS). Implement as a tightly-scoped prep closure with an idempotent `releaseAdmit()`.
+- **Lock-order invariant.** `Kill`/`Reconcile`/terminal arbitration NEVER acquire the admission lock,
+  and it is always released before `failBeforeLaunch`/terminal CAS — so no lock cycle exists (tested).
 - The **flock** file lives in a machine-wide per-user runtime dir (`$XDG_RUNTIME_DIR/aira-admission/`,
-  fallback `~/.cache/aira/admission/`), named `sha256(canonical-slice-path)`. `flock(LOCK_EX)` held
-  via an fd → auto-released if the holder dies (no deadlock). Held only across recheck + scope
-  create + child Start (short); released immediately after Start. This serializes admission
-  *decisions* machine-wide; it cannot reserve a job's future ramp-up (I6b, documented).
-- Jitter on the poll interval avoids synchronized observation; the lock is the actual serializer.
+  fallback `~/.cache/aira/admission/`), named `sha256(canonical-slice-path)`, auto-released on holder
+  death. It serializes admission *decisions* machine-wide but cannot reserve a job's future ramp-up
+  (I6b). Jitter avoids synchronized observation; the lock is the actual serializer.
 
 ### 3.5 Diagnostic writer + faces
 
 - `Config.Diagnostics io.Writer` (or thread the face's raw stderr): admission `warn()`/
   `notePeriodically()` write here, **not** to `LiveStderr` (suppressed under `--json`/merge). CLI
-  passes `os.Stderr`; MCP passes a writer that buffers into the response's diagnostics (or nil →
-  notes are dropped but the recorded `Admission`/reason survive). Never a hang with no signal.
+  passes `os.Stderr`; MCP passes nil (notes dropped). Diagnostics writer **errors are ignored** and
+  writes are best-effort; note a blocking custom writer could itself block Launch (CLI `os.Stderr`
+  does not). **MCP cancellation during the wait creates NO run** — admission is pre-id, so a cancelled
+  wait leaves no id/ledger/scope; the tool call returns cancellation (Sol r2 P2: not "the record
+  survives"). The recorded `Admission`/reason exist only on runs that actually launch.
 - `Request.NoAdmit bool`; `RunRecord.Admission`/`AdmissionReason string` + `AdmissionWaitedMS int64`
   (persist in ledger). `--no-admit` on CLI/MCP `run`.
 
@@ -170,6 +189,18 @@ Gate-loop (fake `Clock` + `sliceMemoryFn` seams):
   for one, assert they do **not** both admit under the lock simultaneously (serialized recheck; the
   second sees the first's effect / waits). *Fails a no-lock impl.*
 - **T6 (--no-admit)** — configured + under pressure + `--no-admit` → `bypassed`, immediate.
+- **T7 (r2 P0 — live lock holder past deadline)** — one Launch holds the real flock (stuck in a
+  fake-slow prep); a second Launch, under pressure with a short `AdmissionMaxWait`, **times out and
+  proceeds unlocked** (never blocks on the held lock). *Fails a blocking-flock impl.*
+- **T8 (r2 — ctx cancel during lock contention)** — permanent contention + ctx cancel → no id/ledger/
+  scope, cancelled.
+- **T9 (r2 — lock-dir/open/flock failure)** — force the lock dir unwritable → `unevaluated`,
+  `lock-error`, loud, **launch proceeds** (not a launch failure).
+- **T10 (r2 — every pre-Start failure releases the lock)** — inject a scope-create/Start failure on an
+  admitted (locked) run → the admission lock is released (a subsequent Launch can acquire it), and the
+  run fails via the normal `failBeforeLaunch` path (no lock held into terminal arbitration).
+- **T11 (r2 — lock-order)** — concurrent Launch/Kill/Reconcile on the same run/slice → no deadlock
+  (Kill/Reconcile never take the admission lock).
 
 Reader/resolver **table tests** (real temp files — not the seam): `memory.current`/`max` present →
 values; `max`=`"max"` → unbounded; missing/permission → read-error; empty/`-1`/non-numeric/overflow
@@ -214,7 +245,20 @@ admission state; `runner.New` default max-wait honoured.
 - **Daemon cross-session fairness queue** — ordered admission when RAM frees; needs the supervisor.
 - Per-run `memory.max` caps (rides the `+memory` enablement).
 
-## 8. Sol plan-review r1 resolutions
+## 8. Sol plan-review resolutions
+
+### r2
+- **P0 blocking-flock liveness** → §3.4: `LOCK_NB` inside the deadline/ctx loop; contention keeps
+  polling; deadline → proceed unlocked (`timeout`); lock open/`flock` error → fail-open loud
+  (`lock-error`). No blocking `flock`. T7/T8/T9.
+- **P1 lock window/release/order** → §3.4: the `admitLock` is held across ALL of launch-prep
+  (id→`starting`→scope→Start), released once idempotently after `Start` and before any pre-Start
+  error/`failBeforeLaunch`; never a function-wide defer; Kill/Reconcile never take it (lock-order).
+  T10/T11.
+- **P2 MCP no-record + diagnostics** → §3.5: MCP cancel during the wait creates no run (pre-id);
+  diagnostics writes best-effort, errors ignored, blocking-writer caveat noted.
+
+### r1 resolutions
 
 - **P1 gate placement** → §3.3: all side-effect-free validation + `EffectiveArgv` + `backend.Probe`
   run BEFORE the gate (fail-fast); the gate is before id/`starting`/scope; `starting` stays after
