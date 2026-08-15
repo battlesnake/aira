@@ -370,17 +370,20 @@ func (c *Client) Run(parent context.Context, request Request) (*Result, error) {
 		}
 	}
 	if ep.Scheme == "https" {
-		if ep.Host == "github.com" && !ep.HasUserinfo {
-			if err := c.requireGH(ctx); err != nil {
-				return nil, err
-			}
+		// A native github.com HTTPS op does not REQUIRE gh: a public repo works
+		// anonymously. Use the gh helper OPPORTUNISTICALLY — inject it when gh can serve a
+		// credential, otherwise run anonymously and let a private repo fail honestly with an
+		// auth error. Never fail a valid public op just because gh is absent.
+		useHelper := false
+		if ep.Host == "github.com" && !ep.HasUserinfo && c.requireGH(ctx) == nil {
+			useHelper = true
 			result.Auth = "https-gh"
 		}
 		opEndpoint := ep
 		if request.Verb == "clone" {
 			opEndpoint.Raw = request.URL
 		}
-		op := c.nativeOp(ctx, request, opEndpoint, ep.Host == "github.com" && !ep.HasUserinfo)
+		op := c.nativeOp(ctx, request, opEndpoint, useHelper)
 		return finish(result, op, false, ep)
 	}
 
@@ -549,10 +552,11 @@ func (c *Client) resolve(ctx context.Context, req Request) (endpoint, []rewriteR
 	if err != nil {
 		return endpoint{}, nil, err
 	}
-	effective := raw
-	if !explicitPushURL {
-		effective = applyRewrite(raw, rules, req.Verb == "push")
-	}
+	// Apply git's URL rewriting exactly once. pushInsteadOf is honoured only for a push
+	// that uses remote.<name>.url — git ignores pushInsteadOf when an explicit pushurl is
+	// set — but ordinary insteadOf STILL applies to an explicit pushurl, so we must not
+	// skip rewriting entirely.
+	effective := applyRewrite(raw, rules, req.Verb == "push" && !explicitPushURL)
 	ep, err := parseEndpoint(effective)
 	if err != nil {
 		return endpoint{}, nil, err
@@ -720,16 +724,21 @@ func hasPassword(output string) bool {
 
 func (c *Client) fallback(ctx context.Context, req Request, ep endpoint, rules []rewriteRule, result *Result) (*Result, error) {
 	canonical := canonicalHTTPS(ep)
+	// All deterministic fallback validation runs BEFORE gh credential access (Sol build
+	// review): rewrite-safety, remote-config allow-list, synthetic-name, and the
+	// explicit-refspec requirement. The transport fields on `result` are set only once
+	// everything has passed, immediately before launching the fallback child, so a
+	// FALLBACK_BLOCKED can never leave a "https-gh" transport claim on a run that never ran.
 	for _, rule := range rules {
 		if rule.Prefix != "" && strings.HasPrefix(canonical, rule.Prefix) {
 			return nil, opError(CodeFallbackBlocked, "fallback URL would be rewritten by "+rule.Key, map[string]any{"reason": "insteadof-rewrite", "rule": rule.Key, "prefix": rule.Prefix})
 		}
 	}
-	if err := c.requireGH(ctx); err != nil {
-		return nil, err
-	}
-	result.Auth, result.URL, result.Host, result.FellBack = "https-gh", canonical, "github.com", true
 	if req.Verb == "clone" {
+		if err := c.requireGH(ctx); err != nil {
+			return nil, err
+		}
+		result.Auth, result.URL, result.Host, result.FellBack = "https-gh", canonical, "github.com", true
 		fallbackEP := endpoint{Raw: canonical, Redacted: canonical, Scheme: "https", Host: "github.com"}
 		op := c.nativeOp(ctx, req, fallbackEP, true)
 		return finish(result, op, true, fallbackEP)
@@ -738,19 +747,23 @@ func (c *Client) fallback(ctx context.Context, req Request, ep endpoint, rules [
 	if err != nil {
 		return nil, err
 	}
+	if req.Verb == "push" && len(req.Refspecs) == 0 && !hasSetting(settings, "push") {
+		return nil, opError(CodeFallbackBlocked, "fallback push requires an explicit refspec; use HEAD:<branch>", map[string]any{"reason": "explicit-refspec-required"})
+	}
 	synthetic, err := c.syntheticName(ctx)
 	if err != nil {
 		return nil, err
 	}
+	if err := c.requireGH(ctx); err != nil {
+		return nil, err
+	}
+	result.Auth, result.URL, result.Host, result.FellBack = "https-gh", canonical, "github.com", true
 	args := []string{"-c", "remote." + synthetic + ".url=" + canonical}
 	for _, setting := range settings {
 		if setting.key == "push" && len(req.Refspecs) > 0 {
 			continue
 		}
 		args = append(args, "-c", "remote."+synthetic+"."+setting.key+"="+setting.value)
-	}
-	if req.Verb == "push" && len(req.Refspecs) == 0 && !hasSetting(settings, "push") {
-		return nil, opError(CodeFallbackBlocked, "fallback push requires an explicit refspec; use HEAD:<branch>", map[string]any{"reason": "explicit-refspec-required"})
 	}
 	args = append(args, "-c", "credential.helper=", "-c", "credential.helper="+credentialHelper, req.Verb, "--", synthetic)
 	args = append(args, req.Refspecs...)
@@ -882,14 +895,19 @@ func scrubEnv(env []string, rewrite bool) []string {
 }
 
 var (
-	// Redact only userinfo that carries a credential (user:secret@). A bare ssh
-	// username (git@host, no colon) is part of the honest URL and must be preserved.
-	urlUserinfoPattern = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://)[^/@\s]*:[^/@\s]*@`)
-	tokenPattern       = regexp.MustCompile(`(?i)(github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|Bearer[ \t]+[A-Za-z0-9._~+/=-]+|password=[^\s]+)`)
+	// HTTPS userinfo is a potential credential (bare token or user:token) → redact ALL
+	// of it. For other schemes (ssh) redact only credential-bearing userinfo (user:secret@)
+	// so a bare ssh username (ssh://git@host) stays in the honest URL.
+	httpsUserinfoPattern = regexp.MustCompile(`(?i)(https?://)[^/@\s]+@`)
+	otherUserinfoPattern = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://)[^/@\s]*:[^/@\s]*@`)
+	tokenPattern         = regexp.MustCompile(`(?i)(github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|Bearer[ \t]+[A-Za-z0-9._~+/=-]+|password=[^\s]+)`)
 )
 
-func redactURL(value string) string { return urlUserinfoPattern.ReplaceAllString(value, `${1}***@`) }
-func redact(value string) string    { return tokenPattern.ReplaceAllString(redactURL(value), "***") }
+func redactURL(value string) string {
+	value = httpsUserinfoPattern.ReplaceAllString(value, `${1}***@`)
+	return otherUserinfoPattern.ReplaceAllString(value, `${1}***@`)
+}
+func redact(value string) string { return tokenPattern.ReplaceAllString(redactURL(value), "***") }
 
 func redactDetails(details map[string]any) map[string]any {
 	if details == nil {

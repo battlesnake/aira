@@ -161,6 +161,8 @@ type fakeExec struct {
 	pushURL            string
 	pushAll            string
 	rules              string
+	rulesResult        *runResult
+	urlResult          *runResult
 	remoteConfig       string
 	remoteConfigResult *runResult
 	remotes            string
@@ -204,8 +206,14 @@ func (f *fakeExec) run(_ context.Context, req runRequest) runResult {
 			}
 			return runResult{Stdout: f.pushURL + "\x00"}
 		}
+		if f.urlResult != nil {
+			return *f.urlResult
+		}
 		return runResult{Stdout: f.rawURL + "\x00"}
 	case req.Name == "git" && strings.Contains(joined, "^url\\..*"):
+		if f.rulesResult != nil {
+			return *f.rulesResult
+		}
 		if f.rules == "" {
 			return runResult{ExitCode: 1}
 		}
@@ -304,6 +312,88 @@ func TestHTTPSApplicationAuthFailureHasAuthCode(t *testing.T) {
 	}
 }
 
+// verifies: a native github.com HTTPS op does NOT require gh — a public repo runs
+// anonymously when gh is absent, never a false E_GIT_GH_UNAVAILABLE.
+func TestNativeGitHubHTTPSRunsAnonymouslyWhenGHAbsent(t *testing.T) {
+	fake := goodFake("https://github.com/owner/repo.git")
+	fake.ghStatus = runResult{ExitCode: 1} // gh not authenticated / absent
+	client := newWithRun(Config{GhFallback: true, OpTimeout: time.Second}, fake.run)
+	result, err := client.Run(context.Background(), Request{Verb: "fetch"})
+	if err != nil || result.Auth != "https" || fake.opCalls != 1 {
+		t.Fatalf("public op should run anonymously: result=%+v error=%v opCalls=%d", result, err, fake.opCalls)
+	}
+	for _, call := range fake.calls {
+		if contains(call.Args, "credential.helper=") {
+			t.Fatalf("gh helper injected despite gh being unavailable: %#v", call.Args)
+		}
+	}
+}
+
+// verifies: a bare (colon-free) HTTPS userinfo credential is redacted from surfaced fields;
+// the redaction must not depend on a colon or a token-shape heuristic.
+func TestBareHTTPSUserinfoIsRedacted(t *testing.T) {
+	fake := goodFake("https://plaincredential@github.com/owner/repo.git")
+	client := newWithRun(Config{GhFallback: true, OpTimeout: time.Second}, fake.run)
+	result, err := client.Run(context.Background(), Request{Verb: "fetch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Auth != "https" || strings.Contains(result.URL, "plaincredential") {
+		t.Fatalf("bare userinfo leaked in reported URL: %q", result.URL)
+	}
+}
+
+// verifies: an explicit pushurl ignores pushInsteadOf (git's rule) but ORDINARY insteadOf
+// still applies — probe/report must use the insteadOf-rewritten endpoint, not the raw pushurl.
+func TestExplicitPushURLStillHonoursOrdinaryInsteadOf(t *testing.T) {
+	fake := goodFake("git@github.com:owner/fetch.git")
+	fake.pushURL = "git@rewrite-me.example:owner/push.git"
+	fake.pushAll = fake.pushURL + "\n"
+	fake.rules = "url.ssh://git@moved.example/.insteadof\ngit@rewrite-me.example:\x00"
+	client := newWithRun(Config{GhFallback: true, OpTimeout: time.Second}, fake.run)
+	result, err := client.Run(context.Background(), Request{Verb: "push", Refspecs: []string{"HEAD:main"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Host != "moved.example" || !strings.HasPrefix(result.URL, "ssh://git@moved.example/") {
+		t.Fatalf("ordinary insteadOf was not applied to the explicit pushurl: %+v", result)
+	}
+	for _, call := range fake.calls {
+		if contains(call.Args, "--heads") && !contains(call.Args, "ssh://git@moved.example/owner/push.git") {
+			t.Fatalf("probe did not use the insteadOf-rewritten pushurl: %#v", call.Args)
+		}
+	}
+}
+
+// verifies: URL/rewrite resolution failures fail CLOSED (never silently "no rewrites" / "no url"),
+// so an unseen rule cannot redirect the committed op. The op must never run.
+func TestResolutionConfigErrorsFailClosed(t *testing.T) {
+	t.Run("rewrite enumeration error", func(t *testing.T) {
+		fake := goodFake("git@github.com:owner/repo.git")
+		fake.rulesResult = &runResult{ExitCode: 2, Stderr: "fatal: bad config"}
+		client := newWithRun(Config{GhFallback: true, OpTimeout: time.Second}, fake.run)
+		if _, err := client.Run(context.Background(), Request{Verb: "fetch"}); err == nil || fake.opCalls != 0 {
+			t.Fatalf("error=%v opCalls=%d (must fail closed, op never runs)", err, fake.opCalls)
+		}
+	})
+	t.Run("rewrite enumeration truncated", func(t *testing.T) {
+		fake := goodFake("git@github.com:owner/repo.git")
+		fake.rulesResult = &runResult{Stdout: "url.x.insteadof\ny", StdoutTruncated: true}
+		client := newWithRun(Config{GhFallback: true, OpTimeout: time.Second}, fake.run)
+		if _, err := client.Run(context.Background(), Request{Verb: "fetch"}); err == nil || fake.opCalls != 0 {
+			t.Fatalf("error=%v opCalls=%d (truncation must fail closed)", err, fake.opCalls)
+		}
+	})
+	t.Run("url read error", func(t *testing.T) {
+		fake := goodFake("")
+		fake.urlResult = &runResult{ExitCode: 2, Stderr: "fatal: bad config"}
+		client := newWithRun(Config{GhFallback: true, OpTimeout: time.Second}, fake.run)
+		if _, err := client.Run(context.Background(), Request{Verb: "fetch", Remote: "origin"}); err == nil || fake.opCalls != 0 {
+			t.Fatalf("error=%v opCalls=%d (url read error must fail closed)", err, fake.opCalls)
+		}
+	})
+}
+
 // verifies: fallback targets a fresh one-URL synthetic remote and copies only known semantics.
 func TestSyntheticRemoteFallbackArgvAndAllowList(t *testing.T) {
 	fake := goodFake("git@github.com:owner/repo.git")
@@ -315,6 +405,7 @@ func TestSyntheticRemoteFallbackArgvAndAllowList(t *testing.T) {
 		"remote.origin.fetch\n+refs/pull/*:refs/remotes/origin/pr/*",
 		"remote.origin.tagOpt\n--no-tags",
 		"remote.origin.prune\ntrue",
+		"remote.origin.pushurl\ngit@github.com:owner/repo.git",
 	}, "\x00") + "\x00"
 	client := newWithRun(Config{GhFallback: true, OpTimeout: time.Second}, fake.run)
 	result, err := client.Run(context.Background(), Request{Verb: "fetch", Remote: "origin"})
@@ -344,6 +435,11 @@ func TestSyntheticRemoteFallbackArgvAndAllowList(t *testing.T) {
 	}
 	if strings.Count(joined, "remote.aira-fallback.url=") != 1 || strings.Contains(joined, "remote.origin.url=") || contains(op.Args, "https://github.com/owner/repo.git") {
 		t.Fatalf("fallback did not use exactly one synthetic URL: %#v", op.Args)
+	}
+	// url and pushurl are recognised for validation but must NEVER be copied onto the
+	// synthetic remote (else the synthetic remote gains a second/original destination).
+	if strings.Contains(joined, "remote.aira-fallback.pushurl=") || strings.Contains(joined, "remote.aira-fallback.url=git@") {
+		t.Fatalf("fallback copied url/pushurl onto the synthetic remote: %#v", op.Args)
 	}
 }
 
