@@ -1,12 +1,21 @@
 # M20 — Detached-run supervisor shim (`aira run --detach`)
 
-Status: PLAN v4 (post Sol rounds 1–3). Phase 5. Resolves the design-authority
+Status: PLAN v5 (post Sol rounds 1–4). Phase 5. Resolves the design-authority
 "decide shim-vs-daemon first" open question (§21) and delivers `--detach`
 (§14 line 153).
 
 Design authority: [`2026-08-07-aira-design.md`](2026-08-07-aira-design.md) §5.2,
 §14, §20/§21. Builds on the foreground runner (M12/M16/M17/M18a/M18b/M19), the
 run-kill ownership guard (#27), and the memory-admission gate (#29).
+
+**v5 changelog (Sol round 4):** leader-exit evidence is **write-once** — a later
+`LeaderExitObserved` re-claim cannot overwrite an exact exit; a conflicting payload
+is diagnosed (`U_RUN_EXIT_CONFLICT`), not silently overwritten (P0). The shared
+`finalizeDetachedTerminal` derives the terminal from a **fresh re-read under the
+flock**, not a caller-supplied stale record (P1). `quiesce-forced` records the
+forced-quiesce *initiated* fact (the `CleanSuccess=false` anchor); the integrity
+asserts `ScopeDescendantKilled` **only when positively supportable**, else
+force-attempted/unevaluated — no over-claiming a kill (P1).
 
 **v4 changelog (Sol round 3):** a durable **`quiesce-forced`** event is written
 **before** the forced `cgroup.kill`, so no finalization race can lose the forced
@@ -207,29 +216,38 @@ robust: a stalled shim cannot backpressure/SIGPIPE the child.
     (below) → `exited N` (or `killed` if a `KillIntent` completed),
     `ScopeContained`.
   - Quiesce times out with descendants still present → **the shim durably appends
-    a `quiesce-forced` event BEFORE issuing `cgroup.kill`** (Sol P0-1 r3), then
-    kills and re-waits. Because the forced-quiesce fact is durable *before* the
-    scope can empty, **any** finalizer (shim or a racing Reconcile) incorporates
-    it: the outcome is `ScopeIntegrity = ScopeDescendantKilled` +
-    `U_RUN_QUIESCE_FORCED`, leader exit preserved as **evidence** —
-    `CleanSuccess()` is **false**. We never report a clean `exited` when we
-    force-killed surviving workload (P0-3), and never *lose* the forced fact to a
-    finalization race.
+    a `quiesce-forced` (forced-quiesce *initiated*) event BEFORE issuing
+    `cgroup.kill`** (Sol P0-1 r3), then kills and re-waits. Because that fact is
+    durable *before* the scope can empty, **any** finalizer (shim or a racing
+    Reconcile) sees it: `U_RUN_QUIESCE_FORCED` is set and `CleanSuccess()` is
+    **false** — we never report a clean `exited` when we intervened, and never
+    *lose* the forced fact to a race. **The integrity classification is honest
+    about what was proven** (Sol P1 r4): `ScopeIntegrity = ScopeDescendantKilled`
+    only when a descendant was **positively observed present** and the kill took
+    effect; if the `cgroup.kill` syscall failed, or the descendants exited on
+    their own before it took effect (unprovable which), the integrity stays
+    honest/`unevaluated` and the outcome is "force-attempted" — still
+    `U_RUN_QUIESCE_FORCED`, still `CleanSuccess()==false`, but no over-claim of a
+    kill that may not have caused the emptiness. Leader exit is preserved as
+    evidence throughout.
   - Scope **never** empties (a D-state uninterruptible descendant, #20 family) →
     the run stays **non-terminal** with the durable evidence + `OutputPartial` +
     `U_RUN_CAPTURE_INCOMPLETE`; it remains **killable** and a later Reconcile
     finalises from the evidence once the scope empties. Never a terminal `exited`
     over live descendants.
-- **One shared finalizer** (Sol P0-2 r3): `finalizeDetachedTerminal(record, scope,
-  evidence)` — used by **both** the shim (post-quiesce) and Reconcile (evidence +
-  empty scope) — re-checks scope-empty under the per-run flock, snapshots cgroup
-  usage (readable until the empty cgroup is removed), stats + `digestFile`s the
-  capture files → `OutputComplete`, folds the `quiesce-forced` fact, builds the
-  terminal from the evidence, and only then `appendTerminalLocked` + removes the
-  empty scope. Whoever wins the CAS produces an **identical, complete** terminal
-  — no usage/digest is discarded by a Reconcile that beats the shim. (A
-  re-population between the empty-check and the CAS is closed by re-checking empty
-  under the same held flock immediately before the CAS.)
+- **One shared finalizer** (Sol P0-2 r3): `finalizeDetachedTerminal(id, scope)` —
+  used by **both** the shim (post-quiesce) and Reconcile (evidence + empty scope).
+  It **acquires the per-run flock, then RE-READS the authoritative record**
+  (`ledger.current`) and derives the terminal candidate **exclusively from that
+  reread plus freshly collected evidence** — never from a caller-supplied stale
+  snapshot (Sol P1 r4), so a kill-intent or `quiesce-forced` fact recorded
+  meanwhile is always reflected. It re-checks scope-empty under the held flock
+  immediately before the CAS (closing a re-population race), snapshots cgroup usage
+  (readable until the empty cgroup is removed), stats + `digestFile`s the capture
+  files → `OutputComplete`, classifies status/integrity from the reread
+  (exited/killed/forced-quiesce), then `appendTerminalLocked` + removes the empty
+  scope. Whoever wins the CAS produces an **identical, complete** terminal — no
+  usage/digest discarded by a Reconcile that beats the shim.
 - Byte cap: "complete up to the disk-eviction cap"; §19 head+tail elision applies
   at **read** time (`run-log`). Eviction/truncation → `evicted`/`unavailable`
   (`U_RUN_OUTPUT_UNAVAILABLE`), never fake `complete`. Hard mid-run cap → §9 D2.
@@ -264,12 +282,18 @@ this is a safety net, not a common path).
 
 Two new durable, **non-terminal** ledger event kinds:
 - **`leader-exited`** — the authoritative exit fact, written immediately after
-  `waitpid`, **before** quiesce/terminal: `LeaderExitObserved bool` (a **monotonic**
-  presence flag) + presence-bearing `ExitCode *int` + `Signal string`. It lets
-  either the shim (post-quiesce) or Reconcile (if the shim dies/wedges) finalise
-  with the **real** exit rather than `U_RUN_EXIT_UNKNOWN`.
-- **`quiesce-forced`** — written *before* a forced `cgroup.kill` (§3), so the
-  forced-quiesce outcome cannot be lost to a finalization race.
+  `waitpid`, **before** quiesce/terminal: `LeaderExitObserved bool` (a **monotonic
+  write-once** presence flag) + presence-bearing `ExitCode *int` + `Signal string`.
+  `waitpid` returns exactly once, so this is **write-once**: the first observation
+  must carry a valid payload (a non-nil `ExitCode` **or** a non-empty `Signal`);
+  thereafter it is preserved. It lets either the shim (post-quiesce) or Reconcile
+  (if the shim dies/wedges) finalise with the **real** exit rather than
+  `U_RUN_EXIT_UNKNOWN`.
+- **`quiesce-forced`** — records that a forced quiesce was **initiated** (written
+  *before* the `cgroup.kill` syscall, §3), the durable `CleanSuccess()==false`
+  anchor that no finalization race can lose. It does **not** by itself assert a
+  descendant was killed (Sol P1 r4) — the *result* (`ScopeDescendantKilled` vs
+  merely force-attempted) is separate evidence, §3.
 
 New terminal status `cancelled` (`Status.Terminal()==true`): the launch handshake
 was abandoned before any child started (§2.1); asserts **no child ran**.
@@ -277,10 +301,15 @@ was abandoned before any child started (§2.1); asserts **no child ran**.
 `mergeEvidence` carries `Detached`, `SupervisorPID`, and — critically — the
 leader-exit evidence **on the monotonic `LeaderExitObserved` flag, not on a
 non-zero exit** (Sol P0-3 r3 — the recurring field-loss trap: a clean `exit 0`
-would otherwise collapse to "no exit observed" and mislabel `lost`). When
-`candidate.LeaderExitObserved`, `base` takes `LeaderExitObserved=true` and the
-presence-bearing `ExitCode`/`Signal`. A replay + both-terminalizer test asserts
-`exit 0` survives. `Request` gains `Detach bool`. New config
+would otherwise collapse to "no exit observed" and mislabel `lost`). The carry is
+**write-once** (Sol P0-4 r4): `if candidate.LeaderExitObserved &&
+!base.LeaderExitObserved { base.LeaderExitObserved = true; base.ExitCode =
+candidate.ExitCode; base.Signal = candidate.Signal }`. A later candidate that
+re-claims `LeaderExitObserved` never overwrites an already-recorded exit; a
+*conflicting* second payload (a corruption/bug, since `waitpid` fires once) is
+diagnosed with `U_RUN_EXIT_CONFLICT`, not silently overwritten. A replay +
+both-terminalizer test asserts `exit 0` survives and a nil-payload re-claim cannot
+erase it. `Request` gains `Detach bool`. New config
 `run.detach_ready_timeout` (§2.1).
 
 ---
@@ -523,5 +552,7 @@ ran), `U_RUN_QUIESCE_FORCED` (surviving descendants force-killed after leader
 exit), `U_RUN_CAPTURE_INCOMPLETE` (dup2-direct capture could not quiesce),
 `U_RUN_SUPERVISOR_STALLED` (alive supervisor, empty scope, no exit evidence),
 `U_RUN_LAUNCH_STALLED` (bounded per-run flock acquisition timed out — a launch may
-be stuck; never a false kill/terminal). All other failures reuse the existing
+be stuck; never a false kill/terminal), `U_RUN_EXIT_CONFLICT` (a second
+`leader-exited` observation conflicts with the write-once exit — corruption
+diagnostic, first observation preserved). All other failures reuse the existing
 `E_RUN_*`/`U_RUN_*` taxonomy via the relay.
