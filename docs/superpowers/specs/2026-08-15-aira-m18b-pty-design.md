@@ -1,6 +1,6 @@
 # AIRA M18b — `--pty` buffering tactic (real-TTY capture)
 
-Status: PLAN (v1, for Sol adversarial plan-review)
+Status: PLAN (v2 — Sol plan-review r1 fixes: TIOCGPTPEER+CLOEXEC slave, kill-members-before-drain-join + bounded, record pty post-Start, pty-code only for parent-side setup, /dev/tty bounded-not-prevented, errors.Is(EIO))
 Date: 2026-08-15
 Milestone: #28 — Phase 5 · M18b — `--pty` buffering tactic (pty capture)
 Depends on: M12 capture, M17 live-tee, M18a `buffering` field (all landed, master `d08a102`)
@@ -43,21 +43,31 @@ setup, stdin no-deadlock, termios output processing) and gets its own two-loop.
 
 ## 2. Invariants (each → a discriminating test)
 
-- **I1 — pty capture is byte-faithful to the defined stream.** The pts is output-raw
-  (`OPOST` cleared) at allocation, so a child writing `line\n` yields `line\n` in `RUN-n.log`
-  (not `line\r\n`). The digest is over exactly the drained master bytes. A test writes a known
-  payload incl. bare `\n` and asserts the captured bytes + digest are `\r`-free.
-- **I2 — the child is genuinely on a controlling TTY.** A probe child asserts `isatty(1) &&
-  isatty(2)`, `tcgetpgrp(1)==getpgrp()` (it owns the TTY foreground group), and `/dev/tty`
-  opens. Containment (cgroup membership) alone proves nothing about TTY correctness.
-- **I3 — honest, fail-CLOSED setup.** `buffering=pty` is recorded **only after** allocation +
-  `Setsid`+`Setctty` succeed and `Start` returns. Any failure (openpt/grant/unlock/ptsname,
-  a wrong `Ctty` index, `Start` error) → the run **fails** `E_RUN_PTY_UNAVAILABLE`; there is
-  **no silent downgrade** to pipes that still records `pty` or `none`.
-- **I4 — no stdin deadlock.** `cmd.Stdin` is **never** the pts (default `/dev/null`, or the
-  existing `--stdin`). A child that reads stdin to EOF (e.g. `cat`) exits promptly; the master
-  is only ever read, never written. Regression test: a no-stdin `--pty` run of a stdin-reading
-  child terminates within the deadline.
+- **I1 — the runner performs no output translation of its own.** The pts is initialised
+  output-raw (`OPOST` cleared) at allocation, so a child writing `line\n` yields `line\n` in
+  `RUN-n.log` (not `line\r\n`) *for the runner's part*; the captured bytes are whatever the pts
+  line discipline produces (which a child may alter via its own termios calls — we do **not**
+  claim captured bytes equal the child's pre-line-discipline writes). The digest is over exactly
+  the drained master bytes. A test writes a known payload incl. bare `\n` (child does not touch
+  termios) and asserts the captured bytes + digest are `\r`-free.
+- **I2 — a successful `Start` establishes the controlling TTY by construction.** With
+  `Setsid=true` + `Setctty=true` (`Ctty=1`), a `Start` that returns nil means the kernel put the
+  child in a new session and made the pts its controlling terminal — so `isatty(1)&&isatty(2)`
+  and foreground-group ownership hold **by construction** (a `Setctty` failure makes `Start`
+  fail). The runner does **not** re-verify at runtime; the real-cgroup integration test asserts
+  `isatty(1&2)`, `tcgetpgrp(1)==getpgrp()`, `/dev/tty` opens — as a *test*, not a runtime claim.
+  Containment (cgroup membership) alone proves nothing about TTY correctness.
+- **I3 — honest, fail-CLOSED setup.** `buffering=pty` is recorded **only after `Start`
+  succeeds** (§3.4). A parent-side pty setup failure (alloc/termios) → the run **fails**
+  `E_RUN_PTY_UNAVAILABLE`; a `Start`-phase failure keeps its existing launch/scope code (§4);
+  there is **no silent downgrade** to pipes that still records `pty` or `none`.
+- **I4 — no fd-0 stdin deadlock; `/dev/tty` reads are bounded, not prevented.** `cmd.Stdin` is
+  **never** the pts (default `/dev/null`, or the existing `--stdin`), so a child reading stdin
+  to EOF (e.g. `cat`) exits promptly (regression test). A child that **opens `/dev/tty`
+  directly** and reads will block (AIRA never writes the master) — TTY input is D1/unsupported in
+  v1; such a read is **bounded by the run timeout + `run-kill`** (the child is scoped and
+  killable), never an unkillable hang. We do not claim to prevent a `/dev/tty` block, only to
+  bound it.
 - **I5 — EIO=EOF drain is complete and leak-free.** Ordering: `Start` → **close the parent's
   copy of the pts (slave)** → drain the master. The drain processes `n>0` **even when**
   `readErr == EIO`, maps **only** `EIO` → clean EOF/`CaptureComplete`, keeps the master open
@@ -76,17 +86,28 @@ setup, stdin no-deadlock, termios output processing) and gets its own two-loop.
 A new `internal/runner/pty_linux.go` (build-tagged `linux`) exposes `allocatePTY() (master,
 slave *os.File, err error)`:
 1. `ptmx := unix.Open("/dev/ptmx", O_RDWR|O_NOCTTY|O_CLOEXEC, 0)` → master.
-2. `unix.IoctlSetPointerInt(ptmx, TIOCSPTLCK, 0)` (unlockpt) and grant (Linux devpts needs no
-   grantpt helper binary; `unix.IoctlGetInt(ptmx, TIOCGPTN)` gives the pts number `N`).
-3. Open `/dev/pts/N` with `O_RDWR|O_NOCTTY` → slave (pts).
-4. Put the **pts** in output-raw: `t, _ := unix.IoctlGetTermios(pts, TCGETS)`; clear `OPOST`
-   (and leave input flags alone — we never write the master); `IoctlSetTermios(pts, TCSETS, t)`.
-   (We clear only `OPOST` — the minimal change that removes `ONLCR` while keeping the TTY
-   otherwise standard so `isatty`/line-buffering hold; §7 termios decision = byte-faithful.)
-5. Wrap both fds in `*os.File` (so Go manages lifetime); master is `O_CLOEXEC` (never inherited
-   by the child), the pts is intentionally inherited as the child's stdout/stderr.
+2. `unix.IoctlSetPointerInt(ptmx, TIOCSPTLCK, 0)` (unlockpt).
+3. **Obtain the slave via `TIOCGPTPEER` (Sol r1 P2), not a path** — `slaveFD, err :=
+   unix.IoctlRetInt(ptmx, TIOCGPTPEER)` with `O_RDWR|O_NOCTTY|O_CLOEXEC` on the returned fd.
+   `TIOCGPTPEER` (Linux 4.13+) returns the peer of *this* master atomically and race-free (no
+   assumption that `/dev/ptmx` and `/dev/pts` reference the same devpts instance). If
+   `TIOCGPTPEER` is unavailable (`ENOTTY`/old kernel), fall back to opening `/dev/pts/<N>`
+   (`TIOCGPTN`) with `O_RDWR|O_NOCTTY|O_CLOEXEC` **and validate** it (`fstat` same rdev / it is a
+   tty) before use.
+4. **The slave is `O_CLOEXEC`** so the parent's original slave fd is *not* inherited by the
+   child (only Go's dup'd fd 1/2 are); this is load-bearing for the EIO drain (§3.3, Sol r1 P0).
+5. Put the **pts** in output-raw: `t, _ := unix.IoctlGetTermios(pts, TCGETS)`; clear `OPOST`
+   (leave input flags — we never write the master); `IoctlSetTermios(pts, TCSETS, t)`. Clearing
+   only `OPOST` removes the runner-induced `ONLCR` (`\n`→`\r\n`) while keeping `isatty`/line-
+   buffering; the runner performs **no translation of its own** (I1 — it does not claim the
+   child cannot re-enable `ONLCR` via its own termios calls).
+6. Wrap both fds in `*os.File`; the master is `O_CLOEXEC` (never inherited), the pts is passed as
+   the child's stdout/stderr (Go dups it to fd 1/2; the parent's original pts *os.File is closed
+   right after `Start`).
 
 Every step fails closed → `E_RUN_PTY_UNAVAILABLE` (with the failing syscall in the payload).
+Allocation + termios run in the **parent, before `Start`**, so these failures are cleanly
+attributable to pty-unavailability (§4).
 
 ### 3.2 Launch wiring
 
@@ -101,45 +122,68 @@ of pipes and returns the master as the single "log" reader and the pts as the si
   of scope here.) `UseCgroupFD`/`CgroupFD` stay set; `Setsid`+`Setctty`+`UseCgroupFD` compose.
 - The pty path forces `Merge=true` in the record and opens a single `RUN-n.log`.
 
-**Ordering (I5):** exactly as the pipe path plus the slave close — after `Start`:
-`for w := range writers { w.Close() }` already closes the parent's pts copy (the pts is the
-"writer"); the master ("reader") is drained by the M17 tee/capture loop; the master is closed
-only after drain completion. The child holds its own dup of the pts (fd 1/2); when it exits,
-the last slave reference is the kernel's and the master read returns `EIO`.
+**Ordering (I5, revised for Sol r1 P0):** the master reaches `EIO` only once **every** slave
+reference is closed — including any held by a **descendant** that inherited fd 1/2 (or reopened
+`/dev/tty`). So the terminal sequence is:
+1. `Start` succeeds → record `Buffering="pty"` (§3.4).
+2. after the leader is waited, the parent closes its original pts `*os.File` (the `O_CLOEXEC`
+   slave means it was never inherited beyond Go's dup'd child fds).
+3. **kill + reap the remaining scope members** before joining the master drain — the child is
+   `clone3`'d into the scope, so the existing terminal path can enumerate + `killScope` any
+   descendant still holding a slave fd; once they die the last slave ref closes and the master
+   `EIO`s.
+4. the M17 decoupled drain reads the master into the capture file + tee; the join is **bounded /
+   cancellable** (ctx-bound, as M17): if the master still has not `EIO`'d within the bound, the
+   drain stops and the capture is marked **`CaptureIncomplete`/`partial`** — never an unbounded
+   hang, never a false `complete`.
+5. the master is closed after drain completion.
 
 ### 3.3 EIO→EOF in the drain
 
 The M17/M12 drain reads the reader (here the master) into the capture file + live tee. For the
 pty reader it must:
-- treat a read returning `n>0, err==EIO` as **data then EOF**: write the `n` bytes, then stop
-  cleanly and mark `CaptureComplete`.
-- treat `n==0, err==EIO` as clean EOF/`CaptureComplete`.
-- treat **any other** error as `CaptureIncomplete`/`partial` (never coerce to complete).
+- always **commit the `n` bytes first**, then inspect the error.
+- treat a read returning `n>0` with an `EIO` error (matched via **`errors.Is(err, unix.EIO)`** —
+  Go wraps the errno in `*PathError`/`*os.SyscallError`, so a literal `err == unix.EIO` is
+  unsafe, Sol r1 P1) as **data then clean EOF** → `CaptureComplete` after the bytes are written.
+- treat `n==0` + `errors.Is(err, unix.EIO)` as clean EOF/`CaptureComplete`.
+- treat **any other** error (incl. a non-EIO errno, or the bounded-join cutoff) as
+  `CaptureIncomplete`/`partial` (never coerce to complete).
 - keep the master open across the loop; close after.
-A `ptyReader` wrapper (or a per-stream "eofErrno" the drain honours) localises this so the pipe
+A `ptyReader` wrapper (or a per-stream `eofErrno` the drain honours) localises this so the pipe
 path is unchanged (pipes EOF normally; only the pty path maps `EIO`).
 
 ### 3.4 Faces + record
 
 - `--pty` (bool) on CLI `aira run` and MCP `aira_run`. `Request.PTY`.
-- `RunRecord.Buffering="pty"` set **before the first ledger event** (M18a's field-loss trap:
-  carried in `mergeEvidence` — the existing `if candidate.Buffering != "" { base.Buffering = … }`
-  already preserves it; a `pty` value must be set on the candidate at every child-ran path).
+- `RunRecord.Buffering="pty"` is set **only after `Start` succeeds** (Sol r1 P1) — unlike
+  M18a's env tactic (known pre-launch), the controlling TTY is established by the kernel at
+  `clone3`+`Setctty` during `Start`, so a successful `Start` is the earliest honest point. The
+  pre-`Start` events (`scope-created`/`starting`) carry `Buffering=""`; the running-transition
+  event sets `"pty"`, and `mergeEvidence` (`if candidate.Buffering != "" { base.Buffering = … }`)
+  carries it through the terminal CAS. A failed `Start` never records `"pty"`.
 - `--pty` implies `Merge=true`: the record's `merge_streams`/`OutputRefs` show a single `log`.
 - text face tees the single merged stream (M17); `--json`/MCP suppress the tee.
 
 ## 4. Fail-closed matrix (E_RUN_PTY_UNAVAILABLE)
 
-| failure | behaviour |
+Only **parent-side pty setup** (allocation/termios, before `Start`) maps to
+`E_RUN_PTY_UNAVAILABLE`. `Start`-phase failures are **not** collapsed into the pty code (Sol r1
+P1): clone3/cgroup/exec/permission failures are not pty-unavailability and keep their existing
+stable codes. Because `Ctty` is derived deterministically (`=1`, §3.2), a Ctty misconfiguration
+does not occur in practice; if `Start` fails it is a genuine launch/scope failure, honestly
+coded as such.
+
+| failure | code |
 |---|---|
 | `/dev/ptmx` open fails (no devpts, sandbox) | `E_RUN_PTY_UNAVAILABLE`, run not launched, no ledger junk |
-| unlockpt / TIOCGPTN / pts open fails | `E_RUN_PTY_UNAVAILABLE` |
+| unlockpt / `TIOCGPTPEER`(+validated fallback) fails | `E_RUN_PTY_UNAVAILABLE` |
 | termios get/set fails | `E_RUN_PTY_UNAVAILABLE` (we do not silently capture cooked bytes) |
-| `Start` fails (bad Ctty / clone3 / EPERM) | existing launch-fail path, but a Ctty/Setctty error is `E_RUN_PTY_UNAVAILABLE`, never a pipe downgrade |
-| never a silent downgrade to pipes recording `pty` or `none` | — |
+| `Start` fails (clone3 / cgroup / exec / EPERM) | **existing** `E_RUN_LAUNCH_FAILED` / `E_RUN_SCOPE_UNAVAILABLE` (unchanged classification) — not the pty code |
+| any pty setup path | **never** a silent downgrade to pipes recording `pty` or `none` |
 
 `E_RUN_PTY_UNAVAILABLE` is registered in `internal/store/check.go` (exit-code map). A pty
-failure fails **this run**; it never falls back to pipes (that would be a dishonest tactic).
+setup failure fails **this run**; it never falls back to pipes (that would be a dishonest tactic).
 
 ## 5. Tests (TDD; discriminating)
 
@@ -181,11 +225,15 @@ sandbox with no devpts → `E_RUN_PTY_UNAVAILABLE` (fail-closed, honest).
 
 ## 7. Invariants for the build review to attack (both directions)
 
-1. A `--pty` child is on a **verified** controlling TTY (isatty(1&2) + owns the fg group), or the
-   run **fails** `E_RUN_PTY_UNAVAILABLE` — never a pipe run mislabeled `pty`.
-2. `cmd.Stdin` is never the pts; a stdin-reading child never deadlocks.
-3. The master drain maps **only** `EIO` → complete; every other error → partial; `n>0` on `EIO`
-   is not dropped; no slave fd lingers (else hang).
+1. A `--pty` child is on a controlling TTY **by construction** (successful `Start` with
+   `Setsid`+`Setctty`); a parent-side setup failure → `E_RUN_PTY_UNAVAILABLE`, a `Start` failure
+   → its existing launch/scope code — never a pipe run mislabeled `pty`, never all-Start-errors
+   collapsed into the pty code.
+2. `cmd.Stdin` is never the pts (no fd-0 deadlock); a `/dev/tty`-reading child is bounded by the
+   run timeout + `run-kill`, not prevented (TTY input is D1).
+3. The master drain maps **only** `errors.Is(err, unix.EIO)` → complete (bytes committed first);
+   every other error and the bounded-join cutoff → partial; the `O_CLOEXEC` slave + kill-and-reap
+   of scope members before the join ensure no lingering slave fd hangs the drain unbounded.
 4. The captured stream is byte-faithful to the defined (output-raw) stream — no `ONLCR` `\r`.
 5. `--pty` ⇒ exactly one `RUN-n.log`, `merge_streams=true`, `Buffering=pty` (set pre-first-event,
    carried in `mergeEvidence`); gate lane unaffected.
