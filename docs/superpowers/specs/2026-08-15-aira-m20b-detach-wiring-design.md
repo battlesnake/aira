@@ -1,34 +1,40 @@
 # M20b — Detached-run telemetry auto-wiring
 
-Status: PLAN (pre-review). Phase 5. Lifts M20 deferral **D1**: a detached run
-(`aira run --detach`) now auto-wires the M19 telemetry (`--report`→test report,
+Status: PLAN v2 (post Sol round 1). Phase 5. Lifts M20 deferral **D1**: a detached
+run (`aira run --detach`) auto-wires the M19 telemetry (`--report`→test report,
 `--tool`→ComputeEvent, `tests-green` observation) **in the supervisor shim after
 the terminal CAS**, instead of rejecting those flags.
 
-Design authority: [`2026-08-07-aira-design.md`](2026-08-07-aira-design.md) §14
-(runner wiring), §9/§12/§13 (reports, compute, tests-green as an *observation* not
-a gate verdict). Builds on M19 (`internal/core/run_wiring.go`) and M20 (the
-detached supervisor shim). The v1 M20 behaviour — reject the wiring flags with
-`E_RUN_ARGUMENT_INVALID` and report telemetry `unevaluated` — is replaced here.
+Design authority: [`2026-08-07-aira-design.md`](2026-08-07-aira-design.md) §14, §9,
+§12, §13. Builds on M19 (`internal/core/run_wiring.go`) and M20 (the detached
+supervisor shim).
+
+**v2 changelog (Sol round 1):** a **durable per-run wiring state** (`not-requested |
+pending | complete | incomplete`) makes async wiring honestly observable — set
+`pending` before the child runs so a crash stays visible (P0). An **exported Core
+entrypoint + DTO** lets the `cmd/aira` shim reach the wiring without crossing the
+unexported boundary (P1). The wiring sidecar is **consumed, validated, and deleted
+early** (before the child launches), the launcher cleans it up on failure (P2).
+The params adapter is proven field-by-field and an **explicitly-unavailable VCS
+snapshot stays unavailable** (never resampled post-run) (P3). `(*RunRecord, error)`
+wiring precondition is specified (P4).
 
 ---
 
 ## 1. Goal and the load-bearing constraint
 
-M19 wires telemetry synchronously in the foreground core handler *after* `Launch`
-returns the terminal record. A detached run returns to the caller at `starting`
-(before the child even runs), so its wiring must happen **in the shim, after the
-terminal CAS** — the only process that knows when the run terminated and has the
+M19 wires telemetry synchronously in the foreground handler after `Launch`. A
+detached run returns at `starting` (before the child runs), so its wiring must
+happen **in the shim, after the terminal CAS** — the only process that has the
 terminal record + captured output.
 
-**The load-bearing constraint (M19's own P0, reaffirmed): the VCS provenance for
-a `--report` must be the code that was *actually tested*, snapshotted BEFORE the
-child runs.** A detached child may change `HEAD`/branch/worktree; the launcher
-must snapshot `reportContext` (commit/branch/worktree) *before spawning the shim*
-and carry that immutable snapshot to the shim, which uses it verbatim at wiring
-time. Sampling VCS in the shim after the run would mis-attribute the report.
-
-Everything else reuses the M19 machinery unchanged (bounded capture read, the
+**Load-bearing (M19's own P0, reaffirmed): a `--report`'s VCS provenance must be
+the code that was *actually tested*, snapshotted BEFORE the child runs.** The
+launcher snapshots `reportContext` (commit/branch/worktree) *before spawning the
+child* and carries that immutable snapshot to the shim, which wires from it
+verbatim. An explicitly-unavailable snapshot (not a git repo, or capture failed)
+stays **empty/comparison-ineligible** and is **never resampled** at wiring time
+(§3.2). Everything else reuses M19 unchanged (bounded capture read, the
 `report_max_bytes` ceiling, the M14 usage normaliser, `tests_green_observed` as a
 FACT never a gate verdict — §120).
 
@@ -37,171 +43,210 @@ FACT never a gate verdict — §120).
 ## 2. Architecture
 
 ```
- aira run --detach --report go-json --tool codex -- <argv>   (LAUNCHER, core)
-   flag-compat (§5) — wiring flags now PERMITTED (except --strict-wiring)
+ aira run --detach --report go-json --tool codex -- <argv>        (LAUNCHER, core)
+   flag-compat (§4) — wiring flags PERMITTED (except --strict-wiring)
    if any wiring flag set:
-     snapshot reportContext (VCS) NOW, before spawning the child   ← M19 P0
-     write a 0600 wiring sidecar {params, reportContext} in the output dir
-   LaunchDetached(req, wiringPath)  → spawns the shim with --wiring <path>
-   print handle {id, status:starting, telemetry: pending}  · exit 0
+     snapshot reportContext (VCS) NOW, before spawning the child        ← M19 P0
+     build WiringParams from args (defensive slice copies)
+     write a versioned 0600 wiring sidecar {schema, params, reportContext}
+       atomically (absolute path, in the output dir)
+   LaunchDetached(req, wiringPath)  → spawns shim with --wiring <path>
+     on LaunchDetached failure OR ACK-cancel: the launcher removes the sidecar
+   print handle {id, status:starting, telemetry: (pending|not-requested)} · exit 0
    ▼
- aira __supervise --control <c> --ready-fd 3 --ack-fd 4 --wiring <w>   (SHIM)
-   record, err := SuperviseRequest(...)     ← now RETURNS the terminal record
-   if --wiring set and the run reached a terminal record:
-     read+delete the wiring sidecar (0600)
-     build the Core (the shim already opens the store `s`)
-     wireTerminalRun(ctx, params, record, reportContext)   ← M19 wiring, verbatim
-       → AddTestReport (provenance from the PRE-LAUNCH snapshot) + AddComputeEvent
+ aira __supervise --control <c> --ready-fd 3 --ack-fd 4 --wiring <w>       (SHIM)
+   EARLY, before the child launches:
+     consume+strict-decode+size-limit the control file → Request
+     consume+strict-decode+size-limit+DELETE the sidecar → params, reportContext
+       malformed/oversized/unknown-schema → fail READINESS before any child runs
+   record, err := SuperviseRequest(...)     ← now RETURNS (*RunRecord, error)
+     (the shim marks telemetry=pending on the starting record when a sidecar is
+      present, so a crash before wiring stays visible)
+   if wiring requested AND record != nil AND record.Status.Terminal():
+     core := build Core (the shim already opens the store `s`)
+     result := core.WireDetachedTelemetry(ctx, params, *record, reportContext)
+       → AddTestReport (provenance = the PRE-LAUNCH snapshot) + AddComputeEvent
+     RecordRunTelemetry(record.ID, complete|incomplete, codes, reportID, computeID)
    exit
 ```
 
-- **`SuperviseRequest` returns `(*RunRecord, error)`** (today: only `error`). The
-  shim needs the terminal record to wire from.
-- **The launcher owns the wiring content; the runner only plumbs a path.**
-  `LaunchDetached(ctx, req, wiringPath string)` adds `--wiring <wiringPath>` to the
-  shim argv iff `wiringPath != ""`. The runner never reads the sidecar — it stays
-  ignorant of report/compute concepts (no store/domain dependency leaks into the
-  runner layer).
-- **The wiring sidecar** is a core-level JSON `{params, reportContext}` written
-  `0600` to the output dir (path `<control>.wiring` or a sibling temp name),
-  deleted by the shim immediately after reading (it names no secrets, but the
-  same hygiene as the control file). `params` = the M19 wiring flags; `reportContext`
-  = `{Commit, Branch, WorktreeID}` (plain strings — no store type on the wire).
+- **Exported Core entrypoint (P1):** `Core.WireDetachedTelemetry(ctx,
+  params WiringParams, record runner.RunRecord, reportContext store.TestReportContext)
+  runWiring` and an exported `WiringParams` DTO. `wireTerminalRun` is refactored to
+  take `WiringParams` internally; the foreground handler adapts `args →
+  WiringParams` (thin, behaviour-preserving); the shim adapts `sidecar →
+  WiringParams`. **One** wiring implementation; store/domain logic stays in Core.
+- **`SuperviseRequest` returns `(*RunRecord, error)`** — the shim wires from the
+  terminal record.
+- **Runner plumbs only a path.** `LaunchDetached(ctx, req, wiringPath string)` adds
+  `--wiring <wiringPath>` to the shim argv iff non-empty; the runner never reads
+  the sidecar (no store/domain dependency leaks into the runner layer).
 
-### 2.1 The `wireTerminalRun` params refactor
+### 2.1 Sidecar lifecycle and security (P2)
 
-`wireTerminalRun` currently reads flags from `*argAccessor`. Extract an explicit
-`runWiringParams` struct (`Report, ReportStream, Suite, Shard, Retry, Usage,
-Provider, Tool, ConfigEnv []string, StrictWiring`) so the wiring is callable
-**without** an `argAccessor`:
+- **Atomic `0600` creation**, absolute path, in the output dir. Content: a
+  **versioned** JSON `{schema:1, params, reportContext{Commit,Branch,WorktreeID}}`
+  — plain strings only (no store type on the wire). `--usage` is a **file path**
+  the shim opens at wiring time (never inlined), so no token secret is on the wire.
+- **Consumed + strictly decoded + size-limited + DELETED early** — at shim startup,
+  *before* `SuperviseRequest` launches the child. A malformed / oversized /
+  unknown-schema sidecar **fails readiness before any child runs** (a synchronous
+  `E_RUN_ARGUMENT_INVALID` to the launcher). Params + snapshot are held in memory
+  for wiring after terminal. `config_env` values and paths do not linger on disk
+  for the run's lifetime.
+- **Launcher cleanup:** the launcher removes the sidecar if `LaunchDetached` fails
+  or the ACK handshake is cancelled (mirrors the control-file cleanup). An orphaned
+  sidecar (crash between write and consume) is bounded to the launch window and is
+  `0600`.
 
-- `wireTerminalRun(ctx, params runWiringParams, record, reportContext)` — the core
-  logic, unchanged in behaviour.
-- The **foreground** handler builds `params` from `args` (a thin adapter) and calls
-  it exactly as before — a pure refactor, no behaviour change (M19 tests stay green).
-- The **shim** builds `params` from the sidecar and calls the same function.
+### 2.2 Durable per-run wiring state (P0)
 
-This keeps one wiring implementation for both faces (the one-core principle) and
-avoids reconstructing a synthetic `argAccessor` in the shim.
+Async wiring is made **observable, never ambiguous**, by a durable per-run
+telemetry state (missing artifacts alone cannot distinguish failure / crash /
+eviction / unfinished — and the shim's stderr is `/dev/null`).
+
+- `RunRecord` gains `Telemetry string` (`not-requested | pending | complete |
+  incomplete`) + `TelemetryCodes []string` + optional `TestReportID` /
+  `ComputeEventID` refs — an **opaque** status the runner records but does not
+  interpret (like M19's Ticket/Phase/Label/Tool pass-through). A new runner method
+  `RecordRunTelemetry(ctx, id, state, codes, reportID, computeID)` appends a
+  `telemetry` ledger event; `mergeEvidence` carries the fields monotonically
+  (state is write-forward: `pending`→`complete|incomplete`, never backward).
+- The **shim sets `Telemetry=pending`** on/right after the `starting` record when a
+  wiring sidecar is present — **before the child runs** — so a shim crash mid-wiring
+  leaves a durable, visible `pending`, not a silent gap.
+- After wiring, the shim sets `complete` (report+compute both succeeded) or
+  `incomplete` (with the M19 warning codes + whatever artifacts *did* land),
+  attaching the artifact IDs.
+- **Reconcile surfaces a stuck wiring**: a **terminal** run with
+  `Telemetry==pending` and a **dead** supervisor (the M20 lease) →
+  `U_RUN_TELEMETRY_PENDING` (a visible residual, like `U_RUN_SUPERVISOR_STALLED`),
+  never a fabricated "complete".
+- `aira get <run>` and the detached handle report this durable state, not a guess.
 
 ---
 
-## 3. Honesty: async wiring is observable, never faked
+## 3. Honesty
 
-- **The launcher cannot report the wiring result** — it returns at `starting`,
-  before the run completes. The detached handle reports telemetry as **`pending`**
-  (a distinct honest state meaning "deferred to the supervisor"), never a
-  fabricated result and never `unevaluated` (which would falsely imply "attempted
-  and could not").
-- **The wiring result is durably queryable via the store artifacts the shim
-  writes** — this is the honest observable outcome, not a new bespoke surface:
-  - `aira test-report ls`/`show` shows the report the shim added, including
-    `parser_complete=false` when the capture was incomplete/truncated (the honest
-    record of an imperfect wiring).
-  - the ComputeEvent shows `tokens=unevaluated` when no authoritative `--usage`
-    was supplied, exactly as foreground.
-  - `tests_green_observed` remains a FACT derived from the report (exit0 AND
-    count>0 AND parser_complete), **never a gate verdict** (§120 / §9 line 118 —
-    unchanged from M19).
-- **A shim wiring failure never rewrites the run outcome.** The run already
-  terminated and its terminal record is authoritative; a store error during wiring
-  is recorded as a shim **diagnostic** (and leaves no report/compute), never a
-  change to the run's `status`/`exit_code`. The run ran; telemetry is
-  best-effort-but-honest.
+### 3.1 The launch handle
+
+The launcher returns at `starting` and reports `telemetry: pending` (a wiring
+sidecar exists) or `not-requested` — never `unevaluated` (which would falsely imply
+"attempted and could not") and never a fabricated result.
+
+### 3.2 Immutable, non-resampled provenance (P3)
+
+`WireDetachedTelemetry` passes the **snapshot** `reportContext` to `AddTestReport`
+verbatim. If the snapshot fields are empty (VCS unavailable at launch), they stay
+empty — **`AddTestReport` must NOT resample the current VCS** at wiring time (that
+would attribute the report to the post-run working tree). The report is then
+comparison-ineligible on provenance, honestly, rather than mis-attributed. (The
+build must confirm `AddTestReport` has no post-hoc VCS fallback that fires on empty
+input; if it does, it is gated off for this path.)
+
+### 3.3 Terminal-record precondition (P4)
+
+The shim wires **iff a terminal record exists** (`record != nil &&
+record.Status.Terminal()`), *including* a terminalization returned alongside an
+error (killed/lost/oom). It **never dereferences** a nil or non-terminal record (a
+pure launch failure → no run ran → no wiring, no dangling `pending`). A
+killed/lost/nonzero-exit run still wires: the report reflects the partial/failed
+output honestly (`parser_complete=false`), `tests_green_observed=false`, compute
+resource usage recorded — no fake green.
+
+### 3.4 Wiring failure never rewrites the run
+
+A store-write failure during wiring never changes the run's `status`/`exit_code`
+(the run already terminated authoritatively). It is recorded as
+`Telemetry=incomplete` + a code + a shim diagnostic; no partial report/compute is
+claimed complete.
 
 ---
 
 ## 4. Flag compatibility (launcher, synchronous)
 
-- **Now permitted with `--detach`:** `--report`, `--report-stream`, `--suite`,
-  `--shard`, `--retry`, `--usage`, `--provider`, `--tool`, `--config-env`. The M20
-  blanket rejection of these is removed.
-- **`--detach --strict-wiring` stays rejected** (`E_RUN_ARGUMENT_INVALID`).
-  `--strict-wiring`'s purpose is to make the *launch command exit non-zero* when
-  wiring is incomplete — a **synchronous** gate a detached run structurally cannot
-  provide (it returns at `starting`). Detached wiring completeness is observable
-  via the store artifacts (§3), not a synchronous exit code. Documented explicitly
-  rather than silently degrading `--strict-wiring` to a no-op.
-- `--usage <file>` with `--detach`: the file path is captured in the sidecar; the
-  shim reads it at wiring time. (`--usage -` was already rejected under `--detach`
-  by M20's `--stdin -`-class reasoning — reaffirm: `--usage` must be a file, not a
-  stream, for a detached run.)
-- The M20 rejections (`--follow`, `--pty`, `--stdin -`) are unchanged.
+- **Permitted with `--detach`:** `--report`, `--report-stream`, `--suite`,
+  `--shard`, `--retry`, `--usage <file>`, `--provider`, `--tool`, `--config-env`.
+- **`--detach --strict-wiring` rejected** (`E_RUN_ARGUMENT_INVALID`): it is a
+  **synchronous** exit gate a detached run structurally cannot provide (returns at
+  `starting`). Completeness is observable via §2.2's durable state + the store
+  artifacts. Documented, not silently a no-op. *(Sol confirmed this is correct.)*
+- `--usage -` stays rejected with `--detach` (must be a file — no live stream).
+- M20's `--follow` / `--pty` / `--stdin -` rejections are unchanged.
 
 ---
 
 ## 5. Deferrals (explicit)
 
-- **D1 — tool-stdout usage auto-extraction** (M19 D1, unchanged): tokens are
-  authoritative only via `--usage`+`--provider`; auto-extraction from the tool's
-  own stdout is still a later cut.
-- **D2 — a bespoke wiring-outcome query surface.** v1 relies on the store
-  artifacts (report/compute) as the observable outcome. A dedicated
-  `aira run --wiring-status <id>` view is deferred; it adds no honesty (the
-  artifacts already carry the truth).
-- The M20 deferrals (D3 run-input, D4 daemon+fairness-queue, D5 non-Linux) are
-  unchanged; M20b does not touch them.
+- **D1 — tool-stdout usage auto-extraction** (M19 D1, unchanged).
+- **D2 — a bespoke `run --wiring-status` view.** §2.2's durable state + the store
+  artifacts already carry the truth; a dedicated view adds no honesty.
+- M20 D3 (run-input) / D4 (daemon+fairness-queue) / D5 (non-Linux) unchanged.
 
 ---
 
 ## 6. Tests and the Sol build-review checklist
 
 TDD. Real-cgroup tests under `AIRA_REAL_CGROUP=1 whale-run`; a committed
-real-binary e2e (`~/tmp/aira-m20b-e2e.sh`) drives the real CLI
-`launcher→sidecar→shim→wiring→store` path.
+real-binary e2e (`~/tmp/aira-m20b-e2e.sh`) drives `launcher→sidecar→shim→wiring→
+store` via the real CLI.
 
 **Correctness properties (each must fail against a plausible wrong impl):**
 
-1. **Detached `--report go-json` of a passing suite** → after the run terminates,
-   `test-report ls` shows a report for the run with a non-fabricated test count and
-   `parser_complete=true`; `tests_green_observed` is derivable and true.
-2. **VCS provenance is the PRE-LAUNCH commit** (the load-bearing check): a detached
-   run whose child changes `HEAD` mid-run produces a report whose commit is the
-   commit at launch time, not the post-run commit. (Mirrors M19's discriminator,
-   now across the launcher/shim boundary.)
-3. **Detached `--tool codex` without `--usage`** → a ComputeEvent with resource
-   usage from the terminal record and `tokens=unevaluated`.
-4. **Detached `--tool codex --usage <file> --provider codex`** → authoritative
-   tokens via the M14 normaliser.
-5. **`tests_green_observed` is never a gate verdict** — no gate-audit row is written
-   by the shim wiring (§120).
-6. **Truncated/incomplete capture → honest** `parser_complete=false` +
-   `U_RUN_REPORT_TOO_LARGE`/capture-incomplete, never a fake green.
-7. **`--detach --strict-wiring` → `E_RUN_ARGUMENT_INVALID`**, synchronously, no id
-   reserved.
-8. **Sidecar hygiene**: `0600`; deleted by the shim after reading; absent → the
-   shim wires nothing and the run still terminalises normally.
-9. **A shim store-write failure does not change the run outcome** — the terminal
-   `status`/`exit_code` are unchanged; the failure is a diagnostic, no partial
-   report/compute is claimed as complete.
-10. **Foreground wiring is byte-for-byte unchanged** by the params refactor (all
-    M19 tests green; a direct equivalence: the same run wired foreground vs via the
-    shim params-path yields the same report/compute).
+1. Detached `--report go-json` of a passing suite → after terminal, `test-report
+   ls` shows the report (non-fabricated count, `parser_complete=true`); the run's
+   `Telemetry` transitions `pending`→`complete`; `tests_green_observed` derivable
+   and true.
+2. **VCS provenance = the PRE-LAUNCH commit** (load-bearing): a detached child that
+   changes `HEAD` mid-run yields a report whose commit is the launch-time commit,
+   not the post-run one; **an empty snapshot stays empty** (never resampled).
+3. Detached `--tool` without `--usage` → ComputeEvent, `tokens=unevaluated`.
+4. Detached `--tool --usage <file> --provider` → authoritative tokens (M14).
+5. `tests_green_observed` writes **no** gate-audit row (§120).
+6. Truncated/incomplete capture → `parser_complete=false` + the M19 code, `Telemetry
+   =incomplete`, never a fake green.
+7. `--detach --strict-wiring` → `E_RUN_ARGUMENT_INVALID`, synchronous, no id.
+8. **Durable state / crash visibility**: `Telemetry=pending` is durable from before
+   the child runs; a shim killed after terminal but before wiring → reconcile
+   surfaces `U_RUN_TELEMETRY_PENDING` (terminal + pending + dead supervisor), never
+   `complete`.
+9. **Sidecar**: versioned `0600`, consumed+deleted before the child launches;
+   malformed/oversized/unknown-schema → readiness fails before any child runs;
+   launcher removes it on LaunchDetached-fail/ACK-cancel; absent sidecar → run
+   terminalises normally with `Telemetry=not-requested`.
+10. **Terminal-record precondition** (P4): launch-failure (nil record) → no wiring,
+    no dangling pending; killed / lost / nonzero-exit (terminal record) → wiring
+    runs, honest report + `tests_green_observed=false`.
+11. **Params-adapter equivalence** (P3): foreground-vs-shim `WiringParams` for a
+    fixed scenario produce byte-identical report+compute for **every** flag/default
+    (report/report_stream/suite/shard/retry/usage/provider/tool/config_env); slices
+    copied defensively.
+12. **Concurrent writer**: the shim's AddTestReport/AddComputeEvent succeed while
+    another process writes the store (WAL/busy-timeout).
+13. Foreground wiring unchanged — all M19 tests green.
 
 **Sol build-review checklist (false-fail AND false-pass):**
 
-- **VCS snapshot before launch**: the launcher snapshots `reportContext` before the
-  child can run and the shim wires from that immutable snapshot; no path samples
-  VCS post-execution.
-- **Layering**: the runner plumbs only a path; no store/domain type crosses into
-  `runner.Request` or the runner control file; the wiring stays a Core method.
-- **One wiring implementation**: foreground and shim call the same
-  `wireTerminalRun(params,…)`; the refactor is behaviour-preserving (M19 tests
-  green).
-- **Honesty**: `pending` (not `unevaluated`/faked) on the launch handle; incomplete
-  capture → honest report codes; `tests_green_observed` never a gate verdict; a
-  wiring failure never rewrites the run outcome.
-- **strict-wiring**: rejected under detach, not silently a no-op.
-- **Sidecar**: `0600`, deleted after read, secret-free on the wire (usage is a path
-  the shim opens, not inlined).
-- **Porous-test check**: the VCS-pre-launch and foreground-equivalence tests
-  genuinely discriminate; real-cgroup tests fail (not skip) under
+- **VCS**: snapshot taken before the child can run; wired verbatim; empty stays
+  empty, no post-run resample; child-changes-HEAD proven.
+- **Durable state**: `pending` before the child runs; reconcile surfaces stuck
+  pending; state write-forward monotonic; no fabricated `complete`.
+- **Sidecar**: versioned + strict-decode + size-limit + `0600` + deleted early +
+  launcher cleanup; secrets (usage) are a path opened at wiring time, not inlined.
+- **Layering**: runner plumbs only a path; the exported Core entrypoint keeps
+  store/domain in Core; `RunRecord.Telemetry` is opaque to the runner.
+- **One wiring impl**: foreground and shim call the same core; params adapter
+  behaviour-preserving (per-field equivalence, not just "M19 green").
+- **Precondition**: wire iff a terminal record exists; never deref nil/non-terminal.
+- **Failure**: a wiring failure never rewrites the run outcome; `incomplete`+code.
+- **Porous-test check**: VCS-pre-launch, per-field equivalence, and crash-visibility
+  tests genuinely discriminate; real-cgroup tests fail (not skip) under
   `AIRA_REAL_CGROUP=1`.
 
-**New/changed surface:** `runWiringParams` (core); `wireTerminalRun` takes params;
-`SuperviseRequest` returns `(*RunRecord, error)`; `LaunchDetached(…, wiringPath)`;
-`--wiring` internal arg on `__supervise` (hidden, like `--ready-fd`/`--ack-fd`);
-the detached handle gains `telemetry: pending`. No new stable error codes (reuses
-the M19 taxonomy: `E_RUN_CONFIG_ENV_INVALID`, `E_RUN_USAGE_PROVIDER_REQUIRED`,
-`U_RUN_REPORT_TOO_LARGE`, `U_TESTREPORT_INCOMPLETE`); `--detach --strict-wiring`
-reuses `E_RUN_ARGUMENT_INVALID`.
+**New/changed surface:** exported `Core.WireDetachedTelemetry` + `WiringParams`;
+`wireTerminalRun` takes `WiringParams`; `SuperviseRequest` → `(*RunRecord, error)`;
+`LaunchDetached(…, wiringPath)`; `--wiring` internal arg on `__supervise` (hidden);
+`RunRecord.Telemetry`/`TelemetryCodes`/`TestReportID`/`ComputeEventID` + a
+`telemetry` ledger event + `RecordRunTelemetry`; new code `U_RUN_TELEMETRY_PENDING`.
+Otherwise reuses the M19 taxonomy; `--detach --strict-wiring` reuses
+`E_RUN_ARGUMENT_INVALID`.
