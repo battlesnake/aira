@@ -1,6 +1,6 @@
 # AIRA #30 — `aira git`: non-interactive git network ops with SSH→gh-credential auth fallback
 
-Status: PLAN (v3 — incorporates Sol round-2 findings: keep-remote-name + rewrite-safety verify)
+Status: PLAN (v4 — incorporates Sol round-3 findings: synthetic single-URL fallback remote + single-destination guard)
 Date: 2026-08-15
 Milestone: #30 — Runner git-op command with SSH→gh-credential auth fallback
 Depends on: nothing unlanded (master `1e84128`)
@@ -157,28 +157,59 @@ Only **github.com** gets the gh fallback in v1 (gh's default host). GitHub Enter
 
 ## 5. The HTTPS/gh fallback — URL override on the same remote, verified, ephemeral
 
-We construct the canonical HTTPS URL ourselves — `https://github.com/<owner>/<repo>.git`
-(`<owner>/<repo>` from the strict two-segment parse, §8.1) — and apply it as an
-**invocation-local override of the remote's URL**, keeping the remote NAME so all
-refspec/tracking semantics survive:
+A `-c remote.<name>.url=…` override is **rejected** (Sol round-3): `remote.<name>.url`
+is *multi-valued* and `-c` **appends**, so `git fetch` keeps using the original (first)
+URL while the rewrite-check passes — a silently-dishonest transport; and an empty `-c
+pushurl=` does not *clear* like `credential.helper=` does. Instead the fallback runs
+against a **synthetic, invocation-local remote** in a fresh config key namespace, so its
+URL is unambiguously single, while the copied fetch refspecs preserve tracking semantics:
 
 ```
 git \
-  -c remote.<name>.url=https://github.com/<owner>/<repo>.git \
-  -c remote.<name>.pushurl=https://github.com/<owner>/<repo>.git   # push only \
+  -c remote.aira-fallback.url=https://github.com/<owner>/<repo>.git \
+  -c remote.aira-fallback.fetch=<each remote.<name>.fetch value, copied verbatim> \
   -c credential.helper= \
   -c credential.helper="!gh auth git-credential" \
-  <op> <name> [refspecs…]
+  <op> aira-fallback [refspecs…]
 ```
 
-- The remote NAME is preserved, so `remote.<name>.fetch` / `push` refspecs and tracking
-  updates work exactly as a normal `git fetch origin` / `git push origin` (fixes the v2
-  semantics break). `clone` has no remote — it takes the explicit canonical URL.
+- The synthetic name (`aira-fallback`, validated **absent** from `git remote`; else a
+  unique suffix, or refuse) has **no pre-existing config**, so `remote.aira-fallback.url`
+  has exactly one value — the fallback provably uses our canonical HTTPS URL, never the
+  original (fixes the multi-value append bug).
+- **Fetch refspecs are copied** from `remote.<name>.fetch` (`git config --get-all`) so
+  `git fetch aira-fallback` updates `refs/remotes/<name>/*` exactly as `git fetch <name>`
+  would (a bare synthetic remote with no fetch refspec would update only `FETCH_HEAD`).
+- **push** copies `remote.<name>.push` refspecs if present; since push.default consults
+  `branch.<b>.remote=<name>` (the *original* name, not the synthetic), a no-refspec push
+  is resolved to a **concrete** refspec ourselves — the current branch to its configured
+  upstream on `<name>` (`refs/heads/<B>:refs/heads/<upstream>`); if there is no
+  configured push refspec and no upstream to resolve, we refuse `E_GIT_ARG_INVALID`
+  ("explicit refspec required for a fallback push of a branch with no upstream") rather
+  than guess. (Native, non-fallback push keeps full push.default semantics — §5.2.)
 - `credential.helper=` (empty) **first clears** any inherited/system helper so a stray
   interactive helper cannot hang or leak; the second sets **only** gh.
-- Nothing is written to `.git/config` (all `-c`, ephemeral).
-- A native-HTTPS github.com remote needs no URL override — same two `credential.helper`
-  `-c` lines on the unchanged remote.
+- Nothing is written to `.git/config` (all `-c`, ephemeral). `clone` has no remote — it
+  takes the explicit canonical URL directly.
+
+### 5.0 Single-destination requirement (fallback only)
+
+The fallback overrides one destination, so it requires the remote to resolve to a
+**single** endpoint. Before falling back we read `git config --get-all
+remote.<name>.url` and `git remote get-url --push --all <name>`; if the remote has
+**more than one distinct fetch URL, or more than one push URL, or its URLs disagree on
+`owner/repo`**, the fallback is refused `E_GIT_FALLBACK_BLOCKED`
+(reason=`multiple-destinations`) — we will not silently pick one or push to several over
+mixed transports. (The *native* path — ssh works, or native https — runs the user's
+multi-URL remote as-is and reports best-effort; the restriction is only on synthesising
+a fallback.) Multi-destination fallback is D7 (deferred, documented).
+
+### 5.2 Native path takes no overrides
+
+When SSH auth works (or the remote is native HTTPS with gh serving credentials), the op
+runs with the **real remote name and zero URL/refspec overrides** — full native
+`push.default`/tracking semantics. Only the two `credential.helper` `-c` lines are added
+on the native-HTTPS-github case (to supply the gh credential); nothing else changes.
 
 ### 5.1 Rewrite-safety check — never claim `https-gh` over an unknown transport
 
@@ -317,12 +348,18 @@ Exit-code choice mirrors the runner family (auth/failed = 1, timeout = 3, arg/co
   covers the cases. Upstream-derivation is D3.) Auth is a property of (transport, host),
   so the SSH probe reads a read-only endpoint on the effective host regardless of push
   vs fetch.
-- **Remote-name / arg option-injection is closed** (Sol P2): the remote name and every
-  refspec must match a safe pattern and **must not begin with `-`** (else
-  `E_GIT_ARG_INVALID`); all git invocations place a `--` terminator before positional
-  remote/refspec/URL arguments. Refspecs pass through **after** a `--` delimiter in the
-  AIRA argv (mirroring `aira run`). No git *option* flags are accepted in v1 (closed
-  argv: `remote` + refspecs) — small, un-injectable surface; richer flags are D4.
+- **Remote-name grammar + arg option-injection is closed** (Sol rounds 2–3): because the
+  remote name is interpolated into config-query keys (`remote.<name>.fetch`, `--get-all
+  remote.<name>.url`), it is validated against a **deliberately narrow grammar** —
+  `[A-Za-z0-9][A-Za-z0-9._/-]*`, no leading `-`, no `=`, no control/whitespace, no `..`
+  — else `E_GIT_ARG_INVALID`; this prevents a name from mis-targeting a different config
+  subsection or being read as an option. Every refspec likewise must not begin with `-`,
+  and all git invocations place a `--` terminator before positional remote/refspec/URL
+  arguments. Refspecs pass through **after** a `--` delimiter in the AIRA argv (mirroring
+  `aira run`). No git *option* flags are accepted in v1 (closed argv: `remote` +
+  refspecs) — small, un-injectable surface; richer flags are D4. The synthetic fallback
+  remote uses a **fixed constant** name (`aira-fallback`), never a user-derived string,
+  so no user input reaches a constructed config key.
 
 ### 8.1 Strict URL grammar (Sol P1 — anti-spoof, no secret leak)
 
@@ -428,10 +465,20 @@ Pure-unit (no network, `internal/gitremote`):
   or an "==255" impl must fail these.)
 - **Transport selection** (table-driven over §4 with a fake exec seam `runFn`): each row
   picks the expected transport / code; probe/op/gh calls simulated deterministically.
-- **Semantics-preserving fallback**: the committed op keeps the **remote name** (never a
-  raw URL), the fallback argv carries `-c remote.<name>.url=https://github.com/owner/
-  repo.git` (+`pushurl` for push) and the two `credential.helper` `-c` lines, and **no
-  `git config` write** ever appears (the seam records every argv).
+- **Synthetic-remote fallback**: the fallback argv targets the **synthetic `aira-fallback`
+  remote** (never the user's remote name in a config key, never a raw URL), carries
+  exactly one `-c remote.aira-fallback.url=https://github.com/owner/repo.git`, copies each
+  `remote.<name>.fetch` value verbatim as `-c remote.aira-fallback.fetch=…`, and the two
+  `credential.helper` `-c` lines; **no `git config` write** ever appears (the seam records
+  every argv). A stub with the original remote holding a *second* url value proves the
+  synthetic remote is used (not the appended-override that the multi-value bug would hit).
+- **Single-destination guard (§5.0)**: a remote with two distinct fetch URLs, or a
+  `--push --all` returning two, or fetch/push URLs disagreeing on owner/repo →
+  `E_GIT_FALLBACK_BLOCKED` reason=`multiple-destinations`, op never runs.
+- **Fallback push refspec**: no-refspec push with a resolvable upstream → concrete
+  `refs/heads/B:refs/heads/<upstream>`; no upstream and no configured push refspec →
+  `E_GIT_ARG_INVALID` (never a guessed destination).
+- **Remote-name grammar**: names with `-`-lead, `=`, `..`, control chars → `E_GIT_ARG_INVALID`.
 - **Rewrite-safety (§5.1)**: a simulated `url."git@github.com:".insteadOf=
   "https://github.com/"` (an "always-ssh" rule) whose value prefixes our canonical HTTPS
   → `E_GIT_FALLBACK_BLOCKED`, op **never runs**; a non-matching rule → fallback proceeds
@@ -485,6 +532,9 @@ on the network.
   scoping them is a possible future.
 - **D6 credential caching / ssh-agent management** — out of scope; we consume whatever
   ssh/gh already provide, non-interactively.
+- **D7 multi-destination remotes** — a remote with several fetch/push URLs runs natively
+  but is refused for *fallback synthesis* (`E_GIT_FALLBACK_BLOCKED`); coherent
+  multi-destination fallback is out of v1.
 
 ## 13. Invariants (for the build review to attack in both directions)
 
@@ -509,10 +559,11 @@ on the network.
 7. Host detection is structural (strict ASCII grammar, exact `github.com`), never
    substring-contains, IDNA-safe; fallback reconstruction requires a strict two-segment
    `owner/repo` path.
-8. Ops keep the **remote name** (semantics preserved); the fallback overrides only
-   `remote.<name>.url`/`pushurl` invocation-locally. A `pushurl`/rewrite cannot make us
-   probe one host and operate on another (auth is per (transport, host); reporting uses
-   the effective URL).
+8. The native path keeps the **real remote name** with zero overrides (full semantics);
+   the fallback runs a **synthetic single-URL remote** with copied fetch refspecs, and
+   only after the single-destination guard (§5.0) and rewrite-safety check (§5.1) — so
+   the fallback provably uses our canonical HTTPS URL exactly once, never the original
+   (multi-value) URL and never several destinations.
 9. No credential is ever invented for the caller or swapped in silently; no
    credential or URL-embedded secret ever reaches a payload, log, or the live tee
    (redaction on all surfaced URLs/stderr).
