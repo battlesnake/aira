@@ -1815,10 +1815,19 @@ func (r *Runner) Reconcile(ctx context.Context) ([]RunRecord, error) {
 	for id := range runs {
 		lock, lockErr := r.boundedRunLock(filepath.Join(filepath.Dir(r.ledger.ledger), id+".lock"))
 		if lockErr != nil {
-			record := runs[id]
-			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_LAUNCH_STALLED")
-			result = append(result, record)
-			continue
+			// U_RUN_LAUNCH_STALLED is the TYPED timeout only. Bounded contention
+			// means the launch may be stalled: preserve + surface, never a
+			// fabricated terminal. Any OTHER acquisition failure (EISDIR / EACCES /
+			// EIO / bad path) is a genuine infrastructure error and must surface as
+			// an error, never be mislabelled as launch contention and swallowed.
+			var launch *LaunchError
+			if errors.As(lockErr, &launch) && launch.Code == "U_RUN_LAUNCH_STALLED" {
+				record := runs[id]
+				record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_LAUNCH_STALLED")
+				result = append(result, record)
+				continue
+			}
+			return nil, lockErr
 		}
 		freshEvents, readErr := r.ledger.read()
 		if readErr != nil {

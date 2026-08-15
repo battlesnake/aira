@@ -1027,6 +1027,32 @@ func TestM20ReconcileAbsentScopeFinalizesFromEvidenceOrLost(t *testing.T) {
 	})
 }
 
+func TestM20ReconcileBoundedLockInfraErrorIsNotStalled(t *testing.T) {
+	oldBoot, oldStat := readBootIDFn, readProcStatFn
+	t.Cleanup(func() { readBootIDFn, readProcStatFn = oldBoot, oldStat })
+	readBootIDFn = func() (string, error) { return "boot-a", nil }
+	readProcStatFn = func(int) ([]byte, error) { return procStatForTest('S', 77), nil }
+
+	r, scope := newMemoryRunner(t, nil)
+	run := detachedRunForTest(scope, processAlive)
+	appendRunEvent(t, r, "starting", run)
+	// Make the per-run lock path a DIRECTORY so acquisition fails with EISDIR — an
+	// infrastructure failure that must surface as an ERROR, never be mislabelled
+	// as U_RUN_LAUNCH_STALLED contention and swallowed.
+	lockPath := filepath.Join(filepath.Dir(r.ledger.ledger), run.ID+".lock")
+	if err := os.MkdirAll(lockPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := r.Reconcile(context.Background())
+	if err == nil {
+		t.Fatal("infrastructure lock failure was swallowed instead of surfaced")
+	}
+	var launch *LaunchError
+	if errors.As(err, &launch) && launch.Code == "U_RUN_LAUNCH_STALLED" {
+		t.Fatalf("infrastructure lock error was mislabelled as launch-stalled: %v", err)
+	}
+}
+
 func TestM20FinalizeKilledAndForceQuiescedRecordsBoth(t *testing.T) {
 	oldBoot, oldStat := readBootIDFn, readProcStatFn
 	t.Cleanup(func() { readBootIDFn, readProcStatFn = oldBoot, oldStat })
