@@ -1,6 +1,6 @@
 # M20b — Detached-run telemetry auto-wiring
 
-Status: PLAN v3 (post Sol rounds 1-2). Phase 5. Lifts M20 deferral **D1**: a detached
+Status: PLAN v4 (post Sol rounds 1-3). Phase 5. Lifts M20 deferral **D1**: a detached
 run (`aira run --detach`) auto-wires the M19 telemetry (`--report`→test report,
 `--tool`→ComputeEvent, `tests-green` observation) **in the supervisor shim after
 the terminal CAS**, instead of rejecting those flags.
@@ -122,29 +122,39 @@ monotonic opaque state + opaque references and knows nothing of reports/compute.
   the child runs. Because readiness is signalled *after* `starting`, **readiness
   implies `pending` is durable**, so a shim crash mid-wiring always leaves a visible
   `pending`.
-- **Post-terminal telemetry write is explicitly authorized in replay (P0).** M20's
-  replay rejects any event after a terminal event. M20b authorizes exactly one
-  additional kind: a `telemetry` event, valid **only when the run is already
-  terminal**, applying **only** `Telemetry`/`TelemetryRefs` (never `status`,
-  `exit_code`, leader-exit evidence, or any lifecycle field). A generic runner
-  method `RecordAuxTelemetry(ctx, id, state string, refs []string)` appends it
-  (rejecting a non-terminal run); `mergeEvidence` keeps it a forward transition
-  from `pending`. `replay`/`rebuild`/the projection/index and their tests are
-  updated for this one authorized post-terminal transition.
+- **The post-terminal telemetry write is a per-run-flock CAS, and the shim is its
+  SOLE writer (P0).** M20's replay rejects any event after a terminal event; M20b
+  authorizes exactly one additional kind — a `telemetry` event, valid **only when
+  the run is already terminal**, applying **only** `Telemetry`/`TelemetryRefs`
+  (never `status`, `exit_code`, leader-exit evidence, or any lifecycle field).
+  `RecordAuxTelemetry(ctx, id, state, refs)` performs it as an **atomic CAS under
+  the per-run flock**: re-read authoritative state; append **only** from `pending`;
+  an identical re-append is **idempotent**; a conflicting transition from an
+  already-settled state is **rejected without appending** — so it is deterministic
+  and uncorrupted regardless of ordering. Because **only the shim** writes telemetry
+  (see the next bullet), there is at most one settling writer per run; the CAS also
+  makes a shim retry safe. `replay`/`rebuild`/projection/index + tests updated for
+  this one authorized post-terminal transition.
 - **The Core decides `complete` vs `incomplete` (P3):** after wiring, the shim
   transitions to `complete` **iff every *requested* wiring op completed** (M19's
   `runWiring.WiringComplete` — so a `--report`-only run needs only the report), else
   `incomplete` — carrying the M19 warning codes **and** the ids of whatever subset
   *did* land, in `TelemetryRefs`.
-- **Reconcile (M20 lease, refined):** for a **terminal** run with
-  `Telemetry==pending`, only a **positively `dead`** supervisor converts it to
-  `incomplete` + `U_RUN_TELEMETRY_PENDING` (the wiring will never happen — the shim
-  is gone). `alive` and `unknown` liveness **preserve `pending`** (the shim may
-  still be wiring), never fabricating a terminal state. `U_RUN_TELEMETRY_PENDING`
-  lives **only in `TelemetryRefs`**, never in the run's `ErrorCodes`, so
-  `CleanSuccess()`, exit classification, and the write-once leader-exit evidence are
-  unchanged (the run itself succeeded; only its *telemetry* is incomplete).
-- `aira get <run>` and the detached handle report this durable state, not a guess.
+- **Reconcile does NOT write telemetry; the Core interprets at READ time (P1).** To
+  keep the runner a pure opaque carrier (no interpretation of telemetry values), the
+  runner's Reconcile never transitions telemetry. Instead the runner exposes
+  **generic supervisor liveness** (`alive|dead|unknown`, the M20 lease), and the
+  **Core** computes the *effective* telemetry status when it is read/displayed — a
+  live query, never a stored fake (AIRA §17): `complete`/`incomplete` as-is; a
+  **terminal** run with durable `Telemetry==pending` and a **dead** supervisor is
+  presented as **incomplete/abandoned** + `U_RUN_TELEMETRY_PENDING` (the shim died
+  before settling — it never will); `pending` with an **alive/unknown** supervisor
+  stays `pending`. The durable state remains the honest `pending` (the shim genuinely
+  did not settle it); `U_RUN_TELEMETRY_PENDING` is a *presentation* code, never in
+  the run's `ErrorCodes`, so `CleanSuccess()`, exit classification, and the
+  write-once leader-exit evidence are all unchanged.
+- `aira get <run>` and the detached handle report this state (durable value +
+  read-time interpretation), not a guess.
 
 ---
 
@@ -232,12 +242,18 @@ store` via the real CLI.
    `Telemetry=pending` is durable in the `starting` event (before the child runs); a
    post-terminal `telemetry` event is accepted by replay (and applies **only**
    telemetry fields — a post-terminal attempt to mutate status/exit is still
-   rejected); a shim killed after terminal but before wiring → reconcile with a
-   **dead** supervisor → `incomplete` + `U_RUN_TELEMETRY_PENDING` (in
-   `TelemetryRefs`, not `ErrorCodes`); with an **alive/unknown** supervisor →
-   `pending` preserved, never fabricated `complete`. A `--report`-only run reaching
-   `complete` (M19 `WiringComplete`) proves `complete` does not require compute.
-   `CleanSuccess()` is unchanged by the telemetry code.
+   rejected). **CAS forced races**: two `RecordAuxTelemetry` calls (complete/incomplete
+   and incomplete/incomplete) resolve deterministically — append only from `pending`,
+   identical re-append idempotent, conflicting settled-transition rejected without
+   corruption; replay stays deterministic. **Read-time interpretation (P1)**:
+   Reconcile writes **no** telemetry event; the Core computes the effective status
+   from the durable value + generic supervisor liveness — a terminal run with durable
+   `Telemetry==pending` + a **dead** supervisor presents as
+   `incomplete`/`U_RUN_TELEMETRY_PENDING` (a *presentation* code, not in
+   `ErrorCodes`), while **alive/unknown** presents `pending`; the durable value stays
+   `pending` (no fabricated `complete`); `CleanSuccess()` is unchanged. A
+   `--report`-only run reaching durable `complete` (M19 `WiringComplete`) proves
+   `complete` does not require compute.
 9. **Sidecar**: versioned `0600`, consumed+deleted before the child launches;
    malformed/oversized/unknown-schema → readiness fails before any child runs;
    launcher removes it on LaunchDetached-fail/ACK-cancel; absent sidecar → run
