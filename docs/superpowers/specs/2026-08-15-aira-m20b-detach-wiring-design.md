@@ -1,6 +1,6 @@
 # M20b — Detached-run telemetry auto-wiring
 
-Status: PLAN v2 (post Sol round 1). Phase 5. Lifts M20 deferral **D1**: a detached
+Status: PLAN v3 (post Sol rounds 1-2). Phase 5. Lifts M20 deferral **D1**: a detached
 run (`aira run --detach`) auto-wires the M19 telemetry (`--report`→test report,
 `--tool`→ComputeEvent, `tests-green` observation) **in the supervisor shim after
 the terminal CAS**, instead of rejecting those flags.
@@ -59,14 +59,14 @@ FACT never a gate verdict — §120).
      consume+strict-decode+size-limit the control file → Request
      consume+strict-decode+size-limit+DELETE the sidecar → params, reportContext
        malformed/oversized/unknown-schema → fail READINESS before any child runs
+     (req.TelemetryPending is set when a sidecar is present, so SuperviseRequest
+      stamps Telemetry=pending ATOMICALLY in the starting event, before the child)
    record, err := SuperviseRequest(...)     ← now RETURNS (*RunRecord, error)
-     (the shim marks telemetry=pending on the starting record when a sidecar is
-      present, so a crash before wiring stays visible)
    if wiring requested AND record != nil AND record.Status.Terminal():
      core := build Core (the shim already opens the store `s`)
      result := core.WireDetachedTelemetry(ctx, params, *record, reportContext)
        → AddTestReport (provenance = the PRE-LAUNCH snapshot) + AddComputeEvent
-     RecordRunTelemetry(record.ID, complete|incomplete, codes, reportID, computeID)
+     RecordAuxTelemetry(record.ID, complete|incomplete, refs=[codes, artifact ids])
    exit
 ```
 
@@ -99,29 +99,51 @@ FACT never a gate verdict — §120).
   sidecar (crash between write and consume) is bounded to the launch window and is
   `0600`.
 
-### 2.2 Durable per-run wiring state (P0)
+### 2.2 Durable per-run wiring state — a generic opaque envelope (P0/P1/P2)
 
-Async wiring is made **observable, never ambiguous**, by a durable per-run
-telemetry state (missing artifacts alone cannot distinguish failure / crash /
-eviction / unfinished — and the shim's stderr is `/dev/null`).
+Async wiring is made **observable, never ambiguous**, by a durable per-run state
+(missing artifacts alone cannot distinguish failure / crash / eviction / unfinished
+— and the shim's stderr is `/dev/null`). The runner stays **generic**: it records a
+monotonic opaque state + opaque references and knows nothing of reports/compute.
 
-- `RunRecord` gains `Telemetry string` (`not-requested | pending | complete |
-  incomplete`) + `TelemetryCodes []string` + optional `TestReportID` /
-  `ComputeEventID` refs — an **opaque** status the runner records but does not
-  interpret (like M19's Ticket/Phase/Label/Tool pass-through). A new runner method
-  `RecordRunTelemetry(ctx, id, state, codes, reportID, computeID)` appends a
-  `telemetry` ledger event; `mergeEvidence` carries the fields monotonically
-  (state is write-forward: `pending`→`complete|incomplete`, never backward).
-- The **shim sets `Telemetry=pending`** on/right after the `starting` record when a
-  wiring sidecar is present — **before the child runs** — so a shim crash mid-wiring
-  leaves a durable, visible `pending`, not a silent gap.
-- After wiring, the shim sets `complete` (report+compute both succeeded) or
-  `incomplete` (with the M19 warning codes + whatever artifacts *did* land),
-  attaching the artifact IDs.
-- **Reconcile surfaces a stuck wiring**: a **terminal** run with
-  `Telemetry==pending` and a **dead** supervisor (the M20 lease) →
-  `U_RUN_TELEMETRY_PENDING` (a visible residual, like `U_RUN_SUPERVISOR_STALLED`),
-  never a fabricated "complete".
+- **Generic envelope on `RunRecord` (P2):** `Telemetry string` (an **opaque**
+  state — the runner never parses its values) + `TelemetryRefs []string` (opaque
+  references — the Core packs codes + artifact ids as strings the runner never
+  interprets). No `TestReportID`/`ComputeEventID`/report/compute names appear in
+  runner logic. **Core** owns every state string (`pending|complete|incomplete`),
+  the `not-requested` default, and the ref content. `mergeEvidence` carries both
+  forward; legacy/empty `Telemetry` normalises to `not-requested` on read.
+- **`pending` is stamped ATOMICALLY in the `starting` event (P1).** `SuperviseRequest`
+  blocks from starting through termination, so there is no seam to append `pending`
+  separately (and a separate append would race M20's held-flock launch section).
+  Instead `Request` carries an **opaque `TelemetryPending string`** (the Core sets
+  it to its `pending` sentinel when a wiring sidecar is present); the runner stamps
+  `record.Telemetry = req.TelemetryPending` in the initial `starting` event — before
+  the child runs. Because readiness is signalled *after* `starting`, **readiness
+  implies `pending` is durable**, so a shim crash mid-wiring always leaves a visible
+  `pending`.
+- **Post-terminal telemetry write is explicitly authorized in replay (P0).** M20's
+  replay rejects any event after a terminal event. M20b authorizes exactly one
+  additional kind: a `telemetry` event, valid **only when the run is already
+  terminal**, applying **only** `Telemetry`/`TelemetryRefs` (never `status`,
+  `exit_code`, leader-exit evidence, or any lifecycle field). A generic runner
+  method `RecordAuxTelemetry(ctx, id, state string, refs []string)` appends it
+  (rejecting a non-terminal run); `mergeEvidence` keeps it a forward transition
+  from `pending`. `replay`/`rebuild`/the projection/index and their tests are
+  updated for this one authorized post-terminal transition.
+- **The Core decides `complete` vs `incomplete` (P3):** after wiring, the shim
+  transitions to `complete` **iff every *requested* wiring op completed** (M19's
+  `runWiring.WiringComplete` — so a `--report`-only run needs only the report), else
+  `incomplete` — carrying the M19 warning codes **and** the ids of whatever subset
+  *did* land, in `TelemetryRefs`.
+- **Reconcile (M20 lease, refined):** for a **terminal** run with
+  `Telemetry==pending`, only a **positively `dead`** supervisor converts it to
+  `incomplete` + `U_RUN_TELEMETRY_PENDING` (the wiring will never happen — the shim
+  is gone). `alive` and `unknown` liveness **preserve `pending`** (the shim may
+  still be wiring), never fabricating a terminal state. `U_RUN_TELEMETRY_PENDING`
+  lives **only in `TelemetryRefs`**, never in the run's `ErrorCodes`, so
+  `CleanSuccess()`, exit classification, and the write-once leader-exit evidence are
+  unchanged (the run itself succeeded; only its *telemetry* is incomplete).
 - `aira get <run>` and the detached handle report this durable state, not a guess.
 
 ---
@@ -206,10 +228,16 @@ store` via the real CLI.
 6. Truncated/incomplete capture → `parser_complete=false` + the M19 code, `Telemetry
    =incomplete`, never a fake green.
 7. `--detach --strict-wiring` → `E_RUN_ARGUMENT_INVALID`, synchronous, no id.
-8. **Durable state / crash visibility**: `Telemetry=pending` is durable from before
-   the child runs; a shim killed after terminal but before wiring → reconcile
-   surfaces `U_RUN_TELEMETRY_PENDING` (terminal + pending + dead supervisor), never
-   `complete`.
+8. **Durable state / crash visibility**: readiness is never emitted until
+   `Telemetry=pending` is durable in the `starting` event (before the child runs); a
+   post-terminal `telemetry` event is accepted by replay (and applies **only**
+   telemetry fields — a post-terminal attempt to mutate status/exit is still
+   rejected); a shim killed after terminal but before wiring → reconcile with a
+   **dead** supervisor → `incomplete` + `U_RUN_TELEMETRY_PENDING` (in
+   `TelemetryRefs`, not `ErrorCodes`); with an **alive/unknown** supervisor →
+   `pending` preserved, never fabricated `complete`. A `--report`-only run reaching
+   `complete` (M19 `WiringComplete`) proves `complete` does not require compute.
+   `CleanSuccess()` is unchanged by the telemetry code.
 9. **Sidecar**: versioned `0600`, consumed+deleted before the child launches;
    malformed/oversized/unknown-schema → readiness fails before any child runs;
    launcher removes it on LaunchDetached-fail/ACK-cancel; absent sidecar → run
@@ -246,7 +274,9 @@ store` via the real CLI.
 **New/changed surface:** exported `Core.WireDetachedTelemetry` + `WiringParams`;
 `wireTerminalRun` takes `WiringParams`; `SuperviseRequest` → `(*RunRecord, error)`;
 `LaunchDetached(…, wiringPath)`; `--wiring` internal arg on `__supervise` (hidden);
-`RunRecord.Telemetry`/`TelemetryCodes`/`TestReportID`/`ComputeEventID` + a
-`telemetry` ledger event + `RecordRunTelemetry`; new code `U_RUN_TELEMETRY_PENDING`.
+the **generic** `RunRecord.Telemetry string` + `TelemetryRefs []string` (opaque to
+the runner), `Request.TelemetryPending string`, a replay-authorized post-terminal
+`telemetry` event + `RecordAuxTelemetry(id, state, refs)`; new code
+`U_RUN_TELEMETRY_PENDING` (carried in `TelemetryRefs`, never `ErrorCodes`).
 Otherwise reuses the M19 taxonomy; `--detach --strict-wiring` reuses
 `E_RUN_ARGUMENT_INVALID`.
