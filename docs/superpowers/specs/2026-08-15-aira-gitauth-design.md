@@ -1,6 +1,6 @@
 # AIRA #30 — `aira git`: non-interactive git network ops with SSH→gh-credential auth fallback
 
-Status: PLAN (v7 — Sol round-6 fixes: raw config URLs + rewrite-once + clean-env probe (no double/triple insteadOf), allow-list remote.* copy)
+Status: PLAN APPROVED (v8 — Sol APPROVE-PLAN after 6 adversarial rounds; build-review checklist in §14)
 Date: 2026-08-15
 Milestone: #30 — Runner git-op command with SSH→gh-credential auth fallback
 Depends on: nothing unlanded (master `1e84128`)
@@ -381,20 +381,26 @@ would apply them a *third* time — so probe, report, and op could all disagree.
 resolution is therefore:
 
 1. **Raw URL from config, never from a `--get-url` expansion**: push → `git config
-   --get-all remote.<name>.pushurl` (falling back to `remote.<name>.url`; single per the
-   §5.0 guard); fetch/ls-remote → `git config --get-all remote.<name>.url` (git uses the
-   first value); clone → the URL argument. `git config` returns the **raw, unrewritten**
-   value.
+   --get-all remote.<name>.pushurl`, and only if **absent** fall back to
+   `remote.<name>.url` (single per the §5.0 guard); fetch/ls-remote → `git config
+   --get-all remote.<name>.url` (git uses the first value); clone → the URL argument.
+   `git config` returns the **raw, unrewritten** value.
 2. **Apply `insteadOf`/`pushInsteadOf` EXACTLY ONCE ourselves** — git's own single pass,
-   **longest-matching-prefix** `<base>`, `pushInsteadOf` taking precedence for a push, no
-   match → passthrough, **not iterated** (a chained A→B where B also matches is *not*
-   re-applied, matching git). This pure, side-effect-free string rewrite is the **only**
-   git behaviour we reimplement (fully specified — unlike `push.default`). The result E is
-   the endpoint git's committed op will use, and the reported `url`/`host`/`auth`.
+   **longest-matching-prefix** `<base>`, no match → passthrough, **not iterated** (a
+   chained A→B where B also matches is *not* re-applied, matching git). Precedence: for a
+   push, `pushInsteadOf` is tried first, **but only when the raw URL came from
+   `remote.<name>.url`** — git does **not** apply `pushInsteadOf`/`insteadOf` to an
+   **explicit `pushurl`** (it is used verbatim); for fetch, only `insteadOf`. This pure,
+   side-effect-free string rewrite is the **only** git behaviour we reimplement (fully
+   specified — unlike `push.default`). The result E is git's committed-op endpoint and the
+   reported `url`/`host`/`auth`.
 3. **Probe E with rewriting suppressed** so git cannot reapply: the throwaway `git
-   ls-remote <E>` runs in a **clean config environment** (`GIT_CONFIG_GLOBAL=/dev/null`,
-   `GIT_CONFIG_SYSTEM=/dev/null`, a non-repo cwd) — no `insteadOf` exists there, so E is
-   used verbatim → probe endpoint == E == op endpoint, per verb, even under chained rules.
+   ls-remote <E>` runs in a **genuinely rewrite-free config environment** — not just
+   `GIT_CONFIG_GLOBAL=/dev/null` + `GIT_CONFIG_SYSTEM=/dev/null` + a non-repo cwd, but
+   also with every **command-scope injection cleared**: `GIT_CONFIG_COUNT`, all
+   `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, and `GIT_CONFIG_PARAMETERS` unset (Sol round-7)
+   — so no `insteadOf` exists there and E is used verbatim → probe endpoint == E == op
+   endpoint, per verb, even under chained rules.
 
 (Build-review must verify our single-pass matches git — longest-prefix, tie-break, case
 sensitivity, `pushInsteadOf` precedence — against fixture repos; see §11.)
@@ -643,3 +649,20 @@ on the network.
 9. No credential is ever invented for the caller or swapped in silently; no
    credential or URL-embedded secret ever reaches a payload, log, or the live tee
    (redaction on all surfaced URLs/stderr).
+
+## 14. Build-review checklist (Sol APPROVE-PLAN, round 7)
+
+Implementation-verified items (not plan blockers) the build review must confirm:
+
+1. **Genuinely rewrite-free probe env** — unset `GIT_CONFIG_COUNT`, all
+   `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, `GIT_CONFIG_PARAMETERS` (plus
+   `GIT_CONFIG_GLOBAL`/`SYSTEM=/dev/null` and a non-repo cwd), so no command-scope config
+   injection can reapply `insteadOf` to the probe.
+2. **Raw-URL selection** — absent vs multiple `pushurl`/`url`; encode git's rule that an
+   explicit `pushurl` is used verbatim (no `pushInsteadOf`/`insteadOf`).
+3. **Fixture-test the single-pass resolver against the installed git** — longest-prefix
+   tie-breaking, case sensitivity, includes/conditional-includes, chained non-iteration.
+4. **Trace-assert endpoint agreement** — resolved endpoint == probe endpoint == committed
+   endpoint == reported transport, for every verb and every failure branch.
+5. **`unsupported-remote-config` detection** reads every effective config scope and
+   **fails closed on an enumeration error** (never silently proceeds).
