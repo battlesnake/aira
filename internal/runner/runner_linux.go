@@ -326,7 +326,11 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		if err = startCommand(cmd); err != nil {
 			closePipes(readers, writers)
 			code := "E_RUN_LAUNCH_FAILED"
-			if strings.Contains(err.Error(), "clone3") || errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.ENOSYS) {
+			// A clone3/cgroup placement failure is a scope failure. A bare EPERM is treated
+			// as a scope denial ONLY for the non-pty path: with --pty, Setsid/TIOCSCTTY (and
+			// exec security policy) are new EPERM sources at Start, so a bare EPERM is
+			// ambiguous and must stay E_RUN_LAUNCH_FAILED rather than falsely claim scope.
+			if strings.Contains(err.Error(), "clone3") || errors.Is(err, syscall.ENOSYS) || (!req.PTY && errors.Is(err, syscall.EPERM)) {
 				code = "E_RUN_SCOPE_UNAVAILABLE"
 			}
 			releaseAdmit()

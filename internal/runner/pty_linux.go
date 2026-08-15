@@ -66,13 +66,24 @@ func collectPTYCapture(ctx context.Context, ch <-chan captureResult, count int, 
 	for _, reader := range readers {
 		_ = reader.Close()
 	}
-	// Closing a Linux pty master interrupts its blocking Read. Join after the
-	// close so no drain goroutine or master descriptor survives Launch.
+	// Closing the pty master interrupts a blocking master.Read — but the drain
+	// goroutine could instead be blocked WRITING the capture file (a stuck/full
+	// sink), which the reader close does not unblock. So this SECOND join is ALSO
+	// bounded: on its deadline we stop waiting rather than hang Launch forever. A
+	// drain still blocked is left to finish on its own (captureCh is buffered, so
+	// its eventual send never blocks); its stream's OutputRef keeps the initialised
+	// OutputPartial state, which is honest.
+	secondary := time.NewTimer(grace)
+	defer secondary.Stop()
 	for len(result) < count {
-		item := <-ch
-		item.State = OutputPartial
-		result = append(result, item)
-		completeness.observe(item)
+		select {
+		case item := <-ch:
+			item.State = OutputPartial
+			result = append(result, item)
+			completeness.observe(item)
+		case <-secondary.C:
+			return result, true
+		}
 	}
 	return result, true
 }

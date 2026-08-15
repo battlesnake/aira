@@ -132,6 +132,36 @@ func TestPTYCaptureIncompleteIsMonotonicAcrossDeadlineEIORace(t *testing.T) {
 	}
 }
 
+// verifies: the SECOND (post-close) join is ALSO bounded. Closing the master unblocks a
+// blocked master.Read, but a drain goroutine blocked WRITING its sink is not unblocked by
+// the close — so collectPTYCapture must not wait forever for its result. A closer whose
+// Close() never completes the drain models that stuck writer.
+func TestPTYCaptureSecondJoinBoundedWhenDrainBlocksOnWrite(t *testing.T) {
+	results := make(chan captureResult, 1) // buffered; the stuck writer never sends
+	tracker := &captureCompleteness{}
+	type outcome struct {
+		captures []captureResult
+		forced   bool
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		captures, forced := collectPTYCapture(context.Background(), results, 1, time.Millisecond, []io.Closer{noopCloser{}}, tracker)
+		done <- outcome{captures, forced}
+	}()
+	select {
+	case got := <-done:
+		if !got.forced || tracker.complete() || len(got.captures) != 0 {
+			t.Fatalf("captures=%+v forced=%v complete=%v (want bounded: forced, incomplete, 0 results)", got.captures, got.forced, tracker.complete())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("collectPTYCapture hung on a write-blocked drain — the second join is not bounded")
+	}
+}
+
+type noopCloser struct{}
+
+func (noopCloser) Close() error { return nil }
+
 type neverEmptyPTYScope struct {
 	killed bool
 }
