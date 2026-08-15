@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +38,29 @@ func TestInitCreatesRegisteredProjectAndRefusesOverwrite(t *testing.T) {
 	}
 	if filepath.IsAbs(result.Root) || filepath.IsAbs(result.Config) || result.Root != "." || result.Config != ".aira/config" {
 		t.Fatalf("init leaked absolute paths: %#v", result)
+	}
+}
+
+func TestOpenWiresNonemptyWorktreeOwnerIntoRunner(t *testing.T) {
+	root := t.TempDir()
+	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	if _, err := Init(context.Background(), root, map[string]any{"project": "demo", "prefixes": "DEMO"}); err != nil {
+		t.Fatal(err)
+	}
+	opened, project, err := Open(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	if project.Runner == nil || project.WorktreeID == "" {
+		t.Fatalf("open project=%+v", project)
+	}
+	owner := reflect.ValueOf(project.Runner).Elem().FieldByName("owner").String()
+	if owner == "" || owner != project.WorktreeID {
+		t.Fatalf("runner owner=%q worktree=%q", owner, project.WorktreeID)
 	}
 }
 

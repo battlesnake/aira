@@ -23,6 +23,7 @@ import (
 type Runner struct {
 	ledger             *ledger
 	outputDir          string
+	owner              string
 	backend            ScopeBackend
 	prefix             []string
 	grace              time.Duration
@@ -92,7 +93,7 @@ func New(cfg Config) (*Runner, error) {
 	if termGrace == 0 {
 		termGrace = 500 * time.Millisecond
 	}
-	return &Runner{ledger: l, outputDir: output, backend: backend, prefix: prefix, grace: grace, termGrace: termGrace, now: cfg.Now,
+	return &Runner{ledger: l, outputDir: output, owner: cfg.Owner, backend: backend, prefix: prefix, grace: grace, termGrace: termGrace, now: cfg.Now,
 		memorySlice: strings.TrimSpace(cfg.MemorySlice), memoryReserve: cfg.MemoryReserve, admissionMaxWait: cfg.AdmissionMaxWait,
 		pollInterval: cfg.PollInterval, clock: cfg.Clock, sliceMemory: cfg.sliceMemoryFn, diagnostics: cfg.Diagnostics}, nil
 }
@@ -222,7 +223,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		started := nowString(r.now)
 		// Containment is not an initial assumption. Until the leader is positively
 		// observed in cgroup.procs, the durable record must remain non-contained.
-		record = RunRecord{SchemaVersion: ledgerSchema, ID: id, Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, Buffering: buffering, Admission: admission.state, AdmissionReason: admission.reason, AdmissionWaitedMS: admission.waitedMS, LaunchPrefix: append([]string(nil), prefix...), StartedAt: started, Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}}
+		record = RunRecord{SchemaVersion: ledgerSchema, ID: id, Owner: r.owner, Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, Buffering: buffering, Admission: admission.state, AdmissionReason: admission.reason, AdmissionWaitedMS: admission.waitedMS, LaunchPrefix: append([]string(nil), prefix...), StartedAt: started, Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}}
 		// The intended scope reference is durable before scope creation. It is not
 		// used as kill authority until the actual scope-created record is present.
 		record.CgroupScope = r.intendedScope(id)
@@ -387,7 +388,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		case outcome := <-waitCh:
 			waitErr, waitState = outcome.err, outcome.state
 		case <-timer.C:
-			attempt, killErr := r.killWithIntent(ctx, id, "run-timeout")
+			attempt, killErr := r.killWithIntent(ctx, id, "run-timeout", killPolicy{Enforce: false})
 			timeoutKill = attempt
 			if killErr != nil || !attempt.IntentPublished {
 				// A wait result published before the deadline wins. Otherwise retain
@@ -616,6 +617,12 @@ func mergeEvidence(base, candidate RunRecord) RunRecord {
 	}
 	if candidate.CgroupScope != "" {
 		base.CgroupScope = candidate.CgroupScope
+	}
+	if candidate.Owner != "" {
+		base.Owner = candidate.Owner
+	}
+	if candidate.StolenBy != "" {
+		base.StolenBy = candidate.StolenBy
 	}
 	if candidate.PIDIdentity.PID != 0 {
 		base.PIDIdentity = candidate.PIDIdentity
@@ -1290,7 +1297,7 @@ type killAttempt struct {
 // killWithIntent is the shared durable kill path. It publishes KillIntent
 // before touching the scope, and leaves terminal publication to the caller so
 // Launch can merge monitor and capture evidence before its terminal CAS.
-func (r *Runner) killWithIntent(ctx context.Context, id, actor string) (killAttempt, error) {
+func (r *Runner) killWithIntent(ctx context.Context, id, actor string, policy killPolicy) (killAttempt, error) {
 	lock, err := lockFile(filepath.Join(filepath.Dir(r.ledger.ledger), id+".lock"))
 	if err != nil {
 		return killAttempt{}, err
@@ -1304,9 +1311,15 @@ func (r *Runner) killWithIntent(ctx context.Context, id, actor string) (killAtte
 	if err != nil {
 		return killAttempt{}, err
 	}
-	current := runs[id]
+	current, ok := runs[id]
+	if !ok {
+		return killAttempt{}, &LaunchError{"E_RUN_NOT_FOUND", errors.New(id)}
+	}
 	if current.Status.Terminal() {
 		return killAttempt{Current: current}, nil
+	}
+	if policy.Enforce && current.Owner != "" && policy.CallerOwner != "" && current.Owner != policy.CallerOwner {
+		return killAttempt{Current: current}, &ForeignOwnerError{RunID: id, Owner: current.Owner, CallerOwner: policy.CallerOwner}
 	}
 	waitPublished := false
 	for _, event := range events {
@@ -1321,7 +1334,17 @@ func (r *Runner) killWithIntent(ctx context.Context, id, actor string) (killAtte
 	if !current.KillIntent.Present {
 		current.KillIntent = KillIntent{Present: true}
 		current.ScopeKill.Requested = true
+		if policy.Steal && policy.CallerOwner != "" {
+			current.StolenBy = policy.CallerOwner
+		}
 		event, appendErr := r.append(ledgerEvent{Kind: "kill-intent", Run: current})
+		if appendErr != nil {
+			return killAttempt{}, appendErr
+		}
+		current = event.Run
+	} else if policy.Steal && policy.CallerOwner != "" {
+		current.StolenBy = policy.CallerOwner
+		event, appendErr := r.append(ledgerEvent{Kind: "kill-steal", Run: current})
 		if appendErr != nil {
 			return killAttempt{}, appendErr
 		}
@@ -1348,9 +1371,14 @@ func (r *Runner) killWithIntent(ctx context.Context, id, actor string) (killAtte
 	return attempt, nil
 }
 
-func (r *Runner) Kill(ctx context.Context, id string) (*RunRecord, error) {
-	attempt, err := r.killWithIntent(ctx, id, "run-kill")
+func (r *Runner) Kill(ctx context.Context, id string, steal bool) (*RunRecord, error) {
+	attempt, err := r.killWithIntent(ctx, id, "run-kill", killPolicy{Enforce: !steal, Steal: steal, CallerOwner: r.owner})
 	if err != nil {
+		var foreign *ForeignOwnerError
+		if errors.As(err, &foreign) {
+			current := attempt.Current
+			return &current, err
+		}
 		return nil, err
 	}
 	current := attempt.Current

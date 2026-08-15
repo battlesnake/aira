@@ -77,7 +77,7 @@ func TestRealCgroupRunKillSnapshotsUsageWithoutOOMMisclassification(t *testing.T
 	// Give the child enough time to accrue measurable user time before the
 	// cgroup.kill/removal path is exercised.
 	time.Sleep(20 * time.Millisecond)
-	_, killErr := r.Kill(context.Background(), "RUN-1")
+	_, killErr := r.Kill(context.Background(), "RUN-1", false)
 	if killErr != nil && !strings.Contains(killErr.Error(), "U_RUN_RECONCILE_REQUIRED") {
 		t.Fatal(killErr)
 	}

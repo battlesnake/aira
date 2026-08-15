@@ -88,7 +88,7 @@ func TestLedgerRoundTripPreservesBufferingAndAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusStarting, ScopeIntegrity: ScopeContained, Buffering: "realtime", Admission: "waited", AdmissionReason: "", AdmissionWaitedMS: 123}
+	run := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Owner: "A", StolenBy: "B", Status: StatusStarting, ScopeIntegrity: ScopeContained, Buffering: "realtime", Admission: "waited", AdmissionReason: "", AdmissionWaitedMS: 123}
 	if _, err := l.append(ledgerEvent{Kind: "starting", Run: run}); err != nil {
 		t.Fatal(err)
 	}
@@ -101,6 +101,9 @@ func TestLedgerRoundTripPreservesBufferingAndAdmission(t *testing.T) {
 	}
 	if events[0].Run.Admission != "waited" || events[0].Run.AdmissionWaitedMS != 123 {
 		t.Fatalf("ledger admission=%+v", events[0].Run)
+	}
+	if events[0].Run.Owner != "A" || events[0].Run.StolenBy != "B" {
+		t.Fatalf("ledger ownership=%+v", events[0].Run)
 	}
 }
 
@@ -606,6 +609,7 @@ func TestRealCgroupIntegrationOrClearSkip(t *testing.T) {
 	if record.Status != StatusExited || record.ExitCode == nil {
 		t.Fatalf("record=%+v", record)
 	}
+	assertRunEventsOwner(t, r, record.ID, "A")
 	if data, err := os.ReadFile(record.OutputRefs["out"].Path); err != nil || string(data) != "out" {
 		t.Fatalf("stdout=%q err=%v", data, err)
 	}
@@ -647,6 +651,7 @@ func TestRealCgroupTimeoutUsesDurableKillAndKillsGrandchild(t *testing.T) {
 	if !record.KillIntent.Present || !record.KillIntent.Completed || !record.ScopeKill.Completed {
 		t.Fatalf("timeout did not retain durable kill evidence: %+v", record)
 	}
+	assertRunEventsOwner(t, r, record.ID, "A")
 	if got := terminalRecords(t, r); got != 1 {
 		t.Fatalf("terminal records=%d", got)
 	}
@@ -894,7 +899,7 @@ func TestRealCgroupRealtimePreservesSeparateCaptureAndDigests(t *testing.T) {
 
 func realRunner(t *testing.T) *Runner {
 	t.Helper()
-	r, err := New(Config{CommonDir: t.TempDir(), Grace: time.Second, TermGrace: 100 * time.Millisecond})
+	r, err := New(Config{CommonDir: t.TempDir(), Owner: "A", Grace: time.Second, TermGrace: 100 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -963,7 +968,7 @@ func terminalRecords(t *testing.T, r *Runner) int {
 func TestRealCgroupWholeScopeKillIncludesSetsidGrandchild(t *testing.T) {
 	r := realRunner(t)
 	outcome := launchAsync(t, r, Request{Argv: []string{"/bin/sh", "-c", "setsid sh -c 'sleep 30' & sleep 30"}})
-	if _, err := r.Kill(context.Background(), "RUN-1"); err != nil {
+	if _, err := r.Kill(context.Background(), "RUN-1", false); err != nil {
 		t.Fatal(err)
 	}
 	result := <-outcome
@@ -977,6 +982,7 @@ func TestRealCgroupWholeScopeKillIncludesSetsidGrandchild(t *testing.T) {
 	if current.Status != StatusKilled {
 		t.Fatalf("whole-scope result=%+v", current)
 	}
+	assertRunEventsOwner(t, r, current.ID, "A")
 	if got := terminalRecords(t, r); got != 1 {
 		t.Fatalf("terminal records=%d", got)
 	}
@@ -985,7 +991,7 @@ func TestRealCgroupWholeScopeKillIncludesSetsidGrandchild(t *testing.T) {
 func TestRealCgroupKillWaitRaceHasOneTerminalWinner(t *testing.T) {
 	r := realRunner(t)
 	outcome := launchAsync(t, r, Request{Argv: []string{"/bin/sh", "-c", "sleep 0.2"}})
-	_, _ = r.Kill(context.Background(), "RUN-1")
+	_, _ = r.Kill(context.Background(), "RUN-1", false)
 	result := <-outcome
 	if result.err != nil && !strings.Contains(result.err.Error(), "U_RUN_RECONCILE_REQUIRED") {
 		t.Fatal(result.err)
@@ -1009,6 +1015,11 @@ func TestRealCgroupReconcileRacePreservesWaitAndTerminalUniqueness(t *testing.T)
 	if got := terminalRecords(t, r); got != 1 {
 		t.Fatalf("terminal records=%d", got)
 	}
+	current, err := r.Get("RUN-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRunEventsOwner(t, r, current.ID, "A")
 }
 
 func TestRealCgroupMigratedLaunchIsNotClean(t *testing.T) {
@@ -1126,7 +1137,7 @@ func TestRealCgroupAtomicMigrationResidualIsExplicit(t *testing.T) {
 func TestRealCgroupFailBeforeLaunchKillRaceHasOneTerminal(t *testing.T) {
 	r := realRunner(t)
 	outcome := launchAsync(t, r, Request{Argv: []string{"/definitely/not/an/executable"}})
-	_, _ = r.Kill(context.Background(), "RUN-1")
+	_, _ = r.Kill(context.Background(), "RUN-1", false)
 	result := <-outcome
 	if result.err == nil {
 		t.Fatal("missing launch failure")

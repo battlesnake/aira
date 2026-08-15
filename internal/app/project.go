@@ -162,6 +162,7 @@ func OpenWithDiagnostics(ctx context.Context, cwd string, diagnostics io.Writer)
 	execution, err := runner.New(runner.Config{
 		CommonDir:        project.CommonDir,
 		OutputDir:        filepath.Join(project.CommonDir, "aira", "runs", "output"),
+		Owner:            project.WorktreeID,
 		CgroupParent:     project.Config.Run.CgroupParent,
 		Prefix:           project.Config.Run.Prefix,
 		MemorySlice:      project.Config.Run.Slice,

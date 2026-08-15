@@ -4,6 +4,7 @@ package runner
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"time"
 )
@@ -78,6 +79,8 @@ type PIDIdentity struct {
 type RunRecord struct {
 	SchemaVersion       int                  `json:"schema_version"`
 	ID                  string               `json:"id"`
+	Owner               string               `json:"owner,omitempty"`
+	StolenBy            string               `json:"stolen_by,omitempty"`
 	Argv                []string             `json:"argv"`
 	Cwd                 string               `json:"cwd"`
 	EnvDigest           string               `json:"env_digest"`
@@ -179,6 +182,7 @@ type OutputChunk struct {
 type Config struct {
 	CommonDir        string
 	OutputDir        string
+	Owner            string
 	CgroupParent     string
 	Prefix           []string
 	Grace            time.Duration
@@ -216,9 +220,25 @@ type killResult struct {
 	Empty     bool
 }
 
+type killPolicy struct {
+	Enforce     bool
+	Steal       bool
+	CallerOwner string
+}
+
 type LaunchError struct {
 	Code string
 	Err  error
+}
+
+type ForeignOwnerError struct {
+	RunID       string
+	Owner       string
+	CallerOwner string
+}
+
+func (e *ForeignOwnerError) Error() string {
+	return fmt.Sprintf("run %s is owned by %q, not caller %q; pass --steal to override", e.RunID, e.Owner, e.CallerOwner)
 }
 
 func (e *LaunchError) Error() string { return e.Code + ": " + e.Err.Error() }

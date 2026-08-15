@@ -23,7 +23,7 @@ func (r *requestCaptureRunner) Launch(_ context.Context, request runner.Request)
 	r.request = request
 	return &runner.RunRecord{ID: "RUN-1", Status: runner.StatusExited}, nil
 }
-func (*requestCaptureRunner) Kill(context.Context, string) (*runner.RunRecord, error) {
+func (*requestCaptureRunner) Kill(context.Context, string, bool) (*runner.RunRecord, error) {
 	return nil, nil
 }
 func (*requestCaptureRunner) Get(string) (*runner.RunRecord, error) { return nil, nil }
@@ -71,6 +71,20 @@ func TestReadyListFlagParsesAsBoolean(t *testing.T) {
 	request, err := buildRequest("ready", positional, options)
 	if err != nil || request.Args["selector"] != nil {
 		t.Fatalf("ready --list request = %#v err=%v", request, err)
+	}
+}
+
+func TestRunKillStealFlagBuildsBooleanRequest(t *testing.T) {
+	positional, options, err := parseArgs("run-kill", []string{"--steal", "RUN-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := buildRequest("run-kill", positional, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Args["run_id"] != "RUN-1" || request.Args["steal"] != true {
+		t.Fatalf("run-kill request=%#v", request)
 	}
 }
 

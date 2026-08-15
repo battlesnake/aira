@@ -128,7 +128,7 @@ func TestKillLostPathRetainsUsageBeforeScopeBecomesUnavailable(t *testing.T) {
 	}
 	run := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusRunning, CgroupScope: dir}
 	appendRunEvent(t, r, "starting", run)
-	_, err = r.Kill(context.Background(), "RUN-1")
+	_, err = r.Kill(context.Background(), "RUN-1", false)
 	if err == nil {
 		t.Fatal("incomplete kill was reported as successful")
 	}

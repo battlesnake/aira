@@ -763,7 +763,7 @@ func TestAdmissionT11KillAndReconcileDoNotTakeAdmissionLock(t *testing.T) {
 	}
 	defer holder.release()
 	done := make(chan struct{}, 2)
-	go func() { _, _ = r.Kill(context.Background(), run.ID); done <- struct{}{} }()
+	go func() { _, _ = r.Kill(context.Background(), run.ID, false); done <- struct{}{} }()
 	go func() { _, _ = r.Reconcile(context.Background()); done <- struct{}{} }()
 	for i := 0; i < 2; i++ {
 		select {

@@ -48,6 +48,22 @@ func TestMCPToolListIsGeneratedAndStable(t *testing.T) {
 	}
 }
 
+func TestMCPRunKillDeclaresStealBoolean(t *testing.T) {
+	server := newMCPServer(nil)
+	binding, ok := server.byName["aira_run_kill"]
+	if !ok {
+		t.Fatal("missing aira_run_kill tool")
+	}
+	schema, ok := binding.tool.InputSchema.(mcpInputSchema)
+	if !ok {
+		t.Fatalf("run-kill schema type=%T", binding.tool.InputSchema)
+	}
+	property, ok := schema.Properties["steal"]
+	if !ok || property.Type != "boolean" {
+		t.Fatalf("run-kill steal property=%+v present=%v", property, ok)
+	}
+}
+
 func TestMCPLifecycleAndProtocolErrors(t *testing.T) {
 	server := newMCPServer(func(context.Context, core.Request) (*core.Core, func(), error) {
 		return core.New(nil), func() {}, nil

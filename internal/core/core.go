@@ -259,7 +259,7 @@ type FaceOutput struct {
 // through this interface.
 type Runner interface {
 	Launch(context.Context, runner.Request) (*runner.RunRecord, error)
-	Kill(context.Context, string) (*runner.RunRecord, error)
+	Kill(context.Context, string, bool) (*runner.RunRecord, error)
 	Get(string) (*runner.RunRecord, error)
 	ReadOutput(context.Context, runner.OutputRequest) (*runner.OutputChunk, error)
 	Reconcile(context.Context) ([]runner.RunRecord, error)
@@ -1124,12 +1124,21 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return record, nil
 		}},
-		"run-kill": {Name: "run-kill", Usage: "run-kill <run-id>", Args: []ArgSpec{stringSpec("run_id", true, true, "Run identifier")}, MCPTool: "aira_run_kill", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+		"run-kill": {Name: "run-kill", Usage: "run-kill <run-id> [--steal]", Args: []ArgSpec{stringSpec("run_id", true, true, "Run identifier"), boolSpec("steal", false, false, "Override foreign run ownership")}, MCPTool: "aira_run_kill", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			runID := stringArg(args, "run_id")
+			steal := boolArg(args, "steal")
 			if c.runner == nil {
 				return nil, runnerError("E_RUN_SCOPE_UNAVAILABLE", errors.New("runner is unavailable"))
 			}
-			return c.runner.Kill(ctx, runID)
+			record, err := c.runner.Kill(ctx, runID, steal)
+			var foreign *runner.ForeignOwnerError
+			if errors.As(err, &foreign) {
+				return handlerData{Code: "E_RUN_FOREIGN_OWNER", Data: map[string]any{
+					"run_id": foreign.RunID, "owner": foreign.Owner, "caller_owner": foreign.CallerOwner,
+					"hint": "pass --steal to override",
+				}}, nil
+			}
+			return record, err
 		}},
 		"run-log": {Name: "run-log", Usage: "run-log <run-id> [--stream out|err|merged] [--follow --from N --tail N --full]", Args: []ArgSpec{
 			stringSpec("run_id", true, true, "Run identifier"),

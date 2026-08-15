@@ -231,7 +231,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"spend":       {"provider": true, "model": true, "source": true, "ticket": true, "phase": true, "at": true, "session": true, "agent": true, "total": true, "cost-usd": true, "usage-file": true, "bucket": true, "reasoning-subset": true, "by": true},
 		"quota":       {"provider": true, "source": true, "at": true, "window": true, "used": true, "limit": true, "remaining": true, "reset-at": true},
 		"insights":    {},
-		"run-kill":    {},
+		"run-kill":    {"steal": true},
 		"run-log":     {"stream": true, "from": true, "tail": true, "follow": true, "full": true},
 		"gate":        {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "reason": true, "report": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-seed": true, "mutation-expected-result": true},
 	}
@@ -349,6 +349,7 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			return core.Request{}, fmt.Errorf("E_RUN_ARGUMENT_INVALID: run-kill requires <run-id>")
 		}
 		args["run_id"] = positional[0]
+		args["steal"] = options["steal"] == "true"
 	case "run-log":
 		if len(positional) != 1 {
 			return core.Request{}, fmt.Errorf("E_RUN_ARGUMENT_INVALID: run-log requires <run-id>")
