@@ -105,6 +105,18 @@ func TestM20bAppendRejectsPreTerminalTelemetry(t *testing.T) {
 	if err == nil {
 		t.Fatal("append accepted a pre-terminal telemetry event")
 	}
+	// The rejected event must NOT be written: the ledger still contains only the
+	// starting event and still replays. (An impl that writes then errors fails here.)
+	events, readErr := r.ledger.read()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(events) != 1 || events[0].Kind != "starting" {
+		t.Fatalf("rejected telemetry event was persisted: %+v", events)
+	}
+	if _, err := replay(events); err != nil {
+		t.Fatalf("ledger no longer replays after a rejected append: %v", err)
+	}
 }
 
 func TestM20bRecordAuxTelemetryCASRacesAndIsIdempotent(t *testing.T) {

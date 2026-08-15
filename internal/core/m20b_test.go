@@ -284,38 +284,60 @@ func TestM20bTerminalFailuresStillWireHonestly(t *testing.T) {
 	}
 }
 
-// TestM20bNonTerminalIsNotWiredAndStoreFailureSettlesIncomplete covers the two
-// shim precondition/settlement edges: a non-terminal record is never wired, and a
-// store-write failure yields an incomplete settlement without rewriting the run.
-func TestM20bNonTerminalIsNotWiredAndStoreFailureSettlesIncomplete(t *testing.T) {
-	t.Run("non-terminal record is not wired", func(t *testing.T) {
-		running := terminalM19Record(0)
-		running.Status, running.TerminalComplete = runner.StatusRunning, false
-		if running.Status.Terminal() {
-			t.Fatal("test setup: record must be non-terminal")
+type fakeAuxRunner struct {
+	m19Runner
+	auxCalls  int
+	lastID    string
+	lastState string
+	lastRefs  []string
+	auxErr    error
+}
+
+func (r *fakeAuxRunner) RecordAuxTelemetry(_ context.Context, id, state string, refs []string) (*runner.RunRecord, error) {
+	r.auxCalls++
+	r.lastID, r.lastState, r.lastRefs = id, state, append([]string(nil), refs...)
+	return nil, r.auxErr
+}
+
+// TestM20bWireAndSettleRunsTheRealSettlement exercises the ACTUAL shim path
+// (WireAndSettleDetached → RecordAuxTelemetry), not a locally-derived state: a
+// shim that skips settlement or hardcodes `complete` fails here.
+func TestM20bWireAndSettleRunsTheRealSettlement(t *testing.T) {
+	t.Run("terminal + store failure settles incomplete exactly once", func(t *testing.T) {
+		record := terminalM19Record(0)
+		aux := &fakeAuxRunner{m19Runner: m19Runner{record: record, chunk: runner.OutputChunk{Bytes: []byte("report")}}}
+		s := &m19Store{reportErr: errors.New("E_TESTREPORT_INVALID: injected")}
+		wiring, settled, err := NewWithRunner(s, aux).WireAndSettleDetached(context.Background(), record, WiringParams{Report: "go-json"}, store.TestReportContext{})
+		if err != nil {
+			t.Fatal(err)
 		}
-		r := &m19Runner{record: running, chunk: runner.OutputChunk{Bytes: []byte("x")}}
-		s := &m19Store{reportResult: store.TestReportAddResult{ID: "TR-1", Report: validM19Report()}}
-		wiring := NewWithRunner(s, r).WireDetachedTelemetry(context.Background(), WiringParams{Report: "go-json"}, running, store.TestReportContext{})
-		if s.reportCalls != 0 || wiring.WiringComplete {
-			t.Fatalf("non-terminal record was wired: calls=%d wiring=%+v", s.reportCalls, wiring)
+		if !settled || wiring.WiringComplete || aux.auxCalls != 1 || aux.lastState != TelemetryIncomplete || aux.lastID != record.ID {
+			t.Fatalf("store failure did not settle incomplete once: settled=%v wiring=%+v aux=%+v", settled, wiring, aux)
 		}
 	})
-
-	t.Run("store failure settles incomplete and preserves the run", func(t *testing.T) {
+	t.Run("terminal + success settles complete exactly once", func(t *testing.T) {
 		record := terminalM19Record(0)
-		r := &m19Runner{record: record, chunk: runner.OutputChunk{Bytes: []byte("report")}}
-		s := &m19Store{reportErr: errors.New("E_TESTREPORT_INVALID: injected"), reportResult: store.TestReportAddResult{}}
-		wiring := NewWithRunner(s, r).WireDetachedTelemetry(context.Background(), WiringParams{Report: "go-json"}, record, store.TestReportContext{})
-		state := TelemetryIncomplete
-		if wiring.WiringComplete {
-			state = TelemetryComplete
+		aux := &fakeAuxRunner{m19Runner: m19Runner{record: record, chunk: runner.OutputChunk{Bytes: []byte("report")}}}
+		s := &m19Store{reportResult: store.TestReportAddResult{ID: "TR-1", Report: validM19Report()}}
+		wiring, settled, err := NewWithRunner(s, aux).WireAndSettleDetached(context.Background(), record, WiringParams{Report: "go-json"}, store.TestReportContext{})
+		if err != nil {
+			t.Fatal(err)
 		}
-		if state != TelemetryIncomplete {
-			t.Fatalf("store failure did not settle incomplete: wiring=%+v", wiring)
+		if !settled || !wiring.WiringComplete || aux.auxCalls != 1 || aux.lastState != TelemetryComplete {
+			t.Fatalf("success did not settle complete once: settled=%v wiring=%+v aux=%+v", settled, wiring, aux)
 		}
-		if record.Status != runner.StatusExited || record.ExitCode == nil || *record.ExitCode != 0 {
-			t.Fatalf("store failure rewrote the run outcome: %+v", record)
+	})
+	t.Run("non-terminal record is neither wired nor settled", func(t *testing.T) {
+		running := terminalM19Record(0)
+		running.Status, running.TerminalComplete = runner.StatusRunning, false
+		aux := &fakeAuxRunner{m19Runner: m19Runner{record: running, chunk: runner.OutputChunk{Bytes: []byte("x")}}}
+		s := &m19Store{reportResult: store.TestReportAddResult{ID: "TR-1", Report: validM19Report()}}
+		_, settled, err := NewWithRunner(s, aux).WireAndSettleDetached(context.Background(), running, WiringParams{Report: "go-json"}, store.TestReportContext{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if settled || s.reportCalls != 0 || aux.auxCalls != 0 {
+			t.Fatalf("non-terminal record was wired/settled: settled=%v reportCalls=%d auxCalls=%d", settled, s.reportCalls, aux.auxCalls)
 		}
 	})
 }

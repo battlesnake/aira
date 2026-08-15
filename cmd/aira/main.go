@@ -188,16 +188,13 @@ func runSupervisor(argv []string, diagnostics io.Writer) int {
 	record, superviseErr := project.Runner.SuperviseRequest(context.Background(), request, readyFD, ackFD)
 	var telemetryErr error
 	if wiringRequested && detachedWiringTerminal(record) {
-		wiring := core.NewWithRunner(s, project.Runner).WireDetachedTelemetry(context.Background(), wiringParams, *record, reportContext)
-		state := core.TelemetryIncomplete
-		if wiring.WiringComplete {
-			state = core.TelemetryComplete
-		} else if diagnostics != nil {
+		wiring, _, settleErr := core.NewWithRunner(s, project.Runner).WireAndSettleDetached(context.Background(), *record, wiringParams, reportContext)
+		telemetryErr = settleErr
+		if diagnostics != nil && !wiring.WiringComplete {
 			for _, warning := range wiring.Warnings {
 				_, _ = fmt.Fprintf(diagnostics, "detached telemetry %s: %s: %s\n", warning.Action, warning.Code, warning.Message)
 			}
 		}
-		_, telemetryErr = project.Runner.RecordAuxTelemetry(context.Background(), record.ID, state, wiring.TelemetryReferences())
 		if telemetryErr != nil && diagnostics != nil {
 			_, _ = fmt.Fprintf(diagnostics, "detached telemetry settlement: %v\n", telemetryErr)
 		}

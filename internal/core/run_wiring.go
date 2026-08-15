@@ -147,6 +147,34 @@ func (c *Core) WireDetachedTelemetry(ctx context.Context, params WiringParams, r
 	return c.wireTerminalRun(ctx, cloneWiringParams(params), record, reportContext)
 }
 
+// auxTelemetryRunner is the generic post-terminal settlement seam.
+type auxTelemetryRunner interface {
+	RecordAuxTelemetry(context.Context, string, string, []string) (*runner.RunRecord, error)
+}
+
+// WireAndSettleDetached is the SINGLE wire→decide→settle path the supervisor shim
+// and its tests share: it wires the terminal run's telemetry, decides `complete`
+// (iff every requested op completed, per WiringComplete) versus `incomplete`, and
+// records the one post-terminal telemetry settlement. It performs no wiring and no
+// settlement for a non-terminal record. Returns the wiring (for diagnostics), a
+// `settled` flag, and any settlement error.
+func (c *Core) WireAndSettleDetached(ctx context.Context, record runner.RunRecord, params WiringParams, reportContext store.TestReportContext) (runWiring, bool, error) {
+	if !record.Status.Terminal() {
+		return runWiring{}, false, nil
+	}
+	wiring := c.WireDetachedTelemetry(ctx, params, record, reportContext)
+	state := TelemetryIncomplete
+	if wiring.WiringComplete {
+		state = TelemetryComplete
+	}
+	recorder, ok := c.runner.(auxTelemetryRunner)
+	if !ok {
+		return wiring, true, errors.New("runner does not support telemetry settlement")
+	}
+	_, err := recorder.RecordAuxTelemetry(ctx, record.ID, state, wiring.TelemetryReferences())
+	return wiring, true, err
+}
+
 // TelemetryReferences packs artifact ids and warning codes into the runner's
 // generic opaque reference list. The ordering is deterministic.
 func (w runWiring) TelemetryReferences() []string {
