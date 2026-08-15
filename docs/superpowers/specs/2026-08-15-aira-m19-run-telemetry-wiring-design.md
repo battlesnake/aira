@@ -1,171 +1,173 @@
-# AIRA M19 — run → telemetry/gate auto-wiring
+# AIRA M19 — run → telemetry auto-wiring (report + compute + honest observation)
 
-Status: PLAN (v1, for Sol adversarial plan-review)
+Status: PLAN (v2 — Sol plan-review r1: drop gate attestation (a run-observed pass is not
+§118 proven-to-fire), add report identity fields, truncation→parser_complete=false, --usage
+authoritative tokens, strict-wiring opt-in)
 Date: 2026-08-15
 Milestone: Phase 5 · M19 — telemetry/gate auto-wiring
-Depends on: M12 runner, M16 rusage, M13 test-reports, M14 compute telemetry, M10b command gate
-(all landed, master `bd965be`)
-Design authority: 2026-08-07-aira-design.md §14 (Launch/Wiring lines 146,155), §12 compute,
-§13 test-reports, §9 gate honesty (line 120: `tests-green` ⇐ exit==0 **and** parsed report
-test-count>0).
+Depends on: M12 runner, M16 rusage, M13 test-reports, M14 compute telemetry (all landed, `bd965be`)
+Design authority: 2026-08-07-aira-design.md §14 (Launch/Wiring 146,155), §12, §13, §9 (line 118
+proven-to-fire; line 120 tests-green ⇐ exit0 AND count>0).
 
-## 0. The gap
+## 0. The gap, and the honest boundary M19 respects
 
-M12–M18b give `aira run` a launch/capture/rusage record, but an agent still has to run three
-*separate* commands to make a run count: `test-report add`, `spend add` (ComputeEvent), and a
-gate attestation. §14 line 155 defines the wiring: a `run --phase … --tool …` auto-emits a
-ComputeEvent; a `run --report <fmt>` creates a §13 report and attests `tests-green` **only** per
-the exit0-and-count>0 rule. M19 wires the existing engines onto `aira run` — it invents no new
-telemetry, only connects what M13/M14/M10b already own, honestly.
+An agent must run `test-report add` and `spend add` separately to make a run count. §14 line 155
+wires those onto `aira run`. But §9 line 118 forbids marking a **checkable gate** green without a
+**dated, evidence-linked, decaying proven-to-fire** attestation — and a `--report` run only proves
+**one run passed**; it never fired the gate's lane on a known-bad input (Sol plan-review r1 P0).
+So M19 deliberately **does not attest any gate verdict**. It:
+
+1. produces the durable §13 **report** (the input a gate/ratchet later consumes), and
+2. records honest **run-observation facts** (`tests_green_observed` = exit0 AND count>0),
+
+and leaves the proven-to-fire gate verdict where it belongs — the M10b command-gate's own lane +
+continuous canary. M19 is telemetry wiring; the "gate" half is *feeding* gates, not deciding them.
 
 ## 1. Scope
 
 **In:**
-- **Run provenance metadata**: `Request.{Ticket,Phase,Label,Tool}` + `RunRecord.{Ticket,Phase,
-  Label,Tool}`; faces `--ticket/--phase/--label/--tool` on `aira run` (CLI + MCP). Recorded on
-  the first ledger event, carried in `mergeEvidence` (the M16/M18a field-loss trap). Pure
-  metadata — never changes launch/capture behaviour.
-- **`--report <fmt>` auto-ingest**: after the run terminates, read the captured output and ingest
-  it as a §13 TestReport (reuse the M13 parser + `AddTestReport`), stamping the run's provenance:
-  `RunRef=<run id>`, `TicketID/Phase` from the flags, `Commit/Branch/WorktreeID` from the store's
-  git context, `Format=<fmt>`, `EnvDigest` from the run. Honesty: `ParserComplete` reflects the
-  **real** parse (a malformed/partial capture → `parser_complete=false`, report still recorded,
-  excluded from flaky/ratchet — never faked); a run whose capture is **incomplete**
-  (`CaptureComplete=false`) yields `parser_complete=false`. Report-ingest failure is surfaced as a
-  **warning on the run response**, never silently dropped and **never fails the run** (the run
-  already happened — recording is best-effort telemetry).
-- **`--tool <t>` ComputeEvent auto-emit**: a run with `--tool` emits a §12 ComputeEvent (reuse
-  `AddComputeEvent`) keyed by `(Ticket, Phase, Model=<tool>)`, capturing the run's **resource**
-  usage — wall (`ended-started`), `cpu_user`, `cpu_sys`, `peak_rss` (from M16, `*int64`, nil ⇒
-  unevaluated). **Token buckets are `unevaluated`** in v1: parsing a tool's `--json` token usage
-  is provider-specific and deferred (D1) — recording fabricated token counts would violate the
-  M14 honesty contract, so the honest default is resource-usage-with-tokens-unevaluated. Emit
-  failure → warning, never fails the run.
-- **`tests-green` attestation** (the gate half): a `run --report --attest <gate-id>` records a
-  `tests-green` attestation **only** when `exit==0` **AND** the parsed report has
-  `test-count>0` (§9 line 120). Otherwise it does **not** attest and records the honest reason
-  (`U_GATE_TESTS_GREEN_UNPROVEN`: exit≠0, zero tests, or an incomplete/failed parse). The
-  attestation is **evidence-linked to the run + report** (§9 line 118 — a green gate must have
-  actually fired and the proof must be evidence-linked), so it is not a bare manual verdict
-  (§3.4 details the linkage decision).
+- **Run provenance**: `Request.{Ticket,Phase,Label,Tool}` + `RunRecord.{Ticket,Phase,Label,Tool}`;
+  faces `--ticket/--phase/--label/--tool` (CLI+MCP). Recorded on the first ledger event, carried
+  in `mergeEvidence` (the M16/M18a field-loss trap). Pure metadata — never alters launch/capture.
+- **`--report <fmt>` auto-ingest** with the §6 identity fields as inputs so the report is
+  *comparable*: `--suite <id>`, `--config-env K=V` (→ env-scoped config digest, as M13),
+  `--shard <s>`, `--retry <n>` (default 0). After the run terminates, read the **full** captured
+  output (§3.2 — uncapped, with truncation detection), build a `domain.TestReportInput` with
+  provenance (`RunRef=<id>`, `TicketID/Phase` from flags, `Commit/Branch/WorktreeID` from the
+  store git context, `SuiteID/Config/Shard/RetryIndex/EnvDigest`, `Format`, `Raw`), and
+  `AddTestReport` (the M13 parser fills `Results/ParserComplete`). **Comparability honesty**: when
+  a required §6 identity field (`suite_id`, config, shard) is unknown, the report is still
+  recorded but is **ineligible for flaky/ratchet comparison** — this is already M13's rule (those
+  require all identity fields non-empty+equal); M19 does not fabricate identities to force
+  comparability.
+- **`--tool <t>` ComputeEvent** keyed `(Ticket,Phase,Model=<tool>)` capturing **resource** usage
+  (wall=`ended-started`, `cpu_user/cpu_sys/peak_rss` from M16; nil→unevaluated). Authoritative
+  **token** usage is recorded **only from an explicit `--usage <file|->`** (a provider usage JSON,
+  parsed by M14's per-provider normaliser — reusing M14's honesty: never fabricate a bucket);
+  absent `--usage` ⇒ token buckets **unevaluated** (§14 "absent → …unevaluated"). Auto-extracting
+  usage from the tool's stdout is D1 (fragile per-tool scraping) — deferred, never silently
+  guessed.
+- **Run-observation facts** (not a gate verdict): the run response reports
+  `tests_green_observed` = (`exit==0` AND the ingested report's `test_count>0` AND
+  `parser_complete`), else the honest reason (`exit≠0` / `zero-tests` / `parse-incomplete` /
+  `no-report`). This is a *run observation*, explicitly **not** a gate attestation (§0).
+- **Wiring outcome + opt-in strictness**: a `wiring` block on the response with a **stable code
+  per auto-action** and an overall `wiring_complete` bool (§4). By default a wiring failure is a
+  **warning** and does not fail the run (the launch record is authority). An opt-in
+  `--strict-wiring` makes an *incomplete* wiring a non-zero **AIRA** exit (the child already ran;
+  AIRA signals the telemetry gap) for workflows that require the evidence.
 
 **Out (deferred, written down):**
-- **D1 provider token-usage parsing** — a per-tool `--json` usage parser feeding the ComputeEvent
-  token buckets; v1 records resource usage only, tokens `unevaluated`.
-- **D2 auto gate creation** — `--attest` names an **existing** gate; M19 never mints a gate.
-- **D3 detach / supervisor** — the `--detach` shim (§14 line 153) is its own milestone; M19 wires
-  the foreground run only.
-- **D4 `run-input`** — post-shim.
+- **D1 tool stdout usage auto-extraction** — v1 takes authoritative tokens only via `--usage`.
+- **D2 gate attestation / verdict** — a run observation is not §118 proven-to-fire; the gate
+  verdict stays with the M10b command-gate lane + canary. M19 feeds gates the report only.
+- **D3 detach/shim**, **D4 run-input**.
 
 ## 2. Invariants (each → a discriminating test)
 
-- **I1 — metadata is orthogonal.** `--ticket/--phase/--label/--tool` change only recorded fields;
-  a run with and without them has the **same** `env_digest`, capture, and exit behaviour.
-- **I2 — the report reflects the real parse, never faked.** A `--report go-json` run of a suite
-  that emits N results records a report with those N results and `parser_complete=true`; a
-  malformed/truncated capture records `parser_complete=false` (report kept, flaky/ratchet
-  exclude it); an **incomplete capture** (`CaptureComplete=false`) → `parser_complete=false`.
-- **I3 — `tests-green` obeys §120 exactly.** `--report --attest G`: `exit==0` + report
-  test-count>0 → a `tests-green` attestation linked to the run+report; `exit==0` + **zero** tests
-  (e.g. `go test` with no test files) → **NOT** attested (`U_GATE_TESTS_GREEN_UNPROVEN`); `exit≠0`
-  → NOT attested. A bare exit code never forges the attestation.
-- **I4 — wiring failures never corrupt the run.** A report-ingest / ComputeEvent / attest failure
-  is a **warning** on the run response; the run's own record (status/exit/capture) is unchanged
-  and the run is not re-run or failed. Telemetry is best-effort; the launch record is authority.
-- **I5 — ComputeEvent tokens are honestly unevaluated.** A `--tool` run's ComputeEvent has real
-  resource usage (or nil→unevaluated where M16 couldn't read it) and token buckets `unevaluated`
-  — never a fabricated 0 or a guessed count.
-- **I6 — no gate-lane recursion.** The auto-wiring runs in the `aira run` **face handler** after
-  `Launch` returns; the M10b command-gate lane (which itself calls the runner) constructs its
-  `runner.Request` without M19 flags, so a gate's own command run does not recursively auto-emit
-  telemetry.
+- **I1 — metadata orthogonal.** `--ticket/--phase/--label/--tool` change only recorded fields; a
+  run with and without them has identical `env_digest`, capture, and exit behaviour.
+- **I2 — report reflects the REAL parse.** A clean `go-json`/`junit` capture → N results,
+  `parser_complete=true`; a malformed capture → `parser_complete=false` (report kept, comparison-
+  excluded); an **incomplete capture** (`CaptureComplete=false`) OR a **truncated read** →
+  `parser_complete=false`, never true (§3.2).
+- **I3 — comparability is honest.** A report missing a required §6 identity field is recorded but
+  flagged ineligible for flaky/ratchet comparison (M13's rule); M19 never fabricates suite/config
+  to force a comparison.
+- **I4 — `tests_green_observed` obeys §120 and is a fact not a verdict.** exit0 + count>0 +
+  parser_complete → observed; exit0 + **zero tests** → not-observed(`zero-tests`); exit≠0 → not.
+  The response never labels this a gate pass; no gate audit row is written.
+- **I5 — tokens honestly unevaluated.** A `--tool` run without `--usage` → ComputeEvent with real
+  resource usage and token buckets nil/unevaluated (never a fabricated 0); with `--usage` → the
+  M14 normaliser fills buckets, still never fabricating an absent one.
+- **I6 — wiring failures never corrupt the run.** An injected report/compute failure → a coded
+  warning + `wiring_complete=false`; the run record (status/exit/capture) is unchanged and the run
+  is not re-run. Default exit is the child's; `--strict-wiring` makes AIRA exit non-zero on
+  incomplete wiring (documented, opt-in).
+- **I7 — no gate-lane recursion.** The wiring runs in the `aira run` core handler after `Launch`;
+  the M10b command-gate builds its `runner.Request` without M19 flags, so a gate's own command run
+  emits no M19 report/ComputeEvent.
 
 ## 3. Design
 
 ### 3.1 Where the wiring runs
 
-The `run` **core handler** (`internal/core/core.go`), after `c.runner.Launch(ctx, req)` returns a
-terminal `RunRecord`, performs the wiring against `c.store`: read capture (via the runner's
-`ReadOutput`), ingest report, emit ComputeEvent, attest. The handler already has both `c.runner`
-and `c.store`. The runner is **not** modified to do telemetry (it stays a pure recorder, §14
-line 146); the metadata fields are the only runner change. The wiring is skipped when the
-relevant flag is absent, and entirely for the gate lane (I6).
+The `run` **core handler** (`internal/core/core.go`), after `c.runner.Launch` returns a terminal
+`RunRecord`, wires against `c.store`. The runner stays a pure recorder (§14 line 146) — only the
+four metadata fields change there. Each auto-action is gated on its flag; the whole block is
+absent for the gate lane (I7).
 
-### 3.2 `--report` ingest
+### 3.2 `--report` full-capture read with truncation honesty (Sol r1 P0)
 
-1. Only if `--report` set. Read the captured bytes: the merged/`out` stream via
-   `runner.ReadOutput` (bounded by the output cap — a report larger than the cap → parser
-   handles truncation → `parser_complete=false`, honest).
-2. Build `domain.TestReportInput{Format, Raw, TicketID, Phase, RunRef=<id>, Commit, Branch,
-   WorktreeID, EnvDigest, At, …}` — provenance from the store's git context + the run.
-3. `s.AddTestReport(ctx, input)` (the M13 parser fills `Results`/`ParserComplete`). Return the
-   report id + parser-complete on the run response; a non-nil error → a `warning` (I4).
+The report must parse the **whole** captured stream, and any dropped bytes must force
+`parser_complete=false`:
+- Read the captured `out`/merged stream **uncapped** (the M12 capture file holds the full bytes;
+  read the file, not a capped `ReadOutput`). If a read bound is unavoidable, `ReadOutput` must
+  **return truncation metadata** and any truncation → `parser_complete=false`.
+- If `RunRecord.CaptureComplete=false` (forced-close/partial capture, e.g. an M17/M18b bounded
+  drain) → `parser_complete=false` regardless of what parsed. A syntactically-valid prefix of a
+  truncated capture must **never** yield `parser_complete=true`.
+- Build `TestReportInput` (provenance + identity §1), `AddTestReport`. Error → coded warning (I6).
 
-### 3.3 `--tool` ComputeEvent
+### 3.3 `--tool` ComputeEvent + authoritative `--usage`
 
-Only if `--tool` set. `domain.ComputeEventInput{TicketID, Phase, Model=<tool>, At, Source="run",
-Raw: <resource usage: wall/cpu_user/cpu_sys/peak_rss; token fields unset ⇒ unevaluated>}`.
-`s.AddComputeEvent`. Failure → warning (I4). (RawUsage's token buckets are `*int64`; leaving them
-nil is the M14 "unevaluated, not zero" contract — §1 D1.)
+`domain.ComputeEventInput{TicketID,Phase,Model=<tool>,At,Source="run",Raw:<resource usage>}`.
+Resource fields from the record (nil→unevaluated). If `--usage <file|->` is given, its provider
+usage JSON is parsed by the **M14 normaliser** and merged into `Raw` (tokens authoritative,
+still never fabricating an absent bucket). `AddComputeEvent`. Error → coded warning (I6).
 
-### 3.4 `tests-green` attestation — the evidence-linkage decision (Sol, please scrutinise)
+### 3.4 Run-observation facts, NOT a gate verdict (the §118 resolution)
 
-The current `AttestGate(id, verdict, actor)` is a **manual** verdict with no evidence linkage,
-which §9 line 118 forbids for a green *checkable* gate. Two candidate mechanisms:
-
-- **(A) proposed:** extend the attestation path with an **evidence ref** (run id + report id +
-  the exit0/count>0 facts), so M19 records a `tests-green` attestation that is dated and
-  evidence-linked, decaying per the existing attestation max-age. `--attest G` on a `--report`
-  run calls this only when `exit==0 && report.TestCount>0`; else records
-  `U_GATE_TESTS_GREEN_UNPROVEN`. This keeps M19 honest (§120) and reuses the audit-durability
-  M10a already has, adding only the evidence ref.
-- **(B) alternative:** M19 does **not** attest; it only produces the report (the durable
-  evidence), and a separate `gate` verb consumes it. This is smaller but leaves the "attest"
-  half of §155 to a follow-up.
-
-v1 proposes **(A)** with the minimal evidence-ref extension; if Sol judges the linkage too large
-for this cut, we fall back to **(B)** and file the attest as M19b. Either way the §120 rule
-(exit0 + count>0) is the hard gate on any `tests-green` signal.
+M19 records `tests_green_observed` as a **run-level observation** on the response and (optionally)
+as a field on the ingested report — it is exit0 AND report.test_count>0 AND parser_complete. It is
+**not** written to the gate audit, **not** an `AttestGate` call, and **not** a
+proven-to-fire attestation, because a run that passed once has not fired the gate's lane on a
+known-bad input (§118). A caller that wants a gate verdict uses the M10b command-gate (its own
+lane + canary) or pins this report into a ratchet baseline (M13b) — both consume the report M19
+produced. This keeps M19 decision-complete and §118-honest.
 
 ## 4. Faces + response
 
-- CLI `aira run`: `--ticket <id> --phase <p> --label <l> --tool <t> --report <fmt> --attest <gate>`.
-- MCP `aira_run`: same as string/bool args.
-- The run response gains a `wiring` block: `{report_id?, report_parser_complete?, compute_event_id?,
-  tests_green?(attested|unproven|not_requested with reason), warnings:[…]}` — every auto-action's
-  outcome is visible and honest (a skipped/failed action says why).
-- `--report`/`--attest`/`--tool` on a run through the `--json`/MCP face behave identically (the
-  wiring is in the core handler, not a text-face concern).
+- CLI `aira run`: `--ticket <id> --phase <p> --label <l> --tool <t> --report <fmt> --suite <id>
+  --config-env K=V --shard <s> --retry <n> --usage <file|-> --strict-wiring`.
+- MCP `aira_run`: the same as string/bool/list args.
+- Response `wiring` block: `{report:{id?,parser_complete?,comparable?,code}, compute:{id?,tokens:
+  authoritative|unevaluated,code}, tests_green_observed:{observed|not:reason}, wiring_complete:bool,
+  warnings:[{action,code,message}]}`. Every auto-action's outcome — done / skipped-why / failed-why
+  — is visible with a stable code; no silent success or drop. `--strict-wiring` + `wiring_complete
+  =false` → AIRA process exit non-zero (distinct from the child's exit, clearly labelled).
 
 ## 5. Tests (TDD; discriminating)
 
-- **I1** metadata orthogonality: env_digest identical with/without `--ticket/--phase/--label/--tool`.
-- **I2** report ingest: real go-json/junit capture → N results, parser_complete=true; a truncated
-  capture → parser_complete=false (report still recorded); an incomplete-capture run → false.
-- **I3** tests-green honesty (the load-bearing discriminators): exit0+count>0 → attested+linked;
-  exit0+**zero tests** → `U_GATE_TESTS_GREEN_UNPROVEN`, NOT attested (a bare-exit0 impl fails this);
-  exit≠0 → not attested.
-- **I4** failure isolation: an injected AddTestReport/AddComputeEvent/AttestGate error → warning on
-  the response, run record unchanged, exit code preserved.
-- **I5** ComputeEvent tokens unevaluated: `--tool` run → ComputeEvent with resource usage set,
-  token buckets nil/unevaluated (never 0).
-- **I6** no gate-lane recursion: an M10b command-gate run does not emit an M19 report/ComputeEvent.
-- Faces/golden: `--ticket/--phase/--label/--tool/--report/--attest` in the dispatch + skill
-  goldens; MCP==CLI request equivalence for the new args.
-- **Real-binary e2e** (`~/tmp/aira-m19-e2e.sh`, committed): `aira run --report go-json --attest G
-  -- go test -json ./somepkg` → a report is created, tests-green attested when green+count>0; a
-  zero-test run → report recorded but tests-green UNPROVEN; a failing run → not attested; a
-  `--tool codex` run → a ComputeEvent with resource usage + unevaluated tokens. The load-bearing
-  check the Go seam-tests can't: config→core→runner→store wiring end-to-end through the CLI.
+- **I1** env_digest identical with/without metadata flags.
+- **I2** real go-json capture → N results, complete; malformed → parser_complete=false, kept;
+  a `CaptureComplete=false` run → parser_complete=false even with a valid prefix (seam-inject a
+  truncated capture — a "parse the prefix and claim complete" impl must fail this).
+- **I3** report with empty suite_id → recorded but flagged comparison-ineligible (M13 rule).
+- **I4** tests_green_observed: exit0+count>0 → observed; exit0+**zero tests** → not(zero-tests) and
+  **no gate audit row written** (assert the gate audit is untouched — proves M19 is not a verdict);
+  exit≠0 → not.
+- **I5** `--tool` no `--usage` → ComputeEvent resource-set, tokens nil; `--usage` present → M14
+  normaliser fills tokens, an absent bucket stays nil (not 0).
+- **I6** injected AddTestReport/AddComputeEvent error → coded warning, wiring_complete=false, run
+  record unchanged, child exit preserved; `--strict-wiring` → AIRA exit non-zero.
+- **I7** an M10b command-gate run emits no M19 report/ComputeEvent.
+- Faces/golden: the new args in dispatch + skill goldens; MCP==CLI request equivalence.
+- **Real-binary e2e** (`~/tmp/aira-m19-e2e.sh`): `aira run --report go-json --ticket AIRA-1
+  --phase work -- go test -json ./pkg` → report created + tests_green_observed; a zero-test run →
+  report kept, observed=not(zero-tests), gate audit empty; a failing run → not observed; a
+  `--tool codex --usage usage.json` run → ComputeEvent tokens authoritative; without `--usage` →
+  tokens unevaluated. The config→core→runner→store wiring the Go seam-tests can't see.
 
 ## 6. Invariants for the build review (both directions)
 
-1. `tests-green` is attested **iff** exit==0 AND parsed report test-count>0 (§120) — never from a
-   bare exit code, never on an incomplete/failed parse.
-2. Telemetry wiring is best-effort: a wiring failure is a warning, never a run failure or a record
-   mutation (the launch record is authority).
-3. Every auto-action's outcome (done / skipped-why / failed-why) is visible in the `wiring` block —
-   no silent success or silent drop.
-4. ComputeEvent token buckets are `unevaluated`, never a fabricated 0 (M14 contract).
-5. Metadata is orthogonal to launch/capture (`env_digest` unchanged).
-6. The gate lane does not recursively auto-emit telemetry.
+1. M19 writes **no gate verdict / no gate-audit row** — a run-observed green is a fact, never a
+   §118 proven-to-fire attestation (the load-bearing honesty line).
+2. `parser_complete=true` is impossible when the capture was incomplete or the read truncated.
+3. Token buckets are `unevaluated` unless an explicit `--usage` provided them; never a fabricated 0.
+4. A report missing a required §6 identity is recorded but comparison-ineligible; identities are
+   never fabricated.
+5. Wiring failures are coded warnings + `wiring_complete=false`, never a run-record mutation;
+   `--strict-wiring` is the only path to a non-zero AIRA exit and is clearly distinguished from the
+   child's exit.
+6. Metadata is orthogonal to launch/capture; the gate lane emits no M19 telemetry.
