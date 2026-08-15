@@ -1,8 +1,8 @@
 # AIRA M19 — run → telemetry auto-wiring (report + compute + honest observation)
 
-Status: PLAN (v2 — Sol plan-review r1: drop gate attestation (a run-observed pass is not
-§118 proven-to-fire), add report identity fields, truncation→parser_complete=false, --usage
-authoritative tokens, strict-wiring opt-in)
+Status: PLAN (v3 — Sol r2: §14 design-authority AMENDED to reconcile attest→observation +
+usage→--usage with §118; bounded capture read (report_max_bytes); --usage file+--provider (no
+`-`, no provider-guess); config-env canonicalization reuse; strict-wiring exit precedence)
 Date: 2026-08-15
 Milestone: Phase 5 · M19 — telemetry/gate auto-wiring
 Depends on: M12 runner, M16 rusage, M13 test-reports, M14 compute telemetry (all landed, `bd965be`)
@@ -97,24 +97,38 @@ The `run` **core handler** (`internal/core/core.go`), after `c.runner.Launch` re
 four metadata fields change there. Each auto-action is gated on its flag; the whole block is
 absent for the gate lane (I7).
 
-### 3.2 `--report` full-capture read with truncation honesty (Sol r1 P0)
+### 3.2 `--report` BOUNDED capture read with truncation honesty (Sol r1 P0 + r2 P0)
 
-The report must parse the **whole** captured stream, and any dropped bytes must force
-`parser_complete=false`:
-- Read the captured `out`/merged stream **uncapped** (the M12 capture file holds the full bytes;
-  read the file, not a capped `ReadOutput`). If a read bound is unavoidable, `ReadOutput` must
-  **return truncation metadata** and any truncation → `parser_complete=false`.
+The read is **bounded** (an unbounded read of a large/hostile capture could OOM the wiring and
+lose even the run response — Sol r2), and any dropped bytes force `parser_complete=false`:
+- Read the captured `out`/merged stream from the M12 capture file up to a configured
+  `run.report_max_bytes` ceiling (default e.g. 32 MiB). If the capture exceeds the ceiling, the
+  read is **truncated → the report is recorded `parser_complete=false`, comparison-ineligible,
+  with a stable code `U_RUN_REPORT_TOO_LARGE`, and NO `tests_green_observed`** — never a parsed
+  prefix claimed complete. (A streaming parser is a possible later refinement; v1 bounds+flags.)
 - If `RunRecord.CaptureComplete=false` (forced-close/partial capture, e.g. an M17/M18b bounded
-  drain) → `parser_complete=false` regardless of what parsed. A syntactically-valid prefix of a
-  truncated capture must **never** yield `parser_complete=true`.
+  drain) → `parser_complete=false` regardless of what parsed. Any capped `ReadOutput` used must
+  return truncation metadata; any truncation → `parser_complete=false`.
+- A syntactically-valid **prefix** of a truncated/oversized capture must **never** yield
+  `parser_complete=true` nor a green observation.
 - Build `TestReportInput` (provenance + identity §1), `AddTestReport`. Error → coded warning (I6).
 
-### 3.3 `--tool` ComputeEvent + authoritative `--usage`
+### 3.3 `--tool` ComputeEvent + authoritative `--usage <file> --provider <p>`
 
-`domain.ComputeEventInput{TicketID,Phase,Model=<tool>,At,Source="run",Raw:<resource usage>}`.
-Resource fields from the record (nil→unevaluated). If `--usage <file|->` is given, its provider
-usage JSON is parsed by the **M14 normaliser** and merged into `Raw` (tokens authoritative,
-still never fabricating an absent bucket). `AddComputeEvent`. Error → coded warning (I6).
+`domain.ComputeEventInput{TicketID,Phase,Model=<tool>,Provider,At,Source="run",Raw:<resource
+usage>}`. Resource fields from the record (nil→unevaluated). Authoritative token usage comes
+**only** from an explicit `--usage <file>` (a **file**, never `-` — after the child ran, the
+process stdin may be consumed/shared/unavailable, so `-` is prohibited, Sol r2 P1) parsed by the
+**M14 per-provider normaliser selected by a required `--provider <p>`** (Sol r2 P1: guessing the
+provider from a tool name would violate M14 honesty; `--usage` without a recognised `--provider`
+⇒ `E_RUN_USAGE_PROVIDER_REQUIRED`, or tokens left `unevaluated` if provider is unknown/unsupported).
+Absent `--usage` ⇒ tokens `unevaluated`. Never fabricate an absent bucket. `AddComputeEvent`;
+error → coded warning (I6).
+
+`--config-env K=V` reuses the **M13 canonicalization** for the report's config/env digest: keys
+sorted, byte-normalised, **duplicate keys rejected** (`E_RUN_CONFIG_ENV_INVALID`), the sha256
+**digest** persisted (not the raw values — no secret leak through the CLI-arg/ledger surface),
+exactly as M13's `test-report add --config-env` (Sol r2 P1).
 
 ### 3.4 Run-observation facts, NOT a gate verdict (the §118 resolution)
 
@@ -131,11 +145,17 @@ produced. This keeps M19 decision-complete and §118-honest.
 - CLI `aira run`: `--ticket <id> --phase <p> --label <l> --tool <t> --report <fmt> --suite <id>
   --config-env K=V --shard <s> --retry <n> --usage <file|-> --strict-wiring`.
 - MCP `aira_run`: the same as string/bool/list args.
+- CLI `aira run`: `--usage <file>` (a file, not `-`) + `--provider <p>` accompany `--tool`.
 - Response `wiring` block: `{report:{id?,parser_complete?,comparable?,code}, compute:{id?,tokens:
   authoritative|unevaluated,code}, tests_green_observed:{observed|not:reason}, wiring_complete:bool,
   warnings:[{action,code,message}]}`. Every auto-action's outcome — done / skipped-why / failed-why
-  — is visible with a stable code; no silent success or drop. `--strict-wiring` + `wiring_complete
-  =false` → AIRA process exit non-zero (distinct from the child's exit, clearly labelled).
+  — is visible with a stable code; no silent success or drop.
+- **Exit-code precedence (Sol r2 P2)**: the child's exact exit is **always** in the response
+  (`data.exit_code`) and is never masked. The AIRA process exit defaults to the run's own mapped
+  exit. With `--strict-wiring`: **child failure takes precedence** — a non-zero child exit is
+  surfaced as-is (the primary signal); only when the child exited 0 **and** `wiring_complete=false`
+  does AIRA exit with a distinct reserved code (`E_RUN_WIRING_INCOMPLETE`) so the telemetry gap is
+  unambiguous and never confused with a child failure.
 
 ## 5. Tests (TDD; discriminating)
 
