@@ -1,6 +1,6 @@
 # AIRA M18b — `--pty` buffering tactic (real-TTY capture)
 
-Status: PLAN (v3 — Sol r2 fixes: close-master-to-unblock the bounded drain, TIOCGPTPEER-only fail-closed (no racy path fallback), cgroup.kill+populated=0 not "reap")
+Status: PLAN APPROVED (v4 — Sol APPROVE-PLAN after 3 rounds; build-review checklist in §8)
 Date: 2026-08-15
 Milestone: #28 — Phase 5 · M18b — `--pty` buffering tactic (pty capture)
 Depends on: M12 capture, M17 live-tee, M18a `buffering` field (all landed, master `d08a102`)
@@ -75,7 +75,9 @@ setup, stdin no-deadlock, termios output processing) and gets its own two-loop.
   On the normal path the master closes after `EIO`; on the bounded-join cutoff the master is
   **closed to unblock** the drain and the capture is `partial`. The `O_CLOEXEC` slave means no
   slave fd lingers in the child beyond fd 1/2 (else the master never EIOs → the bounded cutoff
-  then applies rather than an unbounded hang).
+  then applies rather than an unbounded hang). **`CaptureIncomplete` is monotonic** (Sol r3): once
+  the bounded cutoff has marked the capture incomplete, a late `EIO` arriving concurrently cannot
+  flip it back to `complete`.
 - **I6 — one merged stream, no gate-lane leak.** `--pty` writes exactly one `RUN-n.log`;
   `merge_streams=true`; `Buffering=pty`. The gate command-lane constructs `runner.Request`
   without `PTY`, so gate runs stay `buffering=none`, pipe-captured, digest unchanged.
@@ -246,3 +248,21 @@ sandbox with no devpts → `E_RUN_PTY_UNAVAILABLE` (fail-closed, honest).
    carried in `mergeEvidence`); gate lane unaffected.
 6. `Setsid`+`Setctty(Ctty=1)`+`UseCgroupFD` compose; the child stays scoped + `run-kill`-able.
 7. A pty failure never downgrades to pipes; it fails this run honestly.
+
+## 8. Build-review checklist (Sol APPROVE-PLAN, r3)
+
+Implementation-verified items the build review must confirm:
+
+1. The `cgroup.events populated=0` wait uses the **existing bounded run-kill context** — on
+   expiry (an uninterruptible/D-state member), close the master, retain `CaptureIncomplete`, and
+   return the established cleanup/timeout error rather than hanging.
+2. `CaptureIncomplete` is **monotonic** — a unit test drives the deadline/EIO race (a late `EIO`
+   after the atomic incomplete transition must not overwrite it with `complete`).
+3. `allocatePTY` unit test: `TIOCGPTPEER` returns a slave with `OPOST` cleared + `O_CLOEXEC`;
+   `TIOCGPTPEER` unavailable → `E_RUN_PTY_UNAVAILABLE` (no path fallback).
+4. `ptyReader`/drain: `errors.Is(err, unix.EIO)`, commit-n-first, `(0,EIO)`/`(n,EIO)`/`(n,other)`
+   cases; no lingering slave fd.
+5. Real-cgroup integration (fail-not-skip): isatty(1&2)+`tcgetpgrp`==pgrp, byte-faithful `\n`,
+   no-stdin `cat` terminates, `--pty` child scoped + `run-kill`-able, `CaptureComplete` on exit.
+6. `Ctty=1` derivation holds under `UseCgroupFD`/clone3 (Go maps `cmd.Stdout`→child fd 1;
+   `CgroupFD` is consumed by clone3 and does not shift the child stdio table).
