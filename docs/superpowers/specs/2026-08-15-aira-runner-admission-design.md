@@ -7,8 +7,9 @@
 - **Depends on:** M12 runner (Launch/scope/lockFile), M16 cgroup-read pattern.
 - **Review:** Sol plan-review r1 → REVISE (0×P0; P1 placement/timer/herd/reader-tests; P2
   reason/diagnostic-writer/units), r2 → REVISE (P0 blocking-flock liveness; P1 lock-window/release/
-  order; P2 MCP-no-record); this is **v3** (§8 tracks resolutions). Correctness-critical
-  (cross-session coordination) → full two-loop.
+  order; P2 MCP-no-record), r3 → REVISE→build-ready (P0 locked-recheck-reason; P1 lock-class/fd/
+  release-all-paths/dir-bound; P2 waited-ms/sleep-clamp); this is **v4** (§8 tracks resolutions).
+  Correctness-critical (cross-session coordination) → full two-loop.
 
 ## 0. Context — the failure this fixes
 
@@ -128,40 +129,49 @@ else:
     cur,max,ok,reason := sliceMemory(path)
     if !ok → Admission=unevaluated,reason; warn(); break        // fail-open
     if max-cur >= reserve:
-        lock, err := tryFlockNB(canonical(path))                // LOCK_NB, non-blocking
-        if err != nil → Admission=unevaluated,reason=lock-error; warn(); break   // open/flock error → fail-open loud
-        if lock == nil:                                          // held by a sibling → contend, keep polling
-            // fall through to deadline + sleep
+        lock, err := tryFlockNB(canonical(path))                // LOCK_NB
+        if isContention(err):        // EWOULDBLOCK/EAGAIN: sibling holds it → keep polling (fd closed)
+            /* fall through to deadline + sleep */
+        else if err != nil:          // any OTHER error (dir/open/flock) → fail-open loud
+            Admission=unevaluated; reason=lock-error; warn(); break
         else:
-            cur2,max2,ok2,_ := sliceMemory(path)                // serialized recheck under the lock
-            if ok2 && max2-cur2 >= reserve:
-                Admission=(waited?"waited":"immediate"); AdmissionWaitedMS=since(start)
-                admitLock = lock                                // carried OUT of the loop (see lock window)
-                break
+            cur2,max2,ok2,reason2 := sliceMemory(path)          // serialized recheck under the lock
+            if !ok2:                 // I1: a recheck read failure fails OPEN immediately (not poll-to-timeout)
+                unlock(lock); Admission=unevaluated; reason=reason2; warn(); break
+            if max2-cur2 >= reserve:
+                Admission=(waited?"waited":"immediate"); admitLock=lock; break   // carried out; held to Start
             unlock(lock)                                        // headroom gone under our lock → keep waiting
-    if clock.Now().Sub(start) >= AdmissionMaxWait → Admission=timeout (unlocked); warn(); break
+    if clock.Now().Sub(start) >= AdmissionMaxWait → Admission=timeout; warn(); break
     waited = true; notePeriodically(cur,max)
-    clock.sleep(min(pollInterval±jitter, remaining), ctx)        // ctx-cancellable
+    clock.sleep(clampPositive(min(pollInterval±jitter, remaining)), ctx)   // ctx-cancellable, never ≤0
+// after ANY break: if waited → AdmissionWaitedMS = since(start)   // recorded on waited/timeout/error alike
 ```
 
 - **Non-blocking lock (Sol r2 P0).** The lock is `LOCK_NB` *inside* the deadline/ctx loop — never a
   blocking `flock` (a live holder stuck in launch-prep must not block siblings past `AdmissionMaxWait`).
-  Contention (`EWOULDBLOCK`, `lock==nil`) is treated like "no headroom yet": keep polling until relief
-  or the deadline. A lock-dir/open/`flock` *error* fails **open loudly** (`unevaluated`, `lock-error`),
-  never a launch failure. At the deadline, proceed **unlocked** with `timeout`.
-- **Lock window + release (Sol r2 P1).** Because id/`starting`/scope come *after* admission, the
-  `admitLock` returned by the gate is held across **all of launch-prep** — id reservation, ledger
-  `starting`, output setup, scope create, pipe/stdin setup, and `Start` — so a sibling's recheck sees
-  this job's child placed in the slice. Release **once, idempotently, immediately after a successful
-  `Start`** and **on every pre-Start error path before it enters `failBeforeLaunch`** (a function-wide
-  `defer unlock` is WRONG — it would hold the admission lock through the child's whole lifetime and the
-  terminal CAS). Implement as a tightly-scoped prep closure with an idempotent `releaseAdmit()`.
+  **Error classification (r3):** `errors.Is(err, unix.EWOULDBLOCK)` **or** `EAGAIN` ⇒ contention →
+  keep polling; `EINTR` ⇒ retry after a `ctx` check; **every other error** (dir create/open/other
+  `flock`) ⇒ `lock-error` fail-open loud. **Every unsuccessful acquisition closes its fd** (no leak).
+  A recheck-read failure under the lock fails open immediately with its own reason (r3 P0 — not
+  poll-to-timeout). At the deadline, proceed **unlocked** with `timeout`.
+- **Lock window + release (Sol r2 P1 / r3).** Because id/`starting`/scope come *after* admission, the
+  `admitLock` is held across **all of launch-prep** — id reservation, ledger `starting`, output setup,
+  scope create, pipe/stdin setup, and `Start` — so a sibling's recheck sees this job's child placed in
+  the slice. Implement launch-prep as a **tightly-scoped closure with a LOCAL `defer admitLock.release()`**
+  so **every** exit — success *and* each direct-return error (`reserveID`, `starting` append,
+  `scope-created` append, output/pipe setup, `Start`) *and* the `failBeforeLaunch` path — releases the
+  lock exactly once (idempotent, nil-safe). A function-wide `defer` is WRONG (it would hold the lock
+  through the child's whole lifetime + the terminal CAS); "release before `failBeforeLaunch`" alone is
+  insufficient because those direct returns bypass it (r3). `EffectiveArgv` and all request validation
+  run **before** admission (step 1), not in this closure.
 - **Lock-order invariant.** `Kill`/`Reconcile`/terminal arbitration NEVER acquire the admission lock,
   and it is always released before `failBeforeLaunch`/terminal CAS — so no lock cycle exists (tested).
-- The **flock** file lives in a machine-wide per-user runtime dir (`$XDG_RUNTIME_DIR/aira-admission/`,
-  fallback `~/.cache/aira/admission/`), named `sha256(canonical-slice-path)`, auto-released on holder
-  death. It serializes admission *decisions* machine-wide but cannot reserve a job's future ramp-up
-  (I6b). Jitter avoids synchronized observation; the lock is the actual serializer.
+- The **flock** file lives in a machine-wide per-user runtime dir, named `sha256(canonical-slice-path)`,
+  auto-released on holder death. **Primary: a validated `$XDG_RUNTIME_DIR/aira-admission/`** (tmpfs →
+  dir create/open won't block); the `~/.cache/aira/admission/` fallback is documented as **outside the
+  strict syscall-level bound** (a pathological FS could block the open — r3 P1). It serializes admission
+  *decisions* machine-wide but cannot reserve a job's future ramp-up (I6b). Jitter avoids synchronized
+  observation; the lock is the actual serializer.
 
 ### 3.5 Diagnostic writer + faces
 
@@ -196,11 +206,19 @@ Gate-loop (fake `Clock` + `sliceMemoryFn` seams):
   scope, cancelled.
 - **T9 (r2 — lock-dir/open/flock failure)** — force the lock dir unwritable → `unevaluated`,
   `lock-error`, loud, **launch proceeds** (not a launch failure).
-- **T10 (r2 — every pre-Start failure releases the lock)** — inject a scope-create/Start failure on an
-  admitted (locked) run → the admission lock is released (a subsequent Launch can acquire it), and the
-  run fails via the normal `failBeforeLaunch` path (no lock held into terminal arbitration).
+- **T10 (r2/r3 — EVERY post-admission failure releases the lock)** — inject a failure at **each**
+  direct-return path after admission (`reserveID`, `starting` append, `scope-created` append,
+  output/pipe setup, `Start`) *and* the `failBeforeLaunch` path → in every case the admission lock is
+  released (a subsequent Launch can acquire it) and no lock is held into terminal arbitration. *Fails a
+  release-before-failBeforeLaunch-only impl.*
 - **T11 (r2 — lock-order)** — concurrent Launch/Kill/Reconcile on the same run/slice → no deadlock
   (Kill/Reconcile never take the admission lock).
+- **T12 (r3 P0 — locked recheck fails open)** — first read reports headroom, the acquired-lock recheck
+  returns `!ok` for each reason (read-error/unbounded/parse-error) → the lock is released, `Admission=
+  unevaluated` with that reason, a warning, and **immediate launch** (not poll-to-timeout).
+- **T13 (r3 P2 — waited-ms on non-admit outcomes)** — a run that polls then hits `timeout` (and one that
+  hits a late read/lock error after several polls) records `AdmissionWaitedMS > 0`; contention/EAGAIN is
+  classified as keep-polling, not `lock-error`.
 
 Reader/resolver **table tests** (real temp files — not the seam): `memory.current`/`max` present →
 values; `max`=`"max"` → unbounded; missing/permission → read-error; empty/`-1`/non-numeric/overflow
@@ -246,6 +264,19 @@ admission state; `runner.New` default max-wait honoured.
 - Per-run `memory.max` caps (rides the `+memory` enablement).
 
 ## 8. Sol plan-review resolutions
+
+### r3 — build-ready after these
+- **P0 locked-recheck discards reason** → §3.4: a `!ok2` recheck under the lock releases + fails open
+  immediately (`unevaluated` + the read's reason), not poll-to-timeout. T12.
+- **P1 lock error classification + fd** → §3.4: `EWOULDBLOCK`/`EAGAIN` = contention, `EINTR` = retry
+  after ctx, else `lock-error`; every failed acquisition closes its fd. T13.
+- **P1 release on EVERY post-admission return** → §3.4: launch-prep is a closure with a LOCAL
+  `defer admitLock.release()` covering reserveID/starting/scope/output/Start + failBeforeLaunch;
+  `EffectiveArgv`+validation confirmed before admission. T10 extended to every path.
+- **P1 lock-dir open bound** → §3.4: primary `$XDG_RUNTIME_DIR` (tmpfs); home-cache fallback documented
+  as outside the strict syscall bound.
+- **P2 waited-ms + sleep clamp** → §3.4: `AdmissionWaitedMS` set on every waited outcome
+  (waited/timeout/error); jittered sleep clamped positive (no busy loop). T13.
 
 ### r2
 - **P0 blocking-flock liveness** → §3.4: `LOCK_NB` inside the deadline/ctx loop; contention keeps
