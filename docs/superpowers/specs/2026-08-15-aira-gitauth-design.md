@@ -1,6 +1,6 @@
 # AIRA #30 — `aira git`: non-interactive git network ops with SSH→gh-credential auth fallback
 
-Status: PLAN (v1, for Sol adversarial plan-review)
+Status: PLAN (v2 — incorporates Sol round-1 findings: 4×P0 + 5×P1/P2)
 Date: 2026-08-15
 Milestone: #30 — Runner git-op command with SSH→gh-credential auth fallback
 Depends on: nothing unlanded (master `1e84128`)
@@ -64,39 +64,60 @@ honesty burden is instead:
 - **Record which transport actually carried the op** on success (`auth: ssh` |
   `auth: https-gh`), so the result is auditable.
 
-## 3. Design principle: probe-then-commit, never op-then-scrape
+## 3. Design principle: probe-then-commit over an EXPLICIT resolved URL
 
 The naive design ("run the real op over SSH, scrape stderr, retry over HTTPS on auth
 error") is **rejected**: it risks running a *mutating* op twice and forces brittle
 stderr classification onto the mutation path. Instead:
 
-> **Decide the transport with a read-only probe, then run the real op exactly once
-> over the chosen transport.**
+> **Resolve one explicit endpoint URL, decide the transport with a read-only probe of
+> that exact URL, then run the real op exactly once over the chosen transport — with
+> the endpoint pinned as an explicit URL on the git command line, never a remote name.**
 
-The probe is a read-only `git ls-remote --heads <url>` (or `<url> HEAD`) under
-BatchMode SSH against the resolved remote URL. It authenticates without any
-side-effect. Outcomes:
+### 3.0 Endpoint is resolved and PINNED as an explicit URL (fixes probe≠op)
 
-- Probe exits 0 → SSH auth works → run the real op over SSH.
-- Probe fails with a **positively-classified auth failure** (§6) AND remote host is
-  github.com AND `gh` is available+authenticated → run the real op over HTTPS with the
-  gh credential helper injected ephemerally (§5).
-- Probe fails auth but no fallback is available (non-github host, or gh missing/not
-  authed) → fail with the precise code; the op never runs.
-- Probe fails for a **non-auth** reason (DNS, network down, repo-not-found, or an
-  *unclassifiable* failure) → fail `E_GIT_FAILED` with the probe's stderr; **no
-  fallback, op never runs.**
+Resolve the *verb-specific effective* URL first (§8): **`push` uses the push URL**
+(`git remote get-url --push <remote>`), fetch/ls-remote use the fetch URL, clone uses
+the argument. **Both the probe and the committed op are then invoked against that
+explicit URL string** (e.g. `git push https://github.com/owner/repo.git <refspec>`),
+never against the bare remote name. This guarantees the probe and the op target the
+*same* endpoint — a `pushurl` that differs from the fetch URL cannot make us probe one
+place and push another, and a concurrent `remote set-url` cannot redirect the committed
+op after validation. Inherited `url.*.insteadOf` rewrites apply *identically* to the
+probe and the op (same URL, same config), so they stay consistent; a config mutation
+landing *between* probe and op is the sole accepted TOCTOU (§3.1).
 
-`clone` has no pre-existing remote, so the probe uses the clone URL argument directly.
-`ls-remote` **is** the probe — it runs once as the real op (no separate probe round).
-For `ls-remote` there is no mutation risk, so on a classified SSH-auth failure it may
-fall back and re-run over HTTPS directly.
+### 3.1 The probe and the classification
 
-### 3.1 TOCTOU note (accepted)
+The probe is a read-only `git ls-remote --heads <explicit-ssh-URL>` under BatchMode SSH.
+It authenticates with no side-effect. **Both the probe AND (for reporting) the committed
+op are classified** by the conservative SSH-auth classifier (§6.1). Outcomes:
 
-There is a negligible window between probe and op where auth could change. Accepted:
-auth state does not flip mid-second in practice, and the failure mode (op fails after a
-passing probe) is surfaced honestly as `E_GIT_FAILED`, not masked.
+- Probe exits 0 → SSH auth works → run the real op over SSH (explicit ssh URL).
+- Probe fails and is **positively classified as an SSH-auth failure** (§6.1) AND the
+  host is exactly github.com AND `gh_fallback` is enabled AND `gh` is
+  available+authed for github.com → run the real op over HTTPS against an **explicit
+  canonical HTTPS URL we construct ourselves** (§5), with the gh credential helper.
+- Probe classified auth-fail but no fallback available (non-github host, gh missing/not
+  authed, or fallback disabled) → `E_GIT_AUTH_FAILED` / `E_GIT_GH_UNAVAILABLE`; op never runs.
+- Probe fails for any **non-auth** reason (host-key, DNS, network, repo-not-found, or
+  *unclassifiable*) → `E_GIT_FAILED` with redacted stderr; **no fallback, op never runs.**
+
+If the committed op itself then fails with an SSH-auth signature (auth changed after a
+passing probe — key expiry, agent swap, endpoint race), it is reported
+**`E_GIT_AUTH_FAILED`** (the single real attempt is classified for reporting), **never
+retried**, never mislabeled `E_GIT_FAILED`.
+
+`clone` probes the clone URL argument. `ls-remote` **is** the probe (runs once as the
+real op); with no mutation risk, on a classified SSH-auth failure it may fall back and
+re-run over the explicit HTTPS URL directly.
+
+### 3.2 TOCTOU note (accepted)
+
+The only residual window is a config/auth change landing *between* the probe and the
+single committed op. Accepted: auth does not flip mid-second in practice, both invoke
+the identical explicit URL, and a post-probe op auth-failure is reported honestly as
+`E_GIT_AUTH_FAILED` (never masked, never retried).
 
 ## 4. Transport decision table (by resolved remote URL scheme + host)
 
@@ -114,30 +135,41 @@ Resolve the operation's target URL first (§8). Then:
 Only **github.com** gets the gh fallback in v1 (gh's default host). GitHub Enterprise
 (`GH_HOST`) is **deferred (D2)** — documented, not silently pretended.
 
-## 5. The HTTPS/gh fallback mechanism — ephemeral, never mutates `.git/config`
+## 5. The HTTPS/gh fallback — EXPLICIT canonical URL, never `insteadOf`, never mutates config
 
-When falling back (or for a native-HTTPS github.com remote), invoke git with **`-c`
-overrides only** so nothing is written to the repo config:
+The `insteadOf` rewrite trick is **rejected** (Sol P0): structural host-acceptance is
+broader than any fixed textual `insteadOf` pattern, so an accepted-but-unrewritten SSH
+form (alternate user, explicit port, host case, `ssh://` spelling) would run over SSH
+while we *report* `https-gh` — a dishonest transport label. Instead we **parse
+`owner/repo` from the resolved SSH URL and construct one explicit canonical HTTPS URL
+ourselves**, then hand *that* to git:
 
 ```
 git \
-  -c url."https://github.com/".insteadOf="git@github.com:" \
-  -c url."https://github.com/".insteadOf="ssh://git@github.com/" \
   -c credential.helper= \
   -c credential.helper="!gh auth git-credential" \
-  <op-args>
+  <op> https://github.com/<owner>/<repo>.git [refspecs…]
 ```
 
-- The two `insteadOf` rewrites turn a github.com **SSH** URL into its HTTPS form *for
-  this invocation only*. (For a remote that is already HTTPS they are inert.)
+- The op targets an **explicit `https://github.com/owner/repo.git`** we built — so the
+  transport we report is *provably* the transport git uses (no reliance on rewrite rules
+  firing). `<owner>/<repo>` come from the strict URL parse (§8), `.git` normalised.
 - `credential.helper=` (empty) **first clears** any inherited/system helper so a stray
-  interactive helper cannot hang or leak; the second line sets **only** gh.
+  interactive helper cannot hang or leak; the second sets **only** gh.
 - `!gh auth git-credential` is git's documented shell-helper form.
+- A native-HTTPS github.com remote uses its own resolved URL with the same two
+  `credential.helper` `-c` lines (no reconstruction needed).
 
-`gh` availability is verified **before** the fallback so the failure is cleanly coded,
-not a confusing git error: run `gh auth status` (non-interactive) — non-zero or a
-missing binary → `E_GIT_GH_UNAVAILABLE`. Only when gh is present+authed do we run the
-op over the fallback.
+Nothing is written to `.git/config` (all `-c`, ephemeral).
+
+`gh` availability is verified **before** the fallback, **scoped to github.com** (Sol
+P1): `gh auth status --hostname github.com` (non-interactive, under the op deadline) —
+missing binary or non-zero → `E_GIT_GH_UNAVAILABLE`. As a strengthening we additionally
+confirm the helper actually serves a github.com credential by feeding
+`protocol=https\nhost=github.com\n\n` to `gh auth git-credential get` and checking a
+`password=` line comes back (token value never logged); no credential → still
+`E_GIT_GH_UNAVAILABLE` (honest: the precondition the fallback depends on is unmet).
+Only when both hold do we run the op over the fallback.
 
 ## 6. Non-interactive guarantees (the anti-hang contract) + the SSH-auth classifier
 
@@ -148,40 +180,54 @@ Every child inherits an environment that makes hanging impossible:
   blocking; ConnectTimeout bounds the TCP connect.
 - `GIT_TERMINAL_PROMPT=0` — git never prompts for HTTPS username/password.
 - `GCM_INTERACTIVE=never` (harmless if git-credential-manager is absent) — belt-and-braces.
-- The whole op runs under a **context deadline** (`git.op_timeout_seconds`, default
-  120s). On deadline or ctx-cancel we kill the child's **process group** (Setpgid at
-  launch; `kill(-pgid, SIGKILL)` after SIGTERM) so ssh and its children die too, then
-  report `E_GIT_TIMEOUT`.
+- **Every** child — the URL-resolution `git remote get-url`, the `gh` binary/status/
+  credential checks, the SSH probe, and the committed op — is launched in its own
+  **process group** (Setpgid) and shares the **single end-to-end op context**
+  (`git.op_timeout_seconds`, default 120s). Their stdout/stderr pipes are drained
+  concurrently (a full pipe can never wedge the child). On deadline or ctx-cancel each
+  live child gets `SIGTERM`, a **bounded grace** (e.g. 2s), then `kill(-pgid, SIGKILL)`,
+  then a **bounded reap** — the shutdown path itself cannot exceed the deadline by
+  waiting on a stuck child. Report `E_GIT_TIMEOUT`. The OS-level guarantee is stated as
+  **best-effort bounded cancellation**: uninterruptible kernel I/O (D-state) cannot be
+  excluded, so we promise bounded *signalling*, not instantaneous death.
 
 **StrictHostKeyChecking is left at its default under BatchMode**: BatchMode makes an
 unknown host key a *failure* (no prompt), which we classify as a connection failure
 (not a credential-auth failure) → it does **not** trigger the gh fallback on its own;
 it surfaces as `E_GIT_FAILED`. (We do not silently `accept-new` unknown host keys.)
 
-### 6.1 The conservative SSH-auth-failure classifier
+### 6.1 The conservative, SSH-ATTRIBUTABLE auth-failure classifier
 
-The fallback trigger is a **positive** classification, defaulting to *not-auth-failure*
-when uncertain. An SSH attempt is classified `auth-failure` only when **both**:
+The classifier runs over the **SSH-transport** probe/op, whose stderr is git passing
+through ssh's own diagnostics. It is a **positive** classification defaulting to
+*not-auth-failure* when uncertain. An attempt is classified `auth-failure` only when
+**both**:
 
-1. the process exited non-zero (ssh transport failures are exit 255), **and**
-2. stderr matches one of the closed, well-known credential-rejection signatures:
-   - `Permission denied (publickey` (with or without more methods listed)
-   - `git@github.com: Permission denied`
-   - `remote: Invalid username or password` / `remote: Support for password authentication`
-   - `fatal: Authentication failed`
+1. the process exited **non-zero** — note we do **not** require a specific code (Sol
+   P0): `git ls-remote` exits 128 when its ssh child exits 255, so gating on `==255`
+   would miss every real failure; and
+2. stderr matches one of the closed, **ssh-emitted publickey-rejection** signatures:
+   - `Permission denied (publickey` (with or without further methods listed)
+   - `<user>@<host>: Permission denied` (e.g. `git@github.com: Permission denied`)
    - `Could not read from remote repository` **only when** preceded by a
-     `Permission denied` line in the same stderr (git prints this generic tail after a
-     publickey rejection; alone it is ambiguous → not classified).
+     `Permission denied` line in the same stderr (git's generic tail after a publickey
+     rejection; alone it is ambiguous → not classified).
+
+**HTTPS/application-layer signatures are deliberately NOT in the SSH classifier** (Sol
+P0): `remote: Invalid username or password`, `remote: Support for password
+authentication`, and bare `fatal: Authentication failed` describe *repository
+authorization / HTTPS credential* failures, not ssh-credential negotiation; accepting
+them could trigger a forbidden fallback. Since the probe/op we classify runs over SSH
+explicitly, such application-layer lines do not legitimately appear.
 
 Anything else — `Host key verification failed`, `Connection timed out`, `Could not
-resolve hostname`, `Repository not found`, `does not exist` — is **not** an auth
-failure. Uncertain ⇒ not-auth ⇒ **no fallback**, surface `E_GIT_FAILED`. This
-conservatism is the crux Sol should attack: the danger is a **false-positive** (falling
-back and, for `push`, risking a second side-effect) — but note the probe-then-commit
-design (§3) means the *mutating* op only ever runs once over exactly one transport, so
-even a misclassification cannot double-push; it can only pick the wrong transport for a
-single attempt, which then fails honestly. The classifier signatures live in one
-table with a `verifies:`-tagged unit test per signature (and per non-signature).
+resolve hostname`, `Connection refused`, `Repository not found`, `does not exist` — is
+**not** an auth failure. Uncertain ⇒ not-auth ⇒ **no fallback**, surface `E_GIT_FAILED`.
+The danger to guard is a **false-positive** (falling back wrongly); the probe-then-commit
+design (§3) means even a misclassification only picks the wrong transport for the
+*single* attempt, which then fails honestly — it can never double-push. The signatures
+live in one table with a `verifies:`-tagged unit test per signature **and per
+non-signature** (the load-bearing discriminators).
 
 ## 7. Response contract and stable error codes
 
@@ -194,10 +240,22 @@ Success (`ok: true`) data payload:
   "exit_code": 0 }
 ```
 
-(`url` is the *resolved* remote URL, never a rewritten one; `fell_back` records whether
-the gh path carried it.) The captured git stdout/stderr are returned to the face as
-live output (CLI tees; JSON/MCP put a bounded tail in the payload — see §9), exactly
-like the runner's model.
+(`url` is the *resolved* remote URL; for a fallback it is the explicit canonical HTTPS
+URL we ran; `fell_back` records whether the gh path carried it.) The captured git
+stdout/stderr are returned to the face as live output (CLI tees; JSON/MCP put a bounded
+tail in the payload — see §9), exactly like the runner's model. **All surfaced URLs and
+stderr pass through a secret-redaction filter** (Sol P1): any `userinfo` in a URL
+(`https://user:token@host/…`) and any token-shaped material is replaced with `***`
+before it reaches a payload, a log, or the live tee — a URL that embeds a credential
+must never be echoed.
+
+**On the distinct-code guarantee (narrowed, Sol P2):** the *auth/config/timeout/
+argument/resolution* causes each get their own stable code; **`E_GIT_FAILED` is the
+honest catch-all** for every non-auth git failure (non-fast-forward, conflict, remote
+not-found, DNS, network, unclassifiable) — we do **not** promise a distinct code per
+such cause. The raw (redacted) git stderr is always surfaced with `E_GIT_FAILED` so the
+real reason is visible; we simply do not fabricate a taxonomy git itself does not give
+us cleanly.
 
 New stable codes (registered in `internal/store/check.go` exit-code map):
 
@@ -215,23 +273,44 @@ New stable codes (registered in `internal/store/check.go` exit-code map):
 
 Exit-code choice mirrors the runner family (auth/failed = 1, timeout = 3, arg/config = 2).
 
-## 8. Target-URL resolution
+## 8. Target-URL resolution and the strict URL grammar
 
 - `clone <url> [dir]` — URL is the first positional. Host/scheme parsed from it.
-- `push`/`fetch`/`ls-remote [remote]` — remote name defaults to `origin`; resolve via
-  `git -C <root> remote get-url <remote>`. Empty/no-such-remote → `E_GIT_REMOTE_UNRESOLVED`.
-  (v1 does **not** consult the branch's configured upstream remote; `origin` default +
-  explicit `[remote]` arg covers the cases. Upstream-derivation is D3, documented.)
-- `push` extra args: `push [remote] [refspec…]`; `fetch [remote] [refspec…]`. The
-  refspecs pass through **after** an `--` delimiter in the argv (mirroring `aira run`),
-  so no refspec can be mistaken for a flag or inject an option. No git *option* flags
-  are accepted in v1 (a closed argv: `remote` + refspecs only) — this keeps the surface
-  small and un-injectable; richer flags are D4.
+- `push [remote] [refspec…]` — resolve the **push** URL: `git -C <root> remote get-url
+  --push <remote>` (Sol P0 — push may use a distinct `pushurl`). `fetch`/`ls-remote
+  [remote]` resolve the fetch URL: `git -C <root> remote get-url <remote>`. Remote name
+  defaults to `origin`; empty/no-such-remote → `E_GIT_REMOTE_UNRESOLVED`. (v1 does **not**
+  consult the branch's configured upstream; `origin` default + explicit `[remote]` arg
+  covers the cases. Upstream-derivation is D3.)
+- Refspecs pass through **after** a `--` delimiter (mirroring `aira run`), so none can be
+  mistaken for a flag or inject an option. No git *option* flags are accepted in v1
+  (closed argv: `remote` + refspecs) — small, un-injectable surface; richer flags are D4.
 
-URL parsing handles the two github SSH forms (`git@github.com:owner/repo(.git)` scp-like
-and `ssh://git@github.com/owner/repo`) plus `https://github.com/owner/repo`. The host is
-extracted structurally, not by substring-contains (`github.com.evil.example` must not
-match — Sol should attack this).
+### 8.1 Strict URL grammar (Sol P1 — anti-spoof, no secret leak)
+
+URL parsing is a **strict ASCII grammar**, never substring-contains, over the three
+accepted forms: scp-like `git@github.com:owner/repo(.git)`, `ssh://git@github.com/owner/
+repo(.git)`, `https://github.com/owner/repo(.git)`. To be treated as **github.com** (the
+sole fallback host), ALL must hold:
+
+- host authority, **case-folded** and with a single optional trailing dot stripped,
+  equals exactly `github.com` — `GitHub.com` matches; `github.com.evil.example`,
+  `github.com-x`, `evilgithub.com`, `github.com@evil` do **not**.
+- scheme ∈ {scp-like-ssh, `ssh`, `https`} only; any other (`git://`, `http`, `ftp`,
+  file/local path) → `E_GIT_REMOTE_UNSUPPORTED`.
+- **userinfo**: for SSH, the user must be `git` (the only user gh's fallback rewrites to);
+  a non-`git` user on a github SSH URL is treated as **not a fallback candidate** (run
+  as-is; no https-gh reconstruction — we will not silently change the identity). HTTPS
+  userinfo (`user:token@`) is **stripped and redacted** before use and never echoed.
+- port: empty, or an explicit numeric port equal to the scheme default (22 ssh / 443
+  https); any other explicit port on a github URL → not a fallback candidate (run as-is).
+- reject control characters, whitespace, and any non-ASCII / IDNA/Unicode host
+  (`E_GIT_ARG_INVALID`) — no punycode confusables.
+
+`owner` and `repo` are captured for the canonical-HTTPS reconstruction (§5); `repo` has
+at most one trailing `.git` normalised. A URL that parses as github.com but fails a
+fallback-candidacy sub-condition above still runs honestly over its native transport;
+we simply do not claim the gh path for it.
 
 ## 9. Layering, seam, and faces
 
@@ -284,26 +363,41 @@ configs without it keep working.
 ## 11. Tests (TDD; every classifier signature + transport branch is discriminating)
 
 Pure-unit (no network, `internal/gitremote`):
-- **URL parse**: both SSH forms + HTTPS → correct host/scheme; `github.com.evil.example`
-  and `git@github.com-x:` → **not** github.com; local/file/git:// → unsupported.
-- **Classifier**: one case per §6.1 signature returns auth-failure; and
-  `Host key verification failed`, `Connection timed out`, `Repository not found`,
-  bare `Could not read from remote repository`, exit-0 → **not** auth-failure. (These
-  are the load-bearing discriminators — a "classify everything as auth" impl must fail
-  them.)
-- **Transport selection** (table-driven over §4 with a fake exec seam): each row picks
-  the expected transport / error code. The exec is injected (a `runFn` seam) so the
-  probe/op/gh-status calls are simulated deterministically — no real git/ssh/gh.
-- **Ephemeral-config**: assert the fallback argv contains the four `-c` overrides in
-  order and that no `git config` write is ever issued (the seam records argv).
-- **Anti-hang env**: assert every child request carries `BatchMode=yes`,
-  `GIT_TERMINAL_PROMPT=0`, and a bounded deadline.
-- **Timeout**: a fake exec that blocks past the deadline → `E_GIT_TIMEOUT` and a
-  kill-group call recorded.
+- **URL parse / grammar (§8.1)**: three accepted forms → correct host/scheme/owner/repo;
+  `github.com.evil.example`, `git@github.com-x:`, `evilgithub.com`, `GitHub.com.`
+  (case+trailing-dot → **matches**), `github.com@evil`, punycode/IDNA host, explicit
+  non-default port, non-`git` ssh user (→ not a fallback candidate), control chars,
+  `git://`/`http`/local → each the correct classification/error. HTTPS `user:token@`
+  userinfo → stripped and **redacted** in every surfaced field.
+- **Classifier (§6.1)**: one case per ssh-attributable signature → auth-failure at a
+  **git-wrapped exit 128** (not 255) to prove the exit-code fix; and each of
+  `Host key verification failed`, `Connection timed out`, `Could not resolve hostname`,
+  `Repository not found`, **bare** `Could not read from remote repository`, and the
+  three **application-layer** strings (`remote: Invalid username or password`,
+  `remote: Support for password authentication`, bare `fatal: Authentication failed`) →
+  **not** auth-failure. (Load-bearing discriminators: a "classify everything as auth"
+  or an "==255" impl must fail these.)
+- **Transport selection** (table-driven over §4 with a fake exec seam `runFn`): each row
+  picks the expected transport / code; probe/op/gh calls simulated deterministically.
+- **Explicit-URL pinning**: the committed op argv carries an **explicit URL** (never the
+  bare remote name); for push the resolved URL comes from `get-url --push`; for a
+  fallback the op argv carries the **constructed canonical `https://github.com/owner/
+  repo.git`** and the two `credential.helper` `-c` lines, and **no `insteadOf`** and no
+  `git config` write ever appears (the seam records every argv).
+- **Anti-hang env**: **every** child request (get-url, gh status/credential, probe, op)
+  carries `BatchMode=yes` (ssh ones), `GIT_TERMINAL_PROMPT=0`, and shares the one bounded
+  deadline; a fake exec blocking past the deadline → `E_GIT_TIMEOUT` with a
+  **process-group kill recorded for that child**, and the shutdown returns within the
+  bounded grace (does not itself exceed the deadline).
+- **Post-probe op auth-failure** → `E_GIT_AUTH_FAILED` (classified real attempt), **not**
+  `E_GIT_FAILED`, and the op is **not** retried (op call count == 1).
+- **gh scoping**: `gh auth status` succeeding for a **different** host but failing
+  `--hostname github.com` → `E_GIT_GH_UNAVAILABLE`; gh credential get returning no
+  `password=` → `E_GIT_GH_UNAVAILABLE`.
 - **No-fallback matrix**: github SSH-auth-fail + gh-absent → `E_GIT_GH_UNAVAILABLE`;
   + `gh_fallback:false` → `E_GIT_AUTH_FAILED`; non-github SSH-auth-fail →
-  `E_GIT_AUTH_FAILED`; probe non-auth-fail → `E_GIT_FAILED` with op **never invoked**
-  (the seam asserts the mutating op call count is 0).
+  `E_GIT_AUTH_FAILED`; probe non-auth-fail → `E_GIT_FAILED` with the mutating op **never
+  invoked** (seam asserts op call count == 0).
 
 Core-level:
 - `git` verb dispatch: unknown sub-verb → `E_GIT_ARG_INVALID`; nil seam → unavailable
@@ -341,12 +435,20 @@ on the network.
 1. A **mutating** op (`push`) runs **at most once**, over exactly one transport
    (probe-then-commit). No stderr-scrape-and-retry on the mutation path.
 2. The gh fallback fires **only** on a positively-classified SSH-auth failure to a
-   github.com host with `gh_fallback` enabled and gh present+authed; every other
-   failure surfaces its own distinct code and does **not** fall back.
+   github.com host (strict grammar) with `gh_fallback` enabled and gh present+authed
+   **for github.com**; every other failure surfaces its own code and does **not** fall back.
 3. No path can hang: BatchMode + `GIT_TERMINAL_PROMPT=0` + cleared credential helper +
-   context deadline with process-group kill, on every child.
-4. The repo's stored `.git/config` is never mutated (fallback is `-c`-only).
-5. Success records the transport that actually carried the op; failure never reports
-   success (no fake pass), and every distinguishable cause has its own code.
+   one bounded op deadline with **best-effort** process-group kill on **every** child
+   (including get-url and gh checks) and a bounded shutdown.
+4. The repo's stored `.git/config` is never mutated (all `-c`, ephemeral).
+5. Success records the transport that **provably** carried the op (explicit URL on the
+   command line — never inferred from whether a rewrite fired); failure never reports
+   success. Auth/config/timeout/arg/resolution causes each have a code; other git
+   failures share `E_GIT_FAILED` with redacted stderr (no fabricated taxonomy).
 6. The verb allow-list is closed; an unknown sub-verb is refused, never passed to git.
-7. Host detection is structural (parsed authority), never substring-contains.
+7. Host detection is structural (strict ASCII grammar, exact `github.com`), never
+   substring-contains, IDNA-safe.
+8. The endpoint is **pinned as an explicit URL** for both probe and op (push via
+   `--push`); a `pushurl`/rewrite cannot make us probe one place and operate on another.
+9. No credential or URL-embedded secret ever reaches a payload, log, or the live tee
+   (redaction on all surfaced URLs/stderr).
