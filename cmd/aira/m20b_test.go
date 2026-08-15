@@ -13,8 +13,12 @@ import (
 
 func TestM20bSupervisorRejectsMalformedSidecarBeforeOpeningProject(t *testing.T) {
 	dir := t.TempDir()
+	marker := filepath.Join(dir, "child-ran.marker")
 	control := filepath.Join(dir, "request.ctrl")
-	payload, err := json.Marshal(runner.Request{Argv: []string{"/bin/sh", "-c", "exit 99"}, Detach: true})
+	// The child would create a marker if ever launched. A malformed wiring sidecar
+	// must fail readiness BEFORE the child launches, so the marker stays absent — a
+	// consume-after-launch bug would create it.
+	payload, err := json.Marshal(runner.Request{Argv: []string{"/bin/sh", "-c", "touch " + marker + "; exit 99"}, Detach: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,6 +58,9 @@ func TestM20bSupervisorRejectsMalformedSidecarBeforeOpeningProject(t *testing.T)
 	}
 	if _, err := os.Stat(wiring); !os.IsNotExist(err) {
 		t.Fatalf("malformed sidecar was not consumed early: %v", err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("the child launched despite a malformed sidecar (marker present): %v", err)
 	}
 }
 

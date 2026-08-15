@@ -218,6 +218,11 @@ func (l *ledger) append(event ledgerEvent) (ledgerEvent, error) {
 			case !validAuxTelemetryPayload(event.Run):
 				return event, fmt.Errorf("E_JOURNAL_CORRUPT: invalid telemetry payload for %s", event.Run.ID)
 			}
+		} else if event.Kind == "telemetry" {
+			// A telemetry settlement is valid ONLY after the terminal record.
+			// Reject a pre-terminal telemetry append so it can never poison the
+			// journal (defense-in-depth alongside RecordAuxTelemetry's terminal check).
+			return event, fmt.Errorf("E_JOURNAL_CORRUPT: telemetry before terminal run %s", event.Run.ID)
 		}
 		if len(events) != 0 {
 			event.Sequence = events[len(events)-1].Sequence + 1
@@ -347,6 +352,11 @@ func replay(events []ledgerEvent) (map[string]RunRecord, error) {
 	runs := make(map[string]RunRecord)
 	terminals := make(map[string]bool)
 	telemetryEvents := make(map[string]bool)
+	// envelopes tracks that a durable pending telemetry envelope was established
+	// by a `starting` event with a non-empty Telemetry. A post-terminal telemetry
+	// settlement is only valid against such an envelope — never against telemetry
+	// that merely appeared in a terminal/later record.
+	envelopes := make(map[string]bool)
 	for _, e := range events {
 		if e.Kind != "telemetry" {
 			normalizeBuffering(&e.Run)
@@ -360,7 +370,7 @@ func replay(events []ledgerEvent) (map[string]RunRecord, error) {
 				return nil, fmt.Errorf("E_JOURNAL_CORRUPT: record after terminal run %s", e.Run.ID)
 			}
 			prior := runs[e.Run.ID]
-			if prior.Telemetry == "" || !validAuxTelemetryPayload(e.Run) {
+			if !envelopes[e.Run.ID] || !validAuxTelemetryPayload(e.Run) {
 				return nil, fmt.Errorf("E_JOURNAL_CORRUPT: invalid telemetry payload for %s", e.Run.ID)
 			}
 			prior.Telemetry = e.Run.Telemetry
@@ -398,6 +408,9 @@ func replay(events []ledgerEvent) (map[string]RunRecord, error) {
 			candidate.QuiesceForced = true
 			runs[e.Run.ID] = mergeEvidence(prior, candidate)
 			continue
+		}
+		if e.Kind == "starting" && e.Run.Telemetry != "" {
+			envelopes[e.Run.ID] = true
 		}
 		runs[e.Run.ID] = e.Run
 	}

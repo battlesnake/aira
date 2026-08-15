@@ -67,6 +67,44 @@ func TestM20bReplayAuthorizesOnlyOneTelemetryEventAfterTerminal(t *testing.T) {
 	if _, err := replay(other); err == nil {
 		t.Fatal("replay accepted a non-telemetry event after terminal")
 	}
+	// A telemetry event BEFORE the terminal record is rejected — a pre-terminal
+	// settlement poisons the journal.
+	preTerminal := []ledgerEvent{
+		{Sequence: 1, Kind: "starting", Run: starting},
+		{Sequence: 2, Kind: "telemetry", Run: RunRecord{ID: "RUN-1", Telemetry: "opaque-complete", TelemetryRefs: []string{"TR-1"}}},
+	}
+	if _, err := replay(preTerminal); err == nil {
+		t.Fatal("replay accepted a pre-terminal telemetry event")
+	}
+	// A settlement with NO durable pending envelope (the starting event carried no
+	// Telemetry) is rejected — settlement must anchor to a real starting envelope,
+	// never to telemetry that merely appeared in a terminal/later record.
+	bareStart := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusStarting}
+	bareTerminal := bareStart
+	bareTerminal.Status, bareTerminal.ExitCode, bareTerminal.TerminalComplete = StatusExited, &zero, true
+	noEnvelope := []ledgerEvent{
+		{Sequence: 1, Kind: "starting", Run: bareStart},
+		{Sequence: 2, Kind: "terminal", Run: bareTerminal},
+		{Sequence: 3, Kind: "telemetry", Run: RunRecord{ID: "RUN-1", Telemetry: "opaque-complete", TelemetryRefs: []string{"TR-1"}}},
+	}
+	if _, err := replay(noEnvelope); err == nil {
+		t.Fatal("replay accepted a telemetry settlement without a pending envelope")
+	}
+}
+
+// TestM20bAppendRejectsPreTerminalTelemetry proves the low-level ledger append —
+// not only RecordAuxTelemetry — refuses a telemetry event before the terminal
+// record (defense-in-depth against a poisoned journal).
+func TestM20bAppendRejectsPreTerminalTelemetry(t *testing.T) {
+	r := telemetryRunnerForTest(t)
+	starting := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusStarting, Telemetry: "opaque-pending"}
+	if _, err := r.ledger.append(ledgerEvent{Kind: "starting", Run: starting}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := r.ledger.append(ledgerEvent{Kind: "telemetry", Run: RunRecord{ID: "RUN-1", Telemetry: "opaque-complete", TelemetryRefs: []string{"TR-1"}}})
+	if err == nil {
+		t.Fatal("append accepted a pre-terminal telemetry event")
+	}
 }
 
 func TestM20bRecordAuxTelemetryCASRacesAndIsIdempotent(t *testing.T) {

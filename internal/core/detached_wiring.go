@@ -14,6 +14,10 @@ import (
 
 const detachedWiringMaxBytes int64 = 1 << 20
 
+// renameWiringFile is the atomic-publish seam. Tests inject a failure to prove the
+// final sidecar only ever appears via the rename (never a partial direct write).
+var renameWiringFile = os.Rename
+
 type detachedWiringSidecar struct {
 	Schema        int                         `json:"schema"`
 	Params        WiringParams                `json:"params"`
@@ -73,7 +77,7 @@ func writeDetachedWiringSidecar(outputDir string, params WiringParams, reportCon
 	if err := tmp.Close(); err != nil {
 		return "", err
 	}
-	if err := os.Rename(tmpPath, finalPath); err != nil {
+	if err := renameWiringFile(tmpPath, finalPath); err != nil {
 		return "", err
 	}
 	if err := syncWiringDir(abs); err != nil {

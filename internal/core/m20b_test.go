@@ -81,6 +81,28 @@ func statError(path string) error {
 	return err
 }
 
+func TestM20bWiringSidecarPublishesAtomicallyOrNotAtAll(t *testing.T) {
+	dir := t.TempDir()
+	original := renameWiringFile
+	t.Cleanup(func() { renameWiringFile = original })
+	renameWiringFile = func(string, string) error { return errors.New("injected rename failure") }
+	// A direct WriteFile(final, 0600) impl would succeed here (no rename to fail),
+	// so surfacing the injected rename failure proves the publish is atomic.
+	path, err := writeDetachedWiringSidecar(dir, WiringParams{Report: "go-json"}, store.TestReportContext{})
+	if err == nil || path != "" {
+		t.Fatalf("non-atomic publish: path=%q err=%v", path, err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".wiring") {
+			t.Fatalf("a partial sidecar became visible after a failed publish: %s", e.Name())
+		}
+	}
+}
+
 func TestM20bWiringSidecarRejectsMalformedOversizedAndUnknownSchemaAfterDelete(t *testing.T) {
 	for name, payload := range map[string][]byte{
 		"malformed":      []byte(`{"schema":`),
@@ -232,6 +254,12 @@ func TestM20bForegroundAndDetachedParamsProduceIdenticalStoreInputs(t *testing.T
 	if !reflect.DeepEqual(foregroundStore.reportInput, detachedStore.reportInput) || !reflect.DeepEqual(foregroundStore.computeInput, detachedStore.computeInput) {
 		t.Fatalf("adapter mismatch:\nforeground report=%+v compute=%+v\ndetached report=%+v compute=%+v", foregroundStore.reportInput, foregroundStore.computeInput, detachedStore.reportInput, detachedStore.computeInput)
 	}
+	// --report-stream=err must route the bounded read to the "err" stream on BOTH
+	// paths; a bug that ignores report_stream (reading "out") would pass the input
+	// comparison but fail here.
+	if foregroundRunner.read.Stream != "err" || detachedRunner.read.Stream != "err" {
+		t.Fatalf("report_stream ignored: foreground=%q detached=%q", foregroundRunner.read.Stream, detachedRunner.read.Stream)
+	}
 	if !reflect.DeepEqual(foreground.Wiring, detached) {
 		t.Fatalf("wiring mismatch: foreground=%+v detached=%+v", foreground.Wiring, detached)
 	}
@@ -248,8 +276,48 @@ func TestM20bTerminalFailuresStillWireHonestly(t *testing.T) {
 			if s.reportCalls != 1 || wiring.TestsGreenObserved.Observed || wiring.TestsGreenObserved.Not != "exit-nonzero" {
 				t.Fatalf("terminal failure wiring=%+v calls=%d", wiring, s.reportCalls)
 			}
+			// Wiring never rewrites the terminal outcome: status + exit are unchanged.
+			if record.Status != status || record.ExitCode == nil || *record.ExitCode != 7 {
+				t.Fatalf("wiring mutated the terminal outcome: %+v", record)
+			}
 		})
 	}
+}
+
+// TestM20bNonTerminalIsNotWiredAndStoreFailureSettlesIncomplete covers the two
+// shim precondition/settlement edges: a non-terminal record is never wired, and a
+// store-write failure yields an incomplete settlement without rewriting the run.
+func TestM20bNonTerminalIsNotWiredAndStoreFailureSettlesIncomplete(t *testing.T) {
+	t.Run("non-terminal record is not wired", func(t *testing.T) {
+		running := terminalM19Record(0)
+		running.Status, running.TerminalComplete = runner.StatusRunning, false
+		if running.Status.Terminal() {
+			t.Fatal("test setup: record must be non-terminal")
+		}
+		r := &m19Runner{record: running, chunk: runner.OutputChunk{Bytes: []byte("x")}}
+		s := &m19Store{reportResult: store.TestReportAddResult{ID: "TR-1", Report: validM19Report()}}
+		wiring := NewWithRunner(s, r).WireDetachedTelemetry(context.Background(), WiringParams{Report: "go-json"}, running, store.TestReportContext{})
+		if s.reportCalls != 0 || wiring.WiringComplete {
+			t.Fatalf("non-terminal record was wired: calls=%d wiring=%+v", s.reportCalls, wiring)
+		}
+	})
+
+	t.Run("store failure settles incomplete and preserves the run", func(t *testing.T) {
+		record := terminalM19Record(0)
+		r := &m19Runner{record: record, chunk: runner.OutputChunk{Bytes: []byte("report")}}
+		s := &m19Store{reportErr: errors.New("E_TESTREPORT_INVALID: injected"), reportResult: store.TestReportAddResult{}}
+		wiring := NewWithRunner(s, r).WireDetachedTelemetry(context.Background(), WiringParams{Report: "go-json"}, record, store.TestReportContext{})
+		state := TelemetryIncomplete
+		if wiring.WiringComplete {
+			state = TelemetryComplete
+		}
+		if state != TelemetryIncomplete {
+			t.Fatalf("store failure did not settle incomplete: wiring=%+v", wiring)
+		}
+		if record.Status != runner.StatusExited || record.ExitCode == nil || *record.ExitCode != 0 {
+			t.Fatalf("store failure rewrote the run outcome: %+v", record)
+		}
+	})
 }
 
 func TestM20bTruncatedDetachedCaptureIsIncompleteNeverGreen(t *testing.T) {
