@@ -113,7 +113,7 @@ func runWithInput(argv []string, stdout, stderr io.Writer, stdin io.Reader) int 
 			request.Args["raw"] = data
 		}
 	}
-	s, project, err := app.Open(context.Background(), ".")
+	s, project, err := app.OpenWithDiagnostics(context.Background(), ".", stderr)
 	if err != nil {
 		code := appErrorCode(err)
 		return render(core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
@@ -264,7 +264,7 @@ func parseRunArgs(argv []string) ([]string, map[string]string, error) {
 			return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: run options must precede the launch delimiter")
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "merge" || name == "realtime" || name == "store-stdin" {
+		if name == "merge" || name == "realtime" || name == "store-stdin" || name == "no-admit" {
 			options[name] = "true"
 			continue
 		}
@@ -343,6 +343,7 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		args["realtime"] = options["realtime"] == "true"
 		args["stdin"] = options["stdin"]
 		args["store_stdin"] = options["store-stdin"] == "true"
+		args["no_admit"] = options["no-admit"] == "true"
 	case "run-kill":
 		if len(positional) != 1 {
 			return core.Request{}, fmt.Errorf("E_RUN_ARGUMENT_INVALID: run-kill requires <run-id>")

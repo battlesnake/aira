@@ -82,6 +82,9 @@ type RunRecord struct {
 	Cwd                 string               `json:"cwd"`
 	EnvDigest           string               `json:"env_digest"`
 	Buffering           string               `json:"buffering"`
+	Admission           string               `json:"admission"`
+	AdmissionReason     string               `json:"admission_reason,omitempty"`
+	AdmissionWaitedMS   int64                `json:"admission_waited_ms"`
 	LaunchPrefix        []string             `json:"launch_prefix,omitempty"`
 	CgroupScope         string               `json:"cgroup_scope,omitempty"`
 	StartedAt           string               `json:"started_at"`
@@ -130,6 +133,14 @@ type Request struct {
 	TermGrace   time.Duration
 	LiveStdout  io.Writer // optional best-effort foreground tee sink
 	LiveStderr  io.Writer // optional best-effort foreground tee sink
+	NoAdmit     bool      // bypass the configured memory-admission gate
+}
+
+// Clock is the admission loop's time seam. After must deliver after d in the
+// clock's own timeline; Launch always selects it together with ctx.Done().
+type Clock interface {
+	Now() time.Time
+	After(time.Duration) <-chan time.Time
 }
 
 // OutputRequest describes one bounded, cursor-based read from a captured
@@ -166,14 +177,21 @@ type OutputChunk struct {
 }
 
 type Config struct {
-	CommonDir    string
-	OutputDir    string
-	CgroupParent string
-	Prefix       []string
-	Grace        time.Duration
-	TermGrace    time.Duration
-	Now          func() time.Time
-	Backend      ScopeBackend // nil selects the Linux cgroup-v2 backend
+	CommonDir        string
+	OutputDir        string
+	CgroupParent     string
+	Prefix           []string
+	Grace            time.Duration
+	TermGrace        time.Duration
+	Now              func() time.Time
+	Backend          ScopeBackend // nil selects the Linux cgroup-v2 backend
+	MemorySlice      string
+	MemoryReserve    int64
+	AdmissionMaxWait time.Duration
+	PollInterval     time.Duration
+	Clock            Clock
+	sliceMemoryFn    func(path string) (cur, max int64, ok bool, reason string)
+	Diagnostics      io.Writer
 }
 
 type ScopeBackend interface {

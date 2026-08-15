@@ -21,18 +21,53 @@ import (
 )
 
 type Runner struct {
-	ledger      *ledger
-	outputDir   string
-	backend     ScopeBackend
-	prefix      []string
-	grace       time.Duration
-	termGrace   time.Duration
-	now         func() time.Time
-	mu          sync.Mutex
-	appendFault func(ledgerEvent) error
+	ledger             *ledger
+	outputDir          string
+	backend            ScopeBackend
+	prefix             []string
+	grace              time.Duration
+	termGrace          time.Duration
+	now                func() time.Time
+	mu                 sync.Mutex
+	appendFault        func(ledgerEvent) error
+	memorySlice        string
+	memoryReserve      int64
+	admissionMaxWait   time.Duration
+	pollInterval       time.Duration
+	clock              Clock
+	sliceMemory        func(path string) (cur, max int64, ok bool, reason string)
+	diagnostics        io.Writer
+	reserveIDFn        func() (string, error)
+	openOutputsFn      func(string, string, bool) (map[string]string, map[string]*os.File, error)
+	setupStdinFn       func(*exec.Cmd, Request, string) (func(), bool, error)
+	setupPipesFn       func(*exec.Cmd, bool) (map[string]*os.File, map[string]*os.File, error)
+	startFn            func(*exec.Cmd) error
+	lockAttemptFn      func(string) (*admitLock, error)
+	failBeforeLaunchFn func(context.Context, RunRecord, string, error) (*RunRecord, error)
 }
 
 func New(cfg Config) (*Runner, error) {
+	if cfg.AdmissionMaxWait == 0 {
+		cfg.AdmissionMaxWait = 30 * time.Minute
+	}
+	if cfg.AdmissionMaxWait <= 0 {
+		return nil, &LaunchError{"E_CONFIG_INVALID", errors.New("admission max wait must be positive")}
+	}
+	if cfg.PollInterval == 0 {
+		cfg.PollInterval = 2 * time.Second
+	}
+	if cfg.PollInterval <= 0 {
+		return nil, &LaunchError{"E_CONFIG_INVALID", errors.New("admission poll interval must be positive")}
+	}
+	if cfg.MemoryReserve < 0 || ((strings.TrimSpace(cfg.MemorySlice) == "") != (cfg.MemoryReserve == 0)) {
+		return nil, &LaunchError{"E_CONFIG_INVALID", errors.New("memory slice and positive reserve must be configured together")}
+	}
+	if cfg.Clock == nil {
+		cfg.Clock = systemClock{}
+	}
+	if cfg.sliceMemoryFn == nil {
+		cfg.sliceMemoryFn = readSliceMemory
+	}
 	l, err := newLedger(cfg.CommonDir, cfg.OutputDir)
 	if err != nil {
 		return nil, err
@@ -57,7 +92,9 @@ func New(cfg Config) (*Runner, error) {
 	if termGrace == 0 {
 		termGrace = 500 * time.Millisecond
 	}
-	return &Runner{ledger: l, outputDir: output, backend: backend, prefix: prefix, grace: grace, termGrace: termGrace, now: cfg.Now}, nil
+	return &Runner{ledger: l, outputDir: output, backend: backend, prefix: prefix, grace: grace, termGrace: termGrace, now: cfg.Now,
+		memorySlice: strings.TrimSpace(cfg.MemorySlice), memoryReserve: cfg.MemoryReserve, admissionMaxWait: cfg.AdmissionMaxWait,
+		pollInterval: cfg.PollInterval, clock: cfg.Clock, sliceMemory: cfg.sliceMemoryFn, diagnostics: cfg.Diagnostics}, nil
 }
 
 func (r *Runner) append(event ledgerEvent) (ledgerEvent, error) {
@@ -138,82 +175,140 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 			return nil, launchErr("E_RUN_STDIN_INVALID", err)
 		}
 	}
+	effectiveArgv, err := EffectiveArgv(prefix, req.Argv)
+	if err != nil {
+		return nil, err
+	}
 	if err := r.backend.Probe(ctx); err != nil {
 		return nil, launchErr("E_RUN_SCOPE_UNAVAILABLE", err)
 	}
-
-	id, err := r.ledger.reserveID()
+	admission, err := r.admit(ctx, req)
 	if err != nil {
-		return nil, launchErr("E_RUN_RECONCILE_REQUIRED", err)
+		return nil, err
 	}
-	started := nowString(r.now)
-	// Containment is not an initial assumption. Until the leader is positively
-	// observed in cgroup.procs, the durable record must remain non-contained.
-	record := RunRecord{SchemaVersion: ledgerSchema, ID: id, Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, Buffering: buffering, LaunchPrefix: append([]string(nil), prefix...), StartedAt: started, Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}}
-	// The intended scope reference is durable before scope creation. It is not
-	// used as kill authority until the actual scope-created record is present.
-	record.CgroupScope = r.intendedScope(id)
-	if _, err := r.append(ledgerEvent{Kind: "starting", Run: record}); err != nil {
-		return nil, launchErr("E_RUN_RECONCILE_REQUIRED", err)
-	}
+	releaseAdmit := func() { admission.lock.release() }
 
-	if err := os.MkdirAll(r.outputDir, 0o755); err != nil {
-		return r.failBeforeLaunch(ctx, record, "E_RUN_OUTPUT_OPEN", err)
-	}
-	paths, files, err := openOutputs(r.outputDir, id, req.Merge)
-	if err != nil {
-		return r.failBeforeLaunch(ctx, record, "E_RUN_OUTPUT_OPEN", err)
-	}
+	var id string
+	var record RunRecord
+	var files map[string]*os.File
 	defer func() {
 		for _, f := range files {
 			_ = f.Close()
 		}
 	}()
-	for key, path := range paths {
-		record.OutputRefs[key] = OutputRef{Path: path, State: OutputPartial}
-	}
-	if err := syncDir(r.outputDir); err != nil {
-		return r.failBeforeLaunch(ctx, record, "E_RUN_OUTPUT_OPEN", err)
-	}
-
-	scope, err := r.backend.Create(ctx, id)
-	if err != nil {
-		return r.failBeforeLaunch(ctx, record, "E_RUN_SCOPE_UNAVAILABLE", err)
-	}
-	record.CgroupScope = scope.Reference()
-	if _, err := r.append(ledgerEvent{Kind: "scope-created", Run: record}); err != nil {
-		_ = scope.Remove()
-		return nil, launchErr("E_RUN_RECONCILE_REQUIRED", err)
-	}
-
-	effectiveArgv, err := EffectiveArgv(prefix, req.Argv)
-	if err != nil {
-		return nil, err
-	}
-	// CommandContext's default cancellation calls Process.Kill. That would be
-	// an unsafe main-PID fallback, so all process control stays cgroup-scoped.
-	cmd := exec.Command(effectiveArgv[0], effectiveArgv[1:]...)
-	cmd.Dir, cmd.Env = cwd, env
-	cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: scope.FD()}
-	stdinClose, stdinStore, err := setupStdin(cmd, req, filepath.Join(r.outputDir, id+".in"))
-	if err != nil {
-		return r.failBeforeLaunch(ctx, record, "E_RUN_STDIN_INVALID", err)
-	}
-	if stdinClose != nil {
-		defer stdinClose()
-	}
-	record.StdinStored = stdinStore
-	readers, writers, err := setupPipes(cmd, req.Merge)
-	if err != nil {
-		return r.failBeforeLaunch(ctx, record, "E_RUN_CAPTURE_FAILED", err)
-	}
-	if err := cmd.Start(); err != nil {
-		closePipes(readers, writers)
-		code := "E_RUN_LAUNCH_FAILED"
-		if strings.Contains(err.Error(), "clone3") || errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.ENOSYS) {
-			code = "E_RUN_SCOPE_UNAVAILABLE"
+	var stdinClose func()
+	defer func() {
+		if stdinClose != nil {
+			stdinClose()
 		}
-		return r.failBeforeLaunch(ctx, record, code, err)
+	}()
+	var scope Scope
+	var cmd *exec.Cmd
+	var readers, writers map[string]*os.File
+	launchPrep := func() (*RunRecord, error) {
+		// This local defer is a leak backstop. Each failure explicitly releases
+		// before failBeforeLaunch or any other terminal arbitration is evaluated.
+		defer releaseAdmit()
+
+		reserveID := r.ledger.reserveID
+		if r.reserveIDFn != nil {
+			reserveID = r.reserveIDFn
+		}
+		id, err = reserveID()
+		if err != nil {
+			releaseAdmit()
+			return nil, launchErr("E_RUN_RECONCILE_REQUIRED", err)
+		}
+		started := nowString(r.now)
+		// Containment is not an initial assumption. Until the leader is positively
+		// observed in cgroup.procs, the durable record must remain non-contained.
+		record = RunRecord{SchemaVersion: ledgerSchema, ID: id, Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, Buffering: buffering, Admission: admission.state, AdmissionReason: admission.reason, AdmissionWaitedMS: admission.waitedMS, LaunchPrefix: append([]string(nil), prefix...), StartedAt: started, Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}}
+		// The intended scope reference is durable before scope creation. It is not
+		// used as kill authority until the actual scope-created record is present.
+		record.CgroupScope = r.intendedScope(id)
+		if _, err = r.append(ledgerEvent{Kind: "starting", Run: record}); err != nil {
+			releaseAdmit()
+			return nil, launchErr("E_RUN_RECONCILE_REQUIRED", err)
+		}
+
+		if err = os.MkdirAll(r.outputDir, 0o755); err != nil {
+			releaseAdmit()
+			return r.failLaunchPrep(ctx, record, "E_RUN_OUTPUT_OPEN", err)
+		}
+		var paths map[string]string
+		open := openOutputs
+		if r.openOutputsFn != nil {
+			open = r.openOutputsFn
+		}
+		paths, files, err = open(r.outputDir, id, req.Merge)
+		if err != nil {
+			releaseAdmit()
+			return r.failLaunchPrep(ctx, record, "E_RUN_OUTPUT_OPEN", err)
+		}
+		for key, path := range paths {
+			record.OutputRefs[key] = OutputRef{Path: path, State: OutputPartial}
+		}
+		if err = syncDir(r.outputDir); err != nil {
+			releaseAdmit()
+			return r.failLaunchPrep(ctx, record, "E_RUN_OUTPUT_OPEN", err)
+		}
+
+		scope, err = r.backend.Create(ctx, id)
+		if err != nil {
+			releaseAdmit()
+			return r.failLaunchPrep(ctx, record, "E_RUN_SCOPE_UNAVAILABLE", err)
+		}
+		record.CgroupScope = scope.Reference()
+		if _, err = r.append(ledgerEvent{Kind: "scope-created", Run: record}); err != nil {
+			releaseAdmit()
+			_ = scope.Remove()
+			return nil, launchErr("E_RUN_RECONCILE_REQUIRED", err)
+		}
+
+		// CommandContext's default cancellation calls Process.Kill. That would be
+		// an unsafe main-PID fallback, so all process control stays cgroup-scoped.
+		cmd = exec.Command(effectiveArgv[0], effectiveArgv[1:]...)
+		cmd.Dir, cmd.Env = cwd, env
+		cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: scope.FD()}
+		var stdinStore bool
+		setupInput := setupStdin
+		if r.setupStdinFn != nil {
+			setupInput = r.setupStdinFn
+		}
+		stdinClose, stdinStore, err = setupInput(cmd, req, filepath.Join(r.outputDir, id+".in"))
+		if err != nil {
+			releaseAdmit()
+			return r.failLaunchPrep(ctx, record, "E_RUN_STDIN_INVALID", err)
+		}
+		record.StdinStored = stdinStore
+		setupCapture := setupPipes
+		if r.setupPipesFn != nil {
+			setupCapture = r.setupPipesFn
+		}
+		readers, writers, err = setupCapture(cmd, req.Merge)
+		if err != nil {
+			releaseAdmit()
+			return r.failLaunchPrep(ctx, record, "E_RUN_CAPTURE_FAILED", err)
+		}
+		startCommand := func(command *exec.Cmd) error { return command.Start() }
+		if r.startFn != nil {
+			startCommand = r.startFn
+		}
+		if err = startCommand(cmd); err != nil {
+			closePipes(readers, writers)
+			code := "E_RUN_LAUNCH_FAILED"
+			if strings.Contains(err.Error(), "clone3") || errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.ENOSYS) {
+				code = "E_RUN_SCOPE_UNAVAILABLE"
+			}
+			releaseAdmit()
+			return r.failLaunchPrep(ctx, record, code, err)
+		}
+		// A sibling may recheck as soon as the child is successfully placed.
+		releaseAdmit()
+		return nil, nil
+	}
+	if failedRecord, prepErr := launchPrep(); prepErr != nil {
+		return failedRecord, prepErr
 	}
 	// UseCgroupFD makes Go launch this child with clone3 and
 	// CLONE_INTO_CGROUP. A successful Start therefore proves placement at
@@ -531,6 +626,11 @@ func mergeEvidence(base, candidate RunRecord) RunRecord {
 	if candidate.Buffering != "" {
 		base.Buffering = candidate.Buffering
 	}
+	if candidate.Admission != "" {
+		base.Admission = candidate.Admission
+		base.AdmissionReason = candidate.AdmissionReason
+		base.AdmissionWaitedMS = candidate.AdmissionWaitedMS
+	}
 	base.CaptureComplete = candidate.CaptureComplete
 	base.CaptureForcedClosed = candidate.CaptureForcedClosed
 	base.StdinStored = base.StdinStored || candidate.StdinStored
@@ -651,6 +751,13 @@ func (r *Runner) intendedScope(id string) string {
 		return filepath.Join(b.parent, ".aira-"+id)
 	}
 	return id
+}
+
+func (r *Runner) failLaunchPrep(ctx context.Context, record RunRecord, code string, err error) (*RunRecord, error) {
+	if r.failBeforeLaunchFn != nil {
+		return r.failBeforeLaunchFn(ctx, record, code, err)
+	}
+	return r.failBeforeLaunch(ctx, record, code, err)
 }
 
 func (r *Runner) failBeforeLaunch(ctx context.Context, record RunRecord, code string, err error) (*RunRecord, error) {

@@ -83,12 +83,12 @@ func TestStdbufInjectionPrependsAndNoOpPreservesEnvironment(t *testing.T) {
 	}
 }
 
-func TestLedgerRoundTripPreservesBuffering(t *testing.T) {
+func TestLedgerRoundTripPreservesBufferingAndAdmission(t *testing.T) {
 	l, err := newLedger(t.TempDir(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusStarting, ScopeIntegrity: ScopeContained, Buffering: "realtime"}
+	run := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusStarting, ScopeIntegrity: ScopeContained, Buffering: "realtime", Admission: "waited", AdmissionReason: "", AdmissionWaitedMS: 123}
 	if _, err := l.append(ledgerEvent{Kind: "starting", Run: run}); err != nil {
 		t.Fatal(err)
 	}
@@ -98,6 +98,9 @@ func TestLedgerRoundTripPreservesBuffering(t *testing.T) {
 	}
 	if events[0].Run.Buffering != "realtime" {
 		t.Fatalf("ledger buffering=%q events=%+v", events[0].Run.Buffering, events)
+	}
+	if events[0].Run.Admission != "waited" || events[0].Run.AdmissionWaitedMS != 123 {
+		t.Fatalf("ledger admission=%+v", events[0].Run)
 	}
 }
 

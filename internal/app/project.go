@@ -11,7 +11,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"aira/internal/domain"
 	"aira/internal/runner"
@@ -26,8 +28,11 @@ type Config struct {
 }
 
 type RunConfig struct {
-	Prefix       []string `json:"prefix,omitempty"`
-	CgroupParent string   `json:"cgroup_parent,omitempty"`
+	Prefix           []string `json:"prefix,omitempty"`
+	CgroupParent     string   `json:"cgroup_parent,omitempty"`
+	Slice            string   `json:"slice,omitempty"`
+	MemoryHeadroom   string   `json:"memory_headroom,omitempty"`
+	AdmissionMaxWait string   `json:"admission_max_wait,omitempty"`
 }
 
 type ProjectConfig struct {
@@ -119,6 +124,10 @@ func Discover(ctx context.Context, cwd string) (Project, error) {
 }
 
 func Open(ctx context.Context, cwd string) (*store.Store, Project, error) {
+	return OpenWithDiagnostics(ctx, cwd, nil)
+}
+
+func OpenWithDiagnostics(ctx context.Context, cwd string, diagnostics io.Writer) (*store.Store, Project, error) {
 	project, err := Discover(ctx, cwd)
 	if err != nil {
 		return nil, Project{}, err
@@ -145,11 +154,20 @@ func Open(ctx context.Context, cwd string) (*store.Store, Project, error) {
 	if err != nil {
 		return nil, Project{}, err
 	}
+	memoryReserve, admissionMaxWait, err := parsedRunAdmission(project.Config.Run)
+	if err != nil {
+		_ = s.Close()
+		return nil, Project{}, err
+	}
 	execution, err := runner.New(runner.Config{
-		CommonDir:    project.CommonDir,
-		OutputDir:    filepath.Join(project.CommonDir, "aira", "runs", "output"),
-		CgroupParent: project.Config.Run.CgroupParent,
-		Prefix:       project.Config.Run.Prefix,
+		CommonDir:        project.CommonDir,
+		OutputDir:        filepath.Join(project.CommonDir, "aira", "runs", "output"),
+		CgroupParent:     project.Config.Run.CgroupParent,
+		Prefix:           project.Config.Run.Prefix,
+		MemorySlice:      project.Config.Run.Slice,
+		MemoryReserve:    memoryReserve,
+		AdmissionMaxWait: admissionMaxWait,
+		Diagnostics:      diagnostics,
 	})
 	if err != nil {
 		_ = s.Close()
@@ -352,7 +370,62 @@ func validateConfig(config Config) error {
 	if heartbeatSeconds >= ttlSeconds {
 		return errors.New("E_CONFIG_INVALID: heartbeat must be shorter than ttl")
 	}
+	if _, _, err := parsedRunAdmission(config.Run); err != nil {
+		return err
+	}
 	return nil
+}
+
+func parsedRunAdmission(config RunConfig) (int64, time.Duration, error) {
+	slice := strings.TrimSpace(config.Slice)
+	headroom := strings.TrimSpace(config.MemoryHeadroom)
+	if (slice == "") != (headroom == "") {
+		return 0, 0, errors.New("E_CONFIG_INVALID: run.slice and run.memory_headroom must be configured together")
+	}
+	var reserve int64
+	var err error
+	if headroom != "" {
+		reserve, err = parseByteCount(headroom)
+		if err != nil {
+			return 0, 0, fmt.Errorf("E_CONFIG_INVALID: run.memory_headroom: %w", err)
+		}
+	}
+	var maxWait time.Duration
+	if value := strings.TrimSpace(config.AdmissionMaxWait); value != "" {
+		maxWait, err = time.ParseDuration(value)
+		if err != nil || maxWait <= 0 {
+			return 0, 0, errors.New("E_CONFIG_INVALID: run.admission_max_wait must be a positive duration")
+		}
+	}
+	return reserve, maxWait, nil
+}
+
+func parseByteCount(value string) (int64, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, errors.New("empty byte count")
+	}
+	multiplier := int64(1)
+	last := value[len(value)-1]
+	switch last {
+	case 'k', 'K':
+		multiplier = 1 << 10
+		value = value[:len(value)-1]
+	case 'm', 'M':
+		multiplier = 1 << 20
+		value = value[:len(value)-1]
+	case 'g', 'G':
+		multiplier = 1 << 30
+		value = value[:len(value)-1]
+	case 't', 'T':
+		multiplier = 1 << 40
+		value = value[:len(value)-1]
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed <= 0 || parsed > int64(^uint64(0)>>1)/multiplier {
+		return 0, errors.New("byte count must be a positive 1024-based integer without overflow")
+	}
+	return parsed * multiplier, nil
 }
 
 func writeConfig(path string, data []byte) error {

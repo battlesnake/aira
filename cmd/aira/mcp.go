@@ -402,6 +402,9 @@ func decodeMCPRequest(binding mcpToolBinding, values map[string]json.RawMessage)
 		if _, ok := args["store_stdin"]; !ok {
 			args["store_stdin"] = false
 		}
+		if _, ok := args["no_admit"]; !ok {
+			args["no_admit"] = false
+		}
 	case "run-log":
 		if _, ok := args["stream"]; !ok {
 			args["stream"] = ""

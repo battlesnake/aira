@@ -1091,11 +1091,12 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			boolSpec("realtime", false, false, "Apply realtime stdio buffering when libstdbuf is available"),
 			stringSpec("stdin", false, false, "Launch-time stdin file or -"),
 			boolSpec("store_stdin", false, false, "Persist supplied launch stdin"),
+			boolSpec("no_admit", false, false, "Bypass configured memory admission"),
 		}, MCPTool: "aira_run", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			request := runner.Request{
 				Argv: stringSlice(args, "argv"), Cwd: stringArg(args, "cwd"), Env: stringSlice(args, "env"),
 				Prefix: stringSlice(args, "prefix"), Merge: boolArg(args, "merge"), Realtime: boolArg(args, "realtime"), StdinPath: stringArg(args, "stdin"),
-				StoreStdin: boolArg(args, "store_stdin"),
+				StoreStdin: boolArg(args, "store_stdin"), NoAdmit: boolArg(args, "no_admit"),
 			}
 			if c.face.Live {
 				if request.Merge {

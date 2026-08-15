@@ -249,6 +249,7 @@ func (l *ledger) read() ([]ledgerEvent, error) {
 			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: trailing ledger payload")
 		}
 		normalizeBuffering(&event.Run)
+		normalizeAdmission(&event.Run)
 		prior = event.Sequence
 		events = append(events, event)
 	}
@@ -286,6 +287,7 @@ func replay(events []ledgerEvent) (map[string]RunRecord, error) {
 	terminals := make(map[string]bool)
 	for _, e := range events {
 		normalizeBuffering(&e.Run)
+		normalizeAdmission(&e.Run)
 		if e.Run.ID == "" {
 			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: empty run id")
 		}
@@ -309,6 +311,12 @@ func replay(events []ledgerEvent) (map[string]RunRecord, error) {
 func normalizeBuffering(record *RunRecord) {
 	if record.Buffering == "" {
 		record.Buffering = "none"
+	}
+}
+
+func normalizeAdmission(record *RunRecord) {
+	if record.Admission == "" {
+		record.Admission = "disabled"
 	}
 }
 
@@ -359,21 +367,21 @@ func (l *ledger) project(ctx context.Context) error {
 	if _, err = db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, terminal INTEGER NOT NULL, record_json BLOB NOT NULL)`); err != nil {
 		return err
 	}
-	for _, column := range []string{"peak_rss", "cpu_user", "cpu_sys"} {
-		if err := ensureRunColumn(ctx, db, column); err != nil {
+	for column, kind := range map[string]string{"peak_rss": "INTEGER", "cpu_user": "INTEGER", "cpu_sys": "INTEGER", "admission": "TEXT", "admission_reason": "TEXT", "admission_waited_ms": "INTEGER"} {
+		if err := ensureRunColumn(ctx, db, column, kind); err != nil {
 			return err
 		}
 	}
 	for _, r := range runs {
 		data, _ := json.Marshal(r)
-		if _, err = db.ExecContext(ctx, `INSERT INTO runs(id,status,terminal,record_json,peak_rss,cpu_user,cpu_sys) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,terminal=excluded.terminal,record_json=excluded.record_json,peak_rss=excluded.peak_rss,cpu_user=excluded.cpu_user,cpu_sys=excluded.cpu_sys`, r.ID, r.Status, r.Status.Terminal(), data, nullableMetric(r.PeakRSS), nullableMetric(r.CPUUser), nullableMetric(r.CPUSys)); err != nil {
+		if _, err = db.ExecContext(ctx, `INSERT INTO runs(id,status,terminal,record_json,peak_rss,cpu_user,cpu_sys,admission,admission_reason,admission_waited_ms) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,terminal=excluded.terminal,record_json=excluded.record_json,peak_rss=excluded.peak_rss,cpu_user=excluded.cpu_user,cpu_sys=excluded.cpu_sys,admission=excluded.admission,admission_reason=excluded.admission_reason,admission_waited_ms=excluded.admission_waited_ms`, r.ID, r.Status, r.Status.Terminal(), data, nullableMetric(r.PeakRSS), nullableMetric(r.CPUUser), nullableMetric(r.CPUSys), r.Admission, nullableString(r.AdmissionReason), r.AdmissionWaitedMS); err != nil {
 			return err
 		}
 	}
 	return db.Close()
 }
 
-func ensureRunColumn(ctx context.Context, db *sql.DB, name string) error {
+func ensureRunColumn(ctx context.Context, db *sql.DB, name, kind string) error {
 	rows, err := db.QueryContext(ctx, `PRAGMA table_info(runs)`)
 	if err != nil {
 		return err
@@ -399,7 +407,7 @@ func ensureRunColumn(ctx context.Context, db *sql.DB, name string) error {
 	if found {
 		return nil
 	}
-	_, err = db.ExecContext(ctx, `ALTER TABLE runs ADD COLUMN `+name+` INTEGER`)
+	_, err = db.ExecContext(ctx, `ALTER TABLE runs ADD COLUMN `+name+` `+kind)
 	return err
 }
 
@@ -408,6 +416,13 @@ func nullableMetric(value *int64) any {
 		return nil
 	}
 	return *value
+}
+
+func nullableString(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
 }
 
 func (l *ledger) rebuild(ctx context.Context) error { return l.project(ctx) }

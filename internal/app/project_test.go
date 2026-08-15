@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestInitCreatesRegisteredProjectAndRefusesOverwrite(t *testing.T) {
@@ -36,6 +37,45 @@ func TestInitCreatesRegisteredProjectAndRefusesOverwrite(t *testing.T) {
 	}
 	if filepath.IsAbs(result.Root) || filepath.IsAbs(result.Config) || result.Root != "." || result.Config != ".aira/config" {
 		t.Fatalf("init leaked absolute paths: %#v", result)
+	}
+}
+
+func TestRunAdmissionConfigParsesBytesAndDuration(t *testing.T) {
+	reserve, maxWait, err := parsedRunAdmission(RunConfig{Slice: "whale.slice", MemoryHeadroom: "4G", AdmissionMaxWait: "30m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reserve != 4*1024*1024*1024 || maxWait != 30*time.Minute {
+		t.Fatalf("reserve=%d maxWait=%s", reserve, maxWait)
+	}
+	reserve, _, err = parsedRunAdmission(RunConfig{Slice: "whale.slice", MemoryHeadroom: "1073741824"})
+	if err != nil || reserve != 1024*1024*1024 {
+		t.Fatalf("plain bytes reserve=%d err=%v", reserve, err)
+	}
+	reserve, _, err = parsedRunAdmission(RunConfig{Slice: "whale.slice", MemoryHeadroom: "512M"})
+	if err != nil || reserve != 512*1024*1024 {
+		t.Fatalf("megabytes reserve=%d err=%v", reserve, err)
+	}
+}
+
+func TestRunAdmissionConfigRejectsMalformedAndHalfConfig(t *testing.T) {
+	for name, run := range map[string]RunConfig{
+		"slice only":        {Slice: "whale.slice"},
+		"headroom only":     {MemoryHeadroom: "4G"},
+		"zero":              {Slice: "whale.slice", MemoryHeadroom: "0"},
+		"negative":          {Slice: "whale.slice", MemoryHeadroom: "-1"},
+		"malformed":         {Slice: "whale.slice", MemoryHeadroom: "4GB"},
+		"overflow":          {Slice: "whale.slice", MemoryHeadroom: "9223372036854775807G"},
+		"zero duration":     {Slice: "whale.slice", MemoryHeadroom: "4G", AdmissionMaxWait: "0s"},
+		"negative duration": {Slice: "whale.slice", MemoryHeadroom: "4G", AdmissionMaxWait: "-1s"},
+		"bad duration":      {Slice: "whale.slice", MemoryHeadroom: "4G", AdmissionMaxWait: "soon"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			base := Config{Schema: 1, Project: ProjectConfig{Slug: "demo", Prefixes: []string{"DEMO"}}, Lease: LeaseConfig{TTLSeconds: 900, HeartbeatSeconds: 30}, Run: run}
+			if err := validateConfig(base); err == nil || !strings.HasPrefix(err.Error(), "E_CONFIG_INVALID:") {
+				t.Fatalf("validateConfig()=%v", err)
+			}
+		})
 	}
 }
 
