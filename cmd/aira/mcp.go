@@ -408,7 +408,7 @@ func decodeMCPRequest(binding mcpToolBinding, values map[string]json.RawMessage)
 		if _, ok := args["no_admit"]; !ok {
 			args["no_admit"] = false
 		}
-		for _, name := range []string{"ticket", "phase", "label", "tool", "report", "suite", "shard", "retry", "usage", "provider"} {
+		for _, name := range []string{"ticket", "phase", "label", "tool", "report", "report_stream", "suite", "shard", "retry", "usage", "provider"} {
 			if _, ok := args[name]; !ok {
 				args[name] = ""
 			}

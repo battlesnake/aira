@@ -302,7 +302,7 @@ func parseRunArgs(argv []string) ([]string, map[string]string, error) {
 		switch name {
 		case "prefix", "env", "config-env":
 			options[name] = appendDelimited(options[name], value)
-		case "cwd", "stdin", "ticket", "phase", "label", "tool", "report", "suite", "shard", "retry", "usage", "provider":
+		case "cwd", "stdin", "ticket", "phase", "label", "tool", "report", "report-stream", "suite", "shard", "retry", "usage", "provider":
 			if options[name] != "" {
 				return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: option --%s may occur once", name)
 			}
@@ -376,6 +376,7 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		args["label"] = options["label"]
 		args["tool"] = options["tool"]
 		args["report"] = options["report"]
+		args["report_stream"] = options["report-stream"]
 		args["suite"] = options["suite"]
 		args["config_env"] = canonicalOptionList(options["config-env"])
 		args["shard"] = options["shard"]

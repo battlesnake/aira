@@ -1155,6 +1155,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("label", false, false, "Run label"),
 			stringSpec("tool", false, false, "Tool/model identity"),
 			stringSpec("report", false, false, "Captured test report format", "go-json", "junit"),
+			stringSpec("report_stream", false, false, "Captured stream to parse as the report", "out", "err", "merged"),
 			stringSpec("suite", false, false, "Test suite identity"),
 			listSpec("config_env", false, false, "Environment-scoped test configuration K=V"),
 			stringSpec("shard", false, false, "Test shard i/n"),
@@ -1171,7 +1172,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			// Record all transport-neutral wiring arguments even when the runner is
 			// unavailable; dispatch metadata and generated faces share this handler.
-			for _, name := range []string{"report", "suite", "shard", "retry", "usage", "provider"} {
+			for _, name := range []string{"report", "report_stream", "suite", "shard", "retry", "usage", "provider"} {
 				_ = stringArg(args, name)
 			}
 			_ = stringSlice(args, "config_env")
@@ -1199,11 +1200,20 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 					return nil, runnerError("E_RUN_STDIN_INVALID", errors.New("stdin '-' is unavailable on this face"))
 				}
 			}
+			// Snapshot the VCS identity BEFORE launch (Sol build-review): the child may
+			// change HEAD/branch/worktree, and a report must be attributed to the code that
+			// was actually tested, not to whatever the working tree became afterwards.
+			var reportContext store.TestReportContext
+			if strings.TrimSpace(stringArg(args, "report")) != "" {
+				if contextual, ok := c.store.(testReportContextStore); ok {
+					reportContext = contextual.TestReportContext(ctx)
+				}
+			}
 			record, err := c.runner.Launch(ctx, request)
 			if err != nil {
 				return nil, err
 			}
-			wiring := c.wireTerminalRun(ctx, args, *record)
+			wiring := c.wireTerminalRun(ctx, args, *record, reportContext)
 			data := runResponseData{RunRecord: *record, Wiring: wiring}
 			if boolArg(args, "strict_wiring") && runRecordCode(*record) == "" && !wiring.WiringComplete {
 				return handlerData{Data: data, Code: "E_RUN_WIRING_INCOMPLETE"}, nil

@@ -76,7 +76,7 @@ func runnerReportMaxBytes(execution Runner) int64 {
 	return defaultRunReportMaxBytes
 }
 
-func (c *Core) wireTerminalRun(ctx context.Context, args *argAccessor, record runner.RunRecord) runWiring {
+func (c *Core) wireTerminalRun(ctx context.Context, args *argAccessor, record runner.RunRecord, reportContext store.TestReportContext) runWiring {
 	wiring := runWiring{
 		Report:         runReportWiring{Code: codeReportNotRequested},
 		Compute:        runComputeWiring{Tokens: "unevaluated", Code: codeComputeNotRequested},
@@ -90,7 +90,7 @@ func (c *Core) wireTerminalRun(ctx context.Context, args *argAccessor, record ru
 		wiring.warn("run", "U_RUN_EXIT_UNKNOWN", "run did not return terminal evidence")
 	} else {
 		if reportRequested {
-			c.wireRunReport(ctx, args, record, &wiring)
+			c.wireRunReport(ctx, args, record, reportContext, &wiring)
 		}
 		if toolRequested {
 			c.wireRunCompute(ctx, args, record, &wiring)
@@ -105,7 +105,7 @@ func (w *runWiring) warn(action, code, message string) {
 	w.Warnings = append(w.Warnings, runWiringWarning{Action: action, Code: code, Message: message})
 }
 
-func (c *Core) wireRunReport(ctx context.Context, args *argAccessor, record runner.RunRecord, wiring *runWiring) {
+func (c *Core) wireRunReport(ctx context.Context, args *argAccessor, record runner.RunRecord, reportContext store.TestReportContext, wiring *runWiring) {
 	wiring.Report.Code = "OK"
 	config, err := runConfigDigest(stringSlice(args, "config_env"))
 	if err != nil {
@@ -119,9 +119,15 @@ func (c *Core) wireRunReport(ctx context.Context, args *argAccessor, record runn
 		wiring.warn("report", wiring.Report.Code, err.Error())
 		return
 	}
-	stream := "out"
-	if record.Merge {
-		stream = "merged"
+	// A merged/pty run has one "merged" stream. A non-merged run defaults to stdout
+	// (where go-json and most runners write structured output); --report-stream lets the
+	// caller point at "err" or "merged" when the report is elsewhere, so a report emitted
+	// on stderr is not silently missed (Sol build-review).
+	stream, err := reportStream(stringArg(args, "report_stream"), record.Merge)
+	if err != nil {
+		wiring.Report.Code = "E_RUN_ARGUMENT_INVALID"
+		wiring.warn("report", wiring.Report.Code, err.Error())
+		return
 	}
 	chunk, err := c.runner.ReadOutput(ctx, runner.OutputRequest{RunID: record.ID, Stream: stream, Full: true, MaxBytes: c.reportMaxBytes})
 	if err != nil {
@@ -133,12 +139,11 @@ func (c *Core) wireRunReport(ctx context.Context, args *argAccessor, record runn
 		Format: stringArg(args, "report"), Raw: append([]byte(nil), chunk.Bytes...),
 		TicketID: record.Ticket, Phase: record.Phase, RunRef: record.ID,
 		SuiteID: stringArg(args, "suite"), Config: config, Shard: stringArg(args, "shard"), RetryIndex: retry,
-		EnvDigest: record.EnvDigest, At: record.EndedAt, Runner: record.Tool,
+		EnvDigest: record.EnvDigest, At: record.EndedAt,
 	}
-	if contextual, ok := c.store.(testReportContextStore); ok {
-		identity := contextual.TestReportContext(ctx)
-		input.Commit, input.Branch, input.WorktreeID = identity.Commit, identity.Branch, identity.WorktreeID
-	}
+	// Runner (the test-runner identity) is NOT the --tool (an LLM/compute model); leave it
+	// unknown rather than mislabel provenance (Sol build-review).
+	input.Commit, input.Branch, input.WorktreeID = reportContext.Commit, reportContext.Branch, reportContext.WorktreeID
 	forcedIncomplete := !record.CaptureComplete || chunk.Truncated
 	input.ForceParserIncomplete = forcedIncomplete
 	if chunk.Truncated {
@@ -153,14 +158,20 @@ func (c *Core) wireRunReport(ctx context.Context, args *argAccessor, record runn
 	}
 	added, addErr := c.store.AddTestReport(ctx, input)
 	if addErr != nil && store.ErrorCode(addErr) == "E_TESTREPORT_INVALID" && !chunk.Truncated {
-		// M19 keeps an honestly parser-incomplete observation even when the raw
-		// parser cannot recover results. M13's direct add semantics remain strict.
+		// The captured output did not parse as a valid <fmt> report. Keep an honestly
+		// parser-incomplete observation (raw dropped, no results) AND emit a warning so the
+		// wiring is marked incomplete — a malformed capture is a wiring failure, never a
+		// silent success (Sol build-review). M13's direct add semantics stay strict.
 		input.Raw = nil
 		input.SourceDigest = digestBytes(append([]byte("aira:run-report:parser-incomplete\x00"), chunk.Bytes...))
 		input.Results = nil
 		input.ParserComplete = false
 		input.ForceParserIncomplete = true
 		added, addErr = c.store.AddTestReport(ctx, input)
+		if addErr == nil {
+			wiring.Report.Code = "U_TESTREPORT_INCOMPLETE"
+			wiring.warn("report", wiring.Report.Code, "captured output did not parse as a valid report")
+		}
 	}
 	if addErr != nil {
 		wiring.Report.Code = store.ErrorCode(addErr)
@@ -198,6 +209,33 @@ func runConfigDigest(values []string) (string, error) {
 		return "", fmt.Errorf("E_RUN_CONFIG_ENV_INVALID: %s", strings.TrimPrefix(err.Error(), "E_RUN_ENV_INVALID: "))
 	}
 	return digest, nil
+}
+
+// reportStream resolves which captured stream the report parses. A merged/pty run has
+// exactly one "merged" stream; a non-merged run defaults to stdout ("out") but the caller
+// may select "err" (a report emitted on stderr) so it is never silently missed.
+func reportStream(explicit string, merged bool) (string, error) {
+	explicit = strings.TrimSpace(explicit)
+	if explicit == "" {
+		if merged {
+			return "merged", nil
+		}
+		return "out", nil
+	}
+	switch explicit {
+	case "merged":
+		if !merged {
+			return "", errors.New("E_RUN_ARGUMENT_INVALID: --report-stream merged requires a merged or pty run")
+		}
+		return "merged", nil
+	case "out", "err":
+		if merged {
+			return "", errors.New("E_RUN_ARGUMENT_INVALID: a merged/pty run has a single stream; use --report-stream merged")
+		}
+		return explicit, nil
+	default:
+		return "", errors.New("E_RUN_ARGUMENT_INVALID: --report-stream must be out|err|merged")
+	}
 }
 
 func runRetryIndex(raw string) (int, error) {
