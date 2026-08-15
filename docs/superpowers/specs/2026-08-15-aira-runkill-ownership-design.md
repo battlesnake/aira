@@ -9,7 +9,7 @@
 - **Review:** Sol plan-review r1 → REVISE (0×P0; P1 atomicity/steal-durability/structured-payload/
   owner-wiring, P2 terminal-idempotency/spy-test/per-event-owner), r2 → REVISE (P1 reconcile-not-a-
   killWithIntent-caller, P1 steal-field-loss→monotonic StolenBy; P2 unknown-id, lock-file side
-  effect); this is **v3** (§8).
+  effect); this is **v4** (§8).
 
 ## 0. Context — the failure this guards
 
@@ -28,7 +28,8 @@ not a forger (the owner id is a gitdir hash, not a secret — §6).
 wired from `project.WorktreeID`; an **atomic** ownership guard **inside `killWithIntent`** (under the
 per-run lock) that refuses a clearly-foreign user kill (`E_RUN_FOREIGN_OWNER`, no kill performed)
 unless `--steal`; a **structured refusal payload** (run/owner/caller); `--steal` (CLI+MCP) override
-persisted durably in `KillIntent`; fail-open on unevaluated ownership.
+recorded durably (a monotonic top-level `StolenBy` + a steal evidence event before the scope
+action); fail-open on unevaluated ownership.
 
 **Out (deferred):** unforgeable owner tokens (§6); guarding non-AIRA (whale-run/systemd) scopes
 (route those through `aira run`); read-side (`run-log`) ownership (reads are safe).
@@ -46,12 +47,13 @@ persisted durably in `KillIntent`; fail-open on unevaluated ownership.
   no status change). Atomic — not dependent on `Owner` immutability between a separate read and the
   mutation. (Acquiring the per-run `lockFile` may create a benign lock file — that is the only fs
   side effect; there is no *kill/ledger* mutation.)
-- **I3 — `--steal` overrides, durably (monotonic).** With `steal`, the foreign run is killed and the
-  override is recorded in a **top-level monotonic `RunRecord.StolenBy`** (the stealing worktree id),
-  carried by `mergeEvidence` exactly like `Owner` — so a concurrent timeout/reconcile that *replaces*
-  the nested `KillIntent` cannot erase it (nested `KillIntent.Steal` would be lost when timeout
-  rebuilds the intent or `mergeEvidence` replaces the whole nested value — Sol r2). `ScopeKill.Actor`
-  remains the physical executor.
+- **I3 — `--steal` overrides, durably (monotonic + crash-safe).** With `steal`, the foreign run is
+  killed and the override is recorded in a **top-level monotonic `RunRecord.StolenBy`** (the stealing
+  worktree id), **durably appended BEFORE the scope action** (not relying on the `!KillIntent.Present`
+  append-skip nor the terminal write), and carried by `mergeEvidence` like `Owner`. It survives (a) a
+  timeout/reconcile that rebuilds the nested `KillIntent` and (b) **a crash after the scope action but
+  before the caller's terminal publish** — Reconcile then still surfaces `StolenBy`. `ScopeKill.Actor`
+  remains the physical executor; an empty `StolenBy` candidate never clears a set value.
 - **I4 — fail-open on unevaluated ownership.** `record.Owner==""` (pre-#27 legacy, persists
   indefinitely) → allow. `r.owner==""` is **dead in production** (`app.Open` always supplies a
   nonempty hash); it stays fail-open only for tests, and an **app-level wiring test** asserts
@@ -95,11 +97,15 @@ field-loss trap is worse here because replay replaces whole records.
      policy.CallerOwner` → return `(&current, &ForeignOwnerError{RunID:id, Owner:current.Owner,
      CallerOwner:policy.CallerOwner})` with **no** intent append and **no** scope call (I2).
   4. else proceed with the existing durable kill path; if `policy.Steal`, set the **top-level
-     monotonic** `current.StolenBy = policy.CallerOwner` **before** the scope action, so it is
-     recorded on the intent/terminal events and carried by `mergeEvidence` (survives a
-     timeout/reconcile that rebuilds `KillIntent`). Keep `ScopeKill.Actor` for the executor. This
-     works even if a `KillIntent` is already present (the `if !KillIntent.Present` append-skip would
-     otherwise drop a nested steal field — the top-level `StolenBy` sidesteps that entirely).
+     monotonic** `current.StolenBy = policy.CallerOwner` and **append a durable evidence event
+     carrying it BEFORE the scope action** — regardless of `KillIntent.Present`. The existing
+     `if !current.KillIntent.Present` append-skip means a steal on a run that *already* has a
+     (timeout) intent would otherwise NOT be durably written, so a crash after the scope action but
+     before the terminal publish would lose it and Reconcile would replay the original intent (Sol
+     r3). Emit either a `kill-intent` snapshot that **preserves the original intent sequence** but
+     adds `StolenBy`, or a dedicated `kill-steal` event; replay/reconcile must surface `StolenBy`
+     from it. `mergeEvidence` carries `StolenBy` monotonically (an empty candidate never clears a set
+     value). Keep `ScopeKill.Actor` for the executor.
 
 ### 3.3 Faces + structured refusal
 
@@ -113,9 +119,10 @@ field-loss trap is worse here because replay replaces whole records.
 
 ### 3.4 What does NOT change
 
-Kill mechanics/scope/capture/rusage; same-owner behaviour; `Reconcile`/timeout/`failBeforeLaunch`
-(explicitly `Enforce:false`). Lock-order-style invariant documented: **only the user `Kill` path
-enforces**; every recovery/lifecycle kill bypasses.
+Kill mechanics/scope/capture/rusage; same-owner behaviour. `Reconcile`/`failBeforeLaunch` are
+unchanged (they `killScope` directly, never `killWithIntent`); only `timeout` passes `Enforce:false`.
+Lock-order-style invariant documented: **only the user `Kill` path enforces**; every recovery/
+lifecycle kill bypasses by construction.
 
 ## 4. Tests
 
@@ -127,11 +134,13 @@ counting `Open/Terminate/Kill/Remove`):
 - **T2 (I2, decisive)** — B kills A's `RUN-1` (no steal): `E_RUN_FOREIGN_OWNER`; assert **exact**
   record + ledger-event-count equality (snapshot before/after) and **zero** backend Open/Terminate/
   Kill/Remove. *Fails any unguarded Kill.*
-- **T3 (I3, monotonic steal)** — B `Kill(steal=true)` → A's run killed (`E_RUN_KILLED`);
-  `StolenBy=="B"`; and specifically: a **timeout intent already present → a foreign `--steal`
-  augmentation → a terminal merge / reconcile replay retains `StolenBy`** (a nested `KillIntent.Steal`
-  would be erased by the timeout intent rebuild / `mergeEvidence` nested-replace). Also a steal on a
-  run whose `KillIntent.Present` is already true still records `StolenBy`.
+- **T3 (I3, monotonic + crash-safe steal)** — B `Kill(steal=true)` → A's run killed (`E_RUN_KILLED`);
+  `StolenBy=="B"`. Crash-durability discriminator: a **timeout intent already present**, then a foreign
+  `--steal` that **appends the durable steal event + performs the scope action but crashes BEFORE the
+  caller's terminal publish**; a subsequent `Reconcile` (fresh runner) terminalises the run and
+  **still surfaces `StolenBy=="B"`** (a merge that only mutated in-memory `current`, or a nested
+  `KillIntent.Steal` erased by the timeout intent-rebuild / `mergeEvidence` nested-replace, would lose
+  it). Also: an empty `StolenBy` candidate in a later merge never clears the set value.
 - **T4 (I4)** — `Owner==""` legacy record → allowed; `r.owner==""` runner → allowed (documented
   test-only). Plus an **app-level test**: `app.Open` yields a runner whose `Owner` is a nonempty
   hash (a wiring regression fails here).
@@ -175,9 +184,18 @@ run-kill --steal RUN-1` → killed; A killing its own run works.
 ## 7. Deferred
 
 Unforgeable owner tokens; whale-run/systemd-scope guarding (route via `aira run`); a richer
-`--steal` audit trail (journal event) beyond the `KillIntent` record.
+`--steal` audit trail (a §11 journal event) beyond the `StolenBy` record field + steal evidence event.
 
 ## 8. Sol plan-review resolutions
+
+### r3
+- **P1 steal pre-action durability** → §3.2 step 4 / I3: on a `--steal`, append a durable steal
+  evidence event (a sequence-preserving `kill-intent` snapshot or a `kill-steal` event) carrying
+  `StolenBy` **before** the scope action — regardless of `KillIntent.Present` — so a crash after the
+  scope action but before the terminal publish doesn't lose it (Reconcile surfaces it). `mergeEvidence`
+  carries `StolenBy` monotonically. T3 crash-after-scope-before-terminal → reconcile discriminator.
+- **wording** → removed stale "override stored in `KillIntent`" and "Reconcile passes `Enforce:false`"
+  text; only `timeout` passes `Enforce:false`, recovery paths stay direct.
 
 ### r2
 - **P1 reconcile not a killWithIntent caller** → §3.2/I5: only timeout + user Kill call
@@ -196,8 +214,8 @@ Unforgeable owner tokens; whale-run/systemd-scope guarding (route via `aira run`
 
 - **P1 atomicity** → §3.2: guard moved inside `killWithIntent` under the per-run lock, after replay,
   before intent/scope; `killPolicy` arg so timeout/reconcile bypass (I2 atomic, I5).
-- **P1 steal durability** → §3.2/I3: `KillIntent.{Steal,CallerOwner}` persisted before scope action;
-  `ScopeKill.Actor` kept for the executor.
+- **P1 steal durability** → superseded by r2/r3: a top-level monotonic `StolenBy` + a durable steal
+  evidence event before the scope action (see r2/r3 below); `ScopeKill.Actor` kept for the executor.
 - **P1 structured payload** → §3.3/I7: typed `ForeignOwnerError` → `handlerData{Code,Data}` (data
   preserved; not via a discarded err; not in `ErrorCodes`); exit 1.
 - **P1 owner wiring** → §3.1/I4: `r.owner==""` documented dead-in-prod fail-open + an app-level
