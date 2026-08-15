@@ -534,10 +534,23 @@ func writeConfig(path string, data []byte) error {
 }
 
 func gitValue(ctx context.Context, dir string, args ...string) (string, error) {
+	// Project discovery must never hang. Two failure modes are bounded here: a
+	// genuinely stuck git (killed by the context deadline), and a lingering child
+	// pipe — a git credential-helper / fsmonitor grandchild can inherit git's
+	// stdout and keep Output() blocked reading for EOF long after git itself exits.
+	// WaitDelay force-closes that pipe shortly after exit (Go 1.20+); the captured
+	// ref is still valid, so a WaitDelay on an otherwise-successful git is not a
+	// discovery failure. rev-parse output is a single ref, so these bounds are safe.
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	commandArgs := append([]string{"-C", dir, "rev-parse"}, args...)
 	command := exec.CommandContext(ctx, "git", commandArgs...)
+	command.WaitDelay = 5 * time.Second
 	output, err := command.Output()
 	if err != nil {
+		if errors.Is(err, exec.ErrWaitDelay) && command.ProcessState != nil && command.ProcessState.Success() {
+			return string(output), nil
+		}
 		return "", err
 	}
 	return string(output), nil
