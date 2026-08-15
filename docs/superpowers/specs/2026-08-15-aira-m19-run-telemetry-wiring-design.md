@@ -1,6 +1,6 @@
 # AIRA M19 — run → telemetry auto-wiring (report + compute + honest observation)
 
-Status: PLAN (v3 — Sol r2: §14 design-authority AMENDED to reconcile attest→observation +
+Status: PLAN APPROVED (v4 — Sol APPROVE-PLAN after 3 rounds; §14 authority amended; build-review checklist in §7)
 usage→--usage with §118; bounded capture read (report_max_bytes); --usage file+--provider (no
 `-`, no provider-guess); config-env canonicalization reuse; strict-wiring exit precedence)
 Date: 2026-08-15
@@ -191,3 +191,20 @@ produced. This keeps M19 decision-complete and §118-honest.
    `--strict-wiring` is the only path to a non-zero AIRA exit and is clearly distinguished from the
    child's exit.
 6. Metadata is orthogonal to launch/capture; the gate lane emits no M19 telemetry.
+
+## 7. Build-review checklist (Sol APPROVE-PLAN, r3)
+
+Implementation-verified items the build review must confirm:
+
+1. Effective `parser_complete` = parser-success **AND** `CaptureComplete` **AND** below the
+   `report_max_bytes` ceiling — and M13's `AddTestReport` must not overwrite a forced-false back
+   to true after parsing (compute the AND at the M19 call site and pass it in, or re-assert after).
+2. Unknown/unsupported `--provider` has ONE deterministic outcome: persist a resource-only
+   ComputeEvent with nil token buckets + a stable warning code, and specify its effect on
+   `wiring_complete` (a recognised-but-unparseable usage is a wiring failure; an absent `--usage`
+   is not).
+3. An oversized (`U_RUN_REPORT_TOO_LARGE`) report can **never** produce `tests_green_observed`,
+   even if the retained prefix parses cleanly — a discriminating test.
+4. Strict-wiring precedence tested across the matrix: child-success+all-wiring-ok;
+   child-success+report-fail; child-success+compute-fail; child-success+multiple-wiring-fail;
+   child-FAILURE+wiring-fail (child exit wins, surfaced as-is).
