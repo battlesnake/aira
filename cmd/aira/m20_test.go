@@ -113,6 +113,41 @@ func TestM20RendererPublishesHandleBeforeACKAndCancelsOnBrokenStdout(t *testing.
 	}
 }
 
+func TestM20MCPFlushesHandleBeforeACK(t *testing.T) {
+	for name, tc := range map[string]struct {
+		flushErr  error
+		delivered bool
+	}{
+		"flush-success": {flushErr: nil, delivered: true},
+		"flush-failure": {flushErr: errors.New("flush failed"), delivered: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := &flushWriter{flushErr: tc.flushErr}
+			called := false
+			resp := resultResponse(1, map[string]any{"id": "RUN-30", "status": "starting"})
+			resp.afterWrite = func(delivered bool) error {
+				called = true
+				// The MCP handle must be flushed before the ACK/cancel decision,
+				// and a failed flush is not a delivery (→ cancel), same as the CLI.
+				if !w.flushed {
+					t.Fatal("MCP completion hook ran before the handle was flushed")
+				}
+				if !strings.Contains(w.contentAtFlush, "RUN-30") {
+					t.Fatalf("MCP handle not written before flush: %q", w.contentAtFlush)
+				}
+				if delivered != tc.delivered {
+					t.Fatalf("delivered=%v want %v (flushErr=%v)", delivered, tc.delivered, tc.flushErr)
+				}
+				return nil
+			}
+			_ = writeMCP(w, resp)
+			if !called {
+				t.Fatal("MCP completion hook was not called")
+			}
+		})
+	}
+}
+
 func TestM20DetachIsInMCPAndSkillButSupervisorIsHidden(t *testing.T) {
 	server := newMCPServer(nil)
 	binding, ok := server.byName["aira_run"]

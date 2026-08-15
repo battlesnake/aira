@@ -900,18 +900,36 @@ func TestM20ReconcileUninspectableScopeNeverFinalizes(t *testing.T) {
 	}
 }
 
+func equalInt64Ptr(a, b *int64) bool {
+	return (a == nil) == (b == nil) && (a == nil || *a == *b)
+}
+
 func TestM20FinalizerEquivalenceShimAndReconcile(t *testing.T) {
 	oldBoot, oldStat := readBootIDFn, readProcStatFn
 	t.Cleanup(func() { readBootIDFn, readProcStatFn = oldBoot, oldStat })
 	readBootIDFn = func() (string, error) { return "boot-a", nil }
 	readProcStatFn = func(int) ([]byte, error) { return procStatForTest('S', 77), nil }
 
+	// Identical cgroup usage evidence for both finalizer callers, so a mutation
+	// that clears usage in one path is caught by the usage comparison below.
+	usageDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(usageDir, "memory.peak"), []byte("4096\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(usageDir, "cpu.stat"), []byte("user_usec 1000\nsystem_usec 500\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	capture := filepath.Join(t.TempDir(), "shared.out")
 	if err := os.WriteFile(capture, []byte("identical-capture-bytes"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	setup := func() (*Runner, Scope, RunRecord) {
-		r, scope := newMemoryRunner(t, nil)
+		r, err := New(Config{CommonDir: t.TempDir(), Backend: &memoryBackend{scope: &memoryScope{}}, Grace: 10 * time.Millisecond})
+		if err != nil {
+			t.Fatal(err)
+		}
+		scope := &auditScope{reference: usageDir} // empty (no members) + a usage fixture
+		r.backend = &auditBackend{scope: scope}
 		run := detachedRunForTest(scope, processAlive)
 		run.OutputRefs = map[string]OutputRef{"out": {Path: capture, State: OutputPartial}}
 		appendRunEvent(t, r, "starting", run)
@@ -924,8 +942,8 @@ func TestM20FinalizerEquivalenceShimAndReconcile(t *testing.T) {
 	}
 
 	// The shim finalizes via the lock-acquiring wrapper; Reconcile finalizes via
-	// the …Locked variant. Both must produce an identical honesty payload so
-	// whoever wins the terminal CAS is correct.
+	// the …Locked variant. Both must produce an identical honesty payload —
+	// including usage — so whoever wins the terminal CAS is correct.
 	rShim, scopeShim, runShim := setup()
 	shimFinal, err := rShim.finalizeDetachedTerminal(context.Background(), runShim.ID, scopeShim)
 	if err != nil {
@@ -951,11 +969,114 @@ func TestM20FinalizerEquivalenceShimAndReconcile(t *testing.T) {
 	if shimFinal.Status != recFinal.Status || !sameExit || shimFinal.Signal != recFinal.Signal ||
 		shimFinal.ScopeIntegrity != recFinal.ScopeIntegrity || shimFinal.CaptureComplete != recFinal.CaptureComplete ||
 		shimFinal.TerminalComplete != recFinal.TerminalComplete || shimRef.State != recRef.State ||
-		shimRef.Digest != recRef.Digest || shimRef.Bytes != recRef.Bytes {
+		shimRef.Digest != recRef.Digest || shimRef.Bytes != recRef.Bytes ||
+		!equalInt64Ptr(shimFinal.PeakRSS, recFinal.PeakRSS) || !equalInt64Ptr(shimFinal.CPUUser, recFinal.CPUUser) || !equalInt64Ptr(shimFinal.CPUSys, recFinal.CPUSys) {
 		t.Fatalf("finalizer divergence:\n shim=%+v\n recon=%+v", shimFinal, recFinal)
 	}
 	if shimFinal.ExitCode == nil || *shimFinal.ExitCode != 7 || shimRef.State != OutputComplete || shimRef.Digest == "" {
 		t.Fatalf("finalizer did not preserve exit + digest: %+v", shimFinal)
+	}
+	if shimFinal.PeakRSS == nil || *shimFinal.PeakRSS != 4096 || shimFinal.CPUUser == nil || *shimFinal.CPUUser != 1000 || shimFinal.CPUSys == nil || *shimFinal.CPUSys != 500 {
+		t.Fatalf("finalizer did not capture usage: %+v", shimFinal)
+	}
+}
+
+func TestM20ReconcileAbsentScopeFinalizesFromEvidenceOrLost(t *testing.T) {
+	oldBoot, oldStat := readBootIDFn, readProcStatFn
+	t.Cleanup(func() { readBootIDFn, readProcStatFn = oldBoot, oldStat })
+	readBootIDFn = func() (string, error) { return "boot-a", nil }
+	readProcStatFn = func(int) ([]byte, error) { return procStatForTest('S', 77), nil }
+
+	t.Run("absent scope with leader-exit evidence finalizes the exact exit", func(t *testing.T) {
+		r, scope := newMemoryRunner(t, nil)
+		run := detachedRunForTest(scope, processAlive)
+		capture := filepath.Join(t.TempDir(), "RUN-1.out")
+		if err := os.WriteFile(capture, []byte("done"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		run.OutputRefs = map[string]OutputRef{"out": {Path: capture, State: OutputPartial}}
+		appendRunEvent(t, r, "starting", run)
+		appendRunEvent(t, r, "scope-created", run)
+		five := 5
+		if _, err := r.ledger.append(ledgerEvent{Kind: "leader-exited", Run: RunRecord{ID: run.ID}, LeaderExitObserved: true, ExitCode: &five}); err != nil {
+			t.Fatal(err)
+		}
+		// The scope is positively ABSENT (removed): open returns ErrNotExist. With
+		// leader-exit evidence this finalizes to the exact exit; usage is
+		// unevaluated (no live cgroup), never fabricated.
+		r.backend = &openErrorBackend{err: os.ErrNotExist}
+		got := reconcileOne(t, r)
+		if got.Status != StatusExited || got.ExitCode == nil || *got.ExitCode != 5 || !got.TerminalComplete {
+			t.Fatalf("absent scope + evidence not finalized: %+v", got)
+		}
+		if got.PeakRSS != nil {
+			t.Fatalf("usage fabricated for an absent scope: %+v", got)
+		}
+	})
+
+	t.Run("absent scope dead supervisor without evidence becomes lost", func(t *testing.T) {
+		r, scope := newMemoryRunner(t, nil)
+		run := detachedRunForTest(scope, processDead)
+		appendRunEvent(t, r, "starting", run)
+		appendRunEvent(t, r, "scope-created", run)
+		r.backend = &openErrorBackend{err: os.ErrNotExist}
+		got := reconcileOne(t, r)
+		if got.Status != StatusLost || !containsString(got.ErrorCodes, "U_RUN_EXIT_UNKNOWN") {
+			t.Fatalf("absent scope + dead supervisor not lost: %+v", got)
+		}
+	})
+}
+
+func TestM20FinalizeKilledAndForceQuiescedRecordsBoth(t *testing.T) {
+	oldBoot, oldStat := readBootIDFn, readProcStatFn
+	t.Cleanup(func() { readBootIDFn, readProcStatFn = oldBoot, oldStat })
+	readBootIDFn = func() (string, error) { return "boot-a", nil }
+	readProcStatFn = func(int) ([]byte, error) { return procStatForTest('S', 77), nil }
+
+	r, scope := newMemoryRunner(t, nil)
+	run := detachedRunForTest(scope, processAlive)
+	run.KillIntent = KillIntent{Present: true}
+	run.QuiesceForced = true
+	appendRunEvent(t, r, "starting", run)
+	appendRunEvent(t, r, "scope-created", run)
+	zero := 0
+	if _, err := r.ledger.append(ledgerEvent{Kind: "leader-exited", Run: RunRecord{ID: run.ID}, LeaderExitObserved: true, ExitCode: &zero}); err != nil {
+		t.Fatal(err)
+	}
+	final, err := r.finalizeDetachedTerminal(context.Background(), run.ID, scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both facts must appear: kill wins the status (killed + E_RUN_KILLED) AND the
+	// forced-quiesce diagnostic is folded independently (U_RUN_QUIESCE_FORCED).
+	if final.Status != StatusKilled || !containsString(final.ErrorCodes, "E_RUN_KILLED") || !containsString(final.ErrorCodes, "U_RUN_QUIESCE_FORCED") || final.CleanSuccess() {
+		t.Fatalf("mixed killed+force-quiesced terminal dropped a fact: %+v", final)
+	}
+}
+
+func TestM20RealLaunchFlockHeldThroughRunningAppend(t *testing.T) {
+	r := realRunner(t)
+	r.runLockTimeout = 20 * time.Millisecond
+	lockPath := filepath.Join(filepath.Dir(r.ledger.ledger), "RUN-1.lock")
+	var hookFired, heldAtRunningAppend bool
+	r.beforeRunningAppendFn = func() {
+		hookFired = true
+		// The launch flock must still be held at the running append. A mutation
+		// that released it after Start would let this bounded acquire SUCCEED.
+		_, err := r.boundedRunLock(lockPath)
+		var le *LaunchError
+		heldAtRunningAppend = errors.As(err, &le) && le.Code == "U_RUN_LAUNCH_STALLED"
+	}
+	_, result := startRealDetached(t, r, Request{Argv: []string{"/bin/true"}})
+	outcome := <-result
+	if outcome.err != nil {
+		t.Fatalf("launch err=%v", outcome.err)
+	}
+	if !hookFired {
+		t.Fatal("running-append hook never fired (Start did not reach the running append)")
+	}
+	if !heldAtRunningAppend {
+		t.Fatal("run lock was NOT held at the running append (released after Start)")
 	}
 }
 

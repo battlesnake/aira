@@ -49,6 +49,10 @@ type Runner struct {
 	startFn            func(*exec.Cmd) error
 	lockAttemptFn      func(string) (*admitLock, error)
 	failBeforeLaunchFn func(context.Context, RunRecord, string, error) (*RunRecord, error)
+	// beforeRunningAppendFn is a test seam that fires inside the launch flock,
+	// after a successful Start and before the "running" append, to prove the
+	// per-run lock is held through the running append (not released after Start).
+	beforeRunningAppendFn func()
 }
 
 func New(cfg Config) (*Runner, error) {
@@ -1915,38 +1919,32 @@ func (r *Runner) Reconcile(ctx context.Context) ([]RunRecord, error) {
 
 func (r *Runner) reconcileDetachedLocked(ctx context.Context, record RunRecord, scopeCreated bool) (RunRecord, error) {
 	scope, openErr := r.backend.Open(ctx, record.CgroupScope)
-	if openErr != nil {
-		// The scope is not inspectable right now. A failed open must NEVER be
-		// treated as "empty": the child may still be live and merely
-		// uninspectable, so we never finalize or fabricate a terminal here.
-		if scopeCreated {
-			// It was created earlier and is now unreadable (removed, transient,
-			// or permission). Preserve non-terminal; a later reconcile resolves it.
+	var empty bool
+	switch {
+	case openErr == nil:
+		e, emptyErr := scope.Empty()
+		if emptyErr != nil {
 			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
 			return record, nil
 		}
-		// The scope was never created: this is the normal pre-scope window
-		// (admission wait or launch prep). A live/unknown supervisor is still
-		// working — preserve CLEANLY (not stalled). A dead supervisor died before
-		// creating the scope, so no child ran.
-		if processLive(record.SupervisorPID) == processDead {
-			record.Status, record.EndedAt = StatusLost, nowString(r.now)
-			record.ExitCode, record.Signal = nil, ""
-			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_EXIT_UNKNOWN")
-			record.TerminalComplete = true
-			committed, err := r.appendTerminalLocked(record.ID, record)
-			if err != nil {
-				return RunRecord{}, err
-			}
-			return committed, nil
+		empty = e
+	case errors.Is(openErr, os.ErrNotExist):
+		// The scope is positively ABSENT — removed after the run ended, or never
+		// created — which is genuine emptiness. No live cgroup remains, so any
+		// finalization records usage as unevaluated (nil scope, below).
+		scope, empty = nil, true
+	default:
+		// Genuinely UNINSPECTABLE (transient / permission / IO). NEVER treat as
+		// empty: the child may still be live, so never finalize or fabricate a
+		// terminal. A created scope preserves + surfaces; a pre-scope run with a
+		// dead supervisor never launched, otherwise it is still admitting.
+		if scopeCreated {
+			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
+			return record, nil
 		}
-		return record, nil
-	}
-	// The scope opened, so it exists and is inspectable (a successful open implies
-	// the durable scope-created event, so scopeCreated is necessarily true here).
-	empty, emptyErr := scope.Empty()
-	if emptyErr != nil {
-		record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
+		if processLive(record.SupervisorPID) == processDead {
+			return r.markDetachedLost(record)
+		}
 		return record, nil
 	}
 	if record.LeaderExitObserved {
@@ -1969,7 +1967,7 @@ func (r *Runner) reconcileDetachedLocked(ctx context.Context, record RunRecord, 
 		// A genuine stall requires that the scope was actually created (a durable
 		// scope-created event) and is now empty with a live supervisor and no exit
 		// evidence. A run still in the pre-scope window (admission/launch) is NOT
-		// stalled even if a backend reports its scope inspectable-and-empty.
+		// stalled even if the scope is inspectable-and-empty or positively absent.
 		if empty && scopeCreated {
 			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_SUPERVISOR_STALLED")
 		}
@@ -1981,17 +1979,25 @@ func (r *Runner) reconcileDetachedLocked(ctx context.Context, record RunRecord, 
 		if !empty {
 			return record, nil
 		}
-		record.Status, record.EndedAt = StatusLost, nowString(r.now)
-		record.ExitCode, record.Signal = nil, ""
-		record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_EXIT_UNKNOWN")
-		record.TerminalComplete = true
-		committed, err := r.appendTerminalLocked(record.ID, record)
+		out, err := r.markDetachedLost(record)
 		if err != nil {
 			return RunRecord{}, err
 		}
-		_ = scope.Remove()
-		return committed, nil
+		if scope != nil {
+			_ = scope.Remove()
+		}
+		return out, nil
 	default:
 		return record, nil
 	}
+}
+
+// markDetachedLost terminalizes a detached run whose exit is genuinely unknown.
+// The caller must hold the per-run lock. No fabricated exit code or usage.
+func (r *Runner) markDetachedLost(record RunRecord) (RunRecord, error) {
+	record.Status, record.EndedAt = StatusLost, nowString(r.now)
+	record.ExitCode, record.Signal = nil, ""
+	record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_EXIT_UNKNOWN")
+	record.TerminalComplete = true
+	return r.appendTerminalLocked(record.ID, record)
 }

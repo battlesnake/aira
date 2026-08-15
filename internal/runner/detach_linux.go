@@ -315,6 +315,9 @@ func (r *Runner) launchDetachedValidated(ctx context.Context, req Request, prefi
 		record.ScopeIntegrity = ScopeUnverified
 	}
 	runningJournalIncomplete := false
+	if r.beforeRunningAppendFn != nil {
+		r.beforeRunningAppendFn()
+	}
 	if _, err := r.append(ledgerEvent{Kind: "running", Run: record}); err != nil {
 		// The child already exists in the scope, so returning here would orphan it.
 		// Preserve supervision and retry the full running evidence while still
