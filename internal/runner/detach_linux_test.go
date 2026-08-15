@@ -454,14 +454,21 @@ func TestM20ForceAttemptDoesNotClaimDescendantKillWhenScopeEmptiesNaturally(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if final.Status != StatusKilled || final.QuiesceKillProven || final.ScopeIntegrity == ScopeDescendantKilled || !containsString(final.ErrorCodes, "U_RUN_QUIESCE_FORCED") || final.CleanSuccess() {
+	// The scope emptied while our kill was erroring, so the emptiness is NOT
+	// attributable to us: the run is force-attempted (U_RUN_QUIESCE_FORCED, not
+	// clean), never claimed a descendant-kill, and the leader's exit (0) is kept.
+	// Forced-quiesce alone leaves the status as the leader's exit, not killed.
+	if final.Status != StatusExited || final.ScopeIntegrity == ScopeDescendantKilled || !containsString(final.ErrorCodes, "U_RUN_QUIESCE_FORCED") || final.CleanSuccess() {
 		t.Fatalf("force-attempt was over-claimed: %+v", final)
+	}
+	if final.ExitCode == nil || *final.ExitCode != 0 {
+		t.Fatalf("leader exit was not preserved: %+v", final)
 	}
 }
 func (s *auditScope) Remove() error { s.removed = true; return nil }
 
 func TestM20ForcedQuiesceIsDurableBeforeKillAndClassificationIsHonest(t *testing.T) {
-	for name, killErr := range map[string]error{"proven": nil, "attempt failed": errors.New("kill failed")} {
+	for name, killErr := range map[string]error{"kill-issued-scope-emptied": nil, "kill-failed-scope-stuck": errors.New("kill failed")} {
 		t.Run(name, func(t *testing.T) {
 			scope := &auditScope{members: []int{44}, killErr: killErr}
 			r, err := New(Config{CommonDir: t.TempDir(), Backend: &memoryBackend{scope: &memoryScope{}}, Grace: 10 * time.Millisecond})
@@ -488,20 +495,32 @@ func TestM20ForcedQuiesceIsDurableBeforeKillAndClassificationIsHonest(t *testing
 			if !current.QuiesceForced || current.Status.Terminal() {
 				t.Fatalf("forced evidence/lifecycle=%+v", current)
 			}
+			// A descendant-kill is NEVER claimed: attributing the emptiness to our
+			// kill vs a natural exit is unprovable (Sol build-review).
+			if current.ScopeIntegrity == ScopeDescendantKilled {
+				t.Fatalf("descendant-kill was over-claimed: %+v", current)
+			}
 			if killErr != nil {
-				if forceErr == nil || current.QuiesceKillProven || current.ScopeIntegrity == ScopeDescendantKilled {
-					t.Fatalf("failed kill was over-claimed: record=%+v err=%v", current, forceErr)
+				// The scope stayed populated after a failed kill: capture-incomplete,
+				// non-terminal, no descendant-kill claim.
+				if forceErr == nil || !containsString(current.ErrorCodes, "U_RUN_CAPTURE_INCOMPLETE") {
+					t.Fatalf("stuck kill mis-reported: record=%+v err=%v", current, forceErr)
 				}
 				return
 			}
-			if forceErr != nil || !current.QuiesceKillProven || current.ScopeIntegrity != ScopeDescendantKilled {
-				t.Fatalf("proven forced kill record=%+v err=%v", current, forceErr)
+			// The kill was issued and the scope emptied: recorded as an operational
+			// FACT (ScopeKill completed), but only force-attempted, not proven.
+			if forceErr != nil || !current.ScopeKill.Completed {
+				t.Fatalf("force-attempt record=%+v err=%v", current, forceErr)
 			}
 			final, err := r.finalizeDetachedTerminal(context.Background(), run.ID, scope)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if final.Status != StatusKilled || final.ExitCode == nil || *final.ExitCode != 0 || final.CleanSuccess() || !containsString(final.ErrorCodes, "U_RUN_QUIESCE_FORCED") {
+			// Forced-quiesce keeps the leader's exit (0) and status exited (§3 —
+			// killed only on an explicit KillIntent), stays not-clean via the code,
+			// and never claims a descendant-kill.
+			if final.Status != StatusExited || final.ExitCode == nil || *final.ExitCode != 0 || final.CleanSuccess() || !containsString(final.ErrorCodes, "U_RUN_QUIESCE_FORCED") || final.ScopeIntegrity == ScopeDescendantKilled {
 				t.Fatalf("forced terminal=%+v", final)
 			}
 		})
@@ -517,29 +536,35 @@ func TestM20ForcedQuiescePublishesResultBeforeRacingReconcile(t *testing.T) {
 	r.backend = &auditBackend{scope: scope}
 	run := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusRunning, Detached: true, CgroupScope: scope.Reference(), ScopeIntegrity: ScopeContained, OutputRefs: map[string]OutputRef{}}
 	appendRunEvent(t, r, "starting", run)
+	appendRunEvent(t, r, "scope-created", run)
 	zero := 0
 	if err := r.appendDetachedLeaderExit(run.ID, &zero, ""); err != nil {
 		t.Fatal(err)
 	}
-	reconciled := make(chan RunRecord, 1)
-	scope.beforeKill = func() {
-		go func() {
-			runs, reconcileErr := r.Reconcile(context.Background())
-			if reconcileErr == nil && len(runs) == 1 {
-				reconciled <- runs[0]
-			}
-		}()
-	}
+	// The forced quiesce durably records the forced fact BEFORE the kill and the
+	// kill empties the scope, but the shim does NOT finalize here.
 	if result, forceErr := r.forceDetachedQuiesce(context.Background(), run.ID, run, scope); result != nil || forceErr != nil {
 		t.Fatalf("forced result=%+v err=%v", result, forceErr)
 	}
-	select {
-	case final := <-reconciled:
-		if final.Status != StatusKilled || !final.QuiesceKillProven || final.ScopeIntegrity != ScopeDescendantKilled || !containsString(final.ErrorCodes, "U_RUN_QUIESCE_FORCED") {
-			t.Fatalf("racing finalizer lost forced result: %+v", final)
+	// A racing Reconcile now finalizes from the durable leader-exit evidence over
+	// the (already empty) scope. The durable forced fact must survive: the
+	// terminal is not clean and carries U_RUN_QUIESCE_FORCED, but never claims a
+	// descendant-kill, and keeps the leader's exit (status exited, not killed).
+	runs, reconcileErr := r.Reconcile(context.Background())
+	if reconcileErr != nil {
+		t.Fatal(reconcileErr)
+	}
+	var final *RunRecord
+	for i := range runs {
+		if runs[i].ID == run.ID {
+			final = &runs[i]
 		}
-	case <-time.After(time.Second):
-		t.Fatal("racing reconcile did not finish")
+	}
+	if final == nil {
+		t.Fatalf("reconcile did not return the run: %+v", runs)
+	}
+	if final.Status != StatusExited || final.ExitCode == nil || *final.ExitCode != 0 || final.ScopeIntegrity == ScopeDescendantKilled || !containsString(final.ErrorCodes, "U_RUN_QUIESCE_FORCED") || final.CleanSuccess() {
+		t.Fatalf("racing finalizer lost forced result: %+v", final)
 	}
 }
 
@@ -715,8 +740,12 @@ func TestM20RealForcedQuiescePreservesLeaderExitAndIsNotClean(t *testing.T) {
 		t.Fatalf("detach outcome=%+v", outcome)
 	}
 	record := outcome.record
-	if record.Status != StatusKilled || record.ExitCode == nil || *record.ExitCode != 0 || !record.LeaderExitObserved || !record.QuiesceForced ||
-		!record.QuiesceKillProven || record.ScopeIntegrity != ScopeDescendantKilled || !containsString(record.ErrorCodes, "U_RUN_QUIESCE_FORCED") || record.CleanSuccess() {
+	// The leader (sh) exited 0 while a real descendant (sleep) lingered and was
+	// force-quiesced. Honest outcome: status EXITED (leader's exit preserved, not
+	// killed — §3), U_RUN_QUIESCE_FORCED makes it not-clean, and we NEVER claim a
+	// descendant-kill (the emptiness is not provably attributable to our kill).
+	if record.Status != StatusExited || record.ExitCode == nil || *record.ExitCode != 0 || !record.LeaderExitObserved || !record.QuiesceForced ||
+		record.ScopeIntegrity == ScopeDescendantKilled || !containsString(record.ErrorCodes, "U_RUN_QUIESCE_FORCED") || record.CleanSuccess() {
 		t.Fatalf("forced quiesce record=%+v", record)
 	}
 }
@@ -794,13 +823,27 @@ func TestM20ReconcileDetachedSupervisorLeaseAndExitEvidence(t *testing.T) {
 		}
 	})
 
-	t.Run("alive supervisor empty without evidence is stalled not terminal", func(t *testing.T) {
+	t.Run("alive supervisor empty AFTER scope-created without evidence is stalled not terminal", func(t *testing.T) {
+		r, scope := newMemoryRunner(t, nil)
+		run := detachedRunForTest(scope, processAlive)
+		appendRunEvent(t, r, "starting", run)
+		appendRunEvent(t, r, "scope-created", run)
+		got := reconcileOne(t, r)
+		if got.Status.Terminal() || !containsString(got.ErrorCodes, "U_RUN_SUPERVISOR_STALLED") {
+			t.Fatalf("stalled supervisor outcome: %+v", got)
+		}
+	})
+
+	t.Run("pre-scope queued alive supervisor is NOT stalled", func(t *testing.T) {
+		// No scope-created event: the run is still in the admission/launch window.
+		// A live supervisor here is admitting or launching, not stalled — it must
+		// be preserved cleanly with no U_RUN_SUPERVISOR_STALLED false-fail.
 		r, scope := newMemoryRunner(t, nil)
 		run := detachedRunForTest(scope, processAlive)
 		appendRunEvent(t, r, "starting", run)
 		got := reconcileOne(t, r)
-		if got.Status.Terminal() || !containsString(got.ErrorCodes, "U_RUN_SUPERVISOR_STALLED") {
-			t.Fatalf("stalled supervisor outcome: %+v", got)
+		if got.Status.Terminal() || containsString(got.ErrorCodes, "U_RUN_SUPERVISOR_STALLED") {
+			t.Fatalf("queued run was mislabelled stalled: %+v", got)
 		}
 	})
 
@@ -813,6 +856,107 @@ func TestM20ReconcileDetachedSupervisorLeaseAndExitEvidence(t *testing.T) {
 			t.Fatalf("unknown supervisor was terminalized: %+v", got)
 		}
 	})
+}
+
+type openErrorBackend struct{ err error }
+
+func (b *openErrorBackend) Probe(context.Context) error                   { return nil }
+func (b *openErrorBackend) Create(context.Context, string) (Scope, error) { return nil, b.err }
+func (b *openErrorBackend) Open(context.Context, string) (Scope, error)   { return nil, b.err }
+
+func TestM20ReconcileUninspectableScopeNeverFinalizes(t *testing.T) {
+	oldBoot, oldStat := readBootIDFn, readProcStatFn
+	t.Cleanup(func() { readBootIDFn, readProcStatFn = oldBoot, oldStat })
+	readBootIDFn = func() (string, error) { return "boot-a", nil }
+	readProcStatFn = func(int) ([]byte, error) { return procStatForTest('S', 77), nil }
+
+	r, scope := newMemoryRunner(t, nil)
+	run := detachedRunForTest(scope, processAlive)
+	path := filepath.Join(t.TempDir(), "RUN-1.out")
+	if err := os.WriteFile(path, []byte("still-live"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run.OutputRefs = map[string]OutputRef{"out": {Path: path, State: OutputPartial}}
+	appendRunEvent(t, r, "starting", run)
+	appendRunEvent(t, r, "scope-created", run)
+	zero := 0
+	if _, err := r.ledger.append(ledgerEvent{Kind: "leader-exited", Run: RunRecord{ID: run.ID}, LeaderExitObserved: true, ExitCode: &zero}); err != nil {
+		t.Fatal(err)
+	}
+	// The scope was created earlier but is now UNINSPECTABLE (open error). Even
+	// with leader-exit evidence, a merely-uninspectable scope must NOT be treated
+	// as empty: the child may still be live, so the run must stay non-terminal and
+	// its capture must not be falsely marked complete.
+	r.backend = &openErrorBackend{err: errors.New("scope temporarily unreadable")}
+	got := reconcileOne(t, r)
+	if got.Status.Terminal() {
+		t.Fatalf("uninspectable scope was terminalized (false-pass): %+v", got)
+	}
+	if !containsString(got.ErrorCodes, "U_RUN_RECONCILE_REQUIRED") {
+		t.Fatalf("uninspectable scope was not surfaced: %+v", got)
+	}
+	if got.OutputRefs["out"].State == OutputComplete {
+		t.Fatalf("capture falsely marked complete over an uninspectable scope: %+v", got)
+	}
+}
+
+func TestM20FinalizerEquivalenceShimAndReconcile(t *testing.T) {
+	oldBoot, oldStat := readBootIDFn, readProcStatFn
+	t.Cleanup(func() { readBootIDFn, readProcStatFn = oldBoot, oldStat })
+	readBootIDFn = func() (string, error) { return "boot-a", nil }
+	readProcStatFn = func(int) ([]byte, error) { return procStatForTest('S', 77), nil }
+
+	capture := filepath.Join(t.TempDir(), "shared.out")
+	if err := os.WriteFile(capture, []byte("identical-capture-bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setup := func() (*Runner, Scope, RunRecord) {
+		r, scope := newMemoryRunner(t, nil)
+		run := detachedRunForTest(scope, processAlive)
+		run.OutputRefs = map[string]OutputRef{"out": {Path: capture, State: OutputPartial}}
+		appendRunEvent(t, r, "starting", run)
+		appendRunEvent(t, r, "scope-created", run)
+		seven := 7
+		if _, err := r.ledger.append(ledgerEvent{Kind: "leader-exited", Run: RunRecord{ID: run.ID}, LeaderExitObserved: true, ExitCode: &seven}); err != nil {
+			t.Fatal(err)
+		}
+		return r, scope, run
+	}
+
+	// The shim finalizes via the lock-acquiring wrapper; Reconcile finalizes via
+	// the …Locked variant. Both must produce an identical honesty payload so
+	// whoever wins the terminal CAS is correct.
+	rShim, scopeShim, runShim := setup()
+	shimFinal, err := rShim.finalizeDetachedTerminal(context.Background(), runShim.ID, scopeShim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rRec, _, runRec := setup()
+	runs, err := rRec.Reconcile(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recFinal RunRecord
+	found := false
+	for _, x := range runs {
+		if x.ID == runRec.ID {
+			recFinal, found = x, true
+		}
+	}
+	if !found {
+		t.Fatalf("reconcile lost the run: %+v", runs)
+	}
+	sameExit := (shimFinal.ExitCode == nil) == (recFinal.ExitCode == nil) && (shimFinal.ExitCode == nil || *shimFinal.ExitCode == *recFinal.ExitCode)
+	shimRef, recRef := shimFinal.OutputRefs["out"], recFinal.OutputRefs["out"]
+	if shimFinal.Status != recFinal.Status || !sameExit || shimFinal.Signal != recFinal.Signal ||
+		shimFinal.ScopeIntegrity != recFinal.ScopeIntegrity || shimFinal.CaptureComplete != recFinal.CaptureComplete ||
+		shimFinal.TerminalComplete != recFinal.TerminalComplete || shimRef.State != recRef.State ||
+		shimRef.Digest != recRef.Digest || shimRef.Bytes != recRef.Bytes {
+		t.Fatalf("finalizer divergence:\n shim=%+v\n recon=%+v", shimFinal, recFinal)
+	}
+	if shimFinal.ExitCode == nil || *shimFinal.ExitCode != 7 || shimRef.State != OutputComplete || shimRef.Digest == "" {
+		t.Fatalf("finalizer did not preserve exit + digest: %+v", shimFinal)
+	}
 }
 
 func detachedRunForTest(scope Scope, state processLiveness) RunRecord {

@@ -418,7 +418,8 @@ func (r *Runner) forceDetachedQuiesce(ctx context.Context, id string, record Run
 	if _, appendErr := r.append(ledgerEvent{Kind: "quiesce-forced", Run: forced}); appendErr != nil {
 		return nil, launchErr("U_RUN_RECONCILE_REQUIRED", appendErr)
 	}
-	members, membersErr := scope.Members()
+	// The scope was non-empty after the leader exited (emptyBeforeForce == false),
+	// so descendants were present; issue a forced cgroup.kill.
 	killErr := scope.Kill()
 	var emptyErr error
 	if killErr == nil {
@@ -431,9 +432,14 @@ func (r *Runner) forceDetachedQuiesce(ctx context.Context, id string, record Run
 			emptyErr = killErr
 		}
 	}
-	if membersErr == nil && len(members) > 0 && killErr == nil && emptyErr == nil {
-		forced.QuiesceKillProven = true
-		forced.ScopeIntegrity = ScopeDescendantKilled
+	if killErr == nil && emptyErr == nil {
+		// The forced kill was issued and the scope subsequently emptied. Record
+		// the kill as an operational FACT (issued + completed), but do NOT claim
+		// we killed a specific descendant: a member present a moment earlier may
+		// have exited naturally before the kill took effect (an unprovable race,
+		// Sol build-review). CleanSuccess() stays false via U_RUN_QUIESCE_FORCED
+		// at terminalization; ScopeIntegrity keeps the leader's observed
+		// containment rather than over-claiming descendant-killed.
 		forced.ScopeKill = ScopeKill{Requested: true, Started: true, Completed: true, GraceMS: r.grace.Milliseconds(), Actor: "aira", At: nowString(r.now)}
 		if _, appendErr := r.append(ledgerEvent{Kind: "quiesce-forced", Run: forced}); appendErr != nil {
 			return nil, launchErr("U_RUN_RECONCILE_REQUIRED", appendErr)
@@ -571,19 +577,22 @@ func (r *Runner) finalizeDetachedTerminalLocked(ctx context.Context, id string, 
 		current.Status = StatusKilled
 		current.KillIntent.Completed, current.KillIntent.Empty = true, true
 		current.ErrorCodes = appendUnique(current.ErrorCodes, "E_RUN_KILLED")
-	case current.QuiesceForced:
-		current.Status = StatusKilled
-		current.ErrorCodes = appendUnique(current.ErrorCodes, "U_RUN_QUIESCE_FORCED")
-		if current.QuiesceKillProven {
-			current.ScopeIntegrity = ScopeDescendantKilled
-		} else {
-			current.ScopeIntegrity = ScopeUnverified
-		}
 	default:
+		// The leader exited (per §3, forced-quiesce is "exited N", not "killed" —
+		// only an explicit KillIntent yields killed). The leader's exit code is
+		// preserved as evidence.
 		current.Status = StatusExited
 		if current.ExitCode != nil && *current.ExitCode != 0 {
 			current.ErrorCodes = appendUnique(current.ErrorCodes, "E_RUN_FAILED")
 		}
+	}
+	// Forced-quiesce is folded INDEPENDENTLY of the status precedence (Sol
+	// build-review): a run that was BOTH killed and force-quiesced must still
+	// record the forced fact. ScopeIntegrity keeps the leader's observed
+	// containment; we never assert ScopeDescendantKilled, because attributing the
+	// scope's emptiness to our kill versus a natural descendant exit is unprovable.
+	if current.QuiesceForced {
+		current.ErrorCodes = appendUnique(current.ErrorCodes, "U_RUN_QUIESCE_FORCED")
 	}
 	current.Status = classifyOOMKilled(current.Status, usage, current.Status == StatusKilled && current.KillIntent.Present)
 	// Close the final re-population window immediately before the terminal CAS.

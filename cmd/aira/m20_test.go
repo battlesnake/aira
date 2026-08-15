@@ -16,6 +16,57 @@ type failingWriter struct{}
 
 func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("broken stdout") }
 
+// flushWriter is a buffered stdout whose Flush can fail — modelling a real
+// buffered CLI writer so the handle-before-ACK ordering exercises the Flush path.
+type flushWriter struct {
+	buf            bytes.Buffer
+	flushed        bool
+	flushErr       error
+	contentAtFlush string
+}
+
+func (w *flushWriter) Write(p []byte) (int, error) { return w.buf.Write(p) }
+func (w *flushWriter) Flush() error {
+	w.flushed = true
+	w.contentAtFlush = w.buf.String()
+	return w.flushErr
+}
+
+func TestM20RendererFlushesHandleBeforeACK(t *testing.T) {
+	for name, tc := range map[string]struct {
+		flushErr  error
+		delivered bool
+	}{
+		"flush-success": {flushErr: nil, delivered: true},
+		"flush-failure": {flushErr: errors.New("flush failed"), delivered: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := &flushWriter{flushErr: tc.flushErr}
+			called := false
+			response := core.Response{OK: true, Code: "OK", Data: runner.RunRecord{ID: "RUN-21", Status: runner.StatusStarting, Detached: true}}
+			response.AfterWrite = func(delivered bool) error {
+				called = true
+				// The ACK/cancel decision must run only AFTER the handle is
+				// flushed, and a failed flush is NOT a delivery (→ cancel).
+				if !w.flushed {
+					t.Fatal("completion hook ran before the handle was flushed")
+				}
+				if !strings.Contains(w.contentAtFlush, "RUN-21") {
+					t.Fatalf("handle was not written before flush: %q", w.contentAtFlush)
+				}
+				if delivered != tc.delivered {
+					t.Fatalf("delivered=%v want %v (flushErr=%v)", delivered, tc.delivered, tc.flushErr)
+				}
+				return nil
+			}
+			_ = render(response, false, w, &bytes.Buffer{})
+			if !called {
+				t.Fatal("completion hook was not called")
+			}
+		})
+	}
+}
+
 func TestM20CLIMapsDetachAndFollow(t *testing.T) {
 	target, options, err := parseArgs("run", []string{"--detach", "--follow", "--no-stdin", "--timeout", "2s", "--", "/bin/true"})
 	if err != nil {

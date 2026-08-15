@@ -118,7 +118,6 @@ type RunRecord struct {
 	SupervisorPID       PIDIdentity          `json:"supervisor_pid,omitempty"`
 	LeaderExitObserved  bool                 `json:"leader_exit_observed,omitempty"`
 	QuiesceForced       bool                 `json:"quiesce_forced,omitempty"`
-	QuiesceKillProven   bool                 `json:"quiesce_kill_proven,omitempty"`
 	TerminalComplete    bool                 `json:"terminal_complete"`
 }
 

@@ -1375,8 +1375,12 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				for _, run := range runs {
 					if run.Status == runner.StatusStarting || run.Status == runner.StatusRunning {
 						if run.Detached {
+							// Surface EVERY unevaluated/attention residual honestly — not a
+							// hardcoded subset — so unknown-liveness / uninspectable-scope
+							// (U_RUN_RECONCILE_REQUIRED) is never silently dropped alongside
+							// stalled / launch-stalled / capture-incomplete.
 							for _, code := range run.ErrorCodes {
-								if code == "U_RUN_SUPERVISOR_STALLED" || code == "U_RUN_LAUNCH_STALLED" || code == "U_RUN_CAPTURE_INCOMPLETE" {
+								if strings.HasPrefix(code, "U_") {
 									report.Warnings = append(report.Warnings, store.CheckFinding{Code: code, Subject: run.ID, Message: "detached run requires operator attention", Kind: "warning"})
 								}
 							}

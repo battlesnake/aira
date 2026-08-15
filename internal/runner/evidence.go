@@ -41,7 +41,6 @@ func mergeEvidence(base, candidate RunRecord) RunRecord {
 		}
 	}
 	base.QuiesceForced = base.QuiesceForced || candidate.QuiesceForced
-	base.QuiesceKillProven = base.QuiesceKillProven || candidate.QuiesceKillProven
 	if candidate.OutputRefs != nil {
 		base.OutputRefs = cloneOutputRefs(candidate.OutputRefs)
 	}
