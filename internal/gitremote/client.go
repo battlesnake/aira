@@ -241,22 +241,6 @@ func canonicalHTTPS(ep endpoint) string {
 	return "https://github.com/" + ep.Owner + "/" + ep.Repo + ".git"
 }
 
-func sshAuthFailure(exit int, stderr string) bool {
-	if exit == 0 {
-		return false
-	}
-	for _, line := range strings.Split(stderr, "\n") {
-		line = strings.TrimSuffix(line, "\r")
-		if strings.HasPrefix(line, "Permission denied (publickey") {
-			return true
-		}
-		if prefix, rest, ok := strings.Cut(line, ": "); ok && strings.Contains(prefix, "@") && !strings.ContainsAny(prefix, " \t") && strings.HasPrefix(rest, "Permission denied (publickey") {
-			return true
-		}
-	}
-	return false
-}
-
 func sshAuthFailureFor(exit int, stderr string, ep endpoint) bool {
 	if exit == 0 {
 		return false

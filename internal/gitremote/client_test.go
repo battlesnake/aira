@@ -74,18 +74,20 @@ func TestParseEndpointStrictGrammar(t *testing.T) {
 	}
 }
 
-// verifies: SSH auth classification is positive, publickey-anchored, and accepts git's wrapped exit 128.
+// verifies: SSH auth classification is positive, publickey-anchored, host-scoped, and accepts git's wrapped exit 128.
+// Exercises sshAuthFailureFor — the SAME function the Run decision flow uses (not a look-alike).
 func TestSSHAuthClassifierAtGitExit128(t *testing.T) {
+	ep := endpoint{Host: "github.com", User: "git"}
 	positive := []string{
 		"git@github.com: Permission denied (publickey).",
 		"Permission denied (publickey,password).",
 		"Permission denied (publickey).\nfatal: Could not read from remote repository.",
 	}
 	for _, stderr := range positive {
-		if !sshAuthFailure(128, stderr) {
+		if !sshAuthFailureFor(128, stderr, ep) {
 			t.Errorf("did not classify %q", stderr)
 		}
-		if sshAuthFailure(0, stderr) {
+		if sshAuthFailureFor(0, stderr, ep) {
 			t.Errorf("classified successful process %q", stderr)
 		}
 	}
@@ -101,9 +103,12 @@ func TestSSHAuthClassifierAtGitExit128(t *testing.T) {
 		"git@github.com: Permission denied",
 		"remote: Permission denied (publickey).",
 		"warning Permission denied (publickey).",
+		// host-scoped: a publickey rejection attributed to a DIFFERENT host must not be
+		// read as our endpoint's auth failure (the unscoped look-alike would accept it).
+		"git@evil.example: Permission denied (publickey).",
 	}
 	for _, stderr := range negative {
-		if sshAuthFailure(128, stderr) {
+		if sshAuthFailureFor(128, stderr, ep) {
 			t.Errorf("false positive %q", stderr)
 		}
 	}
