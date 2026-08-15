@@ -1,6 +1,6 @@
 # M20b — Detached-run telemetry auto-wiring
 
-Status: PLAN v4 (post Sol rounds 1-3). Phase 5. Lifts M20 deferral **D1**: a detached
+Status: **PLAN APPROVED** (v4, Sol plan-review 4 rounds -> APPROVE-PLAN). Build-ready. Phase 5. Lifts M20 deferral **D1**: a detached
 run (`aira run --detach`) auto-wires the M19 telemetry (`--report`→test report,
 `--tool`→ComputeEvent, `tests-green` observation) **in the supervisor shim after
 the terminal CAS**, instead of rejecting those flags.
