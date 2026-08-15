@@ -128,7 +128,7 @@ func (s *Store) AddTestReport(ctx context.Context, rawInput domain.TestReportInp
 		input.At = timeNow()
 	}
 	identity := TestReportContext{}
-	if input.Commit == "" || input.Branch == "" || input.WorktreeID == "" {
+	if !input.PreserveEmptyProvenance && (input.Commit == "" || input.Branch == "" || input.WorktreeID == "") {
 		identity = s.TestReportContext(ctx)
 	}
 	if input.Commit == "" {

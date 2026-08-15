@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"syscall"
 	"time"
@@ -189,9 +190,33 @@ func (l *ledger) append(event ledgerEvent) (ledgerEvent, error) {
 		if readErr != nil {
 			return event, readErr
 		}
+		var terminal, telemetry, envelope bool
 		for _, prior := range events {
-			if prior.Run.ID == event.Run.ID && prior.Kind == "terminal" {
+			if prior.Run.ID != event.Run.ID {
+				continue
+			}
+			if prior.Kind == "terminal" {
+				terminal = true
+			}
+			if prior.Kind == "telemetry" {
+				telemetry = true
+			}
+			if prior.Kind == "starting" && prior.Run.Telemetry != "" {
+				envelope = true
+			}
+		}
+		if terminal {
+			switch {
+			case event.Kind == "terminal":
 				return event, fmt.Errorf("E_JOURNAL_CORRUPT: duplicate terminal record for %s", event.Run.ID)
+			case event.Kind != "telemetry":
+				return event, fmt.Errorf("E_JOURNAL_CORRUPT: record after terminal run %s", event.Run.ID)
+			case telemetry:
+				return event, fmt.Errorf("E_JOURNAL_CORRUPT: duplicate telemetry record for %s", event.Run.ID)
+			case !envelope:
+				return event, fmt.Errorf("E_JOURNAL_CORRUPT: telemetry without initial envelope for %s", event.Run.ID)
+			case !validAuxTelemetryPayload(event.Run):
+				return event, fmt.Errorf("E_JOURNAL_CORRUPT: invalid telemetry payload for %s", event.Run.ID)
 			}
 		}
 		if len(events) != 0 {
@@ -282,8 +307,10 @@ func (l *ledger) read() ([]ledgerEvent, error) {
 		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
 			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: trailing ledger payload")
 		}
-		normalizeBuffering(&event.Run)
-		normalizeAdmission(&event.Run)
+		if event.Kind != "telemetry" {
+			normalizeBuffering(&event.Run)
+			normalizeAdmission(&event.Run)
+		}
 		prior = event.Sequence
 		events = append(events, event)
 	}
@@ -319,14 +346,31 @@ func equalBytes(a, b []byte) bool {
 func replay(events []ledgerEvent) (map[string]RunRecord, error) {
 	runs := make(map[string]RunRecord)
 	terminals := make(map[string]bool)
+	telemetryEvents := make(map[string]bool)
 	for _, e := range events {
-		normalizeBuffering(&e.Run)
-		normalizeAdmission(&e.Run)
+		if e.Kind != "telemetry" {
+			normalizeBuffering(&e.Run)
+			normalizeAdmission(&e.Run)
+		}
 		if e.Run.ID == "" {
 			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: empty run id")
 		}
 		if terminals[e.Run.ID] {
-			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: record after terminal run %s", e.Run.ID)
+			if e.Kind != "telemetry" || telemetryEvents[e.Run.ID] {
+				return nil, fmt.Errorf("E_JOURNAL_CORRUPT: record after terminal run %s", e.Run.ID)
+			}
+			prior := runs[e.Run.ID]
+			if prior.Telemetry == "" || !validAuxTelemetryPayload(e.Run) {
+				return nil, fmt.Errorf("E_JOURNAL_CORRUPT: invalid telemetry payload for %s", e.Run.ID)
+			}
+			prior.Telemetry = e.Run.Telemetry
+			prior.TelemetryRefs = append([]string(nil), e.Run.TelemetryRefs...)
+			runs[e.Run.ID] = prior
+			telemetryEvents[e.Run.ID] = true
+			continue
+		}
+		if e.Kind == "telemetry" {
+			return nil, fmt.Errorf("E_JOURNAL_CORRUPT: telemetry before terminal run %s", e.Run.ID)
 		}
 		if e.Kind == "terminal" {
 			if e.Run.Status == StatusStarting || e.Run.Status == StatusRunning {
@@ -358,6 +402,14 @@ func replay(events []ledgerEvent) (map[string]RunRecord, error) {
 		runs[e.Run.ID] = e.Run
 	}
 	return runs, nil
+}
+
+func validAuxTelemetryPayload(record RunRecord) bool {
+	if record.ID == "" || record.Telemetry == "" {
+		return false
+	}
+	expected := RunRecord{ID: record.ID, Telemetry: record.Telemetry, TelemetryRefs: append([]string(nil), record.TelemetryRefs...)}
+	return reflect.DeepEqual(record, expected)
 }
 
 func normalizeBuffering(record *RunRecord) {
@@ -419,14 +471,15 @@ func (l *ledger) project(ctx context.Context) error {
 	if _, err = db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, terminal INTEGER NOT NULL, record_json BLOB NOT NULL)`); err != nil {
 		return err
 	}
-	for column, kind := range map[string]string{"owner": "TEXT", "stolen_by": "TEXT", "peak_rss": "INTEGER", "cpu_user": "INTEGER", "cpu_sys": "INTEGER", "admission": "TEXT", "admission_reason": "TEXT", "admission_waited_ms": "INTEGER"} {
+	for column, kind := range map[string]string{"owner": "TEXT", "stolen_by": "TEXT", "peak_rss": "INTEGER", "cpu_user": "INTEGER", "cpu_sys": "INTEGER", "admission": "TEXT", "admission_reason": "TEXT", "admission_waited_ms": "INTEGER", "telemetry": "TEXT", "telemetry_refs": "BLOB"} {
 		if err := ensureRunColumn(ctx, db, column, kind); err != nil {
 			return err
 		}
 	}
 	for _, r := range runs {
 		data, _ := json.Marshal(r)
-		if _, err = db.ExecContext(ctx, `INSERT INTO runs(id,status,terminal,record_json,owner,stolen_by,peak_rss,cpu_user,cpu_sys,admission,admission_reason,admission_waited_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,terminal=excluded.terminal,record_json=excluded.record_json,owner=excluded.owner,stolen_by=excluded.stolen_by,peak_rss=excluded.peak_rss,cpu_user=excluded.cpu_user,cpu_sys=excluded.cpu_sys,admission=excluded.admission,admission_reason=excluded.admission_reason,admission_waited_ms=excluded.admission_waited_ms`, r.ID, r.Status, r.Status.Terminal(), data, nullableString(r.Owner), nullableString(r.StolenBy), nullableMetric(r.PeakRSS), nullableMetric(r.CPUUser), nullableMetric(r.CPUSys), r.Admission, nullableString(r.AdmissionReason), r.AdmissionWaitedMS); err != nil {
+		refs, _ := json.Marshal(r.TelemetryRefs)
+		if _, err = db.ExecContext(ctx, `INSERT INTO runs(id,status,terminal,record_json,owner,stolen_by,peak_rss,cpu_user,cpu_sys,admission,admission_reason,admission_waited_ms,telemetry,telemetry_refs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,terminal=excluded.terminal,record_json=excluded.record_json,owner=excluded.owner,stolen_by=excluded.stolen_by,peak_rss=excluded.peak_rss,cpu_user=excluded.cpu_user,cpu_sys=excluded.cpu_sys,admission=excluded.admission,admission_reason=excluded.admission_reason,admission_waited_ms=excluded.admission_waited_ms,telemetry=excluded.telemetry,telemetry_refs=excluded.telemetry_refs`, r.ID, r.Status, r.Status.Terminal(), data, nullableString(r.Owner), nullableString(r.StolenBy), nullableMetric(r.PeakRSS), nullableMetric(r.CPUUser), nullableMetric(r.CPUSys), r.Admission, nullableString(r.AdmissionReason), r.AdmissionWaitedMS, nullableString(r.Telemetry), refs); err != nil {
 			return err
 		}
 	}

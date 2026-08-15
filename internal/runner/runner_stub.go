@@ -51,17 +51,25 @@ func (r *Runner) Launch(context.Context, Request) (*RunRecord, error) {
 	return nil, nonLinuxRunError()
 }
 
-func (r *Runner) LaunchDetached(context.Context, Request) (*DetachLaunch, error) {
+func (r *Runner) LaunchDetached(context.Context, Request, string) (*DetachLaunch, error) {
 	return nil, nonLinuxRunError()
 }
+
+func (r *Runner) DetachOutputDir() string { return r.outputDir }
 
 func (r *Runner) Supervise(context.Context, string, int, int) error {
 	return nonLinuxRunError()
 }
 
-func (r *Runner) SuperviseRequest(context.Context, Request, int, int) error {
-	return nonLinuxRunError()
+func (r *Runner) SuperviseRequest(context.Context, Request, int, int) (*RunRecord, error) {
+	return nil, nonLinuxRunError()
 }
+
+func (r *Runner) RecordAuxTelemetry(context.Context, string, string, []string) (*RunRecord, error) {
+	return nil, nonLinuxRunError()
+}
+
+func (r *Runner) SupervisorLiveness(RunRecord) SupervisorLiveness { return SupervisorUnknown }
 
 func (r *Runner) Kill(context.Context, string, bool) (*RunRecord, error) {
 	return nil, nonLinuxRunError()

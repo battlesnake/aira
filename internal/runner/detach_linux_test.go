@@ -229,7 +229,7 @@ func TestM20LauncherDefersACKAndBoundsReadiness(t *testing.T) {
 		ackPath := filepath.Join(t.TempDir(), "ack")
 		t.Setenv("AIRA_M20_FAKE_SUPERVISOR", "success")
 		t.Setenv("AIRA_M20_ACK_PATH", ackPath)
-		launch, err := r.LaunchDetached(context.Background(), Request{Argv: []string{"/bin/true"}, Detach: true})
+		launch, err := r.LaunchDetached(context.Background(), Request{Argv: []string{"/bin/true"}, Detach: true}, "")
 		if err != nil || launch.Record.ID != "RUN-helper" || launch.Record.Status != StatusStarting {
 			t.Fatalf("launch=%+v err=%v", launch, err)
 		}
@@ -257,7 +257,7 @@ func TestM20LauncherDefersACKAndBoundsReadiness(t *testing.T) {
 		r.detachReadyTimeout = 20 * time.Millisecond
 		t.Setenv("AIRA_M20_FAKE_SUPERVISOR", "timeout")
 		started := time.Now()
-		launch, err := r.LaunchDetached(context.Background(), Request{Argv: []string{"/bin/true"}, Detach: true})
+		launch, err := r.LaunchDetached(context.Background(), Request{Argv: []string{"/bin/true"}, Detach: true}, "")
 		var typed *LaunchError
 		if launch != nil || !errors.As(err, &typed) || typed.Code != "E_RUN_DETACH_FAILED" || time.Since(started) > time.Second {
 			t.Fatalf("launch=%+v err=%v elapsed=%s", launch, err, time.Since(started))
@@ -299,7 +299,7 @@ func TestM20MissingACKCancelsWithoutStartingChildAndKillIntentWins(t *testing.T)
 			if err != nil {
 				t.Fatal(err)
 			}
-			req := Request{Argv: []string{"/bin/true"}, Detach: true, detachReady: &detachSignal{file: readyW}, detachAck: ackR}
+			req := Request{Argv: []string{"/bin/true"}, Detach: true, TelemetryPending: "opaque-pending", detachReady: &detachSignal{file: readyW}, detachAck: ackR}
 			cwd, bootID := t.TempDir(), mustBootID(t)
 			result := make(chan error, 1)
 			go func() {
@@ -309,6 +309,10 @@ func TestM20MissingACKCancelsWithoutStartingChildAndKillIntentWins(t *testing.T)
 			var ready detachReadyMessage
 			if err := json.NewDecoder(readyR).Decode(&ready); err != nil || ready.ID == "" {
 				t.Fatalf("readiness=%+v err=%v", ready, err)
+			}
+			pending, err := r.ledger.current(ready.ID)
+			if err != nil || pending.Status != StatusStarting || pending.Telemetry != "opaque-pending" {
+				t.Fatalf("readiness preceded durable pending: record=%+v err=%v", pending, err)
 			}
 			if withIntent {
 				lock, lockErr := lockFile(filepath.Join(filepath.Dir(r.ledger.ledger), ready.ID+".lock"))

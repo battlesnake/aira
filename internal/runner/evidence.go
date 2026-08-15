@@ -32,6 +32,10 @@ func mergeEvidence(base, candidate RunRecord) RunRecord {
 	if base.SupervisorPID.PID == 0 && candidate.SupervisorPID.PID != 0 {
 		base.SupervisorPID = candidate.SupervisorPID
 	}
+	if candidate.Telemetry != "" {
+		base.Telemetry = candidate.Telemetry
+		base.TelemetryRefs = append([]string(nil), candidate.TelemetryRefs...)
+	}
 	if candidate.LeaderExitObserved {
 		if !base.LeaderExitObserved {
 			base.LeaderExitObserved = true

@@ -3,8 +3,10 @@ package store
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"aira/internal/domain"
 )
@@ -130,6 +132,61 @@ func TestForcedParserIncompleteCannotBeFlippedTrueByRawParser(t *testing.T) {
 	}
 	if completeResult.ID == result.ID || !completeResult.Report.ParserComplete {
 		t.Fatalf("forced-incomplete source collided with complete source: forced=%+v complete=%+v", result, completeResult)
+	}
+}
+
+func TestM20bObservedEmptyProvenanceIsNeverResampled(t *testing.T) {
+	base := t.TempDir()
+	s := testStore(t, base, base+"/common", base+"/state")
+	input := reportInput(completeGoJSON, "empty-snapshot")
+	input.PreserveEmptyProvenance = true
+	result, err := s.AddTestReport(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Report.Commit != "" || result.Report.Branch != "" || result.Report.WorktreeID != "" {
+		t.Fatalf("observed empty provenance was resampled: %+v", result.Report)
+	}
+}
+
+func TestM20bTelemetryStoresWaitForConcurrentWriter(t *testing.T) {
+	base := t.TempDir()
+	s := testStore(t, base, base+"/common", base+"/state")
+	other := openTestStore(t, base, base+"/common", base+"/state", filepath.Base(base), "AIRA")
+	conn, err := s.db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		input := reportInput(completeGoJSON, "concurrent")
+		input.PreserveEmptyProvenance = true
+		if _, err := other.AddTestReport(context.Background(), input); err != nil {
+			done <- err
+			return
+		}
+		_, err := other.AddComputeEvent(context.Background(), domain.ComputeEventInput{Model: "codex", Source: "run"})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("telemetry writer did not wait for concurrent transaction: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if _, err := conn.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("telemetry stores did not resume after concurrent writer committed")
 	}
 }
 

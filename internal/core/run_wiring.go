@@ -23,7 +23,47 @@ const (
 	codeComputeNotRequested     = "U_RUN_COMPUTE_NOT_REQUESTED"
 	codeReportCaptureIncomplete = "U_RUN_REPORT_CAPTURE_INCOMPLETE"
 	codeUsageRead               = "E_RUN_USAGE_READ"
+
+	TelemetryNotRequested   = "not-requested"
+	TelemetryPending        = "pending"
+	TelemetryComplete       = "complete"
+	TelemetryIncomplete     = "incomplete"
+	CodeRunTelemetryPending = "U_RUN_TELEMETRY_PENDING"
 )
+
+// WiringParams is the transport-neutral DTO shared by foreground wiring and
+// the detached supervisor shim. ConfigEnv is always copied at boundaries.
+type WiringParams struct {
+	Report       string   `json:"report,omitempty"`
+	ReportStream string   `json:"report_stream,omitempty"`
+	Suite        string   `json:"suite,omitempty"`
+	Shard        string   `json:"shard,omitempty"`
+	Retry        string   `json:"retry,omitempty"`
+	Usage        string   `json:"usage,omitempty"`
+	Provider     string   `json:"provider,omitempty"`
+	Tool         string   `json:"tool,omitempty"`
+	ConfigEnv    []string `json:"config_env,omitempty"`
+	StrictWiring bool     `json:"strict_wiring,omitempty"`
+}
+
+func wiringParamsFromArgs(args *argAccessor) WiringParams {
+	return WiringParams{
+		Report: stringArg(args, "report"), ReportStream: stringArg(args, "report_stream"), Suite: stringArg(args, "suite"),
+		Shard: stringArg(args, "shard"), Retry: stringArg(args, "retry"), Usage: stringArg(args, "usage"),
+		Provider: stringArg(args, "provider"), Tool: stringArg(args, "tool"), ConfigEnv: append([]string(nil), stringSlice(args, "config_env")...),
+		StrictWiring: boolArg(args, "strict_wiring"),
+	}
+}
+
+func cloneWiringParams(params WiringParams) WiringParams {
+	params.ConfigEnv = append([]string(nil), params.ConfigEnv...)
+	return params
+}
+
+func (p WiringParams) requested() bool {
+	return p.Report != "" || p.ReportStream != "" || p.Suite != "" || p.Shard != "" || p.Retry != "" || p.Usage != "" ||
+		p.Provider != "" || p.Tool != "" || len(p.ConfigEnv) != 0 || p.StrictWiring
+}
 
 type runResponseData struct {
 	runner.RunRecord
@@ -76,28 +116,60 @@ func runnerReportMaxBytes(execution Runner) int64 {
 	return defaultRunReportMaxBytes
 }
 
-func (c *Core) wireTerminalRun(ctx context.Context, args *argAccessor, record runner.RunRecord, reportContext store.TestReportContext) runWiring {
+func (c *Core) wireTerminalRun(ctx context.Context, params WiringParams, record runner.RunRecord, reportContext store.TestReportContext) runWiring {
+	params = cloneWiringParams(params)
 	wiring := runWiring{
 		Report:         runReportWiring{Code: codeReportNotRequested},
 		Compute:        runComputeWiring{Tokens: "unevaluated", Code: codeComputeNotRequested},
 		WiringComplete: true,
 		Warnings:       []runWiringWarning{},
 	}
-	reportRequested := strings.TrimSpace(stringArg(args, "report")) != ""
-	toolRequested := strings.TrimSpace(stringArg(args, "tool")) != ""
+	reportRequested := strings.TrimSpace(params.Report) != ""
+	toolRequested := strings.TrimSpace(params.Tool) != ""
 	if !record.Status.Terminal() {
 		wiring.WiringComplete = false
 		wiring.warn("run", "U_RUN_EXIT_UNKNOWN", "run did not return terminal evidence")
 	} else {
 		if reportRequested {
-			c.wireRunReport(ctx, args, record, reportContext, &wiring)
+			c.wireRunReport(ctx, params, record, reportContext, &wiring)
 		}
 		if toolRequested {
-			c.wireRunCompute(ctx, args, record, &wiring)
+			c.wireRunCompute(ctx, params, record, &wiring)
 		}
 	}
 	wiring.TestsGreenObserved = observeTestsGreen(record, reportRequested, wiring.Report)
 	return wiring
+}
+
+// WireDetachedTelemetry reuses the foreground wiring implementation with the
+// launcher's immutable report-context snapshot.
+func (c *Core) WireDetachedTelemetry(ctx context.Context, params WiringParams, record runner.RunRecord, reportContext store.TestReportContext) runWiring {
+	return c.wireTerminalRun(ctx, cloneWiringParams(params), record, reportContext)
+}
+
+// TelemetryReferences packs artifact ids and warning codes into the runner's
+// generic opaque reference list. The ordering is deterministic.
+func (w runWiring) TelemetryReferences() []string {
+	refs := make([]string, 0, 2+len(w.Warnings))
+	if w.Report.ID != "" {
+		refs = append(refs, w.Report.ID)
+	}
+	if w.Compute.ID != "" {
+		refs = append(refs, w.Compute.ID)
+	}
+	for _, warning := range w.Warnings {
+		found := false
+		for _, ref := range refs {
+			if ref == warning.Code {
+				found = true
+				break
+			}
+		}
+		if !found {
+			refs = append(refs, warning.Code)
+		}
+	}
+	return refs
 }
 
 func (w *runWiring) warn(action, code, message string) {
@@ -105,15 +177,15 @@ func (w *runWiring) warn(action, code, message string) {
 	w.Warnings = append(w.Warnings, runWiringWarning{Action: action, Code: code, Message: message})
 }
 
-func (c *Core) wireRunReport(ctx context.Context, args *argAccessor, record runner.RunRecord, reportContext store.TestReportContext, wiring *runWiring) {
+func (c *Core) wireRunReport(ctx context.Context, params WiringParams, record runner.RunRecord, reportContext store.TestReportContext, wiring *runWiring) {
 	wiring.Report.Code = "OK"
-	config, err := runConfigDigest(stringSlice(args, "config_env"))
+	config, err := runConfigDigest(params.ConfigEnv)
 	if err != nil {
 		wiring.Report.Code = "E_RUN_CONFIG_ENV_INVALID"
 		wiring.warn("report", wiring.Report.Code, err.Error())
 		return
 	}
-	retry, err := runRetryIndex(stringArg(args, "retry"))
+	retry, err := runRetryIndex(params.Retry)
 	if err != nil {
 		wiring.Report.Code = "E_RUN_ARGUMENT_INVALID"
 		wiring.warn("report", wiring.Report.Code, err.Error())
@@ -123,7 +195,7 @@ func (c *Core) wireRunReport(ctx context.Context, args *argAccessor, record runn
 	// (where go-json and most runners write structured output); --report-stream lets the
 	// caller point at "err" or "merged" when the report is elsewhere, so a report emitted
 	// on stderr is not silently missed (Sol build-review).
-	stream, err := reportStream(stringArg(args, "report_stream"), record.Merge)
+	stream, err := reportStream(params.ReportStream, record.Merge)
 	if err != nil {
 		wiring.Report.Code = "E_RUN_ARGUMENT_INVALID"
 		wiring.warn("report", wiring.Report.Code, err.Error())
@@ -136,10 +208,11 @@ func (c *Core) wireRunReport(ctx context.Context, args *argAccessor, record runn
 		return
 	}
 	input := domain.TestReportInput{
-		Format: stringArg(args, "report"), Raw: append([]byte(nil), chunk.Bytes...),
+		Format: params.Report, Raw: append([]byte(nil), chunk.Bytes...),
 		TicketID: record.Ticket, Phase: record.Phase, RunRef: record.ID,
-		SuiteID: stringArg(args, "suite"), Config: config, Shard: stringArg(args, "shard"), RetryIndex: retry,
+		SuiteID: params.Suite, Config: config, Shard: params.Shard, RetryIndex: retry,
 		EnvDigest: record.EnvDigest, At: record.EndedAt,
+		PreserveEmptyProvenance: true,
 	}
 	// Runner (the test-runner identity) is NOT the --tool (an LLM/compute model); leave it
 	// unknown rather than mislabel provenance (Sol build-review).
@@ -254,9 +327,9 @@ func digestBytes(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (c *Core) wireRunCompute(ctx context.Context, args *argAccessor, record runner.RunRecord, wiring *runWiring) {
-	provider := strings.ToLower(strings.TrimSpace(stringArg(args, "provider")))
-	usagePath := strings.TrimSpace(stringArg(args, "usage"))
+func (c *Core) wireRunCompute(ctx context.Context, params WiringParams, record runner.RunRecord, wiring *runWiring) {
+	provider := strings.ToLower(strings.TrimSpace(params.Provider))
+	usagePath := strings.TrimSpace(params.Usage)
 	raw := domain.RawUsage{}
 	usageAuthoritative := false
 	warningCode, warningMessage := "", ""
@@ -337,3 +410,30 @@ func observeTestsGreen(record runner.RunRecord, reportRequested bool, report run
 }
 
 func reportTestCount(report runReportWiring) int { return report.testCount }
+
+func (c *Core) presentRunRecord(record runner.RunRecord) runner.RunRecord {
+	record.TelemetryRefs = append([]string(nil), record.TelemetryRefs...)
+	if record.Telemetry == "" {
+		record.Telemetry = TelemetryNotRequested
+	}
+	if record.Status.Terminal() && record.Telemetry == TelemetryPending {
+		liveness := runner.SupervisorUnknown
+		if observer, ok := c.runner.(supervisorLivenessRunner); ok {
+			liveness = observer.SupervisorLiveness(record)
+		}
+		if liveness == runner.SupervisorDead {
+			record.Telemetry = TelemetryIncomplete
+			found := false
+			for _, ref := range record.TelemetryRefs {
+				if ref == CodeRunTelemetryPending {
+					found = true
+					break
+				}
+			}
+			if !found {
+				record.TelemetryRefs = append(record.TelemetryRefs, CodeRunTelemetryPending)
+			}
+		}
+	}
+	return record
+}

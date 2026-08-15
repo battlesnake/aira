@@ -355,6 +355,9 @@ func TestCLIRunRealCgroupOrClearSkip(t *testing.T) {
 		t.Fatalf("run response=%q stderr=%q err=%v", stdout.String(), stderr.String(), err)
 	}
 	if response.Code == "E_RUN_SCOPE_UNAVAILABLE" {
+		if os.Getenv("AIRA_REAL_CGROUP") == "1" {
+			t.Fatalf("real CLI runner required but unavailable: %s", response.Error)
+		}
 		t.Skipf("real CLI runner requires delegated writable cgroup-v2: %s", response.Error)
 	}
 	if exit != 0 || response.Code != "OK" {

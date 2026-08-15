@@ -79,11 +79,15 @@ type TestReportInput struct {
 	// ForceParserIncomplete is a caller-established upper bound on parser
 	// completeness (for example, an incomplete or capped runner capture).
 	ForceParserIncomplete bool
-	Coverage              *Coverage
-	Format                string
-	SourceDigest          string
-	Raw                   []byte
-	Results               []TestResult
+	// PreserveEmptyProvenance means Commit/Branch/WorktreeID are an observed
+	// snapshot, including when observation established empty values. Store must
+	// not replace those values with a later VCS sample.
+	PreserveEmptyProvenance bool
+	Coverage                *Coverage
+	Format                  string
+	SourceDigest            string
+	Raw                     []byte
+	Results                 []TestResult
 }
 
 var shardPattern = regexp.MustCompile(`^[1-9][0-9]*/[1-9][0-9]*$`)

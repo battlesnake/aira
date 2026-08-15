@@ -147,7 +147,7 @@ func runSupervisor(argv []string, diagnostics io.Writer) int {
 			return store.ExitForCode("E_RUN_ARGUMENT_INVALID")
 		}
 		name := strings.TrimPrefix(argv[i], "--")
-		if name != "control" && name != "ready-fd" && name != "ack-fd" {
+		if name != "control" && name != "ready-fd" && name != "ack-fd" && name != "wiring" {
 			writeSupervisorFailure(readyForFailure, "E_RUN_ARGUMENT_INVALID", "malformed supervisor arguments")
 			return store.ExitForCode("E_RUN_ARGUMENT_INVALID")
 		}
@@ -168,16 +168,51 @@ func runSupervisor(argv []string, diagnostics io.Writer) int {
 		writeSupervisorFailure(readyFD, "E_RUN_ARGUMENT_INVALID", err.Error())
 		return store.ExitForCode("E_RUN_ARGUMENT_INVALID")
 	}
+	var wiringParams core.WiringParams
+	var reportContext store.TestReportContext
+	wiringRequested := values["wiring"] != ""
+	if wiringRequested {
+		wiringParams, reportContext, err = core.ConsumeDetachedWiringSidecar(values["wiring"])
+		if err != nil {
+			writeSupervisorFailure(readyFD, "E_RUN_ARGUMENT_INVALID", err.Error())
+			return store.ExitForCode("E_RUN_ARGUMENT_INVALID")
+		}
+		request.TelemetryPending = core.TelemetryPending
+	}
 	s, project, err := app.OpenWithDiagnostics(context.Background(), ".", diagnostics)
 	if err != nil {
 		writeSupervisorFailure(readyFD, "E_RUN_DETACH_FAILED", err.Error())
 		return store.ExitForCode("E_RUN_DETACH_FAILED")
 	}
 	defer s.Close()
-	if err := project.Runner.SuperviseRequest(context.Background(), request, readyFD, ackFD); err != nil {
-		return store.ExitForCode(store.ErrorCode(err))
+	record, superviseErr := project.Runner.SuperviseRequest(context.Background(), request, readyFD, ackFD)
+	var telemetryErr error
+	if wiringRequested && detachedWiringTerminal(record) {
+		wiring := core.NewWithRunner(s, project.Runner).WireDetachedTelemetry(context.Background(), wiringParams, *record, reportContext)
+		state := core.TelemetryIncomplete
+		if wiring.WiringComplete {
+			state = core.TelemetryComplete
+		} else if diagnostics != nil {
+			for _, warning := range wiring.Warnings {
+				_, _ = fmt.Fprintf(diagnostics, "detached telemetry %s: %s: %s\n", warning.Action, warning.Code, warning.Message)
+			}
+		}
+		_, telemetryErr = project.Runner.RecordAuxTelemetry(context.Background(), record.ID, state, wiring.TelemetryReferences())
+		if telemetryErr != nil && diagnostics != nil {
+			_, _ = fmt.Fprintf(diagnostics, "detached telemetry settlement: %v\n", telemetryErr)
+		}
+	}
+	if superviseErr != nil {
+		return store.ExitForCode(store.ErrorCode(superviseErr))
+	}
+	if telemetryErr != nil {
+		return store.ExitForCode(store.ErrorCode(telemetryErr))
 	}
 	return 0
+}
+
+func detachedWiringTerminal(record *runner.RunRecord) bool {
+	return record != nil && record.Status.Terminal()
 }
 
 func supervisorReadyFD(argv []string) int {

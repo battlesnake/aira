@@ -17,7 +17,7 @@ import (
 
 const defaultRunLockTimeout = 2 * time.Second
 
-func (r *Runner) LaunchDetached(ctx context.Context, req Request) (*DetachLaunch, error) {
+func (r *Runner) LaunchDetached(ctx context.Context, req Request, wiringPath string) (*DetachLaunch, error) {
 	req.Detach = true
 	control, err := writeDetachControl(r.outputDir, req)
 	if err != nil {
@@ -44,7 +44,11 @@ func (r *Runner) LaunchDetached(ctx context.Context, req Request) (*DetachLaunch
 		closeOutputFiles(map[string]*os.File{"ready-r": readyR, "ready-w": readyW, "ack-r": ackR, "ack-w": ackW})
 		return nil, launchErr("E_RUN_DETACH_FAILED", err)
 	}
-	cmd := exec.Command("/proc/self/exe", "__supervise", "--control", control, "--ready-fd", "3", "--ack-fd", "4")
+	shimArgv := []string{"__supervise", "--control", control, "--ready-fd", "3", "--ack-fd", "4"}
+	if wiringPath != "" {
+		shimArgv = append(shimArgv, "--wiring", wiringPath)
+	}
+	cmd := exec.Command("/proc/self/exe", shimArgv...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = devnull, devnull, devnull
 	cmd.ExtraFiles = []*os.File{readyW, ackR}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -100,7 +104,7 @@ func (r *Runner) LaunchDetached(ctx context.Context, req Request) (*DetachLaunch
 	}
 	once := sync.Once{}
 	var completeErr error
-	launch := &DetachLaunch{Record: RunRecord{SchemaVersion: ledgerSchema, ID: message.ID, Status: StatusStarting, Detached: true}}
+	launch := &DetachLaunch{Record: RunRecord{SchemaVersion: ledgerSchema, ID: message.ID, Status: StatusStarting, Detached: true, Telemetry: req.TelemetryPending}}
 	launch.complete = func(delivered bool) error {
 		once.Do(func() {
 			if delivered {
@@ -128,18 +132,19 @@ func (r *Runner) Supervise(ctx context.Context, control string, readyFD, ackFD i
 		}
 		return launchErr("E_RUN_ARGUMENT_INVALID", err)
 	}
-	return r.SuperviseRequest(ctx, req, readyFD, ackFD)
+	_, err = r.SuperviseRequest(ctx, req, readyFD, ackFD)
+	return err
 }
 
-func (r *Runner) SuperviseRequest(ctx context.Context, req Request, readyFD, ackFD int) error {
+func (r *Runner) SuperviseRequest(ctx context.Context, req Request, readyFD, ackFD int) (*RunRecord, error) {
 	ready := os.NewFile(uintptr(readyFD), "detach-ready")
 	ack := os.NewFile(uintptr(ackFD), "detach-ack")
 	if ready == nil || ack == nil {
-		return launchErr("E_RUN_ARGUMENT_INVALID", errors.New("invalid supervisor control descriptors"))
+		return nil, launchErr("E_RUN_ARGUMENT_INVALID", errors.New("invalid supervisor control descriptors"))
 	}
 	signal := &detachSignal{file: ready}
 	req.Detach, req.detachReady, req.detachAck = true, signal, ack
-	_, launchErrValue := r.Launch(ctx, req)
+	record, launchErrValue := r.Launch(ctx, req)
 	if launchErrValue != nil && !signal.sentAlready() {
 		code := "E_RUN_DETACH_FAILED"
 		var typed *LaunchError
@@ -148,7 +153,7 @@ func (r *Runner) SuperviseRequest(ctx context.Context, req Request, readyFD, ack
 		}
 		_ = signal.send(detachReadyMessage{Code: code, Error: launchErrValue.Error()})
 	}
-	return launchErrValue
+	return record, launchErrValue
 }
 
 func (r *Runner) launchDetachedValidated(ctx context.Context, req Request, prefix []string, cwd string, env []string, envDigest, buffering string, effectiveArgv []string, bootID string) (*RunRecord, error) {
@@ -172,6 +177,7 @@ func (r *Runner) launchDetachedValidated(ctx context.Context, req Request, prefi
 		Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, Buffering: buffering, Merge: req.Merge,
 		Admission: "disabled", LaunchPrefix: append([]string(nil), prefix...), CgroupScope: r.intendedScope(id), StartedAt: nowString(r.now),
 		Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}, Detached: true, SupervisorPID: supervisor,
+		Telemetry: req.TelemetryPending,
 	}
 	if _, err := r.append(ledgerEvent{Kind: "starting", Run: record}); err != nil {
 		return nil, launchErr("E_RUN_RECONCILE_REQUIRED", err)

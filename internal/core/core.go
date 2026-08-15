@@ -272,12 +272,18 @@ type Runner interface {
 }
 
 type detachedRunner interface {
-	LaunchDetached(context.Context, runner.Request) (*runner.DetachLaunch, error)
+	LaunchDetached(context.Context, runner.Request, string) (*runner.DetachLaunch, error)
+	DetachOutputDir() string
+}
+
+type supervisorLivenessRunner interface {
+	SupervisorLiveness(runner.RunRecord) runner.SupervisorLiveness
 }
 
 type pendingDetachData struct {
-	record runner.RunRecord
-	launch *runner.DetachLaunch
+	record     runner.RunRecord
+	launch     *runner.DetachLaunch
+	wiringPath string
 }
 
 // GitOps is the transport-neutral git network-operation seam.
@@ -384,8 +390,17 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 			Report: runReportWiring{Code: codeReportNotRequested}, Compute: runComputeWiring{Tokens: "unevaluated", Code: codeComputeNotRequested},
 			TestsGreenObserved: runObservation{Not: "detached-unevaluated"}, WiringComplete: false, Warnings: []runWiringWarning{},
 		}}
-		afterWrite = pending.launch.Complete
+		afterWrite = func(delivered bool) error {
+			err := pending.launch.Complete(delivered)
+			if !delivered {
+				if removeErr := removeDetachedWiringSidecar(pending.wiringPath); err == nil {
+					err = removeErr
+				}
+			}
+			return err
+		}
 	}
+	data = c.presentRunData(data)
 	if handlerCode != "" {
 		if handlerError == "" {
 			handlerError = handlerCode
@@ -433,6 +448,28 @@ func runRecord(data any) (runner.RunRecord, bool) {
 		}
 	}
 	return runner.RunRecord{}, false
+}
+
+func (c *Core) presentRunData(data any) any {
+	switch value := data.(type) {
+	case runner.RunRecord:
+		return c.presentRunRecord(value)
+	case *runner.RunRecord:
+		if value != nil {
+			presented := c.presentRunRecord(*value)
+			return &presented
+		}
+	case runResponseData:
+		value.RunRecord = c.presentRunRecord(value.RunRecord)
+		return value
+	case *runResponseData:
+		if value != nil {
+			copy := *value
+			copy.RunRecord = c.presentRunRecord(copy.RunRecord)
+			return &copy
+		}
+	}
+	return data
 }
 
 func runRecordCode(record runner.RunRecord) string {
@@ -534,7 +571,12 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				if len(fields) != 0 {
 					return nil, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("run records do not support ticket field projection"))
 				}
-				return c.runner.Get(selector)
+				record, err := c.runner.Get(selector)
+				if err != nil {
+					return nil, err
+				}
+				presented := c.presentRunRecord(*record)
+				return &presented, nil
 			}
 			record, err := c.store.Get(selector)
 			if err != nil {
@@ -1214,20 +1256,14 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			if noStdin && stringArg(args, "stdin") != "" {
 				return nil, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("no_stdin and stdin are mutually exclusive"))
 			}
+			params := wiringParamsFromArgs(args)
 			request := runner.Request{
 				Argv: stringSlice(args, "argv"), Cwd: stringArg(args, "cwd"), Env: stringSlice(args, "env"),
-				Ticket: stringArg(args, "ticket"), Phase: stringArg(args, "phase"), Label: stringArg(args, "label"), Tool: stringArg(args, "tool"),
+				Ticket: stringArg(args, "ticket"), Phase: stringArg(args, "phase"), Label: stringArg(args, "label"), Tool: params.Tool,
 				Prefix: stringSlice(args, "prefix"), Merge: boolArg(args, "merge"), Realtime: boolArg(args, "realtime"), PTY: boolArg(args, "pty"), StdinPath: stringArg(args, "stdin"),
 				StoreStdin: boolArg(args, "store_stdin"), NoAdmit: boolArg(args, "no_admit"), Timeout: timeout,
 				Detach: boolArg(args, "detach"),
 			}
-			// Record all transport-neutral wiring arguments even when the runner is
-			// unavailable; dispatch metadata and generated faces share this handler.
-			for _, name := range []string{"report", "report_stream", "suite", "shard", "retry", "usage", "provider"} {
-				_ = stringArg(args, name)
-			}
-			_ = stringSlice(args, "config_env")
-			_ = boolArg(args, "strict_wiring")
 			follow := boolArg(args, "follow")
 			if request.PTY {
 				request.Merge = true
@@ -1247,11 +1283,11 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				if follow || request.PTY || request.StdinPath == "-" {
 					return nil, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("detach is incompatible with follow, pty, and stdin '-'"))
 				}
-				wiringSet := stringArg(args, "report") != "" || stringArg(args, "report_stream") != "" || stringArg(args, "suite") != "" ||
-					stringArg(args, "shard") != "" || stringArg(args, "retry") != "" || stringArg(args, "usage") != "" || stringArg(args, "provider") != "" ||
-					stringArg(args, "tool") != "" || len(stringSlice(args, "config_env")) != 0 || boolArg(args, "strict_wiring")
-				if wiringSet {
-					return nil, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("detached telemetry wiring is deferred"))
+				if params.StrictWiring {
+					return nil, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("detach is incompatible with strict wiring"))
+				}
+				if strings.TrimSpace(params.Usage) == "-" {
+					return nil, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("detached --usage requires a file and does not accept -"))
 				}
 				if c.runner == nil {
 					return nil, runnerError("E_RUN_SCOPE_UNAVAILABLE", errors.New("runner is unavailable"))
@@ -1260,11 +1296,25 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				if !ok {
 					return nil, runnerError("E_RUN_SCOPE_UNAVAILABLE", errors.New("detached runner is unavailable"))
 				}
-				launch, err := detacher.LaunchDetached(ctx, request)
+				wiringPath := ""
+				if params.requested() {
+					var reportContext store.TestReportContext
+					if contextual, ok := c.store.(testReportContextStore); ok {
+						reportContext = contextual.TestReportContext(ctx)
+					}
+					wiringPath, err = writeDetachedWiringSidecar(detacher.DetachOutputDir(), params, reportContext)
+					if err != nil {
+						return nil, runnerError("E_RUN_DETACH_FAILED", err)
+					}
+					request.TelemetryPending = TelemetryPending
+				}
+				launch, err := detacher.LaunchDetached(ctx, request, wiringPath)
 				if err != nil {
+					_ = removeDetachedWiringSidecar(wiringPath)
 					return nil, err
 				}
-				return pendingDetachData{record: launch.Record, launch: launch}, nil
+				launch.Record.Telemetry = request.TelemetryPending
+				return pendingDetachData{record: launch.Record, launch: launch, wiringPath: wiringPath}, nil
 			}
 			if c.runner == nil {
 				return nil, runnerError("E_RUN_SCOPE_UNAVAILABLE", errors.New("runner is unavailable"))
@@ -1279,7 +1329,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			// change HEAD/branch/worktree, and a report must be attributed to the code that
 			// was actually tested, not to whatever the working tree became afterwards.
 			var reportContext store.TestReportContext
-			if strings.TrimSpace(stringArg(args, "report")) != "" {
+			if strings.TrimSpace(params.Report) != "" {
 				if contextual, ok := c.store.(testReportContextStore); ok {
 					reportContext = contextual.TestReportContext(ctx)
 				}
@@ -1288,9 +1338,9 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			if err != nil {
 				return nil, err
 			}
-			wiring := c.wireTerminalRun(ctx, args, *record, reportContext)
+			wiring := c.wireTerminalRun(ctx, params, *record, reportContext)
 			data := runResponseData{RunRecord: *record, Wiring: wiring}
-			if boolArg(args, "strict_wiring") && runRecordCode(*record) == "" && !wiring.WiringComplete {
+			if params.StrictWiring && runRecordCode(*record) == "" && !wiring.WiringComplete {
 				return handlerData{Data: data, Code: "E_RUN_WIRING_INCOMPLETE"}, nil
 			}
 			return data, nil
@@ -1357,6 +1407,9 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				runs, err := c.runner.Reconcile(ctx)
 				if err != nil {
 					return nil, err
+				}
+				for i := range runs {
+					runs[i] = c.presentRunRecord(runs[i])
 				}
 				data["runs"] = runs
 			}

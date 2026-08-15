@@ -77,7 +77,8 @@ type PIDIdentity struct {
 }
 
 // RunRecord is the durable protocol object. It intentionally contains no
-// environment values, telemetry, or inferred green field.
+// environment values or inferred green field. Telemetry is an opaque envelope:
+// runner persists it but never assigns meaning to its values or references.
 type RunRecord struct {
 	SchemaVersion       int                  `json:"schema_version"`
 	ID                  string               `json:"id"`
@@ -119,6 +120,8 @@ type RunRecord struct {
 	LeaderExitObserved  bool                 `json:"leader_exit_observed,omitempty"`
 	QuiesceForced       bool                 `json:"quiesce_forced,omitempty"`
 	TerminalComplete    bool                 `json:"terminal_complete"`
+	Telemetry           string               `json:"telemetry,omitempty"`
+	TelemetryRefs       []string             `json:"telemetry_refs,omitempty"`
 }
 
 func (r RunRecord) CleanSuccess() bool {
@@ -154,10 +157,23 @@ type Request struct {
 	LiveStderr  io.Writer `json:"-"` // optional best-effort foreground tee sink
 	NoAdmit     bool      // bypass the configured memory-admission gate
 	Detach      bool      `json:"detach,omitempty"`
-	detachReady *detachSignal
-	detachAck   io.ReadCloser
-	detachRunID string
+	// TelemetryPending is an opaque initial envelope supplied by Core. Runner
+	// stamps it into the starting event without interpreting its value.
+	TelemetryPending string `json:"telemetry_pending,omitempty"`
+	detachReady      *detachSignal
+	detachAck        io.ReadCloser
+	detachRunID      string
 }
+
+// SupervisorLiveness is a generic, boot-aware process observation. Consumers
+// decide what that observation means for their own opaque auxiliary state.
+type SupervisorLiveness string
+
+const (
+	SupervisorAlive   SupervisorLiveness = "alive"
+	SupervisorDead    SupervisorLiveness = "dead"
+	SupervisorUnknown SupervisorLiveness = "unknown"
+)
 
 type DetachLaunch struct {
 	Record   RunRecord

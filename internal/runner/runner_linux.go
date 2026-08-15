@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -124,6 +125,10 @@ func (r *Runner) boundedRunLock(path string) (*os.File, error) {
 }
 
 func (r *Runner) ReportMaxBytes() int64 { return r.reportMaxBytes }
+
+// DetachOutputDir identifies the directory in which a launcher may place an
+// opaque, launch-window sidecar. Runner only receives and plumbs its path.
+func (r *Runner) DetachOutputDir() string { return r.outputDir }
 
 func (r *Runner) append(event ledgerEvent) (ledgerEvent, error) {
 	r.mu.Lock()
@@ -273,7 +278,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		started := nowString(r.now)
 		// Containment is not an initial assumption. Until the leader is positively
 		// observed in cgroup.procs, the durable record must remain non-contained.
-		record = RunRecord{SchemaVersion: ledgerSchema, ID: id, Owner: r.owner, Ticket: req.Ticket, Phase: req.Phase, Label: req.Label, Tool: req.Tool, Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, Buffering: buffering, Merge: req.Merge, Admission: admission.state, AdmissionReason: admission.reason, AdmissionWaitedMS: admission.waitedMS, LaunchPrefix: append([]string(nil), prefix...), StartedAt: started, Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}, Detached: req.Detach}
+		record = RunRecord{SchemaVersion: ledgerSchema, ID: id, Owner: r.owner, Ticket: req.Ticket, Phase: req.Phase, Label: req.Label, Tool: req.Tool, Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, Buffering: buffering, Merge: req.Merge, Admission: admission.state, AdmissionReason: admission.reason, AdmissionWaitedMS: admission.waitedMS, LaunchPrefix: append([]string(nil), prefix...), StartedAt: started, Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}, Detached: req.Detach, Telemetry: req.TelemetryPending}
 		if req.Detach {
 			record.SupervisorPID = PIDIdentity{PID: os.Getpid(), StartTick: processStartTick(os.Getpid()), BootID: bootID}
 			if record.SupervisorPID.StartTick == 0 {
@@ -1397,6 +1402,86 @@ func processLive(identity PIDIdentity) processLiveness {
 	default:
 		return processAlive
 	}
+}
+
+// SupervisorLiveness exposes only the generic process lease observation. It
+// deliberately does not interpret any auxiliary telemetry state.
+func (r *Runner) SupervisorLiveness(record RunRecord) SupervisorLiveness {
+	switch processLive(record.SupervisorPID) {
+	case processAlive:
+		return SupervisorAlive
+	case processDead:
+		return SupervisorDead
+	default:
+		return SupervisorUnknown
+	}
+}
+
+// RecordAuxTelemetry performs the sole post-terminal auxiliary transition. The
+// compare is structural (a non-empty starting envelope and no prior telemetry
+// event), so runner never owns or parses a caller's pending/settled vocabulary.
+func (r *Runner) RecordAuxTelemetry(ctx context.Context, id, state string, refs []string) (*RunRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(id) == "" || strings.TrimSpace(state) == "" {
+		return nil, launchErr("E_RUN_ARGUMENT_INVALID", errors.New("run id and telemetry state are required"))
+	}
+	lock, err := r.boundedRunLock(filepath.Join(filepath.Dir(r.ledger.ledger), id+".lock"))
+	if err != nil {
+		return nil, err
+	}
+	defer unlockFile(lock)
+	events, err := r.ledger.read()
+	if err != nil {
+		return nil, err
+	}
+	runs, err := replay(events)
+	if err != nil {
+		return nil, err
+	}
+	current, ok := runs[id]
+	if !ok {
+		return nil, &LaunchError{"E_RUN_NOT_FOUND", errors.New(id)}
+	}
+	if !current.Status.Terminal() {
+		return nil, launchErr("E_RUN_ARGUMENT_INVALID", errors.New("telemetry requires a terminal run"))
+	}
+	envelope, settled := false, false
+	for _, event := range events {
+		if event.Run.ID != id {
+			continue
+		}
+		if event.Kind == "starting" && event.Run.Telemetry != "" {
+			envelope = true
+		}
+		if event.Kind == "telemetry" {
+			settled = true
+		}
+	}
+	wantRefs := append([]string(nil), refs...)
+	if settled {
+		if current.Telemetry == state && reflect.DeepEqual(current.TelemetryRefs, wantRefs) {
+			if err := r.ledger.project(ctx); err != nil {
+				return &current, err
+			}
+			return &current, nil
+		}
+		return nil, launchErr("E_RUN_TELEMETRY_CONFLICT", errors.New("telemetry is already settled"))
+	}
+	if !envelope || current.Telemetry == "" {
+		return nil, launchErr("E_RUN_TELEMETRY_CONFLICT", errors.New("run has no pending telemetry envelope"))
+	}
+	event, err := r.append(ledgerEvent{Kind: "telemetry", Run: RunRecord{ID: id, Telemetry: state, TelemetryRefs: wantRefs}})
+	if err != nil {
+		return nil, err
+	}
+	current.Telemetry = event.Run.Telemetry
+	current.TelemetryRefs = append([]string(nil), event.Run.TelemetryRefs...)
+	if err := r.ledger.project(ctx); err != nil {
+		return &current, err
+	}
+	return &current, nil
 }
 
 func processIdentityMatches(identity PIDIdentity) bool {
