@@ -1,8 +1,6 @@
 # AIRA M19 — run → telemetry auto-wiring (report + compute + honest observation)
 
 Status: PLAN APPROVED (v4 — Sol APPROVE-PLAN after 3 rounds; §14 authority amended; build-review checklist in §7)
-usage→--usage with §118; bounded capture read (report_max_bytes); --usage file+--provider (no
-`-`, no provider-guess); config-env canonicalization reuse; strict-wiring exit precedence)
 Date: 2026-08-15
 Milestone: Phase 5 · M19 — telemetry/gate auto-wiring
 Depends on: M12 runner, M16 rusage, M13 test-reports, M14 compute telemetry (all landed, `bd965be`)
@@ -31,8 +29,9 @@ continuous canary. M19 is telemetry wiring; the "gate" half is *feeding* gates, 
   in `mergeEvidence` (the M16/M18a field-loss trap). Pure metadata — never alters launch/capture.
 - **`--report <fmt>` auto-ingest** with the §6 identity fields as inputs so the report is
   *comparable*: `--suite <id>`, `--config-env K=V` (→ env-scoped config digest, as M13),
-  `--shard <s>`, `--retry <n>` (default 0). After the run terminates, read the **full** captured
-  output (§3.2 — uncapped, with truncation detection), build a `domain.TestReportInput` with
+  `--shard <s>`, `--retry <n>` (default 0). After the run terminates, read the captured output
+  **bounded by `run.report_max_bytes`** (§3.2 — over-ceiling ⇒ `parser_complete=false`), build a
+  `domain.TestReportInput` with
   provenance (`RunRef=<id>`, `TicketID/Phase` from flags, `Commit/Branch/WorktreeID` from the
   store git context, `SuiteID/Config/Shard/RetryIndex/EnvDigest`, `Format`, `Raw`), and
   `AddTestReport` (the M13 parser fills `Results/ParserComplete`). **Comparability honesty**: when
@@ -42,11 +41,11 @@ continuous canary. M19 is telemetry wiring; the "gate" half is *feeding* gates, 
   comparability.
 - **`--tool <t>` ComputeEvent** keyed `(Ticket,Phase,Model=<tool>)` capturing **resource** usage
   (wall=`ended-started`, `cpu_user/cpu_sys/peak_rss` from M16; nil→unevaluated). Authoritative
-  **token** usage is recorded **only from an explicit `--usage <file|->`** (a provider usage JSON,
-  parsed by M14's per-provider normaliser — reusing M14's honesty: never fabricate a bucket);
-  absent `--usage` ⇒ token buckets **unevaluated** (§14 "absent → …unevaluated"). Auto-extracting
-  usage from the tool's stdout is D1 (fragile per-tool scraping) — deferred, never silently
-  guessed.
+  **token** usage is recorded **only from an explicit `--usage <file>` + `--provider <p>`** (§3.3:
+  a file not `-`; the provider selects the M14 normaliser, never guessed from the tool name),
+  reusing M14's honesty (never fabricate a bucket); absent `--usage` ⇒ token buckets
+  **unevaluated** (§14 "absent → …unevaluated"). Auto-extracting usage from the tool's stdout is
+  D1 (fragile per-tool scraping) — deferred, never silently guessed.
 - **Run-observation facts** (not a gate verdict): the run response reports
   `tests_green_observed` = (`exit==0` AND the ingested report's `test_count>0` AND
   `parser_complete`), else the honest reason (`exit≠0` / `zero-tests` / `parse-incomplete` /
