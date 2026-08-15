@@ -235,18 +235,25 @@ robust: a stalled shim cannot backpressure/SIGPIPE the child.
     `U_RUN_CAPTURE_INCOMPLETE`; it remains **killable** and a later Reconcile
     finalises from the evidence once the scope empties. Never a terminal `exited`
     over live descendants.
-- **One shared finalizer** (Sol P0-2 r3): `finalizeDetachedTerminal(id, scope)` —
-  used by **both** the shim (post-quiesce) and Reconcile (evidence + empty scope).
-  It **acquires the per-run flock, then RE-READS the authoritative record**
-  (`ledger.current`) and derives the terminal candidate **exclusively from that
-  reread plus freshly collected evidence** — never from a caller-supplied stale
-  snapshot (Sol P1 r4), so a kill-intent or `quiesce-forced` fact recorded
-  meanwhile is always reflected. It re-checks scope-empty under the held flock
-  immediately before the CAS (closing a re-population race), snapshots cgroup usage
-  (readable until the empty cgroup is removed), stats + `digestFile`s the capture
-  files → `OutputComplete`, classifies status/integrity from the reread
-  (exited/killed/forced-quiesce), then `appendTerminalLocked` + removes the empty
-  scope. Whoever wins the CAS produces an **identical, complete** terminal — no
+- **One shared finalizer** (Sol P0-2 r3), split by lock ownership to avoid a
+  self-deadlock (Sol P1 r5 — Reconcile already holds the per-run flock when it
+  decides evidence+empty):
+  - `finalizeDetachedTerminalLocked(id, scope)` — the **caller already holds the
+    per-run flock** (Reconcile's case, mirroring the `appendTerminalLocked`
+    convention). It **re-reads the authoritative record** (`ledger.current`) and
+    derives the terminal candidate **exclusively from that reread plus freshly
+    collected usage/output evidence** — never from a caller-supplied stale snapshot
+    (Sol P1 r4), so a kill-intent or `quiesce-forced` fact recorded meanwhile is
+    always reflected. It re-checks scope-empty immediately before the CAS (closing
+    a re-population race), snapshots cgroup usage (readable until the empty cgroup
+    is removed), stats + `digestFile`s the capture files → `OutputComplete`,
+    classifies status/integrity from the reread (exited/killed/forced-quiesce),
+    then `appendTerminalLocked` + removes the empty scope.
+  - `finalizeDetachedTerminal(id, scope)` — the thin wrapper the **shim** uses
+    (it holds no flock): acquire the per-run flock, call the `…Locked` variant,
+    release.
+
+  Whoever wins the CAS produces an **identical, complete** terminal — no
   usage/digest discarded by a Reconcile that beats the shim.
 - Byte cap: "complete up to the disk-eviction cap"; §19 head+tail elision applies
   at **read** time (`run-log`). Eviction/truncation → `evicted`/`unavailable`
