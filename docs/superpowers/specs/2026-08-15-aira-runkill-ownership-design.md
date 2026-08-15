@@ -188,6 +188,13 @@ Unforgeable owner tokens; whale-run/systemd-scope guarding (route via `aira run`
 
 ## 8. Sol plan-review resolutions
 
+### r4 — APPROVE-PLAN (build-ready)
+**Single most important builder note (Sol):** before any scope `Open`/kill action, the durable
+ledger state must contain **both** the kill intent **and** `StolenBy`. Fresh intent → the normal
+`kill-intent` event carries both; existing intent → append the steal evidence **preserving the
+original `KillIntent.Sequence`**. Always continue from the record **returned by that append**, so
+subsequent terminal/reconcile paths cannot regress the evidence.
+
 ### r3
 - **P1 steal pre-action durability** → §3.2 step 4 / I3: on a `--steal`, append a durable steal
   evidence event (a sequence-preserving `kill-intent` snapshot or a `kill-steal` event) carrying
