@@ -349,6 +349,14 @@ func (c *Client) Run(parent context.Context, request Request) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A clone URL is passed as a child argv argument (visible to same-user process
+	// inspection). Refuse a credential-bearing clone URL rather than leak it: HTTPS
+	// userinfo (bare token or user:secret) or any embedded password. A bare ssh username
+	// (git@host) is not a credential and is allowed. Configured remotes (fetch/push) use
+	// the remote NAME, never the URL, so they carry no argv exposure.
+	if request.Verb == "clone" && ((ep.Scheme == "https" && ep.HasUserinfo) || ep.HasPassword) {
+		return nil, opError(CodeArgInvalid, "clone URL must not embed a credential; use gh or a git credential helper", nil)
+	}
 	result := &Result{Op: request.Verb, Remote: request.Remote, URL: ep.Redacted, Host: ep.Host}
 	if ep.Scheme == "ssh" {
 		result.Auth = "ssh"
@@ -371,24 +379,29 @@ func (c *Client) Run(parent context.Context, request Request) (*Result, error) {
 	}
 	if ep.Scheme == "https" {
 		// A native github.com HTTPS op does not REQUIRE gh: a public repo works
-		// anonymously. Use the gh helper OPPORTUNISTICALLY — inject it when gh can serve a
-		// credential, otherwise run anonymously and let a private repo fail honestly with an
-		// auth error. Never fail a valid public op just because gh is absent.
-		useHelper := false
-		if ep.Host == "github.com" && !ep.HasUserinfo && c.requireGH(ctx) == nil {
-			useHelper = true
-			result.Auth = "https-gh"
+		// anonymously. AIRA owns the github auth story, so ALWAYS clear inherited helpers
+		// there (deterministic, no silent/hanging system helper); add gh OPPORTUNISTICALLY
+		// when it can serve a credential, else run truly anonymously and let a private repo
+		// fail honestly with an auth error. Non-github HTTPS keeps git's native credential
+		// handling (honour a user's configured helper; the non-interactive env prevents hangs).
+		clearHelpers, useGH := false, false
+		if ep.Host == "github.com" && !ep.HasUserinfo {
+			clearHelpers = true
+			if c.requireGH(ctx) == nil {
+				useGH = true
+				result.Auth = "https-gh"
+			}
 		}
 		opEndpoint := ep
 		if request.Verb == "clone" {
 			opEndpoint.Raw = request.URL
 		}
-		op := c.nativeOp(ctx, request, opEndpoint, useHelper)
+		op := c.nativeOp(ctx, request, opEndpoint, clearHelpers, useGH)
 		return finish(result, op, false, ep)
 	}
 
 	if request.Verb == "ls-remote" {
-		op := c.nativeOp(ctx, request, ep, false)
+		op := c.nativeOp(ctx, request, ep, false, false)
 		if op.ExitCode == 0 && op.Err == nil {
 			return finish(result, op, false, ep)
 		}
@@ -433,7 +446,7 @@ func (c *Client) Run(parent context.Context, request Request) (*Result, error) {
 	if request.Verb == "clone" {
 		opEndpoint.Raw = request.URL
 	}
-	op := c.nativeOp(ctx, request, opEndpoint, false)
+	op := c.nativeOp(ctx, request, opEndpoint, false, false)
 	return finish(result, op, false, ep)
 }
 
@@ -499,10 +512,17 @@ func (c *Client) probe(ctx context.Context, ep endpoint, _, _ io.Writer) runResu
 	return c.run(ctx, runRequest{Name: "git", Args: []string{"ls-remote", "--heads", "--", ep.Raw}, Env: env, Dir: "/"})
 }
 
-func (c *Client) nativeOp(ctx context.Context, req Request, ep endpoint, githubHelper bool) runResult {
+// nativeOp runs the committed operation. clearHelpers injects an empty credential.helper
+// first (dropping any inherited/system helper — determinism + no silent/hanging helper);
+// useGH additionally adds the gh helper. github.com HTTPS always clears (AIRA owns that
+// auth story: gh or truly anonymous); other hosts keep git's native credential handling.
+func (c *Client) nativeOp(ctx context.Context, req Request, ep endpoint, clearHelpers, useGH bool) runResult {
 	args := make([]string, 0, 12)
-	if githubHelper {
-		args = append(args, "-c", "credential.helper=", "-c", "credential.helper="+credentialHelper)
+	if clearHelpers {
+		args = append(args, "-c", "credential.helper=")
+	}
+	if useGH {
+		args = append(args, "-c", "credential.helper="+credentialHelper)
 	}
 	args = append(args, req.Verb, "--")
 	if req.Verb == "clone" {
@@ -740,7 +760,7 @@ func (c *Client) fallback(ctx context.Context, req Request, ep endpoint, rules [
 		}
 		result.Auth, result.URL, result.Host, result.FellBack = "https-gh", canonical, "github.com", true
 		fallbackEP := endpoint{Raw: canonical, Redacted: canonical, Scheme: "https", Host: "github.com"}
-		op := c.nativeOp(ctx, req, fallbackEP, true)
+		op := c.nativeOp(ctx, req, fallbackEP, true, true)
 		return finish(result, op, true, fallbackEP)
 	}
 	settings, err := c.remoteSettings(ctx, req.Remote)

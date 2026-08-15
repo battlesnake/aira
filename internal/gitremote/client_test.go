@@ -312,8 +312,9 @@ func TestHTTPSApplicationAuthFailureHasAuthCode(t *testing.T) {
 	}
 }
 
-// verifies: a native github.com HTTPS op does NOT require gh — a public repo runs
-// anonymously when gh is absent, never a false E_GIT_GH_UNAVAILABLE.
+// verifies: a native github.com HTTPS op does NOT require gh — a public repo runs when
+// gh is absent (never a false E_GIT_GH_UNAVAILABLE) AND is TRULY anonymous: inherited
+// credential helpers are cleared, the gh helper is not used.
 func TestNativeGitHubHTTPSRunsAnonymouslyWhenGHAbsent(t *testing.T) {
 	fake := goodFake("https://github.com/owner/repo.git")
 	fake.ghStatus = runResult{ExitCode: 1} // gh not authenticated / absent
@@ -322,24 +323,62 @@ func TestNativeGitHubHTTPSRunsAnonymouslyWhenGHAbsent(t *testing.T) {
 	if err != nil || result.Auth != "https" || fake.opCalls != 1 {
 		t.Fatalf("public op should run anonymously: result=%+v error=%v opCalls=%d", result, err, fake.opCalls)
 	}
+	sawOp := false
 	for _, call := range fake.calls {
-		if contains(call.Args, "credential.helper=") {
+		if call.Name != "git" || !contains(call.Args, "fetch") {
+			continue
+		}
+		sawOp = true
+		if !contains(call.Args, "credential.helper=") {
+			t.Fatalf("anonymous github op did not clear inherited helpers: %#v", call.Args)
+		}
+		if contains(call.Args, "credential.helper="+credentialHelper) {
 			t.Fatalf("gh helper injected despite gh being unavailable: %#v", call.Args)
+		}
+	}
+	if !sawOp {
+		t.Fatal("no fetch op observed")
+	}
+}
+
+// verifies: a bare (colon-free) or uppercase-scheme HTTPS userinfo credential is redacted;
+// redaction must not depend on a colon, a token-shape heuristic, or scheme casing.
+func TestBareHTTPSUserinfoIsRedacted(t *testing.T) {
+	for _, raw := range []string{
+		"https://plaincredential@github.com/owner/repo.git",
+		"HTTPS://plaincredential@github.com/owner/repo.git",
+	} {
+		fake := goodFake(raw)
+		client := newWithRun(Config{GhFallback: true, OpTimeout: time.Second}, fake.run)
+		result, err := client.Run(context.Background(), Request{Verb: "fetch"})
+		if err != nil {
+			t.Fatalf("%q: %v", raw, err)
+		}
+		if result.Auth != "https" || strings.Contains(result.URL, "plaincredential") {
+			t.Fatalf("bare userinfo leaked in reported URL for %q: %q", raw, result.URL)
 		}
 	}
 }
 
-// verifies: a bare (colon-free) HTTPS userinfo credential is redacted from surfaced fields;
-// the redaction must not depend on a colon or a token-shape heuristic.
-func TestBareHTTPSUserinfoIsRedacted(t *testing.T) {
-	fake := goodFake("https://plaincredential@github.com/owner/repo.git")
-	client := newWithRun(Config{GhFallback: true, OpTimeout: time.Second}, fake.run)
-	result, err := client.Run(context.Background(), Request{Verb: "fetch"})
-	if err != nil {
-		t.Fatal(err)
+// verifies: a credential-bearing clone URL is refused (it would be exposed in child argv),
+// while a bare ssh username (git@host, not a credential) clones normally.
+func TestCloneCredentialBearingURLIsRefused(t *testing.T) {
+	for _, raw := range []string{
+		"https://token@github.com/owner/repo.git",
+		"https://user:secret@github.com/owner/repo.git",
+		"ssh://user:pass@github.com/owner/repo.git",
+	} {
+		fake := goodFake("")
+		client := newWithRun(Config{GhFallback: true, OpTimeout: time.Second}, fake.run)
+		_, err := client.Run(context.Background(), Request{Verb: "clone", URL: raw, Dir: "dst"})
+		if codeOf(t, err) != CodeArgInvalid || fake.opCalls != 0 {
+			t.Errorf("clone %q: err=%v opCalls=%d (want ARG_INVALID, op never runs)", raw, err, fake.opCalls)
+		}
 	}
-	if result.Auth != "https" || strings.Contains(result.URL, "plaincredential") {
-		t.Fatalf("bare userinfo leaked in reported URL: %q", result.URL)
+	fake := goodFake("")
+	client := newWithRun(Config{GhFallback: true, OpTimeout: time.Second}, fake.run)
+	if _, err := client.Run(context.Background(), Request{Verb: "clone", URL: "ssh://git@github.com/owner/repo.git", Dir: "dst"}); err != nil {
+		t.Fatalf("bare ssh username clone was wrongly refused: %v", err)
 	}
 }
 
