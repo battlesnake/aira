@@ -382,6 +382,28 @@ func TestCloneCredentialBearingURLIsRefused(t *testing.T) {
 	}
 }
 
+// verifies: an embedded password in a configured ssh remote is refused BEFORE the probe,
+// so the read-only `git ls-remote -- <url>` probe argv never carries the password.
+func TestSSHPasswordRemoteRefusedBeforeProbe(t *testing.T) {
+	for _, verb := range []string{"fetch", "push", "ls-remote"} {
+		fake := goodFake("ssh://user:s3cr3t@example.com/owner/repo.git")
+		req := Request{Verb: verb, Remote: "origin"}
+		if verb == "push" {
+			req.Refspecs = []string{"HEAD:main"}
+		}
+		client := newWithRun(Config{GhFallback: true, OpTimeout: time.Second}, fake.run)
+		_, err := client.Run(context.Background(), req)
+		if codeOf(t, err) != CodeArgInvalid {
+			t.Errorf("%s: err=%v (want ARG_INVALID)", verb, err)
+		}
+		for _, call := range fake.calls {
+			if contains(call.Args, "--heads") || strings.Contains(strings.Join(call.Args, " "), "s3cr3t") {
+				t.Errorf("%s: password reached a child argv (probe ran before rejection): %#v", verb, call.Args)
+			}
+		}
+	}
+}
+
 // verifies: an explicit pushurl ignores pushInsteadOf (git's rule) but ORDINARY insteadOf
 // still applies — probe/report must use the insteadOf-rewritten endpoint, not the raw pushurl.
 func TestExplicitPushURLStillHonoursOrdinaryInsteadOf(t *testing.T) {

@@ -349,12 +349,18 @@ func (c *Client) Run(parent context.Context, request Request) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	// A clone URL is passed as a child argv argument (visible to same-user process
-	// inspection). Refuse a credential-bearing clone URL rather than leak it: HTTPS
-	// userinfo (bare token or user:secret) or any embedded password. A bare ssh username
-	// (git@host) is not a credential and is allowed. Configured remotes (fetch/push) use
-	// the remote NAME, never the URL, so they carry no argv exposure.
-	if request.Verb == "clone" && ((ep.Scheme == "https" && ep.HasUserinfo) || ep.HasPassword) {
+	// Refuse an embedded PASSWORD wherever the URL reaches a child argv: the ssh path runs
+	// a read-only probe (git ls-remote -- <url>), and clone passes the URL as an op arg —
+	// both would expose the password to same-user process inspection. (An ssh URL password
+	// is also unusable under BatchMode.) https fetch/push use the remote NAME for the
+	// committed op and run no probe, so a configured credential is not exposed by AIRA and
+	// is redacted in surfaced output — those keep the plan's run-as-is behaviour.
+	if ep.HasPassword && (ep.Scheme == "ssh" || request.Verb == "clone") {
+		return nil, opError(CodeArgInvalid, "remote URL must not embed a password; use gh or a git credential helper", nil)
+	}
+	// clone additionally passes the URL as an op arg, so refuse an https token-username
+	// (bare userinfo) clone too. A bare ssh username (git@host) is not a credential.
+	if request.Verb == "clone" && ep.Scheme == "https" && ep.HasUserinfo {
 		return nil, opError(CodeArgInvalid, "clone URL must not embed a credential; use gh or a git credential helper", nil)
 	}
 	result := &Result{Op: request.Verb, Remote: request.Remote, URL: ep.Redacted, Host: ep.Host}
