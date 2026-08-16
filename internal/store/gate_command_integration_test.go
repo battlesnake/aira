@@ -69,7 +69,11 @@ func TestCommandCheckerUsesRunnerAndRejectsOutputOverflow(t *testing.T) {
 	if evaluation.RunID == "" {
 		t.Fatal("command evaluation did not retain a runner run ID")
 	}
-	record, err := s.runner.Get(evaluation.RunID)
+	execution, ok := s.runner.(*runner.Runner)
+	if !ok {
+		t.Fatalf("store execution dependency is %T, want *runner.Runner", s.runner)
+	}
+	record, err := execution.Get(evaluation.RunID)
 	if err != nil || record.ID != evaluation.RunID || !record.Status.Terminal() {
 		t.Fatalf("command did not produce a durable terminal runner record: record=%#v err=%v", record, err)
 	}
@@ -169,7 +173,11 @@ func TestCommandCheckerStoresAuthoritativeRunnerEnvDigest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	record, err := s.runner.Get(evaluation.RunID)
+	execution, ok := s.runner.(*runner.Runner)
+	if !ok {
+		t.Fatalf("store execution dependency is %T, want *runner.Runner", s.runner)
+	}
+	record, err := execution.Get(evaluation.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}

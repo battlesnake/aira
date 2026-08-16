@@ -235,7 +235,7 @@ func admissibleCommandRun(record runner.RunRecord) (admissible, cleanExit bool, 
 	return true, *record.ExitCode == 0, ""
 }
 
-func readCompleteOutput(ctx context.Context, execution *runner.Runner, record runner.RunRecord, stream string) ([]byte, error) {
+func readCompleteOutput(ctx context.Context, execution Execution, record runner.RunRecord, stream string) ([]byte, error) {
 	ref, ok := record.OutputRefs[stream]
 	if !ok || ref.State != runner.OutputComplete {
 		return nil, errors.New("U_GATE_COMMAND_RUN_UNEVALUATED: output is incomplete")

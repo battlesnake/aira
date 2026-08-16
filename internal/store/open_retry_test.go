@@ -48,11 +48,11 @@ func TestOpenRetriesTransientDiskIOError(t *testing.T) {
 	t.Cleanup(func() { openOnceFn = restore })
 
 	var calls int32
-	openOnceFn = func(ctx context.Context, opts Options) (*Store, error) {
+	openOnceFn = func(ctx context.Context, dbPath, registryPath string) (*DB, error) {
 		if atomic.AddInt32(&calls, 1) < int32(storeOpenRetries) {
 			return nil, diskIOError()
 		}
-		return restore(ctx, opts)
+		return restore(ctx, dbPath, registryPath)
 	}
 
 	dir := t.TempDir()
@@ -73,7 +73,7 @@ func TestOpenDoesNotRetryNonTransient(t *testing.T) {
 	t.Cleanup(func() { openOnceFn = restore })
 
 	var calls int32
-	openOnceFn = func(ctx context.Context, opts Options) (*Store, error) {
+	openOnceFn = func(context.Context, string, string) (*DB, error) {
 		atomic.AddInt32(&calls, 1)
 		return nil, errors.New("E_CONFIG_INVALID: nope")
 	}
@@ -93,7 +93,7 @@ func TestOpenExhaustsRetryBudget(t *testing.T) {
 	t.Cleanup(func() { openOnceFn = restore })
 
 	var calls int32
-	openOnceFn = func(ctx context.Context, opts Options) (*Store, error) {
+	openOnceFn = func(context.Context, string, string) (*DB, error) {
 		atomic.AddInt32(&calls, 1)
 		return nil, diskIOError()
 	}
@@ -114,7 +114,7 @@ func TestOpenStopsOnCancelledContext(t *testing.T) {
 	t.Cleanup(func() { openOnceFn = restore })
 
 	var calls int32
-	openOnceFn = func(ctx context.Context, opts Options) (*Store, error) {
+	openOnceFn = func(context.Context, string, string) (*DB, error) {
 		atomic.AddInt32(&calls, 1)
 		return nil, diskIOError()
 	}
@@ -140,7 +140,7 @@ func TestOpenCancelDuringBackoff(t *testing.T) {
 	t.Cleanup(cancel)
 	called := make(chan struct{}, 1)
 	var calls int32
-	openOnceFn = func(context.Context, Options) (*Store, error) {
+	openOnceFn = func(context.Context, string, string) (*DB, error) {
 		atomic.AddInt32(&calls, 1)
 		select {
 		case called <- struct{}{}:

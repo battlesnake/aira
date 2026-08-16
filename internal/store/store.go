@@ -36,6 +36,7 @@ var (
 type Options struct {
 	Root         string
 	CommonDir    string
+	GitDir       string
 	DBPath       string
 	RegistryPath string
 	ProjectID    string
@@ -59,16 +60,68 @@ type Options struct {
 	Clock             Clock
 }
 
+// ScopeOptions describes one worktree view over a machine-wide DB. DB and
+// registry paths deliberately do not belong here: the DB owner pins them when
+// it calls OpenDB.
+type ScopeOptions struct {
+	Root                string
+	CommonDir           string
+	GitDir              string
+	ProjectID           string
+	WorktreeID          string
+	ProjectSlug         string
+	Prefixes            []string
+	RequirementPrefixes []string
+	ReviewPolicy        ReviewPolicy
+	LeaseStateDir       string
+	LeaseTTLNS          uint64
+	MaxReports          int
+	MaxAgeDays          int
+	MaxComputeEvents    int
+	MaxComputeAgeDays   int
+	MaxQuotaSnapshots   int
+	ConfigDigest        string
+	Clock               Clock
+}
+
+// DB is the owner of one machine-wide SQLite connection and its pinned path
+// identity. Many Store scopes may share it; only DB.Close closes the
+// connection.
+type DB struct {
+	db           *sql.DB
+	dbPath       string
+	registryPath string
+}
+
+// Close releases the connection owned by db.
+func (db *DB) Close() error {
+	if db == nil || db.db == nil {
+		return nil
+	}
+	return db.db.Close()
+}
+
+// Execution is the deliberately narrow process-execution dependency used by
+// command gate lanes. *runner.Runner satisfies it in production; tests may
+// inject a recording implementation.
+type Execution interface {
+	Launch(context.Context, runner.Request) (*runner.RunRecord, error)
+	ReadOutput(context.Context, runner.OutputRequest) (*runner.OutputChunk, error)
+}
+
 type Store struct {
 	db                *sql.DB
+	owner             *DB
 	root              string
 	commonDir         string
+	gitDir            string
 	auditDir          string
 	dbPath            string
 	registryPath      string
 	projectID         string
 	worktreeID        string
 	projectSlug       string
+	configDigest      string
 	reviewPolicy      ReviewPolicy
 	prefixes          map[string]string // prefix -> entity kind (ticket|requirement)
 	leaseStateDir     string
@@ -79,7 +132,7 @@ type Store struct {
 	maxComputeAgeDays int
 	maxQuotaSnapshots int
 	clock             Clock
-	runner            *runner.Runner
+	runner            Execution
 	// beforeMaterialise is intentionally nil in production; tests use it to
 	// observe the receipt-before-file ordering at the crash boundary.
 	beforeMaterialise func(Intent) error
@@ -191,19 +244,51 @@ type scannedTicket struct {
 	Digest     string
 }
 
-// Open opens (creating if needed) the machine-local SQLite store. The open +
-// schema-init writes can transiently fail with SQLITE_IOERR on some filesystems
-// (observed on WSL2's vhdx under I/O load). Schema creation (CREATE TABLE IF NOT
-// EXISTS) and registration are idempotent — register runs on every command — so a
-// bounded retry on a *transient* disk I/O error makes every command robust without
-// masking a persistent error (a non-I/O error, or one that survives the retries,
-// is returned unchanged).
+// Open is the in-process convenience: it opens a private DB and one scope which
+// owns that DB. Daemon callers use OpenDB and NewScope separately.
 func Open(ctx context.Context, opts Options) (*Store, error) {
+	if opts.Root == "" || opts.CommonDir == "" || opts.DBPath == "" || opts.RegistryPath == "" || opts.ProjectID == "" || opts.WorktreeID == "" {
+		return nil, errors.New("E_CONFIG_INVALID: store options are incomplete")
+	}
+	db, err := openDBContext(ctx, opts.DBPath, opts.RegistryPath)
+	if err != nil {
+		return nil, err
+	}
+	scopeOpts := ScopeOptions{
+		Root: opts.Root, CommonDir: opts.CommonDir, GitDir: opts.GitDir,
+		ProjectID: opts.ProjectID, WorktreeID: opts.WorktreeID,
+		ProjectSlug: opts.ProjectSlug, Prefixes: opts.Prefixes,
+		RequirementPrefixes: opts.RequirementPrefixes, ReviewPolicy: opts.ReviewPolicy,
+		LeaseStateDir: opts.LeaseStateDir, LeaseTTLNS: opts.LeaseTTLNS,
+		MaxReports: opts.MaxReports, MaxAgeDays: opts.MaxAgeDays,
+		MaxComputeEvents: opts.MaxComputeEvents, MaxComputeAgeDays: opts.MaxComputeAgeDays,
+		MaxQuotaSnapshots: opts.MaxQuotaSnapshots, Clock: opts.Clock,
+	}
+	// GitDir did not exist in the pre-M21 Options API. Keep that source-level
+	// compatibility for isolated in-process callers; production discovery and
+	// every daemon descriptor provide GitDir and take the checked path.
+	s, err := newScopeContext(ctx, db, scopeOpts, opts.GitDir != "")
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	s.owner = db
+	return s, nil
+}
+
+// OpenDB opens and initialises the one machine-wide connection. It pins the DB
+// and registry paths for its lifetime and retains the bounded transient-I/OERR
+// retry used before the M21 split.
+func OpenDB(dbPath, registryPath string) (*DB, error) {
+	return openDBContext(context.Background(), dbPath, registryPath)
+}
+
+func openDBContext(ctx context.Context, dbPath, registryPath string) (*DB, error) {
 	var lastErr error
 	for attempt := 0; attempt < storeOpenRetries; attempt++ {
-		s, err := openOnceFn(ctx, opts)
+		db, err := openOnceFn(ctx, dbPath, registryPath)
 		if err == nil {
-			return s, nil
+			return db, nil
 		}
 		lastErr = err
 		if !isTransientDiskIOError(err) || ctx.Err() != nil {
@@ -221,9 +306,13 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	return nil, lastErr
 }
 
-// openOnceFn is the single-shot open primitive Open retries. It is a package var
-// so tests can inject transient disk I/O faults; production always uses openOnce.
+// openOnceFn is the single-shot DB open primitive OpenDB retries.
 var openOnceFn = openOnce
+
+// registerOnceFn is the single-shot per-worktree registration primitive which
+// NewScope retries. It is a package variable solely for typed fault injection in
+// the transient-I/OERR regression test.
+var registerOnceFn = func(ctx context.Context, s *Store) error { return s.register(ctx) }
 
 const (
 	// storeOpenRetries bounds the retry budget for a transient disk I/O error.
@@ -249,31 +338,16 @@ func isTransientDiskIOError(err error) bool {
 	return coder.Code()&0xff == sqlite3.SQLITE_IOERR
 }
 
-func openOnce(ctx context.Context, opts Options) (*Store, error) {
-	if opts.Root == "" || opts.CommonDir == "" || opts.DBPath == "" || opts.RegistryPath == "" || opts.ProjectID == "" || opts.WorktreeID == "" {
-		return nil, errors.New("E_CONFIG_INVALID: store options are incomplete")
+func openOnce(ctx context.Context, dbPath, registryPath string) (*DB, error) {
+	if dbPath == "" || registryPath == "" {
+		return nil, errors.New("E_CONFIG_INVALID: DB paths are incomplete")
 	}
-	reviewPolicy, err := ValidateReviewPolicy(opts.ReviewPolicy)
+	dbPath, err := filepath.Abs(dbPath)
 	if err != nil {
 		return nil, err
 	}
-	root, err := filepath.Abs(opts.Root)
+	registry, err := filepath.Abs(registryPath)
 	if err != nil {
-		return nil, err
-	}
-	common, err := filepath.Abs(opts.CommonDir)
-	if err != nil {
-		return nil, err
-	}
-	dbPath, err := filepath.Abs(opts.DBPath)
-	if err != nil {
-		return nil, err
-	}
-	registry, err := filepath.Abs(opts.RegistryPath)
-	if err != nil {
-		return nil, err
-	}
-	if err := domain.ValidateProjectSlug(opts.ProjectSlug); err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
@@ -282,20 +356,77 @@ func openOnce(ctx context.Context, opts Options) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(registry), 0o755); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Join(common, "aira", "locks"), 0o755); err != nil {
-		return nil, err
-	}
 	dsn := dbPath + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=foreign_keys(ON)"
-	db, err := sql.Open("sqlite", dsn)
+	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	conn.SetMaxOpenConns(1)
+	conn.SetMaxIdleConns(1)
+	db := &DB{db: conn, dbPath: dbPath, registryPath: registry}
+	if err := (&Store{db: conn}).initDB(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+// NewScope creates a checked worktree view over db. Project and worktree
+// identities are always recomputed from canonical paths; supplied identities
+// are evidence to validate, never authority.
+func NewScope(db *DB, opts ScopeOptions) (*Store, error) {
+	return newScopeContext(context.Background(), db, opts, true)
+}
+
+func newScopeContext(ctx context.Context, db *DB, opts ScopeOptions, checkIdentity bool) (*Store, error) {
+	if db == nil || db.db == nil {
+		return nil, errors.New("E_CONFIG_INVALID: DB is unavailable")
+	}
+	if opts.Root == "" || opts.CommonDir == "" || opts.ProjectSlug == "" || (checkIdentity && opts.GitDir == "") {
+		return nil, errors.New("E_CONFIG_INVALID: scope options are incomplete")
+	}
+	reviewPolicy, err := ValidateReviewPolicy(opts.ReviewPolicy)
+	if err != nil {
+		return nil, err
+	}
+	root, err := canonicalPath(opts.Root)
+	if err != nil {
+		return nil, err
+	}
+	common, err := canonicalPath(opts.CommonDir)
+	if err != nil {
+		return nil, err
+	}
+	gitDir := opts.GitDir
+	if gitDir == "" {
+		gitDir = root
+	}
+	gitDir, err = canonicalPath(gitDir)
+	if err != nil {
+		return nil, err
+	}
+	projectID, worktreeID := hashPath(common), hashPath(gitDir)
+	if checkIdentity {
+		if opts.ProjectID != "" && opts.ProjectID != projectID {
+			return nil, fmt.Errorf("E_DAEMON_PROJECT_INVALID: project identity %q does not match canonical common directory", opts.ProjectID)
+		}
+		if opts.WorktreeID != "" && opts.WorktreeID != worktreeID {
+			return nil, fmt.Errorf("E_DAEMON_PROJECT_INVALID: worktree identity %q does not match canonical git directory", opts.WorktreeID)
+		}
+	} else {
+		projectID, worktreeID = opts.ProjectID, opts.WorktreeID
+	}
+	if err := domain.ValidateProjectSlug(opts.ProjectSlug); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Join(common, "aira", "locks"), 0o755); err != nil {
+		return nil, err
+	}
 	s := &Store{
-		db: db, root: root, commonDir: common, auditDir: filepath.Join(common, "aira"),
-		dbPath: dbPath, registryPath: registry, projectID: opts.ProjectID,
-		worktreeID: opts.WorktreeID, projectSlug: opts.ProjectSlug, reviewPolicy: reviewPolicy, prefixes: map[string]string{},
+		db: db.db, root: root, commonDir: common, gitDir: gitDir, auditDir: filepath.Join(common, "aira"),
+		dbPath: db.dbPath, registryPath: db.registryPath, projectID: projectID,
+		worktreeID: worktreeID, projectSlug: opts.ProjectSlug, configDigest: opts.ConfigDigest,
+		reviewPolicy: reviewPolicy, prefixes: map[string]string{},
 		leaseStateDir: opts.LeaseStateDir, leaseTTLNS: opts.LeaseTTLNS,
 		maxReports: opts.MaxReports, maxAgeDays: opts.MaxAgeDays,
 		maxComputeEvents: opts.MaxComputeEvents, maxComputeAgeDays: opts.MaxComputeAgeDays,
@@ -311,7 +442,6 @@ func openOnce(ctx context.Context, opts Options) (*Store, error) {
 		s.maxQuotaSnapshots = 5000
 	}
 	if s.maxReports < 1 || s.maxAgeDays < 0 || s.maxComputeEvents < 1 || s.maxComputeAgeDays < 0 || s.maxQuotaSnapshots < 1 {
-		_ = db.Close()
 		return nil, errors.New("E_CONFIG_INVALID: telemetry retention is invalid")
 	}
 	if s.leaseStateDir == "" {
@@ -325,41 +455,87 @@ func openOnce(ctx context.Context, opts Options) (*Store, error) {
 	}
 	for _, prefix := range opts.Prefixes {
 		if !validPrefix(prefix) {
-			_ = db.Close()
 			return nil, fmt.Errorf("E_ID_INVALID: invalid prefix %q", prefix)
 		}
 		s.prefixes[strings.ToUpper(prefix)] = kindTicket
 	}
 	for _, prefix := range opts.RequirementPrefixes {
 		if !validPrefix(prefix) {
-			_ = db.Close()
 			return nil, fmt.Errorf("E_ID_INVALID: invalid prefix %q", prefix)
 		}
 		up := strings.ToUpper(prefix)
 		if existing, dup := s.prefixes[up]; dup && existing != kindRequirement {
 			// Prefixes are disjoint by kind: a prefix may not be both a ticket
 			// and a requirement prefix.
-			_ = db.Close()
 			return nil, fmt.Errorf("E_PREFIX_OWNERSHIP_CONFLICT: prefix %q registered as both ticket and requirement", up)
 		}
 		s.prefixes[up] = kindRequirement
 	}
-	if err := s.initDB(ctx); err != nil {
-		_ = db.Close()
-		return nil, err
+	var lastErr error
+	for attempt := 0; attempt < storeOpenRetries; attempt++ {
+		if err := registerOnceFn(ctx, s); err == nil {
+			return s, nil
+		} else {
+			lastErr = err
+		}
+		if !isTransientDiskIOError(lastErr) || ctx.Err() != nil {
+			return nil, lastErr
+		}
+		if attempt == storeOpenRetries-1 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, lastErr
+		case <-time.After(storeOpenBackoff):
+		}
 	}
-	if err := s.register(ctx); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	return s, nil
+	return nil, lastErr
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func canonicalPath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	canonical, err := filepath.EvalSymlinks(abs)
+	if err == nil {
+		return filepath.Clean(canonical), nil
+	}
+	return filepath.Clean(abs), nil
+}
+
+func hashPath(path string) string {
+	sum := sha256.Sum256([]byte(path))
+	return hex.EncodeToString(sum[:])
+}
+
+// CanonicalScopeIdentity returns the path-derived identity used by NewScope and
+// by daemon-side descriptor validation.
+func CanonicalScopeIdentity(commonDir, gitDir string) (string, string, error) {
+	common, err := canonicalPath(commonDir)
+	if err != nil {
+		return "", "", err
+	}
+	git, err := canonicalPath(gitDir)
+	if err != nil {
+		return "", "", err
+	}
+	return hashPath(common), hashPath(git), nil
+}
+
+// Close closes only a private DB opened by Open. A Store returned by NewScope
+// owns no connection, so its Close is intentionally a no-op.
+func (s *Store) Close() error {
+	if s == nil || s.owner == nil {
+		return nil
+	}
+	return s.owner.Close()
+}
 
 // SetRunner attaches the only process-execution seam used by command gates.
 // The store never falls back to os/exec for gate commands.
-func (s *Store) SetRunner(execution *runner.Runner) { s.runner = execution }
+func (s *Store) SetRunner(execution Execution) { s.runner = execution }
 
 func (s *Store) initDB(ctx context.Context) error {
 	statements := []string{
@@ -843,8 +1019,8 @@ func (s *Store) register(ctx context.Context) error {
 	return s.withImmediate(ctx, func(conn *sql.Conn) error {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 		if _, err := conn.ExecContext(ctx, `INSERT INTO projects(project_id, slug, common_dir, config_digest, created_at)
-            VALUES(?, ?, ?, '', ?) ON CONFLICT(project_id) DO UPDATE SET slug=excluded.slug, common_dir=excluded.common_dir`,
-			s.projectID, s.projectSlug, s.commonDir, now); err != nil {
+			VALUES(?, ?, ?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET slug=excluded.slug, common_dir=excluded.common_dir, config_digest=excluded.config_digest`,
+			s.projectID, s.projectSlug, s.commonDir, s.configDigest, now); err != nil {
 			return err
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO worktrees(project_id, worktree_id, root, active, updated_at)

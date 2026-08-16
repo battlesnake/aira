@@ -174,7 +174,7 @@ func OpenWithDiagnostics(ctx context.Context, cwd string, diagnostics io.Writer)
 		return nil, Project{}, err
 	}
 	s, err := store.Open(ctx, store.Options{
-		Root: project.Root, CommonDir: project.CommonDir,
+		Root: project.Root, CommonDir: project.CommonDir, GitDir: project.GitDir,
 		DBPath:       filepath.Join(project.StateDir, "state.db"),
 		RegistryPath: filepath.Join(project.StateDir, "registry.jsonl"),
 		ProjectID:    project.ProjectID, WorktreeID: project.WorktreeID,
@@ -291,7 +291,7 @@ func Init(ctx context.Context, cwd string, args map[string]any) (InitResult, err
 		return InitResult{}, err
 	}
 	s, err := store.Open(ctx, store.Options{
-		Root: root, CommonDir: common,
+		Root: root, CommonDir: common, GitDir: gitDir,
 		DBPath: filepath.Join(state, "state.db"), RegistryPath: filepath.Join(state, "registry.jsonl"),
 		ProjectID: hashID(canonicalCommon), WorktreeID: hashID(canonicalGitDir), ProjectSlug: slug, Prefixes: prefixes,
 		ReviewPolicy: reviewPolicy,
