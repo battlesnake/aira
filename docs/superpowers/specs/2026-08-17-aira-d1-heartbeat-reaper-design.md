@@ -1,6 +1,6 @@
-# D1 — Daemon heartbeat lease-reaper, v2
+# D1 — Daemon heartbeat lease-reaper, v3
 
-**Status:** plan (Sol plan-review r1 → REQUEST-CHANGES; this is v2). **Milestone:** Phase 5 · D1.
+**Status:** plan (Sol plan-review r1+r2 → REQUEST-CHANGES; this is v3). **Milestone:** Phase 5 · D1.
 **Branch:** `codex-aira-d1`. **Depends on:** M21 (master `44d5948`).
 
 ## 1. Goal
@@ -64,10 +64,11 @@ a real transition): inside the free txn, `nextSequence` → `insertEventActor(pr
 seq, actor="aira-daemon", "lease.lapse", ticketID)` → `outbox` INSERT → after commit
 `journalEvent(ctx, projectID, seq)` to the project's `<commonDir>/aira/journal.jsonl`.
 
-- **Actor is the exact stable value `aira-daemon`** (a daemon-initiated mutation; no
-  worktree attribution is invented — the reap is not a worktree's action; any
-  outbox/worktree column the schema requires is left NULL/daemon, never the dead
-  holder's or the arbitrary sweeping scope's).
+- **Actor is the exact stable value `aira-daemon`**; the `outbox.worktree_id` column is
+  `NOT NULL`, so a reap uses the **empty-string sentinel `""`** (a project-wide,
+  worktree-agnostic reap — never the dead holder's nor the arbitrary sweeping scope's
+  worktree). Reconciliation of a `""`-worktree reap event is tested from an arbitrary
+  worktree (Sol r2 #5).
 - **`journalEvent` failure after COMMIT** leaves the row free with the DB
   `events`/`outbox` rows unjournaled — **identical to `Claim`/`Release` today**; the
   existing reconciler (`store.Reconcile` replays unjournaled events → `journalEvent`)
@@ -81,38 +82,63 @@ Leases live in one machine-wide `state.db` keyed by `project_id`, but every writ
 (`event_counters`, journal dir) is per-project — so a sweep must run through the
 owning project's `Store` scope. D1 sweeps a project's leases at **two** moments:
 
-1. **On scope build (synchronous, first contact):** when the daemon first builds a
-   project's scope (`storeForScope`), it runs one sweep **before** serving the request.
-   So the *first* `Claim`/verb after a daemon restart reaps that project's dead leases
-   up front — the claim then sees a free lease and succeeds with no `--steal`. This
-   closes the daemon-restart gap without machine-wide plumbing.
-2. **Periodically (the timer, §5):** for every currently-cached scope, deduplicated by
-   `project_id` (multiple worktree scopes share one project's leases; the per-project
-   sweep is idempotent), reap on the interval.
+1. **On scope build (once per project, first contact):** when the daemon first *builds*
+   a project's scope, it runs one sweep **before** serving that request. So the first
+   `Claim`/verb after a daemon restart reaps the dead leases up front and the claim
+   succeeds with no `--steal`.
+   - **Outside the global lock (Sol r2 #4):** `storeForScope` acquires `s.mu` only to
+     build + cache the scope, then **releases it**; the on-build sweep runs on the
+     returned scope *after* the unlock but *before* dispatching this request. A
+     multi-txn sweep + journal fsync must never be held under `s.mu` (it would block
+     every project's cached-scope lookup).
+   - **Singleflight:** only the goroutine that *created* the scope runs the on-build
+     sweep (a cache hit does not re-sweep — the periodic reaper covers ongoing decay);
+     `storeForScope` returns a "newly built" flag.
+   - **Best-effort, non-aborting (Sol r2 #3):** an on-build sweep error (clock/DB/journal)
+     is **logged and swallowed** — the request still runs. So "claim without `--steal`"
+     is guaranteed **only when the sweep succeeds**; on sweep failure the claim may still
+     get `E_LEASE_EXPIRED` (retry / `--steal`), and a partial reap (UPDATE committed,
+     journal failed) self-heals via the reconciler (§3). This honours "a reaper failure
+     never impacts a request."
+2. **Periodically (the timer, §5):** every currently-cached scope, deduped by
+   `project_id`, swept on the interval (idempotent).
 
 **Honest limitation:** a project **never contacted** this daemon session (no cached
-scope) is not swept until its first contact — but that first contact (any request,
-including the claim itself) triggers the on-build sweep, so no user ever observes a
-strand they can't clear by simply retrying/contacting. A fully machine-wide sweep
-(scan `projects.common_dir` → per-project reap of never-contacted projects) is a clean
-follow-up, out of D1, and explicitly **not** promised here.
+scope) is not swept until its first contact — but that contact triggers the on-build
+sweep. A fully machine-wide sweep (`projects.common_dir` → per-project reap of
+never-contacted projects) is a clean follow-up, out of D1, and explicitly not promised.
 
-## 5. The daemon timer + shutdown (fixes Sol r1 P0)
+## 5. The daemon timer + shutdown (Sol r1 P0, r2 #1/#2)
 
 - A **reaper goroutine** starts in `Server.Serve`, driven by a ticker at `reapInterval`
-  (§6), each tick snapshotting the scope set (under the `scopes` mutex), deduping by
-  `project_id`, sweeping each.
-- **Definitive stop-and-join before `db.Close` (not merely the bounded drain).** The
-  reaper runs under a dedicated cancelable context and signals a `reaperDone` channel on
-  exit. `Serve` registers `defer stopReaper()` **after** the reaper starts, so — because
-  the `defer db.Close()` was registered earlier and defers run LIFO — `stopReaper()`
-  (cancel + `<-reaperDone`) runs **before** `db.Close()` on *every* return path,
-  including a drain **timeout** and a non-cancellation accept error. The sweep is
-  **interruptible** — it checks its context between candidates — so stop is prompt and
-  cannot outlive the DB. This is independent of the connection drain (which the P0 note
-  showed is insufficient on timeout).
-- A sweep error is logged to daemon diagnostics; the ticker continues; a reaper failure
-  never crashes accept or a served request.
+  (§6); each tick snapshots the scope set (briefly under `s.mu`), dedupes by
+  `project_id`, and sweeps each. A sweep error is logged; the ticker continues; a reaper
+  failure never crashes accept or a served request.
+
+- **The invariant is "never use-after-close", not "prompt shutdown" (Sol r2 #1/#2).**
+  The reaper's per-candidate `journalEvent` takes `journal.lock` via a **blocking,
+  context-unaware `flock(LOCK_EX)`** and may fsync, so a candidate cannot be interrupted
+  mid-write — `<-reaperDone` is **not bounded-promptly**. Likewise M21's served
+  connections use `context.Background()` so a bounded drain can **time out** with work
+  still in flight (this pre-exists D1; the on-build sweep runs inside such a connection).
+  Therefore D1 does **not** promise prompt termination; it guarantees the DB is **never
+  closed while any user might still touch it**:
+
+  - `Serve`'s cleanup (replacing the bare `defer db.Close()`): signal stop (cancel the
+    reaper ctx so it takes no *new* candidate; close the listener so no new accepts),
+    then wait for **both** the reaper (`reaperDone`) **and** the connection WaitGroup,
+    bounded by `DrainTimeout`. **`db.Close()` runs only if both fully drained.** If the
+    bound elapses with a user still active (a stuck `flock`/fsync/connection), the daemon
+    **skips `db.Close()`** and exits — the OS reclaims the fd and SQLite's WAL is
+    crash-safe, so the next daemon start recovers cleanly. This eliminates use-after-close
+    for the reaper *and* the pre-existing connection case, honestly, without pretending a
+    blocking `flock` is interruptible.
+  - The reaper sweep still checks its context **between candidates** so it stops as soon
+    as the current candidate's txn commits — prompt in the common (uncontended) case,
+    and safe (never closing under it) in the pathological one.
+
+  *(This refines M21's `defer db.Close()` — which closed on drain timeout, a latent
+  use-after-close that D1's concurrent DB user makes real.)*
 
 ## 6. Config
 
@@ -122,10 +148,9 @@ follow-up, out of D1, and explicitly **not** promised here.
 - **Grammar:** a Go duration string (`time.ParseDuration`, e.g. `"30s"`, `"2m"`).
 - **Default (unset):** `30s` (well below the default `ttl_seconds`=900; interval only
   affects promptness, never correctness).
-- **Off:** the exact values `disabled` or `0` disable the periodic timer (a
-  **production-supported** setting); the on-scope-build sweep still runs (it is part of
-  correctness, not the timer). *(Or, if reviewers prefer, `disabled` also skips
-  on-build — decide: default keeps on-build, `disabled` = no periodic only.)*
+- **Off:** the exact values `disabled` or `0` disable **only the periodic timer** (a
+  production-supported setting, matching the knob's name); the **on-scope-build sweep
+  always runs** — it is correctness (closes the restart gap), not the timer (Sol r2 #6).
 - **Malformed:** a non-empty unparseable value → the daemon **fails to start** with
   `E_CONFIG_INVALID` (fail-closed, clear message) — never a silent fallback.
 
@@ -144,11 +169,19 @@ follow-up, out of D1, and explicitly **not** promised here.
   reaped.
 - **Reap-on-scope-build closes the restart gap:** a fresh daemon, a project with an
   expired lease, a plain `Claim` (no `--steal`) → succeeds (the on-build sweep freed it),
-  with a `lease.lapse` journaled.
+  with a `lease.lapse` journaled. **Singleflight:** a cache hit does not re-sweep.
+  **Best-effort:** an injected on-build sweep failure is swallowed and the request still
+  runs (the claim may then get `E_LEASE_EXPIRED`).
+- **On-build sweep not under `s.mu`:** a slow sweep does not block another project's
+  cached-scope lookup (assert concurrency).
+- **`""`-worktree reap reconciles:** a `lease.lapse` with `worktree_id=""` replays/
+  reconciles correctly from an arbitrary worktree.
 - **Idempotent / multi-worktree:** two scopes for one project don't double-reap.
-- **Shutdown: no use-after-close even on drain timeout:** a sweep in flight + a stuck
-  connection forcing drain timeout → `stopReaper` still joins before `db.Close` (no
-  panic/race under `-race`); `ctx` cancel stops the reaper promptly.
+- **Shutdown: DB closed only after all users drain; skipped on timeout:** on a clean
+  stop the reaper + connections drain then `db.Close`; with a stuck user forcing the
+  bound to elapse, `db.Close` is **skipped** (no panic/use-after-close under `-race`),
+  the daemon exits, and a fresh daemon recovers the WAL DB. `ctx` cancel stops the
+  reaper after its current candidate commits.
 - **Config:** default 30s; `disabled`/`0` → no periodic sweep; malformed →
   `E_CONFIG_INVALID` daemon-start failure.
 - **e2e (real CLI):** two worktrees; one claims a short-TTL ticket and stops
@@ -182,9 +215,12 @@ follow-up, out of D1, and explicitly **not** promised here.
 5. `lease.lapse` journaled per-project via the owning scope; actor exactly `aira-daemon`;
    no invented worktree attribution; a CAS-fail writes no event; journal-failure
    self-heals via the reconciler.
-6. Reap-on-scope-build runs before first dispatch and closes the restart gap; periodic
-   sweep deduped by project_id + idempotent; never-contacted limitation stated.
-7. `defer stopReaper()` joins before `db.Close()` on every return path incl. drain
-   timeout; sweep interruptible; `-race` clean; a reaper error never crashes the daemon.
+6. Reap-on-scope-build runs before first dispatch (singleflight, **outside `s.mu`**,
+   best-effort/non-aborting); periodic sweep deduped by project_id + idempotent;
+   `outbox.worktree_id=""` reconciles; never-contacted limitation stated.
+7. Shutdown: `db.Close()` runs **only after** the reaper AND connections drain, and is
+   **skipped on the bounded-drain timeout** (no use-after-close; unclean-but-crash-safe
+   exit) — the invariant is never-use-after-close, not prompt shutdown; `-race` clean;
+   a reaper error never crashes the daemon.
 8. Config: default 30s; Go-duration grammar; `disabled`/`0` supported; malformed →
    `E_CONFIG_INVALID` start failure.
