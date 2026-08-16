@@ -1,6 +1,6 @@
-# D1 — Daemon heartbeat lease-reaper, v4
+# D1 — Daemon heartbeat lease-reaper, v5
 
-**Status:** plan (Sol plan-review r1–r3 → REQUEST-CHANGES; this is v4). **Milestone:** Phase 5 · D1.
+**Status:** plan (Sol plan-review r1–r4 → REQUEST-CHANGES; this is v5). **Milestone:** Phase 5 · D1.
 **Branch:** `codex-aira-d1`. **Depends on:** M21 (master `44d5948`).
 
 ## 1. Goal
@@ -69,17 +69,21 @@ seq, actor="aira-daemon", "lease.lapse", ticketID)` → `outbox` INSERT → afte
   worktree-agnostic reap — never the dead holder's nor the arbitrary sweeping scope's
   worktree). Reconciliation of a `""`-worktree reap event is tested from an arbitrary
   worktree (Sol r2 #5).
-- **The reaper journals with a BOUNDED, non-blocking `flock` (Sol r3 #2).** `journalEvent`
-  today takes `journal.lock` via a blocking, context-unaware `flock(LOCK_EX)` that can
-  never return under contention — unacceptable for a background sweep that also runs
-  synchronously on-build. The reaper uses a **bounded journal attempt** (`LOCK_NB` with a
-  short deadline, or a ctx-aware acquire); if it cannot journal within the bound, the
-  reap `UPDATE` is **already committed** (the lease is free), the `events`/`outbox` rows
-  are written but unjournaled, and the existing reconciler (`store.Reconcile` replays
-  unjournaled events → `journalEvent`) journals it later. So a reap **self-heals** and no
-  reaper operation ever blocks indefinitely on the journal — this bounds the periodic
-  sweep, the on-build sweep, the singleflight barrier (§4), and shutdown (§5). Client
-  `Claim`/`Release` keep their existing blocking `flock` (synchronous, caller-owned).
+- **The reaper does NOT journal inline (Sol r3 #2 / r4 P0).** `journalEvent` takes
+  `journal.lock` via a blocking `flock(LOCK_EX)` and then writes + **`fsync`s** the
+  journal file — and `LOCK_NB` bounds only the lock, not the write/fsync, so *no* inline
+  variant is truly bounded. Instead the reap's `withImmediate` txn commits **only the DB
+  state** — the lease `UPDATE`, the `events` row (`insertEventActor`), and the `outbox`
+  row — and does **not** append `journal.jsonl` at all. `journal.jsonl` materialisation
+  is left entirely to the **existing reconciler** (`store.Reconcile` replays unjournaled
+  events → `journalEvent`), exactly the self-heal path a failed inline `journalEvent`
+  already uses today. Thus each reap is a **single bounded DB transaction** (the same
+  fsync every `Claim`/write already does — no *extra* journal-file fsync), so the periodic
+  sweep, the on-build sweep, the readiness barrier (§4), and shutdown never block on the
+  journal file. The DB `events` row is the immediate, authoritative record; the
+  `journal.jsonl` audit catches up on the next reconcile/rebuild. Client `Claim`/`Release`
+  keep their existing inline `journalEvent` (synchronous, caller-owned). *(A continuous
+  daemon reconciler that flushes such deferred journals promptly is D2, out of D1.)*
 - **Replay/digest** is verb-generic (target+digest), and no gauge consumes lease verbs
   today, so `lease.lapse` needs no new consumer; a doc note records the new verb.
 
@@ -107,12 +111,12 @@ owning project's `Store` scope. D1 sweeps a project's leases at **two** moments:
      request waits on `ready` before dispatch**, while other projects' lookups are
      unblocked. The wait is bounded because the sweep is bounded (§3). The barrier fires
      once per scope entry; the periodic reaper covers ongoing decay.
-   - **Best-effort, non-aborting (Sol r2 #3):** an on-build sweep error (clock/DB/journal)
-     is **logged and swallowed** — the request still runs. So "claim without `--steal`"
-     is guaranteed **only when the sweep succeeds**; on sweep failure the claim may still
-     get `E_LEASE_EXPIRED` (retry / `--steal`), and a partial reap (UPDATE committed,
-     journal failed) self-heals via the reconciler (§3). This honours "a reaper failure
-     never impacts a request."
+   - **Best-effort, non-aborting (Sol r2 #3):** an on-build sweep error (clock/DB) is
+     **logged and swallowed** — the request still runs. So "claim without `--steal`" is
+     guaranteed **only when the sweep succeeds**; on sweep failure the claim may still get
+     `E_LEASE_EXPIRED` (retry / `--steal`). The reap commits DB-only (no inline journal,
+     §3), so there is no partial-write to unwind; the `journal.jsonl` audit materialises on
+     the next reconcile. This honours "a reaper failure never impacts a request."
 2. **Periodically (the timer, §5):** every currently-cached scope, deduped by
    `project_id`, swept on the interval (idempotent).
 
@@ -128,34 +132,39 @@ never-contacted projects) is a clean follow-up, out of D1, and explicitly not pr
   `project_id`, and sweeps each. A sweep error is logged; the ticker continues; a reaper
   failure never crashes accept or a served request.
 
-- **The invariant is "never use-after-close", not "prompt shutdown" (Sol r2 #1/#2).**
-  The reaper's per-candidate `journalEvent` takes `journal.lock` via a **blocking,
-  context-unaware `flock(LOCK_EX)`** and may fsync, so a candidate cannot be interrupted
-  mid-write — `<-reaperDone` is **not bounded-promptly**. Likewise M21's served
-  connections use `context.Background()` so a bounded drain can **time out** with work
-  still in flight (this pre-exists D1; the on-build sweep runs inside such a connection).
-  Therefore D1 does **not** promise prompt termination; it guarantees the DB is **never
-  closed while any user might still touch it**:
+- **The invariant is "never use-after-close / never a second writer", not "prompt
+  shutdown".** The reaper's per-candidate work is a single DB transaction (no inline
+  journal, §3), so it stops promptly between candidates (`ctx`-checked) in the common
+  case. The residual unbounded actor is the DB `fsync` itself (`synchronous=FULL`, shared
+  by every write) and M21's served connections using `context.Background()` (a bounded
+  drain can **time out** with work still in flight — this pre-exists D1; the on-build
+  sweep runs inside such a connection). D1 does **not** promise prompt termination; it
+  guarantees the DB is **never closed while any user might still touch it, and no
+  replacement daemon overlaps a live writer**:
 
   - `Serve`'s cleanup (replacing the bare `defer db.Close()`): signal stop (cancel the
     reaper ctx so it takes no *new* candidate; close the listener so no new accepts),
     then wait for **both** the reaper (`reaperDone`) **and** the connection WaitGroup,
     bounded by `DrainTimeout`. **`db.Close()` runs only if both fully drained.**
-  - **Timeout is PROCESS-TERMINAL (Sol r3 #3).** If the bound elapses with a user still
-    active (a stuck `flock`/fsync/connection), the daemon must **neither close the DB nor
-    release the daemon lock/socket** — releasing single-instance while stuck goroutines
-    still mutate the DB would let a **replacement** daemon start and double-write. So on
-    timeout `Serve` returns a distinct `ErrDrainTimeout` **without** running the
-    lock-release / socket-remove, and the production `aira daemon` command treats it as
-    terminal: `os.Exit(1)`. Process death then atomically releases the lock/socket **and**
-    kills the stuck goroutines — no window where a replacement can overlap a live writer.
-    A regression asserts a timed-out server keeps the lock (a concurrent replacement
-    `Serve` gets `ErrAlreadyRunning`). With the bounded journal (§3), this path is rare
-    (only a genuinely wedged connection/fs), and it is honest — never use-after-close,
-    never a second writer.
-  - The reaper sweep still checks its context **between candidates** so it stops as soon
-    as the current candidate's txn commits — prompt in the common (uncontended) case,
-    and safe (never closing under it) in the pathological one.
+  - **Timeout is PROCESS-TERMINAL, with the lock strongly retained (Sol r3 #3, r4 P0).**
+    If the bound elapses with a user still active (a stuck `fsync`/connection), the daemon
+    must **neither close the DB nor release the daemon lock** — releasing single-instance
+    while stuck goroutines still mutate the DB would let a **replacement** daemon start and
+    double-write. On timeout `Serve` returns a distinct **`ErrDrainTimeout` that carries
+    the lock `*os.File`** (and does not run the lock-release / socket-remove defers), so
+    the lock fd stays **strongly reachable** — a bare local `*os.File` would otherwise be
+    GC-finalizable, closing the flock before the process exits. The production `aira
+    daemon` command, on `ErrDrainTimeout`, **must not return normally**: it holds that
+    error value and calls `os.Exit(1)` immediately (which runs no finalizers/defers, so the
+    fd — and the flock — persist until process death). The **socket pathname is not freed
+    by process death** (only the fd is); the next daemon `unlink`s the stale socket path
+    **after** acquiring the lock (exactly M21's existing stale-socket handling), so a
+    lingering socket file is harmless. A regression: a timed-out server (stuck worker) →
+    force `runtime.GC()` → a concurrent replacement `Serve` still gets `ErrAlreadyRunning`
+    (the flock held by the retained fd was not finalized away).
+  - The reaper sweep checks its context **between candidates** (each a single DB txn), so
+    it stops as soon as the current candidate's txn commits — prompt in the common case,
+    safe in the pathological one.
 
   *(This refines M21's `defer db.Close()` — which closed on drain timeout, a latent
   use-after-close that D1's concurrent DB user makes real.)*
@@ -196,12 +205,14 @@ never-contacted projects) is a clean follow-up, out of D1, and explicitly not pr
   cached-scope lookup (assert concurrency).
 - **Barrier, no overtaking:** a concurrent same-scope request waits on `ready` and does
   not dispatch before the on-build sweep completes (so it too sees the freed lease).
-- **Bounded journal:** with `journal.lock` held by another holder, a reap's journal
-  attempt returns within the bound (lease still freed; event unjournaled → reconciler
-  self-heals) — the sweep/on-build/shutdown never hangs.
-- **Process-terminal timeout:** a wedged connection forcing drain timeout → `Serve`
-  returns `ErrDrainTimeout`, does NOT close the DB or release the lock; a concurrent
-  replacement `Serve` gets `ErrAlreadyRunning` (no double-writer window).
+- **Reaper defers the journal:** a reap commits the lease `UPDATE` + `events`/`outbox`
+  rows but appends **no** `journal.jsonl` inline; with `journal.lock` held by another
+  holder the reap still completes (bounded), and a subsequent `reconcile`/`rebuild`
+  materialises the `lease.lapse` journal line — self-heal.
+- **Process-terminal timeout, GC-safe lock retention:** a wedged connection forcing drain
+  timeout → `Serve` returns `ErrDrainTimeout` carrying the lock `*os.File`, does NOT close
+  the DB or release the lock; force `runtime.GC()`, then a concurrent replacement `Serve`
+  still gets `ErrAlreadyRunning` (the retained fd's flock was not finalized away).
 - **`""`-worktree reap reconciles:** a `lease.lapse` with `worktree_id=""` replays/
   reconciles correctly from an arbitrary worktree.
 - **Idempotent / multi-worktree:** two scopes for one project don't double-reap.
@@ -214,7 +225,8 @@ never-contacted projects) is a clean follow-up, out of D1, and explicitly not pr
   `E_CONFIG_INVALID` daemon-start failure.
 - **e2e (real CLI):** two worktrees; one claims a short-TTL ticket and stops
   heartbeating; after > TTL the reaper frees it and the other claims without `--steal`;
-  the lapse is journaled.
+  the `lease.lapse` is in the DB events (and appears in `journal.jsonl` after a
+  `reconcile`).
 
 ## 8. Risks
 
@@ -226,8 +238,9 @@ never-contacted projects) is a clean follow-up, out of D1, and explicitly not pr
   bounded-drain timeout the daemon does NOT close the DB and does NOT release the
   lock/socket, returning `ErrDrainTimeout` → the command `os.Exit`s (process-terminal);
   the reaper journal is bounded so this path is rare (§3/§5).
-- **R3 — cross-project journal correctness.** *Mitigation:* reap+journal via the owning
-  scope; self-heals via the reconciler on journal failure (§3).
+- **R3 — cross-project event correctness.** *Mitigation:* the reap's DB `events`/`outbox`
+  write goes via the owning project's scope (correct `nextSequence`/`event_counters`); the
+  `journal.jsonl` audit materialises via the reconciler, not inline (§3).
 - **R4 — never-contacted projects unswept.** *Mitigation:* on-scope-build sweep makes
   first contact reap; documented; machine-wide deferred (§4).
 - **R5 — reaper failure impacting the daemon.** *Mitigation:* isolated goroutine, logged,
@@ -243,15 +256,19 @@ never-contacted projects) is a clean follow-up, out of D1, and explicitly not pr
 3. Detection uses an inline expiry check, not a reconstructed private `HeldLease`.
 4. The race test (heartbeat between detect and CAS) and the clock-regression test both
    prove no reap.
-5. `lease.lapse` journaled per-project via the owning scope; actor exactly `aira-daemon`;
-   no invented worktree attribution; a CAS-fail writes no event; journal-failure
-   self-heals via the reconciler.
+5. The reap commits DB-only (lease `UPDATE` + `events`/`outbox`) via the owning project
+   scope — **no inline `journalEvent`** (so it never blocks on the journal fsync); actor
+   exactly `aira-daemon`; `outbox.worktree_id=""`; a CAS-fail writes no event; the
+   `journal.jsonl` line materialises via the reconciler.
 6. Reap-on-scope-build runs before first dispatch (singleflight, **outside `s.mu`**,
    best-effort/non-aborting); periodic sweep deduped by project_id + idempotent;
    `outbox.worktree_id=""` reconciles; never-contacted limitation stated.
-7. Shutdown: `db.Close()` runs **only after** the reaper AND connections drain, and is
-   **skipped on the bounded-drain timeout** (no use-after-close; unclean-but-crash-safe
-   exit) — the invariant is never-use-after-close, not prompt shutdown; `-race` clean;
-   a reaper error never crashes the daemon.
+7. Shutdown: `db.Close()` runs **only after** the reaper AND connections drain; on the
+   bounded-drain timeout it is **skipped**, the daemon lock is **not** released, and
+   `Serve` returns `ErrDrainTimeout` carrying a **strongly-reachable** lock `*os.File` so
+   GC cannot finalize the flock before the command `os.Exit(1)`s (a `runtime.GC()`-forced
+   replacement still gets `ErrAlreadyRunning`). Invariant: never use-after-close, never a
+   second writer — not prompt shutdown; `-race` clean; a reaper error never crashes the
+   daemon.
 8. Config: default 30s; Go-duration grammar; `disabled`/`0` supported; malformed →
    `E_CONFIG_INVALID` start failure.
