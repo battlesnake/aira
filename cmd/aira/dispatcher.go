@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -115,7 +116,16 @@ func (d *daemonDispatcher) dispatchClient(ctx context.Context, scope daemon.Work
 		if !response.OK {
 			return response.CoreResponse()
 		}
-		project, err := app.OpenWithoutStore(ctx, scope.Root, d.diagnostics)
+		project, err := app.Discover(ctx, scope.Root)
+		if err != nil {
+			code := store.ErrorCode(err)
+			return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+		}
+		if err := validateProjectSnapshot(project, scope, d.paths); err != nil {
+			code := store.ErrorCode(err)
+			return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+		}
+		project, err = app.BuildWithoutStore(project, d.diagnostics)
 		if err != nil {
 			code := store.ErrorCode(err)
 			return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
@@ -129,6 +139,39 @@ func (d *daemonDispatcher) dispatchClient(ctx context.Context, scope daemon.Work
 	}
 	defer s.Close()
 	return d.dispatchCarved(ctx, request, s, project)
+}
+
+func validateProjectSnapshot(project app.Project, scope daemon.WorktreeScope, paths daemon.Paths) error {
+	discovered, err := scopeFromProject(project, paths)
+	if err != nil {
+		return err
+	}
+	for _, pair := range [][2]string{
+		{discovered.Root, scope.Root},
+		{discovered.CommonDir, scope.CommonDir},
+		{discovered.GitDir, scope.GitDir},
+	} {
+		left, leftErr := canonicalProjectPath(pair[0])
+		right, rightErr := canonicalProjectPath(pair[1])
+		if leftErr != nil || rightErr != nil || left != right {
+			return errors.New(daemon.CodeProjectInvalid + ": project paths changed after scope discovery")
+		}
+	}
+	if discovered.ProjectID != scope.ProjectID || discovered.WorktreeID != scope.WorktreeID {
+		return errors.New(daemon.CodeProjectInvalid + ": project identity changed after scope discovery")
+	}
+	if discovered.ConfigDigest != scope.ConfigDigest {
+		return errors.New(daemon.CodeProjectInvalid + ": project configuration changed after scope discovery")
+	}
+	return nil
+}
+
+func canonicalProjectPath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(absolute)
 }
 
 func (d *daemonDispatcher) dispatchCarved(ctx context.Context, request core.Request, s core.Store, project app.Project) core.Response {

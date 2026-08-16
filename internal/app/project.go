@@ -234,7 +234,7 @@ func OpenWithDiagnostics(ctx context.Context, cwd string, diagnostics io.Writer)
 	if err != nil {
 		return nil, Project{}, err
 	}
-	project, err = buildClientProject(project, diagnostics)
+	project, err = BuildWithoutStore(project, diagnostics)
 	if err != nil {
 		_ = s.Close()
 		return nil, Project{}, err
@@ -250,10 +250,12 @@ func OpenWithoutStore(ctx context.Context, cwd string, diagnostics io.Writer) (P
 	if err != nil {
 		return Project{}, err
 	}
-	return buildClientProject(project, diagnostics)
+	return BuildWithoutStore(project, diagnostics)
 }
 
-func buildClientProject(project Project, diagnostics io.Writer) (Project, error) {
+// BuildWithoutStore constructs local execution dependencies from one already
+// discovered project snapshot. It does not rediscover or open state.db.
+func BuildWithoutStore(project Project, diagnostics io.Writer) (Project, error) {
 	memoryReserve, admissionMaxWait, err := parsedRunAdmission(project.Config.Run)
 	if err != nil {
 		return Project{}, err

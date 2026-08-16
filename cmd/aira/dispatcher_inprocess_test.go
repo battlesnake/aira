@@ -490,6 +490,45 @@ func TestEnsureScopeFailurePreventsStoreFreeVerbExecution(t *testing.T) {
 	}
 }
 
+func TestStoreFreeDispatchFailsClosedWhenConfigChangesDuringHandshake(t *testing.T) {
+	dispatcher, originalScope, _ := storeFreeDispatcherFixture(t)
+	uniqueConfig := `{"schema":1,"project":{"slug":"demo","prefixes":["UNIQUE"]},"lease":{"ttl_seconds":900,"heartbeat_seconds":30}}`
+	configPath := filepath.Join(originalScope.Root, ".aira", "config")
+	if err := os.WriteFile(configPath, []byte(uniqueConfig+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	scope, err := scopeForCWD(context.Background(), originalScope.Root, dispatcher.paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	owner := t.TempDir()
+	if err := exec.Command("git", "-C", owner, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.Init(context.Background(), owner, map[string]any{"project": "owner", "prefixes": "SHARED"}); err != nil {
+		t.Fatal(err)
+	}
+
+	sharedConfig := `{"schema":1,"project":{"slug":"demo","prefixes":["SHARED"]},"lease":{"ttl_seconds":900,"heartbeat_seconds":30}}`
+	dispatcher.storeOpExchange = func(context.Context, string, daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
+		if err := os.WriteFile(configPath, []byte(sharedConfig+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return daemon.ResponseFrame{OK: true, Code: "OK"}, nil
+	}
+	marker := filepath.Join(originalScope.Root, "must-not-run")
+	response := dispatcher.Dispatch(context.Background(), scope, core.Request{Verb: "run", Args: map[string]any{
+		"argv": []string{"/usr/bin/touch", marker}, "no_admit": true,
+	}})
+	if response.Code != daemon.CodeProjectInvalid || !strings.HasPrefix(response.Error, daemon.CodeProjectInvalid+":") {
+		t.Fatalf("snapshot mismatch response = %+v", response)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("store-free command executed after project snapshot diverged: %v", err)
+	}
+}
+
 func TestEnsureScopeFrameReplacesOlderProtocolDaemon(t *testing.T) {
 	dispatcher := autoStartDispatcher(t)
 	older := startProtocolDaemonProcess(t)

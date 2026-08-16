@@ -133,10 +133,11 @@ func (successfulStoreFreeRunner) Reconcile(context.Context) ([]runner.RunRecord,
 	return nil, nil
 }
 
-func TestStoreGuardIsNeverReachedByStoreFreeCarvedHandlers(t *testing.T) {
+func TestStoreFreeCarvedHandlersNeverInvokeStore(t *testing.T) {
 	execution := successfulStoreFreeRunner{}
 	gitops := &fakeGitOps{result: &gitremote.Result{Op: "fetch", ExitCode: 0}}
-	dispatcher := NewWithRunner(StoreGuard(), execution).WithGitOps(gitops)
+	recorder := &recordingStore{}
+	dispatcher := NewWithRunner(recorder, execution).WithGitOps(gitops)
 	requests := []Request{
 		{Verb: "run", Args: map[string]any{"argv": []string{"true"}}},
 		{Verb: "run", Args: map[string]any{"argv": []string{"true"}, "detach": true}},
@@ -151,17 +152,15 @@ func TestStoreGuardIsNeverReachedByStoreFreeCarvedHandlers(t *testing.T) {
 			t.Fatalf("fixture %+v is not store-free", request)
 		}
 		response := dispatcher.Do(context.Background(), request)
-		if response.Code == "E_DAEMON_INTERNAL" || strings.Contains(response.Error, "unexpectedly used the store") {
-			t.Fatalf("request %+v reached store guard: %+v", request, response)
-		}
 		if response.AfterWrite != nil {
 			if err := response.AfterWrite(true); err != nil {
 				t.Fatalf("complete detached response: %v", err)
 			}
 		}
 	}
-	if _, err := StoreGuard().Get("AIRA-1"); err == nil || err.Error() != "E_DAEMON_INTERNAL: carved verb unexpectedly used the store" {
-		t.Fatalf("guard error = %v", err)
+	count, calls := recorder.calls()
+	if count != 0 || len(calls) != 0 {
+		t.Fatalf("store-free handlers invoked store %d times: %+v", count, calls)
 	}
 }
 
