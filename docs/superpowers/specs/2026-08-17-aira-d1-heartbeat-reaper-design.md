@@ -1,6 +1,6 @@
-# D1 — Daemon heartbeat lease-reaper, v3
+# D1 — Daemon heartbeat lease-reaper, v4
 
-**Status:** plan (Sol plan-review r1+r2 → REQUEST-CHANGES; this is v3). **Milestone:** Phase 5 · D1.
+**Status:** plan (Sol plan-review r1–r3 → REQUEST-CHANGES; this is v4). **Milestone:** Phase 5 · D1.
 **Branch:** `codex-aira-d1`. **Depends on:** M21 (master `44d5948`).
 
 ## 1. Goal
@@ -69,10 +69,17 @@ seq, actor="aira-daemon", "lease.lapse", ticketID)` → `outbox` INSERT → afte
   worktree-agnostic reap — never the dead holder's nor the arbitrary sweeping scope's
   worktree). Reconciliation of a `""`-worktree reap event is tested from an arbitrary
   worktree (Sol r2 #5).
-- **`journalEvent` failure after COMMIT** leaves the row free with the DB
-  `events`/`outbox` rows unjournaled — **identical to `Claim`/`Release` today**; the
-  existing reconciler (`store.Reconcile` replays unjournaled events → `journalEvent`)
-  is the retry, so a reap self-heals like any other lease op. No new retry machinery.
+- **The reaper journals with a BOUNDED, non-blocking `flock` (Sol r3 #2).** `journalEvent`
+  today takes `journal.lock` via a blocking, context-unaware `flock(LOCK_EX)` that can
+  never return under contention — unacceptable for a background sweep that also runs
+  synchronously on-build. The reaper uses a **bounded journal attempt** (`LOCK_NB` with a
+  short deadline, or a ctx-aware acquire); if it cannot journal within the bound, the
+  reap `UPDATE` is **already committed** (the lease is free), the `events`/`outbox` rows
+  are written but unjournaled, and the existing reconciler (`store.Reconcile` replays
+  unjournaled events → `journalEvent`) journals it later. So a reap **self-heals** and no
+  reaper operation ever blocks indefinitely on the journal — this bounds the periodic
+  sweep, the on-build sweep, the singleflight barrier (§4), and shutdown (§5). Client
+  `Claim`/`Release` keep their existing blocking `flock` (synchronous, caller-owned).
 - **Replay/digest** is verb-generic (target+digest), and no gauge consumes lease verbs
   today, so `lease.lapse` needs no new consumer; a doc note records the new verb.
 
@@ -91,9 +98,15 @@ owning project's `Store` scope. D1 sweeps a project's leases at **two** moments:
      returned scope *after* the unlock but *before* dispatching this request. A
      multi-txn sweep + journal fsync must never be held under `s.mu` (it would block
      every project's cached-scope lookup).
-   - **Singleflight:** only the goroutine that *created* the scope runs the on-build
-     sweep (a cache hit does not re-sweep — the periodic reaper covers ongoing decay);
-     `storeForScope` returns a "newly built" flag.
+   - **Singleflight with a readiness barrier (Sol r3 #1):** a naive "creator sweeps, cache
+     hit skips" has an overtaking race — a concurrent same-scope request could take the
+     cache hit and dispatch *before* the creator's sweep finishes, so its plain `Claim`
+     still sees `E_LEASE_EXPIRED`. Instead the cache entry carries a `ready` barrier
+     (a channel closed when the on-build sweep completes): the creator builds+caches the
+     entry (ready open), unlocks `s.mu`, sweeps, then closes `ready`; **every same-scope
+     request waits on `ready` before dispatch**, while other projects' lookups are
+     unblocked. The wait is bounded because the sweep is bounded (§3). The barrier fires
+     once per scope entry; the periodic reaper covers ongoing decay.
    - **Best-effort, non-aborting (Sol r2 #3):** an on-build sweep error (clock/DB/journal)
      is **logged and swallowed** — the request still runs. So "claim without `--steal`"
      is guaranteed **only when the sweep succeeds**; on sweep failure the claim may still
@@ -127,12 +140,19 @@ never-contacted projects) is a clean follow-up, out of D1, and explicitly not pr
   - `Serve`'s cleanup (replacing the bare `defer db.Close()`): signal stop (cancel the
     reaper ctx so it takes no *new* candidate; close the listener so no new accepts),
     then wait for **both** the reaper (`reaperDone`) **and** the connection WaitGroup,
-    bounded by `DrainTimeout`. **`db.Close()` runs only if both fully drained.** If the
-    bound elapses with a user still active (a stuck `flock`/fsync/connection), the daemon
-    **skips `db.Close()`** and exits — the OS reclaims the fd and SQLite's WAL is
-    crash-safe, so the next daemon start recovers cleanly. This eliminates use-after-close
-    for the reaper *and* the pre-existing connection case, honestly, without pretending a
-    blocking `flock` is interruptible.
+    bounded by `DrainTimeout`. **`db.Close()` runs only if both fully drained.**
+  - **Timeout is PROCESS-TERMINAL (Sol r3 #3).** If the bound elapses with a user still
+    active (a stuck `flock`/fsync/connection), the daemon must **neither close the DB nor
+    release the daemon lock/socket** — releasing single-instance while stuck goroutines
+    still mutate the DB would let a **replacement** daemon start and double-write. So on
+    timeout `Serve` returns a distinct `ErrDrainTimeout` **without** running the
+    lock-release / socket-remove, and the production `aira daemon` command treats it as
+    terminal: `os.Exit(1)`. Process death then atomically releases the lock/socket **and**
+    kills the stuck goroutines — no window where a replacement can overlap a live writer.
+    A regression asserts a timed-out server keeps the lock (a concurrent replacement
+    `Serve` gets `ErrAlreadyRunning`). With the bounded journal (§3), this path is rare
+    (only a genuinely wedged connection/fs), and it is honest — never use-after-close,
+    never a second writer.
   - The reaper sweep still checks its context **between candidates** so it stops as soon
     as the current candidate's txn commits — prompt in the common (uncontended) case,
     and safe (never closing under it) in the pathological one.
@@ -174,6 +194,14 @@ never-contacted projects) is a clean follow-up, out of D1, and explicitly not pr
   runs (the claim may then get `E_LEASE_EXPIRED`).
 - **On-build sweep not under `s.mu`:** a slow sweep does not block another project's
   cached-scope lookup (assert concurrency).
+- **Barrier, no overtaking:** a concurrent same-scope request waits on `ready` and does
+  not dispatch before the on-build sweep completes (so it too sees the freed lease).
+- **Bounded journal:** with `journal.lock` held by another holder, a reap's journal
+  attempt returns within the bound (lease still freed; event unjournaled → reconciler
+  self-heals) — the sweep/on-build/shutdown never hangs.
+- **Process-terminal timeout:** a wedged connection forcing drain timeout → `Serve`
+  returns `ErrDrainTimeout`, does NOT close the DB or release the lock; a concurrent
+  replacement `Serve` gets `ErrAlreadyRunning` (no double-writer window).
 - **`""`-worktree reap reconciles:** a `lease.lapse` with `worktree_id=""` replays/
   reconciles correctly from an arbitrary worktree.
 - **Idempotent / multi-worktree:** two scopes for one project don't double-reap.
@@ -193,8 +221,11 @@ never-contacted projects) is a clean follow-up, out of D1, and explicitly not pr
 - **R1 — reaping a live lease.** *Mitigation:* single up-front sample (conservative) +
   the steal-clause CAS re-check under `BEGIN IMMEDIATE` + `RowsAffected()==1` + clock
   regression/unreadable excluded (§2).
-- **R2 — use-after-close on shutdown (incl. drain timeout).** *Mitigation:* LIFO
-  `defer stopReaper()` before `db.Close()` + interruptible sweep (§5).
+- **R2 — use-after-close / double-writer on shutdown (incl. drain timeout).**
+  *Mitigation:* `db.Close()` runs only after the reaper + connections drain; on the
+  bounded-drain timeout the daemon does NOT close the DB and does NOT release the
+  lock/socket, returning `ErrDrainTimeout` → the command `os.Exit`s (process-terminal);
+  the reaper journal is bounded so this path is rare (§3/§5).
 - **R3 — cross-project journal correctness.** *Mitigation:* reap+journal via the owning
   scope; self-heals via the reconciler on journal failure (§3).
 - **R4 — never-contacted projects unswept.** *Mitigation:* on-scope-build sweep makes
