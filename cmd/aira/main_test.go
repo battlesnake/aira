@@ -345,11 +345,11 @@ func TestCLIRunRealCgroupOrClearSkip(t *testing.T) {
 	}
 	defer os.Setenv("XDG_STATE_HOME", oldState)
 	var initOut, initErr bytes.Buffer
-	if exit := Run([]string{"init", "--project", "demo", "--prefix", "AIRA"}, &initOut, &initErr); exit != 0 {
+	if exit := runInProcess([]string{"init", "--project", "demo", "--prefix", "AIRA"}, &initOut, &initErr); exit != 0 {
 		t.Fatalf("init exit=%d stdout=%q stderr=%q", exit, initOut.String(), initErr.String())
 	}
 	var stdout, stderr bytes.Buffer
-	exit := Run([]string{"run", "--json", "--merge", "--", "/bin/sh", "-c", "printf cli-run"}, &stdout, &stderr)
+	exit := runInProcess([]string{"run", "--json", "--merge", "--", "/bin/sh", "-c", "printf cli-run"}, &stdout, &stderr)
 	var response core.Response
 	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
 		t.Fatalf("run response=%q stderr=%q err=%v", stdout.String(), stderr.String(), err)
@@ -365,7 +365,7 @@ func TestCLIRunRealCgroupOrClearSkip(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if exit := Run([]string{"run", "--", "/bin/sh", "-c", "printf cli-run"}, &stdout, &stderr); exit != 0 {
+	if exit := runInProcess([]string{"run", "--", "/bin/sh", "-c", "printf cli-run"}, &stdout, &stderr); exit != 0 {
 		t.Fatalf("text run exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "cli-run\n{") || stderr.Len() != 0 {
@@ -393,7 +393,7 @@ func TestReviewConfiguredPolicyRealCLIIntegration(t *testing.T) {
 	defer os.Setenv("XDG_STATE_HOME", oldState)
 
 	var stdout, stderr bytes.Buffer
-	if exit := Run([]string{"init", "--project", "demo", "--prefix", "AIRA"}, &stdout, &stderr); exit != 0 {
+	if exit := runInProcess([]string{"init", "--project", "demo", "--prefix", "AIRA"}, &stdout, &stderr); exit != 0 {
 		t.Fatalf("init exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
 	}
 	policy := `{"schema":1,"project":{"slug":"demo","prefixes":["AIRA"],"review":{"default_tier":3,"path_tiers":[{"glob":"docs/**","tier":0},{"glob":"internal/store/**","tier":3}],"kind_floor":{"bug":2},"severity_floor":{"P0":3}}},"lease":{"ttl_seconds":900,"heartbeat_seconds":30}}`
@@ -402,7 +402,7 @@ func TestReviewConfiguredPolicyRealCLIIntegration(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if exit := Run([]string{"create", "Configured review", "--kind", "feature", "--severity", "P2"}, &stdout, &stderr); exit != 0 {
+	if exit := runInProcess([]string{"create", "Configured review", "--kind", "feature", "--severity", "P2"}, &stdout, &stderr); exit != 0 {
 		t.Fatalf("create exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
 	}
 
@@ -414,7 +414,7 @@ func TestReviewConfiguredPolicyRealCLIIntegration(t *testing.T) {
 			argv = append(argv, "--paths", paths)
 		}
 		argv = append(argv, "--json")
-		if exit := Run(argv, &stdout, &stderr); exit != 0 {
+		if exit := runInProcess(argv, &stdout, &stderr); exit != 0 {
 			t.Fatalf("review %q exit=%d stdout=%q stderr=%q", paths, exit, stdout.String(), stderr.String())
 		}
 		var response core.Response
@@ -451,7 +451,7 @@ func TestReviewConfiguredPolicyRealCLIIntegration(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if exit := Run([]string{"review", "NOPE-9", "--paths", "docs/x.md", "--json"}, &stdout, &stderr); exit != 2 {
+	if exit := runInProcess([]string{"review", "NOPE-9", "--paths", "docs/x.md", "--json"}, &stdout, &stderr); exit != 2 {
 		t.Fatalf("missing selector exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
 	}
 	var missing core.Response

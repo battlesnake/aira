@@ -118,6 +118,14 @@ type InitResult struct {
 	Created  bool     `json:"created"`
 }
 
+// InitPlan is a validated bootstrap descriptor. Preparing it performs git
+// discovery but does not open the machine DB or write the config file, allowing
+// the daemon to register it through its already-open shared DB first.
+type InitPlan struct {
+	Project Project
+	Data    []byte
+}
+
 func Discover(ctx context.Context, cwd string) (Project, error) {
 	root, err := gitValue(ctx, cwd, "--show-toplevel")
 	if err != nil {
@@ -157,6 +165,41 @@ func Discover(ctx context.Context, cwd string) (Project, error) {
 		Root: root, CommonDir: common, GitDir: gitDir,
 		ProjectID: hashID(canonicalCommon), WorktreeID: hashID(canonicalGitDir),
 		ConfigPath: configPath, Config: config, StateDir: stateDir(),
+	}, nil
+}
+
+// DiscoverBootstrap returns git identity before .aira/config exists. It is
+// read-only and is used by the client to describe a routed init request.
+func DiscoverBootstrap(ctx context.Context, cwd string) (Project, error) {
+	root, err := gitValue(ctx, cwd, "--show-toplevel")
+	if err != nil {
+		return Project{}, errors.New("E_NOT_PROJECT: aira init requires a git repository")
+	}
+	root, err = filepath.Abs(strings.TrimSpace(root))
+	if err != nil {
+		return Project{}, err
+	}
+	common, err := gitValue(ctx, root, "--git-common-dir")
+	if err != nil {
+		return Project{}, errors.New("E_NOT_PROJECT: git common directory is unavailable")
+	}
+	common = absoluteGitPath(root, strings.TrimSpace(common))
+	gitDir, err := gitValue(ctx, root, "--git-dir")
+	if err != nil {
+		return Project{}, errors.New("E_NOT_PROJECT: worktree git directory is unavailable")
+	}
+	gitDir = absoluteGitPath(root, strings.TrimSpace(gitDir))
+	canonicalCommon, err := filepath.EvalSymlinks(common)
+	if err != nil {
+		canonicalCommon = common
+	}
+	canonicalGitDir, err := filepath.EvalSymlinks(gitDir)
+	if err != nil {
+		canonicalGitDir = gitDir
+	}
+	return Project{
+		Root: root, CommonDir: common, GitDir: gitDir,
+		ProjectID: hashID(canonicalCommon), WorktreeID: hashID(canonicalGitDir), StateDir: stateDir(),
 	}, nil
 }
 
@@ -230,19 +273,51 @@ func OpenWithDiagnostics(ctx context.Context, cwd string, diagnostics io.Writer)
 }
 
 func Init(ctx context.Context, cwd string, args map[string]any) (InitResult, error) {
+	plan, err := PrepareInit(ctx, cwd, args)
+	if err != nil {
+		return InitResult{}, err
+	}
+	project := plan.Project
+	reviewPolicy, err := store.LoadReviewPolicy(project.Config.Project.Review)
+	if err != nil {
+		return InitResult{}, err
+	}
+	s, err := store.Open(ctx, store.Options{
+		Root: project.Root, CommonDir: project.CommonDir, GitDir: project.GitDir,
+		DBPath: filepath.Join(project.StateDir, "state.db"), RegistryPath: filepath.Join(project.StateDir, "registry.jsonl"),
+		ProjectID: project.ProjectID, WorktreeID: project.WorktreeID,
+		ProjectSlug: project.Config.Project.Slug, Prefixes: project.Config.Project.Prefixes,
+		ReviewPolicy: reviewPolicy, LeaseTTLNS: leaseTTLNS(project.Config),
+	})
+	if err != nil {
+		return InitResult{}, err
+	}
+	if err := CommitInit(plan); err != nil {
+		_ = s.Close()
+		return InitResult{}, err
+	}
+	if err := s.Close(); err != nil {
+		return InitResult{}, err
+	}
+	return plan.Result(cwd)
+}
+
+// PrepareInit validates and discovers an init bootstrap without opening state.db
+// or writing .aira/config.
+func PrepareInit(ctx context.Context, cwd string, args map[string]any) (InitPlan, error) {
 	root, err := gitValue(ctx, cwd, "--show-toplevel")
 	if err != nil {
-		return InitResult{}, errors.New("E_NOT_PROJECT: aira init requires a git repository")
+		return InitPlan{}, errors.New("E_NOT_PROJECT: aira init requires a git repository")
 	}
 	root, err = filepath.Abs(strings.TrimSpace(root))
 	if err != nil {
-		return InitResult{}, err
+		return InitPlan{}, err
 	}
 	configPath := filepath.Join(root, ".aira", "config")
 	if _, err := os.Stat(configPath); err == nil {
-		return InitResult{}, errors.New("E_ALREADY_INITIALIZED: .aira/config already exists")
+		return InitPlan{}, errors.New("E_ALREADY_INITIALIZED: .aira/config already exists")
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return InitResult{}, err
+		return InitPlan{}, err
 	}
 	slug := stringArg(args, "project")
 	if slug == "" {
@@ -257,24 +332,24 @@ func Init(ctx context.Context, cwd string, args map[string]any) (InitResult, err
 	}
 	config := Config{Schema: 1, Project: ProjectConfig{Slug: slug, Prefixes: prefixes}, Lease: LeaseConfig{TTLSeconds: 900, HeartbeatSeconds: 30}}
 	if err := validateConfig(config); err != nil {
-		return InitResult{}, err
+		return InitPlan{}, err
 	}
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
-		return InitResult{}, err
+		return InitPlan{}, err
 	}
 	data = append(data, '\n')
 	if err := os.MkdirAll(filepath.Join(root, ".aira", "tickets"), 0o755); err != nil {
-		return InitResult{}, err
+		return InitPlan{}, err
 	}
 	common, err := gitValue(ctx, root, "--git-common-dir")
 	if err != nil {
-		return InitResult{}, errors.New("E_NOT_PROJECT: git common directory is unavailable")
+		return InitPlan{}, errors.New("E_NOT_PROJECT: git common directory is unavailable")
 	}
 	common = absoluteGitPath(root, strings.TrimSpace(common))
 	gitDir, err := gitValue(ctx, root, "--git-dir")
 	if err != nil {
-		return InitResult{}, errors.New("E_NOT_PROJECT: worktree git directory is unavailable")
+		return InitPlan{}, errors.New("E_NOT_PROJECT: worktree git directory is unavailable")
 	}
 	gitDir = absoluteGitPath(root, strings.TrimSpace(gitDir))
 	canonicalCommon, err := filepath.EvalSymlinks(common)
@@ -285,41 +360,35 @@ func Init(ctx context.Context, cwd string, args map[string]any) (InitResult, err
 	if err != nil {
 		canonicalGitDir = gitDir
 	}
-	state := stateDir()
-	reviewPolicy, err := store.LoadReviewPolicy(config.Project.Review)
-	if err != nil {
-		return InitResult{}, err
-	}
-	s, err := store.Open(ctx, store.Options{
+	return InitPlan{Project: Project{
 		Root: root, CommonDir: common, GitDir: gitDir,
-		DBPath: filepath.Join(state, "state.db"), RegistryPath: filepath.Join(state, "registry.jsonl"),
-		ProjectID: hashID(canonicalCommon), WorktreeID: hashID(canonicalGitDir), ProjectSlug: slug, Prefixes: prefixes,
-		ReviewPolicy: reviewPolicy,
-		LeaseTTLNS:   leaseTTLNS(config),
-	})
-	if err != nil {
-		return InitResult{}, err
-	}
-	if err := writeConfig(configPath, data); err != nil {
-		_ = s.Close()
-		return InitResult{}, err
-	}
-	if err := s.Close(); err != nil {
-		return InitResult{}, err
-	}
+		ProjectID: hashID(canonicalCommon), WorktreeID: hashID(canonicalGitDir),
+		ConfigPath: configPath, Config: config, StateDir: stateDir(),
+	}, Data: data}, nil
+}
+
+// CommitInit writes the config prepared by PrepareInit.
+func CommitInit(plan InitPlan) error {
+	return writeConfig(plan.Project.ConfigPath, plan.Data)
+}
+
+// Result presents a prepared init relative to the caller, preserving the
+// existing CLI contract.
+func (plan InitPlan) Result(cwd string) (InitResult, error) {
+	project := plan.Project
 	cwdAbs, err := filepath.Abs(cwd)
 	if err != nil {
 		return InitResult{}, err
 	}
-	relRoot, err := filepath.Rel(cwdAbs, root)
+	relRoot, err := filepath.Rel(cwdAbs, project.Root)
 	if err != nil {
 		return InitResult{}, err
 	}
-	relConfig, err := filepath.Rel(cwdAbs, configPath)
+	relConfig, err := filepath.Rel(cwdAbs, project.ConfigPath)
 	if err != nil {
 		return InitResult{}, err
 	}
-	return InitResult{Root: filepath.ToSlash(relRoot), Config: filepath.ToSlash(relConfig), Project: slug, Prefixes: prefixes, Created: true}, nil
+	return InitResult{Root: filepath.ToSlash(relRoot), Config: filepath.ToSlash(relConfig), Project: project.Config.Project.Slug, Prefixes: project.Config.Project.Prefixes, Created: true}, nil
 }
 
 func leaseTTLNS(config Config) uint64 {

@@ -235,7 +235,7 @@ func TestSkillExamplesReachCoreFromRun(t *testing.T) {
 	}
 	defer os.Setenv("XDG_STATE_HOME", oldState)
 	var initOut, initErr bytes.Buffer
-	if exit := Run([]string{"init", "--project", "demo", "--prefix", "AIRA"}, &initOut, &initErr); exit != 0 {
+	if exit := runInProcess([]string{"init", "--project", "demo", "--prefix", "AIRA"}, &initOut, &initErr); exit != 0 {
 		t.Fatalf("init exit=%d stdout=%q stderr=%q", exit, initOut.String(), initErr.String())
 	}
 	artifacts, err := core.GenerateSkillArtifacts(core.New(nil).DispatchDescriptors())
@@ -282,9 +282,9 @@ func TestSkillExamplesReachCoreFromRun(t *testing.T) {
 			default:
 				t.Fatalf("test-report add example has unsupported format %q: argv=%v", format, argv)
 			}
-			exit = runWithInput(fullArgv, &stdout, &stderr, strings.NewReader(body))
+			exit = runInProcessWithInput(fullArgv, &stdout, &stderr, strings.NewReader(body))
 		} else {
-			exit = Run(fullArgv, &stdout, &stderr)
+			exit = runInProcess(fullArgv, &stdout, &stderr)
 		}
 		var response struct {
 			Code string `json:"code"`

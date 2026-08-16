@@ -3,14 +3,17 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"aira/internal/app"
 	"aira/internal/core"
+	"aira/internal/daemon"
 	"aira/internal/domain"
 	"aira/internal/runner"
 	"aira/internal/store"
@@ -21,15 +24,29 @@ func main() { os.Exit(Run(os.Args[1:], os.Stdout, os.Stderr)) }
 // Run is the deliberately small CLI adapter: argv parsing, core request
 // construction, and rendering. It contains no ticket or consistency logic.
 func Run(argv []string, stdout, stderr io.Writer) int {
-	return runWithInput(argv, stdout, stderr, os.Stdin)
+	return runWithInputDispatcher(argv, stdout, stderr, os.Stdin, nil)
+}
+
+// RunWithDispatcher is the injected in-process substrate used by tests. The
+// production entrypoint calls Run and therefore always constructs the
+// daemon-backed dispatcher for routed operations.
+func RunWithDispatcher(argv []string, stdout, stderr io.Writer, dispatcher Dispatcher) int {
+	return runWithInputDispatcher(argv, stdout, stderr, os.Stdin, dispatcher)
 }
 
 func runWithInput(argv []string, stdout, stderr io.Writer, stdin io.Reader) int {
+	return runWithInputDispatcher(argv, stdout, stderr, stdin, nil)
+}
+
+func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Reader, injected Dispatcher) int {
 	if len(argv) > 0 && argv[0] == "__supervise" {
 		return runSupervisor(argv[1:], stderr)
 	}
+	if len(argv) > 0 && strings.ToLower(argv[0]) == "daemon" {
+		return runDaemonCommand(argv[1:], stdout, stderr)
+	}
 	if len(argv) > 0 && strings.ToLower(argv[0]) == "mcp" {
-		return runMCP(context.Background(), os.Stdin, stdout, stderr)
+		return runMCPWithDispatcher(context.Background(), os.Stdin, stdout, stderr, injected)
 	}
 	if len(argv) > 0 && strings.ToLower(argv[0]) == "skill" {
 		return runSkill(argv[1:], stdout, stderr)
@@ -58,10 +75,25 @@ func runWithInput(argv []string, stdout, stderr io.Writer, stdin io.Reader) int 
 		if value := options["prefixes"]; value != "" {
 			requestArgs["prefixes"] = splitComma(value)
 		}
-		dispatcher := core.NewWithInitializer(nil, func(ctx context.Context, initArgs map[string]any) (any, error) {
-			return app.Init(ctx, ".", initArgs)
-		})
-		return render(dispatcher.Do(context.Background(), core.Request{Verb: "init", Args: requestArgs}), jsonOutput, stdout, stderr)
+		paths, pathErr := daemon.PathsFromEnv()
+		if pathErr != nil {
+			return render(transportErrorResponse(pathErr), jsonOutput, stdout, stderr)
+		}
+		project, discoverErr := app.DiscoverBootstrap(context.Background(), ".")
+		if discoverErr != nil {
+			code := appErrorCode(discoverErr)
+			return render(core.Response{Code: code, Error: discoverErr.Error(), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
+		}
+		dispatcher := injected
+		if dispatcher == nil {
+			dispatcher, err = newDaemonDispatcher(stdin, stdout, stderr, jsonOutput)
+			if err != nil {
+				return render(transportErrorResponse(err), jsonOutput, stdout, stderr)
+			}
+		}
+		response := dispatcher.Dispatch(context.Background(), bootstrapScope(project, paths), core.Request{Verb: "init", Args: requestArgs})
+		relativiseInitResponse(&response, ".")
+		return render(response, jsonOutput, stdout, stderr)
 	}
 
 	request, err := buildRequest(verb, positional, options)
@@ -116,19 +148,30 @@ func runWithInput(argv []string, stdout, stderr io.Writer, stdin io.Reader) int 
 			request.Args["raw"] = data
 		}
 	}
-	s, project, err := app.OpenWithDiagnostics(context.Background(), ".", stderr)
+	if err := prepareImportContent(&request); err != nil {
+		code := store.ErrorCode(err)
+		return render(core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
+	}
+	paths, err := daemon.PathsFromEnv()
+	if err != nil {
+		return render(transportErrorResponse(err), jsonOutput, stdout, stderr)
+	}
+	scope, err := scopeForCWD(context.Background(), ".", paths)
 	if err != nil {
 		code := appErrorCode(err)
 		return render(core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
 	}
-	defer s.Close()
 	faceStdout := &lineTrackingWriter{w: stdout}
-	dispatcher := core.NewWithRunnerFace(s, project.Runner, stdin, core.FaceOutput{
-		Stdout: faceStdout,
-		Stderr: stderr,
-		Live:   (verb == "run" || verb == "git") && !jsonOutput,
-	}).WithGitOps(project.GitOps)
-	response := dispatcher.Do(context.Background(), request)
+	dispatcher := injected
+	if dispatcher == nil {
+		dispatcher, err = newDaemonDispatcher(stdin, faceStdout, stderr, jsonOutput)
+		if err != nil {
+			return render(transportErrorResponse(err), jsonOutput, stdout, stderr)
+		}
+	} else if local, ok := dispatcher.(*inProcessDispatcher); ok {
+		local.stdin, local.stdout, local.diagnostics, local.jsonOutput = stdin, faceStdout, stderr, jsonOutput
+	}
+	response := dispatcher.Dispatch(context.Background(), scope, request)
 	if verb == "run-log" && !jsonOutput {
 		return renderRunLog(response, stdout, stderr)
 	}
@@ -951,6 +994,67 @@ func splitComma(value string) []string {
 		return nil
 	}
 	return strings.Split(value, ",")
+}
+
+func bootstrapScope(project app.Project, paths daemon.Paths) daemon.WorktreeScope {
+	return daemon.WorktreeScope{
+		Root: project.Root, CommonDir: project.CommonDir, GitDir: project.GitDir,
+		ProjectID: project.ProjectID, WorktreeID: project.WorktreeID,
+		StateID: paths.StateID, Bootstrap: true,
+	}
+}
+
+func prepareImportContent(request *core.Request) error {
+	if request == nil {
+		return nil
+	}
+	canonical := core.CanonicalVerb(request.Verb)
+	isImport := canonical == "import"
+	if canonical == "req" {
+		subverb, _ := request.Args["subverb"].(string)
+		isImport = strings.EqualFold(subverb, "import")
+	}
+	if !isImport {
+		return nil
+	}
+	path, _ := request.Args["file"].(string)
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("E_IMPORT_INVALID: cannot resolve import file %q: %w", path, err)
+	}
+	data, err := os.ReadFile(abs)
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("E_NOT_FOUND: import file %q does not exist", path)
+	}
+	if err != nil {
+		return fmt.Errorf("E_IMPORT_INVALID: cannot read import file %q: %w", path, err)
+	}
+	request.Args["file"] = abs
+	request.Content = data
+	return nil
+}
+
+func relativiseInitResponse(response *core.Response, cwd string) {
+	if response == nil || !response.OK {
+		return
+	}
+	data, ok := response.Data.(map[string]any)
+	if !ok {
+		return
+	}
+	cwdAbs, err := filepath.Abs(cwd)
+	if err != nil {
+		return
+	}
+	for _, key := range []string{"root", "config"} {
+		path, ok := data[key].(string)
+		if !ok || !filepath.IsAbs(path) {
+			continue
+		}
+		if relative, err := filepath.Rel(cwdAbs, path); err == nil {
+			data[key] = filepath.ToSlash(relative)
+		}
+	}
 }
 
 func render(response core.Response, jsonOutput bool, stdout, stderr io.Writer) int {

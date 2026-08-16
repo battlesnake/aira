@@ -18,6 +18,7 @@ type mcpProvider func(context.Context, core.Request) (*core.Core, func(), error)
 
 type mcpServer struct {
 	provider mcpProvider
+	dispatch func(context.Context, core.Request) core.Response
 	tools    []mcpTool
 	byName   map[string]mcpToolBinding
 }
@@ -302,6 +303,9 @@ func (s *mcpServer) call(ctx context.Context, id any, raw json.RawMessage) mcpRe
 	request, err := decodeMCPRequest(binding, params.Arguments)
 	if err != nil {
 		return protocolResponse(id, -32602, err.Error(), stableArgumentData(err.Error()))
+	}
+	if s.dispatch != nil {
+		return toolResponse(id, s.dispatch(ctx, request))
 	}
 	dispatcher, closeFn, err := s.provider(ctx, request)
 	if err != nil {
