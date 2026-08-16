@@ -1,40 +1,49 @@
-# D1 — Daemon heartbeat lease-reaper, v1
+# D1 — Daemon heartbeat lease-reaper, v2
 
-**Status:** plan (pre Sol plan-review). **Milestone:** Phase 5 · D1 (M21 deferral D1).
+**Status:** plan (Sol plan-review r1 → REQUEST-CHANGES; this is v2). **Milestone:** Phase 5 · D1.
 **Branch:** `codex-aira-d1`. **Depends on:** M21 (master `44d5948`).
 
 ## 1. Goal
 
-Today a held lease's liveness is evaluated **lazily** — only inside `Claim`/`Release`/
-`Heartbeat`/area-touch — so a dead session's lease lapses only when *someone else*
-tries to claim or steal it (`domain.HeldLease.IsLive`, `lease.go`). D1 adds the
-M21 daemon's **heartbeat reaper**: on a timer, the long-lived daemon proactively
-frees **positively-expired** leases held by projects it is serving, so a new session
-can claim without needing `--steal` and without waiting for a lazy trigger.
+Held-lease liveness is evaluated **lazily** today — only inside `Claim`/`Release`/
+`Heartbeat`/area-touch (`domain.HeldLease.IsLive`) — and a plain `Claim` on an expired
+lease **fails `E_LEASE_EXPIRED`** unless `--steal` is passed (`lease.go`): it does NOT
+auto-free. So a dead session's lease strands until someone explicitly steals it. D1
+adds the M21 daemon's **heartbeat reaper**: it proactively frees **positively-expired**
+leases so a later `Claim` succeeds with no `--steal` and no manual intervention.
 
-**Honesty invariants (the whole point):**
-- **Only a positively-expired lease is reaped.** A lease is reaped iff, under the
-  writer lock, its liveness is definitively false — the boot-id differs (a prior
-  boot) **or** `mono_now - last_heartbeat >= ttl` on the monotonic/DB clock. A lease
-  that is live, or whose liveness cannot be *evaluated* (clock unreadable, boot-id
-  unknown), is **never** reaped. The reaper never guesses.
-- **The reap re-checks under the lock** (§2), so a lease heartbeated between detection
-  and the free is not reaped — no race with a live holder.
-- **Never a fake free.** A reap is a real, journaled state transition (a `lease.lapse`
-  event, §3); it is not silently applied.
+**Honesty invariants:**
+- **Only a positively-expired lease is reaped** — under the writer lock, boot-id
+  differs (prior boot) **or** `mono_now - last_heartbeat >= ttl`. A live lease, or one
+  whose liveness cannot be *evaluated* (clock unreadable / boot-id unknown / clock
+  regression `mono_now < last`), is **never** reaped.
+- **The free re-checks under the lock** (§2) — a lease heartbeated/stolen between
+  detection and the free is not reaped (a live holder always wins).
+- **A reap is a real, journaled transition** (`lease.lapse`, §3), never silent.
 
 ## 2. The reap CAS
 
-Reaping mirrors the existing steal guard (`lease.go` Claim-from-held) exactly. It is a
-**two-phase** sweep per project scope:
+Per project scope, a **two-phase** sweep with a **single clock sample per sweep**:
 
-1. **Detect (read):** `SELECT ticket_id, generation, boot_id, last_heartbeat_mono_ns,
-   ttl_ns FROM leases WHERE project_id=? AND state='held'`. Candidate = a row that is
-   `!IsLive` under a freshly sampled clock (boot-id mismatch or expired). This read is
-   advisory — the authoritative check is the CAS.
-2. **Free (per-candidate CAS):** for each candidate, in a dedicated `withImmediate`
-   (`BEGIN IMMEDIATE`) transaction, **sample the clock *after* the lock is held** (so
-   the guard sample cannot predate the row it inspects, as Claim does), then:
+1. **Sample once, up front:** take one `sampleClock` (→ `boot_id` + `mono_now`) at the
+   start of the sweep. **If it fails (read error / empty boot-id / out-of-range), the
+   sweep is abandoned — zero leases reaped** (never a reap on an unreadable clock).
+   Sampling once means "clock unreadable ⇒ zero reaps" holds even though each free is
+   its own committed transaction (Sol r1 P1). A single up-front sample is *safe*: a
+   lease heartbeated after the sample has `last > mono_now`, so the SQL guard
+   `mono_now >= last` fails and it is **not** reaped (the reaper only becomes more
+   conservative, never freeing a since-revived lease). An expired lease missed because
+   the sample is slightly stale is simply reaped next sweep.
+2. **Detect (read):** `SELECT ticket_id, generation, boot_id, last_heartbeat_mono_ns,
+   ttl_ns FROM leases WHERE project_id=? AND state='held'`. A candidate is a row that is
+   **expired** by an inline check (not the private `HeldLease`, which needs
+   token/actor/worktree the reaper doesn't reconstruct):
+   `expired = (row.boot_id != sample.boot_id) || (mono_now >= row.last && mono_now - row.last >= row.ttl)`
+   — the SQL/Go mirror of `!IsLive`, with the clock-regression case (`mono_now < last`)
+   **deliberately excluded** (fail-closed: unknown ⇒ don't reap). This read is advisory.
+3. **Free (per-candidate CAS):** for each candidate, in its own `withImmediate`
+   (`BEGIN IMMEDIATE`) txn, run the guarded UPDATE — **the exact steal expiry clause**
+   (`lease.go` Claim-from-held), not a bare "negation of Heartbeat":
    ```sql
    UPDATE leases SET state='free', generation=generation+1,
        holder_token_hash=NULL, boot_id=NULL, last_heartbeat_mono_ns=NULL,
@@ -43,124 +52,139 @@ Reaping mirrors the existing steal guard (`lease.go` Claim-from-held) exactly. I
      AND (boot_id <> ? OR (? >= last_heartbeat_mono_ns
                            AND ? - last_heartbeat_mono_ns >= ttl_ns))
    ```
-   `RowsAffected()` **must be 1** to count as a reap. `0` means the lease was
-   heartbeated / released / stolen (or its generation moved) since detection → **skip,
-   not an error** (a live holder wins). The guard is the exact negation of the
-   Heartbeat renew guard, and matches the steal expiry clause (incl. the boot-id branch
-   that frees a prior-boot lease).
-- The clock is sampled once per CAS via the same `sampleClock`/`systemClock`
-  (`CLOCK_MONOTONIC` + `boot_id`) the store already uses. **If the clock is unreadable
-  (empty boot-id / sample error), the whole sweep is abandoned as *unevaluated* — zero
-  leases reaped** — never a reap on an unknown clock.
-- One transaction **per reaped lease** (like Claim/Release), so a slow journal or a
-  contended row never blocks the others and each reap is independently guarded.
+   with the sweep's `boot_id`/`mono_now` bound in. `RowsAffected()` **must be 1** to
+   count as a reap; `0` (heartbeated / released / stolen / generation moved since
+   detection) → **skip, not an error, no event**. The clock-regression `mono_now < last`
+   makes the guard false → not reaped.
 
 ## 3. The journaled `lease.lapse` event
 
-A reap is journaled exactly like `lease.claim`/`lease.release` (Heartbeat is not
-journaled; reap is a real transition, so it is): inside the same `withImmediate`,
-`nextSequence` → `insertEventActor(projectID, seq, actor, "lease.lapse", ticketID)` →
-`outbox` INSERT → after commit `journalEvent(ctx, projectID, seq)` (append to the
-project's `<commonDir>/aira/journal.jsonl`). The actor is a stable daemon actor
-(e.g. `aira-daemon`). Because `nextSequence`/`event_counters` and `journalEvent`'s
-audit dir are **per-project**, the reap+journal for project P runs through **P's own
-`Store` scope** (§4) — never a raw cross-project handle.
+A reap is journaled like `lease.claim`/`release` (Heartbeat isn't journaled; a reap is
+a real transition): inside the free txn, `nextSequence` → `insertEventActor(projectID,
+seq, actor="aira-daemon", "lease.lapse", ticketID)` → `outbox` INSERT → after commit
+`journalEvent(ctx, projectID, seq)` to the project's `<commonDir>/aira/journal.jsonl`.
 
-## 4. Scope of the sweep — per active daemon scope (machine-wide detect deferred)
+- **Actor is the exact stable value `aira-daemon`** (a daemon-initiated mutation; no
+  worktree attribution is invented — the reap is not a worktree's action; any
+  outbox/worktree column the schema requires is left NULL/daemon, never the dead
+  holder's or the arbitrary sweeping scope's).
+- **`journalEvent` failure after COMMIT** leaves the row free with the DB
+  `events`/`outbox` rows unjournaled — **identical to `Claim`/`Release` today**; the
+  existing reconciler (`store.Reconcile` replays unjournaled events → `journalEvent`)
+  is the retry, so a reap self-heals like any other lease op. No new retry machinery.
+- **Replay/digest** is verb-generic (target+digest), and no gauge consumes lease verbs
+  today, so `lease.lapse` needs no new consumer; a doc note records the new verb.
+
+## 4. Scope: reap-on-scope-build + periodic reap (closes the restart gap, Sol r1 P1)
 
 Leases live in one machine-wide `state.db` keyed by `project_id`, but every write path
-(per-project `event_counters`, per-scope journal dir) is **per-project**. D1 sweeps
-**each project scope the daemon is actively serving** — the `Server.scopes` cache
-(built when a client contacts a project), **deduplicated by `project_id`** (multiple
-worktree scopes share one project's leases; the per-project sweep is idempotent). For
-each such project, run `Store.ReapExpiredLeases(ctx)` (§2/§3) on its scope.
+(`event_counters`, journal dir) is per-project — so a sweep must run through the
+owning project's `Store` scope. D1 sweeps a project's leases at **two** moments:
 
-**Honest limitation:** a project the daemon has **not** been contacted for this
-session (no cached scope) is not swept proactively; its expired leases still lapse
-**lazily** on the next claim/steal (unchanged from today), and are swept on the next
-tick once any request builds that project's scope. This covers the real case — a dead
-session's lease in a project the daemon is serving is freed proactively — while
-avoiding new cross-project write plumbing. A **machine-wide** sweep (one unfiltered
-`leases` read → resolve `project_id`→`common_dir` via the `projects` table → per-project
-CAS+journal) is a clean follow-up if idle-uncontacted-project reaping is ever needed;
-it is out of D1.
+1. **On scope build (synchronous, first contact):** when the daemon first builds a
+   project's scope (`storeForScope`), it runs one sweep **before** serving the request.
+   So the *first* `Claim`/verb after a daemon restart reaps that project's dead leases
+   up front — the claim then sees a free lease and succeeds with no `--steal`. This
+   closes the daemon-restart gap without machine-wide plumbing.
+2. **Periodically (the timer, §5):** for every currently-cached scope, deduplicated by
+   `project_id` (multiple worktree scopes share one project's leases; the per-project
+   sweep is idempotent), reap on the interval.
 
-## 5. The daemon timer
+**Honest limitation:** a project **never contacted** this daemon session (no cached
+scope) is not swept until its first contact — but that first contact (any request,
+including the claim itself) triggers the on-build sweep, so no user ever observes a
+strand they can't clear by simply retrying/contacting. A fully machine-wide sweep
+(scan `projects.common_dir` → per-project reap of never-contacted projects) is a clean
+follow-up, out of D1, and explicitly **not** promised here.
 
-A **reaper goroutine** starts in `Server.Serve` beside the accept loop:
+## 5. The daemon timer + shutdown (fixes Sol r1 P0)
 
-- A ticker fires every `reapInterval` (§6). On each tick it snapshots the current
-  scope set (under the `scopes` mutex), dedupes by `project_id`, and runs the per-scope
-  sweep. A sweep never blocks accept (separate goroutine).
-- It selects on `ctx.Done()`/`stopping` to exit, and is **joined into the graceful
-  drain** — added to a WaitGroup the `drained` computation waits on — so `db.Close()`
-  cannot run until the reaper's in-flight sweep/CAS finishes (no use-after-close on the
-  shared `*store.DB`). On shutdown it stops ticking, finishes the current sweep, exits.
-- A sweep error (e.g. a transient IO) is logged to the daemon diagnostics and the
-  ticker continues; a reaper failure never crashes the daemon or a served request.
+- A **reaper goroutine** starts in `Server.Serve`, driven by a ticker at `reapInterval`
+  (§6), each tick snapshotting the scope set (under the `scopes` mutex), deduping by
+  `project_id`, sweeping each.
+- **Definitive stop-and-join before `db.Close` (not merely the bounded drain).** The
+  reaper runs under a dedicated cancelable context and signals a `reaperDone` channel on
+  exit. `Serve` registers `defer stopReaper()` **after** the reaper starts, so — because
+  the `defer db.Close()` was registered earlier and defers run LIFO — `stopReaper()`
+  (cancel + `<-reaperDone`) runs **before** `db.Close()` on *every* return path,
+  including a drain **timeout** and a non-cancellation accept error. The sweep is
+  **interruptible** — it checks its context between candidates — so stop is prompt and
+  cannot outlive the DB. This is independent of the connection drain (which the P0 note
+  showed is insufficient on timeout).
+- A sweep error is logged to daemon diagnostics; the ticker continues; a reaper failure
+  never crashes accept or a served request.
 
 ## 6. Config
 
-`reapInterval` is a **daemon-level** knob (not the per-project `LeaseConfig` — the
-reaper needs no config: `ttl_ns` is per lease row). Default a sensible value well below
-the default TTL (e.g. **30s**, with the default `ttl_seconds`=900), overridable via
-`AIRA_DAEMON_REAP_INTERVAL` (a duration; ≤0 or unset → default; a `disabled` sentinel
-turns the reaper off for testing). The interval only affects *promptness*; correctness
-(never reap a live lease) does not depend on it.
+`reapInterval` is a **daemon-level** env knob (the reaper needs no per-project config —
+`ttl_ns` is per row): `AIRA_DAEMON_REAP_INTERVAL`.
+
+- **Grammar:** a Go duration string (`time.ParseDuration`, e.g. `"30s"`, `"2m"`).
+- **Default (unset):** `30s` (well below the default `ttl_seconds`=900; interval only
+  affects promptness, never correctness).
+- **Off:** the exact values `disabled` or `0` disable the periodic timer (a
+  **production-supported** setting); the on-scope-build sweep still runs (it is part of
+  correctness, not the timer). *(Or, if reviewers prefer, `disabled` also skips
+  on-build — decide: default keeps on-build, `disabled` = no periodic only.)*
+- **Malformed:** a non-empty unparseable value → the daemon **fails to start** with
+  `E_CONFIG_INVALID` (fail-closed, clear message) — never a silent fallback.
 
 ## 7. Testing
 
-- **Reap frees an expired lease + journals:** claim a lease with a tiny TTL via an
-  injected clock, advance the clock past TTL, run the sweep → the lease is `free`
-  (generation+1, holder cols NULL) and a `lease.lapse` event is in the project journal.
-- **A live lease is never reaped:** a heartbeated lease survives a sweep; a lease whose
-  TTL has *not* elapsed is untouched.
-- **Race with a live holder (the key honesty test):** between detect and the CAS, the
-  lease is heartbeated (via a `beforeReapCAS` seam) → `RowsAffected()==0`, the lease
-  stays held, no `lease.lapse` — the reaper loses to the live holder.
-- **Boot-id mismatch reaped:** a lease from a prior boot-id is reaped (prior-boot
-  liveness is definitively false).
-- **Unevaluated clock → no reap:** an injected clock returning an empty boot-id / error
-  abandons the sweep; zero leases reaped.
-- **Generation CAS:** a lease stolen (generation bumped) between detect and CAS is not
-  reaped by the stale-generation guard.
-- **Idempotent / multi-worktree:** two scopes for one project don't double-reap; a
-  second sweep is a no-op.
-- **Timer lifecycle:** the reaper stops on `ctx` cancel; a graceful `stop` waits for an
-  in-flight sweep before closing the DB; `AIRA_DAEMON_REAP_INTERVAL=disabled` runs no
-  sweep.
-- **e2e (real CLI):** two worktrees, one claims a ticket with a short TTL and "dies"
-  (no heartbeat); after > TTL the daemon reaper frees it and the second worktree claims
-  without `--steal`; the lapse is journaled.
+- **Reap frees + journals:** claim with a tiny TTL via an injected clock; advance past
+  TTL; sweep → lease `free` (gen+1, holder cols NULL) + a `lease.lapse` in the journal.
+- **Live lease never reaped:** heartbeated / not-yet-expired lease survives a sweep.
+- **Race (key honesty test):** heartbeat between detect and CAS (a `beforeReapCAS`
+  seam) → `RowsAffected()==0`, lease stays held, no `lease.lapse`.
+- **Clock regression:** an injected clock with `mono_now < last_heartbeat` → not reaped.
+- **Boot-id mismatch:** a prior-boot lease is reaped.
+- **Unreadable clock → zero reaps:** injected sample error/empty boot-id abandons the
+  sweep; nothing reaped (even with multiple expired candidates present).
+- **Stale generation:** a lease stolen (generation bumped) between detect and CAS is not
+  reaped.
+- **Reap-on-scope-build closes the restart gap:** a fresh daemon, a project with an
+  expired lease, a plain `Claim` (no `--steal`) → succeeds (the on-build sweep freed it),
+  with a `lease.lapse` journaled.
+- **Idempotent / multi-worktree:** two scopes for one project don't double-reap.
+- **Shutdown: no use-after-close even on drain timeout:** a sweep in flight + a stuck
+  connection forcing drain timeout → `stopReaper` still joins before `db.Close` (no
+  panic/race under `-race`); `ctx` cancel stops the reaper promptly.
+- **Config:** default 30s; `disabled`/`0` → no periodic sweep; malformed →
+  `E_CONFIG_INVALID` daemon-start failure.
+- **e2e (real CLI):** two worktrees; one claims a short-TTL ticket and stops
+  heartbeating; after > TTL the reaper frees it and the other claims without `--steal`;
+  the lapse is journaled.
 
 ## 8. Risks
 
-- **R1 — reaping a live lease (the cardinal sin).** *Mitigation:* the CAS re-checks
-  expiry under `BEGIN IMMEDIATE` with the clock sampled after the lock; `RowsAffected`
-  must be 1; unevaluated clock → abandon (§2).
-- **R2 — use-after-close of the shared `*store.DB` on shutdown.** *Mitigation:* the
-  reaper is joined into the bounded drain before `db.Close()` (§5).
-- **R3 — cross-project journaling correctness.** *Mitigation:* reap+journal go through
-  the owning project's per-scope `Store` (§3/§4).
-- **R4 — idle-uncontacted projects not swept.** *Mitigation:* documented; lazy-lapse
-  unchanged + swept on next contact; machine-wide sweep deferred (§4).
-- **R5 — reaper failure impacting the daemon.** *Mitigation:* isolated goroutine,
-  errors logged, ticker continues; never crashes accept or a request (§5).
+- **R1 — reaping a live lease.** *Mitigation:* single up-front sample (conservative) +
+  the steal-clause CAS re-check under `BEGIN IMMEDIATE` + `RowsAffected()==1` + clock
+  regression/unreadable excluded (§2).
+- **R2 — use-after-close on shutdown (incl. drain timeout).** *Mitigation:* LIFO
+  `defer stopReaper()` before `db.Close()` + interruptible sweep (§5).
+- **R3 — cross-project journal correctness.** *Mitigation:* reap+journal via the owning
+  scope; self-heals via the reconciler on journal failure (§3).
+- **R4 — never-contacted projects unswept.** *Mitigation:* on-scope-build sweep makes
+  first contact reap; documented; machine-wide deferred (§4).
+- **R5 — reaper failure impacting the daemon.** *Mitigation:* isolated goroutine, logged,
+  ticker continues (§5).
 
 ## 9. Sol build-review checklist
 
-1. The reap CAS is the exact negation of the Heartbeat guard + the steal expiry clause;
-   clock sampled after `BEGIN IMMEDIATE`; `RowsAffected()==1`; `0`→skip (no error, no
-   journal); free sets `state='free'`, `generation+1`, all holder cols NULL.
-2. A live / not-yet-expired / concurrently-heartbeated lease is never reaped; the
-   race test (heartbeat between detect and CAS) proves it.
-3. Unevaluated clock (empty boot-id / error) → zero reaps (abandon sweep), never a
-   reap on an unknown clock.
-4. `lease.lapse` journaled per-project (correct `nextSequence`/`event_counters`/journal
-   dir) through the owning scope; a reap that CAS-fails writes no event.
-5. Sweep is per active project scope, deduped by `project_id`, idempotent; the
-   machine-wide/idle-project gap is documented, not silently claimed as covered.
-6. Timer: joined into graceful drain (no use-after-close); stops on ctx; interval
-   config + `disabled`; a sweep error never crashes the daemon.
-7. Honesty: the daemon reaps only what it definitively knows is dead; the limitation
-   (uncontacted projects) is stated.
+1. Single clock sample per sweep; unreadable → zero reaps; slightly-stale sample only
+   ever more conservative (never reaps a since-revived lease).
+2. Free CAS == the steal expiry clause (clock-regression + unreadable excluded);
+   `RowsAffected()==1`; `0`→skip (no error, no event); free sets `state='free'`,
+   `generation+1`, all holder cols NULL.
+3. Detection uses an inline expiry check, not a reconstructed private `HeldLease`.
+4. The race test (heartbeat between detect and CAS) and the clock-regression test both
+   prove no reap.
+5. `lease.lapse` journaled per-project via the owning scope; actor exactly `aira-daemon`;
+   no invented worktree attribution; a CAS-fail writes no event; journal-failure
+   self-heals via the reconciler.
+6. Reap-on-scope-build runs before first dispatch and closes the restart gap; periodic
+   sweep deduped by project_id + idempotent; never-contacted limitation stated.
+7. `defer stopReaper()` joins before `db.Close()` on every return path incl. drain
+   timeout; sweep interruptible; `-race` clean; a reaper error never crashes the daemon.
+8. Config: default 30s; Go-duration grammar; `disabled`/`0` supported; malformed →
+   `E_CONFIG_INVALID` start failure.
