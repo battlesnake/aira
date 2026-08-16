@@ -27,6 +27,9 @@ type Server struct {
 	DrainTimeout time.Duration
 	Ready        chan<- struct{}
 	Handle       func(context.Context, WorktreeScope, core.Request) core.Response
+	// OnRequest observes accepted routed requests without replacing the normal
+	// handler. It is set before Serve starts and is primarily a test seam.
+	OnRequest func(WorktreeScope, core.Request)
 
 	mu     sync.Mutex
 	db     *store.DB
@@ -165,6 +168,9 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 	if _, route := core.ClassifyRequest(request.Request); route == core.RouteClient {
 		wrote = writeFrame(conn, errorFrame(CodeProtocol, CodeProtocol+": client-only operation cannot run in daemon")) == nil
 		return
+	}
+	if s.OnRequest != nil {
+		s.OnRequest(request.Scope, request.Request)
 	}
 	var response core.Response
 	if s.Handle != nil {

@@ -1040,28 +1040,46 @@ func relativiseInitResponse(response *core.Response, cwd string) {
 	if response == nil || !response.OK {
 		return
 	}
-	data, ok := response.Data.(map[string]any)
-	if !ok {
-		return
+	var result app.InitResult
+	switch data := response.Data.(type) {
+	case app.InitResult:
+		result = data
+	case *app.InitResult:
+		if data == nil {
+			return
+		}
+		result = *data
+	default:
+		encoded := response.RawData
+		if len(encoded) == 0 {
+			var err error
+			encoded, err = json.Marshal(response.Data)
+			if err != nil {
+				return
+			}
+		}
+		if err := json.Unmarshal(encoded, &result); err != nil {
+			return
+		}
 	}
 	cwdAbs, err := filepath.Abs(cwd)
 	if err != nil {
 		return
 	}
-	changed := false
-	for _, key := range []string{"root", "config"} {
-		path, ok := data[key].(string)
-		if !ok || !filepath.IsAbs(path) {
+	for _, path := range []*string{&result.Root, &result.Config} {
+		if !filepath.IsAbs(*path) {
 			continue
 		}
-		if relative, err := filepath.Rel(cwdAbs, path); err == nil {
-			data[key] = filepath.ToSlash(relative)
-			changed = true
+		if relative, err := filepath.Rel(cwdAbs, *path); err == nil {
+			*path = filepath.ToSlash(relative)
 		}
 	}
-	if changed {
-		response.RawData = nil
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return
 	}
+	response.Data = result
+	response.RawData = encoded
 }
 
 func render(response core.Response, jsonOutput bool, stdout, stderr io.Writer) int {

@@ -5,13 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"aira/internal/domain"
 	"aira/internal/gate"
 	"aira/internal/gitremote"
 	"aira/internal/runner"
+	"aira/internal/store"
 )
 
 func TestCanonicalVerbAliasParity(t *testing.T) {
@@ -131,46 +135,46 @@ func (r *routingGitRecorder) Run(context.Context, gitremote.Request) (*gitremote
 // Store execution dependency; every dependency touch implies a client carve-out
 // and routed operations cannot produce AfterWrite.
 func TestRoutingCompletenessWithRecordingSentinels(t *testing.T) {
-	s, root := coreTestStoreWithRoot(t)
+	s, root := routingTestStore(t)
+	seed := New(s)
+	for _, title := range []string{"routing source", "routing target"} {
+		mustRoutingOK(t, seed.Do(context.Background(), Request{Verb: "create", Args: map[string]any{
+			"title": title, "kind": "feature", "severity": "P2", "body": "", "labels": []string{},
+		}}), "seed ticket")
+	}
+	mustRoutingOK(t, seed.Do(context.Background(), Request{Verb: "req", Args: map[string]any{
+		"subverb": "add", "text": "The routing fixture must complete.", "status": "designed",
+	}}), "seed requirement")
+	findingResponse := seed.Do(context.Background(), Request{Verb: "find", Args: map[string]any{
+		"subverb": "add", "ticket": "AIRA-1", "category": "correctness", "severity": "P1",
+		"verdict": "confirmed", "source": "routing-seed", "message": "seed finding", "file": "seed.go", "line": 1,
+	}})
+	mustRoutingOK(t, findingResponse, "seed finding")
+	findingData, ok := findingResponse.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("seed finding data type = %T", findingResponse.Data)
+	}
+	findingID, _ := findingData["id"].(string)
+	if findingID == "" {
+		t.Fatalf("seed finding data = %#v", findingData)
+	}
+	seedRoutingTestReport(t, s)
+	writeRoutingGateFixtures(t, root)
+
 	execution := &routingRecorder{}
 	gitops := &routingGitRecorder{}
 	s.SetRunner(execution)
-	dispatcher := NewWithRunner(s, execution).WithGitOps(gitops)
-	if err := os.MkdirAll(filepath.Join(root, ".aira", "gates", "canaries"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	definition := gate.GateDefinition{
-		SchemaVersion: 2, ID: "command-fixture", Name: "command fixture", Kind: gate.KindCheckable, Enabled: true,
-		AppliesTo: gate.AppliesTo{All: true}, Lane: gate.Lane{Name: "command", Checker: string(gate.CheckerCommand)},
-		ProofPolicy: gate.ProofPolicy{Mode: gate.ProofRequired, MaxAgeSecs: 3600, RequireCurrentCanary: true}, CanaryIDs: []string{"command-fixture-canary"},
-		Command: &gate.Command{Argv: []string{"/bin/true"}, Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 1024, Predicate: gate.CommandPredicateExitZero},
-	}
-	data, err := gate.RenderGate(definition)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, ".aira", "gates", "command-fixture.json"), data, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	canary := gate.CanaryDeclaration{
-		SchemaVersion: 1, ID: "command-fixture-canary", GateID: definition.ID, Mode: gate.CanaryFixture,
-		Seed: gate.Seed{Files: map[string]string{"fixture.txt": "sentinel"}}, ExpectedGateResult: gate.VerdictFail,
-		LaneBinding: "command", Isolation: gate.IsolationTempGit, Cadence: gate.CadenceOnDemand,
-	}
-	data, err = json.Marshal(canary)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, ".aira", "gates", "canaries", "command-fixture-canary.json"), data, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	dispatcher := NewWithInitializerAndRunner(s, execution, func(context.Context, map[string]any) (any, error) {
+		return map[string]any{"initialised": true}, nil
+	}).WithGitOps(gitops)
 
-	fixtures := routingFixtures(dispatcher.DispatchDescriptors())
+	fixtures := routingFixtures(dispatcher.DispatchDescriptors(), findingID)
 	fixtures = append(fixtures,
 		Request{Verb: "show", Args: map[string]any{"selector": "RUN-1"}},
 		Request{Verb: "get", Args: map[string]any{"selector": "RUN-2"}},
 	)
 	for _, request := range fixtures {
+		prepareRoutingFixture(t, seed, request)
 		execution.reset()
 		gitops.calls = 0
 		response := dispatcher.Do(context.Background(), request)
@@ -188,10 +192,225 @@ func TestRoutingCompletenessWithRecordingSentinels(t *testing.T) {
 		if route == RouteDaemon && response.AfterWrite != nil {
 			t.Fatalf("routed request %+v returned AfterWrite", request)
 		}
+		if route == RouteDaemon {
+			if !response.OK || response.Code == "" {
+				t.Fatalf("routed request %+v did not complete its handler: %+v", request, response)
+			}
+			assertRoutingEffect(t, s, request, findingID)
+		}
 	}
 	for _, operation := range []string{"run", "canary-run"} {
 		if _, route := Classify("gate", operation); route != RouteClient {
 			t.Fatalf("gate %s must be carved wholesale", operation)
+		}
+	}
+}
+
+func routingTestStore(t *testing.T) (*store.Store, string) {
+	t.Helper()
+	base := t.TempDir()
+	if err := exec.Command("git", "-C", base, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(context.Background(), store.Options{
+		Root: base, CommonDir: filepath.Join(base, "common"), DBPath: filepath.Join(base, "state", "state.db"),
+		RegistryPath: filepath.Join(base, "state", "registry.jsonl"), ProjectID: "routing-project", WorktreeID: "routing-worktree",
+		ProjectSlug: "routing", Prefixes: []string{"AIRA"}, RequirementPrefixes: []string{"AR"},
+		LeaseTTLNS: uint64(15 * time.Minute), LeaseStateDir: filepath.Join(base, "lease-state"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s, base
+}
+
+func mustRoutingOK(t *testing.T, response Response, operation string) {
+	t.Helper()
+	if !response.OK {
+		t.Fatalf("%s response = %+v", operation, response)
+	}
+}
+
+const routingGoJSON = `{"Action":"start","Package":"example/pkg"}
+{"Action":"run","Package":"example/pkg","Test":"TestPass"}
+{"Action":"pass","Package":"example/pkg","Test":"TestPass","Elapsed":0.001}
+{"Action":"pass","Package":"example/pkg"}
+`
+
+func seedRoutingTestReport(t *testing.T, s *store.Store) {
+	t.Helper()
+	result, err := s.AddTestReport(context.Background(), domain.TestReportInput{
+		Format: "go-json", Commit: "commit-a", SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1", Raw: []byte(routingGoJSON),
+	})
+	if err != nil || result.ID != "TR-1" {
+		t.Fatalf("seed test report = %+v, err=%v", result, err)
+	}
+}
+
+func writeRoutingGateFixtures(t *testing.T, root string) {
+	t.Helper()
+	directory := filepath.Join(root, ".aira", "gates")
+	if err := os.MkdirAll(filepath.Join(directory, "canaries"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(definition gate.GateDefinition, canary gate.CanaryDeclaration) {
+		t.Helper()
+		data, err := gate.RenderGate(definition)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(directory, definition.ID+".json"), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		data, err = json.Marshal(canary)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(directory, "canaries", canary.ID+".json"), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(gate.GateDefinition{
+		SchemaVersion: 2, ID: "command-fixture", Name: "command fixture", Kind: gate.KindCheckable, Enabled: true,
+		AppliesTo: gate.AppliesTo{All: true}, Lane: gate.Lane{Name: "command", Checker: string(gate.CheckerCommand), EvaluatorVersion: "1"},
+		ProofPolicy: gate.ProofPolicy{Mode: gate.ProofRequired, MaxAgeSecs: 3600, RequireCurrentCanary: true}, CanaryIDs: []string{"command-fixture-canary"},
+		Command: &gate.Command{Argv: []string{"/bin/true"}, Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 1024, Predicate: gate.CommandPredicateExitZero},
+	}, gate.CanaryDeclaration{
+		SchemaVersion: 1, ID: "command-fixture-canary", GateID: "command-fixture", Mode: gate.CanaryFixture,
+		Seed: gate.Seed{Files: map[string]string{"fixture.txt": "sentinel"}}, ExpectedGateResult: gate.VerdictFail,
+		LaneBinding: "command", Isolation: gate.IsolationTempGit, Cadence: gate.CadenceOnDemand,
+	})
+	write(gate.GateDefinition{
+		SchemaVersion: 1, ID: "manual-fixture", Name: "manual fixture", Kind: gate.KindManual, Enabled: true,
+		AppliesTo: gate.AppliesTo{All: true}, Lane: gate.Lane{Name: "human", Checker: string(gate.CheckerManual), EvaluatorVersion: "1"},
+		ProofPolicy: gate.ProofPolicy{Mode: gate.ProofRequired, MaxAgeSecs: 3600, RequireCurrentCanary: true}, CanaryIDs: []string{"manual-fixture-canary"},
+		Manual: &gate.Manual{Role: "reviewer"},
+	}, gate.CanaryDeclaration{
+		SchemaVersion: 1, ID: "manual-fixture-canary", GateID: "manual-fixture", Mode: gate.CanaryAttestationChallenge,
+		ExpectedGateResult: gate.VerdictFail, LaneBinding: "human", Isolation: gate.IsolationTempGit, Cadence: gate.CadenceEveryEvaluation,
+	})
+	write(gate.GateDefinition{
+		SchemaVersion: 2, ID: "ratchet-fixture", Name: "ratchet fixture", Kind: gate.KindRatchet, Enabled: true,
+		AppliesTo: gate.AppliesTo{All: true}, Lane: gate.Lane{Name: "ratchet", Checker: string(gate.CheckerRatchet), EvaluatorVersion: "1", ConfigDigest: "routing-config"},
+		ProofPolicy: gate.ProofPolicy{Mode: gate.ProofRequired, RequireCurrentCanary: true}, CanaryIDs: []string{"ratchet-fixture-canary"},
+		Ratchet: &gate.Ratchet{Metric: "tests", Comparator: "no-new-failures", BaselineSelection: "active-explicitly-pinned", ComparisonKey: gate.ComparisonKey{SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1"}},
+	}, gate.CanaryDeclaration{
+		SchemaVersion: 2, ID: "ratchet-fixture-canary", GateID: "ratchet-fixture", Mode: gate.CanarySyntheticRatchet,
+		BaselineFailing: []string{"TestOld"}, CurrentFailing: []string{"TestOld", "TestNew"}, Expected: "regressed", ExpectedGateResult: gate.VerdictFail,
+		LaneBinding: "ratchet", Isolation: gate.IsolationTempGit, Cadence: gate.CadenceOnDemand,
+	})
+}
+
+func prepareRoutingFixture(t *testing.T, seed *Core, request Request) {
+	t.Helper()
+	canonical := CanonicalVerb(request.Verb)
+	operation, _ := request.Args["subverb"].(string)
+	switch {
+	case canonical == "touch":
+		mustRoutingOK(t, seed.Do(context.Background(), Request{Verb: "claim", Args: map[string]any{"selector": "AIRA-1", "actor": "touch-seed"}}), "seed touch lease")
+	case canonical == "gate" && operation == "attest":
+		mustRoutingOK(t, seed.Do(context.Background(), Request{Verb: "gate", Args: map[string]any{"subverb": "review", "gate_id": "manual-fixture"}}), "seed manual challenge")
+	case canonical == "gate" && operation == "prove":
+		mustRoutingOK(t, seed.Do(context.Background(), Request{Verb: "gate", Args: map[string]any{"subverb": "run", "gate_id": "manual-fixture"}}), "seed manual result")
+	}
+}
+
+func assertRoutingEffect(t *testing.T, s *store.Store, request Request, findingID string) {
+	t.Helper()
+	canonical := CanonicalVerb(request.Verb)
+	operation, _ := request.Args["subverb"].(string)
+	switch canonical {
+	case "create":
+		if _, err := s.Get("AIRA-3"); err != nil {
+			t.Fatalf("create effect: %v", err)
+		}
+	case "set":
+		record, err := s.Get("AIRA-1")
+		if err != nil || record.Ticket.Title != "updated title" {
+			t.Fatalf("set effect record=%+v err=%v", record, err)
+		}
+	case "mv":
+		record, err := s.Get("AIRA-1")
+		if err != nil || record.Ticket.Status != domain.StatusInProgress {
+			t.Fatalf("mv effect record=%+v err=%v", record, err)
+		}
+	case "claim", "heartbeat":
+		if _, err := s.LeaseToken("AIRA-1"); err != nil {
+			t.Fatalf("%s effect: %v", canonical, err)
+		}
+	case "release":
+		if _, err := s.LeaseToken("AIRA-1"); err == nil {
+			t.Fatal("release left a lease token")
+		}
+	case "link":
+		relations, err := s.Relations("AIRA-1")
+		if err != nil || len(relations) == 0 {
+			t.Fatalf("link/%s effect relations=%+v err=%v", operation, relations, err)
+		}
+	case "unlink":
+		relations, err := s.Relations("AIRA-1")
+		if err != nil || len(relations) != 0 {
+			t.Fatalf("unlink effect relations=%+v err=%v", relations, err)
+		}
+	case "import":
+		rows, err := s.ListFindings("source:routing-import")
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("finding import effect rows=%+v err=%v", rows, err)
+		}
+	case "find":
+		if operation == "add" {
+			rows, err := s.ListFindings("")
+			if err != nil || len(rows) < 2 {
+				t.Fatalf("finding add effect rows=%+v err=%v", rows, err)
+			}
+		} else if operation == "set" {
+			record, err := s.GetFinding(findingID)
+			if err != nil || record.Finding.Disposition != domain.DispositionFixed {
+				t.Fatalf("finding set effect record=%+v err=%v", record, err)
+			}
+		}
+	case "req":
+		if operation == "add" {
+			if _, err := s.GetRequirement("AR-2"); err != nil {
+				t.Fatalf("requirement add effect: %v", err)
+			}
+		} else if operation == "set" {
+			record, err := s.GetRequirement("AR-1")
+			if err != nil || record.Requirement.Status != domain.RequirementBuilt {
+				t.Fatalf("requirement set effect record=%+v err=%v", record, err)
+			}
+		} else if operation == "import" {
+			if _, err := s.GetRequirement("AR-99"); err != nil {
+				t.Fatalf("requirement import effect: %v", err)
+			}
+		}
+	case "spend":
+		if operation == "add" {
+			rows, err := s.ListComputeEvents("")
+			if err != nil || len(rows) == 0 {
+				t.Fatalf("spend effect rows=%+v err=%v", rows, err)
+			}
+		}
+	case "quota":
+		if operation == "add" {
+			rows, err := s.ListQuotaSnapshots("")
+			if err != nil || len(rows) == 0 {
+				t.Fatalf("quota effect rows=%+v err=%v", rows, err)
+			}
+		}
+	case "test-report":
+		if operation == "add" {
+			reports, err := s.ListTestReports("")
+			if err != nil || len(reports) < 2 {
+				t.Fatalf("test-report effect reports=%+v err=%v", reports, err)
+			}
+		}
+	case "gate":
+		if operation == "baseline-pin" || operation == "baseline-show" {
+			if _, err := s.ShowGateBaseline("ratchet-fixture"); err != nil {
+				t.Fatalf("gate %s effect: %v", operation, err)
+			}
 		}
 	}
 }
@@ -209,10 +428,13 @@ func routingFixtureMustTouch(request Request) bool {
 	return canonical == "gate" && operation == "run"
 }
 
-func routingFixtures(descriptors []DispatchDescriptor) []Request {
+func routingFixtures(descriptors []DispatchDescriptor, findingID string) []Request {
 	fixtures := make([]Request, 0, len(descriptors))
 	for _, descriptor := range descriptors {
 		base := metadataProbeInputs(descriptor.Name)[0]
+		base["selector"] = "AIRA-1"
+		base["query"] = ""
+		base["token"] = ""
 		base["gate_id"] = "command-fixture"
 		base["checker"] = "command"
 		base["predicate"] = "exit-zero"
@@ -221,13 +443,55 @@ func routingFixtures(descriptors []DispatchDescriptor) []Request {
 		base["timeout_ms"] = "1000"
 		base["output_cap_bytes"] = "1024"
 		base["run_id"] = "RUN-1"
-		if descriptor.Name == "run-log" {
+		switch descriptor.Name {
+		case "find":
+			base["selector"] = findingID
+			base["by"] = "source"
+			base["requirement"] = "AR-1"
+		case "req":
+			base["selector"] = "AR-1"
+			base["status"] = "built"
+		case "link", "unlink":
+			base["from"] = "AIRA-1"
+			base["to"] = "AIRA-2"
+			base["kind"] = "relates"
+		case "set":
+			base["selector"] = "AIRA-1"
+			base["field"] = "title"
+			base["value"] = "updated title"
+		case "mv":
+			base["selector"] = "AIRA-1"
+			base["status"] = "in-progress"
+		case "review":
+			base["selector"] = "AIRA-1"
+			base["paths"] = []string{"**/*.go"}
+		case "grep":
+			base["query"] = "routing"
+			base["kind"] = "ticket"
+		case "spend":
+			delete(base, "raw")
+			base["bucket"] = []string{"fresh_input=1", "output=1"}
+			base["total"] = "2"
+			base["by"] = "phase"
+		case "test-report":
+			base["raw"] = []byte(routingGoJSON)
+			base["selector"] = "TR-1"
+			base["commit"] = "commit-b"
+			base["branch"] = "main"
+			base["config"] = "default"
+			base["env_digest"] = "env"
+		case "run-log":
 			base["from"] = "0"
 			base["tail"] = "0"
 			base["stream"] = "out"
 		}
 		if len(descriptor.Operations) == 0 {
-			fixtures = append(fixtures, Request{Verb: descriptor.Name, Args: base})
+			request := Request{Verb: descriptor.Name, Args: base}
+			if descriptor.Name == "import" {
+				request.Content = []byte(`{"ticket":"AIRA-1","category":"correctness","severity":"P1","verdict":"confirmed","source":"routing-import","message":"import branch","file":"import.go","line":99}` + "\n")
+				request.HasContent = true
+			}
+			fixtures = append(fixtures, request)
 			continue
 		}
 		for _, operation := range descriptor.Operations {
@@ -236,7 +500,33 @@ func routingFixtures(descriptors []DispatchDescriptor) []Request {
 				delete(args, "")
 				args["list"] = operation.Name == "list"
 			}
-			fixtures = append(fixtures, Request{Verb: descriptor.Name, Args: args})
+			request := Request{Verb: descriptor.Name, Args: args}
+			switch descriptor.Name {
+			case "find":
+				if operation.Name == "set" {
+					args["reason"] = ""
+					args["actor"] = ""
+				}
+			case "req":
+				if operation.Name == "import" {
+					request.Content = []byte("| ID | Requirement | Status | Implemented-by | Verified-by |\n|---|---|---|---|---|\n| AR-99 | Imported routing requirement. | planned | — | — |\n")
+					request.HasContent = true
+				}
+			case "gate":
+				switch operation.Name {
+				case "attest":
+					args["gate_id"] = "manual-fixture"
+					args["verdict"] = "fail"
+				case "prove", "review":
+					args["gate_id"] = "manual-fixture"
+				case "canary-run", "canary-show":
+					args["canary_id"] = "manual-fixture-canary"
+				case "baseline-pin", "baseline-show":
+					args["gate_id"] = "ratchet-fixture"
+					args["report"] = "TR-1"
+				}
+			}
+			fixtures = append(fixtures, request)
 		}
 	}
 	return fixtures

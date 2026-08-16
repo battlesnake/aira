@@ -26,6 +26,12 @@ func TestFrameRoundTripPreservesRequestContent(t *testing.T) {
 	}
 }
 
+func TestContentPresenceChangeUsesProtocolVersionTwo(t *testing.T) {
+	if ProtocolVersion != 2 {
+		t.Fatalf("ProtocolVersion = %d, want 2 for has_content wire semantics", ProtocolVersion)
+	}
+}
+
 func TestFrameRoundTripPreservesPresentEmptyContent(t *testing.T) {
 	want := RequestFrame{Proto: ProtocolVersion, Request: core.Request{Verb: "import", Content: []byte{}, HasContent: true}}
 	var buffer bytes.Buffer

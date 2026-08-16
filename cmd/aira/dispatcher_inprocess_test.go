@@ -9,20 +9,30 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
+	"aira/internal/app"
 	"aira/internal/core"
 	"aira/internal/daemon"
 	"aira/internal/store"
+	"golang.org/x/sys/unix"
 )
 
 func runInProcess(argv []string, stdout, stderr io.Writer) int {
 	return runInProcessWithInput(argv, stdout, stderr, strings.NewReader(""))
+}
+
+type dispatcherFunc func(context.Context, daemon.WorktreeScope, core.Request) core.Response
+
+func (dispatch dispatcherFunc) Dispatch(ctx context.Context, scope daemon.WorktreeScope, request core.Request) core.Response {
+	return dispatch(ctx, scope, request)
 }
 
 // shortRuntimeDir returns a short unique XDG_RUNTIME_DIR. The daemon socket must
@@ -261,8 +271,134 @@ func TestAutoStartPreCancelledContextDoesNotSpawn(t *testing.T) {
 	}
 }
 
+const protocolDaemonHelperEnv = "AIRA_PROTOCOL_DAEMON_HELPER"
+
+// TestProtocolDaemonHelperProcess holds a real daemon lock until SIGTERM. It
+// models the process-lifetime part of protocol replacement without requiring a
+// Unix listener, which is unavailable in the restricted test sandbox.
+func TestProtocolDaemonHelperProcess(t *testing.T) {
+	if os.Getenv(protocolDaemonHelperEnv) != "1" {
+		return
+	}
+	paths, err := daemon.PathsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(paths.RuntimeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.OpenFile(paths.LockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	bootID, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewEncoder(lock).Encode(daemon.LockInfo{PID: os.Getpid(), BootID: strings.TrimSpace(string(bootID))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(os.Stdout, "R"); err != nil {
+		t.Fatal(err)
+	}
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	<-signals
+}
+
+type protocolDaemonProcess struct {
+	command *exec.Cmd
+	done    <-chan struct{}
+}
+
+func startProtocolDaemonProcess(t *testing.T) protocolDaemonProcess {
+	t.Helper()
+	command := exec.Command(os.Args[0], "-test.run=^TestProtocolDaemonHelperProcess$")
+	command.Env = append(os.Environ(), protocolDaemonHelperEnv+"=1")
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.Stderr = os.Stderr
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan error, 1)
+	go func() {
+		var marker [1]byte
+		_, err := io.ReadFull(stdout, marker[:])
+		if err == nil && marker[0] != 'R' {
+			err = fmt.Errorf("unexpected helper marker %q", marker[0])
+		}
+		ready <- err
+	}()
+	select {
+	case err := <-ready:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		_ = command.Process.Kill()
+		t.Fatal("protocol daemon helper did not become ready")
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = command.Wait()
+		close(done)
+	}()
+	process := protocolDaemonProcess{command: command, done: done}
+	t.Cleanup(func() {
+		select {
+		case <-process.done:
+			return
+		default:
+		}
+		_ = process.command.Process.Signal(syscall.SIGTERM)
+		select {
+		case <-process.done:
+		case <-time.After(5 * time.Second):
+			_ = process.command.Process.Kill()
+			<-process.done
+		}
+	})
+	return process
+}
+
+func TestNewerClientReplacesOlderProtocolDaemon(t *testing.T) {
+	dispatcher := autoStartDispatcher(t)
+	older := startProtocolDaemonProcess(t)
+	var exchanges atomic.Int32
+	dispatcher.exchange = func(context.Context, string, daemon.RequestFrame) (daemon.ResponseFrame, error) {
+		if exchanges.Add(1) == 1 {
+			return daemon.ResponseFrame{Proto: daemon.ProtocolVersion - 1, Code: daemon.CodeProtocol, Error: daemon.CodeProtocol + ": older daemon"}, nil
+		}
+		return daemon.ResponseFrame{Proto: daemon.ProtocolVersion, OK: true, Code: "OK"}, nil
+	}
+	spawned := false
+	dispatcher.spawn = func() (<-chan childResult, error) {
+		spawned = true
+		return nil, errors.New("must not spawn")
+	}
+	response := dispatcher.Dispatch(context.Background(), daemon.WorktreeScope{}, core.Request{Verb: "list"})
+	if !response.OK || response.Code != "OK" || spawned || exchanges.Load() != 2 {
+		t.Fatalf("response=%+v spawned=%v exchanges=%d", response, spawned, exchanges.Load())
+	}
+	select {
+	case <-older.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("older protocol daemon was not stopped for replacement")
+	}
+}
+
 func TestOlderClientNeverReplacesNewerDaemon(t *testing.T) {
 	dispatcher := autoStartDispatcher(t)
+	newer := startProtocolDaemonProcess(t)
 	spawned := false
 	dispatcher.exchange = func(context.Context, string, daemon.RequestFrame) (daemon.ResponseFrame, error) {
 		return daemon.ResponseFrame{Proto: daemon.ProtocolVersion + 1, Code: daemon.CodeProtocol, Error: daemon.CodeProtocol + ": newer daemon"}, nil
@@ -272,8 +408,13 @@ func TestOlderClientNeverReplacesNewerDaemon(t *testing.T) {
 		return nil, errors.New("must not spawn")
 	}
 	response := dispatcher.Dispatch(context.Background(), daemon.WorktreeScope{}, core.Request{Verb: "list"})
-	if response.Code != daemon.CodeProtocol || spawned {
+	if response.Code != daemon.CodeProtocol || !strings.HasPrefix(response.Error, daemon.CodeProtocol) || spawned {
 		t.Fatalf("response=%+v spawned=%v", response, spawned)
+	}
+	select {
+	case <-newer.done:
+		t.Fatal("newer protocol daemon was stopped by an older client")
+	default:
 	}
 }
 
@@ -325,7 +466,14 @@ func TestMCPMutationUsesRealDaemonSocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	startCommandDaemon(t, daemon.NewServer(paths))
+	server := daemon.NewServer(paths)
+	var socketRequests atomic.Int32
+	server.OnRequest = func(_ daemon.WorktreeScope, request core.Request) {
+		if core.CanonicalVerb(request.Verb) == "create" {
+			socketRequests.Add(1)
+		}
+	}
+	startCommandDaemon(t, server)
 	input := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"aira_create","arguments":{"title":"MCP mutation","kind":"feature","severity":"P2"}}}` + "\n")
 	var output, diagnostics bytes.Buffer
 	if exit := runMCPWithDispatcher(context.Background(), input, &output, &diagnostics, nil); exit != 0 {
@@ -336,6 +484,9 @@ func TestMCPMutationUsesRealDaemonSocket(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, ".aira", "tickets", "AIRA-1.md")); err != nil {
 		t.Fatalf("routed mutation ticket: %v", err)
+	}
+	if got := socketRequests.Load(); got != 1 {
+		t.Fatalf("daemon observed %d MCP create requests, want exactly one", got)
 	}
 }
 
@@ -393,6 +544,47 @@ func TestMCPRoutedStructuredResponseIsRenderedByteIdentically(t *testing.T) {
 	}
 	if !bytes.Contains(gotWire, []byte("9223372036854775807")) {
 		t.Fatalf("max int64 missing from %s", gotWire)
+	}
+}
+
+func TestRoutedInitRenderingMatchesInProcessFieldOrder(t *testing.T) {
+	cwd := t.TempDir()
+	if err := exec.Command("git", "-C", cwd, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(cwd)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(cwd, "state"))
+	t.Setenv("XDG_RUNTIME_DIR", shortRuntimeDir(t))
+	absolute := app.InitResult{
+		Root: cwd, Config: filepath.Join(cwd, ".aira", "config"), Project: "demo", Prefixes: []string{"AIRA"}, Created: true,
+	}
+	raw, err := json.Marshal(absolute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inProcess := dispatcherFunc(func(context.Context, daemon.WorktreeScope, core.Request) core.Response {
+		return core.Response{OK: true, Code: "OK", Data: absolute}
+	})
+	routed := dispatcherFunc(func(context.Context, daemon.WorktreeScope, core.Request) core.Response {
+		return (daemon.ResponseFrame{OK: true, Code: "OK", Data: raw}).CoreResponse()
+	})
+	for _, jsonOutput := range []bool{false, true} {
+		argv := []string{"init", "--project", "demo", "--prefix", "AIRA"}
+		if jsonOutput {
+			argv = append(argv, "--json")
+		}
+		var inProcessOut, routedOut, inProcessErr, routedErr bytes.Buffer
+		inProcessExit := runWithInputDispatcher(argv, &inProcessOut, &inProcessErr, strings.NewReader(""), inProcess)
+		routedExit := runWithInputDispatcher(argv, &routedOut, &routedErr, strings.NewReader(""), routed)
+		if inProcessExit != routedExit || inProcessOut.String() != routedOut.String() || inProcessErr.String() != routedErr.String() {
+			t.Fatalf("json=%v routed init differs\n got stdout: %q\nwant stdout: %q\n got stderr: %q\nwant stderr: %q", jsonOutput, routedOut.String(), inProcessOut.String(), routedErr.String(), inProcessErr.String())
+		}
+		if jsonOutput {
+			wantOrder := `"data":{"root":".","config":".aira/config","project":"demo","prefixes":["AIRA"],"created":true}`
+			if !strings.Contains(routedOut.String(), wantOrder) {
+				t.Fatalf("routed init order = %q", routedOut.String())
+			}
+		}
 	}
 }
 
