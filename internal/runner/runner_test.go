@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"aira/internal/cgrouptest"
 )
 
 func TestEnvDigestUsesSortedLengthPrefixedBytes(t *testing.T) {
@@ -979,7 +981,11 @@ func TestRealCgroupRealtimePreservesSeparateCaptureAndDigests(t *testing.T) {
 
 func realRunner(t *testing.T) *Runner {
 	t.Helper()
-	r, err := New(Config{CommonDir: t.TempDir(), Owner: "A", Grace: time.Second, TermGrace: 100 * time.Millisecond})
+	// A private cgroup parent per call: real-cgroup tests across packages share the
+	// ambient scope, so an ambient-parent runner races others to create `.aira-RUN-1`
+	// (see cgrouptest). Unique per call so a test that builds several runners does not
+	// EEXIST its own parent.
+	r, err := New(Config{CommonDir: t.TempDir(), Owner: "A", CgroupParent: cgrouptest.IsolatedScopeParent(t), Grace: time.Second, TermGrace: 100 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}

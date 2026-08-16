@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"aira/internal/cgrouptest"
 	"aira/internal/gate"
 	"aira/internal/runner"
 )
@@ -32,12 +33,18 @@ func realCommandStore(t *testing.T) (*Store, string) {
 	}
 	gitRun(t, root, "add", ".")
 	s := testStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
-	execution, err := runner.New(runner.Config{CommonDir: filepath.Join(base, "runner-common"), TermGrace: 50 * time.Millisecond, Grace: 200 * time.Millisecond})
+	// Isolate this store's runner under a private cgroup parent: every package's
+	// real-cgroup tests share the ambient scope, and without isolation two packages'
+	// runners collide creating the same `.aira-RUN-1` child (see cgrouptest).
+	execution, err := runner.New(runner.Config{CommonDir: filepath.Join(base, "runner-common"), CgroupParent: cgrouptest.IsolatedScopeParent(t), TermGrace: 50 * time.Millisecond, Grace: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := execution.Probe(context.Background()); err != nil {
-		t.Skipf("real cgroup-v2 delegation unavailable: %v", err)
+		// Probe additionally checks kernel version, clone3, and parent usability;
+		// use the same skip-or-fail policy as the parent mkdir so mandatory-real mode
+		// cannot silently skip on those.
+		cgrouptest.SkipOrFailRealCgroup(t, "real cgroup-v2 delegation unavailable: %v", err)
 	}
 	s.SetRunner(execution)
 	t.Cleanup(func() { _ = s.Close() })
