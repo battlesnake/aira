@@ -1,6 +1,7 @@
-# D7a — Store-free carved verbs stop opening a writable `state.db`, v4 (rescoped)
+# D7a — Store-free carved verbs stop opening a writable `state.db`, v4 — APPROVED
 
-**Status:** plan (rescoped to D7a after the owner split D7; see §1). **Milestone:** Phase 5 · D7a.
+**Status:** APPROVED — Sol plan-review r1–r4 → **APPROVE-PLAN** (r1–r3 hardened the full
+D7 then the owner split it to D7a; r4 approve + 3 build-notes folded). **Milestone:** Phase 5 · D7a.
 **Branch:** `codex-aira-d7`. **Depends on:** M21 (master `05d594e`).
 
 ## 1. Rescope and honest goal
@@ -39,7 +40,12 @@ A carved `(verb, args)` is **store-free** iff its handler touches **no** `state.
 method (verified against the survey + `internal/core/core.go`):
 
 - `run` **without** any telemetry flag (`--report`/`--tool`/`--usage`/`--provider`) —
-  a plain run only drives the runner's file ledger + capture files.
+  a plain run only drives the runner's file ledger + capture files. **The flag test is
+  by NORMALIZED NON-EMPTY value, not arg-key presence** (Sol r4): `buildRequest`
+  inserts `report`/`tool`/`usage`/`provider` keys even when empty, so a key-presence
+  test would misclassify *every* run as store-touching. Conservatively, any non-empty
+  value among these keeps the run on the writable path (harmless even for `--usage`/
+  `--provider` without `--tool`, which would not actually persist).
 - `run-kill`, `run-log`, `show RUN-*` — runner file ledger only.
 - `git` — a bounded network op, no `c.store` call.
 
@@ -59,11 +65,12 @@ without a client write, `dispatchClient` — before running a **store-free** car
 **its** store and returns the ownership-validation outcome (a prefix-ownership conflict
 surfaces with the existing code, from the daemon).
 
-- **Re-register on cache hit (Sol r2 #5):** `Server.coreForScope` caches scopes and
-  does not re-run `register` on a hit, but pre-D7 registered on *every* invocation.
-  `ensure-scope` calls an **exported `Store.Register(ctx)` on the scope every
-  handshake** — cached or freshly built — preserving the per-invocation active refresh
-  + ownership check.
+- **Re-register on cache hit (Sol r2 #5), exactly once per handshake (Sol r4):**
+  `Server.coreForScope` caches scopes and does not re-run `register` on a hit, but
+  pre-D7 registered on *every* invocation. `ensure-scope` must yield **exactly one**
+  register per handshake: a fresh `store.NewScope` already registers (use that, no
+  second call), and a **cached** scope gets an explicit exported `Store.Register(ctx)`
+  — never a double register / redundant `registry.jsonl` append on fresh construction.
 
 ### 3.2 The `ensure-scope` store-op protocol (Sol r1 #3, r2 #3)
 
@@ -124,9 +131,13 @@ reconciler · D3 `watch` · D4 #29 fairness-queue · D6 run-input.
   carved verb, run against a recording-sentinel store, calls **no** store method
   locally; assert the process opens no writable DB handle (the daemon holds the
   authoritative registration). A future store touch fails the sentinel test.
-- **`store-free` predicate completeness:** `run` with each telemetry flag is NOT
-  store-free (stays on the writable path); `run` without is; `run-kill`/`run-log`/
-  `show RUN-*`/`git` are — enumerated + asserted.
+- **`store-free` predicate completeness (Sol r4):** `run` with each telemetry flag set
+  to a **non-empty value** is NOT store-free (stays on the writable path), but a run
+  carrying *empty* telemetry keys (as `buildRequest` emits) IS store-free; `run`
+  without telemetry, a **detached** plain run, and a plain run with unrelated execution
+  flags are store-free; the `get RUN-*` **alias** classifies like `show RUN-*`;
+  `run-kill`/`run-log`/`git` are store-free — all enumerated + asserted, including a
+  positive assertion that telemetry-valued runs remain on the legacy writable path.
 - **`ensure-scope` registers via the daemon:** a store-free verb on a fresh worktree
   creates `projects`/`worktrees`/`prefix_ownership` rows on the **daemon's** store,
   none written by the client; a **second** invocation for the same (cached) worktree
