@@ -535,9 +535,40 @@ func writeConfig(path string, data []byte) error {
 
 func gitValue(ctx context.Context, dir string, args ...string) (string, error) {
 	commandArgs := append([]string{"-C", dir, "rev-parse"}, args...)
+	// Project discovery runs on every command and must be robust to a flaky
+	// git-exec: under load a git subprocess can transiently fail, and a
+	// credential-helper/fsmonitor grandchild can inherit git's stdout and keep
+	// Output() blocked for EOF after git itself exits. Each attempt is bounded (a
+	// context deadline kills a stuck git; WaitDelay force-closes a lingering pipe
+	// and, on an otherwise-successful git, still yields the captured ref); a
+	// transient failure is retried a bounded number of times with a short backoff.
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		out, err := runGitRevParse(ctx, commandArgs)
+		if err == nil {
+			return out, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return "", lastErr
+}
+
+func runGitRevParse(ctx context.Context, commandArgs []string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	command := exec.CommandContext(ctx, "git", commandArgs...)
+	command.WaitDelay = 3 * time.Second
 	output, err := command.Output()
 	if err != nil {
+		// git itself exited successfully but a grandchild held the stdout pipe past
+		// WaitDelay: the captured ref is valid, so this is not a discovery failure.
+		if errors.Is(err, exec.ErrWaitDelay) && command.ProcessState != nil && command.ProcessState.Success() && len(output) > 0 {
+			return string(output), nil
+		}
 		return "", err
 	}
 	return string(output), nil
