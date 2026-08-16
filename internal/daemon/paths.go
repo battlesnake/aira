@@ -27,6 +27,23 @@ type Paths struct {
 	LockPath      string
 }
 
+const defaultReapInterval = 30 * time.Second
+
+func reapIntervalFromEnv() (time.Duration, error) {
+	value, set := os.LookupEnv("AIRA_DAEMON_REAP_INTERVAL")
+	if !set || value == "" {
+		return defaultReapInterval, nil
+	}
+	if value == "disabled" || value == "0" {
+		return 0, nil
+	}
+	interval, err := time.ParseDuration(value)
+	if err != nil || interval <= 0 {
+		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_REAP_INTERVAL must be a positive Go duration, disabled, or 0")
+	}
+	return interval, nil
+}
+
 // PathsFromEnv pins the state identity from the daemon's own environment.
 func PathsFromEnv() (Paths, error) {
 	stateHome := strings.TrimSpace(os.Getenv("XDG_STATE_HOME"))

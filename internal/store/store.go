@@ -142,6 +142,9 @@ type Store struct {
 	// afterLeaseBegin is a test-only observation hook for the lease clock
 	// sampling boundary; production leaves it nil.
 	afterLeaseBegin func()
+	// beforeReapCAS is a test-only seam between advisory expiry detection and
+	// the guarded reaping transaction; production leaves it nil.
+	beforeReapCAS func(string)
 	// beforeRebuildFindingReconstruct is a test-only seam for the finding
 	// scan/reconstruct race boundary; production leaves it nil.
 	beforeRebuildFindingReconstruct func()
@@ -556,6 +559,9 @@ func (s *Store) Close() error {
 // SetRunner attaches the only process-execution seam used by command gates.
 // The store never falls back to os/exec for gate commands.
 func (s *Store) SetRunner(execution Execution) { s.runner = execution }
+
+// ProjectID returns the path-derived project identity owned by this scope.
+func (s *Store) ProjectID() string { return s.projectID }
 
 func (s *Store) initDB(ctx context.Context) error {
 	statements := []string{

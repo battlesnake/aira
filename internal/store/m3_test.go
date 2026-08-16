@@ -3,6 +3,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -15,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"aira/internal/domain"
 )
@@ -214,6 +216,228 @@ func TestLeaseClockAndTTLOverflowAreUnavailable(t *testing.T) {
 	s.leaseTTLNS = ^uint64(0)
 	if _, err := s.Claim(context.Background(), ticket.ID, false, "owner"); ErrorCode(err) != "E_CLOCK_UNAVAILABLE" {
 		t.Fatalf("overflowing lease TTL error = %v", err)
+	}
+}
+
+func TestReapExpiredLeasesFreesAndDefersLapseJournal(t *testing.T) {
+	s, clock, base := m3Store(t)
+	ticket := m3Ticket(t, s, "reap me")
+	claim, err := s.Claim(context.Background(), ticket.ID, false, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, _ := claim.Lease.Held()
+	clock.mono += 900
+
+	journalPath := filepath.Join(base, "common", "aira", "journal.jsonl")
+	before, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journalLock, err := acquireLock(filepath.Join(base, "common", "aira", "journal.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	type reapResult struct {
+		count int
+		err   error
+	}
+	reapDone := make(chan reapResult, 1)
+	go func() {
+		count, err := s.ReapExpiredLeases(context.Background())
+		reapDone <- reapResult{count: count, err: err}
+	}()
+	var result reapResult
+	select {
+	case result = <-reapDone:
+		unlockFile(journalLock)
+	case <-time.After(time.Second):
+		unlockFile(journalLock)
+		t.Fatal("reaper blocked on journal.lock")
+	}
+	reaped, err := result.count, result.err
+	if err != nil || reaped != 1 {
+		t.Fatalf("reap count=%d err=%v", reaped, err)
+	}
+	lease, err := s.GetLease(context.Background(), ticket.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	free, ok := lease.Free()
+	if !ok || free.Generation != held.Generation()+1 {
+		t.Fatalf("reaped lease=%#v", lease)
+	}
+	var actor, verb, target, worktree string
+	var journaled int
+	if err := s.db.QueryRow(`SELECT e.actor, e.verb, e.target, e.journaled, o.worktree_id
+		FROM events e JOIN outbox o USING(project_id, seq)
+		WHERE e.project_id=? AND e.verb='lease.lapse'`, s.projectID).
+		Scan(&actor, &verb, &target, &journaled, &worktree); err != nil {
+		t.Fatal(err)
+	}
+	if actor != "aira-daemon" || verb != "lease.lapse" || target != ticket.ID || journaled != 0 || worktree != "" {
+		t.Fatalf("lapse actor=%q verb=%q target=%q journaled=%d worktree=%q", actor, verb, target, journaled, worktree)
+	}
+	afterReap, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(afterReap, before) {
+		t.Fatal("reaper appended journal.jsonl inline")
+	}
+	sibling, err := Open(context.Background(), Options{
+		Root: filepath.Join(base, "sibling"), CommonDir: filepath.Join(base, "common"),
+		DBPath: filepath.Join(base, "state", "state.db"), RegistryPath: filepath.Join(base, "state", "registry.jsonl"),
+		LeaseStateDir: filepath.Join(base, "sibling-lease-state"), ProjectID: s.projectID, WorktreeID: "worktree-b",
+		ProjectSlug: "aira", Prefixes: []string{"AIRA"}, Clock: clock, LeaseTTLNS: 900,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sibling.Close() })
+	if got, err := sibling.ReapExpiredLeases(context.Background()); err != nil || got != 0 {
+		t.Fatalf("idempotent sibling reap count=%d err=%v", got, err)
+	}
+	if err := sibling.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	afterReconcile, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(afterReconcile, []byte(`"verb":"lease.lapse"`)) {
+		t.Fatalf("reconcile did not materialise lapse journal: %s", afterReconcile)
+	}
+}
+
+func TestReapExpiredLeasesNeverReapsWithoutPositiveExpiry(t *testing.T) {
+	tests := []struct {
+		name       string
+		mutate     func(*m3Clock)
+		wantReaped int
+		wantError  bool
+	}{
+		{name: "live", mutate: func(clock *m3Clock) { clock.mono = 999 }, wantReaped: 0},
+		{name: "clock regression", mutate: func(clock *m3Clock) { clock.mono = 99 }, wantReaped: 0},
+		{name: "boot mismatch", mutate: func(clock *m3Clock) { clock.boot = "boot-b" }, wantReaped: 1},
+		{name: "unreadable clock", mutate: func(clock *m3Clock) { clock.mono = 1000; clock.err = errors.New("unreadable") }, wantReaped: 0, wantError: true},
+		{name: "empty boot id", mutate: func(clock *m3Clock) { clock.mono = 1000; clock.boot = "" }, wantReaped: 0, wantError: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s, clock, _ := m3Store(t)
+			ticket := m3Ticket(t, s, test.name)
+			if _, err := s.Claim(context.Background(), ticket.ID, false, "holder"); err != nil {
+				t.Fatal(err)
+			}
+			if test.name == "unreadable clock" {
+				second := m3Ticket(t, s, "second unreadable candidate")
+				if _, err := s.Claim(context.Background(), second.ID, false, "holder"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			test.mutate(clock)
+			got, err := s.ReapExpiredLeases(context.Background())
+			if got != test.wantReaped || (err != nil) != test.wantError {
+				t.Fatalf("reap count=%d want=%d err=%v", got, test.wantReaped, err)
+			}
+			lease, err := s.GetLease(context.Background(), ticket.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, held := lease.Held()
+			if held == (test.wantReaped == 1) {
+				t.Fatalf("lease held=%v want reaped=%d: %#v", held, test.wantReaped, lease)
+			}
+			var events int
+			if err := s.db.QueryRow(`SELECT count(*) FROM events WHERE project_id=? AND verb='lease.lapse'`, s.projectID).Scan(&events); err != nil {
+				t.Fatal(err)
+			}
+			if events != test.wantReaped {
+				t.Fatalf("lapse events=%d want=%d", events, test.wantReaped)
+			}
+		})
+	}
+}
+
+func TestReapExpiredLeaseCASLosesToHeartbeat(t *testing.T) {
+	s, reapClock, base := m3Store(t)
+	ticket := m3Ticket(t, s, "heartbeat wins")
+	claim, err := s.Claim(context.Background(), ticket.ID, false, "holder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	heartbeatClock := &m3Clock{boot: "boot-a", mono: 150}
+	heartbeater, err := Open(context.Background(), Options{
+		Root: base, CommonDir: filepath.Join(base, "common"),
+		DBPath: filepath.Join(base, "state", "state.db"), RegistryPath: filepath.Join(base, "state", "registry.jsonl"),
+		LeaseStateDir: filepath.Join(base, "heartbeat-state"), ProjectID: s.projectID, WorktreeID: "worktree-heartbeat",
+		ProjectSlug: "aira", Prefixes: []string{"AIRA"}, Clock: heartbeatClock, LeaseTTLNS: 900,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = heartbeater.Close() })
+	reapClock.mono = 1000
+	s.beforeReapCAS = func(string) {
+		s.beforeReapCAS = nil
+		if _, err := heartbeater.Heartbeat(context.Background(), ticket.ID, claim.Token); err != nil {
+			t.Fatalf("racing heartbeat: %v", err)
+		}
+	}
+	reaped, err := s.ReapExpiredLeases(context.Background())
+	if err != nil || reaped != 0 {
+		t.Fatalf("reap count=%d err=%v", reaped, err)
+	}
+	lease, err := s.GetLease(context.Background(), ticket.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, ok := lease.Held()
+	if !ok || held.Generation() != 1 || held.LastHeartbeatMonoNS() != 150 {
+		t.Fatalf("heartbeat did not win reap CAS: %#v", lease)
+	}
+	var lapses int
+	if err := s.db.QueryRow(`SELECT count(*) FROM events WHERE project_id=? AND verb='lease.lapse'`, s.projectID).Scan(&lapses); err != nil || lapses != 0 {
+		t.Fatalf("lapse events=%d err=%v", lapses, err)
+	}
+}
+
+func TestReapExpiredLeaseCASRejectsStaleGeneration(t *testing.T) {
+	s, reapClock, base := m3Store(t)
+	ticket := m3Ticket(t, s, "generation wins")
+	if _, err := s.Claim(context.Background(), ticket.ID, false, "holder"); err != nil {
+		t.Fatal(err)
+	}
+	stealClock := &m3Clock{boot: "boot-a", mono: 1000}
+	stealer, err := Open(context.Background(), Options{
+		Root: base, CommonDir: filepath.Join(base, "common"),
+		DBPath: filepath.Join(base, "state", "state.db"), RegistryPath: filepath.Join(base, "state", "registry.jsonl"),
+		LeaseStateDir: filepath.Join(base, "steal-state"), ProjectID: s.projectID, WorktreeID: "worktree-steal",
+		ProjectSlug: "aira", Prefixes: []string{"AIRA"}, Clock: stealClock, LeaseTTLNS: 900,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stealer.Close() })
+	reapClock.mono = 1000
+	s.beforeReapCAS = func(string) {
+		s.beforeReapCAS = nil
+		if _, err := stealer.Claim(context.Background(), ticket.ID, true, "stealer"); err != nil {
+			t.Fatalf("racing steal: %v", err)
+		}
+	}
+	reaped, err := s.ReapExpiredLeases(context.Background())
+	if err != nil || reaped != 0 {
+		t.Fatalf("reap count=%d err=%v", reaped, err)
+	}
+	lease, err := s.GetLease(context.Background(), ticket.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, ok := lease.Held()
+	if !ok || held.Generation() != 2 || held.Actor() != "stealer" {
+		t.Fatalf("stale generation was reaped: %#v", lease)
 	}
 }
 

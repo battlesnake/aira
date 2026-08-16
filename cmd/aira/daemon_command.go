@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -31,6 +33,10 @@ func runDaemonCommand(args []string, stdout, stderr io.Writer) int {
 		err := daemon.NewServer(paths).Serve(ctx)
 		if errors.Is(err, daemon.ErrAlreadyRunning) {
 			return 0
+		}
+		var drainTimeout *daemon.ErrDrainTimeout
+		if errors.As(err, &drainTimeout) {
+			exitOnDrainTimeout(err)
 		}
 		if err != nil {
 			_, _ = fmt.Fprintln(stderr, err)
@@ -64,4 +70,10 @@ func runDaemonCommand(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stderr, "E_SELECTOR_INVALID: unknown daemon operation %q\n", operation)
 		return store.ExitForCode("E_SELECTOR_INVALID")
 	}
+}
+
+func exitOnDrainTimeout(err error) {
+	heldErr := err
+	os.Exit(1)
+	runtime.KeepAlive(heldErr)
 }

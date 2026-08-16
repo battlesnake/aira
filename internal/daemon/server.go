@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -23,6 +24,20 @@ import (
 
 var ErrAlreadyRunning = errors.New("daemon already running")
 
+// ErrDrainTimeout retains ownership of the daemon lock when in-flight users do
+// not drain. Production treats this as process-terminal: releasing this value
+// could allow a second writer while the original goroutines still use the DB.
+type ErrDrainTimeout struct {
+	lock *os.File
+}
+
+func (e *ErrDrainTimeout) Error() string { return CodeTimeout + ": graceful drain timed out" }
+
+type scopeEntry struct {
+	view  *store.Store
+	ready chan struct{}
+}
+
 type Server struct {
 	Paths        Paths
 	DrainTimeout time.Duration
@@ -34,11 +49,15 @@ type Server struct {
 
 	mu     sync.Mutex
 	db     *store.DB
-	scopes map[string]*store.Store
+	scopes map[string]*scopeEntry
+
+	// Test seams. Production always calls Store.ReapExpiredLeases and DB.Close.
+	reapScope func(context.Context, *store.Store) (int, error)
+	closeDB   func(*store.DB) error
 }
 
 func NewServer(paths Paths) *Server {
-	return &Server{Paths: paths, DrainTimeout: 10 * time.Second, scopes: map[string]*store.Store{}}
+	return &Server{Paths: paths, DrainTimeout: 10 * time.Second, scopes: map[string]*scopeEntry{}}
 }
 
 // maxUnixSocketPath is the AF_UNIX sun_path capacity on Linux (108 bytes,
@@ -46,6 +65,10 @@ func NewServer(paths Paths) *Server {
 const maxUnixSocketPath = 107
 
 func (s *Server) Serve(ctx context.Context) (returnErr error) {
+	reapInterval, err := reapIntervalFromEnv()
+	if err != nil {
+		return err
+	}
 	if len(s.Paths.SocketPath) > maxUnixSocketPath {
 		// Fail fast with a clear code instead of a cryptic bind EINVAL. In
 		// production XDG_RUNTIME_DIR is short (/run/user/<uid>); an over-long one
@@ -63,14 +86,24 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
+	retainInstance := false
+	lockHeld := false
+	defer func() {
+		if retainInstance {
+			return
+		}
+		if lockHeld {
+			_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+		}
+		_ = lock.Close()
+	}()
 	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
 			return ErrAlreadyRunning
 		}
 		return err
 	}
-	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	lockHeld = true
 	if err := writeLockInfo(lock); err != nil {
 		return err
 	}
@@ -83,7 +116,14 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	}
 	s.db = db
 	defer func() {
-		if err := db.Close(); returnErr == nil && err != nil {
+		if retainInstance {
+			return
+		}
+		closeDB := db.Close
+		if s.closeDB != nil {
+			closeDB = func() error { return s.closeDB(db) }
+		}
+		if err := closeDB(); returnErr == nil && err != nil {
 			returnErr = err
 		}
 	}()
@@ -96,7 +136,17 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		_ = listener.Close()
 		return err
 	}
-	defer os.Remove(s.Paths.SocketPath)
+	defer func() {
+		if !retainInstance {
+			_ = os.Remove(s.Paths.SocketPath)
+		}
+	}()
+	reaperCtx, cancelReaper := context.WithCancel(ctx)
+	reaperDone := make(chan struct{})
+	go func() {
+		defer close(reaperDone)
+		s.runReaper(reaperCtx, reapInterval)
+	}()
 	if s.Ready != nil {
 		select {
 		case s.Ready <- struct{}{}:
@@ -113,14 +163,15 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		case <-stopping:
 		}
 	}()
-	defer close(stopping)
+	var serveErr error
 	for {
 		conn, acceptErr := listener.Accept()
 		if acceptErr != nil {
 			if ctx.Err() != nil || errors.Is(acceptErr, net.ErrClosed) {
 				break
 			}
-			return acceptErr
+			serveErr = acceptErr
+			break
 		}
 		connections.Add(1)
 		go func() {
@@ -130,8 +181,15 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 			s.serveConnection(context.Background(), conn)
 		}()
 	}
+	close(stopping)
+	cancelReaper()
+	_ = listener.Close()
 	drained := make(chan struct{})
-	go func() { connections.Wait(); close(drained) }()
+	go func() {
+		connections.Wait()
+		<-reaperDone
+		close(drained)
+	}()
 	timeout := s.DrainTimeout
 	if timeout <= 0 {
 		timeout = 10 * time.Second
@@ -139,9 +197,51 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	select {
 	case <-drained:
 	case <-time.After(timeout):
-		return fmt.Errorf("%s: graceful drain timed out", CodeTimeout)
+		retainInstance = true
+		return &ErrDrainTimeout{lock: lock}
 	}
-	return nil
+	return serveErr
+}
+
+func (s *Server) reap(ctx context.Context, view *store.Store) (int, error) {
+	if s.reapScope != nil {
+		return s.reapScope(ctx, view)
+	}
+	return view.ReapExpiredLeases(ctx)
+}
+
+func (s *Server) runReaper(ctx context.Context, interval time.Duration) {
+	if interval == 0 {
+		<-ctx.Done()
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		s.mu.Lock()
+		byProject := make(map[string]*store.Store)
+		for _, entry := range s.scopes {
+			select {
+			case <-entry.ready:
+				byProject[entry.view.ProjectID()] = entry.view
+			default:
+			}
+		}
+		s.mu.Unlock()
+		for projectID, view := range byProject {
+			if _, err := s.reap(ctx, view); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("aira daemon: reap project %s: %v", projectID, err)
+			}
+			if ctx.Err() != nil {
+				return
+			}
+		}
+	}
 }
 
 func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
@@ -297,8 +397,13 @@ func (s *Server) bootstrap(ctx context.Context, scope WorktreeScope, args map[st
 	}
 	key := strings.Join([]string{planRoot, planCommon, planGit, worktreeID, configDigest}, "\x00")
 	s.mu.Lock()
-	s.scopes[key] = view
+	entry := &scopeEntry{view: view, ready: make(chan struct{})}
+	s.scopes[key] = entry
 	s.mu.Unlock()
+	defer close(entry.ready)
+	if _, err := s.reap(context.Background(), view); err != nil {
+		log.Printf("aira daemon: initial reap project %s: %v", view.ProjectID(), err)
+	}
 	result := app.InitResult{Root: plan.Project.Root, Config: plan.Project.ConfigPath, Project: plan.Project.Config.Project.Slug, Prefixes: plan.Project.Config.Project.Prefixes, Created: true}
 	return core.Response{OK: true, Code: "OK", Data: result}
 }
@@ -353,9 +458,10 @@ func (s *Server) storeForScope(scope WorktreeScope) (*store.Store, bool, error) 
 	}
 	key := strings.Join([]string{root, common, gitDir, worktreeID, scope.ConfigDigest}, "\x00")
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if cached := s.scopes[key]; cached != nil {
-		return cached, true, nil
+		s.mu.Unlock()
+		<-cached.ready
+		return cached.view, true, nil
 	}
 	leaseDir := filepath.Join(s.Paths.LeaseStateDir, worktreeID)
 	scope.ReviewPolicy.Configured = scope.ReviewConfigured
@@ -369,8 +475,15 @@ func (s *Server) storeForScope(scope WorktreeScope) (*store.Store, bool, error) 
 		MaxQuotaSnapshots: scope.MaxQuotaSnapshots, ConfigDigest: scope.ConfigDigest,
 	})
 	if err != nil {
+		s.mu.Unlock()
 		return nil, false, err
 	}
-	s.scopes[key] = view
+	entry := &scopeEntry{view: view, ready: make(chan struct{})}
+	s.scopes[key] = entry
+	s.mu.Unlock()
+	defer close(entry.ready)
+	if _, err := s.reap(context.Background(), view); err != nil {
+		log.Printf("aira daemon: initial reap project %s: %v", view.ProjectID(), err)
+	}
 	return view, false, nil
 }

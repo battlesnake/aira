@@ -72,6 +72,11 @@ type leaseRow struct {
 	worktree            sql.NullString
 }
 
+type reapCandidate struct {
+	ticketID   string
+	generation int64
+}
+
 func defaultLeaseStateDir() string {
 	if value := os.Getenv("XDG_STATE_HOME"); value != "" {
 		return filepath.Join(value, "aira")
@@ -547,4 +552,94 @@ func (s *Store) GetLease(ctx context.Context, ticketID string) (domain.Lease, er
 		return domain.Lease{}, err
 	}
 	return leaseFromRow(ticketID, row)
+}
+
+// ReapExpiredLeases frees only leases that are positively expired at the one
+// clock sample taken for this sweep. Detection is advisory; every free repeats
+// the exact expiry predicate under BEGIN IMMEDIATE and the detected generation.
+func (s *Store) ReapExpiredLeases(ctx context.Context) (int, error) {
+	bootID, monoNS, err := s.sampleClock()
+	if err != nil {
+		return 0, err
+	}
+
+	rows, err := s.db.QueryContext(ctx, `SELECT ticket_id, generation, boot_id, last_heartbeat_mono_ns, ttl_ns
+		FROM leases WHERE project_id=? AND state='held'`, s.projectID)
+	if err != nil {
+		return 0, err
+	}
+	var candidates []reapCandidate
+	for rows.Next() {
+		var ticketID, rowBootID string
+		var generation, lastHeartbeatMonoNS, ttlNS int64
+		if err := rows.Scan(&ticketID, &generation, &rowBootID, &lastHeartbeatMonoNS, &ttlNS); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		last := uint64(lastHeartbeatMonoNS)
+		ttl := uint64(ttlNS)
+		if rowBootID != bootID || (monoNS >= last && monoNS-last >= ttl) {
+			candidates = append(candidates, reapCandidate{ticketID: ticketID, generation: generation})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+
+	reaped := 0
+	for _, candidate := range candidates {
+		if err := ctx.Err(); err != nil {
+			return reaped, err
+		}
+		if s.beforeReapCAS != nil {
+			s.beforeReapCAS(candidate.ticketID)
+		}
+		changed := false
+		err := s.withImmediate(ctx, func(conn *sql.Conn) error {
+			result, err := conn.ExecContext(ctx, `UPDATE leases SET state='free', generation=generation+1,
+				holder_token_hash=NULL, boot_id=NULL, last_heartbeat_mono_ns=NULL,
+				ttl_ns=NULL, actor=NULL, worktree_id=NULL
+				WHERE project_id=? AND ticket_id=? AND state='held' AND generation=?
+				AND (boot_id<>? OR (?>=last_heartbeat_mono_ns AND ?-last_heartbeat_mono_ns>=ttl_ns))`,
+				s.projectID, candidate.ticketID, candidate.generation, bootID, int64(monoNS), int64(monoNS))
+			if err != nil {
+				return err
+			}
+			affected, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if affected == 0 {
+				return nil
+			}
+			if affected != 1 {
+				return fmt.Errorf("E_INTERNAL: reap changed %d leases", affected)
+			}
+			seq, err := nextSequence(ctx, conn, s.projectID)
+			if err != nil {
+				return err
+			}
+			if err := insertEventActor(ctx, conn, s.projectID, seq, "aira-daemon", "lease.lapse", candidate.ticketID); err != nil {
+				return err
+			}
+			if _, err := conn.ExecContext(ctx, `INSERT INTO outbox(project_id, seq, worktree_id, path, verb,
+				precondition_digest, intended_digest, intended_bytes, materialised, allocation_id)
+				VALUES(?, ?, '', '', 'lease.lapse', '', '', NULL, 1, '')`, s.projectID, seq); err != nil {
+				return err
+			}
+			changed = true
+			return nil
+		})
+		if err != nil {
+			return reaped, err
+		}
+		if changed {
+			reaped++
+		}
+	}
+	return reaped, nil
 }

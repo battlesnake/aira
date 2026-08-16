@@ -9,11 +9,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"aira/internal/core"
+	"aira/internal/domain"
 	"aira/internal/store"
 )
 
@@ -391,6 +394,11 @@ func TestServerGracefulDrainCompletesInflightRequest(t *testing.T) {
 	server := NewServer(paths)
 	started := make(chan struct{})
 	release := make(chan struct{})
+	dbClosed := make(chan struct{})
+	server.closeDB = func(db *store.DB) error {
+		close(dbClosed)
+		return db.Close()
+	}
 	server.Handle = func(context.Context, WorktreeScope, core.Request) core.Response {
 		close(started)
 		<-release
@@ -418,6 +426,468 @@ func TestServerGracefulDrainCompletesInflightRequest(t *testing.T) {
 	if response := <-responses; !response.OK {
 		t.Fatalf("drained response = %+v", response)
 	}
+	select {
+	case <-dbClosed:
+	case <-time.After(time.Second):
+		t.Fatal("DB was not closed after all users drained")
+	}
+}
+
+type daemonTestClock struct {
+	boot string
+	mono uint64
+}
+
+func (c daemonTestClock) Now() (string, uint64, error) { return c.boot, c.mono, nil }
+
+func prepareExpiredDaemonLease(t *testing.T, paths Paths, scope WorktreeScope) string {
+	t.Helper()
+	db, err := store.OpenDB(paths.DBPath, paths.RegistryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.NewScope(db, store.ScopeOptions{
+		Root: scope.Root, CommonDir: scope.CommonDir, GitDir: scope.GitDir,
+		ProjectID: scope.ProjectID, WorktreeID: scope.WorktreeID, ProjectSlug: scope.Slug,
+		Prefixes: scope.Prefixes, LeaseStateDir: paths.LeaseStateDir, LeaseTTLNS: 1,
+		ConfigDigest: scope.ConfigDigest, Clock: daemonTestClock{boot: currentBootID(), mono: 0},
+	})
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	ticket, err := view.CreateTicket(context.Background(), domain.CreateTicketInput{
+		Title: "restart gap", Kind: domain.KindFeature, Severity: domain.SeverityP2,
+	})
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := view.Claim(context.Background(), ticket.ID, false, "old-holder"); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return ticket.ID
+}
+
+func TestReapOnScopeBuildClosesRestartGap(t *testing.T) {
+	paths := testPaths(t)
+	scope := testScope(t, paths, "restart-gap")
+	scope.LeaseTTLNS = 1
+	ticketID := prepareExpiredDaemonLease(t, paths, scope)
+	db, err := store.OpenDB(paths.DBPath, paths.RegistryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	server := NewServer(paths)
+	server.db = db
+	serverConn, clientConn := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		server.serveConnection(context.Background(), serverConn)
+		close(done)
+	}()
+	if err := writeFrame(clientConn, RequestFrame{
+		Proto: ProtocolVersion, Scope: scope,
+		Request: core.Request{Verb: "claim", Args: map[string]any{"selector": ticketID, "actor": "new-holder"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var response ResponseFrame
+	if err := readFrame(clientConn, &response); err != nil {
+		t.Fatal(err)
+	}
+	_ = clientConn.Close()
+	<-done
+	if !response.OK {
+		t.Fatalf("plain post-restart claim response=%+v", response)
+	}
+	conn, err := sql.Open("sqlite", paths.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	var lapses int
+	if err := conn.QueryRow(`SELECT count(*) FROM events WHERE project_id=? AND verb='lease.lapse'`, scope.ProjectID).Scan(&lapses); err != nil {
+		t.Fatal(err)
+	}
+	if lapses != 1 {
+		t.Fatalf("lease.lapse events=%d, want 1", lapses)
+	}
+	server.mu.Lock()
+	var view *store.Store
+	for _, entry := range server.scopes {
+		view = entry.view
+		break
+	}
+	server.mu.Unlock()
+	if view == nil {
+		t.Fatal("fresh daemon did not cache the built scope")
+	}
+	if err := view.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	journal, err := os.ReadFile(filepath.Join(scope.CommonDir, "aira", "journal.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(journal, []byte(`"verb":"lease.lapse"`)) {
+		t.Fatalf("reconcile did not materialise lease.lapse: %s", journal)
+	}
+}
+
+func TestScopeBuildBarrierSingleflightAndOtherProjectConcurrency(t *testing.T) {
+	paths := testPaths(t)
+	db, err := store.OpenDB(paths.DBPath, paths.RegistryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	server := NewServer(paths)
+	server.db = db
+	blockedScope := independentScope(t, paths, "blocked", "BLOCK")
+	otherScope := independentScope(t, paths, "other", "OTHER")
+	if _, _, err := server.storeForScope(otherScope); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var blockedCalls atomic.Int32
+	server.reapScope = func(_ context.Context, view *store.Store) (int, error) {
+		if view.ProjectID() == blockedScope.ProjectID {
+			if blockedCalls.Add(1) == 1 {
+				close(started)
+			}
+			<-release
+		}
+		return 0, nil
+	}
+	creatorDone := make(chan error, 1)
+	go func() {
+		_, _, err := server.storeForScope(blockedScope)
+		creatorDone <- err
+	}()
+	<-started
+
+	waiterDone := make(chan error, 1)
+	go func() {
+		_, _, err := server.storeForScope(blockedScope)
+		waiterDone <- err
+	}()
+	select {
+	case err := <-waiterDone:
+		t.Fatalf("same-scope request overtook initial reap: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	otherDone := make(chan error, 1)
+	go func() {
+		_, _, err := server.storeForScope(otherScope)
+		otherDone <- err
+	}()
+	select {
+	case err := <-otherDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("slow on-build reap held s.mu and blocked another project's cached scope")
+	}
+	close(release)
+	if err := <-creatorDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-waiterDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := blockedCalls.Load(); got != 1 {
+		t.Fatalf("initial reap calls=%d, want singleflight 1", got)
+	}
+}
+
+func TestScopeBuildReapFailureIsBestEffortAndClosesBarrier(t *testing.T) {
+	paths := testPaths(t)
+	db, err := store.OpenDB(paths.DBPath, paths.RegistryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	server := NewServer(paths)
+	server.db = db
+	server.reapScope = func(context.Context, *store.Store) (int, error) {
+		return 0, errors.New("fixture reap failure")
+	}
+	scope := independentScope(t, paths, "best-effort", "BEST")
+	if _, cached, err := server.storeForScope(scope); err != nil || cached {
+		t.Fatalf("creator cached=%v err=%v", cached, err)
+	}
+	if _, cached, err := server.storeForScope(scope); err != nil || !cached {
+		t.Fatalf("waiter cached=%v err=%v", cached, err)
+	}
+}
+
+func TestScopeBuildPanicStillClosesBarrier(t *testing.T) {
+	paths := testPaths(t)
+	db, err := store.OpenDB(paths.DBPath, paths.RegistryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	server := NewServer(paths)
+	server.db = db
+	started := make(chan struct{})
+	server.reapScope = func(context.Context, *store.Store) (int, error) {
+		close(started)
+		panic("fixture reap panic")
+	}
+	scope := independentScope(t, paths, "panic-barrier", "PANIC")
+	recovered := make(chan any, 1)
+	go func() {
+		defer func() { recovered <- recover() }()
+		_, _, _ = server.storeForScope(scope)
+	}()
+	<-started
+	if panicValue := <-recovered; panicValue == nil {
+		t.Fatal("initial reap did not panic")
+	}
+	server.reapScope = nil
+	waiter := make(chan error, 1)
+	go func() {
+		_, _, err := server.storeForScope(scope)
+		waiter <- err
+	}()
+	select {
+	case err := <-waiter:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("same-scope waiter remained blocked after initial reap panic")
+	}
+}
+
+func TestPeriodicReaperDedupesProjectsAndSkipsUnreadyScopes(t *testing.T) {
+	paths := testPaths(t)
+	db, err := store.OpenDB(paths.DBPath, paths.RegistryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	server := NewServer(paths)
+	server.db = db
+	first := testScope(t, paths, "periodic-one")
+	second := testScope(t, paths, "periodic-two")
+	firstView, _, err := server.storeForScope(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondView, _, err := server.storeForScope(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.mu.Lock()
+	server.scopes["unready"] = &scopeEntry{view: firstView, ready: make(chan struct{})}
+	server.mu.Unlock()
+	var calls atomic.Int32
+	called := make(chan struct{}, 1)
+	server.reapScope = func(ctx context.Context, _ *store.Store) (int, error) {
+		calls.Add(1)
+		select {
+		case called <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		server.runReaper(ctx, time.Millisecond)
+		close(done)
+	}()
+	<-called
+	cancel()
+	<-done
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("periodic calls=%d, want one deduped project sweep", got)
+	}
+	if firstView.ProjectID() != secondView.ProjectID() {
+		t.Fatal("fixture worktrees did not share a project")
+	}
+}
+
+func TestPeriodicReaperContinuesAfterSweepError(t *testing.T) {
+	paths := testPaths(t)
+	db, err := store.OpenDB(paths.DBPath, paths.RegistryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	server := NewServer(paths)
+	server.db = db
+	if _, _, err := server.storeForScope(independentScope(t, paths, "periodic-error", "PERR")); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	second := make(chan struct{})
+	server.reapScope = func(context.Context, *store.Store) (int, error) {
+		if calls.Add(1) == 1 {
+			return 0, errors.New("fixture periodic failure")
+		}
+		close(second)
+		return 0, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		server.runReaper(ctx, time.Millisecond)
+		close(done)
+	}()
+	select {
+	case <-second:
+	case <-time.After(time.Second):
+		t.Fatal("ticker stopped after a sweep error")
+	}
+	cancel()
+	<-done
+}
+
+func TestShutdownWaitsForReaperAsWellAsConnections(t *testing.T) {
+	t.Setenv("AIRA_DAEMON_REAP_INTERVAL", "1ms")
+	paths := testPaths(t)
+	server := NewServer(paths)
+	server.DrainTimeout = 20 * time.Millisecond
+	var calls atomic.Int32
+	reaperStarted := make(chan struct{})
+	releaseReaper := make(chan struct{})
+	reaperFinished := make(chan struct{})
+	server.reapScope = func(context.Context, *store.Store) (int, error) {
+		if calls.Add(1) == 1 { // on-build sweep
+			return 0, nil
+		}
+		close(reaperStarted)
+		<-releaseReaper
+		close(reaperFinished)
+		return 0, nil
+	}
+	var closes atomic.Int32
+	server.closeDB = func(db *store.DB) error {
+		closes.Add(1)
+		return db.Close()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	ready := make(chan struct{}, 1)
+	server.Ready = ready
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx) }()
+	select {
+	case <-ready:
+	case err := <-done:
+		t.Fatalf("daemon exited before ready: %v", err)
+	}
+	scope := independentScope(t, paths, "reaper-drain", "RDRAIN")
+	response, err := Exchange(context.Background(), paths.SocketPath, RequestFrame{
+		Proto: ProtocolVersion, Scope: scope, Request: core.Request{Verb: "list"},
+	})
+	if err != nil || !response.OK {
+		t.Fatalf("scope build response=%+v err=%v", response, err)
+	}
+	<-reaperStarted
+	cancel()
+	serveErr := <-done
+	var drainTimeout *ErrDrainTimeout
+	if !errors.As(serveErr, &drainTimeout) {
+		t.Fatalf("Serve error=%v, want ErrDrainTimeout", serveErr)
+	}
+	if closes.Load() != 0 {
+		t.Fatal("DB closed while periodic reaper was still active")
+	}
+	close(releaseReaper)
+	<-reaperFinished
+	if err := server.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := drainTimeout.lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(paths.SocketPath)
+}
+
+func TestDrainTimeoutRetainsLockSkipsDBCloseAndSurvivesGC(t *testing.T) {
+	t.Setenv("AIRA_DAEMON_REAP_INTERVAL", "disabled")
+	paths := testPaths(t)
+	server := NewServer(paths)
+	server.DrainTimeout = 20 * time.Millisecond
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server.Handle = func(context.Context, WorktreeScope, core.Request) core.Response {
+		close(started)
+		<-release
+		return core.Response{OK: true, Code: "OK"}
+	}
+	var closes atomic.Int32
+	server.closeDB = func(db *store.DB) error {
+		closes.Add(1)
+		return db.Close()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	ready := make(chan struct{}, 1)
+	server.Ready = ready
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx) }()
+	select {
+	case <-ready:
+	case err := <-done:
+		t.Fatalf("daemon exited before ready: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("daemon did not become ready")
+	}
+	exchangeDone := make(chan error, 1)
+	go func() {
+		_, err := Exchange(context.Background(), paths.SocketPath, RequestFrame{
+			Proto: ProtocolVersion, Scope: testScope(t, paths, "wedged"), Request: core.Request{Verb: "list"},
+		})
+		exchangeDone <- err
+	}()
+	<-started
+	cancel()
+	serveErr := <-done
+	var drainTimeout *ErrDrainTimeout
+	if !errors.As(serveErr, &drainTimeout) || drainTimeout.lock == nil {
+		t.Fatalf("Serve error=%T %v, want lock-owning ErrDrainTimeout", serveErr, serveErr)
+	}
+	if closes.Load() != 0 {
+		t.Fatal("DB was closed on drain timeout")
+	}
+	runtime.GC()
+	replacementCtx, replacementCancel := context.WithTimeout(context.Background(), time.Second)
+	defer replacementCancel()
+	if replacementErr := NewServer(paths).Serve(replacementCtx); !errors.Is(replacementErr, ErrAlreadyRunning) {
+		t.Fatalf("replacement Serve after GC=%v, want ErrAlreadyRunning", replacementErr)
+	}
+	close(release)
+	if exchangeErr := <-exchangeDone; exchangeErr != nil {
+		t.Fatal(exchangeErr)
+	}
+	if closes.Load() != 0 {
+		t.Fatal("timed-out Serve later closed DB")
+	}
+	// A real daemon exits immediately. The test has now drained the worker and
+	// may explicitly release retained resources belonging to its unique fixture.
+	if err := server.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := drainTimeout.lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// The socket pathname intentionally persisted. A replacement acquires the
+	// released lock and removes that stale pathname before binding.
+	recovered := NewServer(paths)
+	_, _ = startServer(t, recovered)
 }
 
 func TestPathsNamespaceStateIdentity(t *testing.T) {
