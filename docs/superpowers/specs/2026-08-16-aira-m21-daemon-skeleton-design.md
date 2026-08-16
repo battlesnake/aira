@@ -1,6 +1,6 @@
-# M21 — Daemon skeleton (mandatory DB-owning daemon), v2
+# M21 — Daemon skeleton (mandatory DB-owning daemon), v3
 
-**Status:** plan (Sol plan-review round 1 → REQUEST-CHANGES; this is v2). **Milestone:** Phase 5 · M21.
+**Status:** plan (Sol plan-review r1+r2 → REQUEST-CHANGES; this is v3). **Milestone:** Phase 5 · M21.
 **Branch:** `codex-aira-m21`. **Amends a spec principle:** §5.2 (see §1).
 
 ## 1. Purpose and the §5.2 amendment
@@ -12,13 +12,16 @@ machine-wide `state.db`**, for the single-writer concurrency win (no cross-proce
 contention / `BEGIN IMMEDIATE` waits / machine-wide flock dances) that compounds under
 parallel load and produced the WSL2 flakes.
 
-**Honest scope of the win in M21 (Sol r1):** the skeleton delivers single-writer for
-**pure-store coordination verbs only**. Foreground-run telemetry and the M20 detach shim
-remain direct DB writers (§7), so `BEGIN IMMEDIATE` contention is **reduced, not yet
-eliminated**, in M21 — full elimination arrives when the execution surface is folded behind
-the daemon (deferrals D5/D7, the very next cut). This is stated, not overclaimed. And a
-single writer never cures the raw transient WSL2 vhdx `write()` EIO (`SQLITE_IOERR 778`) — the
-`store.Open` retry (`995eedc`) remains regardless.
+**Honest scope of the win in M21 (Sol r1/r2):** the skeleton delivers single-writer for
+**routed pure-store coordination verbs only**. The carved-out verbs (§5.1) run in the client
+process and therefore write `state.db` directly — not only foreground-run telemetry and the
+M20 detach shim, but *every* carved verb, because obtaining its runner goes through
+`app.Open`→`store.Open`, whose schema-init + `register()` do `BEGIN IMMEDIATE` writes, and
+because `reconcile`/`check` call `store.Reconcile` before the runner. §7 enumerates this whole
+transitional direct-writer set. So in M21 `BEGIN IMMEDIATE` contention is **reduced, not
+eliminated** — full elimination arrives when the carved surface is folded behind the daemon
+(D7, the next cut). Stated, not overclaimed. And a single writer never cures the raw transient
+WSL2 vhdx `write()` EIO (`SQLITE_IOERR 778`) — the `store.Open` retry (`995eedc`) remains.
 
 **M21 is the foundation cut:** the daemon process, the transport, the store-scoping refactor,
 and client routing for both faces. No reaper/reconciler/watch/fairness-queue/fenced-lease/
@@ -78,31 +81,39 @@ git and never uses its own cwd (§5.3).
 
 ### 5.1 Routing classification (operation/selector granular)
 
-**Criterion (the source of truth, not a hand list):** a `(verb, args)` operation is
-**carved-out** (runs in-process, client-side) iff its handler can reach `c.runner` or
-`c.gitops`. Everything else is **routed** to the daemon's pure-store core. The daemon core is
-built with **runner and GitOps nil**, which is why carved-out ops must never reach it — and is
-exactly why they are carved out (a nil-runner core would otherwise return a false
-`E_RUN_UNAVAILABLE`, Sol r1 #1).
+**Criterion (the source of truth, not a hand list):** a `(verb, selector)` operation is
+**carved-out** (runs in-process, client-side) iff its handler can reach the runner or GitOps
+**by any path** — `Core.runner`/`Core.gitops` *or* `Store.runner` (the command-gate lane goes
+through the store, Sol r2 #1). Everything else is **routed** to the daemon's pure-store core
+(runner/GitOps nil). Carved ops must never reach the daemon core — not because they'd error
+(they often silently *change behaviour* instead: `show RUN-*` falls through to `store.Get`,
+`reconcile`/`check` skip their `if c.runner != nil` branch), but because that silent
+divergence is exactly what routing them would cause.
 
 Enumerated from the real dispatch table (`internal/core/core.go` `dispatchTable()`), audited
-against every `c.runner`/`c.gitops` reference:
+against every runner/GitOps reference in `internal/core` **and** `internal/store`:
 
 - **Selector-granular:** `show` — `show RUN-*` reaches `c.runner.Get` (core.go:570) → carve
   out; `show TICKET-*`/other selectors → route. The classifier inspects the selector.
 - **Verb-level carve-out:** `run`, `run-kill`, `run-log` (`Launch`/`Kill`/`ReadOutput`);
-  `reconcile`, `check` (call `runner.Reconcile`, core.go:1406/1424); `git` (GitOps network
-  ops); any `gate` evaluation that executes a command lane (launches a subprocess).
+  `reconcile`, `check` (call `store.Reconcile` **and** `runner.Reconcile`, core.go:1394/1406/
+  1424); `git` (GitOps network ops); and **all** `gate run` / `gate canary-run` operations —
+  whether a gate *executes* a command lane is **data-dependent** (gate content loaded from
+  disk, via `Store.runner`), which the dispatcher cannot decide from `(verb, args)`, so they
+  are carved out **wholesale** rather than by lane (Sol r2 #1). Non-executing `gate`
+  subcommands (list/show/attest) route.
 - **Routed (pure store):** all other verbs — `id`, `create`, `list`, `get`, `set`, `mv`,
   `claim`, `release`, `heartbeat`, `touch`, `link`, `unlink`, `find(ing)`, `req`, `ready`,
   `review`, `import` (see §5.3), `test-report`, `spend`, `quota`, `grep`, `insights`, `count`,
   `project`, `milestone`, `roadmap`/`backlog`/`stats` (whichever are dispatch verbs), `init`
   (bootstrap, §5.3).
 
-**Completeness is enforced, not asserted in prose:**
-1. A build-time test builds a pure-store core (runner/GitOps nil) and, for every **routed**
-   verb, exercises a representative operation asserting it never returns the nil-runner/nil-
-   GitOps sentinel — i.e. no routed verb secretly needs the runner/GitOps.
+**Completeness is enforced by a behaviour test, not a nil check (Sol r2 #1):**
+1. Build a core over **recording sentinel** dependencies — a runner and GitOps (and a
+   store whose `runner` is a recording sentinel) that record any call. For every **routed**
+   `(verb, selector)`, including data-dependent branches (fixtures that would exercise a gate
+   command lane, a RUN selector, a reconcile with run records), assert the sentinels are
+   **never touched**. A routed verb that reaches a sentinel is a misclassification → fail.
 2. The `AfterWrite` producer (detached `run`, core.go:35) is inside the carve-out; a test
    asserts no routed verb returns a non-nil `AfterWrite`. (Confirmed true today by Sol r1.)
 3. **Honesty rule:** a routed verb later found to need the runner/GitOps is reclassified to
@@ -160,6 +171,16 @@ alias (second worktree writes under the first `Root`, attributes claims/leases t
 - **Concurrency:** the shared `*sql.DB` with `MaxOpenConns(1)` already serialises statements
   in-process; scopes are stateless views. Any per-scope mutable caches (e.g. prefix maps) are
   built per scope, not shared.
+- **Ownership contract (Sol r2 #4):** the `*DB` is closed by exactly one owner. The daemon
+  owns its shared `*DB` and closes it only on shutdown; a **scope's `Close()` is a no-op /
+  release** and must never close the shared connection (today `Store.Close()` closes `s.db` —
+  a scope view must not). The in-process convenience open owns its private DB and closes it as
+  today. A test asserts closing a scope leaves the shared `*DB` usable.
+- **Identity is recomputed, never trusted (Sol r2 #4):** `NewScope` / the daemon recompute
+  the canonical `ProjectID = hash(canonical CommonDir)` and `WorktreeID = hash(canonical
+  GitDir)` from the descriptor's paths, and reject a descriptor whose supplied ProjectID/
+  WorktreeID disagree (`E_DAEMON_PROJECT_INVALID`) — so a malformed descriptor can never
+  register or write under an arbitrary identity.
 
 ### 5.5 Daemon identity, socket, and the startup state machine (Sol r1 #5, #6)
 
@@ -177,10 +198,16 @@ alias (second worktree writes under the first `Root`, attributes claims/leases t
   3. Under the lock: re-`connect` (someone may have just won) → success → **release lock**, use
      it. Else the socket is stale/absent: `unlink` it (safe — we hold the lock), **release the
      lock**, then `fork+exec` `/proc/self/exe daemon`.
-  4. Poll `connect` with a bounded deadline; detect child early-exit (waitpid/`ESRCH`) →
-     `E_DAEMON_UNAVAILABLE` with the child's stderr; deadline exceeded → `E_DAEMON_TIMEOUT`.
+  4. Poll `connect` with a bounded deadline **regardless of our own child's fate** — under a
+     race, several clients fork and all but one child exits 0 after losing the daemon flock;
+     that is a **won race by another client**, not a failure (Sol r2 #3). So: our child exiting
+     **0** → keep polling (the winner's socket is coming up). A **non-zero** child exit → record
+     its stderr but keep polling until the deadline (a concurrent daemon may still serve us).
+     Only the bounded deadline elapsing with no acceptable socket → `E_DAEMON_TIMEOUT` (or
+     `E_DAEMON_UNAVAILABLE` if the last child failure is the sole cause). A `connect` that
+     succeeds at any point wins immediately.
   5. The spawned daemon acquires the **same** `flock` before binding (single-instance); a loser
-     exits 0.
+     exits 0 — expected under a race, per step 4.
 - **Authorized replacement (proto mismatch / `daemon stop`):** the client signals the running
   daemon (via the socket control verb or SIGTERM to the pid in `daemon.lock`), waits (bounded)
   for it to release the lock + remove the socket, then auto-starts. Never `unlink` a socket
@@ -211,14 +238,25 @@ No env flag (a process cannot distinguish a "temporary override" from a user's r
 
 ## 7. Transitional direct-writers (named, folded later)
 
-Carved-out verbs (§5.1) run in-process client-side and write `state.db` directly: the
-execution surface (`run`/`run-kill`/`run-log`, and each verb's M19 telemetry wiring), the M20
-detach **shim** (a separate long-lived process), `git`/`gate`-eval. These are the *same*
-writers that exist today and are individually crash-safe against the WAL DB (single-writer is
-a routing policy, not a SQLite lock), so leaving them direct in M21 is the pre-daemon status
-quo for those verbs — now explicitly scoped for folding in D5 (shim/fenced lease) and D7
-(execution + telemetry through the daemon). Until then, `BEGIN IMMEDIATE` contention is reduced
-(coordination serialised through the daemon), not eliminated (§1).
+Carved-out verbs (§5.1) run in-process client-side and therefore write `state.db` directly.
+The honest, complete enumeration (Sol r2 #2) — larger than "run-telemetry + shim":
+
+1. **Every carved verb's `store.Open`** — obtaining the client-side runner goes through
+   `app.Open`→`store.Open`, whose schema-init + `register()` do `BEGIN IMMEDIATE` writes. So
+   `git`, `run-log`, `show RUN-*`, and all carved verbs perform at least a `register` DB write
+   in the client process (idempotent; may double-write a row the daemon also registers).
+2. **`reconcile`/`check`** additionally call `store.Reconcile` (outbox replay → journal/DB
+   writes) before the runner phase.
+3. **`run`/`run-kill`/`run-log`** and their M19 telemetry wiring (`AddComputeEvent`/
+   `AddTestReport`), plus the M20 detach **shim** (a separate long-lived process).
+
+These are the *same* writers that exist today and are individually crash-safe against the WAL
+DB (single-writer is a routing policy, not a SQLite lock), so leaving them direct in M21 is the
+pre-daemon status quo — now explicitly scoped for folding in D7 (route the carved verbs' store
+phase — incl. `register` and `store.Reconcile` — through the daemon; decompose store-phase vs
+client-runner-phase) and D5 (shim / fenced lease). Until then `BEGIN IMMEDIATE` contention is
+**reduced** (routed coordination serialised through the daemon), not eliminated (§1). A test
+documents this set so the claim stays honest as verbs migrate.
 
 ## 8. Lifecycle and failure semantics
 
@@ -244,15 +282,24 @@ coordination verdict; transport failures are surfaced, never converted to a fake
   coordination verb over the socket returns byte-identical to the in-process result.
 - **MCP routing:** an MCP **mutation** is driven through the daemon (proves §5.6 — MCP is not a
   second writer).
-- **Carve-out completeness:** every routed verb exercised against a nil-runner/nil-GitOps core
-  never hits the nil sentinel; no routed verb returns a non-nil `AfterWrite` (§5.1).
+- **Carve-out completeness (recording sentinels, not nil):** every routed `(verb, selector)`
+  — incl. data-dependent branches (a gate-command-lane fixture, a RUN selector, a reconcile
+  with run records) — exercised against a core whose runner/GitOps and `Store.runner` are
+  **recording sentinels** must never touch a sentinel; no routed verb returns a non-nil
+  `AfterWrite` (§5.1).
 - **Sibling-worktree isolation:** two worktrees, same config, served by one daemon → each
   writes under its own `Root` and attributes claims/leases to its own `WorktreeID` (proves
   §5.4 — no aliasing).
+- **Scope-close ownership:** closing a per-worktree scope leaves the shared daemon `*DB`
+  usable (a subsequent routed verb still works); only `DB.Close()` closes the connection (§5.4).
+- **Recomputed identity:** a descriptor whose supplied ProjectID/WorktreeID disagree with
+  `hash(canonical CommonDir/GitDir)` is rejected `E_DAEMON_PROJECT_INVALID` — no write under a
+  forged identity (§5.4).
 - **State-identity pinning:** a client whose scope implies a different state home is rejected
   `E_DAEMON_PROJECT_INVALID`; two different `XDG_STATE_HOME` → two different sockets/daemons.
-- **Single-instance race:** N concurrent auto-starts → exactly one binds; losers connect; N
-  successes, one lock holder, one socket.
+- **Single-instance race + loser keeps polling:** N concurrent auto-starts → exactly one binds;
+  the N−1 losing children exit 0 and their clients **keep polling and still succeed** (never
+  false-fail `E_DAEMON_UNAVAILABLE`, Sol r2 #3); N successes, one lock holder, one socket.
 - **Stale-socket recovery / child early-exit / bounded timeout:** each yields the correct
   `E_DAEMON_*` (§5.5), never a silent in-process production write.
 - **`import` path safety:** a routed `import` reads bytes client-side; a daemon-cwd-relative
@@ -279,14 +326,20 @@ coordination verdict; transport failures are surfaced, never converted to a fake
 
 1. **Byte-identical relay:** a routed verb's socket `Response` equals the in-process one
    (Data/Code/Warnings/Exit); nothing lost/reordered across the frame.
-2. **Carve-out completeness + AfterWrite:** every runner/GitOps-touching (verb, selector) is
-   carved out; no routed verb hits the nil sentinel or returns a non-nil `AfterWrite`.
-3. **Store scoping:** sibling worktrees never alias; scopeKey includes worktree identity;
-   one DB connection, per-worktree views; no per-scope state shared unsafely.
-4. **State identity:** the daemon pins its own DB/lease paths; a foreign-state scope is
-   rejected; socket/lock namespaced by state-id.
+2. **Carve-out completeness (recording sentinels) + AfterWrite:** every runner/GitOps-touching
+   path — via `Core.runner`/`gitops` OR `Store.runner` (command gates), incl. data-dependent
+   `gate run`/`canary-run` (carved wholesale) — is carved out; the recording-sentinel test
+   proves no routed verb touches a sentinel (not merely "no nil error"); no routed verb returns
+   a non-nil `AfterWrite`.
+3. **Store scoping + ownership:** sibling worktrees never alias; scopeKey includes worktree
+   identity recomputed from paths (forged identity rejected); one DB connection, per-worktree
+   views; `DB.Close()` owns the connection and scope `Close()` is a no-op; no per-scope state
+   shared unsafely.
+4. **State identity:** the daemon pins its own DB/lease paths; a foreign-state or
+   identity-mismatched scope is rejected; socket/lock namespaced by state-id.
 5. **Startup state machine:** flock-before-bind; release-before-fork; stale socket removed only
-   under lock; child early-exit + bounded timeout → correct `E_DAEMON_*`; no two-daemon window.
+   under lock; a losing child's exit-0 keeps the client polling (no false-fail); only the
+   bounded deadline → `E_DAEMON_TIMEOUT`; no two-daemon window.
 6. **Both faces routed:** CLI and MCP share the dispatcher; no production `store.Open`+`core.Do`
    of a routed verb; the MCP-mutation test passes.
 7. **Loud-failure honesty:** every unreachable path returns `E_DAEMON_*`, never a silent
