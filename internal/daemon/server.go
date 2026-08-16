@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -152,17 +153,31 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		}
 	}()
 	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
-	var request RequestFrame
-	if err := readFrame(conn, &request); err != nil {
+	request, storeOp, err := readInboundFrame(conn)
+	if err != nil {
 		wrote = writeFrame(conn, errorFrame(CodeProtocol, err.Error())) == nil
 		return
 	}
-	if request.Proto != ProtocolVersion {
-		wrote = writeFrame(conn, protocolMismatchFrame(fmt.Sprintf("%s: daemon protocol is %d, client requested %d", CodeProtocol, ProtocolVersion, request.Proto))) == nil
+	proto := request.Proto
+	scope := request.Scope
+	if storeOp != nil {
+		proto = storeOp.Proto
+		scope = storeOp.Scope
+	}
+	if proto != ProtocolVersion {
+		wrote = writeFrame(conn, protocolMismatchFrame(fmt.Sprintf("%s: daemon protocol is %d, client requested %d", CodeProtocol, ProtocolVersion, proto))) == nil
 		return
 	}
-	if request.Scope.StateID != "" && request.Scope.StateID != s.Paths.StateID {
+	if scope.StateID != "" && scope.StateID != s.Paths.StateID {
 		wrote = writeFrame(conn, errorFrame(CodeProjectInvalid, CodeProjectInvalid+": state identity does not match daemon")) == nil
+		return
+	}
+	if storeOp != nil {
+		if storeOp.Op != "ensure-scope" {
+			wrote = writeFrame(conn, errorFrame(CodeProtocol, fmt.Sprintf("%s: unknown store operation %q", CodeProtocol, storeOp.Op))) == nil
+			return
+		}
+		wrote = writeFrame(conn, responseFrame(s.ensureScope(ctx, scope))) == nil
 		return
 	}
 	if _, route := core.ClassifyRequest(request.Request); route == core.RouteClient {
@@ -196,6 +211,39 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		}
 	}
 	wrote = writeFrame(conn, responseFrame(response)) == nil
+}
+
+func readInboundFrame(r io.Reader) (*RequestFrame, *StoreOpFrame, error) {
+	var payload json.RawMessage
+	if err := readFrame(r, &payload); err != nil {
+		return nil, nil, err
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &members); err != nil {
+		return nil, nil, fmt.Errorf("%s: invalid JSON: %w", CodeProtocol, err)
+	}
+	_, hasRequest := members["request"]
+	_, hasOp := members["op"]
+	if hasRequest == hasOp {
+		return nil, nil, errors.New(CodeProtocol + ": frame must carry exactly one request or store operation")
+	}
+	if hasRequest {
+		var request RequestFrame
+		if err := json.Unmarshal(payload, &request); err != nil {
+			return nil, nil, fmt.Errorf("%s: invalid request frame: %w", CodeProtocol, err)
+		}
+		return &request, nil, nil
+	}
+	for name := range members {
+		if name != "proto" && name != "scope" && name != "op" {
+			return nil, nil, fmt.Errorf("%s: unexpected store operation field %q", CodeProtocol, name)
+		}
+	}
+	var op StoreOpFrame
+	if err := json.Unmarshal(payload, &op); err != nil {
+		return nil, nil, fmt.Errorf("%s: invalid store operation frame: %w", CodeProtocol, err)
+	}
+	return &RequestFrame{}, &op, nil
 }
 
 func (s *Server) bootstrap(ctx context.Context, scope WorktreeScope, args map[string]any) core.Response {
@@ -256,30 +304,58 @@ func (s *Server) bootstrap(ctx context.Context, scope WorktreeScope, args map[st
 }
 
 func (s *Server) coreForScope(scope WorktreeScope) (*core.Core, error) {
-	root, err := canonicalPath(scope.Root)
+	view, _, err := s.storeForScope(scope)
 	if err != nil {
 		return nil, err
+	}
+	return core.New(view), nil
+}
+
+func (s *Server) ensureScope(ctx context.Context, scope WorktreeScope) core.Response {
+	view, cached, err := s.storeForScope(scope)
+	if err == nil && cached {
+		err = view.Register(ctx)
+	}
+	if err != nil {
+		code := store.ErrorCode(err)
+		if strings.HasPrefix(err.Error(), CodeProjectInvalid) {
+			code = CodeProjectInvalid
+		} else if code == "E_INTERNAL" {
+			code = CodeInternal
+		}
+		return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+	}
+	return core.Response{OK: true, Code: "OK"}
+}
+
+// storeForScope returns whether the scope came from the cache. A fresh
+// NewScope has already registered exactly once; callers use cached to decide
+// whether an explicit refresh is required.
+func (s *Server) storeForScope(scope WorktreeScope) (*store.Store, bool, error) {
+	root, err := canonicalPath(scope.Root)
+	if err != nil {
+		return nil, false, err
 	}
 	common, err := canonicalPath(scope.CommonDir)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	gitDir, err := canonicalPath(scope.GitDir)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	projectID, worktreeID, err := store.CanonicalScopeIdentity(common, gitDir)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if scope.ProjectID != "" && scope.ProjectID != projectID || scope.WorktreeID != "" && scope.WorktreeID != worktreeID {
-		return nil, errors.New(CodeProjectInvalid + ": scope identity does not match canonical paths")
+		return nil, false, errors.New(CodeProjectInvalid + ": scope identity does not match canonical paths")
 	}
 	key := strings.Join([]string{root, common, gitDir, worktreeID, scope.ConfigDigest}, "\x00")
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if cached := s.scopes[key]; cached != nil {
-		return core.New(cached), nil
+		return cached, true, nil
 	}
 	leaseDir := filepath.Join(s.Paths.LeaseStateDir, worktreeID)
 	scope.ReviewPolicy.Configured = scope.ReviewConfigured
@@ -293,8 +369,8 @@ func (s *Server) coreForScope(scope WorktreeScope) (*core.Core, error) {
 		MaxQuotaSnapshots: scope.MaxQuotaSnapshots, ConfigDigest: scope.ConfigDigest,
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	s.scopes[key] = view
-	return core.New(view), nil
+	return view, false, nil
 }

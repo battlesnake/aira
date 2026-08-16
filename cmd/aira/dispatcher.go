@@ -27,16 +27,17 @@ type Dispatcher interface {
 }
 
 type daemonDispatcher struct {
-	stdin       io.Reader
-	stdout      io.Writer
-	diagnostics io.Writer
-	jsonOutput  bool
-	outputCap   int64
-	paths       daemon.Paths
-	startWait   time.Duration
-	lockWait    time.Duration
-	exchange    func(context.Context, string, daemon.RequestFrame) (daemon.ResponseFrame, error)
-	spawn       func() (<-chan childResult, error)
+	stdin           io.Reader
+	stdout          io.Writer
+	diagnostics     io.Writer
+	jsonOutput      bool
+	outputCap       int64
+	paths           daemon.Paths
+	startWait       time.Duration
+	lockWait        time.Duration
+	exchange        func(context.Context, string, daemon.RequestFrame) (daemon.ResponseFrame, error)
+	storeOpExchange func(context.Context, string, daemon.StoreOpFrame) (daemon.ResponseFrame, error)
+	spawn           func() (<-chan childResult, error)
 }
 
 type childResult struct {
@@ -60,6 +61,13 @@ func (d *daemonDispatcher) doExchange(ctx context.Context, frame daemon.RequestF
 		return d.exchange(ctx, d.paths.SocketPath, frame)
 	}
 	return daemon.Exchange(ctx, d.paths.SocketPath, frame)
+}
+
+func (d *daemonDispatcher) doStoreOpExchange(ctx context.Context, frame daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
+	if d.storeOpExchange != nil {
+		return d.storeOpExchange(ctx, d.paths.SocketPath, frame)
+	}
+	return daemon.ExchangeStoreOp(ctx, d.paths.SocketPath, frame)
 }
 
 func (d *daemonDispatcher) spawnDaemon() (<-chan childResult, error) {
@@ -86,41 +94,70 @@ func (d *daemonDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeSc
 	}
 	prepareRoutedRequest(&request)
 	frame := daemon.RequestFrame{Proto: daemon.ProtocolVersion, Scope: scope, Request: request}
-	response, err := d.exchangeOrStart(ctx, frame)
+	response, err := d.exchangeWithReplacement(ctx, func(ctx context.Context) (daemon.ResponseFrame, error) {
+		return d.exchangeOrStart(ctx, frame)
+	})
 	if err != nil {
 		return transportErrorResponse(err)
-	}
-	if response.Proto != 0 && response.Proto != daemon.ProtocolVersion && response.Code != daemon.CodeProtocol {
-		return core.Response{Code: daemon.CodeProtocol, Error: fmt.Sprintf("%s: unexpected daemon protocol %d", daemon.CodeProtocol, response.Proto), Exit: store.ExitForCode(daemon.CodeProtocol)}
-	}
-	if response.Code == daemon.CodeProtocol && response.Proto != 0 && response.Proto != daemon.ProtocolVersion {
-		if daemon.ProtocolVersion <= response.Proto {
-			return response.CoreResponse()
-		}
-		if err := d.replaceOlderDaemon(ctx); err != nil {
-			return transportErrorResponse(err)
-		}
-		response, err = d.exchangeOrStart(ctx, frame)
-		if err != nil {
-			return transportErrorResponse(err)
-		}
 	}
 	return response.CoreResponse()
 }
 
 func (d *daemonDispatcher) dispatchClient(ctx context.Context, scope daemon.WorktreeScope, request core.Request) core.Response {
+	if core.StoreFreeCarved(request.Verb, request.Args) {
+		frame := daemon.StoreOpFrame{Proto: daemon.ProtocolVersion, Scope: scope, Op: "ensure-scope"}
+		response, err := d.exchangeWithReplacement(ctx, func(ctx context.Context) (daemon.ResponseFrame, error) {
+			return d.exchangeOrStartStoreOp(ctx, frame)
+		})
+		if err != nil {
+			return transportErrorResponse(err)
+		}
+		if !response.OK {
+			return response.CoreResponse()
+		}
+		project, err := app.OpenWithoutStore(ctx, scope.Root, d.diagnostics)
+		if err != nil {
+			code := store.ErrorCode(err)
+			return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+		}
+		return d.dispatchCarved(ctx, request, core.StoreGuard(), project)
+	}
 	s, project, err := app.OpenWithDiagnostics(ctx, scope.Root, d.diagnostics)
 	if err != nil {
 		code := store.ErrorCode(err)
 		return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
 	}
 	defer s.Close()
+	return d.dispatchCarved(ctx, request, s, project)
+}
+
+func (d *daemonDispatcher) dispatchCarved(ctx context.Context, request core.Request, s core.Store, project app.Project) core.Response {
 	face := core.FaceOutput{Stdout: d.stdout, Stderr: d.diagnostics, Live: (request.Verb == "run" || request.Verb == "git") && !d.jsonOutput}
 	dispatcher := core.NewWithRunnerFace(s, project.Runner, d.stdin, face).WithGitOps(project.GitOps)
 	if d.outputCap > 0 {
 		dispatcher = core.NewWithRunnerOutputCap(s, project.Runner, d.outputCap).WithGitOps(project.GitOps)
 	}
 	return dispatcher.Do(ctx, request)
+}
+
+func (d *daemonDispatcher) exchangeWithReplacement(ctx context.Context, exchange func(context.Context) (daemon.ResponseFrame, error)) (daemon.ResponseFrame, error) {
+	response, err := exchange(ctx)
+	if err != nil {
+		return daemon.ResponseFrame{}, err
+	}
+	if response.Proto != 0 && response.Proto != daemon.ProtocolVersion && response.Code != daemon.CodeProtocol {
+		return daemon.ResponseFrame{}, fmt.Errorf("%s: unexpected daemon protocol %d", daemon.CodeProtocol, response.Proto)
+	}
+	if response.Code != daemon.CodeProtocol || response.Proto == 0 || response.Proto == daemon.ProtocolVersion {
+		return response, nil
+	}
+	if daemon.ProtocolVersion <= response.Proto {
+		return response, nil
+	}
+	if err := d.replaceOlderDaemon(ctx); err != nil {
+		return daemon.ResponseFrame{}, err
+	}
+	return exchange(ctx)
 }
 
 func prepareRoutedRequest(request *core.Request) {
@@ -143,7 +180,19 @@ func transportErrorResponse(err error) core.Response {
 }
 
 func (d *daemonDispatcher) exchangeOrStart(ctx context.Context, frame daemon.RequestFrame) (daemon.ResponseFrame, error) {
-	response, err := d.doExchange(ctx, frame)
+	return d.exchangeOrStartUsing(ctx, func(ctx context.Context) (daemon.ResponseFrame, error) {
+		return d.doExchange(ctx, frame)
+	})
+}
+
+func (d *daemonDispatcher) exchangeOrStartStoreOp(ctx context.Context, frame daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
+	return d.exchangeOrStartUsing(ctx, func(ctx context.Context) (daemon.ResponseFrame, error) {
+		return d.doStoreOpExchange(ctx, frame)
+	})
+}
+
+func (d *daemonDispatcher) exchangeOrStartUsing(ctx context.Context, exchange func(context.Context) (daemon.ResponseFrame, error)) (daemon.ResponseFrame, error) {
+	response, err := exchange(ctx)
 	if err == nil {
 		return response, nil
 	}
@@ -172,7 +221,7 @@ func (d *daemonDispatcher) exchangeOrStart(ctx context.Context, frame daemon.Req
 		if ctx.Err() != nil {
 			return daemon.ResponseFrame{}, fmt.Errorf("%s: %w", daemon.CodeTimeout, ctx.Err())
 		}
-		if response, err := d.doExchange(ctx, frame); err == nil {
+		if response, err := exchange(ctx); err == nil {
 			return response, nil
 		}
 		if !spawned {
@@ -180,7 +229,7 @@ func (d *daemonDispatcher) exchangeOrStart(ctx context.Context, frame daemon.Req
 				// We own the lock. Re-check for a socket a prior starter just bound,
 				// clear a stale one, then release BEFORE forking (never fork holding
 				// the lock — the child must acquire it to bind).
-				if response, err := d.doExchange(ctx, frame); err == nil {
+				if response, err := exchange(ctx); err == nil {
 					releaseStartupLock(lock)
 					return response, nil
 				}

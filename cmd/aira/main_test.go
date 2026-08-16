@@ -205,6 +205,21 @@ func TestRunDelimiterKeepsChildOptionTokensVerbatim(t *testing.T) {
 	}
 }
 
+func TestBuildRunRequestEmptyTelemetryKeysRemainStoreFree(t *testing.T) {
+	request, err := buildRequest("run", []string{"true"}, map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"report", "tool", "usage", "provider"} {
+		if value, present := request.Args[name]; !present || value != "" {
+			t.Fatalf("%s = %#v present=%v, want present empty value", name, value, present)
+		}
+	}
+	if !core.StoreFreeCarved(request.Verb, request.Args) {
+		t.Fatalf("buildRequest plain run classified store-touching: %+v", request)
+	}
+}
+
 func TestGitCLIRequestGrammarIsClosed(t *testing.T) {
 	for _, tc := range []struct {
 		argv []string

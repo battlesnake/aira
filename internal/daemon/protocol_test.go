@@ -2,8 +2,10 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
+	"net"
 	"strings"
 	"testing"
 
@@ -26,9 +28,24 @@ func TestFrameRoundTripPreservesRequestContent(t *testing.T) {
 	}
 }
 
-func TestContentPresenceChangeUsesProtocolVersionTwo(t *testing.T) {
-	if ProtocolVersion != 2 {
-		t.Fatalf("ProtocolVersion = %d, want 2 for has_content wire semantics", ProtocolVersion)
+func TestStoreOperationFrameChangeUsesProtocolVersionThree(t *testing.T) {
+	if ProtocolVersion != 3 {
+		t.Fatalf("ProtocolVersion = %d, want 3 for mutually exclusive store-operation frames", ProtocolVersion)
+	}
+}
+
+func TestStoreOpFrameRoundTrip(t *testing.T) {
+	want := StoreOpFrame{Proto: ProtocolVersion, Scope: WorktreeScope{Root: "/work", StateID: "state"}, Op: "ensure-scope"}
+	var buffer bytes.Buffer
+	if err := writeFrame(&buffer, want); err != nil {
+		t.Fatal(err)
+	}
+	request, got, err := readInboundFrame(&buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request == nil || got == nil || got.Proto != want.Proto || got.Op != want.Op || got.Scope.Root != want.Scope.Root {
+		t.Fatalf("store op round trip request=%+v op=%+v", request, got)
 	}
 }
 
@@ -82,4 +99,64 @@ func TestWireResponseCannotCarryAfterWrite(t *testing.T) {
 	if response := frame.CoreResponse(); response.AfterWrite != nil {
 		t.Fatal("wire response reconstructed AfterWrite")
 	}
+}
+
+func TestMalformedStoreOperationFramesReturnProtocolError(t *testing.T) {
+	tests := map[string]any{
+		"both kinds": map[string]any{
+			"proto": ProtocolVersion, "scope": WorktreeScope{StateID: "state"},
+			"request": core.Request{Verb: "list"}, "op": "ensure-scope",
+		},
+		"unknown op": StoreOpFrame{Proto: ProtocolVersion, Scope: WorktreeScope{StateID: "state"}, Op: "unknown"},
+		"body": map[string]any{
+			"proto": ProtocolVersion, "scope": WorktreeScope{StateID: "state"}, "op": "ensure-scope", "body": map[string]any{},
+		},
+	}
+	for name, frame := range tests {
+		t.Run(name, func(t *testing.T) {
+			response := serveProtocolFrame(t, frame, false)
+			if response.Code != CodeProtocol || !strings.HasPrefix(response.Error, CodeProtocol+":") {
+				t.Fatalf("response = %+v", response)
+			}
+		})
+	}
+	t.Run("trailing byte", func(t *testing.T) {
+		response := serveProtocolFrame(t, StoreOpFrame{Proto: ProtocolVersion, Scope: WorktreeScope{StateID: "state"}, Op: "ensure-scope"}, true)
+		if response.Code != CodeProtocol || !strings.HasPrefix(response.Error, CodeProtocol+":") {
+			t.Fatalf("response = %+v", response)
+		}
+	})
+}
+
+func serveProtocolFrame(t *testing.T, frame any, trailing bool) ResponseFrame {
+	t.Helper()
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() { _ = clientConn.Close() })
+	done := make(chan struct{})
+	go func() {
+		NewServer(Paths{StateID: "state"}).serveConnection(context.Background(), serverConn)
+		close(done)
+	}()
+	if !trailing {
+		if err := writeFrame(clientConn, frame); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		payload, err := json.Marshal(frame)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload = append(payload, 'x')
+		var header [4]byte
+		binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
+		if _, err := clientConn.Write(append(header[:], payload...)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var response ResponseFrame
+	if err := readFrame(clientConn, &response); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	return response
 }

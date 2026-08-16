@@ -312,7 +312,7 @@ var openOnceFn = openOnce
 // registerOnceFn is the single-shot per-worktree registration primitive which
 // NewScope retries. It is a package variable solely for typed fault injection in
 // the transient-I/OERR regression test.
-var registerOnceFn = func(ctx context.Context, s *Store) error { return s.register(ctx) }
+var registerOnceFn = func(ctx context.Context, s *Store) error { return s.Register(ctx) }
 
 const (
 	// storeOpenRetries bounds the retry budget for a transient disk I/O error.
@@ -1025,7 +1025,9 @@ func findingsHasCompositePrimaryKey(ctx context.Context, db interface {
 	return project > 0 && worktree > 0 && key > 0
 }
 
-func (s *Store) register(ctx context.Context) error {
+// Register refreshes this project/worktree registration and validates global
+// prefix ownership. NewScope already calls it once while constructing a scope.
+func (s *Store) Register(ctx context.Context) error {
 	entry := registryEntry{
 		ProjectID: s.projectID, CommonDir: s.commonDir, WorktreeID: s.worktreeID,
 		Root: s.root, Prefixes: s.prefixesByKind(kindTicket), RequirementPrefixes: s.prefixesByKind(kindRequirement),

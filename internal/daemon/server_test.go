@@ -3,10 +3,13 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -108,6 +111,108 @@ func TestServerRoutedRoundTripAndProtocolEvidence(t *testing.T) {
 	}
 	if mismatch.Proto != ProtocolVersion || mismatch.Code != CodeProtocol {
 		t.Fatalf("protocol mismatch response = %+v", mismatch)
+	}
+}
+
+func TestEnsureScopeRegistersFreshAndRefreshesCachedScopeExactlyOnce(t *testing.T) {
+	paths := testPaths(t)
+	db, err := store.OpenDB(paths.DBPath, paths.RegistryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	server := NewServer(paths)
+	server.db = db
+	scope := testScope(t, paths, "ensure")
+
+	for invocation := 1; invocation <= 2; invocation++ {
+		response := exchangeStoreOpOverPipe(t, server, StoreOpFrame{Proto: ProtocolVersion, Scope: scope, Op: "ensure-scope"})
+		if !response.OK || response.Code != "OK" {
+			t.Fatalf("invocation %d response = %+v", invocation, response)
+		}
+		data, err := os.ReadFile(paths.RegistryPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lines := strings.Count(strings.TrimSpace(string(data)), "\n") + 1; lines != invocation {
+			t.Fatalf("invocation %d registry lines = %d, want exactly %d", invocation, lines, invocation)
+		}
+	}
+
+	conn, err := sql.Open("sqlite", paths.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	for table, want := range map[string]int{"projects": 1, "worktrees": 1, "prefix_ownership": 1} {
+		var got int
+		if err := conn.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("%s rows = %d, want %d", table, got, want)
+		}
+	}
+}
+
+func TestEnsureScopeSurfacesPrefixOwnershipConflict(t *testing.T) {
+	paths := testPaths(t)
+	db, err := store.OpenDB(paths.DBPath, paths.RegistryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	server := NewServer(paths)
+	server.db = db
+	first := independentScope(t, paths, "first", "SHARED")
+	second := independentScope(t, paths, "second", "SHARED")
+	if response := exchangeStoreOpOverPipe(t, server, StoreOpFrame{Proto: ProtocolVersion, Scope: first, Op: "ensure-scope"}); !response.OK {
+		t.Fatalf("first registration = %+v", response)
+	}
+	response := exchangeStoreOpOverPipe(t, server, StoreOpFrame{Proto: ProtocolVersion, Scope: second, Op: "ensure-scope"})
+	if response.OK || response.Code != "E_PREFIX_OWNERSHIP_CONFLICT" || !strings.HasPrefix(response.Error, "E_PREFIX_OWNERSHIP_CONFLICT:") {
+		t.Fatalf("conflict response = %+v", response)
+	}
+}
+
+func exchangeStoreOpOverPipe(t *testing.T, server *Server, frame StoreOpFrame) ResponseFrame {
+	t.Helper()
+	serverConn, clientConn := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		server.serveConnection(context.Background(), serverConn)
+		close(done)
+	}()
+	if err := writeFrame(clientConn, frame); err != nil {
+		t.Fatal(err)
+	}
+	var response ResponseFrame
+	if err := readFrame(clientConn, &response); err != nil {
+		t.Fatal(err)
+	}
+	_ = clientConn.Close()
+	<-done
+	return response
+}
+
+func independentScope(t *testing.T, paths Paths, name, prefix string) WorktreeScope {
+	t.Helper()
+	base := filepath.Join(filepath.Dir(paths.StateHome), "independent", name)
+	root := filepath.Join(base, "root")
+	common := filepath.Join(base, "common")
+	gitDir := filepath.Join(common, "worktrees", name)
+	for _, path := range []string{root, common, gitDir} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	projectID, worktreeID, err := store.CanonicalScopeIdentity(common, gitDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return WorktreeScope{
+		Root: root, CommonDir: common, GitDir: gitDir, ProjectID: projectID, WorktreeID: worktreeID,
+		Slug: name, Prefixes: []string{prefix}, ConfigDigest: name, StateID: paths.StateID,
 	}
 }
 

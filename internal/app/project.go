@@ -234,15 +234,33 @@ func OpenWithDiagnostics(ctx context.Context, cwd string, diagnostics io.Writer)
 	if err != nil {
 		return nil, Project{}, err
 	}
-	memoryReserve, admissionMaxWait, err := parsedRunAdmission(project.Config.Run)
+	project, err = buildClientProject(project, diagnostics)
 	if err != nil {
 		_ = s.Close()
 		return nil, Project{}, err
 	}
+	s.SetRunner(project.Runner)
+	return s, project, nil
+}
+
+// OpenWithoutStore builds the local execution dependencies for a carved verb
+// without opening state.db or registering the client worktree.
+func OpenWithoutStore(ctx context.Context, cwd string, diagnostics io.Writer) (Project, error) {
+	project, err := Discover(ctx, cwd)
+	if err != nil {
+		return Project{}, err
+	}
+	return buildClientProject(project, diagnostics)
+}
+
+func buildClientProject(project Project, diagnostics io.Writer) (Project, error) {
+	memoryReserve, admissionMaxWait, err := parsedRunAdmission(project.Config.Run)
+	if err != nil {
+		return Project{}, err
+	}
 	detachReadyTimeout, err := parsedDetachReadyTimeout(project.Config.Run)
 	if err != nil {
-		_ = s.Close()
-		return nil, Project{}, err
+		return Project{}, err
 	}
 	execution, err := runner.New(runner.Config{
 		CommonDir:          project.CommonDir,
@@ -258,18 +276,15 @@ func OpenWithDiagnostics(ctx context.Context, cwd string, diagnostics io.Writer)
 		ReportMaxBytes:     project.Config.Run.ReportMaxBytes,
 	})
 	if err != nil {
-		_ = s.Close()
-		return nil, Project{}, err
+		return Project{}, err
 	}
-	s.SetRunner(execution)
 	project.Runner = execution
 	project.GitOps = gitremote.New(resolvedGitConfig(project.Config.Git))
 	project.GateAudit, err = store.OpenGateAudit(project.CommonDir, false)
 	if err != nil {
-		_ = s.Close()
-		return nil, Project{}, err
+		return Project{}, err
 	}
-	return s, project, nil
+	return project, nil
 }
 
 func Init(ctx context.Context, cwd string, args map[string]any) (InitResult, error) {

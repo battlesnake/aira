@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -260,5 +261,34 @@ func TestOpenBuildsGitOpsFromProjectConfig(t *testing.T) {
 	defer opened.Close()
 	if project.GitOps == nil {
 		t.Fatal("Open left GitOps nil")
+	}
+}
+
+func TestOpenWithoutStoreBuildsExecutionDependenciesWithoutStateDB(t *testing.T) {
+	root := t.TempDir()
+	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".aira"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := `{"schema":1,"project":{"slug":"demo","prefixes":["DEMO"]},"lease":{"ttl_seconds":900,"heartbeat_seconds":30}}`
+	if err := os.WriteFile(filepath.Join(root, ".aira", "config"), []byte(config+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stateHome := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", stateHome)
+	project, err := OpenWithoutStore(context.Background(), root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if project.Runner == nil || project.GitOps == nil {
+		t.Fatalf("store-free project dependencies = %+v", project)
+	}
+	for _, name := range []string{"state.db", "state.db-wal", "state.db-shm", "registry.jsonl"} {
+		path := filepath.Join(stateHome, "aira", name)
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("OpenWithoutStore created %s: %v", path, err)
+		}
 	}
 }

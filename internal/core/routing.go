@@ -59,3 +59,31 @@ func ClassifyRequest(req Request) (string, Route) {
 	}
 	return Classify(canonical, selector)
 }
+
+// StoreFreeCarved reports whether a canonical client-routed request can run
+// without touching the state store. Telemetry values, rather than key
+// presence, split run because CLI request construction includes empty keys.
+func StoreFreeCarved(verb string, args map[string]any) bool {
+	canonical := CanonicalVerb(verb)
+	switch canonical {
+	case "run":
+		for _, name := range []string{"report", "tool", "usage", "provider"} {
+			value, present := args[name]
+			if !present || value == nil {
+				continue
+			}
+			text, ok := value.(string)
+			if !ok || strings.TrimSpace(text) != "" {
+				return false
+			}
+		}
+		return true
+	case "run-kill", "run-log", "git":
+		return true
+	case "show":
+		selector, _ := args["selector"].(string)
+		return strings.HasPrefix(selector, "RUN-")
+	default:
+		return false
+	}
+}

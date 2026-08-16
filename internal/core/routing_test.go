@@ -71,6 +71,100 @@ func TestClassifyRequestUsesOperationGranularity(t *testing.T) {
 	}
 }
 
+func TestStoreFreeCarvedPredicateIsComplete(t *testing.T) {
+	storeFree := []Request{
+		{Verb: "run", Args: map[string]any{}},
+		{Verb: "run", Args: map[string]any{"report": "", "tool": "", "usage": "", "provider": ""}},
+		{Verb: "run", Args: map[string]any{"detach": true}},
+		{Verb: "run", Args: map[string]any{"cwd": ".", "env": []string{"A=B"}, "timeout": "1s", "no_admit": true}},
+		{Verb: "run-kill", Args: map[string]any{"run_id": "RUN-1"}},
+		{Verb: "run-log", Args: map[string]any{"run_id": "RUN-1"}},
+		{Verb: "show", Args: map[string]any{"selector": "RUN-1"}},
+		{Verb: "get", Args: map[string]any{"selector": "RUN-2"}},
+		{Verb: "git", Args: map[string]any{"subverb": "fetch"}},
+	}
+	for _, request := range storeFree {
+		if !StoreFreeCarved(request.Verb, request.Args) {
+			t.Errorf("request %+v classified store-touching", request)
+		}
+	}
+	for _, field := range []string{"report", "tool", "usage", "provider"} {
+		request := Request{Verb: "run", Args: map[string]any{field: " value "}}
+		if StoreFreeCarved(request.Verb, request.Args) {
+			t.Errorf("telemetry-valued run %+v classified store-free", request)
+		}
+	}
+	storeTouching := []Request{
+		{Verb: "gate", Args: map[string]any{"subverb": "run"}},
+		{Verb: "gate", Args: map[string]any{"subverb": "canary-run"}},
+		{Verb: "reconcile"},
+		{Verb: "check"},
+		{Verb: "show", Args: map[string]any{"selector": "AIRA-1"}},
+	}
+	for _, request := range storeTouching {
+		if StoreFreeCarved(request.Verb, request.Args) {
+			t.Errorf("request %+v classified store-free", request)
+		}
+	}
+}
+
+type successfulStoreFreeRunner struct{}
+
+func (successfulStoreFreeRunner) Launch(context.Context, runner.Request) (*runner.RunRecord, error) {
+	exit := 0
+	return &runner.RunRecord{ID: "RUN-1", Status: runner.StatusExited, ExitCode: &exit}, nil
+}
+func (successfulStoreFreeRunner) LaunchDetached(context.Context, runner.Request, string) (*runner.DetachLaunch, error) {
+	return runner.NewDetachLaunch(runner.RunRecord{ID: "RUN-2", Status: runner.StatusRunning}, nil), nil
+}
+func (successfulStoreFreeRunner) DetachOutputDir() string { return "" }
+func (successfulStoreFreeRunner) Kill(context.Context, string, bool) (*runner.RunRecord, error) {
+	exit := 0
+	return &runner.RunRecord{ID: "RUN-1", Status: runner.StatusExited, ExitCode: &exit}, nil
+}
+func (successfulStoreFreeRunner) Get(id string) (*runner.RunRecord, error) {
+	exit := 0
+	return &runner.RunRecord{ID: id, Status: runner.StatusExited, ExitCode: &exit}, nil
+}
+func (successfulStoreFreeRunner) ReadOutput(context.Context, runner.OutputRequest) (*runner.OutputChunk, error) {
+	return &runner.OutputChunk{RunID: "RUN-1", Complete: true}, nil
+}
+func (successfulStoreFreeRunner) Reconcile(context.Context) ([]runner.RunRecord, error) {
+	return nil, nil
+}
+
+func TestStoreGuardIsNeverReachedByStoreFreeCarvedHandlers(t *testing.T) {
+	execution := successfulStoreFreeRunner{}
+	gitops := &fakeGitOps{result: &gitremote.Result{Op: "fetch", ExitCode: 0}}
+	dispatcher := NewWithRunner(StoreGuard(), execution).WithGitOps(gitops)
+	requests := []Request{
+		{Verb: "run", Args: map[string]any{"argv": []string{"true"}}},
+		{Verb: "run", Args: map[string]any{"argv": []string{"true"}, "detach": true}},
+		{Verb: "run-kill", Args: map[string]any{"run_id": "RUN-1"}},
+		{Verb: "run-log", Args: map[string]any{"run_id": "RUN-1"}},
+		{Verb: "show", Args: map[string]any{"selector": "RUN-1"}},
+		{Verb: "get", Args: map[string]any{"selector": "RUN-1"}},
+		{Verb: "git", Args: map[string]any{"subverb": "fetch"}},
+	}
+	for _, request := range requests {
+		if !StoreFreeCarved(request.Verb, request.Args) {
+			t.Fatalf("fixture %+v is not store-free", request)
+		}
+		response := dispatcher.Do(context.Background(), request)
+		if response.Code == "E_DAEMON_INTERNAL" || strings.Contains(response.Error, "unexpectedly used the store") {
+			t.Fatalf("request %+v reached store guard: %+v", request, response)
+		}
+		if response.AfterWrite != nil {
+			if err := response.AfterWrite(true); err != nil {
+				t.Fatalf("complete detached response: %v", err)
+			}
+		}
+	}
+	if _, err := StoreGuard().Get("AIRA-1"); err == nil || err.Error() != "E_DAEMON_INTERNAL: carved verb unexpectedly used the store" {
+		t.Fatalf("guard error = %v", err)
+	}
+}
+
 func TestShowRunSelectorClassificationMatchesHandlerExactly(t *testing.T) {
 	s := coreTestStore(t)
 	execution := &routingRecorder{}

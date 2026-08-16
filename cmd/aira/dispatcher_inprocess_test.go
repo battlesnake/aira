@@ -418,6 +418,137 @@ func TestOlderClientNeverReplacesNewerDaemon(t *testing.T) {
 	}
 }
 
+func TestStoreFreeCarvedDispatchUsesEnsureScopeWithoutOpeningClientStore(t *testing.T) {
+	dispatcher, scope, stateHome := storeFreeDispatcherFixture(t)
+	var handshakes atomic.Int32
+	dispatcher.storeOpExchange = func(_ context.Context, _ string, frame daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
+		handshakes.Add(1)
+		if frame.Proto != daemon.ProtocolVersion || frame.Op != "ensure-scope" || frame.Scope.WorktreeID != scope.WorktreeID {
+			t.Fatalf("ensure-scope frame = %+v", frame)
+		}
+		return daemon.ResponseFrame{OK: true, Code: "OK"}, nil
+	}
+	requests := []core.Request{
+		{Verb: "run", Args: map[string]any{"argv": []string{"/bin/true"}, "no_admit": true}},
+		{Verb: "run-kill", Args: map[string]any{"run_id": "RUN-missing"}},
+		{Verb: "run-log", Args: map[string]any{"run_id": "RUN-missing"}},
+		{Verb: "show", Args: map[string]any{"selector": "RUN-missing"}},
+		{Verb: "get", Args: map[string]any{"selector": "RUN-missing"}},
+		{Verb: "git", Args: map[string]any{"subverb": "invalid"}},
+	}
+	for _, request := range requests {
+		response := dispatcher.Dispatch(context.Background(), scope, request)
+		if response.Code == daemon.CodeInternal || strings.Contains(response.Error, "unexpectedly used the store") {
+			t.Fatalf("request %+v reached store guard: %+v", request, response)
+		}
+	}
+	if got := handshakes.Load(); got != int32(len(requests)) {
+		t.Fatalf("ensure-scope handshakes = %d, want %d", got, len(requests))
+	}
+	for _, name := range []string{"state.db", "state.db-wal", "state.db-shm", "registry.jsonl"} {
+		path := filepath.Join(stateHome, "aira", name)
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("store-free dispatch created client %s: %v", path, err)
+		}
+	}
+}
+
+func TestTelemetryValuedRunStaysOnWritableClientPath(t *testing.T) {
+	dispatcher, scope, stateHome := storeFreeDispatcherFixture(t)
+	dispatcher.storeOpExchange = func(context.Context, string, daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
+		t.Fatal("telemetry-valued run issued ensure-scope")
+		return daemon.ResponseFrame{}, nil
+	}
+	request := core.Request{Verb: "run", Args: map[string]any{
+		"argv": []string{"/bin/true"}, "no_admit": true, "report": "go-json",
+	}}
+	_ = dispatcher.Dispatch(context.Background(), scope, request)
+	for _, name := range []string{"state.db", "registry.jsonl"} {
+		if _, err := os.Stat(filepath.Join(stateHome, "aira", name)); err != nil {
+			t.Fatalf("telemetry-valued run did not use writable path (%s): %v", name, err)
+		}
+	}
+}
+
+func TestEnsureScopeFailurePreventsStoreFreeVerbExecution(t *testing.T) {
+	dispatcher, scope, stateHome := storeFreeDispatcherFixture(t)
+	dispatcher.storeOpExchange = func(context.Context, string, daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
+		return daemon.ResponseFrame{Code: "E_PREFIX_OWNERSHIP_CONFLICT", Error: "E_PREFIX_OWNERSHIP_CONFLICT: SHARED owned by another project", Exit: 1}, nil
+	}
+	marker := filepath.Join(scope.Root, "must-not-run")
+	response := dispatcher.Dispatch(context.Background(), scope, core.Request{Verb: "run", Args: map[string]any{
+		"argv": []string{"/bin/sh", "-c", "touch must-not-run"}, "no_admit": true,
+	}})
+	if response.Code != "E_PREFIX_OWNERSHIP_CONFLICT" || response.Exit != 1 {
+		t.Fatalf("ownership response = %+v", response)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("verb ran after failed ensure-scope: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stateHome, "aira", "state.db")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed ensure-scope opened client store: %v", err)
+	}
+}
+
+func TestEnsureScopeFrameReplacesOlderProtocolDaemon(t *testing.T) {
+	dispatcher := autoStartDispatcher(t)
+	older := startProtocolDaemonProcess(t)
+	root, scope := writeStoreFreeProject(t, dispatcher.paths)
+	t.Chdir(root)
+	var exchanges atomic.Int32
+	dispatcher.storeOpExchange = func(context.Context, string, daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
+		if exchanges.Add(1) == 1 {
+			return daemon.ResponseFrame{Proto: daemon.ProtocolVersion - 1, Code: daemon.CodeProtocol, Error: daemon.CodeProtocol + ": older daemon"}, nil
+		}
+		return daemon.ResponseFrame{OK: true, Code: "OK"}, nil
+	}
+	response := dispatcher.Dispatch(context.Background(), scope, core.Request{Verb: "show", Args: map[string]any{"selector": "RUN-missing"}})
+	if response.Code == daemon.CodeProtocol || exchanges.Load() != 2 {
+		t.Fatalf("response=%+v exchanges=%d", response, exchanges.Load())
+	}
+	select {
+	case <-older.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("older protocol daemon was not stopped for ensure-scope replacement")
+	}
+}
+
+func storeFreeDispatcherFixture(t *testing.T) (*daemonDispatcher, daemon.WorktreeScope, string) {
+	t.Helper()
+	stateHome := filepath.Join(t.TempDir(), "state")
+	t.Setenv("XDG_STATE_HOME", stateHome)
+	t.Setenv("XDG_RUNTIME_DIR", shortRuntimeDir(t))
+	paths, err := daemon.PathsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, scope := writeStoreFreeProject(t, paths)
+	return &daemonDispatcher{
+		stdin: strings.NewReader(""), stdout: io.Discard, diagnostics: io.Discard,
+		paths: paths, startWait: time.Second, lockWait: time.Second,
+	}, scope, stateHome
+}
+
+func writeStoreFreeProject(t *testing.T, paths daemon.Paths) (string, daemon.WorktreeScope) {
+	t.Helper()
+	root := t.TempDir()
+	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".aira"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := `{"schema":1,"project":{"slug":"demo","prefixes":["AIRA"]},"lease":{"ttl_seconds":900,"heartbeat_seconds":30}}`
+	if err := os.WriteFile(filepath.Join(root, ".aira", "config"), []byte(config+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	scope, err := scopeForCWD(context.Background(), root, paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return root, scope
+}
+
 func startCommandDaemon(t *testing.T, server *daemon.Server) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -488,6 +619,73 @@ func TestMCPMutationUsesRealDaemonSocket(t *testing.T) {
 	if got := socketRequests.Load(); got != 1 {
 		t.Fatalf("daemon observed %d MCP create requests, want exactly one", got)
 	}
+}
+
+func TestStoreFreeRealCLIRegistersOnlyThroughDaemon(t *testing.T) {
+	root := t.TempDir()
+	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".aira"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := `{"schema":1,"project":{"slug":"demo","prefixes":["AIRA"]},"lease":{"ttl_seconds":900,"heartbeat_seconds":30}}`
+	if err := os.WriteFile(filepath.Join(root, ".aira", "config"), []byte(config+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(root)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	t.Setenv("XDG_RUNTIME_DIR", shortRuntimeDir(t))
+	paths, err := daemon.PathsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	startCommandDaemon(t, daemon.NewServer(paths))
+
+	invoke := func(invocation int, argv ...string) core.Response {
+		t.Helper()
+		argv = append([]string{argv[0], "--json"}, argv[1:]...)
+		var stdout, stderr bytes.Buffer
+		_ = runWithInput(argv, &stdout, &stderr, strings.NewReader(""))
+		var response core.Response
+		if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+			t.Fatalf("argv=%v stdout=%q stderr=%q: %v", argv, stdout.String(), stderr.String(), err)
+		}
+		registry, err := os.ReadFile(paths.RegistryPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lines := strings.Count(strings.TrimSpace(string(registry)), "\n") + 1; lines != invocation {
+			t.Fatalf("argv=%v registry lines=%d, want exactly %d daemon registrations", argv, lines, invocation)
+		}
+		return response
+	}
+
+	if response := invoke(1, "show", "RUN-missing"); response.Code != "E_RUN_NOT_FOUND" {
+		t.Fatalf("missing run response = %+v", response)
+	}
+	runResponse := invoke(2, "run", "--no-admit", "--merge", "--", "/bin/true")
+	if runResponse.Code == "E_RUN_SCOPE_UNAVAILABLE" {
+		t.Skipf("real CLI runner requires delegated writable cgroup-v2: %s", runResponse.Error)
+	}
+	if !runResponse.OK {
+		t.Fatalf("run response = %+v", runResponse)
+	}
+	data, ok := runResponse.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("run data type = %T", runResponse.Data)
+	}
+	runID, _ := data["id"].(string)
+	if runID == "" {
+		t.Fatalf("run data = %#v", data)
+	}
+	if response := invoke(3, "show", runID); !response.OK {
+		t.Fatalf("show response = %+v", response)
+	}
+	if response := invoke(4, "run-log", runID, "--full"); !response.OK {
+		t.Fatalf("run-log response = %+v", response)
+	}
+	_ = invoke(5, "run-kill", runID)
 }
 
 type responseParityPayload struct {

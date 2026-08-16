@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	ProtocolVersion = 2
+	ProtocolVersion = 3
 	MaxFrameBytes   = 16 << 20
 )
 
@@ -58,6 +58,14 @@ type RequestFrame struct {
 	Proto   int           `json:"proto"`
 	Scope   WorktreeScope `json:"scope"`
 	Request core.Request  `json:"request"`
+}
+
+// StoreOpFrame is a mutually exclusive daemon frame kind for store lifecycle
+// operations which do not dispatch a Core request.
+type StoreOpFrame struct {
+	Proto int           `json:"proto"`
+	Scope WorktreeScope `json:"scope"`
+	Op    string        `json:"op"`
 }
 
 // ResponseFrame is the wire projection of core.Response. AfterWrite cannot be
@@ -148,6 +156,15 @@ func writeFrame(w io.Writer, value any) error {
 // Exchange sends one request and receives one response over a fresh Unix
 // connection.
 func Exchange(ctx context.Context, socket string, request RequestFrame) (ResponseFrame, error) {
+	return exchange(ctx, socket, request)
+}
+
+// ExchangeStoreOp sends one store operation and receives its ownership result.
+func ExchangeStoreOp(ctx context.Context, socket string, request StoreOpFrame) (ResponseFrame, error) {
+	return exchange(ctx, socket, request)
+}
+
+func exchange(ctx context.Context, socket string, request any) (ResponseFrame, error) {
 	dialer := net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "unix", socket)
 	if err != nil {
