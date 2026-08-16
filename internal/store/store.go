@@ -22,6 +22,7 @@ import (
 	"aira/internal/runner"
 	"golang.org/x/sys/unix"
 	_ "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // covers: AR-5, AR-6, AR-7
@@ -190,7 +191,65 @@ type scannedTicket struct {
 	Digest     string
 }
 
+// Open opens (creating if needed) the machine-local SQLite store. The open +
+// schema-init writes can transiently fail with SQLITE_IOERR on some filesystems
+// (observed on WSL2's vhdx under I/O load). Schema creation (CREATE TABLE IF NOT
+// EXISTS) and registration are idempotent — register runs on every command — so a
+// bounded retry on a *transient* disk I/O error makes every command robust without
+// masking a persistent error (a non-I/O error, or one that survives the retries,
+// is returned unchanged).
 func Open(ctx context.Context, opts Options) (*Store, error) {
+	var lastErr error
+	for attempt := 0; attempt < storeOpenRetries; attempt++ {
+		s, err := openOnceFn(ctx, opts)
+		if err == nil {
+			return s, nil
+		}
+		lastErr = err
+		if !isTransientDiskIOError(err) || ctx.Err() != nil {
+			return nil, err
+		}
+		if attempt == storeOpenRetries-1 {
+			break // budget exhausted — do not back off after the final attempt.
+		}
+		select {
+		case <-ctx.Done():
+			return nil, lastErr
+		case <-time.After(storeOpenBackoff):
+		}
+	}
+	return nil, lastErr
+}
+
+// openOnceFn is the single-shot open primitive Open retries. It is a package var
+// so tests can inject transient disk I/O faults; production always uses openOnce.
+var openOnceFn = openOnce
+
+const (
+	// storeOpenRetries bounds the retry budget for a transient disk I/O error.
+	storeOpenRetries = 3
+	// storeOpenBackoff is the pause between transient-failure retries.
+	storeOpenBackoff = 50 * time.Millisecond
+)
+
+// sqliteCoder is satisfied by *modernc.org/sqlite.Error, which exposes the numeric
+// SQLite result code. Classifying by code (not message text) is what keeps an
+// unrelated error whose text merely contains "disk I/O error" from being retried.
+type sqliteCoder interface{ Code() int }
+
+// isTransientDiskIOError reports whether err is a SQLite disk I/O error — the
+// SQLITE_IOERR family (its extended codes, e.g. SQLITE_IOERR_WRITE=778, all share
+// primary code SQLITE_IOERR). That is the one class safe to retry here;
+// configuration, constraint, and corruption errors are deliberately not matched.
+func isTransientDiskIOError(err error) bool {
+	var coder sqliteCoder
+	if !errors.As(err, &coder) {
+		return false
+	}
+	return coder.Code()&0xff == sqlite3.SQLITE_IOERR
+}
+
+func openOnce(ctx context.Context, opts Options) (*Store, error) {
 	if opts.Root == "" || opts.CommonDir == "" || opts.DBPath == "" || opts.RegistryPath == "" || opts.ProjectID == "" || opts.WorktreeID == "" {
 		return nil, errors.New("E_CONFIG_INVALID: store options are incomplete")
 	}
