@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1031,6 +1032,7 @@ func prepareImportContent(request *core.Request) error {
 	}
 	request.Args["file"] = abs
 	request.Content = data
+	request.HasContent = true
 	return nil
 }
 
@@ -1046,6 +1048,7 @@ func relativiseInitResponse(response *core.Response, cwd string) {
 	if err != nil {
 		return
 	}
+	changed := false
 	for _, key := range []string{"root", "config"} {
 		path, ok := data[key].(string)
 		if !ok || !filepath.IsAbs(path) {
@@ -1053,7 +1056,11 @@ func relativiseInitResponse(response *core.Response, cwd string) {
 		}
 		if relative, err := filepath.Rel(cwdAbs, path); err == nil {
 			data[key] = filepath.ToSlash(relative)
+			changed = true
 		}
+	}
+	if changed {
+		response.RawData = nil
 	}
 }
 
@@ -1112,7 +1119,10 @@ func (w *lineTrackingWriter) needsSeparator() bool {
 func renderHuman(response core.Response, out io.Writer) error {
 	if response.Code == "PASS" || response.Code == "FAIL" || response.Code == "UNEVALUATED" {
 		if report, ok := response.Data.(interface{}); ok {
-			data, _ := json.Marshal(report)
+			data := response.RawData
+			if len(data) == 0 {
+				data, _ = json.Marshal(report)
+			}
 			if _, err := fmt.Fprintf(out, "verdict: %s\n%s\n", strings.ToLower(response.Code), data); err != nil {
 				return err
 			}
@@ -1124,7 +1134,16 @@ func renderHuman(response core.Response, out io.Writer) error {
 		}
 		return nil
 	}
-	data, _ := json.MarshalIndent(response.Data, "", "  ")
+	var data []byte
+	if len(response.RawData) > 0 {
+		var formatted bytes.Buffer
+		if err := json.Indent(&formatted, response.RawData, "", "  "); err == nil {
+			data = formatted.Bytes()
+		}
+	}
+	if len(data) == 0 {
+		data, _ = json.MarshalIndent(response.Data, "", "  ")
+	}
 	if _, err := fmt.Fprintln(out, string(data)); err != nil {
 		return err
 	}

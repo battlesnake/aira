@@ -5,6 +5,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,9 +22,10 @@ import (
 )
 
 type Request struct {
-	Verb    string         `json:"verb"`
-	Args    map[string]any `json:"args,omitempty"`
-	Content []byte         `json:"content,omitempty"`
+	Verb       string         `json:"verb"`
+	Args       map[string]any `json:"args,omitempty"`
+	Content    []byte         `json:"content,omitempty"`
+	HasContent bool           `json:"has_content"`
 }
 
 type Response struct {
@@ -34,6 +36,32 @@ type Response struct {
 	Warnings   []string         `json:"warnings,omitempty"`
 	Exit       int              `json:"exit,omitempty"`
 	AfterWrite func(bool) error `json:"-"`
+	RawData    json.RawMessage  `json:"-"`
+}
+
+// MarshalJSON retains the daemon's already-encoded data member. This keeps
+// integer spelling and object field order identical across transport faces.
+func (response Response) MarshalJSON() ([]byte, error) {
+	data := response.RawData
+	if len(data) == 0 && response.Data != nil {
+		var err error
+		data, err = json.Marshal(response.Data)
+		if err != nil {
+			return nil, err
+		}
+	}
+	type responseJSON struct {
+		OK       bool            `json:"ok"`
+		Code     string          `json:"code"`
+		Data     json.RawMessage `json:"data,omitempty"`
+		Error    string          `json:"error,omitempty"`
+		Warnings []string        `json:"warnings,omitempty"`
+		Exit     int             `json:"exit,omitempty"`
+	}
+	return json.Marshal(responseJSON{
+		OK: response.OK, Code: response.Code, Data: data, Error: response.Error,
+		Warnings: response.Warnings, Exit: response.Exit,
+	})
 }
 
 type Initializer func(context.Context, map[string]any) (any, error)
@@ -47,7 +75,8 @@ type argAccessor struct {
 func newArgAccessor(values map[string]any, content ...[]byte) *argAccessor {
 	accessor := &argAccessor{values: values, reads: make(map[string]struct{})}
 	if len(content) > 0 {
-		accessor.content = content[0]
+		accessor.content = make([]byte, len(content[0]))
+		copy(accessor.content, content[0])
 	}
 	return accessor
 }
@@ -369,7 +398,11 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 		code := "E_UNKNOWN_VERB"
 		return Response{Code: code, Error: fmt.Sprintf("unknown verb %q", req.Verb), Exit: store.ExitForCode(code)}
 	}
-	data, err := spec.Run(ctx, newArgAccessor(req.Args, req.Content))
+	args := newArgAccessor(req.Args)
+	if req.HasContent || req.Content != nil {
+		args = newArgAccessor(req.Args, req.Content)
+	}
+	data, err := spec.Run(ctx, args)
 	if err != nil {
 		code := store.ErrorCode(err)
 		return Response{Code: code, Error: err.Error(), Exit: errorExit(code)}

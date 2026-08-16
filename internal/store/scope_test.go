@@ -80,6 +80,33 @@ func TestNewScopeRejectsRecomputedIdentityMismatch(t *testing.T) {
 	}
 }
 
+func TestCanonicalScopeIdentityResolvesSymlinkBeforeMissingSuffix(t *testing.T) {
+	base := t.TempDir()
+	realParent := filepath.Join(base, "real")
+	if err := os.MkdirAll(realParent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aliasParent := filepath.Join(base, "alias")
+	if err := os.Symlink(realParent, aliasParent); err != nil {
+		t.Fatal(err)
+	}
+	realCommon := filepath.Join(realParent, "missing", "common")
+	realGit := filepath.Join(realCommon, "worktrees", "one")
+	aliasCommon := filepath.Join(aliasParent, "missing", "common")
+	aliasGit := filepath.Join(aliasCommon, "worktrees", "one")
+	realProject, realWorktree, err := CanonicalScopeIdentity(realCommon, realGit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliasProject, aliasWorktree, err := CanonicalScopeIdentity(aliasCommon, aliasGit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aliasProject != realProject || aliasWorktree != realWorktree {
+		t.Fatalf("aliased identities = (%s, %s), real = (%s, %s)", aliasProject, aliasWorktree, realProject, realWorktree)
+	}
+}
+
 // verifies: the per-scope register phase retains the bounded typed-I/OERR
 // retry which used to surround the fused Open operation.
 func TestNewScopeRetriesTransientRegisterIOError(t *testing.T) {

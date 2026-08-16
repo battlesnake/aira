@@ -2,6 +2,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -73,7 +74,9 @@ type ResponseFrame struct {
 
 func responseFrame(response core.Response) ResponseFrame {
 	frame := ResponseFrame{OK: response.OK, Code: response.Code, Error: response.Error, Warnings: response.Warnings, Exit: response.Exit}
-	if response.Data != nil {
+	if len(response.RawData) > 0 {
+		frame.Data = append(json.RawMessage(nil), response.RawData...)
+	} else if response.Data != nil {
 		frame.Data, _ = json.Marshal(response.Data)
 	}
 	return frame
@@ -95,10 +98,13 @@ func (frame ResponseFrame) CoreResponse() core.Response {
 	response := core.Response{OK: frame.OK, Code: frame.Code, Error: frame.Error, Warnings: frame.Warnings, Exit: frame.Exit}
 	if len(frame.Data) > 0 && string(frame.Data) != "null" {
 		var value any
-		if err := json.Unmarshal(frame.Data, &value); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(frame.Data))
+		decoder.UseNumber()
+		if err := decoder.Decode(&value); err != nil {
 			return core.Response{Code: CodeProtocol, Error: CodeProtocol + ": invalid response data", Exit: store.ExitForCode(CodeProtocol)}
 		}
 		response.Data = value
+		response.RawData = append(json.RawMessage(nil), frame.Data...)
 	}
 	return response
 }

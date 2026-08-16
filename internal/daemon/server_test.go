@@ -135,10 +135,10 @@ func TestServerRoutedResponseIsByteIdenticalToInProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, _ := json.Marshal(responseFrame(core.New(view).Do(context.Background(), request)))
-	got, _ := json.Marshal(wire)
+	want, _ := json.Marshal(core.New(view).Do(context.Background(), request))
+	got, _ := json.Marshal(wire.CoreResponse())
 	if !bytes.Equal(got, want) {
-		t.Fatalf("wire response differs\n got: %s\nwant: %s", got, want)
+		t.Fatalf("reconstructed response differs\n got: %s\nwant: %s", got, want)
 	}
 }
 
@@ -202,6 +202,59 @@ func TestServerSingleInstanceFlockBeforeBind(t *testing.T) {
 	defer cancel()
 	if err := second.Serve(ctx); !errors.Is(err, ErrAlreadyRunning) {
 		t.Fatalf("second Serve error = %v, want ErrAlreadyRunning", err)
+	}
+}
+
+func TestSymlinkAliasedMissingStateHasSingleInstance(t *testing.T) {
+	base := t.TempDir()
+	realParent := filepath.Join(base, "real")
+	if err := os.MkdirAll(realParent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aliasParent := filepath.Join(base, "alias")
+	if err := os.Symlink(realParent, aliasParent); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", shortRuntimeDir(t))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(aliasParent, "missing", "state"))
+	aliasPaths, err := PathsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_STATE_HOME", filepath.Join(realParent, "missing", "state"))
+	realPaths, err := PathsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aliasPaths.StateID != realPaths.StateID || aliasPaths.SocketPath != realPaths.SocketPath {
+		t.Fatalf("alias paths=%+v, real paths=%+v", aliasPaths, realPaths)
+	}
+	_, _ = startServer(t, NewServer(aliasPaths))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := NewServer(realPaths).Serve(ctx); !errors.Is(err, ErrAlreadyRunning) {
+		t.Fatalf("aliased second Serve error = %v, want ErrAlreadyRunning", err)
+	}
+}
+
+func TestServerRoundTripPreservesPresentEmptyImports(t *testing.T) {
+	paths := testPaths(t)
+	server := NewServer(paths)
+	_, _ = startServer(t, server)
+	scope := testScope(t, paths, "empty-import")
+	scope.RequirementPrefixes = []string{"AR"}
+	requests := []core.Request{
+		{Verb: "import", Args: map[string]any{"file": "missing-findings.jsonl", "strict": true}, Content: []byte{}, HasContent: true},
+		{Verb: "req", Args: map[string]any{"subverb": "import", "file": "missing-requirements.jsonl"}, Content: []byte{}, HasContent: true},
+	}
+	for _, request := range requests {
+		response, err := Exchange(context.Background(), paths.SocketPath, RequestFrame{Proto: ProtocolVersion, Scope: scope, Request: request})
+		if err != nil {
+			t.Fatalf("%s exchange: %v", request.Verb, err)
+		}
+		if !response.OK {
+			t.Fatalf("%s empty import reopened daemon-relative path: %+v", request.Verb, response)
+		}
 	}
 }
 

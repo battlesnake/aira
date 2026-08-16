@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -213,6 +214,53 @@ func TestAutoStartChildFailureStillWaitsToBoundedTimeout(t *testing.T) {
 	}
 }
 
+// verifies: a spawned child exiting (a lost race) must NOT re-trigger a fork; the
+// client polls the winner's socket instead. Guards against an auto-start fork storm.
+func TestAutoStartSpawnsAtMostOnceDespiteChildExit(t *testing.T) {
+	dispatcher := autoStartDispatcher(t)
+	dispatcher.startWait = 200 * time.Millisecond
+	var spawns atomic.Int32
+	dispatcher.exchange = func(context.Context, string, daemon.RequestFrame) (daemon.ResponseFrame, error) {
+		return daemon.ResponseFrame{}, fmt.Errorf("%s: never ready", daemon.CodeUnavailable)
+	}
+	dispatcher.spawn = func() (<-chan childResult, error) {
+		spawns.Add(1)
+		done := make(chan childResult, 1)
+		done <- childResult{} // child exits 0 immediately (lost race)
+		return done, nil
+	}
+	_, err := dispatcher.exchangeOrStart(context.Background(), daemon.RequestFrame{Proto: daemon.ProtocolVersion})
+	if code := store.ErrorCode(err); code != daemon.CodeTimeout {
+		t.Fatalf("want %s, got %v", daemon.CodeTimeout, err)
+	}
+	if got := spawns.Load(); got != 1 {
+		t.Fatalf("spawned %d times; a child exit must not re-trigger a fork (want 1)", got)
+	}
+}
+
+// verifies: an already-cancelled context never mutates (removes the socket) nor
+// launches a daemon.
+func TestAutoStartPreCancelledContextDoesNotSpawn(t *testing.T) {
+	dispatcher := autoStartDispatcher(t)
+	var spawns atomic.Int32
+	dispatcher.exchange = func(context.Context, string, daemon.RequestFrame) (daemon.ResponseFrame, error) {
+		return daemon.ResponseFrame{}, fmt.Errorf("%s: down", daemon.CodeUnavailable)
+	}
+	dispatcher.spawn = func() (<-chan childResult, error) {
+		spawns.Add(1)
+		return make(chan childResult, 1), nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := dispatcher.exchangeOrStart(ctx, daemon.RequestFrame{Proto: daemon.ProtocolVersion})
+	if code := store.ErrorCode(err); code != daemon.CodeTimeout {
+		t.Fatalf("want %s on a cancelled context, got %v", daemon.CodeTimeout, err)
+	}
+	if got := spawns.Load(); got != 0 {
+		t.Fatalf("spawned %d times under a pre-cancelled context; must not launch (want 0)", got)
+	}
+}
+
 func TestOlderClientNeverReplacesNewerDaemon(t *testing.T) {
 	dispatcher := autoStartDispatcher(t)
 	spawned := false
@@ -229,20 +277,36 @@ func TestOlderClientNeverReplacesNewerDaemon(t *testing.T) {
 	}
 }
 
-type recordingDispatcher struct {
-	requests []core.Request
-	scopes   []daemon.WorktreeScope
+func startCommandDaemon(t *testing.T, server *daemon.Server) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	ready := make(chan struct{}, 1)
+	server.Ready = ready
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx) }()
+	select {
+	case <-ready:
+	case err := <-done:
+		t.Fatalf("daemon exited before ready: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("daemon did not become ready")
+	}
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("daemon shutdown: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("daemon did not stop")
+		}
+	})
 }
 
-func (d *recordingDispatcher) Dispatch(_ context.Context, scope daemon.WorktreeScope, request core.Request) core.Response {
-	d.scopes = append(d.scopes, scope)
-	d.requests = append(d.requests, request)
-	return core.Response{OK: true, Code: "OK", Data: map[string]any{"routed": true}}
-}
-
-// verifies: the production MCP face reaches the shared Dispatcher seam for a
-// mutation instead of opening a project store itself.
-func TestMCPMutationUsesSharedDispatcher(t *testing.T) {
+// verifies: the production MCP face routes a mutation over the real daemon
+// socket instead of opening a project store itself.
+func TestMCPMutationUsesRealDaemonSocket(t *testing.T) {
 	root := t.TempDir()
 	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
 		t.Fatal(err)
@@ -257,17 +321,78 @@ func TestMCPMutationUsesSharedDispatcher(t *testing.T) {
 	t.Chdir(root)
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 	t.Setenv("XDG_RUNTIME_DIR", shortRuntimeDir(t))
-	recorder := &recordingDispatcher{}
+	paths, err := daemon.PathsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	startCommandDaemon(t, daemon.NewServer(paths))
 	input := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"aira_create","arguments":{"title":"MCP mutation","kind":"feature","severity":"P2"}}}` + "\n")
 	var output, diagnostics bytes.Buffer
-	if exit := runMCPWithDispatcher(context.Background(), input, &output, &diagnostics, recorder); exit != 0 {
+	if exit := runMCPWithDispatcher(context.Background(), input, &output, &diagnostics, nil); exit != 0 {
 		t.Fatalf("MCP exit=%d output=%q diagnostics=%q", exit, output.String(), diagnostics.String())
 	}
-	if len(recorder.requests) != 1 || recorder.requests[0].Verb != "create" {
-		t.Fatalf("dispatcher requests = %+v", recorder.requests)
+	if !strings.Contains(output.String(), `"code":"OK"`) {
+		t.Fatalf("MCP output = %q", output.String())
 	}
-	if len(recorder.scopes) != 1 || recorder.scopes[0].Root != root {
-		t.Fatalf("dispatcher scopes = %+v", recorder.scopes)
+	if _, err := os.Stat(filepath.Join(root, ".aira", "tickets", "AIRA-1.md")); err != nil {
+		t.Fatalf("routed mutation ticket: %v", err)
+	}
+}
+
+type responseParityPayload struct {
+	Z     string `json:"z"`
+	Limit int64  `json:"limit"`
+	A     struct {
+		Value int64 `json:"value"`
+	} `json:"a"`
+}
+
+func routedParityResponses(t *testing.T) (core.Response, core.Response) {
+	t.Helper()
+	payload := responseParityPayload{Z: "last", Limit: int64(^uint64(0) >> 1)}
+	payload.A.Value = payload.Limit
+	want := core.Response{OK: true, Code: "OK", Data: payload}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := (daemon.ResponseFrame{OK: true, Code: "OK", Data: raw}).CoreResponse()
+	if !got.OK {
+		t.Fatalf("routed response = %+v", got)
+	}
+	return want, got
+}
+
+func TestCLIRoutedStructuredResponseIsRenderedByteIdentically(t *testing.T) {
+	want, got := routedParityResponses(t)
+	for _, jsonOutput := range []bool{false, true} {
+		var wantOut, gotOut, wantErr, gotErr bytes.Buffer
+		wantExit := render(want, jsonOutput, &wantOut, &wantErr)
+		gotExit := render(got, jsonOutput, &gotOut, &gotErr)
+		if wantExit != gotExit || wantOut.String() != gotOut.String() || wantErr.String() != gotErr.String() {
+			t.Fatalf("json=%v routed render differs\n got stdout: %q\nwant stdout: %q\n got stderr: %q\nwant stderr: %q", jsonOutput, gotOut.String(), wantOut.String(), gotErr.String(), wantErr.String())
+		}
+		if !strings.Contains(gotOut.String(), "9223372036854775807") {
+			t.Fatalf("json=%v max int64 missing from %q", jsonOutput, gotOut.String())
+		}
+	}
+}
+
+func TestMCPRoutedStructuredResponseIsRenderedByteIdentically(t *testing.T) {
+	want, got := routedParityResponses(t)
+	wantWire, err := json.Marshal(toolResponse(json.RawMessage("1"), want))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotWire, err := json.Marshal(toolResponse(json.RawMessage("1"), got))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotWire, wantWire) {
+		t.Fatalf("routed MCP render differs\n got: %s\nwant: %s", gotWire, wantWire)
+	}
+	if !bytes.Contains(gotWire, []byte("9223372036854775807")) {
+		t.Fatalf("max int64 missing from %s", gotWire)
 	}
 }
 

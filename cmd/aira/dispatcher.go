@@ -165,11 +165,17 @@ func (d *daemonDispatcher) exchangeOrStart(ctx context.Context, frame daemon.Req
 	var childDone <-chan childResult
 	var childErr error
 	childStderr := ""
+	spawned := false // spawn at most once; a child exit must not re-trigger a fork.
 	for {
+		// Honour cancellation BEFORE any mutation (remove stale socket / spawn), so
+		// an already-cancelled request never unlinks or launches a daemon.
+		if ctx.Err() != nil {
+			return daemon.ResponseFrame{}, fmt.Errorf("%s: %w", daemon.CodeTimeout, ctx.Err())
+		}
 		if response, err := d.doExchange(ctx, frame); err == nil {
 			return response, nil
 		}
-		if childDone == nil {
+		if !spawned {
 			if lock, ok := d.tryStartupLock(); ok {
 				// We own the lock. Re-check for a socket a prior starter just bound,
 				// clear a stale one, then release BEFORE forking (never fork holding
@@ -188,10 +194,13 @@ func (d *daemonDispatcher) exchangeOrStart(ctx context.Context, frame daemon.Req
 					return daemon.ResponseFrame{}, fmt.Errorf("%s: start daemon: %w", daemon.CodeUnavailable, spawnErr)
 				}
 				childDone = started
+				spawned = true
 			}
-		} else {
+			// Lock held by another starter / a bound daemon → keep polling the socket.
+		} else if childDone != nil {
 			// Our spawned child exiting 0 is the normal losing-child outcome in the
-			// race; non-zero is retained as diagnostics. Neither ends polling.
+			// race; non-zero is retained as diagnostics. Neither ends polling nor
+			// re-spawns (spawned stays true).
 			select {
 			case exited := <-childDone:
 				if exited.err != nil {

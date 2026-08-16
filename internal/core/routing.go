@@ -34,7 +34,7 @@ func Classify(verb, selector string) (string, Route) {
 	canonical := CanonicalVerb(verb)
 	operation := strings.ToLower(strings.TrimSpace(selector))
 	switch {
-	case canonical == "show" && strings.HasPrefix(strings.ToUpper(strings.TrimSpace(selector)), "RUN-"):
+	case canonical == "show" && strings.HasPrefix(selector, "RUN-"):
 		return canonical, RouteClient
 	case canonical == "run" || strings.HasPrefix(canonical, "run-"):
 		return canonical, RouteClient

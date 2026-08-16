@@ -498,11 +498,31 @@ func canonicalPath(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	canonical, err := filepath.EvalSymlinks(abs)
-	if err == nil {
-		return filepath.Clean(canonical), nil
+	abs = filepath.Clean(abs)
+	candidate := abs
+	remainder := []string(nil)
+	for {
+		_, statErr := os.Lstat(candidate)
+		if statErr == nil {
+			canonical, resolveErr := filepath.EvalSymlinks(candidate)
+			if resolveErr != nil {
+				return "", resolveErr
+			}
+			for index := len(remainder) - 1; index >= 0; index-- {
+				canonical = filepath.Join(canonical, remainder[index])
+			}
+			return filepath.Clean(canonical), nil
+		}
+		if !errors.Is(statErr, os.ErrNotExist) {
+			return "", statErr
+		}
+		parent := filepath.Dir(candidate)
+		if parent == candidate {
+			return "", statErr
+		}
+		remainder = append(remainder, filepath.Base(candidate))
+		candidate = parent
 	}
-	return filepath.Clean(abs), nil
 }
 
 func hashPath(path string) string {

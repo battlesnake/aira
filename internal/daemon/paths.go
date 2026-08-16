@@ -66,10 +66,31 @@ func canonicalPath(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-		return filepath.Clean(resolved), nil
+	abs = filepath.Clean(abs)
+	candidate := abs
+	remainder := []string(nil)
+	for {
+		_, statErr := os.Lstat(candidate)
+		if statErr == nil {
+			resolved, resolveErr := filepath.EvalSymlinks(candidate)
+			if resolveErr != nil {
+				return "", resolveErr
+			}
+			for index := len(remainder) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, remainder[index])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !errors.Is(statErr, os.ErrNotExist) {
+			return "", statErr
+		}
+		parent := filepath.Dir(candidate)
+		if parent == candidate {
+			return "", statErr
+		}
+		remainder = append(remainder, filepath.Base(candidate))
+		candidate = parent
 	}
-	return filepath.Clean(abs), nil
 }
 
 type LockInfo struct {
