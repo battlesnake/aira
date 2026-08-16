@@ -1,305 +1,300 @@
-# M21 — Daemon skeleton (mandatory DB-owning daemon), v1
+# M21 — Daemon skeleton (mandatory DB-owning daemon), v2
 
-**Status:** plan (pre Sol plan-review). **Milestone:** Phase 5 · M21.
-**Branch:** `codex-aira-m21`. **Supersedes a spec principle:** amends §5.2 (see §1).
+**Status:** plan (Sol plan-review round 1 → REQUEST-CHANGES; this is v2). **Milestone:** Phase 5 · M21.
+**Branch:** `codex-aira-m21`. **Amends a spec principle:** §5.2 (see §1).
 
 ## 1. Purpose and the §5.2 amendment
 
-The authoritative design (`docs/superpowers/specs/2026-08-07-aira-design.md` §5.2)
-states *"core correctness never requires a running service"* — the daemonless floor the
-whole Phase 1–5 build rests on. **The owner has decided to amend this (2026-08-16):** the
-AIRA daemon becomes **mandatory and owns all writes to the machine-wide `state.db`**.
-The motivation is the single-writer concurrency win — no cross-process WAL contention,
-no `BEGIN IMMEDIATE`/busy-timeout waits, no machine-wide flock dances — which is the
-class of failure that compounds under parallel load (and which produced the WSL2 flakes).
+The authoritative design (`docs/superpowers/specs/2026-08-07-aira-design.md` §5.2) states
+*"core correctness never requires a running service"*. **The owner has decided to amend this
+(2026-08-16):** the AIRA daemon becomes **mandatory and owns writes to the per-user
+machine-wide `state.db`**, for the single-writer concurrency win (no cross-process WAL
+contention / `BEGIN IMMEDIATE` waits / machine-wide flock dances) that compounds under
+parallel load and produced the WSL2 flakes.
 
-**Honest caveat, accepted by the owner:** a single writer removes the *contention* class
-but does **not** cure the raw transient WSL2 vhdx `write()` EIO (`SQLITE_IOERR 778`) — the
-daemon still writes the same vhdx — so the `store.Open` retry (master `995eedc`) remains.
+**Honest scope of the win in M21 (Sol r1):** the skeleton delivers single-writer for
+**pure-store coordination verbs only**. Foreground-run telemetry and the M20 detach shim
+remain direct DB writers (§7), so `BEGIN IMMEDIATE` contention is **reduced, not yet
+eliminated**, in M21 — full elimination arrives when the execution surface is folded behind
+the daemon (deferrals D5/D7, the very next cut). This is stated, not overclaimed. And a
+single writer never cures the raw transient WSL2 vhdx `write()` EIO (`SQLITE_IOERR 778`) — the
+`store.Open` retry (`995eedc`) remains regardless.
 
-**This milestone (M21) is the skeleton only.** Later cuts add the heartbeat reaper,
-continuous reconciler, `aira watch`, the #29 cross-session admission fairness-queue, the
-fenced supervisor lease, and `run-input`. M21 establishes the process, the transport, and
-the invariant; it adds no new coordination behaviour.
+**M21 is the foundation cut:** the daemon process, the transport, the store-scoping refactor,
+and client routing for both faces. No reaper/reconciler/watch/fairness-queue/fenced-lease/
+run-input (all deferred).
 
-## 2. The invariant
+## 2. The invariant (precise)
 
-> **The per-user machine-wide `state.db` is written by at most one process: the daemon.**
+> **The per-user machine-wide `state.db` is written by at most one process — the daemon —
+> for every routed (pure-store coordination) verb.** Named execution/GitOps verbs remain
+> transitional client-side direct-writers (§7), enumerated and scheduled for folding.
 
-Precisely, in M21:
-
-- **The daemon is per-user**, scoped to `$XDG_STATE_HOME` (the same key as `state.db`), and
-  is **always startable** (it is the same static binary, run as the same user; no privileged
-  resource is required). There is therefore **no production escape hatch** — if a client
-  cannot reach or start the daemon it fails loudly with a stable error, never silently
-  writing the DB directly.
-- **Coordination verbs route through the daemon** (§5). This is the single-writer path.
-- **In-process execution is a substrate, not a fallback** (§6): the core can always run
-  against a *given* store in-process. This is used by the test suite (each test has an
-  isolated `XDG_STATE_HOME`/temp DB — one machine-wide daemon cannot serve per-test DBs)
-  and by the daemon itself (the daemon *is* an in-process core over the real store).
-- **Transitional direct-writers, documented, folded in later cuts (§7):** the execution
-  verbs (`run`, `run-kill`, `run-log`) and the M20 detach shim execute in the client's own
-  context and today write DB telemetry directly. M21 does **not** relay these; it carves
-  them out as a named, enumerated set of transitional direct-writers. The single-writer
-  invariant is therefore delivered for coordination in M21 and completed for execution in a
-  later cut. This partial delivery is stated, not hidden.
+- **The daemon is per-user**, its identity pinned to **its own** `$XDG_STATE_HOME` (§5.5),
+  and always startable (same static binary, same user, no privileged resource). **No
+  production escape hatch:** a client that cannot reach or start the daemon fails loudly with
+  a stable `E_DAEMON_*` code — never a silent direct write.
+- **In-process execution is a substrate, not a fallback** (§6): the core always runs against a
+  given store in-process. Used by (a) the daemon itself, (b) the client for carved-out verbs,
+  and (c) the test suite (isolated `XDG_STATE_HOME`; one machine-wide daemon cannot serve
+  per-test DBs). It is reached only by dependency injection, never a production env flag (§6).
 
 ## 3. Scope
 
-**In M21:**
+**In M21:** (1) `aira daemon` — a long-lived per-user process hosting a pure-store core over a
+daemon-owned DB connection, listening on a Unix socket, caching per-**worktree** store scopes;
+(2) a framed serializable request/response transport, byte-identical to in-process `core.Do`;
+(3) client routing for both the **CLI and MCP** faces (§5.6); (4) lifecycle `aira daemon
+[status|stop]` with graceful drain + a precise startup state machine (§5.5); (5) the
+store-scoping refactor (§5.4) and daemon state-identity pinning (§5.5).
 
-1. `aira daemon` — a long-lived per-user process hosting an in-process core over the real
-   store, listening on a Unix stream socket, with a per-project `Core` cache.
-2. A framed serializable request/response transport over that socket, byte-identical in
-   result to today's in-process `core.Do`.
-3. Client routing for **coordination verbs**: discover the project client-side, connect to
-   the daemon (auto-starting it under a single-instance guard if absent), send the request,
-   render the response.
-4. Lifecycle: `aira daemon` (run in foreground), `aira daemon status`, `aira daemon stop`;
-   graceful shutdown that drains in-flight requests; stale-socket detection and cleanup.
-5. The in-process substrate retained for tests and for the daemon's own core.
-
-**Out (explicit deferrals, later cuts):** heartbeat reaper (D1); continuous reconciler (D2);
-`aira watch` (D3); #29 cross-session admission fairness-queue (D4); fenced supervisor lease +
-routing the detach shim's writes through the daemon (D5); `run-input` (D6); relaying the
-execution verbs' DB writes through the daemon (D7); a TCP/auth transport (D8, Unix-socket only
-in v1); a Windows/non-Linux transport (D9).
+**Out (deferrals):** D1 heartbeat reaper · D2 continuous reconciler · D3 `aira watch` · D4 #29
+cross-session admission fairness-queue · D5 fenced supervisor lease + shim writes via the
+daemon · D6 `run-input` · D7 fold the execution/GitOps verbs' DB writes through the daemon ·
+D8 TCP/auth transport · D9 non-Linux transport.
 
 ## 4. Architecture
 
 ```
   aira <verb>  (client, in the agent's cwd/worktree)
-    │  1. discover project (git rev-parse) → Project{ProjectID, CommonDir, Root, Config, …}
-    │  2. classify verb: coordination → route; execution/detach → in-process (transitional)
-    ▼
-  ── coordination ──────────────►  Unix socket  ──►  aira daemon (per-user)
-    3a. frame {Project, Request} JSON                 │  select/build per-project Core
-        over the stream                               │  (keyed by ProjectID) over the
-    4a. read framed Response JSON                      │  ONE open real store
-    5a. render (same FaceOutput as today)              ▼  core.Do(ctx, Request) → Response
-                                                       │  (in the daemon process)
-  ── execution/detach ──────────►  in-process core over the real store (transitional
-        run/run-kill/run-log             direct-writer; runs in the CLIENT context)
+    │ 1. discover project + worktree (git rev-parse) → WorktreeScope{Root,CommonDir,GitDir,
+    │                                                    WorktreeID,ProjectID,Slug,Config,…}
+    │ 2. classify (verb, selector) via the shared classifier (§5.1)
+    ├─ routed (pure store) ──────►  Unix socket ──►  aira daemon (per-user)
+    │   3a. frame {Scope, Request}                    │  pin+verify state identity (§5.5)
+    │   4a. read framed Response                      │  select/build per-worktree store scope
+    │   5a. render (same FaceOutput)                  │    over the ONE daemon-owned DB conn
+    │                                                 ▼  pureStoreCore.Do(ctx, Req) → Response
+    └─ carved-out (runner/GitOps) ─►  in-process core (runner+GitOps) over the same DB, in the
+        run/run-kill/run-log/reconcile/  CLIENT context (transitional direct-writer, §7)
+        check/git/show RUN-*/gate-eval
 ```
 
-- **One daemon per user.** It holds the real store open once and caches a `Core` per
-  `ProjectID`. A project's `Core` carries that project's prefixes/review-policy; its runner
-  and GitOps are **not** used for coordination verbs (those never launch subprocesses), so
-  the daemon may build a coordination-only `Core` (runner/GitOps nil) — see §5.4.
-- **Discovery stays client-side.** The client runs project discovery (it has the cwd and git
-  access — the hardened `gitValue`), and sends the resolved `Project` to the daemon. The
-  daemon does no git and no cwd-sensitive work for coordination verbs.
-- **The daemon reuses `core.Do`.** No new dispatch logic; the daemon is a thin socket front
-  over the existing `Core.Do` (`internal/core/core.go:359`), which is already documented as
-  the transport-neutral seam and speaks serializable `Request`/`Response`.
+Both faces (CLI, MCP) use one **client dispatcher** that owns the classify → route-or-inproc
+decision (§5.6). Discovery stays client-side (the client has cwd + git); the daemon does no
+git and never uses its own cwd (§5.3).
 
-## 5. Client routing (coordination verbs)
+## 5. Design
 
-### 5.1 Verb classification
+### 5.1 Routing classification (operation/selector granular)
 
-The dispatch table (`Core.dispatchTable()`) is the source of truth. Each `verbSpec` is
-tagged (a new boolean/field) as **coordination** (relayable — pure store work) or
-**execution** (client-side in M21). The classification is enumerated in code, not inferred:
+**Criterion (the source of truth, not a hand list):** a `(verb, args)` operation is
+**carved-out** (runs in-process, client-side) iff its handler can reach `c.runner` or
+`c.gitops`. Everything else is **routed** to the daemon's pure-store core. The daemon core is
+built with **runner and GitOps nil**, which is why carved-out ops must never reach it — and is
+exactly why they are carved out (a nil-runner core would otherwise return a false
+`E_RUN_UNAVAILABLE`, Sol r1 #1).
 
-- **Execution / carve-out (in-process, transitional):** `run`, `run-kill`, `run-log`, and the
-  hidden `__supervise` shim path. Rationale: `run` launches a subprocess that must execute in
-  the client's cwd/worktree/cgroup, not the daemon's; `run-log` streams from client-visible
-  capture files; the shim is already a separate long-lived process.
-- **Coordination / relayable (everything else):** `init`, `id`, `create`, `list`, `get`,
-  `set`, `mv`, `claim`, `release`, `heartbeat`, `touch`, `link`, `find`, `req`, `ready`,
-  `review`, `import`, `test-report`, `ratchet`, `spend`, `quota`, `grep`, `backlog`,
-  `roadmap`, `stats`, `check`, `reconcile`, `exec`.
-- **`AfterWrite` carve-out:** any response carrying a non-nil `AfterWrite` callback
-  (`core.go:35`, `json:"-"`) cannot cross the socket. In M21 the only `AfterWrite` producer is
-  the detached-run delivery handshake, which is already inside the execution carve-out, so no
-  coordination verb crosses the socket with an `AfterWrite`. A build-time assertion (a test)
-  enforces this: no coordination-classified verb may return a non-nil `AfterWrite`.
+Enumerated from the real dispatch table (`internal/core/core.go` `dispatchTable()`), audited
+against every `c.runner`/`c.gitops` reference:
 
-**Honesty rule:** if a verb's coordination handler is later found to write outside the
-daemon's process, it is reclassified to the carve-out with a stable warning — never left as a
-silent second writer.
+- **Selector-granular:** `show` — `show RUN-*` reaches `c.runner.Get` (core.go:570) → carve
+  out; `show TICKET-*`/other selectors → route. The classifier inspects the selector.
+- **Verb-level carve-out:** `run`, `run-kill`, `run-log` (`Launch`/`Kill`/`ReadOutput`);
+  `reconcile`, `check` (call `runner.Reconcile`, core.go:1406/1424); `git` (GitOps network
+  ops); any `gate` evaluation that executes a command lane (launches a subprocess).
+- **Routed (pure store):** all other verbs — `id`, `create`, `list`, `get`, `set`, `mv`,
+  `claim`, `release`, `heartbeat`, `touch`, `link`, `unlink`, `find(ing)`, `req`, `ready`,
+  `review`, `import` (see §5.3), `test-report`, `spend`, `quota`, `grep`, `insights`, `count`,
+  `project`, `milestone`, `roadmap`/`backlog`/`stats` (whichever are dispatch verbs), `init`
+  (bootstrap, §5.3).
+
+**Completeness is enforced, not asserted in prose:**
+1. A build-time test builds a pure-store core (runner/GitOps nil) and, for every **routed**
+   verb, exercises a representative operation asserting it never returns the nil-runner/nil-
+   GitOps sentinel — i.e. no routed verb secretly needs the runner/GitOps.
+2. The `AfterWrite` producer (detached `run`, core.go:35) is inside the carve-out; a test
+   asserts no routed verb returns a non-nil `AfterWrite`. (Confirmed true today by Sol r1.)
+3. **Honesty rule:** a routed verb later found to need the runner/GitOps is reclassified to
+   carve-out — never left to false-fail.
 
 ### 5.2 Wire protocol
 
-A Unix `SOCK_STREAM` socket. Each interaction is one framed request and one framed response,
-length-prefixed (4-byte big-endian length + JSON body); connection is one-shot per request in
-v1 (no multiplexing — simplest correct thing; keep-alive/streaming is a `watch`-era concern).
+Unix `SOCK_STREAM`; one framed request + one framed response per connection (no multiplexing
+in v1). Framing: 4-byte big-endian length + JSON body, with a max-frame cap (reject oversized
+→ `E_DAEMON_PROTOCOL`).
 
-- **Request frame:** `{ "project": <Project descriptor>, "request": <core.Request> }`.
-  The `Project` descriptor is the client-discovered, serializable projection needed to build
-  the per-project store Options (ProjectID, CommonDir, Root, StateDir, ProjectSlug, prefixes,
-  review policy, retention caps, lease TTL). It is validated daemon-side against the same
-  `store.Options` rules; a mismatch → `E_DAEMON_PROJECT_INVALID`.
-- **Response frame:** the JSON projection of `core.Response` **minus** `AfterWrite`
-  (`OK, Code, Data, Error, Warnings, Exit`). The client renders it through the identical
-  `FaceOutput` path it uses today, so text/JSON/MCP output is byte-identical.
-- **Protocol version:** the first frame carries a `proto` integer; a client/daemon version
-  mismatch → the client refuses and (per §5.5) restarts the daemon.
+- **Request frame:** `{ "proto": <int>, "scope": <WorktreeScope>, "request": <core.Request> }`.
+  `WorktreeScope` is the client-discovered serializable projection needed to build a store
+  scope: `Root, CommonDir, GitDir, WorktreeID, ProjectID, Slug, Prefixes, RequirementPrefixes,
+  ReviewPolicy, retention caps, LeaseTTL, config_digest`. **It carries no DB/registry/lease-
+  state path** — the daemon derives those from its own env (§5.5).
+- **Response frame:** the JSON projection of `core.Response` minus `AfterWrite`
+  (`OK, Code, Data, Error, Warnings, Exit`); rendered through the identical `FaceOutput`, so
+  text/JSON/MCP output is byte-identical to in-process.
+- **Version:** a `proto` mismatch → the client refuses and triggers authorized replacement
+  (§5.5), never a silent skew.
 
-### 5.3 Git-file writes and `init` (the daemon is not cwd-bound)
+### 5.3 Client-context paths: git-files, `import`, `init`
 
-Coordination verbs are not "DB-only": `create`/`set`/`mv`/`req`/`import` write ticket and
-requirement **git-files** (`.md`) into the worktree, and `init` scaffolds `.aira/config`.
-This does **not** block relaying, because the store writes git-files by **absolute path** —
-its `Options.Root`/`CommonDir` are absolute paths carried in the client's `Project`
-descriptor, and the daemon (same user, same filesystem) can write `<root>/.aira/tickets/…`
-and `<common>/aira/…` directly. The daemon never uses its own cwd for coordination; every
-path is client-provided and absolute. (Runs are different — a subprocess *inherits* cwd and
-namespace, which is why the execution verbs stay client-side, §5.1.)
+- **Git-file writes route fine:** the store writes ticket/requirement `.md` by **absolute**
+  path (`Root`/`CommonDir` from the scope); the daemon (same user, same filesystem) writes
+  `<Root>/.aira/tickets/…` directly. The daemon never uses its own cwd for a routed verb.
+- **`import` / `req import` (Sol r1 #4):** these pass caller-supplied source paths that the
+  store `os.Open`s relative to the executing process — wrong in the daemon. **Fix:** the client
+  resolves the source path to absolute **and reads the bytes client-side**, transmitting the
+  content in the request (the importer parses bytes, not a path). A path that cannot be read
+  client-side fails client-side with the existing error.
+- **`init` (bootstrap):** no `.aira/config`/registration exists yet, so no full scope. The
+  client sends a `bootstrap` descriptor (Root, CommonDir, GitDir, requested slug/prefixes); the
+  daemon scaffolds `<Root>/.aira/config`, registers, and returns. Any caller-relative result
+  presentation is rendered client-side from the absolute paths the daemon returns.
 
-- **`init` is the bootstrap special case:** no `.aira/config`/registration exists yet, so the
-  client cannot send a fully-formed `Project` descriptor. The client sends the repo facts it
-  *can* discover (root, common-dir, git-dir, requested slug/prefixes); the daemon scaffolds
-  `<root>/.aira/config`, registers the project, and returns. `init` is classified coordination
-  but takes a distinct request shape (a `bootstrap` descriptor, not a `Project`).
-- **A worktree the daemon cannot see** (e.g. a bind-mount visible only to the client) would
-  make git-file writes fail — surfaced as the store's existing IO error, never a fake success.
-  This is out of scope for the "same user, same machine" model (a documented assumption).
+### 5.4 Store-scoping refactor (Sol r1 #2)
 
-### 5.4 Per-project Core cache
+Today `store.Open` fuses two concerns: opening the DB **and** binding a worktree scope
+(`root, commonDir, worktreeID, lease-state paths, policies, retention`). A machine-wide daemon
+serving many worktrees over one DB must separate them, or sibling worktrees with equal config
+alias (second worktree writes under the first `Root`, attributes claims/leases to the first
+`WorktreeID`).
 
-The daemon keeps `map[ProjectID]*coordinationCore` under a mutex. On a request for an unseen
-project it builds the store Options from the request's `Project` descriptor, `store.Open`s
-(the real machine-wide DB, already open once at the connection layer — see §5.6), and
-constructs a coordination `Core` (runner/GitOps nil, since coordination verbs never launch).
-Config drift (a project whose `.aira/config` changed since it was cached) is handled by keying
-the cache on `(ProjectID, config_digest)`; a new digest builds a fresh entry. The store handle
-itself is shared (one DB, one `*sql.DB`, `MaxOpenConns(1)` as today).
+- **Refactor:** split into (a) `store.OpenDB(dbPath, registryPath) → *DB` — opens the shared
+  connection once (WAL, `MaxOpenConns(1)`, the M21 retry), owned by the daemon for its
+  lifetime; and (b) `store.NewScope(db, ScopeOptions) → *Store` — a lightweight worktree-scoped
+  view over that shared `*DB` carrying `Root/CommonDir/WorktreeID/lease paths/policies/
+  retention`. In-process callers (tests, carved-out verbs) use a convenience that opens a
+  private DB **and** a scope (today's `store.Open` behaviour, preserved).
+- **Daemon cache:** `map[scopeKey]*Store`, `scopeKey =` canonical
+  `(Root, CommonDir, GitDir, WorktreeID, config_digest)`. A config change → a new digest → a
+  fresh scope. All scopes share the one daemon-owned `*DB`.
+- **Concurrency:** the shared `*sql.DB` with `MaxOpenConns(1)` already serialises statements
+  in-process; scopes are stateless views. Any per-scope mutable caches (e.g. prefix maps) are
+  built per scope, not shared.
 
-### 5.5 Auto-start and single-instance
+### 5.5 Daemon identity, socket, and the startup state machine (Sol r1 #5, #6)
 
-- **Socket + lock live under `$XDG_RUNTIME_DIR/aira/`** (fallback `$XDG_STATE_HOME/aira/run/`
-  if `XDG_RUNTIME_DIR` is unset), dir mode `0700`. Socket `daemon.sock`; lock `daemon.lock`.
-- **Auto-start:** a client that finds no live daemon `fork+exec`s `aira daemon` (via
-  `/proc/self/exe`), then waits (bounded, e.g. 2s) for the socket to accept, then proceeds.
-- **Single-instance:** the daemon acquires an exclusive `flock` on `daemon.lock` (the existing
-  `runner/ledger.go` flock helpers) *before* binding the socket; a second daemon losing the
-  race exits 0 silently (someone else won). A client racing to auto-start likewise: only one
-  `fork+exec` wins the lock; the losers connect to the winner's socket.
-- **Stale-socket detection:** if `connect` fails with `ECONNREFUSED` on an existing socket
-  file (daemon died), the client removes the stale socket **only while holding the lock** and
-  auto-starts. Never remove a socket whose lock is held live.
-- **Liveness:** the lock holder writes its pid to `daemon.lock`; `aira daemon status` reads it
-  and probes the socket. A `boot_id` guard (as in the runner) distinguishes a live pid from a
-  post-reboot reused pid.
+- **State identity is the daemon's, not the client's.** The daemon derives its canonical
+  `DBPath/RegistryPath/LeaseStateDir` from **its own** `$XDG_STATE_HOME` at startup and pins
+  them. A request `WorktreeScope` carries **no** DB path; if a (future) field ever implies a
+  different state home, the daemon rejects it with `E_DAEMON_PROJECT_INVALID`. The socket and
+  lock are **namespaced by the canonical state identity**: `<runtime>/aira/<state-id>/daemon.sock`
+  and `daemon.lock`, where `runtime = $XDG_RUNTIME_DIR` (fallback `$XDG_STATE_HOME/aira/run`),
+  dir mode `0700`, and `state-id = hash(canonical $XDG_STATE_HOME)`. Thus clients with
+  different state homes reach different daemons; none can point a daemon at a foreign DB.
+- **Startup state machine (client auto-start):**
+  1. `connect(sock)`. Success → send request.
+  2. Refused/absent → acquire an exclusive `flock` on `daemon.lock` (bounded wait).
+  3. Under the lock: re-`connect` (someone may have just won) → success → **release lock**, use
+     it. Else the socket is stale/absent: `unlink` it (safe — we hold the lock), **release the
+     lock**, then `fork+exec` `/proc/self/exe daemon`.
+  4. Poll `connect` with a bounded deadline; detect child early-exit (waitpid/`ESRCH`) →
+     `E_DAEMON_UNAVAILABLE` with the child's stderr; deadline exceeded → `E_DAEMON_TIMEOUT`.
+  5. The spawned daemon acquires the **same** `flock` before binding (single-instance); a loser
+     exits 0.
+- **Authorized replacement (proto mismatch / `daemon stop`):** the client signals the running
+  daemon (via the socket control verb or SIGTERM to the pid in `daemon.lock`), waits (bounded)
+  for it to release the lock + remove the socket, then auto-starts. Never `unlink` a socket
+  whose lock is held live; never `fork` while holding the lock.
+- **Liveness/`status`:** the lock holder writes `pid`+`boot_id` to `daemon.lock`; `status`
+  reads them, guards pid-reuse with `boot_id`, and probes the socket.
 
-### 5.6 The store handle
+### 5.6 Both faces route through one client dispatcher (Sol r1 #3)
 
-The daemon `store.Open`s the machine-wide DB **once** at startup and keeps it open for its
-lifetime (the load-once session). Coordination cores share this one handle. On graceful stop
-the handle is closed after in-flight requests drain.
+The CLI (`cmd/aira/main.go`) and the **MCP** provider (`cmd/aira/mcp_project.go`, which today
+calls `app.Open` + `core.Do` per request — a hidden production writer) must **both** go through
+a single `Dispatcher` seam: `Dispatch(ctx, WorktreeScope, Request) → Response`. Production wires
+the daemon-backed dispatcher (classify → route-or-inproc); tests wire an in-process dispatcher
+(§6). No production face may `store.Open` the real DB and `core.Do` a routed verb directly. A
+test drives an **MCP mutation** through the daemon to prove it.
 
-## 6. In-process substrate (tests + the daemon itself)
+## 6. In-process substrate via injection (Sol r1 #7)
 
-`Core.Do` already runs in-process over any `Store`. M21 keeps a single well-named entry point
-—`app`/`core` construct an in-process core over a given store—used by:
+No env flag (a process cannot distinguish a "temporary override" from a user's real
+`$XDG_STATE_HOME`). Instead the client entrypoint takes an **injected `Dispatcher`**:
 
-- **the daemon** (its hosted core), and
-- **the test suite:** `cmd/aira` tests call `Run([]string{…})` against an isolated
-  `XDG_STATE_HOME`. Under M21 the *default* client path would auto-start a daemon; tests must
-  not spawn a per-user daemon against a shared socket. So the client exposes an **in-process
-  execution mode** selected when the target DB is test-isolated. Mechanism: an internal
-  `AIRA_INPROCESS=1` (test-only, set by the test harness / `Run` wrapper) forces the in-process
-  substrate. This is **not** a production escape hatch (production has none, §2); it is the
-  test substrate. A guard rejects `AIRA_INPROCESS=1` pointing at the real per-user
-  `$XDG_STATE_HOME` unless a temp override is in effect, so it cannot become a silent
-  production bypass.
-
-*(Design note for the reviewer: the cleanest form of this may be that `Run`/the client takes
-an injected "dispatcher" — daemon-backed or in-process — and tests inject the in-process one
-directly, avoiding an env flag. The implementer chooses; the invariant is that tests never
-touch a shared daemon and production never runs in-process.)*
+- **Production** wires the daemon-backed dispatcher only; the in-process store path is not
+  reachable from the production entrypoint for routed verbs.
+- **Tests** inject an in-process dispatcher directly (`Run`/the face is parameterised), so they
+  never spawn or contact a shared per-user daemon; they run entirely over their isolated DB.
+- **Daemon integration tests** isolate **both** `XDG_RUNTIME_DIR` and `XDG_STATE_HOME` (temp),
+  so a real daemon under test is namespaced away from any real per-user daemon.
 
 ## 7. Transitional direct-writers (named, folded later)
 
-M21 leaves these writing `state.db` outside the daemon, each documented and enumerated:
-
-1. **Execution verbs** `run`/`run-kill`/`run-log` — execute client-side; their M19 telemetry
-   wiring (`AddComputeEvent`/`AddTestReport`) writes the DB directly. Folded in D7 (client
-   executes; DB writes relay to the daemon).
-2. **The M20 detach shim** — a separate long-lived process writing run/telemetry records.
-   Folded in D5 (fenced supervisor lease / route shim writes through the daemon).
-
-Because these are the *same* writers that already exist and are individually crash-safe
-against the DB (WAL permits concurrent openers; single-writer is a routing policy, not a
-SQLite lock), leaving them direct in M21 is correct, not a regression — it is the pre-daemon
-status quo for those verbs, now explicitly scoped for migration.
+Carved-out verbs (§5.1) run in-process client-side and write `state.db` directly: the
+execution surface (`run`/`run-kill`/`run-log`, and each verb's M19 telemetry wiring), the M20
+detach **shim** (a separate long-lived process), `git`/`gate`-eval. These are the *same*
+writers that exist today and are individually crash-safe against the WAL DB (single-writer is
+a routing policy, not a SQLite lock), so leaving them direct in M21 is the pre-daemon status
+quo for those verbs — now explicitly scoped for folding in D5 (shim/fenced lease) and D7
+(execution + telemetry through the daemon). Until then, `BEGIN IMMEDIATE` contention is reduced
+(coordination serialised through the daemon), not eliminated (§1).
 
 ## 8. Lifecycle and failure semantics
 
-- **Graceful stop** (`aira daemon stop`, SIGTERM): stop accepting, drain in-flight requests
-  (bounded), close the store, release the lock, remove the socket.
-- **Crash:** the lock is released by the kernel on process death; the next client detects the
-  stale socket (§5.5) and auto-starts a fresh daemon. No coordination state is lost — the DB
-  is the authority and every mutation is already durably committed before the response.
-- **A request that panics** in the daemon is recovered per-connection → `E_DAEMON_INTERNAL`;
-  the daemon stays up (one bad request never takes down the shared process).
-- **Idempotency across restart:** because the daemon adds no state beyond the DB, a restart is
-  transparent; there is no in-memory mutation to lose.
+Graceful stop (`daemon stop`/SIGTERM): stop accepting, drain in-flight (bounded), close the DB,
+release the lock, remove the socket. Crash: the kernel releases the lock; the next client
+detects the stale socket (§5.5) and auto-starts; no coordination state is lost (the DB is the
+authority; every mutation commits before its response). A panicking request is recovered
+per-connection → `E_DAEMON_INTERNAL`; the shared daemon stays up. A restart is transparent (the
+daemon holds no state beyond the DB).
 
 ## 9. Error codes (stable)
 
-`E_DAEMON_UNAVAILABLE` (cannot reach or start the daemon; loud failure, never a silent
-bypass), `E_DAEMON_PROJECT_INVALID` (bad project descriptor), `E_DAEMON_PROTOCOL`
-(frame/version error), `E_DAEMON_INTERNAL` (recovered panic / unexpected), `E_DAEMON_TIMEOUT`
-(auto-start or request deadline). None of these is a coordination verdict; they are transport
-failures and are surfaced, never converted to a fake success.
+`E_DAEMON_UNAVAILABLE` (cannot reach/start; loud, never a silent bypass), `E_DAEMON_TIMEOUT`
+(auto-start/request deadline), `E_DAEMON_PROJECT_INVALID` (scope/state-identity disagreement),
+`E_DAEMON_PROTOCOL` (frame/version/oversize), `E_DAEMON_INTERNAL` (recovered panic). None is a
+coordination verdict; transport failures are surfaced, never converted to a fake success.
 
 ## 10. Testing strategy
 
-- **In-process substrate parity:** the existing suite keeps running in-process (isolated DBs)
-  — this is the correctness baseline and must stay green byte-for-byte.
-- **Daemon round-trip:** a real daemon started on a temp `XDG_RUNTIME_DIR` + temp
-  `XDG_STATE_HOME`; a client routes a coordination verb through the socket; assert the
-  response is byte-identical to the in-process result for the same request.
-- **Single-instance race:** N concurrent auto-starts → exactly one daemon binds; the losers
-  connect to it; assert one lock holder, one socket, N successful responses.
-- **Stale-socket recovery:** kill the daemon leaving the socket file; next client detects
-  `ECONNREFUSED`, cleans up under lock, auto-starts, succeeds.
-- **AfterWrite assertion:** a test enumerates the dispatch table and asserts no
-  coordination-classified verb returns a non-nil `AfterWrite`.
-- **No-silent-bypass guard:** `AIRA_INPROCESS=1` against the real `$XDG_STATE_HOME` (no temp
-  override) is rejected.
-- **Graceful drain:** a slow in-flight request completes across a `stop`.
-- **Loud failure:** a client that cannot start the daemon (socket dir made unwritable) returns
-  `E_DAEMON_UNAVAILABLE`, never an in-process write.
+- **In-process parity:** the whole existing suite keeps running over injected in-process
+  dispatchers on isolated DBs — the correctness baseline, must stay byte-for-byte green.
+- **Routed round-trip:** a real daemon on temp `XDG_RUNTIME_DIR`+`XDG_STATE_HOME`; a routed
+  coordination verb over the socket returns byte-identical to the in-process result.
+- **MCP routing:** an MCP **mutation** is driven through the daemon (proves §5.6 — MCP is not a
+  second writer).
+- **Carve-out completeness:** every routed verb exercised against a nil-runner/nil-GitOps core
+  never hits the nil sentinel; no routed verb returns a non-nil `AfterWrite` (§5.1).
+- **Sibling-worktree isolation:** two worktrees, same config, served by one daemon → each
+  writes under its own `Root` and attributes claims/leases to its own `WorktreeID` (proves
+  §5.4 — no aliasing).
+- **State-identity pinning:** a client whose scope implies a different state home is rejected
+  `E_DAEMON_PROJECT_INVALID`; two different `XDG_STATE_HOME` → two different sockets/daemons.
+- **Single-instance race:** N concurrent auto-starts → exactly one binds; losers connect; N
+  successes, one lock holder, one socket.
+- **Stale-socket recovery / child early-exit / bounded timeout:** each yields the correct
+  `E_DAEMON_*` (§5.5), never a silent in-process production write.
+- **`import` path safety:** a routed `import` reads bytes client-side; a daemon-cwd-relative
+  path never resolves against the daemon.
+- **Graceful drain:** a slow in-flight request completes across `stop`.
 
 ## 11. Risks and invariants
 
-- **R1 — partial single-writer in M21.** Execution verbs + shim still write direct. *Mitigation:*
-  named, enumerated, scheduled (D5/D7); the invariant is stated as "coordination single-writer
-  in M21", not overclaimed.
-- **R2 — auto-start races / stale sockets.** *Mitigation:* flock-before-bind; stale cleanup
-  only under lock; boot_id pid guard (§5.5). Two-loop-tested (§10).
-- **R3 — a daemon that hosts a stale per-project Core after a config change.** *Mitigation:*
-  cache keyed on `(ProjectID, config_digest)` (§5.4).
-- **R4 — the daemon becomes a single point of failure.** *Mitigation:* crash → transparent
-  auto-restart; the DB is the authority; no in-memory mutation to lose (§8).
-- **R5 — a coordination verb that secretly writes outside the daemon.** *Mitigation:* the
-  classification is enumerated + the AfterWrite assertion + the honesty rule (§5.1).
+- **R1 — partial single-writer in M21** (execution + shim direct). *Mitigation:* named,
+  enumerated, scheduled (D5/D7); §1/§7 state it, never overclaim.
+- **R2 — carve-out incompleteness** (a routed verb secretly needs runner/GitOps → false-fail).
+  *Mitigation:* the criterion + the completeness test (§5.1).
+- **R3 — sibling-worktree aliasing.** *Mitigation:* the store-scoping refactor + per-worktree
+  scopeKey (§5.4) + the isolation test (§10).
+- **R4 — client-controlled DB path.** *Mitigation:* the daemon pins its own state identity;
+  scope carries no DB path (§5.5).
+- **R5 — auto-start races / stale sockets / fork-while-locked.** *Mitigation:* the exact state
+  machine (§5.5, release-before-fork, flock-before-bind, boot_id guard) + the race test.
+- **R6 — MCP as a hidden writer.** *Mitigation:* one client dispatcher for both faces + the
+  MCP-mutation test (§5.6).
+- **R7 — test bypass of the real DB.** *Mitigation:* injected dispatchers, no env flag (§6).
 
 ## 12. Sol build-review checklist
 
-1. **Byte-identical relay:** does a routed coordination verb produce exactly the in-process
-   `Response` (Data/Code/Warnings/Exit)? Any field lost or reordered across the frame?
-2. **AfterWrite carve-out completeness:** is every `AfterWrite`-producing or DB-writing-outside
-   verb actually in the execution carve-out? Prove no coordination verb writes direct.
-3. **Single-instance correctness:** flock acquired before bind; loser exits cleanly; stale
-   socket removed only under lock; boot_id guard against pid reuse. Any window where two
-   daemons bind, or a live socket is removed?
-4. **Loud-failure honesty:** every unreachable-daemon path returns `E_DAEMON_*` and NEVER a
-   silent in-process production write. The `AIRA_INPROCESS` guard cannot bypass the real DB.
-5. **Graceful drain:** an in-flight request is not truncated by `stop`; the store closes only
-   after drain.
-6. **Test substrate isolation:** tests never spawn/contact a shared per-user daemon; the
-   in-process path is what runs under `go test`.
-7. **No new dispatch logic:** the daemon calls `Core.Do` unchanged; no verb behaviour forks
-   between in-process and daemon paths.
+1. **Byte-identical relay:** a routed verb's socket `Response` equals the in-process one
+   (Data/Code/Warnings/Exit); nothing lost/reordered across the frame.
+2. **Carve-out completeness + AfterWrite:** every runner/GitOps-touching (verb, selector) is
+   carved out; no routed verb hits the nil sentinel or returns a non-nil `AfterWrite`.
+3. **Store scoping:** sibling worktrees never alias; scopeKey includes worktree identity;
+   one DB connection, per-worktree views; no per-scope state shared unsafely.
+4. **State identity:** the daemon pins its own DB/lease paths; a foreign-state scope is
+   rejected; socket/lock namespaced by state-id.
+5. **Startup state machine:** flock-before-bind; release-before-fork; stale socket removed only
+   under lock; child early-exit + bounded timeout → correct `E_DAEMON_*`; no two-daemon window.
+6. **Both faces routed:** CLI and MCP share the dispatcher; no production `store.Open`+`core.Do`
+   of a routed verb; the MCP-mutation test passes.
+7. **Loud-failure honesty:** every unreachable path returns `E_DAEMON_*`, never a silent
+   in-process production write; the injected-dispatcher test substrate cannot touch the real DB.
+8. **Graceful drain:** in-flight requests survive `stop`; the DB closes only after drain.
 
 ## 13. Deferrals
 
-D1 heartbeat reaper · D2 continuous reconciler · D3 `aira watch` · D4 #29 cross-session
-admission fairness-queue · D5 fenced supervisor lease + shim writes through the daemon ·
-D6 `run-input` · D7 execution-verb DB writes relayed through the daemon · D8 TCP/auth
-transport · D9 non-Linux transport.
+D1 reaper · D2 continuous reconciler · D3 `watch` · D4 #29 fairness-queue · D5 fenced supervisor
+lease + shim writes via daemon · D6 `run-input` · D7 execution + telemetry writes via daemon ·
+D8 TCP/auth transport · D9 non-Linux transport.
