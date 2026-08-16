@@ -1,6 +1,6 @@
-# M21 — Daemon skeleton (mandatory DB-owning daemon), v3
+# M21 — Daemon skeleton (mandatory DB-owning daemon), v4
 
-**Status:** plan (Sol plan-review r1+r2 → REQUEST-CHANGES; this is v3). **Milestone:** Phase 5 · M21.
+**Status:** plan (Sol plan-review r1–r3 → REQUEST-CHANGES; this is v4). **Milestone:** Phase 5 · M21.
 **Branch:** `codex-aira-m21`. **Amends a spec principle:** §5.2 (see §1).
 
 ## 1. Purpose and the §5.2 amendment
@@ -81,20 +81,27 @@ git and never uses its own cwd (§5.3).
 
 ### 5.1 Routing classification (operation/selector granular)
 
-**Criterion (the source of truth, not a hand list):** a `(verb, selector)` operation is
-**carved-out** (runs in-process, client-side) iff its handler can reach the runner or GitOps
-**by any path** — `Core.runner`/`Core.gitops` *or* `Store.runner` (the command-gate lane goes
-through the store, Sol r2 #1). Everything else is **routed** to the daemon's pure-store core
-(runner/GitOps nil). Carved ops must never reach the daemon core — not because they'd error
-(they often silently *change behaviour* instead: `show RUN-*` falls through to `store.Get`,
-`reconcile`/`check` skip their `if c.runner != nil` branch), but because that silent
-divergence is exactly what routing them would cause.
+**The classifier canonicalizes aliases FIRST (Sol r3 #1).** `Core.Do` normalizes `get→show`,
+`new→create`, `ls→list` (core.go:361-369). The shared classifier must apply the **identical**
+canonicalization *before* classifying, or `aira get RUN-1` (alias of `show RUN-1`) would route
+to the pure-store daemon and false-not-found. Alias-parity is a required test, `get RUN-*`
+especially.
+
+**Criterion (the source of truth, not a hand list):** a canonicalized `(verb, selector)`
+operation is **carved-out** (runs in-process, client-side) iff its handler can reach the runner
+or GitOps **by any path** — `Core.runner`/`Core.gitops` *or* `Store.runner` (the command-gate
+lane goes through the store, Sol r2 #1). Everything else is **routed** to the daemon's
+pure-store core (runner/GitOps nil). Carved ops must never reach the daemon core — not because
+they'd error (they often silently *change behaviour* instead: `show`/`get RUN-*` falls through
+to `store.Get`, `reconcile`/`check` skip their `if c.runner != nil` branch), but because that
+silent divergence is exactly what routing them would cause.
 
 Enumerated from the real dispatch table (`internal/core/core.go` `dispatchTable()`), audited
 against every runner/GitOps reference in `internal/core` **and** `internal/store`:
 
-- **Selector-granular:** `show` — `show RUN-*` reaches `c.runner.Get` (core.go:570) → carve
-  out; `show TICKET-*`/other selectors → route. The classifier inspects the selector.
+- **Selector-granular:** `show` (and its alias `get`, canonicalized above) — a `RUN-*` selector
+  reaches `c.runner.Get` (core.go:570) → carve out; `TICKET-*`/other selectors → route. The
+  classifier inspects the canonicalized verb + selector.
 - **Verb-level carve-out:** `run`, `run-kill`, `run-log` (`Launch`/`Kill`/`ReadOutput`);
   `reconcile`, `check` (call `store.Reconcile` **and** `runner.Reconcile`, core.go:1394/1406/
   1424); `git` (GitOps network ops); and **all** `gate run` / `gate canary-run` operations —
@@ -108,12 +115,19 @@ against every runner/GitOps reference in `internal/core` **and** `internal/store
   `project`, `milestone`, `roadmap`/`backlog`/`stats` (whichever are dispatch verbs), `init`
   (bootstrap, §5.3).
 
-**Completeness is enforced by a behaviour test, not a nil check (Sol r2 #1):**
-1. Build a core over **recording sentinel** dependencies — a runner and GitOps (and a
-   store whose `runner` is a recording sentinel) that record any call. For every **routed**
-   `(verb, selector)`, including data-dependent branches (fixtures that would exercise a gate
-   command lane, a RUN selector, a reconcile with run records), assert the sentinels are
-   **never touched**. A routed verb that reaches a sentinel is a misclassification → fail.
+**A store execution-dependency interface is required for the test (Sol r3 #2).** Today
+`Store.runner`/`SetRunner` take the concrete `*runner.Runner`, so a recording sentinel cannot
+be injected. Introduce a small interface for the gate-used methods (`Launch`, `ReadOutput`)
+that `Store` depends on; `*runner.Runner` satisfies it in production, a recording sentinel in
+the test. (Narrow, additive — not a runner redesign.)
+
+**Completeness is enforced by a bidirectional behaviour test, not a nil check (Sol r2 #1, r3 #2):**
+1. Build a core over **recording sentinel** dependencies — runner, GitOps, and the store's
+   execution-dependency — that record any call. Across a fixture set covering data-dependent
+   branches (a gate command lane, `show`/`get RUN-*`, `reconcile`/`check` with run records) plus
+   representative pure-store ops, assert **`touched ⇔ carved`**: every routed `(verb, selector)`
+   leaves all sentinels untouched, **and** every carved `(verb, selector)` does touch one. This
+   proves the classifier both excludes and recognizes exactly the runner/GitOps surface.
 2. The `AfterWrite` producer (detached `run`, core.go:35) is inside the carve-out; a test
    asserts no routed verb returns a non-nil `AfterWrite`. (Confirmed true today by Sol r1.)
 3. **Honesty rule:** a routed verb later found to need the runner/GitOps is reclassified to
@@ -159,8 +173,14 @@ serving many worktrees over one DB must separate them, or sibling worktrees with
 alias (second worktree writes under the first `Root`, attributes claims/leases to the first
 `WorktreeID`).
 
+- **Preserve the transient-IOERR retry across the split (Sol r3 #3).** Today `store.Open`
+  retries the whole `openOnce` — including `register()`'s `BEGIN IMMEDIATE` — under the WSL2
+  `SQLITE_IOERR` hardening (`995eedc`). After the split, `OpenDB` cannot register (registration
+  is per-worktree); **`NewScope`'s registration must keep the same bounded retry**, or the
+  hardening is silently lost on first use of each scope. A test covers a transient IOERR during
+  `NewScope` registration.
 - **Refactor:** split into (a) `store.OpenDB(dbPath, registryPath) → *DB` — opens the shared
-  connection once (WAL, `MaxOpenConns(1)`, the M21 retry), owned by the daemon for its
+  connection once (WAL, `MaxOpenConns(1)`, the M21 open retry), owned by the daemon for its
   lifetime; and (b) `store.NewScope(db, ScopeOptions) → *Store` — a lightweight worktree-scoped
   view over that shared `*DB` carrying `Root/CommonDir/WorktreeID/lease paths/policies/
   retention`. In-process callers (tests, carved-out verbs) use a convenience that opens a
@@ -208,10 +228,13 @@ alias (second worktree writes under the first `Root`, attributes claims/leases t
      succeeds at any point wins immediately.
   5. The spawned daemon acquires the **same** `flock` before binding (single-instance); a loser
      exits 0 — expected under a race, per step 4.
-- **Authorized replacement (proto mismatch / `daemon stop`):** the client signals the running
-  daemon (via the socket control verb or SIGTERM to the pid in `daemon.lock`), waits (bounded)
-  for it to release the lock + remove the socket, then auto-starts. Never `unlink` a socket
-  whose lock is held live; never `fork` while holding the lock.
+- **Authorized replacement is MONOTONIC by protocol version (Sol r3 #4):** only a client whose
+  supported `proto` is **newer** than the running daemon's may replace it — it signals the
+  daemon (socket control verb or SIGTERM to the `daemon.lock` pid), waits (bounded) for the lock
+  release + socket removal, then auto-starts. An **older** client that meets a newer daemon gets
+  a loud `E_DAEMON_PROTOCOL` and **does not stop it** — so concurrent old/new binaries cannot
+  ping-pong-replace each other. (`daemon stop` is an explicit operator action, always allowed.)
+  Never `unlink` a socket whose lock is held live; never `fork` while holding the lock.
 - **Liveness/`status`:** the lock holder writes `pid`+`boot_id` to `daemon.lock`; `status`
   reads them, guards pid-reuse with `boot_id`, and probes the socket.
 
