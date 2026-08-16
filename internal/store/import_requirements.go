@@ -63,6 +63,12 @@ func (s *Store) ImportRequirements(ctx context.Context, path string) (ImportRequ
 	if err != nil {
 		return ImportRequirementsSummary{}, fmt.Errorf("E_IMPORT_INVALID: cannot read import file %q: %w", path, err)
 	}
+	return s.ImportRequirementsBytes(ctx, data)
+}
+
+// ImportRequirementsBytes imports caller-read registry content without
+// resolving a path in the daemon process.
+func (s *Store) ImportRequirementsBytes(ctx context.Context, data []byte) (ImportRequirementsSummary, error) {
 	rows, err := parseRequirementTable(data)
 	if err != nil {
 		return ImportRequirementsSummary{}, err

@@ -3,6 +3,7 @@ package store
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -60,6 +61,12 @@ func (s *Store) ImportFindingsFile(ctx context.Context, path string, strict bool
 	}
 	defer f.Close()
 	return s.ImportFindings(ctx, f, strict)
+}
+
+// ImportFindingsBytes imports caller-read content without resolving a path in
+// the daemon process.
+func (s *Store) ImportFindingsBytes(ctx context.Context, data []byte, strict bool) (ImportSummary, error) {
+	return s.ImportFindings(ctx, bytes.NewReader(data), strict)
 }
 
 func (s *Store) ImportFindings(ctx context.Context, r io.Reader, strict bool) (ImportSummary, error) {

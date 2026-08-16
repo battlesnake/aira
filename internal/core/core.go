@@ -21,8 +21,9 @@ import (
 )
 
 type Request struct {
-	Verb string         `json:"verb"`
-	Args map[string]any `json:"args,omitempty"`
+	Verb    string         `json:"verb"`
+	Args    map[string]any `json:"args,omitempty"`
+	Content []byte         `json:"content,omitempty"`
 }
 
 type Response struct {
@@ -38,12 +39,17 @@ type Response struct {
 type Initializer func(context.Context, map[string]any) (any, error)
 
 type argAccessor struct {
-	values map[string]any
-	reads  map[string]struct{}
+	values  map[string]any
+	reads   map[string]struct{}
+	content []byte
 }
 
-func newArgAccessor(values map[string]any) *argAccessor {
-	return &argAccessor{values: values, reads: make(map[string]struct{})}
+func newArgAccessor(values map[string]any, content ...[]byte) *argAccessor {
+	accessor := &argAccessor{values: values, reads: make(map[string]struct{})}
+	if len(content) > 0 {
+		accessor.content = content[0]
+	}
+	return accessor
 }
 
 func (a *argAccessor) record(key string) any {
@@ -357,22 +363,13 @@ func NewWithInitializerAndRunner(s Store, execution Runner, initializer Initiali
 
 // Do dispatches every verb through the same table used to generate Help.
 func (c *Core) Do(ctx context.Context, req Request) Response {
-	verb := strings.ToLower(strings.TrimSpace(req.Verb))
-	if verb == "new" {
-		verb = "create"
-	}
-	if verb == "get" {
-		verb = "show"
-	}
-	if verb == "ls" {
-		verb = "list"
-	}
+	verb := CanonicalVerb(req.Verb)
 	spec, ok := c.verbs[verb]
 	if !ok {
 		code := "E_UNKNOWN_VERB"
 		return Response{Code: code, Error: fmt.Sprintf("unknown verb %q", req.Verb), Exit: store.ExitForCode(code)}
 	}
-	data, err := spec.Run(ctx, newArgAccessor(req.Args))
+	data, err := spec.Run(ctx, newArgAccessor(req.Args, req.Content))
 	if err != nil {
 		code := store.ErrorCode(err)
 		return Response{Code: code, Error: err.Error(), Exit: errorExit(code)}
@@ -680,7 +677,19 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			return handlerData{Data: data}, nil
 		}},
 		"import": {Name: "import", Usage: "import <file> [--strict]", Args: []ArgSpec{stringSpec("file", true, true, "Findings file"), boolSpec("strict", false, false, "Reject partial imports")}, MCPTool: "aira_import", Run: func(ctx context.Context, args *argAccessor) (any, error) {
-			summary, err := c.store.ImportFindingsFile(ctx, stringArg(args, "file"), boolArg(args, "strict"))
+			var summary store.ImportSummary
+			var err error
+			if args.content != nil {
+				importer, ok := c.store.(interface {
+					ImportFindingsBytes(context.Context, []byte, bool) (store.ImportSummary, error)
+				})
+				if !ok {
+					return nil, errors.New("E_IMPORT_INVALID: byte import is unavailable")
+				}
+				summary, err = importer.ImportFindingsBytes(ctx, args.content, boolArg(args, "strict"))
+			} else {
+				summary, err = c.store.ImportFindingsFile(ctx, stringArg(args, "file"), boolArg(args, "strict"))
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -799,7 +808,19 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				}
 				return mutationData(projectRequirementRecord(updated, nil), event), nil
 			case "import":
-				summary, err := c.store.ImportRequirements(ctx, stringArg(args, "file"))
+				var summary store.ImportRequirementsSummary
+				var err error
+				if args.content != nil {
+					importer, ok := c.store.(interface {
+						ImportRequirementsBytes(context.Context, []byte) (store.ImportRequirementsSummary, error)
+					})
+					if !ok {
+						return nil, errors.New("E_IMPORT_INVALID: byte import is unavailable")
+					}
+					summary, err = importer.ImportRequirementsBytes(ctx, args.content)
+				} else {
+					summary, err = c.store.ImportRequirements(ctx, stringArg(args, "file"))
+				}
 				if err != nil {
 					return nil, err
 				}
