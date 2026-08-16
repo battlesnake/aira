@@ -1,6 +1,7 @@
-# M21 — Daemon skeleton (mandatory DB-owning daemon), v4
+# M21 — Daemon skeleton (mandatory DB-owning daemon), v4 — APPROVED
 
-**Status:** plan (Sol plan-review r1–r3 → REQUEST-CHANGES; this is v4). **Milestone:** Phase 5 · M21.
+**Status:** APPROVED — Sol plan-review r1–r4 → **APPROVE-PLAN** (13 defects across 3 rounds
+fixed; r4 approve + 2 build-notes folded). **Milestone:** Phase 5 · M21.
 **Branch:** `codex-aira-m21`. **Amends a spec principle:** §5.2 (see §1).
 
 ## 1. Purpose and the §5.2 amendment
@@ -121,13 +122,18 @@ be injected. Introduce a small interface for the gate-used methods (`Launch`, `R
 that `Store` depends on; `*runner.Runner` satisfies it in production, a recording sentinel in
 the test. (Narrow, additive — not a runner redesign.)
 
-**Completeness is enforced by a bidirectional behaviour test, not a nil check (Sol r2 #1, r3 #2):**
+**Completeness is enforced by a behaviour test, not a nil check (Sol r2 #1, r3 #2, r4 note):**
 1. Build a core over **recording sentinel** dependencies — runner, GitOps, and the store's
    execution-dependency — that record any call. Across a fixture set covering data-dependent
    branches (a gate command lane, `show`/`get RUN-*`, `reconcile`/`check` with run records) plus
-   representative pure-store ops, assert **`touched ⇔ carved`**: every routed `(verb, selector)`
-   leaves all sentinels untouched, **and** every carved `(verb, selector)` does touch one. This
-   proves the classifier both excludes and recognizes exactly the runner/GitOps surface.
+   representative pure-store ops:
+   - **`routed ⇒ untouched` (hard invariant):** every routed `(verb, selector)` leaves all
+     sentinels untouched — a routed op that touches one is a misclassification → fail.
+   - **`touched ⇒ carved`:** any op that touches a sentinel must be classified carve-out.
+   - **Explicit classification assertions** for every **wholesale** carve-out (`gate run`,
+     `gate canary-run`) — since a gate with no command lane legitimately touches nothing, the
+     behaviour test alone can't prove they're carved; assert the classifier labels them
+     carve-out directly (Sol r4).
 2. The `AfterWrite` producer (detached `run`, core.go:35) is inside the carve-out; a test
    asserts no routed verb returns a non-nil `AfterWrite`. (Confirmed true today by Sol r1.)
 3. **Honesty rule:** a routed verb later found to need the runner/GitOps is reclassified to
@@ -147,8 +153,10 @@ in v1). Framing: 4-byte big-endian length + JSON body, with a max-frame cap (rej
 - **Response frame:** the JSON projection of `core.Response` minus `AfterWrite`
   (`OK, Code, Data, Error, Warnings, Exit`); rendered through the identical `FaceOutput`, so
   text/JSON/MCP output is byte-identical to in-process.
-- **Version:** a `proto` mismatch → the client refuses and triggers authorized replacement
-  (§5.5), never a silent skew.
+- **Version:** on a `proto` mismatch the daemon replies with a frame carrying **its own
+  supported `proto`** (evidence for the monotonic comparison, Sol r4) and `E_DAEMON_PROTOCOL`;
+  the client then either performs authorized replacement (only if its proto is newer, §5.5) or
+  fails loud — never a silent skew.
 
 ### 5.3 Client-context paths: git-files, `import`, `init`
 
