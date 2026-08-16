@@ -1,6 +1,7 @@
-# D1 — Daemon heartbeat lease-reaper, v5
+# D1 — Daemon heartbeat lease-reaper, v5 — APPROVED
 
-**Status:** plan (Sol plan-review r1–r4 → REQUEST-CHANGES; this is v5). **Milestone:** Phase 5 · D1.
+**Status:** APPROVED — Sol plan-review r1–r5 → **APPROVE-PLAN** (r5 approve + 5 build-notes
+folded/passed to build). **Milestone:** Phase 5 · D1.
 **Branch:** `codex-aira-d1`. **Depends on:** M21 (master `44d5948`).
 
 ## 1. Goal
@@ -19,7 +20,8 @@ leases so a later `Claim` succeeds with no `--steal` and no manual intervention.
   regression `mono_now < last`), is **never** reaped.
 - **The free re-checks under the lock** (§2) — a lease heartbeated/stolen between
   detection and the free is not reaped (a live holder always wins).
-- **A reap is a real, journaled transition** (`lease.lapse`, §3), never silent.
+- **A reap is a durably-recorded transition** (`lease.lapse` in the DB `events`;
+  `journal.jsonl` materialises on the next reconcile, §3), never silent.
 
 ## 2. The reap CAS
 
@@ -57,12 +59,15 @@ Per project scope, a **two-phase** sweep with a **single clock sample per sweep*
    detection) → **skip, not an error, no event**. The clock-regression `mono_now < last`
    makes the guard false → not reaped.
 
-## 3. The journaled `lease.lapse` event
+## 3. The `lease.lapse` event (DB-immediate, journal deferred)
 
-A reap is journaled like `lease.claim`/`release` (Heartbeat isn't journaled; a reap is
-a real transition): inside the free txn, `nextSequence` → `insertEventActor(projectID,
-seq, actor="aira-daemon", "lease.lapse", ticketID)` → `outbox` INSERT → after commit
-`journalEvent(ctx, projectID, seq)` to the project's `<commonDir>/aira/journal.jsonl`.
+A reap is a **durably-recorded transition with deferred journal materialisation**
+(Heartbeat isn't journaled; Claim/Release journal inline, but the reaper must not block —
+Sol r4). Inside the free `withImmediate` txn: `nextSequence` →
+`insertEventActor(projectID, seq, actor="aira-daemon", "lease.lapse", ticketID)` →
+`outbox` INSERT. The DB `events`/`outbox` rows are **immediate and authoritative**; the
+reaper does **not** append `<commonDir>/aira/journal.jsonl` inline — it materialises later
+via `Reconcile`/`Rebuild` (below).
 
 - **Actor is the exact stable value `aira-daemon`**; the `outbox.worktree_id` column is
   `NOT NULL`, so a reap uses the **empty-string sentinel `""`** (a project-wide,
@@ -109,8 +114,11 @@ owning project's `Store` scope. D1 sweeps a project's leases at **two** moments:
      (a channel closed when the on-build sweep completes): the creator builds+caches the
      entry (ready open), unlocks `s.mu`, sweeps, then closes `ready`; **every same-scope
      request waits on `ready` before dispatch**, while other projects' lookups are
-     unblocked. The wait is bounded because the sweep is bounded (§3). The barrier fires
-     once per scope entry; the periodic reaper covers ongoing decay.
+     unblocked. The creator `defer close(entry.ready)` **immediately after unlocking `s.mu`**
+     so `ready` closes on *every* sweep outcome — success, clock/DB error, or panic — and
+     a same-scope waiter never hangs. The wait is journal-file-independent and bounded by
+     the DB write (§3). Periodic snapshots **skip entries whose on-build sweep is not yet
+     ready** (avoids a redundant concurrent sweep). The barrier fires once per scope entry.
    - **Best-effort, non-aborting (Sol r2 #3):** an on-build sweep error (clock/DB) is
      **logged and swallowed** — the request still runs. So "claim without `--steal`" is
      guaranteed **only when the sweep succeeds**; on sweep failure the claim may still get
