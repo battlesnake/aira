@@ -1,6 +1,6 @@
-# D7 — Foreground-client store-write elimination (relay carved verbs' writes through the daemon), v2
+# D7 — Foreground-client store-write elimination (relay carved verbs' writes through the daemon), v3
 
-**Status:** plan (Sol plan-review r1 → REQUEST-CHANGES; this is v2). **Milestone:** Phase 5 · D7.
+**Status:** plan (Sol plan-review r1+r2 → REQUEST-CHANGES; this is v3). **Milestone:** Phase 5 · D7.
 **Branch:** `codex-aira-d7`. **Depends on:** M21 (master `05d594e`).
 
 ## 1. Goal and honest scope (Sol r1 #7)
@@ -70,28 +70,55 @@ runner + local GitOps** and a `core.Store` that is one of:
 adapter transparently sends the store phase to the daemon; the runner phase runs
 locally. No handler restructure, no `core`→socket dependency, no double-execution.
 
-### 3.2 The scoped store-op protocol (Sol r1 #2, #3)
+### 3.2 The scoped store-op protocol (Sol r1 #2/#3, r2 #1/#2/#3/#4)
 
-A **new, mutually-exclusive frame kind** on the daemon protocol (not an extra field
-on `RequestFrame`), with a **`ProtocolVersion` bump** so an old daemon triggers the
-existing monotonic replacement rather than silently mishandling it.
+A **new, mutually-exclusive frame kind** + a **`ProtocolVersion` bump** (an old
+daemon → the existing monotonic replacement, never silent mishandling).
 
-- **`StoreOpFrame{proto, scope, op, header, body}`** — `op ∈ {ensure-scope,
-  add-test-report, add-compute-event, reconcile, rebuild, check}`; `header` is the
-  typed JSON DTO for that op (explicit JSON field names, closed set); `body` is an
-  **optional length-prefixed binary segment** for large opaque payloads. Exactly one
-  of the frame kinds (routed request vs store-op) is present; a frame carrying both,
-  an unknown `op`, or a malformed/oversized payload → `E_DAEMON_PROTOCOL`.
-- **Large reports (P0 #2):** `AddTestReport`'s `Raw` is sent in the **binary `body`
-  segment** (no base64 expansion), and the store-op frame cap is
-  `run.report_max_bytes` (default 32 MiB) + a bounded header allowance — so any
-  report that fits pre-D7 fits the relay, and an over-cap report yields the *same*
-  `U_RUN_REPORT_TOO_LARGE` as today (never a new transport failure for a valid
-  input). Boundary sizes (cap−1, cap, cap+1) are tested. The generic `RequestFrame`
-  16 MiB cap is unchanged; only the store-op frame carries the larger bound.
-- The daemon executes the one named store method on the request's worktree scope
-  (built/validated exactly as for routed verbs, incl. recomputed identity), and
-  returns a typed result/error frame the `writeRelayStore` decodes.
+**Envelope grammar (both directions, P1 r2 #3).** A store-op message is a bounded
+length-prefixed **JSON header** followed by an **optional length-prefixed binary
+body**. The reader reads `headerLen` (≤ `storeOpHeaderMax`, a small fixed cap e.g.
+1 MiB) + the header JSON, then `bodyLen` (≤ `storeOpBodyMax`, a fixed system ceiling)
++ the body bytes — each independently bounded. A declared length over its bound, a
+second header, an unknown `op`, or a trailing byte → `E_DAEMON_PROTOCOL`. **The same
+grammar applies to responses**, so large *results* travel the same way (P0 r2 #1).
+The generic `RequestFrame`/`ResponseFrame` 16 MiB path is untouched — store-ops are a
+separate kind.
+
+**Ops + payloads (closed set):**
+- `ensure-scope` — no body; result = ownership/registration outcome (§3.4).
+- `add-test-report` — body = the report `Raw` bytes (binary, **no base64**); result
+  = a **compact DTO** `{report_id, suite, parser_complete, counts,
+  tests_green_observed, warnings}`, **not** the echoed parsed results — so the
+  response is small regardless of report size (P0 r2 #1).
+- `add-compute-event` — small JSON header; small result.
+- `reconcile` / `rebuild` — no request body; result = reconciliation findings (in the
+  binary body if large).
+- `check` — no request body; result = the `CheckReport` carried in the binary body
+  under `storeOpBodyMax` (a check report can be large and must NOT be truncated).
+
+**Cap authority + which limit fires (P1 r2 #3/#4).** `run.report_max_bytes` is
+enforced **client-side during capture** (the existing logic) BEFORE a store-op is
+built — an over-cap report yields `U_RUN_REPORT_TOO_LARGE` and **no relay is sent**.
+The daemon needs no knowledge of the client's dynamic cap; it enforces only the fixed
+compile-time `storeOpBodyMax` ceiling (generously above any legitimate report), and a
+body over that is a malformed/abusive client → `E_DAEMON_PROTOCOL`. So the two error
+paths are disjoint: *valid output over its configured capture cap* →
+`U_RUN_REPORT_TOO_LARGE` (client, pre-send); *a declared length over the system
+ceiling* → `E_DAEMON_PROTOCOL` (daemon). Both bounds are boundary-tested.
+
+**Deadlines + cancellation (P0 r2 #2).** `reconcile`/`rebuild`/`check` were local and
+unbounded; they must **not** inherit the 30 s generic transport deadline. Each daemon
+store-op runs under a context **derived from the connection**, so a client
+disconnect/timeout **cancels the operation** — SQLite honours ctx cancellation and
+the transaction rolls back — eliminating the "client reported failure but the write
+committed" ambiguity. The client sizes the store-op deadline to the op (generous/none
+for reconcile/rebuild; the report cap governs add-test-report), not the 30 s default.
+A timed-out heavy op is reported `unevaluated` with the daemon op cancelled, never a
+silent partial commit.
+
+The daemon executes the one named method on the request's worktree scope (built +
+identity-recomputed exactly as for routed verbs).
 
 ### 3.3 `reconcile` / `check` need no dispatcher split (Sol r1 #5)
 
@@ -111,6 +138,13 @@ returns the ownership-validation outcome. A prefix-ownership conflict is surface
 with the existing code, from the daemon. Store-free carved verbs do this cheap
 handshake too, so first-use registration semantics are identical to pre-D7 —
 registration row creation is no longer deferred or undefined.
+
+**Re-register cached scopes (P2 r2 #5).** `Server.coreForScope` caches scopes and
+does **not** re-run `register` on a cache hit, but pre-D7 registered on *every*
+invocation (worktree active-refresh + ownership check). So `ensure-scope` calls an
+**exported `Store.Register(ctx)` (or equivalent) method on the scope every handshake**
+— cached or freshly built — not merely at scope construction, preserving the
+per-invocation active-refresh and ownership validation.
 
 ### 3.5 Read-only store + app builder refactor (Sol r1 #6)
 
@@ -150,7 +184,21 @@ fairness-queue · **D5 fenced supervisor lease + fold the detach supervisor's wr
   hits the guard error — proves the store-free classification.
 - **Store-op round-trip fidelity:** a real daemon serves each op; persisted rows
   equal an in-process baseline (int64 exact, as M21). Report boundary sizes
-  (cap−1/cap/cap+1) — valid ones persist, over-cap → `U_RUN_REPORT_TOO_LARGE`.
+  (cap−1/cap/cap+1) — valid ones persist; over the configured capture cap →
+  `U_RUN_REPORT_TOO_LARGE` client-side (no relay); over the fixed `storeOpBodyMax`
+  ceiling → `E_DAEMON_PROTOCOL` (both directions).
+- **Large responses:** a large parsed test report returns a small compact DTO (not
+  the echoed results); a large `CheckReport` round-trips in the response binary body
+  intact — neither exceeds the response path (P0 r2 #1).
+- **Heavy-op deadline + cancellation:** a slow `reconcile`/`rebuild` whose client
+  times out/disconnects has its daemon operation **cancelled** (transaction rolled
+  back) — the client's failure is honest, no partial commit remains (P0 r2 #2). No
+  30 s ceiling is imposed on these ops.
+- **Envelope grammar:** header/body each independently length-bounded; a frame with
+  both kinds, an unknown op, an over-`storeOpHeaderMax` header, or a trailing byte →
+  `E_DAEMON_PROTOCOL`.
+- **Re-register on cache hit:** a second carved verb for the same worktree re-runs
+  the daemon-side register (active-refresh + ownership), not only the first (P2 r2 #5).
 - **`check` is a write:** `check` over the read-only store fails; over the
   writeRelayStore it relays and the CheckReport matches in-process.
 - **ensure-scope:** a carved verb on a fresh worktree registers via the daemon (rows
@@ -188,11 +236,19 @@ fairness-queue · **D5 fenced supervisor lease + fold the detach supervisor's wr
 3. `writeRelayStore` behind an unchanged `core.Do` — no handler restructure, no
    `core`→socket dependency, no double store phase.
 4. Store-op protocol: new frame kind + proto bump; closed op DTOs w/ explicit JSON
-   names; binary body for `Raw`; report cap = report_max_bytes; both-kinds/unknown/
-   oversized → `E_DAEMON_PROTOCOL`; value-faithful (int64).
-5. `store.OpenReadOnly` truly cannot write; no `initDB`/`register`; correct as a WAL
+   names; **header+body each independently length-bounded, both directions**; binary
+   body for `Raw` (no base64); **responses bounded too** (compact DTO for
+   add-test-report; CheckReport in a body); client capture cap →
+   `U_RUN_REPORT_TOO_LARGE` (pre-send) vs daemon `storeOpBodyMax` → `E_DAEMON_PROTOCOL`
+   are disjoint; both-kinds/unknown/trailing → protocol error; value-faithful (int64).
+5. **Heavy-op deadlines/cancellation:** reconcile/rebuild/check are not capped at 30 s;
+   the daemon op is tied to the connection ctx so a client timeout cancels it and rolls
+   back — no "failed response but committed write."
+6. **ensure-scope re-registers on every handshake** (cached scopes too), preserving
+   active-refresh + ownership validation.
+7. `store.OpenReadOnly` truly cannot write; no `initDB`/`register`; correct as a WAL
    reader.
-6. Honesty: D7 = foreground-client writer elimination; the detach supervisor is still
+8. Honesty: D7 = foreground-client writer elimination; the detach supervisor is still
    a direct writer (D5) — not overclaimed.
-7. Staging: foundations (protocol, read-only, adapter, ensure-scope) land green
+9. Staging: foundations (protocol, read-only, adapter, ensure-scope) land green
    before verb migration.
