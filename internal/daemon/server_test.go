@@ -756,6 +756,220 @@ func TestPeriodicReaperContinuesAfterSweepError(t *testing.T) {
 	<-done
 }
 
+func TestIdleReapThenTimerFlushesDeferredLapseExactlyOnce(t *testing.T) {
+	paths := testPaths(t)
+	db, err := store.OpenDB(paths.DBPath, paths.RegistryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	server := NewServer(paths)
+	server.db = db
+	scope := independentScope(t, paths, "d2-idle-reap", "IDLE")
+	scope.LeaseTTLNS = 1
+	view, _, err := server.storeForScope(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket, err := view.CreateTicket(context.Background(), domain.CreateTicketInput{
+		Title: "expire while idle", Kind: domain.KindFeature, Severity: domain.SeverityP2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := view.Claim(context.Background(), ticket.ID, false, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	var reaped int
+	for attempt := 0; attempt < 20 && reaped == 0; attempt++ {
+		time.Sleep(time.Millisecond)
+		reaped, err = view.ReapExpiredLeases(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if reaped != 1 {
+		t.Fatalf("reaped=%d, want one expired lease", reaped)
+	}
+	journalPath := filepath.Join(scope.CommonDir, "aira", "journal.jsonl")
+	before, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(before, []byte(`"verb":"lease.lapse"`)) {
+		t.Fatal("reaper journaled lease.lapse inline")
+	}
+	flushed := make(chan struct{}, 1)
+	server.flushScopeFn = func(ctx context.Context, view *store.Store) (int, error) {
+		count, err := view.FlushDeferredJournal(ctx)
+		select {
+		case flushed <- struct{}{}:
+		default:
+		}
+		return count, err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		server.runJournalFlusher(ctx, time.Millisecond)
+		close(done)
+	}()
+	select {
+	case <-flushed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("journal flusher did not tick")
+	}
+	cancel()
+	<-done
+	after, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(after), `"verb":"lease.lapse"`); got != 1 {
+		t.Fatalf("lease.lapse journal occurrences=%d, want exactly one", got)
+	}
+	if count, err := view.FlushDeferredJournal(context.Background()); err != nil || count != 0 {
+		t.Fatalf("post-timer idempotent flush count=%d err=%v", count, err)
+	}
+}
+
+func TestPeriodicJournalFlusherDedupesProjectsAndSkipsUnreadyScopes(t *testing.T) {
+	paths := testPaths(t)
+	db, err := store.OpenDB(paths.DBPath, paths.RegistryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	server := NewServer(paths)
+	server.db = db
+	first := testScope(t, paths, "flush-one")
+	second := testScope(t, paths, "flush-two")
+	firstView, _, err := server.storeForScope(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondView, _, err := server.storeForScope(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.mu.Lock()
+	server.scopes["unready-flush"] = &scopeEntry{view: firstView, ready: make(chan struct{})}
+	server.mu.Unlock()
+	var calls atomic.Int32
+	called := make(chan struct{}, 1)
+	server.flushScopeFn = func(ctx context.Context, _ *store.Store) (int, error) {
+		calls.Add(1)
+		select {
+		case called <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		server.runJournalFlusher(ctx, time.Millisecond)
+		close(done)
+	}()
+	<-called
+	cancel()
+	<-done
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("periodic flush calls=%d, want one deduped project", got)
+	}
+	if firstView.ProjectID() != secondView.ProjectID() {
+		t.Fatal("fixture worktrees did not share a project")
+	}
+}
+
+func TestPeriodicJournalFlusherIsolatesProjectErrors(t *testing.T) {
+	paths := testPaths(t)
+	db, err := store.OpenDB(paths.DBPath, paths.RegistryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	server := NewServer(paths)
+	server.db = db
+	if _, _, err := server.storeForScope(independentScope(t, paths, "flush-error-one", "FERRONE")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := server.storeForScope(independentScope(t, paths, "flush-error-two", "FERRTWO")); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	both := make(chan struct{}, 1)
+	server.flushScopeFn = func(context.Context, *store.Store) (int, error) {
+		if calls.Add(1) == 2 {
+			both <- struct{}{}
+		}
+		return 0, errors.New("fixture flush failure")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		server.runJournalFlusher(ctx, time.Millisecond)
+		close(done)
+	}()
+	select {
+	case <-both:
+	case <-time.After(time.Second):
+		t.Fatal("one project flush error blocked another project")
+	}
+	cancel()
+	<-done
+}
+
+func TestDisabledJournalFlusherParksUntilCancellation(t *testing.T) {
+	server := NewServer(Paths{})
+	var calls atomic.Int32
+	server.flushScopeFn = func(context.Context, *store.Store) (int, error) {
+		calls.Add(1)
+		return 0, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		server.runJournalFlusher(ctx, 0)
+		close(done)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	if calls.Load() != 0 {
+		t.Fatal("disabled journal flusher performed work")
+	}
+	select {
+	case <-done:
+		t.Fatal("disabled journal flusher did not park")
+	default:
+	}
+	cancel()
+	<-done
+}
+
+func TestDisabledJournalFlusherDaemonServesWithoutFlushOnBuild(t *testing.T) {
+	t.Setenv("AIRA_DAEMON_JOURNAL_FLUSH_INTERVAL", "disabled")
+	paths := testPaths(t)
+	server := NewServer(paths)
+	var calls atomic.Int32
+	server.flushScopeFn = func(context.Context, *store.Store) (int, error) {
+		calls.Add(1)
+		return 0, nil
+	}
+	_, _ = startServer(t, server)
+	scope := independentScope(t, paths, "disabled-flusher", "DFLUSH")
+	response, err := Exchange(context.Background(), paths.SocketPath, RequestFrame{
+		Proto: ProtocolVersion, Scope: scope, Request: core.Request{Verb: "list"},
+	})
+	if err != nil || !response.OK {
+		t.Fatalf("disabled-flusher daemon response=%+v err=%v", response, err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if calls.Load() != 0 {
+		t.Fatalf("disabled flusher calls=%d, want zero including scope build", calls.Load())
+	}
+}
+
 func TestShutdownWaitsForReaperAsWellAsConnections(t *testing.T) {
 	t.Setenv("AIRA_DAEMON_REAP_INTERVAL", "1ms")
 	paths := testPaths(t)
@@ -808,6 +1022,128 @@ func TestShutdownWaitsForReaperAsWellAsConnections(t *testing.T) {
 	}
 	close(releaseReaper)
 	<-reaperFinished
+	if err := server.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := drainTimeout.lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(paths.SocketPath)
+}
+
+func TestShutdownWaitsForJournalFlusher(t *testing.T) {
+	t.Setenv("AIRA_DAEMON_REAP_INTERVAL", "disabled")
+	t.Setenv("AIRA_DAEMON_JOURNAL_FLUSH_INTERVAL", "1s")
+	paths := testPaths(t)
+	server := NewServer(paths)
+	server.DrainTimeout = 2 * time.Second
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server.flushScopeFn = func(context.Context, *store.Store) (int, error) {
+		close(started)
+		<-release
+		return 0, nil
+	}
+	var closes atomic.Int32
+	server.closeDB = func(db *store.DB) error {
+		closes.Add(1)
+		return db.Close()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	ready := make(chan struct{}, 1)
+	server.Ready = ready
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx) }()
+	select {
+	case <-ready:
+	case err := <-done:
+		t.Fatalf("daemon exited before ready: %v", err)
+	}
+	scope := independentScope(t, paths, "flusher-drain", "FDRAIN")
+	response, err := Exchange(context.Background(), paths.SocketPath, RequestFrame{
+		Proto: ProtocolVersion, Scope: scope, Request: core.Request{Verb: "list"},
+	})
+	if err != nil || !response.OK {
+		t.Fatalf("scope build response=%+v err=%v", response, err)
+	}
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("periodic journal flush did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		t.Fatalf("Serve returned before flusher drained: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	if closes.Load() != 0 {
+		t.Fatal("DB closed while journal flusher was active")
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if closes.Load() != 1 {
+		t.Fatalf("DB close calls=%d, want one after flusher drain", closes.Load())
+	}
+}
+
+func TestDrainTimeoutWithStuckJournalFlusherRetainsLockAndDB(t *testing.T) {
+	t.Setenv("AIRA_DAEMON_REAP_INTERVAL", "disabled")
+	t.Setenv("AIRA_DAEMON_JOURNAL_FLUSH_INTERVAL", "1s")
+	paths := testPaths(t)
+	server := NewServer(paths)
+	server.DrainTimeout = 20 * time.Millisecond
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server.flushScopeFn = func(context.Context, *store.Store) (int, error) {
+		close(started)
+		<-release
+		return 0, nil
+	}
+	var closes atomic.Int32
+	server.closeDB = func(db *store.DB) error {
+		closes.Add(1)
+		return db.Close()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	ready := make(chan struct{}, 1)
+	server.Ready = ready
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx) }()
+	select {
+	case <-ready:
+	case err := <-done:
+		t.Fatalf("daemon exited before ready: %v", err)
+	}
+	scope := independentScope(t, paths, "flusher-timeout", "FTIMEOUT")
+	response, err := Exchange(context.Background(), paths.SocketPath, RequestFrame{
+		Proto: ProtocolVersion, Scope: scope, Request: core.Request{Verb: "list"},
+	})
+	if err != nil || !response.OK {
+		t.Fatalf("scope build response=%+v err=%v", response, err)
+	}
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("periodic journal flush did not start")
+	}
+	cancel()
+	serveErr := <-done
+	var drainTimeout *ErrDrainTimeout
+	if !errors.As(serveErr, &drainTimeout) || drainTimeout.lock == nil {
+		t.Fatalf("Serve error=%T %v, want lock-owning ErrDrainTimeout", serveErr, serveErr)
+	}
+	if closes.Load() != 0 {
+		t.Fatal("DB closed while timed-out journal flusher was active")
+	}
+	replacementCtx, replacementCancel := context.WithTimeout(context.Background(), time.Second)
+	defer replacementCancel()
+	if replacementErr := NewServer(paths).Serve(replacementCtx); !errors.Is(replacementErr, ErrAlreadyRunning) {
+		t.Fatalf("replacement Serve=%v, want ErrAlreadyRunning", replacementErr)
+	}
+	close(release)
 	if err := server.db.Close(); err != nil {
 		t.Fatal(err)
 	}

@@ -27,7 +27,10 @@ type Paths struct {
 	LockPath      string
 }
 
-const defaultReapInterval = 30 * time.Second
+const (
+	defaultReapInterval         = 30 * time.Second
+	defaultJournalFlushInterval = 60 * time.Second
+)
 
 func reapIntervalFromEnv() (time.Duration, error) {
 	value, set := os.LookupEnv("AIRA_DAEMON_REAP_INTERVAL")
@@ -40,6 +43,21 @@ func reapIntervalFromEnv() (time.Duration, error) {
 	interval, err := time.ParseDuration(value)
 	if err != nil || interval <= 0 {
 		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_REAP_INTERVAL must be a positive Go duration, disabled, or 0")
+	}
+	return interval, nil
+}
+
+func journalFlushIntervalFromEnv() (time.Duration, error) {
+	value, set := os.LookupEnv("AIRA_DAEMON_JOURNAL_FLUSH_INTERVAL")
+	if !set || value == "" {
+		return defaultJournalFlushInterval, nil
+	}
+	if value == "disabled" || value == "0" {
+		return 0, nil
+	}
+	interval, err := time.ParseDuration(value)
+	if err != nil || interval < time.Second {
+		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_JOURNAL_FLUSH_INTERVAL must be a Go duration of at least 1s, disabled, or 0")
 	}
 	return interval, nil
 }

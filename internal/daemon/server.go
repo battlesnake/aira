@@ -51,9 +51,10 @@ type Server struct {
 	db     *store.DB
 	scopes map[string]*scopeEntry
 
-	// Test seams. Production always calls Store.ReapExpiredLeases and DB.Close.
-	reapScope func(context.Context, *store.Store) (int, error)
-	closeDB   func(*store.DB) error
+	// Test seams. Production always calls the Store methods and DB.Close.
+	reapScope    func(context.Context, *store.Store) (int, error)
+	flushScopeFn func(context.Context, *store.Store) (int, error)
+	closeDB      func(*store.DB) error
 }
 
 func NewServer(paths Paths) *Server {
@@ -66,6 +67,10 @@ const maxUnixSocketPath = 107
 
 func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	reapInterval, err := reapIntervalFromEnv()
+	if err != nil {
+		return err
+	}
+	flushInterval, err := journalFlushIntervalFromEnv()
 	if err != nil {
 		return err
 	}
@@ -147,6 +152,12 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		defer close(reaperDone)
 		s.runReaper(reaperCtx, reapInterval)
 	}()
+	flusherCtx, cancelFlusher := context.WithCancel(ctx)
+	flusherDone := make(chan struct{})
+	go func() {
+		defer close(flusherDone)
+		s.runJournalFlusher(flusherCtx, flushInterval)
+	}()
 	if s.Ready != nil {
 		select {
 		case s.Ready <- struct{}{}:
@@ -183,11 +194,13 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	}
 	close(stopping)
 	cancelReaper()
+	cancelFlusher()
 	_ = listener.Close()
 	drained := make(chan struct{})
 	go func() {
 		connections.Wait()
 		<-reaperDone
+		<-flusherDone
 		close(drained)
 	}()
 	timeout := s.DrainTimeout
@@ -236,6 +249,47 @@ func (s *Server) runReaper(ctx context.Context, interval time.Duration) {
 		for projectID, view := range byProject {
 			if _, err := s.reap(ctx, view); err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf("aira daemon: reap project %s: %v", projectID, err)
+			}
+			if ctx.Err() != nil {
+				return
+			}
+		}
+	}
+}
+
+func (s *Server) flush(ctx context.Context, view *store.Store) (int, error) {
+	if s.flushScopeFn != nil {
+		return s.flushScopeFn(ctx, view)
+	}
+	return view.FlushDeferredJournal(ctx)
+}
+
+func (s *Server) runJournalFlusher(ctx context.Context, interval time.Duration) {
+	if interval == 0 {
+		<-ctx.Done()
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		s.mu.Lock()
+		byProject := make(map[string]*store.Store)
+		for _, entry := range s.scopes {
+			select {
+			case <-entry.ready:
+				byProject[entry.view.ProjectID()] = entry.view
+			default:
+			}
+		}
+		s.mu.Unlock()
+		for projectID, view := range byProject {
+			if _, err := s.flush(ctx, view); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("aira daemon: journal flush project %s: %v", projectID, err)
 			}
 			if ctx.Err() != nil {
 				return

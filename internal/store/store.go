@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,9 +29,19 @@ import (
 // covers: AR-5, AR-6, AR-7
 
 var (
-	ErrPathIntentBusy = errors.New("E_PATH_INTENT_BUSY")
-	ErrWriteConflict  = errors.New("E_WRITE_CONFLICT")
-	ErrDBBusy         = errors.New("E_DB_BUSY")
+	ErrPathIntentBusy     = errors.New("E_PATH_INTENT_BUSY")
+	ErrWriteConflict      = errors.New("E_WRITE_CONFLICT")
+	ErrDBBusy             = errors.New("E_DB_BUSY")
+	errJournalKeyConflict = errors.New("E_JOURNAL_CORRUPT: journal key conflict")
+	errJournalMalformed   = errors.New("E_JOURNAL_CORRUPT: malformed journal")
+)
+
+const journalLockTimeout = 2 * time.Second
+
+// Test-only fault/observation seams. Production leaves both nil.
+var (
+	beforeFileSync func(*os.File) error
+	beforeDirSync  func(*os.File) error
 )
 
 type Options struct {
@@ -145,6 +156,9 @@ type Store struct {
 	// beforeReapCAS is a test-only seam between advisory expiry detection and
 	// the guarded reaping transaction; production leaves it nil.
 	beforeReapCAS func(string)
+	// afterJournalFlushEvent is a test-only cancellation seam between
+	// successfully journaled events; production leaves it nil.
+	afterJournalFlushEvent func(EventKey)
 	// beforeRebuildFindingReconstruct is a test-only seam for the finding
 	// scan/reconstruct race boundary; production leaves it nil.
 	beforeRebuildFindingReconstruct func()
@@ -423,6 +437,9 @@ func newScopeContext(ctx context.Context, db *DB, opts ScopeOptions, checkIdenti
 		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Join(common, "aira", "locks"), 0o755); err != nil {
+		return nil, err
+	}
+	if err := syncDir(common); err != nil {
 		return nil, err
 	}
 	s := &Store{
@@ -1460,6 +1477,24 @@ func (s *Store) journalEvent(ctx context.Context, projectID string, seq int64) e
 	})
 }
 
+func (s *Store) journalEventBounded(ctx context.Context, projectID string, seq int64, timeout time.Duration) error {
+	var event eventRecord
+	row := s.db.QueryRowContext(ctx, `SELECT project_id, seq, at_wall, actor, verb, target, payload_digest FROM events WHERE project_id=? AND seq=?`, projectID, seq)
+	if err := row.Scan(&event.ProjectID, &event.Seq, &event.At, &event.Actor, &event.Verb, &event.Target, &event.PayloadDigest); err != nil {
+		return err
+	}
+	if err := appendEventIfMissingBounded(ctx, filepath.Join(s.auditDir, "journal.jsonl"), event, filepath.Join(s.auditDir, "journal.lock"), timeout); err != nil {
+		return err
+	}
+	return s.withImmediate(ctx, func(conn *sql.Conn) error {
+		if _, err := conn.ExecContext(ctx, `UPDATE events SET journaled=1 WHERE project_id=? AND seq=?`, projectID, seq); err != nil {
+			return err
+		}
+		_, err := conn.ExecContext(ctx, `UPDATE outbox SET journaled=1, intended_bytes=NULL WHERE project_id=? AND seq=? AND materialised=1`, projectID, seq)
+		return err
+	})
+}
+
 func (s *Store) appendReceiptIfMissing(receipt AllocationReceipt) error {
 	path := filepath.Join(s.auditDir, "receipts.jsonl")
 	if receipt.At == "" {
@@ -1475,6 +1510,9 @@ func (s *Store) appendReceiptIfMissing(receipt AllocationReceipt) error {
 		return fmt.Errorf("E_RECEIPT_IO: %w", err)
 	}
 	defer f.Close()
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("E_RECEIPT_IO: %w", err)
+	}
 	if err := repairJSONLTail(f); err != nil {
 		return fmt.Errorf("E_RECEIPT_IO: %w", err)
 	}
@@ -1501,7 +1539,7 @@ func (s *Store) appendReceiptIfMissing(receipt AllocationReceipt) error {
 	if err := appendJSONValue(f, receipt); err != nil {
 		return fmt.Errorf("E_RECEIPT_IO: %w", err)
 	}
-	if err := f.Sync(); err != nil {
+	if err := syncFile(f); err != nil {
 		return fmt.Errorf("E_RECEIPT_IO: %w", err)
 	}
 	return nil
@@ -1655,6 +1693,58 @@ func (s *Store) replayUnjournaledEvents(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// FlushDeferredJournal durably appends the project-wide snapshot of completed
+// but unjournaled events. Key-local poison is skipped so later events can make
+// progress; journal-global failures abort the pass immediately.
+func (s *Store) FlushDeferredJournal(ctx context.Context) (int, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT project_id, seq FROM outbox
+		WHERE project_id=? AND materialised=1 AND journaled=0 ORDER BY seq`, s.projectID)
+	if err != nil {
+		return 0, err
+	}
+	var keys []EventKey
+	for rows.Next() {
+		var key EventKey
+		if err := rows.Scan(&key.ProjectID, &key.Seq); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+
+	flushed := 0
+	var firstPoison error
+	for _, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return flushed, err
+		}
+		err := s.journalEventBounded(ctx, key.ProjectID, key.Seq, journalLockTimeout)
+		if err == nil {
+			flushed++
+			if s.afterJournalFlushEvent != nil {
+				s.afterJournalFlushEvent(key)
+			}
+			continue
+		}
+		if errors.Is(err, errJournalKeyConflict) || errors.Is(err, sql.ErrNoRows) {
+			log.Printf("aira store: deferred journal poison %s/%d: %v", key.ProjectID, key.Seq, err)
+			if firstPoison == nil {
+				firstPoison = fmt.Errorf("deferred journal poison %s/%d: %w", key.ProjectID, key.Seq, err)
+			}
+			continue
+		}
+		return flushed, err
+	}
+	return flushed, firstPoison
 }
 
 func (s *Store) Rebuild(ctx context.Context) error {
@@ -2458,6 +2548,49 @@ func acquireLock(path string) (*os.File, error) {
 	return f, nil
 }
 
+func acquireLockBounded(ctx context.Context, path string, timeout time.Duration) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	unix.CloseOnExec(int(f.Fd()))
+	if timeout <= 0 {
+		timeout = journalLockTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			_ = f.Close()
+			return nil, ctx.Err()
+		default:
+		}
+		err = unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			return f, nil
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) && !errors.Is(err, unix.EINTR) {
+			_ = f.Close()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			_ = f.Close()
+			return nil, ctx.Err()
+		case <-timer.C:
+			_ = f.Close()
+			return nil, fmt.Errorf("timed out acquiring journal lock %s", path)
+		case <-ticker.C:
+		}
+	}
+}
+
 func (s *Store) appendReceiptForIntent(intent Intent) error {
 	return s.appendReceiptIfMissing(intent.Receipt)
 }
@@ -2491,11 +2624,27 @@ func appendEventIfMissing(path string, event eventRecord, lockPath string) error
 		return err
 	}
 	defer unlockFile(lock)
+	return appendEventIfMissingLocked(path, event)
+}
+
+func appendEventIfMissingBounded(ctx context.Context, path string, event eventRecord, lockPath string, timeout time.Duration) error {
+	lock, err := acquireLockBounded(ctx, lockPath, timeout)
+	if err != nil {
+		return err
+	}
+	defer unlockFile(lock)
+	return appendEventIfMissingLocked(path, event)
+}
+
+func appendEventIfMissingLocked(path string, event eventRecord) error {
 	f, err := openAppendFile(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return err
+	}
 	if err := repairJSONLTail(f); err != nil {
 		return err
 	}
@@ -2503,6 +2652,7 @@ func appendEventIfMissing(path string, event eventRecord, lockPath string) error
 		return err
 	}
 	dec := json.NewDecoder(f)
+	found := false
 	for {
 		var existing eventRecord
 		err := dec.Decode(&existing)
@@ -2510,14 +2660,17 @@ func appendEventIfMissing(path string, event eventRecord, lockPath string) error
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("E_JOURNAL_CORRUPT: %w", err)
+			return fmt.Errorf("%w: %v", errJournalMalformed, err)
 		}
 		if existing.ProjectID == event.ProjectID && existing.Seq == event.Seq {
-			if existing.PayloadDigest != event.PayloadDigest || existing.Verb != event.Verb || existing.Target != event.Target {
-				return fmt.Errorf("E_JOURNAL_CORRUPT: duplicate project/seq %s/%d has different payload", event.ProjectID, event.Seq)
+			if existing.PayloadDigest != event.PayloadDigest || existing.Verb != event.Verb || existing.Target != event.Target || existing.Actor != event.Actor || existing.At != event.At {
+				return fmt.Errorf("%w: duplicate project/seq %s/%d has different identity", errJournalKeyConflict, event.ProjectID, event.Seq)
 			}
-			return nil
+			found = true
 		}
+	}
+	if found {
+		return syncFile(f)
 	}
 	if _, err := f.Seek(0, io.SeekEnd); err != nil {
 		return err
@@ -2525,7 +2678,30 @@ func appendEventIfMissing(path string, event eventRecord, lockPath string) error
 	if err := appendJSONValue(f, event); err != nil {
 		return err
 	}
+	return syncFile(f)
+}
+
+func syncFile(f *os.File) error {
+	if beforeFileSync != nil {
+		if err := beforeFileSync(f); err != nil {
+			return err
+		}
+	}
 	return f.Sync()
+}
+
+func syncDir(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	if beforeDirSync != nil {
+		if err := beforeDirSync(dir); err != nil {
+			return err
+		}
+	}
+	return dir.Sync()
 }
 
 func openAppendFile(path string) (*os.File, error) {
