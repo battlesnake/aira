@@ -92,7 +92,10 @@ func TestRunInputClientGenuineBusyTerminatesAtBudget(t *testing.T) {
 	frozen := time.Now()
 	r.now = func() time.Time { return frozen }
 	runInputConnectRecord(t, r)
+	start := time.Now()
+	var lastDialNanos atomic.Int64
 	r.inputDialFn = func(context.Context, string) (net.Conn, error) {
+		lastDialNanos.Store(time.Now().UnixNano())
 		client, server := net.Pipe()
 		go func() {
 			defer server.Close()
@@ -103,7 +106,6 @@ func TestRunInputClientGenuineBusyTerminatesAtBudget(t *testing.T) {
 		}()
 		return client, nil
 	}
-	start := time.Now()
 	_, err := r.Input(context.Background(), RunInputRequest{RunID: "RUN-1", Reader: bytes.NewReader([]byte("x"))})
 	var inputErr *RunInputError
 	if !errors.As(err, &inputErr) || inputErr.Code != "E_RUN_INPUT_BUSY" {
@@ -111,6 +113,11 @@ func TestRunInputClientGenuineBusyTerminatesAtBudget(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed < runInputBusyRetryBudget || elapsed > 3*time.Second {
 		t.Fatalf("busy budget elapsed=%v (want ~%v, bounded)", elapsed, runInputBusyRetryBudget)
+	}
+	// No dial may begin at or after the budget deadline (a 50ms tolerance covers
+	// the top-of-loop gate's own scheduling).
+	if lastDial := time.Duration(lastDialNanos.Load() - start.UnixNano()); lastDial >= runInputBusyRetryBudget+50*time.Millisecond {
+		t.Fatalf("a dial began %v after start, past the %v budget", lastDial, runInputBusyRetryBudget)
 	}
 }
 
@@ -131,11 +138,15 @@ func TestRunInputClientSilentServerHandshakeDeadlineFires(t *testing.T) {
 	}
 	start := time.Now()
 	_, err := r.Input(context.Background(), RunInputRequest{RunID: "RUN-1", Reader: bytes.NewReader([]byte("x"))})
-	if err == nil {
-		t.Fatal("silent server did not error")
+	var inputErr *RunInputError
+	if !errors.As(err, &inputErr) || inputErr.Code != "E_RUN_INPUT_OUTCOME_UNKNOWN" {
+		t.Fatalf("silent server err=%v (want a bounded OUTCOME_UNKNOWN timeout)", err)
 	}
-	if elapsed := time.Since(start); elapsed > runInputHandshakeTimeout+2*time.Second {
-		t.Fatalf("handshake deadline did not fire; elapsed=%v", elapsed)
+	// The deadline must actually FIRE: elapsed is at least the handshake timeout
+	// (an immediate unrelated error would fail this lower bound) and bounded above.
+	elapsed := time.Since(start)
+	if elapsed < runInputHandshakeTimeout-200*time.Millisecond || elapsed > runInputHandshakeTimeout+2*time.Second {
+		t.Fatalf("handshake deadline elapsed=%v (want ~%v)", elapsed, runInputHandshakeTimeout)
 	}
 }
 

@@ -135,9 +135,15 @@ func (r *Runner) connectRunInput(ctx context.Context, path string, request RunIn
 	// The retry budget uses REAL monotonic time (not the injectable r.now): a
 	// frozen logical test clock must never loop the retry forever (Sol build r1).
 	deadline := time.Now().Add(runInputBusyRetryBudget)
+	var lastBusy error
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
+		}
+		// Gate the budget BEFORE every dial (except the first): no dial/handshake
+		// may begin at or after the deadline (Sol build confirm r2).
+		if lastBusy != nil && !time.Now().Before(deadline) {
+			return nil, lastBusy
 		}
 		conn, dialErr := dial(ctx, path)
 		if dialErr != nil {
@@ -171,8 +177,9 @@ func (r *Runner) connectRunInput(ctx context.Context, path string, request RunIn
 		if !errors.As(respErr, &inputErr) || inputErr.Code != "E_RUN_INPUT_BUSY" {
 			return nil, respErr
 		}
-		// Check the budget BEFORE another attempt and cap the backoff to what
-		// remains, so no dial/handshake starts past the deadline (Sol build confirm).
+		lastBusy = respErr
+		// Cap the backoff to the remaining budget; the top-of-loop gate then
+		// prevents any further dial once the deadline has passed.
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			return nil, respErr
