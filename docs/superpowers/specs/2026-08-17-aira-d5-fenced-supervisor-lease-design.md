@@ -1,6 +1,6 @@
 # D5 — Fenced supervisor lease + shim-via-daemon (design / plan)
 
-**Status:** v3 — folds Sol plan-review r2 (6 findings, all folded). For Sol r3.
+**Status:** v4 — folds Sol plan-review r3 (4 findings, all folded). For Sol r4.
 **Milestone:** Phase 5 · D5 (task #41). Follows D1–D4 (all merged; master `dc7dc35`).
 **Loop:** plan → Sol plan-review (rounds → APPROVE-PLAN) → Fable plan-gate → Terra build →
 Opus real-HW verify → Sol build-review (rounds → RESOLVED) → merge. Correctness-critical
@@ -78,16 +78,26 @@ Spec §14 is a hard requirement: a detached run must work **daemonless**. The le
 authoritative-when-present but its absence never breaks the run — because `/proc` remains the
 finalization authority (§2.4), a leaseless run behaves exactly as M20.
 
-**Idempotent claim (Sol r2 — the ambiguous-timeout-after-commit case).** A claim transport
+**Idempotent claim (Sol r2/r3 — the ambiguous-timeout-after-commit case).** A claim transport
 timeout is AMBIGUOUS: the daemon may have committed the lease before the reply was lost, so the
 lease is `held` but the shim never learned its `generation`. Treating that as "proven unreachable
-→ advisory-leaseless" is wrong (the lease IS held), and a naive retry would then read as a
-`held-by-someone` CONFLICT. Fix: **claim is idempotent for `{project, run_id, holder_pid,
-holder_start_tick, holder_boot_id, holder_token_hash}`** — a re-claim presenting the *identical*
-PIDIdentity + `token_hash` against an existing `held` row with the same identity+hash **returns the
-existing `generation`** (a no-op success), NOT a conflict. So an ambiguous timeout is retried with
-the *identical* token; only a **definite pre-send dial failure** or **exhausted idempotent
-retries** falls to advisory-leaseless.
+→ advisory-leaseless" is wrong (the lease IS held), and a naive retry with a *fresh* token would
+collide with the shim's own possibly-committed lease as a false CONFLICT. Fix — **the shim
+generates its capability + `token_hash` ONCE and RETAINS the pending token across EVERY claim
+retry (including advisory-mode cadence re-claims) until the claim definitively resolves** (Sol r3);
+it never rotates the token mid-claim. The daemon `ClaimSupervisorLease` is **transactional
+(`BEGIN IMMEDIATE`, clock-after-lock) with exactly three cases:**
+1. **no row / `lapsed` / expired-`held` row** → atomically advance `generation` (=`old+1` in Go,
+   `1` if absent) and install the claimant `{PIDIdentity, token_hash, ttl}` as `held`; emit
+   `lease.claim`; return the new `generation`.
+2. **`held`-live row with the SAME `{PIDIdentity, token_hash}`** → idempotent no-op; return the
+   EXISTING `generation` (this is the ambiguous-retry recovery path).
+3. **`held`-live row with a DIFFERENT identity/token** → `E_RUN_SUPERVISOR_LEASE_CONFLICT` (a real
+   one-supervisor-per-run violation; should be impossible in normal operation).
+
+So an ambiguous timeout is retried with the *identical* retained token (case 2 recovers the
+committed generation); only a **definite pre-send dial failure** or **exhausted idempotent
+retries** falls to advisory-leaseless, still holding the same token for the next cadence re-claim.
 
 **Claim/renew/release failure classification — degrade ONLY on proven unreachability:**
 
@@ -101,6 +111,17 @@ retries** falls to advisory-leaseless.
 This mirrors the D4 §2.1 lesson ([[two-loop-porous-tests]] #6): a fallback path is for genuine
 unreachability ONLY; masking real errors as "advisory" is a false-pass. Degradation is bounded
 (proven-unreachable / retry-exhausted) and labelled.
+
+**Pre-readiness vs post-readiness (Sol r3).** The "fail readiness" column applies ONLY to the
+CLAIM at step 2 (before the ready send / ACK). Once the run is live (post-ACK), a *renew* or
+*reacquire* that hits a real fault CANNOT fail readiness — the run is already executing and its
+child is independent of the lease. Runtime fault handling: **the run is always PRESERVED** (a
+lease fault never kills a live run); the supervisor surfaces a **persistent, explicit
+`U_RUN_SUPERVISOR_LEASE_UNHEALTHY` diagnostic** on the record (not a one-shot log line), keeps
+**retrying reacquire** on the cadence, and NEVER misclassifies a real fault as
+daemon-unreachable or silently drops to advisory. A reader that sees a live child (scope
+non-empty, R3) or a live `/proc` (R4/alive) preserves the run regardless; the unhealthy lease is
+a surfaced advisory condition, not a finalization trigger.
 
 **Claim authorization + threat model (Sol r2 #3).** AIRA is a **machine-local, single-user**
 coordination layer (a per-user daemon on a per-user socket). Same-user processes are mutually
@@ -184,22 +205,25 @@ detached run is long-lived + Setsid-decoupled; a held socket dies on every daemo
 
 | Constant | Value | Note |
 |---|---|---|
-| `route_deadline` | 5s | per routed lease call (dial+write+read); the transport deadline. |
-| `renew_retries` | 3, exp backoff 0.5/1/2s (≈3.5s total) | within one renew interval. |
-| `renew_jitter` | ±10% of `renew_interval` | deterministic ±10% (matches the D4 `jitteredPoll` style), not a shared RNG. |
-| `scheduler_pause_budget` | 10s | tolerated CFS/IO stall between renew attempts. |
+| `route_deadline` | 5s | per routed lease call (dial+write+read); the transport deadline **per attempt**. |
+| `renew_attempts` | 3 total (initial + 2 retries) | per renew interval. |
+| `retry_backoff` | 0.5s then 1s (2 gaps, ≈1.5s total) | between the 3 attempts. |
+| `scheduler_pause_budget` | 10s **aggregate** | total tolerated CFS/IO stall across the whole renew interval (not per-gap). |
+| `renew_jitter` | ±10% of `renew_interval`, deterministic ±10% (D4 `jitteredPoll` style, not a shared RNG) | |
 | `renew_interval` | `ttl / 3` | |
 | `min_ttl` | 60s | the config floor. |
 | `default_ttl` | 120s | `run.supervisor_lease_ttl` default. |
 
-- **Delay budget** `D = route_deadline + retry_backoff + scheduler_pause_budget + renew_jitter_max
-  ≈ 5 + 3.5 + 10 + 0.1·renew_interval`.
+- **Delay budget (Sol r3 — all attempts counted):**
+  `D = renew_attempts·route_deadline + retry_backoff + scheduler_pause_budget + renew_jitter_max
+  = 3·5 + 1.5 + 10 + 0.1·(ttl/3) = 26.5 + ttl/30`.
 - **Enforced invariant (config validator, `E_CONFIG_INVALID` at load if violated):**
   `ttl - renew_interval > D` AND `ttl > AIRA_DAEMON_REAP_INTERVAL (30s) + renew_jitter_max`.
-  For `ttl = 60s`: `renew_interval = 20s`, `ttl - renew_interval = 40s > D (≈20.5s)` ✓, and
-  `60 > 30 + 2` ✓. For `default_ttl = 120s`: `renew_interval = 40s`, `80s > D (≈22.5s)` ✓,
-  `120 > 32` ✓. Any `run.supervisor_lease_ttl < min_ttl (60s)`, or ≤0/malformed, or violating the
-  inequality, is rejected at config load (like the D1/D2 timer configs).
+  Solving `ttl - ttl/3 > 26.5 + ttl/30` ⇒ `(19/30)·ttl > 26.5` ⇒ `ttl > 41.8s`; the `min_ttl` floor
+  of **60s** clears it with margin. For `ttl = 60s`: `renew_interval = 20s`, `D = 28.5s`,
+  `40s > 28.5s` ✓, `60 > 32` ✓. For `default_ttl = 120s`: `renew_interval = 40s`, `D = 30.5s`,
+  `80s > 30.5s` ✓, `120 > 34` ✓. Any `run.supervisor_lease_ttl < min_ttl (60s)`, ≤0/malformed, or
+  violating the inequality is rejected at config load (like the D1/D2 timer configs).
 - **Honest residual:** a stall longer than `D` (a multi-minute scheduler freeze) MAY lapse the
   lease before the next renew. This is **false-fail-safe**: `/proc` still shows the supervisor
   alive → the run is preserved (§2.4), not lost; and the reacquire loop (§2.3) re-claims once the
@@ -223,9 +247,12 @@ proc  := processLive(record.SupervisorPID)   // /proc ground-truth; read error �
 lease := getSupervisorLease(run_id)          // read error / malformed → treated as "no positive signal"
 
 R1. scope == UNINSPECTABLE (transient/perm/IO — child may be live):
-      scopeCreated              → preserve, U_RUN_RECONCILE_REQUIRED
-      else (pre-scope window)   → proc==processDead ? markDetachedLost : preserve
-      [lease NOT consulted; never finalize an uninspectable created scope]
+      ALWAYS preserve, U_RUN_RECONCILE_REQUIRED   [never lost, regardless of proc/scopeCreated]
+      [lease NOT consulted. Sol r3: `!scopeCreated` is NOT proof of no-child — the supervisor
+       could have created the scope + launched the child, then crashed BEFORE durably writing the
+       scope-created event, so an uninspectable scope may hide a LIVE child even pre-scope. Only a
+       positively-EMPTY scope (R4) may finalize. This HARDENS a latent M20 false-fail
+       (`reconcileDetachedLocked` :2044 default branch marked lost on `!scopeCreated && dead`).]
 
 R2. LeaderExitObserved (real exit evidence exists):
       scope == NONEMPTY         → preserve  [live descendants; cannot finalize yet]
@@ -340,11 +367,16 @@ When D7b relays these reads through the daemon, they follow; D5 does not require
   (b) `proc alive ∧ lease lapsed` (daemon-disconnected) → preserve (NOT lost); (c) `lease
   read-error` treated as unknown, never absent/dead; (d) `proc dead ∧ lease held-live` → lost
   (the lease does NOT save a genuinely dead supervisor); (e) `leader-exit ∧ lapsed lease` →
-  finalize from evidence (no fabricated exit).
+  finalize from evidence (no fabricated exit); (f) **`scope UNINSPECTABLE ∧ proc dead ∧
+  !scopeCreated` → preserve (NOT lost)** — the R1 hardening discriminator (Sol r3); it must FAIL
+  against the M20 mark-lost behaviour.
 - **Failure classification (unit):** definite pre-send dial failure → advisory-leaseless launch
-  (proceeds, no direct write); **ambiguous post-commit timeout → idempotent retry recovers the
-  committed generation** (NOT a conflict, NOT leaseless); CAS-conflict (different identity) /
-  invalid-TTL / DB-failure → fail readiness with the code (NOT a silent warning).
+  (proceeds, no direct write); **ambiguous post-commit timeout → idempotent retry with the
+  RETAINED token recovers the committed generation** (NOT a conflict, NOT leaseless); CAS-conflict
+  (different identity) / invalid-TTL / DB-failure at CLAIM → fail readiness with the code (NOT a
+  silent warning). **Post-readiness (Sol r3):** a real fault during renew/reacquire (DB/protocol
+  error, persistent conflict) → the run is PRESERVED + a persistent `U_RUN_SUPERVISOR_LEASE_
+  UNHEALTHY` diagnostic + retry, never a kill / silent-advisory / daemon-unreachable misclassify.
 - **Config validator (unit):** `ttl < min_ttl (60s)`, ≤0, malformed, or violating
   `ttl - renew_interval > D` / `ttl > reap_interval + jitter` → `E_CONFIG_INVALID`; boundary
   `ttl = 60s` accepted; a renew delayed to just under/over `D` and a renew racing the reaper
