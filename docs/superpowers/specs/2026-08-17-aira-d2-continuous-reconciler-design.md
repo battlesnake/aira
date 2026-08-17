@@ -59,11 +59,15 @@ goes idle holding leases that expire). Closing the never-touched-since-restart g
 - **Flush-on-scope-build** (Sol r2 #5). Dropped: it would drain an arbitrary backlog inside
   the readiness barrier, adding unbounded first-request latency for every bootstrap joiner.
   Timer-only means a just-built scope's backlog is flushed on a **best-effort** basis from the
-  next tick onward — **not** a ≤60s guarantee: ticks are serial across projects, so a project's
-  flush may be delayed by other projects' flushes in the same tick, and a large backlog takes
-  multiple ticks (poison seqs aside, each tick makes forward progress from the lowest
-  unjournaled seq). This is acceptable because the journal is **not a read-dependency** (command
-  results come from the DB), so a bounded, best-effort lag after first touch is correct, not a gap.
+  next tick onward — **not** a ≤60s guarantee. Each tick's flush is an **unbounded serial pass**:
+  it attempts the whole `journaled=0` snapshot for a project in one pass (there is no per-pass
+  key/time budget), ctx-cancellable **between events** for shutdown. Ticks are serial across
+  projects, so a project with a large one-time backlog (a long-idle or just-restarted project)
+  can delay other projects' flushes within that tick until it drains. This is acceptable because
+  (a) the journal is **not a read-dependency** (command results come from the DB), (b) a large
+  backlog is a one-time drain — steady state each tick is only the handful of lapses since the
+  last tick — and (c) shutdown stays bounded (ctx between events). A per-pass budget is a
+  possible future refinement, noted not hidden; it is deliberately omitted here for simplicity.
 - **Git-file / allocation intent timer drain** — its own cut (needs worktree-liveness
   validation, scope eviction, bounded finding-lock, write-conflict backoff). Crash-residue
   git-file intents are still materialised by the next `reconcile`/`check` verb, as today.
@@ -123,9 +127,18 @@ for pid, view := range byProject {
   - Because keys are processed **`ORDER BY seq`** and only *poison* seqs are skipped (globals
     abort the pass entirely), no poison seq is ever stranded behind a later one; each next tick
     re-attempts from the lowest unjournaled seq, guaranteeing forward progress.
-- Return `(flushed, firstErr)`. **Never** marks a row `journaled` that was not durably appended
+- **Return semantics (r4 #2):** a **global** error returns **immediately as itself** (the
+  actionable cause the daemon logs), even if an earlier poison had been accumulated — the global
+  cause must not be masked by a stale poison error. A **poison** error is accumulated (first
+  one kept, `%w`-wrapped) and returned as `(flushed, accumulatedPoison)` **only if the pass
+  completes** without a global abort. Classification is by `errors.Is` on the typed sentinels /
+  `sql.ErrNoRows` throughout. **Never** marks a row `journaled` that was not durably appended
   (`journaled=1` is set inside `journalEvent`, strictly after a successful, fsync'd
   `appendEventIfMissing`).
+- **A poison seq stays `journaled=0`** (it can never be journaled honestly) and is therefore
+  re-selected and re-skipped every tick. This is bounded and rare (genuine corruption or an
+  orphaned outbox row) and is the operator's / `check` verb's finding to resolve; D2 does not
+  auto-resolve it. It never blocks non-poison seqs (they are journaled around it).
 
 The daemon's single DB connection (`OpenDB` `MaxOpenConns(1)`) serialises the flusher, reaper,
 and connection goroutines, so there is no intra-daemon DB write contention; the only shared
@@ -144,14 +157,20 @@ Four fixes, all in the shared function (benefit every caller); each fault-tested
    prior append put the line in the page cache but the process died before its `Sync`, a later
    flush "finds" it and marks the DB row `journaled=1`, yet a power loss can drop the line —
    and replay only re-appends `journaled=0`. Fix: `f.Sync()` before the dedup-hit `return nil`.
-2. **Unconditional parent-directory sync (r2 #4 / r3 #2).** "File already exists" does **not**
-   imply its directory entry is durable — a prior process may have created the file and died
-   before syncing the parent. Conditionally syncing the parent only when *this* call creates the
-   file therefore leaves a crash/retry hole (a later holder skips the dir-sync, appends, syncs
-   the file, and marks the row journaled although the dirent was never persisted). Fix: `Sync`
-   the **parent directory unconditionally after opening the file, before the dedup scan** — so
-   any caller that will set `journaled=1` has first made the file's existence durable. Cost is a
-   metadata-only `fsync` per append, consistent with the DB's `synchronous(FULL)` posture.
+2. **Durable directory chain (r2 #4 / r3 #2 / r4 #1).** "File already exists" does **not** imply
+   its directory entry is durable — a prior process may have created the file (or the whole
+   `common/aira` audit directory) and died before syncing. Two links, both required so that
+   `journaled=1` truly implies durable:
+   - **Immediate parent, per append:** `appendEventIfMissing` `Sync`s the **parent directory
+     (`common/aira`) unconditionally after opening the file, before the dedup scan** — so any
+     caller that will set `journaled=1` has first made journal.jsonl's dirent durable. Cost is a
+     metadata-only `fsync` per append, consistent with the DB's `synchronous(FULL)` posture.
+     (`receipts.jsonl` shares this parent; `appendReceiptIfMissing` gets the same treatment.)
+   - **Grandparent, once at creation:** the audit-directory provisioning path (where
+     `common/aira` and its `locks/` subdir are `MkdirAll`'d — grep `s.auditDir` / the `aira`
+     `MkdirAll`) must `Sync` **`common`** after creating `aira`, so the `aira` dirent itself is
+     durable in the pre-existing, durable `common`. This is a one-time cost at first use, not
+     per append. Together the chain `common (durable) → common/aira → journal.jsonl` is complete.
 3. **Full-file scan for a conflicting duplicate (r3 #1).** The current scan early-returns `nil`
    on the *first* matching `(project_id, seq)` line, so a conflicting duplicate **after** a
    matching line is never detected. Fix: scan the **whole file**; if any line with the same
@@ -220,18 +239,22 @@ Daemon socket/flock tests are Opus-real-HW (sandbox cannot bind sockets / flock 
 3. **Bounded lock: wedged peer does not hang the flush.** Hold `journal.lock` from another OFD;
    assert `FlushDeferredJournal` returns within the timeout (not blocked), leaves the row
    `journaled=0`, retried next tick — no fake success.
-4. **Error classification — all three classes (r3 #1).** (a) `errJournalKeyConflict` for one
-   seq → that seq skipped, later seqs still journaled this pass, aggregate error returned.
-   (b) A missing `events` row (`sql.ErrNoRows`) for one seq → skipped as key-local poison, later
-   seqs journaled — **not** treated as global (regression guard against stranding). (c)
-   `errJournalMalformed` / a journal-global I/O error → pass aborted (no further keys attempted),
-   nothing marked journaled, retried next tick.
+4. **Error classification — all three classes + return semantics (r3 #1, r4 #2).** (a)
+   `errJournalKeyConflict` for one seq → that seq skipped, later seqs still journaled this pass,
+   accumulated poison returned. (b) A missing `events` row (`sql.ErrNoRows`) for one seq →
+   skipped as key-local poison, later seqs journaled — **not** treated as global (regression
+   guard against stranding). (c) `errJournalMalformed` / a journal-global I/O error → pass
+   aborted (no further keys attempted), nothing marked journaled, retried next tick. (d) **An
+   early poison followed by a later global error returns the GLOBAL error** (`errors.Is` the
+   global cause), not the earlier poison — the actionable cause is not masked.
 5. **ctx cancellation drains between events.** Cancel mid-flush → prompt `context.Canceled`,
    a journaled prefix, none falsely marked.
-6. **`appendEventIfMissing` durability (r1 #1, r2 #4/r3 #2).** `beforeFileSync`/`beforeDirSync`
-   seams: (a) dedup-hit fsyncs the file before returning; (b) the parent dir is synced
-   **unconditionally after open, before the scan**, even when the file already exists (the
-   crash/retry hole) — a fault-injection asserts the dir-sync happens on a pre-existing file.
+6. **`appendEventIfMissing` durability + durable-dir chain (r1 #1, r2 #4/r3 #2, r4 #1).**
+   `beforeFileSync`/`beforeDirSync` seams: (a) dedup-hit fsyncs the file before returning; (b)
+   the immediate parent (`common/aira`) is synced **unconditionally after open, before the
+   scan**, even when the file already exists (the crash/retry hole) — assert the dir-sync
+   happens on a pre-existing file; (c) audit-dir provisioning `Sync`s **`common`** after
+   creating `aira` on first use — assert the grandparent sync fires exactly once at creation.
 7. **Corruption completeness + full-file scan (r2 #3, r3 #1).** (a) A same-`(project_id,seq)`
    line with a differing `Actor`/`At` → `errJournalKeyConflict` (prefix `E_JOURNAL_CORRUPT`),
    DB row stays `journaled=0`. (b) A **conflicting duplicate placed after** a matching line is
@@ -254,8 +277,9 @@ Daemon socket/flock tests are Opus-real-HW (sandbox cannot bind sockets / flock 
 - **Accepted, deferred:** `appendEventIfMissing` rescans the journal from the start on every
   append (O(n²) over a full backlog flush). Pre-existing (every `journalEvent` already does it,
   incl. the `reconcile`/`check` verbs); D2 does not worsen the per-append cost. The flush is a
-  best-effort background timer, ctx-interruptible between events, so a large backlog simply
-  takes several ticks. A journal offset/index is a separate optimisation, noted not hidden.
+  best-effort background timer, ctx-interruptible between events, so a large one-time backlog
+  drains in a single (longer) serial pass without blocking shutdown. A journal offset/index +
+  a per-pass budget are separate optimisations, noted not hidden.
 - **No flush-on-build, no git-file materialisation, no finding-lock, no scope eviction/liveness**
   (all deferred). Do not hold `s.mu` across per-scope DB work.
 - `Co-Authored-By: Codex Terra <noreply@openai.com>` on the build; Opus verifies real-HW.
