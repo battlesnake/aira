@@ -397,12 +397,24 @@ func (s *Server) bootstrap(ctx context.Context, scope WorktreeScope, args map[st
 	}
 	key := strings.Join([]string{planRoot, planCommon, planGit, worktreeID, configDigest}, "\x00")
 	s.mu.Lock()
-	entry := &scopeEntry{view: view, ready: make(chan struct{})}
-	s.scopes[key] = entry
+	existing := s.scopes[key]
+	var entry *scopeEntry
+	if existing == nil {
+		entry = &scopeEntry{view: view, ready: make(chan struct{})}
+		s.scopes[key] = entry
+	}
 	s.mu.Unlock()
-	defer close(entry.ready)
-	if _, err := s.reap(context.Background(), view); err != nil {
-		log.Printf("aira daemon: initial reap project %s: %v", view.ProjectID(), err)
+	if existing != nil {
+		// A concurrent build (storeForScope or another init) already owns this
+		// scope. Join its readiness barrier instead of replacing it with a
+		// second view and a redundant reap; the freshly built view is discarded
+		// (its Close is a no-op over the shared daemon DB).
+		<-existing.ready
+	} else {
+		defer close(entry.ready)
+		if _, err := s.reap(context.Background(), view); err != nil {
+			log.Printf("aira daemon: initial reap project %s: %v", view.ProjectID(), err)
+		}
 	}
 	result := app.InitResult{Root: plan.Project.Root, Config: plan.Project.ConfigPath, Project: plan.Project.Config.Project.Slug, Prefixes: plan.Project.Config.Project.Prefixes, Created: true}
 	return core.Response{OK: true, Code: "OK", Data: result}

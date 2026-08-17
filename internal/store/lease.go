@@ -599,13 +599,19 @@ func (s *Store) ReapExpiredLeases(ctx context.Context) (int, error) {
 			s.beforeReapCAS(candidate.ticketID)
 		}
 		changed := false
+		// Compute the successor generation in Go and bind it, matching Claim /
+		// Release. The generation=? guard fixes the row's value to
+		// candidate.generation, so this is exactly the SQL generation+1 — but
+		// done in Go it avoids SQLite promoting an int64 overflow to REAL (which
+		// the generation>=0 CHECK would silently accept, corrupting the row).
+		nextGeneration := candidate.generation + 1
 		err := s.withImmediate(ctx, func(conn *sql.Conn) error {
-			result, err := conn.ExecContext(ctx, `UPDATE leases SET state='free', generation=generation+1,
+			result, err := conn.ExecContext(ctx, `UPDATE leases SET state='free', generation=?,
 				holder_token_hash=NULL, boot_id=NULL, last_heartbeat_mono_ns=NULL,
 				ttl_ns=NULL, actor=NULL, worktree_id=NULL
 				WHERE project_id=? AND ticket_id=? AND state='held' AND generation=?
 				AND (boot_id<>? OR (?>=last_heartbeat_mono_ns AND ?-last_heartbeat_mono_ns>=ttl_ns))`,
-				s.projectID, candidate.ticketID, candidate.generation, bootID, int64(monoNS), int64(monoNS))
+				nextGeneration, s.projectID, candidate.ticketID, candidate.generation, bootID, int64(monoNS), int64(monoNS))
 			if err != nil {
 				return err
 			}
