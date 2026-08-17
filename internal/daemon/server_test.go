@@ -842,44 +842,56 @@ func TestPeriodicJournalFlusherDedupesProjectsAndSkipsUnreadyScopes(t *testing.T
 	t.Cleanup(func() { _ = db.Close() })
 	server := NewServer(paths)
 	server.db = db
-	first := testScope(t, paths, "flush-one")
-	second := testScope(t, paths, "flush-two")
-	firstView, _, err := server.storeForScope(first)
+
+	// Project P: two ready worktrees of the SAME project → must be flushed once.
+	firstView, _, err := server.storeForScope(testScope(t, paths, "flush-one"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondView, _, err := server.storeForScope(second)
+	secondView, _, err := server.storeForScope(testScope(t, paths, "flush-two"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstView.ProjectID() != secondView.ProjectID() {
+		t.Fatal("fixture worktrees did not share a project")
+	}
+	// Project Q: an INDEPENDENT ready project → must be flushed once.
+	qView, _, err := server.storeForScope(independentScope(t, paths, "flush-indep-ready", "FQREADY"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Project R: an INDEPENDENT project present ONLY via an UNREADY entry → must
+	// be skipped. Build its view, then replace its ready cache entries with a
+	// single never-ready entry (an independent project makes a wrongful include
+	// observable — dedup cannot mask it, unlike a same-project unready entry).
+	rView, _, err := server.storeForScope(independentScope(t, paths, "flush-indep-unready", "FRUNRDY"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	server.mu.Lock()
-	server.scopes["unready-flush"] = &scopeEntry{view: firstView, ready: make(chan struct{})}
-	server.mu.Unlock()
-	var calls atomic.Int32
-	called := make(chan struct{}, 1)
-	server.flushScopeFn = func(ctx context.Context, _ *store.Store) (int, error) {
-		calls.Add(1)
-		select {
-		case called <- struct{}{}:
-		default:
+	for key, entry := range server.scopes {
+		if entry.view.ProjectID() == rView.ProjectID() {
+			delete(server.scopes, key)
 		}
-		<-ctx.Done()
-		return 0, ctx.Err()
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		server.runJournalFlusher(ctx, time.Millisecond)
-		close(done)
-	}()
-	<-called
-	cancel()
-	<-done
-	if got := calls.Load(); got != 1 {
-		t.Fatalf("periodic flush calls=%d, want one deduped project", got)
+	server.scopes["unready-R"] = &scopeEntry{view: rView, ready: make(chan struct{})}
+	server.mu.Unlock()
+
+	perProject := map[string]int{}
+	server.flushScopeFn = func(_ context.Context, v *store.Store) (int, error) {
+		perProject[v.ProjectID()]++ // called sequentially by flushReadyProjects; no lock needed
+		return 0, nil
 	}
-	if firstView.ProjectID() != secondView.ProjectID() {
-		t.Fatal("fixture worktrees did not share a project")
+	server.flushReadyProjects(context.Background())
+
+	if perProject[firstView.ProjectID()] != 1 {
+		t.Fatalf("shared project flushed %d times, want exactly one (dedup)", perProject[firstView.ProjectID()])
+	}
+	if perProject[qView.ProjectID()] != 1 {
+		t.Fatalf("independent ready project flushed %d times, want one", perProject[qView.ProjectID()])
+	}
+	if perProject[rView.ProjectID()] != 0 {
+		t.Fatalf("unready independent project was flushed %d times, want zero (skip not-ready)", perProject[rView.ProjectID()])
 	}
 }
 

@@ -102,28 +102,61 @@ func TestFlushDeferredJournalSnapshotsSingleConnectionAndDeduplicates(t *testing
 	}
 }
 
-func TestFlushDeferredJournalBoundedLockDoesNotFakeSuccess(t *testing.T) {
+func TestFlushDeferredJournalBoundedLockRetriesUntilReleased(t *testing.T) {
 	s := d2Store(t)
 	insertDeferredEvent(t, s, 110)
 	lock, err := acquireLock(filepath.Join(s.auditDir, "journal.lock"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Launch the flush while the lock is HELD, then release it well within the
+	// journalLockTimeout. A correct bounded acquire must retry and then succeed;
+	// a one-shot LOCK_NB that returns on first contention would fail here.
+	type res struct {
+		count int
+		err   error
+	}
+	done := make(chan res, 1)
+	go func() {
+		count, err := s.FlushDeferredJournal(context.Background())
+		done <- res{count, err}
+	}()
+	time.Sleep(200 * time.Millisecond)
+	unlockFile(lock)
+	select {
+	case r := <-done:
+		if r.err != nil || r.count != 1 || outboxJournaled(t, s, 110) != 1 {
+			t.Fatalf("retry-until-released count=%d err=%v journaled=%d", r.count, r.err, outboxJournaled(t, s, 110))
+		}
+	case <-time.After(journalLockTimeout):
+		t.Fatal("bounded lock did not retry-and-succeed after the lock was released")
+	}
+}
+
+func TestFlushDeferredJournalBoundedLockTimesOutWithoutFakeSuccess(t *testing.T) {
+	s := d2Store(t)
+	insertDeferredEvent(t, s, 110)
+	lock, err := acquireLock(filepath.Join(s.auditDir, "journal.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlockFile(lock)
 	started := time.Now()
 	count, err := s.FlushDeferredJournal(context.Background())
+	elapsed := time.Since(started)
 	if err == nil || count != 0 {
-		t.Fatalf("bounded flush count=%d err=%v", count, err)
+		t.Fatalf("bounded flush count=%d err=%v, want a timeout error", count, err)
 	}
-	if elapsed := time.Since(started); elapsed > 3*time.Second {
-		t.Fatalf("bounded lock took %v, want below 3s", elapsed)
+	// It must have actually waited ~journalLockTimeout via retries, not returned
+	// near-instantly on first contention (the one-shot false-pass Sol flagged).
+	if elapsed < journalLockTimeout-500*time.Millisecond {
+		t.Fatalf("bounded lock returned after %v, want it to retry ~%v", elapsed, journalLockTimeout)
+	}
+	if elapsed > journalLockTimeout+time.Second {
+		t.Fatalf("bounded lock took %v, exceeded the timeout budget", elapsed)
 	}
 	if outboxJournaled(t, s, 110) != 0 {
 		t.Fatal("lock timeout falsely marked row journaled")
-	}
-	unlockFile(lock)
-	count, err = s.FlushDeferredJournal(context.Background())
-	if err != nil || count != 1 || outboxJournaled(t, s, 110) != 1 {
-		t.Fatalf("retry after released lock count=%d err=%v", count, err)
 	}
 }
 
@@ -137,6 +170,11 @@ func TestFlushDeferredJournalKeyConflictSkipsToLaterSequence(t *testing.T) {
 	count, err := s.FlushDeferredJournal(context.Background())
 	if count != 1 || !errors.Is(err, errJournalKeyConflict) {
 		t.Fatalf("flush count=%d err=%v, want one plus key-conflict poison", count, err)
+	}
+	// The accumulated poison must still classify as journal corruption: leading
+	// context must not shadow the E_JOURNAL_CORRUPT prefix ErrorCode() parses.
+	if code := ErrorCode(err); code != "E_JOURNAL_CORRUPT" {
+		t.Fatalf("accumulated poison ErrorCode=%q, want E_JOURNAL_CORRUPT", code)
 	}
 	if outboxJournaled(t, s, 120) != 0 || outboxJournaled(t, s, 121) != 1 {
 		t.Fatal("key poison did not preserve its row and advance later rows")

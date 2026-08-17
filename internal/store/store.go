@@ -1738,7 +1738,11 @@ func (s *Store) FlushDeferredJournal(ctx context.Context) (int, error) {
 		if errors.Is(err, errJournalKeyConflict) || errors.Is(err, sql.ErrNoRows) {
 			log.Printf("aira store: deferred journal poison %s/%d: %v", key.ProjectID, key.Seq, err)
 			if firstPoison == nil {
-				firstPoison = fmt.Errorf("deferred journal poison %s/%d: %w", key.ProjectID, key.Seq, err)
+				// Lead with the E_JOURNAL_CORRUPT code so ErrorCode() classifies
+				// the accumulated poison as journal corruption (both a key
+				// conflict and an orphaned outbox row are corruption); %w keeps
+				// errors.Is for the specific sentinel / sql.ErrNoRows cause.
+				firstPoison = fmt.Errorf("E_JOURNAL_CORRUPT: deferred journal poison %s/%d: %w", key.ProjectID, key.Seq, err)
 			}
 			continue
 		}

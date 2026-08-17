@@ -277,23 +277,34 @@ func (s *Server) runJournalFlusher(ctx context.Context, interval time.Duration) 
 			return
 		case <-ticker.C:
 		}
-		s.mu.Lock()
-		byProject := make(map[string]*store.Store)
-		for _, entry := range s.scopes {
-			select {
-			case <-entry.ready:
-				byProject[entry.view.ProjectID()] = entry.view
-			default:
-			}
+		s.flushReadyProjects(ctx)
+		if ctx.Err() != nil {
+			return
 		}
-		s.mu.Unlock()
-		for projectID, view := range byProject {
-			if _, err := s.flush(ctx, view); err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf("aira daemon: journal flush project %s: %v", projectID, err)
-			}
-			if ctx.Err() != nil {
-				return
-			}
+	}
+}
+
+// flushReadyProjects runs one flush pass: it snapshots the ready scopes under
+// s.mu deduplicated by project (the flush is project-wide), skips not-ready
+// scopes, then flushes each project once. Extracted so a single pass is
+// deterministically testable.
+func (s *Server) flushReadyProjects(ctx context.Context) {
+	s.mu.Lock()
+	byProject := make(map[string]*store.Store)
+	for _, entry := range s.scopes {
+		select {
+		case <-entry.ready:
+			byProject[entry.view.ProjectID()] = entry.view
+		default:
+		}
+	}
+	s.mu.Unlock()
+	for projectID, view := range byProject {
+		if _, err := s.flush(ctx, view); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("aira daemon: journal flush project %s: %v", projectID, err)
+		}
+		if ctx.Err() != nil {
+			return
 		}
 	}
 }
