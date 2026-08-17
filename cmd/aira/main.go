@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"aira/internal/app"
 	"aira/internal/core"
@@ -172,6 +174,11 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	} else if local, ok := dispatcher.(*inProcessDispatcher); ok {
 		local.stdin, local.stdout, local.diagnostics, local.jsonOutput = stdin, faceStdout, stderr, jsonOutput
 	}
+	if verb == "watch" {
+		watchCtx, stopWatch := signal.NotifyContext(context.Background(), syscall.SIGINT)
+		defer stopWatch()
+		return runWatchLoop(watchCtx, dispatcher, scope, request, jsonOutput, stdout, stderr)
+	}
 	response := dispatcher.Dispatch(context.Background(), scope, request)
 	if verb == "run-log" && !jsonOutput {
 		return renderRunLog(response, stdout, stderr)
@@ -328,7 +335,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 			continue
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "rebuild" || name == "steal" || name == "strict" || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && verb == "run-log") || (name == "reasoning-subset" && verb == "spend") || (name == "all" && verb == "test-report") {
+		if name == "rebuild" || name == "steal" || name == "strict" || (name == "from-start" && verb == "watch") || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && verb == "run-log") || (name == "reasoning-subset" && verb == "spend") || (name == "all" && verb == "test-report") {
 			options[name] = "true"
 			continue
 		}
@@ -386,6 +393,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"git":         {},
 		"run-kill":    {"steal": true},
 		"run-log":     {"stream": true, "from": true, "tail": true, "follow": true, "full": true},
+		"watch":       {"from": true, "from-start": true, "verb": true},
 		"gate":        {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "reason": true, "report": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-seed": true, "mutation-expected-result": true},
 	}
 	for name := range options {
@@ -592,6 +600,30 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		args["from"] = options["from"]
 		args["tail"] = options["tail"]
 		args["full"] = options["full"] == "true"
+	case "watch":
+		if len(positional) > 1 {
+			return core.Request{}, fmt.Errorf("watch accepts at most one selector")
+		}
+		if options["from"] != "" && options["from-start"] == "true" {
+			return core.Request{}, fmt.Errorf("watch --from and --from-start are mutually exclusive")
+		}
+		if len(positional) == 1 {
+			args["target"] = positional[0]
+		}
+		args["verbs"] = splitComma(options["verb"])
+		args["wait_ms"] = int64(20_000)
+		switch {
+		case options["from-start"] == "true":
+			args["from"] = int64(0)
+		case options["from"] != "":
+			from, err := strconv.ParseInt(options["from"], 10, 64)
+			if err != nil || from < 0 {
+				return core.Request{}, fmt.Errorf("E_SELECTOR_INVALID: watch --from requires a non-negative integer")
+			}
+			args["from"] = from
+		default:
+			args["from_now"] = true
+		}
 	case "id":
 		if len(positional) != 1 {
 			return core.Request{}, fmt.Errorf("id requires <prefix>")

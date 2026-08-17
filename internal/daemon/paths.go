@@ -30,7 +30,20 @@ type Paths struct {
 const (
 	defaultReapInterval         = 30 * time.Second
 	defaultJournalFlushInterval = 60 * time.Second
+	defaultWatchPollInterval    = 500 * time.Millisecond
 )
+
+func watchPollIntervalFromEnv() (time.Duration, error) {
+	value, set := os.LookupEnv("AIRA_DAEMON_WATCH_POLL_INTERVAL")
+	if !set || value == "" {
+		return defaultWatchPollInterval, nil
+	}
+	interval, err := time.ParseDuration(value)
+	if err != nil || interval < 250*time.Millisecond || interval >= 10*time.Second {
+		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_WATCH_POLL_INTERVAL must be a Go duration in [250ms,10s)")
+	}
+	return interval, nil
+}
 
 func reapIntervalFromEnv() (time.Duration, error) {
 	value, set := os.LookupEnv("AIRA_DAEMON_REAP_INTERVAL")

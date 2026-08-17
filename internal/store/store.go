@@ -150,6 +150,9 @@ type Store struct {
 	// beforeLeaseCommit is a test-only crash hook for the DB/token ordering
 	// boundary; production leaves it nil.
 	beforeLeaseCommit func() error
+	// beforeCommit is a test-only seam immediately before COMMIT for proving
+	// cross-handle event allocation/commit ordering. Production leaves it nil.
+	beforeCommit func()
 	// afterLeaseBegin is a test-only observation hook for the lease clock
 	// sampling boundary; production leaves it nil.
 	afterLeaseBegin func()
@@ -2299,6 +2302,9 @@ func (s *Store) withImmediate(ctx context.Context, fn func(*sql.Conn) error) err
 			return translateDBError(fmt.Errorf("%w; rollback failed: %v", err, rollbackErr))
 		}
 		return translateDBError(err)
+	}
+	if s.beforeCommit != nil {
+		s.beforeCommit()
 	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		if rollbackErr := rollbackConn(conn); rollbackErr != nil {

@@ -23,6 +23,8 @@ func CanonicalVerb(verb string) string {
 		return "show"
 	case "ls":
 		return "list"
+	case "watch":
+		return "watch"
 	default:
 		return verb
 	}
@@ -34,6 +36,8 @@ func Classify(verb, selector string) (string, Route) {
 	canonical := CanonicalVerb(verb)
 	operation := strings.ToLower(strings.TrimSpace(selector))
 	switch {
+	case canonical == "watch":
+		return canonical, RouteDaemon
 	case canonical == "show" && strings.HasPrefix(selector, "RUN-"):
 		return canonical, RouteClient
 	case canonical == "run" || strings.HasPrefix(canonical, "run-"):

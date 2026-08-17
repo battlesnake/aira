@@ -50,15 +50,25 @@ type Server struct {
 	mu     sync.Mutex
 	db     *store.DB
 	scopes map[string]*scopeEntry
+	// stopping closes when Serve stops accepting. Watch handlers observe it
+	// directly so their terminal event drain remains distinct from peer-close.
+	stopping          chan struct{}
+	watchSlots        chan struct{}
+	watchPollInterval time.Duration
 
 	// Test seams. Production always calls the Store methods and DB.Close.
-	reapScope    func(context.Context, *store.Store) (int, error)
-	flushScopeFn func(context.Context, *store.Store) (int, error)
-	closeDB      func(*store.DB) error
+	reapScope        func(context.Context, *store.Store) (int, error)
+	flushScopeFn     func(context.Context, *store.Store) (int, error)
+	closeDB          func(*store.DB) error
+	watchEventsSince func(context.Context, *store.Store, int64, int) ([]store.WatchEvent, int64, error)
+	watchAfterWake   func()
 }
 
 func NewServer(paths Paths) *Server {
-	return &Server{Paths: paths, DrainTimeout: 10 * time.Second, scopes: map[string]*scopeEntry{}}
+	return &Server{
+		Paths: paths, DrainTimeout: 10 * time.Second, scopes: map[string]*scopeEntry{},
+		watchSlots: make(chan struct{}, watchMaxConcurrent), watchPollInterval: defaultWatchPollInterval,
+	}
 }
 
 // maxUnixSocketPath is the AF_UNIX sun_path capacity on Linux (108 bytes,
@@ -74,6 +84,11 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	if err != nil {
 		return err
 	}
+	watchPollInterval, err := watchPollIntervalFromEnv()
+	if err != nil {
+		return err
+	}
+	s.watchPollInterval = watchPollInterval
 	if len(s.Paths.SocketPath) > maxUnixSocketPath {
 		// Fail fast with a clear code instead of a cryptic bind EINVAL. In
 		// production XDG_RUNTIME_DIR is short (/run/user/<uid>); an over-long one
@@ -167,6 +182,7 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 
 	var connections sync.WaitGroup
 	stopping := make(chan struct{})
+	s.stopping = stopping
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -314,6 +330,7 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 	wrote := false
 	defer func() {
 		if recovered := recover(); recovered != nil && !wrote {
+			_ = conn.SetWriteDeadline(time.Now().Add(watchWriteTimeout))
 			_ = writeFrame(conn, errorFrame(CodeInternal, fmt.Sprintf("%s: recovered request panic", CodeInternal)))
 		}
 	}()
@@ -353,7 +370,19 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		s.OnRequest(request.Scope, request.Request)
 	}
 	var response core.Response
-	if s.Handle != nil {
+	if core.CanonicalVerb(request.Request.Verb) == "watch" {
+		_ = conn.SetReadDeadline(time.Time{})
+		connCtx, cancelConn := context.WithCancel(context.Background())
+		go func() {
+			var one [1]byte
+			_, _ = conn.Read(one[:])
+			cancelConn()
+		}()
+		response = s.watch(connCtx, request.Scope, request.Request.Args)
+		_ = conn.SetWriteDeadline(time.Now().Add(watchWriteTimeout))
+		wrote = writeFrame(conn, responseFrame(response)) == nil
+		return
+	} else if s.Handle != nil {
 		response = s.Handle(ctx, request.Scope, request.Request)
 	} else if core.CanonicalVerb(request.Request.Verb) == "init" {
 		if !request.Scope.Bootstrap {

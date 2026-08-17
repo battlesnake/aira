@@ -99,6 +99,56 @@ func TestJournalFlushIntervalConfig(t *testing.T) {
 	}
 }
 
+func TestWatchPollIntervalConfig(t *testing.T) {
+	tests := []struct {
+		name  string
+		set   bool
+		value string
+		want  time.Duration
+		code  string
+	}{
+		{name: "default", want: 500 * time.Millisecond},
+		{name: "empty", set: true, value: "", want: 500 * time.Millisecond},
+		{name: "minimum", set: true, value: "250ms", want: 250 * time.Millisecond},
+		{name: "in range", set: true, value: "1500ms", want: 1500 * time.Millisecond},
+		{name: "below floor", set: true, value: "249ms", code: "E_CONFIG_INVALID"},
+		{name: "at ceiling", set: true, value: "10s", code: "E_CONFIG_INVALID"},
+		{name: "above ceiling", set: true, value: "11s", code: "E_CONFIG_INVALID"},
+		{name: "malformed", set: true, value: "often", code: "E_CONFIG_INVALID"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if test.set {
+				t.Setenv("AIRA_DAEMON_WATCH_POLL_INTERVAL", test.value)
+			} else {
+				_ = os.Unsetenv("AIRA_DAEMON_WATCH_POLL_INTERVAL")
+			}
+			got, err := watchPollIntervalFromEnv()
+			if test.code != "" {
+				if err == nil || !strings.HasPrefix(err.Error(), test.code+":") {
+					t.Fatalf("interval=%v err=%v, want %s", got, err, test.code)
+				}
+				return
+			}
+			if err != nil || got != test.want {
+				t.Fatalf("interval=%v want=%v err=%v", got, test.want, err)
+			}
+		})
+	}
+}
+
+func TestMalformedWatchPollIntervalFailsDaemonStartupBeforeBind(t *testing.T) {
+	paths := testPaths(t)
+	t.Setenv("AIRA_DAEMON_WATCH_POLL_INTERVAL", "10s")
+	err := NewServer(paths).Serve(context.Background())
+	if err == nil || !strings.HasPrefix(err.Error(), "E_CONFIG_INVALID:") {
+		t.Fatalf("Serve error=%v, want E_CONFIG_INVALID", err)
+	}
+	if _, statErr := os.Stat(paths.RuntimeDir); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("malformed config touched runtime directory: %v", statErr)
+	}
+}
+
 func TestMalformedJournalFlushIntervalFailsDaemonStartupBeforeBind(t *testing.T) {
 	paths := testPaths(t)
 	t.Setenv("AIRA_DAEMON_JOURNAL_FLUSH_INTERVAL", "eventually")

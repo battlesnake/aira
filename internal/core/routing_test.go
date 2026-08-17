@@ -51,6 +51,7 @@ func TestClassifyExecutionAndGitOpsCarveOuts(t *testing.T) {
 		{"gate", "show", "gate", RouteDaemon},
 		{"gate", "attest", "gate", RouteDaemon},
 		{"create", "", "create", RouteDaemon},
+		{"watch", "", "watch", RouteDaemon},
 	}
 	for _, test := range cases {
 		gotVerb, gotRoute := Classify(test.verb, test.selector)

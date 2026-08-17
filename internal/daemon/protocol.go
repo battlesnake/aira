@@ -28,6 +28,7 @@ const (
 	CodeProjectInvalid = "E_DAEMON_PROJECT_INVALID"
 	CodeProtocol       = "E_DAEMON_PROTOCOL"
 	CodeInternal       = "E_DAEMON_INTERNAL"
+	CodeBusy           = "E_DAEMON_BUSY"
 )
 
 // WorktreeScope is the serialisable, client-discovered projection needed to
@@ -174,6 +175,8 @@ func exchange(ctx context.Context, socket string, request any) (ResponseFrame, e
 		return ResponseFrame{}, fmt.Errorf("%s: %w", CodeUnavailable, err)
 	}
 	defer conn.Close()
+	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopClose()
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	} else {
