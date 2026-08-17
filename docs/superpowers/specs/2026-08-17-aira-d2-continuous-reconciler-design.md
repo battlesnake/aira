@@ -1,6 +1,6 @@
 # AIRA D2 — daemon deferred-journal flush (touched projects, timer-driven)
 
-**Status:** DRAFT v3 (Sol plan-review r1 8→ r2 6 findings; all folded/refuted below)
+**Status:** APPROVED v6 (Sol plan-review 6 rounds: r1 8 → r2 6 → r3 3 → r4 3 → r5 2 → r6 APPROVE-PLAN)
 **Branch:** `codex-aira-d2` · **Base:** master `a0c329f` (D1 merged)
 **Depends on:** D1 (heartbeat reaper — introduced the deferred-journal gap this closes),
 M21 (mandatory DB-owning daemon), D7a (store-free carved verbs).
@@ -264,10 +264,6 @@ Daemon socket/flock tests are Opus-real-HW (sandbox cannot bind sockets / flock 
    happens on a pre-existing file; (c) audit-dir provisioning `Sync`s **`common`** after the
    `MkdirAll` **unconditionally** — assert the grandparent sync fires on a scope-open **even when
    `aira` already exists** (r5 #1).
-11. **Single-connection snapshot (r5 #2).** `FlushDeferredJournal` over ≥2 pending events on a
-    real `MaxOpenConns(1)` DB completes without deadlock — a regression guard that fails if the
-    impl journals while the outbox `Rows` cursor is still open (keys must be snapshotted +
-    `Rows` closed first).
 7. **Corruption completeness + full-file scan (r2 #3, r3 #1).** (a) A same-`(project_id,seq)`
    line with a differing `Actor`/`At` → `errJournalKeyConflict` (prefix `E_JOURNAL_CORRUPT`),
    DB row stays `journaled=0`. (b) A **conflicting duplicate placed after** a matching line is
@@ -277,6 +273,10 @@ Daemon socket/flock tests are Opus-real-HW (sandbox cannot bind sockets / flock 
 9. **Disabled parks the loop; daemon still serves.**
 10. **Config parsing:** default / `disabled` / `0` / a duration / `<1s`→`E_CONFIG_INVALID` /
     malformed→`E_CONFIG_INVALID`.
+11. **Single-connection snapshot (r5 #2).** `FlushDeferredJournal` over ≥2 pending events on a
+    real `MaxOpenConns(1)` DB completes without deadlock — a regression guard that fails if the
+    impl journals while the outbox `Rows` cursor is still open (keys must be snapshotted +
+    `Rows` closed first).
 
 ## 7. Build notes
 - Mirror D1's reaper structures (`flushScopeFn` seam; `flusherCtx`/`flusherDone`; drain gains
