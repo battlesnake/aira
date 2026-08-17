@@ -1,6 +1,6 @@
 # D5 — Fenced supervisor lease + shim-via-daemon (design / plan)
 
-**Status:** v5 — folds Sol plan-review r4 (2 findings, all folded). For Sol r5.
+**Status:** v6 — folds Sol plan-review r5 (1 finding + 1 nit, all folded). For Sol r6.
 **Milestone:** Phase 5 · D5 (task #41). Follows D1–D4 (all merged; master `dc7dc35`).
 **Loop:** plan → Sol plan-review (rounds → APPROVE-PLAN) → Fable plan-gate → Terra build →
 Opus real-HW verify → Sol build-review (rounds → RESOLVED) → merge. Correctness-critical
@@ -16,11 +16,13 @@ lease** (`supervisor_leases`, keyed by `(project_id, run_id)`). The lease is **s
 fenced evidence**, NOT a replacement for the `/proc` liveness check
 (`processLive(record.SupervisorPID)`, `internal/runner/runner_linux.go:1380-1417`):
 
-- **`/proc` remains the sole finalization authority.** A detached run may be marked `lost` ONLY
-  when `processLive == processDead` (a positively dead supervisor) — exactly as M20 today. **A
-  lapsed/absent lease NEVER proves death and NEVER finalizes a run.** Lease expiry means "the
-  daemon-observed renew stopped"; it does not mean the process died (the daemon could have been
-  down while the supervisor kept running daemonless).
+- **`/proc processDead` is the sole authority for synthesizing `lost`** (a terminal with no exit
+  code) — ONLY when `processLive == processDead` AND the scope is positively-EMPTY, exactly as M20.
+  Real leader-exit evidence (`LeaderExitObserved` + EMPTY) may INDEPENDENTLY finalize from the
+  actual exit (§2.4 R2) — the two terminalization paths are distinct and neither is triggered by
+  lease state. **A lapsed/absent lease NEVER proves death and NEVER finalizes a run.** Lease expiry
+  means "the daemon-observed renew stopped"; it does not mean the process died (the daemon could
+  have been down while the supervisor kept running daemonless).
 - **What the lease adds** (its honest, bounded value): (1) **lease-record fencing (Sol r2)** — a
   stale/resurrected supervisor cannot mutate or release the *current lease record* (its `generation`
   CAS-loses). This fences the **lease record only**; it does NOT fence the supervisor's ledger
@@ -49,7 +51,8 @@ fenced evidence**, NOT a replacement for the `/proc` liveness check
 3. A supervisor **reacquire state machine** (Sol r1 #2): a fenced/lapsed/absent renew re-claims
    a fresh generation + capability so a daemon flap that exceeds TTL is self-healing.
 4. The daemon **reaper** (D1) also laps expired supervisor leases (§2.5) — an auditable lapse;
-   it does NOT finalize the run (only `/proc processDead` finalizes, §2.4).
+   it does NOT finalize the run (only a reader synthesizing `lost` on `/proc processDead`+EMPTY, or
+   finalizing from leader-exit evidence, terminalizes — §2.4; lease lapse never does).
 5. The liveness readers (`reconcileDetachedLocked`, `Get`) consult the lease ONLY to resolve the
    `/proc unknown` case and never to finalize; evidence-first ordering unchanged (§2.4).
 
@@ -59,7 +62,7 @@ The M20 shim performs three classes of direct write; D5 owns exactly one:
 | Shim write | Target | Owner |
 |---|---|---|
 | Run ledger (`starting`…`terminal`, `telemetry`) via `r.append` | `common/aira/runs/ledger.bin` (file, flock) | **Neither.** Single-writer-per-run by design (spec §14); a file, not `state.db`. Untouched. |
-| Supervisor liveness (`processLive`) | `/proc` read | **D5** adds a supplemental fenced lease; `/proc` stays the finalization authority. |
+| Supervisor liveness (`processLive`) | `/proc` read | **D5** adds a supplemental fenced lease; `/proc processDead` stays the sole authority for synthesizing `lost` (leader-exit evidence finalizes independently). |
 | `AddTestReport` / `AddComputeEvent` (`WireAndSettleDetached`) | `state.db` (directly-opened store) | **D7b** (task #36). Out of D5 scope. |
 
 **Honest single-writer claim (Sol r1 #8):** "single writer" in D5 means **`supervisor_leases`
@@ -303,7 +306,8 @@ ttl`; per-candidate CAS repeating the exact expiry predicate with a `generation=
 `affected==0`→skip revived; `affected==1`→`lease.lapse` event + outbox row, actor `aira-daemon`).
 Wired into the daemon reaper loop alongside the ticket reap (`server.go:253-292`), same interval,
 per ready project, plus the on-scope-build sweep. Lapsing frees the *lease* only — it does NOT
-finalize the *run* (consistent with §2.4: only `/proc dead` finalizes). Proactive daemon-side run
+finalize the *run* (consistent with §2.4: a reader synthesizes `lost` only on `/proc dead`+EMPTY,
+or finalizes from leader-exit evidence; a lease lapse never terminalizes). Proactive daemon-side run
 finalization is a D7b follow-on. Stated.
 
 ---
@@ -315,8 +319,9 @@ supervisor already dials the daemon socket (`admitSocketPath`, `cmd/aira/main.go
 three verbs on the same transport (daemon validates `SO_PEERCRED`, §2.1):
 
 - `supervise-lease-claim`  `{run_id, pid, start_tick, boot_id, ttl_ms, token_hash}` → `{generation}`.
-- `supervise-lease-renew`  `{run_id, generation, token}` → ok / fenced / lapsed / absent.
-- `supervise-lease-release` `{run_id, generation, token}` → ok.
+- `supervise-lease-renew`  `{run_id, generation, token}` → `ok` / `expired` / `fenced` / `token`
+  / `absent` (any non-`ok` outcome drops the renew loop to re-claim, §2.1 renew semantics).
+- `supervise-lease-release` `{run_id, generation, token}` → `ok` / `fenced` / `token` / `absent`.
 
 The capability itself (renew/release) is sent to the daemon over the per-user socket; the daemon
 stores only its hash (claim carries `token_hash`; renew/release carry the `token` the daemon
@@ -410,7 +415,8 @@ When D7b relays these reads through the daemon, they follow; D5 does not require
   `state.db` write; D5 does not touch it. The supervisor remains a documented telemetry
   second-writer until D7b.
 - **Daemon-side run finalization.** The reaper laps the *lease*; it does not *finalize the run*
-  (only `/proc dead` finalizes). Proactive daemon-side finalize is a D7b follow-on. Stated.
+  (a reader synthesizes `lost` only on `/proc dead`+EMPTY, or finalizes from leader-exit evidence;
+  lease lapse never terminalizes). Proactive daemon-side finalize is a D7b follow-on. Stated.
 - **Held-connection lease** — rejected (§2.3.1); revisit only if periodic renew proves insufficient.
 - **Cross-boot / container PID-namespace** liveness edge cases inherit M20's three-valued
   `unknown` handling unchanged (and the lease only *supplements* the `unknown` case).
