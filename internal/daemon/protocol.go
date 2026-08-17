@@ -147,11 +147,24 @@ func writeFrame(w io.Writer, value any) error {
 	}
 	var header [4]byte
 	binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
-	if _, err := w.Write(header[:]); err != nil {
+	if err := writeFrameBytes(w, header[:]); err != nil {
 		return err
 	}
-	_, err = w.Write(payload)
-	return err
+	return writeFrameBytes(w, payload)
+}
+
+func writeFrameBytes(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
 }
 
 // Exchange sends one request and receives one response over a fresh Unix

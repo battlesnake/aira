@@ -55,19 +55,31 @@ type Server struct {
 	stopping          chan struct{}
 	watchSlots        chan struct{}
 	watchPollInterval time.Duration
+	admitSlots        chan struct{}
+	admitPollInterval time.Duration
+	admitRegistryMu   sync.Mutex
+	admitQueues       map[string]*sliceQueue
 
 	// Test seams. Production always calls the Store methods and DB.Close.
-	reapScope        func(context.Context, *store.Store) (int, error)
-	flushScopeFn     func(context.Context, *store.Store) (int, error)
-	closeDB          func(*store.DB) error
-	watchEventsSince func(context.Context, *store.Store, int64, int) ([]store.WatchEvent, int64, error)
-	watchAfterWake   func()
+	reapScope         func(context.Context, *store.Store) (int, error)
+	flushScopeFn      func(context.Context, *store.Store) (int, error)
+	closeDB           func(*store.DB) error
+	watchEventsSince  func(context.Context, *store.Store, int64, int) ([]store.WatchEvent, int64, error)
+	watchAfterWake    func()
+	admitResolveSlice func(string) (string, bool, string)
+	admitReadMemory   func(string) (int64, int64, bool, string)
+	admitNow          func() time.Time
+	admitAfter        func(time.Duration) <-chan time.Time
+	admitWriteFrame   func(net.Conn, any) error
+	admitBeforeWrite  func(*admitWaiter)
 }
 
 func NewServer(paths Paths) *Server {
 	return &Server{
 		Paths: paths, DrainTimeout: 10 * time.Second, scopes: map[string]*scopeEntry{},
 		watchSlots: make(chan struct{}, watchMaxConcurrent), watchPollInterval: defaultWatchPollInterval,
+		admitSlots: make(chan struct{}, admitGlobalMax), admitPollInterval: defaultAdmitPollInterval,
+		admitQueues: map[string]*sliceQueue{},
 	}
 }
 
@@ -89,6 +101,11 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		return err
 	}
 	s.watchPollInterval = watchPollInterval
+	admitPollInterval, err := admitPollIntervalFromEnv()
+	if err != nil {
+		return err
+	}
+	s.admitPollInterval = admitPollInterval
 	if len(s.Paths.SocketPath) > maxUnixSocketPath {
 		// Fail fast with a clear code instead of a cryptic bind EINVAL. In
 		// production XDG_RUNTIME_DIR is short (/run/user/<uid>); an over-long one
@@ -215,6 +232,7 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	drained := make(chan struct{})
 	go func() {
 		connections.Wait()
+		s.pruneAdmitRegistry()
 		<-reaperDone
 		<-flusherDone
 		close(drained)
@@ -362,6 +380,19 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		wrote = writeFrame(conn, responseFrame(s.ensureScope(ctx, scope))) == nil
 		return
 	}
+	verb := core.CanonicalVerb(request.Request.Verb)
+	if verb == "admit" {
+		if s.OnRequest != nil {
+			s.OnRequest(request.Scope, request.Request)
+		}
+		// The admit handler owns its only frame and all waiter release paths.
+		// Suppress the generic panic writer, which could otherwise write after
+		// the handler's deferred release.
+		wrote = true
+		_ = conn.SetReadDeadline(time.Time{})
+		s.admitConnection(conn, request.Request.Args)
+		return
+	}
 	if _, route := core.ClassifyRequest(request.Request); route == core.RouteClient {
 		wrote = writeFrame(conn, errorFrame(CodeProtocol, CodeProtocol+": client-only operation cannot run in daemon")) == nil
 		return
@@ -370,7 +401,7 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		s.OnRequest(request.Scope, request.Request)
 	}
 	var response core.Response
-	if core.CanonicalVerb(request.Request.Verb) == "watch" {
+	if verb == "watch" {
 		_ = conn.SetReadDeadline(time.Time{})
 		connCtx, cancelConn := context.WithCancel(context.Background())
 		go func() {

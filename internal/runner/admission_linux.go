@@ -5,8 +5,12 @@ package runner
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -29,6 +33,7 @@ type admissionResult struct {
 	reason   string
 	waitedMS int64
 	lock     *admitLock
+	release  io.Closer
 }
 
 var errDetachKillIntent = errors.New("detached run has a pending kill intent")
@@ -52,6 +57,49 @@ func (l *admitLock) release() {
 	}
 }
 
+func (l *admitLock) Close() error {
+	l.release()
+	return nil
+}
+
+func (result admissionResult) releaseAdmission() {
+	if result.release != nil {
+		_ = result.release.Close()
+		return
+	}
+	result.lock.release()
+}
+
+const (
+	runnerDaemonProtocolVersion = 3
+	runnerDaemonMaxFrameBytes   = 16 << 20
+	admitTransportGrace         = time.Second
+	runnerAdmitWaitCap          = 30 * time.Minute
+)
+
+type runnerAdmitRequestFrame struct {
+	Proto   int            `json:"proto"`
+	Scope   map[string]any `json:"scope"`
+	Request struct {
+		Verb       string         `json:"verb"`
+		Args       map[string]any `json:"args,omitempty"`
+		HasContent bool           `json:"has_content"`
+	} `json:"request"`
+}
+
+type runnerAdmitResponseFrame struct {
+	OK    bool            `json:"ok"`
+	Code  string          `json:"code"`
+	Data  json.RawMessage `json:"data,omitempty"`
+	Error string          `json:"error,omitempty"`
+}
+
+type runnerAdmitGrant struct {
+	State    string `json:"state"`
+	Reason   string `json:"reason,omitempty"`
+	WaitedMS int64  `json:"waited_ms"`
+}
+
 func (r *Runner) admit(ctx context.Context, req Request) (admissionResult, error) {
 	if req.NoAdmit {
 		return admissionResult{state: "bypassed"}, nil
@@ -59,17 +107,32 @@ func (r *Runner) admit(ctx context.Context, req Request) (admissionResult, error
 	if r.memorySlice == "" || r.memoryReserve == 0 {
 		return admissionResult{state: "disabled"}, nil
 	}
+	start := r.clock.Now()
+	if result, granted, err := r.admitThroughDaemon(ctx, req); granted || err != nil {
+		return result, err
+	}
 	path, ok, reason := resolveSlicePath(r.memorySlice)
 	if !ok {
 		r.warnAdmission("unevaluated", reason)
 		return admissionResult{state: "unevaluated", reason: reason}, nil
 	}
-	start := r.clock.Now()
-	waited := false
+	return r.admitWithFlock(ctx, req, path, start)
+}
+
+// admitWithFlock is the retained #29 self-gating implementation. Every daemon
+// failure closes its socket before entering this one fallback path.
+func (r *Runner) admitWithFlock(ctx context.Context, req Request, path string, start time.Time) (admissionResult, error) {
+	// Time already spent waiting on a responsive-but-incomplete daemon outcome
+	// belongs to this admission attempt. Ignore sub-millisecond dial failures so
+	// an immediately acquired fallback lock remains "immediate".
+	waited := r.clock.Now().Sub(start) >= time.Millisecond
 	lastNote := start.Add(-time.Hour)
 	iteration := uint64(0)
 	finish := func(state, reason string, lock *admitLock) admissionResult {
 		result := admissionResult{state: state, reason: reason, lock: lock}
+		if lock != nil {
+			result.release = lock
+		}
 		if waited {
 			result.waitedMS = r.clock.Now().Sub(start).Milliseconds()
 		}
@@ -151,6 +214,188 @@ func (r *Runner) admit(ctx context.Context, req Request) (admissionResult, error
 		case <-r.clock.After(delay):
 		}
 	}
+}
+
+func (r *Runner) admitThroughDaemon(ctx context.Context, req Request) (admissionResult, bool, error) {
+	dial := r.admitDialFn
+	if dial == nil {
+		if strings.TrimSpace(r.admitSocketPath) == "" {
+			return admissionResult{}, false, nil
+		}
+		dial = func(ctx context.Context, path string) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, "unix", path)
+		}
+	}
+	maxWait := r.admissionMaxWait
+	if maxWait > runnerAdmitWaitCap {
+		maxWait = runnerAdmitWaitCap
+	}
+	deadlineWait := r.admissionMaxWait
+	if deadlineWait > time.Duration(mathMaxInt64)-admitTransportGrace {
+		deadlineWait = time.Duration(mathMaxInt64) - admitTransportGrace
+	}
+	transportDeadline := time.Now().Add(deadlineWait + admitTransportGrace)
+	transportCtx, cancelTransport := context.WithDeadline(ctx, transportDeadline)
+	defer cancelTransport()
+	conn, err := dial(transportCtx, r.admitSocketPath)
+	if err != nil {
+		if err := ctx.Err(); err != nil {
+			return admissionResult{}, false, err
+		}
+		return admissionResult{}, false, nil
+	}
+	monitorStop := make(chan struct{})
+	monitorErr := make(chan error, 1)
+	if req.Detach {
+		if err := r.checkDetachAdmission(req); err != nil {
+			_ = conn.Close()
+			return admissionResult{}, false, err
+		}
+		interval := r.pollInterval
+		if interval <= 0 {
+			interval = 2 * time.Second
+		}
+		go func() {
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-monitorStop:
+					return
+				case <-ticker.C:
+					if err := r.checkDetachAdmission(req); err != nil {
+						monitorErr <- err
+						_ = conn.Close()
+						return
+					}
+				}
+			}
+		}()
+		defer close(monitorStop)
+	}
+	fail := func() (admissionResult, bool, error) {
+		_ = conn.Close()
+		select {
+		case err := <-monitorErr:
+			return admissionResult{}, false, err
+		default:
+		}
+		if err := ctx.Err(); err != nil {
+			return admissionResult{}, false, err
+		}
+		if req.Detach {
+			if err := r.checkDetachAdmission(req); err != nil {
+				return admissionResult{}, false, err
+			}
+		}
+		return admissionResult{}, false, nil
+	}
+
+	_ = conn.SetDeadline(transportDeadline)
+	// The connection deadline bounds the transport. Only caller cancellation
+	// closes asynchronously: a full frame that completes exactly at the
+	// transport deadline must win and keep this lease open through Start.
+	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopClose()
+
+	frame := runnerAdmitRequestFrame{Proto: runnerDaemonProtocolVersion, Scope: map[string]any{}}
+	frame.Request.Verb = "admit"
+	frame.Request.Args = map[string]any{
+		"slice": r.memorySlice, "reserve": r.memoryReserve,
+		"max_wait_ms": maxWait.Milliseconds(),
+	}
+	if err := writeRunnerAdmitFrame(conn, frame); err != nil {
+		return fail()
+	}
+	var response runnerAdmitResponseFrame
+	if err := readRunnerAdmitFrame(conn, &response); err != nil {
+		return fail()
+	}
+	if !response.OK || response.Code != "OK" {
+		return fail()
+	}
+	var grant runnerAdmitGrant
+	if err := json.Unmarshal(response.Data, &grant); err != nil || !validRunnerAdmitGrant(grant) {
+		return fail()
+	}
+	// A full, validated frame is the sole winning outcome even when its final
+	// byte races the transport deadline. The flock fallback is never entered.
+	return admissionResult{state: grant.State, reason: grant.Reason, waitedMS: grant.WaitedMS, release: conn}, true, nil
+}
+
+const mathMaxInt64 = int64(^uint64(0) >> 1)
+
+func (r *Runner) checkDetachAdmission(req Request) error {
+	if !req.Detach {
+		return nil
+	}
+	current, err := r.ledger.current(req.detachRunID)
+	if err != nil {
+		return launchErr("U_RUN_RECONCILE_REQUIRED", err)
+	}
+	if current.Detached && current.KillIntent.Present {
+		return errDetachKillIntent
+	}
+	return nil
+}
+
+func validRunnerAdmitGrant(grant runnerAdmitGrant) bool {
+	if grant.WaitedMS < 0 {
+		return false
+	}
+	switch grant.State {
+	case "immediate", "waited", "timeout", "unevaluated":
+		return true
+	default:
+		return false
+	}
+}
+
+func writeRunnerAdmitFrame(w io.Writer, value any) error {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	if len(payload) == 0 || len(payload) > runnerDaemonMaxFrameBytes {
+		return errors.New("invalid daemon admission frame size")
+	}
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
+	if err := writeRunnerAdmitBytes(w, header[:]); err != nil {
+		return err
+	}
+	return writeRunnerAdmitBytes(w, payload)
+}
+
+func writeRunnerAdmitBytes(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
+}
+
+func readRunnerAdmitFrame(r io.Reader, value any) error {
+	var header [4]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return err
+	}
+	size := binary.BigEndian.Uint32(header[:])
+	if size == 0 || size > runnerDaemonMaxFrameBytes {
+		return errors.New("invalid daemon admission frame size")
+	}
+	payload := make([]byte, int(size))
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return err
+	}
+	return json.Unmarshal(payload, value)
 }
 
 func jitteredPoll(interval time.Duration, iteration uint64) time.Duration {

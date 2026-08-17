@@ -203,7 +203,7 @@ func (r *Runner) launchDetachedValidated(ctx context.Context, req Request, prefi
 		}
 		return r.failBeforeLaunch(ctx, record, code, err)
 	}
-	releaseAdmit := func() { admission.lock.release() }
+	releaseAdmit := admission.releaseAdmission
 	record.Admission, record.AdmissionReason, record.AdmissionWaitedMS = admission.state, admission.reason, admission.waitedMS
 	lock, err := lockFile(filepath.Join(filepath.Dir(r.ledger.ledger), id+".lock"))
 	if err != nil {

@@ -5,8 +5,10 @@ package runner
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +20,53 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+type chunkReader struct{ reader io.Reader }
+
+func (r chunkReader) Read(p []byte) (int, error) {
+	if len(p) > 1 {
+		p = p[:1]
+	}
+	return r.reader.Read(p)
+}
+
+type deadlineReadError struct{}
+
+func (deadlineReadError) Error() string   { return "deadline" }
+func (deadlineReadError) Timeout() bool   { return true }
+func (deadlineReadError) Temporary() bool { return true }
+
+type deadlineFrameConn struct {
+	mu     sync.Mutex
+	reader *bytes.Reader
+	closed atomic.Bool
+}
+
+func (c *deadlineFrameConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n, err := c.reader.Read(p)
+	if n > 0 && c.reader.Len() == 0 {
+		return n, deadlineReadError{}
+	}
+	return n, err
+}
+func (c *deadlineFrameConn) Write(p []byte) (int, error) { return len(p), nil }
+func (c *deadlineFrameConn) Close() error                { c.closed.Store(true); return nil }
+func (c *deadlineFrameConn) LocalAddr() net.Addr         { return testNetAddr("local") }
+func (c *deadlineFrameConn) RemoteAddr() net.Addr        { return testNetAddr("remote") }
+func (c *deadlineFrameConn) SetDeadline(time.Time) error { return nil }
+func (c *deadlineFrameConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+func (c *deadlineFrameConn) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
+type testNetAddr string
+
+func (a testNetAddr) Network() string { return "test" }
+func (a testNetAddr) String() string  { return string(a) }
 
 type instantClock struct {
 	mu  sync.Mutex
@@ -904,5 +953,259 @@ func TestRealMemoryAdmissionWaitsForReliefThenIsImmediate(t *testing.T) {
 	}
 	if immediate.Admission != "immediate" || immediate.AdmissionWaitedMS != 0 {
 		t.Fatalf("immediate record=%+v", immediate)
+	}
+}
+
+func TestDaemonAdmitReadFullFraming(t *testing.T) {
+	want := runnerAdmitResponseFrame{OK: true, Code: "OK", Data: json.RawMessage(`{"state":"waited","waited_ms":17}`)}
+	var encoded bytes.Buffer
+	if err := writeRunnerAdmitFrame(&encoded, want); err != nil {
+		t.Fatal(err)
+	}
+	var got runnerAdmitResponseFrame
+	if err := readRunnerAdmitFrame(chunkReader{reader: bytes.NewReader(encoded.Bytes())}, &got); err != nil {
+		t.Fatalf("one-byte framing failed: %v", err)
+	}
+	if !got.OK || got.Code != "OK" || !bytes.Equal(got.Data, want.Data) {
+		t.Fatalf("frame=%+v", got)
+	}
+	for name, cut := range map[string]int{"partial header": 2, "partial payload": len(encoded.Bytes()) - 1} {
+		t.Run(name, func(t *testing.T) {
+			var frame runnerAdmitResponseFrame
+			if err := readRunnerAdmitFrame(bytes.NewReader(encoded.Bytes()[:cut]), &frame); !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatalf("error=%v, want io.ErrUnexpectedEOF", err)
+			}
+		})
+	}
+}
+
+func TestDaemonAdmitGrantStatesRemainByteIdentical(t *testing.T) {
+	for _, state := range []string{"immediate", "waited", "timeout", "unevaluated"} {
+		t.Run(state, func(t *testing.T) {
+			clock := newInstantClock()
+			runner, _ := gateOnlyRunner(t, clock, func(string) (int64, int64, bool, string) { return 0, 100, true, "" })
+			client, server := net.Pipe()
+			runner.admitDialFn = func(context.Context, string) (net.Conn, error) { return client, nil }
+			go func() {
+				defer server.Close()
+				var request runnerAdmitRequestFrame
+				if readRunnerAdmitFrame(server, &request) != nil {
+					return
+				}
+				data, _ := json.Marshal(runnerAdmitGrant{State: state, Reason: "reason", WaitedMS: 7})
+				_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{OK: true, Code: "OK", Data: data})
+				var one [1]byte
+				_, _ = server.Read(one[:])
+			}()
+			result, err := runner.admit(context.Background(), Request{})
+			if err != nil || result.state != state || result.reason != "reason" || result.waitedMS != 7 {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+			result.releaseAdmission()
+		})
+	}
+	for _, state := range []string{"disabled", "bypassed"} {
+		runner := &Runner{clock: newInstantClock()}
+		request := Request{NoAdmit: state == "bypassed"}
+		if state == "bypassed" {
+			runner.memorySlice, runner.memoryReserve = "/unused", 1
+		}
+		result, err := runner.admit(context.Background(), request)
+		if err != nil || result.state != state {
+			t.Fatalf("%s result=%+v err=%v", state, result, err)
+		}
+	}
+}
+
+func TestDaemonAdmitStatesAreByteIdenticalOnRunRecord(t *testing.T) {
+	for _, state := range []string{"immediate", "waited", "timeout", "unevaluated"} {
+		t.Run(state, func(t *testing.T) {
+			path := currentSliceForTest(t)
+			runner, err := New(Config{
+				CommonDir: t.TempDir(), Backend: &memoryBackend{scope: &memoryScope{}},
+				MemorySlice: path, MemoryReserve: 40, AdmissionMaxWait: time.Second,
+				PollInterval: time.Millisecond, Clock: newInstantClock(),
+				sliceMemoryFn: func(string) (int64, int64, bool, string) { return 0, 100, true, "" },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			client, server := net.Pipe()
+			runner.admitDialFn = func(context.Context, string) (net.Conn, error) { return client, nil }
+			go func() {
+				defer server.Close()
+				var request runnerAdmitRequestFrame
+				if readRunnerAdmitFrame(server, &request) != nil {
+					return
+				}
+				data, _ := json.Marshal(runnerAdmitGrant{State: state, Reason: "wire-reason", WaitedMS: 11})
+				_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{OK: true, Code: "OK", Data: data})
+				var one [1]byte
+				_, _ = server.Read(one[:])
+			}()
+			runner.startFn = func(*exec.Cmd) error { return errors.New("injected after admission") }
+			if _, err := runner.Launch(context.Background(), Request{Argv: []string{"/bin/true"}}); err == nil {
+				t.Fatal("injected Start error not returned")
+			}
+			events, err := runner.ledger.read()
+			if err != nil || len(events) == 0 {
+				t.Fatalf("events=%d err=%v", len(events), err)
+			}
+			record := events[len(events)-1].Run
+			if record.Admission != state || record.AdmissionReason != "wire-reason" || record.AdmissionWaitedMS != 11 {
+				t.Fatalf("record admission=(%q,%q,%d)", record.Admission, record.AdmissionReason, record.AdmissionWaitedMS)
+			}
+		})
+	}
+}
+
+func TestDaemonAdmitClientDeadlineClosesBeforeSingleFlockFallback(t *testing.T) {
+	path := currentSliceForTest(t)
+	runner := &Runner{
+		memorySlice: path, memoryReserve: 40, admissionMaxWait: 5 * time.Millisecond,
+		pollInterval: time.Millisecond, clock: systemClock{},
+		sliceMemory: func(string) (int64, int64, bool, string) { return 0, 100, true, "" },
+	}
+	client, server := net.Pipe()
+	peerClosed := make(chan struct{})
+	runner.admitDialFn = func(context.Context, string) (net.Conn, error) { return client, nil }
+	go func() {
+		defer server.Close()
+		var request runnerAdmitRequestFrame
+		if readRunnerAdmitFrame(server, &request) != nil {
+			return
+		}
+		var one [1]byte
+		_, _ = server.Read(one[:])
+		close(peerClosed)
+	}()
+	var attempts atomic.Int64
+	runner.lockAttemptFn = func(string) (*admitLock, error) {
+		attempts.Add(1)
+		select {
+		case <-peerClosed:
+		case <-time.After(time.Second):
+			t.Fatal("flock fallback started before daemon socket close")
+		}
+		return &admitLock{}, nil
+	}
+	started := time.Now()
+	result, err := runner.admit(context.Background(), Request{})
+	if err != nil || result.lock == nil || attempts.Load() != 1 {
+		t.Fatalf("result=%+v attempts=%d err=%v", result, attempts.Load(), err)
+	}
+	if elapsed := time.Since(started); elapsed < admitTransportGrace || elapsed > 2*time.Second {
+		t.Fatalf("deadline fallback elapsed=%v", elapsed)
+	}
+	result.releaseAdmission()
+}
+
+func TestDaemonAdmitPartialFrameClosesBeforeFallback(t *testing.T) {
+	path := currentSliceForTest(t)
+	runner := &Runner{
+		memorySlice: path, memoryReserve: 40, admissionMaxWait: 50 * time.Millisecond,
+		pollInterval: time.Millisecond, clock: newInstantClock(),
+		sliceMemory: func(string) (int64, int64, bool, string) { return 0, 100, true, "" },
+	}
+	client, server := net.Pipe()
+	closed := make(chan struct{})
+	runner.admitDialFn = func(context.Context, string) (net.Conn, error) { return client, nil }
+	go func() {
+		defer server.Close()
+		var request runnerAdmitRequestFrame
+		if readRunnerAdmitFrame(server, &request) != nil {
+			return
+		}
+		var complete bytes.Buffer
+		data, _ := json.Marshal(runnerAdmitGrant{State: "immediate"})
+		_ = writeRunnerAdmitFrame(&complete, runnerAdmitResponseFrame{OK: true, Code: "OK", Data: data})
+		partial := complete.Bytes()[:len(complete.Bytes())-1]
+		_, _ = server.Write(partial)
+		var one [1]byte
+		_, _ = server.Read(one[:])
+		close(closed)
+	}()
+	runner.lockAttemptFn = func(string) (*admitLock, error) {
+		select {
+		case <-closed:
+		case <-time.After(time.Second):
+			t.Fatal("fallback did not wait for partial-frame socket close")
+		}
+		return &admitLock{}, nil
+	}
+	result, err := runner.admit(context.Background(), Request{})
+	if err != nil || result.lock == nil {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	result.releaseAdmission()
+}
+
+func TestDaemonAdmitFullFrameAtDeadlineWinsWithoutFlock(t *testing.T) {
+	data, err := json.Marshal(runnerAdmitGrant{State: "waited", WaitedMS: 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded bytes.Buffer
+	if err := writeRunnerAdmitFrame(&encoded, runnerAdmitResponseFrame{OK: true, Code: "OK", Data: data}); err != nil {
+		t.Fatal(err)
+	}
+	conn := &deadlineFrameConn{reader: bytes.NewReader(encoded.Bytes())}
+	path := currentSliceForTest(t)
+	runner := &Runner{
+		memorySlice: path, memoryReserve: 40, admissionMaxWait: time.Millisecond,
+		pollInterval: time.Millisecond, clock: newInstantClock(),
+		sliceMemory: func(string) (int64, int64, bool, string) { return 0, 100, true, "" },
+		admitDialFn: func(context.Context, string) (net.Conn, error) { return conn, nil },
+	}
+	var fallback atomic.Int64
+	runner.lockAttemptFn = func(string) (*admitLock, error) {
+		fallback.Add(1)
+		return &admitLock{}, nil
+	}
+	result, err := runner.admit(context.Background(), Request{})
+	if err != nil || result.state != "waited" || result.waitedMS != 9 || fallback.Load() != 0 {
+		t.Fatalf("result=%+v fallback=%d err=%v", result, fallback.Load(), err)
+	}
+	if conn.closed.Load() {
+		t.Fatal("winning grant connection closed before launch release")
+	}
+	result.releaseAdmission()
+	if !conn.closed.Load() {
+		t.Fatal("winning grant connection was not released")
+	}
+}
+
+func TestDaemonAdmitBusyAndDialFailureUseOneFallback(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		dial func(context.Context, string) (net.Conn, error)
+	}{
+		{name: "dial failure", dial: func(context.Context, string) (net.Conn, error) { return nil, os.ErrNotExist }},
+		{name: "busy", dial: func(context.Context, string) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				defer server.Close()
+				var request runnerAdmitRequestFrame
+				_ = readRunnerAdmitFrame(server, &request)
+				_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{Code: "E_DAEMON_BUSY", Error: "busy"})
+			}()
+			return client, nil
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := currentSliceForTest(t)
+			runner := &Runner{
+				memorySlice: path, memoryReserve: 40, admissionMaxWait: time.Second,
+				pollInterval: time.Millisecond, clock: newInstantClock(), admitDialFn: test.dial,
+				sliceMemory: func(string) (int64, int64, bool, string) { return 0, 100, true, "" },
+			}
+			var attempts atomic.Int64
+			runner.lockAttemptFn = func(string) (*admitLock, error) { attempts.Add(1); return &admitLock{}, nil }
+			result, err := runner.admit(context.Background(), Request{})
+			if err != nil || result.lock == nil || attempts.Load() != 1 {
+				t.Fatalf("result=%+v attempts=%d err=%v", result, attempts.Load(), err)
+			}
+			result.releaseAdmission()
+		})
 	}
 }

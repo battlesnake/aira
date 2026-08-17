@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,12 +50,18 @@ type Runner struct {
 	allocatePTYFn      func() (*os.File, *os.File, error)
 	startFn            func(*exec.Cmd) error
 	lockAttemptFn      func(string) (*admitLock, error)
+	admitSocketPath    string
+	admitDialFn        func(context.Context, string) (net.Conn, error)
 	failBeforeLaunchFn func(context.Context, RunRecord, string, error) (*RunRecord, error)
 	// beforeRunningAppendFn is a test seam that fires inside the launch flock,
 	// after a successful Start and before the "running" append, to prove the
 	// per-run lock is held through the running append (not released after Start).
 	beforeRunningAppendFn func()
 }
+
+// SetAdmitSocketPath supplies the mandatory daemon endpoint resolved by the
+// CLI layer. It is set before a Runner is exposed to concurrent requests.
+func (r *Runner) SetAdmitSocketPath(path string) { r.admitSocketPath = path }
 
 func New(cfg Config) (*Runner, error) {
 	if cfg.ReportMaxBytes == 0 {
@@ -242,7 +249,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if err != nil {
 		return nil, err
 	}
-	releaseAdmit := func() { admission.lock.release() }
+	releaseAdmit := admission.releaseAdmission
 
 	var id string
 	var record RunRecord

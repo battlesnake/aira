@@ -236,6 +236,9 @@ func runSupervisor(argv []string, diagnostics io.Writer) int {
 		return store.ExitForCode("E_RUN_DETACH_FAILED")
 	}
 	defer s.Close()
+	if paths, pathErr := daemon.PathsFromEnv(); pathErr == nil {
+		project.Runner.SetAdmitSocketPath(paths.SocketPath)
+	}
 	record, superviseErr := project.Runner.SuperviseRequest(context.Background(), request, readyFD, ackFD)
 	var telemetryErr error
 	if wiringRequested && detachedWiringTerminal(record) {

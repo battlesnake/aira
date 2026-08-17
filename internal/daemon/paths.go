@@ -31,7 +31,20 @@ const (
 	defaultReapInterval         = 30 * time.Second
 	defaultJournalFlushInterval = 60 * time.Second
 	defaultWatchPollInterval    = 500 * time.Millisecond
+	defaultAdmitPollInterval    = 250 * time.Millisecond
 )
+
+func admitPollIntervalFromEnv() (time.Duration, error) {
+	value, set := os.LookupEnv("AIRA_DAEMON_ADMIT_POLL_INTERVAL")
+	if !set || value == "" {
+		return defaultAdmitPollInterval, nil
+	}
+	interval, err := time.ParseDuration(value)
+	if err != nil || interval < 250*time.Millisecond || interval >= 10*time.Second {
+		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_ADMIT_POLL_INTERVAL must be a Go duration in [250ms,10s)")
+	}
+	return interval, nil
+}
 
 func watchPollIntervalFromEnv() (time.Duration, error) {
 	value, set := os.LookupEnv("AIRA_DAEMON_WATCH_POLL_INTERVAL")
