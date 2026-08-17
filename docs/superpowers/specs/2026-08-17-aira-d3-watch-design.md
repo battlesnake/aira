@@ -1,6 +1,6 @@
 # AIRA D3 — daemon watch (`aira watch`, long-poll event tail)
 
-**Status:** DRAFT v3 (Sol plan-review r1 6 → r2 4 findings; all folded)
+**Status:** DRAFT v4 (Sol plan-review r1 6 → r2 4 → r3 3 findings; all folded)
 **Branch:** `codex-aira-d3` · **Base:** master `982556b` (D2 merged)
 **Depends on:** M21 (mandatory DB-owning daemon + routed coordination), D1/D2 (daemon
 timers + process-terminal shutdown this reuses).
@@ -92,7 +92,9 @@ reclaimed on *every* path — timeout, disconnect, shutdown, error, panic; Sol r
 2. Clamp `wait_ms` to `[pollInterval, watchWaitCapMs]` (a client cannot request a zero/short wait
    that spins; Sol r2 #1). Record `start`.
 3. Resolve the scope store (readiness-barriered). `from_now` → return `{events:[], cursor:
-   CurrentMaxSeq(), eof:false}` immediately; the client then long-polls from there.
+   CurrentMaxSeq(), eof:false}` — but **also paced by the min-request-duration** (§3.5, Sol r2 #3)
+   so a client spamming `from_now` cannot bypass the rate bound; the shutdown-priority check (below)
+   applies before returning it too.
 4. Else loop until the request deadline (`start + wait_ms`):
    - `scanned := EventsSince(from, batchCap)` — a **bounded window of the next seqs, UNFILTERED**
      (§3.3). `next := scanned.MaxScannedSeq` (or `from` if the window is empty).
@@ -107,6 +109,13 @@ reclaimed on *every* path — timeout, disconnect, shutdown, error, panic; Sol r
      (long-poll timeout, client re-polls); `<-s.stopping` → return `{[], from, eof:true}` (the
      ONLY shutdown path); `<-connCtx.Done()` → return `connCtx.Err()` (client gone — the client is
      no longer listening, so the return value is moot; the point is to stop the handler).
+5. **Deterministic shutdown priority (Sol r3 #1).** Go `select` chooses randomly among ready
+   cases, so a `deadlineTimer`/pacing-timer firing *coincident* with `close(s.stopping)` could
+   otherwise return `eof:false`. Therefore: after **every** non-shutdown wake, and **immediately
+   before writing any normal (non-`eof`) response**, do a non-blocking priority check
+   `select { case <-s.stopping: return {[], from, eof:true}; default: }`. Shutdown then always
+   wins over a coincident timeout/batch. (`connCtx` cancellation need not be prioritised — the
+   client is already gone.) §6 stress-tests coincident timeout/event/shutdown.
 4. The wait holds **no** DB connection/txn/lock: `EventsSince` runs a quick `SELECT` and returns,
    then the handler sleeps on the ticker with nothing open (cf. D2's `MaxOpenConns(1)` deadlock).
 
@@ -157,9 +166,12 @@ is an index range, cheap.
 - **SIGINT** → close the connection and exit 0.
 
 ### 3.5 Config & bounds (Sol r1 #2)
-- `AIRA_DAEMON_WATCH_POLL_INTERVAL` (Go duration, default **500ms**, **floor 250ms**, malformed
-  or below floor → `E_CONFIG_INVALID` at daemon start): the internal re-query cadence during a
-  long-poll. It bounds latency; the floor bounds query load.
+- `AIRA_DAEMON_WATCH_POLL_INTERVAL` (Go duration, default **500ms**, **range [250ms, 10s]**;
+  malformed, below the floor, or **≥ the ceiling** → `E_CONFIG_INVALID` at daemon start): the
+  internal re-query cadence during a long-poll. The floor bounds query load; the **ceiling (10s)
+  keeps `pollInterval < watchWaitCapMs` so the `wait_ms` clamp `[pollInterval, watchWaitCapMs]`
+  and the min-request-duration stay well-defined** (Sol r3 #2 — an interval above the request cap
+  would make the range empty and violate the 25s bound). It bounds latency.
 - `watchWaitCapMs` (server const, **25s**): max a single long-poll blocks; the client's `wait_ms`
   is clamped to it — keeps each request finite (drain-safe).
 - `watchBatchCap` (server const, **256**): max events per response; a large backlog drains over
@@ -234,10 +246,12 @@ Store (sandbox-runnable):
    `CurrentMaxSeq` returns the max (0 on empty).
 2. A large backlog drains across successive `EventsSince(cursor, cap)` calls with a strictly
    advancing, contiguous cursor and no gaps/dupes.
-3. **Commit-order regression (§2.1, Sol r1 #6):** a writer holding an open `BEGIN IMMEDIATE` txn
-   with seq `N` allocated-not-committed **blocks** a second writer's seq-`N+1` allocation until it
-   commits (a `beforeCommit` seam); a reader in between never sees `N+1` without `N`. Proves the
-   single-writer serialisation the watch relies on.
+3. **Commit-order regression (§2.1, Sol r1 #6, r3 #4):** using **two independent `*sql.DB` handles
+   plus a separate reader handle** (to model cross-process writers, not one pooled connection), a
+   writer holding an open `BEGIN IMMEDIATE` txn with seq `N` allocated-not-committed **blocks** the
+   second handle's seq-`N+1` allocation until it commits; a reader in between never sees `N+1`
+   without `N`. Independent handles are essential — a single `MaxOpenConns(1)` pool would prove only
+   local queueing, not the cross-process file-lock serialisation the watch actually relies on.
 
 Daemon (`s.watch`, real-HW):
 4. `from_now` returns the current max seq with an empty batch immediately.
@@ -257,16 +271,19 @@ Daemon (`s.watch`, real-HW):
     `E_DAEMON_BUSY`; and capacity is **reclaimed** after each exit path (a slot freed by a
     long-poll timeout, a client disconnect, a shutdown, and a recovered handler panic each let a
     new watch be admitted) — proves the `defer release` runs on every path, not only success.
-12. **Min-request-duration rate bound (Sol r2 #2 #1):** a `from`-cursor watch over a ready backlog
-    does not return its non-empty batch before ~`pollInterval` since request start (so replay
-    cannot spin); a `wait_ms` below `pollInterval` is clamped up; and shutdown returns a
-    deterministic `eof` (never `context.Canceled`) even though the peer-close detector exists.
+12. **Min-request-duration rate bound + deterministic shutdown (Sol r2 #1, r3 #1/#3):** a
+    `from`-cursor watch over a ready backlog does not return its non-empty batch before
+    ~`pollInterval`; a `from_now` request is likewise paced; a `wait_ms` below `pollInterval` is
+    clamped up. **Coincident-wake stress:** with the deadline/pacing timer and `close(s.stopping)`
+    made to fire together (a seam), the handler deterministically returns `eof:true`, never a
+    normal `eof:false` response, across many iterations.
 
 Client / e2e (real daemon):
 13. `aira watch` auto-starts the daemon, prints events as concurrent `mv`/`claim` make them,
     `--verb`/selector narrows, `--json` shape, SIGINT exits 0, `eof` on stop exits 0. At-least-
     once: a killed+restarted daemon mid-watch re-delivers from the unadvanced cursor (seq dedup).
-14. Config parsing: default / a duration / below-floor→`E_CONFIG_INVALID` / malformed→invalid.
+14. Config parsing: default / an in-range duration / below-floor→`E_CONFIG_INVALID` /
+    **at-or-above-ceiling (≥10s)→`E_CONFIG_INVALID`** (Sol r3 #2) / malformed→invalid.
 
 ## 7. Build notes
 - Add `watch` to `CanonicalVerb` + CLI (`cmd/aira`), classify `RouteDaemon`; the CLI command is a
@@ -278,7 +295,10 @@ Client / e2e (real daemon):
   the response. Acquire admission at entry with an immediate `defer release`.
 - `s.watch` uses the readiness-barriered store + `s.stopping` + a `pollTicker`; clamp `wait_ms` to
   `[pollInterval, watchWaitCapMs]`; enforce the min-request-duration = `pollInterval` before
-  returning any batch.
+  returning **any** response incl. `from_now`; run the non-blocking `s.stopping` priority check
+  after every wake and before writing any non-`eof` response.
+- Admission is **one atomic operation** (a `watchMaxConcurrent`-buffered channel semaphore, or an
+  atomic CAS increment-if-below-cap) — never a racy read-then-increment (Sol r3 #4).
 - `s.stopping` becomes a `Server` field; keep the existing `close(stopping)` on shutdown; do not
   otherwise change the reaper/flusher/drain structure.
 - `EventsSince`/`CurrentMaxSeq` are pure reads; the long-poll wait must NOT hold the connection
