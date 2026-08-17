@@ -1,6 +1,6 @@
 # D5 — Fenced supervisor lease + shim-via-daemon (design / plan)
 
-**Status:** v7 — folds Sol plan-review r6 (2 prose/contract residues). For Sol r7.
+**Status:** v8 — APPROVED. Sol plan-review 7 rounds → APPROVE-PLAN; Fable plan-gate → GATE-PASS (3 nits folded). Ready to build.
 **Milestone:** Phase 5 · D5 (task #41). Follows D1–D4 (all merged; master `dc7dc35`).
 **Loop:** plan → Sol plan-review (rounds → APPROVE-PLAN) → Fable plan-gate → Terra build →
 Opus real-HW verify → Sol build-review (rounds → RESOLVED) → merge. Correctness-critical
@@ -200,7 +200,11 @@ is a single serialized goroutine holding the current `{generation, capability}`.
 renew — `expired` (TTL elapsed, or the row was already reaped to `lapsed`), `fenced` (generation
 mismatch), `token` (capability mismatch), or `absent` (no row) — triggers a **re-claim**: obtain a
 fresh `{generation, capability}`, atomically
-replace the in-memory pair, and continue renewing. Re-claim is refused (fail-safe, stays
+replace the in-memory pair, and continue renewing. **Each reacquire is itself a claim operation
+and obeys the §2.1 token-retention rule (Fable gate):** the reacquire generates ONE fresh token
+and RETAINS it across that reacquire's own ambiguous-timeout retries until the reacquire
+definitively resolves — the retention rule is per-claim-operation (initial claim AND every
+reacquire), not just the first claim. Re-claim is refused (fail-safe, stays
 leaseless, `/proc` covers safety) only if the run's lease is `held` by a *different live* holder
 (the §2.1 conflict, impossible in normal operation). Claim/renew/release/reacquire are serialized
 in the one goroutine — no concurrent lease ops from a single supervisor.
@@ -404,6 +408,11 @@ When D7b relays these reads through the daemon, they follow; D5 does not require
   silent warning). **Post-readiness (Sol r3):** a real fault during renew/reacquire (DB/protocol
   error, persistent conflict) → the run is PRESERVED + a persistent `U_RUN_SUPERVISOR_LEASE_
   UNHEALTHY` diagnostic + retry, never a kill / silent-advisory / daemon-unreachable misclassify.
+  **Up-but-broken discriminator (Fable gate):** an UP daemon that dials OK then returns a
+  protocol/DB error at CLAIM fails readiness, whereas a NO-daemon (dial failure) proceeds
+  leaseless — the dial-failure-vs-post-connect classification is load-bearing (D4 fail-loud
+  lesson), so the test must be a genuine discriminator that FAILS if a post-connect fault is
+  misclassified as unreachable.
 - **Config validator (unit):** `ttl < min_ttl (60s)`, ≤0, malformed, or violating
   `ttl - renew_interval > D` / `ttl > reap_interval + jitter` → `E_CONFIG_INVALID`; boundary
   `ttl = 60s` accepted; a renew delayed to just under/over `D` and a renew racing the reaper
@@ -424,6 +433,12 @@ When D7b relays these reads through the daemon, they follow; D5 does not require
 - **Held-connection lease** — rejected (§2.3.1); revisit only if periodic renew proves insufficient.
 - **Cross-boot / container PID-namespace** liveness edge cases inherit M20's three-valued
   `unknown` handling unchanged (and the lease only *supplements* the `unknown` case).
+- **Reaper touched/ready-projects-only inheritance (Fable gate).** `ReapExpiredSupervisorLeases`
+  runs per *ready* project on the daemon reaper loop, inheriting D1/D2's touched-projects-only
+  scope: a never-touched-since-restart project's supervisor lease is not swept until the project
+  is readied. In practice a supervisor's own claim readies the project (a live run is always a
+  touched project), so the gap is benign for active runs; the cross-cutting startup registry
+  discovery that would close it is the same deferred item as D1/D2's reaper/flusher. Stated.
 
 ## 7. Sol build-review checklist (seed)
 1. Does mark-lost fire on ANY signal other than `processDead` + positively-empty scope? (must not.)
