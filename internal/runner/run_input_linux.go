@@ -13,6 +13,7 @@ import (
 
 const (
 	runInputDialTimeout      = 2 * time.Second
+	runInputHandshakeTimeout = 2 * time.Second
 	runInputBusyRetryBudget  = time.Second
 	runInputBusyRetryBackoff = 10 * time.Millisecond
 )
@@ -131,19 +132,24 @@ func (r *Runner) connectRunInput(ctx context.Context, path string, request RunIn
 	if err != nil {
 		return nil, err
 	}
-	now := r.now
-	if now == nil {
-		now = time.Now
-	}
-	deadline := now().Add(runInputBusyRetryBudget)
+	// The retry budget uses REAL monotonic time (not the injectable r.now): a
+	// frozen logical test clock must never loop the retry forever (Sol build r1).
+	deadline := time.Now().Add(runInputBusyRetryBudget)
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		conn, dialErr := dial(ctx, path)
 		if dialErr != nil {
 			return nil, &RunInputError{Code: "E_RUN_INPUT_UNREACHABLE", Err: dialErr}
 		}
-		if err := writeRunInputFrame(conn, runInputOpHello, hello); err != nil {
+		// Bound the HELLO handshake so a silent/wedged peer cannot hang the client;
+		// cleared before streaming (which is backpressure-driven, not deadline-bound).
+		_ = conn.SetDeadline(time.Now().Add(runInputHandshakeTimeout))
+		writeErr := writeRunInputFrame(conn, runInputOpHello, hello)
+		if writeErr != nil {
 			_ = conn.Close()
-			return nil, &RunInputError{Code: "E_RUN_INPUT_OUTCOME_UNKNOWN", Err: err}
+			return nil, &RunInputError{Code: "E_RUN_INPUT_OUTCOME_UNKNOWN", Err: writeErr}
 		}
 		committed, respErr := readRunInputResponse(conn, 0)
 		if respErr == nil {
@@ -151,11 +157,12 @@ func (r *Runner) connectRunInput(ctx context.Context, path string, request RunIn
 				_ = conn.Close()
 				return nil, runInputProtocolError("HELLO ACK was nonzero")
 			}
+			_ = conn.SetDeadline(time.Time{})
 			return conn, nil
 		}
 		_ = conn.Close()
 		var inputErr *RunInputError
-		if !errors.As(respErr, &inputErr) || inputErr.Code != "E_RUN_INPUT_BUSY" || !now().Before(deadline) {
+		if !errors.As(respErr, &inputErr) || inputErr.Code != "E_RUN_INPUT_BUSY" || !time.Now().Before(deadline) {
 			return nil, respErr
 		}
 		select {

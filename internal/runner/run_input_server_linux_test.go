@@ -11,10 +11,92 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 )
+
+func runInputConnectRecord(t *testing.T, r *Runner) {
+	t.Helper()
+	appendRunEvent(t, r, "running", RunRecord{
+		SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusRunning, Detached: true,
+		StdinConnect: true, InputSocket: "/run-input-seam.sock", Owner: r.owner,
+	})
+}
+
+// TestRunInputClientRetriesTransientBusyOnceWithoutResending proves a transient
+// BUSY (a racing slot release) is retried and succeeds WITHOUT resending data:
+// the first HELLO is answered BUSY, the second is served fully (Sol build r1 P2).
+func TestRunInputClientRetriesTransientBusyOnceWithoutResending(t *testing.T) {
+	r, _ := newMemoryRunner(t, nil)
+	r.owner = "owner"
+	runInputConnectRecord(t, r)
+	var attempts atomic.Int32
+	r.inputDialFn = func(context.Context, string) (net.Conn, error) {
+		client, server := net.Pipe()
+		attempt := attempts.Add(1)
+		go func() {
+			defer server.Close()
+			if op, _, err := readRunInputFrame(server); err != nil || op != runInputOpHello {
+				return
+			}
+			if attempt == 1 {
+				_ = writeRunInputError(server, "E_RUN_INPUT_BUSY", 0, "busy")
+				return
+			}
+			_ = writeRunInputFrame(server, runInputOpAck, encodeRunInputAck(0))
+			var committed int64
+			for {
+				op, payload, err := readRunInputFrame(server)
+				if err != nil {
+					return
+				}
+				switch op {
+				case runInputOpData:
+					committed += int64(len(payload))
+					_ = writeRunInputFrame(server, runInputOpAck, encodeRunInputAck(committed))
+				case runInputOpClose:
+					_ = writeRunInputFrame(server, runInputOpAck, encodeRunInputAck(committed))
+					return
+				}
+			}
+		}()
+		return client, nil
+	}
+	res, err := r.Input(context.Background(), RunInputRequest{RunID: "RUN-1", Reader: bytes.NewReader([]byte("hello")), Close: true})
+	if err != nil || res.Accepted != 5 || !res.Closed || attempts.Load() != 2 {
+		t.Fatalf("res=%+v err=%v attempts=%d", res, err, attempts.Load())
+	}
+}
+
+// TestRunInputClientGenuineBusyTerminatesAtBudget proves a persistently busy run
+// is reported honestly after the bounded retry budget, not looped forever.
+func TestRunInputClientGenuineBusyTerminatesAtBudget(t *testing.T) {
+	r, _ := newMemoryRunner(t, nil)
+	r.owner = "owner"
+	runInputConnectRecord(t, r)
+	r.inputDialFn = func(context.Context, string) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			if op, _, err := readRunInputFrame(server); err != nil || op != runInputOpHello {
+				return
+			}
+			_ = writeRunInputError(server, "E_RUN_INPUT_BUSY", 0, "busy")
+		}()
+		return client, nil
+	}
+	start := time.Now()
+	_, err := r.Input(context.Background(), RunInputRequest{RunID: "RUN-1", Reader: bytes.NewReader([]byte("x"))})
+	var inputErr *RunInputError
+	if !errors.As(err, &inputErr) || inputErr.Code != "E_RUN_INPUT_BUSY" {
+		t.Fatalf("genuine busy err=%v", err)
+	}
+	if elapsed := time.Since(start); elapsed < runInputBusyRetryBudget || elapsed > 3*time.Second {
+		t.Fatalf("busy budget elapsed=%v (want ~%v, bounded)", elapsed, runInputBusyRetryBudget)
+	}
+}
 
 func TestRunInputClientDroppedBeforeFinalACKIsOutcomeUnknownWithoutRetry(t *testing.T) {
 	r, _ := newMemoryRunner(t, nil)
@@ -285,11 +367,35 @@ func dialRunInputRawHello(t *testing.T, path string, hello runInputHello) *net.U
 
 func dialRunInputHello(t *testing.T, path string, hello runInputHello) *net.UnixConn {
 	t.Helper()
-	conn := dialRunInputRawHello(t, path, hello)
-	if committed := mustRunInputACK(t, conn); committed != 0 {
-		t.Fatalf("HELLO ACK=%d", committed)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		conn := dialRunInputRawHello(t, path, hello)
+		op, payload, err := readRunInputFrame(conn)
+		if err != nil {
+			t.Fatalf("HELLO response op=%d err=%v", op, err)
+		}
+		if op == runInputOpAck {
+			committed, decErr := decodeRunInputAck(payload)
+			if decErr != nil || committed != 0 {
+				t.Fatalf("HELLO ACK=%d err=%v", committed, decErr)
+			}
+			return conn
+		}
+		if op == runInputOpError {
+			wireErr := decodeRunInputWireError(payload)
+			var inputErr *RunInputError
+			// A sequential reconnect can transiently race the prior handler's
+			// single-writer-slot release; BUSY commits zero bytes, so retry it
+			// within a bounded budget (raw prompt-BUSY tests connect directly).
+			if errors.As(wireErr, &inputErr) && inputErr.Code == "E_RUN_INPUT_BUSY" && time.Now().Before(deadline) {
+				_ = conn.Close()
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
+			t.Fatalf("HELLO error: %v", wireErr)
+		}
+		t.Fatalf("unexpected HELLO response op=%d", op)
 	}
-	return conn
 }
 
 func mustRunInputACK(t *testing.T, reader io.Reader) int64 {

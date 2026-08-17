@@ -756,11 +756,22 @@ func TestRunInputRealDescendantReceivesEOFAfterLeaderExit(t *testing.T) {
 	}
 	r := realRunner(t)
 	r.inputRuntimeDir = newRunInputRuntimeDir(t)
+	started := time.Now()
 	_, result := startRealDetached(t, r, Request{Argv: []string{python, "-c", "import os,sys\nif os.fork():\n os._exit(0)\nsys.stdin.read()"}, StdinConnect: true})
 	select {
 	case outcome := <-result:
-		if outcome.err != nil || outcome.record == nil || !outcome.record.Status.Terminal() {
+		// The descendant must drain via EOF (leader-exit closes inputW BEFORE
+		// waitEmpty) and exit CLEANLY — NOT be force-quiesced. A late-inputW-close
+		// impl would block the descendant, force-kill it, and still reach a terminal
+		// state, so the discriminator is the absence of forced quiescence (Sol build r1).
+		if outcome.err != nil || outcome.record == nil || outcome.record.Status != StatusExited {
 			t.Fatalf("descendant EOF outcome=%+v", outcome)
+		}
+		if outcome.record.QuiesceForced || containsString(outcome.record.ErrorCodes, "U_RUN_QUIESCE_FORCED") {
+			t.Fatalf("descendant was force-quiesced, not EOF-drained: %+v", outcome.record)
+		}
+		if elapsed := time.Since(started); elapsed >= r.grace {
+			t.Fatalf("descendant terminated only after the quiescence grace (%s); inputW closed late", elapsed)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("leader-exit input close did not release the descendant")
