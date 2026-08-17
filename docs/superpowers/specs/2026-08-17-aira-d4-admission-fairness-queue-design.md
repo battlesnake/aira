@@ -1,6 +1,6 @@
 # AIRA D4 — daemon cross-session admission fairness-queue
 
-**Status:** DRAFT v3 (Sol plan-review r1 8 → r2 4 findings; all folded)
+**Status:** DRAFT v4 (Sol plan-review r1 8 → r2 4 → r3 4 findings; all folded)
 **Branch:** `codex-aira-d4` · **Base:** master `1cf83f2` (D3 merged)
 **Depends on:** #29 part 1 (per-process memory admission — the mechanism this fair-queues **and
 retains as the daemon-down fallback**), M21 (mandatory daemon), D3 (held-connection + peer-close +
@@ -43,6 +43,16 @@ fencing/leases (a shared fence cannot represent the daemon's *multiple* concurre
 and the transition window is already advisory); the alternative — no fallback — is a worse
 un-gated stampede. This degradation is stated, not hidden.
 
+**One more advisory window, daemon-up (Sol r3 #2):** if the daemon commits+writes a grant but the
+client reads only a **partial** frame before its deadline (§3.2) and falls back to the flock, the
+run launches via the flock **while the daemon still holds its reservation** (until it observes the
+close). The reservation is *conservative* (it accounts the memory the run then uses), so this does
+not over-grant *others*; but on the client's close→daemon-release the grant→materialise window is
+**extended by the fallback latency** (flock poll+lock+`Start`), a slightly longer advisory window
+than the normal grant→`Start`. So strict accounting is not perfect even with the daemon up; it is
+advisory across this (rare) partial-frame path too — documented, not hidden. Delaying fallback
+until a release-ack would need a protocol round-trip and is not worth it for a rare path.
+
 ### 2.2 The grant rule (fair + concurrent, strict FIFO, no jump-ahead)
 Per slice the daemon keeps an ordered **waiter list** (FIFO by a per-slice monotonic arrival seq
 assigned under the registry lock, so concurrent enqueues get a total order) and a set of
@@ -56,38 +66,39 @@ reservation state and walks the waiter list **from the front**, granting each wa
 - **Concurrent when memory allows:** the longest fitting FIFO *prefix* is granted, not one-at-a-
   time.
 
-### 2.3 Atomic, generation-fenced, single-writer evaluation (Sol r1 #2/#4, r2 #2)
-Each slice queue has **one serialised evaluator goroutine**; enqueue, release, timeout, and the
-poll ticker feed it. Coalescing uses a **generation counter**, not a bare dirty flag (which has a
-set-while-clearing missed-wake): the slice's `gen` is bumped **under the registry lock** on every
-waiter/reservation change. The evaluator loop is: (a) under the lock, read `gen0` and snapshot the
-front waiters; (b) **outside** the lock, read the slice's live `memory.current`/`memory.max` (I/O);
-(c) **under the lock again**, if `gen != gen0` **discard and re-loop** (a release/enqueue happened
-during the read — the memory sample and the reservation set would be inconsistent, the exact
-double-spend Sol r2 #2 flags: a release drops Σ while the pre-release `current` doesn't yet reflect
-the started process); else compute `available = (max - current) - Σ(outstanding)` with **checked
-arithmetic**, walk the front prefix, commit the fitting grants (§2.3.1), and atomically mark the
-work done for this generation. This makes the memory sample and the reservation set a **consistent
-snapshot**; no two triggers grant against the same free memory. The lock is never held across the
-memory read or a frame write.
+### 2.3 Atomic, progress-guaranteed evaluation (Sol r1 #2/#4, r2 #2, r3 #1)
+Each slice queue has **one serialised evaluator**, triggered by enqueue, release, timeout, and the
+poll ticker (coalesced by a one-shot "kick": a buffered-1 channel drained per evaluation, so a
+trigger during an evaluation re-runs it exactly once — no set-while-clearing missed wake). The
+whole step — **read `memory.current`/`memory.max`, compute `available`, walk+commit the front
+prefix** — runs **holding the per-slice evaluation lock** (Sol r3 #1). The generation-fence /
+read-outside-the-lock scheme is dropped: it could **livelock** (continuous churn changes `gen`
+every read so a grant never commits), and a cgroup `memory.current` read is a fast local
+pseudo-file read (sub-ms), so holding the per-slice lock across it is bounded and makes the memory
+sample and the reservation set an **atomic, consistent snapshot** by construction — no stale-
+sample double-spend, guaranteed forward progress. (The per-slice lock scopes the blast radius to
+one slice; the registry map has its own brief lock.) `available = (max - current) - Σ(outstanding)`
+uses **checked arithmetic** (clamp negatives to 0); the front prefix is granted per §2.2.
 
-#### 2.3.1 Single-owner delivery — the grant/write/close race (Sol r1 #4, r2 #3)
-Every waiter has **exactly one owner: its admit-handler goroutine** (the one serving the
-connection). Peer-close monitoring starts at **enqueue**. The lifecycle
-`queued → granted → released` is owned end-to-end by the handler so grant-commit, frame-write, and
-peer-close cannot interleave destructively:
-- The **evaluator** only transitions `queued → granted` **under the lock** (insert the reservation,
-  bump `gen`) and hands the waiter to its owner via a buffered, non-blocking signal. It never
-  writes a frame and never releases.
-- The **handler** then writes the one grant frame (with a write deadline). On **write success** it
-  holds for peer-close, then releases. On **write failure / partial write** it releases
-  immediately (never leave a reserved-but-undelivered grant). All exit conditions — grant-close,
-  write-fail, `max_wait`, `ctx`/peer-close, shutdown — funnel through the **same idempotent
-  `release`** in the handler (remove reservation if `granted`, remove waiter, mark `released`, bump
-  `gen`, wake the evaluator). Because release is single-owner, a peer-close that fires *between* the
-  evaluator's commit and the handler's write does **not** independently release: it just cancels
-  the handler's held state, and the handler's write (to the now-dead socket) fails → the handler
-  releases once. A waiter is granted ≤ once and released ≤ once; **no write occurs after release**.
+#### 2.3.1 Single-owner delivery via a one-shot signal (Sol r1 #4, r2 #3, r3 #4)
+Every waiter has **exactly one owner: its admit-handler goroutine**; peer-close monitoring starts
+at **enqueue**; the lifecycle `queued → granted → released` is owned end-to-end by the handler.
+- Each waiter carries an initially-open `grantedCh`. The **evaluator**, under the per-slice lock,
+  transitions `queued → granted`, inserts the reservation, and **`close(grantedCh)`** — a
+  **one-shot signal that can never be dropped** (a closed channel is always readable; the handler
+  is already blocked in its `select` from enqueue, so the grant is never lost — Sol r3 #4). The
+  evaluator never writes a frame and never releases.
+- The **handler** selects on `{grantedCh, deadlineTimer, ctx/peer-close, s.stopping}`. On
+  `grantedCh` it writes the one grant frame (write deadline); **write success** → hold for
+  peer-close → release; **write failure / partial write** → release immediately. Every exit —
+  grant-close, write-fail, `max_wait`, peer-close, shutdown-cancel — funnels through the handler's
+  **single idempotent `release`** (remove the reservation if `granted`, remove the waiter, kick the
+  evaluator). A peer-close firing between the evaluator's commit and the handler's write does
+  **not** independently release; it cancels the handler's held state, the write to the dead socket
+  fails, and the handler releases **once**. A waiter is granted ≤ once, released ≤ once, and **no
+  write occurs after release**. A committed reservation always has its owning handler alive to
+  deliver-or-release it (the handler exists for the connection's whole life), so a grant is never
+  leaked.
 
 ### 2.4 Reservation lifecycle & crash-recovery honesty (Sol r1 #3)
 A reservation bridges **grant → the granted process's memory appearing in `memory.current`**, so
@@ -118,10 +129,14 @@ backstop, **not** by strict accounting — and is the honest cost of not persist
   timeout is an honest bypass (a run that waited too long launches unfairly-but-not-stranded), so
   a later waiter with a shorter `max_wait` **can** launch before an earlier one — stated plainly,
   and tested with unequal deadlines.
-- **Shutdown:** on `s.stopping` the daemon **closes all admit connections server-side and clears
-  the registry exactly once** (Sol r1 #7); queued clients see EOF → they fail over (fallback/
-  `unevaluated`); already-granted clients (launching) simply proceed. `Serve` drains without the
-  process-terminal path.
+- **Shutdown (single-owner-preserving; Sol r1 #7, r3 #3):** on `s.stopping` the daemon does **not**
+  release reservations directly (that would be a second owner racing the handler). It **cancels/
+  closes each admit connection**, and **each handler performs its own sole idempotent release** on
+  the resulting peer-close/`s.stopping` wake; only **after** the handlers have drained does the
+  daemon prune the (now-empty) registry entries. So "no write after release" and single-ownership
+  hold through shutdown. Queued clients see EOF → they fail over (fallback/`unevaluated`);
+  already-granted clients (launching) simply proceed. `Serve` drains without the process-terminal
+  path (the handlers' release is prompt: bounded write deadline + peer-close).
 - **Daemon unavailable / a lost or wedged response:** the **client** never blocks indefinitely
   (Sol r1 #1) — its admit read carries a **client-side deadline = `max_wait` + a bounded transport
   grace**; on expiry it closes the socket and takes the fallback (flock), else `unevaluated`. So
@@ -150,12 +165,15 @@ Daemon flow:
 ### 3.2 The client (`internal/runner` admit path)
 `Runner.admit` reroutes: it dials the daemon admit (via an injected `admitDialFn` seam so queue
 tests stay hermetic), sends the request, and reads the single grant frame **under a client-side
-deadline** (§2.5). **Exactly-one-outcome rule (Sol r2 #3):** a **complete, validated** grant frame
-**wins** even if it arrives coincident with the client deadline (the client checks "did a full
-frame arrive?" before treating a deadline as failure) → the run is `granted`, holds the connection,
-and **never also takes the flock** (no double-launch). Only if **no** complete frame arrived
-(deadline with nothing/partial, EOF-before-grant, `E_DAEMON_BUSY`, or any daemon-admit failure)
-does the client **close the socket first, then enter exactly one fallback path** — the #29 flock
+deadline** (§2.5). **Exactly-one-outcome rule + framing (Sol r2 #3, r3 #4):** the grant frame is a bounded
+length-prefix read via **`io.ReadFull` for the header and the payload**, and **only a fully-read,
+JSON-validated frame counts as "granted"** — such a complete frame **wins** even if it arrives
+coincident with the client deadline (the client checks "did a full valid frame arrive?" before
+treating the deadline as failure) → the run is `granted`, holds the connection, and **never also
+takes the flock** (no double-launch). Any **partial** bytes at the deadline (an `io.ReadFull`
+short read), nothing at all, `EOF`-before-grant, `E_DAEMON_BUSY`, or any daemon-admit failure are
+**discarded**, and the client **closes the socket first, then enters exactly one fallback path** —
+the #29 flock
 self-gating (§2.1); if the fallback is itself unevaluable, launch `unevaluated`. On a grant it
 returns `admissionResult{state, reason, waitedMS, release: conn}`; the call sites
 (`runner_linux.go:241`, `detach_linux.go:194`) keep the handle and **close it right after `Start`**
@@ -220,11 +238,12 @@ Queue/evaluator logic (sandbox-runnable):
    re-eval timing; a fourth mid-stream goes to the back.
 2. **Prefix concurrency:** memory fits A+B not C → A,B granted together; C waits for a release.
 3. **No jump-ahead:** a large non-fitting front A blocks a small B behind it until A is granted.
-4. **Reservation accounting / no double-spend + generation fence (Sol r2 #2):** grant A (reserve
-   R); B needing R is not granted until A releases even though raw `max-current` looked sufficient;
-   and a **release that lands between the evaluator's memory read and its commit** (a `gen`-change
-   seam) forces a re-read — the commit never uses a pre-release `current` with a post-release Σ
-   (the exact stale-snapshot double-spend). Concurrent release+enqueue+ticker never double-grants.
+4. **Reservation accounting / no double-spend + progress (Sol r2 #2, r3 #1):** grant A (reserve R);
+   B needing R is not granted until A releases even though raw `max-current` looked sufficient;
+   a **concurrent release+enqueue+ticker** never double-grants (the read+compute+commit is atomic
+   under the per-slice lock — one memory sample and the reservation set are always consistent); and
+   under **sustained churn** the evaluator still **makes progress** (grants the fitting front within
+   bounded time — no livelock, unlike a re-read-on-generation-change scheme).
 5. **Release on close frees the next** within a poll interval (peer-close).
 6. **Death while queued dequeues** (never granted); **death after grant before release** frees the
    reservation; **a failed/partial grant write releases immediately** (seam). **Close-between-
@@ -234,8 +253,15 @@ Queue/evaluator logic (sandbox-runnable):
 7. **Timeout is a labelled bypass with unequal deadlines (Sol r1 #5):** a short-`max_wait` waiter
    behind a long-`max_wait` non-fitting front is granted `timeout` first; a grant/timeout race
    never both-grants-and-times-out one waiter.
-8. **Unevaluated** (unresolvable/unreadable) immediate, no enqueue; **shutdown** closes all admit
-   connections + clears the registry once, queued→EOF, `Serve` drains without `DrainTimeout`.
+7b. **One-shot handoff not dropped (Sol r3 #4):** the evaluator's `close(grantedCh)` grant is
+    always observed by the waiting handler (even if the evaluator grants before the handler re-enters
+    its select) — a committed reservation is never left with no owner to deliver/release it.
+7c. **Shutdown preserves single ownership (Sol r3 #3):** on `s.stopping` each handler performs its
+    own release (the daemon does not release directly); a grant committed just before shutdown is
+    delivered-or-released exactly once by its handler; the registry is pruned only after handlers drain.
+8. **Unevaluated** (unresolvable/unreadable) immediate, no enqueue; **shutdown** cancels all admit
+   connections (handlers self-release, then registry pruned — §7c), queued→EOF, `Serve` drains
+   without `DrainTimeout`.
 9. **Bounds/validation:** global + per-slice cap → `E_DAEMON_BUSY`; hostile reserve/max_wait
    rejected/clamped; empty registry entries pruned.
 10. **Byte-identical `admission` state** on the run record across every path.
