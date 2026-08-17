@@ -1,6 +1,6 @@
 # D5 — Fenced supervisor lease + shim-via-daemon (design / plan)
 
-**Status:** v4 — folds Sol plan-review r3 (4 findings, all folded). For Sol r4.
+**Status:** v5 — folds Sol plan-review r4 (2 findings, all folded). For Sol r5.
 **Milestone:** Phase 5 · D5 (task #41). Follows D1–D4 (all merged; master `dc7dc35`).
 **Loop:** plan → Sol plan-review (rounds → APPROVE-PLAN) → Fable plan-gate → Terra build →
 Opus real-HW verify → Sol build-review (rounds → RESOLVED) → merge. Correctness-critical
@@ -98,6 +98,17 @@ it never rotates the token mid-claim. The daemon `ClaimSupervisorLease` is **tra
 So an ambiguous timeout is retried with the *identical* retained token (case 2 recovers the
 committed generation); only a **definite pre-send dial failure** or **exhausted idempotent
 retries** falls to advisory-leaseless, still holding the same token for the next cadence re-claim.
+
+**Renew semantics — an expired `held` row is NEVER renewed (Sol r4).** `RenewSupervisorLease`
+mirrors the ticket-lease `Heartbeat` (`lease.go:479-540`) exactly: sample the clock AFTER
+`BEGIN IMMEDIATE`, and the UPDATE CAS requires the **exact live predicate** — `state='held' AND
+generation=? AND holder_token_hash=? AND boot_id=? AND ? >= last_heartbeat_mono_ns AND ? -
+last_heartbeat_mono_ns < ttl_ns`. A `held`-but-EXPIRED row (TTL elapsed but the reaper has not yet
+lapped it) therefore matches ZERO rows → returns **`expired`** WITHOUT updating; a stale/reaped
+generation returns **`fenced`**; a wrong token returns **`token`**. In every one of these the
+renew loop DROPS to a **re-claim** (§2.3 reacquire), which advances `generation` (case 1) — so an
+expired lease can NEVER be revived in place at its old generation. This closes the
+renew-before-reap revival window (a renew must not resurrect an expired lease).
 
 **Claim/renew/release failure classification — degrade ONLY on proven unreachability:**
 
@@ -274,9 +285,11 @@ R4. scope == EMPTY (no exit evidence) — the ONLY rule that consults liveness:
 **Derived invariants (the matrix `proc{alive,dead,unknown}` × `lease{held-live, held-expired,
 lapsed, absent, wrong-boot, malformed, read-error}` × `scope{empty, nonempty, absent,
 uninspectable}` × `leader-exit{yes,no}` is enumerated in the tests from THIS algorithm):**
-(a) mark-lost occurs ONLY at R1-pre-scope or R4 on `proc == processDead` AND positively-`EMPTY`
-scope — a lapsed/absent/expired/malformed/errored lease NEVER finalizes; (b) `LeaderExitObserved`
-+ `EMPTY` finalizes from the real exit regardless of lease; (c) the lease is consulted at exactly
+(a) **synthesizing `lost`** occurs ONLY at R4 on `proc == processDead` AND positively-`EMPTY`
+scope — R1 (uninspectable) never finalizes, and a lapsed/absent/expired/malformed/errored lease
+NEVER finalizes; (b) **finalizing from real evidence** occurs ONLY at R2 (`LeaderExitObserved`
++ `EMPTY`), regardless of lease — these are two distinct terminalization paths and neither is
+triggered by lease state; (c) the lease is consulted at exactly
 ONE point (R4 / `processUnknown`) and can only *upgrade* the preserve reason to
 "recent-heartbeat", never change a preserve into a finalize; (d) a `held-live` lease attests a
 recent heartbeat, NOT current liveness — sound because `unknown` cannot finalize anyway. The
@@ -321,8 +334,11 @@ When D7b relays these reads through the daemon, they follow; D5 does not require
 ---
 
 ## 4. Invariants (Sol plan-review + build-review check both directions)
-1. **Only `/proc processDead` finalizes.** A lapsed/absent/expired/malformed/errored lease NEVER
-   marks a run `lost` and never fabricates an exit. `processUnknown` never finalizes.
+1. **Two distinct terminalization paths, neither lease-triggered.** Synthesizing `lost` (no exit
+   code) occurs ONLY on `proc == processDead` AND positively-EMPTY scope (R4). Finalizing from
+   real evidence (the leader's actual exit) occurs ONLY on `LeaderExitObserved` AND EMPTY scope
+   (R2). A lapsed/absent/expired/malformed/errored lease NEVER marks `lost`, never finalizes, and
+   never fabricates an exit; `processUnknown` and UNINSPECTABLE scope never finalize.
 2. **Lease read error → `unknown`, never `absent`** (so a read fault cannot become a death signal).
 3. **Single writer (lease).** Only the daemon mutates `supervisor_leases`; the supervisor never
    writes it directly (daemon-down → leaseless, not a direct write).
@@ -353,7 +369,9 @@ When D7b relays these reads through the daemon, they follow; D5 does not require
 ## 5. Tests (discriminators — must FAIL against the wrong impl; [[two-loop-porous-tests]])
 - **Store (real, `-race`):** claim→renew→release; renew after a fenced generation bump FAILS
   (`ErrLeaseFenced`); renew/release with a WRONG capability FAILS (`ErrLeaseToken`) even with a
-  correct generation (forged-PIDIdentity discriminator); a stale holder CANNOT alter/release the
+  correct generation (forged-PIDIdentity discriminator); **renew of a `held`-but-EXPIRED row (TTL
+  elapsed, not yet reaped) returns `expired` WITHOUT updating — cannot revive the old generation
+  in place (Sol r4 discriminator);** a stale holder CANNOT alter/release the
   CURRENT lease record (lease-record-fence discriminator, Sol r2); **idempotent claim** — a
   re-claim with the identical `{PIDIdentity, token_hash}` returns the existing generation (no-op),
   a claim with a DIFFERENT identity → conflict (Sol r2); reap laps an expired supervisor lease
