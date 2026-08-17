@@ -163,6 +163,10 @@ type Store struct {
 	// both nil; tests use them to prove clock-after-lock and the reap CAS race.
 	afterSupervisorLeaseBegin func()
 	beforeSupervisorReapCAS   func(string)
+	// afterSupervisorReapBegin fires inside each reaping transaction, after the
+	// writer lock is held and before the clock is re-sampled; tests use it to
+	// prove the reap CAS samples the clock under the lock. Production leaves nil.
+	afterSupervisorReapBegin func()
 	// afterJournalFlushEvent is a test-only cancellation seam between
 	// successfully journaled events; production leaves it nil.
 	afterJournalFlushEvent func(EventKey)

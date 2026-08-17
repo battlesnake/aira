@@ -445,6 +445,9 @@ func (s *Store) ReapExpiredSupervisorLeases(ctx context.Context) (int, error) {
 		changed := false
 		nextGeneration := candidate.generation + 1
 		err := s.withImmediate(ctx, func(conn *sql.Conn) error {
+			if s.afterSupervisorReapBegin != nil {
+				s.afterSupervisorReapBegin()
+			}
 			// Re-sample the clock AFTER BEGIN IMMEDIATE owns the writer lock (Sol
 			// build r1 P1): the sweep sample chose the candidate, but the reaping
 			// CAS must decide expiry against a clock taken under the lock, so a

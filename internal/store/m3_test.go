@@ -51,6 +51,7 @@ type lockAwareClock struct {
 	liveMono      uint64
 	lockAcquired  *atomic.Bool
 	sampledBefore *atomic.Bool
+	sampledAfter  *atomic.Bool
 }
 
 func (c *lockAwareClock) Now() (string, uint64, error) {
@@ -59,6 +60,9 @@ func (c *lockAwareClock) Now() (string, uint64, error) {
 			c.sampledBefore.Store(true)
 		}
 		return c.boot, c.staleMono, nil
+	}
+	if c.sampledAfter != nil {
+		c.sampledAfter.Store(true)
 	}
 	return c.boot, c.liveMono, nil
 }

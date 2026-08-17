@@ -169,6 +169,19 @@ func TestSupervisorLeasePeerPIDMismatchRejected(t *testing.T) {
 	if after.Generation != before.Generation || after.LastHeartbeatMonoNS != before.LastHeartbeatMonoNS || after.HolderPID != before.HolderPID {
 		t.Fatalf("wrong-peer-pid renew mutated the lease: before=%+v after=%+v", before, after)
 	}
+	release := exchange(os.Getpid()+1, core.Request{Verb: "supervise-lease-release", Args: map[string]any{
+		"run_id": "RUN-1", "generation": generation, "token": token,
+	}})
+	if release.OK || release.Code != CodeProtocol {
+		t.Fatalf("wrong-peer-pid release response=%+v", release)
+	}
+	afterRelease, err := view.GetSupervisorLease(context.Background(), "RUN-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterRelease.State != store.SupervisorLeaseHeld || afterRelease.Generation != before.Generation || afterRelease.HolderPID != before.HolderPID {
+		t.Fatalf("wrong-peer-pid release mutated the held lease: before=%+v after=%+v", before, afterRelease)
+	}
 }
 
 func TestSupervisorLeaseDaemonReaperTimerLapsesExpired(t *testing.T) {

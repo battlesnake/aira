@@ -178,6 +178,30 @@ func TestSupervisorLeaseReapLapsesAndSkipsRevived(t *testing.T) {
 	}
 }
 
+// TestSupervisorLeaseReapSamplesClockUnderLock proves the reaping CAS re-samples
+// the clock AFTER BEGIN IMMEDIATE holds the writer lock (Sol build r1 P1). The
+// lock-aware clock records a sample taken while the reap lock is held; the old
+// pre-lock-only implementation never sampled under the lock, so it fails this.
+func TestSupervisorLeaseReapSamplesClockUnderLock(t *testing.T) {
+	s, clock, _ := m3Store(t)
+	_, hash := supervisorToken(11)
+	if _, _, err := s.ClaimSupervisorLease(context.Background(), "RUN-7", 71, 72, clock.boot, hash, 100); err != nil {
+		t.Fatal(err)
+	}
+	var lockAcquired, sampledAfter atomic.Bool
+	// Both the pre-lock sweep sample (500) and the under-lock CAS sample (600) are
+	// far past expiry, so the reap fires AND reaches the under-lock re-sample.
+	s.clock = &lockAwareClock{boot: clock.boot, staleMono: 500, liveMono: 600, lockAcquired: &lockAcquired, sampledAfter: &sampledAfter}
+	s.afterSupervisorReapBegin = func() { lockAcquired.Store(true) }
+	count, err := s.ReapExpiredSupervisorLeases(context.Background())
+	if err != nil || count != 1 {
+		t.Fatalf("reap count=%d err=%v", count, err)
+	}
+	if !sampledAfter.Load() {
+		t.Fatal("reaping CAS did not sample the clock under the writer lock")
+	}
+}
+
 func TestSupervisorLeaseConcurrentClaimHasOneWinner(t *testing.T) {
 	s, clock, base := m3Store(t)
 	open := func(worktree string) *Store {

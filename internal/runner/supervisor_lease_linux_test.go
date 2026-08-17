@@ -5,8 +5,10 @@ package runner
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -143,13 +145,74 @@ func TestSupervisorLeaseUnhealthyRetriesUntilDurable(t *testing.T) {
 	if !manager.unhealthy {
 		t.Fatal("pending-health flag was cleared despite the append failure")
 	}
-	manager.flushUnhealthy()
+	// The NEXT cadence must AUTOMATICALLY flush the pending diagnostic (this test
+	// never calls flushUnhealthy directly, so it fails if the cadence auto-retry
+	// is removed). Make the renew merely unreachable so no NEW fault is raised.
+	r.supervisorLeaseRenewFn = func(context.Context, string, int64, string) (string, error) {
+		return "", &supervisorLeaseRouteError{kind: supervisorLeaseDialFailure, err: errors.New("daemon down")}
+	}
+	manager.cadence()
 	current, err := r.ledger.current(record.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !containsString(current.ErrorCodes, "U_RUN_SUPERVISOR_LEASE_UNHEALTHY") || manager.unhealthy {
-		t.Fatalf("retry did not durably record the diagnostic: codes=%v pending=%v", current.ErrorCodes, manager.unhealthy)
+		t.Fatalf("cadence auto-retry did not durably record the diagnostic: codes=%v pending=%v", current.ErrorCodes, manager.unhealthy)
+	}
+}
+
+// TestSupervisorLeaseWireIntegersAreExactStrings captures the real request frames
+// and asserts identity integers travel as EXACT decimal strings, so a value above
+// 2^53 keeps byte identity across the daemon's map decode (float64 would lose it —
+// Sol build r1 P1). It fails against numeric encoding.
+func TestSupervisorLeaseWireIntegersAreExactStrings(t *testing.T) {
+	r, err := New(Config{CommonDir: t.TempDir(), Backend: &memoryBackend{scope: &memoryScope{}}, SupervisorLeaseTTL: 60 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.admitSocketPath = "/unused"
+	var mu sync.Mutex
+	var lastArgs map[string]any
+	respond := func(data map[string]any) func(context.Context, string) (net.Conn, error) {
+		return func(context.Context, string) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				defer server.Close()
+				var req runnerAdmitRequestFrame
+				if readRunnerAdmitFrame(server, &req) != nil {
+					return
+				}
+				mu.Lock()
+				lastArgs = req.Request.Args
+				mu.Unlock()
+				payload, _ := json.Marshal(data)
+				_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{OK: true, Code: "OK", Data: payload})
+				var one [1]byte
+				_, _ = server.Read(one[:])
+			}()
+			return client, nil
+		}
+	}
+	const big = uint64(9007199254740993) // 2^53 + 1
+	r.admitDialFn = respond(map[string]any{"generation": 1, "outcome": "claimed"})
+	if _, _, err := r.claimSupervisorLease(context.Background(), supervisorLeaseClaim{RunID: "RUN-1", Identity: PIDIdentity{PID: 123, StartTick: big, BootID: "boot"}, TokenHash: "hash", TTL: 60 * time.Second}); err != nil {
+		t.Fatalf("claim err=%v", err)
+	}
+	mu.Lock()
+	claimArgs := lastArgs
+	mu.Unlock()
+	if claimArgs["start_tick"] != "9007199254740993" {
+		t.Fatalf("start_tick wire value=%#v, want exact decimal string", claimArgs["start_tick"])
+	}
+	r.admitDialFn = respond(map[string]any{"outcome": "ok"})
+	if _, err := r.renewSupervisorLease(context.Background(), "RUN-1", int64(big), "capability"); err != nil {
+		t.Fatalf("renew err=%v", err)
+	}
+	mu.Lock()
+	renewArgs := lastArgs
+	mu.Unlock()
+	if renewArgs["generation"] != "9007199254740993" {
+		t.Fatalf("generation wire value=%#v, want exact decimal string", renewArgs["generation"])
 	}
 }
 
