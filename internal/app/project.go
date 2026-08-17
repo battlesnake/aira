@@ -68,6 +68,7 @@ type RunConfig struct {
 	MemoryHeadroom     string   `json:"memory_headroom,omitempty"`
 	AdmissionMaxWait   string   `json:"admission_max_wait,omitempty"`
 	DetachReadyTimeout string   `json:"detach_ready_timeout,omitempty"`
+	SupervisorLeaseTTL string   `json:"supervisor_lease_ttl,omitempty"`
 	ReportMaxBytes     int64    `json:"report_max_bytes,omitempty"`
 }
 
@@ -240,6 +241,7 @@ func OpenWithDiagnostics(ctx context.Context, cwd string, diagnostics io.Writer)
 		return nil, Project{}, err
 	}
 	s.SetRunner(project.Runner)
+	project.Runner.SetSupervisorLeaseReader(s.SupervisorLeaseLive)
 	return s, project, nil
 }
 
@@ -264,6 +266,14 @@ func BuildWithoutStore(project Project, diagnostics io.Writer) (Project, error) 
 	if err != nil {
 		return Project{}, err
 	}
+	supervisorLeaseTTL, err := parsedSupervisorLeaseTTL(project.Config.Run)
+	if err != nil {
+		return Project{}, err
+	}
+	daemonScope, err := runnerDaemonScope(project)
+	if err != nil {
+		return Project{}, err
+	}
 	execution, err := runner.New(runner.Config{
 		CommonDir:          project.CommonDir,
 		OutputDir:          filepath.Join(project.CommonDir, "aira", "runs", "output"),
@@ -274,6 +284,8 @@ func BuildWithoutStore(project Project, diagnostics io.Writer) (Project, error) 
 		MemoryReserve:      memoryReserve,
 		AdmissionMaxWait:   admissionMaxWait,
 		DetachReadyTimeout: detachReadyTimeout,
+		SupervisorLeaseTTL: supervisorLeaseTTL,
+		DaemonScope:        daemonScope,
 		Diagnostics:        diagnostics,
 		ReportMaxBytes:     project.Config.Run.ReportMaxBytes,
 	})
@@ -476,6 +488,9 @@ func validateConfig(config Config) error {
 	if _, err := parsedDetachReadyTimeout(config.Run); err != nil {
 		return err
 	}
+	if _, err := parsedSupervisorLeaseTTL(config.Run); err != nil {
+		return err
+	}
 	seen := map[string]bool{}
 	for _, prefix := range config.Project.Prefixes {
 		if len(prefix) < 2 || prefix != strings.ToUpper(prefix) {
@@ -577,6 +592,41 @@ func parsedDetachReadyTimeout(config RunConfig) (time.Duration, error) {
 		return 0, errors.New("E_CONFIG_INVALID: run.detach_ready_timeout must be a positive duration")
 	}
 	return timeout, nil
+}
+
+func parsedSupervisorLeaseTTL(config RunConfig) (time.Duration, error) {
+	value := strings.TrimSpace(config.SupervisorLeaseTTL)
+	if value == "" {
+		return 120 * time.Second, nil
+	}
+	ttl, err := time.ParseDuration(value)
+	if err != nil || ttl < 60*time.Second || !runner.ValidSupervisorLeaseTTL(ttl) {
+		return 0, errors.New("E_CONFIG_INVALID: run.supervisor_lease_ttl violates the supervisor lease timing invariant")
+	}
+	return ttl, nil
+}
+
+func runnerDaemonScope(project Project) (map[string]any, error) {
+	reviewPolicy, err := store.LoadReviewPolicy(project.Config.Project.Review)
+	if err != nil {
+		return nil, err
+	}
+	configBytes, err := json.Marshal(project.Config)
+	if err != nil {
+		return nil, err
+	}
+	digest := sha256.Sum256(configBytes)
+	return map[string]any{
+		"root": project.Root, "common_dir": project.CommonDir, "git_dir": project.GitDir,
+		"project_id": project.ProjectID, "worktree_id": project.WorktreeID,
+		"slug": project.Config.Project.Slug, "prefixes": project.Config.Project.Prefixes,
+		"requirement_prefixes": project.Config.Project.RequirementPrefixes,
+		"review_policy":        reviewPolicy, "review_configured": reviewPolicy.Configured,
+		"max_reports": project.Config.Project.TestReports.MaxReports, "max_age_days": project.Config.Project.TestReports.MaxAgeDays,
+		"max_compute_events": project.Config.Project.Compute.MaxEvents, "max_compute_age_days": project.Config.Project.Compute.MaxAgeDays,
+		"max_quota_snapshots": project.Config.Project.Compute.MaxQuotaSnapshots,
+		"lease_ttl_ns":        leaseTTLNS(project.Config), "config_digest": hex.EncodeToString(digest[:]),
+	}, nil
 }
 
 func parseByteCount(value string) (int64, error) {

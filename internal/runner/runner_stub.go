@@ -20,6 +20,12 @@ type Runner struct {
 }
 
 func New(cfg Config) (*Runner, error) {
+	if cfg.SupervisorLeaseTTL == 0 {
+		cfg.SupervisorLeaseTTL = defaultSupervisorLeaseTTL
+	}
+	if !ValidSupervisorLeaseTTL(cfg.SupervisorLeaseTTL) {
+		return nil, &LaunchError{Code: "E_CONFIG_INVALID", Err: errors.New("supervisor lease TTL violates the renewal timing invariant")}
+	}
 	if cfg.ReportMaxBytes == 0 {
 		cfg.ReportMaxBytes = DefaultReportMaxBytes
 	}
@@ -42,6 +48,8 @@ func New(cfg Config) (*Runner, error) {
 }
 
 func (r *Runner) ReportMaxBytes() int64 { return r.reportMaxBytes }
+
+func (r *Runner) SetSupervisorLeaseReader(func(context.Context, string) (bool, error)) {}
 
 func nonLinuxRunError() error {
 	return &LaunchError{Code: "E_RUN_SCOPE_UNAVAILABLE", Err: errors.New("cgroup-v2 runner is supported only on Linux")}

@@ -182,6 +182,16 @@ func (r *Runner) launchDetachedValidated(ctx context.Context, req Request, prefi
 	if _, err := r.append(ledgerEvent{Kind: "starting", Run: record}); err != nil {
 		return nil, launchErr("E_RUN_RECONCILE_REQUIRED", err)
 	}
+	supervisorLease, err := r.startSupervisorLease(ctx, record)
+	if err != nil {
+		code := supervisorLeaseErrorCode(err)
+		var typed *LaunchError
+		if errors.As(err, &typed) {
+			code = typed.Code
+		}
+		return r.terminalizeDetachedNoChild(ctx, record, false, code, err)
+	}
+	defer supervisorLease.stopAndRelease()
 	readyErr := req.detachReady.send(detachReadyMessage{ID: id})
 	ack := make([]byte, 1)
 	n, ackErr := req.detachAck.Read(ack)

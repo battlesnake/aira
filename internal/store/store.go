@@ -159,6 +159,10 @@ type Store struct {
 	// beforeReapCAS is a test-only seam between advisory expiry detection and
 	// the guarded reaping transaction; production leaves it nil.
 	beforeReapCAS func(string)
+	// Supervisor-lease equivalents of the D1 lease seams. Production leaves
+	// both nil; tests use them to prove clock-after-lock and the reap CAS race.
+	afterSupervisorLeaseBegin func()
+	beforeSupervisorReapCAS   func(string)
 	// afterJournalFlushEvent is a test-only cancellation seam between
 	// successfully journaled events; production leaves it nil.
 	afterJournalFlushEvent func(EventKey)
@@ -669,6 +673,21 @@ func (s *Store) initDB(ctx context.Context) error {
                     ttl_ns IS NOT NULL AND ttl_ns > 0 AND actor IS NOT NULL AND length(trim(actor)) > 0 AND
                     worktree_id IS NOT NULL AND length(trim(worktree_id)) > 0))
 	        )`,
+		`CREATE TABLE IF NOT EXISTS supervisor_leases (
+			project_id TEXT NOT NULL,
+			run_id TEXT NOT NULL,
+			state TEXT NOT NULL CHECK (state IN ('held','lapsed')),
+			generation INTEGER NOT NULL CHECK (generation >= 1),
+			holder_token_hash TEXT NOT NULL,
+			holder_pid INTEGER NOT NULL,
+			holder_start_tick INTEGER NOT NULL,
+			holder_boot_id TEXT NOT NULL,
+			last_heartbeat_mono_ns INTEGER NOT NULL,
+			ttl_ns INTEGER NOT NULL CHECK (ttl_ns > 0),
+			actor TEXT NOT NULL,
+			worktree_id TEXT NOT NULL,
+			PRIMARY KEY (project_id, run_id)
+		)`,
 		`CREATE TABLE IF NOT EXISTS area_hints (
             project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, worktree_id TEXT NOT NULL,
             generation INTEGER NOT NULL DEFAULT 0, glob TEXT NOT NULL,

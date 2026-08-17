@@ -72,6 +72,7 @@ type Server struct {
 	admitAfter        func(time.Duration) <-chan time.Time
 	admitWriteFrame   func(net.Conn, any) error
 	admitBeforeWrite  func(*admitWaiter)
+	peerCredential    func(net.Conn) (int, int, error)
 }
 
 func NewServer(paths Paths) *Server {
@@ -254,7 +255,12 @@ func (s *Server) reap(ctx context.Context, view *store.Store) (int, error) {
 	if s.reapScope != nil {
 		return s.reapScope(ctx, view)
 	}
-	return view.ReapExpiredLeases(ctx)
+	tickets, err := view.ReapExpiredLeases(ctx)
+	if err != nil {
+		return tickets, err
+	}
+	supervisors, err := view.ReapExpiredSupervisorLeases(ctx)
+	return tickets + supervisors, err
 }
 
 func (s *Server) runReaper(ctx context.Context, interval time.Duration) {
@@ -391,6 +397,13 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		wrote = true
 		_ = conn.SetReadDeadline(time.Time{})
 		s.admitConnection(conn, request.Request.Args)
+		return
+	}
+	if isSupervisorLeaseVerb(verb) {
+		if s.OnRequest != nil {
+			s.OnRequest(request.Scope, request.Request)
+		}
+		wrote = writeFrame(conn, responseFrame(s.supervisorLeaseRequest(ctx, conn, request.Scope, verb, request.Request.Args))) == nil
 		return
 	}
 	if _, route := core.ClassifyRequest(request.Request); route == core.RouteClient {

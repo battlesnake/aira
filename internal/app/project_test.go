@@ -98,6 +98,26 @@ func TestM20DetachReadyTimeoutConfig(t *testing.T) {
 	}
 }
 
+func TestSupervisorLeaseConfig(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  time.Duration
+		ok    bool
+	}{
+		{value: "", want: 120 * time.Second, ok: true},
+		{value: "60s", want: 60 * time.Second, ok: true},
+		{value: "59.999s"},
+		{value: "0s"},
+		{value: "-1s"},
+		{value: "later"},
+	} {
+		got, err := parsedSupervisorLeaseTTL(RunConfig{SupervisorLeaseTTL: test.value})
+		if (err == nil) != test.ok || test.ok && got != test.want {
+			t.Fatalf("ttl %q = %s, err=%v; want %s ok=%v", test.value, got, err, test.want, test.ok)
+		}
+	}
+}
+
 func TestRunAdmissionConfigRejectsMalformedAndHalfConfig(t *testing.T) {
 	for name, run := range map[string]RunConfig{
 		"slice only":          {Slice: "whale.slice"},

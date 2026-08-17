@@ -250,6 +250,25 @@ type Config struct {
 	Diagnostics        io.Writer
 	ReportMaxBytes     int64
 	DetachReadyTimeout time.Duration
+	SupervisorLeaseTTL time.Duration
+	DaemonScope        map[string]any
+}
+
+const (
+	defaultSupervisorLeaseTTL = 120 * time.Second
+	minimumSupervisorLeaseTTL = 60 * time.Second
+)
+
+// ValidSupervisorLeaseTTL enforces the approved ttl/3 cadence budget and the
+// daemon's 30-second reap interval with deterministic ten-percent jitter.
+func ValidSupervisorLeaseTTL(ttl time.Duration) bool {
+	if ttl < minimumSupervisorLeaseTTL {
+		return false
+	}
+	renew := ttl / 3
+	jitter := renew / 10
+	delayBudget := 3*5*time.Second + 1500*time.Millisecond + 10*time.Second + jitter
+	return ttl-renew > delayBudget && ttl > 30*time.Second+jitter
 }
 
 const DefaultReportMaxBytes int64 = 32 << 20

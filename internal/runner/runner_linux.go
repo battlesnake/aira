@@ -23,36 +23,43 @@ import (
 )
 
 type Runner struct {
-	ledger             *ledger
-	outputDir          string
-	owner              string
-	backend            ScopeBackend
-	prefix             []string
-	grace              time.Duration
-	termGrace          time.Duration
-	now                func() time.Time
-	mu                 sync.Mutex
-	appendFault        func(ledgerEvent) error
-	memorySlice        string
-	memoryReserve      int64
-	admissionMaxWait   time.Duration
-	pollInterval       time.Duration
-	clock              Clock
-	sliceMemory        func(path string) (cur, max int64, ok bool, reason string)
-	diagnostics        io.Writer
-	reportMaxBytes     int64
-	detachReadyTimeout time.Duration
-	runLockTimeout     time.Duration
-	reserveIDFn        func() (string, error)
-	openOutputsFn      func(string, string, bool) (map[string]string, map[string]*os.File, error)
-	setupStdinFn       func(*exec.Cmd, Request, string) (func(), bool, error)
-	setupPipesFn       func(*exec.Cmd, bool) (map[string]*os.File, map[string]*os.File, error)
-	allocatePTYFn      func() (*os.File, *os.File, error)
-	startFn            func(*exec.Cmd) error
-	lockAttemptFn      func(string) (*admitLock, error)
-	admitSocketPath    string
-	admitDialFn        func(context.Context, string) (net.Conn, error)
-	failBeforeLaunchFn func(context.Context, RunRecord, string, error) (*RunRecord, error)
+	ledger                   *ledger
+	outputDir                string
+	owner                    string
+	backend                  ScopeBackend
+	prefix                   []string
+	grace                    time.Duration
+	termGrace                time.Duration
+	now                      func() time.Time
+	mu                       sync.Mutex
+	appendFault              func(ledgerEvent) error
+	memorySlice              string
+	memoryReserve            int64
+	admissionMaxWait         time.Duration
+	pollInterval             time.Duration
+	clock                    Clock
+	sliceMemory              func(path string) (cur, max int64, ok bool, reason string)
+	diagnostics              io.Writer
+	reportMaxBytes           int64
+	detachReadyTimeout       time.Duration
+	runLockTimeout           time.Duration
+	reserveIDFn              func() (string, error)
+	openOutputsFn            func(string, string, bool) (map[string]string, map[string]*os.File, error)
+	setupStdinFn             func(*exec.Cmd, Request, string) (func(), bool, error)
+	setupPipesFn             func(*exec.Cmd, bool) (map[string]*os.File, map[string]*os.File, error)
+	allocatePTYFn            func() (*os.File, *os.File, error)
+	startFn                  func(*exec.Cmd) error
+	lockAttemptFn            func(string) (*admitLock, error)
+	admitSocketPath          string
+	admitDialFn              func(context.Context, string) (net.Conn, error)
+	daemonScope              map[string]any
+	supervisorLeaseTTL       time.Duration
+	supervisorLeaseReadFn    func(context.Context, string) (bool, error)
+	supervisorLeaseClaimFn   func(context.Context, supervisorLeaseClaim) (int64, string, error)
+	supervisorLeaseRenewFn   func(context.Context, string, int64, string) (string, error)
+	supervisorLeaseReleaseFn func(context.Context, string, int64, string) (string, error)
+	supervisorLeaseAfter     func(time.Duration) <-chan time.Time
+	failBeforeLaunchFn       func(context.Context, RunRecord, string, error) (*RunRecord, error)
 	// beforeRunningAppendFn is a test seam that fires inside the launch flock,
 	// after a successful Start and before the "running" append, to prove the
 	// per-run lock is held through the running append (not released after Start).
@@ -68,7 +75,19 @@ func (r *Runner) SetAdmitSocketPath(path string) { r.admitSocketPath = path }
 // It lets the CLI layer's wiring be asserted without a live socket.
 func (r *Runner) AdmitSocketPath() string { return r.admitSocketPath }
 
+// SetSupervisorLeaseReader wires the fresh store-backed reader without
+// introducing a runner -> store import cycle.
+func (r *Runner) SetSupervisorLeaseReader(read func(context.Context, string) (bool, error)) {
+	r.supervisorLeaseReadFn = read
+}
+
 func New(cfg Config) (*Runner, error) {
+	if cfg.SupervisorLeaseTTL == 0 {
+		cfg.SupervisorLeaseTTL = defaultSupervisorLeaseTTL
+	}
+	if !ValidSupervisorLeaseTTL(cfg.SupervisorLeaseTTL) {
+		return nil, &LaunchError{"E_CONFIG_INVALID", errors.New("supervisor lease TTL violates the renewal timing invariant")}
+	}
 	if cfg.ReportMaxBytes == 0 {
 		cfg.ReportMaxBytes = DefaultReportMaxBytes
 	}
@@ -129,7 +148,19 @@ func New(cfg Config) (*Runner, error) {
 	return &Runner{ledger: l, outputDir: output, owner: cfg.Owner, backend: backend, prefix: prefix, grace: grace, termGrace: termGrace, now: cfg.Now,
 		memorySlice: strings.TrimSpace(cfg.MemorySlice), memoryReserve: cfg.MemoryReserve, admissionMaxWait: cfg.AdmissionMaxWait,
 		pollInterval: cfg.PollInterval, clock: cfg.Clock, sliceMemory: cfg.sliceMemoryFn, diagnostics: cfg.Diagnostics, reportMaxBytes: cfg.ReportMaxBytes,
-		detachReadyTimeout: cfg.DetachReadyTimeout, runLockTimeout: defaultRunLockTimeout}, nil
+		detachReadyTimeout: cfg.DetachReadyTimeout, runLockTimeout: defaultRunLockTimeout,
+		supervisorLeaseTTL: cfg.SupervisorLeaseTTL, daemonScope: cloneAnyMap(cfg.DaemonScope)}, nil
+}
+
+func cloneAnyMap(source map[string]any) map[string]any {
+	if source == nil {
+		return nil
+	}
+	clone := make(map[string]any, len(source))
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
 }
 
 func (r *Runner) boundedRunLock(path string) (*os.File, error) {
@@ -1377,6 +1408,68 @@ const (
 	processDead
 )
 
+type detachedScopeState uint8
+
+const (
+	detachedScopeEmpty detachedScopeState = iota
+	detachedScopeNonempty
+	detachedScopeUninspectable
+)
+
+type detachedReaderAction uint8
+
+const (
+	detachedPreserve detachedReaderAction = iota
+	detachedFinalizeEvidence
+	detachedMarkLost
+)
+
+type detachedReaderDecision struct {
+	action          detachedReaderAction
+	diagnostic      string
+	recentHeartbeat bool
+}
+
+// decideDetachedReader is the one R1-R4 precedence algorithm shared by Get
+// and reconciliation. The lease input is meaningful only in R4/unknown.
+func decideDetachedReader(proc processLiveness, leaseLive bool, scope detachedScopeState, leaderExit, scopeCreated bool) detachedReaderDecision {
+	if scope == detachedScopeUninspectable { // R1
+		return detachedReaderDecision{action: detachedPreserve, diagnostic: "U_RUN_RECONCILE_REQUIRED"}
+	}
+	if leaderExit { // R2
+		if scope == detachedScopeNonempty {
+			return detachedReaderDecision{action: detachedPreserve}
+		}
+		return detachedReaderDecision{action: detachedFinalizeEvidence}
+	}
+	if scope == detachedScopeNonempty { // R3
+		return detachedReaderDecision{action: detachedPreserve}
+	}
+	// R4: positively empty, with no real exit evidence.
+	switch proc {
+	case processAlive:
+		diagnostic := ""
+		if scopeCreated {
+			diagnostic = "U_RUN_SUPERVISOR_STALLED"
+		}
+		return detachedReaderDecision{action: detachedPreserve, diagnostic: diagnostic}
+	case processDead:
+		return detachedReaderDecision{action: detachedMarkLost}
+	default:
+		if leaseLive {
+			return detachedReaderDecision{action: detachedPreserve, recentHeartbeat: true}
+		}
+		return detachedReaderDecision{action: detachedPreserve, diagnostic: "U_RUN_RECONCILE_REQUIRED"}
+	}
+}
+
+func (r *Runner) readSupervisorLeaseLive(ctx context.Context, runID string) (bool, error) {
+	if r.supervisorLeaseReadFn == nil {
+		return false, nil
+	}
+	return r.supervisorLeaseReadFn(ctx, runID)
+}
+
 func processLive(identity PIDIdentity) processLiveness {
 	bootID, err := readBootIDFn()
 	if err != nil || bootID == "" || identity.BootID == "" {
@@ -1772,16 +1865,34 @@ func (r *Runner) Get(id string) (*RunRecord, error) {
 	if err != nil {
 		return nil, err
 	}
-	if record.Detached && !record.Status.Terminal() && !record.LeaderExitObserved {
-		switch processLive(record.SupervisorPID) {
-		case processAlive:
-			if scope, openErr := r.backend.Open(context.Background(), record.CgroupScope); openErr == nil {
-				if empty, emptyErr := scope.Empty(); emptyErr == nil && empty {
-					record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_SUPERVISOR_STALLED")
+	if record.Detached && !record.Status.Terminal() {
+		scopeState := detachedScopeUninspectable
+		if scope, openErr := r.backend.Open(context.Background(), record.CgroupScope); openErr == nil {
+			if empty, emptyErr := scope.Empty(); emptyErr == nil {
+				if empty {
+					scopeState = detachedScopeEmpty
+				} else {
+					scopeState = detachedScopeNonempty
 				}
 			}
-		case processUnknown:
-			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
+		} else if errors.Is(openErr, os.ErrNotExist) {
+			scopeState = detachedScopeEmpty
+		}
+		proc := processUnknown
+		leaseLive := false
+		if scopeState != detachedScopeUninspectable {
+			proc = processLive(record.SupervisorPID)
+			if scopeState == detachedScopeEmpty && !record.LeaderExitObserved && proc == processUnknown {
+				leaseLive, _ = r.readSupervisorLeaseLive(context.Background(), record.ID)
+			}
+		}
+		scopeCreated := false
+		if events, readErr := r.ledger.read(); readErr == nil {
+			scopeCreated = hasEvent(events, record.ID, "scope-created")
+		}
+		decision := decideDetachedReader(proc, leaseLive, scopeState, record.LeaderExitObserved, scopeCreated)
+		if decision.diagnostic != "" {
+			record.ErrorCodes = appendUnique(record.ErrorCodes, decision.diagnostic)
 		}
 	}
 	return &record, nil
@@ -2025,7 +2136,7 @@ func (r *Runner) Reconcile(ctx context.Context) ([]RunRecord, error) {
 
 func (r *Runner) reconcileDetachedLocked(ctx context.Context, record RunRecord, scopeCreated bool) (RunRecord, error) {
 	scope, openErr := r.backend.Open(ctx, record.CgroupScope)
-	var empty bool
+	scopeState := detachedScopeUninspectable
 	switch {
 	case openErr == nil:
 		e, emptyErr := scope.Empty()
@@ -2033,30 +2144,34 @@ func (r *Runner) reconcileDetachedLocked(ctx context.Context, record RunRecord, 
 			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
 			return record, nil
 		}
-		empty = e
+		if e {
+			scopeState = detachedScopeEmpty
+		} else {
+			scopeState = detachedScopeNonempty
+		}
 	case errors.Is(openErr, os.ErrNotExist):
 		// The scope is positively ABSENT — removed after the run ended, or never
 		// created — which is genuine emptiness. No live cgroup remains, so any
 		// finalization records usage as unevaluated (nil scope, below).
-		scope, empty = nil, true
+		scope, scopeState = nil, detachedScopeEmpty
 	default:
-		// Genuinely UNINSPECTABLE (transient / permission / IO). NEVER treat as
-		// empty: the child may still be live, so never finalize or fabricate a
-		// terminal. A created scope preserves + surfaces; a pre-scope run with a
-		// dead supervisor never launched, otherwise it is still admitting.
-		if scopeCreated {
-			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
-			return record, nil
-		}
-		if processLive(record.SupervisorPID) == processDead {
-			return r.markDetachedLost(record)
-		}
+		// R1: an uninspectable scope may hide a live child even before the
+		// scope-created ledger event was made durable.
+		record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
 		return record, nil
 	}
-	if record.LeaderExitObserved {
-		if !empty {
-			return record, nil
-		}
+	proc := processLive(record.SupervisorPID)
+	leaseLive := false
+	if scopeState == detachedScopeEmpty && !record.LeaderExitObserved && proc == processUnknown {
+		// A read fault or malformed row is deliberately not a positive signal.
+		leaseLive, _ = r.readSupervisorLeaseLive(ctx, record.ID)
+	}
+	decision := decideDetachedReader(proc, leaseLive, scopeState, record.LeaderExitObserved, scopeCreated)
+	if decision.diagnostic != "" {
+		record.ErrorCodes = appendUnique(record.ErrorCodes, decision.diagnostic)
+	}
+	switch decision.action {
+	case detachedFinalizeEvidence:
 		finalized, err := r.finalizeDetachedTerminalLocked(ctx, record.ID, scope)
 		if err != nil {
 			var launch *LaunchError
@@ -2067,24 +2182,7 @@ func (r *Runner) reconcileDetachedLocked(ctx context.Context, record RunRecord, 
 			return RunRecord{}, err
 		}
 		return *finalized, nil
-	}
-	switch processLive(record.SupervisorPID) {
-	case processAlive:
-		// A genuine stall requires that the scope was actually created (a durable
-		// scope-created event) and is now empty with a live supervisor and no exit
-		// evidence. A run still in the pre-scope window (admission/launch) is NOT
-		// stalled even if the scope is inspectable-and-empty or positively absent.
-		if empty && scopeCreated {
-			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_SUPERVISOR_STALLED")
-		}
-		return record, nil
-	case processUnknown:
-		record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
-		return record, nil
-	case processDead:
-		if !empty {
-			return record, nil
-		}
+	case detachedMarkLost:
 		out, err := r.markDetachedLost(record)
 		if err != nil {
 			return RunRecord{}, err
