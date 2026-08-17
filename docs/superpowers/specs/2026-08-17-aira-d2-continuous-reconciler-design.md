@@ -1,263 +1,250 @@
-# AIRA D2 — daemon continuous reconciler
+# AIRA D2 — daemon deferred-journal flush (continuous, idle-safe)
 
-**Status:** DRAFT (plan-review pending)
+**Status:** DRAFT v2 (Sol plan-review r1 → CHANGES-NEEDED, 8 findings; 7 folded, 1 refuted)
 **Branch:** `codex-aira-d2` · **Base:** master `a0c329f` (D1 merged)
 **Depends on:** D1 (heartbeat reaper — introduced the deferred-journal gap this closes),
 M21 (mandatory DB-owning daemon), D7a (store-free carved verbs).
 
 ## 1. Problem
 
-D1's reaper frees expired leases **DB-only**: it writes the `lease.lapse` event and
-its outbox row (`materialised=1, journaled=0, worktree_id=''`) inside the sweep
-transaction but deliberately does **not** append `journal.jsonl` inline — the
-flock+fsync was moved off the latency-sensitive sweep path and *deferred to the
-reconciler*.
+D1's reaper frees expired leases **DB-only**: it writes the `lease.lapse` event and its
+outbox row (`materialised=1, journaled=0, worktree_id='', path=''`) inside the sweep
+transaction but deliberately does **not** append `journal.jsonl` inline — the flock+fsync
+was moved off the latency-sensitive sweep path and *deferred to the reconciler*.
 
-Today that reconciler only runs when a command triggers it:
+Today that deferred journal is materialised only when a command triggers it: the
+`reconcile`/`check` verbs (client-side carved) call `store.Reconcile`, or the rare
+`Rebuild` calls `replayUnjournaledEvents`. So on an **idle** project — leases expiring,
+the daemon's reaper freeing them DB-only, no command arriving — the durable audit journal
+(`journal.jsonl`, spec §11) falls behind the DB **indefinitely**. Because the reaper laps
+leases on *every* idle expiry, this is a routine steady-state gap, not a rare crash edge.
 
-- `store.Reconcile` is invoked by the `reconcile` and `check` verbs (`core.go:1448`,
-  `check.go:164`), both **client-side carved** (they open their own store; not routed
-  to the daemon until D7b);
-- `replayUnjournaledEvents` runs only inside `Rebuild` (rare).
+**D2:** the mandatory daemon flushes the deferred journal on a timer (and at scope build),
+so `journal.jsonl` converges toward the DB even when the project is otherwise idle. This is
+the direct completion of D1.
 
-So on an **idle** project — leases expiring, the daemon's reaper freeing them DB-only,
-but no `reconcile`/`check`/`rebuild` command arriving — the durable audit journal
-(`journal.jsonl`) goes **stale indefinitely**. The DB is the source of truth and stays
-correct, but the append-only journal (the crash-replay + audit record, spec §11) falls
-behind the DB. The same is true of any other materialised-but-unjournaled event and of
-crash-residue git-file/allocation intents in a worktree that is not currently issuing
-commands.
+## 2. Scope decision — journal flush only (the r1 pivot)
 
-**D2:** the mandatory daemon runs reconciliation on a timer, per ready scope, so the
-journal and the outbox stay current even when the project is idle — moving the deferred
-flush (and the shared crash-window close) off the command path onto the daemon's
-background cadence. This is the natural completion of D1.
+The v1 plan ran the *full* `store.Reconcile` on a timer. Sol plan-review r1 showed that
+folding **git-file/allocation intent materialisation** into a background timer is the risky,
+low-yield part: it takes the blocking cross-process finding-rebuild flock (starvation, #2),
+can **resurrect a deleted worktree** by re-creating files under a removed path (#3), is
+per-worktree with unbounded cached-scope churn (#6), and can hot-loop on a persistent
+write-conflict (#7). Pending git-file intents are **crash residue** (steady-state creation
+materialises inline), so a background timer for them is low benefit / high surface.
 
-## 2. Scope
+The **pressing** gap D1 created is the *journal flush*, and `replayUnjournaledEvents`
+(`SELECT … WHERE project_id=? AND materialised=1 AND journaled=0`; `journalEvent` each)
+does exactly and only that: **project-wide, no finding-rebuild lock, no git-file writes, no
+worktree touch, no write-conflict path.** Narrowing D2 to journal-flush-only closes the
+pressing gap and dissolves findings #3, #6, #7 by construction while shrinking #2 and #5.
+
+So — mirroring the owner-approved D7a/D7b split:
 
 ### In
-
-- A daemon background **reconcile loop**, structurally mirroring D1's reaper: a ticker
-  goroutine that, each tick, snapshots the ready scopes under `s.mu` and runs the
-  store's existing, tested `Reconcile(ctx)` on each — best-effort, honest logging on
-  error, one scope's failure never blocks another or crashes the daemon.
-- Config `AIRA_DAEMON_RECONCILE_INTERVAL` (Go duration; default **60s**; `disabled`/`0`
-  → periodic reconcile off; malformed → `E_CONFIG_INVALID` at daemon start), mirroring
-  D1's `AIRA_DAEMON_REAP_INTERVAL` parsing exactly.
-- Shutdown that drains the reconciler goroutine **in addition to** connections and the
-  reaper before `db.Close()`, reusing D1's process-terminal `ErrDrainTimeout` (the lock
-  `*os.File` is retained if *any* background goroutine fails to drain in time).
+- A daemon background **flush loop** + a **flush-on-scope-build**, both invoking a new
+  `Store.FlushDeferredJournal(ctx)` (a ctx-aware, resilient wrapper over the existing
+  `replayUnjournaledEvents` set — §3.2), deduped **by `project_id`** (like D1's reaper).
+- Config `AIRA_DAEMON_JOURNAL_FLUSH_INTERVAL` (Go duration; default **60s**; `disabled`/`0`
+  → periodic flush off; malformed or below a floor → `E_CONFIG_INVALID` at daemon start),
+  parsing mirroring D1's `AIRA_DAEMON_REAP_INTERVAL`.
+- A small, general durability fix to `appendEventIfMissing` (§3.5, finding #1).
+- Shutdown that drains the flush goroutine in addition to connections and the reaper, via
+  D1's process-terminal `ErrDrainTimeout`.
 
 ### Out (deferred, written down — not silent)
+- **Git-file / allocation intent materialisation on a timer** ("outbox file drain"). Its
+  own cut when the benefit is pressing; it needs worktree-liveness validation + scope
+  eviction + bounded finding-lock + write-conflict backoff (all of r1's #2/#3/#5-file/#6/#7).
+  Until then, crash-residue git-file intents are materialised by the next command's
+  `reconcile`/`check` verb and by the daemon's per-command paths, exactly as today.
+- **Proactive `runner.Reconcile`** on a timer (crashed/detached run finalisation) — distinct
+  honesty surface (M20/M20b), verb-triggered as today.
+- **Startup registry discovery** — reconciling projects with *zero* cached scopes since the
+  daemon (re)started. See the accepted residual in §2.1.
+- **Eliminating client-side carved reconcile/check** — that is D7b.
 
-- **D3** watch/inotify-driven reconcile (event-driven rather than polled).
-- **Proactive `runner.Reconcile`** on a timer (finalising crashed/detached runs the
-  daemon did not supervise). That is a distinct honesty surface with its own
-  crash-recovery semantics (M20/M20b), still triggered by the run/reconcile/check verbs;
-  folding it into a background timer is deferred to a run-focused daemon cut.
-- **Reconcile-on-scope-build.** D1 reaps on scope build to close a *correctness* restart
-  gap (an expired lease must be freed before the first claim observes it). The journal is
-  **not a read-dependency** — command results come from the DB, never from `journal.jsonl`
-  or from not-yet-materialised git files — so there is no analogous correctness gap. A
-  restart's backlog of unjournaled events is flushed within one reconcile interval (and
-  the client-side `reconcile`/`check` verbs still flush on demand). Timer-only avoids
-  adding flock+fsync latency to the first command after a scope is built. Explicitly out.
-- **Eliminating client-side carved reconcile/check** (routing their writes through the
-  daemon). That is D7b. D2 is an additive background safety-net that *coexists* with the
-  transitional client-side direct-writers; it does not change their routing.
+### 2.1 Accepted residual (explicit, not silent)
+After a daemon restart the scope cache is empty; the flush loop only iterates scopes that
+have been built by a request. A project that has had **no** request since restart is not
+flushed until its first request — at which point **flush-on-scope-build** (§3.3) flushes its
+entire `journaled=0` backlog before the request completes. So the residual is only "a
+project nobody has touched at all since restart has a journal older than its DB" — which
+harms nothing until someone touches it, and is closed at that first touch. Full startup
+registry discovery (flush every known project before serving) is deferred; noted, not
+pretended-away.
 
 ## 3. Design
 
-### 3.1 The reconcile loop (`internal/daemon/server.go`)
-
-A new goroutine `runReconciler(ctx, interval)`, symmetric with D1's `runReaper`:
+### 3.1 The flush loop (`internal/daemon/server.go`)
+A goroutine `runJournalFlusher(ctx, interval)`, structurally identical to D1's `runReaper`
+(same ready-scope snapshot under `s.mu`, same `context.Canceled` tolerance, same per-scope
+isolation), and **deduped by `project_id`** — because the flush is project-wide, one scope
+per project suffices, so N cached worktrees of a project do one flush, not N:
 
 ```
-func (s *Server) runReconciler(ctx, interval) {
-    if interval == 0 { <-ctx.Done(); return }   // disabled: park until shutdown
-    ticker := NewTicker(interval); defer Stop
-    for {
-        select { case <-ctx.Done(): return; case <-ticker.C: }
-        s.mu.Lock()
-        var ready []*store.Store            // snapshot ready scopes (NOT deduped by project)
-        for _, entry := range s.scopes {
-            select { case <-entry.ready: ready = append(ready, entry.view); default: }
+if interval == 0 { <-ctx.Done(); return }         // disabled: park until shutdown
+for {
+    select { case <-ctx.Done(): return; case <-ticker.C: }
+    s.mu.Lock()
+    byProject := map[string]*store.Store{}
+    for _, e := range s.scopes {
+        select { case <-e.ready: byProject[e.view.ProjectID()] = e.view; default: }
+    }
+    s.mu.Unlock()
+    for pid, view := range byProject {
+        if err := s.flush(ctx, view); err != nil && !errors.Is(err, context.Canceled) {
+            log.Printf("aira daemon: journal flush project %s: %v", pid, err)
         }
-        s.mu.Unlock()
-        for _, view := range ready {
-            if err := s.reconcileScope(ctx, view); err != nil && !errors.Is(err, context.Canceled) {
-                log.Printf("aira daemon: reconcile project %s worktree %s: %v", ...)
-            }
-            if ctx.Err() != nil { return }
-        }
+        if ctx.Err() != nil { return }
     }
 }
 ```
+`flush` wraps `view.FlushDeferredJournal(ctx)` behind a `s.flushScopeFn` test seam (nil in
+production), exactly as D1 wrapped the reaper with `s.reapScope`.
 
-`reconcileScope` wraps `view.Reconcile(ctx)` behind a test seam
-(`s.reconcileScopeFn`, nil in production), exactly as D1 wrapped the reaper with
-`s.reapScope`.
+### 3.2 `Store.FlushDeferredJournal(ctx)` — ctx-aware, resilient (findings #2, #5)
+`replayUnjournaledEvents` today loops `journalEvent` and `return err`s on the first failure.
+On the daemon timer that means one wedged event starves the rest of a project's backlog
+indefinitely, and a blocking journal-lock cannot observe shutdown cancellation (#2 for the
+journal path; #5 the abort-on-first-error). The daemon must not call it as-is.
 
-**Per-scope, NOT deduped by project.** D1's reaper dedups by `project_id` because
-lease reaping is project-wide. Reconcile is *scope*-scoped: its outbox query is
-`WHERE project_id=? AND (worktree_id=? OR path='')`, so per-worktree git-file/allocation
-intents are only drained by *their own* worktree's scope. We therefore run reconcile on
-**every** ready scope. The project-wide `path=''` events (including D1's `lease.lapse`)
-are consequently re-examined by each of a project's cached scopes; this is **safe and
-idempotent** — `journalEvent` uses `appendEventIfMissing` + an `UPDATE … WHERE
-materialised=1` that sets `journaled=1`, so the second and later scopes find the row
-already journaled and do nothing. The redundancy is bounded (one no-op SELECT per
-already-journaled row per extra cached scope per interval) and is documented, not silent.
+Add `FlushDeferredJournal(ctx)` (leaving `replayUnjournaledEvents`/`Rebuild` untouched — a
+DB rebuild still wants fail-fast):
 
-### 3.2 Honesty (best-effort, never a fake success)
+- Select the `materialised=1 AND journaled=0` keys (project-wide), `ORDER BY seq`.
+- For each key: **check `ctx.Err()` first** (so shutdown drains between events — each
+  `journalEvent` is a single bounded append, so the worst-case block is one in-flight append
+  by a *live* peer; a crashed peer's flock is kernel-released on exit); then `journalEvent`.
+- **Continue past an independent event's error** — record the first error, keep going, and
+  return the aggregate (count flushed, firstErr). One bad/locked event never blocks the rest;
+  a genuine failure is logged by the daemon and retried next tick. Never marks anything
+  journaled that was not durably appended (the `journaled=1` update is inside `journalEvent`,
+  strictly after a successful `appendEventIfMissing`).
 
-`store.Reconcile` returns two distinct classes of non-nil error; the daemon must treat
-them differently, and **never** convert either into a fake success:
+This is the only new store method; it does not change existing reconcile semantics.
 
-1. **A recorded write-conflict** (`ErrWriteConflict`). Here reconcile has done its honest
-   job: it recorded a finding for the conflicting intent and returns the conflict as
-   *information*. The daemon logs it at most once per occurrence and moves on; the finding
-   is the durable, honest outcome. It is **not** retried into a tight loop (the finding is
-   already recorded; `recordFinding` is idempotent on re-encounter).
-2. **A genuine failure** (disk error, lock error, `SQLITE_BUSY` from a racing client-side
-   reconcile). The daemon logs it and leaves the work for the next tick. Nothing is marked
-   done. No event is journaled that was not actually appended (the `journaled=1` update is
-   inside the same path as the `appendEventIfMissing`, so a failed append never flips the
-   flag).
+### 3.3 Flush-on-scope-build (finding #4)
+D1 reaps on scope build to close a *correctness* restart gap. For the journal there is no
+read-dependency (command results come from the DB), so flush-on-build is not for
+correctness — it is to make the idle-flush **actually cover a just-restarted daemon**: the
+first request that builds a project's scope flushes that project's whole `journaled=0`
+backlog before the request completes. Implement it exactly where D1 reaps on build
+(`bootstrap` and `storeForScope`, after the reap, before `close(entry.ready)`), best-effort
+(`log` on error), reusing the same readiness barrier. Journal-only ⇒ no finding-lock, no
+git-file writes, so the first-command cost is a bounded set of quick appends, once per
+project-scope per daemon lifetime.
 
-A reconcile panic in one scope must not take down the loop or the daemon; the per-scope
-call is isolated and a panic closes over to a logged error (mirroring D1's per-scope
-isolation). One scope failing never prevents the others in the same tick.
+(The v1 rationale that "no command reads git files / no first-command `E_PATH_INTENT_BUSY`"
+is now moot: D2 no longer materialises git-file intents, so it neither reads nor blocks on
+them.)
 
-### 3.3 Cross-process coexistence
+### 3.4 Honesty & cross-process coexistence
+- **Best-effort, never fake.** A flush failure is logged and retried next tick; nothing is
+  marked journaled that was not appended. `context.Canceled` during shutdown is not an error.
+- **Single daemon connection.** `OpenDB` sets `MaxOpenConns(1)`, so the flusher, the reaper,
+  and connection goroutines serialise on one DB connection inside the daemon — no intra-daemon
+  write contention.
+- **Cross-process.** Client-side carved `reconcile`/`check` (own connection) may journal the
+  same events concurrently. `journalEvent`/`appendEventIfMissing` are idempotent on
+  `(project_id, seq)` and serialised by `journal.lock`; a same-seq/different-payload line is
+  rejected as `E_JOURNAL_CORRUPT` (not silently accepted). D2 is an additive peer under the
+  existing, correct serialisation, not a new single-writer (that is D7b).
 
-The daemon holds the single writable DB connection (`OpenDB` sets `MaxOpenConns(1)`), so
-the reconciler goroutine, the reaper goroutine, and all connection-serving goroutines
-**serialise at the DB layer inside the daemon** — there is no intra-daemon SQLite write
-contention to reason about.
+### 3.5 `appendEventIfMissing` durability fix (finding #1)
+On the **dedup-hit** path (an existing `(project_id, seq)` line is found) the function
+returns `nil` **without** `f.Sync()`. If a prior append wrote the line into the page cache
+but the process died before its `Sync`, a later flush finds the line and marks the DB row
+`journaled=1`, yet a power loss can drop the line — and `replayUnjournaledEvents` will never
+re-append it (it only replays `journaled=0`). Fix: `f.Sync()` before the dedup-hit `return
+nil`, so "found" implies "durable" before we let the caller set `journaled=1`; also `Sync`
+the parent directory when the journal file is first created. Small, general, benefits every
+caller. A fault-injection test (`beforeJournalSync` seam: first append's sync fails, retry
+finds the line and must sync it) locks it in.
 
-Across processes, the **client-side carved** `reconcile`/`check` verbs still open their
-own connection to the same `state.db`. Coexistence is already safe and is unchanged by D2:
+### 3.6 Config (`internal/daemon/paths.go`, finding #7)
+`journalFlushIntervalFromEnv()` mirrors `reapIntervalFromEnv()`:
+unset/empty → `60s`; `disabled`/`0` → off; a positive duration **≥ a 1s floor** → that value;
+anything else or a positive value **below the floor** → `E_CONFIG_INVALID` before the
+listener binds. The floor prevents a mistyped tiny interval from turning the flush into a
+tight loop. (With journal-flush-only there is no write-conflict re-record, so the r1 conflict
+hot-loop is otherwise moot; the floor is defence-in-depth.)
 
-- DB writes: WAL + `busy_timeout(5000)`; `withImmediate`'s `BEGIN IMMEDIATE` waits for the
-  peer writer, then proceeds or surfaces `SQLITE_BUSY` as an error (daemon: logged,
-  retried next tick; client: the verb errors as it does today).
-- File mutations: the common-dir `finding-rebuild.lock` (blocking `LOCK_EX`) and the
-  `journal.lock` serialise finding-file and journal appends across processes.
-- Idempotency: reconcile is convergent — re-running it after a peer already materialised a
-  row is a no-op.
-
-D2 therefore does not *reduce* client-side reconcile contention (that is D7b's single-writer
-win); it *adds* a background writer that is a peer under the same, already-correct
-serialisation. This transitional coexistence is stated in the honesty note, not hidden.
-
-### 3.4 Shutdown (generalise D1's process-terminal drain)
-
-D1's `Serve` drains `connections` **and** the reaper before `db.Close()`, and on timeout
-returns a lock-owning `ErrDrainTimeout` that makes the run process-terminal. D2 adds the
-reconciler goroutine to the same structure:
-
-- `reconcilerCtx, cancelReconciler := WithCancel(ctx)`; goroutine closes `reconcilerDone`.
-- On the shutdown path: `close(stopping)`, `cancelReaper()`, `cancelReconciler()`,
-  `listener.Close()`.
-- The `drained` goroutine waits `connections.Wait(); <-reaperDone; <-reconcilerDone` before
-  `close(drained)`.
-- The existing `select { case <-drained: … case <-time.After(timeout): retainInstance=true;
-  return &ErrDrainTimeout{lock} }` is unchanged: if the reconciler (mid-flush, e.g. blocked
-  briefly on the journal flock or a busy DB) has not returned within `DrainTimeout`, the run
-  is process-terminal and the lock/db/socket cleanup defers are suppressed — no second daemon
-  can open the DB while a leaked reconciler goroutine still holds the single connection.
-
-`ctx` cancellation is observed by the reconciler between scopes (`if ctx.Err() != nil {
-return }`) and by `store.Reconcile` via `QueryContext`/`ExecContext`, so an ordinary
-shutdown drains within one in-flight scope's reconcile, well under `DrainTimeout` in the
-common case.
-
-### 3.5 Config (`internal/daemon/paths.go`)
-
-`reconcileIntervalFromEnv()` mirrors `reapIntervalFromEnv()` byte-for-byte in behaviour:
-
-- unset/empty → default `60s`;
-- `disabled` or `0` → `0` (periodic reconcile off; the loop parks on `<-ctx.Done()`);
-- a positive Go duration → that interval;
-- anything else (or `≤0`) → `E_CONFIG_INVALID` returned from `Serve` before the listener
-  binds, so a misconfigured daemon fails fast at start rather than silently not reconciling.
-
-Default 60s (vs the reaper's 30s): journal freshness is less time-critical than lease TTL
-reclamation, and a slower cadence lowers the cross-process contention footprint with
-client-side reconcile/check.
+### 3.7 Shutdown (generalise D1's process-terminal drain)
+Add `flusherCtx`/`flusherDone` alongside D1's `reaperCtx`/`reaperDone`; the shutdown path
+`cancelFlusher()`s and the `drained` goroutine waits `connections.Wait(); <-reaperDone;
+<-flusherDone`. The existing `select { <-drained | <-time.After(DrainTimeout) →
+retainInstance=true; return &ErrDrainTimeout{lock} }` is unchanged: a flush that overruns
+`DrainTimeout` is process-terminal with the lock retained — no window for a second writer.
+Because `FlushDeferredJournal` checks `ctx` between events, ordinary shutdown drains within
+one in-flight append.
 
 ## 4. Invariants
+1. **No fake success.** A flush that cannot durably append an event never marks it
+   `journaled`; genuine failures are logged and retried, never swallowed.
+2. **Idempotent, project-deduped convergence.** One flush per project per tick converges
+   `journaled=0 → 1`; re-running is a no-op; correct regardless of cached-worktree count.
+3. **Isolation.** One event's (or one project's) flush error never blocks the rest of that
+   project's backlog or the other projects, and never crashes the daemon.
+4. **Journal never ahead of the DB.** DB commit (D1) precedes journal append; D2 only moves
+   the journal toward the DB. "Found in journal" now implies fsync'd before `journaled=1`.
+5. **Bounded, drainable shutdown.** An in-flight flush drains before `db.Close`; overruns are
+   process-terminal with the lock retained.
+6. **Disabled means disabled.** `…FLUSH_INTERVAL=disabled|0` turns the periodic flush fully
+   off; flush-on-build and the client verbs still work; the daemon still starts and serves.
+7. **No git-file writes.** D2 never materialises a git-file/allocation intent, so it can never
+   resurrect a deleted worktree (that surface is deferred with its guards).
 
-1. **No fake success.** A reconcile that could not append an event never marks it
-   `journaled`; a genuine failure is logged and retried next tick, never swallowed as done.
-2. **Idempotent redundancy.** Running reconcile on every ready scope (including the
-   project-wide `path=''` events on each) converges: already-journaled/materialised rows
-   are no-ops. Correct regardless of how many of a project's worktrees are cached.
-3. **Isolation.** One scope's reconcile error or panic never blocks the other scopes in the
-   tick, never crashes the daemon, and never fakes a result for the others.
-4. **Bounded, drainable shutdown.** An in-flight reconcile is drained before `db.Close`;
-   if it exceeds `DrainTimeout` the run is process-terminal with the lock retained — no
-   window for a second writer.
-5. **Journal never ahead of the DB.** The DB event/outbox row is committed first (D1); the
-   journal append is a strictly-later materialisation. D2 only ever moves the journal
-   *toward* the DB, never past it.
-6. **Disabled means disabled.** `AIRA_DAEMON_RECONCILE_INTERVAL=disabled|0` turns the
-   periodic reconcile fully off (the client-side `reconcile`/`check` verbs still work); the
-   daemon still starts and serves.
+## 5. Refuted r1 finding (investigated, not folded)
+**#8 "dedup accepts a different audit record (ignores actor/timestamp)."** Refuted:
+`appendEventIfMissing` matches on `(ProjectID, Seq)` — the exact event key — and if a
+same-key line has a different `PayloadDigest`/`Verb`/`Target` it returns `E_JOURNAL_CORRUPT`
+rather than accepting it. It cannot silently mark a different record as journaled. No change.
 
-## 5. Tests (`internal/daemon/server_test.go`, `paths_test.go`)
-
-The store `Reconcile` is already covered; D2's tests target the daemon wrapper. All daemon
-socket/flock tests are Opus-real-HW (the sandbox cannot bind sockets / flock under
+## 6. Tests
+Daemon socket/flock tests are Opus-real-HW (sandbox cannot bind sockets / flock under
 `/run/user`).
 
-1. **Idle reap → timer reconcile materialises the deferred journal.** Seed an expired
-   lease; run one reaper sweep (DB-only `lease.lapse`, `journaled=0`); assert `journal.jsonl`
-   does *not* yet contain the lapse; let one reconcile tick run; assert the lapse now
-   appears exactly once and the outbox row is `journaled=1`. This is the end-to-end proof of
-   the D1→D2 gap closure.
-2. **Per-scope, not project-deduped.** Two worktree scopes of the same project, each with a
-   pending per-worktree git-file intent; assert one reconcile tick materialises **both**
-   worktrees' intents (a project-dedup would leave one worktree's intent pending).
-3. **Idempotent double-drain of `path=''` events.** Two cached scopes of one project + one
-   `lease.lapse`; assert one tick journals it exactly once (no duplicate journal line, no
-   error) — proving the second scope's re-examination is a no-op.
-4. **Best-effort on failure, continues next tick / other scopes.** Via `reconcileScopeFn`:
-   make scope A return an error and scope B succeed in the same tick; assert B is still
-   reconciled and the daemon survives; assert A is retried on the next tick.
-5. **Write-conflict is not a fake success and not a tight loop.** A reconcile that returns
-   `ErrWriteConflict`: assert the finding is recorded and the daemon logs-and-continues
-   (does not mark anything journaled that was not appended, does not spin).
-6. **Shutdown drains the reconciler as well as the reaper and connections.** A reconcile
-   blocked in `reconcileScopeFn` until released delays `Serve`'s return until it completes
-   (within `DrainTimeout`); `db.Close` does not run before it drains.
-7. **Drain timeout with a stuck reconciler is process-terminal and retains the lock.**
-   Mirror D1's `TestDrainTimeoutRetainsLockSkipsDBCloseAndSurvivesGC` with the stall in the
-   reconciler rather than a connection: assert `ErrDrainTimeout`, lock retained, `db.Close`
-   skipped, survives a forced GC.
-8. **Disabled interval parks the loop but the daemon still serves.**
-   `AIRA_DAEMON_RECONCILE_INTERVAL=disabled` → no periodic reconcile fires, a routed request
-   still round-trips.
-9. **Config parsing:** default / `disabled` / `0` / a duration / malformed→`E_CONFIG_INVALID`
-   (mirrors D1's `paths_test.go`).
+1. **Idle reap → timer flush materialises the deferred journal (end-to-end D1→D2).** Seed an
+   expired lease; one reaper sweep (DB-only `lease.lapse`, `journaled=0`); assert
+   `journal.jsonl` lacks the lapse; one flush tick; assert the lapse appears **exactly once**
+   and the outbox row is `journaled=1`.
+2. **Project-dedup.** Two cached worktree scopes of one project + one `lease.lapse`; assert a
+   tick journals it exactly once, one flush call (via `flushScopeFn` counter == 1 per project).
+3. **Resilient continue-past-error + retry.** `FlushDeferredJournal` over two pending events
+   where the first's `journalEvent` fails once (seam): assert the second is still journaled
+   this pass, and the first is journaled on the next pass; the aggregate error is returned,
+   not swallowed, and nothing is falsely marked journaled.
+4. **ctx cancellation drains between events.** Cancel mid-flush; assert it returns promptly
+   (`context.Canceled`), having journaled a prefix, none falsely marked.
+5. **Flush-on-scope-build closes the restart backlog.** Fresh daemon, empty cache, a project
+   with a pre-existing `journaled=0` lapse; first `storeForScope`/`bootstrap` flushes it
+   before readiness; assert journaled before the first request returns.
+6. **`appendEventIfMissing` dedup-hit fsyncs (finding #1).** `beforeJournalSync` seam: first
+   append's sync fails; a retry finds the line and must `Sync` before returning nil; assert
+   the retry syncs (fault-injection observes the second sync).
+7. **Shutdown drains the flusher too.** A flush blocked in `flushScopeFn` until released
+   delays `Serve`'s return until it completes; `db.Close` not called before it drains.
+8. **Drain-timeout with a stuck flusher is process-terminal, retains the lock.** Mirror D1's
+   `TestDrainTimeoutRetainsLockSkipsDBCloseAndSurvivesGC` with the stall in the flusher:
+   assert `ErrDrainTimeout`, lock retained, `db.Close` skipped, survives forced GC.
+9. **Disabled parks the loop; daemon still serves.** `…FLUSH_INTERVAL=disabled` → no periodic
+   flush fires; a routed request round-trips.
+10. **Config parsing:** default / `disabled` / `0` / a duration / below-floor→`E_CONFIG_INVALID`
+    / malformed→`E_CONFIG_INVALID` (mirrors D1's `paths_test.go`).
 
-## 6. Build notes for the implementer
+## 7. Build notes
+- Mirror D1's reaper structures exactly (`flushScopeFn` seam; `flusherCtx`/`flusherDone`;
+  drain gains `<-flusherDone`; `journalFlushIntervalFromEnv` mirrors `reapIntervalFromEnv`
+  plus the ≥1s floor).
+- Only one new store method: `FlushDeferredJournal(ctx)` (ctx-aware + continue-past-error over
+  the `materialised=1 AND journaled=0` set). Leave `replayUnjournaledEvents`/`Rebuild`/
+  `reconcile` untouched. Plus the `appendEventIfMissing` dedup-hit `Sync` + parent-dir sync.
+- Do **not** materialise git-file/allocation intents, take the finding-rebuild lock, evict
+  scopes, or add worktree-liveness checks — all deferred with the git-file drain (§2 Out).
+- `Co-Authored-By: Codex Terra <noreply@openai.com>` on the build; Opus verifies real-HW.
 
-- Mirror D1's structures exactly: `reconcileScopeFn func(context.Context, *store.Store)
-  error` test seam; `reconcilerCtx`/`reconcilerDone`; the drain goroutine gains
-  `<-reconcilerDone`; `reconcileIntervalFromEnv` mirrors `reapIntervalFromEnv`.
-- Do **not** add reconcile-on-scope-build (§2 Out). Do **not** dedup by project (§3.1).
-- Keep `store.Reconcile` unchanged — D2 is a pure daemon-side wrapper. If a store change
-  seems necessary, stop: it is out of scope.
-- The reaper and reconciler are independent goroutines with independent intervals; neither
-  holds `s.mu` across its per-scope DB work (snapshot ready scopes under the lock, release,
-  then reconcile).
-- `Co-Authored-By: Codex Terra <noreply@openai.com>` on the build commit; Opus verifies on
-  real hardware and commits.
-
-## 7. Deferrals
-
-D3 watch-driven reconcile · proactive `runner.Reconcile` on a timer · D7b client-verb
-write-relay (removes the cross-process coexistence entirely) · reconcile-on-scope-build
-(only if a future read-dependency on journal freshness ever appears — none today).
+## 8. Deferrals
+Git-file/allocation intent timer drain (with worktree-liveness validation, scope eviction,
+bounded finding-lock, write-conflict backoff) · D3 watch-driven reconcile · proactive
+`runner.Reconcile` · startup registry discovery · D7b client-verb write-relay.
