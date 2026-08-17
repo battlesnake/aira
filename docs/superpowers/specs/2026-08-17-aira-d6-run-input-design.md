@@ -1,6 +1,6 @@
 # D6 — run-input (live stdin push to a detached run) — design / plan
 
-**Status:** v4 — folds Sol plan-review r3 (3 findings, all folded). For Sol r4.
+**Status:** v5 — Sol plan-review 4 rounds → APPROVE-PLAN. Fable plan-gate pending.
 **Milestone:** Phase 5 · D6 (task #42). Follows D1–D5 (all merged; master `f8c4412`).
 **Loop:** plan → Sol plan-review (rounds → APPROVE-PLAN) → Fable plan-gate → Terra build →
 Opus real-HW verify → Sol build-review (rounds → RESOLVED) → merge. Correctness-critical (a live
