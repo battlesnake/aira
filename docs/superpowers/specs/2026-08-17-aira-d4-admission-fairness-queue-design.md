@@ -1,6 +1,6 @@
 # AIRA D4 — daemon cross-session admission fairness-queue
 
-**Status:** DRAFT v5 (Sol plan-review r1 8 → r2 4 → r3 4 → r4 3 findings; all folded)
+**Status:** DRAFT v6 (Sol plan-review r1 8 → r2 4 → r3 4 → r4 3 → r5 2 findings; all folded)
 **Branch:** `codex-aira-d4` · **Base:** master `1cf83f2` (D3 merged)
 **Depends on:** #29 part 1 (per-process memory admission — the mechanism this fair-queues **and
 retains as the daemon-down fallback**), M21 (mandatory daemon), D3 (held-connection + peer-close +
@@ -43,17 +43,21 @@ fencing/leases (a shared fence cannot represent the daemon's *multiple* concurre
 and the transition window is already advisory); the alternative — no fallback — is a worse
 un-gated stampede. This degradation is stated, not hidden.
 
-**One more advisory over-grant window, daemon-up (Sol r3 #2, corrected r4 #1):** if the daemon
-commits+writes a grant but the client reads only a **partial** frame before its deadline (§3.2), it
-**closes the daemon socket first, then falls back to the flock**. The daemon observes that close and
-**releases the reservation — potentially well before** the fallback acquires the flock and reaches
-`Start`/memory-visibility. In that **close/release → fallback-`Start`** gap the daemon can grant
-*other* waiters against memory the fallback run is about to consume, so this **is a real daemon-up
-cross-domain over-grant window** (my earlier "conservative, no over-grant of others" was wrong). It
-is bounded only by the fallback latency and the slice `OOMPolicy=kill` backstop — advisory, exactly
-#29's stance. It is rare (a partial frame on a local Unix socket is uncommon), and eliminating it
-would need a release-ack protocol round-trip not worth it for a rare path. Documented as a genuine
-advisory over-grant window, not hidden.
+**Daemon-up cross-domain over-grant — ANY fallback path (Sol r3 #2, corrected r4 #1, generalised
+r5):** the over-grant window is **not limited to a partial frame** (Sol r5). It occurs after **any
+committed-but-unaccepted grant** — a partial/zero-byte read at the deadline, an `EOF`/reset, an
+invalid frame, or a **failed/partial server-side write** — and also whenever a **cap** sends a
+client to the fallback while a healthy daemon keeps granting (`E_DAEMON_BUSY` at the global or
+per-slice cap). In each case the client **closes the daemon socket first, then falls back to the
+flock**; the daemon observes the close and **releases the reservation — potentially before** the
+fallback reaches `Start`/memory-visibility, so it can grant *other* waiters against memory the
+fallback run is about to consume: a **real daemon-up cross-domain over-grant window**, bounded only
+by fallback latency and the slice `OOMPolicy=kill` backstop (advisory, #29's stance). These paths
+are rare (a healthy local Unix socket delivers whole frames; caps are large), and eliminating the
+window would need a release-ack protocol round-trip not worth it. **Therefore strict fairness +
+strict accounting hold only while the daemon is stably up, load is within caps, AND no client is on
+the fallback;** every fallback path (any of the above, plus the §2.1/§2.4 transitions) is advisory,
+downgrading *fair+accounted* to *never-stranded*. Stated, not hidden.
 
 ### 2.2 The grant rule (fair + concurrent, strict FIFO, no jump-ahead)
 Per slice the daemon keeps an ordered **waiter list** (FIFO by a per-slice monotonic arrival seq
@@ -205,12 +209,15 @@ byte-for-byte across all paths.
    can push Σ(outstanding) past `available`, blocking memory-gated grants until finite deadlines
    bypass — everyone still launches, just unfairly, Sol r2 #4); **global-cap overload** (a hot
    slice filling the global connection cap forces other slices onto the flock fallback — unfair
-   but no strand); and **daemon transitions** (§2.1/§2.4 advisory). In all of these the guarantee
-   downgrades from *fair* to *never-stranded*: every run still launches (grant, timeout,
-   fallback, or unevaluated), each honestly labelled.
+   but no strand); **any fallback path** while the daemon is up (partial/EOF/invalid/failed-write/
+   cap-`E_DAEMON_BUSY` → the daemon-up cross-domain over-grant window of §2.1); and **daemon
+   transitions** (§2.1/§2.4). Strict fair+accounted holds only *daemon-up ∧ within-caps ∧
+   no-fallback*; in every other case the guarantee downgrades from *fair* to *never-stranded*:
+   every run still launches (grant, timeout, fallback, or unevaluated), each honestly labelled.
 2. **Atomic grant, no double-spend.** Evaluation is serialised per slice and the grant prefix is
-   committed under the registry lock against the current reservation set; two triggers never grant
-   against the same free-memory sample. Advisory floor (memory materialises after `Start`), as #29.
+   read+computed+committed **under the per-slice state mutex** against the current reservation set;
+   two triggers never grant against the same free-memory sample. Advisory floor (memory materialises
+   after `Start`), as #29.
 3. **Exact-once lifecycle.** Each waiter is `queued→granted→released`; release is idempotent and
    runs on every exit (grant-close, failed/partial write, timeout, peer-close, shutdown); a
    reservation is never leaked (which would shrink `available` and deadlock the queue) nor released
