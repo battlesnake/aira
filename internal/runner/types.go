@@ -116,6 +116,8 @@ type RunRecord struct {
 	CPUSys              *int64               `json:"cpu_sys,omitempty"`
 	PIDIdentity         PIDIdentity          `json:"pid_identity,omitempty"`
 	Detached            bool                 `json:"detached,omitempty"`
+	StdinConnect        bool                 `json:"stdin_connect,omitempty"`
+	InputSocket         string               `json:"input_socket,omitempty"`
 	SupervisorPID       PIDIdentity          `json:"supervisor_pid,omitempty"`
 	LeaderExitObserved  bool                 `json:"leader_exit_observed,omitempty"`
 	QuiesceForced       bool                 `json:"quiesce_forced,omitempty"`
@@ -135,28 +137,29 @@ type EnvEntry struct {
 }
 
 type Request struct {
-	Argv        []string `json:"argv"`
-	Ticket      string
-	Phase       string
-	Label       string
-	Tool        string
-	Cwd         string
-	Env         []string // exact KEY=VALUE overrides; inherited environment is retained
-	Timeout     time.Duration
-	ExplicitEnv bool // when true, Env is the complete child environment
-	Prefix      []string
-	Merge       bool
-	Realtime    bool
-	PTY         bool
-	StdinPath   string    // empty means null stdin; "-" means the caller's stdin
-	Stdin       io.Reader `json:"-"`
-	StoreStdin  bool
-	Grace       time.Duration
-	TermGrace   time.Duration
-	LiveStdout  io.Writer `json:"-"` // optional best-effort foreground tee sink
-	LiveStderr  io.Writer `json:"-"` // optional best-effort foreground tee sink
-	NoAdmit     bool      // bypass the configured memory-admission gate
-	Detach      bool      `json:"detach,omitempty"`
+	Argv         []string `json:"argv"`
+	Ticket       string
+	Phase        string
+	Label        string
+	Tool         string
+	Cwd          string
+	Env          []string // exact KEY=VALUE overrides; inherited environment is retained
+	Timeout      time.Duration
+	ExplicitEnv  bool // when true, Env is the complete child environment
+	Prefix       []string
+	Merge        bool
+	Realtime     bool
+	PTY          bool
+	StdinPath    string    // empty means null stdin; "-" means the caller's stdin
+	Stdin        io.Reader `json:"-"`
+	StoreStdin   bool
+	Grace        time.Duration
+	TermGrace    time.Duration
+	LiveStdout   io.Writer `json:"-"` // optional best-effort foreground tee sink
+	LiveStderr   io.Writer `json:"-"` // optional best-effort foreground tee sink
+	NoAdmit      bool      // bypass the configured memory-admission gate
+	Detach       bool      `json:"detach,omitempty"`
+	StdinConnect bool      `json:"stdin_connect,omitempty"`
 	// TelemetryPending is an opaque initial envelope supplied by Core. Runner
 	// stamps it into the starting event without interpreting its value.
 	TelemetryPending string `json:"telemetry_pending,omitempty"`
@@ -252,7 +255,44 @@ type Config struct {
 	DetachReadyTimeout time.Duration
 	SupervisorLeaseTTL time.Duration
 	DaemonScope        map[string]any
+	InputRuntimeDir    string
 }
+
+// RunInputRequest describes one serial input-plane connection. Reader is
+// streamed in bounded DATA frames; Close explicitly closes the child's fd0.
+type RunInputRequest struct {
+	RunID  string
+	Reader io.Reader
+	Close  bool
+	Steal  bool
+}
+
+// RunInputResult reports bytes accepted into the kernel pipe. Accepted does
+// not mean that the child has processed those bytes.
+type RunInputResult struct {
+	RunID    string `json:"run_id"`
+	Accepted int64  `json:"accepted"`
+	Closed   bool   `json:"closed,omitempty"`
+}
+
+type RunInputError struct {
+	Code      string
+	Committed int64
+	Err       error
+}
+
+func (e *RunInputError) Error() string {
+	message := e.Code
+	if e.Err != nil {
+		message += ": " + e.Err.Error()
+	}
+	if e.Committed > 0 || e.Code == "E_RUN_INPUT_CLOSED" || e.Code == "E_RUN_INPUT_PARTIAL" || e.Code == "E_RUN_INPUT_OUTCOME_UNKNOWN" {
+		message += fmt.Sprintf(" (committed=%d)", e.Committed)
+	}
+	return message
+}
+
+func (e *RunInputError) Unwrap() error { return e.Err }
 
 const (
 	defaultSupervisorLeaseTTL = 120 * time.Second

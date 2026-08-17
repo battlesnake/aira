@@ -88,6 +88,25 @@ func TestRunKillStealFlagBuildsBooleanRequest(t *testing.T) {
 	}
 }
 
+func TestRunInputCLIAndStdinConnectParsing(t *testing.T) {
+	positional, options, err := parseArgs("run-input", []string{"--close", "--steal", "RUN-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := buildRequest("run-input", positional, options)
+	if err != nil || request.Args["run_id"] != "RUN-1" || request.Args["close"] != true || request.Args["steal"] != true {
+		t.Fatalf("request=%#v err=%v", request, err)
+	}
+	argv, runOptions, err := parseArgs("run", []string{"--detach", "--stdin-connect", "--", "cat"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runRequest, err := buildRequest("run", argv, runOptions)
+	if err != nil || runRequest.Args["stdin_connect"] != true || runRequest.Args["detach"] != true {
+		t.Fatalf("run request=%#v err=%v", runRequest, err)
+	}
+}
+
 func TestTouchRequestAcceptsZeroOrMoreGlobsAndTokenOption(t *testing.T) {
 	positional, options, err := parseArgs("touch", []string{"AIRA-1", "src/**", "--token", "token"})
 	if err != nil {
@@ -193,7 +212,7 @@ func TestRunDelimiterKeepsChildOptionTokensVerbatim(t *testing.T) {
 	}
 	want := core.Request{Verb: "run", Args: map[string]any{
 		"argv": []string{"tool", "--child-option", "--json"}, "prefix": []string(nil), "cwd": "",
-		"env": []string{}, "merge": true, "realtime": false, "pty": false, "detach": false, "follow": false, "stdin": "", "no_stdin": false, "store_stdin": false, "no_admit": false, "timeout": "",
+		"env": []string{}, "merge": true, "realtime": false, "pty": false, "detach": false, "stdin_connect": false, "follow": false, "stdin": "", "no_stdin": false, "store_stdin": false, "no_admit": false, "timeout": "",
 		"ticket": "", "phase": "", "label": "", "tool": "", "report": "", "report_stream": "", "suite": "", "config_env": []string{},
 		"shard": "", "retry": "", "usage": "", "provider": "", "strict_wiring": false,
 	}}

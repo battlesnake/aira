@@ -16,8 +16,8 @@ func TestSkillMetadataNormalisesEveryIncludedAction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(artifacts.Actions) != 60 {
-		t.Fatalf("actions=%d, want 60", len(artifacts.Actions))
+	if len(artifacts.Actions) != 61 {
+		t.Fatalf("actions=%d, want 61", len(artifacts.Actions))
 	}
 	for _, action := range artifacts.Actions {
 		if action.Summary == "" || !action.Safety.Valid() || !strings.HasPrefix(action.Command, "aira ") {
@@ -76,7 +76,7 @@ func TestSkillSafetyGolden(t *testing.T) {
 		"reconcile": SafetyReconcile, "check": SafetyReconcile,
 		"insights/ls": SafetyRead, "insights/show": SafetyRead,
 		"test-report/add": SafetyMutate, "test-report/ls": SafetyRead, "test-report/show": SafetyRead, "test-report/flaky": SafetyRead,
-		"run": SafetyExecute, "run-kill": SafetyExecute, "run-log": SafetyRead,
+		"run": SafetyExecute, "run-input": SafetyExecute, "run-kill": SafetyExecute, "run-log": SafetyRead,
 		"git/clone": SafetyExecute, "git/fetch": SafetyExecute, "git/push": SafetyExecute, "git/ls-remote": SafetyExecute,
 		"find/add": SafetyMutate, "find/ls": SafetyRead, "find/show": SafetyRead, "find/set": SafetyMutate,
 		"req/add": SafetyMutate, "req/ls": SafetyRead, "req/show": SafetyRead, "req/set": SafetyMutate, "req/import": SafetyMutate,

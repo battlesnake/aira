@@ -37,7 +37,7 @@ func TestMCPToolListIsGeneratedAndStable(t *testing.T) {
 	for _, tool := range result.Tools {
 		got = append(got, tool.Name)
 	}
-	want := []string{"aira_check", "aira_claim", "aira_count", "aira_create", "aira_finding", "aira_gate", "aira_get", "aira_git", "aira_grep", "aira_heartbeat", "aira_id", "aira_import", "aira_init", "aira_insights", "aira_link", "aira_list", "aira_quota", "aira_ready", "aira_reconcile", "aira_release", "aira_requirement", "aira_review", "aira_run", "aira_run_kill", "aira_run_output", "aira_spend", "aira_test_report", "aira_touch", "aira_transition"}
+	want := []string{"aira_check", "aira_claim", "aira_count", "aira_create", "aira_finding", "aira_gate", "aira_get", "aira_git", "aira_grep", "aira_heartbeat", "aira_id", "aira_import", "aira_init", "aira_insights", "aira_link", "aira_list", "aira_quota", "aira_ready", "aira_reconcile", "aira_release", "aira_requirement", "aira_review", "aira_run", "aira_run_input", "aira_run_kill", "aira_run_output", "aira_spend", "aira_test_report", "aira_touch", "aira_transition"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("tools=%v, want=%v", got, want)
 	}
@@ -61,6 +61,18 @@ func TestMCPRunKillDeclaresStealBoolean(t *testing.T) {
 	property, ok := schema.Properties["steal"]
 	if !ok || property.Type != "boolean" {
 		t.Fatalf("run-kill steal property=%+v present=%v", property, ok)
+	}
+}
+
+func TestMCPRunInputDeclaresBoundedOneShotShape(t *testing.T) {
+	server := newMCPServer(nil)
+	binding, ok := server.byName["aira_run_input"]
+	if !ok {
+		t.Fatal("missing aira_run_input tool")
+	}
+	schema, ok := binding.tool.InputSchema.(mcpInputSchema)
+	if !ok || schema.Properties["data"].Type != "string" || schema.Properties["data"].MaxLength == 0 || schema.Properties["close"].Type != "boolean" || schema.Properties["steal"].Type != "boolean" {
+		t.Fatalf("schema=%+v", binding.tool.InputSchema)
 	}
 }
 

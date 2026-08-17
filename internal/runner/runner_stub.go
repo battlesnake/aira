@@ -12,11 +12,12 @@ import (
 // Execution remains deliberately unavailable because runner scopes require
 // Linux cgroup v2.
 type Runner struct {
-	ledger         *ledger
-	outputDir      string
-	owner          string
-	backend        ScopeBackend
-	reportMaxBytes int64
+	ledger          *ledger
+	outputDir       string
+	owner           string
+	backend         ScopeBackend
+	reportMaxBytes  int64
+	inputRuntimeDir string
 }
 
 func New(cfg Config) (*Runner, error) {
@@ -44,10 +45,12 @@ func New(cfg Config) (*Runner, error) {
 	if backend == nil {
 		backend = newDefaultBackend(cfg.CgroupParent)
 	}
-	return &Runner{ledger: l, outputDir: output, owner: cfg.Owner, backend: backend, reportMaxBytes: cfg.ReportMaxBytes}, nil
+	return &Runner{ledger: l, outputDir: output, owner: cfg.Owner, backend: backend, reportMaxBytes: cfg.ReportMaxBytes, inputRuntimeDir: cfg.InputRuntimeDir}, nil
 }
 
 func (r *Runner) ReportMaxBytes() int64 { return r.reportMaxBytes }
+
+func (r *Runner) SetInputRuntimeDir(path string) { r.inputRuntimeDir = path }
 
 func (r *Runner) SetSupervisorLeaseReader(func(context.Context, string) (bool, error)) {}
 

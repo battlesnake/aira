@@ -64,11 +64,17 @@ type Runner struct {
 	// after a successful Start and before the "running" append, to prove the
 	// per-run lock is held through the running append (not released after Start).
 	beforeRunningAppendFn func()
+	inputRuntimeDir       string
+	inputDialFn           func(context.Context, string) (net.Conn, error)
 }
 
 // SetAdmitSocketPath supplies the mandatory daemon endpoint resolved by the
 // CLI layer. It is set before a Runner is exposed to concurrent requests.
 func (r *Runner) SetAdmitSocketPath(path string) { r.admitSocketPath = path }
+
+// SetInputRuntimeDir supplies daemon.PathsFromEnv().RuntimeDir, keeping run
+// input discovery pinned to the same state identity as the daemon socket.
+func (r *Runner) SetInputRuntimeDir(path string) { r.inputRuntimeDir = path }
 
 // AdmitSocketPath reports the wired daemon admission endpoint (empty when the
 // daemon is not wired, in which case admit falls back to the in-process flock).
@@ -145,7 +151,7 @@ func New(cfg Config) (*Runner, error) {
 	if termGrace == 0 {
 		termGrace = 500 * time.Millisecond
 	}
-	return &Runner{ledger: l, outputDir: output, owner: cfg.Owner, backend: backend, prefix: prefix, grace: grace, termGrace: termGrace, now: cfg.Now,
+	return &Runner{ledger: l, outputDir: output, owner: cfg.Owner, backend: backend, prefix: prefix, grace: grace, termGrace: termGrace, now: cfg.Now, inputRuntimeDir: cfg.InputRuntimeDir,
 		memorySlice: strings.TrimSpace(cfg.MemorySlice), memoryReserve: cfg.MemoryReserve, admissionMaxWait: cfg.AdmissionMaxWait,
 		pollInterval: cfg.PollInterval, clock: cfg.Clock, sliceMemory: cfg.sliceMemoryFn, diagnostics: cfg.Diagnostics, reportMaxBytes: cfg.ReportMaxBytes,
 		detachReadyTimeout: cfg.DetachReadyTimeout, runLockTimeout: defaultRunLockTimeout,
@@ -203,6 +209,9 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	}
 	if req.PTY && req.Realtime {
 		return nil, launchErr("E_RUN_ARGUMENT_INVALID", errors.New("pty and realtime buffering are mutually exclusive"))
+	}
+	if req.StdinConnect && (!req.Detach || req.PTY || req.StdinPath != "" || req.Stdin != nil || req.StoreStdin) {
+		return nil, launchErr("E_RUN_ARGUMENT_INVALID", errors.New("--stdin-connect requires --detach and is incompatible with stdin, pty, and store-stdin"))
 	}
 	if req.Detach && (req.PTY || req.StdinPath == "-") {
 		return nil, launchErr("E_RUN_ARGUMENT_INVALID", errors.New("detach is incompatible with pty and stdin '-'"))

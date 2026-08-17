@@ -324,6 +324,7 @@ func renderMarkdownBody(title string, actions []SkillAction, contract ResponseCo
 	fmt.Fprintf(&out, "Responses carry stable AIRA codes. Verdicts are `%s`, `%s`, and `%s`. `unevaluated` is not a pass and not zero.\n\n", contract.Verdicts[0], contract.Verdicts[1], contract.Verdicts[2])
 	out.WriteString("Gate results require authenticated evidence and proof-of-fire; a canary that does not fire is fail-closed, never a warning or pass.\n\n")
 	out.WriteString("Detached run example: `aira run --detach -- sh -c 'printf hello'`. Poll the returned run handle with `aira get` or `aira run-log`.\n\n")
+	out.WriteString("Live input requires `--stdin-connect`; `run-input` reports bytes accepted for delivery into the kernel pipe, not bytes processed by the child. A writer whose connection disappears while backpressured can retain the serial slot until the child drains or terminates, so another writer may receive `E_RUN_INPUT_BUSY`. Only `run-input --close` sends EOF.\n\n")
 	out.WriteString("Stable codes: `")
 	out.WriteString(strings.Join(contract.StableCodes, "`, `"))
 	fmt.Fprintf(&out, "`.\n\nThis list is the documented vocabulary, not exhaustive: any error response still carries a stable `E_`/`W_`/`U_` code, and a code not listed here exits with the default exit `%d`.\n\nExit codes:\n\n", contract.DefaultExit)

@@ -82,7 +82,7 @@ func StoreFreeCarved(verb string, args map[string]any) bool {
 			}
 		}
 		return true
-	case "run-kill", "run-log", "git":
+	case "run-kill", "run-log", "run-input", "git":
 		return true
 	case "show":
 		selector, _ := args["selector"].(string)

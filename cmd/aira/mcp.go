@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"strings"
 
 	"aira/internal/core"
+	"aira/internal/runner"
 	"aira/internal/store"
 )
 
@@ -51,6 +53,7 @@ type mcpProperty struct {
 	Items       any      `json:"items,omitempty"`
 	Enum        []string `json:"enum,omitempty"`
 	Description string   `json:"description,omitempty"`
+	MaxLength   int      `json:"maxLength,omitempty"`
 }
 
 type mcpRequest struct {
@@ -156,6 +159,10 @@ func makeToolBinding(name string, descriptors []core.DispatchDescriptor) mcpTool
 			property.Type = "string"
 		}
 		properties[arg.Name] = property
+		if descriptors[0].Name == "run-input" && arg.Name == "data" {
+			property.MaxLength = base64.StdEncoding.EncodedLen(runner.MaxRunInputFrameBytes)
+			properties[arg.Name] = property
+		}
 	}
 	schema := mcpInputSchema{Type: "object", Properties: properties}
 	if len(operations) == 1 {
@@ -406,6 +413,9 @@ func decodeMCPRequest(binding mcpToolBinding, values map[string]json.RawMessage)
 		}
 		if _, ok := args["detach"]; !ok {
 			args["detach"] = false
+		}
+		if _, ok := args["stdin_connect"]; !ok {
+			args["stdin_connect"] = false
 		}
 		if _, ok := args["follow"]; !ok {
 			args["follow"] = false

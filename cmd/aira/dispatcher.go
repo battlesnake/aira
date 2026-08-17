@@ -176,6 +176,7 @@ func canonicalProjectPath(path string) (string, error) {
 
 func (d *daemonDispatcher) dispatchCarved(ctx context.Context, request core.Request, s core.Store, project app.Project) core.Response {
 	project.Runner.SetAdmitSocketPath(d.paths.SocketPath)
+	project.Runner.SetInputRuntimeDir(d.paths.RuntimeDir)
 	face := core.FaceOutput{Stdout: d.stdout, Stderr: d.diagnostics, Live: (request.Verb == "run" || request.Verb == "git") && !d.jsonOutput}
 	dispatcher := core.NewWithRunnerFace(s, project.Runner, d.stdin, face).WithGitOps(project.GitOps)
 	if d.outputCap > 0 {
@@ -386,6 +387,9 @@ func (d *inProcessDispatcher) Dispatch(ctx context.Context, scope daemon.Worktre
 		return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
 	}
 	defer s.Close()
+	if paths, pathErr := daemon.PathsFromEnv(); pathErr == nil {
+		project.Runner.SetInputRuntimeDir(paths.RuntimeDir)
+	}
 	face := core.FaceOutput{Stdout: d.stdout, Stderr: d.diagnostics, Live: (request.Verb == "run" || request.Verb == "git") && !d.jsonOutput}
 	dispatcher := core.NewWithRunnerFace(s, project.Runner, d.stdin, face).WithGitOps(project.GitOps)
 	if d.outputCap > 0 {

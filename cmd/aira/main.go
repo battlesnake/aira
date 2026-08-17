@@ -238,6 +238,7 @@ func runSupervisor(argv []string, diagnostics io.Writer) int {
 	defer s.Close()
 	if paths, pathErr := daemon.PathsFromEnv(); pathErr == nil {
 		project.Runner.SetAdmitSocketPath(paths.SocketPath)
+		project.Runner.SetInputRuntimeDir(paths.RuntimeDir)
 	}
 	record, superviseErr := project.Runner.SuperviseRequest(context.Background(), request, readyFD, ackFD)
 	var telemetryErr error
@@ -338,13 +339,13 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 			continue
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "rebuild" || name == "steal" || name == "strict" || (name == "from-start" && verb == "watch") || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && verb == "run-log") || (name == "reasoning-subset" && verb == "spend") || (name == "all" && verb == "test-report") {
+		if name == "rebuild" || name == "steal" || name == "strict" || (name == "close" && verb == "run-input") || (name == "from-start" && verb == "watch") || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && verb == "run-log") || (name == "reasoning-subset" && verb == "spend") || (name == "all" && verb == "test-report") {
 			options[name] = "true"
 			continue
 		}
 		gateListValue := verb == "gate" && (name == "argv" || name == "env-allow")
 		if i+1 >= len(argv) || (strings.HasPrefix(argv[i+1], "--") && !gateListValue) {
-			if verb == "run-log" {
+			if strings.HasPrefix(verb, "run-") {
 				return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: option --%s requires a value", name)
 			}
 			if verb == "git" {
@@ -395,13 +396,14 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"insights":    {},
 		"git":         {},
 		"run-kill":    {"steal": true},
+		"run-input":   {"close": true, "steal": true},
 		"run-log":     {"stream": true, "from": true, "tail": true, "follow": true, "full": true},
 		"watch":       {"from": true, "from-start": true, "verb": true},
 		"gate":        {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "reason": true, "report": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-seed": true, "mutation-expected-result": true},
 	}
 	for name := range options {
 		if !allowed[verb][name] {
-			if verb == "run-log" {
+			if strings.HasPrefix(verb, "run-") {
 				return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: option --%s is not valid for %s", name, verb)
 			}
 			if verb == "git" {
@@ -447,7 +449,7 @@ func parseRunArgs(argv []string) ([]string, map[string]string, error) {
 			return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: run options must precede the launch delimiter")
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "merge" || name == "realtime" || name == "pty" || name == "detach" || name == "follow" || name == "no-stdin" || name == "store-stdin" || name == "no-admit" || name == "strict-wiring" {
+		if name == "merge" || name == "realtime" || name == "pty" || name == "detach" || name == "stdin-connect" || name == "follow" || name == "no-stdin" || name == "store-stdin" || name == "no-admit" || name == "strict-wiring" {
 			options[name] = "true"
 			continue
 		}
@@ -526,6 +528,7 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		args["realtime"] = options["realtime"] == "true"
 		args["pty"] = options["pty"] == "true"
 		args["detach"] = options["detach"] == "true"
+		args["stdin_connect"] = options["stdin-connect"] == "true"
 		args["follow"] = options["follow"] == "true"
 		args["stdin"] = options["stdin"]
 		args["no_stdin"] = options["no-stdin"] == "true"
@@ -592,6 +595,13 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			return core.Request{}, fmt.Errorf("E_RUN_ARGUMENT_INVALID: run-kill requires <run-id>")
 		}
 		args["run_id"] = positional[0]
+		args["steal"] = options["steal"] == "true"
+	case "run-input":
+		if len(positional) != 1 {
+			return core.Request{}, fmt.Errorf("E_RUN_ARGUMENT_INVALID: run-input requires <run-id>")
+		}
+		args["run_id"] = positional[0]
+		args["close"] = options["close"] == "true"
 		args["steal"] = options["steal"] == "true"
 	case "run-log":
 		if len(positional) != 1 {

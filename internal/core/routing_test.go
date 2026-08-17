@@ -37,6 +37,7 @@ func TestClassifyExecutionAndGitOpsCarveOuts(t *testing.T) {
 		{"run", "", "run", RouteClient},
 		{"run-kill", "", "run-kill", RouteClient},
 		{"run-log", "", "run-log", RouteClient},
+		{"run-input", "", "run-input", RouteClient},
 		{"show", "RUN-1", "show", RouteClient},
 		{"get", "RUN-2", "show", RouteClient},
 		{"get", "run-2", "show", RouteDaemon},
@@ -80,6 +81,7 @@ func TestStoreFreeCarvedPredicateIsComplete(t *testing.T) {
 		{Verb: "run", Args: map[string]any{"cwd": ".", "env": []string{"A=B"}, "timeout": "1s", "no_admit": true}},
 		{Verb: "run-kill", Args: map[string]any{"run_id": "RUN-1"}},
 		{Verb: "run-log", Args: map[string]any{"run_id": "RUN-1"}},
+		{Verb: "run-input", Args: map[string]any{"run_id": "RUN-1"}},
 		{Verb: "show", Args: map[string]any{"selector": "RUN-1"}},
 		{Verb: "get", Args: map[string]any{"selector": "RUN-2"}},
 		{Verb: "git", Args: map[string]any{"subverb": "fetch"}},
@@ -133,6 +135,9 @@ func (successfulStoreFreeRunner) ReadOutput(context.Context, runner.OutputReques
 func (successfulStoreFreeRunner) Reconcile(context.Context) ([]runner.RunRecord, error) {
 	return nil, nil
 }
+func (successfulStoreFreeRunner) Input(_ context.Context, request runner.RunInputRequest) (*runner.RunInputResult, error) {
+	return &runner.RunInputResult{RunID: request.RunID, Closed: request.Close}, nil
+}
 
 func TestStoreFreeCarvedHandlersNeverInvokeStore(t *testing.T) {
 	execution := successfulStoreFreeRunner{}
@@ -144,6 +149,7 @@ func TestStoreFreeCarvedHandlersNeverInvokeStore(t *testing.T) {
 		{Verb: "run", Args: map[string]any{"argv": []string{"true"}, "detach": true}},
 		{Verb: "run-kill", Args: map[string]any{"run_id": "RUN-1"}},
 		{Verb: "run-log", Args: map[string]any{"run_id": "RUN-1"}},
+		{Verb: "run-input", Args: map[string]any{"run_id": "RUN-1", "data": "", "close": true}},
 		{Verb: "show", Args: map[string]any{"selector": "RUN-1"}},
 		{Verb: "get", Args: map[string]any{"selector": "RUN-1"}},
 		{Verb: "git", Args: map[string]any{"subverb": "fetch"}},
@@ -216,6 +222,10 @@ func (r *routingRecorder) ReadOutput(context.Context, runner.OutputRequest) (*ru
 func (r *routingRecorder) Reconcile(context.Context) ([]runner.RunRecord, error) {
 	r.record("reconcile")
 	return []runner.RunRecord{{ID: "RUN-1", Status: runner.StatusExited}}, nil
+}
+func (r *routingRecorder) Input(context.Context, runner.RunInputRequest) (*runner.RunInputResult, error) {
+	r.record("input")
+	return nil, errors.New("E_RUN_INPUT_UNREACHABLE: recording sentinel")
 }
 
 type routingGitRecorder struct{ calls int }
@@ -578,6 +588,8 @@ func routingFixtures(descriptors []DispatchDescriptor, findingID string) []Reque
 			base["from"] = "0"
 			base["tail"] = "0"
 			base["stream"] = "out"
+		case "run-input":
+			base["close"] = true
 		}
 		if len(descriptor.Operations) == 0 {
 			request := Request{Verb: descriptor.Name, Args: base}

@@ -29,6 +29,10 @@ func mergeEvidence(base, candidate RunRecord) RunRecord {
 		base.PIDIdentity = candidate.PIDIdentity
 	}
 	base.Detached = base.Detached || candidate.Detached
+	base.StdinConnect = base.StdinConnect || candidate.StdinConnect
+	if candidate.InputSocket != "" {
+		base.InputSocket = candidate.InputSocket
+	}
 	if base.SupervisorPID.PID == 0 && candidate.SupervisorPID.PID != 0 {
 		base.SupervisorPID = candidate.SupervisorPID
 	}

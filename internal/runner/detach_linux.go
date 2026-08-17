@@ -104,7 +104,7 @@ func (r *Runner) LaunchDetached(ctx context.Context, req Request, wiringPath str
 	}
 	once := sync.Once{}
 	var completeErr error
-	launch := &DetachLaunch{Record: RunRecord{SchemaVersion: ledgerSchema, ID: message.ID, Status: StatusStarting, Detached: true, Telemetry: req.TelemetryPending}}
+	launch := &DetachLaunch{Record: RunRecord{SchemaVersion: ledgerSchema, ID: message.ID, Status: StatusStarting, Detached: true, StdinConnect: req.StdinConnect, Telemetry: req.TelemetryPending}}
 	launch.complete = func(delivered bool) error {
 		once.Do(func() {
 			if delivered {
@@ -176,7 +176,7 @@ func (r *Runner) launchDetachedValidated(ctx context.Context, req Request, prefi
 		SchemaVersion: ledgerSchema, ID: id, Owner: r.owner, Ticket: req.Ticket, Phase: req.Phase, Label: req.Label, Tool: req.Tool,
 		Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, Buffering: buffering, Merge: req.Merge,
 		Admission: "disabled", LaunchPrefix: append([]string(nil), prefix...), CgroupScope: r.intendedScope(id), StartedAt: nowString(r.now),
-		Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}, Detached: true, SupervisorPID: supervisor,
+		Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}, Detached: true, StdinConnect: req.StdinConnect, SupervisorPID: supervisor,
 		Telemetry: req.TelemetryPending,
 	}
 	if _, err := r.append(ledgerEvent{Kind: "starting", Run: record}); err != nil {
@@ -286,7 +286,7 @@ func (r *Runner) launchDetachedValidated(ctx context.Context, req Request, prefi
 	}
 	cmd := exec.Command(effectiveArgv[0], effectiveArgv[1:]...)
 	cmd.Dir, cmd.Env = cwd, env
-	cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: scope.FD()}
+	cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: scope.FD(), Setpgid: req.StdinConnect}
 	cmd.Stdout, cmd.Stderr, err = detachedOutputFiles(files, req.Merge)
 	if err != nil {
 		closeFiles()
@@ -295,22 +295,79 @@ func (r *Runner) launchDetachedValidated(ctx context.Context, req Request, prefi
 		_ = scope.Remove()
 		return r.failBeforeLaunch(ctx, record, "E_RUN_CAPTURE_FAILED", err)
 	}
-	setupInput := setupStdin
-	if r.setupStdinFn != nil {
-		setupInput = r.setupStdinFn
+	type waitOutcome struct {
+		err   error
+		state *os.ProcessState
 	}
-	stdinClose, stdinStored, err := setupInput(cmd, req, filepath.Join(r.outputDir, id+".in"))
-	if err != nil {
-		closeFiles()
-		unlock()
-		releaseAdmit()
-		_ = scope.Remove()
-		return r.failBeforeLaunch(ctx, record, "E_RUN_STDIN_INVALID", err)
+	var (
+		inputPlane   *runInputPlane
+		waitCh       chan waitOutcome
+		childStarted bool
+		leaderReaped bool
+	)
+	if req.StdinConnect {
+		inputPlane, err = prepareRunInputPlane(r.inputRuntimeDir, id, record.Owner)
+		if err != nil {
+			closeFiles()
+			unlock()
+			releaseAdmit()
+			_ = scope.Remove()
+			var inputErr *RunInputError
+			code := "E_RUN_INPUT_UNREACHABLE"
+			if errors.As(err, &inputErr) {
+				code = inputErr.Code
+			}
+			return r.failBeforeLaunch(ctx, record, code, err)
+		}
+		// This defer is installed before Start and owns every input-plane exit.
+		// In particular it never waits for the splice goroutine before closing
+		// inputW, so a full-pipe Write cannot wedge supervision.
+		defer func() {
+			inputPlane.closeTerminal()
+			if !childStarted || leaderReaped {
+				return
+			}
+			killDetachedInputChild(scope, cmd)
+			if waitCh == nil {
+				return
+			}
+			timer := time.NewTimer(2 * time.Second)
+			defer timer.Stop()
+			select {
+			case <-waitCh:
+				leaderReaped = true
+			case <-timer.C:
+				record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
+				_, _ = r.append(ledgerEvent{Kind: "input-abort-incomplete", Run: record})
+			}
+		}()
+		cmd.Stdin = inputPlane.inputR
+		record.InputSocket = inputPlane.path
+		if _, err := r.append(ledgerEvent{Kind: "input-ready", Run: record}); err != nil {
+			closeFiles()
+			unlock()
+			releaseAdmit()
+			_ = scope.Remove()
+			return r.failBeforeLaunch(ctx, record, "U_RUN_RECONCILE_REQUIRED", err)
+		}
+	} else {
+		setupInput := setupStdin
+		if r.setupStdinFn != nil {
+			setupInput = r.setupStdinFn
+		}
+		stdinClose, stdinStored, setupErr := setupInput(cmd, req, filepath.Join(r.outputDir, id+".in"))
+		if setupErr != nil {
+			closeFiles()
+			unlock()
+			releaseAdmit()
+			_ = scope.Remove()
+			return r.failBeforeLaunch(ctx, record, "E_RUN_STDIN_INVALID", setupErr)
+		}
+		if stdinClose != nil {
+			defer stdinClose()
+		}
+		record.StdinStored = stdinStored
 	}
-	if stdinClose != nil {
-		defer stdinClose()
-	}
-	record.StdinStored = stdinStored
 	startCommand := func(command *exec.Cmd) error { return command.Start() }
 	if r.startFn != nil {
 		startCommand = r.startFn
@@ -322,6 +379,15 @@ func (r *Runner) launchDetachedValidated(ctx context.Context, req Request, prefi
 		_ = scope.Remove()
 		return r.failBeforeLaunch(ctx, record, "E_RUN_LAUNCH_FAILED", err)
 	}
+	childStarted = true
+	if inputPlane != nil {
+		_ = inputPlane.inputR.Close()
+	}
+	waitCh = make(chan waitOutcome, 1)
+	go func() {
+		waitErr := cmd.Wait()
+		waitCh <- waitOutcome{err: waitErr, state: cmd.ProcessState}
+	}()
 	record.PIDIdentity = PIDIdentity{PID: cmd.Process.Pid, StartTick: processStartTick(cmd.Process.Pid), BootID: bootID}
 	record.Status = StatusRunning
 	members, memberErr := scope.Members()
@@ -335,6 +401,32 @@ func (r *Runner) launchDetachedValidated(ctx context.Context, req Request, prefi
 		r.beforeRunningAppendFn()
 	}
 	if _, err := r.append(ledgerEvent{Kind: "running", Run: record}); err != nil {
+		if inputPlane != nil {
+			// Unlike the legacy detached mode, a connect-mode child cannot be
+			// preserved after losing its durable socket discovery record: it
+			// would remain alive on a pipe that no client can reach.
+			inputPlane.closeTerminal()
+			killDetachedInputChild(scope, cmd)
+			timer := time.NewTimer(2 * time.Second)
+			select {
+			case <-waitCh:
+				leaderReaped = true
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+			case <-timer.C:
+				record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
+			}
+			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
+			_, _ = r.append(ledgerEvent{Kind: "running-failure", Run: record})
+			unlock()
+			releaseAdmit()
+			closeFiles()
+			return nil, launchErr("U_RUN_RECONCILE_REQUIRED", err)
+		}
 		// The child already exists in the scope, so returning here would orphan it.
 		// Preserve supervision and retry the full running evidence while still
 		// holding the launch flock. This run can no longer be a clean success.
@@ -345,16 +437,9 @@ func (r *Runner) launchDetachedValidated(ctx context.Context, req Request, prefi
 	unlock()
 	releaseAdmit()
 	closeFiles()
-
-	type waitOutcome struct {
-		err   error
-		state *os.ProcessState
+	if inputPlane != nil {
+		inputPlane.serve()
 	}
-	waitCh := make(chan waitOutcome, 1)
-	go func() {
-		waitErr := cmd.Wait()
-		waitCh <- waitOutcome{err: waitErr, state: cmd.ProcessState}
-	}()
 	var outcome waitOutcome
 	if req.Timeout > 0 {
 		timer := time.NewTimer(req.Timeout)
@@ -386,6 +471,12 @@ func (r *Runner) launchDetachedValidated(ctx context.Context, req Request, prefi
 	} else {
 		outcome = <-waitCh
 	}
+	leaderReaped = true
+	if inputPlane != nil {
+		// The leader has exited. Close fd0 before waitEmpty/forced quiescence:
+		// a descendant blocked on inherited stdin must observe EOF and drain.
+		inputPlane.closeTerminal()
+	}
 	waitErr := outcome.err
 	cmd.ProcessState = outcome.state
 	exitCode, signal := waitEvidence(cmd.ProcessState, waitErr)
@@ -405,6 +496,17 @@ func (r *Runner) launchDetachedValidated(ctx context.Context, req Request, prefi
 		}
 	}
 	return r.finalizeDetachedTerminal(ctx, id, scope)
+}
+
+func killDetachedInputChild(scope Scope, cmd *exec.Cmd) {
+	_ = scope.Kill()
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	// Connect-mode children are their own process-group leaders, so this
+	// fallback cannot signal the supervisor's group.
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	_ = cmd.Process.Kill()
 }
 
 func (r *Runner) forceDetachedQuiesce(ctx context.Context, id string, record RunRecord, scope Scope) (*RunRecord, error) {

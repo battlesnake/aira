@@ -49,6 +49,40 @@ func TestEnvDigestUsesSortedLengthPrefixedBytes(t *testing.T) {
 	}
 }
 
+func TestStdinConnectValidationPrecedesLaunch(t *testing.T) {
+	r, err := New(Config{CommonDir: t.TempDir(), Backend: &validationBackend{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]Request{
+		"requires detach": {Argv: []string{"true"}, StdinConnect: true},
+		"stdin file":      {Argv: []string{"true"}, Detach: true, StdinConnect: true, StdinPath: "input"},
+		"stdin dash":      {Argv: []string{"true"}, Detach: true, StdinConnect: true, StdinPath: "-"},
+		"pty":             {Argv: []string{"true"}, Detach: true, StdinConnect: true, PTY: true},
+		"store stdin":     {Argv: []string{"true"}, Detach: true, StdinConnect: true, StoreStdin: true},
+		"reader":          {Argv: []string{"true"}, Detach: true, StdinConnect: true, Stdin: strings.NewReader("x")},
+	}
+	for name, req := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := r.Launch(context.Background(), req)
+			var launch *LaunchError
+			if !errors.As(err, &launch) || launch.Code != "E_RUN_ARGUMENT_INVALID" {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
+
+type validationBackend struct{}
+
+func (*validationBackend) Probe(context.Context) error { return errors.New("must not probe") }
+func (*validationBackend) Create(context.Context, string) (Scope, error) {
+	return nil, errors.New("must not create")
+}
+func (*validationBackend) Open(context.Context, string) (Scope, error) {
+	return nil, errors.New("must not open")
+}
+
 func TestStdbufInjectionPrependsAndNoOpPreservesEnvironment(t *testing.T) {
 	previous := locateLibstdbufFn
 	t.Cleanup(func() { locateLibstdbufFn = previous })
@@ -90,7 +124,7 @@ func TestLedgerRoundTripPreservesBufferingAndAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Owner: "A", StolenBy: "B", Status: StatusStarting, ScopeIntegrity: ScopeContained, Buffering: "realtime", Admission: "waited", AdmissionReason: "", AdmissionWaitedMS: 123}
+	run := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Owner: "A", StolenBy: "B", Status: StatusStarting, ScopeIntegrity: ScopeContained, Buffering: "realtime", Admission: "waited", AdmissionReason: "", AdmissionWaitedMS: 123, StdinConnect: true, InputSocket: "/runtime/input.sock"}
 	if _, err := l.append(ledgerEvent{Kind: "starting", Run: run}); err != nil {
 		t.Fatal(err)
 	}
@@ -106,6 +140,9 @@ func TestLedgerRoundTripPreservesBufferingAndAdmission(t *testing.T) {
 	}
 	if events[0].Run.Owner != "A" || events[0].Run.StolenBy != "B" {
 		t.Fatalf("ledger ownership=%+v", events[0].Run)
+	}
+	if !events[0].Run.StdinConnect || events[0].Run.InputSocket != "/runtime/input.sock" {
+		t.Fatalf("ledger input discovery=%+v", events[0].Run)
 	}
 }
 

@@ -4,7 +4,9 @@
 package core
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -309,6 +311,10 @@ type Runner interface {
 type detachedRunner interface {
 	LaunchDetached(context.Context, runner.Request, string) (*runner.DetachLaunch, error)
 	DetachOutputDir() string
+}
+
+type runInputRunner interface {
+	Input(context.Context, runner.RunInputRequest) (*runner.RunInputResult, error)
 }
 
 type supervisorLivenessRunner interface {
@@ -1282,6 +1288,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			boolSpec("realtime", false, false, "Apply realtime stdio buffering when libstdbuf is available"),
 			boolSpec("pty", false, false, "Capture through a controlling PTY and merge stdout with stderr"),
 			boolSpec("detach", false, false, "Return a handle while a per-run supervisor owns the child"),
+			boolSpec("stdin_connect", false, false, "Accept live stdin bytes over a per-run socket"),
 			boolSpec("follow", false, false, "Keep the launching face attached to the run"),
 			stringSpec("stdin", false, false, "Launch-time stdin file or -"),
 			boolSpec("no_stdin", false, false, "Explicitly launch with null stdin"),
@@ -1316,7 +1323,10 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				Ticket: stringArg(args, "ticket"), Phase: stringArg(args, "phase"), Label: stringArg(args, "label"), Tool: params.Tool,
 				Prefix: stringSlice(args, "prefix"), Merge: boolArg(args, "merge"), Realtime: boolArg(args, "realtime"), PTY: boolArg(args, "pty"), StdinPath: stringArg(args, "stdin"),
 				StoreStdin: boolArg(args, "store_stdin"), NoAdmit: boolArg(args, "no_admit"), Timeout: timeout,
-				Detach: boolArg(args, "detach"),
+				Detach: boolArg(args, "detach"), StdinConnect: boolArg(args, "stdin_connect"),
+			}
+			if request.StdinConnect && (!request.Detach || request.PTY || request.StdinPath != "" || noStdin || request.StoreStdin) {
+				return nil, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("--stdin-connect requires --detach and is incompatible with --stdin, --no-stdin, --pty, and --store-stdin"))
 			}
 			follow := boolArg(args, "follow")
 			if request.PTY {
@@ -1398,6 +1408,46 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				return handlerData{Data: data, Code: "E_RUN_WIRING_INCOMPLETE"}, nil
 			}
 			return data, nil
+		}},
+		"run-input": {Name: "run-input", Usage: "run-input <run-id> [--close] [--steal]", Args: []ArgSpec{
+			stringSpec("run_id", true, true, "Run identifier"),
+			stringSpec("data", false, false, "Base64 bytes accepted for delivery (MCP; maximum 1 MiB)"),
+			boolSpec("close", false, false, "Close the child's stdin after accepted bytes"),
+			boolSpec("steal", false, false, "Override foreign run ownership"),
+		}, MCPTool: "aira_run_input", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+			request := runner.RunInputRequest{RunID: stringArg(args, "run_id"), Close: boolArg(args, "close"), Steal: boolArg(args, "steal")}
+			dataPresent := args.present("data")
+			inputRunner, ok := c.runner.(runInputRunner)
+			if !ok {
+				return nil, runnerError("E_RUN_SCOPE_UNAVAILABLE", errors.New("run input is unavailable"))
+			}
+			if dataPresent {
+				encoded := stringArg(args, "data")
+				if len(encoded) > base64.StdEncoding.EncodedLen(runner.MaxRunInputFrameBytes) {
+					return nil, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("run-input data exceeds the maximum frame size"))
+				}
+				data, err := base64.StdEncoding.DecodeString(encoded)
+				if err != nil {
+					return nil, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("run-input data must be valid base64"))
+				}
+				if len(data) > runner.MaxRunInputFrameBytes {
+					return nil, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("run-input data exceeds the maximum frame size"))
+				}
+				request.Reader = bytes.NewReader(data)
+			} else {
+				request.Reader = c.stdin
+			}
+			if request.Reader == nil && !request.Close {
+				return nil, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("run-input requires data or --close"))
+			}
+			result, err := inputRunner.Input(ctx, request)
+			var inputErr *runner.RunInputError
+			if errors.As(err, &inputErr) {
+				return handlerData{Code: inputErr.Code, Error: inputErr.Error(), Data: map[string]any{
+					"run_id": request.RunID, "accepted": inputErr.Committed,
+				}}, nil
+			}
+			return result, err
 		}},
 		"run-kill": {Name: "run-kill", Usage: "run-kill <run-id> [--steal]", Args: []ArgSpec{stringSpec("run_id", true, true, "Run identifier"), boolSpec("steal", false, false, "Override foreign run ownership")}, MCPTool: "aira_run_kill", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			runID := stringArg(args, "run_id")
@@ -1627,6 +1677,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 			{Name: "ls-remote", Summary: "List remote refs", Safety: SafetyExecute, Args: []OperationArg{{Name: "remote"}, {Name: "refspecs"}}, Example: []string{"ls-remote", "origin"}},
 		}},
 		"run":       {summary: "Launch a subprocess in an owned scope", safety: SafetyExecute, example: []string{"--merge", "--", "printf", "hello"}},
+		"run-input": {summary: "Send bytes accepted for delivery to a detached run", safety: SafetyExecute, example: []string{"RUN-1", "--close"}},
 		"run-kill":  {summary: "Kill an owned run scope", safety: SafetyExecute, example: []string{"RUN-1"}},
 		"run-log":   {summary: "Read captured run output", safety: SafetyRead, example: []string{"RUN-1", "--stream", "out"}},
 		"reconcile": {summary: "Reconcile derived project state", safety: SafetyReconcile, example: []string{"--rebuild"}},

@@ -3,18 +3,45 @@ package core
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"io"
 	"testing"
 
 	"aira/internal/runner"
 )
 
 type faceRunner struct {
-	request runner.Request
+	request      runner.Request
+	inputRequest runner.RunInputRequest
+	inputData    []byte
+	inputCalls   int
+	launchCalls  int
 }
 
 func (r *faceRunner) Launch(_ context.Context, request runner.Request) (*runner.RunRecord, error) {
+	r.launchCalls++
 	r.request = request
 	return &runner.RunRecord{ID: "RUN-1", Status: runner.StatusExited}, nil
+}
+
+func TestRunStdinConnectCoreValidationRejectsEveryConflictingFaceOption(t *testing.T) {
+	cases := map[string]map[string]any{
+		"requires detach": {"stdin_connect": true},
+		"stdin":           {"stdin_connect": true, "detach": true, "stdin": "input"},
+		"no stdin":        {"stdin_connect": true, "detach": true, "no_stdin": true},
+		"pty":             {"stdin_connect": true, "detach": true, "pty": true},
+		"store stdin":     {"stdin_connect": true, "detach": true, "store_stdin": true},
+	}
+	for name, options := range cases {
+		t.Run(name, func(t *testing.T) {
+			fake := &faceRunner{}
+			options["argv"] = []string{"child"}
+			response := NewWithRunner(nil, fake).Do(context.Background(), Request{Verb: "run", Args: options})
+			if response.Code != "E_RUN_ARGUMENT_INVALID" || fake.launchCalls != 0 {
+				t.Fatalf("response=%+v launchCalls=%d", response, fake.launchCalls)
+			}
+		})
+	}
 }
 func (*faceRunner) Kill(context.Context, string, bool) (*runner.RunRecord, error) { return nil, nil }
 func (*faceRunner) Get(string) (*runner.RunRecord, error)                         { return nil, nil }
@@ -22,6 +49,30 @@ func (*faceRunner) ReadOutput(context.Context, runner.OutputRequest) (*runner.Ou
 	return nil, nil
 }
 func (*faceRunner) Reconcile(context.Context) ([]runner.RunRecord, error) { return nil, nil }
+func (r *faceRunner) Input(_ context.Context, request runner.RunInputRequest) (*runner.RunInputResult, error) {
+	r.inputCalls++
+	r.inputRequest = request
+	if request.Reader != nil {
+		r.inputData, _ = io.ReadAll(request.Reader)
+	}
+	return &runner.RunInputResult{RunID: request.RunID, Accepted: int64(len(r.inputData)), Closed: request.Close}, nil
+}
+
+func TestRunInputFaceStreamsCLIBytesAndBoundsMCPData(t *testing.T) {
+	fake := &faceRunner{}
+	dispatcher := NewWithRunnerFace(nil, fake, bytes.NewReader([]byte{0, 1, 0xff}), FaceOutput{})
+	response := dispatcher.Do(context.Background(), Request{Verb: "run-input", Args: map[string]any{"run_id": "RUN-1", "close": true, "steal": true}})
+	if !response.OK || !bytes.Equal(fake.inputData, []byte{0, 1, 0xff}) || !fake.inputRequest.Close || !fake.inputRequest.Steal {
+		t.Fatalf("response=%+v request=%+v data=%x", response, fake.inputRequest, fake.inputData)
+	}
+
+	overCap := base64.StdEncoding.EncodeToString(make([]byte, runner.MaxRunInputFrameBytes+1))
+	fake.inputCalls = 0
+	response = NewWithRunnerOutputCap(nil, fake, 1024).Do(context.Background(), Request{Verb: "run-input", Args: map[string]any{"run_id": "RUN-1", "data": overCap}})
+	if response.Code != "E_RUN_ARGUMENT_INVALID" || fake.inputCalls != 0 {
+		t.Fatalf("over-cap response=%+v calls=%d", response, fake.inputCalls)
+	}
+}
 
 func TestRunnerFaceWiresSeparateLiveSinksWithoutMutatingCore(t *testing.T) {
 	var stdout, stderr bytes.Buffer

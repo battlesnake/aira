@@ -3,6 +3,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -383,6 +384,37 @@ func TestM20LaunchFlockIsHeldThroughStartAttempt(t *testing.T) {
 	}
 }
 
+func TestRunInputPathFailureOccursBeforeChildStart(t *testing.T) {
+	r, scope := newMemoryRunner(t, nil)
+	r.inputRuntimeDir = filepath.Join(newRunInputRuntimeDir(t), strings.Repeat("long-runtime-component-", 8))
+	started := 0
+	r.startFn = func(*exec.Cmd) error {
+		started++
+		return errors.New("must not start")
+	}
+	readyR, readyW, _ := os.Pipe()
+	ackR, ackW, _ := os.Pipe()
+	req := Request{Argv: []string{"/bin/true"}, Detach: true, StdinConnect: true, detachReady: &detachSignal{file: readyW}, detachAck: ackR}
+	done := make(chan error, 1)
+	cwd := t.TempDir()
+	bootID := mustBootID(t)
+	go func() {
+		_, err := r.launchDetachedValidated(context.Background(), req, nil, cwd, []string{}, "digest", "none", req.Argv, bootID)
+		done <- err
+	}()
+	var ready detachReadyMessage
+	if err := json.NewDecoder(readyR).Decode(&ready); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = ackW.Write([]byte{1})
+	_ = ackW.Close()
+	err := <-done
+	var launch *LaunchError
+	if !errors.As(err, &launch) || launch.Code != "E_RUN_INPUT_PATH_TOO_LONG" || started != 0 || len(scope.members) != 0 {
+		t.Fatalf("error=%v started=%d members=%v", err, started, scope.members)
+	}
+}
+
 func TestM20ReconcileAndKillBoundedLockNeverFabricateTerminal(t *testing.T) {
 	r, scope := newMemoryRunner(t, []int{42})
 	r.runLockTimeout = 15 * time.Millisecond
@@ -714,6 +746,93 @@ func TestM20RealDetachReturnsWhileChildLivesAndSupervisorIsOutsideScope(t *testi
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("supervisor did not finish after run-kill")
+	}
+}
+
+func TestRunInputRealDescendantReceivesEOFAfterLeaderExit(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		skipOrFailRealCgroup(t, "python3 unavailable: %v", err)
+	}
+	r := realRunner(t)
+	r.inputRuntimeDir = newRunInputRuntimeDir(t)
+	_, result := startRealDetached(t, r, Request{Argv: []string{python, "-c", "import os,sys\nif os.fork():\n os._exit(0)\nsys.stdin.read()"}, StdinConnect: true})
+	select {
+	case outcome := <-result:
+		if outcome.err != nil || outcome.record == nil || !outcome.record.Status.Terminal() {
+			t.Fatalf("descendant EOF outcome=%+v", outcome)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("leader-exit input close did not release the descendant")
+	}
+}
+
+func TestRunInputRealBinaryReconnectAndExplicitEOF(t *testing.T) {
+	r := realRunner(t)
+	r.inputRuntimeDir = newRunInputRuntimeDir(t)
+	id, result := startRealDetached(t, r, Request{Argv: []string{"/bin/cat"}, StdinConnect: true})
+	running := waitForRunState(t, r, id, func(record RunRecord) bool {
+		return record.Status == StatusRunning && record.StdinConnect && record.InputSocket != ""
+	})
+	first := []byte{0, 'a', '\n', 0xff}
+	accepted, err := r.Input(context.Background(), RunInputRequest{RunID: id, Reader: bytes.NewReader(first)})
+	if err != nil || accepted.Accepted != int64(len(first)) || accepted.Closed {
+		t.Fatalf("first input=%+v err=%v", accepted, err)
+	}
+	second := []byte("second\n")
+	accepted, err = r.Input(context.Background(), RunInputRequest{RunID: id, Reader: bytes.NewReader(second), Close: true})
+	if err != nil || accepted.Accepted != int64(len(second)) || !accepted.Closed {
+		t.Fatalf("second input=%+v err=%v", accepted, err)
+	}
+	select {
+	case outcome := <-result:
+		if outcome.err != nil || outcome.record == nil || outcome.record.Status != StatusExited {
+			t.Fatalf("cat outcome=%+v", outcome)
+		}
+		output, readErr := os.ReadFile(outcome.record.OutputRefs["out"].Path)
+		want := append(append([]byte(nil), first...), second...)
+		if readErr != nil || !bytes.Equal(output, want) {
+			t.Fatalf("output=%x want=%x err=%v running=%+v", output, want, readErr, running)
+		}
+		if _, statErr := os.Stat(running.InputSocket); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("input socket was not unlinked: %v", statErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cat did not exit after explicit input close")
+	}
+}
+
+func TestRunInputRealKillUnblocksFullPipeSplice(t *testing.T) {
+	r := realRunner(t)
+	r.inputRuntimeDir = newRunInputRuntimeDir(t)
+	id, supervisor := startRealDetached(t, r, Request{Argv: []string{"/bin/sleep", "30"}, StdinConnect: true})
+	running := waitForRunState(t, r, id, func(record RunRecord) bool {
+		return record.Status == StatusRunning && record.InputSocket != ""
+	})
+	inputDone := make(chan error, 1)
+	go func() {
+		_, inputErr := r.Input(context.Background(), RunInputRequest{RunID: id, Reader: bytes.NewReader(make([]byte, 2*MaxRunInputFrameBytes))})
+		inputDone <- inputErr
+	}()
+	time.Sleep(200 * time.Millisecond)
+	if _, err := r.Kill(context.Background(), id, false); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-inputDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("closing inputW did not unblock the full-pipe splice")
+	}
+	select {
+	case outcome := <-supervisor:
+		if outcome.err != nil || outcome.record == nil || !outcome.record.Status.Terminal() {
+			t.Fatalf("supervisor outcome=%+v", outcome)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("supervisor did not terminalize after mid-input kill")
+	}
+	if _, statErr := os.Stat(running.InputSocket); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("input socket was not unlinked: %v", statErr)
 	}
 }
 
