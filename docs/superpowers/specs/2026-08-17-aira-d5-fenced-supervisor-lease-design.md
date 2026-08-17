@@ -1,6 +1,6 @@
 # D5 — Fenced supervisor lease + shim-via-daemon (design / plan)
 
-**Status:** v6 — folds Sol plan-review r5 (1 finding + 1 nit, all folded). For Sol r6.
+**Status:** v7 — folds Sol plan-review r6 (2 prose/contract residues). For Sol r7.
 **Milestone:** Phase 5 · D5 (task #41). Follows D1–D4 (all merged; master `dc7dc35`).
 **Loop:** plan → Sol plan-review (rounds → APPROVE-PLAN) → Fable plan-gate → Terra build →
 Opus real-HW verify → Sol build-review (rounds → RESOLVED) → merge. Correctness-critical
@@ -48,8 +48,9 @@ fenced evidence**, NOT a replacement for the `/proc` liveness check
 2. The supervisor (`__supervise`) claims / renews / releases via the D4 admit transport
    (shim-via-daemon, §3). The daemon is the SOLE writer of `supervisor_leases`; the supervisor
    never mutates it directly.
-3. A supervisor **reacquire state machine** (Sol r1 #2): a fenced/lapsed/absent renew re-claims
-   a fresh generation + capability so a daemon flap that exceeds TTL is self-healing.
+3. A supervisor **reacquire state machine** (Sol r1 #2): any non-`ok` renew
+   (`expired`/`fenced`/`token`/`absent`) re-claims a fresh generation + capability so a daemon flap
+   that exceeds TTL is self-healing.
 4. The daemon **reaper** (D1) also laps expired supervisor leases (§2.5) — an auditable lapse;
    it does NOT finalize the run (only a reader synthesizing `lost` on `/proc processDead`+EMPTY, or
    finalizing from leader-exit evidence, terminalizes — §2.4; lease lapse never does).
@@ -78,8 +79,9 @@ the telemetry relay.
 
 ### 2.1 The daemonless floor + failure classification (Sol r1 #4, #5)
 Spec §14 is a hard requirement: a detached run must work **daemonless**. The lease is
-authoritative-when-present but its absence never breaks the run — because `/proc` remains the
-finalization authority (§2.4), a leaseless run behaves exactly as M20.
+authoritative-when-present but its absence never breaks the run — because `/proc processDead`
+remains the sole authority for synthesizing `lost` (and leader-exit evidence finalizes
+independently, §2.4), a leaseless run behaves exactly as M20.
 
 **Idempotent claim (Sol r2/r3 — the ambiguous-timeout-after-commit case).** A claim transport
 timeout is AMBIGUOUS: the daemon may have committed the lease before the reply was lost, so the
@@ -194,9 +196,10 @@ Frame: the M20 two-phase readiness+ACK (`detach_linux.go:182-191`).
    authoritative). Stop the renew loop.
 
 **Reacquire state machine (self-healing after a daemon flap that exceeds TTL):** the renew loop
-is a single serialized goroutine holding the current `{generation, capability}`. A renew that
-returns *fenced* (generation mismatch), *lapsed*, or *absent* (the reaper lapped it during a long
-daemon outage) triggers a **re-claim**: obtain a fresh `{generation, capability}`, atomically
+is a single serialized goroutine holding the current `{generation, capability}`. ANY non-`ok`
+renew — `expired` (TTL elapsed, or the row was already reaped to `lapsed`), `fenced` (generation
+mismatch), `token` (capability mismatch), or `absent` (no row) — triggers a **re-claim**: obtain a
+fresh `{generation, capability}`, atomically
 replace the in-memory pair, and continue renewing. Re-claim is refused (fail-safe, stays
 leaseless, `/proc` covers safety) only if the run's lease is `held` by a *different live* holder
 (the §2.1 conflict, impossible in normal operation). Claim/renew/release/reacquire are serialized
@@ -382,7 +385,8 @@ When D7b relays these reads through the daemon, they follow; D5 does not require
   a claim with a DIFFERENT identity → conflict (Sol r2); reap laps an expired supervisor lease
   (exact-predicate CAS, `affected==1`), skips a revived one (`beforeReapCAS` seam like D1);
   concurrent claim by two supervisors → exactly one wins; clock-after-lock; events+outbox emitted.
-- **Reacquire (unit):** a lapsed/absent renew re-claims a fresh generation and continues;
+- **Reacquire (unit):** any non-`ok` renew (`expired`/`fenced`/`token`/`absent`, incl. a row
+  reaped to `lapsed`) re-claims a fresh generation and continues;
   serialized (no concurrent lease op from one supervisor).
 - **Reader matrix (unit, table-driven, full §2.4 matrix):** every `{proc}×{lease}×{scope}×
   {leader-exit}` cell → assert preserve / finalize-from-evidence / lost / reconcile-required.
