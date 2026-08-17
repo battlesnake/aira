@@ -1,6 +1,6 @@
 # AIRA D3 — daemon watch (`aira watch`, long-poll event tail)
 
-**Status:** DRAFT v5 (Sol plan-review r1 6 → r2 4 → r3 3 → r4 3 findings; folded, eof reframed best-effort)
+**Status:** DRAFT v6 (Sol plan-review r1 6 → r2 4 → r3 3 → r4 3 → r5 1 findings; folded)
 **Branch:** `codex-aira-d3` · **Base:** master `982556b` (D2 merged)
 **Depends on:** M21 (mandatory DB-owning daemon + routed coordination), D1/D2 (daemon
 timers + process-terminal shutdown this reuses).
@@ -106,27 +106,35 @@ reclaimed on *every* path — timeout, disconnect, shutdown, error, panic; Sol r
      exceed ~`watchMaxConcurrent`/`pollInterval` round-trips/s — the bound the cap+floor claim). A
      `<-s.stopping`/`<-connCtx.Done()` during that wait short-circuits (eof / canceled).
    - Else `select`: `<-pollTicker` → re-query; `<-deadlineTimer` → return `{[], from, eof:false}`
-     (long-poll timeout, client re-polls); `<-s.stopping` → return `{[], from, eof:true}` (the
-     ONLY shutdown path); `<-connCtx.Done()` → return `connCtx.Err()` (client gone — the client is
-     no longer listening, so the return value is moot; the point is to stop the handler).
-5. **Best-effort shutdown priority, benign residual (Sol r3 #1, r4).** Go `select` chooses randomly
-   among ready cases, so after **every** non-shutdown wake and **immediately before writing any
-   normal (non-`eof`) response** the handler does a non-blocking priority check
-   `select { case <-s.stopping: return {[], from, eof:true}; default: }` — this pre-write check is
-   the **linearization point**: if `s.stopping` is observed closed, the client gets `eof`. Perfect
-   atomicity is impossible (a shutdown that begins *during* the response write cannot un-write it),
-   and it is **unnecessary**: the residual race — a normal batch delivered as shutdown begins — is
-   **benign**. That batch carries only real committed events (no loss, no duplication beyond the
-   stated at-least-once contract, no fabrication); the client then re-requests, gets
-   `E_DAEMON_UNAVAILABLE`, and its at-least-once retry reconnects or auto-starts — exactly what a
-   durable "keep me updated" watch should do in the mandatory-daemon model. So `eof` is a
-   **best-effort clean-exit hint**, not a hard guarantee; correctness (no lost/duped events, clean
-   client behaviour on daemon-gone) holds either way. A mutex/state-transition would only shrink,
-   never close, the in-flight-write window and is not warranted for a benign race. (`connCtx`
-   cancellation need not be prioritised — the client is already gone.) §6 tests the pre-write
-   check under coincident timeout/event/shutdown and the client's graceful daemon-gone re-request.
-4. The wait holds **no** DB connection/txn/lock: `EventsSince` runs a quick `SELECT` and returns,
+     (long-poll timeout, client re-polls); `<-s.stopping` → **`terminalDrain(from)`** (the ONLY
+     shutdown path, §3.2.1); `<-connCtx.Done()` → return `connCtx.Err()` (client gone — the client
+     is no longer listening, so the return value is moot; the point is to stop the handler).
+5. **Best-effort shutdown priority (Sol r3 #1, r4).** Go `select` chooses randomly among ready
+   cases, so after **every** non-shutdown wake and **immediately before writing any normal
+   (non-`eof`) response** the handler does a non-blocking priority check
+   `select { case <-s.stopping: return terminalDrain(from); default: }` — this pre-write check is
+   the **linearization point**: if `s.stopping` is observed closed, the client gets the terminal
+   drain (§3.2.1). Perfect atomicity is impossible (a shutdown beginning *during* the response
+   write cannot un-write it) and **unnecessary**: the residual race — a normal batch delivered as
+   shutdown begins — is **benign** (only real committed events; no loss/dup beyond the at-least-once
+   contract; the client re-requests, gets `E_DAEMON_UNAVAILABLE`, and its at-least-once retry
+   reconnects/auto-starts, exactly what a durable watch should do). A mutex would only shrink, never
+   close, the in-flight-write window — not warranted. (`connCtx` cancellation need not be
+   prioritised — the client is already gone.)
+6. The wait holds **no** DB connection/txn/lock: `EventsSince` runs a quick `SELECT` and returns,
    then the handler sleeps on the ticker with nothing open (cf. D2's `MaxOpenConns(1)` deadlock).
+
+#### 3.2.1 `terminalDrain(from)` — no committed event lost at shutdown (Sol r5)
+Returning a bare `{events:[], cursor:from, eof:true}` on shutdown **loses** any event committed
+after the last scan: cursor 10, event 11 commits, `s.stopping` closes, the client gets `eof` and
+exits without ever fetching 11. So **every** `eof:true` return goes through `terminalDrain(from)`:
+a **final** `EventsSince(from, batchCap)` scan; return `{events: filter(scanned), cursor:
+scanned.MaxScannedSeq (or from), eof: true}`. The client processes this last batch **then** exits
+on `eof`, so every event committed **up to the daemon's final shutdown scan is delivered**.
+Residual (honest, bounded): events committed *after* that final scan — or beyond `batchCap` at the
+exact shutdown instant — are not delivered on this connection, but are durable in the DB and
+recoverable with `--from <cursor>` on a re-watch. `terminalDrain` is a pure read, no lock; it runs
+on both the pre-write priority check and the loop's `<-s.stopping` case.
 
 `s.stopping` is promoted to a `Server` field (set where the local `stopping` is created in
 `Serve`, closed on the shutdown path as today). A long-poll is a **finite** request (≤
@@ -202,7 +210,10 @@ is an index range, cheap.
 ## 4. Invariants
 1. **Completeness.** Every `events` row is *scanned* in seq order; every row matching the filter is
    delivered **at least once, in order** (any writer — routed, reaper, carved), deduped by `seq`.
-   No missed-write gap. (Not "exactly once" — a lost response re-delivers; see invariant 3.)
+   No missed-write gap. (Not "exactly once" — a lost response re-delivers; see invariant 3.) **At
+   shutdown, the terminal `eof` response first drains** (§3.2.1) so events committed up to the
+   daemon's final scan are delivered before the client exits; events committed *after* the daemon
+   stops accepting are durable and recoverable via `--from` (bounded, honest residual).
 2. **Ordered matching delivery; cursor is a global high-water mark (Sol r1 #4).** The cursor
    advances past *scanned* (not just matching) seqs, so a filtered stream's **emitted** seqs are
    ordered and complete but **not contiguous** (gaps = filtered-out events). The unfiltered scan
@@ -272,8 +283,9 @@ Daemon (`s.watch`, real-HW):
    excludes a burst, one poll returns `{events:[], cursor:advanced}` and the *next* poll does not
    rescan the excluded rows (assert the scanned-from cursor moved).
 7. Long-poll **timeout** returns `{[], from, eof:false}` at ~`wait_ms`; cursor unchanged.
-8. **Shutdown returns `eof` promptly** — a watch mid-long-poll returns `{eof:true}` on stop and
-   `Serve` drains without `DrainTimeout`.
+8. **Shutdown terminal-drains, loses nothing (Sol r5):** an event committed at cursor+1 just
+   before `close(s.stopping)` is **delivered in the terminal `eof:true` batch** (not an empty
+   `{cursor:from, eof:true}`); the watch returns promptly and `Serve` drains without `DrainTimeout`.
 9. **Disconnect cancels promptly (Sol r1 #1):** a client that closes mid-long-poll cancels the
    handler (peer-close detector) rather than leaking until `wait_ms`; a non-reading client is
    bounded by the write deadline.
@@ -287,8 +299,8 @@ Daemon (`s.watch`, real-HW):
     `from`-cursor watch over a ready backlog does not return its non-empty batch before
     ~`pollInterval`; a `from_now` request is likewise paced; a `wait_ms` below `pollInterval` is
     clamped up. **Coincident-wake stress:** with the deadline/pacing timer and `close(s.stopping)`
-    made to fire together (a seam), the handler deterministically returns `eof:true`, never a
-    normal `eof:false` response, across many iterations.
+    made to fire together (a seam), the handler returns `eof:true` (terminal-drained per §3.2.1),
+    never a normal `eof:false` response, across many iterations.
 
 Client / e2e (real daemon):
 13. `aira watch` auto-starts the daemon, prints events as concurrent `mv`/`claim` make them,
