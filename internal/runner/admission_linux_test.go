@@ -1059,11 +1059,12 @@ func TestDaemonAdmitStatesAreByteIdenticalOnRunRecord(t *testing.T) {
 	}
 }
 
-func TestDaemonAdmitWedgedDaemonDeadlineIsUnevaluatedNotFlock(t *testing.T) {
-	// A wedged daemon (dial succeeds, no response) is UP and may hold live
-	// reservations, so the client-side deadline must NOT enter the flock domain
-	// (Sol build r1 #2); it fails open unevaluated, still bounded by the deadline
-	// (Sol build r1 #1/#4). The connection close happens before the client returns.
+func TestDaemonAdmitWedgedDaemonDeadlineFallsToFlock(t *testing.T) {
+	// A wedged daemon (dial succeeds, no response) trips the client-side transport
+	// deadline (Sol build r1 #1/#4). The client closes the socket, then routes to the
+	// SINGLE flock fallback (§2.1, Sol build r2 #2): the plan-approved advisory
+	// degradation — the flock serialises fallback clients (bounded), never an ungated
+	// unevaluated stampede. The bounded deadline ensures the client is never stranded.
 	path := currentSliceForTest(t)
 	runner := &Runner{
 		memorySlice: path, memoryReserve: 40, admissionMaxWait: 5 * time.Millisecond,
@@ -1085,8 +1086,8 @@ func TestDaemonAdmitWedgedDaemonDeadlineIsUnevaluatedNotFlock(t *testing.T) {
 	runner.lockAttemptFn = func(string) (*admitLock, error) { attempts.Add(1); return &admitLock{}, nil }
 	started := time.Now()
 	result, err := runner.admit(context.Background(), Request{})
-	if err != nil || result.state != "unevaluated" || result.lock != nil || result.release != nil || attempts.Load() != 0 {
-		t.Fatalf("result=%+v attempts=%d err=%v (want unevaluated, no flock)", result, attempts.Load(), err)
+	if err != nil || result.lock == nil || attempts.Load() != 1 {
+		t.Fatalf("result=%+v attempts=%d err=%v (want flock fallback)", result, attempts.Load(), err)
 	}
 	if elapsed := time.Since(started); elapsed < admitTransportGrace || elapsed > 2*time.Second {
 		t.Fatalf("wedged-daemon deadline elapsed=%v", elapsed)
@@ -1094,10 +1095,11 @@ func TestDaemonAdmitWedgedDaemonDeadlineIsUnevaluatedNotFlock(t *testing.T) {
 	result.releaseAdmission()
 }
 
-func TestDaemonAdmitPartialFrameIsUnevaluatedNotFlock(t *testing.T) {
-	// A partial frame from an UP daemon is a post-dial failure: it must NOT flock
-	// (the daemon may hold live reservations — Sol build r1 #2), it fails open
-	// unevaluated after closing the socket.
+func TestDaemonAdmitPartialFrameFallsToFlock(t *testing.T) {
+	// A partial frame is a post-dial failure (a committed-but-unaccepted grant, §2.1):
+	// the client closes the socket, then routes to the SINGLE flock fallback (Sol build
+	// r2 #2). The truncated frame produces an immediate io.ErrUnexpectedEOF once the
+	// server closes, so no deadline wait is needed here.
 	path := currentSliceForTest(t)
 	runner := &Runner{
 		memorySlice: path, memoryReserve: 40, admissionMaxWait: 50 * time.Millisecond,
@@ -1107,9 +1109,9 @@ func TestDaemonAdmitPartialFrameIsUnevaluatedNotFlock(t *testing.T) {
 	client, server := net.Pipe()
 	runner.admitDialFn = func(context.Context, string) (net.Conn, error) { return client, nil }
 	go func() {
-		defer server.Close()
 		var request runnerAdmitRequestFrame
 		if readRunnerAdmitFrame(server, &request) != nil {
+			_ = server.Close()
 			return
 		}
 		var complete bytes.Buffer
@@ -1117,14 +1119,13 @@ func TestDaemonAdmitPartialFrameIsUnevaluatedNotFlock(t *testing.T) {
 		_ = writeRunnerAdmitFrame(&complete, runnerAdmitResponseFrame{OK: true, Code: "OK", Data: data})
 		partial := complete.Bytes()[:len(complete.Bytes())-1]
 		_, _ = server.Write(partial)
-		var one [1]byte
-		_, _ = server.Read(one[:])
+		_ = server.Close() // truncated frame -> client read errors immediately
 	}()
 	var attempts atomic.Int64
 	runner.lockAttemptFn = func(string) (*admitLock, error) { attempts.Add(1); return &admitLock{}, nil }
 	result, err := runner.admit(context.Background(), Request{})
-	if err != nil || result.state != "unevaluated" || result.lock != nil || attempts.Load() != 0 {
-		t.Fatalf("result=%+v attempts=%d err=%v (want unevaluated, no flock)", result, attempts.Load(), err)
+	if err != nil || result.lock == nil || attempts.Load() != 1 {
+		t.Fatalf("result=%+v attempts=%d err=%v (want flock fallback)", result, attempts.Load(), err)
 	}
 	result.releaseAdmission()
 }
@@ -1164,21 +1165,19 @@ func TestDaemonAdmitFullFrameAtDeadlineWinsWithoutFlock(t *testing.T) {
 	}
 }
 
-func TestDaemonAdmitBusyIsUnevaluatedDialFailureFlocks(t *testing.T) {
-	// Sol build r1 #2: only a DIAL FAILURE (daemon unreachable -> no live daemon
-	// reservations) falls to the flock. E_DAEMON_BUSY means the daemon is UP and
-	// reserving, so flocking would over-grant against its reservations -> it fails
-	// open unevaluated instead.
+func TestDaemonAdmitDialFailureAndBusyFallToFlock(t *testing.T) {
+	// §2.1 (Sol build r2 #2): EVERY daemon non-grant routes to the SINGLE flock
+	// fallback — an unreachable daemon (dial failure -> no live reservations) AND a
+	// live daemon that declines at a cap (E_DAEMON_BUSY). Labelling a busy decline as
+	// "unevaluated" would launch un-gated and could stampede; the documented advisory
+	// degradation is the flock, which serialises fallback clients (bounded).
 	for _, test := range []struct {
-		name        string
-		dial        func(context.Context, string) (net.Conn, error)
-		wantFlock   bool
-		wantState   string
-		wantAttempt int64
+		name string
+		dial func(context.Context, string) (net.Conn, error)
 	}{
-		{name: "dial failure", wantFlock: true, wantAttempt: 1,
+		{name: "dial failure",
 			dial: func(context.Context, string) (net.Conn, error) { return nil, os.ErrNotExist }},
-		{name: "busy", wantState: "unevaluated", wantAttempt: 0,
+		{name: "busy",
 			dial: func(context.Context, string) (net.Conn, error) {
 				client, server := net.Pipe()
 				go func() {
@@ -1202,14 +1201,8 @@ func TestDaemonAdmitBusyIsUnevaluatedDialFailureFlocks(t *testing.T) {
 			var attempts atomic.Int64
 			runner.lockAttemptFn = func(string) (*admitLock, error) { attempts.Add(1); return &admitLock{}, nil }
 			result, err := runner.admit(context.Background(), Request{})
-			if err != nil || attempts.Load() != test.wantAttempt {
-				t.Fatalf("result=%+v attempts=%d err=%v", result, attempts.Load(), err)
-			}
-			if test.wantFlock && result.lock == nil {
-				t.Fatalf("dial failure did not flock: %+v", result)
-			}
-			if !test.wantFlock && (result.state != test.wantState || result.lock != nil) {
-				t.Fatalf("busy result=%+v, want %s no-flock", result, test.wantState)
+			if err != nil || result.lock == nil || attempts.Load() != 1 {
+				t.Fatalf("%s result=%+v attempts=%d err=%v (want flock fallback)", test.name, result, attempts.Load(), err)
 			}
 			result.releaseAdmission()
 		})

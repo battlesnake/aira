@@ -282,13 +282,12 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request) (admission
 	} else {
 		close(monitorDone)
 	}
-	// fail is the POST-DIAL failure path. A dial failure (daemon unreachable ->
-	// no live daemon reservations) falls to the flock earlier; a post-dial failure
-	// means the daemon was UP (E_DAEMON_BUSY, broken read/write, invalid frame),
-	// so entering the flock would admit against memory the daemon still reserves
-	// for other clients (Sol build r1 #2 cross-domain over-grant). Instead fail
-	// open UNEVALUATED (labelled), never the flock — except a detach kill-intent
-	// or ctx cancellation, which abort the run.
+	// fail closes the socket first, then routes to the SINGLE flock fallback
+	// (§2.1). This is the plan-approved documented advisory degradation: the flock
+	// serialises fallback clients (bounded, unlike an ungated unevaluated
+	// stampede — Sol build r2), while its cross-domain over-grant against live
+	// daemon reservations is bounded by the OOMPolicy=kill backstop. A detach
+	// kill-intent or ctx cancellation aborts instead.
 	fail := func() (admissionResult, bool, error) {
 		_ = conn.Close()
 		select {
@@ -304,8 +303,7 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request) (admission
 				return admissionResult{}, false, err
 			}
 		}
-		r.warnAdmission("unevaluated", "daemon-admit-incomplete")
-		return admissionResult{state: "unevaluated", reason: "daemon-admit-incomplete"}, true, nil
+		return admissionResult{}, false, nil
 	}
 
 	_ = conn.SetDeadline(transportDeadline)
@@ -336,10 +334,17 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request) (admission
 		return fail()
 	}
 	// A full, validated frame claims the connection as the lease. Before returning
-	// it, STOP AND JOIN the async closers so neither the ctx callback nor the detach
-	// monitor can close the lease after we hand it back (Sol build r1 #3), and then
-	// honour a detach kill-intent that raced the grant: the closer wins -> abort.
-	stopClose()
+	// it, STOP the async closers so neither the ctx callback nor the detach monitor
+	// can close the lease after we hand it back (Sol build r1 #3, r2 #3).
+	// ctx-callback arbitration: stopClose() returns false iff the ctx callback has
+	// already started (ctx is Done) — the closer won, so abort with the ctx error
+	// rather than return a lease it is closing.
+	if !stopClose() {
+		_ = conn.Close()
+		return admissionResult{}, false, ctx.Err()
+	}
+	// detach-monitor arbitration: stop + JOIN the monitor, then honour a kill-intent
+	// that raced the grant (closer wins -> abort).
 	stopMonitor()
 	<-monitorDone
 	select {
