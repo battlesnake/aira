@@ -58,10 +58,10 @@ advisory over-grant window, not hidden.
 ### 2.2 The grant rule (fair + concurrent, strict FIFO, no jump-ahead)
 Per slice the daemon keeps an ordered **waiter list** (FIFO by a per-slice monotonic arrival seq
 assigned under the registry lock, so concurrent enqueues get a total order) and a set of
-**outstanding reservations**. **Evaluation is serialised per slice** (§2.3). One evaluation reads
-the slice's live `memory.current`/`memory.max` once, then — holding the registry lock —
-recomputes `available = (max - current) - Σ(outstanding reserves)` against the *current* waiter/
-reservation state and walks the waiter list **from the front**, granting each waiter whose
+**outstanding reservations**. **Evaluation is serialised per slice** (§2.3). One evaluation, under
+the **per-slice lock**, reads the slice's live `memory.current`/`memory.max` once and computes
+`available = (max - current) - Σ(outstanding reserves)` against the *current* waiter/reservation
+state, then walks the waiter list **from the front**, granting each waiter whose
 `reserve ≤ available` and subtracting as it goes, **stopping at the first that does not fit**.
 - **Strictly fair, no starvation:** a later small waiter never precedes an earlier non-fitting
   one (head-of-line blocking is the fair choice). Arrival order is total per slice.
