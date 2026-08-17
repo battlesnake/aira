@@ -1,6 +1,6 @@
 # D6 — run-input (live stdin push to a detached run) — design / plan
 
-**Status:** v5 — Sol plan-review 4 rounds → APPROVE-PLAN. Fable plan-gate pending.
+**Status:** v6 — APPROVED. Sol plan-review 4 rounds → APPROVE-PLAN; Fable plan-gate → GATE-PASS (4 nits folded). Ready to build.
 **Milestone:** Phase 5 · D6 (task #42). Follows D1–D5 (all merged; master `f8c4412`).
 **Loop:** plan → Sol plan-review (rounds → APPROVE-PLAN) → Fable plan-gate → Terra build →
 Opus real-HW verify → Sol build-review (rounds → RESOLVED) → merge. Correctness-critical (a live
@@ -316,3 +316,18 @@ The D5 supervisor lease is orthogonal (liveness evidence), not a prerequisite fo
 8. `SO_PEERCRED` same-uid AND `CallerOwner` refusal (`--steal` override); socket `0600` in `0700`;
    binary-safe DATA; MCP is bounded base64 (never reads MCP stdin).
 9. Daemon-up vs daemon-down identical (daemon never on the path).
+10. **`inputW.Fd()` TRAP (Fable gate).** Invariant 5 (a blocked splice-`Write` is released by
+    `inputW.Close()`) holds ONLY while `inputW` stays netpoller-registered. Calling
+    `(*os.File).Fd()` on `inputW`/`inputR` switches the fd to BLOCKING mode and silently breaks
+    teardown → a full-pipe `Write` can no longer be unblocked by `Close`. NEVER call `.Fd()` on the
+    input pipe ends (pass them via `cmd.Stdin`, never `Fd()`).
+11. **ACK honesty (Fable gate):** an `OP_ACK` means the bytes are in the KERNEL PIPE BUFFER, not
+    that the child consumed them — up to ~64 KiB of ACKed bytes can die unread if the run is killed.
+    CLI help + outcome wording say "accepted for delivery", never "processed".
+12. **Deliberate asymmetry (Fable gate):** a `running`-append failure KILLS in connect-mode (§2.2
+    step 4) but preserves supervision in non-connect mode (a connect child is alive on a pipe no one
+    can now reach). State this rationale in a code comment.
+13. **Backpressure slot-hold (Fable gate):** a client that disconnects while its splice `Write` is
+    blocked on a full pipe keeps the slot held (in-order delivery continues) until the child drains
+    or terminal — so `run-input` can return `BUSY` with no client currently connected. Correct
+    (ordering-preserving); document in the `run-input` help.
