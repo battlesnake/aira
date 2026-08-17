@@ -1,6 +1,6 @@
 # AIRA D3 — daemon watch (`aira watch`, long-poll event tail)
 
-**Status:** DRAFT v7 (Sol plan-review r1 6 → r2 4 → r3 3 → r4 3 → r5 1 → r6 2 findings; folded)
+**Status:** APPROVED v7 (Sol plan-review 7 rounds: 6→4→3→3→1→2→APPROVE-PLAN; 3 build-notes folded)
 **Branch:** `codex-aira-d3` · **Base:** master `982556b` (D2 merged)
 **Depends on:** M21 (mandatory DB-owning daemon + routed coordination), D1/D2 (daemon
 timers + process-terminal shutdown this reuses).
@@ -91,10 +91,12 @@ reclaimed on *every* path — timeout, disconnect, shutdown, error, panic; Sol r
    `E_DAEMON_BUSY` immediately — never queue. Else acquire + `defer release`.
 2. Clamp `wait_ms` to `[pollInterval, watchWaitCapMs]` (a client cannot request a zero/short wait
    that spins; Sol r2 #1). Record `start`.
-3. Resolve the scope store (readiness-barriered). `from_now` → return `{events:[], cursor:
-   CurrentMaxSeq(), eof:false}` — but **also paced by the min-request-duration** (§3.5, Sol r2 #3)
-   so a client spamming `from_now` cannot bypass the rate bound; the shutdown-priority check (below)
-   applies before returning it too.
+3. Resolve the scope store (readiness-barriered). **`from_now` is normalised to an effective
+   cursor first** (Sol r7 build-note): `from = CurrentMaxSeq()`; then it returns `{events:[],
+   cursor:from, eof:false}`, paced by the min-request-duration (§3.5, Sol r2 #3) so spamming
+   `from_now` cannot bypass the rate bound, and the shutdown-priority check applies. Normalising
+   first means a `from_now`+shutdown race runs `terminalDrain(from=sampledMax)`, **not**
+   `terminalDrain(0)` — so it never replays the whole log on a shutdown-raced `from_now`.
 4. Else loop until the request deadline (`start + wait_ms`):
    - `scanned := EventsSince(from, batchCap)` — a **bounded window of the next seqs, UNFILTERED**
      (§3.3). `next := scanned.MaxScannedSeq` (or `from` if the window is empty).
@@ -132,9 +134,11 @@ a **final** `EventsSince(from, batchCap)` scan under a **bounded `QueryContext`*
 deadline = a short shutdown-drain budget, and cancelled by `connCtx`, so it cannot block awaiting
 the shared connection / SQLite-busy past the drain). On success return `{events: filter(scanned),
 cursor: scanned.MaxScannedSeq (or from), eof: true}`; the client processes this last batch **then**
-exits on `eof`. **If the final scan errors or times out, do NOT send `eof`** — return a transient
-failure (`E_DAEMON_UNAVAILABLE`) so the client's at-least-once retry re-requests from its unadvanced
-cursor rather than exiting having missed events. `terminalDrain` is a pure read, no lock; it runs on
+exits on `eof`. **Every final-scan failure path — deadline expiry, `connCtx` cancellation,
+connection-acquisition failure, `SQLITE_BUSY`/any query error — maps to a transient
+`E_DAEMON_UNAVAILABLE` with no cursor advancement and never `eof:true`** (Sol r7 build-note), so the
+client's at-least-once retry re-requests from its unadvanced cursor rather than exiting having
+missed events. `terminalDrain` is a pure read, no lock; it runs on
 both the pre-write priority check and the loop's `<-s.stopping` case. **Residual (honest, bounded):**
 the terminal batch delivers only the **first contiguous ≤`batchCap` window** visible to the final
 query; events beyond that cap at the shutdown instant, and any committed *after* the final snapshot,
@@ -293,11 +297,13 @@ Daemon (`s.watch`, real-HW):
 8. **Shutdown terminal-drains, loses nothing (Sol r5):** an event committed at cursor+1 just
    before `close(s.stopping)` is **delivered in the terminal `eof:true` batch** (not an empty
    `{cursor:from, eof:true}`); the watch returns promptly and `Serve` drains without `DrainTimeout`.
-   **Shutdown overflow (Sol r6):** with `> batchCap` pending at shutdown, the terminal batch
-   delivers the first contiguous `batchCap` with `eof:true` and an advanced cursor; the remainder
-   is fetched by a re-watch with `--from <that cursor>` (proves the honest capped-window residual,
-   no silent drop). **Bounded final scan:** a `terminalDrain` whose query is made to time out
-   returns a transient failure, **not** `eof` (the client would retry from the unadvanced cursor).
+   **Shutdown overflow at both boundaries (Sol r6/r7):** with **exactly `batchCap`** pending the
+   terminal batch delivers all of them with `eof:true`; with **`batchCap+1`** it delivers the first
+   contiguous `batchCap` with `eof:true` and an advanced cursor and the remaining one is fetched by
+   a re-watch with `--from <that cursor>` (proves the honest capped-window residual, no silent
+   drop). **Bounded final scan:** a `terminalDrain` whose query is made to time out returns the
+   transient **`E_DAEMON_UNAVAILABLE`** code with **no `eof` and no cursor advance** (asserted
+   explicitly), so the client retries from the unadvanced cursor.
 9. **Disconnect cancels promptly (Sol r1 #1):** a client that closes mid-long-poll cancels the
    handler (peer-close detector) rather than leaking until `wait_ms`; a non-reading client is
    bounded by the write deadline.
