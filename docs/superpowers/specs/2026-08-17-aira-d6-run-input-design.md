@@ -1,6 +1,6 @@
 # D6 — run-input (live stdin push to a detached run) — design / plan
 
-**Status:** v1 — DRAFT for Sol plan-review.
+**Status:** v2 — folds Sol plan-review r1 (7 findings, all folded). For Sol r2.
 **Milestone:** Phase 5 · D6 (task #42). Follows D1–D5 (all merged; master `f8c4412`).
 **Loop:** plan → Sol plan-review (rounds → APPROVE-PLAN) → Fable plan-gate → Terra build →
 Opus real-HW verify → Sol build-review (rounds → RESOLVED) → merge. Correctness-critical (a live
@@ -42,59 +42,93 @@ already takes `--stdin` at launch); interactive TTY/approval prompts (spec §14 
 
 ## 2. Design
 
-### 2.1 The socket: location, creation, discovery, auth
-- **Path.** The runs output dir lives under the git `CommonDir` (possibly long / networked), which
-  can exceed the ~108-byte `sun_path` limit, so the input socket does NOT live there. It mirrors the
-  daemon's scheme: `$XDG_RUNTIME_DIR/aira/<state-id>/inputs/<run-id>.sock`, in a `0700` dir, socket
-  `0600`. The **supervisor** creates it (bind+listen) after `Start`, before the `running` event;
-  the resolved absolute path is recorded in the `running` `RunRecord` as a new field
-  `InputSocket string` (json omitempty). The **client** reads the record (`show RUN-n`, carved) →
-  `InputSocket` → dials it. Recording the path (vs re-deriving) avoids a derivation mismatch and
-  makes "connect mode was requested" observable.
-- **Auth (machine-local single-user threat model, per D5 §2.1).** `SO_PEERCRED`: the peer uid must
-  equal the supervisor's euid; the `0700` dir + `0600` socket already restrict to the owner. Same-user
-  input-injection is out of the threat model (a same-user process can already `cgroup.kill` the run
-  or write the ledger). Owner-scoping like `run-kill`'s `CallerOwner` is noted as a possible
-  addition but not required in v1; stated, not hidden.
-- **Absence/stale.** If the run was not launched `--stdin-connect`, `InputSocket` is empty →
-  `run-input` fails `E_RUN_INPUT_UNAVAILABLE` (no fabricated success). If the socket exists but the
-  dial fails (supervisor dead/gone), `run-input` reports `E_RUN_INPUT_UNREACHABLE` and suggests
-  `reconcile` — never silently drops the bytes.
+### 2.1 The socket: location, BIND-BEFORE-START, discovery, auth
+- **Path + sun_path pre-validation (Sol r1 #1, #6).** The runs output dir is under the git
+  `CommonDir` (possibly long / networked, and can exceed the ~108-byte `sun_path` limit), so the
+  socket does NOT live there. It reuses the **daemon's pinned path resolution** (`internal/daemon/
+  paths.go` — which already handles `$XDG_RUNTIME_DIR` unset via a pinned per-user fallback under a
+  stable state-id root, so a `Setsid`'d shim with no `XDG_RUNTIME_DIR` still resolves it):
+  `<runtime-root>/aira/<state-id>/inputs/<run-id>.sock`, `0700` dir, `0600` socket. The **full
+  `sun_path` length is validated BEFORE `Start`** (`E_RUN_INPUT_PATH_TOO_LONG` fails the launch
+  cleanly — no child is created that would then wait on an unfeedable pipe).
+- **BIND BEFORE START (Sol r1 #1).** The supervisor resolves the path, unlinks any **stale** socket
+  (a leftover from a dead prior supervisor), then `bind`+`listen`+`chmod 0600` **before `Start`**.
+  Only once the listener is up does it `Start` the child (whose fd0 is the pipe). `InputSocket` is
+  written into the `starting`/`running` record so the path is durable + observable. Every post-bind,
+  post-`Start` failure (including a `running`-append failure, §2.2) runs the full input+child
+  teardown (close input plane, `cgroup.kill`, `Wait`/reap, record `U_RUN_RECONCILE_REQUIRED`) — a
+  child is never left alive waiting on a pipe no one can reach.
+- **Discovery states (Sol r1 #3, #6) — the client distinguishes, never fakes:** `InputSocket`
+  empty (run not `--stdin-connect`) → `E_RUN_INPUT_UNAVAILABLE`; record present but no socket yet /
+  run not yet `running` → `E_RUN_INPUT_NOT_READY`; dial fails / stale socket / supervisor gone →
+  `E_RUN_INPUT_UNREACHABLE` (suggest `reconcile`); server replies closed → `E_RUN_INPUT_CLOSED`. No
+  path silently drops bytes.
+- **Auth (Sol r1 #7) — transport AND logical owner.** (a) Transport: `SO_PEERCRED` peer uid ==
+  supervisor euid; `0700` dir + `0600` socket. (b) **Logical owner, mirroring `run-kill`:** the
+  server enforces `CallerOwner` — a `run-input` from a foreign AIRA owner is refused
+  (`E_RUN_INPUT_FOREIGN_OWNER`), overridable with `--steal`, exactly as `killPolicy{Enforce,
+  CallerOwner}` + `ForeignOwnerError` (`runner_linux.go:1709`). The client passes its owner identity
+  in the connect handshake; the D5 lease token is NOT used (it authenticates the supervisor to the
+  daemon, not a client to the supervisor — wrong credential).
 
 ### 2.2 The child's fd0 pipe + the splice loop (supervisor side)
-At launch, when `req.StdinConnect`, instead of `setupStdin` wiring fd0 to a file/`/dev/null`
-(`detach_linux.go:298-313`), the supervisor:
-1. Creates `inputR, inputW := os.Pipe()`; `cmd.Stdin = inputR`; retains `inputW`.
-2. After the `running` event + `closeFiles()`, closes its copy of `inputR` (the child holds the
-   dup'd read end) and starts a dedicated **input-serve goroutine** concurrent with the existing
-   `cmd.Wait()` goroutine (`detach_linux.go:349-357`).
-3. The input-serve goroutine `Accept()`s on the socket, **SERIALLY** (one active connection at a
-   time; a second concurrent dial gets `E_RUN_INPUT_BUSY` and closes — no interleaved bytes). For
-   the active connection it reads framed input (§2.3) and `io.Copy`s DATA bytes into `inputW`; a
-   CLOSE frame closes `inputW` (child sees EOF) and marks input permanently closed (subsequent
-   connects → `E_RUN_INPUT_CLOSED`).
+Order of operations when `req.StdinConnect` (replacing the file/`/dev/null` fd0 wiring at
+`detach_linux.go:298-313`):
+1. Validate `sun_path` length (§2.1) — else fail the launch before any child exists.
+2. `inputR, inputW := os.Pipe()`; `cmd.Stdin = inputR`. Resolve + unlink-stale + `bind`+`listen`+
+   `chmod 0600` the socket. **A single `defer` (installed here, before `Start`) tears the input
+   plane + child down on EVERY subsequent return path** (Sol r1 #1, #2): close listener + active
+   conn, close `inputW`, `unlink` the socket; on a post-`Start` error also `cgroup.kill`+reap.
+3. `Start` the child. Close the parent's `inputR` copy (the child holds the dup'd read end).
+4. A `running`-append failure (`detach_linux.go:337-344`) is now a full teardown+kill, not just a
+   flagged running-failure — the child must not be left alive on an orphaned input plane.
+5. Start the **input-serve goroutine** concurrent with the `cmd.Wait()` goroutine
+   (`detach_linux.go:349-357`).
 
-**Teardown (the correctness crux — must not wedge supervision or leak the child).** The input-serve
-goroutine and `inputW` are owned by a `context` cancelled the instant the run reaches ANY terminal
-path (normal exit, timeout kill, forced quiesce, cancelled). On cancel: close the listener (unblocks
-`Accept`), close the active conn, and close `inputW` (so a child still reading fd0 sees EOF rather
-than a half-open pipe). The `cmd.Wait()` select (`detach_linux.go:358-388`) is UNCHANGED and never
-blocks on the input path; a blocked splice-`Write` (child stopped reading, pipe full) is confined to
-the input-serve goroutine and is released by the terminal `inputW.Close()`. The socket file is
-`unlink`ed at terminal.
+**Serve loop (Sol r1 #4) — continuous accept, atomic single-writer:** the goroutine `Accept()`s
+CONTINUOUSLY. A per-run atomic/mutex claims exactly ONE active writer; a second accepted connection
+is IMMEDIATELY answered `E_RUN_INPUT_BUSY` and closed (it does not sit in the listen backlog). The
+active connection is read with bounded, fully-read frames (§2.3) and its DATA bytes copied into
+`inputW`; `OP_CLOSE` closes `inputW` (child EOF) and marks input permanently closed (later connects
+→ `E_RUN_INPUT_CLOSED`).
 
-### 2.3 The wire protocol (client ↔ supervisor)
-A minimal length-prefixed frame on the socket (mirrors the D4 admit framing idiom
-`writeRunnerAdmitFrame`): `[1-byte opcode][4-byte BE length][payload]`.
-- `OP_DATA` (payload = raw stdin bytes, binary-safe): spliced into `inputW`.
-- `OP_CLOSE` (length 0): closes `inputW` (child EOF), marks input closed.
-- Response: a single trailing status frame per connection — `OK`, or a stable code
-  (`E_RUN_INPUT_BUSY` / `E_RUN_INPUT_CLOSED` / a write error if the child's read end vanished).
-The client streams its own stdin as `OP_DATA` frames (bounded chunk size), then either leaves the
-connection (stream paused; more `run-input` calls may follow) or, with `--close`, sends `OP_CLOSE`.
-**Closing the CONNECTION is NOT EOF** — the supervisor keeps `inputW` open across connections;
-only `OP_CLOSE` gives the child EOF. This lets multiple sequential `run-input` calls append to one
-stdin stream.
+**Close the input plane after the LEADER exits, BEFORE `waitEmpty` (Sol r1 #2 — the descendant
+deadlock).** `inputW` is closed **immediately after the leader's `cmd.Wait()` returns**, ahead of
+`forceDetachedQuiesce`/`waitEmpty`. Otherwise a descendant that inherited fd0 and is blocked reading
+would wait for EOF while the supervisor waits for an empty scope — a deadlock. Closing `inputW` right
+after the leader exit lets such a descendant see EOF and drain, so quiescence can complete. The
+listener + socket are also closed/unlinked at that point (no new input after the leader is gone).
+
+**Teardown never wedges supervision.** The `cmd.Wait()` select (`detach_linux.go:358-388`) is
+UNCHANGED and never blocks on input. A blocked splice-`Write` (child stopped reading, pipe full) is
+confined to the input-serve goroutine and released by `inputW.Close()` (leader-exit or the
+pre-`Start` defer). No terminal/kill/timeout path joins the splice before closing `inputW`.
+
+### 2.3 The wire protocol (client ↔ supervisor) — ACKed committed bytes (Sol r1 #3)
+Length-prefixed frames on the socket (D4 `writeRunnerAdmitFrame`/`io.ReadFull` idiom):
+`[1-byte opcode][4-byte BE length][payload]`, **length validated against a max-frame cap BEFORE
+allocation** (a `>cap` or a nonzero-length `OP_CLOSE` → `E_RUN_INPUT_PROTOCOL`, connection closed,
+`inputW` untouched).
+- `OP_HELLO` (owner identity) — the first frame; the server runs the `CallerOwner` check (§2.1).
+- `OP_DATA` (raw stdin bytes, binary-safe): the server splices into `inputW`, then replies
+  `OP_ACK{committed}` = the cumulative count of bytes it has DURABLY written to `inputW`. The client
+  advances its offset by the ACK, so it always knows exactly how many bytes landed — never a blind
+  retry.
+- `OP_CLOSE` (length 0): closes `inputW` (child EOF), marks input closed; server replies `OP_ACK`
+  then closes.
+- **Request termination:** the client signals end-of-request with `CloseWrite` (half-close) on the
+  connection; the server drains remaining frames, sends a final `OP_ACK`/status, then closes.
+
+**Outcome codes (honest, never a blind-retry hint):** a clean full ACK → success. A mid-stream child
+read-end close (write to `inputW` returns `EPIPE`/`EBADF`) → `E_RUN_INPUT_CLOSED` **with the
+committed byte count** so the caller knows the prefix that landed. A connection that drops before a
+final ACK → `E_RUN_INPUT_OUTCOME_UNKNOWN` (the committed prefix is whatever the last ACK reported;
+`E_RUN_INPUT_PARTIAL` names the case where some-but-not-all requested bytes were ACKed). Retrying
+resends only un-ACKed bytes — the protocol makes the safe resume point explicit.
+
+**Closing the CONNECTION is NOT EOF** — the supervisor keeps `inputW` open across connections; only
+`OP_CLOSE` gives the child EOF. Sequential `run-input` calls append to one stdin stream in call
+order.
 
 ### 2.4 Backpressure, ordering, EOF (honest semantics)
 - **Ordering.** Serial single-active writer (§2.2) ⇒ bytes reach fd0 in exactly the order the active
@@ -106,8 +140,14 @@ stdin stream.
   client** (contrast the OUTPUT side, which is deliberately non-blocking "always drains", §14 l.149;
   input has the opposite, intended hazard). It never blocks supervision (§2.2 teardown).
 - **EOF.** Explicit only (`--close` → `OP_CLOSE`). A run that never receives `OP_CLOSE` keeps fd0
-  open until terminal, at which point teardown closes `inputW` (the child, if still reading, sees
+  open until the leader exits, at which point teardown closes `inputW` (a child still reading sees
   EOF as the run ends). No implicit EOF on connection close.
+- **Child-exit / kill mid-splice (Sol r1 #2, #3).** If the child (or a descendant holding fd0)
+  closes its read end while a splice `Write` is in flight, the write returns `EPIPE`/`EBADF`; the
+  serve loop maps this to `E_RUN_INPUT_CLOSED` (with the committed count) and stops — it never
+  panics the supervisor or fakes success. A `run-input` racing an in-progress kill either lands on
+  the still-open `inputW` (ACKed) or, once the leader has exited and `inputW` is closed, is refused
+  `E_RUN_INPUT_CLOSED`/`E_RUN_INPUT_UNREACHABLE` — never a silent drop.
 
 ### 2.5 Launch validation + the new mode
 - New `Request.StdinConnect bool` (CLI `--stdin-connect`, detach-only). Reconcile with the existing
@@ -126,20 +166,29 @@ The D5 supervisor lease is orthogonal (liveness evidence), not a prerequisite fo
 ---
 
 ## 3. Invariants (Sol plan-review + build-review check both directions)
-1. **No fabricated delivery.** `run-input` to a non-connect run → `E_RUN_INPUT_UNAVAILABLE`; to a
-   dead/gone supervisor → `E_RUN_INPUT_UNREACHABLE`; after `OP_CLOSE` → `E_RUN_INPUT_CLOSED`. Bytes
-   are never silently dropped or a success faked.
-2. **Ordering.** Serial single-active writer; concurrent connect → `E_RUN_INPUT_BUSY`; no interleave.
-3. **Teardown never wedges supervision.** A blocked splice-`Write` (full pipe, child not reading) is
-   confined to the input-serve goroutine and released by terminal `inputW.Close()`; `cmd.Wait()` /
-   kill / timeout paths are unchanged and never block on input.
-4. **No orphan / no half-open.** At every terminal path the listener + active conn + `inputW` close
-   and the socket file is unlinked; a child still reading fd0 sees EOF, not a wedged pipe.
-5. **Explicit EOF only.** Connection close ≠ EOF; only `OP_CLOSE` closes the child's fd0 write end.
-6. **Auth.** `SO_PEERCRED` uid == supervisor euid; `0700` dir + `0600` socket; same-user only.
-7. **Binary-safe.** DATA frames carry arbitrary bytes verbatim (no text assumptions).
-8. **Daemonless.** Identical behaviour daemon-up or down; the daemon is never on the input path.
-9. **Backpressure is honest.** A slow/stopped child backs pressure up to the client's `Write`; the
+1. **Bind before Start; no orphan.** The socket is `sun_path`-validated + bound + listening BEFORE
+   `Start`; a bind/path failure fails the launch with no child created. Every post-`Start` failure
+   (incl. `running`-append) tears down input + kills + reaps the child — never leaves a child alive
+   on an unreachable pipe.
+2. **Close `inputW` after the leader exits, before `waitEmpty`.** A descendant inheriting fd0 sees
+   EOF and drains, so quiescence never deadlocks on the input plane.
+3. **No fabricated delivery; ACKed bytes.** Non-connect → `E_RUN_INPUT_UNAVAILABLE`; not-yet-running
+   → `NOT_READY`; dead/stale → `UNREACHABLE`; post-`OP_CLOSE`/child-EPIPE → `CLOSED`; ambiguity →
+   `PARTIAL`/`OUTCOME_UNKNOWN` with the committed count. Every accepted byte is ACKed only after it
+   is durably written to `inputW`. Bytes are never silently dropped or success faked.
+4. **Ordering + continuous-accept BUSY.** One atomically-claimed active writer; a second connection
+   is accepted and IMMEDIATELY refused `E_RUN_INPUT_BUSY` (never left in the backlog); no interleave.
+5. **Teardown never wedges supervision.** A blocked splice-`Write` (full pipe, child not reading) is
+   confined to the input-serve goroutine and released by `inputW.Close()`; `cmd.Wait()` / kill /
+   timeout paths are unchanged and never join the splice.
+6. **No half-open; socket unlinked.** Listener + active conn + `inputW` close and the socket is
+   unlinked by the pre-`Start` teardown defer on every return path; a child still reading sees EOF.
+7. **Explicit EOF only.** Connection close ≠ EOF; only `OP_CLOSE` closes the child's fd0 write end.
+8. **Auth — transport + owner.** `SO_PEERCRED` uid == supervisor euid; `0700` dir + `0600` socket;
+   AND `CallerOwner` refusal (`E_RUN_INPUT_FOREIGN_OWNER`, `--steal` overrides), mirroring `run-kill`.
+9. **Binary-safe.** DATA frames carry arbitrary bytes verbatim; frame length capped before alloc.
+10. **Daemonless.** Identical behaviour daemon-up or down; the daemon is never on the input path.
+11. **Backpressure is honest.** A slow/stopped child backs pressure up to the client's `Write`; the
    run is never killed for it, and input is never buffered unboundedly in the supervisor.
 
 ## 4. Tests (discriminators — must FAIL against the wrong impl; [[two-loop-porous-tests]])
@@ -150,26 +199,49 @@ The D5 supervisor lease is orthogonal (liveness evidence), not a prerequisite fo
   first stream uncorrupted (discriminator: an interleaving impl fails).
 - **Non-connect run:** `run-input` on a run launched WITHOUT `--stdin-connect` → `E_RUN_INPUT_
   UNAVAILABLE` (not a hang, not a fake success).
+- **Descendant-EOF deadlock (Sol r1 #2, real-cgroup):** `sh -c 'sleep 0.2 & cat'` in connect mode
+  (leader `sh` exits, `cat` descendant inherits fd0 and blocks reading) → the run still terminalizes
+  (leader-exit closes `inputW`, `cat` EOFs and drains, `waitEmpty` completes). Discriminator: an
+  impl that closes `inputW` only at terminal deadlocks (bounded-time fail).
+- **Bind-before-Start (Sol r1 #1):** a sun_path-too-long / bind failure fails the launch with NO
+  child spawned (assert no ledger `running`, no orphan scope member).
 - **Teardown:** kill a run mid-input (child not reading, pipe full, splice blocked) → the kill
-  completes, the run terminalizes, no leaked goroutine/fd (goroutine-count + a bounded-time assert);
+  completes, the run terminalizes, no leaked goroutine/fd (goroutine-count + bounded-time assert);
   the socket file is unlinked. Discriminator: an impl that joins the splice before kill deadlocks.
+- **ACK/partial (Sol r1 #3):** the client's ACK offset equals bytes written to fd0; a child that
+  closes fd0 mid-stream → `E_RUN_INPUT_CLOSED` with the exact committed count (not a fake success).
 - **EOF discipline:** stream, drop the connection WITHOUT `--close`, reconnect, stream more → the
   child receives the concatenation (proves connection-close ≠ EOF).
-- **Auth:** `SO_PEERCRED` reject a different uid (seam-injected); socket mode is `0600`.
+- **Continuous-accept BUSY (Sol r1 #4):** a second concurrent connect is answered `E_RUN_INPUT_BUSY`
+  promptly (bounded-time), the first stream uncorrupted.
+- **Auth:** `SO_PEERCRED` reject a different uid (seam-injected); a foreign `CallerOwner` →
+  `E_RUN_INPUT_FOREIGN_OWNER`, `--steal` overrides; socket mode `0600`.
 - **Validation (unit):** `--stdin-connect` without `--detach`, or with `--stdin`/`--pty`/`--store-
-  stdin` → `E_RUN_ARGUMENT_INVALID`.
-- **Framing (unit):** partial/one-byte-at-a-time DATA/CLOSE frames reassemble (io.ReadFull idiom);
-  a malformed opcode → a stable error, connection closed, `inputW` untouched.
+  stdin` → `E_RUN_ARGUMENT_INVALID`. MCP over-cap base64 `data` → a stable argument error.
+- **Framing (unit):** partial/one-byte-at-a-time frames reassemble (io.ReadFull); a `>cap` length
+  or nonzero-length `OP_CLOSE` → `E_RUN_INPUT_PROTOCOL`, connection closed, `inputW` untouched.
 
 ## 5. Faces / plumbing
 - `Request.StdinConnect bool`; `RunRecord.InputSocket string` (omitempty). CLI `--stdin-connect` +
-  the `run-input` verb (`run-input RUN-n [--close]`) across CLI + MCP + dispatch tables + generated
-  help. `run-input` is `RouteClient` (carved), reads the record client-side, dials the socket.
-- New codes: `E_RUN_INPUT_UNAVAILABLE` / `E_RUN_INPUT_UNREACHABLE` / `E_RUN_INPUT_CLOSED` /
-  `E_RUN_INPUT_BUSY` (+ exit-code mapping in `check.go`).
+  the `run-input` verb across dispatch tables + generated help. `run-input` is `RouteClient`
+  (carved), reads the record client-side, dials the socket, passes its owner in `OP_HELLO`.
+- **CLI face:** `aira run-input RUN-n [--close] [--steal]` streams its own stdin as `OP_DATA`
+  frames; `--close` sends `OP_CLOSE`; `--steal` overrides the `CallerOwner` refusal (mirrors
+  `run-kill`).
+- **MCP face (Sol r1 #5) — NOT stdin streaming:** an MCP invocation's stdin IS the MCP transport,
+  so it cannot stream it. MCP `run-input` takes a **bounded base64 `data` arg** (≤ the max-frame
+  cap) + optional `close bool` — a one-shot bounded write, not a stream. Larger-than-cap → a stable
+  argument error. (Streaming stays CLI-only in v1.)
+- **Codes** (+ `check.go` exit mapping): `E_RUN_INPUT_UNAVAILABLE` (not connect-mode) /
+  `E_RUN_INPUT_NOT_READY` (not yet running) / `E_RUN_INPUT_UNREACHABLE` (dial/stale) /
+  `E_RUN_INPUT_CLOSED` (OP_CLOSE'd or child EPIPE) / `E_RUN_INPUT_BUSY` (another active writer) /
+  `E_RUN_INPUT_FOREIGN_OWNER` (owner refusal, `--steal` overrides) / `E_RUN_INPUT_PARTIAL` +
+  `E_RUN_INPUT_OUTCOME_UNKNOWN` (delivery ambiguity, with committed count) / `E_RUN_INPUT_PROTOCOL`
+  (bad frame) / `E_RUN_INPUT_PATH_TOO_LONG` (launch-time `sun_path`).
 - Supervisor: the input-serve goroutine + `inputW` lifecycle in `detach_linux.go`
-  launchDetachedValidated (a new `stdinConnect` branch at the fd-wiring site, cancelled at every
-  terminal path). Non-Linux stub parity (`runner_stub.go`).
+  launchDetachedValidated (a new `stdinConnect` branch: bind-before-Start, pre-Start teardown defer,
+  close-inputW-after-leader-exit). Socket path resolution reuses `internal/daemon/paths.go`.
+  Non-Linux stub parity (`runner_stub.go`).
 
 ## 6. Deferrals + honest coverage gaps
 - **Live-input capture** (`--store-stdin` + `--stdin-connect`): rejected in v1; a growing-append
@@ -180,10 +252,17 @@ The D5 supervisor lease is orthogonal (liveness evidence), not a prerequisite fo
 - **Owner-scoped auth** (like kill's `CallerOwner` + `--steal`): v1 is same-uid; noted.
 
 ## 7. Sol build-review checklist (seed)
-1. Does any terminal/kill/timeout path block on the input goroutine or a full pipe? (must not).
-2. Is `inputW` closed on EVERY terminal path (no half-open pipe, no leaked fd/goroutine)?
-3. Is connection-close distinct from `OP_CLOSE` (no implicit EOF)?
-4. Is the writer genuinely serial (no interleave; `E_RUN_INPUT_BUSY` on concurrent connect)?
-5. Are non-connect / unreachable / closed runs reported with stable codes, never a fake success?
-6. `SO_PEERCRED` same-uid enforced; socket `0600` in a `0700` dir; binary-safe DATA.
-7. Daemon-up vs daemon-down identical (daemon never on the path).
+1. Socket bound+listening BEFORE `Start`; bind/path failure spawns no child; every post-`Start`
+   failure tears down input + kills + reaps (no orphan on an unreachable pipe).
+2. Is `inputW` closed right after the LEADER `Wait` (before `waitEmpty`), so a descendant on fd0
+   can't deadlock quiescence? Is it closed on EVERY return path (pre-`Start` teardown defer)?
+3. Does any terminal/kill/timeout path block on the input goroutine or a full pipe? (must not).
+4. ACK reports only durably-written bytes; child EPIPE → `CLOSED` with committed count; dropped
+   connection → `OUTCOME_UNKNOWN`/`PARTIAL`; no blind-retry hint, no fake success.
+5. Continuous accept + atomic single writer; a second connection promptly `E_RUN_INPUT_BUSY` (not
+   stuck in backlog); frame length capped before alloc; nonzero `OP_CLOSE` rejected.
+6. Connection-close distinct from `OP_CLOSE` (no implicit EOF).
+7. Non-connect / not-ready / unreachable / closed reported with stable codes, never a fake success.
+8. `SO_PEERCRED` same-uid AND `CallerOwner` refusal (`--steal` override); socket `0600` in `0700`;
+   binary-safe DATA; MCP is bounded base64 (never reads MCP stdin).
+9. Daemon-up vs daemon-down identical (daemon never on the path).
