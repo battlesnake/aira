@@ -95,7 +95,7 @@ func TestRunInputClientGenuineBusyTerminatesAtBudget(t *testing.T) {
 	start := time.Now()
 	var lastDialNanos atomic.Int64
 	r.inputDialFn = func(context.Context, string) (net.Conn, error) {
-		lastDialNanos.Store(time.Now().UnixNano())
+		lastDialNanos.Store(int64(time.Since(start))) // monotonic elapsed, not wall-clock UnixNano
 		client, server := net.Pipe()
 		go func() {
 			defer server.Close()
@@ -116,7 +116,7 @@ func TestRunInputClientGenuineBusyTerminatesAtBudget(t *testing.T) {
 	}
 	// No dial may begin at or after the budget deadline (a 50ms tolerance covers
 	// the top-of-loop gate's own scheduling).
-	if lastDial := time.Duration(lastDialNanos.Load() - start.UnixNano()); lastDial >= runInputBusyRetryBudget+50*time.Millisecond {
+	if lastDial := time.Duration(lastDialNanos.Load()); lastDial >= runInputBusyRetryBudget+50*time.Millisecond {
 		t.Fatalf("a dial began %v after start, past the %v budget", lastDial, runInputBusyRetryBudget)
 	}
 }
@@ -131,8 +131,9 @@ func TestRunInputClientSilentServerHandshakeDeadlineFires(t *testing.T) {
 	r.inputDialFn = func(context.Context, string) (net.Conn, error) {
 		client, server := net.Pipe()
 		go func() {
-			_, _, _ = readRunInputFrame(server) // read HELLO, then go silent forever
-			select {}
+			defer server.Close()
+			_, _, _ = readRunInputFrame(server) // read HELLO, then stay silent (no reply)
+			_, _, _ = readRunInputFrame(server) // blocks silently; unblocks + exits when the client closes
 		}()
 		return client, nil
 	}
