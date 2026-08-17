@@ -1,6 +1,6 @@
 # D5 — Fenced supervisor lease + shim-via-daemon (design / plan)
 
-**Status:** v2 — folds Sol plan-review r1 (8 findings, all folded). For Sol r2.
+**Status:** v3 — folds Sol plan-review r2 (6 findings, all folded). For Sol r3.
 **Milestone:** Phase 5 · D5 (task #41). Follows D1–D4 (all merged; master `dc7dc35`).
 **Loop:** plan → Sol plan-review (rounds → APPROVE-PLAN) → Fable plan-gate → Terra build →
 Opus real-HW verify → Sol build-review (rounds → RESOLVED) → merge. Correctness-critical
@@ -21,13 +21,20 @@ fenced evidence**, NOT a replacement for the `/proc` liveness check
   lapsed/absent lease NEVER proves death and NEVER finalizes a run.** Lease expiry means "the
   daemon-observed renew stopped"; it does not mean the process died (the daemon could have been
   down while the supervisor kept running daemonless).
-- **What the lease adds** (its honest, bounded value): (1) **fencing** — a stale/resurrected
-  supervisor's writes CAS-lose on `generation`; (2) **auditability** — `lease.claim`/`lease.lapse`
+- **What the lease adds** (its honest, bounded value): (1) **lease-record fencing (Sol r2)** — a
+  stale/resurrected supervisor cannot mutate or release the *current lease record* (its `generation`
+  CAS-loses). This fences the **lease record only**; it does NOT fence the supervisor's ledger
+  writes (flock-serialised, not generation-guarded) or its D7b-deferred telemetry writes.
+  Effective supervisor-*write* fencing is a D7b concern; D5 fences the lease record. (2)
+  **auditability** — `lease.claim`/`lease.lapse`
   flow through the outbox → D2 journal → D3 watch, making the supervisor lifecycle a durable
   event stream instead of ephemeral `/proc` state; (3) **`unknown`-case resolution** — when the
   reader's `/proc` read is `processUnknown` (clock/boot-id unreadable, missing recorded boot-id),
-  a *live* lease positively preserves the run as supervisor-alive rather than leaving a bare
-  `U_RUN_RECONCILE_REQUIRED`; (4) a **single-writer, daemon-owned lease foundation** that D7b
+  a *held-live* lease attests a **recent daemon-observed heartbeat (within TTL)** — NOT current
+  liveness (the supervisor could have died just after its last renew; Sol r2) — which is
+  nonetheless sufficient to preserve the run (an `unknown` `/proc` can never finalize anyway),
+  upgrading a bare `U_RUN_RECONCILE_REQUIRED` to a positively-preserved "recent-heartbeat" reason;
+  (4) a **single-writer, daemon-owned lease foundation** that D7b
   builds daemon-side run finalization on. The lease is the mandatory-daemon-world model for
   supervisor liveness ([[aira-daemon-direction]]); D5 lands it honestly as supplemental, and D7b
   completes the loop.
@@ -71,20 +78,39 @@ Spec §14 is a hard requirement: a detached run must work **daemonless**. The le
 authoritative-when-present but its absence never breaks the run — because `/proc` remains the
 finalization authority (§2.4), a leaseless run behaves exactly as M20.
 
+**Idempotent claim (Sol r2 — the ambiguous-timeout-after-commit case).** A claim transport
+timeout is AMBIGUOUS: the daemon may have committed the lease before the reply was lost, so the
+lease is `held` but the shim never learned its `generation`. Treating that as "proven unreachable
+→ advisory-leaseless" is wrong (the lease IS held), and a naive retry would then read as a
+`held-by-someone` CONFLICT. Fix: **claim is idempotent for `{project, run_id, holder_pid,
+holder_start_tick, holder_boot_id, holder_token_hash}`** — a re-claim presenting the *identical*
+PIDIdentity + `token_hash` against an existing `held` row with the same identity+hash **returns the
+existing `generation`** (a no-op success), NOT a conflict. So an ambiguous timeout is retried with
+the *identical* token; only a **definite pre-send dial failure** or **exhausted idempotent
+retries** falls to advisory-leaseless.
+
 **Claim/renew/release failure classification — degrade ONLY on proven unreachability:**
 
 | Failure at the supervisor | Meaning | Action |
 |---|---|---|
-| Daemon unreachable / dial fail / transport timeout | daemon down; may be running daemonless | **Advisory-leaseless**: warn, proceed; retry claim on the renew cadence (self-heal when the daemon returns). NEVER a direct `supervisor_leases` write. |
-| CAS conflict — the run's lease is `held` by a *different, live* holder | another supervisor owns this run (should be impossible: one supervisor per run) | **Fail readiness** (`E_RUN_SUPERVISOR_LEASE_CONFLICT`): a real invariant violation, not degraded. |
+| Definite pre-send dial failure, or exhausted idempotent-claim retries | daemon down; may be running daemonless | **Advisory-leaseless**: warn, proceed; retry claim on the renew cadence (self-heal when the daemon returns). NEVER a direct `supervisor_leases` write. |
+| Ambiguous transport timeout (reply lost) | claim may have committed | **Retry the idempotent claim with the identical token** (returns the committed generation if it landed). Only exhaustion → advisory-leaseless. |
+| CAS conflict — the run's lease is `held` by a *different* identity/token | another supervisor claims this run (should be impossible: one supervisor per run) | **Fail readiness** (`E_RUN_SUPERVISOR_LEASE_CONFLICT`): a real invariant violation, not degraded. |
 | Invalid request / invalid TTL / protocol error / DB failure / invariant violation | a real fault | **Fail readiness** with the explicit code; NEVER masked as an advisory warning. |
 
 This mirrors the D4 §2.1 lesson ([[two-loop-porous-tests]] #6): a fallback path is for genuine
 unreachability ONLY; masking real errors as "advisory" is a false-pass. Degradation is bounded
-(proven-unreachable) and labelled. **Peer-credential check:** the daemon validates the connecting
-peer's uid via `SO_PEERCRED` on the admit socket (already a per-user socket) and that the claim's
-run + PIDIdentity are self-consistent, so a lease op cannot be issued for a run the caller does
-not own.
+(proven-unreachable / retry-exhausted) and labelled.
+
+**Claim authorization + threat model (Sol r2 #3).** AIRA is a **machine-local, single-user**
+coordination layer (a per-user daemon on a per-user socket). Same-user processes are mutually
+trusting: a hostile same-user process can already `kill` the supervisor or corrupt the file
+ledger directly, so **same-user lease squatting is explicitly OUT of the threat model.** D5 adds
+cheap, free defence-in-depth against *accidental / naive* mis-claims, not a same-user adversary:
+(a) `SO_PEERCRED` uid check on the socket; (b) **`peer_pid == claim.holder_pid`** — the connecting
+process must BE the supervisor it claims to be. Cross-checking the ledger's recorded
+`SupervisorPID` under the run lock is noted as a possible further check but not required given the
+threat model. This is stated, not silently assumed.
 
 ### 2.2 Data model — `supervisor_leases` (sibling of `leases`; capability-token ownership)
 A NEW table, NOT the ticket `leases` table (which is `PRIMARY KEY(project_id, ticket_id)` and
@@ -154,56 +180,81 @@ in the one goroutine — no concurrent lease ops from a single supervisor.
 Periodic routed renew (ticket-lease `Heartbeat` model), NOT a held connection (rejected: a
 detached run is long-lived + Setsid-decoupled; a held socket dies on every daemon restart).
 
-Config `run.supervisor_lease_ttl` (default 120s; malformed/≤0 → `E_CONFIG_INVALID` at load,
-like the D1/D2 timer configs). Derived, with an explicit safety invariant:
+**Concrete constants (Sol r2 #7) — chosen, then the invariant is derived and enforced:**
 
-- `renew_interval = ttl / 3`.
-- per-renew **route deadline** (bounded routed call) + bounded retry/backoff within the interval.
-- **min TTL** floor (e.g. 30s) and jitter budget.
-- **Invariant:** `ttl - renew_interval > (route_deadline + max_retry_backoff + scheduler_pause_budget)`
-  AND `ttl > AIRA_DAEMON_REAP_INTERVAL (30s) + renew jitter` — a healthy supervisor is never
-  reaped between renews. Longer stalls (a multi-minute scheduler freeze) MAY lapse the lease, but
-  this is **false-fail-safe**: `/proc` still shows the supervisor alive, so the run is preserved,
-  not lost (§2.4). Stated, not hidden.
+| Constant | Value | Note |
+|---|---|---|
+| `route_deadline` | 5s | per routed lease call (dial+write+read); the transport deadline. |
+| `renew_retries` | 3, exp backoff 0.5/1/2s (≈3.5s total) | within one renew interval. |
+| `renew_jitter` | ±10% of `renew_interval` | deterministic ±10% (matches the D4 `jitteredPoll` style), not a shared RNG. |
+| `scheduler_pause_budget` | 10s | tolerated CFS/IO stall between renew attempts. |
+| `renew_interval` | `ttl / 3` | |
+| `min_ttl` | 60s | the config floor. |
+| `default_ttl` | 120s | `run.supervisor_lease_ttl` default. |
 
-### 2.4 Reader rewire — `/proc` is the finalization authority; the lease only resolves `unknown` (Sol r1 #1, #5, #6)
+- **Delay budget** `D = route_deadline + retry_backoff + scheduler_pause_budget + renew_jitter_max
+  ≈ 5 + 3.5 + 10 + 0.1·renew_interval`.
+- **Enforced invariant (config validator, `E_CONFIG_INVALID` at load if violated):**
+  `ttl - renew_interval > D` AND `ttl > AIRA_DAEMON_REAP_INTERVAL (30s) + renew_jitter_max`.
+  For `ttl = 60s`: `renew_interval = 20s`, `ttl - renew_interval = 40s > D (≈20.5s)` ✓, and
+  `60 > 30 + 2` ✓. For `default_ttl = 120s`: `renew_interval = 40s`, `80s > D (≈22.5s)` ✓,
+  `120 > 32` ✓. Any `run.supervisor_lease_ttl < min_ttl (60s)`, or ≤0/malformed, or violating the
+  inequality, is rejected at config load (like the D1/D2 timer configs).
+- **Honest residual:** a stall longer than `D` (a multi-minute scheduler freeze) MAY lapse the
+  lease before the next renew. This is **false-fail-safe**: `/proc` still shows the supervisor
+  alive → the run is preserved (§2.4), not lost; and the reacquire loop (§2.3) re-claims once the
+  stall clears. Boundary values (`ttl = min_ttl`, a renew delayed to just under/over `D`, and a
+  renew racing the reaper) are tested (§5). Stated, not hidden.
+
+### 2.4 Reader rewire — ONE canonical precedence algorithm (Sol r1 #1/#5/#6, Sol r2)
 Rewire sites: `reconcileDetachedLocked` (`runner_linux.go:2044` uninspectable-`default` branch,
-`:2070` main switch), `Get` (`:1775-1786`). **Evidence-first ordering UNCHANGED:**
-`LeaderExitObserved` dominates (real exit, never `lost`); a non-empty/uninspectable scope
-preserves (a live child is never finalized). The lease is consulted at exactly the step where
-`/proc` is consulted today, and **only to resolve `processUnknown`** — it NEVER expands the
-finalize gate.
+`:2070` main switch), `Get` (`:1775-1786`). The reader first classifies the scope, then applies a
+**single ordered rule list (first match wins)** — the matrix is DERIVED from this algorithm, not
+stated separately, so a test cannot bless a divergent behaviour.
 
-Read the lease fresh (non-transactional read from the reader's open store; **every lease read
-error → treat as `unknown`, never `absent`** — Sol r1 #8). Then:
+**Scope classification:** open the scope → `Empty()==true` ⇒ `EMPTY`; `Empty()==false` ⇒
+`NONEMPTY`; `os.ErrNotExist` ⇒ `EMPTY` (positively absent); any other error ⇒ `UNINSPECTABLE`.
+Read the lease fresh (non-transactional read from the reader's open store); **every lease read
+error, malformed row, wrong-boot, or expired row is "not a positive live signal" — treated as
+`unknown`, never as `absent`/dead** (Sol r1 #8).
 
 ```
-proc := processLive(record.SupervisorPID)   // /proc ground-truth; read error → processUnknown
-lease := getSupervisorLease(run_id)          // nil on absent; read error → treat as unknown, NOT absent
+proc  := processLive(record.SupervisorPID)   // /proc ground-truth; read error → processUnknown
+lease := getSupervisorLease(run_id)          // read error / malformed → treated as "no positive signal"
 
-switch proc {
-case processAlive:                           // supervisor provably running → preserve
-    if empty && scopeCreated: U_RUN_SUPERVISOR_STALLED
-    else: preserve (running / pending)
-case processDead:                            // THE ONLY finalize gate — unchanged from M20
-    if empty (positively): markDetachedLost   // (leader-exit already handled above)
-    else: preserve
-case processUnknown:
-    if lease is held ∧ IsLive(bootID, monoNow): preserve (supervisor alive per lease)  // <-- the lease's added value
-    else: U_RUN_RECONCILE_REQUIRED             // cannot prove death → preserve, never lost
-}
+R1. scope == UNINSPECTABLE (transient/perm/IO — child may be live):
+      scopeCreated              → preserve, U_RUN_RECONCILE_REQUIRED
+      else (pre-scope window)   → proc==processDead ? markDetachedLost : preserve
+      [lease NOT consulted; never finalize an uninspectable created scope]
+
+R2. LeaderExitObserved (real exit evidence exists):
+      scope == NONEMPTY         → preserve  [live descendants; cannot finalize yet]
+      else (EMPTY)              → finalizeDetachedTerminalLocked  [real exit from evidence]
+      [lease NOT consulted; evidence is authoritative — never a fabricated exit]
+
+R3. scope == NONEMPTY (no exit evidence):
+      preserve  [a live child is never finalized]
+      [lease NOT consulted]
+
+R4. scope == EMPTY (no exit evidence) — the ONLY rule that consults liveness:
+      proc == processAlive      → preserve (U_RUN_SUPERVISOR_STALLED if scopeCreated)
+      proc == processDead       → markDetachedLost              [THE only finalize-to-lost gate]
+      proc == processUnknown:
+          lease held ∧ IsLive() → preserve, "recent daemon-observed heartbeat (within TTL)"
+          else                  → preserve, U_RUN_RECONCILE_REQUIRED
 ```
 
-**Full state matrix to enumerate in §2.4 + tests (Sol r1 #6):**
-`proc ∈ {alive, dead, unknown}` × `lease ∈ {held-live, held-expired, lapsed, absent, wrong-boot,
-malformed, read-error}` × `scope ∈ {empty, non-empty, absent, uninspectable}` ×
-`leader-exit ∈ {observed, not}`. Invariants across the whole matrix: (a) `leader-exit observed`
-→ finalize from evidence (unless non-empty/uninspectable → preserve); (b) mark-lost requires
-`proc == processDead` AND positively-empty scope — nothing else; (c) `lease read-error`,
-`malformed`, `wrong-boot`, or `expired` are all treated as "not a positive live signal" and never
-trigger finalization; they only fail to *upgrade* an `unknown`. The per-run **flock** still
-serialises the supervisor's finalize vs. a reader's mark-lost (no double-finalize; the loser
-re-reads terminal and early-returns).
+**Derived invariants (the matrix `proc{alive,dead,unknown}` × `lease{held-live, held-expired,
+lapsed, absent, wrong-boot, malformed, read-error}` × `scope{empty, nonempty, absent,
+uninspectable}` × `leader-exit{yes,no}` is enumerated in the tests from THIS algorithm):**
+(a) mark-lost occurs ONLY at R1-pre-scope or R4 on `proc == processDead` AND positively-`EMPTY`
+scope — a lapsed/absent/expired/malformed/errored lease NEVER finalizes; (b) `LeaderExitObserved`
++ `EMPTY` finalizes from the real exit regardless of lease; (c) the lease is consulted at exactly
+ONE point (R4 / `processUnknown`) and can only *upgrade* the preserve reason to
+"recent-heartbeat", never change a preserve into a finalize; (d) a `held-live` lease attests a
+recent heartbeat, NOT current liveness — sound because `unknown` cannot finalize anyway. The
+per-run **flock** still serialises the supervisor's finalize vs. a reader's mark-lost (no
+double-finalize; the loser re-reads terminal and early-returns).
 
 ### 2.5 Reaper extension
 `Store.ReapExpiredSupervisorLeases(ctx)` mirrors `ReapExpiredLeases` (`lease.go:560-651`) exactly
@@ -249,9 +300,17 @@ When D7b relays these reads through the daemon, they follow; D5 does not require
 3. **Single writer (lease).** Only the daemon mutates `supervisor_leases`; the supervisor never
    writes it directly (daemon-down → leaseless, not a direct write).
 4. **Ownership.** Renew/release require the in-memory capability; a forged PIDIdentity+generation
-   cannot renew/release another supervisor's lease. `SO_PEERCRED` uid check on the socket.
-5. **Fence.** A stale/reaped-and-reclaimed generation CAS-loses renew/release/reap
-   (`RowsAffected==1`); reacquire installs a fresh `{generation, capability}` and self-heals.
+   cannot renew/release another supervisor's lease. `SO_PEERCRED` uid + `peer_pid == holder_pid`
+   defence-in-depth; same-user squatting is out of the threat model (§2.1), stated.
+5. **Lease-record fence (NOT write-fence).** A stale/reaped-and-reclaimed generation CAS-loses
+   renew/release/reap on the *lease record* (`RowsAffected==1`); reacquire installs a fresh
+   `{generation, capability}` and self-heals. The generation does NOT fence the supervisor's
+   ledger/telemetry writes — that is D7b (Sol r2).
+5a. **Idempotent claim.** A re-claim with the identical `{PIDIdentity, token_hash}` against a
+   matching `held` row returns the existing `generation` (no-op success), so an ambiguous
+   post-commit timeout retry is never a false conflict (Sol r2).
+5b. **Recent-heartbeat honesty.** A `held-live` lease attests a heartbeat within TTL, not current
+   liveness; it may only *preserve* (never finalize), so the label is "recent heartbeat" (Sol r2).
 6. **Clock-after-lock + never-reap-a-live-lease.** Every CAS samples the clock inside
    `BEGIN IMMEDIATE`; the reap CAS repeats the exact expiry predicate; `affected==0`→skip.
 7. **Evidence dominates.** `LeaderExitObserved` finalizes from the real exit regardless of lease.
@@ -267,7 +326,10 @@ When D7b relays these reads through the daemon, they follow; D5 does not require
 ## 5. Tests (discriminators — must FAIL against the wrong impl; [[two-loop-porous-tests]])
 - **Store (real, `-race`):** claim→renew→release; renew after a fenced generation bump FAILS
   (`ErrLeaseFenced`); renew/release with a WRONG capability FAILS (`ErrLeaseToken`) even with a
-  correct generation (forged-PIDIdentity discriminator); reap laps an expired supervisor lease
+  correct generation (forged-PIDIdentity discriminator); a stale holder CANNOT alter/release the
+  CURRENT lease record (lease-record-fence discriminator, Sol r2); **idempotent claim** — a
+  re-claim with the identical `{PIDIdentity, token_hash}` returns the existing generation (no-op),
+  a claim with a DIFFERENT identity → conflict (Sol r2); reap laps an expired supervisor lease
   (exact-predicate CAS, `affected==1`), skips a revived one (`beforeReapCAS` seam like D1);
   concurrent claim by two supervisors → exactly one wins; clock-after-lock; events+outbox emitted.
 - **Reacquire (unit):** a lapsed/absent renew re-claims a fresh generation and continues;
@@ -279,9 +341,14 @@ When D7b relays these reads through the daemon, they follow; D5 does not require
   read-error` treated as unknown, never absent/dead; (d) `proc dead ∧ lease held-live` → lost
   (the lease does NOT save a genuinely dead supervisor); (e) `leader-exit ∧ lapsed lease` →
   finalize from evidence (no fabricated exit).
-- **Failure classification (unit):** daemon-unreachable claim → advisory-leaseless launch
-  (proceeds, no direct write); CAS-conflict / invalid-TTL / DB-failure → fail readiness with the
-  code (NOT a silent warning).
+- **Failure classification (unit):** definite pre-send dial failure → advisory-leaseless launch
+  (proceeds, no direct write); **ambiguous post-commit timeout → idempotent retry recovers the
+  committed generation** (NOT a conflict, NOT leaseless); CAS-conflict (different identity) /
+  invalid-TTL / DB-failure → fail readiness with the code (NOT a silent warning).
+- **Config validator (unit):** `ttl < min_ttl (60s)`, ≤0, malformed, or violating
+  `ttl - renew_interval > D` / `ttl > reap_interval + jitter` → `E_CONFIG_INVALID`; boundary
+  `ttl = 60s` accepted; a renew delayed to just under/over `D` and a renew racing the reaper
+  (fake-clock) exercise the invariant edges.
 - **Daemon (real HW, Opus):** routed claim/renew/release over the socket; `SO_PEERCRED` reject;
   reaper laps a dead-supervisor lease on the timer.
 - **e2e (real binary, Opus):** `aira run --detach` claims a lease (visible via `watch`); kill the
