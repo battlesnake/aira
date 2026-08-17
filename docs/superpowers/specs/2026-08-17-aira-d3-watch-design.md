@@ -1,6 +1,6 @@
 # AIRA D3 — daemon watch (`aira watch`, long-poll event tail)
 
-**Status:** DRAFT v4 (Sol plan-review r1 6 → r2 4 → r3 3 findings; all folded)
+**Status:** DRAFT v5 (Sol plan-review r1 6 → r2 4 → r3 3 → r4 3 findings; folded, eof reframed best-effort)
 **Branch:** `codex-aira-d3` · **Base:** master `982556b` (D2 merged)
 **Depends on:** M21 (mandatory DB-owning daemon + routed coordination), D1/D2 (daemon
 timers + process-terminal shutdown this reuses).
@@ -81,9 +81,9 @@ renders `ctx.Done()` dead — a disconnected/SIGINT'd client would leak the hand
   `exchange`, verified) sends one request and **never half-closes** — so *any* Read result (EOF
   full-close, or error) means the client is gone and **cancels `connCtx`**. `connCtx` is cancelled
   **only** by this detector — **not** by `s.stopping` (Sol r2 #2): mixing the two makes the select
-  non-deterministically return `context.Canceled` instead of `eof` on shutdown, causing the client
-  to retry during an intentional stop. Shutdown is handled solely by the `<-s.stopping` case → a
-  deterministic `eof`.
+  non-deterministically surface `context.Canceled` instead of `eof` on shutdown. Shutdown is
+  handled solely by the `<-s.stopping` case → a **best-effort** `eof` (step 5; the residual race is
+  benign, never `context.Canceled`).
 
 Handler body (admission acquired at entry with **immediate `defer release`** so the count is
 reclaimed on *every* path — timeout, disconnect, shutdown, error, panic; Sol r2 #4):
@@ -109,13 +109,22 @@ reclaimed on *every* path — timeout, disconnect, shutdown, error, panic; Sol r
      (long-poll timeout, client re-polls); `<-s.stopping` → return `{[], from, eof:true}` (the
      ONLY shutdown path); `<-connCtx.Done()` → return `connCtx.Err()` (client gone — the client is
      no longer listening, so the return value is moot; the point is to stop the handler).
-5. **Deterministic shutdown priority (Sol r3 #1).** Go `select` chooses randomly among ready
-   cases, so a `deadlineTimer`/pacing-timer firing *coincident* with `close(s.stopping)` could
-   otherwise return `eof:false`. Therefore: after **every** non-shutdown wake, and **immediately
-   before writing any normal (non-`eof`) response**, do a non-blocking priority check
-   `select { case <-s.stopping: return {[], from, eof:true}; default: }`. Shutdown then always
-   wins over a coincident timeout/batch. (`connCtx` cancellation need not be prioritised — the
-   client is already gone.) §6 stress-tests coincident timeout/event/shutdown.
+5. **Best-effort shutdown priority, benign residual (Sol r3 #1, r4).** Go `select` chooses randomly
+   among ready cases, so after **every** non-shutdown wake and **immediately before writing any
+   normal (non-`eof`) response** the handler does a non-blocking priority check
+   `select { case <-s.stopping: return {[], from, eof:true}; default: }` — this pre-write check is
+   the **linearization point**: if `s.stopping` is observed closed, the client gets `eof`. Perfect
+   atomicity is impossible (a shutdown that begins *during* the response write cannot un-write it),
+   and it is **unnecessary**: the residual race — a normal batch delivered as shutdown begins — is
+   **benign**. That batch carries only real committed events (no loss, no duplication beyond the
+   stated at-least-once contract, no fabrication); the client then re-requests, gets
+   `E_DAEMON_UNAVAILABLE`, and its at-least-once retry reconnects or auto-starts — exactly what a
+   durable "keep me updated" watch should do in the mandatory-daemon model. So `eof` is a
+   **best-effort clean-exit hint**, not a hard guarantee; correctness (no lost/duped events, clean
+   client behaviour on daemon-gone) holds either way. A mutex/state-transition would only shrink,
+   never close, the in-flight-write window and is not warranted for a benign race. (`connCtx`
+   cancellation need not be prioritised — the client is already gone.) §6 tests the pre-write
+   check under coincident timeout/event/shutdown and the client's graceful daemon-gone re-request.
 4. The wait holds **no** DB connection/txn/lock: `EventsSince` runs a quick `SELECT` and returns,
    then the handler sleeps on the ticker with nothing open (cf. D2's `MaxOpenConns(1)` deadlock).
 
@@ -166,7 +175,7 @@ is an index range, cheap.
 - **SIGINT** → close the connection and exit 0.
 
 ### 3.5 Config & bounds (Sol r1 #2)
-- `AIRA_DAEMON_WATCH_POLL_INTERVAL` (Go duration, default **500ms**, **range [250ms, 10s]**;
+- `AIRA_DAEMON_WATCH_POLL_INTERVAL` (Go duration, default **500ms**, **range [250ms, 10s)**;
   malformed, below the floor, or **≥ the ceiling** → `E_CONFIG_INVALID` at daemon start): the
   internal re-query cadence during a long-poll. The floor bounds query load; the **ceiling (10s)
   keeps `pollInterval < watchWaitCapMs` so the `wait_ms` clamp `[pollInterval, watchWaitCapMs]`
@@ -208,12 +217,14 @@ is an index range, cheap.
 5. **Bounded.** Batch ≤ `watchBatchCap`; one long-poll ≤ `watchWaitCapMs`; poll floor bounds
    latency+load; concurrency ≤ `watchMaxConcurrent`; the wait holds **no** connection/txn/lock —
    a long-polling watch never starves routed traffic.
-6. **Disconnect- & shutdown-clean, deterministically separated (Sol r2 #2).** A closed/SIGINT'd
-   client is detected promptly by the peer-close detector, which cancels `connCtx` (peer-close is
-   its **only** trigger); on daemon stop the handler returns `eof` via the dedicated `<-s.stopping`
-   case (never `context.Canceled`), so the client never mistakes an intentional stop for a transient
-   error; a non-reading client is bounded by the response write deadline. Admission is released on
-   every exit path (`defer`).
+6. **Disconnect- & shutdown-clean, separated (Sol r2 #2, r4).** A closed/SIGINT'd client is detected
+   promptly by the peer-close detector, which cancels `connCtx` (peer-close is its **only**
+   trigger — never `s.stopping`, so shutdown never surfaces as `context.Canceled`). On daemon stop
+   the handler returns `eof` on a **best-effort** basis via the dedicated pre-write `<-s.stopping`
+   linearization check; a batch that races the shutdown write is benign (real events; the client
+   re-requests and its at-least-once retry reconnects/auto-starts). Correctness (no lost/duped
+   events; clean daemon-gone client behaviour) holds regardless. A non-reading client is bounded by
+   the response write deadline. Admission is released on every exit path (`defer`).
 7. **No fabrication.** Only committed `events` rows are reported; never synthesised, reordered, or
    backdated. `at_wall` is advisory (§11); `seq` is the authority.
 
@@ -254,7 +265,8 @@ Store (sandbox-runnable):
    local queueing, not the cross-process file-lock serialisation the watch actually relies on.
 
 Daemon (`s.watch`, real-HW):
-4. `from_now` returns the current max seq with an empty batch immediately.
+4. `from_now` returns the current max seq with an **empty batch after ≥ the min-request-duration**
+   (`pollInterval`), not instantly (Sol r4 — from_now is paced too).
 5. A blocked long-poll returns a concurrently-written event within ~poll interval, correct cursor.
 6. **Filtered cursor advances past non-matching events (Sol r1 #3):** with a `--verb` filter that
    excludes a burst, one poll returns `{events:[], cursor:advanced}` and the *next* poll does not
