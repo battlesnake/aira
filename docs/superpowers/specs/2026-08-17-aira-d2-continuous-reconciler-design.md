@@ -58,9 +58,12 @@ goes idle holding leases that expire). Closing the never-touched-since-restart g
 ### Out (deferred, explicit)
 - **Flush-on-scope-build** (Sol r2 #5). Dropped: it would drain an arbitrary backlog inside
   the readiness barrier, adding unbounded first-request latency for every bootstrap joiner.
-  Timer-only means a just-built scope's backlog is flushed within one interval (≤ default 60s);
-  the journal is **not a read-dependency** (command results come from the DB), so a bounded lag
-  after first touch is correct, not a gap.
+  Timer-only means a just-built scope's backlog is flushed on a **best-effort** basis from the
+  next tick onward — **not** a ≤60s guarantee: ticks are serial across projects, so a project's
+  flush may be delayed by other projects' flushes in the same tick, and a large backlog takes
+  multiple ticks (poison seqs aside, each tick makes forward progress from the lowest
+  unjournaled seq). This is acceptable because the journal is **not a read-dependency** (command
+  results come from the DB), so a bounded, best-effort lag after first touch is correct, not a gap.
 - **Git-file / allocation intent timer drain** — its own cut (needs worktree-liveness
   validation, scope eviction, bounded finding-lock, write-conflict backoff). Crash-residue
   git-file intents are still materialised by the next `reconcile`/`check` verb, as today.
@@ -99,16 +102,27 @@ for pid, view := range byProject {
   (`journalEventBounded`) that acquires `journal.lock` through a new
   `acquireLockBounded(ctx, path, timeout)` — `LOCK_EX|LOCK_NB` retried with backoff until the
   timeout or `ctx.Done()` (modelled on `runner.boundedRunLock`) — instead of the plain
-  blocking `LOCK_EX`. A paused/slow live peer can no longer wedge the flusher, later projects,
-  or shutdown; the in-flight event is time-bounded.
-- **Error classification (r2 #6):**
-  - success → `flushed++`.
-  - `E_JOURNAL_CORRUPT` for a specific seq (a poison event: DB says one payload, the journal
-    line for that seq says another) → log, **skip that seq, continue** (key-local; one poison
-    row must not starve the rest of the backlog).
-  - lock-acquire timeout, or any I/O / permission / open error → **journal-global**: stop this
-    pass, return the error; the daemon logs it and retries next tick with backoff. Continuing
-    would just re-fail every remaining key against the same wedged/broken journal.
+  blocking `LOCK_EX`. The timeout is a fixed **`journalLockTimeout = 2s`**, chosen well below
+  D1's `DrainTimeout = 10s` so a bounded lock-wait plus the event's own I/O still fits inside
+  the drain budget. A paused/slow live peer can no longer wedge the flusher, later projects,
+  or shutdown; the in-flight event's lock wait is time-bounded.
+- **Error classification by TYPED error (r2 #6, r3 #1)** — not by the overloaded
+  `E_JOURNAL_CORRUPT` string. The store exposes sentinels (each whose `Error()` **keeps the
+  `E_JOURNAL_CORRUPT:` prefix** so existing `ErrorCode`-string callers are unaffected):
+  - **success** → `flushed++`.
+  - **`errJournalKeyConflict`** (this seq's journal line disagrees with the DB event on
+    payload/verb/target/actor/at — a genuine per-seq corruption that can never be journaled
+    honestly) → log, **skip that seq, continue** (key-local poison).
+  - **missing `events` row** (`journalEvent`'s `SELECT … FROM events` returns
+    `sql.ErrNoRows` — an orphaned outbox seq) → **skip that seq, continue** (key-local poison;
+    that seq can never be journaled and must not strand later seqs).
+  - **`errJournalMalformed`** (unparseable JSON anywhere in the file), **lock-acquire timeout**,
+    or any **I/O / permission / open / fsync** error → **journal-global**: stop this pass,
+    return the error; the daemon logs it and retries the whole project next tick with backoff.
+    Continuing would re-fail every remaining key against the same broken/locked journal.
+  - Because keys are processed **`ORDER BY seq`** and only *poison* seqs are skipped (globals
+    abort the pass entirely), no poison seq is ever stranded behind a later one; each next tick
+    re-attempts from the lowest unjournaled seq, guaranteeing forward progress.
 - Return `(flushed, firstErr)`. **Never** marks a row `journaled` that was not durably appended
   (`journaled=1` is set inside `journalEvent`, strictly after a successful, fsync'd
   `appendEventIfMissing`).
@@ -124,23 +138,34 @@ otherwise malformed → `E_CONFIG_INVALID` before the listener binds. The 1s flo
 mistyped tiny interval from spinning the flush.
 
 ### 3.4 `appendEventIfMissing` durability + corruption detection
-Three fixes, all in the shared function (benefit every caller); each fault-tested.
+Four fixes, all in the shared function (benefit every caller); each fault-tested.
 
 1. **Dedup-hit durability (r1 #1).** The dedup-hit path returns `nil` without `f.Sync()`. If a
    prior append put the line in the page cache but the process died before its `Sync`, a later
    flush "finds" it and marks the DB row `journaled=1`, yet a power loss can drop the line —
    and replay only re-appends `journaled=0`. Fix: `f.Sync()` before the dedup-hit `return nil`.
-2. **Creation ordering (r2 #4).** When the journal file is first created, `Sync` the **parent
-   directory before** the first content append (and before any dedup scan can return), so the
-   file's directory entry is durable independent of the content `Sync`. This removes the
-   retry-hole where a file exists but its dirent was never persisted. On steady-state (file
-   already present) this is skipped.
-3. **Corruption-check completeness (r2 #3 / r1 #8, conceded).** Verified: `journalEvent`
-   reconstructs the record from the DB (`SELECT at_wall, actor, verb, target, payload_digest`),
-   so `Actor` and `At` are **deterministic from the DB** — comparing them cannot cause a false
-   corruption. Extend the same-`(project_id, seq)` check from `PayloadDigest|Verb|Target` to
-   also include `Actor` and `At`; a same-key line whose actor/timestamp differ is now flagged
-   `E_JOURNAL_CORRUPT` (detected) instead of silently accepted-and-marked-journaled.
+2. **Unconditional parent-directory sync (r2 #4 / r3 #2).** "File already exists" does **not**
+   imply its directory entry is durable — a prior process may have created the file and died
+   before syncing the parent. Conditionally syncing the parent only when *this* call creates the
+   file therefore leaves a crash/retry hole (a later holder skips the dir-sync, appends, syncs
+   the file, and marks the row journaled although the dirent was never persisted). Fix: `Sync`
+   the **parent directory unconditionally after opening the file, before the dedup scan** — so
+   any caller that will set `journaled=1` has first made the file's existence durable. Cost is a
+   metadata-only `fsync` per append, consistent with the DB's `synchronous(FULL)` posture.
+3. **Full-file scan for a conflicting duplicate (r3 #1).** The current scan early-returns `nil`
+   on the *first* matching `(project_id, seq)` line, so a conflicting duplicate **after** a
+   matching line is never detected. Fix: scan the **whole file**; if any line with the same
+   `(project_id, seq)` disagrees on the identity fields, it is a key conflict. (This does not
+   change asymptotic cost — the scan already reads from the start; see the §7 note on the
+   pre-existing O(n²) rescan-per-append characteristic, an accepted, deferred optimisation.)
+4. **Typed corruption detection incl. actor/at (r2 #3 / r1 #8, conceded; r3 #1 typing).**
+   Verified (Sol r3): `events` has carried `actor` and `at_wall` since inception and no
+   production path rewrites them; `journalEvent` reconstructs both from the DB, so comparing
+   them cannot cause a false corruption. Extend the same-`(project_id, seq)` identity check from
+   `PayloadDigest|Verb|Target` to also include `Actor` and `At`, and return the **typed**
+   `errJournalKeyConflict` (message keeps the `E_JOURNAL_CORRUPT:` prefix). Malformed JSON
+   returns the typed `errJournalMalformed` (also `E_JOURNAL_CORRUPT:`-prefixed). §3.2 classifies
+   the former as key-local poison and the latter as journal-global.
 
 ### 3.5 Honesty & cross-process coexistence
 Best-effort, never fake (§3.2). Client-side carved `reconcile`/`check` (own connection) may
@@ -153,17 +178,24 @@ single-writer (that is D7b).
 Add `flusherCtx`/`flusherDone` alongside D1's `reaperCtx`/`reaperDone`; the shutdown path
 `cancelFlusher()`s and the `drained` goroutine waits `connections.Wait(); <-reaperDone;
 <-flusherDone`. The existing `select { <-drained | <-time.After(DrainTimeout) →
-retainInstance=true; return &ErrDrainTimeout{lock} }` is unchanged. Because the flush is now
-ctx-aware between events **and** bounds each event's lock wait, ordinary shutdown drains
-promptly and the process-terminal path is a true last resort, not a routine outcome.
+retainInstance=true; return &ErrDrainTimeout{lock} }` is unchanged. The flush is ctx-aware
+**between events** and bounds each event's **lock wait** to `journalLockTimeout = 2s`; the
+per-event file I/O (open / scan / append / fsync) is *not* individually cancellable, so the
+worst-case drain overrun is **one in-flight event's total work** (≤ 2s lock wait + that event's
+I/O), designed to fit within `DrainTimeout = 10s`. A pathological event (e.g. a gigantic
+journal whose full-file scan alone exceeds the budget) is caught by the unchanged
+process-terminal backstop — the honest last resort, not the routine path.
 
 ## 4. Invariants
 1. **No fake success.** A flush that cannot durably append never marks the row `journaled`;
    global failures are logged and retried, never swallowed; a poison seq is skipped, not faked.
 2. **Idempotent, project-deduped convergence.** One flush per project per tick moves
    `journaled=0 → 1`; re-running is a no-op; correct for any cached-worktree count.
-3. **Isolation & boundedness.** One project's (or one poison seq's) failure never blocks the
-   rest; each event's lock wait is time-bounded; a global failure backs off to the next tick.
+3. **Isolation & bounded lock wait.** One project's (or one poison seq's) failure never blocks
+   the rest; each event's *lock wait* is bounded to `journalLockTimeout`; a global failure aborts
+   the pass and backs off to the next tick. Per-event file I/O is not individually cancellable
+   (the drain bound is one in-flight event; the process-terminal path is the pathological
+   backstop), and timer delivery is best-effort per tick, not a fixed-latency guarantee.
 4. **Journal never ahead of the DB, and "found" implies durable.** DB commit precedes journal
    append; a dedup-hit now fsyncs before letting the caller set `journaled=1`.
 5. **Drainable shutdown.** In-flight flush drains before `db.Close`; overruns are
@@ -188,17 +220,22 @@ Daemon socket/flock tests are Opus-real-HW (sandbox cannot bind sockets / flock 
 3. **Bounded lock: wedged peer does not hang the flush.** Hold `journal.lock` from another OFD;
    assert `FlushDeferredJournal` returns within the timeout (not blocked), leaves the row
    `journaled=0`, retried next tick — no fake success.
-4. **Error classification.** (a) A poison-seq `E_JOURNAL_CORRUPT` is skipped and later seqs are
-   still journaled this pass. (b) A journal-global I/O error aborts the pass (no further keys
-   attempted) and marks nothing journaled.
+4. **Error classification — all three classes (r3 #1).** (a) `errJournalKeyConflict` for one
+   seq → that seq skipped, later seqs still journaled this pass, aggregate error returned.
+   (b) A missing `events` row (`sql.ErrNoRows`) for one seq → skipped as key-local poison, later
+   seqs journaled — **not** treated as global (regression guard against stranding). (c)
+   `errJournalMalformed` / a journal-global I/O error → pass aborted (no further keys attempted),
+   nothing marked journaled, retried next tick.
 5. **ctx cancellation drains between events.** Cancel mid-flush → prompt `context.Canceled`,
    a journaled prefix, none falsely marked.
-6. **`appendEventIfMissing`: dedup-hit fsyncs (r1 #1) + creation dir-sync ordering (r2 #4).**
-   `beforeJournalSync`/`beforeDirSync` seams: first append's file-sync fails → retry finds the
-   line and must `Sync` before returning; creation syncs the parent dir before the first
-   content append.
-7. **Corruption completeness (r2 #3).** A same-`(project_id,seq)` journal line with a differing
-   `Actor`/`At` → `E_JOURNAL_CORRUPT` (not accepted, DB row stays `journaled=0`).
+6. **`appendEventIfMissing` durability (r1 #1, r2 #4/r3 #2).** `beforeFileSync`/`beforeDirSync`
+   seams: (a) dedup-hit fsyncs the file before returning; (b) the parent dir is synced
+   **unconditionally after open, before the scan**, even when the file already exists (the
+   crash/retry hole) — a fault-injection asserts the dir-sync happens on a pre-existing file.
+7. **Corruption completeness + full-file scan (r2 #3, r3 #1).** (a) A same-`(project_id,seq)`
+   line with a differing `Actor`/`At` → `errJournalKeyConflict` (prefix `E_JOURNAL_CORRUPT`),
+   DB row stays `journaled=0`. (b) A **conflicting duplicate placed after** a matching line is
+   still detected (proves the full-file scan, not first-match early-return).
 8. **Shutdown drains the flusher too**; **drain-timeout with a stuck flusher is
    process-terminal, retains the lock** (mirror D1's `TestDrainTimeoutRetains…`).
 9. **Disabled parks the loop; daemon still serves.**
@@ -209,9 +246,16 @@ Daemon socket/flock tests are Opus-real-HW (sandbox cannot bind sockets / flock 
 - Mirror D1's reaper structures (`flushScopeFn` seam; `flusherCtx`/`flusherDone`; drain gains
   `<-flusherDone`; `journalFlushIntervalFromEnv` mirrors `reapIntervalFromEnv` + the ≥1s floor).
 - New store surface: `FlushDeferredJournal(ctx) (int, error)`, a `journalEventBounded` helper,
-  and `acquireLockBounded(ctx, path, timeout)` (model on `runner.boundedRunLock`). Plus the
-  three `appendEventIfMissing` fixes (§3.4). Do **not** change `replayUnjournaledEvents`,
-  `Rebuild`, `reconcile`, or the plain `acquireLock` used elsewhere.
+  `acquireLockBounded(ctx, path, timeout)` (model on `runner.boundedRunLock`), and the typed
+  sentinels `errJournalKeyConflict` / `errJournalMalformed` (both `Error()` keep the
+  `E_JOURNAL_CORRUPT:` prefix so `ErrorCode` callers in check.go/gate_eval.go/insights.go are
+  unaffected). Plus the four `appendEventIfMissing` fixes (§3.4). Do **not** change
+  `replayUnjournaledEvents`, `Rebuild`, `reconcile`, or the plain `acquireLock` used elsewhere.
+- **Accepted, deferred:** `appendEventIfMissing` rescans the journal from the start on every
+  append (O(n²) over a full backlog flush). Pre-existing (every `journalEvent` already does it,
+  incl. the `reconcile`/`check` verbs); D2 does not worsen the per-append cost. The flush is a
+  best-effort background timer, ctx-interruptible between events, so a large backlog simply
+  takes several ticks. A journal offset/index is a separate optimisation, noted not hidden.
 - **No flush-on-build, no git-file materialisation, no finding-lock, no scope eviction/liveness**
   (all deferred). Do not hold `s.mu` across per-scope DB work.
 - `Co-Authored-By: Codex Terra <noreply@openai.com>` on the build; Opus verifies real-HW.
