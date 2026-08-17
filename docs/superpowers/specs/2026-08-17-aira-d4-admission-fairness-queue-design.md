@@ -1,6 +1,6 @@
 # AIRA D4 — daemon cross-session admission fairness-queue
 
-**Status:** DRAFT v6 (Sol plan-review r1 8 → r2 4 → r3 4 → r4 3 → r5 2 findings; all folded)
+**Status:** APPROVED v6 (Sol plan-review 6 rounds: 8→4→4→3→2→APPROVE-PLAN; trivial note folded)
 **Branch:** `codex-aira-d4` · **Base:** master `1cf83f2` (D3 merged)
 **Depends on:** #29 part 1 (per-process memory admission — the mechanism this fair-queues **and
 retains as the daemon-down fallback**), M21 (mandatory daemon), D3 (held-connection + peer-close +
@@ -212,7 +212,8 @@ byte-for-byte across all paths.
    but no strand); **any fallback path** while the daemon is up (partial/EOF/invalid/failed-write/
    cap-`E_DAEMON_BUSY` → the daemon-up cross-domain over-grant window of §2.1); and **daemon
    transitions** (§2.1/§2.4). Strict fair+accounted holds only *daemon-up ∧ within-caps ∧
-   no-fallback*; in every other case the guarantee downgrades from *fair* to *never-stranded*:
+   no-fallback ∧ no-timeout/unevaluated-bypass*; in every other case the guarantee downgrades from
+   *fair* to *never-stranded*:
    every run still launches (grant, timeout, fallback, or unevaluated), each honestly labelled.
 2. **Atomic grant, no double-spend.** Evaluation is serialised per slice and the grant prefix is
    read+computed+committed **under the per-slice state mutex** against the current reservation set;
