@@ -612,15 +612,17 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		}
 		args["verbs"] = splitComma(options["verb"])
 		args["wait_ms"] = int64(20_000)
+		// The cursor is sent as a decimal STRING so a > 2^53 sequence survives the
+		// daemon's request-arg decode without float64 rounding (Sol build r1 #3).
 		switch {
 		case options["from-start"] == "true":
-			args["from"] = int64(0)
+			args["from"] = "0"
 		case options["from"] != "":
 			from, err := strconv.ParseInt(options["from"], 10, 64)
 			if err != nil || from < 0 {
 				return core.Request{}, fmt.Errorf("E_SELECTOR_INVALID: watch --from requires a non-negative integer")
 			}
-			args["from"] = from
+			args["from"] = strconv.FormatInt(from, 10)
 		default:
 			args["from_now"] = true
 		}

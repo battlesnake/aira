@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"strconv"
 	"time"
 
 	"aira/internal/core"
@@ -69,12 +70,29 @@ func runWatchLoop(ctx context.Context, dispatcher Dispatcher, scope daemon.Workt
 		}
 		cursor = batch.Cursor
 		request.Args["from_now"] = false
-		request.Args["from"] = cursor
-		backoff = watchBackoffMin
+		// Send the cursor as a decimal STRING so a > 2^53 sequence is never
+		// rounded through float64 on the daemon's request decode (Sol build r1 #3).
+		request.Args["from"] = strconv.FormatInt(cursor, 10)
 		if batch.EOF {
-			_, _ = fmt.Fprintln(stderr, "aira watch: daemon stopped")
-			return 0
+			// A watch is durable across daemon restarts. eof means THIS daemon
+			// instance is stopping — do NOT exit. Reconnect and continue from the
+			// cursor so a freshly auto-started daemon serves everything still in
+			// the DB: the > batchCap terminal overflow AND any event a
+			// still-draining writer committed after the terminal scan (Sol build
+			// r1 #1/#2). Only SIGINT (ctx) or a fatal error ends the watch.
+			_, _ = fmt.Fprintln(stderr, "aira watch: daemon stopping; reconnecting from cursor")
+			if !waitWatchBackoff(ctx, backoff) {
+				return 0
+			}
+			if backoff < watchBackoffMax {
+				backoff *= 2
+				if backoff > watchBackoffMax {
+					backoff = watchBackoffMax
+				}
+			}
+			continue
 		}
+		backoff = watchBackoffMin
 	}
 }
 
@@ -135,6 +153,9 @@ func watchRequestInt64(value any) int64 {
 		return int64(value)
 	case float64:
 		return int64(value)
+	case string:
+		parsed, _ := strconv.ParseInt(value, 10, 64)
+		return parsed
 	default:
 		return 0
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -236,6 +237,12 @@ func watchInt64(value any) int64 {
 		return int64(value)
 	case json.Number:
 		parsed, _ := value.Int64()
+		return parsed
+	case string:
+		// The client sends the cursor as a decimal string so a > 2^53 sequence
+		// is never rounded through float64 by the request-arg decode (Sol build
+		// r1 #3). Non-numeric strings degrade to 0 (from-start).
+		parsed, _ := strconv.ParseInt(value, 10, 64)
 		return parsed
 	default:
 		return 0

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -166,6 +167,10 @@ func TestWatchShutdownTerminalDrainAndOverflowBoundaries(t *testing.T) {
 				t.Fatalf("terminal data count=%d cursor=%d eof=%v", len(data.Events), data.Cursor, data.EOF)
 			}
 			if count == watchBatchCap+1 {
+				// The overflow beyond batchCap is NOT lost: the client, on eof,
+				// reconnects from the terminal cursor to a fresh (running) daemon.
+				// A non-stopping server (open `stopping`) models that fresh daemon,
+				// which serves the remaining seq from data.Cursor.
 				server.stopping = make(chan struct{})
 				remainder := watchData(t, server.watch(context.Background(), scope, map[string]any{"from": data.Cursor, "wait_ms": 1}))
 				if len(remainder.Events) != 1 || remainder.Events[0].Seq != watchBatchCap+1 {
@@ -314,5 +319,19 @@ func TestWatchCanceledTerminalDrainNeverClaimsEOF(t *testing.T) {
 	var data WatchResponse
 	if response.Data != nil || !errors.Is(ctx.Err(), context.Canceled) {
 		t.Fatalf("canceled terminal response=%+v data=%+v", response, data)
+	}
+}
+
+func TestWatchInt64CursorAbove2Pow53IsExactViaString(t *testing.T) {
+	// A cursor is sent as a decimal string so it survives the request-arg decode
+	// without float64 rounding. 2^53+1 is the first int not representable as a
+	// float64 (float64(2^53+1) == 2^53), so the string path must preserve it and
+	// the float64 path must NOT (Sol build r1 #3).
+	const cursor int64 = (1 << 53) + 1
+	if got := watchInt64(strconv.FormatInt(cursor, 10)); got != cursor {
+		t.Fatalf("string cursor decoded to %d, want %d", got, cursor)
+	}
+	if lossy := watchInt64(float64(cursor)); lossy == cursor {
+		t.Fatalf("float64 cursor unexpectedly exact (%d) — the string encoding would be pointless", lossy)
 	}
 }

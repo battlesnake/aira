@@ -22,8 +22,8 @@ func TestWatchArgumentsBuildCursorFiltersAndTarget(t *testing.T) {
 		want map[string]any
 	}{
 		{name: "from now", argv: nil, want: map[string]any{"from_now": true}},
-		{name: "from", argv: []string{"--from", "42"}, want: map[string]any{"from": int64(42)}},
-		{name: "from start", argv: []string{"--from-start"}, want: map[string]any{"from": int64(0)}},
+		{name: "from", argv: []string{"--from", "42"}, want: map[string]any{"from": "42"}},
+		{name: "from start", argv: []string{"--from-start"}, want: map[string]any{"from": "0"}},
 		{name: "filters", argv: []string{"AIRA-2", "--verb", "lease.release,lease.lapse"}, want: map[string]any{"target": "AIRA-2"}},
 	}
 	for _, test := range tests {
@@ -63,8 +63,9 @@ func TestWatchArgumentsBuildCursorFiltersAndTarget(t *testing.T) {
 	}
 }
 
-func TestWatchLoopRetriesUnadvancedCursorPrintsThenStopsOnEOF(t *testing.T) {
+func TestWatchLoopRetriesUnadvancedCursorPrintsThenReconnectsOnEOF(t *testing.T) {
 	var requests []core.Request
+	ctx, cancel := context.WithCancel(context.Background())
 	dispatcher := dispatcherFunc(func(_ context.Context, _ daemon.WorktreeScope, request core.Request) core.Response {
 		copyArgs := make(map[string]any, len(request.Args))
 		for key, value := range request.Args {
@@ -76,35 +77,48 @@ func TestWatchLoopRetriesUnadvancedCursorPrintsThenStopsOnEOF(t *testing.T) {
 			return core.Response{Code: daemon.CodeUnavailable, Error: daemon.CodeUnavailable + ": dropped", Exit: 4}
 		case 2:
 			return core.Response{OK: true, Code: "OK", Data: daemon.WatchResponse{Events: []store.WatchEvent{{Seq: 6, At: "now", Actor: "a", Verb: "mv", Target: "AIRA-1"}}, Cursor: 6}}
+		case 3:
+			// eof: a durable watch must NOT exit — it reconnects from the cursor.
+			return core.Response{OK: true, Code: "OK", Data: daemon.WatchResponse{Events: []store.WatchEvent{}, Cursor: 6, EOF: true}}
 		default:
+			cancel() // the only thing that ends a durable watch, as SIGINT would
 			return core.Response{OK: true, Code: "OK", Data: daemon.WatchResponse{Events: []store.WatchEvent{}, Cursor: 6, EOF: true}}
 		}
 	})
-	request := core.Request{Verb: "watch", Args: map[string]any{"from": int64(5), "wait_ms": int64(20_000)}}
+	request := core.Request{Verb: "watch", Args: map[string]any{"from": "5", "wait_ms": int64(20_000)}}
 	var stdout, stderr bytes.Buffer
-	if exit := runWatchLoop(context.Background(), dispatcher, daemon.WorktreeScope{}, request, false, &stdout, &stderr); exit != 0 {
+	if exit := runWatchLoop(ctx, dispatcher, daemon.WorktreeScope{}, request, false, &stdout, &stderr); exit != 0 {
 		t.Fatalf("exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
 	}
 	if got := stdout.String(); got != "6 now a mv AIRA-1\n" {
 		t.Fatalf("stdout=%q", got)
 	}
-	if !strings.Contains(stderr.String(), "daemon stopped") {
+	if !strings.Contains(stderr.String(), "reconnecting") {
 		t.Fatalf("stderr=%q", stderr.String())
 	}
-	if len(requests) != 3 || requests[0].Args["from"] != int64(5) || requests[1].Args["from"] != int64(5) || requests[2].Args["from"] != int64(6) {
+	// req1 retried from the unadvanced "5"; after the batch the cursor advanced to
+	// "6" (a decimal string, precision-safe); eof RECONNECTED from "6", not an exit.
+	if len(requests) < 4 || requests[0].Args["from"] != "5" || requests[1].Args["from"] != "5" || requests[2].Args["from"] != "6" || requests[3].Args["from"] != "6" {
 		t.Fatalf("requests=%#v", requests)
 	}
 }
 
 func TestWatchLoopJSONPrintsOneObjectPerEvent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var calls int
 	dispatcher := dispatcherFunc(func(context.Context, daemon.WorktreeScope, core.Request) core.Response {
+		calls++
+		if calls > 1 {
+			cancel() // end the durable watch after the first batch prints
+			return core.Response{OK: true, Code: "OK", Data: daemon.WatchResponse{Events: []store.WatchEvent{}, Cursor: 2}}
+		}
 		return core.Response{OK: true, Code: "OK", Data: daemon.WatchResponse{Events: []store.WatchEvent{
 			{Seq: 1, At: "a", Actor: "one", Verb: "create", Target: "AIRA-1"},
 			{Seq: 2, At: "b", Actor: "two", Verb: "mv", Target: "AIRA-1"},
-		}, Cursor: 2, EOF: true}}
+		}, Cursor: 2}}
 	})
 	var stdout, stderr bytes.Buffer
-	if exit := runWatchLoop(context.Background(), dispatcher, daemon.WorktreeScope{}, core.Request{Verb: "watch", Args: map[string]any{}}, true, &stdout, &stderr); exit != 0 {
+	if exit := runWatchLoop(ctx, dispatcher, daemon.WorktreeScope{}, core.Request{Verb: "watch", Args: map[string]any{}}, true, &stdout, &stderr); exit != 0 {
 		t.Fatal(exit)
 	}
 	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
@@ -160,7 +174,7 @@ func (b *lockedBuffer) String() string {
 	return b.b.String()
 }
 
-func TestWatchRealDaemonPrintsConcurrentEventAndEOF(t *testing.T) {
+func TestWatchRealDaemonPrintsConcurrentEventAndExitsOnSIGINT(t *testing.T) {
 	dispatcher, scope, _ := storeFreeDispatcherFixture(t)
 	server := daemon.NewServer(dispatcher.paths)
 	ctx, cancelServer := context.WithCancel(context.Background())
@@ -177,10 +191,11 @@ func TestWatchRealDaemonPrintsConcurrentEventAndEOF(t *testing.T) {
 	}
 
 	var stdout, stderr lockedBuffer
+	watchCtx, cancelWatch := context.WithCancel(context.Background())
 	watchDone := make(chan int, 1)
 	go func() {
-		watchDone <- runWatchLoop(context.Background(), dispatcher, scope, core.Request{Verb: "watch", Args: map[string]any{
-			"from": int64(0), "verbs": []string{"id.allocate"}, "wait_ms": int64(20_000),
+		watchDone <- runWatchLoop(watchCtx, dispatcher, scope, core.Request{Verb: "watch", Args: map[string]any{
+			"from": "0", "verbs": []string{"id.allocate"}, "wait_ms": int64(20_000),
 		}}, false, &stdout, &stderr)
 	}()
 	mutation := dispatcher.Dispatch(context.Background(), scope, core.Request{Verb: "id", Args: map[string]any{"prefix": "AIRA"}})
@@ -194,15 +209,18 @@ func TestWatchRealDaemonPrintsConcurrentEventAndEOF(t *testing.T) {
 	if !strings.Contains(stdout.String(), "id.allocate") {
 		t.Fatalf("watch output=%q", stdout.String())
 	}
-	cancelServer()
+	// A durable watch exits only on client SIGINT (ctx), NOT when the daemon stops
+	// (it would reconnect). Cancel the watch ctx as SIGINT would.
+	cancelWatch()
 	select {
 	case exit := <-watchDone:
 		if exit != 0 {
 			t.Fatalf("watch exit=%d stderr=%q", exit, stderr.String())
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("watch did not exit on daemon EOF")
+		t.Fatal("watch did not exit on client SIGINT")
 	}
+	cancelServer()
 	if err := <-serverDone; err != nil {
 		t.Fatalf("server stop=%v", err)
 	}
