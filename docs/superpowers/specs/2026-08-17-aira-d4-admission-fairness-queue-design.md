@@ -1,201 +1,218 @@
 # AIRA D4 — daemon cross-session admission fairness-queue
 
-**Status:** DRAFT v1 (plan-review pending)
+**Status:** DRAFT v2 (Sol plan-review r1 → CHANGES-NEEDED, 8 findings; all folded)
 **Branch:** `codex-aira-d4` · **Base:** master `1cf83f2` (D3 merged)
-**Depends on:** #29 part 1 (per-process memory admission — the mechanism this fair-queues),
-M21 (mandatory DB-owning daemon), D3 (held-connection + peer-close + long-poll infrastructure).
+**Depends on:** #29 part 1 (per-process memory admission — the mechanism this fair-queues **and
+retains as the daemon-down fallback**), M21 (mandatory daemon), D3 (held-connection + peer-close +
+long-poll infra).
 
 ## 1. Problem & goal
 
-#29 part 1 gave `aira run` **coupled** memory admission: before launching, the run process
-reads the shared slice's `memory.current`/`memory.max`, and when free ≥ reserve it takes a
-**non-blocking machine-wide `LOCK_EX` flock** (keyed by the canonical slice path) held from
-launch-prep through `Start`; on contention it spin-polls (jittered) until the lock is free or
-`admission_max_wait` elapses (then launches anyway, `admission=timeout`). Fail-open on an
-unreadable slice/memory/lock (`admission=unevaluated`). Coupling is the load-bearing property:
-the gate lives *inside* the run process, so it cannot silently die and strand the job the way a
-decoupled "wait for the lane" loop did (the real incident that motivated #29).
+#29 part 1 gave `aira run` **coupled** memory admission: the run process reads the shared slice's
+`memory.current`/`memory.max`, and when free ≥ reserve it takes a **non-blocking machine-wide
+`LOCK_EX` flock** (keyed by the canonical slice path) held launch-prep→`Start`; on contention it
+spin-polls until free-and-locked or `admission_max_wait` (then launches anyway, `timeout`);
+fail-open on an unreadable slice/memory/lock (`unevaluated`). **Coupling** is load-bearing: the
+gate lives *inside* the run process, so it cannot silently die and strand the job. But the flock
+is **not fair** — acquisition order is non-deterministic, so a run can **starve** and a burst
+**herds**.
 
-But the flock is **not fair**. Under contention the acquisition order is non-deterministic —
-whoever's poll happens to align with the lock being free wins — so a run can **starve** (keep
-losing the race) and a burst of waiters **herds** (all wake, one wins, the rest re-poll). Order
-is memoryless; a long-waiting run has no precedence over a just-arrived one.
+**Goal (D4):** the mandatory daemon becomes the **fair cross-session arbiter** — a per-slice
+**FIFO queue** granting admission in arrival order when memory allows — while **preserving
+coupling and fail-open honesty**, and **retaining #29's in-process flock as the fallback when the
+daemon is unreachable** (so a daemon fault degrades to serialized-but-unfair, never to an
+un-gated stampede).
 
-**Goal (D4):** the mandatory per-user daemon becomes the **fair cross-session arbiter**. It holds
-a per-slice **FIFO admission queue** and grants admission in **arrival order** when memory allows,
-replacing the non-deterministic flock race. Coupling and fail-open honesty are preserved; the
-run process still holds its grant through `Start` and still launches even when admission is
-unevaluated or times out.
+## 2. Design
 
-## 2. Design — a per-slice FIFO queue with reservation accounting
-
-### 2.1 Where it lives
-`run` is a **carved** verb: the subprocess launches in the *client* process. D4 routes only the
-**admission decision** to the daemon; the launch stays client-side. The daemon is the natural
-cross-session arbiter — it is machine-wide (one per user), already reads the cgroup fs, and D3
-gave it the held-connection + peer-close machinery this needs.
+### 2.1 Where it lives, and the flock fallback (Sol r1 #6)
+`run` is carved (the subprocess launches in the *client*). D4 routes only the **admission
+decision** to the daemon; the launch stays client-side. The daemon is the cross-session arbiter.
+**The #29 in-process flock path is retained as the fallback:** the client tries the daemon admit;
+if the daemon is genuinely unreachable *after auto-start* (a real fault), the client falls back to
+the **existing #29 flock self-gating** — serialized, not fair, but never an un-gated stampede.
+Fallback and daemon-queue do not run concurrently in steady state; only during a bounded daemon
+*restart* window can a fallback client overlap a reviving daemon, and that overlap collapses to
+the same advisory grant→materialise window as §2.4 (documented, not a silent regression). Carrying
+both is cheap: #29's code already exists and is exercised only on the daemon-down path.
 
 ### 2.2 The grant rule (fair + concurrent, strict FIFO, no jump-ahead)
-Per slice the daemon keeps an ordered **waiter list** (FIFO by arrival seq) and a set of
-**outstanding reservations** (granted-but-not-yet-released reserves). On each re-evaluation it
-reads the slice's live `memory.current`/`memory.max` once and computes
-`available = (max - current) - Σ(outstanding reserves)`, then walks the waiter list **from the
-front**, granting each waiter whose `reserve ≤ available` and subtracting its reserve from
-`available` as it goes — **stopping at the first waiter that does not fit**. That first
-non-fitting waiter (and everyone behind it) waits. This is:
-- **Strictly fair / no starvation:** a later small waiter never jumps ahead of an earlier
-  non-fitting one (head-of-line blocking is the *fair* choice — the front is guaranteed to go
-  first once memory frees). Arrival order is total per slice.
-- **Concurrent when memory allows:** it grants the longest fitting FIFO *prefix*, not one-at-a-
-  time — strictly better utilisation than the flock's single-holder while staying fair.
+Per slice the daemon keeps an ordered **waiter list** (FIFO by a per-slice monotonic arrival seq
+assigned under the registry lock, so concurrent enqueues get a total order) and a set of
+**outstanding reservations**. **Evaluation is serialised per slice** (§2.3). One evaluation reads
+the slice's live `memory.current`/`memory.max` once, then — holding the registry lock —
+recomputes `available = (max - current) - Σ(outstanding reserves)` against the *current* waiter/
+reservation state and walks the waiter list **from the front**, granting each waiter whose
+`reserve ≤ available` and subtracting as it goes, **stopping at the first that does not fit**.
+- **Strictly fair, no starvation:** a later small waiter never precedes an earlier non-fitting
+  one (head-of-line blocking is the fair choice). Arrival order is total per slice.
+- **Concurrent when memory allows:** the longest fitting FIFO *prefix* is granted, not one-at-a-
+  time.
 
-### 2.3 The reservation lifecycle (the correctness core)
-A reservation exists to bridge the window between **grant** and the granted process's memory
-actually appearing in `memory.current`, so two waiters cannot both see the same free memory and
-both launch. It is created on grant and released when the run process is done needing admission:
+### 2.3 Atomic, single-writer evaluation (Sol r1 #2, #4)
+Each slice queue has **one serialised evaluator**: enqueue, release, timeout, and the poll ticker
+all set a per-slice **dirty flag** and signal a single evaluate step (a per-slice mutex or a lone
+evaluator goroutine) — evaluations never overlap. The memory read happens outside the registry
+lock (I/O), but the **grant commit re-validates `available` and the front prefix under the
+registry lock atomically** with reservation insertion, so two triggers can never read the same
+free memory and independently grant. The registry lock is never held across the memory read or a
+frame write.
 
-- **Grant → hold:** on granting a waiter the daemon adds its reserve to the slice's outstanding
-  set and delivers the grant; the run process then launches and `Start`s.
-- **Release:** the run process **closes the admit connection right after `Start`**. The daemon's
-  peer-close detector (D3) releases the reservation and re-evaluates the queue. By `Start` the
-  process's memory is materialising into `memory.current`, so releasing the reservation hands
-  accounting over to the live reading (advisory, matching #29 — an admission floor, not a
-  guarantee).
-- **Death before Start:** if the run process dies while queued or after grant but before
-  release, the same peer-close releases its waiter slot / reservation immediately — a dead
-  requester never holds a slot or a reservation (the flock had this via kernel lock-release; D4
-  keeps it via connection-close).
+**Per-waiter exact-once state machine** `queued → granted → released` (Sol r1 #4). Transitions are
+taken under the registry lock; **peer-close monitoring starts at enqueue** (not after grant), so a
+death at any point is caught. `release` (remove reservation if in `granted`, remove waiter, mark
+`released`, wake the evaluator) is **idempotent** and runs on **every** exit path: successful
+grant-then-client-close, a **failed/partial grant frame write** (release immediately — never leave
+a reserved-but-undelivered grant), `max_wait`, `ctx`/peer-close, and shutdown. A waiter is granted
+at most once and released at most once.
 
-### 2.4 Honesty — never a fake block, never a strand
-- **Unevaluated:** if the daemon cannot resolve the slice path or read `memory.current`/`.max`,
-  it grants **immediately** with `admission=unevaluated` + a reason; the run launches. Identical
-  fail-open to #29 (an advisory floor that never blocks on missing evidence).
-- **Timeout:** each waiter carries its `admission_max_wait`; when it elapses the daemon grants it
-  **anyway** with `admission=timeout` (it leaves the FIFO and launches), so a run is never
-  stranded behind a permanently-too-large front. The reserve is still held from this grant to
-  release (so a timeout grant still participates in accounting).
-- **Daemon unavailable:** the daemon is mandatory (auto-started). If the admit exchange still
-  fails after auto-start (a genuine daemon fault), the client **fails open**: it warns and
-  launches with `admission=unevaluated`, never blocking a run on the arbiter being down. (The
-  #29 in-process flock path is **removed** as the steady-state arbiter; daemon-unavailable
-  fail-open is the safety net — see §5 deferrals for the "flock fallback" option.)
-- **`--no-admit` / disabled** (`run.slice` unset): unchanged — no admission, launches directly.
+### 2.4 Reservation lifecycle & crash-recovery honesty (Sol r1 #3)
+A reservation bridges **grant → the granted process's memory appearing in `memory.current`**, so
+two waiters cannot both launch against the same free memory. Created on grant; released when the
+run process closes the admit connection **right after `Start`** (peer-close), by which point its
+memory is materialising into `current` (accounting hands over to the live reading — advisory,
+matching #29). A death before release frees the reservation at once.
 
-### 3. Protocol & the client
+**Daemon crash after grant delivery (honest, advisory-floor-consistent):** if the daemon crashes
+between delivering a grant and the client's release, the **granted run proceeds and is honestly
+recorded as granted** (it *was* admitted; the crash does not un-admit it). The in-memory
+reservation is lost, but the restarted daemon re-reads live `memory.current`, which already
+reflects that run's materialising memory — so the lost reservation collapses to the **same
+advisory grant→materialise window** D4 already tolerates, not a new hazard. A client that loses
+the socket **before** receiving a grant frame is not admitted → it **fails over** (to the flock
+fallback, else `unevaluated` launch). We do **not** add restart-safe persisted reservations; the
+crash window is advisory, stated not hidden.
 
-### 3.1 The `admit` op (held-connection long-poll)
-A new daemon op (a `StoreOpFrame`-style routed op, or a `RouteDaemon` verb the daemon
-intercepts — mirror D3's `watch` interception, since it is likewise daemon-specific and holds
-the connection). Request: `{slice, reserve, max_wait_ms}`. The daemon:
-1. Resolves + reads the slice; on unresolvable/unreadable → immediate `{state: unevaluated,
-   reason}` (no enqueue).
-2. Else enqueues the connection as a waiter (arrival seq) under the slice, derives a
-   shutdown-/peer-cancellable context (D3 pattern), and **long-polls**: re-evaluate on a poll
-   ticker (memory changes are external, so poll — default 250ms) and whenever another waiter
-   releases; grant when §2.2 reaches this waiter, or `max_wait` elapses (`state: timeout`), or
-   `s.stopping` closes (daemon shutdown → grant `state: unevaluated, reason: daemon-stopping`
-   so the run is never blocked by a daemon restart).
-3. On grant: add the reserve to outstanding, write **one** grant frame `{state, reason,
-   waited_ms}`, then **hold the connection** watching for close (peer-close detector). On close
-   → remove the reservation, remove the waiter, re-evaluate.
-4. Admission concurrency is bounded (`admitMaxWaiters` per slice, e.g. 256; excess →
-   `E_DAEMON_BUSY`, and the client fails open + launches with a warning rather than blocking).
+### 2.5 Honesty — never a fake block, never a strand
+- **Unevaluated:** daemon cannot resolve the slice / read memory → **immediate** `unevaluated`
+  grant (no enqueue); the run launches.
+- **Timeout is an explicit, labelled queue bypass (Sol r1 #5).** Each waiter respects **its own**
+  `admission_max_wait`; on expiry it leaves the FIFO and is granted `timeout` (still adds a
+  reservation grant→release). This means FIFO governs the **memory-freed grant order only**; a
+  timeout is an honest bypass (a run that waited too long launches unfairly-but-not-stranded), so
+  a later waiter with a shorter `max_wait` **can** launch before an earlier one — stated plainly,
+  and tested with unequal deadlines.
+- **Shutdown:** on `s.stopping` the daemon **closes all admit connections server-side and clears
+  the registry exactly once** (Sol r1 #7); queued clients see EOF → they fail over (fallback/
+  `unevaluated`); already-granted clients (launching) simply proceed. `Serve` drains without the
+  process-terminal path.
+- **Daemon unavailable / a lost or wedged response:** the **client** never blocks indefinitely
+  (Sol r1 #1) — its admit read carries a **client-side deadline = `max_wait` + a bounded transport
+  grace**; on expiry it closes the socket and takes the fallback (flock), else `unevaluated`. So
+  coupling holds **at the client**, independent of daemon liveness.
+- **`--no-admit` / `run.slice` unset:** unchanged (bypassed/disabled).
+
+## 3. Protocol & the client
+
+### 3.1 The `admit` op (held-connection, daemon-intercepted, bounded)
+A daemon-intercepted op (mirror D3's `watch` interception). Request `{slice, reserve, max_wait_ms}`
+is **validated server-side** (Sol r1 #8): `reserve ≥ 0` and within a sane ceiling, `max_wait_ms`
+clamped to `[0, admitWaitCapMs]`, `slice` canonicalised; hostile/overflowing values are rejected
+(`E_DAEMON_PROTOCOL`) or clamped with **checked arithmetic** in the `available` computation.
+Daemon flow:
+1. Resolve+read the slice; unresolvable/unreadable → immediate `{state: unevaluated, reason}`.
+2. Enqueue (arrival seq under the registry lock), start the peer-close monitor, derive a
+   shutdown-/peer-cancellable ctx, and run the serialised evaluator: grant per §2.2 / `max_wait`
+   → `timeout` / `s.stopping` → `unevaluated`.
+3. On grant: insert reservation under the lock, write **one** grant frame `{state, reason,
+   waited_ms}` with a **write deadline**; a write failure → immediate release. Then **hold** the
+   connection (peer-close) → on close, idempotent release + evaluate.
+4. **Bounds (Sol r1 #8):** a **global** admit-connection cap and a per-slice waiter cap (excess →
+   `E_DAEMON_BUSY`); empty per-slice registry entries are deleted; connections/goroutines/FDs are
+   bounded.
 
 ### 3.2 The client (`internal/runner` admit path)
-`Runner.admit` is rerouted: instead of the local memory-poll + flock loop, it **opens the admit
-connection to the daemon** (via the runner's injected daemon-admit seam so tests stay
-hermetic), sends `{slice, reserve, max_wait}`, blocks reading the single grant frame, and
-returns an `admissionResult{state, reason, waitedMS, release: <the open connection>}`. The
-existing call sites (`runner_linux.go:241`, `detach_linux.go:194`) keep the returned handle and
-**close it right after `Start`** (replacing `admitLock.release()`), so the reservation is held
-grant→Start exactly as the flock was. `ctx` cancellation (run killed while queued) closes the
-connection → the daemon dequeues it. The recorded `admission` state (`immediate`/`waited`/
-`timeout`/`unevaluated`/`disabled`/`bypassed`) is preserved on the run record byte-for-byte.
+`Runner.admit` reroutes: it dials the daemon admit (via an injected `admitDialFn` seam so queue
+tests stay hermetic), sends the request, and reads the single grant frame **under a client-side
+deadline** (§2.5). On a grant it returns `admissionResult{state, reason, waitedMS, release: conn}`;
+the existing call sites (`runner_linux.go:241`, `detach_linux.go:194`) keep the handle and
+**close it right after `Start`** (replacing `admitLock.release()`), holding the reservation
+grant→Start exactly as the flock did. On a client-deadline expiry, EOF-before-grant, `E_DAEMON_
+BUSY`, or any daemon-admit failure → **fall back to the #29 flock self-gating** (§2.1); if the
+fallback itself is unevaluable, launch `unevaluated`. `ctx` cancellation (run killed while queued)
+closes the connection → the daemon dequeues it. The recorded `admission` state
+(`immediate`/`waited`/`timeout`/`unevaluated`/`disabled`/`bypassed`) is preserved on the run record
+byte-for-byte across all paths.
 
 ## 4. Invariants
-1. **Fair, total FIFO order per slice.** Waiters are granted in strict arrival order; a later
-   waiter never precedes an earlier one, even when smaller — no starvation of the front.
-2. **Memory floor honoured (advisory).** A grant is issued only when
-   `reserve ≤ (max - current) - Σ outstanding`, computed from a single live memory sample per
-   evaluation; the reservation is held grant→release so two waiters never double-spend the same
-   free memory. As in #29 this is an advisory floor (memory materialises after `Start`), never a
-   hard guarantee.
-3. **Coupled, never stranded.** The gate is the run process's held connection; if it dies
-   (queued or granted-not-released) the daemon frees its slot/reservation at once. A run is
-   **never blocked** by: an unreadable slice/memory (→ unevaluated grant), `max_wait` (→ timeout
-   grant), a daemon shutdown (→ unevaluated grant), or a daemon fault (→ client fail-open launch).
-4. **No fake success / honest state.** The recorded `admission` state names exactly what
-   happened (immediate/waited/timeout/unevaluated/disabled/bypassed); a fail-open path is always
-   labelled, never presented as a clean gate.
-5. **Bounded.** Per-slice waiter count ≤ `admitMaxWaiters`; the poll re-evaluation is bounded;
-   the long-poll holds no lock and no DB connection (it reads the cgroup fs, not `state.db`).
-6. **Shutdown-clean.** Admit connections are drained on daemon stop via D3's `s.stopping`
-   (grant-unevaluated), so they never hang the drain or trip the process-terminal path.
+1. **Fair FIFO among memory-freed grants; timeout is a labelled bypass.** Waiters granted because
+   memory freed go in strict per-slice arrival order (no jump-ahead, no starvation of the front);
+   a `max_wait` timeout is an explicit, recorded bypass respecting each waiter's own deadline.
+2. **Atomic grant, no double-spend.** Evaluation is serialised per slice and the grant prefix is
+   committed under the registry lock against the current reservation set; two triggers never grant
+   against the same free-memory sample. Advisory floor (memory materialises after `Start`), as #29.
+3. **Exact-once lifecycle.** Each waiter is `queued→granted→released`; release is idempotent and
+   runs on every exit (grant-close, failed/partial write, timeout, peer-close, shutdown); a
+   reservation is never leaked (which would shrink `available` and deadlock the queue) nor released
+   twice.
+4. **Coupled at the client, never stranded.** The client never blocks past `max_wait` + grace
+   regardless of daemon liveness; a run always launches — via grant, timeout, unevaluated, the
+   flock fallback (daemon down → serialized, not a stampede), or a labelled fail-open.
+5. **Honest state.** The recorded `admission` names exactly what happened; every fail-open/bypass
+   is labelled, never presented as a clean gate; a daemon crash after grant keeps the granted run
+   honestly `granted` with the reservation loss folded into the advisory window (§2.4).
+6. **Bounded & validated.** Global + per-slice waiter caps; empty registry entries pruned;
+   server-side range validation + checked arithmetic on reserve/max_wait/available.
+7. **Shutdown-clean.** All admit connections closed server-side + registry cleared exactly once on
+   stop; queued clients fail over on EOF; the drain never hangs.
 
 ## 5. Scope
 
 ### In
-The per-slice FIFO queue + reservation accounting in the daemon; the `admit` held-connection op
-(enqueue → prefix-grant → hold → release-on-close), with unevaluated/timeout/shutdown fail-open;
-the runner `admit` reroute to the daemon (held handle released after `Start`); the daemon reading
-slice memory; config reuse (`run.slice`/`memory_headroom`/`admission_max_wait`, plus
-`AIRA_DAEMON_ADMIT_POLL_INTERVAL` default 250ms) ; per-slice waiter cap.
+The per-slice FIFO queue + serialised atomic evaluator + reservation accounting; the exact-once
+waiter state machine with peer-close-from-enqueue; the daemon-intercepted held-connection `admit`
+op with server-side validation, global+per-slice caps, and registry pruning; unevaluated/timeout/
+shutdown fail-open; the runner `admit` reroute with a **client-side deadline** and **flock
+fallback**; config reuse (`run.slice`/`memory_headroom`/`admission_max_wait`) +
+`AIRA_DAEMON_ADMIT_POLL_INTERVAL` (default 250ms) + `admitWaitCapMs`/`admitMaxWaiters`/global cap.
 
 ### Out (deferred, explicit)
-- **Priority / weighted fairness** (non-FIFO ordering by ticket/phase). First cut is arrival-FIFO.
-- **Backfill scheduling** (letting a small waiter jump a too-large stuck front). Deliberately not
-  done — head-of-line blocking is the fair, no-starvation choice; backfill is a later efficiency
-  knob with its own starvation risk.
-- **Peak-RSS estimation** (#29 part 2) — D4 uses the *configured* reserve; estimating a job's
-  real peak is separate.
-- **The in-process flock as a daemon-unavailable fallback.** First cut fails open (launch) if the
-  daemon is truly down after auto-start; retaining #29's flock as a fallback arbiter is a possible
-  follow-up, weighed against carrying two admission mechanisms.
-- **Cross-slice / global memory** (multiple slices, machine-total pressure), **admission for
-  non-`run` work**, **MCP surfacing of the queue**.
+Priority/weighted fairness (non-FIFO) · backfill (small waiter jumping a too-large front —
+deliberately not done; head-of-line blocking is the fair choice) · peak-RSS estimation (#29 part
+2) · restart-safe persisted reservations (§2.4 crash window is advisory) · cross-slice/global
+memory pressure · admission for non-`run` work · MCP queue surfacing.
 
 ## 6. Tests
-Daemon socket tests are Opus-real-HW (sandbox cannot bind sockets); the queue/reservation logic
-is unit-testable behind seams (injected memory reader + a fake clock, as #29 already uses).
+Daemon socket tests are Opus-real-HW; the queue/reservation/evaluator logic is unit-testable
+behind seams (injected memory reader + fake clock, as #29 uses).
 
-Queue logic (sandbox-runnable via seams):
-1. **FIFO order:** three waiters A,B,C arrive in order; with memory for one at a time, they are
-   granted A→B→C regardless of re-eval timing; a fourth arriving mid-stream goes to the back.
-2. **Prefix concurrency:** memory fits A+B but not C; A and B are granted together, C waits until
-   a release frees its reserve.
-3. **No jump-ahead / head-of-line:** a large front A (doesn't fit) blocks a small B behind it even
-   though B would fit — B is not granted until A is (then both, if they now fit).
-4. **Reservation accounting:** grant A (reserve R) with plenty of `max` but `current` low; assert
-   B needing R is *not* granted until A releases, even though the raw `max-current` looked
-   sufficient (the outstanding reserve is subtracted).
-5. **Release on close frees the next** (peer-close): closing A's connection releases R and grants
-   the next fitting waiter within a poll interval.
-6. **Death while queued dequeues** without ever granting; **death after grant before release**
-   frees the reservation.
-7. **Unevaluated:** unresolvable slice / unreadable memory → immediate `unevaluated` grant, no
-   enqueue; **timeout:** a waiter behind a permanently-too-large front is granted `timeout` at
-   `max_wait` and still holds a reserve until release; **shutdown:** `s.stopping` grants queued
-   waiters `unevaluated` and `Serve` drains without `DrainTimeout`.
-8. **Waiter cap** → `E_DAEMON_BUSY`; the client fails open (launches) on busy/daemon-fault.
-9. **Byte-identical `admission` state** on the run record across all paths (immediate/waited/
-   timeout/unevaluated/disabled/bypassed).
+Queue/evaluator logic (sandbox-runnable):
+1. **FIFO order:** A,B,C arrive in order; memory for one at a time → granted A→B→C regardless of
+   re-eval timing; a fourth mid-stream goes to the back.
+2. **Prefix concurrency:** memory fits A+B not C → A,B granted together; C waits for a release.
+3. **No jump-ahead:** a large non-fitting front A blocks a small B behind it until A is granted.
+4. **Reservation accounting / no double-spend:** grant A (reserve R); B needing R is not granted
+   until A releases even though raw `max-current` looked sufficient; a **concurrent release+enqueue
+   +ticker** never double-grants against one memory sample (serialised-evaluator race test).
+5. **Release on close frees the next** within a poll interval (peer-close).
+6. **Death while queued dequeues** (never granted); **death after grant before release** frees the
+   reservation; **a failed/partial grant write releases immediately** (seam).
+7. **Timeout is a labelled bypass with unequal deadlines (Sol r1 #5):** a short-`max_wait` waiter
+   behind a long-`max_wait` non-fitting front is granted `timeout` first; a grant/timeout race
+   never both-grants-and-times-out one waiter.
+8. **Unevaluated** (unresolvable/unreadable) immediate, no enqueue; **shutdown** closes all admit
+   connections + clears the registry once, queued→EOF, `Serve` drains without `DrainTimeout`.
+9. **Bounds/validation:** global + per-slice cap → `E_DAEMON_BUSY`; hostile reserve/max_wait
+   rejected/clamped; empty registry entries pruned.
+10. **Byte-identical `admission` state** on the run record across every path.
 
-Runner/e2e (real-HW): the runner `admit` reroute holds the daemon grant through `Start` and
-releases on close; two concurrent real `aira run` processes on one slice are serialised in
-arrival order; a killed queued run dequeues.
+Client/runner + e2e (real-HW): the reroute holds the grant through `Start` and releases on close;
+**client-side deadline** returns without a grant when the daemon is wedged (a stuck-handler seam)
+and **falls back to the flock**; two concurrent real `aira run` on one slice are serialised in
+arrival order; a killed queued run dequeues; daemon-down → flock fallback (not a stampede).
 
 ## 7. Build notes
 - Mirror D3's held-connection interception in `serveConnection` (defer `conn.Close` first,
-  peer-close detector, clear read deadline, write deadline on the grant frame, cancel on
-  `s.stopping`); the admit handler is daemon-specific like `watch`.
-- The per-slice registry is a `map[canonicalSlice]*sliceQueue{waiters []*admitWaiter, …}` under a
-  mutex; re-evaluation walks the front prefix. Never hold the mutex across the memory read or the
-  frame write.
-- The runner keeps its seams (`sliceMemoryFn`, `clock`, and a new `admitDialFn`) so queue tests
-  run without a socket; the memory reader stays the daemon's (`readSliceMemory`).
-- Preserve the exact `admission` state strings + the run-record field; do not change #29's config
+  peer-close detector from enqueue, clear read deadline, write deadline on the grant frame, cancel
+  on `s.stopping`); the admit handler is daemon-specific like `watch`.
+- Per-slice `sliceQueue{waiters []*admitWaiter, outstanding, dirty, seq}` in a
+  `map[canonicalSlice]*sliceQueue` under a `Server` mutex; one serialised evaluator per slice; the
+  grant prefix committed under the lock; prune empty entries; global + per-slice caps.
+- Runner keeps its seams (`sliceMemoryFn`, `clock`) + a new `admitDialFn`; the client-side deadline
+  and the flock fallback live in `Runner.admit`; **do not remove #29's flock code** (it is the
+  fallback). Preserve the exact `admission` state strings + run-record field and #29's config
   validation. `Co-Authored-By: Codex Terra <noreply@openai.com>`; Opus verifies real-HW + commits.
 
 ## 8. Deferrals
-Priority/weighted fairness · backfill · peak-RSS estimation (#29 part 2) · flock fallback for a
-down daemon · cross-slice/global pressure · admission for non-run work · MCP queue surfacing.
+Priority/weighted fairness · backfill · peak-RSS estimation (#29 part 2) · restart-safe persisted
+reservations · cross-slice/global pressure · admission for non-run work · MCP queue surfacing.
