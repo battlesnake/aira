@@ -1,6 +1,6 @@
 # D6 — run-input (live stdin push to a detached run) — design / plan
 
-**Status:** v3 — folds Sol plan-review r2 (7 findings, all folded). For Sol r3.
+**Status:** v4 — folds Sol plan-review r3 (3 findings, all folded). For Sol r4.
 **Milestone:** Phase 5 · D6 (task #42). Follows D1–D5 (all merged; master `f8c4412`).
 **Loop:** plan → Sol plan-review (rounds → APPROVE-PLAN) → Fable plan-gate → Terra build →
 Opus real-HW verify → Sol build-review (rounds → RESOLVED) → merge. Correctness-critical (a live
@@ -71,16 +71,18 @@ already takes `--stdin` at launch); interactive TTY/approval prompts (spec §14 
   launch indefinitely — reusing M20's `forceDetachedQuiesce` honesty (never claims an unprovable
   descendant-kill). A child is never left alive on an unreachable pipe, and launch never hangs.
 - **Discovery — classify from the ledger status FIRST, then dial (Sol r1 #6, r2 #6):** the client
-  reads the record and decides in this order, so a terminal run is never mislabeled unreachable:
-  1. run **not `--stdin-connect`** (`InputSocket` empty) → `E_RUN_INPUT_UNAVAILABLE`.
+  reads the record and decides in this order (using a **persisted `RunRecord.StdinConnect bool`
+  independent of `InputSocket`** — Sol r3 #2 — so "connect-mode but not-yet-bound" is distinct from
+  "not connect-mode"; a terminal run is never mislabeled unreachable):
+  1. run **not connect-mode** (`StdinConnect == false`) → `E_RUN_INPUT_UNAVAILABLE`.
   2. run **terminal** (exited/killed/lost/cancelled) → `E_RUN_INPUT_CLOSED` (the run ended; input is
      moot — do NOT dial). A terminal run has no server to answer, so classifying it before dialing
      avoids a false `UNREACHABLE`.
-  3. run **starting / not yet `running`** (no `InputSocket` yet) → `E_RUN_INPUT_NOT_READY`.
-  4. run **`running`** with `InputSocket` → **dial**. Dial/handshake success → serve; server replies
-     closed (post-`OP_CLOSE`) → `E_RUN_INPUT_CLOSED`; **dial fails** (nominally running but the
-     supervisor's socket is unreachable — dead/gone) → `E_RUN_INPUT_UNREACHABLE` (suggest
-     `reconcile`). No path silently drops bytes.
+  3. connect-mode but **no `InputSocket` yet** (starting / not yet `running`) → `E_RUN_INPUT_NOT_READY`.
+  4. **`running` with `InputSocket`** → **dial**. Success → serve; server replies closed
+     (post-`OP_CLOSE`) → `E_RUN_INPUT_CLOSED`; **dial fails** (nominally running but the supervisor's
+     socket is unreachable — dead/gone) → `E_RUN_INPUT_UNREACHABLE` (suggest `reconcile`). No path
+     silently drops bytes.
 - **Auth (Sol r1 #7) — transport AND logical owner.** (a) Transport: `SO_PEERCRED` peer uid ==
   supervisor euid; `0700` dir + `0600` socket. (b) **Logical owner, mirroring `run-kill`:** the
   server enforces `CallerOwner` — a `run-input` from a foreign AIRA owner is refused
@@ -93,10 +95,13 @@ already takes `--stdin` at launch); interactive TTY/approval prompts (spec §14 
 Order of operations when `req.StdinConnect` (replacing the file/`/dev/null` fd0 wiring at
 `detach_linux.go:298-313`):
 1. Validate `sun_path` length (§2.1) — else fail the launch before any child exists.
-2. `inputR, inputW := os.Pipe()`; `cmd.Stdin = inputR`. Resolve + unlink-stale + `bind`+`listen`+
-   `chmod 0600` the socket. **A single `defer` (installed here, before `Start`) tears the input
-   plane + child down on EVERY subsequent return path** (Sol r1 #1, #2): close listener + active
-   conn, close `inputW`, `unlink` the socket; on a post-`Start` error also `cgroup.kill`+reap.
+2. `inputR, inputW := os.Pipe()`; `cmd.Stdin = inputR`. Resolve the fresh nonce path and
+   `bind`+`listen`+`chmod 0600` — **NO pre-unlink of any existing path (Sol r2 #4, r3)**; on the
+   (astronomically unlikely) `EADDRINUSE`, regenerate the nonce and retry. The teardown `unlink`s
+   ONLY this listener's own recorded path. **A single `defer` (installed here, before `Start`) tears
+   the input plane + child down on EVERY subsequent return path** (Sol r1 #1, #2): close listener +
+   active conn, close `inputW`, `unlink` this path; on a post-`Start` error also the bounded
+   escalating kill+reap (§2.1).
 3. `Start` the child. Close the parent's `inputR` copy (the child holds the dup'd read end).
 4. A `running`-append failure (`detach_linux.go:337-344`) is now a full teardown+kill, not just a
    flagged running-failure — the child must not be left alive on an orphaned input plane.
@@ -106,10 +111,12 @@ Order of operations when `req.StdinConnect` (replacing the file/`/dev/null` fd0 
 **Serve loop (Sol r1 #4, r2 #2) — dedicated acceptor + claim-slot-BEFORE-HELLO:** a dedicated
 **acceptor goroutine** loops on `Accept()` (never blocked on a connection's I/O). For each accepted
 connection it does an atomic **CAS to claim the single writer slot** *before* reading anything:
-- **Claim fails** (another writer active, or input already `OP_CLOSE`d/terminal) → reply
-  `E_RUN_INPUT_BUSY` / `E_RUN_INPUT_CLOSED` and close IMMEDIATELY. So at most ONE connection is ever
-  being read at a time — a slow/idle client cannot exhaust fds/goroutines, and a second writer never
-  sits silently in the backlog.
+- **Claim fails** (another writer active, or input already `OP_CLOSE`d/terminal) → the rejection
+  reply (`E_RUN_INPUT_BUSY` / `E_RUN_INPUT_CLOSED`) is written **under a short write deadline in a
+  bounded reject worker** (best-effort), then the connection is closed — the **acceptor loop never
+  blocks writing to a non-reading rejected peer** (Sol r3 #3), so a third connection still gets a
+  prompt answer. At most ONE connection is ever being READ at a time (a slow/idle client cannot
+  exhaust fds/goroutines), and a second writer never sits silently in the backlog.
 - **Claim succeeds** → the acceptor hands the connection to the (single) active handler, which reads
   `OP_HELLO` under a **bounded HELLO deadline** (a stuck claimant is force-released on timeout →
   `E_RUN_INPUT_PROTOCOL`), runs the `CallerOwner` check, then reads bounded fully-read frames (§2.3),
@@ -247,8 +254,13 @@ The D5 supervisor lease is orthogonal (liveness evidence), not a prerequisite fo
   closes fd0 mid-stream → `E_RUN_INPUT_CLOSED` with the exact committed count (not a fake success).
 - **EOF discipline:** stream, drop the connection WITHOUT `--close`, reconnect, stream more → the
   child receives the concatenation (proves connection-close ≠ EOF).
-- **Continuous-accept BUSY (Sol r1 #4):** a second concurrent connect is answered `E_RUN_INPUT_BUSY`
-  promptly (bounded-time), the first stream uncorrupted.
+- **Continuous-accept BUSY (Sol r1 #4, r3 #3):** a second concurrent connect is answered
+  `E_RUN_INPUT_BUSY` promptly (bounded-time), the first stream uncorrupted; AND with a rejected peer
+  that NEVER READS its reply, a THIRD connection must still get a prompt answer (proves the acceptor
+  doesn't block on a rejection write).
+- **Discovery bit (Sol r3 #2):** a connect-mode run in `starting` (no `InputSocket` yet) →
+  `E_RUN_INPUT_NOT_READY` (not `UNAVAILABLE`); a non-connect run → `UNAVAILABLE`; a terminal
+  connect-mode run → `CLOSED` (classified from status without dialing).
 - **Auth:** `SO_PEERCRED` reject a different uid (seam-injected); a foreign `CallerOwner` →
   `E_RUN_INPUT_FOREIGN_OWNER`, `--steal` overrides; socket mode `0600`.
 - **Validation (unit):** `--stdin-connect` without `--detach`, or with `--stdin`/`--pty`/`--store-
@@ -257,9 +269,10 @@ The D5 supervisor lease is orthogonal (liveness evidence), not a prerequisite fo
   or nonzero-length `OP_CLOSE` → `E_RUN_INPUT_PROTOCOL`, connection closed, `inputW` untouched.
 
 ## 5. Faces / plumbing
-- `Request.StdinConnect bool`; `RunRecord.InputSocket string` (omitempty). CLI `--stdin-connect` +
-  the `run-input` verb across dispatch tables + generated help. `run-input` is `RouteClient`
-  (carved), reads the record client-side, dials the socket, passes its owner in `OP_HELLO`.
+- `Request.StdinConnect bool`; `RunRecord.StdinConnect bool` (persisted, drives discovery §2.1
+  independent of the socket path) + `RunRecord.InputSocket string` (omitempty). CLI
+  `--stdin-connect` + the `run-input` verb across dispatch tables + generated help. `run-input` is
+  `RouteClient` (carved), reads the record client-side, dials the socket, passes its owner in `OP_HELLO`.
 - **CLI face:** `aira run-input RUN-n [--close] [--steal]` streams its own stdin as `OP_DATA`
   frames; `--close` sends `OP_CLOSE`; `--steal` overrides the `CallerOwner` refusal (mirrors
   `run-kill`).
