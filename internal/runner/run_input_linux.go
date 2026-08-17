@@ -145,7 +145,10 @@ func (r *Runner) connectRunInput(ctx context.Context, path string, request RunIn
 		}
 		// Bound the HELLO handshake so a silent/wedged peer cannot hang the client;
 		// cleared before streaming (which is backpressure-driven, not deadline-bound).
-		_ = conn.SetDeadline(time.Now().Add(runInputHandshakeTimeout))
+		if deadlineErr := conn.SetDeadline(time.Now().Add(runInputHandshakeTimeout)); deadlineErr != nil {
+			_ = conn.Close()
+			return nil, &RunInputError{Code: "E_RUN_INPUT_UNREACHABLE", Err: deadlineErr}
+		}
 		writeErr := writeRunInputFrame(conn, runInputOpHello, hello)
 		if writeErr != nil {
 			_ = conn.Close()
@@ -157,18 +160,31 @@ func (r *Runner) connectRunInput(ctx context.Context, path string, request RunIn
 				_ = conn.Close()
 				return nil, runInputProtocolError("HELLO ACK was nonzero")
 			}
-			_ = conn.SetDeadline(time.Time{})
+			if clearErr := conn.SetDeadline(time.Time{}); clearErr != nil {
+				_ = conn.Close()
+				return nil, &RunInputError{Code: "E_RUN_INPUT_UNREACHABLE", Err: clearErr}
+			}
 			return conn, nil
 		}
 		_ = conn.Close()
 		var inputErr *RunInputError
-		if !errors.As(respErr, &inputErr) || inputErr.Code != "E_RUN_INPUT_BUSY" || !time.Now().Before(deadline) {
+		if !errors.As(respErr, &inputErr) || inputErr.Code != "E_RUN_INPUT_BUSY" {
 			return nil, respErr
+		}
+		// Check the budget BEFORE another attempt and cap the backoff to what
+		// remains, so no dial/handshake starts past the deadline (Sol build confirm).
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, respErr
+		}
+		backoff := runInputBusyRetryBackoff
+		if backoff > remaining {
+			backoff = remaining
 		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(runInputBusyRetryBackoff):
+		case <-time.After(backoff):
 		}
 	}
 }

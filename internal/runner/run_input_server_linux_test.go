@@ -33,6 +33,7 @@ func TestRunInputClientRetriesTransientBusyOnceWithoutResending(t *testing.T) {
 	r.owner = "owner"
 	runInputConnectRecord(t, r)
 	var attempts atomic.Int32
+	var attempt1SawData atomic.Bool
 	r.inputDialFn = func(context.Context, string) (net.Conn, error) {
 		client, server := net.Pipe()
 		attempt := attempts.Add(1)
@@ -43,6 +44,13 @@ func TestRunInputClientRetriesTransientBusyOnceWithoutResending(t *testing.T) {
 			}
 			if attempt == 1 {
 				_ = writeRunInputError(server, "E_RUN_INPUT_BUSY", 0, "busy")
+				// A correct client sends NO DATA on a BUSY-refused attempt — it
+				// closes and retries. Record any frame that arrives here to catch a
+				// client that wrongly streamed before the HELLO ACK (Sol build confirm).
+				_ = server.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+				if op, _, err := readRunInputFrame(server); err == nil && op == runInputOpData {
+					attempt1SawData.Store(true)
+				}
 				return
 			}
 			_ = writeRunInputFrame(server, runInputOpAck, encodeRunInputAck(0))
@@ -68,6 +76,9 @@ func TestRunInputClientRetriesTransientBusyOnceWithoutResending(t *testing.T) {
 	if err != nil || res.Accepted != 5 || !res.Closed || attempts.Load() != 2 {
 		t.Fatalf("res=%+v err=%v attempts=%d", res, err, attempts.Load())
 	}
+	if attempt1SawData.Load() {
+		t.Fatal("client sent DATA on the BUSY-refused first attempt (would duplicate on retry)")
+	}
 }
 
 // TestRunInputClientGenuineBusyTerminatesAtBudget proves a persistently busy run
@@ -75,6 +86,11 @@ func TestRunInputClientRetriesTransientBusyOnceWithoutResending(t *testing.T) {
 func TestRunInputClientGenuineBusyTerminatesAtBudget(t *testing.T) {
 	r, _ := newMemoryRunner(t, nil)
 	r.owner = "owner"
+	// FREEZE the injectable clock: the budget must use REAL monotonic time, so a
+	// frozen r.now must NOT loop the retry forever. An impl that derived the budget
+	// from r.now would hang here (test timeout) — the discriminator (Sol build confirm).
+	frozen := time.Now()
+	r.now = func() time.Time { return frozen }
 	runInputConnectRecord(t, r)
 	r.inputDialFn = func(context.Context, string) (net.Conn, error) {
 		client, server := net.Pipe()
@@ -95,6 +111,57 @@ func TestRunInputClientGenuineBusyTerminatesAtBudget(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed < runInputBusyRetryBudget || elapsed > 3*time.Second {
 		t.Fatalf("busy budget elapsed=%v (want ~%v, bounded)", elapsed, runInputBusyRetryBudget)
+	}
+}
+
+// TestRunInputClientSilentServerHandshakeDeadlineFires proves the per-attempt
+// handshake deadline bounds a silent peer (accepts + reads HELLO, never replies):
+// the client returns in bounded time rather than hanging forever (Sol build confirm).
+func TestRunInputClientSilentServerHandshakeDeadlineFires(t *testing.T) {
+	r, _ := newMemoryRunner(t, nil)
+	r.owner = "owner"
+	runInputConnectRecord(t, r)
+	r.inputDialFn = func(context.Context, string) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			_, _, _ = readRunInputFrame(server) // read HELLO, then go silent forever
+			select {}
+		}()
+		return client, nil
+	}
+	start := time.Now()
+	_, err := r.Input(context.Background(), RunInputRequest{RunID: "RUN-1", Reader: bytes.NewReader([]byte("x"))})
+	if err == nil {
+		t.Fatal("silent server did not error")
+	}
+	if elapsed := time.Since(start); elapsed > runInputHandshakeTimeout+2*time.Second {
+		t.Fatalf("handshake deadline did not fire; elapsed=%v", elapsed)
+	}
+}
+
+// TestRunInputClientNonBusyHelloErrorNotRetried proves ONLY BUSY is retried: a
+// FOREIGN_OWNER HELLO refusal returns immediately after a single attempt.
+func TestRunInputClientNonBusyHelloErrorNotRetried(t *testing.T) {
+	r, _ := newMemoryRunner(t, nil)
+	r.owner = "owner"
+	runInputConnectRecord(t, r)
+	var attempts atomic.Int32
+	r.inputDialFn = func(context.Context, string) (net.Conn, error) {
+		client, server := net.Pipe()
+		attempts.Add(1)
+		go func() {
+			defer server.Close()
+			if op, _, err := readRunInputFrame(server); err != nil || op != runInputOpHello {
+				return
+			}
+			_ = writeRunInputError(server, "E_RUN_INPUT_FOREIGN_OWNER", 0, "foreign owner")
+		}()
+		return client, nil
+	}
+	_, err := r.Input(context.Background(), RunInputRequest{RunID: "RUN-1", Reader: bytes.NewReader([]byte("x"))})
+	var inputErr *RunInputError
+	if !errors.As(err, &inputErr) || inputErr.Code != "E_RUN_INPUT_FOREIGN_OWNER" || attempts.Load() != 1 {
+		t.Fatalf("non-BUSY HELLO error err=%v attempts=%d (want single attempt)", err, attempts.Load())
 	}
 }
 
@@ -370,6 +437,7 @@ func dialRunInputHello(t *testing.T, path string, hello runInputHello) *net.Unix
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		conn := dialRunInputRawHello(t, path, hello)
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second)) // a silent server can't hang the helper
 		op, payload, err := readRunInputFrame(conn)
 		if err != nil {
 			t.Fatalf("HELLO response op=%d err=%v", op, err)
@@ -379,15 +447,16 @@ func dialRunInputHello(t *testing.T, path string, hello runInputHello) *net.Unix
 			if decErr != nil || committed != 0 {
 				t.Fatalf("HELLO ACK=%d err=%v", committed, decErr)
 			}
+			_ = conn.SetReadDeadline(time.Time{})
 			return conn
 		}
 		if op == runInputOpError {
 			wireErr := decodeRunInputWireError(payload)
 			var inputErr *RunInputError
 			// A sequential reconnect can transiently race the prior handler's
-			// single-writer-slot release; BUSY commits zero bytes, so retry it
+			// single-writer-slot release; a ZERO-committed BUSY is safe to retry
 			// within a bounded budget (raw prompt-BUSY tests connect directly).
-			if errors.As(wireErr, &inputErr) && inputErr.Code == "E_RUN_INPUT_BUSY" && time.Now().Before(deadline) {
+			if errors.As(wireErr, &inputErr) && inputErr.Code == "E_RUN_INPUT_BUSY" && inputErr.Committed == 0 && time.Now().Before(deadline) {
 				_ = conn.Close()
 				time.Sleep(5 * time.Millisecond)
 				continue
