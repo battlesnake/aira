@@ -1,6 +1,6 @@
 # D6 — run-input (live stdin push to a detached run) — design / plan
 
-**Status:** v2 — folds Sol plan-review r1 (7 findings, all folded). For Sol r2.
+**Status:** v3 — folds Sol plan-review r2 (7 findings, all folded). For Sol r3.
 **Milestone:** Phase 5 · D6 (task #42). Follows D1–D5 (all merged; master `f8c4412`).
 **Loop:** plan → Sol plan-review (rounds → APPROVE-PLAN) → Fable plan-gate → Terra build →
 Opus real-HW verify → Sol build-review (rounds → RESOLVED) → merge. Correctness-critical (a live
@@ -48,21 +48,39 @@ already takes `--stdin` at launch); interactive TTY/approval prompts (spec §14 
   socket does NOT live there. It reuses the **daemon's pinned path resolution** (`internal/daemon/
   paths.go` — which already handles `$XDG_RUNTIME_DIR` unset via a pinned per-user fallback under a
   stable state-id root, so a `Setsid`'d shim with no `XDG_RUNTIME_DIR` still resolves it):
-  `<runtime-root>/aira/<state-id>/inputs/<run-id>.sock`, `0700` dir, `0600` socket. The **full
-  `sun_path` length is validated BEFORE `Start`** (`E_RUN_INPUT_PATH_TOO_LONG` fails the launch
+  **`<runtime-root>/aira/<state-id>/inputs/<run-id>-<nonce>.sock`**, `0700` dir, `0600` socket. The
+  **full `sun_path` length is validated BEFORE `Start`** (`E_RUN_INPUT_PATH_TOO_LONG` fails the launch
   cleanly — no child is created that would then wait on an unfeedable pipe).
-- **BIND BEFORE START (Sol r1 #1).** The supervisor resolves the path, unlinks any **stale** socket
-  (a leftover from a dead prior supervisor), then `bind`+`listen`+`chmod 0600` **before `Start`**.
-  Only once the listener is up does it `Start` the child (whose fd0 is the pipe). `InputSocket` is
-  written into the `starting`/`running` record so the path is durable + observable. Every post-bind,
-  post-`Start` failure (including a `running`-append failure, §2.2) runs the full input+child
-  teardown (close input plane, `cgroup.kill`, `Wait`/reap, record `U_RUN_RECONCILE_REQUIRED`) — a
-  child is never left alive waiting on a pipe no one can reach.
-- **Discovery states (Sol r1 #3, #6) — the client distinguishes, never fakes:** `InputSocket`
-  empty (run not `--stdin-connect`) → `E_RUN_INPUT_UNAVAILABLE`; record present but no socket yet /
-  run not yet `running` → `E_RUN_INPUT_NOT_READY`; dial fails / stale socket / supervisor gone →
-  `E_RUN_INPUT_UNREACHABLE` (suggest `reconcile`); server replies closed → `E_RUN_INPUT_CLOSED`. No
-  path silently drops bytes.
+- **Nonce-qualified path — no unlink-stale race (Sol r2 #4).** The path carries a fresh per-launch
+  `<nonce>` (like the detach control file's nonce), so two supervisors NEVER share a socket path and
+  the bind never unlinks a peer's reachable socket. The supervisor `bind`+`listen`+`chmod 0600` its
+  own fresh path (no pre-unlink), and unlinks ONLY that exact path at its own teardown. A crashed
+  supervisor leaves one nonce-stale file (harmless cruft; the client always uses the record's
+  current `InputSocket`); a stale file is never mistaken for live and never unlinked after a mere
+  failed dial (staleness is proven by the ledger's terminal/liveness state, §2.1 discovery, not by a
+  dial). The client reads `InputSocket` from the record and dials exactly that path.
+- **BIND BEFORE START (Sol r1 #1).** `bind`+`listen`+`chmod` happen **before `Start`**; only once the
+  listener is up does the supervisor `Start` the child (fd0 = the pipe). `InputSocket` (with nonce)
+  is written into the `starting`/`running` record so it is durable + observable.
+- **Post-`Start` failure teardown — bounded, never blocks return (Sol r1 #1, r2 #5).** A single
+  pre-`Start` `defer` runs the full teardown on every subsequent return path: close input plane, then
+  **kill the child with a bounded, escalating policy** — `cgroup.kill` if the scope is usable, else a
+  direct `SIGKILL` to the leader PID / process group (verified against `scope.Members()` where
+  possible), with a **bounded reap wait**; if the reap cannot be proven complete it records
+  `U_RUN_RECONCILE_REQUIRED` (honest, never claims a clean kill) and returns rather than blocking
+  launch indefinitely — reusing M20's `forceDetachedQuiesce` honesty (never claims an unprovable
+  descendant-kill). A child is never left alive on an unreachable pipe, and launch never hangs.
+- **Discovery — classify from the ledger status FIRST, then dial (Sol r1 #6, r2 #6):** the client
+  reads the record and decides in this order, so a terminal run is never mislabeled unreachable:
+  1. run **not `--stdin-connect`** (`InputSocket` empty) → `E_RUN_INPUT_UNAVAILABLE`.
+  2. run **terminal** (exited/killed/lost/cancelled) → `E_RUN_INPUT_CLOSED` (the run ended; input is
+     moot — do NOT dial). A terminal run has no server to answer, so classifying it before dialing
+     avoids a false `UNREACHABLE`.
+  3. run **starting / not yet `running`** (no `InputSocket` yet) → `E_RUN_INPUT_NOT_READY`.
+  4. run **`running`** with `InputSocket` → **dial**. Dial/handshake success → serve; server replies
+     closed (post-`OP_CLOSE`) → `E_RUN_INPUT_CLOSED`; **dial fails** (nominally running but the
+     supervisor's socket is unreachable — dead/gone) → `E_RUN_INPUT_UNREACHABLE` (suggest
+     `reconcile`). No path silently drops bytes.
 - **Auth (Sol r1 #7) — transport AND logical owner.** (a) Transport: `SO_PEERCRED` peer uid ==
   supervisor euid; `0700` dir + `0600` socket. (b) **Logical owner, mirroring `run-kill`:** the
   server enforces `CallerOwner` — a `run-input` from a foreign AIRA owner is refused
@@ -85,12 +103,20 @@ Order of operations when `req.StdinConnect` (replacing the file/`/dev/null` fd0 
 5. Start the **input-serve goroutine** concurrent with the `cmd.Wait()` goroutine
    (`detach_linux.go:349-357`).
 
-**Serve loop (Sol r1 #4) — continuous accept, atomic single-writer:** the goroutine `Accept()`s
-CONTINUOUSLY. A per-run atomic/mutex claims exactly ONE active writer; a second accepted connection
-is IMMEDIATELY answered `E_RUN_INPUT_BUSY` and closed (it does not sit in the listen backlog). The
-active connection is read with bounded, fully-read frames (§2.3) and its DATA bytes copied into
-`inputW`; `OP_CLOSE` closes `inputW` (child EOF) and marks input permanently closed (later connects
-→ `E_RUN_INPUT_CLOSED`).
+**Serve loop (Sol r1 #4, r2 #2) — dedicated acceptor + claim-slot-BEFORE-HELLO:** a dedicated
+**acceptor goroutine** loops on `Accept()` (never blocked on a connection's I/O). For each accepted
+connection it does an atomic **CAS to claim the single writer slot** *before* reading anything:
+- **Claim fails** (another writer active, or input already `OP_CLOSE`d/terminal) → reply
+  `E_RUN_INPUT_BUSY` / `E_RUN_INPUT_CLOSED` and close IMMEDIATELY. So at most ONE connection is ever
+  being read at a time — a slow/idle client cannot exhaust fds/goroutines, and a second writer never
+  sits silently in the backlog.
+- **Claim succeeds** → the acceptor hands the connection to the (single) active handler, which reads
+  `OP_HELLO` under a **bounded HELLO deadline** (a stuck claimant is force-released on timeout →
+  `E_RUN_INPUT_PROTOCOL`), runs the `CallerOwner` check, then reads bounded fully-read frames (§2.3),
+  splicing DATA into `inputW` and ACKing committed bytes. `OP_CLOSE` closes `inputW` (child EOF) +
+  marks input permanently closed. **The writer slot is released on EVERY handler exit** (auth
+  failure, protocol error, HELLO timeout, `CloseWrite`, disconnect) so the next `run-input` can
+  claim it; only `OP_CLOSE`/terminal makes the closed state sticky.
 
 **Close the input plane after the LEADER exits, BEFORE `waitEmpty` (Sol r1 #2 — the descendant
 deadlock).** `inputW` is closed **immediately after the leader's `cmd.Wait()` returns**, ahead of
@@ -119,12 +145,17 @@ allocation** (a `>cap` or a nonzero-length `OP_CLOSE` → `E_RUN_INPUT_PROTOCOL`
 - **Request termination:** the client signals end-of-request with `CloseWrite` (half-close) on the
   connection; the server drains remaining frames, sends a final `OP_ACK`/status, then closes.
 
-**Outcome codes (honest, never a blind-retry hint):** a clean full ACK → success. A mid-stream child
-read-end close (write to `inputW` returns `EPIPE`/`EBADF`) → `E_RUN_INPUT_CLOSED` **with the
+**Outcome codes (honest; NOT auto-retryable — Sol r2 #1).** A clean full ACK → success. A mid-stream
+child read-end close (write to `inputW` returns `EPIPE`/`EBADF`) → `E_RUN_INPUT_CLOSED` **with the
 committed byte count** so the caller knows the prefix that landed. A connection that drops before a
-final ACK → `E_RUN_INPUT_OUTCOME_UNKNOWN` (the committed prefix is whatever the last ACK reported;
-`E_RUN_INPUT_PARTIAL` names the case where some-but-not-all requested bytes were ACKed). Retrying
-resends only un-ACKed bytes — the protocol makes the safe resume point explicit.
+final ACK → `E_RUN_INPUT_OUTCOME_UNKNOWN` (the last ACK is the last *proven* committed prefix, but
+bytes after it MAY have committed with the ACK lost). **A stdin byte stream is not idempotent**, so
+the client does NOT auto-resume/retry — auto-resending "un-ACKed" bytes could DUPLICATE committed
+bytes. `run-input` reports `OUTCOME_UNKNOWN` + the last proven committed count and exits non-zero;
+resuming is an explicit operator decision, never automatic. (`E_RUN_INPUT_PARTIAL` is the
+determinate case: the connection stayed up and the server reported some-but-not-all bytes committed
+before a child-close — the committed count is exact.) v1 adds no request-id/offset dedup layer; that
+(safe automatic resume) is a deferral (§6).
 
 **Closing the CONNECTION is NOT EOF** — the supervisor keeps `inputW` open across connections; only
 `OP_CLOSE` gives the child EOF. Sequential `run-input` calls append to one stdin stream in call
@@ -199,10 +230,14 @@ The D5 supervisor lease is orthogonal (liveness evidence), not a prerequisite fo
   first stream uncorrupted (discriminator: an interleaving impl fails).
 - **Non-connect run:** `run-input` on a run launched WITHOUT `--stdin-connect` → `E_RUN_INPUT_
   UNAVAILABLE` (not a hang, not a fake success).
-- **Descendant-EOF deadlock (Sol r1 #2, real-cgroup):** `sh -c 'sleep 0.2 & cat'` in connect mode
-  (leader `sh` exits, `cat` descendant inherits fd0 and blocks reading) → the run still terminalizes
-  (leader-exit closes `inputW`, `cat` EOFs and drains, `waitEmpty` completes). Discriminator: an
-  impl that closes `inputW` only at terminal deadlocks (bounded-time fail).
+- **Descendant-EOF deadlock (Sol r1 #2, r2 #3, real-cgroup):** a DETERMINISTIC fork helper whose
+  **leader exits while a descendant blocks on inherited fd0** — e.g. `python3 -c 'import os,sys;
+  \nif os.fork():\n os._exit(0)\nsys.stdin.read()'` (parent/leader `os._exit(0)` immediately; the
+  forked child keeps fd0 and blocks in `stdin.read()` until EOF). NOT `sh -c '... & cat'` (the shell
+  leader waits for a foreground `cat`, so the leader does not exit first — that would false-pass).
+  In connect mode: the run must still terminalize in bounded time because leader-exit closes
+  `inputW` → the descendant EOFs and drains → `waitEmpty` completes. Discriminator: an impl that
+  closes `inputW` only at terminal (after `waitEmpty`) deadlocks (bounded-time fail).
 - **Bind-before-Start (Sol r1 #1):** a sun_path-too-long / bind failure fails the launch with NO
   child spawned (assert no ledger `running`, no orphan scope member).
 - **Teardown:** kill a run mid-input (child not reading, pipe full, splice blocked) → the kill
@@ -249,7 +284,9 @@ The D5 supervisor lease is orthogonal (liveness evidence), not a prerequisite fo
 - **Concurrent interleaved multi-writer:** v1 is serial single-active; a merge/mux policy is deferred.
 - **Daemon-routed input:** impossible without a new supervisor-push transport; v1 is direct + daemonless.
 - **Foreground `run-input`:** foreground takes `--stdin` at launch; a live foreground channel is deferred.
-- **Owner-scoped auth** (like kill's `CallerOwner` + `--steal`): v1 is same-uid; noted.
+- **Safe automatic resume** (request-id/offset/dedup so a lost-ACK `OUTCOME_UNKNOWN` can auto-resend
+  without duplication) is deferred; v1 surfaces `OUTCOME_UNKNOWN` for an explicit operator decision.
+  (Owner-scoped `CallerOwner` + `--steal` auth is NORMATIVE in v1, §2.1 — not deferred.)
 
 ## 7. Sol build-review checklist (seed)
 1. Socket bound+listening BEFORE `Start`; bind/path failure spawns no child; every post-`Start`
