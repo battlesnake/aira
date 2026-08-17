@@ -1059,7 +1059,11 @@ func TestDaemonAdmitStatesAreByteIdenticalOnRunRecord(t *testing.T) {
 	}
 }
 
-func TestDaemonAdmitClientDeadlineClosesBeforeSingleFlockFallback(t *testing.T) {
+func TestDaemonAdmitWedgedDaemonDeadlineIsUnevaluatedNotFlock(t *testing.T) {
+	// A wedged daemon (dial succeeds, no response) is UP and may hold live
+	// reservations, so the client-side deadline must NOT enter the flock domain
+	// (Sol build r1 #2); it fails open unevaluated, still bounded by the deadline
+	// (Sol build r1 #1/#4). The connection close happens before the client returns.
 	path := currentSliceForTest(t)
 	runner := &Runner{
 		memorySlice: path, memoryReserve: 40, admissionMaxWait: 5 * time.Millisecond,
@@ -1067,7 +1071,6 @@ func TestDaemonAdmitClientDeadlineClosesBeforeSingleFlockFallback(t *testing.T) 
 		sliceMemory: func(string) (int64, int64, bool, string) { return 0, 100, true, "" },
 	}
 	client, server := net.Pipe()
-	peerClosed := make(chan struct{})
 	runner.admitDialFn = func(context.Context, string) (net.Conn, error) { return client, nil }
 	go func() {
 		defer server.Close()
@@ -1076,31 +1079,25 @@ func TestDaemonAdmitClientDeadlineClosesBeforeSingleFlockFallback(t *testing.T) 
 			return
 		}
 		var one [1]byte
-		_, _ = server.Read(one[:])
-		close(peerClosed)
+		_, _ = server.Read(one[:]) // wedged: never reply until the client closes
 	}()
 	var attempts atomic.Int64
-	runner.lockAttemptFn = func(string) (*admitLock, error) {
-		attempts.Add(1)
-		select {
-		case <-peerClosed:
-		case <-time.After(time.Second):
-			t.Fatal("flock fallback started before daemon socket close")
-		}
-		return &admitLock{}, nil
-	}
+	runner.lockAttemptFn = func(string) (*admitLock, error) { attempts.Add(1); return &admitLock{}, nil }
 	started := time.Now()
 	result, err := runner.admit(context.Background(), Request{})
-	if err != nil || result.lock == nil || attempts.Load() != 1 {
-		t.Fatalf("result=%+v attempts=%d err=%v", result, attempts.Load(), err)
+	if err != nil || result.state != "unevaluated" || result.lock != nil || result.release != nil || attempts.Load() != 0 {
+		t.Fatalf("result=%+v attempts=%d err=%v (want unevaluated, no flock)", result, attempts.Load(), err)
 	}
 	if elapsed := time.Since(started); elapsed < admitTransportGrace || elapsed > 2*time.Second {
-		t.Fatalf("deadline fallback elapsed=%v", elapsed)
+		t.Fatalf("wedged-daemon deadline elapsed=%v", elapsed)
 	}
 	result.releaseAdmission()
 }
 
-func TestDaemonAdmitPartialFrameClosesBeforeFallback(t *testing.T) {
+func TestDaemonAdmitPartialFrameIsUnevaluatedNotFlock(t *testing.T) {
+	// A partial frame from an UP daemon is a post-dial failure: it must NOT flock
+	// (the daemon may hold live reservations — Sol build r1 #2), it fails open
+	// unevaluated after closing the socket.
 	path := currentSliceForTest(t)
 	runner := &Runner{
 		memorySlice: path, memoryReserve: 40, admissionMaxWait: 50 * time.Millisecond,
@@ -1108,7 +1105,6 @@ func TestDaemonAdmitPartialFrameClosesBeforeFallback(t *testing.T) {
 		sliceMemory: func(string) (int64, int64, bool, string) { return 0, 100, true, "" },
 	}
 	client, server := net.Pipe()
-	closed := make(chan struct{})
 	runner.admitDialFn = func(context.Context, string) (net.Conn, error) { return client, nil }
 	go func() {
 		defer server.Close()
@@ -1123,19 +1119,12 @@ func TestDaemonAdmitPartialFrameClosesBeforeFallback(t *testing.T) {
 		_, _ = server.Write(partial)
 		var one [1]byte
 		_, _ = server.Read(one[:])
-		close(closed)
 	}()
-	runner.lockAttemptFn = func(string) (*admitLock, error) {
-		select {
-		case <-closed:
-		case <-time.After(time.Second):
-			t.Fatal("fallback did not wait for partial-frame socket close")
-		}
-		return &admitLock{}, nil
-	}
+	var attempts atomic.Int64
+	runner.lockAttemptFn = func(string) (*admitLock, error) { attempts.Add(1); return &admitLock{}, nil }
 	result, err := runner.admit(context.Background(), Request{})
-	if err != nil || result.lock == nil {
-		t.Fatalf("result=%+v err=%v", result, err)
+	if err != nil || result.state != "unevaluated" || result.lock != nil || attempts.Load() != 0 {
+		t.Fatalf("result=%+v attempts=%d err=%v (want unevaluated, no flock)", result, attempts.Load(), err)
 	}
 	result.releaseAdmission()
 }
@@ -1175,22 +1164,33 @@ func TestDaemonAdmitFullFrameAtDeadlineWinsWithoutFlock(t *testing.T) {
 	}
 }
 
-func TestDaemonAdmitBusyAndDialFailureUseOneFallback(t *testing.T) {
+func TestDaemonAdmitBusyIsUnevaluatedDialFailureFlocks(t *testing.T) {
+	// Sol build r1 #2: only a DIAL FAILURE (daemon unreachable -> no live daemon
+	// reservations) falls to the flock. E_DAEMON_BUSY means the daemon is UP and
+	// reserving, so flocking would over-grant against its reservations -> it fails
+	// open unevaluated instead.
 	for _, test := range []struct {
-		name string
-		dial func(context.Context, string) (net.Conn, error)
+		name        string
+		dial        func(context.Context, string) (net.Conn, error)
+		wantFlock   bool
+		wantState   string
+		wantAttempt int64
 	}{
-		{name: "dial failure", dial: func(context.Context, string) (net.Conn, error) { return nil, os.ErrNotExist }},
-		{name: "busy", dial: func(context.Context, string) (net.Conn, error) {
-			client, server := net.Pipe()
-			go func() {
-				defer server.Close()
-				var request runnerAdmitRequestFrame
-				_ = readRunnerAdmitFrame(server, &request)
-				_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{Code: "E_DAEMON_BUSY", Error: "busy"})
-			}()
-			return client, nil
-		}},
+		{name: "dial failure", wantFlock: true, wantAttempt: 1,
+			dial: func(context.Context, string) (net.Conn, error) { return nil, os.ErrNotExist }},
+		{name: "busy", wantState: "unevaluated", wantAttempt: 0,
+			dial: func(context.Context, string) (net.Conn, error) {
+				client, server := net.Pipe()
+				go func() {
+					defer server.Close()
+					var request runnerAdmitRequestFrame
+					_ = readRunnerAdmitFrame(server, &request)
+					_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{Code: "E_DAEMON_BUSY", Error: "busy"})
+					var one [1]byte
+					_, _ = server.Read(one[:])
+				}()
+				return client, nil
+			}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			path := currentSliceForTest(t)
@@ -1202,8 +1202,14 @@ func TestDaemonAdmitBusyAndDialFailureUseOneFallback(t *testing.T) {
 			var attempts atomic.Int64
 			runner.lockAttemptFn = func(string) (*admitLock, error) { attempts.Add(1); return &admitLock{}, nil }
 			result, err := runner.admit(context.Background(), Request{})
-			if err != nil || result.lock == nil || attempts.Load() != 1 {
+			if err != nil || attempts.Load() != test.wantAttempt {
 				t.Fatalf("result=%+v attempts=%d err=%v", result, attempts.Load(), err)
+			}
+			if test.wantFlock && result.lock == nil {
+				t.Fatalf("dial failure did not flock: %+v", result)
+			}
+			if !test.wantFlock && (result.state != test.wantState || result.lock != nil) {
+				t.Fatalf("busy result=%+v, want %s no-flock", result, test.wantState)
 			}
 			result.releaseAdmission()
 		})

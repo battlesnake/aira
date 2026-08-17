@@ -231,7 +231,9 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request) (admission
 	if maxWait > runnerAdmitWaitCap {
 		maxWait = runnerAdmitWaitCap
 	}
-	deadlineWait := r.admissionMaxWait
+	// The client transport deadline is derived from the CAPPED maxWait (Sol build
+	// r1 #4): a wedged daemon must not strand the client past the advertised cap.
+	deadlineWait := maxWait
 	if deadlineWait > time.Duration(mathMaxInt64)-admitTransportGrace {
 		deadlineWait = time.Duration(mathMaxInt64) - admitTransportGrace
 	}
@@ -246,7 +248,10 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request) (admission
 		return admissionResult{}, false, nil
 	}
 	monitorStop := make(chan struct{})
+	monitorDone := make(chan struct{})
 	monitorErr := make(chan error, 1)
+	var monitorStopOnce sync.Once
+	stopMonitor := func() { monitorStopOnce.Do(func() { close(monitorStop) }) }
 	if req.Detach {
 		if err := r.checkDetachAdmission(req); err != nil {
 			_ = conn.Close()
@@ -257,6 +262,7 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request) (admission
 			interval = 2 * time.Second
 		}
 		go func() {
+			defer close(monitorDone)
 			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 			for {
@@ -272,8 +278,17 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request) (admission
 				}
 			}
 		}()
-		defer close(monitorStop)
+		defer stopMonitor()
+	} else {
+		close(monitorDone)
 	}
+	// fail is the POST-DIAL failure path. A dial failure (daemon unreachable ->
+	// no live daemon reservations) falls to the flock earlier; a post-dial failure
+	// means the daemon was UP (E_DAEMON_BUSY, broken read/write, invalid frame),
+	// so entering the flock would admit against memory the daemon still reserves
+	// for other clients (Sol build r1 #2 cross-domain over-grant). Instead fail
+	// open UNEVALUATED (labelled), never the flock — except a detach kill-intent
+	// or ctx cancellation, which abort the run.
 	fail := func() (admissionResult, bool, error) {
 		_ = conn.Close()
 		select {
@@ -289,7 +304,8 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request) (admission
 				return admissionResult{}, false, err
 			}
 		}
-		return admissionResult{}, false, nil
+		r.warnAdmission("unevaluated", "daemon-admit-incomplete")
+		return admissionResult{state: "unevaluated", reason: "daemon-admit-incomplete"}, true, nil
 	}
 
 	_ = conn.SetDeadline(transportDeadline)
@@ -318,6 +334,19 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request) (admission
 	var grant runnerAdmitGrant
 	if err := json.Unmarshal(response.Data, &grant); err != nil || !validRunnerAdmitGrant(grant) {
 		return fail()
+	}
+	// A full, validated frame claims the connection as the lease. Before returning
+	// it, STOP AND JOIN the async closers so neither the ctx callback nor the detach
+	// monitor can close the lease after we hand it back (Sol build r1 #3), and then
+	// honour a detach kill-intent that raced the grant: the closer wins -> abort.
+	stopClose()
+	stopMonitor()
+	<-monitorDone
+	select {
+	case err := <-monitorErr:
+		_ = conn.Close()
+		return admissionResult{}, false, err
+	default:
 	}
 	// A full, validated frame is the sole winning outcome even when its final
 	// byte races the transport deadline. The flock fallback is never entered.

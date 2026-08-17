@@ -63,6 +63,11 @@ type Runner struct {
 // CLI layer. It is set before a Runner is exposed to concurrent requests.
 func (r *Runner) SetAdmitSocketPath(path string) { r.admitSocketPath = path }
 
+// AdmitSocketPath reports the wired daemon admission endpoint (empty when the
+// daemon is not wired, in which case admit falls back to the in-process flock).
+// It lets the CLI layer's wiring be asserted without a live socket.
+func (r *Runner) AdmitSocketPath() string { return r.admitSocketPath }
+
 func New(cfg Config) (*Runner, error) {
 	if cfg.ReportMaxBytes == 0 {
 		cfg.ReportMaxBytes = DefaultReportMaxBytes
