@@ -101,7 +101,12 @@ for pid, view := range byProject {
 (Sol r1 #5, r2 #1, r2 #6.) Leaves `replayUnjournaledEvents`/`Rebuild`/`reconcile` untouched.
 
 - Select `project_id, seq FROM outbox WHERE project_id=? AND materialised=1 AND journaled=0
-  ORDER BY seq` (a snapshot; new laps arriving mid-flush are caught next tick).
+  ORDER BY seq`, **fully read the result into an in-memory `[]EventKey` and close + `Err`-check
+  the `Rows` BEFORE journaling any event** (mirroring `replayUnjournaledEvents`). This is
+  **mandatory** under the daemon's single connection (`OpenDB` `MaxOpenConns(1)`, r5 #2): holding
+  an open `Rows` cursor while `journalEventBounded` issues its own `SELECT`/`UPDATE` on the same
+  connection would **deadlock** waiting for that one connection. New laps arriving after the
+  snapshot are caught next tick.
 - For each key: **check `ctx.Err()` first**, then journal it via a **bounded** path
   (`journalEventBounded`) that acquires `journal.lock` through a new
   `acquireLockBounded(ctx, path, timeout)` — `LOCK_EX|LOCK_NB` retried with backoff until the
@@ -166,11 +171,14 @@ Four fixes, all in the shared function (benefit every caller); each fault-tested
      caller that will set `journaled=1` has first made journal.jsonl's dirent durable. Cost is a
      metadata-only `fsync` per append, consistent with the DB's `synchronous(FULL)` posture.
      (`receipts.jsonl` shares this parent; `appendReceiptIfMissing` gets the same treatment.)
-   - **Grandparent, once at creation:** the audit-directory provisioning path (where
+   - **Grandparent, at provisioning:** the audit-directory provisioning path (where
      `common/aira` and its `locks/` subdir are `MkdirAll`'d — grep `s.auditDir` / the `aira`
-     `MkdirAll`) must `Sync` **`common`** after creating `aira`, so the `aira` dirent itself is
-     durable in the pre-existing, durable `common`. This is a one-time cost at first use, not
-     per append. Together the chain `common (durable) → common/aira → journal.jsonl` is complete.
+     `MkdirAll`) must `Sync` **`common`** **unconditionally after the `MkdirAll`, whether or not
+     `aira` already existed** (r5 #1) — "exists" does not imply "durable"; a prior creator may
+     have died before its own sync, so a conditional-on-creation sync leaves the same crash hole
+     one level up. `MkdirAll` is idempotent and the sync is a one-time-per-scope-open metadata
+     `fsync`, so making it unconditional is cheap. The chain `common (pre-existing, durable) →
+     common/aira → journal.jsonl` is then complete regardless of which process created `aira`.
 3. **Full-file scan for a conflicting duplicate (r3 #1).** The current scan early-returns `nil`
    on the *first* matching `(project_id, seq)` line, so a conflicting duplicate **after** a
    matching line is never detected. Fix: scan the **whole file**; if any line with the same
@@ -253,8 +261,13 @@ Daemon socket/flock tests are Opus-real-HW (sandbox cannot bind sockets / flock 
    `beforeFileSync`/`beforeDirSync` seams: (a) dedup-hit fsyncs the file before returning; (b)
    the immediate parent (`common/aira`) is synced **unconditionally after open, before the
    scan**, even when the file already exists (the crash/retry hole) — assert the dir-sync
-   happens on a pre-existing file; (c) audit-dir provisioning `Sync`s **`common`** after
-   creating `aira` on first use — assert the grandparent sync fires exactly once at creation.
+   happens on a pre-existing file; (c) audit-dir provisioning `Sync`s **`common`** after the
+   `MkdirAll` **unconditionally** — assert the grandparent sync fires on a scope-open **even when
+   `aira` already exists** (r5 #1).
+11. **Single-connection snapshot (r5 #2).** `FlushDeferredJournal` over ≥2 pending events on a
+    real `MaxOpenConns(1)` DB completes without deadlock — a regression guard that fails if the
+    impl journals while the outbox `Rows` cursor is still open (keys must be snapshotted +
+    `Rows` closed first).
 7. **Corruption completeness + full-file scan (r2 #3, r3 #1).** (a) A same-`(project_id,seq)`
    line with a differing `Actor`/`At` → `errJournalKeyConflict` (prefix `E_JOURNAL_CORRUPT`),
    DB row stays `journaled=0`. (b) A **conflicting duplicate placed after** a matching line is
