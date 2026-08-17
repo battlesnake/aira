@@ -1,6 +1,6 @@
 # AIRA D4 — daemon cross-session admission fairness-queue
 
-**Status:** DRAFT v4 (Sol plan-review r1 8 → r2 4 → r3 4 findings; all folded)
+**Status:** DRAFT v5 (Sol plan-review r1 8 → r2 4 → r3 4 → r4 3 findings; all folded)
 **Branch:** `codex-aira-d4` · **Base:** master `1cf83f2` (D3 merged)
 **Depends on:** #29 part 1 (per-process memory admission — the mechanism this fair-queues **and
 retains as the daemon-down fallback**), M21 (mandatory daemon), D3 (held-connection + peer-close +
@@ -43,15 +43,17 @@ fencing/leases (a shared fence cannot represent the daemon's *multiple* concurre
 and the transition window is already advisory); the alternative — no fallback — is a worse
 un-gated stampede. This degradation is stated, not hidden.
 
-**One more advisory window, daemon-up (Sol r3 #2):** if the daemon commits+writes a grant but the
-client reads only a **partial** frame before its deadline (§3.2) and falls back to the flock, the
-run launches via the flock **while the daemon still holds its reservation** (until it observes the
-close). The reservation is *conservative* (it accounts the memory the run then uses), so this does
-not over-grant *others*; but on the client's close→daemon-release the grant→materialise window is
-**extended by the fallback latency** (flock poll+lock+`Start`), a slightly longer advisory window
-than the normal grant→`Start`. So strict accounting is not perfect even with the daemon up; it is
-advisory across this (rare) partial-frame path too — documented, not hidden. Delaying fallback
-until a release-ack would need a protocol round-trip and is not worth it for a rare path.
+**One more advisory over-grant window, daemon-up (Sol r3 #2, corrected r4 #1):** if the daemon
+commits+writes a grant but the client reads only a **partial** frame before its deadline (§3.2), it
+**closes the daemon socket first, then falls back to the flock**. The daemon observes that close and
+**releases the reservation — potentially well before** the fallback acquires the flock and reaches
+`Start`/memory-visibility. In that **close/release → fallback-`Start`** gap the daemon can grant
+*other* waiters against memory the fallback run is about to consume, so this **is a real daemon-up
+cross-domain over-grant window** (my earlier "conservative, no over-grant of others" was wrong). It
+is bounded only by the fallback latency and the slice `OOMPolicy=kill` backstop — advisory, exactly
+#29's stance. It is rare (a partial frame on a local Unix socket is uncommon), and eliminating it
+would need a release-ack protocol round-trip not worth it for a rare path. Documented as a genuine
+advisory over-grant window, not hidden.
 
 ### 2.2 The grant rule (fair + concurrent, strict FIFO, no jump-ahead)
 Per slice the daemon keeps an ordered **waiter list** (FIFO by a per-slice monotonic arrival seq
@@ -99,6 +101,17 @@ at **enqueue**; the lifecycle `queued → granted → released` is owned end-to-
   write occurs after release**. A committed reservation always has its owning handler alive to
   deliver-or-release it (the handler exists for the connection's whole life), so a grant is never
   leaked.
+
+**Linearization (build-critical, Sol r4 #3):** `queued → granted` (with the `close(grantedCh)`) and
+`queued|granted → released` are **all taken under the one per-slice state mutex**, and
+`close(grantedCh)` is performed **solely** by the winning `queued → granted` transition. So the two
+racers are ordered: if **release wins first**, the evaluator's grant sees `state != queued` and
+**skips** the waiter (no reserve, no close); if **grant wins first**, the reservation is inserted +
+`grantedCh` closed, and the later release removes the reservation **exactly once**. No double-close,
+no grant-after-release. **Lock order is fixed: registry-map mutex → per-slice mutex, never the
+reverse** — enqueue/prune take `registry→slice`, and the evaluator must **not** acquire the
+registry-map mutex while holding the per-slice mutex (it kicks the evaluator via a channel, not by
+re-entering the map lock), so there is no lock-order cycle.
 
 ### 2.4 Reservation lifecycle & crash-recovery honesty (Sol r1 #3)
 A reservation bridges **grant → the granted process's memory appearing in `memory.current`**, so
@@ -210,8 +223,16 @@ byte-for-byte across all paths.
    honestly `granted` with the reservation loss folded into the advisory window (§2.4).
 6. **Bounded & validated.** Global + per-slice waiter caps; empty registry entries pruned;
    server-side range validation + checked arithmetic on reserve/max_wait/available.
-7. **Shutdown-clean.** All admit connections closed server-side + registry cleared exactly once on
-   stop; queued clients fail over on EOF; the drain never hangs.
+7. **Shutdown-clean (client guarantee unconditional; daemon drain normally-prompt).** On stop the
+   daemon cancels all admit connections; each handler self-releases (single owner, §2.3.1); the
+   registry is pruned after handlers drain. The daemon drain is **prompt in the normal case**
+   (bounded write deadline + peer-close). It is **not hard-bounded**: a pathologically-wedged cgroup
+   `memory.current` read could pin a slice's evaluator (Sol r4 #2) — that is caught by the same
+   **process-terminal `ErrDrainTimeout` backstop** as D1/D2/D3, not by strict bounding. Crucially,
+   the **client's never-stranded coupling guarantee (invariant 4) is independent of daemon
+   liveness** — the client's own deadline + flock fallback launch the run regardless — so a wedged
+   daemon read never strands a run, it only degrades the daemon-side drain to the process-terminal
+   path.
 
 ## 5. Scope
 
