@@ -1,6 +1,6 @@
 # AIRA D3 — daemon watch (`aira watch`, long-poll event tail)
 
-**Status:** DRAFT v6 (Sol plan-review r1 6 → r2 4 → r3 3 → r4 3 → r5 1 findings; folded)
+**Status:** DRAFT v7 (Sol plan-review r1 6 → r2 4 → r3 3 → r4 3 → r5 1 → r6 2 findings; folded)
 **Branch:** `codex-aira-d3` · **Base:** master `982556b` (D2 merged)
 **Depends on:** M21 (mandatory DB-owning daemon + routed coordination), D1/D2 (daemon
 timers + process-terminal shutdown this reuses).
@@ -128,13 +128,18 @@ reclaimed on *every* path — timeout, disconnect, shutdown, error, panic; Sol r
 Returning a bare `{events:[], cursor:from, eof:true}` on shutdown **loses** any event committed
 after the last scan: cursor 10, event 11 commits, `s.stopping` closes, the client gets `eof` and
 exits without ever fetching 11. So **every** `eof:true` return goes through `terminalDrain(from)`:
-a **final** `EventsSince(from, batchCap)` scan; return `{events: filter(scanned), cursor:
-scanned.MaxScannedSeq (or from), eof: true}`. The client processes this last batch **then** exits
-on `eof`, so every event committed **up to the daemon's final shutdown scan is delivered**.
-Residual (honest, bounded): events committed *after* that final scan — or beyond `batchCap` at the
-exact shutdown instant — are not delivered on this connection, but are durable in the DB and
-recoverable with `--from <cursor>` on a re-watch. `terminalDrain` is a pure read, no lock; it runs
-on both the pre-write priority check and the loop's `<-s.stopping` case.
+a **final** `EventsSince(from, batchCap)` scan under a **bounded `QueryContext`** (Sol r6 —
+deadline = a short shutdown-drain budget, and cancelled by `connCtx`, so it cannot block awaiting
+the shared connection / SQLite-busy past the drain). On success return `{events: filter(scanned),
+cursor: scanned.MaxScannedSeq (or from), eof: true}`; the client processes this last batch **then**
+exits on `eof`. **If the final scan errors or times out, do NOT send `eof`** — return a transient
+failure (`E_DAEMON_UNAVAILABLE`) so the client's at-least-once retry re-requests from its unadvanced
+cursor rather than exiting having missed events. `terminalDrain` is a pure read, no lock; it runs on
+both the pre-write priority check and the loop's `<-s.stopping` case. **Residual (honest, bounded):**
+the terminal batch delivers only the **first contiguous ≤`batchCap` window** visible to the final
+query; events beyond that cap at the shutdown instant, and any committed *after* the final snapshot,
+are durable in the DB and recoverable with `--from <cursor>` on a re-watch — never silently claimed
+delivered.
 
 `s.stopping` is promoted to a `Server` field (set where the local `stopping` is created in
 `Serve`, closed on the shutdown path as today). A long-poll is a **finite** request (≤
@@ -211,9 +216,11 @@ is an index range, cheap.
 1. **Completeness.** Every `events` row is *scanned* in seq order; every row matching the filter is
    delivered **at least once, in order** (any writer — routed, reaper, carved), deduped by `seq`.
    No missed-write gap. (Not "exactly once" — a lost response re-delivers; see invariant 3.) **At
-   shutdown, the terminal `eof` response first drains** (§3.2.1) so events committed up to the
-   daemon's final scan are delivered before the client exits; events committed *after* the daemon
-   stops accepting are durable and recoverable via `--from` (bounded, honest residual).
+   shutdown, the terminal `eof` response first drains** (§3.2.1) the **first contiguous ≤`batchCap`
+   window** visible to the final scan, delivered before the client exits; events **beyond that cap**
+   at the shutdown instant, or committed *after* the final snapshot, are durable and recoverable via
+   `--from` (bounded, honest residual — not claimed delivered). A final scan that errors/times out
+   yields a transient failure (client retries), never a premature `eof`.
 2. **Ordered matching delivery; cursor is a global high-water mark (Sol r1 #4).** The cursor
    advances past *scanned* (not just matching) seqs, so a filtered stream's **emitted** seqs are
    ordered and complete but **not contiguous** (gaps = filtered-out events). The unfiltered scan
@@ -286,6 +293,11 @@ Daemon (`s.watch`, real-HW):
 8. **Shutdown terminal-drains, loses nothing (Sol r5):** an event committed at cursor+1 just
    before `close(s.stopping)` is **delivered in the terminal `eof:true` batch** (not an empty
    `{cursor:from, eof:true}`); the watch returns promptly and `Serve` drains without `DrainTimeout`.
+   **Shutdown overflow (Sol r6):** with `> batchCap` pending at shutdown, the terminal batch
+   delivers the first contiguous `batchCap` with `eof:true` and an advanced cursor; the remainder
+   is fetched by a re-watch with `--from <that cursor>` (proves the honest capped-window residual,
+   no silent drop). **Bounded final scan:** a `terminalDrain` whose query is made to time out
+   returns a transient failure, **not** `eof` (the client would retry from the unadvanced cursor).
 9. **Disconnect cancels promptly (Sol r1 #1):** a client that closes mid-long-poll cancels the
    handler (peer-close detector) rather than leaking until `wait_ms`; a non-reading client is
    bounded by the write deadline.
