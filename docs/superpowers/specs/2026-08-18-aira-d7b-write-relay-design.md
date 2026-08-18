@@ -1,18 +1,73 @@
-# D7b — Relay the store-touching carved verbs' `state.db` writes through the daemon, v4
+# D7b — Relay the store-touching carved verbs' `state.db` writes through the daemon, v5
 
-**Status:** plan — Sol r1 (4) → v2 → Sol r2 (P1b resolved; 3 open) → v3 → Sol r3 (P0b +
-P1a resolved; P0a open + 1 new P1) → this is **v4** folding both. **Milestone:** Phase 5 ·
-D7b (task #36). **Branch:** `codex-aira-d7b`. **Depends on:** D7a (`ensure-scope`,
-`StoreGuard`, `BuildWithoutStore`, proto v3), M21 (daemon). **Predecessor design:** the
-full-D7 plan v3 (`…2026-08-16-aira-d7-execution-write-fold-design.md` at git `f7c8595`).
-**v4 key moves:** responses are a **deterministically bounded DTO** (Sol r2 P0b);
-**operation-level atomicity is claimed only for the append ops** (single `withImmediate`),
-while `reconcile`/`Rebuild`/`check` are **explicitly not** atomic — their projection is a
+**Status:** plan — Sol r1→r4 → **APPROVE-PLAN** (4 rounds, 4→3→2→0) → Fable code-grounded
+plan-gate → **GATE-PASS** with 6 P1 + 5 P2 amendments → this is **v5** folding them (§1a is
+authoritative where it refines a later section). **Milestone:** Phase 5 · D7b (task #36).
+**Branch:** `codex-aira-d7b`. **Depends on:** D7a (`ensure-scope`, `StoreGuard`,
+`BuildWithoutStore`, proto v3), M21 (daemon).
+**v4 key moves (kept):** responses are a **deterministically bounded DTO** (Sol r2 P0b);
+operation-level atomicity is claimed only for the append ops (single `withImmediate`),
+while `reconcile`/`Rebuild`/`check` are explicitly not atomic — their projection is a
 **rebuildable** cache recovered by re-reconcile, relayed unchanged from pre-D7b (no
-regression) (Sol r3 P0a); a **daemon-owned deadline** bounds a runaway heavy op so it
-cannot pin the single writer, cancel being safe *because* the projection is rebuildable
-(Sol r3 P1); framing rejects structured misdeclarations, never interprets inert trailing
-bytes (Sol r2 P1a).
+regression) (Sol r3 P0a); a **daemon-owned deadline** bounds a runaway heavy op (Sol r3
+P1); framing rejects structured misdeclarations, never interprets inert trailing bytes
+(Sol r2 P1a).
+
+## 1a. v5 amendments (Fable plan-gate — AUTHORITATIVE; supersede any conflicting detail below)
+
+- **A1 — `reconcile` and `rebuild` are TWO separate ops (drop the `{rebuild bool}` field).**
+  `core.Do` issues `c.store.Reconcile` (core.go:1629) and `c.store.Rebuild` (core.go:1633)
+  as separate calls, so the adapter's `Reconcile` override can never see `--rebuild`. The
+  adapter overrides `Reconcile`→`reconcile` op and `Rebuild`→`rebuild` op independently.
+- **A2 — `add-test-report` body is OPTIONAL; `BodyLen==0` ⇔ `Raw=nil` is LEGAL.**
+  Metadata-only reports (truncated capture run_wiring.go:252-258; `E_TESTREPORT_INVALID`
+  parse-retry run_wiring.go:261-271) send `Raw=nil` honestly. The "body-bearing op with
+  `BodyLen==0` → `E_DAEMON_PROTOCOL`" rule applies ONLY to ops whose grammar forbids a body
+  (`add-compute-event`, `add-command-event`, `reconcile`, `rebuild`, `check`). (This
+  replaces Terra's interim one-byte-marker workaround with the clean optional body.)
+- **A3 — the `add-test-report` result DTO echoes the NORMALIZED stored header (minus
+  `Results`).** The client computes `testCount` and `Comparable` from the *stored* report's
+  `ParserComplete, Commit, SuiteID, Config, EnvDigest, Shard` (run_wiring.go:283-296), and
+  the store normalizes (empty `Shard`→"1/1", testreport.go:97-99), so the DTO MUST carry the
+  full stored header (every field except the `Results` slice) + `evicted`/`remaining` — else
+  false `U_TESTREPORT_INCOMPARABLE`. Still bounded (header is small).
+- **A4 — the migrated branch replicates BOTH store↔runner wirings.** (a)
+  `roStore.SetRunner(runner)` (store.go:600-602) — the store's gate-**command** execution
+  seam (gate_command.go), consumed by carved `gate run`/`canary-run` via the promoted
+  methods on the embedded read-only store; without it command gates degrade to
+  `U_GATE_COMMAND_RUN_UNEVALUATED`. (b) `runner.SetSupervisorLeaseReader(roStore.
+  SupervisorLeaseLive)` (project.go:252, a pure DB read supervisor_lease.go:387 the ro
+  handle serves); without it D5 detached-run lease evidence silently degrades.
+- **A5 — proto-4 replacement is carried by the `ensure-scope` handshake, ordering is
+  LOAD-BEARING.** `readInboundFrame`'s strict field allow-list (server.go:475-478) runs
+  *before* the proto check (server.go:373); a new-fields store-op hits an old daemon's
+  allow-list first → Proto-less `errorFrame` → no replacement (dispatcher.go:196-207 needs
+  `Proto!=0`) → hard fail. Only the `ensure-scope` frame ({proto,scope,op}) reaches the
+  proto check → `protocolMismatchFrame(Proto=3)` → replacement. The store-touching branch
+  MUST send `ensure-scope` before any relay op; §7's replacement test exercises the
+  ensure-scope path (proto-3 daemon + proto-4 client → replace → then the relay op succeeds).
+- **A6 — error-code fidelity through the relay.** `run --report` retry branches on
+  `store.ErrorCode` == `E_TESTREPORT_INVALID` (run_wiring.go:261) and `reconcile` on
+  `U_INDEX_UNESTABLISHED` (core.go:1634); `ErrorCode` parses the `CODE:` message prefix
+  (check.go:607-619). The write-relay overrides MUST reconstruct a daemon error as a Go
+  error whose `.Error()` keeps the `CODE:` prefix (rebuild from `ResponseFrame.Code+Error`).
+  §7 adds code-round-trip assertions for both sites.
+- **Ops set (final):** `ensure-scope` | `add-test-report` (optional `Raw` body, normalized-
+  header DTO) | `add-compute-event` | `add-command-event` | `reconcile` (no field,
+  error-only result) | `rebuild` (separate op, error-only result) | `check` (bounded
+  `CheckReport` DTO). `reconcile`/`rebuild` return only `error` — their "findings DTO" rows
+  below are vacuous; only `check` carries a bounded result (P2-2).
+- **P2 folds:** gate-run's carved state.db reads are the **ratchet lane's `test_reports`
+  reads** (gate_ratchet.go:135,387), not the DB gate projection (the gate *definition* is
+  from git files gate_index.go:50-110) — read-only WAL still suffices; point the §7 read
+  test there (P2-1). `storeOpBodyMax`/`StoreOpBodyMax` lives in **`internal/store`** (app
+  can't import daemon; store.go:41-44) (P2-3). `inProcessDispatcher` (dispatcher.go:368-389)
+  keeps `OpenWithDiagnostics` — out of scope; no-client-write tests target the
+  `daemonDispatcher` seam (P2-4). `findings_omitted` needs a home in the `check` DTO mapping
+  (a new field or synthesized warning) since `store.CheckReport` (check.go:102-109) lacks it
+  (P2-2). Under relay, git-context cross-checks + provenance fill run in the daemon process
+  (same scope root; 4-state provenance absorbs divergence); `ensure-scope`-first also
+  guarantees the WAL/`-shm` exist before `OpenReadOnly` (P2-5).
 
 ## 1. Goal and honest scope
 
