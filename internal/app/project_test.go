@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"aira/internal/store"
 )
 
 func TestInitCreatesRegisteredProjectAndRefusesOverwrite(t *testing.T) {
@@ -138,6 +140,18 @@ func TestRunAdmissionConfigRejectsMalformedAndHalfConfig(t *testing.T) {
 				t.Fatalf("validateConfig()=%v", err)
 			}
 		})
+	}
+}
+
+func TestReportMaxBytesCannotExceedStoreOpBodyMax(t *testing.T) {
+	base := Config{Schema: 1, Project: ProjectConfig{Slug: "demo", Prefixes: []string{"DEMO"}}, Lease: LeaseConfig{TTLSeconds: 900, HeartbeatSeconds: 30}}
+	base.Run.ReportMaxBytes = store.StoreOpBodyMax
+	if err := validateConfig(base); err != nil {
+		t.Fatalf("boundary rejected: %v", err)
+	}
+	base.Run.ReportMaxBytes++
+	if err := validateConfig(base); err == nil || !strings.HasPrefix(err.Error(), "E_CONFIG_INVALID:") {
+		t.Fatalf("over-boundary error = %v", err)
 	}
 }
 

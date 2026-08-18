@@ -493,6 +493,9 @@ func validateConfig(config Config) error {
 	if config.Run.ReportMaxBytes < 0 {
 		return errors.New("E_CONFIG_INVALID: run.report_max_bytes must be non-negative")
 	}
+	if config.Run.ReportMaxBytes > store.StoreOpBodyMax {
+		return fmt.Errorf("E_CONFIG_INVALID: run.report_max_bytes must be at most %d", store.StoreOpBodyMax)
+	}
 	if _, err := parsedDetachReadyTimeout(config.Run); err != nil {
 		return err
 	}

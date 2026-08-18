@@ -187,11 +187,11 @@ func exchangeStoreOpOverPipe(t *testing.T, server *Server, frame StoreOpFrame) R
 		server.serveConnection(context.Background(), serverConn)
 		close(done)
 	}()
-	if err := writeFrame(clientConn, frame); err != nil {
+	if err := writeStoreOp(clientConn, frame); err != nil {
 		t.Fatal(err)
 	}
 	var response ResponseFrame
-	if err := readFrame(clientConn, &response); err != nil {
+	if err := readResponse(clientConn, &response); err != nil {
 		t.Fatal(err)
 	}
 	_ = clientConn.Close()

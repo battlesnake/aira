@@ -61,18 +61,22 @@ type Server struct {
 	admitQueues       map[string]*sliceQueue
 
 	// Test seams. Production always calls the Store methods and DB.Close.
-	reapScope         func(context.Context, *store.Store) (int, error)
-	flushScopeFn      func(context.Context, *store.Store) (int, error)
-	closeDB           func(*store.DB) error
-	watchEventsSince  func(context.Context, *store.Store, int64, int) ([]store.WatchEvent, int64, error)
-	watchAfterWake    func()
-	admitResolveSlice func(string) (string, bool, string)
-	admitReadMemory   func(string) (int64, int64, bool, string)
-	admitNow          func() time.Time
-	admitAfter        func(time.Duration) <-chan time.Time
-	admitWriteFrame   func(net.Conn, any) error
-	admitBeforeWrite  func(*admitWaiter)
-	peerCredential    func(net.Conn) (int, int, error)
+	reapScope            func(context.Context, *store.Store) (int, error)
+	flushScopeFn         func(context.Context, *store.Store) (int, error)
+	closeDB              func(*store.DB) error
+	watchEventsSince     func(context.Context, *store.Store, int64, int) ([]store.WatchEvent, int64, error)
+	watchAfterWake       func()
+	admitResolveSlice    func(string) (string, bool, string)
+	admitReadMemory      func(string) (int64, int64, bool, string)
+	admitNow             func() time.Time
+	admitAfter           func(time.Duration) <-chan time.Time
+	admitWriteFrame      func(net.Conn, any) error
+	admitBeforeWrite     func(*admitWaiter)
+	peerCredential       func(net.Conn) (int, int, error)
+	storeOpAppendTimeout time.Duration
+	storeOpHeavyTimeout  time.Duration
+	storeOpWriteTimeout  time.Duration
+	storeOpRun           func(context.Context, *store.Store, StoreOpFrame) (any, error)
 }
 
 func NewServer(paths Paths) *Server {
@@ -80,7 +84,10 @@ func NewServer(paths Paths) *Server {
 		Paths: paths, DrainTimeout: 10 * time.Second, scopes: map[string]*scopeEntry{},
 		watchSlots: make(chan struct{}, watchMaxConcurrent), watchPollInterval: defaultWatchPollInterval,
 		admitSlots: make(chan struct{}, admitGlobalMax), admitPollInterval: defaultAdmitPollInterval,
-		admitQueues: map[string]*sliceQueue{},
+		admitQueues:          map[string]*sliceQueue{},
+		storeOpAppendTimeout: 30 * time.Second,
+		storeOpHeavyTimeout:  5 * time.Minute,
+		storeOpWriteTimeout:  30 * time.Second,
 	}
 }
 
@@ -379,11 +386,10 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		return
 	}
 	if storeOp != nil {
-		if storeOp.Op != "ensure-scope" {
-			wrote = writeFrame(conn, errorFrame(CodeProtocol, fmt.Sprintf("%s: unknown store operation %q", CodeProtocol, storeOp.Op))) == nil
-			return
-		}
-		wrote = writeFrame(conn, responseFrame(s.ensureScope(ctx, scope))) == nil
+		_ = conn.SetReadDeadline(time.Time{})
+		response := s.serveStoreOp(scope, *storeOp)
+		_ = conn.SetWriteDeadline(time.Now().Add(s.storeOpWriteTimeout))
+		wrote = writeResponse(conn, response) == nil
 		return
 	}
 	verb := core.CanonicalVerb(request.Request.Verb)
@@ -473,13 +479,22 @@ func readInboundFrame(r io.Reader) (*RequestFrame, *StoreOpFrame, error) {
 		return &request, nil, nil
 	}
 	for name := range members {
-		if name != "proto" && name != "scope" && name != "op" {
+		if name != "proto" && name != "scope" && name != "op" && name != "body_len" && name != "payload" {
 			return nil, nil, fmt.Errorf("%s: unexpected store operation field %q", CodeProtocol, name)
 		}
 	}
 	var op StoreOpFrame
 	if err := json.Unmarshal(payload, &op); err != nil {
 		return nil, nil, fmt.Errorf("%s: invalid store operation frame: %w", CodeProtocol, err)
+	}
+	if err := validateStoreOpEnvelope(op); err != nil {
+		return nil, nil, err
+	}
+	if op.BodyLen > 0 {
+		op.Body = make([]byte, int(op.BodyLen))
+		if _, err := io.ReadFull(r, op.Body); err != nil {
+			return nil, nil, fmt.Errorf("%s: short store operation body: %w", CodeProtocol, err)
+		}
 	}
 	return &RequestFrame{}, &op, nil
 }

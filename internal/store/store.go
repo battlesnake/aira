@@ -38,6 +38,11 @@ var (
 
 const journalLockTimeout = 2 * time.Second
 
+// StoreOpBodyMax is the compile-time transport ceiling for a relayed store
+// operation body. It lives in store so config validation and the daemon wire
+// layer share one value without an app<->daemon import cycle.
+const StoreOpBodyMax int64 = 64 << 20
+
 // Test-only fault/observation seams. Production leaves both nil.
 var (
 	beforeFileSync func(*os.File) error

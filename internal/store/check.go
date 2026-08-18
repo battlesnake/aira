@@ -106,6 +106,9 @@ type CheckReport struct {
 	Warnings            []CheckFinding    `json:"warnings,omitempty"`
 	UnevaluatedFindings []CheckFinding    `json:"unevaluated_findings,omitempty"`
 	Unevaluated         bool              `json:"unevaluated,omitempty"`
+	FindingCounts       map[string]uint   `json:"finding_counts,omitempty"`
+	FindingsOmitted     uint              `json:"findings_omitted,omitempty"`
+	FindingsTruncated   uint              `json:"findings_truncated,omitempty"`
 }
 
 // Check runs the explicit full consistency pass. Known integrity findings are

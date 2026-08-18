@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	ProtocolVersion = 3
+	ProtocolVersion = 4
 	MaxFrameBytes   = 16 << 20
+	StoreOpBodyMax  = uint64(store.StoreOpBodyMax)
 )
 
 const (
@@ -66,9 +67,12 @@ type RequestFrame struct {
 // StoreOpFrame is a mutually exclusive daemon frame kind for store lifecycle
 // operations which do not dispatch a Core request.
 type StoreOpFrame struct {
-	Proto int           `json:"proto"`
-	Scope WorktreeScope `json:"scope"`
-	Op    string        `json:"op"`
+	Proto   int             `json:"proto"`
+	Scope   WorktreeScope   `json:"scope"`
+	Op      string          `json:"op"`
+	BodyLen uint64          `json:"body_len,omitempty"`
+	Payload json.RawMessage `json:"payload,omitempty"`
+	Body    []byte          `json:"-"`
 }
 
 // ResponseFrame is the wire projection of core.Response. AfterWrite cannot be
@@ -81,6 +85,8 @@ type ResponseFrame struct {
 	Error    string          `json:"error,omitempty"`
 	Warnings []string        `json:"warnings,omitempty"`
 	Exit     int             `json:"exit,omitempty"`
+	BodyLen  uint64          `json:"body_len,omitempty"`
+	Body     []byte          `json:"-"`
 }
 
 func responseFrame(response core.Response) ResponseFrame {
@@ -169,6 +175,50 @@ func writeFrameBytes(w io.Writer, data []byte) error {
 	return nil
 }
 
+func writeStoreOp(w io.Writer, frame StoreOpFrame) error {
+	if frame.BodyLen != uint64(len(frame.Body)) {
+		return fmt.Errorf("%s: declared request body length %d does not match %d bytes", CodeProtocol, frame.BodyLen, len(frame.Body))
+	}
+	if frame.BodyLen > StoreOpBodyMax {
+		return fmt.Errorf("%s: request body is too large", CodeProtocol)
+	}
+	if err := writeFrame(w, frame); err != nil {
+		return err
+	}
+	return writeFrameBytes(w, frame.Body)
+}
+
+func writeResponse(w io.Writer, frame ResponseFrame) error {
+	if frame.BodyLen != uint64(len(frame.Body)) {
+		return fmt.Errorf("%s: declared response body length %d does not match %d bytes", CodeProtocol, frame.BodyLen, len(frame.Body))
+	}
+	if frame.BodyLen > StoreOpBodyMax {
+		return fmt.Errorf("%s: response body is too large", CodeProtocol)
+	}
+	if err := writeFrame(w, frame); err != nil {
+		return err
+	}
+	return writeFrameBytes(w, frame.Body)
+}
+
+func readResponse(r io.Reader, frame *ResponseFrame) error {
+	if err := readFrame(r, frame); err != nil {
+		return err
+	}
+	if frame.BodyLen > StoreOpBodyMax {
+		return fmt.Errorf("%s: response body is too large", CodeProtocol)
+	}
+	if frame.BodyLen == 0 {
+		frame.Body = nil
+		return nil
+	}
+	frame.Body = make([]byte, int(frame.BodyLen))
+	if _, err := io.ReadFull(r, frame.Body); err != nil {
+		return fmt.Errorf("%s: short response body: %w", CodeProtocol, err)
+	}
+	return nil
+}
+
 // Exchange sends one request and receives one response over a fresh Unix
 // connection.
 func Exchange(ctx context.Context, socket string, request RequestFrame) (ResponseFrame, error) {
@@ -178,6 +228,21 @@ func Exchange(ctx context.Context, socket string, request RequestFrame) (Respons
 // ExchangeStoreOp sends one store operation and receives its ownership result.
 func ExchangeStoreOp(ctx context.Context, socket string, request StoreOpFrame) (ResponseFrame, error) {
 	return exchange(ctx, socket, request)
+}
+
+// StoreOpOutcomeUnknownError means the complete request was written but no
+// acknowledgement was established. Callers must not retry append operations.
+type StoreOpOutcomeUnknownError struct{ Err error }
+
+func (e *StoreOpOutcomeUnknownError) Error() string {
+	return "OUTCOME_UNKNOWN: relayed store operation may have been applied: " + e.Err.Error()
+}
+
+func (e *StoreOpOutcomeUnknownError) Unwrap() error { return e.Err }
+
+func IsStoreOpOutcomeUnknown(err error) bool {
+	var target *StoreOpOutcomeUnknownError
+	return errors.As(err, &target)
 }
 
 func exchange(ctx context.Context, socket string, request any) (ResponseFrame, error) {
@@ -197,12 +262,23 @@ func exchange(ctx context.Context, socket string, request any) (ResponseFrame, e
 	} else {
 		_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 	}
-	if err := writeFrame(conn, request); err != nil {
-		return ResponseFrame{}, wrapTransportError(ctx, err)
+	storeOp, isStoreOp := request.(StoreOpFrame)
+	var writeErr error
+	if isStoreOp {
+		writeErr = writeStoreOp(conn, storeOp)
+	} else {
+		writeErr = writeFrame(conn, request)
+	}
+	if writeErr != nil {
+		return ResponseFrame{}, wrapTransportError(ctx, writeErr)
 	}
 	var response ResponseFrame
-	if err := readFrame(conn, &response); err != nil {
-		return ResponseFrame{}, wrapTransportError(ctx, err)
+	if err := readResponse(conn, &response); err != nil {
+		wrapped := wrapTransportError(ctx, err)
+		if isStoreOp {
+			return ResponseFrame{}, &StoreOpOutcomeUnknownError{Err: wrapped}
+		}
+		return ResponseFrame{}, wrapped
 	}
 	return response, nil
 }
