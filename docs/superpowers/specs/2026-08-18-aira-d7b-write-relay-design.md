@@ -1,17 +1,18 @@
-# D7b — Relay the store-touching carved verbs' `state.db` writes through the daemon, v3
+# D7b — Relay the store-touching carved verbs' `state.db` writes through the daemon, v4
 
-**Status:** plan — Sol plan-review r1 (4 findings) → v2 → Sol r2 (R1-P1b resolved; 3
-still open) → this is **v3** folding all three. **Milestone:** Phase 5 · D7b (task #36).
-**Branch:** `codex-aira-d7b`. **Depends on:** D7a (`ensure-scope`, `StoreGuard`,
-`BuildWithoutStore`, proto v3), M21 (daemon). **Predecessor design:** the full-D7 plan v3
-(`…2026-08-16-aira-d7-execution-write-fold-design.md` at git `f7c8595`) — Sol-reviewed
-r1+r2; this plan reuses its mechanism and folds what D7a landed + two facts the v3 survey
-predates. **v3 key moves:** responses are a **deterministically bounded DTO** (not a
-bigger buffer — Sol r2 P0b); store-ops **run to completion, never cancelled mid-flight**,
-so the atomicity escape hatch is gone — append ops are atomic, `reconcile`/`check`
-idempotent + phase-transactional (Sol r2 P0a); inert trailing bytes are never interpreted
-(one-shot, `RequestFrame`-identical) with structured misdeclarations actively rejected
-(Sol r2 P1a).
+**Status:** plan — Sol r1 (4) → v2 → Sol r2 (P1b resolved; 3 open) → v3 → Sol r3 (P0b +
+P1a resolved; P0a open + 1 new P1) → this is **v4** folding both. **Milestone:** Phase 5 ·
+D7b (task #36). **Branch:** `codex-aira-d7b`. **Depends on:** D7a (`ensure-scope`,
+`StoreGuard`, `BuildWithoutStore`, proto v3), M21 (daemon). **Predecessor design:** the
+full-D7 plan v3 (`…2026-08-16-aira-d7-execution-write-fold-design.md` at git `f7c8595`).
+**v4 key moves:** responses are a **deterministically bounded DTO** (Sol r2 P0b);
+**operation-level atomicity is claimed only for the append ops** (single `withImmediate`),
+while `reconcile`/`Rebuild`/`check` are **explicitly not** atomic — their projection is a
+**rebuildable** cache recovered by re-reconcile, relayed unchanged from pre-D7b (no
+regression) (Sol r3 P0a); a **daemon-owned deadline** bounds a runaway heavy op so it
+cannot pin the single writer, cancel being safe *because* the projection is rebuildable
+(Sol r3 P1); framing rejects structured misdeclarations, never interprets inert trailing
+bytes (Sol r2 P1a).
 
 ## 1. Goal and honest scope
 
@@ -182,31 +183,50 @@ malformed/abusive client → `E_DAEMON_PROTOCOL`. Both boundaries are tested.
 **Execution model — run to completion, no mid-op cancellation (Sol r2 P0a).** v2's
 "one ctx-aware transaction, or document partial progress" was an escape hatch: forcing
 `reconcile`/`check` (inherently multi-phase) into one giant transaction is wrong and out
-of D7b's scope, and "documenting partial progress" is not a guarantee. D7b removes the
-hatch by **not cancelling any store-op mid-flight** — every relayed op runs on the daemon
-to completion under a per-op `context.Background()`-derived context, decoupled from the
-connection deadline (the handler clears the 30 s read deadline for the potentially-slow
-`reconcile`/`rebuild`/`check`, exactly as the `watch` handler clears it at
-`server.go:418`). This yields a **concrete** guarantee per op class, no hatch:
-- **Append ops (`add-test-report`/`-compute-event`/`-command-event`) are atomic.**
-  Verified: each is a single `withImmediate(ctx,…)` transaction (`store.go:2499` —
-  `BEGIN IMMEDIATE`…`COMMIT`, rollback on any error). It either commits or rolls back;
-  it is **never torn**. Running to completion (not cancelling) means the only outcome is
-  commit-or-clean-abort.
-- **`reconcile`/`rebuild`/`check` are idempotent and phase-transactional.** They are a
-  sequence of individually-transactional phases (each internal write is its own
-  `withImmediate`), so no phase leaves torn state; and the whole operation is a
-  recompute-to-fixed-point, so completing it is deterministic. Running to completion (no
-  mid-flight cancel) means there is **no partial-commit-on-cancel to reason about** — the
-  op finishes and the projection is fully advanced. The build **audits** that each
-  internal phase is transactional (no torn state) — that is the concrete, verifiable
-  requirement replacing the hatch, not "single BEGIN…COMMIT for the whole op".
+of D7b's scope. v2/v3 tried "run to completion" as the guarantee, but Sol r3 correctly
+noted that per-phase transactions + run-to-completion still leave partial *operation*
+state on a daemon **crash** between phases — so operation-level atomicity is **not** a
+property of `reconcile`/`check`, and pretending otherwise is dishonest. D7b therefore
+states the **real** guarantee explicitly, per op class:
 
-A client disconnect or client-side timeout therefore **cannot tear a store-op**: the
-daemon completes it regardless; the client merely stops waiting and (for
-`reconcile`/`check`, being idempotent) may safely re-run. The daemon writes the response
-best-effort under a bounded write deadline; a dead connection just drops the (already
-persisted) result.
+- **Append ops (`add-test-report`/`-compute-event`/`-command-event`) ARE operation-atomic
+  and durable.** Verified: each is a single `withImmediate(ctx,…)` transaction
+  (`store.go:2499` — `BEGIN IMMEDIATE`…`COMMIT`, rollback on any error) in WAL mode, so a
+  crash or cancel mid-transaction rolls back (nothing) and a post-`COMMIT` crash keeps the
+  durable row. Commit-or-nothing across crashes. The only residual is the client-side
+  post-write/pre-ack window (below).
+- **`reconcile`/`rebuild`/`check` are explicitly NOT operation-atomic — and do not need to
+  be, because the projection tables they write are a REBUILDABLE cache of git-file truth**
+  (AIRA's core invariant; `.aira/*.md` files are authoritative, the SQLite projection is
+  a rebuildable index). Concretely: `Rebuild`'s main projection rebuild is itself a
+  **single** `withImmediate` transaction (`store.go:2135`–`2364`), so a crash/cancel there
+  rolls back to the **prior** projection — never torn or empty; the residual seams (the
+  separate `rebuildGateProjection` transaction; `reconcile`'s incremental per-phase
+  transactions) leave a per-phase-consistent, **rebuildable** projection. **Durable
+  recovery = re-running `reconcile`/`Rebuild`** (idempotent recompute-to-fixed-point) —
+  which `check` itself performs and which AIRA's on-demand-reconcile read model already
+  relies on (projections are eventually-consistent; a crash-partial projection is a
+  bounded staleness, not corruption). **D7b relays these methods with their transaction
+  structure UNCHANGED from the pre-D7b client-side path, so it introduces no atomicity
+  regression** — it relocates *where* they run, not their atomicity.
+
+**Bounding a runaway op — daemon-owned deadline (Sol r3 P1).** An unbounded
+`reconcile`/`rebuild`/`check` on a pathological repo could pin the single writer and
+starve later writes. Each runs under a **daemon-owned deadline** (generous, config-
+defaulted — e.g. minutes — NOT the 30 s transport deadline), independent of the client
+connection. If it fires, the op is cancelled: `withImmediate`'s ctx-rollback unwinds the
+in-flight phase and the `defer`red `rebuild.lock`/mutation-lock files release, leaving a
+**rebuildable** partial projection — safe, because a subsequent `reconcile` reconstructs
+it, exactly as after a crash. Cancellation here does **not** expose partially-advanced
+state in any sense a re-reconcile does not fix (that is precisely why it is safe *only*
+for the rebuildable-projection ops; the append ops are never deadline-cancelled into a
+torn state because they are single-transaction atomic). The client is told `unevaluated`
+honestly. Append ops keep a normal short bound.
+
+A client disconnect or client-side timeout does **not** dictate the daemon op's fate: the
+daemon runs each op under its own context (append: fast; reconcile/check: the daemon
+deadline), writes the response best-effort under a bounded write deadline, and a dead
+connection just drops the (already persisted, or rebuildable) result.
 
 **The one inherent residual — the post-commit / pre-ack window — is reported honestly.**
 If the client's connection fails **after** it finished writing the request but **before**
@@ -220,10 +240,15 @@ are safe to re-run and say so. No op fakes a definite success or failure across 
 window.
 
 **Daemon side.** Each op handler gets the writable scope via the existing `storeForScope`
-(same cache + single writable `*store.Store` routed verbs and `ensure-scope` use), clears
-the connection read deadline, runs the one named method to completion under a background
-context, and writes the result frame under a bounded write deadline. Reuses M21
-scope-build + identity recompute exactly.
+(same cache + single writable `*store.Store` routed verbs and `ensure-scope` use). The
+request header + any declared `BodyLen` body are read under the existing 30 s read
+deadline (a dribbling client times out); after the full request is read the handler
+**clears the read deadline** (no further socket reads) and runs the one named method under
+a **daemon-owned context** — a short bound for the atomic append ops, the generous
+config-defaulted deadline for `reconcile`/`rebuild`/`check` — then writes the result under
+a bounded write deadline. Reuses M21 scope-build + identity recompute exactly. Extend the
+`readInboundFrame` store-op field allow-list (`server.go:475`) for the new frame fields
+(`op`, `body_len`, a single `payload` `json.RawMessage`) and keep it strict.
 
 ### 4.3 `store.OpenReadOnly` (new)
 
@@ -288,14 +313,17 @@ instead); folding `time`/`run` telemetry into a single op.
   counts, a findings list capped at `maxRelayedFindings`, and `findings_omitted > 0`
   (assert the encoded size is bounded and the counts are exact, not the list length); a
   large report yields a small compact `add-test-report` DTO.
-- **Run-to-completion + ambiguous outcome (Sol r2 P0a / Sol r1 P0#1).** (a) A slow
-  `reconcile`/`check` whose client disconnects mid-op is **completed** by the daemon (not
-  torn): assert the projection is fully advanced and consistent afterwards, and a
-  subsequent `check` is clean (idempotent); (b) a post-write/pre-read disconnect yields
+- **Atomicity, recovery, and bounding (Sol r3 P0a + P1).** (a) An append op whose
+  `withImmediate` ctx is cancelled before commit leaves **no** row (operation-atomic); (b)
+  a `reconcile`/`Rebuild` cancelled by the daemon-owned deadline mid-op leaves a
+  **rebuildable** projection — assert `Rebuild`'s main transaction rolled back to the prior
+  projection (not torn/empty), and a subsequent `reconcile`/`Rebuild` reconstructs the
+  fixed point (recovery); (c) the daemon-owned deadline actually fires on a
+  deliberately-slow reconcile (injected slow phase) → `unevaluated`, writer released for a
+  concurrent op (no indefinite pin); (d) a post-write/pre-read disconnect yields
   `OUTCOME_UNKNOWN` — append ops report `unevaluated` and are **not** auto-retried (no
-  duplicate row); idempotent ops report re-runnable; (c) an append op cancelled *before*
-  commit (its `withImmediate` ctx errors) leaves **no** row (atomic); (d) no op reports a
-  fake definite success/failure across the window.
+  duplicate row); idempotent ops report re-runnable; (e) no op reports a fake definite
+  success/failure across the window.
 - **`check` is a write.** `check` over the read-only store fails; over `writeRelayStore`
   it relays and the `CheckReport` matches in-process; the local `runner.Reconcile` phase
   still runs (end state == pre-D7b, no double-reconcile).
@@ -325,10 +353,15 @@ instead); folding `time`/`run` telemetry into a single op.
   carved reads are the gate **definition** (`Rebuild`-projected, committed) and
   `TestReportContext` (committed) — both visible to a WAL reader. If one ever needs
   uncommitted daemon state it becomes a relay op.
-- **R3 — a store-op is torn by a mid-flight disconnect.** *Mitigation:* no store-op is
-  cancelled mid-flight (§4.2 run-to-completion); append ops are atomic (`withImmediate`,
-  verified `store.go:2499`); `reconcile`/`check` are phase-transactional (build audits
-  each internal write is its own transaction — no torn state) + idempotent.
+- **R3 — a store-op leaves partial state on crash/cancel.** *Mitigation:* append ops are
+  operation-atomic (`withImmediate`, verified `store.go:2499`); `reconcile`/`Rebuild`/
+  `check` write a **rebuildable** projection (`Rebuild`'s main tx is atomic `store.go:2135`;
+  residual seams self-heal), recovered by re-running `reconcile` (idempotent) — the same
+  crash-recovery AIRA already relies on; D7b changes none of it, so **no regression**.
+- **R3b — a runaway op pins the single writer.** *Mitigation:* the daemon-owned deadline
+  bounds `reconcile`/`Rebuild`/`check`; on fire, `withImmediate` ctx-rollback + `defer`red
+  lock release free the writer, leaving a rebuildable projection (safe to cancel *because*
+  rebuildable).
 - **R4 — `OUTCOME_UNKNOWN` telemetry loss.** *Mitigation:* accepted for high-volume
   non-critical telemetry (a lost row beats a silent duplicate); reported honestly as
   `unevaluated`, never faked; an idempotency-key dedup is a stated future option.
@@ -359,12 +392,15 @@ instead); folding `time`/`run` telemetry into a single op.
    (unknown-op / body-on-no-body-op / oversized / short-read / both-kinds) →
    `E_DAEMON_PROTOCOL` + close; inert trailing bytes never interpreted (one-shot,
    `RequestFrame`-identical); exact reads; value-faithful (int64).
-5. Execution: **no store-op is cancelled mid-flight** (run-to-completion, cleared read
-   deadline, bounded write deadline); append ops verified atomic (`withImmediate`);
-   `reconcile`/`check` phase-transactional (each internal write its own transaction, no
-   torn state) + idempotent; `OUTCOME_UNKNOWN` for the post-write/pre-ack window surfaced
-   honestly — append ops `unevaluated` + **not** auto-retried, idempotent ops re-runnable;
-   heavy ops not 30 s-capped.
+5. Execution/atomicity: append ops are operation-atomic + durable (`withImmediate`,
+   verified); `reconcile`/`Rebuild`/`check` are **explicitly not** operation-atomic —
+   their projection is a **rebuildable** cache (`Rebuild` main tx atomic; recovery =
+   re-reconcile), relayed unchanged from pre-D7b (no regression), not overclaimed; a
+   **daemon-owned deadline** bounds a runaway heavy op (safe cancel — rebuildable) so it
+   cannot pin the single writer; the request body read stays deadline-bounded, only the
+   compute phase is un-deadlined; `OUTCOME_UNKNOWN` for the post-write/pre-ack window
+   surfaced honestly — append ops `unevaluated` + **not** auto-retried, idempotent ops
+   re-runnable.
 6. `store.OpenReadOnly` truly cannot write (mode=ro + query_only, no initDB/register),
    correct as a WAL reader.
 7. Honesty: D7b = foreground-**client** `state.db`-writer elimination; gate audit file,
