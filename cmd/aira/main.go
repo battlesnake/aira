@@ -666,6 +666,9 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 				return core.Request{}, fmt.Errorf("rant ls accepts no positional arguments")
 			}
 			args["subverb"], args["by"], args["unreviewed"] = "ls", options["by"], options["unreviewed"] == "true"
+			if tags := splitOptionList(options["tag"]); len(tags) > 0 {
+				args["tags"] = tags
+			}
 			if options["since"] != "" {
 				value, err := strconv.ParseInt(options["since"], 10, 64)
 				if err != nil || value < 0 {

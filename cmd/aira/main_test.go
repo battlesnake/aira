@@ -516,3 +516,19 @@ func TestReviewConfiguredPolicyRealCLIIntegration(t *testing.T) {
 		t.Fatalf("missing selector response=%#v", missing)
 	}
 }
+
+func TestRantCLIListTagFilterAndSeverityDistribution(t *testing.T) {
+	// `rant ls --tag "Slow Tests"` wires the filter through the tags arg.
+	req, err := buildRequest("rant", []string{"ls"}, map[string]string{"tag": "Slow Tests"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Args["subverb"] != "ls" || !reflect.DeepEqual(req.Args["tags"], []string{"Slow Tests"}) {
+		t.Fatalf("ls --tag request = %#v", req.Args)
+	}
+	// `rant ls --by severity` passes the distribution field through.
+	bySev, err := buildRequest("rant", []string{"ls"}, map[string]string{"by": "severity"})
+	if err != nil || bySev.Args["by"] != "severity" {
+		t.Fatalf("ls --by severity request = %#v err=%v", bySev.Args, err)
+	}
+}

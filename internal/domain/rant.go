@@ -106,12 +106,22 @@ type RantListOptions struct {
 	By         string
 	Unreviewed bool
 	Since      int64
+	// Tag, when non-empty, restricts the listing to rants carrying this
+	// (already-normalised) recorded tag.
+	Tag string
 }
 
 var rantTagBreaks = regexp.MustCompile(`[^a-z0-9]+`)
 var rantIDPattern = regexp.MustCompile(`^RANT-[1-9][0-9]*$`)
 var gateRefPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 var findingRefPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$`)
+
+// NormaliseRantTag canonicalises a tag exactly as capture does (lowercase,
+// whitespace/punctuation runs → single hyphen, trimmed), so a filter typed as
+// "Slow Tests" matches the stored "slow-tests". Shared by capture and ls --tag.
+func NormaliseRantTag(raw string) string {
+	return strings.Trim(rantTagBreaks.ReplaceAllString(strings.ToLower(strings.TrimSpace(raw)), "-"), "-")
+}
 
 func (input RantInput) Normalised() (RantInput, error) {
 	if !utf8.ValidString(input.Body) || strings.ContainsRune(input.Body, '\x00') || strings.TrimSpace(input.Body) == "" {
@@ -135,7 +145,7 @@ func (input RantInput) Normalised() (RantInput, error) {
 	}
 	tags := make(map[string]struct{}, len(input.Tags))
 	for _, raw := range input.Tags {
-		tag := strings.Trim(rantTagBreaks.ReplaceAllString(strings.ToLower(strings.TrimSpace(raw)), "-"), "-")
+		tag := NormaliseRantTag(raw)
 		if tag == "" || len([]byte(tag)) > MaxRantTagBytes {
 			return RantInput{}, errors.New(CodeRantInvalid + ": tag is invalid")
 		}

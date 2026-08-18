@@ -140,6 +140,10 @@ func (s *Store) ListRants(options domain.RantListOptions) ([]domain.Rant, error)
 	if options.Unreviewed {
 		query += ` AND NOT EXISTS(SELECT 1 FROM rant_reviews rr WHERE rr.project_id=rants.project_id AND rr.rant_id=rants.id)`
 	}
+	if options.Tag != "" {
+		query += ` AND EXISTS(SELECT 1 FROM rant_tags rt WHERE rt.project_id=rants.project_id AND rt.rant_id=rants.id AND rt.tag=?)`
+		args = append(args, options.Tag)
+	}
 	query += ` ORDER BY seq ASC LIMIT ?`
 	args = append(args, ListLimit)
 	rows, err := s.db.Query(query, args...)
@@ -311,7 +315,7 @@ func (s *Store) CountRants(query, by string) (RantCountResult, error) {
 	if query != "" {
 		return RantCountResult{}, errors.New("E_QUERY_INVALID: rant count does not accept a free-text query; use grep")
 	}
-	if by != "tag" && by != "actor" {
+	if by != "tag" && by != "actor" && by != "severity" {
 		return RantCountResult{}, fmt.Errorf("E_SELECTOR_INVALID: unsupported rant distribution field %q", by)
 	}
 	result := RantCountResult{By: by, Groups: map[string]RantCountGroup{}}
@@ -320,9 +324,14 @@ func (s *Store) CountRants(query, by string) (RantCountResult, error) {
 	}
 	var rows *sql.Rows
 	var err error
-	if by == "tag" {
+	switch by {
+	case "tag":
 		rows, err = s.db.Query(`SELECT rt.tag,COUNT(*),COUNT(DISTINCT r.actor) FROM rant_tags rt JOIN rants r ON r.project_id=rt.project_id AND r.id=rt.rant_id WHERE rt.project_id=? GROUP BY rt.tag ORDER BY rt.tag`, s.projectID)
-	} else {
+	case "severity":
+		// The empty-string group is the honest count of rants with no severity;
+		// severity is never inferred.
+		rows, err = s.db.Query(`SELECT severity,COUNT(*),COUNT(DISTINCT actor) FROM rants WHERE project_id=? GROUP BY severity ORDER BY severity`, s.projectID)
+	default: // actor
 		rows, err = s.db.Query(`SELECT actor,COUNT(*),COUNT(DISTINCT actor) FROM rants WHERE project_id=? GROUP BY actor ORDER BY actor`, s.projectID)
 	}
 	if err != nil {

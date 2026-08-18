@@ -478,3 +478,67 @@ func mustAddRant(t *testing.T, s *Store, input domain.RantInput) RantAddResult {
 	}
 	return result
 }
+
+func TestRantListByTagAndCountBySeverity(t *testing.T) {
+	s, _ := rantTestStore(t)
+	mustAddRant(t, s, domain.RantInput{Body: "slow build", Tags: []string{"infra", "slow-tests"}, Severity: domain.RantSeverityBlocker, Actor: "terra"})
+	mustAddRant(t, s, domain.RantInput{Body: "lint noise", Tags: []string{"linter-noise"}, Severity: domain.RantSeverityPapercut, Actor: "opus"})
+	mustAddRant(t, s, domain.RantInput{Body: "another infra gripe", Tags: []string{"infra"}, Actor: "terra"}) // no severity
+
+	// ls --tag restricts to rants carrying the tag; a non-existent tag is an
+	// honest empty result, not the whole list.
+	infra, err := s.ListRants(domain.RantListOptions{Tag: "infra"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infra) != 2 {
+		t.Fatalf("ls --tag infra = %d rants, want 2", len(infra))
+	}
+	for _, r := range infra {
+		if !containsString(r.Tags, "infra") {
+			t.Fatalf("ls --tag infra returned a rant without the tag: %#v", r.Tags)
+		}
+	}
+	if none, err := s.ListRants(domain.RantListOptions{Tag: "nonexistent"}); err != nil || len(none) != 0 {
+		t.Fatalf("ls --tag nonexistent = %v len=%d (want honest empty)", err, len(none))
+	}
+	// A filter typed "Slow Tests" matches the stored normalised "slow-tests".
+	if got := domain.NormaliseRantTag("Slow Tests"); got != "slow-tests" {
+		t.Fatalf("NormaliseRantTag(\"Slow Tests\") = %q, want slow-tests", got)
+	}
+	if slow, err := s.ListRants(domain.RantListOptions{Tag: domain.NormaliseRantTag("Slow Tests")}); err != nil || len(slow) != 1 {
+		t.Fatalf("ls --tag 'Slow Tests' = %v len=%d, want 1", err, len(slow))
+	}
+	// count --by severity groups honestly, including the empty-severity group.
+	count, err := s.CountRants("", "severity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count.By != "severity" || count.Total != 3 || count.Groups["blocker"].Rants != 1 || count.Groups["papercut"].Rants != 1 || count.Groups[""].Rants != 1 {
+		t.Fatalf("count --by severity = %#v", count)
+	}
+	if _, err := s.CountRants("", "bogus"); ErrorCode(err) != "E_SELECTOR_INVALID" {
+		t.Fatalf("bogus distribution field = %v, want E_SELECTOR_INVALID", err)
+	}
+}
+func TestRantListTagFilterComposesWithUnreviewedAndSince(t *testing.T) {
+	s, _ := rantTestStore(t)
+	a := mustAddRant(t, s, domain.RantInput{Body: "infra reviewed", Tags: []string{"infra"}, Actor: "t"})
+	b := mustAddRant(t, s, domain.RantInput{Body: "infra unreviewed", Tags: []string{"infra"}, Actor: "t"})
+	mustAddRant(t, s, domain.RantInput{Body: "other unreviewed", Tags: []string{"other"}, Actor: "t"})
+	if _, err := s.ReviewRant(context.Background(), a.Rant.ID, domain.RantReviewInput{Reviewer: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	// tag AND unreviewed composes: only the unreviewed infra rant.
+	if rows, err := s.ListRants(domain.RantListOptions{Tag: "infra", Unreviewed: true}); err != nil || len(rows) != 1 || rows[0].ID != b.Rant.ID {
+		t.Fatalf("infra+unreviewed = %v %#v", err, rows)
+	}
+	// tag AND since composes: only the infra rant after a's seq.
+	if rows, err := s.ListRants(domain.RantListOptions{Tag: "infra", Since: a.Rant.Seq}); err != nil || len(rows) != 1 || rows[0].ID != b.Rant.ID {
+		t.Fatalf("infra+since = %v %#v", err, rows)
+	}
+	// All three filters compose simultaneously.
+	if rows, err := s.ListRants(domain.RantListOptions{Tag: "infra", Unreviewed: true, Since: a.Rant.Seq}); err != nil || len(rows) != 1 || rows[0].ID != b.Rant.ID {
+		t.Fatalf("infra+unreviewed+since = %v %#v", err, rows)
+	}
+}

@@ -993,3 +993,39 @@ func writeCoreTicketFile(t *testing.T, path string, ticket domain.Ticket) {
 		t.Fatal(err)
 	}
 }
+
+func TestRantListGuardsRejectDishonestFiltersThroughDispatch(t *testing.T) {
+	s, _ := coreTestStoreWithRoot(t)
+	c := New(s)
+	capture := func(text string, tags ...string) {
+		t.Helper()
+		if r := c.Do(context.Background(), Request{Verb: "rant", Args: map[string]any{"subverb": "capture", "text": text, "tags": tags}}); !r.OK {
+			t.Fatalf("rant capture %q: %#v", text, r)
+		}
+	}
+	capture("slow build", "infra")
+	capture("lint noise", "linter-noise")
+	ls := func(args map[string]any) Response {
+		args["subverb"] = "ls"
+		return c.Do(context.Background(), Request{Verb: "rant", Args: args})
+	}
+	rejects := func(name string, args map[string]any) {
+		t.Helper()
+		if r := ls(args); r.OK || r.Code != domain.CodeRantInvalid {
+			t.Fatalf("%s: OK=%v code=%q, want reject with %s", name, r.OK, r.Code, domain.CodeRantInvalid)
+		}
+	}
+	// A tag that normalises to empty ("---") must NOT silently return every rant.
+	rejects("ls --tag '---'", map[string]any{"tags": []string{"---"}})
+	// Multiple tags must be rejected, not silently reduced to the first.
+	rejects("ls --tag a --tag b", map[string]any{"tags": []string{"a", "b"}})
+	// A distribution combined with a filter must be rejected, not silently ignored.
+	rejects("ls --by severity --unreviewed", map[string]any{"by": "severity", "unreviewed": true})
+	// The valid forms still work.
+	if r := ls(map[string]any{"tags": []string{"infra"}}); !r.OK {
+		t.Fatalf("ls --tag infra: %#v", r)
+	}
+	if r := ls(map[string]any{"by": "severity"}); !r.OK {
+		t.Fatalf("ls --by severity: %#v", r)
+	}
+}

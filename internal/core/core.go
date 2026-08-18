@@ -623,7 +623,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			return mutationData(map[string]any{"id": ticket.ID, "path": ".aira/tickets/" + ticket.ID + ".md", "ticket": ticket}, event), nil
 		}},
 		"rant": {Name: "rant", Usage: "rant <text> [--tag T --severity S --ref kind:id --idem KEY] | rant ls|get|review|redact ...", GitContext: true,
-			Args:    []ArgSpec{stringSpec("subverb", false, true, "Rant operation", "capture", "ls", "get", "review", "redact"), stringSpec("text", false, true, "Unfiltered friction text"), listSpec("tags", false, false, "Recorded tags; suggested seeds: slow-tests, linter-noise, flaky-infra, confusing-setup"), stringSpec("severity", false, false, "Subjective severity", "papercut", "annoyance", "blocker"), listSpec("refs", false, false, "Typed project references"), stringSpec("idempotency_key", false, false, "Retry key"), stringSpec("selector", false, true, "Rant ID"), stringSpec("by", false, false, "Distribution field", "tag", "actor"), boolSpec("unreviewed", false, false, "Only rants with no review rows"), stringSpec("since", false, false, "Rant sequence cursor"), stringSpec("outcome", false, false, "Typed non-final outcome", "actioned", "planned", "duplicate", "wont-fix", "needs-evidence"), stringSpec("note", false, false, "Review note"), stringSpec("resolved_by", false, false, "Typed project reference")},
+			Args:    []ArgSpec{stringSpec("subverb", false, true, "Rant operation", "capture", "ls", "get", "review", "redact"), stringSpec("text", false, true, "Unfiltered friction text"), listSpec("tags", false, false, "Recorded tags; suggested seeds: slow-tests, linter-noise, flaky-infra, confusing-setup"), stringSpec("severity", false, false, "Subjective severity", "papercut", "annoyance", "blocker"), listSpec("refs", false, false, "Typed project references"), stringSpec("idempotency_key", false, false, "Retry key"), stringSpec("selector", false, true, "Rant ID"), stringSpec("by", false, false, "Distribution field", "tag", "actor", "severity"), boolSpec("unreviewed", false, false, "Only rants with no review rows"), stringSpec("since", false, false, "Rant sequence cursor"), stringSpec("outcome", false, false, "Typed non-final outcome", "actioned", "planned", "duplicate", "wont-fix", "needs-evidence"), stringSpec("note", false, false, "Review note"), stringSpec("resolved_by", false, false, "Typed project reference")},
 			MCPTool: "aira_rant", MCPOperation: "subverb", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 				rants, ok := c.store.(rantStore)
 				if !ok {
@@ -643,15 +643,34 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				}
 				switch subverb {
 				case "ls", "list":
-					since, err := parseRantSince(stringArg(args, "since"))
+					by := stringArg(args, "by")
+					tags := stringSlice(args, "tags")
+					unreviewed := boolArg(args, "unreviewed")
+					sinceRaw := stringArg(args, "since")
+					if by != "" {
+						// A distribution aggregates every rant; combining it with
+						// a filter would silently discard the filter.
+						if len(tags) > 0 || unreviewed || sinceRaw != "" {
+							return nil, errors.New(domain.CodeRantInvalid + ": --by aggregates every rant and cannot be combined with --tag/--unreviewed/--since")
+						}
+						return rants.CountRants("", by)
+					}
+					since, err := parseRantSince(sinceRaw)
 					if err != nil {
 						return nil, err
 					}
-					by := stringArg(args, "by")
-					if by != "" {
-						return rants.CountRants("", by)
+					tagFilter := ""
+					if len(tags) > 0 {
+						if len(tags) > 1 {
+							return nil, errors.New(domain.CodeRantInvalid + ": rant ls --tag accepts a single tag")
+						}
+						// A tag that normalises to empty (e.g. "---") must not
+						// silently disable the filter and return every rant.
+						if tagFilter = domain.NormaliseRantTag(tags[0]); tagFilter == "" {
+							return nil, errors.New(domain.CodeRantInvalid + ": --tag filter is empty after normalisation")
+						}
 					}
-					return rants.ListRants(domain.RantListOptions{Unreviewed: boolArg(args, "unreviewed"), Since: since})
+					return rants.ListRants(domain.RantListOptions{Unreviewed: unreviewed, Since: since, Tag: tagFilter})
 				case "get":
 					return rants.GetRant(stringArg(args, "selector"))
 				case "review":
@@ -1737,7 +1756,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		"create": {summary: "Create a ticket", safety: SafetyMutate, example: []string{"AIRA ticket", "--kind", "feature", "--severity", "P1", "--body", "body", "--label", "label"}},
 		"rant": {summary: "Capture and review agent friction", safety: SafetyMutate, operations: []OperationSpec{
 			{Name: "capture", Summary: "Capture unfiltered friction", Safety: SafetyMutate, Args: []OperationArg{{Name: "text", Required: true}, {Name: "tags"}, {Name: "severity"}, {Name: "refs"}, {Name: "idempotency_key"}}, Example: []string{"capture", "slow tests wasted a retry", "--tag", "slow-tests"}},
-			{Name: "ls", Summary: "List or aggregate recorded rants", Safety: SafetyRead, Args: []OperationArg{{Name: "by"}, {Name: "unreviewed"}, {Name: "since"}}, Example: []string{"ls", "--unreviewed"}},
+			{Name: "ls", Summary: "List or aggregate recorded rants", Safety: SafetyRead, Args: []OperationArg{{Name: "by"}, {Name: "unreviewed"}, {Name: "since"}, {Name: "tags"}}, Example: []string{"ls", "--unreviewed"}},
 			{Name: "get", Summary: "Read one rant including untrusted prose", Safety: SafetyRead, Args: []OperationArg{{Name: "selector", Required: true}}, Example: []string{"get", "RANT-1"}},
 			{Name: "review", Summary: "Append a review observation", Safety: SafetyMutate, Args: []OperationArg{{Name: "selector", Required: true}, {Name: "outcome"}, {Name: "note"}, {Name: "resolved_by"}}, Example: []string{"review", "RANT-1", "--outcome", "planned"}},
 			{Name: "redact", Summary: "Tombstone a secret-bearing rant body", Safety: SafetyMutate, Args: []OperationArg{{Name: "selector", Required: true}}, Example: []string{"redact", "RANT-1"}},
