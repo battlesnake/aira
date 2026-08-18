@@ -11,10 +11,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"syscall"
 	"time"
 
 	"aira/internal/gitremote"
+
+	"golang.org/x/sys/unix"
 )
 
 const ResolverVersion = "git-files-v1"
@@ -53,16 +54,17 @@ type Options struct {
 }
 
 type Resolver struct {
-	ReadFile func(string) ([]byte, error)
-	// PathGuard rejects a ref whose on-disk path escapes root or traverses a
-	// symlink, so a malicious or unusual repository cannot make the resolver
-	// read an arbitrary file and report its contents as a real hash.
-	PathGuard   func(root, ref string) error
+	// ReadFile reads the fixed metadata files (HEAD, config, packed-refs). Loose
+	// refs, whose sub-path is attacker-influenced, are read separately through
+	// an openat2 no-symlink walk so a malicious or unusual repository cannot
+	// steer a read outside the ref store and have its contents reported as a
+	// real hash.
+	ReadFile    func(string) ([]byte, error)
 	MaxAttempts int
 }
 
 func NewResolver() Resolver {
-	return Resolver{ReadFile: readBoundedRegularFile, PathGuard: guardRefBeneathRoot, MaxAttempts: 6}
+	return Resolver{ReadFile: readBoundedRegularFile, MaxAttempts: 6}
 }
 
 type snapshot struct {
@@ -72,9 +74,6 @@ type snapshot struct {
 func (r Resolver) Resolve(opts Options) GitContext {
 	if r.ReadFile == nil {
 		r.ReadFile = readBoundedRegularFile
-	}
-	if r.PathGuard == nil {
-		r.PathGuard = guardRefBeneathRoot
 	}
 	if r.MaxAttempts < 2 {
 		r.MaxAttempts = 2
@@ -183,18 +182,84 @@ func (r Resolver) readLooseRef(opts Options, ref string) ([]byte, bool, error) {
 		if root == "" {
 			continue
 		}
-		if err := r.PathGuard(root, ref); err != nil {
+		data, found, err := readLooseRefBeneath(root, ref)
+		if err != nil {
 			return nil, false, err
 		}
-		data, err := r.ReadFile(filepath.Join(root, filepath.FromSlash(ref)))
-		if err == nil {
+		if found {
 			return data, true, nil
-		}
-		if !errors.Is(err, os.ErrNotExist) {
-			return nil, false, err
 		}
 	}
 	return nil, false, nil
+}
+
+// readLooseRefBeneath opens ref strictly beneath root with no symlink component
+// followed, using openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS) — which closes
+// the whole class of intermediate-directory symlink swaps a check-then-open
+// walk cannot. A symlink or escape surfaces as a read error (→ unevaluated),
+// never a followed read. On a kernel without openat2 it falls back to a
+// Lstat-walk guard plus an O_NOFOLLOW open.
+func readLooseRefBeneath(root, ref string) ([]byte, bool, error) {
+	dirfd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ENOTDIR) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	defer unix.Close(dirfd)
+	how := &unix.OpenHow{Flags: uint64(unix.O_RDONLY | unix.O_CLOEXEC), Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS}
+	fd, err := unix.Openat2(dirfd, filepath.FromSlash(ref), how)
+	if err != nil {
+		switch {
+		case errors.Is(err, unix.ENOSYS), errors.Is(err, unix.EPERM):
+			return readLooseRefBeneathFallback(root, ref)
+		case errors.Is(err, os.ErrNotExist), errors.Is(err, unix.ENOTDIR):
+			return nil, false, nil
+		default: // ELOOP (symlink), EXDEV (escape), etc. — refuse.
+			return nil, false, err
+		}
+	}
+	file := os.NewFile(uintptr(fd), filepath.Join(root, filepath.FromSlash(ref)))
+	defer file.Close()
+	return readBoundedFromFile(file)
+}
+
+// readLooseRefBeneathFallback is the pre-openat2 path: reject any symlink or
+// out-of-root component with an Lstat walk, then open O_NOFOLLOW. It leaves a
+// narrow check-then-open window an active local attacker could race, which is
+// outside AIRA's machine-local single-user threat model.
+func readLooseRefBeneathFallback(root, ref string) ([]byte, bool, error) {
+	if err := guardRefBeneathRoot(root, ref); err != nil {
+		return nil, false, err
+	}
+	data, err := readBoundedRegularFile(filepath.Join(root, filepath.FromSlash(ref)))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return data, true, nil
+}
+
+func readBoundedFromFile(file *os.File) ([]byte, bool, error) {
+	info, err := file.Stat()
+	if err != nil {
+		return nil, false, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, false, errors.New("not a regular file")
+	}
+	const max = 16 << 20
+	data, err := io.ReadAll(io.LimitReader(file, max+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if len(data) > max {
+		return nil, false, errors.New("file exceeds resolver limit")
+	}
+	return bytes.Clone(data), true, nil
 }
 
 func (r Resolver) readPackedRef(commonDir, ref string, hashLen int) (string, bool, error) {
@@ -286,7 +351,7 @@ func parseConfig(data []byte, readErr error) configSettings {
 		switch {
 		case ((section == "include" || section == "includeif") && key == "path") || key == "include.path":
 			hasInclude = true
-		case section == "extensions" && key == "refstorage":
+		case section == "extensions" && subsection == "" && key == "refstorage":
 			switch strings.ToLower(value) {
 			case "reftable":
 				storage = storageReftable
@@ -295,7 +360,7 @@ func parseConfig(data []byte, readErr error) configSettings {
 			default:
 				storage = storageUnknown
 			}
-		case section == "extensions" && key == "objectformat":
+		case section == "extensions" && subsection == "" && key == "objectformat":
 			switch strings.ToLower(value) {
 			case "sha1":
 				hashLen = 40
@@ -452,7 +517,7 @@ func readBoundedRegularFile(path string) ([]byte, error) {
 	// O_NOFOLLOW closes the last-component symlink race the path guard cannot
 	// (a symlink swapped in after the Lstat); a symlinked final component then
 	// fails to open and is treated as unreadable rather than followed.
-	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	file, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
 	}

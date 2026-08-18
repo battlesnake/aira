@@ -835,6 +835,14 @@ func (s *Store) initDB(ctx context.Context) error {
 		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
 	}
+	// The rant_reviews_no_update trigger gained a redaction exception. A
+	// database created before that carries the old unconditional trigger, which
+	// CREATE ... IF NOT EXISTS will not replace — and which would abort the
+	// note scrub, rolling back redaction of any reviewed rant. Drop the stale
+	// definition first so the loop recreates the current one.
+	if err := s.dropStaleRantReviewTrigger(ctx); err != nil {
+		return err
+	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return translateDBError(err)
@@ -861,6 +869,26 @@ func (s *Store) initDB(ctx context.Context) error {
 		return err
 	}
 	return s.ensureSearchFTS(ctx)
+}
+
+// dropStaleRantReviewTrigger removes a pre-redaction-exception
+// rant_reviews_no_update trigger so the schema loop recreates the current one.
+// The current definition is recognised by its redaction-exception sentinel; a
+// missing trigger or the current definition is left untouched.
+func (s *Store) dropStaleRantReviewTrigger(ctx context.Context) error {
+	var triggerSQL sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='trigger' AND name='rant_reviews_no_update'`).Scan(&triggerSQL)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return translateDBError(err)
+	}
+	if triggerSQL.Valid && strings.Contains(triggerSQL.String, "'"+domain.RedactedRantBody+"'") {
+		return nil
+	}
+	_, err = s.db.ExecContext(ctx, `DROP TRIGGER IF EXISTS rant_reviews_no_update`)
+	return translateDBError(err)
 }
 
 func (s *Store) ensureAreaHintsGeneration(ctx context.Context) error {

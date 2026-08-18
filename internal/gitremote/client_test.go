@@ -897,17 +897,18 @@ func TestMissingSSHHasDistinctCodeBeforeProbe(t *testing.T) {
 }
 
 func TestRedactURLScrubsTokensOnEveryPath(t *testing.T) {
-	const token = "ghp_super_secret_token_zzz"
+	// A realistic GitHub token: prefix plus a long unbroken alphanumeric run.
+	const token = "ghp_" + "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
 	cases := []struct{ name, raw, want string }{
 		{"token-in-https-path", "https://github.com/" + token + "/repo.git", "https://github.com/***/repo.git"},
 		{"scp-token-userinfo", token + "@github.com:owner/repo.git", "***@github.com:owner/repo.git"},
 		{"token-in-ssh-path", "ssh://git@github.com/" + token + "/repo", "ssh://git@github.com/***/repo"},
-		{"pat-in-path", "https://github.com/github_pat_" + strings.Repeat("A", 20) + "/repo.git", "https://github.com/***/repo.git"},
+		{"pat-in-path", "https://github.com/github_pat_" + strings.Repeat("A", 30) + "/repo.git", "https://github.com/***/repo.git"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := RedactURL(tc.raw)
-			if strings.Contains(got, token) || strings.Contains(got, "github_pat_") {
+			if strings.Contains(got, token) || strings.Contains(got, "github_pat_A") {
 				t.Fatalf("token survived: %q -> %q", tc.raw, got)
 			}
 			if got != tc.want {
@@ -918,5 +919,10 @@ func TestRedactURLScrubsTokensOnEveryPath(t *testing.T) {
 	// A bare ssh username is not a credential and must survive redaction.
 	if got := RedactURL("git@github.com:owner/repo.git"); got != "git@github.com:owner/repo.git" {
 		t.Fatalf("bare ssh username over-redacted: %q", got)
+	}
+	// A short lookalike (org/repo literally named ghp_tools) is not a token and
+	// must NOT be over-redacted.
+	if got := RedactURL("https://github.com/ghp_tools/repo.git"); got != "https://github.com/ghp_tools/repo.git" {
+		t.Fatalf("short ghp_ lookalike over-redacted: %q", got)
 	}
 }

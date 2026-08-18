@@ -1,8 +1,10 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,9 +57,16 @@ func TestRantIdempotencyByteIdentityAndGitContext(t *testing.T) {
 	if got.Body != body || got.GitContext != ctx {
 		t.Fatalf("stored identity changed: body=%q context=%#v", got.Body, got.GitContext)
 	}
-	// Every caller-supplied field is a discriminator. A reused key describing a
-	// different caller (actor/session/model) or a different observed context
-	// must conflict, not silently alias the original rant.
+	// Volatile Git state is excluded: a retry after HEAD moved between attempts
+	// is still the same submission and stays idempotent.
+	movedHead := ctx
+	movedHead.HeadHash = gitcontext.Field{Value: strings.Repeat("b", 40), Status: gitcontext.StatusValue}
+	if third, err := s.AddRant(context.Background(), input, movedHead); err != nil || !third.Idempotent || third.Rant.ID != first.Rant.ID {
+		t.Fatalf("moved-HEAD retry not idempotent: %#v err=%v", third, err)
+	}
+	// Every caller-supplied field, plus the stable repository/worktree scope,
+	// is a discriminator: a reused key describing a different caller or a
+	// different location must conflict, not silently alias the original rant.
 	mk := func(mut func(*domain.RantInput)) domain.RantInput {
 		c := input
 		c.Tags = append([]string(nil), input.Tags...)
@@ -65,8 +74,8 @@ func TestRantIdempotencyByteIdentityAndGitContext(t *testing.T) {
 		mut(&c)
 		return c
 	}
-	movedHead := ctx
-	movedHead.HeadHash = gitcontext.Field{Value: strings.Repeat("b", 40), Status: gitcontext.StatusValue}
+	otherWorktree := ctx
+	otherWorktree.WorktreeID = gitcontext.Field{Value: "wt-different", Status: gitcontext.StatusValue}
 	conflicts := []struct {
 		name  string
 		input domain.RantInput
@@ -79,7 +88,7 @@ func TestRantIdempotencyByteIdentityAndGitContext(t *testing.T) {
 		{"actor", mk(func(i *domain.RantInput) { i.Actor = "different-agent" }), ctx},
 		{"session", mk(func(i *domain.RantInput) { i.Session = "sess-2" }), ctx},
 		{"model", mk(func(i *domain.RantInput) { i.Model = "sonnet" }), ctx},
-		{"context", mk(func(i *domain.RantInput) {}), movedHead},
+		{"worktree-scope", mk(func(i *domain.RantInput) {}), otherWorktree},
 	}
 	for _, tc := range conflicts {
 		t.Run("conflicting-"+tc.name, func(t *testing.T) {
@@ -274,6 +283,63 @@ func TestRantRedactErasesEveryProseSurfaceKeepsProvenance(t *testing.T) {
 	}
 	if domain.RedactedRantBody != "[redacted]" {
 		t.Fatalf("sentinel drift: the trigger literal must match domain.RedactedRantBody=%q", domain.RedactedRantBody)
+	}
+	// (6) A redacted rant refuses fresh prose — a new note would re-open a
+	// prose surface — but still accepts structured triage.
+	if _, err := s.ReviewRant(context.Background(), added.Rant.ID, domain.RantReviewInput{Reviewer: "owner", Outcome: domain.RantOutcomeWontFix, Note: "late " + secret}); ErrorCode(err) != domain.CodeRantRedacted {
+		t.Fatalf("note on a redacted rant = %v, want E_RANT_REDACTED", err)
+	}
+	if _, err := s.ReviewRant(context.Background(), added.Rant.ID, domain.RantReviewInput{Reviewer: "owner", Outcome: domain.RantOutcomeWontFix}); err != nil {
+		t.Fatalf("structured triage on a redacted rant rejected: %v", err)
+	}
+	// (7) The secret does not linger as raw bytes in the database or its WAL:
+	// secure_delete overwrote the freed cells and the redaction checkpoint
+	// folded and truncated the WAL.
+	for _, suffix := range []string{"", "-wal"} {
+		raw, err := os.ReadFile(s.dbPath + suffix)
+		if errors.Is(err, os.ErrNotExist) && suffix != "" {
+			continue // WAL truncated away entirely
+		}
+		if err != nil {
+			t.Fatalf("read %s: %v", s.dbPath+suffix, err)
+		}
+		if bytes.Contains(raw, []byte(secret)) {
+			t.Fatalf("secret survived as raw bytes in %s", s.dbPath+suffix)
+		}
+	}
+}
+
+func TestRantRedactWorksAfterUpgradingStaleReviewTrigger(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "repo")
+	s := openRantStore(t, base, root)
+	// Simulate a pre-fix database: swap the current trigger for the old
+	// unconditional one that blocks ANY update to rant_reviews.
+	if _, err := s.db.Exec(`DROP TRIGGER rant_reviews_no_update`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`CREATE TRIGGER rant_reviews_no_update BEFORE UPDATE ON rant_reviews BEGIN SELECT RAISE(ABORT,'rant reviews are append-only'); END`); err != nil {
+		t.Fatal(err)
+	}
+	// Reopening must upgrade the stale trigger so redaction of a reviewed rant
+	// scrubs the note instead of aborting the whole redaction.
+	s2 := openRantStore(t, base, root)
+	added, err := s2.AddRant(context.Background(), domain.RantInput{Body: "secret to scrub", Actor: "terra"}, gitcontext.GitContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s2.ReviewRant(context.Background(), added.Rant.ID, domain.RantReviewInput{Reviewer: "owner", Outcome: domain.RantOutcomePlanned, Note: "a note"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s2.RedactRant(context.Background(), added.Rant.ID); err != nil {
+		t.Fatalf("redaction aborted against a non-upgraded trigger: %v", err)
+	}
+	got, err := s2.GetRant(added.Rant.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Reviews) != 1 || got.Reviews[0].Note != domain.RedactedRantBody {
+		t.Fatalf("note not scrubbed after trigger upgrade: %#v", got.Reviews)
 	}
 }
 

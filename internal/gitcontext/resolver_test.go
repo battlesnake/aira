@@ -221,6 +221,45 @@ func TestResolveHeadUnevaluatedWhenStorageOrFormatUnknown(t *testing.T) {
 		}
 		assertField(t, NewResolver().Resolve(opts).HeadHash, unevaluatedField("unknown-object-format"))
 	})
+	// extensions.objectFormat is only valid in the bare [extensions] section; a
+	// bogus [extensions "x"] must not override it and downgrade the hash width.
+	t.Run("extensions-subsection-cannot-override-format", func(t *testing.T) {
+		opts := repositoryFixture(t, strings.Repeat("a", 40)+"\n", nil, "")
+		config := "[extensions]\n objectFormat = sha256\n[extensions \"x\"]\n objectFormat = sha1\n"
+		if err := os.WriteFile(filepath.Join(opts.CommonDir, "config"), []byte(config), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		assertField(t, NewResolver().Resolve(opts).HeadHash, unevaluatedField("unusual-head"))
+	})
+}
+
+// TestReadLooseRefBeneathFallbackRejectsSymlink covers the pre-openat2 path
+// directly, since modern kernels take the openat2 branch in the resolver tests.
+func TestReadLooseRefBeneathFallbackRejectsSymlink(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "refs", "heads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	planted := filepath.Join(t.TempDir(), "planted")
+	if err := os.WriteFile(planted, []byte(strings.Repeat("e", 40)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(planted, filepath.Join(root, "refs", "heads", "main")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	if _, found, err := readLooseRefBeneathFallback(root, "refs/heads/main"); err == nil {
+		t.Fatalf("fallback followed a symlinked ref (found=%v)", found)
+	}
+	if err := os.Remove(filepath.Join(root, "refs", "heads", "main")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "refs", "heads", "main"), []byte(strings.Repeat("a", 40)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data, found, err := readLooseRefBeneathFallback(root, "refs/heads/main")
+	if err != nil || !found || strings.TrimSpace(string(data)) != strings.Repeat("a", 40) {
+		t.Fatalf("fallback regular read = %q found=%v err=%v", data, found, err)
+	}
 }
 
 func repositoryFixture(t *testing.T, head string, loose map[string]string, packed string) Options {

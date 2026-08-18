@@ -926,7 +926,10 @@ var (
 	// so a bare ssh username (ssh://git@host) stays in the honest URL.
 	httpsUserinfoPattern = regexp.MustCompile(`(?i)(https?://)[^/@\s]+@`)
 	otherUserinfoPattern = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://)[^/@\s]*:[^/@\s]*@`)
-	tokenPattern         = regexp.MustCompile(`(?i)(github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|Bearer[ \t]+[A-Za-z0-9._~+/=-]+|password=[^\s]+)`)
+	// Length/format-aware so real tokens (ghX_ + a long unbroken run; a long
+	// github_pat_ body) are scrubbed while short lookalikes such as an org or
+	// repo named "ghp_tools" are not over-redacted.
+	tokenPattern = regexp.MustCompile(`(?i)(github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{16,}|Bearer[ \t]+[A-Za-z0-9._~+/=-]+|password=[^\s]+)`)
 )
 
 // RedactURL removes credential-bearing URL components while retaining enough

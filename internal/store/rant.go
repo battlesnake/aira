@@ -182,10 +182,18 @@ func (s *Store) ReviewRant(ctx context.Context, id string, input domain.RantRevi
 	}
 	var result RantReviewResult
 	err := s.withImmediate(ctx, func(conn *sql.Conn) error {
-		if exists, err := s.rantExistsConn(ctx, conn, id); err != nil {
-			return err
-		} else if !exists {
+		var redacted int
+		switch err := conn.QueryRowContext(ctx, `SELECT redacted FROM rants WHERE project_id=? AND id=?`, s.projectID, id).Scan(&redacted); {
+		case errors.Is(err, sql.ErrNoRows):
 			return errors.New("E_NOT_FOUND: rant not found")
+		case err != nil:
+			return err
+		}
+		// A redacted rant has had all its free text scrubbed; a new review note
+		// would re-introduce a prose surface on it. Structured triage
+		// (outcome/resolved) is still allowed, but prose is refused.
+		if redacted != 0 && input.Note != "" {
+			return errors.New(domain.CodeRantRedacted + ": cannot add a note to a redacted rant")
 		}
 		var resolvedKind, resolvedID any
 		if input.ResolvedBy != nil {
@@ -244,6 +252,11 @@ func (s *Store) RedactRant(ctx context.Context, id string) (EventKey, error) {
 		// deliberately retained; only free text is scrubbed. The append-only
 		// review triggers permit exactly this note→sentinel update and nothing
 		// else.
+		// FTS5 secure-delete makes the index delete overwrite its term bytes
+		// rather than leave a tombstone over live segment data.
+		if _, err := conn.ExecContext(ctx, `INSERT INTO search_fts(search_fts,rank) VALUES('secure-delete',1)`); err != nil {
+			return err
+		}
 		if _, err := conn.ExecContext(ctx, `DELETE FROM search_fts WHERE project_id=? AND kind='rant' AND ref_id=?`, s.projectID, id); err != nil {
 			return err
 		}
@@ -263,6 +276,11 @@ func (s *Store) RedactRant(ctx context.Context, id string) (EventKey, error) {
 	if err != nil {
 		return EventKey{}, err
 	}
+	// Fold the secure_delete'd frames from the WAL into the main database and
+	// truncate the WAL so the scrubbed bytes do not linger in stale frames.
+	// Best-effort: a busy checkpoint (another reader holding the WAL) leaves the
+	// data committed and already overwritten in place, only not yet consolidated.
+	_, _ = s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
 	return event, s.journalEvent(ctx, event.ProjectID, event.Seq)
 }
 
@@ -413,11 +431,10 @@ func (s *Store) findRantByIdempotency(ctx context.Context, conn *sql.Conn, key s
 
 // sameRantInput decides whether a reused idempotency key describes the very
 // same call. It compares every caller-supplied field — not just the content:
-// a different actor, session, or model, or a different observed git context,
+// a different actor, session, or model, or a different stable repository scope,
 // is a distinct caller and must conflict rather than silently return the
-// original rant. The envelope timestamps (observed_at/received_at) and the
-// resolver version are excluded because they vary between an honest retry and
-// its original without changing the caller's intent.
+// original rant. Volatile derived Git state (HEAD, ref, remote) and the
+// envelope timestamps are excluded so an honest retry stays idempotent.
 func sameRantInput(rant domain.Rant, input domain.RantInput, observed gitcontext.GitContext) bool {
 	if rant.Body != input.Body || rant.Severity != input.Severity ||
 		rant.Actor != input.Actor || rant.Session != input.Session || rant.Model != input.Model ||
@@ -437,9 +454,13 @@ func sameRantInput(rant domain.Rant, input domain.RantInput, observed gitcontext
 	return sameGitContextSemantics(rant.GitContext, observed)
 }
 
+// sameGitContextSemantics compares only the STABLE repository/worktree scope,
+// not volatile derived Git state (HEAD hash/ref, remote URL). An honest retry
+// after HEAD moves between attempts is still the same submission and stays
+// idempotent; a reuse from a different worktree/repository is a genuine
+// collision and conflicts.
 func sameGitContextSemantics(a, b gitcontext.GitContext) bool {
-	return a.RepoRoot == b.RepoRoot && a.WorktreePath == b.WorktreePath && a.WorktreeID == b.WorktreeID &&
-		a.HeadHash == b.HeadHash && a.HeadRef == b.HeadRef && a.RemoteURL == b.RemoteURL
+	return a.RepoRoot == b.RepoRoot && a.WorktreePath == b.WorktreePath && a.WorktreeID == b.WorktreeID
 }
 
 func (s *Store) validateRantRefConn(ctx context.Context, conn *sql.Conn, ref domain.RantRef) error {
@@ -469,12 +490,6 @@ func (s *Store) validateRantRefConn(ctx context.Context, conn *sql.Conn, ref dom
 		return errors.New(domain.CodeRantRefInvalid + ": reference does not exist in this project")
 	}
 	return nil
-}
-
-func (s *Store) rantExistsConn(ctx context.Context, conn *sql.Conn, id string) (bool, error) {
-	var exists int
-	err := conn.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM rants WHERE project_id=? AND id=?)`, s.projectID, id).Scan(&exists)
-	return exists != 0, err
 }
 
 func (s *Store) sharingRecordedTags(ctx context.Context, current string, tags []string) ([]RantTagOutcome, error) {
