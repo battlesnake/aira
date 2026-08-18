@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -546,20 +547,59 @@ func TestStoreFreeCarvedDispatchUsesEnsureScopeWithoutOpeningClientStore(t *test
 	}
 }
 
-func TestTelemetryValuedRunStaysOnWritableClientPath(t *testing.T) {
+func TestStoreTouchingCarvedDispatchUsesReadOnlyClientAndRelaysCommandWrite(t *testing.T) {
 	dispatcher, scope, stateHome := storeFreeDispatcherFixture(t)
-	dispatcher.storeOpExchange = func(context.Context, string, daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
-		t.Fatal("telemetry-valued run issued ensure-scope")
-		return daemon.ResponseFrame{}, nil
+	db, err := store.OpenDB(dispatcher.paths.DBPath, dispatcher.paths.RegistryPath)
+	if err != nil {
+		t.Fatal(err)
 	}
-	request := core.Request{Verb: "run", Args: map[string]any{
-		"argv": []string{"/bin/true"}, "no_admit": true, "report": "go-json",
-	}}
-	_ = dispatcher.Dispatch(context.Background(), scope, request)
-	for _, name := range []string{"state.db", "registry.jsonl"} {
-		if _, err := os.Stat(filepath.Join(stateHome, "aira", name)); err != nil {
-			t.Fatalf("telemetry-valued run did not use writable path (%s): %v", name, err)
+	defer db.Close()
+	var view *store.Store
+	var ops []string
+	dispatcher.storeOpExchange = func(_ context.Context, _ string, frame daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
+		ops = append(ops, frame.Op)
+		switch frame.Op {
+		case "ensure-scope":
+			var scopeErr error
+			view, scopeErr = store.NewScope(db, store.ScopeOptions{
+				Root: frame.Scope.Root, CommonDir: frame.Scope.CommonDir, GitDir: frame.Scope.GitDir,
+				ProjectID: frame.Scope.ProjectID, WorktreeID: frame.Scope.WorktreeID,
+				ProjectSlug: frame.Scope.Slug, Prefixes: frame.Scope.Prefixes, ConfigDigest: frame.Scope.ConfigDigest,
+			})
+			if scopeErr != nil {
+				t.Fatal(scopeErr)
+			}
+			return daemon.ResponseFrame{OK: true, Code: "OK"}, nil
+		case "add-command-event":
+			data, marshalErr := json.Marshal(store.CommandEventAddResult{ID: "CMD-relayed", Event: domain.CommandEvent{ID: "CMD-relayed"}})
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			return daemon.ResponseFrame{OK: true, Code: "OK", Data: data}, nil
+		default:
+			t.Fatalf("unexpected store op %+v", frame)
+			return daemon.ResponseFrame{}, nil
 		}
+	}
+	response := dispatcher.Dispatch(context.Background(), scope, core.Request{Verb: "time", Args: map[string]any{
+		"argv": []string{"/bin/true"}, "no_prefix": true,
+	}})
+	if !response.OK || len(ops) != 2 || ops[0] != "ensure-scope" || ops[1] != "add-command-event" {
+		t.Fatalf("response=%+v ops=%v", response, ops)
+	}
+	if view == nil {
+		t.Fatal("daemon scope was not established")
+	}
+	rows, err := view.ListCommandEvents("")
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("foreground client wrote command rows=%+v err=%v", rows, err)
+	}
+	registry, err := os.ReadFile(filepath.Join(stateHome, "aira", "registry.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lines := strings.Count(strings.TrimSpace(string(registry)), "\n") + 1; lines != 1 {
+		t.Fatalf("client registered locally; registry lines=%d", lines)
 	}
 }
 
@@ -642,6 +682,72 @@ func TestEnsureScopeFrameReplacesOlderProtocolDaemon(t *testing.T) {
 	case <-older.done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("older protocol daemon was not stopped for ensure-scope replacement")
+	}
+}
+
+func TestStoreWriteOpReplacesProtoThreeDaemonAndRetries(t *testing.T) {
+	dispatcher := autoStartDispatcher(t)
+	older := startProtocolDaemonProcess(t)
+	root, scope := writeStoreFreeProject(t, dispatcher.paths)
+	t.Chdir(root)
+	db, err := store.OpenDB(dispatcher.paths.DBPath, dispatcher.paths.RegistryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := store.NewScope(db, store.ScopeOptions{
+		Root: scope.Root, CommonDir: scope.CommonDir, GitDir: scope.GitDir,
+		ProjectID: scope.ProjectID, WorktreeID: scope.WorktreeID, ProjectSlug: scope.Slug,
+		Prefixes: scope.Prefixes, ConfigDigest: scope.ConfigDigest,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var exchanges atomic.Int32
+	dispatcher.storeOpExchange = func(_ context.Context, _ string, frame daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
+		switch exchanges.Add(1) {
+		case 1:
+			if frame.Op != "ensure-scope" {
+				t.Fatalf("first op=%q", frame.Op)
+			}
+			return daemon.ResponseFrame{OK: true, Code: "OK"}, nil
+		case 2:
+			if frame.Op != "add-command-event" {
+				t.Fatalf("second op=%q", frame.Op)
+			}
+			return daemon.ResponseFrame{Proto: 3, Code: daemon.CodeProtocol, Error: daemon.CodeProtocol + ": daemon protocol is 3"}, nil
+		default:
+			data, marshalErr := json.Marshal(store.CommandEventAddResult{ID: "CMD-relayed", Event: domain.CommandEvent{ID: "CMD-relayed"}})
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			return daemon.ResponseFrame{OK: true, Code: "OK", Data: data}, nil
+		}
+	}
+	response := dispatcher.Dispatch(context.Background(), scope, core.Request{Verb: "time", Args: map[string]any{"argv": []string{"/bin/true"}, "no_prefix": true}})
+	if !response.OK || exchanges.Load() != 3 {
+		t.Fatalf("response=%+v exchanges=%d", response, exchanges.Load())
+	}
+	select {
+	case <-older.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("proto-3 daemon was not replaced for v4 write op")
+	}
+}
+
+func TestStoreTouchingEnsureScopeConflictPreventsExecution(t *testing.T) {
+	dispatcher, scope, _ := storeFreeDispatcherFixture(t)
+	dispatcher.storeOpExchange = func(context.Context, string, daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
+		return daemon.ResponseFrame{Code: "E_PREFIX_OWNERSHIP_CONFLICT", Error: "E_PREFIX_OWNERSHIP_CONFLICT: owned by another project", Exit: 1}, nil
+	}
+	marker := filepath.Join(scope.Root, "must-not-run")
+	response := dispatcher.Dispatch(context.Background(), scope, core.Request{Verb: "time", Args: map[string]any{
+		"argv": []string{"/usr/bin/touch", marker}, "no_prefix": true,
+	}})
+	if response.Code != "E_PREFIX_OWNERSHIP_CONFLICT" || response.Exit != 1 {
+		t.Fatalf("response=%+v", response)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("time ran after ensure-scope conflict: %v", err)
 	}
 }
 
@@ -818,6 +924,71 @@ func TestStoreFreeRealCLIRegistersOnlyThroughDaemon(t *testing.T) {
 		t.Fatalf("run-log response = %+v", response)
 	}
 	_ = invoke(5, "run-kill", runID)
+}
+
+func TestD7bRealCLIStoreTouchingVerbsRelayThroughDaemon(t *testing.T) {
+	if os.Getenv("AIRA_REAL_SOCKET") != "1" {
+		t.Skip("real Unix-socket D7b e2e requires AIRA_REAL_SOCKET=1")
+	}
+	root := t.TempDir()
+	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".aira"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := `{"schema":1,"project":{"slug":"demo","prefixes":["AIRA"]},"lease":{"ttl_seconds":900,"heartbeat_seconds":30}}`
+	if err := os.WriteFile(filepath.Join(root, ".aira", "config"), []byte(config+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(root)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	t.Setenv("XDG_RUNTIME_DIR", shortRuntimeDir(t))
+	paths, err := daemon.PathsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	startCommandDaemon(t, daemon.NewServer(paths))
+	invoke := func(argv ...string) (int, string, string) {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		exit := runWithInput(append([]string{argv[0], "--json"}, argv[1:]...), &stdout, &stderr, strings.NewReader(""))
+		return exit, stdout.String(), stderr.String()
+	}
+	if exit, stdout, stderr := invoke("time", "--no-prefix", "--", "/bin/true"); exit != 0 {
+		t.Fatalf("time exit=%d stdout=%q stderr=%q", exit, stdout, stderr)
+	}
+	reportScript := `printf '%s\n' '{"Action":"run","Package":"pkg","Test":"TestOne"}' '{"Action":"pass","Package":"pkg","Test":"TestOne","Elapsed":0.1}' '{"Action":"pass","Package":"pkg","Elapsed":0.1}'`
+	if exit, stdout, stderr := invoke("run", "--no-admit", "--report", "go-json", "--suite", "unit", "--shard", "1/1", "--", "/bin/sh", "-c", reportScript); exit != 0 {
+		t.Fatalf("run --report exit=%d stdout=%q stderr=%q", exit, stdout, stderr)
+	}
+	if exit, stdout, stderr := invoke("reconcile"); exit != 0 {
+		t.Fatalf("reconcile exit=%d stdout=%q stderr=%q", exit, stdout, stderr)
+	}
+	if exit, stdout, _ := invoke("gate", "run", "missing"); exit == 0 || !strings.Contains(stdout, "E_NOT_FOUND") {
+		t.Fatalf("gate run missing exit=%d stdout=%q", exit, stdout)
+	}
+	db, err := sql.Open("sqlite", paths.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for table, wantAtLeast := range map[string]int{"command_events": 1, "test_reports": 1} {
+		var count int
+		if err := db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count < wantAtLeast {
+			t.Fatalf("%s rows=%d want at least %d", table, count, wantAtLeast)
+		}
+	}
+	registry, err := os.ReadFile(paths.RegistryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lines := strings.Count(strings.TrimSpace(string(registry)), "\n") + 1; lines != 4 {
+		t.Fatalf("registry lines=%d want exactly four daemon handshakes; a writable client open would add registrations", lines)
+	}
 }
 
 type responseParityPayload struct {

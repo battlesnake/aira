@@ -27,6 +27,7 @@ const nilReportBodyMarker byte = 0
 type TestReportStoreOpPayload struct {
 	Input      domain.TestReportInput `json:"input"`
 	RawPresent bool                   `json:"raw_present"`
+	RawEmpty   bool                   `json:"raw_empty,omitempty"`
 }
 
 type ReconcileStoreOpPayload struct {
@@ -105,11 +106,12 @@ func encodeStoreOpPayload(value any) (json.RawMessage, error) {
 func NewAddTestReportStoreOp(scope WorktreeScope, input domain.TestReportInput) (StoreOpFrame, error) {
 	rawPresent := input.Raw != nil
 	body := append([]byte(nil), input.Raw...)
+	rawEmpty := rawPresent && len(body) == 0
 	input.Raw = nil
-	if !rawPresent {
+	if !rawPresent || rawEmpty {
 		body = []byte{nilReportBodyMarker}
 	}
-	payload, err := encodeStoreOpPayload(TestReportStoreOpPayload{Input: input, RawPresent: rawPresent})
+	payload, err := encodeStoreOpPayload(TestReportStoreOpPayload{Input: input, RawPresent: rawPresent, RawEmpty: rawEmpty})
 	if err != nil {
 		return StoreOpFrame{}, err
 	}
@@ -188,8 +190,18 @@ func runStoreOp(ctx context.Context, view *store.Store, frame StoreOpFrame) (any
 			return nil, err
 		}
 		if payload.RawPresent {
-			payload.Input.Raw = append([]byte(nil), frame.Body...)
+			if payload.RawEmpty {
+				if len(frame.Body) != 1 || frame.Body[0] != nilReportBodyMarker {
+					return nil, errors.New(CodeProtocol + ": invalid empty report body marker")
+				}
+				payload.Input.Raw = []byte{}
+			} else {
+				payload.Input.Raw = append([]byte(nil), frame.Body...)
+			}
 		} else {
+			if payload.RawEmpty {
+				return nil, errors.New(CodeProtocol + ": nil report cannot declare raw_empty")
+			}
 			if len(frame.Body) != 1 || frame.Body[0] != nilReportBodyMarker {
 				return nil, errors.New(CodeProtocol + ": invalid nil report body marker")
 			}

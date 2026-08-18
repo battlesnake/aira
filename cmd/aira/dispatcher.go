@@ -135,13 +135,54 @@ func (d *daemonDispatcher) dispatchClient(ctx context.Context, scope daemon.Work
 		}
 		return d.dispatchCarved(ctx, request, core.StoreGuard(), project)
 	}
-	s, project, err := app.OpenWithDiagnostics(ctx, scope.Root, d.diagnostics)
+	frame := daemon.StoreOpFrame{Proto: daemon.ProtocolVersion, Scope: scope, Op: "ensure-scope"}
+	response, err := d.exchangeWithReplacement(ctx, func(ctx context.Context) (daemon.ResponseFrame, error) {
+		return d.exchangeOrStartStoreOp(ctx, frame)
+	})
+	if err != nil {
+		return transportErrorResponse(err)
+	}
+	if !response.OK {
+		return response.CoreResponse()
+	}
+	project, err := app.Discover(ctx, scope.Root)
 	if err != nil {
 		code := store.ErrorCode(err)
 		return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
 	}
-	defer s.Close()
-	return d.dispatchCarved(ctx, request, s, project)
+	if err := validateProjectSnapshot(project, scope, d.paths); err != nil {
+		code := store.ErrorCode(err)
+		return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+	}
+	project, err = app.BuildWithoutStore(project, d.diagnostics)
+	if err != nil {
+		code := store.ErrorCode(err)
+		return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+	}
+	readScope := scope
+	readScope.ReviewPolicy.Configured = readScope.ReviewConfigured
+	readOnly, err := store.OpenReadOnly(filepath.Join(project.StateDir, "state.db"), store.ScopeOptions{
+		Root: readScope.Root, CommonDir: readScope.CommonDir, GitDir: readScope.GitDir,
+		ProjectID: readScope.ProjectID, WorktreeID: readScope.WorktreeID, ProjectSlug: readScope.Slug,
+		Prefixes: readScope.Prefixes, RequirementPrefixes: readScope.RequirementPrefixes, ReviewPolicy: readScope.ReviewPolicy,
+		LeaseTTLNS: readScope.LeaseTTLNS, MaxReports: readScope.MaxReports, MaxAgeDays: readScope.MaxAgeDays,
+		MaxComputeEvents: readScope.MaxComputeEvents, MaxComputeAgeDays: readScope.MaxComputeAgeDays,
+		MaxCommandEvents: readScope.MaxCommandEvents, MaxCommandAgeDays: readScope.MaxCommandAgeDays,
+		MaxQuotaSnapshots: readScope.MaxQuotaSnapshots, ConfigDigest: readScope.ConfigDigest,
+	})
+	if err != nil {
+		code := store.ErrorCode(err)
+		return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+	}
+	defer readOnly.Close()
+	relay := newWriteRelayStore(readOnly, scope, func(ctx context.Context, frame daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
+		return d.exchangeWithReplacement(ctx, func(ctx context.Context) (daemon.ResponseFrame, error) {
+			return d.exchangeOrStartStoreOp(ctx, frame)
+		})
+	})
+	relay.SetRunner(project.Runner)
+	project.Runner.SetSupervisorLeaseReader(readOnly.SupervisorLeaseLive)
+	return d.dispatchCarved(ctx, request, relay, project)
 }
 
 func validateProjectSnapshot(project app.Project, scope daemon.WorktreeScope, paths daemon.Paths) error {
@@ -386,6 +427,9 @@ func (d *inProcessDispatcher) Dispatch(ctx context.Context, scope daemon.Worktre
 		}
 		return core.Response{OK: true, Code: "OK", Data: result}
 	}
+	// This test-only substrate has no daemon transport to relay through. Keep its
+	// private in-process store so parity tests can compare against production;
+	// no production fallback reaches this dispatcher.
 	s, project, err := app.OpenWithDiagnostics(ctx, scope.Root, d.diagnostics)
 	if err != nil {
 		code := store.ErrorCode(err)

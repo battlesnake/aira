@@ -74,6 +74,9 @@ func TestOpenReadOnlyDoesNotRegisterReadsWALAndRejectsWritesLoudly(t *testing.T)
 	}); err == nil {
 		t.Fatal("read-only AddCommandEvent succeeded")
 	}
+	if _, err := ro.Check(context.Background()); err == nil {
+		t.Fatal("read-only Check succeeded even though check refreshes projections")
+	}
 	if rows, err := writer.ListCommandEvents(""); err != nil || len(rows) != 1 {
 		t.Fatalf("read-only write changed rows=%+v err=%v", rows, err)
 	}

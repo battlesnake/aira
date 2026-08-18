@@ -7,10 +7,40 @@ import (
 	"strings"
 	"testing"
 
+	"aira/internal/core"
 	"aira/internal/daemon"
 	"aira/internal/domain"
+	"aira/internal/runner"
 	"aira/internal/store"
 )
+
+type relayRecordingRunner struct {
+	reconciles int
+}
+
+func (*relayRecordingRunner) Launch(_ context.Context, request runner.Request) (*runner.RunRecord, error) {
+	exit, peak := 0, int64(123)
+	return &runner.RunRecord{
+		ID: "RUN-relay", Status: runner.StatusExited, ExitCode: &exit,
+		StartedAt: "2026-08-18T10:00:00Z", EndedAt: "2026-08-18T10:00:01Z",
+		CaptureComplete: true, TerminalComplete: true, EnvDigest: "env", PeakRSS: &peak,
+		Tool: request.Tool, Ticket: request.Ticket, Phase: request.Phase,
+	}, nil
+}
+func (*relayRecordingRunner) Kill(context.Context, string, bool) (*runner.RunRecord, error) {
+	return nil, nil
+}
+func (*relayRecordingRunner) Get(string) (*runner.RunRecord, error) { return nil, nil }
+func (*relayRecordingRunner) ReadOutput(context.Context, runner.OutputRequest) (*runner.OutputChunk, error) {
+	raw := "{\"Action\":\"run\",\"Package\":\"pkg\",\"Test\":\"TestOne\"}\n" +
+		"{\"Action\":\"pass\",\"Package\":\"pkg\",\"Test\":\"TestOne\",\"Elapsed\":0.1}\n" +
+		"{\"Action\":\"pass\",\"Package\":\"pkg\",\"Elapsed\":0.1}\n"
+	return &runner.OutputChunk{RunID: "RUN-relay", Bytes: []byte(raw), Complete: true}, nil
+}
+func (r *relayRecordingRunner) Reconcile(context.Context) ([]runner.RunRecord, error) {
+	r.reconciles++
+	return nil, nil
+}
 
 func relayStoreFixture(t *testing.T) (*store.Store, daemon.WorktreeScope) {
 	t.Helper()
@@ -150,4 +180,78 @@ func TestWriteRelayStoreRejectsFailedOrMalformedResponses(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestStoreTouchingCarvedVerbCompletenessUsesExpectedRelayOps(t *testing.T) {
+	ro, scope := relayStoreFixture(t)
+	var frames []daemon.StoreOpFrame
+	relay := newWriteRelayStore(ro, scope, func(_ context.Context, frame daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
+		frames = append(frames, frame)
+		var result any
+		switch frame.Op {
+		case "add-test-report":
+			result = daemon.RelayedTestReportResult{ReportID: "TR-1", Suite: domain.TestReport{Commit: "abc", SuiteID: "unit", Config: "cfg", EnvDigest: "env", Shard: "1/1"}, ParserComplete: true, Counts: daemon.TestReportCounts{Pass: 1}}
+		case "add-compute-event":
+			result = store.ComputeEventAddResult{ID: "CE-1", Event: domain.ComputeEvent{ID: "CE-1", Conservation: domain.ConservationUnevaluated}}
+		case "add-command-event":
+			result = store.CommandEventAddResult{ID: "CMD-1", Event: domain.CommandEvent{ID: "CMD-1"}}
+		case "reconcile":
+			result = daemon.RelayedReconcileResult{Verdict: "pass"}
+		case "check":
+			result = store.CheckReport{Verdict: "pass", Dimensions: map[string]string{"rebuild-integrity": "pass"}}
+		default:
+			t.Fatalf("unexpected op %q", frame.Op)
+		}
+		data, err := json.Marshal(result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return daemon.ResponseFrame{OK: true, Code: "OK", Data: data}, nil
+	})
+	execution := &relayRecordingRunner{}
+	relay.SetRunner(execution)
+	dispatch := core.NewWithRunner(relay, execution)
+	tests := []struct {
+		name    string
+		request core.Request
+		ops     []string
+	}{
+		{name: "run report", request: core.Request{Verb: "run", Args: map[string]any{"argv": []string{"true"}, "report": "go-json", "suite": "unit", "shard": "1/1"}}, ops: []string{"add-test-report"}},
+		{name: "run compute", request: core.Request{Verb: "run", Args: map[string]any{"argv": []string{"true"}, "tool": "gpt"}}, ops: []string{"add-compute-event"}},
+		{name: "time command", request: core.Request{Verb: "time", Args: map[string]any{"argv": []string{"/bin/true"}, "no_prefix": true}}, ops: []string{"add-command-event"}},
+		{name: "reconcile rebuild", request: core.Request{Verb: "reconcile", Args: map[string]any{"rebuild": true}}, ops: []string{"reconcile", "reconcile"}},
+		{name: "check is write", request: core.Request{Verb: "check", Args: map[string]any{}}, ops: []string{"check"}},
+		{name: "gate run file ledger only", request: core.Request{Verb: "gate", Args: map[string]any{"subverb": "run", "gate_id": "missing"}}},
+		{name: "gate canary file ledger only", request: core.Request{Verb: "gate", Args: map[string]any{"subverb": "canary-run", "canary_id": "missing"}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			canonical, route := core.ClassifyRequest(test.request)
+			if route != core.RouteClient || core.StoreFreeCarved(canonical, test.request.Args) {
+				t.Fatalf("fixture classification canonical=%s route=%v", canonical, route)
+			}
+			before := len(frames)
+			_ = dispatch.Do(context.Background(), test.request)
+			got := frames[before:]
+			if len(got) != len(test.ops) {
+				t.Fatalf("ops=%v want=%v", opNames(got), test.ops)
+			}
+			for index, want := range test.ops {
+				if got[index].Op != want {
+					t.Fatalf("ops=%v want=%v", opNames(got), test.ops)
+				}
+			}
+		})
+	}
+	if execution.reconciles != 2 {
+		t.Fatalf("local runner reconcile calls=%d, want reconcile+check exactly once each", execution.reconciles)
+	}
+}
+
+func opNames(frames []daemon.StoreOpFrame) []string {
+	result := make([]string, len(frames))
+	for index := range frames {
+		result[index] = frames[index].Op
+	}
+	return result
 }

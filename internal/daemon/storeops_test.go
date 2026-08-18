@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"aira/internal/domain"
+	"aira/internal/runner"
 	"aira/internal/store"
 )
 
@@ -128,6 +129,28 @@ func TestNilRawReportUsesExplicitNonemptyMarker(t *testing.T) {
 	})
 	if !response.OK {
 		t.Fatalf("metadata-only response = %+v", response)
+	}
+}
+
+func TestReportBodyBoundaryUsesRawBytesAndMetadataMarker(t *testing.T) {
+	for _, size := range []int64{runner.DefaultReportMaxBytes - 1, runner.DefaultReportMaxBytes} {
+		raw := make([]byte, int(size))
+		frame, err := NewAddTestReportStoreOp(WorktreeScope{}, domain.TestReportInput{Raw: raw})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if frame.BodyLen != uint64(size) || len(frame.Body) != int(size) {
+			t.Fatalf("size=%d frame body_len=%d bytes=%d", size, frame.BodyLen, len(frame.Body))
+		}
+	}
+	// Capture at report_max_bytes+1 is dropped by runner/core before relay. The
+	// resulting metadata-only report still has an explicit non-zero envelope.
+	frame, err := NewAddTestReportStoreOp(WorktreeScope{}, domain.TestReportInput{Raw: nil})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frame.BodyLen != 1 || len(frame.Body) != 1 {
+		t.Fatalf("metadata-only frame body_len=%d bytes=%d", frame.BodyLen, len(frame.Body))
 	}
 }
 
