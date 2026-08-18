@@ -105,14 +105,7 @@ func runTimedCommand(parent context.Context, argv []string, cwd string, env []st
 				if timeout > 0 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 					return timedCommandResult{Status: domain.CommandTimeout, Signal: "KILL", WallMS: &wall, Exit: 124}
 				}
-				// Short-form to match the timeout branch's "KILL" and the fixtures
-				// (SIGKILL→KILL, SIGTERM→TERM) so one signal is one population, not
-				// two, in command_events rows and any future signal aggregation.
-				name := strings.TrimPrefix(unix.SignalName(sig), "SIG")
-				if name == "" {
-					name = strings.TrimPrefix(strings.ToUpper(sig.String()), "SIG")
-				}
-				return timedCommandResult{Status: domain.CommandSignalled, Signal: name, WallMS: &wall, Exit: 128 + int(sig)}
+				return timedCommandResult{Status: domain.CommandSignalled, Signal: shortSignalName(unix.SignalName(sig), sig.String()), WallMS: &wall, Exit: 128 + int(sig)}
 			}
 			code := int64(wait.ExitStatus())
 			return timedCommandResult{Status: domain.CommandExited, ExitCode: &code, WallMS: &wall, Exit: int(code)}
@@ -122,6 +115,19 @@ func runTimedCommand(parent context.Context, argv []string, cwd string, env []st
 		return timedCommandResult{Status: domain.CommandTimeout, Signal: "KILL", WallMS: &wall, Exit: 124}
 	}
 	return timedCommandResult{Status: domain.CommandUnknown, WallMS: &wall, Exit: 3}
+}
+
+// shortSignalName renders a signal in the short convention (SIGTERM→TERM,
+// SIGKILL→KILL) matching the timeout branch's "KILL" and the fixtures, so one
+// signal is one population. `named` is unix.SignalName(sig) (may be empty for a
+// realtime/unnamed signal); only it is SIG-stripped. The `fallback`
+// (sig.String(), e.g. "signal 34") is NOT stripped — trimming it would mangle
+// "SIGNAL 34" into "NAL 34".
+func shortSignalName(named, fallback string) string {
+	if named != "" {
+		return strings.TrimPrefix(named, "SIG")
+	}
+	return strings.ToUpper(fallback)
 }
 
 func commandEventFromInput(input domain.CommandEventInput) domain.CommandEvent {

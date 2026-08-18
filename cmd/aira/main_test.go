@@ -105,9 +105,11 @@ func TestTimeCLIParsingBuildsCarvedRequestAndPreservesTargetTokens(t *testing.T)
 	if _, j := removeJSON([]string{"time", "--json", "--", "gh", "pr", "list"}); !j {
 		t.Fatal("time leading --json should select the JSON face")
 	}
-	// `run` keeps its established post-delimiter --json behaviour — the fix must not regress it.
-	if _, j := removeJSON([]string{"run", "--", "foo", "--json"}); !j {
-		t.Fatal("run target --json should still select the JSON face")
+	// `run` keeps its established post-delimiter --json behaviour — the fix must
+	// not regress it: it selects the JSON face AND leaves the target's --json in
+	// the child argv (it is the child's flag too).
+	if s, j := removeJSON([]string{"run", "--", "foo", "--json"}); !j || !reflect.DeepEqual(s, []string{"run", "--", "foo", "--json"}) {
+		t.Fatalf("run target --json: json=%v stripped=%#v", j, s)
 	}
 	if _, _, err := parseArgs("time", []string{"go", "test"}); err == nil {
 		t.Fatal("time accepted missing delimiter")

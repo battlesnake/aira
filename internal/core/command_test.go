@@ -293,3 +293,18 @@ func TestTimeAndCommandsDescriptorsAndRouting(t *testing.T) {
 func commandTestInt64(value int64) *int64 { return &value }
 
 var _ = bytes.Buffer{}
+
+func TestShortSignalNameStripsSigOnlyFromNamed(t *testing.T) {
+	if got := shortSignalName("SIGTERM", "terminated"); got != "TERM" {
+		t.Fatalf("SIGTERM -> %q, want TERM", got)
+	}
+	if got := shortSignalName("SIGKILL", "killed"); got != "KILL" {
+		t.Fatalf("SIGKILL -> %q, want KILL", got)
+	}
+	// An unnamed (realtime) signal: unix.SignalName returns "" and sig.String()
+	// is "signal 34"; the fallback must NOT be SIG-trimmed, which would mangle
+	// "SIGNAL 34" into "NAL 34".
+	if got := shortSignalName("", "signal 34"); got != "SIGNAL 34" {
+		t.Fatalf("unnamed signal -> %q, want SIGNAL 34 (not NAL 34)", got)
+	}
+}
