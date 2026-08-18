@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -16,6 +17,21 @@ import (
 
 type relayRecordingRunner struct {
 	reconciles int
+}
+
+type reportBoundaryRunner struct {
+	relayRecordingRunner
+	size    int64
+	maxRead int64
+}
+
+func (r *reportBoundaryRunner) ReadOutput(_ context.Context, request runner.OutputRequest) (*runner.OutputChunk, error) {
+	r.maxRead = request.MaxBytes
+	returned := r.size
+	if returned > request.MaxBytes {
+		returned = request.MaxBytes
+	}
+	return &runner.OutputChunk{RunID: "RUN-relay", Bytes: make([]byte, int(returned)), Complete: r.size <= request.MaxBytes, Truncated: r.size > request.MaxBytes}, nil
 }
 
 func (*relayRecordingRunner) Launch(_ context.Context, request runner.Request) (*runner.RunRecord, error) {
@@ -245,6 +261,39 @@ func TestStoreTouchingCarvedVerbCompletenessUsesExpectedRelayOps(t *testing.T) {
 	}
 	if execution.reconciles != 2 {
 		t.Fatalf("local runner reconcile calls=%d, want reconcile+check exactly once each", execution.reconciles)
+	}
+}
+
+func TestRunReportRelayBoundaryMinusEqualPlusOne(t *testing.T) {
+	ro, scope := relayStoreFixture(t)
+	for _, size := range []int64{runner.DefaultReportMaxBytes - 1, runner.DefaultReportMaxBytes, runner.DefaultReportMaxBytes + 1} {
+		t.Run(fmt.Sprintf("size-%d", size), func(t *testing.T) {
+			var frame daemon.StoreOpFrame
+			relay := newWriteRelayStore(ro, scope, func(_ context.Context, got daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
+				frame = got
+				data, err := json.Marshal(daemon.RelayedTestReportResult{
+					ReportID: "TR-1", Suite: domain.TestReport{Commit: "abc", SuiteID: "unit", Config: "cfg", EnvDigest: "env", Shard: "1/1"},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return daemon.ResponseFrame{OK: true, Code: "OK", Data: data}, nil
+			})
+			execution := &reportBoundaryRunner{size: size}
+			_ = core.NewWithRunner(relay, execution).Do(context.Background(), core.Request{Verb: "run", Args: map[string]any{
+				"argv": []string{"true"}, "report": "go-json", "suite": "unit", "shard": "1/1",
+			}})
+			if execution.maxRead != runner.DefaultReportMaxBytes || frame.Op != "add-test-report" {
+				t.Fatalf("max_read=%d frame=%+v", execution.maxRead, frame)
+			}
+			wantBody := size
+			if size > runner.DefaultReportMaxBytes {
+				wantBody = 1
+			}
+			if frame.BodyLen != uint64(wantBody) || int64(len(frame.Body)) != wantBody {
+				t.Fatalf("size=%d body_len=%d bytes=%d want=%d", size, frame.BodyLen, len(frame.Body), wantBody)
+			}
+		})
 	}
 }
 

@@ -20,6 +20,7 @@ const (
 	maxRelayedFindingCodeBytes = 64
 	maxRelayedFindingTextBytes = 192
 	maxRelayedFindingKindBytes = 32
+	maxRelayedReportFieldBytes = 1024
 )
 
 const nilReportBodyMarker byte = 0
@@ -263,6 +264,17 @@ func storeOpErrorFrame(err error) ResponseFrame {
 func compactTestReportResult(result store.TestReportAddResult) RelayedTestReportResult {
 	suite := result.Report
 	suite.Results = nil
+	truncated := false
+	bound := func(value string) string {
+		value, wasTruncated := boundedUTF8(value, maxRelayedReportFieldBytes)
+		truncated = truncated || wasTruncated
+		return value
+	}
+	suite.ID, suite.TicketID, suite.Phase = bound(suite.ID), bound(suite.TicketID), bound(suite.Phase)
+	suite.Commit, suite.Branch, suite.WorktreeID = bound(suite.Commit), bound(suite.Branch), bound(suite.WorktreeID)
+	suite.Agent, suite.Session, suite.At, suite.RunRef = bound(suite.Agent), bound(suite.Session), bound(suite.At), bound(suite.RunRef)
+	suite.SuiteID, suite.Runner, suite.Config = bound(suite.SuiteID), bound(suite.Runner), bound(suite.Config)
+	suite.EnvDigest, suite.Shard, suite.Format, suite.SourceDigest = bound(suite.EnvDigest), bound(suite.Shard), bound(suite.Format), bound(suite.SourceDigest)
 	var counts TestReportCounts
 	for _, test := range result.Report.Results {
 		switch test.Outcome {
@@ -276,11 +288,15 @@ func compactTestReportResult(result store.TestReportAddResult) RelayedTestReport
 			counts.Error++
 		}
 	}
-	return RelayedTestReportResult{
+	relayed := RelayedTestReportResult{
 		ReportID: result.ID, Suite: suite, ParserComplete: result.Report.ParserComplete,
 		Counts: counts, TestsGreenObserved: result.Report.ParserComplete && counts.Pass > 0 && counts.Fail == 0 && counts.Error == 0,
 		Evicted: result.EvictedCount, Remaining: result.Remaining, Idempotent: result.Idempotent,
 	}
+	if truncated {
+		relayed.Warnings = []string{"W_RELAY_FIELD_TRUNCATED: oversized report metadata was truncated on the wire"}
+	}
+	return relayed
 }
 
 func boundedCheckReport(report store.CheckReport) store.CheckReport {

@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"aira/internal/domain"
-	"aira/internal/runner"
 	"aira/internal/store"
 )
 
@@ -132,28 +131,6 @@ func TestNilRawReportUsesExplicitNonemptyMarker(t *testing.T) {
 	}
 }
 
-func TestReportBodyBoundaryUsesRawBytesAndMetadataMarker(t *testing.T) {
-	for _, size := range []int64{runner.DefaultReportMaxBytes - 1, runner.DefaultReportMaxBytes} {
-		raw := make([]byte, int(size))
-		frame, err := NewAddTestReportStoreOp(WorktreeScope{}, domain.TestReportInput{Raw: raw})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if frame.BodyLen != uint64(size) || len(frame.Body) != int(size) {
-			t.Fatalf("size=%d frame body_len=%d bytes=%d", size, frame.BodyLen, len(frame.Body))
-		}
-	}
-	// Capture at report_max_bytes+1 is dropped by runner/core before relay. The
-	// resulting metadata-only report still has an explicit non-zero envelope.
-	frame, err := NewAddTestReportStoreOp(WorktreeScope{}, domain.TestReportInput{Raw: nil})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if frame.BodyLen != 1 || len(frame.Body) != 1 {
-		t.Fatalf("metadata-only frame body_len=%d bytes=%d", frame.BodyLen, len(frame.Body))
-	}
-}
-
 func TestBoundedCheckReportKeepsExactCountsAndBoundedEncoding(t *testing.T) {
 	full := store.CheckReport{Verdict: "fail", Dimensions: map[string]string{"traceability": "fail"}}
 	for i := 0; i < MaxRelayedFindings+37; i++ {
@@ -177,26 +154,56 @@ func TestBoundedCheckReportKeepsExactCountsAndBoundedEncoding(t *testing.T) {
 	}
 }
 
+func TestCompactTestReportResultIsBoundedIndependentlyOfMetadata(t *testing.T) {
+	large := strings.Repeat("\x01", MaxFrameBytes-1)
+	result := compactTestReportResult(store.TestReportAddResult{
+		ID: "TR-1", Report: domain.TestReport{ID: "TR-1", SuiteID: large, Results: []domain.TestResult{{Name: large, Outcome: domain.OutcomePass}}},
+	})
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) >= MaxFrameBytes || result.Counts.Pass != 1 || len(result.Warnings) == 0 || len(result.Suite.SuiteID) > maxRelayedReportFieldBytes {
+		t.Fatalf("compact bytes=%d result=%+v", len(encoded), result)
+	}
+}
+
 func TestDaemonOwnedHeavyDeadlineFiresAndReleasesOperation(t *testing.T) {
 	server, scope := storeOpTestServer(t)
 	server.storeOpHeavyTimeout = 20 * time.Millisecond
 	var active atomic.Int32
+	started := make(chan struct{})
+	released := make(chan struct{})
 	server.storeOpRun = func(ctx context.Context, _ *store.Store, frame StoreOpFrame) (any, error) {
 		if frame.Op == "check" {
 			active.Add(1)
-			defer active.Add(-1)
+			close(started)
+			defer func() {
+				active.Add(-1)
+				close(released)
+			}()
 			<-ctx.Done()
 			return nil, ctx.Err()
 		}
+		<-released
 		return map[string]bool{"stored": true}, nil
 	}
-	response := exchangeStoreOpOverPipe(t, server, StoreOpFrame{Proto: ProtocolVersion, Scope: scope, Op: "check"})
+	checkDone := make(chan ResponseFrame, 1)
+	go func() {
+		checkDone <- exchangeStoreOpOverPipe(t, server, StoreOpFrame{Proto: ProtocolVersion, Scope: scope, Op: "check"})
+	}()
+	<-started
+	appendDone := make(chan ResponseFrame, 1)
+	go func() {
+		appendDone <- exchangeStoreOpOverPipe(t, server, StoreOpFrame{
+			Proto: ProtocolVersion, Scope: scope, Op: "add-command-event", Payload: json.RawMessage(`{}`),
+		})
+	}()
+	response := <-checkDone
 	if response.Code != CodeTimeout || !strings.Contains(response.Error, "unevaluated") || active.Load() != 0 {
 		t.Fatalf("deadline response=%+v active=%d", response, active.Load())
 	}
-	appendResponse := exchangeStoreOpOverPipe(t, server, StoreOpFrame{
-		Proto: ProtocolVersion, Scope: scope, Op: "add-command-event", Payload: json.RawMessage(`{}`),
-	})
+	appendResponse := <-appendDone
 	if !appendResponse.OK || active.Load() != 0 {
 		t.Fatalf("writer remained pinned: response=%+v active=%d", appendResponse, active.Load())
 	}

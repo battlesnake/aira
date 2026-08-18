@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"aira/internal/domain"
+	"aira/internal/gate"
 )
 
 func TestOpenReadOnlyDoesNotRegisterReadsWALAndRejectsWritesLoudly(t *testing.T) {
@@ -35,6 +36,22 @@ func TestOpenReadOnlyDoesNotRegisterReadsWALAndRejectsWritesLoudly(t *testing.T)
 		Root: root, CommonDir: common, GitDir: gitDir, ProjectID: projectID, WorktreeID: worktreeID,
 		ProjectSlug: "demo", Prefixes: []string{"DEMO"}, ConfigDigest: "fixture",
 	}
+	definition := gate.GateDefinition{
+		SchemaVersion: 1, ID: "traceability", Name: "Traceability", Kind: gate.KindCheckable,
+		AppliesTo: gate.AppliesTo{All: true}, Lane: gate.Lane{Name: "local", Checker: "check-dimension", EvaluatorVersion: "1"},
+		ProofPolicy: gate.ProofPolicy{Mode: gate.ProofRequired, MaxAgeSecs: 604800, RequireCurrentCanary: true},
+		CanaryIDs:   []string{"fixture"}, Checkable: &gate.Checkable{Dimension: "traceability"}, Enabled: true,
+	}
+	definitionData, err := gate.RenderGate(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".aira", "gates"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".aira", "gates", "traceability.json"), definitionData, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	ro, err := OpenReadOnly(dbPath, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -46,6 +63,13 @@ func TestOpenReadOnlyDoesNotRegisterReadsWALAndRejectsWritesLoudly(t *testing.T)
 	}
 	if projects != 0 {
 		t.Fatalf("read-only open registered %d projects", projects)
+	}
+	gates, err := ro.ListGates()
+	if err != nil || len(gates) != 1 || gates[0].ID != definition.ID {
+		t.Fatalf("read-only gate definitions=%+v err=%v", gates, err)
+	}
+	if reportContext := ro.TestReportContext(context.Background()); reportContext.WorktreeID != worktreeID {
+		t.Fatalf("read-only report context=%+v", reportContext)
 	}
 	if _, err := os.Stat(registryPath); !os.IsNotExist(err) {
 		t.Fatalf("read-only open created registry: %v", err)
