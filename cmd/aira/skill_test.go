@@ -263,6 +263,11 @@ func TestSkillExamplesReachCoreFromRun(t *testing.T) {
 	codeOf := func(argv []string) (string, int) {
 		var stdout, stderr bytes.Buffer
 		fullArgv := append(append([]string{}, argv...), "--json")
+		if len(argv) > 0 && argv[0] == "time" {
+			// time preserves every post-delimiter token as child argv, so its AIRA
+			// face selector must precede the standalone launch delimiter.
+			fullArgv = append([]string{"time", "--json"}, argv[1:]...)
+		}
 		var exit int
 		if len(argv) >= 2 && argv[0] == "test-report" && argv[1] == "add" {
 			format := ""

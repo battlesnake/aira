@@ -5,8 +5,11 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -135,22 +138,31 @@ func TestTimeWriteFailurePreservesExitWarningsAndAfterWrite(t *testing.T) {
 }
 
 func TestTimeConfiguredPrefixSelectionAndDigestExcludePrefix(t *testing.T) {
-	target := []string{"go", "test", "./x"}
+	observed := filepath.Join(t.TempDir(), "prefix-observed")
+	target := []string{"sh", "-c", `printf %s "$AIRA_PREFIX_EXECUTION_TEST" > "$1"`, "prefix-target", observed}
 	cases := []struct {
 		name       string
 		args       map[string]any
 		wantPrefix string
+		wantSeen   string
 	}{
-		{"configured", map[string]any{"argv": target, "env": []string{}}, "env"},
-		{"none", map[string]any{"argv": target, "env": []string{}, "no_prefix": true}, ""},
-		{"override", map[string]any{"argv": target, "env": []string{}, "prefix": []string{"nohup"}}, "nohup"},
+		{"configured", map[string]any{"argv": target, "env": []string{"AIRA_PREFIX_EXECUTION_TEST=unprefixed"}}, "env AIRA_PREFIX_EXECUTION_TEST=configured", "configured"},
+		{"none", map[string]any{"argv": target, "env": []string{"AIRA_PREFIX_EXECUTION_TEST=unprefixed"}, "no_prefix": true}, "", "unprefixed"},
+		{"override", map[string]any{"argv": target, "env": []string{"AIRA_PREFIX_EXECUTION_TEST=unprefixed"}, "prefix": []string{"env", "AIRA_PREFIX_EXECUTION_TEST=override"}}, "env AIRA_PREFIX_EXECUTION_TEST=override", "override"},
 	}
 	var digest string
 	for _, test := range cases {
+		if err := os.Remove(observed); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
 		s := &commandCoreStore{}
-		response := NewWithRunnerFace(s, nil, nil, FaceOutput{}).WithCommandPrefix([]string{"env"}).Do(context.Background(), Request{Verb: "time", Args: test.args})
-		if !response.OK || len(s.inputs) != 1 || s.inputs[0].PrefixPreview != test.wantPrefix || s.inputs[0].Key != "go test" || s.inputs[0].Program != "go" {
+		response := NewWithRunnerFace(s, nil, nil, FaceOutput{}).WithCommandPrefix([]string{"env", "AIRA_PREFIX_EXECUTION_TEST=configured"}).Do(context.Background(), Request{Verb: "time", Args: test.args})
+		if !response.OK || response.Exit != 0 || len(s.inputs) != 1 || s.inputs[0].PrefixPreview != test.wantPrefix || s.inputs[0].Key != "sh" || s.inputs[0].Program != "sh" {
 			t.Fatalf("%s response=%#v input=%#v", test.name, response, s.inputs)
+		}
+		seen, err := os.ReadFile(observed)
+		if err != nil || string(seen) != test.wantSeen {
+			t.Fatalf("%s child observed prefix marker %q, want %q (err=%v)", test.name, seen, test.wantSeen, err)
 		}
 		if digest == "" {
 			digest = s.inputs[0].ArgvDigest
@@ -163,6 +175,62 @@ func TestTimeConfiguredPrefixSelectionAndDigestExcludePrefix(t *testing.T) {
 	prefix[0] = "changed"
 	if c.commandPrefix[0] != "env" {
 		t.Fatal("WithCommandPrefix retained caller slice")
+	}
+}
+
+func TestTimeForwardsSIGTERMToChild(t *testing.T) {
+	termFile := filepath.Join(t.TempDir(), "got-term")
+	readyFile := filepath.Join(t.TempDir(), "child-ready")
+	guard := make(chan os.Signal, 4)
+	signal.Notify(guard, syscall.SIGTERM)
+	t.Cleanup(func() { signal.Stop(guard) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	s := &commandCoreStore{}
+	responses := make(chan Response, 1)
+	script := `trap 'printf got-term > "$1"; exit 42' TERM; printf ready > "$2"; while :; do sleep 1; done`
+	go func() {
+		responses <- NewWithRunnerFace(s, nil, nil, FaceOutput{}).Do(ctx, Request{Verb: "time", Args: map[string]any{
+			"argv": []string{"sh", "-c", script, "term-child", termFile, readyFile},
+			"env":  []string{},
+		}})
+	}()
+
+	readyDeadline := time.Now().Add(3 * time.Second)
+	for {
+		if contents, err := os.ReadFile(readyFile); err == nil && string(contents) == "ready" {
+			break
+		}
+		if time.Now().After(readyDeadline) {
+			cancel()
+			<-responses
+			t.Fatal("child did not become ready for SIGTERM")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The child-ready marker means Start returned; allow the timing goroutine to
+	// complete signal.Notify before signalling this test process (the wrapper).
+	time.Sleep(50 * time.Millisecond)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		cancel()
+		<-responses
+		t.Fatal(err)
+	}
+
+	select {
+	case response := <-responses:
+		contents, err := os.ReadFile(termFile)
+		if err != nil || string(contents) != "got-term" {
+			t.Fatalf("child did not record forwarded SIGTERM: contents=%q err=%v response=%#v", contents, err, response)
+		}
+		if !response.OK || response.Exit != 42 || len(s.inputs) != 1 || s.inputs[0].Status != domain.CommandExited || !reflect.DeepEqual(s.inputs[0].ExitCode, commandTestInt64(42)) {
+			t.Fatalf("response=%#v inputs=%#v", response, s.inputs)
+		}
+	case <-time.After(3 * time.Second):
+		cancel()
+		response := <-responses
+		t.Fatalf("timed command did not finish after wrapper received SIGTERM: response=%#v", response)
 	}
 }
 

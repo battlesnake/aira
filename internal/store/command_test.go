@@ -26,6 +26,26 @@ func TestCommandEventDBRejectsIllegalOutcomeAndGitPairings(t *testing.T) {
 	if _, err := s.db.Exec(insert, base...); err == nil {
 		t.Fatal("DB accepted exited without exit_code")
 	}
+	illegalOutcomes := []struct {
+		name     string
+		status   string
+		exitCode any
+		signal   string
+		wallMS   any
+	}{
+		{name: "signalled-with-exit-code", status: "signalled", exitCode: int64(0), signal: "TERM", wallMS: int64(1)},
+		{name: "exited-with-signal", status: "exited", exitCode: int64(0), signal: "KILL", wallMS: int64(1)},
+		{name: "launch-failed-with-wall", status: "launch-failed", exitCode: nil, signal: "", wallMS: int64(1)},
+	}
+	for _, test := range illegalOutcomes {
+		t.Run(test.name, func(t *testing.T) {
+			values := append([]any(nil), base...)
+			values[10], values[11], values[12], values[13] = test.status, test.exitCode, test.signal, test.wallMS
+			if _, err := s.db.Exec(insert, values...); err == nil {
+				t.Fatalf("DB accepted illegal outcome pairing: status=%q exit_code=%v signal=%q wall_ms=%v", test.status, test.exitCode, test.signal, test.wallMS)
+			}
+		})
+	}
 	badGit := append([]any(nil), base...)
 	badGit[11] = int64(0)
 	badGit[19], badGit[20] = "", "value"
@@ -93,9 +113,14 @@ func TestCommandDistributionUsesPairAndExitedOnlyFailureDenominator(t *testing.T
 	add(domain.CommandKeyProgramSubcommand, domain.CommandExited, commandPtr(2), "")
 	add(domain.CommandKeyProgramSubcommand, domain.CommandSignalled, nil, "TERM")
 	add(domain.CommandKeyProgramSubcommand, domain.CommandTimeout, nil, "KILL")
+	launchFailed := commandInput("go test", domain.CommandKeyProgramSubcommand, domain.CommandLaunchFailed, nil, nil)
+	if _, err := s.AddCommandEvent(context.Background(), launchFailed); err != nil {
+		t.Fatal(err)
+	}
+	add(domain.CommandKeyProgramSubcommand, domain.CommandUnknown, nil, "")
 	add(domain.CommandKeyLabel, domain.CommandExited, commandPtr(0), "")
 	result, err := s.CommandDistribution("", "key")
-	if err != nil || result.Total != 7 || len(result.Groups) != 2 {
+	if err != nil || result.Total != 9 || len(result.Groups) != 2 {
 		t.Fatalf("distribution=%#v err=%v", result, err)
 	}
 	var heuristic CommandDistributionGroup
@@ -104,11 +129,14 @@ func TestCommandDistributionUsesPairAndExitedOnlyFailureDenominator(t *testing.T
 			heuristic = group
 		}
 	}
-	if heuristic.Count != 6 || heuristic.Exited != 4 || heuristic.ExitedNonzero != 1 || heuristic.Signalled != 1 || heuristic.Timeout != 1 {
+	if heuristic.Count != 8 || heuristic.Exited != 4 || heuristic.ExitedNonzero != 1 || heuristic.Signalled != 1 || heuristic.Timeout != 1 || heuristic.LaunchFailed != 1 || heuristic.Unknown != 1 {
 		t.Fatalf("heuristic=%#v", heuristic)
 	}
+	if failureRate := float64(heuristic.ExitedNonzero) / float64(heuristic.Exited); failureRate != float64(1)/4 {
+		t.Fatalf("failure rate=%v from exited_nonzero=%d exited=%d", failureRate, heuristic.ExitedNonzero, heuristic.Exited)
+	}
 	paired, err := s.ListCommandEvents("key-source:program-subcommand key:go test")
-	if err != nil || len(paired) != 6 {
+	if err != nil || len(paired) != 8 {
 		t.Fatalf("paired drill rows=%d err=%v", len(paired), err)
 	}
 	weird := commandInput("go test status:exited", domain.CommandKeyLabel, domain.CommandExited, commandPtr(0), commandPtr(1))

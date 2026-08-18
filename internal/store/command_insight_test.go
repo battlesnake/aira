@@ -12,7 +12,11 @@ import (
 func TestCommandLatencyGaugeUsesPairFloorsHonestFailureRateAndDrills(t *testing.T) {
 	s := testStore(t, t.TempDir(), filepath.Join(t.TempDir(), "common"), t.TempDir())
 	add := func(source domain.CommandKeySource, key string, status domain.CommandOutcome, code *int64, signal string, wall int64) {
-		input := domain.CommandEventInput{Key: key, KeySource: source, Program: "go", Status: status, ExitCode: code, Signal: signal, WallMS: &wall}
+		var wallMS *int64
+		if status != domain.CommandLaunchFailed {
+			wallMS = &wall
+		}
+		input := domain.CommandEventInput{Key: key, KeySource: source, Program: "go", Status: status, ExitCode: code, Signal: signal, WallMS: wallMS}
 		if _, err := s.AddCommandEvent(context.Background(), input); err != nil {
 			t.Fatal(err)
 		}
@@ -26,6 +30,8 @@ func TestCommandLatencyGaugeUsesPairFloorsHonestFailureRateAndDrills(t *testing.
 	}
 	add(domain.CommandKeyProgramSubcommand, "go test", domain.CommandSignalled, nil, "TERM", 7)
 	add(domain.CommandKeyProgramSubcommand, "go test", domain.CommandTimeout, nil, "KILL", 8)
+	add(domain.CommandKeyProgramSubcommand, "go test", domain.CommandLaunchFailed, nil, "", 0)
+	add(domain.CommandKeyProgramSubcommand, "go test", domain.CommandUnknown, nil, "", 9)
 	for i := 0; i < 3; i++ {
 		code, wall := int64(0), int64(i+1)
 		add(domain.CommandKeyLabel, "go test", domain.CommandExited, &code, "", wall)
@@ -38,11 +44,11 @@ func TestCommandLatencyGaugeUsesPairFloorsHonestFailureRateAndDrills(t *testing.
 		t.Fatalf("gauge=%#v", gauge)
 	}
 	heuristic := gauge.Breakdown["program-subcommand / go test"]
-	if heuristic.Count != 8 || heuristic.Fields["p50_ms"].Value != int64(3) || !heuristic.Fields["p95_ms"].Unevaluated || heuristic.Fields["p95_ms"].UnevaluatedReason != "n=6, need ≥20" {
+	if heuristic.Count != 10 || heuristic.Fields["p50_ms"].Value != int64(3) || !heuristic.Fields["p95_ms"].Unevaluated || heuristic.Fields["p95_ms"].UnevaluatedReason != "n=6, need ≥20" {
 		t.Fatalf("heuristic=%#v", heuristic)
 	}
 	failure := heuristic.Fields["failure_rate"]
-	if failure.Value != float64(1)/6 || failure.Counts["exited_nonzero"] != 1 || failure.Counts["exited_total"] != 6 || heuristic.Fields["signalled"].Value != 1 || heuristic.Fields["timeout"].Value != 1 {
+	if failure.Value != float64(1)/6 || failure.Counts["exited_nonzero"] != 1 || failure.Counts["exited_total"] != 6 || heuristic.Fields["signalled"].Value != 1 || heuristic.Fields["timeout"].Value != 1 || heuristic.Fields["launch_failed"].Value != 1 || heuristic.Fields["unknown"].Value != 1 {
 		t.Fatalf("failure fields=%#v", heuristic.Fields)
 	}
 	if heuristic.Drilldown == nil || heuristic.Drilldown.Verb != "commands ls" || heuristic.Drilldown.Query != "key-source:program-subcommand key:go test" {
@@ -52,7 +58,7 @@ func TestCommandLatencyGaugeUsesPairFloorsHonestFailureRateAndDrills(t *testing.
 	if !label.Fields["p50_ms"].Unevaluated || label.Fields["p50_ms"].UnevaluatedReason != "n=3, need ≥5" || !label.Fields["p95_ms"].Unevaluated {
 		t.Fatalf("label=%#v", label)
 	}
-	if got := fmt.Sprint(gauge.Universe.AsOf["command_at_seq"]); got != "11" {
+	if got := fmt.Sprint(gauge.Universe.AsOf["command_at_seq"]); got != "13" {
 		t.Fatalf("watermark=%s", got)
 	}
 }
