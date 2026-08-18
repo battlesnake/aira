@@ -1,130 +1,158 @@
 # RANT — agent friction capture + git-context provenance (design / plan)
 
-**Status:** v1 — DRAFT for multi-model design review (Sol · Terra · Opus-5 · Fable final gate).
+**Status:** v2 — folds round-1 multi-model review (Sol · Opus-5 · Terra, all convergent). For round-2.
 **Milestone:** Phase 5 · rant (task #43). Follows D1–D6 (all merged; master `59596b5`).
-**Loop:** multi-model design rounds → committed spec → Sol plan-review (rounds → APPROVE-PLAN)
-→ Fable plan-gate → Terra build → Opus real-HW verify → Sol build-review → merge.
+**Loop:** multi-model design rounds → committed spec → Sol plan-review → Fable plan-gate → Terra
+build → Opus real-HW verify → Sol build-review → merge.
 
 ---
 
 ## 1. Goal + intent
-`aira rant "<text>"` — a **zero-ceremony, agent-initiated, free-form complaint** logged into AIRA.
-Purpose (owner): a **durable, reviewable corpus** of agent friction that humans or a dedicated
-analysis agent periodically review to find **process inefficiencies and areas for improvement**.
-It is the *qualitative* complement to command telemetry: an agent notices "these 200 integration
-tests fire on every trivial change and could be skipped," and today that insight **evaporates at
-session end** (like review findings did before AIRA made them survive by construction, §10). A
-rant makes it a standing, git-situated datum — turning the one-off retrospective (what a human/
-agent does by hand mining logs) into a **continuous, evidence-based retro**.
+`aira rant "<text>"` — **zero-ceremony, agent-initiated, free-form complaint** logged into AIRA, so
+agent friction (which evaporates at session end today) becomes a **durable, reviewable corpus** that
+humans or an analysis agent periodically review to find process inefficiencies. The *qualitative*
+complement to command telemetry; turns the one-off log-mining retro into a **continuous, evidence-
+based** one. **Non-goals:** real-time alerting; AIRA auto-diagnosing (primitives, not judgement — the
+synthesis is the reviewer's job); a finding-of-record (a rant is a subjective gripe until triaged).
 
-**Non-goals:** real-time alerting; AIRA auto-diagnosing the slowdown ("primitives, not judgement"
-— the synthesis stays the reviewer's job); a formal finding-of-record (a rant is a subjective
-gripe until a reviewer triages it into one).
+## 2. The two existential risks the design must answer (round-1, Opus-5)
+A friction corpus dies two ways, and the *entity in the middle* can't save it — both ends must be designed:
+- **Adoption (input).** A purely passive tool → an empty corpus: agents have no persistent self and
+  feel no accumulated friction. **Reconciled with the owner's "never prompted (context block only)":
+  AIRA itself never nags.** Adoption comes from the *edges*, not AIRA interrupting: (a) an **opt-in,
+  OFF-by-default friction-moment hook** — when enabled, AIRA may emit ONE contextual invitation at a
+  *detected anomaly* it already has telemetry for (a gate bounce, a test suite over a wall-clock
+  threshold, a retry loop); (b) the **dev-loop skills** invite a rant at natural junctures (post-gate-
+  bounce, post-flaky-retry) — agent-side, not AIRA. **This is a genuine owner fork (§10-Q1); v1 ships
+  the context-block advertisement + designs the hook but leaves it OFF/deferred pending the owner.**
+- **Review ritual (output).** A corpus with no owner + no cadence is a graveyard. v1 names the ritual:
+  a periodic **friction digest** pass (an owner + a cadence + an output = tickets/lints), served by
+  the review surfaces below — the machinery alone can't create the ritual, so the spec states it.
 
-## 2. Scope — v1 = capture + review, NOT the promotion lifecycle
-**IN:** the `rant` entity; `aira rant` capture; a shared client-side **git-context provenance**
-primitive (§4); reviewable surfaces (`rant ls --by tag`, `grep` FTS, `watch`, one insight gauge);
-a **minimal reviewed-marker** so review passes are cumulative.
-**OUT (deferred, §8):** promote-a-recurring-rant-to-ticket/lint with `derived-from` edges; the full
-disposition workflow; cross-project aggregation; live command-telemetry *capture* (a separate
-milestone — the metrics substrate already exists, §17; only coverage is missing); ML clustering.
+## 3. Scope — v1 = the smallest genuinely-reviewable loop (Terra/Sol YAGNI)
+**IN:** the `rant` entity (capture); `rant ls`/`count --by tag`/`get`; **append-only review
+observations** + a **review-pass cursor**; **caller-observed git-context** provenance; FTS search;
+`unreviewed` aging/counts; a "**recorded-tags**" aggregate.
+**DEFER:** a trend gauge + any "themes/similarity" claim (free tags can't honestly cluster — Sol);
+**cross-verb git-context rollout** (rant is the sole v1 consumer; run/finding fold in later) + the
+M19 snapshot migration (fast-follow); the friction-moment hook *implementation*; promote-a-recurring-
+rant-to-ticket/lint lifecycle (`derived-from` edges); cross-project aggregation; live command-
+telemetry capture; ML clustering; the `dirty?` bit.
 
-## 3. The rant entity (data model)
-A **lightweight, event-like** record that sits **beside** findings — NOT inside them. A finding is
-a claim-of-record with verdicts + disposition + a `resolves` edge; a rant is a logged *subjective
-opinion*. Different semantics ⇒ different entity, so rants never pollute finding aggregates.
+## 4. Data model (grounded in the real codebase — Terra)
+Rants are a **lightweight entity beside findings** (different semantics: a finding is a claim-of-record
+with verdicts; a rant is a logged subjective opinion), stored **DB-only**.
 
-- `id` — `RANT-<n>`, allocated via the existing `aira id` allocator (never hand-picked).
-- `body` — free-form text, bounded (e.g. ≤ 8 KiB; over → `E_RANT_TOO_LARGE`, never silent trunc).
-- `tags[]` — optional; free-form strings, with a *suggested* light vocabulary surfaced in help
-  (`slow-tests`, `linter-noise`, `flaky`, `toil`, `tooling`, `docs`, `env`). Not an enum — an agent
-  can coin a tag; the suggested set just seeds consistent clustering.
-- `about_run` — optional `RUN-*` reference (fuses the qualitative rant to the quantitative
-  run/command telemetry).
-- **git-context** — the §4 provenance struct, stamped at capture time.
-- **provenance** — actor (agent identity, the runner's `owner`), model + session if available.
-- `seq` + `at` — auto (the §11 event stamp).
-- **review state (minimal):** `reviewed bool`, `reviewed_at`, `reviewed_by`, optional `outcome`
-  note. Enough that a review pass is cumulative and the "we heard this, here's what we did / why we
-  won't" decision is durable (§10 `waived`-style visible-debt discipline, kept to its lightest form).
+- **ID = a project-scoped `rant_counter`** (follow `test_report_counter`), NOT `Store.AllocateID` —
+  the ticket allocator only knows configured ticket/requirement prefixes, writes git-file allocation
+  receipts, and `RANT` would collide in machine-global `prefix_ownership`. `RANT-<n>`.
+- **DB-only, with a journal EVENT HEADER only.** `journal.jsonl` carries `eventRecord` *metadata*, not
+  payloads, so it can NOT recover the corpus — the earlier "journal it for durability" lean was wrong
+  (Terra). Bodies/provenance/reviews live in DB tables; `rant.create` / `rant.reviewed` events are
+  journaled (ordering + `watch` visibility) exactly like other significant mutations.
+- Tables: `rants(project_id, rant_id, body, severity, idempotency_key, actor, session, observed_at,
+  received_at, resolver_version, seq, ...)`, `rant_tags(project_id, rant_id, tag)` (join table),
+  `rant_git_context(...)` (per-field value + status), `rant_context_refs(project_id, rant_id, kind,
+  target)`, `rant_reviews(project_id, rant_id, pass_id, reviewer, at, note)` (**append-only**),
+  `rant_passes(project_id, pass_id, reviewer, started_at, completed_at, through_seq, universe)`.
+- **`reviewed` is DERIVED, never a mutable bool** (Sol): unreviewed ≡ no `rant_reviews` row (`reviewed_
+  at IS NULL`). "reviewed" means strictly **examined**, not accepted/resolved. Append-only reviews keep
+  *who examined what, when, in which pass, with what note* — a bool erases that + can falsely imply
+  disposition.
+- Fields:
+  - `body` — free-form, **bounded by BYTES** (≤ 8 KiB), UTF-8/NUL-validated, empty rejected; over →
+    `E_RANT_TOO_LARGE` (never silent trunc); whitespace preserved (explicit; byte-identity tested).
+  - `tags[]` — optional; **normalized** (lowercase, hyphenate) so clustering doesn't fragment
+    (`slow_tests`≠`slow-tests`); bounded count + length; free-form with a *suggested seed set* in help.
+  - `severity` — OPTIONAL small enum (`papercut · annoyance · blocker`) — the ranter's subjective
+    weight; telemetry gives frequency, only the ranter gives cost → enables impact-sort (Opus-5).
+  - `context_refs[]` — bounded, **typed** (`run · ticket · finding · gate`), validated in-project
+    (replaces the bespoke `about_run` — Sol/Opus-5).
+  - **provenance** — `actor` (the runner's `owner`), `session`/`model` when available.
+  - **idempotency_key** — client-supplied; a retried MCP/CLI call does NOT double-file (Sol).
 
-**Storage + journaling.** Rants live in `state.db` (a `rants` table) AND are **journaled** (§11):
-they are low-frequency (agent-initiated, not per-run) so they won't swamp the journal the way
-per-run/`spend` telemetry would, and they are exactly the kind of *significant, provenance-bearing
-mutation* the journal is for — durable across DB loss, git-context preserved. (Per-run command
-telemetry stays DB-only; a rant is not per-run.)
+## 5. Git-context = CALLER-OBSERVED provenance (owner-requested; Sol reframing)
+A typed `GitContext` **stamped client-side at call time onto `core.Request`** (a first-class field,
+NOT inside `Args` — Terra), stored **verbatim** and labelled **caller-observed, never daemon-verified**
+(the client can be stale-before-commit or fabricate). Fields the owner asked for + honesty metadata:
+`{ repo_root, worktree_path, worktree_id, head_hash, head_ref, remote_url }` + per-field
+`status ∈ {value|none|unevaluated}(+reason)` + `observed_at` + daemon `received_at` + `resolver_version`.
+(repo_root and worktree_path coincide for the main worktree but DIFFER for a linked worktree — the
+owner's "if appropriate" case — so both are kept.)
 
-**Honesty.** `kind = rant`, explicitly subjective. Every aggregate reads "**N rants about X**",
-never "X is true/bad" — the same stance §10 takes for reviewer verdict ratios (honest aggregates of
-recorded labels, not proven claims).
+- **Read git FILES directly (Terra's recipe), marking the hard cases `unevaluated` rather than
+  faking them (the honesty stance that makes file-reading SAFE where a subprocess is a hang-risk /
+  over-claim).** Consume the already-discovered `Root/CommonDir/GitDir/WorktreeID` (linked worktrees
+  already modelled by `app.Project`). Resolve bounded regular files: `GitDir/HEAD` → validated
+  symbolic-ref chain → loose ref in `GitDir` then `CommonDir` → exact match in `CommonDir/packed-refs`;
+  distinguish **detached · unborn · absent · unreadable**; **retry until two consecutive snapshots
+  agree** (ref-update race). Config parsing (for `remote_url`) handles quoting/continuations/case/
+  duplicate URLs; **reftable, config `include`s, and unusual ref storage → explicit `unevaluated`**,
+  never mis-parsed. (Sol's bounded-cancellable-`git`-subprocess is the documented alternative if
+  reftable adoption grows; note: `app.Project` discovery already shells to git independently, so this
+  is orthogonal to that pre-existing path.)
+- **Secrecy (Sol — bigger than cred-strip):** `remote_url` → strip HTTP(S) userinfo + query + fragment
+  and SCP-style creds (**reuse the existing unexported `gitremote.redactURL`** — Terra); host/repo
+  normalization is a documented option. Abs worktree paths are the user's own machine (machine-local
+  single-user) so stored by default, but path storage is **configurable to relativize/hash** for the
+  future remote/multi-user phase. **Rant bodies are UNTRUSTED input** (a prompt-injection surface) —
+  documented as such; a reviewing agent must treat them as data, never inject them raw as
+  instructions; audited redaction/tombstoning keeps the ID + journal history.
+- **Scope: artifact-CREATING verbs only** (rant, later run/finding-create) via a new `verbSpec`/
+  `DispatchDescriptor` provenance flag — NOT review actions or generic telemetry (they describe
+  *existing* records + should reference the original context). NOT hot read paths.
 
-## 4. Git-context provenance (the shared primitive — owner-requested, cross-cutting)
-A reusable `GitContext { repo_root, worktree_path, worktree_id, head_hash, head_ref, remote_url }`
-resolved **client-side at call time**, stamped onto the verbs that opt in. Rant is its **first
-consumer and forcing function**; `run`/`finding`/telemetry/`review` reuse it, and **M19's ad-hoc
-pre-launch VCS snapshot (commit/branch/worktree) folds into this one honest resolver** — one
-primitive, not two.
+## 6. Routing + faces (Terra)
+- **`rant` is a ROUTED verb** — a daemon-owned durable write; default `Classify` already routes it
+  daemon-side. The client resolves `GitContext` + stamps it on `core.Request` before routing; the
+  daemon validates the scope-stable fields against `WorktreeScope` and accepts the caller-only HEAD
+  evidence verbatim.
+- **CLI:** `aira rant "<text>" [--tag T]… [--severity S] [--ref run:RUN-n|ticket:… ]…`;
+  `aira rant ls [--by tag] [--unreviewed] [--since <seq>] [--by actor]`; `aira rant get RANT-n`;
+  `aira rant review RANT-n [--pass P] [--note "…"]`; `aira rant pass start|complete`.
+- **MCP:** `aira_rant({ text, tags?, severity?, refs?, idempotency_key? })`. **The tool description
+  is the only permitted "prompt"** — e.g. *"Ranting welcome: if something wastes your time — slow
+  tests, linter noise, flaky infra, confusing setup — dump it here unfiltered; it's logged for later
+  review, you won't be asked to format it."* Never nagged per-turn.
+- **Capture returns same-TAG recent rants + their review outcomes** (honest: a tag match is a *fact*,
+  not ML similarity — reconciles Opus-5's loop-closing with Sol's no-semantic-dedup) so the ranter
+  sees "3 similar; one reviewed: won't-fix because X" → dedupes + suppresses re-filing + closes the
+  loop back to agents (the only feedback path, else `outcome` notes rot).
+- **Reviewable surfaces:** `rant ls`/`count --by tag`/**`--by actor`** (distinct-reporter is the
+  primary systemic signal — "5 agents hit this" ≠ "1 vented 5×", Opus-5); FTS via `aira grep`; the
+  generic `watch` already streams `rant.create` (no dedicated watch UX needed — Terra); the
+  **pass cursor** makes "since I last looked" well-defined across reviewers + interrupted passes (Sol).
+  Aggregates read "**recorded tags / N distinct actors**", never "themes" (§17 honesty).
 
-- **Read git FILES directly — do NOT shell to `git`.** `head_hash`/`head_ref` come from
-  `<gitdir>/HEAD` (+ the ref file, with a `packed-refs` fallback); `remote_url` from `<gitdir>/config`
-  `[remote "origin"] url`. This is cheap, subprocess-free, and **avoids the `git rev-parse` hang**
-  M20b already got bitten by (`gitValue` + `WaitDelay`), and it matches the store's "git files"
-  layer. Detached HEAD → the hash, no `head_ref`.
-- **Redact credentials** from `remote_url` (`https://user:token@host/…` → `https://host/…`) before
-  storing — AIRA's secrecy posture. Multiple remotes → prefer `origin`; record explicit "none" if
-  absent.
-- **`worktree_path` "if appropriate":** the working-tree root; for a *linked* worktree
-  (`gitdir != commondir`) record the linked path; `worktree_id` reuses AIRA's existing identity.
-- **HEAD is call-time, per-worktree provenance — NOT daemon-cached scope identity.** The daemon
-  caches the scope (root/gitdir/worktree) by a stable config digest, but HEAD moves every commit and
-  each worktree has its own HEAD, so the **client** resolves `GitContext` and passes it in the
-  request; the daemon stores it verbatim (it cannot derive the caller's commit).
-- **Scope — diagnostic/state-changing verbs only.** A per-verb dispatch-table flag opts a verb in
-  (rant, run, finding, telemetry, review). Hot read paths (`ls`/`get`/`count`/`grep`) do NOT pay the
-  resolution latency for provenance they don't durably keep.
-- **Honesty.** Not-a-git-repo / unreadable HEAD / no remote / detached → explicit `unevaluated` /
-  `none`, never a faked value. Optional cheap `dirty?` bit is a later opt-in (`git status
-  --porcelain` is pricier).
+## 7. Invariants
+1. A rant is a subjective opinion, typed as such; every aggregate reads "N rants / N distinct actors
+   about tag X", never a proven claim.
+2. `reviewed` is DERIVED from append-only observations; "reviewed" = examined, never accepted/resolved.
+3. git-context is caller-OBSERVED (per-field status, `observed_at`/`received_at`), never daemon-verified;
+   unresolvable/reftable/includes → `unevaluated`, never faked; creds redacted; bodies untrusted.
+4. Cheap to file (text-only), NEVER nagged (context block only), aggressive to aggregate; a sidecar
+   stream that never pollutes primary work views; idempotent under retry.
+5. Over-size body → `E_RANT_TOO_LARGE`; empty → rejected; tags/refs bounded + validated in-project.
 
-## 5. Faces
-- **CLI:** `aira rant "<text>" [--tag T]… [--about RUN-n]`; `aira rant ls [--by tag] [--since <seq>]
-  [--unreviewed]`; `aira rant review RANT-n [--note "…"]`.
-- **MCP:** `aira_rant({ text, tags?, about_run? })`. **The MCP tool description advertises it — the
-  only "prompt" the owner permits:** e.g. *"Ranting welcome. If something in this repo wastes your
-  time — slow tests, linter noise, flaky infra, confusing setup — dump it here, unfiltered. It's
-  logged for later review; you won't be asked to format it."* Never nagged per-turn.
-- **Grep (FTS)** over rant bodies; **`watch` (D3)** streams new rants live to an analysis agent;
-  one **insight gauge** — "rant themes by tag + trend + unreviewed-since-last-pass" (a live query,
-  never a stored numeral, §17).
+## 8. Effort + build order (Terra: minimal slice ≈ 4–6 days; full ≈ 10–15)
+resolver tests → domain/schema/`rant_counter`/tags-join → atomic capture+event → routed CLI/MCP →
+list/review/count → FTS reinsert-on-rebuild → (fast-follow) M19 fold + cross-verb stamping + gauge.
+Data-model traps: reinsert DB rants transactionally into every FTS delete/rebuild; `CountRants` (count
+is entity-specific); CHECK-constrained review fields; define project-vs-worktree visibility; routed +
+in-process byte-identity tests for the stored body + git-context.
 
-## 6. Reviewability (the actual deliverable)
-The value is realised in the **review pass**, not the individual rant. The reviewer (human or agent)
-needs to **cluster by tag** (+ FTS similarity), **sort by frequency/recency**, see provenance +
-git-context, and — critically — know **"what's new since I last looked"** (the `seq` cursor / D3
-`watch` give this for free, so a pass is incremental). The **minimal reviewed-marker** keeps the
-pass cumulative: the next reviewer isn't re-reading the same 200 gripes, and the disposition is
-durable.
+## 9. Deferrals
+Friction-moment hook impl (opt-in, off); promote-to-ticket/lint lifecycle; cross-verb git-context +
+M19 fold; trend/similarity gauges; cross-project; live command-telemetry capture; `dirty?` bit;
+payload-bearing journal (if corpus-recovery-across-DB-loss is ever wanted).
 
-## 7. Honesty + anti-noise invariants
-1. A rant is a subjective opinion, typed as such; aggregates read "N rants about X".
-2. **Cheap to file** (text-only, everything else auto/optional), **never prompted** (context block
-   only), **aggressive to aggregate** — the system must never become the thing agents rant about.
-3. Rants are a **sidecar stream** — they never pollute primary work views (`ls`/`backlog`/`ready`).
-4. git-context: `unevaluated` when unresolvable; credentials redacted.
-5. Over-size body → stable `E_RANT_TOO_LARGE`, never silent truncation.
-
-## 8. Deferrals
-Promote-to-ticket/lint lifecycle (`derived-from` edges + full disposition); cross-project rant
-aggregation (AIRA is machine-local/per-project today); live command-telemetry capture (retrospective
-ingestion + a hook — a separate milestone); ML/embedding clustering; the `dirty?` bit.
-
-## 9. Open questions for the model rounds
-- **Entity vs pure event.** A first-class allocated `RANT-n` entity (carries a reviewed-marker + is
-  referenceable) vs a pure append-only event. (Lean: lightweight entity.)
-- **Journal vs DB-only** for rants. (Lean: journal — low-frequency, provenance-bearing.)
-- **git-context inside rant vs its own cross-cutting milestone first.** (Lean: build the primitive
-  within rant as the first consumer, designed for reuse.)
-- **Tag model** — free vs suggested-enum vs both. (Lean: free + a suggested seed set.)
-- **Reviewed-marker granularity** — per-rant vs per-cluster.
-- **De-dup at capture** — none (log everything, dedupe at review) vs a cheap near-dup hint.
-- Is `about_run` enough, or should a rant also optionally reference a ticket/finding/gate?
+## 10. Open questions for round-2
+- **Q1 (owner fork):** the adoption forcing-function — ship the opt-in friction-moment hook in v1
+  (off by default) or defer it entirely and rely on skills + context-block? (Leaning: design it, defer
+  impl, surface to owner.)
+- **Q2:** severity enum (`papercut·annoyance·blocker`) vs a free rough-cost string vs both.
+- **Q3:** is a review-PASS entity worth v1, or is `--unreviewed` + a per-reviewer "last seen seq" note
+  enough? (Sol wants the pass; Terra's minimal slice omits it — resolve.)
+- **Q4:** keep both repo_root + worktree_path, or is worktree_id + one path enough?
+- **Q5:** capture-time same-tag-outcome lookup in v1, or defer (it's the loop-closer but adds a read
+  on the hot capture path)?
