@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"os"
@@ -305,6 +306,57 @@ func TestRantRedactErasesEveryProseSurfaceKeepsProvenance(t *testing.T) {
 		}
 		if bytes.Contains(raw, []byte(secret)) {
 			t.Fatalf("secret survived as raw bytes in %s", s.dbPath+suffix)
+		}
+	}
+}
+
+func TestRantRedactReportsIncompletePhysicalErasureWhenWALHeld(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "repo")
+	s := openRantStore(t, base, root)
+	const secret = "ghp_wal_held_secret_marker_zzz"
+	added, err := s.AddRant(context.Background(), domain.RantInput{Body: "leak " + secret, Actor: "terra"}, gitcontext.GitContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A second connection holds an open read transaction, pinning the WAL so a
+	// TRUNCATE checkpoint cannot complete.
+	reader := openRantStore(t, base, root)
+	tx, err := reader.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM rants`).Scan(&n); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	// Redaction commits logically but must NOT falsely claim physical erasure.
+	if _, err := s.RedactRant(context.Background(), added.Rant.ID); ErrorCode(err) != domain.CodeRantRedactionIncomplete {
+		_ = tx.Rollback()
+		t.Fatalf("redaction with a held WAL = %v, want E_RANT_REDACTION_INCOMPLETE", err)
+	}
+	// The logical scrub is still durable despite the incomplete physical purge.
+	if got, err := s.GetRant(added.Rant.ID); err != nil || got.Body != domain.RedactedRantBody || !got.Redacted {
+		t.Fatalf("logical redaction not committed: %#v err=%v", got, err)
+	}
+	// Releasing the reader and re-running redaction (idempotent) purges the WAL.
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RedactRant(context.Background(), added.Rant.ID); err != nil {
+		t.Fatalf("redaction after releasing the reader: %v", err)
+	}
+	for _, suffix := range []string{"", "-wal"} {
+		raw, err := os.ReadFile(s.dbPath + suffix)
+		if errors.Is(err, os.ErrNotExist) && suffix != "" {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(raw, []byte(secret)) {
+			t.Fatalf("secret survived as raw bytes in %s after purge", s.dbPath+suffix)
 		}
 	}
 }

@@ -276,12 +276,35 @@ func (s *Store) RedactRant(ctx context.Context, id string) (EventKey, error) {
 	if err != nil {
 		return EventKey{}, err
 	}
+	if err := s.journalEvent(ctx, event.ProjectID, event.Seq); err != nil {
+		return EventKey{}, err
+	}
 	// Fold the secure_delete'd frames from the WAL into the main database and
-	// truncate the WAL so the scrubbed bytes do not linger in stale frames.
-	// Best-effort: a busy checkpoint (another reader holding the WAL) leaves the
-	// data committed and already overwritten in place, only not yet consolidated.
-	_, _ = s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
-	return event, s.journalEvent(ctx, event.ProjectID, event.Seq)
+	// truncate the WAL so the scrubbed bytes cannot be recovered from a stale
+	// frame. The logical redaction above is already committed and journaled; if
+	// a reader pins the WAL and the truncate cannot complete, report the
+	// physical erasure as incomplete rather than falsely claiming the bytes are
+	// gone — re-running redact (idempotent) retries the purge.
+	if err := s.checkpointTruncate(ctx); err != nil {
+		return event, err
+	}
+	return event, nil
+}
+
+// checkpointTruncate folds and truncates the WAL. A single wal_checkpoint
+// already blocks up to busy_timeout for the checkpoint lock, so a transient
+// reader is waited out; a reader still holding the WAL after that yields busy,
+// and we return E_RANT_REDACTION_INCOMPLETE rather than falsely claiming the
+// scrubbed bytes were purged. Re-running redact (idempotent) retries the purge.
+func (s *Store) checkpointTruncate(ctx context.Context) error {
+	var busy, walFrames, checkpointed int
+	if err := s.db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &walFrames, &checkpointed); err != nil {
+		return translateDBError(err)
+	}
+	if busy != 0 {
+		return errors.New(domain.CodeRantRedactionIncomplete + ": redaction committed but a reader holds the WAL, so the scrubbed bytes are not yet purged from it; retry redact to purge")
+	}
+	return nil
 }
 
 func (s *Store) CountRants(query, by string) (RantCountResult, error) {

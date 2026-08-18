@@ -778,16 +778,10 @@ func (s *Store) initDB(ctx context.Context) error {
 		    CHECK(length(CAST(note AS BLOB)) <= 8192), CHECK(instr(note,char(0)) = 0),
 		    FOREIGN KEY(project_id,rant_id) REFERENCES rants(project_id,id) ON DELETE CASCADE
 		)`,
-		// Append-only, with one narrow exception: redaction may scrub a review's
-		// free-text note to the '[redacted]' sentinel (domain.RedactedRantBody),
-		// leaving every other column identical. Any other update still aborts.
-		`CREATE TRIGGER IF NOT EXISTS rant_reviews_no_update BEFORE UPDATE ON rant_reviews
-		 WHEN NEW.review_id IS NOT OLD.review_id OR NEW.project_id IS NOT OLD.project_id
-		   OR NEW.rant_id IS NOT OLD.rant_id OR NEW.reviewer IS NOT OLD.reviewer
-		   OR NEW.at IS NOT OLD.at OR NEW.outcome IS NOT OLD.outcome
-		   OR NEW.resolved_kind IS NOT OLD.resolved_kind OR NEW.resolved_id IS NOT OLD.resolved_id
-		   OR NEW.note <> '[redacted]'
-		 BEGIN SELECT RAISE(ABORT,'rant reviews are append-only'); END`,
+		// rant_reviews_no_update is created/upgraded atomically by
+		// ensureRantReviewTriggerCurrent after this loop, not here, so a stale
+		// pre-redaction-exception definition can be replaced without a window in
+		// which append-only protection is absent.
 		`CREATE TRIGGER IF NOT EXISTS rant_reviews_no_delete BEFORE DELETE ON rant_reviews
 		 BEGIN SELECT RAISE(ABORT,'rant reviews are append-only'); END`,
 		`CREATE TABLE IF NOT EXISTS test_reports (
@@ -835,18 +829,17 @@ func (s *Store) initDB(ctx context.Context) error {
 		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
 	}
-	// The rant_reviews_no_update trigger gained a redaction exception. A
-	// database created before that carries the old unconditional trigger, which
-	// CREATE ... IF NOT EXISTS will not replace — and which would abort the
-	// note scrub, rolling back redaction of any reviewed rant. Drop the stale
-	// definition first so the loop recreates the current one.
-	if err := s.dropStaleRantReviewTrigger(ctx); err != nil {
-		return err
-	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return translateDBError(err)
 		}
+	}
+	// The rant_reviews_no_update trigger gained a redaction exception. Upgrading
+	// a stale pre-exception definition (which CREATE ... IF NOT EXISTS cannot
+	// replace, and which would abort the redaction note scrub) is done atomically
+	// so append-only protection is never absent for a concurrent opener.
+	if err := s.ensureRantReviewTriggerCurrent(ctx); err != nil {
+		return err
 	}
 	for _, column := range []string{"wall_ms", "cpu_user", "cpu_sys", "peak_rss"} {
 		if hasTableColumn(ctx, s.db, "compute_events", column) {
@@ -871,24 +864,82 @@ func (s *Store) initDB(ctx context.Context) error {
 	return s.ensureSearchFTS(ctx)
 }
 
-// dropStaleRantReviewTrigger removes a pre-redaction-exception
-// rant_reviews_no_update trigger so the schema loop recreates the current one.
-// The current definition is recognised by its redaction-exception sentinel; a
-// missing trigger or the current definition is left untouched.
-func (s *Store) dropStaleRantReviewTrigger(ctx context.Context) error {
+// rantReviewNoUpdateTriggerDDL is the current append-only trigger with the one
+// narrow redaction exception: redaction may scrub a review's free-text note to
+// the '[redacted]' sentinel (domain.RedactedRantBody), leaving every other
+// column identical. Any other update still aborts.
+const rantReviewNoUpdateTriggerDDL = `CREATE TRIGGER rant_reviews_no_update BEFORE UPDATE ON rant_reviews
+		 WHEN NEW.review_id IS NOT OLD.review_id OR NEW.project_id IS NOT OLD.project_id
+		   OR NEW.rant_id IS NOT OLD.rant_id OR NEW.reviewer IS NOT OLD.reviewer
+		   OR NEW.at IS NOT OLD.at OR NEW.outcome IS NOT OLD.outcome
+		   OR NEW.resolved_kind IS NOT OLD.resolved_kind OR NEW.resolved_id IS NOT OLD.resolved_id
+		   OR NEW.note <> '[redacted]'
+		 BEGIN SELECT RAISE(ABORT,'rant reviews are append-only'); END`
+
+// rantReviewTriggerIsCurrent reports whether the installed trigger already
+// carries the redaction-exception sentinel, using a single read so the common
+// (already-current) path never takes the write lock.
+func rantReviewTriggerIsCurrent(sqlText sql.NullString) bool {
+	return sqlText.Valid && strings.Contains(sqlText.String, "'"+domain.RedactedRantBody+"'")
+}
+
+// ensureRantReviewTriggerCurrent installs the current rant_reviews_no_update
+// trigger, replacing a stale pre-redaction-exception definition. A read-only
+// fast path avoids the write lock when the trigger is already current (every
+// Open would otherwise serialise on it). Otherwise detect, drop, and recreate
+// run in one BEGIN IMMEDIATE transaction, re-checked under the lock, so a
+// concurrent opener never observes a window with append-only protection absent
+// and a partial init cannot leave the trigger missing.
+func (s *Store) ensureRantReviewTriggerCurrent(ctx context.Context) error {
 	var triggerSQL sql.NullString
 	err := s.db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='trigger' AND name='rant_reviews_no_update'`).Scan(&triggerSQL)
-	if errors.Is(err, sql.ErrNoRows) {
+	if err == nil && rantReviewTriggerIsCurrent(triggerSQL) {
 		return nil
 	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return translateDBError(err)
+	}
+	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return translateDBError(err)
 	}
-	if triggerSQL.Valid && strings.Contains(triggerSQL.String, "'"+domain.RedactedRantBody+"'") {
-		return nil
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return translateDBError(err)
 	}
-	_, err = s.db.ExecContext(ctx, `DROP TRIGGER IF EXISTS rant_reviews_no_update`)
-	return translateDBError(err)
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		}
+	}()
+	// Re-check under the write lock: another opener may have installed it since
+	// the fast read.
+	err = conn.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='trigger' AND name='rant_reviews_no_update'`).Scan(&triggerSQL)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// absent — create below
+	case err != nil:
+		return translateDBError(err)
+	case rantReviewTriggerIsCurrent(triggerSQL):
+		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+			return translateDBError(err)
+		}
+		committed = true
+		return nil
+	default:
+		if _, err := conn.ExecContext(ctx, `DROP TRIGGER rant_reviews_no_update`); err != nil {
+			return translateDBError(err)
+		}
+	}
+	if _, err := conn.ExecContext(ctx, rantReviewNoUpdateTriggerDDL); err != nil {
+		return translateDBError(err)
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return translateDBError(err)
+	}
+	committed = true
+	return nil
 }
 
 func (s *Store) ensureAreaHintsGeneration(ctx context.Context) error {

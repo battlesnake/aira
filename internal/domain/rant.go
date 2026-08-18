@@ -25,6 +25,7 @@ const (
 	CodeRantIdempotencyConflict = "E_RANT_IDEMPOTENCY_CONFLICT"
 	CodeRantRefInvalid          = "E_RANT_REF_INVALID"
 	CodeRantRedacted            = "E_RANT_REDACTED"
+	CodeRantRedactionIncomplete = "E_RANT_REDACTION_INCOMPLETE"
 )
 
 type RantSeverity string
