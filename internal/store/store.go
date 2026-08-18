@@ -67,6 +67,8 @@ type Options struct {
 	MaxAgeDays        int
 	MaxComputeEvents  int
 	MaxComputeAgeDays int
+	MaxCommandEvents  int
+	MaxCommandAgeDays int
 	MaxQuotaSnapshots int
 	Clock             Clock
 }
@@ -90,6 +92,8 @@ type ScopeOptions struct {
 	MaxAgeDays          int
 	MaxComputeEvents    int
 	MaxComputeAgeDays   int
+	MaxCommandEvents    int
+	MaxCommandAgeDays   int
 	MaxQuotaSnapshots   int
 	ConfigDigest        string
 	Clock               Clock
@@ -141,6 +145,8 @@ type Store struct {
 	maxAgeDays        int
 	maxComputeEvents  int
 	maxComputeAgeDays int
+	maxCommandEvents  int
+	maxCommandAgeDays int
 	maxQuotaSnapshots int
 	clock             Clock
 	runner            Execution
@@ -290,6 +296,7 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		LeaseStateDir: opts.LeaseStateDir, LeaseTTLNS: opts.LeaseTTLNS,
 		MaxReports: opts.MaxReports, MaxAgeDays: opts.MaxAgeDays,
 		MaxComputeEvents: opts.MaxComputeEvents, MaxComputeAgeDays: opts.MaxComputeAgeDays,
+		MaxCommandEvents: opts.MaxCommandEvents, MaxCommandAgeDays: opts.MaxCommandAgeDays,
 		MaxQuotaSnapshots: opts.MaxQuotaSnapshots, Clock: opts.Clock,
 	}
 	// GitDir did not exist in the pre-M21 Options API. Keep that source-level
@@ -463,6 +470,7 @@ func newScopeContext(ctx context.Context, db *DB, opts ScopeOptions, checkIdenti
 		leaseStateDir: opts.LeaseStateDir, leaseTTLNS: opts.LeaseTTLNS,
 		maxReports: opts.MaxReports, maxAgeDays: opts.MaxAgeDays,
 		maxComputeEvents: opts.MaxComputeEvents, maxComputeAgeDays: opts.MaxComputeAgeDays,
+		maxCommandEvents: opts.MaxCommandEvents, maxCommandAgeDays: opts.MaxCommandAgeDays,
 		maxQuotaSnapshots: opts.MaxQuotaSnapshots, clock: opts.Clock,
 	}
 	if s.maxReports == 0 {
@@ -471,10 +479,13 @@ func newScopeContext(ctx context.Context, db *DB, opts ScopeOptions, checkIdenti
 	if s.maxComputeEvents == 0 {
 		s.maxComputeEvents = 20000
 	}
+	if s.maxCommandEvents == 0 {
+		s.maxCommandEvents = 50000
+	}
 	if s.maxQuotaSnapshots == 0 {
 		s.maxQuotaSnapshots = 5000
 	}
-	if s.maxReports < 1 || s.maxAgeDays < 0 || s.maxComputeEvents < 1 || s.maxComputeAgeDays < 0 || s.maxQuotaSnapshots < 1 {
+	if s.maxReports < 1 || s.maxAgeDays < 0 || s.maxComputeEvents < 1 || s.maxComputeAgeDays < 0 || s.maxCommandEvents < 1 || s.maxCommandAgeDays < 0 || s.maxQuotaSnapshots < 1 {
 		return nil, errors.New("E_CONFIG_INVALID: telemetry retention is invalid")
 	}
 	if s.leaseStateDir == "" {
@@ -816,6 +827,36 @@ func (s *Store) initDB(ctx context.Context) error {
 		    wall_ms INTEGER, cpu_user INTEGER, cpu_sys INTEGER, peak_rss INTEGER,
 		    at_seq INTEGER NOT NULL,
 		    PRIMARY KEY(project_id, id),
+		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS command_event_counter (
+		    project_id TEXT PRIMARY KEY, next_number INTEGER NOT NULL, next_seq INTEGER NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS command_events (
+		    project_id TEXT NOT NULL, id TEXT NOT NULL, at TEXT NOT NULL, at_seq INTEGER NOT NULL,
+		    key TEXT NOT NULL, key_source TEXT NOT NULL, program TEXT NOT NULL DEFAULT '',
+		    argv_preview TEXT NOT NULL DEFAULT '', argv_digest TEXT NOT NULL DEFAULT '',
+		    prefix_preview TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, exit_code INTEGER,
+		    signal TEXT NOT NULL DEFAULT '', wall_ms INTEGER, ticket_id TEXT NOT NULL DEFAULT '',
+		    phase TEXT NOT NULL DEFAULT '', actor TEXT NOT NULL DEFAULT '', session TEXT NOT NULL DEFAULT '',
+		    cwd TEXT NOT NULL DEFAULT '',
+		    head_hash TEXT NOT NULL DEFAULT '', head_hash_status TEXT NOT NULL DEFAULT 'unevaluated',
+		    head_ref TEXT NOT NULL DEFAULT '', head_ref_status TEXT NOT NULL DEFAULT 'unevaluated',
+		    worktree_id TEXT NOT NULL DEFAULT '', worktree_id_status TEXT NOT NULL DEFAULT 'unevaluated',
+		    PRIMARY KEY(project_id,id),
+		    CHECK(status IN ('exited','signalled','timeout','launch-failed','unknown')),
+		    CHECK(key_source IN ('label','program-subcommand','program')),
+		    CHECK((status='exited' AND exit_code IS NOT NULL AND signal='' AND wall_ms IS NOT NULL)
+		       OR (status='signalled' AND exit_code IS NULL AND signal<>'' AND wall_ms IS NOT NULL)
+		       OR (status='timeout' AND exit_code IS NULL AND signal<>'' AND wall_ms IS NOT NULL)
+		       OR (status='launch-failed' AND exit_code IS NULL AND signal='' AND wall_ms IS NULL)
+		       OR (status='unknown' AND exit_code IS NULL AND signal='')),
+		    CHECK(head_hash_status IN ('value','none','unevaluated','mismatch')),
+		    CHECK(head_ref_status IN ('value','none','unevaluated','mismatch')),
+		    CHECK(worktree_id_status IN ('value','none','unevaluated','mismatch')),
+		    CHECK((head_hash_status IN ('value','mismatch') AND length(head_hash)>0) OR (head_hash_status IN ('none','unevaluated') AND head_hash='')),
+		    CHECK((head_ref_status IN ('value','mismatch') AND length(head_ref)>0) OR (head_ref_status IN ('none','unevaluated') AND head_ref='')),
+		    CHECK((worktree_id_status IN ('value','mismatch') AND length(worktree_id)>0) OR (worktree_id_status IN ('none','unevaluated') AND worktree_id='')),
 		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS quota_snapshot_counter (

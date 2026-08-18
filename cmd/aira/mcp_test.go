@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"aira/internal/core"
+	"aira/internal/domain"
 	"aira/internal/store"
 )
 
@@ -38,7 +39,7 @@ func TestMCPToolListIsGeneratedAndStable(t *testing.T) {
 	for _, tool := range result.Tools {
 		got = append(got, tool.Name)
 	}
-	want := []string{"aira_check", "aira_claim", "aira_count", "aira_create", "aira_finding", "aira_gate", "aira_get", "aira_git", "aira_grep", "aira_heartbeat", "aira_id", "aira_import", "aira_init", "aira_insights", "aira_link", "aira_list", "aira_quota", "aira_rant", "aira_ready", "aira_reconcile", "aira_release", "aira_requirement", "aira_review", "aira_run", "aira_run_input", "aira_run_kill", "aira_run_output", "aira_spend", "aira_test_report", "aira_touch", "aira_transition"}
+	want := []string{"aira_check", "aira_claim", "aira_commands", "aira_count", "aira_create", "aira_finding", "aira_gate", "aira_get", "aira_git", "aira_grep", "aira_heartbeat", "aira_id", "aira_import", "aira_init", "aira_insights", "aira_link", "aira_list", "aira_quota", "aira_rant", "aira_ready", "aira_reconcile", "aira_release", "aira_requirement", "aira_review", "aira_run", "aira_run_input", "aira_run_kill", "aira_run_output", "aira_spend", "aira_test_report", "aira_time", "aira_touch", "aira_transition"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("tools=%v, want=%v", got, want)
 	}
@@ -115,6 +116,47 @@ func TestMCPRunDeclaresPTYBoolean(t *testing.T) {
 	property, ok := schema.Properties["pty"]
 	if !ok || property.Type != "boolean" {
 		t.Fatalf("run pty property=%+v present=%v", property, ok)
+	}
+}
+
+type mcpCommandStore struct {
+	core.Store
+	input domain.CommandEventInput
+}
+
+func (s *mcpCommandStore) AddCommandEvent(_ context.Context, input domain.CommandEventInput) (store.CommandEventAddResult, error) {
+	s.input = input
+	event := domain.CommandEvent{ID: "CMD-1", AtSeq: 1, Key: input.Key, KeySource: input.KeySource, Program: input.Program, ArgvPreview: input.ArgvPreview, ArgvDigest: input.ArgvDigest, PrefixPreview: input.PrefixPreview, Status: input.Status, ExitCode: input.ExitCode, Signal: input.Signal, WallMS: input.WallMS, Cwd: input.Cwd}
+	return store.CommandEventAddResult{Event: event, ID: event.ID, Remaining: 1}, nil
+}
+func (s *mcpCommandStore) ListCommandEvents(string) ([]domain.CommandEvent, error) { return nil, nil }
+func (s *mcpCommandStore) CommandDistribution(string, string) (store.CommandDistributionResult, error) {
+	return store.CommandDistributionResult{}, nil
+}
+func (s *mcpCommandStore) CommandLatencyByKeyPair(context.Context) ([]store.CommandLatencySummary, error) {
+	return nil, nil
+}
+
+func TestMCPTimeReturnsStructuredOutcomeAndCannotConsumeNextFrame(t *testing.T) {
+	input := strings.NewReader(strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"aira_time","arguments":{"argv":["sh","-c","read stolen; exit 0"]}}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"ping"}`,
+	}, "\n") + "\n")
+	s := &mcpCommandStore{}
+	server := newMCPServer(nil)
+	server.dispatch = func(ctx context.Context, request core.Request) core.Response {
+		return core.NewWithRunnerFace(s, nil, input, core.FaceOutput{}).Do(ctx, request)
+	}
+	var output bytes.Buffer
+	if err := server.Serve(context.Background(), input, &output, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	if len(lines) != 2 || !strings.Contains(lines[0], `"status":"exited"`) || !strings.Contains(lines[1], `"id":2`) {
+		t.Fatalf("MCP output=%q", output.String())
+	}
+	if s.input.Status != domain.CommandExited || s.input.ExitCode == nil || *s.input.ExitCode != 0 {
+		t.Fatalf("recorded=%#v", s.input)
 	}
 }
 

@@ -586,6 +586,8 @@ func routingFixtures(descriptors []DispatchDescriptor, findingID string) []Reque
 			base["bucket"] = []string{"fresh_input=1", "output=1"}
 			base["total"] = "2"
 			base["by"] = "phase"
+		case "commands":
+			base["by"] = "status"
 		case "test-report":
 			base["raw"] = []byte(routingGoJSON)
 			base["selector"] = "TR-1"

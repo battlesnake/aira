@@ -79,6 +79,7 @@ type ProjectConfig struct {
 	Review              json.RawMessage   `json:"review,omitempty"`
 	TestReports         TestReportsConfig `json:"test_reports,omitempty"`
 	Compute             ComputeConfig     `json:"compute,omitempty"`
+	Commands            CommandsConfig    `json:"commands,omitempty"`
 }
 
 type TestReportsConfig struct {
@@ -90,6 +91,11 @@ type ComputeConfig struct {
 	MaxEvents         int `json:"max_events,omitempty"`
 	MaxAgeDays        int `json:"max_age_days,omitempty"`
 	MaxQuotaSnapshots int `json:"max_quota_snapshots,omitempty"`
+}
+
+type CommandsConfig struct {
+	MaxEvents  int `json:"max_events,omitempty"`
+	MaxAgeDays int `json:"max_age_days,omitempty"`
 }
 
 type LeaseConfig struct {
@@ -229,6 +235,8 @@ func OpenWithDiagnostics(ctx context.Context, cwd string, diagnostics io.Writer)
 		MaxAgeDays:          project.Config.Project.TestReports.MaxAgeDays,
 		MaxComputeEvents:    project.Config.Project.Compute.MaxEvents,
 		MaxComputeAgeDays:   project.Config.Project.Compute.MaxAgeDays,
+		MaxCommandEvents:    project.Config.Project.Commands.MaxEvents,
+		MaxCommandAgeDays:   project.Config.Project.Commands.MaxAgeDays,
 		MaxQuotaSnapshots:   project.Config.Project.Compute.MaxQuotaSnapshots,
 		LeaseTTLNS:          leaseTTLNS(project.Config),
 	})
@@ -479,8 +487,8 @@ func validateConfig(config Config) error {
 	if len(config.Project.Prefixes) == 0 {
 		return errors.New("E_CONFIG_INVALID: config has no prefixes")
 	}
-	if config.Project.TestReports.MaxReports < 0 || config.Project.TestReports.MaxAgeDays < 0 || config.Project.Compute.MaxEvents < 0 || config.Project.Compute.MaxAgeDays < 0 || config.Project.Compute.MaxQuotaSnapshots < 0 {
-		return errors.New("E_CONFIG_INVALID: test report retention values must be non-negative")
+	if config.Project.TestReports.MaxReports < 0 || config.Project.TestReports.MaxAgeDays < 0 || config.Project.Compute.MaxEvents < 0 || config.Project.Compute.MaxAgeDays < 0 || config.Project.Compute.MaxQuotaSnapshots < 0 || config.Project.Commands.MaxEvents < 0 || config.Project.Commands.MaxAgeDays < 0 {
+		return errors.New("E_CONFIG_INVALID: telemetry retention values must be non-negative")
 	}
 	if config.Run.ReportMaxBytes < 0 {
 		return errors.New("E_CONFIG_INVALID: run.report_max_bytes must be non-negative")
@@ -624,6 +632,7 @@ func runnerDaemonScope(project Project) (map[string]any, error) {
 		"review_policy":        reviewPolicy, "review_configured": reviewPolicy.Configured,
 		"max_reports": project.Config.Project.TestReports.MaxReports, "max_age_days": project.Config.Project.TestReports.MaxAgeDays,
 		"max_compute_events": project.Config.Project.Compute.MaxEvents, "max_compute_age_days": project.Config.Project.Compute.MaxAgeDays,
+		"max_command_events": project.Config.Project.Commands.MaxEvents, "max_command_age_days": project.Config.Project.Commands.MaxAgeDays,
 		"max_quota_snapshots": project.Config.Project.Compute.MaxQuotaSnapshots,
 		"lease_ttl_ns":        leaseTTLNS(project.Config), "config_digest": hex.EncodeToString(digest[:]),
 	}, nil

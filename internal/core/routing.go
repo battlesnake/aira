@@ -42,6 +42,8 @@ func Classify(verb, selector string) (string, Route) {
 		return canonical, RouteClient
 	case canonical == "run" || strings.HasPrefix(canonical, "run-"):
 		return canonical, RouteClient
+	case canonical == "time":
+		return canonical, RouteClient
 	case canonical == "reconcile", canonical == "check", canonical == "git":
 		return canonical, RouteClient
 	case canonical == "gate" && (operation == "run" || operation == "canary-run"):

@@ -105,6 +105,7 @@ var insightRegistry = []Gauge{
 	{Name: "wip", Title: "Non-terminal work in progress", Kind: GaugeKindDistribution},
 	{Name: "review-loop-economics", Title: "Compute tokens and cost by phase", Kind: GaugeKindDistribution},
 	{Name: "quota-burn", Title: "Latest quota use and burn by provider", Kind: GaugeKindRate},
+	{Name: "command-latency", Title: "Recorded command latency by key", Kind: GaugeKindDuration},
 	{Name: "ratchet-status", Title: "Live ratchet gate status", Kind: GaugeKindDistribution},
 	{Name: "traceability-status", Title: "Requirement traceability status", Kind: GaugeKindDistribution},
 }
@@ -124,6 +125,8 @@ func init() {
 			insightRegistry[i].Compute = computeReviewLoopEconomics
 		case "quota-burn":
 			insightRegistry[i].Compute = computeQuotaBurn
+		case "command-latency":
+			insightRegistry[i].Compute = computeCommandLatencyByKeyPair
 		case "ratchet-status":
 			insightRegistry[i].Compute = computeRatchetStatus
 		case "traceability-status":
@@ -381,6 +384,52 @@ func computeReviewLoopEconomics(s *Store) (GaugeResult, error) {
 	result.Universe = gaugeUniverse(total, "project", map[string]any{"compute_at_seq": watermark})
 	if total == 0 {
 		result.Unevaluated, result.UnevaluatedReason = true, "no compute events"
+	}
+	return result, nil
+}
+
+func computeCommandLatencyByKeyPair(s *Store) (GaugeResult, error) {
+	rows, err := s.CommandLatencyByKeyPair(context.Background())
+	if err != nil {
+		return GaugeResult{}, err
+	}
+	result := GaugeResult{Name: "command-latency", Title: "Recorded command latency by key", Kind: GaugeKindDuration,
+		Breakdown: map[string]GaugeCell{}, Universe: gaugeUniverse(len(rows), "recorded aira time runs only", map[string]any{"command_at_seq": int64(0)}),
+		Drilldown: GaugeDrilldown{Verb: "commands ls", Query: ""}}
+	watermark := int64(0)
+	for _, row := range rows {
+		if row.AtSeq > watermark {
+			watermark = row.AtSeq
+		}
+		drill := GaugeDrilldown{Verb: "commands ls", Query: "key-source:" + string(row.KeySource) + " key:" + row.Key}
+		cell := GaugeCell{Count: row.Count, Fields: map[string]GaugeCell{}, Drilldown: &drill}
+		cell.Fields["key_source"] = GaugeCell{Value: string(row.KeySource)}
+		cell.Fields["key"] = GaugeCell{Value: row.Key}
+		cell.Fields["count"] = GaugeCell{Value: row.Count}
+		if row.P50MS == nil {
+			cell.Fields["p50_ms"] = gaugeCellUnevaluated(fmt.Sprintf("n=%d, need ≥5", row.Exited))
+		} else {
+			cell.Fields["p50_ms"] = GaugeCell{Value: *row.P50MS}
+		}
+		if row.P95MS == nil {
+			cell.Fields["p95_ms"] = gaugeCellUnevaluated(fmt.Sprintf("n=%d, need ≥20", row.Exited))
+		} else {
+			cell.Fields["p95_ms"] = GaugeCell{Value: *row.P95MS}
+		}
+		if row.Exited == 0 {
+			cell.Fields["failure_rate"] = gaugeCellUnevaluated("no exited commands")
+		} else {
+			cell.Fields["failure_rate"] = GaugeCell{Value: float64(row.ExitedNonzero) / float64(row.Exited), Counts: map[string]int{"exited_nonzero": row.ExitedNonzero, "exited_total": row.Exited}}
+		}
+		cell.Fields["signalled"] = GaugeCell{Value: row.Signalled}
+		cell.Fields["timeout"] = GaugeCell{Value: row.Timeout}
+		cell.Fields["launch_failed"] = GaugeCell{Value: row.LaunchFailed}
+		cell.Fields["unknown"] = GaugeCell{Value: row.Unknown}
+		result.Breakdown[string(row.KeySource)+" / "+row.Key] = cell
+	}
+	result.Universe = gaugeUniverse(len(rows), "recorded aira time runs only", map[string]any{"command_at_seq": watermark})
+	if len(rows) == 0 {
+		result.Unevaluated, result.UnevaluatedReason = true, "no recorded command events"
 	}
 	return result, nil
 }

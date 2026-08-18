@@ -52,7 +52,7 @@ func (s *Store) AddRant(ctx context.Context, raw domain.RantInput, observed gitc
 	if err != nil {
 		return RantAddResult{}, err
 	}
-	observed = s.crossCheckRantContext(observed)
+	observed = s.crossCheckGitContext(observed)
 	received := time.Now().UTC().Format(time.RFC3339Nano)
 	var result RantAddResult
 	err = s.withImmediate(ctx, func(conn *sql.Conn) error {
@@ -568,7 +568,7 @@ func contextFromFields(fields map[string]gitcontext.Field, observedAt, version s
 	return gitcontext.GitContext{RepoRoot: fields["repo_root"], WorktreePath: fields["worktree_path"], WorktreeID: fields["worktree_id"], HeadHash: fields["head_hash"], HeadRef: fields["head_ref"], RemoteURL: fields["remote_url"], ObservedAt: observedAt, ResolverVersion: version}
 }
 
-func (s *Store) crossCheckRantContext(context gitcontext.GitContext) gitcontext.GitContext {
+func (s *Store) crossCheckGitContext(context gitcontext.GitContext) gitcontext.GitContext {
 	fields := gitContextFields(context)
 	for name, field := range fields {
 		if field.Status == "" {

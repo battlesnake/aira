@@ -48,6 +48,8 @@ type WorktreeScope struct {
 	MaxAgeDays          int                `json:"max_age_days,omitempty"`
 	MaxComputeEvents    int                `json:"max_compute_events,omitempty"`
 	MaxComputeAgeDays   int                `json:"max_compute_age_days,omitempty"`
+	MaxCommandEvents    int                `json:"max_command_events,omitempty"`
+	MaxCommandAgeDays   int                `json:"max_command_age_days,omitempty"`
 	MaxQuotaSnapshots   int                `json:"max_quota_snapshots,omitempty"`
 	LeaseTTLNS          uint64             `json:"lease_ttl_ns,omitempty"`
 	ConfigDigest        string             `json:"config_digest"`

@@ -30,7 +30,7 @@ func TestInsightEmptyUniverseIsUnevaluatedWithUniverse(t *testing.T) {
 	base := t.TempDir()
 	s := testStore(t, base, base+"/common", base+"/state")
 	results, err := s.ComputeAllGauges()
-	if err != nil || len(results) != 8 {
+	if err != nil || len(results) != 9 {
 		t.Fatalf("gauges=%#v err=%v", results, err)
 	}
 	for _, result := range results {

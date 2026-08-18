@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,12 +22,104 @@ import (
 	"aira/internal/app"
 	"aira/internal/core"
 	"aira/internal/daemon"
+	"aira/internal/domain"
 	"aira/internal/store"
 	"golang.org/x/sys/unix"
 )
 
 func runInProcess(argv []string, stdout, stderr io.Writer) int {
 	return runInProcessWithInput(argv, stdout, stderr, strings.NewReader(""))
+}
+
+func TestTimeCLIExitPassthroughHumanSuppressionAndStructuredRead(t *testing.T) {
+	root := t.TempDir()
+	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(root)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	t.Setenv("XDG_RUNTIME_DIR", shortRuntimeDir(t))
+	var stdout, stderr bytes.Buffer
+	if exit := runInProcess([]string{"init", "--project", "demo", "--prefix", "AIRA"}, &stdout, &stderr); exit != 0 {
+		t.Fatalf("init exit=%d out=%q err=%q", exit, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	exit := runInProcess([]string{"time", "--json", "--", "sh", "-c", "exit 7"}, &stdout, &stderr)
+	if exit != 7 || stderr.Len() != 0 || !strings.Contains(stdout.String(), `"status":"exited"`) || !strings.Contains(stdout.String(), `"exit_code":7`) {
+		t.Fatalf("time exit=%d out=%q err=%q", exit, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if exit := runInProcess([]string{"time", "--", "true"}, &stdout, &stderr); exit != 0 || stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("human time exit=%d out=%q err=%q", exit, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if exit := runInProcess([]string{"commands", "ls", "--json"}, &stdout, &stderr); exit != 0 || !strings.Contains(stdout.String(), `"total":2`) || !strings.Contains(stdout.String(), `"CMD-2"`) {
+		t.Fatalf("commands exit=%d out=%q err=%q", exit, stdout.String(), stderr.String())
+	}
+}
+
+// This discriminator needs a real AF_UNIX listener. The Codex sandbox cannot
+// bind it; AIRA_REAL_SOCKET=1 is the Opus real-hardware mode and fails closed.
+func TestCommandsRoutedDaemonParityAndPairedDrillRealSocket(t *testing.T) {
+	if os.Getenv("AIRA_REAL_SOCKET") != "1" {
+		t.Skip("real Unix-socket parity requires AIRA_REAL_SOCKET=1")
+	}
+	root := t.TempDir()
+	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".aira"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := `{"schema":1,"project":{"slug":"demo","prefixes":["AIRA"]},"lease":{"ttl_seconds":900,"heartbeat_seconds":30}}`
+	if err := os.WriteFile(filepath.Join(root, ".aira", "config"), []byte(config+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(root)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	t.Setenv("XDG_RUNTIME_DIR", shortRuntimeDir(t))
+	paths, err := daemon.PathsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _, err := app.Open(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zero, wall := int64(0), int64(12)
+	_, err = s.AddCommandEvent(context.Background(), domain.CommandEventInput{Key: "go test", KeySource: domain.CommandKeyProgramSubcommand, Program: "go", Status: domain.CommandExited, ExitCode: &zero, WallMS: &wall})
+	if closeErr := s.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope, err := scopeForCWD(context.Background(), root, paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startCommandDaemon(t, daemon.NewServer(paths))
+	request := core.Request{Verb: "commands", Args: map[string]any{"subverb": "ls", "query": "key-source:program-subcommand key:go test"}}
+	routed := (&daemonDispatcher{paths: paths, jsonOutput: true, startWait: time.Second}).Dispatch(context.Background(), scope, request)
+	inProcess := (&inProcessDispatcher{jsonOutput: true}).Dispatch(context.Background(), scope, request)
+	if !routed.OK || !inProcess.OK {
+		t.Fatalf("routed=%#v in-process=%#v", routed, inProcess)
+	}
+	normalise := func(value any) any {
+		data, _ := json.Marshal(value)
+		var decoded any
+		_ = json.Unmarshal(data, &decoded)
+		return decoded
+	}
+	if !reflect.DeepEqual(normalise(routed.Data), normalise(inProcess.Data)) {
+		t.Fatalf("routed rows=%#v in-process rows=%#v", routed.Data, inProcess.Data)
+	}
+	if canonical, route := core.Classify("commands", "ls"); canonical != "commands" || route != core.RouteDaemon {
+		t.Fatalf("route=%q/%v", canonical, route)
+	}
 }
 
 type dispatcherFunc func(context.Context, daemon.WorktreeScope, core.Request) core.Response

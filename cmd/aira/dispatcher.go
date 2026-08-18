@@ -180,10 +180,10 @@ func canonicalProjectPath(path string) (string, error) {
 func (d *daemonDispatcher) dispatchCarved(ctx context.Context, request core.Request, s core.Store, project app.Project) core.Response {
 	project.Runner.SetAdmitSocketPath(d.paths.SocketPath)
 	project.Runner.SetInputRuntimeDir(d.paths.RuntimeDir)
-	face := core.FaceOutput{Stdout: d.stdout, Stderr: d.diagnostics, Live: (request.Verb == "run" || request.Verb == "git") && !d.jsonOutput}
-	dispatcher := core.NewWithRunnerFace(s, project.Runner, d.stdin, face).WithGitOps(project.GitOps)
+	face := core.FaceOutput{Stdout: d.stdout, Stderr: d.diagnostics, Live: (request.Verb == "run" || request.Verb == "git" || request.Verb == "time") && !d.jsonOutput}
+	dispatcher := core.NewWithRunnerFace(s, project.Runner, d.stdin, face).WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix)
 	if d.outputCap > 0 {
-		dispatcher = core.NewWithRunnerOutputCap(s, project.Runner, d.outputCap).WithGitOps(project.GitOps)
+		dispatcher = core.NewWithRunnerFace(s, project.Runner, d.stdin, face).WithOutputCap(d.outputCap).WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix)
 	}
 	return dispatcher.Do(ctx, request)
 }
@@ -395,10 +395,11 @@ func (d *inProcessDispatcher) Dispatch(ctx context.Context, scope daemon.Worktre
 	if paths, pathErr := daemon.PathsFromEnv(); pathErr == nil {
 		project.Runner.SetInputRuntimeDir(paths.RuntimeDir)
 	}
-	face := core.FaceOutput{Stdout: d.stdout, Stderr: d.diagnostics, Live: (request.Verb == "run" || request.Verb == "git") && !d.jsonOutput}
-	dispatcher := core.NewWithRunnerFace(s, project.Runner, d.stdin, face).WithGitOps(project.GitOps)
+	canonical := core.CanonicalVerb(request.Verb)
+	face := core.FaceOutput{Stdout: d.stdout, Stderr: d.diagnostics, Live: (canonical == "run" || canonical == "git" || canonical == "time") && !d.jsonOutput}
+	dispatcher := core.NewWithRunnerFace(s, project.Runner, d.stdin, face).WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix)
 	if d.outputCap > 0 {
-		dispatcher = core.NewWithRunnerOutputCap(s, project.Runner, d.outputCap).WithGitOps(project.GitOps)
+		dispatcher = core.NewWithRunnerFace(s, project.Runner, d.stdin, face).WithOutputCap(d.outputCap).WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix)
 	}
 	return dispatcher.Do(ctx, request)
 }
@@ -455,6 +456,7 @@ func scopeFromProject(project app.Project, paths daemon.Paths) (daemon.WorktreeS
 		ReviewConfigured: reviewPolicy.Configured,
 		MaxReports:       project.Config.Project.TestReports.MaxReports, MaxAgeDays: project.Config.Project.TestReports.MaxAgeDays,
 		MaxComputeEvents: project.Config.Project.Compute.MaxEvents, MaxComputeAgeDays: project.Config.Project.Compute.MaxAgeDays,
+		MaxCommandEvents: project.Config.Project.Commands.MaxEvents, MaxCommandAgeDays: project.Config.Project.Commands.MaxAgeDays,
 		MaxQuotaSnapshots: project.Config.Project.Compute.MaxQuotaSnapshots,
 		LeaseTTLNS:        leaseTTL, ConfigDigest: hex.EncodeToString(digest[:]), StateID: paths.StateID,
 	}, nil

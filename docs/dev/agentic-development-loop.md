@@ -41,6 +41,14 @@ input is refused. Correctness-critical changes use adversarial probes against
 short-lived processes and crash/interleaving scenarios, not only in-process happy
 paths.
 
+Run ordinary development commands through `aira time -- <cmd>`, for example
+`aira time -- go test ./...`, so the retained command-frequency and latency
+evidence reflects the loop. Configure the project once with
+`"run":{"prefix":["whale-run"]}` when the existing memory cap must remain the
+inner launcher; `aira time` itself does not provide cgroup containment. The
+retrofit shell form `whale-run(){ aira time -- "$@"; }` preserves the established
+habit after that prefix is configured.
+
 ### Friction checkpoint
 
 At a gate bounce or after a flaky retry, pause once: if that just cost you time,

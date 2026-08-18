@@ -197,7 +197,7 @@ func TestSkillFaceInstallGuideAndRefusalRules(t *testing.T) {
 		t.Fatal(err)
 	}
 	var parsed core.SkillManifest
-	if err := json.Unmarshal(manifest, &parsed); err != nil || len(parsed.Actions) != 66 || parsed.Version == "" {
+	if err := json.Unmarshal(manifest, &parsed); err != nil || len(parsed.Actions) != 69 || parsed.Version == "" {
 		t.Fatalf("manifest err=%v value=%#v", err, parsed)
 	}
 	if exit := Run([]string{"skill", "install", installDir}, &out, &stderr); exit != 0 {

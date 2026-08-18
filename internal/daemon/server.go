@@ -622,6 +622,7 @@ func (s *Server) storeForScope(scope WorktreeScope) (*store.Store, bool, error) 
 		ReviewPolicy: scope.ReviewPolicy, LeaseStateDir: leaseDir, LeaseTTLNS: scope.LeaseTTLNS,
 		MaxReports: scope.MaxReports, MaxAgeDays: scope.MaxAgeDays,
 		MaxComputeEvents: scope.MaxComputeEvents, MaxComputeAgeDays: scope.MaxComputeAgeDays,
+		MaxCommandEvents: scope.MaxCommandEvents, MaxCommandAgeDays: scope.MaxCommandAgeDays,
 		MaxQuotaSnapshots: scope.MaxQuotaSnapshots, ConfigDigest: scope.ConfigDigest,
 	})
 	if err != nil {

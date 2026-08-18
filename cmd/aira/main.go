@@ -180,6 +180,9 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		return runWatchLoop(watchCtx, dispatcher, scope, request, jsonOutput, stdout, stderr)
 	}
 	response := dispatcher.Dispatch(context.Background(), scope, request)
+	if verb == "time" && !jsonOutput {
+		return renderTime(response, stdout, stderr)
+	}
 	if verb == "run-log" && !jsonOutput {
 		return renderRunLog(response, stdout, stderr)
 	}
@@ -296,7 +299,8 @@ func removeJSON(argv []string) ([]string, bool) {
 	result := make([]string, 0, len(argv))
 	jsonOutput := false
 	end := len(argv)
-	if len(argv) > 0 && strings.EqualFold(argv[0], "run") {
+	carvedArgv := len(argv) > 0 && (strings.EqualFold(argv[0], "run") || strings.EqualFold(argv[0], "time"))
+	if carvedArgv {
 		for i := 1; i < len(argv); i++ {
 			if argv[i] == "--" {
 				end = i
@@ -306,7 +310,7 @@ func removeJSON(argv []string) ([]string, bool) {
 	}
 	for i, arg := range argv {
 		if i >= end {
-			if len(argv) > 0 && strings.EqualFold(argv[0], "run") && arg == "--json" {
+			if carvedArgv && arg == "--json" {
 				// The token remains in the child argv verbatim, but still acts as
 				// the outer adapter's output selector for deterministic diagnostics.
 				jsonOutput = true
@@ -326,6 +330,9 @@ func removeJSON(argv []string) ([]string, bool) {
 func parseArgs(verb string, argv []string) ([]string, map[string]string, error) {
 	if verb == "run" {
 		return parseRunArgs(argv)
+	}
+	if verb == "time" {
+		return parseTimeArgs(argv)
 	}
 	if verb == "git" {
 		return parseGitArgs(argv)
@@ -395,6 +402,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"spend":       {"provider": true, "model": true, "source": true, "ticket": true, "phase": true, "at": true, "session": true, "agent": true, "total": true, "cost-usd": true, "usage-file": true, "bucket": true, "reasoning-subset": true, "by": true},
 		"quota":       {"provider": true, "source": true, "at": true, "window": true, "used": true, "limit": true, "remaining": true, "reset-at": true},
 		"insights":    {},
+		"commands":    {"by": true},
 		"git":         {},
 		"run-kill":    {"steal": true},
 		"run-input":   {"close": true, "steal": true},
@@ -478,6 +486,55 @@ func parseRunArgs(argv []string) ([]string, map[string]string, error) {
 	return target, options, nil
 }
 
+func parseTimeArgs(argv []string) ([]string, map[string]string, error) {
+	options := map[string]string{}
+	delimiter := -1
+	for i, arg := range argv {
+		if arg == "--" {
+			delimiter = i
+			break
+		}
+	}
+	if delimiter < 0 {
+		return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: time requires the standalone -- launch delimiter")
+	}
+	for i := 0; i < delimiter; i++ {
+		arg := argv[i]
+		if !strings.HasPrefix(arg, "--") || arg == "--" {
+			return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: time options must precede the launch delimiter")
+		}
+		name := strings.TrimPrefix(arg, "--")
+		if name == "no-prefix" {
+			options[name] = "true"
+			continue
+		}
+		if i+1 >= delimiter || strings.HasPrefix(argv[i+1], "--") {
+			return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: option --%s requires a value", name)
+		}
+		i++
+		value := argv[i]
+		switch name {
+		case "prefix", "env":
+			options[name] = appendDelimited(options[name], value)
+		case "cwd", "timeout", "ticket", "phase", "label":
+			if options[name] != "" {
+				return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: option --%s may occur once", name)
+			}
+			options[name] = value
+		default:
+			return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: option --%s is not valid for time", name)
+		}
+	}
+	if options["no-prefix"] == "true" && options["prefix"] != "" {
+		return nil, nil, errors.New("E_RUN_ARGUMENT_INVALID: --prefix and --no-prefix are mutually exclusive")
+	}
+	target := append([]string(nil), argv[delimiter+1:]...)
+	if len(target) == 0 {
+		return nil, nil, errors.New("E_RUN_ARGUMENT_INVALID: time target argv is empty")
+	}
+	return target, options, nil
+}
+
 const optionListSeparator = "\x00"
 
 func appendDelimited(existing, value string) string {
@@ -549,6 +606,25 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		args["usage"] = options["usage"]
 		args["provider"] = options["provider"]
 		args["strict_wiring"] = options["strict-wiring"] == "true"
+	case "time":
+		if len(positional) == 0 {
+			return core.Request{}, errors.New("E_RUN_ARGUMENT_INVALID: time target argv is empty")
+		}
+		args["argv"] = append([]string(nil), positional...)
+		if options["prefix"] != "" {
+			args["prefix"] = splitOptionList(options["prefix"])
+		}
+		args["no_prefix"] = options["no-prefix"] == "true"
+		args["cwd"], args["env"], args["timeout"] = options["cwd"], canonicalOptionList(options["env"]), options["timeout"]
+		args["ticket"], args["phase"], args["label"] = options["ticket"], options["phase"], options["label"]
+	case "commands":
+		if len(positional) == 0 || (positional[0] != "ls" && positional[0] != "count") {
+			return core.Request{}, errors.New("commands requires ls|count")
+		}
+		if positional[0] == "count" && options["by"] == "" {
+			return core.Request{}, errors.New("commands count requires --by <field>")
+		}
+		args["subverb"], args["query"], args["by"] = positional[0], strings.Join(positional[1:], " "), options["by"]
 	case "git":
 		if len(positional) == 0 {
 			return core.Request{}, fmt.Errorf("E_GIT_ARG_INVALID: git requires clone|fetch|push|ls-remote")
@@ -1289,6 +1365,41 @@ func renderRunLog(response core.Response, stdout, stderr io.Writer) int {
 		return exitForError(response.Code)
 	}
 	return 0
+}
+
+func renderTime(response core.Response, stdout, stderr io.Writer) int {
+	var writeErr error
+	for _, warning := range response.Warnings {
+		if _, err := fmt.Fprintf(stderr, "warning: %s\n", warning); err != nil && writeErr == nil {
+			writeErr = err
+		}
+	}
+	if !response.OK && response.Error != "" {
+		if _, err := fmt.Fprintln(stderr, response.Error); err != nil && writeErr == nil {
+			writeErr = err
+		}
+	}
+	if writeErr == nil && response.OK {
+		if flusher, ok := stdout.(interface{ Flush() error }); ok {
+			writeErr = flusher.Flush()
+		}
+	}
+	if response.AfterWrite != nil {
+		if err := response.AfterWrite(response.OK && writeErr == nil); err != nil {
+			_, _ = fmt.Fprintf(stderr, "E_RUN_DETACH_FAILED: %v\n", err)
+			return exitForError("E_RUN_DETACH_FAILED")
+		}
+	}
+	if writeErr != nil {
+		return exitForError("E_RUN_DETACH_FAILED")
+	}
+	if response.Exit != 0 {
+		return response.Exit
+	}
+	if response.OK {
+		return 0
+	}
+	return exitForError(response.Code)
 }
 
 func appErrorCode(err error) string {

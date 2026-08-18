@@ -152,6 +152,10 @@ type Store interface {
 	AddComputeEvent(context.Context, domain.ComputeEventInput) (store.ComputeEventAddResult, error)
 	ListComputeEvents(string) ([]domain.ComputeEvent, error)
 	SpendByPhase(context.Context, string) ([]store.ComputePhaseSummary, error)
+	AddCommandEvent(context.Context, domain.CommandEventInput) (store.CommandEventAddResult, error)
+	ListCommandEvents(string) ([]domain.CommandEvent, error)
+	CommandDistribution(string, string) (store.CommandDistributionResult, error)
+	CommandLatencyByKeyPair(context.Context) ([]store.CommandLatencySummary, error)
 	AddQuotaSnapshot(context.Context, domain.QuotaSnapshotInput) (store.QuotaSnapshotAddResult, error)
 	ListQuotaSnapshots(string) ([]domain.QuotaSnapshot, error)
 	PinGateBaseline(context.Context, string, []string, string, string) (store.GateBaseline, error)
@@ -304,6 +308,7 @@ type Core struct {
 	outputCap      int64
 	reportMaxBytes int64
 	face           FaceOutput
+	commandPrefix  []string
 	verbs          map[string]verbSpec
 }
 
@@ -398,9 +403,22 @@ func NewWithRunnerOutputCap(s Store, execution Runner, cap int64) *Core {
 	return c
 }
 
+func (c *Core) WithOutputCap(cap int64) *Core {
+	c.outputCap = cap
+	return c
+}
+
 // WithGitOps attaches git network operations to a runner-bearing face.
 func (c *Core) WithGitOps(g GitOps) *Core {
 	c.gitops = g
+	return c
+}
+
+// WithCommandPrefix attaches the configured run prefix to the thin time
+// launcher. The copy prevents a caller from mutating launch policy after Core
+// construction.
+func (c *Core) WithCommandPrefix(prefix []string) *Core {
+	c.commandPrefix = append([]string(nil), prefix...)
 	return c
 }
 
@@ -459,6 +477,9 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 		}
 	}
 	data = c.presentRunData(data)
+	if timed, ok := data.(commandTimingData); ok {
+		return responseForCommandTiming(timed, warnings, afterWrite)
+	}
 	if handlerCode != "" {
 		if handlerError == "" {
 			handlerError = handlerCode
@@ -961,6 +982,18 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				return nil, fmt.Errorf("E_UNKNOWN_VERB: unknown req sub-verb %q", subverb)
 			}
 		}},
+		"time": {Name: "time", Usage: "time [--prefix P... | --no-prefix] [--cwd DIR] [--env K=V...] [--timeout D] [--ticket T] [--phase P] [--label L] -- <argv...>; output not captured; returns the recorded command event only", GitContext: true, Args: []ArgSpec{
+			listSpec("argv", true, true, "Exact target argv after the launch delimiter"),
+			listSpec("prefix", false, false, "Optional exact launch-prefix argv"),
+			boolSpec("no_prefix", false, false, "Disable the configured launch prefix"),
+			stringSpec("cwd", false, false, "Launch working directory"),
+			listSpec("env", false, false, "Exact KEY=VALUE environment overrides"),
+			stringSpec("timeout", false, false, "Positive command timeout duration"),
+			stringSpec("ticket", false, false, "Ticket ID"), stringSpec("phase", false, false, "Work phase"), stringSpec("label", false, false, "Aggregation label"),
+		}, MCPTool: "aira_time", Run: c.runCommandTime},
+		"commands": {Name: "commands", Usage: "commands ls [q] [--by program|key|status|branch|ticket] | commands count [q] --by <field>", Args: []ArgSpec{
+			stringSpec("subverb", true, true, "Command telemetry operation", "ls", "count"), stringSpec("query", false, true, "Command event query"), stringSpec("by", false, false, "Distribution field", "program", "key", "status", "branch", "ticket"),
+		}, MCPTool: "aira_commands", MCPOperation: "subverb", Run: c.runCommands},
 		"spend": {Name: "spend", Usage: "spend add|ls ...", Args: []ArgSpec{
 			stringSpec("subverb", true, true, "Spend operation", "add", "ls"), stringSpec("provider", false, false, "LLM provider"), stringSpec("model", false, false, "Model"), stringSpec("source", false, false, "Ingest source"), stringSpec("ticket", false, false, "Ticket ID"), stringSpec("phase", false, false, "Work phase"), stringSpec("at", false, false, "Timestamp"), stringSpec("session", false, false, "Session"), stringSpec("agent", false, false, "Agent"), stringSpec("total", false, false, "Reported total"), stringSpec("cost-usd", false, false, "Caller-supplied cost"), stringSpec("query", false, false, "Event query"), stringSpec("by", false, false, "Live distribution field"), boolSpec("reasoning-subset", false, false, "Reasoning is a subset of output"), listSpec("bucket", false, false, "Explicit disjoint bucket K=V"), stringSpec("raw", false, false, "Provider usage payload"), stringSpec("usage-file", false, false, "Provider usage file"),
 		}, MCPTool: "aira_spend", MCPOperation: "subverb", Run: func(ctx context.Context, args *argAccessor) (any, error) {
@@ -1781,7 +1814,12 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 			{Name: "push", Summary: "Push explicit refs", Safety: SafetyExecute, Args: []OperationArg{{Name: "remote"}, {Name: "refspecs"}}, Example: []string{"push", "origin", "--", "HEAD:main"}},
 			{Name: "ls-remote", Summary: "List remote refs", Safety: SafetyExecute, Args: []OperationArg{{Name: "remote"}, {Name: "refspecs"}}, Example: []string{"ls-remote", "origin"}},
 		}},
-		"run":       {summary: "Launch a subprocess in an owned scope", safety: SafetyExecute, example: []string{"--merge", "--", "printf", "hello"}},
+		"run":  {summary: "Launch a subprocess in an owned scope", safety: SafetyExecute, example: []string{"--merge", "--", "printf", "hello"}},
+		"time": {summary: "Run a byte-transparent command and record timing", safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
+		"commands": {summary: "Read recorded command events and exact distributions", safety: SafetyRead, operations: []OperationSpec{
+			{Name: "ls", Summary: "List recorded command events", Safety: SafetyRead, Args: []OperationArg{{Name: "query"}, {Name: "by"}}, Example: []string{"ls", "key-source:program-subcommand key:go test"}},
+			{Name: "count", Summary: "Count command events by a dimension", Safety: SafetyRead, Args: []OperationArg{{Name: "query"}, {Name: "by", Required: true}}, Example: []string{"count", "status:exited", "--by", "key"}},
+		}},
 		"run-input": {summary: "Send bytes accepted for delivery to a detached run", safety: SafetyExecute, example: []string{"RUN-1", "--close"}},
 		"run-kill":  {summary: "Kill an owned run scope", safety: SafetyExecute, example: []string{"RUN-1"}},
 		"run-log":   {summary: "Read captured run output", safety: SafetyRead, example: []string{"RUN-1", "--stream", "out"}},

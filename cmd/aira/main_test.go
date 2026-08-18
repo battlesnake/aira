@@ -80,6 +80,50 @@ func TestHumanRenderingIncludesWarnings(t *testing.T) {
 	}
 }
 
+func TestTimeCLIParsingBuildsCarvedRequestAndPreservesTargetTokens(t *testing.T) {
+	argv, options, err := parseArgs("time", []string{"--prefix", "whale-run", "--env", "A=B", "--timeout", "1s", "--ticket", "AIRA-1", "--phase", "implement", "--label", "tests", "--", "go", "test", "--json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := buildRequest("time", argv, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(request.Args["argv"], []string{"go", "test", "--json"}) || !reflect.DeepEqual(request.Args["prefix"], []string{"whale-run"}) || request.Args["timeout"] != "1s" || request.Args["label"] != "tests" {
+		t.Fatalf("time request=%#v", request)
+	}
+	stripped, jsonOutput := removeJSON([]string{"time", "--json", "--", "go", "test", "--json"})
+	if !jsonOutput || !reflect.DeepEqual(stripped, []string{"time", "--", "go", "test", "--json"}) {
+		t.Fatalf("removeJSON=%#v json=%v", stripped, jsonOutput)
+	}
+	if _, _, err := parseArgs("time", []string{"go", "test"}); err == nil {
+		t.Fatal("time accepted missing delimiter")
+	}
+}
+
+func TestRenderTimeSuppressesDataButKeepsWarningsExitAndAfterWrite(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	called := false
+	response := core.Response{OK: true, Code: "OK", Data: map[string]any{"status": "exited"}, Warnings: []string{"telemetry failed"}, Exit: 7, AfterWrite: func(delivered bool) error { called = delivered; return nil }}
+	if exit := renderTime(response, &stdout, &stderr); exit != 7 {
+		t.Fatalf("exit=%d", exit)
+	}
+	if stdout.Len() != 0 || !strings.Contains(stderr.String(), "telemetry failed") || !called {
+		t.Fatalf("stdout=%q stderr=%q called=%v", stdout.String(), stderr.String(), called)
+	}
+}
+
+func TestRenderTimeReportsDiagnosticDeliveryFailureToAfterWrite(t *testing.T) {
+	delivered := true
+	response := core.Response{OK: true, Code: "OK", Warnings: []string{"telemetry failed"}, AfterWrite: func(ok bool) error {
+		delivered = ok
+		return nil
+	}}
+	if exit := renderTime(response, &bytes.Buffer{}, failingWriter{}); exit != 4 || delivered {
+		t.Fatalf("exit=%d delivered=%v", exit, delivered)
+	}
+}
+
 func TestReadyListFlagParsesAsBoolean(t *testing.T) {
 	positional, options, err := parseArgs("ready", []string{"--list"})
 	if err != nil {

@@ -44,7 +44,7 @@ func TestDispatchMetadataMatchesInstrumentedHandlerReads(t *testing.T) {
 		}
 		if len(descriptor.Operations) > 0 {
 			discriminator := ""
-			if name == "find" || name == "req" || name == "test-report" || name == "spend" || name == "quota" || name == "insights" || name == "git" || name == "rant" {
+			if name == "find" || name == "req" || name == "test-report" || name == "spend" || name == "quota" || name == "insights" || name == "git" || name == "rant" || name == "commands" {
 				discriminator = "subverb"
 			} else if name == "link" {
 				discriminator = "list"
@@ -109,6 +109,20 @@ func metadataProbeInputs(name string) []map[string]any {
 		"remote": "origin", "url": "git@github.com:owner/repo.git", "refspecs": []string{"HEAD:main"}, "dir": "repo",
 	}
 	switch name {
+	case "time":
+		values = cloneMetadataInputs(values, "argv", []string{"/bin/true"})
+		values = cloneMetadataInputs(values, "prefix", []string{})
+		values = cloneMetadataInputs(values, "no_prefix", false)
+		values = cloneMetadataInputs(values, "cwd", "")
+		values = cloneMetadataInputs(values, "env", []string{})
+		values = cloneMetadataInputs(values, "timeout", "")
+		values = cloneMetadataInputs(values, "phase", "implement")
+		values = cloneMetadataInputs(values, "label", "unit")
+		return []map[string]any{values}
+	case "commands":
+		values = cloneMetadataInputs(values, "query", "")
+		values = cloneMetadataInputs(values, "by", "status")
+		return []map[string]any{cloneMetadataInputs(values, "subverb", "ls"), cloneMetadataInputs(values, "subverb", "count")}
 	case "rant":
 		values = cloneMetadataInputs(values, "by", "")
 		values = cloneMetadataInputs(values, "severity", "annoyance")
@@ -327,6 +341,16 @@ func (metadataProbeStore) ListComputeEvents(string) ([]domain.ComputeEvent, erro
 func (metadataProbeStore) SpendByPhase(context.Context, string) ([]store.ComputePhaseSummary, error) {
 	return nil, nil
 }
+func (metadataProbeStore) AddCommandEvent(context.Context, domain.CommandEventInput) (store.CommandEventAddResult, error) {
+	return store.CommandEventAddResult{}, nil
+}
+func (metadataProbeStore) ListCommandEvents(string) ([]domain.CommandEvent, error) { return nil, nil }
+func (metadataProbeStore) CommandDistribution(string, string) (store.CommandDistributionResult, error) {
+	return store.CommandDistributionResult{}, nil
+}
+func (metadataProbeStore) CommandLatencyByKeyPair(context.Context) ([]store.CommandLatencySummary, error) {
+	return nil, nil
+}
 func (metadataProbeStore) AddQuotaSnapshot(context.Context, domain.QuotaSnapshotInput) (store.QuotaSnapshotAddResult, error) {
 	return store.QuotaSnapshotAddResult{}, nil
 }
@@ -375,7 +399,7 @@ func TestCanonicalDispatchNamesAndAliases(t *testing.T) {
 		got = append(got, descriptor.Name)
 	}
 	sort.Strings(got)
-	want := []string{"check", "claim", "count", "create", "find", "gate", "git", "grep", "heartbeat", "help", "id", "import", "init", "insights", "link", "list", "mv", "quota", "rant", "ready", "reconcile", "release", "req", "review", "run", "run-input", "run-kill", "run-log", "set", "show", "spend", "test-report", "touch", "unlink"}
+	want := []string{"check", "claim", "commands", "count", "create", "find", "gate", "git", "grep", "heartbeat", "help", "id", "import", "init", "insights", "link", "list", "mv", "quota", "rant", "ready", "reconcile", "release", "req", "review", "run", "run-input", "run-kill", "run-log", "set", "show", "spend", "test-report", "time", "touch", "unlink"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("dispatch names=%v, want=%v", got, want)
 	}

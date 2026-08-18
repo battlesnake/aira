@@ -136,6 +136,18 @@ func (unexpectedCarvedStore) ListComputeEvents(string) ([]domain.ComputeEvent, e
 func (unexpectedCarvedStore) SpendByPhase(context.Context, string) ([]store.ComputePhaseSummary, error) {
 	return nil, errUnexpectedCarvedStore
 }
+func (unexpectedCarvedStore) AddCommandEvent(context.Context, domain.CommandEventInput) (store.CommandEventAddResult, error) {
+	return store.CommandEventAddResult{}, errUnexpectedCarvedStore
+}
+func (unexpectedCarvedStore) ListCommandEvents(string) ([]domain.CommandEvent, error) {
+	return nil, errUnexpectedCarvedStore
+}
+func (unexpectedCarvedStore) CommandDistribution(string, string) (store.CommandDistributionResult, error) {
+	return store.CommandDistributionResult{}, errUnexpectedCarvedStore
+}
+func (unexpectedCarvedStore) CommandLatencyByKeyPair(context.Context) ([]store.CommandLatencySummary, error) {
+	return nil, errUnexpectedCarvedStore
+}
 func (unexpectedCarvedStore) AddQuotaSnapshot(context.Context, domain.QuotaSnapshotInput) (store.QuotaSnapshotAddResult, error) {
 	return store.QuotaSnapshotAddResult{}, errUnexpectedCarvedStore
 }
