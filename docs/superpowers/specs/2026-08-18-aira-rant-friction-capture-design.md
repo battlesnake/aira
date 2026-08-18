@@ -1,6 +1,6 @@
 # RANT — agent friction capture + git-context provenance (design / plan)
 
-**Status:** v4 — APPROVED. Round-1+2 (Sol · Opus-5 · Terra) + Fable final-boss gate → GATE-PASS (5 residuals folded). Ready for the build loop.
+**Status:** v5 — APPROVED + operator forks resolved (2026-08-18): hook→skill-only; digest→owner-triggered/on-demand. Ready to build.
 **Milestone:** Phase 5 · rant (task #43). Follows D1–D6 (all merged; master `59596b5`).
 **Loop:** multi-model design → Fable final gate → committed spec → Sol plan-review → Fable plan-gate
 → Terra build → Opus real-HW verify → Sol build-review → merge.
@@ -25,13 +25,15 @@ A friction corpus dies at either end; the entity in the middle can't save it.
   just cost you time, `aira rant` it."* Ship only the tool description → empty corpus; ship the
   checkpoint → it fills. (An AIRA-side friction-moment hook that fires ONE invitation at a detected
   anomaly is **deferred** — off-by-default *unimplemented* machinery adds no adoption value, Sol; its
-  boundary is specified in §9 for later, and remains an owner fork since it edges the "never prompted"
-  line.)
-- **Review ritual (output).** A corpus with no owner + no cadence is a graveyard. v1 **institutes a
-  concrete first ritual as a COMMITTED, build-review-checkable artifact** (not aspirational): a
-  `docs/dev/friction-digest.md` naming the **first owner + cadence + output** (→ tickets/lints) for the
-  periodic **friction digest**, plus a **minimal `resolved_by` link** (§4) so "did my rant change
-  anything" is answerable (the feedback that sustains adoption).
+  boundary is specified in §9 for later. **Owner decision (2026-08-18): leave adoption to the skill
+  checkpoint for now — the AIRA-side hook stays deferred.**)
+- **Review ritual (output).** A corpus with no owner + no cadence is a graveyard. v1 ships a
+  COMMITTED, build-review-checkable **`docs/dev/friction-digest.md`** describing the review flow.
+  **Owner decision (2026-08-18): the ritual is OWNER-TRIGGERED / on-demand — no fixed cadence; the
+  owner tells an agent "review this repo's rants and report back," which runs the review surfaces
+  (`rant ls --by tag|actor`, `--unreviewed`, `grep`, typed outcomes) and records dispositions.** The
+  doc names the owner as trigger + the concrete surface commands + the output (→ tickets/lints); the
+  **minimal `resolved_by` link** (§4) makes "did my rant change anything" answerable.
 
 ## 3. Scope — v1 = the smallest genuinely-reviewable loop
 **IN:** the `rant` entity (capture); `rant ls`/`count --by tag`/`--by actor`/`get`; **append-only
@@ -155,7 +157,7 @@ git-context + M19 fold; trend/similarity gauges; cross-project; live command-tel
 `dirty?` bit; payload-bearing journal (only if corpus-recovery-across-DB-loss is ever wanted).
 
 ## 10. Resolved open questions
-Q1 adoption: **defer the hook impl** (spec its boundary, §9) + **promote a dev-loop skill checkpoint to a
-v1 DoD** (§2). Q2 severity: **enum only**. Q3 pass entity: **defer** — `--unreviewed`+`--since` for v1
+Q1 adoption: **owner chose skill-only** — the friction-moment hook is deferred (§9); the dev-loop skill
+checkpoint is the v1 DoD (§2). Q2 severity: **enum only**. Q3 pass entity: **defer** — `--unreviewed`+`--since` for v1
 (single-reviewer), add the entity migration-free later. Q4: **keep both paths**. Q5 same-tag loop-closer:
 **v1**, post-commit, typed outcomes, honest label.
