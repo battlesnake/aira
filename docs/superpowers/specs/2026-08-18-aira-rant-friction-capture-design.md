@@ -1,6 +1,6 @@
 # RANT — agent friction capture + git-context provenance (design / plan)
 
-**Status:** v3 — folds round-1 + round-2 (Sol · Opus-5 · Terra). For the Fable final-boss gate.
+**Status:** v4 — APPROVED. Round-1+2 (Sol · Opus-5 · Terra) + Fable final-boss gate → GATE-PASS (5 residuals folded). Ready for the build loop.
 **Milestone:** Phase 5 · rant (task #43). Follows D1–D6 (all merged; master `59596b5`).
 **Loop:** multi-model design → Fable final gate → committed spec → Sol plan-review → Fable plan-gate
 → Terra build → Opus real-HW verify → Sol build-review → merge.
@@ -28,15 +28,17 @@ A friction corpus dies at either end; the entity in the middle can't save it.
   boundary is specified in §9 for later, and remains an owner fork since it edges the "never prompted"
   line.)
 - **Review ritual (output).** A corpus with no owner + no cadence is a graveyard. v1 **institutes a
-  concrete first ritual** (definition-of-done, not aspirational): a periodic **friction digest** —
-  named owner + cadence + output=tickets/lints — plus a **minimal `resolved_by` link** (§4) so "did my
-  rant change anything" is answerable (the feedback that sustains adoption).
+  concrete first ritual as a COMMITTED, build-review-checkable artifact** (not aspirational): a
+  `docs/dev/friction-digest.md` naming the **first owner + cadence + output** (→ tickets/lints) for the
+  periodic **friction digest**, plus a **minimal `resolved_by` link** (§4) so "did my rant change
+  anything" is answerable (the feedback that sustains adoption).
 
 ## 3. Scope — v1 = the smallest genuinely-reviewable loop
 **IN:** the `rant` entity (capture); `rant ls`/`count --by tag`/`--by actor`/`get`; **append-only
 review observations** with a **typed outcome**; `--unreviewed` + an explicit **`--since <seq>`** cursor;
 **caller-observed git-context**; FTS; the **same-tag prior-outcome** loop-closer; a "recorded-tags / N
-distinct actors" aggregate; the §2 skill-checkpoint + first digest ritual.
+distinct actors" aggregate; **`aira rant redact`** (tombstone a secret-bearing body, keep ID+provenance);
+the §2 skill-checkpoint + first digest ritual (both as committed artifacts — §2/§8).
 **DEFER:** a persisted **review-PASS entity** (v1 is single-reviewer — `--unreviewed`+`--since` suffice;
 append-only rows make it migration-free to add for multi-reviewer/auditable-interrupted passes — the
 one Sol↔Opus-5 divergence, resolved toward YAGNI + honesty); a trend/"themes"/similarity gauge (free
@@ -91,15 +93,21 @@ owner's "if appropriate" case); `worktree_id` replaces neither.
   unexported `gitremote.redactURL`** — Terra); abs worktree paths are machine-local (stored by default,
   but path storage **configurable to relativize/hash** for the future remote phase). **Rant bodies +
   review notes are UNTRUSTED input** (a prompt-injection surface) — documented; a reviewing agent must
-  treat them as data, never raw instructions; the loop-closer (§6) surfaces only TYPED outcomes + safely-
-  rendered notes; audited redaction/tombstoning keeps the ID + journal history.
+  treat them as data, never raw instructions; the loop-closer (§6) surfaces only
+  `{rant_id, tag, typed outcome}` (never body/note prose — prose stays behind an explicit `rant get`);
+  and a v1 **`aira rant redact RANT-n`** tombstones a body an agent pasted a secret into, **keeping the
+  ID + provenance + journal history** (Fable 2 — agents WILL paste token-bearing error output).
 - **Scope: artifact-CREATING verbs only** (rant now; run/finding-create later) via a new `verbSpec`/
   `DispatchDescriptor` provenance flag — NOT review actions / generic telemetry / hot read paths.
 
 ## 6. Routing + faces (Terra)
 - **`rant` is a ROUTED verb** (daemon-owned durable write; default `Classify` routes it). The client
-  resolves `GitContext` + stamps it on `core.Request`; the daemon validates scope-stable fields against
-  `WorktreeScope` and accepts the caller-only HEAD evidence verbatim.
+  resolves `GitContext` + stamps it on `core.Request`; the daemon **cross-checks the
+  scope-stable fields** (`repo_root`, `worktree_id`, git-dir-derived) against its `WorktreeScope` and,
+  on a mismatch, **stores the caller value with an explicit `mismatch` status label** (never silently
+  rejects — the caller's honest observation is still recorded, flagged); the **caller-only evidence**
+  (`head_hash`, `head_ref`, `remote_url`) is stored **verbatim, unvalidated** (the daemon cannot know the
+  caller's commit).
 - **CLI:** `aira rant "<text>" [--tag T]… [--severity S] [--ref run:RUN-n|ticket:…]… [--idem KEY]`;
   `aira rant ls [--by tag|actor] [--unreviewed] [--since <seq>]`; `aira rant get RANT-n`;
   `aira rant review RANT-n [--outcome O] [--note "…"] [--resolved-by ticket:X]`.
@@ -107,10 +115,11 @@ owner's "if appropriate" case); `worktree_id` replaces neither.
   permitted prompt: *"Ranting welcome: slow tests, linter noise, flaky infra, confusing setup — dump it
   unfiltered; logged for later review, you won't be asked to format it."* Never nagged per-turn.
 - **Loop-closer (Q5 = v1; Sol/Opus-5 converge):** capture returns, **post-commit**, a small deterministic
-  set of **recent rants sharing a recorded tag** + their **typed review outcomes** (labelled "sharing
-  recorded tags", NEVER "similar") — so the ranter sees "3 similar; one `wont-fix`: X". Dedupes *future*
-  re-files + closes the only agent-facing feedback loop; honest because tag-match is a fact + the outcome
-  is typed (not prose-inferred).
+  set of **recent rants sharing a recorded tag**, each as **`{rant_id, tag, typed outcome}` ONLY — never
+  the note/body prose** (Fable: prose can be fenced but not sanitized, so it stays behind an explicit
+  `rant get`), labelled "sharing recorded tags", NEVER "similar" — so the ranter sees "RANT-4/RANT-9 share
+  tag `slow-tests`; RANT-4 outcome=`wont-fix`". Dedupes *future* re-files + closes the only agent-facing
+  feedback loop; honest because tag-match is a fact + the outcome is typed (not prose-inferred).
 - **Reviewable surfaces:** `ls`/`count --by tag`/**`--by actor`** (distinct-reporter is the systemic
   signal — "5 agents hit this" ≠ "1 vented 5×"); FTS via `aira grep`; the generic `watch` already streams
   `rant.create` (no dedicated watch UX); `--unreviewed` + `--since <seq>` give honest "what's new"
@@ -120,9 +129,11 @@ owner's "if appropriate" case); `worktree_id` replaces neither.
 1. Subjective-opinion type; aggregates read "N rants / N distinct actors about tag X", never a claim.
 2. `reviewed` DERIVED from append-only observations; "reviewed" = examined; disposition only via the
    typed `outcome`, never inferred from prose; `outcome` is explicitly NON-final.
-3. git-context is caller-OBSERVED (per-field status, observed/received_at), never daemon-verified;
-   reftable/includes/unresolvable → `unevaluated`; creds redacted; bodies+notes untrusted (never
-   raw-injected into a reviewer's prompt).
+3. git-context is caller-OBSERVED: scope-stable fields (repo_root/worktree_id/git-dir) are daemon
+   cross-checked → mismatch stored with a `mismatch` label (never silently rejected); the caller-only
+   evidence (head_hash/head_ref/remote_url) is stored verbatim, unvalidated. Unresolvable/reftable/
+   includes → `unevaluated`; creds redacted; bodies+notes untrusted (never raw-injected into a
+   reviewer's prompt; the loop-closer returns no prose).
 4. Idempotent under retry via `UNIQUE(project_id, idempotency_key)`; same-key-different-input →
    `E_RANT_IDEMPOTENCY_CONFLICT`; no semantic dedup.
 5. Cheap to file, NEVER nagged (context block only; adoption via the dev-loop skill checkpoint);
