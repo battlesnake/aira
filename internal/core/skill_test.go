@@ -16,8 +16,8 @@ func TestSkillMetadataNormalisesEveryIncludedAction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(artifacts.Actions) != 61 {
-		t.Fatalf("actions=%d, want 61", len(artifacts.Actions))
+	if len(artifacts.Actions) != 66 {
+		t.Fatalf("actions=%d, want 66", len(artifacts.Actions))
 	}
 	for _, action := range artifacts.Actions {
 		if action.Summary == "" || !action.Safety.Valid() || !strings.HasPrefix(action.Command, "aira ") {
@@ -83,6 +83,7 @@ func TestSkillSafetyGolden(t *testing.T) {
 		"link/link": SafetyMutate, "link/list": SafetyRead,
 		"spend/add": SafetyMutate, "spend/ls": SafetyRead,
 		"quota/add": SafetyMutate, "quota/ls": SafetyRead,
+		"rant/capture": SafetyMutate, "rant/ls": SafetyRead, "rant/get": SafetyRead, "rant/review": SafetyMutate, "rant/redact": SafetyMutate,
 		"gate/add": SafetyMutate, "gate/ls": SafetyRead, "gate/show": SafetyRead,
 		"gate/set": SafetyMutate, "gate/run": SafetyReconcile, "gate/check": SafetyRead,
 		"gate/attest": SafetyMutate, "gate/prove": SafetyMutate, "gate/review": SafetyRead,
@@ -96,7 +97,7 @@ func TestSkillSafetyGolden(t *testing.T) {
 	got := map[string]SafetyClass{}
 	for _, action := range artifacts.Actions {
 		key := action.Verb
-		if action.Verb == "find" || action.Verb == "req" || action.Verb == "link" || action.Verb == "gate" || action.Verb == "test-report" || action.Verb == "spend" || action.Verb == "quota" || action.Verb == "insights" || action.Verb == "git" {
+		if action.Verb == "find" || action.Verb == "req" || action.Verb == "link" || action.Verb == "gate" || action.Verb == "test-report" || action.Verb == "spend" || action.Verb == "quota" || action.Verb == "insights" || action.Verb == "git" || action.Verb == "rant" {
 			key += "/" + action.Operation
 		}
 		got[key] = action.Safety

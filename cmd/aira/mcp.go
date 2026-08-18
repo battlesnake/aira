@@ -111,6 +111,9 @@ func makeToolBinding(name string, descriptors []core.DispatchDescriptor) mcpTool
 		operation := descriptor.MCPOperation
 		for _, arg := range descriptor.Args {
 			if arg.Name == "subverb" {
+				if descriptor.Name == "rant" {
+					continue
+				}
 				if operation == "" || operation == "subverb" {
 					for _, value := range arg.Enum {
 						operations[value] = makeMCPOperation(descriptor, value)
@@ -127,6 +130,15 @@ func makeToolBinding(name string, descriptors []core.DispatchDescriptor) mcpTool
 		if operation != "" && operation != "subverb" {
 			operations[operation] = makeMCPOperation(descriptor, operation)
 		}
+	}
+	if len(descriptors) == 1 && descriptors[0].Name == "rant" {
+		capture := makeMCPOperation(descriptors[0], "capture")
+		operations = map[string]mcpOperation{"": capture}
+		allArgs = map[string]core.ArgSpec{}
+		for _, arg := range capture.declaredArgs {
+			allArgs[arg.Name] = arg
+		}
+		multiple = false
 	}
 	// `link ls <id>` is the third operation of the grouped link tool.
 	if link, ok := descriptorNamed(descriptors, "link"); ok {
@@ -180,6 +192,9 @@ func makeToolBinding(name string, descriptors []core.DispatchDescriptor) mcpTool
 	description := name
 	if len(descriptors) > 0 && descriptors[0].Usage != "" {
 		description = descriptors[0].Usage
+	}
+	if len(descriptors) == 1 && descriptors[0].Name == "rant" {
+		description = "Ranting welcome: slow tests, linter noise, flaky infra, confusing setup — dump it unfiltered; logged for later review, you won't be asked to format it."
 	}
 	return mcpToolBinding{
 		tool:        mcpTool{Name: name, Description: description, InputSchema: schema},
@@ -368,6 +383,10 @@ func decodeMCPRequest(binding mcpToolBinding, values map[string]json.RawMessage)
 		if string(raw) == "null" && !arg.Required && (bindingOperation.descriptor.Name == "run" || bindingOperation.descriptor.Name == "run-log") {
 			continue
 		}
+		if string(raw) == "null" && !arg.Required && bindingOperation.descriptor.Name == "rant" && arg.Kind == core.ArgKindStringList {
+			args[arg.Name] = []string(nil)
+			continue
+		}
 		value, err := decodeMCPValue(arg, raw)
 		if err != nil {
 			return core.Request{}, err
@@ -375,7 +394,7 @@ func decodeMCPRequest(binding mcpToolBinding, values map[string]json.RawMessage)
 		args[arg.Name] = value
 	}
 	if bindingOperation.descriptor.MCPOperation == "subverb" {
-		args["subverb"] = operation
+		args["subverb"] = bindingOperation.operation
 	}
 	if bindingOperation.descriptor.Name == "link" && operation == "list" {
 		args["list"] = true

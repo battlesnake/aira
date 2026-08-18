@@ -41,6 +41,14 @@ input is refused. Correctness-critical changes use adversarial probes against
 short-lived processes and crash/interleaving scenarios, not only in-process happy
 paths.
 
+### Friction checkpoint
+
+At a gate bounce or after a flaky retry, pause once: if that just cost you time,
+`aira rant "<what got in the way>" --tag <recorded-tag>` it. This is the agent's
+own workflow checkpoint, not an AIRA prompt; AIRA never nags during ordinary
+commands. Capture the friction and continue the task rather than polishing the
+wording or attempting diagnosis in the rant.
+
 ## Lighter path for trivial changes
 
 A typo, link correction, comment-only edit, or mechanical change with no

@@ -548,6 +548,15 @@ func routingFixtures(descriptors []DispatchDescriptor, findingID string) []Reque
 		base["output_cap_bytes"] = "1024"
 		base["run_id"] = "RUN-1"
 		switch descriptor.Name {
+		case "rant":
+			base["selector"] = "RANT-1"
+			base["severity"] = "annoyance"
+			base["text"] = "routing friction"
+			base["tags"] = []string{"routing"}
+			base["refs"] = []string{}
+			base["idempotency_key"] = ""
+			base["by"] = ""
+			base["since"] = "0"
 		case "find":
 			base["selector"] = findingID
 			base["by"] = "source"

@@ -929,11 +929,32 @@ var (
 	tokenPattern         = regexp.MustCompile(`(?i)(github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|Bearer[ \t]+[A-Za-z0-9._~+/=-]+|password=[^\s]+)`)
 )
 
-func redactURL(value string) string {
-	value = httpsUserinfoPattern.ReplaceAllString(value, `${1}***@`)
-	return otherUserinfoPattern.ReplaceAllString(value, `${1}***@`)
+// RedactURL removes credential-bearing URL components while retaining enough
+// endpoint identity for provenance and diagnostics.
+func RedactURL(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if parsed, err := url.Parse(trimmed); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+		if strings.EqualFold(parsed.Scheme, "http") || strings.EqualFold(parsed.Scheme, "https") || (parsed.User != nil && strings.Contains(parsed.User.String(), ":")) {
+			parsed.User = nil
+		}
+		parsed.RawQuery = ""
+		parsed.ForceQuery = false
+		parsed.Fragment = ""
+		return parsed.String()
+	}
+	trimmed = httpsUserinfoPattern.ReplaceAllString(trimmed, `${1}***@`)
+	trimmed = otherUserinfoPattern.ReplaceAllString(trimmed, `${1}***@`)
+	if at := strings.IndexByte(trimmed, '@'); at > 0 && strings.Contains(trimmed[:at], ":") && !strings.Contains(trimmed[:at], "/") {
+		trimmed = "***" + trimmed[at:]
+	}
+	if cut := strings.IndexAny(trimmed, "?#"); cut >= 0 {
+		trimmed = trimmed[:cut]
+	}
+	return trimmed
 }
-func redact(value string) string { return tokenPattern.ReplaceAllString(redactURL(value), "***") }
+
+func redactURL(value string) string { return RedactURL(value) }
+func redact(value string) string    { return tokenPattern.ReplaceAllString(redactURL(value), "***") }
 
 func redactDetails(details map[string]any) map[string]any {
 	if details == nil {

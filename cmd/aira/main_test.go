@@ -19,6 +19,26 @@ type requestCaptureRunner struct {
 	request runner.Request
 }
 
+func TestRantCLIRepeatedTagsRefsAndReviewFaces(t *testing.T) {
+	positional, options, err := parseArgs("rant", []string{"raw friction", "--tag", "Slow_Tests", "--tag", "infra", "--severity", "annoyance", "--ref", "ticket:AIRA-1", "--ref", "gate:unit", "--idem", "retry-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := buildRequest("rant", positional, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTags := []string{"Slow_Tests", "infra"}
+	wantRefs := []string{"ticket:AIRA-1", "gate:unit"}
+	if request.Args["subverb"] != "capture" || request.Args["text"] != "raw friction" || !reflect.DeepEqual(request.Args["tags"], wantTags) || !reflect.DeepEqual(request.Args["refs"], wantRefs) || request.Args["idempotency_key"] != "retry-1" {
+		t.Fatalf("capture request = %#v", request)
+	}
+	review, err := buildRequest("rant", []string{"review", "RANT-1"}, map[string]string{"outcome": "planned", "note": "examined", "resolved-by": "ticket:AIRA-1"})
+	if err != nil || review.Args["subverb"] != "review" || review.Args["resolved_by"] != "ticket:AIRA-1" {
+		t.Fatalf("review request=%#v err=%v", review, err)
+	}
+}
+
 func (r *requestCaptureRunner) Launch(_ context.Context, request runner.Request) (*runner.RunRecord, error) {
 	r.request = request
 	return &runner.RunRecord{ID: "RUN-1", Status: runner.StatusExited}, nil

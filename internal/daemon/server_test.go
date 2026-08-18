@@ -17,6 +17,7 @@ import (
 
 	"aira/internal/core"
 	"aira/internal/domain"
+	"aira/internal/gitcontext"
 	"aira/internal/store"
 )
 
@@ -247,6 +248,38 @@ func TestServerRoutedResponseIsByteIdenticalToInProcess(t *testing.T) {
 	got, _ := json.Marshal(wire.CoreResponse())
 	if !bytes.Equal(got, want) {
 		t.Fatalf("reconstructed response differs\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestServerRoutedRantPreservesBodyAndGitContext(t *testing.T) {
+	paths := testPaths(t)
+	server := NewServer(paths)
+	_, _ = startServer(t, server)
+	scope := testScope(t, paths, "rant")
+	body := "  routed body\ntrailing bytes  "
+	observed := gitcontext.GitContext{
+		RepoRoot:     gitcontext.Field{Value: scope.Root, Status: gitcontext.StatusValue},
+		WorktreePath: gitcontext.Field{Value: scope.Root, Status: gitcontext.StatusValue},
+		WorktreeID:   gitcontext.Field{Value: scope.WorktreeID, Status: gitcontext.StatusValue},
+		HeadHash:     gitcontext.Field{Value: "caller-head-verbatim", Status: gitcontext.StatusValue},
+		HeadRef:      gitcontext.Field{Value: "caller-ref-verbatim", Status: gitcontext.StatusValue},
+		RemoteURL:    gitcontext.Field{Value: "caller-remote-verbatim", Status: gitcontext.StatusValue},
+		ObservedAt:   "2026-08-18T12:00:00Z", ResolverVersion: "route-test-v1",
+	}
+	captured, err := Exchange(context.Background(), paths.SocketPath, RequestFrame{Proto: ProtocolVersion, Scope: scope, Request: core.Request{Verb: "rant", Args: map[string]any{"subverb": "capture", "text": body, "tags": []string{"route"}}, GitContext: &observed, Actor: "terra"}})
+	if err != nil || !captured.OK {
+		t.Fatalf("capture response=%+v err=%v", captured, err)
+	}
+	gotFrame, err := Exchange(context.Background(), paths.SocketPath, RequestFrame{Proto: ProtocolVersion, Scope: scope, Request: core.Request{Verb: "rant", Args: map[string]any{"subverb": "get", "selector": "RANT-1"}}})
+	if err != nil || !gotFrame.OK {
+		t.Fatalf("get response=%+v err=%v", gotFrame, err)
+	}
+	var got domain.Rant
+	if err := json.Unmarshal(gotFrame.Data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Body != body || got.GitContext != observed || got.Actor != "terra" {
+		t.Fatalf("routed rant changed: %#v", got)
 	}
 }
 

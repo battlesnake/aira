@@ -729,6 +729,57 @@ func (s *Store) initDB(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS test_report_counter (
 		    project_id TEXT PRIMARY KEY, next_number INTEGER NOT NULL, next_seq INTEGER NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS rant_counter (
+		    project_id TEXT PRIMARY KEY, next_number INTEGER NOT NULL CHECK(next_number >= 1),
+		    next_seq INTEGER NOT NULL CHECK(next_seq >= 1)
+		)`,
+		`CREATE TABLE IF NOT EXISTS rants (
+		    project_id TEXT NOT NULL, id TEXT NOT NULL, body TEXT NOT NULL,
+		    severity TEXT NOT NULL DEFAULT '' CHECK(severity IN ('','papercut','annoyance','blocker')),
+		    idempotency_key TEXT, actor TEXT NOT NULL, session TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',
+		    observed_at TEXT NOT NULL DEFAULT '', received_at TEXT NOT NULL, resolver_version TEXT NOT NULL DEFAULT '',
+		    seq INTEGER NOT NULL CHECK(seq >= 1), redacted INTEGER NOT NULL DEFAULT 0 CHECK(redacted IN (0,1)),
+		    PRIMARY KEY(project_id,id), UNIQUE(project_id,seq), UNIQUE(project_id,idempotency_key),
+		    CHECK(length(CAST(body AS BLOB)) BETWEEN 1 AND 8192), CHECK(instr(body,char(0)) = 0),
+		    CHECK(idempotency_key IS NULL OR (length(CAST(idempotency_key AS BLOB)) BETWEEN 1 AND 256 AND instr(idempotency_key,char(0)) = 0)),
+		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS rant_tags (
+		    project_id TEXT NOT NULL, rant_id TEXT NOT NULL, tag TEXT NOT NULL,
+		    PRIMARY KEY(project_id,rant_id,tag),
+		    CHECK(length(CAST(tag AS BLOB)) BETWEEN 1 AND 64), CHECK(instr(tag,char(0)) = 0),
+		    FOREIGN KEY(project_id,rant_id) REFERENCES rants(project_id,id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS rant_git_context (
+		    project_id TEXT NOT NULL, rant_id TEXT NOT NULL, field TEXT NOT NULL,
+		    value TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '',
+		    PRIMARY KEY(project_id,rant_id,field),
+		    CHECK(field IN ('repo_root','worktree_path','worktree_id','head_hash','head_ref','remote_url')),
+		    CHECK(status IN ('value','none','unevaluated','mismatch')),
+		    CHECK((status IN ('value','mismatch') AND length(value)>0) OR (status IN ('none','unevaluated') AND value='')),
+		    FOREIGN KEY(project_id,rant_id) REFERENCES rants(project_id,id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS rant_context_refs (
+		    project_id TEXT NOT NULL, rant_id TEXT NOT NULL, kind TEXT NOT NULL, ref_id TEXT NOT NULL,
+		    PRIMARY KEY(project_id,rant_id,kind,ref_id), CHECK(kind IN ('run','ticket','finding','gate')),
+		    CHECK(length(ref_id)>0), CHECK(instr(ref_id,char(0)) = 0),
+		    FOREIGN KEY(project_id,rant_id) REFERENCES rants(project_id,id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS rant_reviews (
+		    project_id TEXT NOT NULL, review_id INTEGER PRIMARY KEY AUTOINCREMENT, rant_id TEXT NOT NULL,
+		    reviewer TEXT NOT NULL, at TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', outcome TEXT NOT NULL DEFAULT '',
+		    resolved_kind TEXT, resolved_id TEXT,
+		    CHECK(length(reviewer)>0), CHECK(length(at)>0),
+		    CHECK(outcome IN ('','actioned','planned','duplicate','wont-fix','needs-evidence')),
+		    CHECK((resolved_kind IS NULL AND resolved_id IS NULL) OR
+		          (resolved_kind IN ('run','ticket','finding','gate') AND resolved_id IS NOT NULL AND length(resolved_id)>0)),
+		    CHECK(length(CAST(note AS BLOB)) <= 8192), CHECK(instr(note,char(0)) = 0),
+		    FOREIGN KEY(project_id,rant_id) REFERENCES rants(project_id,id) ON DELETE CASCADE
+		)`,
+		`CREATE TRIGGER IF NOT EXISTS rant_reviews_no_update BEFORE UPDATE ON rant_reviews
+		 BEGIN SELECT RAISE(ABORT,'rant reviews are append-only'); END`,
+		`CREATE TRIGGER IF NOT EXISTS rant_reviews_no_delete BEFORE DELETE ON rant_reviews
+		 BEGIN SELECT RAISE(ABORT,'rant reviews are append-only'); END`,
 		`CREATE TABLE IF NOT EXISTS test_reports (
 		    project_id TEXT NOT NULL, id TEXT NOT NULL, ticket_id TEXT NOT NULL DEFAULT '',
 		    phase TEXT NOT NULL DEFAULT '', "commit" TEXT NOT NULL DEFAULT '', branch TEXT NOT NULL DEFAULT '',
@@ -1999,6 +2050,11 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		}
 		if err := insertSearchRows(ctx, conn, s.projectID, scanned, scannedFindings); err != nil {
 			return err
+		}
+		for _, entry := range entries {
+			if err := insertRantSearchRows(ctx, conn, s.projectID, entry.WorktreeID); err != nil {
+				return err
+			}
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO event_counters(project_id,next_seq) VALUES(?,?)
 			ON CONFLICT(project_id) DO UPDATE SET next_seq=CASE WHEN event_counters.next_seq < excluded.next_seq THEN excluded.next_seq ELSE event_counters.next_seq END`,

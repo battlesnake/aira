@@ -18,16 +18,21 @@ import (
 
 	"aira/internal/domain"
 	"aira/internal/gate"
+	"aira/internal/gitcontext"
 	"aira/internal/gitremote"
 	"aira/internal/runner"
 	"aira/internal/store"
 )
 
 type Request struct {
-	Verb       string         `json:"verb"`
-	Args       map[string]any `json:"args,omitempty"`
-	Content    []byte         `json:"content,omitempty"`
-	HasContent bool           `json:"has_content"`
+	Verb       string                 `json:"verb"`
+	Args       map[string]any         `json:"args,omitempty"`
+	Content    []byte                 `json:"content,omitempty"`
+	HasContent bool                   `json:"has_content"`
+	GitContext *gitcontext.GitContext `json:"git_context,omitempty"`
+	Actor      string                 `json:"actor,omitempty"`
+	Session    string                 `json:"session,omitempty"`
+	Model      string                 `json:"model,omitempty"`
 }
 
 type Response struct {
@@ -69,9 +74,13 @@ func (response Response) MarshalJSON() ([]byte, error) {
 type Initializer func(context.Context, map[string]any) (any, error)
 
 type argAccessor struct {
-	values  map[string]any
-	reads   map[string]struct{}
-	content []byte
+	values     map[string]any
+	reads      map[string]struct{}
+	content    []byte
+	gitContext *gitcontext.GitContext
+	actor      string
+	session    string
+	model      string
 }
 
 func newArgAccessor(values map[string]any, content ...[]byte) *argAccessor {
@@ -171,6 +180,15 @@ type gateActionStore interface {
 
 type gateActionInputStore interface {
 	GateActionWithFields(context.Context, string, string, string, map[string]any) (any, error)
+}
+
+type rantStore interface {
+	AddRant(context.Context, domain.RantInput, gitcontext.GitContext) (store.RantAddResult, error)
+	ListRants(domain.RantListOptions) ([]domain.Rant, error)
+	GetRant(string) (domain.Rant, error)
+	ReviewRant(context.Context, string, domain.RantReviewInput) (store.RantReviewResult, error)
+	RedactRant(context.Context, string) (store.EventKey, error)
+	CountRants(string, string) (store.RantCountResult, error)
 }
 
 type handlerData struct {
@@ -274,6 +292,7 @@ type DispatchDescriptor struct {
 	Include      bool            `json:"include"`
 	Example      []string        `json:"example"`
 	Operations   []OperationSpec `json:"operations,omitempty"`
+	GitContext   bool            `json:"git_context"`
 }
 
 type Core struct {
@@ -343,6 +362,7 @@ type verbSpec struct {
 	Include      bool
 	Example      []string
 	Operations   []OperationSpec
+	GitContext   bool
 	Run          func(context.Context, *argAccessor) (any, error)
 }
 
@@ -408,6 +428,8 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 	if req.HasContent || req.Content != nil {
 		args = newArgAccessor(req.Args, req.Content)
 	}
+	args.gitContext = req.GitContext
+	args.actor, args.session, args.model = req.Actor, req.Session, req.Model
 	data, err := spec.Run(ctx, args)
 	if err != nil {
 		code := store.ErrorCode(err)
@@ -571,7 +593,7 @@ func (c *Core) DispatchDescriptors() []DispatchDescriptor {
 		result = append(result, DispatchDescriptor{
 			Name: spec.Name, Usage: spec.Usage, Args: args, MCPTool: spec.MCPTool,
 			MCPOperation: spec.MCPOperation, Summary: spec.Summary, Safety: spec.Safety,
-			Include: spec.Include, Example: copyExample(spec.Example), Operations: operations,
+			Include: spec.Include, Example: copyExample(spec.Example), Operations: operations, GitContext: spec.GitContext,
 		})
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
@@ -600,6 +622,58 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return mutationData(map[string]any{"id": ticket.ID, "path": ".aira/tickets/" + ticket.ID + ".md", "ticket": ticket}, event), nil
 		}},
+		"rant": {Name: "rant", Usage: "rant <text> [--tag T --severity S --ref kind:id --idem KEY] | rant ls|get|review|redact ...", GitContext: true,
+			Args:    []ArgSpec{stringSpec("subverb", false, true, "Rant operation", "capture", "ls", "get", "review", "redact"), stringSpec("text", false, true, "Unfiltered friction text"), listSpec("tags", false, false, "Recorded tags; suggested seeds: slow-tests, linter-noise, flaky-infra, confusing-setup"), stringSpec("severity", false, false, "Subjective severity", "papercut", "annoyance", "blocker"), listSpec("refs", false, false, "Typed project references"), stringSpec("idempotency_key", false, false, "Retry key"), stringSpec("selector", false, true, "Rant ID"), stringSpec("by", false, false, "Distribution field", "tag", "actor"), boolSpec("unreviewed", false, false, "Only rants with no review rows"), stringSpec("since", false, false, "Rant sequence cursor"), stringSpec("outcome", false, false, "Typed non-final outcome", "actioned", "planned", "duplicate", "wont-fix", "needs-evidence"), stringSpec("note", false, false, "Review note"), stringSpec("resolved_by", false, false, "Typed project reference")},
+			MCPTool: "aira_rant", MCPOperation: "subverb", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+				rants, ok := c.store.(rantStore)
+				if !ok {
+					return nil, errors.New("E_RANT_INVALID: rant store is unavailable")
+				}
+				subverb := strings.ToLower(strings.TrimSpace(stringArg(args, "subverb")))
+				if subverb == "" || subverb == "capture" {
+					refs, err := parseRantRefs(stringSlice(args, "refs"))
+					if err != nil {
+						return nil, err
+					}
+					observed := gitcontext.GitContext{}
+					if args.gitContext != nil {
+						observed = *args.gitContext
+					}
+					return rants.AddRant(ctx, domain.RantInput{Body: stringArg(args, "text"), Tags: stringSlice(args, "tags"), Severity: domain.RantSeverity(stringArg(args, "severity")), Refs: refs, IdempotencyKey: stringArg(args, "idempotency_key"), Actor: args.actor, Session: args.session, Model: args.model}, observed)
+				}
+				switch subverb {
+				case "ls", "list":
+					since, err := parseRantSince(stringArg(args, "since"))
+					if err != nil {
+						return nil, err
+					}
+					by := stringArg(args, "by")
+					if by != "" {
+						return rants.CountRants("", by)
+					}
+					return rants.ListRants(domain.RantListOptions{Unreviewed: boolArg(args, "unreviewed"), Since: since})
+				case "get":
+					return rants.GetRant(stringArg(args, "selector"))
+				case "review":
+					var resolved *domain.RantRef
+					if raw := stringArg(args, "resolved_by"); raw != "" {
+						ref, err := parseRantRef(raw)
+						if err != nil {
+							return nil, err
+						}
+						resolved = &ref
+					}
+					return rants.ReviewRant(ctx, stringArg(args, "selector"), domain.RantReviewInput{Reviewer: args.actor, Outcome: domain.RantOutcome(stringArg(args, "outcome")), Note: stringArg(args, "note"), ResolvedBy: resolved})
+				case "redact":
+					event, err := rants.RedactRant(ctx, stringArg(args, "selector"))
+					if err != nil {
+						return nil, err
+					}
+					return mutationData(map[string]any{"id": stringArg(args, "selector"), "redacted": true}, event), nil
+				default:
+					return nil, fmt.Errorf("E_RANT_INVALID: unknown rant operation %q", subverb)
+				}
+			}},
 		"show": {Name: "show", Usage: "show <selector>", Args: []ArgSpec{stringSpec("selector", true, true, "Exact ticket or run selector"), listSpec("fields", false, false, "Optional projected ticket fields")}, MCPTool: "aira_get", Run: func(_ context.Context, args *argAccessor) (any, error) {
 			selector := stringArg(args, "selector")
 			fields := stringSlice(args, "fields")
@@ -695,7 +769,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				"report_instruction": `aira find add <id> --source codex --verdict confirmed|refuted|plausible --category <cat> --severity P0|P1|P2 --message "<...>" [--file path:line]`,
 			}, nil
 		}},
-		"grep": {Name: "grep", Usage: "grep <query> [--kind ticket|finding --by kind --fields F,...]", Args: []ArgSpec{stringSpec("query", true, true, "Search query"), stringSpec("kind", false, false, "Result kind", "ticket", "finding"), stringSpec("by", false, false, "Distribution field", "kind"), listSpec("fields", false, false, "Optional projected fields")}, MCPTool: "aira_grep", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+		"grep": {Name: "grep", Usage: "grep <query> [--kind ticket|finding|rant --by kind --fields F,...]", Args: []ArgSpec{stringSpec("query", true, true, "Search query"), stringSpec("kind", false, false, "Result kind", "ticket", "finding", "rant"), stringSpec("by", false, false, "Distribution field", "kind"), listSpec("fields", false, false, "Optional projected fields")}, MCPTool: "aira_grep", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			rows, err := c.store.Search(ctx, stringArg(args, "query"), stringArg(args, "kind"))
 			if err != nil {
 				if store.ErrorCode(err) == "E_INDEX_UNEVALUATED" {
@@ -1214,6 +1288,11 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			return handlerData{Data: data, Warnings: recordWarnings(rows)}, nil
 		}},
 		"count": {Name: "count", Usage: "count [query] --by F", Args: []ArgSpec{stringSpec("query", false, true, "Ticket query"), stringSpec("by", true, false, "Count dimension")}, MCPTool: "aira_count", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+			if by := stringArg(args, "by"); by == "tag" || by == "actor" {
+				if rants, ok := c.store.(rantStore); ok {
+					return rants.CountRants(stringArg(args, "query"), by)
+				}
+			}
 			result, err := c.store.Count(stringArg(args, "query"), stringArg(args, "by"))
 			return handlerData{Data: result, Warnings: result.Warnings}, err
 		}},
@@ -1653,12 +1732,19 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 
 func applyDispatchMetadata(verbs map[string]verbSpec) {
 	metadata := map[string]verbMetadata{
-		"init":      {summary: "Initialise AIRA for the current project", safety: SafetyReconcile, example: []string{"--project", "demo", "--prefix", "AIRA"}},
-		"id":        {summary: "Allocate the next ticket identifier", safety: SafetyMutate, example: []string{"AIRA"}},
-		"create":    {summary: "Create a ticket", safety: SafetyMutate, example: []string{"AIRA ticket", "--kind", "feature", "--severity", "P1", "--body", "body", "--label", "label"}},
+		"init":   {summary: "Initialise AIRA for the current project", safety: SafetyReconcile, example: []string{"--project", "demo", "--prefix", "AIRA"}},
+		"id":     {summary: "Allocate the next ticket identifier", safety: SafetyMutate, example: []string{"AIRA"}},
+		"create": {summary: "Create a ticket", safety: SafetyMutate, example: []string{"AIRA ticket", "--kind", "feature", "--severity", "P1", "--body", "body", "--label", "label"}},
+		"rant": {summary: "Capture and review agent friction", safety: SafetyMutate, operations: []OperationSpec{
+			{Name: "capture", Summary: "Capture unfiltered friction", Safety: SafetyMutate, Args: []OperationArg{{Name: "text", Required: true}, {Name: "tags"}, {Name: "severity"}, {Name: "refs"}, {Name: "idempotency_key"}}, Example: []string{"capture", "slow tests wasted a retry", "--tag", "slow-tests"}},
+			{Name: "ls", Summary: "List or aggregate recorded rants", Safety: SafetyRead, Args: []OperationArg{{Name: "by"}, {Name: "unreviewed"}, {Name: "since"}}, Example: []string{"ls", "--unreviewed"}},
+			{Name: "get", Summary: "Read one rant including untrusted prose", Safety: SafetyRead, Args: []OperationArg{{Name: "selector", Required: true}}, Example: []string{"get", "RANT-1"}},
+			{Name: "review", Summary: "Append a review observation", Safety: SafetyMutate, Args: []OperationArg{{Name: "selector", Required: true}, {Name: "outcome"}, {Name: "note"}, {Name: "resolved_by"}}, Example: []string{"review", "RANT-1", "--outcome", "planned"}},
+			{Name: "redact", Summary: "Tombstone a secret-bearing rant body", Safety: SafetyMutate, Args: []OperationArg{{Name: "selector", Required: true}}, Example: []string{"redact", "RANT-1"}},
+		}},
 		"show":      {summary: "Show one ticket", safety: SafetyRead, example: []string{"AIRA-1", "--fields", "id"}},
 		"review":    {summary: "Assemble a review briefing", safety: SafetyRead, example: []string{"AIRA-1", "--paths", "internal/store/gate.go,docs/x.md"}},
-		"grep":      {summary: "Search indexed tickets and findings", safety: SafetyRead, example: []string{"ticket", "--kind", "ticket", "--by", "kind", "--fields", "id"}},
+		"grep":      {summary: "Search indexed tickets, findings, and rants", safety: SafetyRead, example: []string{"ticket", "--kind", "ticket", "--by", "kind", "--fields", "id"}},
 		"import":    {summary: "Import findings from a JSONL file", safety: SafetyMutate, example: []string{"findings.jsonl", "--strict"}},
 		"claim":     {summary: "Claim a ticket lease", safety: SafetyLease, example: []string{"AIRA-1", "--steal", "--actor", "codex"}},
 		"release":   {summary: "Release a ticket lease", safety: SafetyLease, example: []string{"AIRA-1", "--token", "token"}},
@@ -1773,6 +1859,41 @@ func stringArg(args *argAccessor, key string) string {
 	}
 	value, _ := args.record(key).(string)
 	return value
+}
+
+func parseRantSince(value string) (int64, error) {
+	if strings.TrimSpace(value) == "" {
+		return 0, nil
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed < 0 {
+		return 0, errors.New("E_RANT_INVALID: --since requires a non-negative integer")
+	}
+	return parsed, nil
+}
+
+func parseRantRefs(values []string) ([]domain.RantRef, error) {
+	refs := make([]domain.RantRef, 0, len(values))
+	for _, value := range values {
+		ref, err := parseRantRef(value)
+		if err != nil {
+			return nil, err
+		}
+		refs = append(refs, ref)
+	}
+	return refs, nil
+}
+
+func parseRantRef(value string) (domain.RantRef, error) {
+	kind, id, ok := strings.Cut(strings.TrimSpace(value), ":")
+	if !ok {
+		return domain.RantRef{}, errors.New(domain.CodeRantRefInvalid + ": reference must be kind:id")
+	}
+	ref := domain.RantRef{Kind: domain.RantRefKind(strings.ToLower(kind)), ID: id}
+	if err := ref.Validate(); err != nil {
+		return domain.RantRef{}, err
+	}
+	return ref, nil
 }
 
 func usageArgs(args *argAccessor, provider string) (domain.RawUsage, error) {

@@ -64,6 +64,23 @@ func ClassifyRequest(req Request) (string, Route) {
 	return Classify(canonical, selector)
 }
 
+// RequiresGitContext reports whether this exact request creates an artefact
+// whose caller-observed Git provenance must be stamped. Rant reads and review
+// observations deliberately do not opt in.
+func RequiresGitContext(req Request) bool {
+	canonical := CanonicalVerb(req.Verb)
+	descriptor, ok := New(nil).verbs[canonical]
+	if !ok || !descriptor.GitContext {
+		return false
+	}
+	if canonical == "rant" {
+		operation, _ := req.Args["subverb"].(string)
+		operation = strings.ToLower(strings.TrimSpace(operation))
+		return operation == "" || operation == "capture"
+	}
+	return true
+}
+
 // StoreFreeCarved reports whether a canonical client-routed request can run
 // without touching the state store. Telemetry values, rather than key
 // presence, split run because CLI request construction includes empty keys.

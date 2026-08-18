@@ -453,6 +453,24 @@ func (l *ledger) current(id string) (RunRecord, error) {
 	return r, nil
 }
 
+// HasRun reports whether id is present in the project-scoped run ledger.
+// It reads the ledger directly and does not create runner state.
+func HasRun(commonDir, id string) (bool, error) {
+	common, err := filepath.Abs(commonDir)
+	if err != nil {
+		return false, err
+	}
+	l := &ledger{root: common, ledger: filepath.Join(common, "aira", "runs", "ledger.bin")}
+	if _, err := l.current(id); err != nil {
+		var launchErr *LaunchError
+		if errors.As(err, &launchErr) && launchErr.Code == "E_RUN_NOT_FOUND" {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 func (l *ledger) nextSequence() (uint64, error) {
 	events, err := l.read()
 	if err != nil {

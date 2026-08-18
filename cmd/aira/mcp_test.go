@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -37,7 +38,7 @@ func TestMCPToolListIsGeneratedAndStable(t *testing.T) {
 	for _, tool := range result.Tools {
 		got = append(got, tool.Name)
 	}
-	want := []string{"aira_check", "aira_claim", "aira_count", "aira_create", "aira_finding", "aira_gate", "aira_get", "aira_git", "aira_grep", "aira_heartbeat", "aira_id", "aira_import", "aira_init", "aira_insights", "aira_link", "aira_list", "aira_quota", "aira_ready", "aira_reconcile", "aira_release", "aira_requirement", "aira_review", "aira_run", "aira_run_input", "aira_run_kill", "aira_run_output", "aira_spend", "aira_test_report", "aira_touch", "aira_transition"}
+	want := []string{"aira_check", "aira_claim", "aira_count", "aira_create", "aira_finding", "aira_gate", "aira_get", "aira_git", "aira_grep", "aira_heartbeat", "aira_id", "aira_import", "aira_init", "aira_insights", "aira_link", "aira_list", "aira_quota", "aira_rant", "aira_ready", "aira_reconcile", "aira_release", "aira_requirement", "aira_review", "aira_run", "aira_run_input", "aira_run_kill", "aira_run_output", "aira_spend", "aira_test_report", "aira_touch", "aira_transition"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("tools=%v, want=%v", got, want)
 	}
@@ -45,6 +46,31 @@ func TestMCPToolListIsGeneratedAndStable(t *testing.T) {
 		if tool.Name == "help" || strings.HasPrefix(tool.Name, "aira_new") || strings.HasPrefix(tool.Name, "aira_ls") || strings.HasPrefix(tool.Name, "aira_get_get") {
 			t.Fatalf("alias/help leaked into tool list: %q", tool.Name)
 		}
+	}
+}
+
+func TestRantMCPIsCaptureOnlyWithApprovedAdvertisement(t *testing.T) {
+	server := newMCPServer(nil)
+	binding, ok := server.byName["aira_rant"]
+	if !ok {
+		t.Fatal("aira_rant tool missing")
+	}
+	wantDescription := "Ranting welcome: slow tests, linter noise, flaky infra, confusing setup — dump it unfiltered; logged for later review, you won't be asked to format it."
+	if binding.tool.Description != wantDescription {
+		t.Fatalf("description = %q", binding.tool.Description)
+	}
+	schema, ok := binding.tool.InputSchema.(mcpInputSchema)
+	if !ok {
+		t.Fatalf("schema type = %T", binding.tool.InputSchema)
+	}
+	got := make([]string, 0, len(schema.Properties))
+	for name := range schema.Properties {
+		got = append(got, name)
+	}
+	sort.Strings(got)
+	want := []string{"idempotency_key", "refs", "severity", "tags", "text"}
+	if !reflect.DeepEqual(got, want) || !reflect.DeepEqual(schema.Required, []string{"text"}) {
+		t.Fatalf("schema properties=%v required=%v", got, schema.Required)
 	}
 }
 

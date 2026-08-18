@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"aira/internal/domain"
+	"aira/internal/gitcontext"
 	"aira/internal/store"
 )
 
@@ -43,7 +44,7 @@ func TestDispatchMetadataMatchesInstrumentedHandlerReads(t *testing.T) {
 		}
 		if len(descriptor.Operations) > 0 {
 			discriminator := ""
-			if name == "find" || name == "req" || name == "test-report" || name == "spend" || name == "quota" || name == "insights" || name == "git" {
+			if name == "find" || name == "req" || name == "test-report" || name == "spend" || name == "quota" || name == "insights" || name == "git" || name == "rant" {
 				discriminator = "subverb"
 			} else if name == "link" {
 				discriminator = "list"
@@ -108,6 +109,26 @@ func metadataProbeInputs(name string) []map[string]any {
 		"remote": "origin", "url": "git@github.com:owner/repo.git", "refspecs": []string{"HEAD:main"}, "dir": "repo",
 	}
 	switch name {
+	case "rant":
+		values = cloneMetadataInputs(values, "by", "")
+		values = cloneMetadataInputs(values, "severity", "annoyance")
+		values = cloneMetadataInputs(values, "text", "friction")
+		values = cloneMetadataInputs(values, "tags", []string{"slow-tests"})
+		values = cloneMetadataInputs(values, "refs", []string{})
+		values = cloneMetadataInputs(values, "idempotency_key", "")
+		values = cloneMetadataInputs(values, "resolved_by", "")
+		values = cloneMetadataInputs(values, "outcome", "planned")
+		values = cloneMetadataInputs(values, "note", "note")
+		values = cloneMetadataInputs(values, "reviewer", "reviewer")
+		values = cloneMetadataInputs(values, "since", "0")
+		values = cloneMetadataInputs(values, "unreviewed", true)
+		return []map[string]any{
+			cloneMetadataInputs(values, "subverb", "capture"),
+			cloneMetadataInputs(values, "subverb", "ls"),
+			cloneMetadataInputs(values, "subverb", "get"),
+			cloneMetadataInputs(values, "subverb", "review"),
+			cloneMetadataInputs(values, "subverb", "redact"),
+		}
 	case "find", "req":
 		values = cloneMetadataInputs(values, "by", "subtype")
 		return []map[string]any{
@@ -233,6 +254,24 @@ func (metadataProbeStore) Count(string, string) (store.CountResult, error) {
 func (metadataProbeStore) CountFindings(string, string) (store.FindingCountResult, error) {
 	return store.FindingCountResult{}, nil
 }
+func (metadataProbeStore) AddRant(context.Context, domain.RantInput, gitcontext.GitContext) (store.RantAddResult, error) {
+	return store.RantAddResult{Rant: domain.Rant{ID: "RANT-1"}, ID: "RANT-1"}, nil
+}
+func (metadataProbeStore) ListRants(domain.RantListOptions) ([]domain.Rant, error) {
+	return []domain.Rant{}, nil
+}
+func (metadataProbeStore) GetRant(string) (domain.Rant, error) {
+	return domain.Rant{ID: "RANT-1"}, nil
+}
+func (metadataProbeStore) ReviewRant(context.Context, string, domain.RantReviewInput) (store.RantReviewResult, error) {
+	return store.RantReviewResult{RantID: "RANT-1"}, nil
+}
+func (metadataProbeStore) RedactRant(context.Context, string) (store.EventKey, error) {
+	return store.EventKey{}, nil
+}
+func (metadataProbeStore) CountRants(string, string) (store.RantCountResult, error) {
+	return store.RantCountResult{Groups: map[string]store.RantCountGroup{}}, nil
+}
 func (metadataProbeStore) ComputeGauge(string) (store.GaugeResult, error) {
 	return store.GaugeResult{}, nil
 }
@@ -336,7 +375,7 @@ func TestCanonicalDispatchNamesAndAliases(t *testing.T) {
 		got = append(got, descriptor.Name)
 	}
 	sort.Strings(got)
-	want := []string{"check", "claim", "count", "create", "find", "gate", "git", "grep", "heartbeat", "help", "id", "import", "init", "insights", "link", "list", "mv", "quota", "ready", "reconcile", "release", "req", "review", "run", "run-input", "run-kill", "run-log", "set", "show", "spend", "test-report", "touch", "unlink"}
+	want := []string{"check", "claim", "count", "create", "find", "gate", "git", "grep", "heartbeat", "help", "id", "import", "init", "insights", "link", "list", "mv", "quota", "rant", "ready", "reconcile", "release", "req", "review", "run", "run-input", "run-kill", "run-log", "set", "show", "spend", "test-report", "touch", "unlink"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("dispatch names=%v, want=%v", got, want)
 	}

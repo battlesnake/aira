@@ -55,6 +55,9 @@ func TestSkillExamplesMatchMCPRequestsForEveryAction(t *testing.T) {
 	})
 	for _, action := range artifacts.Actions {
 		t.Run(action.Verb+"/"+action.Operation, func(t *testing.T) {
+			if action.Verb == "rant" && action.Operation != "capture" {
+				t.Skip("v1 MCP intentionally exposes capture only")
+			}
 			argv := action.Argv
 			positional, options, err := parseArgs(argv[0], argv[1:])
 			if err != nil {
@@ -194,7 +197,7 @@ func TestSkillFaceInstallGuideAndRefusalRules(t *testing.T) {
 		t.Fatal(err)
 	}
 	var parsed core.SkillManifest
-	if err := json.Unmarshal(manifest, &parsed); err != nil || len(parsed.Actions) != 61 || parsed.Version == "" {
+	if err := json.Unmarshal(manifest, &parsed); err != nil || len(parsed.Actions) != 66 || parsed.Version == "" {
 		t.Fatalf("manifest err=%v value=%#v", err, parsed)
 	}
 	if exit := Run([]string{"skill", "install", installDir}, &out, &stderr); exit != 0 {

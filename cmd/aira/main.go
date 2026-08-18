@@ -339,7 +339,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 			continue
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "rebuild" || name == "steal" || name == "strict" || (name == "close" && verb == "run-input") || (name == "from-start" && verb == "watch") || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && verb == "run-log") || (name == "reasoning-subset" && verb == "spend") || (name == "all" && verb == "test-report") {
+		if name == "rebuild" || name == "steal" || name == "strict" || (name == "close" && verb == "run-input") || (name == "from-start" && verb == "watch") || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && verb == "run-log") || (name == "reasoning-subset" && verb == "spend") || (name == "all" && verb == "test-report") || (name == "unreviewed" && verb == "rant") {
 			options[name] = "true"
 			continue
 		}
@@ -369,7 +369,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 				options["fields"] += ","
 			}
 			options["fields"] += argv[i]
-		} else if name == "argv" || name == "env-allow" || (name == "config-env" && verb == "test-report") || (name == "bucket" && verb == "spend") {
+		} else if name == "argv" || name == "env-allow" || (name == "config-env" && verb == "test-report") || (name == "bucket" && verb == "spend") || (verb == "rant" && (name == "tag" || name == "ref")) {
 			options[name] = appendDelimited(options[name], argv[i])
 		} else {
 			options[name] = argv[i]
@@ -378,6 +378,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 	allowed := map[string]map[string]bool{
 		"init":   {"project": true, "prefixes": true},
 		"create": {"kind": true, "severity": true, "labels": true, "body": true},
+		"rant":   {"tag": true, "severity": true, "ref": true, "idem": true, "by": true, "unreviewed": true, "since": true, "outcome": true, "note": true, "resolved-by": true},
 		"new":    {"kind": true, "severity": true, "labels": true, "body": true},
 		"show":   {"fields": true}, "get": {"fields": true}, "review": {"paths": true},
 		"list": {"by": true, "fields": true}, "ls": {"by": true, "fields": true},
@@ -650,6 +651,49 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		}
 		args["title"] = strings.Join(positional, " ")
 		args["kind"], args["severity"], args["body"], args["labels"] = options["kind"], options["severity"], options["body"], splitComma(options["labels"])
+	case "rant":
+		if len(positional) == 0 {
+			return core.Request{}, fmt.Errorf("rant requires <text> or ls|get|review|redact")
+		}
+		switch strings.ToLower(positional[0]) {
+		case "capture":
+			if len(positional) != 2 {
+				return core.Request{}, fmt.Errorf("rant capture requires one quoted text argument")
+			}
+			args["subverb"], args["text"], args["tags"], args["severity"], args["refs"], args["idempotency_key"] = "capture", positional[1], splitOptionList(options["tag"]), options["severity"], splitOptionList(options["ref"]), options["idem"]
+		case "ls", "list":
+			if len(positional) != 1 {
+				return core.Request{}, fmt.Errorf("rant ls accepts no positional arguments")
+			}
+			args["subverb"], args["by"], args["unreviewed"] = "ls", options["by"], options["unreviewed"] == "true"
+			if options["since"] != "" {
+				value, err := strconv.ParseInt(options["since"], 10, 64)
+				if err != nil || value < 0 {
+					return core.Request{}, fmt.Errorf("E_RANT_INVALID: --since requires a non-negative integer")
+				}
+				args["since"] = strconv.FormatInt(value, 10)
+			}
+		case "get":
+			if len(positional) != 2 {
+				return core.Request{}, fmt.Errorf("rant get requires RANT-n")
+			}
+			args["subverb"], args["selector"] = "get", positional[1]
+		case "review":
+			if len(positional) != 2 {
+				return core.Request{}, fmt.Errorf("rant review requires RANT-n")
+			}
+			args["subverb"], args["selector"], args["outcome"], args["note"], args["resolved_by"] = "review", positional[1], options["outcome"], options["note"], options["resolved-by"]
+		case "redact":
+			if len(positional) != 2 {
+				return core.Request{}, fmt.Errorf("rant redact requires RANT-n")
+			}
+			args["subverb"], args["selector"] = "redact", positional[1]
+		default:
+			if len(positional) != 1 {
+				return core.Request{}, fmt.Errorf("rant text must be one quoted argument")
+			}
+			args["subverb"], args["text"], args["tags"], args["severity"], args["refs"], args["idempotency_key"] = "capture", positional[0], splitOptionList(options["tag"]), options["severity"], splitOptionList(options["ref"]), options["idem"]
+		}
 	case "show", "get":
 		if len(positional) != 1 {
 			return core.Request{}, fmt.Errorf("show requires <selector>")

@@ -25,7 +25,8 @@ type SearchResult struct {
 var ErrSearchUnevaluated = errors.New("E_INDEX_UNEVALUATED: search index could not be built")
 
 // Search reconciles the disposable FTS cache from the current canonical files
-// before every query. Git files therefore remain authoritative even after
+// plus DB-authoritative rants before every query. Git files therefore remain
+// authoritative even after
 // direct edits, interrupted mutations, or removal of an indexed entity.
 // The scan, replacement, and MATCH query share a brief search writer lock with
 // AIRA mutations and other greps, so one grep observes one canonical snapshot.
@@ -36,7 +37,7 @@ func (s *Store) Search(ctx context.Context, query, kind string) ([]SearchResult,
 	if query == "" {
 		return nil, errors.New("E_QUERY_INVALID: grep query is empty")
 	}
-	if kind != "" && kind != "ticket" && kind != "finding" {
+	if kind != "" && kind != "ticket" && kind != "finding" && kind != "rant" {
 		return nil, fmt.Errorf("E_QUERY_INVALID: unsupported grep kind %q", kind)
 	}
 	lock, err := s.acquireSearchLock()
@@ -119,8 +120,17 @@ func (s *Store) reconcileSearchIndex(ctx context.Context) error {
 		if _, err := conn.ExecContext(ctx, `DELETE FROM search_fts WHERE project_id=? AND worktree_id=?`, s.projectID, s.worktreeID); err != nil {
 			return err
 		}
-		return insertSearchRows(ctx, conn, s.projectID, tickets, findings.valid)
+		if err := insertSearchRows(ctx, conn, s.projectID, tickets, findings.valid); err != nil {
+			return err
+		}
+		return insertRantSearchRows(ctx, conn, s.projectID, s.worktreeID)
 	})
+}
+
+func insertRantSearchRows(ctx context.Context, conn *sql.Conn, projectID, worktreeID string) error {
+	_, err := conn.ExecContext(ctx, `INSERT INTO search_fts(project_id,kind,ref_id,worktree_id,content)
+		SELECT project_id,'rant',id,?,body FROM rants WHERE project_id=?`, worktreeID, projectID)
+	return err
 }
 
 func (s *Store) acquireSearchLock() (*os.File, error) {

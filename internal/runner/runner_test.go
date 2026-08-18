@@ -20,6 +20,29 @@ import (
 	"aira/internal/cgrouptest"
 )
 
+func TestHasRunUsesOnlyTheSelectedProjectLedger(t *testing.T) {
+	common := t.TempDir()
+	l, err := newLedger(common, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.append(ledgerEvent{Kind: "starting", Run: RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-41", Status: StatusStarting}}); err != nil {
+		t.Fatal(err)
+	}
+	found, err := HasRun(common, "RUN-41")
+	if err != nil || !found {
+		t.Fatalf("selected ledger found=%v err=%v", found, err)
+	}
+	found, err = HasRun(common, "RUN-42")
+	if err != nil || found {
+		t.Fatalf("missing run found=%v err=%v", found, err)
+	}
+	found, err = HasRun(t.TempDir(), "RUN-41")
+	if err != nil || found {
+		t.Fatalf("foreign project found=%v err=%v", found, err)
+	}
+}
+
 func TestEnvDigestUsesSortedLengthPrefixedBytes(t *testing.T) {
 	entries := []EnvEntry{{Key: []byte("B"), Value: []byte("x\x00=")}, {Key: []byte("A"), Value: []byte("line\n")}}
 	got, err := EnvDigest(entries)

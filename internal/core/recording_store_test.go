@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 
 	"aira/internal/domain"
+	"aira/internal/gitcontext"
 	"aira/internal/store"
 )
 
@@ -87,6 +88,24 @@ func (s *recordingStore) Count(string, string) (store.CountResult, error) {
 }
 func (s *recordingStore) CountFindings(string, string) (store.FindingCountResult, error) {
 	return store.FindingCountResult{}, s.fail("CountFindings")
+}
+func (s *recordingStore) AddRant(context.Context, domain.RantInput, gitcontext.GitContext) (store.RantAddResult, error) {
+	return store.RantAddResult{}, s.fail("AddRant")
+}
+func (s *recordingStore) ListRants(domain.RantListOptions) ([]domain.Rant, error) {
+	return nil, s.fail("ListRants")
+}
+func (s *recordingStore) GetRant(string) (domain.Rant, error) {
+	return domain.Rant{}, s.fail("GetRant")
+}
+func (s *recordingStore) ReviewRant(context.Context, string, domain.RantReviewInput) (store.RantReviewResult, error) {
+	return store.RantReviewResult{}, s.fail("ReviewRant")
+}
+func (s *recordingStore) RedactRant(context.Context, string) (store.EventKey, error) {
+	return store.EventKey{}, s.fail("RedactRant")
+}
+func (s *recordingStore) CountRants(string, string) (store.RantCountResult, error) {
+	return store.RantCountResult{}, s.fail("CountRants")
 }
 func (s *recordingStore) ComputeGauge(string) (store.GaugeResult, error) {
 	return store.GaugeResult{}, s.fail("ComputeGauge")

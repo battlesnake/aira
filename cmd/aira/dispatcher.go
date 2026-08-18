@@ -18,6 +18,7 @@ import (
 	"aira/internal/app"
 	"aira/internal/core"
 	"aira/internal/daemon"
+	"aira/internal/gitcontext"
 	"aira/internal/store"
 	"golang.org/x/sys/unix"
 )
@@ -90,6 +91,8 @@ func (d *daemonDispatcher) spawnDaemon() (<-chan childResult, error) {
 func (d *daemonDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeScope, request core.Request) core.Response {
 	canonical, route := core.ClassifyRequest(request)
 	request.Verb = canonical
+	stampRantCaller(&request)
+	stampGitContext(scope, &request)
 	if route == core.RouteClient {
 		return d.dispatchClient(ctx, scope, request)
 	}
@@ -373,6 +376,8 @@ type inProcessDispatcher struct {
 }
 
 func (d *inProcessDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeScope, request core.Request) core.Response {
+	stampRantCaller(&request)
+	stampGitContext(scope, &request)
 	if core.CanonicalVerb(request.Verb) == "init" {
 		result, err := app.Init(ctx, scope.Root, request.Args)
 		if err != nil {
@@ -396,6 +401,36 @@ func (d *inProcessDispatcher) Dispatch(ctx context.Context, scope daemon.Worktre
 		dispatcher = core.NewWithRunnerOutputCap(s, project.Runner, d.outputCap).WithGitOps(project.GitOps)
 	}
 	return dispatcher.Do(ctx, request)
+}
+
+func stampRantCaller(request *core.Request) {
+	if request == nil || core.CanonicalVerb(request.Verb) != "rant" {
+		return
+	}
+	if request.Actor == "" {
+		request.Actor = os.Getenv("AIRA_ACTOR")
+	}
+	if request.Session == "" {
+		request.Session = os.Getenv("AIRA_SESSION")
+	}
+	if request.Model == "" {
+		request.Model = os.Getenv("AIRA_MODEL")
+	}
+}
+
+func stampGitContext(scope daemon.WorktreeScope, request *core.Request) {
+	if request == nil || request.GitContext != nil || !core.RequiresGitContext(*request) {
+		return
+	}
+	repoRoot := scope.Root
+	if filepath.Base(filepath.Clean(scope.CommonDir)) == ".git" {
+		repoRoot = filepath.Dir(filepath.Clean(scope.CommonDir))
+	}
+	resolved := gitcontext.NewResolver().Resolve(gitcontext.Options{
+		RepoRoot: repoRoot, WorktreePath: scope.Root, CommonDir: scope.CommonDir,
+		GitDir: scope.GitDir, WorktreeID: scope.WorktreeID,
+	})
+	request.GitContext = &resolved
 }
 
 func scopeFromProject(project app.Project, paths daemon.Paths) (daemon.WorktreeScope, error) {
