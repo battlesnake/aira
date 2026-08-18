@@ -29,12 +29,19 @@ func TestRantIdempotencyByteIdentityAndGitContext(t *testing.T) {
 		ObservedAt:   "2026-08-18T10:00:00Z", ResolverVersion: gitcontext.ResolverVersion,
 	}
 	refs := []domain.RantRef{{Kind: domain.RantRefTicket, ID: ticket.ID}}
-	input := domain.RantInput{Body: body, Tags: []string{"Slow_Tests", "infra"}, Severity: domain.RantSeverityBlocker, Refs: refs, IdempotencyKey: "attempt-1", Actor: "terra"}
+	input := domain.RantInput{Body: body, Tags: []string{"Slow_Tests", "infra"}, Severity: domain.RantSeverityBlocker, Refs: refs, IdempotencyKey: "attempt-1", Actor: "terra", Session: "sess-1", Model: "opus"}
 	first, err := s.AddRant(context.Background(), input, ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := s.AddRant(context.Background(), domain.RantInput{Body: body, Tags: []string{"infra", "slow tests"}, Severity: domain.RantSeverityBlocker, Refs: refs, IdempotencyKey: "attempt-1", Actor: "different-retry-metadata"}, gitcontext.GitContext{})
+	// An honest retry repeats every caller field and observes the same context,
+	// differing only in tag spelling that normalises identically and in the
+	// resolver's fresh observed_at (a volatile envelope field). Idempotent.
+	retry := input
+	retry.Tags = []string{"infra", "slow tests"}
+	retryCtx := ctx
+	retryCtx.ObservedAt = "2026-08-18T10:05:00Z"
+	second, err := s.AddRant(context.Background(), retry, retryCtx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,19 +55,79 @@ func TestRantIdempotencyByteIdentityAndGitContext(t *testing.T) {
 	if got.Body != body || got.GitContext != ctx {
 		t.Fatalf("stored identity changed: body=%q context=%#v", got.Body, got.GitContext)
 	}
-	conflicts := map[string]domain.RantInput{
-		"body":     {Body: body + "changed", Tags: input.Tags, Severity: input.Severity, Refs: refs, IdempotencyKey: input.IdempotencyKey},
-		"tags":     {Body: body, Tags: []string{"other"}, Severity: input.Severity, Refs: refs, IdempotencyKey: input.IdempotencyKey},
-		"severity": {Body: body, Tags: input.Tags, Severity: domain.RantSeverityAnnoyance, Refs: refs, IdempotencyKey: input.IdempotencyKey},
-		"refs":     {Body: body, Tags: input.Tags, Severity: input.Severity, IdempotencyKey: input.IdempotencyKey},
+	// Every caller-supplied field is a discriminator. A reused key describing a
+	// different caller (actor/session/model) or a different observed context
+	// must conflict, not silently alias the original rant.
+	mk := func(mut func(*domain.RantInput)) domain.RantInput {
+		c := input
+		c.Tags = append([]string(nil), input.Tags...)
+		c.Refs = append([]domain.RantRef(nil), input.Refs...)
+		mut(&c)
+		return c
 	}
-	for name, conflict := range conflicts {
-		t.Run("conflicting-"+name, func(t *testing.T) {
-			_, err := s.AddRant(context.Background(), conflict, ctx)
+	movedHead := ctx
+	movedHead.HeadHash = gitcontext.Field{Value: strings.Repeat("b", 40), Status: gitcontext.StatusValue}
+	conflicts := []struct {
+		name  string
+		input domain.RantInput
+		ctx   gitcontext.GitContext
+	}{
+		{"body", mk(func(i *domain.RantInput) { i.Body += "changed" }), ctx},
+		{"tags", mk(func(i *domain.RantInput) { i.Tags = []string{"other"} }), ctx},
+		{"severity", mk(func(i *domain.RantInput) { i.Severity = domain.RantSeverityAnnoyance }), ctx},
+		{"refs", mk(func(i *domain.RantInput) { i.Refs = nil }), ctx},
+		{"actor", mk(func(i *domain.RantInput) { i.Actor = "different-agent" }), ctx},
+		{"session", mk(func(i *domain.RantInput) { i.Session = "sess-2" }), ctx},
+		{"model", mk(func(i *domain.RantInput) { i.Model = "sonnet" }), ctx},
+		{"context", mk(func(i *domain.RantInput) {}), movedHead},
+	}
+	for _, tc := range conflicts {
+		t.Run("conflicting-"+tc.name, func(t *testing.T) {
+			_, err := s.AddRant(context.Background(), tc.input, tc.ctx)
 			if ErrorCode(err) != domain.CodeRantIdempotencyConflict {
 				t.Fatalf("conflict error = %v", err)
 			}
 		})
+	}
+}
+
+func TestRantIdempotencyConcurrentMultiStore(t *testing.T) {
+	// Two independent stores over one DB race the same key. BEGIN IMMEDIATE
+	// serialises them: identical input yields exactly one rant, observed
+	// idempotently by the loser; a different caller field yields a conflict.
+	base := t.TempDir()
+	root := filepath.Join(base, "repo")
+	s1 := openRantStore(t, base, root)
+	s2 := openRantStore(t, base, root)
+	ctxv := gitcontext.GitContext{RepoRoot: gitcontext.Field{Value: root, Status: gitcontext.StatusValue}, WorktreePath: gitcontext.Field{Value: root, Status: gitcontext.StatusValue}, WorktreeID: gitcontext.Field{Value: "wt-rant", Status: gitcontext.StatusValue}, ObservedAt: "2026-08-18T10:00:00Z", ResolverVersion: "v"}
+	input := domain.RantInput{Body: "same body", Tags: []string{"infra"}, IdempotencyKey: "race-1", Actor: "terra"}
+	type res struct {
+		out RantAddResult
+		err error
+	}
+	ch := make(chan res, 2)
+	start := make(chan struct{})
+	for _, st := range []*Store{s1, s2} {
+		st := st
+		go func() {
+			<-start
+			out, err := st.AddRant(context.Background(), input, ctxv)
+			ch <- res{out, err}
+		}()
+	}
+	close(start)
+	a, b := <-ch, <-ch
+	if a.err != nil || b.err != nil {
+		t.Fatalf("same-input race errored: %v / %v", a.err, b.err)
+	}
+	if a.out.Rant.ID != b.out.Rant.ID {
+		t.Fatalf("same-input race produced two rants: %s vs %s", a.out.Rant.ID, b.out.Rant.ID)
+	}
+	if a.out.Idempotent == b.out.Idempotent {
+		t.Fatalf("expected one insert and one idempotent hit, got %v/%v", a.out.Idempotent, b.out.Idempotent)
+	}
+	if _, err := s2.AddRant(context.Background(), domain.RantInput{Body: "same body", Tags: []string{"infra"}, IdempotencyKey: "race-1", Actor: "other"}, ctxv); ErrorCode(err) != domain.CodeRantIdempotencyConflict {
+		t.Fatalf("different-caller reuse = %v", err)
 	}
 }
 
@@ -137,22 +204,76 @@ func TestRantLoopCloserContainsNoProse(t *testing.T) {
 	}
 }
 
-func TestRantRedactKeepsIdentityProvenanceAndContext(t *testing.T) {
+func TestRantRedactErasesEveryProseSurfaceKeepsProvenance(t *testing.T) {
 	s, root := rantTestStore(t)
-	ctx := gitcontext.GitContext{RepoRoot: gitcontext.Field{Value: root, Status: gitcontext.StatusValue}, ObservedAt: "2026-08-18T10:00:00Z", ResolverVersion: "v-test"}
-	added, err := s.AddRant(context.Background(), domain.RantInput{Body: "paste contained a secret", Tags: []string{"security"}, Actor: "terra"}, ctx)
+	const secret = "ghp_super_secret_leaked_token_zzz"
+	ticket, err := s.CreateTicket(context.Background(), domain.CreateTicketInput{Title: "ref", Kind: domain.KindFeature, Severity: domain.SeverityP2})
 	if err != nil {
 		t.Fatal(err)
+	}
+	ctx := gitcontext.GitContext{RepoRoot: gitcontext.Field{Value: root, Status: gitcontext.StatusValue}, ObservedAt: "2026-08-18T10:00:00Z", ResolverVersion: "v-test"}
+	added, err := s.AddRant(context.Background(), domain.RantInput{Body: "paste contained " + secret, Tags: []string{"security"}, Refs: []domain.RantRef{{Kind: domain.RantRefTicket, ID: ticket.ID}}, Actor: "terra"}, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReviewRant(context.Background(), added.Rant.ID, domain.RantReviewInput{Reviewer: "owner", Outcome: domain.RantOutcomePlanned, Note: "reviewer echoed " + secret}); err != nil {
+		t.Fatal(err)
+	}
+	// Populate the disposable FTS index so the secret is present there too; a
+	// correct redaction must delete those rows now, not wait for a rebuild.
+	if rows, err := s.Search(context.Background(), "leaked", "rant"); err != nil || len(rows) != 1 {
+		t.Fatalf("pre-redaction search = %v %#v", err, rows)
 	}
 	if _, err := s.RedactRant(context.Background(), added.Rant.ID); err != nil {
 		t.Fatal(err)
 	}
+	// (1) canonical body scrubbed; provenance + audit skeleton retained.
 	got, err := s.GetRant(added.Rant.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ID != added.Rant.ID || got.Body != domain.RedactedRantBody || !got.Redacted || got.GitContext.RepoRoot != ctx.RepoRoot || got.GitContext.ObservedAt != ctx.ObservedAt || got.GitContext.ResolverVersion != ctx.ResolverVersion || got.Actor != "terra" {
-		t.Fatalf("redacted rant = %#v", got)
+	if got.ID != added.Rant.ID || got.Body != domain.RedactedRantBody || !got.Redacted {
+		t.Fatalf("body not redacted: %#v", got)
+	}
+	if got.GitContext.RepoRoot != ctx.RepoRoot || got.GitContext.ObservedAt != ctx.ObservedAt || got.GitContext.ResolverVersion != ctx.ResolverVersion || got.Actor != "terra" || len(got.Tags) != 1 || got.Tags[0] != "security" || len(got.Refs) != 1 || got.Refs[0].ID != ticket.ID {
+		t.Fatalf("redaction dropped provenance/skeleton: %#v", got)
+	}
+	if len(got.Reviews) != 1 || got.Reviews[0].Outcome != domain.RantOutcomePlanned || got.Reviews[0].Reviewer != "owner" || got.Reviews[0].Note != domain.RedactedRantBody {
+		t.Fatalf("review skeleton/scrub wrong: %#v", got.Reviews)
+	}
+	// (2) no raw table retains a trace of the secret.
+	for _, q := range []struct{ label, query string }{
+		{"rants.body", `SELECT COUNT(*) FROM rants WHERE project_id=? AND instr(body,?)>0`},
+		{"rant_reviews.note", `SELECT COUNT(*) FROM rant_reviews WHERE project_id=? AND instr(note,?)>0`},
+		{"search_fts.content", `SELECT COUNT(*) FROM search_fts WHERE project_id=? AND instr(content,?)>0`},
+	} {
+		var n int
+		if err := s.db.QueryRow(q.query, s.projectID, secret).Scan(&n); err != nil {
+			t.Fatalf("%s scan: %v", q.label, err)
+		}
+		if n != 0 {
+			t.Fatalf("secret survived in %s", q.label)
+		}
+	}
+	// (3) grep no longer surfaces it, even after the reconciling rebuild.
+	if rows, err := s.Search(context.Background(), "leaked", "rant"); err != nil || len(rows) != 0 {
+		t.Fatalf("post-redaction search = %v %#v", err, rows)
+	}
+	// (4/5) responses were prose-free and the journal is metadata-only.
+	data, err := os.ReadFile(filepath.Join(s.auditDir, "journal.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), secret) {
+		t.Fatalf("journal leaked the secret: %s", string(data))
+	}
+	// The append-only redaction exception is exactly as wide as it must be:
+	// nothing but the note→sentinel scrub is permitted.
+	if _, err := s.db.Exec(`UPDATE rant_reviews SET outcome='actioned' WHERE project_id=? AND rant_id=?`, s.projectID, added.Rant.ID); err == nil {
+		t.Fatal("redaction exception allowed an outcome rewrite")
+	}
+	if domain.RedactedRantBody != "[redacted]" {
+		t.Fatalf("sentinel drift: the trigger literal must match domain.RedactedRantBody=%q", domain.RedactedRantBody)
 	}
 }
 
@@ -211,6 +332,14 @@ func rantTestStore(t *testing.T) (*Store, string) {
 	t.Helper()
 	base := t.TempDir()
 	root := filepath.Join(base, "repo")
+	return openRantStore(t, base, root), root
+}
+
+// openRantStore opens a store for the fixed rant project/worktree over the DB
+// under base. Calling it twice with the same base yields two independent
+// handles onto one database, modelling cross-process contention.
+func openRantStore(t *testing.T, base, root string) *Store {
+	t.Helper()
 	common := filepath.Join(root, ".git")
 	if err := os.MkdirAll(common, 0o755); err != nil {
 		t.Fatal(err)
@@ -220,7 +349,7 @@ func rantTestStore(t *testing.T) (*Store, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	return s, root
+	return s
 }
 
 func mustAddRant(t *testing.T, s *Store, input domain.RantInput) RantAddResult {

@@ -940,7 +940,9 @@ func RedactURL(value string) string {
 		parsed.RawQuery = ""
 		parsed.ForceQuery = false
 		parsed.Fragment = ""
-		return parsed.String()
+		// A token can hide in a path segment (…/ghp_x/repo) that structural
+		// redaction leaves untouched; scrub every serialised return path.
+		return scrubTokens(parsed.String())
 	}
 	trimmed = httpsUserinfoPattern.ReplaceAllString(trimmed, `${1}***@`)
 	trimmed = otherUserinfoPattern.ReplaceAllString(trimmed, `${1}***@`)
@@ -950,11 +952,15 @@ func RedactURL(value string) string {
 	if cut := strings.IndexAny(trimmed, "?#"); cut >= 0 {
 		trimmed = trimmed[:cut]
 	}
-	return trimmed
+	// SCP-style git@host:path and any residual bare token (no userinfo colon)
+	// are only caught by the token scrub below.
+	return scrubTokens(trimmed)
 }
 
+func scrubTokens(value string) string { return tokenPattern.ReplaceAllString(value, "***") }
+
 func redactURL(value string) string { return RedactURL(value) }
-func redact(value string) string    { return tokenPattern.ReplaceAllString(redactURL(value), "***") }
+func redact(value string) string    { return scrubTokens(redactURL(value)) }
 
 func redactDetails(details map[string]any) map[string]any {
 	if details == nil {

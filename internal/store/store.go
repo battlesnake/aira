@@ -384,7 +384,9 @@ func openOnce(ctx context.Context, dbPath, registryPath string) (*DB, error) {
 	if err := os.MkdirAll(filepath.Dir(registry), 0o755); err != nil {
 		return nil, err
 	}
-	dsn := dbPath + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=foreign_keys(ON)"
+	// secure_delete overwrites freed content so a redacted rant body/note does
+	// not linger as recoverable bytes in freelist pages after the logical scrub.
+	dsn := dbPath + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=foreign_keys(ON)&_pragma=secure_delete(ON)"
 	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -776,7 +778,15 @@ func (s *Store) initDB(ctx context.Context) error {
 		    CHECK(length(CAST(note AS BLOB)) <= 8192), CHECK(instr(note,char(0)) = 0),
 		    FOREIGN KEY(project_id,rant_id) REFERENCES rants(project_id,id) ON DELETE CASCADE
 		)`,
+		// Append-only, with one narrow exception: redaction may scrub a review's
+		// free-text note to the '[redacted]' sentinel (domain.RedactedRantBody),
+		// leaving every other column identical. Any other update still aborts.
 		`CREATE TRIGGER IF NOT EXISTS rant_reviews_no_update BEFORE UPDATE ON rant_reviews
+		 WHEN NEW.review_id IS NOT OLD.review_id OR NEW.project_id IS NOT OLD.project_id
+		   OR NEW.rant_id IS NOT OLD.rant_id OR NEW.reviewer IS NOT OLD.reviewer
+		   OR NEW.at IS NOT OLD.at OR NEW.outcome IS NOT OLD.outcome
+		   OR NEW.resolved_kind IS NOT OLD.resolved_kind OR NEW.resolved_id IS NOT OLD.resolved_id
+		   OR NEW.note <> '[redacted]'
 		 BEGIN SELECT RAISE(ABORT,'rant reviews are append-only'); END`,
 		`CREATE TRIGGER IF NOT EXISTS rant_reviews_no_delete BEFORE DELETE ON rant_reviews
 		 BEGIN SELECT RAISE(ABORT,'rant reviews are append-only'); END`,

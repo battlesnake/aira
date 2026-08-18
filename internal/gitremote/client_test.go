@@ -895,3 +895,28 @@ func TestMissingSSHHasDistinctCodeBeforeProbe(t *testing.T) {
 		t.Fatalf("error=%v opCalls=%d", err, fake.opCalls)
 	}
 }
+
+func TestRedactURLScrubsTokensOnEveryPath(t *testing.T) {
+	const token = "ghp_super_secret_token_zzz"
+	cases := []struct{ name, raw, want string }{
+		{"token-in-https-path", "https://github.com/" + token + "/repo.git", "https://github.com/***/repo.git"},
+		{"scp-token-userinfo", token + "@github.com:owner/repo.git", "***@github.com:owner/repo.git"},
+		{"token-in-ssh-path", "ssh://git@github.com/" + token + "/repo", "ssh://git@github.com/***/repo"},
+		{"pat-in-path", "https://github.com/github_pat_" + strings.Repeat("A", 20) + "/repo.git", "https://github.com/***/repo.git"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RedactURL(tc.raw)
+			if strings.Contains(got, token) || strings.Contains(got, "github_pat_") {
+				t.Fatalf("token survived: %q -> %q", tc.raw, got)
+			}
+			if got != tc.want {
+				t.Fatalf("RedactURL(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+	// A bare ssh username is not a credential and must survive redaction.
+	if got := RedactURL("git@github.com:owner/repo.git"); got != "git@github.com:owner/repo.git" {
+		t.Fatalf("bare ssh username over-redacted: %q", got)
+	}
+}

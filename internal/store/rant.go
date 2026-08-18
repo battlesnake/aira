@@ -62,7 +62,7 @@ func (s *Store) AddRant(ctx context.Context, raw domain.RantInput, observed gitc
 				return err
 			}
 			if found {
-				if !sameRantInput(existing, input) {
+				if !sameRantInput(existing, input, observed) {
 					return errors.New(domain.CodeRantIdempotencyConflict + ": key already belongs to different rant input")
 				}
 				result = RantAddResult{Rant: existing, ID: existing.ID, Idempotent: true}
@@ -236,6 +236,20 @@ func (s *Store) RedactRant(ctx context.Context, id string) (EventKey, error) {
 		if affected, _ := result.RowsAffected(); affected == 0 {
 			return errors.New("E_NOT_FOUND: rant not found")
 		}
+		// Redaction must erase the pasted secret everywhere it can resurface,
+		// not just the canonical body: the disposable FTS rows a grep reads
+		// (per worktree, so filter on the rant, not this worktree) and the free
+		// prose of every review. The structured audit skeleton — ids, seq,
+		// timestamps, actor, tags, refs, git provenance, review outcomes — is
+		// deliberately retained; only free text is scrubbed. The append-only
+		// review triggers permit exactly this note→sentinel update and nothing
+		// else.
+		if _, err := conn.ExecContext(ctx, `DELETE FROM search_fts WHERE project_id=? AND kind='rant' AND ref_id=?`, s.projectID, id); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, `UPDATE rant_reviews SET note=? WHERE project_id=? AND rant_id=? AND note<>''`, domain.RedactedRantBody, s.projectID, id); err != nil {
+			return err
+		}
 		seq, err := nextSequence(ctx, conn, s.projectID)
 		if err != nil {
 			return err
@@ -397,8 +411,17 @@ func (s *Store) findRantByIdempotency(ctx context.Context, conn *sql.Conn, key s
 	return rant, err == nil, err
 }
 
-func sameRantInput(rant domain.Rant, input domain.RantInput) bool {
-	if rant.Body != input.Body || rant.Severity != input.Severity || len(rant.Tags) != len(input.Tags) || len(rant.Refs) != len(input.Refs) {
+// sameRantInput decides whether a reused idempotency key describes the very
+// same call. It compares every caller-supplied field — not just the content:
+// a different actor, session, or model, or a different observed git context,
+// is a distinct caller and must conflict rather than silently return the
+// original rant. The envelope timestamps (observed_at/received_at) and the
+// resolver version are excluded because they vary between an honest retry and
+// its original without changing the caller's intent.
+func sameRantInput(rant domain.Rant, input domain.RantInput, observed gitcontext.GitContext) bool {
+	if rant.Body != input.Body || rant.Severity != input.Severity ||
+		rant.Actor != input.Actor || rant.Session != input.Session || rant.Model != input.Model ||
+		len(rant.Tags) != len(input.Tags) || len(rant.Refs) != len(input.Refs) {
 		return false
 	}
 	for i := range rant.Tags {
@@ -411,7 +434,12 @@ func sameRantInput(rant domain.Rant, input domain.RantInput) bool {
 			return false
 		}
 	}
-	return true
+	return sameGitContextSemantics(rant.GitContext, observed)
+}
+
+func sameGitContextSemantics(a, b gitcontext.GitContext) bool {
+	return a.RepoRoot == b.RepoRoot && a.WorktreePath == b.WorktreePath && a.WorktreeID == b.WorktreeID &&
+		a.HeadHash == b.HeadHash && a.HeadRef == b.HeadRef && a.RemoteURL == b.RemoteURL
 }
 
 func (s *Store) validateRantRefConn(ctx context.Context, conn *sql.Conn, ref domain.RantRef) error {

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"aira/internal/gitremote"
@@ -52,12 +53,16 @@ type Options struct {
 }
 
 type Resolver struct {
-	ReadFile    func(string) ([]byte, error)
+	ReadFile func(string) ([]byte, error)
+	// PathGuard rejects a ref whose on-disk path escapes root or traverses a
+	// symlink, so a malicious or unusual repository cannot make the resolver
+	// read an arbitrary file and report its contents as a real hash.
+	PathGuard   func(root, ref string) error
 	MaxAttempts int
 }
 
 func NewResolver() Resolver {
-	return Resolver{ReadFile: readBoundedRegularFile, MaxAttempts: 6}
+	return Resolver{ReadFile: readBoundedRegularFile, PathGuard: guardRefBeneathRoot, MaxAttempts: 6}
 }
 
 type snapshot struct {
@@ -67,6 +72,9 @@ type snapshot struct {
 func (r Resolver) Resolve(opts Options) GitContext {
 	if r.ReadFile == nil {
 		r.ReadFile = readBoundedRegularFile
+	}
+	if r.PathGuard == nil {
+		r.PathGuard = guardRefBeneathRoot
 	}
 	if r.MaxAttempts < 2 {
 		r.MaxAttempts = 2
@@ -100,15 +108,24 @@ func (r Resolver) resolveSnapshot(opts Options) snapshot {
 	config, configErr := r.ReadFile(filepath.Join(opts.CommonDir, "config"))
 	settings := parseConfig(config, configErr)
 	var headHash, headRef Field
-	if settings.reftable {
+	switch settings.storage {
+	case storageReftable:
 		headHash, headRef = unevaluated("reftable"), unevaluated("reftable")
-	} else {
-		headHash, headRef = r.resolveHead(opts)
+	case storageFiles:
+		if settings.hashLen == 0 {
+			// Object format is set to something we cannot validate against, so
+			// a files-backend read could accept a wrong-width hash.
+			headHash, headRef = unevaluated("unknown-object-format"), unevaluated("unknown-object-format")
+		} else {
+			headHash, headRef = r.resolveHead(opts, settings.hashLen)
+		}
+	default: // storageUnknown: unreadable or include-dependent config.
+		headHash, headRef = unevaluated("ref-storage-unknown"), unevaluated("ref-storage-unknown")
 	}
 	return snapshot{HeadHash: headHash, HeadRef: headRef, RemoteURL: settings.remote}
 }
 
-func (r Resolver) resolveHead(opts Options) (Field, Field) {
+func (r Resolver) resolveHead(opts Options, hashLen int) (Field, Field) {
 	data, err := r.ReadFile(filepath.Join(opts.GitDir, "HEAD"))
 	if errors.Is(err, os.ErrNotExist) {
 		return none("absent"), none("absent")
@@ -117,7 +134,7 @@ func (r Resolver) resolveHead(opts Options) (Field, Field) {
 		return unevaluated("unreadable"), unevaluated("unreadable")
 	}
 	value := strings.TrimSpace(string(data))
-	if hashValid(value) {
+	if hashValid(value, hashLen) {
 		return valueOf(strings.ToLower(value)), none("detached")
 	}
 	if !strings.HasPrefix(value, "ref: ") {
@@ -135,7 +152,7 @@ func (r Resolver) resolveHead(opts Options) (Field, Field) {
 			return unevaluated("unreadable"), unevaluated("unreadable")
 		}
 		if !found {
-			hash, packed, packedErr := r.readPackedRef(opts.CommonDir, ref)
+			hash, packed, packedErr := r.readPackedRef(opts.CommonDir, ref, hashLen)
 			if packedErr != nil {
 				return unevaluated("unreadable"), unevaluated("unreadable")
 			}
@@ -145,7 +162,7 @@ func (r Resolver) resolveHead(opts Options) (Field, Field) {
 			return none("unborn"), valueOf(ref)
 		}
 		text := strings.TrimSpace(string(data))
-		if hashValid(text) {
+		if hashValid(text, hashLen) {
 			return valueOf(strings.ToLower(text)), valueOf(ref)
 		}
 		if strings.HasPrefix(text, "ref: ") {
@@ -158,13 +175,18 @@ func (r Resolver) resolveHead(opts Options) (Field, Field) {
 }
 
 func (r Resolver) readLooseRef(opts Options, ref string) ([]byte, bool, error) {
-	paths := []string{filepath.Join(opts.GitDir, filepath.FromSlash(ref))}
-	common := filepath.Join(opts.CommonDir, filepath.FromSlash(ref))
-	if common != paths[0] {
-		paths = append(paths, common)
+	roots := []string{opts.GitDir}
+	if opts.CommonDir != "" && opts.CommonDir != opts.GitDir {
+		roots = append(roots, opts.CommonDir)
 	}
-	for _, path := range paths {
-		data, err := r.ReadFile(path)
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		if err := r.PathGuard(root, ref); err != nil {
+			return nil, false, err
+		}
+		data, err := r.ReadFile(filepath.Join(root, filepath.FromSlash(ref)))
 		if err == nil {
 			return data, true, nil
 		}
@@ -175,7 +197,7 @@ func (r Resolver) readLooseRef(opts Options, ref string) ([]byte, bool, error) {
 	return nil, false, nil
 }
 
-func (r Resolver) readPackedRef(commonDir, ref string) (string, bool, error) {
+func (r Resolver) readPackedRef(commonDir, ref string, hashLen int) (string, bool, error) {
 	data, err := r.ReadFile(filepath.Join(commonDir, "packed-refs"))
 	if errors.Is(err, os.ErrNotExist) {
 		return "", false, nil
@@ -192,7 +214,7 @@ func (r Resolver) readPackedRef(commonDir, ref string) (string, bool, error) {
 			return "", false, fmt.Errorf("unusual packed-refs line")
 		}
 		if fields[1] == ref {
-			if !hashValid(fields[0]) {
+			if !hashValid(fields[0], hashLen) {
 				return "", false, fmt.Errorf("invalid packed hash")
 			}
 			return strings.ToLower(fields[0]), true, nil
@@ -201,23 +223,43 @@ func (r Resolver) readPackedRef(commonDir, ref string) (string, bool, error) {
 	return "", false, nil
 }
 
+// refStorageKind records what we could establish about the ref backend. Only a
+// known files backend permits interpreting HEAD/refs as files.
+type refStorageKind int
+
+const (
+	storageFiles refStorageKind = iota
+	storageReftable
+	storageUnknown
+)
+
 type configSettings struct {
-	remote   Field
-	reftable bool
+	remote  Field
+	storage refStorageKind
+	// hashLen is the expected hex hash width (40 for sha1, 64 for sha256);
+	// 0 when the object format could not be established.
+	hashLen int
 }
 
 var configSectionPattern = regexp.MustCompile(`^\[\s*([^\s\]"]+)(?:\s+"((?:[^"\\]|\\.)*)")?\s*\]$`)
 
 func parseConfig(data []byte, readErr error) configSettings {
 	if errors.Is(readErr, os.ErrNotExist) {
-		return configSettings{remote: none("absent")}
+		// No config file at all: git resolves refs with its built-in defaults,
+		// which are the files backend and the SHA-1 object format.
+		return configSettings{remote: none("absent"), storage: storageFiles, hashLen: 40}
 	}
 	if readErr != nil {
-		return configSettings{remote: unevaluated("unreadable")}
+		// Unreadable config: neither the ref backend nor the object format can
+		// be established, so HEAD must not be interpreted as files.
+		return configSettings{remote: unevaluated("unreadable"), storage: storageUnknown}
 	}
 	logical := configLogicalLines(string(data))
 	section, subsection := "", ""
-	settings := configSettings{remote: none("absent")}
+	remote := none("absent")
+	storage := storageFiles
+	hashLen := 40
+	hasInclude := false
 	for _, raw := range logical {
 		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
@@ -226,7 +268,7 @@ func parseConfig(data []byte, readErr error) configSettings {
 		if match := configSectionPattern.FindStringSubmatch(line); match != nil {
 			section, subsection = strings.ToLower(match[1]), strings.ToLower(unescapeConfig(match[2]))
 			if section == "include" || section == "includeif" {
-				settings.remote = unevaluated("config-include")
+				hasInclude = true
 			}
 			continue
 		}
@@ -241,17 +283,37 @@ func parseConfig(data []byte, readErr error) configSettings {
 		}
 		key = strings.ToLower(strings.TrimSpace(key))
 		value = parseConfigValue(value)
-		if section == "extensions" && key == "refstorage" && strings.EqualFold(value, "reftable") {
-			settings.reftable = true
-		}
-		if ((section == "include" || section == "includeif") && key == "path") || key == "include.path" {
-			settings.remote = unevaluated("config-include")
-		}
-		if section == "remote" && subsection == "origin" && key == "url" && settings.remote.Reason != "config-include" {
-			settings.remote = valueOf(gitremote.RedactURL(value))
+		switch {
+		case ((section == "include" || section == "includeif") && key == "path") || key == "include.path":
+			hasInclude = true
+		case section == "extensions" && key == "refstorage":
+			switch strings.ToLower(value) {
+			case "reftable":
+				storage = storageReftable
+			case "files":
+				storage = storageFiles
+			default:
+				storage = storageUnknown
+			}
+		case section == "extensions" && key == "objectformat":
+			switch strings.ToLower(value) {
+			case "sha1":
+				hashLen = 40
+			case "sha256":
+				hashLen = 64
+			default:
+				hashLen = 0
+			}
+		case section == "remote" && subsection == "origin" && key == "url":
+			remote = valueOf(gitremote.RedactURL(value))
 		}
 	}
-	return settings
+	if hasInclude {
+		// An include(If) can silently set the URL, ref backend, or object
+		// format from another file we do not read; none can be trusted.
+		return configSettings{remote: unevaluated("config-include"), storage: storageUnknown}
+	}
+	return configSettings{remote: remote, storage: storage, hashLen: hashLen}
 }
 
 func configLogicalLines(value string) []string {
@@ -298,15 +360,48 @@ func unescapeConfig(value string) string {
 	return replacer.Replace(value)
 }
 
+// validRef enforces the subset of git check-ref-format we rely on: a refs/…
+// path whose every component is a legal refname component. A purely lexical
+// check is not enough — an accepted but malformed name (a leading dot, a .lock
+// component, a control byte) could otherwise steer a file read.
 func validRef(ref string) bool {
-	if !strings.HasPrefix(ref, "refs/") || strings.HasSuffix(ref, "/") || strings.Contains(ref, "..") || strings.Contains(ref, "@{") || strings.Contains(ref, "//") {
+	if !strings.HasPrefix(ref, "refs/") {
 		return false
 	}
-	return !strings.ContainsAny(ref, " ~^:?*[\\") && !strings.HasSuffix(ref, ".") && !strings.HasSuffix(ref, ".lock")
+	if strings.HasSuffix(ref, "/") || strings.HasSuffix(ref, ".") {
+		return false
+	}
+	if strings.Contains(ref, "..") || strings.Contains(ref, "@{") {
+		return false
+	}
+	for _, component := range strings.Split(ref, "/") {
+		if !validRefComponent(component) {
+			return false
+		}
+	}
+	return true
 }
 
-func hashValid(value string) bool {
-	if len(value) != 40 && len(value) != 64 {
+func validRefComponent(component string) bool {
+	if component == "" { // empty ⇒ leading, trailing, or doubled slash
+		return false
+	}
+	if strings.HasPrefix(component, ".") || strings.HasSuffix(component, ".lock") {
+		return false
+	}
+	for _, r := range component {
+		if r < 0x20 || r == 0x7f { // ASCII control characters and DEL
+			return false
+		}
+		if strings.ContainsRune(" ~^:?*[\\", r) {
+			return false
+		}
+	}
+	return true
+}
+
+func hashValid(value string, hashLen int) bool {
+	if hashLen == 0 || len(value) != hashLen {
 		return false
 	}
 	for _, c := range value {
@@ -317,8 +412,47 @@ func hashValid(value string) bool {
 	return true
 }
 
+var (
+	errRefEscapesRoot = errors.New("ref path escapes repository root")
+	errRefSymlink     = errors.New("ref path traverses a symlink")
+)
+
+// guardRefBeneathRoot verifies that ref, resolved under root, stays within root
+// and that no existing path component is a symlink. A component that does not
+// yet exist ends the walk (there is nothing further to follow); the ReadFile
+// then simply reports it absent. Injected in-memory tests supply their own
+// content without touching disk, so a non-existent walk is transparent to them.
+func guardRefBeneathRoot(root, ref string) error {
+	full := filepath.Join(root, filepath.FromSlash(ref))
+	rel, err := filepath.Rel(root, full)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return errRefEscapesRoot
+	}
+	cur := root
+	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
+		if part == "" || part == "." {
+			continue
+		}
+		cur = filepath.Join(cur, part)
+		info, err := os.Lstat(cur)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return errRefSymlink
+		}
+	}
+	return nil
+}
+
 func readBoundedRegularFile(path string) ([]byte, error) {
-	file, err := os.Open(path)
+	// O_NOFOLLOW closes the last-component symlink race the path guard cannot
+	// (a symlink swapped in after the Lstat); a symlinked final component then
+	// fails to open and is treated as unreadable rather than followed.
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
 	}
