@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -313,6 +314,113 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		return nil, err
 	}
 	s.owner = db
+	return s, nil
+}
+
+// OpenReadOnly opens an existing state database as a query-only WAL reader.
+// It deliberately performs no schema initialisation, directory creation, or
+// worktree registration. The returned Store owns only this read connection.
+func OpenReadOnly(dbPath string, opts ScopeOptions) (*Store, error) {
+	if dbPath == "" || opts.Root == "" || opts.CommonDir == "" || opts.GitDir == "" || opts.ProjectSlug == "" {
+		return nil, errors.New("E_CONFIG_INVALID: read-only store options are incomplete")
+	}
+	reviewPolicy, err := ValidateReviewPolicy(opts.ReviewPolicy)
+	if err != nil {
+		return nil, err
+	}
+	root, err := canonicalPath(opts.Root)
+	if err != nil {
+		return nil, err
+	}
+	common, err := canonicalPath(opts.CommonDir)
+	if err != nil {
+		return nil, err
+	}
+	gitDir, err := canonicalPath(opts.GitDir)
+	if err != nil {
+		return nil, err
+	}
+	projectID, worktreeID := hashPath(common), hashPath(gitDir)
+	if opts.ProjectID != "" && opts.ProjectID != projectID {
+		return nil, fmt.Errorf("E_DAEMON_PROJECT_INVALID: project identity %q does not match canonical common directory", opts.ProjectID)
+	}
+	if opts.WorktreeID != "" && opts.WorktreeID != worktreeID {
+		return nil, fmt.Errorf("E_DAEMON_PROJECT_INVALID: worktree identity %q does not match canonical git directory", opts.WorktreeID)
+	}
+	if err := domain.ValidateProjectSlug(opts.ProjectSlug); err != nil {
+		return nil, err
+	}
+	dbPath, err = filepath.Abs(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	dsn := (&url.URL{Scheme: "file", Path: dbPath, RawQuery: "mode=ro&_pragma=query_only(ON)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)"}).String()
+	conn, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	conn.SetMaxOpenConns(1)
+	conn.SetMaxIdleConns(1)
+	if err := conn.PingContext(context.Background()); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	owner := &DB{db: conn, dbPath: dbPath, registryPath: filepath.Join(filepath.Dir(dbPath), "registry.jsonl")}
+	s := &Store{
+		db: conn, owner: owner, root: root, commonDir: common, gitDir: gitDir,
+		auditDir: filepath.Join(common, "aira"), dbPath: dbPath, registryPath: owner.registryPath,
+		projectID: projectID, worktreeID: worktreeID, projectSlug: opts.ProjectSlug,
+		configDigest: opts.ConfigDigest, reviewPolicy: reviewPolicy, prefixes: map[string]string{},
+		leaseStateDir: opts.LeaseStateDir, leaseTTLNS: opts.LeaseTTLNS,
+		maxReports: opts.MaxReports, maxAgeDays: opts.MaxAgeDays,
+		maxComputeEvents: opts.MaxComputeEvents, maxComputeAgeDays: opts.MaxComputeAgeDays,
+		maxCommandEvents: opts.MaxCommandEvents, maxCommandAgeDays: opts.MaxCommandAgeDays,
+		maxQuotaSnapshots: opts.MaxQuotaSnapshots, clock: opts.Clock,
+	}
+	if s.maxReports == 0 {
+		s.maxReports = 5000
+	}
+	if s.maxComputeEvents == 0 {
+		s.maxComputeEvents = 20000
+	}
+	if s.maxCommandEvents == 0 {
+		s.maxCommandEvents = 50000
+	}
+	if s.maxQuotaSnapshots == 0 {
+		s.maxQuotaSnapshots = 5000
+	}
+	if s.maxReports < 1 || s.maxAgeDays < 0 || s.maxComputeEvents < 1 || s.maxComputeAgeDays < 0 || s.maxCommandEvents < 1 || s.maxCommandAgeDays < 0 || s.maxQuotaSnapshots < 1 {
+		_ = conn.Close()
+		return nil, errors.New("E_CONFIG_INVALID: telemetry retention is invalid")
+	}
+	if s.leaseStateDir == "" {
+		s.leaseStateDir = defaultLeaseStateDir()
+	}
+	if s.leaseTTLNS == 0 {
+		s.leaseTTLNS = defaultLeaseTTLNS
+	}
+	if s.clock == nil {
+		s.clock = systemClock{}
+	}
+	for _, prefix := range opts.Prefixes {
+		if !validPrefix(prefix) {
+			_ = conn.Close()
+			return nil, fmt.Errorf("E_ID_INVALID: invalid prefix %q", prefix)
+		}
+		s.prefixes[strings.ToUpper(prefix)] = kindTicket
+	}
+	for _, prefix := range opts.RequirementPrefixes {
+		if !validPrefix(prefix) {
+			_ = conn.Close()
+			return nil, fmt.Errorf("E_ID_INVALID: invalid prefix %q", prefix)
+		}
+		up := strings.ToUpper(prefix)
+		if existing, duplicate := s.prefixes[up]; duplicate && existing != kindRequirement {
+			_ = conn.Close()
+			return nil, fmt.Errorf("E_PREFIX_OWNERSHIP_CONFLICT: prefix %q registered as both ticket and requirement", up)
+		}
+		s.prefixes[up] = kindRequirement
+	}
 	return s, nil
 }
 
