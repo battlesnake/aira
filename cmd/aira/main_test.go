@@ -96,6 +96,19 @@ func TestTimeCLIParsingBuildsCarvedRequestAndPreservesTargetTokens(t *testing.T)
 	if !jsonOutput || !reflect.DeepEqual(stripped, []string{"time", "--", "go", "test", "--json"}) {
 		t.Fatalf("removeJSON=%#v json=%v", stripped, jsonOutput)
 	}
+	// Byte-transparency: a target `--json` (after `--`) must NOT flip AIRA's face
+	// for `time` — it belongs to the child (gh/npm/jest/jq all use --json). Only a
+	// leading `--json` (before `--`) selects the JSON face.
+	if s, j := removeJSON([]string{"time", "--", "gh", "pr", "list", "--json"}); j || !reflect.DeepEqual(s, []string{"time", "--", "gh", "pr", "list", "--json"}) {
+		t.Fatalf("time target --json flipped the outer face: stripped=%#v json=%v", s, j)
+	}
+	if _, j := removeJSON([]string{"time", "--json", "--", "gh", "pr", "list"}); !j {
+		t.Fatal("time leading --json should select the JSON face")
+	}
+	// `run` keeps its established post-delimiter --json behaviour — the fix must not regress it.
+	if _, j := removeJSON([]string{"run", "--", "foo", "--json"}); !j {
+		t.Fatal("run target --json should still select the JSON face")
+	}
 	if _, _, err := parseArgs("time", []string{"go", "test"}); err == nil {
 		t.Fatal("time accepted missing delimiter")
 	}

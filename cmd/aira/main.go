@@ -310,9 +310,13 @@ func removeJSON(argv []string) ([]string, bool) {
 	}
 	for i, arg := range argv {
 		if i >= end {
-			if carvedArgv && arg == "--json" {
-				// The token remains in the child argv verbatim, but still acts as
-				// the outer adapter's output selector for deterministic diagnostics.
+			// A post-`--` token belongs to the TARGET. `run` historically also
+			// treats a target `--json` as its own face selector (it captures
+			// output anyway), but `time` MUST stay byte-transparent: a common
+			// child flag (`gh … --json`, `npm … --json`, `jest --json`) must
+			// reach the child and never flip AIRA into JSON mode + /dev/null the
+			// child's output. So only `run` honours a post-delimiter `--json`.
+			if strings.EqualFold(argv[0], "run") && arg == "--json" {
 				jsonOutput = true
 			}
 			result = append(result, arg)

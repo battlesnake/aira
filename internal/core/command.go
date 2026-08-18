@@ -105,9 +105,12 @@ func runTimedCommand(parent context.Context, argv []string, cwd string, env []st
 				if timeout > 0 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 					return timedCommandResult{Status: domain.CommandTimeout, Signal: "KILL", WallMS: &wall, Exit: 124}
 				}
-				name := unix.SignalName(sig)
+				// Short-form to match the timeout branch's "KILL" and the fixtures
+				// (SIGKILL→KILL, SIGTERM→TERM) so one signal is one population, not
+				// two, in command_events rows and any future signal aggregation.
+				name := strings.TrimPrefix(unix.SignalName(sig), "SIG")
 				if name == "" {
-					name = strings.ToUpper(sig.String())
+					name = strings.TrimPrefix(strings.ToUpper(sig.String()), "SIG")
 				}
 				return timedCommandResult{Status: domain.CommandSignalled, Signal: name, WallMS: &wall, Exit: 128 + int(sig)}
 			}

@@ -70,10 +70,14 @@ func TestTimeExitPassthroughLaunchFailureTimeoutAndNoRunner(t *testing.T) {
 		exit    int
 		status  domain.CommandOutcome
 		code    *int64
+		signal  string
 	}{
-		{"exit7", []string{"sh", "-c", "exit 7"}, "", 7, domain.CommandExited, commandTestInt64(7)},
-		{"launch-failed", []string{"/definitely/not/a/command"}, "", 127, domain.CommandLaunchFailed, nil},
-		{"timeout", []string{"sleep", "30"}, "1s", 124, domain.CommandTimeout, nil},
+		{"exit7", []string{"sh", "-c", "exit 7"}, "", 7, domain.CommandExited, commandTestInt64(7), ""},
+		{"launch-failed", []string{"/definitely/not/a/command"}, "", 127, domain.CommandLaunchFailed, nil, ""},
+		{"timeout", []string{"sleep", "30"}, "1s", 124, domain.CommandTimeout, nil, "KILL"},
+		// A signalled child records the SHORT signal name (TERM, not SIGTERM) so
+		// it shares one population with a timeout's "KILL", and exit = 128+signum.
+		{"signalled-term", []string{"sh", "-c", "kill -TERM $$"}, "", 128 + 15, domain.CommandSignalled, nil, "TERM"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -84,14 +88,17 @@ func TestTimeExitPassthroughLaunchFailureTimeoutAndNoRunner(t *testing.T) {
 				t.Fatalf("response=%#v inputs=%#v", response, s.inputs)
 			}
 			input := s.inputs[0]
-			if input.Status != test.status || !reflect.DeepEqual(input.ExitCode, test.code) {
-				t.Fatalf("input=%#v", input)
+			if input.Status != test.status || !reflect.DeepEqual(input.ExitCode, test.code) || input.Signal != test.signal {
+				t.Fatalf("input=%#v want status=%s signal=%q", input, test.status, test.signal)
 			}
 			if test.status == domain.CommandLaunchFailed && input.WallMS != nil {
 				t.Fatalf("launch failure has wall=%v", input.WallMS)
 			}
-			if test.status == domain.CommandTimeout && (input.Signal != "KILL" || input.WallMS == nil || *input.WallMS < 500 || *input.WallMS > 2500) {
+			if test.status == domain.CommandTimeout && (input.WallMS == nil || *input.WallMS < 500 || *input.WallMS > 2500) {
 				t.Fatalf("timeout=%#v", input)
+			}
+			if test.status == domain.CommandSignalled && input.WallMS == nil {
+				t.Fatalf("signalled has nil wall: %#v", input)
 			}
 		})
 	}
