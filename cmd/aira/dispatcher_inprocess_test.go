@@ -578,7 +578,7 @@ func TestStoreTouchingCarvedDispatchUsesReadOnlyClientAndRelaysCommandWrite(t *t
 			}
 			return daemon.ResponseFrame{OK: true, Code: "OK"}, nil
 		case "add-command-event":
-			data, marshalErr := json.Marshal(store.CommandEventAddResult{ID: "CMD-relayed", Event: domain.CommandEvent{ID: "CMD-relayed"}})
+			data, marshalErr := json.Marshal(validCommandEventAddResult("CMD-relayed"))
 			if marshalErr != nil {
 				t.Fatal(marshalErr)
 			}
@@ -695,6 +695,53 @@ func TestEnsureScopeFrameReplacesOlderProtocolDaemon(t *testing.T) {
 	}
 }
 
+func TestEnsureScopeStoreOpFrameRemainsProtoThreeAllowListCompatible(t *testing.T) {
+	_, scope, _ := storeFreeDispatcherFixture(t)
+	ensureScope := daemon.StoreOpFrame{Proto: daemon.ProtocolVersion, Scope: scope, Op: "ensure-scope"}
+	encoded, err := json.Marshal(ensureScope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &members); err != nil {
+		t.Fatal(err)
+	}
+	if len(members) != 3 || members["proto"] == nil || members["scope"] == nil || members["op"] == nil {
+		t.Fatalf("ensure-scope members=%v, want only proto/scope/op", members)
+	}
+	if err := parseProtoThreeStoreOpFrame(encoded); err != nil {
+		t.Fatalf("proto-3 parser rejected ensure-scope frame %s: %v", encoded, err)
+	}
+
+	bodyFrame, err := daemon.NewAddTestReportStoreOp(scope, domain.TestReportInput{Raw: []byte("report")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err = json.Marshal(bodyFrame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := parseProtoThreeStoreOpFrame(encoded); err == nil {
+		t.Fatalf("proto-3 parser accepted body-bearing store-op frame %s", encoded)
+	}
+}
+
+// parseProtoThreeStoreOpFrame preserves the pre-D7b strict store-op member
+// allow-list. Proto 3 rejected every store-op field except proto/scope/op.
+func parseProtoThreeStoreOpFrame(payload []byte) error {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &members); err != nil {
+		return err
+	}
+	for name := range members {
+		if name != "proto" && name != "scope" && name != "op" {
+			return fmt.Errorf("unexpected store operation field %q", name)
+		}
+	}
+	var frame daemon.StoreOpFrame
+	return json.Unmarshal(payload, &frame)
+}
+
 func TestStoreTouchingEnsureScopeReplacesProtoThreeBeforeRelayOp(t *testing.T) {
 	dispatcher := autoStartDispatcher(t)
 	older := startProtocolDaemonProcess(t)
@@ -731,7 +778,7 @@ func TestStoreTouchingEnsureScopeReplacesProtoThreeBeforeRelayOp(t *testing.T) {
 			if frame.Op != "add-command-event" {
 				t.Fatalf("relay op after replacement=%q", frame.Op)
 			}
-			data, marshalErr := json.Marshal(store.CommandEventAddResult{ID: "CMD-relayed", Event: domain.CommandEvent{ID: "CMD-relayed"}})
+			data, marshalErr := json.Marshal(validCommandEventAddResult("CMD-relayed"))
 			if marshalErr != nil {
 				t.Fatal(marshalErr)
 			}

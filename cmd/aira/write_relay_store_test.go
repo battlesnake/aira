@@ -91,17 +91,17 @@ func TestWriteRelayStoreOverridesAllCarvedWritersAndBackstopsOthers(t *testing.T
 		switch frame.Op {
 		case "add-test-report":
 			result = daemon.RelayedTestReportResult{
-				Header: daemon.NewRelayedTestReportHeader(domain.TestReport{ID: "TR-9", Commit: "abc", SuiteID: "unit", Config: "cfg", EnvDigest: "env", Shard: "1/1", ParserComplete: true}),
+				Header: validRelayedTestReportHeader("TR-9"),
 				Counts: daemon.TestReportCounts{Pass: 2}, Remaining: 1,
 			}
 		case "add-compute-event":
-			result = store.ComputeEventAddResult{ID: "CE-9", Event: domain.ComputeEvent{ID: "CE-9"}}
+			result = validComputeEventAddResult("CE-9")
 		case "add-command-event":
-			result = store.CommandEventAddResult{ID: "CMD-9", Event: domain.CommandEvent{ID: "CMD-9"}}
+			result = validCommandEventAddResult("CMD-9")
 		case "reconcile", "rebuild":
 			return daemon.ResponseFrame{OK: true, Code: "OK"}, nil
 		case "check":
-			result = store.CheckReport{Verdict: "pass", Dimensions: map[string]string{"rebuild-integrity": "pass"}}
+			result = validCheckReport()
 		default:
 			t.Fatalf("unexpected op %q", frame.Op)
 		}
@@ -191,12 +191,169 @@ func TestWriteRelayStoreRejectsFailedOrMalformedResponses(t *testing.T) {
 	}
 }
 
+func TestWriteRelayStoreRejectsStructurallyMalformedSuccessDTOs(t *testing.T) {
+	ro, scope := relayStoreFixture(t)
+	tests := []struct {
+		name string
+		data json.RawMessage
+		call func(*writeRelayStore) error
+	}{
+		{
+			name: "valid JSON empty test report result",
+			data: json.RawMessage(`{}`),
+			call: func(relay *writeRelayStore) error {
+				_, err := relay.AddTestReport(context.Background(), domain.TestReportInput{})
+				return err
+			},
+		},
+		{
+			name: "valid JSON empty compute result",
+			data: json.RawMessage(`{}`),
+			call: func(relay *writeRelayStore) error {
+				_, err := relay.AddComputeEvent(context.Background(), domain.ComputeEventInput{})
+				return err
+			},
+		},
+		{
+			name: "valid JSON empty command result",
+			data: json.RawMessage(`{}`),
+			call: func(relay *writeRelayStore) error {
+				_, err := relay.AddCommandEvent(context.Background(), domain.CommandEventInput{})
+				return err
+			},
+		},
+		{
+			name: "valid JSON empty check result",
+			data: json.RawMessage(`{}`),
+			call: func(relay *writeRelayStore) error {
+				_, err := relay.Check(context.Background())
+				return err
+			},
+		},
+		{
+			name: "negative test result count",
+			data: mustMarshalRelayResult(t, daemon.RelayedTestReportResult{
+				Header: validRelayedTestReportHeader("TR-1"), Counts: daemon.TestReportCounts{Pass: -1}, Remaining: 1,
+			}),
+			call: func(relay *writeRelayStore) error {
+				_, err := relay.AddTestReport(context.Background(), domain.TestReportInput{})
+				return err
+			},
+		},
+		{
+			name: "huge test result count",
+			data: mustMarshalRelayResult(t, daemon.RelayedTestReportResult{
+				Header: validRelayedTestReportHeader("TR-1"), Counts: daemon.TestReportCounts{Pass: maxRelayedTestResults + 1}, Remaining: 1,
+			}),
+			call: func(relay *writeRelayStore) error {
+				_, err := relay.AddTestReport(context.Background(), domain.TestReportInput{})
+				return err
+			},
+		},
+		{
+			name: "negative compute retention count",
+			data: func() json.RawMessage {
+				result := validComputeEventAddResult("CE-1")
+				result.EvictedCount = -1
+				return mustMarshalRelayResult(t, result)
+			}(),
+			call: func(relay *writeRelayStore) error {
+				_, err := relay.AddComputeEvent(context.Background(), domain.ComputeEventInput{})
+				return err
+			},
+		},
+		{
+			name: "negative command retention count",
+			data: func() json.RawMessage {
+				result := validCommandEventAddResult("CMD-1")
+				result.Remaining = -1
+				return mustMarshalRelayResult(t, result)
+			}(),
+			call: func(relay *writeRelayStore) error {
+				_, err := relay.AddCommandEvent(context.Background(), domain.CommandEventInput{})
+				return err
+			},
+		},
+		{
+			name: "check finding lengths exceed bound",
+			data: func() json.RawMessage {
+				report := validCheckReport()
+				report.Verdict = "fail"
+				report.Dimensions["rebuild-integrity"] = "fail"
+				report.Findings = make([]store.CheckFinding, daemon.MaxRelayedFindings+1)
+				for index := range report.Findings {
+					report.Findings[index] = store.CheckFinding{Code: "E_TEST", Kind: "fail"}
+				}
+				report.FindingCounts["findings"] = uint(len(report.Findings))
+				return mustMarshalRelayResult(t, report)
+			}(),
+			call: func(relay *writeRelayStore) error {
+				_, err := relay.Check(context.Background())
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			relay := newWriteRelayStore(ro, scope, func(context.Context, daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
+				return daemon.ResponseFrame{OK: true, Code: "OK", Data: test.data}, nil
+			})
+			err := test.call(relay)
+			if err == nil || store.ErrorCode(err) != daemon.CodeProtocol || !strings.Contains(err.Error(), "malformed store-op result") {
+				t.Fatalf("err=%v, want %s malformed store-op result", err, daemon.CodeProtocol)
+			}
+		})
+	}
+}
+
+func mustMarshalRelayResult(t *testing.T, value any) json.RawMessage {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func validRelayedTestReportHeader(id string) daemon.RelayedTestReportHeader {
+	return daemon.NewRelayedTestReportHeader(domain.TestReport{
+		ID: id, At: "2026-08-18T10:00:00Z", AtSeq: 1,
+		Commit: "abc", SuiteID: "unit", Config: "cfg", EnvDigest: "env", Shard: "1/1",
+		ParserComplete: true, Format: "go-json", SourceDigest: "sha256:test",
+	})
+}
+
+func validComputeEventAddResult(id string) store.ComputeEventAddResult {
+	event := domain.ComputeEvent{
+		ID: id, Model: "gpt-test", Provider: "openai", At: "2026-08-18T10:00:00Z",
+		Source: "run", Conservation: domain.ConservationUnevaluated, AtSeq: 1,
+	}
+	return store.ComputeEventAddResult{ID: id, Event: event, Remaining: 1}
+}
+
+func validCommandEventAddResult(id string) store.CommandEventAddResult {
+	exitCode, wallMS := int64(0), int64(1)
+	event := domain.CommandEvent{
+		ID: id, At: "2026-08-18T10:00:00Z", AtSeq: 1,
+		Key: "true", KeySource: domain.CommandKeyProgram, Program: "true",
+		Status: domain.CommandExited, ExitCode: &exitCode, WallMS: &wallMS,
+	}
+	return store.CommandEventAddResult{ID: id, Event: event, Remaining: 1}
+}
+
+func validCheckReport() store.CheckReport {
+	return store.CheckReport{
+		Verdict: "pass", Dimensions: map[string]string{"rebuild-integrity": "pass"},
+		FindingCounts: map[string]uint{"findings": 0, "warnings": 0, "unevaluated_findings": 0},
+	}
+}
+
 func TestWriteRelayStoreMapsCheckFindingsOmitted(t *testing.T) {
 	ro, scope := relayStoreFixture(t)
 	want := store.CheckReport{
 		Verdict: "fail", Dimensions: map[string]string{"traceability": "fail"},
 		Findings:      []store.CheckFinding{{Code: "E_TRACE", Kind: "fail"}},
-		FindingCounts: map[string]uint{"findings": 9}, FindingsOmitted: 8,
+		FindingCounts: map[string]uint{"findings": 9, "warnings": 0, "unevaluated_findings": 0}, FindingsOmitted: 8,
 	}
 	relay := newWriteRelayStore(ro, scope, func(context.Context, daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
 		data, err := json.Marshal(want)
@@ -218,9 +375,7 @@ func TestWriteRelayReportHeaderKeepsWireRunReportComparable(t *testing.T) {
 			t.Fatalf("op=%q", frame.Op)
 		}
 		data, err := json.Marshal(daemon.RelayedTestReportResult{
-			Header: daemon.NewRelayedTestReportHeader(domain.TestReport{
-				ID: "TR-1", Commit: "abc", SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1", ParserComplete: true,
-			}),
+			Header: validRelayedTestReportHeader("TR-1"),
 			Counts: daemon.TestReportCounts{Pass: 1}, Remaining: 1,
 		})
 		if err != nil {
@@ -248,15 +403,15 @@ func TestStoreTouchingCarvedVerbCompletenessUsesExpectedRelayOps(t *testing.T) {
 		var result any
 		switch frame.Op {
 		case "add-test-report":
-			result = daemon.RelayedTestReportResult{Header: daemon.NewRelayedTestReportHeader(domain.TestReport{ID: "TR-1", Commit: "abc", SuiteID: "unit", Config: "cfg", EnvDigest: "env", Shard: "1/1", ParserComplete: true}), Counts: daemon.TestReportCounts{Pass: 1}}
+			result = daemon.RelayedTestReportResult{Header: validRelayedTestReportHeader("TR-1"), Counts: daemon.TestReportCounts{Pass: 1}}
 		case "add-compute-event":
-			result = store.ComputeEventAddResult{ID: "CE-1", Event: domain.ComputeEvent{ID: "CE-1", Conservation: domain.ConservationUnevaluated}}
+			result = validComputeEventAddResult("CE-1")
 		case "add-command-event":
-			result = store.CommandEventAddResult{ID: "CMD-1", Event: domain.CommandEvent{ID: "CMD-1"}}
+			result = validCommandEventAddResult("CMD-1")
 		case "reconcile", "rebuild":
 			return daemon.ResponseFrame{OK: true, Code: "OK"}, nil
 		case "check":
-			result = store.CheckReport{Verdict: "pass", Dimensions: map[string]string{"rebuild-integrity": "pass"}}
+			result = validCheckReport()
 		default:
 			t.Fatalf("unexpected op %q", frame.Op)
 		}
@@ -314,7 +469,7 @@ func TestRunReportRelayBoundaryMinusEqualPlusOne(t *testing.T) {
 			relay := newWriteRelayStore(ro, scope, func(_ context.Context, got daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
 				frame = got
 				data, err := json.Marshal(daemon.RelayedTestReportResult{
-					Header: daemon.NewRelayedTestReportHeader(domain.TestReport{ID: "TR-1", Commit: "abc", SuiteID: "unit", Config: "cfg", EnvDigest: "env", Shard: "1/1"}),
+					Header: validRelayedTestReportHeader("TR-1"),
 				})
 				if err != nil {
 					t.Fatal(err)
@@ -348,9 +503,7 @@ func TestWriteRelayStorePreservesDaemonCodesAtLiveBranchSites(t *testing.T) {
 			if len(frames) == 1 {
 				return daemon.ResponseFrame{Code: "E_TESTREPORT_INVALID", Error: "malformed go-json"}, nil
 			}
-			data, err := json.Marshal(daemon.RelayedTestReportResult{Header: daemon.NewRelayedTestReportHeader(domain.TestReport{
-				ID: "TR-1", Commit: "abc", SuiteID: "unit", Config: "cfg", EnvDigest: "env", Shard: "1/1",
-			})})
+			data, err := json.Marshal(daemon.RelayedTestReportResult{Header: validRelayedTestReportHeader("TR-1")})
 			if err != nil {
 				t.Fatal(err)
 			}

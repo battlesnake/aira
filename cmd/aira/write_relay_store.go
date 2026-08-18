@@ -15,6 +15,14 @@ import (
 
 type storeOpRelay func(context.Context, daemon.StoreOpFrame) (daemon.ResponseFrame, error)
 
+const (
+	// Compact test-report counts are expanded into synthetic TestResult values
+	// on the client. Keep a malicious success DTO from forcing an unbounded
+	// allocation even though its small JSON representation fits in one frame.
+	maxRelayedTestResults = daemon.MaxFrameBytes / 16
+	maxRelayedStoreCount  = 1<<31 - 1
+)
+
 // writeRelayStore delegates the complete read surface to a query-only Store
 // while overriding every state.db writer used by carved verbs. Any future
 // unoverridden writer reaches SQLite query_only and fails loudly.
@@ -41,6 +49,9 @@ func (s *writeRelayStore) AddTestReport(ctx context.Context, input domain.TestRe
 	if err := s.exchange(ctx, frame, &relayed, false); err != nil {
 		return store.TestReportAddResult{}, err
 	}
+	if err := validateRelayedTestReportResult(relayed, s.scope.MaxReports); err != nil {
+		return store.TestReportAddResult{}, malformedStoreOpResult(frame.Op, err)
+	}
 	report := relayed.Header.TestReport()
 	report.Results = syntheticTestResults(relayed.Counts)
 	return store.TestReportAddResult{
@@ -58,6 +69,9 @@ func (s *writeRelayStore) AddComputeEvent(ctx context.Context, input domain.Comp
 	if err := s.exchange(ctx, frame, &result, false); err != nil {
 		return store.ComputeEventAddResult{}, err
 	}
+	if err := validateRelayedComputeEventResult(result, s.scope.MaxComputeEvents); err != nil {
+		return store.ComputeEventAddResult{}, malformedStoreOpResult(frame.Op, err)
+	}
 	return result, nil
 }
 
@@ -69,6 +83,9 @@ func (s *writeRelayStore) AddCommandEvent(ctx context.Context, input domain.Comm
 	var result store.CommandEventAddResult
 	if err := s.exchange(ctx, frame, &result, false); err != nil {
 		return store.CommandEventAddResult{}, err
+	}
+	if err := validateRelayedCommandEventResult(result, s.scope.MaxCommandEvents); err != nil {
+		return store.CommandEventAddResult{}, malformedStoreOpResult(frame.Op, err)
 	}
 	return result, nil
 }
@@ -89,7 +106,157 @@ func (s *writeRelayStore) Check(ctx context.Context) (store.CheckReport, error) 
 	if err := s.exchange(ctx, frame, &result, true); err != nil {
 		return store.CheckReport{}, err
 	}
+	if err := validateRelayedCheckReport(result); err != nil {
+		return store.CheckReport{}, malformedStoreOpResult(frame.Op, err)
+	}
 	return result, nil
+}
+
+func malformedStoreOpResult(op string, err error) error {
+	return fmt.Errorf("%s: malformed store-op result for %s: %v", daemon.CodeProtocol, op, err)
+}
+
+func validateRelayedTestReportResult(result daemon.RelayedTestReportResult, configuredMax int) error {
+	report := result.Header.TestReport()
+	if err := report.Validate(); err != nil {
+		return fmt.Errorf("invalid report header: %w", err)
+	}
+	if err := validateRelayedCount("evicted", result.Evicted); err != nil {
+		return err
+	}
+	if err := validateRelayedRemaining(result.Remaining, configuredMax); err != nil {
+		return err
+	}
+	total := 0
+	for name, count := range map[string]int{
+		"pass": result.Counts.Pass, "fail": result.Counts.Fail,
+		"skip": result.Counts.Skip, "error": result.Counts.Error,
+	} {
+		if count < 0 {
+			return fmt.Errorf("%s count is negative", name)
+		}
+		if count > maxRelayedTestResults-total {
+			return fmt.Errorf("test result count exceeds %d", maxRelayedTestResults)
+		}
+		total += count
+	}
+	return nil
+}
+
+func validateRelayedComputeEventResult(result store.ComputeEventAddResult, configuredMax int) error {
+	if strings.TrimSpace(result.ID) == "" || result.ID != result.Event.ID {
+		return errors.New("compute event result identity is missing or inconsistent")
+	}
+	if err := result.Event.Validate(); err != nil {
+		return fmt.Errorf("invalid compute event: %w", err)
+	}
+	if err := validateRelayedCount("evicted_count", result.EvictedCount); err != nil {
+		return err
+	}
+	return validateRelayedRemaining(result.Remaining, configuredMax)
+}
+
+func validateRelayedCommandEventResult(result store.CommandEventAddResult, configuredMax int) error {
+	event := result.Event
+	if strings.TrimSpace(result.ID) == "" || result.ID != event.ID || strings.TrimSpace(event.At) == "" || event.AtSeq < 1 {
+		return errors.New("command event result identity is missing or inconsistent")
+	}
+	input := domain.CommandEventInput{
+		At: event.At, Key: event.Key, KeySource: event.KeySource, Program: event.Program,
+		ArgvPreview: event.ArgvPreview, ArgvDigest: event.ArgvDigest, PrefixPreview: event.PrefixPreview,
+		Status: event.Status, ExitCode: event.ExitCode, Signal: event.Signal, WallMS: event.WallMS,
+		TicketID: event.TicketID, Phase: event.Phase, Actor: event.Actor, Session: event.Session, Cwd: event.Cwd,
+	}
+	if err := input.Validate(); err != nil {
+		return fmt.Errorf("invalid command event: %w", err)
+	}
+	if err := validateRelayedCount("evicted_count", result.EvictedCount); err != nil {
+		return err
+	}
+	return validateRelayedRemaining(result.Remaining, configuredMax)
+}
+
+func validateRelayedCount(name string, count int) error {
+	if count < 0 || count > maxRelayedStoreCount {
+		return fmt.Errorf("%s is outside the supported range", name)
+	}
+	return nil
+}
+
+func validateRelayedRemaining(remaining, configuredMax int) error {
+	if err := validateRelayedCount("remaining", remaining); err != nil {
+		return err
+	}
+	if configuredMax > 0 && remaining > configuredMax {
+		return fmt.Errorf("remaining count %d exceeds configured maximum %d", remaining, configuredMax)
+	}
+	return nil
+}
+
+func validateRelayedCheckReport(report store.CheckReport) error {
+	switch report.Verdict {
+	case "pass":
+		if report.Unevaluated {
+			return errors.New("pass verdict is marked unevaluated")
+		}
+	case "fail":
+	case "unevaluated":
+		if !report.Unevaluated {
+			return errors.New("unevaluated verdict is not marked unevaluated")
+		}
+	default:
+		return errors.New("verdict is missing or invalid")
+	}
+	if len(report.Dimensions) == 0 {
+		return errors.New("dimensions are missing")
+	}
+	for name, verdict := range report.Dimensions {
+		if strings.TrimSpace(name) == "" {
+			return errors.New("dimension name is empty")
+		}
+		switch verdict {
+		case "pass", "fail", "warning", "unevaluated":
+		default:
+			return fmt.Errorf("dimension %q has invalid verdict %q", name, verdict)
+		}
+	}
+
+	type findingGroup struct {
+		name     string
+		findings []store.CheckFinding
+	}
+	groups := []findingGroup{
+		{name: "findings", findings: report.Findings},
+		{name: "warnings", findings: report.Warnings},
+		{name: "unevaluated_findings", findings: report.UnevaluatedFindings},
+	}
+	if len(report.FindingCounts) != len(groups) {
+		return errors.New("finding counts are missing or contain unexpected keys")
+	}
+	included, original := uint64(0), uint64(0)
+	for _, group := range groups {
+		if len(group.findings) > daemon.MaxRelayedFindings || included+uint64(len(group.findings)) > daemon.MaxRelayedFindings {
+			return fmt.Errorf("included findings exceed %d", daemon.MaxRelayedFindings)
+		}
+		count, ok := report.FindingCounts[group.name]
+		if !ok || count < uint(len(group.findings)) || uint64(count) > maxRelayedStoreCount {
+			return fmt.Errorf("%s count is missing or invalid", group.name)
+		}
+		included += uint64(len(group.findings))
+		original += uint64(count)
+		for _, finding := range group.findings {
+			if strings.TrimSpace(finding.Code) == "" || strings.TrimSpace(finding.Kind) == "" {
+				return errors.New("finding code or kind is empty")
+			}
+		}
+	}
+	if uint64(report.FindingsOmitted) > maxRelayedStoreCount || original != included+uint64(report.FindingsOmitted) {
+		return errors.New("findings_omitted is inconsistent with finding counts")
+	}
+	if uint64(report.FindingsTruncated) > included*4 {
+		return errors.New("findings_truncated exceeds included finding fields")
+	}
+	return nil
 }
 
 func (s *writeRelayStore) exchange(ctx context.Context, frame daemon.StoreOpFrame, result any, safeToRerun bool) error {
