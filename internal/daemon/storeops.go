@@ -20,19 +20,10 @@ const (
 	maxRelayedFindingCodeBytes = 64
 	maxRelayedFindingTextBytes = 192
 	maxRelayedFindingKindBytes = 32
-	maxRelayedReportFieldBytes = 1024
 )
 
-const nilReportBodyMarker byte = 0
-
 type TestReportStoreOpPayload struct {
-	Input      domain.TestReportInput `json:"input"`
-	RawPresent bool                   `json:"raw_present"`
-	RawEmpty   bool                   `json:"raw_empty,omitempty"`
-}
-
-type ReconcileStoreOpPayload struct {
-	Rebuild bool `json:"rebuild"`
+	Input domain.TestReportInput `json:"input"`
 }
 
 type TestReportCounts struct {
@@ -42,22 +33,59 @@ type TestReportCounts struct {
 	Error int `json:"error"`
 }
 
-type RelayedTestReportResult struct {
-	ReportID           string            `json:"report_id"`
-	Suite              domain.TestReport `json:"suite"`
-	ParserComplete     bool              `json:"parser_complete"`
-	Counts             TestReportCounts  `json:"counts"`
-	TestsGreenObserved bool              `json:"tests_green_observed"`
-	Warnings           []string          `json:"warnings,omitempty"`
-	Evicted            int               `json:"evicted"`
-	Remaining          int               `json:"remaining"`
-	Idempotent         bool              `json:"idempotent,omitempty"`
+// RelayedTestReportHeader is the complete stored TestReport projection except
+// for the unbounded per-test Results slice.
+type RelayedTestReportHeader struct {
+	ID             string           `json:"id"`
+	TicketID       string           `json:"ticket_id,omitempty"`
+	Phase          string           `json:"phase,omitempty"`
+	Commit         string           `json:"commit"`
+	Branch         string           `json:"branch"`
+	WorktreeID     string           `json:"worktree_id"`
+	Agent          string           `json:"agent,omitempty"`
+	Session        string           `json:"session,omitempty"`
+	At             string           `json:"at"`
+	RunRef         string           `json:"run_ref,omitempty"`
+	SuiteID        string           `json:"suite_id"`
+	Runner         string           `json:"runner"`
+	Config         string           `json:"config"`
+	EnvDigest      string           `json:"env_digest"`
+	Shard          string           `json:"shard"`
+	RetryIndex     int              `json:"retry_index"`
+	ParserComplete bool             `json:"parser_complete"`
+	Coverage       *domain.Coverage `json:"coverage,omitempty"`
+	Format         string           `json:"format"`
+	SourceDigest   string           `json:"source_digest"`
+	AtSeq          int64            `json:"at_seq"`
+	Pinned         bool             `json:"pinned,omitempty"`
 }
 
-type RelayedReconcileResult struct {
-	Reconciled bool   `json:"reconciled"`
-	Rebuilt    bool   `json:"rebuilt,omitempty"`
-	Verdict    string `json:"verdict"`
+type RelayedTestReportResult struct {
+	Header     RelayedTestReportHeader `json:"header"`
+	Counts     TestReportCounts        `json:"counts"`
+	Evicted    int                     `json:"evicted"`
+	Remaining  int                     `json:"remaining"`
+	Idempotent bool                    `json:"idempotent,omitempty"`
+}
+
+func NewRelayedTestReportHeader(report domain.TestReport) RelayedTestReportHeader {
+	return RelayedTestReportHeader{
+		ID: report.ID, TicketID: report.TicketID, Phase: report.Phase, Commit: report.Commit, Branch: report.Branch,
+		WorktreeID: report.WorktreeID, Agent: report.Agent, Session: report.Session, At: report.At, RunRef: report.RunRef,
+		SuiteID: report.SuiteID, Runner: report.Runner, Config: report.Config, EnvDigest: report.EnvDigest, Shard: report.Shard,
+		RetryIndex: report.RetryIndex, ParserComplete: report.ParserComplete, Coverage: report.Coverage, Format: report.Format,
+		SourceDigest: report.SourceDigest, AtSeq: report.AtSeq, Pinned: report.Pinned,
+	}
+}
+
+func (header RelayedTestReportHeader) TestReport() domain.TestReport {
+	return domain.TestReport{
+		ID: header.ID, TicketID: header.TicketID, Phase: header.Phase, Commit: header.Commit, Branch: header.Branch,
+		WorktreeID: header.WorktreeID, Agent: header.Agent, Session: header.Session, At: header.At, RunRef: header.RunRef,
+		SuiteID: header.SuiteID, Runner: header.Runner, Config: header.Config, EnvDigest: header.EnvDigest, Shard: header.Shard,
+		RetryIndex: header.RetryIndex, ParserComplete: header.ParserComplete, Coverage: header.Coverage, Format: header.Format,
+		SourceDigest: header.SourceDigest, AtSeq: header.AtSeq, Pinned: header.Pinned,
+	}
 }
 
 func validateStoreOpEnvelope(frame StoreOpFrame) error {
@@ -70,22 +98,19 @@ func validateStoreOpEnvelope(frame StoreOpFrame) error {
 			return errors.New(CodeProtocol + ": ensure-scope cannot carry a body or payload")
 		}
 	case "add-test-report":
-		if frame.BodyLen == 0 {
-			return errors.New(CodeProtocol + ": add-test-report requires a declared body")
-		}
 		if len(frame.Payload) == 0 {
 			return errors.New(CodeProtocol + ": add-test-report requires a payload")
 		}
-	case "add-compute-event", "add-command-event", "reconcile":
+	case "add-compute-event", "add-command-event":
 		if frame.BodyLen != 0 {
 			return fmt.Errorf("%s: %s cannot carry a body", CodeProtocol, frame.Op)
 		}
 		if len(frame.Payload) == 0 {
 			return fmt.Errorf("%s: %s requires a payload", CodeProtocol, frame.Op)
 		}
-	case "check":
+	case "reconcile", "rebuild", "check":
 		if frame.BodyLen != 0 || len(frame.Payload) != 0 {
-			return errors.New(CodeProtocol + ": check cannot carry a body or payload")
+			return fmt.Errorf("%s: %s cannot carry a body or payload", CodeProtocol, frame.Op)
 		}
 	default:
 		return fmt.Errorf("%s: unknown store operation %q", CodeProtocol, frame.Op)
@@ -101,18 +126,16 @@ func encodeStoreOpPayload(value any) (json.RawMessage, error) {
 	return payload, nil
 }
 
-// NewAddTestReportStoreOp builds the only body-bearing store operation. A
-// metadata-only report uses an explicit one-byte marker so BodyLen remains a
-// truthful presence discriminator and zero remains an invalid declaration.
+// NewAddTestReportStoreOp builds the only optionally body-bearing store
+// operation. A zero body length means Raw is nil; metadata-only reports use
+// that representation without a sentinel byte.
 func NewAddTestReportStoreOp(scope WorktreeScope, input domain.TestReportInput) (StoreOpFrame, error) {
-	rawPresent := input.Raw != nil
 	body := append([]byte(nil), input.Raw...)
-	rawEmpty := rawPresent && len(body) == 0
-	input.Raw = nil
-	if !rawPresent || rawEmpty {
-		body = []byte{nilReportBodyMarker}
+	if len(body) == 0 {
+		body = nil
 	}
-	payload, err := encodeStoreOpPayload(TestReportStoreOpPayload{Input: input, RawPresent: rawPresent, RawEmpty: rawEmpty})
+	input.Raw = nil
+	payload, err := encodeStoreOpPayload(TestReportStoreOpPayload{Input: input})
 	if err != nil {
 		return StoreOpFrame{}, err
 	}
@@ -156,7 +179,7 @@ func (s *Server) serveStoreOp(scope WorktreeScope, frame StoreOpFrame) ResponseF
 		return storeOpErrorFrame(err)
 	}
 	timeout := s.storeOpAppendTimeout
-	if frame.Op == "reconcile" || frame.Op == "check" {
+	if frame.Op == "reconcile" || frame.Op == "rebuild" || frame.Op == "check" {
 		timeout = s.storeOpHeavyTimeout
 	}
 	if timeout <= 0 {
@@ -176,6 +199,9 @@ func (s *Server) serveStoreOp(scope WorktreeScope, frame StoreOpFrame) ResponseF
 		}
 		return storeOpErrorFrame(err)
 	}
+	if result == nil {
+		return ResponseFrame{OK: true, Code: "OK"}
+	}
 	data, err := json.Marshal(result)
 	if err != nil {
 		return errorFrame(CodeInternal, CodeInternal+": encode store operation result")
@@ -190,22 +216,8 @@ func runStoreOp(ctx context.Context, view *store.Store, frame StoreOpFrame) (any
 		if err := decodeStoreOpPayload(frame.Payload, &payload); err != nil {
 			return nil, err
 		}
-		if payload.RawPresent {
-			if payload.RawEmpty {
-				if len(frame.Body) != 1 || frame.Body[0] != nilReportBodyMarker {
-					return nil, errors.New(CodeProtocol + ": invalid empty report body marker")
-				}
-				payload.Input.Raw = []byte{}
-			} else {
-				payload.Input.Raw = append([]byte(nil), frame.Body...)
-			}
-		} else {
-			if payload.RawEmpty {
-				return nil, errors.New(CodeProtocol + ": nil report cannot declare raw_empty")
-			}
-			if len(frame.Body) != 1 || frame.Body[0] != nilReportBodyMarker {
-				return nil, errors.New(CodeProtocol + ": invalid nil report body marker")
-			}
+		payload.Input.Raw = append([]byte(nil), frame.Body...)
+		if frame.BodyLen == 0 {
 			payload.Input.Raw = nil
 		}
 		added, err := view.AddTestReport(ctx, payload.Input)
@@ -226,18 +238,15 @@ func runStoreOp(ctx context.Context, view *store.Store, frame StoreOpFrame) (any
 		}
 		return view.AddCommandEvent(ctx, input)
 	case "reconcile":
-		var payload ReconcileStoreOpPayload
-		if err := decodeStoreOpPayload(frame.Payload, &payload); err != nil {
+		if err := view.Reconcile(ctx); err != nil {
 			return nil, err
 		}
-		if payload.Rebuild {
-			if err := view.Rebuild(ctx); err != nil {
-				return nil, err
-			}
-		} else if err := view.Reconcile(ctx); err != nil {
+		return nil, nil
+	case "rebuild":
+		if err := view.Rebuild(ctx); err != nil {
 			return nil, err
 		}
-		return RelayedReconcileResult{Reconciled: !payload.Rebuild, Rebuilt: payload.Rebuild, Verdict: "pass"}, nil
+		return nil, nil
 	case "check":
 		report, err := view.Check(ctx)
 		if err != nil {
@@ -262,19 +271,6 @@ func storeOpErrorFrame(err error) ResponseFrame {
 }
 
 func compactTestReportResult(result store.TestReportAddResult) RelayedTestReportResult {
-	suite := result.Report
-	suite.Results = nil
-	truncated := false
-	bound := func(value string) string {
-		value, wasTruncated := boundedUTF8(value, maxRelayedReportFieldBytes)
-		truncated = truncated || wasTruncated
-		return value
-	}
-	suite.ID, suite.TicketID, suite.Phase = bound(suite.ID), bound(suite.TicketID), bound(suite.Phase)
-	suite.Commit, suite.Branch, suite.WorktreeID = bound(suite.Commit), bound(suite.Branch), bound(suite.WorktreeID)
-	suite.Agent, suite.Session, suite.At, suite.RunRef = bound(suite.Agent), bound(suite.Session), bound(suite.At), bound(suite.RunRef)
-	suite.SuiteID, suite.Runner, suite.Config = bound(suite.SuiteID), bound(suite.Runner), bound(suite.Config)
-	suite.EnvDigest, suite.Shard, suite.Format, suite.SourceDigest = bound(suite.EnvDigest), bound(suite.Shard), bound(suite.Format), bound(suite.SourceDigest)
 	var counts TestReportCounts
 	for _, test := range result.Report.Results {
 		switch test.Outcome {
@@ -289,12 +285,8 @@ func compactTestReportResult(result store.TestReportAddResult) RelayedTestReport
 		}
 	}
 	relayed := RelayedTestReportResult{
-		ReportID: result.ID, Suite: suite, ParserComplete: result.Report.ParserComplete,
-		Counts: counts, TestsGreenObserved: result.Report.ParserComplete && counts.Pass > 0 && counts.Fail == 0 && counts.Error == 0,
+		Header: NewRelayedTestReportHeader(result.Report), Counts: counts,
 		Evicted: result.EvictedCount, Remaining: result.Remaining, Idempotent: result.Idempotent,
-	}
-	if truncated {
-		relayed.Warnings = []string{"W_RELAY_FIELD_TRUNCATED: oversized report metadata was truncated on the wire"}
 	}
 	return relayed
 }

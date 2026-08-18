@@ -87,6 +87,12 @@ func (r *Runner) SetSupervisorLeaseReader(read func(context.Context, string) (bo
 	r.supervisorLeaseReadFn = read
 }
 
+// SupervisorLeaseReaderConfigured reports whether detached-run lease evidence
+// has a fresh store-backed reader.
+func (r *Runner) SupervisorLeaseReaderConfigured() bool {
+	return r != nil && r.supervisorLeaseReadFn != nil
+}
+
 func New(cfg Config) (*Runner, error) {
 	if cfg.SupervisorLeaseTTL == 0 {
 		cfg.SupervisorLeaseTTL = defaultSupervisorLeaseTTL

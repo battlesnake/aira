@@ -132,9 +132,15 @@ func TestMalformedStoreOperationFramesReturnProtocolError(t *testing.T) {
 		"unexpected field": map[string]any{
 			"proto": ProtocolVersion, "scope": WorktreeScope{StateID: "state"}, "op": "ensure-scope", "other": map[string]any{},
 		},
-		"body on no-body op":  StoreOpFrame{Proto: ProtocolVersion, Scope: WorktreeScope{StateID: "state"}, Op: "ensure-scope", BodyLen: 1},
-		"missing report body": StoreOpFrame{Proto: ProtocolVersion, Scope: WorktreeScope{StateID: "state"}, Op: "add-test-report", Payload: json.RawMessage(`{}`)},
-		"oversized body":      StoreOpFrame{Proto: ProtocolVersion, Scope: WorktreeScope{StateID: "state"}, Op: "add-test-report", BodyLen: StoreOpBodyMax + 1},
+		"body on ensure-scope": StoreOpFrame{Proto: ProtocolVersion, Scope: WorktreeScope{StateID: "state"}, Op: "ensure-scope", BodyLen: 1},
+		"body on rebuild":      StoreOpFrame{Proto: ProtocolVersion, Scope: WorktreeScope{StateID: "state"}, Op: "rebuild", BodyLen: 1},
+		"payload on reconcile": StoreOpFrame{
+			Proto: ProtocolVersion, Scope: WorktreeScope{StateID: "state"}, Op: "reconcile", Payload: json.RawMessage(`{}`),
+		},
+		"payload on rebuild": StoreOpFrame{
+			Proto: ProtocolVersion, Scope: WorktreeScope{StateID: "state"}, Op: "rebuild", Payload: json.RawMessage(`{}`),
+		},
+		"oversized body": StoreOpFrame{Proto: ProtocolVersion, Scope: WorktreeScope{StateID: "state"}, Op: "add-test-report", BodyLen: StoreOpBodyMax + 1},
 	}
 	for name, frame := range tests {
 		t.Run(name, func(t *testing.T) {

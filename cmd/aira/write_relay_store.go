@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"aira/internal/core"
 	"aira/internal/daemon"
@@ -40,12 +41,10 @@ func (s *writeRelayStore) AddTestReport(ctx context.Context, input domain.TestRe
 	if err := s.exchange(ctx, frame, &relayed, false); err != nil {
 		return store.TestReportAddResult{}, err
 	}
-	report := relayed.Suite
-	report.ID = relayed.ReportID
-	report.ParserComplete = relayed.ParserComplete
+	report := relayed.Header.TestReport()
 	report.Results = syntheticTestResults(relayed.Counts)
 	return store.TestReportAddResult{
-		Report: report, ID: relayed.ReportID, EvictedCount: relayed.Evicted,
+		Report: report, ID: report.ID, EvictedCount: relayed.Evicted,
 		Remaining: relayed.Remaining, Idempotent: relayed.Idempotent,
 	}, nil
 }
@@ -75,21 +74,13 @@ func (s *writeRelayStore) AddCommandEvent(ctx context.Context, input domain.Comm
 }
 
 func (s *writeRelayStore) Reconcile(ctx context.Context) error {
-	frame, err := daemon.NewJSONStoreOp(s.scope, "reconcile", daemon.ReconcileStoreOpPayload{})
-	if err != nil {
-		return err
-	}
-	var result daemon.RelayedReconcileResult
-	return s.exchange(ctx, frame, &result, true)
+	frame := daemon.StoreOpFrame{Proto: daemon.ProtocolVersion, Scope: s.scope, Op: "reconcile"}
+	return s.exchange(ctx, frame, nil, true)
 }
 
 func (s *writeRelayStore) Rebuild(ctx context.Context) error {
-	frame, err := daemon.NewJSONStoreOp(s.scope, "reconcile", daemon.ReconcileStoreOpPayload{Rebuild: true})
-	if err != nil {
-		return err
-	}
-	var result daemon.RelayedReconcileResult
-	return s.exchange(ctx, frame, &result, true)
+	frame := daemon.StoreOpFrame{Proto: daemon.ProtocolVersion, Scope: s.scope, Op: "rebuild"}
+	return s.exchange(ctx, frame, nil, true)
 }
 
 func (s *writeRelayStore) Check(ctx context.Context) (store.CheckReport, error) {
@@ -117,14 +108,18 @@ func (s *writeRelayStore) exchange(ctx context.Context, frame daemon.StoreOpFram
 		return err
 	}
 	if !response.OK {
-		if response.Error != "" {
-			return errors.New(response.Error)
-		}
 		code := response.Code
 		if code == "" {
 			code = daemon.CodeInternal
 		}
-		return fmt.Errorf("%s: relayed store operation failed", code)
+		message := strings.TrimSpace(response.Error)
+		if message == "" {
+			message = "relayed store operation failed"
+		}
+		if !strings.HasPrefix(message, code+":") {
+			message = code + ": " + message
+		}
+		return errors.New(message)
 	}
 	if result == nil {
 		return nil

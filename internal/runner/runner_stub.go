@@ -12,12 +12,13 @@ import (
 // Execution remains deliberately unavailable because runner scopes require
 // Linux cgroup v2.
 type Runner struct {
-	ledger          *ledger
-	outputDir       string
-	owner           string
-	backend         ScopeBackend
-	reportMaxBytes  int64
-	inputRuntimeDir string
+	ledger                          *ledger
+	outputDir                       string
+	owner                           string
+	backend                         ScopeBackend
+	reportMaxBytes                  int64
+	inputRuntimeDir                 string
+	supervisorLeaseReaderConfigured bool
 }
 
 func New(cfg Config) (*Runner, error) {
@@ -52,7 +53,13 @@ func (r *Runner) ReportMaxBytes() int64 { return r.reportMaxBytes }
 
 func (r *Runner) SetInputRuntimeDir(path string) { r.inputRuntimeDir = path }
 
-func (r *Runner) SetSupervisorLeaseReader(func(context.Context, string) (bool, error)) {}
+func (r *Runner) SetSupervisorLeaseReader(read func(context.Context, string) (bool, error)) {
+	r.supervisorLeaseReaderConfigured = read != nil
+}
+
+func (r *Runner) SupervisorLeaseReaderConfigured() bool {
+	return r != nil && r.supervisorLeaseReaderConfigured
+}
 
 func nonLinuxRunError() error {
 	return &LaunchError{Code: "E_RUN_SCOPE_UNAVAILABLE", Err: errors.New("cgroup-v2 runner is supported only on Linux")}

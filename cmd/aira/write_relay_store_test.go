@@ -91,15 +91,15 @@ func TestWriteRelayStoreOverridesAllCarvedWritersAndBackstopsOthers(t *testing.T
 		switch frame.Op {
 		case "add-test-report":
 			result = daemon.RelayedTestReportResult{
-				ReportID: "TR-9", Suite: domain.TestReport{Commit: "abc", SuiteID: "unit", Config: "cfg", EnvDigest: "env", Shard: "1/1"},
-				ParserComplete: true, Counts: daemon.TestReportCounts{Pass: 2}, TestsGreenObserved: true, Remaining: 1,
+				Header: daemon.NewRelayedTestReportHeader(domain.TestReport{ID: "TR-9", Commit: "abc", SuiteID: "unit", Config: "cfg", EnvDigest: "env", Shard: "1/1", ParserComplete: true}),
+				Counts: daemon.TestReportCounts{Pass: 2}, Remaining: 1,
 			}
 		case "add-compute-event":
 			result = store.ComputeEventAddResult{ID: "CE-9", Event: domain.ComputeEvent{ID: "CE-9"}}
 		case "add-command-event":
 			result = store.CommandEventAddResult{ID: "CMD-9", Event: domain.CommandEvent{ID: "CMD-9"}}
-		case "reconcile":
-			result = daemon.RelayedReconcileResult{Verdict: "pass"}
+		case "reconcile", "rebuild":
+			return daemon.ResponseFrame{OK: true, Code: "OK"}, nil
 		case "check":
 			result = store.CheckReport{Verdict: "pass", Dimensions: map[string]string{"rebuild-integrity": "pass"}}
 		default:
@@ -131,7 +131,7 @@ func TestWriteRelayStoreOverridesAllCarvedWritersAndBackstopsOthers(t *testing.T
 	if report, err := relay.Check(context.Background()); err != nil || report.Verdict != "pass" {
 		t.Fatalf("check=%+v err=%v", report, err)
 	}
-	wantOps := []string{"add-test-report", "add-compute-event", "add-command-event", "reconcile", "reconcile", "check"}
+	wantOps := []string{"add-test-report", "add-compute-event", "add-command-event", "reconcile", "rebuild", "check"}
 	if len(frames) != len(wantOps) {
 		t.Fatalf("frames=%+v", frames)
 	}
@@ -143,15 +143,8 @@ func TestWriteRelayStoreOverridesAllCarvedWritersAndBackstopsOthers(t *testing.T
 	if !strings.EqualFold(string(frames[0].Body), string(raw)) || frames[0].BodyLen != uint64(len(raw)) || strings.Contains(string(frames[0].Payload), "raw report bytes") {
 		t.Fatalf("report envelope=%+v", frames[0])
 	}
-	var reconcile, rebuild daemon.ReconcileStoreOpPayload
-	if err := json.Unmarshal(frames[3].Payload, &reconcile); err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal(frames[4].Payload, &rebuild); err != nil {
-		t.Fatal(err)
-	}
-	if reconcile.Rebuild || !rebuild.Rebuild {
-		t.Fatalf("reconcile=%+v rebuild=%+v", reconcile, rebuild)
+	if len(frames[3].Payload) != 0 || len(frames[4].Payload) != 0 || frames[3].BodyLen != 0 || frames[4].BodyLen != 0 {
+		t.Fatalf("reconcile/rebuild must be bodyless and payloadless: %+v %+v", frames[3], frames[4])
 	}
 	if _, err := relay.AddQuotaSnapshot(context.Background(), domain.QuotaSnapshotInput{Provider: "openai", Source: "manual"}); err == nil {
 		t.Fatal("unoverridden writer bypassed read-only embed backstop")
@@ -198,6 +191,55 @@ func TestWriteRelayStoreRejectsFailedOrMalformedResponses(t *testing.T) {
 	}
 }
 
+func TestWriteRelayStoreMapsCheckFindingsOmitted(t *testing.T) {
+	ro, scope := relayStoreFixture(t)
+	want := store.CheckReport{
+		Verdict: "fail", Dimensions: map[string]string{"traceability": "fail"},
+		Findings:      []store.CheckFinding{{Code: "E_TRACE", Kind: "fail"}},
+		FindingCounts: map[string]uint{"findings": 9}, FindingsOmitted: 8,
+	}
+	relay := newWriteRelayStore(ro, scope, func(context.Context, daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
+		data, err := json.Marshal(want)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return daemon.ResponseFrame{OK: true, Code: "OK", Data: data}, nil
+	})
+	got, err := relay.Check(context.Background())
+	if err != nil || got.FindingsOmitted != want.FindingsOmitted || got.FindingCounts["findings"] != 9 || len(got.Findings) != 1 {
+		t.Fatalf("mapped check=%+v err=%v", got, err)
+	}
+}
+
+func TestWriteRelayReportHeaderKeepsWireRunReportComparable(t *testing.T) {
+	ro, scope := relayStoreFixture(t)
+	relay := newWriteRelayStore(ro, scope, func(_ context.Context, frame daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
+		if frame.Op != "add-test-report" {
+			t.Fatalf("op=%q", frame.Op)
+		}
+		data, err := json.Marshal(daemon.RelayedTestReportResult{
+			Header: daemon.NewRelayedTestReportHeader(domain.TestReport{
+				ID: "TR-1", Commit: "abc", SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1", ParserComplete: true,
+			}),
+			Counts: daemon.TestReportCounts{Pass: 1}, Remaining: 1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return daemon.ResponseFrame{OK: true, Code: "OK", Data: data}, nil
+	})
+	response := core.NewWithRunner(relay, &relayRecordingRunner{}).Do(context.Background(), core.Request{Verb: "run", Args: map[string]any{
+		"argv": []string{"true"}, "report": "go-json", "suite": "unit", "shard": "1/1",
+	}})
+	encoded, err := json.Marshal(response.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !response.OK || !strings.Contains(string(encoded), `"comparable":true`) || !strings.Contains(string(encoded), `"parser_complete":true`) {
+		t.Fatalf("response=%+v data=%s", response, encoded)
+	}
+}
+
 func TestStoreTouchingCarvedVerbCompletenessUsesExpectedRelayOps(t *testing.T) {
 	ro, scope := relayStoreFixture(t)
 	var frames []daemon.StoreOpFrame
@@ -206,13 +248,13 @@ func TestStoreTouchingCarvedVerbCompletenessUsesExpectedRelayOps(t *testing.T) {
 		var result any
 		switch frame.Op {
 		case "add-test-report":
-			result = daemon.RelayedTestReportResult{ReportID: "TR-1", Suite: domain.TestReport{Commit: "abc", SuiteID: "unit", Config: "cfg", EnvDigest: "env", Shard: "1/1"}, ParserComplete: true, Counts: daemon.TestReportCounts{Pass: 1}}
+			result = daemon.RelayedTestReportResult{Header: daemon.NewRelayedTestReportHeader(domain.TestReport{ID: "TR-1", Commit: "abc", SuiteID: "unit", Config: "cfg", EnvDigest: "env", Shard: "1/1", ParserComplete: true}), Counts: daemon.TestReportCounts{Pass: 1}}
 		case "add-compute-event":
 			result = store.ComputeEventAddResult{ID: "CE-1", Event: domain.ComputeEvent{ID: "CE-1", Conservation: domain.ConservationUnevaluated}}
 		case "add-command-event":
 			result = store.CommandEventAddResult{ID: "CMD-1", Event: domain.CommandEvent{ID: "CMD-1"}}
-		case "reconcile":
-			result = daemon.RelayedReconcileResult{Verdict: "pass"}
+		case "reconcile", "rebuild":
+			return daemon.ResponseFrame{OK: true, Code: "OK"}, nil
 		case "check":
 			result = store.CheckReport{Verdict: "pass", Dimensions: map[string]string{"rebuild-integrity": "pass"}}
 		default:
@@ -235,7 +277,7 @@ func TestStoreTouchingCarvedVerbCompletenessUsesExpectedRelayOps(t *testing.T) {
 		{name: "run report", request: core.Request{Verb: "run", Args: map[string]any{"argv": []string{"true"}, "report": "go-json", "suite": "unit", "shard": "1/1"}}, ops: []string{"add-test-report"}},
 		{name: "run compute", request: core.Request{Verb: "run", Args: map[string]any{"argv": []string{"true"}, "tool": "gpt"}}, ops: []string{"add-compute-event"}},
 		{name: "time command", request: core.Request{Verb: "time", Args: map[string]any{"argv": []string{"/bin/true"}, "no_prefix": true}}, ops: []string{"add-command-event"}},
-		{name: "reconcile rebuild", request: core.Request{Verb: "reconcile", Args: map[string]any{"rebuild": true}}, ops: []string{"reconcile", "reconcile"}},
+		{name: "reconcile rebuild", request: core.Request{Verb: "reconcile", Args: map[string]any{"rebuild": true}}, ops: []string{"reconcile", "rebuild"}},
 		{name: "check is write", request: core.Request{Verb: "check", Args: map[string]any{}}, ops: []string{"check"}},
 		{name: "gate run file ledger only", request: core.Request{Verb: "gate", Args: map[string]any{"subverb": "run", "gate_id": "missing"}}},
 		{name: "gate canary file ledger only", request: core.Request{Verb: "gate", Args: map[string]any{"subverb": "canary-run", "canary_id": "missing"}}},
@@ -272,7 +314,7 @@ func TestRunReportRelayBoundaryMinusEqualPlusOne(t *testing.T) {
 			relay := newWriteRelayStore(ro, scope, func(_ context.Context, got daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
 				frame = got
 				data, err := json.Marshal(daemon.RelayedTestReportResult{
-					ReportID: "TR-1", Suite: domain.TestReport{Commit: "abc", SuiteID: "unit", Config: "cfg", EnvDigest: "env", Shard: "1/1"},
+					Header: daemon.NewRelayedTestReportHeader(domain.TestReport{ID: "TR-1", Commit: "abc", SuiteID: "unit", Config: "cfg", EnvDigest: "env", Shard: "1/1"}),
 				})
 				if err != nil {
 					t.Fatal(err)
@@ -288,13 +330,57 @@ func TestRunReportRelayBoundaryMinusEqualPlusOne(t *testing.T) {
 			}
 			wantBody := size
 			if size > runner.DefaultReportMaxBytes {
-				wantBody = 1
+				wantBody = 0
 			}
 			if frame.BodyLen != uint64(wantBody) || int64(len(frame.Body)) != wantBody {
 				t.Fatalf("size=%d body_len=%d bytes=%d want=%d", size, frame.BodyLen, len(frame.Body), wantBody)
 			}
 		})
 	}
+}
+
+func TestWriteRelayStorePreservesDaemonCodesAtLiveBranchSites(t *testing.T) {
+	ro, scope := relayStoreFixture(t)
+	t.Run("invalid report retries metadata-only", func(t *testing.T) {
+		var frames []daemon.StoreOpFrame
+		relay := newWriteRelayStore(ro, scope, func(_ context.Context, frame daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
+			frames = append(frames, frame)
+			if len(frames) == 1 {
+				return daemon.ResponseFrame{Code: "E_TESTREPORT_INVALID", Error: "malformed go-json"}, nil
+			}
+			data, err := json.Marshal(daemon.RelayedTestReportResult{Header: daemon.NewRelayedTestReportHeader(domain.TestReport{
+				ID: "TR-1", Commit: "abc", SuiteID: "unit", Config: "cfg", EnvDigest: "env", Shard: "1/1",
+			})})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return daemon.ResponseFrame{OK: true, Code: "OK", Data: data}, nil
+		})
+		execution := &relayRecordingRunner{}
+		response := core.NewWithRunner(relay, execution).Do(context.Background(), core.Request{Verb: "run", Args: map[string]any{
+			"argv": []string{"true"}, "report": "go-json", "suite": "unit", "shard": "1/1",
+		}})
+		if !response.OK || len(frames) != 2 || frames[0].BodyLen == 0 || frames[1].BodyLen != 0 || frames[1].Body != nil {
+			t.Fatalf("response=%+v report frames=%+v", response, frames)
+		}
+	})
+
+	t.Run("rebuild index uncertainty becomes reconcile unevaluated", func(t *testing.T) {
+		var ops []string
+		relay := newWriteRelayStore(ro, scope, func(_ context.Context, frame daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
+			ops = append(ops, frame.Op)
+			if frame.Op == "rebuild" {
+				return daemon.ResponseFrame{Code: "U_INDEX_UNESTABLISHED", Error: "projection changed during rebuild"}, nil
+			}
+			return daemon.ResponseFrame{OK: true, Code: "OK"}, nil
+		})
+		response := core.NewWithRunner(relay, &relayRecordingRunner{}).Do(context.Background(), core.Request{
+			Verb: "reconcile", Args: map[string]any{"rebuild": true},
+		})
+		if !response.OK || response.Code != "UNEVALUATED" || strings.Join(ops, ",") != "reconcile,rebuild" {
+			t.Fatalf("response=%+v ops=%v", response, ops)
+		}
+	})
 }
 
 func opNames(frames []daemon.StoreOpFrame) []string {

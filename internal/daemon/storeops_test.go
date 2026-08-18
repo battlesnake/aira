@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -46,7 +47,7 @@ func TestStoreOpAppendRoundTripPersistsValueFaithfully(t *testing.T) {
 	}
 	reportFrame := StoreOpFrame{
 		Proto: ProtocolVersion, Scope: scope, Op: "add-test-report", BodyLen: uint64(len(raw)), Body: raw,
-		Payload: payloadForTest(t, TestReportStoreOpPayload{Input: reportInput, RawPresent: true}),
+		Payload: payloadForTest(t, TestReportStoreOpPayload{Input: reportInput}),
 	}
 	reportResponse := exchangeStoreOpOverPipe(t, server, reportFrame)
 	if !reportResponse.OK {
@@ -56,7 +57,7 @@ func TestStoreOpAppendRoundTripPersistsValueFaithfully(t *testing.T) {
 	if err := json.Unmarshal(reportResponse.Data, &compact); err != nil {
 		t.Fatal(err)
 	}
-	if compact.ReportID != "TR-1" || compact.Counts.Pass != 1 || len(compact.Suite.Results) != 0 || !compact.TestsGreenObserved {
+	if compact.Header.ID != "TR-1" || compact.Counts.Pass != 1 || !compact.Header.ParserComplete || strings.Contains(string(reportResponse.Data), `"results"`) {
 		t.Fatalf("compact report = %+v", compact)
 	}
 
@@ -102,7 +103,7 @@ func TestStoreOpAppendRoundTripPersistsValueFaithfully(t *testing.T) {
 		t.Fatal(err)
 	}
 	reports, err := view.ListTestReports("")
-	if err != nil || len(reports) != 1 || reports[0].ID != compact.ReportID || len(reports[0].Results) != 1 {
+	if err != nil || len(reports) != 1 || reports[0].ID != compact.Header.ID || len(reports[0].Results) != 1 {
 		t.Fatalf("persisted reports=%+v err=%v", reports, err)
 	}
 	computeRows, err := view.ListComputeEvents("")
@@ -115,19 +116,72 @@ func TestStoreOpAppendRoundTripPersistsValueFaithfully(t *testing.T) {
 	}
 }
 
-func TestNilRawReportUsesExplicitNonemptyMarker(t *testing.T) {
+func TestNilRawReportUsesLegalEmptyBody(t *testing.T) {
 	server, scope := storeOpTestServer(t)
 	input := domain.TestReportInput{
-		Format: "junit", Commit: "abc", Branch: "main", WorktreeID: scope.WorktreeID,
-		SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1", ParserComplete: false,
+		TicketID: "AIRA-7", Phase: "test", Format: "junit", Commit: "abc", Branch: "main", WorktreeID: scope.WorktreeID,
+		Agent: "terra", Session: "gate-fix", At: "2026-08-18T12:00:00Z", RunRef: "RUN-7",
+		SuiteID: "unit", Runner: "go", Config: "default", EnvDigest: "env", ParserComplete: false,
+		Coverage:     &domain.Coverage{Pct: float64Pointer(87.5)},
 		SourceDigest: strings.Repeat("a", 64), PreserveEmptyProvenance: true,
 	}
 	response := exchangeStoreOpOverPipe(t, server, StoreOpFrame{
-		Proto: ProtocolVersion, Scope: scope, Op: "add-test-report", BodyLen: 1, Body: []byte{nilReportBodyMarker},
-		Payload: payloadForTest(t, TestReportStoreOpPayload{Input: input, RawPresent: false}),
+		Proto: ProtocolVersion, Scope: scope, Op: "add-test-report",
+		Payload: payloadForTest(t, TestReportStoreOpPayload{Input: input}),
 	})
 	if !response.OK {
 		t.Fatalf("metadata-only response = %+v", response)
+	}
+	var relayed RelayedTestReportResult
+	if err := json.Unmarshal(response.Data, &relayed); err != nil {
+		t.Fatal(err)
+	}
+	if relayed.Header.Shard != "1/1" || relayed.Header.ParserComplete || strings.Contains(string(response.Data), `"results"`) {
+		t.Fatalf("normalised metadata-only header = %+v", relayed.Header)
+	}
+	view, _, err := server.storeForScope(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := view.ListTestReports("")
+	if err != nil || len(stored) != 1 {
+		t.Fatalf("stored reports=%+v err=%v", stored, err)
+	}
+	wantHeader := stored[0]
+	wantHeader.Results = nil
+	if got := relayed.Header.TestReport(); !reflect.DeepEqual(got, wantHeader) {
+		t.Fatalf("relayed header=%+v want stored header=%+v", got, wantHeader)
+	}
+	want := input
+	want.Shard = "1/1"
+	if relayed.Header.TicketID != want.TicketID || relayed.Header.Phase != want.Phase || relayed.Header.Commit != want.Commit ||
+		relayed.Header.Branch != want.Branch || relayed.Header.WorktreeID != want.WorktreeID || relayed.Header.Agent != want.Agent ||
+		relayed.Header.Session != want.Session || relayed.Header.At != want.At || relayed.Header.RunRef != want.RunRef ||
+		relayed.Header.SuiteID != want.SuiteID || relayed.Header.Runner != want.Runner || relayed.Header.Config != want.Config ||
+		relayed.Header.EnvDigest != want.EnvDigest || relayed.Header.Format != want.Format || relayed.Header.SourceDigest != want.SourceDigest ||
+		relayed.Header.Coverage == nil || relayed.Header.Coverage.Pct == nil || *relayed.Header.Coverage.Pct != *want.Coverage.Pct ||
+		relayed.Header.ID == "" || relayed.Header.AtSeq < 1 || relayed.Remaining != 1 {
+		t.Fatalf("relayed header omitted stored fields: %+v", relayed)
+	}
+}
+
+func float64Pointer(value float64) *float64 { return &value }
+
+func TestReconcileAndRebuildAreSeparateBodylessStoreOps(t *testing.T) {
+	server, scope := storeOpTestServer(t)
+	var called []string
+	server.storeOpRun = func(_ context.Context, _ *store.Store, frame StoreOpFrame) (any, error) {
+		called = append(called, frame.Op)
+		return nil, nil
+	}
+	for _, op := range []string{"reconcile", "rebuild"} {
+		response := exchangeStoreOpOverPipe(t, server, StoreOpFrame{Proto: ProtocolVersion, Scope: scope, Op: op})
+		if !response.OK || len(response.Data) != 0 {
+			t.Fatalf("%s response = %+v", op, response)
+		}
+	}
+	if strings.Join(called, ",") != "reconcile,rebuild" {
+		t.Fatalf("called ops = %v", called)
 	}
 }
 
@@ -154,17 +208,29 @@ func TestBoundedCheckReportKeepsExactCountsAndBoundedEncoding(t *testing.T) {
 	}
 }
 
-func TestCompactTestReportResultIsBoundedIndependentlyOfMetadata(t *testing.T) {
-	large := strings.Repeat("\x01", MaxFrameBytes-1)
+func TestCompactTestReportResultEchoesStoredHeaderAndBoundsResults(t *testing.T) {
+	metadata := strings.Repeat("suite", 300)
+	stored := domain.TestReport{
+		ID: "TR-1", TicketID: "AIRA-1", Phase: "verify", Commit: "abc", Branch: "main", WorktreeID: "worktree",
+		Agent: "terra", Session: "session", At: "2026-08-18T12:00:00Z", RunRef: "RUN-1", SuiteID: metadata,
+		Runner: "go", Config: "cfg", EnvDigest: "env", Shard: "1/1", RetryIndex: 2, ParserComplete: true,
+		Coverage: &domain.Coverage{Pct: float64Pointer(91.5)}, Format: "go-json", SourceDigest: strings.Repeat("a", 64), AtSeq: 9, Pinned: true,
+		Results: []domain.TestResult{{Name: strings.Repeat("r", MaxFrameBytes), Outcome: domain.OutcomePass}},
+	}
 	result := compactTestReportResult(store.TestReportAddResult{
-		ID: "TR-1", Report: domain.TestReport{ID: "TR-1", SuiteID: large, Results: []domain.TestResult{{Name: large, Outcome: domain.OutcomePass}}},
+		ID: "TR-1", EvictedCount: 2, Remaining: 7, Report: stored,
 	})
 	encoded, err := json.Marshal(result)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(encoded) >= MaxFrameBytes || result.Counts.Pass != 1 || len(result.Warnings) == 0 || len(result.Suite.SuiteID) > maxRelayedReportFieldBytes {
+	if len(encoded) >= MaxFrameBytes || result.Counts.Pass != 1 || result.Header.SuiteID != metadata || strings.Contains(string(encoded), `"results"`) ||
+		result.Header.ID != "TR-1" || result.Header.AtSeq != 9 || !result.Header.Pinned || result.Evicted != 2 || result.Remaining != 7 {
 		t.Fatalf("compact bytes=%d result=%+v", len(encoded), result)
+	}
+	stored.Results = nil
+	if got := result.Header.TestReport(); !reflect.DeepEqual(got, stored) {
+		t.Fatalf("header=%+v want=%+v", got, stored)
 	}
 }
 

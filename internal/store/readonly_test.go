@@ -122,3 +122,54 @@ func TestOpenReadOnlyRequiresExistingDatabase(t *testing.T) {
 		t.Fatalf("missing DB side effect = %v", statErr)
 	}
 }
+
+func TestOpenReadOnlyServesRatchetTestReportReadsFromWAL(t *testing.T) {
+	base, root := t.TempDir(), filepath.Join(t.TempDir(), "root")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	definition := ratchetTestGate(t, root)
+	gitRun(t, root, "init", "-q")
+	gitRun(t, root, "config", "user.email", "aira@example.test")
+	gitRun(t, root, "config", "user.name", "AIRA")
+	gitRun(t, root, "add", ".")
+	gitRun(t, root, "commit", "-qm", "ratchet read-only fixture")
+	common, gitDir := filepath.Join(root, ".git"), filepath.Join(root, ".git")
+	projectID, worktreeID, err := CanonicalScopeIdentity(common, gitDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(base, "state", "state.db")
+	db, err := OpenDB(dbPath, filepath.Join(base, "state", "registry.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	opts := ScopeOptions{
+		Root: root, CommonDir: common, GitDir: gitDir, ProjectID: projectID, WorktreeID: worktreeID,
+		ProjectSlug: "demo", Prefixes: []string{"AIRA"}, ConfigDigest: "fixture",
+	}
+	writer, err := NewScope(db, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit := writer.gitValue(context.Background(), "HEAD")
+	baseline := addRatchetReportWithResults(t, writer, commit, []domain.TestResult{{Name: "A", Outcome: domain.OutcomeFail}})
+	if _, err := writer.PinGateBaseline(context.Background(), definition.ID, []string{baseline.ID}, "test", "read-only relay fixture"); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := OpenReadOnly(dbPath, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	addRatchetReportInput(t, writer, domain.TestReportInput{
+		Format: "junit", Commit: commit, SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1",
+		ParserComplete: true, SourceDigest: "current-after-reader-open",
+		Results: []domain.TestResult{{Name: "A", Outcome: domain.OutcomeFail}, {Name: "B", Outcome: domain.OutcomePass}},
+	})
+	evaluation, err := reader.evaluateRatchet(context.Background(), definition, root)
+	if err != nil || evaluation.Predicate != gate.PredicatePass || !evaluation.Evidence {
+		t.Fatalf("read-only ratchet evaluation=%+v err=%v", evaluation, err)
+	}
+}

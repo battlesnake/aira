@@ -714,6 +714,10 @@ func (s *Store) Close() error {
 // The store never falls back to os/exec for gate commands.
 func (s *Store) SetRunner(execution Execution) { s.runner = execution }
 
+// RunnerConfigured reports whether command-gate execution has been wired. It
+// keeps alternate composition paths testable against OpenWithDiagnostics.
+func (s *Store) RunnerConfigured() bool { return s != nil && s.runner != nil }
+
 // ProjectID returns the path-derived project identity owned by this scope.
 func (s *Store) ProjectID() string { return s.projectID }
 

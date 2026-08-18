@@ -29,17 +29,18 @@ type Dispatcher interface {
 }
 
 type daemonDispatcher struct {
-	stdin           io.Reader
-	stdout          io.Writer
-	diagnostics     io.Writer
-	jsonOutput      bool
-	outputCap       int64
-	paths           daemon.Paths
-	startWait       time.Duration
-	lockWait        time.Duration
-	exchange        func(context.Context, string, daemon.RequestFrame) (daemon.ResponseFrame, error)
-	storeOpExchange func(context.Context, string, daemon.StoreOpFrame) (daemon.ResponseFrame, error)
-	spawn           func() (<-chan childResult, error)
+	stdin            io.Reader
+	stdout           io.Writer
+	diagnostics      io.Writer
+	jsonOutput       bool
+	outputCap        int64
+	paths            daemon.Paths
+	startWait        time.Duration
+	lockWait         time.Duration
+	exchange         func(context.Context, string, daemon.RequestFrame) (daemon.ResponseFrame, error)
+	storeOpExchange  func(context.Context, string, daemon.StoreOpFrame) (daemon.ResponseFrame, error)
+	spawn            func() (<-chan childResult, error)
+	afterRelayWiring func(storeRunner, supervisorLeaseReader bool)
 }
 
 type childResult struct {
@@ -182,6 +183,9 @@ func (d *daemonDispatcher) dispatchClient(ctx context.Context, scope daemon.Work
 	})
 	relay.SetRunner(project.Runner)
 	project.Runner.SetSupervisorLeaseReader(readOnly.SupervisorLeaseLive)
+	if d.afterRelayWiring != nil {
+		d.afterRelayWiring(readOnly.RunnerConfigured(), project.Runner.SupervisorLeaseReaderConfigured())
+	}
 	return d.dispatchCarved(ctx, request, relay, project)
 }
 

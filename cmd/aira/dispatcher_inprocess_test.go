@@ -549,6 +549,13 @@ func TestStoreFreeCarvedDispatchUsesEnsureScopeWithoutOpeningClientStore(t *test
 
 func TestStoreTouchingCarvedDispatchUsesReadOnlyClientAndRelaysCommandWrite(t *testing.T) {
 	dispatcher, scope, stateHome := storeFreeDispatcherFixture(t)
+	var wiringObserved bool
+	dispatcher.afterRelayWiring = func(storeRunner, supervisorLeaseReader bool) {
+		wiringObserved = true
+		if !storeRunner || !supervisorLeaseReader {
+			t.Fatalf("relay wiring store_runner=%v supervisor_lease_reader=%v", storeRunner, supervisorLeaseReader)
+		}
+	}
 	db, err := store.OpenDB(dispatcher.paths.DBPath, dispatcher.paths.RegistryPath)
 	if err != nil {
 		t.Fatal(err)
@@ -589,6 +596,9 @@ func TestStoreTouchingCarvedDispatchUsesReadOnlyClientAndRelaysCommandWrite(t *t
 	}
 	if view == nil {
 		t.Fatal("daemon scope was not established")
+	}
+	if !wiringObserved {
+		t.Fatal("store-touching branch did not complete relay runner wiring")
 	}
 	rows, err := view.ListCommandEvents("")
 	if err != nil || len(rows) != 0 {
@@ -685,7 +695,7 @@ func TestEnsureScopeFrameReplacesOlderProtocolDaemon(t *testing.T) {
 	}
 }
 
-func TestStoreWriteOpReplacesProtoThreeDaemonAndRetries(t *testing.T) {
+func TestStoreTouchingEnsureScopeReplacesProtoThreeBeforeRelayOp(t *testing.T) {
 	dispatcher := autoStartDispatcher(t)
 	older := startProtocolDaemonProcess(t)
 	root, scope := writeStoreFreeProject(t, dispatcher.paths)
@@ -703,19 +713,24 @@ func TestStoreWriteOpReplacesProtoThreeDaemonAndRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 	var exchanges atomic.Int32
+	var ops []string
 	dispatcher.storeOpExchange = func(_ context.Context, _ string, frame daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
+		ops = append(ops, frame.Op)
 		switch exchanges.Add(1) {
 		case 1:
 			if frame.Op != "ensure-scope" {
 				t.Fatalf("first op=%q", frame.Op)
 			}
-			return daemon.ResponseFrame{OK: true, Code: "OK"}, nil
+			return daemon.ResponseFrame{Proto: 3, Code: daemon.CodeProtocol, Error: daemon.CodeProtocol + ": daemon protocol is 3"}, nil
 		case 2:
-			if frame.Op != "add-command-event" {
+			if frame.Op != "ensure-scope" {
 				t.Fatalf("second op=%q", frame.Op)
 			}
-			return daemon.ResponseFrame{Proto: 3, Code: daemon.CodeProtocol, Error: daemon.CodeProtocol + ": daemon protocol is 3"}, nil
+			return daemon.ResponseFrame{OK: true, Code: "OK"}, nil
 		default:
+			if frame.Op != "add-command-event" {
+				t.Fatalf("relay op after replacement=%q", frame.Op)
+			}
 			data, marshalErr := json.Marshal(store.CommandEventAddResult{ID: "CMD-relayed", Event: domain.CommandEvent{ID: "CMD-relayed"}})
 			if marshalErr != nil {
 				t.Fatal(marshalErr)
@@ -724,13 +739,13 @@ func TestStoreWriteOpReplacesProtoThreeDaemonAndRetries(t *testing.T) {
 		}
 	}
 	response := dispatcher.Dispatch(context.Background(), scope, core.Request{Verb: "time", Args: map[string]any{"argv": []string{"/bin/true"}, "no_prefix": true}})
-	if !response.OK || exchanges.Load() != 3 {
-		t.Fatalf("response=%+v exchanges=%d", response, exchanges.Load())
+	if !response.OK || exchanges.Load() != 3 || strings.Join(ops, ",") != "ensure-scope,ensure-scope,add-command-event" {
+		t.Fatalf("response=%+v exchanges=%d ops=%v", response, exchanges.Load(), ops)
 	}
 	select {
 	case <-older.done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("proto-3 daemon was not replaced for v4 write op")
+		t.Fatal("proto-3 daemon was not replaced by ensure-scope before the v4 write op")
 	}
 }
 
