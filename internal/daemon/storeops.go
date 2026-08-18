@@ -99,6 +99,36 @@ func encodeStoreOpPayload(value any) (json.RawMessage, error) {
 	return payload, nil
 }
 
+// NewAddTestReportStoreOp builds the only body-bearing store operation. A
+// metadata-only report uses an explicit one-byte marker so BodyLen remains a
+// truthful presence discriminator and zero remains an invalid declaration.
+func NewAddTestReportStoreOp(scope WorktreeScope, input domain.TestReportInput) (StoreOpFrame, error) {
+	rawPresent := input.Raw != nil
+	body := append([]byte(nil), input.Raw...)
+	input.Raw = nil
+	if !rawPresent {
+		body = []byte{nilReportBodyMarker}
+	}
+	payload, err := encodeStoreOpPayload(TestReportStoreOpPayload{Input: input, RawPresent: rawPresent})
+	if err != nil {
+		return StoreOpFrame{}, err
+	}
+	return StoreOpFrame{Proto: ProtocolVersion, Scope: scope, Op: "add-test-report", Payload: payload, BodyLen: uint64(len(body)), Body: body}, nil
+}
+
+// NewJSONStoreOp builds one body-free operation with a typed JSON payload.
+func NewJSONStoreOp(scope WorktreeScope, op string, payloadValue any) (StoreOpFrame, error) {
+	payload, err := encodeStoreOpPayload(payloadValue)
+	if err != nil {
+		return StoreOpFrame{}, err
+	}
+	frame := StoreOpFrame{Proto: ProtocolVersion, Scope: scope, Op: op, Payload: payload}
+	if err := validateStoreOpEnvelope(frame); err != nil {
+		return StoreOpFrame{}, err
+	}
+	return frame, nil
+}
+
 func decodeStoreOpPayload(payload json.RawMessage, value any) error {
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
@@ -187,15 +217,14 @@ func runStoreOp(ctx context.Context, view *store.Store, frame StoreOpFrame) (any
 		if err := decodeStoreOpPayload(frame.Payload, &payload); err != nil {
 			return nil, err
 		}
-		if err := view.Reconcile(ctx); err != nil {
-			return nil, err
-		}
 		if payload.Rebuild {
 			if err := view.Rebuild(ctx); err != nil {
 				return nil, err
 			}
+		} else if err := view.Reconcile(ctx); err != nil {
+			return nil, err
 		}
-		return RelayedReconcileResult{Reconciled: true, Rebuilt: payload.Rebuild, Verdict: "pass"}, nil
+		return RelayedReconcileResult{Reconciled: !payload.Rebuild, Rebuilt: payload.Rebuild, Verdict: "pass"}, nil
 	case "check":
 		report, err := view.Check(ctx)
 		if err != nil {
