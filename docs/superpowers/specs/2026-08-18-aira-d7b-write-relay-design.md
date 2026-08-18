@@ -180,7 +180,7 @@ with a metadata-only report), so a relayed body is always `≤ report_max_bytes 
 storeOpBodyMax`. A `BodyLen > storeOpBodyMax` reaching the daemon is therefore a
 malformed/abusive client → `E_DAEMON_PROTOCOL`. Both boundaries are tested.
 
-**Execution model — run to completion, no mid-op cancellation (Sol r2 P0a).** v2's
+**Execution model — atomicity by op class + a daemon-owned bound (Sol r2/r3 P0a).** v2's
 "one ctx-aware transaction, or document partial progress" was an escape hatch: forcing
 `reconcile`/`check` (inherently multi-phase) into one giant transaction is wrong and out
 of D7b's scope. v2/v3 tried "run to completion" as the guarantee, but Sol r3 correctly
@@ -270,14 +270,15 @@ carved verb opens a writable `state.db`. The store-free branch is untouched.
 ## 5. Scope
 
 **In:** §4.1 `writeRelayStore`; §4.2 store-op protocol (new ops + symmetric optional
-binary body + single length + proto→4 + run-to-completion execution + bounded response
+binary body + single length + proto→4 + per-op-class atomicity + daemon-owned deadline + bounded response
 DTO + honest ambiguous-outcome classification + `report_max_bytes ≤ storeOpBodyMax`
 config validation); §4.3 `store.OpenReadOnly`; §4.4 migrate the store-touching carved
 branch.
 
 **Out (stated, not silent):** the gate audit HMAC file ledger + runner run-log
 (concurrent file ledgers, by design); the M20 detach supervisor's direct `state.db`
-writes (**D5**); mid-op cancellation of store-ops (they run to completion — §4.2); an
+writes (**D5**); client-driven mid-op cancellation (only the daemon-owned deadline cancels
+a heavy op — §4.2); an
 idempotency-key dedup table (telemetry appends use honest `OUTCOME_UNKNOWN` non-retry
 instead); folding `time`/`run` telemetry into a single op.
 
@@ -285,7 +286,8 @@ instead); folding `time`/`run` telemetry into a single op.
 
 1. **Protocol** — extend `StoreOpFrame`/`ResponseFrame` (`Op`, `BodyLen`), the
    optional-body read/write on both sides, proto→4, daemon op handlers over
-   `storeForScope` (run-to-completion, cleared read deadline, bounded write deadline),
+   `storeForScope` (append ops atomic short-bound; reconcile/check under a daemon-owned
+   deadline; cleared read deadline post-request; bounded write deadline),
    the bounded response DTO, `report_max_bytes` config validation. Old daemon (proto 3)
    → monotonic replacement.
 2. **`store.OpenReadOnly`** + a loud-write-rejection test.
