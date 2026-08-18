@@ -306,6 +306,24 @@ func TestWriteRelayStoreRejectsStructurallyMalformedSuccessDTOs(t *testing.T) {
 	}
 }
 
+func TestWriteRelayStoreAcceptsRemainingAboveConfiguredMax(t *testing.T) {
+	ro, scope := relayStoreFixture(t)
+	scope.MaxReports = 1
+	data := mustMarshalRelayResult(t, daemon.RelayedTestReportResult{
+		Header:    validRelayedTestReportHeader("TR-pinned"),
+		Counts:    daemon.TestReportCounts{Pass: 1},
+		Remaining: 2,
+	})
+	relay := newWriteRelayStore(ro, scope, func(context.Context, daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
+		return daemon.ResponseFrame{OK: true, Code: "OK", Data: data}, nil
+	})
+
+	result, err := relay.AddTestReport(context.Background(), domain.TestReportInput{})
+	if err != nil || result.Remaining != 2 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
 func mustMarshalRelayResult(t *testing.T, value any) json.RawMessage {
 	t.Helper()
 	data, err := json.Marshal(value)

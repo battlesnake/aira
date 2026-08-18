@@ -49,7 +49,7 @@ func (s *writeRelayStore) AddTestReport(ctx context.Context, input domain.TestRe
 	if err := s.exchange(ctx, frame, &relayed, false); err != nil {
 		return store.TestReportAddResult{}, err
 	}
-	if err := validateRelayedTestReportResult(relayed, s.scope.MaxReports); err != nil {
+	if err := validateRelayedTestReportResult(relayed); err != nil {
 		return store.TestReportAddResult{}, malformedStoreOpResult(frame.Op, err)
 	}
 	report := relayed.Header.TestReport()
@@ -69,7 +69,7 @@ func (s *writeRelayStore) AddComputeEvent(ctx context.Context, input domain.Comp
 	if err := s.exchange(ctx, frame, &result, false); err != nil {
 		return store.ComputeEventAddResult{}, err
 	}
-	if err := validateRelayedComputeEventResult(result, s.scope.MaxComputeEvents); err != nil {
+	if err := validateRelayedComputeEventResult(result); err != nil {
 		return store.ComputeEventAddResult{}, malformedStoreOpResult(frame.Op, err)
 	}
 	return result, nil
@@ -84,7 +84,7 @@ func (s *writeRelayStore) AddCommandEvent(ctx context.Context, input domain.Comm
 	if err := s.exchange(ctx, frame, &result, false); err != nil {
 		return store.CommandEventAddResult{}, err
 	}
-	if err := validateRelayedCommandEventResult(result, s.scope.MaxCommandEvents); err != nil {
+	if err := validateRelayedCommandEventResult(result); err != nil {
 		return store.CommandEventAddResult{}, malformedStoreOpResult(frame.Op, err)
 	}
 	return result, nil
@@ -116,7 +116,7 @@ func malformedStoreOpResult(op string, err error) error {
 	return fmt.Errorf("%s: malformed store-op result for %s: %v", daemon.CodeProtocol, op, err)
 }
 
-func validateRelayedTestReportResult(result daemon.RelayedTestReportResult, configuredMax int) error {
+func validateRelayedTestReportResult(result daemon.RelayedTestReportResult) error {
 	report := result.Header.TestReport()
 	if err := report.Validate(); err != nil {
 		return fmt.Errorf("invalid report header: %w", err)
@@ -124,7 +124,7 @@ func validateRelayedTestReportResult(result daemon.RelayedTestReportResult, conf
 	if err := validateRelayedCount("evicted", result.Evicted); err != nil {
 		return err
 	}
-	if err := validateRelayedRemaining(result.Remaining, configuredMax); err != nil {
+	if err := validateRelayedRemaining(result.Remaining); err != nil {
 		return err
 	}
 	total := 0
@@ -143,7 +143,7 @@ func validateRelayedTestReportResult(result daemon.RelayedTestReportResult, conf
 	return nil
 }
 
-func validateRelayedComputeEventResult(result store.ComputeEventAddResult, configuredMax int) error {
+func validateRelayedComputeEventResult(result store.ComputeEventAddResult) error {
 	if strings.TrimSpace(result.ID) == "" || result.ID != result.Event.ID {
 		return errors.New("compute event result identity is missing or inconsistent")
 	}
@@ -153,10 +153,10 @@ func validateRelayedComputeEventResult(result store.ComputeEventAddResult, confi
 	if err := validateRelayedCount("evicted_count", result.EvictedCount); err != nil {
 		return err
 	}
-	return validateRelayedRemaining(result.Remaining, configuredMax)
+	return validateRelayedRemaining(result.Remaining)
 }
 
-func validateRelayedCommandEventResult(result store.CommandEventAddResult, configuredMax int) error {
+func validateRelayedCommandEventResult(result store.CommandEventAddResult) error {
 	event := result.Event
 	if strings.TrimSpace(result.ID) == "" || result.ID != event.ID || strings.TrimSpace(event.At) == "" || event.AtSeq < 1 {
 		return errors.New("command event result identity is missing or inconsistent")
@@ -173,7 +173,7 @@ func validateRelayedCommandEventResult(result store.CommandEventAddResult, confi
 	if err := validateRelayedCount("evicted_count", result.EvictedCount); err != nil {
 		return err
 	}
-	return validateRelayedRemaining(result.Remaining, configuredMax)
+	return validateRelayedRemaining(result.Remaining)
 }
 
 func validateRelayedCount(name string, count int) error {
@@ -183,14 +183,8 @@ func validateRelayedCount(name string, count int) error {
 	return nil
 }
 
-func validateRelayedRemaining(remaining, configuredMax int) error {
-	if err := validateRelayedCount("remaining", remaining); err != nil {
-		return err
-	}
-	if configuredMax > 0 && remaining > configuredMax {
-		return fmt.Errorf("remaining count %d exceeds configured maximum %d", remaining, configuredMax)
-	}
-	return nil
+func validateRelayedRemaining(remaining int) error {
+	return validateRelayedCount("remaining", remaining)
 }
 
 func validateRelayedCheckReport(report store.CheckReport) error {
