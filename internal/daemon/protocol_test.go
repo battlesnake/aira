@@ -29,9 +29,9 @@ func TestFrameRoundTripPreservesRequestContent(t *testing.T) {
 	}
 }
 
-func TestStoreWriteRelayUsesProtocolVersionFour(t *testing.T) {
-	if ProtocolVersion != 4 {
-		t.Fatalf("ProtocolVersion = %d, want 4 for store write relay", ProtocolVersion)
+func TestStoreWriteRelayUsesProtocolVersionFive(t *testing.T) {
+	if ProtocolVersion != 5 {
+		t.Fatalf("ProtocolVersion = %d, want 5 for compute git-context relay", ProtocolVersion)
 	}
 }
 

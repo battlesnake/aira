@@ -24,6 +24,7 @@ import (
 	"aira/internal/core"
 	"aira/internal/daemon"
 	"aira/internal/domain"
+	"aira/internal/gitcontext"
 	"aira/internal/store"
 	"golang.org/x/sys/unix"
 )
@@ -487,6 +488,43 @@ func TestNewerClientReplacesOlderProtocolDaemon(t *testing.T) {
 	case <-older.done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("older protocol daemon was not stopped for replacement")
+	}
+}
+
+func TestProtocolFiveComputeGitContextStoreOpReplacesLiveProtocolFourDaemon(t *testing.T) {
+	if daemon.ProtocolVersion != 5 {
+		t.Fatalf("protocol=%d want=5", daemon.ProtocolVersion)
+	}
+	dispatcher := autoStartDispatcher(t)
+	older := startProtocolDaemonProcess(t)
+	input := domain.ComputeEventInput{
+		Model: "gpt", Provider: "openai", Source: "manual",
+		GitContext: gitcontext.GitContext{HeadHash: gitcontext.Field{Value: "abc123", Status: gitcontext.StatusValue}},
+	}
+	frame, err := daemon.NewJSONStoreOp(daemon.WorktreeScope{}, "add-compute-event", input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(frame.Payload, []byte(`"GitContext"`)) {
+		t.Fatalf("compute payload omitted git context: %s", frame.Payload)
+	}
+	var exchanges atomic.Int32
+	dispatcher.storeOpExchange = func(context.Context, string, daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
+		if exchanges.Add(1) == 1 {
+			return daemon.ResponseFrame{Proto: 4, Code: daemon.CodeProtocol, Error: daemon.CodeProtocol + ": protocol-4 daemon"}, nil
+		}
+		return daemon.ResponseFrame{Proto: 5, OK: true, Code: "OK"}, nil
+	}
+	response, err := dispatcher.exchangeWithReplacement(context.Background(), func(ctx context.Context) (daemon.ResponseFrame, error) {
+		return dispatcher.exchangeOrStartStoreOp(ctx, frame)
+	})
+	if err != nil || !response.OK || exchanges.Load() != 2 {
+		t.Fatalf("response=%+v err=%v exchanges=%d", response, err, exchanges.Load())
+	}
+	select {
+	case <-older.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("live protocol-4 daemon was not stopped before retrying compute git-context op")
 	}
 }
 

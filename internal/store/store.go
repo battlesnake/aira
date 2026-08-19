@@ -954,8 +954,17 @@ func (s *Store) initDB(ctx context.Context) error {
 		    output INTEGER, reasoning INTEGER, reported_total INTEGER, cost_usd REAL,
 		    conservation TEXT NOT NULL, reasoning_subset INTEGER NOT NULL DEFAULT 0,
 		    wall_ms INTEGER, cpu_user INTEGER, cpu_sys INTEGER, peak_rss INTEGER,
+		    head_hash TEXT NOT NULL DEFAULT '', head_hash_status TEXT NOT NULL DEFAULT 'unevaluated',
+		    head_ref TEXT NOT NULL DEFAULT '', head_ref_status TEXT NOT NULL DEFAULT 'unevaluated',
+		    worktree_id TEXT NOT NULL DEFAULT '', worktree_id_status TEXT NOT NULL DEFAULT 'unevaluated',
 		    at_seq INTEGER NOT NULL,
 		    PRIMARY KEY(project_id, id),
+		    CHECK(head_hash_status IN ('value','none','unevaluated','mismatch')),
+		    CHECK(head_ref_status IN ('value','none','unevaluated','mismatch')),
+		    CHECK(worktree_id_status IN ('value','none','unevaluated','mismatch')),
+		    CHECK((head_hash_status IN ('value','mismatch') AND length(head_hash)>0) OR (head_hash_status IN ('none','unevaluated') AND head_hash='')),
+		    CHECK((head_ref_status IN ('value','mismatch') AND length(head_ref)>0) OR (head_ref_status IN ('none','unevaluated') AND head_ref='')),
+		    CHECK((worktree_id_status IN ('value','mismatch') AND length(worktree_id)>0) OR (worktree_id_status IN ('none','unevaluated') AND worktree_id='')),
 		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS command_event_counter (
@@ -1016,6 +1025,30 @@ func (s *Store) initDB(ctx context.Context) error {
 			continue
 		}
 		if _, err := s.db.ExecContext(ctx, `ALTER TABLE compute_events ADD COLUMN `+column+` INTEGER`); err != nil {
+			return translateDBError(err)
+		}
+	}
+	computeGitColumns := []struct {
+		name, definition string
+	}{
+		{name: "head_hash", definition: `head_hash TEXT NOT NULL DEFAULT ''`},
+		{name: "head_hash_status", definition: `head_hash_status TEXT NOT NULL DEFAULT 'unevaluated'
+			CHECK(head_hash_status IN ('value','none','unevaluated','mismatch'))
+			CHECK((head_hash_status IN ('value','mismatch') AND length(head_hash)>0) OR (head_hash_status IN ('none','unevaluated') AND head_hash=''))`},
+		{name: "head_ref", definition: `head_ref TEXT NOT NULL DEFAULT ''`},
+		{name: "head_ref_status", definition: `head_ref_status TEXT NOT NULL DEFAULT 'unevaluated'
+			CHECK(head_ref_status IN ('value','none','unevaluated','mismatch'))
+			CHECK((head_ref_status IN ('value','mismatch') AND length(head_ref)>0) OR (head_ref_status IN ('none','unevaluated') AND head_ref=''))`},
+		{name: "worktree_id", definition: `worktree_id TEXT NOT NULL DEFAULT ''`},
+		{name: "worktree_id_status", definition: `worktree_id_status TEXT NOT NULL DEFAULT 'unevaluated'
+			CHECK(worktree_id_status IN ('value','none','unevaluated','mismatch'))
+			CHECK((worktree_id_status IN ('value','mismatch') AND length(worktree_id)>0) OR (worktree_id_status IN ('none','unevaluated') AND worktree_id=''))`},
+	}
+	for _, column := range computeGitColumns {
+		if hasTableColumn(ctx, s.db, "compute_events", column.name) {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE compute_events ADD COLUMN `+column.definition); err != nil {
 			return translateDBError(err)
 		}
 	}

@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	ProtocolVersion = 4
+	ProtocolVersion = 5
 	MaxFrameBytes   = 16 << 20
 	StoreOpBodyMax  = uint64(store.StoreOpBodyMax)
 )

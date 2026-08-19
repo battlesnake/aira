@@ -126,6 +126,7 @@ func (s *Store) AddComputeEvent(ctx context.Context, input domain.ComputeEventIn
 	if input.At == "" {
 		input.At = timeNow()
 	}
+	input.GitContext = s.crossCheckGitContext(input.GitContext)
 	var result ComputeEventAddResult
 	err := s.withImmediate(ctx, func(conn *sql.Conn) error {
 		number, sequence, err := nextComputeNumbers(ctx, conn, s.projectID)
@@ -137,11 +138,14 @@ func (s *Store) AddComputeEvent(ctx context.Context, input domain.ComputeEventIn
 			Model: input.Model, Provider: input.Provider, At: input.At, Session: input.Session,
 			Agent: input.Agent, Source: input.Source, Resources: cloneResourceUsage(input.Raw.Resources), Buckets: buckets, ReportedTotal: total,
 			CostUSD: cloneFloat64(input.CostUSD), ReasoningSubset: reasoningSubset, Conservation: conservation, AtSeq: sequence,
+			GitContext: domain.ComputeGitContextFrom(input.GitContext),
 		}
-		if _, err := conn.ExecContext(ctx, `INSERT INTO compute_events(project_id,id,ticket_id,phase,model,provider,at,session,agent,source,fresh_input,cache_read,cache_write,output,reasoning,reported_total,cost_usd,conservation,reasoning_subset,wall_ms,cpu_user,cpu_sys,peak_rss,at_seq)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.projectID, event.ID, event.TicketID, event.Phase,
+		git := event.GitContext
+		if _, err := conn.ExecContext(ctx, `INSERT INTO compute_events(project_id,id,ticket_id,phase,model,provider,at,session,agent,source,fresh_input,cache_read,cache_write,output,reasoning,reported_total,cost_usd,conservation,reasoning_subset,wall_ms,cpu_user,cpu_sys,peak_rss,head_hash,head_hash_status,head_ref,head_ref_status,worktree_id,worktree_id_status,at_seq)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.projectID, event.ID, event.TicketID, event.Phase,
 			event.Model, event.Provider, event.At, event.Session, event.Agent, event.Source,
-			optionalInt64(event.Buckets.FreshInput), optionalInt64(event.Buckets.CacheRead), optionalInt64(event.Buckets.CacheWrite), optionalInt64(event.Buckets.Output), optionalInt64(event.Buckets.Reasoning), optionalInt64(event.ReportedTotal), optionalFloat64(event.CostUSD), event.Conservation, boolInt(event.ReasoningSubset), optionalInt64(event.Resources.WallMS), optionalInt64(event.Resources.CPUUser), optionalInt64(event.Resources.CPUSys), optionalInt64(event.Resources.PeakRSS), event.AtSeq); err != nil {
+			optionalInt64(event.Buckets.FreshInput), optionalInt64(event.Buckets.CacheRead), optionalInt64(event.Buckets.CacheWrite), optionalInt64(event.Buckets.Output), optionalInt64(event.Buckets.Reasoning), optionalInt64(event.ReportedTotal), optionalFloat64(event.CostUSD), event.Conservation, boolInt(event.ReasoningSubset), optionalInt64(event.Resources.WallMS), optionalInt64(event.Resources.CPUUser), optionalInt64(event.Resources.CPUSys), optionalInt64(event.Resources.PeakRSS),
+			git.HeadHash.Value, git.HeadHash.Status, git.HeadRef.Value, git.HeadRef.Status, git.WorktreeID.Value, git.WorktreeID.Status, event.AtSeq); err != nil {
 			return err
 		}
 		evicted, err := s.evictComputeEvents(ctx, conn)
@@ -233,12 +237,14 @@ func (s *Store) evictComputeEvents(ctx context.Context, conn *sql.Conn) (int, er
 	return evicted, nil
 }
 
+const computeSelect = `SELECT id,ticket_id,phase,model,provider,at,session,agent,source,fresh_input,cache_read,cache_write,output,reasoning,reported_total,cost_usd,conservation,reasoning_subset,wall_ms,cpu_user,cpu_sys,peak_rss,head_hash,head_hash_status,head_ref,head_ref_status,worktree_id,worktree_id_status,at_seq FROM compute_events`
+
 func (s *Store) ListComputeEvents(query string) ([]domain.ComputeEvent, error) {
 	filters, err := computeFilters(query)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.db.Query(`SELECT id,ticket_id,phase,model,provider,at,session,agent,source,fresh_input,cache_read,cache_write,output,reasoning,reported_total,cost_usd,conservation,reasoning_subset,wall_ms,cpu_user,cpu_sys,peak_rss,at_seq FROM compute_events WHERE project_id=? ORDER BY at_seq DESC`, s.projectID)
+	rows, err := s.db.Query(computeSelect+` WHERE project_id=? ORDER BY at_seq DESC`, s.projectID)
 	if err != nil {
 		return nil, err
 	}
@@ -301,7 +307,8 @@ func scanComputeEvent(row interface{ Scan(...any) error }) (domain.ComputeEvent,
 	var wall, cpuUser, cpuSys, peakRSS sql.NullInt64
 	var cost sql.NullFloat64
 	var subset int
-	if err := row.Scan(&event.ID, &event.TicketID, &event.Phase, &event.Model, &event.Provider, &event.At, &event.Session, &event.Agent, &event.Source, &fresh, &cacheRead, &cacheWrite, &output, &reasoning, &total, &cost, &event.Conservation, &subset, &wall, &cpuUser, &cpuSys, &peakRSS, &event.AtSeq); err != nil {
+	if err := row.Scan(&event.ID, &event.TicketID, &event.Phase, &event.Model, &event.Provider, &event.At, &event.Session, &event.Agent, &event.Source, &fresh, &cacheRead, &cacheWrite, &output, &reasoning, &total, &cost, &event.Conservation, &subset, &wall, &cpuUser, &cpuSys, &peakRSS,
+		&event.GitContext.HeadHash.Value, &event.GitContext.HeadHash.Status, &event.GitContext.HeadRef.Value, &event.GitContext.HeadRef.Status, &event.GitContext.WorktreeID.Value, &event.GitContext.WorktreeID.Status, &event.AtSeq); err != nil {
 		return domain.ComputeEvent{}, err
 	}
 	event.ReasoningSubset = subset != 0
@@ -341,7 +348,7 @@ func (s *Store) reconcileComputeConservationConn(ctx context.Context, conn *sql.
 	if _, err := conn.ExecContext(ctx, `DELETE FROM findings WHERE project_id=? AND subtype='reconciliation' AND code=?`, s.projectID, domain.ComputeCodeConservation); err != nil {
 		return err
 	}
-	rows, err := conn.QueryContext(ctx, `SELECT id,ticket_id,phase,model,provider,at,session,agent,source,fresh_input,cache_read,cache_write,output,reasoning,reported_total,cost_usd,conservation,reasoning_subset,wall_ms,cpu_user,cpu_sys,peak_rss,at_seq FROM compute_events WHERE project_id=? AND conservation=? ORDER BY at_seq`, s.projectID, string(domain.ConservationMismatch))
+	rows, err := conn.QueryContext(ctx, computeSelect+` WHERE project_id=? AND conservation=? ORDER BY at_seq`, s.projectID, string(domain.ConservationMismatch))
 	if err != nil {
 		return err
 	}

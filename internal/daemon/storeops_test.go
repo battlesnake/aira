@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"aira/internal/domain"
+	"aira/internal/gitcontext"
 	"aira/internal/store"
 )
 
@@ -66,6 +67,13 @@ func TestStoreOpAppendRoundTripPersistsValueFaithfully(t *testing.T) {
 	computeInput := domain.ComputeEventInput{Model: "gpt", Provider: "openai", Source: "manual", Raw: domain.RawUsage{
 		PromptTokens: &large, CachedTokens: &zero, CompletionTokens: &zero, TotalTokens: &large,
 	}}
+	computeInput.GitContext = gitcontext.GitContext{
+		RepoRoot:     gitcontext.Field{Value: scope.Root, Status: gitcontext.StatusValue},
+		WorktreePath: gitcontext.Field{Value: scope.Root, Status: gitcontext.StatusValue},
+		HeadHash:     gitcontext.Field{Value: "abc123", Status: gitcontext.StatusValue},
+		HeadRef:      gitcontext.Field{Status: gitcontext.StatusNone},
+		WorktreeID:   gitcontext.Field{Value: "client-worktree", Status: gitcontext.StatusValue},
+	}
 	computeResponse := exchangeStoreOpOverPipe(t, server, StoreOpFrame{
 		Proto: ProtocolVersion, Scope: scope, Op: "add-compute-event", Payload: payloadForTest(t, computeInput),
 	})
@@ -78,6 +86,11 @@ func TestStoreOpAppendRoundTripPersistsValueFaithfully(t *testing.T) {
 	}
 	if computeResult.Event.Buckets.FreshInput == nil || *computeResult.Event.Buckets.FreshInput != large {
 		t.Fatalf("compute int64 lost: %+v", computeResult.Event.Buckets)
+	}
+	if computeResult.Event.GitContext.HeadHash.Value != "abc123" || computeResult.Event.GitContext.HeadHash.Status != gitcontext.StatusValue ||
+		computeResult.Event.GitContext.HeadRef.Status != gitcontext.StatusNone || computeResult.Event.GitContext.WorktreeID.Value != "client-worktree" ||
+		computeResult.Event.GitContext.WorktreeID.Status != gitcontext.StatusMismatch {
+		t.Fatalf("compute git context was lost or not daemon-cross-checked: %+v", computeResult.Event.GitContext)
 	}
 
 	commandInput := domain.CommandEventInput{
@@ -107,7 +120,8 @@ func TestStoreOpAppendRoundTripPersistsValueFaithfully(t *testing.T) {
 		t.Fatalf("persisted reports=%+v err=%v", reports, err)
 	}
 	computeRows, err := view.ListComputeEvents("")
-	if err != nil || len(computeRows) != 1 || computeRows[0].Buckets.FreshInput == nil || *computeRows[0].Buckets.FreshInput != large {
+	if err != nil || len(computeRows) != 1 || computeRows[0].Buckets.FreshInput == nil || *computeRows[0].Buckets.FreshInput != large ||
+		!reflect.DeepEqual(computeRows[0].GitContext, computeResult.Event.GitContext) {
 		t.Fatalf("persisted compute=%+v err=%v", computeRows, err)
 	}
 	commandRows, err := view.ListCommandEvents("")
