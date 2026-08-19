@@ -1,9 +1,17 @@
-# Compute-event git-context provenance — commit-attribute run/compute telemetry, v1
+# Compute-event git-context provenance — commit-attribute run/compute telemetry, v2
 
-**Status:** plan (pre-review). **Milestone:** Phase 5 · compute git-context (the
-git-context/M19 fast-follow). **Branch:** `codex-aira-compute-gitctx`. **Depends on:**
-M14 (compute events), M19 (run→compute wiring), command-telemetry (#46, the git-context
-pattern being mirrored), D7b (compute writes relay through the daemon).
+**Status:** plan — Sol plan-review r1 → REQUEST-CHANGES (P0 + 2 P1 + P2, all folded); this
+is v2. **Milestone:** Phase 5 · compute git-context (the git-context/M19 fast-follow).
+**Branch:** `codex-aira-compute-gitctx`. **Depends on:** M14 (compute events), M19
+(run→compute wiring), command-telemetry (#46, the git-context pattern mirrored), D7b
+(compute writes relay through the daemon).
+**v2 folds:** the detach supervisor no longer resolves git-context at settlement (a HEAD
+move mid-run would misattribute) — v1 records detach compute events `unevaluated`, with
+launch-capture+relay a stated follow-up (Sol r1 P0); `Validate` covers `mismatch` too
+(non-empty, like `value`) (Sol r1 P1); the migration adds the value column before its
+status column so the paired CHECK is legal, and tests partial/interrupted migration (Sol
+r1 P1); the foreground predicate reuses the one `StoreFreeCarved` classification that
+gates compute-event creation, not a duplicated flag list (Sol r1 P2).
 
 ## 1. Goal and honest scope
 
@@ -52,34 +60,56 @@ Add `GitContext gitcontext.GitContext` to `ComputeEventInput` and a lean status-
 `ComputeGitContext` (`HeadHash, HeadRef, WorktreeID` as `gitcontext.Field`) on the read
 `ComputeEvent`, with `ComputeGitContextFrom(gitcontext.GitContext)` — identical shape to
 `CommandGitContext`/`CommandGitContextFrom` (`domain/command.go:56-66`). `Validate` gains
-the same value↔status pairing invariant the command input enforces (a `value` status ⇒
-non-empty field; `none`/`unevaluated` ⇒ empty), so an illegal git-context is unrepresentable.
+the same value↔status pairing invariant the command input enforces, matching the schema
+CHECK exactly: **`value` OR `mismatch` ⇒ non-empty field; `none` OR `unevaluated` ⇒ empty**
+(Sol r1 P1 — `mismatch` must also require a non-empty value), so an illegal git-context is
+unrepresentable in memory as well as on disk.
 
 ### 3.2 Store — schema + migration + cross-check
 Add to `compute_events`: `head_hash/head_hash_status`, `head_ref/head_ref_status`,
 `worktree_id/worktree_id_status` (defaults `''` / `'unevaluated'`), with the **same CHECK**
-constraints as `command_events`/`rant_git_context` (`(status IN ('value','mismatch') AND
-length(field)>0) OR (status IN ('none','unevaluated') AND field='')`). For existing DBs, an
-**idempotent `ALTER TABLE … ADD COLUMN`** guarded by `hasTableColumn` (the existing
-`compute_events` ALTER pattern at `store.go:1015`), defaulting old rows to `unevaluated`
-(honest — their commit is unknown). `AddComputeEvent` runs `crossCheckGitContext(input.
-GitContext)` (reuse the command/rant helper) before the insert; `INSERT`/`SELECT` carry the
-six columns; the read projection fills `ComputeGitContext`.
+as `command_events`/`rant_git_context` (`(status IN ('value','mismatch') AND
+length(field)>0) OR (status IN ('none','unevaluated') AND field='')`). New DBs get the CHECK
+in the `CREATE TABLE`.
 
-### 3.3 Wiring — stamp the caller-observed context (two sites)
-- **Foreground run:** add `GitContext: true` to the `run` verb descriptor **conditioned on
-  a telemetry flag** — `RequiresGitContext` returns true for `run` only when a
-  `--tool/--usage/--provider` (compute) or `--report` value is present, i.e. **not**
-  store-free (mirror `StoreFreeCarved`'s telemetry-flag test). A store-free `run` pays no
+**Migration ordering (Sol r1 P1).** For existing DBs, each pair is added by **idempotent
+per-column `ALTER TABLE … ADD COLUMN`** guarded by `hasTableColumn` (extends the existing
+`compute_events` ALTER at `store.go:1015`), **value column first, then its status column
+carrying the paired CHECK** — an `ADD COLUMN` CHECK may reference a sibling only once that
+sibling exists, and the status column's CHECK references the just-added value column. The
+defaults (`head_hash=''`, `head_hash_status='unevaluated'`) satisfy the CHECK, so existing
+rows migrate cleanly to `unevaluated` (honest — their commit is unknown). Because each
+column is independently `hasTableColumn`-guarded, an **interrupted migration** (crash after
+the value column, before the status column) resumes correctly on the next open. No
+table rebuild.
+
+`AddComputeEvent` runs `crossCheckGitContext(input.GitContext)` (reuse the command/rant
+helper) before the insert; `INSERT`/`SELECT` carry the six columns; the read projection
+fills `ComputeGitContext`.
+
+### 3.3 Wiring — stamp the caller-observed context (foreground; detach deferred)
+- **Foreground run (in scope):** add `GitContext: true` to the `run` verb descriptor, but
+  **`RequiresGitContext` derives the run case from the one classifier that gates
+  compute-event creation** — `core.StoreFreeCarved("run", args)` (Sol r1 P2): a `run` needs
+  git-context iff it is **not** store-free (i.e. a `--tool/--usage/--provider`/`--report`
+  telemetry flag is present and will create an event). No duplicated flag list — the
+  predicate and the event-creation gate cannot drift. A store-free `run` pays no
   git-resolve cost. `wireRunCompute` copies `request.GitContext` (resolved by
-  `stampGitContext`) onto the `ComputeEventInput`.
-- **Detach supervisor:** `WireAndSettleDetached` (the `aira __supervise` process) resolves
-  the caller-observed context itself (it holds the worktree paths; reuse
-  `gitcontext.NewResolver().Resolve`) and stamps it on the supervisor-built
-  `ComputeEventInput`, so a `run --detach --tool` compute event is attributed identically.
-  Absent/failed resolution ⇒ `unevaluated`.
+  `stampGitContext` at request time = **launch time**, the correct commit) onto the
+  `ComputeEventInput`.
+- **Detach supervisor (deferred — Sol r1 P0):** the `aira __supervise` process settles the
+  run **later**, so resolving git-context there would record the commit at *settlement*,
+  not the commit the run **launched** under — a HEAD move mid-run would be a **wrong
+  `value`**, not honest provenance. v1 therefore records detach-supervisor compute events'
+  git-context as **`unevaluated`** (honest: not captured for detached runs yet), and does
+  **not** resolve at settlement. The correct fix — capture the caller-observed context at
+  detach **launch** (the client already resolves it) and **relay it through the M20 detach
+  handoff** to the supervisor, letting the daemon cross-check turn a later divergence into
+  `mismatch` — is a **stated follow-up** (it touches the supervisor handoff machinery; kept
+  out of this small milestone).
 - The daemon `crossCheckGitContext` runs in the daemon process (D7b relay) against the same
-  scope root — the 4-state provenance records a `mismatch` honestly if they diverge.
+  scope root — the 4-state provenance records a `mismatch` honestly if the foreground
+  client's observed value diverges from the daemon's.
 
 ### 3.4 Reads / insights
 `compute ls`/the compute read projection expose the `ComputeGitContext`. A commit filter on
@@ -88,16 +118,17 @@ command-events pattern `command.go:228`); a dedicated gauge is **out** (v1).
 
 ## 4. Scope
 
-**In:** §3.1 domain view + Validate pairing; §3.2 `compute_events` git columns + guarded
-ALTER migration + CHECKs + `crossCheckGitContext`; §3.3 stamp at the foreground-run and
-detach-supervisor sites, with `run` git-context gated on a telemetry flag; the git-context
-travels the D7b `add-compute-event` relay unchanged.
+**In:** §3.1 domain view + Validate pairing (`value`/`mismatch`⇒non-empty); §3.2
+`compute_events` git columns + ordered guarded ALTER migration + CHECKs +
+`crossCheckGitContext`; §3.3 stamp at the **foreground-run** site, `run` git-context gated
+on `StoreFreeCarved`; the git-context travels the D7b `add-compute-event` relay unchanged.
 
-**Out (stated):** retro-fill of historical compute rows (stay `unevaluated`); a compute-by-
-commit insight **gauge** (reads may filter; the gauge is a later cut); changing what compute
-events measure; test-report provenance (already present); `RemoteURL` on compute (the lean
-view carries head/ref/worktree like command events — remote is not needed for run
-attribution).
+**Out (stated):** **detach-supervisor git-context capture** (v1 records it `unevaluated`;
+launch-capture + M20-handoff relay is the follow-up — Sol r1 P0); retro-fill of historical
+compute rows (stay `unevaluated`); a compute-by-commit insight **gauge** (reads may filter;
+the gauge is a later cut); changing what compute events measure; test-report provenance
+(already present); `RemoteURL` on compute (the lean view carries head/ref/worktree like
+command events — remote is not needed for run attribution).
 
 ## 5. Testing
 
@@ -107,16 +138,27 @@ attribution).
 - **Round-trip fidelity:** a compute event with a resolved context persists + reads back the
   exact `Field{Value,Status}` per column (value/mismatch/none/unevaluated all covered);
   int64/byte-faithful as the command-events tests.
-- **Migration:** an old `compute_events` DB (no git columns) opens, the guarded ALTER adds
-  them, existing rows read `unevaluated`, new rows carry context — no data loss.
+- **Migration ordered + interruptible:** an old `compute_events` DB (no git columns) opens,
+  the guarded per-column ALTER adds each value column **then** its status-with-CHECK column,
+  existing rows read `unevaluated`, new rows carry context — no data loss. A **partial**
+  migration (value column present, status column absent — simulating a crash between) resumes
+  and completes on the next open (each column independently `hasTableColumn`-guarded).
+- **Validate covers `mismatch`:** a `ComputeGitContext` with `mismatch` status + empty field
+  is rejected by `Validate` (parallel to `value`); `none`/`unevaluated` + non-empty rejected.
 - **Cross-check 4-state:** client value == daemon value ⇒ `value`; divergent ⇒ `mismatch`;
   client `none`/daemon-unreadable ⇒ the honest state; never faked (reuse/parallel the
   command cross-check test).
+- **Predicate reuse (no drift):** a **table-driven** assertion that every foreground
+  event-producing `run` shape (`--tool`/`--usage`/`--provider`/`--report`) has
+  `RequiresGitContext==true` and every genuinely **store-free** `run` shape has
+  `RequiresGitContext==false`, derived from the same `StoreFreeCarved` used to create the
+  event (they cannot drift).
 - **Wiring — foreground:** `run --tool …` in a git worktree records a compute event whose
   head_hash matches HEAD; `run --tool` outside git ⇒ `unevaluated`; a **store-free** `run`
   (no telemetry flag) does **not** resolve git-context (assert no resolver call / no cost).
-- **Wiring — detach:** `run --detach --tool …` records a compute event with the same
-  attribution via the supervisor (`AIRA_REAL_*`-gated as the detach tests are).
+- **Detach ⇒ unevaluated (v1):** a `run --detach --tool …` compute event records git-context
+  `unevaluated` (NOT a settlement-time value); assert no settlement-time resolution occurs
+  (`AIRA_REAL_*`-gated as the detach tests are).
 - **Relay (D7b):** the git-context survives the `add-compute-event` store-op round-trip to
   the daemon intact (value-faithful), and the daemon cross-check runs.
 - **e2e:** `run --tool` through the daemon; assert the persisted compute row's git columns +
@@ -124,28 +166,36 @@ attribution).
 
 ## 6. Risks
 
-- **R1 — the two stamp sites diverge** (foreground vs supervisor). *Mitigation:* both use
-  the one `gitcontext.Resolver`; a shared helper builds the `ComputeEventInput` git-context;
-  a test covers both paths.
-- **R2 — migration on a populated compute DB.** *Mitigation:* guarded idempotent ALTER
-  (existing pattern), defaults `unevaluated`; migration test on a pre-populated fixture.
+- **R1 — detach provenance misattribution.** *Mitigation:* detach compute events record
+  `unevaluated` (not a settlement-time value); the honest launch-capture+relay is a stated
+  follow-up (§3.3).
+- **R2 — migration on a populated compute DB / interrupted migration.** *Mitigation:*
+  ordered per-column `hasTableColumn`-guarded ALTER (value col before status-with-CHECK
+  col); defaults `unevaluated`; clean-and-partial migration tests on a pre-populated fixture.
 - **R3 — per-run git-resolve cost on store-free runs.** *Mitigation:* `run` git-context is
-  gated on a telemetry flag (only resolved when a compute/report event will be created).
+  gated on `StoreFreeCarved` (resolved only when a compute/report event will be created).
 - **R4 — D7b relay must carry the new field.** *Mitigation:* `ComputeEventInput` travels as
   JSON in the `add-compute-event` op; a relay round-trip test asserts fidelity.
+- **R5 — predicate/event-creation drift.** *Mitigation:* `RequiresGitContext(run)` reuses
+  the one `StoreFreeCarved` classifier; a table-driven test pins the correspondence.
 
 ## 7. Sol build-review checklist
 
 1. `compute_events` git columns + CHECKs identical in shape to `command_events`; illegal
-   states unrepresentable (raw-insert + `Validate`, both directions, all three fields).
-2. Guarded idempotent ALTER migration; old rows `unevaluated`; no data loss; no retro-fill.
+   states unrepresentable (raw-insert + `Validate`, both directions, all three fields);
+   `Validate` requires non-empty for `value` **and** `mismatch`.
+2. Ordered per-column `hasTableColumn`-guarded ALTER (value col before status-with-CHECK
+   col — the CHECK legally references the just-added value col); old rows `unevaluated`; a
+   partial/interrupted migration resumes; no data loss; no retro-fill.
 3. `crossCheckGitContext` runs daemon-side before insert; 4-state provenance faithful; never
    a faked `value`.
-4. Stamped at BOTH the foreground-run and detach-supervisor sites via the one resolver;
-   `run` git-context gated on a telemetry flag (store-free `run` pays no cost); the context
-   is caller-observed.
+4. Stamped at the **foreground-run** site via the one resolver at **launch time**;
+   `RequiresGitContext(run)` reuses `StoreFreeCarved` (no duplicated flag list; store-free
+   `run` pays no cost); the context is caller-observed. **Detach records `unevaluated`** (no
+   settlement-time resolution) — the launch-capture+relay is a stated follow-up, not
+   overclaimed.
 5. Travels the D7b `add-compute-event` relay unchanged; value-faithful round-trip.
 6. Reads expose `ComputeGitContext`; the optional commit filter (if added) matches the
    command-events pattern; no gauge (out of scope).
-7. Honesty: provenance stamping only; `unevaluated` when git unreadable or historical; not
-   overclaimed as new measurement.
+7. Honesty: provenance stamping only; `unevaluated` when git unreadable, historical, or a
+   detached run; not overclaimed as new measurement.
