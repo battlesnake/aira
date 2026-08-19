@@ -265,6 +265,18 @@ type registryEntry struct {
 	At                  string   `json:"at"`
 }
 
+// RegistryEntry is the discovery-safe public projection of a registry
+// breadcrumb. At is deliberately omitted because registry discovery needs the
+// recorded identity and configuration only, not append chronology.
+type RegistryEntry struct {
+	ProjectID           string   `json:"project_id"`
+	CommonDir           string   `json:"common_dir"`
+	WorktreeID          string   `json:"worktree_id"`
+	Root                string   `json:"root"`
+	Prefixes            []string `json:"prefixes"`
+	RequirementPrefixes []string `json:"requirement_prefixes,omitempty"`
+}
+
 type eventRecord struct {
 	ProjectID     string `json:"project_id"`
 	Seq           int64  `json:"seq"`
@@ -3148,6 +3160,52 @@ func readRegistry(path string) ([]registryEntry, error) {
 		entries = append(entries, entry)
 	}
 	return entries, nil
+}
+
+// ListRegistryEntries returns the intact registry breadcrumbs used by daemon
+// discovery. A crash-torn final JSONL record is ignored, matching the tail
+// repair performed before registry appends; malformed completed records still
+// fail the read.
+func ListRegistryEntries(path string) ([]RegistryEntry, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var entries []RegistryEntry
+	dec := json.NewDecoder(bytes.NewReader(data))
+	for {
+		var entry RegistryEntry
+		err := dec.Decode(&entry)
+		if errors.Is(err, io.EOF) {
+			return entries, nil
+		}
+		if err != nil {
+			if isTornRegistryTail(data, dec.InputOffset()) {
+				return entries, nil
+			}
+			return nil, fmt.Errorf("E_CONFIG_INVALID: registry: %w", err)
+		}
+		entries = append(entries, entry)
+	}
+}
+
+func isTornRegistryTail(data []byte, decodedOffset int64) bool {
+	if len(data) == 0 || data[len(data)-1] == '\n' {
+		return false
+	}
+	start := int(decodedOffset)
+	for start < len(data) {
+		switch data[start] {
+		case ' ', '\t', '\r', '\n':
+			start++
+		default:
+			return start > bytes.LastIndexByte(data, '\n')
+		}
+	}
+	return false
 }
 
 func discoverWorktrees(root, projectID string, registry []registryEntry) ([]registryEntry, error) {
