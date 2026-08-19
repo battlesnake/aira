@@ -104,11 +104,49 @@ func TestComputeGitContextCrossCheckIsHonest(t *testing.T) {
 	}
 	got := s.crossCheckGitContext(observed)
 	if got.RepoRoot.Status != gitcontext.StatusValue || got.WorktreePath.Status != gitcontext.StatusMismatch ||
-		got.WorktreeID.Status != gitcontext.StatusMismatch || got.HeadHash.Status != gitcontext.StatusValue || got.HeadRef.Status != gitcontext.StatusNone {
+		got.WorktreeID.Status != gitcontext.StatusMismatch || got.HeadHash.Status != gitcontext.StatusMismatch || got.HeadRef.Status != gitcontext.StatusNone {
 		t.Fatalf("cross-check states=%#v", got)
 	}
 	if got.RemoteURL.Status != gitcontext.StatusUnevaluated || got.RemoteURL.Value != "" {
 		t.Fatalf("missing field was fabricated: %#v", got.RemoteURL)
+	}
+}
+
+func TestComputeGitContextScopeMismatchPersistsHeadMismatch(t *testing.T) {
+	base := t.TempDir()
+	s := testStore(t, base, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	input := computeInput(domain.RawUsage{})
+	input.GitContext = gitcontext.GitContext{
+		RepoRoot:     gitcontext.Field{Value: filepath.Join(base, "other-repository"), Status: gitcontext.StatusValue},
+		WorktreePath: gitcontext.Field{Value: filepath.Join(base, "other-worktree"), Status: gitcontext.StatusValue},
+		WorktreeID:   gitcontext.Field{Value: s.worktreeID, Status: gitcontext.StatusValue},
+		HeadHash:     gitcontext.Field{Value: "abc123", Status: gitcontext.StatusValue},
+		HeadRef:      gitcontext.Field{Value: "refs/heads/other", Status: gitcontext.StatusValue},
+	}
+	added, err := s.AddComputeEvent(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if added.Event.GitContext.HeadHash.Status != gitcontext.StatusMismatch || added.Event.GitContext.HeadHash.Value != "abc123" {
+		t.Fatalf("added head hash=%#v, want retained mismatch", added.Event.GitContext.HeadHash)
+	}
+	if added.Event.GitContext.HeadRef.Status != gitcontext.StatusMismatch || added.Event.GitContext.HeadRef.Value != "refs/heads/other" {
+		t.Fatalf("added head ref=%#v, want retained mismatch", added.Event.GitContext.HeadRef)
+	}
+	var headHash, headHashStatus, headRef, headRefStatus string
+	if err := s.db.QueryRow(`SELECT head_hash,head_hash_status,head_ref,head_ref_status FROM compute_events WHERE project_id=? AND id=?`, s.projectID, added.ID).Scan(&headHash, &headHashStatus, &headRef, &headRefStatus); err != nil {
+		t.Fatal(err)
+	}
+	if headHash != "abc123" || headHashStatus != string(gitcontext.StatusMismatch) {
+		t.Fatalf("persisted head hash=(%q,%q), want retained mismatch", headHash, headHashStatus)
+	}
+	if headRef != "refs/heads/other" || headRefStatus != string(gitcontext.StatusMismatch) {
+		t.Fatalf("persisted head ref=(%q,%q), want retained mismatch", headRef, headRefStatus)
+	}
+	rows, err := s.ListComputeEvents("")
+	if err != nil || len(rows) != 1 || rows[0].GitContext.HeadHash.Value != "abc123" || rows[0].GitContext.HeadHash.Status != gitcontext.StatusMismatch ||
+		rows[0].GitContext.HeadRef.Value != "refs/heads/other" || rows[0].GitContext.HeadRef.Status != gitcontext.StatusMismatch {
+		t.Fatalf("round trip rows=%#v err=%v", rows, err)
 	}
 }
 

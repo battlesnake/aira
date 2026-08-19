@@ -76,18 +76,18 @@ func TestCommandEventsRoundTripRetentionFiltersAndGitStates(t *testing.T) {
 			t.Fatalf("retention=%#v", result)
 		}
 	}
-	rows, err := s.ListCommandEvents("branch:main ticket:AIRA-1 phase:implement")
+	rows, err := s.ListCommandEvents("ticket:AIRA-1 phase:implement")
 	if err != nil || len(rows) != 2 || rows[0].ID != "CMD-3" || rows[1].ID != "CMD-2" {
 		t.Fatalf("rows=%#v err=%v", rows, err)
 	}
-	if rows[0].GitContext.HeadRef.Status != gitcontext.StatusValue || rows[0].GitContext.HeadRef.Value != "refs/heads/main" || rows[0].GitContext.HeadHash.Status != gitcontext.StatusUnevaluated || rows[0].GitContext.WorktreeID.Status != gitcontext.StatusMismatch {
+	if rows[0].GitContext.HeadRef.Status != gitcontext.StatusMismatch || rows[0].GitContext.HeadRef.Value != "refs/heads/main" || rows[0].GitContext.HeadHash.Status != gitcontext.StatusUnevaluated || rows[0].GitContext.WorktreeID.Status != gitcontext.StatusMismatch {
 		t.Fatalf("four-state git context not preserved: %#v", rows[0].GitContext)
 	}
 	if rows[0].GitContext.HeadRef.Reason != "" || rows[0].GitContext.WorktreeID.Reason != "" {
 		t.Fatalf("high-volume command row retained git reasons: %#v", rows[0].GitContext)
 	}
-	if miss, err := s.ListCommandEvents("branch:other"); err != nil || len(miss) != 0 {
-		t.Fatalf("branch miss=%#v err=%v", miss, err)
+	if miss, err := s.ListCommandEvents("branch:main"); err != nil || len(miss) != 0 {
+		t.Fatalf("mismatched branch unexpectedly matched filter: rows=%#v err=%v", miss, err)
 	}
 	var journalRows int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM events WHERE project_id=?`, s.projectID).Scan(&journalRows); err != nil || journalRows != 0 {

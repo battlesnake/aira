@@ -586,7 +586,18 @@ func (s *Store) crossCheckGitContext(context gitcontext.GitContext) gitcontext.G
 	if context.WorktreeID.Status == gitcontext.StatusValue && context.WorktreeID.Value != s.worktreeID {
 		context.WorktreeID.Status, context.WorktreeID.Reason = gitcontext.StatusMismatch, "daemon-scope-worktree-id"
 	}
+	if context.RepoRoot.Status == gitcontext.StatusMismatch || context.WorktreePath.Status == gitcontext.StatusMismatch || context.WorktreeID.Status == gitcontext.StatusMismatch {
+		context.HeadHash = mismatchHeadForScope(context.HeadHash)
+		context.HeadRef = mismatchHeadForScope(context.HeadRef)
+	}
 	return context
+}
+
+func mismatchHeadForScope(field gitcontext.Field) gitcontext.Field {
+	if field.Status == gitcontext.StatusValue {
+		field.Status, field.Reason = gitcontext.StatusMismatch, "daemon-scope-mismatch"
+	}
+	return field
 }
 
 func mismatchPath(field gitcontext.Field, expected string) gitcontext.Field {

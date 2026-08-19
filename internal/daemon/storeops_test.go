@@ -87,7 +87,7 @@ func TestStoreOpAppendRoundTripPersistsValueFaithfully(t *testing.T) {
 	if computeResult.Event.Buckets.FreshInput == nil || *computeResult.Event.Buckets.FreshInput != large {
 		t.Fatalf("compute int64 lost: %+v", computeResult.Event.Buckets)
 	}
-	if computeResult.Event.GitContext.HeadHash.Value != "abc123" || computeResult.Event.GitContext.HeadHash.Status != gitcontext.StatusValue ||
+	if computeResult.Event.GitContext.HeadHash.Value != "abc123" || computeResult.Event.GitContext.HeadHash.Status != gitcontext.StatusMismatch ||
 		computeResult.Event.GitContext.HeadRef.Status != gitcontext.StatusNone || computeResult.Event.GitContext.WorktreeID.Value != "client-worktree" ||
 		computeResult.Event.GitContext.WorktreeID.Status != gitcontext.StatusMismatch {
 		t.Fatalf("compute git context was lost or not daemon-cross-checked: %+v", computeResult.Event.GitContext)

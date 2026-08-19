@@ -56,8 +56,10 @@ func TestRantCoreStoresScopeMismatchButDoesNotValidateCallerOnlyEvidence(t *test
 	if got.GitContext.RepoRoot.Status != gitcontext.StatusMismatch || got.GitContext.WorktreePath.Status != gitcontext.StatusMismatch || got.GitContext.WorktreeID.Status != gitcontext.StatusMismatch {
 		t.Fatalf("stable fields were not marked mismatch: %#v", got.GitContext)
 	}
-	if got.GitContext.HeadHash != observed.HeadHash || got.GitContext.HeadRef != observed.HeadRef || got.GitContext.RemoteURL != observed.RemoteURL {
-		t.Fatalf("caller-only evidence was changed: %#v", got.GitContext)
+	if got.GitContext.HeadHash.Value != observed.HeadHash.Value || got.GitContext.HeadHash.Status != gitcontext.StatusMismatch ||
+		got.GitContext.HeadRef.Value != observed.HeadRef.Value || got.GitContext.HeadRef.Status != gitcontext.StatusMismatch ||
+		got.GitContext.RemoteURL != observed.RemoteURL {
+		t.Fatalf("caller-only evidence was not retained with honest scope status: %#v", got.GitContext)
 	}
 }
 

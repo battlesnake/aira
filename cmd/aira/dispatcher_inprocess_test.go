@@ -1160,8 +1160,12 @@ func TestD7bRealCLIStoreTouchingVerbsRelayThroughDaemon(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lines := strings.Count(strings.TrimSpace(string(registry)), "\n") + 1; lines != 6 {
-		t.Fatalf("registry lines=%d want exactly six daemon handshakes; a writable client open would add registrations", lines)
+	// Five store-touching carved verbs each do one ensure-scope handshake (time,
+	// run --report, run --tool, reconcile, gate run); `spend ls` is routed (no
+	// handshake). More than five would mean a writable client open added a
+	// registration — the D7b invariant this guards.
+	if lines := strings.Count(strings.TrimSpace(string(registry)), "\n") + 1; lines != 5 {
+		t.Fatalf("registry lines=%d want exactly five daemon handshakes; a writable client open would add registrations", lines)
 	}
 }
 
