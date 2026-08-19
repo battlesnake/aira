@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"math"
 	"strings"
+
+	"aira/internal/gitcontext"
 )
 
 // Compute telemetry is operational data.  A nil bucket is deliberately
@@ -54,35 +56,53 @@ func ValidatePhase(phase string) error {
 func ValidPhase(phase string) bool { return ValidatePhase(phase) == nil }
 
 type ComputeEvent struct {
-	ID              string         `json:"id"`
-	TicketID        string         `json:"ticket_id,omitempty"`
-	Phase           string         `json:"phase,omitempty"`
-	Model           string         `json:"model"`
-	Provider        string         `json:"provider"`
-	At              string         `json:"at"`
-	Session         string         `json:"session,omitempty"`
-	Agent           string         `json:"agent,omitempty"`
-	Source          string         `json:"source"`
-	Resources       ResourceUsage  `json:"resources"`
-	Buckets         ComputeBuckets `json:"buckets"`
-	ReportedTotal   *int64         `json:"reported_total,omitempty"`
-	CostUSD         *float64       `json:"cost_usd,omitempty"`
-	ReasoningSubset bool           `json:"reasoning_subset,omitempty"`
-	Conservation    Conservation   `json:"conservation"`
-	AtSeq           int64          `json:"at_seq"`
+	ID              string            `json:"id"`
+	TicketID        string            `json:"ticket_id,omitempty"`
+	Phase           string            `json:"phase,omitempty"`
+	Model           string            `json:"model"`
+	Provider        string            `json:"provider"`
+	At              string            `json:"at"`
+	Session         string            `json:"session,omitempty"`
+	Agent           string            `json:"agent,omitempty"`
+	Source          string            `json:"source"`
+	Resources       ResourceUsage     `json:"resources"`
+	Buckets         ComputeBuckets    `json:"buckets"`
+	ReportedTotal   *int64            `json:"reported_total,omitempty"`
+	CostUSD         *float64          `json:"cost_usd,omitempty"`
+	ReasoningSubset bool              `json:"reasoning_subset,omitempty"`
+	Conservation    Conservation      `json:"conservation"`
+	AtSeq           int64             `json:"at_seq"`
+	GitContext      ComputeGitContext `json:"git_context"`
+}
+
+// ComputeGitContext is the lean, status-preserving compute provenance view.
+// Stable repository scope is implied by project_id and Field.Reason is
+// deliberately absent from high-volume compute rows.
+type ComputeGitContext struct {
+	HeadHash   gitcontext.Field `json:"head_hash"`
+	HeadRef    gitcontext.Field `json:"head_ref"`
+	WorktreeID gitcontext.Field `json:"worktree_id"`
+}
+
+func ComputeGitContextFrom(value gitcontext.GitContext) ComputeGitContext {
+	field := func(input gitcontext.Field) gitcontext.Field {
+		return gitcontext.Field{Value: input.Value, Status: input.Status}
+	}
+	return ComputeGitContext{HeadHash: field(value.HeadHash), HeadRef: field(value.HeadRef), WorktreeID: field(value.WorktreeID)}
 }
 
 type ComputeEventInput struct {
-	TicketID string
-	Phase    string
-	Model    string
-	Provider string
-	At       string
-	Session  string
-	Agent    string
-	Source   string
-	Raw      RawUsage
-	CostUSD  *float64
+	TicketID   string
+	Phase      string
+	Model      string
+	Provider   string
+	At         string
+	Session    string
+	Agent      string
+	Source     string
+	Raw        RawUsage
+	CostUSD    *float64
+	GitContext gitcontext.GitContext
 }
 
 // ResourceUsage contains process/cgroup observations. Nil means the runner

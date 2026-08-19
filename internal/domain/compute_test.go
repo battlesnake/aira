@@ -3,6 +3,8 @@ package domain
 import (
 	"strings"
 	"testing"
+
+	"aira/internal/gitcontext"
 )
 
 func i64(value int64) *int64 { return &value }
@@ -140,5 +142,42 @@ func TestComputePhaseValidation(t *testing.T) {
 	}
 	if err := (ComputeEventInput{Provider: "openai", Model: "gpt", Source: "manual", Phase: "work-review"}).Validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestComputeValidationToleratesUnstampedGitContext(t *testing.T) {
+	valid := ComputeEventInput{Provider: "openai", Model: "gpt", Source: "manual"}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("zero-valued git context: %v", err)
+	}
+	valid.GitContext = gitcontext.GitContext{
+		HeadHash:   gitcontext.Field{Status: gitcontext.StatusUnevaluated},
+		HeadRef:    gitcontext.Field{Status: gitcontext.StatusUnevaluated},
+		WorktreeID: gitcontext.Field{Status: gitcontext.StatusUnevaluated},
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("explicitly unevaluated git context: %v", err)
+	}
+}
+
+func TestComputeEventGitContextViewSurvivesValidationReconstruction(t *testing.T) {
+	observed := gitcontext.GitContext{
+		HeadHash:   gitcontext.Field{Value: "abc123", Status: gitcontext.StatusValue, Reason: "not-retained"},
+		HeadRef:    gitcontext.Field{Value: "refs/heads/main", Status: gitcontext.StatusMismatch, Reason: "not-retained"},
+		WorktreeID: gitcontext.Field{Status: gitcontext.StatusNone, Reason: "not-retained"},
+	}
+	event := ComputeEvent{
+		ID: "CE-1", Model: "gpt", Provider: "openai", At: "2026-08-19T00:00:00Z", Source: "manual",
+		Conservation: ConservationUnevaluated, AtSeq: 1, GitContext: ComputeGitContextFrom(observed),
+	}
+	if err := event.Validate(); err != nil {
+		t.Fatalf("read event validation rejected git context: %v", err)
+	}
+	if event.GitContext.HeadHash.Value != "abc123" || event.GitContext.HeadHash.Status != gitcontext.StatusValue ||
+		event.GitContext.HeadRef.Status != gitcontext.StatusMismatch || event.GitContext.WorktreeID.Status != gitcontext.StatusNone {
+		t.Fatalf("git context view lost state: %#v", event.GitContext)
+	}
+	if event.GitContext.HeadHash.Reason != "" || event.GitContext.HeadRef.Reason != "" || event.GitContext.WorktreeID.Reason != "" {
+		t.Fatalf("lean git context retained reasons: %#v", event.GitContext)
 	}
 }
