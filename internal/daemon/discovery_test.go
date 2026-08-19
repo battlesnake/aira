@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"aira/internal/app"
+	"aira/internal/domain"
 	"aira/internal/store"
 )
 
@@ -273,6 +275,36 @@ func TestRunRegistryDiscoveryRetriesTransientEntry(t *testing.T) {
 	}
 }
 
+func TestDiscoverRegistryPassQuarantinesPersistentStoreFailure(t *testing.T) {
+	server, paths := newDiscoveryTestServer(t)
+	ownerScope := independentScope(t, paths, "prefix-owner", "SHARED")
+	if _, _, err := server.storeForScope(ownerScope); err != nil {
+		t.Fatal(err)
+	}
+
+	conflict := projectForDiscoveryScope(independentScope(t, paths, "prefix-conflict", "SHARED"))
+	writeDiscoveryRegistry(t, paths.RegistryPath, registryEntryForProject(conflict))
+	var discoverCalls atomic.Int32
+	server.discoverProject = func(context.Context, string) (app.Project, error) {
+		discoverCalls.Add(1)
+		return conflict, nil
+	}
+
+	for pass := 1; pass <= 3; pass++ {
+		server.discoverRegistryPass(context.Background())
+		data, err := os.ReadFile(paths.RegistryPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lines := bytes.Count(data, []byte{'\n'}); lines != 2 {
+			t.Fatalf("pass %d registry lines=%d, want one source breadcrumb plus one failed registration", pass, lines)
+		}
+	}
+	if calls := discoverCalls.Load(); calls != 1 {
+		t.Fatalf("persistent store failure discovered %d times, want one attempt per daemon lifetime", calls)
+	}
+}
+
 func TestRunRegistryDiscoveryDisabledDoesNotEnumerate(t *testing.T) {
 	for _, value := range []string{"disabled", "0"} {
 		t.Run(value, func(t *testing.T) {
@@ -412,24 +444,38 @@ func TestDiscoveryUsesIntactRegistryPrefixDespiteTornTail(t *testing.T) {
 func TestDiscoveryDoesNotResurrectMarkdownIntent(t *testing.T) {
 	server, paths := newDiscoveryTestServer(t)
 	project := createConfiguredGitProject(t, filepath.Join(filepath.Dir(paths.StateHome), "honesty-projects"), "honesty", "HONEST")
-	airaDir := filepath.Join(project.Root, ".aira")
-	writeDiscoveryRegistry(t, paths.RegistryPath, registryEntryForProject(project))
-	server.discoverRegistryPass(context.Background())
-	var markdown []string
-	err := filepath.WalkDir(airaDir, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if !entry.IsDir() && filepath.Ext(path) == ".md" {
-			markdown = append(markdown, path)
-		}
-		return nil
-	})
+	ticket := domain.Ticket{
+		Schema: 1, ID: "HONEST-7", Project: project.Config.Project.Slug, Title: "unreconciled intent",
+		Status: domain.StatusPlanned, Kind: domain.KindFeature, Severity: domain.SeverityP2,
+		Labels: []string{}, Relations: []domain.Relation{},
+	}
+	data, err := domain.RenderTicket(ticket, "recoverable from the git file")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(markdown) != 0 {
-		t.Fatalf("discovery resurrected markdown intent: %v", markdown)
+	ticketPath := filepath.Join(project.Root, ".aira", "tickets", ticket.ID+".md")
+	if err := os.MkdirAll(filepath.Dir(ticketPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ticketPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeDiscoveryRegistry(t, paths.RegistryPath, registryEntryForProject(project))
+	server.discoverRegistryPass(context.Background())
+	projection, err := sql.Open("sqlite", paths.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer projection.Close()
+	var projected int
+	if err := projection.QueryRow(`SELECT count(*) FROM tickets WHERE project_id=? AND worktree_id=? AND id=?`, project.ProjectID, project.WorktreeID, ticket.ID).Scan(&projected); err != nil {
+		t.Fatal(err)
+	}
+	if projected != 0 {
+		t.Fatalf("discovery reconciled unreconciled git-file intent %s into the projection", ticket.ID)
+	}
+	if _, err := os.Stat(ticketPath); err != nil {
+		t.Fatalf("unreconciled git-file intent disappeared: %v", err)
 	}
 	entries, err := store.ListRegistryEntries(paths.RegistryPath)
 	if err != nil || len(entries) == 0 {
@@ -573,6 +619,68 @@ func TestServeDrainsRegistryDiscoveryBeforeClosingDB(t *testing.T) {
 	default:
 		t.Fatal("DB was not closed after discovery drained")
 	}
+}
+
+func TestServeDiscoveryDrainTimeoutRetainsInstance(t *testing.T) {
+	requireRealSocket(t)
+	t.Setenv("AIRA_DAEMON_REAP_INTERVAL", "disabled")
+	t.Setenv("AIRA_DAEMON_JOURNAL_FLUSH_INTERVAL", "disabled")
+	paths := testPaths(t)
+	project := projectForDiscoveryScope(independentScope(t, paths, "drain-timeout", "DRAINTIMEOUT"))
+	writeDiscoveryRegistry(t, paths.RegistryPath, registryEntryForProject(project))
+	server := NewServer(paths)
+	server.DrainTimeout = 20 * time.Millisecond
+	server.discoverProject = func(context.Context, string) (app.Project, error) { return project, nil }
+	buildStarted := make(chan struct{})
+	releaseBuild := make(chan struct{})
+	buildFinished := make(chan struct{})
+	server.reapScope = func(context.Context, *store.Store) (int, error) {
+		close(buildStarted)
+		<-releaseBuild
+		close(buildFinished)
+		return 0, nil
+	}
+	var closes atomic.Int32
+	server.closeDB = func(db *store.DB) error {
+		closes.Add(1)
+		return db.Close()
+	}
+	cancel, done, ready := serveForDiscoveryTest(t, server)
+	select {
+	case <-ready:
+	case err := <-done:
+		t.Fatalf("Serve exited before Ready: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not signal Ready")
+	}
+	select {
+	case <-buildStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("discovery did not enter scope build")
+	}
+	cancel()
+	serveErr := <-done
+	var drainTimeout *ErrDrainTimeout
+	if !errors.As(serveErr, &drainTimeout) || drainTimeout.lock == nil {
+		t.Fatalf("Serve error=%T %v, want lock-owning ErrDrainTimeout", serveErr, serveErr)
+	}
+	if closes.Load() != 0 {
+		t.Fatal("DB closed while timed-out discovery still used it")
+	}
+	replacementCtx, replacementCancel := context.WithTimeout(context.Background(), time.Second)
+	defer replacementCancel()
+	if replacementErr := NewServer(paths).Serve(replacementCtx); !errors.Is(replacementErr, ErrAlreadyRunning) {
+		t.Fatalf("replacement Serve=%v, want ErrAlreadyRunning", replacementErr)
+	}
+	close(releaseBuild)
+	<-buildFinished
+	if err := server.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := drainTimeout.lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(paths.SocketPath)
 }
 
 func TestServeDiscoveryReapsPriorLifetimeProjectWithoutRequest(t *testing.T) {

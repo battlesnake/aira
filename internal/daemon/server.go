@@ -54,6 +54,10 @@ type Server struct {
 	// breadcrumbs cannot reconstruct the full scopes cache key, so coverage is
 	// recorded by its hash-derived worktree identity whenever a scope is added.
 	coveredWorktrees map[string]struct{}
+	// discoveryFailed quarantines worktrees whose background scope construction
+	// reached Register and failed. Retrying those entries would append another
+	// registry breadcrumb on every discovery pass.
+	discoveryFailed map[string]struct{}
 	// stopping closes when Serve stops accepting. Watch handlers observe it
 	// directly so their terminal event drain remains distinct from peer-close.
 	stopping          chan struct{}
@@ -87,7 +91,7 @@ type Server struct {
 
 func NewServer(paths Paths) *Server {
 	return &Server{
-		Paths: paths, DrainTimeout: 10 * time.Second, scopes: map[string]*scopeEntry{}, coveredWorktrees: map[string]struct{}{},
+		Paths: paths, DrainTimeout: 10 * time.Second, scopes: map[string]*scopeEntry{}, coveredWorktrees: map[string]struct{}{}, discoveryFailed: map[string]struct{}{},
 		watchSlots: make(chan struct{}, watchMaxConcurrent), watchPollInterval: defaultWatchPollInterval,
 		admitSlots: make(chan struct{}, admitGlobalMax), admitPollInterval: defaultAdmitPollInterval,
 		admitQueues:          map[string]*sliceQueue{},

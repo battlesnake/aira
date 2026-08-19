@@ -37,8 +37,9 @@ func (s *Server) discoverRegistryPass(ctx context.Context) (discovered, register
 	for _, entry := range entries {
 		s.mu.Lock()
 		_, covered := s.coveredWorktrees[entry.WorktreeID]
+		_, failed := s.discoveryFailed[entry.WorktreeID]
 		s.mu.Unlock()
-		if covered {
+		if covered || failed {
 			continue
 		}
 
@@ -61,6 +62,12 @@ func (s *Server) discoverRegistryPass(ctx context.Context) (discovered, register
 		}
 		_, cached, err := s.storeForScope(scope)
 		if err != nil {
+			s.mu.Lock()
+			if s.discoveryFailed == nil {
+				s.discoveryFailed = make(map[string]struct{})
+			}
+			s.discoveryFailed[entry.WorktreeID] = struct{}{}
+			s.mu.Unlock()
 			skipped++
 			logRegistryDiscoverySkip(entry, err)
 			continue
