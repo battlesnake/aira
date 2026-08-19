@@ -75,6 +75,9 @@ func RequiresGitContext(req Request) bool {
 	if !ok || !descriptor.GitContext {
 		return false
 	}
+	if canonical == "run" {
+		return !StoreFreeCarved(canonical, req.Args)
+	}
 	if canonical == "rant" {
 		operation, _ := req.Args["subverb"].(string)
 		operation = strings.ToLower(strings.TrimSpace(operation))

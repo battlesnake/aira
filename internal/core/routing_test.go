@@ -111,6 +111,31 @@ func TestStoreFreeCarvedPredicateIsComplete(t *testing.T) {
 	}
 }
 
+func TestRunRequiresGitContextExactlyWhenNotStoreFree(t *testing.T) {
+	tests := []struct {
+		name string
+		args map[string]any
+	}{
+		{name: "plain", args: map[string]any{}},
+		{name: "empty cli telemetry keys", args: map[string]any{"report": "", "tool": "", "usage": "", "provider": ""}},
+		{name: "detach only", args: map[string]any{"detach": true}},
+		{name: "tool", args: map[string]any{"tool": "codex"}},
+		{name: "report", args: map[string]any{"report": "go-json"}},
+		{name: "usage", args: map[string]any{"usage": "usage.json"}},
+		{name: "provider", args: map[string]any{"provider": "openai"}},
+		{name: "non-string telemetry value", args: map[string]any{"tool": true}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := Request{Verb: "run", Args: test.args}
+			want := !StoreFreeCarved(request.Verb, request.Args)
+			if got := RequiresGitContext(request); got != want {
+				t.Fatalf("RequiresGitContext=%v StoreFreeCarved=%v", got, !want)
+			}
+		})
+	}
+}
+
 type successfulStoreFreeRunner struct{}
 
 func (successfulStoreFreeRunner) Launch(context.Context, runner.Request) (*runner.RunRecord, error) {

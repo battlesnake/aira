@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"aira/internal/domain"
+	"aira/internal/gitcontext"
 )
 
 func coreComputeI64(value int64) *int64 { return &value }
@@ -26,6 +27,7 @@ func TestSpendLSJSONPreservesAbsentAndExplicitZeroBuckets(t *testing.T) {
 	s := coreTestStore(t)
 	if _, err := s.AddComputeEvent(context.Background(), domain.ComputeEventInput{
 		Model: "manual", Provider: "mystery", Source: "manual", Raw: domain.RawUsage{Buckets: &domain.ComputeBuckets{}},
+		GitContext: gitcontext.GitContext{HeadHash: gitcontext.Field{Value: "abc123", Status: gitcontext.StatusValue}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -51,6 +53,9 @@ func TestSpendLSJSONPreservesAbsentAndExplicitZeroBuckets(t *testing.T) {
 	if data.Rows[1].Buckets.Output != nil {
 		t.Fatalf("absent row=%#v", data.Rows[1])
 	}
+	if data.Rows[1].GitContext.HeadHash.Value != "abc123" || data.Rows[1].GitContext.HeadHash.Status != gitcontext.StatusValue {
+		t.Fatalf("spend ls omitted compute provenance: %#v", data.Rows[1].GitContext)
+	}
 	zeroJSON, err := json.Marshal(data.Rows[0])
 	if err != nil {
 		t.Fatal(err)
@@ -61,5 +66,20 @@ func TestSpendLSJSONPreservesAbsentAndExplicitZeroBuckets(t *testing.T) {
 	}
 	if !strings.Contains(string(zeroJSON), `"output":0`) || strings.Contains(string(absentJSON), `"output"`) {
 		t.Fatalf("nullable JSON zero=%s absent=%s", zeroJSON, absentJSON)
+	}
+}
+
+func TestSpendAddRecordsUnevaluatedGitContext(t *testing.T) {
+	s := coreTestStore(t)
+	response := New(s).Do(context.Background(), Request{Verb: "spend", Args: map[string]any{
+		"subverb": "add", "model": "gpt", "provider": "openai", "source": "manual", "bucket": []string{"output=0"},
+	}})
+	if !response.OK {
+		t.Fatalf("spend add response=%+v", response)
+	}
+	rows, err := s.ListComputeEvents("")
+	if err != nil || len(rows) != 1 || rows[0].GitContext.HeadHash.Status != gitcontext.StatusUnevaluated ||
+		rows[0].GitContext.HeadRef.Status != gitcontext.StatusUnevaluated || rows[0].GitContext.WorktreeID.Status != gitcontext.StatusUnevaluated {
+		t.Fatalf("spend add git context rows=%#v err=%v", rows, err)
 	}
 }

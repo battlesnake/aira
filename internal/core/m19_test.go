@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"aira/internal/domain"
+	"aira/internal/gitcontext"
 	"aira/internal/runner"
 	"aira/internal/store"
 )
@@ -231,6 +232,24 @@ func TestM19ComputeWiringKeepsResourceFactsAndUnevaluatedTokens(t *testing.T) {
 	}
 	if s.computeInput.Raw.HasUsage() {
 		t.Fatalf("absent --usage fabricated token usage: %+v", s.computeInput.Raw)
+	}
+}
+
+func TestM19ForegroundComputeWiringCarriesLaunchGitContext(t *testing.T) {
+	observed := gitcontext.GitContext{
+		HeadHash:   gitcontext.Field{Value: "abc123", Status: gitcontext.StatusValue},
+		HeadRef:    gitcontext.Field{Value: "refs/heads/main", Status: gitcontext.StatusValue},
+		WorktreeID: gitcontext.Field{Value: "worktree-1", Status: gitcontext.StatusValue},
+	}
+	s := &m19Store{compute: store.ComputeEventAddResult{ID: "CE-1"}}
+	r := &m19Runner{record: terminalM19Record(0)}
+	args := map[string]any{"argv": []string{"child"}, "tool": "codex"}
+	response := NewWithRunner(s, r).Do(context.Background(), Request{Verb: "run", Args: args, GitContext: &observed})
+	if !response.OK {
+		t.Fatalf("response=%+v", response)
+	}
+	if !reflect.DeepEqual(s.computeInput.GitContext, observed) {
+		t.Fatalf("compute git context=%#v want=%#v", s.computeInput.GitContext, observed)
 	}
 }
 

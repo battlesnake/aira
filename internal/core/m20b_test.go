@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"aira/internal/domain"
+	"aira/internal/gitcontext"
 	"aira/internal/runner"
 	"aira/internal/store"
 )
@@ -223,6 +225,9 @@ func TestM20bSidecarJSONUsesPlainSnapshotFields(t *testing.T) {
 	if err := json.Unmarshal(data, &value); err != nil {
 		t.Fatal(err)
 	}
+	if bytes.Contains(data, []byte("git_context")) || bytes.Contains(data, []byte("GitContext")) {
+		t.Fatalf("detach sidecar captured deferred git context: %s", data)
+	}
 	contextValue, ok := value["report_context"].(map[string]any)
 	if !ok || contextValue["commit"] != "c" || contextValue["branch"] != "b" || contextValue["worktree_id"] != "w" {
 		t.Fatalf("wire snapshot=%#v", value)
@@ -251,8 +256,13 @@ func TestM20bForegroundAndDetachedParamsProduceIdenticalStoreInputs(t *testing.T
 	detachedRecord := record
 	detachedRecord.Ticket, detachedRecord.Phase, detachedRecord.Label, detachedRecord.Tool = "AIRA-1", "implement", "unit", "codex"
 	detached := NewWithRunner(detachedStore, detachedRunner).WireDetachedTelemetry(context.Background(), params, detachedRecord, store.TestReportContext{Commit: "abc", Branch: "main", WorktreeID: "worktree-1"})
-	if !reflect.DeepEqual(foregroundStore.reportInput, detachedStore.reportInput) || !reflect.DeepEqual(foregroundStore.computeInput, detachedStore.computeInput) {
-		t.Fatalf("adapter mismatch:\nforeground report=%+v compute=%+v\ndetached report=%+v compute=%+v", foregroundStore.reportInput, foregroundStore.computeInput, detachedStore.reportInput, detachedStore.computeInput)
+	foregroundCompute := foregroundStore.computeInput
+	foregroundCompute.GitContext = gitcontext.GitContext{}
+	if !reflect.DeepEqual(foregroundStore.reportInput, detachedStore.reportInput) || !reflect.DeepEqual(foregroundCompute, detachedStore.computeInput) {
+		t.Fatalf("adapter mismatch outside deferred git context:\nforeground report=%+v compute=%+v\ndetached report=%+v compute=%+v", foregroundStore.reportInput, foregroundStore.computeInput, detachedStore.reportInput, detachedStore.computeInput)
+	}
+	if !reflect.DeepEqual(detachedStore.computeInput.GitContext, gitcontext.GitContext{}) {
+		t.Fatalf("detach settlement captured git context: %#v", detachedStore.computeInput.GitContext)
 	}
 	// --report-stream=err must route the bounded read to the "err" stream on BOTH
 	// paths; a bug that ignores report_stream (reading "out") would pass the input
@@ -262,6 +272,40 @@ func TestM20bForegroundAndDetachedParamsProduceIdenticalStoreInputs(t *testing.T
 	}
 	if !reflect.DeepEqual(foreground.Wiring, detached) {
 		t.Fatalf("wiring mismatch: foreground=%+v detached=%+v", foreground.Wiring, detached)
+	}
+}
+
+func TestM20bDetachedComputePersistsUnevaluatedGitContext(t *testing.T) {
+	s := coreTestStore(t)
+	record := terminalM19Record(0)
+	record.Tool = "codex"
+	wiring := NewWithRunner(s, &m19Runner{record: record}).WireDetachedTelemetry(context.Background(), WiringParams{Tool: "codex"}, record, store.TestReportContext{})
+	if !wiring.WiringComplete {
+		t.Fatalf("detached wiring=%+v", wiring)
+	}
+	rows, err := s.ListComputeEvents("")
+	if err != nil || len(rows) != 1 || rows[0].GitContext.HeadHash.Status != gitcontext.StatusUnevaluated ||
+		rows[0].GitContext.HeadRef.Status != gitcontext.StatusUnevaluated || rows[0].GitContext.WorktreeID.Status != gitcontext.StatusUnevaluated {
+		t.Fatalf("detached compute git context rows=%#v err=%v", rows, err)
+	}
+}
+
+func TestM20bDetachSettlementGitContextReal(t *testing.T) {
+	if os.Getenv("AIRA_REAL_CGROUP") != "1" {
+		t.Skip("real detach settlement requires AIRA_REAL_CGROUP=1")
+	}
+	s := coreTestStore(t)
+	record := terminalM19Record(0)
+	record.Tool = "codex"
+	aux := &fakeAuxRunner{m19Runner: m19Runner{record: record}}
+	wiring, settled, err := NewWithRunner(s, aux).WireAndSettleDetached(context.Background(), record, WiringParams{Tool: "codex"}, store.TestReportContext{})
+	if err != nil || !settled || !wiring.WiringComplete {
+		t.Fatalf("wiring=%+v settled=%v err=%v", wiring, settled, err)
+	}
+	rows, err := s.ListComputeEvents("")
+	if err != nil || len(rows) != 1 || rows[0].GitContext.HeadHash.Status != gitcontext.StatusUnevaluated ||
+		rows[0].GitContext.HeadRef.Status != gitcontext.StatusUnevaluated || rows[0].GitContext.WorktreeID.Status != gitcontext.StatusUnevaluated {
+		t.Fatalf("real detach settlement rows=%#v err=%v", rows, err)
 	}
 }
 

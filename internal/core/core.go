@@ -1410,7 +1410,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return result, err
 		}},
-		"run": {Name: "run", Usage: "run [options] -- <argv...>", Args: []ArgSpec{
+		"run": {Name: "run", Usage: "run [options] -- <argv...>", GitContext: true, Args: []ArgSpec{
 			listSpec("argv", true, true, "Exact target argv after the launch delimiter"),
 			listSpec("prefix", false, false, "Optional exact launch-prefix argv"),
 			stringSpec("cwd", false, false, "Launch working directory"),
@@ -1533,7 +1533,11 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			if err != nil {
 				return nil, err
 			}
-			wiring := c.wireTerminalRun(ctx, params, *record, reportContext)
+			var observedGitContext gitcontext.GitContext
+			if args.gitContext != nil {
+				observedGitContext = *args.gitContext
+			}
+			wiring := c.wireTerminalRun(ctx, params, *record, reportContext, observedGitContext)
 			data := runResponseData{RunRecord: *record, Wiring: wiring}
 			if params.StrictWiring && runRecordCode(*record) == "" && !wiring.WiringComplete {
 				return handlerData{Data: data, Code: "E_RUN_WIRING_INCOMPLETE"}, nil

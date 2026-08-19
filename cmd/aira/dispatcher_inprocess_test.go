@@ -528,6 +528,51 @@ func TestProtocolFiveComputeGitContextStoreOpReplacesLiveProtocolFourDaemon(t *t
 	}
 }
 
+func TestRunGitContextStampingUsesLaunchWorktreeAndSkipsStoreFreeRuns(t *testing.T) {
+	root := t.TempDir()
+	if err := exec.Command("git", "init", "-q", root).Run(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "tracked.txt"), []byte("launch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, argv := range [][]string{
+		{"git", "-C", root, "add", "tracked.txt"},
+		{"git", "-C", root, "-c", "user.name=Terra", "-c", "user.email=terra@example.test", "commit", "-qm", "launch"},
+	} {
+		if output, err := exec.Command(argv[0], argv[1:]...).CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v: %s", argv, err, output)
+		}
+	}
+	wantHead, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := daemon.WorktreeScope{Root: root, CommonDir: filepath.Join(root, ".git"), GitDir: filepath.Join(root, ".git"), WorktreeID: "main"}
+	inGit := core.Request{Verb: "run", Args: map[string]any{"tool": "codex"}}
+	stampGitContext(scope, &inGit)
+	if inGit.GitContext == nil || inGit.GitContext.HeadHash.Status != gitcontext.StatusValue || inGit.GitContext.HeadHash.Value != strings.TrimSpace(string(wantHead)) {
+		t.Fatalf("in-git launch context=%#v want HEAD=%q", inGit.GitContext, strings.TrimSpace(string(wantHead)))
+	}
+
+	outsideRoot := t.TempDir()
+	outsideGit := filepath.Join(outsideRoot, "unreadable-git")
+	if err := os.MkdirAll(filepath.Join(outsideGit, "HEAD"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := core.Request{Verb: "run", Args: map[string]any{"tool": "codex"}}
+	stampGitContext(daemon.WorktreeScope{Root: outsideRoot, CommonDir: outsideGit, GitDir: outsideGit, WorktreeID: "outside"}, &outside)
+	if outside.GitContext == nil || outside.GitContext.HeadHash.Status != gitcontext.StatusUnevaluated || outside.GitContext.HeadHash.Value != "" {
+		t.Fatalf("outside-git launch context=%#v", outside.GitContext)
+	}
+
+	storeFree := core.Request{Verb: "run", Args: map[string]any{}}
+	stampGitContext(daemon.WorktreeScope{}, &storeFree)
+	if storeFree.GitContext != nil {
+		t.Fatalf("store-free run invoked resolver: %#v", storeFree.GitContext)
+	}
+}
+
 func TestOlderClientNeverReplacesNewerDaemon(t *testing.T) {
 	dispatcher := autoStartDispatcher(t)
 	newer := startProtocolDaemonProcess(t)
@@ -1034,6 +1079,22 @@ func TestD7bRealCLIStoreTouchingVerbsRelayThroughDaemon(t *testing.T) {
 	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(root, "tracked.txt"), []byte("launch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, argv := range [][]string{
+		{"git", "-C", root, "add", "tracked.txt"},
+		{"git", "-C", root, "-c", "user.name=Terra", "-c", "user.email=terra@example.test", "commit", "-qm", "launch"},
+	} {
+		if output, err := exec.Command(argv[0], argv[1:]...).CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v: %s", argv, err, output)
+		}
+	}
+	headBytes, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := strings.TrimSpace(string(headBytes))
 	if err := os.MkdirAll(filepath.Join(root, ".aira"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1062,6 +1123,12 @@ func TestD7bRealCLIStoreTouchingVerbsRelayThroughDaemon(t *testing.T) {
 	if exit, stdout, stderr := invoke("run", "--no-admit", "--report", "go-json", "--suite", "unit", "--shard", "1/1", "--", "/bin/sh", "-c", reportScript); exit != 0 {
 		t.Fatalf("run --report exit=%d stdout=%q stderr=%q", exit, stdout, stderr)
 	}
+	if exit, stdout, stderr := invoke("run", "--no-admit", "--tool", "codex", "--", "/bin/true"); exit != 0 {
+		t.Fatalf("run --tool exit=%d stdout=%q stderr=%q", exit, stdout, stderr)
+	}
+	if exit, stdout, stderr := invoke("spend", "ls"); exit != 0 || !strings.Contains(stdout, head) || !strings.Contains(stdout, `"git_context"`) {
+		t.Fatalf("spend ls exit=%d stdout=%q stderr=%q want head=%q", exit, stdout, stderr, head)
+	}
 	if exit, stdout, stderr := invoke("reconcile"); exit != 0 {
 		t.Fatalf("reconcile exit=%d stdout=%q stderr=%q", exit, stdout, stderr)
 	}
@@ -1073,7 +1140,7 @@ func TestD7bRealCLIStoreTouchingVerbsRelayThroughDaemon(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	for table, wantAtLeast := range map[string]int{"command_events": 1, "test_reports": 1} {
+	for table, wantAtLeast := range map[string]int{"command_events": 1, "test_reports": 1, "compute_events": 1} {
 		var count int
 		if err := db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil {
 			t.Fatal(err)
@@ -1082,12 +1149,19 @@ func TestD7bRealCLIStoreTouchingVerbsRelayThroughDaemon(t *testing.T) {
 			t.Fatalf("%s rows=%d want at least %d", table, count, wantAtLeast)
 		}
 	}
+	var storedHead, storedStatus string
+	if err := db.QueryRow(`SELECT head_hash,head_hash_status FROM compute_events ORDER BY at_seq DESC LIMIT 1`).Scan(&storedHead, &storedStatus); err != nil {
+		t.Fatal(err)
+	}
+	if storedHead != head || storedStatus != "value" {
+		t.Fatalf("persisted compute head=(%q,%q) want=(%q,value)", storedHead, storedStatus, head)
+	}
 	registry, err := os.ReadFile(paths.RegistryPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lines := strings.Count(strings.TrimSpace(string(registry)), "\n") + 1; lines != 4 {
-		t.Fatalf("registry lines=%d want exactly four daemon handshakes; a writable client open would add registrations", lines)
+	if lines := strings.Count(strings.TrimSpace(string(registry)), "\n") + 1; lines != 6 {
+		t.Fatalf("registry lines=%d want exactly six daemon handshakes; a writable client open would add registrations", lines)
 	}
 }
 

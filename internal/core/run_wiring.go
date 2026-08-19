@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"aira/internal/domain"
+	"aira/internal/gitcontext"
 	"aira/internal/runner"
 	"aira/internal/store"
 )
@@ -116,7 +117,7 @@ func runnerReportMaxBytes(execution Runner) int64 {
 	return defaultRunReportMaxBytes
 }
 
-func (c *Core) wireTerminalRun(ctx context.Context, params WiringParams, record runner.RunRecord, reportContext store.TestReportContext) runWiring {
+func (c *Core) wireTerminalRun(ctx context.Context, params WiringParams, record runner.RunRecord, reportContext store.TestReportContext, gitContext gitcontext.GitContext) runWiring {
 	params = cloneWiringParams(params)
 	wiring := runWiring{
 		Report:         runReportWiring{Code: codeReportNotRequested},
@@ -134,7 +135,7 @@ func (c *Core) wireTerminalRun(ctx context.Context, params WiringParams, record 
 			c.wireRunReport(ctx, params, record, reportContext, &wiring)
 		}
 		if toolRequested {
-			c.wireRunCompute(ctx, params, record, &wiring)
+			c.wireRunCompute(ctx, params, record, gitContext, &wiring)
 		}
 	}
 	wiring.TestsGreenObserved = observeTestsGreen(record, reportRequested, wiring.Report)
@@ -144,7 +145,7 @@ func (c *Core) wireTerminalRun(ctx context.Context, params WiringParams, record 
 // WireDetachedTelemetry reuses the foreground wiring implementation with the
 // launcher's immutable report-context snapshot.
 func (c *Core) WireDetachedTelemetry(ctx context.Context, params WiringParams, record runner.RunRecord, reportContext store.TestReportContext) runWiring {
-	return c.wireTerminalRun(ctx, cloneWiringParams(params), record, reportContext)
+	return c.wireTerminalRun(ctx, cloneWiringParams(params), record, reportContext, gitcontext.GitContext{})
 }
 
 // auxTelemetryRunner is the generic post-terminal settlement seam.
@@ -355,7 +356,7 @@ func digestBytes(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (c *Core) wireRunCompute(ctx context.Context, params WiringParams, record runner.RunRecord, wiring *runWiring) {
+func (c *Core) wireRunCompute(ctx context.Context, params WiringParams, record runner.RunRecord, gitContext gitcontext.GitContext, wiring *runWiring) {
 	provider := strings.ToLower(strings.TrimSpace(params.Provider))
 	usagePath := strings.TrimSpace(params.Usage)
 	raw := domain.RawUsage{}
@@ -384,7 +385,7 @@ func (c *Core) wireRunCompute(ctx context.Context, params WiringParams, record r
 	}
 	input := domain.ComputeEventInput{
 		TicketID: record.Ticket, Phase: record.Phase, Model: record.Tool, Provider: provider,
-		At: record.EndedAt, Source: "run", Raw: raw,
+		At: record.EndedAt, Source: "run", Raw: raw, GitContext: gitContext,
 	}
 	input.Raw.Resources = domain.ResourceUsage{WallMS: runWallMS(record), CPUUser: record.CPUUser, CPUSys: record.CPUSys, PeakRSS: record.PeakRSS}
 	added, err := c.store.AddComputeEvent(ctx, input)
