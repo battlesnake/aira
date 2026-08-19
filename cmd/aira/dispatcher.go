@@ -3,9 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -190,7 +187,7 @@ func (d *daemonDispatcher) dispatchClient(ctx context.Context, scope daemon.Work
 }
 
 func validateProjectSnapshot(project app.Project, scope daemon.WorktreeScope, paths daemon.Paths) error {
-	discovered, err := scopeFromProject(project, paths)
+	discovered, err := daemon.ScopeFromProject(project, paths)
 	if err != nil {
 		return err
 	}
@@ -482,38 +479,10 @@ func stampGitContext(scope daemon.WorktreeScope, request *core.Request) {
 	request.GitContext = &resolved
 }
 
-func scopeFromProject(project app.Project, paths daemon.Paths) (daemon.WorktreeScope, error) {
-	reviewPolicy, err := store.LoadReviewPolicy(project.Config.Project.Review)
-	if err != nil {
-		return daemon.WorktreeScope{}, err
-	}
-	configBytes, err := json.Marshal(project.Config)
-	if err != nil {
-		return daemon.WorktreeScope{}, err
-	}
-	digest := sha256.Sum256(configBytes)
-	leaseTTL := uint64(0)
-	if project.Config.Lease.TTLSeconds > 0 {
-		leaseTTL = uint64(project.Config.Lease.TTLSeconds) * uint64(time.Second)
-	}
-	return daemon.WorktreeScope{
-		Root: project.Root, CommonDir: project.CommonDir, GitDir: project.GitDir,
-		ProjectID: project.ProjectID, WorktreeID: project.WorktreeID,
-		Slug: project.Config.Project.Slug, Prefixes: project.Config.Project.Prefixes,
-		RequirementPrefixes: project.Config.Project.RequirementPrefixes, ReviewPolicy: reviewPolicy,
-		ReviewConfigured: reviewPolicy.Configured,
-		MaxReports:       project.Config.Project.TestReports.MaxReports, MaxAgeDays: project.Config.Project.TestReports.MaxAgeDays,
-		MaxComputeEvents: project.Config.Project.Compute.MaxEvents, MaxComputeAgeDays: project.Config.Project.Compute.MaxAgeDays,
-		MaxCommandEvents: project.Config.Project.Commands.MaxEvents, MaxCommandAgeDays: project.Config.Project.Commands.MaxAgeDays,
-		MaxQuotaSnapshots: project.Config.Project.Compute.MaxQuotaSnapshots,
-		LeaseTTLNS:        leaseTTL, ConfigDigest: hex.EncodeToString(digest[:]), StateID: paths.StateID,
-	}, nil
-}
-
 func scopeForCWD(ctx context.Context, cwd string, paths daemon.Paths) (daemon.WorktreeScope, error) {
 	project, err := app.Discover(ctx, cwd)
 	if err != nil {
 		return daemon.WorktreeScope{}, err
 	}
-	return scopeFromProject(project, paths)
+	return daemon.ScopeFromProject(project, paths)
 }
