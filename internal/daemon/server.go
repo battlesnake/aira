@@ -50,6 +50,10 @@ type Server struct {
 	mu     sync.Mutex
 	db     *store.DB
 	scopes map[string]*scopeEntry
+	// coveredWorktrees is the registry-discovery membership index. Registry
+	// breadcrumbs cannot reconstruct the full scopes cache key, so coverage is
+	// recorded by its hash-derived worktree identity whenever a scope is added.
+	coveredWorktrees map[string]struct{}
 	// stopping closes when Serve stops accepting. Watch handlers observe it
 	// directly so their terminal event drain remains distinct from peer-close.
 	stopping          chan struct{}
@@ -77,11 +81,13 @@ type Server struct {
 	storeOpHeavyTimeout  time.Duration
 	storeOpWriteTimeout  time.Duration
 	storeOpRun           func(context.Context, *store.Store, StoreOpFrame) (any, error)
+	listRegistryEntries  func(string) ([]store.RegistryEntry, error)
+	discoverProject      func(context.Context, string) (app.Project, error)
 }
 
 func NewServer(paths Paths) *Server {
 	return &Server{
-		Paths: paths, DrainTimeout: 10 * time.Second, scopes: map[string]*scopeEntry{},
+		Paths: paths, DrainTimeout: 10 * time.Second, scopes: map[string]*scopeEntry{}, coveredWorktrees: map[string]struct{}{},
 		watchSlots: make(chan struct{}, watchMaxConcurrent), watchPollInterval: defaultWatchPollInterval,
 		admitSlots: make(chan struct{}, admitGlobalMax), admitPollInterval: defaultAdmitPollInterval,
 		admitQueues:          map[string]*sliceQueue{},
@@ -101,6 +107,10 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		return err
 	}
 	flushInterval, err := journalFlushIntervalFromEnv()
+	if err != nil {
+		return err
+	}
+	discoveryInterval, err := registryDiscoveryIntervalFromEnv()
 	if err != nil {
 		return err
 	}
@@ -204,6 +214,12 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		default:
 		}
 	}
+	discoveryCtx, cancelDiscovery := context.WithCancel(ctx)
+	discoveryDone := make(chan struct{})
+	go func() {
+		defer close(discoveryDone)
+		s.runRegistryDiscovery(discoveryCtx, discoveryInterval)
+	}()
 
 	var connections sync.WaitGroup
 	stopping := make(chan struct{})
@@ -236,6 +252,7 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	close(stopping)
 	cancelReaper()
 	cancelFlusher()
+	cancelDiscovery()
 	_ = listener.Close()
 	drained := make(chan struct{})
 	go func() {
@@ -243,6 +260,7 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		s.pruneAdmitRegistry()
 		<-reaperDone
 		<-flusherDone
+		<-discoveryDone
 		close(drained)
 	}()
 	timeout := s.DrainTimeout
@@ -555,6 +573,7 @@ func (s *Server) bootstrap(ctx context.Context, scope WorktreeScope, args map[st
 	if existing == nil {
 		entry = &scopeEntry{view: view, ready: make(chan struct{})}
 		s.scopes[key] = entry
+		s.recordCoveredWorktreeLocked(worktreeID)
 	}
 	s.mu.Unlock()
 	if existing != nil {
@@ -646,10 +665,18 @@ func (s *Server) storeForScope(scope WorktreeScope) (*store.Store, bool, error) 
 	}
 	entry := &scopeEntry{view: view, ready: make(chan struct{})}
 	s.scopes[key] = entry
+	s.recordCoveredWorktreeLocked(worktreeID)
 	s.mu.Unlock()
 	defer close(entry.ready)
 	if _, err := s.reap(context.Background(), view); err != nil {
 		log.Printf("aira daemon: initial reap project %s: %v", view.ProjectID(), err)
 	}
 	return view, false, nil
+}
+
+func (s *Server) recordCoveredWorktreeLocked(worktreeID string) {
+	if s.coveredWorktrees == nil {
+		s.coveredWorktrees = make(map[string]struct{})
+	}
+	s.coveredWorktrees[worktreeID] = struct{}{}
 }

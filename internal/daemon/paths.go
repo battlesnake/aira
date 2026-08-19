@@ -29,6 +29,7 @@ type Paths struct {
 
 const (
 	defaultReapInterval         = 30 * time.Second
+	defaultDiscoveryInterval    = 30 * time.Second
 	defaultJournalFlushInterval = 60 * time.Second
 	defaultWatchPollInterval    = 500 * time.Millisecond
 	defaultAdmitPollInterval    = 250 * time.Millisecond
@@ -84,6 +85,21 @@ func journalFlushIntervalFromEnv() (time.Duration, error) {
 	interval, err := time.ParseDuration(value)
 	if err != nil || interval < time.Second {
 		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_JOURNAL_FLUSH_INTERVAL must be a Go duration of at least 1s, disabled, or 0")
+	}
+	return interval, nil
+}
+
+func registryDiscoveryIntervalFromEnv() (time.Duration, error) {
+	value, set := os.LookupEnv("AIRA_DAEMON_DISCOVERY_INTERVAL")
+	if !set || value == "" {
+		return defaultDiscoveryInterval, nil
+	}
+	if value == "disabled" || value == "0" {
+		return 0, nil
+	}
+	interval, err := time.ParseDuration(value)
+	if err != nil || interval < time.Second {
+		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_DISCOVERY_INTERVAL must be a Go duration of at least 1s, disabled, or 0")
 	}
 	return interval, nil
 }
