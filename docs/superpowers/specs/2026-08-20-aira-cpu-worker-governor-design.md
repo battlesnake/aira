@@ -1,7 +1,8 @@
 # Embedded sidecar modules + dynamic cross-session CPU-worker governor, v2
 
-**Status:** plan — Sol plan-review r1 → REQUEST-CHANGES (2 P0 + 3 P1 + 2 P2, all folded);
-this is v2. **Milestone:** Phase 5 · CPU-worker governor (task #49). **Branch:**
+**Status:** plan — Sol r1 (2 P0 + 3 P1 + 2 P2) → v2 → Sol r2 (6/7 resolved; P0b needs
+atomic publication) → this is **v3** folding P0b. **Milestone:** Phase 5 · CPU-worker
+governor (task #49). **Branch:**
 `codex-aira-cpu-governor`. **Depends on:** M21 (daemon owns machine-local runtime state),
 #29/D4 (the RAM-admission precedent + advisory-fail-open stance).
 **v2 folds:** the pytest gate is a `pytest_runtest_protocol` **hookwrapper** (wait precedes
@@ -93,6 +94,16 @@ The daemon, on `Serve` startup, **creates the slot dir `<RuntimeDir>/cpuslots/` 
 the governed resource is the machine's cores) and created before `Ready`. The wrappers set
 **`AIRA_CPU_SLOTS_DIR=<that dir>`** in the child env.
 
+**Atomic publication (Sol r2 P0b).** The N-file set must appear **all-or-nothing** — creating
+the dir then adding files one-by-one would let a worker (or a mid-creation daemon crash)
+observe a **partial/empty** population and mis-count the cap, possibly permanently. So the
+daemon builds the complete set in a **private temp dir** (`<RuntimeDir>/.cpuslots-<pid>-<rand>/`
+with all N files) and `rename`s it onto `<RuntimeDir>/cpuslots`. An observer therefore sees
+either **no dir** (→ fail-open, no gating) or the **complete N-file dir**, never a partial
+one. If the target already exists (a prior start / a racing daemon published it), the
+`rename` loses; the loser **validates** the existing dir is a complete slot set and removes
+its own temp — it does **not** merge or overwrite (that would re-introduce the resize hazard).
+
 **Sizing is create-once, never a live resize (Sol r1 P0).** If the dir already exists the
 daemon **leaves its file set untouched** — it does **not** add, remove, or replace slot
 files to match a changed `NumCPU`/`reserve`, because a worker may hold an `flock` on an
@@ -180,11 +191,13 @@ best-effort tie-in only); non-Linux (`flock` + the Linux runner are the target).
   not fairness, is what's asserted).
 - **Crash auto-release (Go):** a child killed (`SIGKILL`) while holding a slot → the slot is
   immediately re-acquirable by another process (kernel `flock` release; no reaper).
-- **Daemon slot dir create-once (Sol r1 P0):** `Serve` creates `N = max(1, NumCPU − reserve)`
-  files honouring `AIRA_DAEMON_CPU_RESERVE` (incl. reserve ≥ NumCPU → floor 1), before
-  `Ready`; a **second start with a different NumCPU/reserve leaves the existing file set
-  untouched** (no add/remove/replace) — assert the file set is unchanged and no lock is
-  disturbed; logs the effective `N`.
+- **Daemon slot dir create-once + atomic publish (Sol r1/r2 P0):** `Serve` builds the
+  `N = max(1, NumCPU − reserve)` files in a private temp dir and `rename`s it into place
+  (honours `AIRA_DAEMON_CPU_RESERVE`, incl. reserve ≥ NumCPU → floor 1), before `Ready` —
+  assert an observer only ever sees no dir or the **complete** N-file set (never partial),
+  including under a simulated mid-creation abort; a **second start with a different
+  NumCPU/reserve leaves the existing file set untouched** (rename loses → validate + drop
+  temp; no add/remove/replace, no lock disturbed); logs the effective `N`.
 - **Extraction (Sol r1 P2):** `ExtractPyLib` is idempotent (skip on `.ready` present), atomic
   (private temp + `rename`), concurrent-safe (two extractors → exactly one published dir, the
   loser validates `.ready` + removes its own temp), re-extracts on a **content-hash** change,
@@ -234,10 +247,12 @@ best-effort tie-in only); non-Linux (`flock` + the Linux runner are the target).
    permission/`open`/`flock` error, `EINTR`, max-wait, missing conftest, any plugin
    exception → tests run normally; monotonic clock; release from an unconditional `finally`;
    the governor never stalls or fails a suite.
-3. Daemon **create-once** slot dir: `N = max(1, NumCPU − reserve)` before `Ready`, honouring
+3. Daemon **create-once + atomically-published** slot dir: `N = max(1, NumCPU − reserve)`
+   built in a private temp dir and `rename`d in (observers see no dir or the complete set,
+   never partial — even on a mid-creation abort), before `Ready`, honouring
    `AIRA_DAEMON_CPU_RESERVE`; a later start with a different size **does not** add/remove/
-   replace files (no disjoint lock populations); machine-wide single dir under `RuntimeDir`;
-   effective `N` logged.
+   replace files (rename loses → validate + drop temp; no disjoint lock populations);
+   machine-wide single dir under `RuntimeDir`; effective `N` logged.
 4. `go:embed` extraction: idempotent + atomic (private temp + `rename`) + **content-hash**-
    stamped + concurrent-safe with an explicit loser path (validate `.ready`, clean own temp);
    `AIRA_PY_LIB` importable; AIRA never executes the module; one static binary / no cgo.
