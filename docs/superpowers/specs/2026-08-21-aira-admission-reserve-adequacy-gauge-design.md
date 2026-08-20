@@ -1,9 +1,10 @@
 # AIRA §17 admission estimate-vs-actual insight gauge — design
 
-Status: PLAN v3 (Sol plan-review r1 CHANGES-NEEDED + Fable code-gate r1
-GATE-PASS-conditional folded → v2; Sol r2 CHANGES-NEEDED [1 P0 classification
-order + grammar/signature/reason] + Fable re-gate GATE-PASS-conditional [kill/
-cancel/lost truncation + nullable signature] folded → v3). Milestone task #52.
+Status: PLAN v3 — **APPROVED** (Sol plan-review r1 CHANGES-NEEDED + Fable
+code-gate r1 GATE-PASS-conditional folded → v2; Sol r2 CHANGES-NEEDED [1 P0
+classification order + grammar/signature/reason] + Fable re-gate
+GATE-PASS-conditional [kill/cancel/lost truncation + nullable signature] folded
+→ v3; **Sol r3 APPROVE-PLAN**). Milestone task #52.
 Deferral #2 of the peak-RSS admission-estimate milestone (#50,
 `docs/superpowers/specs/2026-08-20-aira-peak-rss-admission-estimate-design.md`,
 §12.2). Constrained by the no-compat rule (AIRA is not live).
