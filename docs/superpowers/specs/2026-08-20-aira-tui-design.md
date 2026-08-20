@@ -36,7 +36,10 @@ it from an event tail.
   `Claim` (`lease.go:249-255`), so hiding it would fabricate "free" while claims bounce. The daemon
   takes **one** `sampleClock()` and stamps each row with `expired` via the exact reap predicate
   (`lease.go:581`: `bootID mismatch || monoNS-last ≥ ttl`); a cross-boot row is marked
-  `stale (prior boot)` with **no fabricated age** (the monotonic clock resets across boots). This is
+  `stale (prior boot)` with **no fabricated age** (the monotonic clock resets across boots). A
+  same-boot row whose `last_heartbeat_mono_ns > sampleMono` (a heartbeat committed concurrently with,
+  and just after, our one clock sample) is **not** negative-aged: `expired=false` and
+  `age_note="concurrently renewed"` — never an underflowed or fabricated-zero age. This is
   the honest counterpart to `Claim`/`Release` and makes the coordination view real. The verb
   registers like any read verb (`dispatchTable` + a metadata entry — `applyDispatchMetadata` panics
   if missing, `core.go:1930-1932`; default `RouteDaemon`); it surfaces in **MCP + Skill** too (an
@@ -101,21 +104,31 @@ Correctness lives in a **pure controller state machine**, not in tview. Three la
    the active view, a `PanelState` per view (`generation int`, `status` ∈
    {loading, ready, error}, the computed **view-model** rows/tiles, `errCode`), the watch
    `cursor int64`, a fixed-size `eventRing`, a coalesced `pendingRefresh` set, and `shuttingDown`.
+   `PanelState` carries `generation`, `inFlight bool`, `inFlightGen int` (the generation of the
+   fetch currently in flight), and `dirty bool`. **All refresh requests funnel through one internal
+   `requestRefresh(view)` transition** so the state can never diverge:
+   - `requestRefresh(view)`: if `panel.inFlight` → set `panel.dirty = true` and **do nothing else**
+     (no generation bump, no `Fetch` — the in-flight fetch stays the single one); else → bump
+     `panel.generation`, set `panel.inFlight = true`, `panel.inFlightGen = panel.generation`, and
+     emit `Fetch{view, gen: panel.generation}`.
    Pure transitions return `(AppState, []Cmd)`:
-   - `OnKey(k)` → navigation / open-palette / quit; may emit `Fetch{view, gen}` or `Quit`.
-   - `OnFetchResult{view, gen, resp}` → clears the panel's `inFlight`; folds the result **only if
-     `gen == panel.generation`** (per-panel singleflight — a newer refresh bumped the generation, so
-     a stale response is dropped); then, if the panel's `dirty` bit is set (an invalidation arrived
-     while a fetch was in flight), clears it and emits a fresh `Fetch` — a **trailing refresh** that
-     guarantees the final state is always fetched.
-   - `OnWatchBatch{events, cursor}` → appends to the ring (bounded), advances `cursor`, and for each
-     affected visible panel: if a fetch is `inFlight`, set `dirty`; else emit `ScheduleRefresh`
-     (debounce). **At most one in-flight fetch per panel**, ever — never a goroutine per event.
-   - `OnRefreshDue{view}` → if not `inFlight`, bump `generation`, set `inFlight`, emit `Fetch`.
+   - `OnKey(k)` → navigation / open-palette / quit; `r` (manual refresh of the active panel) calls
+     `requestRefresh` (so `r` during an in-flight fetch sets `dirty`, never a second fetch nor an
+     unfetched bumped generation).
+   - `OnFetchResult{view, gen, resp}` → **if `gen != panel.inFlightGen`, IGNORE it entirely — clear
+     nothing** (it is a superseded fetch's late result; clearing `inFlight` here would wrongly cancel
+     the newer in-flight fetch). Otherwise: clear `inFlight`, fold the result; then if `dirty`, clear
+     `dirty` and call `requestRefresh(view)` — the **trailing refresh** (which bumps + sets inFlight +
+     emits `Fetch`), guaranteeing the final state is always fetched.
+   - `OnWatchBatch{events, cursor}` → append to the ring (bounded), advance `cursor`, and for each
+     affected visible panel call `requestRefresh` (via a coalescing `ScheduleRefresh`; §7). **At most
+     one in-flight fetch per panel**, ever — never a goroutine per event.
+   - `OnRefreshDue{view}` → `requestRefresh(view)` (debounce fired).
    - `OnEOF` → emit `Reconnect` with exponential backoff + jitter.
    `Cmd` is a value (`Fetch`, `ScheduleRefresh`, `Reconnect`, `Quit`) — never a closure — so every
-   transition is table-testable, including sustained-events-with-a-slow-dispatcher converging to a
-   final quiescent fetch.
+   transition is table-testable, including: `r` during a pending fetch (→ dirty, not a second fetch);
+   a late generation-N result delivered during generation N+1 (→ ignored, N+1's inFlight preserved);
+   and sustained-events-under-a-slow-dispatcher converging to exactly one final quiescent fetch.
 2. **Executor** (impure, bounded). Runs `Cmd`s **off the UI thread** with a bounded worker pool:
    `Fetch` runs `Dispatch` in a worker and delivers a `msg`; `ScheduleRefresh` arms one debounce
    timer per view (~250 ms; a later `ScheduleRefresh` resets it) that fires `OnRefreshDue`; the
@@ -259,7 +272,9 @@ One watch goroutine reuses the CLI exchange (`Dispatch(Verb:"watch")` + `decodeW
 - **`lease ls` primitive (store test):** `store.ListLeases` returns a `HeldLeaseRow` per held row
   with `ticket_id` populated, JSON round-trips through `RawData`, includes an **expired-held** row
   **marked** `expired` (not omitted), marks a **boot-mismatch** row `stale (prior boot)` with no
-  age, and lists **only** `state='held'` (a `state='free'` row is absent); the verb is `SafetyRead`,
+  age, handles a **heartbeat-after-sample** row (`last > sampleMono`) as `concurrently renewed` with
+  `expired=false` and no negative age, and lists **only** `state='held'` (a `state='free'` row is
+  absent); the verb is `SafetyRead`,
   routes to the daemon, and surfaces in MCP/Skill (its `MCPTool` present, descriptor goldens
   updated).
 - **Face parity:** `aira tui` builds the same `(dispatcher, scope)` as the CLI verb path; the CLI
