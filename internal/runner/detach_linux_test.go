@@ -384,6 +384,53 @@ func TestM20LaunchFlockIsHeldThroughStartAttempt(t *testing.T) {
 	}
 }
 
+func TestDetachedLaunchReceivesSidecarEnvironmentFromCommonSeam(t *testing.T) {
+	r, _ := newMemoryRunner(t, nil)
+	r.inputRuntimeDir = filepath.Join(t.TempDir(), "runtime")
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	var childEnv []string
+	r.startFn = func(command *exec.Cmd) error {
+		childEnv = append([]string(nil), command.Env...)
+		return errors.New("injected after detached environment observation")
+	}
+	readyR, readyW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ackR, ackW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := Request{
+		Argv:        []string{"/bin/true"},
+		Env:         []string{"PATH=/bin"},
+		ExplicitEnv: true,
+		Detach:      true,
+		detachReady: &detachSignal{file: readyW},
+		detachAck:   ackR,
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, launchErr := r.Launch(context.Background(), req)
+		result <- launchErr
+	}()
+	var ready detachReadyMessage
+	if err := json.NewDecoder(readyR).Decode(&ready); err != nil || ready.ID == "" {
+		t.Fatalf("readiness=%+v err=%v", ready, err)
+	}
+	if _, err := ackW.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	_ = ackW.Close()
+	if err := <-result; err == nil {
+		t.Fatal("injected detached start failure did not propagate")
+	}
+	values := testEnvironmentValues(t, childEnv)
+	if values["AIRA_PY_LIB"] == "" || values["AIRA_CPU_SLOTS_DIR"] != filepath.Join(r.inputRuntimeDir, "cpuslots") {
+		t.Fatalf("detached child sidecar env=%v", childEnv)
+	}
+}
+
 func TestRunInputPathFailureOccursBeforeChildStart(t *testing.T) {
 	r, scope := newMemoryRunner(t, nil)
 	r.inputRuntimeDir = filepath.Join(newRunInputRuntimeDir(t), strings.Repeat("long-runtime-component-", 8))

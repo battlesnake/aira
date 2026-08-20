@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"aira/internal/pylib"
 	"golang.org/x/sys/unix"
 )
 
@@ -75,6 +76,10 @@ func (r *Runner) SetAdmitSocketPath(path string) { r.admitSocketPath = path }
 // SetInputRuntimeDir supplies daemon.PathsFromEnv().RuntimeDir, keeping run
 // input discovery pinned to the same state identity as the daemon socket.
 func (r *Runner) SetInputRuntimeDir(path string) { r.inputRuntimeDir = path }
+
+// SidecarRuntimeDir lets the thin time wrapper share the daemon runtime
+// identity already wired into the concrete runner.
+func (r *Runner) SidecarRuntimeDir() string { return r.inputRuntimeDir }
 
 // AdmitSocketPath reports the wired daemon admission endpoint (empty when the
 // daemon is not wired, in which case admit falls back to the in-process flock).
@@ -271,6 +276,10 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 			buffering = "realtime"
 		}
 	}
+	// Inject after EnvDigest at the common point shared by foreground and
+	// detached launches. These advisory coordinates are deliberately excluded
+	// from the child environment identity recorded in telemetry.
+	env = pylib.AppendChildEnvironment(env, r.inputRuntimeDir, r.diagnostics)
 	if req.StoreStdin && req.StdinPath == "" && req.Stdin == nil {
 		return nil, launchErr("E_RUN_STDIN_INVALID", errors.New("store-stdin requires a launch source"))
 	}

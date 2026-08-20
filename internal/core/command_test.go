@@ -23,6 +23,13 @@ type commandCoreStore struct {
 	err    error
 }
 
+type commandSidecarRunner struct {
+	successfulStoreFreeRunner
+	runtimeDir string
+}
+
+func (r commandSidecarRunner) SidecarRuntimeDir() string { return r.runtimeDir }
+
 func (s *commandCoreStore) AddCommandEvent(_ context.Context, input domain.CommandEventInput) (store.CommandEventAddResult, error) {
 	s.inputs = append(s.inputs, input)
 	if s.err != nil {
@@ -175,6 +182,36 @@ func TestTimeConfiguredPrefixSelectionAndDigestExcludePrefix(t *testing.T) {
 	prefix[0] = "changed"
 	if c.commandPrefix[0] != "env" {
 		t.Fatal("WithCommandPrefix retained caller slice")
+	}
+}
+
+func TestTimeChildReceivesExtractedSidecarEnvironment(t *testing.T) {
+	dataHome := t.TempDir()
+	runtimeDir := filepath.Join(t.TempDir(), "runtime")
+	observed := filepath.Join(t.TempDir(), "time-env")
+	t.Setenv("XDG_DATA_HOME", dataHome)
+	t.Setenv("AIRA_CPU_POLL_INTERVAL", "0.2")
+	t.Setenv("AIRA_CPU_MAX_WAIT", "9")
+	s := &commandCoreStore{}
+	execution := commandSidecarRunner{runtimeDir: runtimeDir}
+	script := `printf '%s\n%s\n%s\n%s\n' "$AIRA_PY_LIB" "$AIRA_CPU_SLOTS_DIR" "$AIRA_CPU_POLL_INTERVAL" "$AIRA_CPU_MAX_WAIT" > "$1"`
+	response := NewWithRunnerFace(s, execution, nil, FaceOutput{}).Do(context.Background(), Request{Verb: "time", Args: map[string]any{
+		"argv": []string{"sh", "-c", script, "time-env", observed},
+		"env":  []string{},
+	}})
+	if !response.OK || response.Exit != 0 {
+		t.Fatalf("response=%#v", response)
+	}
+	data, err := os.ReadFile(observed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 4 || lines[0] == "" || lines[1] != filepath.Join(runtimeDir, "cpuslots") || lines[2] != "0.2" || lines[3] != "9" {
+		t.Fatalf("time sidecar environment=%q", data)
+	}
+	if _, err := os.Stat(filepath.Join(lines[0], "aira_xdist_governor", "__init__.py")); err != nil {
+		t.Fatalf("time AIRA_PY_LIB is not importable: %v", err)
 	}
 }
 

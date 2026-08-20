@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -900,6 +901,76 @@ func TestRealCgroupExplicitNonemptyEnvironmentIsCanonicalAndDigested(t *testing.
 	if err != nil || record.EnvDigest != want {
 		t.Fatalf("env digest=%s want %s (err=%v)", record.EnvDigest, want, err)
 	}
+}
+
+func TestSidecarEnvironmentIsInjectedAfterDigestForExplicitEnv(t *testing.T) {
+	r, _ := newMemoryRunner(t, nil)
+	r.inputRuntimeDir = filepath.Join(t.TempDir(), "runtime")
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	var childEnv []string
+	r.startFn = func(command *exec.Cmd) error {
+		childEnv = append([]string(nil), command.Env...)
+		return errors.New("injected after environment observation")
+	}
+	record, err := r.Launch(context.Background(), Request{
+		Argv:        []string{"/bin/true"},
+		Env:         []string{"PATH=/bin"},
+		ExplicitEnv: true,
+	})
+	if err == nil {
+		t.Fatalf("launch record=%+v err=%v", record, err)
+	}
+	record, getErr := r.Get("RUN-1")
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	values := testEnvironmentValues(t, childEnv)
+	if values["AIRA_PY_LIB"] == "" || values["AIRA_CPU_SLOTS_DIR"] != filepath.Join(r.inputRuntimeDir, "cpuslots") {
+		t.Fatalf("child sidecar env=%v", childEnv)
+	}
+	wantDigest, digestErr := EnvDigest([]EnvEntry{{Key: []byte("PATH"), Value: []byte("/bin")}})
+	if digestErr != nil || record.EnvDigest != wantDigest {
+		t.Fatalf("injected vars changed digest: got=%q want=%q err=%v", record.EnvDigest, wantDigest, digestErr)
+	}
+}
+
+func TestSidecarExtractionFailureDoesNotBlockLaunch(t *testing.T) {
+	r, _ := newMemoryRunner(t, nil)
+	r.inputRuntimeDir = filepath.Join(t.TempDir(), "runtime")
+	blockedDataHome := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blockedDataHome, []byte("file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_DATA_HOME", blockedDataHome)
+	var childEnv []string
+	r.startFn = func(command *exec.Cmd) error {
+		childEnv = append([]string(nil), command.Env...)
+		return errors.New("launch reached after sidecar failure")
+	}
+	_, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/true"}, Env: []string{"PATH=/bin"}, ExplicitEnv: true})
+	if err == nil || !strings.Contains(err.Error(), "launch reached after sidecar failure") {
+		t.Fatalf("sidecar failure blocked or replaced launch result: %v", err)
+	}
+	values := testEnvironmentValues(t, childEnv)
+	if values["AIRA_PY_LIB"] != "" || values["AIRA_CPU_SLOTS_DIR"] != "" {
+		t.Fatalf("failed extraction injected partial sidecar env: %v", childEnv)
+	}
+}
+
+func testEnvironmentValues(t *testing.T, env []string) map[string]string {
+	t.Helper()
+	values := make(map[string]string, len(env))
+	for _, entry := range env {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			t.Fatalf("invalid environment entry %q", entry)
+		}
+		if _, exists := values[key]; exists {
+			t.Fatalf("duplicate environment key %q", key)
+		}
+		values[key] = value
+	}
+	return values
 }
 
 func TestRealCgroupRealtimeHonestyAndChildEnvironment(t *testing.T) {
