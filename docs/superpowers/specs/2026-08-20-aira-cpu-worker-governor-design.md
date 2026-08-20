@@ -1,8 +1,51 @@
 # Embedded sidecar modules + dynamic cross-session CPU-worker governor, v2
 
-**Status:** plan — Sol r1 (2 P0 + 3 P1 + 2 P2) → v2 → Sol r2 (6/7) → v3 → Sol r3 (P0b
-resolved *with* `renameat2(RENAME_NOREPLACE)`) → this is **v4** (both publish points use
-`RENAME_NOREPLACE`); Sol-APPROVED. **Milestone:** Phase 5 · CPU-worker governor (task #49). **Branch:**
+**Status:** plan — Sol r1→r3 → APPROVE → Fable code-grounded gate → **GATE-PASS** (1 P0 + 3
+P1 + 6 P2, folded in §1a) → this is **v5**. **Milestone:** Phase 5 · CPU-worker governor
+(task #49). Fable live-verified the pytest hookwrapper (pytest 9.0.3, pre-yield wait
+excluded from phase durations), `unix.Renameat2`+`RENAME_NOREPLACE` in the vendored
+`x/sys v0.47.0`, and the flock/Serve-hook/NumCPU claims.
+
+## 1a. v5 amendments (Fable plan-gate — AUTHORITATIVE; supersede any conflicting detail below)
+
+- **A1 (P0) — fail-open at EVERY layer, + fsync before publish.** (a) The `conftest` snippet
+  is **import-time** code — document it as **`try/except Exception: pass`** around the
+  sys.path-insert + register, a no-op on any error (a raising conftest fails the whole
+  suite). (b) When `ExtractPyLib` or `renameat2` errors (`EINVAL`/`ENOSYS` on an exotic FS),
+  the wrapper **skips setting the env vars and proceeds** — never fails `run`/`time`. (c)
+  When slot-dir creation fails, the daemon **logs and degrades** — never aborts the mandatory
+  `Serve` (`server.go:108`). (d) **`fsync` the extracted files + their dirs (and the slot
+  files + dir) BEFORE the `renameat2` publish** (precedent `syncDir`, `runner_linux.go:372`)
+  — `XDG_DATA_HOME` is persistent ext4; a crash after the rename could otherwise durably
+  publish `.ready` over zero-length files.
+- **A2 (P1-1) — the `run` env append must be at the COMMON construction point, not
+  `runner_linux.go:392`.** The `--detach` branch returns at `runner_linux.go:297` before 392,
+  so 392 misses every detached run. Inject at `runner_linux.go:248-269` (after `EnvDigest` at
+  :258, following the `stdbufInjection` precedent at :269 — so the two vars stay **out of the
+  digest** and reach foreground **and** detached). Add a **detached-run env test**. Also
+  confirm `--env`-replace mode (`req.ExplicitEnv`, :250-251) still injects them (stdbuf
+  precedent: yes, regardless).
+- **A3 (P1-2) — `//go:embed all:<pylibdir>`** (a plain directory embed drops `__init__.py`
+  and any `_`/`.`-prefixed file). Keep the embedded dir **pristine**: gitignore
+  `__pycache__/`/`*.pyc` so `all:` doesn't churn the content hash per box; the "Python can
+  import it" test catches a broken tree.
+- **A4 (P1-3) — the concurrency test uses K independent single-process `pytest` invocations,
+  not xdist.** xdist is **not installed** on the canonical `make test` box (pytest 9.0.3 is);
+  K concurrent single-process runs contend for the N flock slots — this both avoids the xdist
+  dependency **and** exercises the real cross-process flock claim. Gate real-python tests on
+  **pytest availability only**, and mirror #33: **`AIRA_REAL_PYTEST=1` hard-fails** if pytest
+  is absent (like `SkipOrFailRealCgroup`) so coverage can't silently vanish.
+- **P2 folds:** `NumCPU` is the right basis on this box (whale.slice has only `CPUWeight`, no
+  `CPUQuota`/`AllowedCPUs`; `NumCPU` reads `sched_getaffinity` so a cpuset is honoured); note
+  a future `cpu.max` quota would **not** shrink N (accepted advisory drift). The
+  reboot-clears-`XDG_RUNTIME_DIR` re-derivation only holds when it's **set** — `PathsFromEnv`
+  falls back to a **persistent** `<stateHome>/aira/run` where N never re-derives (logged-N
+  mitigates; state it). Open slot fds **`O_CLOEXEC`** + note the `multiprocessing`-fork edge
+  (a forked child inherits the fd and can pin a slot past the item — advisory-bounded). A
+  **failed loser-validation** (no `.ready` / incomplete slot set) → **log-once + fail-open**;
+  a dir with **zero visible slot files** → treat as **inactive** (don't contend to max-wait).
+  The daemon may **sweep its own-prefix crash-litter** (`.cpuslots-<pid>-*`, and stale
+  `.tmp-<pid>-*` under pylib) at start (it holds the single-instance flock) — cheap, optional. **Branch:**
 `codex-aira-cpu-governor`. **Depends on:** M21 (daemon owns machine-local runtime state),
 #29/D4 (the RAM-admission precedent + advisory-fail-open stance).
 **v2 folds:** the pytest gate is a `pytest_runtest_protocol` **hookwrapper** (wait precedes
