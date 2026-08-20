@@ -3,6 +3,7 @@ package pylib
 import (
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,7 +27,9 @@ func AppendChildEnvironment(env []string, runtimeDir string, diagnostics io.Writ
 		childEnvFailureOnce.Do(func() {
 			if diagnostics != nil {
 				_, _ = fmt.Fprintf(diagnostics, "aira CPU governor disabled: %v\n", err)
+				return
 			}
+			log.Printf("aira CPU governor disabled: %v", err)
 		})
 		return env
 	}
