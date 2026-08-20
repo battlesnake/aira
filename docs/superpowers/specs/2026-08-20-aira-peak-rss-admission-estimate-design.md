@@ -108,13 +108,17 @@ signature index returns everything the estimator needs:
 
 ```sql
 SELECT
-  COUNT(*)                                                                   AS total_n,
-  SUM(CASE WHEN status IN ('exited','oom-killed') AND peak_rss IS NOT NULL
-        THEN 1 ELSE 0 END)                                                   AS sample_n,
-  MAX(CASE WHEN status IN ('exited','oom-killed') THEN peak_rss END)         AS peak_max,
-  SUM(CASE WHEN status='oom-killed'               THEN 1 ELSE 0 END)         AS oom_n
+  COUNT(*)                                                                            AS total_n,
+  COALESCE(SUM(CASE WHEN status IN ('exited','oom-killed') AND peak_rss IS NOT NULL
+        THEN 1 ELSE 0 END), 0)                                                        AS sample_n,
+  COALESCE(MAX(CASE WHEN status IN ('exited','oom-killed') THEN peak_rss END), 0)     AS peak_max,
+  COALESCE(SUM(CASE WHEN status='oom-killed' THEN 1 ELSE 0 END), 0)                   AS oom_n
 FROM runs WHERE resource_signature = ?;
 ```
+
+`COALESCE(…,0)` on every `SUM`/`MAX` is load-bearing: SQLite returns `NULL` (not 0) for `SUM`
+and `MAX` over **zero** matching rows, which would otherwise scan into an int as a
+`fallback:read-error` instead of the correct `fallback:no-history`. `COUNT(*)` is naturally 0.
 
 Filter rationale (verified against the code):
 
@@ -140,54 +144,60 @@ context deadline (`sampleReadTimeout`, default 250 ms). A concurrent-writer `SQL
 deadline, or any error → `fallback:read-timeout` / `fallback:read-error`; the read **never**
 blocks admission (which has its own `admissionMaxWait` and must not inherit a DB-lock wait).
 
-## 4. Resource signature — finer than the telemetry key, shared strip only
+## 4. Resource signature — the exact effective launch argv, no stripping
 
-The command-telemetry key (`normaliseCommandKey`, `internal/core/command.go:208-286`) collapses
-`go test ./...` and `go test ./internal/store` both to `go test`. That coarseness is fine for a
-latency *view* but dangerous for resource *admission*: a light workload's history would
-authorise a heavier one. The **resource signature is therefore distinct and finer** — it
-retains the full stripped argv, not just `program subcommand`.
+The signature must group runs that consume memory the same way. **Wrapper-stripping is unsafe
+here**: `whale-run` imposes a hard memory cap, `timeout` can truncate a run before its true peak
+(and if the child exits under the signal it may still record as `exited`), and `env VAR=…` can
+carry a memory control (`GOMEMLIMIT`) — stripping any of these lets a capped or truncated peak
+authorise an uncapped or full run in the *dangerous* (under-reserve) direction. So the resource
+signature keeps the **full effective launch argv, stripping nothing**, and shares no logic with
+the coarse command-telemetry key (`normaliseCommandKey`); the two serve different purposes.
 
-Only the **wrapper-stripping** is shared. Extract the prefix-strip loop
-(`command.go:210-268`, including the all-stripped reset at :266-268 — `timeout`/`nice -n`/
-`ionice -c`/`stdbuf`/`sudo`/`env`/`whale-run`/`nohup`/`KEY=VALUE`) into a helper
-`stripCommandWrappers(argv) []string` in `internal/core`. `normaliseCommandKey` calls it then
-derives its coarse key (unchanged behaviour — the goldens at `command_test.go:50-73` never
-exercise the all-stripped path, so a verbatim extraction preserves them); `resourceSignature`
-calls it then joins the **entire** stripped argv:
+**Basis = exactly what the runner will execute.** The runner composes the launch argv as
+`EffectiveArgv(effectivePrefix(configuredPrefix, req.Prefix), req.Argv)` (`runner_linux.go:233,293`),
+where `effectivePrefix` (`env.go:222-227`) **replaces** the configured prefix with `req.Prefix`
+when the latter is **non-nil** (distinguishing nil from a non-nil empty `[]` — an explicit
+`--prefix` of `[]` suppresses the config prefix). Core must mirror this exactly, not concatenate;
+otherwise a `"prefix": []` request (reachable via MCP, since `stringSlice` returns a non-nil empty
+slice, `core.go:2151`) would alias a plain run with a `valgrind`-config-prefixed one. So export the
+selection helper as `runner.EffectivePrefix` and compute the signature with the runner's own
+composition:
 
 ```go
-func resourceSignature(argv []string) string // NUL-join of stripCommandWrappers(argv)
+sel, err := runner.EffectivePrefix(c.commandPrefix, req.Prefix) // == effectivePrefix, exported
+eff, err := runner.EffectiveArgv(sel, req.Argv)                 // already exported, types.go:364
+signature := nulJoin(eff)                                       // no stripping
 ```
 
-**Basis = the effective argv** — `commandPrefix ++ req.Prefix ++ req.Argv`, wrapper-stripped.
-The config `run.prefix` is available to core as `commandPrefix` (threaded via `WithCommandPrefix`,
-`core.go:420`; `dispatcher.go:226,228,445,447`) and the explicit `--prefix` as `req.Prefix`.
-Innocuous wrappers (`timeout`/`nice`/…) strip out, so `timeout 600 go test ./...` and
-`go test ./...` share history; but a **memory-changing** launcher that survives stripping — e.g.
-`valgrind` (not in the strip set) — stays in the signature, so it can never alias a plain run.
-Core computes this once and **stores** the resulting signature on the record, so store == query
-is symmetric by construction regardless of how the runner later composes the launch argv (no
-read-time re-derivation from `RunRecord.Argv`).
+`commandPrefix` reaches core via `WithCommandPrefix` (`core.go:420`; `dispatcher.go:226,228,445,447`).
+Core computes the signature once and **stores** it on the record, so store == query is symmetric
+by construction. Because the basis is byte-identical to the launched argv, `valgrind …`,
+`whale-run …`, `timeout 600 …`, and a plain run each get a distinct signature — none can alias
+another with a different resource profile. A launched wrapper that is genuinely constant per
+project (`run.prefix = whale-run`) is present on every run, so its runs still group together.
 
 **Deliberately excluded from the signature (documented residual aliasing).** Working directory
-and environment are **not** keyed, for a concrete reason: `runs.db` is per-project common-dir
-and AIRA's core workflow is short-lived per-worktree runs — keying on CWD would make a fresh
-worktree ignore all accumulated project history and sit permanently in fallback, defeating the
-feature. The argv itself already distinguishes test *scope* (`go test ./...` vs
-`go test ./internal/store` are different signatures), so the residual risk is only the *same*
-argv run from a genuinely different repo position, or a resource-changing env var
-(`GOMEMLIMIT=…`) that stripping erases — both rare in this workflow, both bounded by the
-`safetyPct` margin and the `OOMPolicy=kill` backstop, and both cleanly addressable later by a
-CWD dimension or a resource-env allowlist digest (§12). Stated, not hidden.
+and environment are **not** keyed, for a concrete reason: `runs.db` is per-project common-dir and
+AIRA's core workflow is short-lived per-worktree runs — keying on CWD would make a fresh worktree
+ignore all accumulated project history and sit permanently in fallback, defeating the feature.
+The argv already distinguishes test *scope* (`go test ./...` vs `go test ./internal/store`), so
+the residual risk is only the *same* argv run from a genuinely different repo position, or a
+resource-changing env var (`GOMEMLIMIT=…`) passed **outside** the argv (an argv-embedded
+`env GOMEMLIMIT=… go test` is kept, since nothing is stripped). Both are rare in this workflow,
+bounded by the `safetyPct` margin and `OOMPolicy=kill`, and cleanly addressable later by a CWD
+dimension or a resource-env allowlist digest (§12). Stated, not hidden.
 
 ## 5. Component boundaries
 
 Four units, each independently testable:
 
-1. **Signature (core, pure).** `stripCommandWrappers` + `resourceSignature` (§4). Shares the
-   strip set with `normaliseCommandKey`; table-tested, including that a differing target
-   (`./...` vs `./internal/store`) yields a *different* signature.
+1. **Signature (core, pure).** `nulJoin(runner.EffectiveArgv(runner.EffectivePrefix(commandPrefix,
+   req.Prefix), req.Argv))` (§4) — the exported runner helpers guarantee it matches the launched
+   argv. `effectivePrefix` is promoted to exported `EffectivePrefix` (its one internal caller,
+   `runner_linux.go:233`, is updated). Table-tested: differing target, wrapped vs plain, timed vs
+   untimed, and the `req.Prefix == []` (non-nil empty) replace edge all yield the intended
+   distinctions.
 
 2. **Aggregate reader (runner, domain-free).** An optional interface implemented by
    `*runner.Runner`, asserted on `c.runner` via the existing seam pattern
@@ -234,32 +244,37 @@ an OOM-kill — the dangerous direction), while staying simple:
   only when `TotalCount==0`; `fallback:capture-unavailable` when `TotalCount>0 && SampleCount==0`
   (runs exist but no usable peak — `+memory` not delegated, or only killed/cancelled/lost runs);
   `fallback:insufficient-samples:n=<SampleCount>` when `0<SampleCount<minSamples`.
-- **Conservative statistic, integer arithmetic.** `estimate = PeakMax + PeakMax*safetyPct/100`
-  with `safetyPct` default 15 (≈ 1.15×). `PeakMax` (the worst observed complete-run peak,
-  **including any OOM-killed run's cap** — the strongest evidence of demand, §3) sizes the
-  reserve. The multiply is **overflow-guarded** (if `PeakMax > (MaxInt64-PeakMax*safetyPct)`
-  arithmetic would overflow, clamp to `maxEstimateReserve`). No floats.
+- **Conservative statistic, integer arithmetic in a proven-safe order.** `safetyPct` default 15
+  (≈ 1.15×). `PeakMax` is the worst observed complete-run peak, **including any OOM-killed run's
+  cap** (the strongest evidence of demand, §3). The order avoids any overflow and any
+  floor-violating post-clamp:
+  1. If `PeakMax > maxEstimateReserve` → `estimate = maxEstimateReserve` (already over cap).
+  2. Else `estimate = PeakMax + PeakMax*safetyPct/100`. This multiply cannot overflow: `PeakMax`
+     is now `≤ maxEstimateReserve = 2^50`, so `PeakMax*115 < 2^57 ≪ MaxInt64`. Then if
+     `estimate > maxEstimateReserve` → clamp to `maxEstimateReserve` (basis `estimate:capped`).
+  3. **OOM floor:** if `OOMCount > 0` → `reserve = max(headroom, estimate)`. Because config
+     guarantees `headroom ≤ maxEstimateReserve` and `estimate ≤ maxEstimateReserve`, the max is
+     `≤ maxEstimateReserve` — no further clamp is needed and the floor is never undone. Else
+     `reserve = estimate`.
+  4. Assert `0 < reserve ≤ maxEstimateReserve` before emitting. No floats anywhere.
 - **A defended `estimate:` basis always means the override was applied.** If `PeakMax <= 0`
   (a degenerate stored `peak_rss` of 0) or the computed `estimate <= 0`, do **not** emit an
   override — fall back with basis `fallback:malformed`. The runner's guard is
   `*override > 0` (§7), so an `estimate:` basis must correspond to a strictly-positive reserve
   that was actually enforced; this closes the "reserve 0 → static enforced but record says
   `estimate:max=0`" mis-report.
-- **OOM floors the reserve at the headroom.** When `OOMCount > 0`, the command has hit the cap,
-  so reserve at least the operator's headroom: `reserve = max(headroom, estimate)`, basis
-  `estimate:oom:max=<PeakMax>,n=<SampleCount>,oom=<OOMCount>,f=115`. Including the OOM peak in
-  `PeakMax` already pushes the estimate up; the explicit `max(headroom, ·)` guarantees a
-  cap-hitting signature is never *re-authorised* below the headroom even in a pathological
-  `cap < headroom` config. (A chronic OOMer whose inflated estimate exceeds what the slice can
-  hold then simply waits and fails open — bounded by `OOMPolicy=kill`, §9 — the honest outcome
-  for a job that provably does not fit.)
-- **Cap, don't emit an unadmittable reserve.** Clamp to `maxEstimateReserve = 1<<50`, a core
-  const duplicating `daemon.admitMaxReserve` (`daemon/admit.go:25`) with a cross-reference
-  comment (core cannot import daemon; the daemon still independently validates
-  `reserve ∈ [0, admitMaxReserve]`, so the two agreeing is belt-and-braces). A raw estimate
-  above the cap → `reserve = maxEstimateReserve`, basis `estimate:capped`. At real peak-RSS
-  magnitudes (≤ 2^38-ish) the cap is never hit; it exists to bound the overflow-guarded
-  arithmetic. Non-OOM values within range → basis `estimate:max=<PeakMax>,n=<SampleCount>,f=115`.
+- **OOM floor — why (step 3).** An OOM-killed run proves demand ≥ the cap, so the signature must
+  reserve at least the operator's headroom; folding the OOM peak into `PeakMax` already pushes the
+  estimate up, and `max(headroom, ·)` guarantees a cap-hitting signature is never *re-authorised*
+  below the headroom even in a pathological `cap < headroom` config. Basis
+  `estimate:oom:max=<PeakMax>,n=<SampleCount>,oom=<OOMCount>,f=115`. (A chronic OOMer whose
+  inflated estimate exceeds what the slice can hold then simply waits and fails open — bounded by
+  `OOMPolicy=kill`, §9 — the honest outcome for a job that provably does not fit.)
+- **The cap const (step 1–2).** `maxEstimateReserve = 1<<50` is a core const duplicating
+  `daemon.admitMaxReserve` (`daemon/admit.go:25`) with a cross-reference comment (core cannot
+  import daemon; the daemon still independently validates `reserve ∈ [0, admitMaxReserve]`, so the
+  two agreeing is belt-and-braces). At real peak-RSS magnitudes (≤ 2^38-ish) the cap is never hit;
+  it exists to bound the arithmetic. Non-OOM in-range → basis `estimate:max=<PeakMax>,n=<SampleCount>,f=115`.
 - **Opt-in.** New config `run.memory_estimate` (bool, default **false**). Off → today's fixed
   reserve, feature fully inert (no signature computed, no read, no override, no basis). On →
   the above. In estimate mode `run.memory_headroom` is the **unknown-command fallback** and the
@@ -269,8 +284,11 @@ an OOM-kill — the dangerous direction), while staying simple:
 
 `run.memory_estimate = true` is only valid when admission is configured (`run.slice` +
 `run.memory_headroom` present); otherwise `E_CONFIG_INVALID`, mirroring the existing
-both-or-neither check (`project.go:575-577`). `minSamples`, `safetyPct`, `sampleReadTimeout`,
-`maxEstimateReserve` are built-in constants in v1 — deliberately not new config surface.
+both-or-neither check (`project.go:575-577`). **`parsedRunAdmission` additionally rejects
+`memory_headroom > maxEstimateReserve`** (`E_CONFIG_INVALID`) so the OOM-floor `max(headroom,·)`
+can never exceed the cap — this is what makes step 3's "no further clamp" sound. `minSamples`,
+`safetyPct`, `sampleReadTimeout`, `maxEstimateReserve` are built-in constants in v1 — deliberately
+not new config surface.
 
 ## 7. Admission integration (every reserve read)
 
