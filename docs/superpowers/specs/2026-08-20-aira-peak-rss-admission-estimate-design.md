@@ -109,16 +109,22 @@ signature index returns everything the estimator needs:
 ```sql
 SELECT
   COUNT(*)                                                                            AS total_n,
-  COALESCE(SUM(CASE WHEN status IN ('exited','oom-killed') AND peak_rss IS NOT NULL
+  COALESCE(SUM(CASE WHEN status IN ('exited','oom-killed') AND peak_rss > 0
         THEN 1 ELSE 0 END), 0)                                                        AS sample_n,
-  COALESCE(MAX(CASE WHEN status IN ('exited','oom-killed') THEN peak_rss END), 0)     AS peak_max,
-  COALESCE(SUM(CASE WHEN status='oom-killed' THEN 1 ELSE 0 END), 0)                   AS oom_n
+  COALESCE(MAX(CASE WHEN status IN ('exited','oom-killed') AND peak_rss > 0
+        THEN peak_rss END), 0)                                                        AS peak_max,
+  COALESCE(SUM(CASE WHEN status='oom-killed' AND peak_rss > 0 THEN 1 ELSE 0 END), 0)  AS oom_n
 FROM runs WHERE resource_signature = ?;
 ```
 
-`COALESCE(…,0)` on every `SUM`/`MAX` is load-bearing: SQLite returns `NULL` (not 0) for `SUM`
-and `MAX` over **zero** matching rows, which would otherwise scan into an int as a
-`fallback:read-error` instead of the correct `fallback:no-history`. `COUNT(*)` is naturally 0.
+The sample predicate is **`peak_rss > 0`, not `IS NOT NULL`**: `parseMemoryPeak` accepts a stored
+`peak_rss` of 0 (`usage_linux.go`), and a degenerate 0 must not count toward `minSamples` — a
+history of `{100,0,0}` has **one** usable sample, not three, and must fall back rather than
+estimate from a single observation. `COALESCE(…,0)` on every `SUM`/`MAX` is load-bearing: SQLite
+returns `NULL` (not 0) for `SUM`/`MAX` over **zero** matching rows, which would otherwise scan into
+an int as a `fallback:read-error` instead of the correct `fallback:no-history`; `COUNT(*)` is
+naturally 0. (`oom_n` also requires `peak_rss > 0` so an OOM only floors the reserve when it carries
+a usable cap value.)
 
 Filter rationale (verified against the code):
 
@@ -233,6 +239,13 @@ Four units, each independently testable:
    at `detach_linux.go:204`) lanes inherit the estimate. With the flag off, none of this runs —
    the reader is never called. The runner consumes the override at the top of `admit` and stamps
    the record.
+
+   **Signature-error path.** `resourceSignature` can only error when the argv/prefix is invalid
+   (empty target, bad prefix) — exactly the inputs the runner's `Launch` will itself reject via the
+   same `EffectiveArgv`. On such an error, core sets **no** signature, override, or basis and
+   proceeds normally; `Launch` then returns the canonical `E_RUN_ARGUMENT_INVALID` /
+   `E_RUN_PREFIX_INVALID`. The estimate therefore never introduces a new, earlier, or
+   flag-dependent failure path, and never stores a partial signature — it is purely additive.
 
 ## 6. Estimate policy
 
@@ -393,16 +406,18 @@ blocks:
 ## 10. Testing
 
 - **Signature (pure):** `go test ./...` vs `go test ./internal/store` → distinct signatures;
-  a *strippable* prefix (`timeout 600 …`) does **not** change the signature; a *non-strippable
-  memory-changing* prefix (`valgrind …` via `req.Prefix`/`commandPrefix`) **does**;
-  `normaliseCommandKey` goldens unchanged after the `stripCommandWrappers` extraction.
+  `timeout 600 …` and `valgrind …` (via `req.Prefix`/`commandPrefix`) each yield a signature
+  distinct from the plain run (nothing is stripped); the `req.Prefix == []` (non-nil empty) replace
+  edge matches the runner; an **empty argv** and a **malformed prefix** each return the canonical
+  error, and core then sets no signature/override (tested in foreground *and* detached lanes).
 - **Estimator (pure, table-driven):** OOM handling — the OOM peak enters `PeakMax` *and*
   `OOMCount>0` floors the reserve at the headroom (`estimate:oom:` basis) and never falls to a
-  smaller reserve; `no-history` (`TotalCount==0`) vs `capture-unavailable`
-  (`TotalCount>0,SampleCount==0`) vs `insufficient-samples:n` selection; `max×115%` rounding
-  edge; overflow guard clamps instead of wrapping; `estimate:capped` above the cap;
-  `PeakMax<=0`/`estimate<=0` → `fallback:malformed` with **no** override; `< minSamples` →
-  fallback; exact basis strings.
+  smaller reserve; a **mixed `{100,0,0}` history** yields `SampleCount==1` (0-peaks excluded) →
+  `insufficient-samples`, never an estimate from the single valid sample; `no-history`
+  (`TotalCount==0`) vs `capture-unavailable` (`TotalCount>0,SampleCount==0`) vs
+  `insufficient-samples:n` selection; `max×115%` rounding edge; overflow guard clamps instead of
+  wrapping; `estimate:capped` above the cap; `PeakMax<=0`/`estimate<=0` → `fallback:malformed` with
+  **no** override; `< minSamples` → fallback; exact basis strings.
 - **Aggregate reader (runner, real `runs.db` fixture):** `PeakMax` includes both `exited` and
   `oom-killed` peaks and excludes nil-peak/killed/cancelled/lost; `OOMCount` counts oom-killed;
   `TotalCount`/`SampleCount` correct; returns `(_, false, nil)` when `runs.db` is absent; a held
