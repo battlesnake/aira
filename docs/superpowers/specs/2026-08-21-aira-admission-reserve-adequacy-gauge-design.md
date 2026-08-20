@@ -1,8 +1,10 @@
 # AIRA §17 admission estimate-vs-actual insight gauge — design
 
-Status: PLAN v2 (Sol plan-review r1 CHANGES-NEEDED + Fable code-gate r1
-GATE-PASS-conditional, both folded). Milestone task #52. Deferral #2 of the
-peak-RSS admission-estimate milestone (#50,
+Status: PLAN v3 (Sol plan-review r1 CHANGES-NEEDED + Fable code-gate r1
+GATE-PASS-conditional folded → v2; Sol r2 CHANGES-NEEDED [1 P0 classification
+order + grammar/signature/reason] + Fable re-gate GATE-PASS-conditional [kill/
+cancel/lost truncation + nullable signature] folded → v3). Milestone task #52.
+Deferral #2 of the peak-RSS admission-estimate milestone (#50,
 `docs/superpowers/specs/2026-08-20-aira-peak-rss-admission-estimate-design.md`,
 §12.2). Constrained by the no-compat rule (AIRA is not live).
 
@@ -52,51 +54,80 @@ language anywhere in title, field names, or operator guidance.
 ### 2.1 Per-run classification (the load-bearing logic)
 
 Candidate population = runs whose `admission_reserve_basis` begins `estimate`
-(coarse SQL prefilter). Each candidate is then **strictly** classified in Go —
-`LIKE 'estimate%'` alone is not trusted (it admits case-variants and lookalikes,
-Sol P1-2). Exactly one bucket per run:
+(coarse SQL prefilter). Each candidate is then classified in Go into **exactly
+one rate-partition** — `{adequate, inadequate, excluded}` — with OOM handled as
+a **primary orthogonal axis evaluated first** (Sol r2 P0: bucketing capped /
+invalid-reserve *before* OOM let an OOM-killed run escape `inadequate`, so the
+headline could still read 100 %). The two truncation arguments (Sol on OOM,
+Fable on kill/cancel/lost) unify to one rule: **an observed peak is a lower
+bound; only `exited` runs have a complete footprint; any OOM is inadequate.**
 
-- **malformed_basis** — estimate-prefixed but not one of the three known exact
-  forms `estimate:capped` | `estimate:max=…` | `estimate:oom:max=…`. Surfaced,
-  never silently dropped.
-- **capped** — basis `estimate:capped`. Its reserve is the `1<<50` clamp, so it
-  trivially exceeds any real peak and says nothing about estimate quality.
-  **Excluded from the primary rate** (Sol P1-3); reported as its own count (plus
-  `capped_oom` if such a run still `oom-killed`).
-- Otherwise (a real `estimate:max` / `estimate:oom:max` row):
-  - **invalid_reserve** — `admission_reserve` NULL or `<= 0` (an invariant
-    violation / corruption; the code guarantees `>0`, Fable-confirmed at
-    resource_estimate.go:81-83). Surfaced as its own count, never hidden.
-  - **inadequate** — the run `oom-killed` (ground-truth inadequacy; counted
-    regardless of peak) **or** (peak present and `> reserve`). OOM rows are not
-    placed in the margin distribution (a killed run's peak is truncated at the
-    limit, not a true footprint).
-  - **adequate** — not oom-killed, peak present, `0 < peak <= reserve`.
-  - **missing_peak** — not oom-killed, peak NULL (honest-nil, unknown — never
-    coerced to 0). Excluded from the rate.
-  - **invalid_peak** — not oom-killed, peak present but `<= 0` (corruption).
-    Excluded from the rate, surfaced as its own count (Sol P1-1: do not lump
-    every non-positive peak under one "excluded_nil_peak").
+Step 1 — **strict basis grammar** (Sol r2 P1; `LIKE 'estimate%'` is only a
+coarse prefilter and is not trusted). Anchored full-match against the exact forms
+`internal/core/resource_estimate.go` emits, else `malformed_basis` (excluded,
+surfaced):
+- `estimate:capped` — exact literal.
+- `estimate:max=<n>,n=<n>,f=115` — anchored `^estimate:max=\d+,n=\d+,f=115$`.
+- `estimate:oom:max=<n>,n=<n>,oom=<n>,f=115` — anchored
+  `^estimate:oom:max=\d+,n=\d+,oom=\d+,f=115$`.
+A near-miss (`estimate:max=x…`, truncated, trailing suffix, nonnumeric field,
+unknown `estimate:*`) → `malformed_basis`. (The embedded numbers are **not**
+consumed — classification uses the stored `admission_reserve`/`peak_rss` columns,
+not the basis string; the grammar only authenticates the form.)
 
-**Evaluable** = adequate + inadequate (uncapped). **adequacy_rate** = adequate /
-evaluable. When evaluable == 0 → `Unevaluated`, `Value=nil` (never a fabricated
-0.0/1.0), with a reason distinguishing "no estimate-mode runs recorded" from
-"estimate-mode runs recorded but none had a determinable outcome (no captured
-peak, no OOM)".
+Step 2 — **OOM axis (primary, first).** For any run that passed step 1 (capped,
+max, or oom:max) with `status == "oom-killed"` → **inadequate**, unconditionally
+(count `oom_killed`; if the form was capped also count `capped_oom`). OOM rows
+are never placed in the margin distribution (peak truncated at the limit).
+
+Step 3 — **non-OOM classification** (only runs not already inadequate by step 2):
+- `capped` → **excluded/capped** (its `1<<50` reserve trivially exceeds any peak;
+  says nothing about estimate quality — Sol r1 P1-3).
+- `invalid_reserve` — `admission_reserve` NULL or `<= 0` → **excluded/invalid_reserve**
+  (invariant violation / corruption; code guarantees `>0`, resource_estimate.go:81-83).
+- valid reserve (`> 0`):
+  - `peak > reserve` (peak present, `> 0`) → **inadequate**, for **any** status
+    (Fable P1: a truncated peak already exceeding reserve is a conclusive lower
+    bound). In the margin distribution only if `status == "exited"`.
+  - `peak` present, `0 < peak <= reserve`:
+    - `status == "exited"` → **adequate** (complete footprint conclusively within
+      the envelope). In the margin distribution.
+    - other terminal status (`killed`/`cancelled`/`lost`) → **excluded/truncated_inconclusive**
+      (peak is a lower bound; "under reserve" is not conclusive — Fable P1).
+    - non-terminal (`starting`/`running`) → **excluded/nonterminal** (defensive).
+  - `peak` NULL → **excluded/missing_peak** (honest-nil, unknown — never coerced
+    to 0; the primary discriminating invariant).
+  - `peak` present `<= 0` → **excluded/invalid_peak** (corruption; Sol r1 P1-1:
+    not lumped with `missing_peak`).
+
+**Evaluable** = adequate + inadequate. **adequacy_rate** = adequate / evaluable.
+When evaluable == 0 → `Unevaluated`, `Value=nil` (never a fabricated 0.0/1.0)
+with a **neutral** reason (Sol r2 P1): `"no estimate-mode runs recorded"` when
+`candidate == 0`, else `"no eligible evaluable runs — see exclusion counts"`
+(the `Fields` exclusion counts explain why, without a claim the counts may
+contradict).
 
 ### 2.2 Gauge shape (`GaugeKindRatio`)
 
 - `Value` = adequacy_rate (float) or absent when Unevaluated. `Direction: "up"`.
 - `Fields` (all honest integer counts, so partial-corruption is visible, not
-  hidden): `candidate`, `evaluable`, `adequate`, `inadequate`, `oom_killed`,
-  `missing_peak`, `invalid_peak`, `invalid_reserve`, `malformed_basis`,
-  `capped`, `capped_oom`. Plus `semantics` (a short string restating "reserve
-  threshold vs observed peak; OOM = inadequate; not a causal OOM-protection
-  guarantee").
-- `Breakdown` keyed by `resource_signature`: per-signature `Count` (evaluable),
-  a `Counts` map {adequate, inadequate, oom_killed, missing_peak}, cell `Value`
-  = per-signature adequacy_rate, or `Unevaluated` when that signature has zero
-  evaluable runs.
+  hidden). The **exclusive rate-partition** counts sum to `candidate`:
+  `adequate`, `inadequate`, and the excluded buckets `capped`, `invalid_reserve`,
+  `missing_peak`, `invalid_peak`, `truncated_inconclusive`, `nonterminal`,
+  `malformed_basis`; plus `candidate` and `evaluable` (= adequate + inadequate).
+  Two **overlay** counts (not part of the partition, may overlap it): `oom_killed`
+  (all estimate-form runs that OOM-killed — every one is in `inadequate`) and
+  `capped_oom` (capped runs that OOM-killed — in `inadequate`, not in `capped`).
+  Plus `semantics` (a short string: "reserve threshold vs observed peak; OOM and
+  observed-peak-over-reserve = inadequate; adequate requires a completed
+  (exited) run; not a causal OOM-protection guarantee").
+- `Breakdown` keyed by `resource_signature` (a run with a NULL signature buckets
+  under `"(unsigned)"`, Sol r2/Fable): per-signature `Count` (evaluable) and a
+  `Counts` map {adequate, inadequate, oom_killed, missing_peak, excluded}, cell
+  `Value` = per-signature adequacy_rate, or `Unevaluated` when that signature has
+  zero evaluable runs. Per-signature cells intentionally summarise the evaluable
+  outcome plus a rolled-up `excluded`; the full exclusion breakdown lives in the
+  top-level `Fields` (documented, not a silent omission — Sol r2 P2).
 - `Distributions["margin"]` = reserve/peak bucket histogram over the
   peak-bearing, non-OOM, uncapped runs (adequate ∪ envelope-exceeded):
   `shortfall(<1.0)`, `1.0–1.25`, `1.25–2.0`, `>=2.0`. Bucketed (not averaged),
@@ -144,9 +175,11 @@ New runner code (`internal/runner/estimate_actual.go`):
 
 ```go
 type AdmissionSample struct {
-    Signature string // resource_signature
+    Signature string // resource_signature; "" when SQL NULL (scanned via
+                     // sql.NullString so one NULL row cannot error the whole
+                     // read — Sol r2 P1 / Fable P2; classifier maps "" → "(unsigned)")
     Basis     string // admission_reserve_basis (estimate-prefixed, by query)
-    Status    string // runs.status, e.g. "oom-killed"
+    Status    string // runs.status, e.g. "oom-killed" (NOT NULL by schema)
     Reserve   *int64 // admission_reserve  (nil == SQL NULL)
     Peak      *int64 // peak_rss           (nil == honest-nil, unknown)
 }
@@ -209,22 +242,43 @@ classifier, exhaustive table tests** over hand-built `[]runner.AdmissionSample`
 3. peak `> reserve`, non-OOM → `inadequate`, margin `shortfall` bucket (red vs
    `>=` / reversed comparison).
 4. peak `== reserve`, non-OOM → `adequate` (red vs strict `<`).
-5. `estimate:capped` → `capped`, excluded from primary rate; a capped-only
-   population ⇒ Unevaluated (evaluable 0), not 100 % (red vs counting capped
-   adequate — Sol P1-3).
+5. `estimate:capped`, non-OOM → `capped`, excluded; a capped-only population ⇒
+   Unevaluated (evaluable 0), not 100 % (red vs counting capped adequate — Sol
+   r1 P1-3).
 6. `invalid_reserve` (nil/0 reserve) and `invalid_peak` (≤0 peak) each land in
-   their own count, not `missing_peak` (red vs one lumped bucket — Sol P1-1).
-7. `ESTIMATE:...` / `estimated-x` / other estimate-prefixed lookalikes →
-   `malformed_basis`, not evaluable (red vs trusting `LIKE 'estimate%'` — Sol
-   P1-2).
-8. `fallback:*` / `disabled:*` / `""` never reach the classifier (query filters
-   them) — a defensive test that a stray fallback row is ignored.
-9. per-signature separation: two signatures keep independent adequacy cells.
-10. mixed population (Sol P1-5): valid+invalid reserve, unknown basis, ±peak,
-    OOM-with-present-peak-below-reserve (still inadequate), capped, exact margin
-    boundaries `1.0`/`1.25`/`2.0` — asserts the full Fields/Breakdown/margin
-    histogram at once.
-11. empty population → Unevaluated, `Value` nil, `Universe.Count` 0, `Scope`
+   their own count, not `missing_peak` (red vs one lumped bucket — Sol r1 P1-1).
+7. `ESTIMATE:...` / `estimated-x` / `estimate:max=x,n=5,f=115` (nonnumeric) /
+   `estimate:max=1,n=2` (truncated) / `estimate:oom:max=1,n=2,f=115` (missing
+   `oom=`) / trailing-suffix forms → `malformed_basis`, not evaluable (red vs an
+   unanchored prefix/`LIKE 'estimate%'` match — Sol r2 P1). Assert the three
+   canonical forms parse.
+8. **OOM is orthogonal-and-first** (Sol r2 P0): a `estimate:capped` run that
+   `oom-killed`, and an `invalid_reserve` estimate run that `oom-killed`, each →
+   `inadequate` (+ `oom_killed`, capped one also `capped_oom`), NOT `capped` /
+   `invalid_reserve`; a population of only these ⇒ adequacy_rate 0.0, never 100 %
+   or Unevaluated (red vs classifying capped/invalid before OOM).
+9. **truncated non-exited** (Fable P1): a `killed`/`cancelled`/`lost` run with
+   peak `<= reserve`, non-OOM → `truncated_inconclusive`, excluded; a population
+   of only such runs ⇒ Unevaluated, and one added to an otherwise-adequate set
+   must NOT raise the rate (red vs counting peak≤reserve adequate for any
+   status). A `killed` run with peak `> reserve` → `inadequate` (conclusive).
+   A `starting`/`running` row → `nonterminal`, excluded.
+10. `fallback:*` / `disabled:*` / `""` never reach the classifier (query filters
+    them) — a defensive test that a stray fallback row is ignored.
+11. NULL signature (`""`) → `"(unsigned)"` breakdown bucket; mixed NULL/non-NULL
+    signatures keep independent cells (Sol r2 P1 / Fable P2).
+12. per-signature separation: two signatures keep independent adequacy cells.
+13. mixed population (Sol r1 P1-5): valid+invalid reserve, unknown/near-valid
+    basis, ±peak, OOM-with-present-peak-below-reserve (still inadequate), capped,
+    capped-OOM, killed-under-reserve, exact margin boundaries `1.0`/`1.25`/`2.0`
+    — asserts the full Fields partition (sums to `candidate`) + Breakdown +
+    margin histogram at once.
+14. zero-evaluable **reason is neutral** (Sol r2 P1): a capped-only / malformed-
+    only / invalid-reserve-only population ⇒ Unevaluated with reason "no eligible
+    evaluable runs — see exclusion counts" (red vs a "no captured peak, no OOM"
+    reason those counts would contradict); an empty candidate ⇒ "no estimate-mode
+    runs recorded".
+15. empty population → Unevaluated, `Value` nil, `Universe.Count` 0, `Scope`
     set, `AsOf` `{}` (non-nil), `At` set (conforms to insights_test.go's
     empty-universe invariant).
 
@@ -233,14 +287,25 @@ reader**, seeding `runs.db` via the existing `ledger.append`+`project` harness
 (reused from peak_rss_history_test.go; only reachable from package runner —
 Fable P1 on §7):
 
-- estimate rows with nil peak / present peak / oom-killed / capped are returned;
-  fallback/disabled/NULL-basis rows are excluded by the query.
+- estimate rows with nil peak / present peak / oom-killed / capped / killed are
+  returned; fallback/disabled/NULL-basis rows are excluded by the query.
+- a row with a NULL `resource_signature` is returned with `Signature==""` (scan
+  via `sql.NullString`, not a scan error blanking the whole read — Sol r2 P1).
 - `runs.db` absent → `present=false`, nil samples, nil err.
-- malformed / non-db file → `present=true`, err (caller degrades).
+- `runs.db` present but the `runs` table missing, or a required column missing,
+  or a non-db/garbage file → `present=true`, err (caller degrades — Sol r2 P2).
+- `SQLITE_BUSY`/locked → the `busy_timeout(0)` open fails fast, err (does not
+  block the daemon read path — Sol r2 P2).
 - read-only proof: assert `readOnlyHistoryDSN` carries `mode=ro` +
   `busy_timeout(0)` and the main `runs.db` size is unchanged after the read.
   **Do not** assert `-shm` absence (a mode=ro WAL reader may create one — the
   WAL-invalid mistake from #50's confirm round).
+
+**B2. store-level degradation** (`admission_insight_test.go`): a
+`computeAdmissionReserveAdequacy` over a scope whose reader returns an error →
+`GaugeResult` Unevaluated with a reason and a **nil** compute error (never
+propagate; Sol r2 P2). Seed by pointing the scope's common-dir at a garbage
+`runs.db`.
 
 **C. Registry**: bump `internal/store/insights_test.go:33` from `!= 9` to `!=
 10` (the only count-pin; Fable P2 — core/insights_test.go self-derives, the TUI
@@ -254,15 +319,17 @@ Unevaluated (not erroring) on an empty scope.
   read-only aggregate per gauge computation; bounded, non-blocking.
 - **schema knowledge** now lives only in the runner package that owns `runs.db`;
   a column change is a same-package edit (and AIRA is not live).
-- **capped inflation / OOM-masking / nil-as-zero** — all closed by §2.1 and
-  pinned by tests A2/A5/A6.
+- **capped inflation / OOM-masking (incl. capped-OOM order) / nil-as-zero /
+  truncated-peak false-pass** — all closed by §2.1 (OOM orthogonal-and-first;
+  adequate requires `exited`) and pinned by tests A2/A5/A8/A9.
 - **mis-framing as OOM protection** — closed by the §2 semantics statement, the
   retitle, and the `semantics` field.
 
 ## 8. Two-loop plan
 
-Sol plan-review r2 (confirm the honesty folds) + Fable re-gate (confirm the
-runner-reader seam + pure-classifier test realizability) → fold → Terra build
-(TDD, self-review) → Sol build-review (false-fail and false-pass) → Sol confirm
-→ Opus real-HW verify (build/vet/`CGO_ENABLED=0`/test ×2/`-race` all green,
-discriminating tests proven red) → merge to master (fast-forward, prune worktree).
+Plan review COMPLETE: Sol r1 (2 P0 + 5 P1 + 1 P2) + Fable r1 (2 P1 + 1 P2) →
+v2; Sol r2 (1 P0 + 3 P1 + 1 P2) + Fable re-gate (1 P1 + 1 P2) → v3. A final Sol
+r3 confirms the v3 folds. Then: Terra build (TDD, self-review) → Sol build-review
+(false-fail and false-pass) → Sol confirm → Opus real-HW verify
+(build/vet/`CGO_ENABLED=0`/test ×2/`-race` all green, discriminating tests
+proven red) → merge to master (fast-forward, prune worktree).
