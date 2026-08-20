@@ -66,6 +66,7 @@ type RunConfig struct {
 	CgroupParent       string   `json:"cgroup_parent,omitempty"`
 	Slice              string   `json:"slice,omitempty"`
 	MemoryHeadroom     string   `json:"memory_headroom,omitempty"`
+	MemoryEstimate     bool     `json:"memory_estimate,omitempty"`
 	AdmissionMaxWait   string   `json:"admission_max_wait,omitempty"`
 	DetachReadyTimeout string   `json:"detach_ready_timeout,omitempty"`
 	SupervisorLeaseTTL string   `json:"supervisor_lease_ttl,omitempty"`
@@ -266,10 +267,11 @@ func OpenWithoutStore(ctx context.Context, cwd string, diagnostics io.Writer) (P
 // BuildWithoutStore constructs local execution dependencies from one already
 // discovered project snapshot. It does not rediscover or open state.db.
 func BuildWithoutStore(project Project, diagnostics io.Writer) (Project, error) {
-	memoryReserve, admissionMaxWait, err := parsedRunAdmission(project.Config.Run)
+	memoryReserve, admissionMaxWait, memoryEstimate, err := parsedRunAdmission(project.Config.Run)
 	if err != nil {
 		return Project{}, err
 	}
+	project.Config.Run.MemoryEstimate = memoryEstimate
 	detachReadyTimeout, err := parsedDetachReadyTimeout(project.Config.Run)
 	if err != nil {
 		return Project{}, err
@@ -534,7 +536,7 @@ func validateConfig(config Config) error {
 	if heartbeatSeconds >= ttlSeconds {
 		return errors.New("E_CONFIG_INVALID: heartbeat must be shorter than ttl")
 	}
-	if _, _, err := parsedRunAdmission(config.Run); err != nil {
+	if _, _, _, err := parsedRunAdmission(config.Run); err != nil {
 		return err
 	}
 	if (config.Git.sshTimeoutPresent && config.Git.SSHConnectTimeoutSeconds <= 0) || (!config.Git.sshTimeoutPresent && config.Git.SSHConnectTimeoutSeconds < 0) {
@@ -569,28 +571,36 @@ func resolvedGitConfig(config GitConfig) gitremote.Config {
 	}
 }
 
-func parsedRunAdmission(config RunConfig) (int64, time.Duration, error) {
+const maxMemoryEstimateReserve int64 = 1 << 50 // mirrors core.maxEstimateReserve and daemon.admitMaxReserve
+
+func parsedRunAdmission(config RunConfig) (int64, time.Duration, bool, error) {
 	slice := strings.TrimSpace(config.Slice)
 	headroom := strings.TrimSpace(config.MemoryHeadroom)
 	if (slice == "") != (headroom == "") {
-		return 0, 0, errors.New("E_CONFIG_INVALID: run.slice and run.memory_headroom must be configured together")
+		return 0, 0, false, errors.New("E_CONFIG_INVALID: run.slice and run.memory_headroom must be configured together")
+	}
+	if config.MemoryEstimate && slice == "" {
+		return 0, 0, false, errors.New("E_CONFIG_INVALID: run.memory_estimate requires run.slice and run.memory_headroom")
 	}
 	var reserve int64
 	var err error
 	if headroom != "" {
 		reserve, err = parseByteCount(headroom)
 		if err != nil {
-			return 0, 0, fmt.Errorf("E_CONFIG_INVALID: run.memory_headroom: %w", err)
+			return 0, 0, false, fmt.Errorf("E_CONFIG_INVALID: run.memory_headroom: %w", err)
+		}
+		if config.MemoryEstimate && reserve > maxMemoryEstimateReserve {
+			return 0, 0, false, errors.New("E_CONFIG_INVALID: run.memory_headroom exceeds the memory estimate reserve cap")
 		}
 	}
 	var maxWait time.Duration
 	if value := strings.TrimSpace(config.AdmissionMaxWait); value != "" {
 		maxWait, err = time.ParseDuration(value)
 		if err != nil || maxWait <= 0 {
-			return 0, 0, errors.New("E_CONFIG_INVALID: run.admission_max_wait must be a positive duration")
+			return 0, 0, false, errors.New("E_CONFIG_INVALID: run.admission_max_wait must be a positive duration")
 		}
 	}
-	return reserve, maxWait, nil
+	return reserve, maxWait, config.MemoryEstimate, nil
 }
 
 func parsedDetachReadyTimeout(config RunConfig) (time.Duration, error) {

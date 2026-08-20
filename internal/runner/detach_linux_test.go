@@ -5,6 +5,7 @@ package runner
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -194,7 +195,8 @@ func TestM20MergedDetachedCaptureUsesOneOpenFileDescription(t *testing.T) {
 
 func TestM20ControlFileIs0600AndConsumedBeforeLaunch(t *testing.T) {
 	dir := t.TempDir()
-	path, err := writeDetachControl(dir, Request{Argv: []string{"/bin/true"}, Detach: true})
+	override := int64(70)
+	path, err := writeDetachControl(dir, Request{Argv: []string{"/bin/true"}, Detach: true, ResourceSignature: "sig", MemoryReserveOverride: &override, MemoryReserveBasis: "estimate:max=60,n=3,f=115"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +211,7 @@ func TestM20ControlFileIs0600AndConsumedBeforeLaunch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !req.Detach || len(req.Argv) != 1 || req.Argv[0] != "/bin/true" {
+	if !req.Detach || len(req.Argv) != 1 || req.Argv[0] != "/bin/true" || req.ResourceSignature != "sig" || req.MemoryReserveOverride == nil || *req.MemoryReserveOverride != override || req.MemoryReserveBasis != "estimate:max=60,n=3,f=115" {
 		t.Fatalf("control request = %+v", req)
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
@@ -381,6 +383,72 @@ func TestM20LaunchFlockIsHeldThroughStartAttempt(t *testing.T) {
 	_ = ackW.Close()
 	if err := <-done; err == nil || !checked {
 		t.Fatalf("launch err=%v checked=%v", err, checked)
+	}
+}
+
+func TestDetachedRecordStampsEffectiveAdmissionOverrideAfterAdmit(t *testing.T) {
+	r, _ := newMemoryRunner(t, nil)
+	r.memorySlice = currentSliceForTest(t)
+	r.memoryReserve = 40
+	r.sliceMemory = func(string) (int64, int64, bool, string) { return 0, 100, true, "" }
+	r.clock = newInstantClock()
+	r.startFn = func(*exec.Cmd) error { return errors.New("injected after detached admission") }
+	override := int64(70)
+	readyR, readyW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ackR, ackW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := Request{
+		Argv:                  []string{"/bin/true"},
+		Detach:                true,
+		ResourceSignature:     "sig",
+		MemoryReserveOverride: &override,
+		MemoryReserveBasis:    "estimate:max=60,n=3,f=115",
+		detachReady:           &detachSignal{file: readyW},
+		detachAck:             ackR,
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, launchErr := r.Launch(context.Background(), req)
+		result <- launchErr
+	}()
+	var ready detachReadyMessage
+	if err := json.NewDecoder(readyR).Decode(&ready); err != nil || ready.ID == "" {
+		t.Fatalf("readiness=%+v err=%v", ready, err)
+	}
+	if _, err := ackW.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	_ = ackW.Close()
+	if err := <-result; err == nil {
+		t.Fatal("injected detached start failure did not propagate")
+	}
+	record, err := r.Get(ready.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.ResourceSignature != "sig" || record.AdmissionReserve == nil || *record.AdmissionReserve != override || record.AdmissionReserveBasis != "estimate:max=60,n=3,f=115" {
+		t.Fatalf("detached record=%+v", record)
+	}
+	if err := r.ledger.project(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", r.ledger.projection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var signature, basis string
+	var reserve int64
+	if err := db.QueryRow(`SELECT resource_signature,admission_reserve,admission_reserve_basis FROM runs WHERE id=?`, ready.ID).Scan(&signature, &reserve, &basis); err != nil {
+		t.Fatal(err)
+	}
+	if signature != "sig" || reserve != override || basis != "estimate:max=60,n=3,f=115" {
+		t.Fatalf("detached columns signature=%q reserve=%d basis=%q", signature, reserve, basis)
 	}
 }
 

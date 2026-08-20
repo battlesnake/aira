@@ -199,6 +199,32 @@ func TestPrefixValidationRejectsAmbiguousDelimiter(t *testing.T) {
 	}
 }
 
+func TestEffectivePrefixReplacesConfiguredOnlyWhenRequestedIsNonNil(t *testing.T) {
+	tests := []struct {
+		name       string
+		configured []string
+		requested  []string
+		want       []string
+	}{
+		{name: "nil uses configured", configured: []string{"valgrind"}, want: []string{"valgrind"}},
+		{name: "non-nil replaces configured", configured: []string{"valgrind"}, requested: []string{"timeout", "600"}, want: []string{"timeout", "600"}},
+		{name: "non-nil empty suppresses configured", configured: []string{"valgrind"}, requested: []string{}, want: []string{}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := EffectivePrefix(test.configured, test.requested)
+			if err != nil || len(got) != len(test.want) {
+				t.Fatalf("EffectivePrefix()=%q, %v; want %q", got, err, test.want)
+			}
+			for i := range test.want {
+				if got[i] != test.want[i] {
+					t.Fatalf("EffectivePrefix()=%q, %v; want %q", got, err, test.want)
+				}
+			}
+		})
+	}
+}
+
 func TestEffectiveArgvPreservesTargetOptionTokensWithoutShell(t *testing.T) {
 	got, err := EffectiveArgv([]string{"agentmux", "run", "--"}, []string{"tool", "--literal", "$(not-shell)", ""})
 	if err != nil {

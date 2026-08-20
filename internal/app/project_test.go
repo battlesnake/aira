@@ -71,20 +71,39 @@ func TestOpenWiresNonemptyWorktreeOwnerIntoRunner(t *testing.T) {
 }
 
 func TestRunAdmissionConfigParsesBytesAndDuration(t *testing.T) {
-	reserve, maxWait, err := parsedRunAdmission(RunConfig{Slice: "whale.slice", MemoryHeadroom: "4G", AdmissionMaxWait: "30m"})
+	reserve, maxWait, estimate, err := parsedRunAdmission(RunConfig{Slice: "whale.slice", MemoryHeadroom: "4G", AdmissionMaxWait: "30m", MemoryEstimate: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reserve != 4*1024*1024*1024 || maxWait != 30*time.Minute {
-		t.Fatalf("reserve=%d maxWait=%s", reserve, maxWait)
+	if reserve != 4*1024*1024*1024 || maxWait != 30*time.Minute || !estimate {
+		t.Fatalf("reserve=%d maxWait=%s estimate=%v", reserve, maxWait, estimate)
 	}
-	reserve, _, err = parsedRunAdmission(RunConfig{Slice: "whale.slice", MemoryHeadroom: "1073741824"})
+	reserve, _, estimate, err = parsedRunAdmission(RunConfig{Slice: "whale.slice", MemoryHeadroom: "1073741824"})
 	if err != nil || reserve != 1024*1024*1024 {
 		t.Fatalf("plain bytes reserve=%d err=%v", reserve, err)
 	}
-	reserve, _, err = parsedRunAdmission(RunConfig{Slice: "whale.slice", MemoryHeadroom: "512M"})
+	if estimate {
+		t.Fatal("memory estimate defaulted on")
+	}
+	reserve, _, _, err = parsedRunAdmission(RunConfig{Slice: "whale.slice", MemoryHeadroom: "512M"})
 	if err != nil || reserve != 512*1024*1024 {
 		t.Fatalf("megabytes reserve=%d err=%v", reserve, err)
+	}
+}
+
+func TestRunMemoryEstimateRequiresAdmissionAndCapsHeadroom(t *testing.T) {
+	for name, run := range map[string]RunConfig{
+		"without admission":           {MemoryEstimate: true},
+		"headroom above estimate cap": {Slice: "whale.slice", MemoryHeadroom: "1125899906842625", MemoryEstimate: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, _, err := parsedRunAdmission(run); err == nil || !strings.HasPrefix(err.Error(), "E_CONFIG_INVALID:") {
+				t.Fatalf("parsedRunAdmission(%+v) error=%v", run, err)
+			}
+		})
+	}
+	if reserve, _, estimate, err := parsedRunAdmission(RunConfig{Slice: "whale.slice", MemoryHeadroom: "1125899906842624", MemoryEstimate: true}); err != nil || reserve != 1<<50 || !estimate {
+		t.Fatalf("cap boundary reserve=%d estimate=%v err=%v", reserve, estimate, err)
 	}
 }
 

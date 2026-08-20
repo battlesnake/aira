@@ -219,7 +219,10 @@ func validatePrefix(prefix []string) ([]string, error) {
 	return prefix, nil
 }
 
-func effectivePrefix(configured, requested []string) ([]string, error) {
+// EffectivePrefix selects the requested launch prefix when it is non-nil;
+// otherwise it selects the configured prefix. A non-nil empty request
+// deliberately suppresses a configured prefix.
+func EffectivePrefix(configured, requested []string) ([]string, error) {
 	if requested == nil {
 		requested = configured
 	}

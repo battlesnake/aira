@@ -25,6 +25,9 @@ func mergeEvidence(base, candidate RunRecord) RunRecord {
 	if candidate.Tool != "" {
 		base.Tool = candidate.Tool
 	}
+	if candidate.ResourceSignature != "" {
+		base.ResourceSignature = candidate.ResourceSignature
+	}
 	if candidate.PIDIdentity.PID != 0 {
 		base.PIDIdentity = candidate.PIDIdentity
 	}
@@ -60,6 +63,8 @@ func mergeEvidence(base, candidate RunRecord) RunRecord {
 		base.Admission = candidate.Admission
 		base.AdmissionReason = candidate.AdmissionReason
 		base.AdmissionWaitedMS = candidate.AdmissionWaitedMS
+		base.AdmissionReserve = candidate.AdmissionReserve
+		base.AdmissionReserveBasis = candidate.AdmissionReserveBasis
 	}
 	base.CaptureComplete = candidate.CaptureComplete
 	base.CaptureForcedClosed = candidate.CaptureForcedClosed

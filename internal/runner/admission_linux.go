@@ -104,11 +104,15 @@ func (r *Runner) admit(ctx context.Context, req Request) (admissionResult, error
 	if req.NoAdmit {
 		return admissionResult{state: "bypassed"}, nil
 	}
+	effectiveReserve := r.memoryReserve
+	if req.MemoryReserveOverride != nil && *req.MemoryReserveOverride > 0 {
+		effectiveReserve = *req.MemoryReserveOverride
+	}
 	if r.memorySlice == "" || r.memoryReserve == 0 {
 		return admissionResult{state: "disabled"}, nil
 	}
 	start := r.clock.Now()
-	if result, granted, err := r.admitThroughDaemon(ctx, req); granted || err != nil {
+	if result, granted, err := r.admitThroughDaemon(ctx, req, effectiveReserve); granted || err != nil {
 		return result, err
 	}
 	path, ok, reason := resolveSlicePath(r.memorySlice)
@@ -116,12 +120,12 @@ func (r *Runner) admit(ctx context.Context, req Request) (admissionResult, error
 		r.warnAdmission("unevaluated", reason)
 		return admissionResult{state: "unevaluated", reason: reason}, nil
 	}
-	return r.admitWithFlock(ctx, req, path, start)
+	return r.admitWithFlock(ctx, req, path, start, effectiveReserve)
 }
 
 // admitWithFlock is the retained #29 self-gating implementation. Every daemon
 // failure closes its socket before entering this one fallback path.
-func (r *Runner) admitWithFlock(ctx context.Context, req Request, path string, start time.Time) (admissionResult, error) {
+func (r *Runner) admitWithFlock(ctx context.Context, req Request, path string, start time.Time, effectiveReserve int64) (admissionResult, error) {
 	// Time already spent waiting on a responsive-but-incomplete daemon outcome
 	// belongs to this admission attempt. Ignore sub-millisecond dial failures so
 	// an immediately acquired fallback lock remains "immediate".
@@ -156,7 +160,7 @@ func (r *Runner) admitWithFlock(ctx context.Context, req Request, path string, s
 			r.warnAdmission("unevaluated", reason)
 			return finish("unevaluated", reason, nil), nil
 		}
-		if max-cur >= r.memoryReserve {
+		if max-cur >= effectiveReserve {
 			lockAttempt := r.lockAttemptFn
 			if lockAttempt == nil {
 				lockAttempt = tryAdmissionLock
@@ -170,7 +174,7 @@ func (r *Runner) admitWithFlock(ctx context.Context, req Request, path string, s
 					r.warnAdmission("unevaluated", reason2)
 					return finish("unevaluated", reason2, nil), nil
 				}
-				if max2-cur2 >= r.memoryReserve {
+				if max2-cur2 >= effectiveReserve {
 					state := "immediate"
 					if waited {
 						state = "waited"
@@ -194,7 +198,7 @@ func (r *Runner) admitWithFlock(ctx context.Context, req Request, path string, s
 		}
 		waited = true
 		if now.Sub(lastNote) >= 30*time.Second {
-			r.noteAdmission(cur, max)
+			r.noteAdmission(cur, max, effectiveReserve)
 			lastNote = now
 		}
 		delay := jitteredPoll(r.pollInterval, iteration)
@@ -216,7 +220,7 @@ func (r *Runner) admitWithFlock(ctx context.Context, req Request, path string, s
 	}
 }
 
-func (r *Runner) admitThroughDaemon(ctx context.Context, req Request) (admissionResult, bool, error) {
+func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveReserve int64) (admissionResult, bool, error) {
 	dial := r.admitDialFn
 	if dial == nil {
 		if strings.TrimSpace(r.admitSocketPath) == "" {
@@ -316,7 +320,7 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request) (admission
 	frame := runnerAdmitRequestFrame{Proto: runnerDaemonProtocolVersion, Scope: map[string]any{}}
 	frame.Request.Verb = "admit"
 	frame.Request.Args = map[string]any{
-		"slice": r.memorySlice, "reserve": r.memoryReserve,
+		"slice": r.memorySlice, "reserve": effectiveReserve,
 		"max_wait_ms": maxWait.Milliseconds(),
 	}
 	if err := writeRunnerAdmitFrame(conn, frame); err != nil {
@@ -445,9 +449,9 @@ func jitteredPoll(interval time.Duration, iteration uint64) time.Duration {
 	}
 }
 
-func (r *Runner) noteAdmission(cur, max int64) {
+func (r *Runner) noteAdmission(cur, max, effectiveReserve int64) {
 	if r.diagnostics != nil {
-		_, _ = fmt.Fprintf(r.diagnostics, "aira: memory admission waiting: current=%d max=%d reserve=%d\n", cur, max, r.memoryReserve)
+		_, _ = fmt.Fprintf(r.diagnostics, "aira: memory admission waiting: current=%d max=%d reserve=%d\n", cur, max, effectiveReserve)
 	}
 }
 

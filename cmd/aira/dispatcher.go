@@ -223,9 +223,9 @@ func (d *daemonDispatcher) dispatchCarved(ctx context.Context, request core.Requ
 	project.Runner.SetAdmitSocketPath(d.paths.SocketPath)
 	project.Runner.SetInputRuntimeDir(d.paths.RuntimeDir)
 	face := core.FaceOutput{Stdout: d.stdout, Stderr: d.diagnostics, Live: (request.Verb == "run" || request.Verb == "git" || request.Verb == "time") && !d.jsonOutput}
-	dispatcher := core.NewWithRunnerFace(s, project.Runner, d.stdin, face).WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix)
+	dispatcher := core.NewWithRunnerFace(s, project.Runner, d.stdin, face).WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix).WithMemoryEstimate(project.Config.Run.MemoryEstimate)
 	if d.outputCap > 0 {
-		dispatcher = core.NewWithRunnerFace(s, project.Runner, d.stdin, face).WithOutputCap(d.outputCap).WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix)
+		dispatcher = core.NewWithRunnerFace(s, project.Runner, d.stdin, face).WithOutputCap(d.outputCap).WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix).WithMemoryEstimate(project.Config.Run.MemoryEstimate)
 	}
 	return dispatcher.Do(ctx, request)
 }
@@ -442,9 +442,9 @@ func (d *inProcessDispatcher) Dispatch(ctx context.Context, scope daemon.Worktre
 	}
 	canonical := core.CanonicalVerb(request.Verb)
 	face := core.FaceOutput{Stdout: d.stdout, Stderr: d.diagnostics, Live: (canonical == "run" || canonical == "git" || canonical == "time") && !d.jsonOutput}
-	dispatcher := core.NewWithRunnerFace(s, project.Runner, d.stdin, face).WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix)
+	dispatcher := core.NewWithRunnerFace(s, project.Runner, d.stdin, face).WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix).WithMemoryEstimate(project.Config.Run.MemoryEstimate)
 	if d.outputCap > 0 {
-		dispatcher = core.NewWithRunnerFace(s, project.Runner, d.stdin, face).WithOutputCap(d.outputCap).WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix)
+		dispatcher = core.NewWithRunnerFace(s, project.Runner, d.stdin, face).WithOutputCap(d.outputCap).WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix).WithMemoryEstimate(project.Config.Run.MemoryEstimate)
 	}
 	return dispatcher.Do(ctx, request)
 }

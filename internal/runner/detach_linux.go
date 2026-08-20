@@ -172,10 +172,11 @@ func (r *Runner) launchDetachedValidated(ctx context.Context, req Request, prefi
 	if err != nil {
 		return nil, launchErr("E_RUN_RECONCILE_REQUIRED", err)
 	}
+	admissionReserve, admissionReserveBasis := r.admissionProvenance(req)
 	record := RunRecord{
 		SchemaVersion: ledgerSchema, ID: id, Owner: r.owner, Ticket: req.Ticket, Phase: req.Phase, Label: req.Label, Tool: req.Tool,
 		Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, Buffering: buffering, Merge: req.Merge,
-		Admission: "disabled", LaunchPrefix: append([]string(nil), prefix...), CgroupScope: r.intendedScope(id), StartedAt: nowString(r.now),
+		Admission: "disabled", ResourceSignature: req.ResourceSignature, AdmissionReserve: admissionReserve, AdmissionReserveBasis: admissionReserveBasis, LaunchPrefix: append([]string(nil), prefix...), CgroupScope: r.intendedScope(id), StartedAt: nowString(r.now),
 		Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}, Detached: true, StdinConnect: req.StdinConnect, SupervisorPID: supervisor,
 		Telemetry: req.TelemetryPending,
 	}
@@ -215,6 +216,7 @@ func (r *Runner) launchDetachedValidated(ctx context.Context, req Request, prefi
 	}
 	releaseAdmit := admission.releaseAdmission
 	record.Admission, record.AdmissionReason, record.AdmissionWaitedMS = admission.state, admission.reason, admission.waitedMS
+	record.AdmissionReserve, record.AdmissionReserveBasis = r.admissionProvenance(req)
 	lock, err := lockFile(filepath.Join(filepath.Dir(r.ledger.ledger), id+".lock"))
 	if err != nil {
 		releaseAdmit()

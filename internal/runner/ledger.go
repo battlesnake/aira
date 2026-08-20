@@ -502,15 +502,18 @@ func (l *ledger) project(ctx context.Context) error {
 	if _, err = db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, terminal INTEGER NOT NULL, record_json BLOB NOT NULL)`); err != nil {
 		return err
 	}
-	for column, kind := range map[string]string{"owner": "TEXT", "stolen_by": "TEXT", "peak_rss": "INTEGER", "cpu_user": "INTEGER", "cpu_sys": "INTEGER", "admission": "TEXT", "admission_reason": "TEXT", "admission_waited_ms": "INTEGER", "telemetry": "TEXT", "telemetry_refs": "BLOB"} {
+	for column, kind := range map[string]string{"owner": "TEXT", "stolen_by": "TEXT", "peak_rss": "INTEGER", "cpu_user": "INTEGER", "cpu_sys": "INTEGER", "admission": "TEXT", "admission_reason": "TEXT", "admission_waited_ms": "INTEGER", "telemetry": "TEXT", "telemetry_refs": "BLOB", "resource_signature": "TEXT", "admission_reserve": "INTEGER", "admission_reserve_basis": "TEXT"} {
 		if err := ensureRunColumn(ctx, db, column, kind); err != nil {
 			return err
 		}
 	}
+	if _, err = db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS runs_resource_signature ON runs(resource_signature)`); err != nil {
+		return err
+	}
 	for _, r := range runs {
 		data, _ := json.Marshal(r)
 		refs, _ := json.Marshal(r.TelemetryRefs)
-		if _, err = db.ExecContext(ctx, `INSERT INTO runs(id,status,terminal,record_json,owner,stolen_by,peak_rss,cpu_user,cpu_sys,admission,admission_reason,admission_waited_ms,telemetry,telemetry_refs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,terminal=excluded.terminal,record_json=excluded.record_json,owner=excluded.owner,stolen_by=excluded.stolen_by,peak_rss=excluded.peak_rss,cpu_user=excluded.cpu_user,cpu_sys=excluded.cpu_sys,admission=excluded.admission,admission_reason=excluded.admission_reason,admission_waited_ms=excluded.admission_waited_ms,telemetry=excluded.telemetry,telemetry_refs=excluded.telemetry_refs`, r.ID, r.Status, r.Status.Terminal(), data, nullableString(r.Owner), nullableString(r.StolenBy), nullableMetric(r.PeakRSS), nullableMetric(r.CPUUser), nullableMetric(r.CPUSys), r.Admission, nullableString(r.AdmissionReason), r.AdmissionWaitedMS, nullableString(r.Telemetry), refs); err != nil {
+		if _, err = db.ExecContext(ctx, `INSERT INTO runs(id,status,terminal,record_json,owner,stolen_by,peak_rss,cpu_user,cpu_sys,admission,admission_reason,admission_waited_ms,telemetry,telemetry_refs,resource_signature,admission_reserve,admission_reserve_basis) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,terminal=excluded.terminal,record_json=excluded.record_json,owner=excluded.owner,stolen_by=excluded.stolen_by,peak_rss=excluded.peak_rss,cpu_user=excluded.cpu_user,cpu_sys=excluded.cpu_sys,admission=excluded.admission,admission_reason=excluded.admission_reason,admission_waited_ms=excluded.admission_waited_ms,telemetry=excluded.telemetry,telemetry_refs=excluded.telemetry_refs,resource_signature=excluded.resource_signature,admission_reserve=excluded.admission_reserve,admission_reserve_basis=excluded.admission_reserve_basis`, r.ID, r.Status, r.Status.Terminal(), data, nullableString(r.Owner), nullableString(r.StolenBy), nullableMetric(r.PeakRSS), nullableMetric(r.CPUUser), nullableMetric(r.CPUSys), r.Admission, nullableString(r.AdmissionReason), r.AdmissionWaitedMS, nullableString(r.Telemetry), refs, nullableString(r.ResourceSignature), nullableMetric(r.AdmissionReserve), nullableString(r.AdmissionReserveBasis)); err != nil {
 			return err
 		}
 	}

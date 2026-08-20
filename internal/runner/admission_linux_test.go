@@ -5,6 +5,7 @@ package runner
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -238,6 +239,10 @@ func TestAdmissionT1FailOpenReasonsAndDisabled(t *testing.T) {
 	if result, err := (&Runner{}).admit(context.Background(), Request{}); err != nil || result.state != "disabled" {
 		t.Fatalf("disabled result=%+v err=%v", result, err)
 	}
+	override := int64(70)
+	if result, err := (&Runner{}).admit(context.Background(), Request{MemoryReserveOverride: &override}); err != nil || result.state != "disabled" {
+		t.Fatalf("override enabled statically-disabled admission: result=%+v err=%v", result, err)
+	}
 	for _, reason := range []string{"slice-not-found", "read-error", "unbounded", "parse-error"} {
 		t.Run(reason, func(t *testing.T) {
 			var diagnostics bytes.Buffer
@@ -367,6 +372,46 @@ func TestAdmissionT4ExactFakeClockTimeout(t *testing.T) {
 	if err != nil || result.state != "timeout" || clock.Now().Sub(start) != 25*time.Millisecond || result.waitedMS != 25 || result.lock != nil {
 		t.Fatalf("result=%+v elapsed=%s err=%v", result, clock.Now().Sub(start), err)
 	}
+}
+
+func TestAdmissionOverrideControlsBothFlockChecksAndDiagnostic(t *testing.T) {
+	override := int64(70)
+	t.Run("pre-lock threshold", func(t *testing.T) {
+		clock := newInstantClock()
+		var lockAttempts atomic.Int64
+		var diagnostics bytes.Buffer
+		r, _ := gateOnlyRunner(t, clock, func(string) (int64, int64, bool, string) { return 40, 100, true, "" })
+		r.admissionMaxWait = time.Millisecond
+		r.diagnostics = &diagnostics
+		r.lockAttemptFn = func(string) (*admitLock, error) {
+			lockAttempts.Add(1)
+			return &admitLock{}, nil
+		}
+		result, err := r.admit(context.Background(), Request{MemoryReserveOverride: &override})
+		if err != nil || result.state != "timeout" || lockAttempts.Load() != 0 {
+			t.Fatalf("result=%+v lockAttempts=%d err=%v", result, lockAttempts.Load(), err)
+		}
+		if !strings.Contains(diagnostics.String(), "reserve=70") || strings.Contains(diagnostics.String(), "reserve=40") {
+			t.Fatalf("diagnostic=%q", diagnostics.String())
+		}
+	})
+
+	t.Run("under-lock threshold", func(t *testing.T) {
+		clock := newInstantClock()
+		var reads atomic.Int64
+		r, _ := gateOnlyRunner(t, clock, func(string) (int64, int64, bool, string) {
+			if reads.Add(1)%2 == 1 {
+				return 0, 100, true, ""
+			}
+			return 40, 100, true, ""
+		})
+		r.admissionMaxWait = time.Millisecond
+		r.lockAttemptFn = func(string) (*admitLock, error) { return &admitLock{}, nil }
+		result, err := r.admit(context.Background(), Request{MemoryReserveOverride: &override})
+		if err != nil || result.state != "timeout" || reads.Load() < 2 {
+			t.Fatalf("result=%+v reads=%d err=%v", result, reads.Load(), err)
+		}
+	})
 }
 
 func TestAdmissionPersistentEINTRUsesBoundedOuterLoop(t *testing.T) {
@@ -1015,6 +1060,122 @@ func TestDaemonAdmitGrantStatesRemainByteIdentical(t *testing.T) {
 			t.Fatalf("%s result=%+v err=%v", state, result, err)
 		}
 	}
+}
+
+func TestDaemonAdmitFrameUsesOverrideReserve(t *testing.T) {
+	positive, zero, negative := int64(70), int64(0), int64(-1)
+	for _, test := range []struct {
+		name     string
+		override *int64
+		want     int64
+	}{
+		{name: "nil preserves static", want: 40},
+		{name: "positive replaces static", override: &positive, want: positive},
+		{name: "zero preserves static", override: &zero, want: 40},
+		{name: "negative preserves static", override: &negative, want: 40},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			r, _ := gateOnlyRunner(t, newInstantClock(), func(string) (int64, int64, bool, string) { return 0, 100, true, "" })
+			client, server := net.Pipe()
+			r.admitDialFn = func(context.Context, string) (net.Conn, error) { return client, nil }
+			reserveCh := make(chan int64, 1)
+			go func() {
+				defer server.Close()
+				var request runnerAdmitRequestFrame
+				if err := readRunnerAdmitFrame(server, &request); err != nil {
+					return
+				}
+				reserve, _ := request.Request.Args["reserve"].(float64)
+				reserveCh <- int64(reserve)
+				data, _ := json.Marshal(runnerAdmitGrant{State: "immediate"})
+				_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{OK: true, Code: "OK", Data: data})
+				var one [1]byte
+				_, _ = server.Read(one[:])
+			}()
+			result, err := r.admit(context.Background(), Request{MemoryReserveOverride: test.override})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer result.releaseAdmission()
+			if got := <-reserveCh; got != test.want {
+				t.Fatalf("daemon reserve=%d want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestAdmissionProvenanceStampedOnForegroundRecords(t *testing.T) {
+	path := currentSliceForTest(t)
+	newRunner := func(t *testing.T, configured bool) *Runner {
+		t.Helper()
+		cfg := Config{CommonDir: t.TempDir(), Backend: &memoryBackend{scope: &memoryScope{}}, Clock: newInstantClock()}
+		if configured {
+			cfg.MemorySlice, cfg.MemoryReserve = path, 40
+			cfg.sliceMemoryFn = func(string) (int64, int64, bool, string) { return 0, 100, true, "" }
+		}
+		r, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	for _, test := range []struct {
+		name       string
+		configured bool
+		request    Request
+		want       *int64
+		basis      string
+	}{
+		{name: "override", configured: true, request: Request{Argv: []string{"/bin/true"}, ResourceSignature: "sig", MemoryReserveOverride: int64Pointer(70), MemoryReserveBasis: "estimate:max=60,n=3,f=115"}, want: int64Pointer(70), basis: "estimate:max=60,n=3,f=115"},
+		{name: "static nil override", configured: true, request: Request{Argv: []string{"/bin/true"}, ResourceSignature: "sig"}, want: int64Pointer(40)},
+		{name: "no admit", configured: true, request: Request{Argv: []string{"/bin/true"}, ResourceSignature: "sig", NoAdmit: true}, basis: "disabled:no-admit"},
+		{name: "disabled config", request: Request{Argv: []string{"/bin/true"}, ResourceSignature: "sig"}, basis: "disabled:config"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			r := newRunner(t, test.configured)
+			r.startFn = func(*exec.Cmd) error { return errors.New("injected after record construction") }
+			if _, err := r.Launch(context.Background(), test.request); err == nil {
+				t.Fatal("injected launch failure was not returned")
+			}
+			record, err := r.Get("RUN-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if record.ResourceSignature != "sig" || record.AdmissionReserveBasis != test.basis || !equalInt64Pointer(record.AdmissionReserve, test.want) {
+				t.Fatalf("record signature=%q reserve=%v basis=%q", record.ResourceSignature, record.AdmissionReserve, record.AdmissionReserveBasis)
+			}
+			if err := r.ledger.project(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			var signature, basis sql.NullString
+			var reserve sql.NullInt64
+			var recordJSON []byte
+			db, err := sql.Open("sqlite", r.ledger.projection)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if err := db.QueryRow(`SELECT resource_signature,admission_reserve,admission_reserve_basis,record_json FROM runs WHERE id=?`, record.ID).Scan(&signature, &reserve, &basis, &recordJSON); err != nil {
+				t.Fatal(err)
+			}
+			if !signature.Valid || signature.String != "sig" || reserve.Valid != (test.want != nil) || reserve.Valid && reserve.Int64 != *test.want || basis.Valid != (test.basis != "") || basis.Valid && basis.String != test.basis {
+				t.Fatalf("columns signature=%v reserve=%v basis=%v", signature, reserve, basis)
+			}
+			var projected RunRecord
+			if err := json.Unmarshal(recordJSON, &projected); err != nil {
+				t.Fatal(err)
+			}
+			if projected.ResourceSignature != "sig" || projected.AdmissionReserveBasis != test.basis || !equalInt64Pointer(projected.AdmissionReserve, test.want) {
+				t.Fatalf("record_json signature=%q reserve=%v basis=%q", projected.ResourceSignature, projected.AdmissionReserve, projected.AdmissionReserveBasis)
+			}
+		})
+	}
+}
+
+func int64Pointer(value int64) *int64 { return &value }
+
+func equalInt64Pointer(left, right *int64) bool {
+	return left == nil && right == nil || left != nil && right != nil && *left == *right
 }
 
 func TestDaemonAdmitStatesAreByteIdenticalOnRunRecord(t *testing.T) {

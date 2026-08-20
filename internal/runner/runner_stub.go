@@ -17,6 +17,7 @@ type Runner struct {
 	owner                           string
 	backend                         ScopeBackend
 	reportMaxBytes                  int64
+	memoryReserve                   int64
 	inputRuntimeDir                 string
 	supervisorLeaseReaderConfigured bool
 }
@@ -46,10 +47,12 @@ func New(cfg Config) (*Runner, error) {
 	if backend == nil {
 		backend = newDefaultBackend(cfg.CgroupParent)
 	}
-	return &Runner{ledger: l, outputDir: output, owner: cfg.Owner, backend: backend, reportMaxBytes: cfg.ReportMaxBytes, inputRuntimeDir: cfg.InputRuntimeDir}, nil
+	return &Runner{ledger: l, outputDir: output, owner: cfg.Owner, backend: backend, reportMaxBytes: cfg.ReportMaxBytes, memoryReserve: cfg.MemoryReserve, inputRuntimeDir: cfg.InputRuntimeDir}, nil
 }
 
 func (r *Runner) ReportMaxBytes() int64 { return r.reportMaxBytes }
+
+func (r *Runner) MemoryReserve() int64 { return r.memoryReserve }
 
 func (r *Runner) SetInputRuntimeDir(path string) { r.inputRuntimeDir = path }
 

@@ -186,6 +186,24 @@ func (r *Runner) boundedRunLock(path string) (*os.File, error) {
 
 func (r *Runner) ReportMaxBytes() int64 { return r.reportMaxBytes }
 
+// MemoryReserve reports the configured fixed admission reserve. Core uses it
+// only as the estimate fallback and OOM floor.
+func (r *Runner) MemoryReserve() int64 { return r.memoryReserve }
+
+func (r *Runner) admissionProvenance(req Request) (*int64, string) {
+	if req.NoAdmit {
+		return nil, "disabled:no-admit"
+	}
+	if r.memorySlice == "" || r.memoryReserve == 0 {
+		return nil, "disabled:config"
+	}
+	effectiveReserve := r.memoryReserve
+	if req.MemoryReserveOverride != nil && *req.MemoryReserveOverride > 0 {
+		effectiveReserve = *req.MemoryReserveOverride
+	}
+	return &effectiveReserve, req.MemoryReserveBasis
+}
+
 // DetachOutputDir identifies the directory in which a launcher may place an
 // opaque, launch-window sidecar. Runner only receives and plumbs its path.
 func (r *Runner) DetachOutputDir() string { return r.outputDir }
@@ -230,7 +248,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if req.PTY {
 		req.Merge = true
 	}
-	prefix, err := effectivePrefix(r.prefix, req.Prefix)
+	prefix, err := EffectivePrefix(r.prefix, req.Prefix)
 	if err != nil {
 		return nil, launchErr("E_RUN_PREFIX_INVALID", err)
 	}
@@ -345,9 +363,10 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 			return nil, launchErr("E_RUN_RECONCILE_REQUIRED", err)
 		}
 		started := nowString(r.now)
+		admissionReserve, admissionReserveBasis := r.admissionProvenance(req)
 		// Containment is not an initial assumption. Until the leader is positively
 		// observed in cgroup.procs, the durable record must remain non-contained.
-		record = RunRecord{SchemaVersion: ledgerSchema, ID: id, Owner: r.owner, Ticket: req.Ticket, Phase: req.Phase, Label: req.Label, Tool: req.Tool, Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, Buffering: buffering, Merge: req.Merge, Admission: admission.state, AdmissionReason: admission.reason, AdmissionWaitedMS: admission.waitedMS, LaunchPrefix: append([]string(nil), prefix...), StartedAt: started, Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}, Detached: req.Detach, Telemetry: req.TelemetryPending}
+		record = RunRecord{SchemaVersion: ledgerSchema, ID: id, Owner: r.owner, Ticket: req.Ticket, Phase: req.Phase, Label: req.Label, Tool: req.Tool, Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, Buffering: buffering, Merge: req.Merge, Admission: admission.state, AdmissionReason: admission.reason, AdmissionWaitedMS: admission.waitedMS, ResourceSignature: req.ResourceSignature, AdmissionReserve: admissionReserve, AdmissionReserveBasis: admissionReserveBasis, LaunchPrefix: append([]string(nil), prefix...), StartedAt: started, Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}, Detached: req.Detach, Telemetry: req.TelemetryPending}
 		if req.Detach {
 			record.SupervisorPID = PIDIdentity{PID: os.Getpid(), StartTick: processStartTick(os.Getpid()), BootID: bootID}
 			if record.SupervisorPID.StartTick == 0 {

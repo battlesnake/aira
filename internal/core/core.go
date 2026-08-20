@@ -309,6 +309,8 @@ type Core struct {
 	reportMaxBytes int64
 	face           FaceOutput
 	commandPrefix  []string
+	memoryEstimate bool
+	memoryHeadroom int64
 	verbs          map[string]verbSpec
 }
 
@@ -419,6 +421,20 @@ func (c *Core) WithGitOps(g GitOps) *Core {
 // construction.
 func (c *Core) WithCommandPrefix(prefix []string) *Core {
 	c.commandPrefix = append([]string(nil), prefix...)
+	return c
+}
+
+type memoryReserveRunner interface{ MemoryReserve() int64 }
+
+// WithMemoryEstimate enables the opt-in peak-RSS admission estimate. The
+// concrete runner supplies the configured fixed headroom used for fallbacks
+// and as the OOM floor.
+func (c *Core) WithMemoryEstimate(enabled bool) *Core {
+	c.memoryEstimate = enabled
+	c.memoryHeadroom = 0
+	if configured, ok := c.runner.(memoryReserveRunner); ok {
+		c.memoryHeadroom = configured.MemoryReserve()
+	}
 	return c
 }
 
@@ -1455,6 +1471,30 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				Prefix: stringSlice(args, "prefix"), Merge: boolArg(args, "merge"), Realtime: boolArg(args, "realtime"), PTY: boolArg(args, "pty"), StdinPath: stringArg(args, "stdin"),
 				StoreStdin: boolArg(args, "store_stdin"), NoAdmit: boolArg(args, "no_admit"), Timeout: timeout,
 				Detach: boolArg(args, "detach"), StdinConnect: boolArg(args, "stdin_connect"),
+			}
+			if c.memoryEstimate {
+				signature, signatureErr := resourceSignature(c.commandPrefix, request.Prefix, request.Argv)
+				if signatureErr == nil {
+					request.ResourceSignature = signature
+					historian, ok := c.runner.(runner.PeakRSSHistorian)
+					if !ok {
+						request.MemoryReserveBasis = "fallback:read-error"
+					} else {
+						stats, _, readErr := historian.PeakRSSHistory(ctx, signature)
+						if readErr != nil {
+							request.MemoryReserveBasis = "fallback:read-error"
+							if errors.Is(readErr, context.DeadlineExceeded) {
+								request.MemoryReserveBasis = "fallback:read-timeout"
+							}
+						} else {
+							reserve, override, basis := estimateReserve(stats, c.memoryHeadroom)
+							request.MemoryReserveBasis = basis
+							if override {
+								request.MemoryReserveOverride = &reserve
+							}
+						}
+					}
+				}
 			}
 			if request.StdinConnect && (!request.Detach || request.PTY || request.StdinPath != "" || noStdin || request.StoreStdin) {
 				return nil, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("--stdin-connect requires --detach and is incompatible with --stdin, --no-stdin, --pty, and --store-stdin"))
