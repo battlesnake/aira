@@ -50,8 +50,6 @@ func TestTUIKeypressAndQuitWhileFetchAndQueueUpdateAreInFlight(t *testing.T) {
 	screen := tcell.NewSimulationScreen("UTF-8")
 	screen.SetSize(100, 30)
 	runtime := newTUIRuntime(ctx, dispatcher, daemon.WorktreeScope{}, screen)
-	queueUpdateStarted := make(chan struct{})
-	runtime.queueUpdateStarted = queueUpdateStarted
 	drawn := make(chan struct{})
 	var drawOnce sync.Once
 	runtime.app.SetAfterDrawFunc(func(tcell.Screen) { drawOnce.Do(func() { close(drawn) }) })
@@ -89,40 +87,52 @@ waitDirty:
 		t.Fatalf("inline refresh state=%#v", panel)
 	}
 
-	// Hold the q handler on the UI goroutine until the pump is synchronously
-	// blocked in QueueUpdateDraw behind it. A quit implementation that joins on
-	// the UI goroutine deadlocks this exact ordering.
-	qEntered := make(chan struct{})
-	releaseQ := make(chan struct{})
-	runtime.app.QueueUpdate(func() {
-		runtime.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-			if event.Key() == tcell.KeyRune && event.Rune() == 'q' {
-				close(qEntered)
-				<-releaseQ
-			}
-			return runtime.captureInput(event)
-		})
-	})
+	// Quit while a fetch is still in flight (tickets is InFlight+Dirty above). The
+	// full quit path must complete cleanly: the q handler marks+cancels+returns on
+	// the UI goroutine, and a SEPARATE coordinator joins the pump/executor then
+	// Stops — it must never join on the UI goroutine (that would deadlock). The
+	// pump-blocked-in-QueueUpdateDraw release is proven deterministically by
+	// TestPumpExitsOnCancelWhenUILoopAbsent.
 	screen.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
-	select {
-	case <-qEntered:
-	case <-time.After(time.Second):
-		t.Fatal("q did not enter the UI handler")
-	}
-	runtime.executor.messages <- tuiMessage{Kind: msgWatchBatch, Cursor: 1}
-	select {
-	case <-queueUpdateStarted:
-	case <-time.After(time.Second):
-		t.Fatal("pump did not enter QueueUpdateDraw behind q")
-	}
-	close(releaseQ)
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatal(err)
 		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("TUI quit deadlocked or did not complete")
+	}
+}
+
+// TestPumpExitsOnCancelWhenUILoopAbsent guards the abnormal-app.Run deadlock fix
+// directly at the pump. The tview event loop is NEVER started, so any
+// QueueUpdateDraw the pump issues blocks forever — modelling an app.Run that
+// returned abnormally (e.g. a screen-init failure) while the coordinator still
+// needs to join the pump. A non-abandonable pump would block in QueueUpdateDraw
+// and pumpDone would never close; the abandonable delivery must let cancel
+// release it. Proven to hang against a synchronous-QueueUpdateDraw pump.
+func TestPumpExitsOnCancelWhenUILoopAbsent(t *testing.T) {
+	dispatcher := &tuiSmokeDispatcher{started: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	screen := tcell.NewSimulationScreen("UTF-8")
+	screen.SetSize(100, 30)
+	runtime := newTUIRuntime(ctx, dispatcher, daemon.WorktreeScope{}, screen)
+	started := make(chan struct{}, 1)
+	runtime.queueUpdateStarted = started
+
+	go runtime.pump() // no app.Run(): the UI loop is absent, so QueueUpdateDraw blocks.
+	runtime.executor.messages <- tuiMessage{Kind: msgWatchBatch, Cursor: 1}
+	select {
+	case <-started:
 	case <-time.After(2 * time.Second):
-		t.Fatal("TUI quit deadlocked or leaked a joined goroutine")
+		t.Fatal("pump did not process the message")
+	}
+	cancel() // the pump is now stuck in QueueUpdateDraw; cancel must release it.
+	select {
+	case <-runtime.pumpDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pump did not exit on cancel with the UI loop absent — shutdown would deadlock")
 	}
 }
 
