@@ -149,6 +149,17 @@ func makeToolBinding(name string, descriptors []core.DispatchDescriptor) mcpTool
 	if !multiple && len(operations) == 0 {
 		operations[""] = makeMCPOperation(descriptors[0], "")
 	}
+	// A grouped descriptor with one operation needs no operation discriminator
+	// in the wire schema. Address that sole operation through the empty key while
+	// retaining its declared operation value for request construction.
+	if len(operations) == 1 {
+		for key, operation := range operations {
+			if key != "" {
+				delete(operations, key)
+				operations[""] = operation
+			}
+		}
+	}
 	if len(operations) > 1 {
 		allArgs["operation"] = core.ArgSpec{Name: "operation", Kind: core.ArgKindString, Required: true, Enum: sortedOperationNames(operations), Description: "Operation"}
 	}

@@ -153,6 +153,53 @@ func TestReadyListFlagParsesAsBoolean(t *testing.T) {
 	}
 }
 
+func TestLeaseAndTUIRequestConstruction(t *testing.T) {
+	for _, tc := range []struct {
+		verb string
+		argv []string
+		want core.Request
+	}{
+		{verb: "lease", argv: []string{"ls"}, want: core.Request{Verb: "lease", Args: map[string]any{"subverb": "ls"}}},
+		{verb: "tui", want: core.Request{Verb: "tui"}},
+	} {
+		positional, options, err := parseArgs(tc.verb, tc.argv)
+		if err != nil {
+			t.Fatalf("parseArgs(%s): %v", tc.verb, err)
+		}
+		got, err := buildRequest(tc.verb, positional, options)
+		if err != nil {
+			t.Fatalf("buildRequest(%s): %v", tc.verb, err)
+		}
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("buildRequest(%s)=%#v, want %#v", tc.verb, got, tc.want)
+		}
+	}
+	for _, tc := range []struct {
+		verb string
+		argv []string
+	}{
+		{verb: "lease", argv: nil},
+		{verb: "lease", argv: []string{"show"}},
+		{verb: "tui", argv: []string{"extra"}},
+		{verb: "tui", argv: []string{"--unexpected", "value"}},
+	} {
+		positional, options, err := parseArgs(tc.verb, tc.argv)
+		if err == nil {
+			_, err = buildRequest(tc.verb, positional, options)
+		}
+		if err == nil {
+			t.Fatalf("%s %v unexpectedly accepted", tc.verb, tc.argv)
+		}
+	}
+}
+
+func TestTUIRejectsJSONFaceOption(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if exit := Run([]string{"tui", "--json"}, &stdout, &stderr); exit == 0 || !strings.Contains(stdout.String()+stderr.String(), "--json is not valid for tui") {
+		t.Fatalf("exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
+	}
+}
+
 func TestRunKillStealFlagBuildsBooleanRequest(t *testing.T) {
 	positional, options, err := parseArgs("run-kill", []string{"--steal", "RUN-1"})
 	if err != nil {

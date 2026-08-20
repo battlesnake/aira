@@ -16,8 +16,8 @@ func TestSkillMetadataNormalisesEveryIncludedAction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(artifacts.Actions) != 69 {
-		t.Fatalf("actions=%d, want 69", len(artifacts.Actions))
+	if len(artifacts.Actions) != 70 {
+		t.Fatalf("actions=%d, want 70", len(artifacts.Actions))
 	}
 	for _, action := range artifacts.Actions {
 		if action.Summary == "" || !action.Safety.Valid() || !strings.HasPrefix(action.Command, "aira ") {
@@ -87,9 +87,10 @@ func TestSkillSafetyGolden(t *testing.T) {
 		"rant/capture": SafetyMutate, "rant/ls": SafetyRead, "rant/get": SafetyRead, "rant/review": SafetyMutate, "rant/redact": SafetyMutate,
 		"gate/add": SafetyMutate, "gate/ls": SafetyRead, "gate/show": SafetyRead,
 		"gate/set": SafetyMutate, "gate/run": SafetyReconcile, "gate/check": SafetyRead,
-		"gate/attest": SafetyMutate, "gate/prove": SafetyMutate, "gate/review": SafetyRead,
+		"gate/attest": SafetyMutate, "gate/prove": SafetyMutate, "gate/review": SafetyMutate,
 		"gate/canary-run": SafetyReconcile, "gate/canary-show": SafetyRead,
 		"gate/baseline-pin": SafetyMutate, "gate/baseline-show": SafetyRead,
+		"lease/ls": SafetyRead,
 	}
 	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
 	if err != nil {
@@ -98,7 +99,7 @@ func TestSkillSafetyGolden(t *testing.T) {
 	got := map[string]SafetyClass{}
 	for _, action := range artifacts.Actions {
 		key := action.Verb
-		if action.Verb == "find" || action.Verb == "req" || action.Verb == "link" || action.Verb == "gate" || action.Verb == "test-report" || action.Verb == "spend" || action.Verb == "quota" || action.Verb == "insights" || action.Verb == "git" || action.Verb == "rant" || action.Verb == "commands" {
+		if action.Verb == "find" || action.Verb == "req" || action.Verb == "link" || action.Verb == "gate" || action.Verb == "test-report" || action.Verb == "spend" || action.Verb == "quota" || action.Verb == "insights" || action.Verb == "git" || action.Verb == "rant" || action.Verb == "commands" || action.Verb == "lease" {
 			key += "/" + action.Operation
 		}
 		got[key] = action.Safety
@@ -106,6 +107,22 @@ func TestSkillSafetyGolden(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("safety=%v, want=%v", got, want)
 	}
+}
+
+func TestGateReviewIsMutation(t *testing.T) {
+	descriptor, ok := descriptorByName(New(nil).DispatchDescriptors(), "gate")
+	if !ok {
+		t.Fatal("gate descriptor missing")
+	}
+	for _, operation := range descriptor.Operations {
+		if operation.Name == "review" {
+			if operation.Safety != SafetyMutate {
+				t.Fatalf("gate review safety=%s, want %s", operation.Safety, SafetyMutate)
+			}
+			return
+		}
+	}
+	t.Fatal("gate review operation missing")
 }
 
 func TestSkillActionSetIsCanonicalAndDealiased(t *testing.T) {

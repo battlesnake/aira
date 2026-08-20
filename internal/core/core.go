@@ -195,6 +195,10 @@ type rantStore interface {
 	CountRants(string, string) (store.RantCountResult, error)
 }
 
+type leaseLister interface {
+	ListLeases(context.Context) ([]store.HeldLeaseRow, error)
+}
+
 type handlerData struct {
 	Data     any
 	Warnings []string
@@ -1253,6 +1257,20 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			lease, err := c.store.Heartbeat(ctx, record.Ticket.ID, token)
 			return lease, err
 		}},
+		"lease": {Name: "lease", Usage: "lease ls", Args: []ArgSpec{stringSpec("subverb", true, true, "Lease operation", "ls")}, MCPTool: "aira_lease", MCPOperation: "subverb", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+			if strings.ToLower(strings.TrimSpace(stringArg(args, "subverb"))) != "ls" {
+				return nil, errors.New("E_SELECTOR_INVALID: lease requires ls")
+			}
+			lister, ok := c.store.(leaseLister)
+			if !ok {
+				return nil, errors.New("E_CONFIG_INVALID: lease listing is unavailable")
+			}
+			rows, err := lister.ListLeases(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"total": len(rows), "rows": rows}, nil
+		}},
 		"touch": {Name: "touch", Usage: "touch <id> <glob...>", Args: []ArgSpec{stringSpec("selector", true, true, "Ticket selector"), stringSpec("token", false, false, "Lease token"), listSpec("globs", false, true, "Area globs")}, MCPTool: "aira_touch", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			record, err := c.store.Get(stringArg(args, "selector"))
 			if err != nil {
@@ -1845,13 +1863,16 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		"claim":     {summary: "Claim a ticket lease", safety: SafetyLease, example: []string{"AIRA-1", "--steal", "--actor", "codex"}},
 		"release":   {summary: "Release a ticket lease", safety: SafetyLease, example: []string{"AIRA-1", "--token", "token"}},
 		"heartbeat": {summary: "Renew a ticket lease", safety: SafetyLease, example: []string{"AIRA-1", "--token", "token"}},
-		"touch":     {summary: "Record ticket area ownership", safety: SafetyMutate, example: []string{"AIRA-1", "**/*.go", "--token", "token"}},
-		"unlink":    {summary: "Remove a ticket relation", safety: SafetyMutate, example: []string{"AIRA-1", "blocks", "AIRA-2"}},
-		"ready":     {summary: "List tickets ready to work on", safety: SafetyRead, example: []string{"--list"}},
-		"list":      {summary: "List tickets", safety: SafetyRead, example: []string{"kind:feature", "--by", "status", "--fields", "id"}},
-		"count":     {summary: "Count tickets by a dimension", safety: SafetyRead, example: []string{"kind:feature", "--by", "status"}},
-		"set":       {summary: "Set a ticket field", safety: SafetyMutate, example: []string{"AIRA-1", "status=planned"}},
-		"mv":        {summary: "Move a ticket to a new status", safety: SafetyMutate, example: []string{"AIRA-1", "planned"}},
+		"lease": {summary: "List held ticket leases", safety: SafetyRead, operations: []OperationSpec{
+			{Name: "ls", Summary: "List held ticket leases", Safety: SafetyRead, Args: nil, Example: []string{"ls"}},
+		}},
+		"touch":  {summary: "Record ticket area ownership", safety: SafetyMutate, example: []string{"AIRA-1", "**/*.go", "--token", "token"}},
+		"unlink": {summary: "Remove a ticket relation", safety: SafetyMutate, example: []string{"AIRA-1", "blocks", "AIRA-2"}},
+		"ready":  {summary: "List tickets ready to work on", safety: SafetyRead, example: []string{"--list"}},
+		"list":   {summary: "List tickets", safety: SafetyRead, example: []string{"kind:feature", "--by", "status", "--fields", "id"}},
+		"count":  {summary: "Count tickets by a dimension", safety: SafetyRead, example: []string{"kind:feature", "--by", "status"}},
+		"set":    {summary: "Set a ticket field", safety: SafetyMutate, example: []string{"AIRA-1", "status=planned"}},
+		"mv":     {summary: "Move a ticket to a new status", safety: SafetyMutate, example: []string{"AIRA-1", "planned"}},
 		"git": {summary: "Run a bounded authenticated git network operation", safety: SafetyExecute, operations: []OperationSpec{
 			{Name: "clone", Summary: "Clone a remote repository", Safety: SafetyExecute, Args: []OperationArg{{Name: "url", Required: true}, {Name: "dir"}}, Example: []string{"clone", "file:///repo", "repo"}},
 			{Name: "fetch", Summary: "Fetch remote refs", Safety: SafetyExecute, Args: []OperationArg{{Name: "remote"}, {Name: "refspecs"}}, Example: []string{"fetch", "origin"}},
@@ -1888,7 +1909,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 			{Name: "check", Summary: "Read the latest gate result", Safety: SafetyRead, Args: nil, Example: []string{"check"}},
 			{Name: "attest", Summary: "Answer a manual gate challenge", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}, {Name: "verdict", Required: true}, {Name: "actor", Required: true}}, Example: []string{"attest", "review", "--verdict", "pass", "--actor", "human"}},
 			{Name: "prove", Summary: "Record proof of fire", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"prove", "traceability"}},
-			{Name: "review", Summary: "Request manual gate review", Safety: SafetyRead, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"review", "review"}},
+			{Name: "review", Summary: "Request manual gate review", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"review", "review"}},
 			{Name: "canary-run", Summary: "Run a named canary", Safety: SafetyReconcile, Args: append([]OperationArg{{Name: "canary_id", Required: true}}, mutationOperationArgs()...), Example: []string{"canary-run", "unit-tests-mutation", "--mutation-kind", "go-inject-failing-test", "--mutation-pkgdir", ".", "--mutation-testname", "TestInjected"}},
 			{Name: "canary-show", Summary: "Show a canary declaration", Safety: SafetyRead, Args: append([]OperationArg{{Name: "canary_id", Required: true}}, mutationOperationArgs()...), Example: []string{"canary-show", "unit-tests-mutation"}},
 			{Name: "baseline-pin", Summary: "Pin a durable ratchet baseline", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}, {Name: "report", Required: true}, {Name: "reason"}, {Name: "actor"}}, Example: []string{"baseline-pin", "unit-tests", "--report", "TR-1", "--actor", "release-bot"}},

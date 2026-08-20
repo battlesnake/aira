@@ -69,6 +69,10 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		response := core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
 		return render(response, jsonOutput, stdout, stderr)
 	}
+	if verb == "tui" && jsonOutput {
+		response := core.Response{Code: "E_SELECTOR_INVALID", Error: "option --json is not valid for tui", Exit: store.ExitForCode("E_SELECTOR_INVALID")}
+		return render(response, true, stdout, stderr)
+	}
 
 	if verb == "init" {
 		requestArgs := map[string]any{}
@@ -163,6 +167,16 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	if err != nil {
 		code := appErrorCode(err)
 		return render(core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
+	}
+	if verb == "tui" {
+		dispatcher := injected
+		if dispatcher == nil {
+			dispatcher, err = newDaemonDispatcher(stdin, io.Discard, io.Discard, false)
+			if err != nil {
+				return render(transportErrorResponse(err), jsonOutput, stdout, stderr)
+			}
+		}
+		return runTUI(context.Background(), dispatcher, scope, stderr)
 	}
 	faceStdout := &lineTrackingWriter{w: stdout}
 	dispatcher := injected
@@ -406,6 +420,8 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"spend":       {"provider": true, "model": true, "source": true, "ticket": true, "phase": true, "at": true, "session": true, "agent": true, "total": true, "cost-usd": true, "usage-file": true, "bucket": true, "reasoning-subset": true, "by": true},
 		"quota":       {"provider": true, "source": true, "at": true, "window": true, "used": true, "limit": true, "remaining": true, "reset-at": true},
 		"insights":    {},
+		"lease":       {},
+		"tui":         nil,
 		"commands":    {"by": true},
 		"git":         {},
 		"run-kill":    {"steal": true},
@@ -720,6 +736,16 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		default:
 			args["from_now"] = true
 		}
+	case "tui":
+		if len(positional) != 0 {
+			return core.Request{}, fmt.Errorf("tui accepts no positional arguments")
+		}
+		return core.Request{Verb: "tui"}, nil
+	case "lease":
+		if len(positional) != 1 || strings.ToLower(positional[0]) != "ls" {
+			return core.Request{}, fmt.Errorf("lease requires ls")
+		}
+		args["subverb"] = "ls"
 	case "id":
 		if len(positional) != 1 {
 			return core.Request{}, fmt.Errorf("id requires <prefix>")

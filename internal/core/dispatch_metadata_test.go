@@ -44,7 +44,7 @@ func TestDispatchMetadataMatchesInstrumentedHandlerReads(t *testing.T) {
 		}
 		if len(descriptor.Operations) > 0 {
 			discriminator := ""
-			if name == "find" || name == "req" || name == "test-report" || name == "spend" || name == "quota" || name == "insights" || name == "git" || name == "rant" || name == "commands" {
+			if name == "find" || name == "req" || name == "test-report" || name == "spend" || name == "quota" || name == "insights" || name == "git" || name == "rant" || name == "commands" || name == "lease" {
 				discriminator = "subverb"
 			} else if name == "link" {
 				discriminator = "list"
@@ -186,6 +186,8 @@ func metadataProbeInputs(name string) []map[string]any {
 		return []map[string]any{cloneMetadataInputs(values, "subverb", "add"), cloneMetadataInputs(values, "subverb", "ls")}
 	case "insights":
 		return []map[string]any{cloneMetadataInputs(values, "subverb", "ls"), cloneMetadataInputs(values, "subverb", "show")}
+	case "lease":
+		return []map[string]any{cloneMetadataInputs(values, "subverb", "ls")}
 	case "git":
 		return []map[string]any{
 			cloneMetadataInputs(values, "subverb", "clone"),
@@ -399,7 +401,7 @@ func TestCanonicalDispatchNamesAndAliases(t *testing.T) {
 		got = append(got, descriptor.Name)
 	}
 	sort.Strings(got)
-	want := []string{"check", "claim", "commands", "count", "create", "find", "gate", "git", "grep", "heartbeat", "help", "id", "import", "init", "insights", "link", "list", "mv", "quota", "rant", "ready", "reconcile", "release", "req", "review", "run", "run-input", "run-kill", "run-log", "set", "show", "spend", "test-report", "time", "touch", "unlink"}
+	want := []string{"check", "claim", "commands", "count", "create", "find", "gate", "git", "grep", "heartbeat", "help", "id", "import", "init", "insights", "lease", "link", "list", "mv", "quota", "rant", "ready", "reconcile", "release", "req", "review", "run", "run-input", "run-kill", "run-log", "set", "show", "spend", "test-report", "time", "touch", "unlink"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("dispatch names=%v, want=%v", got, want)
 	}

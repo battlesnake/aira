@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"aira/internal/domain"
 	"golang.org/x/sys/unix"
@@ -59,6 +60,19 @@ type LeaseClaim struct {
 	Token  string       `json:"token"`
 	Stolen bool         `json:"stolen,omitempty"`
 	Event  EventKey     `json:"event"`
+}
+
+// HeldLeaseRow is the read-only wire representation of a currently held
+// lease. It deliberately omits the holder token hash.
+type HeldLeaseRow struct {
+	TicketID               string `json:"ticket_id"`
+	Actor                  string `json:"actor"`
+	WorktreeID             string `json:"worktree_id"`
+	Generation             int64  `json:"generation"`
+	TTLNanos               int64  `json:"ttl_ns"`
+	LastHeartbeatMonoNanos int64  `json:"last_heartbeat_mono_ns"`
+	Expired                bool   `json:"expired"`
+	AgeNote                string `json:"age_note"`
 }
 
 type leaseRow struct {
@@ -552,6 +566,55 @@ func (s *Store) GetLease(ctx context.Context, ticketID string) (domain.Lease, er
 		return domain.Lease{}, err
 	}
 	return leaseFromRow(ticketID, row)
+}
+
+// ListLeases returns every held row, including expired rows that have not yet
+// been reaped. Liveness and age notes are stamped from one monotonic sample.
+func (s *Store) ListLeases(ctx context.Context) ([]HeldLeaseRow, error) {
+	bootID, monoNS, err := s.sampleClock()
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT ticket_id, actor, worktree_id, generation,
+		boot_id, last_heartbeat_mono_ns, ttl_ns
+		FROM leases WHERE project_id=? AND state='held' ORDER BY ticket_id`, s.projectID)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]HeldLeaseRow, 0)
+	for rows.Next() {
+		var row HeldLeaseRow
+		var rowBootID string
+		if err := rows.Scan(&row.TicketID, &row.Actor, &row.WorktreeID, &row.Generation,
+			&rowBootID, &row.LastHeartbeatMonoNanos, &row.TTLNanos); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		last := uint64(row.LastHeartbeatMonoNanos)
+		ttl := uint64(row.TTLNanos)
+		switch {
+		case rowBootID != bootID:
+			row.Expired = true
+			row.AgeNote = "stale (prior boot)"
+		case last > monoNS:
+			row.Expired = false
+			row.AgeNote = "concurrently renewed"
+		default:
+			age := monoNS - last
+			row.Expired = age >= ttl
+			row.AgeNote = time.Duration(age).String()
+		}
+		result = append(result, row)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // ReapExpiredLeases frees only leases that are positively expired at the one
