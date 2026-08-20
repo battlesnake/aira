@@ -390,7 +390,13 @@ func TestDetachedRecordStampsEffectiveAdmissionOverrideAfterAdmit(t *testing.T) 
 	r, _ := newMemoryRunner(t, nil)
 	r.memorySlice = currentSliceForTest(t)
 	r.memoryReserve = 40
-	r.sliceMemory = func(string) (int64, int64, bool, string) { return 0, 100, true, "" }
+	// Free memory (max-cur) is 60 — strictly between the static reserve (40) and
+	// the override (70). A correct implementation enforcing the override cannot
+	// admit (60 < 70) and times out; an implementation that STAMPS the override
+	// but still ENFORCES the static 40 would admit "immediate" (60 >= 40). The
+	// Admission state below therefore proves the override value was enforced, not
+	// merely recorded.
+	r.sliceMemory = func(string) (int64, int64, bool, string) { return 40, 100, true, "" }
 	r.clock = newInstantClock()
 	r.startFn = func(*exec.Cmd) error { return errors.New("injected after detached admission") }
 	override := int64(70)
@@ -433,6 +439,12 @@ func TestDetachedRecordStampsEffectiveAdmissionOverrideAfterAdmit(t *testing.T) 
 	}
 	if record.ResourceSignature != "sig" || record.AdmissionReserve == nil || *record.AdmissionReserve != override || record.AdmissionReserveBasis != "estimate:max=60,n=3,f=115" {
 		t.Fatalf("detached record=%+v", record)
+	}
+	// The enforced threshold was the override (70), not the static reserve (40):
+	// with 60 free the override cannot be granted, so admission times out
+	// (fail-open). A static-40 enforcement would have granted immediately.
+	if record.Admission != "timeout" {
+		t.Fatalf("override not enforced: admission=%q want timeout (60 free < override 70)", record.Admission)
 	}
 	if err := r.ledger.project(context.Background()); err != nil {
 		t.Fatal(err)

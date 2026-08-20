@@ -5,6 +5,9 @@ package runner
 import (
 	"context"
 	"database/sql"
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -204,9 +207,63 @@ func TestPeakRSSHistoryHeldWriteLockFailsWithinReadDeadline(t *testing.T) {
 	if err == nil || !readable {
 		t.Fatalf("held lock readable=%v err=%v", readable, err)
 	}
-	if elapsed > 2*sampleReadTimeout {
-		t.Fatalf("held lock blocked for %s, timeout=%s", elapsed, sampleReadTimeout)
+	// busy_timeout(0) must fail fast, not wait the 250ms deadline and not block
+	// on the exclusive lock. Bound tightly (deadline + scheduling slack) so an
+	// implementation using a longer busy_timeout or a blocking open — which would
+	// return only near/after the full deadline — is rejected. 2x the timeout was
+	// porous: it accepted a 400-499ms implementation.
+	if elapsed > sampleReadTimeout+100*time.Millisecond {
+		t.Fatalf("held lock blocked for %s, deadline=%s (must fail fast under busy_timeout(0))", elapsed, sampleReadTimeout)
 	}
+}
+
+// TestPeakRSSHistoryReadDoesNotMutateProjection proves the reader opens the DB
+// read-only: a successful read neither grows runs.db nor creates any new
+// sidecar (a writable open would create/checkpoint -wal/-shm or mutate the file).
+func TestPeakRSSHistoryReadDoesNotMutateProjection(t *testing.T) {
+	r, err := New(Config{CommonDir: t.TempDir(), Backend: &memoryBackend{scope: &memoryScope{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peak := int64(4242)
+	if _, err := r.ledger.append(ledgerEvent{Kind: "terminal", Run: RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusExited, PeakRSS: &peak, ResourceSignature: "sig"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ledger.project(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Dir(r.ledger.projection)
+	before := dirFileSizes(t, dir)
+
+	stats, readable, err := r.PeakRSSHistory(context.Background(), "sig")
+	if err != nil || !readable || stats.SampleCount != 1 || stats.PeakMax != 4242 {
+		t.Fatalf("read stats=%+v readable=%v err=%v", stats, readable, err)
+	}
+	// A second read must also be side-effect free.
+	if _, _, err := r.PeakRSSHistory(context.Background(), "sig"); err != nil {
+		t.Fatal(err)
+	}
+	after := dirFileSizes(t, dir)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("read mutated the projection directory: before=%v after=%v", before, after)
+	}
+}
+
+func dirFileSizes(t *testing.T, dir string) map[string]int64 {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sizes := make(map[string]int64)
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sizes[entry.Name()] = info.Size()
+	}
+	return sizes
 }
 
 func runIDForTest(order, index int) string {

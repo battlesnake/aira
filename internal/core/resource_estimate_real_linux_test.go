@@ -32,16 +32,44 @@ func TestRealCgroupPeakRSSHistoryDrivesEstimatedAdmission(t *testing.T) {
 		cgrouptest.SkipOrFailRealCgroup(t, "real memory-enabled cgroup unavailable: %v", err)
 	}
 	c := NewWithRunner(nil, r).WithMemoryEstimate(true)
-	args := map[string]any{"argv": []string{"python3", "-c", "x=bytearray(8*1024*1024); x[-1]=1"}}
+	argv := []string{"python3", "-c", "x=bytearray(8*1024*1024); x[-1]=1"}
+	args := map[string]any{"argv": argv}
 	for i := 0; i < minSamples; i++ {
 		record := runRealEstimateCommand(t, c, args)
 		if record.PeakRSS == nil || *record.PeakRSS <= 0 || record.AdmissionReserve == nil || *record.AdmissionReserve != headroom || !strings.HasPrefix(record.AdmissionReserveBasis, "fallback:") {
 			t.Fatalf("history run %d record=%+v", i+1, record)
 		}
 	}
+	// Capture the EXACT estimator input the next run will see (the history so far,
+	// before the estimated run adds itself), and the reserve/basis it must stamp.
+	sig, err := resourceSignature(c.commandPrefix, nil, argv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats, readable, err := r.PeakRSSHistory(context.Background(), sig)
+	if err != nil || !readable {
+		t.Fatalf("history read stats=%+v readable=%v err=%v", stats, readable, err)
+	}
+	wantReserve, override, wantBasis := estimateReserve(stats, headroom)
+	if !override {
+		t.Fatalf("real history did not produce an override: stats=%+v basis=%q", stats, wantBasis)
+	}
+	// The fixture is only meaningful if the estimate DIFFERS from the static
+	// headroom — otherwise the test cannot tell an estimate-driven reserve from
+	// the fallback. An 8 MiB allocation must estimate well under the 64 MiB headroom.
+	if wantReserve == headroom {
+		t.Fatalf("estimate (%d) coincided with headroom; fixture cannot distinguish estimate from fallback", wantReserve)
+	}
 	estimated := runRealEstimateCommand(t, c, args)
-	if estimated.Admission != "immediate" || estimated.AdmissionReserve == nil || *estimated.AdmissionReserve <= 0 || *estimated.AdmissionReserve > maxEstimateReserve || !strings.HasPrefix(estimated.AdmissionReserveBasis, "estimate:") {
-		t.Fatalf("estimated record=%+v", estimated)
+	if estimated.AdmissionReserve == nil {
+		t.Fatalf("estimated run stamped no reserve: %+v", estimated)
+	}
+	// The stamped reserve must be EXACTLY the estimate computed from queried
+	// history — not an arbitrary value, and not the static headroom. This rejects
+	// an implementation that stamps `estimate:*` while enforcing/recording something else.
+	if estimated.Admission != "immediate" || *estimated.AdmissionReserve != wantReserve || estimated.AdmissionReserveBasis != wantBasis {
+		t.Fatalf("stamped reserve/basis must equal the estimate from queried history: got admission=%q reserve=%d basis=%q want reserve=%d basis=%q (stats=%+v)",
+			estimated.Admission, *estimated.AdmissionReserve, estimated.AdmissionReserveBasis, wantReserve, wantBasis, stats)
 	}
 }
 

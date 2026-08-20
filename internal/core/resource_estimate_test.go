@@ -8,17 +8,27 @@ import (
 )
 
 func TestResourceSignatureMatchesRunnerEffectiveArgv(t *testing.T) {
+	// `want` is a hand-written literal token sequence, NUL-joined below — NOT
+	// derived through the production EffectivePrefix/EffectiveArgv, so a bug in
+	// those helpers (e.g. one that stripped a wrapper) cannot corrupt both the
+	// value under test and its expectation. Every case keeps the FULL argv,
+	// including memory/lifetime-affecting wrappers (whale-run, timeout) which
+	// must NOT be stripped.
 	tests := []struct {
 		name          string
 		commandPrefix []string
 		reqPrefix     []string
 		argv          []string
+		want          []string
 	}{
-		{name: "all packages", argv: []string{"go", "test", "./..."}},
-		{name: "store package", argv: []string{"go", "test", "./internal/store"}},
-		{name: "configured valgrind", commandPrefix: []string{"valgrind"}, argv: []string{"go", "test", "./..."}},
-		{name: "requested timeout", reqPrefix: []string{"timeout", "600"}, argv: []string{"go", "test", "./..."}},
-		{name: "empty request suppresses configured", commandPrefix: []string{"valgrind"}, reqPrefix: []string{}, argv: []string{"go", "test", "./..."}},
+		{name: "all packages", argv: []string{"go", "test", "./..."}, want: []string{"go", "test", "./..."}},
+		{name: "store package", argv: []string{"go", "test", "./internal/store"}, want: []string{"go", "test", "./internal/store"}},
+		{name: "configured valgrind", commandPrefix: []string{"valgrind"}, argv: []string{"go", "test", "./..."}, want: []string{"valgrind", "go", "test", "./..."}},
+		{name: "requested timeout", reqPrefix: []string{"timeout", "600"}, argv: []string{"go", "test", "./..."}, want: []string{"timeout", "600", "go", "test", "./..."}},
+		{name: "configured whale-run kept", commandPrefix: []string{"whale-run"}, argv: []string{"go", "test", "./..."}, want: []string{"whale-run", "go", "test", "./..."}},
+		{name: "requested whale-run kept", reqPrefix: []string{"whale-run"}, argv: []string{"pytest", "tests"}, want: []string{"whale-run", "pytest", "tests"}},
+		{name: "delimiter stripped then kept", reqPrefix: []string{"nice", "-n", "10", "--"}, argv: []string{"go", "test"}, want: []string{"nice", "-n", "10", "go", "test"}},
+		{name: "empty request suppresses configured", commandPrefix: []string{"valgrind"}, reqPrefix: []string{}, argv: []string{"go", "test", "./..."}, want: []string{"go", "test", "./..."}},
 	}
 	signatures := make(map[string]string)
 	for _, test := range tests {
@@ -27,17 +37,9 @@ func TestResourceSignatureMatchesRunnerEffectiveArgv(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			selected, err := runner.EffectivePrefix(test.commandPrefix, test.reqPrefix)
-			if err != nil {
-				t.Fatal(err)
-			}
-			effective, err := runner.EffectiveArgv(selected, test.argv)
-			if err != nil {
-				t.Fatal(err)
-			}
-			want := nulJoin(effective)
+			want := strings.Join(test.want, "\x00")
 			if got != want {
-				t.Fatalf("signature=%q want %q from effective argv %q", got, want, effective)
+				t.Fatalf("signature=%q want %q", got, want)
 			}
 			signatures[test.name] = got
 		})

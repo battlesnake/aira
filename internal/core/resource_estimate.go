@@ -70,8 +70,16 @@ func estimateReserve(stats runner.PeakRSSStats, headroom int64) (reserve int64, 
 	} else {
 		basis = fmt.Sprintf("estimate:max=%d,n=%d,f=115", peak, stats.SampleCount)
 	}
-	if reserve <= 0 || reserve > maxEstimateReserve {
-		panic("peak-RSS estimate reserve outside configured invariant")
+	// The reserve is bounded to (0, cap] by construction (peak>0, cap clamp, and
+	// config rejecting headroom>cap). Degrade honestly rather than crashing an
+	// advisory estimate if that invariant is ever violated: clamp an over-cap
+	// value, and fall back on a non-positive one instead of emitting a reserve
+	// the runner would (correctly) refuse to enforce.
+	if reserve > maxEstimateReserve {
+		reserve = maxEstimateReserve
+	}
+	if reserve <= 0 {
+		return 0, false, "fallback:malformed"
 	}
 	return reserve, true, basis
 }
