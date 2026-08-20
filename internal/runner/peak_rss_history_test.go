@@ -5,11 +5,11 @@ package runner
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"net/url"
 	"os"
-	"path/filepath"
-	"reflect"
+	"strings"
 	"testing"
-	"time"
 )
 
 func TestPeakRSSHistoryFiltersAndAggregatesRealProjection(t *testing.T) {
@@ -201,26 +201,52 @@ func TestPeakRSSHistoryHeldWriteLockFailsWithinReadDeadline(t *testing.T) {
 	}
 	defer locker.Exec(`ROLLBACK`)
 
-	started := time.Now()
 	_, readable, err := r.PeakRSSHistory(context.Background(), "sig")
-	elapsed := time.Since(started)
 	if err == nil || !readable {
 		t.Fatalf("held lock readable=%v err=%v", readable, err)
 	}
-	// busy_timeout(0) must fail fast, not wait the 250ms deadline and not block
-	// on the exclusive lock. Bound tightly (deadline + scheduling slack) so an
-	// implementation using a longer busy_timeout or a blocking open — which would
-	// return only near/after the full deadline — is rejected. 2x the timeout was
-	// porous: it accepted a 400-499ms implementation.
-	if elapsed > sampleReadTimeout+100*time.Millisecond {
-		t.Fatalf("held lock blocked for %s, deadline=%s (must fail fast under busy_timeout(0))", elapsed, sampleReadTimeout)
+	// busy_timeout(0) must fail fast ON THE LOCK: it returns SQLITE_BUSY/LOCKED
+	// immediately. It must NOT block until the 250ms read deadline — an
+	// implementation using a longer busy_timeout (e.g. 300ms > 250ms) would be
+	// interrupted by the context and surface context.DeadlineExceeded instead,
+	// which this rejects. (A wall-clock bound was porous: busy_timeout(300)
+	// returned under 350ms.)
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("read blocked until the deadline (busy_timeout is not 0): %v", err)
+	}
+	lower := strings.ToLower(err.Error())
+	if !strings.Contains(lower, "busy") && !strings.Contains(lower, "locked") {
+		t.Fatalf("expected a fail-fast SQLITE_BUSY/LOCKED error, got %v", err)
 	}
 }
 
-// TestPeakRSSHistoryReadDoesNotMutateProjection proves the reader opens the DB
-// read-only: a successful read neither grows runs.db nor creates any new
-// sidecar (a writable open would create/checkpoint -wal/-shm or mutate the file).
-func TestPeakRSSHistoryReadDoesNotMutateProjection(t *testing.T) {
+// TestReadOnlyHistoryDSNIsReadOnlyAndFailFast proves, deterministically, that the
+// reader's DSN opens strictly read-only (mode=ro) and fails fast (busy_timeout 0),
+// and that a path containing URI-special characters is escaped rather than
+// terminating the query early. This replaces a WAL-invalid "no sidecar created"
+// assertion: a legitimate mode=ro WAL reader may create runs.db-shm/-wal.
+func TestReadOnlyHistoryDSNIsReadOnlyAndFailFast(t *testing.T) {
+	dsn := readOnlyHistoryDSN("/tmp/aira runs?x/runs.db")
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("dsn %q not parseable: %v", dsn, err)
+	}
+	if u.Path != "/tmp/aira runs?x/runs.db" {
+		t.Fatalf("path not preserved/escaped: %q from %q", u.Path, dsn)
+	}
+	q := u.Query()
+	if q.Get("mode") != "ro" {
+		t.Fatalf("DSN is not read-only (mode=ro): %q", dsn)
+	}
+	if !strings.Contains(dsn, "busy_timeout(0)") {
+		t.Fatalf("DSN does not fail fast (busy_timeout(0)): %q", dsn)
+	}
+}
+
+// TestPeakRSSHistoryReadDoesNotGrowMainProjection is supplemental: a read must
+// not grow the main runs.db file (WAL sidecars -shm/-wal are legitimate and are
+// deliberately not asserted here; read-only is proven by the DSN test above).
+func TestPeakRSSHistoryReadDoesNotGrowMainProjection(t *testing.T) {
 	r, err := New(Config{CommonDir: t.TempDir(), Backend: &memoryBackend{scope: &memoryScope{}}})
 	if err != nil {
 		t.Fatal(err)
@@ -232,38 +258,23 @@ func TestPeakRSSHistoryReadDoesNotMutateProjection(t *testing.T) {
 	if err := r.ledger.project(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	dir := filepath.Dir(r.ledger.projection)
-	before := dirFileSizes(t, dir)
-
+	before := fileSize(t, r.ledger.projection)
 	stats, readable, err := r.PeakRSSHistory(context.Background(), "sig")
 	if err != nil || !readable || stats.SampleCount != 1 || stats.PeakMax != 4242 {
 		t.Fatalf("read stats=%+v readable=%v err=%v", stats, readable, err)
 	}
-	// A second read must also be side-effect free.
-	if _, _, err := r.PeakRSSHistory(context.Background(), "sig"); err != nil {
-		t.Fatal(err)
-	}
-	after := dirFileSizes(t, dir)
-	if !reflect.DeepEqual(before, after) {
-		t.Fatalf("read mutated the projection directory: before=%v after=%v", before, after)
+	if after := fileSize(t, r.ledger.projection); after != before {
+		t.Fatalf("read grew the main projection: before=%d after=%d", before, after)
 	}
 }
 
-func dirFileSizes(t *testing.T, dir string) map[string]int64 {
+func fileSize(t *testing.T, path string) int64 {
 	t.Helper()
-	entries, err := os.ReadDir(dir)
+	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sizes := make(map[string]int64)
-	for _, entry := range entries {
-		info, err := entry.Info()
-		if err != nil {
-			t.Fatal(err)
-		}
-		sizes[entry.Name()] = info.Size()
-	}
-	return sizes
+	return info.Size()
 }
 
 func runIDForTest(order, index int) string {

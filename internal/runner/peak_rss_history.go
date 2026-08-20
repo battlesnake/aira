@@ -11,6 +11,15 @@ import (
 
 const sampleReadTimeout = 250 * time.Millisecond
 
+// readOnlyHistoryDSN builds a strictly read-only, fail-fast sqlite DSN for the
+// history projection. mode=ro opens the file with O_RDONLY (a writable open
+// would fail on read-only storage and could create the DB in a stat/open race);
+// busy_timeout(0) returns SQLITE_BUSY immediately instead of importing a lock
+// wait into admission. The file: URL escapes any '?'/'#' in the path.
+func readOnlyHistoryDSN(path string) string {
+	return (&url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro&_pragma=query_only(ON)&_pragma=busy_timeout(0)"}).String()
+}
+
 func (r *Runner) PeakRSSHistory(ctx context.Context, signature string) (PeakRSSStats, bool, error) {
 	path := r.ledger.projection
 	if _, err := os.Stat(path); err != nil {
@@ -19,12 +28,7 @@ func (r *Runner) PeakRSSHistory(ctx context.Context, signature string) (PeakRSSS
 		}
 		return PeakRSSStats{}, true, err
 	}
-	// A true read-only open (mode=ro): never creates or writes the DB, so it
-	// cannot lose a stat/open race by materialising the file, and it fails fast
-	// (busy_timeout 0) rather than importing a lock wait into admission. The
-	// file: URL escapes any '?'/'#' in the path.
-	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro&_pragma=query_only(ON)&_pragma=busy_timeout(0)"}).String()
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", readOnlyHistoryDSN(path))
 	if err != nil {
 		return PeakRSSStats{}, true, err
 	}
