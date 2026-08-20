@@ -160,16 +160,18 @@ func classifyTestsGreen(cleanExit bool, output []byte) (gate.PredicateState, str
 }
 
 func allowListedEnvironment(names []string) ([]string, []runner.EnvEntry, error) {
-	values := make([]string, 0, len(names))
 	entries := make([]runner.EnvEntry, 0, len(names))
 	for _, name := range names {
 		if value, ok := os.LookupEnv(name); ok {
-			values = append(values, name+"="+value)
 			entries = append(entries, runner.EnvEntry{Key: []byte(name), Value: []byte(value)})
 		}
 	}
+	entries = runner.StripGovernorEnv(entries)
 	sort.Slice(entries, func(i, j int) bool { return string(entries[i].Key) < string(entries[j].Key) })
-	sort.Strings(values)
+	values := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		values = append(values, string(entry.Key)+"="+string(entry.Value))
+	}
 	return values, entries, nil
 }
 

@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"aira/internal/pylib"
 )
 
 var locateLibstdbufFn = locateLibstdbuf
@@ -116,6 +118,18 @@ func EnvDigest(entries []EnvEntry) (string, error) {
 		_, _ = h.Write(e.Value)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// StripGovernorEnv removes launch-coordination entries from the environment
+// identity shared by runners and command gates.
+func StripGovernorEnv(entries []EnvEntry) []EnvEntry {
+	result := make([]EnvEntry, 0, len(entries))
+	for _, entry := range entries {
+		if !pylib.IsGovernorEnvironmentKey(string(entry.Key)) {
+			result = append(result, entry)
+		}
+	}
+	return result
 }
 
 func effectiveEnvironment(overrides []string) ([]string, []EnvEntry, error) {

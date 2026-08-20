@@ -190,6 +190,30 @@ func TestCommandCheckerStoresAuthoritativeRunnerEnvDigest(t *testing.T) {
 	}
 }
 
+func TestCommandCheckerIgnoresAllowedGovernorEnvironmentInDigest(t *testing.T) {
+	t.Setenv("AIRA_CPU_SLOTS_DIR", filepath.Join(t.TempDir(), "slots"))
+	s, root := realCommandStore(t)
+	def := commandDefinition(gate.Command{
+		Argv:           []string{"/bin/sh", "-c", "sleep 0.05; true"},
+		Cwd:            "root",
+		EnvAllow:       []string{"AIRA_CPU_SLOTS_DIR"},
+		TimeoutMS:      1000,
+		OutputCapBytes: 1024,
+		Predicate:      gate.CommandPredicateExitZero,
+	})
+	evaluation, err := s.runCommandChecker(context.Background(), def, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evaluation.Predicate != gate.PredicatePass {
+		t.Fatalf("evaluation=%#v", evaluation)
+	}
+	wantDigest, err := runner.EnvDigest(nil)
+	if err != nil || evaluation.EnvDigest != wantDigest {
+		t.Fatalf("env digest=%q want=%q err=%v", evaluation.EnvDigest, wantDigest, err)
+	}
+}
+
 func TestCommandGateProofBindsCurrentEnvironmentAndLaneReadOnly(t *testing.T) {
 	const binding = "AIRA_M10B_BINDING"
 	if err := os.Setenv(binding, "one"); err != nil {
