@@ -42,11 +42,22 @@ def _setting(name, default, *, allow_zero):
 
 def _visible_slots(directory):
     with os.scandir(directory) as entries:
-        return [
-            entry.path
-            for entry in entries
-            if entry.name.startswith("slot-") and entry.is_file(follow_symlinks=False)
-        ]
+        indexed = []
+        for entry in entries:
+            if not entry.name.startswith("slot-"):
+                raise RuntimeError("unexpected entry in CPU slot population")
+            suffix = entry.name[len("slot-") :]
+            if not suffix.isdigit() or str(int(suffix)) != suffix:
+                raise RuntimeError("malformed CPU slot name")
+            if not entry.is_file(follow_symlinks=False):
+                raise RuntimeError("CPU slot is not a regular file")
+            indexed.append((int(suffix), entry.path))
+    if not indexed:
+        return []
+    indexed.sort()
+    if [index for index, _ in indexed] != list(range(len(indexed))):
+        raise RuntimeError("incomplete CPU slot population")
+    return [path for _, path in indexed]
 
 
 def _try_slots(paths):
@@ -61,6 +72,9 @@ def _try_slots(paths):
             return descriptor
         except BlockingIOError:
             os.close(descriptor)
+        except Exception:
+            os.close(descriptor)
+            raise
     return None
 
 
