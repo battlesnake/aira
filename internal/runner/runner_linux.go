@@ -260,6 +260,14 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if err != nil {
 		return nil, launchErr("E_RUN_ENV_INVALID", err)
 	}
+	env = pylib.StripGovernorEnvironment(env)
+	strippedEntries := make([]EnvEntry, 0, len(entries))
+	for _, entry := range entries {
+		if !pylib.IsGovernorEnvironmentKey(string(entry.Key)) {
+			strippedEntries = append(strippedEntries, entry)
+		}
+	}
+	entries = strippedEntries
 	envDigest, err := EnvDigest(entries)
 	if err != nil {
 		return nil, launchErr("E_RUN_ENV_INVALID", err)

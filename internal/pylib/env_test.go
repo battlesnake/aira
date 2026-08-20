@@ -32,8 +32,8 @@ func TestAppendChildEnvironmentInjectsAuthoritativePathsAndTunables(t *testing.T
 	if values["AIRA_CPU_POLL_INTERVAL"] != "0.25" {
 		t.Fatalf("poll passthrough=%q", values["AIRA_CPU_POLL_INTERVAL"])
 	}
-	if values["AIRA_CPU_MAX_WAIT"] != "7" {
-		t.Fatalf("explicit child max-wait was replaced: %q", values["AIRA_CPU_MAX_WAIT"])
+	if values["AIRA_CPU_MAX_WAIT"] != "12" {
+		t.Fatalf("authoritative max-wait=%q", values["AIRA_CPU_MAX_WAIT"])
 	}
 	if _, err := os.Stat(filepath.Join(values["AIRA_PY_LIB"], "aira_xdist_governor", "__init__.py")); err != nil {
 		t.Fatalf("injected module path is not importable: %v", err)
@@ -50,12 +50,21 @@ func TestAppendChildEnvironmentSkipsEverythingOnExtractionFailure(t *testing.T) 
 		childEnvFailureOnce = previousOnce
 	})
 	t.Setenv("AIRA_CPU_POLL_INTERVAL", "0.25")
-	input := []string{"PATH=/bin"}
+	input := []string{
+		"PATH=/bin",
+		"AIRA_PY_LIB=/stale",
+		"AIRA_CPU_SLOTS_DIR=/stale-slots",
+		"AIRA_CPU_POLL_INTERVAL=99",
+		"AIRA_CPU_MAX_WAIT=99",
+	}
 	var diagnostics bytes.Buffer
 	first := AppendChildEnvironment(input, t.TempDir(), &diagnostics)
 	second := AppendChildEnvironment(input, t.TempDir(), &diagnostics)
-	if strings.Join(first, "\x00") != strings.Join(input, "\x00") || strings.Join(second, "\x00") != strings.Join(input, "\x00") {
-		t.Fatalf("failure injected partial environment: first=%v second=%v", first, second)
+	for _, got := range [][]string{first, second} {
+		values := childEnvValues(t, got)
+		if len(values) != 1 || values["PATH"] != "/bin" {
+			t.Fatalf("failure retained governor environment: %v", got)
+		}
 	}
 	if strings.Count(diagnostics.String(), "injected extraction failure") != 1 {
 		t.Fatalf("failure was not logged once: %q", diagnostics.String())
@@ -65,10 +74,10 @@ func TestAppendChildEnvironmentSkipsEverythingOnExtractionFailure(t *testing.T) 
 func TestAppendChildEnvironmentWithoutRuntimeDirIsSideEffectFree(t *testing.T) {
 	dataHome := filepath.Join(t.TempDir(), "must-not-exist")
 	t.Setenv("XDG_DATA_HOME", dataHome)
-	input := []string{"PATH=/bin"}
+	input := []string{"PATH=/bin", "AIRA_CPU_SLOTS_DIR=/stale-slots"}
 	got := AppendChildEnvironment(input, "", nil)
-	if strings.Join(got, "\x00") != strings.Join(input, "\x00") {
-		t.Fatalf("empty runtime changed environment: %v", got)
+	if strings.Join(got, "\x00") != "PATH=/bin" {
+		t.Fatalf("empty runtime retained governor environment: %v", got)
 	}
 	if _, err := os.Stat(dataHome); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("empty runtime extracted sidecar: %v", err)

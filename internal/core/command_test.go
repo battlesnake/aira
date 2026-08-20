@@ -215,6 +215,31 @@ func TestTimeChildReceivesExtractedSidecarEnvironment(t *testing.T) {
 	}
 }
 
+func TestTimeExtractionFailureStripsInheritedGovernorEnvironment(t *testing.T) {
+	runtimeDir := filepath.Join(t.TempDir(), "runtime")
+	blockedDataHome := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blockedDataHome, []byte("file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_DATA_HOME", blockedDataHome)
+	for _, key := range []string{"AIRA_PY_LIB", "AIRA_CPU_SLOTS_DIR", "AIRA_CPU_POLL_INTERVAL", "AIRA_CPU_MAX_WAIT"} {
+		t.Setenv(key, "/stale-"+key)
+	}
+	observed := filepath.Join(t.TempDir(), "time-env")
+	script := `env | grep '^AIRA_\(PY_LIB\|CPU_SLOTS_DIR\|CPU_POLL_INTERVAL\|CPU_MAX_WAIT\)=' > "$1" || :`
+	response := NewWithRunnerFace(&commandCoreStore{}, commandSidecarRunner{runtimeDir: runtimeDir}, nil, FaceOutput{}).Do(context.Background(), Request{Verb: "time", Args: map[string]any{
+		"argv": []string{"sh", "-c", script, "time-env", observed},
+		"env":  []string{},
+	}})
+	if !response.OK || response.Exit != 0 {
+		t.Fatalf("response=%#v", response)
+	}
+	data, err := os.ReadFile(observed)
+	if err != nil || len(data) != 0 {
+		t.Fatalf("failed time extraction retained governor env %q: %v", data, err)
+	}
+}
+
 func TestTimeForwardsSIGTERMToChild(t *testing.T) {
 	termFile := filepath.Join(t.TempDir(), "got-term")
 	readyFile := filepath.Join(t.TempDir(), "child-ready")

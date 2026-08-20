@@ -267,6 +267,9 @@ func TestRealPytestTotalFailOpen(t *testing.T) {
 		}, nil)
 	})
 	t.Run("permission error", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses directory permission bits")
+		}
 		slots := makeRealPytestSlots(t, 1)
 		if err := os.Chmod(slots, 0); err != nil {
 			t.Fatal(err)
@@ -353,6 +356,64 @@ governor.gc = ProbeGC
 			t.Fatalf("invalid loser population did not fail open promptly: %s", elapsed)
 		}
 	})
+}
+
+func TestRealPytestForkDoesNotPinSlot(t *testing.T) {
+	pytest := requireRealPytest(t)
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	pythonDir, err := ExtractPyLib()
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := t.TempDir()
+	slots := makeRealPytestSlots(t, 1)
+	writeTestFile(t, project, "test_fork_slot.py", `
+import os
+import sys
+
+sys.path.insert(0, os.environ["AIRA_PY_LIB"])
+import aira_xdist_governor as governor
+
+def test_fork_does_not_pin_slot():
+    slot = os.path.join(os.environ["AIRA_CPU_SLOTS_DIR"], "slot-0")
+    descriptor = governor._try_slots([slot])
+    assert descriptor is not None
+    ready_read, ready_write = os.pipe()
+    release_read, release_write = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(ready_read)
+        os.close(release_write)
+        os.write(ready_write, b"1")
+        os.close(ready_write)
+        os.read(release_read, 1)
+        os.close(release_read)
+        os._exit(0)
+    os.close(ready_write)
+    os.close(release_read)
+    reacquired = None
+    try:
+        assert os.read(ready_read, 1) == b"1"
+        getattr(governor, "_release_slot", os.close)(descriptor)
+        descriptor = None
+        reacquired = governor._try_slots([slot])
+        assert reacquired is not None
+    finally:
+        if descriptor is not None:
+            getattr(governor, "_release_slot", os.close)(descriptor)
+        if reacquired is not None:
+            getattr(governor, "_release_slot", os.close)(reacquired)
+        os.close(ready_read)
+        os.write(release_write, b"1")
+        os.close(release_write)
+        waited, status = os.waitpid(child, 0)
+        assert waited == child
+        assert os.waitstatus_to_exitcode(status) == 0
+`)
+	result := runPytest(t, pytest, project, pythonDir, map[string]string{"AIRA_CPU_SLOTS_DIR": slots})
+	if result.err != nil {
+		t.Fatalf("forked child pinned CPU slot: %v\n%s", result.err, result.output)
+	}
 }
 
 func TestRealPytestOptOutWithoutConftestIsInactive(t *testing.T) {

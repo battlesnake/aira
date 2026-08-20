@@ -913,8 +913,14 @@ func TestSidecarEnvironmentIsInjectedAfterDigestForExplicitEnv(t *testing.T) {
 		return errors.New("injected after environment observation")
 	}
 	record, err := r.Launch(context.Background(), Request{
-		Argv:        []string{"/bin/true"},
-		Env:         []string{"PATH=/bin"},
+		Argv: []string{"/bin/true"},
+		Env: []string{
+			"PATH=/bin",
+			"AIRA_PY_LIB=/stale",
+			"AIRA_CPU_SLOTS_DIR=/stale-slots",
+			"AIRA_CPU_POLL_INTERVAL=99",
+			"AIRA_CPU_MAX_WAIT=99",
+		},
 		ExplicitEnv: true,
 	})
 	if err == nil {
@@ -930,7 +936,54 @@ func TestSidecarEnvironmentIsInjectedAfterDigestForExplicitEnv(t *testing.T) {
 	}
 	wantDigest, digestErr := EnvDigest([]EnvEntry{{Key: []byte("PATH"), Value: []byte("/bin")}})
 	if digestErr != nil || record.EnvDigest != wantDigest {
-		t.Fatalf("injected vars changed digest: got=%q want=%q err=%v", record.EnvDigest, wantDigest, digestErr)
+		t.Fatalf("governor vars changed digest: got=%q want=%q err=%v", record.EnvDigest, wantDigest, digestErr)
+	}
+}
+
+func TestSidecarEnvironmentDigestIgnoresInheritedGovernorValues(t *testing.T) {
+	r, _ := newMemoryRunner(t, nil)
+	r.inputRuntimeDir = filepath.Join(t.TempDir(), "runtime")
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	var childEnv []string
+	r.startFn = func(command *exec.Cmd) error {
+		childEnv = append([]string(nil), command.Env...)
+		return errors.New("injected after environment observation")
+	}
+
+	governorKeys := []string{"AIRA_PY_LIB", "AIRA_CPU_SLOTS_DIR", "AIRA_CPU_POLL_INTERVAL", "AIRA_CPU_MAX_WAIT"}
+	for _, key := range governorKeys {
+		t.Setenv(key, "/stale-"+key)
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/true"}})
+	if err == nil {
+		t.Fatal("launch unexpectedly succeeded")
+	}
+	withoutGovernor, getErr := r.Get("RUN-1")
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	for _, key := range governorKeys {
+		if err := os.Setenv(key, "/stale-"+key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err = r.Launch(context.Background(), Request{Argv: []string{"/bin/true"}})
+	if err == nil {
+		t.Fatal("launch unexpectedly succeeded")
+	}
+	withGovernor, getErr := r.Get("RUN-2")
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if withGovernor.EnvDigest != withoutGovernor.EnvDigest {
+		t.Fatalf("inherited governor values changed digest: with=%q without=%q", withGovernor.EnvDigest, withoutGovernor.EnvDigest)
+	}
+	values := testEnvironmentValues(t, childEnv)
+	if values["AIRA_PY_LIB"] == "" || values["AIRA_PY_LIB"] == "/stale-AIRA_PY_LIB" || values["AIRA_CPU_SLOTS_DIR"] != filepath.Join(r.inputRuntimeDir, "cpuslots") {
+		t.Fatalf("child did not receive authoritative governor values: %v", childEnv)
 	}
 }
 
@@ -947,13 +1000,21 @@ func TestSidecarExtractionFailureDoesNotBlockLaunch(t *testing.T) {
 		childEnv = append([]string(nil), command.Env...)
 		return errors.New("launch reached after sidecar failure")
 	}
-	_, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/true"}, Env: []string{"PATH=/bin"}, ExplicitEnv: true})
+	_, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/true"}, Env: []string{
+		"PATH=/bin",
+		"AIRA_PY_LIB=/stale",
+		"AIRA_CPU_SLOTS_DIR=/stale-slots",
+		"AIRA_CPU_POLL_INTERVAL=99",
+		"AIRA_CPU_MAX_WAIT=99",
+	}, ExplicitEnv: true})
 	if err == nil || !strings.Contains(err.Error(), "launch reached after sidecar failure") {
 		t.Fatalf("sidecar failure blocked or replaced launch result: %v", err)
 	}
 	values := testEnvironmentValues(t, childEnv)
-	if values["AIRA_PY_LIB"] != "" || values["AIRA_CPU_SLOTS_DIR"] != "" {
-		t.Fatalf("failed extraction injected partial sidecar env: %v", childEnv)
+	for _, key := range []string{"AIRA_PY_LIB", "AIRA_CPU_SLOTS_DIR", "AIRA_CPU_POLL_INTERVAL", "AIRA_CPU_MAX_WAIT"} {
+		if _, present := values[key]; present {
+			t.Fatalf("failed extraction retained %s: %v", key, childEnv)
+		}
 	}
 }
 

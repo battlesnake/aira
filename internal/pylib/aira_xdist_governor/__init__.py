@@ -14,6 +14,25 @@ import pytest
 _DEFAULT_POLL_INTERVAL = 0.75
 _DEFAULT_MAX_WAIT = 300.0
 _logged_failure = False
+_held_slot_descriptors = set()
+
+
+def _release_slot(descriptor):
+    _held_slot_descriptors.discard(descriptor)
+    os.close(descriptor)
+
+
+def _close_inherited_slots():
+    descriptors = tuple(_held_slot_descriptors)
+    _held_slot_descriptors.clear()
+    for descriptor in descriptors:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+os.register_at_fork(after_in_child=_close_inherited_slots)
 
 
 def _log_once(message):
@@ -63,12 +82,12 @@ def _visible_slots(directory):
 def _try_slots(paths):
     random.shuffle(paths)
     for path in paths:
-        # O_CLOEXEC prevents an exec'ed descendant retaining the lock. A
-        # multiprocessing fork can still inherit it and pin the advisory slot
-        # beyond the item; callers should avoid forking while an item is gated.
+        # O_CLOEXEC covers exec. The at-fork hook closes inherited copies before
+        # child code can retain the shared flock open-file description.
         descriptor = os.open(path, os.O_RDWR | os.O_CLOEXEC)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _held_slot_descriptors.add(descriptor)
             return descriptor
         except BlockingIOError:
             os.close(descriptor)
@@ -119,6 +138,6 @@ def pytest_runtest_protocol(item, nextitem):
     finally:
         if descriptor is not None:
             try:
-                os.close(descriptor)
+                _release_slot(descriptor)
             except Exception as exc:
                 _log_once(exc)

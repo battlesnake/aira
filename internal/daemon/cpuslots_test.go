@@ -113,43 +113,72 @@ func TestCPUSlotBuildAbortLeavesNoPublishedPartialSet(t *testing.T) {
 }
 
 func TestEnsureCPUSlotsObserverSeesAbsentOrComplete(t *testing.T) {
-	runtimeDir := t.TempDir()
-	target := filepath.Join(runtimeDir, cpuSlotsDirName)
-	stop := make(chan struct{})
-	failures := make(chan error, 1)
-	var observer sync.WaitGroup
-	observer.Add(1)
-	go func() {
-		defer observer.Done()
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			count, err := validateCPUSlots(target)
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			if err != nil || count != 64 {
+	const iterations = 32
+	const slots = 16
+	root := t.TempDir()
+	for iteration := 0; iteration < iterations; iteration++ {
+		runtimeDir := filepath.Join(root, strconv.Itoa(iteration))
+		if err := os.Mkdir(runtimeDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		target := filepath.Join(runtimeDir, cpuSlotsDirName)
+		stop := make(chan struct{})
+		observerReady := make(chan struct{})
+		observedComplete := make(chan struct{})
+		failures := make(chan error, 1)
+		var observer sync.WaitGroup
+		observer.Add(1)
+		go func() {
+			defer observer.Done()
+			published := false
+			close(observerReady)
+			for {
 				select {
-				case failures <- fmt.Errorf("observer count=%d err=%v", count, err):
+				case <-stop:
+					return
 				default:
 				}
-				return
+				count, err := validateCPUSlots(target)
+				if errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+				if err != nil || count != slots {
+					select {
+					case failures <- fmt.Errorf("iteration %d: observer count=%d err=%v", iteration, count, err):
+					default:
+					}
+					return
+				}
+				if !published {
+					close(observedComplete)
+					published = true
+				}
 			}
+		}()
+		<-observerReady
+		if _, err := ensureCPUSlots(runtimeDir, slots); err != nil {
+			close(stop)
+			observer.Wait()
+			t.Fatal(err)
 		}
-	}()
-	_, err := ensureCPUSlots(runtimeDir, 64)
-	close(stop)
-	observer.Wait()
-	if err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case err := <-failures:
-		t.Fatal(err)
-	default:
+		select {
+		case <-observedComplete:
+		case err := <-failures:
+			close(stop)
+			observer.Wait()
+			t.Fatal(err)
+		case <-time.After(2 * time.Second):
+			close(stop)
+			observer.Wait()
+			t.Fatalf("iteration %d never sampled the published population", iteration)
+		}
+		close(stop)
+		observer.Wait()
+		select {
+		case err := <-failures:
+			t.Fatal(err)
+		default:
+		}
 	}
 }
 
