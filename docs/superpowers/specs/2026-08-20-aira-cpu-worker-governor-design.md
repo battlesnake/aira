@@ -1,8 +1,19 @@
-# Embedded sidecar modules + dynamic cross-session CPU-worker governor, v1
+# Embedded sidecar modules + dynamic cross-session CPU-worker governor, v2
 
-**Status:** plan (pre-review). **Milestone:** Phase 5 · CPU-worker governor (task #49).
-**Branch:** `codex-aira-cpu-governor`. **Depends on:** M21 (daemon owns machine-local
-runtime state), #29/D4 (the RAM-admission precedent + advisory-fail-open stance).
+**Status:** plan — Sol plan-review r1 → REQUEST-CHANGES (2 P0 + 3 P1 + 2 P2, all folded);
+this is v2. **Milestone:** Phase 5 · CPU-worker governor (task #49). **Branch:**
+`codex-aira-cpu-governor`. **Depends on:** M21 (daemon owns machine-local runtime state),
+#29/D4 (the RAM-admission precedent + advisory-fail-open stance).
+**v2 folds:** the pytest gate is a `pytest_runtest_protocol` **hookwrapper** (wait precedes
+every phase → not counted in setup/call/teardown durations; `try/finally` release) not an
+in-`runtest_call` wait (Sol r1 P0); the slot dir is created **once and never resized while
+locks may be held** — an N change needs a fresh dir at quiescence (Sol r1 P0); fail-open is
+**total** (every error class + monotonic clock + unconditional `finally`) (Sol r1 P1); the
+cap invariant is scoped to **participating workers, outside bounded fail-open** (Sol r1 P1);
+the unsupported "contention-fair / settle near N/2" claim is dropped for **cap-only, no
+fairness guarantee** + randomized probe/backoff as light anti-starvation (Sol r1 P1);
+extraction is **content-hash**-stamped with an explicit loser path (Sol r1 P2); the
+`gc.collect()` claim is softened to opportunistic Python-object reclaim (Sol r1 P2).
 
 ## 1. Goal and honest scope
 
@@ -25,8 +36,14 @@ modules use:
 
 **Dynamic only (owner cut the static budget).** There is no `AIRA_CPU_BUDGET`. xdist keeps
 one process per core; the module gates whether each worker **runs the next test**: over the
-cap it finishes its current test, `gc.collect()`s, and **sleeps** (stops pulling) until a
-slot frees; under the cap it **wakes**. Total *active* workers across all jobs ≤ `N`.
+cap it finishes its current test, `gc.collect()`s (opportunistically reclaiming unreachable
+Python objects — not a guaranteed OS-RAM release), and **sleeps** (stops pulling) until a
+slot frees; under the cap it **wakes**. **The scoped invariant (Sol r1 P1):** the number of
+*participating* workers holding a slot ≤ `N`, **except** during bounded fail-open. It is
+**not** a hard "total active workers" cap — non-participating jobs (a plain `pytest` with no
+conftest snippet, a `go test` before its module ships) are uncounted, and a max-wait
+fail-open deliberately permits transient `> N`. Honestly a *cap on cooperating workers*,
+not a machine-wide guarantee.
 
 **Honesty / low-risk invariants (load-bearing):**
 - **Advisory, not safety.** CPU oversubscription only costs throughput — there is no
@@ -55,22 +72,36 @@ slot frees; under the cap it **wakes**. Total *active* workers across all jobs �
 
 ### 3.1 Embedded module + exposure (`AIRA_PY_LIB`)
 `go:embed` the Python sidecar source (a package dir) into the binary. A shared helper
-`ExtractPyLib()` extracts it **idempotently and atomically** to a **versioned** dir
-`<XDG_DATA_HOME>/aira/pylib/<version>/` (`<version>` = the aira build version or a content
-hash): if the dir already exists with a matching version-stamp, skip; else extract to a
-temp dir and `rename` into place (atomic; concurrent extractors race harmlessly on the
-rename). The wrappers call it once and set **`AIRA_PY_LIB=<that dir>`** in the child env.
-Stable (not runtime) storage because the source content is stable and reused across runs.
+`ExtractPyLib()` extracts it **idempotently and atomically** to a **content-hash**-stamped
+dir `<XDG_DATA_HOME>/aira/pylib/<sha256-of-embedded-tree>/` — a content hash, **not** the
+build version (Sol r1 P2), so a rebuilt binary whose module bytes changed but version
+didn't still re-extracts, and a matching hash is proof the extracted tree is current. Flow:
+if `<dir>/.ready` exists → skip (fast path). Else extract into a **private** temp dir
+(`<...>/.tmp-<pid>-<rand>/`), write `.ready` last, and `rename` the temp onto `<dir>`. **The
+loser path (Sol r1 P2):** if the `rename` fails because `<dir>` already exists (a concurrent
+winner), the loser **validates** `<dir>/.ready` (the winner finished) and then **removes its
+own private temp**; it never publishes a half-written tree (`.ready` is written before the
+rename, so a crashed extractor leaves an unpublished temp that is never imported). The
+wrappers call it once and set **`AIRA_PY_LIB=<that dir>`**. Stable (XDG_DATA, not runtime)
+storage — content is stable and reused; old-hash dirs are inert (never auto-deleted mid-run).
 AIRA never imports or executes it.
 
 ### 3.2 The flock slot dir (the shared primitive, `AIRA_CPU_SLOTS_DIR`)
-The daemon, on `Serve` startup, creates a **machine-wide** slot dir
-`<RuntimeDir>/cpuslots/` containing `N = max(1, runtime.NumCPU() − reserve)` empty files
-`slot-0 … slot-{N-1}` (idempotent: create missing files, never delete extras). `reserve`
-comes from **`AIRA_DAEMON_CPU_RESERVE`** (default **1** — leave a core for the OS/daemon).
-The dir is created before `Ready` and is machine-wide (one per user/daemon, shared by every
-session and project — the resource being governed is the machine's cores). The wrappers set
+The daemon, on `Serve` startup, **creates the slot dir `<RuntimeDir>/cpuslots/` once** with
+`N = max(1, runtime.NumCPU() − reserve)` empty files `slot-0 … slot-{N-1}` (`reserve` from
+**`AIRA_DAEMON_CPU_RESERVE`**, default **1**). The dir is machine-wide (one per user/daemon;
+the governed resource is the machine's cores) and created before `Ready`. The wrappers set
 **`AIRA_CPU_SLOTS_DIR=<that dir>`** in the child env.
+
+**Sizing is create-once, never a live resize (Sol r1 P0).** If the dir already exists the
+daemon **leaves its file set untouched** — it does **not** add, remove, or replace slot
+files to match a changed `NumCPU`/`reserve`, because a worker may hold an `flock` on an
+existing file: removing/replacing files while locks are held would split the population into
+**disjoint** lock sets and blow the cap. So `N` is fixed at first-creation for the life of
+the dir. `XDG_RUNTIME_DIR` is cleared on reboot/logout, so `N` naturally re-derives then; a
+mid-life resize is **explicitly unsupported** and requires deleting the dir **at quiescence**
+(no workers holding slots). The daemon logs the effective `N` on startup so a stale size is
+visible. (Idempotent "ensure exists" — not "reconcile to current size".)
 
 The **coordination is entirely kernel `flock`** and needs no daemon in the hot path: a
 worker acquires a slot with `flock(LOCK_EX|LOCK_NB)` scanning `slot-0..N-1` for the first
@@ -81,25 +112,45 @@ module fails open (no gating).
 
 ### 3.3 The pytest xdist governor (the v1 consumer)
 A pytest plugin (`aira_xdist_governor`) shipped in the embedded package. **Activation is
-opt-in**: a project adds a two-line snippet to `conftest.py` that, *only when
-`AIRA_PY_LIB` is set*, puts it on `sys.path` and registers it (documented; when unset the
-snippet is a no-op, so committing it is safe for non-AIRA runs). When active it:
-1. Reads `AIRA_CPU_SLOTS_DIR`; if unset/absent → **inactive** (no gating).
-2. Gates each test **before `pytest_runtest_call`** (outside the timed body, so wait time
-   never inflates durations or trips per-test timeouts): try to `flock` a free slot; if
-   none free, `gc.collect()` **once** then sleep `poll_interval` (default ~0.75 s, config
-   `AIRA_CPU_POLL_INTERVAL`) and retry, **re-scanning the dir each poll** so it wakes as
-   soon as another job releases a slot. Hold the slot across the test; release after.
-3. **Bounded fail-open:** if no slot is acquired within a max wait
-   (`AIRA_CPU_MAX_WAIT`, default generous, e.g. 5 min), run the test anyway (advisory —
-   never stall a suite; a genuinely stuck peer must not deadlock this one).
-4. Works for any `-n` incl. `-n0`/`-n1` (single worker just rarely contends) and every
-   `--dist` mode (the gate is per-test-execution, distribution-agnostic).
+opt-in**: a project adds a small snippet to `conftest.py` that, *only when `AIRA_PY_LIB` is
+set*, puts it on `sys.path` and registers it (documented; unset → the snippet is a no-op,
+so committing it is safe for non-AIRA runs). When active:
 
-Total workers *running a test* across all jobs ≤ `N`; two suites contend equally for freed
-slots and settle near `N/2` each; when one ends its slots free and the other's sleeping
-workers wake on their next poll. The `gc.collect()` on sleep is a deliberate second win —
-a sleeping worker also **releases RAM**, easing the memory contention #29 governs.
+1. Reads `AIRA_CPU_SLOTS_DIR`; if unset/absent/unreadable → **inactive** (no gating).
+2. **Gate via a `pytest_runtest_protocol` hookwrapper (Sol r1 P0), not an in-`call` wait.**
+   `@pytest.hookimpl(hookwrapper=True)`: *before* `yield` (which precedes this item's setup,
+   call, and teardown) acquire a slot; `yield` (run the item); release in an unconditional
+   `finally`. Because the acquire-wait happens **before any phase runs**, it is **not**
+   counted in the setup/call/teardown durations pytest reports, and it precedes a
+   call-phase timeout. (`pytest-timeout`: the default *signal* method times only the call
+   phase → unaffected; the *thread* method times the whole item → a long contention wait
+   could count against it, bounded by `AIRA_CPU_MAX_WAIT` — a documented advisory edge, not
+   a correctness bug.) A hookwrapper legitimately holds state around all other
+   implementations, which a plain hook cannot.
+3. **Acquire loop:** scan `slot-0..N-1` in a **randomized order** with `flock(LOCK_EX|
+   LOCK_NB)`, holding the first free fd. If none free, `gc.collect()` **once** then sleep a
+   randomized `poll_interval ± jitter` (base `AIRA_CPU_POLL_INTERVAL`, ~0.75 s) using a
+   **monotonic** deadline, and retry, **re-listing the dir each poll** so a released slot is
+   seen promptly. Randomized probe + jittered backoff are a light anti-starvation measure —
+   **not** a fairness guarantee (see below).
+4. **Bounded, total fail-open (Sol r1 P1):** if no slot is acquired within `AIRA_CPU_MAX_WAIT`
+   (default generous, e.g. 5 min, monotonic), run the item anyway. Moreover **any** error —
+   malformed `POLL_INTERVAL`/`MAX_WAIT`, permission error, dir vanished/mutated, `open`/
+   `flock` failure, interrupted sleep (`EINTR`), or an unexpected exception anywhere in the
+   plugin — is caught, logged once, and **disables gating for that item** (run ungoverned).
+   The plugin must **never** raise into a test or stall a suite; release is always from an
+   unconditional `finally`.
+5. Works for any `-n` incl. `-n0`/`-n1` and every `--dist` mode (the gate is per-item,
+   distribution-agnostic).
+
+**What is and isn't guaranteed.** The plugin caps *participating* workers running an item at
+`≤ N` (outside fail-open); it makes **no fairness guarantee (Sol r1 P1)** — a naive
+first-free scan + poll can, under adversarial churn, favour workers with short tests or
+transiently starve a suite. Randomized probe + jittered backoff reduce systematic bias;
+strict fairness (a real queue / ticket order) is deferred. The `gc.collect()` on sleep may
+opportunistically reclaim unreachable Python objects (it does **not** guarantee returning
+RAM to the OS — Python arenas) — a minor, best-effort tie-in to the memory pressure #29
+governs, not a second RAM mechanism.
 
 ### 3.4 Env vars (all set by `aira run`/`aira time`)
 `AIRA_PY_LIB` (module dir, §3.1) · `AIRA_CPU_SLOTS_DIR` (slot dir, §3.2) ·
@@ -108,39 +159,48 @@ Daemon-level: `AIRA_DAEMON_CPU_RESERVE`.
 
 ## 4. Scope
 
-**In:** §3.1 `go:embed` + idempotent atomic versioned extraction + `AIRA_PY_LIB`; §3.2
-daemon slot-dir creation (`N = NumCPU − reserve`, `AIRA_DAEMON_CPU_RESERVE`) +
-`AIRA_CPU_SLOTS_DIR`; wrappers append the env vars to `cmd.Env` (both `run` and `time`);
-§3.3 the Python `aira_xdist_governor` plugin (pure-flock, gated before `runtest_call`,
-`gc`-on-sleep, dynamic re-scan, bounded fail-open) + the opt-in `conftest` snippet doc.
+**In:** §3.1 `go:embed` + idempotent atomic **content-hash** extraction (+ loser path) +
+`AIRA_PY_LIB`; §3.2 daemon **create-once** slot dir (`N = NumCPU − reserve`,
+`AIRA_DAEMON_CPU_RESERVE`, no live resize) + `AIRA_CPU_SLOTS_DIR`; wrappers append the env
+vars to `cmd.Env` (both `run` and `time`); §3.3 the Python `aira_xdist_governor` plugin
+(pure-flock, `pytest_runtest_protocol` hookwrapper, randomized probe + jittered monotonic
+backoff, `gc`-on-sleep, total fail-open) + the opt-in `conftest` snippet doc.
 
 **Out (stated):** the static `AIRA_CPU_BUDGET` (owner cut it); non-Python language modules
-(Rust/Go — later, same slot dir); strict per-job fairness *quotas* (v1 is contention-fair,
-which already caps oversubscription — the actual goal); any daemon involvement in the
-coordination hot path (pure flock); a new RAM mechanism (#29 owns RAM; `gc`-on-sleep is the
-only tie-in); non-Linux (`flock` + the Linux runner are the target, matching AIRA).
+(Rust/Go — later, same slot dir); **any fairness guarantee** (v1 caps concurrency but a
+queue/ticket order is deferred — Sol r1 P1); **live resizing** of the slot dir (fixed at
+first-creation; change needs a fresh dir at quiescence — Sol r1 P0); any daemon in the
+coordination hot path (pure flock); a new RAM mechanism (#29 owns RAM; `gc`-on-sleep is a
+best-effort tie-in only); non-Linux (`flock` + the Linux runner are the target).
 
 ## 5. Testing
 
 - **Semaphore cap (Go, no python):** many processes each `flock`-acquiring from an `N`-file
-  dir + holding briefly → a shared observed-concurrency counter never exceeds `N`; two
-  "jobs" contend fairly (neither starves).
+  dir + holding briefly → a shared observed-concurrency counter never exceeds `N` (the cap,
+  not fairness, is what's asserted).
 - **Crash auto-release (Go):** a child killed (`SIGKILL`) while holding a slot → the slot is
   immediately re-acquirable by another process (kernel `flock` release; no reaper).
-- **Daemon slot dir:** `Serve` creates `N = NumCPU − reserve` files idempotently (missing
-  ones added, extras untouched), honours `AIRA_DAEMON_CPU_RESERVE` (incl. reserve ≥ NumCPU →
-  floor 1), before `Ready`; survives a restart.
-- **Extraction:** `ExtractPyLib` is idempotent (skip on version match), atomic
-  (temp+rename), concurrent-safe (two extractors → one valid dir), re-extracts on version
-  change; `AIRA_PY_LIB` names a dir Python can import.
+- **Daemon slot dir create-once (Sol r1 P0):** `Serve` creates `N = max(1, NumCPU − reserve)`
+  files honouring `AIRA_DAEMON_CPU_RESERVE` (incl. reserve ≥ NumCPU → floor 1), before
+  `Ready`; a **second start with a different NumCPU/reserve leaves the existing file set
+  untouched** (no add/remove/replace) — assert the file set is unchanged and no lock is
+  disturbed; logs the effective `N`.
+- **Extraction (Sol r1 P2):** `ExtractPyLib` is idempotent (skip on `.ready` present), atomic
+  (private temp + `rename`), concurrent-safe (two extractors → exactly one published dir, the
+  loser validates `.ready` + removes its own temp), re-extracts on a **content-hash** change,
+  never publishes a half-written tree; `AIRA_PY_LIB` names a dir Python can import.
 - **Wrapper env:** `run` and `time` both export `AIRA_PY_LIB` + `AIRA_CPU_SLOTS_DIR` to the
   child (assert on the child's environment); a store-free `run` still works (env-only, no
   store touch).
 - **pytest module (real python, gated behind a `pytest`-available marker):** a conftest
   activating the module + an `N=2` slot dir + a suite instrumented to record max concurrent
-  in-`runtest_call` tests → never exceeds 2; wait time is **not** counted in test duration;
-  `gc.collect` fires only when sleeping; **fail-open** when `AIRA_CPU_SLOTS_DIR` unset and
-  when max-wait exceeded (test still runs); inactive when the conftest snippet isn't present.
+  *in-protocol* tests → never exceeds 2 (the **cap**; no `N/2`-fairness assertion — Sol r1
+  P1); acquire-wait is **not** counted in the reported call/setup/teardown duration (assert
+  a contended test's phase durations exclude wait); `gc.collect` fires only when sleeping.
+- **Total fail-open (Sol r1 P1):** the item still runs (never errors, never hangs) for each
+  of: `AIRA_CPU_SLOTS_DIR` unset; dir absent/removed mid-run; a malformed
+  `POLL_INTERVAL`/`MAX_WAIT`; a permissions error; max-wait exceeded. Assert no exception
+  propagates into the test and the suite completes.
 - **Opt-out / off:** `AIRA_PY_LIB` unset → the conftest snippet is a no-op; module never
   imported → zero effect.
 
@@ -149,34 +209,45 @@ only tie-in); non-Linux (`flock` + the Linux runner are the target, matching AIR
 - **R1 — Python surface in a Go project.** *Mitigation:* embedded source only; AIRA never
   runs it; the consumer is opt-in and self-contained; tests that need a real interpreter are
   marked/skipped when `pytest` is absent so `make test` stays hermetic.
-- **R2 — xdist hook correctness / duration inflation.** *Mitigation:* gate strictly before
-  `pytest_runtest_call`; a real-python test asserts durations exclude wait time and that it
-  works across `--dist` modes + `-n0`.
-- **R3 — a suite stalls on the governor.** *Mitigation:* bounded fail-open (`AIRA_CPU_MAX_
-  WAIT` → run anyway); no daemon in the hot path; kernel-released flocks — no deadlock class
-  exists.
-- **R4 — extraction races / stale versions.** *Mitigation:* atomic temp+rename, version-
-  stamped dir, idempotent skip; old versions are inert (never auto-deleted mid-run).
-- **R5 — advisory drift (a non-participating job oversubscribes).** *Mitigation:* stated
-  honestly — only jobs whose runner imports a sidecar module participate; v1 covers pytest;
-  other languages join as their module lands. Never overclaimed as a hard machine cap.
+- **R2 — xdist hook correctness / duration inflation.** *Mitigation:* a
+  `pytest_runtest_protocol` hookwrapper so the wait precedes all phases; a real-python test
+  asserts phase durations exclude wait time + it works across `--dist` modes + `-n0`; the
+  `pytest-timeout` thread-method edge is documented + bounded by max-wait.
+- **R3 — a suite stalls on the governor.** *Mitigation:* total bounded fail-open (any error
+  or max-wait → run ungoverned); no daemon in the hot path; kernel-released flocks — no
+  deadlock class exists.
+- **R4 — extraction races / stale modules.** *Mitigation:* private-temp + `rename`,
+  content-hash stamp + `.ready`, idempotent skip, explicit loser path; old-hash dirs inert.
+- **R5 — resize splits the lock population.** *Mitigation:* the slot dir is create-once, never
+  resized while locks may be held; a change takes effect only on a fresh dir at quiescence
+  (reboot clears `XDG_RUNTIME_DIR`); the daemon logs the effective `N`.
+- **R6 — advisory drift + no fairness.** *Mitigation:* stated honestly — only jobs importing a
+  sidecar module participate (v1 = pytest); fail-open permits transient `> N`; v1 caps
+  concurrency but gives no fairness guarantee (randomized backoff only). Never overclaimed as
+  a hard machine cap or a fair scheduler.
 
 ## 7. Sol build-review checklist
 
 1. Coordination is pure `flock` — daemon absent from the hot path; a crashed worker / killed
    suite / dead daemon cannot wedge a slot (kernel release); no reaper invented.
-2. Fail-open is total: unset env, absent dir, max-wait, missing conftest → tests run
-   normally; the governor never stalls or fails a suite.
-3. Daemon creates `N = max(1, NumCPU − reserve)` slot files idempotently (missing added,
-   extras kept), before `Ready`, honouring `AIRA_DAEMON_CPU_RESERVE`; machine-wide single
-   dir under `RuntimeDir`.
-4. `go:embed` extraction is idempotent + atomic (temp+rename) + version-stamped +
-   concurrent-safe; `AIRA_PY_LIB` importable; AIRA never executes the module; one static
-   binary / no cgo preserved.
+2. Fail-open is **total**: unset env, absent/removed dir, malformed interval/max-wait,
+   permission/`open`/`flock` error, `EINTR`, max-wait, missing conftest, any plugin
+   exception → tests run normally; monotonic clock; release from an unconditional `finally`;
+   the governor never stalls or fails a suite.
+3. Daemon **create-once** slot dir: `N = max(1, NumCPU − reserve)` before `Ready`, honouring
+   `AIRA_DAEMON_CPU_RESERVE`; a later start with a different size **does not** add/remove/
+   replace files (no disjoint lock populations); machine-wide single dir under `RuntimeDir`;
+   effective `N` logged.
+4. `go:embed` extraction: idempotent + atomic (private temp + `rename`) + **content-hash**-
+   stamped + concurrent-safe with an explicit loser path (validate `.ready`, clean own temp);
+   `AIRA_PY_LIB` importable; AIRA never executes the module; one static binary / no cgo.
 5. Both `run` and `time` export `AIRA_PY_LIB` + `AIRA_CPU_SLOTS_DIR`; no store touch added to
    store-free `run`.
-6. The pytest gate sits before `pytest_runtest_call` (no duration inflation / timeout trip);
-   `gc.collect` only on sleep; dir re-scanned each poll (dynamic wake); active only when
-   opted-in and the dir exists.
+6. The pytest gate is a `pytest_runtest_protocol` **hookwrapper** (wait precedes all phases —
+   no duration inflation; `pytest-timeout` signal-method unaffected, thread-method edge
+   documented + max-wait-bounded); `gc.collect` only on sleep; dir re-listed each poll
+   (dynamic wake); randomized probe + jittered backoff; active only when opted-in and the dir
+   exists.
 7. Honesty: advisory throughput coordination (no OOM-kill analog); dynamic-only (no static
-   budget); contention-fair (quotas deferred); Python is a sidecar AIRA never runs.
+   budget); **cap-only, no fairness guarantee** (queue deferred); the cap is on *participating*
+   workers outside fail-open, not a hard machine total; Python is a sidecar AIRA never runs.
