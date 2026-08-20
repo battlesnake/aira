@@ -1,8 +1,8 @@
 # Embedded sidecar modules + dynamic cross-session CPU-worker governor, v2
 
-**Status:** plan — Sol r1 (2 P0 + 3 P1 + 2 P2) → v2 → Sol r2 (6/7 resolved; P0b needs
-atomic publication) → this is **v3** folding P0b. **Milestone:** Phase 5 · CPU-worker
-governor (task #49). **Branch:**
+**Status:** plan — Sol r1 (2 P0 + 3 P1 + 2 P2) → v2 → Sol r2 (6/7) → v3 → Sol r3 (P0b
+resolved *with* `renameat2(RENAME_NOREPLACE)`) → this is **v4** (both publish points use
+`RENAME_NOREPLACE`); Sol-APPROVED. **Milestone:** Phase 5 · CPU-worker governor (task #49). **Branch:**
 `codex-aira-cpu-governor`. **Depends on:** M21 (daemon owns machine-local runtime state),
 #29/D4 (the RAM-admission precedent + advisory-fail-open stance).
 **v2 folds:** the pytest gate is a `pytest_runtest_protocol` **hookwrapper** (wait precedes
@@ -78,11 +78,12 @@ dir `<XDG_DATA_HOME>/aira/pylib/<sha256-of-embedded-tree>/` — a content hash, 
 build version (Sol r1 P2), so a rebuilt binary whose module bytes changed but version
 didn't still re-extracts, and a matching hash is proof the extracted tree is current. Flow:
 if `<dir>/.ready` exists → skip (fast path). Else extract into a **private** temp dir
-(`<...>/.tmp-<pid>-<rand>/`), write `.ready` last, and `rename` the temp onto `<dir>`. **The
-loser path (Sol r1 P2):** if the `rename` fails because `<dir>` already exists (a concurrent
-winner), the loser **validates** `<dir>/.ready` (the winner finished) and then **removes its
-own private temp**; it never publishes a half-written tree (`.ready` is written before the
-rename, so a crashed extractor leaves an unpublished temp that is never imported). The
+(`<...>/.tmp-<pid>-<rand>/`), write `.ready` last, and publish with **`renameat2(…,
+RENAME_NOREPLACE)`** onto `<dir>`. **The loser path (Sol r1 P2 / r3):** `RENAME_NOREPLACE`
+fails with **`EEXIST`** if `<dir>` already exists at all (not plain `rename`, which could
+replace an empty one); the loser **validates** `<dir>/.ready` (the winner finished) and
+**removes its own private temp**. A half-written tree is never published (`.ready` is written
+before the rename, so a crashed extractor leaves only an unpublished, never-imported temp). The
 wrappers call it once and set **`AIRA_PY_LIB=<that dir>`**. Stable (XDG_DATA, not runtime)
 storage — content is stable and reused; old-hash dirs are inert (never auto-deleted mid-run).
 AIRA never imports or executes it.
@@ -98,11 +99,14 @@ the governed resource is the machine's cores) and created before `Ready`. The wr
 the dir then adding files one-by-one would let a worker (or a mid-creation daemon crash)
 observe a **partial/empty** population and mis-count the cap, possibly permanently. So the
 daemon builds the complete set in a **private temp dir** (`<RuntimeDir>/.cpuslots-<pid>-<rand>/`
-with all N files) and `rename`s it onto `<RuntimeDir>/cpuslots`. An observer therefore sees
-either **no dir** (→ fail-open, no gating) or the **complete N-file dir**, never a partial
-one. If the target already exists (a prior start / a racing daemon published it), the
-`rename` loses; the loser **validates** the existing dir is a complete slot set and removes
-its own temp — it does **not** merge or overwrite (that would re-introduce the resize hazard).
+with all N files) and publishes it with **`renameat2(…, RENAME_NOREPLACE)`** onto
+`<RuntimeDir>/cpuslots`. `RENAME_NOREPLACE` (not plain `rename(2)`, which would *replace* an
+existing **empty** target — Sol r2/r3 P0b) fails with **`EEXIST`** whenever the target exists
+at all. So an observer sees either **no dir** (→ fail-open, no gating) or the **complete
+N-file dir**, never a partial one. On `EEXIST` (a prior start / racing daemon already
+published), the loser **validates** the existing dir is a complete slot set and removes only
+its own temp — it never merges or overwrites (which would re-introduce the resize hazard).
+`RENAME_NOREPLACE` is Linux-native, matching AIRA's Linux target.
 
 **Sizing is create-once, never a live resize (Sol r1 P0).** If the dir already exists the
 daemon **leaves its file set untouched** — it does **not** add, remove, or replace slot
@@ -248,14 +252,15 @@ best-effort tie-in only); non-Linux (`flock` + the Linux runner are the target).
    exception → tests run normally; monotonic clock; release from an unconditional `finally`;
    the governor never stalls or fails a suite.
 3. Daemon **create-once + atomically-published** slot dir: `N = max(1, NumCPU − reserve)`
-   built in a private temp dir and `rename`d in (observers see no dir or the complete set,
-   never partial — even on a mid-creation abort), before `Ready`, honouring
-   `AIRA_DAEMON_CPU_RESERVE`; a later start with a different size **does not** add/remove/
-   replace files (rename loses → validate + drop temp; no disjoint lock populations);
-   machine-wide single dir under `RuntimeDir`; effective `N` logged.
-4. `go:embed` extraction: idempotent + atomic (private temp + `rename`) + **content-hash**-
-   stamped + concurrent-safe with an explicit loser path (validate `.ready`, clean own temp);
-   `AIRA_PY_LIB` importable; AIRA never executes the module; one static binary / no cgo.
+   built in a private temp dir and published with **`renameat2(RENAME_NOREPLACE)`** (observers
+   see no dir or the complete set, never partial — even on a mid-creation abort), before
+   `Ready`, honouring `AIRA_DAEMON_CPU_RESERVE`; a later start with a different size **does
+   not** add/remove/replace files (`EEXIST` → validate + drop temp; no disjoint lock
+   populations); machine-wide single dir under `RuntimeDir`; effective `N` logged.
+4. `go:embed` extraction: idempotent + atomic (private temp + **`renameat2(RENAME_NOREPLACE)`**,
+   never plain `rename` over an empty target) + **content-hash**-stamped + concurrent-safe
+   with an explicit `EEXIST` loser path (validate `.ready`, clean own temp); `AIRA_PY_LIB`
+   importable; AIRA never executes the module; one static binary / no cgo.
 5. Both `run` and `time` export `AIRA_PY_LIB` + `AIRA_CPU_SLOTS_DIR`; no store touch added to
    store-free `run`.
 6. The pytest gate is a `pytest_runtest_protocol` **hookwrapper** (wait precedes all phases —
