@@ -40,11 +40,21 @@ func ticketListViewModel(data listEnvelope) panelModel {
 func readyListViewModel(data listEnvelope) panelModel {
 	model := panelModel{Headers: []string{"ID", "Status", "Kind", "Severity", "Ready", "Verdict"}}
 	for _, item := range data.Rows {
-		ready := "no"
-		if value, ok := item["ready"].(bool); ok && value {
-			ready = "yes"
+		// The batch `ready` verb returns an authoritative per-row `ready` bool.
+		// Present-true → yes, present-false → no. An ABSENT or malformed field is
+		// NOT evidence of "not ready" — render it UNEVALUATED, never a fabricated "no".
+		ready := "UNEVALUATED"
+		style := ""
+		if value, ok := item["ready"].(bool); ok {
+			if value {
+				ready = "yes"
+			} else {
+				ready = "no"
+			}
+		} else {
+			style = "unevaluated"
 		}
-		model.Rows = append(model.Rows, tableRow{ID: textCell(item["id"]), Cells: []string{
+		model.Rows = append(model.Rows, tableRow{ID: textCell(item["id"]), Style: style, Cells: []string{
 			textCell(item["id"]), textCell(item["status"]), textCell(item["kind"]), textCell(item["severity"]), ready, textCell(item["verdict"]),
 		}})
 	}

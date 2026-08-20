@@ -166,11 +166,9 @@ func (r *tuiRuntime) submitCommands(commands []tuiCmd) {
 			r.cancel()
 			return
 		}
-		if !r.executor.submit(command) && r.ctx.Err() == nil {
-			panel := r.state.Panels[command.View]
-			panel.Status, panel.ErrorCode, panel.InFlight = panelError, "E_TUI_BUSY", false
-			r.state.Panels[command.View] = panel
-		}
+		// submit is lossless, so there is no drop path that could corrupt a
+		// panel's InFlight/PendingRefresh state.
+		r.executor.submit(command)
 	}
 }
 
@@ -187,13 +185,29 @@ func (r *tuiRuntime) pump() {
 				default:
 				}
 			}
-			r.app.QueueUpdateDraw(func() {
-				if r.state.ShuttingDown {
-					return
-				}
-				r.applyAsync(message)
-				r.render()
-			})
+			// QueueUpdateDraw is SYNCHRONOUS — it blocks until the tview event
+			// loop runs the closure. If that loop has already exited (a normal
+			// quit, or an abnormal app.Run() return such as a screen-init
+			// failure), the send would block forever, so the coordinator would
+			// deadlock waiting on pumpDone. Deliver it abandonably: once the
+			// context is cancelled, stop waiting and exit (the orphaned goroutine
+			// is harmless — the process is on its way out).
+			done := make(chan struct{})
+			go func() {
+				r.app.QueueUpdateDraw(func() {
+					if r.state.ShuttingDown {
+						return
+					}
+					r.applyAsync(message)
+					r.render()
+				})
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-r.ctx.Done():
+				return
+			}
 		}
 	}
 }

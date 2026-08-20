@@ -31,9 +31,11 @@ func TestListLeasesReturnsEveryHeldLeaseHonestly(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	insert("AIRA-1", "held", "boot-a", 0, 50)
-	insert("AIRA-2", "held", "boot-old", 99, 900)
-	insert("AIRA-3", "held", "boot-a", 101, 900)
+	insert("AIRA-1", "held", "boot-a", 0, 50)     // age 100 > ttl 50 → expired
+	insert("AIRA-2", "held", "boot-old", 99, 900) // prior boot → stale
+	insert("AIRA-3", "held", "boot-a", 101, 900)  // last > sample → concurrently renewed
+	insert("AIRA-5", "held", "boot-a", 50, 50)    // age 50 == ttl 50 → expired (>=, NOT >)
+	insert("AIRA-6", "held", "boot-a", 80, 50)    // age 20 < ttl 50 → live
 	insert("AIRA-4", "free", "", 0, 0)
 
 	rows, err := s.ListLeases(context.Background())
@@ -43,8 +45,8 @@ func TestListLeasesReturnsEveryHeldLeaseHonestly(t *testing.T) {
 	if clock.calls != 1 {
 		t.Fatalf("clock samples=%d, want exactly 1", clock.calls)
 	}
-	if len(rows) != 3 {
-		t.Fatalf("rows=%#v, want exactly the three held rows", rows)
+	if len(rows) != 5 {
+		t.Fatalf("rows=%#v, want exactly the five held rows (free excluded)", rows)
 	}
 	if rows[0].TicketID != "AIRA-1" || !rows[0].Expired || rows[0].AgeNote == "" {
 		t.Fatalf("expired held row=%#v", rows[0])
@@ -54,6 +56,16 @@ func TestListLeasesReturnsEveryHeldLeaseHonestly(t *testing.T) {
 	}
 	if rows[2].TicketID != "AIRA-3" || rows[2].Expired || rows[2].AgeNote != "concurrently renewed" {
 		t.Fatalf("heartbeat-after-sample row=%#v", rows[2])
+	}
+	// age == ttl is the reap boundary: the predicate is >=, so this MUST be
+	// expired. A `>`-only implementation would wrongly report it live.
+	if rows[3].TicketID != "AIRA-5" || !rows[3].Expired {
+		t.Fatalf("age==ttl boundary must be expired (>=): %#v", rows[3])
+	}
+	// age < ttl is genuinely live, with a real (non-marker) age note.
+	if rows[4].TicketID != "AIRA-6" || rows[4].Expired || rows[4].AgeNote == "" ||
+		rows[4].AgeNote == "stale (prior boot)" || rows[4].AgeNote == "concurrently renewed" {
+		t.Fatalf("live lease row=%#v", rows[4])
 	}
 
 	raw, err := json.Marshal(rows)

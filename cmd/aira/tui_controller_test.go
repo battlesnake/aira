@@ -32,11 +32,18 @@ func TestControllerManualRefreshDuringFetchQueuesOneTrailingFetch(t *testing.T) 
 
 func TestControllerLateResultDoesNotClearNewerInFlightFetch(t *testing.T) {
 	state := newTUIState(8)
-	state.Panels[viewTickets] = panelState{Generation: 2, InFlight: true, InFlightGeneration: 2, Status: panelLoading}
-	state, cmds := onTUIFetchResult(state, fetchResult{View: viewTickets, Generation: 1, Model: panelModel{Footer: "stale"}})
+	// Dirty is deliberately TRUE: a superseded (stale-generation) result must not
+	// clear InFlight, must not clear Dirty (dropping the pending trailing refresh),
+	// and must not fold its model/error. It must change NOTHING.
+	state.Panels[viewTickets] = panelState{Generation: 2, InFlight: true, InFlightGeneration: 2, Status: panelLoading, Dirty: true, SelectedID: "AIRA-9", Model: panelModel{Footer: "current"}}
+	state, cmds := onTUIFetchResult(state, fetchResult{View: viewTickets, Generation: 1, Code: "E_STALE", Model: panelModel{Footer: "stale"}})
 	panel := state.Panels[viewTickets]
-	if len(cmds) != 0 || !panel.InFlight || panel.InFlightGeneration != 2 || panel.Model.Footer == "stale" {
-		t.Fatalf("late result altered newer fetch: state=%#v cmds=%#v", panel, cmds)
+	if len(cmds) != 0 {
+		t.Fatalf("stale result emitted commands: %#v", cmds)
+	}
+	if !panel.InFlight || panel.InFlightGeneration != 2 || !panel.Dirty || panel.Generation != 2 ||
+		panel.Status != panelLoading || panel.ErrorCode != "" || panel.SelectedID != "AIRA-9" || panel.Model.Footer != "current" {
+		t.Fatalf("stale result mutated the newer in-flight fetch: %#v", panel)
 	}
 }
 

@@ -46,13 +46,27 @@ func TestDecodeTUIResponseOKCodeAndMalformed(t *testing.T) {
 }
 
 func TestFetchReadyPanelAcceptsMissingOptionalEnvelopeKeys(t *testing.T) {
-	dispatcher := &tuiFakeDispatcher{responses: []core.Response{{OK: true, Code: "OK", RawData: json.RawMessage(`{"total":1,"rows":[{"id":"AIRA-1","ready":true,"verdict":"pass"}]}`)}}}
+	// Rows with ready:true, ready:false, and NO ready field; distribution/truncated
+	// keys absent (empty footer). Critically, an ABSENT ready field renders
+	// UNEVALUATED, never a fabricated "no".
+	dispatcher := &tuiFakeDispatcher{responses: []core.Response{{OK: true, Code: "OK", RawData: json.RawMessage(
+		`{"total":3,"rows":[{"id":"AIRA-1","ready":true},{"id":"AIRA-2","ready":false},{"id":"AIRA-3"}]}`)}}}
 	result := fetchTUIView(context.Background(), dispatcher, daemon.WorktreeScope{}, viewReady, 7)
-	if result.Code != "" || result.Generation != 7 || len(result.Model.Rows) != 1 || result.Model.Footer != "" {
+	if result.Code != "" || result.Generation != 7 || len(result.Model.Rows) != 3 || result.Model.Footer != "" {
 		t.Fatalf("fetch result=%#v", result)
 	}
 	if len(dispatcher.requests) != 1 || dispatcher.requests[0].Verb != "ready" {
 		t.Fatalf("requests=%#v", dispatcher.requests)
+	}
+	// Ready column is index 4 (ID, Status, Kind, Severity, Ready, Verdict).
+	want := []string{"yes", "no", "UNEVALUATED"}
+	for i, expected := range want {
+		if got := result.Model.Rows[i].Cells[4]; got != expected {
+			t.Fatalf("row %d ready cell=%q want %q (absent ready must be UNEVALUATED, not a fabricated no)", i, got, expected)
+		}
+	}
+	if result.Model.Rows[2].Style != "unevaluated" {
+		t.Fatalf("absent-ready row must carry the unevaluated style: %#v", result.Model.Rows[2])
 	}
 }
 

@@ -85,15 +85,18 @@ const (
 	cmdScheduleRefresh
 	cmdReconnect
 	cmdQuit
+	cmdPalette // executor-only; never emitted by a controller transition
 )
 
-// tuiCmd contains only values. The executor interprets it off the UI thread.
+// tuiCmd contains only values (Palette is executor-only). The executor
+// interprets it off the UI thread.
 type tuiCmd struct {
 	Kind       tuiCmdKind
 	View       tuiView
 	Generation int
 	Backoff    time.Duration
 	DetailID   string
+	Palette    *core.Request
 }
 
 type fetchResult struct {

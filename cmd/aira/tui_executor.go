@@ -49,7 +49,9 @@ type tuiExecutor struct {
 	ctx        context.Context
 	dispatcher Dispatcher
 	scope      daemon.WorktreeScope
-	commands   chan tuiCmd
+	mu         sync.Mutex
+	queue      []tuiCmd
+	wake       chan struct{}
 	jobs       chan tuiJob
 	messages   chan tuiMessage
 	reconnect  chan struct{}
@@ -62,7 +64,7 @@ func newTUIExecutor(ctx context.Context, dispatcher Dispatcher, scope daemon.Wor
 	}
 	executor := &tuiExecutor{
 		ctx: ctx, dispatcher: dispatcher, scope: scope,
-		commands: make(chan tuiCmd, 64), jobs: make(chan tuiJob, workers*2),
+		wake: make(chan struct{}, 1), jobs: make(chan tuiJob, workers*2),
 		messages: make(chan tuiMessage, 64), reconnect: make(chan struct{}, 1),
 	}
 	executor.wg.Add(1)
@@ -79,29 +81,34 @@ func newTUIExecutor(ctx context.Context, dispatcher Dispatcher, scope daemon.Wor
 	return executor
 }
 
+// submit is LOSSLESS and non-blocking for the UI goroutine: it appends to an
+// unbounded mutex-backed queue and nudges the command loop. It never drops a
+// command, so a saturated executor can never leave a panel with InFlight/
+// PendingRefresh stuck (the bug a bounded, droppable channel caused).
 func (e *tuiExecutor) submit(command tuiCmd) bool {
+	e.mu.Lock()
+	e.queue = append(e.queue, command)
+	e.mu.Unlock()
 	select {
-	case e.commands <- command:
-		return true
-	case <-e.ctx.Done():
-		return false
+	case e.wake <- struct{}{}:
 	default:
-		return false
 	}
+	return true
 }
 
 func (e *tuiExecutor) submitPalette(request core.Request) bool {
-	select {
-	case e.jobs <- tuiJob{Palette: &request}:
-		return true
-	case <-e.ctx.Done():
-		return false
-	default:
-		return false
-	}
+	return e.submit(tuiCmd{Kind: cmdPalette, Palette: &request})
 }
 
 func (e *tuiExecutor) wait() { e.wg.Wait() }
+
+func (e *tuiExecutor) drainQueue() []tuiCmd {
+	e.mu.Lock()
+	commands := e.queue
+	e.queue = nil
+	e.mu.Unlock()
+	return commands
+}
 
 func (e *tuiExecutor) commandLoop() {
 	defer e.wg.Done()
@@ -109,11 +116,19 @@ func (e *tuiExecutor) commandLoop() {
 		select {
 		case <-e.ctx.Done():
 			return
-		case command := <-e.commands:
+		case <-e.wake:
+		}
+		for _, command := range e.drainQueue() {
 			switch command.Kind {
 			case cmdFetch:
 				select {
 				case e.jobs <- tuiJob{View: command.View, Generation: command.Generation, DetailID: command.DetailID}:
+				case <-e.ctx.Done():
+					return
+				}
+			case cmdPalette:
+				select {
+				case e.jobs <- tuiJob{Palette: command.Palette}:
 				case <-e.ctx.Done():
 					return
 				}
