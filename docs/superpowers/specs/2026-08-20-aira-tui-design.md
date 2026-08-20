@@ -24,10 +24,25 @@ it from an event tail.
 **In scope (v1 — read-only dashboard).**
 
 - A new client-side `aira tui` verb that launches a full-screen dashboard and exits cleanly on `q`.
-- **One small new read primitive: `lease ls`** — `store.ListLeases` (all `state='held'` rows,
-  mirroring the existing `ReapExpiredLeases` query at `internal/store/lease.go:567`) surfaced as a
-  `SafetyRead` core verb returning `[]domain.HeldLease`. This is the honest counterpart to
-  `Claim`/`Release` and makes the coordination view real; the CLI gains it for free.
+- **One small new read primitive: `lease ls`** — `store.ListLeases` reads **all `state='held'`
+  rows** (mirroring the `ReapExpiredLeases` query at `internal/store/lease.go:566-567`; columns are
+  NOT NULL for held rows, `store.go:816-820`, so no schema change) and returns a **new exported wire
+  DTO** `store.HeldLeaseRow` — `{ticket_id, actor, worktree_id, generation, ttl_ns,
+  last_heartbeat_mono_ns, expired bool, age_note string}`. It must **not** be `[]domain.HeldLease`:
+  that type carries no ticket id (it is on the unexported `Lease`), has unexported fields, is
+  marshal-only (no `UnmarshalJSON`), and `NewHeldLease` demands the 32-byte token hash — so it is
+  undecodable from `resp.RawData` by design. **Held-but-expired rows are listed and MARKED, never
+  hidden**: reaping is lazy/advisory and an expired-unreaped held lease still refuses a non-steal
+  `Claim` (`lease.go:249-255`), so hiding it would fabricate "free" while claims bounce. The daemon
+  takes **one** `sampleClock()` and stamps each row with `expired` via the exact reap predicate
+  (`lease.go:581`: `bootID mismatch || monoNS-last ≥ ttl`); a cross-boot row is marked
+  `stale (prior boot)` with **no fabricated age** (the monotonic clock resets across boots). This is
+  the honest counterpart to `Claim`/`Release` and makes the coordination view real. The verb
+  registers like any read verb (`dispatchTable` + a metadata entry — `applyDispatchMetadata` panics
+  if missing, `core.go:1930-1932`; default `RouteDaemon`); it surfaces in **MCP + Skill** too (an
+  `MCPTool` `aira_lease` is required — `applyDispatchMetadata` sets `Include=true`), and the CLI
+  needs its own `case "lease":` in `buildRequest` (unknown verbs are rejected, `main.go:1161-1162`);
+  the descriptor golden tests (`dispatch_metadata_test.go`, `skill_test.go`) gain the new verb.
 - A **sixth thin consumer of the existing `Dispatcher`** (`cmd/aira/dispatcher.go:24`), built as the
   CLI builds it (`newDaemonDispatcher` + `scopeForCWD`, `main.go:162-176`) but handed `io.Discard`
   for stdout/diagnostics (tcell owns the screen — no stray writes may corrupt it). Reads route
@@ -88,29 +103,44 @@ Correctness lives in a **pure controller state machine**, not in tview. Three la
    `cursor int64`, a fixed-size `eventRing`, a coalesced `pendingRefresh` set, and `shuttingDown`.
    Pure transitions return `(AppState, []Cmd)`:
    - `OnKey(k)` → navigation / open-palette / quit; may emit `Fetch{view, gen}` or `Quit`.
-   - `OnFetchResult{view, gen, resp}` → folds the result **only if `gen == panel.generation`**
-     (per-panel singleflight: a newer refresh bumped the generation, so a stale response is
-     dropped), mapping `resp` → a view-model or an error state.
-   - `OnWatchBatch{events, cursor}` → appends to the ring (bounded), advances `cursor`, and computes
-     the **invalidation set** (§7), emitting a coalesced `Fetch` per affected visible panel.
-   - `OnEOF` → emit `Reconnect` (backoff).
-   `Cmd` is a value (`Fetch`, `Reconnect`, `Quit`) — never a closure — so transitions are testable.
-2. **Executor** (impure). Runs `Cmd`s **off the UI thread**: `Fetch` spawns a goroutine that
-   `Dispatch`es and delivers a `msg` on a buffered channel; the watch loop (one goroutine, reusing
-   `decodeWatchResponse`, `watch.go:99`) delivers `WatchBatch`/`EOF` msgs.
+   - `OnFetchResult{view, gen, resp}` → clears the panel's `inFlight`; folds the result **only if
+     `gen == panel.generation`** (per-panel singleflight — a newer refresh bumped the generation, so
+     a stale response is dropped); then, if the panel's `dirty` bit is set (an invalidation arrived
+     while a fetch was in flight), clears it and emits a fresh `Fetch` — a **trailing refresh** that
+     guarantees the final state is always fetched.
+   - `OnWatchBatch{events, cursor}` → appends to the ring (bounded), advances `cursor`, and for each
+     affected visible panel: if a fetch is `inFlight`, set `dirty`; else emit `ScheduleRefresh`
+     (debounce). **At most one in-flight fetch per panel**, ever — never a goroutine per event.
+   - `OnRefreshDue{view}` → if not `inFlight`, bump `generation`, set `inFlight`, emit `Fetch`.
+   - `OnEOF` → emit `Reconnect` with exponential backoff + jitter.
+   `Cmd` is a value (`Fetch`, `ScheduleRefresh`, `Reconnect`, `Quit`) — never a closure — so every
+   transition is table-testable, including sustained-events-with-a-slow-dispatcher converging to a
+   final quiescent fetch.
+2. **Executor** (impure, bounded). Runs `Cmd`s **off the UI thread** with a bounded worker pool:
+   `Fetch` runs `Dispatch` in a worker and delivers a `msg`; `ScheduleRefresh` arms one debounce
+   timer per view (~250 ms; a later `ScheduleRefresh` resets it) that fires `OnRefreshDue`; the
+   watch loop (one goroutine, reusing `decodeWatchResponse`, `watch.go:99`) delivers `WatchBatch`/
+   `EOF` msgs. All delivery is `select{ case ch<-msg: case <-ctx.Done(): }` so nothing blocks after
+   cancel.
 3. **Renderer** (`cmd/aira/tui.go`, thin). A single `render(AppState)` sets widget content from the
-   controller's view-models. tview owns the `App`/`Pages`/widgets and input; `SetInputCapture`
-   forwards keys to `controller.OnKey`. **All `AppState` mutation happens on the UI goroutine**: a
-   pump goroutine drains the msg channel and, for each msg, calls `app.QueueUpdateDraw(func(){ apply
-   the transition; render() })`. So the controller is touched only inside `QueueUpdateDraw` closures
-   (serialized on the UI thread) — race-free — while the blocking `Dispatch`es run in Executor
-   goroutines.
+   controller's view-models. tview owns the `App`/`Pages`/widgets. `AppState` is mutated **only on
+   the UI goroutine, via exactly two entry paths**, both serialized there:
+   - **Keypresses** — `SetInputCapture` handlers already run *on* the tview event-loop goroutine, so
+     they apply the transition + `render()` **inline** and must **not** call `QueueUpdateDraw` (that
+     blocks until the loop runs the closure — i.e. it would deadlock on itself).
+   - **Async msgs** (fetch results, watch batches) — the pump goroutine delivers them via
+     `app.QueueUpdateDraw(func(){ apply the transition; render() })`, which serializes onto the UI
+     goroutine.
+   Blocking `Dispatch`es run only in Executor workers; the controller is never touched off the UI
+   goroutine → race-free.
 
-**Shutdown ordering (avoids the QueueUpdateDraw-after-Stop leak):** on `Quit`, cancel the Executor
-context → the pump goroutine selects on `ctx.Done()` and stops calling `QueueUpdateDraw` → in-flight
-fetch goroutines deliver onto the buffered channel via `select{ case ch<-msg; case <-ctx.Done() }`
-(a post-cancel result is dropped, never blocks) → join Executor + pump → `app.Stop()`. Defined order:
-cancel → drain/join → Stop.
+**Shutdown ordering (avoids the synchronous-`QueueUpdateDraw` deadlock and the after-`Stop` leak):**
+`QueueUpdateDraw` is synchronous, so the UI goroutine must never *join* anything. On `Quit` (a
+keypress, already on the UI goroutine): set `shuttingDown`, `cancel()` the Executor context, and
+**return immediately** — it does not join. A **separate coordinator goroutine** (started at launch)
+waits on `ctx.Done()`, then joins the Executor workers + pump (their `select`-guarded sends drop
+post-cancel, so none is blocked in `QueueUpdateDraw`), then calls `app.Stop()` to unblock the event
+loop. Defined order: UI marks+cancels+returns → coordinator joins workers+pump → `app.Stop()`.
 
 ## 6. Views
 
@@ -124,8 +154,12 @@ the active panel (bumping its generation); `:` opens the palette.
    from a separately-capped `ready` list is truncation, not "blocked" (§8).
 2. **Ready queue** — the `ready` list verb → its own table, with the honest truncated/distribution
    footer. This is the batch readiness view; it never contaminates the Tickets panel.
-3. **Leases (held)** — `lease ls` → table (ticket, holder/actor, worktree, generation, TTL /
-   heartbeat age). The coordination answer to "who holds what right now."
+3. **Leases (held)** — `lease ls` → table (ticket, holder/actor, worktree, generation, TTL, and the
+   daemon-computed `expired`/`stale (prior boot)` marker, §2). The coordination answer to "who holds
+   what right now." Heartbeat renewals are **not** evented (only `lease.claim`/`steal`/`release`/
+   `lapse` are, `lease.go:296-300,451,632`), so this panel's age/staleness refreshes on those events
+   or manual `r`, not continuously; the age is labeled **"as of last refresh"** and never presented
+   as a live wall-clock age.
 4. **Findings** — `find ls` → table (id, ticket, severity, status, unevaluated?) → `find show`
    detail; unevaluated findings are visually distinct.
 5. **Insights** — `insights ls` then one `insights show <name>` per gauge, **all tagged with the
@@ -137,12 +171,20 @@ the active panel (bumping its generation); `:` opens the palette.
 7. **Palette (`:`)** — a `List` of **operation-granular `SafetyRead` entries** from
    `DispatchDescriptors()` (§8). A verb with `Operations` is expanded per operation and filtered by
    `OperationSpec.Safety` (`core.go:278-284`); a verb without operations uses its verb-level
-   `Safety`. So `gate attest`/`gate set` (mutations under a verb-level-`SafetyRead` `gate`) are
-   **excluded**, and `find ls`/`rant get`/`spend ls` (reads under verb-level-mutate verbs) are
-   **included**. Required/positional args are prompted via a form built by joining the operation's
-   `[]OperationArg{Name,Required}` to the verb-level `[]ArgSpec` by name to recover `Enum`/`Kind`
-   (`core.go:240,273`). A tested **descriptor→request parser** validates inputs. Non-read verbs are
-   **not listed at all** in v1 (no disabled entries).
+   `Safety`. So `gate attest`/`gate set`/`gate review` (mutations — see the reclassification below)
+   are **excluded**, and `find ls`/`rant get`/`spend ls` (reads under verb-level-mutate verbs) are
+   **included**. **Prerequisite honesty fix:** `gate review` is declared `SafetyRead` (`core.go:1891`,
+   pinned at `skill_test.go:90`) but its handler routes through `GateAction` (`core.go:1811-1819`),
+   which **writes** the gate audit (`OpenGateAudit(…, true)` + `Append("review")` + mints a challenge
+   nonce, `gate_eval.go:408-416`). The palette is the first face that *executes* on op-granular
+   `Safety`, so this latent mislabel becomes a real write from a read-only surface. Reclassify
+   `gate review` → `SafetyMutate` (core.go:1891 + the `skill_test.go:90` pin) as part of this
+   milestone — a general honesty fix, not a TUI-side denylist. Required/positional args are prompted
+   via a form built by joining the operation's `[]OperationArg{Name,Required}` to the verb-level
+   `[]ArgSpec` by name to recover `Enum`/`Kind` (`core.go:240,273`). A tested **descriptor→request
+   parser** validates inputs. Non-read verbs are **not listed at all** in v1 (no disabled entries).
+   Two v1 pins: the `link` read op is `list` (not `ls`, `core.go:1924`) — display it verbatim; and
+   the carved `run-log` palette form **pins `follow=false`** (a following read blocks indefinitely).
 
 ## 7. Live refresh, bounded and honest
 
@@ -187,27 +229,41 @@ One watch goroutine reuses the CLI exchange (`Dispatch(Verb:"watch")` + `decodeW
 ## 9. Testing
 
 - **Controller (pure, table-driven — where correctness lives):** generation/singleflight (a stale
-  `OnFetchResult` is dropped); `OnWatchBatch` invalidation set for representative events; **every
-  non-read `DispatchDescriptor` (operation-granular) maps to ≥1 panel invalidation**; ready/detail
-  wiring never sets a "blocked" badge from `list`; EOF → reconnect (not quit); the event ring is
-  bounded (oldest evicted); coalescing yields one refresh per burst.
+  `OnFetchResult` is dropped); **at most one in-flight `Fetch` per panel** with the `dirty`
+  **trailing refresh** — a burst of invalidations under a slow dispatcher yields exactly one final
+  fetch at quiescence (no goroutine-per-event); `OnWatchBatch` invalidation set for representative
+  events; **every non-read `DispatchDescriptor` (operation-granular) maps to ≥1 panel invalidation**;
+  ready/detail wiring never sets a "blocked" badge from `list`; EOF → reconnect with backoff (not
+  quit); the event ring is bounded (oldest evicted).
 - **View-models (pure):** ticket rows + truncated/distribution footer at >50; finding rows with a
   distinct unevaluated marker; gauge tiles for value/direction/baseline and
-  **unevaluated-with-reason (≠ 0)** and **per-tile error**; lease rows (holder/ttl/heartbeat).
+  **unevaluated-with-reason (≠ 0)** and **per-tile error**; lease rows including an **`expired`** row
+  and a **`stale (prior boot)`** row rendered distinctly with no fabricated age.
 - **Palette (pure):** the enumerated set equals the **operation-granular** `SafetyRead` subset —
-  explicitly asserting `gate attest`/`gate set` are **NOT** runnable and `find ls`/`rant get` ARE;
-  the descriptor→request parser validates required args and rejects unknown ones.
+  explicitly asserting `gate attest`/`gate set`/**`gate review`** are **NOT** runnable and
+  `find ls`/`rant get` ARE; the descriptor→request parser validates required args and rejects
+  unknown ones; the `run-log` form pins `follow=false`.
+- **`gate review` reclassification:** a test asserts `gate review` is `SafetyMutate` (guarding the
+  regression the `skill_test.go:90` pin previously locked in), so no face — palette included — can
+  invoke it as a read.
 - **Fetch adapter (fake `Dispatcher`):** OK decodes into the typed target; non-OK surfaces `Code`;
   malformed `RawData`/missing optional envelope keys → honest states, never a fabricated value.
 - **Watch integration (fake `Dispatcher`):** cursor advances; `from_now` first, cursor after; EOF
-  reconnects with backoff; concurrent fetch + watch do not race the controller (state touched only
-  in `QueueUpdateDraw`).
-- **tview smoke (`tcell.NewSimulationScreen`):** the app constructs, pages register, `q` quits with
-  the defined cancel→join→Stop order (no leaked goroutine, asserted), `:` opens the palette, and the
-  rendered screen shows the error / unevaluated / truncated states for canned controller states.
-- **`lease ls` primitive:** `store.ListLeases` returns held leases (holder/ticket/gen/ttl), excludes
-  freed/expired; the verb is `SafetyRead` and routes to the daemon; a discriminating store test.
-- **Face parity:** `aira tui` builds the same `(dispatcher, scope)` as the CLI verb path.
+  reconnects with backoff; concurrent fetch + watch do not race the controller.
+- **tview smoke (`tcell.NewSimulationScreen`):** the app constructs, pages register; a **keypress
+  while a fetch is pending** applies inline without deadlock (no `QueueUpdateDraw` from the input
+  handler); `q` **while a fetch and a `QueueUpdateDraw` are both in flight** quits cleanly via the
+  UI-marks-cancel-returns → coordinator-joins → `Stop` order (no leaked goroutine, no deadlock,
+  asserted); `:` opens the palette; the rendered screen shows the error / unevaluated / truncated
+  states for canned controller states.
+- **`lease ls` primitive (store test):** `store.ListLeases` returns a `HeldLeaseRow` per held row
+  with `ticket_id` populated, JSON round-trips through `RawData`, includes an **expired-held** row
+  **marked** `expired` (not omitted), marks a **boot-mismatch** row `stale (prior boot)` with no
+  age, and lists **only** `state='held'` (a `state='free'` row is absent); the verb is `SafetyRead`,
+  routes to the daemon, and surfaces in MCP/Skill (its `MCPTool` present, descriptor goldens
+  updated).
+- **Face parity:** `aira tui` builds the same `(dispatcher, scope)` as the CLI verb path; the CLI
+  `case "lease":` produces a well-formed request.
 
 Every confirmed review counterexample becomes a discriminating regression test. Unit tests need no
 real daemon or terminal; a manual real-HW smoke (launch, drive, observe live events, quit) is
@@ -216,9 +272,10 @@ recorded in the build verification.
 ## 10. Risks
 
 - **Async correctness** (the main risk). Mitigated by the pure controller (all state mutation on the
-  UI goroutine via `QueueUpdateDraw`; blocking Dispatches off-thread), per-panel generations, the
-  defined cancel→join→Stop shutdown, and the `select`-guarded result delivery — all unit-tested, plus
-  the smoke test's leaked-goroutine assertion.
+  UI goroutine via its two serialized entry paths — inline keypresses and `QueueUpdateDraw`-delivered
+  async msgs; blocking Dispatches off-thread), per-panel generation + single-in-flight + trailing
+  refresh, the UI-marks-cancel-returns → coordinator-joins → `Stop` shutdown, and `select`-guarded
+  delivery — all unit-tested, plus the smoke test's deadlock/leak assertions.
 - **Dependency weight** — 8 modules over 2 direct deps; owner-accepted, cgo-free, contained to
   `cmd/aira`, recorded in `go.sum`; `go mod tidy` + build/test in this milestone's verification.
 - **Read amplification** — event-driven invalidation re-fetches panels; bounded (≤50 rows/read) and
