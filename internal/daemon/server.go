@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -87,6 +88,7 @@ type Server struct {
 	storeOpRun           func(context.Context, *store.Store, StoreOpFrame) (any, error)
 	listRegistryEntries  func(string) ([]store.RegistryEntry, error)
 	discoverProject      func(context.Context, string) (app.Project, error)
+	ensureCPUSlotsFn     func(string, int) (int, error)
 }
 
 func NewServer(paths Paths) *Server {
@@ -165,6 +167,24 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	lockHeld = true
 	if err := writeLockInfo(lock); err != nil {
 		return err
+	}
+	desiredSlots, slotErr := desiredCPUSlots(runtime.NumCPU())
+	if slotErr == nil {
+		ensureSlots := ensureCPUSlots
+		if s.ensureCPUSlotsFn != nil {
+			ensureSlots = s.ensureCPUSlotsFn
+		}
+		var effectiveSlots int
+		effectiveSlots, slotErr = ensureSlots(s.Paths.RuntimeDir, desiredSlots)
+		if slotErr == nil {
+			log.Printf("aira daemon: CPU slots effective=%d requested=%d path=%s", effectiveSlots, desiredSlots, filepath.Join(s.Paths.RuntimeDir, cpuSlotsDirName))
+		}
+	}
+	if slotErr != nil {
+		// CPU coordination is advisory. A malformed reserve, unsupported
+		// renameat2 filesystem, or invalid prior population must not prevent
+		// the mandatory daemon from serving its other responsibilities.
+		log.Printf("aira daemon: CPU slot governor disabled: %v", slotErr)
 	}
 	if err := os.Remove(s.Paths.SocketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
