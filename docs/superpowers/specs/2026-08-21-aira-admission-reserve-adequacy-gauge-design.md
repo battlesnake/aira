@@ -1,6 +1,13 @@
 # AIRA §17 admission estimate-vs-actual insight gauge — design
 
-Status: PLAN v3 — **APPROVED** (Sol plan-review r1 CHANGES-NEEDED + Fable
+Status: PLAN v3 — **APPROVED + BUILT** (build reviewed: Sol build-review
+CHANGES-NEEDED [4 P1 + 2 P2] folded — OOM-first already correct; folded: exact
+integer margin bucketing (no float rounding at 1.25/2.0), nullable signature
+`*string` with a distinct `"(signature absent)"` sentinel (NULL ≠ empty ≠ literal
+`"(unsigned)"`), `Direction:"up"` on the absent path, an injectable read-only
+opener seam proving the DSN is used, corrected `shortfall(<1.0)` key, and
+de-porous isolated per-form/per-status/margin-boundary tests). Sol plan-review r1
+CHANGES-NEEDED + Fable
 code-gate r1 GATE-PASS-conditional folded → v2; Sol r2 CHANGES-NEEDED [1 P0
 classification order + grammar/signature/reason] + Fable re-gate
 GATE-PASS-conditional [kill/cancel/lost truncation + nullable signature] folded
@@ -123,7 +130,7 @@ contradict).
   observed-peak-over-reserve = inadequate; adequate requires a completed
   (exited) run; not a causal OOM-protection guarantee").
 - `Breakdown` keyed by `resource_signature` (a run with a NULL signature buckets
-  under `"(unsigned)"`, Sol r2/Fable): per-signature `Count` (evaluable) and a
+  under `"(signature absent)"`; a present-empty signature and a literal `"(unsigned)"` run name stay distinct, Sol build-review P1): per-signature `Count` (evaluable) and a
   `Counts` map {adequate, inadequate, oom_killed, missing_peak, excluded}, cell
   `Value` = per-signature adequacy_rate, or `Unevaluated` when that signature has
   zero evaluable runs. Per-signature cells intentionally summarise the evaluable
@@ -178,7 +185,7 @@ New runner code (`internal/runner/estimate_actual.go`):
 type AdmissionSample struct {
     Signature string // resource_signature; "" when SQL NULL (scanned via
                      // sql.NullString so one NULL row cannot error the whole
-                     // read — Sol r2 P1 / Fable P2; classifier maps "" → "(unsigned)")
+                     // read — Sol r2 P1 / Fable P2; nil signature → "(signature absent)" bucket)
     Basis     string // admission_reserve_basis (estimate-prefixed, by query)
     Status    string // runs.status, e.g. "oom-killed" (NOT NULL by schema)
     Reserve   *int64 // admission_reserve  (nil == SQL NULL)
@@ -266,7 +273,7 @@ classifier, exhaustive table tests** over hand-built `[]runner.AdmissionSample`
    A `starting`/`running` row → `nonterminal`, excluded.
 10. `fallback:*` / `disabled:*` / `""` never reach the classifier (query filters
     them) — a defensive test that a stray fallback row is ignored.
-11. NULL signature (`""`) → `"(unsigned)"` breakdown bucket; mixed NULL/non-NULL
+11. NULL signature (absent) → `"(signature absent)"` bucket, kept distinct from a present-empty `""` and a literal `"(unsigned)"` run name; mixed NULL/non-NULL
     signatures keep independent cells (Sol r2 P1 / Fable P2).
 12. per-signature separation: two signatures keep independent adequacy cells.
 13. mixed population (Sol r1 P1-5): valid+invalid reserve, unknown/near-valid

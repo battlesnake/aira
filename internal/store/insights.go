@@ -99,6 +99,7 @@ func copyAsOf(values map[string]any) map[string]any {
 }
 
 var insightRegistry = []Gauge{
+	{Name: "admission-reserve-adequacy", Title: "Admission reserve vs observed peak RSS", Kind: GaugeKindRatio},
 	{Name: "reviewer-verdict-ratio", Title: "Reviewer verdict kill-rate by source", Kind: GaugeKindRatio},
 	{Name: "recurring-mistakes", Title: "Open findings by category", Kind: GaugeKindDistribution},
 	{Name: "flaky-rate", Title: "Flaky identity-cell rate", Kind: GaugeKindRate},
@@ -113,6 +114,8 @@ var insightRegistry = []Gauge{
 func init() {
 	for i := range insightRegistry {
 		switch insightRegistry[i].Name {
+		case "admission-reserve-adequacy":
+			insightRegistry[i].Compute = computeAdmissionReserveAdequacy
 		case "reviewer-verdict-ratio":
 			insightRegistry[i].Compute = computeReviewerVerdictRatio
 		case "recurring-mistakes":
