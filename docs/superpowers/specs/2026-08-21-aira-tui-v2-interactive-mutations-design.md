@@ -1,7 +1,9 @@
 # AIRA TUI v2 — interactive mutations (design)
 
-Status: PLAN v2 (Sol plan-review r1 CHANGES-NEEDED [3 P0 + 3 P1 + 1 P2] + Fable
-code-gate r1 GATE-PASS-conditional, both folded). Milestone task #53.
+Status: PLAN v3 (Sol plan-review r1 CHANGES-NEEDED [3 P0 + 3 P1 + 1 P2] + Fable
+code-gate r1 GATE-PASS-conditional folded → v2; Sol r2 CHANGES-NEEDED [2 P0:
+forced-refresh for no-event mutations + precise transport-failure classification]
+folded → v3). Milestone task #53.
 Owner-selected (2026-08-21) follow-up to the read-only TUI (#51,
 `docs/superpowers/specs/2026-08-20-aira-tui-design.md` §12 deferral #1).
 Constrained by the no-compat rule (AIRA is not live).
@@ -69,15 +71,24 @@ never silent, never single-key, never duplicated, and never falsely reported**":
    (secure-delete + FTS purge + checkpoint, `store.go:519-521`, `rant.go:259-286`).
    The confirmation for a `Destructive` op additionally requires the operator to
    **type the resolved subject id** (e.g. the rant id) to enable Confirm.
-6. **Honest results — three distinct outcomes, never conflated:**
-   - **Applied** — the daemon returns a definite success response: shown as such.
-   - **Rejected** — the daemon returns an error `Code` (validation, lease-CAS
-     conflict, not-found): the exact `Code` is shown; nothing claims success.
-   - **Outcome-unknown** — a transport/socket error *after send* (the daemon may
-     have committed and lost the response): shown as **`unevaluated`/outcome
-     unknown** (Sol P0), **never** as an ordinary failure. The watch stream (§3)
-     reflects whatever actually committed, so the panels converge to truth
-     regardless; the result banner keeps saying "unknown".
+6. **Honest results — three outcomes, classified by *what transport can prove*,
+   never conflated** (Sol r2 P0):
+   - **Applied** — a well-formed success response arrived: shown as applied.
+   - **Rejected (not applied)** — ONLY two provable cases: (a) a well-formed
+     daemon **error `Code`** (validation, lease-CAS conflict, not-found — the
+     daemon evaluated and refused), or (b) a **provable pre-send failure** (the
+     request frame could not be written to the socket at all, so the daemon never
+     received it). The exact `Code`/reason is shown; nothing claims success.
+   - **Outcome-unknown** — **everything else**: EOF, timeout, decode failure,
+     malformed/empty response, or any missing valid terminal response once the
+     request may have been transmitted. The daemon may have committed and lost the
+     response, so this is shown as **`unevaluated`/outcome unknown** (Sol P0),
+     **never** as failure. If transport cannot prove whether the bytes were sent,
+     the outcome is **conservatively unknown**, not rejected.
+   After an **applied** or **outcome-unknown** result the controller **forces a
+   source-of-truth refresh** of the affected panels (§3) — it does not rely on a
+   watch event, because several admitted mutations emit none. The unknown banner
+   is retained across that refresh.
 7. **Provenance** — git-context / rant-caller stamping happens **client-side in
    the dispatcher before framing** (`dispatcher.go:92-93,452-480`), identical to
    the CLI; the daemon performs the write. The TUI adds no shortcut and loses no
@@ -110,17 +121,23 @@ async delivery only via the pump (`tui.go:154-155,188-210`).
   keys are handled inline on the event loop. Confirm (when enabled) → set
   `PaletteDispatching`, clear `PaletteConfirm`, emit one `cmdPalette`; the result
   arrives as the existing `msgPaletteResult`.
-- **Refresh is WATCH-DRIVEN — not response-keyed** (Fable P1 corrects v1's plan).
-  `invalidatedViews` is consumed only by `onTUIWatchBatch` on daemon **watch
-  events** (`tui_controller.go:248,289`); the palette-result fold does no
-  invalidation and `msgPaletteResult` carries only a formatted string. So the
-  "refresh on success only" property is **emergent and correct**: a successful
-  write inserts an event row (`store.go:1610,1668`, `lease.go:314,465`,
-  `rant.go:110,223,274`) → watch fires → the affected panels re-fetch
-  source-of-truth; a rejected write inserts no row → no refresh. v2 keeps the
-  string result path (no verb/OK bit added). **Known lag** (documented, honest):
-  `spend add`, `quota add`, gate-config, and any mutation that emits no watch
-  event will not auto-refresh a panel until the next watch tick or a manual `r`.
+- **Refresh is response-keyed and forced** (Sol r2 P0; supersedes v2's
+  watch-only idea, which Fable rightly noted removed the response-path
+  invalidation — but watch events alone are insufficient because several admitted
+  mutations emit none). The controller stashes the **dispatched verb** in
+  `AppState` when it emits `cmdPalette`; when `msgPaletteResult` folds back with an
+  **applied** or **outcome-unknown** result, the controller force-invalidates
+  `invalidatedViews(dispatchedVerb, descriptors)` (`tui_controller.go:289`) for
+  the affected panels, forcing a source-of-truth re-fetch. This is
+  **deterministic**: it refreshes even for mutations that record no watch event
+  (`spend add`, `quota add`, gate-config), and it converges panels after an
+  outcome-unknown — which a watch-only mechanism cannot. The daemon **watch
+  stream** still drives refresh for changes made by *other* sessions (unchanged
+  from v1). A definite **rejection** changed nothing, so refresh is unnecessary,
+  but forcing it is harmless; the controller may force-refresh on any completed
+  dispatch for simplicity. `msgPaletteResult` keeps its formatted-string payload;
+  the verb it refreshes on comes from the stashed dispatch state, not a new
+  message field.
 - **One core change** (revises v1's "no core changes"): add `Destructive bool` to
   the operation descriptor and set it on `rant redact`; expose it on the
   `DispatchDescriptor` projection the TUI already reads. No Safety reclassification
@@ -135,10 +152,11 @@ async delivery only via the pump (`tui.go:154-155,188-210`).
 
 - A mutating entry opened but not confirmed dispatches **nothing** (controller
   test: form-submit → confirm-pending, cancel → zero commands).
-- **Rejection vs outcome-unknown are distinct** (§2.6): a daemon error `Code` is a
-  known rejection (no refresh, correctly — no event emitted); a post-send
-  transport error is `unevaluated`/unknown and the watch stream still converges
-  the panels to whatever committed.
+- **Rejection vs outcome-unknown are distinct** (§2.6): a well-formed daemon error
+  `Code` (or a provable pre-send failure) is a known rejection; any ambiguous
+  transport/decode failure is `unevaluated`/unknown. An applied or unknown result
+  **forces** a source-of-truth refresh of the affected panels (§3), so the panels
+  converge to whatever actually committed even for no-watch-event mutations.
 - **Exactly-one dispatch** under key-repeat (§2.4), so an at-most-once verb is not
   double-applied by the UI.
 - The confirmation shows the **immutable resolved** request; mutating the form
@@ -165,12 +183,18 @@ async delivery only via the pump (`tui.go:154-155,188-210`).
 - **Destructive gate** (Sol P1): `rant redact` cannot Confirm until the resolved
   id is typed correctly; a wrong/blank id keeps Confirm disabled. Red vs a generic
   confirm.
-- **Result honesty** (Sol P1-2): daemon error `Code` → shown as rejection;
-  post-send transport error → `unevaluated`/unknown (not failure); empty/malformed
-  response → surfaced honestly, never a fabricated "done". Distinct test per case.
-- **Watch-driven refresh pipeline** (Fable P1): a successful mutation's recorded
-  event drives `invalidatedViews` → panel re-fetch; a rejected mutation records no
-  event → no refresh. (Pipeline/integration test, not a response-keyed unit test.)
+- **Result classification** (Sol r2 P0): per-case controller tests — a well-formed
+  daemon error `Code` → **rejected**; a provable pre-send frame-write failure →
+  **rejected (not applied)**; EOF / timeout / decode failure / malformed / empty /
+  missing-terminal-after-send / unprovable-send → **outcome-unknown**
+  (`unevaluated`), never failure; a well-formed success → **applied**. No path
+  fabricates "done" (red vs treating any transport error as failure — which would
+  hide a committed write).
+- **Forced refresh** (Sol r2 P0): an **applied** and an **outcome-unknown** result
+  each force-invalidate `invalidatedViews(dispatchedVerb)` for the affected panels
+  — deterministic, including no-watch-event verbs (`spend add`, `quota add`,
+  gate-config); red vs a watch-only mechanism that leaves a no-event mutation's
+  panel stale after a successful write.
 - **`link link`** parses to the exact expected request (Fable P2).
 - **Immutable snapshot** (Sol P2): after the confirm modal is shown, mutating the
   form buffer does not change the dispatched request.
@@ -202,9 +226,9 @@ consume it later. A metadata test asserts `rant redact` is the (currently only)
 
 ## 8. Two-loop plan
 
-Sol plan-review r1 + Fable code-gate r1 folded → v2. A final Sol r2 confirms the
-folds; then Terra build (TDD, self-review) → Sol build-review (false-fail +
-false-pass; especially the confirm gate, atomic consume, transport-unknown, and
-the routed-only boundary) → Sol confirm → Opus real-HW verify
-(build/vet/`CGO_ENABLED=0`/test ×2/`-race`; discriminating tests proven red) →
-merge to master (fast-forward, prune worktree).
+Sol plan-review r1 + Fable code-gate r1 → v2; Sol r2 (2 P0) → v3. A final Sol r3
+confirms the v3 folds; then Terra build (TDD, self-review) → Sol build-review
+(false-fail + false-pass; especially the confirm gate, atomic consume,
+transport-unknown classification, forced refresh, and the routed-only boundary) →
+Sol confirm → Opus real-HW verify (build/vet/`CGO_ENABLED=0`/test ×2/`-race`;
+discriminating tests proven red) → merge to master (fast-forward, prune worktree).
