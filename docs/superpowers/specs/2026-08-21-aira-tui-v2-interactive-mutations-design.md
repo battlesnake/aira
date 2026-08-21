@@ -3,7 +3,7 @@
 Status: PLAN v3 (Sol plan-review r1 CHANGES-NEEDED [3 P0 + 3 P1 + 1 P2] + Fable
 code-gate r1 GATE-PASS-conditional folded → v2; Sol r2 CHANGES-NEEDED [2 P0:
 forced-refresh for no-event mutations + precise transport-failure classification]
-folded → v3). Milestone task #53.
+folded → v3; **Sol r3 APPROVE-PLAN**). Milestone task #53.
 Owner-selected (2026-08-21) follow-up to the read-only TUI (#51,
 `docs/superpowers/specs/2026-08-20-aira-tui-design.md` §12 deferral #1).
 Constrained by the no-compat rule (AIRA is not live).
