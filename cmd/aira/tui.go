@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -16,28 +17,36 @@ import (
 )
 
 const (
-	dashboardPage     = "dashboard"
-	palettePage       = "palette"
-	paletteResultPage = "palette-result"
+	dashboardPage      = "dashboard"
+	palettePage        = "palette"
+	paletteConfirmPage = "palette-confirm"
+	paletteResultPage  = "palette-result"
 )
 
 type tuiRuntime struct {
-	app         *tview.Application
-	outerPages  *tview.Pages
-	panelPages  *tview.Pages
-	tabs        *tview.TextView
-	tables      map[tuiView]*tview.Table
-	details     map[tuiView]*tview.TextView
-	footers     map[tuiView]*tview.TextView
-	insights    *tview.TextView
-	paletteList *tview.List
-	state       tuiState
-	descriptors []core.DispatchDescriptor
-	executor    *tuiExecutor
-	ctx         context.Context
-	cancel      context.CancelFunc
-	pumpDone    chan struct{}
-	coordDone   chan struct{}
+	app                  *tview.Application
+	outerPages           *tview.Pages
+	panelPages           *tview.Pages
+	tabs                 *tview.TextView
+	tables               map[tuiView]*tview.Table
+	details              map[tuiView]*tview.TextView
+	footers              map[tuiView]*tview.TextView
+	insights             *tview.TextView
+	paletteList          *tview.List
+	paletteConfirmForm   *tview.Form
+	paletteSubmitButton  *tview.Button
+	paletteSubmit        func()
+	paletteConfirmButton *tview.Button
+	paletteCancelButton  *tview.Button
+	paletteConfirmAction func()
+	paletteCancelAction  func()
+	state                tuiState
+	descriptors          []core.DispatchDescriptor
+	executor             *tuiExecutor
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	pumpDone             chan struct{}
+	coordDone            chan struct{}
 	// queueUpdateStarted is a test-only observation seam. It never carries
 	// state and is nil in production.
 	queueUpdateStarted chan<- struct{}
@@ -139,6 +148,34 @@ func (r *tuiRuntime) buildWidgets() {
 
 func (r *tuiRuntime) captureInput(event *tcell.EventKey) *tcell.EventKey {
 	if r.state.PaletteOpen {
+		if r.state.PaletteConfirm != nil {
+			if event.Key() == tcell.KeyEscape || event.Key() == tcell.KeyRune && event.Rune() == 'n' {
+				r.paletteCancelAction()
+				return nil
+			}
+			if event.Key() == tcell.KeyRune && event.Rune() == 'y' {
+				return nil
+			}
+			if event.Key() == tcell.KeyEnter {
+				switch {
+				case r.paletteCancelButton != nil && r.paletteCancelButton.HasFocus():
+					r.paletteCancelAction()
+				case r.paletteConfirmButton != nil && r.paletteConfirmButton.HasFocus():
+					r.paletteConfirmAction()
+				}
+				return nil
+			}
+		}
+		if r.state.PaletteDispatching && event.Key() == tcell.KeyEnter {
+			return nil
+		}
+		// Consume keyboard form submission at the application capture layer.
+		// This prevents tview's old form child from restoring its focus after a
+		// page replacement performed by its Enter handler.
+		if event.Key() == tcell.KeyEnter && r.paletteSubmit != nil && r.paletteSubmitButton != nil && r.paletteSubmitButton.HasFocus() {
+			r.paletteSubmit()
+			return nil
+		}
 		return event
 	}
 	key := event.Rune()
@@ -228,7 +265,12 @@ func (r *tuiRuntime) applyAsync(message tuiMessage) {
 		panel.Status, panel.ErrorCode = panelError, message.Code
 		r.state.Panels[viewEvents] = panel
 	case msgPaletteResult:
-		r.showPaletteResult(message.PaletteResult)
+		r.state, commands = onPaletteResult(r.state, message.PaletteOutcome, r.descriptors)
+		// The result still drives controller convergence after the operator
+		// closes the flow, but must not pop a modal over the dashboard.
+		if r.state.PaletteOpen {
+			r.showPaletteResult(message.PaletteResult)
+		}
 	case msgDetailResult:
 		r.state, commands = onTUIDetailResult(r.state, message.Detail)
 	}
@@ -331,10 +373,14 @@ func (r *tuiRuntime) renderInsights(panel panelState) {
 
 func (r *tuiRuntime) makePaletteList() *tview.List {
 	list := tview.NewList().ShowSecondaryText(true)
-	list.SetBorder(true).SetTitle(" Read-only palette ")
+	list.SetBorder(true).SetTitle(" Command palette ")
 	for _, item := range buildPalette(r.descriptors) {
 		entry := item
-		list.AddItem(entryKey(entry), entry.Summary, 0, func() { r.openPaletteEntry(entry) })
+		marker := string(entry.Safety)
+		if entry.Destructive {
+			marker += " · DESTRUCTIVE"
+		}
+		list.AddItem(entryKey(entry), marker+" — "+entry.Summary, 0, func() { r.openPaletteEntry(entry) })
 	}
 	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEscape {
@@ -348,7 +394,7 @@ func (r *tuiRuntime) makePaletteList() *tview.List {
 
 func (r *tuiRuntime) showPaletteList() {
 	r.state.PaletteOpen = true
-	r.outerPages.ShowPage(palettePage).SwitchToPage(palettePage)
+	r.outerPages.HidePage(paletteConfirmPage).HidePage(paletteResultPage).ShowPage(palettePage).SwitchToPage(palettePage)
 	r.app.SetFocus(r.paletteList)
 }
 
@@ -359,7 +405,7 @@ func (r *tuiRuntime) openPaletteEntry(entry paletteEntry) {
 			r.showPaletteResult("ERROR " + err.Error())
 			return
 		}
-		r.runPaletteRequest(request)
+		r.submitPaletteEntry(entry, request)
 		return
 	}
 	form := tview.NewForm()
@@ -377,7 +423,14 @@ func (r *tuiRuntime) openPaletteEntry(entry paletteEntry) {
 		fields[arg.Spec.Name] = field
 		form.AddFormItem(field)
 	}
-	form.AddButton("Run", func() {
+	buttonLabel := "Run"
+	if entry.Safety != core.SafetyRead {
+		buttonLabel = "Continue"
+	}
+	form.AddButton(buttonLabel, func() {
+		r.paletteSubmit()
+	})
+	r.paletteSubmit = func() {
 		values := make(map[string]string, len(fields))
 		for name, field := range fields {
 			values[name] = field.GetText()
@@ -387,23 +440,130 @@ func (r *tuiRuntime) openPaletteEntry(entry paletteEntry) {
 			r.showPaletteResult("ERROR " + err.Error())
 			return
 		}
-		r.runPaletteRequest(request)
-	})
+		r.submitPaletteEntry(entry, request)
+	}
+	r.paletteSubmitButton = form.GetButton(0)
 	form.AddButton("Cancel", r.showPaletteList)
 	form.SetCancelFunc(r.showPaletteList)
 	r.outerPages.RemovePage(palettePage).AddPage(palettePage, centeredPrimitive(form, 80, len(entry.Args)+6), true, true)
 	r.app.SetFocus(form)
 }
 
-func (r *tuiRuntime) runPaletteRequest(request core.Request) {
-	if !r.executor.submitPalette(request) {
-		r.showPaletteResult("ERROR E_TUI_BUSY")
+func (r *tuiRuntime) submitPaletteEntry(entry paletteEntry, request core.Request) {
+	var commands []tuiCmd
+	r.state, commands = onPaletteSubmit(r.state, entry, request)
+	r.submitCommands(commands)
+	if r.state.PaletteConfirm != nil {
+		r.showPaletteConfirmation()
 		return
 	}
-	r.showPaletteResult("loading…")
+	if len(commands) > 0 {
+		r.showPaletteResult("dispatching…")
+	}
+}
+
+func (r *tuiRuntime) showPaletteConfirmation() {
+	confirm := r.state.PaletteConfirm
+	if confirm == nil || r.state.PaletteDispatching {
+		return
+	}
+	details := tview.NewTextView().SetWrap(true).SetText(paletteConfirmationText(confirm))
+	details.SetBorder(true).SetTitle(" Resolved request ")
+	form := tview.NewForm()
+	r.paletteSubmit = nil
+	r.paletteSubmitButton = nil
+	r.paletteConfirmForm = form
+	if confirm.Destructive {
+		form.SetBorder(true).SetTitle(" Confirm DESTRUCTIVE mutation ")
+	} else {
+		form.SetBorder(true).SetTitle(" Confirm mutation ")
+	}
+	var idField *tview.InputField
+	if confirm.Destructive && confirm.ConfirmIDTarget != "" {
+		idField = tview.NewInputField().SetLabel("Type " + confirm.ConfirmIDTarget + ": ")
+		form.AddFormItem(idField)
+	}
+	r.paletteConfirmAction = func() {
+		var commands []tuiCmd
+		r.state, commands = onPaletteConfirm(r.state)
+		if len(commands) == 0 {
+			return
+		}
+		r.submitCommands(commands)
+		r.showPaletteResult("dispatching…")
+	}
+	r.paletteCancelAction = func() {
+		r.state, _ = onPaletteCancel(r.state)
+		r.showPaletteList()
+	}
+	form.AddButton("Confirm", r.paletteConfirmAction)
+	form.AddButton("Cancel", r.paletteCancelAction)
+	confirmButton := form.GetButton(0)
+	r.paletteConfirmButton = confirmButton
+	r.paletteCancelButton = form.GetButton(1)
+	confirmButton.SetDisabled(!paletteConfirmEnabled(confirm))
+	if idField != nil {
+		idField.SetChangedFunc(func(text string) {
+			r.state = onPaletteConfirmTypedID(r.state, text)
+			confirmButton.SetDisabled(!paletteConfirmEnabled(r.state.PaletteConfirm))
+		})
+	}
+	cancel := r.paletteCancelAction
+	form.SetCancelFunc(cancel)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape || event.Key() == tcell.KeyRune && event.Rune() == 'n' {
+			cancel()
+			return nil
+		}
+		// There is deliberately no single-key affirmative path.
+		if event.Key() == tcell.KeyRune && event.Rune() == 'y' {
+			return nil
+		}
+		return event
+	})
+	// Buttons follow form items. Confirm is first and Cancel second; focus Cancel
+	// so a stray/form-submit Enter cannot affirm the mutation.
+	form.SetFocus(form.GetFormItemCount() + 1)
+	content := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(details, 0, 1, false).
+		AddItem(form, form.GetFormItemCount()+5, 0, true)
+	r.outerPages.RemovePage(paletteConfirmPage).
+		AddPage(paletteConfirmPage, centeredPrimitive(content, 90, 26), true, true).
+		SwitchToPage(paletteConfirmPage)
+	r.app.SetFocus(form)
+	r.app.SetFocus(form.GetButton(1))
+}
+
+func paletteConfirmationText(confirm *paletteConfirm) string {
+	if confirm == nil {
+		return ""
+	}
+	var out strings.Builder
+	fmt.Fprintf(&out, "Safety: %s\nAction: %s\n", confirm.Safety, confirm.Verb)
+	if confirm.Summary != "" {
+		fmt.Fprintf(&out, "Summary: %s\n", confirm.Summary)
+	}
+	names := make([]string, 0, len(confirm.Request.Args))
+	for name := range confirm.Request.Args {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		fmt.Fprintf(&out, "%s → %v\n", name, confirm.Request.Args[name])
+	}
+	if confirm.ConfirmBlockedReason != "" {
+		fmt.Fprintf(&out, "\n⚠ cannot confirm: %s\n", confirm.ConfirmBlockedReason)
+	}
+	return out.String()
 }
 
 func (r *tuiRuntime) showPaletteResult(text string) {
+	r.paletteSubmit = nil
+	r.paletteSubmitButton = nil
+	r.paletteConfirmAction = nil
+	r.paletteCancelAction = nil
+	r.paletteConfirmButton = nil
+	r.paletteCancelButton = nil
 	result := tview.NewTextView().SetWrap(true).SetScrollable(true).SetText(text)
 	result.SetBorder(true).SetTitle(" Palette result (Esc to close) ")
 	result.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
@@ -414,13 +574,22 @@ func (r *tuiRuntime) showPaletteResult(text string) {
 		return event
 	})
 	r.state.PaletteOpen = true
-	r.outerPages.RemovePage(paletteResultPage).AddPage(paletteResultPage, centeredPrimitive(result, 90, 24), true, true)
+	r.outerPages.RemovePage(paletteResultPage).
+		AddPage(paletteResultPage, centeredPrimitive(result, 90, 24), true, true).
+		SwitchToPage(paletteResultPage)
 	r.app.SetFocus(result)
 }
 
 func (r *tuiRuntime) closePalette() {
+	r.state, _ = onPaletteCancel(r.state)
 	r.state.PaletteOpen = false
-	r.outerPages.HidePage(palettePage).HidePage(paletteResultPage).SwitchToPage(dashboardPage)
+	r.paletteSubmit = nil
+	r.paletteSubmitButton = nil
+	r.paletteConfirmAction = nil
+	r.paletteCancelAction = nil
+	r.paletteConfirmButton = nil
+	r.paletteCancelButton = nil
+	r.outerPages.HidePage(palettePage).HidePage(paletteConfirmPage).HidePage(paletteResultPage).SwitchToPage(dashboardPage)
 	if table := r.tables[r.state.Active]; table != nil {
 		r.app.SetFocus(table)
 	} else {

@@ -15,20 +15,22 @@ type paletteArg struct {
 }
 
 type paletteEntry struct {
-	Verb      string
-	Operation string
-	Summary   string
-	Args      []paletteArg
+	Verb        string
+	Operation   string
+	Summary     string
+	Safety      core.SafetyClass
+	Destructive bool
+	Args        []paletteArg
 }
 
 func buildPalette(descriptors []core.DispatchDescriptor) []paletteEntry {
 	entries := make([]paletteEntry, 0)
 	for _, descriptor := range descriptors {
 		if len(descriptor.Operations) == 0 {
-			if descriptor.Safety != core.SafetyRead {
+			if !paletteOperationAdmitted(descriptor.Name, "", descriptor.Safety) {
 				continue
 			}
-			entry := paletteEntry{Verb: descriptor.Name, Summary: descriptor.Summary}
+			entry := paletteEntry{Verb: descriptor.Name, Summary: descriptor.Summary, Safety: descriptor.Safety, Destructive: descriptor.Destructive}
 			for _, arg := range descriptor.Args {
 				if descriptor.Name == "run-log" && arg.Name == "follow" {
 					continue
@@ -43,10 +45,10 @@ func buildPalette(descriptors []core.DispatchDescriptor) []paletteEntry {
 			byName[arg.Name] = arg
 		}
 		for _, operation := range descriptor.Operations {
-			if operation.Safety != core.SafetyRead {
+			if !paletteOperationAdmitted(descriptor.Name, operation.Name, operation.Safety) {
 				continue
 			}
-			entry := paletteEntry{Verb: descriptor.Name, Operation: operation.Name, Summary: operation.Summary}
+			entry := paletteEntry{Verb: descriptor.Name, Operation: operation.Name, Summary: operation.Summary, Safety: operation.Safety, Destructive: operation.Destructive}
 			for _, operationArg := range operation.Args {
 				spec, ok := byName[operationArg.Name]
 				if !ok {
@@ -61,6 +63,20 @@ func buildPalette(descriptors []core.DispatchDescriptor) []paletteEntry {
 	}
 	sort.Slice(entries, func(i, j int) bool { return entryKey(entries[i]) < entryKey(entries[j]) })
 	return entries
+}
+
+func paletteOperationAdmitted(verb, operation string, safety core.SafetyClass) bool {
+	if safety != core.SafetyRead && safety != core.SafetyMutate && safety != core.SafetyLease {
+		return false
+	}
+	if _, route := core.Classify(verb, operation); route != core.RouteDaemon {
+		return false
+	}
+	return !isPaletteFileContentOperation(verb, operation)
+}
+
+func isPaletteFileContentOperation(verb, operation string) bool {
+	return verb == "import" || verb == "req" && operation == "import" || verb == "test-report" && operation == "add"
 }
 
 func entryKey(entry paletteEntry) string {
@@ -85,6 +101,9 @@ func parsePaletteRequest(entry paletteEntry, values map[string]string) (core.Req
 		switch {
 		case entry.Verb == "link" && entry.Operation == "list":
 			args["list"] = true
+		case entry.Verb == "link" && entry.Operation == "link":
+			// The link handler uses only the list discriminator. The mutation
+			// operation deliberately has no synthetic subverb.
 		default:
 			args["subverb"] = entry.Operation
 		}
@@ -123,7 +142,11 @@ func parsePaletteRequest(entry paletteEntry, values map[string]string) (core.Req
 	if entry.Verb == "run-log" {
 		args["follow"] = false
 	}
-	return core.Request{Verb: entry.Verb, Args: args}, nil
+	request := core.Request{Verb: entry.Verb, Args: args}
+	if _, route := core.ClassifyRequest(request); route != core.RouteDaemon {
+		return core.Request{}, fmt.Errorf("E_SELECTOR_INVALID: %s is unavailable in the daemon-routed palette", entryKey(entry))
+	}
+	return request, nil
 }
 
 func containsString(values []string, target string) bool {

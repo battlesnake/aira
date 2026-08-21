@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -103,6 +104,44 @@ func (d *daemonDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeSc
 		return transportErrorResponse(err)
 	}
 	return response.CoreResponse()
+}
+
+// DispatchPalette preserves transport evidence that the ordinary Dispatcher
+// response intentionally flattens for legacy faces. The TUI uses it to avoid
+// reporting a possibly committed mutation as rejected.
+func (d *daemonDispatcher) DispatchPalette(ctx context.Context, scope daemon.WorktreeScope, request core.Request) paletteDispatchAttempt {
+	canonical, route := core.ClassifyRequest(request)
+	request.Verb = canonical
+	if route != core.RouteDaemon {
+		// The palette is a routed-only, read-only-store face: it must NEVER execute
+		// a client-routed verb locally (Sol build-review P0). A client route here can
+		// only come from a stale entry/adapter/parser regression; reject it as a
+		// provable pre-send failure so nothing is applied and no client handler or
+		// store is touched.
+		return paletteDispatchAttempt{
+			Err:  fmt.Errorf("%s: %s is not daemon-routed and cannot run from the palette", "E_SELECTOR_INVALID", canonical),
+			Send: paletteSendNotSent,
+		}
+	}
+	stampRantCaller(&request)
+	stampGitContext(scope, &request)
+	prepareRoutedRequest(&request)
+	frame := daemon.RequestFrame{Proto: daemon.ProtocolVersion, Scope: scope, Request: request}
+	response, err := d.exchangeWithReplacement(ctx, func(ctx context.Context) (daemon.ResponseFrame, error) {
+		return d.exchangeOrStart(ctx, frame)
+	})
+	if err != nil {
+		send := paletteSendUnprovable
+		if daemon.IsRequestNotSent(err) {
+			send = paletteSendNotSent
+		} else if daemon.IsRequestOutcomeUnknown(err) {
+			send = paletteSendMayHaveBeenSent
+		}
+		return paletteDispatchAttempt{Err: err, Send: send}
+	}
+	malformed := response.OK && (response.Code != "OK" || len(response.Data) > 0 && !json.Valid(response.Data)) ||
+		!response.OK && (response.Code == "" || response.Code == "OK")
+	return paletteDispatchAttempt{Response: response.CoreResponse(), Send: paletteSendMayHaveBeenSent, Malformed: malformed}
 }
 
 func (d *daemonDispatcher) dispatchClient(ctx context.Context, scope daemon.WorktreeScope, request core.Request) core.Response {
@@ -286,6 +325,16 @@ func (d *daemonDispatcher) exchangeOrStartUsing(ctx context.Context, exchange fu
 	if err == nil {
 		return response, nil
 	}
+	if daemon.IsRequestOutcomeUnknown(err) {
+		return daemon.ResponseFrame{}, err
+	}
+	requestNotSent := daemon.IsRequestNotSent(err)
+	markNotSent := func(err error) error {
+		if requestNotSent {
+			return &daemon.RequestNotSentError{Err: err}
+		}
+		return err
+	}
 	if store.ErrorCode(err) != daemon.CodeUnavailable {
 		return daemon.ResponseFrame{}, err
 	}
@@ -294,7 +343,7 @@ func (d *daemonDispatcher) exchangeOrStartUsing(ctx context.Context, exchange fu
 		deadline = contextDeadline
 	}
 	if err := os.MkdirAll(d.paths.RuntimeDir, 0o700); err != nil {
-		return daemon.ResponseFrame{}, fmt.Errorf("%s: %w", daemon.CodeUnavailable, err)
+		return daemon.ResponseFrame{}, markNotSent(fmt.Errorf("%s: %w", daemon.CodeUnavailable, err))
 	}
 	// One loop interleaves two ways to succeed: (a) connect to a daemon a racing
 	// client already started, or (b) win the startup lock and start one ourselves.
@@ -309,10 +358,14 @@ func (d *daemonDispatcher) exchangeOrStartUsing(ctx context.Context, exchange fu
 		// Honour cancellation BEFORE any mutation (remove stale socket / spawn), so
 		// an already-cancelled request never unlinks or launches a daemon.
 		if ctx.Err() != nil {
-			return daemon.ResponseFrame{}, fmt.Errorf("%s: %w", daemon.CodeTimeout, ctx.Err())
+			return daemon.ResponseFrame{}, markNotSent(fmt.Errorf("%s: %w", daemon.CodeTimeout, ctx.Err()))
 		}
 		if response, err := exchange(ctx); err == nil {
 			return response, nil
+		} else if daemon.IsRequestOutcomeUnknown(err) {
+			return daemon.ResponseFrame{}, err
+		} else if !daemon.IsRequestNotSent(err) {
+			requestNotSent = false
 		}
 		if !spawned {
 			if lock, ok := d.tryStartupLock(); ok {
@@ -322,15 +375,20 @@ func (d *daemonDispatcher) exchangeOrStartUsing(ctx context.Context, exchange fu
 				if response, err := exchange(ctx); err == nil {
 					releaseStartupLock(lock)
 					return response, nil
+				} else if daemon.IsRequestOutcomeUnknown(err) {
+					releaseStartupLock(lock)
+					return daemon.ResponseFrame{}, err
+				} else if !daemon.IsRequestNotSent(err) {
+					requestNotSent = false
 				}
 				if removeErr := os.Remove(d.paths.SocketPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 					releaseStartupLock(lock)
-					return daemon.ResponseFrame{}, fmt.Errorf("%s: remove stale socket: %w", daemon.CodeUnavailable, removeErr)
+					return daemon.ResponseFrame{}, markNotSent(fmt.Errorf("%s: remove stale socket: %w", daemon.CodeUnavailable, removeErr))
 				}
 				releaseStartupLock(lock)
 				started, spawnErr := d.spawnDaemon()
 				if spawnErr != nil {
-					return daemon.ResponseFrame{}, fmt.Errorf("%s: start daemon: %w", daemon.CodeUnavailable, spawnErr)
+					return daemon.ResponseFrame{}, markNotSent(fmt.Errorf("%s: start daemon: %w", daemon.CodeUnavailable, spawnErr))
 				}
 				childDone = started
 				spawned = true
@@ -355,14 +413,26 @@ func (d *daemonDispatcher) exchangeOrStartUsing(ctx context.Context, exchange fu
 		}
 		select {
 		case <-ctx.Done():
-			return daemon.ResponseFrame{}, fmt.Errorf("%s: %w", daemon.CodeTimeout, ctx.Err())
+			err := fmt.Errorf("%s: %w", daemon.CodeTimeout, ctx.Err())
+			if requestNotSent {
+				err = &daemon.RequestNotSentError{Err: err}
+			}
+			return daemon.ResponseFrame{}, err
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
 	if childErr != nil && childStderr != "" {
-		return daemon.ResponseFrame{}, fmt.Errorf("%s: daemon did not accept before deadline (%v): %s", daemon.CodeTimeout, childErr, strings.TrimSpace(childStderr))
+		err := fmt.Errorf("%s: daemon did not accept before deadline (%v): %s", daemon.CodeTimeout, childErr, strings.TrimSpace(childStderr))
+		if requestNotSent {
+			err = &daemon.RequestNotSentError{Err: err}
+		}
+		return daemon.ResponseFrame{}, err
 	}
-	return daemon.ResponseFrame{}, errors.New(daemon.CodeTimeout + ": daemon did not accept before deadline")
+	err = errors.New(daemon.CodeTimeout + ": daemon did not accept before deadline")
+	if requestNotSent {
+		err = &daemon.RequestNotSentError{Err: err}
+	}
+	return daemon.ResponseFrame{}, err
 }
 
 // tryStartupLock makes a single non-blocking attempt to take the shared daemon

@@ -7,11 +7,43 @@ import (
 	"encoding/json"
 	"io"
 	"net"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"aira/internal/core"
 )
+
+func TestRequestExchangePreservesSendEvidence(t *testing.T) {
+	request := RequestFrame{Proto: ProtocolVersion, Request: core.Request{Verb: "create"}}
+	_, err := Exchange(context.Background(), filepath.Join(t.TempDir(), "absent.sock"), request)
+	if !IsRequestNotSent(err) || IsRequestOutcomeUnknown(err) {
+		t.Fatalf("dial failure evidence=%T %v", err, err)
+	}
+
+	socket := filepath.Join(t.TempDir(), "daemon.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		var received RequestFrame
+		_ = readFrame(connection, &received)
+		_ = connection.Close() // complete request, missing terminal response.
+	}()
+	_, err = Exchange(context.Background(), socket, request)
+	_ = listener.Close()
+	<-done
+	if !IsRequestOutcomeUnknown(err) || IsRequestNotSent(err) {
+		t.Fatalf("post-send EOF evidence=%T %v", err, err)
+	}
+}
 
 func TestFrameRoundTripPreservesRequestContent(t *testing.T) {
 	content := []byte("one\ntwo\n")

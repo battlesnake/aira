@@ -245,14 +245,60 @@ func IsStoreOpOutcomeUnknown(err error) bool {
 	return errors.As(err, &target)
 }
 
+// RequestNotSentError proves that zero request-frame bytes reached the socket.
+// A mutation wrapped by this error cannot have been evaluated by the daemon.
+type RequestNotSentError struct{ Err error }
+
+func (e *RequestNotSentError) Error() string { return e.Err.Error() }
+func (e *RequestNotSentError) Unwrap() error { return e.Err }
+
+func IsRequestNotSent(err error) bool {
+	var target *RequestNotSentError
+	return errors.As(err, &target)
+}
+
+// RequestOutcomeUnknownError means some request bytes may have reached the
+// daemon but no valid terminal response was established.
+type RequestOutcomeUnknownError struct{ Err error }
+
+// Error delegates to the wrapped error so existing string-prefix code extraction
+// (store.ErrorCode) still recovers E_TIMEOUT/E_UNAVAILABLE for non-TUI callers.
+// The outcome-unknown meaning is carried by the TYPE (IsRequestOutcomeUnknown),
+// not the message; prepending a non-code marker here regressed ErrorCode to
+// E_INTERNAL for every shared-path caller (Sol build-review P1).
+func (e *RequestOutcomeUnknownError) Error() string { return e.Err.Error() }
+func (e *RequestOutcomeUnknownError) Unwrap() error { return e.Err }
+
+func IsRequestOutcomeUnknown(err error) bool {
+	var target *RequestOutcomeUnknownError
+	return errors.As(err, &target)
+}
+
+type countingWriter struct {
+	io.Writer
+	written int64
+}
+
+func (w *countingWriter) Write(data []byte) (int, error) {
+	n, err := w.Writer.Write(data)
+	w.written += int64(n)
+	return n, err
+}
+
 func exchange(ctx context.Context, socket string, request any) (ResponseFrame, error) {
+	_, isStoreOp := request.(StoreOpFrame)
 	dialer := net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "unix", socket)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return ResponseFrame{}, fmt.Errorf("%s: %w", CodeTimeout, err)
+			err = fmt.Errorf("%s: %w", CodeTimeout, err)
+		} else {
+			err = fmt.Errorf("%s: %w", CodeUnavailable, err)
 		}
-		return ResponseFrame{}, fmt.Errorf("%s: %w", CodeUnavailable, err)
+		if !isStoreOp {
+			err = &RequestNotSentError{Err: err}
+		}
+		return ResponseFrame{}, err
 	}
 	defer conn.Close()
 	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
@@ -262,15 +308,24 @@ func exchange(ctx context.Context, socket string, request any) (ResponseFrame, e
 	} else {
 		_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 	}
-	storeOp, isStoreOp := request.(StoreOpFrame)
+	storeOp, _ := request.(StoreOpFrame)
+	writer := &countingWriter{Writer: conn}
 	var writeErr error
 	if isStoreOp {
-		writeErr = writeStoreOp(conn, storeOp)
+		writeErr = writeStoreOp(writer, storeOp)
 	} else {
-		writeErr = writeFrame(conn, request)
+		writeErr = writeFrame(writer, request)
 	}
 	if writeErr != nil {
-		return ResponseFrame{}, wrapTransportError(ctx, writeErr)
+		wrapped := wrapTransportError(ctx, writeErr)
+		if !isStoreOp {
+			if writer.written == 0 {
+				wrapped = &RequestNotSentError{Err: wrapped}
+			} else {
+				wrapped = &RequestOutcomeUnknownError{Err: wrapped}
+			}
+		}
+		return ResponseFrame{}, wrapped
 	}
 	var response ResponseFrame
 	if err := readResponse(conn, &response); err != nil {
@@ -278,7 +333,7 @@ func exchange(ctx context.Context, socket string, request any) (ResponseFrame, e
 		if isStoreOp {
 			return ResponseFrame{}, &StoreOpOutcomeUnknownError{Err: wrapped}
 		}
-		return ResponseFrame{}, wrapped
+		return ResponseFrame{}, &RequestOutcomeUnknownError{Err: wrapped}
 	}
 	return response, nil
 }

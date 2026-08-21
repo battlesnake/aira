@@ -1,6 +1,7 @@
 package main
 
 import (
+	"regexp"
 	"time"
 
 	"aira/internal/core"
@@ -67,16 +68,46 @@ type panelState struct {
 }
 
 type tuiState struct {
-	Active            tuiView
-	Panels            map[tuiView]panelState
-	Cursor            int64
-	Events            []store.WatchEvent
-	EventRingCapacity int
-	PendingRefresh    map[tuiView]bool
-	PaletteOpen       bool
-	ShuttingDown      bool
-	ReconnectAttempt  int
+	Active                tuiView
+	Panels                map[tuiView]panelState
+	Cursor                int64
+	Events                []store.WatchEvent
+	EventRingCapacity     int
+	PendingRefresh        map[tuiView]bool
+	PaletteOpen           bool
+	PaletteConfirm        *paletteConfirm
+	PaletteDispatching    bool
+	PaletteDispatchedVerb string
+	ShuttingDown          bool
+	ReconnectAttempt      int
 }
+
+// paletteConfirm is the immutable, resolved request snapshot displayed by the
+// confirmation page. TypedID is the sole mutable confirmation buffer.
+type paletteConfirm struct {
+	Request              core.Request
+	Summary              string
+	Safety               core.SafetyClass
+	Destructive          bool
+	ConfirmIDTarget      string
+	ConfirmBlockedReason string
+	TypedID              string
+	Verb                 string
+}
+
+var canonicalIDPattern = regexp.MustCompile(`^[A-Z][A-Z0-9]*-[1-9][0-9]*$`)
+
+// isCanonicalID reports whether s is a concrete AIRA id (e.g. RANT-7, AIRA-12),
+// the only form a destructive confirmation will bind its typed-id gate to.
+func isCanonicalID(s string) bool { return canonicalIDPattern.MatchString(s) }
+
+type paletteOutcome string
+
+const (
+	paletteApplied        paletteOutcome = "applied"
+	paletteRejected       paletteOutcome = "rejected"
+	paletteOutcomeUnknown paletteOutcome = "outcome-unknown"
+)
 
 type tuiCmdKind uint8
 
@@ -131,6 +162,11 @@ func newTUIState(eventCapacity int) tuiState {
 
 func cloneTUIState(state tuiState) tuiState {
 	copyState := state
+	if state.PaletteConfirm != nil {
+		confirm := *state.PaletteConfirm
+		confirm.Request = clonePaletteRequest(confirm.Request)
+		copyState.PaletteConfirm = &confirm
+	}
 	copyState.Panels = make(map[tuiView]panelState, len(state.Panels))
 	for view, panel := range state.Panels {
 		panel.Model.Headers = append([]string(nil), panel.Model.Headers...)
@@ -144,6 +180,139 @@ func cloneTUIState(state tuiState) tuiState {
 		copyState.PendingRefresh[view] = pending
 	}
 	return copyState
+}
+
+func clonePaletteRequest(request core.Request) core.Request {
+	copyRequest := request
+	copyRequest.Content = append([]byte(nil), request.Content...)
+	copyRequest.Args = make(map[string]any, len(request.Args))
+	for name, value := range request.Args {
+		copyRequest.Args[name] = clonePaletteValue(value)
+	}
+	if request.GitContext != nil {
+		gitContext := *request.GitContext
+		copyRequest.GitContext = &gitContext
+	}
+	return copyRequest
+}
+
+func clonePaletteValue(value any) any {
+	switch value := value.(type) {
+	case []string:
+		return append([]string(nil), value...)
+	case []byte:
+		return append([]byte(nil), value...)
+	case map[string]any:
+		copyMap := make(map[string]any, len(value))
+		for name, item := range value {
+			copyMap[name] = clonePaletteValue(item)
+		}
+		return copyMap
+	case []any:
+		copySlice := make([]any, len(value))
+		for index, item := range value {
+			copySlice[index] = clonePaletteValue(item)
+		}
+		return copySlice
+	default:
+		return value
+	}
+}
+
+func onPaletteSubmit(state tuiState, entry paletteEntry, request core.Request) (tuiState, []tuiCmd) {
+	state = cloneTUIState(state)
+	if state.PaletteDispatching {
+		return state, nil
+	}
+	request = clonePaletteRequest(request)
+	if entry.Safety == core.SafetyRead {
+		return state, []tuiCmd{{Kind: cmdPalette, Palette: &request}}
+	}
+	verb := entry.Verb
+	if entry.Operation != "" {
+		verb += "." + entry.Operation
+	}
+	target, blockedReason := "", ""
+	if entry.Destructive {
+		// Bind the typed-id gate to a CANONICAL id, never a shorthand/alias that
+		// could resolve elsewhere, and never a non-string selector (Sol build-review
+		// P1). A non-canonical selector leaves the target empty AND records a reason,
+		// so the confirmation is explicitly blocked, not silently un-confirmable.
+		// Validate the selector EXACTLY as it will be dispatched — do not trim a
+		// copy, or the gate would bind to a different value than the request carries
+		// (" RANT-7 " confirmed as RANT-7 yet dispatched with spaces; Sol confirm P1).
+		selector, ok := request.Args["selector"].(string)
+		if ok && isCanonicalID(selector) {
+			target = selector
+		} else {
+			blockedReason = "destructive confirmation requires a canonical id selector (e.g. RANT-7)"
+		}
+	}
+	state.PaletteConfirm = &paletteConfirm{
+		Request: request, Summary: entry.Summary, Safety: entry.Safety,
+		Destructive: entry.Destructive, ConfirmIDTarget: target, ConfirmBlockedReason: blockedReason, Verb: verb,
+	}
+	return state, nil
+}
+
+func onPaletteConfirmTypedID(state tuiState, typed string) tuiState {
+	state = cloneTUIState(state)
+	if state.PaletteConfirm != nil && !state.PaletteDispatching {
+		state.PaletteConfirm.TypedID = typed
+	}
+	return state
+}
+
+func paletteConfirmEnabled(confirm *paletteConfirm) bool {
+	if confirm == nil {
+		return false
+	}
+	return !confirm.Destructive || confirm.ConfirmIDTarget != "" && confirm.TypedID == confirm.ConfirmIDTarget
+}
+
+func onPaletteConfirm(state tuiState) (tuiState, []tuiCmd) {
+	state = cloneTUIState(state)
+	if state.PaletteDispatching || !paletteConfirmEnabled(state.PaletteConfirm) {
+		return state, nil
+	}
+	request := clonePaletteRequest(state.PaletteConfirm.Request)
+	state.PaletteDispatching = true
+	state.PaletteDispatchedVerb = state.PaletteConfirm.Verb
+	state.PaletteConfirm = nil
+	return state, []tuiCmd{{Kind: cmdPalette, Palette: &request}}
+}
+
+func onPaletteCancel(state tuiState) (tuiState, []tuiCmd) {
+	state = cloneTUIState(state)
+	if state.PaletteDispatching {
+		return state, nil
+	}
+	state.PaletteConfirm = nil
+	return state, nil
+}
+
+// onPaletteResult clears the atomic dispatch gate. A definite daemon rejection
+// cannot have changed state, so it deliberately skips refresh; applied and
+// outcome-unknown results force source-of-truth fetches because either may have
+// committed without producing a watch event.
+func onPaletteResult(state tuiState, outcome paletteOutcome, descriptors []core.DispatchDescriptor) (tuiState, []tuiCmd) {
+	state = cloneTUIState(state)
+	if !state.PaletteDispatching {
+		return state, nil
+	}
+	verb := state.PaletteDispatchedVerb
+	state.PaletteDispatching = false
+	state.PaletteDispatchedVerb = ""
+	if outcome == paletteRejected {
+		return state, nil
+	}
+	var commands []tuiCmd
+	for _, view := range invalidatedViews(verb, descriptors) {
+		var refresh []tuiCmd
+		state, refresh = requestPanelRefresh(state, view)
+		commands = append(commands, refresh...)
+	}
+	return state, commands
 }
 
 // requestPanelRefresh is the only transition that begins a panel fetch.

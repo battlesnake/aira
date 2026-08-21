@@ -280,11 +280,12 @@ type OperationArg struct {
 }
 
 type OperationSpec struct {
-	Name    string         `json:"name"`
-	Summary string         `json:"summary"`
-	Safety  SafetyClass    `json:"safety"`
-	Args    []OperationArg `json:"args"`
-	Example []string       `json:"example"`
+	Name        string         `json:"name"`
+	Summary     string         `json:"summary"`
+	Safety      SafetyClass    `json:"safety"`
+	Destructive bool           `json:"destructive"`
+	Args        []OperationArg `json:"args"`
+	Example     []string       `json:"example"`
 }
 
 // DispatchDescriptor is the read-only metadata projection used by generated
@@ -297,6 +298,7 @@ type DispatchDescriptor struct {
 	MCPOperation string          `json:"mcp_operation,omitempty"`
 	Summary      string          `json:"summary"`
 	Safety       SafetyClass     `json:"safety"`
+	Destructive  bool            `json:"destructive"`
 	Include      bool            `json:"include"`
 	Example      []string        `json:"example"`
 	Operations   []OperationSpec `json:"operations,omitempty"`
@@ -370,6 +372,7 @@ type verbSpec struct {
 	MCPOperation string
 	Summary      string
 	Safety       SafetyClass
+	Destructive  bool
 	Include      bool
 	Example      []string
 	Operations   []OperationSpec
@@ -633,7 +636,7 @@ func (c *Core) DispatchDescriptors() []DispatchDescriptor {
 		}
 		result = append(result, DispatchDescriptor{
 			Name: spec.Name, Usage: spec.Usage, Args: args, MCPTool: spec.MCPTool,
-			MCPOperation: spec.MCPOperation, Summary: spec.Summary, Safety: spec.Safety,
+			MCPOperation: spec.MCPOperation, Summary: spec.Summary, Safety: spec.Safety, Destructive: spec.Destructive,
 			Include: spec.Include, Example: copyExample(spec.Example), Operations: operations, GitContext: spec.GitContext,
 		})
 	}
@@ -1854,7 +1857,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 			{Name: "ls", Summary: "List or aggregate recorded rants", Safety: SafetyRead, Args: []OperationArg{{Name: "by"}, {Name: "unreviewed"}, {Name: "since"}, {Name: "tags"}}, Example: []string{"ls", "--unreviewed"}},
 			{Name: "get", Summary: "Read one rant including untrusted prose", Safety: SafetyRead, Args: []OperationArg{{Name: "selector", Required: true}}, Example: []string{"get", "RANT-1"}},
 			{Name: "review", Summary: "Append a review observation", Safety: SafetyMutate, Args: []OperationArg{{Name: "selector", Required: true}, {Name: "outcome"}, {Name: "note"}, {Name: "resolved_by"}}, Example: []string{"review", "RANT-1", "--outcome", "planned"}},
-			{Name: "redact", Summary: "Tombstone a secret-bearing rant body", Safety: SafetyMutate, Args: []OperationArg{{Name: "selector", Required: true}}, Example: []string{"redact", "RANT-1"}},
+			{Name: "redact", Summary: "Tombstone a secret-bearing rant body", Safety: SafetyMutate, Destructive: true, Args: []OperationArg{{Name: "selector", Required: true}}, Example: []string{"redact", "RANT-1"}},
 		}},
 		"show":      {summary: "Show one ticket", safety: SafetyRead, example: []string{"AIRA-1", "--fields", "id"}},
 		"review":    {summary: "Assemble a review briefing", safety: SafetyRead, example: []string{"AIRA-1", "--paths", "internal/store/gate.go,docs/x.md"}},
@@ -1952,7 +1955,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		if !ok {
 			panic("missing dispatch metadata for " + name)
 		}
-		spec.Summary, spec.Safety, spec.Include = entry.summary, entry.safety, true
+		spec.Summary, spec.Safety, spec.Destructive, spec.Include = entry.summary, entry.safety, entry.destructive, true
 		spec.Example = copyExample(entry.example)
 		spec.Operations = append([]OperationSpec(nil), entry.operations...)
 		verbs[name] = spec
@@ -1960,10 +1963,11 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 }
 
 type verbMetadata struct {
-	summary    string
-	safety     SafetyClass
-	example    []string
-	operations []OperationSpec
+	summary     string
+	safety      SafetyClass
+	destructive bool
+	example     []string
+	operations  []OperationSpec
 }
 
 func (c *Core) Help() []map[string]string {

@@ -28,14 +28,44 @@ const (
 )
 
 type tuiMessage struct {
-	Kind          tuiMessageKind
-	Fetch         fetchResult
-	Events        []store.WatchEvent
-	Cursor        int64
-	Code          string
-	PaletteResult string
-	View          tuiView
-	Detail        detailResult
+	Kind           tuiMessageKind
+	Fetch          fetchResult
+	Events         []store.WatchEvent
+	Cursor         int64
+	Code           string
+	PaletteResult  string
+	PaletteOutcome paletteOutcome
+	View           tuiView
+	Detail         detailResult
+}
+
+type paletteSendEvidence uint8
+
+const (
+	paletteSendUnprovable paletteSendEvidence = iota
+	paletteSendNotSent
+	paletteSendMayHaveBeenSent
+)
+
+type paletteDispatchAttempt struct {
+	Response  core.Response
+	Err       error
+	Send      paletteSendEvidence
+	Malformed bool
+	// Evidenceless is set when the dispatcher provided no transport send-evidence
+	// (a plain Dispatcher fallback). A flattened non-success then cannot be
+	// distinguished from a committed-then-lost write, so it must classify as
+	// outcome-unknown, never rejected (Sol build-review P0).
+	Evidenceless bool
+}
+
+type paletteResult struct {
+	Outcome paletteOutcome
+	Text    string
+}
+
+type paletteOutcomeDispatcher interface {
+	DispatchPalette(context.Context, daemon.WorktreeScope, core.Request) paletteDispatchAttempt
 }
 
 type tuiJob struct {
@@ -173,8 +203,8 @@ func (e *tuiExecutor) worker() {
 			return
 		case job := <-e.jobs:
 			if job.Palette != nil {
-				response := e.dispatcher.Dispatch(e.ctx, e.scope, *job.Palette)
-				e.deliver(tuiMessage{Kind: msgPaletteResult, PaletteResult: formatPaletteResponse(response)})
+				result := executePaletteRequest(e.ctx, e.dispatcher, e.scope, *job.Palette)
+				e.deliver(tuiMessage{Kind: msgPaletteResult, PaletteResult: result.Text, PaletteOutcome: result.Outcome})
 				continue
 			}
 			if job.DetailID != "" {
@@ -259,21 +289,68 @@ func waitTUIReconnect(ctx context.Context, reconnect <-chan struct{}) bool {
 	}
 }
 
-func formatPaletteResponse(response core.Response) string {
-	if !response.OK {
-		return fmt.Sprintf("ERROR %s\n%s", response.Code, response.Error)
+func executePaletteRequest(ctx context.Context, dispatcher Dispatcher, scope daemon.WorktreeScope, request core.Request) paletteResult {
+	if outcomeDispatcher, ok := dispatcher.(paletteOutcomeDispatcher); ok {
+		return classifyPaletteDispatch(outcomeDispatcher.DispatchPalette(ctx, scope, request))
 	}
+	// No send-evidence: never label a non-success as rejected (Sol P0).
+	return classifyPaletteDispatch(paletteDispatchAttempt{
+		Response: dispatcher.Dispatch(ctx, scope, request), Send: paletteSendMayHaveBeenSent, Evidenceless: true,
+	})
+}
+
+func classifyPaletteDispatch(attempt paletteDispatchAttempt) paletteResult {
+	if attempt.Err != nil {
+		if attempt.Send == paletteSendNotSent {
+			return paletteResult{Outcome: paletteRejected, Text: fmt.Sprintf("REJECTED (not sent)\n%s", attempt.Err)}
+		}
+		return paletteResult{Outcome: paletteOutcomeUnknown, Text: fmt.Sprintf("UNEVALUATED — outcome unknown\n%s", attempt.Err)}
+	}
+	if attempt.Malformed {
+		return paletteResult{Outcome: paletteOutcomeUnknown, Text: "UNEVALUATED — outcome unknown\nmalformed daemon response"}
+	}
+	response := attempt.Response
+	if !response.OK {
+		// Only a send-evidenced daemon error Code is a provable rejection. Without
+		// send-evidence, a flattened error may be a committed-then-lost write, so it
+		// is outcome-unknown, never rejected (Sol P0).
+		if !attempt.Evidenceless && response.Code != "" && response.Code != "OK" {
+			return paletteResult{Outcome: paletteRejected, Text: fmt.Sprintf("REJECTED %s\n%s", response.Code, response.Error)}
+		}
+		return paletteResult{Outcome: paletteOutcomeUnknown, Text: "UNEVALUATED — outcome unknown\nmissing terminal daemon response"}
+	}
+	if response.Code != "OK" {
+		return paletteResult{Outcome: paletteOutcomeUnknown, Text: "UNEVALUATED — outcome unknown\nmalformed daemon response"}
+	}
+	formatted, ok := formatPaletteSuccess(response)
+	if !ok {
+		return paletteResult{Outcome: paletteOutcomeUnknown, Text: "UNEVALUATED — outcome unknown\nmalformed daemon response data"}
+	}
+	if formatted == "" {
+		return paletteResult{Outcome: paletteApplied, Text: "APPLIED"}
+	}
+	return paletteResult{Outcome: paletteApplied, Text: "APPLIED\n" + formatted}
+}
+
+func formatPaletteSuccess(response core.Response) (string, bool) {
 	data := response.RawData
+	if len(data) == 0 && response.Data != nil {
+		var err error
+		data, err = json.Marshal(response.Data)
+		if err != nil {
+			return "", false
+		}
+	}
 	if len(data) == 0 {
-		data, _ = json.Marshal(response.Data)
+		return "", true
 	}
 	var value any
-	if len(data) == 0 || json.Unmarshal(data, &value) != nil {
-		return "ERROR " + tuiDecodeError
+	if json.Unmarshal(data, &value) != nil {
+		return "", false
 	}
 	pretty, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
-		return "ERROR " + tuiDecodeError
+		return "", false
 	}
-	return string(pretty)
+	return string(pretty), true
 }

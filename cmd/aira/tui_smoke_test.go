@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"aira/internal/core"
 	"aira/internal/daemon"
 	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 )
 
 type tuiSmokeDispatcher struct {
@@ -162,14 +164,15 @@ func TestTUIPaletteOpensOnColon(t *testing.T) {
 	contents := ""
 	for time.Now().Before(deadline) {
 		contents = simulationTextOnUI(t, runtime, screen)
-		if strings.Contains(contents, "Read-only palette") {
+		if strings.Contains(contents, "Command palette") {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if !strings.Contains(contents, "Read-only palette") || !strings.Contains(contents, "find ls") {
+	if !strings.Contains(contents, "Command palette") || !strings.Contains(contents, "find ls") {
 		t.Fatalf("palette not rendered:\n%s", contents)
 	}
+	screen.InjectKey(tcell.KeyEscape, 0, tcell.ModNone)
 	screen.InjectKey(tcell.KeyEscape, 0, tcell.ModNone)
 	screen.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
 	select {
@@ -179,6 +182,251 @@ func TestTUIPaletteOpensOnColon(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("palette TUI did not quit")
+	}
+}
+
+type tuiMutationDispatcher struct {
+	mu       sync.Mutex
+	requests []core.Request
+}
+
+func (d *tuiMutationDispatcher) Dispatch(ctx context.Context, _ daemon.WorktreeScope, request core.Request) core.Response {
+	if request.Verb == "watch" {
+		<-ctx.Done()
+		return core.Response{Code: daemon.CodeUnavailable, Error: ctx.Err().Error()}
+	}
+	if request.Verb == "set" || request.Verb == "count" || request.Verb == "rant" {
+		d.mu.Lock()
+		d.requests = append(d.requests, clonePaletteRequest(request))
+		d.mu.Unlock()
+	}
+	return core.Response{OK: true, Code: "OK", RawData: json.RawMessage(`{"ok":true}`)}
+}
+
+func (d *tuiMutationDispatcher) count(verb string) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	count := 0
+	for _, request := range d.requests {
+		if request.Verb == verb {
+			count++
+		}
+	}
+	return count
+}
+
+// covers: the form-submit Enter, y, Cancel-default Enter, and key repeat are
+// non-affirmative; only navigating to Confirm and pressing Enter dispatches.
+func TestTUIConfirmationRequiresFocusedConfirmEnterAndDispatchesOnce(t *testing.T) {
+	dispatcher := &tuiMutationDispatcher{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	screen := tcell.NewSimulationScreen("UTF-8")
+	screen.SetSize(110, 36)
+	runtime := newTUIRuntime(ctx, dispatcher, daemon.WorktreeScope{}, screen)
+	done := make(chan error, 1)
+	go func() { done <- runtime.run() }()
+	waitForSimulationText(t, runtime, screen, "1:Tickets")
+
+	entry := paletteEntry{
+		Verb: "set", Summary: "set a ticket field", Safety: core.SafetyMutate,
+		Args: []paletteArg{{Spec: core.ArgSpec{Name: "selector", Kind: core.ArgKindString}, Required: true}},
+	}
+	openPaletteEntryOnUI(t, runtime, entry)
+	screen.InjectKey(tcell.KeyRune, 'A', tcell.ModNone)
+	for _, ch := range "IRA-1" {
+		screen.InjectKey(tcell.KeyRune, ch, tcell.ModNone)
+	}
+	screen.InjectKey(tcell.KeyTab, 0, tcell.ModNone)
+	time.Sleep(20 * time.Millisecond)
+	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone) // form submit only.
+	time.Sleep(20 * time.Millisecond)
+	waitForSimulationText(t, runtime, screen, "Confirm mutation")
+	assertConfirmCancelFocused(t, runtime)
+	if got := dispatcher.count("set"); got != 0 {
+		t.Fatalf("form-submit Enter dispatched %d requests", got)
+	}
+	screen.InjectKey(tcell.KeyRune, 'y', tcell.ModNone)
+	time.Sleep(20 * time.Millisecond)
+	if got := dispatcher.count("set"); got != 0 {
+		t.Fatalf("single-key y dispatched %d requests", got)
+	}
+	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone) // default Cancel.
+	time.Sleep(20 * time.Millisecond)
+	if got := dispatcher.count("set"); got != 0 {
+		t.Fatalf("default-focus Enter dispatched %d requests", got)
+	}
+
+	openPaletteEntryOnUI(t, runtime, entry)
+	for _, ch := range "AIRA-1" {
+		screen.InjectKey(tcell.KeyRune, ch, tcell.ModNone)
+	}
+	screen.InjectKey(tcell.KeyTab, 0, tcell.ModNone)
+	time.Sleep(20 * time.Millisecond)
+	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone)
+	time.Sleep(20 * time.Millisecond)
+	waitForSimulationText(t, runtime, screen, "Confirm mutation")
+	assertConfirmCancelFocused(t, runtime)
+	screen.InjectKey(tcell.KeyTab, 0, tcell.ModNone) // Cancel -> Confirm.
+	time.Sleep(20 * time.Millisecond)
+	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone)
+	for i := 0; i < 8; i++ {
+		screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && dispatcher.count("set") == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := dispatcher.count("set"); got != 1 {
+		t.Fatalf("focused Confirm with repeat dispatched %d requests, want exactly 1", got)
+	}
+
+	// A read retains the v1 one-step path and never creates confirmation state.
+	openPaletteEntryOnUI(t, runtime, paletteEntry{Verb: "count", Summary: "count", Safety: core.SafetyRead})
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && dispatcher.count("count") == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	confirmState := make(chan *paletteConfirm, 1)
+	go runtime.app.QueueUpdate(func() { confirmState <- runtime.state.PaletteConfirm })
+	confirm := <-confirmState
+	if got := dispatcher.count("count"); got != 1 || confirm != nil {
+		t.Fatalf("read dispatch count=%d confirm=%#v", got, confirm)
+	}
+
+	screen.InjectKey(tcell.KeyEscape, 0, tcell.ModNone)
+	screen.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("confirmation TUI did not quit")
+	}
+}
+
+func TestTUIDestructiveConfirmationRequiresExactResolvedID(t *testing.T) {
+	dispatcher := &tuiMutationDispatcher{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	screen := tcell.NewSimulationScreen("UTF-8")
+	screen.SetSize(110, 36)
+	runtime := newTUIRuntime(ctx, dispatcher, daemon.WorktreeScope{}, screen)
+	done := make(chan error, 1)
+	go func() { done <- runtime.run() }()
+	waitForSimulationText(t, runtime, screen, "1:Tickets")
+
+	entry := paletteEntryNamed(t, buildPalette(runtime.descriptors), "rant", "redact")
+	openPaletteEntryOnUI(t, runtime, entry)
+	for _, ch := range "RANT-7" {
+		screen.InjectKey(tcell.KeyRune, ch, tcell.ModNone)
+	}
+	screen.InjectKey(tcell.KeyTab, 0, tcell.ModNone)
+	time.Sleep(20 * time.Millisecond)
+	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone)
+	time.Sleep(20 * time.Millisecond)
+	waitForSimulationText(t, runtime, screen, "Type RANT-7")
+
+	checkDisabled := func(want bool) {
+		t.Helper()
+		result := make(chan bool, 1)
+		go runtime.app.QueueUpdate(func() { result <- runtime.paletteConfirmForm.GetButton(0).IsDisabled() })
+		if got := <-result; got != want {
+			t.Fatalf("Confirm disabled=%v, want %v", got, want)
+		}
+	}
+	checkDisabled(true)
+	setConfirmIDOnUI(t, runtime, "RANT-8")
+	checkDisabled(true)
+	screen.InjectKey(tcell.KeyRune, 'y', tcell.ModNone)
+	if got := dispatcher.count("rant"); got != 0 {
+		t.Fatalf("wrong destructive id dispatched %d requests", got)
+	}
+	setConfirmIDOnUI(t, runtime, "RANT-7")
+	checkDisabled(false)
+
+	screen.InjectKey(tcell.KeyEscape, 0, tcell.ModNone)
+	time.Sleep(20 * time.Millisecond)
+	cancelled := make(chan bool, 1)
+	go runtime.app.QueueUpdateDraw(func() {
+		cancelled <- runtime.state.PaletteConfirm == nil
+		runtime.closePalette()
+	})
+	if !<-cancelled {
+		t.Fatal("Escape did not cancel destructive confirmation")
+	}
+	screen.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("destructive confirmation TUI did not quit")
+	}
+}
+
+func TestTUIPaletteResultDoesNotPopAfterFlowWasClosed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	runtime := newTUIRuntime(ctx, &tuiMutationDispatcher{}, daemon.WorktreeScope{}, nil)
+	runtime.state.PaletteOpen = false
+	runtime.state.PaletteDispatching = true
+	runtime.state.PaletteDispatchedVerb = "spend.add"
+	runtime.applyAsync(tuiMessage{Kind: msgPaletteResult, PaletteOutcome: paletteApplied, PaletteResult: "APPLIED"})
+	if page, _ := runtime.outerPages.GetFrontPage(); page != dashboardPage {
+		t.Fatalf("late palette result popped page %q over dashboard", page)
+	}
+	cancel()
+	runtime.executor.wait()
+}
+
+func openPaletteEntryOnUI(t *testing.T, runtime *tuiRuntime, entry paletteEntry) {
+	t.Helper()
+	done := make(chan struct{}, 1)
+	go runtime.app.QueueUpdateDraw(func() {
+		runtime.state.PaletteOpen = true
+		runtime.openPaletteEntry(entry)
+		done <- struct{}{}
+	})
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("opening palette entry deadlocked")
+	}
+}
+
+func assertConfirmCancelFocused(t *testing.T, runtime *tuiRuntime) {
+	t.Helper()
+	type focusState struct {
+		buttons [2]bool
+		focus   string
+	}
+	result := make(chan focusState, 1)
+	go runtime.app.QueueUpdate(func() {
+		result <- focusState{buttons: [2]bool{runtime.paletteConfirmForm.GetButton(0).HasFocus(), runtime.paletteConfirmForm.GetButton(1).HasFocus()}, focus: fmt.Sprintf("%T", runtime.app.GetFocus())}
+	})
+	select {
+	case focused := <-result:
+		if !focused.buttons[1] {
+			t.Fatalf("confirmation default focus is not Cancel (Confirm=%v Cancel=%v app=%s)", focused.buttons[0], focused.buttons[1], focused.focus)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reading confirmation focus deadlocked")
+	}
+}
+
+func setConfirmIDOnUI(t *testing.T, runtime *tuiRuntime, value string) {
+	t.Helper()
+	done := make(chan struct{}, 1)
+	go runtime.app.QueueUpdateDraw(func() {
+		runtime.paletteConfirmForm.GetFormItem(0).(*tview.InputField).SetText(value)
+		done <- struct{}{}
+	})
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("setting confirmation id deadlocked")
 	}
 }
 
@@ -261,7 +509,10 @@ ready:
 
 func waitForSimulationText(t *testing.T, runtime *tuiRuntime, screen tcell.SimulationScreen, needle string) string {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	// Generous under -race + full-suite contention on a loaded box: the tview event
+	// loop can lag well past a second while heavy integration tests run in the same
+	// binary. The wait is a poll, so a fast path still returns immediately.
+	deadline := time.Now().Add(10 * time.Second)
 	text := ""
 	for time.Now().Before(deadline) {
 		text = simulationTextOnUI(t, runtime, screen)
@@ -302,4 +553,50 @@ func simulationText(screen tcell.SimulationScreen) string {
 		}
 	}
 	return out.String()
+}
+
+// verifies: Space at the confirmation modal's DEFAULT (Cancel) focus does not
+// dispatch — it activates Cancel and closes the modal (Sol confirm P1: the
+// Space/mouse activation path was previously unregressed). Any affirmative from
+// the default focus is safe; only deliberate navigation to Confirm can dispatch.
+func TestTUIConfirmationSpaceAtDefaultFocusDoesNotDispatch(t *testing.T) {
+	dispatcher := &tuiMutationDispatcher{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	screen := tcell.NewSimulationScreen("UTF-8")
+	screen.SetSize(110, 36)
+	runtime := newTUIRuntime(ctx, dispatcher, daemon.WorktreeScope{}, screen)
+	done := make(chan error, 1)
+	go func() { done <- runtime.run() }()
+	waitForSimulationText(t, runtime, screen, "1:Tickets")
+
+	entry := paletteEntry{
+		Verb: "set", Summary: "set a ticket field", Safety: core.SafetyMutate,
+		Args: []paletteArg{{Spec: core.ArgSpec{Name: "selector", Kind: core.ArgKindString}, Required: true}},
+	}
+	openPaletteEntryOnUI(t, runtime, entry)
+	for _, ch := range "AIRA-1" {
+		screen.InjectKey(tcell.KeyRune, ch, tcell.ModNone)
+	}
+	screen.InjectKey(tcell.KeyTab, 0, tcell.ModNone)
+	time.Sleep(20 * time.Millisecond)
+	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone) // form submit -> confirmation
+	time.Sleep(20 * time.Millisecond)
+	waitForSimulationText(t, runtime, screen, "Confirm mutation")
+	assertConfirmCancelFocused(t, runtime)
+
+	// Space with default (Cancel) focus must NOT dispatch (it cancels).
+	screen.InjectKey(tcell.KeyRune, ' ', tcell.ModNone)
+	time.Sleep(40 * time.Millisecond)
+	if got := dispatcher.count("set"); got != 0 {
+		t.Fatalf("Space at default focus dispatched %d requests", got)
+	}
+	waitForSimulationText(t, runtime, screen, "1:Tickets") // modal closed back to dashboard
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runtime did not exit after cancel")
+	}
 }

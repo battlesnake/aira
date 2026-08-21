@@ -394,6 +394,33 @@ func TestDispatchDescriptorsAreStableReadOnlyCopies(t *testing.T) {
 	}
 }
 
+// verifies: destructive metadata is centrally owned and never inferred from a
+// broad safety class by a generated face.
+func TestRantRedactIsTheOnlyDestructiveOperation(t *testing.T) {
+	var destructive []string
+	for _, descriptor := range New(nil).DispatchDescriptors() {
+		if descriptor.Destructive {
+			destructive = append(destructive, descriptor.Name)
+			if descriptor.Safety == SafetyRead {
+				t.Fatalf("read descriptor %q is destructive", descriptor.Name)
+			}
+		}
+		for _, operation := range descriptor.Operations {
+			if !operation.Destructive {
+				continue
+			}
+			name := descriptor.Name + " " + operation.Name
+			destructive = append(destructive, name)
+			if operation.Safety == SafetyRead {
+				t.Fatalf("read operation %q is destructive", name)
+			}
+		}
+	}
+	if want := []string{"rant redact"}; !reflect.DeepEqual(destructive, want) {
+		t.Fatalf("destructive descriptors=%v, want %v", destructive, want)
+	}
+}
+
 func TestCanonicalDispatchNamesAndAliases(t *testing.T) {
 	descriptors := New(nil).DispatchDescriptors()
 	got := make([]string, 0, len(descriptors))
