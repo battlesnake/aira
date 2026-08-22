@@ -1,0 +1,711 @@
+//go:build linux
+
+package runner
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"aira/internal/pylib"
+	"golang.org/x/sys/unix"
+)
+
+const (
+	confineHandshakeSchema  = 1
+	confineHandshakeMaxSize = 4096
+	confineSetupFD          = 3
+	confineReleaseFD        = 4
+	confineOOMScoreAdj      = 500
+	confineNice             = 19
+	confineIOPriorityClass  = 3
+)
+
+type confineHandshake struct {
+	Schema      int  `json:"schema"`
+	OOMScoreAdj bool `json:"oom_score_adj"`
+	Nice        bool `json:"nice"`
+	IONice      bool `json:"ionice"`
+}
+
+func (result confineHandshake) applied() bool {
+	return result.Schema == confineHandshakeSchema && result.OOMScoreAdj && result.Nice && result.IONice
+}
+
+func parseConfineHandshake(payload []byte) (confineHandshake, bool) {
+	var result confineHandshake
+	if len(payload) == 0 || len(payload) > confineHandshakeMaxSize || payload[len(payload)-1] != '\n' || bytes.Count(payload, []byte{'\n'}) != 1 {
+		return result, false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload[:len(payload)-1]))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&result); err != nil || !result.applied() {
+		return result, false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return confineHandshake{}, false
+	}
+	return result, true
+}
+
+type confineCommand struct {
+	cmd     *exec.Cmd
+	mu      sync.Mutex
+	process *os.Process
+}
+
+func (command *confineCommand) Start() error {
+	command.mu.Lock()
+	defer command.mu.Unlock()
+	err := command.cmd.Start()
+	command.process = command.cmd.Process
+	return err
+}
+
+func (command *confineCommand) Process() *os.Process {
+	command.mu.Lock()
+	defer command.mu.Unlock()
+	return command.process
+}
+
+type confineLockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (writer *confineLockedWriter) Write(payload []byte) (int, error) {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	return writer.w.Write(payload)
+}
+
+type confineDeps struct {
+	resolveSlicePath func(string) (string, bool, string)
+	newBackend       func(string) ScopeBackend
+	admit            func(context.Context, string, ConfineRequest, int64) (admissionResult, error)
+	writeOOMGroup    func(Scope) error
+	start            func(*confineCommand) error
+	readHandshake    func(*os.File, time.Duration) ([]byte, error)
+	readCap          func(string) (int64, bool)
+	signalSource     func() (<-chan os.Signal, func())
+}
+
+func defaultConfineDeps() confineDeps {
+	return confineDeps{
+		resolveSlicePath: resolveSlicePath,
+		newBackend:       newDefaultBackend,
+		admit:            admitConfine,
+		writeOOMGroup:    writeConfineOOMGroup,
+		start:            func(command *confineCommand) error { return command.Start() },
+		readHandshake:    readConfineHandshake,
+		readCap:          effectiveConfineCap,
+		signalSource:     confineSignalSource,
+	}
+}
+
+func fillConfineDeps(deps confineDeps) confineDeps {
+	defaults := defaultConfineDeps()
+	if deps.resolveSlicePath == nil {
+		deps.resolveSlicePath = defaults.resolveSlicePath
+	}
+	if deps.newBackend == nil {
+		deps.newBackend = defaults.newBackend
+	}
+	if deps.admit == nil {
+		deps.admit = defaults.admit
+	}
+	if deps.writeOOMGroup == nil {
+		deps.writeOOMGroup = defaults.writeOOMGroup
+	}
+	if deps.start == nil {
+		deps.start = defaults.start
+	}
+	if deps.readHandshake == nil {
+		deps.readHandshake = defaults.readHandshake
+	}
+	if deps.readCap == nil {
+		deps.readCap = defaults.readCap
+	}
+	if deps.signalSource == nil {
+		deps.signalSource = defaults.signalSource
+	}
+	return deps
+}
+
+func confine(ctx context.Context, request ConfineRequest) (ConfineResult, error) {
+	return confineWithDeps(ctx, request, defaultConfineDeps())
+}
+
+func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDeps) (ConfineResult, error) {
+	deps = fillConfineDeps(deps)
+	sliceName := ResolveConfineSlice(request.Slice)
+	result := ConfineResult{Status: ConfineStatus{
+		Slice: sliceName, Cap: ConfineCapUnevaluated, Admission: ConfineAdmissionUnevaluated,
+		Scope: ConfineScopeUnverified, OOMGroup: ConfineOOMGroupUnverified,
+		Priorities: ConfinePrioritiesUnverified,
+	}}
+	if len(request.Argv) == 0 || request.Argv[0] == "" {
+		return result, errors.New("E_CONFINE_ARGUMENT_INVALID: target argv is empty")
+	}
+	if err := validateConfineName(request.Name); err != nil {
+		return result, err
+	}
+	path, ok, reason := deps.resolveSlicePath(sliceName)
+	if !ok {
+		if reason == "" {
+			reason = "slice-not-found"
+		}
+		return result, confineUnavailable(sliceName, errors.New(reason))
+	}
+	backend := deps.newBackend(path)
+	if err := backend.Probe(ctx); err != nil {
+		return result, confineUnavailable(sliceName, fmt.Errorf("probe: %w", err))
+	}
+
+	// A finite effective cap is a precondition, not a facet: without one the only
+	// backstop is a global (host) OOM, which is exactly what confinement must
+	// prevent. Refuse before admitting or launching so an uncapped slice never runs
+	// a heavy job that could starve the machine (the child self-check in
+	// RunConfineSetup is the defence-in-depth mirror of this gate).
+	maximum, finite := deps.readCap(path)
+	if !finite {
+		return result, confineUnavailable(sliceName, fmt.Errorf(
+			"slice %s has no finite memory.max in its cgroup ancestry (uncapped); refusing to launch", sliceName))
+	}
+	result.Status.Cap = ConfineCapEnforced
+	result.Status.CapBytes = maximum
+
+	reserve := request.MemoryReserve
+	if reserve <= 0 {
+		reserve = DefaultConfineMemoryReserve
+	}
+	admission, err := deps.admit(ctx, path, request, reserve)
+	if err != nil {
+		return result, err
+	}
+	var releaseAdmissionOnce sync.Once
+	releaseAdmission := func() { releaseAdmissionOnce.Do(admission.releaseAdmission) }
+	defer releaseAdmission()
+	result.Status.ReserveBytes = reserve
+	result.Status.AdmissionState = admission.state
+	result.Status.AdmissionWaitedMS = admission.waitedMS
+	switch admission.state {
+	case "immediate", "waited":
+		result.Status.Admission = ConfineAdmissionAdmitted
+	case "timeout":
+		result.Status.Admission = ConfineAdmissionTimeout
+	default:
+		result.Status.Admission = ConfineAdmissionUnevaluated
+	}
+
+	scope, err := backend.Create(ctx, confineScopeID(request.Name))
+	if err != nil {
+		return result, confineUnavailable(sliceName, fmt.Errorf("create scope: %w", err))
+	}
+	var started atomic.Bool
+	var interrupted atomic.Bool
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cleanupOnce.Do(func() { cleanupConfineScope(scope, started.Load() || interrupted.Load()) })
+	}
+	defer cleanup()
+
+	var commandMu sync.RWMutex
+	var command *confineCommand
+	process := func() *os.Process {
+		commandMu.RLock()
+		defer commandMu.RUnlock()
+		if command == nil {
+			return nil
+		}
+		return command.Process()
+	}
+	signalEvents, stopSignalSource := deps.signalSource()
+	stopSignalHandler := forwardConfineSignals(signalEvents, process, func() {
+		interrupted.Store(true)
+		cleanup()
+	})
+	defer func() {
+		stopSignalSource()
+		stopSignalHandler()
+	}()
+	if interrupted.Load() {
+		return result, confineUnavailable(sliceName, errors.New("interrupted before confined target start"))
+	}
+	if err := deps.writeOOMGroup(scope); err != nil {
+		return result, confineUnavailable(sliceName, fmt.Errorf("set memory.oom.group: %w", err))
+	}
+	result.Status.OOMGroup = ConfineOOMGroupSet
+	if interrupted.Load() {
+		return result, confineUnavailable(sliceName, errors.New("interrupted before confined target start"))
+	}
+
+	handshakeRead, handshakeWrite, err := os.Pipe()
+	if err != nil {
+		return result, confineUnavailable(sliceName, fmt.Errorf("create setup handshake: %w", err))
+	}
+	defer handshakeRead.Close()
+	defer handshakeWrite.Close()
+	releaseRead, releaseWrite, err := os.Pipe()
+	if err != nil {
+		return result, confineUnavailable(sliceName, fmt.Errorf("create setup release gate: %w", err))
+	}
+	defer releaseRead.Close()
+	defer releaseWrite.Close()
+	self := strings.TrimSpace(request.SelfPath)
+	if self == "" {
+		self = "/proc/self/exe"
+	}
+	setupArgv := confineSetupArgv(request.Argv)
+	diagnostics := request.Stderr
+	if diagnostics == nil {
+		diagnostics = os.Stderr
+	}
+	diagnostics = &confineLockedWriter{w: diagnostics}
+	stdin, stdout := request.Stdin, request.Stdout
+	if stdin == nil {
+		stdin = os.Stdin
+	}
+	if stdout == nil {
+		stdout = os.Stdout
+	}
+	cmd := exec.CommandContext(ctx, self, setupArgv...)
+	cmd.Env = pylib.AppendChildEnvironment(confineEnvironment(request.Env), request.RuntimeDir, diagnostics)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, diagnostics
+	cmd.ExtraFiles = []*os.File{handshakeWrite, releaseRead}
+	cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: scope.FD()}
+	commandMu.Lock()
+	command = &confineCommand{cmd: cmd}
+	commandMu.Unlock()
+	if interrupted.Load() {
+		return result, confineUnavailable(sliceName, errors.New("interrupted before confined target start"))
+	}
+	if err := deps.start(command); err != nil {
+		return result, confineUnavailable(sliceName, fmt.Errorf("start in scope: %w", err))
+	}
+	started.Store(true)
+	_ = handshakeWrite.Close()
+	_ = releaseRead.Close()
+	releaseAdmission()
+
+	abortStarted := func(cause error) (ConfineResult, error) {
+		_ = releaseWrite.Close()
+		_ = scope.Kill()
+		if child := command.Process(); child != nil {
+			_ = child.Kill()
+		}
+		_ = command.cmd.Wait()
+		return result, confineUnavailable(sliceName, cause)
+	}
+	if interrupted.Load() {
+		return abortStarted(errors.New("interrupted before confined target release"))
+	}
+
+	handshakeTimeout := request.HandshakeTimeout
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = time.Second
+	}
+	if payload, readErr := deps.readHandshake(handshakeRead, handshakeTimeout); readErr == nil {
+		if handshake, verified := parseConfineHandshake(payload); verified && handshake.applied() {
+			result.Status.Priorities = ConfinePrioritiesApplied
+		}
+	}
+	pid := command.Process().Pid
+	members, memberErr := scope.Members()
+	if memberErr != nil {
+		return abortStarted(fmt.Errorf("verify scope membership: %w", memberErr))
+	}
+	if !containsPID(members, pid) {
+		return abortStarted(fmt.Errorf("verify scope membership: pid %d absent", pid))
+	}
+	result.Status.Scope = ConfineScopePlaced
+	if interrupted.Load() {
+		return abortStarted(errors.New("interrupted before confined target release"))
+	}
+	if n, writeErr := releaseWrite.Write([]byte{1}); writeErr != nil || n != 1 {
+		if writeErr == nil {
+			writeErr = io.ErrShortWrite
+		}
+		return abortStarted(fmt.Errorf("release confined target: %w", writeErr))
+	}
+	_ = releaseWrite.Close()
+	_, _ = fmt.Fprintln(diagnostics, FormatConfineStatus(result.Status))
+	result.Exit = waitConfineCommand(cmd)
+	return result, nil
+}
+
+func admitConfine(ctx context.Context, path string, request ConfineRequest, reserve int64) (admissionResult, error) {
+	maxWait := request.AdmissionMaxWait
+	if maxWait <= 0 {
+		maxWait = 30 * time.Minute
+	}
+	poll := request.PollInterval
+	if poll <= 0 {
+		poll = 2 * time.Second
+	}
+	admitter := &Runner{
+		memorySlice: path, memoryReserve: reserve, admissionMaxWait: maxWait,
+		pollInterval: poll, clock: systemClock{}, sliceMemory: readSliceMemory,
+		diagnostics: request.Stderr, admitSocketPath: request.AdmitSocketPath,
+	}
+	return admitter.admit(ctx, Request{})
+}
+
+func readConfineCap(path string) (int64, bool) {
+	data, err := os.ReadFile(filepath.Join(path, "memory.max"))
+	if err != nil || strings.TrimSpace(string(data)) == "max" {
+		return 0, false
+	}
+	return parseAdmissionMemory(data)
+}
+
+func confineEnvironment(env []string) []string {
+	if env == nil {
+		return os.Environ()
+	}
+	return append([]string(nil), env...)
+}
+
+func validateConfineName(name string) error {
+	if name == "" {
+		return nil
+	}
+	if len(name) > 100 {
+		return errors.New("E_CONFINE_ARGUMENT_INVALID: --name is too long")
+	}
+	for _, r := range name {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("_.-", r) {
+			continue
+		}
+		return errors.New("E_CONFINE_ARGUMENT_INVALID: --name requires letters, digits, '.', '_', or '-'")
+	}
+	return nil
+}
+
+func confineScopeID(name string) string {
+	if name == "" {
+		name = "job"
+	}
+	return "CONFINE-" + name + "-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+}
+
+func confineUnavailable(slice string, err error) error {
+	return fmt.Errorf("E_CONFINE_UNAVAILABLE: slice %s: %w", slice, err)
+}
+
+func writeConfineOOMGroup(scope Scope) error {
+	fd, err := unix.Openat(scope.FD(), "memory.oom.group", unix.O_WRONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	file := os.NewFile(uintptr(fd), "memory.oom.group")
+	if file == nil {
+		_ = unix.Close(fd)
+		return errors.New("open memory.oom.group")
+	}
+	if _, err := file.WriteString("1\n"); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	readFD, err := unix.Openat(scope.FD(), "memory.oom.group", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	readFile := os.NewFile(uintptr(readFD), "memory.oom.group")
+	if readFile == nil {
+		_ = unix.Close(readFD)
+		return errors.New("open memory.oom.group for verification")
+	}
+	defer readFile.Close()
+	data, err := io.ReadAll(io.LimitReader(readFile, 32))
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(data)) != "1" {
+		return errors.New("memory.oom.group did not read back as 1")
+	}
+	return nil
+}
+
+func confineSetupArgv(target []string) []string {
+	argv := []string{
+		"__confine-setup", "--handshake-fd", strconv.Itoa(confineSetupFD),
+		"--release-fd", strconv.Itoa(confineReleaseFD),
+		"--oom-score-adj", strconv.Itoa(confineOOMScoreAdj), "--nice", strconv.Itoa(confineNice),
+		"--ionice-class", strconv.Itoa(confineIOPriorityClass), "--",
+	}
+	return append(argv, target...)
+}
+
+func readConfineHandshake(reader *os.File, timeout time.Duration) ([]byte, error) {
+	type outcome struct {
+		payload []byte
+		err     error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		payload, err := io.ReadAll(io.LimitReader(reader, confineHandshakeMaxSize+1))
+		done <- outcome{payload: payload, err: err}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case got := <-done:
+		if got.err != nil || len(got.payload) > confineHandshakeMaxSize {
+			return nil, errors.New("invalid setup handshake")
+		}
+		return got.payload, nil
+	case <-timer.C:
+		_ = reader.Close()
+		return nil, errors.New("setup handshake timed out")
+	}
+}
+
+func confineSignalSource() (<-chan os.Signal, func()) {
+	forward := make(chan os.Signal, 2)
+	signal.Notify(forward, syscall.SIGINT, syscall.SIGTERM)
+	return forward, func() { signal.Stop(forward) }
+}
+
+func forwardConfineSignals(forward <-chan os.Signal, process func() *os.Process, onSignal func()) func() {
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case received, ok := <-forward:
+				if !ok {
+					return
+				}
+				if onSignal != nil {
+					onSignal()
+				}
+				if child := process(); child != nil {
+					_ = child.Signal(received)
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+	return func() {
+		close(done)
+	}
+}
+
+func waitConfineCommand(cmd *exec.Cmd) int {
+	err := cmd.Wait()
+	if err == nil {
+		return 0
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if wait, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+			if wait.Signaled() {
+				return 128 + int(wait.Signal())
+			}
+			return wait.ExitStatus()
+		}
+	}
+	return 3
+}
+
+func cleanupConfineScope(scope Scope, started bool) {
+	if scope == nil {
+		return
+	}
+	if started {
+		_ = scope.Kill()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = waitEmpty(ctx, scope, 2*time.Second)
+	_ = scope.Remove()
+}
+
+// RunConfineSetup verifies its own cgroup, applies child-local priority knobs,
+// reports them to the parent, and waits for the parent's release before exec.
+func RunConfineSetup(argv []string, diagnostics io.Writer) int {
+	handshakeFD, releaseFD, oomAdj, niceValue, ioClass, target, err := parseConfineSetupArgs(argv)
+	if err != nil {
+		if diagnostics != nil {
+			_, _ = fmt.Fprintln(diagnostics, err)
+		}
+		return 127
+	}
+	handshake := os.NewFile(uintptr(handshakeFD), "confine-handshake")
+	release := os.NewFile(uintptr(releaseFD), "confine-release")
+	if handshake == nil || release == nil {
+		return 127
+	}
+	unix.CloseOnExec(handshakeFD)
+	unix.CloseOnExec(releaseFD)
+	defer handshake.Close()
+	defer release.Close()
+	if verifyErr := verifyConfineSetupScope(); verifyErr != nil {
+		_ = writeConfineHandshake(handshake, confineHandshake{Schema: confineHandshakeSchema})
+		if diagnostics != nil {
+			_, _ = fmt.Fprintf(diagnostics, "confine setup: verify scope: %v\n", verifyErr)
+		}
+		return 127
+	}
+	result := confineHandshake{Schema: confineHandshakeSchema}
+	result.OOMScoreAdj = os.WriteFile("/proc/self/oom_score_adj", []byte(strconv.Itoa(oomAdj)+"\n"), 0o644) == nil
+	result.Nice = unix.Setpriority(unix.PRIO_PROCESS, 0, niceValue) == nil
+	_, _, errno := unix.Syscall(unix.SYS_IOPRIO_SET, uintptr(1), 0, uintptr(ioClass<<13))
+	result.IONice = errno == 0
+	if err := writeConfineHandshake(handshake, result); err != nil {
+		if diagnostics != nil {
+			_, _ = fmt.Fprintf(diagnostics, "confine setup: write handshake: %v\n", err)
+		}
+		return 127
+	}
+	if err := handshake.Close(); err != nil {
+		return 127
+	}
+	var releaseByte [1]byte
+	if _, err := io.ReadFull(release, releaseByte[:]); err != nil {
+		if diagnostics != nil {
+			_, _ = fmt.Fprintf(diagnostics, "confine setup: wait for release: %v\n", err)
+		}
+		return 127
+	}
+	path, lookErr := exec.LookPath(target[0])
+	if lookErr != nil {
+		if diagnostics != nil {
+			_, _ = fmt.Fprintf(diagnostics, "confine setup: %v\n", lookErr)
+		}
+		return 127
+	}
+	if err := syscall.Exec(path, target, os.Environ()); err != nil {
+		if diagnostics != nil {
+			_, _ = fmt.Fprintf(diagnostics, "confine setup: exec: %v\n", err)
+		}
+		return 127
+	}
+	return 127
+}
+
+func verifyConfineSetupScope() error {
+	mount, err := unifiedMount()
+	if err != nil {
+		return err
+	}
+	path, err := currentCgroupPath(mount)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(filepath.Join(path, "memory.oom.group"))
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(data)) != "1" {
+		return errors.New("memory.oom.group is not 1")
+	}
+	// oom.group alone does not bound growth — it only groups the kill once an OOM
+	// occurs. A heavy job must never exec in an UNCAPPED cgroup, or it can still
+	// drive the host to a global OOM. Require a finite memory.max somewhere in the
+	// ancestry (the effective cap), so a standalone/forged-fd invocation cannot run
+	// the target in an oom.group-but-uncapped cgroup (Sol confirm P0-a).
+	if !hasFiniteCapAncestor(mount, path) {
+		return errors.New("no finite memory.max in cgroup ancestry (uncapped)")
+	}
+	return nil
+}
+
+// hasFiniteCapAncestor reports whether the cgroup at path, or any ancestor up to
+// the cgroup2 mount root, has a finite memory.max (memory.max is hierarchical, so
+// any finite ancestor bounds the subtree).
+func hasFiniteCapAncestor(mount, path string) bool {
+	_, ok := effectiveCapFrom(mount, path)
+	return ok
+}
+
+// effectiveConfineCap returns the effective memory ceiling for a slice path: the
+// smallest finite memory.max across the path and its ancestors up to the cgroup2
+// mount root, and whether any finite cap bounds the subtree. memory.max is
+// hierarchical, so the effective ceiling is the minimum finite value in the
+// ancestry — an uncapped slice under a capped parent is still bounded.
+func effectiveConfineCap(path string) (int64, bool) {
+	mount, err := unifiedMount()
+	if err != nil {
+		return 0, false
+	}
+	return effectiveCapFrom(mount, path)
+}
+
+func effectiveCapFrom(mount, path string) (int64, bool) {
+	current := filepath.Clean(path)
+	root := filepath.Clean(mount)
+	var best int64
+	found := false
+	for {
+		if maximum, finite := readConfineCap(current); finite && maximum > 0 {
+			if !found || maximum < best {
+				best, found = maximum, true
+			}
+		}
+		if current == root {
+			break
+		}
+		parent := filepath.Dir(current)
+		if parent == current || len(parent) < len(root) {
+			break
+		}
+		current = parent
+	}
+	return best, found
+}
+
+func writeConfineHandshake(writer io.Writer, result confineHandshake) error {
+	payload, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+	payload = append(payload, '\n')
+	for len(payload) > 0 {
+		n, writeErr := writer.Write(payload)
+		if writeErr != nil {
+			return writeErr
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		payload = payload[n:]
+	}
+	return nil
+}
+
+func parseConfineSetupArgs(argv []string) (handshakeFD, releaseFD, oomAdj, niceValue, ioClass int, target []string, err error) {
+	if len(argv) < 11 || argv[0] != "--handshake-fd" || argv[2] != "--release-fd" || argv[4] != "--oom-score-adj" || argv[6] != "--nice" || argv[8] != "--ionice-class" || argv[10] != "--" || len(argv) == 11 || argv[11] == "" {
+		return 0, 0, 0, 0, 0, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: malformed confine setup arguments")
+	}
+	values := []*int{&handshakeFD, &releaseFD, &oomAdj, &niceValue, &ioClass}
+	for i, text := range []string{argv[1], argv[3], argv[5], argv[7], argv[9]} {
+		value, parseErr := strconv.Atoi(text)
+		if parseErr != nil {
+			return 0, 0, 0, 0, 0, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: malformed confine setup arguments")
+		}
+		*values[i] = value
+	}
+	if handshakeFD < 3 || releaseFD < 3 || handshakeFD == releaseFD || oomAdj < -1000 || oomAdj > 1000 || niceValue < -20 || niceValue > 19 || ioClass != 3 {
+		return 0, 0, 0, 0, 0, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: malformed confine setup arguments")
+	}
+	return handshakeFD, releaseFD, oomAdj, niceValue, ioClass, append([]string(nil), argv[11:]...), nil
+}

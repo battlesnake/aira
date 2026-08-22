@@ -1494,28 +1494,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				Detach: boolArg(args, "detach"), StdinConnect: boolArg(args, "stdin_connect"),
 			}
 			if c.memoryEstimate {
-				signature, signatureErr := resourceSignature(c.commandPrefix, request.Prefix, request.Argv)
-				if signatureErr == nil {
-					request.ResourceSignature = signature
-					historian, ok := c.runner.(runner.PeakRSSHistorian)
-					if !ok {
-						request.MemoryReserveBasis = "fallback:read-error"
-					} else {
-						stats, _, readErr := historian.PeakRSSHistory(ctx, signature)
-						if readErr != nil {
-							request.MemoryReserveBasis = "fallback:read-error"
-							if errors.Is(readErr, context.DeadlineExceeded) {
-								request.MemoryReserveBasis = "fallback:read-timeout"
-							}
-						} else {
-							reserve, override, basis := estimateReserve(stats, c.memoryHeadroom)
-							request.MemoryReserveBasis = basis
-							if override {
-								request.MemoryReserveOverride = &reserve
-							}
-						}
-					}
-				}
+				prepareMemoryEstimate(ctx, c.runner, c.memoryHeadroom, c.commandPrefix, &request)
 			}
 			if request.StdinConnect && (!request.Detach || request.PTY || request.StdinPath != "" || noStdin || request.StoreStdin) {
 				return nil, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("--stdin-connect requires --detach and is incompatible with --stdin, --no-stdin, --pty, and --store-stdin"))
@@ -1644,6 +1623,17 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				}}, nil
 			}
 			return result, err
+		}},
+		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] -- <argv...>", Args: []ArgSpec{
+			listSpec("argv", true, true, "Exact target argv after the launch delimiter"),
+			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
+			stringSpec("name", false, false, "Scope name component"),
+		}, Run: func(ctx context.Context, args *argAccessor) (any, error) {
+			_ = ctx
+			_ = stringSlice(args, "argv")
+			_ = stringArg(args, "slice")
+			_ = stringArg(args, "name")
+			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine is a direct CLI-only foreground verb")
 		}},
 		"run-kill": {Name: "run-kill", Usage: "run-kill <run-id> [--steal]", Args: []ArgSpec{stringSpec("run_id", true, true, "Run identifier"), boolSpec("steal", false, false, "Override foreign run ownership")}, MCPTool: "aira_run_kill", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			runID := stringArg(args, "run_id")
@@ -1882,8 +1872,9 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 			{Name: "push", Summary: "Push explicit refs", Safety: SafetyExecute, Args: []OperationArg{{Name: "remote"}, {Name: "refspecs"}}, Example: []string{"push", "origin", "--", "HEAD:main"}},
 			{Name: "ls-remote", Summary: "List remote refs", Safety: SafetyExecute, Args: []OperationArg{{Name: "remote"}, {Name: "refspecs"}}, Example: []string{"ls-remote", "origin"}},
 		}},
-		"run":  {summary: "Launch a subprocess in an owned scope", safety: SafetyExecute, example: []string{"--merge", "--", "printf", "hello"}},
-		"time": {summary: "Run a byte-transparent command and record timing", safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
+		"run":     {summary: "Launch a subprocess in an owned scope", safety: SafetyExecute, example: []string{"--merge", "--", "printf", "hello"}},
+		"confine": {summary: "Run a foreground subprocess in a machine-wide confined slice", safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
+		"time":    {summary: "Run a byte-transparent command and record timing", safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
 		"commands": {summary: "Read recorded command events and exact distributions", safety: SafetyRead, operations: []OperationSpec{
 			{Name: "ls", Summary: "List recorded command events", Safety: SafetyRead, Args: []OperationArg{{Name: "query"}, {Name: "by"}}, Example: []string{"ls", "key-source:program-subcommand key:go test"}},
 			{Name: "count", Summary: "Count command events by a dimension", Safety: SafetyRead, Args: []OperationArg{{Name: "query"}, {Name: "by", Required: true}}, Example: []string{"count", "status:exited", "--by", "key"}},
@@ -1955,7 +1946,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		if !ok {
 			panic("missing dispatch metadata for " + name)
 		}
-		spec.Summary, spec.Safety, spec.Destructive, spec.Include = entry.summary, entry.safety, entry.destructive, true
+		spec.Summary, spec.Safety, spec.Destructive, spec.Include = entry.summary, entry.safety, entry.destructive, name != "confine"
 		spec.Example = copyExample(entry.example)
 		spec.Operations = append([]OperationSpec(nil), entry.operations...)
 		verbs[name] = spec

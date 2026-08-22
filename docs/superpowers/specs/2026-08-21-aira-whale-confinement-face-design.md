@@ -94,21 +94,32 @@ Applied to each `.aira-RUN-N` scope after `backend.Create`, before `Start`
 - These writes need the `+memory` controller delegated on the parent; whale.slice
   provides it (propagation, not a `Delegate=` on the slice — Fable §1 correction).
 - **Enforcement status is multi-faceted, reported per facet** (Sol r2 P1), never
-  collapsed into one boolean: (a) *admitted against a finite cap* (vs unevaluated),
-  (b) *scope placement confirmed* (CLONE_INTO_CGROUP membership), (c)
-  *`memory.oom.group` set*, (d) *priorities applied* (per the handshake). A finite
-  cap can be enforced while a priority write fails; a set `oom.group` is not a cap.
+  collapsed into one boolean: (a) *cap enforced* (a finite effective `memory.max`,
+  now a precondition — §3) with (a′) the *admission outcome* against it (admitted /
+  waited / timeout / unevaluated) as a separate facet, (b) *scope placement
+  confirmed* (CLONE_INTO_CGROUP membership), (c) *`memory.oom.group` set*, (d)
+  *priorities applied* (per the handshake). The cap holds while a priority write
+  fails; a set `oom.group` is not a cap; a timeout still runs under the finite cap.
   Each facet is surfaced (before/concurrently with target execution) so the
   operator sees exactly what is and is not enforced.
 
 ## 3. Honesty and the deliberate simplification
 
-- **Gate = slice-vs-cap** (owner). If the slice's `memory.max` is a finite number,
-  admit against it. If it is `max`/unreadable (the slice is not actually capped —
-  which must not happen in the deployed model where whale.slice/aira.slice carries
-  the cap), admission is honestly **`unevaluated`** and the job launches; the
-  confinement writes still apply best-effort and the enforcement status is
-  surfaced. AIRA never fakes a cap it did not read.
+- **Gate = slice-vs-cap** (owner). Admit against the slice's **effective cap** —
+  the smallest finite `memory.max` across the slice and its cgroup ancestry
+  (memory.max is hierarchical, so a finite ancestor bounds the subtree). AIRA never
+  fakes a cap it did not read.
+- **A finite effective cap is a PRECONDITION, not a facet (Sol P0-a, tightening
+  the v3 "uncapped → launch" decision).** If no finite cap bounds the ancestry
+  (`max`/unreadable all the way to the cgroup2 root), the only remaining backstop
+  is a **global (host) OOM** — precisely the outcome confinement exists to prevent.
+  So an uncapped slice is **refused** (`E_CONFINE_UNAVAILABLE`), before admission
+  or launch, rather than run with only a host-OOM net. This must not happen in the
+  deployed model (whale.slice/aira.slice always carries the cap); when it does it
+  is a misconfiguration, and refusing with an actionable error is safer and more
+  honest than a silent ungated launch. `--unsafe-unconfined` (deferred) remains the
+  only escape hatch. *(Rationale: the owner's prime directive — never OOM the whole
+  system — outranks the v3 simplification; relying on host-OOM violates it.)*
 - **Owner-accepted simplification vs Sol's host-headroom P0.** Sol argued
   `slice.max − slice.current` can admit while the *host* is near-OOM. The owner's
   design accepts this: the machine-wide slice cap is **sized conservatively**
@@ -121,13 +132,28 @@ Applied to each `.aira-RUN-N` scope after `backend.Create`, before `Start`
   no launch fails because coordination was unavailable. This is distinct from
   **confinement/infrastructure failure**: if the slice is absent/inaccessible, or
   `backend.Create` fails, or `+memory` is not delegated so `memory.oom.group`
-  cannot be set, AIRA **cannot confine** — it then **fails the command with a
-  clear, actionable error** (`E_CONFINE_UNAVAILABLE: slice <name> …`), rather than
-  silently running the heavy job unconfined (which could OOM the box). A missing
-  cap value on an *otherwise-placeable* slice is the milder `unevaluated`-admission
-  case above (still confined by the scope; just ungated). The optional
-  `--unsafe-unconfined` escape hatch (deferred) is the only way to run outside a
-  scope.
+  cannot be set, **or the slice has no finite effective cap** (uncapped ancestry),
+  AIRA **cannot safely confine** — it then **fails the command with a clear,
+  actionable error** (`E_CONFINE_UNAVAILABLE: slice <name> …`), rather than
+  silently running the heavy job unconfined or capped only by host-OOM (either
+  could OOM the box). The optional `--unsafe-unconfined` escape hatch (deferred) is
+  the only way to run outside a capped scope.
+- **Two-way placement gate (Sol build-review P0 + confirm P0-a).** The target must
+  never `exec` until confinement is *verified*, so the setup helper and the parent
+  hold a two-sided gate: (1) the helper, already placed by CLONE_INTO_CGROUP,
+  **self-verifies** its ambient cgroup has `memory.oom.group=1` **and** a finite
+  `memory.max` in its ancestry (defence-in-depth mirror of the parent cap gate) —
+  refusing to `exec` otherwise; (2) it then blocks reading one byte from a
+  parent→child **release pipe**; (3) the parent verifies `oom.group` (via the scope
+  FD) and confirms the child PID is a scope member **before** writing that release
+  byte; on any placement failure it closes the gate unreleased, kills+reaps the
+  helper, and returns `E_CONFINE_UNAVAILABLE` — the target never ran. The handshake
+  pipe conveys only best-effort **priority** status (a failed/absent priority write
+  never blocks a job that is already safely confined by cap+oom.group+placement);
+  it is not the safety gate. `confine` is a *cooperative* confinement primitive for
+  agents that want it, not a sandbox against a hostile caller (who could bypass it
+  by not invoking `confine` at all); the gate's job is to make an *accidental*
+  unconfined/uncapped launch impossible, not to jail an adversary.
 
 ## 4. Faces
 
@@ -146,7 +172,8 @@ thing safely, anywhere").
   success and `/proc/<pid>/oom_score_adj`==500 (inherited by a child); a forced
   handshake failure → reported `unenforced`, enforcement **not** claimed.
 - **Admit slice-vs-cap**: slice free < reserve → waits; ≥ reserve → proceeds;
-  daemon-down still admits via flock; an uncapped slice → `unevaluated`, launches.
+  daemon-down still admits via flock; an uncapped slice (no finite effective cap) →
+  `E_CONFINE_UNAVAILABLE`, refused before start (target never runs).
 - **Never-blocks**: a timeout proceeds (launches), never errors.
 - **Foreground semantics**: child exit code + a killing signal surface as the
   verb's exit status; stdio is inherited.

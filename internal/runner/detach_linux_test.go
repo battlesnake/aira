@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,10 +22,51 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	if len(os.Args) > 1 && os.Args[1] == "__confine-test-setup" {
+		os.Exit(runConfineTestSetup(os.Args[2:]))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "__confine-setup" {
+		os.Exit(RunConfineSetup(os.Args[2:], os.Stderr))
+	}
 	if len(os.Args) > 1 && os.Args[1] == "__supervise" && os.Getenv("AIRA_M20_FAKE_SUPERVISOR") != "" {
 		os.Exit(runM20FakeSupervisor())
 	}
 	os.Exit(m.Run())
+}
+
+func runConfineTestSetup(argv []string) int {
+	handshakeFD, releaseFD, _, _, _, target, err := parseConfineSetupArgs(argv)
+	if err != nil {
+		return 127
+	}
+	handshake := os.NewFile(uintptr(handshakeFD), "confine-test-handshake")
+	release := os.NewFile(uintptr(releaseFD), "confine-test-release")
+	if handshake == nil || release == nil {
+		return 127
+	}
+	defer handshake.Close()
+	defer release.Close()
+	_ = os.WriteFile("/proc/self/oom_score_adj", []byte("500\n"), 0o644)
+	if err := writeConfineHandshake(handshake, confineHandshake{
+		Schema: confineHandshakeSchema, OOMScoreAdj: true, Nice: true, IONice: true,
+	}); err != nil {
+		return 127
+	}
+	if err := handshake.Close(); err != nil {
+		return 127
+	}
+	var releaseByte [1]byte
+	if _, err := io.ReadFull(release, releaseByte[:]); err != nil {
+		return 127
+	}
+	path, err := exec.LookPath(target[0])
+	if err != nil {
+		return 127
+	}
+	if err := unix.Exec(path, target, os.Environ()); err != nil {
+		return 127
+	}
+	return 127
 }
 
 func runM20FakeSupervisor() int {

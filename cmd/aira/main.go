@@ -24,6 +24,8 @@ import (
 
 func main() { os.Exit(Run(os.Args[1:], os.Stdout, os.Stderr)) }
 
+var runConfined = runner.Confine
+
 // Run is the deliberately small CLI adapter: argv parsing, core request
 // construction, and rendering. It contains no ticket or consistency logic.
 func Run(argv []string, stdout, stderr io.Writer) int {
@@ -42,6 +44,9 @@ func runWithInput(argv []string, stdout, stderr io.Writer, stdin io.Reader) int 
 }
 
 func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Reader, injected Dispatcher) int {
+	if len(argv) > 0 && argv[0] == "__confine-setup" {
+		return runner.RunConfineSetup(argv[1:], stderr)
+	}
 	if len(argv) > 0 && argv[0] == "__supervise" {
 		return runSupervisor(argv[1:], stderr)
 	}
@@ -72,6 +77,13 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	if verb == "tui" && jsonOutput {
 		response := core.Response{Code: "E_SELECTOR_INVALID", Error: "option --json is not valid for tui", Exit: store.ExitForCode("E_SELECTOR_INVALID")}
 		return render(response, true, stdout, stderr)
+	}
+	if verb == "confine" {
+		if jsonOutput {
+			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for confine", Exit: store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
+			return render(response, true, stdout, stderr)
+		}
+		return runConfineCommand(context.Background(), positional, options, stdin, stdout, stderr)
 	}
 
 	if verb == "init" {
@@ -313,7 +325,7 @@ func removeJSON(argv []string) ([]string, bool) {
 	result := make([]string, 0, len(argv))
 	jsonOutput := false
 	end := len(argv)
-	carvedArgv := len(argv) > 0 && (strings.EqualFold(argv[0], "run") || strings.EqualFold(argv[0], "time"))
+	carvedArgv := len(argv) > 0 && (strings.EqualFold(argv[0], "run") || strings.EqualFold(argv[0], "time") || strings.EqualFold(argv[0], "confine"))
 	if carvedArgv {
 		for i := 1; i < len(argv); i++ {
 			if argv[i] == "--" {
@@ -346,6 +358,9 @@ func removeJSON(argv []string) ([]string, bool) {
 }
 
 func parseArgs(verb string, argv []string) ([]string, map[string]string, error) {
+	if verb == "confine" {
+		return parseConfineArgs(argv)
+	}
 	if verb == "run" {
 		return parseRunArgs(argv)
 	}
@@ -442,6 +457,62 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		}
 	}
 	return positional, options, nil
+}
+
+func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
+	options := map[string]string{}
+	delimiter := -1
+	for i, arg := range argv {
+		if arg == "--" {
+			delimiter = i
+			break
+		}
+	}
+	if delimiter < 0 {
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine requires the standalone -- launch delimiter")
+	}
+	for i := 0; i < delimiter; i++ {
+		arg := argv[i]
+		if !strings.HasPrefix(arg, "--") || arg == "--" {
+			return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine options must precede the launch delimiter")
+		}
+		name := strings.TrimPrefix(arg, "--")
+		if name != "slice" && name != "name" {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for confine", name)
+		}
+		if i+1 >= delimiter || strings.HasPrefix(argv[i+1], "--") {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s requires a value", name)
+		}
+		if _, exists := options[name]; exists {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s may occur once", name)
+		}
+		i++
+		options[name] = argv[i]
+	}
+	target := append([]string(nil), argv[delimiter+1:]...)
+	if len(target) == 0 || target[0] == "" {
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine target argv is empty")
+	}
+	return target, options, nil
+}
+
+func runConfineCommand(ctx context.Context, target []string, options map[string]string, stdin io.Reader, stdout, stderr io.Writer) int {
+	request := runner.ConfineRequest{
+		Slice: options["slice"], Name: options["name"], Argv: append([]string(nil), target...),
+		Stdin: stdin, Stdout: stdout, Stderr: stderr,
+	}
+	if paths, err := daemon.PathsFromEnv(); err == nil {
+		request.RuntimeDir = paths.RuntimeDir
+		request.AdmitSocketPath = paths.SocketPath
+	} else if stderr != nil {
+		_, _ = fmt.Fprintf(stderr, "confine: daemon paths unavailable; admission will use flock and CPU governor is disabled: %v\n", err)
+	}
+	result, err := runConfined(ctx, request)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return store.ExitForCode(store.ErrorCode(err))
+	}
+	return result.Exit
 }
 
 func parseGitArgs(argv []string) ([]string, map[string]string, error) {
@@ -626,6 +697,12 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		args["usage"] = options["usage"]
 		args["provider"] = options["provider"]
 		args["strict_wiring"] = options["strict-wiring"] == "true"
+	case "confine":
+		if len(positional) == 0 {
+			return core.Request{}, errors.New("E_CONFINE_ARGUMENT_INVALID: confine target argv is empty")
+		}
+		args["argv"] = append([]string(nil), positional...)
+		args["slice"], args["name"] = options["slice"], options["name"]
 	case "time":
 		if len(positional) == 0 {
 			return core.Request{}, errors.New("E_RUN_ARGUMENT_INVALID: time target argv is empty")
