@@ -1,7 +1,10 @@
 # AIRA whale-run confinement face — design
 
-Status: PLAN v2 (Sol plan-review r1 CHANGES-NEEDED + Fable code-gate r1
-GATE-PASS-conditional folded; **owner decisions 2026-08-21**: (1) the slice/RAM
+Status: PLAN v3 (Sol plan-review r1 CHANGES-NEEDED + Fable code-gate r1
+GATE-PASS-conditional folded → v2; Sol r2 APPROVE-WITH-CHANGES [3 P1 honesty
+tightenings: point-in-time admission not a reservation; "never refuses" scoped to
+admission with infra-failure = hard error; multi-faceted enforcement status +
+robust handshake] folded → v3). **Owner decisions 2026-08-21**: (1) the slice/RAM
 limit is **system-wide, not per-project** — the goal is to stop dev work from any
 project/session from OOMing the box, modelled on agentmux's `whale.slice`; (2)
 admission is **simple** — check the slice's RAM usage vs the slice's RAM cap,
@@ -39,14 +42,19 @@ last-resort backstop; admit-first keeps jobs off it.
   delegates it — replacing whale.slice — is the explicit follow-up, §6.)
 - **Simple admission = slice usage vs slice cap** (owner decision 2). Admit when
   the slice's `memory.max − memory.current ≥ reserve` (exactly #29
-  `admission_linux.go`), with the #50 peak-RSS reserve estimate. Cross-session
-  fairness via the daemon queue (#40) when it is up so concurrent `confine` jobs
-  from different sessions don't collectively over-commit the shared slice; the
-  per-slice **flock** fallback self-gates when the daemon is down. **No host-PSI /
-  host-`MemAvailable` gate and no fail-closed refusal** — the conservatively-sized
-  slice cap is the host-safety boundary, and the watchdog + oomd (layers 2–3)
-  remain the extra host-level net, unchanged (see §3 for the deliberate
-  simplification vs Sol's host-headroom finding).
+  `admission_linux.go`), with the #50 peak-RSS reserve estimate. The daemon queue
+  (#40) **serialises** concurrent admits when it is up; the per-slice **flock**
+  fallback self-gates when the daemon is down. **Admission is an honest
+  point-in-time check** (free-at-launch), not a lifetime reservation: because it
+  is released after `Start` (before the child ramps), several slow-growing jobs
+  can each observe the same free RAM — so admission *reduces* but does not
+  *eliminate* concurrent over-commit (Sol r2 P1). The **slice `MemoryMax` +
+  per-scope `memory.oom.group` are the actual enforcement**; admission only keeps
+  jobs off them. **No host-PSI / host-`MemAvailable` gate and no fail-closed
+  refusal** — the conservatively-sized slice cap is the host-safety boundary, and
+  the watchdog + oomd (layers 2–3) remain the extra host-level net, unchanged
+  (§3). (Holding a per-job reservation until exit — a true anti-over-commit
+  reservation — is a clean refinement, deferred §6.)
 - **A new slim entry point, not `aira run`.** `confine` composes the runner's
   quartet — `backend.Probe` → `admit` → `backend.Create` → `exec.Cmd{SysProcAttr:
   {UseCgroupFD,CgroupFD}}` → `Start`, then release-admission-after-Start — with
@@ -77,14 +85,21 @@ Applied to each `.aira-RUN-N` scope after `backend.Create`, before `Start`
 - **`oom_score_adj = 500`** on the leader + **`nice -n 19` + `ionice -c 3`**,
   applied by an **exec-self confine-setup helper** (Sol P1): AIRA re-execs itself
   in a `--confine-setup` mode that sets `oom_score_adj`/`setpriority`/`ioprio_set`,
-  reports success through a **handshake pipe**, then `exec`s the target. AIRA
-  **claims enforcement only if the handshake confirms it** — never a best-effort
-  `|| true` that silently no-ops. (Go has no safe arbitrary pre-exec callback;
-  exec-self is the cgo-free, `/bin/sh`-free, verifiable pattern.)
+  reports success over a **close-on-exec handshake pipe**, then `exec`s the target.
+  AIRA **claims enforcement only if the handshake confirms it**; a handshake
+  **timeout, EOF, malformed/partial message, or a failed syscall is treated as
+  unverified** (Sol r2 P1), never a best-effort `|| true` that silently no-ops.
+  (Go has no safe arbitrary pre-exec callback; exec-self is the cgo-free,
+  `/bin/sh`-free, verifiable pattern.)
 - These writes need the `+memory` controller delegated on the parent; whale.slice
   provides it (propagation, not a `Delegate=` on the slice — Fable §1 correction).
-  Absent delegation, the `memory.oom.group` write fails and is reported
-  **`unenforced`**, never silently assumed.
+- **Enforcement status is multi-faceted, reported per facet** (Sol r2 P1), never
+  collapsed into one boolean: (a) *admitted against a finite cap* (vs unevaluated),
+  (b) *scope placement confirmed* (CLONE_INTO_CGROUP membership), (c)
+  *`memory.oom.group` set*, (d) *priorities applied* (per the handshake). A finite
+  cap can be enforced while a priority write fails; a set `oom.group` is not a cap.
+  Each facet is surfaced (before/concurrently with target execution) so the
+  operator sees exactly what is and is not enforced.
 
 ## 3. Honesty and the deliberate simplification
 
@@ -101,9 +116,18 @@ Applied to each `.aira-RUN-N` scope after `backend.Create`, before `Start`
   host", and the watchdog + oomd remain the host-level backstops. v1 therefore
   gates on slice-vs-cap only; a host-`MemAvailable`/PSI co-gate is recorded as a
   clean future option, not built.
-- **Never blocks** (owner's earlier ask): admission only ever *waits* up to
-  `AdmissionMaxWait`, then proceeds; daemon-down degrades to flock; there is no
-  path that fails a launch because coordination was unavailable.
+- **"Never refuses" is scoped to ADMISSION** (Sol r2 P1): admission only ever
+  *waits* up to `AdmissionMaxWait`, then proceeds; daemon-down degrades to flock;
+  no launch fails because coordination was unavailable. This is distinct from
+  **confinement/infrastructure failure**: if the slice is absent/inaccessible, or
+  `backend.Create` fails, or `+memory` is not delegated so `memory.oom.group`
+  cannot be set, AIRA **cannot confine** — it then **fails the command with a
+  clear, actionable error** (`E_CONFINE_UNAVAILABLE: slice <name> …`), rather than
+  silently running the heavy job unconfined (which could OOM the box). A missing
+  cap value on an *otherwise-placeable* slice is the milder `unevaluated`-admission
+  case above (still confined by the scope; just ungated). The optional
+  `--unsafe-unconfined` escape hatch (deferred) is the only way to run outside a
+  scope.
 
 ## 4. Faces
 
@@ -138,6 +162,10 @@ thing safely, anywhere").
    machine-wide CPU-slots pool. Replaces the whale.slice dependency; lets
    whale.slice retire.
 2. Optional host-`MemAvailable`/PSI co-gate (Sol's host-headroom option).
+2b. **Held per-job reservation** — keep an in-flight reservation for each
+   `confine` job until it exits (the daemon tracking `outstanding` for the job's
+   lifetime, not just the admit), turning point-in-time admission into a true
+   anti-over-commit reservation (Sol r2 P1).
 3. Per-run `memory.max`/`memory.high` scope caps (#50 deferral #3).
 4. Fold whale layers 2–3 (watchdog, oomd) into AIRA.
 5. Migrate `whale-run` call-sites + a `whale-run`→`aira confine` shim.
