@@ -1,158 +1,161 @@
 # AIRA whale-run confinement face — design
 
-Status: PLAN v1 (pre-review). Milestone task #54. Owner-selected (2026-08-21)
-after TUI v2 (#53): fold the agentmux `whale-run` heavy-job confinement into
-AIRA, so heavy commands run **admitted-first** in an AIRA-managed, memory-capped
-cgroup scope with a **last-resort OOM-kill backstop kept** (owner: "keep an OOM
-kill limit for the slice as an absolute last-resort … so whale can move to aira
-eventually"). Constrained by the no-compat rule (AIRA is not live).
+Status: PLAN v2 (Sol plan-review r1 CHANGES-NEEDED + Fable code-gate r1
+GATE-PASS-conditional folded; **owner decisions 2026-08-21**: (1) the slice/RAM
+limit is **system-wide, not per-project** — the goal is to stop dev work from any
+project/session from OOMing the box, modelled on agentmux's `whale.slice`; (2)
+admission is **simple** — check the slice's RAM usage vs the slice's RAM cap,
+nothing more). Milestone task #54. Constrained by no-compat (AIRA is not live).
 
-## 1. What whale-run does today, and what AIRA already has
+## 1. The model (whale today, and what AIRA adds)
 
-`whale-run <cmd>` (`~/repos/claude/cmd/agentmux/whale.go`) runs
-`systemd-run --user --scope --slice=whale.slice --property=OOMPolicy=kill --
-sh -c 'echo 500 > /proc/self/oom_score_adj; exec nice -n 19 ionice -c 3 "$@"'`.
-So a transient **scope** under a hard-capped **slice** (`whale.slice`:
-`MemoryMax`, `MemorySwapMax=2G`, `CPUWeight/IOWeight=50`, `Delegate` so the cap is
-enforced), with per-scope **OOM-kill** (`OOMPolicy=kill` ⇒ one OOM tears the whole
-scope down, no half-dead fleets) + deprioritisation. It is dead-simple,
-low-latency, daemon-free, and **catches nothing on the way in — it just caps and
-kills** (there is no admission; a job that won't fit still starts and may OOM).
+agentmux confines heavy jobs with **one machine-wide user slice** `whale.slice`
+(hard `MemoryMax` sized to leave desktop headroom — `--memory-max` > installed >
+2/3 physical RAM; `MemoryHigh = Max − 2G`; `MemorySwapMax=2G`;
+`CPUWeight/IOWeight=50`; `+memory` propagated so the cap is enforced). `whale-run
+<cmd>` runs the job as a transient **scope** under that slice via
+`systemd-run … --property=OOMPolicy=kill … sh -c 'echo 500 >
+/proc/self/oom_score_adj; exec nice -n 19 ionice -c 3 "$@"'`. It **caps + kills
+but does not admit** — a too-big job still starts and may OOM before the cap
+bites; whale relies on the watchdog + oomd (layers 2–3) to catch that.
 
-AIRA's runner already does the harder half: it creates an owned cgroup-v2 scope
-(`.aira-RUN-N` under a configured parent) and places the child via
-**clone3 + CLONE_INTO_CGROUP** (`cgroup_linux.go:189-193`,
-`runner_linux.go:423`), captures `memory.peak`, kills via `cgroup.kill`, and —
-the value whale lacks — **admits before launch** (RAM-aware `#29`
-`admission_linux.go:103`, peak-RSS reserve estimate `#50`
-`core.go:1499-1514`), fail-open when the daemon is down (flock fallback
-`admission_linux.go:118-221`).
+AIRA already has the missing half — **admit-before-launch** (#29 RAM-aware, #50
+peak-RSS reserve) — and owns cgroup-v2 scopes (clone3 + CLONE_INTO_CGROUP), but
+it currently **sets no limits or priorities at all** (map: no
+`memory.oom.group`/`memory.max`/`oom_score_adj`/`nice`/`ionice` writes; the cap is
+assumed external). This milestone folds whale's layer-1 confinement into AIRA: a
+`whale-run`-fast verb that runs a heavy command **admitted-first** in a scope
+under the **machine-wide capped slice**, with the per-scope OOM-kill + deprioritise
+that whale applies. The hard slice `MemoryMax` + OOM behaviour is the owner's kept
+last-resort backstop; admit-first keeps jobs off it.
 
-**The gap (headline map finding):** AIRA **sets no limits or priorities** — it
-writes no `memory.max`/`memory.high`, no `memory.oom.group`, no `oom_score_adj`,
-no `nice`/`ionice`. The cap it admits against is presumed to be provided by an
-external systemd slice. **So the hard slice cap + OOM-kill do not exist inside
-AIRA today; whale.slice provides them.**
+## 2. Scope (v1) — machine-wide slice, admit on slice-vs-cap, reuse whale.slice
 
-## 2. Scope (v1) — reuse the external capped slice; add the confinement value
+- **Machine-wide slice, project-less.** `aira confine -- <argv…>` works in **any
+  directory** (no `.aira/config` required), confining under one machine-wide
+  slice. The slice is a **machine-level default** — `whale.slice` initially —
+  overridable by `--slice`/`AIRA_CONFINE_SLICE`; there is no per-project slice
+  here. (AIRA owning its own `aira.slice` + an `aira install` face that sizes and
+  delegates it — replacing whale.slice — is the explicit follow-up, §6.)
+- **Simple admission = slice usage vs slice cap** (owner decision 2). Admit when
+  the slice's `memory.max − memory.current ≥ reserve` (exactly #29
+  `admission_linux.go`), with the #50 peak-RSS reserve estimate. Cross-session
+  fairness via the daemon queue (#40) when it is up so concurrent `confine` jobs
+  from different sessions don't collectively over-commit the shared slice; the
+  per-slice **flock** fallback self-gates when the daemon is down. **No host-PSI /
+  host-`MemAvailable` gate and no fail-closed refusal** — the conservatively-sized
+  slice cap is the host-safety boundary, and the watchdog + oomd (layers 2–3)
+  remain the extra host-level net, unchanged (see §3 for the deliberate
+  simplification vs Sol's host-headroom finding).
+- **A new slim entry point, not `aira run`.** `confine` composes the runner's
+  quartet — `backend.Probe` → `admit` → `backend.Create` → `exec.Cmd{SysProcAttr:
+  {UseCgroupFD,CgroupFD}}` → `Start`, then release-admission-after-Start — with
+  `aira time`'s **foreground** machinery (inherit stdio, forward signals, map exit
+  status incl. 128+signal). It writes **no ledger/run-record**, does no telemetry
+  or git-context, and synthesises a non-ledger scope id — so it is `whale-run`-fast
+  (Launch itself is not trimmable; the pieces are). A **per-call** runner/backend
+  is built so `--slice` takes effect per invocation.
+- **Daemon-optional.** `confine` **bypasses the mandatory `ensure-scope` daemon
+  exchange** (which otherwise hard-fails client verbs when the daemon is down,
+  `dispatcher.go:147-158`) so it always runs; the daemon is used only as the
+  admission-fairness optimisation, with the flock fallback otherwise.
+- **CPU governor** env (`AIRA_CPU_SLOTS_DIR`, …) is injected into the child (as
+  `run`/`time` do) — confined heavy jobs are exactly the pytest fleets the #49
+  governor caps, so they compose.
 
-v1 does **not** make AIRA install or own a slice (AIRA has no install face and
-writes no systemd/delegation today — that is a large, root-touching follow-up).
-Instead v1 **reuses an external capped+delegated slice** as the confinement
-parent — `whale.slice` initially, via the runner's **already-working**
-`run.cgroup_parent`/`run.slice` config (`project.go:64-74`, used exactly this way
-by #50). The hard `MemoryMax` + `+memory` delegation stay owned by that external
-slice — **that is the owner's last-resort backstop, unchanged.** AIRA adds:
+## 2.1 Confinement writes (per scope), honestly verified
 
-1. **A slim confinement verb** — `aira confine [--slice S] [--name N] -- <argv…>`
-   (name TBD in review; `aira confine`/`aira sh`/`aira x` are candidates). It
-   launches `<argv>` through the runner's minimal quartet — `backend.Probe` →
-   `r.admit` → `backend.Create` → `exec.Cmd{SysProcAttr:{UseCgroupFD,CgroupFD}}` →
-   `Start` (`runner_linux.go:322-465`) — **without** the heavy per-run ledger
-   event chain (`starting`/`scope-created`/`running`/`wait-observed`), telemetry
-   wiring, or git-context stamping that `aira run` does. This keeps it
-   whale-run-fast; `aira time` (`command.go:301`) is the lightness precedent.
-   Exit code and signal are propagated; stdio is inherited (a foreground wrapper,
-   not a captured run).
-2. **Per-scope confinement writes**, applied right after `backend.Create`
-   (`runner_linux.go` ~412, before `Start`) where delegation permits:
-   - **`memory.oom.group = 1`** on the `.aira-RUN-N` scope — the cgroup-v2
-     equivalent of `OOMPolicy=kill`: an OOM in the scope kills the *whole* scope.
-     **This is the OOM-kill backstop, now at scope granularity.**
-   - **`oom_score_adj = 500`** on the leader (child self-writes `/proc/self/
-     oom_score_adj` before exec — the proven whale pattern — so it is set before
-     the process can grow) and inherited by descendants.
-   - **`nice -n 19` + `ionice -c 3`** so the desktop preempts cleanly (applied via
-     the same pre-exec step, or `setpriority`/`ioprio_set`).
-   These are **best-effort and honest**: if the parent lacks `+memory` delegation
-   the `memory.oom.group` write fails and is reported as `unenforced`, never
-   silently assumed (mirrors #50's honest-nil-peak discipline).
-3. **Admit-first as the primary mechanism.** The verb admits via #29 (+#50
-   reserve) before launching, so a job that won't fit **waits** rather than
-   starting and OOMing. Admission is **fail-open** (owner: never block a heavy
-   command): daemon-down → flock fallback; flock timeout/unevaluated → launch
-   anyway, confined — the slice cap + `memory.oom.group` are the net. A job never
-   fails to run because admission could not be established; it only ever *waits*
-   up to `AdmissionMaxWait`, then proceeds confined.
+Applied to each `.aira-RUN-N` scope after `backend.Create`, before `Start`
+(Fable live-probed these succeed unprivileged under whale.slice):
 
-The composition: **admit-first keeps you off the cap in normal operation; the
-external slice `MemoryMax` + per-scope `memory.oom.group` are the absolute last
-resort.** Exactly the owner's model.
+- **`memory.oom.group = 1`** on the scope. This is the cgroup-v2 memcg
+  guarantee that an OOM *inside the scope* kills the whole scope's tasks together
+  (no half-dead fleets). It is described accurately as **the narrower guarantee**
+  it is (Sol P1): it is *not* a full synonym for systemd `OOMPolicy=kill` — it has
+  `oom_score_adj=-1000` exemptions and does not reproduce the manager-level
+  reaction; the systemd-oomd layer remains the broader net.
+- **`oom_score_adj = 500`** on the leader + **`nice -n 19` + `ionice -c 3`**,
+  applied by an **exec-self confine-setup helper** (Sol P1): AIRA re-execs itself
+  in a `--confine-setup` mode that sets `oom_score_adj`/`setpriority`/`ioprio_set`,
+  reports success through a **handshake pipe**, then `exec`s the target. AIRA
+  **claims enforcement only if the handshake confirms it** — never a best-effort
+  `|| true` that silently no-ops. (Go has no safe arbitrary pre-exec callback;
+  exec-self is the cgo-free, `/bin/sh`-free, verifiable pattern.)
+- These writes need the `+memory` controller delegated on the parent; whale.slice
+  provides it (propagation, not a `Delegate=` on the slice — Fable §1 correction).
+  Absent delegation, the `memory.oom.group` write fails and is reported
+  **`unenforced`**, never silently assumed.
 
-## 3. Honesty and failure modes
+## 3. Honesty and the deliberate simplification
 
-- **Uncapped / undelegated parent** — if `run.slice`'s `memory.max` is `max`/
-  unreadable or `+memory` is not delegated, admission is honestly `unevaluated`
-  and the job launches ungated (as today), and the `memory.oom.group` write is
-  reported `unenforced`. The verb **surfaces the enforcement status** (capped &
-  delegated vs not) rather than implying a backstop that is not there.
-- **Daemon down** — confinement + OOM-group still apply (cgroup writes, not
-  daemon-dependent); admission degrades to the flock fallback. Fully functional.
-- **Bootstrap** — building AIRA itself uses `whale-run`. v1 is **additive**:
-  `whale-run` keeps working unchanged; `aira confine` is a new, parallel path.
-  Migrating call-sites (and optionally making the `whale-run` shim `exec aira
-  confine` when AIRA is installed) is a later, separate step — no chicken-and-egg.
+- **Gate = slice-vs-cap** (owner). If the slice's `memory.max` is a finite number,
+  admit against it. If it is `max`/unreadable (the slice is not actually capped —
+  which must not happen in the deployed model where whale.slice/aira.slice carries
+  the cap), admission is honestly **`unevaluated`** and the job launches; the
+  confinement writes still apply best-effort and the enforcement status is
+  surfaced. AIRA never fakes a cap it did not read.
+- **Owner-accepted simplification vs Sol's host-headroom P0.** Sol argued
+  `slice.max − slice.current` can admit while the *host* is near-OOM. The owner's
+  design accepts this: the machine-wide slice cap is **sized conservatively**
+  (whale: 2/3 physical RAM) precisely so "fits in the slice" ≈ "won't OOM the
+  host", and the watchdog + oomd remain the host-level backstops. v1 therefore
+  gates on slice-vs-cap only; a host-`MemAvailable`/PSI co-gate is recorded as a
+  clean future option, not built.
+- **Never blocks** (owner's earlier ask): admission only ever *waits* up to
+  `AdmissionMaxWait`, then proceeds; daemon-down degrades to flock; there is no
+  path that fails a launch because coordination was unavailable.
 
 ## 4. Faces
 
-CLI-only in v1 (it is a shell-confinement primitive; it inherits stdio and
-propagates exit status — not a structured `core.Do` result). It is a
-`RouteClient` verb (executes client-side like `run`/`time`; needs the daemon only
-for cross-client admission fairness, and degrades without it). No MCP/Skill
-surface in v1 (an agent that wants a *recorded* run uses `aira run`; `aira
-confine` is the lightweight "just run this heavy thing safely" path). The
-dispatch-table descriptor is added so generated help lists it.
+CLI-only in v1 (a shell-confinement primitive: inherits stdio, propagates exit
+status — not a structured `core.Do` result). `RouteClient` + daemon-optional. A
+dispatch-table descriptor is added so generated help lists it. No MCP/Skill (an
+agent wanting a *recorded* run uses `aira run`; `confine` is "just run this heavy
+thing safely, anywhere").
 
-## 5. Testing (real-cgroup, honest)
+## 5. Testing (real-cgroup, honest; gated by AIRA_REAL_CGROUP=1)
 
-Real-cgroup tests gated by `cgrouptest.IsolatedScopeParent` + `AIRA_REAL_CGROUP=1`
-(the #33 harness), each a discriminating case:
-- **`memory.oom.group=1` is written** on the scope when the parent delegates
-  `+memory` (read it back); and an OOM in a child kills the whole scope (a
-  two-child fixture where one OOMs → both die), proving the backstop.
-- **`oom_score_adj=500`** is set on the leader (read `/proc/<pid>/oom_score_adj`)
-  and inherited by a child.
-- **admit-first gates**: with a slice whose free < reserve, `aira confine` waits;
-  with free ≥ reserve it proceeds. Fail-open: daemon-down still admits via flock;
-  an unevaluable slice launches ungated (not blocked).
-- **honest unenforced**: a parent without `+memory` delegation → the oom.group
-  write is reported `unenforced` and the run is not claimed as capped (red vs a
-  silent assume-enforced).
-- **low overhead / no ledger**: `aira confine` writes no RunRecord/ledger events
-  (assert the ledger is untouched) — distinguishing it from `aira run`.
-- **exit-status + signal propagation**: the child's exit code and a killing
-  signal surface as the verb's exit status.
-Pure/unit: the argv/priority/oom-group plumbing where separable from real cgroups.
+- **`memory.oom.group=1` written** on the scope (read back) under a `+memory`-
+  delegated parent; an OOM in one child **kills the whole scope** (two-child
+  fixture, one OOMs → both die).
+- **oom_score_adj/nice/ionice via the handshake**: the setup helper reports
+  success and `/proc/<pid>/oom_score_adj`==500 (inherited by a child); a forced
+  handshake failure → reported `unenforced`, enforcement **not** claimed.
+- **Admit slice-vs-cap**: slice free < reserve → waits; ≥ reserve → proceeds;
+  daemon-down still admits via flock; an uncapped slice → `unevaluated`, launches.
+- **Never-blocks**: a timeout proceeds (launches), never errors.
+- **Foreground semantics**: child exit code + a killing signal surface as the
+  verb's exit status; stdio is inherited.
+- **No ledger**: `confine` writes no RunRecord/ledger events (assert untouched) —
+  distinguishing it from `aira run`.
+- **Project-less**: runs with no `.aira/config` present.
 
-## 6. Deferrals (explicit follow-ups, each its own milestone)
+## 6. Deferrals (each its own milestone)
 
-1. **AIRA owns the slice** — an `aira install` face writing an `aira.slice`
-   (`MemoryMax`, `MemorySwapMax`, `CPUWeight/IOWeight`) + the `+memory`
-   delegation drop-in (root), modelled on whale's install and on AIRA's existing
-   machine-wide CPU-slots pool (`daemon/cpuslots.go`). This is the phase where
-   AIRA fully owns the cap and whale.slice can retire.
-2. **Per-run `memory.max`/`memory.high` scope caps** (#50 deferral #3) — a
-   per-command cap in addition to the slice cap.
-3. **Fold whale layers 2–3** — the bypass-job watchdog and the systemd-oomd
-   backstop — into AIRA.
-4. **Migrate `whale-run` call-sites** + the `whale-run`→`aira confine` shim.
+1. **AIRA owns the slice** — `aira install` writing an `aira.slice` (sized
+   `MemoryMax`/`MemoryHigh`/`MemorySwapMax`, `CPUWeight/IOWeight`) + the `+memory`
+   delegation drop-in (root), modelled on agentmux's installer and AIRA's
+   machine-wide CPU-slots pool. Replaces the whale.slice dependency; lets
+   whale.slice retire.
+2. Optional host-`MemAvailable`/PSI co-gate (Sol's host-headroom option).
+3. Per-run `memory.max`/`memory.high` scope caps (#50 deferral #3).
+4. Fold whale layers 2–3 (watchdog, oomd) into AIRA.
+5. Migrate `whale-run` call-sites + a `whale-run`→`aira confine` shim.
 
 ## 7. Risks
 
-- **Reusing whale.slice couples v1 to an external unit** — acceptable and
-  intended (it is the owner's kept backstop); AIRA reads its cap for admission
-  and writes only within its own child scope. The AIRA-owned-slice follow-up
-  removes the coupling.
-- **`memory.oom.group` needs `+memory` delegation** — handled by reusing the
-  already-delegated whale.slice; honestly reported `unenforced` otherwise.
-- **Foreground stdio/exit semantics** — v1 is a thin foreground wrapper; getting
-  signal/exit propagation right is the main implementation care (covered by §5).
-- **Scope creep into the install/root work** — explicitly fenced to the deferrals.
+- **External whale.slice dependency** — v1 depends on an externally-managed slice
+  for the cap + delegation; preflighted each launch and reported honestly;
+  removed by deferral #1.
+- **`memory.oom.group` narrower than `OOMPolicy=kill`** — described accurately;
+  oomd remains the broader net (§2.1).
+- **Foreground stdio/exit + the setup-helper handshake** are the main
+  implementation care (§5 covers both).
+- **Host-headroom simplification** — owner-accepted (§3); watchdog/oomd remain.
 
 ## 8. Two-loop plan
 
-Sol plan-review (inline) + Fable code-gate (verify the quartet-reuse, the
-`memory.oom.group`/delegation facts, the fail-open admission, and that no
-install/root work sneaks in) → fold → owner reviews the committed spec → Terra
-build (TDD, self-review) → Sol build-review → Sol confirm → Opus real-HW verify
-(build/vet/`CGO_ENABLED=0`/test ×2/`-race`, real-cgroup cases proven red) → merge.
+Sol r1 + Fable r1 folded → v2 with owner decisions. Owner reviews this committed
+spec; a Sol r2 confirms the folds. Then Terra build (TDD, self-review) → Sol
+build-review → Sol confirm → Opus real-HW verify (build/vet/`CGO_ENABLED=0`/test
+×2/`-race`, real-cgroup cases proven red) → merge.
