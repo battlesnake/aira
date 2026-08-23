@@ -49,6 +49,37 @@ func TestConfineRunsDirectlyWithoutProjectOrDispatcher(t *testing.T) {
 	}
 }
 
+// covers: task-57 confine CLI parsing and request threading.
+func TestConfineMemoryFlagsThreadIntoRequest(t *testing.T) {
+	original := runConfined
+	t.Cleanup(func() { runConfined = original })
+	runConfined = func(_ context.Context, request runner.ConfineRequest) (runner.ConfineResult, error) {
+		if request.ScopeMemoryMax != 32<<20 || request.ScopeMemoryHigh != 16<<20 {
+			t.Fatalf("request=%+v", request)
+		}
+		return runner.ConfineResult{}, nil
+	}
+	if exit := runWithInput([]string{"confine", "--memory-max", "32M", "--memory-high", "16m", "--", "true"}, io.Discard, io.Discard, strings.NewReader("")); exit != 0 {
+		t.Fatalf("exit=%d", exit)
+	}
+}
+
+// verifies: task-57 confine rejects invalid cap relationships before launch.
+func TestConfineMemoryFlagValidation(t *testing.T) {
+	for _, argv := range [][]string{
+		{"--memory-high", "1M", "--", "true"},
+		{"--memory-high", "0", "--", "true"},
+		{"--memory-max", "0", "--", "true"},
+		{"--memory-max", "1023K", "--", "true"},
+		{"--memory-max", "2M", "--memory-high", "3M", "--", "true"},
+		{"--memory-max", "garbage", "--", "true"},
+	} {
+		if _, _, err := parseArgs("confine", argv); err == nil || !strings.HasPrefix(err.Error(), "E_CONFINE_ARGUMENT_INVALID:") {
+			t.Fatalf("parseArgs(%q) err=%v", argv, err)
+		}
+	}
+}
+
 func TestConfineInfraErrorUsesDedicatedExitAndDoesNotDispatch(t *testing.T) {
 	original := runConfined
 	t.Cleanup(func() { runConfined = original })
@@ -89,7 +120,7 @@ func TestConfineDescriptorIsClientExecuteWithoutMCP(t *testing.T) {
 			continue
 		}
 		found = true
-		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] -- <argv...>" {
+		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--memory-max S] [--memory-high S] -- <argv...>" {
 			t.Fatalf("descriptor=%+v", descriptor)
 		}
 	}

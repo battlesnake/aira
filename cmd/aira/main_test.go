@@ -350,6 +350,37 @@ func TestRunDelimiterKeepsChildOptionTokensVerbatim(t *testing.T) {
 	}
 }
 
+// covers: task-57 run CLI accepts and transports both scope-memory options.
+func TestRunMemoryFlagsBuildRequest(t *testing.T) {
+	target, options, err := parseArgs("run", []string{"--memory-max", "32M", "--memory-high", "1025K", "--", "true"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := buildRequest("run", target, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Args["memory_max"] != "32M" || request.Args["memory_high"] != "1025K" {
+		t.Fatalf("request=%#v", request)
+	}
+}
+
+// verifies: task-57 run rejects lone high, undersized max, and high above max.
+func TestRunMemoryFlagValidation(t *testing.T) {
+	for _, argv := range [][]string{
+		{"--memory-high", "1M", "--", "true"},
+		{"--memory-high", "0", "--", "true"},
+		{"--memory-max", "0", "--", "true"},
+		{"--memory-max", "1023K", "--", "true"},
+		{"--memory-max", "2M", "--memory-high", "3M", "--", "true"},
+		{"--memory-max", "1MB", "--", "true"},
+	} {
+		if _, _, err := parseArgs("run", argv); err == nil || !strings.HasPrefix(err.Error(), "E_RUN_ARGUMENT_INVALID:") {
+			t.Fatalf("parseArgs(%q) err=%v", argv, err)
+		}
+	}
+}
+
 func TestBuildRunRequestEmptyTelemetryKeysRemainStoreFree(t *testing.T) {
 	request, err := buildRequest("run", []string{"true"}, map[string]string{})
 	if err != nil {

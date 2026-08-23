@@ -56,16 +56,20 @@ const (
 // OOM-group, and priority facets separate. In particular, a successful
 // admission never fabricates a cap snapshot or implies priority success.
 type ConfineStatus struct {
-	Slice             string
-	Cap               ConfineCap
-	Admission         ConfineAdmission
-	AdmissionState    string
-	AdmissionWaitedMS int64
-	CapBytes          int64
-	ReserveBytes      int64
-	Scope             ConfineScope
-	OOMGroup          ConfineOOMGroup
-	Priorities        ConfinePriorities
+	Slice                string
+	Cap                  ConfineCap
+	Admission            ConfineAdmission
+	AdmissionState       string
+	AdmissionWaitedMS    int64
+	CapBytes             int64
+	ReserveBytes         int64
+	Scope                ConfineScope
+	OOMGroup             ConfineOOMGroup
+	Priorities           ConfinePriorities
+	ScopeMemoryMax       int64
+	ScopeMemoryHigh      int64
+	ScopeMemoryBinding   string
+	ScopeMemoryEffective int64
 }
 
 type ConfineRequest struct {
@@ -76,6 +80,8 @@ type ConfineRequest struct {
 	RuntimeDir       string
 	AdmitSocketPath  string
 	MemoryReserve    int64
+	ScopeMemoryMax   int64
+	ScopeMemoryHigh  int64
 	AdmissionMaxWait time.Duration
 	PollInterval     time.Duration
 	HandshakeTimeout time.Duration
@@ -145,5 +151,19 @@ func FormatConfineStatus(status ConfineStatus) string {
 	line += " scope=" + string(status.Scope)
 	line += " oom.group=" + string(status.OOMGroup)
 	line += " priorities=" + string(status.Priorities)
+	if status.ScopeMemoryMax <= 0 {
+		line += " scope-memory.max=not-requested"
+	} else {
+		line += " scope-memory.max=enforced=" + strconv.FormatInt(status.ScopeMemoryMax, 10)
+		if status.ScopeMemoryBinding != "" {
+			line += " binding=" + status.ScopeMemoryBinding
+		}
+		if status.ScopeMemoryEffective > 0 {
+			line += " effective=" + strconv.FormatInt(status.ScopeMemoryEffective, 10)
+		}
+		if status.ScopeMemoryHigh > 0 {
+			line += " memory.high=reclaim-pressure=" + strconv.FormatInt(status.ScopeMemoryHigh, 10)
+		}
+	}
 	return line
 }

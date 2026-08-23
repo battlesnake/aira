@@ -43,6 +43,38 @@ func TestRunStdinConnectCoreValidationRejectsEveryConflictingFaceOption(t *testi
 		})
 	}
 }
+
+// covers: task-57 transport-neutral Core parsing threads exact byte values.
+func TestRunScopeMemoryCoreThreading(t *testing.T) {
+	fake := &faceRunner{}
+	response := NewWithRunner(nil, fake).Do(context.Background(), Request{Verb: "run", Args: map[string]any{
+		"argv": []string{"child"}, "memory_max": "32M", "memory_high": "1025K",
+	}})
+	if !response.OK || fake.launchCalls != 1 || fake.request.ScopeMemoryMax != 32<<20 || fake.request.ScopeMemoryHigh != 1025<<10 {
+		t.Fatalf("response=%+v calls=%d request=%+v", response, fake.launchCalls, fake.request)
+	}
+}
+
+// verifies: task-57 Core rejects invalid memory relationships without launching.
+func TestRunScopeMemoryCoreValidation(t *testing.T) {
+	for name, options := range map[string]map[string]any{
+		"high requires max":      {"memory_high": "1M"},
+		"zero high requires max": {"memory_high": "0"},
+		"zero max":               {"memory_max": "0"},
+		"max minimum":            {"memory_max": "1023K"},
+		"high above max":         {"memory_max": "2M", "memory_high": "3M"},
+		"syntax":                 {"memory_max": "1MB"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fake := &faceRunner{}
+			options["argv"] = []string{"child"}
+			response := NewWithRunner(nil, fake).Do(context.Background(), Request{Verb: "run", Args: options})
+			if response.Code != "E_RUN_ARGUMENT_INVALID" || fake.launchCalls != 0 {
+				t.Fatalf("response=%+v calls=%d", response, fake.launchCalls)
+			}
+		})
+	}
+}
 func (*faceRunner) Kill(context.Context, string, bool) (*runner.RunRecord, error) { return nil, nil }
 func (*faceRunner) Get(string) (*runner.RunRecord, error)                         { return nil, nil }
 func (*faceRunner) ReadOutput(context.Context, runner.OutputRequest) (*runner.OutputChunk, error) {

@@ -482,7 +482,7 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 			return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine options must precede the launch delimiter")
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name != "slice" && name != "name" {
+		if name != "slice" && name != "name" && name != "memory-max" && name != "memory-high" {
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for confine", name)
 		}
 		if i+1 >= delimiter || strings.HasPrefix(argv[i+1], "--") {
@@ -498,12 +498,21 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 	if len(target) == 0 || target[0] == "" {
 		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine target argv is empty")
 	}
+	if _, _, err := parseScopeMemoryOptions(options, "E_CONFINE_ARGUMENT_INVALID"); err != nil {
+		return nil, nil, err
+	}
 	return target, options, nil
 }
 
 func runConfineCommand(ctx context.Context, target []string, options map[string]string, stdin io.Reader, stdout, stderr io.Writer) int {
+	maximum, high, err := parseScopeMemoryOptions(options, "E_CONFINE_ARGUMENT_INVALID")
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+	}
 	request := runner.ConfineRequest{
 		Slice: options["slice"], Name: options["name"], Argv: append([]string(nil), target...),
+		ScopeMemoryMax: maximum, ScopeMemoryHigh: high,
 		Stdin: stdin, Stdout: stdout, Stderr: stderr,
 	}
 	if paths, err := daemon.PathsFromEnv(); err == nil {
@@ -566,7 +575,7 @@ func parseRunArgs(argv []string) ([]string, map[string]string, error) {
 		switch name {
 		case "prefix", "env", "config-env":
 			options[name] = appendDelimited(options[name], value)
-		case "cwd", "stdin", "timeout", "ticket", "phase", "label", "tool", "report", "report-stream", "suite", "shard", "retry", "usage", "provider":
+		case "cwd", "stdin", "timeout", "ticket", "phase", "label", "tool", "report", "report-stream", "suite", "shard", "retry", "usage", "provider", "memory-max", "memory-high":
 			if options[name] != "" {
 				return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: option --%s may occur once", name)
 			}
@@ -579,7 +588,44 @@ func parseRunArgs(argv []string) ([]string, map[string]string, error) {
 	if len(target) == 0 {
 		return nil, nil, fmt.Errorf("E_RUN_ARGUMENT_INVALID: run target argv is empty")
 	}
+	if _, _, err := parseScopeMemoryOptions(options, "E_RUN_ARGUMENT_INVALID"); err != nil {
+		return nil, nil, err
+	}
 	return target, options, nil
+}
+
+func parseScopeMemoryOptions(options map[string]string, code string) (int64, int64, error) {
+	parse := func(name string) (int64, error) {
+		raw, present := options[name]
+		if !present {
+			return 0, nil
+		}
+		value, err := runner.ParseMemorySize(raw)
+		if err != nil {
+			return 0, fmt.Errorf("%s: --%s: %w", code, name, err)
+		}
+		return value, nil
+	}
+	maximum, err := parse("memory-max")
+	if err != nil {
+		return 0, 0, err
+	}
+	high, err := parse("memory-high")
+	if err != nil {
+		return 0, 0, err
+	}
+	_, maximumRequested := options["memory-max"]
+	_, highRequested := options["memory-high"]
+	if highRequested && !maximumRequested {
+		return 0, 0, fmt.Errorf("%s: --memory-high requires --memory-max", code)
+	}
+	if maximumRequested && maximum == 0 {
+		return 0, 0, fmt.Errorf("%s: --memory-max must be at least 1MiB", code)
+	}
+	if err := runner.ValidateScopeMemoryCap(maximum, high); err != nil {
+		return 0, 0, fmt.Errorf("%s: %w", code, err)
+	}
+	return maximum, high, nil
 }
 
 func parseTimeArgs(argv []string) ([]string, map[string]string, error) {
@@ -688,6 +734,12 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		args["no_stdin"] = options["no-stdin"] == "true"
 		args["store_stdin"] = options["store-stdin"] == "true"
 		args["no_admit"] = options["no-admit"] == "true"
+		if value, ok := options["memory-max"]; ok {
+			args["memory_max"] = value
+		}
+		if value, ok := options["memory-high"]; ok {
+			args["memory_high"] = value
+		}
 		args["timeout"] = options["timeout"]
 		args["ticket"] = options["ticket"]
 		args["phase"] = options["phase"]
@@ -708,6 +760,12 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		}
 		args["argv"] = append([]string(nil), positional...)
 		args["slice"], args["name"] = options["slice"], options["name"]
+		if value, ok := options["memory-max"]; ok {
+			args["memory_max"] = value
+		}
+		if value, ok := options["memory-high"]; ok {
+			args["memory_high"] = value
+		}
 	case "time":
 		if len(positional) == 0 {
 			return core.Request{}, errors.New("E_RUN_ARGUMENT_INVALID: time target argv is empty")

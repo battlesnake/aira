@@ -99,6 +99,8 @@ type RunRecord struct {
 	ResourceSignature     string               `json:"resource_signature,omitempty"`
 	AdmissionReserve      *int64               `json:"admission_reserve,omitempty"`
 	AdmissionReserveBasis string               `json:"admission_reserve_basis,omitempty"`
+	ScopeMemoryMax        *int64               `json:"scope_memory_max,omitempty"`
+	ScopeMemoryHigh       *int64               `json:"scope_memory_high,omitempty"`
 	LaunchPrefix          []string             `json:"launch_prefix,omitempty"`
 	CgroupScope           string               `json:"cgroup_scope,omitempty"`
 	StartedAt             string               `json:"started_at"`
@@ -166,6 +168,8 @@ type Request struct {
 	ResourceSignature     string    `json:"resource_signature,omitempty"`
 	MemoryReserveOverride *int64    `json:"memory_reserve_override,omitempty"`
 	MemoryReserveBasis    string    `json:"memory_reserve_basis,omitempty"`
+	ScopeMemoryMax        int64     `json:"scope_memory_max,omitempty"`
+	ScopeMemoryHigh       int64     `json:"scope_memory_high,omitempty"`
 	// TelemetryPending is an opaque initial envelope supplied by Core. Runner
 	// stamps it into the starting event without interpreting its value.
 	TelemetryPending string `json:"telemetry_pending,omitempty"`

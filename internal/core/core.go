@@ -231,6 +231,39 @@ func nonNegativeInt(args *argAccessor, name string) (int64, error) {
 	return value, nil
 }
 
+func scopeMemoryArgs(args *argAccessor, code string) (int64, int64, error) {
+	parse := func(raw, flag string) (int64, error) {
+		if raw == "" {
+			return 0, nil
+		}
+		value, err := runner.ParseMemorySize(raw)
+		if err != nil {
+			return 0, runnerError(code, fmt.Errorf("%s: %w", flag, err))
+		}
+		return value, nil
+	}
+	maximumRaw := stringArg(args, "memory_max")
+	highRaw := stringArg(args, "memory_high")
+	maximum, err := parse(maximumRaw, "--memory-max")
+	if err != nil {
+		return 0, 0, err
+	}
+	high, err := parse(highRaw, "--memory-high")
+	if err != nil {
+		return 0, 0, err
+	}
+	if highRaw != "" && maximumRaw == "" {
+		return 0, 0, runnerError(code, errors.New("--memory-high requires --memory-max"))
+	}
+	if maximumRaw != "" && maximum == 0 {
+		return 0, 0, runnerError(code, errors.New("--memory-max must be at least 1MiB"))
+	}
+	if err := runner.ValidateScopeMemoryCap(maximum, high); err != nil {
+		return 0, 0, runnerError(code, err)
+	}
+	return maximum, high, nil
+}
+
 // ArgKind is the intentionally small transport-neutral argument vocabulary
 // shared by the CLI and generated protocol faces.
 type ArgKind string
@@ -1462,6 +1495,8 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			boolSpec("no_stdin", false, false, "Explicitly launch with null stdin"),
 			boolSpec("store_stdin", false, false, "Persist supplied launch stdin"),
 			boolSpec("no_admit", false, false, "Bypass configured memory admission"),
+			stringSpec("memory_max", false, false, "Per-run scope memory.max ([KMG] binary suffix)"),
+			stringSpec("memory_high", false, false, "Per-run scope memory.high reclaim pressure ([KMG] binary suffix)"),
 			stringSpec("timeout", false, false, "Positive run timeout duration"),
 			stringSpec("ticket", false, false, "Ticket ID"),
 			stringSpec("phase", false, false, "Work phase"),
@@ -1485,6 +1520,10 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			if noStdin && stringArg(args, "stdin") != "" {
 				return nil, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("no_stdin and stdin are mutually exclusive"))
 			}
+			memoryMax, memoryHigh, err := scopeMemoryArgs(args, "E_RUN_ARGUMENT_INVALID")
+			if err != nil {
+				return nil, err
+			}
 			params := wiringParamsFromArgs(args)
 			request := runner.Request{
 				Argv: stringSlice(args, "argv"), Cwd: stringArg(args, "cwd"), Env: stringSlice(args, "env"),
@@ -1492,6 +1531,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				Prefix: stringSlice(args, "prefix"), Merge: boolArg(args, "merge"), Realtime: boolArg(args, "realtime"), PTY: boolArg(args, "pty"), StdinPath: stringArg(args, "stdin"),
 				StoreStdin: boolArg(args, "store_stdin"), NoAdmit: boolArg(args, "no_admit"), Timeout: timeout,
 				Detach: boolArg(args, "detach"), StdinConnect: boolArg(args, "stdin_connect"),
+				ScopeMemoryMax: memoryMax, ScopeMemoryHigh: memoryHigh,
 			}
 			if c.memoryEstimate {
 				prepareMemoryEstimate(ctx, c.runner, c.memoryHeadroom, c.commandPrefix, &request)
@@ -1624,15 +1664,19 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return result, err
 		}},
-		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] -- <argv...>", Args: []ArgSpec{
+		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--memory-max S] [--memory-high S] -- <argv...>", Args: []ArgSpec{
 			listSpec("argv", true, true, "Exact target argv after the launch delimiter"),
 			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
 			stringSpec("name", false, false, "Scope name component"),
+			stringSpec("memory_max", false, false, "Scope memory.max ([KMG] binary suffix)"),
+			stringSpec("memory_high", false, false, "Scope memory.high reclaim pressure ([KMG] binary suffix)"),
 		}, Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			_ = ctx
 			_ = stringSlice(args, "argv")
 			_ = stringArg(args, "slice")
 			_ = stringArg(args, "name")
+			_ = stringArg(args, "memory_max")
+			_ = stringArg(args, "memory_high")
 			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine is a direct CLI-only foreground verb")
 		}},
 		"run-kill": {Name: "run-kill", Usage: "run-kill <run-id> [--steal]", Args: []ArgSpec{stringSpec("run_id", true, true, "Run identifier"), boolSpec("steal", false, false, "Override foreign run ownership")}, MCPTool: "aira_run_kill", Run: func(ctx context.Context, args *argAccessor) (any, error) {

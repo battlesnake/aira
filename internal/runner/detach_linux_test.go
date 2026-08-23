@@ -238,7 +238,7 @@ func TestM20MergedDetachedCaptureUsesOneOpenFileDescription(t *testing.T) {
 func TestM20ControlFileIs0600AndConsumedBeforeLaunch(t *testing.T) {
 	dir := t.TempDir()
 	override := int64(70)
-	path, err := writeDetachControl(dir, Request{Argv: []string{"/bin/true"}, Detach: true, ResourceSignature: "sig", MemoryReserveOverride: &override, MemoryReserveBasis: "estimate:max=60,n=3,f=115"})
+	path, err := writeDetachControl(dir, Request{Argv: []string{"/bin/true"}, Detach: true, ResourceSignature: "sig", MemoryReserveOverride: &override, MemoryReserveBasis: "estimate:max=60,n=3,f=115", ScopeMemoryMax: 32 << 20, ScopeMemoryHigh: 16 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +253,7 @@ func TestM20ControlFileIs0600AndConsumedBeforeLaunch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !req.Detach || len(req.Argv) != 1 || req.Argv[0] != "/bin/true" || req.ResourceSignature != "sig" || req.MemoryReserveOverride == nil || *req.MemoryReserveOverride != override || req.MemoryReserveBasis != "estimate:max=60,n=3,f=115" {
+	if !req.Detach || len(req.Argv) != 1 || req.Argv[0] != "/bin/true" || req.ResourceSignature != "sig" || req.MemoryReserveOverride == nil || *req.MemoryReserveOverride != override || req.MemoryReserveBasis != "estimate:max=60,n=3,f=115" || req.ScopeMemoryMax != 32<<20 || req.ScopeMemoryHigh != 16<<20 {
 		t.Fatalf("control request = %+v", req)
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {

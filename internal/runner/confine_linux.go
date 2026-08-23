@@ -94,26 +94,28 @@ func (writer *confineLockedWriter) Write(payload []byte) (int, error) {
 }
 
 type confineDeps struct {
-	resolveSlicePath func(string) (string, bool, string)
-	newBackend       func(string) ScopeBackend
-	admit            func(context.Context, string, ConfineRequest, int64) (admissionResult, error)
-	writeOOMGroup    func(Scope) error
-	start            func(*confineCommand) error
-	readHandshake    func(*os.File, time.Duration) ([]byte, error)
-	readCap          func(string) (int64, bool)
-	signalSource     func() (<-chan os.Signal, func())
+	resolveSlicePath    func(string) (string, bool, string)
+	newBackend          func(string) ScopeBackend
+	admit               func(context.Context, string, ConfineRequest, int64) (admissionResult, error)
+	writeOOMGroup       func(Scope) error
+	writeScopeMemoryCap func(Scope, int64, int64, bool) error
+	start               func(*confineCommand) error
+	readHandshake       func(*os.File, time.Duration) ([]byte, error)
+	readCap             func(string) (int64, bool)
+	signalSource        func() (<-chan os.Signal, func())
 }
 
 func defaultConfineDeps() confineDeps {
 	return confineDeps{
-		resolveSlicePath: resolveSlicePath,
-		newBackend:       newDefaultBackend,
-		admit:            admitConfine,
-		writeOOMGroup:    writeConfineOOMGroup,
-		start:            func(command *confineCommand) error { return command.Start() },
-		readHandshake:    readConfineHandshake,
-		readCap:          effectiveConfineCap,
-		signalSource:     confineSignalSource,
+		resolveSlicePath:    resolveSlicePath,
+		newBackend:          newDefaultBackend,
+		admit:               admitConfine,
+		writeOOMGroup:       writeConfineOOMGroup,
+		writeScopeMemoryCap: writeScopeMemoryCap,
+		start:               func(command *confineCommand) error { return command.Start() },
+		readHandshake:       readConfineHandshake,
+		readCap:             effectiveConfineCap,
+		signalSource:        confineSignalSource,
 	}
 }
 
@@ -130,6 +132,9 @@ func fillConfineDeps(deps confineDeps) confineDeps {
 	}
 	if deps.writeOOMGroup == nil {
 		deps.writeOOMGroup = defaults.writeOOMGroup
+	}
+	if deps.writeScopeMemoryCap == nil {
+		deps.writeScopeMemoryCap = defaults.writeScopeMemoryCap
 	}
 	if deps.start == nil {
 		deps.start = defaults.start
@@ -160,6 +165,9 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	}}
 	if len(request.Argv) == 0 || request.Argv[0] == "" {
 		return result, errors.New("E_CONFINE_ARGUMENT_INVALID: target argv is empty")
+	}
+	if err := validateScopeMemoryCap(request.ScopeMemoryMax, request.ScopeMemoryHigh); err != nil {
+		return result, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: %w", err)
 	}
 	if err := validateConfineName(request.Name); err != nil {
 		return result, err
@@ -250,6 +258,19 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		return result, confineUnavailable(sliceName, fmt.Errorf("set memory.oom.group: %w", err))
 	}
 	result.Status.OOMGroup = ConfineOOMGroupSet
+	if request.ScopeMemoryMax > 0 {
+		if err := deps.writeScopeMemoryCap(scope, request.ScopeMemoryMax, request.ScopeMemoryHigh, false); err != nil {
+			return result, confineUnavailable(sliceName, fmt.Errorf("set scope memory cap: %w", err))
+		}
+		result.Status.ScopeMemoryMax = floorMemoryPage(request.ScopeMemoryMax)
+		result.Status.ScopeMemoryHigh = floorMemoryPage(request.ScopeMemoryHigh)
+		result.Status.ScopeMemoryBinding = "ancestor-limited"
+		result.Status.ScopeMemoryEffective = maximum
+		if result.Status.ScopeMemoryMax < maximum {
+			result.Status.ScopeMemoryBinding = "scope-limited"
+			result.Status.ScopeMemoryEffective = result.Status.ScopeMemoryMax
+		}
+	}
 	if interrupted.Load() {
 		return result, confineUnavailable(sliceName, errors.New("interrupted before confined target start"))
 	}
@@ -440,6 +461,73 @@ func writeConfineOOMGroup(scope Scope) error {
 	}
 	if strings.TrimSpace(string(data)) != "1" {
 		return errors.New("memory.oom.group did not read back as 1")
+	}
+	return nil
+}
+
+func writeScopeMemoryCap(scope Scope, maximum, high int64, setOOMGroup bool) error {
+	if setOOMGroup {
+		if err := writeConfineOOMGroup(scope); err != nil {
+			return fmt.Errorf("set memory.oom.group: %w", err)
+		}
+	}
+	if err := writeScopeMemoryValue(scope, "memory.max", maximum); err != nil {
+		return err
+	}
+	if high > 0 {
+		if err := writeScopeMemoryValue(scope, "memory.high", high); err != nil {
+			return err
+		}
+	}
+	if err := verifyScopeMemoryValue(scope, "memory.max", floorMemoryPage(maximum)); err != nil {
+		return err
+	}
+	if high > 0 {
+		if err := verifyScopeMemoryValue(scope, "memory.high", floorMemoryPage(high)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeScopeMemoryValue(scope Scope, name string, value int64) error {
+	fd, err := unix.Openat(scope.FD(), name, unix.O_WRONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", name, err)
+	}
+	file := os.NewFile(uintptr(fd), name)
+	if file == nil {
+		_ = unix.Close(fd)
+		return fmt.Errorf("open %s", name)
+	}
+	if _, err := file.WriteString(strconv.FormatInt(value, 10) + "\n"); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("write %s: %w", name, err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", name, err)
+	}
+	return nil
+}
+
+func verifyScopeMemoryValue(scope Scope, name string, want int64) error {
+	fd, err := unix.Openat(scope.FD(), name, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open %s for verification: %w", name, err)
+	}
+	file := os.NewFile(uintptr(fd), name)
+	if file == nil {
+		_ = unix.Close(fd)
+		return fmt.Errorf("open %s for verification", name)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, 64))
+	if err != nil {
+		return fmt.Errorf("read %s for verification: %w", name, err)
+	}
+	got, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil || got != want {
+		return fmt.Errorf("%s read-back=%q, want %d", name, strings.TrimSpace(string(data)), want)
 	}
 	return nil
 }

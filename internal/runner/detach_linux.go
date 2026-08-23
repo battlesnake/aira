@@ -193,12 +193,30 @@ func (r *Runner) launchDetachedValidated(ctx context.Context, req Request, prefi
 		return r.terminalizeDetachedNoChild(ctx, record, false, code, err)
 	}
 	defer supervisorLease.stopAndRelease()
-	readyErr := req.detachReady.send(detachReadyMessage{ID: id})
-	ack := make([]byte, 1)
-	n, ackErr := req.detachAck.Read(ack)
-	_ = req.detachAck.Close()
-	if readyErr != nil || ackErr != nil || n != 1 {
-		return r.terminalizeDetachedNoChild(ctx, record, false, "U_RUN_DETACH_CANCELLED", errors.New("detach launch was not acknowledged"))
+	ackClosed := false
+	defer func() {
+		if !ackClosed {
+			_ = req.detachAck.Close()
+		}
+	}()
+	awaitAcknowledgement := func() error {
+		readyErr := req.detachReady.send(detachReadyMessage{ID: id})
+		ack := make([]byte, 1)
+		n, ackErr := req.detachAck.Read(ack)
+		_ = req.detachAck.Close()
+		ackClosed = true
+		if readyErr != nil || ackErr != nil || n != 1 {
+			return errors.New("detach launch was not acknowledged")
+		}
+		return nil
+	}
+	// Existing uncapped detaches retain their byte-for-byte readiness sequence.
+	// A capped detach cannot announce success until its empty scope cap has been
+	// verified, otherwise E_RUN_CAP_UNAVAILABLE could not reach the launcher.
+	if req.ScopeMemoryMax <= 0 {
+		if err := awaitAcknowledgement(); err != nil {
+			return r.terminalizeDetachedNoChild(ctx, record, false, "U_RUN_DETACH_CANCELLED", err)
+		}
 	}
 
 	req.detachRunID = id
@@ -285,6 +303,44 @@ func (r *Runner) launchDetachedValidated(ctx context.Context, req Request, prefi
 		releaseAdmit()
 		_ = scope.Remove()
 		return r.failBeforeLaunch(ctx, record, "U_RUN_RECONCILE_REQUIRED", err)
+	}
+	if err := r.applyScopeMemoryCap(scope, req, &record); err != nil {
+		closeFiles()
+		unlock()
+		releaseAdmit()
+		_ = scope.Remove()
+		return r.failBeforeLaunch(ctx, record, "E_RUN_CAP_UNAVAILABLE", err)
+	}
+	if req.ScopeMemoryMax > 0 {
+		if _, err := r.append(ledgerEvent{Kind: "cap-enforced", Run: record}); err != nil {
+			closeFiles()
+			unlock()
+			releaseAdmit()
+			_ = scope.Remove()
+			return r.failBeforeLaunch(ctx, record, "U_RUN_RECONCILE_REQUIRED", err)
+		}
+		if err := awaitAcknowledgement(); err != nil {
+			closeFiles()
+			unlock()
+			releaseAdmit()
+			_ = scope.Remove()
+			return r.terminalizeDetachedNoChild(ctx, record, false, "U_RUN_DETACH_CANCELLED", err)
+		}
+		current, err = r.ledger.current(id)
+		if err != nil {
+			closeFiles()
+			unlock()
+			releaseAdmit()
+			_ = scope.Remove()
+			return nil, launchErr("U_RUN_RECONCILE_REQUIRED", err)
+		}
+		if current.KillIntent.Present {
+			closeFiles()
+			unlock()
+			releaseAdmit()
+			_ = scope.Remove()
+			return r.terminalizeDetachedNoChild(ctx, record, true, "E_RUN_KILLED", errors.New("kill intent preceded launch"))
+		}
 	}
 	cmd := exec.Command(effectiveArgv[0], effectiveArgv[1:]...)
 	cmd.Dir, cmd.Env = cwd, env

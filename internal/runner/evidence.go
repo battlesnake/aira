@@ -28,6 +28,12 @@ func mergeEvidence(base, candidate RunRecord) RunRecord {
 	if candidate.ResourceSignature != "" {
 		base.ResourceSignature = candidate.ResourceSignature
 	}
+	if candidate.ScopeMemoryMax != nil {
+		base.ScopeMemoryMax = candidate.ScopeMemoryMax
+	}
+	if candidate.ScopeMemoryHigh != nil {
+		base.ScopeMemoryHigh = candidate.ScopeMemoryHigh
+	}
 	if candidate.PIDIdentity.PID != 0 {
 		base.PIDIdentity = candidate.PIDIdentity
 	}

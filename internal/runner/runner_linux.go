@@ -61,6 +61,7 @@ type Runner struct {
 	supervisorLeaseReleaseFn func(context.Context, string, int64, string) (string, error)
 	supervisorLeaseAfter     func(time.Duration) <-chan time.Time
 	failBeforeLaunchFn       func(context.Context, RunRecord, string, error) (*RunRecord, error)
+	writeScopeMemoryCapFn    func(Scope, int64, int64, bool) error
 	// beforeRunningAppendFn is a test seam that fires inside the launch flock,
 	// after a successful Start and before the "running" append, to prove the
 	// per-run lock is held through the running append (not released after Start).
@@ -235,6 +236,9 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	}()
 	if len(req.Argv) == 0 || req.Argv[0] == "" {
 		return nil, launchErr("E_RUN_ARGUMENT_INVALID", errors.New("target argv is empty"))
+	}
+	if err := validateScopeMemoryCap(req.ScopeMemoryMax, req.ScopeMemoryHigh); err != nil {
+		return nil, launchErr("E_RUN_ARGUMENT_INVALID", err)
 	}
 	if req.PTY && req.Realtime {
 		return nil, launchErr("E_RUN_ARGUMENT_INVALID", errors.New("pty and realtime buffering are mutually exclusive"))
@@ -414,6 +418,10 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 			releaseAdmit()
 			_ = scope.Remove()
 			return nil, launchErr("E_RUN_RECONCILE_REQUIRED", err)
+		}
+		if err := r.applyScopeMemoryCap(scope, req, &record); err != nil {
+			releaseAdmit()
+			return r.failLaunchPrep(ctx, record, "E_RUN_CAP_UNAVAILABLE", err)
 		}
 
 		// CommandContext's default cancellation calls Process.Kill. That would be
@@ -843,6 +851,26 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		return &committed, launchErr("U_RUN_RECONCILE_REQUIRED", ptyCleanupErr)
 	}
 	return &committed, nil
+}
+
+func (r *Runner) applyScopeMemoryCap(scope Scope, req Request, record *RunRecord) error {
+	if req.ScopeMemoryMax <= 0 {
+		return nil
+	}
+	write := writeScopeMemoryCap
+	if r.writeScopeMemoryCapFn != nil {
+		write = r.writeScopeMemoryCapFn
+	}
+	if err := write(scope, req.ScopeMemoryMax, req.ScopeMemoryHigh, true); err != nil {
+		return err
+	}
+	maximum := floorMemoryPage(req.ScopeMemoryMax)
+	record.ScopeMemoryMax = &maximum
+	if req.ScopeMemoryHigh > 0 {
+		high := floorMemoryPage(req.ScopeMemoryHigh)
+		record.ScopeMemoryHigh = &high
+	}
+	return nil
 }
 
 func hasScopeReconcileError(codes []string) bool {

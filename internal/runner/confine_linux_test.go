@@ -99,6 +99,77 @@ func TestFormatConfineStatusReportsIndependentFacets(t *testing.T) {
 	}
 }
 
+// verifies: task-57 status distinguishes an unrequested scope cap from a verified
+// cap and labels memory.high only as reclaim pressure.
+func TestFormatConfineStatusReportsScopeMemoryFacet(t *testing.T) {
+	plain := FormatConfineStatus(ConfineStatus{Slice: "finite.slice"})
+	if !strings.Contains(plain, "scope-memory.max=not-requested") || strings.Contains(plain, "binding=") {
+		t.Fatalf("plain status=%q", plain)
+	}
+	capped := FormatConfineStatus(ConfineStatus{
+		Slice: "finite.slice", ScopeMemoryMax: 32 << 20, ScopeMemoryHigh: 16 << 20,
+		ScopeMemoryBinding: "scope-limited", ScopeMemoryEffective: 32 << 20,
+	})
+	for _, want := range []string{
+		"scope-memory.max=enforced=33554432", "binding=scope-limited", "effective=33554432",
+		"memory.high=reclaim-pressure=16777216",
+	} {
+		if !strings.Contains(capped, want) {
+			t.Fatalf("capped status %q lacks %q", capped, want)
+		}
+	}
+	if strings.Contains(capped, "memory.high=cap") {
+		t.Fatalf("memory.high falsely labelled a cap: %q", capped)
+	}
+}
+
+// verifies: task-57 a requested confine cap that cannot be written never starts.
+func TestConfineScopeMemoryCapFailureDoesNotLaunch(t *testing.T) {
+	scope := &confineFakeScope{}
+	started := false
+	deps := confineUnitDeps(scope)
+	deps.writeScopeMemoryCap = func(Scope, int64, int64, bool) error {
+		return errors.New("memory.max unavailable")
+	}
+	deps.start = func(*confineCommand) error {
+		started = true
+		return nil
+	}
+	_, err := confineWithDeps(context.Background(), ConfineRequest{
+		Slice: "nodeleg.slice", Argv: []string{"must-not-run"}, ScopeMemoryMax: 32 << 20, Stderr: io.Discard,
+	}, deps)
+	if err == nil || !strings.Contains(err.Error(), "E_CONFINE_UNAVAILABLE") || !strings.Contains(err.Error(), "memory.max") {
+		t.Fatalf("error=%v", err)
+	}
+	if started {
+		t.Fatal("target launch reached after scope cap failure")
+	}
+	if !scope.removed {
+		t.Fatal("empty failed scope was not removed")
+	}
+}
+
+// verifies: task-57 a no-cap confine keeps the existing oom.group behavior but
+// does not invoke the new scope-cap writer.
+func TestConfineWithoutScopeMemoryCapDoesNotWriteCap(t *testing.T) {
+	scope := &confineFakeScope{}
+	deps := confineUnitDeps(scope)
+	called := false
+	deps.writeScopeMemoryCap = func(Scope, int64, int64, bool) error {
+		called = true
+		return errors.New("must not be called")
+	}
+	result, err := confineWithDeps(context.Background(), ConfineRequest{
+		Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard,
+	}, deps)
+	if err != nil || result.Exit != 0 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if called {
+		t.Fatal("no-cap confine called the scope memory writer")
+	}
+}
+
 func TestConfineProbeFailureDoesNotLaunch(t *testing.T) {
 	started := false
 	deps := confineDeps{
