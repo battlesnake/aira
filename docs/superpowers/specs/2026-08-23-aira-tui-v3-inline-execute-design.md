@@ -1,7 +1,14 @@
 # AIRA TUI v3 — inline per-panel edits + carved/execute verbs
 
-Status: PLAN v1 (from the ultracode understand+design workflow `wf_5edc730f-8a3`:
-5 code-grounded readers → 3 design approaches → judged synthesis). Milestone #56.
+Status: PLAN v2 — folds Sol + Gemini plan-review + the Fable code-grounded gate
+(which was GATE-FAIL on the §3 `signal.Reset` mechanism — all three reviewers
+converged that it would kill the TUI on Ctrl-C; now corrected to an owned
+`signal.Notify` channel that swallows during execute). Also folded: shell-word lexer
+(not whitespace-split), two-dimensional execute honesty, explicit execute capability,
+inline `PaletteOpen` modal flag, severity enum from `create`/`domain.ValidSeverity`,
+`{run,git,time}` allowlist, lease token captured at action-start. Base design from
+the ultracode understand+design workflow `wf_5edc730f-8a3` (5 code-grounded readers →
+3 approaches → judged synthesis). Milestone #56.
 Successor to TUI v1 (#51, read-only dashboard, merged `c45cfd1`) and TUI v2 (#53,
 interactive palette mutations, merged `76bcf87`).
 
@@ -72,10 +79,28 @@ no-op):
 to the Leases and Ready tables** (`tui.go:113` region) so those panels have a
 `SelectedID` to act on.
 
-**Overlay.** The enum picker is a `tview.List` mounted on `r.outerPages` via
-`centeredPrimitive`/`AddPage`/`RemovePage`, restoring focus exactly like
-`openPaletteEntry`. A tiny transient `inlineAction` field is added to `tuiState`
-(cloned by `cloneTUIState`).
+**Overlay + modal flag (Fable).** The enum picker is a `tview.List` mounted on
+`r.outerPages` via `centeredPrimitive`/`AddPage`/`RemovePage`, restoring focus
+exactly like `openPaletteEntry`. **Opening any inline picker/confirm MUST set
+`PaletteOpen=true`** (or an equivalent modal flag handled identically in
+`captureInput`): `captureInput` swallows every rune AND Enter at the application
+layer when `PaletteOpen` is false, so without the flag the confirm form is unusable
+AND the v2 no-single-key-affirm + double-Enter-suppression protections would not
+engage. A tiny transient `inlineAction` field is added to `tuiState` (cloned by
+`cloneTUIState`).
+
+**Enum sourcing + fail-closed (Fable + Sol).** `s` status and `d` disposition read
+`ArgSpec.Enum` off the LIVE `r.descriptors` (`mv` carries the status enum; `find`
+carries the disposition enum — both deep-copied into descriptors). BUT `set`'s
+ArgSpecs carry NO enum, so `v` **severity** sources its `P0/P1/P2` from the `create`
+descriptor's severity ArgSpec (or `domain.ValidSeverity`), not from `set`. If an
+expected enum is absent/ambiguous, the picker **fails closed** (an explicit error, no
+free-text fallback) — never silently offer an unvalidated box where an enum was due.
+
+**Lease token captured at action start (Sol P2).** `c`/`k`/`b` capture the lease's
+id **and its token/version at action start**, not by row index or late
+auto-resolution, so a heartbeat/release acts on the exact lease the operator saw —
+not a racy re-read.
 
 **ID-anchoring (Sol-v2 regression carried forward):** the canonical id is captured
 at action START and dispatched verbatim even if a watch-driven row reorder/replace
@@ -86,8 +111,9 @@ changes the row index mid-action — no trim/copy drift.
 **New file `cmd/aira/tui_execute.go`** — a launcher opened with `x`, **physically
 disjoint** from the palette: it never calls `DispatchPalette`, never passes through
 `paletteOperationAdmitted`, and never weakens the RouteClient refusal at
-`dispatcher.go:115` (a Sol-v2 P0). `buildExecuteList` filters `r.descriptors` to the
-foreground RouteClient `SafetyExecute` verbs `run`, `git`, `time`, plus a
+`dispatcher.go:115` (a Sol-v2 P0). `buildExecuteList` uses an **explicit `{run, git, time}` allowlist** (Fable: NOT a
+`SafetyExecute`+`RouteClient` predicate — `run-input`/`run-kill` are also
+SafetyExecute+RouteClient and a predicate would leak them into the launcher), plus a
 **print-only** `confine` entry.
 
 **Wiring the real terminal (the load-bearing fix).** Today `runTUI` only receives
@@ -96,33 +122,69 @@ stderr and the dashboard dispatcher writes to `io.Discard`. Change
 io.Writer`; at `main.go:191` pass the real `os.Stdin`/`os.Stdout` and build a SECOND
 terminal-bound `executeDispatcher = newDaemonDispatcher(stdin, stdout, stderr,
 false)` alongside the `io.Discard` dashboard dispatcher; store it on the runtime.
-When the dispatcher is an injected/in-process test double, `executeDispatcher` is
-`nil` → the launcher degrades every verb to **print-only**, keeping tests hermetic.
+**Explicit execute capability (Sol P1 — no silent degradation):** the runtime holds
+an explicit `canExecute` flag, not a "nil-means-print-only" overload. When execute
+is unavailable (no real terminal dispatcher), the launcher **clearly disables**
+execution (greys the verbs, shows "execute unavailable") rather than silently
+presenting executable verbs as print-only. Tests inject a **fake execute
+dispatcher** that records the dispatch (exercising the seam), never a nil that skips
+it.
 
-**Arg form.** One field = the argv after the verb's `--`. On submit, whitespace-split
-(v1; quoted-arg parsing deferred) and run through the EXISTING
-`parseGitArgs/parseTimeArgs/parseRunArgs` + `buildRequest` — **never hand-build a
-`core.Request`** — so `--` semantics and `StoreFreeCarved`'s telemetry-VALUE split
-are byte-identical to the CLI and cannot silently drift the store-touching behaviour.
+**Arg form.** One field = the argv after the verb's `--`. On submit it is parsed by a
+small **POSIX-ish shell-word lexer** (single/double quotes + backslash escape) — NOT
+a whitespace split (Sol/Gemini/Fable: whitespace-split corrupts spaces/quotes/empty
+args and is not byte-faithful to CLI argv). A lexer error (e.g. an unterminated
+quote) is surfaced as an explicit form error, never a silent mis-parse. The lexed
+argv then runs through the EXISTING `parseGitArgs/parseTimeArgs/parseRunArgs` +
+`buildRequest` — **never hand-build a `core.Request`** — so `--` semantics and
+`StoreFreeCarved`'s telemetry-VALUE split are byte-identical to the CLI and cannot
+silently drift the store-touching behaviour. (`git` is bounded to
+clone/fetch/push/ls-remote and forbids `-`-prefixed args, so it needs no quoting; the
+lexer simply makes `run`/`time` correct too.)
+
+**Signal handling — corrected mechanism (Sol P0 + Fable FAIL + Gemini #1).** The
+spec's original `signal.Reset` was WRONG: parent and child share the foreground
+process group, so restoring default disposition means terminal Ctrl-C **kills the
+TUI** for the child's whole lifetime, and `signal.NotifyContext`'s channel is hidden
+so it cannot be "re-armed". The child already receives Ctrl-C **via process-group
+delivery** (exactly as the CLI carved verbs do — the CLI installs no per-verb SIGINT
+handler; `git`/`time`/non-pty `run` are plain `exec.Command` in the shared pgroup).
+So: **replace `runTUI`'s `signal.NotifyContext` with an explicit `signal.Notify`
+channel owned by the runtime.** Its goroutine calls `r.cancel()` **only when
+`ExecuteRunning` is false**, and **swallows** the signal while an execute is running
+(Go delivers each signal to every registered channel; keeping one registered
+suppresses default disposition, so the **TUI survives** while the child dies from the
+same Ctrl-C). Dispatch the child with `r.ctx` (never a signal-derived ctx). Caveat
+(documented): a `--pty` run does `Setsid` (its own session), so terminal Ctrl-C
+cannot reach it — `aira run-kill` is its interrupt path.
 
 **Execution** (on the UI goroutine ONLY, never the executor worker pool), guarded by
-an `ExecuteRunning` atomic (exactly-once, mirrors `PaletteDispatching`):
-1. `signal.Reset(SIGINT, SIGTERM)` — detach the TUI's `signal.NotifyContext` so
-   Ctrl-C reaches the child.
-2. `r.app.Suspend(func(){ … })` with a **deferred `recover()` + screen-restore**
-   guard so a panic or a screen-scribbling child cannot wedge raw mode / alt-screen.
-   Inside: `executeDispatcher.Dispatch(ctx, scope, req)` routes RouteClient →
-   `dispatchClient → dispatchCarved` with `FaceOutput{Live:true}` bound to the real
-   `os.Stdout/os.Stderr` (`time` inherits stdio directly; `git`/`run` live-tee).
-   Print the child's REAL exit + run error code; wait for Enter.
-3. Re-arm the TUI `NotifyContext`; `app.Sync()`; **force-refresh ALL dataViews** (a
-   telemetry-bearing run may relay writes with no watch event).
+an `ExecuteRunning` atomic (exactly-once local guard, mirrors `PaletteDispatching`):
+1. `r.app.Suspend(func(){ … })`. `Suspend` itself owns `screen.Fini()`/`Init()`
+   (tcell) — **do NOT add a second screen re-init** (Sol P0: double-init hazard).
+   Handle `Suspend` **returning false** (screen not suspendable) → abort the execute
+   honestly, no run. Inside the callback: a **`defer recover()`** catches a PANIC in
+   the callback path only (it logs + lets `Suspend`'s own resume restore the screen;
+   no `defer` can repair SIGKILL / process-wide SIGINT / `os.Exit`). Run
+   `executeDispatcher.Dispatch(r.ctx, scope, req)` → RouteClient → `dispatchClient →
+   dispatchCarved` with `FaceOutput{Live:true}` bound to the real `os.Stdout/Stderr`
+   (`time` inherits stdio directly; `git`/`run` live-tee); print the honest result
+   (below); wait for Enter.
+2. On resume: `app.Sync()` (redraw from scratch) then **force-refresh ALL dataViews**
+   (a telemetry-bearing run may relay writes with no watch event). `ExecuteRunning`
+   cleared last, so the signal goroutine re-enables `r.cancel()`.
 
-**Honest reporting (NOT the 3-way store classifier — it assumes a store mutation):**
-verb-appropriate — `time` = byte-transparent ProcessExit; `run` =
-`E_RUN_*`/`E_RUN_KILLED`/`E_RUN_OOM_KILLED`/`U_RUN_EXIT_UNKNOWN`; `git` = gitops exit;
-if even the `ensure-scope` exchange failed → **outcome-unknown**, never a fabricated
-success.
+**Honest reporting — TWO dimensions (Sol P1), NOT the 3-way store classifier (which
+assumes a store mutation):** report the **execution result** and the **persistence
+result** separately, because a telemetry-bearing `run` can have a *known* child exit
+while the daemon's telemetry-relay acknowledgement is *unknown*.
+- **Execution:** verb-appropriate — `time` = byte-transparent ProcessExit; `run` =
+  `E_RUN_*`/`E_RUN_KILLED`/`E_RUN_OOM_KILLED`/`U_RUN_EXIT_UNKNOWN`; `git` = gitops exit.
+- **Persistence** (telemetry-bearing run only): the write-relay ack — known-persisted
+  vs relay-unknown.
+- An **`ensure-scope` failure before launch → "not launched"** (Fable+Sol): the child
+  provably never ran (`dispatchClient` returns before `dispatchCarved`), so report the
+  transport code as *did-not-run* — never fabricate uncertainty in EITHER direction.
 
 **Single-writer preserved.** Store-free carved verbs (`git`, telemetry-less `run`)
 send only `ensure-scope` and run local against `StoreGuard()`; a telemetry-bearing
@@ -158,6 +220,10 @@ non-blocking `run` is deferred — §5).
 - **CHANGED** `cmd/aira/tui_executor.go` — msg type + apply hook to surface the
   execute result and drive the post-resume forced refresh (execution stays on the UI
   goroutine, not the worker pool).
+- **CHANGED** `cmd/aira/tui_viewmodel.go` (Fable) — `ticketListViewModel`/`tableRow`
+  extended to project the `hold` bool from the wire row (it is on `projectRecord`
+  today but discarded), so the `h` toggle can read the current value; lease rows
+  already carry token/version for the Sol-P2 capture.
 - **CHANGED** `cmd/aira/main.go` — thread real stdin/stdout into `runTUI` at `:191`
   and construct the terminal-bound `executeDispatcher`.
 - **NEW** `cmd/aira/tui_inline_test.go`, `cmd/aira/tui_execute_test.go`.
@@ -170,23 +236,39 @@ non-blocking `run` is deferred — §5).
 **ID-anchoring regression** — start an action, inject a watch-driven row reorder that
 changes the index, confirm, assert the dispatched selector is the canonical id
 captured at start (reuse the Sol `" RANT-7 "`-style test); (3) illegal status jump →
-REJECTED `E_TRANSITION_INVALID`, NO refresh; (4) committed-then-lost → outcome-unknown
-WITH forced source-of-truth refresh (reuse the classify/onPaletteResult tests);
-(5) enum options come from the descriptor projection (assert they equal the
-`mv`/`find set` ArgSpec.Enum, not a hardcoded list); (6) `waived` requires the
-reason+actor mini-form; (7) exactly-once — a double action-key/confirm is swallowed
-by `PaletteDispatching`.
+REJECTED `E_TRANSITION_INVALID`, NO refresh; (3b) a **deleted-id mid-action** →
+deterministic REJECTED (`E_*_NOT_FOUND` with send-evidence), never outcome-unknown or
+panic; (4) committed-then-lost → outcome-unknown WITH forced source-of-truth refresh
+(reuse the classify/onPaletteResult tests); (5) enum options come from the descriptor
+projection — assert `s`/`d` equal the `mv`/`find set` ArgSpec.Enum AND `v` **severity**
+equals the `create`/`domain.ValidSeverity` source (not `set`, which has no enum), and
+that an absent enum **fails closed**; (6) `waived` requires the reason+actor mini-form;
+(7) exactly-once — a double action-key/confirm is swallowed by `PaletteDispatching`;
+(8) opening a picker sets `PaletteOpen` (so `captureInput` + the v2 single-key/
+double-Enter guards engage); (9) `h` toggle reads the current `hold` from the row
+model.
 
-**Execute:** (a) the launcher lists only foreground RouteClient `SafetyExecute`
-(`run`/`git`/`time`) + a print-only `confine`; (b) argv is built via the REAL
-`parse*Args`/`buildRequest` — feed empty-vs-nonempty telemetry values and assert
-`StoreFreeCarved` is preserved/flipped exactly as the CLI, and the `--` delimiter is
+**Execute:** (a) the launcher lists the `{run,git,time}` allowlist + a print-only
+`confine`, and **explicitly EXCLUDES `run-kill`/`run-input`** (also SafetyExecute+
+RouteClient); (b) the **shell-word lexer** — quotes/escapes lex correctly, an
+unterminated quote is an explicit form error; the lexed argv → REAL
+`parse*Args`/`buildRequest`; feed empty-vs-nonempty telemetry values and assert
+`StoreFreeCarved` preserved/flipped exactly as the CLI; the `--` delimiter is
 required; (c) `ExecuteRunning` makes launch exactly-once (double-submit swallowed);
-(d) exit-code mapping table-tested (time ProcessExit byte-transparent; run `E_RUN_*`
-family; ensure-scope failure → outcome-unknown, never fake success); (e) `confine`
-renders argv-SAFE (shell-quoted + `--`) and dispatches NOTHING; (f) a fake
-`executeDispatcher` records that execute calls `Dispatch` (RouteClient) and NEVER
-`DispatchPalette`, and that inline NEVER calls `Dispatch`.
+(d) honesty table-tested — `time` ProcessExit byte-transparent; `run` `E_RUN_*`
+family; a telemetry run reports **execution + persistence as two facets**; an
+`ensure-scope` failure → **"not launched"** (never fabricated uncertainty either way);
+(e) `confine` renders argv-SAFE (shell-quoted + `--`) and dispatches NOTHING; (f) a
+fake execute dispatcher records `Dispatch` (RouteClient) and NEVER `DispatchPalette`;
+inline NEVER calls `Dispatch`; when the capability is absent the launcher **disables**
+execute (not silent print-only); (g) **signal** — the owned `signal.Notify` channel
+swallows an injected SIGINT while `ExecuteRunning` (TUI's `cancel` NOT called) and
+cancels when idle (unit-testable by feeding the channel).
+
+**Real-terminal (gated/manual, documented — hard to automate a tty in CI):** Ctrl-C
+during an execute leaves the TUI alive and the child interrupted; a panicking child
+restores the screen (no wedged raw-mode/alt-screen); resize + repeated launches;
+child stdin ownership. Provide a scripted repro; Opus verifies on a real terminal.
 
 Extend `tui_smoke_test`; `go test -race` across the UI-goroutine/worker boundary.
 Heavy builds/tests under `whale-run`. Two-loop: both-directions build review +
@@ -206,6 +288,6 @@ Opus real-terminal verify.
 - per-entity narrowing of `invalidatedViews` (stays coarse = all dataViews, to not
   miss cross-entity ready/relation effects).
 - cell-level `SetSelectable(true,true)` editing; domain-computed legal-successor
-  pre-filter; quoted/escaped argv parsing in the execute field (whitespace split v1);
-  commit-on-Enter without confirm (v2 Continue/Cancel confirm kept for exactly-once
-  surface consistency).
+  pre-filter; commit-on-Enter without confirm (v2 Continue/Cancel confirm kept for
+  exactly-once surface consistency). (The execute arg field ships a real shell-word
+  lexer — §3 — not the earlier whitespace-split, so quoted argv is NOT deferred.)
