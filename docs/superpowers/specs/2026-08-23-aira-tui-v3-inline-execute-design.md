@@ -2,8 +2,9 @@
 
 Status: PLAN v2 — folds Sol + Gemini plan-review + the Fable code-grounded gate
 (which was GATE-FAIL on the §3 `signal.Reset` mechanism — all three reviewers
-converged that it would kill the TUI on Ctrl-C; now corrected to an owned
-`signal.Notify` channel that swallows during execute). Also folded: shell-word lexer
+converged that it would kill the TUI on Ctrl-C; corrected to an owned buffered
+`signal.Notify` channel that swallows during execute, with `defer`-cleared
+`ExecuteRunning` + `defer signal.Stop` — **re-gated by Fable: GATE-PASS**). Also folded: shell-word lexer
 (not whitespace-split), two-dimensional execute honesty, explicit execute capability,
 inline `PaletteOpen` modal flag, severity enum from `create`/`domain.ValidSeverity`,
 `{run,git,time}` allowlist, lease token captured at action-start. Base design from
@@ -150,29 +151,43 @@ so it cannot be "re-armed". The child already receives Ctrl-C **via process-grou
 delivery** (exactly as the CLI carved verbs do — the CLI installs no per-verb SIGINT
 handler; `git`/`time`/non-pty `run` are plain `exec.Command` in the shared pgroup).
 So: **replace `runTUI`'s `signal.NotifyContext` with an explicit `signal.Notify`
-channel owned by the runtime.** Its goroutine calls `r.cancel()` **only when
-`ExecuteRunning` is false**, and **swallows** the signal while an execute is running
-(Go delivers each signal to every registered channel; keeping one registered
-suppresses default disposition, so the **TUI survives** while the child dies from the
-same Ctrl-C). Dispatch the child with `r.ctx` (never a signal-derived ctx). Caveat
+channel owned by the runtime** (buffered, **cap ≥ 1** — `signal.Notify` silently
+drops to a full channel; harmless while swallowing but the buffer is required —
+Fable). Its goroutine calls `r.cancel()` **only when `ExecuteRunning` is false**, and
+**swallows** the signal while an execute is running (Go delivers each signal to every
+registered channel and, while any channel is registered, suppresses default
+disposition — so the **TUI survives** while the child dies from the same Ctrl-C via
+foreground-pgroup kernel delivery; the swallow-channel coexists with `time`'s own
+transient forwarder without stealing its delivery). **`defer signal.Stop(ch)` in
+`runTUI`** (mirrors today's `NotifyContext` `defer stop()`) so default disposition is
+restored once `app.Run` returns and the process is interruptible during post-TUI
+teardown. Dispatch the child with `r.ctx` (never a signal-derived ctx). Caveats
 (documented): a `--pty` run does `Setsid` (its own session), so terminal Ctrl-C
-cannot reach it — `aira run-kill` is its interrupt path.
+cannot reach it — `aira run-kill` is its interrupt path; and swallowing **SIGTERM**
+during an execute means a process-directed `kill <tui-pid>` is ignored until the
+child exits (operator escape: Ctrl-C the child, then quit) — acceptable for v3.
 
 **Execution** (on the UI goroutine ONLY, never the executor worker pool), guarded by
 an `ExecuteRunning` atomic (exactly-once local guard, mirrors `PaletteDispatching`):
+set it true, then **`defer` the clear (Fable must-fix) so EVERY exit path — normal,
+`Suspend`-returns-false abort, or a callback panic — clears it.** A stuck-true flag
+would leave the signal goroutine never re-enabling `r.cancel()` → a permanently
+un-interruptible TUI (the exact wedge this redesign prevents). Then:
 1. `r.app.Suspend(func(){ … })`. `Suspend` itself owns `screen.Fini()`/`Init()`
    (tcell) — **do NOT add a second screen re-init** (Sol P0: double-init hazard).
-   Handle `Suspend` **returning false** (screen not suspendable) → abort the execute
-   honestly, no run. Inside the callback: a **`defer recover()`** catches a PANIC in
-   the callback path only (it logs + lets `Suspend`'s own resume restore the screen;
-   no `defer` can repair SIGKILL / process-wide SIGINT / `os.Exit`). Run
-   `executeDispatcher.Dispatch(r.ctx, scope, req)` → RouteClient → `dispatchClient →
-   dispatchCarved` with `FaceOutput{Live:true}` bound to the real `os.Stdout/Stderr`
+   `Suspend` **returning false** (screen not suspendable) → abort honestly, no run
+   (the deferred clear still fires). Inside the callback: a **`defer recover()`**
+   catches a PANIC in the callback path only (it logs + lets `Suspend`'s own resume
+   restore the screen; no `defer` repairs SIGKILL / process-wide SIGINT / `os.Exit`).
+   Run `executeDispatcher.Dispatch(r.ctx, scope, req)` → RouteClient → `dispatchClient
+   → dispatchCarved` with `FaceOutput{Live:true}` bound to the real `os.Stdout/Stderr`
    (`time` inherits stdio directly; `git`/`run` live-tee); print the honest result
    (below); wait for Enter.
-2. On resume: `app.Sync()` (redraw from scratch) then **force-refresh ALL dataViews**
-   (a telemetry-bearing run may relay writes with no watch event). `ExecuteRunning`
-   cleared last, so the signal goroutine re-enables `r.cancel()`.
+2. On resume (in the function body, BEFORE the deferred clear runs): `app.Sync()`
+   (redraw from scratch) then **force-refresh ALL dataViews** (a telemetry-bearing run
+   may relay writes with no watch event). The deferred `ExecuteRunning` clear then
+   fires last, re-enabling `r.cancel()` — so a Ctrl-C in the child-exit→resume window
+   is still swallowed rather than killing the TUI.
 
 **Honest reporting — TWO dimensions (Sol P1), NOT the 3-way store classifier (which
 assumes a store mutation):** report the **execution result** and the **persistence
