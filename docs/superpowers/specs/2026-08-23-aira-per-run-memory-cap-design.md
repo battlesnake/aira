@@ -153,7 +153,7 @@ not hold; `oom.group` kills all killable members.)
   detached scope == requested; a cap-write failure there → `E_RUN_CAP_UNAVAILABLE`
   surfaced to the launcher, no detached job started. A lone `--memory-high` (no
   `--memory-max`) → `E_*_ARGUMENT_INVALID`. Page-truncation read-back: a `1025K`
-  request verifies against its 4KiB-floored value (proven not to false-fail).
+  request verifies against its PAGE_SIZE-floored value (proven not to false-fail).
 - **Honest facet/record:** requested vs enforced vs unevaluated, proven discriminating.
 
 ## 6. Deferrals (recorded)

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"strconv"
 )
 
@@ -68,4 +69,11 @@ func ValidateScopeMemoryCap(maximum, high int64) error {
 	return validateScopeMemoryCap(maximum, high)
 }
 
-func floorMemoryPage(value int64) int64 { return value &^ int64(4095) }
+// floorMemoryPage rounds down to the kernel's real PAGE_SIZE. cgroup-v2 stores
+// memory.max/high as (bytes / PAGE_SIZE) * PAGE_SIZE, so the read-back verify must
+// compare against the same floor — hardcoding 4096 would false-fail legitimate caps
+// on 16K/64K-page kernels (arm64). os.Getpagesize() returns a power of two.
+func floorMemoryPage(value int64) int64 {
+	page := int64(os.Getpagesize())
+	return value &^ (page - 1)
+}

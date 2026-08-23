@@ -3,9 +3,26 @@ package runner
 import (
 	"encoding/json"
 	"math"
+	"os"
 	"strings"
 	"testing"
 )
+
+// verifies: the read-back page floor uses the kernel's real PAGE_SIZE, not a
+// hardcoded 4096. Non-discriminating on 4KiB hosts (WSL x86) by nature — a
+// portability guard that catches the false-fail on 16K/64K-page kernels (arm64).
+func TestFloorMemoryPageUsesKernelPageSize(t *testing.T) {
+	page := int64(os.Getpagesize())
+	if got := floorMemoryPage(page + 1); got != page {
+		t.Fatalf("floorMemoryPage(%d)=%d, want %d (kernel PAGE_SIZE floor)", page+1, got, page)
+	}
+	if page > 4096 {
+		v := page + 4096 // 4KiB-aligned but below the next real page boundary
+		if got := floorMemoryPage(v); got != page {
+			t.Fatalf("floorMemoryPage(%d)=%d, want %d; a hardcoded-4KiB mask false-fails read-back on this arch", v, got, page)
+		}
+	}
+}
 
 // covers: task-57 portable [KMG] parsing, including lowercase suffixes and zero.
 func TestParseMemorySize(t *testing.T) {
