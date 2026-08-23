@@ -749,12 +749,20 @@ func effectiveWatchdogCapEvaluated(mount, path string) (int64, bool, bool) {
 	for {
 		data, err := os.ReadFile(filepath.Join(current, "memory.max"))
 		if err != nil {
-			return 0, false, false
-		}
-		value := strings.TrimSpace(string(data))
-		if value != "max" {
-			parsed, err := strconv.ParseInt(value, 10, 64)
-			if err != nil || parsed <= 0 {
+			if !os.IsNotExist(err) {
+				// A genuine read error (permission/IO) — cannot establish the
+				// cap. For a KILLER, fail conservative: unevaluated, so the
+				// process is never classified uncapped and never killed.
+				return 0, false, false
+			}
+			// memory.max ABSENT at this level: the cgroup2 mount root NEVER has
+			// a memory.max (kernel invariant), and a controllerless cgroup
+			// likewise — "no cap here", so CONTINUE the ancestry walk. Aborting
+			// on this ENOENT made the classifier inert on every real host
+			// (build-review P1); confine's readConfineCap tolerates it too.
+		} else if value := strings.TrimSpace(string(data)); value != "max" {
+			parsed, perr := strconv.ParseInt(value, 10, 64)
+			if perr != nil || parsed <= 0 {
 				return 0, false, false
 			}
 			if !found || parsed < best {

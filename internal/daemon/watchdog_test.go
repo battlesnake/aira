@@ -423,8 +423,13 @@ func TestFiniteMemoryMaxAncestorAndAIRAComponent(t *testing.T) {
 	if err := os.Remove(filepath.Join(leaf, "memory.max")); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, evaluated := effectiveWatchdogCapEvaluated(root, leaf); evaluated {
-		t.Fatal("missing memory.max was classified uncapped instead of unevaluated")
+	// A leaf WITHOUT memory.max (the memory controller isn't limiting there) is
+	// "no cap at the leaf" — the walk must CONTINUE and still find the finite
+	// ancestor cap (user.slice=4096), NOT abort to unevaluated. Aborting on an
+	// absent memory.max made the watchdog inert on every real host, where the
+	// cgroup2 mount root itself has no memory.max (build-review P1).
+	if cap, finite, evaluated := effectiveWatchdogCapEvaluated(root, leaf); !evaluated || !finite || cap != 4096 {
+		t.Fatalf("leaf without memory.max: cap=%d finite=%v evaluated=%v; want cap=4096 finite=true evaluated=true (bounded by the ancestor slice)", cap, finite, evaluated)
 	}
 	if !hasAIRAComponent("/user.slice/.aira-job.scope") || hasAIRAComponent("/user.slice/not.aira-job.scope") {
 		t.Fatal("aira component classification wrong")
