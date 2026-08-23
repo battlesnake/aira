@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/signal"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"syscall"
 
 	"aira/internal/core"
@@ -21,6 +24,9 @@ const (
 	palettePage        = "palette"
 	paletteConfirmPage = "palette-confirm"
 	paletteResultPage  = "palette-result"
+	inlinePage         = "inline"
+	executePage        = "execute"
+	executeConfirmPage = "execute-confirm"
 )
 
 type tuiRuntime struct {
@@ -40,9 +46,23 @@ type tuiRuntime struct {
 	paletteCancelButton  *tview.Button
 	paletteConfirmAction func()
 	paletteCancelAction  func()
+	executeSubmitButton  *tview.Button
+	executeSubmit        func()
+	executeConfirmButton *tview.Button
+	executeCancelButton  *tview.Button
+	executeConfirmAction func()
+	executeCancelAction  func()
 	state                tuiState
 	descriptors          []core.DispatchDescriptor
 	executor             *tuiExecutor
+	executeDispatcher    Dispatcher
+	canExecute           bool
+	executeRunning       atomic.Bool
+	suspend              func(func()) bool
+	scope                daemon.WorktreeScope
+	stdin                io.Reader
+	stdout               io.Writer
+	stderr               io.Writer
 	ctx                  context.Context
 	cancel               context.CancelFunc
 	pumpDone             chan struct{}
@@ -52,14 +72,21 @@ type tuiRuntime struct {
 	queueUpdateStarted chan<- struct{}
 }
 
-func runTUI(ctx context.Context, dispatcher Dispatcher, scope daemon.WorktreeScope, stderr io.Writer) int {
-	signalCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	return runTUIWithScreen(signalCtx, dispatcher, scope, stderr, nil)
+func runTUI(ctx context.Context, dispatcher, executeDispatcher Dispatcher, scope daemon.WorktreeScope, stdin io.Reader, stdout, stderr io.Writer) int {
+	runtime := newTUIRuntime(ctx, dispatcher, executeDispatcher, scope, stdin, stdout, stderr, nil)
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	go runTUISignalLoop(runtime.ctx, signals, runtime.executeRunning.Load, runtime.cancel)
+	return runTUIRuntime(runtime, stderr)
 }
 
-func runTUIWithScreen(ctx context.Context, dispatcher Dispatcher, scope daemon.WorktreeScope, stderr io.Writer, screen tcell.Screen) int {
-	runtime := newTUIRuntime(ctx, dispatcher, scope, screen)
+func runTUIWithScreen(ctx context.Context, dispatcher, executeDispatcher Dispatcher, scope daemon.WorktreeScope, stdin io.Reader, stdout, stderr io.Writer, screen tcell.Screen) int {
+	runtime := newTUIRuntime(ctx, dispatcher, executeDispatcher, scope, stdin, stdout, stderr, screen)
+	return runTUIRuntime(runtime, stderr)
+}
+
+func runTUIRuntime(runtime *tuiRuntime, stderr io.Writer) int {
 	if err := runtime.run(); err != nil {
 		_, _ = fmt.Fprintf(stderr, "E_INTERNAL: tui: %v\n", err)
 		return store.ExitForCode("E_INTERNAL")
@@ -67,18 +94,22 @@ func runTUIWithScreen(ctx context.Context, dispatcher Dispatcher, scope daemon.W
 	return 0
 }
 
-func newTUIRuntime(parent context.Context, dispatcher Dispatcher, scope daemon.WorktreeScope, screen tcell.Screen) *tuiRuntime {
+func newTUIRuntime(parent context.Context, dispatcher, executeDispatcher Dispatcher, scope daemon.WorktreeScope, stdin io.Reader, stdout, stderr io.Writer, screen tcell.Screen) *tuiRuntime {
 	ctx, cancel := context.WithCancel(parent)
 	runtime := &tuiRuntime{
 		app: tview.NewApplication(), state: newTUIState(512), descriptors: core.New(nil).DispatchDescriptors(),
 		ctx: ctx, cancel: cancel, pumpDone: make(chan struct{}), coordDone: make(chan struct{}),
 		tables: make(map[tuiView]*tview.Table), details: make(map[tuiView]*tview.TextView), footers: make(map[tuiView]*tview.TextView),
+		executeDispatcher: executeDispatcher, canExecute: executeDispatcher != nil, scope: scope,
+		stdin: stdin, stdout: stdout, stderr: stderr,
 	}
+	runtime.state.CanExecute = runtime.canExecute
 	if screen != nil {
 		runtime.app.SetScreen(screen)
 	}
 	runtime.executor = newTUIExecutor(ctx, dispatcher, scope, 4)
 	runtime.buildWidgets()
+	runtime.suspend = runtime.app.Suspend
 	return runtime
 }
 
@@ -110,7 +141,7 @@ func (r *tuiRuntime) buildWidgets() {
 		table := tview.NewTable().SetSelectable(true, false).SetFixed(1, 0)
 		table.SetBorder(true).SetTitle(" " + strings.Title(string(view)) + " ") //nolint:staticcheck
 		r.tables[view] = table
-		if view == viewTickets || view == viewFindings {
+		if view == viewTickets || view == viewFindings || view == viewLeases || view == viewReady {
 			selectedView := view
 			table.SetSelectionChangedFunc(func(row, _ int) {
 				model := r.state.Panels[selectedView].Model
@@ -147,6 +178,31 @@ func (r *tuiRuntime) buildWidgets() {
 }
 
 func (r *tuiRuntime) captureInput(event *tcell.EventKey) *tcell.EventKey {
+	if r.state.ExecuteOpen {
+		if event.Key() == tcell.KeyEscape && r.executeCancelAction != nil && !r.state.ExecuteRunning {
+			r.executeCancelAction()
+			return nil
+		}
+		if r.state.ExecuteConfirm != nil {
+			if event.Key() == tcell.KeyRune && event.Rune() == 'y' {
+				return nil
+			}
+			if event.Key() == tcell.KeyEnter {
+				switch {
+				case r.executeCancelButton != nil && r.executeCancelButton.HasFocus():
+					r.executeCancelAction()
+				case r.executeConfirmButton != nil && r.executeConfirmButton.HasFocus():
+					r.executeConfirmAction()
+				}
+				return nil
+			}
+		}
+		if event.Key() == tcell.KeyEnter && r.executeSubmit != nil && r.executeSubmitButton != nil && r.executeSubmitButton.HasFocus() {
+			r.executeSubmit()
+			return nil
+		}
+		return event
+	}
 	if r.state.PaletteOpen {
 		if r.state.PaletteConfirm != nil {
 			if event.Key() == tcell.KeyEscape || event.Key() == tcell.KeyRune && event.Rune() == 'n' {
@@ -186,13 +242,26 @@ func (r *tuiRuntime) captureInput(event *tcell.EventKey) *tcell.EventKey {
 		return event
 	}
 	var commands []tuiCmd
-	r.state, commands = onTUIKey(r.state, key)
+	r.state, commands = onTUIKey(r.state, key, r.descriptors)
 	r.render()
 	// Input capture already runs on the tview loop. Submitting value commands
 	// and rendering inline avoids QueueUpdateDraw's synchronous self-deadlock.
 	r.submitCommands(commands)
 	if key == ':' {
 		r.showPaletteList()
+	} else if key == 'x' && r.state.ExecuteOpen {
+		r.showExecuteList()
+	} else if r.state.InlineError != "" {
+		r.showPaletteResult("ERROR " + r.state.InlineError)
+	} else if r.state.InlineAction != nil {
+		switch {
+		case r.state.PaletteConfirm != nil:
+			r.showPaletteConfirmation()
+		case r.state.InlineAction.Stage == inlineStagePicker:
+			r.showInlinePicker()
+		case r.state.InlineAction.Stage == inlineStageMiniForm:
+			r.showInlineMiniForm()
+		}
 	}
 	return nil
 }
@@ -273,6 +342,8 @@ func (r *tuiRuntime) applyAsync(message tuiMessage) {
 		}
 	case msgDetailResult:
 		r.state, commands = onTUIDetailResult(r.state, message.Detail)
+	case msgExecuteResume:
+		r.state, commands = onExecuteResume(r.state)
 	}
 	r.submitCommands(commands)
 }
@@ -294,7 +365,7 @@ func (r *tuiRuntime) render() {
 		}
 		tabNames = append(tabNames, name)
 	}
-	r.tabs.SetText(strings.Join(tabNames, "  ") + "    r refresh  : palette  q quit")
+	r.tabs.SetText(strings.Join(tabNames, "  ") + "    r refresh  : palette  x execute  q quit")
 	r.panelPages.SwitchToPage(string(r.state.Active))
 	for _, view := range allViews {
 		if view == viewInsights {
@@ -393,6 +464,8 @@ func (r *tuiRuntime) makePaletteList() *tview.List {
 }
 
 func (r *tuiRuntime) showPaletteList() {
+	r.state.InlineAction = nil
+	r.state.InlineError = ""
 	r.state.PaletteOpen = true
 	r.outerPages.HidePage(paletteConfirmPage).HidePage(paletteResultPage).ShowPage(palettePage).SwitchToPage(palettePage)
 	r.app.SetFocus(r.paletteList)
@@ -493,8 +566,12 @@ func (r *tuiRuntime) showPaletteConfirmation() {
 		r.showPaletteResult("dispatching…")
 	}
 	r.paletteCancelAction = func() {
-		r.state, _ = onPaletteCancel(r.state)
-		r.showPaletteList()
+		if r.state.InlineAction != nil {
+			r.closeInline()
+		} else {
+			r.state, _ = onPaletteCancel(r.state)
+			r.showPaletteList()
+		}
 	}
 	form.AddButton("Confirm", r.paletteConfirmAction)
 	form.AddButton("Cancel", r.paletteCancelAction)
@@ -589,12 +666,310 @@ func (r *tuiRuntime) closePalette() {
 	r.paletteCancelAction = nil
 	r.paletteConfirmButton = nil
 	r.paletteCancelButton = nil
-	r.outerPages.HidePage(palettePage).HidePage(paletteConfirmPage).HidePage(paletteResultPage).SwitchToPage(dashboardPage)
+	r.outerPages.HidePage(palettePage).HidePage(paletteConfirmPage).HidePage(paletteResultPage).HidePage(inlinePage).SwitchToPage(dashboardPage)
 	if table := r.tables[r.state.Active]; table != nil {
 		r.app.SetFocus(table)
 	} else {
 		r.app.SetFocus(r.insights)
 	}
+}
+
+func (r *tuiRuntime) showInlinePicker() {
+	pending := r.state.InlineAction
+	if pending == nil || pending.Stage != inlineStagePicker {
+		return
+	}
+	list := tview.NewList().ShowSecondaryText(false)
+	list.SetBorder(true).SetTitle(" " + pending.Action.Label + " — " + pending.TargetID + " ")
+	for _, option := range pending.Options {
+		value := option
+		list.AddItem(value, "", 0, func() {
+			var commands []tuiCmd
+			r.state, commands = onInlineActionPick(r.state, value, r.descriptors)
+			r.submitCommands(commands)
+			switch {
+			case r.state.InlineError != "":
+				r.showPaletteResult("ERROR " + r.state.InlineError)
+			case r.state.PaletteConfirm != nil:
+				r.showPaletteConfirmation()
+			case r.state.InlineAction != nil && r.state.InlineAction.Stage == inlineStageMiniForm:
+				r.showInlineMiniForm()
+			}
+		})
+	}
+	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			r.closeInline()
+			return nil
+		}
+		return event
+	})
+	r.outerPages.RemovePage(inlinePage).AddPage(inlinePage, centeredPrimitive(list, 72, len(pending.Options)+4), true, true).SwitchToPage(inlinePage)
+	r.app.SetFocus(list)
+}
+
+func (r *tuiRuntime) showInlineMiniForm() {
+	pending := r.state.InlineAction
+	if pending == nil || pending.Stage != inlineStageMiniForm {
+		return
+	}
+	form := tview.NewForm()
+	form.SetBorder(true).SetTitle(" waive " + pending.TargetID + " ")
+	fields := make(map[string]*tview.InputField, len(pending.FormArgs))
+	for _, name := range pending.FormArgs {
+		field := tview.NewInputField().SetLabel(name + " *: ")
+		fields[name] = field
+		form.AddFormItem(field)
+	}
+	r.paletteSubmit = func() {
+		values := make(map[string]string, len(fields))
+		for name, field := range fields {
+			values[name] = field.GetText()
+		}
+		var commands []tuiCmd
+		r.state, commands = onInlineMiniFormSubmit(r.state, values, r.descriptors)
+		r.submitCommands(commands)
+		if r.state.InlineError != "" {
+			r.showPaletteResult("ERROR " + r.state.InlineError)
+			return
+		}
+		if r.state.PaletteConfirm != nil {
+			r.showPaletteConfirmation()
+		}
+	}
+	form.AddButton("Continue", func() { r.paletteSubmit() })
+	r.paletteSubmitButton = form.GetButton(0)
+	form.AddButton("Cancel", r.closeInline)
+	form.SetCancelFunc(r.closeInline)
+	r.outerPages.RemovePage(inlinePage).AddPage(inlinePage, centeredPrimitive(form, 80, len(fields)+6), true, true).SwitchToPage(inlinePage)
+	r.app.SetFocus(form)
+}
+
+func (r *tuiRuntime) closeInline() {
+	r.state, _ = onInlineActionCancel(r.state)
+	r.paletteSubmit = nil
+	r.paletteSubmitButton = nil
+	r.paletteConfirmAction = nil
+	r.paletteCancelAction = nil
+	r.paletteConfirmButton = nil
+	r.paletteCancelButton = nil
+	r.outerPages.HidePage(inlinePage).HidePage(paletteConfirmPage).HidePage(paletteResultPage).SwitchToPage(dashboardPage)
+	if table := r.tables[r.state.Active]; table != nil {
+		r.app.SetFocus(table)
+	}
+}
+
+func (r *tuiRuntime) showExecuteList() {
+	r.state = onExecuteOpen(r.state)
+	list := tview.NewList().ShowSecondaryText(true)
+	list.SetBorder(true).SetTitle(" Foreground execute ")
+	for _, item := range buildExecuteList(r.descriptors, r.canExecute) {
+		entry := item
+		label := entry.Verb
+		secondary := entry.Summary
+		if entry.PrintOnly {
+			secondary = "PRINT ONLY — " + secondary
+		}
+		if !entry.Enabled {
+			label = "[gray]" + entry.Verb + "[-]"
+			secondary = "[gray]" + entry.Unavailable
+		}
+		list.AddItem(label, secondary, 0, func() {
+			r.state = onExecuteSelect(r.state, entry)
+			if r.state.ExecuteError != "" {
+				list.SetTitle(" Foreground execute — " + r.state.ExecuteError + " ")
+				return
+			}
+			r.showExecuteArgForm()
+		})
+	}
+	r.executeCancelAction = r.closeExecute
+	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			r.closeExecute()
+			return nil
+		}
+		return event
+	})
+	r.outerPages.RemovePage(executePage).AddPage(executePage, centeredPrimitive(list, 84, 12), true, true).SwitchToPage(executePage)
+	r.app.SetFocus(list)
+}
+
+func (r *tuiRuntime) showExecuteArgForm() {
+	entry := r.state.ExecuteSelected
+	if entry == nil {
+		return
+	}
+	form := tview.NewForm()
+	field := tview.NewInputField().SetLabel("arguments (include --): ")
+	field.SetPlaceholder("-- command arg")
+	form.AddFormItem(field)
+	form.SetBorder(true).SetTitle(" " + entry.Verb + " foreground arguments ")
+	r.executeSubmit = func() {
+		var err error
+		r.state, err = onExecuteSubmit(r.state, field.GetText())
+		if err != nil {
+			form.SetTitle(" " + entry.Verb + " — " + err.Error() + " ")
+			return
+		}
+		r.showExecuteConfirmation()
+	}
+	form.AddButton("Continue", func() { r.executeSubmit() })
+	r.executeSubmitButton = form.GetButton(0)
+	r.executeCancelAction = r.closeExecute
+	form.AddButton("Cancel", r.closeExecute)
+	form.SetCancelFunc(r.closeExecute)
+	r.outerPages.RemovePage(executePage).AddPage(executePage, centeredPrimitive(form, 92, 8), true, true).SwitchToPage(executePage)
+	r.app.SetFocus(form)
+}
+
+func (r *tuiRuntime) showExecuteConfirmation() {
+	launch := r.state.ExecuteConfirm
+	if launch == nil || r.state.ExecuteRunning {
+		return
+	}
+	text := launch.Entry.Verb
+	if launch.Entry.PrintOnly {
+		text = "PRINT ONLY — no command will be launched\n\n" + launch.ConfineText
+	} else {
+		text += "\n\n" + executeRequestText(launch.Request)
+	}
+	details := tview.NewTextView().SetWrap(true).SetText(text)
+	details.SetBorder(true).SetTitle(" Resolved foreground request ")
+	form := tview.NewForm()
+	form.SetBorder(true).SetTitle(" Confirm foreground action ")
+	r.executeSubmit = nil
+	r.executeSubmitButton = nil
+	r.executeConfirmAction = r.confirmExecuteOnUI
+	r.executeCancelAction = r.closeExecute
+	form.AddButton("Confirm", r.executeConfirmAction)
+	form.AddButton("Cancel", r.executeCancelAction)
+	r.executeConfirmButton = form.GetButton(0)
+	r.executeCancelButton = form.GetButton(1)
+	form.SetCancelFunc(r.executeCancelAction)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			r.executeCancelAction()
+			return nil
+		}
+		if event.Key() == tcell.KeyRune && event.Rune() == 'y' {
+			return nil
+		}
+		return event
+	})
+	// As with palette mutations, a stray Enter defaults to Cancel.
+	form.SetFocus(1)
+	content := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(details, 0, 1, false).
+		AddItem(form, 5, 0, true)
+	r.outerPages.RemovePage(executeConfirmPage).AddPage(executeConfirmPage, centeredPrimitive(content, 94, 24), true, true).SwitchToPage(executeConfirmPage)
+	r.app.SetFocus(form.GetButton(1))
+}
+
+func executeRequestText(request core.Request) string {
+	var out strings.Builder
+	fmt.Fprintf(&out, "verb: %s\n", request.Verb)
+	names := make([]string, 0, len(request.Args))
+	for name := range request.Args {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		fmt.Fprintf(&out, "%s → %v\n", name, request.Args[name])
+	}
+	return out.String()
+}
+
+func (r *tuiRuntime) executeLaunchOnUI(launch executeLaunch) {
+	if !r.executeRunning.CompareAndSwap(false, true) {
+		return
+	}
+	r.executeLaunchOnUIGuarded(launch)
+}
+
+func (r *tuiRuntime) confirmExecuteOnUI() {
+	// Publish the atomic signal guard before changing reducer state so there is
+	// no confirm→Suspend window in which SIGINT could cancel the TUI.
+	if !r.executeRunning.CompareAndSwap(false, true) {
+		return
+	}
+	var launch *executeLaunch
+	r.state, launch = onExecuteConfirm(r.state)
+	if launch == nil {
+		r.executeRunning.Store(false)
+		return
+	}
+	r.executeLaunchOnUIGuarded(*launch)
+}
+
+func (r *tuiRuntime) executeLaunchOnUIGuarded(launch executeLaunch) {
+	// The atomic clear is intentionally the final deferred action. Signals stay
+	// swallowed through screen restoration, Sync, and source-of-truth refresh.
+	defer func() {
+		r.state = onExecuteComplete(r.state)
+		r.resetExecuteWidgets()
+		r.outerPages.HidePage(executePage).HidePage(executeConfirmPage).SwitchToPage(dashboardPage)
+		r.render()
+		r.executeRunning.Store(false)
+	}()
+	callback := func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				_, _ = fmt.Fprintf(r.executeStderr(), "E_INTERNAL: execute callback panic: %v\n", recovered)
+			}
+			_, _ = fmt.Fprint(r.executeStdout(), "\nPress Enter to return to AIRA…")
+			_, _ = bufio.NewReader(r.executeStdin()).ReadString('\n')
+		}()
+		report := dispatchExecuteLaunch(r.ctx, r.executeDispatcher, r.scope, launch)
+		_, _ = fmt.Fprintf(r.executeStdout(), "\n%s\n", report.String())
+	}
+	if r.suspend == nil || !r.suspend(callback) {
+		_, _ = fmt.Fprintln(r.executeStderr(), "E_TUI_EXECUTE_SUSPEND: not launched; terminal suspension failed")
+		return
+	}
+	r.app.Sync()
+	r.applyAsync(tuiMessage{Kind: msgExecuteResume})
+}
+
+func (r *tuiRuntime) closeExecute() {
+	r.state = onExecuteCancel(r.state)
+	r.resetExecuteWidgets()
+	r.outerPages.HidePage(executePage).HidePage(executeConfirmPage).SwitchToPage(dashboardPage)
+	if table := r.tables[r.state.Active]; table != nil {
+		r.app.SetFocus(table)
+	} else {
+		r.app.SetFocus(r.insights)
+	}
+}
+
+func (r *tuiRuntime) resetExecuteWidgets() {
+	r.executeSubmitButton = nil
+	r.executeSubmit = nil
+	r.executeConfirmButton = nil
+	r.executeCancelButton = nil
+	r.executeConfirmAction = nil
+	r.executeCancelAction = nil
+}
+
+func (r *tuiRuntime) executeStdin() io.Reader {
+	if r.stdin == nil {
+		return strings.NewReader("\n")
+	}
+	return r.stdin
+}
+
+func (r *tuiRuntime) executeStdout() io.Writer {
+	if r.stdout == nil {
+		return io.Discard
+	}
+	return r.stdout
+}
+
+func (r *tuiRuntime) executeStderr() io.Writer {
+	if r.stderr == nil {
+		return io.Discard
+	}
+	return r.stderr
 }
 
 func centeredPrimitive(primitive tview.Primitive, width, height int) tview.Primitive {

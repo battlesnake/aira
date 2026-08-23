@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -51,7 +52,7 @@ func TestTUIKeypressAndQuitWhileFetchAndQueueUpdateAreInFlight(t *testing.T) {
 	defer cancel()
 	screen := tcell.NewSimulationScreen("UTF-8")
 	screen.SetSize(100, 30)
-	runtime := newTUIRuntime(ctx, dispatcher, daemon.WorktreeScope{}, screen)
+	runtime := newTUIRuntime(ctx, dispatcher, nil, daemon.WorktreeScope{}, nil, nil, nil, screen)
 	drawn := make(chan struct{})
 	var drawOnce sync.Once
 	runtime.app.SetAfterDrawFunc(func(tcell.Screen) { drawOnce.Do(func() { close(drawn) }) })
@@ -119,7 +120,7 @@ func TestPumpExitsOnCancelWhenUILoopAbsent(t *testing.T) {
 	defer cancel()
 	screen := tcell.NewSimulationScreen("UTF-8")
 	screen.SetSize(100, 30)
-	runtime := newTUIRuntime(ctx, dispatcher, daemon.WorktreeScope{}, screen)
+	runtime := newTUIRuntime(ctx, dispatcher, nil, daemon.WorktreeScope{}, nil, nil, nil, screen)
 	started := make(chan struct{}, 1)
 	runtime.queueUpdateStarted = started
 
@@ -144,7 +145,7 @@ func TestTUIPaletteOpensOnColon(t *testing.T) {
 	defer cancel()
 	screen := tcell.NewSimulationScreen("UTF-8")
 	screen.SetSize(100, 30)
-	runtime := newTUIRuntime(ctx, dispatcher, daemon.WorktreeScope{}, screen)
+	runtime := newTUIRuntime(ctx, dispatcher, nil, daemon.WorktreeScope{}, nil, nil, nil, screen)
 	drawn := make(chan struct{}, 1)
 	runtime.app.SetAfterDrawFunc(func(tcell.Screen) {
 		select {
@@ -223,7 +224,7 @@ func TestTUIConfirmationRequiresFocusedConfirmEnterAndDispatchesOnce(t *testing.
 	defer cancel()
 	screen := tcell.NewSimulationScreen("UTF-8")
 	screen.SetSize(110, 36)
-	runtime := newTUIRuntime(ctx, dispatcher, daemon.WorktreeScope{}, screen)
+	runtime := newTUIRuntime(ctx, dispatcher, nil, daemon.WorktreeScope{}, nil, nil, nil, screen)
 	done := make(chan error, 1)
 	go func() { done <- runtime.run() }()
 	waitForSimulationText(t, runtime, screen, "1:Tickets")
@@ -312,7 +313,7 @@ func TestTUIDestructiveConfirmationRequiresExactResolvedID(t *testing.T) {
 	defer cancel()
 	screen := tcell.NewSimulationScreen("UTF-8")
 	screen.SetSize(110, 36)
-	runtime := newTUIRuntime(ctx, dispatcher, daemon.WorktreeScope{}, screen)
+	runtime := newTUIRuntime(ctx, dispatcher, nil, daemon.WorktreeScope{}, nil, nil, nil, screen)
 	done := make(chan error, 1)
 	go func() { done <- runtime.run() }()
 	waitForSimulationText(t, runtime, screen, "1:Tickets")
@@ -369,7 +370,7 @@ func TestTUIDestructiveConfirmationRequiresExactResolvedID(t *testing.T) {
 
 func TestTUIPaletteResultDoesNotPopAfterFlowWasClosed(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	runtime := newTUIRuntime(ctx, &tuiMutationDispatcher{}, daemon.WorktreeScope{}, nil)
+	runtime := newTUIRuntime(ctx, &tuiMutationDispatcher{}, nil, daemon.WorktreeScope{}, nil, nil, nil, nil)
 	runtime.state.PaletteOpen = false
 	runtime.state.PaletteDispatching = true
 	runtime.state.PaletteDispatchedVerb = "spend.add"
@@ -463,7 +464,7 @@ func TestTUIRendersTruncatedErrorAndUnevaluatedStates(t *testing.T) {
 	defer cancel()
 	screen := tcell.NewSimulationScreen("UTF-8")
 	screen.SetSize(100, 30)
-	runtime := newTUIRuntime(ctx, tuiRenderDispatcher{}, daemon.WorktreeScope{}, screen)
+	runtime := newTUIRuntime(ctx, tuiRenderDispatcher{}, nil, daemon.WorktreeScope{}, nil, nil, nil, screen)
 	done := make(chan error, 1)
 	go func() { done <- runtime.run() }()
 	deadline := time.Now().Add(time.Second)
@@ -565,7 +566,7 @@ func TestTUIConfirmationSpaceAtDefaultFocusDoesNotDispatch(t *testing.T) {
 	defer cancel()
 	screen := tcell.NewSimulationScreen("UTF-8")
 	screen.SetSize(110, 36)
-	runtime := newTUIRuntime(ctx, dispatcher, daemon.WorktreeScope{}, screen)
+	runtime := newTUIRuntime(ctx, dispatcher, nil, daemon.WorktreeScope{}, nil, nil, nil, screen)
 	done := make(chan error, 1)
 	go func() { done <- runtime.run() }()
 	waitForSimulationText(t, runtime, screen, "1:Tickets")
@@ -599,4 +600,105 @@ func TestTUIConfirmationSpaceAtDefaultFocusDoesNotDispatch(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("runtime did not exit after cancel")
 	}
+}
+
+// covers: the real tview path opens the disjoint execute launcher, parses the
+// one-field argv, confirms once, suspends, calls only the fake execute dispatcher,
+// resumes, and returns to a live dashboard.
+func TestTUIExecuteLauncherSuspendsDispatchesAndResumes(t *testing.T) {
+	dashboard := &tuiSmokeDispatcher{started: make(chan struct{})}
+	execute := &executeRouteRecorder{response: core.Response{OK: true, Code: "OK"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	screen := tcell.NewSimulationScreen("UTF-8")
+	screen.SetSize(110, 36)
+	var stdout, stderr bytes.Buffer
+	runtime := newTUIRuntime(ctx, dashboard, execute, daemon.WorktreeScope{}, strings.NewReader("\n"), &stdout, &stderr, screen)
+	done := make(chan error, 1)
+	go func() { done <- runtime.run() }()
+	waitForSimulationText(t, runtime, screen, "1:Tickets")
+
+	screen.InjectKey(tcell.KeyRune, 'x', tcell.ModNone)
+	text := waitForSimulationText(t, runtime, screen, "Foreground execute")
+	if !strings.Contains(text, "subprocess in an owned scope") || strings.Contains(text, "run-kill") {
+		t.Fatalf("execute launcher contents:\n%s", text)
+	}
+	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone) // run
+	waitForSimulationText(t, runtime, screen, "arguments (include --)")
+	for _, ch := range "-- true" {
+		screen.InjectKey(tcell.KeyRune, ch, tcell.ModNone)
+	}
+	screen.InjectKey(tcell.KeyTab, 0, tcell.ModNone)
+	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone)
+	waitForSimulationText(t, runtime, screen, "Confirm foreground action")
+	screen.InjectKey(tcell.KeyTab, 0, tcell.ModNone) // Cancel -> Confirm.
+	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		dispatch, palette, route := execute.counts()
+		if dispatch == 1 && palette == 0 && route == core.RouteClient && strings.Contains(stdout.String(), "execution: completed") {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	dispatch, palette, route := execute.counts()
+	if dispatch != 1 || palette != 0 || route != core.RouteClient {
+		t.Fatalf("execute routes dispatch=%d palette=%d route=%v stdout=%q stderr=%q", dispatch, palette, route, stdout.String(), stderr.String())
+	}
+	if runtime.executeRunning.Load() {
+		t.Fatal("execute atomic guard remained set after resume")
+	}
+	screen.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("execute smoke TUI did not quit")
+	}
+}
+
+func TestTUIExecuteCapabilityAbsentIsVisible(t *testing.T) {
+	dispatcher := &tuiSmokeDispatcher{started: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	screen := tcell.NewSimulationScreen("UTF-8")
+	screen.SetSize(110, 36)
+	runtime := newTUIRuntime(ctx, dispatcher, nil, daemon.WorktreeScope{}, nil, nil, nil, screen)
+	done := make(chan error, 1)
+	go func() { done <- runtime.run() }()
+	waitForSimulationText(t, runtime, screen, "1:Tickets")
+	screen.InjectKey(tcell.KeyRune, 'x', tcell.ModNone)
+	if text := waitForSimulationText(t, runtime, screen, "unavailable: no terminal dispatcher"); !strings.Contains(text, "unavailable: no terminal dispatcher") {
+		t.Fatalf("capability absence was silent:\n%s", text)
+	}
+	screen.InjectKey(tcell.KeyEscape, 0, tcell.ModNone)
+	screen.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("capability smoke TUI did not quit")
+	}
+}
+
+func TestTUILeaseAndReadyTablesPublishSelection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	runtime := newTUIRuntime(ctx, &tuiSmokeDispatcher{started: make(chan struct{})}, nil, daemon.WorktreeScope{}, nil, nil, nil, nil)
+	for _, test := range []struct {
+		view tuiView
+		id   string
+	}{{view: viewLeases, id: "AIRA-lease"}, {view: viewReady, id: "AIRA-ready"}} {
+		panel := runtime.state.Panels[test.view]
+		panel.Model = panelModel{Headers: []string{"ID"}, Rows: []tableRow{{ID: test.id, Cells: []string{test.id}}}}
+		runtime.state.Panels[test.view] = panel
+		runtime.renderTable(test.view, panel.Model, panel)
+		runtime.tables[test.view].Select(1, 0)
+		if got := runtime.state.Panels[test.view].SelectedID; got != test.id {
+			t.Fatalf("%s selected id=%q want=%q", test.view, got, test.id)
+		}
+	}
+	cancel()
+	runtime.executor.wait()
 }

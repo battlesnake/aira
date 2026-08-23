@@ -13,6 +13,10 @@ import (
 
 const tuiDecodeError = "E_TUI_DECODE"
 
+type tuiLeaseTokenResolver interface {
+	TUILeaseToken(daemon.WorktreeScope, string) (string, error)
+}
+
 func decodeTUIResponse(response core.Response, target any) string {
 	if !response.OK {
 		if response.Code != "" {
@@ -64,7 +68,18 @@ func fetchTUIView(ctx context.Context, dispatcher Dispatcher, scope daemon.Workt
 		if result.Code = dispatchTUIData(ctx, dispatcher, scope, core.Request{Verb: "lease", Args: map[string]any{"subverb": "ls"}}, &data); result.Code != "" {
 			return result
 		}
-		result.Model = leaseListViewModel(data.Rows)
+		tokens := make(map[string]string)
+		if resolver, ok := dispatcher.(tuiLeaseTokenResolver); ok {
+			for _, lease := range data.Rows {
+				if lease.WorktreeID != scope.WorktreeID {
+					continue
+				}
+				if token, err := resolver.TUILeaseToken(scope, lease.TicketID); err == nil && token != "" {
+					tokens[lease.TicketID] = token
+				}
+			}
+		}
+		result.Model = leaseListViewModel(data.Rows, tokens)
 	case viewFindings:
 		var data listEnvelope
 		if result.Code = dispatchTUIData(ctx, dispatcher, scope, core.Request{Verb: "find", Args: map[string]any{"subverb": "ls"}}, &data); result.Code != "" {

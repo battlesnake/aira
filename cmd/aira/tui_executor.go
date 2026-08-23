@@ -25,6 +25,7 @@ const (
 	msgPaletteResult
 	msgRefreshDue
 	msgDetailResult
+	msgExecuteResume
 )
 
 type tuiMessage struct {

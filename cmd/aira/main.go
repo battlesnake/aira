@@ -182,13 +182,18 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	}
 	if verb == "tui" {
 		dispatcher := injected
+		var executeDispatcher Dispatcher
 		if dispatcher == nil {
 			dispatcher, err = newDaemonDispatcher(stdin, io.Discard, io.Discard, false)
 			if err != nil {
 				return render(transportErrorResponse(err), jsonOutput, stdout, stderr)
 			}
+			executeDispatcher, err = newDaemonDispatcher(stdin, stdout, stderr, false)
+			if err != nil {
+				return render(transportErrorResponse(err), jsonOutput, stdout, stderr)
+			}
 		}
-		return runTUI(context.Background(), dispatcher, scope, stderr)
+		return runTUI(context.Background(), dispatcher, executeDispatcher, scope, stdin, stdout, stderr)
 	}
 	faceStdout := &lineTrackingWriter{w: stdout}
 	dispatcher := injected

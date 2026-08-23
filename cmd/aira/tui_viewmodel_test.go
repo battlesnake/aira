@@ -52,11 +52,14 @@ func TestLeaseViewModelDistinguishesExpiredAndPriorBoot(t *testing.T) {
 	model := leaseListViewModel([]store.HeldLeaseRow{
 		{TicketID: "AIRA-1", Actor: "alice", WorktreeID: "wt-a", Generation: 2, TTLNanos: 100, Expired: true, AgeNote: "250ns"},
 		{TicketID: "AIRA-2", Actor: "bob", WorktreeID: "wt-b", Generation: 3, TTLNanos: 100, Expired: true, AgeNote: "stale (prior boot)"},
-	})
+	}, map[string]string{"AIRA-1": "captured-token"})
 	if model.Rows[0].Cells[5] != "EXPIRED" || !strings.Contains(model.Rows[0].Cells[6], "as of last refresh") {
 		t.Fatalf("expired row=%#v", model.Rows[0])
 	}
 	if model.Rows[1].Cells[5] != "STALE" || !strings.Contains(model.Rows[1].Cells[6], "stale (prior boot)") || strings.Contains(model.Rows[1].Cells[6], "0s") {
 		t.Fatalf("prior boot row=%#v", model.Rows[1])
+	}
+	if model.Rows[0].LeaseToken != "captured-token" || model.Rows[0].LeaseVersion != 2 {
+		t.Fatalf("lease action snapshot=%#v", model.Rows[0])
 	}
 }

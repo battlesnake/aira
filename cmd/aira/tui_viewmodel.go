@@ -28,7 +28,8 @@ type gaugeFetch struct {
 func ticketListViewModel(data listEnvelope) panelModel {
 	model := panelModel{Headers: []string{"ID", "Status", "Kind", "Severity", "Assignee", "Milestone"}}
 	for _, item := range data.Rows {
-		model.Rows = append(model.Rows, tableRow{ID: textCell(item["id"]), Cells: []string{
+		hold, _ := item["hold"].(bool)
+		model.Rows = append(model.Rows, tableRow{ID: textCell(item["id"]), Hold: hold, Cells: []string{
 			textCell(item["id"]), textCell(item["status"]), textCell(item["kind"]), textCell(item["severity"]),
 			textCell(item["assignee"]), textCell(item["milestone"]),
 		}})
@@ -86,8 +87,12 @@ func findingListViewModel(data listEnvelope) panelModel {
 	return model
 }
 
-func leaseListViewModel(rows []store.HeldLeaseRow) panelModel {
+func leaseListViewModel(rows []store.HeldLeaseRow, tokenSnapshots ...map[string]string) panelModel {
 	model := panelModel{Headers: []string{"Ticket", "Actor", "Worktree", "Generation", "TTL", "State", "Age"}}
+	var tokens map[string]string
+	if len(tokenSnapshots) > 0 {
+		tokens = tokenSnapshots[0]
+	}
 	for _, lease := range rows {
 		state := "HELD"
 		style := ""
@@ -102,7 +107,7 @@ func leaseListViewModel(rows []store.HeldLeaseRow) panelModel {
 		if age != "" {
 			age += " — as of last refresh"
 		}
-		model.Rows = append(model.Rows, tableRow{ID: lease.TicketID, Style: style, Cells: []string{
+		model.Rows = append(model.Rows, tableRow{ID: lease.TicketID, Style: style, LeaseToken: tokens[lease.TicketID], LeaseVersion: lease.Generation, Cells: []string{
 			lease.TicketID, lease.Actor, lease.WorktreeID, fmt.Sprint(lease.Generation), time.Duration(lease.TTLNanos).String(), state, age,
 		}})
 	}

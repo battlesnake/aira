@@ -106,6 +106,19 @@ func (d *daemonDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeSc
 	return response.CoreResponse()
 }
 
+// TUILeaseToken snapshots the caller worktree's local bearer token without
+// adding it to the daemon's lease-list wire response. The paired generation
+// comes from that response; a race can only produce a mismatched pair, which
+// the daemon rejects, never authority over a newer lease.
+func (d *daemonDispatcher) TUILeaseToken(scope daemon.WorktreeScope, ticketID string) (string, error) {
+	path := filepath.Join(d.paths.LeaseStateDir, scope.WorktreeID, "leases", scope.ProjectID, scope.WorktreeID, ticketID+".token")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
 // DispatchPalette preserves transport evidence that the ordinary Dispatcher
 // response intentionally flattens for legacy faces. The TUI uses it to avoid
 // reporting a possibly committed mutation as rejected.

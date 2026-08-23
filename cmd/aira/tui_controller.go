@@ -33,9 +33,12 @@ const (
 )
 
 type tableRow struct {
-	Cells []string
-	ID    string
-	Style string
+	Cells        []string
+	ID           string
+	Style        string
+	Hold         bool
+	LeaseToken   string
+	LeaseVersion int64
 }
 
 type gaugeTile struct {
@@ -78,6 +81,14 @@ type tuiState struct {
 	PaletteConfirm        *paletteConfirm
 	PaletteDispatching    bool
 	PaletteDispatchedVerb string
+	InlineAction          *inlineActionState
+	InlineError           string
+	CanExecute            bool
+	ExecuteOpen           bool
+	ExecuteSelected       *executeEntry
+	ExecuteConfirm        *executeLaunch
+	ExecuteRunning        bool
+	ExecuteError          string
 	ShuttingDown          bool
 	ReconnectAttempt      int
 }
@@ -166,6 +177,24 @@ func cloneTUIState(state tuiState) tuiState {
 		confirm := *state.PaletteConfirm
 		confirm.Request = clonePaletteRequest(confirm.Request)
 		copyState.PaletteConfirm = &confirm
+	}
+	if state.InlineAction != nil {
+		inline := *state.InlineAction
+		inline.Options = append([]string(nil), state.InlineAction.Options...)
+		inline.FormArgs = append([]string(nil), state.InlineAction.FormArgs...)
+		inline.Values = make(map[string]string, len(state.InlineAction.Values))
+		for name, value := range state.InlineAction.Values {
+			inline.Values[name] = value
+		}
+		copyState.InlineAction = &inline
+	}
+	if state.ExecuteSelected != nil {
+		selected := *state.ExecuteSelected
+		copyState.ExecuteSelected = &selected
+	}
+	if state.ExecuteConfirm != nil {
+		confirm := cloneExecuteLaunch(*state.ExecuteConfirm)
+		copyState.ExecuteConfirm = &confirm
 	}
 	copyState.Panels = make(map[tuiView]panelState, len(state.Panels))
 	for view, panel := range state.Panels {
@@ -288,6 +317,8 @@ func onPaletteCancel(state tuiState) (tuiState, []tuiCmd) {
 		return state, nil
 	}
 	state.PaletteConfirm = nil
+	state.InlineAction = nil
+	state.InlineError = ""
 	return state, nil
 }
 
@@ -303,6 +334,8 @@ func onPaletteResult(state tuiState, outcome paletteOutcome, descriptors []core.
 	verb := state.PaletteDispatchedVerb
 	state.PaletteDispatching = false
 	state.PaletteDispatchedVerb = ""
+	state.InlineAction = nil
+	state.InlineError = ""
 	if outcome == paletteRejected {
 		return state, nil
 	}
@@ -333,8 +366,13 @@ func requestPanelRefresh(state tuiState, view tuiView) (tuiState, []tuiCmd) {
 	return state, []tuiCmd{{Kind: cmdFetch, View: view, Generation: panel.Generation}}
 }
 
-func onTUIKey(state tuiState, key rune) (tuiState, []tuiCmd) {
+func onTUIKey(state tuiState, key rune, descriptors []core.DispatchDescriptor) (tuiState, []tuiCmd) {
 	state = cloneTUIState(state)
+	if !state.PaletteOpen && !state.PaletteDispatching && state.Panels[state.Active].SelectedID != "" {
+		if action, ok := inlineActionFor(state.Active, key); ok {
+			return onInlineActionStart(state, action, descriptors)
+		}
+	}
 	switch key {
 	case 'q':
 		state.ShuttingDown = true
@@ -344,6 +382,10 @@ func onTUIKey(state tuiState, key rune) (tuiState, []tuiCmd) {
 	case ':':
 		state.PaletteOpen = true
 		return state, nil
+	case 'x':
+		if !state.PaletteOpen && !state.PaletteDispatching && !state.ExecuteRunning {
+			return onExecuteOpen(state), nil
+		}
 	case '\t':
 		for i, view := range allViews {
 			if view == state.Active {
@@ -390,6 +432,9 @@ func onTUISelect(state tuiState, view tuiView, id string) (tuiState, []tuiCmd) {
 	}
 	panel.SelectedID = id
 	state.Panels[view] = panel
+	if view != viewTickets && view != viewFindings {
+		return state, nil
+	}
 	return state, []tuiCmd{{Kind: cmdFetch, View: view, Generation: panel.Generation, DetailID: id}}
 }
 

@@ -133,7 +133,7 @@ func TestControllerManualRefreshDuringFetchQueuesOneTrailingFetch(t *testing.T) 
 	state, cmds := requestPanelRefresh(state, viewTickets)
 	assertSingleFetch(t, cmds, viewTickets, 1)
 
-	state, cmds = onTUIKey(state, 'r')
+	state, cmds = onTUIKey(state, 'r', core.New(nil).DispatchDescriptors())
 	if len(cmds) != 0 || !state.Panels[viewTickets].Dirty || state.Panels[viewTickets].Generation != 1 {
 		t.Fatalf("refresh during fetch state=%#v cmds=%#v", state.Panels[viewTickets], cmds)
 	}
