@@ -1,9 +1,14 @@
 # AIRA TUI v4 — detached-run execute mode (non-blocking)
 
-Status: PLAN v2 — corrects v1's wrong "detached is fire-and-forget" premise after
-the Fable code-gate (**GATE-FAIL** on the missing `AfterWrite` ack seam) + Sol
-plan-review (both P0: async dispatch, the ack contract, a THIRD honesty state).
-Milestone #58. Extends the TUI v3 `x` execute launcher (#56, merged `781d8f4`).
+Status: PLAN v3 — Fable code-gate **re-gate GATE-PASS** (v2 fixed the GATE-FAIL P0:
+the missing `AfterWrite` ack seam). Folds Fable's 3 re-gate must-fixes: (1) the third
+honesty state is `AfterWrite(true)`-errors ONLY, not a fictional post-admission
+timeout (every error response is provably "not launched"); (2) "accepted: RUN-<id> —
+supervisor released, outcome pending", never "child started" (the ack precedes
+admission for uncapped runs); (3) nil-guard `AfterWrite` + hand results back via the
+executor messages/ctx pattern. Sol plan-review folded (async off-UI, ack contract);
+Sol's post-admission-timeout leg was corrected by Fable's code-grounding. Milestone
+#58. Extends the TUI v3 `x` execute launcher (#56, merged `781d8f4`).
 
 ## 0. Context + the corrected mechanism
 
@@ -46,11 +51,17 @@ signal seam, no terminal ownership — but it DOES block for the ready-wait
 - On confirm, branch on `launch.Detached`:
   - **Detached → asynchronous.** Enqueue a NEW executor job (mirroring the fetch-job
     pattern in `tui_executor.go`) that, off the UI goroutine, calls
-    `executeDispatcher.Dispatch(r.ctx, scope, req)` then, on an OK response with a
-    valid `RUN-<id>`, `response.AfterWrite(true)` (releasing the supervisor); it
-    returns a `msgExecuteDetachedResult{state, id, code}` marshalled back through the
-    tview UI queue (`QueueUpdateDraw`), where a controller transition renders the
-    result. **No `Suspend`, no `ExecuteRunning`, no signal seam.** The dashboard keeps
+    `executeDispatcher.Dispatch(r.ctx, scope, req)` then, **only if `response.OK &&
+    response.AfterWrite != nil`** and the response carried a valid `RUN-<id>`, calls
+    `response.AfterWrite(true)` (releasing the supervisor). Error responses carry a
+    nil `AfterWrite` (`core.go:508-511`), so the call is nil-guarded — a bare call
+    panics. The worker keeps the ONE `core.Response` value in ONE closure (Dispatch →
+    check id → ack → message) so `AfterWrite`/`Data` stay intact (in-process
+    dispatcher; `AfterWrite` is `json:"-"`). It hands the result back via the existing
+    **executor `messages` channel + ctx pattern** (as fetch jobs do), NOT a bare
+    `QueueUpdateDraw` (which can block a worker forever if the app stopped
+    mid-dispatch — Fable); a controller transition then renders the result. **No
+    `Suspend`, no `ExecuteRunning`, no signal seam.** The dashboard keeps
     live-refreshing while the ready-wait blocks the worker (not the UI).
   - **else** → the unchanged v3 foreground suspend path.
 - **In-flight guard (Sol/Fable P1):** a separate `DetachedSubmitting` atomic (NOT
@@ -64,21 +75,35 @@ signal seam, no terminal ownership — but it DOES block for the ready-wait
 
 ## 3. Honesty — THREE states (Fable + Sol P0)
 
-The detached report is one of:
-- **`launched detached: RUN-<id>`** — the OK response carried a valid `RUN-<id>` AND
-  `AfterWrite(true)` returned **nil** (the ack proves durable admission + supervisor
-  ownership, not mere id/control-file creation — Sol). A missing/malformed id on an
-  OK response is a **protocol error**, never success.
-- **`not launched: <code>`** — a pre-admission failure explicitly classified as
-  did-not-run (`executeNotLaunchedCode` transport/ensure-scope codes;
-  `E_RUN_ARGUMENT_INVALID`/`E_RUN_SCOPE_UNAVAILABLE`/`E_RUN_DETACH_FAILED`; a ready
-  message code before launch). The child provably never ran.
-- **`launch status unknown: <reason>`** (Sol P0, the third state) — a timeout or
-  connection loss **after** admission, or `AfterWrite` returning an error (supervisor
-  may have launched but the ack/response was lost). NEVER fabricate "launched" or
-  "not launched" here; and invoke `AfterWrite(false)` on any path that will NOT
-  surface a launched id (cancels the run + removes the wiring sidecar,
-  `core.go:525-533`) so a genuinely-unlaunched run is cleaned up.
+The detached report is one of THREE states — grounded in what the code can actually
+prove (Fable re-gate corrected v2 here; Sol's "post-admission timeout" leg is
+fictional — see below):
+
+- **`detached run accepted: RUN-<id>`** — the OK response carried a valid `RUN-<id>`
+  AND `AfterWrite(true)` returned **nil**. **Honest meaning (Fable):** the id is
+  reserved, `"starting"` is journaled, the supervisor lease is held, and the
+  supervisor is **RELEASED** — it does NOT mean the child has started or passed
+  admission (for *uncapped* runs the ack precedes `r.admit`, `detach_linux.go:216`;
+  only capped runs verify admission+cap before ready, `:314-328`). So the report
+  reads "accepted: RUN-<id> — supervisor released; admission + outcome pending, see
+  `run-log`/`show RUN-<id>`", NEVER "child started". A missing/malformed id on an OK
+  response → **protocol error**, never success.
+- **`not launched: <code>`** — **EVERY error response** (Fable): all launcher errors
+  return `E_RUN_DETACH_FAILED`/pre-admission codes, and on every error path the
+  launcher closes the ack pipe (`detach_linux.go:84,90,94,98`) → the supervisor
+  self-cancels via ack-EOF → `U_RUN_DETACH_CANCELLED`, so the child provably never
+  ran. Error responses carry a **nil `AfterWrite`** (`core.go:508-511`), so
+  `AfterWrite` is invoked ONLY on OK responses (`if response.AfterWrite != nil`).
+- **`launch status unknown`** — the SOLE ambiguous case (Fable): `AfterWrite(true)`
+  itself returns an error (ack-write EPIPE — the supervisor died after readiness but
+  before receiving the ack; the run may be left `"starting"` until reconcile). Only
+  here do we refuse to claim accepted OR not-launched. (Sol's "timeout/connection
+  loss after admission → unknown" does NOT exist: the launch is in-process, no daemon
+  connection carries it; classifying a provable not-launched as "unknown" would
+  *downgrade* honesty.)
+
+`AfterWrite(false)` is invoked on any path that decides NOT to surface an accepted id
+from an OK response (cancels the run + removes the wiring sidecar, `core.go:525-533`).
 
 The report renders in a **TUI surface** (a status line / small modal) — NEVER via
 `executeStdout()` (v3 writes there inside the suspend callback; doing so while tview
@@ -108,12 +133,15 @@ the store views; refresh nothing (or only a run-oriented view if one is added la
 
 - **AfterWrite contract (load-bearing):** a fake dispatcher returning an OK response
   with a spy `AfterWrite` — assert the detached path invokes `AfterWrite(true)`
-  exactly once BEFORE reporting "launched", and reports the RUN-id from the response;
+  exactly once BEFORE reporting "accepted", and reports the RUN-id from the response;
   an `AfterWrite` returning error → **"launch status unknown"**, NEVER a fabricated
-  id; a path that won't surface the id invokes `AfterWrite(false)`.
-- **Three-state honesty:** OK+valid id+AfterWrite-nil → "launched: RUN-x";
-  pre-admission error code → "not launched: <code>"; post-admission timeout/lost →
-  "launch status unknown"; OK response with missing/malformed id → protocol error.
+  id; a path that won't surface the id invokes `AfterWrite(false)`. An **error
+  response has a nil `AfterWrite`** → assert the path does NOT call it (no panic).
+- **Three-state honesty:** OK + valid id + `AfterWrite`-nil → "accepted: RUN-x" (with
+  the supervisor-released/outcome-pending wording, never "child started"); **ANY
+  error response** → "not launched: <code>" (never "unknown"); **`AfterWrite(true)`
+  returns an error** → "launch status unknown" (the ONLY unknown trigger); OK
+  response with missing/malformed id → protocol error.
 - **Async + guard:** the detached dispatch runs off the UI goroutine (assert the UI
   is not blocked / the job goes through the executor); `DetachedSubmitting` makes a
   double-confirm enqueue exactly one dispatch; foreground path still takes
