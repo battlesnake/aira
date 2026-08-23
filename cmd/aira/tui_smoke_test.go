@@ -637,7 +637,7 @@ func TestTUIExecuteLauncherSuspendsDispatchesAndResumes(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		dispatch, palette, route := execute.counts()
-		if dispatch == 1 && palette == 0 && route == core.RouteClient && strings.Contains(stdout.String(), "execution: completed") {
+		if dispatch == 1 && palette == 0 && route == core.RouteClient && !runtime.executeRunning.Load() {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)

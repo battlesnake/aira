@@ -77,7 +77,7 @@ func runTUI(ctx context.Context, dispatcher, executeDispatcher Dispatcher, scope
 	signals := make(chan os.Signal, 2)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(signals)
-	go runTUISignalLoop(runtime.ctx, signals, runtime.executeRunning.Load, runtime.cancel)
+	go runTUISignalLoop(runtime.ctx, signals, runtime.executeRunning.Load, runtime.cancel, nil)
 	return runTUIRuntime(runtime, stderr)
 }
 

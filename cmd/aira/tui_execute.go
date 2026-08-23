@@ -396,7 +396,15 @@ func isRunExecutionCode(code string, hasRunRecord bool) bool {
 	if code == "E_RUN_WIRING_INCOMPLETE" && hasRunRecord {
 		return false
 	}
-	return strings.HasPrefix(code, "E_RUN_") || strings.HasPrefix(code, "U_RUN_")
+	if hasRunRecord {
+		return strings.HasPrefix(code, "E_RUN_") || strings.HasPrefix(code, "U_RUN_")
+	}
+	switch code {
+	case "E_RUN_KILLED", "E_RUN_OOM_KILLED", "E_RUN_FAILED", "U_RUN_EXIT_UNKNOWN":
+		return true
+	default:
+		return false
+	}
 }
 
 func executeNotLaunchedCode(code string) bool {
@@ -446,7 +454,7 @@ func decodeGitExecuteData(response core.Response) gitExecuteData {
 // runTUISignalLoop owns only the TUI cancellation policy. Registered signals
 // are swallowed while a foreground execute runs; the child receives terminal
 // signals independently through foreground-process-group delivery.
-func runTUISignalLoop(ctx context.Context, signals <-chan os.Signal, executeRunning func() bool, cancel func()) {
+func runTUISignalLoop(ctx context.Context, signals <-chan os.Signal, executeRunning func() bool, cancel func(), processed func()) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -454,6 +462,9 @@ func runTUISignalLoop(ctx context.Context, signals <-chan os.Signal, executeRunn
 		case <-signals:
 			if !executeRunning() {
 				cancel()
+			}
+			if processed != nil {
+				processed()
 			}
 		}
 	}

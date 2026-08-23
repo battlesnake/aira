@@ -230,6 +230,10 @@ func TestExecuteHonestyReportsExecutionAndPersistenceSeparately(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	reportTelemetry, err := parseExecuteRequest("run", `--report go-json -- true`)
+	if err != nil {
+		t.Fatal(err)
+	}
 	plain, err := parseExecuteRequest("run", `-- true`)
 	if err != nil {
 		t.Fatal(err)
@@ -246,10 +250,11 @@ func TestExecuteHonestyReportsExecutionAndPersistenceSeparately(t *testing.T) {
 		{name: "time ensure scope policy rejection not launched", verb: "time", request: core.Request{Verb: "time"}, response: core.Response{Code: "E_PREFIX_OWNERSHIP_CONFLICT", Exit: 1}, execution: "not launched"},
 		{name: "run killed", verb: "run", request: plain, response: core.Response{Code: "E_RUN_KILLED", Exit: 1}, execution: "E_RUN_KILLED"},
 		{name: "run argument family", verb: "run", request: plain, response: core.Response{Code: "E_RUN_ARGUMENT_INVALID", Exit: 2}, execution: "E_RUN_ARGUMENT_INVALID"},
-		{name: "run oom", verb: "run", request: plain, response: core.Response{Code: "E_RUN_OOM_KILLED", Exit: 1}, execution: "E_RUN_OOM_KILLED"},
+		{name: "run oom with record", verb: "run", request: plain, response: core.Response{Code: "E_RUN_OOM_KILLED", Exit: 1, RawData: []byte(`{"status":"oom_killed"}`)}, execution: "E_RUN_OOM_KILLED"},
 		{name: "run exit unknown", verb: "run", request: plain, response: core.Response{Code: "U_RUN_EXIT_UNKNOWN", Exit: 3}, execution: "U_RUN_EXIT_UNKNOWN"},
 		{name: "telemetry persisted", verb: "run", request: telemetry, response: core.Response{OK: true, Code: "OK", RawData: []byte(`{"status":"exited","exit_code":0,"wiring":{"wiring_complete":true}}`)}, execution: "exited", persistence: "persisted"},
 		{name: "telemetry relay unknown", verb: "run", request: telemetry, response: core.Response{OK: true, Code: "OK", RawData: []byte(`{"status":"exited","exit_code":0,"wiring":{"wiring_complete":false,"warnings":[{"code":"U_DAEMON_OUTCOME_UNKNOWN"}]}}`)}, execution: "exited", persistence: "relay unknown"},
+		{name: "telemetry argument invalid before launch", verb: "run", request: reportTelemetry, response: core.Response{Code: "E_RUN_ARGUMENT_INVALID", Exit: 2}, execution: "not launched", persistence: "not attempted"},
 		{name: "ensure scope not launched", verb: "run", request: telemetry, response: core.Response{Code: daemon.CodeUnavailable, Error: "dial failed", Exit: 4}, execution: "not launched", persistence: "not attempted"},
 		{name: "ensure scope policy rejection not launched", verb: "run", request: telemetry, response: core.Response{Code: "E_PREFIX_OWNERSHIP_CONFLICT", Error: "prefix owned by another project", Exit: 1}, execution: "not launched", persistence: "not attempted"},
 		{name: "git reports gitops exit", verb: "git", request: core.Request{Verb: "git"}, response: core.Response{Code: "E_GIT_FAILED", Exit: 1, RawData: []byte(`{"exit_code":128}`)}, execution: "gitops exit 128"},
@@ -278,6 +283,7 @@ func TestTUISignalLoopSwallowsDuringExecuteAndCancelsWhenIdle(t *testing.T) {
 	var mu sync.Mutex
 	running := true
 	cancelled := 0
+	processed := make(chan struct{}, 2)
 	done := make(chan struct{})
 	go func() {
 		runTUISignalLoop(ctx, signals, func() bool {
@@ -288,11 +294,15 @@ func TestTUISignalLoopSwallowsDuringExecuteAndCancelsWhenIdle(t *testing.T) {
 			mu.Lock()
 			cancelled++
 			mu.Unlock()
-		})
+		}, func() { processed <- struct{}{} })
 		close(done)
 	}()
 	signals <- syscall.SIGINT
-	time.Sleep(20 * time.Millisecond)
+	select {
+	case <-processed:
+	case <-time.After(time.Second):
+		t.Fatal("signal loop did not process SIGINT while execute was running")
+	}
 	mu.Lock()
 	if cancelled != 0 {
 		mu.Unlock()
@@ -301,15 +311,10 @@ func TestTUISignalLoopSwallowsDuringExecuteAndCancelsWhenIdle(t *testing.T) {
 	running = false
 	mu.Unlock()
 	signals <- syscall.SIGINT
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		mu.Lock()
-		got := cancelled
-		mu.Unlock()
-		if got == 1 {
-			break
-		}
-		time.Sleep(time.Millisecond)
+	select {
+	case <-processed:
+	case <-time.After(time.Second):
+		t.Fatal("signal loop did not process SIGINT while idle")
 	}
 	mu.Lock()
 	got := cancelled
