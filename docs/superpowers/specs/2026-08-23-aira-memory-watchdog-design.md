@@ -1,6 +1,11 @@
 # AIRA memory watchdog — host-OOM bypass-killer (whale→AIRA)
 
-Status: PLAN v2 — **Fable code-gate GATE-PASS** (folded the safety-critical predicate
+Status: PLAN v3 — **Fable RE-GATE GATE-PASS** on the hardened kill-safety (v2 machinery
+confirmed buildable+correct against the code; the 3 re-gate must-fixes now folded:
+interlock **cannot-confirm→refuse** [`is-active` empty/bus-fail must NOT read as
+inactive], `/proc/stat` **parse-after-last-`)`** + **ENOSYS→degrade-not-`kill(2)`**,
+and MemAvailable/latch spec-consistency + tests). Prior: **Fable code-gate GATE-PASS**
+(folded the safety-critical predicate
 fix: "uncapped" = no finite `memory.max` ancestor, else capped whale jobs are
 false-kill victims; + the host-global audit contract) and **Sol adversarial
 plan-review** (folded: hard machine-wide interlock vs whale-watchdog; pidfd/TOCTOU
@@ -128,18 +133,22 @@ the signal a PID can be reused — signalling a raw PID could hit an unrelated (
 important) process. So:
 - At selection, **`pidfd_open(2)`** each target (the offender root + each subtree
   member); the pidfd is a stable handle to *that* process, immune to PID reuse. Signal
-  via **`pidfd_send_signal(2)`** (both cgo-free raw syscalls via `golang.org/x/sys/unix`;
-  kernel ≥ 5.3, this box is 6.x).
+  via **`pidfd_send_signal(2)`** (`PidfdOpen`/`PidfdSendSignal` in the vendored
+  `golang.org/x/sys/unix`, cgo-free; kernel ≥ 5.3, box is 6.x). **`ENOSYS` from either
+  → recorded honest degradation (no kill), NEVER a raw `kill(2)` fallback** (Fable — a
+  fallback reintroduces exactly the TOCTOU this closes).
 - **Re-validate immediately before BOTH SIGTERM and SIGKILL** (not just "still alive"
-  — TERM is already destructive): the process start-time (`/proc/<pid>/stat` field 22)
-  still matches the selection, its cgroup is STILL uncapped (no finite `memory.max`
-  ancestor), and it is STILL not-protected. Any mismatch / unreadable `/proc` data →
-  **disqualify that target, do not signal it**.
+  — TERM is already destructive): the process start-time (`/proc/<pid>/stat` field 22,
+  **parsed AFTER the last `)`** — comm (field 2) may contain spaces/parens, so naive
+  field-splitting mis-indexes — Fable) still matches the selection, its cgroup is STILL
+  uncapped (no finite `memory.max` ancestor), and it is STILL not-protected. Any
+  mismatch / unreadable `/proc` data → **disqualify that target, do not signal it**.
 - **Protection applies to EVERY target in the subtree, not just the root (Sol #4):**
   each subtree member is independently checked (not the AIRA daemon, not PID 1, not a
   system/session-critical unit — "critical" defined mechanically: PID 1, the daemon's
-  own pid/cgroup, and anything whose cgroup is under `init.scope`/a `-.slice`/systemd
-  system units). A reparented or foreign process that drifted into the tree is skipped.
+  own pid/cgroup, and anything whose cgroup PATH has a `/system.slice/` or
+  `/init.scope/` component (Fable: a literal `-.slice` never appears in a cgroup path).
+  A reparented or foreign process that drifted into the tree is skipped.
 - Sequence: SIGTERM the qualifying targets → **5s ctx-aware grace** → re-validate +
   re-check PSI still tripped → **SIGKILL** the survivors that still qualify. Not
   `cgroup.kill` (foreign cgroup we don't own); not SIGKILL-only (graceful chance
@@ -160,14 +169,22 @@ important) process. So:
     load before trusting it.
   - **enforce** — real SIGTERM→SIGKILL, but gated by a **hard machine-wide interlock
     (Sol #1 — off-by-default + docs cannot prevent two killers):** on entering enforce
-    the daemon (a) acquires a machine-wide **kill-authority `flock`** on a well-known
-    path (`$XDG_RUNTIME_DIR/aira-memory-watchdog.lock`) and (b) confirms
-    **whale-watchdog is NOT active** (`systemctl --user is-active whale-watchdog`
-    ≠ active). If the lock is held or whale-watchdog is active, enforce **REFUSES** —
-    it logs the reason and runs as **observe** instead (honest degradation), never a
-    second concurrent killer. Re-checked each armed episode (whale-watchdog could start
-    later). This is the clean whale→aira handoff: the operator stops whale-watchdog,
-    then AIRA's enforce takes authority.
+    the daemon (a) acquires a machine-wide **kill-authority `flock`** (non-blocking) on
+    `$XDG_RUNTIME_DIR/aira-memory-watchdog.lock` (same `XDG_RUNTIME_DIR` fallback as
+    `PathsFromEnv`, `paths.go:121-123`; refuse enforce if unset) and (b) **positively
+    confirms whale-watchdog is inactive — CANNOT-CONFIRM = REFUSE (Fable MUST-FIX,
+    probed live):** `systemctl --user is-active whale-watchdog` prints `active`/exit 0
+    when running, `inactive`/exit 4 for an unknown unit, but on a **bus failure prints
+    EMPTY stdout/exit 1** — so a "≠ active" or exit-code-only reading would treat
+    *cannot-determine* as *inactive* and authorise a SECOND killer on a bus-less
+    daemon. Authorise enforce ONLY on a **clean exec whose stdout is EXACTLY `inactive`
+    or `failed`**; any exec/bus error, empty stdout, or other value → cannot-confirm →
+    **degrade to observe**. If the lock is held or whale-watchdog is (or may be)
+    active, enforce runs as **observe** (honest degradation), never a second concurrent
+    killer. Re-checked each armed episode. Recorded limitation: a **manually-run
+    (non-unit) whale-watchdog is invisible** to `is-active` and the flock — the
+    interlock covers the systemd-managed unit (the normal case). Clean whale→aira
+    handoff: stop whale-watchdog, then AIRA enforce takes authority.
 - `AIRA_DAEMON_WATCHDOG_INTERVAL` — Go duration, default 2s, validated `[1s, 30s)`
   **at startup per the fail-fast `*FromEnv` pattern** (a malformed/out-of-range value
   fails daemon startup regardless of mode — not silently ignored when off — Fable P2).
@@ -207,8 +224,10 @@ events tail, not just `log.Printf`. A failed non-ESRCH kill is recorded as a fai
   died), `exited` (re-validated gone after grace), `escalated_sigkill`, and
   `unresolved` (still present after SIGKILL+grace). **NEVER label "killed" from
   `pidfd_send_signal` returning nil** — that proves delivery, not death; "killed" is
-  claimed only after the target is re-validated gone. Nothing is reported as done that
-  was not done.
+  claimed only after the target is re-validated gone. **Reading rule (Fable P2):** an
+  intent record with NO matching outcome (the daemon crashed between intent and
+  outcome) reads as **`unknown`**, never "killed". Nothing is reported as done that was
+  not done.
 
 ## 6. Daemon integration (grounded)
 
@@ -230,13 +249,16 @@ events tail, not just `log.Printf`. A failed non-ESRCH kill is recorded as a fai
 
 ## 7. Tests (TDD; pure decision logic + gated real-proc)
 
-- **Pure (fixtures via the deps seam):** the PSI parser (`full avg10` extraction,
-  malformed/absent → unevaluated); the hysteresis+debounce state machine (trip only
-  after K sustained; recover; in-band hold; unreadable resets; re-arm after acting);
+- **Pure (fixtures via the deps seam):** the PSI parser (`full` avg10 **AND `total`**
+  extraction, malformed/absent → unevaluated); the trigger state machine (trip only
+  after K sustained on `total`-delta+avg10+low-MemAvailable; recover; in-band hold;
+  unreadable resets; **LATCH after acting** — a SECOND sustained window while still
+  unrecovered must NOT re-kill; re-arm only after a genuine recovery — Fable MUST-FIX);
   the four-predicate offender selection (each predicate independently gates — a
-  confined / non-agent / light / protected candidate is NEVER selected; none-qualifies
-  → defer); mode gating (off = no-op, observe = WOULD-kill-no-signal, enforce = kill);
-  the audit event content. Each proven RED against the wrong impl (both directions).
+  **capped [`.aira-` OR finite-`memory.max`-ancestor]** / non-agent / light / protected
+  candidate is NEVER selected; none-qualifies → defer); mode gating (off = no-op,
+  observe = WOULD-kill-no-signal, enforce = kill); the audit event content. Each proven
+  RED against the wrong impl (both directions).
 - **Kill mechanics (unit, fake kill dep):** SIGTERM→grace→SIGKILL ordering; ESRCH
   tolerated; EPERM → recorded failure; self/PID1/protected never signalled.
 - **Real-proc (gated), with a TINY `minVictimRSS` (Sol #8 — no real-GiB alloc):** a
@@ -256,7 +278,7 @@ events tail, not just `log.Printf`. A failed non-ESRCH kill is recorded as a fai
 
 ## 8. Deferrals (recorded)
 
-MemAvailable corroboration of the PSI trigger; per-cgroup `memory.pressure` victim
+Per-cgroup `memory.pressure` victim
 ranking + recursive cgroup-tree scan; a daemon-published authoritative live `.aira-*`
 scope registry (the `/proc/<pid>/cgroup` test suffices for now); auto-detect-and-refuse
 when whale-watchdog is running (documented interlock only); `nice`/`memory.high`
