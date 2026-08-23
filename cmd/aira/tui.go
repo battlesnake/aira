@@ -34,6 +34,7 @@ type tuiRuntime struct {
 	outerPages           *tview.Pages
 	panelPages           *tview.Pages
 	tabs                 *tview.TextView
+	detachedStatus       *tview.TextView
 	tables               map[tuiView]*tview.Table
 	details              map[tuiView]*tview.TextView
 	footers              map[tuiView]*tview.TextView
@@ -58,6 +59,7 @@ type tuiRuntime struct {
 	executeDispatcher    Dispatcher
 	canExecute           bool
 	executeRunning       atomic.Bool
+	detachedSubmitting   atomic.Bool
 	suspend              func(func()) bool
 	scope                daemon.WorktreeScope
 	stdin                io.Reader
@@ -107,7 +109,7 @@ func newTUIRuntime(parent context.Context, dispatcher, executeDispatcher Dispatc
 	if screen != nil {
 		runtime.app.SetScreen(screen)
 	}
-	runtime.executor = newTUIExecutor(ctx, dispatcher, scope, 4)
+	runtime.executor = newTUIExecutor(ctx, dispatcher, executeDispatcher, scope, 4)
 	runtime.buildWidgets()
 	runtime.suspend = runtime.app.Suspend
 	return runtime
@@ -168,7 +170,11 @@ func (r *tuiRuntime) buildWidgets() {
 		}
 		r.panelPages.AddPage(string(view), content, true, false)
 	}
-	dashboard := tview.NewFlex().SetDirection(tview.FlexRow).AddItem(r.tabs, 1, 0, false).AddItem(r.panelPages, 0, 1, true)
+	r.detachedStatus = tview.NewTextView().SetWrap(true)
+	dashboard := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(r.tabs, 1, 0, false).
+		AddItem(r.detachedStatus, 2, 0, false).
+		AddItem(r.panelPages, 0, 1, true)
 	r.paletteList = r.makePaletteList()
 	r.outerPages = tview.NewPages().
 		AddPage(dashboardPage, dashboard, true, true).
@@ -344,6 +350,9 @@ func (r *tuiRuntime) applyAsync(message tuiMessage) {
 		r.state, commands = onTUIDetailResult(r.state, message.Detail)
 	case msgExecuteResume:
 		r.state, commands = onExecuteResume(r.state)
+	case msgExecuteDetachedResult:
+		r.state = onExecuteDetachedResult(r.state, message.DetachedResult)
+		r.detachedSubmitting.Store(false)
 	}
 	r.submitCommands(commands)
 }
@@ -366,6 +375,7 @@ func (r *tuiRuntime) render() {
 		tabNames = append(tabNames, name)
 	}
 	r.tabs.SetText(strings.Join(tabNames, "  ") + "    r refresh  : palette  x execute  q quit")
+	r.detachedStatus.SetText(r.state.DetachedReport)
 	r.panelPages.SwitchToPage(string(r.state.Active))
 	for _, view := range allViews {
 		if view == viewInsights {
@@ -834,10 +844,14 @@ func (r *tuiRuntime) showExecuteConfirmation() {
 	} else {
 		text += "\n\n" + executeRequestText(launch.Request)
 	}
+	mode := "foreground"
+	if launch.Detached {
+		mode = "detached"
+	}
 	details := tview.NewTextView().SetWrap(true).SetText(text)
-	details.SetBorder(true).SetTitle(" Resolved foreground request ")
+	details.SetBorder(true).SetTitle(" Resolved " + mode + " request ")
 	form := tview.NewForm()
-	form.SetBorder(true).SetTitle(" Confirm foreground action ")
+	form.SetBorder(true).SetTitle(" Confirm " + mode + " action ")
 	r.executeSubmit = nil
 	r.executeSubmitButton = nil
 	r.executeConfirmAction = r.confirmExecuteOnUI
@@ -881,6 +895,13 @@ func executeRequestText(request core.Request) string {
 }
 
 func (r *tuiRuntime) executeLaunchOnUI(launch executeLaunch) {
+	if launch.Detached {
+		if !r.detachedSubmitting.CompareAndSwap(false, true) {
+			return
+		}
+		r.executeDetachedLaunchOnUIGuarded(launch)
+		return
+	}
 	if !r.executeRunning.CompareAndSwap(false, true) {
 		return
 	}
@@ -888,6 +909,20 @@ func (r *tuiRuntime) executeLaunchOnUI(launch executeLaunch) {
 }
 
 func (r *tuiRuntime) confirmExecuteOnUI() {
+	pending := r.state.ExecuteConfirm
+	if pending != nil && pending.Detached {
+		if !r.detachedSubmitting.CompareAndSwap(false, true) {
+			return
+		}
+		var launch *executeLaunch
+		r.state, launch = onExecuteConfirm(r.state)
+		if launch == nil {
+			r.detachedSubmitting.Store(false)
+			return
+		}
+		r.executeDetachedLaunchOnUIGuarded(*launch)
+		return
+	}
 	// Publish the atomic signal guard before changing reducer state so there is
 	// no confirm→Suspend window in which SIGINT could cancel the TUI.
 	if !r.executeRunning.CompareAndSwap(false, true) {
@@ -900,6 +935,27 @@ func (r *tuiRuntime) confirmExecuteOnUI() {
 		return
 	}
 	r.executeLaunchOnUIGuarded(*launch)
+}
+
+func (r *tuiRuntime) executeDetachedLaunchOnUIGuarded(launch executeLaunch) {
+	r.state.ExecuteOpen = false
+	r.state.ExecuteSelected = nil
+	r.state.ExecuteConfirm = nil
+	r.state.ExecuteError = ""
+	r.state.DetachedReport = "detached run submitting…"
+	r.resetExecuteWidgets()
+	r.outerPages.HidePage(executePage).HidePage(executeConfirmPage).SwitchToPage(dashboardPage)
+	if table := r.tables[r.state.Active]; table != nil {
+		r.app.SetFocus(table)
+	} else {
+		r.app.SetFocus(r.insights)
+	}
+	r.render()
+	if !r.executor.submitDetached(launch) {
+		r.state.DetachedReport = "detached run not launched: E_TUI_EXECUTE_UNAVAILABLE"
+		r.detachedSubmitting.Store(false)
+		r.render()
+	}
 }
 
 func (r *tuiRuntime) executeLaunchOnUIGuarded(launch executeLaunch) {

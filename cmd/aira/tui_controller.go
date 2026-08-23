@@ -89,6 +89,7 @@ type tuiState struct {
 	ExecuteConfirm        *executeLaunch
 	ExecuteRunning        bool
 	ExecuteError          string
+	DetachedReport        string
 	ShuttingDown          bool
 	ReconnectAttempt      int
 }
@@ -127,7 +128,8 @@ const (
 	cmdScheduleRefresh
 	cmdReconnect
 	cmdQuit
-	cmdPalette // executor-only; never emitted by a controller transition
+	cmdPalette         // executor-only; never emitted by a controller transition
+	cmdExecuteDetached // executor-only; never emitted by a controller transition
 )
 
 // tuiCmd contains only values (Palette is executor-only). The executor
@@ -139,6 +141,7 @@ type tuiCmd struct {
 	Backoff    time.Duration
 	DetailID   string
 	Palette    *core.Request
+	Execute    *executeLaunch
 }
 
 type fetchResult struct {

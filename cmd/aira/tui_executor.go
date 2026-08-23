@@ -26,6 +26,7 @@ const (
 	msgRefreshDue
 	msgDetailResult
 	msgExecuteResume
+	msgExecuteDetachedResult
 )
 
 type tuiMessage struct {
@@ -38,6 +39,7 @@ type tuiMessage struct {
 	PaletteOutcome paletteOutcome
 	View           tuiView
 	Detail         detailResult
+	DetachedResult executeDetachedResult
 }
 
 type paletteSendEvidence uint8
@@ -73,28 +75,30 @@ type tuiJob struct {
 	View       tuiView
 	Generation int
 	Palette    *core.Request
+	Detached   *executeLaunch
 	DetailID   string
 }
 
 type tuiExecutor struct {
-	ctx        context.Context
-	dispatcher Dispatcher
-	scope      daemon.WorktreeScope
-	mu         sync.Mutex
-	queue      []tuiCmd
-	wake       chan struct{}
-	jobs       chan tuiJob
-	messages   chan tuiMessage
-	reconnect  chan struct{}
-	wg         sync.WaitGroup
+	ctx               context.Context
+	dispatcher        Dispatcher
+	executeDispatcher Dispatcher
+	scope             daemon.WorktreeScope
+	mu                sync.Mutex
+	queue             []tuiCmd
+	wake              chan struct{}
+	jobs              chan tuiJob
+	messages          chan tuiMessage
+	reconnect         chan struct{}
+	wg                sync.WaitGroup
 }
 
-func newTUIExecutor(ctx context.Context, dispatcher Dispatcher, scope daemon.WorktreeScope, workers int) *tuiExecutor {
+func newTUIExecutor(ctx context.Context, dispatcher, executeDispatcher Dispatcher, scope daemon.WorktreeScope, workers int) *tuiExecutor {
 	if workers < 1 {
 		workers = 1
 	}
 	executor := &tuiExecutor{
-		ctx: ctx, dispatcher: dispatcher, scope: scope,
+		ctx: ctx, dispatcher: dispatcher, executeDispatcher: executeDispatcher, scope: scope,
 		wake: make(chan struct{}, 1), jobs: make(chan tuiJob, workers*2),
 		messages: make(chan tuiMessage, 64), reconnect: make(chan struct{}, 1),
 	}
@@ -131,6 +135,11 @@ func (e *tuiExecutor) submitPalette(request core.Request) bool {
 	return e.submit(tuiCmd{Kind: cmdPalette, Palette: &request})
 }
 
+func (e *tuiExecutor) submitDetached(launch executeLaunch) bool {
+	launch = cloneExecuteLaunch(launch)
+	return e.submit(tuiCmd{Kind: cmdExecuteDetached, Execute: &launch})
+}
+
 func (e *tuiExecutor) wait() { e.wg.Wait() }
 
 func (e *tuiExecutor) drainQueue() []tuiCmd {
@@ -160,6 +169,12 @@ func (e *tuiExecutor) commandLoop() {
 			case cmdPalette:
 				select {
 				case e.jobs <- tuiJob{Palette: command.Palette}:
+				case <-e.ctx.Done():
+					return
+				}
+			case cmdExecuteDetached:
+				select {
+				case e.jobs <- tuiJob{Detached: command.Execute}:
 				case <-e.ctx.Done():
 					return
 				}
@@ -203,6 +218,11 @@ func (e *tuiExecutor) worker() {
 		case <-e.ctx.Done():
 			return
 		case job := <-e.jobs:
+			if job.Detached != nil {
+				result := dispatchDetachedExecute(e.ctx, e.executeDispatcher, e.scope, *job.Detached)
+				e.deliver(tuiMessage{Kind: msgExecuteDetachedResult, DetachedResult: result})
+				continue
+			}
 			if job.Palette != nil {
 				result := executePaletteRequest(e.ctx, e.dispatcher, e.scope, *job.Palette)
 				e.deliver(tuiMessage{Kind: msgPaletteResult, PaletteResult: result.Text, PaletteOutcome: result.Outcome})

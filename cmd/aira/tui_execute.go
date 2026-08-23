@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -25,6 +26,7 @@ type executeLaunch struct {
 	Entry       executeEntry
 	Request     core.Request
 	ConfineText string
+	Detached    bool
 }
 
 type executeReport struct {
@@ -110,6 +112,7 @@ func onExecuteSubmit(state tuiState, line string) (tuiState, error) {
 		launch.ConfineText, err = renderConfineCommand(line)
 	} else {
 		launch.Request, err = parseExecuteRequest(entry.Verb, line)
+		launch.Detached, _ = launch.Request.Args["detach"].(bool)
 	}
 	if err != nil {
 		state.ExecuteError = err.Error()
@@ -126,8 +129,13 @@ func onExecuteConfirm(state tuiState) (tuiState, *executeLaunch) {
 		return state, nil
 	}
 	launch := cloneExecuteLaunch(*state.ExecuteConfirm)
-	state.ExecuteRunning = true
 	state.ExecuteConfirm = nil
+	if launch.Detached {
+		state.ExecuteOpen = false
+		state.ExecuteSelected = nil
+	} else {
+		state.ExecuteRunning = true
+	}
 	return state, &launch
 }
 
@@ -277,11 +285,6 @@ func parseExecuteRequest(verb, line string) (core.Request, error) {
 	if _, route := core.ClassifyRequest(request); route != core.RouteClient {
 		return core.Request{}, fmt.Errorf("E_TUI_EXECUTE_ROUTE: %s is not client-routed", verb)
 	}
-	if verb == "run" {
-		if detached, _ := request.Args["detach"].(bool); detached {
-			return core.Request{}, errors.New("E_TUI_EXECUTE_ARGV: detached run is unavailable from the foreground launcher")
-		}
-	}
 	return request, nil
 }
 
@@ -326,6 +329,81 @@ func dispatchExecuteLaunch(ctx context.Context, dispatcher Dispatcher, scope dae
 	}
 	response := dispatcher.Dispatch(ctx, scope, launch.Request)
 	return classifyExecuteResponse(launch.Entry.Verb, launch.Request, response)
+}
+
+type executeDetachedState string
+
+const (
+	executeDetachedAccepted    executeDetachedState = "accepted"
+	executeDetachedNotLaunched executeDetachedState = "not-launched"
+	executeDetachedUnknown     executeDetachedState = "unknown"
+)
+
+const executeDetachedProtocolCode = "E_TUI_EXECUTE_PROTOCOL"
+
+type executeDetachedResult struct {
+	State executeDetachedState
+	ID    string
+	Code  string
+}
+
+func (r executeDetachedResult) String() string {
+	switch r.State {
+	case executeDetachedAccepted:
+		return "detached run accepted: " + r.ID + " — supervisor released; admission + outcome pending, see run-log / show " + r.ID
+	case executeDetachedUnknown:
+		return "detached run launch status unknown — supervisor release acknowledgement failed"
+	default:
+		if r.Code == executeDetachedProtocolCode {
+			return "detached run not launched: " + r.Code + " — protocol error: OK response missing a valid RUN-id or supervisor-release callback"
+		}
+		return "detached run not launched: " + r.Code
+	}
+}
+
+func dispatchDetachedExecute(ctx context.Context, dispatcher Dispatcher, scope daemon.WorktreeScope, launch executeLaunch) executeDetachedResult {
+	if dispatcher == nil || !launch.Entry.Enabled {
+		return executeDetachedResult{State: executeDetachedNotLaunched, Code: "E_TUI_EXECUTE_UNAVAILABLE"}
+	}
+	response := dispatcher.Dispatch(ctx, scope, launch.Request)
+	return classifyDetachedExecuteResponse(response)
+}
+
+func classifyDetachedExecuteResponse(response core.Response) executeDetachedResult {
+	if !response.OK {
+		code := response.Code
+		if code == "" {
+			code = executeDetachedProtocolCode
+		}
+		return executeDetachedResult{State: executeDetachedNotLaunched, Code: code}
+	}
+	data := decodeExecuteData(response)
+	if !validDetachedRunID(data.ID) || response.AfterWrite == nil {
+		if response.AfterWrite != nil {
+			_ = response.AfterWrite(false)
+		}
+		return executeDetachedResult{State: executeDetachedNotLaunched, Code: executeDetachedProtocolCode}
+	}
+	if err := response.AfterWrite(true); err != nil {
+		_ = response.AfterWrite(false)
+		return executeDetachedResult{State: executeDetachedUnknown}
+	}
+	return executeDetachedResult{State: executeDetachedAccepted, ID: data.ID}
+}
+
+func validDetachedRunID(id string) bool {
+	if !strings.HasPrefix(id, "RUN-") {
+		return false
+	}
+	number := strings.TrimPrefix(id, "RUN-")
+	value, err := strconv.ParseUint(number, 10, 64)
+	return err == nil && value > 0 && strconv.FormatUint(value, 10) == number
+}
+
+func onExecuteDetachedResult(state tuiState, result executeDetachedResult) tuiState {
+	state = cloneTUIState(state)
+	state.DetachedReport = result.String()
+	return state
 }
 
 func classifyExecuteResponse(verb string, request core.Request, response core.Response) executeReport {
@@ -417,6 +495,7 @@ func executeNotLaunchedCode(code string) bool {
 }
 
 type executeData struct {
+	ID       string `json:"id"`
 	Status   string `json:"status"`
 	ExitCode *int   `json:"exit_code"`
 	Wiring   struct {

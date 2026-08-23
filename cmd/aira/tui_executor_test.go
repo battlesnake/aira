@@ -90,7 +90,7 @@ func (d *countingDispatcher) Dispatch(_ context.Context, _ daemon.WorktreeScope,
 func TestExecutorSubmitIsLosslessUnderSaturation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	executor := newTUIExecutor(ctx, &countingDispatcher{}, daemon.WorktreeScope{}, 2)
+	executor := newTUIExecutor(ctx, &countingDispatcher{}, nil, daemon.WorktreeScope{}, 2)
 
 	const n = 500
 	for i := 0; i < n; i++ {

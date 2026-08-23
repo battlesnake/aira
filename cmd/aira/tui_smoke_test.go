@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -239,7 +240,7 @@ func TestTUIConfirmationRequiresFocusedConfirmEnterAndDispatchesOnce(t *testing.
 		screen.InjectKey(tcell.KeyRune, ch, tcell.ModNone)
 	}
 	screen.InjectKey(tcell.KeyTab, 0, tcell.ModNone)
-	time.Sleep(20 * time.Millisecond)
+	waitForButtonFocusOnUI(t, runtime, runtime.paletteSubmitButton)
 	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone) // form submit only.
 	time.Sleep(20 * time.Millisecond)
 	waitForSimulationText(t, runtime, screen, "Confirm mutation")
@@ -263,7 +264,7 @@ func TestTUIConfirmationRequiresFocusedConfirmEnterAndDispatchesOnce(t *testing.
 		screen.InjectKey(tcell.KeyRune, ch, tcell.ModNone)
 	}
 	screen.InjectKey(tcell.KeyTab, 0, tcell.ModNone)
-	time.Sleep(20 * time.Millisecond)
+	waitForButtonFocusOnUI(t, runtime, runtime.paletteSubmitButton)
 	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone)
 	time.Sleep(20 * time.Millisecond)
 	waitForSimulationText(t, runtime, screen, "Confirm mutation")
@@ -415,6 +416,25 @@ func assertConfirmCancelFocused(t *testing.T, runtime *tuiRuntime) {
 	case <-time.After(time.Second):
 		t.Fatal("reading confirmation focus deadlocked")
 	}
+}
+
+func waitForButtonFocusOnUI(t *testing.T, runtime *tuiRuntime, button *tview.Button) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		result := make(chan bool, 1)
+		go runtime.app.QueueUpdate(func() { result <- button.HasFocus() })
+		select {
+		case focused := <-result:
+			if focused {
+				return
+			}
+		case <-time.After(time.Second):
+			t.Fatal("reading form button focus deadlocked")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("form submit button did not receive focus")
 }
 
 func setConfirmIDOnUI(t *testing.T, runtime *tuiRuntime, value string) {
@@ -657,6 +677,72 @@ func TestTUIExecuteLauncherSuspendsDispatchesAndResumes(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("execute smoke TUI did not quit")
+	}
+}
+
+// covers: the real tview path submits detach through the executor, releases the
+// supervisor before rendering acceptance, and returns directly to a live
+// dashboard without suspending or touching foreground terminal streams.
+func TestTUIDetachedExecuteRendersAcceptedWithoutSuspend(t *testing.T) {
+	dashboard := &tuiSmokeDispatcher{started: make(chan struct{})}
+	var acknowledged atomic.Bool
+	execute := &executeRouteRecorder{response: core.Response{
+		OK: true, Code: "OK", RawData: []byte(`{"id":"RUN-61","status":"starting"}`),
+		AfterWrite: func(delivered bool) error {
+			acknowledged.Store(delivered)
+			return nil
+		},
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	screen := tcell.NewSimulationScreen("UTF-8")
+	screen.SetSize(130, 38)
+	var stdout, stderr bytes.Buffer
+	runtime := newTUIRuntime(ctx, dashboard, execute, daemon.WorktreeScope{}, strings.NewReader("\n"), &stdout, &stderr, screen)
+	var suspended atomic.Bool
+	runtime.suspend = func(func()) bool {
+		suspended.Store(true)
+		return false
+	}
+	done := make(chan error, 1)
+	go func() { done <- runtime.run() }()
+	waitForSimulationText(t, runtime, screen, "1:Tickets")
+
+	screen.InjectKey(tcell.KeyRune, 'x', tcell.ModNone)
+	waitForSimulationText(t, runtime, screen, "Foreground execute")
+	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone) // run
+	waitForSimulationText(t, runtime, screen, "arguments (include --)")
+	for _, ch := range "--detach -- true" {
+		screen.InjectKey(tcell.KeyRune, ch, tcell.ModNone)
+	}
+	screen.InjectKey(tcell.KeyTab, 0, tcell.ModNone)
+	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone)
+	waitForSimulationText(t, runtime, screen, "Confirm detached action")
+	screen.InjectKey(tcell.KeyTab, 0, tcell.ModNone) // Cancel -> Confirm.
+	screen.InjectKey(tcell.KeyEnter, 0, tcell.ModNone)
+	text := waitForSimulationText(t, runtime, screen, "detached run accepted: RUN-61")
+	if !strings.Contains(text, "supervisor released;") || !strings.Contains(text, "admission + outcome") || strings.Contains(text, "child started") {
+		t.Fatalf("detached status was dishonest:\n%s", text)
+	}
+	if !acknowledged.Load() || suspended.Load() || runtime.executeRunning.Load() || runtime.state.ExecuteRunning {
+		t.Fatalf("detached seams ack=%v suspended=%v atomic=%v state=%v", acknowledged.Load(), suspended.Load(), runtime.executeRunning.Load(), runtime.state.ExecuteRunning)
+	}
+	if stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("detached path wrote terminal stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	dispatch, palette, route := execute.counts()
+	if dispatch != 1 || palette != 0 || route != core.RouteClient {
+		t.Fatalf("detached routes dispatch=%d palette=%d route=%v", dispatch, palette, route)
+	}
+
+	screen.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("detached execute smoke TUI did not quit")
 	}
 }
 

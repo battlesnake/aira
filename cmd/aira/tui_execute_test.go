@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -114,14 +116,229 @@ func TestParseExecuteRequestMatchesCLIAndStoreFreeCarved(t *testing.T) {
 			t.Fatalf("%s missing delimiter error=%v", verb, err)
 		}
 	}
-	if _, err := parseExecuteRequest("run", `--detach -- true`); err == nil || !strings.Contains(err.Error(), "detached run is unavailable") {
-		t.Fatalf("foreground launcher accepted detached run: %v", err)
+	detached, err := parseExecuteRequest("run", `--detach -- true`)
+	if err != nil || detached.Args["detach"] != true {
+		t.Fatalf("detached run request=%#v err=%v", detached, err)
+	}
+	for _, verb := range []string{"git", "time"} {
+		if _, err := parseExecuteRequest(verb, `--detach -- true`); err == nil {
+			t.Fatalf("%s accepted --detach", verb)
+		}
 	}
 	gitReq, err := parseExecuteRequest("git", `-- fetch origin`)
 	if err != nil || gitReq.Args["subverb"] != "fetch" || gitReq.Args["remote"] != "origin" {
 		t.Fatalf("git request=%#v err=%v", gitReq, err)
 	}
 }
+
+func TestExecuteSubmitMarksDetachedLaunchWithoutForegroundRunning(t *testing.T) {
+	state := onExecuteOpen(newTUIState(8))
+	state = onExecuteSelect(state, executeEntryMap(buildExecuteList(core.New(nil).DispatchDescriptors(), true))["run"])
+	state, err := onExecuteSubmit(state, `--detach -- true`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.ExecuteConfirm == nil || !state.ExecuteConfirm.Detached {
+		t.Fatalf("detached launch=%#v", state.ExecuteConfirm)
+	}
+	state, launch := onExecuteConfirm(state)
+	if launch == nil || !launch.Detached || state.ExecuteRunning {
+		t.Fatalf("confirm launch=%#v running=%v", launch, state.ExecuteRunning)
+	}
+}
+
+func TestDetachedExecuteThreeStateAndAfterWriteContract(t *testing.T) {
+	tests := []struct {
+		name           string
+		response       func(*[]bool) core.Response
+		wantState      executeDetachedState
+		wantText       string
+		unwantedText   string
+		wantAfterWrite []bool
+	}{
+		{
+			name: "accepted only after supervisor release",
+			response: func(calls *[]bool) core.Response {
+				return core.Response{OK: true, Code: "OK", RawData: []byte(`{"id":"RUN-58","status":"starting"}`), AfterWrite: func(delivered bool) error {
+					*calls = append(*calls, delivered)
+					return nil
+				}}
+			},
+			wantState: executeDetachedAccepted, wantText: "detached run accepted: RUN-58 — supervisor released; admission + outcome pending, see run-log / show RUN-58",
+			unwantedText: "child started", wantAfterWrite: []bool{true},
+		},
+		{
+			name: "any error is definitely not launched and nil callback is safe",
+			response: func(*[]bool) core.Response {
+				return core.Response{Code: "E_RUN_CAP_UNAVAILABLE", Error: "cap failed"}
+			},
+			wantState: executeDetachedNotLaunched, wantText: "not launched: E_RUN_CAP_UNAVAILABLE", unwantedText: "unknown",
+		},
+		{
+			name: "ack write error is the sole unknown state",
+			response: func(calls *[]bool) core.Response {
+				return core.Response{OK: true, Code: "OK", Data: map[string]any{"id": "RUN-59"}, AfterWrite: func(delivered bool) error {
+					*calls = append(*calls, delivered)
+					if delivered {
+						return errors.New("ack pipe closed")
+					}
+					return nil
+				}}
+			},
+			wantState: executeDetachedUnknown, wantText: "launch status unknown", unwantedText: "RUN-59", wantAfterWrite: []bool{true, false},
+		},
+		{
+			name: "missing id is a cancelling protocol error",
+			response: func(calls *[]bool) core.Response {
+				return core.Response{OK: true, Code: "OK", RawData: []byte(`{"status":"starting"}`), AfterWrite: func(delivered bool) error {
+					*calls = append(*calls, delivered)
+					return nil
+				}}
+			},
+			wantState: executeDetachedNotLaunched, wantText: "protocol error", unwantedText: "accepted", wantAfterWrite: []bool{false},
+		},
+		{
+			name: "missing release callback is a protocol error",
+			response: func(*[]bool) core.Response {
+				return core.Response{OK: true, Code: "OK", Data: map[string]any{"id": "RUN-60"}}
+			},
+			wantState: executeDetachedNotLaunched, wantText: "protocol error", unwantedText: "accepted",
+		},
+		{
+			name: "malformed id is a cancelling protocol error",
+			response: func(calls *[]bool) core.Response {
+				return core.Response{OK: true, Code: "OK", Data: map[string]any{"id": "RUN-not-a-number"}, AfterWrite: func(delivered bool) error {
+					*calls = append(*calls, delivered)
+					return nil
+				}}
+			},
+			wantState: executeDetachedNotLaunched, wantText: "protocol error", unwantedText: "accepted", wantAfterWrite: []bool{false},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := []bool(nil)
+			result := classifyDetachedExecuteResponse(test.response(&calls))
+			if result.State != test.wantState || !strings.Contains(result.String(), test.wantText) || test.unwantedText != "" && strings.Contains(result.String(), test.unwantedText) {
+				t.Fatalf("result=%#v text=%q want state=%q containing=%q without=%q", result, result.String(), test.wantState, test.wantText, test.unwantedText)
+			}
+			if !reflect.DeepEqual(calls, test.wantAfterWrite) {
+				t.Fatalf("AfterWrite calls=%v want=%v", calls, test.wantAfterWrite)
+			}
+		})
+	}
+}
+
+type panicTerminalReader struct{}
+
+func (panicTerminalReader) Read([]byte) (int, error) { panic("detached path read stdin") }
+
+type panicTerminalWriter struct{}
+
+func (panicTerminalWriter) Write([]byte) (int, error) { panic("detached path wrote terminal output") }
+
+type blockingDetachedDispatcher struct {
+	started      chan struct{}
+	release      chan struct{}
+	dispatches   atomic.Int32
+	paletteCalls atomic.Int32
+	acknowledged atomic.Bool
+}
+
+func (d *blockingDetachedDispatcher) Dispatch(_ context.Context, _ daemon.WorktreeScope, request core.Request) core.Response {
+	d.dispatches.Add(1)
+	if _, route := core.ClassifyRequest(request); route != core.RouteClient {
+		panic("detached execute did not use RouteClient")
+	}
+	select {
+	case d.started <- struct{}{}:
+	default:
+	}
+	<-d.release
+	return core.Response{OK: true, Code: "OK", Data: map[string]any{"id": "RUN-60"}, AfterWrite: func(delivered bool) error {
+		d.acknowledged.Store(delivered)
+		return nil
+	}}
+}
+
+func (d *blockingDetachedDispatcher) DispatchPalette(context.Context, daemon.WorktreeScope, core.Request) paletteDispatchAttempt {
+	d.paletteCalls.Add(1)
+	return paletteDispatchAttempt{Err: errors.New("wrong route"), Send: paletteSendNotSent}
+}
+
+func TestDetachedConfirmIsAsyncGuardedAndTerminalIndependent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	dispatcher := &blockingDetachedDispatcher{started: make(chan struct{}, 1), release: make(chan struct{})}
+	runtime := newTUIRuntime(ctx, &tuiSmokeDispatcher{started: make(chan struct{})}, dispatcher,
+		daemon.WorktreeScope{}, panicTerminalReader{}, panicTerminalWriter{}, panicTerminalWriter{}, nil)
+	var suspends atomic.Int32
+	runtime.suspend = func(func()) bool {
+		suspends.Add(1)
+		return true
+	}
+	state := onExecuteOpen(runtime.state)
+	state = onExecuteSelect(state, executeEntryMap(buildExecuteList(runtime.descriptors, true))["run"])
+	var err error
+	state, err = onExecuteSubmit(state, `--detach -- true`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.state = state
+	repeated := cloneExecuteLaunch(*state.ExecuteConfirm)
+
+	startedAt := time.Now()
+	runtime.confirmExecuteOnUI()
+	if time.Since(startedAt) > time.Second {
+		t.Fatal("detached confirm blocked the UI caller")
+	}
+	select {
+	case <-dispatcher.started:
+	case <-time.After(time.Second):
+		t.Fatal("detached executor job did not dispatch")
+	}
+	// Re-present the exact same immutable confirmation while the first job is
+	// blocked. The atomic in-flight guard, not merely reducer state clearing,
+	// must reject this second confirm.
+	runtime.state.ExecuteOpen = true
+	runtime.state.ExecuteConfirm = &repeated
+	runtime.confirmExecuteOnUI()
+	select {
+	case <-dispatcher.started:
+		t.Fatal("double confirm enqueued a second detached dispatch")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := dispatcher.dispatches.Load(); got != 1 {
+		t.Fatalf("double confirm dispatched %d times", got)
+	}
+	if runtime.executeRunning.Load() || runtime.state.ExecuteRunning || suspends.Load() != 0 {
+		t.Fatalf("detached path owned foreground seam: atomic=%v state=%v suspends=%d", runtime.executeRunning.Load(), runtime.state.ExecuteRunning, suspends.Load())
+	}
+	close(dispatcher.release)
+	var message tuiMessage
+	deadline := time.After(time.Second)
+	for message.Kind != msgExecuteDetachedResult {
+		select {
+		case message = <-runtime.executor.messages:
+		case <-deadline:
+			t.Fatal("detached result was not delivered through executor messages")
+		}
+	}
+	if !dispatcher.acknowledged.Load() {
+		t.Fatal("accepted result was reported before AfterWrite(true)")
+	}
+	runtime.applyAsync(message)
+	if runtime.detachedSubmitting.Load() || !strings.Contains(runtime.state.DetachedReport, "accepted: RUN-60") {
+		t.Fatalf("detached completion guard=%v report=%q", runtime.detachedSubmitting.Load(), runtime.state.DetachedReport)
+	}
+	if dispatcher.paletteCalls.Load() != 0 {
+		t.Fatalf("detached execute called DispatchPalette %d times", dispatcher.paletteCalls.Load())
+	}
+	cancel()
+	runtime.executor.wait()
+}
+
+var _ io.Reader = panicTerminalReader{}
+var _ io.Writer = panicTerminalWriter{}
 
 func TestExecuteControllerConfirmIsExactlyOnce(t *testing.T) {
 	state := newTUIState(8)
