@@ -1,6 +1,22 @@
 package store
 
-import "context"
+import (
+	"context"
+	"database/sql"
+)
+
+// AppendWatchdogEvent appends one host-watchdog decision to this project scope.
+// The daemon is the single caller and broadcasts the same decision to each ready
+// project so host-global safety actions remain visible in project-scoped watches.
+func (s *Store) AppendWatchdogEvent(ctx context.Context, verb, target string) error {
+	return s.withImmediate(ctx, func(conn *sql.Conn) error {
+		seq, err := nextSequence(ctx, conn, s.projectID)
+		if err != nil {
+			return err
+		}
+		return insertEventActor(ctx, conn, s.projectID, seq, "aira-watchdog", verb, target)
+	})
+}
 
 // WatchEvent is the durable event header exposed by the daemon watch API.
 // Seq is the ordering authority; At is advisory wall-clock evidence.

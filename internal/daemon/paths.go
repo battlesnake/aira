@@ -33,7 +33,41 @@ const (
 	defaultJournalFlushInterval = 60 * time.Second
 	defaultWatchPollInterval    = 500 * time.Millisecond
 	defaultAdmitPollInterval    = 250 * time.Millisecond
+	defaultWatchdogInterval     = 2 * time.Second
 )
+
+type watchdogMode string
+
+const (
+	watchdogOff     watchdogMode = "off"
+	watchdogObserve watchdogMode = "observe"
+	watchdogEnforce watchdogMode = "enforce"
+)
+
+func watchdogModeFromEnv() (watchdogMode, error) {
+	mode := watchdogMode(strings.TrimSpace(os.Getenv("AIRA_DAEMON_WATCHDOG_MODE")))
+	if mode == "" {
+		return watchdogOff, nil
+	}
+	switch mode {
+	case watchdogOff, watchdogObserve, watchdogEnforce:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_WATCHDOG_MODE must be off, observe, or enforce")
+	}
+}
+
+func watchdogIntervalFromEnv() (time.Duration, error) {
+	value := strings.TrimSpace(os.Getenv("AIRA_DAEMON_WATCHDOG_INTERVAL"))
+	if value == "" {
+		return defaultWatchdogInterval, nil
+	}
+	interval, err := time.ParseDuration(value)
+	if err != nil || interval < time.Second || interval >= 30*time.Second {
+		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_WATCHDOG_INTERVAL must be a Go duration in [1s,30s)")
+	}
+	return interval, nil
+}
 
 func admitPollIntervalFromEnv() (time.Duration, error) {
 	value, set := os.LookupEnv("AIRA_DAEMON_ADMIT_POLL_INTERVAL")

@@ -151,6 +151,49 @@ func TestMalformedRegistryDiscoveryIntervalFailsDaemonStartup(t *testing.T) {
 	}
 }
 
+func TestWatchdogConfigFromEnv(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode, interval string
+		wantMode             watchdogMode
+		wantInterval         time.Duration
+		wantErr              bool
+	}{
+		{name: "defaults", wantMode: watchdogOff, wantInterval: 2 * time.Second},
+		{name: "observe", mode: "observe", interval: "1s", wantMode: watchdogObserve, wantInterval: time.Second},
+		{name: "enforce", mode: "enforce", interval: "29.999s", wantMode: watchdogEnforce, wantInterval: 29999 * time.Millisecond},
+		{name: "bad mode", mode: "yes", wantErr: true},
+		{name: "too short", interval: "999ms", wantErr: true},
+		{name: "upper bound", interval: "30s", wantErr: true},
+		{name: "malformed while off", mode: "off", interval: "bad", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("AIRA_DAEMON_WATCHDOG_MODE", tc.mode)
+			t.Setenv("AIRA_DAEMON_WATCHDOG_INTERVAL", tc.interval)
+			mode, modeErr := watchdogModeFromEnv()
+			interval, intervalErr := watchdogIntervalFromEnv()
+			if (modeErr != nil || intervalErr != nil) != tc.wantErr {
+				t.Fatalf("mode=%q interval=%v errors=(%v,%v) wantErr=%v", mode, interval, modeErr, intervalErr, tc.wantErr)
+			}
+			if !tc.wantErr && (mode != tc.wantMode || interval != tc.wantInterval) {
+				t.Fatalf("mode=%q interval=%v want %q %v", mode, interval, tc.wantMode, tc.wantInterval)
+			}
+		})
+	}
+}
+
+func TestMalformedWatchdogIntervalFailsDaemonStartupEvenWhenOff(t *testing.T) {
+	paths := testPaths(t)
+	t.Setenv("AIRA_DAEMON_WATCHDOG_MODE", "off")
+	t.Setenv("AIRA_DAEMON_WATCHDOG_INTERVAL", "eventually")
+	err := NewServer(paths).Serve(context.Background())
+	if err == nil || !strings.HasPrefix(err.Error(), "E_CONFIG_INVALID:") {
+		t.Fatalf("Serve error=%v, want E_CONFIG_INVALID", err)
+	}
+	if _, statErr := os.Stat(paths.RuntimeDir); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("malformed config touched runtime directory: %v", statErr)
+	}
+}
+
 func TestWatchPollIntervalConfig(t *testing.T) {
 	tests := []struct {
 		name  string

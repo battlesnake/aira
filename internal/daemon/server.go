@@ -120,6 +120,14 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	if err != nil {
 		return err
 	}
+	watchdogMode, err := watchdogModeFromEnv()
+	if err != nil {
+		return err
+	}
+	watchdogInterval, err := watchdogIntervalFromEnv()
+	if err != nil {
+		return err
+	}
 	watchPollInterval, err := watchPollIntervalFromEnv()
 	if err != nil {
 		return err
@@ -244,6 +252,16 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		defer close(discoveryDone)
 		s.runRegistryDiscovery(discoveryCtx, discoveryInterval)
 	}()
+	watchdogCtx, cancelWatchdog := context.WithCancel(ctx)
+	watchdogDone := make(chan struct{})
+	watchdogRuntimeDeps := watchdogDeps{}
+	if watchdogMode != watchdogOff {
+		watchdogRuntimeDeps = realWatchdogDeps(s)
+	}
+	go func() {
+		defer close(watchdogDone)
+		s.runWatchdog(watchdogCtx, watchdogMode, watchdogInterval, watchdogRuntimeDeps)
+	}()
 
 	var connections sync.WaitGroup
 	stopping := make(chan struct{})
@@ -277,6 +295,7 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	cancelReaper()
 	cancelFlusher()
 	cancelDiscovery()
+	cancelWatchdog()
 	_ = listener.Close()
 	drained := make(chan struct{})
 	go func() {
@@ -285,6 +304,7 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		<-reaperDone
 		<-flusherDone
 		<-discoveryDone
+		<-watchdogDone
 		close(drained)
 	}()
 	timeout := s.DrainTimeout
