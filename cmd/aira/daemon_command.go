@@ -68,7 +68,12 @@ func runDaemonCommand(args []string, stdout, stderr io.Writer) int {
 		}
 		return store.ExitForCode(daemon.CodeUnavailable)
 	case "stop":
-		if daemon.ServiceIsEnabled(daemon.DefaultServiceUnit, daemonSystemctlRun) {
+		// Refuse (and redirect to systemctl) ONLY when this invocation's own daemon
+		// IS the managed service — identity-matched, not merely is-enabled. A
+		// divergent-identity caller (a temp-XDG_STATE_HOME harness that forked its
+		// own daemon) must be able to stop ITS daemon via daemon.Stop(paths), and
+		// must never be misdirected to `systemctl stop` the unrelated machine service.
+		if daemon.ServiceIdentityMatches(paths, daemon.DefaultServiceUnit, daemonSystemctlRun, nil, nil) {
 			_, _ = fmt.Fprintf(stderr, "%s: %s is enabled; use `systemctl --user stop %s` (or disable it)\n", daemon.CodeUnavailable, daemon.DefaultServiceUnit, daemon.DefaultServiceUnit)
 			return store.ExitForCode(daemon.CodeUnavailable)
 		}

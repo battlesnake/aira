@@ -154,6 +154,89 @@ func TestPersistentOldProtocolUnderServiceRequiresReinstall(t *testing.T) {
 	}
 }
 
+// TestDaemonServeDoesNotDeferOnDivergentIdentity: a stray `daemon serve` whose
+// resolved SocketPath diverges from the enabled unit's baked identity must NOT
+// self-defer (that would `systemctl start` the service + exit, stranding its own
+// socket the service never binds). Guards the identity conjunct at the serve seam.
+func TestDaemonServeDoesNotDeferOnDivergentIdentity(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(t.TempDir(), "runtime"))
+	t.Setenv("AIRA_DAEMON_MANAGED", "")
+
+	unitDir := filepath.Join(home, ".config", "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Baked identity diverges from the caller's -> ServiceIdentityMatches=false,
+	// while is-enabled=true. XDG_RUNTIME_DIR baked so no show-environment call.
+	divergentState := filepath.Join(t.TempDir(), "other-state")
+	content := "# aira-managed: aira-daemon.service\n[Service]\n" +
+		"Environment=XDG_STATE_HOME=" + divergentState + "\n" +
+		"Environment=XDG_RUNTIME_DIR=" + os.Getenv("XDG_RUNTIME_DIR") + "\n"
+	if err := os.WriteFile(filepath.Join(unitDir, daemon.DefaultServiceUnit), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	originalRun, originalServe := daemonSystemctlRun, serveDaemon
+	t.Cleanup(func() { daemonSystemctlRun, serveDaemon = originalRun, originalServe })
+	var starts, serves int
+	daemonSystemctlRun = func(argv []string) ([]byte, error) {
+		switch strings.Join(argv, " ") {
+		case "systemctl --user is-enabled aira-daemon.service":
+			return []byte("enabled\n"), nil
+		case "systemctl --user start aira-daemon.service":
+			starts++
+			return nil, nil
+		default:
+			return nil, errors.New("unexpected command: " + strings.Join(argv, " "))
+		}
+	}
+	serveDaemon = func(context.Context, daemon.Paths) error { serves++; return nil }
+
+	// Identity diverges → must serve its own daemon, never defer.
+	if exit := runDaemonCommand([]string{"serve"}, os.Stdout, os.Stderr); exit != 0 || starts != 0 || serves != 1 {
+		t.Fatalf("divergent stray must serve its own daemon, not defer: exit=%d starts=%d serves=%d", exit, starts, serves)
+	}
+}
+
+// TestDaemonStopDoesNotMisdirectWhenIdentityDivergent: `aira daemon stop` from a
+// divergent-identity caller must act on ITS own daemon, never misdirect the
+// operator to `systemctl --user stop` the unrelated machine service.
+func TestDaemonStopDoesNotMisdirectWhenIdentityDivergent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "caller-state"))
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(t.TempDir(), "caller-runtime"))
+
+	unitDir := filepath.Join(home, ".config", "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := "# aira-managed: aira-daemon.service\n[Service]\n" +
+		"Environment=XDG_STATE_HOME=" + filepath.Join(t.TempDir(), "service-state") + "\n" +
+		"Environment=XDG_RUNTIME_DIR=" + filepath.Join(t.TempDir(), "service-runtime") + "\n"
+	if err := os.WriteFile(filepath.Join(unitDir, daemon.DefaultServiceUnit), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	original := daemonSystemctlRun
+	t.Cleanup(func() { daemonSystemctlRun = original })
+	daemonSystemctlRun = func(argv []string) ([]byte, error) {
+		if strings.Join(argv, " ") == "systemctl --user is-enabled aira-daemon.service" {
+			return []byte("enabled\n"), nil
+		}
+		return nil, errors.New("unexpected command: " + strings.Join(argv, " "))
+	}
+	var stderr bytes.Buffer
+	_ = runDaemonCommand([]string{"stop"}, os.Stdout, &stderr)
+	// No divergent daemon is actually running, so the fixed path reports "not
+	// running" — but it must NEVER emit the service-stop misdirection.
+	if strings.Contains(stderr.String(), "systemctl --user stop aira-daemon.service") {
+		t.Fatalf("misdirected operator to stop the machine service: stderr=%q", stderr.String())
+	}
+}
+
 func TestDaemonServeSelfDefersUnlessManaged(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
 	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(t.TempDir(), "runtime"))
@@ -191,8 +274,25 @@ func TestDaemonServeSelfDefersUnlessManaged(t *testing.T) {
 }
 
 func TestDaemonStopRefusesWhenServiceEnabled(t *testing.T) {
-	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
-	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(t.TempDir(), "runtime"))
+	// The refuse-and-redirect path fires only when the caller's OWN daemon IS the
+	// managed service — identity-matched, not merely is-enabled. Bake a unit whose
+	// identity matches this caller so ServiceIdentityMatches is true.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stateHome := filepath.Join(t.TempDir(), "state")
+	runtimeDir := filepath.Join(t.TempDir(), "runtime")
+	t.Setenv("XDG_STATE_HOME", stateHome)
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+	unitDir := filepath.Join(home, ".config", "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := "# aira-managed: aira-daemon.service\n[Service]\n" +
+		"Environment=XDG_STATE_HOME=" + stateHome + "\n" +
+		"Environment=XDG_RUNTIME_DIR=" + runtimeDir + "\n"
+	if err := os.WriteFile(filepath.Join(unitDir, daemon.DefaultServiceUnit), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	original := daemonSystemctlRun
 	t.Cleanup(func() { daemonSystemctlRun = original })
 	daemonSystemctlRun = func(argv []string) ([]byte, error) {

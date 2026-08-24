@@ -11,6 +11,51 @@ import (
 	"aira/internal/daemon"
 )
 
+// TestInstallDaemonNoChangeRunDoesNotBounceDaemon: a byte-identical convergence
+// re-run must NOT stop or restart the live machine daemon (that would drop the
+// admission queue + reset the watchdog latch on a no-op); only a watchdog change
+// may restart it. RED against the pre-fix unconditional stop+restart.
+func TestInstallDaemonNoChangeRunDoesNotBounceDaemon(t *testing.T) {
+	d, state := newFakeInstall(t)
+	stops := 0
+	baseStop := d.daemonStop
+	d.daemonStop = func(p daemon.Paths) error { stops++; return baseStop(p) }
+
+	if err := runInstall(d, installOpts{memoryMax: "16G", watchdog: "observe", watchdogInterval: 2 * time.Second}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Byte-identical convergence — must leave the live daemon untouched.
+	state.commands = nil
+	stops = 0
+	if err := runInstall(d, installOpts{memoryMax: "16G", watchdog: "observe", watchdogInterval: 2 * time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	if stops != 0 {
+		t.Fatalf("no-change convergence run stopped the live daemon %d time(s)", stops)
+	}
+	for _, argv := range state.commands {
+		if strings.Join(argv, " ") == "systemctl --user restart "+defaultDaemonUnit {
+			t.Fatalf("no-change convergence run restarted the live daemon; commands=%q", state.commands)
+		}
+	}
+
+	// A watchdog change — only a changing run may restart.
+	state.commands = nil
+	if err := runInstall(d, installOpts{memoryMax: "16G", watchdog: "enforce", watchdogInterval: 2 * time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	foundRestart := false
+	for _, argv := range state.commands {
+		if strings.Join(argv, " ") == "systemctl --user restart "+defaultDaemonUnit {
+			foundRestart = true
+		}
+	}
+	if !foundRestart {
+		t.Fatalf("watchdog change did not restart daemon; commands=%q", state.commands)
+	}
+}
+
 func TestParseInstallWatchdogFlags(t *testing.T) {
 	opts, err := parseInstallArgs(nil)
 	if err != nil || opts.watchdog != "observe" || opts.watchdogInterval != 2*time.Second {

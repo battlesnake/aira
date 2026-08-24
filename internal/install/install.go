@@ -421,22 +421,31 @@ func runInstall(d installDeps, opts installOpts) error {
 	if err := verifyDaemonSocketIdentity(d, paths); err != nil {
 		return unavailable(err)
 	}
-	if status := d.daemonStatus(paths); status.Running {
-		if err := d.daemonStop(paths); err != nil {
-			// A racing shutdown can make Status say running immediately before
-			// Stop observes no holder. That is the intended end state; only fail
-			// if a holder remains after the stop error.
-			if d.daemonStatus(paths).Running {
-				return unavailable(fmt.Errorf("stop incumbent daemon: %w", err))
+	// Displace an incumbent ONLY on a first install (no managed unit yet): the only
+	// daemon to displace predates the install (a client-forked, watchdog-off stray).
+	// On a re-install the managed unit already exists and — because clients defer to
+	// the service — any running daemon IS the managed service; stopping it would
+	// bounce the live machine daemon (drop the admission queue, reset the watchdog
+	// latch, interrupt the reconciler) on a no-op convergence run. So skip the whole
+	// stop+wait when daemonPresent.
+	if !daemonPresent {
+		if status := d.daemonStatus(paths); status.Running {
+			if err := d.daemonStop(paths); err != nil {
+				// A racing shutdown can make Status say running immediately before
+				// Stop observes no holder. That is the intended end state; only fail
+				// if a holder remains after the stop error.
+				if d.daemonStatus(paths).Running {
+					return unavailable(fmt.Errorf("stop incumbent daemon: %w", err))
+				}
 			}
 		}
-	}
-	stopDeadline := d.now().Add(12 * time.Second)
-	for d.daemonStatus(paths).Running {
-		if !d.now().Before(stopDeadline) {
-			return unavailable(errors.New("incumbent daemon did not stop before deadline"))
+		stopDeadline := d.now().Add(12 * time.Second)
+		for d.daemonStatus(paths).Running {
+			if !d.now().Before(stopDeadline) {
+				return unavailable(errors.New("incumbent daemon did not stop before deadline"))
+			}
+			d.sleep(25 * time.Millisecond)
 		}
-		d.sleep(25 * time.Millisecond)
 	}
 	daemonChanged, err := publishManagedUnit(d, dirfd, uid, d.daemonUnit, []byte(daemonUnit))
 	if err != nil {
@@ -453,9 +462,14 @@ func runInstall(d installDeps, opts installOpts) error {
 	if _, err := d.run([]string{"systemctl", "--user", "enable", "--now", d.daemonUnit}, nil); err != nil {
 		return unavailable(fmt.Errorf("enable and start %s: %w", d.daemonUnit, err))
 	}
-	if daemonPresent {
+	// Restart only when a pre-existing managed service's unit content actually
+	// changed (e.g. a changed --watchdog mode) — `enable --now` above does NOT pick
+	// up a changed Environment on an already-running service, but a byte-identical
+	// convergence re-run must NOT bounce the live daemon. On a first install
+	// (!daemonPresent) `enable --now` already started it fresh with the new content.
+	if daemonPresent && daemonChanged {
 		if _, err := d.run([]string{"systemctl", "--user", "restart", d.daemonUnit}, nil); err != nil {
-			return unavailable(fmt.Errorf("restart existing %s after incumbent shutdown: %w", d.daemonUnit, err))
+			return unavailable(fmt.Errorf("restart %s to apply changed unit: %w", d.daemonUnit, err))
 		}
 	}
 	if _, err := d.run([]string{"loginctl", "enable-linger", strconv.Itoa(uid)}, nil); err != nil {
