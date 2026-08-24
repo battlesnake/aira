@@ -307,7 +307,7 @@ func shellQuote(token string) string {
 
 func renderSkillMarkdown(actions []SkillAction, contract ResponseContractSpec) string {
 	var out strings.Builder
-	out.WriteString("---\nname: aira\ndescription: Machine-local coordination for AI agents.\n---\n\n")
+	out.WriteString("---\nname: aira\ndescription: Machine-local coordination for AI agents: mandatory memory-confinement of heavy shell commands via `aira confine` (the `whale-run` prefix), plus opt-in per-project tickets, gates, and telemetry.\nallowed-tools: Bash(aira *)\n---\n\n")
 	out.WriteString(renderMarkdownBody("# AIRA Skill", actions, contract))
 	return out.String()
 }
@@ -320,6 +320,10 @@ func renderMarkdownBody(title string, actions []SkillAction, contract ResponseCo
 	var out strings.Builder
 	fmt.Fprintf(&out, "%s\n\n", title)
 	out.WriteString("AIRA is a machine-local coordination tool for AI agents, with one CLI entrypoint over its core operations.\n\n")
+	out.WriteString("## Confining heavy commands (mandatory)\n\n")
+	out.WriteString("Any memory-heavy shell command — test suites, builds, data loads, sims/training/sweeps, dev servers, long-running jobs — MUST be run under `aira confine -- <cmd>` (the `whale-run` prefix execs exactly this). It runs the job in a machine-wide memory-capped slice with `memory.oom.group` group-kill, deprioritises it (nice/ionice/oom_score_adj), and RAM-gates admission, so a runaway dies in-slice instead of OOM-killing the machine. This applies in EVERY working directory: `aira confine` is project-less and needs no `.aira/config`. A confined job has NO graceful shutdown — a signal hard-kills its whole process tree; to stop one, `kill <PID>` the `aira confine`/`whale-run` process (never `systemctl --user stop` the shared slice). Trivial read-only commands (`ls`, `cat`, `grep`, `git status/log/diff`) run unconfined.\n\n")
+	out.WriteString("## Coordination is opt-in per project\n\n")
+	out.WriteString("AIRA's coordination surface — tickets, relations, gates, findings, query, telemetry, insights (every verb below except `confine`) — operates ONLY in a project the user has initialized with `aira init`, which writes `.aira/config` at the worktree root. Outside such a project these verbs return `E_CONFIG_MISSING`; that is expected, not a failure to work around. Do NOT run `aira init` or use the coordination verbs unless the user has explicitly adopted AIRA for this project. `aira confine` (above) is the sole exception — it is always available, project or not.\n\n")
 	out.WriteString("## Honesty contract\n\n")
 	fmt.Fprintf(&out, "Responses carry stable AIRA codes. Verdicts are `%s`, `%s`, and `%s`. `unevaluated` is not a pass and not zero.\n\n", contract.Verdicts[0], contract.Verdicts[1], contract.Verdicts[2])
 	out.WriteString("Gate results require authenticated evidence and proof-of-fire; a canary that does not fire is fail-closed, never a warning or pass.\n\n")

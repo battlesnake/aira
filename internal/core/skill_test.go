@@ -36,6 +36,41 @@ func TestSkillMetadataNormalisesEveryIncludedAction(t *testing.T) {
 	}
 }
 
+func TestSkillMandatesConfineAndFramesCoordinationOptIn(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	skill := string(artifacts.SkillMD)
+	guide := string(artifacts.Guide)
+	// The mandatory-confine directive + the opt-in coordination framing must appear
+	// in BOTH the installed SKILL.md and the agent guide (they share renderMarkdownBody).
+	for _, want := range []string{
+		"Confining heavy commands (mandatory)",
+		"MUST be run under `aira confine",
+		"project-less and needs no `.aira/config`",
+		"Coordination is opt-in per project",
+		"return `E_CONFIG_MISSING`",
+	} {
+		if !strings.Contains(skill, want) {
+			t.Fatalf("SKILL.md missing mandate/opt-in prose: %q", want)
+		}
+		if !strings.Contains(guide, want) {
+			t.Fatalf("guide missing mandate/opt-in prose: %q", want)
+		}
+	}
+	if !strings.Contains(skill, "allowed-tools: Bash(aira *)") {
+		t.Fatal("SKILL.md frontmatter missing allowed-tools scope")
+	}
+	// confine stays CLI-only: mandated in prose, never a generated action (Include=false)
+	// so it is also never an MCP tool.
+	for _, action := range artifacts.Actions {
+		if action.Verb == "confine" {
+			t.Fatal("confine leaked into generated actions; it must stay a prose-only CLI mandate")
+		}
+	}
+}
+
 func TestSkillGeneratorFailsClosedForIncompleteMetadata(t *testing.T) {
 	base := New(nil).DispatchDescriptors()
 	var create DispatchDescriptor
