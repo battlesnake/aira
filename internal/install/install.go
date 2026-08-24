@@ -249,8 +249,18 @@ func runInstall(d installDeps, opts installOpts) error {
 	}
 
 	meminfo, memErr := d.readFile("/proc/meminfo")
-	if memErr != nil && opts.memoryMax == "" && parseInstalledValue(string(installed), installedMemoryMaxRE) == "" {
-		return unavailable(fmt.Errorf("read /proc/meminfo for default memory limit: %w", memErr))
+	// The ⅔-MemTotal default is only consulted when no --memory-max was given and
+	// no value is already on disk. In that case an unreadable OR malformed
+	// (MemTotal-less) meminfo is an environment failure, not a bad user argument:
+	// surface it as E_INSTALL_UNAVAILABLE rather than letting a 0 MemTotal fall
+	// through to a "0G" cap that fails the floor and is misreported as argument-invalid.
+	if opts.memoryMax == "" && parseInstalledValue(string(installed), installedMemoryMaxRE) == "" {
+		if memErr != nil {
+			return unavailable(fmt.Errorf("read /proc/meminfo for default memory limit: %w", memErr))
+		}
+		if parseMemTotalKB(meminfo) == 0 {
+			return unavailable(errors.New("/proc/meminfo has no usable MemTotal for the default memory limit"))
+		}
 	}
 	maximum, high, err := computeMemoryLimits(opts.memoryMax, opts.memoryHigh, string(installed), parseMemTotalKB(meminfo))
 	if err != nil {
@@ -663,7 +673,10 @@ func openExistingUnitDirectory(d installDeps, unitDir string, uid int) (int, boo
 }
 
 func readRegularUnitAt(d installDeps, dirfd, uid int, unit string, requireMarker bool) ([]byte, bool, error) {
-	fd, err := d.openat(dirfd, unit, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	// O_NONBLOCK so a planted FIFO/device at a unit name returns a fd immediately
+	// (then rejected by validateRegularFD) instead of blocking open() forever;
+	// O_NOFOLLOW rejects symlinks but not FIFOs. Harmless on a regular file.
+	fd, err := d.openat(dirfd, unit, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if errors.Is(err, unix.ENOENT) {
 		return nil, false, nil
 	}

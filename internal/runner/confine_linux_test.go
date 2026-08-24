@@ -79,6 +79,15 @@ func TestDefaultConfineResolutionDistinguishesDeadAnchorFromNeverInstalled(t *te
 			managedErr: fs.ErrPermission, airaErr: fs.ErrNotExist,
 			whalePath: "/cg/whale.slice", wantName: "aira.slice", wantErrText: "cannot evaluate aira.slice unit",
 		},
+		{
+			// cgroup is active (airaErr==nil) but no aira-managed unit file: an
+			// active-yet-unmanaged aira.slice must be REFUSED (never confine into
+			// it, never fall back to whale — an active cgroup is not definite absence).
+			name:    "active cgroup without managed unit refuses and never falls back",
+			managed: false, airaPath: "/cg/aira.slice", airaErr: nil,
+			whalePath: "/cg/whale.slice", wantName: "aira.slice", wantPath: "",
+			wantErrText: "aira-managed unit is absent", wantWhale: false,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			whaleCalled := false
