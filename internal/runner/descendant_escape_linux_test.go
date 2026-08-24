@@ -203,6 +203,42 @@ func TestTeardownMemberAliveOutsideAfterKillIsEscapeNotKilled(t *testing.T) {
 	}
 }
 
+// TestTeardownAliveMemberUnreadableCgroupIsGapNotContained guards the honesty
+// invariant that a snapshotted member still alive at teardown, whose
+// /proc/<pid>/cgroup cannot be read, is a residual read-gap — attestable neither
+// as reclaimed (it is alive) nor as escaped (its cgroup is unreadable) — and
+// must never yield a clean containment claim. Before the processAlive branch set
+// result.Gap for a non-escape, this narrow interleaving (a late joiner the
+// monitor never sampled, so HadDescendants=false, that leaves the subtree before
+// Kill so the scope reads empty) produced ScopeContained + CleanSuccess: the
+// cardinal false-pass this milestone exists to prevent.
+func TestTeardownAliveMemberUnreadableCgroupIsGapNotContained(t *testing.T) {
+	oldBoot, oldStat, oldCgroup := readBootIDFn, readProcStatFn, readProcCgroupFn
+	t.Cleanup(func() { readBootIDFn, readProcStatFn, readProcCgroupFn = oldBoot, oldStat, oldCgroup })
+	readBootIDFn = func() (string, error) { return "boot", nil }
+	// Genuinely alive (stable start tick) but the cgroup read fails transiently.
+	readProcStatFn = func(int) ([]byte, error) { return procStatForTest('S', 55), nil }
+	readProcCgroupFn = func(int) ([]byte, error) { return nil, errors.New("hidepid") }
+
+	scope := &migratingTeardownScope{path: "/sys/fs/cgroup/work/.aira-RUN-1", pid: 4242}
+	result := attestScopeTeardown(context.Background(), scope, 0, 50*time.Millisecond)
+	if !result.Gap {
+		t.Fatalf("alive member with an unreadable cgroup must be a residual gap: %+v", result)
+	}
+	if result.Escape != nil {
+		t.Fatalf("an unreadable cgroup must not be treated as a witnessed escape: %+v", result)
+	}
+	got, _, _ := classifyLaunchScopeIntegrity(launchScopeFacts{
+		ScopeVerified: true, PlacementGuaranteed: true, IdentityValid: true, WaitObserved: true,
+		ScopePath: scope.Reference(),
+		Monitor:   scopeMonitorResult{HadDescendants: false},
+		Teardown:  result,
+	})
+	if got == ScopeContained {
+		t.Fatalf("an unattested live former member must not be classified contained (got %q)", got)
+	}
+}
+
 func TestScopeIntegrityMergeUsesTotalPrecedence(t *testing.T) {
 	states := []ScopeIntegrity{
 		ScopeContained,

@@ -222,11 +222,24 @@ func allOutputsComplete(record runner.RunRecord) bool {
 	return true
 }
 
+// admissibleScopeIntegrity reports whether a run's scope-integrity verdict is
+// trustworthy enough to derive a gate verdict from. The command gate's verdict
+// rests on the leader's exit code and the completely-captured output, not on
+// descendant memory containment, so ScopeUnverified — placement proven but
+// whole-subtree containment not attestable, the normal outcome for any command
+// that forks children (e.g. `go test`) — is admissible alongside ScopeContained.
+// States that evidence a real integrity failure (a descendant killed at teardown
+// or witnessed escaping, leader migration, a handoff never verified) stay
+// inadmissible: the run was not clean.
+func admissibleScopeIntegrity(integrity runner.ScopeIntegrity) bool {
+	return integrity == runner.ScopeContained || integrity == runner.ScopeUnverified
+}
+
 // admissibleCommandRun deliberately does not delegate to CleanSuccess: command
 // gates also consume each output reference and must reject forced capture
 // closure before any parser sees bytes.
 func admissibleCommandRun(record runner.RunRecord) (admissible, cleanExit bool, reason string) {
-	if record.CaptureForcedClosed || record.Status != runner.StatusExited || record.ExitCode == nil || record.ScopeIntegrity != runner.ScopeContained || !record.CaptureComplete || !record.TerminalComplete || !allOutputsComplete(record) {
+	if record.CaptureForcedClosed || record.Status != runner.StatusExited || record.ExitCode == nil || !admissibleScopeIntegrity(record.ScopeIntegrity) || !record.CaptureComplete || !record.TerminalComplete || !allOutputsComplete(record) {
 		return false, false, "U_GATE_COMMAND_RUN_UNEVALUATED"
 	}
 	for _, code := range record.ErrorCodes {

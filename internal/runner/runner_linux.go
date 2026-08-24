@@ -899,7 +899,8 @@ func hasScopeReconcileError(codes []string) bool {
 
 // ScopeHandoffUnverified never appears on a clean record: it always carries a
 // scope/reconcile error (E_RUN_SCOPE_INVALID | E_RUN_SCOPE_HANDOFF |
-// U_RUN_RECONCILE_REQUIRED). Only ScopeContained is gate-admissible.
+// U_RUN_RECONCILE_REQUIRED) and is never gate-admissible (see
+// admissibleScopeIntegrity: only contained/unverified are).
 func ensureTerminalScopeEvidence(record RunRecord) RunRecord {
 	noDetachedChild := record.Detached && record.PIDIdentity.PID == 0 && (record.Status == StatusCancelled || record.Status == StatusKilled)
 	if record.Status.Terminal() && !noDetachedChild && record.ScopeIntegrity == ScopeHandoffUnverified && !hasScopeReconcileError(record.ErrorCodes) {
@@ -1705,9 +1706,17 @@ func attestScopeTeardown(ctx context.Context, scope Scope, excludePID int, wait 
 			continue
 		case processAlive:
 			observation := observeProcessCgroup(identity, scope.Reference())
-			if witnessedEscape(scope.Reference(), &observation) && result.Escape == nil {
-				copy := observation
-				result.Escape = &copy
+			if witnessedEscape(scope.Reference(), &observation) {
+				if result.Escape == nil {
+					copy := observation
+					result.Escape = &copy
+				}
+			} else {
+				// A snapshotted member still alive that we cannot prove escaped
+				// (its /proc/<pid>/cgroup is unreadable, or it is alive inside the
+				// scope) is a residual we can attest neither reclaimed nor escaped:
+				// a read gap, never a claimed containment.
+				result.Gap = true
 			}
 			allDead = false
 		default:

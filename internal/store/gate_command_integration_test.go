@@ -177,6 +177,42 @@ func TestCommandCheckerCleanNonzeroIsFailure(t *testing.T) {
 	}
 }
 
+// TestCommandGateAdmitsMultiProcessGreenCommand is the discriminating guard for
+// task #20: `/bin/sh -c "sleep 0.05; printf ..."` forks a real `sleep` child, so
+// the run is a genuine multi-process command exactly like `go test`/builds/
+// linters — the descendant is observed and the record is classified
+// ScopeUnverified, not ScopeContained. A green such command must still produce a
+// PASS gate verdict; before admissibleCommandRun was relaxed to admit the honest
+// ScopeUnverified residual this returned U_GATE_COMMAND_RUN_UNEVALUATED, breaking
+// every real command-backed gate. This restores the multi-process coverage the
+// build swapped out for single-process helpers.
+func TestCommandGateAdmitsMultiProcessGreenCommand(t *testing.T) {
+	s, root := realCommandStore(t)
+	greenOutput := "{\"Action\":\"start\",\"Package\":\"p\"}\\n" +
+		"{\"Action\":\"run\",\"Package\":\"p\",\"Test\":\"TestX\"}\\n" +
+		"{\"Action\":\"pass\",\"Package\":\"p\",\"Test\":\"TestX\"}\\n" +
+		"{\"Action\":\"pass\",\"Package\":\"p\"}\\n"
+	def := commandDefinition(gate.Command{Argv: []string{"/bin/sh", "-c", "sleep 0.05; printf '" + greenOutput + "'"}, Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 4096, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
+	evaluation, err := s.runCommandChecker(context.Background(), def, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evaluation.Predicate != gate.PredicatePass {
+		t.Fatalf("green multi-process gate command must PASS; got predicate=%q code=%q (a descendant-spawning command must not be forced to unevaluated)", evaluation.Predicate, evaluation.Code)
+	}
+	execution, ok := s.runner.(*runner.Runner)
+	if !ok {
+		t.Fatalf("store execution dependency is %T, want *runner.Runner", s.runner)
+	}
+	record, err := execution.Get(evaluation.RunID)
+	if err != nil {
+		t.Fatalf("command did not produce a durable runner record: err=%v", err)
+	}
+	if record.ScopeIntegrity != runner.ScopeUnverified {
+		t.Fatalf("expected the forking command to be ScopeUnverified (proving the multi-process/unverified admission path), got %q", record.ScopeIntegrity)
+	}
+}
+
 func TestCommandCheckerTestsGreenHonorsFailureOutcomes(t *testing.T) {
 	s, root := realCommandStore(t)
 	failedOutput := "{\"Action\":\"start\",\"Package\":\"p\"}\n" +
