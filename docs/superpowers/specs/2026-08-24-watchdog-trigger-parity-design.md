@@ -54,6 +54,22 @@ the unchanged offender selection: it only kills **uncapped + claude-descendant +
 not-protected** processes and DEFERS ("pressure elsewhere") when claude isn't the cause —
 so an early trip with no qualifying offender is a logged no-op, never a wrong kill.
 
+**Reconcile the escalation gate (REQUIRED — else arm-then-abort).** `pressureStillTripped`
+(`watchdog.go:465-471`) gates SIGTERM→SIGKILL escalation with the SAME strict AND
+(`avg >= trip && total > prev && available < low`). If only the arm-trip becomes OR, a
+mem-low-alone trip would SIGTERM and then, at the post-grace recheck, find `avg < trip` →
+not-still-tripped → the offender that ignored SIGTERM survives. So `pressureStillTripped`
+must use the identical OR:
+
+```
+memLow   := available < deps.lowMemAvailable
+psiStall := avg >= deps.tripPSIFullAvg10 && total > previousTotal
+stillTripped := ok && memOK && (memLow || psiStall)
+```
+
+(the `total <= previousTotal` early-out is folded into `psiStall`; a mem-low read failure →
+not-still-tripped, conservative — no escalation on unknown state).
+
 Nothing else changes: `selectOffender`, the pidfd TOCTOU-safe kill, the interlock, the
 four predicates, and the observe/enforce/off gating are all untouched.
 
@@ -80,6 +96,9 @@ verified from the journal.
   neither → no trip; a single-poll dip (K=1) does NOT trip (debounce); latch holds until
   BOTH mem ≥ 16G AND psi calm (mem-recovered-but-psi-high stays latched, and vice versa);
   a psi/mem read failure → `unevaluated`, armCount reset, never a trip.
+- `pressureStillTripped`: mem-low-alone (avail < 8G, avg10 = 0) returns still-tripped
+  (RED against the current AND) so a mem-low arm actually escalates to SIGKILL; psi-stall
+  alone still-tripped; neither → false; a mem read failure → false (conservative).
 - Offender selection unchanged (regression): capped / non-descendant / light / protected
   never selected; deferred when no qualifying offender even though tripped.
 - Observability: a fake logf/logger records a line for each emitted decision; an idle
