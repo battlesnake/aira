@@ -120,6 +120,25 @@ func eligibleTree() map[int]watchdogProc {
 	}
 }
 
+func twoEligibleOffenders() map[int]watchdogProc {
+	return map[int]watchdogProc{
+		10: {pid: 10, ppid: 1, comm: "claude", rss: 50, startTime: 10, cgroup: watchdogCgroup{path: "/user.slice/first.scope", uncapped: true}},
+		20: {pid: 20, ppid: 10, comm: "worker-a", rss: 900, startTime: 20, cgroup: watchdogCgroup{path: "/user.slice/first.scope", uncapped: true}},
+		30: {pid: 30, ppid: 1, comm: "claude", rss: 50, startTime: 30, cgroup: watchdogCgroup{path: "/user.slice/second.scope", uncapped: true}},
+		40: {pid: 40, ppid: 30, comm: "worker-b", rss: 800, startTime: 40, cgroup: watchdogCgroup{path: "/user.slice/second.scope", uncapped: true}},
+	}
+}
+
+func countWatchdogDecision(events []watchdogEvent, decision string) int {
+	count := 0
+	for _, event := range events {
+		if event.Decision == decision {
+			count++
+		}
+	}
+	return count
+}
+
 func TestMemLowAloneTripsAfterDebounce(t *testing.T) {
 	readings := []pressureSample{{0, 100, true, ""}, {0, 100, true, ""}, {0, 100, true, ""}}
 	d, events, _ := baseWatchdogDeps(readings, 10, eligibleTree())
@@ -229,6 +248,9 @@ func TestTriggerLatchesUntilMemoryRecoveryThreshold(t *testing.T) {
 	for range available {
 		evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
 	}
+	// Polls 1-3 debounce then act (would_signal #1, cooldown=1); poll 4's low
+	// sample consumes the cooldown; poll 5 is HOLD and clears the critical run;
+	// poll 6 recovers; polls 7-9 re-debounce and emit would_signal #2.
 	wouldSignal, recovered := 0, 0
 	for _, event := range *events {
 		if event.Decision == "would_signal" {
@@ -240,6 +262,227 @@ func TestTriggerLatchesUntilMemoryRecoveryThreshold(t *testing.T) {
 	}
 	if wouldSignal != 2 || recovered != 1 {
 		t.Fatalf("would_signal=%d recovered=%d events=%+v", wouldSignal, recovered, *events)
+	}
+}
+
+func TestEnforcePursuesDistinctOffendersWhileMemoryStaysCritical(t *testing.T) {
+	procs := twoEligibleOffenders()
+	d, _, _ := baseWatchdogDeps([]pressureSample{{20, 104, true, ""}}, 10, procs)
+	var signalledPIDs []int
+	d.pidfdSignal = func(fd int, signal unix.Signal) error {
+		pid := fd - 1000
+		signalledPIDs = append(signalledPIDs, pid)
+		if signal == unix.SIGKILL {
+			delete(procs, pid)
+		}
+		return nil
+	}
+	state := watchdogState{}
+	for range 5 {
+		evaluateWatchdog(context.Background(), watchdogEnforce, &state, d)
+	}
+	want := []int{20, 20, 40, 40}
+	if len(signalledPIDs) != len(want) {
+		t.Fatalf("signalled pids=%v state=%+v; want TERM+KILL for both offenders", signalledPIDs, state)
+	}
+	for i := range want {
+		if signalledPIDs[i] != want[i] {
+			t.Fatalf("signalled pids=%v state=%+v; want %v", signalledPIDs, state, want)
+		}
+	}
+}
+
+func TestWatchdogHoldBandStopsActionsAndRecoveryFullyResets(t *testing.T) {
+	available := int64(10)
+	d, events, signals := baseWatchdogDeps([]pressureSample{{20, 104, true, ""}}, available, eligibleTree())
+	d.readMemAvailable = func() (int64, bool, string) { return available, true, "" }
+	state := watchdogState{}
+	for range 3 {
+		evaluateWatchdog(context.Background(), watchdogEnforce, &state, d)
+	}
+	actedSignals := len(*signals)
+	available = d.lowMemAvailable
+	for range 3 {
+		evaluateWatchdog(context.Background(), watchdogEnforce, &state, d)
+	}
+	if len(*signals) != actedSignals {
+		t.Fatalf("HOLD initiated another action: before=%d after=%d events=%+v", actedSignals, len(*signals), *events)
+	}
+	if !state.latched || state.criticalRun || state.armCount != 0 || state.cooldown != 0 {
+		t.Fatalf("HOLD transition state=%+v", state)
+	}
+	available = d.recoverMemAvailable
+	evaluateWatchdog(context.Background(), watchdogEnforce, &state, d)
+	if countWatchdogDecision(*events, "recovered") != 1 || state != (watchdogState{}) {
+		t.Fatalf("recovery did not emit and fully reset: state=%+v events=%+v", state, *events)
+	}
+}
+
+func TestWatchdogHoldBandBreaksCriticalRunAndRequiresFreshDebounce(t *testing.T) {
+	available := int64(10)
+	d, events, _ := baseWatchdogDeps([]pressureSample{{20, 104, true, ""}}, available, eligibleTree())
+	d.readMemAvailable = func() (int64, bool, string) { return available, true, "" }
+	state := watchdogState{}
+	for range 3 {
+		evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
+	}
+	available = d.lowMemAvailable
+	evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
+	if !state.latched || state.criticalRun || state.armCount != 0 || state.cooldown != 0 {
+		t.Fatalf("HOLD did not break the critical run: state=%+v", state)
+	}
+	available = 10
+	evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
+	if got := countWatchdogDecision(*events, "would_signal"); got != 1 {
+		t.Fatalf("single post-HOLD low poll acted without debounce: would_signal=%d events=%+v", got, *events)
+	}
+	for range 2 {
+		evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
+	}
+	if got := countWatchdogDecision(*events, "would_signal"); got != 2 {
+		t.Fatalf("fresh three-poll low run did not act: would_signal=%d state=%+v events=%+v", got, state, *events)
+	}
+}
+
+func TestWatchdogReArmCooldownHasExactEveryOtherPollCadence(t *testing.T) {
+	d, events, _ := baseWatchdogDeps([]pressureSample{{20, 104, true, ""}}, 10, eligibleTree())
+	state := watchdogState{}
+	for range 3 {
+		evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
+	}
+	if got := countWatchdogDecision(*events, "would_signal"); got != 1 {
+		t.Fatalf("entry cadence: would_signal=%d events=%+v", got, *events)
+	}
+	if !state.latched || !state.criticalRun || state.cooldown != watchdogReArmCooldown {
+		t.Fatalf("acted transition state=%+v", state)
+	}
+	evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
+	if got := countWatchdogDecision(*events, "would_signal"); got != 1 {
+		t.Fatalf("first post-action poll bypassed cooldown: would_signal=%d events=%+v", got, *events)
+	}
+	if state.cooldown != 0 || !state.criticalRun {
+		t.Fatalf("cooldown transition state=%+v", state)
+	}
+	evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
+	if got := countWatchdogDecision(*events, "would_signal"); got != 2 {
+		t.Fatalf("action did not resume after one cooldown poll: would_signal=%d state=%+v events=%+v", got, state, *events)
+	}
+}
+
+func TestObserveCooldownPursuesDistinctOffenders(t *testing.T) {
+	procs := twoEligibleOffenders()
+	d, events, _ := baseWatchdogDeps([]pressureSample{{20, 104, true, ""}}, 10, procs)
+	state := watchdogState{}
+	for range 3 {
+		evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
+	}
+	delete(procs, 20)
+	evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
+	evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
+	var pids []int
+	for _, event := range *events {
+		if event.Decision == "would_signal" {
+			pids = append(pids, event.PID)
+		}
+	}
+	if len(pids) != 2 || pids[0] != 20 || pids[1] != 40 {
+		t.Fatalf("would_signal pids=%v state=%+v events=%+v", pids, state, *events)
+	}
+}
+
+func TestWatchdogEmitsOneTripAcrossContinuousMultiActRun(t *testing.T) {
+	d, events, _ := baseWatchdogDeps([]pressureSample{{20, 104, true, ""}}, 10, eligibleTree())
+	state := watchdogState{}
+	for range 5 {
+		evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
+	}
+	if trips, actions := countWatchdogDecision(*events, "trip"), countWatchdogDecision(*events, "would_signal"); trips != 1 || actions != 2 {
+		t.Fatalf("trip=%d would_signal=%d state=%+v events=%+v", trips, actions, state, *events)
+	}
+}
+
+func TestWatchdogSnapshotErrorMidCriticalRunStaysLatchedAndRetries(t *testing.T) {
+	d, events, _ := baseWatchdogDeps([]pressureSample{{20, 104, true, ""}}, 10, eligibleTree())
+	snapshotCalls := 0
+	d.snapshotProcs = func() (map[int]watchdogProc, error) {
+		snapshotCalls++
+		if snapshotCalls == 2 {
+			return nil, errors.New("transient")
+		}
+		return eligibleTree(), nil
+	}
+	state := watchdogState{}
+	for range 5 {
+		evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
+	}
+	if countWatchdogDecision(*events, "unevaluated") != 1 || !state.latched || !state.criticalRun || state.cooldown != 0 {
+		t.Fatalf("snapshot error ended earned latch: calls=%d state=%+v events=%+v", snapshotCalls, state, *events)
+	}
+	evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
+	if snapshotCalls != 3 || countWatchdogDecision(*events, "would_signal") != 2 {
+		t.Fatalf("snapshot error was not retried next poll: calls=%d state=%+v events=%+v", snapshotCalls, state, *events)
+	}
+}
+
+func TestWatchdogDeferDuringLatchedRunPreservesRecoveryEvent(t *testing.T) {
+	procs := eligibleTree()
+	available := int64(10)
+	d, events, _ := baseWatchdogDeps([]pressureSample{{20, 104, true, ""}}, available, procs)
+	d.readMemAvailable = func() (int64, bool, string) { return available, true, "" }
+	state := watchdogState{}
+	for range 3 {
+		evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
+	}
+	for pid := range procs {
+		delete(procs, pid)
+	}
+	evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
+	evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
+	if countWatchdogDecision(*events, "defer") != 1 || !state.latched || state.criticalRun || state.cooldown != 0 {
+		t.Fatalf("defer did not preserve earned latch: state=%+v events=%+v", state, *events)
+	}
+	available = d.recoverMemAvailable
+	evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
+	if countWatchdogDecision(*events, "recovered") != 1 || state != (watchdogState{}) {
+		t.Fatalf("earned latch did not close with recovered: state=%+v events=%+v", state, *events)
+	}
+}
+
+func TestWatchdogMemReadFailureBreaksCriticalRunAndRedebounces(t *testing.T) {
+	available, memOK, memReason := int64(10), true, ""
+	d, events, _ := baseWatchdogDeps([]pressureSample{{20, 104, true, ""}}, available, eligibleTree())
+	d.readMemAvailable = func() (int64, bool, string) {
+		if !memOK {
+			return 0, false, memReason
+		}
+		return available, true, ""
+	}
+	state := watchdogState{}
+	for range 3 {
+		evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
+	}
+	memOK, memReason = false, "read-error"
+	evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
+	if !state.latched || state.criticalRun || state.armCount != 0 || state.cooldown != 0 {
+		t.Fatalf("mem failure transition state=%+v", state)
+	}
+	memOK, memReason = true, ""
+	evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
+	if got := countWatchdogDecision(*events, "would_signal"); got != 1 {
+		t.Fatalf("single low after mem failure acted without debounce: would_signal=%d events=%+v", got, *events)
+	}
+	for range 2 {
+		evaluateWatchdog(context.Background(), watchdogObserve, &state, d)
+	}
+	if countWatchdogDecision(*events, "unevaluated") != 1 || countWatchdogDecision(*events, "would_signal") != 2 {
+		t.Fatalf("mem failure did not break/restart run: state=%+v events=%+v", state, *events)
+	}
+}
+
+func TestFreshWatchdogStateHasNoEpisodeState(t *testing.T) {
+	state := watchdogState{}
+	if state.armCount != 0 || state.latched || state.criticalRun || state.cooldown != 0 {
+		t.Fatalf("fresh state carried episode data: %+v", state)
 	}
 }
 
@@ -482,22 +725,74 @@ func TestEnforceRejectsChangedCgroupAndProtectedSubtreeMember(t *testing.T) {
 
 func TestSignalErrorsAreHonest(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		err  error
-		want string
-	}{{"exited", unix.ESRCH, "exited"}, {"failure", unix.EPERM, "failure"}, {"unsupported", unix.ENOSYS, "degraded"}} {
+		name      string
+		failOn    unix.Signal
+		err       error
+		wantExact string
+	}{{"term already exited", unix.SIGTERM, unix.ESRCH, "already_exited"}, {"term failed", unix.SIGTERM, unix.EPERM, "signal_failed"}, {"term unsupported", unix.SIGTERM, unix.ENOSYS, "degraded_no_signal"}, {"kill already exited", unix.SIGKILL, unix.ESRCH, "already_exited"}, {"kill failed", unix.SIGKILL, unix.EPERM, "signal_failed"}} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := eligibleTree()
 			delete(p, 21)
 			d, events, _ := baseWatchdogDeps([]pressureSample{{20, 104, true, ""}}, 10, p)
-			d.pidfdSignal = func(int, unix.Signal) error { return tc.err }
-			handleArmed(context.Background(), watchdogEnforce, d, pressureSample{avg10: 20, total: 104, ok: true}, 10, p)
-			joined := ""
-			for _, e := range *events {
-				joined += e.Outcome + " " + e.Reason
+			d.pidfdSignal = func(_ int, signal unix.Signal) error {
+				if signal == tc.failOn {
+					return tc.err
+				}
+				return nil
 			}
-			if !strings.Contains(joined, tc.want) {
-				t.Fatalf("events=%+v want %q", *events, tc.want)
+			handleArmed(context.Background(), watchdogEnforce, d, pressureSample{avg10: 20, total: 104, ok: true}, 10, p)
+			found := false
+			for _, e := range *events {
+				if e.Outcome == tc.wantExact {
+					found = true
+				}
+				if e.Outcome == "signal_sent,exited" || e.Outcome == "signal_sent,failure" {
+					t.Fatalf("signal error overclaimed delivery: %+v", e)
+				}
+			}
+			if !found {
+				t.Fatalf("events=%+v want exact outcome %q", *events, tc.wantExact)
+			}
+		})
+	}
+	t.Run("pidfd open already exited", func(t *testing.T) {
+		p := eligibleTree()
+		delete(p, 21)
+		d, events, _ := baseWatchdogDeps([]pressureSample{{20, 104, true, ""}}, 10, p)
+		d.pidfdOpen = func(int) (int, error) { return -1, unix.ESRCH }
+		handleArmed(context.Background(), watchdogEnforce, d, pressureSample{avg10: 20, total: 104, ok: true}, 10, p)
+		if len(*events) != 1 || (*events)[0].Outcome != "exited" {
+			t.Fatalf("pidfd_open ESRCH outcome changed: events=%+v", *events)
+		}
+	})
+}
+
+func TestObserveOutcomesDescribeConditionalSignalSequence(t *testing.T) {
+	const wouldSignal = "would_signal: SIGTERM; SIGKILL after grace if still alive and MemAvailable remains < 8 GiB"
+	for _, tc := range []struct {
+		name      string
+		mode      watchdogMode
+		interlock func() (func(), bool, string)
+		want      string
+	}{
+		{name: "observe", mode: watchdogObserve, want: wouldSignal},
+		{name: "interlock denied", mode: watchdogEnforce, interlock: func() (func(), bool, string) {
+			return nil, false, "whale-watchdog active"
+		}, want: "degraded_to_observe; " + wouldSignal},
+		{name: "missing release", mode: watchdogEnforce, interlock: func() (func(), bool, string) {
+			return nil, true, ""
+		}, want: "degraded_to_observe; " + wouldSignal},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, events, signals := baseWatchdogDeps([]pressureSample{{20, 104, true, ""}}, 10, eligibleTree())
+			if tc.interlock != nil {
+				d.interlockOK = tc.interlock
+			}
+			if acted := handleArmed(context.Background(), tc.mode, d, pressureSample{avg10: 20, total: 104, ok: true}, 10, eligibleTree()); !acted {
+				t.Fatal("observe/degraded action did not count as acted")
+			}
+			if len(*signals) != 0 || len(*events) != 1 || (*events)[0].Decision != "would_signal" || (*events)[0].Outcome != tc.want {
+				t.Fatalf("signals=%v events=%+v want outcome %q", *signals, *events, tc.want)
 			}
 		})
 	}
@@ -712,6 +1007,9 @@ func TestRealWatchdogDepsThresholdsAndInvariantWiring(t *testing.T) {
 	// #59 inertness this ticket fixes. Assert the literal 8 GiB / 16 GiB thresholds.
 	if watchdogLowMemAvailable != int64(8<<30) || watchdogRecoverMemAvailable != int64(16<<30) {
 		t.Fatalf("whale-parity thresholds drifted: low=%d recover=%d (want 8GiB/16GiB)", watchdogLowMemAvailable, watchdogRecoverMemAvailable)
+	}
+	if watchdogReArmCooldown != 1 {
+		t.Fatalf("re-arm cooldown=%d want one settle poll", watchdogReArmCooldown)
 	}
 	if d.lowMemAvailable != watchdogLowMemAvailable || d.recoverMemAvailable != watchdogRecoverMemAvailable || d.debounce != watchdogDebounce {
 		t.Fatalf("threshold wiring: low=%d recover=%d debounce=%d", d.lowMemAvailable, d.recoverMemAvailable, d.debounce)
@@ -940,7 +1238,7 @@ func TestWatchdogAuditBroadcastsToReadyProjectsOnly(t *testing.T) {
 		"two": {view: readyTwo, ready: closed},
 		"no":  {view: unready, ready: make(chan struct{})},
 	}
-	if err := server.emitWatchdogEvent(context.Background(), watchdogEvent{At: time.Now(), Mode: watchdogObserve, Decision: "would_signal", PID: 42, Outcome: "WOULD SIGKILL"}); err != nil {
+	if err := server.emitWatchdogEvent(context.Background(), watchdogEvent{At: time.Now(), Mode: watchdogObserve, Decision: "would_signal", PID: 42, Outcome: "would_signal: SIGTERM; SIGKILL after grace if still alive and MemAvailable remains < 8 GiB"}); err != nil {
 		t.Fatal(err)
 	}
 	for name, view := range map[string]*store.Store{"one": readyOne, "two": readyTwo, "unready": unready} {

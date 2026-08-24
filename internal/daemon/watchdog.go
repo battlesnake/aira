@@ -28,6 +28,9 @@ const (
 	watchdogGrace               = 5 * time.Second
 	watchdogPostKillSettle      = time.Second
 	watchdogEmitTimeout         = 250 * time.Millisecond
+	// Approximately ceil(postKillSettle/interval). This is 1 because the
+	// one-second settle is no longer than the minimum legal watchdog interval.
+	watchdogReArmCooldown = max(1, int((watchdogPostKillSettle+defaultWatchdogInterval-1)/defaultWatchdogInterval))
 )
 
 type pressureSample struct {
@@ -99,8 +102,10 @@ type watchdogDeps struct {
 }
 
 type watchdogState struct {
-	armCount int
-	latched  bool
+	armCount    int  // debounce counter for critical-run entry only
+	latched     bool // acted and not yet fully recovered; gates recovered emission only
+	criticalRun bool // already acted during the current continuous below-low run
+	cooldown    int  // settle polls remaining before the next action in a critical run
 }
 
 func readHostPressureFull() (float64, uint64, bool, string) {
@@ -216,45 +221,78 @@ func evaluateWatchdog(ctx context.Context, mode watchdogMode, state *watchdogSta
 		}
 		return pressureSample{avg10: avg, total: total, ok: ok, reason: reason}
 	}
+	act := func(entry bool) {
+		if entry {
+			// HOLD or an unreadable memory sample can start another debounced entry
+			// while an earlier earned latch is still waiting for full recovery. Those
+			// entries each trip, but the latched period closes with one recovered event.
+			base.Decision = "trip"
+			emitWatchdog(ctx, deps, base)
+		}
+		// A just-signalled offender can remain in /proc until it is reaped and be
+		// selected again. That is benign: per-target revalidation, ESRCH handling,
+		// and the cooldown make the retry safe and paced.
+		procs, err := deps.snapshotProcs()
+		if err != nil {
+			state.armCount = 0
+			base.Decision, base.Reason = "unevaluated", "process-snapshot:"+err.Error()
+			emitWatchdog(ctx, deps, eventWithPSI(base, readPSI()))
+			return
+		}
+		psi := pressureSample{}
+		if mode == watchdogObserve {
+			psi = readPSI()
+		}
+		acted := handleArmed(ctx, mode, deps, psi, available, procs)
+		if acted {
+			state.latched = true
+			state.criticalRun = true
+			state.cooldown = watchdogReArmCooldown
+		} else {
+			state.criticalRun = false
+			state.cooldown = 0
+		}
+		state.armCount = 0
+	}
 	if !memOK {
 		state.armCount = 0
+		state.criticalRun = false
+		state.cooldown = 0
 		base.Decision, base.Reason = "unevaluated", "memavailable:"+memReason
 		emitWatchdog(ctx, deps, eventWithPSI(base, readPSI()))
 		return
 	}
-	if state.latched {
-		if available >= deps.recoverMemAvailable {
-			state.latched = false
-			state.armCount = 0
+	if available >= deps.recoverMemAvailable {
+		wasLatched := state.latched
+		state.armCount = 0
+		state.latched = false
+		state.criticalRun = false
+		state.cooldown = 0
+		if wasLatched {
 			base.Decision = "recovered"
 			emitWatchdog(ctx, deps, eventWithPSI(base, readPSI()))
 		}
 		return
 	}
-	if available < deps.lowMemAvailable {
-		state.armCount++
-	} else {
+	if available >= deps.lowMemAvailable {
 		state.armCount = 0
+		state.criticalRun = false
+		state.cooldown = 0
+		return
 	}
+	if state.criticalRun {
+		if state.cooldown > 0 {
+			state.cooldown--
+			return
+		}
+		act(false)
+		return
+	}
+	state.armCount++
 	if state.armCount < deps.debounce {
 		return
 	}
-	base.Decision = "trip"
-	emitWatchdog(ctx, deps, base)
-	procs, err := deps.snapshotProcs()
-	if err != nil {
-		state.armCount = 0
-		base.Decision, base.Reason = "unevaluated", "process-snapshot:"+err.Error()
-		emitWatchdog(ctx, deps, eventWithPSI(base, readPSI()))
-		return
-	}
-	psi := pressureSample{}
-	if mode == watchdogObserve {
-		psi = readPSI()
-	}
-	acted := handleArmed(ctx, mode, deps, psi, available, procs)
-	state.armCount = 0
-	state.latched = acted
+	act(true)
 }
 
 func eventWithPSI(event watchdogEvent, psi pressureSample) watchdogEvent {
@@ -338,22 +376,26 @@ func handleArmed(ctx context.Context, mode watchdogMode, deps watchdogDeps, psi 
 	}
 	base := watchdogEvent{At: deps.now(), Mode: mode, MemAvailable: available, PID: offender.pid, Comm: offender.comm, RSS: offender.rss, StartTime: offender.startTime, Predicates: verdicts[offender.pid]}
 	if mode == watchdogObserve {
-		base.Decision, base.Outcome = "would_signal", "WOULD SIGKILL"
+		base.Decision, base.Outcome = "would_signal", "would_signal: SIGTERM; SIGKILL after grace if still alive and MemAvailable remains < 8 GiB"
 		emitWatchdog(ctx, deps, eventWithPSI(base, samplePSI()))
 		return true
 	}
 	release, allowed, reason := deps.interlockOK()
 	if !allowed {
-		base.Decision, base.Reason, base.Outcome = "would_signal", "interlock: "+reason, "degraded_to_observe; WOULD SIGKILL"
+		base.Decision, base.Reason, base.Outcome = "would_signal", "interlock: "+reason, "degraded_to_observe; would_signal: SIGTERM; SIGKILL after grace if still alive and MemAvailable remains < 8 GiB"
 		emitWatchdog(ctx, deps, eventWithPSI(base, samplePSI()))
 		return true
 	}
 	if release == nil {
-		base.Decision, base.Reason, base.Outcome = "would_signal", "interlock: missing authority release", "degraded_to_observe; WOULD SIGKILL"
+		base.Decision, base.Reason, base.Outcome = "would_signal", "interlock: missing authority release", "degraded_to_observe; would_signal: SIGTERM; SIGKILL after grace if still alive and MemAvailable remains < 8 GiB"
 		emitWatchdog(ctx, deps, eventWithPSI(base, samplePSI()))
 		return true
 	}
 	defer release()
+	// offenderSubtree establishes ancestry only. Before every signal below,
+	// revalidateWatchdogTarget freshly re-checks the safety predicates (cgroup,
+	// AIRA/protected status, and process identity) for each target. The remaining
+	// revalidate-to-signal gap is unavoidable and deliberately kept minimal.
 	targets := offenderSubtree(procs, offender.pid)
 	type openedTarget struct {
 		proc watchdogProc
@@ -414,13 +456,13 @@ func handleArmed(ctx context.Context, mode watchdogMode, deps watchdogDeps, psi 
 			survivors = append(survivors, target)
 		case errors.Is(err, unix.ESRCH):
 			terminalTargets++
-			outcome.Outcome = "signal_sent,exited"
+			outcome.Outcome = "already_exited"
 		case errors.Is(err, unix.ENOSYS):
 			outcome.Outcome, outcome.Reason = "degraded_no_signal", "pidfd_send_signal unsupported"
 			emitWatchdog(ctx, deps, eventWithPSI(outcome, samplePSI()))
 			return true
 		default:
-			outcome.Outcome, outcome.Reason = "signal_sent,failure", err.Error()
+			outcome.Outcome, outcome.Reason = "signal_failed", err.Error()
 			survivors = append(survivors, target)
 		}
 		emitWatchdog(ctx, deps, eventWithPSI(outcome, samplePSI()))
@@ -457,12 +499,12 @@ func handleArmed(ctx context.Context, mode watchdogMode, deps watchdogDeps, psi 
 			escalated = append(escalated, target)
 		case errors.Is(err, unix.ESRCH):
 			terminalTargets++
-			outcome.Outcome = "signal_sent,exited"
+			outcome.Outcome = "already_exited"
 		case errors.Is(err, unix.ENOSYS):
 			unsupported = true
 			outcome.Outcome, outcome.Reason = "degraded_no_signal", "pidfd_send_signal unsupported"
 		default:
-			outcome.Outcome, outcome.Reason = "signal_sent,failure", err.Error()
+			outcome.Outcome, outcome.Reason = "signal_failed", err.Error()
 		}
 		emitWatchdog(ctx, deps, eventWithPSI(outcome, samplePSI()))
 	}
