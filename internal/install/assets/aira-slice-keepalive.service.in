@@ -1,0 +1,12 @@
+# aira-managed: @ANCHORUNIT@
+[Unit]
+Description=AIRA slice delegation anchor — keeps memory delegated to @SLICEUNIT@.
+
+[Service]
+Slice=@SLICEUNIT@
+MemoryAccounting=yes
+ExecStart=@AIRABIN@ __slice-anchor
+Restart=always
+
+[Install]
+WantedBy=default.target

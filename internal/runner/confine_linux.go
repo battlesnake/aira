@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -94,28 +95,34 @@ func (writer *confineLockedWriter) Write(payload []byte) (int, error) {
 }
 
 type confineDeps struct {
-	resolveSlicePath    func(string) (string, bool, string)
-	newBackend          func(string) ScopeBackend
-	admit               func(context.Context, string, ConfineRequest, int64) (admissionResult, error)
-	writeOOMGroup       func(Scope) error
-	writeScopeMemoryCap func(Scope, int64, int64, bool) error
-	start               func(*confineCommand) error
-	readHandshake       func(*os.File, time.Duration) ([]byte, error)
-	readCap             func(string) (int64, bool)
-	signalSource        func() (<-chan os.Signal, func())
+	resolveSlicePath      func(string) (string, bool, string)
+	resolveSlicePathExact func(string) (string, error)
+	managedUnitPresent    func(string) (bool, error)
+	ensureDelegation      func(string) error
+	newBackend            func(string) ScopeBackend
+	admit                 func(context.Context, string, ConfineRequest, int64) (admissionResult, error)
+	writeOOMGroup         func(Scope) error
+	writeScopeMemoryCap   func(Scope, int64, int64, bool) error
+	start                 func(*confineCommand) error
+	readHandshake         func(*os.File, time.Duration) ([]byte, error)
+	readCap               func(string) (int64, bool)
+	signalSource          func() (<-chan os.Signal, func())
 }
 
 func defaultConfineDeps() confineDeps {
 	return confineDeps{
-		resolveSlicePath:    resolveSlicePath,
-		newBackend:          newDefaultBackend,
-		admit:               admitConfine,
-		writeOOMGroup:       writeConfineOOMGroup,
-		writeScopeMemoryCap: writeScopeMemoryCap,
-		start:               func(command *confineCommand) error { return command.Start() },
-		readHandshake:       readConfineHandshake,
-		readCap:             effectiveConfineCap,
-		signalSource:        confineSignalSource,
+		resolveSlicePath:      resolveSlicePath,
+		resolveSlicePathExact: resolveSlicePathExact,
+		managedUnitPresent:    managedConfineUnitPresent,
+		ensureDelegation:      ensureConfineDelegation,
+		newBackend:            newDefaultBackend,
+		admit:                 admitConfine,
+		writeOOMGroup:         writeConfineOOMGroup,
+		writeScopeMemoryCap:   writeScopeMemoryCap,
+		start:                 func(command *confineCommand) error { return command.Start() },
+		readHandshake:         readConfineHandshake,
+		readCap:               effectiveConfineCap,
+		signalSource:          confineSignalSource,
 	}
 }
 
@@ -123,6 +130,15 @@ func fillConfineDeps(deps confineDeps) confineDeps {
 	defaults := defaultConfineDeps()
 	if deps.resolveSlicePath == nil {
 		deps.resolveSlicePath = defaults.resolveSlicePath
+	}
+	if deps.resolveSlicePathExact == nil {
+		deps.resolveSlicePathExact = defaults.resolveSlicePathExact
+	}
+	if deps.managedUnitPresent == nil {
+		deps.managedUnitPresent = defaults.managedUnitPresent
+	}
+	if deps.ensureDelegation == nil {
+		deps.ensureDelegation = defaults.ensureDelegation
 	}
 	if deps.newBackend == nil {
 		deps.newBackend = defaults.newBackend
@@ -155,29 +171,158 @@ func confine(ctx context.Context, request ConfineRequest) (ConfineResult, error)
 	return confineWithDeps(ctx, request, defaultConfineDeps())
 }
 
+func resolveDefaultConfineSlice(deps confineDeps) (string, string, error) {
+	managed, unitErr := deps.managedUnitPresent(DefaultConfineSlice)
+	if unitErr != nil {
+		return DefaultConfineSlice, "", fmt.Errorf("cannot evaluate aira.slice unit: %w", unitErr)
+	}
+	airaPath, airaErr := deps.resolveSlicePathExact(DefaultConfineSlice)
+	if airaErr == nil {
+		if !managed {
+			return DefaultConfineSlice, "", errors.New("aira.slice cgroup is active but its aira-managed unit is absent; re-run aira install")
+		}
+		return DefaultConfineSlice, airaPath, nil
+	}
+	if managed {
+		return DefaultConfineSlice, "", errors.New("aira.slice installed but not active — anchor dead? re-run aira install")
+	}
+	if !errors.Is(airaErr, fs.ErrNotExist) {
+		return DefaultConfineSlice, "", fmt.Errorf("cannot evaluate aira.slice: %w", airaErr)
+	}
+	whalePath, whaleErr := deps.resolveSlicePathExact("whale.slice")
+	if whaleErr == nil {
+		return "whale.slice", whalePath, nil
+	}
+	if !errors.Is(whaleErr, fs.ErrNotExist) {
+		return DefaultConfineSlice, "", fmt.Errorf("aira.slice is absent and whale.slice cannot be evaluated: %w", whaleErr)
+	}
+	return DefaultConfineSlice, "", errors.New("aira.slice not found (run 'aira install')")
+}
+
+func managedConfineUnitPresent(unit string) (bool, error) {
+	home := strings.TrimSpace(os.Getenv("HOME"))
+	if home == "" {
+		var err error
+		home, err = os.UserHomeDir()
+		if err != nil {
+			return false, err
+		}
+	}
+	path := filepath.Join(home, ".config", "systemd", "user", unit)
+	info, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return false, fmt.Errorf("%s is not a regular unit file", path)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || int(stat.Uid) != os.Geteuid() {
+		return false, fmt.Errorf("%s is not owned by the invoking user", path)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	first := content
+	if index := bytes.IndexByte(first, '\n'); index >= 0 {
+		first = first[:index]
+	}
+	return string(first) == "# aira-managed: "+unit, nil
+}
+
+func ensureConfineDelegation(parent string) error {
+	controllers, err := os.ReadFile(filepath.Join(parent, "cgroup.controllers"))
+	if err != nil {
+		return fmt.Errorf("read cgroup.controllers: %w", err)
+	}
+	if !confineHasToken(controllers, "memory") {
+		return errors.New("memory is absent from cgroup.controllers")
+	}
+	subtree := filepath.Join(parent, "cgroup.subtree_control")
+	current, err := os.ReadFile(subtree)
+	if err != nil {
+		return fmt.Errorf("read cgroup.subtree_control: %w", err)
+	}
+	if !confineHasToken(current, "memory") {
+		file, openErr := os.OpenFile(subtree, os.O_WRONLY, 0)
+		if openErr != nil {
+			return fmt.Errorf("open cgroup.subtree_control: %w", openErr)
+		}
+		_, writeErr := file.WriteString("+memory\n")
+		closeErr := file.Close()
+		if writeErr != nil {
+			return fmt.Errorf("write +memory to cgroup.subtree_control: %w", writeErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close cgroup.subtree_control: %w", closeErr)
+		}
+	}
+	verified, err := os.ReadFile(subtree)
+	if err != nil {
+		return fmt.Errorf("verify cgroup.subtree_control: %w", err)
+	}
+	if !confineHasToken(verified, "memory") {
+		return errors.New("memory missing from cgroup.subtree_control after enable")
+	}
+	return nil
+}
+
+func confineHasToken(data []byte, wanted string) bool {
+	for _, token := range strings.Fields(string(data)) {
+		if token == wanted {
+			return true
+		}
+	}
+	return false
+}
+
 func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDeps) (ConfineResult, error) {
 	deps = fillConfineDeps(deps)
-	sliceName := ResolveConfineSlice(request.Slice)
+	explicitSlice := ResolveConfineSlice(request.Slice)
+	attemptedSlice := explicitSlice
+	if attemptedSlice == "" {
+		attemptedSlice = DefaultConfineSlice
+	}
 	result := ConfineResult{Status: ConfineStatus{
-		Slice: sliceName, Cap: ConfineCapUnevaluated, Admission: ConfineAdmissionUnevaluated,
+		Cap: ConfineCapUnevaluated, Admission: ConfineAdmissionUnevaluated,
 		Scope: ConfineScopeUnverified, OOMGroup: ConfineOOMGroupUnverified,
 		Priorities: ConfinePrioritiesUnverified,
 	}}
 	if len(request.Argv) == 0 || request.Argv[0] == "" {
+		result.Status.Slice = attemptedSlice
 		return result, errors.New("E_CONFINE_ARGUMENT_INVALID: target argv is empty")
 	}
 	if err := validateScopeMemoryCap(request.ScopeMemoryMax, request.ScopeMemoryHigh); err != nil {
+		result.Status.Slice = attemptedSlice
 		return result, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: %w", err)
 	}
 	if err := validateConfineName(request.Name); err != nil {
+		result.Status.Slice = attemptedSlice
 		return result, err
 	}
-	path, ok, reason := deps.resolveSlicePath(sliceName)
-	if !ok {
-		if reason == "" {
-			reason = "slice-not-found"
+	sliceName, path := explicitSlice, ""
+	if explicitSlice == "" {
+		var resolveErr error
+		sliceName, path, resolveErr = resolveDefaultConfineSlice(deps)
+		result.Status.Slice = sliceName
+		if resolveErr != nil {
+			return result, confineUnavailable(sliceName, resolveErr)
 		}
-		return result, confineUnavailable(sliceName, errors.New(reason))
+	} else {
+		var ok bool
+		var reason string
+		path, ok, reason = deps.resolveSlicePath(sliceName)
+		result.Status.Slice = sliceName
+		if !ok {
+			if reason == "" {
+				reason = "slice-not-found"
+			}
+			return result, confineUnavailable(sliceName, errors.New(reason))
+		}
 	}
 	backend := deps.newBackend(path)
 	if err := backend.Probe(ctx); err != nil {
@@ -196,6 +341,9 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	}
 	result.Status.Cap = ConfineCapEnforced
 	result.Status.CapBytes = maximum
+	if err := deps.ensureDelegation(path); err != nil {
+		return result, confineUnavailable(sliceName, fmt.Errorf("ensure memory delegation: %w", err))
+	}
 
 	reserve := request.MemoryReserve
 	if reserve <= 0 {

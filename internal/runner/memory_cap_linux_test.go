@@ -319,7 +319,7 @@ func TestRealDetachedScopeMemoryCap(t *testing.T) {
 
 // verifies: task-57 missing +memory delegation fails closed for confine,
 // foreground run, and detached run; none can create its marker.
-func TestRealScopeMemoryCapMissingDelegationNeverLaunches(t *testing.T) {
+func TestRealScopeMemoryCapDelegationBehavior(t *testing.T) {
 	newParent := func(t *testing.T) string {
 		t.Helper()
 		parent := cgrouptest.IsolatedScopeParent(t)
@@ -328,16 +328,18 @@ func TestRealScopeMemoryCapMissingDelegationNeverLaunches(t *testing.T) {
 		}
 		return parent
 	}
-	t.Run("confine", func(t *testing.T) {
+	t.Run("confine repairs delegation", func(t *testing.T) {
 		marker := filepath.Join(t.TempDir(), "ran")
-		_, err := Confine(context.Background(), ConfineRequest{
+		result, err := Confine(context.Background(), ConfineRequest{
 			Slice: newParent(t), MemoryReserve: 1, ScopeMemoryMax: 32 << 20,
 			Argv: []string{"/bin/sh", "-c", `: > "$1"`, "sh", marker}, SelfPath: os.Args[0], Stderr: io.Discard,
 		})
-		if err == nil || !strings.Contains(err.Error(), "E_CONFINE_UNAVAILABLE") {
-			t.Fatalf("error=%v", err)
+		if err != nil || result.Exit != 0 {
+			t.Fatalf("result=%+v error=%v", result, err)
 		}
-		assertMarkerAbsent(t, marker)
+		if _, statErr := os.Stat(marker); statErr != nil {
+			t.Fatalf("target did not run: %v", statErr)
+		}
 	})
 	t.Run("foreground", func(t *testing.T) {
 		marker := filepath.Join(t.TempDir(), "ran")

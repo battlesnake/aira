@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"os"
 	"os/user"
@@ -476,6 +477,90 @@ func resolveSlicePath(slice string) (string, bool, string) {
 		return "", false, "slice-not-found"
 	}
 	return resolveSlicePathAt(slice, mount, current)
+}
+
+// resolveSlicePathExact is the error-preserving counterpart used by confine's
+// aira→whale default policy. The older resolver intentionally collapses every
+// failure for admission callers; default confinement must distinguish definite
+// ENOENT from permission and evaluation failures.
+func resolveSlicePathExact(slice string) (string, error) {
+	mount, err := unifiedMount()
+	if err != nil {
+		return "", err
+	}
+	current, err := currentCgroupPath(mount)
+	if err != nil {
+		return "", err
+	}
+	return resolveSlicePathAtExact(slice, mount, current)
+}
+
+func resolveSlicePathAtExact(slice, mount, current string) (string, error) {
+	slice = strings.TrimSpace(slice)
+	if slice == "" || hasParentComponent(slice) {
+		return "", fs.ErrNotExist
+	}
+	mountAbs, err := filepath.Abs(mount)
+	if err != nil {
+		return "", err
+	}
+	mountCanonical, err := filepath.EvalSymlinks(mountAbs)
+	if err != nil {
+		return "", err
+	}
+	var candidates []string
+	if filepath.IsAbs(slice) {
+		candidates = []string{slice}
+	} else if !strings.ContainsRune(slice, filepath.Separator) && strings.HasSuffix(slice, ".slice") {
+		for cursor := filepath.Clean(current); pathWithin(mountCanonical, cursor); cursor = filepath.Dir(cursor) {
+			if filepath.Base(cursor) == slice {
+				candidates = append(candidates, cursor)
+			}
+			candidates = append(candidates, filepath.Join(cursor, slice))
+			if filepath.Clean(cursor) == filepath.Clean(mountCanonical) {
+				break
+			}
+		}
+	} else {
+		candidates = []string{filepath.Join(mountCanonical, slice)}
+	}
+	var firstFailure error
+	for _, candidate := range candidates {
+		candidateAbs, absErr := filepath.Abs(candidate)
+		if absErr != nil {
+			if firstFailure == nil {
+				firstFailure = absErr
+			}
+			continue
+		}
+		if !pathWithin(mountCanonical, candidateAbs) {
+			continue
+		}
+		canonical, evalErr := filepath.EvalSymlinks(candidateAbs)
+		if evalErr != nil {
+			if !errors.Is(evalErr, fs.ErrNotExist) && firstFailure == nil {
+				firstFailure = evalErr
+			}
+			continue
+		}
+		if !pathWithin(mountCanonical, canonical) {
+			continue
+		}
+		info, statErr := os.Stat(canonical)
+		if statErr == nil && info.IsDir() {
+			return canonical, nil
+		}
+		if statErr == nil {
+			statErr = fmt.Errorf("%s is not a directory", canonical)
+		}
+		if !errors.Is(statErr, fs.ErrNotExist) && firstFailure == nil {
+			firstFailure = statErr
+		}
+	}
+	if firstFailure != nil {
+		return "", firstFailure
+	}
+	return "", fs.ErrNotExist
 }
 
 func resolveSlicePathAt(slice, mount, current string) (string, bool, string) {

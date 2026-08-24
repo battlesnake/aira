@@ -1,0 +1,15 @@
+# aira-managed: @SLICEUNIT@
+# aira-overcommit-accepted: @OVERCOMMIT@
+[Unit]
+Description=AIRA confinement slice — bounds memory-heavy jobs run via `aira confine`.
+# Managed by `aira install` (baked into the aira binary). Do not edit by hand;
+# re-run `aira install --memory-max=…` to change the cap.
+
+[Slice]
+MemoryAccounting=yes
+MemoryHigh=@MEMHIGH@
+MemoryMax=@MEMMAX@
+MemorySwapMax=2G
+CPUWeight=50
+IOWeight=50
+TasksMax=infinity

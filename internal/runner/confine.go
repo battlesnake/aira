@@ -5,12 +5,11 @@ import (
 	"io"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 )
 
 const (
-	DefaultConfineSlice = "whale.slice"
+	DefaultConfineSlice = "aira.slice"
 	// A project-less invocation has no per-project peak-RSS history. Four GiB is
 	// a conservative #50 no-history fallback; injected callers may override it.
 	DefaultConfineMemoryReserve = int64(4 << 30)
@@ -98,15 +97,17 @@ type ConfineResult struct {
 	Status ConfineStatus
 }
 
-// ResolveConfineSlice applies flag > environment > machine default precedence.
+// ResolveConfineSlice applies only explicit flag > environment precedence.
+// Linux resolves the machine default from live, injected state; portable code
+// must not probe cgroups or silently select a compatibility slice.
 func ResolveConfineSlice(flagValue string) string {
-	if value := strings.TrimSpace(flagValue); value != "" {
+	if flagValue != "" {
+		return flagValue
+	}
+	if value := os.Getenv("AIRA_CONFINE_SLICE"); value != "" {
 		return value
 	}
-	if value := strings.TrimSpace(os.Getenv("AIRA_CONFINE_SLICE")); value != "" {
-		return value
-	}
-	return DefaultConfineSlice
+	return ""
 }
 
 // Confine runs a foreground command in a newly-created cgroup scope. Platform
@@ -136,7 +137,11 @@ func FormatConfineStatus(status ConfineStatus) string {
 	if capFacet == "" {
 		capFacet = ConfineCapUnevaluated
 	}
-	line := "confine: slice=" + status.Slice + " cap=" + string(capFacet)
+	slice := status.Slice
+	if slice == "" {
+		slice = "unevaluated"
+	}
+	line := "confine: slice=" + slice + " cap=" + string(capFacet)
 	if status.CapBytes > 0 {
 		line += "(" + formatConfineBytes(status.CapBytes) + ")"
 	}

@@ -8,8 +8,12 @@ import (
 	"io"
 )
 
-func confine(context.Context, ConfineRequest) (ConfineResult, error) {
-	return ConfineResult{}, errors.New("E_CONFINE_UNAVAILABLE: cgroup-v2 confinement is supported only on Linux")
+func confine(_ context.Context, request ConfineRequest) (ConfineResult, error) {
+	slice := ResolveConfineSlice(request.Slice)
+	if slice == "" {
+		slice = DefaultConfineSlice
+	}
+	return ConfineResult{Status: ConfineStatus{Slice: slice}}, errors.New("E_CONFINE_UNAVAILABLE: cgroup-v2 confinement is supported only on Linux")
 }
 
 func RunConfineSetup([]string, io.Writer) int { return 127 }

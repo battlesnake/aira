@@ -46,6 +46,8 @@ func Classify(verb, selector string) (string, Route) {
 		return canonical, RouteClient
 	case canonical == "confine":
 		return canonical, RouteClient
+	case canonical == "install":
+		return canonical, RouteClient
 	case canonical == "reconcile", canonical == "check", canonical == "git":
 		return canonical, RouteClient
 	case canonical == "gate" && (operation == "run" || operation == "canary-run"):

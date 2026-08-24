@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -38,9 +39,120 @@ func TestResolveConfineSlicePrecedence(t *testing.T) {
 		})
 	}
 	t.Setenv("AIRA_CONFINE_SLICE", "")
-	if got := ResolveConfineSlice(""); got != "whale.slice" {
-		t.Fatalf("default slice=%q, want whale.slice", got)
+	if got := ResolveConfineSlice(""); got != "" {
+		t.Fatalf("portable default slice=%q, want empty for linux probing", got)
 	}
+}
+
+func TestDefaultConfineResolutionDistinguishesDeadAnchorFromNeverInstalled(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		managed     bool
+		managedErr  error
+		airaPath    string
+		airaErr     error
+		whalePath   string
+		whaleErr    error
+		wantName    string
+		wantPath    string
+		wantErrText string
+		wantWhale   bool
+	}{
+		{
+			name:    "managed unit present but cgroup absent is dead anchor",
+			managed: true, airaErr: fs.ErrNotExist,
+			whalePath: "/cg/whale.slice", wantName: "aira.slice",
+			wantErrText: "aira.slice installed but not active — anchor dead? re-run aira install",
+		},
+		{
+			name:    "never installed falls back",
+			managed: false, airaErr: fs.ErrNotExist,
+			whalePath: "/cg/whale.slice", wantName: "whale.slice", wantPath: "/cg/whale.slice", wantWhale: true,
+		},
+		{
+			name:    "unreadable aira cgroup never falls back",
+			managed: false, airaErr: fs.ErrPermission,
+			whalePath: "/cg/whale.slice", wantName: "aira.slice", wantErrText: "cannot evaluate aira.slice",
+		},
+		{
+			name:       "unit state unreadable never falls back",
+			managedErr: fs.ErrPermission, airaErr: fs.ErrNotExist,
+			whalePath: "/cg/whale.slice", wantName: "aira.slice", wantErrText: "cannot evaluate aira.slice unit",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			whaleCalled := false
+			deps := confineDeps{
+				managedUnitPresent: func(string) (bool, error) { return test.managed, test.managedErr },
+				resolveSlicePathExact: func(name string) (string, error) {
+					if name == "aira.slice" {
+						return test.airaPath, test.airaErr
+					}
+					whaleCalled = true
+					return test.whalePath, test.whaleErr
+				},
+			}
+			name, path, err := resolveDefaultConfineSlice(deps)
+			if name != test.wantName || path != test.wantPath {
+				t.Fatalf("resolution=(%q,%q,%v), want (%q,%q)", name, path, err, test.wantName, test.wantPath)
+			}
+			if test.wantErrText == "" && err != nil || test.wantErrText != "" && (err == nil || !strings.Contains(err.Error(), test.wantErrText)) {
+				t.Fatalf("error=%v, want substring %q", err, test.wantErrText)
+			}
+			if whaleCalled != test.wantWhale {
+				t.Fatalf("whale fallback called=%v, want %v", whaleCalled, test.wantWhale)
+			}
+		})
+	}
+}
+
+func TestDefaultConfinePresentButUncappedFailsOnAIRA(t *testing.T) {
+	deps := confineUnitDeps(&confineFakeScope{})
+	deps.managedUnitPresent = func(string) (bool, error) { return true, nil }
+	deps.resolveSlicePathExact = func(name string) (string, error) {
+		if name != "aira.slice" {
+			t.Fatalf("unexpected fallback to %s", name)
+		}
+		return "/cg/aira.slice", nil
+	}
+	deps.readCap = func(string) (int64, bool) { return 0, false }
+	result, err := confineWithDeps(context.Background(), ConfineRequest{Argv: []string{"must-not-run"}, Stderr: io.Discard}, deps)
+	if err == nil || !strings.Contains(err.Error(), "E_CONFINE_UNAVAILABLE: slice aira.slice") || !strings.Contains(err.Error(), "uncapped") {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+	if result.Status.Slice != "aira.slice" {
+		t.Fatalf("failure status slice=%q", result.Status.Slice)
+	}
+}
+
+func TestConfineDelegationResetFailsClosedBeforeCreate(t *testing.T) {
+	created := false
+	started := false
+	deps := confineDeps{
+		resolveSlicePath: func(string) (string, bool, string) { return "/cg/aira.slice", true, "" },
+		ensureDelegation: func(string) error { return errors.New("memory missing from cgroup.subtree_control") },
+		newBackend:       func(string) ScopeBackend { return confineCreateTrackingBackend{created: &created} },
+		readCap:          func(string) (int64, bool) { return 16 << 30, true },
+		start:            func(*confineCommand) error { started = true; return nil },
+	}
+	_, err := confineWithDeps(context.Background(), ConfineRequest{Slice: "aira.slice", Argv: []string{"must-not-run"}, Stderr: io.Discard}, deps)
+	if err == nil || !strings.Contains(err.Error(), "E_CONFINE_UNAVAILABLE") || !strings.Contains(err.Error(), "subtree_control") {
+		t.Fatalf("error=%v", err)
+	}
+	if created || started {
+		t.Fatalf("delegation failure reached create=%v start=%v", created, started)
+	}
+}
+
+type confineCreateTrackingBackend struct{ created *bool }
+
+func (confineCreateTrackingBackend) Probe(context.Context) error { return nil }
+func (b confineCreateTrackingBackend) Create(context.Context, string) (Scope, error) {
+	*b.created = true
+	return nil, errors.New("unexpected create")
+}
+func (confineCreateTrackingBackend) Open(context.Context, string) (Scope, error) {
+	return nil, errors.New("unused")
 }
 
 func TestParseConfineHandshakeRequiresCompleteSuccessfulResult(t *testing.T) {
@@ -610,6 +722,7 @@ func TestConfineLaunchWiresCgroupPlacement(t *testing.T) {
 func confineUnitDeps(scope *confineFakeScope) confineDeps {
 	return confineDeps{
 		resolveSlicePath: func(string) (string, bool, string) { return "/fake/finite.slice", true, "" },
+		ensureDelegation: func(string) error { return nil },
 		newBackend:       func(string) ScopeBackend { return confineFakeBackend{scope: scope} },
 		admit: func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
 			return admissionResult{state: "immediate"}, nil
@@ -1055,18 +1168,21 @@ func TestConfineRealAdmissionWaitsThenProceedsDaemonDown(t *testing.T) {
 	}
 }
 
-func TestConfineRealNoMemoryDelegationFailsWithoutLaunch(t *testing.T) {
+func TestConfineRealMissingSubtreeDelegationIsRepairedBeforeLaunch(t *testing.T) {
 	parent := cgrouptest.IsolatedScopeParent(t)
 	marker := filepath.Join(t.TempDir(), "ran")
-	_, err := Confine(context.Background(), ConfineRequest{
+	result, err := Confine(context.Background(), ConfineRequest{
 		Slice: parent, MemoryReserve: 1, Argv: []string{"/bin/sh", "-c", "echo ran > \"$1\"", "sh", marker},
 		SelfPath: os.Args[0], Stderr: io.Discard,
 	})
-	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("unconfinable target ran: marker err=%v", statErr)
+	if err != nil || result.Exit != 0 {
+		t.Fatalf("confine did not repair delegation: result=%+v err=%v", result, err)
 	}
-	if err == nil || !strings.Contains(err.Error(), "E_CONFINE_UNAVAILABLE") || !strings.Contains(err.Error(), "memory.oom.group") {
-		t.Fatalf("error=%v", err)
+	if _, statErr := os.Stat(marker); statErr != nil {
+		t.Fatalf("confined target did not run: %v", statErr)
+	}
+	if data, readErr := os.ReadFile(filepath.Join(parent, "cgroup.subtree_control")); readErr != nil || !confineHasToken(data, "memory") {
+		t.Fatalf("memory delegation was not repaired: %q err=%v", data, readErr)
 	}
 }
 

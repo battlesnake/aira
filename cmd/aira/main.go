@@ -18,6 +18,7 @@ import (
 	"aira/internal/core"
 	"aira/internal/daemon"
 	"aira/internal/domain"
+	installcmd "aira/internal/install"
 	"aira/internal/runner"
 	"aira/internal/store"
 )
@@ -25,6 +26,8 @@ import (
 func main() { os.Exit(Run(os.Args[1:], os.Stdout, os.Stderr)) }
 
 var runConfined = runner.Confine
+var runInstaller = installcmd.Run
+var runSliceAnchor = installcmd.RunSliceAnchor
 
 // Run is the deliberately small CLI adapter: argv parsing, core request
 // construction, and rendering. It contains no ticket or consistency logic.
@@ -44,6 +47,16 @@ func runWithInput(argv []string, stdout, stderr io.Writer, stdin io.Reader) int 
 }
 
 func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Reader, injected Dispatcher) int {
+	if len(argv) > 0 && argv[0] == "__slice-anchor" {
+		return runSliceAnchor()
+	}
+	if len(argv) > 0 && strings.EqualFold(argv[0], "install") {
+		if err := runInstaller(argv[1:], stdout); err != nil {
+			_, _ = fmt.Fprintln(stderr, err)
+			return store.ExitForCode(store.ErrorCode(err))
+		}
+		return 0
+	}
 	if len(argv) > 0 && argv[0] == "__confine-setup" {
 		return runner.RunConfineSetup(argv[1:], stderr)
 	}
@@ -363,6 +376,9 @@ func removeJSON(argv []string) ([]string, bool) {
 }
 
 func parseArgs(verb string, argv []string) ([]string, map[string]string, error) {
+	if verb == "install" {
+		return parseInstallDescriptorArgs(argv)
+	}
 	if verb == "confine" {
 		return parseConfineArgs(argv)
 	}
@@ -462,6 +478,42 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		}
 	}
 	return positional, options, nil
+}
+
+func parseInstallDescriptorArgs(argv []string) ([]string, map[string]string, error) {
+	options := map[string]string{}
+	for i := 0; i < len(argv); i++ {
+		arg := argv[i]
+		if !strings.HasPrefix(arg, "--") {
+			return nil, nil, fmt.Errorf("E_INSTALL_ARGUMENT_INVALID: unexpected argument %q", arg)
+		}
+		name, value, hasValue := strings.Cut(strings.TrimPrefix(arg, "--"), "=")
+		if _, exists := options[name]; exists {
+			return nil, nil, fmt.Errorf("E_INSTALL_ARGUMENT_INVALID: option --%s may occur once", name)
+		}
+		switch name {
+		case "allow-overcommit", "dry-run", "status":
+			if hasValue {
+				return nil, nil, fmt.Errorf("E_INSTALL_ARGUMENT_INVALID: option --%s does not take a value", name)
+			}
+			options[name] = "true"
+		case "memory-max", "memory-high":
+			if !hasValue {
+				if i+1 >= len(argv) || strings.HasPrefix(argv[i+1], "--") {
+					return nil, nil, fmt.Errorf("E_INSTALL_ARGUMENT_INVALID: option --%s requires a value", name)
+				}
+				i++
+				value = argv[i]
+			}
+			if value == "" {
+				return nil, nil, fmt.Errorf("E_INSTALL_ARGUMENT_INVALID: option --%s requires a value", name)
+			}
+			options[name] = value
+		default:
+			return nil, nil, fmt.Errorf("E_INSTALL_ARGUMENT_INVALID: option --%s is not valid for install", name)
+		}
+	}
+	return nil, options, nil
 }
 
 func parseConfineArgs(argv []string) ([]string, map[string]string, error) {

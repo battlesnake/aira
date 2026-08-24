@@ -1679,6 +1679,21 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringArg(args, "memory_high")
 			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine is a direct CLI-only foreground verb")
 		}},
+		"install": {Name: "install", Usage: "install [--memory-max SZ] [--memory-high SZ] [--allow-overcommit] [--dry-run] [--status]", Args: []ArgSpec{
+			stringSpec("memory_max", false, false, "aira.slice MemoryMax (<N>G)"),
+			stringSpec("memory_high", false, false, "aira.slice MemoryHigh (<N>G)"),
+			boolSpec("allow_overcommit", false, false, "Acknowledge coexistence with capped whale.slice"),
+			boolSpec("dry_run", false, false, "Render units and planned actions without mutation"),
+			boolSpec("status", false, false, "Report each installed and live facet honestly"),
+		}, Run: func(ctx context.Context, args *argAccessor) (any, error) {
+			_ = ctx
+			_ = stringArg(args, "memory_max")
+			_ = stringArg(args, "memory_high")
+			_ = boolArg(args, "allow_overcommit")
+			_ = boolArg(args, "dry_run")
+			_ = boolArg(args, "status")
+			return nil, errors.New("E_INSTALL_UNAVAILABLE: install is a direct CLI-only systemd mutation verb")
+		}},
 		"run-kill": {Name: "run-kill", Usage: "run-kill <run-id> [--steal]", Args: []ArgSpec{stringSpec("run_id", true, true, "Run identifier"), boolSpec("steal", false, false, "Override foreign run ownership")}, MCPTool: "aira_run_kill", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			runID := stringArg(args, "run_id")
 			steal := boolArg(args, "steal")
@@ -1918,6 +1933,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		}},
 		"run":     {summary: "Launch a subprocess in an owned scope", safety: SafetyExecute, example: []string{"--merge", "--", "printf", "hello"}},
 		"confine": {summary: "Run a foreground subprocess in a machine-wide confined slice", safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
+		"install": {summary: "Install and inspect the AIRA-owned confinement slice", safety: SafetyExecute, example: []string{"--status"}},
 		"time":    {summary: "Run a byte-transparent command and record timing", safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
 		"commands": {summary: "Read recorded command events and exact distributions", safety: SafetyRead, operations: []OperationSpec{
 			{Name: "ls", Summary: "List recorded command events", Safety: SafetyRead, Args: []OperationArg{{Name: "query"}, {Name: "by"}}, Example: []string{"ls", "key-source:program-subcommand key:go test"}},
@@ -1990,7 +2006,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		if !ok {
 			panic("missing dispatch metadata for " + name)
 		}
-		spec.Summary, spec.Safety, spec.Destructive, spec.Include = entry.summary, entry.safety, entry.destructive, name != "confine"
+		spec.Summary, spec.Safety, spec.Destructive, spec.Include = entry.summary, entry.safety, entry.destructive, name != "confine" && name != "install"
 		spec.Example = copyExample(entry.example)
 		spec.Operations = append([]OperationSpec(nil), entry.operations...)
 		verbs[name] = spec
