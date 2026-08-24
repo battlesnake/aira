@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,15 +14,70 @@ import (
 	"aira/internal/runner"
 )
 
-// Test commands carry a small `sleep` prefix on purpose. The M12 runner verifies
-// cgroup containment, drains capture pipes, and observes the wait AFTER cmd.Start;
-// a sub-millisecond command (bare `exit 7`/`printf`) can finish before that
-// bookkeeping completes, which the runner honestly records as lost/scope-invalid
-// (fail-closed -> the gate is unevaluated, never a false pass). Real gate commands
-// (go test, builds, linters) run for many milliseconds and are reliably observed,
-// so these fixtures model a realistic command lifetime rather than a pathological
-// instant exit. The sub-millisecond robustness gap is an accepted M12 limitation
-// (fail-closed) and a candidate for a future runner-hardening ticket.
+// Gate integration fixtures use this test binary as a single-process command.
+// A shell plus sleep would intentionally become ScopeUnverified under task #20
+// because it spawns a descendant, which is the wrong fixture for tests that need
+// a positively contained command record.
+func gateHelperArgv(action string, values ...string) []string {
+	argv := []string{os.Args[0], "-test.run=^TestGateCommandHelperProcess$", "--", action}
+	return append(argv, values...)
+}
+
+func TestGateCommandHelperProcess(t *testing.T) {
+	separator := -1
+	for i, arg := range os.Args {
+		if arg == "--" {
+			separator = i
+			break
+		}
+	}
+	if separator < 0 || separator+1 >= len(os.Args) {
+		return
+	}
+	time.Sleep(50 * time.Millisecond)
+	action := os.Args[separator+1]
+	values := os.Args[separator+2:]
+	switch action {
+	case "emit":
+		if len(values) == 1 {
+			_, _ = os.Stdout.WriteString(values[0])
+		}
+		os.Exit(0)
+	case "noop":
+		os.Exit(0)
+	case "overflow":
+		_, _ = os.Stdout.Write(make([]byte, 2048))
+		os.Exit(0)
+	case "exit":
+		code := 1
+		if len(values) == 1 {
+			code, _ = strconv.Atoi(values[0])
+		}
+		os.Exit(code)
+	case "timeout":
+		time.Sleep(30 * time.Second)
+		os.Exit(0)
+	case "source-go-test-json":
+		injected := false
+		files, _ := filepath.Glob("*.go")
+		for _, path := range files {
+			data, _ := os.ReadFile(path)
+			if strings.Contains(string(data), "TestInjected") {
+				injected = true
+				break
+			}
+		}
+		if injected {
+			_, _ = os.Stdout.WriteString("{\"Action\":\"start\",\"Package\":\"p\"}\n{\"Action\":\"run\",\"Package\":\"p\",\"Test\":\"TestInjected\"}\n{\"Action\":\"fail\",\"Package\":\"p\",\"Test\":\"TestInjected\"}\n{\"Action\":\"fail\",\"Package\":\"p\"}\n")
+			os.Exit(1)
+		}
+		_, _ = os.Stdout.WriteString("{\"Action\":\"start\",\"Package\":\"p\"}\n{\"Action\":\"run\",\"Package\":\"p\",\"Test\":\"TestPass\"}\n{\"Action\":\"pass\",\"Package\":\"p\",\"Test\":\"TestPass\"}\n{\"Action\":\"pass\",\"Package\":\"p\"}\n")
+		os.Exit(0)
+	default:
+		os.Exit(2)
+	}
+}
+
 func realCommandStore(t *testing.T) (*Store, string) {
 	t.Helper()
 	base, root := t.TempDir(), filepath.Join(t.TempDir(), "root")
@@ -58,7 +115,7 @@ func commandDefinition(command gate.Command) gate.GateDefinition {
 
 func TestCommandCheckerUsesRunnerAndRejectsOutputOverflow(t *testing.T) {
 	s, root := realCommandStore(t)
-	def := commandDefinition(gate.Command{Argv: []string{"/bin/sh", "-c", "sleep 0.05; printf 0123456789"}, Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 1024, Predicate: gate.CommandPredicateExitZero})
+	def := commandDefinition(gate.Command{Argv: gateHelperArgv("emit", "0123456789"), Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 1024, Predicate: gate.CommandPredicateExitZero})
 	evaluation, err := s.runCommandChecker(context.Background(), def, root)
 	if err != nil {
 		t.Fatal(err)
@@ -78,7 +135,7 @@ func TestCommandCheckerUsesRunnerAndRejectsOutputOverflow(t *testing.T) {
 		t.Fatalf("command did not produce a durable terminal runner record: record=%#v err=%v", record, err)
 	}
 	def.Command.OutputCapBytes = 1024
-	def.Command.Argv = []string{"/bin/sh", "-c", "sleep 0.05; head -c 2048 /dev/zero"}
+	def.Command.Argv = gateHelperArgv("overflow")
 	overflow, err := s.runCommandChecker(context.Background(), def, root)
 	if err != nil {
 		t.Fatal(err)
@@ -90,7 +147,7 @@ func TestCommandCheckerUsesRunnerAndRejectsOutputOverflow(t *testing.T) {
 
 func TestCommandCheckerTimeoutAndTestsGreenZeroCountAreUnevaluated(t *testing.T) {
 	s, root := realCommandStore(t)
-	timeout := commandDefinition(gate.Command{Argv: []string{"/bin/sh", "-c", "sleep 0.05; sleep 30"}, Cwd: "root", TimeoutMS: 20, OutputCapBytes: 1024, Predicate: gate.CommandPredicateExitZero})
+	timeout := commandDefinition(gate.Command{Argv: gateHelperArgv("timeout"), Cwd: "root", TimeoutMS: 20, OutputCapBytes: 1024, Predicate: gate.CommandPredicateExitZero})
 	evaluation, err := s.runCommandChecker(context.Background(), timeout, root)
 	if err != nil {
 		t.Fatal(err)
@@ -98,7 +155,7 @@ func TestCommandCheckerTimeoutAndTestsGreenZeroCountAreUnevaluated(t *testing.T)
 	if evaluation.Predicate != gate.PredicateUnevaluated || evaluation.Code != "U_GATE_COMMAND_TIMEOUT" {
 		t.Fatalf("timeout=%#v", evaluation)
 	}
-	zero := commandDefinition(gate.Command{Argv: []string{"/bin/sh", "-c", "sleep 0.05; printf '{\"Action\":\"start\",\"Package\":\"p\"}\\n{\"Action\":\"pass\",\"Package\":\"p\"}\\n'"}, Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 4096, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
+	zero := commandDefinition(gate.Command{Argv: gateHelperArgv("emit", "{\"Action\":\"start\",\"Package\":\"p\"}\n{\"Action\":\"pass\",\"Package\":\"p\"}\n"), Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 4096, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
 	zeroEval, err := s.runCommandChecker(context.Background(), zero, root)
 	if err != nil {
 		t.Fatal(err)
@@ -110,7 +167,7 @@ func TestCommandCheckerTimeoutAndTestsGreenZeroCountAreUnevaluated(t *testing.T)
 
 func TestCommandCheckerCleanNonzeroIsFailure(t *testing.T) {
 	s, root := realCommandStore(t)
-	def := commandDefinition(gate.Command{Argv: []string{"/bin/sh", "-c", "sleep 0.05; exit 7"}, Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 1024, Predicate: gate.CommandPredicateExitZero})
+	def := commandDefinition(gate.Command{Argv: gateHelperArgv("exit", "7"), Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 1024, Predicate: gate.CommandPredicateExitZero})
 	evaluation, err := s.runCommandChecker(context.Background(), def, root)
 	if err != nil {
 		t.Fatal(err)
@@ -122,11 +179,11 @@ func TestCommandCheckerCleanNonzeroIsFailure(t *testing.T) {
 
 func TestCommandCheckerTestsGreenHonorsFailureOutcomes(t *testing.T) {
 	s, root := realCommandStore(t)
-	failedOutput := "{\"Action\":\"start\",\"Package\":\"p\"}\\n" +
-		"{\"Action\":\"run\",\"Package\":\"p\",\"Test\":\"TestX\"}\\n" +
-		"{\"Action\":\"fail\",\"Package\":\"p\",\"Test\":\"TestX\"}\\n" +
-		"{\"Action\":\"pass\",\"Package\":\"p\"}\\n"
-	failed := commandDefinition(gate.Command{Argv: []string{"/bin/sh", "-c", "sleep 0.05; printf '" + failedOutput + "'"}, Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 4096, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
+	failedOutput := "{\"Action\":\"start\",\"Package\":\"p\"}\n" +
+		"{\"Action\":\"run\",\"Package\":\"p\",\"Test\":\"TestX\"}\n" +
+		"{\"Action\":\"fail\",\"Package\":\"p\",\"Test\":\"TestX\"}\n" +
+		"{\"Action\":\"pass\",\"Package\":\"p\"}\n"
+	failed := commandDefinition(gate.Command{Argv: gateHelperArgv("emit", failedOutput), Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 4096, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
 	evaluation, err := s.runCommandChecker(context.Background(), failed, root)
 	if err != nil {
 		t.Fatal(err)
@@ -135,11 +192,11 @@ func TestCommandCheckerTestsGreenHonorsFailureOutcomes(t *testing.T) {
 		t.Fatalf("failed test outcome=%#v", evaluation)
 	}
 
-	greenOutput := "{\"Action\":\"start\",\"Package\":\"p\"}\\n" +
-		"{\"Action\":\"run\",\"Package\":\"p\",\"Test\":\"TestX\"}\\n" +
-		"{\"Action\":\"pass\",\"Package\":\"p\",\"Test\":\"TestX\"}\\n" +
-		"{\"Action\":\"pass\",\"Package\":\"p\"}\\n"
-	green := commandDefinition(gate.Command{Argv: []string{"/bin/sh", "-c", "sleep 0.05; printf '" + greenOutput + "'"}, Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 4096, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
+	greenOutput := "{\"Action\":\"start\",\"Package\":\"p\"}\n" +
+		"{\"Action\":\"run\",\"Package\":\"p\",\"Test\":\"TestX\"}\n" +
+		"{\"Action\":\"pass\",\"Package\":\"p\",\"Test\":\"TestX\"}\n" +
+		"{\"Action\":\"pass\",\"Package\":\"p\"}\n"
+	green := commandDefinition(gate.Command{Argv: gateHelperArgv("emit", greenOutput), Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 4096, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
 	evaluation, err = s.runCommandChecker(context.Background(), green, root)
 	if err != nil {
 		t.Fatal(err)
@@ -151,7 +208,7 @@ func TestCommandCheckerTestsGreenHonorsFailureOutcomes(t *testing.T) {
 
 func TestCommandCheckerTestsGreenCleanNonzeroEmptyOutputIsFailure(t *testing.T) {
 	s, root := realCommandStore(t)
-	def := commandDefinition(gate.Command{Argv: []string{"/bin/sh", "-c", "sleep 0.05; exit 1"}, Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 1024, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
+	def := commandDefinition(gate.Command{Argv: gateHelperArgv("exit", "1"), Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 1024, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
 	evaluation, err := s.runCommandChecker(context.Background(), def, root)
 	if err != nil {
 		t.Fatal(err)
@@ -168,7 +225,7 @@ func TestCommandCheckerStoresAuthoritativeRunnerEnvDigest(t *testing.T) {
 	}
 	defer os.Unsetenv(name)
 	s, root := realCommandStore(t)
-	def := commandDefinition(gate.Command{Argv: []string{"/bin/sh", "-c", "sleep 0.05; true"}, Cwd: "root", EnvAllow: []string{name}, TimeoutMS: 1000, OutputCapBytes: 1024, Predicate: gate.CommandPredicateExitZero})
+	def := commandDefinition(gate.Command{Argv: gateHelperArgv("noop"), Cwd: "root", EnvAllow: []string{name}, TimeoutMS: 1000, OutputCapBytes: 1024, Predicate: gate.CommandPredicateExitZero})
 	evaluation, err := s.runCommandChecker(context.Background(), def, root)
 	if err != nil {
 		t.Fatal(err)
@@ -194,7 +251,7 @@ func TestCommandCheckerIgnoresAllowedGovernorEnvironmentInDigest(t *testing.T) {
 	t.Setenv("AIRA_CPU_SLOTS_DIR", filepath.Join(t.TempDir(), "slots"))
 	s, root := realCommandStore(t)
 	def := commandDefinition(gate.Command{
-		Argv:           []string{"/bin/sh", "-c", "sleep 0.05; true"},
+		Argv:           gateHelperArgv("noop"),
 		Cwd:            "root",
 		EnvAllow:       []string{"AIRA_CPU_SLOTS_DIR"},
 		TimeoutMS:      1000,
@@ -231,7 +288,7 @@ func TestCommandGateProofBindsCurrentEnvironmentAndLaneReadOnly(t *testing.T) {
 	def := gate.GateDefinition{SchemaVersion: 2, ID: "unit-tests", Name: "Unit tests", Kind: gate.KindCheckable,
 		AppliesTo: gate.AppliesTo{All: true}, Lane: gate.Lane{Name: "go", Checker: string(gate.CheckerCommand), EvaluatorVersion: "1"},
 		ProofPolicy: gate.ProofPolicy{Mode: gate.ProofRequired, MaxAgeSecs: 3600, RequireCurrentCanary: true}, CanaryIDs: []string{"unit-tests-mutation"},
-		Command: &gate.Command{Argv: []string{"/home/user/.local/bin/go", "test", "-json", "./..."}, Cwd: "root", EnvAllow: []string{binding, "GOCACHE", "HOME", "PATH"}, TimeoutMS: 60000, OutputCapBytes: 8 * 1024 * 1024, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen}, Enabled: true}
+		Command: &gate.Command{Argv: gateHelperArgv("source-go-test-json"), Cwd: "root", EnvAllow: []string{binding, "GOCACHE", "HOME", "PATH"}, TimeoutMS: 60000, OutputCapBytes: 8 * 1024 * 1024, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen}, Enabled: true}
 	canary := gate.CanaryDeclaration{SchemaVersion: 1, ID: "unit-tests-mutation", GateID: def.ID, Mode: gate.CanaryMutation,
 		Mutation:           &gate.MutationSeed{SchemaVersion: 1, Kind: "go-inject-failing-test", Seed: 1, PkgDir: ".", TestName: "TestInjected", ExpectedResult: gate.VerdictFail},
 		ExpectedGateResult: gate.VerdictFail, LaneBinding: "go", Isolation: gate.IsolationTempGit, Cadence: gate.CadenceOnDemand}

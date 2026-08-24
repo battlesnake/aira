@@ -353,19 +353,45 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	if !containsPID(members, pid) {
 		return abortStarted(fmt.Errorf("verify scope membership: pid %d absent", pid))
 	}
+	bootID, bootErr := currentBootID()
+	identity := PIDIdentity{PID: pid, StartTick: processStartTick(pid), BootID: bootID}
+	if bootErr != nil || identity.StartTick == 0 {
+		if bootErr == nil {
+			bootErr = errors.New("process start tick unavailable")
+		}
+		return abortStarted(fmt.Errorf("verify process identity: %w", bootErr))
+	}
 	result.Status.Scope = ConfineScopePlaced
+	monitorStop := make(chan struct{})
+	monitorResult := make(chan scopeMonitorResult, 1)
+	go monitorScopeMembership(scope, identity, members, monitorStop, monitorResult)
 	if interrupted.Load() {
+		close(monitorStop)
+		<-monitorResult
 		return abortStarted(errors.New("interrupted before confined target release"))
 	}
 	if n, writeErr := releaseWrite.Write([]byte{1}); writeErr != nil || n != 1 {
+		close(monitorStop)
+		<-monitorResult
 		if writeErr == nil {
 			writeErr = io.ErrShortWrite
 		}
 		return abortStarted(fmt.Errorf("release confined target: %w", writeErr))
 	}
 	_ = releaseWrite.Close()
-	_, _ = fmt.Fprintln(diagnostics, FormatConfineStatus(result.Status))
 	result.Exit = waitConfineCommand(cmd)
+	close(monitorStop)
+	monitorSummary := <-monitorResult
+	teardown := attestScopeTeardown(ctx, scope, pid, 2*time.Second)
+	integrity, _, _ := classifyLaunchScopeIntegrity(launchScopeFacts{
+		ScopeVerified: true, PlacementGuaranteed: true, IdentityValid: true, WaitObserved: true,
+		ScopePath: scope.Reference(), Monitor: monitorSummary, Teardown: teardown,
+	})
+	result.Status.ScopeIntegrity = integrity
+	if observation := escapedObservation(scope.Reference(), monitorSummary.Escape, teardown.Escape); observation != nil {
+		result.Status.DescendantEscape = &DescendantEscapeEvidence{PIDIdentity: observation.Identity, Cgroup: observation.Cgroup}
+	}
+	_, _ = fmt.Fprintln(diagnostics, FormatConfineStatus(result.Status))
 	return result, nil
 }
 

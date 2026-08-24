@@ -64,6 +64,8 @@ type ConfineStatus struct {
 	CapBytes             int64
 	ReserveBytes         int64
 	Scope                ConfineScope
+	ScopeIntegrity       ScopeIntegrity
+	DescendantEscape     *DescendantEscapeEvidence
 	OOMGroup             ConfineOOMGroup
 	Priorities           ConfinePriorities
 	ScopeMemoryMax       int64
@@ -149,6 +151,13 @@ func FormatConfineStatus(status ConfineStatus) string {
 		line += " admission=" + admissionFacet
 	}
 	line += " scope=" + string(status.Scope)
+	if status.ScopeIntegrity != "" {
+		line += " scope-integrity=" + string(status.ScopeIntegrity)
+	}
+	if status.DescendantEscape != nil {
+		line += " escaped-pid=" + strconv.Itoa(status.DescendantEscape.PIDIdentity.PID)
+		line += " escaped-cgroup=" + status.DescendantEscape.Cgroup
+	}
 	line += " oom.group=" + string(status.OOMGroup)
 	line += " priorities=" + string(status.Priorities)
 	if status.ScopeMemoryMax <= 0 {

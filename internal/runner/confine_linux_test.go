@@ -666,6 +666,13 @@ func (s *confineFakeScope) Members() ([]int, error) {
 func (s *confineFakeScope) Empty() (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	live := s.members[:0]
+	for _, pid := range s.members {
+		if processStartTick(pid) != 0 {
+			live = append(live, pid)
+		}
+	}
+	s.members = live
 	return len(s.members) == 0, nil
 }
 func (*confineFakeScope) Terminate([]int) error { return nil }

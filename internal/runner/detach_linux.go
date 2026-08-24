@@ -177,7 +177,7 @@ func (r *Runner) launchDetachedValidated(ctx context.Context, req Request, prefi
 		SchemaVersion: ledgerSchema, ID: id, Owner: r.owner, Ticket: req.Ticket, Phase: req.Phase, Label: req.Label, Tool: req.Tool,
 		Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, Buffering: buffering, Merge: req.Merge,
 		Admission: "disabled", ResourceSignature: req.ResourceSignature, AdmissionReserve: admissionReserve, AdmissionReserveBasis: admissionReserveBasis, LaunchPrefix: append([]string(nil), prefix...), CgroupScope: r.intendedScope(id), StartedAt: nowString(r.now),
-		Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}, Detached: true, StdinConnect: req.StdinConnect, SupervisorPID: supervisor,
+		Status: StatusStarting, OutputRefs: map[string]OutputRef{}, Detached: true, StdinConnect: req.StdinConnect, SupervisorPID: supervisor,
 		Telemetry: req.TelemetryPending,
 	}
 	if _, err := r.append(ledgerEvent{Kind: "starting", Run: record}); err != nil {
@@ -695,6 +695,9 @@ func (r *Runner) terminalizeDetachedNoChild(ctx context.Context, record RunRecor
 		current.KillIntent.Completed, current.KillIntent.Empty = current.KillIntent.Present, true
 	} else {
 		current.Status = StatusCancelled
+	}
+	if current.ScopeIntegrity == "" {
+		current.ScopeIntegrity = ScopeHandoffUnverified
 	}
 	current.EndedAt, current.TerminalComplete = nowString(r.now), true
 	current.ErrorCodes = appendUnique(current.ErrorCodes, code)

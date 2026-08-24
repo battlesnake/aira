@@ -432,7 +432,9 @@ func TestProcessIdentityRejectsReusedPIDStartTick(t *testing.T) {
 
 func TestFailedMembershipObservationCannotClaimContained(t *testing.T) {
 	memberErr := errors.New("cgroup.procs read failed")
-	integrity, unobserved, code := classifyLaunchScopeIntegrity(false, true, true, true, false, memberErr)
+	integrity, unobserved, code := classifyLaunchScopeIntegrity(launchScopeFacts{
+		PlacementGuaranteed: true, IdentityValid: true, WaitObserved: true, MemberErr: memberErr,
+	})
 	if integrity == ScopeContained || integrity != ScopeHandoffUnverified {
 		t.Fatalf("membership failure claimed unexpected integrity=%q", integrity)
 	}
@@ -440,7 +442,9 @@ func TestFailedMembershipObservationCannotClaimContained(t *testing.T) {
 		t.Fatalf("membership failure classification unobserved=%v code=%q", unobserved, code)
 	}
 
-	integrity, unobserved, code = classifyLaunchScopeIntegrity(false, true, false, true, false, nil)
+	integrity, unobserved, code = classifyLaunchScopeIntegrity(launchScopeFacts{
+		PlacementGuaranteed: true, WaitObserved: true,
+	})
 	if integrity == ScopeContained || integrity != ScopeHandoffUnverified {
 		t.Fatalf("invalid start identity claimed unexpected integrity=%q", integrity)
 	}
@@ -449,8 +453,8 @@ func TestFailedMembershipObservationCannotClaimContained(t *testing.T) {
 	}
 }
 
-func TestObservedContainmentUpgradesPreObservationEvidence(t *testing.T) {
-	base := RunRecord{ID: "RUN-1", Buffering: "none", ScopeIntegrity: ScopeHandoffUnverified}
+func TestObservedContainmentFillsEmptyPreObservationEvidence(t *testing.T) {
+	base := RunRecord{ID: "RUN-1", Buffering: "none"}
 	candidate := RunRecord{ID: "RUN-1", Buffering: "realtime", ScopeIntegrity: ScopeContained}
 	merged := mergeEvidence(base, candidate)
 	if merged.ScopeIntegrity != ScopeContained {
@@ -853,7 +857,7 @@ func TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration(t *testing.T) {
 	}
 
 	r = realRunner(t)
-	nearDeadline, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/sh", "-c", "sleep 0.04"}, Timeout: 50 * time.Millisecond})
+	nearDeadline, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/sleep", "0.04"}, Timeout: 50 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1370,7 +1374,9 @@ target="$parent/.aira-descendant-$$"
 mkdir "$target"
 proof=$(pwd)
 printf '%s\n' "$target" > "$proof/target"
-sh -c 'target=$1; proof=$2; printf "%s\n" "$$" > "$proof/pid"; echo $$ > "$target/cgroup.procs"; printf migrated > "$proof/migrated"; exec 1>&- 2>&-; exec sleep 30' sh "$target" "$proof" &
+sh -c 'target=$1; proof=$2; printf "%s\n" "$$" > "$proof/pid"; sleep 0.03; echo $$ > "$target/cgroup.procs"; printf migrated > "$proof/migrated"; exec 1>&- 2>&-; exec sleep 30' sh "$target" "$proof" &
+while [ ! -s "$proof/migrated" ]; do sleep 0.001; done
+sleep 0.03
 exit 0`
 	record, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/sh", "-c", script}, Cwd: proofDir})
 	if err != nil {
@@ -1415,15 +1421,14 @@ exit 0`
 	if record.Status != StatusExited || record.ExitCode == nil || *record.ExitCode != 0 {
 		t.Fatalf("descendant migration record=%+v", record)
 	}
-	if record.ScopeIntegrity == ScopeMigrated && record.CleanSuccess() {
-		t.Fatal("impossible migrated clean success")
+	if record.ScopeIntegrity != ScopeDescendantEscaped || record.DescendantEscape == nil {
+		t.Fatalf("witnessed descendant escape was not attested: %+v", record)
 	}
-	if record.CleanSuccess() {
-		assertHonestExitScope(t, r, record)
-		t.Skip("leader containment observed; descendant containment not attestable after scope exit — daemonless residual, see task #20 (cgroup-namespace / supervisor mitigation)")
+	if record.DescendantEscape.PIDIdentity.PID != pid || record.DescendantEscape.Cgroup != target {
+		t.Fatalf("escape evidence=%+v want pid=%d cgroup=%q", record.DescendantEscape, pid, target)
 	}
-	if record.ScopeIntegrity == ScopeContained && len(record.ErrorCodes) == 0 {
-		t.Fatalf("fixture was proven escaped but record was unexpectedly clean: %+v", record)
+	if !containsString(record.ErrorCodes, "E_RUN_SCOPE_MIGRATION") || record.CleanSuccess() {
+		t.Fatalf("escaped record has dishonest terminal evidence: %+v", record)
 	}
 }
 

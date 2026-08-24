@@ -29,13 +29,14 @@ type ScopeIntegrity string
 
 const (
 	ScopeContained ScopeIntegrity = "contained"
-	// ScopeUnverified means clone placement succeeded, but the leader was
-	// never positively observed in cgroup.procs before it exited. It is not
-	// evidence of migration, and it is deliberately not positive containment.
+	// ScopeUnverified means placement was proven but the available observations
+	// cannot attest descendant containment. It is not evidence of migration,
+	// and it is deliberately not positive containment.
 	ScopeUnverified        ScopeIntegrity = "unverified"
 	ScopeHandoffUnverified ScopeIntegrity = "handoff-unverified"
 	ScopeMigrated          ScopeIntegrity = "migrated"
 	ScopeDescendantKilled  ScopeIntegrity = "descendant-killed"
+	ScopeDescendantEscaped ScopeIntegrity = "descendant-escaped"
 )
 
 type OutputState string
@@ -76,59 +77,68 @@ type PIDIdentity struct {
 	BootID    string `json:"boot_id,omitempty"`
 }
 
+// DescendantEscapeEvidence records the exact live process identity and foreign
+// cgroup that completed a witnessed escape proof. It describes an observation,
+// not who moved the process or how it was moved.
+type DescendantEscapeEvidence struct {
+	PIDIdentity PIDIdentity `json:"pid_identity"`
+	Cgroup      string      `json:"cgroup"`
+}
+
 // RunRecord is the durable protocol object. It intentionally contains no
 // environment values or inferred green field. Telemetry is an opaque envelope:
 // runner persists it but never assigns meaning to its values or references.
 type RunRecord struct {
-	SchemaVersion         int                  `json:"schema_version"`
-	ID                    string               `json:"id"`
-	Owner                 string               `json:"owner,omitempty"`
-	StolenBy              string               `json:"stolen_by,omitempty"`
-	Ticket                string               `json:"ticket,omitempty"`
-	Phase                 string               `json:"phase,omitempty"`
-	Label                 string               `json:"label,omitempty"`
-	Tool                  string               `json:"tool,omitempty"`
-	Argv                  []string             `json:"argv"`
-	Cwd                   string               `json:"cwd"`
-	EnvDigest             string               `json:"env_digest"`
-	Buffering             string               `json:"buffering"`
-	Merge                 bool                 `json:"merge_streams"`
-	Admission             string               `json:"admission"`
-	AdmissionReason       string               `json:"admission_reason,omitempty"`
-	AdmissionWaitedMS     int64                `json:"admission_waited_ms"`
-	ResourceSignature     string               `json:"resource_signature,omitempty"`
-	AdmissionReserve      *int64               `json:"admission_reserve,omitempty"`
-	AdmissionReserveBasis string               `json:"admission_reserve_basis,omitempty"`
-	ScopeMemoryMax        *int64               `json:"scope_memory_max,omitempty"`
-	ScopeMemoryHigh       *int64               `json:"scope_memory_high,omitempty"`
-	LaunchPrefix          []string             `json:"launch_prefix,omitempty"`
-	CgroupScope           string               `json:"cgroup_scope,omitempty"`
-	StartedAt             string               `json:"started_at"`
-	EndedAt               string               `json:"ended_at,omitempty"`
-	Status                Status               `json:"status"`
-	ScopeIntegrity        ScopeIntegrity       `json:"scope_integrity"`
-	ExitCode              *int                 `json:"exit_code,omitempty"`
-	Signal                string               `json:"signal,omitempty"`
-	OutputRefs            map[string]OutputRef `json:"output_refs,omitempty"`
-	CaptureComplete       bool                 `json:"capture_complete"`
-	CaptureForcedClosed   bool                 `json:"capture_forced_closed"`
-	StdinStored           bool                 `json:"stdin_stored"`
-	ScopeKill             ScopeKill            `json:"scope_kill"`
-	KillIntent            KillIntent           `json:"kill_intent"`
-	ErrorCodes            []string             `json:"error_codes,omitempty"`
-	PeakRSS               *int64               `json:"peak_rss,omitempty"`
-	CPUUser               *int64               `json:"cpu_user,omitempty"`
-	CPUSys                *int64               `json:"cpu_sys,omitempty"`
-	PIDIdentity           PIDIdentity          `json:"pid_identity,omitempty"`
-	Detached              bool                 `json:"detached,omitempty"`
-	StdinConnect          bool                 `json:"stdin_connect,omitempty"`
-	InputSocket           string               `json:"input_socket,omitempty"`
-	SupervisorPID         PIDIdentity          `json:"supervisor_pid,omitempty"`
-	LeaderExitObserved    bool                 `json:"leader_exit_observed,omitempty"`
-	QuiesceForced         bool                 `json:"quiesce_forced,omitempty"`
-	TerminalComplete      bool                 `json:"terminal_complete"`
-	Telemetry             string               `json:"telemetry,omitempty"`
-	TelemetryRefs         []string             `json:"telemetry_refs,omitempty"`
+	SchemaVersion         int                       `json:"schema_version"`
+	ID                    string                    `json:"id"`
+	Owner                 string                    `json:"owner,omitempty"`
+	StolenBy              string                    `json:"stolen_by,omitempty"`
+	Ticket                string                    `json:"ticket,omitempty"`
+	Phase                 string                    `json:"phase,omitempty"`
+	Label                 string                    `json:"label,omitempty"`
+	Tool                  string                    `json:"tool,omitempty"`
+	Argv                  []string                  `json:"argv"`
+	Cwd                   string                    `json:"cwd"`
+	EnvDigest             string                    `json:"env_digest"`
+	Buffering             string                    `json:"buffering"`
+	Merge                 bool                      `json:"merge_streams"`
+	Admission             string                    `json:"admission"`
+	AdmissionReason       string                    `json:"admission_reason,omitempty"`
+	AdmissionWaitedMS     int64                     `json:"admission_waited_ms"`
+	ResourceSignature     string                    `json:"resource_signature,omitempty"`
+	AdmissionReserve      *int64                    `json:"admission_reserve,omitempty"`
+	AdmissionReserveBasis string                    `json:"admission_reserve_basis,omitempty"`
+	ScopeMemoryMax        *int64                    `json:"scope_memory_max,omitempty"`
+	ScopeMemoryHigh       *int64                    `json:"scope_memory_high,omitempty"`
+	LaunchPrefix          []string                  `json:"launch_prefix,omitempty"`
+	CgroupScope           string                    `json:"cgroup_scope,omitempty"`
+	StartedAt             string                    `json:"started_at"`
+	EndedAt               string                    `json:"ended_at,omitempty"`
+	Status                Status                    `json:"status"`
+	ScopeIntegrity        ScopeIntegrity            `json:"scope_integrity"`
+	DescendantEscape      *DescendantEscapeEvidence `json:"descendant_escape,omitempty"`
+	ExitCode              *int                      `json:"exit_code,omitempty"`
+	Signal                string                    `json:"signal,omitempty"`
+	OutputRefs            map[string]OutputRef      `json:"output_refs,omitempty"`
+	CaptureComplete       bool                      `json:"capture_complete"`
+	CaptureForcedClosed   bool                      `json:"capture_forced_closed"`
+	StdinStored           bool                      `json:"stdin_stored"`
+	ScopeKill             ScopeKill                 `json:"scope_kill"`
+	KillIntent            KillIntent                `json:"kill_intent"`
+	ErrorCodes            []string                  `json:"error_codes,omitempty"`
+	PeakRSS               *int64                    `json:"peak_rss,omitempty"`
+	CPUUser               *int64                    `json:"cpu_user,omitempty"`
+	CPUSys                *int64                    `json:"cpu_sys,omitempty"`
+	PIDIdentity           PIDIdentity               `json:"pid_identity,omitempty"`
+	Detached              bool                      `json:"detached,omitempty"`
+	StdinConnect          bool                      `json:"stdin_connect,omitempty"`
+	InputSocket           string                    `json:"input_socket,omitempty"`
+	SupervisorPID         PIDIdentity               `json:"supervisor_pid,omitempty"`
+	LeaderExitObserved    bool                      `json:"leader_exit_observed,omitempty"`
+	QuiesceForced         bool                      `json:"quiesce_forced,omitempty"`
+	TerminalComplete      bool                      `json:"terminal_complete"`
+	Telemetry             string                    `json:"telemetry,omitempty"`
+	TelemetryRefs         []string                  `json:"telemetry_refs,omitempty"`
 }
 
 func (r RunRecord) CleanSuccess() bool {

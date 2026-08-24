@@ -370,7 +370,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		admissionReserve, admissionReserveBasis := r.admissionProvenance(req)
 		// Containment is not an initial assumption. Until the leader is positively
 		// observed in cgroup.procs, the durable record must remain non-contained.
-		record = RunRecord{SchemaVersion: ledgerSchema, ID: id, Owner: r.owner, Ticket: req.Ticket, Phase: req.Phase, Label: req.Label, Tool: req.Tool, Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, Buffering: buffering, Merge: req.Merge, Admission: admission.state, AdmissionReason: admission.reason, AdmissionWaitedMS: admission.waitedMS, ResourceSignature: req.ResourceSignature, AdmissionReserve: admissionReserve, AdmissionReserveBasis: admissionReserveBasis, LaunchPrefix: append([]string(nil), prefix...), StartedAt: started, Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, OutputRefs: map[string]OutputRef{}, Detached: req.Detach, Telemetry: req.TelemetryPending}
+		record = RunRecord{SchemaVersion: ledgerSchema, ID: id, Owner: r.owner, Ticket: req.Ticket, Phase: req.Phase, Label: req.Label, Tool: req.Tool, Argv: append([]string(nil), req.Argv...), Cwd: cwd, EnvDigest: envDigest, Buffering: buffering, Merge: req.Merge, Admission: admission.state, AdmissionReason: admission.reason, AdmissionWaitedMS: admission.waitedMS, ResourceSignature: req.ResourceSignature, AdmissionReserve: admissionReserve, AdmissionReserveBasis: admissionReserveBasis, LaunchPrefix: append([]string(nil), prefix...), StartedAt: started, Status: StatusStarting, OutputRefs: map[string]OutputRef{}, Detached: req.Detach, Telemetry: req.TelemetryPending}
 		if req.Detach {
 			record.SupervisorPID = PIDIdentity{PID: os.Getpid(), StartTick: processStartTick(os.Getpid()), BootID: bootID}
 			if record.SupervisorPID.StartTick == 0 {
@@ -531,8 +531,8 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		return nil, launchErr("E_RUN_RECONCILE_REQUIRED", err)
 	}
 	monitorStop := make(chan struct{})
-	monitorResult := make(chan bool, 1)
-	go monitorScopeMembership(scope, record.PIDIdentity, monitorStop, monitorResult)
+	monitorResult := make(chan scopeMonitorResult, 1)
+	go monitorScopeMembership(scope, record.PIDIdentity, members, monitorStop, monitorResult)
 
 	captureCh := make(chan captureResult, len(readers))
 	liveStreams = make(map[string]*liveStream)
@@ -600,17 +600,22 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		waitErr, waitState = outcome.err, outcome.state
 	}
 	close(monitorStop)
-	migrated := initialMigrated
+	monitorSummary := <-monitorResult
+	monitorSummary.LeaderMigrated = monitorSummary.LeaderMigrated || initialMigrated
 	// Always join the monitor, even when the initial observation already found
 	// a live escape, so its event watcher cannot outlive this launch.
-	if <-monitorResult {
-		migrated = true
-	}
 	waitExit, waitSignal := waitEvidence(waitState, waitErr)
 	waitObserved := waitExit != nil || waitSignal != ""
 	var unobservedPlacedExit bool
 	var scopeCode string
-	record.ScopeIntegrity, unobservedPlacedExit, scopeCode = classifyLaunchScopeIntegrity(scopeVerified, placementGuaranteed, identityValid, waitObserved, migrated, memberErr)
+	record.ScopeIntegrity, unobservedPlacedExit, scopeCode = classifyLaunchScopeIntegrity(launchScopeFacts{
+		ScopeVerified: scopeVerified, PlacementGuaranteed: placementGuaranteed,
+		IdentityValid: identityValid, WaitObserved: waitObserved, MemberErr: memberErr,
+		ScopePath: scope.Reference(), Monitor: monitorSummary,
+	})
+	if observation := escapedObservation(scope.Reference(), monitorSummary.Escape, nil); observation != nil {
+		record.DescendantEscape = &DescendantEscapeEvidence{PIDIdentity: observation.Identity, Cgroup: observation.Cgroup}
+	}
 	if scopeCode != "" {
 		// A failed membership observation is not itself an escape: a successful
 		// CLONE_INTO_CGROUP placement followed by a real wait exit leaves the
@@ -745,7 +750,10 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_CAPTURE_FAILED")
 	}
 
-	if !record.CaptureComplete || forced {
+	var teardown scopeTeardownResult
+	if (!record.CaptureComplete || forced) && !req.PTY {
+		teardown = attestScopeTeardown(ctx, scope, record.PIDIdentity.PID, r.grace)
+	} else if (!record.CaptureComplete || forced) && req.PTY {
 		members, membersErr := scope.Members()
 		if membersErr == nil && len(members) > 0 {
 			if kill, err := r.killScope(ctx, scope, id, "capture"); err == nil && kill.Completed {
@@ -758,21 +766,25 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 			record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_SCOPE_HANDOFF")
 		}
 	}
-	empty, emptyErr := scope.Empty()
-	if migrated {
-		record.ScopeIntegrity = ScopeMigrated
-		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_SCOPE_MIGRATION")
-	} else if emptyErr != nil {
-		record.ScopeIntegrity = ScopeHandoffUnverified
-		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_SCOPE_HANDOFF")
-	} else if !empty {
-		record.ScopeIntegrity = ScopeHandoffUnverified
-		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_SCOPE_HANDOFF")
-	} else if unobservedPlacedExit {
-		// Placement proves where the leader started, not that it remained there.
-		// This honest third state is distinct from both observed containment and a
-		// live migration: daemonless observation cannot classify migrate-and-exit.
-		record.ScopeIntegrity = ScopeUnverified
+	if !req.PTY && !teardown.Observed && !teardown.Gap {
+		teardown = attestScopeTeardown(ctx, scope, record.PIDIdentity.PID, r.grace)
+	}
+	finalIntegrity, _, finalScopeCode := classifyLaunchScopeIntegrity(launchScopeFacts{
+		ScopeVerified: scopeVerified, PlacementGuaranteed: placementGuaranteed,
+		IdentityValid: identityValid, WaitObserved: waitObserved, MemberErr: memberErr,
+		ScopePath: scope.Reference(), Monitor: monitorSummary, Teardown: teardown,
+	})
+	if scopeIntegrityPrecedence(finalIntegrity) > scopeIntegrityPrecedence(record.ScopeIntegrity) {
+		record.ScopeIntegrity = finalIntegrity
+	}
+	if finalScopeCode != "" {
+		record.ErrorCodes = appendUnique(record.ErrorCodes, finalScopeCode)
+	}
+	if observation := escapedObservation(scope.Reference(), monitorSummary.Escape, teardown.Escape); observation != nil {
+		record.DescendantEscape = &DescendantEscapeEvidence{PIDIdentity: observation.Identity, Cgroup: observation.Cgroup}
+	}
+	if teardown.DescendantKilled {
+		record.ScopeKill = ScopeKill{Requested: true, Started: true, Completed: true, GraceMS: r.grace.Milliseconds(), Actor: "aira", At: nowString(r.now)}
 	}
 	if timedOut {
 		record.Status = StatusKilled
@@ -783,7 +795,9 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 			record.KillIntent = KillIntent{Present: true, Sequence: timeoutKill.IntentSequence, Completed: true, Empty: true}
 		} else {
 			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
-			record.ScopeIntegrity = ScopeHandoffUnverified
+			if scopeIntegrityPrecedence(ScopeHandoffUnverified) > scopeIntegrityPrecedence(record.ScopeIntegrity) {
+				record.ScopeIntegrity = ScopeHandoffUnverified
+			}
 		}
 	} else if waitObserved && (scopeVerified || unobservedPlacedExit) {
 		record.Status = StatusExited
@@ -802,7 +816,7 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if record.Status == StatusExited && record.ExitCode != nil && *record.ExitCode != 0 {
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_FAILED")
 	}
-	if record.ScopeIntegrity != ScopeContained && record.ScopeIntegrity != ScopeUnverified && !hasScopeReconcileError(record.ErrorCodes) {
+	if record.ScopeIntegrity == ScopeHandoffUnverified && !hasScopeReconcileError(record.ErrorCodes) {
 		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_SCOPE_HANDOFF")
 	}
 	record.EndedAt = nowString(r.now)
@@ -961,6 +975,9 @@ func (r *Runner) failLaunchPrep(ctx context.Context, record RunRecord, code stri
 }
 
 func (r *Runner) failBeforeLaunch(ctx context.Context, record RunRecord, code string, err error) (*RunRecord, error) {
+	if record.ScopeIntegrity == "" {
+		record.ScopeIntegrity = ScopeHandoffUnverified
+	}
 	lock, lockErr := lockFile(filepath.Join(filepath.Dir(r.ledger.ledger), record.ID+".lock"))
 	if lockErr != nil {
 		return nil, launchErr("U_RUN_RECONCILE_REQUIRED", lockErr)
@@ -1327,14 +1344,69 @@ func waitEvidence(state *os.ProcessState, waitErr error) (*int, string) {
 	return nil, ""
 }
 
-func classifyLaunchScopeIntegrity(scopeVerified, placementGuaranteed, identityValid, waitObserved, migrated bool, memberErr error) (ScopeIntegrity, bool, string) {
-	if migrated {
-		return ScopeMigrated, false, ""
+type launchScopeFacts struct {
+	ScopeVerified       bool
+	PlacementGuaranteed bool
+	IdentityValid       bool
+	WaitObserved        bool
+	MemberErr           error
+	ScopePath           string
+	Monitor             scopeMonitorResult
+	Teardown            scopeTeardownResult
+}
+
+type scopeMonitorResult struct {
+	LeaderMigrated bool
+	HadDescendants bool
+	Gap            bool
+	Escape         *processCgroupObservation
+}
+
+type scopeTeardownResult struct {
+	Observed         bool
+	Empty            bool
+	DescendantKilled bool
+	Gap              bool
+	Escape           *processCgroupObservation
+}
+
+type processCgroupObservation struct {
+	Identity        PIDIdentity
+	Live            processLiveness
+	Readable        bool
+	StartTickBefore uint64
+	StartTickAfter  uint64
+	Cgroup          string
+}
+
+func classifyLaunchScopeIntegrity(facts launchScopeFacts) (ScopeIntegrity, bool, string) {
+	if witnessedEscape(facts.ScopePath, facts.Monitor.Escape) || witnessedEscape(facts.ScopePath, facts.Teardown.Escape) {
+		return ScopeDescendantEscaped, false, "E_RUN_SCOPE_MIGRATION"
 	}
-	if scopeVerified {
+	if facts.Monitor.LeaderMigrated {
+		return ScopeMigrated, false, "E_RUN_SCOPE_MIGRATION"
+	}
+	if facts.Teardown.DescendantKilled {
+		return ScopeDescendantKilled, false, "E_RUN_DESCENDANT_KILLED"
+	}
+	if facts.Teardown.Observed {
+		if facts.Monitor.Gap || facts.Teardown.Gap || !facts.Teardown.Empty || facts.Monitor.HadDescendants {
+			return ScopeUnverified, false, ""
+		}
+		if facts.ScopeVerified {
+			return ScopeContained, false, ""
+		}
+	}
+	if facts.Teardown.Gap && facts.PlacementGuaranteed && facts.IdentityValid && facts.WaitObserved {
+		return ScopeUnverified, true, ""
+	}
+	if facts.Monitor.Gap && facts.PlacementGuaranteed && facts.IdentityValid && facts.WaitObserved {
+		return ScopeUnverified, true, ""
+	}
+	if facts.ScopeVerified {
 		return ScopeContained, false, ""
 	}
-	if placementGuaranteed && identityValid && memberErr == nil && waitObserved {
+	if facts.PlacementGuaranteed && facts.IdentityValid && facts.MemberErr == nil && facts.WaitObserved {
 		// Placement plus a real wait exit, without positive membership evidence,
 		// is honest only as unverified—not as positive containment.
 		return ScopeUnverified, true, ""
@@ -1342,9 +1414,43 @@ func classifyLaunchScopeIntegrity(scopeVerified, placementGuaranteed, identityVa
 	return ScopeHandoffUnverified, false, "E_RUN_SCOPE_INVALID"
 }
 
+func witnessedEscape(scopePath string, observation *processCgroupObservation) bool {
+	if observation == nil || observation.Live != processAlive || !observation.Readable || observation.Cgroup == "" {
+		return false
+	}
+	identity := observation.Identity
+	if identity.PID <= 0 || identity.StartTick == 0 || observation.StartTickBefore != identity.StartTick || observation.StartTickAfter != identity.StartTick {
+		return false
+	}
+	return !pathEqualOrUnder(scopePath, observation.Cgroup)
+}
+
+func escapedObservation(scopePath string, observations ...*processCgroupObservation) *processCgroupObservation {
+	for _, observation := range observations {
+		if witnessedEscape(scopePath, observation) {
+			return observation
+		}
+	}
+	return nil
+}
+
+func pathEqualOrUnder(root, candidate string) bool {
+	root = filepath.Clean(root)
+	candidate = filepath.Clean(candidate)
+	if root == "." || candidate == "." || !filepath.IsAbs(root) || !filepath.IsAbs(candidate) {
+		return false
+	}
+	relative, err := filepath.Rel(root, candidate)
+	if err != nil {
+		return false
+	}
+	return relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative))
+}
+
 var (
-	readBootIDFn   = currentBootID
-	readProcStatFn = func(pid int) ([]byte, error) { return os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)) }
+	readBootIDFn     = currentBootID
+	readProcStatFn   = func(pid int) ([]byte, error) { return os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)) }
+	readProcCgroupFn = func(pid int) ([]byte, error) { return os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid)) }
 )
 
 func currentBootID() (string, error) {
@@ -1386,39 +1492,231 @@ func processStartTick(pid int) uint64 {
 	return tick
 }
 
-func monitorScopeMembership(scope Scope, identity PIDIdentity, stop <-chan struct{}, result chan<- bool) {
-	// This detects a live launch process observed outside the scope. A process
-	// that migrates and exits between two samples is inherently unobservable
-	// without a supervisor; such descendant/handoff limits remain non-green
-	// whenever the scope/pipe evidence is incomplete.
+func monitorScopeMembership(scope Scope, leader PIDIdentity, initialMembers []int, stop <-chan struct{}, result chan<- scopeMonitorResult) {
+	// Sampling can prove a live escape but cannot prove that no descendant
+	// escaped between samples. The ever-member inventory is therefore evidence
+	// for witnessed escapes and teardown honesty, never a whole-tree guarantee.
 	ticker := time.NewTicker(2 * time.Millisecond)
 	defer ticker.Stop()
 	events := scopeMembershipEvents(scope, stop)
-	for {
-		select {
-		case <-stop:
-			result <- false
+	summary := scopeMonitorResult{}
+	everMembers := make(map[PIDIdentity]struct{})
+	bootID := leader.BootID
+	if bootID == "" {
+		var err error
+		bootID, err = readBootIDFn()
+		if err != nil || bootID == "" {
+			summary.Gap = true
+		}
+	}
+
+	sample := func(seed []int) {
+		members := seed
+		var err error
+		if members == nil {
+			members, err = scope.Members()
+		}
+		if err != nil {
+			summary.Gap = true
 			return
-		case <-ticker.C:
-			if !processIdentityMatches(identity) {
-				result <- false
-				return
+		}
+		memberNow := make(map[int]struct{}, len(members))
+		for _, pid := range members {
+			memberNow[pid] = struct{}{}
+			observed := PIDIdentity{PID: pid, StartTick: processStartTick(pid), BootID: bootID}
+			if pid == leader.PID && leader.StartTick != 0 && leader.BootID != "" {
+				observed = leader
 			}
-			members, err := scope.Members()
-			if err == nil && !containsPID(members, identity.PID) && processLive(identity) == processAlive {
-				result <- true
-				return
+			if observed.StartTick == 0 || observed.BootID == "" {
+				summary.Gap = true
+				continue
 			}
-		case <-events:
-			if processIdentityMatches(identity) {
-				members, err := scope.Members()
-				if err == nil && !containsPID(members, identity.PID) && processLive(identity) == processAlive {
-					result <- true
-					return
+			if _, known := everMembers[observed]; !known && pid != leader.PID {
+				confirmed, confirmErr := scope.Members()
+				if confirmErr != nil || !containsPID(confirmed, pid) || processStartTick(pid) != observed.StartTick {
+					summary.Gap = true
+					continue
 				}
+			}
+			everMembers[observed] = struct{}{}
+			if pid != leader.PID {
+				summary.HadDescendants = true
+			}
+		}
+
+		if _, present := memberNow[leader.PID]; !present && processLive(leader) == processAlive {
+			summary.LeaderMigrated = true
+		}
+		for observed := range everMembers {
+			live := processLive(observed)
+			if live == processDead {
+				delete(everMembers, observed)
+				continue
+			}
+			if live == processUnknown {
+				summary.Gap = true
+				continue
+			}
+			if observed.PID == leader.PID {
+				continue
+			}
+			if _, directMember := memberNow[observed.PID]; directMember {
+				continue
+			}
+			observation := observeProcessCgroup(observed, scope.Reference())
+			if !observation.Readable {
+				summary.Gap = true
+				continue
+			}
+			if witnessedEscape(scope.Reference(), &observation) && summary.Escape == nil {
+				copy := observation
+				summary.Escape = &copy
 			}
 		}
 	}
+
+	sample(initialMembers)
+	for {
+		select {
+		case <-stop:
+			sample(nil)
+			result <- summary
+			return
+		case <-ticker.C:
+			sample(nil)
+		case <-events:
+			sample(nil)
+		}
+	}
+}
+
+func observeProcessCgroup(identity PIDIdentity, scopePath string) processCgroupObservation {
+	observation := processCgroupObservation{Identity: identity, Live: processLive(identity)}
+	if observation.Live != processAlive {
+		return observation
+	}
+	before, err := readProcStatFn(identity.PID)
+	if err != nil {
+		return observation
+	}
+	observation.StartTickBefore, _ = processStartTickFromStat(before)
+	cgroupData, err := readProcCgroupFn(identity.PID)
+	if err != nil {
+		return observation
+	}
+	after, err := readProcStatFn(identity.PID)
+	if err != nil {
+		return observation
+	}
+	observation.StartTickAfter, _ = processStartTickFromStat(after)
+	observation.Live = processLivenessFromStat(after)
+	mount, err := unifiedMount()
+	if err != nil {
+		return observation
+	}
+	observation.Cgroup, err = processUnifiedCgroupPath(cgroupData, mount)
+	observation.Readable = err == nil
+	return observation
+}
+
+func processLivenessFromStat(data []byte) processLiveness {
+	i := strings.LastIndexByte(string(data), ')')
+	if i < 0 || i+2 >= len(data) {
+		return processUnknown
+	}
+	switch data[i+2] {
+	case 'Z', 'X', 'x':
+		return processDead
+	default:
+		return processAlive
+	}
+}
+
+func processUnifiedCgroupPath(data []byte, mount string) (string, error) {
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "0::") {
+			relative := strings.TrimPrefix(line, "0::")
+			if relative == "" {
+				return "", errors.New("empty unified cgroup membership")
+			}
+			return filepath.Join(mount, strings.TrimPrefix(relative, "/")), nil
+		}
+	}
+	return "", errors.New("unified cgroup membership not found")
+}
+
+func snapshotScopeMemberIdentities(scope Scope, excludePID int) ([]PIDIdentity, bool) {
+	members, err := scope.Members()
+	if err != nil {
+		return nil, false
+	}
+	bootID, err := readBootIDFn()
+	if err != nil || bootID == "" {
+		return nil, false
+	}
+	identities := make([]PIDIdentity, 0, len(members))
+	for _, pid := range members {
+		if pid == excludePID {
+			continue
+		}
+		startTick := processStartTick(pid)
+		confirmed, confirmErr := scope.Members()
+		if startTick == 0 || confirmErr != nil || !containsPID(confirmed, pid) || processStartTick(pid) != startTick {
+			return nil, false
+		}
+		identities = append(identities, PIDIdentity{PID: pid, StartTick: startTick, BootID: bootID})
+	}
+	if len(identities) == 0 {
+		return nil, false
+	}
+	return identities, true
+}
+
+func attestScopeTeardown(ctx context.Context, scope Scope, excludePID int, wait time.Duration) scopeTeardownResult {
+	empty, err := scope.Empty()
+	if err != nil {
+		return scopeTeardownResult{Gap: true}
+	}
+	result := scopeTeardownResult{Observed: true, Empty: empty}
+	if empty {
+		return result
+	}
+	identities, complete := snapshotScopeMemberIdentities(scope, excludePID)
+	if !complete {
+		result.Gap = true
+	}
+	if err := scope.Kill(); err != nil {
+		result.Gap = true
+		return result
+	}
+	if err := waitEmpty(ctx, scope, wait); err != nil {
+		result.Gap = true
+	}
+	postEmpty, postErr := scope.Empty()
+	if postErr != nil || !postEmpty {
+		result.Gap = true
+	} else {
+		result.Empty = true
+	}
+	allDead := complete && len(identities) > 0
+	for _, identity := range identities {
+		switch processLive(identity) {
+		case processDead:
+			continue
+		case processAlive:
+			observation := observeProcessCgroup(identity, scope.Reference())
+			if witnessedEscape(scope.Reference(), &observation) && result.Escape == nil {
+				copy := observation
+				result.Escape = &copy
+			}
+			allDead = false
+		default:
+			result.Gap = true
+			allDead = false
+		}
+	}
+	result.DescendantKilled = allDead && result.Empty && !result.Gap && result.Escape == nil
+	return result
 }
 
 type scopeEvents interface{ EventsPath() string }

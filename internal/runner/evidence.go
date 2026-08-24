@@ -75,8 +75,12 @@ func mergeEvidence(base, candidate RunRecord) RunRecord {
 	base.CaptureComplete = candidate.CaptureComplete
 	base.CaptureForcedClosed = candidate.CaptureForcedClosed
 	base.StdinStored = base.StdinStored || candidate.StdinStored
-	if candidate.ScopeIntegrity != "" {
+	if scopeIntegrityPrecedence(candidate.ScopeIntegrity) > scopeIntegrityPrecedence(base.ScopeIntegrity) {
 		base.ScopeIntegrity = candidate.ScopeIntegrity
+	}
+	if candidate.ScopeIntegrity == ScopeDescendantEscaped && candidate.DescendantEscape != nil && base.DescendantEscape == nil {
+		escape := *candidate.DescendantEscape
+		base.DescendantEscape = &escape
 	}
 	if candidate.ScopeKill.Requested {
 		base.ScopeKill = candidate.ScopeKill
@@ -89,6 +93,25 @@ func mergeEvidence(base, candidate RunRecord) RunRecord {
 		base.ErrorCodes = appendUnique(base.ErrorCodes, code)
 	}
 	return base
+}
+
+func scopeIntegrityPrecedence(integrity ScopeIntegrity) int {
+	switch integrity {
+	case ScopeContained:
+		return 1
+	case ScopeHandoffUnverified:
+		return 2
+	case ScopeUnverified:
+		return 3
+	case ScopeDescendantKilled:
+		return 4
+	case ScopeMigrated:
+		return 5
+	case ScopeDescendantEscaped:
+		return 6
+	default:
+		return 0
+	}
 }
 
 func exitEvidenceConflicts(baseExit *int, baseSignal string, candidateExit *int, candidateSignal string) bool {
