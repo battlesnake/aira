@@ -1,8 +1,11 @@
 # AIRA watchdog — enforce-path hardening (multi-offender pursuit + audit honesty)
 
-Status: PLAN v2 — folds Sol GATE-FAIL (transient-dip re-arm, imprecise no-over-kill claim,
-contradictory cooldown reset) and Fable GATE-PASS-WITH-NITS (cooldown derivation vs the deps
-seam, a third overclaiming outcome string, snapshot-error-during-re-arm, prefix preservation).
+Status: PLAN v3 (builder-ready) — v2 folded Sol GATE-FAIL; v3 folds the re-gate: Sol
+GATE-PASS-WITH-NITS + Fable GATE-PASS-WITH-NITS incl. one P1 (a defer/failed re-kill must NOT
+unset an earned `latch` or it swallows the `recovered` event — §2 act step-4). Both gates now
+pass; the remaining items are the precise folds below (F2 escalation wording, `!memOK` clears
+`criticalRun`, existing-test updates). Original v2 folds: cooldown-derivation-as-const,
+a third overclaiming outcome string, snapshot-error-during-re-arm, prefix preservation.
 Pre-flip hardening (#65, follow-up to #64) after a cross-lineage flip-review of the LIVE enforce
 code (Opus build-review: no live defect; **Sol + DeepSeek both BLOCK**, independently).
 Safety-critical KILL logic → full two-loop, then re-run the cross-lineage flip-review; flip only
@@ -65,7 +68,7 @@ Per-poll transition table (after reading `available`; `low`=8 GiB, `recover`=16 
 
 | condition | armCount | criticalRun | latched | cooldown | action |
 |---|---|---|---|---|---|
-| `!memOK` | 0 | (keep) | (keep) | 0 | emit `unevaluated`; return |
+| `!memOK` | 0 | **false** | (keep) | 0 | emit `unevaluated`; return — a failed mem read breaks the continuous-`<8G` evidence, so the next dip re-debounces; `latched` kept (recovery unknown, don't emit `recovered`) |
 | `available >= recover` | 0 | false | false | 0 | if was `latched`: emit `recovered`; return |
 | `low <= available < recover` (HOLD) | 0 | **false** | (keep) | 0 | return — **no new kill**; clearing `criticalRun` forces re-debounce on the next dip |
 | `available < low` **and** `criticalRun` | (0) | true | — | see act | if `cooldown>0`: `cooldown--`, return; else `act(entry=false)` |
@@ -73,16 +76,27 @@ Per-poll transition table (after reading `available`; `low`=8 GiB, `recover`=16 
 
 `act(entry)`:
 1. if `entry`: emit `trip` (a re-kill within a `criticalRun` is NOT a fresh trip — so `trip`
-   count == number of debounced episode-entries, one per continuous critical run).
+   count == number of debounced episode-entries, one per **successfully maintained** episode;
+   see the trip/recovered note below).
 2. snapshot procs. **On error: emit `unevaluated`; keep `criticalRun`/`latched` (a live episode
-   is not ended by a transient snapshot failure); `armCount=0`; return** (retry next poll).
+   is not ended by a transient snapshot failure — the `<8G` read already succeeded this poll);
+   `armCount=0`; return** (retry next poll).
 3. read PSI (observe only — off the enforce kill path, unchanged from #64); `acted :=
    handleArmed(...)`.
 4. if `acted`: `latched=true; criticalRun=true; cooldown=watchdogReArmCooldown`.
-   else (defer / all-retryable-failure): `latched=false; criticalRun=false; cooldown=0` (the #64
-   "defer/failed round does not latch" rule — the episode drops; a still-critical next poll
-   re-debounces).
+   else (defer / all-retryable-failure): `criticalRun=false; cooldown=0` — **leave `latched`
+   untouched** (Fable P1). The #64 rule is "a defer/failed round does not *set* `latched`": in the
+   ENTRY path `latched` is already `false`, so this drops the episode and the next `<8G` poll
+   re-debounces; but in a RE-KILL path (already `latched` from a prior kill) it must NOT *unset*
+   an earned `latch`, or the `recovered` event for a real multi-kill episode is swallowed. Since
+   `latched` gates ONLY the `recovered` emission (no kill-path consequence), keeping it is free.
 5. `armCount=0`.
+
+**Trip/recovered are not 1:1 (doc, harmless):** a latched period may contain several debounced
+entries (each a `trip`) separated by HOLD/`!memOK` excursions that cleared `criticalRun`, all
+closed by a single `recovered` at ≥16 GiB. So `trip` count ≥ `recovered` count within a period is
+expected — an audit reader must not read it as a lost event. (Grep confirms no non-test consumer
+of any watchdog decision string outside `watchdog.go`.)
 
 **Cooldown transitions are now unambiguous (Sol P1):** `cooldown` is SET (>0) only in `act` step 4
 on `acted`; DECREMENTED only in the `criticalRun` + `<low` branch; ZEROED on `!memOK`, `recover`,
@@ -105,9 +119,15 @@ kill — so threshold oscillation (7.9↔8.1 GiB) cannot cause repeated un-debou
 - ESRCH (`:417,:460`): `"already_exited"` (no signal sent). pidfd_open ESRCH stays `"exited"`.
 - Other signal error (`:423,:465`): `"signal_failed"` (no signal delivered).
 - Observe / interlock-degraded outcome: `"would_signal: SIGTERM; SIGKILL after grace if still
-  alive"`, preserving the degraded prefix, i.e. `:347/:352` become
-  `"degraded_to_observe; would_signal: SIGTERM; SIGKILL after grace if still alive"`. `Decision`
-  stays `"would_signal"`.
+  alive and MemAvailable remains < 8 GiB"` (Sol P2 — the escalation is gated on
+  `pressureStillTripped`, so state the recheck), preserving the degraded prefix, i.e. `:347/:352`
+  become `"degraded_to_observe; would_signal: SIGTERM; SIGKILL after grace if still alive and
+  MemAvailable remains < 8 GiB"`. `Decision` stays `"would_signal"`.
+- **Existing test to update (Fable P2):** `TestSignalErrorsAreHonest` (`watchdog_test.go:483-504`)
+  asserts substring `"failure"`, which `"signal_failed"` does NOT contain → update its want to
+  `"signal_failed"`, and pin `"already_exited"` for the ESRCH case (the current `"exited"`
+  substring is non-discriminating — it matches both old and new). Grep for any other test
+  asserting these strings.
 
 ## 4. Tests (TDD; pure via the deps seam; proven RED both directions)
 
@@ -132,17 +152,27 @@ records signalled pids via the fd↔pid stub; a mutating shared `procs` map betw
   `trip` decision is emitted (re-kills are not trips).
 - **F1 snapshot-error during re-arm (Fable P2):** a snapshot error while `criticalRun` emits
   `unevaluated` and stays latched (does NOT unlatch/end the episode); next poll retries.
-- **F1 defer still unlatches:** latched + < 8 GiB but no qualifying offender → defer → unlatch →
-  next poll re-debounces (the #64 rule preserved).
+- **F1 defer preserves an earned latch (Fable P1):** during a latched run (a prior kill),
+  a re-act that defers (no qualifying offender) clears `criticalRun` (stops re-killing) but keeps
+  `latched`, so when memory later reaches ≥ 16 GiB a `recovered` IS still emitted (RED vs the
+  latched=false-on-defer bug that swallows it). Separately, an ENTRY-path defer (never killed)
+  does NOT set `latched` and re-debounces next poll — the #64 rule. (`TestDeferDoesNotLatchAndRearms`
+  stays green under the amendment.)
+- **F1 `!memOK` mid-criticalRun re-debounces:** a mem-read failure during a `criticalRun` clears
+  `criticalRun` (keeps `latched`), so the next single `< 8 GiB` poll does NOT re-kill without a
+  fresh K=3 (RED vs keeping `criticalRun` across an `!memOK`).
 - **F1 restart zeroing:** a fresh `watchdogState{}` has no criticalRun/latched/cooldown — the
   observe→enforce flip restarts the daemon, so no stale episode carries.
 - **F2:** ESRCH → `"already_exited"`; other error → `"signal_failed"`; observe outcome →
   `"would_signal: SIGTERM; SIGKILL after grace if still alive"` (each RED vs the old string).
-- **Existing-test review (Fable P1):** `TestTriggerLatchesUntilMemoryRecoveryThreshold`
-  (`watchdog_test.go:219-243`, wants would_signal==2) must be re-read under the new semantics and
-  confirmed to still assert the INTENDED behaviour (two distinct debounced episodes separated by a
-  ≥16 GiB recovery), not merely pass because cooldown≥1 absorbs a stray poll. Update its comment/
-  shape if it now proves the wrong thing.
+- **Existing test — keep as-is + document (Fable verified):** `TestTriggerLatchesUntilMemoryRecoveryThreshold`
+  (`watchdog_test.go:219-244`, wants would_signal==2, recovered==1) **passes unchanged under v2**
+  and gains discriminating power (a broken cooldown → 3; v1-style skip-debounce-whenever-latched
+  → 4). Full v2 trace to add as a comment: polls 1-3 debounce→act (would_signal#1, criticalRun set,
+  cooldown=1); poll 4 (10) absorbed by the **cooldown**; poll 5 (1999) is a **HOLD-band** sample
+  (low=1000/recover=2000) — no kill, `criticalRun` cleared; poll 6 (2000 ≥ recover) → `recovered`#1;
+  polls 7-9 re-debounce → would_signal#2. Keep the test + expectations; add the trace comment so the
+  cooldown/HOLD absorption is explicit.
 - `go build ./... && go vet ./... && go test ./internal/daemon/ -race` green.
 
 ## 5. After merge (unchanged endgame, owner-gated)
