@@ -578,11 +578,19 @@ func emitWatchdog(ctx context.Context, deps watchdogDeps, event watchdogEvent) {
 		if event.PSIAvg10 != nil {
 			psi = strconv.FormatFloat(*event.PSIAvg10, 'f', -1, 64)
 		}
+		// An unestablished MemAvailable (mem-read failure → available==0) must not render
+		// as a concrete "0.00GiB": that is a fabricated zero on the operator surface. Show
+		// "?" — consistent with the JSON audit, whose mem_available_bytes is omitempty (a
+		// live /proc read never returns exactly 0 before the box is dead).
+		mem := "?"
+		if event.MemAvailable != 0 {
+			mem = fmt.Sprintf("%.2fGiB", float64(event.MemAvailable)/(1<<30))
+		}
 		victim := ""
 		if event.PID != 0 {
 			victim = fmt.Sprintf(" victim pid=%d comm=%s rss=%d", event.PID, event.Comm, event.RSS)
 		}
-		deps.logf("aira daemon: watchdog %s: %s mem_avail=%.2fGiB psi_avg10=%s%s", event.Decision, detail, float64(event.MemAvailable)/(1<<30), psi, victim)
+		deps.logf("aira daemon: watchdog %s: %s mem_avail=%s psi_avg10=%s%s", event.Decision, detail, mem, psi, victim)
 	}
 	if deps.emitEvent == nil {
 		return

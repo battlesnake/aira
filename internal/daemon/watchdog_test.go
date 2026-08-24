@@ -172,6 +172,15 @@ func TestTriggerUsesOnlyConsecutiveLowMemory(t *testing.T) {
 			ok     bool
 			reason string
 		}{{10, true, ""}, {5000, true, ""}, {5000, true, ""}}, 0, 0},
+		// A healthy read between lows must RESET the debounce count — otherwise a run of
+		// scattered transient dips accumulates to K and false-kills a legitimate heavy job.
+		// [low, healthy, low, low] @ debounce=3: consecutive impl peaks at run 2 (no trip);
+		// a cumulative impl (drop the else-reset at watchdog.go:237) reaches 3 and trips.
+		{"interleaved dips never reach K", []pressureSample{{20, 101, true, ""}}, []struct {
+			value  int64
+			ok     bool
+			reason string
+		}{{10, true, ""}, {5000, true, ""}, {10, true, ""}, {10, true, ""}}, 0, 0},
 		{"mem failure resets", []pressureSample{{20, 101, true, ""}}, []struct {
 			value  int64
 			ok     bool
@@ -697,6 +706,13 @@ func TestWatchdogDepsInvariantRequiresEveryKillPathDependency(t *testing.T) {
 
 func TestRealWatchdogDepsThresholdsAndInvariantWiring(t *testing.T) {
 	d := realWatchdogDeps(&Server{})
+	// Pin the whale-parity magnitudes, not just the wiring: `d.low == watchdogLow` is
+	// tautological (realWatchdogDeps assigns one from the other), so a mis-set constant
+	// (e.g. 8<<20) that preserves low<recover would sail through and re-introduce the exact
+	// #59 inertness this ticket fixes. Assert the literal 8 GiB / 16 GiB thresholds.
+	if watchdogLowMemAvailable != int64(8<<30) || watchdogRecoverMemAvailable != int64(16<<30) {
+		t.Fatalf("whale-parity thresholds drifted: low=%d recover=%d (want 8GiB/16GiB)", watchdogLowMemAvailable, watchdogRecoverMemAvailable)
+	}
 	if d.lowMemAvailable != watchdogLowMemAvailable || d.recoverMemAvailable != watchdogRecoverMemAvailable || d.debounce != watchdogDebounce {
 		t.Fatalf("threshold wiring: low=%d recover=%d debounce=%d", d.lowMemAvailable, d.recoverMemAvailable, d.debounce)
 	}
@@ -723,7 +739,9 @@ func TestWatchdogDecisionLoggingAndIdleDoesNotReadPSI(t *testing.T) {
 	if len(*events) != 1 || len(logs) != 1 || psiReads != 1 {
 		t.Fatalf("decision observability: events=%+v logs=%v psiReads=%d", *events, logs, psiReads)
 	}
-	if !strings.Contains(logs[0], "watchdog unevaluated") || !strings.Contains(logs[0], "mem_avail=") || !strings.Contains(logs[0], "psi_avg10=12.5") {
+	// The mem read FAILED here, so MemAvailable was never established: the operator log must
+	// render it "?" (honesty — no fabricated 0.00GiB), mirroring the psi_avg10=? treatment.
+	if !strings.Contains(logs[0], "watchdog unevaluated") || !strings.Contains(logs[0], "mem_avail=?") || strings.Contains(logs[0], "mem_avail=0.00GiB") || !strings.Contains(logs[0], "psi_avg10=12.5") {
 		t.Fatalf("unexpected watchdog log: %q", logs[0])
 	}
 }
