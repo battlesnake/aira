@@ -21,9 +21,8 @@ import (
 )
 
 const (
-	watchdogTripPSIFullAvg10    = 10.0
-	watchdogRecoverPSIFullAvg10 = 1.0
 	watchdogLowMemAvailable     = int64(8 << 30)
+	watchdogRecoverMemAvailable = int64(16 << 30)
 	watchdogMinVictimRSS        = int64(2 << 30)
 	watchdogDebounce            = 3
 	watchdogGrace               = 5 * time.Second
@@ -64,9 +63,8 @@ type watchdogEvent struct {
 	Mode         watchdogMode       `json:"mode"`
 	Decision     string             `json:"decision"`
 	Reason       string             `json:"reason,omitempty"`
-	PSIAvg10     float64            `json:"psi_full_avg10"`
-	PSITotal     uint64             `json:"psi_full_total_us"`
-	PSIDelta     uint64             `json:"psi_full_delta_us"`
+	PSIAvg10     *float64           `json:"psi_full_avg10,omitempty"`
+	PSITotal     *uint64            `json:"psi_full_total_us,omitempty"`
 	MemAvailable int64              `json:"mem_available_bytes,omitempty"`
 	PID          int                `json:"pid,omitempty"`
 	Comm         string             `json:"comm,omitempty"`
@@ -87,12 +85,12 @@ type watchdogDeps struct {
 	cgroupOf            func(int) (watchdogCgroup, bool, string)
 	interlockOK         func() (release func(), ok bool, reason string)
 	emitEvent           func(context.Context, watchdogEvent) error
+	logf                func(format string, args ...any)
 	sleep               func(context.Context, time.Duration) bool
 	now                 func() time.Time
 	minVictimRSS        int64
-	tripPSIFullAvg10    float64
-	recoverPSIFullAvg10 float64
 	lowMemAvailable     int64
+	recoverMemAvailable int64
 	debounce            int
 	grace               time.Duration
 	postKillSettle      time.Duration
@@ -101,10 +99,8 @@ type watchdogDeps struct {
 }
 
 type watchdogState struct {
-	haveTotal bool
-	lastTotal uint64
-	armCount  int
-	latched   bool
+	armCount int
+	latched  bool
 }
 
 func readHostPressureFull() (float64, uint64, bool, string) {
@@ -170,6 +166,10 @@ func runWatchdog(ctx context.Context, mode watchdogMode, interval time.Duration,
 		<-ctx.Done()
 		return
 	}
+	if !validWatchdogDeps(deps) {
+		log.Printf("aira daemon: watchdog disabled: invalid dependencies (low_mem=%d recover_mem=%d debounce=%d); watchdog will not run", deps.lowMemAvailable, deps.recoverMemAvailable, deps.debounce)
+		return
+	}
 	state := watchdogState{}
 	for {
 		select {
@@ -184,55 +184,56 @@ func runWatchdog(ctx context.Context, mode watchdogMode, interval time.Duration,
 	}
 }
 
+func validWatchdogDeps(deps watchdogDeps) bool {
+	return deps.lowMemAvailable > 0 &&
+		deps.recoverMemAvailable > deps.lowMemAvailable &&
+		deps.debounce >= 1 &&
+		deps.readMemAvailable != nil &&
+		deps.readPressure != nil &&
+		deps.snapshotProcs != nil &&
+		deps.emitEvent != nil &&
+		deps.pidfdOpen != nil &&
+		deps.pidfdSignal != nil &&
+		deps.closeFD != nil &&
+		deps.startTime != nil &&
+		deps.cgroupOf != nil &&
+		deps.interlockOK != nil &&
+		deps.now != nil &&
+		deps.sleep != nil
+}
+
 func (s *Server) runWatchdog(ctx context.Context, mode watchdogMode, interval time.Duration, deps watchdogDeps) {
 	runWatchdog(ctx, mode, interval, deps)
 }
 
 func evaluateWatchdog(ctx context.Context, mode watchdogMode, state *watchdogState, deps watchdogDeps) {
-	avg, total, ok, reason := deps.readPressure()
-	base := watchdogEvent{At: deps.now(), Mode: mode, PSIAvg10: avg, PSITotal: total}
-	if !ok {
-		state.armCount = 0
-		state.haveTotal = false
-		base.Decision, base.Reason = "unevaluated", "psi:"+reason
-		emitWatchdog(ctx, deps, base)
-		return
-	}
-	if !state.haveTotal {
-		state.haveTotal, state.lastTotal = true, total
-		return
-	}
-	if total < state.lastTotal {
-		state.lastTotal, state.armCount = total, 0
-		base.Decision, base.Reason = "unevaluated", "psi:counter-reset"
-		emitWatchdog(ctx, deps, base)
-		return
-	}
-	delta := total - state.lastTotal
-	state.lastTotal = total
-	base.PSIDelta = delta
 	available, memOK, memReason := deps.readMemAvailable()
-	base.MemAvailable = available
+	base := watchdogEvent{At: deps.now(), Mode: mode, MemAvailable: available}
+	readPSI := func() pressureSample {
+		avg, total, ok, reason := deps.readPressure()
+		if !ok && reason == "" {
+			reason = "unavailable"
+		}
+		return pressureSample{avg10: avg, total: total, ok: ok, reason: reason}
+	}
 	if !memOK {
 		state.armCount = 0
 		base.Decision, base.Reason = "unevaluated", "memavailable:"+memReason
-		emitWatchdog(ctx, deps, base)
+		emitWatchdog(ctx, deps, eventWithPSI(base, readPSI()))
 		return
 	}
-	recovered := avg <= deps.recoverPSIFullAvg10 && delta == 0
 	if state.latched {
-		if recovered {
+		if available >= deps.recoverMemAvailable {
 			state.latched = false
 			state.armCount = 0
 			base.Decision = "recovered"
-			emitWatchdog(ctx, deps, base)
+			emitWatchdog(ctx, deps, eventWithPSI(base, readPSI()))
 		}
 		return
 	}
-	trip := avg >= deps.tripPSIFullAvg10 && delta > 0 && available < deps.lowMemAvailable
-	if trip {
+	if available < deps.lowMemAvailable {
 		state.armCount++
-	} else if avg <= deps.recoverPSIFullAvg10 || avg >= deps.tripPSIFullAvg10 {
+	} else {
 		state.armCount = 0
 	}
 	if state.armCount < deps.debounce {
@@ -244,12 +245,25 @@ func evaluateWatchdog(ctx context.Context, mode watchdogMode, state *watchdogSta
 	if err != nil {
 		state.armCount = 0
 		base.Decision, base.Reason = "unevaluated", "process-snapshot:"+err.Error()
-		emitWatchdog(ctx, deps, base)
+		emitWatchdog(ctx, deps, eventWithPSI(base, readPSI()))
 		return
 	}
-	acted := handleArmed(ctx, mode, deps, avg, total, delta, available, procs)
+	psi := pressureSample{}
+	if mode == watchdogObserve {
+		psi = readPSI()
+	}
+	acted := handleArmed(ctx, mode, deps, psi, available, procs)
 	state.armCount = 0
 	state.latched = acted
+}
+
+func eventWithPSI(event watchdogEvent, psi pressureSample) watchdogEvent {
+	if !psi.ok {
+		return event
+	}
+	avg, total := psi.avg10, psi.total
+	event.PSIAvg10, event.PSITotal = &avg, &total
+	return event
 }
 
 func claudeDescendants(procs map[int]watchdogProc) map[int]bool {
@@ -307,27 +321,36 @@ func selectOffender(procs map[int]watchdogProc, minRSS int64, daemonPID int, dae
 	return selected, verdicts
 }
 
-func handleArmed(ctx context.Context, mode watchdogMode, deps watchdogDeps, avg float64, total, delta uint64, available int64, procs map[int]watchdogProc) bool {
+func handleArmed(ctx context.Context, mode watchdogMode, deps watchdogDeps, psi pressureSample, available int64, procs map[int]watchdogProc) bool {
+	psiSampled := psi.ok || psi.reason != ""
+	samplePSI := func() pressureSample {
+		if !psiSampled {
+			psi.avg10, psi.total, psi.ok, psi.reason = deps.readPressure()
+			psiSampled = true
+		}
+		return psi
+	}
 	offender, verdicts := selectOffender(procs, deps.minVictimRSS, deps.daemonPID, deps.daemonCgroup)
 	if offender == nil {
-		emitWatchdog(ctx, deps, watchdogEvent{At: deps.now(), Mode: mode, Decision: "defer", Reason: "pressure elsewhere; deferring to oomd/kernel", PSIAvg10: avg, PSITotal: total, PSIDelta: delta, MemAvailable: available})
+		event := watchdogEvent{At: deps.now(), Mode: mode, Decision: "defer", Reason: "pressure elsewhere; deferring to oomd/kernel", MemAvailable: available}
+		emitWatchdog(ctx, deps, eventWithPSI(event, samplePSI()))
 		return false
 	}
-	base := watchdogEvent{At: deps.now(), Mode: mode, PSIAvg10: avg, PSITotal: total, PSIDelta: delta, MemAvailable: available, PID: offender.pid, Comm: offender.comm, RSS: offender.rss, StartTime: offender.startTime, Predicates: verdicts[offender.pid]}
+	base := watchdogEvent{At: deps.now(), Mode: mode, MemAvailable: available, PID: offender.pid, Comm: offender.comm, RSS: offender.rss, StartTime: offender.startTime, Predicates: verdicts[offender.pid]}
 	if mode == watchdogObserve {
 		base.Decision, base.Outcome = "would_signal", "WOULD SIGKILL"
-		emitWatchdog(ctx, deps, base)
+		emitWatchdog(ctx, deps, eventWithPSI(base, samplePSI()))
 		return true
 	}
 	release, allowed, reason := deps.interlockOK()
 	if !allowed {
 		base.Decision, base.Reason, base.Outcome = "would_signal", "interlock: "+reason, "degraded_to_observe; WOULD SIGKILL"
-		emitWatchdog(ctx, deps, base)
+		emitWatchdog(ctx, deps, eventWithPSI(base, samplePSI()))
 		return true
 	}
 	if release == nil {
 		base.Decision, base.Reason, base.Outcome = "would_signal", "interlock: missing authority release", "degraded_to_observe; WOULD SIGKILL"
-		emitWatchdog(ctx, deps, base)
+		emitWatchdog(ctx, deps, eventWithPSI(base, samplePSI()))
 		return true
 	}
 	defer release()
@@ -337,6 +360,9 @@ func handleArmed(ctx context.Context, mode watchdogMode, deps watchdogDeps, avg 
 		fd   int
 	}
 	opened := make([]openedTarget, 0, len(targets))
+	terminalTargets := 0
+	delivered := false
+	unsupported := false
 	defer func() {
 		for _, target := range opened {
 			_ = deps.closeFD(target.fd)
@@ -346,10 +372,11 @@ func handleArmed(ctx context.Context, mode watchdogMode, deps watchdogDeps, avg 
 		fd, err := deps.pidfdOpen(proc.pid)
 		if errors.Is(err, unix.ENOSYS) {
 			base.Decision, base.Reason, base.Outcome = "degraded", "pidfd_open unsupported", "degraded_no_signal"
-			emitWatchdog(ctx, deps, base)
+			emitWatchdog(ctx, deps, eventWithPSI(base, samplePSI()))
 			return true
 		}
 		if errors.Is(err, unix.ESRCH) {
+			terminalTargets++
 			outcome := base
 			outcome.PID, outcome.Decision, outcome.Outcome = proc.pid, "outcome", "exited"
 			emitWatchdog(ctx, deps, outcome)
@@ -364,7 +391,7 @@ func handleArmed(ctx context.Context, mode watchdogMode, deps watchdogDeps, avg 
 		opened = append(opened, openedTarget{proc: proc, fd: fd})
 	}
 	if len(opened) == 0 {
-		return true
+		return terminalTargets == len(targets)
 	}
 	survivors := make([]openedTarget, 0, len(opened))
 	for _, target := range opened {
@@ -382,42 +409,42 @@ func handleArmed(ctx context.Context, mode watchdogMode, deps watchdogDeps, avg 
 		outcome.Decision = "outcome"
 		switch {
 		case err == nil:
+			delivered = true
 			outcome.Outcome = "signal_sent,delivered"
 			survivors = append(survivors, target)
 		case errors.Is(err, unix.ESRCH):
+			terminalTargets++
 			outcome.Outcome = "signal_sent,exited"
 		case errors.Is(err, unix.ENOSYS):
 			outcome.Outcome, outcome.Reason = "degraded_no_signal", "pidfd_send_signal unsupported"
-			emitWatchdog(ctx, deps, outcome)
+			emitWatchdog(ctx, deps, eventWithPSI(outcome, samplePSI()))
 			return true
 		default:
 			outcome.Outcome, outcome.Reason = "signal_sent,failure", err.Error()
 			survivors = append(survivors, target)
 		}
-		emitWatchdog(ctx, deps, outcome)
+		emitWatchdog(ctx, deps, eventWithPSI(outcome, samplePSI()))
 	}
 	if len(survivors) == 0 || !deps.sleep(ctx, deps.grace) {
-		return true
+		return delivered || terminalTargets == len(targets)
 	}
-	stillTripped, currentTotal := pressureStillTripped(deps, total)
-	if !stillTripped {
+	if !pressureStillTripped(deps) {
 		for _, target := range survivors {
 			outcome := eventForTarget(base, target.proc)
 			outcome.Decision, outcome.Outcome = "outcome", targetStateAfterGrace(target.proc, deps)
-			emitWatchdog(ctx, deps, outcome)
+			emitWatchdog(ctx, deps, eventWithPSI(outcome, samplePSI()))
 		}
-		return true
+		return delivered || terminalTargets == len(targets)
 	}
 	escalated := make([]openedTarget, 0, len(survivors))
 	for _, target := range survivors {
 		if valid, reason := revalidateWatchdogTarget(target.proc, deps); !valid {
 			outcome := eventForTarget(base, target.proc)
 			outcome.Decision, outcome.Outcome, outcome.Reason = "outcome", targetStateAfterGrace(target.proc, deps), reason
-			emitWatchdog(ctx, deps, outcome)
+			emitWatchdog(ctx, deps, eventWithPSI(outcome, samplePSI()))
 			continue
 		}
 		intent := eventForTarget(base, target.proc)
-		intent.PSITotal, intent.PSIDelta = currentTotal, currentTotal-total
 		intent.Decision, intent.Outcome = "intent", "about_to_sigkill"
 		emitWatchdog(ctx, deps, intent)
 		err := deps.pidfdSignal(target.fd, unix.SIGKILL)
@@ -425,25 +452,28 @@ func handleArmed(ctx context.Context, mode watchdogMode, deps watchdogDeps, avg 
 		outcome.Decision = "outcome"
 		switch {
 		case err == nil:
+			delivered = true
 			outcome.Outcome = "signal_sent,delivered,escalated_sigkill"
 			escalated = append(escalated, target)
 		case errors.Is(err, unix.ESRCH):
+			terminalTargets++
 			outcome.Outcome = "signal_sent,exited"
 		case errors.Is(err, unix.ENOSYS):
+			unsupported = true
 			outcome.Outcome, outcome.Reason = "degraded_no_signal", "pidfd_send_signal unsupported"
 		default:
 			outcome.Outcome, outcome.Reason = "signal_sent,failure", err.Error()
 		}
-		emitWatchdog(ctx, deps, outcome)
+		emitWatchdog(ctx, deps, eventWithPSI(outcome, samplePSI()))
 	}
 	if len(escalated) > 0 && deps.sleep(ctx, deps.postKillSettle) {
 		for _, target := range escalated {
 			final := eventForTarget(base, target.proc)
 			final.Decision, final.Outcome = "outcome", targetStateAfterGrace(target.proc, deps)
-			emitWatchdog(ctx, deps, final)
+			emitWatchdog(ctx, deps, eventWithPSI(final, samplePSI()))
 		}
 	}
-	return true
+	return delivered || terminalTargets == len(targets) || unsupported
 }
 
 func eventForTarget(base watchdogEvent, proc watchdogProc) watchdogEvent {
@@ -462,13 +492,9 @@ func targetStateAfterGrace(proc watchdogProc, deps watchdogDeps) string {
 	return "unresolved"
 }
 
-func pressureStillTripped(deps watchdogDeps, previousTotal uint64) (bool, uint64) {
-	avg, total, ok, _ := deps.readPressure()
-	if !ok || total <= previousTotal || avg < deps.tripPSIFullAvg10 {
-		return false, total
-	}
+func pressureStillTripped(deps watchdogDeps) bool {
 	available, ok, _ := deps.readMemAvailable()
-	return ok && available < deps.lowMemAvailable, total
+	return ok && available < deps.lowMemAvailable
 }
 
 func revalidateWatchdogTarget(proc watchdogProc, deps watchdogDeps) (bool, string) {
@@ -540,6 +566,24 @@ func hasAIRAComponent(cgroup string) bool {
 }
 
 func emitWatchdog(ctx context.Context, deps watchdogDeps, event watchdogEvent) {
+	if deps.logf != nil {
+		detail := event.Outcome
+		if detail == "" {
+			detail = event.Reason
+		}
+		if detail == "" {
+			detail = "-"
+		}
+		psi := "?"
+		if event.PSIAvg10 != nil {
+			psi = strconv.FormatFloat(*event.PSIAvg10, 'f', -1, 64)
+		}
+		victim := ""
+		if event.PID != 0 {
+			victim = fmt.Sprintf(" victim pid=%d comm=%s rss=%d", event.PID, event.Comm, event.RSS)
+		}
+		deps.logf("aira daemon: watchdog %s: %s mem_avail=%.2fGiB psi_avg10=%s%s", event.Decision, detail, float64(event.MemAvailable)/(1<<30), psi, victim)
+	}
 	if deps.emitEvent == nil {
 		return
 	}
@@ -564,12 +608,12 @@ func realWatchdogDeps(s *Server) watchdogDeps {
 		cgroupOf:            func(pid int) (watchdogCgroup, bool, string) { return watchdogCgroupForPID(pid, mount, mountErr) },
 		interlockOK:         realWatchdogInterlock,
 		emitEvent:           s.emitWatchdogEvent,
+		logf:                log.Printf,
 		sleep:               watchdogSleep,
 		now:                 time.Now,
 		minVictimRSS:        watchdogMinVictimRSS,
-		tripPSIFullAvg10:    watchdogTripPSIFullAvg10,
-		recoverPSIFullAvg10: watchdogRecoverPSIFullAvg10,
 		lowMemAvailable:     watchdogLowMemAvailable,
+		recoverMemAvailable: watchdogRecoverMemAvailable,
 		debounce:            watchdogDebounce,
 		grace:               watchdogGrace,
 		postKillSettle:      watchdogPostKillSettle,
