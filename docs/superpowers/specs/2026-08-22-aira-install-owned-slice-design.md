@@ -1,26 +1,34 @@
 # `aira install` — AIRA-owned confinement slice (aira.slice)
 
-> **DEFERRED (owner, 2026-08-22).** Not built now. Owner clarified the containment
-> is **nested, not parallel**: 96 GB machine → 80 GB WSL cap → 64 GB whale.slice,
-> each level 16 GB below its parent so an OOM is contained to the offending level.
-> `aira confine` therefore just **uses the existing `whale.slice`** for now (already
-> its default + configurable via `--slice`/`$AIRA_CONFINE_SLICE` — merged in #54, no
-> build needed). `aira.slice` + `aira install` are deferred until whale's full
-> functionality lives in AIRA and is being removed from agentmux; at that point
-> `aira.slice` **replaces** whale.slice (becomes the single 64 GB pool) rather than
-> coexisting — so this plan's §3 overcommit/`--allow-overcommit` machinery and §4
-> aira→whale fallback become obsolete and must be re-cut for a *replacement* (not
-> sibling) design. Everything else here (embed/render/install pattern, the
-> empirical delegation-anchor + runtime-verify, daemon-reload-applies-cap, hardened
-> file mutation) remains the valid basis for that future milestone.
+> **ACTIVE — building (owner, 2026-08-24).** Owner reactivated #55 with a
+> **concurrent-first, then-redirect** migration (superseding the earlier "aira.slice
+> *replaces* whale.slice" deferral): install `aira.slice` as an **independent
+> top-level sibling** to `whale.slice` and **run both concurrently** for a
+> time-scoped interim (owner explicitly accepts the two-cap overcommit / OOM risk),
+> then later **redirect `agentmux whale` (whale-run) into `aira confine`** and retire
+> whale.slice, leaving `aira.slice` the sole pool. This is exactly the sibling shape
+> §3/§4 already describe, so this plan's overcommit/`--allow-overcommit` machinery and
+> the aira→whale fallback are **kept, not obsolete** — the concurrent interim IS the
+> intended state, with `--allow-overcommit` its owner-accepted opt-in. **Milestone
+> scope (build + throwaway-slice tests only; NO live-host mutation):** `aira install`
+> + `aira.slice` + the delegation anchor + confine default→aira.slice. **Explicit
+> sequels, NOT built here (§9):** the agentmux `whale-run → aira confine` redirect (a
+> change in the agentmux repo, hook `whale.go:80-89`/`:117-118`), and actually
+> running the live `aira install` on this box. §0's agentmux claims below were
+> re-verified against `/home/user/claude/claude` by code-reading (2026-08-24) — all
+> grounded, two nuances folded in (see §0).
 
-Status: PLAN v3 — Fable code-grounded plan-gate GATE-PASS; folds Sol plan-review
-r1+r2 (all points addressed), Gemini r1, Fable's 5 must-fix items, and the empirical
+Status: PLAN v4 — re-cut 2026-08-24 for the owner's concurrent-first/then-redirect
+migration (the DEFERRED banner's replacement-model framing is withdrawn; the sibling
+§3/§4 machinery stands). Carries forward the v3 Fable code-grounded GATE-PASS basis:
+folds Sol plan-review r1+r2, Gemini r1, Fable's 5 must-fix items, and the empirical
 systemd-255 findings (`Delegate=` on a `[Slice]` ignored; manual subtree_control
 delegation wiped by daemon-reload; `daemon-reload` alone applies a changed slice
 `MemoryMax`), and the owner's directive to mirror `agentmux install`'s
-baked-into-binary pattern. Milestone #55. Successor to `aira confine`
-([2026-08-21](2026-08-21-aira-whale-confinement-face-design.md), merged `e9e83c4`).
+baked-into-binary pattern (§0 re-verified against live agentmux code 2026-08-24).
+**Re-gate required** for the v4 framing before build. Milestone #55. Successor to
+`aira confine` ([2026-08-21](2026-08-21-aira-whale-confinement-face-design.md),
+merged `e9e83c4`).
 
 Owner selected this thread (2026-08-22) — the whale endgame: AIRA installs and owns
 its own capped systemd **user** slice, mirroring how `agentmux install` bakes the
@@ -47,6 +55,24 @@ parts and drops the rest:
   non-root without it warns "cap NOT enforced". whale.slice's own subtree_control is
   populated durably only because `whale-run` uses `systemd-run --scope` (systemd-
   managed accounted children).
+
+**Re-verified against live agentmux code 2026-08-24 (`/home/user/claude/claude/cmd/agentmux/`).**
+All five claims above grounded: embed `//go:embed assets`→`assetsFS` (`assets.go:10-11`),
+template `whale.slice.in` with `@MEMHIGH@`/`@MEMMAX@` via `strings.ReplaceAll`
+(`install.go:570-573`); sizing `computeMemoryMax` (`install.go:504-519`) — flag > on-disk
+`parseInstalledMemoryMax` > `⅔·MemTotal`, high=max−2G, regex `^[0-9]+G$` (`install.go:479`),
+floor 4G (`validateMemoryMax:559-561`); seam struct **`installDeps`** (`install.go:605-633`);
+delegation detect `memoryControllerDelegated` (`install.go:1469-1480`) + root drop-in
+`/etc/systemd/system/user@.service.d/10-agentmux-delegate.conf` = `[Service]\nDelegate=yes`
+(no `subtree_control` write anywhere); whale-run launch `systemd-run --user --quiet --scope
+--unit=whale-run-<name>.scope --slice=whale.slice --property=OOMPolicy=kill --` (`whale.go:80-89`).
+**Two nuances folded in:** (i) agentmux's `whale.slice.in` has **no `MemoryAccounting=`** line
+(MemoryMax implies accounting) — AIRA keeps `MemoryAccounting=yes` explicit on both units
+because the anchor service depends on accounting; harmless. (ii) agentmux writes the slice
+**unconditionally** (deterministic render → byte-identical) and content-compares only its
+/etc drop-ins (`bytes.Equal`); **AIRA content-compares the slice too** before writing, so an
+unchanged cap triggers no needless `daemon-reload` and `--status` can honestly report "up to
+date" — a deliberate improvement, not a divergence in behaviour.
 
 AIRA copies the embed/render/size/idempotence/seam pattern verbatim in spirit.
 **In scope, deliberately narrower than agentmux:** ONLY the confinement slice +
@@ -197,16 +223,22 @@ user-owned / lacks the marker. Serialise concurrent `install` runs with an
 advisory `flock` on a lockfile in the unit dir so two installs cannot interleave
 their reload/write.
 
-## 3. Coexistence with whale.slice — safe by construction (Sol r2)
+## 3. Coexistence with whale.slice — the owner-accepted concurrent interim (Sol r2)
+
+**This concurrent state IS the intended v4 interim** (owner, 2026-08-24): aira.slice
+and whale.slice run side by side, `whale-run` jobs on whale.slice and `aira confine`
+jobs on aira.slice, until the agentmux redirect (§9) retires whale.slice. The owner
+has **explicitly accepted the time-scoped overcommit / OOM risk** of two live caps —
+so `--allow-overcommit` is the expected install path here, not a rare edge.
 
 aira.slice is an **independent top-level** user slice (the "self-owned" shape the
 owner asked for, mirroring whale.slice's own independence and matching the
-"similar-approach-to-agentmux" directive). Two independently-capped ~⅔-RAM slices
-sum to more than physical RAM, so saturating BOTH `whale-run` and `aira confine`
-at once could overcommit and OOM the host. A warning does not *prevent* that
-(Sol r2: A is acceptable only as an explicitly-accepted product risk, not a safety
-resolution). So the risk is made an **enforced, explicit opt-in** rather than a
-default the operator might not notice:
+"similar-approach-to-agentmux" directive). Two independently-capped slices can sum
+past the VM's RAM, so saturating BOTH `whale-run` and `aira confine` at once could
+overcommit and OOM the host. A warning does not *prevent* that (Sol r2: acceptable
+only as an explicitly-accepted product risk, not a safety resolution). So even under
+the owner's blanket acceptance the risk stays a **tool-enforced, explicit opt-in** —
+a fresh operator (or a future automated caller) never creates a silent overcommit:
 
 - **`aira install` detects a capped `whale.slice` and, by default, REFUSES** to
   create a second overcommitting cap — exiting `E_INSTALL_OVERCOMMIT` with a clear
@@ -218,9 +250,13 @@ default the operator might not notice:
   silent overcommit is ever created.
 - With no capped whale.slice present, `install` proceeds normally (aira.slice is
   then the only cap — no overcommit possible).
-- Default cap sizing is identical to a same-host whale.slice (both ⅔ RAM), so the
-  single-slice steady state is correctly sized and the later migration needs no
-  re-tuning. `--status` always shows the coexistence + opt-in state.
+- **Sizing (interim, this host).** The derive-if-unspecified default is `⅔·MemTotal`
+  (mirrors agentmux). Note whale.slice is a hardcoded 64G — that is `⅔` of the **96G
+  physical** box, but inside the **80G WSL VM** `/proc/meminfo` MemTotal ≈ 80G, so the
+  auto-derived default would be ≈53G, NOT 64G. **Recommended interim install:**
+  `aira install --memory-max=64G --allow-overcommit`, so aira.slice matches whale's
+  pool and the eventual single-pool end-state (whale retired → aira.slice the sole 64G
+  pool) needs no re-tuning. `--status` always shows the coexistence + opt-in state.
 - **`run` is unaffected (Fable):** the `run` verb's admission slice comes from
   project config (`run.slice`), not confine's default; §4 changes only `confine`.
   Existing configs pointing `run.slice` at whale.slice keep working unchanged.
@@ -351,7 +387,27 @@ whale.slice exists and `--allow-overcommit` was not given). Stable, actionable.
 
 ## 9. Deferrals (recorded, not built)
 
-Migrate `whale-run` call-sites → `aira confine --slice aira.slice` and retire/alias
-whale.slice (fully resolves §3 overcommit); fold whale watchdog + systemd-oomd;
+**The two owner-directed sequels to THIS milestone (do next, in order):**
+
+1. **Run the live install.** After merge, actually run `aira install --memory-max=64G
+   --allow-overcommit` on this box to create the real aira.slice + anchor (the
+   milestone's tests only ever touch a throwaway `aira-test-<pid>.slice`). This
+   mutates the user's real systemd units, so it is an outward, confirm-first step —
+   surfaced to the owner, not done unattended by the build.
+2. **Redirect `agentmux whale` → `aira confine`** (in the agentmux repo, NOT AIRA).
+   Replace the `systemd-run --user --quiet --scope … --slice=whale.slice …` argv
+   built by `buildWhaleRunArgv` (`cmd/agentmux/whale.go:80-89`, dispatched at
+   `whale.go:117-118` via `execWhaleRun`) with an exec of `aira confine --slice
+   aira.slice -- <cmd>`. `aira confine` is project-less + daemon-optional, so the
+   redirect needs no running AIRA daemon. Preserve whale-run's deprioritisation
+   (`nice -n 19 ionice -c 3`, `oom_score_adj` bias) — confine already applies its
+   own per-scope oom.group + deprioritisation, so verify parity before cutting over.
+   Once redirected and whale.slice is idle, retire/alias whale.slice → aira.slice
+   becomes the sole 64G pool (fully resolves §3's overcommit; the single-slice size
+   already matches, §3 sizing).
+
+**Later / independent:** fold whale watchdog + systemd-oomd (the watchdog itself
+already landed in AIRA, #59 — this is the oomd unit + the interlock flip);
 `aira install --remove`/uninstall; the daemon-as-anchor consolidation; a system
-(root) slice for cross-user confinement; per-run scope sub-caps.
+(root) slice for cross-user confinement; per-run scope sub-caps (already shipped for
+confine/run in #57 — this is the install-slice interaction).
