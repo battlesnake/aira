@@ -66,8 +66,11 @@ may use the lighter path described in
   agent guide come from dispatch tables.
 - No cgo. The release target is one static Go binary.
 - Prefix heavy commands, including Go builds/tests and real-data loads, with
-  `whale-run`. If a job must be stopped, stop only the scope owned by this
-  session (`whale-run-<name>.scope`), never the shared `whale.slice`.
+  `whale-run` (which now execs `aira confine --slice aira.slice`, confining the job
+  to a cgroup scope under `aira.slice`). If a job must be stopped, `kill <PID>` the
+  `whale-run`/`aira confine` process you started (it cgroup-kills its own scope);
+  never `systemctl --user stop aira.slice` (or `whale.slice`) — that hits every
+  session. A whale-run job now has no graceful shutdown (Ctrl-C hard-kills the tree).
 - Do not claim a command is green from truncated output. Record its exact exit
   code and distinguish `pass`, `fail`, and `unevaluated`.
 - Phase 0 uses `covers:` in Go doc comments and `verifies:` in tests as a
