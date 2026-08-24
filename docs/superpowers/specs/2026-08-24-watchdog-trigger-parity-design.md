@@ -1,10 +1,13 @@
 # AIRA watchdog — MemAvailable-authoritative trip (whale-watchdog parity) + observe visibility
 
-Status: PLAN v3 — folds the Sol v2 re-gate (GATE-FAIL, no P0; core confirmed sound; P1
-honesty + P1 latch-spec + P2 invariant/placement) and the Fable v2 re-gate
-(GATE-PASS-WITH-NITS; same honesty P1 + compile/dead-code/nil-guard/test specifics). Fixes a
+Status: PLAN v4 (builder-ready) — folds three gate rounds to convergence: Sol v1 GATE-FAIL
+(direction: MemAvailable-authoritative, not OR-hybrid) → Sol v2 GATE-FAIL (no P0; core
+confirmed sound) → Sol confirm (2 enforce-path items, below) and Fable v1/v2/confirm
+(GATE-PASS-WITH-NITS throughout; confirm: "builder-ready ... without a re-gate"). Fixes a
 real inertness the observe-mode deployment surfaced (#64, follow-up to #59). Safety-critical
-KILL-trigger logic → full two-loop, re-gated to convergence.
+KILL-trigger logic. v4 folds the final Sol-confirm enforce-path findings (§3.2, §3.6) and the
+final Fable-confirm builder nits (§3.7, §4). Post-build adversarial build-review is the next
+adversarial gate on the enforce kill path.
 
 ## 1. The gap (evidence)
 
@@ -88,9 +91,25 @@ state.latched = acted
 decision + state update are computed, purely to populate diagnostic fields. Idle no-emit
 polls do not read PSI at all. A slow/failed PSI read therefore cannot delay arm/recover/trip
 or the state machine; it only affects the (already-decided) event's diagnostics. `readPressure`
-is a bounded `/proc/pressure/memory` read (no network/lock). Read once per emitting poll and
-pass the resulting `psi` sample into `handleArmed` so all armed-path events share one
-consistent snapshot.
+is a `/proc/pressure/memory` read.
+
+**PSI is kept OFF the enforce kill path (Sol confirm P2).** Under severe memory pressure —
+exactly when enforce signals — a `/proc` read can itself stall, so no best-effort PSI read may
+precede a signal syscall. Concretely:
+
+- The memory decision + state update in `evaluateWatchdog` read no PSI.
+- The `trip` event and `handleArmed`'s pre-signal `intent` (`about_to_sigterm`/`about_to_sigkill`)
+  events carry **PSI = nil** (honest absent — §3.3). The durable pre-kill intent audit is
+  preserved; it simply omits PSI so nothing on the path to the signal reads `/proc`.
+- `handleArmed` issues its `pidfdSignal` calls using memory + proc-snapshot data only.
+- PSI is read best-effort and attached only to events that do NOT precede a signal: the
+  `recovered` / `unevaluated` / `defer` events, the observe-mode `would_signal` (no signal
+  follows), and the post-signal `outcome` events. In observe mode there is no signal, so the
+  `trip`/`would_signal` events may carry PSI freely.
+
+Read the `psi` sample at most once per emitting poll (shared across that poll's non-critical
+events). Test (deps seam): in enforce mode, an order-recording `readPressure` + `pidfdSignal`
+proves no `readPressure` call precedes the first `pidfdSignal` (RED if PSI is read upfront).
 
 ### 3.3 Honesty — PSI fields are nullable; no fabricated zero (Sol v2 P1 + Fable v2 P1)
 
@@ -145,12 +164,20 @@ MATCHES current `handleArmed` behaviour — no code change, but it must be pinne
 |---|---|---|
 | `defer` — no qualifying offender (observe or enforce) | **NO** | pressure persists but claude isn't the cause; keep evaluating so a *newly-appearing* offender is caught. Re-emits a `defer` each debounce period — intended. |
 | `would_signal` (observe) | YES | one would_signal per episode until recover |
-| `would_signal` — interlock-degraded (enforce) | YES | same as observe; interlock held |
-| signal attempted incl. `signal_sent,failure` (enforce) | YES | best-effort attempt made; retrying a failing signal every 6 s won't help; oomd + kernel oom.group are backstops |
-| `degraded_no_signal` — pidfd unsupported | YES | nothing more AIRA can do this episode |
+| `would_signal` — interlock-degraded (enforce) | YES | interlock held; nothing to retry until it releases |
+| enforce — **≥1 signal delivered**, or all targets terminal (already-exited `ESRCH`) | YES | the kill is in progress / the subtree is gone; wait for recovery |
+| enforce — **no signal delivered, retryable failure** (`pidfdSignal` errored non-`ENOSYS`, e.g. `EPERM`/`EAGAIN`, on every target) | **NO** | Sol confirm P1: do NOT give up for the episode — re-arm and retry next debounce cycle (bounded by recovery at ≥16 GiB). The box is still low; keep trying to protect it (oomd + kernel oom.group remain backstops). |
+| `degraded_no_signal` — pidfd/pidfd_send_signal **unsupported** (`ENOSYS`) | YES | terminal — the kernel lacks the syscall; retrying cannot help |
 
 So "one decision per episode" holds **once an offender is actioned**; a sustained non-claude
-low-mem period emits a `defer` each debounce period (correct — catches a later offender).
+low-mem period (defer) or an all-retryable-failure enforce attempt re-arms each debounce
+period (correct — catches a later offender / retries the protective kill). This changes the
+current unconditional `return true` on the `signal_sent,failure` path (`watchdog.go:393-396`,
+`:446`): `handleArmed` must return "did we effectively act" = (≥1 delivered) ∨ (all targets
+terminal) ∨ observe-would_signal ∨ interlock-degrade ∨ `ENOSYS`-degrade — and `false` when an
+enforce round delivered no signal on a retryable error. Tests: an observe `would_signal`
+latches; an enforce round where every `pidfdSignal` returns a retryable error does NOT latch
+(re-arms next cycle); an `ENOSYS` round latches.
 
 ### 3.7 Excise dead PSI machinery (Fable v2 P2-b) + construction-time invariant (Sol v2 P2)
 
@@ -159,12 +186,20 @@ low-mem period emits a `defer` each debounce period (correct — catches a later
   / `watchdogRecoverPSIFullAvg10`; their wiring in `realWatchdogDeps` (`:570-571`) and the
   test deps (`:100-101`). Leaving them would falsely imply PSI thresholds still gate.
   (`readPressure` stays — still used for observability.)
-- **Validate the deps invariant fail-loud** at watchdog start (`runWatchdog`, before the
-  loop): `lowMemAvailable > 0 && recoverMemAvailable > lowMemAvailable && debounce >= 1` and
-  the required func fields (`readMemAvailable`, `readPressure`, `snapshotProcs`, `emitEvent`,
-  pidfd*, `now`, `sleep`) non-nil. On violation → `log.Printf` a loud error and **do not run
-  the watchdog loop** (visibly-off, never silently-inert). This is the general guard against
-  the #59 silent-inertness class (a zero/miswired threshold → `available >= 0` vacuously true).
+- **Validate the deps invariant fail-loud** in `runWatchdog` — **after the existing
+  `mode == watchdogOff || interval == 0` park (`watchdog.go:169-172`), before the loop**
+  (Fable confirm P2-1: the server passes a zero `watchdogDeps{}` when mode is off,
+  `server.go:257-260`, so validating before the park would log a spurious loud error on every
+  off-mode start and, if the builder `return`s instead of parking, drain off-mode early —
+  inverting `TestRunWatchdogOffParksAndDrains` `:385`). Check `lowMemAvailable > 0 &&
+  recoverMemAvailable > lowMemAvailable && debounce >= 1` and the required func fields non-nil:
+  `readMemAvailable`, `readPressure`, `snapshotProcs`, `emitEvent`, `pidfdOpen`, `pidfdSignal`,
+  `closeFD`, `startTime`, `cgroupOf`, `interlockOK`, `now`, `sleep` (Fable confirm P2-2 — the
+  last four are dereferenced unguarded on the enforce path at `:322`/`:342`/`:455`/`:475`/`:482`;
+  a nil one panics the watchdog goroutine and takes the daemon down). On violation →
+  `log.Printf` a loud error and **do not run the watchdog loop** (visibly-off, never
+  silently-inert). Guards the #59 silent-inertness class (a zero/miswired threshold →
+  `available >= 0` vacuously true).
 
 ## 4. Tests (TDD; pure via the deps seam; proven RED both directions)
 
@@ -187,9 +222,18 @@ low-mem period emits a `defer` each debounce period (correct — catches a later
   watchdogLowMemAvailable`, `debounce == watchdogDebounce`, `logf != nil`, and that the
   invariant `low > 0 && recover > low && debounce >= 1` holds. A `runWatchdog` given
   invariant-violating deps logs + does not loop (does not emit/act).
-- **Existing test inversions named** (Fable v2 P2-3 + P2-d): `watchdog_test.go:132` ("in band
-  holds") and `:155-171` (`TestTriggerLatchesUntilGenuineRecovery`) both encode PSI-gated
-  semantics being removed; replaced by the memory-trigger + latch tables. Deliberate.
+- **Enforce kill-path tests** (Sol confirm): (a) order test — in enforce mode no
+  `readPressure` precedes the first `pidfdSignal` (§3.2, RED if PSI read upfront); (b) latch
+  retry — an enforce round where every `pidfdSignal` returns a retryable (non-`ENOSYS`) error
+  does NOT latch (re-arms next cycle), an observe `would_signal` DOES latch, an `ENOSYS` round
+  latches (§3.6).
+- **Existing test inversions + compile-break list named** (Fable v2 P2-3/P2-d + confirm P2-3):
+  trigger rows `watchdog_test.go:128/:129/:131/:132/:133` invert under mem-only semantics
+  (want 0→1) and `:155-171` (`TestTriggerLatchesUntilGenuineRecovery`) yields one decision not
+  two — replaced by the memory-trigger + latch tables (deliberate). Six tests call
+  `handleArmed` directly with the old `(avg, total, delta, available)` signature and must be
+  mechanically updated to the new `(psi, available)` shape to compile: `watchdog_test.go:292,
+  :323, :354, :373, :538, :555`.
 - **Observability**: a fake `logf` records one line per emitted decision; an idle no-trip poll
   logs nothing (and reads no PSI).
 - **Offender selection unchanged** (regression): capped / non-descendant / light / protected
