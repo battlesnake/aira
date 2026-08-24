@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"aira/internal/daemon"
 	"golang.org/x/sys/unix"
 )
 
@@ -31,6 +32,7 @@ const (
 
 	defaultSliceUnit  = "aira.slice"
 	defaultAnchorUnit = "aira-slice-keepalive.service"
+	defaultDaemonUnit = daemon.DefaultServiceUnit
 	gibPerKiB         = int64(1024 * 1024)
 	cgroupRoot        = "/sys/fs/cgroup"
 )
@@ -45,46 +47,56 @@ var (
 var assets embed.FS
 
 type installOpts struct {
-	memoryMax       string
-	memoryHigh      string
-	allowOvercommit bool
-	dryRun          bool
-	status          bool
+	memoryMax        string
+	memoryHigh       string
+	allowOvercommit  bool
+	dryRun           bool
+	status           bool
+	watchdog         string
+	watchdogInterval time.Duration
 }
 
 // installDeps is intentionally exhaustive: install-time identity, process,
 // filesystem, descriptor, clock, and output effects all cross this seam.
 type installDeps struct {
-	geteuid    func() int
-	getenv     func(string) string
-	executable func() (string, error)
-	abs        func(string) (string, error)
-	getpid     func() int
-	now        func() time.Time
-	run        func([]string, []byte) ([]byte, error)
-	stat       func(string) (os.FileInfo, error)
-	lstat      func(string) (os.FileInfo, error)
-	readFile   func(string) ([]byte, error)
-	writeFile  func(string, []byte, os.FileMode) error
-	mkdirAll   func(string, os.FileMode) error
-	mkdirTemp  func(string, string) (string, error)
-	remove     func(string) error
-	rename     func(string, string) error
-	openat     func(int, string, int, uint32) (int, error)
-	fstat      func(int, *unix.Stat_t) error
-	close      func(int) error
-	readFD     func(int) ([]byte, error)
-	writeFD    func(int, []byte) error
-	fsync      func(int) error
-	fchmod     func(int, uint32) error
-	renameat   func(int, string, int, string) error
-	unlinkat   func(int, string, int) error
-	flock      func(int, int) error
-	logf       func(string, ...any)
+	geteuid      func() int
+	getenv       func(string) string
+	executable   func() (string, error)
+	abs          func(string) (string, error)
+	getpid       func() int
+	now          func() time.Time
+	run          func([]string, []byte) ([]byte, error)
+	stat         func(string) (os.FileInfo, error)
+	lstat        func(string) (os.FileInfo, error)
+	readFile     func(string) ([]byte, error)
+	writeFile    func(string, []byte, os.FileMode) error
+	mkdirAll     func(string, os.FileMode) error
+	mkdirTemp    func(string, string) (string, error)
+	remove       func(string) error
+	rename       func(string, string) error
+	openat       func(int, string, int, uint32) (int, error)
+	fstat        func(int, *unix.Stat_t) error
+	close        func(int) error
+	readFD       func(int) ([]byte, error)
+	writeFD      func(int, []byte) error
+	fsync        func(int) error
+	fchmod       func(int, uint32) error
+	renameat     func(int, string, int, string) error
+	unlinkat     func(int, string, int) error
+	flock        func(int, int) error
+	logf         func(string, ...any)
+	daemonPaths  func() (daemon.Paths, error)
+	daemonStatus func(daemon.Paths) daemon.StatusInfo
+	daemonStop   func(daemon.Paths) error
+	sleep        func(time.Duration)
 
 	sliceUnit  string
 	anchorUnit string
-	cgroupRoot string
+	daemonUnit string
+	// daemonRuntimeDir is test-only: production inherits XDG_RUNTIME_DIR from
+	// the user manager; real-systemd tests bake an isolated runtime explicitly.
+	daemonRuntimeDir string
+	cgroupRoot       string
 }
 
 func realInstallDeps() installDeps {
@@ -140,8 +152,9 @@ func realInstallDeps() installDeps {
 		},
 		fsync: unix.Fsync, fchmod: unix.Fchmod, renameat: unix.Renameat,
 		unlinkat: unix.Unlinkat, flock: unix.Flock,
-		logf:      func(format string, args ...any) { fmt.Printf(format+"\n", args...) },
-		sliceUnit: defaultSliceUnit, anchorUnit: defaultAnchorUnit, cgroupRoot: cgroupRoot,
+		logf:        func(format string, args ...any) { fmt.Printf(format+"\n", args...) },
+		daemonPaths: daemon.PathsFromEnv, daemonStatus: daemon.Status, daemonStop: daemon.Stop, sleep: time.Sleep,
+		sliceUnit: defaultSliceUnit, anchorUnit: defaultAnchorUnit, daemonUnit: defaultDaemonUnit, cgroupRoot: cgroupRoot,
 	}
 }
 
@@ -171,7 +184,7 @@ func RunSliceAnchor() int {
 }
 
 func parseInstallArgs(args []string) (installOpts, error) {
-	var opts installOpts
+	opts := installOpts{watchdog: "observe", watchdogInterval: 2 * time.Second}
 	seen := map[string]bool{}
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -196,7 +209,7 @@ func parseInstallArgs(args []string) (installOpts, error) {
 			case "status":
 				opts.status = true
 			}
-		case "memory-max", "memory-high":
+		case "memory-max", "memory-high", "watchdog", "watchdog-interval":
 			if !hasValue {
 				if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
 					return opts, argumentInvalid(fmt.Sprintf("option --%s requires a value", name))
@@ -209,14 +222,25 @@ func parseInstallArgs(args []string) (installOpts, error) {
 			}
 			if name == "memory-max" {
 				opts.memoryMax = value
-			} else {
+			} else if name == "memory-high" {
 				opts.memoryHigh = value
+			} else if name == "watchdog" {
+				if value != "off" && value != "observe" && value != "enforce" {
+					return opts, argumentInvalid("--watchdog must be off, observe, or enforce")
+				}
+				opts.watchdog = value
+			} else {
+				interval, parseErr := time.ParseDuration(value)
+				if parseErr != nil || interval < time.Second || interval >= 30*time.Second {
+					return opts, argumentInvalid("--watchdog-interval must be a Go duration in [1s,30s)")
+				}
+				opts.watchdogInterval = interval
 			}
 		default:
 			return opts, argumentInvalid(fmt.Sprintf("unknown option --%s", name))
 		}
 	}
-	if opts.status && (opts.memoryMax != "" || opts.memoryHigh != "" || opts.allowOvercommit || opts.dryRun) {
+	if opts.status && (opts.memoryMax != "" || opts.memoryHigh != "" || opts.allowOvercommit || opts.dryRun || seen["watchdog"] || seen["watchdog-interval"]) {
 		return opts, argumentInvalid("--status cannot be combined with mutation options")
 	}
 	return opts, nil
@@ -224,6 +248,12 @@ func parseInstallArgs(args []string) (installOpts, error) {
 
 func runInstall(d installDeps, opts installOpts) error {
 	d = fillInstallDeps(d)
+	if opts.watchdog == "" {
+		opts.watchdog = "observe"
+	}
+	if opts.watchdogInterval == 0 {
+		opts.watchdogInterval = 2 * time.Second
+	}
 	home, err := installHome(d)
 	if err != nil {
 		return err
@@ -231,6 +261,7 @@ func runInstall(d installDeps, opts installOpts) error {
 	uid := d.geteuid()
 	unitDir := filepath.Join(home, ".config", "systemd", "user")
 	installed, whaleContent := []byte(nil), []byte(nil)
+	daemonPresent := false
 	if existingFD, present, openErr := openExistingUnitDirectory(d, unitDir, uid); openErr != nil {
 		return unavailable(openErr)
 	} else if present {
@@ -238,6 +269,9 @@ func runInstall(d installDeps, opts installOpts) error {
 		installed, _, readErr = readRegularUnitAt(d, existingFD, uid, d.sliceUnit, true)
 		if readErr == nil {
 			_, _, readErr = readRegularUnitAt(d, existingFD, uid, d.anchorUnit, true)
+		}
+		if readErr == nil {
+			_, daemonPresent, readErr = readRegularUnitAt(d, existingFD, uid, d.daemonUnit, true)
 		}
 		if readErr == nil {
 			whaleContent, _, readErr = readRegularUnitAt(d, existingFD, uid, "whale.slice", false)
@@ -289,14 +323,25 @@ func runInstall(d installDeps, opts installOpts) error {
 	if err != nil {
 		return argumentInvalid(err.Error())
 	}
+	paths, err := d.daemonPaths()
+	if err != nil {
+		return unavailable(fmt.Errorf("resolve daemon paths: %w", err))
+	}
+	daemonUnit, err := renderDaemonUnit(d.daemonUnit, executable, paths.StateHome, opts.watchdog, opts.watchdogInterval, d.daemonRuntimeDir)
+	if err != nil {
+		return argumentInvalid(err.Error())
+	}
 
 	if opts.dryRun {
 		d.logf("--- %s ---\n%s", d.sliceUnit, strings.TrimSuffix(slice, "\n"))
 		d.logf("--- %s ---\n%s", d.anchorUnit, strings.TrimSuffix(anchor, "\n"))
+		d.logf("--- %s ---\n%s", d.daemonUnit, strings.TrimSuffix(daemonUnit, "\n"))
 		d.logf("planned: create %s; atomically update managed units", unitDir)
 		d.logf("planned: systemctl --user daemon-reload")
 		d.logf("planned: systemctl --user enable --now %s", d.anchorUnit)
 		d.logf("planned: enable and verify +memory delegation in %s", d.sliceUnit)
+		d.logf("planned: stop incumbent daemon and wait; publish and enable --now %s", d.daemonUnit)
+		d.logf("planned: loginctl enable-linger %d; verify active/running MainPID equals daemon lock PID", uid)
 		return nil
 	}
 
@@ -373,12 +418,58 @@ func runInstall(d installDeps, opts installOpts) error {
 	if _, err := d.readFile(filepath.Join(anchorCgroup, "memory.max")); err != nil {
 		return unavailable(fmt.Errorf("anchor child lacks delegated memory controller: %w", err))
 	}
+	if err := verifyDaemonSocketIdentity(d, paths); err != nil {
+		return unavailable(err)
+	}
+	if status := d.daemonStatus(paths); status.Running {
+		if err := d.daemonStop(paths); err != nil {
+			// A racing shutdown can make Status say running immediately before
+			// Stop observes no holder. That is the intended end state; only fail
+			// if a holder remains after the stop error.
+			if d.daemonStatus(paths).Running {
+				return unavailable(fmt.Errorf("stop incumbent daemon: %w", err))
+			}
+		}
+	}
+	stopDeadline := d.now().Add(12 * time.Second)
+	for d.daemonStatus(paths).Running {
+		if !d.now().Before(stopDeadline) {
+			return unavailable(errors.New("incumbent daemon did not stop before deadline"))
+		}
+		d.sleep(25 * time.Millisecond)
+	}
+	daemonChanged, err := publishManagedUnit(d, dirfd, uid, d.daemonUnit, []byte(daemonUnit))
+	if err != nil {
+		return unavailable(err)
+	}
+	if daemonChanged {
+		d.logf("%s: updated", d.daemonUnit)
+	} else {
+		d.logf("%s: up to date", d.daemonUnit)
+	}
+	if _, err := d.run([]string{"systemctl", "--user", "daemon-reload"}, nil); err != nil {
+		return unavailable(fmt.Errorf("reload daemon unit: %w", err))
+	}
+	if _, err := d.run([]string{"systemctl", "--user", "enable", "--now", d.daemonUnit}, nil); err != nil {
+		return unavailable(fmt.Errorf("enable and start %s: %w", d.daemonUnit, err))
+	}
+	if daemonPresent {
+		if _, err := d.run([]string{"systemctl", "--user", "restart", d.daemonUnit}, nil); err != nil {
+			return unavailable(fmt.Errorf("restart existing %s after incumbent shutdown: %w", d.daemonUnit, err))
+		}
+	}
+	if _, err := d.run([]string{"loginctl", "enable-linger", strconv.Itoa(uid)}, nil); err != nil {
+		d.logf("warning: loginctl enable-linger %d failed; daemon persistence is limited to active login sessions: %v", uid, err)
+	}
+	if err := waitDaemonReachable(d, paths); err != nil {
+		return unavailable(err)
+	}
 	if accepted && whaleCapped {
 		d.logf("overcommit: accepted and recorded (capped whale.slice coexists)")
 	} else if accepted {
 		d.logf("overcommit opt-in: recorded (no capped whale.slice detected)")
 	}
-	d.logf("installed: %s MemoryMax=%s MemoryHigh=%s; anchor active; memory delegated", d.sliceUnit, maximum, high)
+	d.logf("installed: %s MemoryMax=%s MemoryHigh=%s; anchor active; memory delegated; %s active, running, and MainPID-tied", d.sliceUnit, maximum, high, d.daemonUnit)
 	return nil
 }
 
@@ -395,6 +486,9 @@ func fillInstallDeps(d installDeps) installDeps {
 	}
 	if d.anchorUnit == "" {
 		d.anchorUnit = defaultAnchorUnit
+	}
+	if d.daemonUnit == "" {
+		d.daemonUnit = defaultDaemonUnit
 	}
 	if d.cgroupRoot == "" {
 		d.cgroupRoot = cgroupRoot
@@ -530,6 +624,49 @@ func renderUnits(sliceUnit, anchorUnit, executable, maximum, high string, accept
 	anchor = strings.ReplaceAll(anchor, "@SLICEUNIT@", sliceUnit)
 	anchor = strings.ReplaceAll(anchor, "@AIRABIN@", systemdExecPath(executable))
 	return slice, anchor, nil
+}
+
+func renderDaemonUnit(unit, executable, stateHome, watchdog string, interval time.Duration, runtimeDir string) (string, error) {
+	if strings.ContainsAny(unit, "\r\n/") || !strings.HasSuffix(unit, ".service") {
+		return "", errors.New("daemon unit name must end in .service and contain no path separators")
+	}
+	if strings.ContainsAny(executable+stateHome+runtimeDir, "\r\n") || !filepath.IsAbs(executable) || !filepath.IsAbs(stateHome) {
+		return "", errors.New("daemon executable and state home must be absolute single-line paths")
+	}
+	if watchdog != "off" && watchdog != "observe" && watchdog != "enforce" {
+		return "", errors.New("watchdog mode must be off, observe, or enforce")
+	}
+	if interval < time.Second || interval >= 30*time.Second {
+		return "", errors.New("watchdog interval must be in [1s,30s)")
+	}
+	template, err := assets.ReadFile("assets/aira-daemon.service.in")
+	if err != nil {
+		return "", err
+	}
+	runtimeEnvironment := ""
+	if runtimeDir != "" {
+		if !filepath.IsAbs(runtimeDir) {
+			return "", errors.New("daemon runtime directory must be absolute")
+		}
+		runtimeEnvironment = "Environment=" + systemdEnvironmentAssignment("XDG_RUNTIME_DIR", runtimeDir) + "\n"
+	}
+	unitContent := string(template)
+	replacements := map[string]string{
+		"@DAEMONUNIT@": unit, "@AIRABIN@": systemdExecPath(executable), "@STATEHOME@": systemdExecPath(stateHome),
+		"@WATCHDOG_MODE@": watchdog, "@WATCHDOG_INTERVAL@": interval.String(), "@RUNTIME_ENV@": runtimeEnvironment,
+	}
+	for placeholder, value := range replacements {
+		unitContent = strings.ReplaceAll(unitContent, placeholder, value)
+	}
+	return unitContent, nil
+}
+
+func systemdEnvironmentAssignment(name, value string) string {
+	assignment := name + "=" + value
+	if !strings.ContainsAny(assignment, " \t\\\"") {
+		return assignment
+	}
+	return strconv.Quote(assignment)
 }
 
 func systemdExecPath(path string) string {
@@ -763,6 +900,83 @@ func verifyActive(d installDeps, unit string) error {
 	return nil
 }
 
+func verifyDaemonSocketIdentity(d installDeps, invoking daemon.Paths) error {
+	runtimeDir := d.daemonRuntimeDir
+	if runtimeDir == "" {
+		out, err := d.run([]string{"systemctl", "--user", "show-environment"}, nil)
+		if err != nil {
+			return fmt.Errorf("read user-manager environment for daemon SocketPath: %w", err)
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.HasPrefix(line, "XDG_RUNTIME_DIR=") {
+				runtimeDir = strings.TrimPrefix(line, "XDG_RUNTIME_DIR=")
+				break
+			}
+		}
+	}
+	if runtimeDir == "" {
+		return errors.New("user-manager XDG_RUNTIME_DIR is unavailable; cannot verify daemon SocketPath identity")
+	}
+	home, err := installHome(d)
+	if err != nil {
+		return err
+	}
+	servicePaths, err := daemon.PathsFromEnvironment(invoking.StateHome, runtimeDir, home)
+	if err != nil {
+		return fmt.Errorf("resolve baked daemon SocketPath: %w", err)
+	}
+	if servicePaths.SocketPath != invoking.SocketPath {
+		return fmt.Errorf("daemon SocketPath divergence: invoking client resolves %s but the user service resolves %s", invoking.SocketPath, servicePaths.SocketPath)
+	}
+	return nil
+}
+
+func verifyDaemonReachable(d installDeps, paths daemon.Paths) error {
+	property := func(name string) (string, error) {
+		out, err := d.run([]string{"systemctl", "--user", "show", "-p", name, "--value", d.daemonUnit}, nil)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(out)), nil
+	}
+	active, err := property("ActiveState")
+	if err != nil || active != "active" {
+		return fmt.Errorf("%s ActiveState=%q (want active): %v", d.daemonUnit, active, err)
+	}
+	sub, err := property("SubState")
+	if err != nil || sub != "running" {
+		return fmt.Errorf("%s SubState=%q (want running): %v", d.daemonUnit, sub, err)
+	}
+	mainValue, err := property("MainPID")
+	mainPID, parseErr := strconv.Atoi(mainValue)
+	if err != nil || parseErr != nil || mainPID <= 0 {
+		return fmt.Errorf("%s MainPID=%q is unreadable: command=%v parse=%v", d.daemonUnit, mainValue, err, parseErr)
+	}
+	status := d.daemonStatus(paths)
+	if !status.Running || !status.Ready || status.Lock.PID <= 0 {
+		return fmt.Errorf("%s MainPID=%d but daemon status is not running and ready (lock PID=%d)", d.daemonUnit, mainPID, status.Lock.PID)
+	}
+	if mainPID != status.Lock.PID {
+		return fmt.Errorf("%s MainPID=%d does not match daemon lock-holder PID=%d", d.daemonUnit, mainPID, status.Lock.PID)
+	}
+	return nil
+}
+
+func waitDaemonReachable(d installDeps, paths daemon.Paths) error {
+	deadline := d.now().Add(5 * time.Second)
+	var last error
+	for {
+		last = verifyDaemonReachable(d, paths)
+		if last == nil {
+			return nil
+		}
+		if !d.now().Before(deadline) {
+			return last
+		}
+		d.sleep(25 * time.Millisecond)
+	}
+}
+
 func controlGroupPath(d installDeps, unit string) (string, error) {
 	out, err := d.run([]string{"systemctl", "--user", "show", "-p", "ControlGroup", "--value", unit}, nil)
 	if err != nil {
@@ -836,22 +1050,26 @@ func runStatus(d installDeps) error {
 	}
 	uid := d.geteuid()
 	unitDir := filepath.Join(home, ".config", "systemd", "user")
-	var content, anchorContent, whaleContent []byte
-	var unitErr, anchorErr, whaleErr error
+	var content, anchorContent, daemonContent, whaleContent []byte
+	var unitErr, anchorErr, daemonErr, whaleErr error
 	if dirfd, present, openErr := openExistingUnitDirectory(d, unitDir, uid); openErr != nil {
-		unitErr, anchorErr, whaleErr = openErr, openErr, openErr
+		unitErr, anchorErr, daemonErr, whaleErr = openErr, openErr, openErr, openErr
 	} else if !present {
-		unitErr, anchorErr, whaleErr = fs.ErrNotExist, fs.ErrNotExist, fs.ErrNotExist
+		unitErr, anchorErr, daemonErr, whaleErr = fs.ErrNotExist, fs.ErrNotExist, fs.ErrNotExist, fs.ErrNotExist
 	} else {
-		var slicePresent, anchorPresent, whalePresent bool
+		var slicePresent, anchorPresent, daemonPresent, whalePresent bool
 		content, slicePresent, unitErr = readRegularUnitAt(d, dirfd, uid, d.sliceUnit, true)
 		anchorContent, anchorPresent, anchorErr = readRegularUnitAt(d, dirfd, uid, d.anchorUnit, true)
+		daemonContent, daemonPresent, daemonErr = readRegularUnitAt(d, dirfd, uid, d.daemonUnit, true)
 		whaleContent, whalePresent, whaleErr = readRegularUnitAt(d, dirfd, uid, "whale.slice", false)
 		if unitErr == nil && !slicePresent {
 			unitErr = fs.ErrNotExist
 		}
 		if anchorErr == nil && !anchorPresent {
 			anchorErr = fs.ErrNotExist
+		}
+		if daemonErr == nil && !daemonPresent {
+			daemonErr = fs.ErrNotExist
 		}
 		if whaleErr == nil && !whalePresent {
 			whaleErr = fs.ErrNotExist
@@ -914,6 +1132,7 @@ func runStatus(d installDeps) error {
 			}
 		}
 	}
+	statusDaemonFacet(d, uid, daemonContent, daemonErr)
 
 	whaleCapped := cappedWhaleContent(whaleContent)
 	switch {
@@ -958,6 +1177,77 @@ func statusLiveProperty(d installDeps, unit, property string) {
 		return
 	}
 	d.logf("live %s: %s", property, value)
+}
+
+func statusDaemonFacet(d installDeps, uid int, content []byte, unitErr error) {
+	switch {
+	case unitErr == nil:
+		d.logf("daemon unit: present (managed marker ok)")
+	case errors.Is(unitErr, fs.ErrNotExist):
+		d.logf("daemon unit: absent")
+	case strings.Contains(unitErr.Error(), "marker-less"):
+		d.logf("daemon unit: present (foreign/marker invalid)")
+	default:
+		d.logf("daemon unit: unevaluated (%v)", unitErr)
+	}
+	active := statusProperty(d, d.daemonUnit, "ActiveState")
+	sub := statusProperty(d, d.daemonUnit, "SubState")
+	if active == "active" && sub == "running" {
+		d.logf("daemon: active+running")
+	} else {
+		d.logf("daemon: ActiveState=%s SubState=%s", valueOrUnevaluated(active), valueOrUnevaluated(sub))
+	}
+	mode := ""
+	liveEnvironment, liveErr := d.run([]string{"systemctl", "--user", "show", "-p", "Environment", "--value", d.daemonUnit}, nil)
+	if liveErr == nil {
+		for _, field := range strings.Fields(string(liveEnvironment)) {
+			if strings.HasPrefix(field, "AIRA_DAEMON_WATCHDOG_MODE=") {
+				mode = strings.TrimPrefix(field, "AIRA_DAEMON_WATCHDOG_MODE=")
+			}
+		}
+	}
+	if mode == "" {
+		for _, line := range strings.Split(string(content), "\n") {
+			if strings.HasPrefix(line, "Environment=AIRA_DAEMON_WATCHDOG_MODE=") {
+				mode = strings.TrimPrefix(line, "Environment=AIRA_DAEMON_WATCHDOG_MODE=") + " (declared; live unevaluated)"
+			}
+		}
+	}
+	if mode == "" {
+		d.logf("daemon watchdog: unevaluated (%v)", liveErr)
+	} else {
+		d.logf("daemon watchdog: %s", mode)
+	}
+	paths, pathsErr := d.daemonPaths()
+	if pathsErr != nil {
+		d.logf("daemon reachable: unevaluated (%v)", pathsErr)
+	} else if err := verifyDaemonReachable(d, paths); err != nil {
+		d.logf("daemon reachable: no (%v)", err)
+	} else {
+		d.logf("daemon reachable: yes (MainPID matches lock-holder PID)")
+	}
+	lingerOut, lingerErr := d.run([]string{"loginctl", "show-user", strconv.Itoa(uid), "-p", "Linger", "--value"}, nil)
+	linger := strings.TrimSpace(string(lingerOut))
+	if lingerErr != nil || (linger != "yes" && linger != "no") {
+		d.logf("linger: unevaluated (%v)", lingerErr)
+	} else {
+		d.logf("linger: %s", map[bool]string{true: "on", false: "off"}[linger == "yes"])
+	}
+}
+
+func statusProperty(d installDeps, unit, property string) string {
+	out, err := d.run([]string{"systemctl", "--user", "show", "-p", property, "--value", unit}, nil)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func valueOrUnevaluated(value string) string {
+	if value == "" {
+		return "unevaluated"
+	}
+	return value
 }
 
 func parseAnchorBinary(content []byte) (string, bool) {

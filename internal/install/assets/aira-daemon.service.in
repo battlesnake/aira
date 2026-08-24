@@ -1,0 +1,20 @@
+# aira-managed: @DAEMONUNIT@
+[Unit]
+Description=AIRA daemon — owns state.db and runs the memory watchdog, reaper, reconciler.
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=@AIRABIN@ daemon serve
+Environment=AIRA_DAEMON_MANAGED=1
+Environment=AIRA_DAEMON_WATCHDOG_MODE=@WATCHDOG_MODE@
+Environment=AIRA_DAEMON_WATCHDOG_INTERVAL=@WATCHDOG_INTERVAL@
+Environment=XDG_STATE_HOME=@STATEHOME@
+@RUNTIME_ENV@MemoryAccounting=yes
+MemoryMax=1G
+MemoryHigh=768M
+TasksMax=512
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

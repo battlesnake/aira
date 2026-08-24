@@ -9,6 +9,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"aira/internal/daemon"
 )
 
 func TestComputeMemoryLimitsPrecedenceAndValidation(t *testing.T) {
@@ -99,8 +102,8 @@ func TestInstallReloadFailureConvergesOnNextRun(t *testing.T) {
 	if err := runInstall(d, installOpts{memoryMax: "16G"}); err != nil {
 		t.Fatalf("second install: %v", err)
 	}
-	if state.reloads != 2 {
-		t.Fatalf("daemon-reloads=%d, want 2", state.reloads)
+	if state.reloads != 3 {
+		t.Fatalf("daemon-reloads=%d, want 3 (failed anchor reload, then anchor+daemon convergence)", state.reloads)
 	}
 	if state.liveMax != 16<<30 {
 		t.Fatalf("live memory.max=%d, want %d", state.liveMax, int64(16<<30))
@@ -297,16 +300,18 @@ func TestEnableMemoryDelegation(t *testing.T) {
 }
 
 type fakeInstallState struct {
-	home        string
-	uid         int
-	writes      int
-	reloads     int
-	failReloads int
-	liveMax     int64
-	liveHigh    int64
-	logs        []string
-	commands    [][]string
-	cgroup      map[string][]byte
+	home          string
+	uid           int
+	writes        int
+	reloads       int
+	failReloads   int
+	liveMax       int64
+	liveHigh      int64
+	logs          []string
+	commands      [][]string
+	cgroup        map[string][]byte
+	daemonRunning bool
+	daemonPID     int
 }
 
 func (s *fakeInstallState) unitDir() string {
@@ -315,7 +320,9 @@ func (s *fakeInstallState) unitDir() string {
 
 func newFakeInstall(t *testing.T) (installDeps, *fakeInstallState) {
 	t.Helper()
-	state := &fakeInstallState{home: t.TempDir(), uid: os.Geteuid(), cgroup: map[string][]byte{}}
+	state := &fakeInstallState{home: t.TempDir(), uid: os.Geteuid(), cgroup: map[string][]byte{}, daemonPID: 4242}
+	stateHome := filepath.Join(state.home, "state")
+	runtimeDir := filepath.Join(state.home, "runtime")
 	userControllers := fmt.Sprintf("/sys/fs/cgroup/user.slice/user-%d.slice/user@%d.service/cgroup.controllers", state.uid, state.uid)
 	state.cgroup[userControllers] = []byte("memory pids\n")
 	state.cgroup["/sys/fs/cgroup/fake/aira.slice/cgroup.controllers"] = []byte("memory pids\n")
@@ -325,11 +332,22 @@ func newFakeInstall(t *testing.T) (installDeps, *fakeInstallState) {
 	realWriteFD := d.writeFD
 	d.writeFD = func(fd int, data []byte) error { state.writes++; return realWriteFD(fd, data) }
 	d.getenv = func(name string) string {
-		if name == "HOME" {
+		switch name {
+		case "HOME":
 			return state.home
+		case "XDG_STATE_HOME":
+			return stateHome
+		case "XDG_RUNTIME_DIR":
+			return runtimeDir
 		}
 		return ""
 	}
+	d.daemonPaths = func() (daemon.Paths, error) { return daemon.PathsFromEnvironment(stateHome, runtimeDir, state.home) }
+	d.daemonStatus = func(daemon.Paths) daemon.StatusInfo {
+		return daemon.StatusInfo{Running: state.daemonRunning, Ready: state.daemonRunning, Lock: daemon.LockInfo{PID: state.daemonPID}}
+	}
+	d.daemonStop = func(daemon.Paths) error { state.daemonRunning = false; return nil }
+	d.sleep = func(time.Duration) {}
 	d.geteuid = func() int { return state.uid }
 	d.executable = func() (string, error) { return "/opt/aira", nil }
 	realWriteFile := d.writeFile
@@ -372,7 +390,23 @@ func newFakeInstall(t *testing.T) (installDeps, *fakeInstallState) {
 			}
 			return nil, nil
 		case strings.HasPrefix(joined, "systemctl --user enable --now "):
+			if strings.HasSuffix(joined, defaultDaemonUnit) {
+				state.daemonRunning = true
+			}
 			return nil, nil
+		case joined == "systemctl --user show-environment":
+			return []byte("XDG_RUNTIME_DIR=" + runtimeDir + "\n"), nil
+		case joined == "systemctl --user restart "+defaultDaemonUnit:
+			state.daemonRunning = true
+			return nil, nil
+		case joined == "loginctl enable-linger "+fmt.Sprint(state.uid):
+			return nil, nil
+		case joined == "systemctl --user show -p ActiveState --value "+defaultDaemonUnit:
+			return []byte("active\n"), nil
+		case joined == "systemctl --user show -p SubState --value "+defaultDaemonUnit:
+			return []byte("running\n"), nil
+		case joined == "systemctl --user show -p MainPID --value "+defaultDaemonUnit:
+			return []byte(fmt.Sprintf("%d\n", state.daemonPID)), nil
 		case strings.HasPrefix(joined, "systemctl --user is-active "):
 			return []byte("active\n"), nil
 		case joined == "systemctl --user show -p ControlGroup --value aira.slice":

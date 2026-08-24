@@ -9,11 +9,17 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
 	"aira/internal/daemon"
 	"aira/internal/store"
+)
+
+var (
+	daemonSystemctlRun daemon.SystemctlRun = daemon.RunSystemctl
+	serveDaemon                            = func(ctx context.Context, paths daemon.Paths) error { return daemon.NewServer(paths).Serve(ctx) }
 )
 
 func runDaemonCommand(args []string, stdout, stderr io.Writer) int {
@@ -28,10 +34,20 @@ func runDaemonCommand(args []string, stdout, stderr io.Writer) int {
 	}
 	switch operation {
 	case "serve":
+		if strings.TrimSpace(os.Getenv("AIRA_DAEMON_MANAGED")) == "" && daemon.ServiceIdentityMatches(paths, daemon.DefaultServiceUnit, daemonSystemctlRun, os.ReadFile, os.Getenv) {
+			// Best effort: the enabled service is authoritative. Exiting without
+			// taking the flock prevents a race-forked stray daemon from stranding it.
+			_, _ = daemonSystemctlRun([]string{"systemctl", "--user", "start", daemon.DefaultServiceUnit})
+			return 0
+		}
 		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 		defer cancel()
-		err := daemon.NewServer(paths).Serve(ctx)
+		err := serveDaemon(ctx, paths)
 		if errors.Is(err, daemon.ErrAlreadyRunning) {
+			if os.Getenv("INVOCATION_ID") != "" {
+				status := daemon.Status(paths)
+				_, _ = fmt.Fprintf(stderr, "aira daemon: service could not acquire daemon lock; current lock-holder PID=%d\n", status.Lock.PID)
+			}
 			return 0
 		}
 		var drainTimeout *daemon.ErrDrainTimeout
@@ -52,6 +68,10 @@ func runDaemonCommand(args []string, stdout, stderr io.Writer) int {
 		}
 		return store.ExitForCode(daemon.CodeUnavailable)
 	case "stop":
+		if daemon.ServiceIsEnabled(daemon.DefaultServiceUnit, daemonSystemctlRun) {
+			_, _ = fmt.Fprintf(stderr, "%s: %s is enabled; use `systemctl --user stop %s` (or disable it)\n", daemon.CodeUnavailable, daemon.DefaultServiceUnit, daemon.DefaultServiceUnit)
+			return store.ExitForCode(daemon.CodeUnavailable)
+		}
 		if err := daemon.Stop(paths); err != nil {
 			_, _ = fmt.Fprintln(stderr, err)
 			return store.ExitForCode(store.ErrorCode(err))

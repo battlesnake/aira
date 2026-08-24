@@ -37,7 +37,10 @@ type daemonDispatcher struct {
 	lockWait         time.Duration
 	exchange         func(context.Context, string, daemon.RequestFrame) (daemon.ResponseFrame, error)
 	storeOpExchange  func(context.Context, string, daemon.StoreOpFrame) (daemon.ResponseFrame, error)
-	spawn            func() (<-chan childResult, error)
+	spawn            func() (<-chan childResult, error) // injectable fork fallback
+	systemctlRun     daemon.SystemctlRun
+	readFile         func(string) ([]byte, error)
+	getenv           func(string) string
 	afterRelayWiring func(storeRunner, supervisorLeaseReader bool)
 }
 
@@ -72,6 +75,14 @@ func (d *daemonDispatcher) doStoreOpExchange(ctx context.Context, frame daemon.S
 }
 
 func (d *daemonDispatcher) spawnDaemon() (<-chan childResult, error) {
+	if daemon.ServiceIdentityMatches(d.paths, daemon.DefaultServiceUnit, d.systemctl(), d.reader(), d.environment()) {
+		done := make(chan childResult, 1)
+		_, err := d.systemctl()([]string{"systemctl", "--user", "start", daemon.DefaultServiceUnit})
+		if err != nil {
+			done <- childResult{err: err}
+		}
+		return done, nil
+	}
 	if d.spawn != nil {
 		return d.spawn()
 	}
@@ -85,6 +96,27 @@ func (d *daemonDispatcher) spawnDaemon() (<-chan childResult, error) {
 	done := make(chan childResult, 1)
 	go func() { done <- childResult{err: child.Wait(), stderr: childStderr.String()} }()
 	return done, nil
+}
+
+func (d *daemonDispatcher) systemctl() daemon.SystemctlRun {
+	if d.systemctlRun != nil {
+		return d.systemctlRun
+	}
+	return daemon.RunSystemctl
+}
+
+func (d *daemonDispatcher) reader() func(string) ([]byte, error) {
+	if d.readFile != nil {
+		return d.readFile
+	}
+	return os.ReadFile
+}
+
+func (d *daemonDispatcher) environment() func(string) string {
+	if d.getenv != nil {
+		return d.getenv
+	}
+	return os.Getenv
 }
 
 func (d *daemonDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeScope, request core.Request) core.Response {
@@ -296,10 +328,22 @@ func (d *daemonDispatcher) exchangeWithReplacement(ctx context.Context, exchange
 	if daemon.ProtocolVersion <= response.Proto {
 		return response, nil
 	}
-	if err := d.replaceOlderDaemon(ctx); err != nil {
+	serviceRestart, err := d.replaceOlderDaemon(ctx)
+	if err != nil {
 		return daemon.ResponseFrame{}, err
 	}
-	return exchange(ctx)
+	retry, err := exchange(ctx)
+	if err != nil {
+		return daemon.ResponseFrame{}, err
+	}
+	if serviceRestart && isOlderProtocol(retry) {
+		return daemon.ResponseFrame{}, errors.New("installed aira-daemon.service binary is older than this client — re-run 'aira install'")
+	}
+	return retry, nil
+}
+
+func isOlderProtocol(response daemon.ResponseFrame) bool {
+	return response.Code == daemon.CodeProtocol && response.Proto > 0 && response.Proto < daemon.ProtocolVersion
 }
 
 func prepareRoutedRequest(request *core.Request) {
@@ -434,8 +478,12 @@ func (d *daemonDispatcher) exchangeOrStartUsing(ctx context.Context, exchange fu
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
-	if childErr != nil && childStderr != "" {
-		err := fmt.Errorf("%s: daemon did not accept before deadline (%v): %s", daemon.CodeTimeout, childErr, strings.TrimSpace(childStderr))
+	if childErr != nil {
+		detail := childErr.Error()
+		if strings.TrimSpace(childStderr) != "" {
+			detail += ": " + strings.TrimSpace(childStderr)
+		}
+		err := fmt.Errorf("%s: daemon did not accept before deadline: %s", daemon.CodeTimeout, detail)
 		if requestNotSent {
 			err = &daemon.RequestNotSentError{Err: err}
 		}
@@ -471,23 +519,29 @@ func releaseStartupLock(file *os.File) {
 	_ = file.Close()
 }
 
-func (d *daemonDispatcher) replaceOlderDaemon(ctx context.Context) error {
+func (d *daemonDispatcher) replaceOlderDaemon(ctx context.Context) (bool, error) {
+	if daemon.ServiceIdentityMatches(d.paths, daemon.DefaultServiceUnit, d.systemctl(), d.reader(), d.environment()) {
+		if _, err := d.systemctl()([]string{"systemctl", "--user", "restart", daemon.DefaultServiceUnit}); err != nil {
+			return true, fmt.Errorf("restart installed %s: %w", daemon.DefaultServiceUnit, err)
+		}
+		return true, nil
+	}
 	if err := daemon.Stop(d.paths); err != nil {
-		return err
+		return false, err
 	}
 	deadline := time.Now().Add(d.startWait)
 	for time.Now().Before(deadline) {
 		status := daemon.Status(d.paths)
 		if !status.Running && !status.Ready {
-			return nil
+			return false, nil
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("%s: %w", daemon.CodeTimeout, ctx.Err())
+			return false, fmt.Errorf("%s: %w", daemon.CodeTimeout, ctx.Err())
 		case <-time.After(25 * time.Millisecond):
 		}
 	}
-	return errors.New(daemon.CodeTimeout + ": older daemon did not stop")
+	return false, errors.New(daemon.CodeTimeout + ": older daemon did not stop")
 }
 
 // inProcessDispatcher is injected by tests. It is a substrate, never a

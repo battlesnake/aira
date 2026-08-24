@@ -141,10 +141,25 @@ func registryDiscoveryIntervalFromEnv() (time.Duration, error) {
 // PathsFromEnv pins the state identity from the daemon's own environment.
 func PathsFromEnv() (Paths, error) {
 	stateHome := strings.TrimSpace(os.Getenv("XDG_STATE_HOME"))
+	home := ""
 	if stateHome == "" {
-		home, err := os.UserHomeDir()
+		var err error
+		home, err = os.UserHomeDir()
 		if err != nil {
 			return Paths{}, err
+		}
+	}
+	return PathsFromEnvironment(stateHome, strings.TrimSpace(os.Getenv("XDG_RUNTIME_DIR")), home)
+}
+
+// PathsFromEnvironment resolves the same daemon identity as PathsFromEnv from
+// explicit environment values. It lets service-aware callers compare identities
+// without mutating process-global environment variables.
+func PathsFromEnvironment(stateHome, runtimeDir, home string) (Paths, error) {
+	stateHome = strings.TrimSpace(stateHome)
+	if stateHome == "" {
+		if strings.TrimSpace(home) == "" {
+			return Paths{}, errors.New("HOME is unset; cannot resolve XDG_STATE_HOME")
 		}
 		stateHome = filepath.Join(home, ".local", "state")
 	}
@@ -152,7 +167,7 @@ func PathsFromEnv() (Paths, error) {
 	if err != nil {
 		return Paths{}, err
 	}
-	runtime := strings.TrimSpace(os.Getenv("XDG_RUNTIME_DIR"))
+	runtime := strings.TrimSpace(runtimeDir)
 	if runtime == "" {
 		runtime = filepath.Join(stateHome, "aira", "run")
 	}

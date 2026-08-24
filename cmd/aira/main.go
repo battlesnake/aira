@@ -497,7 +497,7 @@ func parseInstallDescriptorArgs(argv []string) ([]string, map[string]string, err
 				return nil, nil, fmt.Errorf("E_INSTALL_ARGUMENT_INVALID: option --%s does not take a value", name)
 			}
 			options[name] = "true"
-		case "memory-max", "memory-high":
+		case "memory-max", "memory-high", "watchdog", "watchdog-interval":
 			if !hasValue {
 				if i+1 >= len(argv) || strings.HasPrefix(argv[i+1], "--") {
 					return nil, nil, fmt.Errorf("E_INSTALL_ARGUMENT_INVALID: option --%s requires a value", name)

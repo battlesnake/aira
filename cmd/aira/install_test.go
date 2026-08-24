@@ -72,11 +72,11 @@ func TestInstallDescriptorIsHelpListedButNotMCPIncluded(t *testing.T) {
 }
 
 func TestInstallParseArgsEntryAcceptsDocumentedFlags(t *testing.T) {
-	positionals, options, err := parseArgs("install", []string{"--memory-max", "16G", "--memory-high=14G", "--allow-overcommit", "--dry-run"})
+	positionals, options, err := parseArgs("install", []string{"--memory-max", "16G", "--memory-high=14G", "--watchdog=enforce", "--watchdog-interval", "5s", "--allow-overcommit", "--dry-run"})
 	if err != nil || len(positionals) != 0 {
 		t.Fatalf("positionals=%q options=%q err=%v", positionals, options, err)
 	}
-	for key, want := range map[string]string{"memory-max": "16G", "memory-high": "14G", "allow-overcommit": "true", "dry-run": "true"} {
+	for key, want := range map[string]string{"memory-max": "16G", "memory-high": "14G", "watchdog": "enforce", "watchdog-interval": "5s", "allow-overcommit": "true", "dry-run": "true"} {
 		if options[key] != want {
 			t.Fatalf("option %s=%q, want %q", key, options[key], want)
 		}
