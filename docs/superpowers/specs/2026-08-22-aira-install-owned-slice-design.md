@@ -26,9 +26,17 @@ systemd-255 findings (`Delegate=` on a `[Slice]` ignored; manual subtree_control
 delegation wiped by daemon-reload; `daemon-reload` alone applies a changed slice
 `MemoryMax`), and the owner's directive to mirror `agentmux install`'s
 baked-into-binary pattern (§0 re-verified against live agentmux code 2026-08-24).
-**Re-gate required** for the v4 framing before build. Milestone #55. Successor to
-`aira confine` ([2026-08-21](2026-08-21-aira-whale-confinement-face-design.md),
-merged `e9e83c4`).
+**v4 re-gate DONE (2026-08-24):** Sol GATE-FAIL + Fable GATE-PASS-WITH-NITS, which
+**converged on one load-bearing P1** — §4's "definite absence = slice-not-found"
+would silently fall back a dead-anchor aira.slice to whale.slice for the whole
+concurrent interim (invisibly, since whale stays valid). All folded: §4 definite-
+absence redefined (unit-file + cgroup, `fs.ErrNotExist`-distinguishing) + its red
+test; §6 reload must converge (not skip-forever on a prior failed reload); §3 claim
+scoped to AIRA's tooling + `--status` observes coexistence; §7 leak-safe real-systemd
+teardown; §4 failure-path `Status.Slice` intent; §9 redirect OOM-parity precondition;
+§5 build reminders (RouteClient load-bearing, `E_INSTALL_*` catalog). Ready to build.
+Milestone #55. Successor to `aira confine`
+([2026-08-21](2026-08-21-aira-whale-confinement-face-design.md), merged `e9e83c4`).
 
 Owner selected this thread (2026-08-22) — the whale endgame: AIRA installs and owns
 its own capped systemd **user** slice, mirroring how `agentmux install` bakes the
@@ -246,10 +254,20 @@ a fresh operator (or a future automated caller) never creates a silent overcommi
   whale-run→confine migration) and the exact opt-in flag to proceed.
 - **`aira install --allow-overcommit`** is the explicit acknowledgement that
   proceeds anyway, recording the acceptance in the install output/status. This is
-  the tool-enforced form of "owner-approved product risk" Sol r2 requires — no
-  silent overcommit is ever created.
+  the tool-enforced form of "owner-approved product risk" Sol r2 requires.
+- **The gate is one-directional — claim scoped honestly (Sol + Fable P2).** AIRA can
+  only gate the overcommit *it* creates (installing aira.slice when whale.slice is
+  already capped). It cannot prevent the *reverse*: `agentmux install` / a whale-run
+  activation creating a capped whale.slice **after** aira.slice, with no AIRA opt-in
+  ever recorded. So the guarantee is precisely "**no overcommit created by AIRA's
+  own tooling without `--allow-overcommit`**" — NOT "no overcommit ever exists".
+  `--status` closes the honesty gap by *observing* the live world: when it detects a
+  capped whale.slice coexisting with aira.slice and no recorded opt-in, it reports
+  "coexisting capped slices present, overcommit opt-in not recorded" (an observed
+  fact, never a fake "safe"). On this box the expected order is whale-first (whale is
+  already live), so the `--allow-overcommit` path is normally exercised at install.
 - With no capped whale.slice present, `install` proceeds normally (aira.slice is
-  then the only cap — no overcommit possible).
+  then the only cap — no overcommit possible at install time).
 - **Sizing (interim, this host).** The derive-if-unspecified default is `⅔·MemTotal`
   (mirrors agentmux). Note whale.slice is a hardcoded 64G — that is `⅔` of the **96G
   physical** box, but inside the **80G WSL VM** `/proc/meminfo` MemTotal ≈ 80G, so the
@@ -273,15 +291,18 @@ Resolution precedence: `--slice` > `$AIRA_CONFINE_SLICE` > `aira.slice` (if it
 resolves to a *valid* AIRA-owned, active, capped, delegated slice) > `whale.slice`
 (if valid) > `E_CONFINE_UNAVAILABLE: aira.slice not found (run 'aira install')`.
 
-- Fallback to whale.slice happens ONLY on *definite absence* of aira.slice. If
-  aira.slice exists but is inactive / uncapped / undelegated / permission-denied,
-  confine **fails on AIRA** with that reason — it does not silently switch slices
-  (masking a broken install is dishonest and could run less-confined than intended).
+- Fallback to whale.slice happens ONLY on *definite absence* of aira.slice — defined
+  in the Mechanics paragraph below as **no aira-managed unit file AND no cgroup dir**
+  (NOT the v3 "slice-not-found", which conflated inactive with never-installed). If
+  aira.slice is installed-but-inactive (unit file present, no cgroup dir) OR active
+  but uncapped / undelegated / permission-denied, confine **fails on AIRA** with that
+  reason — it does not silently switch slices (masking a broken install is dishonest
+  and, for the inactive case, would run under whale for the whole interim unnoticed).
 - An explicit `--slice`/`$AIRA_CONFINE_SLICE` **never** falls back — the operator's
   choice is honoured or fails.
-- "Resolves to a valid slice" is defined precisely: the unit path exists under the
-  user manager, the cgroup is active, `memory.max` is finite (the existing
-  effective-cap check), and `memory` is delegated to it.
+- "Resolves to a valid slice" is defined precisely: the aira-managed unit file exists
+  AND the cgroup is active AND `memory.max` is finite (the existing effective-cap
+  check) AND `memory` is delegated to it.
 
 **Mechanics (Fable, code-grounded).** The probing precedence is linux-only and must
 live in the linux `confineWithDeps` path behind a **new injectable dep** — NOT in
@@ -291,12 +312,45 @@ flag/env detection (explicit `--slice`/`$AIRA_CONFINE_SLICE` → returned verbat
 never probed/fallen-back); the aira→whale default resolution + validity probe run
 in the linux path using `resolveSlicePath` (`admission_linux.go`) +
 `effectiveConfineCap` + a **new** `cgroup.controllers` delegation read the repo
-lacks. "Definite absence" = the existing `slice-not-found` reason (a stopped slice
-has no cgroup dir). Because the honest slice name is only known after probing,
-`result.Status.Slice` stamping (today at the top of `confineWithDeps`) moves to
-after resolution. `TestResolveConfineSlicePrecedence` (which hardcodes the
-whale.slice default) is rewritten (fine under the not-live/no-compat rule); the
-`confineDeps` seam keeps the other confine tests intact.
+lacks.
+
+**"Definite absence" — CORRECTED (Sol + Fable P1, MUST-FIX; the v3 definition was
+wrong).** The existing `resolveSlicePath`/`resolveSlicePathAt`
+(`admission_linux.go:469-525`) collapses **every** failure — unifiedMount error,
+`EvalSymlinks`/permission-denied, `os.Stat` ENOENT — into the single reason
+`slice-not-found`. So a cgroup-path probe **cannot** tell *never-installed* from
+*installed-but-inactive*: systemd removes a slice's cgroup dir when its last member
+exits, so a stopped aira.slice (exactly §2a's dead-anchor / moved-binary scenario)
+looks identical to one that was never installed. Under v3's "definite absence =
+slice-not-found" a dead-anchor aira.slice would **silently fall back to whale.slice
+for the entire concurrent interim** — and because whale.slice stays permanently
+valid, that masking is *permanent and invisible* (the concurrent model makes it
+strictly worse than the replacement model, where the fallback would eventually fail
+loudly). This contradicts §4's own "inactive → fail on AIRA" bullet. **Fix:**
+*definite absence* ≡ **no aira-managed unit file** (the §2b marker-bearing
+`aira.slice` file in the user unit dir) **AND** no cgroup dir. The new injected
+resolution dep must (a) distinguish `errors.Is(err, fs.ErrNotExist)` from other
+stat/eval errors instead of reusing the collapsed reason, and (b) check for the
+aira-managed unit file. Resulting policy:
+  - unit file **absent** + cgroup dir absent → *definite absence* → fall back to
+    whale.slice (if valid).
+  - unit file **present** + cgroup dir absent/unreadable → **fail on AIRA**
+    (`E_CONFINE_UNAVAILABLE: aira.slice installed but not active — anchor dead?
+    re-run aira install`), never whale.
+  - cgroup dir present but uncapped/undelegated/permission-denied → **fail on AIRA**
+    (unchanged from the v3 intent).
+
+**Failure-path `Status.Slice` (Fable P2).** Because the honest slice name is only
+known after probing, the `result.Status.Slice` stamp (today at
+`confine_linux.go:161-165`, before every failure path) moves to **after** resolution.
+On a resolution-failure path, stamp the **attempted** slice name (`aira.slice` for a
+default resolution, or the explicit `--slice` value) so no result ever carries an
+empty `Slice`; `FormatConfineStatus` (`confine_linux.go:394`, success-only today)
+must never print `slice=` with an empty name.
+
+`TestResolveConfineSlicePrecedence` (which hardcodes the whale.slice default) is
+rewritten (fine under the not-live/no-compat rule); the `confineDeps` seam keeps the
+other confine tests intact.
 
 ## 5. Faces
 
@@ -336,7 +390,17 @@ formatted `"CODE: message"` so `store.ErrorCode` prefix-parses them (as
 **Code home (Fable).** Put the installer logic + `//go:embed assets` in a new
 `internal/install` package with the seam-injected `installDeps` struct (every
 os/exec side effect a field, mirroring agentmux); `cmd/aira/main.go` stays a thin
-face. Precedent for embed: `internal/pylib` already `//go:embed`s a directory.
+face. Precedent for embed: `internal/pylib` already `//go:embed`s a directory
+(`internal/pylib/extract.go:28`, `//go:embed all:…`).
+
+**Build reminders (Fable, code-grounded — not new design):** (1) the explicit
+`install → RouteClient` classification is **load-bearing**: `Classify` defaults to
+`RouteDaemon` (`internal/core/routing.go:53-54`), and the palette-exclusion +
+daemon-rejection safety both rely on `install` being `RouteClient`; add a
+confine-style erroring `Run` stub (the `core.go:1680` pattern) as the honest backstop
+if it is ever misrouted. (2) Add the `E_INSTALL_*` codes to the error catalog so
+`ExitForCode` (`internal/store/check.go:90-95`, unknown → 1) maps them intentionally,
+and they are `"CODE: message"`-formatted for `store.ErrorCode` prefix-parsing.
 
 ## 6. Update semantics — daemon-reload only, single source of truth (Sol r2, measured)
 
@@ -353,18 +417,47 @@ honestly (`unevaluated`/failed), never claiming a change that did not take. A sl
 is never "restarted" (its properties are live), so there is no active-job restart
 hazard — simpler than agentmux's service updates.
 
+**Idempotence must CONVERGE, not just report honestly (Sol #3, MUST-FIX).** Content
+equality alone cannot gate the reload: if a prior install wrote the unit file
+successfully but its `daemon-reload` then failed (transient), the on-disk bytes now
+equal the rendered asset, so a naive "content-equal → up to date → skip reload"
+would skip the reload **forever** while the live cgroup keeps the stale/absent cap —
+honest-but-stuck. So the reload decision is gated on the **live** state, not the file:
+`install` runs `daemon-reload` whenever the file is rewritten **OR** the live
+`memory.max` does not equal the declared cap (or delegation is missing). Equivalently
+and more simply, `install` may **always** `daemon-reload` (it is cheap and idempotent,
+matching agentmux's unconditional write) and use the file content-compare only to
+decide whether to rewrite the file and to phrase the "up to date" status. Either way
+a failed reload is retried on the next run until live == declared — convergence, not
+just an honest failure. The post-reload read-back verify (above) stays; it now
+guarantees convergence rather than a permanent honest-mismatch.
+
 ## 7. Tests (TDD; real-systemd gated by `AIRA_REAL_SYSTEMD=1`, throwaway slice name)
 
 - **Pure:** sizing (MemTotal→max/high, precedence, `high≤max`, floor, regex);
-  render substitution; marker presence; resolution precedence incl. strict
-  no-fallback on a *present-but-broken* aira.slice and never-fallback on explicit
-  `--slice`. Proven red against the wrong impl.
+  render substitution; marker presence; resolution precedence incl. never-fallback on
+  explicit `--slice`. Proven red against the wrong impl.
+- **§4 definite-absence — the P1 discriminating tests (Sol + Fable, MUST be RED
+  against the v3 "slice-not-found = absence" impl):** (a) aira-managed **unit file
+  present + no cgroup dir** (installed-but-inactive / dead-anchor) → confine **fails
+  on AIRA** (`E_CONFINE_UNAVAILABLE`), NEVER whale.slice; (b) **no unit file + no
+  cgroup dir** (never installed) → falls back to whale.slice (if valid); (c) cgroup
+  present but uncapped/undelegated → fails on AIRA. The v3-porous "present-but-broken"
+  case (cgroup present, uncapped) is kept but is insufficient alone — (a) is the case
+  it missed. The injected resolution dep must distinguish `fs.ErrNotExist` from other
+  errors, tested both ways.
+- **Reload convergence (Sol #3):** a run whose first `daemon-reload` fails (injected
+  seam error) with the file already written → the NEXT run still `daemon-reload`s
+  (live≠declared forces it), reaching live==declared — NOT a permanent "up to date"
+  skip. Red against a naive content-equal-skips-reload impl.
 - **Seam-injected install:** `--dry-run` writes nothing / invokes no systemctl;
-  idempotent second run reports "up to date" (content-equal); a changed
-  `--memory-max` reports the delta + re-renders + `daemon-reload`s (no
+  idempotent second run reports "up to date" (content-equal, live already matches);
+  a changed `--memory-max` reports the delta + re-renders + `daemon-reload`s (no
   `set-property`); a foreign (marker-less) unit of the same name is refused, not
   clobbered; a symlink/non-regular target is rejected; a capped whale.slice without
-  `--allow-overcommit` → `E_INSTALL_OVERCOMMIT` (nothing written).
+  `--allow-overcommit` → `E_INSTALL_OVERCOMMIT` (nothing written); `--status` detecting
+  a capped whale.slice coexisting with aira.slice reports the observed coexistence
+  (opt-in-not-recorded), never a fake "safe".
 - **Delegation (temp-dir cgroup mock):** enable writes `+memory` given `memory` in
   cgroup.controllers; hard error when absent; **reload-strip regression** — after a
   simulated subtree_control reset, confine's runtime verify fails closed (target
@@ -375,8 +468,14 @@ hazard — simpler than agentmux's service updates.
   then stop + clean the throwaway. **Both** unit names (the slice AND the anchor
   service) must be parametrised through the installer seam so the fixed
   `aira-slice-keepalive.service` name never leaks into a throwaway-slice test
-  (Fable). Skips cleanly with no user manager (`E_INSTALL_UNAVAILABLE`; mention
-  `loginctl enable-linger` for headless — Gemini r1).
+  (Fable). **Leak-safe teardown (Fable P2, MUST):** the throwaway anchor is a real
+  `Restart=always` service written into the real `~/.config/systemd/user`; a test
+  killed before teardown leaves a live, auto-restarting anchor holding a slice
+  forever. So: register stop+disable+remove of BOTH throwaway units via `t.Cleanup`
+  (runs even on failure), and at test START best-effort pre-clean any stale
+  `aira-test-*` slice/anchor units whose embedded `<pid>` is no longer alive. Skips
+  cleanly with no user manager (`E_INSTALL_UNAVAILABLE`; mention `loginctl
+  enable-linger` for headless — Gemini r1).
 
 ## 8. Errors
 
@@ -404,7 +503,15 @@ whale.slice exists and `--allow-overcommit` was not given). Stable, actionable.
    own per-scope oom.group + deprioritisation, so verify parity before cutting over.
    Once redirected and whale.slice is idle, retire/alias whale.slice → aira.slice
    becomes the sole 64G pool (fully resolves §3's overcommit; the single-slice size
-   already matches, §3 sizing).
+   already matches, §3 sizing). **OOM-semantics parity is a hard precondition of the
+   redirect (Sol #4):** whale-run relies on `--property=OOMPolicy=kill` (a
+   systemd unit-level policy); confine relies on `memory.oom.group=1` (cgroup
+   group-OOM). These are NOT proven equivalent — group-OOM fires on a cgroup memory
+   *limit* hit and kills the whole scope, but systemd's unit-level cleanup may cover
+   global/ancestor-OOM cases group-OOM does not. Before cutting whale-run over,
+   explicitly test both the cgroup-limit and host/ancestor-OOM paths and preserve or
+   replicate whatever OOMPolicy=kill gave, so the redirect never silently loses kill
+   coverage.
 
 **Later / independent:** fold whale watchdog + systemd-oomd (the watchdog itself
 already landed in AIRA, #59 — this is the oomd unit + the interlock flip);
