@@ -687,8 +687,8 @@ func runUserInstall(d installDeps, opts installOpts) error {
 		d.logf("overcommit opt-in: recorded (no capped whale.slice detected)")
 	}
 	enforcement := memoryEnforcementState(d, uid, maximum)
-	oomdCurrent := systemDropinsCurrent(d, uid)
-	if enforcement != enforcementActive || !oomdCurrent {
+	oomdHealthy := systemDropinsHealthy(d, uid)
+	if enforcement != enforcementActive || !oomdHealthy {
 		d.logf("warning: run 'sudo aira install' to apply the /etc oomd + delegation drop-ins, then re-login")
 	}
 	d.logf("installed: %s MemoryMax=%s MemoryHigh=%s; anchor active; memory delegation: %s; %s active, running, and MainPID-tied", d.sliceUnit, maximum, high, enforcement, d.daemonUnit)
@@ -1105,7 +1105,7 @@ func installSystemDropins(d installDeps, uid int, dryRun bool) error {
 			failures = append(failures, fmt.Errorf("systemctl daemon-reload: %w", reloadErr))
 		}
 	}
-	if oomdChanged {
+	if oomdChanged || !systemdOomdActive(d) {
 		if _, restartErr := d.run([]string{"systemctl", "restart", "systemd-oomd"}, nil); restartErr != nil {
 			d.logf("partial /etc install: systemctl restart systemd-oomd failed: %v", restartErr)
 			failures = append(failures, fmt.Errorf("systemctl restart systemd-oomd: %w", restartErr))
@@ -1138,6 +1138,15 @@ func systemDropinsCurrent(d installDeps, uid int) bool {
 		}
 	}
 	return true
+}
+
+func systemdOomdActive(d installDeps) bool {
+	out, err := d.run([]string{"systemctl", "is-active", "systemd-oomd"}, nil)
+	return err == nil && strings.TrimSpace(string(out)) == "active"
+}
+
+func systemDropinsHealthy(d installDeps, uid int) bool {
+	return systemDropinsCurrent(d, uid) && systemdOomdActive(d)
 }
 
 func delegationDropinCurrent(d installDeps, uid int) bool {
@@ -1572,10 +1581,10 @@ func runStatus(d installDeps) error {
 
 	maximum, _ := parseInstalledMemoryMax(string(content))
 	d.logf("memory delegation: %s", memoryEnforcementState(d, uid, maximum))
-	if systemDropinsCurrent(d, uid) {
+	if systemDropinsHealthy(d, uid) {
 		d.logf("oomd + delegation drop-ins: up to date")
 	} else {
-		d.logf("oomd + delegation drop-ins: missing or stale")
+		d.logf("oomd + delegation drop-ins: missing, stale, or systemd-oomd inactive")
 	}
 
 	anchorBinary, binaryOK := parseAnchorBinary(anchorContent)

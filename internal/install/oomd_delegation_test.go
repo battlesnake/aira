@@ -276,6 +276,38 @@ func TestStatusReportsHonestMemoryEnforcementTriState(t *testing.T) {
 	}
 }
 
+func TestInactiveSystemdOomdPreventsHealthySummaryAndStatus(t *testing.T) {
+	d, state := newFakeInstall(t)
+	if err := runInstall(d, installOpts{memoryMax: "16G"}); err != nil {
+		t.Fatal(err)
+	}
+	installFakeSystemDropins(t, &d, state.home)
+	priorRun := d.run
+	d.run = func(argv []string, stdin []byte) ([]byte, error) {
+		if reflect.DeepEqual(argv, []string{"systemctl", "is-active", "systemd-oomd"}) {
+			return []byte("inactive\n"), errors.New("exit status 3")
+		}
+		return priorRun(argv, stdin)
+	}
+
+	state.logs = nil
+	if err := runInstall(d, installOpts{memoryMax: "16G"}); err != nil {
+		t.Fatal(err)
+	}
+	if logs := strings.Join(state.logs, "\n"); !strings.Contains(logs, "warning: run 'sudo aira install'") {
+		t.Fatalf("install summary suppressed the oomd warning while systemd-oomd was inactive: %q", logs)
+	}
+
+	state.logs = nil
+	if err := runStatus(d); err != nil {
+		t.Fatal(err)
+	}
+	logs := strings.Join(state.logs, "\n")
+	if strings.Contains(logs, "oomd + delegation drop-ins: up to date") {
+		t.Fatalf("status reported inactive systemd-oomd as healthy: %q", logs)
+	}
+}
+
 func TestRootInstallFailFastBeforeEtcWrites(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -346,6 +378,24 @@ func TestRootActivationFailureIsNonZeroAfterUserPhase(t *testing.T) {
 	}
 }
 
+func TestRootInstallRetriesOomdRestartAfterPriorActivationFailure(t *testing.T) {
+	d, state := newFakeRootInstall(t)
+	state.failCommand = "systemctl restart systemd-oomd"
+	err := runInstall(d, installOpts{memoryMax: "16G"})
+	if err == nil || !strings.Contains(err.Error(), "partial /etc") {
+		t.Fatalf("first activation failure was masked: %v", err)
+	}
+
+	state.failCommand = ""
+	state.commands = nil
+	if err := runInstall(d, installOpts{memoryMax: "16G"}); err != nil {
+		t.Fatalf("convergence run failed: %v", err)
+	}
+	if !containsArgv(state.commands, []string{"systemctl", "restart", "systemd-oomd"}) {
+		t.Fatalf("convergence run did not retry the unconfirmed oomd activation: %q", state.commands)
+	}
+}
+
 func TestRootWriteFailureIsExplicitPartialAndStillRunsUserPhase(t *testing.T) {
 	d, state := newFakeRootInstall(t)
 	d.writeFD = func(int, []byte) error { return errors.New("injected disk full") }
@@ -376,6 +426,37 @@ func TestRootPreflightsEveryOwnedTargetBeforeFirstPublish(t *testing.T) {
 	}
 	if state.reexec == nil {
 		t.Fatal("user phase did not run after /etc preflight refusal")
+	}
+}
+
+func TestRootInstallRefusesSymlinkedEtcDropinTarget(t *testing.T) {
+	d, state := newFakeRootInstall(t)
+	dst := filepath.Join(d.etcRoot, "systemd/oomd.conf.d/aira-oomd.conf")
+	victim := filepath.Join(t.TempDir(), "victim")
+	wantVictim := []byte("# aira-managed: aira-oomd.conf\nvictim must remain unchanged\n")
+	if err := os.WriteFile(victim, wantVictim, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, dst); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runInstall(d, installOpts{memoryMax: "16G"})
+	if err == nil {
+		t.Fatal("install accepted a symlinked /etc drop-in target")
+	}
+	if state.writes != 0 {
+		t.Fatalf("install published files after symlink preflight refusal: writes=%d", state.writes)
+	}
+	gotVictim, readErr := os.ReadFile(victim)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(gotVictim, wantVictim) {
+		t.Fatalf("install wrote through symlink: got %q, want %q", gotVictim, wantVictim)
 	}
 }
 
@@ -437,10 +518,9 @@ func TestRootReexecDropsCredentialsAtomicallyAndSanitizesEnvironment(t *testing.
 	if request.credential.Uid != 1234 || request.credential.Gid != 1234 || !reflect.DeepEqual(request.credential.Groups, []uint32{1234, 55}) {
 		t.Fatalf("credential=%+v", request.credential)
 	}
-	for _, want := range []string{"install", "--memory-max", "20G", "--memory-high", "17G", "--watchdog", "enforce", "--watchdog-interval", "5s", "--allow-overcommit", "--dry-run"} {
-		if !containsString(request.args, want) {
-			t.Errorf("re-exec argv lacks %q: %q", want, request.args)
-		}
+	wantArgs := []string{"install", "--memory-max", "20G", "--memory-high", "17G", "--watchdog", "enforce", "--watchdog-interval", "5s", "--allow-overcommit", "--dry-run"}
+	if !reflect.DeepEqual(request.args, wantArgs) {
+		t.Errorf("re-exec argv=%q, want exact ordered argv %q", request.args, wantArgs)
 	}
 	joinedEnv := strings.Join(request.env, "\n")
 	for _, want := range []string{"HOME=/home/alice", "XDG_RUNTIME_DIR=/run/user/1234", "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1234/bus", "AIRA_INSTALL_REEXEC=1"} {
@@ -475,6 +555,7 @@ type fakeRootInstallState struct {
 	writes      int
 	failCommand string
 	reexec      *reexecRequest
+	oomdActive  bool
 }
 
 func newFakeRootInstall(t *testing.T) (installDeps, *fakeRootInstallState) {
@@ -550,7 +631,17 @@ func newFakeRootInstall(t *testing.T) (installDeps, *fakeRootInstallState) {
 		if joined == state.failCommand {
 			return nil, errors.New("injected activation failure")
 		}
-		if joined == "timeout 10s loginctl enable-linger 1234" || joined == "systemctl daemon-reload" || joined == "systemctl restart systemd-oomd" {
+		if joined == "systemctl is-active systemd-oomd" {
+			if state.oomdActive {
+				return []byte("active\n"), nil
+			}
+			return []byte("inactive\n"), errors.New("exit status 3")
+		}
+		if joined == "systemctl restart systemd-oomd" {
+			state.oomdActive = true
+			return nil, nil
+		}
+		if joined == "timeout 10s loginctl enable-linger 1234" || joined == "systemctl daemon-reload" {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("unexpected real-command attempt: %q", argv)
@@ -593,6 +684,42 @@ func installFakeDelegationDropin(t *testing.T, d *installDeps, root string) {
 		}
 		return info, statErr
 	}
+}
+
+func installFakeSystemDropins(t *testing.T, d *installDeps, root string) {
+	t.Helper()
+	d.etcRoot = filepath.Join(root, "fake-etc")
+	rendered, err := renderSystemDropins(d.etcRoot, os.Geteuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned := make(map[string]bool, len(rendered))
+	for _, dropin := range rendered {
+		if err := os.MkdirAll(filepath.Dir(dropin.dst), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(dropin.dst, dropin.content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		owned[dropin.dst] = true
+	}
+	prior := d.lstat
+	d.lstat = func(path string) (os.FileInfo, error) {
+		info, statErr := prior(path)
+		if statErr == nil && owned[path] {
+			return ownedFileInfo{FileInfo: info, uid: 0, gid: 0}, nil
+		}
+		return info, statErr
+	}
+}
+
+func containsArgv(commands [][]string, want []string) bool {
+	for _, command := range commands {
+		if reflect.DeepEqual(command, want) {
+			return true
+		}
+	}
+	return false
 }
 
 type staticFileInfo struct {
