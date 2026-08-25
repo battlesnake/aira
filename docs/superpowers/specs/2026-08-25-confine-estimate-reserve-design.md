@@ -1,12 +1,12 @@
 # `aira confine` OOM prevention: estimate-sized hard sub-caps + lifetime-held reservations
 
-Status: PLAN v3 (builder-ready pending a quick re-gate) — folds the v2 re-gate: Sol (P0 invariant
-gaps: budget the supervisor + set the ceiling BELOW the cap so kills are always scope-contained,
-hold to scope teardown, prevent migration; P1 OOM censored-escalation; P2 queue aging) and Fable
-(P0: a delivered rejection must NOT fall back and launch; P1 pinned-reserve marker; P2 grant
-carry-back / store seam / protocol-reject wording / residuals). Both re-gates: "fold, not
-redesign" — v2's premises are code-accurate. Owner chose **(1b) strict prevention**. Safety-critical
-→ full two-loop.
+Status: PLAN v4 (BUILDER-READY) — v3 folded the v2 re-gate; v4 folds the v3 confirm round: Fable
+GATE-PASS-WITH-NITS ("fold the P1 and proceed to build without another gate round") + Sol's two
+precise refinements. Folded: the daemon-lease-only hold (flock releases at start — Fable P1),
+concurrency-scaled headroom (Sol P0) renamed off "watchdog", OOM-escalation clamped to the ceiling
+(Sol P1), aging DROPPED (evaluator is already strict-FIFO — Fable P2-b invalidated Sol's P2),
+`aira run` shares the terminal rejection (Fable P2-a), `ResourceSignature` error → honest
+no-signature fallback. Owner chose **(1b) strict prevention**. Both gates now pass; proceed to build.
 
 ## 1. Root cause (verified)
 
@@ -23,22 +23,35 @@ The estimate sizes each job's own `memory.max`; admission holds Σ granted ≤ *
 headroom)** so the *slice* cap is never hit — therefore every OOM is a *per-scope* cap kill
 (oom.group-contained to the culprit), never an ancestor-limit kill that would take a random victim.
 
-1. **Lifetime-held reservation, to scope teardown.** DELETE the early `releaseAdmission()` at
-   `confine_linux.go:472` and rely on the existing `defer releaseAdmission()` (`:356-358`,
-   `sync.Once`), which fires when `confineWithDeps` returns — i.e. AFTER `waitConfineCommand`
-   (`:530`) AND `scope.Remove` (`:801`). So the reservation is held until the scope is empty/removed
-   (Sol P0), covering lingering descendants/charges after main-child exit. Daemon needs zero change
-   (it holds `outstanding` until the conn closes; kernel closes it on a supervisor crash).
+1. **Lifetime-held reservation, to scope teardown — DAEMON LEASE ONLY (Fable confirm P1).** The
+   early `releaseAdmission()` at `confine_linux.go:472` releases BOTH the daemon conn AND the
+   fallback `admitLock` flock (`admissionResult.release`, `admission_linux.go:66-72`). Deleting it
+   unconditionally would lifetime-hold the machine-wide EXCLUSIVE flock on the daemon-unavailable
+   path → every other fallback client stalls the full `maxWait` then launches uncapped (pathological
+   serialize-to-one). Fix: make the early release **conditional on the admission source** —
+   `if result.lock != nil { release the flock now }` (fallback keeps release-at-start); the DAEMON
+   lease is held to teardown via the existing `defer releaseAdmission()` (`:356-358`, `sync.Once`),
+   which fires when `confineWithDeps` returns — AFTER `waitConfineCommand` (`:530`) and
+   `cleanupConfineScope`/`scope.Remove` (`:791-801`; LIFO: cleanup at `:381` runs before the
+   deferred release). So the daemon reservation is held until the scope is empty/removed (Sol P0),
+   covering lingering charges. Daemon needs zero change (holds `outstanding` until the conn closes;
+   kernel closes it on a supervisor crash). The lingering-charge edge (Remove fails after the 2 s
+   waitEmpty, lease released anyway) is covered by `max(outstanding,current)` + headroom.
 2. **Granted reserve = the job's scope `memory.max`.** The daemon returns the resolved reserve in
    the grant (new carry-back, §6); confine writes it via `writeScopeMemoryCap`
    (`confine_linux.go:642`, #57 write side) before exec, with `oom.group=1` (already set). Kernel-
    capped at the estimate.
-3. **Admission ceiling = slice cap − HEADROOM (Sol P0).** The daemon budgets a fixed headroom
-   (`watchdogSliceHeadroom`, default 4 GiB — covers the confine SUPERVISORS living outside every
-   scope, any direct-slice/session overhead, and `memory.max` enforcement overshoot). Admission
-   grants iff `reserve ≤ (cap − headroom) − charge`. Because the slice's *own* cap is thus never
-   reached, an over-running job trips its *own* scope `memory.max` (contained, oom.group) — never
-   the slice's ancestor limit (which would not be scope-contained).
+3. **Admission ceiling = slice cap − HEADROOM, CONCURRENCY-SCALED (Sol P0/confirm-P0).** The daemon
+   budgets `headroom = admitBaseHeadroom + (outstandingJobs + 1) × admitSupervisorBudget` — a NEW
+   const `admitSliceHeadroom*` in the daemon (NOT "watchdog"-named): a base (default 2 GiB, for
+   direct-slice/session overhead + `memory.max` enforcement overshoot) plus a per-supervisor budget
+   (default 64 MiB) times the current admitted-job count + the one being admitted. This bounds the
+   headroom at ANY concurrency (the confine SUPERVISORS live outside every scope; the running ones
+   already appear in `current`, so `max(outstanding,current)` counts them — the scaling term closes
+   the not-yet-started new supervisor + the worst-case simultaneous overshoot). Admission grants iff
+   `reserve ≤ (cap − headroom) − charge`. Because the slice's *own* cap is thus never reached, an
+   over-running job trips its *own* scope `memory.max` (contained, oom.group) — never the slice's
+   ancestor limit (which would not be scope-contained).
 4. **Migration/escape prevented** by the existing #20 descendant-escape attestation +
    no-delegation-out; a witnessed escape is surfaced (residual, §8).
 
@@ -59,17 +72,23 @@ Daemon-owned (confine is project-less). Computed in `admitConnection` AFTER `rea
 (`admit.go:105`) and BEFORE `enqueueAdmit` (`:110`) — never under `queue.mu` (Fable) — and bounded
 at ~250 ms (single-conn WAL DB, `store.go:526`; #50's pattern) with honest fallback on timeout.
 - **Signature:** confine passes `sig = ResourceSignature(nil,nil,argv)` in the admit frame (§6).
+  `ResourceSignature` returns `(string, error)` — on error, send NO signature (honest
+  `fallback:no-signature`, the daemon uses the p90 prior/default; never a fabricated/partial sig).
 - **Store:** daemon `confine_peak_history(signature, peak_rss NULL, oom INTEGER, at)` in `state.db`
   (schema `store.go:737+`; WAL `:521`), indexed on signature, last-20/sig prune. NEW project-less
   read/write methods on `*store.DB` (only `Close` is public today — Fable P2).
 - **Estimate (reuse `EstimateMemoryReserve` for the non-OOM path):** with ≥3 **usable** (non-null)
   peak samples → `peak_max + 15%`.
-- **OOM censored-escalation (Sol P1).** A capped peak is right-censored ("needed ≥ cap"). When
-  history for `sig` has `oom_kill` samples, escalate MULTIPLICATIVELY, not +15%: reserve =
-  `max(estimate, max_oomed_cap × 1.5)`, so a repeatedly-killed command converges in ~2 runs rather
-  than creeping. Capped at (cap − headroom); if that still can't fit, → too-large (§6). This is an
-  explicit **availability tradeoff** (a novel huge job may fail its first run(s)); it is NOT
-  presented as reliably self-healing.
+- **OOM censored-escalation, CLAMPED to the ceiling (Sol P1/confirm-P1).** A capped peak is
+  right-censored ("needed ≥ cap"). When history for `sig` has `oom_kill` samples, escalate
+  MULTIPLICATIVELY: reserve = `min( max(estimate, max_oomed_cap × 1.5), ceiling )` where `ceiling =
+  cap − headroom`. **Clamping to the ceiling is load-bearing:** without it, `1.5 × oomed_cap`
+  overshooting the ceiling would return terminal `E_ADMIT_TOO_LARGE` even when the true requirement
+  lies between the old cap and the ceiling — permanently wedging a runnable job. With the clamp, a
+  job whose true need ≤ ceiling always gets a shot at the ceiling cap; only a job that OOMs AT the
+  ceiling is genuinely too-large (§6). Convergence is logarithmic (not "~2 runs"). This is an
+  explicit **availability tradeoff** (a novel huge job may fail its first run(s)); NOT presented as
+  reliably self-healing.
 - **No per-sig history → global p90 prior** (Sol v1 P1 — p90, not median; median under-reserves the
   heavy half) of PeakMax across ≥3-usable-sample signatures, cached + lazily refreshed. A NEW heavy
   command is capped at the p90-heavy footprint from run 1.
@@ -111,9 +130,16 @@ samples (don't satisfy ≥3). A crashed/SIGKILLed *supervisor* leaves a gap (res
   `pinned`. NOTE an OLD daemon (pre-upgrade service) REJECTS the extra fields (E_PROTOCOL) → the
   client takes the honest flock fallback until `aira install` restarts the daemon — a transient
   upgrade-window degradation, stated.
-- **Queue aging (Sol P2):** once a waiter has waited > an aging threshold, the evaluator RESERVES
-  budget for it (does not grant a newly-fitting smaller job that would further delay the aged
-  waiter) — bounded starvation, no permanent head-of-line block.
+- **No aging needed (Fable confirm P2-b):** `evaluateAdmitQueue` (`admit.go:258-280`) is ALREADY
+  strict-FIFO — `blocked=true` at the first unfittable waiter stops all later grants, so a smaller
+  job can never overtake an aged big waiter. Sol's starvation concern is already satisfied; do NOT
+  add an aging mechanism (its test could not go RED). A too-large request is rejected BEFORE queueing
+  (§4), so it never head-of-line-blocks. Waiting is bounded only by incumbents releasing (stated
+  residual, §8).
+- **`aira run` shares this path (Fable P2-a):** the admit queue + `admitThroughDaemon` are shared, so
+  the `timeoutAdmitWaiter`→`E_ADMIT_SATURATED` change and the terminal-rejection client fix also
+  apply to `aira run` — a run job that waits out `maxWait` now gets a terminal rejection instead of a
+  force-grant+warning. Intended (no-compat); confine and run behave identically here.
 - **Honesty:** confine reports the resolved cap + basis (`estimate:…` / `estimate:oom-escalated` /
   `estimate:p90-prior` / `fallback:no-history` / `fallback:daemon-unavailable` / `pinned:…` /
   `reject:too-large`/`reject:saturated`); `peak=unknown` never becomes 0.
@@ -132,8 +158,10 @@ samples (don't satisfy ≥3). A crashed/SIGKILLed *supervisor* leaves a gap (res
 - **Accounting:** `(max−headroom) − max(outstanding,current)` — a running capped job charged once.
 - **Estimator + OOM escalation:** ≥3 usable PeakMax=15G → 15G+15%; a sig with oom_kill history →
   multiplicative escalation converges (RED vs +15% creep); `peak=unknown` doesn't reach ≥3.
-- **p90 prior; too-large reject + pinned override; saturation reject; aging (aged waiter not
-  starved by a small fitter).**
+- **p90 prior; too-large reject + pinned override; saturation reject** (confine AND run get the
+  terminal rejection); **concurrency-scaled headroom** (headroom grows with admitted-job count so a
+  high-concurrency burst still leaves the slice below its own cap); **flock released at start on the
+  daemon-unavailable path** (a long fallback job does NOT hold the machine-wide flock for life).
 - **Peak capture + report:** parent survives an oom.group child kill + still reports; `peak=unknown`
   stored sample-count-only.
 - **Regression:** `aira run` estimation UNCHANGED; daemon queue otherwise preserved.
