@@ -1010,6 +1010,13 @@ func TestConfineRealTwoWayGatePlacesBeforeTargetMarker(t *testing.T) {
 func confineRealSetupScope(t *testing.T, oomGroup bool) Scope {
 	t.Helper()
 	parent := confineMemoryParent(t, "max")
+	if _, ok := effectiveConfineCap(parent); !ok {
+		// These real-setup assertions (priority handshake, delegation repair) only
+		// hold when the ambient ancestry is capped — i.e. the suite runs under
+		// `aira confine`. Bare (uncapped) sessions can't exercise them; skip
+		// normally, hard-fail only under mandatory-real mode (AIRA_REAL_CGROUP=1).
+		cgrouptest.SkipOrFailRealCgroup(t, "confine real setup requires a capped cgroup ancestor (run under `aira confine`); parent %s is uncapped", parent)
+	}
 	backend := newDefaultBackend(parent)
 	if err := backend.Probe(context.Background()); err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "real setup backend probe: %v", err)
@@ -1179,6 +1186,12 @@ func TestConfineRealAdmissionWaitsThenProceedsDaemonDown(t *testing.T) {
 
 func TestConfineRealMissingSubtreeDelegationIsRepairedBeforeLaunch(t *testing.T) {
 	parent := cgrouptest.IsolatedScopeParent(t)
+	if _, ok := effectiveConfineCap(parent); !ok {
+		// Delegation-repair can only be exercised with a capped ancestor (confine
+		// refuses to launch into an uncapped slice). Skip in bare sessions; the
+		// suite exercises this under `aira confine`.
+		cgrouptest.SkipOrFailRealCgroup(t, "subtree-delegation-repair requires a capped cgroup ancestor (run under `aira confine`); parent %s is uncapped", parent)
+	}
 	marker := filepath.Join(t.TempDir(), "ran")
 	result, err := Confine(context.Background(), ConfineRequest{
 		Slice: parent, MemoryReserve: 1, Argv: []string{"/bin/sh", "-c", "echo ran > \"$1\"", "sh", marker},
