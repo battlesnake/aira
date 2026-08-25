@@ -14,6 +14,12 @@ import (
 	"aira/internal/runner"
 )
 
+// A helper spawned by a -race test is itself race-instrumented. Its runtime
+// shutdown alone can exceed one second, so successful command fixtures need a
+// deadline above that instrumentation overhead. The explicit timeout fixture
+// below keeps its independent 20ms deadline and still proves timeout handling.
+const gateFastCommandTimeoutMS = 5000
+
 // Gate integration fixtures use this test binary as a single-process command.
 // A shell plus sleep would intentionally become ScopeUnverified under task #20
 // because it spawns a descendant, which is the wrong fixture for tests that need
@@ -115,7 +121,7 @@ func commandDefinition(command gate.Command) gate.GateDefinition {
 
 func TestCommandCheckerUsesRunnerAndRejectsOutputOverflow(t *testing.T) {
 	s, root := realCommandStore(t)
-	def := commandDefinition(gate.Command{Argv: gateHelperArgv("emit", "0123456789"), Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 1024, Predicate: gate.CommandPredicateExitZero})
+	def := commandDefinition(gate.Command{Argv: gateHelperArgv("emit", "0123456789"), Cwd: "root", TimeoutMS: gateFastCommandTimeoutMS, OutputCapBytes: 1024, Predicate: gate.CommandPredicateExitZero})
 	evaluation, err := s.runCommandChecker(context.Background(), def, root)
 	if err != nil {
 		t.Fatal(err)
@@ -155,7 +161,7 @@ func TestCommandCheckerTimeoutAndTestsGreenZeroCountAreUnevaluated(t *testing.T)
 	if evaluation.Predicate != gate.PredicateUnevaluated || evaluation.Code != "U_GATE_COMMAND_TIMEOUT" {
 		t.Fatalf("timeout=%#v", evaluation)
 	}
-	zero := commandDefinition(gate.Command{Argv: gateHelperArgv("emit", "{\"Action\":\"start\",\"Package\":\"p\"}\n{\"Action\":\"pass\",\"Package\":\"p\"}\n"), Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 4096, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
+	zero := commandDefinition(gate.Command{Argv: gateHelperArgv("emit", "{\"Action\":\"start\",\"Package\":\"p\"}\n{\"Action\":\"pass\",\"Package\":\"p\"}\n"), Cwd: "root", TimeoutMS: gateFastCommandTimeoutMS, OutputCapBytes: 4096, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
 	zeroEval, err := s.runCommandChecker(context.Background(), zero, root)
 	if err != nil {
 		t.Fatal(err)
@@ -167,7 +173,7 @@ func TestCommandCheckerTimeoutAndTestsGreenZeroCountAreUnevaluated(t *testing.T)
 
 func TestCommandCheckerCleanNonzeroIsFailure(t *testing.T) {
 	s, root := realCommandStore(t)
-	def := commandDefinition(gate.Command{Argv: gateHelperArgv("exit", "7"), Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 1024, Predicate: gate.CommandPredicateExitZero})
+	def := commandDefinition(gate.Command{Argv: gateHelperArgv("exit", "7"), Cwd: "root", TimeoutMS: gateFastCommandTimeoutMS, OutputCapBytes: 1024, Predicate: gate.CommandPredicateExitZero})
 	evaluation, err := s.runCommandChecker(context.Background(), def, root)
 	if err != nil {
 		t.Fatal(err)
@@ -192,7 +198,7 @@ func TestCommandGateAdmitsMultiProcessGreenCommand(t *testing.T) {
 		"{\"Action\":\"run\",\"Package\":\"p\",\"Test\":\"TestX\"}\\n" +
 		"{\"Action\":\"pass\",\"Package\":\"p\",\"Test\":\"TestX\"}\\n" +
 		"{\"Action\":\"pass\",\"Package\":\"p\"}\\n"
-	def := commandDefinition(gate.Command{Argv: []string{"/bin/sh", "-c", "sleep 0.05; printf '" + greenOutput + "'"}, Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 4096, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
+	def := commandDefinition(gate.Command{Argv: []string{"/bin/sh", "-c", "sleep 0.05; printf '" + greenOutput + "'"}, Cwd: "root", TimeoutMS: gateFastCommandTimeoutMS, OutputCapBytes: 4096, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
 	evaluation, err := s.runCommandChecker(context.Background(), def, root)
 	if err != nil {
 		t.Fatal(err)
@@ -219,7 +225,7 @@ func TestCommandCheckerTestsGreenHonorsFailureOutcomes(t *testing.T) {
 		"{\"Action\":\"run\",\"Package\":\"p\",\"Test\":\"TestX\"}\n" +
 		"{\"Action\":\"fail\",\"Package\":\"p\",\"Test\":\"TestX\"}\n" +
 		"{\"Action\":\"pass\",\"Package\":\"p\"}\n"
-	failed := commandDefinition(gate.Command{Argv: gateHelperArgv("emit", failedOutput), Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 4096, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
+	failed := commandDefinition(gate.Command{Argv: gateHelperArgv("emit", failedOutput), Cwd: "root", TimeoutMS: gateFastCommandTimeoutMS, OutputCapBytes: 4096, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
 	evaluation, err := s.runCommandChecker(context.Background(), failed, root)
 	if err != nil {
 		t.Fatal(err)
@@ -232,7 +238,7 @@ func TestCommandCheckerTestsGreenHonorsFailureOutcomes(t *testing.T) {
 		"{\"Action\":\"run\",\"Package\":\"p\",\"Test\":\"TestX\"}\n" +
 		"{\"Action\":\"pass\",\"Package\":\"p\",\"Test\":\"TestX\"}\n" +
 		"{\"Action\":\"pass\",\"Package\":\"p\"}\n"
-	green := commandDefinition(gate.Command{Argv: gateHelperArgv("emit", greenOutput), Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 4096, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
+	green := commandDefinition(gate.Command{Argv: gateHelperArgv("emit", greenOutput), Cwd: "root", TimeoutMS: gateFastCommandTimeoutMS, OutputCapBytes: 4096, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
 	evaluation, err = s.runCommandChecker(context.Background(), green, root)
 	if err != nil {
 		t.Fatal(err)
@@ -244,7 +250,7 @@ func TestCommandCheckerTestsGreenHonorsFailureOutcomes(t *testing.T) {
 
 func TestCommandCheckerTestsGreenCleanNonzeroEmptyOutputIsFailure(t *testing.T) {
 	s, root := realCommandStore(t)
-	def := commandDefinition(gate.Command{Argv: gateHelperArgv("exit", "1"), Cwd: "root", TimeoutMS: 1000, OutputCapBytes: 1024, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
+	def := commandDefinition(gate.Command{Argv: gateHelperArgv("exit", "1"), Cwd: "root", TimeoutMS: gateFastCommandTimeoutMS, OutputCapBytes: 1024, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
 	evaluation, err := s.runCommandChecker(context.Background(), def, root)
 	if err != nil {
 		t.Fatal(err)
@@ -261,7 +267,7 @@ func TestCommandCheckerStoresAuthoritativeRunnerEnvDigest(t *testing.T) {
 	}
 	defer os.Unsetenv(name)
 	s, root := realCommandStore(t)
-	def := commandDefinition(gate.Command{Argv: gateHelperArgv("noop"), Cwd: "root", EnvAllow: []string{name}, TimeoutMS: 1000, OutputCapBytes: 1024, Predicate: gate.CommandPredicateExitZero})
+	def := commandDefinition(gate.Command{Argv: gateHelperArgv("noop"), Cwd: "root", EnvAllow: []string{name}, TimeoutMS: gateFastCommandTimeoutMS, OutputCapBytes: 1024, Predicate: gate.CommandPredicateExitZero})
 	evaluation, err := s.runCommandChecker(context.Background(), def, root)
 	if err != nil {
 		t.Fatal(err)
@@ -290,7 +296,7 @@ func TestCommandCheckerIgnoresAllowedGovernorEnvironmentInDigest(t *testing.T) {
 		Argv:           gateHelperArgv("noop"),
 		Cwd:            "root",
 		EnvAllow:       []string{"AIRA_CPU_SLOTS_DIR"},
-		TimeoutMS:      1000,
+		TimeoutMS:      gateFastCommandTimeoutMS,
 		OutputCapBytes: 1024,
 		Predicate:      gate.CommandPredicateExitZero,
 	})

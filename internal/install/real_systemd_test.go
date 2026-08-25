@@ -105,9 +105,6 @@ func TestInstallRealSystemdThrowawaySliceAnchorAndDelegation(t *testing.T) {
 	d.daemonRuntimeDir = runtimeDir
 	d.logf = func(string, ...any) {}
 	if err := runInstall(d, installOpts{memoryMax: "4G", allowOvercommit: true}); err != nil {
-		if strings.Contains(err.Error(), CodeDelegation) {
-			t.Skipf("memory is not delegated to this user manager; re-login after enabling Delegate=yes: %v", err)
-		}
 		t.Fatal(err)
 	}
 	for _, unit := range []string{sliceUnit, anchorUnit, daemonUnit} {
@@ -131,6 +128,9 @@ func TestInstallRealSystemdThrowawaySliceAnchorAndDelegation(t *testing.T) {
 	mainPID, err := strconv.Atoi(strings.TrimSpace(string(mainOutput)))
 	if status := daemon.Status(paths); err != nil || !status.Running || !status.Ready || mainPID != status.Lock.PID {
 		t.Fatalf("throwaway daemon is not MainPID-tied: MainPID=%d status=%+v parseErr=%v", mainPID, status, err)
+	}
+	if !userMemoryControllerDelegated(d, os.Geteuid()) {
+		t.Skip("user units installed in degrade mode; live memory delegation assertions require re-login after sudo aira install")
 	}
 	sliceCgroup, err := controlGroupPath(d, sliceUnit)
 	if err != nil {

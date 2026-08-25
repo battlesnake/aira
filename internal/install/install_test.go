@@ -399,8 +399,10 @@ func newFakeInstall(t *testing.T) (installDeps, *fakeInstallState) {
 		case joined == "systemctl --user restart "+defaultDaemonUnit:
 			state.daemonRunning = true
 			return nil, nil
-		case joined == "loginctl enable-linger "+fmt.Sprint(state.uid):
+		case joined == "timeout 10s loginctl enable-linger "+fmt.Sprint(state.uid):
 			return nil, nil
+		case joined == "timeout 10s loginctl show-user "+fmt.Sprint(state.uid)+" -p Linger --value":
+			return []byte("yes\n"), nil
 		case joined == "systemctl --user show -p ActiveState --value "+defaultDaemonUnit:
 			return []byte("active\n"), nil
 		case joined == "systemctl --user show -p SubState --value "+defaultDaemonUnit:

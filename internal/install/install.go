@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -27,7 +28,6 @@ import (
 const (
 	CodeUnavailable     = "E_INSTALL_UNAVAILABLE"
 	CodeArgumentInvalid = "E_INSTALL_ARGUMENT_INVALID"
-	CodeDelegation      = "E_INSTALL_DELEGATION"
 	CodeOvercommit      = "E_INSTALL_OVERCOMMIT"
 
 	defaultSliceUnit  = "aira.slice"
@@ -35,6 +35,7 @@ const (
 	defaultDaemonUnit = daemon.DefaultServiceUnit
 	gibPerKiB         = int64(1024 * 1024)
 	cgroupRoot        = "/sys/fs/cgroup"
+	defaultEtcRoot    = "/etc"
 )
 
 var (
@@ -56,16 +57,35 @@ type installOpts struct {
 	watchdogInterval time.Duration
 }
 
+type installTarget struct {
+	uid      int
+	gid      int
+	groups   []uint32
+	home     string
+	username string
+}
+
+type reexecRequest struct {
+	path       string
+	args       []string
+	env        []string
+	credential *syscall.Credential
+}
+
 // installDeps is intentionally exhaustive: install-time identity, process,
 // filesystem, descriptor, clock, and output effects all cross this seam.
 type installDeps struct {
 	geteuid      func() int
 	getenv       func(string) string
+	lookupUser   func(string) (*user.User, error)
+	lookupUID    func(string) (*user.User, error)
+	groupIDs     func(*user.User) ([]string, error)
 	executable   func() (string, error)
 	abs          func(string) (string, error)
 	getpid       func() int
 	now          func() time.Time
 	run          func([]string, []byte) ([]byte, error)
+	reexec       func(reexecRequest) error
 	stat         func(string) (os.FileInfo, error)
 	lstat        func(string) (os.FileInfo, error)
 	readFile     func(string) ([]byte, error)
@@ -97,12 +117,16 @@ type installDeps struct {
 	// the user manager; real-systemd tests bake an isolated runtime explicitly.
 	daemonRuntimeDir string
 	cgroupRoot       string
+	etcRoot          string
 }
 
 func realInstallDeps() installDeps {
 	return installDeps{
 		geteuid:    os.Geteuid,
 		getenv:     os.Getenv,
+		lookupUser: user.Lookup,
+		lookupUID:  user.LookupId,
+		groupIDs:   func(u *user.User) ([]string, error) { return u.GroupIds() },
 		executable: os.Executable,
 		abs:        filepath.Abs,
 		getpid:     os.Getpid,
@@ -117,6 +141,20 @@ func realInstallDeps() installDeps {
 			}
 			cmd.Stderr = os.Stderr
 			return cmd.Output()
+		},
+		reexec: func(request reexecRequest) error {
+			if request.path == "" || request.credential == nil {
+				return errors.New("invalid re-exec request")
+			}
+			cmd := exec.Command(request.path, request.args...)
+			cmd.Env = append([]string(nil), request.env...)
+			cmd.Stdin = os.Stdin
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			cmd.SysProcAttr = &syscall.SysProcAttr{Credential: request.credential}
+			// ExtraFiles is deliberately nil: only stdin/stdout/stderr cross the
+			// privilege boundary; os/exec closes all other descriptors.
+			return cmd.Run()
 		},
 		stat: os.Stat, lstat: os.Lstat, readFile: os.ReadFile, writeFile: os.WriteFile,
 		mkdirAll: os.MkdirAll, mkdirTemp: os.MkdirTemp, remove: os.Remove, rename: os.Rename,
@@ -154,7 +192,8 @@ func realInstallDeps() installDeps {
 		unlinkat: unix.Unlinkat, flock: unix.Flock,
 		logf:        func(format string, args ...any) { fmt.Printf(format+"\n", args...) },
 		daemonPaths: daemon.PathsFromEnv, daemonStatus: daemon.Status, daemonStop: daemon.Stop, sleep: time.Sleep,
-		sliceUnit: defaultSliceUnit, anchorUnit: defaultAnchorUnit, daemonUnit: defaultDaemonUnit, cgroupRoot: cgroupRoot,
+		sliceUnit: defaultSliceUnit, anchorUnit: defaultAnchorUnit, daemonUnit: defaultDaemonUnit,
+		cgroupRoot: cgroupRoot, etcRoot: defaultEtcRoot,
 	}
 }
 
@@ -246,7 +285,165 @@ func parseInstallArgs(args []string) (installOpts, error) {
 	return opts, nil
 }
 
+const sudoIdentityHint = "run 'sudo aira install' from an active login session as a non-root account"
+
+func runRootInstall(d installDeps, opts installOpts) error {
+	target, err := validateSudoIdentity(d)
+	if err != nil {
+		return err
+	}
+	runtimeDir := filepath.Join("/run/user", strconv.Itoa(target.uid))
+	runtimeInfo, err := d.stat(runtimeDir)
+	if err != nil {
+		return unavailable(fmt.Errorf("no active login session for %s (%s): %w; %s", target.username, runtimeDir, err, sudoIdentityHint))
+	}
+	if !runtimeInfo.IsDir() {
+		return unavailable(fmt.Errorf("active session path %s is not a directory; %s", runtimeDir, sudoIdentityHint))
+	}
+	if owner, ok := fileOwner(runtimeInfo); !ok || owner != target.uid {
+		return unavailable(fmt.Errorf("active session path %s is not owned by uid %d; %s", runtimeDir, target.uid, sudoIdentityHint))
+	}
+
+	executable, err := d.executable()
+	if err != nil {
+		return unavailable(fmt.Errorf("resolve running binary for re-exec: %w", err))
+	}
+	executable, err = d.abs(executable)
+	if err != nil {
+		return unavailable(fmt.Errorf("make re-exec binary path absolute: %w", err))
+	}
+	executableInfo, err := d.stat(executable)
+	if err != nil {
+		return unavailable(fmt.Errorf("running binary %q is unavailable to the target user: %w", executable, err))
+	}
+	if !targetCanReadExec(executableInfo, target) {
+		return unavailable(fmt.Errorf("target user %s cannot read and execute %q", target.username, executable))
+	}
+
+	activationErr := installSystemDropins(d, target.uid, opts.dryRun)
+	if !opts.dryRun {
+		if _, lingerErr := d.run(timeoutArgv("loginctl", "enable-linger", strconv.Itoa(target.uid)), nil); lingerErr != nil {
+			d.logf("warning: loginctl enable-linger %d failed; daemon persistence is limited to active login sessions: %v", target.uid, lingerErr)
+		}
+	}
+	request := reexecRequestFor(executable, target, opts)
+	if err := d.reexec(request); err != nil {
+		return unavailable(fmt.Errorf("re-exec user install as %s: %w", target.username, err))
+	}
+	if activationErr != nil {
+		return unavailable(fmt.Errorf("partial /etc installation or activation failure: %w; the user-level install completed", activationErr))
+	}
+	return nil
+}
+
+func validateSudoIdentity(d installDeps) (installTarget, error) {
+	uidText, username, gidText := d.getenv("SUDO_UID"), d.getenv("SUDO_USER"), d.getenv("SUDO_GID")
+	if uidText == "" || username == "" || username == "root" || gidText == "" {
+		return installTarget{}, unavailable(errors.New(sudoIdentityHint))
+	}
+	byUID, err := d.lookupUID(uidText)
+	if err != nil {
+		return installTarget{}, unavailable(errors.New(sudoIdentityHint))
+	}
+	byName, err := d.lookupUser(username)
+	if err != nil || byUID.Username != username || byName.Uid != uidText || byName.Gid != gidText || byUID.Gid != gidText {
+		return installTarget{}, unavailable(errors.New(sudoIdentityHint))
+	}
+	uid, uidErr := strconv.Atoi(uidText)
+	gid, gidErr := strconv.Atoi(gidText)
+	if uidErr != nil || gidErr != nil || uid <= 0 || gid <= 0 || byUID.HomeDir == "" {
+		return installTarget{}, unavailable(errors.New(sudoIdentityHint))
+	}
+	groupTexts, err := d.groupIDs(byUID)
+	if err != nil {
+		return installTarget{}, unavailable(fmt.Errorf("resolve supplementary groups for %s: %w", username, err))
+	}
+	groups := make([]uint32, 0, len(groupTexts)+1)
+	seen := map[uint32]bool{}
+	for _, text := range append([]string{gidText}, groupTexts...) {
+		value, parseErr := strconv.ParseUint(text, 10, 32)
+		if parseErr != nil {
+			return installTarget{}, unavailable(fmt.Errorf("resolve supplementary groups for %s: invalid gid %q", username, text))
+		}
+		group := uint32(value)
+		if !seen[group] {
+			seen[group] = true
+			groups = append(groups, group)
+		}
+	}
+	return installTarget{uid: uid, gid: gid, groups: groups, home: byUID.HomeDir, username: username}, nil
+}
+
+func targetCanReadExec(info os.FileInfo, target installTarget) bool {
+	mode := info.Mode()
+	if !mode.IsRegular() {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	perm := mode.Perm()
+	if int(stat.Uid) == target.uid {
+		return perm&0o500 == 0o500
+	}
+	for _, group := range target.groups {
+		if stat.Gid == group {
+			return perm&0o050 == 0o050
+		}
+	}
+	return perm&0o005 == 0o005
+}
+
+func reexecRequestFor(executable string, target installTarget, opts installOpts) reexecRequest {
+	runtimeDir := filepath.Join("/run/user", strconv.Itoa(target.uid))
+	args := []string{"install"}
+	if opts.memoryMax != "" {
+		args = append(args, "--memory-max", opts.memoryMax)
+	}
+	if opts.memoryHigh != "" {
+		args = append(args, "--memory-high", opts.memoryHigh)
+	}
+	args = append(args, "--watchdog", opts.watchdog, "--watchdog-interval", opts.watchdogInterval.String())
+	if opts.allowOvercommit {
+		args = append(args, "--allow-overcommit")
+	}
+	if opts.dryRun {
+		args = append(args, "--dry-run")
+	}
+	return reexecRequest{
+		path: executable,
+		args: args,
+		env: []string{
+			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+			"HOME=" + target.home,
+			"XDG_RUNTIME_DIR=" + runtimeDir,
+			"DBUS_SESSION_BUS_ADDRESS=unix:path=" + runtimeDir + "/bus",
+			"AIRA_INSTALL_REEXEC=1",
+		},
+		credential: &syscall.Credential{Uid: uint32(target.uid), Gid: uint32(target.gid), Groups: append([]uint32(nil), target.groups...)},
+	}
+}
+
+func timeoutArgv(command string, args ...string) []string {
+	return append([]string{"timeout", "10s", command}, args...)
+}
+
 func runInstall(d installDeps, opts installOpts) error {
+	d = fillInstallDeps(d)
+	if opts.watchdog == "" {
+		opts.watchdog = "observe"
+	}
+	if opts.watchdogInterval == 0 {
+		opts.watchdogInterval = 2 * time.Second
+	}
+	if d.geteuid() == 0 {
+		return runRootInstall(d, opts)
+	}
+	return runUserInstall(d, opts)
+}
+
+func runUserInstall(d installDeps, opts installOpts) error {
 	d = fillInstallDeps(d)
 	if opts.watchdog == "" {
 		opts.watchdog = "observe"
@@ -301,9 +498,7 @@ func runInstall(d installDeps, opts installOpts) error {
 		return argumentInvalid(err.Error())
 	}
 
-	if err := requireUserMemoryDelegation(d, uid); err != nil {
-		return err
-	}
+	delegated := userMemoryControllerDelegated(d, uid)
 	executable, err := d.executable()
 	if err != nil {
 		return unavailable(fmt.Errorf("resolve running executable: %w", err))
@@ -339,7 +534,11 @@ func runInstall(d installDeps, opts installOpts) error {
 		d.logf("planned: create %s; atomically update managed units", unitDir)
 		d.logf("planned: systemctl --user daemon-reload")
 		d.logf("planned: systemctl --user enable --now %s", d.anchorUnit)
-		d.logf("planned: enable and verify +memory delegation in %s", d.sliceUnit)
+		if delegated {
+			d.logf("planned: enable and verify +memory delegation in %s", d.sliceUnit)
+		} else {
+			d.logf("planned: install units with memory enforcement pending re-login")
+		}
 		d.logf("planned: stop incumbent daemon and wait; publish and enable --now %s", d.daemonUnit)
 		d.logf("planned: loginctl enable-linger %d; verify active/running MainPID equals daemon lock PID", uid)
 		return nil
@@ -401,22 +600,24 @@ func runInstall(d installDeps, opts installOpts) error {
 	if err := verifyActive(d, d.anchorUnit); err != nil {
 		return unavailable(err)
 	}
-	sliceCgroup, err := controlGroupPath(d, d.sliceUnit)
-	if err != nil {
-		return unavailable(err)
-	}
-	if err := enableMemoryDelegation(d, sliceCgroup); err != nil {
-		return unavailable(fmt.Errorf("delegate memory in %s: %w", d.sliceUnit, err))
-	}
-	if err := verifyLiveLimits(d, sliceCgroup, maximum, high); err != nil {
-		return unavailable(err)
-	}
-	anchorCgroup, err := controlGroupPath(d, d.anchorUnit)
-	if err != nil {
-		return unavailable(err)
-	}
-	if _, err := d.readFile(filepath.Join(anchorCgroup, "memory.max")); err != nil {
-		return unavailable(fmt.Errorf("anchor child lacks delegated memory controller: %w", err))
+	if delegated {
+		sliceCgroup, err := controlGroupPath(d, d.sliceUnit)
+		if err != nil {
+			return unavailable(err)
+		}
+		if err := enableMemoryDelegation(d, sliceCgroup); err != nil {
+			return unavailable(fmt.Errorf("delegate memory in %s: %w", d.sliceUnit, err))
+		}
+		if err := verifyLiveLimits(d, sliceCgroup, maximum, high); err != nil {
+			return unavailable(err)
+		}
+		anchorCgroup, err := controlGroupPath(d, d.anchorUnit)
+		if err != nil {
+			return unavailable(err)
+		}
+		if _, err := d.readFile(filepath.Join(anchorCgroup, "memory.max")); err != nil {
+			return unavailable(fmt.Errorf("anchor child lacks delegated memory controller: %w", err))
+		}
 	}
 	if err := verifyDaemonSocketIdentity(d, paths); err != nil {
 		return unavailable(err)
@@ -472,7 +673,9 @@ func runInstall(d installDeps, opts installOpts) error {
 			return unavailable(fmt.Errorf("restart %s to apply changed unit: %w", d.daemonUnit, err))
 		}
 	}
-	if _, err := d.run([]string{"loginctl", "enable-linger", strconv.Itoa(uid)}, nil); err != nil {
+	if d.getenv("AIRA_INSTALL_REEXEC") == "1" {
+		lingerReport(d, uid)
+	} else if _, err := d.run(timeoutArgv("loginctl", "enable-linger", strconv.Itoa(uid)), nil); err != nil {
 		d.logf("warning: loginctl enable-linger %d failed; daemon persistence is limited to active login sessions: %v", uid, err)
 	}
 	if err := waitDaemonReachable(d, paths); err != nil {
@@ -483,7 +686,12 @@ func runInstall(d installDeps, opts installOpts) error {
 	} else if accepted {
 		d.logf("overcommit opt-in: recorded (no capped whale.slice detected)")
 	}
-	d.logf("installed: %s MemoryMax=%s MemoryHigh=%s; anchor active; memory delegated; %s active, running, and MainPID-tied", d.sliceUnit, maximum, high, d.daemonUnit)
+	enforcement := memoryEnforcementState(d, uid, maximum)
+	oomdCurrent := systemDropinsCurrent(d, uid)
+	if enforcement != enforcementActive || !oomdCurrent {
+		d.logf("warning: run 'sudo aira install' to apply the /etc oomd + delegation drop-ins, then re-login")
+	}
+	d.logf("installed: %s MemoryMax=%s MemoryHigh=%s; anchor active; memory delegation: %s; %s active, running, and MainPID-tied", d.sliceUnit, maximum, high, enforcement, d.daemonUnit)
 	return nil
 }
 
@@ -506,6 +714,9 @@ func fillInstallDeps(d installDeps) installDeps {
 	}
 	if d.cgroupRoot == "" {
 		d.cgroupRoot = cgroupRoot
+	}
+	if d.etcRoot == "" {
+		d.etcRoot = defaultEtcRoot
 	}
 	return d
 }
@@ -727,16 +938,13 @@ func cappedWhaleContent(content []byte) bool {
 	return value != "" && value != "max" && value != "infinity"
 }
 
-func requireUserMemoryDelegation(d installDeps, uid int) error {
+func userMemoryControllerDelegated(d installDeps, uid int) bool {
 	path := filepath.Join(d.cgroupRoot, "user.slice", fmt.Sprintf("user-%d.slice", uid), fmt.Sprintf("user@%d.service", uid), "cgroup.controllers")
 	data, err := d.readFile(path)
 	if err != nil {
-		return delegationError(fmt.Errorf("cannot read %s: %w", path, err))
+		return false
 	}
-	if !hasToken(data, "memory") {
-		return delegationError(errors.New("memory controller not delegated to your user manager; enable it — e.g. run `agentmux install`, or add a `Delegate=yes` drop-in on user@.service — and re-login, then re-run"))
-	}
-	return nil
+	return hasToken(data, "memory")
 }
 
 func hasToken(data []byte, wanted string) bool {
@@ -746,6 +954,232 @@ func hasToken(data []byte, wanted string) bool {
 		}
 	}
 	return false
+}
+
+type systemDropin struct {
+	asset string
+	dst   string
+	oomd  bool
+	unit  bool
+}
+
+type renderedSystemDropin struct {
+	systemDropin
+	content []byte
+}
+
+func systemDropins(etcRoot string, uid int) []systemDropin {
+	return []systemDropin{
+		{asset: "assets/oomd/oomd-overrides.conf", dst: filepath.Join(etcRoot, "systemd/oomd.conf.d/aira-oomd.conf"), oomd: true},
+		{asset: "assets/oomd/user-service-oomd.conf", dst: filepath.Join(etcRoot, "systemd/system/user@.service.d/50-aira-oomd.conf"), oomd: true, unit: true},
+		{asset: "assets/oomd/user-slice-oomd.conf", dst: filepath.Join(etcRoot, "systemd/system", fmt.Sprintf("user-%d.slice.d", uid), "50-aira-oomd.conf"), oomd: true, unit: true},
+		{asset: "assets/oomd/session-slice-oomd-protect.conf", dst: filepath.Join(etcRoot, "systemd/user/session.slice.d/50-aira-oomd-protect.conf"), oomd: true, unit: true},
+		{asset: "assets/oomd/user-service-delegate.conf", dst: filepath.Join(etcRoot, "systemd/system/user@.service.d/10-aira-delegate.conf"), unit: true},
+	}
+}
+
+func renderSystemDropins(etcRoot string, uid int) ([]renderedSystemDropin, error) {
+	dropins := systemDropins(etcRoot, uid)
+	rendered := make([]renderedSystemDropin, 0, len(dropins))
+	for _, dropin := range dropins {
+		content, err := assets.ReadFile(dropin.asset)
+		if err != nil {
+			return nil, fmt.Errorf("read embedded drop-in %s: %w", dropin.asset, err)
+		}
+		name := filepath.Base(dropin.dst)
+		if !hasMarker(content, name) {
+			return nil, fmt.Errorf("embedded drop-in %s lacks first-line marker %q", dropin.asset, marker(name))
+		}
+		if bytes.Contains(content, []byte{'\r'}) || bytes.Contains(content, []byte{'\x00'}) || bytes.Contains(content, []byte("@UID@")) {
+			return nil, fmt.Errorf("embedded drop-in %s contains invalid or unsubstituted content", dropin.asset)
+		}
+		rendered = append(rendered, renderedSystemDropin{systemDropin: dropin, content: content})
+	}
+	return rendered, nil
+}
+
+func installSystemDropins(d installDeps, uid int, dryRun bool) error {
+	rendered, err := renderSystemDropins(d.etcRoot, uid)
+	if err != nil {
+		return err
+	}
+	if dryRun {
+		for _, dropin := range rendered {
+			d.logf("planned: write %s", dropin.dst)
+		}
+		d.logf("planned: systemctl daemon-reload for changed unit drop-ins")
+		d.logf("planned: systemctl restart systemd-oomd for changed oomd drop-ins")
+		return nil
+	}
+
+	lockDir := filepath.Join(d.etcRoot, "systemd")
+	if err := d.mkdirAll(lockDir, 0o755); err != nil {
+		return fmt.Errorf("create systemd configuration directory: %w", err)
+	}
+	lockDirFD, err := d.openat(unix.AT_FDCWD, lockDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open systemd configuration directory: %w", err)
+	}
+	defer d.close(lockDirFD)
+	if err := validateDirectoryFD(d, lockDirFD, 0); err != nil {
+		return err
+	}
+	lockFD, err := d.openat(lockDirFD, ".aira-install.lock", unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+	if err != nil {
+		return fmt.Errorf("open root install lock: %w", err)
+	}
+	defer d.close(lockFD)
+	if err := validateRegularFD(d, lockFD, 0, ".aira-install.lock"); err != nil {
+		return err
+	}
+	if err := d.flock(lockFD, unix.LOCK_EX); err != nil {
+		return fmt.Errorf("lock root install: %w", err)
+	}
+
+	type openedDropin struct {
+		renderedSystemDropin
+		dirFD int
+		stale bool
+	}
+	opened := make([]openedDropin, 0, len(rendered))
+	defer func() {
+		for _, dropin := range opened {
+			_ = d.close(dropin.dirFD)
+		}
+	}()
+	// Validate every destination and existing target before publishing any of
+	// them. A foreign/symlinked target therefore cannot cause a half-write.
+	for _, dropin := range rendered {
+		dir := filepath.Dir(dropin.dst)
+		if err := d.mkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create drop-in directory %s: %w", dir, err)
+		}
+		dirFD, openErr := d.openat(unix.AT_FDCWD, dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if openErr != nil {
+			return fmt.Errorf("open drop-in directory %s: %w", dir, openErr)
+		}
+		if validateErr := validateDirectoryFD(d, dirFD, 0); validateErr != nil {
+			_ = d.close(dirFD)
+			return validateErr
+		}
+		name := filepath.Base(dropin.dst)
+		existing, present, readErr := readManagedUnitAt(d, dirFD, 0, name)
+		if readErr != nil {
+			_ = d.close(dirFD)
+			return readErr
+		}
+		modeCurrent := false
+		if present {
+			mode, modePresent, modeErr := managedUnitModeAt(d, dirFD, 0, name)
+			if modeErr != nil {
+				_ = d.close(dirFD)
+				return modeErr
+			}
+			modeCurrent = modePresent && mode == 0o644
+		}
+		opened = append(opened, openedDropin{renderedSystemDropin: dropin, dirFD: dirFD, stale: !present || !bytes.Equal(existing, dropin.content) || !modeCurrent})
+	}
+
+	var failures []error
+	unitChanged, oomdChanged := false, false
+	for _, dropin := range opened {
+		if !dropin.stale {
+			d.logf("%s: up to date", dropin.dst)
+			continue
+		}
+		changed, publishErr := publishManagedUnit(d, dropin.dirFD, 0, filepath.Base(dropin.dst), dropin.content)
+		if publishErr != nil {
+			d.logf("partial /etc install: %s failed: %v", dropin.dst, publishErr)
+			failures = append(failures, fmt.Errorf("publish %s: %w", dropin.dst, publishErr))
+			continue
+		}
+		if changed {
+			d.logf("%s: updated", dropin.dst)
+			unitChanged = unitChanged || dropin.unit
+			oomdChanged = oomdChanged || dropin.oomd
+		}
+	}
+	if unitChanged {
+		if _, reloadErr := d.run([]string{"systemctl", "daemon-reload"}, nil); reloadErr != nil {
+			d.logf("partial /etc install: systemctl daemon-reload failed: %v", reloadErr)
+			failures = append(failures, fmt.Errorf("systemctl daemon-reload: %w", reloadErr))
+		}
+	}
+	if oomdChanged {
+		if _, restartErr := d.run([]string{"systemctl", "restart", "systemd-oomd"}, nil); restartErr != nil {
+			d.logf("partial /etc install: systemctl restart systemd-oomd failed: %v", restartErr)
+			failures = append(failures, fmt.Errorf("systemctl restart systemd-oomd: %w", restartErr))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func managedSystemDropinCurrent(d installDeps, dropin renderedSystemDropin) bool {
+	info, err := d.lstat(dropin.dst)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || !isCanonicalManagedMode(info.Mode()) {
+		return false
+	}
+	owner, ok := fileOwner(info)
+	if !ok || owner != 0 {
+		return false
+	}
+	content, err := d.readFile(dropin.dst)
+	return err == nil && bytes.Equal(content, dropin.content)
+}
+
+func systemDropinsCurrent(d installDeps, uid int) bool {
+	rendered, err := renderSystemDropins(d.etcRoot, uid)
+	if err != nil {
+		return false
+	}
+	for _, dropin := range rendered {
+		if !managedSystemDropinCurrent(d, dropin) {
+			return false
+		}
+	}
+	return true
+}
+
+func delegationDropinCurrent(d installDeps, uid int) bool {
+	rendered, err := renderSystemDropins(d.etcRoot, uid)
+	if err != nil {
+		return false
+	}
+	return managedSystemDropinCurrent(d, rendered[len(rendered)-1])
+}
+
+const (
+	enforcementActive       = "active"
+	enforcementPending      = "pending re-login"
+	enforcementNotInstalled = "not installed"
+)
+
+func memoryEnforcementState(d installDeps, uid int, maximum string) string {
+	if userMemoryControllerDelegated(d, uid) && maximum != "" {
+		if cgroup, err := controlGroupPath(d, d.sliceUnit); err == nil {
+			if live, readErr := d.readFile(filepath.Join(cgroup, "memory.max")); readErr == nil {
+				if want, sizeErr := sizeBytes(maximum); sizeErr == nil && strings.TrimSpace(string(live)) == strconv.FormatInt(want, 10) {
+					return enforcementActive
+				}
+			}
+		}
+	}
+	if delegationDropinCurrent(d, uid) {
+		return enforcementPending
+	}
+	return enforcementNotInstalled
+}
+
+func lingerReport(d installDeps, uid int) string {
+	out, err := d.run(timeoutArgv("loginctl", "show-user", strconv.Itoa(uid), "-p", "Linger", "--value"), nil)
+	value := strings.TrimSpace(string(out))
+	if err != nil || (value != "yes" && value != "no") {
+		d.logf("linger: unevaluated (%v)", err)
+		return "unevaluated"
+	}
+	status := map[bool]string{true: "on", false: "off"}[value == "yes"]
+	d.logf("linger: %s", status)
+	return status
 }
 
 func inspectExistingPath(d installDeps, path string, uid int, unit string, requireMarker bool) ([]byte, error) {
@@ -852,13 +1286,42 @@ func readManagedUnitAt(d installDeps, dirfd, uid int, unit string) ([]byte, bool
 	return readRegularUnitAt(d, dirfd, uid, unit, true)
 }
 
+func isCanonicalManagedMode(mode os.FileMode) bool {
+	return mode.Perm() == 0o644 && mode&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) == 0
+}
+
+func managedUnitModeAt(d installDeps, dirfd, uid int, unit string) (os.FileMode, bool, error) {
+	fd, err := d.openat(dirfd, unit, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("open %s to verify mode: %w", unit, err)
+	}
+	defer d.close(fd)
+	if err := validateRegularFD(d, fd, uid, unit); err != nil {
+		return 0, false, err
+	}
+	var stat unix.Stat_t
+	if err := d.fstat(fd, &stat); err != nil {
+		return 0, false, fmt.Errorf("stat %s mode: %w", unit, err)
+	}
+	return os.FileMode(stat.Mode & 0o7777), true, nil
+}
+
 func publishManagedUnit(d installDeps, dirfd, uid int, unit string, wanted []byte) (bool, error) {
 	existing, present, err := readManagedUnitAt(d, dirfd, uid, unit)
 	if err != nil {
 		return false, err
 	}
 	if present && bytes.Equal(existing, wanted) {
-		return false, nil
+		mode, modePresent, modeErr := managedUnitModeAt(d, dirfd, uid, unit)
+		if modeErr != nil {
+			return false, modeErr
+		}
+		if modePresent && mode == 0o644 {
+			return false, nil
+		}
 	}
 	temp := fmt.Sprintf(".%s.tmp-%d-%d", unit, d.getpid(), d.now().UnixNano())
 	fd, err := d.openat(dirfd, temp, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
@@ -1107,23 +1570,12 @@ func runStatus(d installDeps) error {
 	statusLiveProperty(d, d.sliceUnit, "MemoryMax")
 	statusLiveProperty(d, d.sliceUnit, "MemoryHigh")
 
-	managerControllers := filepath.Join(d.cgroupRoot, "user.slice", fmt.Sprintf("user-%d.slice", uid), fmt.Sprintf("user@%d.service", uid), "cgroup.controllers")
-	managerData, managerErr := d.readFile(managerControllers)
-	if managerErr != nil {
-		d.logf("delegation: unevaluated (%v)", managerErr)
-	} else if !hasToken(managerData, "memory") {
-		d.logf("delegation: memory unavailable")
+	maximum, _ := parseInstalledMemoryMax(string(content))
+	d.logf("memory delegation: %s", memoryEnforcementState(d, uid, maximum))
+	if systemDropinsCurrent(d, uid) {
+		d.logf("oomd + delegation drop-ins: up to date")
 	} else {
-		path, cgErr := controlGroupPath(d, d.sliceUnit)
-		if cgErr != nil {
-			d.logf("delegation: unevaluated (%v)", cgErr)
-		} else if subtree, readErr := d.readFile(filepath.Join(path, "cgroup.subtree_control")); readErr != nil {
-			d.logf("delegation: unevaluated (%v)", readErr)
-		} else if hasToken(subtree, "memory") {
-			d.logf("delegation: memory enabled")
-		} else {
-			d.logf("delegation: memory not enabled")
-		}
+		d.logf("oomd + delegation drop-ins: missing or stale")
 	}
 
 	anchorBinary, binaryOK := parseAnchorBinary(anchorContent)
@@ -1240,7 +1692,7 @@ func statusDaemonFacet(d installDeps, uid int, content []byte, unitErr error) {
 	} else {
 		d.logf("daemon reachable: yes (MainPID matches lock-holder PID)")
 	}
-	lingerOut, lingerErr := d.run([]string{"loginctl", "show-user", strconv.Itoa(uid), "-p", "Linger", "--value"}, nil)
+	lingerOut, lingerErr := d.run(timeoutArgv("loginctl", "show-user", strconv.Itoa(uid), "-p", "Linger", "--value"), nil)
 	linger := strings.TrimSpace(string(lingerOut))
 	if lingerErr != nil || (linger != "yes" && linger != "no") {
 		d.logf("linger: unevaluated (%v)", lingerErr)
@@ -1293,7 +1745,6 @@ func first(values []string) string {
 
 func argumentInvalid(message string) error { return fmt.Errorf("%s: %s", CodeArgumentInvalid, message) }
 func unavailable(err error) error          { return fmt.Errorf("%s: %w", CodeUnavailable, err) }
-func delegationError(err error) error      { return fmt.Errorf("%s: %w", CodeDelegation, err) }
 func overcommitError() error {
 	return fmt.Errorf("%s: capped whale.slice already exists; two independent caps can sum past physical RAM. Migrate whale-run to aira confine for the safe end-state, or re-run with --allow-overcommit to acknowledge the interim risk", CodeOvercommit)
 }
