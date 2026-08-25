@@ -1,10 +1,11 @@
 # AIRA install owns systemd-oomd + memory delegation (whale layer-3 migration)
 
-Status: PLAN v2 — folds Sol GATE-FAIL (2 P0: always-own-delegation, enforced-needs-proof; P1:
-transactional /etc, effective-config-before-teardown, privilege-drop hardening, invariant
-pins) and Fable GATE-FAIL (P1: seam lacks reexec/lookupUser, 2/5 filenames collide, the
-delegation-STRICT user phase breaks the ported ordering, marker/ownership policy for foreign
-/etc files). Final phase of whale→AIRA (owner 2026-08-25: AIRA fully replaces whale, carry all
+Status: PLAN v3 (builder-ready) — v2 folded Sol+Fable GATE-FAIL (always-own-delegation, honest
+tri-state enforcement, relax the 4 strict checks, unique /etc names, marker/ownership policy,
+seam extension). v3 folds the re-gate: Sol GATE-FAIL→one P1 (privilege drop via fork/exec
+`SysProcAttr.Credential`, not parent `setresuid`) + Fable GATE-PASS-WITH-NITS "ready to build"
+(root `--dry-run` forwarding, in-dest-dir `publishManagedUnit` staging, `E_INSTALL_DELEGATION`
+registry drop). Both gates now pass. Final phase of whale→AIRA (owner 2026-08-25: AIRA fully replaces whale, carry all
 lessons, then retire whale from agentmux + system). Safety-critical (root /etc, desktop OOM
 protection) → full two-loop. The agentmux teardown + system whale retirement are the FOLLOW-ON
 milestone (this ships + is verified FIRST; the desktop is never unprotected).
@@ -78,7 +79,11 @@ re-login` (tri-state `pending`), exit 0 for that expected transitional state. Th
 honesty (never claims enforced when it isn't) while letting aira bootstrap delegation on a fresh
 machine. (`E_INSTALL_DELEGATION` hard-fail is removed; the "run agentmux install" hint becomes
 "run sudo aira install".) The strict aira.slice-not-whale.slice fallback refusal from #55 is
-UNCHANGED — only the delegation-absent path degrades instead of aborting.
+UNCHANGED — only the delegation-absent path degrades instead of aborting. **Removing the
+`E_INSTALL_DELEGATION` code (Fable P2-3) must also drop its registry entry
+`"E_INSTALL_DELEGATION": 4` at `internal/store/check.go:59`** (the fail-closed code-registry test
+will otherwise catch the orphan) — or keep the code defined-but-unused if any other site emits it
+(grep first).
 
 ## 5. Root/user phase model — port agentmux's, with the seam + privilege-drop specced
 
@@ -94,13 +99,20 @@ Mirror `agentmux runInstall` (`~/tools/cmd/agentmux/install.go:737`):
 - **Root `sudo aira install`** — harden the privilege transition (Sol P1): resolve identity via
   passwd from `SUDO_UID` (reject a direct/ambiguous root invocation with no SUDO_*), require
   agreeing `SUDO_USER`/`SUDO_UID`/`SUDO_GID`, validate `/run/user/<uid>` exists AND is owned by
-  <uid>, sanitize the environment, and re-exec AS the target user via `setgroups`/`initgroups`
-  + `setresgid`/`setresuid` (drop privileges fully) — never do user-file ops as root. Order:
-  fail-fast (session + target-readable re-exec binary) BEFORE any /etc write → install the
-  aira-named /etc drop-ins (oomd always; **delegation ALWAYS** per §3) → re-exec the user phase
-  as the target user (`AIRA_INSTALL_REEXEC=1`) so the user-level layers install → surface a
-  failed oomd/delegation activation as a NON-ZERO exit AFTER the user phase ran (agentmux's
-  anti-masking ordering).
+  <uid>, sanitize the environment. **Drop privileges via the fork/exec credential path, not
+  parent `setresuid` (Sol re-gate P1):** resolve the target's supplementary groups while still
+  privileged (`getgrouplist`/`user.Lookup`), then spawn the re-exec with
+  `exec.Cmd{SysProcAttr: &syscall.SysProcAttr{Credential: &syscall.Credential{Uid, Gid, Groups}}}`
+  so the fork'd child applies uid/gid/groups atomically pre-exec (single-threaded, no Go
+  multithreaded thread-credential hazard); the parent stays root and waits. Inherit only stdio
+  (`Stdout`/`Stderr` = os.Stdout/Stderr; every other fd CLOEXEC), fail-closed on any error. Never
+  do user-file ops as root in-process. Order: fail-fast (session + target-readable re-exec
+  binary) BEFORE any /etc write → install the aira-named /etc drop-ins (oomd always; **delegation
+  ALWAYS** per §3) → re-exec the user phase as the target user (`AIRA_INSTALL_REEXEC=1`) so the
+  user-level layers install → surface a failed oomd/delegation activation as a NON-ZERO exit
+  AFTER the user phase ran (agentmux's anti-masking ordering). Under `--dry-run`, forward
+  `--dry-run` to the child (its early-return makes the re-exec a safe no-op that prints the
+  planned user-level writes) — never re-exec a REAL user install under a dry run (Fable P2-1).
 - Enable user-linger as root BEFORE the re-exec (authoritative, no polkit); the re-exec child
   does read-only `lingerReport` via the `AIRA_INSTALL_REEXEC` sentinel, NOT another
   `enable-linger`, and wraps any `loginctl` in `timeout` (Fable P2-2).
@@ -109,11 +121,14 @@ Mirror `agentmux runInstall` (`~/tools/cmd/agentmux/install.go:737`):
   `installHome` + `systemctl --user` + daemon socket identity) and forwarding
   `--memory-max`/`--memory-high`/`--watchdog`/`--watchdog-interval`/`--allow-overcommit`.
 
-**Transactional /etc writes (Sol P1):** stage every drop-in in a root temp dir, validate, then
-atomic-rename each into place (root-owned, non-symlink target, mode 0644, fsync); a write /
-daemon-reload / restart failure reports EXPLICIT partial installation with a non-zero exit —
-never "up to date". Ordered user daemon-reload/restart so the running aira-daemon never observes
-a half-installed user unit.
+**Transactional /etc writes (Sol P1; mechanism per Fable P2-2):** "staging/validation" = render +
+validate all five drop-ins IN MEMORY in a pre-flight pass (fail before any write if any renders
+wrong); the atomic write itself is the existing `publishManagedUnit` per destination directory —
+its temp file lives in the DESTINATION dirfd and uses same-dir `renameat` (same-FS guaranteed,
+no cross-dir EXDEV), root-owned, non-symlink target, mode 0644, fsync. A write / daemon-reload /
+restart failure reports EXPLICIT partial installation with a non-zero exit — never "up to date".
+Ordered user daemon-reload/restart so the running aira-daemon never observes a half-installed
+user unit.
 
 ## 6. Marker + ownership policy for aira's /etc files (Fable P1-e)
 
