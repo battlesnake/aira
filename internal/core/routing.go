@@ -44,7 +44,7 @@ func Classify(verb, selector string) (string, Route) {
 		return canonical, RouteClient
 	case canonical == "time":
 		return canonical, RouteClient
-	case canonical == "confine":
+	case canonical == "confine" || canonical == "confine-list" || canonical == "confine-kill":
 		return canonical, RouteClient
 	case canonical == "install":
 		return canonical, RouteClient
@@ -108,7 +108,7 @@ func StoreFreeCarved(verb string, args map[string]any) bool {
 			}
 		}
 		return true
-	case "run-kill", "run-log", "run-input", "git", "confine":
+	case "run-kill", "run-log", "run-input", "git", "confine", "confine-list", "confine-kill":
 		return true
 	case "show":
 		selector, _ := args["selector"].(string)

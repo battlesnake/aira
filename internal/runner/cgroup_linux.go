@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,8 +21,10 @@ const cloneIntoCgroup = uintptr(1 << 33)
 
 type linuxScopeBackend struct{ parent string }
 type linuxScope struct {
-	path string
-	fd   *os.File
+	path              string
+	fd                *os.File
+	events            *os.File
+	removedMeansEmpty bool
 }
 
 func newDefaultBackend(parent string) ScopeBackend { return &linuxScopeBackend{parent: parent} }
@@ -220,8 +223,25 @@ func (b *linuxScopeBackend) Open(ctx context.Context, reference string) (Scope, 
 func (s *linuxScope) Reference() string  { return s.path }
 func (s *linuxScope) FD() int            { return int(s.fd.Fd()) }
 func (s *linuxScope) EventsPath() string { return filepath.Join(s.path, "cgroup.events") }
+func (s *linuxScope) openFile(name string, flags int) (*os.File, error) {
+	fd, err := unix.Openat(s.FD(), name, flags|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), name)
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, errors.New("open scope control file")
+	}
+	return file, nil
+}
 func (s *linuxScope) Members() ([]int, error) {
-	data, err := os.ReadFile(filepath.Join(s.path, "cgroup.procs"))
+	file, err := s.openFile("cgroup.procs", unix.O_RDONLY)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, 1<<20))
 	if err != nil {
 		return nil, err
 	}
@@ -236,10 +256,32 @@ func (s *linuxScope) Members() ([]int, error) {
 	return result, nil
 }
 func (s *linuxScope) Empty() (bool, error) {
-	data, err := os.ReadFile(filepath.Join(s.path, "cgroup.events"))
-	if err != nil {
+	file := s.events
+	closeAfter := false
+	if file == nil {
+		var err error
+		file, err = s.openFile("cgroup.events", unix.O_RDONLY)
+		if err != nil {
+			return false, err
+		}
+		closeAfter = true
+	}
+	if closeAfter {
+		defer file.Close()
+	}
+	data := make([]byte, 4096)
+	n, err := unix.Pread(int(file.Fd()), data, 0)
+	if s.removedMeansEmpty && (errors.Is(err, unix.ENODEV) || errors.Is(err, unix.ENOENT)) {
+		// A cgroup directory can be removed only after the kernel has observed it
+		// empty. Management enables this inference only after cgroup.kill itself
+		// succeeded, so a supervisor teardown racing the poll is an equally strong
+		// empty attestation rather than a fabricated success.
+		return true, nil
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
 		return false, err
 	}
+	data = data[:n]
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) == 2 && fields[0] == "populated" {
@@ -267,7 +309,7 @@ func (s *linuxScope) Terminate(pids []int) error {
 }
 func memberStillPresent(current []int, pid int) bool { return containsPID(current, pid) }
 func (s *linuxScope) Kill() error {
-	f, err := os.OpenFile(filepath.Join(s.path, "cgroup.kill"), os.O_WRONLY, 0)
+	f, err := s.openFile("cgroup.kill", unix.O_WRONLY)
 	if err != nil {
 		return err
 	}

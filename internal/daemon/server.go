@@ -473,6 +473,13 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		wrote = writeFrame(conn, responseFrame(s.confineReport(request.Request.Args))) == nil
 		return
 	}
+	if verb == "confine-list" || verb == "confine-kill" {
+		if s.OnRequest != nil {
+			s.OnRequest(request.Scope, request.Request)
+		}
+		wrote = writeFrame(conn, responseFrame(s.confineManagement(ctx, request.Request))) == nil
+		return
+	}
 	if verb == "admit" {
 		if s.OnRequest != nil {
 			s.OnRequest(request.Scope, request.Request)

@@ -2,9 +2,11 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -78,6 +80,8 @@ type ConfineStatus struct {
 type ConfineRequest struct {
 	Slice               string
 	Name                string
+	Owner               string
+	ScopeID             string
 	Argv                []string
 	Env                 []string
 	RuntimeDir          string
@@ -94,6 +98,28 @@ type ConfineRequest struct {
 	Stderr              io.Writer
 	SelfPath            string
 	ResourceSignature   string
+}
+
+const ConfineUnknownOwner = "unknown"
+
+// ValidateConfineIdentity applies the deliberately small scope-id component
+// alphabet to cooperative owner identities. It prevents control characters or
+// path-shaped values from crossing the CLI/admission boundary; it is not an
+// authentication mechanism.
+func ValidateConfineIdentity(value string) error {
+	if value == "" {
+		return errors.New("identity is empty")
+	}
+	if len(value) > 100 {
+		return errors.New("identity is too long")
+	}
+	for _, r := range value {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("_.-", r) {
+			continue
+		}
+		return errors.New("identity requires letters, digits, '.', '_', or '-'")
+	}
+	return nil
 }
 
 type ConfineResult struct {

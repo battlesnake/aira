@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"text/tabwriter"
+	"time"
 
 	"aira/internal/app"
 	"aira/internal/core"
@@ -92,11 +94,31 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		return render(response, true, stdout, stderr)
 	}
 	if verb == "confine" {
-		if jsonOutput {
+		management := options["list"] == "true" || options["kill"] != ""
+		if jsonOutput && !management {
 			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for confine", Exit: store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
 			return render(response, true, stdout, stderr)
 		}
+		if management {
+			return runConfineManagementCommand(context.Background(), options, jsonOutput, stdout, stderr, injected)
+		}
 		return runConfineCommand(context.Background(), positional, options, stdin, stdout, stderr)
+	}
+	if verb == "confine-list" || verb == "confine-kill" {
+		request, requestErr := buildRequest(verb, positional, options)
+		if requestErr != nil {
+			code := store.ErrorCode(requestErr)
+			if code == "E_INTERNAL" {
+				code = "E_CONFINE_ARGUMENT_INVALID"
+			}
+			return render(core.Response{Code: code, Error: requestErr.Error(), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
+		}
+		owner, ownerErr := resolveConfineOwner(context.Background(), options["owner"])
+		if ownerErr != nil {
+			return render(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: --owner: " + ownerErr.Error(), Exit: store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, jsonOutput, stdout, stderr)
+		}
+		request.Args["owner"] = owner
+		return dispatchConfineManagementRequest(context.Background(), request, jsonOutput, stdout, stderr, injected)
 	}
 
 	if verb == "init" {
@@ -448,23 +470,25 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"count":  {"by": true}, "reconcile": {"rebuild": true},
 		"claim":   {"steal": true, "actor": true},
 		"release": {"token": true}, "heartbeat": {"token": true},
-		"touch":       {"token": true},
-		"ready":       {"list": true},
-		"find":        {"category": true, "severity": true, "verdict": true, "source": true, "message": true, "file": true, "requirement": true, "by": true, "fields": true, "disposition": true, "reason": true, "actor": true},
-		"req":         {"status": true, "fields": true},
-		"test-report": {"format": true, "explain": true, "all": true, "ticket": true, "phase": true, "commit": true, "branch": true, "suite": true, "config": true, "config-env": true, "shard": true, "retry": true},
-		"spend":       {"provider": true, "model": true, "source": true, "ticket": true, "phase": true, "at": true, "session": true, "agent": true, "total": true, "cost-usd": true, "usage-file": true, "bucket": true, "reasoning-subset": true, "by": true},
-		"quota":       {"provider": true, "source": true, "at": true, "window": true, "used": true, "limit": true, "remaining": true, "reset-at": true},
-		"insights":    {},
-		"lease":       {},
-		"tui":         nil,
-		"commands":    {"by": true},
-		"git":         {},
-		"run-kill":    {"steal": true},
-		"run-input":   {"close": true, "steal": true},
-		"run-log":     {"stream": true, "from": true, "tail": true, "follow": true, "full": true},
-		"watch":       {"from": true, "from-start": true, "verb": true},
-		"gate":        {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "reason": true, "report": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-seed": true, "mutation-expected-result": true},
+		"touch":        {"token": true},
+		"ready":        {"list": true},
+		"find":         {"category": true, "severity": true, "verdict": true, "source": true, "message": true, "file": true, "requirement": true, "by": true, "fields": true, "disposition": true, "reason": true, "actor": true},
+		"req":          {"status": true, "fields": true},
+		"test-report":  {"format": true, "explain": true, "all": true, "ticket": true, "phase": true, "commit": true, "branch": true, "suite": true, "config": true, "config-env": true, "shard": true, "retry": true},
+		"spend":        {"provider": true, "model": true, "source": true, "ticket": true, "phase": true, "at": true, "session": true, "agent": true, "total": true, "cost-usd": true, "usage-file": true, "bucket": true, "reasoning-subset": true, "by": true},
+		"quota":        {"provider": true, "source": true, "at": true, "window": true, "used": true, "limit": true, "remaining": true, "reset-at": true},
+		"insights":     {},
+		"lease":        {},
+		"tui":          nil,
+		"commands":     {"by": true},
+		"git":          {},
+		"run-kill":     {"steal": true},
+		"run-input":    {"close": true, "steal": true},
+		"run-log":      {"stream": true, "from": true, "tail": true, "follow": true, "full": true},
+		"confine-list": {"slice": true, "owner": true},
+		"confine-kill": {"steal": true, "slice": true, "owner": true},
+		"watch":        {"from": true, "from-start": true, "verb": true},
+		"gate":         {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "reason": true, "report": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-seed": true, "mutation-expected-result": true},
 	}
 	for name := range options {
 		if !allowed[verb][name] {
@@ -526,7 +550,7 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 		}
 	}
 	if delimiter < 0 {
-		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine requires the standalone -- launch delimiter")
+		return parseConfineManagementArgs(argv)
 	}
 	for i := 0; i < delimiter; i++ {
 		arg := argv[i]
@@ -534,7 +558,7 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 			return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine options must precede the launch delimiter")
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name != "slice" && name != "name" && name != "memory-reserve" && name != "memory-max" && name != "memory-high" {
+		if name != "slice" && name != "name" && name != "owner" && name != "memory-reserve" && name != "memory-max" && name != "memory-high" {
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for confine", name)
 		}
 		if i+1 >= delimiter || strings.HasPrefix(argv[i+1], "--") {
@@ -565,6 +589,56 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 	return target, options, nil
 }
 
+func parseConfineManagementArgs(argv []string) ([]string, map[string]string, error) {
+	options := map[string]string{}
+	for i := 0; i < len(argv); i++ {
+		arg := argv[i]
+		if !strings.HasPrefix(arg, "--") || arg == "--" {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: unexpected management argument %q", arg)
+		}
+		name, inline, hasInline := strings.Cut(strings.TrimPrefix(arg, "--"), "=")
+		if _, exists := options[name]; exists {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s may occur once", name)
+		}
+		switch name {
+		case "list", "steal":
+			if hasInline {
+				return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s does not take a value", name)
+			}
+			options[name] = "true"
+		case "kill", "slice", "owner":
+			value := inline
+			if !hasInline {
+				if i+1 >= len(argv) || strings.HasPrefix(argv[i+1], "--") {
+					return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s requires a value", name)
+				}
+				i++
+				value = argv[i]
+			}
+			if value == "" {
+				return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s requires a value", name)
+			}
+			options[name] = value
+		default:
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for confine management", name)
+		}
+	}
+	list := options["list"] == "true"
+	kill := options["kill"] != ""
+	if list == kill {
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine management requires exactly one of --list or --kill <selector>")
+	}
+	if list && options["steal"] == "true" {
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --steal is valid only with --kill")
+	}
+	if owner := options["owner"]; owner != "" {
+		if err := runner.ValidateConfineIdentity(owner); err != nil {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --owner: %w", err)
+		}
+	}
+	return nil, options, nil
+}
+
 func runConfineCommand(ctx context.Context, target []string, options map[string]string, stdin io.Reader, stdout, stderr io.Writer) int {
 	maximum, high, err := parseScopeMemoryOptions(options, "E_CONFINE_ARGUMENT_INVALID")
 	if err != nil {
@@ -590,8 +664,14 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 	if maximum > 0 {
 		reserve, reservePinned = maximum, true
 	}
+	owner, err := resolveConfineOwner(ctx, options["owner"])
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --owner: %v\n", err)
+		return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+	}
 	request := runner.ConfineRequest{
 		Slice: options["slice"], Name: options["name"], Argv: append([]string(nil), target...),
+		Owner:         owner,
 		MemoryReserve: reserve, MemoryReservePinned: reservePinned,
 		ScopeMemoryMax: maximum, ScopeMemoryHigh: high,
 		Stdin: stdin, Stdout: stdout, Stderr: stderr,
@@ -608,6 +688,63 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		return store.ExitForCode(store.ErrorCode(err))
 	}
 	return result.Exit
+}
+
+func resolveConfineOwner(ctx context.Context, explicit string) (string, error) {
+	if explicit != "" {
+		if err := runner.ValidateConfineIdentity(explicit); err != nil {
+			return "", err
+		}
+		return explicit, nil
+	}
+	if environment := strings.TrimSpace(os.Getenv("AIRA_CONFINE_OWNER")); environment != "" {
+		if err := runner.ValidateConfineIdentity(environment); err != nil {
+			return "", err
+		}
+		return environment, nil
+	}
+	if project, err := app.Discover(ctx, "."); err == nil && project.WorktreeID != "" {
+		if err := runner.ValidateConfineIdentity(project.WorktreeID); err == nil {
+			return project.WorktreeID, nil
+		}
+	}
+	return runner.ConfineUnknownOwner, nil
+}
+
+func runConfineManagementCommand(ctx context.Context, options map[string]string, jsonOutput bool, stdout, stderr io.Writer, injected Dispatcher) int {
+	owner, err := resolveConfineOwner(ctx, options["owner"])
+	if err != nil {
+		return render(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: --owner: " + err.Error(), Exit: store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, jsonOutput, stdout, stderr)
+	}
+	verb := "confine-list"
+	args := map[string]any{"slice": options["slice"], "owner": owner}
+	if selector := options["kill"]; selector != "" {
+		verb = "confine-kill"
+		args["selector"] = selector
+		args["steal"] = options["steal"] == "true"
+	}
+	return dispatchConfineManagementRequest(ctx, core.Request{Verb: verb, Args: args}, jsonOutput, stdout, stderr, injected)
+}
+
+func dispatchConfineManagementRequest(ctx context.Context, request core.Request, jsonOutput bool, stdout, stderr io.Writer, injected Dispatcher) int {
+	if request.Args == nil {
+		request.Args = map[string]any{}
+	}
+	slice, _ := request.Args["slice"].(string)
+	request.Args["slice"] = runner.ResolveConfineSlice(slice)
+	dispatcher := injected
+	var err error
+	if dispatcher == nil {
+		dispatcher, err = newDaemonDispatcher(nil, stdout, stderr, jsonOutput)
+		if err != nil {
+			return render(transportErrorResponse(err), jsonOutput, stdout, stderr)
+		}
+	}
+	response := dispatcher.Dispatch(ctx, daemon.WorktreeScope{}, request)
+	if request.Verb == "confine-list" && !jsonOutput && response.OK {
+		return renderConfineListResponse(response, stdout, stderr)
+	}
+	return render(response, jsonOutput, stdout, stderr)
 }
 
 func parseGitArgs(argv []string) ([]string, map[string]string, error) {
@@ -850,6 +987,18 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		if value, ok := options["memory-high"]; ok {
 			args["memory_high"] = value
 		}
+	case "confine-list":
+		if len(positional) != 0 {
+			return core.Request{}, errors.New("E_CONFINE_ARGUMENT_INVALID: confine-list accepts no selector")
+		}
+		args["slice"], args["owner"] = options["slice"], options["owner"]
+	case "confine-kill":
+		if len(positional) != 1 || positional[0] == "" {
+			return core.Request{}, errors.New("E_CONFINE_ARGUMENT_INVALID: confine-kill requires one selector")
+		}
+		args["selector"] = positional[0]
+		args["steal"] = options["steal"] == "true"
+		args["slice"], args["owner"] = options["slice"], options["owner"]
 	case "time":
 		if len(positional) == 0 {
 			return core.Request{}, errors.New("E_RUN_ARGUMENT_INVALID: time target argv is empty")
@@ -1537,6 +1686,66 @@ func render(response core.Response, jsonOutput bool, stdout, stderr io.Writer) i
 		return 0
 	}
 	return exitForError(response.Code)
+}
+
+func renderConfineListResponse(response core.Response, stdout, stderr io.Writer) int {
+	var result runner.ConfineListResult
+	data := response.RawData
+	if len(data) == 0 {
+		data, _ = json.Marshal(response.Data)
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return render(core.Response{Code: daemon.CodeProtocol, Error: daemon.CodeProtocol + ": invalid confine-list response", Exit: store.ExitForCode(daemon.CodeProtocol)}, false, stdout, stderr)
+	}
+	if result.Verdict == "unevaluated" {
+		_, _ = fmt.Fprintf(stdout, "confine list: unevaluated: %s\n", result.Reason)
+		if response.Exit != 0 {
+			return response.Exit
+		}
+		return 3
+	}
+	table := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+	_, _ = fmt.Fprintln(table, "NAME\tOWNER\tSUPERVISOR-PID\tSCOPE-ID\tPOPULATED\tRSS\tAGE\tCAP")
+	for _, record := range result.Scopes {
+		_, _ = fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			record.Name, record.Owner, confineInt(record.SupervisorPID), record.ScopeID,
+			confineInt(record.Populated), confineInt64(record.RSSBytes), confineAge(record.AgeSeconds), confineString(record.Cap))
+	}
+	if err := table.Flush(); err != nil {
+		return exitForError("E_RUN_DETACH_FAILED")
+	}
+	if response.Exit != 0 {
+		return response.Exit
+	}
+	return 0
+}
+
+func confineInt(value *int) string {
+	if value == nil {
+		return "unevaluated"
+	}
+	return strconv.Itoa(*value)
+}
+
+func confineInt64(value *int64) string {
+	if value == nil {
+		return "unevaluated"
+	}
+	return strconv.FormatInt(*value, 10)
+}
+
+func confineAge(value *int64) string {
+	if value == nil {
+		return "unevaluated"
+	}
+	return (time.Duration(*value) * time.Second).String()
+}
+
+func confineString(value *string) string {
+	if value == nil {
+		return "unevaluated"
+	}
+	return *value
 }
 
 type lineTrackingWriter struct {

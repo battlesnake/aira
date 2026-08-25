@@ -339,6 +339,11 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 		"signature":   req.ResourceSignature,
 		"pinned":      !req.DaemonEstimateMemory || req.MemoryReservePinned,
 	}
+	if req.ConfineScopeID != "" {
+		frame.Request.Args["scope_id"] = req.ConfineScopeID
+		frame.Request.Args["name"] = req.ConfineName
+		frame.Request.Args["owner"] = req.ConfineOwner
+	}
 	if err := writeRunnerAdmitFrame(conn, frame); err != nil {
 		return fail()
 	}

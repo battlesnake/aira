@@ -80,6 +80,32 @@ func TestAdmitFIFOOrderAndMidstreamArrival(t *testing.T) {
 	server.releaseAdmitWaiter(queue, d)
 }
 
+func TestValidateAdmitArgsRejectsTraversalShapedConfineScopeID(t *testing.T) {
+	base := map[string]any{
+		"slice": "aira.slice", "reserve": int64(1), "max_wait_ms": int64(1),
+		"name": "job", "owner": "session-a",
+	}
+	for _, scopeID := range []string{"../CONFINE-job-1-a", "CONFINE-../job-1-a", "CONFINE-job/child-1-a", ".aira-CONFINE-job-1-a", "CONFINE-job-x-a", "CONFINE-job-1-A"} {
+		args := make(map[string]any, len(base)+1)
+		for key, value := range base {
+			args[key] = value
+		}
+		args["scope_id"] = scopeID
+		if _, err := validateAdmitArgs(args); err == nil {
+			t.Fatalf("scope_id %q accepted", scopeID)
+		}
+	}
+	valid := make(map[string]any, len(base)+1)
+	for key, value := range base {
+		valid[key] = value
+	}
+	valid["scope_id"] = "CONFINE-job-123-abc9"
+	request, err := validateAdmitArgs(valid)
+	if err != nil || request.scopeID != valid["scope_id"] || request.owner != "session-a" {
+		t.Fatalf("request=%+v err=%v", request, err)
+	}
+}
+
 func TestAdmitPrefixConcurrencyAndNoJumpAhead(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(100)

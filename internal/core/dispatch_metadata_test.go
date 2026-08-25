@@ -396,7 +396,7 @@ func TestDispatchDescriptorsAreStableReadOnlyCopies(t *testing.T) {
 
 // verifies: destructive metadata is centrally owned and never inferred from a
 // broad safety class by a generated face.
-func TestRantRedactIsTheOnlyDestructiveOperation(t *testing.T) {
+func TestDestructiveOperationsAreExplicit(t *testing.T) {
 	var destructive []string
 	for _, descriptor := range New(nil).DispatchDescriptors() {
 		if descriptor.Destructive {
@@ -416,7 +416,7 @@ func TestRantRedactIsTheOnlyDestructiveOperation(t *testing.T) {
 			}
 		}
 	}
-	if want := []string{"rant redact"}; !reflect.DeepEqual(destructive, want) {
+	if want := []string{"confine-kill", "rant redact"}; !reflect.DeepEqual(destructive, want) {
 		t.Fatalf("destructive descriptors=%v, want %v", destructive, want)
 	}
 }
@@ -428,7 +428,7 @@ func TestCanonicalDispatchNamesAndAliases(t *testing.T) {
 		got = append(got, descriptor.Name)
 	}
 	sort.Strings(got)
-	want := []string{"check", "claim", "commands", "confine", "count", "create", "find", "gate", "git", "grep", "heartbeat", "help", "id", "import", "init", "insights", "install", "lease", "link", "list", "mv", "quota", "rant", "ready", "reconcile", "release", "req", "review", "run", "run-input", "run-kill", "run-log", "set", "show", "spend", "test-report", "time", "touch", "unlink"}
+	want := []string{"check", "claim", "commands", "confine", "confine-kill", "confine-list", "count", "create", "find", "gate", "git", "grep", "heartbeat", "help", "id", "import", "init", "insights", "install", "lease", "link", "list", "mv", "quota", "rant", "ready", "reconcile", "release", "req", "review", "run", "run-input", "run-kill", "run-log", "set", "show", "spend", "test-report", "time", "touch", "unlink"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("dispatch names=%v, want=%v", got, want)
 	}

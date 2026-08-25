@@ -182,6 +182,9 @@ type Request struct {
 	DaemonEstimateMemory  bool      `json:"daemon_estimate_memory,omitempty"`
 	ScopeMemoryMax        int64     `json:"scope_memory_max,omitempty"`
 	ScopeMemoryHigh       int64     `json:"scope_memory_high,omitempty"`
+	ConfineScopeID        string    `json:"confine_scope_id,omitempty"`
+	ConfineName           string    `json:"confine_name,omitempty"`
+	ConfineOwner          string    `json:"confine_owner,omitempty"`
 	// TelemetryPending is an opaque initial envelope supplied by Core. Runner
 	// stamps it into the starting event without interpreting its value.
 	TelemetryPending string `json:"telemetry_pending,omitempty"`

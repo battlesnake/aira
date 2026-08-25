@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,6 +53,9 @@ type admitWaiter struct {
 	reason    string
 	waitedMS  int64
 	basis     string
+	scopeID   string
+	name      string
+	owner     string
 }
 
 type sliceQueue struct {
@@ -84,7 +88,12 @@ type admitRequest struct {
 	maxWait   int64
 	signature string
 	pinned    bool
+	scopeID   string
+	name      string
+	owner     string
 }
+
+var confineScopeIDPattern = regexp.MustCompile(`^CONFINE-[A-Za-z0-9._-]+-[0-9]+-[0-9a-z]+$`)
 
 type admitRejection struct {
 	Required int64  `json:"required,omitempty"`
@@ -280,7 +289,7 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		s.writeAdmitRejection(conn, CodeAdmitTooLarge, admitRejection{Required: reserve, Ceiling: ceiling, Basis: basis})
 		return
 	}
-	queue, waiter, code, enqueueErr := s.enqueueResolvedAdmit(path, reserve, basis, maximum)
+	queue, waiter, code, enqueueErr := s.enqueueResolvedConfineAdmit(path, reserve, basis, maximum, request)
 	if enqueueErr != nil {
 		if code == CodeAdmitTooLarge {
 			s.writeAdmitRejection(conn, code, admitRejection{Required: reserve, Ceiling: s.admitCeiling(path, maximum), Basis: basis})
@@ -364,14 +373,18 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 }
 
 func (s *Server) enqueueAdmit(path string, reserve int64) (*sliceQueue, *admitWaiter, string, error) {
-	return s.enqueueAdmitInternal(path, reserve, "", 0, false)
+	return s.enqueueAdmitInternal(path, reserve, "", 0, false, admitRequest{})
 }
 
 func (s *Server) enqueueResolvedAdmit(path string, reserve int64, basis string, maximum int64) (*sliceQueue, *admitWaiter, string, error) {
-	return s.enqueueAdmitInternal(path, reserve, basis, maximum, true)
+	return s.enqueueAdmitInternal(path, reserve, basis, maximum, true, admitRequest{})
 }
 
-func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, maximum int64, enforceCeiling bool) (*sliceQueue, *admitWaiter, string, error) {
+func (s *Server) enqueueResolvedConfineAdmit(path string, reserve int64, basis string, maximum int64, request admitRequest) (*sliceQueue, *admitWaiter, string, error) {
+	return s.enqueueAdmitInternal(path, reserve, basis, maximum, true, request)
+}
+
+func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, maximum int64, enforceCeiling bool, request admitRequest) (*sliceQueue, *admitWaiter, string, error) {
 	s.admitRegistryMu.Lock()
 	if s.admitQueues == nil {
 		s.admitQueues = make(map[string]*sliceQueue)
@@ -395,11 +408,18 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 	if enforceCeiling && reserve > subtractFloor(maximum, s.admitSliceHeadroom(queue.outstandingJobs+1)) {
 		return nil, nil, CodeAdmitTooLarge, fmt.Errorf("%s: required reserve exceeds cap minus headroom", CodeAdmitTooLarge)
 	}
+	if request.scopeID != "" {
+		for _, existing := range queue.waiters {
+			if existing != nil && existing.state != admitReleased && existing.scopeID == request.scopeID {
+				return nil, nil, CodeProtocol, fmt.Errorf("%s: confine scope_id is already registered", CodeProtocol)
+			}
+		}
+	}
 	if queue.seq == math.MaxInt64 {
 		return nil, nil, CodeProtocol, fmt.Errorf("%s: admission arrival sequence overflow", CodeProtocol)
 	}
 	queue.seq++
-	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime()}
+	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner}
 	queue.waiters = append(queue.waiters, waiter)
 	queue.signal()
 	return queue, waiter, "", nil
@@ -597,11 +617,11 @@ func elapsedMilliseconds(start, end time.Time) int64 {
 }
 
 func validateAdmitArgs(args map[string]any) (admitRequest, error) {
-	if len(args) < 3 || len(args) > 5 {
-		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, max_wait_ms, and optional signature/pinned", CodeProtocol)
+	if len(args) < 3 || len(args) > 8 {
+		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, max_wait_ms, optional signature/pinned, and an optional complete scope_id/name/owner tuple", CodeProtocol)
 	}
 	for name := range args {
-		if name != "slice" && name != "reserve" && name != "max_wait_ms" && name != "signature" && name != "pinned" {
+		if name != "slice" && name != "reserve" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "scope_id" && name != "name" && name != "owner" {
 			return admitRequest{}, fmt.Errorf("%s: unexpected admit field %q", CodeProtocol, name)
 		}
 	}
@@ -640,7 +660,45 @@ func validateAdmitArgs(args map[string]any) (admitRequest, error) {
 			return admitRequest{}, fmt.Errorf("%s: admit pinned must be boolean", CodeProtocol)
 		}
 	}
+	scopeID, hasScope := args["scope_id"]
+	name, hasName := args["name"]
+	owner, hasOwner := args["owner"]
+	if hasScope || hasName || hasOwner {
+		if !hasScope || !hasName || !hasOwner {
+			return admitRequest{}, fmt.Errorf("%s: admit scope_id, name, and owner must be supplied together", CodeProtocol)
+		}
+		scopeText, scopeOK := scopeID.(string)
+		nameText, nameOK := name.(string)
+		ownerText, ownerOK := owner.(string)
+		if !scopeOK || !confineScopeIDPattern.MatchString(scopeText) {
+			return admitRequest{}, fmt.Errorf("%s: admit scope_id is not canonical", CodeProtocol)
+		}
+		if !nameOK || runner.ValidateConfineIdentity(nameText) != nil {
+			return admitRequest{}, fmt.Errorf("%s: admit name is invalid", CodeProtocol)
+		}
+		if embedded, valid := confineAdmitScopeName(scopeText); !valid || embedded != nameText {
+			return admitRequest{}, fmt.Errorf("%s: admit name does not match scope_id", CodeProtocol)
+		}
+		if !ownerOK || runner.ValidateConfineIdentity(ownerText) != nil {
+			return admitRequest{}, fmt.Errorf("%s: admit owner is invalid", CodeProtocol)
+		}
+		return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, scopeID: scopeText, name: nameText, owner: ownerText}, nil
+	}
 	return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned}, nil
+}
+
+func confineAdmitScopeName(scopeID string) (string, bool) {
+	rest := strings.TrimPrefix(scopeID, "CONFINE-")
+	last := strings.LastIndexByte(rest, '-')
+	if last <= 0 {
+		return "", false
+	}
+	rest = rest[:last]
+	last = strings.LastIndexByte(rest, '-')
+	if last <= 0 {
+		return "", false
+	}
+	return rest[:last], true
 }
 
 func exactAdmitInt64(value any) (int64, bool) {

@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,10 +22,12 @@ import (
 	"time"
 
 	"aira/internal/app"
+	"aira/internal/cgrouptest"
 	"aira/internal/core"
 	"aira/internal/daemon"
 	"aira/internal/domain"
 	"aira/internal/gitcontext"
+	"aira/internal/runner"
 	"aira/internal/store"
 	"golang.org/x/sys/unix"
 )
@@ -1001,6 +1004,80 @@ func TestMCPMutationUsesRealDaemonSocket(t *testing.T) {
 	}
 	if got := socketRequests.Load(); got != 1 {
 		t.Fatalf("daemon observed %d MCP create requests, want exactly one", got)
+	}
+}
+
+func TestMCPConfineKillOutsideProjectKeepsOwnershipAndStealChecks(t *testing.T) {
+	if _, err := os.Stat("/home/user/.local/bin/aira"); err != nil {
+		t.Skip("installed aira helper unavailable")
+	}
+	root := t.TempDir()
+	t.Chdir(root)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	t.Setenv("XDG_RUNTIME_DIR", shortRuntimeDir(t))
+	t.Setenv("AIRA_CONFINE_OWNER", "session-b")
+	paths, err := daemon.PathsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	startCommandDaemon(t, daemon.NewServer(paths))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	name := "mcp-e2e-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	done := make(chan error, 1)
+	go func() {
+		_, launchErr := runner.Confine(ctx, runner.ConfineRequest{
+			Slice: "aira.slice", Name: name, Owner: "session-a", Argv: []string{"/bin/sh", "-c", "sleep 60"},
+			RuntimeDir: paths.RuntimeDir, AdmitSocketPath: paths.SocketPath, SelfPath: "/home/user/.local/bin/aira",
+			Stdout: io.Discard, Stderr: io.Discard,
+		})
+		done <- launchErr
+	}()
+
+	call := func(arguments string) string {
+		t.Helper()
+		input := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"aira_confine_kill","arguments":` + arguments + `}}` + "\n")
+		var output, diagnostics bytes.Buffer
+		if exit := runMCPWithDispatcher(context.Background(), input, &output, &diagnostics, nil); exit != 0 {
+			t.Fatalf("MCP exit=%d output=%q diagnostics=%q", exit, output.String(), diagnostics.String())
+		}
+		return output.String()
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		input := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"aira_confine_list","arguments":{}}}` + "\n")
+		var output bytes.Buffer
+		_ = runMCPWithDispatcher(context.Background(), input, &output, io.Discard, nil)
+		if strings.Contains(output.String(), name) && strings.Contains(output.String(), "session-a") {
+			break
+		}
+		select {
+		case launchErr := <-done:
+			if launchErr != nil {
+				cgrouptest.SkipOrFailRealCgroup(t, "real MCP confine launch unavailable: %v", launchErr)
+			}
+			t.Fatal("confined workload exited before kill")
+		default:
+		}
+		if time.Now().After(deadline) {
+			cgrouptest.SkipOrFailRealCgroup(t, "confine registry did not become visible")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	withoutSteal := call(fmt.Sprintf(`{"selector":%q}`, name))
+	if !strings.Contains(withoutSteal, runner.CodeConfineOwnerUnverified) {
+		t.Fatalf("without steal=%q", withoutSteal)
+	}
+	withSteal := call(fmt.Sprintf(`{"selector":%q,"steal":true}`, name))
+	if !strings.Contains(withSteal, `"code":"OK"`) || !strings.Contains(withSteal, `"status":"killed"`) {
+		t.Fatalf("with steal=%q", withSteal)
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("confine supervisor did not finish after scope kill")
 	}
 }
 

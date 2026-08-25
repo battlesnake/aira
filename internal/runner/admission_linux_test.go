@@ -296,8 +296,13 @@ func TestAdmissionT2NoLaunchSideEffectsDuringWait(t *testing.T) {
 	base := t.TempDir()
 	r, err := New(Config{CommonDir: base, Backend: backend, MemorySlice: path, MemoryReserve: 40, AdmissionMaxWait: time.Second, PollInterval: 10 * time.Millisecond, Clock: clock,
 		sliceMemoryFn: func(string) (int64, int64, bool, string) {
+			// Snapshot the pressure state before notifying the test. Otherwise the
+			// test goroutine can relieve pressure between close(firstRead) and the
+			// load below, accidentally turning the first observation into an
+			// immediate admission instead of exercising the waiting state.
+			wasRelieved := relieved.Load()
 			once.Do(func() { close(firstRead) })
-			if relieved.Load() {
+			if wasRelieved {
 				return 0, 100, true, ""
 			}
 			return 90, 100, true, ""
@@ -1060,6 +1065,34 @@ func TestDaemonAdmitGrantStatesRemainByteIdentical(t *testing.T) {
 			t.Fatalf("%s result=%+v err=%v", state, result, err)
 		}
 	}
+}
+
+func TestConfineAdmitFrameCarriesScopeNameAndOwner(t *testing.T) {
+	r, _ := gateOnlyRunner(t, newInstantClock(), func(string) (int64, int64, bool, string) { return 0, 100, true, "" })
+	client, server := net.Pipe()
+	r.admitDialFn = func(context.Context, string) (net.Conn, error) { return client, nil }
+	seen := make(chan map[string]any, 1)
+	go func() {
+		defer server.Close()
+		var request runnerAdmitRequestFrame
+		if err := readRunnerAdmitFrame(server, &request); err != nil {
+			return
+		}
+		seen <- request.Request.Args
+		data, _ := json.Marshal(runnerAdmitGrant{State: "immediate", Reserve: 40, Basis: "pinned:client"})
+		_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{OK: true, Code: "OK", Data: data})
+		var one [1]byte
+		_, _ = server.Read(one[:])
+	}()
+	result, err := r.admit(context.Background(), Request{ConfineScopeID: "CONFINE-job-123-abc", ConfineName: "job", ConfineOwner: "session-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := <-seen
+	if args["scope_id"] != "CONFINE-job-123-abc" || args["name"] != "job" || args["owner"] != "session-a" {
+		t.Fatalf("admit args=%v", args)
+	}
+	result.releaseAdmission()
 }
 
 func TestDaemonAdmitFrameUsesOverrideReserve(t *testing.T) {

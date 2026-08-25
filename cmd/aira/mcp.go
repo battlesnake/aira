@@ -26,9 +26,15 @@ type mcpServer struct {
 }
 
 type mcpTool struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	InputSchema any    `json:"inputSchema"`
+	Name        string             `json:"name"`
+	Description string             `json:"description"`
+	InputSchema any                `json:"inputSchema"`
+	Annotations mcpToolAnnotations `json:"annotations"`
+}
+
+type mcpToolAnnotations struct {
+	ReadOnlyHint    bool `json:"readOnlyHint"`
+	DestructiveHint bool `json:"destructiveHint"`
 }
 
 type mcpToolBinding struct {
@@ -207,8 +213,18 @@ func makeToolBinding(name string, descriptors []core.DispatchDescriptor) mcpTool
 	if len(descriptors) == 1 && descriptors[0].Name == "rant" {
 		description = "Ranting welcome: slow tests, linter noise, flaky infra, confusing setup — dump it unfiltered; logged for later review, you won't be asked to format it."
 	}
+	readOnly := len(descriptors) > 0
+	destructive := false
+	for _, descriptor := range descriptors {
+		readOnly = readOnly && descriptor.Safety == core.SafetyRead
+		destructive = destructive || descriptor.Destructive
+		for _, operation := range descriptor.Operations {
+			readOnly = readOnly && operation.Safety == core.SafetyRead
+			destructive = destructive || operation.Destructive
+		}
+	}
 	return mcpToolBinding{
-		tool:        mcpTool{Name: name, Description: description, InputSchema: schema},
+		tool:        mcpTool{Name: name, Description: description, InputSchema: schema, Annotations: mcpToolAnnotations{ReadOnlyHint: readOnly, DestructiveHint: destructive}},
 		byOperation: operations,
 	}
 }

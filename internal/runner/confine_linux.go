@@ -314,6 +314,13 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		result.Status.Slice = attemptedSlice
 		return result, err
 	}
+	if request.Owner == "" {
+		request.Owner = ConfineUnknownOwner
+	}
+	if err := ValidateConfineIdentity(request.Owner); err != nil {
+		result.Status.Slice = attemptedSlice
+		return result, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --owner: %w", err)
+	}
 	sliceName, path := explicitSlice, ""
 	if explicitSlice == "" {
 		var resolveErr error
@@ -373,6 +380,11 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	request.ResourceSignature = signature
 	request.MemoryReserve = reserve
 	request.MemoryReservePinned = pinned
+	if request.Name == "" {
+		request.Name = "job"
+	}
+	scopeID := confineScopeID(request.Name)
+	request.ScopeID = scopeID
 	admission, err := deps.admit(ctx, path, request, reserve)
 	resolvedReserve := reserve
 	if admission.reserve > 0 {
@@ -397,7 +409,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		result.Status.Admission = ConfineAdmissionUnevaluated
 	}
 
-	scope, err := backend.Create(ctx, confineScopeID(request.Name))
+	scope, err := backend.Create(ctx, scopeID)
 	if err != nil {
 		return result, confineUnavailable(sliceName, fmt.Errorf("create scope: %w", err))
 	}
@@ -614,6 +626,9 @@ func admitConfine(ctx context.Context, path string, request ConfineRequest, rese
 		ResourceSignature:    request.ResourceSignature,
 		MemoryReservePinned:  request.MemoryReservePinned,
 		DaemonEstimateMemory: true,
+		ConfineScopeID:       request.ScopeID,
+		ConfineName:          request.Name,
+		ConfineOwner:         request.Owner,
 	})
 }
 

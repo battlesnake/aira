@@ -17,6 +17,7 @@ import (
 	"aira/internal/core"
 	"aira/internal/daemon"
 	"aira/internal/gitcontext"
+	"aira/internal/runner"
 	"aira/internal/store"
 	"golang.org/x/sys/unix"
 )
@@ -27,21 +28,24 @@ type Dispatcher interface {
 }
 
 type daemonDispatcher struct {
-	stdin            io.Reader
-	stdout           io.Writer
-	diagnostics      io.Writer
-	jsonOutput       bool
-	outputCap        int64
-	paths            daemon.Paths
-	startWait        time.Duration
-	lockWait         time.Duration
-	exchange         func(context.Context, string, daemon.RequestFrame) (daemon.ResponseFrame, error)
-	storeOpExchange  func(context.Context, string, daemon.StoreOpFrame) (daemon.ResponseFrame, error)
-	spawn            func() (<-chan childResult, error) // injectable fork fallback
-	systemctlRun     daemon.SystemctlRun
-	readFile         func(string) ([]byte, error)
-	getenv           func(string) string
-	afterRelayWiring func(storeRunner, supervisorLeaseReader bool)
+	stdin               io.Reader
+	stdout              io.Writer
+	diagnostics         io.Writer
+	jsonOutput          bool
+	outputCap           int64
+	paths               daemon.Paths
+	startWait           time.Duration
+	lockWait            time.Duration
+	exchange            func(context.Context, string, daemon.RequestFrame) (daemon.ResponseFrame, error)
+	storeOpExchange     func(context.Context, string, daemon.StoreOpFrame) (daemon.ResponseFrame, error)
+	spawn               func() (<-chan childResult, error) // injectable fork fallback
+	systemctlRun        daemon.SystemctlRun
+	readFile            func(string) ([]byte, error)
+	getenv              func(string) string
+	afterRelayWiring    func(storeRunner, supervisorLeaseReader bool)
+	resolveConfineSlice func(string) (string, string, error)
+	listConfines        func(context.Context, string, []runner.ConfineRegistryEntry) (runner.ConfineListResult, error)
+	killConfine         func(context.Context, string, string, string, bool, []runner.ConfineRegistryEntry, runner.ConfineOwnerLookup) (runner.ConfineKillResult, error)
 }
 
 type childResult struct {
@@ -122,6 +126,9 @@ func (d *daemonDispatcher) environment() func(string) string {
 func (d *daemonDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeScope, request core.Request) core.Response {
 	canonical, route := core.ClassifyRequest(request)
 	request.Verb = canonical
+	if canonical == "confine-list" || canonical == "confine-kill" {
+		return d.dispatchConfineManagement(ctx, request)
+	}
 	stampRantCaller(&request)
 	stampGitContext(scope, &request)
 	if route == core.RouteClient {
@@ -136,6 +143,61 @@ func (d *daemonDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeSc
 		return transportErrorResponse(err)
 	}
 	return response.CoreResponse()
+}
+
+func (d *daemonDispatcher) dispatchConfineManagement(ctx context.Context, request core.Request) core.Response {
+	owner, _ := request.Args["owner"].(string)
+	if err := runner.ValidateConfineIdentity(owner); err != nil {
+		return confineClientError(fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: owner: %w", err))
+	}
+	frame := daemon.RequestFrame{Proto: daemon.ProtocolVersion, Scope: daemon.WorktreeScope{}, Request: request}
+	response, err := d.doExchange(ctx, frame)
+	if err == nil {
+		return response.CoreResponse()
+	}
+	if daemon.IsRequestOutcomeUnknown(err) || !daemon.IsRequestNotSent(err) && store.ErrorCode(err) != daemon.CodeUnavailable {
+		return transportErrorResponse(err)
+	}
+	slice, _ := request.Args["slice"].(string)
+	resolve := d.resolveConfineSlice
+	if resolve == nil {
+		resolve = runner.ResolveConfineManagementSlice
+	}
+	_, path, resolveErr := resolve(slice)
+	if resolveErr != nil {
+		return confineClientError(resolveErr)
+	}
+	registry := []runner.ConfineRegistryEntry{}
+	if request.Verb == "confine-list" {
+		list := d.listConfines
+		if list == nil {
+			list = runner.ListConfines
+		}
+		result, listErr := list(ctx, path, registry)
+		if listErr != nil {
+			return confineClientError(listErr)
+		}
+		if result.Verdict == "unevaluated" {
+			return core.Response{OK: true, Code: "UNEVALUATED", Data: result, Exit: 3}
+		}
+		return core.Response{OK: true, Code: "OK", Data: result}
+	}
+	selector, _ := request.Args["selector"].(string)
+	steal, _ := request.Args["steal"].(bool)
+	kill := d.killConfine
+	if kill == nil {
+		kill = runner.KillConfine
+	}
+	result, killErr := kill(ctx, path, selector, owner, steal, registry, nil)
+	if killErr != nil {
+		return confineClientError(killErr)
+	}
+	return core.Response{OK: true, Code: "OK", Data: result}
+}
+
+func confineClientError(err error) core.Response {
+	code := store.ErrorCode(err)
+	return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
 }
 
 // TUILeaseToken snapshots the caller worktree's local bearer token without

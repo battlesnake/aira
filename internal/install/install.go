@@ -1755,5 +1755,5 @@ func first(values []string) string {
 func argumentInvalid(message string) error { return fmt.Errorf("%s: %s", CodeArgumentInvalid, message) }
 func unavailable(err error) error          { return fmt.Errorf("%s: %w", CodeUnavailable, err) }
 func overcommitError() error {
-	return fmt.Errorf("%s: capped whale.slice already exists; two independent caps can sum past physical RAM. Migrate whale-run to aira confine for the safe end-state, or re-run with --allow-overcommit to acknowledge the interim risk", CodeOvercommit)
+	return fmt.Errorf("%s: capped whale.slice already exists; two independent caps can sum past physical RAM. Migrate legacy commands to aira confine for the safe end-state, or re-run with --allow-overcommit to acknowledge the interim risk", CodeOvercommit)
 }

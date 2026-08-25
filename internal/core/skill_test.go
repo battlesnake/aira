@@ -16,8 +16,8 @@ func TestSkillMetadataNormalisesEveryIncludedAction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(artifacts.Actions) != 70 {
-		t.Fatalf("actions=%d, want 70", len(artifacts.Actions))
+	if len(artifacts.Actions) != 72 {
+		t.Fatalf("actions=%d, want 72", len(artifacts.Actions))
 	}
 	for _, action := range artifacts.Actions {
 		if action.Summary == "" || !action.Safety.Valid() || !strings.HasPrefix(action.Command, "aira ") {
@@ -51,6 +51,11 @@ func TestSkillMandatesConfineAndFramesCoordinationOptIn(t *testing.T) {
 		"project-less and needs no `.aira/config`",
 		"Coordination is opt-in per project",
 		"return `E_CONFIG_MISSING`",
+		"`aira confine --list`",
+		"`aira confine --kill <name|supervisor-pid|scope-id>`",
+		"Kill the scope, not a bash wrapper",
+		"Never `kill -9` the supervisor",
+		"`export AIRA_CONFINE_OWNER=<stable-session-id>`",
 	} {
 		if !strings.Contains(skill, want) {
 			t.Fatalf("SKILL.md missing mandate/opt-in prose: %q", want)
@@ -58,6 +63,9 @@ func TestSkillMandatesConfineAndFramesCoordinationOptIn(t *testing.T) {
 		if !strings.Contains(guide, want) {
 			t.Fatalf("guide missing mandate/opt-in prose: %q", want)
 		}
+	}
+	if strings.Contains(skill, "whale-run") || strings.Contains(guide, "whale-run") {
+		t.Fatal("retired whale-run guidance remains")
 	}
 	if !strings.Contains(skill, "allowed-tools: Bash(aira *)") {
 		t.Fatal("SKILL.md frontmatter missing allowed-tools scope")
@@ -112,6 +120,7 @@ func TestSkillSafetyGolden(t *testing.T) {
 		"insights/ls": SafetyRead, "insights/show": SafetyRead,
 		"test-report/add": SafetyMutate, "test-report/ls": SafetyRead, "test-report/show": SafetyRead, "test-report/flaky": SafetyRead,
 		"run": SafetyExecute, "run-input": SafetyExecute, "run-kill": SafetyExecute, "run-log": SafetyRead,
+		"confine-list": SafetyRead, "confine-kill": SafetyExecute,
 		"time": SafetyExecute, "commands/ls": SafetyRead, "commands/count": SafetyRead,
 		"git/clone": SafetyExecute, "git/fetch": SafetyExecute, "git/push": SafetyExecute, "git/ls-remote": SafetyExecute,
 		"find/add": SafetyMutate, "find/ls": SafetyRead, "find/show": SafetyRead, "find/set": SafetyMutate,

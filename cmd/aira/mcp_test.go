@@ -39,7 +39,7 @@ func TestMCPToolListIsGeneratedAndStable(t *testing.T) {
 	for _, tool := range result.Tools {
 		got = append(got, tool.Name)
 	}
-	want := []string{"aira_check", "aira_claim", "aira_commands", "aira_count", "aira_create", "aira_finding", "aira_gate", "aira_get", "aira_git", "aira_grep", "aira_heartbeat", "aira_id", "aira_import", "aira_init", "aira_insights", "aira_lease", "aira_link", "aira_list", "aira_quota", "aira_rant", "aira_ready", "aira_reconcile", "aira_release", "aira_requirement", "aira_review", "aira_run", "aira_run_input", "aira_run_kill", "aira_run_output", "aira_spend", "aira_test_report", "aira_time", "aira_touch", "aira_transition"}
+	want := []string{"aira_check", "aira_claim", "aira_commands", "aira_confine_kill", "aira_confine_list", "aira_count", "aira_create", "aira_finding", "aira_gate", "aira_get", "aira_git", "aira_grep", "aira_heartbeat", "aira_id", "aira_import", "aira_init", "aira_insights", "aira_lease", "aira_link", "aira_list", "aira_quota", "aira_rant", "aira_ready", "aira_reconcile", "aira_release", "aira_requirement", "aira_review", "aira_run", "aira_run_input", "aira_run_kill", "aira_run_output", "aira_spend", "aira_test_report", "aira_time", "aira_touch", "aira_transition"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("tools=%v, want=%v", got, want)
 	}
@@ -88,6 +88,25 @@ func TestMCPRunKillDeclaresStealBoolean(t *testing.T) {
 	property, ok := schema.Properties["steal"]
 	if !ok || property.Type != "boolean" {
 		t.Fatalf("run-kill steal property=%+v present=%v", property, ok)
+	}
+}
+
+func TestMCPConfineToolsAreSeparateAndSafetyAnnotated(t *testing.T) {
+	server := newMCPServer(nil)
+	list, listOK := server.byName["aira_confine_list"]
+	kill, killOK := server.byName["aira_confine_kill"]
+	if !listOK || !killOK {
+		t.Fatalf("list=%v kill=%v", listOK, killOK)
+	}
+	if !list.tool.Annotations.ReadOnlyHint || list.tool.Annotations.DestructiveHint {
+		t.Fatalf("list annotations=%+v", list.tool.Annotations)
+	}
+	if kill.tool.Annotations.ReadOnlyHint || !kill.tool.Annotations.DestructiveHint {
+		t.Fatalf("kill annotations=%+v", kill.tool.Annotations)
+	}
+	schema, ok := kill.tool.InputSchema.(mcpInputSchema)
+	if !ok || schema.Properties["steal"].Type != "boolean" || !reflect.DeepEqual(schema.Required, []string{"selector"}) {
+		t.Fatalf("kill schema=%+v", kill.tool.InputSchema)
 	}
 }
 
