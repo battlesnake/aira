@@ -95,6 +95,80 @@ func TestAdmitConcurrencyScaledHeadroomAndLifetimeCapacity(t *testing.T) {
 	}
 }
 
+// verifies: the concurrency-scaled per-supervisor headroom term changes the
+// admission DECISION (the grant count), not merely the helper formula. With an
+// amplified per-supervisor budget, the correct scaled headroom admits one FEWER
+// job than any constant/base-only headroom mis-wire would — so this is RED
+// against dropping the (outstandingJobs+1) scaling at the evaluateAdmitQueue
+// call site (which the coarser 15 GiB / 64 GiB case cannot detect).
+func TestAdmitScaledHeadroomDiscriminatesPerSupervisorTerm(t *testing.T) {
+	server := NewServer(Paths{})
+	server.stopping = make(chan struct{})
+	server.admitPollInterval = time.Hour
+	server.admitSliceHeadroomBase = 2 << 30
+	server.admitSliceHeadroomSupervisor = 2 << 30
+	server.admitReadMemory = func(string) (int64, int64, bool, string) { return 0, 64 << 30, true, "" }
+	queue := &sliceQueue{path: "/slice", server: server}
+	for index := 0; index < 6; index++ {
+		queue.waiters = append(queue.waiters, &admitWaiter{seq: int64(index + 1), reserve: 10 << 30, state: admitQueued, grantedCh: make(chan struct{})})
+	}
+	server.evaluateAdmitQueue(queue)
+	granted := 0
+	for _, waiter := range queue.waiters {
+		if waiter.state == admitGranted {
+			granted++
+		}
+	}
+	// Scaled headroom = 2G + jobs*2G admits exactly 5 (the 6th needs 10G but only
+	// the slice cap minus a 14G headroom minus 50G outstanding, =0, is free). A
+	// base-only or admitSliceHeadroom(1) constant headroom would admit all 6.
+	if granted != 5 || queue.outstanding != 50<<30 || queue.outstandingJobs != 5 {
+		t.Fatalf("granted=%d outstanding=%d jobs=%d, want scaled-headroom decision (5)", granted, queue.outstanding, queue.outstandingJobs)
+	}
+}
+
+// verifies: when the slice memory read fails, evaluateAdmitQueue does NOT grant
+// queued waiters (fail-closed). Granting them uncounted (no outstanding /
+// outstandingJobs) would abandon the Σ(reserve) ≤ cap-headroom invariant and
+// re-open the slice-cap random-victim OOM this milestone exists to prevent. The
+// waiters stay queued and are granted, accounted, once the read recovers.
+func TestAdmitReadFailureKeepsWaitersQueuedUncounted(t *testing.T) {
+	server := NewServer(Paths{})
+	server.stopping = make(chan struct{})
+	server.admitPollInterval = time.Hour
+	readable := false
+	server.admitReadMemory = func(string) (int64, int64, bool, string) {
+		if !readable {
+			return 0, 0, false, "unbounded"
+		}
+		return 0, 64 << 30, true, ""
+	}
+	queue := &sliceQueue{path: "/slice", server: server}
+	for index := 0; index < 3; index++ {
+		queue.waiters = append(queue.waiters, &admitWaiter{seq: int64(index + 1), reserve: 10 << 30, state: admitQueued, grantedCh: make(chan struct{})})
+	}
+	server.evaluateAdmitQueue(queue)
+	for _, waiter := range queue.waiters {
+		if waiter.state != admitQueued {
+			t.Fatalf("read failure granted a waiter uncounted: state=%d", waiter.state)
+		}
+	}
+	if queue.outstanding != 0 || queue.outstandingJobs != 0 {
+		t.Fatalf("read-failure accounting outstanding=%d jobs=%d, want zero", queue.outstanding, queue.outstandingJobs)
+	}
+	readable = true
+	server.evaluateAdmitQueue(queue)
+	granted := 0
+	for _, waiter := range queue.waiters {
+		if waiter.state == admitGranted {
+			granted++
+		}
+	}
+	if granted != 3 || queue.outstanding != 30<<30 || queue.outstandingJobs != 3 {
+		t.Fatalf("post-recovery granted=%d outstanding=%d jobs=%d", granted, queue.outstanding, queue.outstandingJobs)
+	}
+}
+
 func TestPinnedTooLargeRejectedBeforeQueue(t *testing.T) {
 	server := NewServer(Paths{})
 	server.stopping = make(chan struct{})

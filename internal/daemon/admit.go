@@ -135,6 +135,8 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 	}
 	readCtx, cancel := context.WithTimeout(context.Background(), admitHistoryTimeout)
 	defer cancel()
+	historyUnavailable := false
+	insufficientSamples := false
 	if request.signature != "" {
 		read := s.admitPeakHistory
 		if read == nil && s.db != nil {
@@ -142,13 +144,23 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 		}
 		if read != nil {
 			stats, err := read(readCtx, request.signature)
-			if err == nil {
+			if err != nil {
+				// The read itself could not be established (timeout / DB error).
+				// Distinguish this from genuine absence of history so the basis is
+				// honest; the reserve value still falls back safely below.
+				historyUnavailable = true
+			} else {
 				reserve := request.reserve
 				basis := "fallback:insufficient-samples"
 				ordinary := stats
 				ordinary.OOMCount = 0
 				if estimated, ok, estimatedBasis := runner.EstimateMemoryReserve(ordinary, 0); ok {
 					reserve, basis = estimated, estimatedBasis
+				}
+				if stats.TotalCount > 0 {
+					// Some observations exist but did not yield a usable estimate
+					// (fewer than three usable samples): not genuine "no history".
+					insufficientSamples = true
 				}
 				if stats.OOMCount > 0 && stats.MaxOOMPeak > 0 {
 					escalated := stats.MaxOOMPeak
@@ -182,6 +194,12 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 	}
 	if request.signature == "" {
 		return request.reserve, "fallback:no-signature"
+	}
+	if historyUnavailable {
+		return request.reserve, "fallback:history-unavailable"
+	}
+	if insufficientSamples {
+		return request.reserve, "fallback:insufficient-samples"
 	}
 	return request.reserve, "fallback:no-history"
 }
@@ -248,7 +266,10 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	}
 	_, maximum, ok, reason := readMemory(path)
 	if !ok {
-		s.writeAdmitGrant(conn, AdmitResponse{State: "unevaluated", Reason: reason, Reserve: request.reserve, Basis: "fallback:daemon-unavailable"})
+		// The daemon answered; only the slice's live usage was unreadable. Report
+		// that honestly (NOT "daemon-unavailable") so the operator-facing basis is
+		// truthful, and the client leaves the scope uncapped (state != admitted).
+		s.writeAdmitGrant(conn, AdmitResponse{State: "unevaluated", Reason: reason, Reserve: request.reserve, Basis: "fallback:slice-unreadable"})
 		return
 	}
 	jobs := s.admitOutstandingJobs(path)
@@ -413,18 +434,15 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	if readMemory == nil {
 		readMemory = readSliceMemory
 	}
-	current, maximum, ok, reason := readMemory(queue.path)
+	current, maximum, ok, _ := readMemory(queue.path)
 	if !ok {
-		for _, waiter := range queue.waiters {
-			if waiter.state != admitQueued {
-				continue
-			}
-			waiter.state = admitGranted
-			waiter.outcome = "unevaluated"
-			waiter.reason = reason
-			waiter.waitedMS = elapsedMilliseconds(waiter.enqueued, s.admitNowTime())
-			close(waiter.grantedCh)
-		}
+		// Fail CLOSED: without a slice-memory read the ceiling cannot be
+		// established, so granting queued waiters would be uncounted (no
+		// outstanding/outstandingJobs) and abandon the Σ(reserve) ≤ cap-headroom
+		// invariant — re-opening the slice-cap random-victim OOM this design
+		// prevents. Leave the waiters queued; the poll ticker re-evaluates when
+		// the read recovers, and each waiter's own maxWait deadline still fires
+		// (timeoutAdmitWaiter → E_ADMIT_SATURATED) if it never does.
 		return
 	}
 	blocked := false

@@ -175,3 +175,28 @@ samples (don't satisfy ≥3). A crashed/SIGKILLed *supervisor* leaves a gap (res
   *supervisor* leaves a history gap. The watchdog + slice cap + the headroom remain defence-in-depth
   — but with (1b) the slice cap is never *reached* by admitted confine jobs, so the innocent-victim
   kill is eliminated by construction for the confine workload.
+
+## 8b. Build-review folds + accepted residuals (2026-08-26)
+
+The adversarial build-review (15 agents, 7 confirmed) drove four folds into the build (all with
+RED-proven regression tests): (A) an `unevaluated` daemon grant is no longer applied as a hard scope
+`memory.max` sub-cap — only an *admitted* (immediate/waited, accounted) grant caps, matching §6's
+"daemon-unavailable ⇒ no sub-cap"; (B) `evaluateAdmitQueue` now fails **closed** on a slice-memory
+read failure (leaves waiters queued to retry / time-out-to-saturated) instead of mass-granting them
+uncounted, which had abandoned the Σ ≤ cap−headroom invariant for that burst; (C) the read-failure
+grant basis is relabelled `fallback:slice-unreadable` (the daemon answered), and `resolveAdmitReserve`
+now distinguishes `fallback:history-unavailable` / `fallback:insufficient-samples` / `no-history`;
+(C-test) the concurrency-scaled-headroom test gained a boundary case whose *grant count* is RED
+against a constant/base-only headroom mis-wire.
+
+Two P3s are **accepted, not fixed** (both degrade safely, never toward over-admit or a wrong-victim
+kill):
+- **NULL-peak rows count toward the last-20 retention** (`confine_peak_history.go`), so a burst of
+  capture-unknown runs can evict real samples for a signature. Accepted: the estimate then reverts to
+  the flat/p90 fallback — a *larger* reserve / fewer concurrent jobs (conservative), never over-admit;
+  it self-limits once real captures resume.
+- **An OOM whose peak is unknown (NULL) does not drive escalation** (`resolveAdmitReserve` gates on
+  `MaxOOMPeak > 0`). Accepted: a scope OOM on a ≥5.19 kernel records `memory.peak ≈ cap` (positive →
+  escalates); the no-escalation edge only bites kernels < 5.19, is fully contained (the job dies in
+  its *own* oom.group scope, never a random slice victim), and escalating from *no* observed peak
+  would fabricate an escalation target against the honesty doctrine.

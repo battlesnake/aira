@@ -614,6 +614,31 @@ func TestConfineGrantedReserveIsScopeCapAndPeakIsReported(t *testing.T) {
 	}
 }
 
+// verifies: a daemon grant whose admission could not be evaluated (state
+// "unevaluated" — the daemon answered but the slice's live usage was unreadable)
+// carries only the flat fallback reserve and was never accounted, so it must NOT
+// become a hard scope memory.max sub-cap. Sub-capping it at the flat 4 GiB would
+// false-fail a heavy job although admission was never actually evaluated (design
+// §6: that basis ⇒ no sub-cap). Only an immediate/waited (accounted) grant caps.
+func TestConfineUnevaluatedDaemonGrantIsNotSubCapped(t *testing.T) {
+	scope := &confineFakeScope{}
+	closer := &confineCountingCloser{}
+	deps := confineUnitDeps(scope)
+	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
+		return admissionResult{state: "unevaluated", reserve: 4 << 30, basis: "fallback:slice-unreadable", release: closer}, nil
+	}
+	deps.writeScopeMemoryCap = func(Scope, int64, int64, bool) error {
+		t.Fatalf("unevaluated daemon grant must not write a scope memory cap")
+		return nil
+	}
+	deps.readUsage = func(string) cgroupUsage { return cgroupUsage{} }
+	deps.reportPeak = func(context.Context, ConfineRequest, string, *int64, bool) error { return nil }
+	result, err := confineWithDeps(context.Background(), ConfineRequest{Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard}, deps)
+	if err != nil || result.Status.ScopeMemoryMax != 0 {
+		t.Fatalf("result=%+v err=%v, want no sub-cap for an unevaluated grant", result, err)
+	}
+}
+
 func TestConfineZeroPeakIsReportedAsUnknown(t *testing.T) {
 	scope := &confineFakeScope{}
 	deps := confineUnitDeps(scope)

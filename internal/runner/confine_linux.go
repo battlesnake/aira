@@ -436,7 +436,14 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	}
 	result.Status.OOMGroup = ConfineOOMGroupSet
 	scopeMemoryMax := request.ScopeMemoryMax
-	if scopeMemoryMax <= 0 && admission.lock == nil && admission.release != nil && admission.reserve > 0 {
+	// Only an ADMITTED (accounted) daemon grant carries an estimate-sized reserve
+	// that both bounds Σ(reserve) ≤ cap-headroom AND may be enforced as the scope
+	// memory.max. An "unevaluated" daemon grant (the daemon answered but could not
+	// read the slice's live usage) was never accounted and carries only the flat
+	// fallback reserve — enforcing it as a hard sub-cap would false-fail a heavy
+	// job although admission was never evaluated (design §6: no sub-cap here).
+	admitted := admission.state == "immediate" || admission.state == "waited"
+	if scopeMemoryMax <= 0 && admitted && admission.lock == nil && admission.release != nil && admission.reserve > 0 {
 		scopeMemoryMax = admission.reserve
 	}
 	if scopeMemoryMax > 0 {
