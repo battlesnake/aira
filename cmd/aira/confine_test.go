@@ -64,6 +64,34 @@ func TestConfineMemoryFlagsThreadIntoRequest(t *testing.T) {
 	}
 }
 
+func TestConfinePinnedReserveFlagEnvironmentAndMemoryMaxPrecedence(t *testing.T) {
+	original := runConfined
+	t.Cleanup(func() { runConfined = original })
+	for _, test := range []struct {
+		name string
+		env  string
+		argv []string
+		want int64
+	}{
+		{name: "flag", env: "8M", argv: []string{"confine", "--memory-reserve", "12M", "--", "true"}, want: 12 << 20},
+		{name: "environment", env: "8M", argv: []string{"confine", "--", "true"}, want: 8 << 20},
+		{name: "memory-max", env: "8M", argv: []string{"confine", "--memory-reserve", "12M", "--memory-max", "16M", "--", "true"}, want: 16 << 20},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("AIRA_CONFINE_RESERVE", test.env)
+			runConfined = func(_ context.Context, request runner.ConfineRequest) (runner.ConfineResult, error) {
+				if !request.MemoryReservePinned || request.MemoryReserve != test.want {
+					t.Fatalf("request=%+v", request)
+				}
+				return runner.ConfineResult{}, nil
+			}
+			if exit := runWithInput(test.argv, io.Discard, io.Discard, strings.NewReader("")); exit != 0 {
+				t.Fatalf("exit=%d", exit)
+			}
+		})
+	}
+}
+
 // verifies: task-57 confine rejects invalid cap relationships before launch.
 func TestConfineMemoryFlagValidation(t *testing.T) {
 	for _, argv := range [][]string{
@@ -73,6 +101,8 @@ func TestConfineMemoryFlagValidation(t *testing.T) {
 		{"--memory-max", "1023K", "--", "true"},
 		{"--memory-max", "2M", "--memory-high", "3M", "--", "true"},
 		{"--memory-max", "garbage", "--", "true"},
+		{"--memory-reserve", "garbage", "--", "true"},
+		{"--memory-reserve", "1023K", "--", "true"},
 	} {
 		if _, _, err := parseArgs("confine", argv); err == nil || !strings.HasPrefix(err.Error(), "E_CONFINE_ARGUMENT_INVALID:") {
 			t.Fatalf("parseArgs(%q) err=%v", argv, err)
@@ -120,7 +150,7 @@ func TestConfineDescriptorIsClientExecuteWithoutMCP(t *testing.T) {
 			continue
 		}
 		found = true
-		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--memory-max S] [--memory-high S] -- <argv...>" {
+		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--memory-reserve S] [--memory-max S] [--memory-high S] -- <argv...>" {
 			t.Fatalf("descriptor=%+v", descriptor)
 		}
 	}

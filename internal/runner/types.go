@@ -178,6 +178,8 @@ type Request struct {
 	ResourceSignature     string    `json:"resource_signature,omitempty"`
 	MemoryReserveOverride *int64    `json:"memory_reserve_override,omitempty"`
 	MemoryReserveBasis    string    `json:"memory_reserve_basis,omitempty"`
+	MemoryReservePinned   bool      `json:"memory_reserve_pinned,omitempty"`
+	DaemonEstimateMemory  bool      `json:"daemon_estimate_memory,omitempty"`
 	ScopeMemoryMax        int64     `json:"scope_memory_max,omitempty"`
 	ScopeMemoryHigh       int64     `json:"scope_memory_high,omitempty"`
 	// TelemetryPending is an opaque initial envelope supplied by Core. Runner
@@ -195,6 +197,7 @@ type PeakRSSStats struct {
 	SampleCount int
 	PeakMax     int64
 	OOMCount    int
+	MaxOOMPeak  int64
 }
 
 type PeakRSSHistorian interface {

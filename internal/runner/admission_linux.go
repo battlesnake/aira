@@ -35,6 +35,8 @@ type admissionResult struct {
 	waitedMS int64
 	lock     *admitLock
 	release  io.Closer
+	reserve  int64
+	basis    string
 }
 
 var errDetachKillIntent = errors.New("detached run has a pending kill intent")
@@ -72,7 +74,7 @@ func (result admissionResult) releaseAdmission() {
 }
 
 const (
-	runnerDaemonProtocolVersion = 3
+	runnerDaemonProtocolVersion = 5
 	runnerDaemonMaxFrameBytes   = 16 << 20
 	admitTransportGrace         = time.Second
 	runnerAdmitWaitCap          = 30 * time.Minute
@@ -99,6 +101,14 @@ type runnerAdmitGrant struct {
 	State    string `json:"state"`
 	Reason   string `json:"reason,omitempty"`
 	WaitedMS int64  `json:"waited_ms"`
+	Reserve  int64  `json:"reserve"`
+	Basis    string `json:"basis"`
+}
+
+type runnerAdmitRejection struct {
+	Required int64  `json:"required,omitempty"`
+	Ceiling  int64  `json:"cap_minus_headroom,omitempty"`
+	Basis    string `json:"basis"`
 }
 
 func (r *Runner) admit(ctx context.Context, req Request) (admissionResult, error) {
@@ -116,25 +126,28 @@ func (r *Runner) admit(ctx context.Context, req Request) (admissionResult, error
 	if result, granted, err := r.admitThroughDaemon(ctx, req, effectiveReserve); granted || err != nil {
 		return result, err
 	}
+	daemonWaited := false
+	if r.admitDialFn != nil || strings.TrimSpace(r.admitSocketPath) != "" {
+		daemonWaited = r.clock.Now().Sub(start) >= time.Millisecond
+	}
 	path, ok, reason := resolveSlicePath(r.memorySlice)
 	if !ok {
 		r.warnAdmission("unevaluated", reason)
 		return admissionResult{state: "unevaluated", reason: reason}, nil
 	}
-	return r.admitWithFlock(ctx, req, path, start, effectiveReserve)
+	return r.admitWithFlock(ctx, req, path, start, effectiveReserve, daemonWaited)
 }
 
 // admitWithFlock is the retained #29 self-gating implementation. Every daemon
 // failure closes its socket before entering this one fallback path.
-func (r *Runner) admitWithFlock(ctx context.Context, req Request, path string, start time.Time, effectiveReserve int64) (admissionResult, error) {
+func (r *Runner) admitWithFlock(ctx context.Context, req Request, path string, start time.Time, effectiveReserve int64, waited bool) (admissionResult, error) {
 	// Time already spent waiting on a responsive-but-incomplete daemon outcome
 	// belongs to this admission attempt. Ignore sub-millisecond dial failures so
 	// an immediately acquired fallback lock remains "immediate".
-	waited := r.clock.Now().Sub(start) >= time.Millisecond
 	lastNote := start.Add(-time.Hour)
 	iteration := uint64(0)
 	finish := func(state, reason string, lock *admitLock) admissionResult {
-		result := admissionResult{state: state, reason: reason, lock: lock}
+		result := admissionResult{state: state, reason: reason, lock: lock, reserve: effectiveReserve, basis: "fallback:daemon-unavailable"}
 		if lock != nil {
 			result.release = lock
 		}
@@ -323,6 +336,8 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 	frame.Request.Args = map[string]any{
 		"slice": r.memorySlice, "reserve": effectiveReserve,
 		"max_wait_ms": maxWait.Milliseconds(),
+		"signature":   req.ResourceSignature,
+		"pinned":      !req.DaemonEstimateMemory || req.MemoryReservePinned,
 	}
 	if err := writeRunnerAdmitFrame(conn, frame); err != nil {
 		return fail()
@@ -332,6 +347,25 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 		return fail()
 	}
 	if !response.OK || response.Code != "OK" {
+		if response.Code == "E_ADMIT_TOO_LARGE" || response.Code == "E_ADMIT_SATURATED" {
+			var rejection runnerAdmitRejection
+			if err := json.Unmarshal(response.Data, &rejection); err == nil && validRunnerAdmitRejection(response.Code, rejection) {
+				_ = conn.Close()
+				message := response.Error
+				if message == "" {
+					message = response.Code + ": " + rejection.Basis
+				}
+				resolved := rejection.Required
+				if resolved <= 0 {
+					resolved = effectiveReserve
+				}
+				basis := "reject:saturated"
+				if response.Code == "E_ADMIT_TOO_LARGE" {
+					basis = "reject:too-large"
+				}
+				return admissionResult{state: strings.TrimPrefix(strings.ToLower(response.Code), "e_admit_"), reserve: resolved, basis: basis}, true, errors.New(message)
+			}
+		}
 		return fail()
 	}
 	var grant runnerAdmitGrant
@@ -360,7 +394,7 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 	}
 	// A full, validated frame is the sole winning outcome even when its final
 	// byte races the transport deadline. The flock fallback is never entered.
-	return admissionResult{state: grant.State, reason: grant.Reason, waitedMS: grant.WaitedMS, release: conn}, true, nil
+	return admissionResult{state: grant.State, reason: grant.Reason, waitedMS: grant.WaitedMS, release: conn, reserve: grant.Reserve, basis: grant.Basis}, true, nil
 }
 
 const mathMaxInt64 = int64(^uint64(0) >> 1)
@@ -380,12 +414,23 @@ func (r *Runner) checkDetachAdmission(req Request) error {
 }
 
 func validRunnerAdmitGrant(grant runnerAdmitGrant) bool {
-	if grant.WaitedMS < 0 {
+	if grant.WaitedMS < 0 || grant.Reserve <= 0 || strings.TrimSpace(grant.Basis) == "" {
 		return false
 	}
 	switch grant.State {
-	case "immediate", "waited", "timeout", "unevaluated":
+	case "immediate", "waited", "unevaluated":
 		return true
+	default:
+		return false
+	}
+}
+
+func validRunnerAdmitRejection(code string, rejection runnerAdmitRejection) bool {
+	switch code {
+	case "E_ADMIT_TOO_LARGE":
+		return rejection.Required > 0 && rejection.Ceiling >= 0 && strings.TrimSpace(rejection.Basis) != ""
+	case "E_ADMIT_SATURATED":
+		return rejection.Basis == "reject:saturated"
 	default:
 		return false
 	}
@@ -417,6 +462,41 @@ func writeRunnerAdmitBytes(w io.Writer, data []byte) error {
 			return io.ErrShortWrite
 		}
 		data = data[n:]
+	}
+	return nil
+}
+
+func reportConfinePeak(ctx context.Context, request ConfineRequest, signature string, peak *int64, oom bool) error {
+	if strings.TrimSpace(request.AdmitSocketPath) == "" || signature == "" {
+		return errors.New("daemon report unavailable")
+	}
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "unix", request.AdmitSocketPath)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	frame := runnerAdmitRequestFrame{Proto: runnerDaemonProtocolVersion, Scope: map[string]any{}}
+	frame.Request.Verb = "confine-report"
+	frame.Request.Args = map[string]any{"signature": signature, "oom": oom}
+	if peak != nil && *peak > 0 {
+		frame.Request.Args["peak_rss"] = *peak
+	}
+	if err := writeRunnerAdmitFrame(conn, frame); err != nil {
+		return err
+	}
+	var response runnerAdmitResponseFrame
+	if err := readRunnerAdmitFrame(conn, &response); err != nil {
+		return err
+	}
+	if !response.OK || response.Code != "OK" {
+		if response.Error != "" {
+			return errors.New(response.Error)
+		}
+		return errors.New("daemon rejected confine report")
 	}
 	return nil
 }

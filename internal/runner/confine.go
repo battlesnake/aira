@@ -71,25 +71,29 @@ type ConfineStatus struct {
 	ScopeMemoryHigh      int64
 	ScopeMemoryBinding   string
 	ScopeMemoryEffective int64
+	ReserveBasis         string
+	PeakRSS              *int64
 }
 
 type ConfineRequest struct {
-	Slice            string
-	Name             string
-	Argv             []string
-	Env              []string
-	RuntimeDir       string
-	AdmitSocketPath  string
-	MemoryReserve    int64
-	ScopeMemoryMax   int64
-	ScopeMemoryHigh  int64
-	AdmissionMaxWait time.Duration
-	PollInterval     time.Duration
-	HandshakeTimeout time.Duration
-	Stdin            io.Reader
-	Stdout           io.Writer
-	Stderr           io.Writer
-	SelfPath         string
+	Slice               string
+	Name                string
+	Argv                []string
+	Env                 []string
+	RuntimeDir          string
+	AdmitSocketPath     string
+	MemoryReserve       int64
+	MemoryReservePinned bool
+	ScopeMemoryMax      int64
+	ScopeMemoryHigh     int64
+	AdmissionMaxWait    time.Duration
+	PollInterval        time.Duration
+	HandshakeTimeout    time.Duration
+	Stdin               io.Reader
+	Stdout              io.Writer
+	Stderr              io.Writer
+	SelfPath            string
+	ResourceSignature   string
 }
 
 type ConfineResult struct {
@@ -147,6 +151,9 @@ func FormatConfineStatus(status ConfineStatus) string {
 	}
 	if status.ReserveBytes > 0 {
 		line += " reserve=" + formatConfineBytes(status.ReserveBytes)
+		if status.ReserveBasis != "" {
+			line += " reserve-basis=" + status.ReserveBasis
+		}
 	}
 	admissionFacet := status.AdmissionState
 	if admissionFacet == "" {

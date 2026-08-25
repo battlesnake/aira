@@ -1025,7 +1025,7 @@ func TestDaemonAdmitReadFullFraming(t *testing.T) {
 }
 
 func TestDaemonAdmitGrantStatesRemainByteIdentical(t *testing.T) {
-	for _, state := range []string{"immediate", "waited", "timeout", "unevaluated"} {
+	for _, state := range []string{"immediate", "waited", "unevaluated"} {
 		t.Run(state, func(t *testing.T) {
 			clock := newInstantClock()
 			runner, _ := gateOnlyRunner(t, clock, func(string) (int64, int64, bool, string) { return 0, 100, true, "" })
@@ -1037,7 +1037,7 @@ func TestDaemonAdmitGrantStatesRemainByteIdentical(t *testing.T) {
 				if readRunnerAdmitFrame(server, &request) != nil {
 					return
 				}
-				data, _ := json.Marshal(runnerAdmitGrant{State: state, Reason: "reason", WaitedMS: 7})
+				data, _ := json.Marshal(runnerAdmitGrant{State: state, Reason: "reason", WaitedMS: 7, Reserve: 40, Basis: "pinned:client"})
 				_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{OK: true, Code: "OK", Data: data})
 				var one [1]byte
 				_, _ = server.Read(one[:])
@@ -1087,7 +1087,7 @@ func TestDaemonAdmitFrameUsesOverrideReserve(t *testing.T) {
 				}
 				reserve, _ := request.Request.Args["reserve"].(float64)
 				reserveCh <- int64(reserve)
-				data, _ := json.Marshal(runnerAdmitGrant{State: "immediate"})
+				data, _ := json.Marshal(runnerAdmitGrant{State: "immediate", Reserve: test.want, Basis: "pinned:client"})
 				_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{OK: true, Code: "OK", Data: data})
 				var one [1]byte
 				_, _ = server.Read(one[:])
@@ -1179,7 +1179,7 @@ func equalInt64Pointer(left, right *int64) bool {
 }
 
 func TestDaemonAdmitStatesAreByteIdenticalOnRunRecord(t *testing.T) {
-	for _, state := range []string{"immediate", "waited", "timeout", "unevaluated"} {
+	for _, state := range []string{"immediate", "waited", "unevaluated"} {
 		t.Run(state, func(t *testing.T) {
 			path := currentSliceForTest(t)
 			runner, err := New(Config{
@@ -1199,7 +1199,7 @@ func TestDaemonAdmitStatesAreByteIdenticalOnRunRecord(t *testing.T) {
 				if readRunnerAdmitFrame(server, &request) != nil {
 					return
 				}
-				data, _ := json.Marshal(runnerAdmitGrant{State: state, Reason: "wire-reason", WaitedMS: 11})
+				data, _ := json.Marshal(runnerAdmitGrant{State: state, Reason: "wire-reason", WaitedMS: 11, Reserve: 40, Basis: "pinned:client"})
 				_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{OK: true, Code: "OK", Data: data})
 				var one [1]byte
 				_, _ = server.Read(one[:])
@@ -1276,7 +1276,7 @@ func TestDaemonAdmitPartialFrameFallsToFlock(t *testing.T) {
 			return
 		}
 		var complete bytes.Buffer
-		data, _ := json.Marshal(runnerAdmitGrant{State: "immediate"})
+		data, _ := json.Marshal(runnerAdmitGrant{State: "immediate", Reserve: 40, Basis: "pinned:client"})
 		_ = writeRunnerAdmitFrame(&complete, runnerAdmitResponseFrame{OK: true, Code: "OK", Data: data})
 		partial := complete.Bytes()[:len(complete.Bytes())-1]
 		_, _ = server.Write(partial)
@@ -1292,7 +1292,7 @@ func TestDaemonAdmitPartialFrameFallsToFlock(t *testing.T) {
 }
 
 func TestDaemonAdmitFullFrameAtDeadlineWinsWithoutFlock(t *testing.T) {
-	data, err := json.Marshal(runnerAdmitGrant{State: "waited", WaitedMS: 9})
+	data, err := json.Marshal(runnerAdmitGrant{State: "waited", WaitedMS: 9, Reserve: 40, Basis: "pinned:client"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1351,6 +1351,23 @@ func TestDaemonAdmitDialFailureAndBusyFallToFlock(t *testing.T) {
 				}()
 				return client, nil
 			}},
+		{name: "old daemon protocol",
+			dial: func(context.Context, string) (net.Conn, error) {
+				client, server := net.Pipe()
+				go func() {
+					defer server.Close()
+					var request runnerAdmitRequestFrame
+					_ = readRunnerAdmitFrame(server, &request)
+					if _, ok := request.Request.Args["signature"]; !ok {
+						t.Error("new client did not send signature to old daemon")
+					}
+					if _, ok := request.Request.Args["pinned"]; !ok {
+						t.Error("new client did not send pinned marker to old daemon")
+					}
+					_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{Code: "E_DAEMON_PROTOCOL", Error: "unexpected admit field"})
+				}()
+				return client, nil
+			}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			path := currentSliceForTest(t)
@@ -1362,10 +1379,41 @@ func TestDaemonAdmitDialFailureAndBusyFallToFlock(t *testing.T) {
 			var attempts atomic.Int64
 			runner.lockAttemptFn = func(string) (*admitLock, error) { attempts.Add(1); return &admitLock{}, nil }
 			result, err := runner.admit(context.Background(), Request{})
-			if err != nil || result.lock == nil || attempts.Load() != 1 {
+			if err != nil || result.lock == nil || attempts.Load() != 1 || result.basis != "fallback:daemon-unavailable" {
 				t.Fatalf("%s result=%+v attempts=%d err=%v (want flock fallback)", test.name, result, attempts.Load(), err)
 			}
 			result.releaseAdmission()
 		})
+	}
+}
+
+func TestRunSaturatedAdmissionIsTerminalBeforeScopeOrLedger(t *testing.T) {
+	path := currentSliceForTest(t)
+	backend := &countingBackend{scope: &memoryScope{}}
+	r, err := New(Config{
+		CommonDir: t.TempDir(), Backend: backend, MemorySlice: path, MemoryReserve: 40,
+		AdmissionMaxWait: time.Second, PollInterval: time.Millisecond, Clock: newInstantClock(),
+		sliceMemoryFn: func(string) (int64, int64, bool, string) { return 0, 100, true, "" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, server := net.Pipe()
+	r.admitDialFn = func(context.Context, string) (net.Conn, error) { return client, nil }
+	go func() {
+		defer server.Close()
+		var request runnerAdmitRequestFrame
+		_ = readRunnerAdmitFrame(server, &request)
+		data, _ := json.Marshal(runnerAdmitRejection{Basis: "reject:saturated"})
+		_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{Code: "E_ADMIT_SATURATED", Error: "E_ADMIT_SATURATED: capacity remained full", Data: data})
+	}()
+	if record, err := r.Launch(context.Background(), Request{Argv: []string{"must-not-run"}}); err == nil || !strings.Contains(err.Error(), "E_ADMIT_SATURATED") || record != nil {
+		t.Errorf("record=%+v err=%v", record, err)
+	}
+	if backend.creates.Load() != 0 {
+		t.Fatalf("terminal run rejection created %d scopes", backend.creates.Load())
+	}
+	if events, err := r.ledger.read(); err != nil || len(events) != 0 {
+		t.Fatalf("terminal run rejection events=%d err=%v", len(events), err)
 	}
 }

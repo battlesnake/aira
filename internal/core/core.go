@@ -1664,10 +1664,11 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return result, err
 		}},
-		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--memory-max S] [--memory-high S] -- <argv...>", Args: []ArgSpec{
+		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--memory-reserve S] [--memory-max S] [--memory-high S] -- <argv...>", Args: []ArgSpec{
 			listSpec("argv", true, true, "Exact target argv after the launch delimiter"),
 			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
 			stringSpec("name", false, false, "Scope name component"),
+			stringSpec("memory_reserve", false, false, "Pinned admission reserve ([KMG] binary suffix)"),
 			stringSpec("memory_max", false, false, "Scope memory.max ([KMG] binary suffix)"),
 			stringSpec("memory_high", false, false, "Scope memory.high reclaim pressure ([KMG] binary suffix)"),
 		}, Run: func(ctx context.Context, args *argAccessor) (any, error) {
@@ -1675,6 +1676,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringSlice(args, "argv")
 			_ = stringArg(args, "slice")
 			_ = stringArg(args, "name")
+			_ = stringArg(args, "memory_reserve")
 			_ = stringArg(args, "memory_max")
 			_ = stringArg(args, "memory_high")
 			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine is a direct CLI-only foreground verb")

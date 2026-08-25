@@ -30,6 +30,8 @@ const (
 	CodeProtocol       = "E_DAEMON_PROTOCOL"
 	CodeInternal       = "E_DAEMON_INTERNAL"
 	CodeBusy           = "E_DAEMON_BUSY"
+	CodeAdmitTooLarge  = "E_ADMIT_TOO_LARGE"
+	CodeAdmitSaturated = "E_ADMIT_SATURATED"
 )
 
 // WorktreeScope is the serialisable, client-discovered projection needed to

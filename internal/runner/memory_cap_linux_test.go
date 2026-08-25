@@ -276,7 +276,7 @@ func TestRealConfineScopeMemoryCapAncestorLimitedReporting(t *testing.T) {
 	requestMax := ancestor + 16<<20
 	result, err := Confine(context.Background(), ConfineRequest{
 		Slice: parent, Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard,
-		MemoryReserve: 1 << 20, ScopeMemoryMax: requestMax,
+		MemoryReserve: 1 << 20, ScopeMemoryMax: requestMax, AdmissionMaxWait: 10 * time.Millisecond,
 	})
 	if err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "ancestor-limited confine: %v", err)

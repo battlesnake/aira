@@ -16,14 +16,19 @@ import (
 	"time"
 
 	"aira/internal/core"
+	"aira/internal/runner"
 )
 
 const (
-	admitWaitCapMs    int64 = 30 * 60 * 1000
-	admitMaxWaiters         = 256
-	admitGlobalMax          = 1024
-	admitMaxReserve   int64 = 1 << 50
-	admitWriteTimeout       = 5 * time.Second
+	admitWaitCapMs                      int64 = 30 * 60 * 1000
+	admitMaxWaiters                           = 256
+	admitGlobalMax                            = 1024
+	admitMaxReserve                     int64 = 1 << 50
+	admitWriteTimeout                         = 5 * time.Second
+	admitHistoryTimeout                       = 250 * time.Millisecond
+	admitPriorRefresh                         = time.Minute
+	admitSliceHeadroomBaseDefault       int64 = 2 << 30
+	admitSliceHeadroomSupervisorDefault int64 = 64 << 20
 )
 
 type admitWaiterState uint8
@@ -32,6 +37,7 @@ const (
 	admitQueued admitWaiterState = iota
 	admitGranted
 	admitReleased
+	admitRejected
 )
 
 type admitWaiter struct {
@@ -45,19 +51,21 @@ type admitWaiter struct {
 	outcome   string
 	reason    string
 	waitedMS  int64
+	basis     string
 }
 
 type sliceQueue struct {
-	mu          sync.Mutex
-	path        string
-	waiters     []*admitWaiter
-	outstanding int64
-	seq         int64
-	kick        chan struct{}
-	stop        chan struct{}
-	stopOnce    sync.Once
-	poll        time.Duration
-	server      *Server
+	mu              sync.Mutex
+	path            string
+	waiters         []*admitWaiter
+	outstanding     int64
+	outstandingJobs int
+	seq             int64
+	kick            chan struct{}
+	stop            chan struct{}
+	stopOnce        sync.Once
+	poll            time.Duration
+	server          *Server
 }
 
 // AdmitResponse is the one grant payload sent before the daemon holds the
@@ -66,6 +74,142 @@ type AdmitResponse struct {
 	State    string `json:"state"`
 	Reason   string `json:"reason,omitempty"`
 	WaitedMS int64  `json:"waited_ms"`
+	Reserve  int64  `json:"reserve"`
+	Basis    string `json:"basis"`
+}
+
+type admitRequest struct {
+	slice     string
+	reserve   int64
+	maxWait   int64
+	signature string
+	pinned    bool
+}
+
+type admitRejection struct {
+	Required int64  `json:"required,omitempty"`
+	Ceiling  int64  `json:"cap_minus_headroom"`
+	Basis    string `json:"basis"`
+}
+
+func subtractFloor(value, subtract int64) int64 {
+	if value <= 0 || subtract < 0 || subtract >= value {
+		return 0
+	}
+	return value - subtract
+}
+
+func (s *Server) admitSliceHeadroom(jobs int) int64 {
+	if jobs < 0 {
+		jobs = 0
+	}
+	base := s.admitSliceHeadroomBase
+	perJob := s.admitSliceHeadroomSupervisor
+	if base < 0 || perJob < 0 || jobs > 0 && perJob > (math.MaxInt64-base)/int64(jobs) {
+		return math.MaxInt64
+	}
+	return base + int64(jobs)*perJob
+}
+
+func (s *Server) admitOutstandingJobs(path string) int {
+	s.admitRegistryMu.Lock()
+	queue := s.admitQueues[path]
+	if queue == nil {
+		s.admitRegistryMu.Unlock()
+		return 0
+	}
+	queue.mu.Lock()
+	jobs := queue.outstandingJobs
+	queue.mu.Unlock()
+	s.admitRegistryMu.Unlock()
+	return jobs
+}
+
+func (s *Server) admitCeiling(path string, maximum int64) int64 {
+	return subtractFloor(maximum, s.admitSliceHeadroom(s.admitOutstandingJobs(path)+1))
+}
+
+func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64, string) {
+	if request.pinned {
+		return request.reserve, "pinned:client"
+	}
+	readCtx, cancel := context.WithTimeout(context.Background(), admitHistoryTimeout)
+	defer cancel()
+	if request.signature != "" {
+		read := s.admitPeakHistory
+		if read == nil && s.db != nil {
+			read = s.db.ConfinePeakHistory
+		}
+		if read != nil {
+			stats, err := read(readCtx, request.signature)
+			if err == nil {
+				reserve := request.reserve
+				basis := "fallback:insufficient-samples"
+				ordinary := stats
+				ordinary.OOMCount = 0
+				if estimated, ok, estimatedBasis := runner.EstimateMemoryReserve(ordinary, 0); ok {
+					reserve, basis = estimated, estimatedBasis
+				}
+				if stats.OOMCount > 0 && stats.MaxOOMPeak > 0 {
+					escalated := stats.MaxOOMPeak
+					if escalated > math.MaxInt64-escalated/2 {
+						escalated = math.MaxInt64
+					} else {
+						escalated += escalated / 2
+					}
+					if escalated > reserve {
+						reserve = escalated
+					}
+					// An OOM observed at the present ceiling is genuinely too
+					// large. Earlier censored caps are allowed to climb to the
+					// ceiling so a runnable job is never permanently wedged.
+					if stats.MaxOOMPeak < ceiling && reserve > ceiling {
+						reserve = ceiling
+					}
+					return reserve, "estimate:oom-escalated"
+				}
+				if stats.SampleCount >= 3 && reserve > 0 {
+					return reserve, basis
+				}
+			}
+		}
+	}
+	if peak, ok := s.cachedAdmitPeakP90(readCtx); ok {
+		stats := runner.PeakRSSStats{TotalCount: 3, SampleCount: 3, PeakMax: peak}
+		if reserve, usable, _ := runner.EstimateMemoryReserve(stats, 0); usable {
+			return reserve, "estimate:p90-prior"
+		}
+	}
+	if request.signature == "" {
+		return request.reserve, "fallback:no-signature"
+	}
+	return request.reserve, "fallback:no-history"
+}
+
+func (s *Server) cachedAdmitPeakP90(ctx context.Context) (int64, bool) {
+	now := s.admitNowTime()
+	s.admitPriorMu.Lock()
+	if !s.admitPriorAt.IsZero() && now.Sub(s.admitPriorAt) < admitPriorRefresh {
+		peak, ok := s.admitPriorPeak, s.admitPriorOK
+		s.admitPriorMu.Unlock()
+		return peak, ok
+	}
+	s.admitPriorMu.Unlock()
+	read := s.admitPeakP90
+	if read == nil && s.db != nil {
+		read = s.db.ConfinePeakP90
+	}
+	if read == nil {
+		return 0, false
+	}
+	peak, ok, err := read(ctx)
+	if err != nil {
+		return 0, false
+	}
+	s.admitPriorMu.Lock()
+	s.admitPriorPeak, s.admitPriorOK, s.admitPriorAt = peak, ok, now
+	s.admitPriorMu.Unlock()
+	return peak, ok
 }
 
 func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
@@ -84,7 +228,7 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		return
 	}
 
-	slice, reserve, maxWait, err := validateAdmitArgs(args)
+	request, err := validateAdmitArgs(args)
 	if err != nil {
 		s.writeAdmitError(conn, CodeProtocol, err.Error())
 		return
@@ -93,7 +237,7 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	if resolve == nil {
 		resolve = resolveAdmitSlicePath
 	}
-	path, ok, reason := resolve(slice)
+	path, ok, reason := resolve(request.slice)
 	if !ok {
 		s.writeAdmitGrant(conn, AdmitResponse{State: "unevaluated", Reason: reason})
 		return
@@ -102,14 +246,26 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	if readMemory == nil {
 		readMemory = readSliceMemory
 	}
-	if _, _, ok, reason = readMemory(path); !ok {
-		s.writeAdmitGrant(conn, AdmitResponse{State: "unevaluated", Reason: reason})
+	_, maximum, ok, reason := readMemory(path)
+	if !ok {
+		s.writeAdmitGrant(conn, AdmitResponse{State: "unevaluated", Reason: reason, Reserve: request.reserve, Basis: "fallback:daemon-unavailable"})
 		return
 	}
-
-	queue, waiter, code, enqueueErr := s.enqueueAdmit(path, reserve)
+	jobs := s.admitOutstandingJobs(path)
+	headroom := s.admitSliceHeadroom(jobs + 1)
+	ceiling := subtractFloor(maximum, headroom)
+	reserve, basis := s.resolveAdmitReserve(request, ceiling)
+	if reserve > ceiling {
+		s.writeAdmitRejection(conn, CodeAdmitTooLarge, admitRejection{Required: reserve, Ceiling: ceiling, Basis: basis})
+		return
+	}
+	queue, waiter, code, enqueueErr := s.enqueueResolvedAdmit(path, reserve, basis, maximum)
 	if enqueueErr != nil {
-		s.writeAdmitError(conn, code, enqueueErr.Error())
+		if code == CodeAdmitTooLarge {
+			s.writeAdmitRejection(conn, code, admitRejection{Required: reserve, Ceiling: s.admitCeiling(path, maximum), Basis: basis})
+		} else {
+			s.writeAdmitError(conn, code, enqueueErr.Error())
+		}
 		return
 	}
 	peerCtx, cancelPeer := context.WithCancel(context.Background())
@@ -130,7 +286,7 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	}
 	defer release()
 
-	remaining := time.Duration(maxWait)*time.Millisecond - s.admitNowTime().Sub(waiter.enqueued)
+	remaining := time.Duration(request.maxWait)*time.Millisecond - s.admitNowTime().Sub(waiter.enqueued)
 	if remaining < 0 {
 		remaining = 0
 	}
@@ -154,11 +310,16 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	}
 
 	queue.mu.Lock()
+	if waiter.state == admitRejected {
+		queue.mu.Unlock()
+		s.writeAdmitRejection(conn, CodeAdmitSaturated, admitRejection{Basis: "reject:saturated"})
+		return
+	}
 	if waiter.state != admitGranted {
 		queue.mu.Unlock()
 		return
 	}
-	grant := AdmitResponse{State: waiter.outcome, Reason: waiter.reason, WaitedMS: waiter.waitedMS}
+	grant := AdmitResponse{State: waiter.outcome, Reason: waiter.reason, WaitedMS: waiter.waitedMS, Reserve: waiter.reserve, Basis: waiter.basis}
 	queue.mu.Unlock()
 
 	if s.admitBeforeWrite != nil {
@@ -174,7 +335,7 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	}
 
 	// A successfully delivered grant remains reserved until the client closes
-	// immediately after Start, or shutdown cancels this held connection.
+	// its lease (confine does so after scope teardown), or shutdown cancels it.
 	select {
 	case <-peerCtx.Done():
 	case <-s.stopping:
@@ -182,6 +343,14 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 }
 
 func (s *Server) enqueueAdmit(path string, reserve int64) (*sliceQueue, *admitWaiter, string, error) {
+	return s.enqueueAdmitInternal(path, reserve, "", 0, false)
+}
+
+func (s *Server) enqueueResolvedAdmit(path string, reserve int64, basis string, maximum int64) (*sliceQueue, *admitWaiter, string, error) {
+	return s.enqueueAdmitInternal(path, reserve, basis, maximum, true)
+}
+
+func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, maximum int64, enforceCeiling bool) (*sliceQueue, *admitWaiter, string, error) {
 	s.admitRegistryMu.Lock()
 	if s.admitQueues == nil {
 		s.admitQueues = make(map[string]*sliceQueue)
@@ -202,11 +371,14 @@ func (s *Server) enqueueAdmit(path string, reserve int64) (*sliceQueue, *admitWa
 	if len(queue.waiters) >= admitMaxWaiters {
 		return nil, nil, CodeBusy, fmt.Errorf("%s: too many admission waiters for slice", CodeBusy)
 	}
+	if enforceCeiling && reserve > subtractFloor(maximum, s.admitSliceHeadroom(queue.outstandingJobs+1)) {
+		return nil, nil, CodeAdmitTooLarge, fmt.Errorf("%s: required reserve exceeds cap minus headroom", CodeAdmitTooLarge)
+	}
 	if queue.seq == math.MaxInt64 {
 		return nil, nil, CodeProtocol, fmt.Errorf("%s: admission arrival sequence overflow", CodeProtocol)
 	}
 	queue.seq++
-	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime()}
+	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime()}
 	queue.waiters = append(queue.waiters, waiter)
 	queue.signal()
 	return queue, waiter, "", nil
@@ -255,12 +427,13 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		}
 		return
 	}
-	available := checkedAvailable(current, maximum, queue.outstanding)
 	blocked := false
 	for _, waiter := range queue.waiters {
 		if waiter.state != admitQueued {
 			continue
 		}
+		headroom := s.admitSliceHeadroom(queue.outstandingJobs + 1)
+		available := checkedAvailable(current, maximum, queue.outstanding, headroom)
 		if blocked || waiter.reserve > available {
 			blocked = true
 			waiter.waited = true
@@ -269,7 +442,7 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		waiter.state = admitGranted
 		waiter.accounted = true
 		queue.outstanding += waiter.reserve
-		available -= waiter.reserve
+		queue.outstandingJobs++
 		if waiter.waited {
 			waiter.outcome = "waited"
 			waiter.waitedMS = elapsedMilliseconds(waiter.enqueued, s.admitNowTime())
@@ -280,15 +453,19 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	}
 }
 
-func checkedAvailable(current, maximum, outstanding int64) int64 {
-	if current < 0 || maximum < 0 || outstanding < 0 || maximum <= current {
+func checkedAvailable(current, maximum, outstanding, headroom int64) int64 {
+	if current < 0 || maximum < 0 || outstanding < 0 || headroom < 0 || maximum <= headroom {
 		return 0
 	}
-	free := maximum - current
-	if outstanding >= free {
+	ceiling := maximum - headroom
+	charge := outstanding
+	if current > charge {
+		charge = current
+	}
+	if charge >= ceiling {
 		return 0
 	}
-	return free - outstanding
+	return ceiling - charge
 }
 
 func (s *Server) timeoutAdmitWaiter(queue *sliceQueue, waiter *admitWaiter) {
@@ -297,13 +474,9 @@ func (s *Server) timeoutAdmitWaiter(queue *sliceQueue, waiter *admitWaiter) {
 		queue.mu.Unlock()
 		return
 	}
-	// admitMaxReserve*admitGlobalMax is below MaxInt64, so the validated,
-	// globally-bounded timeout bypass cannot overflow this sum.
-	waiter.state = admitGranted
-	waiter.accounted = true
-	waiter.outcome = "timeout"
+	waiter.state = admitRejected
+	waiter.outcome = "saturated"
 	waiter.waitedMS = elapsedMilliseconds(waiter.enqueued, s.admitNowTime())
-	queue.outstanding += waiter.reserve
 	close(waiter.grantedCh)
 	queue.mu.Unlock()
 	queue.signal()
@@ -317,6 +490,7 @@ func (s *Server) releaseAdmitWaiter(queue *sliceQueue, waiter *admitWaiter) {
 	}
 	if waiter.state == admitGranted && waiter.accounted {
 		queue.outstanding -= waiter.reserve
+		queue.outstandingJobs--
 	}
 	for index, candidate := range queue.waiters {
 		if candidate == waiter {
@@ -375,6 +549,21 @@ func (s *Server) writeAdmitError(conn net.Conn, code, message string) {
 	_ = write(conn, errorFrame(code, message))
 }
 
+func (s *Server) writeAdmitRejection(conn net.Conn, code string, rejection admitRejection) {
+	_ = conn.SetWriteDeadline(time.Now().Add(admitWriteTimeout))
+	write := s.admitWriteFrame
+	if write == nil {
+		write = func(conn net.Conn, value any) error { return writeFrame(conn, value) }
+	}
+	message := code + ": " + rejection.Basis
+	if code == CodeAdmitTooLarge {
+		message = fmt.Sprintf("%s: required=%d cap_minus_headroom=%d basis=%s", code, rejection.Required, rejection.Ceiling, rejection.Basis)
+	}
+	frame := errorFrame(code, message)
+	frame.Data, _ = json.Marshal(rejection)
+	_ = write(conn, frame)
+}
+
 func (s *Server) admitNowTime() time.Time {
 	if s.admitNow != nil {
 		return s.admitNow()
@@ -389,27 +578,27 @@ func elapsedMilliseconds(start, end time.Time) int64 {
 	return end.Sub(start).Milliseconds()
 }
 
-func validateAdmitArgs(args map[string]any) (string, int64, int64, error) {
-	if len(args) != 3 {
-		return "", 0, 0, fmt.Errorf("%s: admit requires exactly slice, reserve, and max_wait_ms", CodeProtocol)
+func validateAdmitArgs(args map[string]any) (admitRequest, error) {
+	if len(args) < 3 || len(args) > 5 {
+		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, max_wait_ms, and optional signature/pinned", CodeProtocol)
 	}
 	for name := range args {
-		if name != "slice" && name != "reserve" && name != "max_wait_ms" {
-			return "", 0, 0, fmt.Errorf("%s: unexpected admit field %q", CodeProtocol, name)
+		if name != "slice" && name != "reserve" && name != "max_wait_ms" && name != "signature" && name != "pinned" {
+			return admitRequest{}, fmt.Errorf("%s: unexpected admit field %q", CodeProtocol, name)
 		}
 	}
 	slice, ok := args["slice"].(string)
 	slice = strings.TrimSpace(slice)
 	if !ok || slice == "" {
-		return "", 0, 0, fmt.Errorf("%s: admit slice must be a non-empty string", CodeProtocol)
+		return admitRequest{}, fmt.Errorf("%s: admit slice must be a non-empty string", CodeProtocol)
 	}
 	reserve, ok := exactAdmitInt64(args["reserve"])
 	if !ok || reserve < 0 || reserve > admitMaxReserve {
-		return "", 0, 0, fmt.Errorf("%s: admit reserve must be in [0,%d]", CodeProtocol, admitMaxReserve)
+		return admitRequest{}, fmt.Errorf("%s: admit reserve must be in [0,%d]", CodeProtocol, admitMaxReserve)
 	}
 	maxWait, ok := exactAdmitInt64(args["max_wait_ms"])
 	if !ok {
-		return "", 0, 0, fmt.Errorf("%s: admit max_wait_ms must be an integer", CodeProtocol)
+		return admitRequest{}, fmt.Errorf("%s: admit max_wait_ms must be an integer", CodeProtocol)
 	}
 	if maxWait < 0 {
 		maxWait = 0
@@ -417,7 +606,23 @@ func validateAdmitArgs(args map[string]any) (string, int64, int64, error) {
 	if maxWait > admitWaitCapMs {
 		maxWait = admitWaitCapMs
 	}
-	return slice, reserve, maxWait, nil
+	signature := ""
+	if raw, exists := args["signature"]; exists {
+		var valid bool
+		signature, valid = raw.(string)
+		if !valid {
+			return admitRequest{}, fmt.Errorf("%s: admit signature must be a string", CodeProtocol)
+		}
+	}
+	pinned := false
+	if raw, exists := args["pinned"]; exists {
+		var valid bool
+		pinned, valid = raw.(bool)
+		if !valid {
+			return admitRequest{}, fmt.Errorf("%s: admit pinned must be boolean", CodeProtocol)
+		}
+	}
+	return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned}, nil
 }
 
 func exactAdmitInt64(value any) (int64, bool) {

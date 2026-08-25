@@ -5,9 +5,11 @@ package runner
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"io/fs"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -474,6 +476,157 @@ func TestConfineAdmissionReleaseExactlyOnce(t *testing.T) {
 				t.Fatalf("admission release count=%d, want 1", closer.count)
 			}
 		})
+	}
+}
+
+func TestConfineRejectedAdmissionCreatesNoScopeAndStartsNoChild(t *testing.T) {
+	for _, code := range []string{"E_ADMIT_TOO_LARGE", "E_ADMIT_SATURATED"} {
+		t.Run(code, func(t *testing.T) {
+			created, started := false, false
+			deps := confineDeps{
+				resolveSlicePath: func(string) (string, bool, string) { return "/fake/finite.slice", true, "" },
+				ensureDelegation: func(string) error { return nil },
+				readCap:          func(string) (int64, bool) { return 64 << 30, true },
+				newBackend:       func(string) ScopeBackend { return confineCreateTrackingBackend{created: &created} },
+				start:            func(*confineCommand) error { started = true; return nil },
+			}
+			deps.admit = func(ctx context.Context, path string, request ConfineRequest, reserve int64) (admissionResult, error) {
+				r := &Runner{memorySlice: path, memoryReserve: reserve, admissionMaxWait: time.Second, pollInterval: time.Millisecond, clock: newInstantClock(), sliceMemory: func(string) (int64, int64, bool, string) { return 0, 64 << 30, true, "" }}
+				client, server := net.Pipe()
+				r.admitDialFn = func(context.Context, string) (net.Conn, error) { return client, nil }
+				go func() {
+					defer server.Close()
+					var frame runnerAdmitRequestFrame
+					_ = readRunnerAdmitFrame(server, &frame)
+					rejection := runnerAdmitRejection{Basis: "reject:saturated"}
+					if code == "E_ADMIT_TOO_LARGE" {
+						rejection = runnerAdmitRejection{Required: 70 << 30, Ceiling: 61 << 30, Basis: "estimate:max=1,n=3,f=115"}
+					}
+					data, _ := json.Marshal(rejection)
+					_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{Code: code, Error: code + ": rejected", Data: data})
+				}()
+				return r.admit(ctx, Request{ResourceSignature: request.ResourceSignature, DaemonEstimateMemory: true})
+			}
+			result, err := confineWithDeps(context.Background(), ConfineRequest{Slice: "finite.slice", Argv: []string{"must-not-run"}, Stderr: io.Discard}, deps)
+			if err == nil || !strings.Contains(err.Error(), code) || created || started {
+				t.Fatalf("result=%+v err=%v created=%v started=%v", result, err, created, started)
+			}
+			if result.Status.ReserveBasis != map[string]string{"E_ADMIT_TOO_LARGE": "reject:too-large", "E_ADMIT_SATURATED": "reject:saturated"}[code] {
+				t.Fatalf("rejection basis=%q", result.Status.ReserveBasis)
+			}
+		})
+	}
+}
+
+type confineOrderingCloser struct {
+	t     *testing.T
+	scope *confineFakeScope
+	count int
+}
+
+func (closer *confineOrderingCloser) Close() error {
+	closer.count++
+	closer.scope.mu.Lock()
+	removed := closer.scope.removed
+	closer.scope.mu.Unlock()
+	if !removed {
+		closer.t.Error("daemon lease released before scope teardown")
+	}
+	return nil
+}
+
+func TestConfineDaemonLeaseHeldUntilScopeTeardown(t *testing.T) {
+	scope := &confineFakeScope{}
+	closer := &confineOrderingCloser{t: t, scope: scope}
+	deps := confineUnitDeps(scope)
+	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
+		return admissionResult{state: "immediate", reserve: 32 << 20, basis: "estimate:max=1,n=3,f=115", release: closer}, nil
+	}
+	deps.writeScopeMemoryCap = func(Scope, int64, int64, bool) error { return nil }
+	deps.readHandshake = func(reader *os.File, timeout time.Duration) ([]byte, error) {
+		if closer.count != 0 {
+			t.Fatal("daemon lease was released while the started child was at the handshake gate")
+		}
+		return readConfineHandshake(reader, timeout)
+	}
+	deps.readUsage = func(string) cgroupUsage {
+		if closer.count != 0 {
+			t.Fatal("daemon lease was not held for the running lifetime")
+		}
+		return cgroupUsage{}
+	}
+	deps.reportPeak = func(context.Context, ConfineRequest, string, *int64, bool) error { return nil }
+	if _, err := confineWithDeps(context.Background(), ConfineRequest{Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard}, deps); err != nil {
+		t.Fatal(err)
+	}
+	if closer.count != 1 {
+		t.Fatalf("lease closes=%d", closer.count)
+	}
+}
+
+func TestConfineFallbackFlockReleasedAtStart(t *testing.T) {
+	scope := &confineFakeScope{}
+	closer := &confineCountingCloser{}
+	deps := confineUnitDeps(scope)
+	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
+		return admissionResult{state: "immediate", reserve: 4 << 30, basis: "fallback:daemon-unavailable", lock: &admitLock{}, release: closer}, nil
+	}
+	deps.readUsage = func(string) cgroupUsage {
+		if closer.count != 1 {
+			t.Fatalf("fallback flock closes during run=%d, want release at start", closer.count)
+		}
+		return cgroupUsage{}
+	}
+	deps.reportPeak = func(context.Context, ConfineRequest, string, *int64, bool) error { return nil }
+	if _, err := confineWithDeps(context.Background(), ConfineRequest{Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard}, deps); err != nil {
+		t.Fatal(err)
+	}
+	if closer.count != 1 {
+		t.Fatalf("fallback release count=%d", closer.count)
+	}
+}
+
+func TestConfineGrantedReserveIsScopeCapAndPeakIsReported(t *testing.T) {
+	scope := &confineFakeScope{}
+	closer := &confineCountingCloser{}
+	deps := confineUnitDeps(scope)
+	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
+		return admissionResult{state: "immediate", reserve: 96 << 20, basis: "estimate:p90-prior", release: closer}, nil
+	}
+	var capWritten int64
+	deps.writeScopeMemoryCap = func(_ Scope, maximum, high int64, setOOM bool) error {
+		capWritten = maximum
+		if high != 0 || setOOM {
+			t.Fatalf("cap args maximum=%d high=%d oom=%v", maximum, high, setOOM)
+		}
+		return nil
+	}
+	peak, oomKill := int64(80<<20), int64(1)
+	deps.readUsage = func(string) cgroupUsage { return cgroupUsage{PeakRSS: &peak, OOMKill: &oomKill} }
+	reported := false
+	deps.reportPeak = func(_ context.Context, _ ConfineRequest, signature string, got *int64, oom bool) error {
+		reported = signature != "" && got != nil && *got == peak && oom
+		return nil
+	}
+	result, err := confineWithDeps(context.Background(), ConfineRequest{Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard}, deps)
+	if err != nil || capWritten != 96<<20 || result.Status.ScopeMemoryMax != 96<<20 || result.Status.PeakRSS == nil || *result.Status.PeakRSS != peak || !reported {
+		t.Fatalf("result=%+v err=%v cap=%d reported=%v", result, err, capWritten, reported)
+	}
+}
+
+func TestConfineZeroPeakIsReportedAsUnknown(t *testing.T) {
+	scope := &confineFakeScope{}
+	deps := confineUnitDeps(scope)
+	zero := int64(0)
+	deps.readUsage = func(string) cgroupUsage { return cgroupUsage{PeakRSS: &zero} }
+	reportedUnknown := false
+	deps.reportPeak = func(_ context.Context, _ ConfineRequest, _ string, peak *int64, _ bool) error {
+		reportedUnknown = peak == nil
+		return nil
+	}
+	result, err := confineWithDeps(context.Background(), ConfineRequest{Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard}, deps)
+	if err != nil || result.Status.PeakRSS != nil || !reportedUnknown {
+		t.Fatalf("result=%+v err=%v reportedUnknown=%v", result, err, reportedUnknown)
 	}
 }
 
@@ -1038,7 +1191,7 @@ func TestConfineRealOOMGroupWrittenAndEffective(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "python3 is unavailable: %v", err)
 	}
-	parent := confineMemoryParent(t, "67108864")
+	parent := confineMemoryParent(t, "134217728")
 	marker := filepath.Join(t.TempDir(), "survived")
 	observation := &confineScopeObservation{}
 	deps := defaultConfineDeps()
@@ -1046,14 +1199,14 @@ func TestConfineRealOOMGroupWrittenAndEffective(t *testing.T) {
 		return confineObservingBackend{ScopeBackend: newDefaultBackend(path), observation: observation}
 	}
 	result, err := confineWithDeps(context.Background(), ConfineRequest{
-		Slice: parent, MemoryReserve: 1 << 20, AdmissionMaxWait: 2 * time.Second, PollInterval: 10 * time.Millisecond,
+		Slice: parent, MemoryReserve: 1 << 20, ScopeMemoryMax: 32 << 20, AdmissionMaxWait: 2 * time.Second, PollInterval: 10 * time.Millisecond,
 		Argv:     []string{"/bin/sh", "-c", `(sleep 2; echo survived > "$1") & python3 -c 'x=bytearray(256*1024*1024); x[-1]=1'; wait`, "sh", marker},
 		SelfPath: os.Args[0], Stderr: io.Discard,
 	}, deps)
 	if err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "confine real OOM fixture unavailable: %v", err)
 	}
-	if result.Exit != 137 {
+	if result.Exit != 137 || result.Status.ScopeMemoryMax != 32<<20 || result.Status.PeakRSS == nil {
 		t.Fatalf("OOM group leader exit=%d, want 137", result.Exit)
 	}
 	if observation.oomGroup != "1" {

@@ -19,6 +19,7 @@ import (
 
 	"aira/internal/app"
 	"aira/internal/core"
+	"aira/internal/runner"
 	"aira/internal/store"
 	"golang.org/x/sys/unix"
 )
@@ -61,13 +62,19 @@ type Server struct {
 	discoveryFailed map[string]struct{}
 	// stopping closes when Serve stops accepting. Watch handlers observe it
 	// directly so their terminal event drain remains distinct from peer-close.
-	stopping          chan struct{}
-	watchSlots        chan struct{}
-	watchPollInterval time.Duration
-	admitSlots        chan struct{}
-	admitPollInterval time.Duration
-	admitRegistryMu   sync.Mutex
-	admitQueues       map[string]*sliceQueue
+	stopping                     chan struct{}
+	watchSlots                   chan struct{}
+	watchPollInterval            time.Duration
+	admitSlots                   chan struct{}
+	admitPollInterval            time.Duration
+	admitRegistryMu              sync.Mutex
+	admitQueues                  map[string]*sliceQueue
+	admitPriorMu                 sync.Mutex
+	admitPriorPeak               int64
+	admitPriorOK                 bool
+	admitPriorAt                 time.Time
+	admitSliceHeadroomBase       int64
+	admitSliceHeadroomSupervisor int64
 
 	// Test seams. Production always calls the Store methods and DB.Close.
 	reapScope            func(context.Context, *store.Store) (int, error)
@@ -81,6 +88,8 @@ type Server struct {
 	admitAfter           func(time.Duration) <-chan time.Time
 	admitWriteFrame      func(net.Conn, any) error
 	admitBeforeWrite     func(*admitWaiter)
+	admitPeakHistory     func(context.Context, string) (runner.PeakRSSStats, error)
+	admitPeakP90         func(context.Context) (int64, bool, error)
 	peerCredential       func(net.Conn) (int, int, error)
 	storeOpAppendTimeout time.Duration
 	storeOpHeavyTimeout  time.Duration
@@ -96,10 +105,12 @@ func NewServer(paths Paths) *Server {
 		Paths: paths, DrainTimeout: 10 * time.Second, scopes: map[string]*scopeEntry{}, coveredWorktrees: map[string]struct{}{}, discoveryFailed: map[string]struct{}{},
 		watchSlots: make(chan struct{}, watchMaxConcurrent), watchPollInterval: defaultWatchPollInterval,
 		admitSlots: make(chan struct{}, admitGlobalMax), admitPollInterval: defaultAdmitPollInterval,
-		admitQueues:          map[string]*sliceQueue{},
-		storeOpAppendTimeout: 30 * time.Second,
-		storeOpHeavyTimeout:  5 * time.Minute,
-		storeOpWriteTimeout:  30 * time.Second,
+		admitQueues:                  map[string]*sliceQueue{},
+		admitSliceHeadroomBase:       admitSliceHeadroomBaseDefault,
+		admitSliceHeadroomSupervisor: admitSliceHeadroomSupervisorDefault,
+		storeOpAppendTimeout:         30 * time.Second,
+		storeOpHeavyTimeout:          5 * time.Minute,
+		storeOpWriteTimeout:          30 * time.Second,
 	}
 }
 
@@ -455,6 +466,13 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		return
 	}
 	verb := core.CanonicalVerb(request.Request.Verb)
+	if verb == "confine-report" {
+		if s.OnRequest != nil {
+			s.OnRequest(request.Scope, request.Request)
+		}
+		wrote = writeFrame(conn, responseFrame(s.confineReport(request.Request.Args))) == nil
+		return
+	}
 	if verb == "admit" {
 		if s.OnRequest != nil {
 			s.OnRequest(request.Scope, request.Request)

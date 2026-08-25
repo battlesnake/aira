@@ -834,6 +834,12 @@ func (s *Store) initDB(ctx context.Context) error {
 			worktree_id TEXT NOT NULL,
 			PRIMARY KEY (project_id, run_id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS confine_peak_history (
+		    signature TEXT NOT NULL, peak_rss INTEGER, oom INTEGER NOT NULL, at TEXT NOT NULL,
+		    CHECK(length(signature)>0), CHECK(peak_rss IS NULL OR peak_rss>0), CHECK(oom IN (0,1))
+		)`,
+		`CREATE INDEX IF NOT EXISTS confine_peak_history_signature
+		    ON confine_peak_history(signature)`,
 		`CREATE TABLE IF NOT EXISTS area_hints (
             project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, worktree_id TEXT NOT NULL,
             generation INTEGER NOT NULL DEFAULT 0, glob TEXT NOT NULL,

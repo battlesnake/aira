@@ -534,7 +534,7 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 			return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine options must precede the launch delimiter")
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name != "slice" && name != "name" && name != "memory-max" && name != "memory-high" {
+		if name != "slice" && name != "name" && name != "memory-reserve" && name != "memory-max" && name != "memory-high" {
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for confine", name)
 		}
 		if i+1 >= delimiter || strings.HasPrefix(argv[i+1], "--") {
@@ -553,6 +553,15 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 	if _, _, err := parseScopeMemoryOptions(options, "E_CONFINE_ARGUMENT_INVALID"); err != nil {
 		return nil, nil, err
 	}
+	if raw, present := options["memory-reserve"]; present {
+		value, err := runner.ParseMemorySize(raw)
+		if err != nil || value < 1<<20 {
+			if err == nil {
+				err = errors.New("must be at least 1MiB")
+			}
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --memory-reserve: %w", err)
+		}
+	}
 	return target, options, nil
 }
 
@@ -562,8 +571,28 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		_, _ = fmt.Fprintln(stderr, err)
 		return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 	}
+	reserveRaw, reservePinned := options["memory-reserve"]
+	if !reservePinned {
+		reserveRaw = os.Getenv("AIRA_CONFINE_RESERVE")
+		reservePinned = reserveRaw != ""
+	}
+	var reserve int64
+	if reservePinned {
+		reserve, err = runner.ParseMemorySize(reserveRaw)
+		if err != nil || reserve < 1<<20 {
+			if err == nil {
+				err = errors.New("must be at least 1MiB")
+			}
+			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --memory-reserve: %v\n", err)
+			return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		}
+	}
+	if maximum > 0 {
+		reserve, reservePinned = maximum, true
+	}
 	request := runner.ConfineRequest{
 		Slice: options["slice"], Name: options["name"], Argv: append([]string(nil), target...),
+		MemoryReserve: reserve, MemoryReservePinned: reservePinned,
 		ScopeMemoryMax: maximum, ScopeMemoryHigh: high,
 		Stdin: stdin, Stdout: stdout, Stderr: stderr,
 	}
@@ -812,6 +841,9 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		}
 		args["argv"] = append([]string(nil), positional...)
 		args["slice"], args["name"] = options["slice"], options["name"]
+		if value, ok := options["memory-reserve"]; ok {
+			args["memory_reserve"] = value
+		}
 		if value, ok := options["memory-max"]; ok {
 			args["memory_max"] = value
 		}

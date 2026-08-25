@@ -107,6 +107,8 @@ type confineDeps struct {
 	readHandshake         func(*os.File, time.Duration) ([]byte, error)
 	readCap               func(string) (int64, bool)
 	signalSource          func() (<-chan os.Signal, func())
+	readUsage             func(string) cgroupUsage
+	reportPeak            func(context.Context, ConfineRequest, string, *int64, bool) error
 }
 
 func defaultConfineDeps() confineDeps {
@@ -123,6 +125,8 @@ func defaultConfineDeps() confineDeps {
 		readHandshake:         readConfineHandshake,
 		readCap:               effectiveConfineCap,
 		signalSource:          confineSignalSource,
+		readUsage:             readCgroupUsage,
+		reportPeak:            reportConfinePeak,
 	}
 }
 
@@ -163,6 +167,12 @@ func fillConfineDeps(deps confineDeps) confineDeps {
 	}
 	if deps.signalSource == nil {
 		deps.signalSource = defaults.signalSource
+	}
+	if deps.readUsage == nil {
+		deps.readUsage = defaults.readUsage
+	}
+	if deps.reportPeak == nil {
+		deps.reportPeak = defaults.reportPeak
 	}
 	return deps
 }
@@ -346,19 +356,38 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	}
 
 	reserve := request.MemoryReserve
+	pinned := request.MemoryReservePinned || reserve > 0
 	if reserve <= 0 {
 		reserve = DefaultConfineMemoryReserve
 	}
+	if request.ScopeMemoryMax > 0 {
+		reserve = request.ScopeMemoryMax
+		pinned = true
+	}
+	signature := request.ResourceSignature
+	if signature == "" {
+		if computed, signatureErr := ResourceSignature(nil, nil, request.Argv); signatureErr == nil {
+			signature = computed
+		}
+	}
+	request.ResourceSignature = signature
+	request.MemoryReserve = reserve
+	request.MemoryReservePinned = pinned
 	admission, err := deps.admit(ctx, path, request, reserve)
+	resolvedReserve := reserve
+	if admission.reserve > 0 {
+		resolvedReserve = admission.reserve
+	}
+	result.Status.ReserveBytes = resolvedReserve
+	result.Status.ReserveBasis = admission.basis
+	result.Status.AdmissionState = admission.state
+	result.Status.AdmissionWaitedMS = admission.waitedMS
 	if err != nil {
 		return result, err
 	}
 	var releaseAdmissionOnce sync.Once
 	releaseAdmission := func() { releaseAdmissionOnce.Do(admission.releaseAdmission) }
 	defer releaseAdmission()
-	result.Status.ReserveBytes = reserve
-	result.Status.AdmissionState = admission.state
-	result.Status.AdmissionWaitedMS = admission.waitedMS
 	switch admission.state {
 	case "immediate", "waited":
 		result.Status.Admission = ConfineAdmissionAdmitted
@@ -406,11 +435,15 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		return result, confineUnavailable(sliceName, fmt.Errorf("set memory.oom.group: %w", err))
 	}
 	result.Status.OOMGroup = ConfineOOMGroupSet
-	if request.ScopeMemoryMax > 0 {
-		if err := deps.writeScopeMemoryCap(scope, request.ScopeMemoryMax, request.ScopeMemoryHigh, false); err != nil {
+	scopeMemoryMax := request.ScopeMemoryMax
+	if scopeMemoryMax <= 0 && admission.lock == nil && admission.release != nil && admission.reserve > 0 {
+		scopeMemoryMax = admission.reserve
+	}
+	if scopeMemoryMax > 0 {
+		if err := deps.writeScopeMemoryCap(scope, scopeMemoryMax, request.ScopeMemoryHigh, false); err != nil {
 			return result, confineUnavailable(sliceName, fmt.Errorf("set scope memory cap: %w", err))
 		}
-		result.Status.ScopeMemoryMax = floorMemoryPage(request.ScopeMemoryMax)
+		result.Status.ScopeMemoryMax = floorMemoryPage(scopeMemoryMax)
 		result.Status.ScopeMemoryHigh = floorMemoryPage(request.ScopeMemoryHigh)
 		result.Status.ScopeMemoryBinding = "ancestor-limited"
 		result.Status.ScopeMemoryEffective = maximum
@@ -469,7 +502,9 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	started.Store(true)
 	_ = handshakeWrite.Close()
 	_ = releaseRead.Close()
-	releaseAdmission()
+	if admission.lock != nil {
+		releaseAdmission()
+	}
 
 	abortStarted := func(cause error) (ConfineResult, error) {
 		_ = releaseWrite.Close()
@@ -528,6 +563,17 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	}
 	_ = releaseWrite.Close()
 	result.Exit = waitConfineCommand(cmd)
+	usage := deps.readUsage(scope.Reference())
+	if usage.PeakRSS != nil && *usage.PeakRSS <= 0 {
+		usage.PeakRSS = nil
+	}
+	result.Status.PeakRSS = usage.PeakRSS
+	oom := usage.OOMKill != nil && *usage.OOMKill > 0
+	if signature != "" {
+		reportCtx, cancelReport := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		_ = deps.reportPeak(reportCtx, request, signature, usage.PeakRSS, oom)
+		cancelReport()
+	}
 	close(monitorStop)
 	monitorSummary := <-monitorResult
 	teardown := attestScopeTeardown(ctx, scope, pid, 2*time.Second)
@@ -557,7 +603,11 @@ func admitConfine(ctx context.Context, path string, request ConfineRequest, rese
 		pollInterval: poll, clock: systemClock{}, sliceMemory: readSliceMemory,
 		diagnostics: request.Stderr, admitSocketPath: request.AdmitSocketPath,
 	}
-	return admitter.admit(ctx, Request{})
+	return admitter.admit(ctx, Request{
+		ResourceSignature:    request.ResourceSignature,
+		MemoryReservePinned:  request.MemoryReservePinned,
+		DaemonEstimateMemory: true,
+	})
 }
 
 func readConfineCap(path string) (int64, bool) {

@@ -19,6 +19,8 @@ func admitTestServer(maximum *atomic.Int64) *Server {
 	server := NewServer(Paths{})
 	server.stopping = make(chan struct{})
 	server.admitPollInterval = time.Hour
+	server.admitSliceHeadroomBase = 0
+	server.admitSliceHeadroomSupervisor = 0
 	server.admitResolveSlice = func(string) (string, bool, string) { return "/slice", true, "" }
 	server.admitReadMemory = func(string) (int64, int64, bool, string) {
 		return 0, maximum.Load(), true, ""
@@ -217,9 +219,11 @@ func TestAdmitFailedWriteAndCloseBetweenCommitAndWriteReleaseOnce(t *testing.T) 
 	}
 }
 
-func TestAdmitTimeoutBypassUsesUnequalDeadlines(t *testing.T) {
+func TestAdmitSaturationRejectUsesUnequalDeadlines(t *testing.T) {
 	var maximum atomic.Int64
+	maximum.Store(10)
 	server := admitTestServer(&maximum)
+	server.admitReadMemory = func(string) (int64, int64, bool, string) { return 10, 10, true, "" }
 	aServer, aClient := net.Pipe()
 	bServer, bClient := net.Pipe()
 	defer aClient.Close()
@@ -240,9 +244,8 @@ func TestAdmitTimeoutBypassUsesUnequalDeadlines(t *testing.T) {
 	if err := readFrame(bClient, &bFrame); err != nil {
 		t.Fatal(err)
 	}
-	bGrant := admitGrantData(t, bFrame)
-	if bGrant.State != "timeout" {
-		t.Fatalf("short waiter state=%q", bGrant.State)
+	if bFrame.Code != CodeAdmitSaturated {
+		t.Fatalf("short waiter frame=%+v", bFrame)
 	}
 	_ = bClient.Close()
 	_ = aClient.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
@@ -255,8 +258,8 @@ func TestAdmitTimeoutBypassUsesUnequalDeadlines(t *testing.T) {
 	if err := readFrame(aClient, &aFrame); err != nil {
 		t.Fatal(err)
 	}
-	if grant := admitGrantData(t, aFrame); grant.State != "timeout" {
-		t.Fatalf("long waiter state=%q", grant.State)
+	if aFrame.Code != CodeAdmitSaturated {
+		t.Fatalf("long waiter frame=%+v", aFrame)
 	}
 	_ = aClient.Close()
 	<-aDone
@@ -288,7 +291,7 @@ func TestAdmitGrantTimeoutRaceCommitsExactlyOnce(t *testing.T) {
 		racers.Wait()
 		waitAdmitGrant(t, waiter)
 		queue.mu.Lock()
-		if waiter.state != admitGranted || queue.outstanding != 1 {
+		if waiter.state != admitGranted && waiter.state != admitRejected || queue.outstanding != 0 && queue.outstanding != 1 {
 			t.Fatalf("iteration %d state=%v outstanding=%d", iteration, waiter.state, queue.outstanding)
 		}
 		queue.mu.Unlock()
@@ -376,7 +379,9 @@ func TestAdmitGrantCommittedAtShutdownDeliveredOrReleasedOnce(t *testing.T) {
 
 func TestAdmitShutdownHandlerOwnsReleaseAndPrunesAfterDrain(t *testing.T) {
 	var maximum atomic.Int64
+	maximum.Store(10)
 	server := admitTestServer(&maximum)
+	server.admitReadMemory = func(string) (int64, int64, bool, string) { return 10, 10, true, "" }
 	serverConn, clientConn := net.Pipe()
 	done := make(chan struct{})
 	go func() {
@@ -432,8 +437,8 @@ func TestAdmitUnevaluatedImmediateWithoutEnqueue(t *testing.T) {
 }
 
 func TestAdmitValidationAndCaps(t *testing.T) {
-	if _, reserve, wait, err := validateAdmitArgs(map[string]any{"slice": " x ", "reserve": int64(1), "max_wait_ms": admitWaitCapMs + 1}); err != nil || reserve != 1 || wait != admitWaitCapMs {
-		t.Fatalf("valid/clamped reserve=%d wait=%d err=%v", reserve, wait, err)
+	if request, err := validateAdmitArgs(map[string]any{"slice": " x ", "reserve": int64(1), "max_wait_ms": admitWaitCapMs + 1, "signature": "a\x00b", "pinned": true}); err != nil || request.reserve != 1 || request.maxWait != admitWaitCapMs || request.signature != "a\x00b" || !request.pinned {
+		t.Fatalf("valid/clamped request=%+v err=%v", request, err)
 	}
 	for name, args := range map[string]map[string]any{
 		"missing":         {"slice": "x", "reserve": 1},
@@ -443,7 +448,7 @@ func TestAdmitValidationAndCaps(t *testing.T) {
 		"extra":           {"slice": "x", "reserve": 1, "max_wait_ms": 1, "extra": true},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, _, _, err := validateAdmitArgs(args); err == nil {
+			if _, err := validateAdmitArgs(args); err == nil {
 				t.Fatal("hostile request accepted")
 			}
 		})
@@ -492,19 +497,20 @@ func TestAdmitValidationAndCaps(t *testing.T) {
 
 func TestCheckedAvailableClampsWithoutOverflow(t *testing.T) {
 	for _, test := range []struct {
-		current, maximum, outstanding, want int64
+		current, maximum, outstanding, headroom, want int64
 	}{
-		{0, 100, 25, 75}, {100, 100, 0, 0}, {101, 100, 0, 0},
-		{0, math.MaxInt64, math.MaxInt64, 0}, {-1, math.MaxInt64, 0, 0},
+		{0, 100, 25, 0, 75}, {20, 100, 25, 10, 65}, {80, 100, 25, 10, 10},
+		{100, 100, 0, 0, 0}, {101, 100, 0, 0, 0},
+		{0, math.MaxInt64, math.MaxInt64, 0, 0}, {-1, math.MaxInt64, 0, 0, 0},
 	} {
-		if got := checkedAvailable(test.current, test.maximum, test.outstanding); got != test.want {
-			t.Fatalf("checkedAvailable(%d,%d,%d)=%d want=%d", test.current, test.maximum, test.outstanding, got, test.want)
+		if got := checkedAvailable(test.current, test.maximum, test.outstanding, test.headroom); got != test.want {
+			t.Fatalf("checkedAvailable(%d,%d,%d,%d)=%d want=%d", test.current, test.maximum, test.outstanding, test.headroom, got, test.want)
 		}
 	}
 }
 
 func validAdmitArgs(reserve, wait int64) map[string]any {
-	return map[string]any{"slice": "slice", "reserve": reserve, "max_wait_ms": wait}
+	return map[string]any{"slice": "slice", "reserve": reserve, "max_wait_ms": wait, "signature": "", "pinned": true}
 }
 
 func admitGrantData(t *testing.T, frame ResponseFrame) AdmitResponse {
