@@ -1,146 +1,149 @@
 # `aira confine` OOM prevention: estimate-sized hard sub-caps + lifetime-held reservations
 
-Status: PLAN v2 — reshaped after Sol GATE-FAIL (estimates reduce ≠ prevent; double-count;
-median-not-safety; reject-not-clamp; daemon-must-capture-peak) and Fable GATE-FAIL (the reservation
-is released at START, not held for life — my v1 premise was factually wrong). Owner chose **(1b)
-strict prevention** (2026-08-25). Safety-critical (admission + a machine-wide store + per-job hard
-caps) → full two-loop, re-gated.
+Status: PLAN v3 (builder-ready pending a quick re-gate) — folds the v2 re-gate: Sol (P0 invariant
+gaps: budget the supervisor + set the ceiling BELOW the cap so kills are always scope-contained,
+hold to scope teardown, prevent migration; P1 OOM censored-escalation; P2 queue aging) and Fable
+(P0: a delivered rejection must NOT fall back and launch; P1 pinned-reserve marker; P2 grant
+carry-back / store seam / protocol-reject wording / residuals). Both re-gates: "fold, not
+redesign" — v2's premises are code-accurate. Owner chose **(1b) strict prevention**. Safety-critical
+→ full two-loop.
 
-## 1. Root cause (corrected — verified in code)
+## 1. Root cause (verified)
 
-`aira.slice` is a single 64 GiB hard cap (oom.group=1) shared by every session's `aira confine`
-jobs. Two facts combine:
-1. **The admission reservation is released at job START, not job exit.** `confine_linux.go:472`
-   (and the runner at `:489`) call `releaseAdmission()` immediately after the child is placed —
-   ms after grant, before the job grows (daemon comment `admit.go:174-176`). So `outstanding`
-   only covers the grant→start window; thereafter only the slice's *actual* `memory.current` counts.
-2. **The reserve is a flat 4 GiB** (`confine.go:15`; `admission_linux.go:108`) with no per-job
-   estimate.
+`aira.slice` = one 64 GiB hard cap (oom.group=1) shared by all sessions' `aira confine` jobs. The
+admission reservation is **released at job START** (`confine_linux.go:472`; runner `:489`) — ms
+after grant, before the job grows — and the reserve is a **flat 4 GiB** (`confine.go:15`) with no
+estimate. So heavy jobs admit, start, release while tiny, the next 250 ms poll sees the cap free →
+all N run concurrently before any peaks → aggregate > 64 GiB → the slice oom.group SIGKILLs a whole
+scope; `oom_score_adj=500` on every confine job → the victim is the innocent, not the culprit.
 
-Together: each heavy job (15+ GiB) admits, starts, *releases its reservation while its memory is
-still tiny*, the next 250 ms poll sees the cap ~free → admits the next → **all N run concurrently
-before any reaches its peak** → aggregate blows past 64 GiB → the slice `oom.group` SIGKILLs a
-whole scope; every confine job has `oom_score_adj=500` so the victim is picked by size — often the
-innocent merge-gate, not the culprit. A better *reserve value alone* cannot help while the
-reservation is released before the job is big.
+## 2. Design (1b) — estimate-sized hard sub-caps, and the SLICE cap is never reached
 
-## 2. Design (1b) — the estimate is a HARD per-job cap; admission holds Σ caps ≤ slice cap
+The estimate sizes each job's own `memory.max`; admission holds Σ granted ≤ **(slice cap −
+headroom)** so the *slice* cap is never hit — therefore every OOM is a *per-scope* cap kill
+(oom.group-contained to the culprit), never an ancestor-limit kill that would take a random victim.
 
-The estimate sizes each job's own `memory.max`, and admission guarantees the sum of granted caps
-never exceeds the slice cap. Then a runaway dies **in its own scope**, never a random victim, and
-the slice as a whole can never OOM.
-
-1. **Lifetime-held reservation.** Move confine's `releaseAdmission()` from `confine_linux.go:472`
-   (post-start) to after `waitConfineCommand` (`:530`, post-exit). The reservation stays in the
-   daemon's `outstanding` for the job's whole life. (The daemon lease mechanism already supports
-   this — it holds the conn until the client closes.)
+1. **Lifetime-held reservation, to scope teardown.** DELETE the early `releaseAdmission()` at
+   `confine_linux.go:472` and rely on the existing `defer releaseAdmission()` (`:356-358`,
+   `sync.Once`), which fires when `confineWithDeps` returns — i.e. AFTER `waitConfineCommand`
+   (`:530`) AND `scope.Remove` (`:801`). So the reservation is held until the scope is empty/removed
+   (Sol P0), covering lingering descendants/charges after main-child exit. Daemon needs zero change
+   (it holds `outstanding` until the conn closes; kernel closes it on a supervisor crash).
 2. **Granted reserve = the job's scope `memory.max`.** The daemon returns the resolved reserve in
-   the grant; confine writes it as the scope's `memory.max` (the #57 sub-cap plumbing —
-   `writeScopeMemoryCap`, `confine_linux.go:409-415`) with `oom.group=1` (already set). So the job
-   is kernel-capped at its estimate.
-3. **Admission invariant Σ granted ≤ slice cap.** With every job hard-capped at its reservation,
-   `outstanding = Σ granted` and a job's actual `≤` its reservation, so `slice.current ≤
-   outstanding ≤ cap` always ⇒ the slice never OOMs. Prevention, not reduction.
+   the grant (new carry-back, §6); confine writes it via `writeScopeMemoryCap`
+   (`confine_linux.go:642`, #57 write side) before exec, with `oom.group=1` (already set). Kernel-
+   capped at the estimate.
+3. **Admission ceiling = slice cap − HEADROOM (Sol P0).** The daemon budgets a fixed headroom
+   (`watchdogSliceHeadroom`, default 4 GiB — covers the confine SUPERVISORS living outside every
+   scope, any direct-slice/session overhead, and `memory.max` enforcement overshoot). Admission
+   grants iff `reserve ≤ (cap − headroom) − charge`. Because the slice's *own* cap is thus never
+   reached, an over-running job trips its *own* scope `memory.max` (contained, oom.group) — never
+   the slice's ancestor limit (which would not be scope-contained).
+4. **Migration/escape prevented** by the existing #20 descendant-escape attestation +
+   no-delegation-out; a witnessed escape is surfaced (residual, §8).
 
-## 3. Accounting fix — charge = max(outstanding, current), no double-count (Sol P0#2)
+**Invariant:** for confine tenants, actual ≤ reserve (kernel) and Σ reserve ≤ cap − headroom ⇒
+slice.current ≤ cap − headroom < cap ⇒ the slice never OOMs; all kills are per-scope/contained.
 
-With lifetime holds, `outstanding` (Σ reservations) and `current` (actual) both include a running
-job → the existing `max − current − outstanding` (`admit.go:283-292`) would DOUBLE-count. Change
-`checkedAvailable` to `available = maximum − max(outstanding, current)`:
-- For capped jobs `actual ≤ reserve` ⇒ `current ≤ outstanding` ⇒ charge = outstanding (exact, no
-  double-count).
-- `max(...)` stays safe against any un-reserved slice usage (there is none in aira.slice, but it
-  costs nothing).
-This makes admission exact rather than up to 2× conservative.
+## 3. Accounting — charge = max(outstanding, current), no double-count (Sol v1 P0#2)
+
+Change `checkedAvailable` (`admit.go:283-292`, currently `max − current − outstanding`) to
+`available = (max − headroom) − max(outstanding, current)`. Capped tenants have actual ≤ reserve ⇒
+current ≤ outstanding ⇒ charge = outstanding (exact, no double-count); `max(...)` stays safe against
+any unreserved usage; the headroom absorbs the supervisor/overhead. Fable verified the evaluator
+race is safe (a capped tenant cannot grow past its reserve between the `current` read and a grant).
 
 ## 4. Estimation from machine-wide per-signature history (the reserve/cap value)
 
-Confine is project-less, so the DAEMON (owns `state.db` + admit) holds the history and estimates.
-- **Signature:** confine computes `sig = ResourceSignature(nil, nil, argv)` (`resource_estimate.go:18`)
-  and passes it in the admit frame (see §6 for the protocol-compat handling).
-- **Store:** daemon persists `confine_peak_history(signature TEXT, peak_rss INTEGER NULL, oom
-  INTEGER, at TEXT)` in `state.db` (schema block `store.go:737+`; WAL already on, `store.go:521`),
-  indexed on signature, bounded (keep last N=20/signature, indexed prune).
-- **Estimate (reuse #50 verbatim):** in `admitConnection` BEFORE `enqueueAdmit` (NOT under
-  `queue.mu` — Fable P1#2; a sqlite read under the single per-slice evaluator lock would freeze all
-  admissions), read `PeakRSSStats` for `sig`, call `EstimateMemoryReserve(stats, headroom)`.
-  - `override` (≥3 **usable** peak samples): reserve = estimate (`peak_max + 15%`, OOM-boost).
-  - else: the **global prior** = the **p90** (Sol P1: not median — median under-reserves the heavy
-    half) of PeakMax across all signatures with ≥3 usable samples, cached + refreshed lazily. So a
-    NEW heavy command is capped at the p90-heavy footprint from run 1.
-  - else (brand-new machine, no prior): the client fallback (`DefaultConfineMemoryReserve`, or a new
-    `--memory-reserve`/`$AIRA_CONFINE_RESERVE` override; §6).
-- Return the resolved reserve + basis in the grant.
+Daemon-owned (confine is project-less). Computed in `admitConnection` AFTER `readMemory`
+(`admit.go:105`) and BEFORE `enqueueAdmit` (`:110`) — never under `queue.mu` (Fable) — and bounded
+at ~250 ms (single-conn WAL DB, `store.go:526`; #50's pattern) with honest fallback on timeout.
+- **Signature:** confine passes `sig = ResourceSignature(nil,nil,argv)` in the admit frame (§6).
+- **Store:** daemon `confine_peak_history(signature, peak_rss NULL, oom INTEGER, at)` in `state.db`
+  (schema `store.go:737+`; WAL `:521`), indexed on signature, last-20/sig prune. NEW project-less
+  read/write methods on `*store.DB` (only `Close` is public today — Fable P2).
+- **Estimate (reuse `EstimateMemoryReserve` for the non-OOM path):** with ≥3 **usable** (non-null)
+  peak samples → `peak_max + 15%`.
+- **OOM censored-escalation (Sol P1).** A capped peak is right-censored ("needed ≥ cap"). When
+  history for `sig` has `oom_kill` samples, escalate MULTIPLICATIVELY, not +15%: reserve =
+  `max(estimate, max_oomed_cap × 1.5)`, so a repeatedly-killed command converges in ~2 runs rather
+  than creeping. Capped at (cap − headroom); if that still can't fit, → too-large (§6). This is an
+  explicit **availability tradeoff** (a novel huge job may fail its first run(s)); it is NOT
+  presented as reliably self-healing.
+- **No per-sig history → global p90 prior** (Sol v1 P1 — p90, not median; median under-reserves the
+  heavy half) of PeakMax across ≥3-usable-sample signatures, cached + lazily refreshed. A NEW heavy
+  command is capped at the p90-heavy footprint from run 1.
+- **No prior (brand-new machine) → the client fallback** (`DefaultConfineMemoryReserve`, or a pinned
+  override, §6). Return resolved reserve + basis + usable/total counts in the grant.
 
-## 5. Peak capture — confine reads it; the supervisor survives the kill (Sol P1 / Fable P2#1)
+## 5. Peak capture — confine reads it; the supervisor survives the kill (verified)
 
-The confine PARENT lives OUTSIDE the scope (only the child is placed via `CgroupFD`,
-`confine_linux.go:459`), so it survives an `oom.group` kill of the child and CAN report. After
-`waitConfineCommand` (`:530`) and before the deferred `scope.Remove` (`:381`), confine reads the
-scope's `memory.peak` via `readCgroupUsage`/`scope.Reference()` (`usage_linux.go:22`, exists) and
-the oom flag from `memory.events`; records `PeakRSS *int64` (nil = honest **unknown**, never a
-fabricated 0 — absent `memory.peak` pre-5.19) into `ConfineStatus`, and reports `(sig, peak, oom)`
-to the daemon via a new `confine-report` verb (dispatch precedent: the `admit` special-case,
-`server.go:457-469`). An oom-killed job died AT its cap, so its peak ≈ its cap → the next estimate
-rightly grows. A crashed/SIGKILLed *supervisor* never reports (stated gap). `peak=unknown` rows
-count toward TotalCount but are NOT usable peak samples (do not satisfy `≥3`).
+Only the child is placed (`CgroupFD`, `confine_linux.go:459`); the parent survives an oom.group
+child kill. After `waitConfineCommand` (`:530`), before the deferred `scope.Remove` (`:801`),
+confine reads `memory.peak` + `memory.events{oom_kill}` via `readCgroupUsage`/`scope.Reference()`
+(`usage_linux.go:22`, `cgroup_linux.go:220`) into `ConfineStatus.PeakRSS *int64` (nil = honest
+**unknown**, never 0), and reports `(sig, peak, oom)` to the daemon via a new `confine-report` verb
+(dispatch precedent `server.go:457-469`). `peak=unknown` rows count TotalCount but are NOT usable
+samples (don't satisfy ≥3). A crashed/SIGKILLed *supervisor* leaves a gap (residual, §8).
 
-## 6. Over-cap, timeout, protocol, honesty (Sol P1 ×2, Fable P1 ×3)
+## 6. Terminal rejection (no launch), overrides, protocol, honesty
 
-- **Estimate > slice cap → REJECT, never silently clamp (Sol P1).** A job whose estimate exceeds
-  the whole cap can never fit; admission returns `E_ADMIT_TOO_LARGE{estimated_required, slice_cap,
-  basis}` immediately, with an explicit `--memory-reserve <N>`/force override that runs it at a
-  smaller cap (knowingly accepting its own-scope OOM risk). Clamping-to-cap is only ever an
-  explicit labeled override.
-- **Timeout must NOT over-commit (Fable P1#3).** `timeoutAdmitWaiter` currently grants ANY waiter
-  after `maxWait` (≤30 min) + adds its full reserve — which would break Σ ≤ cap. For (1b): on
-  timeout with insufficient budget, **fail** the admission (`E_ADMIT_SATURATED: slice full for
-  <maxWait>`) rather than force-admit-and-over-commit. 30 min of genuine saturation means the box
-  is overloaded; failing honestly (the job doesn't launch) is correct — never fuel an OOM. (This is
-  (1b)'s explicit throughput trade: admission can fail under sustained saturation.)
-- **Protocol compat (Fable P1#1).** `validateAdmitArgs` (`admit.go:393`) rejects a 4th field.
-  Relax it to **accept-and-ignore** an optional `signature` (forward-compatible: an old daemon
-  ignores it and uses the client reserve; a new daemon estimates). No version bump needed; AIRA is
-  not-live so no cross-version guarantee is owed, but accept-and-ignore avoids a silent
-  flock-fallback during the install upgrade window.
-- **Honesty.** confine's output reports the resolved cap + basis: `scope-memory.max=<GiB>
-  (estimate:max=…,n=…)` / `(estimate:p90-prior)` / `(fallback:no-history)` /
-  `(fallback:daemon-unavailable)` / `(override:…)` / `(reject:too-large)`; `peak=unknown` never
-  becomes 0; the daemon-unavailable flock path keeps the flat fallback + reports it (no estimate,
-  no sub-cap, honest degraded mode).
+- **A delivered rejection MUST terminate, not fall back and launch (Fable P0 — the load-bearing
+  fold).** Today `admitThroughDaemon` maps ANY non-OK frame → `fail()` → flock fallback → launch
+  uncapped. Fix: the client distinguishes a **delivered, well-formed rejection frame** (a terminal
+  `E_ADMIT_*` — surfaced as the error; **confine does NOT create the scope or exec**; the job does
+  not launch) from **transport/daemon-unavailable** (connection error → flock fallback stays, flat
+  reserve, honest `fallback:daemon-unavailable`, no sub-cap). `confineWithDeps` must treat a
+  rejected admission as terminal, never a launchable status facet.
+  - `E_ADMIT_TOO_LARGE{required, cap_minus_headroom, basis}`: estimate can't fit even in an empty
+    slice → reject (never silent clamp); recover via the pinned override below.
+  - `E_ADMIT_SATURATED`: budget full for `maxWait` → reject (never force-grant-and-overcommit; the
+    `timeoutAdmitWaiter` force-grant at `admit.go:294-310` is replaced by a saturation rejection).
+- **Pinned-reserve override (Fable P1).** `--memory-reserve <N>` / `$AIRA_CONFINE_RESERVE` sets the
+  reserve AND a **pinned marker** in the admit frame; the daemon uses the pin verbatim (never
+  overrides it with an estimate) and still enforces Σ ≤ cap−headroom (a pin > cap−headroom →
+  too-large). Precedence: explicit `--memory-reserve`/`--memory-max` > estimate > p90 prior >
+  default. `--memory-max` (the #57 scope cap) and the granted reserve are unified: the sub-cap IS
+  the granted reserve unless `--memory-max` pins it.
+- **Grant carry-back (Fable P2):** add `reserve int64` + `basis string` to `AdmitResponse`
+  (`admit.go:65`), `runnerAdmitGrant` (`admission_linux.go:98`), and `admissionResult` (`:32`).
+- **Protocol (Fable P2):** relax `validateAdmitArgs` (`admit.go:393`) to accept `signature` +
+  `pinned`. NOTE an OLD daemon (pre-upgrade service) REJECTS the extra fields (E_PROTOCOL) → the
+  client takes the honest flock fallback until `aira install` restarts the daemon — a transient
+  upgrade-window degradation, stated.
+- **Queue aging (Sol P2):** once a waiter has waited > an aging threshold, the evaluator RESERVES
+  budget for it (does not grant a newly-fitting smaller job that would further delay the aged
+  waiter) — bounded starvation, no permanent head-of-line block.
+- **Honesty:** confine reports the resolved cap + basis (`estimate:…` / `estimate:oom-escalated` /
+  `estimate:p90-prior` / `fallback:no-history` / `fallback:daemon-unavailable` / `pinned:…` /
+  `reject:too-large`/`reject:saturated`); `peak=unknown` never becomes 0.
 
 ## 7. Tests (TDD; pure via the deps seams; proven RED)
 
-- **Lifetime hold (the crux):** with releaseAdmission moved to exit, N jobs each reserved 15 GiB
-  against 64 GiB admit only ⌊64/15⌋=4 concurrently; the rest queue — assert `outstanding` stays
-  held across the *run* (RED vs the release-at-start impl, which lets all N in). Drive Start→wait
-  with the fake clock so the reservation is observably held during the run.
-- **Sub-cap = reservation:** an admitted job's scope `memory.max` is written to its granted reserve
-  (RED vs no-sub-cap); a job exceeding it is oom.group-killed in its own scope (real-cgroup test
-  under `aira confine`), slice unaffected.
-- **Accounting:** `available = maximum − max(outstanding, current)` — a running capped job is
-  charged once, not twice (RED vs `current+outstanding`).
-- **Estimator wiring:** ≥3 usable samples PeakMax=15G → reserve 15G+15% (RED vs flat 4G); OOM-boost;
-  `peak=unknown` rows don't reach the ≥3 threshold.
-- **Global p90 prior:** no per-sig history but other ≥3-sample sigs present → reserve = p90 (RED vs
-  median / vs flat 4G / vs per-signature-only).
-- **> cap reject:** estimate > slice cap → `E_ADMIT_TOO_LARGE` + override runs at a smaller cap.
-- **Timeout saturation:** budget full for maxWait → `E_ADMIT_SATURATED` (RED vs force-grant that
-  over-commits).
-- **Peak capture + report:** confine records `(sig,peak,oom)`; parent survives an oom.group child
-  kill + still reports; `peak=unknown` stored sample-count-only.
-- **Protocol:** old daemon (no signature support) → accept-and-ignore, client uses fallback +
-  honest basis; new daemon estimates.
-- **Regression:** `aira run`'s project-scoped estimation UNCHANGED; daemon queue/timeout semantics
-  otherwise preserved.
+- **Rejected admission ⇒ NO child process (Fable P0, end-to-end):** a daemon that returns
+  `E_ADMIT_TOO_LARGE`/`E_ADMIT_SATURATED` ⇒ confine surfaces the error and NEVER creates a scope or
+  execs (assert no child, no scope) — RED vs the current fall-back-and-launch. A daemon-unavailable
+  (transport error) ⇒ flock fallback DOES launch (the distinction).
+- **Lifetime hold:** N jobs reserved 15 GiB vs (64−headroom) admit only ⌊(60)/15⌋ concurrently, the
+  rest queue, and `outstanding` stays held across the run (RED vs release-at-start).
+- **Sub-cap = reservation + contained kill (real-cgroup, under `aira confine`):** an admitted job's
+  scope `memory.max` = granted; a job exceeding it is oom.group-killed in its own scope; the slice
+  never reaches its own cap (headroom).
+- **Accounting:** `(max−headroom) − max(outstanding,current)` — a running capped job charged once.
+- **Estimator + OOM escalation:** ≥3 usable PeakMax=15G → 15G+15%; a sig with oom_kill history →
+  multiplicative escalation converges (RED vs +15% creep); `peak=unknown` doesn't reach ≥3.
+- **p90 prior; too-large reject + pinned override; saturation reject; aging (aged waiter not
+  starved by a small fitter).**
+- **Peak capture + report:** parent survives an oom.group child kill + still reports; `peak=unknown`
+  stored sample-count-only.
+- **Regression:** `aira run` estimation UNCHANGED; daemon queue otherwise preserved.
 - `go build/vet ./... && go test ./internal/runner/ ./internal/daemon/ ./cmd/aira/ -race` green;
-  full `make test` under `aira confine`.
+  `make test` under `aira confine`.
 
-## 8. Deferrals / stated residual risk
-- Signature fragmentation (volatile argv → few reach 3 samples) is real; the **p90 prior is the
-  mitigation** (fragmented/novel commands are capped at the heavy-job prior, not 4 GiB). Argv
-  canonicalization/hashing is deferred.
-- A crashed *supervisor* leaves a history gap (survivor bias for the rare SIGKILL-of-supervisor).
-- Cross-machine history is out of scope (single machine).
-- The watchdog + slice cap remain as defence-in-depth, but with (1b) the slice cap can no longer be
-  exceeded by admitted jobs, so the innocent-victim kill is eliminated by construction.
+## 8. Residual risk (stated, not silent)
+- Σ ≤ cap−headroom holds only for **confine tenants**; `aira run` keeps release-at-start + uncapped
+  scopes; a **daemon restart drops all held reservations mid-job** (a burst right after restart can
+  transiently over-admit); signature fragmentation → the p90 prior is the mitigation; a crashed
+  *supervisor* leaves a history gap. The watchdog + slice cap + the headroom remain defence-in-depth
+  — but with (1b) the slice cap is never *reached* by admitted confine jobs, so the innocent-victim
+  kill is eliminated by construction for the confine workload.
