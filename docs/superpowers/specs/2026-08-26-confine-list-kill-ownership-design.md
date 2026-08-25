@@ -1,6 +1,15 @@
 # `aira confine --list` / `--kill`: discoverable, ownership-guarded confine job control
 
-Status: PLAN v2 (re-gate). v1 was GATE-FAIL by Sol + DeepSeek + Fable (three lineages, strongly
+Status: PLAN v3 (BUILDER-READY). v2 re-gate: **Fable GATE-PASS-WITH-NITS ("the build can start" —
+all five v1 P1s verified closed against the code, exactly-once release re-confirmed, no new load-
+bearing problem) + Sol substantively-closed**. v3 folds the 4 P2 nits: **(1)** explicitly hoist
+`confineScopeID` to *before* `deps.admit` (a required build step — it is computed after admit today);
+**(2)** the `registry ∪ scan` union dedups by canonical scope-id (one record; registry enriches
+owner; conflicts fail closed) and `--kill` resolves owner from a *fresh* registry lookup, never a
+`--list` snapshot; **(3)** two dispatch verbs derive two MCP tools; **(4)** `--owner` on both the
+launch-form allowlist and the management parser, the kill holds one scope **dirfd** across
+observe→kill→confirm, and `owner` values are charset-sanitised (accidental same-uid isolation, not
+authentication). v1 was GATE-FAIL by Sol + DeepSeek + Fable (three lineages, strongly
 convergent). Fable's **code-grounded** gate verified the architecture is sound and feasible (held-
 admit-lease anchor, scope-path `cgroup.kill`, registry-as-view, exactly-once release already
 structurally guaranteed) and that only five load-bearing P1s + P2 polish need folding — bounded
@@ -44,9 +53,14 @@ The v1 error was anchoring *existence* on the daemon admit connection. Corrected
   from #67); `validateAdmitArgs` records them on the granted waiter (`admit.go:599`). The registry is
   a view over held confine leases, keyed by `scope_id`. It supplies **owner** (and the RAM
   reservation link), never existence.
-- **`--list` and `--kill` operate on `registry ∪ cgroup-scan`.** A scan-only scope (flock-fallback,
-  orphaned supervisor, pre-restart) has `owner=unknown` and is treated as foreign (→ `--steal`). A
-  registry entry with no scope dir yet (grant→`backend.Create` window) is `pending`/mid-launch.
+- **`--list` and `--kill` operate on `registry ∪ cgroup-scan`, deduped by canonical scope-id.** The
+  scan (existence) is the spine: one record per `.aira-CONFINE-*` dir. The registry *enriches* the
+  matching record with `owner` (+ the reservation link). A scan-only scope (flock-fallback, orphaned
+  supervisor, pre-restart) has `owner=unknown` and is treated as foreign (→ `--steal`). A registry
+  entry with no scope dir yet (grant→`backend.Create` window) is `pending`/mid-launch (not a second
+  record). Any registry/scan skew resolves conservatively (`unknown` → `--steal`, never an enabled
+  kill). `--kill` resolves the scope's owner from a **fresh registry lookup at kill time**, never
+  from a stale `--list` snapshot, so a caller's own just-registered job is not spuriously foreign.
 
 ### Owner identity (folds P1-b — run's `project.WorktreeID` does not exist project-less)
 
@@ -74,8 +88,10 @@ Enumerate live confine scopes from `registry ∪ aira.slice cgroup-scan`. Column
 - Per-field read failure ⇒ that field `unevaluated`, never 0. If the slice cgroup itself is
   unreadable ⇒ the whole result is `unevaluated` with a reason, never a fabricated empty list.
 
-CLI (human table + `--json`) and MCP (`aira_confine`, op `list`). No selector. `--json` is permitted
-on the management form (folds P2-a — today `main.go:382` rejects `--json` for all confine).
+CLI (human table + `--json`) and its own derived MCP tool (the dispatch verb `confine-list` yields
+one MCP tool; `confine-kill` yields a second — two verbs, two tools, per the dispatch-table
+derivation, §6/§8). No selector. `--json` is permitted on the management form (folds P2-a — today
+`main.go` rejects `--json` for all confine).
 
 ## 5. `aira confine --kill <selector> [--steal]` (SafetyExecute, Destructive)
 
@@ -90,9 +106,11 @@ Kill exactly one confine scope, honestly.
   `unknown` → `E_CONFINE_OWNER_UNVERIFIED{scope, owner, caller}` unless `--steal` (renamed from the
   v1 `E_CONFINE_KILL_UNVERIFIED` — it names a refusal, folds P2-f).
 - **`scope_id` path validation (folds P1-e).** `validateAdmitArgs` accepts a `scope_id` only if it
-  matches `^CONFINE-[A-Za-z0-9._-]+-[0-9]+-[0-9a-z]+$`; the kill path targets only a direct child of
-  the resolved slice dir named `.aira-<scope_id>` (dirfd-relative `openat` under the slice, no
-  symlink, no `..`). A traversal-shaped id is rejected at admit, never reaching a kill.
+  matches `^CONFINE-[A-Za-z0-9._-]+-[0-9]+-[0-9a-z]+$`; the kill opens only a direct child of the
+  resolved slice dir named `.aira-<scope_id>` (dirfd-relative `openat` under the slice, `O_NOFOLLOW`,
+  no `..`). A traversal-shaped id is rejected at admit, never reaching a kill. The kill holds **one
+  opened scope dirfd across observe→kill→confirm** (populated-read, `cgroup.kill`, `waitEmpty` all
+  relative to that fd) so no path re-resolution can retarget a recycled dir mid-operation.
 - **The kill = `cgroup.kill` on the validated scope path** (reuse `linuxScope.Kill()`,
   `cgroup_linux.go:269`): atomic, whole-subtree, **reparenting-proof** — fixes the incident (the
   reparented supervisor's *child scope* still dies regardless of the supervisor's PID/parent). The
@@ -153,8 +171,11 @@ Kill exactly one confine scope, honestly.
 ## 8. Code map (verified by the Fable gate against the code)
 
 - `internal/runner/confine.go`/`confine_linux.go`: add `Owner` to `ConfineRequest` (derivation chain
-  §3); send `scope_id`+`name`+`owner` in the admit frame (`admitConfine` ~`:603`); `confineScopeID`
-  (`:651`) computed before admit; child placed via `CgroupFD` (`:499`).
+  §3); send `scope_id`+`name`+`owner` in the admit frame (`admitConfine` ~`:603`). **Required build
+  step: hoist `confineScopeID` (`:651`) to BEFORE `deps.admit` (`:376`)** — today it is computed
+  inside `backend.Create` (`:400`), *after* admit; it is a pure function of name+pid+nanotime, so the
+  hoist is trivial but load-bearing (the admit frame must carry the scope-id). Child placed via
+  `CgroupFD` (`:499`).
 - `internal/daemon/admit.go`: `validateAdmitArgs` (`:599`) accepts + **validates** `scope_id`
   (canonical regex) and records `name`/`owner` on the granted waiter; the active-confine registry is a
   filtered view of held confine leases; `releaseAdmitWaiter` (`:504-521`) is the idempotent release.
@@ -168,7 +189,10 @@ Kill exactly one confine scope, honestly.
 - `internal/core/routing.go`, `mcp_project.go`, `dispatcher.go`: `Classify` RouteClient +
   `StoreFreeCarved` membership; MCP project carve-out.
 - `cmd/aira/main.go`: parse `--list` / `--kill <selector>` / `--steal` / `--owner` for `confine`
-  (management form has no `--` delimiter; allow `--json`; branch the `--`-mandatory check `:519-529`).
+  (management form has no `--` delimiter; allow `--json`; the management branch precedes the
+  `--`-mandatory check `:519-529`). Add `--owner` to the **launch-form** option allowlist (`:537`)
+  too, not only the management parser. `owner` values are charset-sanitised (same allowlist as the
+  scope-id charset) on both forms.
 - `internal/core/skill.go` + `internal/install/install.go` (embedded guide): kill-guidance rewrite;
   drop `whale-run`.
 - New stable codes: `E_CONFINE_OWNER_UNVERIFIED`, `E_CONFINE_NOT_FOUND`, `U_CONFINE_NOT_LAUNCHED`,
@@ -184,8 +208,10 @@ Kill exactly one confine scope, honestly.
   placement observes `populated≥1` and truly kills.
 - **Reparented-supervisor kill (the incident, real-cgroup):** a scope whose supervisor is reparented /
   launcher gone is killed by scope-id; assert workload PIDs die.
-- **Scan-union (folds P1-d):** a flock-fallback / scan-only scope (no registry entry) appears in
-  daemon-up `--list` with `owner=unknown` and is killable only with `--steal`.
+- **Scan-union + dedup (folds P1-d):** a flock-fallback / scan-only scope (no registry entry) appears
+  in daemon-up `--list` with `owner=unknown` and is killable only with `--steal`; a scope present in
+  BOTH registry and scan appears **once** with the registry's owner (no double-count); `--kill`
+  resolves owner from a fresh registry lookup (a just-registered own job is killable without `--steal`).
 - **scope_id validation (folds P1-e):** an admit frame with a traversal-shaped `scope_id`
   (`../`, `/`, non-canonical) is rejected at `validateAdmitArgs`; no kill path is ever composed from it.
 - **Daemon-down degrade:** `--list` via scan (`owner=unknown`); `--kill` without `--steal` →
@@ -200,7 +226,9 @@ Kill exactly one confine scope, honestly.
   `outstandingJobs` return to baseline once.
 - **Registry lifetime:** entry on grant, gone on lease close; startup rescan surfaces a pre-existing
   scope with `owner=unknown`.
-- **Faces:** MCP `aira_confine` list/kill dispatch works **outside a project** (carve-out); Skill
+- **Faces:** the two MCP tools (from `confine-list`/`confine-kill`) dispatch **outside a project**
+  (carve-out), and an e2e test proves the carve-out still enforces ownership, the Destructive
+  marking, and `--steal` — i.e. it bypasses only project discovery, not any safety check. Skill
   contains the new guidance and **no** `whale-run`.
 - Regression: `aira run`/`run-kill` ownership + #67 admission unchanged; `go build/vet ./... &&
   go test ./internal/runner/ ./internal/daemon/ ./cmd/aira/ ./internal/core/ -race` green; `make test`
@@ -216,6 +244,8 @@ Kill exactly one confine scope, honestly.
   only) → `--steal` needed (honest, consistent with #67 §8 reservation drop).
 - A wedged supervisor that never reaps its killed child lingers outside the scope doing nothing; the
   daemon frees its lease on the confirmed kill so no reservation leaks.
-- `owner` is a cooperative session id (like `run`), not an OS credential; the guard prevents
-  *accidental* cross-session kills, not a hostile same-uid actor (out of scope, as for `run`). An
+- `owner` is a cooperative, caller-supplied, **spoofable** session id (like `run`), not an OS
+  credential: the guard is **accidental same-uid isolation, not authentication**. It prevents an agent
+  from *accidentally* killing another session's job, not a hostile same-uid actor (out of scope, as
+  for `run`). `owner` values are charset-sanitised (no injection into the scope/kill path). An
   optional `SO_PEERCRED` cross-check of the admit-conn PID is noted for a future hardening.
