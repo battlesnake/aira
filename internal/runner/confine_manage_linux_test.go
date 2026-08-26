@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"syscall"
@@ -83,6 +84,10 @@ func TestConfineListHonestyUnreadablePerFieldAndHusk(t *testing.T) {
 	}
 	if kill, killErr := KillConfine(context.Background(), missing, "job", "owner", true, nil, nil); killErr == nil || !strings.HasPrefix(killErr.Error(), CodeConfineKillUnconfirmed+":") || kill.Status == "killed" {
 		t.Fatalf("unreadable kill=%+v err=%v", kill, killErr)
+	}
+	reap, reapErr := ReapOrphanedConfineScopes(context.Background(), missing, time.Minute, nil, nil)
+	if reapErr != nil || reap.Verdict != "unevaluated" || reap.Reason == "" || reap.Reaped == nil {
+		t.Fatalf("unreadable reap=%+v err=%v", reap, reapErr)
 	}
 
 	slice := t.TempDir()
@@ -363,6 +368,76 @@ func TestConfineRealScopeKillSurvivesLauncherIdentityLoss(t *testing.T) {
 	}
 	if empty, emptyErr := scope.Empty(); emptyErr != nil || !empty {
 		t.Fatalf("reparented workload survived cgroup.kill: empty=%v err=%v", empty, emptyErr)
+	}
+}
+
+func TestReapOrphanedConfineScopesRealCgroupSafetyGates(t *testing.T) {
+	parent := cgrouptest.IsolatedScopeParent(t)
+	backend := newDefaultBackend(parent)
+	if err := backend.Probe(context.Background()); err != nil {
+		cgrouptest.SkipOrFailRealCgroup(t, "real confine reaper backend unavailable: %v", err)
+	}
+
+	exited := exec.Command("/bin/true")
+	if err := exited.Run(); err != nil {
+		t.Fatal(err)
+	}
+	deadPID := exited.ProcessState.Pid()
+	now := time.Now()
+	oldStamp := now.Add(-10 * time.Second).UnixNano()
+	oldOrphan := confineTestScopeID("orphan", deadPID, oldStamp)
+	live := confineTestScopeID("live", os.Getpid(), oldStamp+1)
+	populated := confineTestScopeID("populated", deadPID, oldStamp+2)
+	young := confineTestScopeID("young", deadPID, now.UnixNano())
+	// leased is empty + dead-PID + old like oldOrphan, but a live daemon admit
+	// lease (hasLiveLease) must keep it — the PID-namespace-independent guard.
+	leased := confineTestScopeID("leased", deadPID, oldStamp+3)
+
+	for _, id := range []string{oldOrphan, live, populated, young, leased} {
+		scope, err := backend.Create(context.Background(), id)
+		if err != nil {
+			cgrouptest.SkipOrFailRealCgroup(t, "create real reaper scope %s: %v", id, err)
+		}
+		if err := scope.(*linuxScope).fd.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	populatedPath := filepath.Join(parent, ".aira-"+populated)
+	populatedFD, err := os.OpenFile(populatedPath, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sleeper := exec.Command("/bin/sleep", "60")
+	sleeper.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(populatedFD.Fd())}
+	if err := sleeper.Start(); err != nil {
+		_ = populatedFD.Close()
+		cgrouptest.SkipOrFailRealCgroup(t, "start populated reaper scope workload: %v", err)
+	}
+	_ = populatedFD.Close()
+	t.Cleanup(func() {
+		_ = sleeper.Process.Kill()
+		_ = sleeper.Wait()
+	})
+
+	result, err := ReapOrphanedConfineScopes(context.Background(), parent, 5*time.Second, func(pid int) bool {
+		return pid == deadPID
+	}, func(scopeID string) bool {
+		return scopeID == leased
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Verdict != "pass" || !reflect.DeepEqual(result.Reaped, []string{oldOrphan}) {
+		t.Fatalf("result=%+v, want only %s reaped", result, oldOrphan)
+	}
+	if _, err := os.Stat(filepath.Join(parent, ".aira-"+oldOrphan)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old orphan still exists: %v", err)
+	}
+	for _, id := range []string{live, populated, young, leased} {
+		if _, err := os.Stat(filepath.Join(parent, ".aira-"+id)); err != nil {
+			t.Fatalf("guarded scope %s removed: %v", id, err)
+		}
 	}
 }
 

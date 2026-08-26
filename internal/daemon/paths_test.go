@@ -139,6 +139,49 @@ func TestRegistryDiscoveryIntervalConfig(t *testing.T) {
 	}
 }
 
+func TestScopeReapIntervalConfig(t *testing.T) {
+	// The "default" case os.Unsetenv's the var (t.Setenv cannot unset); restore the
+	// TestMain-set value afterwards so later daemon tests keep the reaper inert.
+	if orig, had := os.LookupEnv("AIRA_DAEMON_SCOPE_REAP_INTERVAL"); had {
+		t.Cleanup(func() { _ = os.Setenv("AIRA_DAEMON_SCOPE_REAP_INTERVAL", orig) })
+	} else {
+		t.Cleanup(func() { _ = os.Unsetenv("AIRA_DAEMON_SCOPE_REAP_INTERVAL") })
+	}
+	tests := []struct {
+		name  string
+		set   bool
+		value string
+		want  time.Duration
+		code  string
+	}{
+		{name: "default", want: 5 * time.Minute},
+		{name: "duration", set: true, value: "2m", want: 2 * time.Minute},
+		{name: "disabled", set: true, value: "disabled", want: 0},
+		{name: "zero", set: true, value: "0", want: 0},
+		{name: "too small", set: true, value: "500ms", code: "E_CONFIG_INVALID"},
+		{name: "malformed", set: true, value: "garbage", code: "E_CONFIG_INVALID"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if test.set {
+				t.Setenv("AIRA_DAEMON_SCOPE_REAP_INTERVAL", test.value)
+			} else {
+				_ = os.Unsetenv("AIRA_DAEMON_SCOPE_REAP_INTERVAL")
+			}
+			got, err := scopeReapIntervalFromEnv()
+			if test.code != "" {
+				if err == nil || !strings.HasPrefix(err.Error(), test.code+":") {
+					t.Fatalf("interval=%v err=%v, want %s", got, err, test.code)
+				}
+				return
+			}
+			if err != nil || got != test.want {
+				t.Fatalf("interval=%v want=%v err=%v", got, test.want, err)
+			}
+		})
+	}
+}
+
 func TestMalformedRegistryDiscoveryIntervalFailsDaemonStartup(t *testing.T) {
 	paths := testPaths(t)
 	t.Setenv("AIRA_DAEMON_DISCOVERY_INTERVAL", "eventually")

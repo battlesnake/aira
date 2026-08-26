@@ -19,3 +19,7 @@ func listConfines(context.Context, string, []ConfineRegistryEntry) (ConfineListR
 func killConfine(context.Context, string, string, string, bool, []ConfineRegistryEntry, ConfineOwnerLookup, time.Duration) (ConfineKillResult, error) {
 	return ConfineKillResult{}, errors.New("E_CONFINE_UNAVAILABLE: confine management requires Linux")
 }
+
+func ReapOrphanedConfineScopes(context.Context, string, time.Duration, func(int) bool, func(string) bool) (ConfineReapResult, error) {
+	return ConfineReapResult{Verdict: "unevaluated", Reason: "confine is linux-only", Reaped: []string{}}, nil
+}

@@ -48,6 +48,37 @@ type ConfineKillResult struct {
 	Owner   string `json:"owner"`
 }
 
+type ConfineReapResult struct {
+	Verdict string   `json:"verdict"`
+	Reason  string   `json:"reason,omitempty"`
+	Reaped  []string `json:"reaped"`
+	Skipped int      `json:"skipped"`
+}
+
+// orphanedConfineScopeCandidates requires positive proof for every orphan
+// facet. Unknown population, supervisor, or age state is never a candidate. A
+// scope with a live daemon admit lease (hasLiveLease) is NEVER a candidate: that
+// is the authoritative, PID-namespace-independent liveness signal — kill(pid,0)
+// alone can misjudge a supervisor whose scope-id PID is namespace-local.
+func orphanedConfineScopeCandidates(records []ConfineRecord, grace time.Duration, supervisorDead func(pid int) bool, hasLiveLease func(scopeID string) bool) []ConfineRecord {
+	graceSeconds := int64(grace / time.Second)
+	candidates := make([]ConfineRecord, 0)
+	if supervisorDead == nil {
+		return candidates
+	}
+	for _, record := range records {
+		if record.Populated == nil || *record.Populated != 0 ||
+			record.SupervisorPID == nil || !supervisorDead(*record.SupervisorPID) ||
+			record.AgeSeconds == nil || *record.AgeSeconds < graceSeconds ||
+			record.Pending ||
+			(hasLiveLease != nil && hasLiveLease(record.ScopeID)) {
+			continue
+		}
+		candidates = append(candidates, record)
+	}
+	return candidates
+}
+
 // ConfineOwnerLookup is deliberately invoked after selector resolution, at
 // kill time, so ownership never comes from a stale list snapshot.
 type ConfineOwnerLookup func(scopeID string) (owner string, known bool)

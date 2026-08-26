@@ -132,6 +132,56 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 	return result, nil
 }
 
+func ReapOrphanedConfineScopes(ctx context.Context, slicePath string, grace time.Duration, supervisorDead func(pid int) bool, hasLiveLease func(scopeID string) bool) (ConfineReapResult, error) {
+	return reapOrphanedConfineScopesWithDeps(ctx, slicePath, grace, supervisorDead, hasLiveLease, defaultConfineScanDeps())
+}
+
+func reapOrphanedConfineScopesWithDeps(ctx context.Context, slicePath string, grace time.Duration, supervisorDead func(pid int) bool, hasLiveLease func(scopeID string) bool, deps confineScanDeps) (ConfineReapResult, error) {
+	listed, err := listConfinesWithDeps(ctx, slicePath, nil, deps)
+	if err != nil {
+		return ConfineReapResult{}, err
+	}
+	if listed.Verdict == "unevaluated" {
+		return ConfineReapResult{Verdict: "unevaluated", Reason: listed.Reason, Reaped: []string{}}, nil
+	}
+	if supervisorDead == nil {
+		supervisorDead = pidIsDead
+	}
+	candidates := orphanedConfineScopeCandidates(listed.Scopes, grace, supervisorDead, hasLiveLease)
+	result := ConfineReapResult{Verdict: "pass", Reaped: []string{}}
+	parentFD, err := unix.Open(slicePath, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return result, fmt.Errorf("open confine slice for orphan reap: %w", err)
+	}
+	defer unix.Close(parentFD)
+	for _, record := range candidates {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		if !validConfineScopeID(record.ScopeID) {
+			result.Skipped++
+			continue
+		}
+		// Remove anchored to the O_NOFOLLOW parent fd, never by reconstructed path:
+		// AT_REMOVEDIR is an atomic rmdir that the kernel performs ONLY on a
+		// genuinely empty cgroup (a repopulated scope, a scope that grew a child
+		// cgroup, or a name swapped to a symlink all fail with EBUSY/ENOTDIR →
+		// Skipped, never a fabricated reap). Scope IDs are unique per launch, so a
+		// mid-launch scope can never reuse this name.
+		childName := ".aira-" + record.ScopeID
+		if err := unix.Unlinkat(parentFD, childName, unix.AT_REMOVEDIR); err != nil {
+			result.Skipped++
+			continue
+		}
+		result.Reaped = append(result.Reaped, record.ScopeID)
+	}
+	return result, nil
+}
+
+func pidIsDead(pid int) bool {
+	return errors.Is(unix.Kill(pid, 0), unix.ESRCH)
+}
+
 func mergeConfineRegistry(byID map[string]ConfineRecord, registry []ConfineRegistryEntry) {
 	seen := make(map[string]ConfineRegistryEntry)
 	conflict := make(map[string]bool)

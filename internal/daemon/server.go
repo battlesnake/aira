@@ -75,6 +75,7 @@ type Server struct {
 	admitPriorAt                 time.Time
 	admitSliceHeadroomBase       int64
 	admitSliceHeadroomSupervisor int64
+	scopeReapGrace               time.Duration
 
 	// Test seams. Production always calls the Store methods and DB.Close.
 	reapScope            func(context.Context, *store.Store) (int, error)
@@ -108,6 +109,7 @@ func NewServer(paths Paths) *Server {
 		admitQueues:                  map[string]*sliceQueue{},
 		admitSliceHeadroomBase:       admitSliceHeadroomBaseDefault,
 		admitSliceHeadroomSupervisor: admitSliceHeadroomSupervisorDefault,
+		scopeReapGrace:               defaultScopeReapGrace,
 		storeOpAppendTimeout:         30 * time.Second,
 		storeOpHeavyTimeout:          5 * time.Minute,
 		storeOpWriteTimeout:          30 * time.Second,
@@ -128,6 +130,10 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		return err
 	}
 	discoveryInterval, err := registryDiscoveryIntervalFromEnv()
+	if err != nil {
+		return err
+	}
+	scopeReapInterval, err := scopeReapIntervalFromEnv()
 	if err != nil {
 		return err
 	}
@@ -263,6 +269,12 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		defer close(discoveryDone)
 		s.runRegistryDiscovery(discoveryCtx, discoveryInterval)
 	}()
+	scopeReaperCtx, cancelScopeReaper := context.WithCancel(ctx)
+	scopeReaperDone := make(chan struct{})
+	go func() {
+		defer close(scopeReaperDone)
+		s.runScopeReaper(scopeReaperCtx, scopeReapInterval)
+	}()
 	watchdogCtx, cancelWatchdog := context.WithCancel(ctx)
 	watchdogDone := make(chan struct{})
 	watchdogRuntimeDeps := watchdogDeps{}
@@ -306,6 +318,7 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	cancelReaper()
 	cancelFlusher()
 	cancelDiscovery()
+	cancelScopeReaper()
 	cancelWatchdog()
 	_ = listener.Close()
 	drained := make(chan struct{})
@@ -315,6 +328,7 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		<-reaperDone
 		<-flusherDone
 		<-discoveryDone
+		<-scopeReaperDone
 		<-watchdogDone
 		close(drained)
 	}()
