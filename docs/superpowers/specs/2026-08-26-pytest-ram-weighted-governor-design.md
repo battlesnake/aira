@@ -1,151 +1,177 @@
 # RAM-weighted pytest governor: per-test memory reservation against the shared aira.slice ledger
 
-Status: PLAN v1 (for the Sol + DeepSeek + Fable plan-gate). Owner-initiated (2026-08-26): the #49 CPU
-governor caps concurrent test COUNT (≈nproc uniform flock slots) but treats every test as equal
-weight; memory-heavy tests (multi-GB OHW-corpus items) fill all slots and blow the 64 GiB `aira.slice`
-cap even though the count is bounded — a real `-n16` OOM across two sessions' overlapping suites. Owner
-asked for a per-test/suite/group RAM-estimate **annotation**, a **no-op shim** when the AIRA plugin is
-absent, and a **sane nonzero default**. Owner-chosen fork (brainstormed): **reuse #67's daemon
-admission** (one honest ledger shared by confine jobs and pytest workers) over a governor-local pool.
+Status: PLAN v2 (BUILDER-READY). v1 re-gate: **Fable GATE-PASS-WITH-NITS — Model 3 verified CORRECT
+against the #67 ledger** (the daemon charges `max(outstanding, current)`, never the sum, so a
+reservation and its realized RSS never double-count, and actual slice usage self-corrects admission
+when estimates are wrong). Sol + DeepSeek GATE-FAILed on a double-count / "leases-aren't-enforcement"
+reading that the code refutes; their valid residue (fail-open policy, default-must-pin) is folded as
+Fable's nits. v2 folds Fable's 3 mandatory P1s + 5 P2s: **(a)** v1 reserves are always PINNED (an
+unpinned request with no per-signature history applies the machine-wide p90 prior over ALL confine
+peaks — admit.go:198 — ballooning a light test); **(b)** `confine-reserve` is DAEMON-ONLY (no flock
+fallback — else a daemon-down test holds the machine-wide flock for its whole runtime); **(c)** the
+governor env is coupled to `--delegate-ram` by construction (stripped on non-delegate launches);
+plus the marker grammar, fork-stdin close, fail-open policy, dispatch template, and test additions.
+Owner-initiated (2026-08-26); owner-chosen fork: reuse #67's shared ledger.
 
 ## 1. Motivation & root cause (verified)
 
 `internal/pylib/aira_xdist_governor/__init__.py` holds one kernel `flock` on a `slot-N` file
-(`AIRA_CPU_SLOTS_DIR`, an immutable pool of `NumCPU-reserve` slots created by
-`internal/daemon/cpuslots.go`) across each test's setup/call/teardown. This bounds concurrent test
-COUNT to ≈nproc but is RAM-blind: N uniform slots × heterogeneous per-test memory can exceed the slice
-cap. The `-n16` failure was **inter-suite** (two sessions' suites filled the shared slot pool
-together), so only a **shared** RAM ledger — not a suite-local one — bounds it. #67 already maintains
-exactly such a ledger: the daemon's `aira.slice` admission holds Σ granted ≤ cap − headroom.
+(`AIRA_CPU_SLOTS_DIR`, an immutable ~nproc pool from `internal/daemon/cpuslots.go`) per test →
+bounds concurrent test COUNT, RAM-blind. The real `-n16` failure was inter-suite (two sessions'
+suites filled the shared slot pool; 15 multi-GB corpus tests exceeded the 64 GiB slice → OOM). Only a
+SHARED RAM ledger bounds that. #67 is exactly that ledger: the daemon's `aira.slice` admission holds
+Σ granted ≤ cap − headroom and **charges `max(outstanding, current)`** (`checkedAvailable`,
+admit.go:494-507), so it accounts a job by the greater of its reservation and its live RSS.
 
 ## 2. Design — per-test RAM reservation against the shared #67 ledger
 
-Compose two independent, both-fail-open gates per test (in `pytest_runtest_protocol`, around the
-existing CPU-slot acquire):
-1. the existing **CPU-slot flock** (bounds count ≈nproc) — unchanged;
+Per test, in `pytest_runtest_protocol`, compose two independent, both-fail-open gates:
+1. the existing **CPU-slot flock** (bounds count ≈nproc) — unchanged, acquired FIRST;
 2. a new **RAM reservation** of the test's estimate, held for the test's duration, granted by the
-   daemon's #67 admission against `aira.slice` (Σ granted ≤ cap − headroom).
+   daemon's #67 admission against `aira.slice`.
 
-A memory-heavy test therefore blocks in admission until the slice budget has room, while light tests
-(small estimate) admit instantly and parallelise freely — so aggregate concurrent test RAM across ALL
-sessions' suites stays under the slice cap. The reservation is released the instant the test finishes.
+A heavy test blocks in admission until the slice budget has room; light tests admit instantly and
+parallelise. Because RAM-acquire follows slot-acquire, concurrent held reservations ≤ ~nproc
+(≪ `admitMaxWaiters=256`, admit.go:24). A slot-holding test waiting on RAM holds NO reservation, so
+all `outstanding` belongs to running jobs that complete → no deadlock. Crash-safe: the daemon peer-
+read goroutine (admit.go:303) + idempotent `releaseAdmitWaiter` (:523) free the lease on ANY
+connection close, including `kill -9` / oom.group of the whole suite.
 
-### 2a. The suite/test double-counting problem (KEY GATE QUESTION)
+### 2a. Suite/test accounting — Model 3, verified correct
 
-The pytest invocation itself runs under `aira confine -- pytest -n N` (heavy-command policy), i.e. as
-ONE confine job with its own slice reservation + scope. The tests' memory lives INSIDE that scope. If
-each test ALSO reserves against the slice on top of a suite-sized reservation, the slice ledger
-double-counts (suite reservation + test reservations both charge, but the tests' RAM is within the
-suite's already-charged scope). Proposed resolution (**Model 3**, for gate scrutiny):
+The pytest invocation runs as ONE confine job (`aira confine --delegate-ram -- pytest -n N`). Two
+code facts make per-test reservations sound WITHOUT double-counting:
+- **`max(outstanding, current)` charging** (admit.go:494): the suite's realized RSS (`current`) and
+  the per-test reservations (`outstanding`) never sum — the ledger takes the greater. So the tests'
+  reservations and their actual memory are one charge, not two.
+- **Auto-sub-cap opt-out**: an admitted confine grant is auto-enforced as the suite scope's
+  `memory.max` (confine_linux.go:450-460). A per-test-on-top-of-a-suite-reservation design would
+  OOM-kill the whole suite at the (small) suite reserve regardless of test grants. **`--delegate-ram`
+  suppresses ONLY the `confine_linux.go:458` auto-sub-cap write**; `oom.group` (:446) and the finite-
+  cap refuse-precondition (:354) are upstream and REMAIN — containment intact (an over-running suite
+  is oom.group-killed within the slice, never a random victim). The suite's own reservation is a
+  minimal framework overhead via the existing `--memory-reserve` flag (cmd/aira/main.go:580, already
+  auto-pinned, confine_linux.go:366).
+- **Inter-suite bound holds**: both suites' per-test reservations land in the same per-slice
+  `queue.outstanding`, so Σ across sessions ≤ cap − headroom (the `-n16` fix). Confirmed necessary +
+  sufficient; no cleaner model found.
 
-- The pytest confine job **delegates its RAM accounting to the per-test reservations**: it launches
-  with a MINIMAL framework-overhead reservation and **no per-scope `memory.max` sub-cap** (a confine
-  launch mode: `--memory-reserve=<overhead>` + opt-out of the #67 estimate sub-cap, e.g.
-  `AIRA_CONFINE_DELEGATE_RAM=1` / a `--delegate-ram` flag), so the slice ledger is charged by the
-  governor's per-test reservations, not a big suite reservation. Containment (oom.group) + slice-
-  boundedness remain; the slice cap + watchdog are the backstop.
-- Alternatives the gate should weigh: (A) the governor reserves against a SUITE-LOCAL budget = the
-  suite's own confine `memory.max` (bounds intra-suite only — does NOT fix the inter-suite `-n16`
-  case, so rejected as the primary); (B) the governor's reservations are the suite's reservation —
-  the suite reserves 0 up front and the tests reserve incrementally (≈Model 3). This interaction is
-  the single most load-bearing correctness question and is called out explicitly.
+## 3. Estimate model (annotation > pinned default; both PINNED in v1)
 
-## 3. Estimate model (annotation > default; history deferred)
+Per-test estimate precedence, both arms **pinned** in v1 (P1-a — an unpinned reserve with no
+`pytest:<nodeid>` history hits `resolveAdmitReserve`'s p90 prior over ALL confine peaks, admit.go:198,
+ballooning a light test to a whole-command footprint):
+1. **`aira_mem` pytest marker** — test / class / module scope (marker inheritance gives suite/group:
+   `@pytest.mark.aira_mem("4G")`, or `pytestmark = pytest.mark.aira_mem("512M")` at module top). Value
+   grammar is **exactly `runner.ParseMemorySize`** (`[0-9]+[KMGkmg]?`, memory_size.go:15) — `"4G"`,
+   `"512M"`, or a bare byte int; **NOT** `"4GB"`/`"512MiB"`. Parsed IN PYTHON (a ~5-line grammar
+   mirror) so an unparseable marker falls to the default + one log (§7) rather than being an
+   indistinguishable helper error. Sent as a **pinned** reserve.
+2. **configured nonzero pinned default** (`AIRA_TEST_MEM_DEFAULT`, e.g. `512M`) when no marker —
+   nonzero is load-bearing (a 0 default admits unlimited heavies = the `-n16` failure). Sent pinned.
+- **History self-calibration is DEFERRED to v2** (§10). In v1 both arms pin, so #67's estimate/p90
+  never applies to tests (correct — avoids the balloon). v2 adds per-test peak reporting → an unpinned
+  history-estimated default.
 
-Per-test estimate precedence:
-1. **`aira_mem` pytest marker** — appliable at test / class / module scope (pytest marker inheritance
-   gives "suite or group" for free: `@pytest.mark.aira_mem("4GB")`, or `pytestmark =
-   pytest.mark.aira_mem("512MB")` at module top). Value: a human size (`"4GB"`,`"512MiB"`, or an int
-   of bytes), parsed by the existing `[KMG]` parser lineage. The marker maps to #67's **pinned
-   reserve** (the daemon uses it verbatim, never estimate-overrides it, still ≤ ceiling).
-2. **configured nonzero default** (`AIRA_TEST_MEM_DEFAULT`, e.g. 512 MiB) when no marker — **nonzero
-   is load-bearing**: a zero default would let unlimited unannotated heavies through (the exact
-   `-n16` failure). Passed as the reservation when unpinned.
-- **History self-calibration is DEFERRED to v2** (§10): reliable per-test peak-RSS capture inside a
-  shared long-lived xdist worker (whose RSS accumulates across tests) is genuinely hard; the marker is
-  the seed until then. #67's per-signature history + p90 prior still apply automatically IF a test
-  signature ever accrues samples, but v1 ships no active per-test peak reporting.
+## 4. The reserve helper — `aira confine-reserve` (DAEMON-ONLY, mirrors `confine`)
 
-## 4. The reserve helper (thin CLI reusing #67 admission — no protocol duplication)
-
-A new project-less verb `aira confine-reserve --bytes N [--signature S] [--pinned] [--slice …]`
-(dispatch-table, like `confine-list`): it resolves `aira.slice`, opens the daemon admit socket, and
-issues the #67 admit (reserve=N, pinned iff a marker was given, signature=S). On GRANT it prints one
-line to stdout (`granted reserve=<n> basis=<basis>`) and **holds the connection open, blocking on
-stdin, until stdin closes or it is signalled**, then releases (connection close = #67 lease release,
-exactly as confine holds its lease). This reuses the exact Go admit client — Python speaks NO wire
-protocol. Non-grant outcomes (daemon-unavailable, `E_ADMIT_TOO_LARGE`, `E_ADMIT_SATURATED` after the
-bounded wait) exit nonzero with the code on stdout → the plugin **fails open** (runs the test
-ungoverned for RAM, logs once), consistent with the CPU governor.
+A new **CLI-only** verb `aira confine-reserve --bytes N --pinned --signature pytest:<nodeid>
+[--slice …] [--max-wait …]` that mirrors `confine` itself (NOT `confine-list`): `core.Do` returns
+`E_CONFINE_UNAVAILABLE` with `Include:false` for MCP (core.go:1667-1684 precedent), and it resolves
+the admit socket directly (main.go:681). It issues the #67 admit **DAEMON-ONLY** — it must NOT fall
+through to `admitWithFlock` (admission_linux.go:126-138): a per-test flock fallback would hold the
+machine-wide EXCLUSIVE flock for the test's whole runtime, collapsing the run to ONE governed test
+while others stall `max_wait` (P1-b). Expose a no-fallback path (`admitThroughDaemon` / a
+`NoFlockFallback` admit mode); a dial failure ⇒ **instant nonzero exit** (fail open, §7). On GRANT it
+prints one line to stdout (`granted reserve=<n> basis=pinned:client`) and **holds the connection
+open, blocking on stdin, until stdin closes / it is signalled**, then releases (connection close =
+#67 lease release). Reuses the exact Go admit client (proto-5 framing + grant validation + lease
+arbitration all stay in Go); Python speaks no wire protocol.
 
 ## 5. Plugin changes (`aira_xdist_governor`)
 
-In `pytest_runtest_protocol`, after acquiring the CPU slot: resolve the test's estimate (marker →
-default), spawn `aira confine-reserve --bytes <est> [--pinned] --signature pytest:<nodeid>` (path via
-`AIRA_CONFINE_RESERVE_CMD`/`aira` on PATH), wait (bounded) for the `granted` line; on grant run the
-test then close the helper's stdin in `finally` (releasing the reservation); on any failure/timeout
-run ungoverned (log once). All new behaviour is gated on an env the loader sets (e.g.
-`AIRA_TEST_MEM_GOVERNOR=1`); absent → today's CPU-only behaviour, unchanged. The signature is
-`pytest:<nodeid>` (namespaced so test history never collides with confine command signatures).
+In `pytest_runtest_protocol`, after the CPU slot: resolve the estimate (marker → default, parsed in
+Python), spawn `aira confine-reserve --bytes <est> --pinned --signature pytest:<nodeid>` (path via
+`AIRA_CONFINE_RESERVE_CMD`), wait (bounded) for the `granted` line; on grant run the test then close
+the helper's stdin in `finally` (releasing the reservation); on any failure/timeout run ungoverned
+(`_log_once`). **Fork safety (P2-b):** register the helper's stdin write-fd in the held-descriptor set
+and close it in the existing `after_in_child` at-fork hook (__init__.py:25-35) — else a
+`multiprocessing` child inherits it and stdin-close won't release until the child exits. All new
+behaviour gates on `AIRA_TEST_MEM_GOVERNOR`.
 
 ## 6. The `aira_mem` marker + no-op shim (owner's explicit ask)
 
-The plugin **registers** the `aira_mem` marker (via `pytest_configure` `config.addinivalue_line`,
-so pytest emits no unknown-marker warning) and reads its value. When the AIRA plugin is NOT loaded
-(no daemon / opt-out), the loader/conftest shim provides a **no-op `aira_mem`** so test files annotate
-unconditionally with zero hard dependency on AIRA — the marker is then inert metadata pytest ignores.
-Ship the shim beside the plugin so a repo can vendor it.
+The plugin **registers** the marker (`pytest_configure` `config.addinivalue_line`, no unknown-marker
+warning) and reads its value. When the AIRA plugin is NOT loaded, the loader/conftest shim provides a
+**no-op `aira_mem`** so test files annotate unconditionally with zero hard dependency; the marker is
+then inert metadata. Ship the shim beside the plugin.
 
-## 7. Honesty & fail-open (advisory, never breaks a test)
+## 7. Honesty & fail-open policy (advisory; contained by oom.group + slice cap)
 
-- No daemon / helper missing / helper error / admit timeout / too-large ⇒ the test runs **ungoverned**
-  (logged once, like the CPU governor's `_log_once`); a wrong estimate only mis-sizes admission, it
-  never fails or skips a test. RAM governance is advisory, exactly as CPU governance is.
-- The helper reports the resolved reserve + #67 basis honestly; an unparseable marker ⇒ fall to the
-  default + log once (never a fabricated 0 or a hard error).
-- No new daemon RAM accountant: the ONE ledger is #67's slice admission (owner's shared-ledger choice).
+- Ungoverned-after-failure is still in-slice contained (finite-cap precondition + oom.group), so
+  desktop-safe; the risk is a slice-level OOM taking the victim scope (the whole delegate-ram suite).
+  Acceptable for advisory v1, with two refinements (P2-c):
+  - **SATURATED** ⇒ a generous bounded WAIT before falling open (mirror the CPU governor's 300 s;
+    the daemon caps at 30 min) — fail-open at peak saturation is the worst moment.
+  - **TOO_LARGE** (a pinned marker > ceiling) can never succeed by waiting ⇒ **clamp to the ceiling +
+    re-admit** (serialises the monster) rather than run ungoverned; at minimum a loud log.
+  - daemon-down / helper-missing / other ⇒ instant ungoverned + one log (like the CPU governor).
+- An unparseable marker ⇒ default + one log (never a fabricated 0 or a hard error). The helper reports
+  the resolved reserve + basis honestly. The ONE ledger is #67's slice admission (no second RAM
+  accountant).
 
-## 8. Code map (seams, verified on master 56bd635)
+## 8. Code map (seams verified on master 56bd635)
 
-- `internal/pylib/aira_xdist_governor/__init__.py`: add the RAM-reservation acquire/hold/release
-  around the CPU-slot flock; `aira_mem` marker registration + value parse; the no-op shim; all gated
-  on `AIRA_TEST_MEM_GOVERNOR`. `internal/pylib/{env.go,extract.go}`: wire the new env
-  (`AIRA_TEST_MEM_DEFAULT`, `AIRA_CONFINE_RESERVE_CMD`, `AIRA_TEST_MEM_GOVERNOR`).
-- `cmd/aira/main.go` + `internal/core/core.go`: the `confine-reserve` verb (project-less, SafetyExecute;
-  reuses `runner.admit`/the #67 client — `admission_linux.go:339` signature/pinned frame; holds the
-  lease like confine). Reuse the `[KMG]` size parser (#57).
-- `internal/runner/confine*.go`: the `--delegate-ram` / minimal-overhead launch mode for the pytest
-  suite (§2a) — opt out of the per-scope estimate sub-cap while keeping oom.group + slice-boundedness.
-- Skill/guide: document `aira_mem`, the nonzero default, and that heavy suites run
+- `internal/pylib/aira_xdist_governor/__init__.py`: RAM acquire/hold/release around the CPU flock;
+  `aira_mem` registration + Python-side `[KMG]` parse; the no-op shim; fork-stdin close; gated on
+  `AIRA_TEST_MEM_GOVERNOR`.
+- `internal/pylib/env.go`: **add `AIRA_TEST_MEM_GOVERNOR`, `AIRA_TEST_MEM_DEFAULT`,
+  `AIRA_CONFINE_RESERVE_CMD` to `governorEnvironmentKeys` (:18-23)** so `AppendChildEnvironment`
+  (confine_linux.go:508) STRIPS inherited values on every launch and sets them **iff `--delegate-ram`**
+  (P1-c — a governed plugin under a non-delegate launch would recreate the double-count + sub-cap
+  failure; coupling by construction makes the mismatch impossible). `extract.go` as needed.
+- `cmd/aira/main.go` + `internal/core/core.go`: the `confine-reserve` CLI-only verb (mirrors
+  `confine`: `E_CONFINE_UNAVAILABLE` from `core.Do`, `Include:false`; admit socket via main.go:681);
+  the `--delegate-ram` flag on the confine launch (suppress ONLY the confine_linux.go:458 sub-cap
+  write). Reuse `runner.ParseMemorySize` (memory_size.go:15).
+- `internal/runner/admission_linux.go`: a daemon-only admit path (no `admitWithFlock` fallback) for
+  `confine-reserve`; the pinned frame (:336-341) already carries `pinned:client`.
+- `internal/runner/confine_linux.go`: `--delegate-ram` gates the :458 sub-cap write; :446 oom.group +
+  :354 finite-cap refuse untouched.
+- Skill/guide: document `aira_mem` (`"4G"`/`"512M"`), the nonzero default, and that heavy suites run
   `aira confine --delegate-ram -- pytest …`.
 
-## 9. Tests (TDD; pure where possible; the Go/CLI parts under `aira confine`)
+## 9. Tests (TDD; pure where possible; Go/CLI under `aira confine`)
 
-- **Estimate precedence:** marker (pinned) beats default; module/class/test marker scope resolves
-  (inheritance); unparseable marker → default + one log.
-- **RAM-bounded concurrency (the `-n16` fix):** with a tiny fake slice budget + heavy per-test
-  estimates, concurrent admitted tests never exceed the budget (heavy tests serialise); light tests
-  don't block. (Go-level via the #67 admit seam + a plugin-level integration test with a fake helper.)
-- **Fail-open:** helper missing / daemon down / admit timeout / too-large ⇒ the test still runs
-  (ungoverned), one log line, non-zero helper exit tolerated.
-- **No-op shim:** `aira_mem` importable + inert when the plugin isn't loaded; marker registered (no
-  unknown-marker warning) when it is.
-- **confine-reserve verb:** grant → holds until stdin close → releases exactly once (#67 lease
-  reuse); rejection surfaces the code + exits nonzero; project-less.
-- **Double-count avoidance (§2a):** the delegate-ram suite launch reserves only overhead + no sub-cap;
-  per-test reservations charge the slice; Σ across two simulated suites ≤ cap.
+- **Estimate precedence:** marker (pinned) beats default; module/class/test scope resolves; unparseable
+  marker → default + one log; helper round-trip proves `basis="pinned:client"`.
+- **RAM-bounded concurrency (`-n16` fix):** tiny fake slice budget + heavy estimates ⇒ concurrent
+  admitted tests never exceed budget (heavy serialise, light don't block); two simulated suites'
+  reservations share `queue.outstanding` ≤ cap. (Go via the #67 admit seam + plugin-level with a fake
+  helper.)
+- **Daemon-only / fail-open:** daemon-down ⇒ `confine-reserve` exits nonzero INSTANTLY, the flock
+  fallback is NEVER engaged; the test still runs (ungoverned) + one log.
+- **Lease lifecycle:** grant → holds until stdin close → releases exactly once; `kill -9` of the
+  helper ⇒ lease released exactly once (connection-close path).
+- **delegate-ram:** suppresses ONLY the :458 auto-sub-cap while oom.group (:446) AND the finite-cap
+  refuse (:354) both still hold; a non-delegate launch STRIPS the governor env (mode mismatch
+  impossible).
+- **No-op shim:** `aira_mem` importable + inert when the plugin isn't loaded; registered (no warning)
+  when it is. **Fork:** a forking test's child does not pin the reservation past its own exit.
 - Regression: CPU-only governance unchanged when `AIRA_TEST_MEM_GOVERNOR` unset; #67 confine admission
   unchanged. `go build/vet ./... && go test ./internal/runner/ ./internal/daemon/ ./cmd/aira/
-  ./internal/pylib/ -race`; `make test` under `aira confine`; the Python plugin's own pytest suite.
+  ./internal/pylib/ -race`; `make test` under `aira confine`; the plugin's own pytest suite.
 
 ## 10. Residual risk & deferrals (stated)
 
 - **History self-calibration deferred to v2** — needs reliable per-test peak-RSS capture in a shared
-  xdist worker (a sampled high-water-mark minus baseline); until then unannotated tests use the
-  configured default (never self-tighten). The marker is the seed.
-- The per-test daemon round-trip (via the helper) reintroduces a daemon dependency in the test hot
-  path; it is fully fail-open (daemon down ⇒ ungoverned), and the fork cost (~ms) is negligible beside
-  a memory-heavy test.
-- `owner`/estimate are cooperative and advisory; a deliberately-wrong annotation only mis-sizes its own
-  admission. The slice cap + watchdog remain the hard backstop.
-- The §2a suite/test-reservation interaction is the load-bearing design point the gate must confirm.
+  xdist worker; v1 pins annotation-or-default (never self-tightens). The marker is the seed.
+- `--delegate-ram` opts the suite OUT of #67's per-scope sub-cap, so a suite's containment is
+  `oom.group` + the slice cap (+ watchdog), NOT a per-suite `memory.max`; an over-running delegate-ram
+  suite is killed as one oom.group unit within the slice (contained, never a random victim), but is
+  coarser than a per-suite cap. This is the deliberate cost of delegating RAM to per-test reservations.
+  The per-test governor keeps Σ concurrent estimates under budget so the suite normally never reaches
+  the slice cap.
+- The per-test daemon round-trip is fully fail-open (daemon down ⇒ ungoverned); fork cost (~ms) is
+  negligible beside a memory-heavy test. Estimates are cooperative/advisory; the slice cap + watchdog
+  are the hard backstop.
