@@ -109,7 +109,16 @@ type confineDeps struct {
 	signalSource          func() (<-chan os.Signal, func())
 	readUsage             func(string) cgroupUsage
 	reportPeak            func(context.Context, ConfineRequest, string, *int64, bool) error
+	admitWaitDiagInterval time.Duration
 }
+
+// defaultAdmitWaitDiagInterval is how often a blocked admission prints a
+// "waiting for memory admission" progress line. Admission can legitimately wait
+// (a reserve-contended slice queues a job behind other sessions' in-flight jobs
+// under the shared cap), and the client blocks on a single socket read for up to
+// its maxWait; without a periodic line a bounded wait is indistinguishable from a
+// hang. Tests override the interval.
+const defaultAdmitWaitDiagInterval = 15 * time.Second
 
 func defaultConfineDeps() confineDeps {
 	return confineDeps{
@@ -393,7 +402,39 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	}
 	scopeID := confineScopeID(request.Name)
 	request.ScopeID = scopeID
+	// Admission can legitimately block: a reserve-contended slice queues this job
+	// behind other sessions' in-flight jobs under the shared cap, and the client
+	// waits on a single socket read for up to its maxWait. Emit a periodic progress
+	// line so a bounded wait is never mistaken for a hang. Nothing prints when
+	// admission returns promptly; the goroutine is stopped and joined first.
+	admitDiag := request.Stderr
+	if admitDiag == nil {
+		admitDiag = os.Stderr
+	}
+	diagInterval := deps.admitWaitDiagInterval
+	if diagInterval <= 0 {
+		diagInterval = defaultAdmitWaitDiagInterval
+	}
+	admitWaitDone := make(chan struct{})
+	admitWaitStopped := make(chan struct{})
+	go func() {
+		defer close(admitWaitStopped)
+		start := time.Now()
+		ticker := time.NewTicker(diagInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-admitWaitDone:
+				return
+			case <-ticker.C:
+				fmt.Fprintf(admitDiag, "confine: waiting for memory admission on %s (reserve %s, waited %ds)\n",
+					sliceName, formatConfineBytes(reserve), int64(time.Since(start).Seconds()))
+			}
+		}
+	}()
 	admission, err := deps.admit(ctx, path, request, reserve)
+	close(admitWaitDone)
+	<-admitWaitStopped
 	resolvedReserve := reserve
 	if admission.reserve > 0 {
 		resolvedReserve = admission.reserve

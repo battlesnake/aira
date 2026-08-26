@@ -1499,3 +1499,54 @@ func (confineUnavailableBackend) Create(context.Context, string) (Scope, error) 
 func (confineUnavailableBackend) Open(context.Context, string) (Scope, error) {
 	return nil, errors.New("must not open")
 }
+
+// A blocked admission must emit a periodic "waiting for memory admission"
+// diagnostic so a legitimate reserve-contended wait (queued behind other
+// sessions' in-flight jobs under the shared slice cap) is never mistaken for a
+// hang. RED against a Confine that blocks on admit without any progress output.
+func TestConfineAdmissionWaitEmitsProgressDiagnostic(t *testing.T) {
+	var mu sync.Mutex
+	var buf bytes.Buffer
+	sink := writerFunc(func(p []byte) (int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return buf.Write(p)
+	})
+	proceed := make(chan struct{})
+	scope := &confineFakeScope{}
+	deps := confineUnitDeps(scope)
+	deps.admitWaitDiagInterval = 5 * time.Millisecond
+	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
+		<-proceed // block, as a reserve-contended daemon wait would
+		return admissionResult{state: "immediate"}, nil
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = confineWithDeps(context.Background(), ConfineRequest{
+			Slice: "finite.slice", MemoryReserve: 4 << 30, Argv: []string{"/bin/true"},
+			SelfPath: os.Args[0], Stderr: sink,
+		}, deps)
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	seen := false
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := buf.String()
+		mu.Unlock()
+		if strings.Contains(got, "waiting for memory admission") {
+			seen = true
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	close(proceed)
+	<-done
+	if !seen {
+		t.Fatalf("no admission-wait progress diagnostic emitted; stderr=%q", buf.String())
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
