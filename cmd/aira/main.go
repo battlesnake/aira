@@ -28,6 +28,7 @@ import (
 func main() { os.Exit(Run(os.Args[1:], os.Stdout, os.Stderr)) }
 
 var runConfined = runner.Confine
+var reserveConfined = runner.ConfineReserve
 var runInstaller = installcmd.Run
 var runSliceAnchor = installcmd.RunSliceAnchor
 
@@ -103,6 +104,13 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 			return runConfineManagementCommand(context.Background(), options, jsonOutput, stdout, stderr, injected)
 		}
 		return runConfineCommand(context.Background(), positional, options, stdin, stdout, stderr)
+	}
+	if verb == "confine-reserve" {
+		if jsonOutput {
+			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for confine-reserve", Exit: store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
+			return render(response, true, stdout, stderr)
+		}
+		return runConfineReserveCommand(context.Background(), options, stdin, stdout, stderr)
 	}
 	if verb == "confine-list" || verb == "confine-kill" {
 		request, requestErr := buildRequest(verb, positional, options)
@@ -404,6 +412,9 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 	if verb == "confine" {
 		return parseConfineArgs(argv)
 	}
+	if verb == "confine-reserve" {
+		return parseConfineReserveArgs(argv)
+	}
 	if verb == "run" {
 		return parseRunArgs(argv)
 	}
@@ -558,6 +569,13 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 			return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine options must precede the launch delimiter")
 		}
 		name := strings.TrimPrefix(arg, "--")
+		if name == "delegate-ram" {
+			if _, exists := options[name]; exists {
+				return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s may occur once", name)
+			}
+			options[name] = "true"
+			continue
+		}
 		if name != "slice" && name != "name" && name != "owner" && name != "memory-reserve" && name != "memory-max" && name != "memory-high" {
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for confine", name)
 		}
@@ -587,6 +605,52 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 		}
 	}
 	return target, options, nil
+}
+
+func parseConfineReserveArgs(argv []string) ([]string, map[string]string, error) {
+	options := map[string]string{}
+	for index := 0; index < len(argv); index++ {
+		arg := argv[index]
+		if !strings.HasPrefix(arg, "--") || arg == "--" {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: unexpected confine-reserve argument %q", arg)
+		}
+		name := strings.TrimPrefix(arg, "--")
+		if _, exists := options[name]; exists {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s may occur once", name)
+		}
+		if name == "pinned" {
+			options[name] = "true"
+			continue
+		}
+		if name != "bytes" && name != "signature" && name != "slice" && name != "max-wait" {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for confine-reserve", name)
+		}
+		if index+1 >= len(argv) || strings.HasPrefix(argv[index+1], "--") {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s requires a value", name)
+		}
+		index++
+		options[name] = argv[index]
+	}
+	if options["pinned"] != "true" || strings.TrimSpace(options["signature"]) == "" || strings.TrimSpace(options["bytes"]) == "" {
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine-reserve requires --bytes N --pinned --signature S")
+	}
+	reserve, err := runner.ParseMemorySize(options["bytes"])
+	if err != nil || reserve <= 0 {
+		if err == nil {
+			err = errors.New("must be positive")
+		}
+		return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --bytes: %w", err)
+	}
+	if raw := options["max-wait"]; raw != "" {
+		wait, waitErr := time.ParseDuration(raw)
+		if waitErr != nil || wait <= 0 || wait > 30*time.Minute {
+			if waitErr == nil {
+				waitErr = errors.New("must be in (0, 30m]")
+			}
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --max-wait: %w", waitErr)
+		}
+	}
+	return nil, options, nil
 }
 
 func parseConfineManagementArgs(argv []string) ([]string, map[string]string, error) {
@@ -673,6 +737,7 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		Slice: options["slice"], Name: options["name"], Argv: append([]string(nil), target...),
 		Owner:         owner,
 		MemoryReserve: reserve, MemoryReservePinned: reservePinned,
+		DelegateRAM:    options["delegate-ram"] == "true",
 		ScopeMemoryMax: maximum, ScopeMemoryHigh: high,
 		Stdin: stdin, Stdout: stdout, Stderr: stderr,
 	}
@@ -688,6 +753,60 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		return store.ExitForCode(store.ErrorCode(err))
 	}
 	return result.Exit
+}
+
+func runConfineReserveCommand(ctx context.Context, options map[string]string, stdin io.Reader, stdout, stderr io.Writer) int {
+	reserve, err := runner.ParseMemorySize(options["bytes"])
+	if err != nil || reserve <= 0 {
+		if err == nil {
+			err = errors.New("must be positive")
+		}
+		_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --bytes: %v\n", err)
+		return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+	}
+	maxWait := runner.DefaultConfineReserveMaxWait
+	if raw := options["max-wait"]; raw != "" {
+		maxWait, err = time.ParseDuration(raw)
+		if err != nil || maxWait <= 0 || maxWait > 30*time.Minute {
+			_, _ = fmt.Fprintln(stderr, "E_CONFINE_ARGUMENT_INVALID: invalid --max-wait")
+			return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		}
+	}
+	paths, err := daemon.PathsFromEnv()
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: daemon paths unavailable: %v\n", err)
+		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
+	}
+	request := runner.ConfineReserveRequest{
+		Slice: options["slice"], AdmitSocketPath: paths.SocketPath,
+		Bytes: reserve, Pinned: options["pinned"] == "true",
+		Signature: options["signature"], MaxWait: maxWait,
+	}
+	signalCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	reservation, err := reserveConfined(signalCtx, request)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return store.ExitForCode(store.ErrorCode(err))
+	}
+	defer reservation.Close()
+	if reservation.ClampedFrom > 0 {
+		_, _ = fmt.Fprintf(stderr, "aira: RAM reservation clamped from %d to daemon ceiling %d\n", reservation.ClampedFrom, reservation.Reserve)
+	}
+	if _, err := fmt.Fprintf(stdout, "granted reserve=%d basis=%s\n", reservation.Reserve, reservation.Basis); err != nil {
+		_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: write grant: %v\n", err)
+		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
+	}
+	done := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, stdin)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-signalCtx.Done():
+	}
+	return 0
 }
 
 func resolveConfineOwner(ctx context.Context, explicit string) (string, error) {

@@ -88,6 +88,7 @@ type ConfineRequest struct {
 	AdmitSocketPath     string
 	MemoryReserve       int64
 	MemoryReservePinned bool
+	DelegateRAM         bool
 	ScopeMemoryMax      int64
 	ScopeMemoryHigh     int64
 	AdmissionMaxWait    time.Duration

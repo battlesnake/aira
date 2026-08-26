@@ -16,11 +16,16 @@ var (
 )
 
 var governorEnvironmentKeys = map[string]struct{}{
-	"AIRA_PY_LIB":            {},
-	"AIRA_CPU_SLOTS_DIR":     {},
-	"AIRA_CPU_POLL_INTERVAL": {},
-	"AIRA_CPU_MAX_WAIT":      {},
+	"AIRA_PY_LIB":              {},
+	"AIRA_CPU_SLOTS_DIR":       {},
+	"AIRA_CPU_POLL_INTERVAL":   {},
+	"AIRA_CPU_MAX_WAIT":        {},
+	"AIRA_TEST_MEM_GOVERNOR":   {},
+	"AIRA_TEST_MEM_DEFAULT":    {},
+	"AIRA_CONFINE_RESERVE_CMD": {},
 }
+
+const DefaultTestMemoryReserve = "512M"
 
 // IsGovernorEnvironmentKey reports whether key is launch coordination rather
 // than part of the tested child environment identity.
@@ -48,6 +53,16 @@ func StripGovernorEnvironment(env []string) []string {
 // every governor variable stripped, disabling gating instead of using stale
 // inherited coordinates.
 func AppendChildEnvironment(env []string, runtimeDir string, diagnostics io.Writer) []string {
+	return appendChildEnvironment(env, runtimeDir, diagnostics, false, "", "")
+}
+
+// AppendConfineChildEnvironment couples per-test RAM governance to an explicit
+// delegate-RAM confine launch. Every other launch strips these coordinates.
+func AppendConfineChildEnvironment(env []string, runtimeDir string, diagnostics io.Writer, delegateRAM bool, reserveCommand, memoryDefault string) []string {
+	return appendChildEnvironment(env, runtimeDir, diagnostics, delegateRAM, reserveCommand, memoryDefault)
+}
+
+func appendChildEnvironment(env []string, runtimeDir string, diagnostics io.Writer, delegateRAM bool, reserveCommand, memoryDefault string) []string {
 	result := StripGovernorEnvironment(env)
 	if strings.TrimSpace(runtimeDir) == "" {
 		return result
@@ -69,6 +84,14 @@ func AppendChildEnvironment(env []string, runtimeDir string, diagnostics io.Writ
 		if value, configured := os.LookupEnv(key); configured {
 			result = append(result, key+"="+value)
 		}
+	}
+	if delegateRAM {
+		if strings.TrimSpace(memoryDefault) == "" {
+			memoryDefault = DefaultTestMemoryReserve
+		}
+		result = upsertChildEnv(result, "AIRA_TEST_MEM_GOVERNOR", "1")
+		result = upsertChildEnv(result, "AIRA_TEST_MEM_DEFAULT", memoryDefault)
+		result = upsertChildEnv(result, "AIRA_CONFINE_RESERVE_CMD", reserveCommand)
 	}
 	return result
 }

@@ -1664,7 +1664,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return result, err
 		}},
-		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] -- <argv...>", Args: []ArgSpec{
+		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--delegate-ram] -- <argv...>", Args: []ArgSpec{
 			listSpec("argv", true, true, "Exact target argv after the launch delimiter"),
 			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
 			stringSpec("name", false, false, "Scope name component"),
@@ -1672,6 +1672,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("memory_reserve", false, false, "Pinned admission reserve ([KMG] binary suffix)"),
 			stringSpec("memory_max", false, false, "Scope memory.max ([KMG] binary suffix)"),
 			stringSpec("memory_high", false, false, "Scope memory.high reclaim pressure ([KMG] binary suffix)"),
+			boolSpec("delegate_ram", false, false, "Delegate RAM admission to per-test pinned reservations"),
 		}, Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			_ = ctx
 			_ = stringSlice(args, "argv")
@@ -1681,7 +1682,22 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringArg(args, "memory_reserve")
 			_ = stringArg(args, "memory_max")
 			_ = stringArg(args, "memory_high")
+			_ = boolArg(args, "delegate_ram")
 			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine is a direct CLI-only foreground verb")
+		}},
+		"confine-reserve": {Name: "confine-reserve", Usage: "confine-reserve --bytes N --pinned --signature S [--slice S] [--max-wait D]", Args: []ArgSpec{
+			stringSpec("bytes", true, false, "Pinned byte reservation ([KMG] binary suffix)"),
+			boolSpec("pinned", true, false, "Require the v1 pinned estimate path"),
+			stringSpec("signature", true, false, "Per-test resource signature"),
+			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
+			stringSpec("max_wait", false, false, "Bounded daemon admission wait"),
+		}, Run: func(_ context.Context, args *argAccessor) (any, error) {
+			_ = stringArg(args, "bytes")
+			_ = boolArg(args, "pinned")
+			_ = stringArg(args, "signature")
+			_ = stringArg(args, "slice")
+			_ = stringArg(args, "max_wait")
+			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine-reserve is a direct CLI-only foreground verb")
 		}},
 		"confine-list": {Name: "confine-list", Usage: "confine --list [--slice S] [--owner ID] [--json]", Args: []ArgSpec{
 			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
@@ -1955,12 +1971,13 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 			{Name: "push", Summary: "Push explicit refs", Safety: SafetyExecute, Args: []OperationArg{{Name: "remote"}, {Name: "refspecs"}}, Example: []string{"push", "origin", "--", "HEAD:main"}},
 			{Name: "ls-remote", Summary: "List remote refs", Safety: SafetyExecute, Args: []OperationArg{{Name: "remote"}, {Name: "refspecs"}}, Example: []string{"ls-remote", "origin"}},
 		}},
-		"run":          {summary: "Launch a subprocess in an owned scope", safety: SafetyExecute, example: []string{"--merge", "--", "printf", "hello"}},
-		"confine":      {summary: "Run a foreground subprocess in a machine-wide confined slice", safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
-		"confine-list": {summary: "List discoverable confine scopes without fabricating unreadable fields", safety: SafetyRead, example: []string{}},
-		"confine-kill": {summary: "Kill one ownership-checked confine scope after populated-to-empty proof", safety: SafetyExecute, destructive: true, example: []string{"job"}},
-		"install":      {summary: "Install and inspect the AIRA-owned confinement slice", safety: SafetyExecute, example: []string{"--status"}},
-		"time":         {summary: "Run a byte-transparent command and record timing", safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
+		"run":             {summary: "Launch a subprocess in an owned scope", safety: SafetyExecute, example: []string{"--merge", "--", "printf", "hello"}},
+		"confine":         {summary: "Run a foreground subprocess in a machine-wide confined slice", safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
+		"confine-reserve": {summary: "Hold one daemon-only pinned confine reservation", safety: SafetyExecute, example: []string{"--bytes", "512M", "--pinned", "--signature", "pytest:test_example.py::test_case"}},
+		"confine-list":    {summary: "List discoverable confine scopes without fabricating unreadable fields", safety: SafetyRead, example: []string{}},
+		"confine-kill":    {summary: "Kill one ownership-checked confine scope after populated-to-empty proof", safety: SafetyExecute, destructive: true, example: []string{"job"}},
+		"install":         {summary: "Install and inspect the AIRA-owned confinement slice", safety: SafetyExecute, example: []string{"--status"}},
+		"time":            {summary: "Run a byte-transparent command and record timing", safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
 		"commands": {summary: "Read recorded command events and exact distributions", safety: SafetyRead, operations: []OperationSpec{
 			{Name: "ls", Summary: "List recorded command events", Safety: SafetyRead, Args: []OperationArg{{Name: "query"}, {Name: "by"}}, Example: []string{"ls", "key-source:program-subcommand key:go test"}},
 			{Name: "count", Summary: "Count command events by a dimension", Safety: SafetyRead, Args: []OperationArg{{Name: "query"}, {Name: "by", Required: true}}, Example: []string{"count", "status:exited", "--by", "key"}},
@@ -2032,7 +2049,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		if !ok {
 			panic("missing dispatch metadata for " + name)
 		}
-		spec.Summary, spec.Safety, spec.Destructive, spec.Include = entry.summary, entry.safety, entry.destructive, name != "confine" && name != "install"
+		spec.Summary, spec.Safety, spec.Destructive, spec.Include = entry.summary, entry.safety, entry.destructive, name != "confine" && name != "confine-reserve" && name != "install"
 		spec.Example = copyExample(entry.example)
 		spec.Operations = append([]OperationSpec(nil), entry.operations...)
 		verbs[name] = spec

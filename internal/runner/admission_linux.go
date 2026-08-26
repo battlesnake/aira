@@ -36,6 +36,7 @@ type admissionResult struct {
 	lock     *admitLock
 	release  io.Closer
 	reserve  int64
+	ceiling  int64
 	basis    string
 }
 
@@ -368,7 +369,7 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 				if response.Code == "E_ADMIT_TOO_LARGE" {
 					basis = "reject:too-large"
 				}
-				return admissionResult{state: strings.TrimPrefix(strings.ToLower(response.Code), "e_admit_"), reserve: resolved, basis: basis}, true, errors.New(message)
+				return admissionResult{state: strings.TrimPrefix(strings.ToLower(response.Code), "e_admit_"), reserve: resolved, ceiling: rejection.Ceiling, basis: basis}, true, errors.New(message)
 			}
 		}
 		return fail()

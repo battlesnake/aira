@@ -455,7 +455,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// fallback reserve — enforcing it as a hard sub-cap would false-fail a heavy
 	// job although admission was never evaluated (design §6: no sub-cap here).
 	admitted := admission.state == "immediate" || admission.state == "waited"
-	if scopeMemoryMax <= 0 && admitted && admission.lock == nil && admission.release != nil && admission.reserve > 0 {
+	if !request.DelegateRAM && scopeMemoryMax <= 0 && admitted && admission.lock == nil && admission.release != nil && admission.reserve > 0 {
 		scopeMemoryMax = admission.reserve
 	}
 	if scopeMemoryMax > 0 {
@@ -505,7 +505,19 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		stdout = os.Stdout
 	}
 	cmd := exec.CommandContext(ctx, self, setupArgv...)
-	cmd.Env = pylib.AppendChildEnvironment(confineEnvironment(request.Env), request.RuntimeDir, diagnostics)
+	reserveCommand := ""
+	memoryDefault := ""
+	if request.DelegateRAM {
+		reserveCommand = self
+		if executable, executableErr := filepath.EvalSymlinks(self); executableErr == nil {
+			reserveCommand = executable
+		}
+		memoryDefault = strings.TrimSpace(os.Getenv("AIRA_TEST_MEM_DEFAULT"))
+		if parsed, parseErr := ParseMemorySize(memoryDefault); parseErr != nil || parsed <= 0 {
+			memoryDefault = pylib.DefaultTestMemoryReserve
+		}
+	}
+	cmd.Env = pylib.AppendConfineChildEnvironment(confineEnvironment(request.Env), request.RuntimeDir, diagnostics, request.DelegateRAM, reserveCommand, memoryDefault)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, diagnostics
 	cmd.ExtraFiles = []*os.File{handshakeWrite, releaseRead}
 	cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: scope.FD()}

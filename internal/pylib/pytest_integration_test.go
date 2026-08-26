@@ -416,6 +416,244 @@ def test_fork_does_not_pin_slot():
 	}
 }
 
+func TestRealPytestRAMMarkerPrecedencePinnedAndRegistered(t *testing.T) {
+	pytest := requireRealPytest(t)
+	project, pythonDir := realPytestProject(t, "")
+	requests := filepath.Join(project, "requests.jsonl")
+	helper := writeReserveHelper(t, project, `
+import json, os, sys
+with open(os.environ["AIRA_TEST_REQUESTS"], "a", encoding="utf-8") as target:
+    target.write(json.dumps(sys.argv[1:]) + "\n")
+estimate = sys.argv[sys.argv.index("--bytes") + 1]
+print("granted reserve=%s basis=pinned:client" % estimate, flush=True)
+sys.stdin.buffer.read()
+`)
+	writeTestFile(t, project, "test_ram_marks.py", `
+import pytest
+
+pytestmark = pytest.mark.aira_mem("64M")
+
+def test_module_scope(): pass
+
+@pytest.mark.aira_mem("32M")
+class TestClassScope:
+    def test_class_scope(self): pass
+
+    @pytest.mark.aira_mem("16M")
+    def test_test_scope(self): pass
+
+@pytest.mark.aira_mem("4GB")
+def test_invalid_uses_default(): pass
+`)
+	result := runPytest(t, pytest, project, pythonDir, map[string]string{
+		"AIRA_TEST_MEM_GOVERNOR": "1", "AIRA_TEST_MEM_DEFAULT": "8M",
+		"AIRA_CONFINE_RESERVE_CMD": helper, "AIRA_TEST_REQUESTS": requests,
+		"PYTEST_ADDOPTS": "--strict-markers",
+	})
+	if result.err != nil {
+		t.Fatalf("RAM marker pytest failed: %v\n%s", result.err, result.output)
+	}
+	data, err := os.ReadFile(requests)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wants := map[string]string{
+		"test_module_scope": "67108864", "test_class_scope": "33554432",
+		"test_test_scope": "16777216", "test_invalid_uses_default": "8388608",
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var argv []string
+		if err := json.Unmarshal([]byte(line), &argv); err != nil {
+			t.Fatal(err)
+		}
+		joined := strings.Join(argv, " ")
+		if !strings.Contains(joined, " --pinned ") && !strings.Contains(joined, "--pinned") {
+			t.Fatalf("unpinned helper argv=%v", argv)
+		}
+		for node, estimate := range wants {
+			if strings.Contains(joined, node) {
+				if got := argv[indexOf(t, argv, "--bytes")+1]; got != estimate {
+					t.Fatalf("%s estimate=%s want=%s argv=%v", node, got, estimate, argv)
+				}
+				delete(wants, node)
+			}
+		}
+	}
+	if len(wants) != 0 || strings.Count(result.output, "invalid aira_mem marker") != 1 || strings.Contains(result.output, "PytestUnknownMarkWarning") {
+		t.Fatalf("missing=%v output=%s requests=%s", wants, result.output, data)
+	}
+}
+
+func TestRealPytestRAMWeightedConcurrencySharesBudgetAcrossSuites(t *testing.T) {
+	pytest := requireRealPytest(t)
+	project, pythonDir := realPytestProject(t, "")
+	state := filepath.Join(project, "ram-state.json")
+	writeTestFile(t, project, "ram-state.json", `{"current":0,"maximum":0,"count":0,"max_count":0,"heavy":0,"heavy_max":0}`)
+	helper := writeReserveHelper(t, project, `
+import fcntl, json, os, sys, time
+state_path = os.environ["AIRA_RAM_STATE"]
+estimate = int(sys.argv[sys.argv.index("--bytes") + 1])
+budget = int(os.environ["AIRA_RAM_BUDGET"])
+while True:
+    with open(state_path + ".lock", "a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        with open(state_path, encoding="utf-8") as source: state = json.load(source)
+        if state["current"] + estimate <= budget:
+            state["current"] += estimate
+            state["maximum"] = max(state["maximum"], state["current"])
+            state["count"] += 1
+            state["max_count"] = max(state["max_count"], state["count"])
+            if estimate > budget // 2:
+                state["heavy"] += 1
+                state["heavy_max"] = max(state["heavy_max"], state["heavy"])
+            with open(state_path, "w", encoding="utf-8") as target: json.dump(state, target)
+            break
+    time.sleep(0.01)
+print("granted reserve=%d basis=pinned:client" % estimate, flush=True)
+sys.stdin.buffer.read()
+with open(state_path + ".lock", "a+") as lock:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    with open(state_path, encoding="utf-8") as source: state = json.load(source)
+    state["current"] -= estimate
+    state["count"] -= 1
+    if estimate > budget // 2: state["heavy"] -= 1
+    with open(state_path, "w", encoding="utf-8") as target: json.dump(state, target)
+`)
+	writeTestFile(t, project, "test_ram_cap.py", `
+import os, pytest, time
+
+@pytest.mark.aira_mem(os.environ["AIRA_CASE_ESTIMATE"])
+def test_participating_suite():
+    time.sleep(0.2)
+`)
+	type invocation struct {
+		command *exec.Cmd
+		output  bytes.Buffer
+	}
+	estimates := []string{"70", "70", "20", "20", "20", "20"}
+	invocations := make([]*invocation, 0, len(estimates))
+	for _, estimate := range estimates {
+		call := &invocation{}
+		call.command = exec.Command(pytest, "-q", "test_ram_cap.py")
+		call.command.Dir = project
+		call.command.Env = realPytestEnv(pythonDir, map[string]string{
+			"AIRA_TEST_MEM_GOVERNOR": "1", "AIRA_TEST_MEM_DEFAULT": "10",
+			"AIRA_CONFINE_RESERVE_CMD": helper, "AIRA_RAM_STATE": state,
+			"AIRA_RAM_BUDGET": "100", "AIRA_CASE_ESTIMATE": estimate,
+		})
+		call.command.Stdout, call.command.Stderr = &call.output, &call.output
+		if err := call.command.Start(); err != nil {
+			t.Fatal(err)
+		}
+		invocations = append(invocations, call)
+	}
+	for _, call := range invocations {
+		if err := call.command.Wait(); err != nil {
+			t.Fatalf("pytest failed: %v\n%s", err, call.output.String())
+		}
+	}
+	var observed struct {
+		Current  int `json:"current"`
+		Maximum  int `json:"maximum"`
+		Count    int `json:"count"`
+		MaxCount int `json:"max_count"`
+		Heavy    int `json:"heavy"`
+		HeavyMax int `json:"heavy_max"`
+	}
+	data, err := os.ReadFile(state)
+	if err != nil || json.Unmarshal(data, &observed) != nil {
+		t.Fatalf("state=%q err=%v", data, err)
+	}
+	if observed.Current != 0 || observed.Count != 0 || observed.Maximum > 100 || observed.Maximum < 70 || observed.HeavyMax != 1 || observed.MaxCount < 2 {
+		t.Fatalf("weighted shared state=%+v", observed)
+	}
+}
+
+func TestRealPytestRAMHelperFailureIsInstantAndFailOpen(t *testing.T) {
+	pytest := requireRealPytest(t)
+	started := time.Now()
+	project, pythonDir := realPytestProject(t, "")
+	marker := filepath.Join(project, "ran")
+	writeTestFile(t, project, "test_fail_open_ram.py", fmt.Sprintf("def test_runs(): open(%q, 'w').write('yes')\n", marker))
+	result := runPytest(t, pytest, project, pythonDir, map[string]string{
+		"AIRA_TEST_MEM_GOVERNOR": "1", "AIRA_TEST_MEM_DEFAULT": "8M",
+		"AIRA_CONFINE_RESERVE_CMD": filepath.Join(project, "missing-aira"),
+	})
+	if result.err != nil || time.Since(started) > 2*time.Second || !strings.Contains(result.output, "aira RAM governor disabled") {
+		t.Fatalf("result=%v elapsed=%s output=%s", result.err, time.Since(started), result.output)
+	}
+	if data, err := os.ReadFile(marker); err != nil || string(data) != "yes" {
+		t.Fatalf("test did not run: data=%q err=%v", data, err)
+	}
+}
+
+func TestRealPytestRAMForkDoesNotPinHelperStdin(t *testing.T) {
+	pytest := requireRealPytest(t)
+	project, pythonDir := realPytestProject(t, "")
+	released := filepath.Join(project, "released")
+	childDone := filepath.Join(project, "child-done")
+	helper := writeReserveHelper(t, project, `
+import os, sys, time
+estimate = sys.argv[sys.argv.index("--bytes") + 1]
+print("granted reserve=%s basis=pinned:client" % estimate, flush=True)
+sys.stdin.buffer.read()
+with open(os.environ["AIRA_RELEASED"], "w", encoding="utf-8") as target: target.write(str(time.time_ns()))
+`)
+	writeTestFile(t, project, "test_ram_fork.py", `
+import os, time
+def test_fork_child_does_not_hold_reservation():
+    child = os.fork()
+    if child == 0:
+        os.close(1); os.close(2)
+        time.sleep(1.0)
+        with open(os.environ["AIRA_CHILD_DONE"], "w", encoding="utf-8") as target: target.write(str(time.time_ns()))
+        os._exit(0)
+`)
+	result := runPytest(t, pytest, project, pythonDir, map[string]string{
+		"AIRA_TEST_MEM_GOVERNOR": "1", "AIRA_TEST_MEM_DEFAULT": "8M",
+		"AIRA_CONFINE_RESERVE_CMD": helper, "AIRA_RELEASED": released, "AIRA_CHILD_DONE": childDone,
+	})
+	if result.err != nil {
+		t.Fatalf("fork pytest failed: %v\n%s", result.err, result.output)
+	}
+	waitForPath := func(path string) []byte {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if data, err := os.ReadFile(path); err == nil {
+				return data
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for %s", path)
+		return nil
+	}
+	releaseTime, childTime := waitForPath(released), waitForPath(childDone)
+	if string(releaseTime) >= string(childTime) {
+		t.Fatalf("reservation release=%s child done=%s", releaseTime, childTime)
+	}
+}
+
+func TestRealPytestAiraMemShimIsInertWithoutPlugin(t *testing.T) {
+	pytest := requireRealPytest(t)
+	project := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	pythonDir, err := ExtractPyLib()
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, project, "test_shim.py", `
+import sys
+sys.path.insert(0, __import__("os").environ["AIRA_PY_LIB"])
+from aira_xdist_governor.shim import aira_mem
+@aira_mem("4G")
+def test_inert_shim(): pass
+`)
+	result := runPytest(t, pytest, project, pythonDir, map[string]string{"PYTEST_ADDOPTS": "--strict-markers"})
+	if result.err != nil || strings.Contains(result.output, "UnknownMark") {
+		t.Fatalf("inert shim failed: %v\n%s", result.err, result.output)
+	}
+}
+
 func TestRealPytestOptOutWithoutConftestIsInactive(t *testing.T) {
 	pytest := requireRealPytest(t)
 	project := t.TempDir()
@@ -521,7 +759,8 @@ func realPytestEnv(pythonDir string, overrides map[string]string) []string {
 		"AIRA_PY_LIB": true, "AIRA_CPU_SLOTS_DIR": true,
 		"AIRA_CPU_POLL_INTERVAL": true, "AIRA_CPU_MAX_WAIT": true,
 		"PYTHONPATH": true, "PYTEST_ADDOPTS": true, "PYTEST_PLUGINS": true,
-		"PYTHONDONTWRITEBYTECODE": true, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": true,
+		"AIRA_CONFINE_RESERVE_CMD": true,
+		"PYTHONDONTWRITEBYTECODE":  true, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": true,
 	}
 	env := make([]string, 0, len(os.Environ())+len(overrides)+3)
 	for _, entry := range os.Environ() {
@@ -539,6 +778,27 @@ func realPytestEnv(pythonDir string, overrides map[string]string) []string {
 		env = append(env, key+"="+value)
 	}
 	return env
+}
+
+func writeReserveHelper(t *testing.T, project, body string) string {
+	t.Helper()
+	path := filepath.Join(project, "fake-aira-reserve")
+	writeTestFile(t, project, filepath.Base(path), "#!/usr/bin/env python3\n"+strings.TrimSpace(body))
+	if err := os.Chmod(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func indexOf(t *testing.T, values []string, wanted string) int {
+	t.Helper()
+	for index, value := range values {
+		if value == wanted {
+			return index
+		}
+	}
+	t.Fatalf("%q not found in %v", wanted, values)
+	return -1
 }
 
 func waitForRealPytestFile(t *testing.T, path string, done <-chan error) {

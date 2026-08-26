@@ -84,6 +84,27 @@ func TestAppendChildEnvironmentWithoutRuntimeDirIsSideEffectFree(t *testing.T) {
 	}
 }
 
+func TestConfineRAMGovernorEnvironmentIsCoupledToDelegateMode(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	runtimeDir := filepath.Join(t.TempDir(), "runtime")
+	inherited := []string{
+		"PATH=/bin",
+		"AIRA_TEST_MEM_GOVERNOR=stale",
+		"AIRA_TEST_MEM_DEFAULT=99G",
+		"AIRA_CONFINE_RESERVE_CMD=/stale/aira",
+	}
+	nondelegate := childEnvValues(t, AppendChildEnvironment(inherited, runtimeDir, nil))
+	for _, key := range []string{"AIRA_TEST_MEM_GOVERNOR", "AIRA_TEST_MEM_DEFAULT", "AIRA_CONFINE_RESERVE_CMD"} {
+		if _, present := nondelegate[key]; present {
+			t.Fatalf("non-delegate launch retained %s: %v", key, nondelegate)
+		}
+	}
+	delegate := childEnvValues(t, AppendConfineChildEnvironment(inherited, runtimeDir, nil, true, "/opt/aira", "768M"))
+	if delegate["AIRA_TEST_MEM_GOVERNOR"] != "1" || delegate["AIRA_TEST_MEM_DEFAULT"] != "768M" || delegate["AIRA_CONFINE_RESERVE_CMD"] != "/opt/aira" {
+		t.Fatalf("delegate RAM environment=%v", delegate)
+	}
+}
+
 func childEnvValues(t *testing.T, env []string) map[string]string {
 	t.Helper()
 	values := make(map[string]string, len(env))

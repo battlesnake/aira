@@ -614,6 +614,47 @@ func TestConfineGrantedReserveIsScopeCapAndPeakIsReported(t *testing.T) {
 	}
 }
 
+func TestConfineDelegateRAMSuppressesOnlyAutomaticSubcap(t *testing.T) {
+	t.Run("finite admitted launch keeps oom group and skips auto subcap", func(t *testing.T) {
+		scope := &confineFakeScope{}
+		deps := confineUnitDeps(scope)
+		closer := &confineCountingCloser{}
+		deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
+			return admissionResult{state: "immediate", reserve: 96 << 20, basis: "pinned:client", release: closer}, nil
+		}
+		oomWrites := 0
+		deps.writeOOMGroup = func(Scope) error { oomWrites++; return nil }
+		deps.writeScopeMemoryCap = func(Scope, int64, int64, bool) error {
+			t.Fatal("delegate RAM wrote the automatic admission-sized memory.max")
+			return nil
+		}
+		result, err := confineWithDeps(context.Background(), ConfineRequest{
+			Slice: "finite.slice", DelegateRAM: true, Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard,
+		}, deps)
+		if err != nil || result.Status.Cap != ConfineCapEnforced || result.Status.OOMGroup != ConfineOOMGroupSet || result.Status.ScopeMemoryMax != 0 || oomWrites != 1 {
+			t.Fatalf("result=%+v err=%v oomWrites=%d", result, err, oomWrites)
+		}
+	})
+
+	t.Run("finite cap remains a precondition", func(t *testing.T) {
+		admitted, oomWritten, started := false, false, false
+		deps := confineUnitDeps(&confineFakeScope{})
+		deps.readCap = func(string) (int64, bool) { return 0, false }
+		deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
+			admitted = true
+			return admissionResult{}, nil
+		}
+		deps.writeOOMGroup = func(Scope) error { oomWritten = true; return nil }
+		deps.start = func(*confineCommand) error { started = true; return nil }
+		_, err := confineWithDeps(context.Background(), ConfineRequest{
+			Slice: "finite.slice", DelegateRAM: true, Argv: []string{"must-not-run"}, Stderr: io.Discard,
+		}, deps)
+		if err == nil || !strings.Contains(err.Error(), "uncapped") || admitted || oomWritten || started {
+			t.Fatalf("err=%v admitted=%v oomWritten=%v started=%v", err, admitted, oomWritten, started)
+		}
+	})
+}
+
 // verifies: a daemon grant whose admission could not be evaluated (state
 // "unevaluated" — the daemon answered but the slice's live usage was unreadable)
 // carries only the flat fallback reserve and was never accounted, so it must NOT

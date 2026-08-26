@@ -135,6 +135,44 @@ func TestAdmitPrefixConcurrencyAndNoJumpAhead(t *testing.T) {
 	waitAdmitGrant(t, small)
 }
 
+func TestAdmitWeightedReservationsBoundConcurrentSumAcrossSuites(t *testing.T) {
+	var maximum atomic.Int64
+	maximum.Store(100)
+	server := admitTestServer(&maximum)
+	queue, suiteAHeavy := enqueueAdmitTest(t, server, 70)
+	_, suiteBHeavy := enqueueAdmitTest(t, server, 70)
+	waitAdmitGrant(t, suiteAHeavy)
+	requireAdmitQueued(t, suiteBHeavy)
+	queue.mu.Lock()
+	if queue.outstanding > maximum.Load() || queue.outstanding != 70 {
+		t.Fatalf("heavy outstanding=%d cap=%d", queue.outstanding, maximum.Load())
+	}
+	queue.mu.Unlock()
+	server.releaseAdmitWaiter(queue, suiteAHeavy)
+	waitAdmitGrant(t, suiteBHeavy)
+	server.releaseAdmitWaiter(queue, suiteBHeavy)
+
+	var lights []*admitWaiter
+	for index := 0; index < 5; index++ {
+		lightQueue, waiter := enqueueAdmitTest(t, server, 20)
+		if index == 0 {
+			queue = lightQueue
+		}
+		lights = append(lights, waiter)
+	}
+	for _, waiter := range lights {
+		waitAdmitGrant(t, waiter)
+	}
+	queue.mu.Lock()
+	if queue.outstanding != 100 || queue.outstanding > maximum.Load() || queue.outstandingJobs != 5 {
+		t.Fatalf("light outstanding=%d jobs=%d cap=%d", queue.outstanding, queue.outstandingJobs, maximum.Load())
+	}
+	queue.mu.Unlock()
+	for _, waiter := range lights {
+		server.releaseAdmitWaiter(queue, waiter)
+	}
+}
+
 func TestAdmitReservationAtomicProgressUnderChurn(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(100)

@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"aira/internal/app"
 	"aira/internal/core"
@@ -206,6 +207,49 @@ func TestConfineMemoryFlagsThreadIntoRequest(t *testing.T) {
 	}
 }
 
+func TestConfineDelegateRAMFlagThreadsIntoRequest(t *testing.T) {
+	original := runConfined
+	t.Cleanup(func() { runConfined = original })
+	runConfined = func(_ context.Context, request runner.ConfineRequest) (runner.ConfineResult, error) {
+		if !request.DelegateRAM {
+			t.Fatalf("request=%+v", request)
+		}
+		return runner.ConfineResult{}, nil
+	}
+	if exit := runWithInput([]string{"confine", "--delegate-ram", "--memory-reserve", "512M", "--", "pytest", "-q"}, io.Discard, io.Discard, strings.NewReader("")); exit != 0 {
+		t.Fatalf("exit=%d", exit)
+	}
+}
+
+func TestConfineReserveCLIParsesPinnedRequestAndHoldsUntilStdinClose(t *testing.T) {
+	original := reserveConfined
+	t.Cleanup(func() { reserveConfined = original })
+	granted := make(chan runner.ConfineReserveRequest, 1)
+	reserveConfined = func(_ context.Context, request runner.ConfineReserveRequest) (*runner.ConfineReservation, error) {
+		granted <- request
+		return &runner.ConfineReservation{State: "immediate", Reserve: request.Bytes, Basis: "pinned:client"}, nil
+	}
+	reader, writer := io.Pipe()
+	var stdout, stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- runWithInput([]string{"confine-reserve", "--bytes", "512M", "--pinned", "--signature", "pytest:test_x.py::test_y", "--max-wait", "5s"}, &stdout, &stderr, reader)
+	}()
+	request := <-granted
+	if request.Bytes != 512<<20 || !request.Pinned || request.Signature != "pytest:test_x.py::test_y" || request.MaxWait != 5*time.Second {
+		t.Fatalf("request=%+v", request)
+	}
+	select {
+	case exit := <-done:
+		t.Fatalf("helper exited before stdin close: %d", exit)
+	case <-time.After(20 * time.Millisecond):
+	}
+	_ = writer.Close()
+	if exit := <-done; exit != 0 || stdout.String() != "granted reserve=536870912 basis=pinned:client\n" || stderr.Len() != 0 {
+		t.Fatalf("exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
+	}
+}
+
 func TestConfinePinnedReserveFlagEnvironmentAndMemoryMaxPrecedence(t *testing.T) {
 	original := runConfined
 	t.Cleanup(func() { runConfined = original })
@@ -292,11 +336,29 @@ func TestConfineDescriptorIsClientExecuteWithoutMCP(t *testing.T) {
 			continue
 		}
 		found = true
-		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] -- <argv...>" {
+		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--delegate-ram] -- <argv...>" {
 			t.Fatalf("descriptor=%+v", descriptor)
 		}
 	}
 	if !found {
 		t.Fatal("confine descriptor missing")
+	}
+}
+
+func TestConfineReserveDescriptorIsCLIOnly(t *testing.T) {
+	canonical, route := core.Classify("confine-reserve", "")
+	if canonical != "confine-reserve" || route != core.RouteClient {
+		t.Fatalf("classify=%q/%v", canonical, route)
+	}
+	response := core.New(nil).Do(context.Background(), core.Request{Verb: "confine-reserve", Args: map[string]any{
+		"bytes": "1", "pinned": true, "signature": "pytest:x",
+	}})
+	if response.Code != "E_CONFINE_UNAVAILABLE" || response.OK {
+		t.Fatalf("response=%+v", response)
+	}
+	for _, descriptor := range core.New(nil).DispatchDescriptors() {
+		if descriptor.Name == "confine-reserve" && (descriptor.Include || descriptor.MCPTool != "") {
+			t.Fatalf("descriptor=%+v", descriptor)
+		}
 	}
 }
