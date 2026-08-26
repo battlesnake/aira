@@ -17,7 +17,11 @@ import pytest
 _DEFAULT_POLL_INTERVAL = 0.75
 _DEFAULT_MAX_WAIT = 300.0
 _GRANT_READ_GRACE = 2.0
-_MEMORY_SIZE = re.compile(r"^[0-9]+[KMGkmg]?$")
+# re.ASCII keeps case-folding ASCII-only, matching Go's byte-wise strings.ToUpper;
+# without it re.IGNORECASE would fold Unicode look-alikes (e.g. U+212A KELVIN SIGN
+# → "k") that Go rejects, diverging the two parsers.
+_MEMORY_SIZE = re.compile(r"^([0-9]+)(B|KIB|KB|K|MIB|MB|M|GIB|GB|G|TIB|TB|T)?$", re.IGNORECASE | re.ASCII)
+_MEMORY_SCALE = {"": 1, "B": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
 _GRANT_LINE = re.compile(r"^granted reserve=([1-9][0-9]*) basis=pinned:client$")
 _logged_failures = set()
 _held_slot_descriptors = set()
@@ -148,13 +152,19 @@ def _acquire_slot():
 
 
 def _parse_memory_size(raw):
-    if not isinstance(raw, str) or not _MEMORY_SIZE.fullmatch(raw):
-        raise ValueError("memory size must match [0-9]+[KMGkmg]?")
-    multiplier = {"k": 1 << 10, "m": 1 << 20, "g": 1 << 30}.get(
-        raw[-1].lower(), 1
-    )
-    digits = raw[:-1] if multiplier != 1 else raw
-    value = int(digits) * multiplier
+    # Mirrors runner.ParseMemorySize exactly: [0-9]+ with an optional 1024-based
+    # unit, case-insensitive, every spelling a synonym (4G == 4GB == 4GiB).
+    match = _MEMORY_SIZE.fullmatch(raw) if isinstance(raw, str) else None
+    if match is None:
+        raise ValueError(
+            "memory size must be [0-9]+ with an optional K/M/G/T (x i x B) unit"
+        )
+    unit = (match.group(2) or "").upper()
+    scale = unit[0] if unit[:1] in ("K", "M", "G", "T") else ""
+    value = int(match.group(1)) * _MEMORY_SCALE[scale]
+    # The grammar matches runner.ParseMemorySize; the marker deliberately parts
+    # from it on ONE point — a zero per-test estimate is meaningless, so "0" (which
+    # the Go parser accepts as an unset-cap sentinel) falls to the pinned default here.
     if value <= 0 or value > (1 << 63) - 1:
         raise ValueError("memory size must be a positive int64 byte count")
     return value
@@ -270,7 +280,7 @@ def pytest_configure(config):
     global _plugin_active
     _plugin_active = True
     config.addinivalue_line(
-        "markers", "aira_mem(size): pinned per-test RAM estimate ([0-9]+[KMGkmg]?)"
+        "markers", "aira_mem(size): pinned per-test RAM estimate, e.g. 4G / 512MB / 4GiB (1024-based)"
     )
 
 

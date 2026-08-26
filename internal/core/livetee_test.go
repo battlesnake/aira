@@ -63,7 +63,7 @@ func TestRunScopeMemoryCoreValidation(t *testing.T) {
 		"zero max":               {"memory_max": "0"},
 		"max minimum":            {"memory_max": "1023K"},
 		"high above max":         {"memory_max": "2M", "memory_high": "3M"},
-		"syntax":                 {"memory_max": "1MB"},
+		"syntax":                 {"memory_max": "1.5G"}, // fractional sizes rejected
 	} {
 		t.Run(name, func(t *testing.T) {
 			fake := &faceRunner{}

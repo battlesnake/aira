@@ -24,7 +24,8 @@ func TestFloorMemoryPageUsesKernelPageSize(t *testing.T) {
 	}
 }
 
-// covers: task-57 portable [KMG] parsing, including lowercase suffixes and zero.
+// covers: portable size parsing — single-letter and full unit spellings
+// (K/KB/KiB, M/MB/MiB, G/GB/GiB, T/TB/TiB, B), case-insensitive, 1024-based.
 func TestParseMemorySize(t *testing.T) {
 	tests := []struct {
 		input string
@@ -36,6 +37,18 @@ func TestParseMemorySize(t *testing.T) {
 		{input: "2m", want: 2 << 20},
 		{input: "3G", want: 3 << 30},
 		{input: "0004k", want: 4 << 10},
+		// Widened: full unit spellings; B/iB are accepted synonyms (4G==4GB==4GiB).
+		{input: "512B", want: 512},
+		{input: "4KB", want: 4 << 10},
+		{input: "4KiB", want: 4 << 10},
+		{input: "512MB", want: 512 << 20},
+		{input: "10MiB", want: 10 << 20},
+		{input: "4GB", want: 4 << 30},
+		{input: "4GiB", want: 4 << 30},
+		{input: "4gb", want: 4 << 30},
+		{input: "4gib", want: 4 << 30},
+		{input: "1T", want: 1 << 40},
+		{input: "2TiB", want: 2 << 40},
 	}
 	for _, test := range tests {
 		t.Run(test.input, func(t *testing.T) {
@@ -47,9 +60,15 @@ func TestParseMemorySize(t *testing.T) {
 	}
 }
 
-// verifies: task-57 rejects every shape outside [0-9]+[KMGkmg]? and overflow.
+// verifies: rejects every shape outside [0-9]+(unit)? — partial/garbage units,
+// floats, signs, whitespace, and overflow. "1T"/"1MB" are NOW valid (widened).
 func TestParseMemorySizeRejectsInvalidInput(t *testing.T) {
-	for _, input := range []string{"", "-1", "+1", " 1M", "1M ", "1T", "1MB", "1.5G", "K", "12x", "9223372036854775808", "9007199254740992K"} {
+	for _, input := range []string{
+		"", "-1", "+1", " 1M", "1M ", "1.5G", "K", "12x",
+		"1KI", "1Gi", "1GG", "GB", "1KBB", "1 G", "4G B",
+		"1K", "1KB", // U+212A KELVIN SIGN folds to ASCII k under Unicode; must be rejected (Go/Python parity)
+		"9223372036854775808", "9007199254740992K", "9007199254740992T",
+	} {
 		t.Run(strings.ReplaceAll(input, " ", "space"), func(t *testing.T) {
 			if got, err := parseMemorySize(input); err == nil {
 				t.Fatalf("parseMemorySize(%q)=%d, want error", input, got)

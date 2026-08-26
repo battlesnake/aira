@@ -6,35 +6,43 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"strings"
 )
 
 const minimumScopeMemoryMax = int64(1 << 20)
 
-// parseMemorySize parses an integer byte count with an optional binary K, M,
-// or G suffix. It is intentionally independent of Linux and cgroup files.
+// parseMemorySize parses an integer byte count with an optional 1024-based unit.
+// The unit is case-insensitive and every spelling of a scale is a synonym:
+// K/KB/KiB, M/MB/MiB, G/GB/GiB, T/TB/TiB, and a bare B (bytes). So 4G == 4GB ==
+// 4GiB. It is intentionally independent of Linux and cgroup files. Integer only
+// (no fractional sizes): write 1536M rather than 1.5G.
 func parseMemorySize(s string) (int64, error) {
 	if s == "" {
 		return 0, errors.New("memory size is empty")
 	}
-	multiplier := int64(1)
-	last := s[len(s)-1]
-	switch last {
-	case 'K', 'k':
-		multiplier, s = 1<<10, s[:len(s)-1]
-	case 'M', 'm':
-		multiplier, s = 1<<20, s[:len(s)-1]
-	case 'G', 'g':
-		multiplier, s = 1<<30, s[:len(s)-1]
+	digits := 0
+	for digits < len(s) && s[digits] >= '0' && s[digits] <= '9' {
+		digits++
 	}
-	if s == "" {
-		return 0, errors.New("memory size has no digits")
+	if digits == 0 {
+		return 0, fmt.Errorf("memory size %q must be [0-9]+ with an optional K/M/G/T (× i × B) unit", s)
 	}
-	for i := range s {
-		if s[i] < '0' || s[i] > '9' {
-			return 0, fmt.Errorf("memory size %q must match [0-9]+[KMGkmg]?", s)
-		}
+	var multiplier int64
+	switch strings.ToUpper(s[digits:]) {
+	case "", "B":
+		multiplier = 1
+	case "K", "KB", "KIB":
+		multiplier = 1 << 10
+	case "M", "MB", "MIB":
+		multiplier = 1 << 20
+	case "G", "GB", "GIB":
+		multiplier = 1 << 30
+	case "T", "TB", "TIB":
+		multiplier = 1 << 40
+	default:
+		return 0, fmt.Errorf("memory size %q has an invalid unit; use one of K/KB/KiB, M/MB/MiB, G/GB/GiB, T/TB/TiB, or B", s)
 	}
-	value, err := strconv.ParseInt(s, 10, 64)
+	value, err := strconv.ParseInt(s[:digits], 10, 64)
 	if err != nil || value > math.MaxInt64/multiplier {
 		return 0, errors.New("memory size overflows int64 bytes")
 	}

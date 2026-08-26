@@ -49,7 +49,9 @@ def test_large_corpus():
     ...
 ```
 
-The size grammar is exactly `[0-9]+[KMGkmg]?` (`4G`, `512M`, or bare bytes;
-not `4GB` or `512MiB`). Unmarked tests use the nonzero pinned
+The size is `[0-9]+` with an optional 1024-based unit — `K`/`KB`/`KiB`,
+`M`/`MB`/`MiB`, `G`/`GB`/`GiB`, `T`/`TB`/`TiB`, or a bare `B` — case-insensitive,
+every spelling a synonym (`4G` == `4GB` == `4GiB`). Integer only (write `1536M`,
+not `1.5G`). Unmarked tests use the nonzero pinned
 `AIRA_TEST_MEM_DEFAULT`. Reservations are advisory and fail open, while the
 delegate suite remains contained by `memory.oom.group` and the finite slice cap.

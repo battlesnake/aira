@@ -1495,8 +1495,8 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			boolSpec("no_stdin", false, false, "Explicitly launch with null stdin"),
 			boolSpec("store_stdin", false, false, "Persist supplied launch stdin"),
 			boolSpec("no_admit", false, false, "Bypass configured memory admission"),
-			stringSpec("memory_max", false, false, "Per-run scope memory.max ([KMG] binary suffix)"),
-			stringSpec("memory_high", false, false, "Per-run scope memory.high reclaim pressure ([KMG] binary suffix)"),
+			stringSpec("memory_max", false, false, "Per-run scope memory.max (1024-based; K/M/G/T + optional i/B, e.g. 4G/4GiB)"),
+			stringSpec("memory_high", false, false, "Per-run scope memory.high reclaim pressure (1024-based; K/M/G/T + optional i/B, e.g. 4G/4GiB)"),
 			stringSpec("timeout", false, false, "Positive run timeout duration"),
 			stringSpec("ticket", false, false, "Ticket ID"),
 			stringSpec("phase", false, false, "Work phase"),
@@ -1669,9 +1669,9 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
 			stringSpec("name", false, false, "Scope name component"),
 			stringSpec("owner", false, false, "Cooperative owner identity"),
-			stringSpec("memory_reserve", false, false, "Pinned admission reserve ([KMG] binary suffix)"),
-			stringSpec("memory_max", false, false, "Scope memory.max ([KMG] binary suffix)"),
-			stringSpec("memory_high", false, false, "Scope memory.high reclaim pressure ([KMG] binary suffix)"),
+			stringSpec("memory_reserve", false, false, "Pinned admission reserve (1024-based; K/M/G/T + optional i/B, e.g. 4G/4GiB)"),
+			stringSpec("memory_max", false, false, "Scope memory.max (1024-based; K/M/G/T + optional i/B, e.g. 4G/4GiB)"),
+			stringSpec("memory_high", false, false, "Scope memory.high reclaim pressure (1024-based; K/M/G/T + optional i/B, e.g. 4G/4GiB)"),
 			boolSpec("delegate_ram", false, false, "Delegate RAM admission to per-test pinned reservations"),
 		}, Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			_ = ctx
@@ -1686,7 +1686,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine is a direct CLI-only foreground verb")
 		}},
 		"confine-reserve": {Name: "confine-reserve", Usage: "confine-reserve --bytes N --pinned --signature S [--slice S] [--max-wait D]", Args: []ArgSpec{
-			stringSpec("bytes", true, false, "Pinned byte reservation ([KMG] binary suffix)"),
+			stringSpec("bytes", true, false, "Pinned byte reservation (1024-based; K/M/G/T + optional i/B, e.g. 4G/4GiB)"),
 			boolSpec("pinned", true, false, "Require the v1 pinned estimate path"),
 			stringSpec("signature", true, false, "Per-test resource signature"),
 			stringSpec("slice", false, false, "Machine-wide cgroup slice"),

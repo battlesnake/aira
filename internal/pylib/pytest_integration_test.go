@@ -443,6 +443,9 @@ class TestClassScope:
     def test_test_scope(self): pass
 
 @pytest.mark.aira_mem("4GB")
+def test_full_unit_spelling(): pass
+
+@pytest.mark.aira_mem("1.5G")
 def test_invalid_uses_default(): pass
 `)
 	result := runPytest(t, pytest, project, pythonDir, map[string]string{
@@ -459,7 +462,10 @@ def test_invalid_uses_default(): pass
 	}
 	wants := map[string]string{
 		"test_module_scope": "67108864", "test_class_scope": "33554432",
-		"test_test_scope": "16777216", "test_invalid_uses_default": "8388608",
+		"test_test_scope": "16777216",
+		// "4GB" is now a valid full-unit spelling (== 4GiB == 4<<30); a float
+		// ("1.5G") is still rejected and falls to the 8M default with one log.
+		"test_full_unit_spelling": "4294967296", "test_invalid_uses_default": "8388608",
 	}
 	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
 		var argv []string
