@@ -277,18 +277,24 @@ func killConfineWithDeps(ctx context.Context, slicePath, selector, callerOwner s
 	}
 	scope := &linuxScope{path: filepath.Join(slicePath, childName), fd: os.NewFile(uintptr(fd), childName)}
 	defer scope.fd.Close()
-	members, err := scope.Members()
-	if err != nil {
-		return ConfineKillResult{}, fmt.Errorf("%s: scope %s population could not be established: %w", CodeConfineKillUnconfirmed, record.ScopeID, err)
-	}
-	if len(members) == 0 {
-		return ConfineKillResult{}, fmt.Errorf("%s: scope %s has nothing to kill yet; retry", CodeConfineNotLaunched, record.ScopeID)
-	}
+	// Observe population SUBTREE-aware via cgroup.events `populated`, the same
+	// source the empty-confirmation uses (cgroup_linux.go Empty). Leaf-only
+	// cgroup.procs would miss a workload that migrated into a child cgroup it
+	// created inside its own scope, reporting a running job as not-launched and
+	// leaving it uncancellable; cgroup.kill is itself recursive, so the whole
+	// subtree is the correct unit for both the gate and the confirmation.
 	scope.events, err = scope.openFile("cgroup.events", unix.O_RDONLY)
 	if err != nil {
 		return ConfineKillResult{}, fmt.Errorf("%s: scope %s confirmation channel unavailable: %w", CodeConfineKillUnconfirmed, record.ScopeID, err)
 	}
 	defer scope.events.Close()
+	empty, err := scope.Empty()
+	if err != nil {
+		return ConfineKillResult{}, fmt.Errorf("%s: scope %s population could not be established: %w", CodeConfineKillUnconfirmed, record.ScopeID, err)
+	}
+	if empty {
+		return ConfineKillResult{}, fmt.Errorf("%s: scope %s has nothing to kill yet; retry", CodeConfineNotLaunched, record.ScopeID)
+	}
 	if err := scope.Kill(); err != nil {
 		return ConfineKillResult{}, fmt.Errorf("%s: cgroup.kill for %s: %w", CodeConfineKillUnconfirmed, record.ScopeID, err)
 	}

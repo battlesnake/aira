@@ -143,6 +143,83 @@ func TestConfineKillUsesFreshRegistryOwnerNotListSnapshot(t *testing.T) {
 	}
 }
 
+// verifies: the kill observes SUBTREE population (cgroup.events populated), not
+// leaf-only cgroup.procs, so a workload that migrated into a child cgroup inside
+// its own scope is still killed (cgroup.kill is recursive) instead of mis-reported
+// as not-launched and left uncancellable. RED against a leaf-only Members() observe.
+func TestConfineKillObservesSubtreePopulationNotLeafOnly(t *testing.T) {
+	slice := t.TempDir()
+	id := confineTestScopeID("nested", 4601, time.Now().UnixNano())
+	path := filepath.Join(slice, ".aira-"+id)
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Leaf cgroup.procs is EMPTY (the workload migrated into a self-created child
+	// cgroup) while the SUBTREE is populated per cgroup.events.
+	for name, data := range map[string]string{
+		"cgroup.procs": "", "cgroup.events": "populated 1\n", "memory.current": "4096\n", "memory.max": "8192\n", "cgroup.kill": "",
+	} {
+		if err := os.WriteFile(filepath.Join(path, name), []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deps := defaultConfineScanDeps()
+	deps.waitEmpty = func(_ context.Context, scope Scope, _ time.Duration) error {
+		return os.WriteFile(filepath.Join(scope.Reference(), "cgroup.events"), []byte("populated 0\n"), 0o644)
+	}
+	result, err := killConfineWithDeps(context.Background(), slice, id, "owner", false, []ConfineRegistryEntry{{ScopeID: id, Name: "nested", Owner: "owner"}}, func(string) (string, bool) { return "owner", true }, time.Second, deps)
+	if err != nil || result.Status != "killed" {
+		t.Fatalf("subtree-populated kill result=%+v err=%v (a leaf-only observe would mis-report not-launched)", result, err)
+	}
+	if data, _ := os.ReadFile(filepath.Join(path, "cgroup.kill")); string(data) != "1" {
+		t.Fatalf("kill file=%q", data)
+	}
+}
+
+// verifies: the ownership guard refuses an unknown/scan-only owner AND an unknown
+// CALLER without --steal — the daemon-down / AIRA_CONFINE_OWNER-unset incident
+// class where BOTH resolve to "unknown". A guard that dropped the !known /
+// caller-unknown clauses would let "unknown"=="unknown" bypass and kill a foreign
+// scope with no --steal (the exact cross-session bypass this feature prevents).
+func TestConfineKillScanOnlyAndUnknownCallerRequireSteal(t *testing.T) {
+	newScope := func(t *testing.T) (string, string) {
+		slice := t.TempDir()
+		id := confineTestScopeID("scanonly", 4701, time.Now().UnixNano())
+		writeConfineTestScope(t, slice, id, "77\n")
+		return slice, id
+	}
+	assertRefusedNoKill := func(t *testing.T, slice, id, caller string) {
+		t.Helper()
+		// scan-only: nil registry AND nil lookup → owner resolves to unknown.
+		result, err := KillConfine(context.Background(), slice, id, caller, false, nil, nil)
+		if err == nil || !strings.HasPrefix(err.Error(), CodeConfineOwnerUnverified+":") || result.Status == "killed" {
+			t.Fatalf("caller=%q result=%+v err=%v, want owner-unverified refusal", caller, result, err)
+		}
+		if data, _ := os.ReadFile(filepath.Join(slice, ".aira-"+id, "cgroup.kill")); len(data) != 0 {
+			t.Fatalf("caller=%q refusal wrote kill=%q", caller, data)
+		}
+	}
+	t.Run("scan-only-foreign-concrete-caller", func(t *testing.T) {
+		slice, id := newScope(t)
+		assertRefusedNoKill(t, slice, id, "session-b")
+	})
+	t.Run("scan-only-and-unknown-caller", func(t *testing.T) {
+		slice, id := newScope(t)
+		assertRefusedNoKill(t, slice, id, ConfineUnknownOwner)
+	})
+	t.Run("scan-only-steal-kills", func(t *testing.T) {
+		slice, id := newScope(t)
+		deps := defaultConfineScanDeps()
+		deps.waitEmpty = func(_ context.Context, scope Scope, _ time.Duration) error {
+			return os.WriteFile(filepath.Join(scope.Reference(), "cgroup.events"), []byte("populated 0\n"), 0o644)
+		}
+		result, err := killConfineWithDeps(context.Background(), slice, id, ConfineUnknownOwner, true, nil, nil, time.Second, deps)
+		if err != nil || result.Status != "killed" {
+			t.Fatalf("scan-only steal result=%+v err=%v", result, err)
+		}
+	})
+}
+
 func TestConfineKillEmptyAndUnconfirmedNeverReportKilled(t *testing.T) {
 	t.Run("empty-not-launched", func(t *testing.T) {
 		slice := t.TempDir()
