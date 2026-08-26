@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -162,6 +163,47 @@ func TestConfineReservePinnedGrantHeldUntilCloseAndReleasedOnce(t *testing.T) {
 	case <-released:
 	case <-time.After(time.Second):
 		t.Fatal("lease did not release on close")
+	}
+}
+
+// verifies: v1 requires a PINNED reserve — an unpinned request is refused BEFORE
+// any daemon dial (never sent to the estimate/p90 path). RED against dropping the
+// !Pinned guard in validateConfineReserveRequest.
+func TestConfineReserveUnpinnedIsRefusedBeforeDial(t *testing.T) {
+	r := reserveTestRunner()
+	r.admitDialFn = func(context.Context, string) (net.Conn, error) {
+		t.Fatal("unpinned reserve must be refused before any daemon dial")
+		return nil, errors.New("unreachable")
+	}
+	reservation, err := confineReserveWithRunner(context.Background(), ConfineReserveRequest{
+		Bytes: 40, Pinned: false, Signature: "pytest:unpinned",
+	}, r)
+	if err == nil || reservation != nil || !strings.Contains(err.Error(), "must be pinned") {
+		t.Fatalf("reservation=%+v err=%v, want pinned refusal", reservation, err)
+	}
+}
+
+// verifies: a saturated slice (budget full for max_wait) is a terminal reserve
+// error with NO reservation (the helper exits nonzero → the plugin fails open) —
+// it never fabricates a grant. RED against treating E_ADMIT_SATURATED as a grant.
+func TestConfineReserveSaturatedIsTerminalNoGrant(t *testing.T) {
+	r := reserveTestRunner()
+	r.admitDialFn = func(context.Context, string) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			var frame runnerAdmitRequestFrame
+			_ = readRunnerAdmitFrame(server, &frame)
+			data, _ := json.Marshal(runnerAdmitRejection{Basis: "reject:saturated"})
+			_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{Code: "E_ADMIT_SATURATED", Error: "saturated", Data: data})
+		}()
+		return client, nil
+	}
+	reservation, err := confineReserveWithRunner(context.Background(), ConfineReserveRequest{
+		Bytes: 40, Pinned: true, Signature: "pytest:saturated",
+	}, r)
+	if err == nil || reservation != nil {
+		t.Fatalf("reservation=%+v err=%v, want terminal saturated error", reservation, err)
 	}
 }
 

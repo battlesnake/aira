@@ -15,6 +15,12 @@ const (
 	// A project-less invocation has no per-project peak-RSS history. Four GiB is
 	// a conservative #50 no-history fallback; injected callers may override it.
 	DefaultConfineMemoryReserve = int64(4 << 30)
+	// Under --delegate-ram the suite delegates RAM accounting to its per-test
+	// reservations, so its OWN reserve must be a small PINNED framework overhead —
+	// never the unpinned whole-command estimate, which would double-book the
+	// per-test reservations in queue.outstanding and could inflate via history to
+	// reject the whole suite E_ADMIT_TOO_LARGE.
+	DefaultDelegateRAMOverhead = int64(512 << 20)
 )
 
 type ConfineAdmission string

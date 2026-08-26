@@ -564,7 +564,13 @@ def test_participating_suite():
 	if err != nil || json.Unmarshal(data, &observed) != nil {
 		t.Fatalf("state=%q err=%v", data, err)
 	}
-	if observed.Current != 0 || observed.Count != 0 || observed.Maximum > 100 || observed.Maximum < 70 || observed.HeavyMax != 1 || observed.MaxCount < 2 {
+	// The budget ceiling is enforced by the fake helper (production admission is
+	// tested in Go); the load-bearing plugin behaviour is that reservations are
+	// held then released (Current/Count back to 0), heavy tests serialise
+	// (HeavyMax==1), light tests parallelise (MaxCount>=2), and the observed peak
+	// weight packed near the budget (Maximum>=70). ("Maximum>100" was dead — the
+	// helper caps at 100 — so it is dropped.)
+	if observed.Current != 0 || observed.Count != 0 || observed.Maximum < 70 || observed.HeavyMax != 1 || observed.MaxCount < 2 {
 		t.Fatalf("weighted shared state=%+v", observed)
 	}
 }

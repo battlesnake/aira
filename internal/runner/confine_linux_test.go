@@ -636,6 +636,29 @@ func TestConfineDelegateRAMSuppressesOnlyAutomaticSubcap(t *testing.T) {
 		}
 	})
 
+	t.Run("no explicit reserve pins a small framework overhead not the unpinned estimate", func(t *testing.T) {
+		scope := &confineFakeScope{}
+		deps := confineUnitDeps(scope)
+		closer := &confineCountingCloser{}
+		var gotReserve int64
+		var gotPinned bool
+		deps.admit = func(_ context.Context, _ string, request ConfineRequest, reserve int64) (admissionResult, error) {
+			gotReserve, gotPinned = reserve, request.MemoryReservePinned
+			return admissionResult{state: "immediate", reserve: reserve, basis: "pinned:client", release: closer}, nil
+		}
+		if _, err := confineWithDeps(context.Background(), ConfineRequest{
+			Slice: "finite.slice", DelegateRAM: true, Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard,
+		}, deps); err != nil {
+			t.Fatal(err)
+		}
+		// A delegate-ram suite delegates RAM accounting to its per-test reservations,
+		// so its OWN reserve must be a small PINNED overhead — never the unpinned
+		// whole-command estimate (which would double-book the per-test reservations).
+		if gotReserve != DefaultDelegateRAMOverhead || !gotPinned {
+			t.Fatalf("delegate-ram no-reserve => reserve=%d pinned=%v, want %d pinned", gotReserve, gotPinned, DefaultDelegateRAMOverhead)
+		}
+	})
+
 	t.Run("finite cap remains a precondition", func(t *testing.T) {
 		admitted, oomWritten, started := false, false, false
 		deps := confineUnitDeps(&confineFakeScope{})

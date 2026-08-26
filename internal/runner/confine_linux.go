@@ -365,7 +365,15 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	reserve := request.MemoryReserve
 	pinned := request.MemoryReservePinned || reserve > 0
 	if reserve <= 0 {
-		reserve = DefaultConfineMemoryReserve
+		if request.DelegateRAM {
+			// Delegate-ram: pin a small framework overhead so the suite's own
+			// reserve never takes the unpinned whole-command estimate path (which
+			// would double-book the per-test reservations, §2a).
+			reserve = DefaultDelegateRAMOverhead
+			pinned = true
+		} else {
+			reserve = DefaultConfineMemoryReserve
+		}
 	}
 	if request.ScopeMemoryMax > 0 {
 		reserve = request.ScopeMemoryMax

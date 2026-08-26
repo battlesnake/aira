@@ -21,7 +21,7 @@ _MEMORY_SIZE = re.compile(r"^[0-9]+[KMGkmg]?$")
 _GRANT_LINE = re.compile(r"^granted reserve=([1-9][0-9]*) basis=pinned:client$")
 _logged_failures = set()
 _held_slot_descriptors = set()
-_held_reservation_descriptors = set()
+_held_reservation_streams = set()
 _plugin_active = False
 
 
@@ -31,26 +31,41 @@ def _release_slot(descriptor):
 
 
 def _close_inherited_slots():
-    descriptors = tuple(_held_slot_descriptors | _held_reservation_descriptors)
+    descriptors = tuple(_held_slot_descriptors)
     _held_slot_descriptors.clear()
-    _held_reservation_descriptors.clear()
     for descriptor in descriptors:
         try:
             os.close(descriptor)
         except OSError:
+            pass
+    # Reservation stdin is a BufferedWriter (subprocess.PIPE). Close the STREAM
+    # OBJECT (its write buffer is always empty — we only close it for EOF, never
+    # write), so the inherited copy is released with a single clean fd close and
+    # the child's finalizer cannot double-close a since-reused fd.
+    streams = tuple(_held_reservation_streams)
+    _held_reservation_streams.clear()
+    for stream in streams:
+        try:
+            stream.close()
+        except Exception:
             pass
 
 
 os.register_at_fork(after_in_child=_close_inherited_slots)
 
 
-def _log_once(message, *, domain="CPU"):
-    key = domain
+def _log_once(message, *, domain="CPU", disabled=True):
+    # `disabled=False` is an advisory note where governance CONTINUES (e.g. an
+    # invalid marker that falls back to the pinned default); it must NOT claim the
+    # governor was disabled (honesty), and is deduped separately so it can never
+    # suppress a later genuine "disabled" message.
+    key = domain if disabled else domain + ":note"
     if key in _logged_failures:
         return
     _logged_failures.add(key)
     try:
-        sys.stderr.write("aira %s governor disabled: %s\n" % (domain, message))
+        status = "disabled" if disabled else "note"
+        sys.stderr.write("aira %s governor %s: %s\n" % (domain, status, message))
     except Exception:
         pass
 
@@ -160,7 +175,7 @@ def _memory_estimate(item):
             raise ValueError("aira_mem requires exactly one positional value")
         return _parse_memory_size(marker.args[0])
     except Exception as exc:
-        _log_once("invalid aira_mem marker on %s: %s; using pinned default" % (item.nodeid, exc), domain="RAM")
+        _log_once("invalid aira_mem marker on %s: %s; using pinned default" % (item.nodeid, exc), domain="RAM", disabled=False)
         return default
 
 
@@ -198,10 +213,7 @@ def _stop_reservation(process):
         return
     stdin = process.stdin
     if stdin is not None:
-        try:
-            _held_reservation_descriptors.discard(stdin.fileno())
-        except (OSError, ValueError):
-            pass
+        _held_reservation_streams.discard(stdin)
         try:
             stdin.close()
         except Exception:
@@ -245,7 +257,7 @@ def _acquire_reservation(item):
             stderr=None,
             close_fds=True,
         )
-        _held_reservation_descriptors.add(process.stdin.fileno())
+        _held_reservation_streams.add(process.stdin)
         _read_grant(process, _DEFAULT_MAX_WAIT + _GRANT_READ_GRACE)
         return process
     except Exception as exc:
