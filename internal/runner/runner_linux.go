@@ -1380,6 +1380,17 @@ type processCgroupObservation struct {
 	Cgroup          string
 }
 
+// classifyLaunchScopeIntegrity folds the launch, monitor, and teardown evidence
+// into a single scope-integrity verdict. ScopeContained is a SAMPLING-based,
+// best-effort positive: it means the leader was positively verified in the scope
+// and no descendant was observed across the samples taken. It is NOT a whole-tree
+// proof — a descendant that forks and migrates out entirely within a single
+// sub-2ms sampler gap is never observed and such a run can still read Contained.
+// This is an accepted coverage gap (written down per the review policy): cgroup-v2
+// exposes no cheap process-granular cumulative witness to close it (pids.peak
+// counts TIDs, not processes, so it is inflated by the leader's own threads and by
+// AIRA's in-scope confine setup helper, and it requires kernel >=6.1). A witnessed
+// escape/kill/migration always overrides the positive claim.
 func classifyLaunchScopeIntegrity(facts launchScopeFacts) (ScopeIntegrity, bool, string) {
 	if witnessedEscape(facts.ScopePath, facts.Monitor.Escape) || witnessedEscape(facts.ScopePath, facts.Teardown.Escape) {
 		return ScopeDescendantEscaped, false, "E_RUN_SCOPE_MIGRATION"
