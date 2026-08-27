@@ -256,6 +256,7 @@ func TestFormatConfineReserveAdvisory(t *testing.T) {
 	peak89 := int64(89)
 	halfMax := int64(math.MaxInt64 / 2)
 	maxPeak := int64(math.MaxInt64)
+	almostMax := int64(math.MaxInt64 - 1)
 	for _, test := range []struct {
 		name string
 		cap  int64
@@ -306,6 +307,13 @@ func TestFormatConfineReserveAdvisory(t *testing.T) {
 			// overflowing the percentage multiply.
 			name: "huge near-cap reports safe percentage", cap: math.MaxInt64, peak: &maxPeak,
 			want: fmt.Sprintf("confine: peak RSS %s reached 100%% of the reserved cap %s; consider a higher --memory-reserve or --delegate-ram for suites", FormatConfineBytes(math.MaxInt64), FormatConfineBytes(math.MaxInt64)),
+		},
+		{
+			// Overflow safety, discriminating: peak = cap-1 near MaxInt64 has a huge
+			// remainder, so peak%cap*100 overflows int64; the 128-bit path must still
+			// floor to 99%. A split-division would wrap here and report a wrong value.
+			name: "huge just-below-cap reports 99 percent without overflow", cap: math.MaxInt64, peak: &almostMax,
+			want: fmt.Sprintf("confine: peak RSS %s reached 99%% of the reserved cap %s; consider a higher --memory-reserve or --delegate-ram for suites", FormatConfineBytes(math.MaxInt64-1), FormatConfineBytes(math.MaxInt64)),
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {

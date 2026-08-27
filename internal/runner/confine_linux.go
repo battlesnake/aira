@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math/bits"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -692,11 +693,15 @@ func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool
 	return ""
 }
 
-// confinePercentOfCap returns floor(peak*100/cap) without overflowing int64 for
-// any byte-scale cap. cap is > 0 at every call site; peak <= cap (a peak above
-// the enforced cap is an OOM, handled before this is reached).
+// confinePercentOfCap returns floor(peak*100/cap) exactly, for any peak and cap
+// in [1, MaxInt64], by doing the multiply in 128 bits so peak*100 never wraps.
+// cap is > 0 and peak > 0 at every call site; peak <= cap (a peak above the
+// enforced cap is an OOM, handled before this is reached), so the quotient is
+// <= 100 and bits.Div64 (which requires the quotient to fit in 64 bits) is safe.
 func confinePercentOfCap(peak, capBytes int64) int {
-	return int(peak/capBytes*100 + peak%capBytes*100/capBytes)
+	hi, lo := bits.Mul64(uint64(peak), 100)
+	quotient, _ := bits.Div64(hi, lo, uint64(capBytes))
+	return int(quotient)
 }
 
 func admitConfine(ctx context.Context, path string, request ConfineRequest, reserve int64) (admissionResult, error) {
