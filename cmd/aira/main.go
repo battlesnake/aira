@@ -1833,6 +1833,16 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 	if err := table.Flush(); err != nil {
 		return exitForError("E_RUN_DETACH_FAILED")
 	}
+	if result.SliceReserve != nil {
+		jobLabel := "jobs"
+		if result.SliceReserve.Jobs == 1 {
+			jobLabel = "job"
+		}
+		_, _ = fmt.Fprintf(stdout, "slice reserve: %s granted / %s ceiling across %d admitted %s\n",
+			formatReserveBytes(result.SliceReserve.GrantedBytes),
+			formatReserveBytes(result.SliceReserve.CeilingBytes),
+			result.SliceReserve.Jobs, jobLabel)
+	}
 	if response.Exit != 0 {
 		return response.Exit
 	}
@@ -1851,6 +1861,17 @@ func confineInt64(value *int64) string {
 		return "unevaluated"
 	}
 	return strconv.FormatInt(*value, 10)
+}
+
+// formatReserveBytes renders a KNOWN reserve/ceiling byte count. Unlike
+// FormatConfineBytes (which maps 0 to "unknown" for the optional trailer facets),
+// a slice-reserve summary value of 0 is a genuine zero (an idle slice, or a cap
+// fully consumed by headroom), so render it as "0B" rather than "unknown".
+func formatReserveBytes(value int64) string {
+	if value <= 0 {
+		return "0B"
+	}
+	return runner.FormatConfineBytes(value)
 }
 
 func confineAge(value *int64) string {

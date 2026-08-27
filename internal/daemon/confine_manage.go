@@ -120,6 +120,19 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		if result.Verdict == "unevaluated" {
 			return core.Response{OK: true, Code: "UNEVALUATED", Data: result, Exit: 3}
 		}
+		readMemory := s.admitReadMemory
+		if readMemory == nil {
+			readMemory = readSliceMemory
+		}
+		_, maximum, ok, _ := readMemory(path)
+		if ok {
+			granted, jobs, _ := s.admitOutstandingReserve(path)
+			result.SliceReserve = &runner.ConfineSliceReserve{
+				GrantedBytes: granted,
+				CeilingBytes: s.admitCeiling(path, maximum),
+				Jobs:         jobs,
+			}
+		}
 		return core.Response{OK: true, Code: "OK", Data: result}
 	case "confine-kill":
 		selector := stringArg(request.Args, "selector")

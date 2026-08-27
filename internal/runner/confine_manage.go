@@ -36,9 +36,16 @@ type ConfineRecord struct {
 }
 
 type ConfineListResult struct {
-	Verdict string          `json:"verdict"`
-	Reason  string          `json:"reason,omitempty"`
-	Scopes  []ConfineRecord `json:"scopes"`
+	Verdict      string               `json:"verdict"`
+	Reason       string               `json:"reason,omitempty"`
+	Scopes       []ConfineRecord      `json:"scopes"`
+	SliceReserve *ConfineSliceReserve `json:"slice_reserve,omitempty"`
+}
+
+type ConfineSliceReserve struct {
+	GrantedBytes int64 `json:"granted_bytes"`
+	CeilingBytes int64 `json:"ceiling_bytes"`
+	Jobs         int   `json:"jobs"`
 }
 
 type ConfineKillResult struct {

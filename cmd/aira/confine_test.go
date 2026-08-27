@@ -149,6 +149,44 @@ func TestConfineListRendersHumanTableAndAllowsJSON(t *testing.T) {
 	}
 }
 
+func TestRenderConfineListReserveSummary(t *testing.T) {
+	tests := []struct {
+		name    string
+		reserve *runner.ConfineSliceReserve
+		want    string
+	}{
+		{
+			name:    "present",
+			reserve: &runner.ConfineSliceReserve{GrantedBytes: 3 << 30, CeilingBytes: 12 << 30, Jobs: 1},
+			want:    "slice reserve: 3G granted / 12G ceiling across 1 admitted job\n",
+		},
+		{
+			// An idle slice (0 granted) renders a genuine zero as "0B", never
+			// "unknown" — reserve/ceiling here are always established values.
+			name:    "idle-zero",
+			reserve: &runner.ConfineSliceReserve{GrantedBytes: 0, CeilingBytes: 12 << 30, Jobs: 0},
+			want:    "slice reserve: 0B granted / 12G ceiling across 0 admitted jobs\n",
+		},
+		{name: "unavailable"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{}, SliceReserve: test.reserve}
+			var stdout, stderr bytes.Buffer
+			exit := renderConfineListResponse(core.Response{OK: true, Code: "OK", Data: result}, &stdout, &stderr)
+			if exit != 0 || stderr.Len() != 0 {
+				t.Fatalf("exit=%d stderr=%q", exit, stderr.String())
+			}
+			if gotSummary := strings.Contains(stdout.String(), "slice reserve:"); gotSummary != (test.reserve != nil) {
+				t.Fatalf("stdout=%q", stdout.String())
+			}
+			if test.want != "" && !strings.Contains(stdout.String(), test.want) {
+				t.Fatalf("stdout=%q, want summary %q", stdout.String(), test.want)
+			}
+		})
+	}
+}
+
 func TestConfineDaemonDownRequiresSteal(t *testing.T) {
 	d := &daemonDispatcher{}
 	d.exchange = func(context.Context, string, daemon.RequestFrame) (daemon.ResponseFrame, error) {

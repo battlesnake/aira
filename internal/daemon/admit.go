@@ -134,6 +134,20 @@ func (s *Server) admitOutstandingJobs(path string) int {
 	return jobs
 }
 
+func (s *Server) admitOutstandingReserve(path string) (granted int64, jobs int, ok bool) {
+	s.admitRegistryMu.Lock()
+	queue := s.admitQueues[path]
+	if queue == nil {
+		s.admitRegistryMu.Unlock()
+		return 0, 0, false
+	}
+	queue.mu.Lock()
+	granted, jobs = queue.outstanding, queue.outstandingJobs
+	queue.mu.Unlock()
+	s.admitRegistryMu.Unlock()
+	return granted, jobs, true
+}
+
 func (s *Server) admitCeiling(path string, maximum int64) int64 {
 	return subtractFloor(maximum, s.admitSliceHeadroom(s.admitOutstandingJobs(path)+1))
 }

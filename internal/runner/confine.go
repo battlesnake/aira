@@ -153,7 +153,7 @@ func Confine(ctx context.Context, request ConfineRequest) (ConfineResult, error)
 	return confine(ctx, request)
 }
 
-func formatConfineBytes(value int64) string {
+func FormatConfineBytes(value int64) string {
 	if value <= 0 {
 		return "unknown"
 	}
@@ -180,10 +180,10 @@ func FormatConfineStatus(status ConfineStatus) string {
 	}
 	line := "confine: slice=" + slice + " cap=" + string(capFacet)
 	if status.CapBytes > 0 {
-		line += "(" + formatConfineBytes(status.CapBytes) + ")"
+		line += "(" + FormatConfineBytes(status.CapBytes) + ")"
 	}
 	if status.ReserveBytes > 0 {
-		line += " reserve=" + formatConfineBytes(status.ReserveBytes)
+		line += " reserve=" + FormatConfineBytes(status.ReserveBytes)
 		if status.ReserveBasis != "" {
 			line += " reserve-basis=" + status.ReserveBasis
 		}

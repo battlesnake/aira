@@ -124,3 +124,55 @@ func TestConfineRegistryRejectsDuplicateScopeID(t *testing.T) {
 		t.Fatalf("duplicate code=%q err=%v", code, err)
 	}
 }
+
+func TestConfineListSliceReserveSummary(t *testing.T) {
+	const (
+		maximum    = int64(16 << 30)
+		granted    = int64(3 << 30)
+		jobs       = 2
+		base       = int64(2 << 30)
+		supervisor = int64(64 << 20)
+	)
+	setup := func(t *testing.T) (*Server, string) {
+		t.Helper()
+		path := t.TempDir()
+		server := NewServer(Paths{})
+		server.admitResolveSlice = func(string) (string, bool, string) { return path, true, "" }
+		server.admitSliceHeadroomBase = base
+		server.admitSliceHeadroomSupervisor = supervisor
+		server.admitQueues[path] = &sliceQueue{path: path, server: server, outstanding: granted, outstandingJobs: jobs}
+		return server, path
+	}
+	request := core.Request{Verb: "confine-list", Args: map[string]any{"slice": "test.slice", "owner": "session-a"}}
+
+	t.Run("established", func(t *testing.T) {
+		server, _ := setup(t)
+		server.admitReadMemory = func(string) (int64, int64, bool, string) {
+			return 0, maximum, true, ""
+		}
+		response := server.confineManagement(context.Background(), request)
+		result, ok := response.Data.(runner.ConfineListResult)
+		if !response.OK || !ok || result.SliceReserve == nil {
+			t.Fatalf("response=%+v result=%+v", response, result)
+		}
+		wantCeiling := maximum - base - int64(jobs+1)*supervisor
+		if got := *result.SliceReserve; got != (runner.ConfineSliceReserve{GrantedBytes: granted, CeilingBytes: wantCeiling, Jobs: jobs}) {
+			t.Fatalf("slice reserve=%+v, want granted=%d ceiling=%d jobs=%d", got, granted, wantCeiling, jobs)
+		}
+	})
+
+	t.Run("memory-unavailable", func(t *testing.T) {
+		server, _ := setup(t)
+		server.admitReadMemory = func(string) (int64, int64, bool, string) {
+			return 0, 0, false, "read-error"
+		}
+		response := server.confineManagement(context.Background(), request)
+		result, ok := response.Data.(runner.ConfineListResult)
+		if !response.OK || !ok {
+			t.Fatalf("response=%+v", response)
+		}
+		if result.SliceReserve != nil {
+			t.Fatalf("slice reserve=%+v, want nil", result.SliceReserve)
+		}
+	})
+}

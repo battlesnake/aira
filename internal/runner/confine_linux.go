@@ -428,7 +428,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 				return
 			case <-ticker.C:
 				fmt.Fprintf(admitDiag, "confine: waiting for memory admission on %s (reserve %s, waited %ds)\n",
-					sliceName, formatConfineBytes(reserve), int64(time.Since(start).Seconds()))
+					sliceName, FormatConfineBytes(reserve), int64(time.Since(start).Seconds()))
 			}
 		}
 	}()
