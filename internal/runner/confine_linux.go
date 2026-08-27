@@ -666,7 +666,27 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		result.Status.DescendantEscape = &DescendantEscapeEvidence{PIDIdentity: observation.Identity, Cgroup: observation.Cgroup}
 	}
 	_, _ = fmt.Fprintln(diagnostics, FormatConfineStatus(result.Status))
+	if advisory := formatConfineReserveAdvisory(result.Status.ScopeMemoryMax, result.Status.PeakRSS, oom); advisory != "" {
+		_, _ = fmt.Fprintln(diagnostics, advisory)
+	}
 	return result, nil
+}
+
+func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool) string {
+	if scopeMemoryMax <= 0 {
+		return ""
+	}
+	peak := "unknown"
+	if peakRSS != nil {
+		peak = FormatConfineBytes(*peakRSS)
+	}
+	if oom {
+		return fmt.Sprintf("confine: job OOM-killed at its reserved cap %s (peak RSS %s); raise --memory-reserve for this job or split heavy work under --delegate-ram", FormatConfineBytes(scopeMemoryMax), peak)
+	}
+	if peakRSS != nil && *peakRSS >= scopeMemoryMax*9/10 {
+		return fmt.Sprintf("confine: peak RSS %s reached %d%% of the reserved cap %s; consider a higher --memory-reserve or --delegate-ram for suites", peak, *peakRSS*100/scopeMemoryMax, FormatConfineBytes(scopeMemoryMax))
+	}
+	return ""
 }
 
 func admitConfine(ctx context.Context, path string, request ConfineRequest, reserve int64) (admissionResult, error) {

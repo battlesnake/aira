@@ -246,6 +246,56 @@ func TestFormatConfineStatusReportsScopeMemoryFacet(t *testing.T) {
 	}
 }
 
+// verifies: a whole-job reserve advisory is emitted only for an actually
+// enforced scope cap, and never fabricates a peak when it cannot be read.
+func TestFormatConfineReserveAdvisory(t *testing.T) {
+	peak90 := int64(90)
+	peak95 := int64(95)
+	peak89 := int64(89)
+	for _, test := range []struct {
+		name string
+		cap  int64
+		peak *int64
+		oom  bool
+		want string
+	}{
+		{
+			name: "oom with observed peak", cap: 100, peak: &peak95, oom: true,
+			want: "confine: job OOM-killed at its reserved cap 100 (peak RSS 95); raise --memory-reserve for this job or split heavy work under --delegate-ram",
+		},
+		{
+			name: "oom with unreadable peak", cap: 100, oom: true,
+			want: "confine: job OOM-killed at its reserved cap 100 (peak RSS unknown); raise --memory-reserve for this job or split heavy work under --delegate-ram",
+		},
+		{
+			// Negative control: removing the cap==0 guard would falsely advise
+			// delegate-ram/unevaluated jobs and make this case fail.
+			name: "oom without enforced whole-job cap", cap: 0, peak: &peak95, oom: true,
+		},
+		{
+			name: "exactly ninety percent is near cap", cap: 100, peak: &peak90,
+			want: "confine: peak RSS 90 reached 90% of the reserved cap 100; consider a higher --memory-reserve or --delegate-ram for suites",
+		},
+		{
+			name: "above ninety percent reports floored percentage", cap: 100, peak: &peak95,
+			want: "confine: peak RSS 95 reached 95% of the reserved cap 100; consider a higher --memory-reserve or --delegate-ram for suites",
+		},
+		{
+			// Negative control: removing the threshold guard would make this
+			// sub-ninety-percent observation emit a dishonest advisory.
+			name: "below ninety percent is quiet", cap: 100, peak: &peak89,
+		},
+		{name: "unreadable peak without oom is quiet", cap: 100},
+		{name: "zero cap is always quiet", cap: 0, peak: &peak95},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := formatConfineReserveAdvisory(test.cap, test.peak, test.oom); got != test.want {
+				t.Fatalf("formatConfineReserveAdvisory(%d, %v, %v) = %q, want %q", test.cap, test.peak, test.oom, got, test.want)
+			}
+		})
+	}
+}
+
 // verifies: task-57 a requested confine cap that cannot be written never starts.
 func TestConfineScopeMemoryCapFailureDoesNotLaunch(t *testing.T) {
 	scope := &confineFakeScope{}
