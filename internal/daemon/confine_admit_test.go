@@ -73,6 +73,7 @@ func TestConfineEstimatorP90PriorNotMedianOrFlat(t *testing.T) {
 
 func TestAdmitConcurrencyScaledHeadroomAndLifetimeCapacity(t *testing.T) {
 	server := NewServer(Paths{})
+	server.admitConfineScan = noConfinesScan
 	server.stopping = make(chan struct{})
 	server.admitPollInterval = time.Hour
 	server.admitReadMemory = func(string) (int64, int64, bool, string) { return 0, 64 << 30, true, "" }
@@ -103,6 +104,7 @@ func TestAdmitConcurrencyScaledHeadroomAndLifetimeCapacity(t *testing.T) {
 // call site (which the coarser 15 GiB / 64 GiB case cannot detect).
 func TestAdmitScaledHeadroomDiscriminatesPerSupervisorTerm(t *testing.T) {
 	server := NewServer(Paths{})
+	server.admitConfineScan = noConfinesScan
 	server.stopping = make(chan struct{})
 	server.admitPollInterval = time.Hour
 	server.admitSliceHeadroomBase = 2 << 30
@@ -134,6 +136,7 @@ func TestAdmitScaledHeadroomDiscriminatesPerSupervisorTerm(t *testing.T) {
 // waiters stay queued and are granted, accounted, once the read recovers.
 func TestAdmitReadFailureKeepsWaitersQueuedUncounted(t *testing.T) {
 	server := NewServer(Paths{})
+	server.admitConfineScan = noConfinesScan
 	server.stopping = make(chan struct{})
 	server.admitPollInterval = time.Hour
 	readable := false

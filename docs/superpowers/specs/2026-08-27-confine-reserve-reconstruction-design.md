@@ -146,6 +146,30 @@ reserve. Set `SliceReserve.GrantedBytes = addClamp(outstanding, adopted)` and
 - The scan reuses `ResolveConfineManagementSlice("")` + `runner.ListConfines` (as #72
   does). Interacts with, but is independent of, the #72 orphan reaper.
 
+## Build-review folds (Sol build-review BLOCK → APPROVE)
+
+- **`adoptedJobs` counts finite-cap scopes ONLY** (Sol P1): a non-finite-cap live scope
+  (delegate-ram `"max"`, nil, malformed, negative) contributes neither reserve bytes nor a
+  headroom-job — fully unreconstructed, a safe under-count (its RSS is still charged via
+  `current`), consistent with the delegate-ram deferral. Never a new wrongful-wait.
+- **`--list` ceiling scales headroom by the TOTAL (outstanding+adopted) jobs** (Sol P2),
+  so the displayed ceiling is consistent with the displayed `Jobs`.
+- **Subtree-nested liveness (Sol P1, DEFERRED to v2):** `ListConfines.Populated` is the
+  LEAF `cgroup.procs` count, not the subtree-aware `cgroup.events` the #72 reaper uses. A
+  live workload nested in a child cgroup reads empty here and is skipped from `adopted` →
+  under-count → over-admit (the *safe* direction, exactly as today's forgotten ledger,
+  never worse). Uncommon for confine workloads; subtree-aware `adopted` liveness is a v2
+  scan enhancement.
+- **Teardown-race phantom (Sol P2, ACCEPTED bounded transient):** if a held live scope is
+  captured by the scan and then finishes (teardown + connection-close) before `queue.mu`
+  is taken, its stale record is briefly counted in `adopted` after leaving `outstanding` —
+  an over-count for ≤ one throttle interval (≤1 s), self-corrected by the next scan. Rare
+  (a job must finish in the µs scan→lock gap), bounded, and the conservative direction
+  (wrongful-wait, never OOM).
+- **Deadlock test hardened** (Sol P3): the real-cgroup test now registers its queue in
+  `admitQueues`, so a regressed `activeConfines`-under-lock call would actually deadlock and
+  be caught, not evade on a nil queue.
+
 ## Tests
 
 Unit (daemon, injected `admitReadMemory` + a fake confine scan seam):

@@ -22,6 +22,7 @@ func admitTestServer(maximum *atomic.Int64) *Server {
 	server.admitSliceHeadroomBase = 0
 	server.admitSliceHeadroomSupervisor = 0
 	server.admitResolveSlice = func(string) (string, bool, string) { return "/slice", true, "" }
+	server.admitConfineScan = noConfinesScan
 	server.admitReadMemory = func(string) (int64, int64, bool, string) {
 		return 0, maximum.Load(), true, ""
 	}

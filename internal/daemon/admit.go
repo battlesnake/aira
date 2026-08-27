@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"net"
 	"os"
@@ -28,6 +29,7 @@ const (
 	admitWriteTimeout                         = 5 * time.Second
 	admitHistoryTimeout                       = 250 * time.Millisecond
 	admitPriorRefresh                         = time.Minute
+	admitConfineScanIntervalDefault           = time.Second
 	admitSliceHeadroomBaseDefault       int64 = 2 << 30
 	admitSliceHeadroomSupervisorDefault int64 = 64 << 20
 )
@@ -59,17 +61,21 @@ type admitWaiter struct {
 }
 
 type sliceQueue struct {
-	mu              sync.Mutex
-	path            string
-	waiters         []*admitWaiter
-	outstanding     int64
-	outstandingJobs int
-	seq             int64
-	kick            chan struct{}
-	stop            chan struct{}
-	stopOnce        sync.Once
-	poll            time.Duration
-	server          *Server
+	mu                sync.Mutex
+	path              string
+	waiters           []*admitWaiter
+	outstanding       int64
+	outstandingJobs   int
+	adopted           int64
+	adoptedJobs       int
+	adoptedAt         time.Time
+	adoptedScanFailed bool
+	seq               int64
+	kick              chan struct{}
+	stop              chan struct{}
+	stopOnce          sync.Once
+	poll              time.Duration
+	server            *Server
 }
 
 // AdmitResponse is the one grant payload sent before the daemon holds the
@@ -108,6 +114,21 @@ func subtractFloor(value, subtract int64) int64 {
 	return value - subtract
 }
 
+func addClamp(a, b int64) int64 {
+	if a < 0 || b < 0 || a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
+}
+
+func addJobCountClamp(a, b int) int {
+	maxInt := int(^uint(0) >> 1)
+	if a < 0 || b < 0 || a > maxInt-b {
+		return maxInt
+	}
+	return a + b
+}
+
 func (s *Server) admitSliceHeadroom(jobs int) int64 {
 	if jobs < 0 {
 		jobs = 0
@@ -134,18 +155,19 @@ func (s *Server) admitOutstandingJobs(path string) int {
 	return jobs
 }
 
-func (s *Server) admitOutstandingReserve(path string) (granted int64, jobs int, ok bool) {
+func (s *Server) admitOutstandingReserve(path string) (outstanding int64, outstandingJobs int, adopted int64, adoptedJobs int, ok bool) {
 	s.admitRegistryMu.Lock()
 	queue := s.admitQueues[path]
 	if queue == nil {
 		s.admitRegistryMu.Unlock()
-		return 0, 0, false
+		return 0, 0, 0, 0, false
 	}
 	queue.mu.Lock()
-	granted, jobs = queue.outstanding, queue.outstandingJobs
+	outstanding, outstandingJobs = queue.outstanding, queue.outstandingJobs
+	adopted, adoptedJobs = queue.adopted, queue.adoptedJobs
 	queue.mu.Unlock()
 	s.admitRegistryMu.Unlock()
-	return granted, jobs, true
+	return outstanding, outstandingJobs, adopted, adoptedJobs, true
 }
 
 func (s *Server) admitCeiling(path string, maximum int64) int64 {
@@ -462,8 +484,87 @@ func (q *sliceQueue) signal() {
 }
 
 func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
+	// Production has exactly one caller: this queue's runEvaluator goroutine.
+	// That single-writer property permits the throttle read before queue.mu;
+	// other goroutines only read the adopted ledger while holding queue.mu.
+	now := s.admitNowTime()
+	refreshInterval := s.admitConfineScanInterval
+	if refreshInterval <= 0 {
+		refreshInterval = admitConfineScanIntervalDefault
+	}
+	refreshAdopted := queue.adoptedAt.IsZero() || now.Sub(queue.adoptedAt) >= refreshInterval
+	var scanResult runner.ConfineListResult
+	var scanErr error
+	if refreshAdopted {
+		scan := s.admitConfineScan
+		if scan == nil {
+			scan = func(path string) (runner.ConfineListResult, error) {
+				return runner.ListConfines(context.Background(), path, nil)
+			}
+		}
+		scanResult, scanErr = scan(queue.path)
+		if scanErr == nil && scanResult.Verdict == "unevaluated" {
+			reason := strings.TrimSpace(scanResult.Reason)
+			if reason == "" {
+				reason = "confine scan unevaluated"
+			}
+			scanErr = errors.New(reason)
+		}
+	}
+
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
+	if refreshAdopted {
+		// adoptedAt is the last scan attempt, successful or not, so a failing
+		// filesystem does not turn every queue kick into another scan.
+		queue.adoptedAt = now
+		if scanErr != nil {
+			if !queue.adoptedScanFailed {
+				log.Printf("aira daemon: confine reserve scan failed: %v", scanErr)
+			}
+			queue.adoptedScanFailed = true
+		} else {
+			held := make(map[string]struct{})
+			for _, waiter := range queue.waiters {
+				if waiter != nil && waiter.state == admitGranted && waiter.scopeID != "" {
+					held[waiter.scopeID] = struct{}{}
+				}
+			}
+			adopted := int64(0)
+			adoptedJobs := 0
+			for _, record := range scanResult.Scopes {
+				// Populated is the scope's LEAF cgroup.procs count, not the
+				// subtree-aware cgroup.events populated the #72 reaper uses. A live
+				// workload nested in a child cgroup it created reads empty here and is
+				// SKIPPED — the safe direction (its reserve is under-counted → over-
+				// admit, exactly as a fully forgotten pre-restart ledger, never worse).
+				// Subtree-aware liveness for adopted is a v2 item.
+				if record.Populated == nil || *record.Populated <= 0 {
+					continue
+				}
+				if _, connectionHeld := held[record.ScopeID]; connectionHeld {
+					continue
+				}
+				// A non-finite cap (delegate-ram "max", nil, malformed, negative)
+				// contributes NEITHER reserve bytes NOR a headroom-job: such a scope is
+				// unreconstructable, left as a safe under-count (its actual RSS is still
+				// charged via `current`). Counting only finite-cap scopes keeps adopted
+				// and adoptedJobs consistent — never a new wrongful-wait.
+				if record.Cap == nil {
+					continue
+				}
+				cap, err := strconv.ParseInt(strings.TrimSpace(*record.Cap), 10, 64)
+				if err != nil || cap < 0 {
+					continue
+				}
+				adopted = addClamp(adopted, cap)
+				adoptedJobs = addJobCountClamp(adoptedJobs, 1)
+			}
+			queue.adopted = adopted
+			queue.adoptedJobs = adoptedJobs
+			queue.adoptedScanFailed = false
+		}
+	}
 	readMemory := s.admitReadMemory
 	if readMemory == nil {
 		readMemory = readSliceMemory
@@ -484,8 +585,9 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		if waiter.state != admitQueued {
 			continue
 		}
-		headroom := s.admitSliceHeadroom(queue.outstandingJobs + 1)
-		available := checkedAvailable(current, maximum, queue.outstanding, headroom)
+		jobs := addJobCountClamp(addJobCountClamp(queue.outstandingJobs, queue.adoptedJobs), 1)
+		headroom := s.admitSliceHeadroom(jobs)
+		available := checkedAvailable(current, maximum, addClamp(queue.outstanding, queue.adopted), headroom)
 		if blocked || waiter.reserve > available {
 			blocked = true
 			waiter.waited = true

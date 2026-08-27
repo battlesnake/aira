@@ -127,11 +127,13 @@ func TestConfineRegistryRejectsDuplicateScopeID(t *testing.T) {
 
 func TestConfineListSliceReserveSummary(t *testing.T) {
 	const (
-		maximum    = int64(16 << 30)
-		granted    = int64(3 << 30)
-		jobs       = 2
-		base       = int64(2 << 30)
-		supervisor = int64(64 << 20)
+		maximum     = int64(16 << 30)
+		granted     = int64(3 << 30)
+		adopted     = int64(4 << 30)
+		jobs        = 2
+		adoptedJobs = 3
+		base        = int64(2 << 30)
+		supervisor  = int64(64 << 20)
 	)
 	setup := func(t *testing.T) (*Server, string) {
 		t.Helper()
@@ -140,7 +142,7 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		server.admitResolveSlice = func(string) (string, bool, string) { return path, true, "" }
 		server.admitSliceHeadroomBase = base
 		server.admitSliceHeadroomSupervisor = supervisor
-		server.admitQueues[path] = &sliceQueue{path: path, server: server, outstanding: granted, outstandingJobs: jobs}
+		server.admitQueues[path] = &sliceQueue{path: path, server: server, outstanding: granted, outstandingJobs: jobs, adopted: adopted, adoptedJobs: adoptedJobs}
 		return server, path
 	}
 	request := core.Request{Verb: "confine-list", Args: map[string]any{"slice": "test.slice", "owner": "session-a"}}
@@ -155,9 +157,29 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		if !response.OK || !ok || result.SliceReserve == nil {
 			t.Fatalf("response=%+v result=%+v", response, result)
 		}
-		wantCeiling := maximum - base - int64(jobs+1)*supervisor
-		if got := *result.SliceReserve; got != (runner.ConfineSliceReserve{GrantedBytes: granted, CeilingBytes: wantCeiling, Jobs: jobs}) {
-			t.Fatalf("slice reserve=%+v, want granted=%d ceiling=%d jobs=%d", got, granted, wantCeiling, jobs)
+		wantJobs := jobs + adoptedJobs
+		// Ceiling scales headroom by TOTAL admitted jobs (outstanding+adopted)+1.
+		wantCeiling := maximum - base - int64(jobs+adoptedJobs+1)*supervisor
+		if got := *result.SliceReserve; got != (runner.ConfineSliceReserve{GrantedBytes: granted + adopted, CeilingBytes: wantCeiling, Jobs: wantJobs}) {
+			t.Fatalf("slice reserve=%+v, want granted=%d ceiling=%d jobs=%d", got, granted+adopted, wantCeiling, wantJobs)
+		}
+	})
+
+	t.Run("adopted-only", func(t *testing.T) {
+		server, path := setup(t)
+		server.admitQueues[path].outstanding = 0
+		server.admitQueues[path].outstandingJobs = 0
+		server.admitReadMemory = func(string) (int64, int64, bool, string) {
+			return 0, maximum, true, ""
+		}
+		response := server.confineManagement(context.Background(), request)
+		result, ok := response.Data.(runner.ConfineListResult)
+		if !response.OK || !ok || result.SliceReserve == nil {
+			t.Fatalf("response=%+v result=%+v", response, result)
+		}
+		wantCeiling := maximum - base - int64(adoptedJobs+1)*supervisor
+		if got := *result.SliceReserve; got != (runner.ConfineSliceReserve{GrantedBytes: adopted, CeilingBytes: wantCeiling, Jobs: adoptedJobs}) {
+			t.Fatalf("slice reserve=%+v, want adopted-only granted=%d ceiling=%d jobs=%d", got, adopted, wantCeiling, adoptedJobs)
 		}
 	})
 

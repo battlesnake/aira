@@ -78,27 +78,29 @@ type Server struct {
 	scopeReapGrace               time.Duration
 
 	// Test seams. Production always calls the Store methods and DB.Close.
-	reapScope            func(context.Context, *store.Store) (int, error)
-	flushScopeFn         func(context.Context, *store.Store) (int, error)
-	closeDB              func(*store.DB) error
-	watchEventsSince     func(context.Context, *store.Store, int64, int) ([]store.WatchEvent, int64, error)
-	watchAfterWake       func()
-	admitResolveSlice    func(string) (string, bool, string)
-	admitReadMemory      func(string) (int64, int64, bool, string)
-	admitNow             func() time.Time
-	admitAfter           func(time.Duration) <-chan time.Time
-	admitWriteFrame      func(net.Conn, any) error
-	admitBeforeWrite     func(*admitWaiter)
-	admitPeakHistory     func(context.Context, string) (runner.PeakRSSStats, error)
-	admitPeakP90         func(context.Context) (int64, bool, error)
-	peerCredential       func(net.Conn) (int, int, error)
-	storeOpAppendTimeout time.Duration
-	storeOpHeavyTimeout  time.Duration
-	storeOpWriteTimeout  time.Duration
-	storeOpRun           func(context.Context, *store.Store, StoreOpFrame) (any, error)
-	listRegistryEntries  func(string) ([]store.RegistryEntry, error)
-	discoverProject      func(context.Context, string) (app.Project, error)
-	ensureCPUSlotsFn     func(string, int) (int, error)
+	reapScope                func(context.Context, *store.Store) (int, error)
+	flushScopeFn             func(context.Context, *store.Store) (int, error)
+	closeDB                  func(*store.DB) error
+	watchEventsSince         func(context.Context, *store.Store, int64, int) ([]store.WatchEvent, int64, error)
+	watchAfterWake           func()
+	admitResolveSlice        func(string) (string, bool, string)
+	admitReadMemory          func(string) (int64, int64, bool, string)
+	admitConfineScan         func(string) (runner.ConfineListResult, error)
+	admitConfineScanInterval time.Duration
+	admitNow                 func() time.Time
+	admitAfter               func(time.Duration) <-chan time.Time
+	admitWriteFrame          func(net.Conn, any) error
+	admitBeforeWrite         func(*admitWaiter)
+	admitPeakHistory         func(context.Context, string) (runner.PeakRSSStats, error)
+	admitPeakP90             func(context.Context) (int64, bool, error)
+	peerCredential           func(net.Conn) (int, int, error)
+	storeOpAppendTimeout     time.Duration
+	storeOpHeavyTimeout      time.Duration
+	storeOpWriteTimeout      time.Duration
+	storeOpRun               func(context.Context, *store.Store, StoreOpFrame) (any, error)
+	listRegistryEntries      func(string) ([]store.RegistryEntry, error)
+	discoverProject          func(context.Context, string) (app.Project, error)
+	ensureCPUSlotsFn         func(string, int) (int, error)
 }
 
 func NewServer(paths Paths) *Server {
@@ -106,7 +108,11 @@ func NewServer(paths Paths) *Server {
 		Paths: paths, DrainTimeout: 10 * time.Second, scopes: map[string]*scopeEntry{}, coveredWorktrees: map[string]struct{}{}, discoveryFailed: map[string]struct{}{},
 		watchSlots: make(chan struct{}, watchMaxConcurrent), watchPollInterval: defaultWatchPollInterval,
 		admitSlots: make(chan struct{}, admitGlobalMax), admitPollInterval: defaultAdmitPollInterval,
-		admitQueues:                  map[string]*sliceQueue{},
+		admitQueues: map[string]*sliceQueue{},
+		admitConfineScan: func(path string) (runner.ConfineListResult, error) {
+			return runner.ListConfines(context.Background(), path, nil)
+		},
+		admitConfineScanInterval:     admitConfineScanIntervalDefault,
 		admitSliceHeadroomBase:       admitSliceHeadroomBaseDefault,
 		admitSliceHeadroomSupervisor: admitSliceHeadroomSupervisorDefault,
 		scopeReapGrace:               defaultScopeReapGrace,

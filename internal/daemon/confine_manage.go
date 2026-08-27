@@ -126,11 +126,15 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		}
 		_, maximum, ok, _ := readMemory(path)
 		if ok {
-			granted, jobs, _ := s.admitOutstandingReserve(path)
+			outstanding, outstandingJobs, adopted, adoptedJobs, _ := s.admitOutstandingReserve(path)
+			totalJobs := addJobCountClamp(outstandingJobs, adoptedJobs)
 			result.SliceReserve = &runner.ConfineSliceReserve{
-				GrantedBytes: granted,
-				CeilingBytes: s.admitCeiling(path, maximum),
-				Jobs:         jobs,
+				GrantedBytes: addClamp(outstanding, adopted),
+				// Ceiling is what one MORE job would face; scale headroom by the
+				// TOTAL admitted jobs (outstanding + adopted) so it stays consistent
+				// with the Jobs shown, not just the connection-held ones.
+				CeilingBytes: subtractFloor(maximum, s.admitSliceHeadroom(addJobCountClamp(totalJobs, 1))),
+				Jobs:         totalJobs,
 			}
 		}
 		return core.Response{OK: true, Code: "OK", Data: result}
