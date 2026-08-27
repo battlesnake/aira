@@ -47,7 +47,7 @@ func (s *Server) eject(ctx context.Context, args map[string]any) core.Response {
 		return lifecycleError(fmt.Errorf("E_EJECT_LIVE_STATE: %s", strings.Join(holders, "; ")))
 	}
 
-	roots, gone, err := s.verifyEjectDurability(ctx, target)
+	roots, gone, err := s.verifyEjectDurability(ctx, target, purge)
 	if err != nil {
 		return lifecycleError(err)
 	}
@@ -161,7 +161,7 @@ func (s *Server) endProjectUse(projectID string) {
 	s.mu.Unlock()
 }
 
-func (s *Server) verifyEjectDurability(ctx context.Context, target store.ProjectRegistration) ([]string, bool, error) {
+func (s *Server) verifyEjectDurability(ctx context.Context, target store.ProjectRegistration, skipDurabilityCheck bool) ([]string, bool, error) {
 	roots := make([]string, 0, len(target.Worktrees))
 	missing := 0
 	for _, worktree := range target.Worktrees {
@@ -192,6 +192,9 @@ func (s *Server) verifyEjectDurability(ctx context.Context, target store.Project
 		}
 		if project.ProjectID != target.ProjectID {
 			return nil, false, fmt.Errorf("E_EJECT_UNVERIFIED: worktree %s resolves to project %s", root, project.ProjectID)
+		}
+		if skipDurabilityCheck {
+			continue
 		}
 		scope, err := ScopeFromProject(project, s.Paths)
 		if err != nil {

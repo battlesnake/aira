@@ -249,6 +249,81 @@ func TestEjectDrainsOutboxButRefusesFileIndexDivergence(t *testing.T) {
 	}
 }
 
+func staleMaterializedTicket(t *testing.T, view *store.Store, scope WorktreeScope) {
+	t.Helper()
+	if _, err := view.CreateTicket(context.Background(), domain.CreateTicketInput{Title: "stale", Kind: domain.KindFeature, Severity: domain.SeverityP2}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(scope.Root, ".aira", "tickets", "LIFE-1.md")
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	report, err := view.Check(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Dimensions["stale-index"] != "warning" {
+		t.Fatalf("stale-index=%q, want warning", report.Dimensions["stale-index"])
+	}
+}
+
+func TestEjectPurgeSkipsDurabilityForStaleMaterializedIndex(t *testing.T) {
+	server, scope, view := lifecycleFixture(t)
+	staleMaterializedTicket(t, view, scope)
+
+	response := server.eject(context.Background(), map[string]any{"project": scope.ProjectID, "purge": true, "force": true})
+	if !response.OK {
+		t.Fatalf("purge stale index=%+v", response)
+	}
+	if _, err := os.Stat(filepath.Join(scope.Root, ".aira")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("purge left .aira: %v", err)
+	}
+}
+
+func TestEjectKeepsDurabilityCheckForStaleMaterializedIndex(t *testing.T) {
+	server, scope, view := lifecycleFixture(t)
+	staleMaterializedTicket(t, view, scope)
+
+	response := server.eject(context.Background(), map[string]any{"project": scope.ProjectID, "force": true})
+	if response.Code != "E_EJECT_UNVERIFIED" || !strings.Contains(response.Error, "stale-index") {
+		t.Fatalf("deregister stale index=%+v", response)
+	}
+}
+
+func TestEjectPurgePreservesWorktreeIdentityGuard(t *testing.T) {
+	server, scope, _ := lifecycleFixture(t)
+	replacementRoot := filepath.Join(t.TempDir(), "replacement")
+	if err := os.MkdirAll(filepath.Join(replacementRoot, ".aira", "tickets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command("git", "-C", replacementRoot, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
+	}
+	config := `{"schema":1,"project":{"slug":"replacement","prefixes":["REPLACED"]},"lease":{"ttl_seconds":900,"heartbeat_seconds":30}}` + "\n"
+	if err := os.WriteFile(filepath.Join(replacementRoot, ".aira", "config"), []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := app.Discover(context.Background(), replacementRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacement.ProjectID == scope.ProjectID {
+		t.Fatalf("replacement project ID=%s, want different from %s", replacement.ProjectID, scope.ProjectID)
+	}
+	db := lifecycleSQL(t, server.Paths.DBPath)
+	if _, err := db.Exec(`UPDATE worktrees SET root=? WHERE project_id=? AND worktree_id=?`, replacementRoot, scope.ProjectID, scope.WorktreeID); err != nil {
+		t.Fatal(err)
+	}
+
+	response := server.eject(context.Background(), map[string]any{"project": scope.ProjectID, "purge": true, "force": true})
+	if response.Code != "E_EJECT_UNVERIFIED" || !strings.Contains(response.Error, replacement.ProjectID) {
+		t.Fatalf("purge replacement root=%+v", response)
+	}
+	if _, err := os.Stat(filepath.Join(replacementRoot, ".aira")); err != nil {
+		t.Fatalf("identity refusal purged replacement .aira: %v", err)
+	}
+}
+
 func TestEjectDrainsPendingMaterialisationBeforeDrop(t *testing.T) {
 	server, scope, view := lifecycleFixture(t)
 	if _, err := view.CreateTicket(context.Background(), domain.CreateTicketInput{Title: "drain", Kind: domain.KindFeature, Severity: domain.SeverityP2}); err != nil {
