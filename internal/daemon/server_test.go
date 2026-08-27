@@ -768,10 +768,15 @@ func TestPeriodicReaperContinuesAfterSweepError(t *testing.T) {
 	var calls atomic.Int32
 	second := make(chan struct{})
 	server.reapScope = func(context.Context, *store.Store) (int, error) {
-		if calls.Add(1) == 1 {
+		// The 1ms reaper can fire a third sweep before cancel() lands, so only the
+		// second call closes; later calls are harmless no-ops (a bare close(second)
+		// double-closes and panics under load).
+		switch calls.Add(1) {
+		case 1:
 			return 0, errors.New("fixture periodic failure")
+		case 2:
+			close(second)
 		}
-		close(second)
 		return 0, nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
