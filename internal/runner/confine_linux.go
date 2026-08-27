@@ -683,10 +683,20 @@ func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool
 	if oom {
 		return fmt.Sprintf("confine: job OOM-killed at its reserved cap %s (peak RSS %s); raise --memory-reserve for this job or split heavy work under --delegate-ram", FormatConfineBytes(scopeMemoryMax), peak)
 	}
-	if peakRSS != nil && *peakRSS >= scopeMemoryMax*9/10 {
-		return fmt.Sprintf("confine: peak RSS %s reached %d%% of the reserved cap %s; consider a higher --memory-reserve or --delegate-ram for suites", peak, *peakRSS*100/scopeMemoryMax, FormatConfineBytes(scopeMemoryMax))
+	// Overflow-safe threshold: never multiply a byte count that the input domain
+	// allows to approach MaxInt64. `scopeMemoryMax - scopeMemoryMax/10` is a
+	// conservative >=90% mark that never fires below 90% for a non-round cap.
+	if peakRSS != nil && *peakRSS >= scopeMemoryMax-scopeMemoryMax/10 {
+		return fmt.Sprintf("confine: peak RSS %s reached %d%% of the reserved cap %s; consider a higher --memory-reserve or --delegate-ram for suites", peak, confinePercentOfCap(*peakRSS, scopeMemoryMax), FormatConfineBytes(scopeMemoryMax))
 	}
 	return ""
+}
+
+// confinePercentOfCap returns floor(peak*100/cap) without overflowing int64 for
+// any byte-scale cap. cap is > 0 at every call site; peak <= cap (a peak above
+// the enforced cap is an OOM, handled before this is reached).
+func confinePercentOfCap(peak, capBytes int64) int {
+	return int(peak/capBytes*100 + peak%capBytes*100/capBytes)
 }
 
 func admitConfine(ctx context.Context, path string, request ConfineRequest, reserve int64) (admissionResult, error) {

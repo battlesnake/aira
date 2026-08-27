@@ -7,8 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -252,6 +254,8 @@ func TestFormatConfineReserveAdvisory(t *testing.T) {
 	peak90 := int64(90)
 	peak95 := int64(95)
 	peak89 := int64(89)
+	halfMax := int64(math.MaxInt64 / 2)
+	maxPeak := int64(math.MaxInt64)
 	for _, test := range []struct {
 		name string
 		cap  int64
@@ -287,6 +291,22 @@ func TestFormatConfineReserveAdvisory(t *testing.T) {
 		},
 		{name: "unreadable peak without oom is quiet", cap: 100},
 		{name: "zero cap is always quiet", cap: 0, peak: &peak95},
+		{
+			// Non-round cap: 90/101 = 89.1% must stay quiet under the conservative
+			// `cap - cap/10` threshold; the old `cap*9/10` floor wrongly fired here.
+			name: "just below ninety percent with a non-round cap is quiet", cap: 101, peak: &peak90,
+		},
+		{
+			// Overflow safety: a cap near MaxInt64 must not overflow the threshold
+			// nor fabricate a near-cap warning for a sub-threshold peak.
+			name: "huge sub-threshold cap stays quiet without overflow", cap: math.MaxInt64, peak: &halfMax,
+		},
+		{
+			// Overflow safety: peak == cap near MaxInt64 reports 100% without
+			// overflowing the percentage multiply.
+			name: "huge near-cap reports safe percentage", cap: math.MaxInt64, peak: &maxPeak,
+			want: fmt.Sprintf("confine: peak RSS %s reached 100%% of the reserved cap %s; consider a higher --memory-reserve or --delegate-ram for suites", FormatConfineBytes(math.MaxInt64), FormatConfineBytes(math.MaxInt64)),
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := formatConfineReserveAdvisory(test.cap, test.peak, test.oom); got != test.want {
