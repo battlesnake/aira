@@ -80,15 +80,16 @@ candidates); no selector and no `.aira/config` → `E_NO_PROJECT` (never guess).
 
 **Deregister (default, files kept)** — the daemon, holding `s.mu` for the
 target `project_id`:
-1. **Set a persisted eject tombstone** (a machine-level `ejections` row keyed by
-   `project_id`, outside the per-project cascade) and **evict the scope cache**:
-   remove every `s.scopes` entry and `coveredWorktrees` id for the project, and
-   hold a **per-project exclusion** that makes `storeForScope`/`ensureScope`/
-   `Register` and discovery refuse that `project_id` for the guard→drop span.
-   This closes the **deterministic** resurrection: without it, `ensureScope`
-   re-`Register`s on the next cached hit (server.go:693-712) and re-squats the
-   prefix. The tombstone is cleared **only** by a subsequent `init` re-adopt, and
-   survives daemon restart (so a post-eject verb or restart cannot resurrect).
+1. **Evict the scope cache + hold an in-memory per-project exclusion** (under
+   `s.mu`): remove every `s.scopes` entry and `coveredWorktrees` id for the
+   project, and hold an exclusion that makes `storeForScope`/`ensureScope`/
+   `Register` and discovery refuse that `project_id` for the whole guard→commit
+   span. Under `SetMaxOpenConns(1)` (store.go:526) the daemon is the sole writer,
+   so this exclusion — **not** a pre-persisted marker — is what prevents a
+   concurrent path from creating project rows mid-eject and closes the
+   deterministic resurrection (without it `ensureScope` re-`Register`s on the next
+   cached hit, server.go:693-712). Nothing is persisted yet, so a refusal or
+   crash in steps 2–3 leaves the project completely untouched.
 2. **Live-state check** — refuse `E_EJECT_LIVE_STATE` (listing every holder) if
    the project holds a non-expired ticket lease or a live detached-run
    `supervisor_lease`. `--force` overrides. (Confine is project-less — never part
@@ -102,25 +103,41 @@ target `project_id`:
    `fileMissing` check.go:440-443) → `E_EJECT_UNVERIFIED`. A gone-root eject
    **requires `--force`** (destructive abandonment of DB-only telemetry) — both
    first-use commands already pass it, so zero cost.
-4. **Release + cascade, in one `BEGIN IMMEDIATE` transaction** that **re-asserts**
-   the live-state and durability preconditions (closing the guard→drop TOCTOU):
+4. **Release + cascade + tombstone, in one `BEGIN IMMEDIATE` transaction** (every
+   statement on the single pinned connection — never `s.db.*`, which would
+   self-deadlock the pool) that **re-asserts** the live-state precondition and the
+   `outbox` count == 0 durability re-check (the in-txn re-verify is the outbox
+   query, *not* the file-reading `check`), closing the guard→drop TOCTOU:
    - CAS-release the prefix: `DELETE FROM prefix_ownership WHERE prefix=? AND
      project_id=?` (serialises against `Register`'s SELECT-then-INSERT
      store.go:1453-1466).
    - **Neutralise the append-only rant trigger** for this cascade: the
      `rant_reviews_no_delete`/`no_update` ABORT triggers (store.go:931) otherwise
      kill the transaction even via FK cascade (`foreign_keys=ON`, store.go:521).
-     Add a **project-eject exception** to the trigger (the redaction-exception
-     pattern, store.go:1022-1026), or drop+recreate it inside this transaction
-     (sound: the daemon is the only writer).
+     **Drop and recreate the trigger inside this transaction** (sound: the daemon
+     is the sole writer; exact precedent `ensureRantReviewTriggerCurrent`
+     store.go:1116-1151) — preferred over a `WHEN parent-gone` exception, whose
+     cascade-time ordering is implementation-typical rather than documented.
    - Drop every per-project row. The row-drop is **FK-driven**: every
      project-owned table carries `… REFERENCES projects(project_id) ON DELETE
      CASCADE`, so `DELETE FROM projects WHERE project_id=?` cascades the whole
      tree in child-before-parent order; the FTS5 virtual table is deleted
-     explicitly by `DELETE FROM search_fts WHERE project_id=?` (FTS5 maintains its
-     own shadow tables — proven in `Rebuild`, store.go:2310).
-5. **Trim** the project's `registry.jsonl` breadcrumbs and delete its `worktrees`
-   rows (via the cascade — **delete**, not "mark removed").
+     explicitly by `DELETE FROM search_fts WHERE project_id=?` (virtual — cannot
+     carry an FK; FTS5 maintains its own shadow tables, proven in `Rebuild`,
+     store.go:2310).
+   - **Insert the persisted `ejections` tombstone** (keyed by `project_id`;
+     machine-level, deliberately **outside** the per-project cascade and **exempt**
+     from the FK chain — it must outlive the project).
+   - **Post-cascade zero-row re-assert** over the `sqlite_master`-derived project
+     table set (below) *before* `COMMIT`: if any project row survives (an
+     unmigrated / FK-incomplete DB), **roll back** with a loud error rather than
+     silently orphan.
+   A crash before `COMMIT` leaves the project fully intact — no tombstone, no
+   partial drop — so retry is safe. The committed tombstone survives daemon
+   restart and is cleared **only** by a subsequent `init` re-adopt, so no
+   post-eject verb or restart can resurrect the project.
+5. **Trim** the project's `registry.jsonl` breadcrumbs (its `worktrees` rows are
+   already gone via the cascade — **delete**, not "mark removed").
 6. **Report** — prefixes released; rows dropped per table; telemetry discarded
    (counts); files left in place; `aira init` to re-adopt.
 
@@ -141,7 +158,12 @@ for an *available* root (protecting the kept record).
 - **Adoption-from-committed-files**: if `.aira/` already has committed
   tickets/requirements/findings, adopt claims the prefix and rebuilds the index
   from those files via `Rebuild` (a clone on a fresh machine becomes a working
-  project with full history), and **clears any eject tombstone** for it.
+  project with full history), and **clears any eject tombstone** for it. Because
+  bootstrap `Register`s *before* `CommitInit` (server.go:639-654) and `Register`
+  is where the tombstone check gates every path, the bootstrap `Register` must
+  **delete the `ejections` row in its own `withImmediate` txn** (a bootstrap flag
+  on the tombstone check) — otherwise re-adopt would be permanently self-refused.
+  Only the `init`/adopt path may clear a tombstone.
 - **Atomic**: preflight the committed `config` slug + ID prefixes against the
   resolved (path-derived) worktree identity and existing owners **before** any
   write; claim the prefix **only after** the rebuild succeeds, rolling back on
@@ -154,17 +176,41 @@ for an *available* root (protecting the kept record).
 
 ## Honesty / safety
 
-- **No resurrection** — the tombstone + scope-cache eviction + per-project
-  exclusion guarantee that neither a post-eject client verb, a mid-eject cached
-  write, nor discovery/restart can re-register the project; only `init` re-adopts.
-- **Illegal-states-unrepresentable cascade** — every `project_id` table has an
+- **No resurrection** — the scope-cache eviction + per-project exclusion (live
+  span) and the committed tombstone (steady state + restart) guarantee that
+  neither a post-eject client verb, a mid-eject cached write, nor
+  discovery/restart can re-register the project; only `init` re-adopts. The
+  tombstone check sits inside `Register` **before** its pre-txn registry-breadcrumb
+  append (store.go:1434-1438), so a refused re-`Register` does not even append a
+  stray breadcrumb line.
+- **Illegal-states-unrepresentable cascade** — every project-owned table has an
   `ON DELETE CASCADE` FK to `projects`; a **schema-introspection test** enumerates
   `sqlite_master` for tables with a `project_id` column and **fails** for any that
-  lack the FK chain, so a future table cannot silently orphan. The zero-orphan
-  eject test derives its table list the same way (not a hand-maintained list).
-  The five per-project counters (`event_counters`, `test_report_counter`,
-  `rant_counter`, `compute_event_counter`, `command_event_counter`) and
-  `id_counters` are covered; `confine_peak_history` is correctly excluded.
+  lack the FK chain, so a future table cannot silently orphan. **Two principled
+  exemptions** are hard-coded in the test: `ejections` (the tombstone — must
+  outlive the project by design; adding the FK would cascade-delete it and reopen
+  the resurrection P0) and `search_fts` (an FTS5 virtual table — cannot carry an
+  FK; covered by the explicit delete-through + the zero-orphan assertion). The
+  zero-orphan eject test derives its table list from the same introspection (not
+  a hand list). Counters covered: `id_counters`, `event_counters`,
+  `test_report_counter`, `rant_counter`, `compute_event_counter`,
+  `command_event_counter`; `confine_peak_history` has no `project_id` and is
+  excluded.
+- **The FK migration is a real in-place rewrite of the live DB.** Verified: ~10
+  telemetry tables already carry the FK (rants tree ×5, `test_reports`,
+  `test_report_results`, `compute_events`, `command_events`, `quota_snapshots`,
+  store.go:893-1014); ~24 core tables (`worktrees`, `prefix_ownership`, `tickets`,
+  `allocations`, `outbox`, `events`, `requirements`, `relations`, `findings`,
+  `leases`, `supervisor_leases`, `gates`×6, `id_counters`, the five counters,
+  `area_hints`) have **none**, and `CREATE TABLE IF NOT EXISTS` never upgrades the
+  existing machine `state.db` — the motivating first use runs against exactly that
+  DB. The migration therefore **recreates each FK-less table in place**, keyed on
+  an empty `PRAGMA foreign_key_list` (precedent: `ensureFindingsSchema`'s
+  table-recreate, store.go:1310-1380), running a `PRAGMA foreign_key_check` and
+  deleting any pre-existing orphan index rows (rebuildable) before commit. It is a
+  distinct, separately-reviewed commit that lands **before** any eject code (see
+  Scope). No circular FK exists — `projects` is the root; the only two-level
+  chains are `rants→projects` and `test_report_results→test_reports`.
 - **Fail-closed durability** — never drop an available root's index while its
   files are incomplete or unverifiable; all preconditions re-asserted inside the
   single drop transaction.
@@ -176,17 +222,29 @@ for an *available* root (protecting the kept record).
   released, a later re-claim by a *different* project can collide in the human ID
   namespace with the ejected project's committed IDs — inherent to release; (b)
   the common-dir `.git/aira` journal/receipts survive eject — load-bearing and
-  good (same-path re-adopt replays them for `seq` continuity).
+  good (same-path re-adopt replays them for `seq` continuity); (c) with
+  `secure_delete=ON`, a large telemetry cascade is not instant and the eject txn
+  (single pinned connection) briefly stalls other daemon DB traffic — an accepted
+  one-off cost, documented rather than optimised.
 
 ## Scope / deferrals
 
-- **In (v1)**: the project-less `aira eject` daemon verb (deregister + `--purge`
-  + `--force` + selectors) with the tombstone/cache-eviction/in-txn cascade; the
-  FK `ON DELETE CASCADE` schema migration + the schema-introspection test; the
-  `rant_reviews` trigger project-eject exception; `init` adoption-from-files +
-  atomic claim + the helpful conflict error + tombstone clear; the `docs/`
-  project-lifecycle doc; the two-loop tests. First-use squat clear + AIRA
-  self-adoption is a manual post-merge step (Opus, on real hardware).
+- **In (v1), built as two separately-reviewed commits** (per the re-gate — the
+  migration has its own blast radius on the live DB and lands + is reviewed
+  *before* any eject code):
+  - **Commit 1 — schema FK migration**: add `ON DELETE CASCADE` FKs to the ~24
+    FK-less project tables via in-place table-recreate (empty-`foreign_key_list`
+    keyed, `ensureFindingsSchema` precedent) + `foreign_key_check` + orphan
+    sweep; the `sqlite_master` schema-introspection test (with the `ejections`/
+    `search_fts` exemptions). RED/GREEN against the current machine DB shape.
+  - **Commit 2 — the lifecycle verb**: the project-less `aira eject` daemon verb
+    (deregister + `--purge` + `--force` + selectors) with the
+    cache-eviction/exclusion + in-txn release+cascade+tombstone+zero-row-reassert;
+    the in-txn `rant_reviews` trigger drop/recreate; `init` adoption-from-files +
+    atomic claim + tombstone clear + the helpful conflict error; the `docs/`
+    project-lifecycle doc; the two-loop tests.
+  First-use squat clear + AIRA self-adoption is a manual post-merge step (Opus, on
+  real hardware).
 - **Out**: `--commit` (cut — hooks/signing/branch surface in the user's repo for
   marginal value; the user commits first); `--export` telemetry sidecar (deferred
   to v2 — no consumer yet); an MCP `aira_eject` tool (deferred — CLI core first,
@@ -198,7 +256,13 @@ for an *available* root (protecting the kept record).
 - **No-resurrection** (the P0): after eject, a coordination verb from the kept
   worktree returns `E_NOT_ADOPTED` (tombstone) and does **not** recreate
   projects/prefix rows; a mid-eject cached `AllocateID`/reconcile insert is
-  excluded; only `init` clears the tombstone and re-adopts.
+  excluded; only `init` clears the tombstone and re-adopts. **Refusal safety**: a
+  `--force`-less eject refused at the live-state or durability guard leaves **no**
+  tombstone (the target is not bricked — a later verb still works).
+- **FK migration** (commit 1): against a DB snapshot with the ~24 FK-less tables,
+  the migration adds the FK chains, `foreign_key_check` passes, and the
+  introspection test then goes GREEN; RED before the migration; the `ejections`
+  and `search_fts` exemptions are asserted.
 - **Rant-cascade** (the other P0): a project with a **reviewed rant** ejects
   cleanly (the trigger exception permits the cascade); asserted RED against the
   un-excepted trigger.
@@ -226,9 +290,11 @@ for an *available* root (protecting the kept record).
 
 - After eject, nothing but an explicit `init` can re-register the project (no
   cached-verb, discovery, or restart resurrection).
-- Release + full cascade + precondition re-verification happen in **one**
-  `BEGIN IMMEDIATE` transaction; a crash before it commits leaves the project
-  intact (the tombstone makes the retry safe).
+- Release + full cascade + tombstone insert + precondition re-verification +
+  zero-row re-assert happen in **one** `BEGIN IMMEDIATE` transaction; a crash or
+  a guard refusal before it commits leaves the project fully intact — **no
+  tombstone, no partial drop** — so a refused target is never bricked and retry
+  is safe.
 - Every `project_id` table has an `ON DELETE CASCADE` FK to `projects`; eject
   leaves zero project rows anywhere, and no non-project table
   (`confine_peak_history`) is touched.
