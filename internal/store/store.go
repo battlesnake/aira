@@ -742,24 +742,29 @@ func (s *Store) initDB(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS worktrees (
             project_id TEXT NOT NULL, worktree_id TEXT NOT NULL, root TEXT NOT NULL,
             active INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL,
-            PRIMARY KEY(project_id, worktree_id)
+            PRIMARY KEY(project_id, worktree_id),
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
         )`,
 		`CREATE TABLE IF NOT EXISTS prefix_ownership (
             prefix TEXT PRIMARY KEY, project_id TEXT NOT NULL, registered_seq INTEGER NOT NULL,
-            kind TEXT NOT NULL DEFAULT 'ticket'
+            kind TEXT NOT NULL DEFAULT 'ticket',
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
         )`,
 		`CREATE TABLE IF NOT EXISTS event_counters (
-            project_id TEXT PRIMARY KEY, next_seq INTEGER NOT NULL
+            project_id TEXT PRIMARY KEY, next_seq INTEGER NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
         )`,
 		`CREATE TABLE IF NOT EXISTS id_counters (
             project_id TEXT NOT NULL, prefix TEXT NOT NULL, next_number INTEGER NOT NULL,
-            PRIMARY KEY(project_id, prefix)
+            PRIMARY KEY(project_id, prefix),
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
         )`,
 		`CREATE TABLE IF NOT EXISTS allocations (
             project_id TEXT NOT NULL, prefix TEXT NOT NULL, number INTEGER NOT NULL,
             worktree_id TEXT NOT NULL, state TEXT NOT NULL, path TEXT NOT NULL,
             seq INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'ticket',
-            PRIMARY KEY(project_id, prefix, number)
+            PRIMARY KEY(project_id, prefix, number),
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
         )`,
 		`CREATE TABLE IF NOT EXISTS outbox (
             project_id TEXT NOT NULL, seq INTEGER NOT NULL, worktree_id TEXT NOT NULL,
@@ -767,7 +772,8 @@ func (s *Store) initDB(ctx context.Context) error {
             intended_digest TEXT NOT NULL, intended_bytes BLOB, materialised INTEGER NOT NULL DEFAULT 0,
             resolution TEXT, journaled INTEGER NOT NULL DEFAULT 0, allocation_id TEXT NOT NULL DEFAULT '',
             kind TEXT NOT NULL DEFAULT 'ticket-file',
-            PRIMARY KEY(project_id, seq)
+            PRIMARY KEY(project_id, seq),
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
         )`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS unresolved_path_intent
             ON outbox(project_id, worktree_id, path)
@@ -776,23 +782,27 @@ func (s *Store) initDB(ctx context.Context) error {
             project_id TEXT NOT NULL, seq INTEGER NOT NULL, at_wall TEXT NOT NULL,
             actor TEXT NOT NULL, verb TEXT NOT NULL, target TEXT NOT NULL,
             payload_digest TEXT NOT NULL, journaled INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY(project_id, seq)
+            PRIMARY KEY(project_id, seq),
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
         )`,
 		`CREATE TABLE IF NOT EXISTS tickets (
             project_id TEXT NOT NULL, worktree_id TEXT NOT NULL, id TEXT NOT NULL,
             path TEXT NOT NULL, digest TEXT NOT NULL, status TEXT NOT NULL, hold INTEGER NOT NULL,
             title TEXT NOT NULL, kind TEXT NOT NULL, severity TEXT NOT NULL,
-	            PRIMARY KEY(project_id, worktree_id, id)
+	            PRIMARY KEY(project_id, worktree_id, id),
+	            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 	        )`,
 		`CREATE TABLE IF NOT EXISTS requirements (
             project_id TEXT NOT NULL, worktree_id TEXT NOT NULL, id TEXT NOT NULL,
             path TEXT NOT NULL, digest TEXT NOT NULL, status TEXT NOT NULL, text TEXT NOT NULL DEFAULT '',
-            PRIMARY KEY(project_id, worktree_id, id)
+            PRIMARY KEY(project_id, worktree_id, id),
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
         )`,
 		`CREATE TABLE IF NOT EXISTS relations (
 	            project_id TEXT NOT NULL, worktree_id TEXT NOT NULL, kind TEXT NOT NULL,
 	            from_id TEXT NOT NULL, to_id TEXT NOT NULL, canonical_file TEXT NOT NULL,
-	            PRIMARY KEY(project_id, worktree_id, kind, from_id, to_id)
+	            PRIMARY KEY(project_id, worktree_id, kind, from_id, to_id),
+	            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 	        )`,
 		`CREATE TABLE IF NOT EXISTS findings (
 			project_id TEXT NOT NULL, worktree_id TEXT NOT NULL DEFAULT '', finding_key TEXT NOT NULL,
@@ -803,7 +813,8 @@ func (s *Store) initDB(ctx context.Context) error {
 			file TEXT NOT NULL DEFAULT '', line INTEGER NOT NULL DEFAULT 0, requirement_id TEXT NOT NULL DEFAULT '',
 			waiver_reason TEXT NOT NULL DEFAULT '', waiver_actor TEXT NOT NULL DEFAULT '', canonical_file TEXT NOT NULL DEFAULT '',
 			message TEXT NOT NULL DEFAULT '',
-			PRIMARY KEY(project_id, worktree_id, finding_key)
+			PRIMARY KEY(project_id, worktree_id, finding_key),
+			FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 	        )`,
 		`CREATE TABLE IF NOT EXISTS leases (
             project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, state TEXT NOT NULL,
@@ -817,7 +828,8 @@ func (s *Store) initDB(ctx context.Context) error {
                     boot_id IS NOT NULL AND length(trim(boot_id)) > 0 AND
                     last_heartbeat_mono_ns IS NOT NULL AND last_heartbeat_mono_ns >= 0 AND
                     ttl_ns IS NOT NULL AND ttl_ns > 0 AND actor IS NOT NULL AND length(trim(actor)) > 0 AND
-                    worktree_id IS NOT NULL AND length(trim(worktree_id)) > 0))
+                    worktree_id IS NOT NULL AND length(trim(worktree_id)) > 0)),
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 	        )`,
 		`CREATE TABLE IF NOT EXISTS supervisor_leases (
 			project_id TEXT NOT NULL,
@@ -832,7 +844,8 @@ func (s *Store) initDB(ctx context.Context) error {
 			ttl_ns INTEGER NOT NULL CHECK (ttl_ns > 0),
 			actor TEXT NOT NULL,
 			worktree_id TEXT NOT NULL,
-			PRIMARY KEY (project_id, run_id)
+			PRIMARY KEY (project_id, run_id),
+			FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS confine_peak_history (
 		    signature TEXT NOT NULL, peak_rss INTEGER, oom INTEGER NOT NULL, at TEXT NOT NULL,
@@ -843,43 +856,52 @@ func (s *Store) initDB(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS area_hints (
             project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, worktree_id TEXT NOT NULL,
             generation INTEGER NOT NULL DEFAULT 0, glob TEXT NOT NULL,
-            PRIMARY KEY(project_id, ticket_id, worktree_id, glob)
+            PRIMARY KEY(project_id, ticket_id, worktree_id, glob),
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 	        )`,
 		`CREATE TABLE IF NOT EXISTS gates (
 		    project_id TEXT NOT NULL, gate_id TEXT NOT NULL, definition_digest TEXT NOT NULL,
-		    definition_json TEXT NOT NULL, PRIMARY KEY(project_id, gate_id)
+		    definition_json TEXT NOT NULL, PRIMARY KEY(project_id, gate_id),
+		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS gate_results (
 		    project_id TEXT NOT NULL, gate_id TEXT NOT NULL, subject TEXT NOT NULL,
 		    seq INTEGER NOT NULL, verdict TEXT NOT NULL, code TEXT NOT NULL,
 		    trusted INTEGER NOT NULL, suspect INTEGER NOT NULL, record_json TEXT NOT NULL,
-		    PRIMARY KEY(project_id, gate_id, subject)
+		    PRIMARY KEY(project_id, gate_id, subject),
+		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS gate_proofs (
 		    project_id TEXT NOT NULL, seq INTEGER NOT NULL, gate_id TEXT NOT NULL,
-		    record_json TEXT NOT NULL, PRIMARY KEY(project_id, seq)
+		    record_json TEXT NOT NULL, PRIMARY KEY(project_id, seq),
+		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS gate_attestations (
 		    project_id TEXT NOT NULL, seq INTEGER NOT NULL, gate_id TEXT NOT NULL,
-		    record_json TEXT NOT NULL, PRIMARY KEY(project_id, seq)
+		    record_json TEXT NOT NULL, PRIMARY KEY(project_id, seq),
+		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS gate_baselines (
 		    project_id TEXT NOT NULL, gate_id TEXT NOT NULL, baseline_seq INTEGER NOT NULL,
 		    comparator TEXT NOT NULL, comparator_version TEXT NOT NULL, comparison_key TEXT NOT NULL,
 		    source_commit TEXT NOT NULL, snapshot_digest TEXT NOT NULL, snapshot_json TEXT NOT NULL,
 		    valid INTEGER NOT NULL DEFAULT 1,
-		    PRIMARY KEY(project_id, baseline_seq)
+		    PRIMARY KEY(project_id, baseline_seq),
+		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS gate_baseline_active (
 		    project_id TEXT NOT NULL, gate_id TEXT NOT NULL, active_baseline_seq INTEGER NOT NULL,
-		    PRIMARY KEY(project_id, gate_id)
+		    PRIMARY KEY(project_id, gate_id),
+		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS test_report_counter (
-		    project_id TEXT PRIMARY KEY, next_number INTEGER NOT NULL, next_seq INTEGER NOT NULL
+		    project_id TEXT PRIMARY KEY, next_number INTEGER NOT NULL, next_seq INTEGER NOT NULL,
+		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS rant_counter (
 		    project_id TEXT PRIMARY KEY, next_number INTEGER NOT NULL CHECK(next_number >= 1),
-		    next_seq INTEGER NOT NULL CHECK(next_seq >= 1)
+		    next_seq INTEGER NOT NULL CHECK(next_seq >= 1),
+		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS rants (
 		    project_id TEXT NOT NULL, id TEXT NOT NULL, body TEXT NOT NULL,
@@ -950,7 +972,8 @@ func (s *Store) initDB(ctx context.Context) error {
 		    FOREIGN KEY(project_id, report_id) REFERENCES test_reports(project_id, id) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS compute_event_counter (
-		    project_id TEXT PRIMARY KEY, next_number INTEGER NOT NULL, next_seq INTEGER NOT NULL
+		    project_id TEXT PRIMARY KEY, next_number INTEGER NOT NULL, next_seq INTEGER NOT NULL,
+		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS compute_events (
 		    project_id TEXT NOT NULL, id TEXT NOT NULL, ticket_id TEXT NOT NULL DEFAULT '',
@@ -974,7 +997,8 @@ func (s *Store) initDB(ctx context.Context) error {
 		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS command_event_counter (
-		    project_id TEXT PRIMARY KEY, next_number INTEGER NOT NULL, next_seq INTEGER NOT NULL
+		    project_id TEXT PRIMARY KEY, next_number INTEGER NOT NULL, next_seq INTEGER NOT NULL,
+		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS command_events (
 		    project_id TEXT NOT NULL, id TEXT NOT NULL, at TEXT NOT NULL, at_seq INTEGER NOT NULL,
@@ -1004,7 +1028,8 @@ func (s *Store) initDB(ctx context.Context) error {
 		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS quota_snapshot_counter (
-		    project_id TEXT PRIMARY KEY, next_number INTEGER NOT NULL, next_seq INTEGER NOT NULL
+		    project_id TEXT PRIMARY KEY, next_number INTEGER NOT NULL, next_seq INTEGER NOT NULL,
+		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS quota_snapshots (
 		    project_id TEXT NOT NULL, id TEXT NOT NULL, provider TEXT NOT NULL, at TEXT NOT NULL,
@@ -1012,6 +1037,9 @@ func (s *Store) initDB(ctx context.Context) error {
 		    reset_at TEXT NOT NULL DEFAULT '', source TEXT NOT NULL, at_seq INTEGER NOT NULL,
 		    PRIMARY KEY(project_id, id),
 		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS ejections (
+		    project_id TEXT PRIMARY KEY, ejected_at TEXT NOT NULL
 		)`,
 	}
 	for _, statement := range statements {
@@ -1070,7 +1098,10 @@ func (s *Store) initDB(ctx context.Context) error {
 	if err := s.ensureFindingsSchema(ctx); err != nil {
 		return err
 	}
-	return s.ensureSearchFTS(ctx)
+	if err := s.ensureSearchFTS(ctx); err != nil {
+		return err
+	}
+	return s.ensureProjectOwnershipFKs(ctx)
 }
 
 // rantReviewNoUpdateTriggerDDL is the current append-only trigger with the one

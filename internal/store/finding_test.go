@@ -257,7 +257,11 @@ func TestLegacyFindingsMigrationIsIdempotentAndTyped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = db.Exec(`CREATE TABLE findings (project_id TEXT NOT NULL, finding_key TEXT NOT NULL, code TEXT NOT NULL, subject TEXT NOT NULL, details TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(project_id,finding_key)); INSERT INTO findings VALUES ('project-aira','legacy','E_OLD','subject','details','now')`)
+	_, err = db.Exec(`
+		CREATE TABLE projects (project_id TEXT PRIMARY KEY, slug TEXT NOT NULL, common_dir TEXT NOT NULL, config_digest TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
+		INSERT INTO projects VALUES ('project-aira','aira','/legacy','', 'now');
+		CREATE TABLE findings (project_id TEXT NOT NULL, finding_key TEXT NOT NULL, code TEXT NOT NULL, subject TEXT NOT NULL, details TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(project_id,finding_key));
+		INSERT INTO findings VALUES ('project-aira','legacy','E_OLD','subject','details','now')`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +348,11 @@ func createLegacyFindingsDB(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err := db.Exec(`CREATE TABLE findings (project_id TEXT NOT NULL, finding_key TEXT NOT NULL, code TEXT NOT NULL, subject TEXT NOT NULL, details TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(project_id,finding_key)); INSERT INTO findings VALUES ('project-aira','legacy','E_OLD','subject','details','now')`); err != nil {
+	if _, err := db.Exec(`
+		CREATE TABLE projects (project_id TEXT PRIMARY KEY, slug TEXT NOT NULL, common_dir TEXT NOT NULL, config_digest TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
+		INSERT INTO projects VALUES ('project-aira','aira','/legacy','', 'now');
+		CREATE TABLE findings (project_id TEXT NOT NULL, finding_key TEXT NOT NULL, code TEXT NOT NULL, subject TEXT NOT NULL, details TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(project_id,finding_key));
+		INSERT INTO findings VALUES ('project-aira','legacy','E_OLD','subject','details','now')`); err != nil {
 		t.Fatal(err)
 	}
 }

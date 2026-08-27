@@ -123,6 +123,9 @@ func TestEventSequenceCommitOrderAcrossIndependentHandles(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer readerDB.Close()
+	if _, err := firstDB.db.Exec(`INSERT INTO projects(project_id,slug,common_dir,config_digest,created_at) VALUES ('commit-order','commit-order','/commit-order','','now')`); err != nil {
+		t.Fatal(err)
+	}
 
 	first := &Store{db: firstDB.db, projectID: "commit-order"}
 	second := &Store{db: secondDB.db, projectID: "commit-order"}
