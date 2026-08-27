@@ -31,6 +31,19 @@ modulo page-rounding). The scan already reads it into `ConfineRecord.Cap`. So th
 reserve of any live confine job is **reconstructable** from the cgroup filesystem —
 no FD handoff, no state transfer between processes.
 
+## Plan-gate outcome (v2 — Sol + DeepSeek BLOCK, Fable code-grounded GATE-FAIL→conditional-pass)
+
+Fable code-grounded that the **core scalar design is sound**, overriding the inline
+reviewers' abstract double-count/atomicity worries: the grant loop (admit.go:487-488)
+is `checkedAvailable`'s ONLY consumer; `max(outstanding+adopted, current)` preserves the
+#67 invariant; the exclusion is airtight (a grant charges `outstanding` *before* its
+scope exists, and teardown removes the scope *before* the connection closes, so each job
+is counted once — in `outstanding` XOR `adopted`); `--memory-max` is refuted
+(`confine_linux.go:387` pins `reserve = ScopeMemoryMax` → `memory.max == granted reserve`);
+delegate-ram → `"max"` → 0. This v2 folds the must-fixes: the **deadlock restructure**
+(scan-before-lock + held-set from `queue.waiters`, no `activeConfines`), the **`Populated>0`
+orphan rule**, **`--list` inclusion**, **overflow guards**, and the documented asymmetries.
+
 ## Design: a re-derived "adopted reserve"
 
 Reconstructing into the incremental `outstanding` counter at startup is wrong: the
@@ -41,25 +54,42 @@ future jobs. Instead, model the pre-restart (connection-less) reserves as a
 
 Add per-slice-queue fields: `adopted int64`, `adoptedJobs int`, `adoptedAt time.Time`.
 
-**Refresh (inside `evaluateAdmitQueue`, throttled to ≤ once/sec via `adoptedAt`):**
-scan the confine slice's `.aira-CONFINE-*` scopes (reuse `runner.ListConfines`) and
-compute over scopes whose `scope_id` is **NOT** in the daemon's connection-held set
-(`activeConfines(slice)` scope-ids):
-- `adopted   = Σ` of each such scope's finite `memory.max` (`ConfineRecord.Cap`
-  parsed as a byte count; `"max"` / unevaluated / non-finite contributes 0),
-- `adoptedJobs = count` of such scopes.
-Exclusion by connection-held `scope_id` prevents double-counting a post-restart job
-that is BOTH connection-held (in `outstanding`) and has a live scope.
+**Refresh — scan BEFORE the lock, exclusion from the held waiters (Fable P0).**
+`activeConfines` takes `admitRegistryMu` then `queue.mu`, so calling it from inside
+`evaluateAdmitQueue` (which already holds `queue.mu`) self-deadlocks / inverts the
+registry→queue lock order. Instead, throttled to ≤ once/sec via `adoptedAt`:
+1. **Outside** `queue.mu`: `runner.ListConfines(confineSlice)` (fs scan; the confine
+   slice resolves via `ResolveConfineManagementSlice("")`). This is safe unlocked: the
+   evaluator is the single grant goroutine, and scope creation strictly happens-*after*
+   its grant, so any scope the scan observes already has its granted waiter present.
+2. **Under** `queue.mu` (held for the grant loop): build the connection-held set by
+   iterating `queue.waiters` for `state == admitGranted && scopeID != ""` (NO
+   `activeConfines` call). Then:
+   - `adopted    = Σ` finite `memory.max` (`ConfineRecord.Cap`) over scanned scopes that
+     are **`Populated > 0`** AND whose `scope_id` is NOT in the held set;
+   - `adoptedJobs = count` of those scopes.
+   Store `adopted`/`adoptedJobs`/`adoptedAt` on the queue.
 
-**Charge (the only admission-math change):** replace the two ledger inputs to the
-grant gate:
-- `checkedAvailable(current, maximum, queue.outstanding + queue.adopted, headroom)`,
-- `headroom = admitSliceHeadroom(queue.outstandingJobs + queue.adoptedJobs + 1)`.
+**`Populated > 0` (Fable P2 orphan rule):** an empty scope is not a live memory
+consumer — it is either mid-teardown or a SIGKILLed-supervisor orphan (the #72 reaper's
+target, which only covers the default slice on a 2-min grace). Charging its reserve
+would be a permanent phantom on a custom slice. Skipping empties ties `adopted` to
+actually-running jobs; a genuinely-live but momentarily-empty (mid-launch) scope is
+briefly uncharged (safe under-count) and picked up once populated.
 
-`outstanding + adopted` = total granted reserves (post-restart A-jobs + pre-restart
-B-jobs); `charge = max(that, current)` keeps the exact #67 invariant
-(`Σ(reserve) ≤ cap − headroom`, and never below actual RSS). No double count: it is a
-`max` between the reserve side and the actual side, not a sum.
+**Exclusion is airtight (Fable-confirmed):** a granted A-job charges `outstanding`
+*before* its scope exists (→ not yet scanned → not in `adopted`); once its scope exists,
+its `scope_id` is in the held set (→ excluded from `adopted`); teardown removes the scope
+*before* the connection closes (→ gone from the scan before it leaves `outstanding`). So
+each job is counted exactly once, in `outstanding` XOR `adopted`.
+
+**Charge (the only admission-math change), overflow-guarded (Sol/DeepSeek):** in the
+grant loop, replace the two ledger inputs with `addClamp(queue.outstanding, queue.adopted)`
+and `queue.outstandingJobs + queue.adoptedJobs`:
+- `checkedAvailable(current, maximum, addClamp(outstanding, adopted), admitSliceHeadroom(outstandingJobs + adoptedJobs + 1))`,
+where `addClamp` saturates at `math.MaxInt64` (never wraps negative — a negative would
+fabricate available headroom). `charge = max(outstanding+adopted, current)` keeps the
+exact #67 invariant (`Σ(reserve) ≤ cap − headroom`, never below actual RSS).
 
 **Self-healing lifecycle:**
 - *At startup*: `outstanding = 0`, no connections yet, so the first refresh sets
@@ -83,17 +113,38 @@ B-jobs); `charge = max(that, current)` keeps the exact #67 invariant
   forgotten ledger, never a new wrongful-wait. Documented, accepted for v1.
 - No fabricated values: an unparseable/`"max"` cap contributes 0, never a guess.
 
+## `--list` reserve summary includes `adopted` (Fable P2)
+
+#73's `confine --list` slice-reserve summary is built in `confineManagement` from the
+admit ledger; post-restart it must add `adopted` so it does not under-report granted
+reserve. Set `SliceReserve.GrantedBytes = addClamp(outstanding, adopted)` and
+`Jobs = outstandingJobs + adoptedJobs` (reading the queue's fields under `queue.mu`).
+
 ## Scope / deferrals
 
-- **In:** the `adopted`/`adoptedJobs` re-derive in `evaluateAdmitQueue` (throttled),
-  its inclusion in the grant gate + headroom, fail-safe on scan error, tests.
-- **Out:** exact reserve accounting for `--delegate-ram` scopes (v2 — would need the
-  reserve persisted per-scope beyond `memory.max`); systemd socket-activation for the
-  connection blip (separate, smaller follow-up — this milestone removes the *state*
-  loss; socket activation removes the ~1 s connection blip). Nothing here does FD
-  handoff or allows two daemon writers — single-writer invariant is untouched.
-- The scan reuses `ResolveConfineManagementSlice("")` + `runner.ListConfines` (as
-  #72 does). Interacts with, but is independent of, the #72 orphan reaper.
+- **In:** the `adopted`/`adoptedJobs` re-derive in `evaluateAdmitQueue` (scan-before-lock,
+  held-set from waiters, `Populated>0`), its overflow-guarded inclusion in the grant gate
+  + headroom + the `--list` summary, fail-safe on scan error, tests.
+- **Enqueue-time `E_ADMIT_TOO_LARGE` (admit.go:298-304/408) is left excluding `adopted`
+  (Fable P3, documented asymmetry):** a post-restart job whose reserve is infeasible only
+  once `adopted` is counted will WAIT and then time out to `E_ADMIT_SATURATED` rather than
+  fast-reject as `TOO_LARGE`. Honest (it truly cannot be admitted now), just slower — the
+  grant gate still never over-admits it. Not worth threading `adopted` through the
+  per-job ceiling for a slower-but-correct rejection.
+- **Out (deferred):** exact reserve accounting for `--delegate-ram` scopes (their
+  `memory.max` is `"max"` → contribute 0 → safe under-count, same direction as today);
+  **#69 `confine-reserve` per-test reservations are UNRECONSTRUCTABLE** — they are ledger
+  reservations with no cgroup scope of their own, so a scan cannot see them; they are lost
+  on restart exactly as today (opt-in pytest governor, safe under-count). Both are the
+  benign over-admit direction, never a new wrongful-wait.
+- **systemd socket-activation** for the ~1 s connection blip is a separate, smaller
+  follow-up. This milestone removes the *state* loss only. Nothing here does FD handoff
+  or allows two daemon writers — the single-writer invariant is untouched.
+- **Fail-safe observability:** a persistent scan failure keeps the last `adopted`
+  (conservative), but log it once per transition so a stuck-high `adopted` (wrongful-wait,
+  not OOM) is diagnosable rather than silent.
+- The scan reuses `ResolveConfineManagementSlice("")` + `runner.ListConfines` (as #72
+  does). Interacts with, but is independent of, the #72 orphan reaper.
 
 ## Tests
 
@@ -111,6 +162,18 @@ Unit (daemon, injected `admitReadMemory` + a fake confine scan seam):
 6. **delegate-ram / non-finite cap**: a `"max"`-cap scope contributes 0.
 7. **Charge invariant**: with `adopted` set, `checkedAvailable` still returns
    `ceiling − max(outstanding+adopted, current)` and never over-grants.
+8. **Orphan / empty skip (P2)**: an empty (`Populated==0`) finite-cap scope is NOT
+   counted in `adopted` (no phantom reserve), while a `Populated>0` one is.
+9. **Grant-window / no double (P0-ordering)**: a granted waiter present in `outstanding`
+   whose `scope_id` also appears in the scan is counted once (excluded from `adopted`);
+   a granted waiter whose scope is not yet scanned is counted once (in `outstanding`).
+10. **Overflow guard**: an `adopted` (or `outstanding+adopted`) sum near `math.MaxInt64`
+    saturates rather than wrapping negative (which would fabricate available headroom).
+11. **`--list` includes adopted**: with `adopted>0` and `outstanding=0`, the
+    `SliceReserve.GrantedBytes`/`Jobs` reflect `adopted`/`adoptedJobs` (not 0).
+12. **No re-entrant deadlock**: the refresh does not call `activeConfines`; a real
+    `evaluateAdmitQueue` run completes (a `-race`/deadlock-detector real-cgroup test that
+    seeds a scope + a queued waiter and drives one evaluation without hanging).
 
 ## Invariants
 
