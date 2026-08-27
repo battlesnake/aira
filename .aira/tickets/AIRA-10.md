@@ -1,0 +1,4 @@
+---
+{"schema":1,"id":"AIRA-10","project":"aira","title":"Pre-existing pylib load-timing flake: TestRealPytestTotalFailOpen bounds wall-clock incl. pytest startup at 1200ms","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
+---
+internal/pylib/pytest_integration_test.go:530 asserts elapsed <= 1200ms for the incomplete-population fail-open, but elapsed includes pytest interpreter startup (~1s under load) against a MAX_WAIT of 2s. Fails only under full-suite contention (measured 1.296s); passes 3/3 in isolation. Unrelated to AIRA-6/AIRA-2 (branch touches no pylib code). A robust fix decouples pytest-startup from the fail-open measurement (or widens MAX_WAIT + bound); a bare threshold bump only moves the flake. Deferred design.
