@@ -324,6 +324,55 @@ func TestMalformedAdmitPollIntervalFailsDaemonStartupBeforeBind(t *testing.T) {
 	}
 }
 
+func TestAdmitBackfillGraceConfig(t *testing.T) {
+	tests := []struct {
+		name  string
+		set   bool
+		value string
+		want  time.Duration
+		code  string
+	}{
+		{name: "default", want: time.Minute},
+		{name: "duration", set: true, value: "2m", want: 2 * time.Minute},
+		{name: "disabled", set: true, value: "disabled", want: 0},
+		{name: "zero", set: true, value: "0", want: 0},
+		{name: "malformed", set: true, value: "eventually", code: "E_CONFIG_INVALID"},
+		{name: "negative", set: true, value: "-1s", code: "E_CONFIG_INVALID"},
+		{name: "noncanonical zero", set: true, value: "0s", code: "E_CONFIG_INVALID"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if test.set {
+				t.Setenv("AIRA_DAEMON_ADMIT_BACKFILL_GRACE", test.value)
+			} else {
+				_ = os.Unsetenv("AIRA_DAEMON_ADMIT_BACKFILL_GRACE")
+			}
+			got, err := admitBackfillGraceFromEnv()
+			if test.code != "" {
+				if err == nil || !strings.HasPrefix(err.Error(), test.code+":") {
+					t.Fatalf("grace=%v err=%v, want %s", got, err, test.code)
+				}
+				return
+			}
+			if err != nil || got != test.want {
+				t.Fatalf("grace=%v want=%v err=%v", got, test.want, err)
+			}
+		})
+	}
+}
+
+func TestMalformedAdmitBackfillGraceFailsDaemonStartupBeforeBind(t *testing.T) {
+	paths := testPaths(t)
+	t.Setenv("AIRA_DAEMON_ADMIT_BACKFILL_GRACE", "eventually")
+	err := NewServer(paths).Serve(context.Background())
+	if err == nil || !strings.HasPrefix(err.Error(), "E_CONFIG_INVALID:") {
+		t.Fatalf("Serve error=%v, want E_CONFIG_INVALID", err)
+	}
+	if _, statErr := os.Stat(paths.RuntimeDir); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("malformed config touched runtime directory: %v", statErr)
+	}
+}
+
 func TestMalformedWatchPollIntervalFailsDaemonStartupBeforeBind(t *testing.T) {
 	paths := testPaths(t)
 	t.Setenv("AIRA_DAEMON_WATCH_POLL_INTERVAL", "10s")

@@ -73,6 +73,7 @@ type Server struct {
 	watchPollInterval            time.Duration
 	admitSlots                   chan struct{}
 	admitPollInterval            time.Duration
+	admitBackfillGrace           time.Duration
 	admitRegistryMu              sync.Mutex
 	admitQueues                  map[string]*sliceQueue
 	admitPriorMu                 sync.Mutex
@@ -116,7 +117,7 @@ func NewServer(paths Paths) *Server {
 		Paths: paths, DrainTimeout: 10 * time.Second, scopes: map[string]*scopeEntry{}, ejecting: map[string]struct{}{}, coveredWorktrees: map[string]struct{}{}, discoveryFailed: map[string]struct{}{},
 		projectUses: map[string]int{},
 		watchSlots:  make(chan struct{}, watchMaxConcurrent), watchPollInterval: defaultWatchPollInterval,
-		admitSlots: make(chan struct{}, admitGlobalMax), admitPollInterval: defaultAdmitPollInterval,
+		admitSlots: make(chan struct{}, admitGlobalMax), admitPollInterval: defaultAdmitPollInterval, admitBackfillGrace: defaultAdmitBackfillGrace,
 		admitQueues: map[string]*sliceQueue{},
 		admitConfineScan: func(path string) (runner.ConfineListResult, error) {
 			return runner.ListConfines(context.Background(), path, nil)
@@ -172,6 +173,11 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		return err
 	}
 	s.admitPollInterval = admitPollInterval
+	admitBackfillGrace, err := admitBackfillGraceFromEnv()
+	if err != nil {
+		return err
+	}
+	s.admitBackfillGrace = admitBackfillGrace
 	if len(s.Paths.SocketPath) > maxUnixSocketPath {
 		// Fail fast with a clear code instead of a cryptic bind EINVAL. In
 		// production XDG_RUNTIME_DIR is short (/run/user/<uid>); an over-long one

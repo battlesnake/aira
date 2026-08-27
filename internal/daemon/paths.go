@@ -33,6 +33,7 @@ const (
 	defaultJournalFlushInterval = 60 * time.Second
 	defaultWatchPollInterval    = 500 * time.Millisecond
 	defaultAdmitPollInterval    = 250 * time.Millisecond
+	defaultAdmitBackfillGrace   = time.Minute
 	defaultWatchdogInterval     = 2 * time.Second
 	defaultScopeReapInterval    = 5 * time.Minute
 	defaultScopeReapGrace       = 2 * time.Minute
@@ -81,6 +82,21 @@ func admitPollIntervalFromEnv() (time.Duration, error) {
 		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_ADMIT_POLL_INTERVAL must be a Go duration in [250ms,10s)")
 	}
 	return interval, nil
+}
+
+func admitBackfillGraceFromEnv() (time.Duration, error) {
+	value, set := os.LookupEnv("AIRA_DAEMON_ADMIT_BACKFILL_GRACE")
+	if !set || value == "" {
+		return defaultAdmitBackfillGrace, nil
+	}
+	if value == "disabled" || value == "0" {
+		return 0, nil
+	}
+	grace, err := time.ParseDuration(value)
+	if err != nil || grace <= 0 {
+		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_ADMIT_BACKFILL_GRACE must be a positive Go duration, disabled, or 0")
+	}
+	return grace, nil
 }
 
 func watchPollIntervalFromEnv() (time.Duration, error) {

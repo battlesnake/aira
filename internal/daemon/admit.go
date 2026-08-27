@@ -580,7 +580,7 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		// (timeoutAdmitWaiter → E_ADMIT_SATURATED) if it never does.
 		return
 	}
-	blocked := false
+	frozen := false
 	for _, waiter := range queue.waiters {
 		if waiter.state != admitQueued {
 			continue
@@ -588,9 +588,16 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		jobs := addJobCountClamp(addJobCountClamp(queue.outstandingJobs, queue.adoptedJobs), 1)
 		headroom := s.admitSliceHeadroom(jobs)
 		available := checkedAvailable(current, maximum, addClamp(queue.outstanding, queue.adopted), headroom)
-		if blocked || waiter.reserve > available {
-			blocked = true
+		if frozen {
 			waiter.waited = true
+			continue
+		}
+		if waiter.reserve > available {
+			waiter.waited = true
+			// now is pass-start time, so a slow adopted-confine scan can defer this freeze by its duration.
+			if s.admitBackfillGrace <= 0 || now.Sub(waiter.enqueued) >= s.admitBackfillGrace {
+				frozen = true
+			}
 			continue
 		}
 		waiter.state = admitGranted
