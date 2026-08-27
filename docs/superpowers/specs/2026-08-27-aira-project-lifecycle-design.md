@@ -304,3 +304,21 @@ for an *available* root (protecting the kept record).
 - After eject (deregister), `aira init` re-adopts from the committed files and
   reconstructs the full authoritative record; the surviving common-dir journal
   preserves `seq` continuity.
+
+---
+
+## v2.2 (2026-08-28) — MCP aira_eject landed; --export/--commit remain out
+
+Follows the v2 "Scope / deferrals": the deferred MCP `aira_eject` tool is now
+built (AIRA-2). eject is exposed as a destructive daemon-routed MCP tool
+(DestructiveHint=true), routed through the same project-less daemon transport as
+the CLI (dispatcher.go eject branch) — the CLI shape settled + was dogfooded
+(FRG squatter cleared live), so the "CLI core first" precondition is met. Include
+now also lists eject in the generated help + SKILL.md verb table (intended,
+consistent with init); no MCP-only flag was added (architectural-simplicity).
+
+Still intentionally OUT (no consumer / decided cut — YAGNI):
+- `--export` telemetry sidecar — deferred; still no consumer. Reopen only when a
+  concrete telemetry-preservation need exists.
+- `--commit` for --purge — cut (the user commits first; hooks/signing/branch
+  surface in the user's repo for marginal value). Not reopened.
