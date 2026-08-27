@@ -1,0 +1,4 @@
+---
+{"schema":1,"id":"AIRA-7","project":"aira","title":"Skill/guidance: agents declare per-test/suite RAM estimates where it matters; sane default covers the rest","status":"done","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["confine","skill"],"hold":false,"relations":[]}
+---
+The generated SKILL.md (internal/core/skill.go) mentions --delegate-ram/aira_mem but frames it as niche and doesn't convey: (a) plain 'aira confine -- <cmd>' takes a WHOLE-JOB reserve (over-reserves a suite -> contention); (b) prefer --delegate-ram for pytest so the governor admits per-test; (c) declare aira_mem only on heavy outliers + --memory-reserve per suite; (d) a sane DEFAULT estimate covers the majority, so agents need not annotate everything. Owner request 2026-08-28, born from the reserve-contention debugging. Needs skill re-install to deploy.

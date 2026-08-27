@@ -1,0 +1,4 @@
+---
+{"schema":1,"id":"AIRA-4","project":"aira","title":"Confine admission: backfill past a head-of-line-blocked big waiter (starvation-safe)","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine"],"hold":false,"relations":[]}
+---
+admit.go:591 sets blocked=true on the first non-fitting waiter, so a big whole-job waiter (e.g. 37G make merge-gate) stalls all smaller waiters behind it in the strict-FIFO queue even when they would fit the idle headroom. Add backfill: grant later waiters that fit while the oldest blocked waiter's wait < a grace deadline; once it exceeds the deadline, freeze backfill so freed reserve accumulates for it (bounded extra delay => starvation-free). Preserves the #40 D4 fairness invariant. Found via reserve-contention debugging 2026-08-27.
