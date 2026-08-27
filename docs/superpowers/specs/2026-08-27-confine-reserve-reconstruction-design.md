@@ -208,3 +208,46 @@ Unit (daemon, injected `admitReadMemory` + a fake confine scan seam):
 - `adopted` never fabricates a reserve (non-finite cap → 0) and never zeros on a
   transient scan failure.
 - Exactly one daemon writer throughout; no FD/state handoff.
+
+## Accepted characteristic: the restart connection-blip (socket-activation declined)
+
+This milestone removes the *state* loss across a daemon restart. It deliberately
+leaves the **connection-blip** in place as an accepted characteristic:
+
+- A `systemctl restart aira-daemon` stops the old daemon (which owns the AF_UNIX
+  socket at `Paths.SocketPath` and unlinks it on exit), then the new daemon binds a
+  fresh socket. During that ~1 s gap a client that dials the socket gets
+  `ECONNREFUSED`, and any established `watch`/relay connection drops.
+- This degrades gracefully: `confine` admission falls back to the flock path, a fresh
+  dial fast-fails and retries, and — because of this milestone plus the DB persist —
+  **no reserve, lease, or DB state is lost**. The blip is a brief, self-healing
+  latency event on a *deliberate* restart, not a correctness hazard.
+
+**systemd socket-activation** (systemd owns the listening socket across the restart
+and queues incoming connections; the new daemon inherits the FD via `sd_listen_fds`)
+was designed and plan-gated as task #75 to erase even this blip. It was **declined on
+architectural-simplicity grounds** (owner decision 2026-08-27). The mechanism is
+sound — all three review lineages confirmed systemd passes the same-base-name socket's
+FD to the service on *every* start, not only socket-triggered ones (the always-on
+`docker.service`/`docker.socket` precedent) — but it couples the daemon's most critical
+liveness path to a second systemd unit and introduces real new semantic surface for a
+purely cosmetic gain:
+
+- **resurrect-on-dial** — with the socket listening and the service stopped, any client
+  dial restarts the daemon, so `systemctl stop aira-daemon` no longer means stopped;
+- **probe dishonesty** — `aira daemon status` reads liveness with a bare socket dial
+  (`paths.go` `Status.Ready`); under activation systemd accepts the connection even
+  with the daemon dead or crash-looping, so status would report `Ready=true` with no
+  daemon behind it (an honesty regression);
+- **fast-fail → 30 s stall** — a down daemon today returns an instant `ECONNREFUSED`
+  that clients turn into an immediate flock fallback; under activation the connection
+  is accepted and the request instead blocks to the client's ~30 s deadline.
+
+Given the owner's hard "don't stack complexity / keep the primitive + document the
+gap" steer, and that this milestone already fixed the half of the seamless-restart
+goal that actually lost state, the simpler primitive wins: **accept the restart blip
+and document it here.** Should the trade ever be revisited, the #75 plan (branch
+discarded) and its gate findings — the shutdown-time `os.Remove(SocketPath)` unlink
+hazard (`server.go`), the first-install socket path-steal ordering, `LISTEN_FDS==1`
+fail-closed, the `net.FileListener` fd/CLOEXEC hygiene, and the `.socket` `ListenStream`
+identity check — are the folds a v2 would need.
