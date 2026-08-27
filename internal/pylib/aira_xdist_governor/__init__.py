@@ -16,6 +16,7 @@ import pytest
 
 _DEFAULT_POLL_INTERVAL = 0.75
 _DEFAULT_MAX_WAIT = 300.0
+_DEFAULT_AFTER_TEST_GC_INTERVAL = 10.0
 _GRANT_READ_GRACE = 2.0
 # re.ASCII keeps case-folding ASCII-only, matching Go's byte-wise strings.ToUpper;
 # without it re.IGNORECASE would fold Unicode look-alikes (e.g. U+212A KELVIN SIGN
@@ -27,6 +28,7 @@ _logged_failures = set()
 _held_slot_descriptors = set()
 _held_reservation_streams = set()
 _plugin_active = False
+_last_after_test_gc = time.monotonic()
 
 
 def _release_slot(descriptor):
@@ -218,6 +220,15 @@ def _read_grant(process, timeout):
     return int(match.group(1))
 
 
+def _grant_ready(process):
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(process.stdout.fileno(), selectors.EVENT_READ)
+        return bool(selector.select(0))
+    finally:
+        selector.close()
+
+
 def _stop_reservation(process):
     if process is None:
         return
@@ -268,6 +279,8 @@ def _acquire_reservation(item):
             close_fds=True,
         )
         _held_reservation_streams.add(process.stdin)
+        if not _grant_ready(process):
+            gc.collect()
         _read_grant(process, _DEFAULT_MAX_WAIT + _GRANT_READ_GRACE)
         return process
     except Exception as exc:
@@ -287,6 +300,7 @@ def pytest_configure(config):
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_protocol(item, nextitem):
     """Hold CPU and optional RAM leases across setup, call, and teardown."""
+    global _last_after_test_gc
     descriptor = None
     reservation = None
     try:
@@ -299,6 +313,16 @@ def pytest_runtest_protocol(item, nextitem):
         except Exception as exc:
             _log_once("%s; running ungoverned" % (exc,), domain="RAM")
         yield
+        try:
+            interval = _setting(
+                "AIRA_TEST_AFTER_TEST_GC_INTERVAL", _DEFAULT_AFTER_TEST_GC_INTERVAL, allow_zero=True
+            )
+            now = time.monotonic()
+            if interval != 0 and now - _last_after_test_gc >= interval:
+                gc.collect()
+                _last_after_test_gc = now
+        except Exception as exc:
+            _log_once("%s; skipping periodic post-test gc" % (exc,), domain="GC", disabled=False)
     finally:
         try:
             _stop_reservation(reservation)

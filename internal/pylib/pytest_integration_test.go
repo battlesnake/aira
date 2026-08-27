@@ -244,6 +244,181 @@ governor.gc = ProbeGC
 	}
 }
 
+func TestRealPytestPeriodicAfterTestGC(t *testing.T) {
+	pytest := requireRealPytest(t)
+	count := func(t *testing.T, path string) string {
+		t.Helper()
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read gc count: %v", err)
+		}
+		return string(data)
+	}
+	probe := `
+import os
+import time
+import aira_xdist_governor as governor
+
+class ProbeGC:
+    @staticmethod
+    def collect():
+        path = os.environ["AIRA_TEST_GC_COUNT"]
+        value = int(open(path, encoding="utf-8").read()) if os.path.exists(path) else 0
+        with open(path, "w", encoding="utf-8") as target:
+            target.write(str(value + 1))
+
+governor.gc = ProbeGC
+governor._last_after_test_gc = time.monotonic() - 60
+`
+	t.Run("two fast tests collect once", func(t *testing.T) {
+		project, pythonDir := realPytestProject(t, probe)
+		countPath := filepath.Join(project, "gc-count")
+		writeTestFile(t, project, "test_cadence.py", "def test_first(): pass\ndef test_second(): pass")
+		result := runPytest(t, pytest, project, pythonDir, map[string]string{
+			"AIRA_TEST_AFTER_TEST_GC_INTERVAL": "60", "AIRA_TEST_GC_COUNT": countPath,
+		})
+		if result.err != nil {
+			t.Fatalf("pytest cadence failed: %v\n%s", result.err, result.output)
+		}
+		if got := count(t, countPath); got != "1" {
+			t.Fatalf("after-test gc count=%q, want exactly one for tests within interval", got)
+		}
+	})
+	t.Run("CPU wait collect does not suppress cadence", func(t *testing.T) {
+		project, pythonDir := realPytestProject(t, probe)
+		countPath := filepath.Join(project, "gc-count")
+		writeTestFile(t, project, "test_independent.py", "def test_runs(): pass")
+		slots := makeRealPytestSlots(t, 1)
+		_ = lockRealPytestSlot(t, filepath.Join(slots, "slot-0"))
+		result := runPytest(t, pytest, project, pythonDir, map[string]string{
+			"AIRA_CPU_SLOTS_DIR": slots, "AIRA_CPU_POLL_INTERVAL": "0.02", "AIRA_CPU_MAX_WAIT": "0.15",
+			"AIRA_TEST_AFTER_TEST_GC_INTERVAL": "60", "AIRA_TEST_GC_COUNT": countPath,
+		})
+		if result.err != nil {
+			t.Fatalf("pytest independent timer failed: %v\n%s", result.err, result.output)
+		}
+		if got := count(t, countPath); got != "2" {
+			t.Fatalf("gc count=%q, want one before CPU block plus one after test", got)
+		}
+	})
+	t.Run("zero disables cadence", func(t *testing.T) {
+		project, pythonDir := realPytestProject(t, probe)
+		countPath := filepath.Join(project, "gc-count")
+		writeTestFile(t, project, "test_disabled.py", "def test_runs(): pass")
+		result := runPytest(t, pytest, project, pythonDir, map[string]string{
+			"AIRA_TEST_AFTER_TEST_GC_INTERVAL": "0", "AIRA_TEST_GC_COUNT": countPath,
+		})
+		if result.err != nil {
+			t.Fatalf("pytest disabled cadence failed: %v\n%s", result.err, result.output)
+		}
+		if _, err := os.Stat(countPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("disabled cadence collected: %v", err)
+		}
+	})
+	for _, value := range []string{"-1", "garbage"} {
+		t.Run("invalid interval "+value+" is fail-open", func(t *testing.T) {
+			assertRealPytestItemRuns(t, pytest, map[string]string{"AIRA_TEST_AFTER_TEST_GC_INTERVAL": value}, nil)
+		})
+	}
+}
+
+func TestRealPytestRAMWaitCollectsBeforeBlocking(t *testing.T) {
+	pytest := requireRealPytest(t)
+	project, pythonDir := realPytestProject(t, `
+import os
+import aira_xdist_governor as governor
+
+class ProbeGC:
+    @staticmethod
+    def collect():
+        path = os.environ["AIRA_TEST_GC_COUNT"]
+        value = int(open(path, encoding="utf-8").read()) if os.path.exists(path) else 0
+        with open(path, "w", encoding="utf-8") as target:
+            target.write(str(value + 1))
+
+governor.gc = ProbeGC
+`)
+	countPath := filepath.Join(project, "gc-count")
+	helper := writeReserveHelper(t, project, `
+import os, sys, time
+deadline = time.monotonic() + 0.5
+while not os.path.exists(os.environ["AIRA_TEST_GC_COUNT"]) and time.monotonic() < deadline:
+    time.sleep(0.01)
+estimate = sys.argv[sys.argv.index("--bytes") + 1]
+print("granted reserve=%s basis=pinned:client" % estimate, flush=True)
+sys.stdin.buffer.read()
+`)
+	writeTestFile(t, project, "test_ram_wait.py", "def test_runs(): pass")
+	result := runPytest(t, pytest, project, pythonDir, map[string]string{
+		"AIRA_CPU_SLOTS_DIR":     makeRealPytestSlots(t, 1),
+		"AIRA_TEST_MEM_GOVERNOR": "1", "AIRA_TEST_MEM_DEFAULT": "8M",
+		"AIRA_CONFINE_RESERVE_CMD": helper, "AIRA_TEST_GC_COUNT": countPath,
+		"AIRA_TEST_AFTER_TEST_GC_INTERVAL": "0",
+	})
+	if result.err != nil {
+		t.Fatalf("pytest RAM wait failed: %v\n%s", result.err, result.output)
+	}
+	data, err := os.ReadFile(countPath)
+	if err != nil || string(data) != "1" {
+		t.Fatalf("RAM wait gc count=%q err=%v, want exactly one pre-collect", data, err)
+	}
+}
+
+func TestRealPytestRAMImmediateGrantSkipsCollect(t *testing.T) {
+	pytest := requireRealPytest(t)
+	project, pythonDir := realPytestProject(t, `
+import os
+import aira_xdist_governor as governor
+
+class ProbeGC:
+    @staticmethod
+    def collect():
+        with open(os.environ["AIRA_TEST_GC_COUNT"], "w", encoding="utf-8") as target:
+            target.write("collected")
+
+class Stdin:
+    def close(self):
+        pass
+
+class ImmediateGrantProcess:
+    def __init__(self, descriptor):
+        self.stdin = Stdin()
+        self.stdout = os.fdopen(descriptor, "rb", buffering=0)
+    def poll(self):
+        return None
+    def wait(self, timeout=None):
+        return 0
+    def terminate(self):
+        pass
+    def kill(self):
+        pass
+
+def immediate_grant_popen(command, **kwargs):
+    descriptor, writer = os.pipe()
+    estimate = command[command.index("--bytes") + 1]
+    os.write(writer, ("granted reserve=%s basis=pinned:client\\n" % estimate).encode("ascii"))
+    os.close(writer)
+    return ImmediateGrantProcess(descriptor)
+
+governor.gc = ProbeGC
+governor.subprocess.Popen = immediate_grant_popen
+`)
+	countPath := filepath.Join(project, "gc-count")
+	writeTestFile(t, project, "test_ram_immediate.py", "def test_runs(): pass")
+	result := runPytest(t, pytest, project, pythonDir, map[string]string{
+		"AIRA_CPU_SLOTS_DIR":     makeRealPytestSlots(t, 1),
+		"AIRA_TEST_MEM_GOVERNOR": "1", "AIRA_TEST_MEM_DEFAULT": "8M",
+		"AIRA_CONFINE_RESERVE_CMD": "fake-aira", "AIRA_TEST_GC_COUNT": countPath,
+		"AIRA_TEST_AFTER_TEST_GC_INTERVAL": "0",
+	})
+	if result.err != nil {
+		t.Fatalf("pytest immediate RAM grant failed: %v\n%s", result.err, result.output)
+	}
+	if _, err := os.Stat(countPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("immediate RAM grant collected: %v", err)
+	}
+}
+
 func TestRealPytestTotalFailOpen(t *testing.T) {
 	pytest := requireRealPytest(t)
 	t.Run("unset directory", func(t *testing.T) {
