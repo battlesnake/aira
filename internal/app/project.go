@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -132,6 +133,7 @@ type InitResult struct {
 type InitPlan struct {
 	Project Project
 	Data    []byte
+	Adopt   bool
 }
 
 func Discover(ctx context.Context, cwd string) (Project, error) {
@@ -321,12 +323,73 @@ func Init(ctx context.Context, cwd string, args map[string]any) (InitResult, err
 	if err != nil {
 		return InitResult{}, err
 	}
+	dbPath := filepath.Join(project.StateDir, "state.db")
+	registryPath := filepath.Join(project.StateDir, "registry.jsonl")
+	db, err := store.OpenDB(dbPath, registryPath)
+	if err != nil {
+		return InitResult{}, err
+	}
+	defer func() {
+		if db != nil {
+			_ = db.Close()
+		}
+	}()
+	tombstoned, err := db.ProjectEjected(ctx, project.ProjectID)
+	if err != nil {
+		return InitResult{}, err
+	}
+	if plan.Adopt || tombstoned {
+		configBytes, err := json.Marshal(project.Config)
+		if err != nil {
+			return InitResult{}, err
+		}
+		digest := sha256.Sum256(configBytes)
+		view, err := store.NewUnregisteredScope(db, store.ScopeOptions{
+			Root: project.Root, CommonDir: project.CommonDir, GitDir: project.GitDir,
+			ProjectID: project.ProjectID, WorktreeID: project.WorktreeID,
+			ProjectSlug: project.Config.Project.Slug, Prefixes: project.Config.Project.Prefixes,
+			RequirementPrefixes: project.Config.Project.RequirementPrefixes, ReviewPolicy: reviewPolicy,
+			LeaseTTLNS: leaseTTLNS(project.Config), ConfigDigest: hex.EncodeToString(digest[:]), Bootstrap: true,
+		})
+		if err != nil {
+			return InitResult{}, err
+		}
+		if err := view.PreflightAdoption(ctx); err != nil {
+			return InitResult{}, err
+		}
+		if err := view.StageAdoption(ctx); err != nil {
+			return InitResult{}, err
+		}
+		staged := true
+		defer func() {
+			if staged {
+				_ = view.RollbackStagedAdoption(context.Background())
+			}
+		}()
+		if plan.Adopt {
+			if err := view.Rebuild(ctx); err != nil {
+				return InitResult{}, err
+			}
+		} else if err := CommitInit(plan); err != nil {
+			return InitResult{}, err
+		}
+		if err := view.Register(ctx); err != nil {
+			return InitResult{}, err
+		}
+		staged = false
+		return plan.Result(cwd)
+	}
+	if err := db.Close(); err != nil {
+		return InitResult{}, err
+	}
+	db = nil
 	s, err := store.Open(ctx, store.Options{
 		Root: project.Root, CommonDir: project.CommonDir, GitDir: project.GitDir,
-		DBPath: filepath.Join(project.StateDir, "state.db"), RegistryPath: filepath.Join(project.StateDir, "registry.jsonl"),
+		DBPath: dbPath, RegistryPath: registryPath,
 		ProjectID: project.ProjectID, WorktreeID: project.WorktreeID,
 		ProjectSlug: project.Config.Project.Slug, Prefixes: project.Config.Project.Prefixes,
-		ReviewPolicy: reviewPolicy, LeaseTTLNS: leaseTTLNS(project.Config),
+		RequirementPrefixes: project.Config.Project.RequirementPrefixes,
+		ReviewPolicy:        reviewPolicy, LeaseTTLNS: leaseTTLNS(project.Config),
 	})
 	if err != nil {
 		return InitResult{}, err
@@ -353,33 +416,59 @@ func PrepareInit(ctx context.Context, cwd string, args map[string]any) (InitPlan
 		return InitPlan{}, err
 	}
 	configPath := filepath.Join(root, ".aira", "config")
-	if _, err := os.Stat(configPath); err == nil {
-		return InitPlan{}, errors.New("E_ALREADY_INITIALIZED: .aira/config already exists")
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return InitPlan{}, err
+	adopt := false
+	var config Config
+	var data []byte
+	if existing, statErr := os.ReadFile(configPath); statErr == nil {
+		committed, err := exec.CommandContext(ctx, "git", "-C", root, "show", "HEAD:.aira/config").Output()
+		if err != nil {
+			return InitPlan{}, errors.New("E_ALREADY_INITIALIZED: .aira/config already exists")
+		}
+		if !bytes.Equal(existing, committed) {
+			return InitPlan{}, errors.New("E_CONFIG_INVALID: working .aira/config diverges from committed config")
+		}
+		config, err = readConfig(configPath)
+		if err != nil {
+			return InitPlan{}, err
+		}
+		if requested := stringArg(args, "project"); requested != "" && requested != config.Project.Slug {
+			return InitPlan{}, fmt.Errorf("E_CONFIG_INVALID: committed project slug mismatch: config=%s requested=%s", config.Project.Slug, requested)
+		}
+		if requested := stringSlice(args, "prefixes"); len(requested) > 0 {
+			for i := range requested {
+				requested[i] = strings.ToUpper(requested[i])
+			}
+			if strings.Join(requested, "\x00") != strings.Join(config.Project.Prefixes, "\x00") {
+				return InitPlan{}, fmt.Errorf("E_CONFIG_INVALID: committed project prefixes mismatch: config=%v requested=%v", config.Project.Prefixes, requested)
+			}
+		}
+		data = committed
+		adopt = true
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return InitPlan{}, statErr
 	}
-	slug := stringArg(args, "project")
-	if slug == "" {
-		slug = strings.ToLower(filepath.Base(root))
-	}
-	prefixes := stringSlice(args, "prefixes")
-	if len(prefixes) == 0 {
-		prefixes = []string{"AIRA"}
-	}
-	for i := range prefixes {
-		prefixes[i] = strings.ToUpper(prefixes[i])
-	}
-	config := Config{Schema: 1, Project: ProjectConfig{Slug: slug, Prefixes: prefixes}, Lease: LeaseConfig{TTLSeconds: 900, HeartbeatSeconds: 30}}
-	if err := validateConfig(config); err != nil {
-		return InitPlan{}, err
-	}
-	data, err := json.MarshalIndent(config, "", "  ")
-	if err != nil {
-		return InitPlan{}, err
-	}
-	data = append(data, '\n')
-	if err := os.MkdirAll(filepath.Join(root, ".aira", "tickets"), 0o755); err != nil {
-		return InitPlan{}, err
+	if !adopt {
+		slug := stringArg(args, "project")
+		if slug == "" {
+			slug = strings.ToLower(filepath.Base(root))
+		}
+		prefixes := stringSlice(args, "prefixes")
+		if len(prefixes) == 0 {
+			prefixes = []string{"AIRA"}
+		}
+		for i := range prefixes {
+			prefixes[i] = strings.ToUpper(prefixes[i])
+		}
+		config = Config{Schema: 1, Project: ProjectConfig{Slug: slug, Prefixes: prefixes}, Lease: LeaseConfig{TTLSeconds: 900, HeartbeatSeconds: 30}}
+		if err := validateConfig(config); err != nil {
+			return InitPlan{}, err
+		}
+		var err error
+		data, err = json.MarshalIndent(config, "", "  ")
+		if err != nil {
+			return InitPlan{}, err
+		}
+		data = append(data, '\n')
 	}
 	common, err := gitValue(ctx, root, "--git-common-dir")
 	if err != nil {
@@ -403,11 +492,17 @@ func PrepareInit(ctx context.Context, cwd string, args map[string]any) (InitPlan
 		Root: root, CommonDir: common, GitDir: gitDir,
 		ProjectID: hashID(canonicalCommon), WorktreeID: hashID(canonicalGitDir),
 		ConfigPath: configPath, Config: config, StateDir: stateDir(),
-	}, Data: data}, nil
+	}, Data: data, Adopt: adopt}, nil
 }
 
 // CommitInit writes the config prepared by PrepareInit.
 func CommitInit(plan InitPlan) error {
+	if plan.Adopt {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Join(plan.Project.Root, ".aira", "tickets"), 0o755); err != nil {
+		return err
+	}
 	return writeConfig(plan.Project.ConfigPath, plan.Data)
 }
 

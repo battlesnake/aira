@@ -52,6 +52,12 @@ type Server struct {
 	mu     sync.Mutex
 	db     *store.DB
 	scopes map[string]*scopeEntry
+	// ejecting is the in-memory guard spanning eject preconditions through the
+	// committed tombstone. Scope construction and discovery fail closed while a
+	// project is present here.
+	ejecting    map[string]struct{}
+	projectUses map[string]int
+	projectCond *sync.Cond
 	// coveredWorktrees is the registry-discovery membership index. Registry
 	// breadcrumbs cannot reconstruct the full scopes cache key, so coverage is
 	// recorded by its hash-derived worktree identity whenever a scope is added.
@@ -100,13 +106,16 @@ type Server struct {
 	storeOpRun               func(context.Context, *store.Store, StoreOpFrame) (any, error)
 	listRegistryEntries      func(string) ([]store.RegistryEntry, error)
 	discoverProject          func(context.Context, string) (app.Project, error)
+	adoptRebuild             func(context.Context, *store.Store) error
+	beforeEjectTransaction   func()
 	ensureCPUSlotsFn         func(string, int) (int, error)
 }
 
 func NewServer(paths Paths) *Server {
-	return &Server{
-		Paths: paths, DrainTimeout: 10 * time.Second, scopes: map[string]*scopeEntry{}, coveredWorktrees: map[string]struct{}{}, discoveryFailed: map[string]struct{}{},
-		watchSlots: make(chan struct{}, watchMaxConcurrent), watchPollInterval: defaultWatchPollInterval,
+	server := &Server{
+		Paths: paths, DrainTimeout: 10 * time.Second, scopes: map[string]*scopeEntry{}, ejecting: map[string]struct{}{}, coveredWorktrees: map[string]struct{}{}, discoveryFailed: map[string]struct{}{},
+		projectUses: map[string]int{},
+		watchSlots:  make(chan struct{}, watchMaxConcurrent), watchPollInterval: defaultWatchPollInterval,
 		admitSlots: make(chan struct{}, admitGlobalMax), admitPollInterval: defaultAdmitPollInterval,
 		admitQueues: map[string]*sliceQueue{},
 		admitConfineScan: func(path string) (runner.ConfineListResult, error) {
@@ -120,6 +129,8 @@ func NewServer(paths Paths) *Server {
 		storeOpHeavyTimeout:          5 * time.Minute,
 		storeOpWriteTimeout:          30 * time.Second,
 	}
+	server.projectCond = sync.NewCond(&server.mu)
+	return server
 }
 
 // maxUnixSocketPath is the AF_UNIX sun_path capacity on Linux (108 bytes,
@@ -376,23 +387,18 @@ func (s *Server) runReaper(ctx context.Context, interval time.Duration) {
 			return
 		case <-ticker.C:
 		}
-		s.mu.Lock()
-		byProject := make(map[string]*store.Store)
-		for _, entry := range s.scopes {
-			select {
-			case <-entry.ready:
-				byProject[entry.view.ProjectID()] = entry.view
-			default:
-			}
-		}
-		s.mu.Unlock()
+		byProject := s.readyProjectViewsForUse()
 		for projectID, view := range byProject {
-			if _, err := s.reap(ctx, view); err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf("aira daemon: reap project %s: %v", projectID, err)
-			}
 			if ctx.Err() != nil {
-				return
+				s.endProjectUse(projectID)
+				continue
 			}
+			func() {
+				defer s.endProjectUse(projectID)
+				if _, err := s.reap(ctx, view); err != nil && !errors.Is(err, context.Canceled) {
+					log.Printf("aira daemon: reap project %s: %v", projectID, err)
+				}
+			}()
 		}
 	}
 }
@@ -429,24 +435,47 @@ func (s *Server) runJournalFlusher(ctx context.Context, interval time.Duration) 
 // scopes, then flushes each project once. Extracted so a single pass is
 // deterministically testable.
 func (s *Server) flushReadyProjects(ctx context.Context) {
+	byProject := s.readyProjectViewsForUse()
+	for projectID, view := range byProject {
+		if ctx.Err() != nil {
+			s.endProjectUse(projectID)
+			continue
+		}
+		func() {
+			defer s.endProjectUse(projectID)
+			if _, err := s.flush(ctx, view); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("aira daemon: journal flush project %s: %v", projectID, err)
+			}
+		}()
+	}
+}
+
+// readyProjectViewsForUse snapshots each ready project and acquires one use
+// reference under the same mutex that installs eject's exclusion. A lifecycle
+// operation therefore either waits for the background pass or prevents the
+// pass from taking a view at all.
+func (s *Server) readyProjectViewsForUse() map[string]*store.Store {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	byProject := make(map[string]*store.Store)
 	for _, entry := range s.scopes {
 		select {
 		case <-entry.ready:
-			byProject[entry.view.ProjectID()] = entry.view
+			projectID := entry.view.ProjectID()
+			if _, blocked := s.ejecting[projectID]; blocked {
+				continue
+			}
+			byProject[projectID] = entry.view
 		default:
 		}
 	}
-	s.mu.Unlock()
-	for projectID, view := range byProject {
-		if _, err := s.flush(ctx, view); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("aira daemon: journal flush project %s: %v", projectID, err)
-		}
-		if ctx.Err() != nil {
-			return
-		}
+	if s.projectUses == nil {
+		s.projectUses = make(map[string]int)
 	}
+	for projectID := range byProject {
+		s.projectUses[projectID]++
+	}
+	return byProject
 }
 
 func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
@@ -500,6 +529,13 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		wrote = writeFrame(conn, responseFrame(s.confineManagement(ctx, request.Request))) == nil
 		return
 	}
+	if verb == "eject" {
+		if s.OnRequest != nil {
+			s.OnRequest(request.Scope, request.Request)
+		}
+		wrote = writeFrame(conn, responseFrame(s.eject(ctx, request.Request.Args))) == nil
+		return
+	}
 	if verb == "admit" {
 		if s.OnRequest != nil {
 			s.OnRequest(request.Scope, request.Request)
@@ -511,6 +547,14 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		_ = conn.SetReadDeadline(time.Time{})
 		s.admitConnection(conn, request.Request.Args)
 		return
+	}
+	if scope.ProjectID != "" {
+		release, err := s.beginProjectUse(scope.ProjectID)
+		if err != nil {
+			wrote = writeFrame(conn, responseFrame(lifecycleError(err))) == nil
+			return
+		}
+		defer release()
 	}
 	if isSupervisorLeaseVerb(verb) {
 		if s.OnRequest != nil {
@@ -636,14 +680,26 @@ func (s *Server) bootstrap(ctx context.Context, scope WorktreeScope, args map[st
 	}
 	digest := sha256.Sum256(configBytes)
 	configDigest := hex.EncodeToString(digest[:])
-	view, err := store.NewScope(s.db, store.ScopeOptions{
+	scopeOptions := store.ScopeOptions{
 		Root: planRoot, CommonDir: planCommon, GitDir: planGit,
 		ProjectID: projectID, WorktreeID: worktreeID,
 		ProjectSlug: plan.Project.Config.Project.Slug, Prefixes: plan.Project.Config.Project.Prefixes,
 		RequirementPrefixes: plan.Project.Config.Project.RequirementPrefixes, ReviewPolicy: reviewPolicy,
 		LeaseStateDir: filepath.Join(s.Paths.LeaseStateDir, worktreeID),
 		LeaseTTLNS:    uint64(plan.Project.Config.Lease.TTLSeconds) * uint64(time.Second), ConfigDigest: configDigest,
-	})
+		Bootstrap: true,
+	}
+	tombstoned, err := s.db.ProjectEjected(ctx, projectID)
+	if err != nil {
+		return lifecycleError(err)
+	}
+	lifecycleBootstrap := plan.Adopt || tombstoned
+	var view *store.Store
+	if lifecycleBootstrap {
+		view, err = store.NewUnregisteredScope(s.db, scopeOptions)
+	} else {
+		view, err = store.NewScope(s.db, scopeOptions)
+	}
 	if err != nil {
 		code := store.ErrorCode(err)
 		if strings.HasPrefix(err.Error(), CodeProjectInvalid) {
@@ -651,7 +707,35 @@ func (s *Server) bootstrap(ctx context.Context, scope WorktreeScope, args map[st
 		}
 		return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
 	}
-	if err := app.CommitInit(plan); err != nil {
+	if lifecycleBootstrap {
+		if err := view.PreflightAdoption(ctx); err != nil {
+			return lifecycleError(err)
+		}
+		if err := view.StageAdoption(ctx); err != nil {
+			return lifecycleError(err)
+		}
+		staged := true
+		defer func() {
+			if staged {
+				_ = view.RollbackStagedAdoption(context.Background())
+			}
+		}()
+		if plan.Adopt {
+			rebuild := func(ctx context.Context, view *store.Store) error { return view.Rebuild(ctx) }
+			if s.adoptRebuild != nil {
+				rebuild = s.adoptRebuild
+			}
+			if err := rebuild(ctx, view); err != nil {
+				return lifecycleError(err)
+			}
+		} else if err := app.CommitInit(plan); err != nil {
+			return lifecycleError(err)
+		}
+		if err := view.Register(ctx); err != nil {
+			return lifecycleError(err)
+		}
+		staged = false
+	} else if err := app.CommitInit(plan); err != nil {
 		code := store.ErrorCode(err)
 		return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
 	}
@@ -731,6 +815,10 @@ func (s *Server) storeForScope(scope WorktreeScope) (*store.Store, bool, error) 
 	}
 	key := strings.Join([]string{root, common, gitDir, worktreeID, scope.ConfigDigest}, "\x00")
 	s.mu.Lock()
+	if _, blocked := s.ejecting[projectID]; blocked {
+		s.mu.Unlock()
+		return nil, false, fmt.Errorf("E_NOT_ADOPTED: project %s is being ejected", projectID)
+	}
 	if cached := s.scopes[key]; cached != nil {
 		s.mu.Unlock()
 		<-cached.ready
@@ -755,7 +843,14 @@ func (s *Server) storeForScope(scope WorktreeScope) (*store.Store, bool, error) 
 	entry := &scopeEntry{view: view, ready: make(chan struct{})}
 	s.scopes[key] = entry
 	s.recordCoveredWorktreeLocked(worktreeID)
+	if s.projectUses == nil {
+		s.projectUses = make(map[string]int)
+	}
+	// Fresh scope construction continues with a reap after releasing s.mu.
+	// Count that tail as active so eject's exclusion waits for it to finish.
+	s.projectUses[projectID]++
 	s.mu.Unlock()
+	defer s.endProjectUse(projectID)
 	defer close(entry.ready)
 	if _, err := s.reap(context.Background(), view); err != nil {
 		log.Printf("aira daemon: initial reap project %s: %v", view.ProjectID(), err)

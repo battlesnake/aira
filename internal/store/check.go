@@ -15,6 +15,7 @@ var ExitCodes = map[string]int{
 	"E_CONFIG_MISSING": 2, "E_CONFIG_INVALID": 2, "E_NOT_PROJECT": 2,
 	"E_ID_INVALID": 2, "E_SELECTOR_INVALID": 2, "E_NOT_FOUND": 2,
 	"E_SELECTOR_AMBIGUOUS": 2, "E_UNKNOWN_VERB": 2,
+	"E_NOT_ADOPTED": 2, "E_NO_PROJECT": 2,
 	"E_ALREADY_INITIALIZED": 2,
 	"E_GLOB_INVALID":        2,
 	"E_DAEMON_UNAVAILABLE":  4, "E_DAEMON_BUSY": 4, "E_DAEMON_TIMEOUT": 3,
@@ -23,6 +24,7 @@ var ExitCodes = map[string]int{
 	"E_DB_BUSY":                4, "E_DB_CORRUPT": 4, "E_RECEIPT_IO": 4,
 	"E_RECONCILE_REQUIRED": 4, "E_GIT_SCAN": 4, "E_INTERNAL": 4,
 	"E_JOURNAL_CORRUPT": 4,
+	"E_SCHEMA_INVALID":  4, "E_EJECT_LIVE_STATE": 1, "E_EJECT_UNVERIFIED": 3, "E_PURGE_DIRTY": 1,
 	"E_FINDING_INVALID": 2, "E_WAIVER_REASON_REQUIRED": 2, "E_QUERY_INVALID": 2,
 	"E_REQUIREMENT_INVALID": 2,
 	"E_COMPUTE_INVALID":     2, "E_COMPUTE_PROVIDER_UNKNOWN": 2, "E_COMPUTE_CONSERVATION": 0,
@@ -432,6 +434,36 @@ func (s *Store) checkStaleIndex(report *CheckReport) error {
 		}
 		if digestBytes(data) != digest {
 			addWarning(report, CheckFinding{Code: "W_STALE_INDEX", Subject: id, Message: "indexed digest differs from ticket file", Kind: "warning"}, "stale-index")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	// Requirements are also durable .aira records. Unlike tickets, their
+	// projection is rebuilt wholesale, so retain this pre-rebuild check: eject
+	// must refuse an indexed requirement that has disappeared from disk just as
+	// it refuses an indexed ticket that has disappeared.
+	rows, err = s.db.Query(`SELECT id, path FROM requirements WHERE project_id=? AND worktree_id=?`, s.projectID, s.worktreeID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, path string
+		if err := rows.Scan(&id, &path); err != nil {
+			return err
+		}
+		if _, statErr := os.Lstat(path); statErr != nil {
+			if errors.Is(statErr, os.ErrNotExist) {
+				addWarning(report, CheckFinding{Code: "W_STALE_INDEX", Subject: id, Message: "indexed requirement file is missing", Kind: "warning"}, "stale-index")
+				continue
+			}
+			return statErr
 		}
 	}
 	return rows.Err()

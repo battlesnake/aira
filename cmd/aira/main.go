@@ -128,6 +128,28 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		request.Args["owner"] = owner
 		return dispatchConfineManagementRequest(context.Background(), request, jsonOutput, stdout, stderr, injected)
 	}
+	if verb == "eject" {
+		request, requestErr := buildRequest(verb, positional, options)
+		if requestErr != nil {
+			code := store.ErrorCode(requestErr)
+			return render(core.Response{Code: code, Error: requestErr.Error(), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
+		}
+		if request.Args["project"] == "" && request.Args["prefix"] == "" {
+			project, discoverErr := app.Discover(context.Background(), ".")
+			if discoverErr != nil {
+				return render(core.Response{Code: "E_NO_PROJECT", Error: "E_NO_PROJECT: no selector and no current .aira/config", Exit: store.ExitForCode("E_NO_PROJECT")}, jsonOutput, stdout, stderr)
+			}
+			request.Args["project"] = project.ProjectID
+		}
+		dispatcher := injected
+		if dispatcher == nil {
+			dispatcher, err = newDaemonDispatcher(stdin, stdout, stderr, jsonOutput)
+			if err != nil {
+				return render(transportErrorResponse(err), jsonOutput, stdout, stderr)
+			}
+		}
+		return render(dispatcher.Dispatch(context.Background(), daemon.WorktreeScope{}, request), jsonOutput, stdout, stderr)
+	}
 
 	if verb == "init" {
 		requestArgs := map[string]any{}
@@ -433,7 +455,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 			continue
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "rebuild" || name == "steal" || name == "strict" || (name == "close" && verb == "run-input") || (name == "from-start" && verb == "watch") || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && verb == "run-log") || (name == "reasoning-subset" && verb == "spend") || (name == "all" && verb == "test-report") || (name == "unreviewed" && verb == "rant") {
+		if name == "rebuild" || name == "steal" || name == "strict" || ((name == "purge" || name == "force") && verb == "eject") || (name == "close" && verb == "run-input") || (name == "from-start" && verb == "watch") || (name == "list" && verb == "ready") || ((name == "follow" || name == "full") && verb == "run-log") || (name == "reasoning-subset" && verb == "spend") || (name == "all" && verb == "test-report") || (name == "unreviewed" && verb == "rant") {
 			options[name] = "true"
 			continue
 		}
@@ -453,7 +475,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 				options["labels"] += ","
 			}
 			options["labels"] += argv[i]
-		} else if name == "prefix" {
+		} else if name == "prefix" && verb == "init" {
 			if options["prefixes"] != "" {
 				options["prefixes"] += ","
 			}
@@ -471,6 +493,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 	}
 	allowed := map[string]map[string]bool{
 		"init":   {"project": true, "prefixes": true},
+		"eject":  {"project": true, "prefix": true, "purge": true, "force": true},
 		"create": {"kind": true, "severity": true, "labels": true, "body": true},
 		"rant":   {"tag": true, "severity": true, "ref": true, "idem": true, "by": true, "unreviewed": true, "since": true, "outcome": true, "note": true, "resolved-by": true},
 		"new":    {"kind": true, "severity": true, "labels": true, "body": true},
@@ -1051,6 +1074,22 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		if options["prefixes"] != "" {
 			args["prefixes"] = splitComma(options["prefixes"])
 		}
+	case "eject":
+		if len(positional) > 1 {
+			return core.Request{}, errors.New("E_SELECTOR_AMBIGUOUS: eject accepts at most one project selector")
+		}
+		project := options["project"]
+		if len(positional) == 1 {
+			if project != "" || options["prefix"] != "" {
+				return core.Request{}, errors.New("E_SELECTOR_AMBIGUOUS: choose one eject selector")
+			}
+			project = positional[0]
+		}
+		if project != "" && options["prefix"] != "" {
+			return core.Request{}, errors.New("E_SELECTOR_AMBIGUOUS: choose --project or --prefix")
+		}
+		args["project"], args["prefix"] = project, options["prefix"]
+		args["purge"], args["force"] = options["purge"] == "true", options["force"] == "true"
 	case "run":
 		if len(positional) == 0 {
 			return core.Request{}, fmt.Errorf("E_RUN_ARGUMENT_INVALID: run target argv is empty")

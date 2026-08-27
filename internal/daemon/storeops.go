@@ -171,6 +171,11 @@ func decodeStoreOpPayload(payload json.RawMessage, value any) error {
 }
 
 func (s *Server) serveStoreOp(scope WorktreeScope, frame StoreOpFrame) ResponseFrame {
+	release, useErr := s.beginProjectUse(scope.ProjectID)
+	if useErr != nil {
+		return storeOpErrorFrame(useErr)
+	}
+	defer release()
 	if frame.Op == "ensure-scope" {
 		return responseFrame(s.ensureScope(context.Background(), scope))
 	}

@@ -686,6 +686,18 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return c.initializer(ctx, map[string]any{"project": stringArg(args, "project"), "prefixes": stringSlice(args, "prefixes")})
 		}},
+		"eject": {Name: "eject", Usage: "eject [project-id] [--prefix P | --project ID] [--purge] [--force]", Args: []ArgSpec{
+			stringSpec("project", false, true, "Exact or unambiguous project ID prefix"),
+			stringSpec("prefix", false, false, "Owned ID prefix"),
+			boolSpec("purge", false, false, "Remove .aira after a clean durability check"),
+			boolSpec("force", false, false, "Override live-state, gone-root, and dirty-purge guards"),
+		}, Run: func(_ context.Context, args *argAccessor) (any, error) {
+			_ = stringArg(args, "project")
+			_ = stringArg(args, "prefix")
+			_ = boolArg(args, "purge")
+			_ = boolArg(args, "force")
+			return nil, errors.New("E_DAEMON_UNAVAILABLE: eject requires the project-less daemon transport")
+		}},
 		"id": {Name: "id", Usage: "id <prefix>", Args: []ArgSpec{stringSpec("prefix", true, true, "ID prefix")}, MCPTool: "aira_id", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			prefix := stringArg(args, "prefix")
 			id, err := c.store.AllocateID(ctx, prefix)
@@ -1939,6 +1951,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 func applyDispatchMetadata(verbs map[string]verbSpec) {
 	metadata := map[string]verbMetadata{
 		"init":   {summary: "Initialise AIRA for the current project", safety: SafetyReconcile, example: []string{"--project", "demo", "--prefix", "AIRA"}},
+		"eject":  {summary: "Deregister a project after durability and live-state checks", safety: SafetyReconcile, destructive: true, example: []string{"--prefix", "AIRA", "--force"}},
 		"id":     {summary: "Allocate the next ticket identifier", safety: SafetyMutate, example: []string{"AIRA"}},
 		"create": {summary: "Create a ticket", safety: SafetyMutate, example: []string{"AIRA ticket", "--kind", "feature", "--severity", "P1", "--body", "body", "--label", "label"}},
 		"rant": {summary: "Capture and review agent friction", safety: SafetyMutate, operations: []OperationSpec{
@@ -2049,7 +2062,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		if !ok {
 			panic("missing dispatch metadata for " + name)
 		}
-		spec.Summary, spec.Safety, spec.Destructive, spec.Include = entry.summary, entry.safety, entry.destructive, name != "confine" && name != "confine-reserve" && name != "install"
+		spec.Summary, spec.Safety, spec.Destructive, spec.Include = entry.summary, entry.safety, entry.destructive, name != "confine" && name != "confine-reserve" && name != "install" && name != "eject"
 		spec.Example = copyExample(entry.example)
 		spec.Operations = append([]OperationSpec(nil), entry.operations...)
 		verbs[name] = spec

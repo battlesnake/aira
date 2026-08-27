@@ -16,7 +16,6 @@ import (
 	"strings"
 	"time"
 
-	"aira/internal/store"
 	"golang.org/x/sys/unix"
 )
 
@@ -950,25 +949,19 @@ func (s *Server) emitWatchdogEvent(ctx context.Context, event watchdogEvent) err
 	if err != nil {
 		return err
 	}
-	s.mu.Lock()
-	byProject := make(map[string]*store.Store)
-	for _, entry := range s.scopes {
-		select {
-		case <-entry.ready:
-			byProject[entry.view.ProjectID()] = entry.view
-		default:
-		}
-	}
-	s.mu.Unlock()
+	byProject := s.readyProjectViewsForUse()
 	if len(byProject) == 0 {
 		log.Printf("aira daemon: watchdog audit unrouted: no ready scope: %s", payload)
 		return nil
 	}
 	var errs []error
 	for projectID, view := range byProject {
-		if err := view.AppendWatchdogEvent(ctx, "watchdog."+event.Decision, string(payload)); err != nil {
-			errs = append(errs, fmt.Errorf("project %s: %w", projectID, err))
-		}
+		func() {
+			defer s.endProjectUse(projectID)
+			if err := view.AppendWatchdogEvent(ctx, "watchdog."+event.Decision, string(payload)); err != nil {
+				errs = append(errs, fmt.Errorf("project %s: %w", projectID, err))
+			}
+		}()
 	}
 	return errors.Join(errs...)
 }

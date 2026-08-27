@@ -129,6 +129,16 @@ func (d *daemonDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeSc
 	if canonical == "confine-list" || canonical == "confine-kill" {
 		return d.dispatchConfineManagement(ctx, request)
 	}
+	if canonical == "eject" {
+		frame := daemon.RequestFrame{Proto: daemon.ProtocolVersion, Scope: daemon.WorktreeScope{}, Request: request}
+		response, err := d.exchangeWithReplacement(ctx, func(ctx context.Context) (daemon.ResponseFrame, error) {
+			return d.exchangeOrStart(ctx, frame)
+		})
+		if err != nil {
+			return transportErrorResponse(err)
+		}
+		return response.CoreResponse()
+	}
 	stampRantCaller(&request)
 	stampGitContext(scope, &request)
 	if route == core.RouteClient {

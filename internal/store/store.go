@@ -102,6 +102,7 @@ type ScopeOptions struct {
 	MaxCommandAgeDays   int
 	MaxQuotaSnapshots   int
 	ConfigDigest        string
+	Bootstrap           bool
 	Clock               Clock
 }
 
@@ -155,6 +156,7 @@ type Store struct {
 	maxCommandAgeDays int
 	maxQuotaSnapshots int
 	clock             Clock
+	bootstrap         bool
 	runner            Execution
 	// beforeMaterialise is intentionally nil in production; tests use it to
 	// observe the receipt-before-file ordering at the crash boundary.
@@ -320,7 +322,7 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	// GitDir did not exist in the pre-M21 Options API. Keep that source-level
 	// compatibility for isolated in-process callers; production discovery and
 	// every daemon descriptor provide GitDir and take the checked path.
-	s, err := newScopeContext(ctx, db, scopeOpts, opts.GitDir != "")
+	s, err := newScopeContext(ctx, db, scopeOpts, opts.GitDir != "", true)
 	if err != nil {
 		_ = db.Close()
 		return nil, err
@@ -387,7 +389,7 @@ func OpenReadOnly(dbPath string, opts ScopeOptions) (*Store, error) {
 		maxReports: opts.MaxReports, maxAgeDays: opts.MaxAgeDays,
 		maxComputeEvents: opts.MaxComputeEvents, maxComputeAgeDays: opts.MaxComputeAgeDays,
 		maxCommandEvents: opts.MaxCommandEvents, maxCommandAgeDays: opts.MaxCommandAgeDays,
-		maxQuotaSnapshots: opts.MaxQuotaSnapshots, clock: opts.Clock,
+		maxQuotaSnapshots: opts.MaxQuotaSnapshots, clock: opts.Clock, bootstrap: opts.Bootstrap,
 	}
 	if s.maxReports == 0 {
 		s.maxReports = 5000
@@ -537,10 +539,17 @@ func openOnce(ctx context.Context, dbPath, registryPath string) (*DB, error) {
 // identities are always recomputed from canonical paths; supplied identities
 // are evidence to validate, never authority.
 func NewScope(db *DB, opts ScopeOptions) (*Store, error) {
-	return newScopeContext(context.Background(), db, opts, true)
+	return newScopeContext(context.Background(), db, opts, true, true)
 }
 
-func newScopeContext(ctx context.Context, db *DB, opts ScopeOptions, checkIdentity bool) (*Store, error) {
+// NewUnregisteredScope builds a checked view without Register side effects.
+// Lifecycle durability checks use it while the daemon's project exclusion is
+// active, so checking a project can never resurrect it.
+func NewUnregisteredScope(db *DB, opts ScopeOptions) (*Store, error) {
+	return newScopeContext(context.Background(), db, opts, true, false)
+}
+
+func newScopeContext(ctx context.Context, db *DB, opts ScopeOptions, checkIdentity, register bool) (*Store, error) {
 	if db == nil || db.db == nil {
 		return nil, errors.New("E_CONFIG_INVALID: DB is unavailable")
 	}
@@ -596,7 +605,7 @@ func newScopeContext(ctx context.Context, db *DB, opts ScopeOptions, checkIdenti
 		maxReports: opts.MaxReports, maxAgeDays: opts.MaxAgeDays,
 		maxComputeEvents: opts.MaxComputeEvents, maxComputeAgeDays: opts.MaxComputeAgeDays,
 		maxCommandEvents: opts.MaxCommandEvents, maxCommandAgeDays: opts.MaxCommandAgeDays,
-		maxQuotaSnapshots: opts.MaxQuotaSnapshots, clock: opts.Clock,
+		maxQuotaSnapshots: opts.MaxQuotaSnapshots, clock: opts.Clock, bootstrap: opts.Bootstrap,
 	}
 	if s.maxReports == 0 {
 		s.maxReports = 5000
@@ -639,6 +648,9 @@ func newScopeContext(ctx context.Context, db *DB, opts ScopeOptions, checkIdenti
 			return nil, fmt.Errorf("E_PREFIX_OWNERSHIP_CONFLICT: prefix %q registered as both ticket and requirement", up)
 		}
 		s.prefixes[up] = kindRequirement
+	}
+	if !register {
+		return s, nil
 	}
 	var lastErr error
 	for attempt := 0; attempt < storeOpenRetries; attempt++ {
@@ -732,6 +744,9 @@ func (s *Store) RunnerConfigured() bool { return s != nil && s.runner != nil }
 
 // ProjectID returns the path-derived project identity owned by this scope.
 func (s *Store) ProjectID() string { return s.projectID }
+
+// WorktreeID returns the path-derived worktree identity owned by this scope.
+func (s *Store) WorktreeID() string { return s.worktreeID }
 
 func (s *Store) initDB(ctx context.Context) error {
 	statements := []string{
@@ -1457,6 +1472,17 @@ func findingsHasCompositePrimaryKey(ctx context.Context, db interface {
 // Register refreshes this project/worktree registration and validates global
 // prefix ownership. NewScope already calls it once while constructing a scope.
 func (s *Store) Register(ctx context.Context) error {
+	if s.bootstrap {
+		return s.RegisterBootstrap(ctx)
+	}
+	var ejected int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM ejections WHERE project_id=?`, s.projectID).Scan(&ejected)
+	if err == nil {
+		return fmt.Errorf("E_NOT_ADOPTED: project %s was ejected; run aira init to re-adopt", s.projectID)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return translateDBError(err)
+	}
 	entry := registryEntry{
 		ProjectID: s.projectID, CommonDir: s.commonDir, WorktreeID: s.worktreeID,
 		Root: s.root, Prefixes: s.prefixesByKind(kindTicket), RequirementPrefixes: s.prefixesByKind(kindRequirement),
@@ -1467,8 +1493,43 @@ func (s *Store) Register(ctx context.Context) error {
 	if err := appendJSONLine(s.registryPath, entry, s.registryPath+".lock"); err != nil {
 		return err
 	}
+	return s.registerDB(ctx, false)
+}
+
+// RegisterBootstrap is the only registration path allowed to clear an eject
+// tombstone. It is called by explicit init after any adoption rebuild has
+// succeeded; ordinary discovery and verbs always use Register.
+func (s *Store) RegisterBootstrap(ctx context.Context) error {
+	var one int
+	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM ejections WHERE project_id=?`, s.projectID).Scan(&one); err == nil {
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return translateDBError(err)
+	}
+	entry := registryEntry{
+		ProjectID: s.projectID, CommonDir: s.commonDir, WorktreeID: s.worktreeID,
+		Root: s.root, Prefixes: s.prefixesByKind(kindTicket), RequirementPrefixes: s.prefixesByKind(kindRequirement),
+		At: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if err := appendJSONLine(s.registryPath, entry, s.registryPath+".lock"); err != nil {
+		return err
+	}
+	if err := s.registerDB(ctx, true); err != nil {
+		if trimErr := TrimRegistryProject(s.registryPath, s.projectID); trimErr != nil {
+			return fmt.Errorf("%w; bootstrap registry rollback failed: %v", err, trimErr)
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Store) registerDB(ctx context.Context, bootstrap bool) error {
 	return s.withImmediate(ctx, func(conn *sql.Conn) error {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
+		if bootstrap {
+			if _, err := conn.ExecContext(ctx, `DELETE FROM ejections WHERE project_id=?`, s.projectID); err != nil {
+				return err
+			}
+		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO projects(project_id, slug, common_dir, config_digest, created_at)
 			VALUES(?, ?, ?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET slug=excluded.slug, common_dir=excluded.common_dir, config_digest=excluded.config_digest`,
 			s.projectID, s.projectSlug, s.commonDir, s.configDigest, now); err != nil {
@@ -1483,7 +1544,9 @@ func (s *Store) Register(ctx context.Context) error {
 			var owner, ownerKind string
 			err := conn.QueryRowContext(ctx, `SELECT project_id, kind FROM prefix_ownership WHERE prefix=?`, prefix).Scan(&owner, &ownerKind)
 			if err == nil && owner != s.projectID {
-				return fmt.Errorf("E_PREFIX_OWNERSHIP_CONFLICT: %s owned by %s", prefix, owner)
+				var root string
+				_ = conn.QueryRowContext(ctx, `SELECT root FROM worktrees WHERE project_id=? AND active=1 ORDER BY updated_at DESC LIMIT 1`, owner).Scan(&root)
+				return fmt.Errorf("E_PREFIX_OWNERSHIP_CONFLICT: %s owned by project %s at %s; run aira eject --project %s", prefix, owner, root, owner)
 			}
 			if err == nil && normaliseKind(ownerKind) != kind {
 				// A prefix's kind is immutable: it may not be re-registered under

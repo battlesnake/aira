@@ -416,7 +416,7 @@ func TestDestructiveOperationsAreExplicit(t *testing.T) {
 			}
 		}
 	}
-	if want := []string{"confine-kill", "rant redact"}; !reflect.DeepEqual(destructive, want) {
+	if want := []string{"confine-kill", "eject", "rant redact"}; !reflect.DeepEqual(destructive, want) {
 		t.Fatalf("destructive descriptors=%v, want %v", destructive, want)
 	}
 }
@@ -428,9 +428,19 @@ func TestCanonicalDispatchNamesAndAliases(t *testing.T) {
 		got = append(got, descriptor.Name)
 	}
 	sort.Strings(got)
-	want := []string{"check", "claim", "commands", "confine", "confine-kill", "confine-list", "confine-reserve", "count", "create", "find", "gate", "git", "grep", "heartbeat", "help", "id", "import", "init", "insights", "install", "lease", "link", "list", "mv", "quota", "rant", "ready", "reconcile", "release", "req", "review", "run", "run-input", "run-kill", "run-log", "set", "show", "spend", "test-report", "time", "touch", "unlink"}
+	want := []string{"check", "claim", "commands", "confine", "confine-kill", "confine-list", "confine-reserve", "count", "create", "eject", "find", "gate", "git", "grep", "heartbeat", "help", "id", "import", "init", "insights", "install", "lease", "link", "list", "mv", "quota", "rant", "ready", "reconcile", "release", "req", "review", "run", "run-input", "run-kill", "run-log", "set", "show", "spend", "test-report", "time", "touch", "unlink"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("dispatch names=%v, want=%v", got, want)
+	}
+}
+
+func TestEjectDescriptorIsCLIOnly(t *testing.T) {
+	descriptor, ok := descriptorByName(New(nil).DispatchDescriptors(), "eject")
+	if !ok {
+		t.Fatal("eject descriptor missing")
+	}
+	if descriptor.MCPTool != "" || descriptor.Include {
+		t.Fatalf("eject leaked into generated non-CLI faces: %+v", descriptor)
 	}
 }
 

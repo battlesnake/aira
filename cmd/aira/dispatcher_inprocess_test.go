@@ -1344,6 +1344,46 @@ func TestRoutedInitRenderingMatchesInProcessFieldOrder(t *testing.T) {
 	}
 }
 
+func TestEjectCLIUsesProjectlessMachineRouteAndPreservesSelectors(t *testing.T) {
+	var gotScope daemon.WorktreeScope
+	var gotRequest core.Request
+	dispatcher := dispatcherFunc(func(_ context.Context, scope daemon.WorktreeScope, request core.Request) core.Response {
+		gotScope, gotRequest = scope, request
+		return core.Response{OK: true, Code: "OK", Data: map[string]any{"project_id": "p"}}
+	})
+	var stdout, stderr bytes.Buffer
+	exit := runWithInputDispatcher([]string{"eject", "--prefix", "LIFE", "--purge", "--force"}, &stdout, &stderr, strings.NewReader(""), dispatcher)
+	if exit != 0 {
+		t.Fatalf("exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
+	}
+	if gotScope.Root != "" || gotScope.ProjectID != "" || gotScope.WorktreeID != "" || len(gotScope.Prefixes) != 0 {
+		t.Fatalf("eject carried project scope: %+v", gotScope)
+	}
+	if gotRequest.Verb != "eject" || gotRequest.Args["prefix"] != "LIFE" || gotRequest.Args["purge"] != true || gotRequest.Args["force"] != true {
+		t.Fatalf("request=%#v", gotRequest)
+	}
+}
+
+func TestEjectWithoutSelectorAndWithoutCurrentConfigIsENoProject(t *testing.T) {
+	cwd := t.TempDir()
+	if err := exec.Command("git", "-C", cwd, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(cwd)
+	called := false
+	dispatcher := dispatcherFunc(func(context.Context, daemon.WorktreeScope, core.Request) core.Response {
+		called = true
+		return core.Response{OK: true, Code: "OK"}
+	})
+	var stdout, stderr bytes.Buffer
+	if exit := runWithInputDispatcher([]string{"eject"}, &stdout, &stderr, strings.NewReader(""), dispatcher); exit != store.ExitForCode("E_NO_PROJECT") {
+		t.Fatalf("exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
+	}
+	if called || !strings.Contains(stderr.String(), "E_NO_PROJECT") {
+		t.Fatalf("called=%v stderr=%q", called, stderr.String())
+	}
+}
+
 func runInProcessWithInput(argv []string, stdout, stderr io.Writer, stdin io.Reader) int {
 	dispatcher := &inProcessDispatcher{stdin: stdin, stdout: stdout, diagnostics: stderr}
 	return runWithInputDispatcher(argv, stdout, stderr, stdin, dispatcher)
