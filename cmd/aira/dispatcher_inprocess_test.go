@@ -1364,6 +1364,37 @@ func TestEjectCLIUsesProjectlessMachineRouteAndPreservesSelectors(t *testing.T) 
 	}
 }
 
+// verifies: MCP eject is decoded and sent through the daemon dispatcher even
+// when MCP is started outside an adopted project. The injected dispatcher is
+// the daemon-transport seam; the in-process eject handler would instead return
+// E_DAEMON_UNAVAILABLE.
+func TestMCPEjectUsesProjectlessDaemonRouteAndPreservesSelectors(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	t.Setenv("XDG_RUNTIME_DIR", shortRuntimeDir(t))
+	called := false
+	dispatcher := dispatcherFunc(func(_ context.Context, scope daemon.WorktreeScope, request core.Request) core.Response {
+		called = true
+		if scope.Root != "" || scope.ProjectID != "" || scope.WorktreeID != "" || len(scope.Prefixes) != 0 {
+			t.Fatalf("eject carried project scope: %+v", scope)
+		}
+		want := core.Request{Verb: "eject", Args: map[string]any{"prefix": "X", "force": true}}
+		if !reflect.DeepEqual(request, want) {
+			t.Fatalf("request=%#v, want %#v", request, want)
+		}
+		return core.Response{OK: true, Code: "OK", Data: map[string]any{"routed": "daemon"}}
+	})
+	input := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"aira_eject","arguments":{"prefix":"X","force":true}}}` + "\n")
+	var output, diagnostics bytes.Buffer
+	if exit := runMCPWithDispatcher(context.Background(), input, &output, &diagnostics, dispatcher); exit != 0 {
+		t.Fatalf("MCP exit=%d output=%q diagnostics=%q", exit, output.String(), diagnostics.String())
+	}
+	if !called || !strings.Contains(output.String(), `"code":"OK"`) || strings.Contains(output.String(), "E_DAEMON_UNAVAILABLE") {
+		t.Fatalf("called=%v output=%q", called, output.String())
+	}
+}
+
 func TestEjectWithoutSelectorAndWithoutCurrentConfigIsENoProject(t *testing.T) {
 	cwd := t.TempDir()
 	if err := exec.Command("git", "-C", cwd, "init", "-q").Run(); err != nil {

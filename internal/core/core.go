@@ -691,7 +691,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("prefix", false, false, "Owned ID prefix"),
 			boolSpec("purge", false, false, "Remove .aira after a clean durability check"),
 			boolSpec("force", false, false, "Override live-state, gone-root, and dirty-purge guards"),
-		}, Run: func(_ context.Context, args *argAccessor) (any, error) {
+		}, MCPTool: "aira_eject", Run: func(_ context.Context, args *argAccessor) (any, error) {
 			_ = stringArg(args, "project")
 			_ = stringArg(args, "prefix")
 			_ = boolArg(args, "purge")
@@ -2062,7 +2062,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		if !ok {
 			panic("missing dispatch metadata for " + name)
 		}
-		spec.Summary, spec.Safety, spec.Destructive, spec.Include = entry.summary, entry.safety, entry.destructive, name != "confine" && name != "confine-reserve" && name != "install" && name != "eject"
+		spec.Summary, spec.Safety, spec.Destructive, spec.Include = entry.summary, entry.safety, entry.destructive, name != "confine" && name != "confine-reserve" && name != "install"
 		spec.Example = copyExample(entry.example)
 		spec.Operations = append([]OperationSpec(nil), entry.operations...)
 		verbs[name] = spec

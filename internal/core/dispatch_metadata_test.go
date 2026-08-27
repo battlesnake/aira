@@ -434,13 +434,13 @@ func TestCanonicalDispatchNamesAndAliases(t *testing.T) {
 	}
 }
 
-func TestEjectDescriptorIsCLIOnly(t *testing.T) {
+func TestEjectDescriptorIsDestructiveMCPTool(t *testing.T) {
 	descriptor, ok := descriptorByName(New(nil).DispatchDescriptors(), "eject")
 	if !ok {
 		t.Fatal("eject descriptor missing")
 	}
-	if descriptor.MCPTool != "" || descriptor.Include {
-		t.Fatalf("eject leaked into generated non-CLI faces: %+v", descriptor)
+	if descriptor.MCPTool != "aira_eject" || !descriptor.Include || descriptor.Safety != SafetyReconcile || !descriptor.Destructive {
+		t.Fatalf("eject descriptor=%+v, want included destructive aira_eject", descriptor)
 	}
 }
 
