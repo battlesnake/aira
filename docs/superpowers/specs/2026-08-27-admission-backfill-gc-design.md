@@ -37,25 +37,43 @@ FIFO order and still recomputes `jobs`/`headroom`/`available` per waiter (so the
   strict FIFO — so freed reserve accumulates for the starving head instead of
   being backfilled away.
 
-**Starvation-freedom argument.** Backfill can only delay the head by consuming
-idle reserve that would otherwise sit unused (the head does not fit it anyway).
-Once the head has waited `admitBackfillGrace`, freezing halts *new* backfill, so
-from that point the head's admission is gated only by already-running jobs (and
-grace-window backfillers) finishing and freeing reserve — a process independent
-of any further backfill. The head therefore admits within its natural
-reserve-wait plus a bounded backfill overhang, never indefinitely. (Strict FIFO
-today has zero head delay but wastes idle capacity; this trades a *bounded* head
-delay for utilisation — the standard backfill trade, with `admitBackfillGrace`
-the knob.)
+**Starvation-freedom (honest guarantee).** Two facts, both grounded in the
+current code, bound the head:
+- **No perpetual starvation.** Once the head has waited `admitBackfillGrace`,
+  freezing halts *new* backfill. `queue.waiters` is FIFO (seq assigned under
+  `queue.mu` at append; releases preserve order), so the first non-fitting queued
+  waiter *is* the oldest blocked one, and the freeze boolean derives from the
+  immutable `enqueued` — monotone across passes, with accrued age transferring on
+  timeout/disconnect (no reset-to-zero ladder). After the freeze, no waiter is
+  granted ahead of the head, so its admission is gated only by the **finite,
+  fixed-at-freeze set** of in-flight jobs finishing. Since every job terminates,
+  the head is never delayed by an unbounded *stream* of new small jobs — the real
+  starvation risk a naïve skip-to-fit would create.
+- **The residual is capped and honest.** A single grace-window backfiller whose
+  reserve straddles the head's threshold can extend the head by *that one job's*
+  runtime — this is the accepted trade (we deliberately do **not** predict
+  runtimes). But this is not an infinite hang: the existing `admitWaitCapMs`
+  (30-min hard cap, admit.go) converts any residual head wait into an honest
+  `saturated` **rejection**, exactly as today. So the head either admits or is
+  told `saturated` within the existing bound — never silently hangs.
 
-- `admitBackfillGrace` is a daemon setting (`AIRA_DAEMON_ADMIT_BACKFILL_GRACE`,
-  duration, default **60s**; `0` disables backfill = today's strict FIFO, the
-  safe fallback). Parsed with the existing duration-setting helper; an invalid
-  value falls back to the default with a one-time log (fail-safe to a valid grace,
-  never to unbounded backfill).
-- The `current == 0 / no established scope` guard (admit.go:558-578) that leaves
-  waiters queued to preserve the ledger invariant is **unchanged** — backfill runs
-  only in the branch that already grants.
+(Strict FIFO today has zero head delay but wastes idle capacity; this trades a
+head delay — bounded by the pre-freeze jobs' completion and ultimately by the
+30-min cap → honest rejection — for utilisation. `admitBackfillGrace` is the knob;
+`0` = today's exact strict FIFO.)
+
+- `admitBackfillGrace` is a daemon setting via a new `admitBackfillGraceFromEnv`
+  (`AIRA_DAEMON_ADMIT_BACKFILL_GRACE`, duration; default **60s**) that follows the
+  **exact pattern of its siblings** (`admitPollIntervalFromEnv`,
+  `reapIntervalFromEnv`, `scopeReapIntervalFromEnv` in paths.go): an invalid value
+  returns `E_CONFIG_INVALID` and **hard-fails daemon startup** (propagated at
+  server.go), never a silent fallback; `"0"`/`"disabled"` is accepted (the
+  `reapIntervalFromEnv` precedent) and means **strict FIFO** (backfill off) —
+  today's exact loop.
+- The fail-closed guard that leaves waiters queued when the slice is unreadable is
+  the `readMemory` `!ok` return (admit.go ~572-582), **not** a `current==0` check
+  (`current==0` is a valid empty slice). It is **unchanged** — backfill runs
+  strictly inside the granting branch that executes *after* that guard.
 - `waited`/`outcome` reporting is unchanged: a backfilled waiter that was skipped
   on a prior pass still reports `waited`; the protected head reports `waited`.
 - The poll ticker + release-driven re-evaluation already re-run
@@ -64,24 +82,39 @@ the knob.)
 
 ## AIRA-5: periodic gc.collect (≤ 1 / 10 s per worker)
 
-In `pytest_runtest_protocol` (governor `__init__.py`, :288), **after the test's
-`yield` completes**, run a proactive `gc.collect()` — but at most once per
-`AIRA_GC_MIN_INTERVAL` (default **10s**) per worker process, tracked by a
-module-global monotonic `_last_gc` timestamp:
+In `pytest_runtest_protocol` (governor `__init__.py`, the hookwrapper at ~:287),
+**after the test's `yield` completes**, run a proactive `gc.collect()` — but at
+most once per `interval` (default **10s**) per worker process:
 
-- After each test: `if time.monotonic() − _last_gc ≥ interval: gc.collect();
-  _last_gc = now`.
-- The **existing before-block collects** (`_acquire_slot` :148 and the RAM-reserve
-  wait, if present) stay **unconditional** (they must run before reserving) and
-  **also refresh `_last_gc`** — so the after-test collect is genuinely "at most
-  once per 10s, *excluding* the always-collect-before-block", and we never
-  double-collect immediately after a block.
-- `_last_gc` is per xdist worker process (module global), which is correct — each
-  worker paces its own gc.
-- **Fail-open**: the whole periodic-collect is wrapped so any error is swallowed
-  (a governor hiccup never fails a test); `interval ≤ 0` disables it.
+- The after-test cadence uses its **own** timestamp `_last_after_test_gc`,
+  **initialized at module import to `time.monotonic()`** (per worker process).
+  Import-init matters: `time.monotonic()` is host uptime, so a `0`/None sentinel
+  would fire a collect on the very first test of every worker — flipping the
+  existing free-slot `wantGC:""` case of `TestRealPytestGCCollectsOnceOnlyWhenSleeping`
+  (pytest_integration_test.go). With import-init the first after-test collect is
+  genuinely ≤`interval` from worker start.
+- **The before-block collects do NOT touch `_last_after_test_gc`** — honouring the
+  owner's "at most once per 10s *excluding* the always-collect-before-blocking".
+  The after-test collect paces independently of blocking, so a worker that gets
+  CPU+RAM immediately (never blocks, never collects) still collects ≤1/10s.
+- **Before-block collects are made consistent across *both* wait paths, and are
+  independent of the after-test timer.** Today only `_acquire_slot` (:148) collects
+  before waiting; `_acquire_reservation` (the RAM `confine-reserve` wait) does
+  **not**, so a worker that gets a CPU slot then blocks on RAM performs no pre-block
+  collection. Add the same unconditional `gc.collect()`-before-first-sleep to the
+  RAM-reservation wait, each path keeping its own once-per-wait latch (like
+  `_acquire_slot`'s `collected`). These before-block collects deliberately do
+  **not** read or write `_last_after_test_gc` — they are the always-on,
+  not-rate-limited collects the owner's "excluding" clause carves out.
+- `interval` is read via `_setting(..., allow_zero=True)` (the `_setting` contract:
+  a negative value raises, zero needs `allow_zero=True`); `interval == 0` disables
+  the after-test collect. The whole after-test block is **fail-open** — any error
+  is swallowed by the wrapper + `_log_once`, so a governor hiccup never fails a
+  test (covers a negative/garbage interval too).
+- Correct per-worker: `_last_after_test_gc` is a module global in each xdist worker
+  process (separate, single-threaded; `register_at_fork` already handled at :58).
 - Rationale: caps a worker's RSS growth between blocks → lower peak → smaller
-  history-derived reserves + prompter RAM release, at a bounded cost (one collect
+  history-derived reserves + prompter RAM release, at a bounded cost (≤ one collect
   per 10 s per worker, not per fast test).
 
 ## Honesty / invariants
@@ -89,10 +122,16 @@ module-global monotonic `_last_gc` timestamp:
 - `Σ(granted reserve) ≤ cap − headroom` is preserved every pass (the per-waiter
   `checkedAvailable` recompute is unchanged); backfill only changes *which*
   fitting waiters are granted, never the ceiling.
-- Backfill is bounded-starvation-safe: no waiter waits indefinitely because the
-  oldest blocked waiter is frozen-protected after `admitBackfillGrace`.
-- `AIRA_DAEMON_ADMIT_BACKFILL_GRACE=0` reproduces today's exact strict-FIFO
-  behaviour (safe rollback via config, no redeploy).
+- Backfill introduces **no perpetual starvation**: after `admitBackfillGrace` the
+  oldest blocked (FIFO-head) waiter is frozen-protected against *new* backfill, so
+  its residual wait is gated only by the finite pre-freeze in-flight set finishing;
+  any residue beyond `admitWaitCapMs` becomes an honest `saturated` rejection, never
+  a silent hang. (The stated trade: one pre-freeze grace-window backfiller can
+  extend the head by its own runtime, up to that cap.)
+- `AIRA_DAEMON_ADMIT_BACKFILL_GRACE=0`/`disabled` reproduces today's exact
+  strict-FIFO behaviour (safe rollback via config, no redeploy); an invalid value
+  hard-fails startup (parity with the sibling interval settings), never a silent
+  or unbounded-backfill fallback.
 - The gc change is advisory + fail-open; disabling it (`interval ≤ 0`) restores
   today's before-block-only behaviour.
 
@@ -114,12 +153,24 @@ module-global monotonic `_last_gc` timestamp:
 - **Starvation freeze**: once the head's wait ≥ grace, a newly-arrived fitting
   small waiter is **not** backfilled (frozen), so freed reserve is held for the
   head; the head is granted on the next pass once it fits.
-- **`grace=0` == strict FIFO**: no backfill; identical to today (a regression
-  guard on the fallback).
-- **Ledger invariant under backfill**: exact-value test that `outstanding` +
-  `outstandingJobs` after a backfill pass equal the sum of granted reserves and
-  the ceiling is never exceeded.
-- **gc cadence**: with a fake clock, two tests <10s apart trigger exactly one
-  after-test collect; a before-block collect refreshes the window (no immediate
-  after-test collect); `interval ≤ 0` disables; a raised error is swallowed
-  (fail-open). (Assert via a `gc.collect` spy / counter injected for the test.)
+- **`grace=0`/`"disabled"` == strict FIFO**: no backfill; behaviourally identical
+  to today (a regression guard on the fallback).
+- **grace parse hard-fails**: an invalid `AIRA_DAEMON_ADMIT_BACKFILL_GRACE` makes
+  `admitBackfillGraceFromEnv` return `E_CONFIG_INVALID` and daemon startup fail
+  (parity with the sibling `*FromEnv` tests); `"0"`/`"disabled"` parse to strict
+  FIFO.
+- **Ledger invariant under backfill**: exact-value test using the `admitNow` seam
+  that after a backfill pass `outstanding`/`outstandingJobs` equal the sum of
+  granted reserves and the ceiling is never exceeded (grant order independent).
+- **Head bound is honest**: a head starved past `admitWaitCapMs` receives a
+  `saturated` rejection, never an infinite wait (asserts the honest-rejection
+  bound, using the `admitNow`/`admitAfter` seams).
+- **gc after-test cadence** (fake clock via the `governor.gc` / `ProbeGC` spy):
+  two tests <`interval` apart trigger exactly **one** after-test collect; a
+  before-block collect does **not** suppress the after-test collect (separate
+  timer); `interval==0` disables it; a negative/garbage interval is swallowed
+  (fail-open). The existing `TestRealPytestGCCollectsOnceOnlyWhenSleeping` stays
+  green (import-init → no immediate first-test collect).
+- **RAM-path pre-collect**: a worker that gets a CPU slot immediately then blocks
+  on the RAM reservation performs exactly one before-block `gc.collect()` on the
+  reservation wait (RED against today's no-collect RAM path).
