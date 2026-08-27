@@ -1,0 +1,4 @@
+---
+{"schema":1,"id":"AIRA-1","project":"aira","title":"eject --purge must skip the durability guard (files are being deleted)","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["lifecycle"],"hold":false,"relations":[{"kind":"blocks","from":"AIRA-1","to":"AIRA-3"}]}
+---
+aira eject --prefix FRG --force --purge was refused E_EJECT_UNVERIFIED (stale-index: FRG-3 row has no file). But --purge deletes .aira/ anyway, so the files==index durability check is moot and must be skipped when purge+force are set. The plan (docs/superpowers/specs/2026-08-27-aira-project-lifecycle-design.md) says '--purge --force makes the guard moot'; the impl runs ejectDurabilityFinding unconditionally before the purge branch (internal/daemon/eject.go). Found by dogfooding the FRG squatter eject 2026-08-27.
