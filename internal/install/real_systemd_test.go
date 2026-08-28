@@ -62,7 +62,7 @@ func TestInstallRealSystemdThrowawaySliceAnchorAndDelegation(t *testing.T) {
 	sliceUnit := fmt.Sprintf("aira-test-%d.slice", pid)
 	anchorUnit := fmt.Sprintf("aira-test-%d-anchor.service", pid)
 	daemonUnit := fmt.Sprintf("aira-daemon-test-%d.service", pid)
-	isolationRoot, err := os.MkdirTemp("/home/user/tmp", fmt.Sprintf("aira-daemon-test-%d-", pid))
+	isolationRoot, err := os.MkdirTemp("", fmt.Sprintf("aira-daemon-test-%d-", pid))
 	if err != nil {
 		t.Fatal(err)
 	}
