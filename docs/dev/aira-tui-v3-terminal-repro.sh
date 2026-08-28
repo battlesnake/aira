@@ -7,7 +7,7 @@ if [[ ! -t 0 || ! -t 1 ]]; then
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-repro_root="${AIRA_TUI_REPRO_DIR:-/home/user/tmp/aira-tui-v3-terminal-repro}"
+repro_root="${AIRA_TUI_REPRO_DIR:-${TMPDIR:-/tmp}/aira-tui-v3-terminal-repro}"
 go_tmp="${repro_root}/go-tmp"
 binary="${repro_root}/aira"
 mkdir -p "${go_tmp}"

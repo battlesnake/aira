@@ -7,7 +7,7 @@ case "$aira_bin" in
   *) aira_bin="$(pwd)/$aira_bin" ;;
 esac
 
-work=$(mktemp -d /home/user/tmp/aira-m20b-e2e.XXXXXX)
+work=$(mktemp -d "${TMPDIR:-/tmp}/aira-m20b-e2e.XXXXXX")
 cleanup() {
   rm -rf -- "$work"
 }

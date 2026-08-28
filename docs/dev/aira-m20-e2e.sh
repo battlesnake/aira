@@ -7,7 +7,7 @@ case "$aira_bin" in
   *) aira_bin="$(pwd)/$aira_bin" ;;
 esac
 
-work=$(mktemp -d /home/user/tmp/aira-m20-e2e.XXXXXX)
+work=$(mktemp -d "${TMPDIR:-/tmp}/aira-m20-e2e.XXXXXX")
 cleanup() {
   if [[ -n ${run_id:-} ]]; then
     "$aira_bin" run-kill "$run_id" --steal >/dev/null 2>&1 || true
