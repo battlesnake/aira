@@ -627,7 +627,28 @@ class TestClassScope:
 def test_full_unit_spelling(): pass
 
 @pytest.mark.aira_mem("1.5G")
-def test_invalid_uses_default(): pass
+def test_decimal_marker(): pass
+`)
+	writeTestFile(t, project, "test_memory_size.py", `
+import pytest
+import aira_xdist_governor as governor
+
+# Keep these parity constants byte-identical with runner.TestParseMemorySize.
+@pytest.mark.parametrize(("raw", "expected"), [
+    ("1", 1),
+    ("4GiB", 4294967296),
+    ("1.5GB", 1610612736),
+    ("0.5G", 536870912),
+    ("1.05G", 1127428915),
+    ("1.3K", 1331),
+])
+def test_parse_memory_size(raw, expected):
+    assert governor._parse_memory_size(raw) == expected
+
+@pytest.mark.parametrize("raw", ["", "0", "1.", ".5G", "1.2.3", "1,5", "-1", "nonnumeric"])
+def test_parse_memory_size_rejects_invalid_input(raw):
+    with pytest.raises(ValueError):
+        governor._parse_memory_size(raw)
 `)
 	result := runPytest(t, pytest, project, pythonDir, map[string]string{
 		"AIRA_TEST_MEM_GOVERNOR": "1", "AIRA_TEST_MEM_DEFAULT": "8M",
@@ -644,9 +665,9 @@ def test_invalid_uses_default(): pass
 	wants := map[string]string{
 		"test_module_scope": "67108864", "test_class_scope": "33554432",
 		"test_test_scope": "16777216",
-		// "4GB" is now a valid full-unit spelling (== 4GiB == 4<<30); a float
-		// ("1.5G") is still rejected and falls to the 8M default with one log.
-		"test_full_unit_spelling": "4294967296", "test_invalid_uses_default": "8388608",
+		// "4GB" is a full-unit spelling (== 4GiB == 4<<30); decimal mantissas
+		// retain exact integer-byte precision on the marker path.
+		"test_full_unit_spelling": "4294967296", "test_decimal_marker": "1610612736",
 	}
 	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
 		var argv []string
@@ -666,7 +687,7 @@ def test_invalid_uses_default(): pass
 			}
 		}
 	}
-	if len(wants) != 0 || strings.Count(result.output, "invalid aira_mem marker") != 1 || strings.Contains(result.output, "PytestUnknownMarkWarning") {
+	if len(wants) != 0 || strings.Contains(result.output, "invalid aira_mem marker") || strings.Contains(result.output, "PytestUnknownMarkWarning") {
 		t.Fatalf("missing=%v output=%s requests=%s", wants, result.output, data)
 	}
 }

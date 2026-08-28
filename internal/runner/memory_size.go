@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"os"
 	"strconv"
 	"strings"
@@ -11,11 +12,11 @@ import (
 
 const minimumScopeMemoryMax = int64(1 << 20)
 
-// parseMemorySize parses an integer byte count with an optional 1024-based unit.
+// parseMemorySize parses a decimal byte count with an optional 1024-based unit.
 // The unit is case-insensitive and every spelling of a scale is a synonym:
 // K/KB/KiB, M/MB/MiB, G/GB/GiB, T/TB/TiB, and a bare B (bytes). So 4G == 4GB ==
-// 4GiB. It is intentionally independent of Linux and cgroup files. Integer only
-// (no fractional sizes): write 1536M rather than 1.5G.
+// 4GiB. It is intentionally independent of Linux and cgroup files. A decimal
+// mantissa is floored to whole bytes without floating-point rounding.
 func parseMemorySize(s string) (int64, error) {
 	if s == "" {
 		return 0, errors.New("memory size is empty")
@@ -25,10 +26,22 @@ func parseMemorySize(s string) (int64, error) {
 		digits++
 	}
 	if digits == 0 {
-		return 0, fmt.Errorf("memory size %q must be [0-9]+ with an optional K/M/G/T (× i × B) unit", s)
+		return 0, fmt.Errorf("memory size %q must be [0-9]+(\\.[0-9]+)? with an optional K/M/G/T (× i × B) unit", s)
+	}
+	mantissaEnd := digits
+	fractionStart := 0
+	if mantissaEnd < len(s) && s[mantissaEnd] == '.' {
+		fractionStart = mantissaEnd + 1
+		mantissaEnd = fractionStart
+		for mantissaEnd < len(s) && s[mantissaEnd] >= '0' && s[mantissaEnd] <= '9' {
+			mantissaEnd++
+		}
+		if mantissaEnd == fractionStart {
+			return 0, fmt.Errorf("memory size %q must be [0-9]+(\\.[0-9]+)? with an optional K/M/G/T (× i × B) unit", s)
+		}
 	}
 	var multiplier int64
-	switch strings.ToUpper(s[digits:]) {
+	switch strings.ToUpper(s[mantissaEnd:]) {
 	case "", "B":
 		multiplier = 1
 	case "K", "KB", "KIB":
@@ -46,7 +59,23 @@ func parseMemorySize(s string) (int64, error) {
 	if err != nil || value > math.MaxInt64/multiplier {
 		return 0, errors.New("memory size overflows int64 bytes")
 	}
-	return value * multiplier, nil
+	whole := value * multiplier
+	if fractionStart == 0 {
+		return whole, nil
+	}
+
+	// Keep the prescribed frac*scale/10^len(frac) calculation exact. math/big
+	// avoids both float rounding and intermediate int64 overflow for a long frac.
+	var numerator, denominator big.Int
+	numerator.SetString(s[fractionStart:mantissaEnd], 10)
+	numerator.Mul(&numerator, big.NewInt(multiplier))
+	denominator.Exp(big.NewInt(10), big.NewInt(int64(mantissaEnd-fractionStart)), nil)
+	numerator.Quo(&numerator, &denominator)
+	fraction := numerator.Int64()
+	if whole > math.MaxInt64-fraction {
+		return 0, errors.New("memory size overflows int64 bytes")
+	}
+	return whole + fraction, nil
 }
 
 // ParseMemorySize exposes the shared portable parser to CLI and Core faces.

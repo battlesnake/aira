@@ -24,8 +24,9 @@ func TestFloorMemoryPageUsesKernelPageSize(t *testing.T) {
 	}
 }
 
-// covers: portable size parsing — single-letter and full unit spellings
-// (K/KB/KiB, M/MB/MiB, G/GB/GiB, T/TB/TiB, B), case-insensitive, 1024-based.
+// covers: portable size parsing — integer and decimal mantissas; single-letter
+// and full unit spellings (K/KB/KiB, M/MB/MiB, G/GB/GiB, T/TB/TiB, B),
+// case-insensitive, 1024-based.
 func TestParseMemorySize(t *testing.T) {
 	tests := []struct {
 		input string
@@ -49,6 +50,11 @@ func TestParseMemorySize(t *testing.T) {
 		{input: "4gib", want: 4 << 30},
 		{input: "1T", want: 1 << 40},
 		{input: "2TiB", want: 2 << 40},
+		// Keep these parity constants byte-identical with the Python parser test.
+		{input: "1.5GB", want: 1610612736},
+		{input: "0.5G", want: 536870912},
+		{input: "1.05G", want: 1127428915},
+		{input: "1.3K", want: 1331},
 	}
 	for _, test := range tests {
 		t.Run(test.input, func(t *testing.T) {
@@ -60,11 +66,11 @@ func TestParseMemorySize(t *testing.T) {
 	}
 }
 
-// verifies: rejects every shape outside [0-9]+(unit)? — partial/garbage units,
-// floats, signs, whitespace, and overflow. "1T"/"1MB" are NOW valid (widened).
+// verifies: rejects every shape outside [0-9]+(\.[0-9]+)?(unit)? — malformed
+// decimals, partial/garbage units, signs, whitespace, and overflow.
 func TestParseMemorySizeRejectsInvalidInput(t *testing.T) {
 	for _, input := range []string{
-		"", "-1", "+1", " 1M", "1M ", "1.5G", "K", "12x",
+		"", "-1", "+1", " 1M", "1M ", "1.", ".5G", "1.2.3", "1,5", "K", "12x",
 		"1KI", "1Gi", "1GG", "GB", "1KBB", "1 G", "4G B",
 		"1K", "1KB", // U+212A KELVIN SIGN folds to ASCII k under Unicode; must be rejected (Go/Python parity)
 		"9223372036854775808", "9007199254740992K", "9007199254740992T",

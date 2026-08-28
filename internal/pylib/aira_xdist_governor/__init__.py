@@ -21,7 +21,7 @@ _GRANT_READ_GRACE = 2.0
 # re.ASCII keeps case-folding ASCII-only, matching Go's byte-wise strings.ToUpper;
 # without it re.IGNORECASE would fold Unicode look-alikes (e.g. U+212A KELVIN SIGN
 # → "k") that Go rejects, diverging the two parsers.
-_MEMORY_SIZE = re.compile(r"^([0-9]+)(B|KIB|KB|K|MIB|MB|M|GIB|GB|G|TIB|TB|T)?$", re.IGNORECASE | re.ASCII)
+_MEMORY_SIZE = re.compile(r"^([0-9]+)(?:\.([0-9]+))?(B|KIB|KB|K|MIB|MB|M|GIB|GB|G|TIB|TB|T)?$", re.IGNORECASE | re.ASCII)
 _MEMORY_SCALE = {"": 1, "B": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
 _GRANT_LINE = re.compile(r"^granted reserve=([1-9][0-9]*) basis=pinned:client$")
 _logged_failures = set()
@@ -154,16 +154,21 @@ def _acquire_slot():
 
 
 def _parse_memory_size(raw):
-    # Mirrors runner.ParseMemorySize exactly: [0-9]+ with an optional 1024-based
-    # unit, case-insensitive, every spelling a synonym (4G == 4GB == 4GiB).
+    # Mirrors runner.ParseMemorySize exactly: [0-9]+(\.[0-9]+)? with an optional
+    # 1024-based unit, case-insensitive, every spelling a synonym (4G == 4GB ==
+    # 4GiB). Decimal fractions are floored to whole bytes without float math.
     match = _MEMORY_SIZE.fullmatch(raw) if isinstance(raw, str) else None
     if match is None:
         raise ValueError(
-            "memory size must be [0-9]+ with an optional K/M/G/T (x i x B) unit"
+            "memory size must be [0-9]+(\\.[0-9]+)? with an optional K/M/G/T (x i x B) unit"
         )
-    unit = (match.group(2) or "").upper()
+    unit = (match.group(3) or "").upper()
     scale = unit[0] if unit[:1] in ("K", "M", "G", "T") else ""
-    value = int(match.group(1)) * _MEMORY_SCALE[scale]
+    multiplier = _MEMORY_SCALE[scale]
+    value = int(match.group(1)) * multiplier
+    fraction = match.group(2) or ""
+    if fraction:
+        value += (int(fraction) * multiplier) // (10 ** len(fraction))
     # The grammar matches runner.ParseMemorySize; the marker deliberately parts
     # from it on ONE point — a zero per-test estimate is meaningless, so "0" (which
     # the Go parser accepts as an unset-cap sentinel) falls to the pinned default here.
@@ -293,7 +298,7 @@ def pytest_configure(config):
     global _plugin_active
     _plugin_active = True
     config.addinivalue_line(
-        "markers", "aira_mem(size): pinned per-test RAM estimate, e.g. 4G / 512MB / 4GiB (1024-based)"
+        "markers", "aira_mem(size): pinned per-test RAM estimate, e.g. 4G / 512MB / 1.5GB / 4GiB (1024-based)"
     )
 
 

@@ -373,7 +373,7 @@ func TestRunMemoryFlagValidation(t *testing.T) {
 		{"--memory-max", "0", "--", "true"},
 		{"--memory-max", "1023K", "--", "true"},
 		{"--memory-max", "2M", "--memory-high", "3M", "--", "true"},
-		{"--memory-max", "1.5G", "--", "true"}, // fractional sizes are rejected (units are integer-only)
+		{"--memory-max", "1.", "--", "true"},
 	} {
 		if _, _, err := parseArgs("run", argv); err == nil || !strings.HasPrefix(err.Error(), "E_RUN_ARGUMENT_INVALID:") {
 			t.Fatalf("parseArgs(%q) err=%v", argv, err)
