@@ -1,9 +1,9 @@
 # Common Go development commands for AIRA. Run targets from the repository
 # root; the hooks also invoke these targets from any cwd.
 
-GO ?= /home/user/.local/bin/go
+GO ?= go
 GO_BIN := $(shell $(GO) env GOROOT 2>/dev/null)/bin
-export PATH := $(GO_BIN):/home/user/.local/bin:$(PATH)
+export PATH := $(GO_BIN):$(HOME)/.local/bin:$(PATH)
 
 .PHONY: fmt fmt-check vet lint build test race cover fuzz tidy ci install-hooks
 

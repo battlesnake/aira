@@ -1008,7 +1008,8 @@ func TestMCPMutationUsesRealDaemonSocket(t *testing.T) {
 }
 
 func TestMCPConfineKillOutsideProjectKeepsOwnershipAndStealChecks(t *testing.T) {
-	if _, err := os.Stat("/home/user/.local/bin/aira"); err != nil {
+	airaHelper := filepath.Join(os.Getenv("HOME"), ".local", "bin", "aira")
+	if _, err := os.Stat(airaHelper); err != nil {
 		t.Skip("installed aira helper unavailable")
 	}
 	root := t.TempDir()
@@ -1029,7 +1030,7 @@ func TestMCPConfineKillOutsideProjectKeepsOwnershipAndStealChecks(t *testing.T) 
 	go func() {
 		_, launchErr := runner.Confine(ctx, runner.ConfineRequest{
 			Slice: "aira.slice", Name: name, Owner: "session-a", Argv: []string{"/bin/sh", "-c", "sleep 60"},
-			RuntimeDir: paths.RuntimeDir, AdmitSocketPath: paths.SocketPath, SelfPath: "/home/user/.local/bin/aira",
+			RuntimeDir: paths.RuntimeDir, AdmitSocketPath: paths.SocketPath, SelfPath: airaHelper,
 			Stdout: io.Discard, Stderr: io.Discard,
 		})
 		done <- launchErr
