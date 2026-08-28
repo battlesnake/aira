@@ -13,9 +13,9 @@
 
 ## 2. The problem (evidence, not assertion)
 
-Observed in `~/claude/an earlier project` (~194 live worktrees) and confirmed by a docs + 4,000-commit-history sweep:
+Observed in `an earlier project` (~194 live worktrees) and confirmed by a docs + 4,000-commit-history sweep:
 
-1. **ID allocation is out-of-repo, bespoke machinery** — `make id`: an `flock`'d common-dir counter (self-healing cache over the markdown), a fail-closed duplicate gate, and a **common-dir receipt log** that catches IDs *burned in a rebase* (an earlier ticket/384 committed then dropped; an earlier ticket collided across clones). Python/bash bolted to one repo's two tables.
+1. **ID allocation is out-of-repo, bespoke machinery** — `make id`: an `flock`'d common-dir counter (self-healing cache over the markdown), a fail-closed duplicate gate, and a **common-dir receipt log** that catches IDs *burned in a rebase* (IDs committed then dropped; another collided across clones). Python/bash bolted to one repo's two tables.
 2. **Findings evaporate** — 92 hand-written `docs/reviews/`+`docs/audits/` files exist only by manual transcription; the two-loop review found *seven real bugs in code that passed its own seventeen tests*, durable only because someone wrote them down; the same defect classes resurface loop after loop, unqueryable.
 3. **Coordination is manual prose** — no "who owns what" DB; owner sentences, files hand-queued "for a non-parallel session," `base-red owned by other sessions` triaged from memory at merge.
 
@@ -86,7 +86,7 @@ Run **output blobs** (§14): machine-local gitignored files, capped + zstd-compr
 
 ## 6. Data model
 
-Closed, small enums (overloaded string fields caused real an earlier project bugs). Durability class per §5.3.
+Closed, small enums (overloaded string fields caused real bugs in an earlier project). Durability class per §5.3.
 
 - **Project** — slug, repo path(s), owned ID prefixes, **gate policy** (incl. the path→{suite, review-tier} map, §16), milestones, config. *Content (git).*
 - **Ticket** — `PREFIX-N`; title; body; **status** (`draft → planned → in-progress → in-review → done`, + `retired`, `superseded`); kind; severity (`P0|P1|P2`); assignee/agent/session/worktree-id; milestone; labels; timestamps (event-log-authoritative). **Blockedness is *derived* from unmet `blocked-by` edges (plus an explicit hold flag), not a hand-set `blocked` status** — one source of truth, no status-vs-edge disagreement.
@@ -103,7 +103,7 @@ Closed, small enums (overloaded string fields caused real an earlier project bug
 
 ## 7. ID allocation
 
-Report-time; three layers. **(1) The machine-wide DB counter is the atomic cross-worktree authority** — `new = counter+1` in one exclusive txn *that also writes the receipt* (counter++ and receipt are one transaction; the ticket file is written after, and a crash between them leaves a receipt-without-file the reconciler resolves — offer to create, or retire). It must be the DB, not a git scan: a sibling worktree's just-*committed* `AIRA-50` isn't visible in this checkout, and a just-*written-uncommitted* one isn't visible to any object/ref scan at all. **Counter rebuild (on DB loss) enumerates every worktree from the common-dir and scans each working tree's `.aira/tickets/` + the common-dir journals + all refs** — *not* a single `max(counter, git_max)`, which would miss an uncommitted sibling-worktree ID and re-mint it (the an earlier ticket duplicate class). **(2) A fail-closed duplicate-definition check** (one shared parser). **(3) Receipts live in the common-dir** (audit class, §5.3) — out of the commit graph, so the rebase that drops a ticket commit can't drop the receipt that detects the loss. `aira id <prefix>` is the primitive; an allocated ID resolves to a live ticket or an explicit `retired`/`superseded` one — never nothing. *(Cross-clone/remote allocation stays an open question, §21 — as an earlier project's own design concedes.)*
+Report-time; three layers. **(1) The machine-wide DB counter is the atomic cross-worktree authority** — `new = counter+1` in one exclusive txn *that also writes the receipt* (counter++ and receipt are one transaction; the ticket file is written after, and a crash between them leaves a receipt-without-file the reconciler resolves — offer to create, or retire). It must be the DB, not a git scan: a sibling worktree's just-*committed* `AIRA-50` isn't visible in this checkout, and a just-*written-uncommitted* one isn't visible to any object/ref scan at all. **Counter rebuild (on DB loss) enumerates every worktree from the common-dir and scans each working tree's `.aira/tickets/` + the common-dir journals + all refs** — *not* a single `max(counter, git_max)`, which would miss an uncommitted sibling-worktree ID and re-mint it (the cross-clone duplicate class). **(2) A fail-closed duplicate-definition check** (one shared parser). **(3) Receipts live in the common-dir** (audit class, §5.3) — out of the commit graph, so the rebase that drops a ticket commit can't drop the receipt that detects the loss. `aira id <prefix>` is the primitive; an allocated ID resolves to a live ticket or an explicit `retired`/`superseded` one — never nothing. *(Cross-clone/remote allocation stays an open question, §21 — as an earlier project's own design concedes.)*
 
 ## 8. Coordination — the "too many cooks" fix
 
@@ -154,7 +154,7 @@ Agents run heavy commands via a `whale-run` prefix (a systemd slice with a hard 
 - **Resource accounting from the cgroup, at exit.** peak-RSS/CPU from the scope's cgroup (`memory.peak` — kernel ≥ 5.19; `cpu.stat`; `memory.events oom_kill` to mark `oom-killed`), read by the supervisor *at child-exit*. `getrusage(RUSAGE_CHILDREN)` misses grandchildren and is not used; a bare run with no cgroup reads `peak_rss` = `unevaluated` (never a fake number). This feeds estimate-vs-actual (§17) and data-driven `MemoryMax` tuning.
 - **Wiring.** A run `--phase work-review --tool codex` auto-emits a ComputeEvent capturing the run's resource usage (wall/cpu/peak-RSS; `unevaluated` where the cgroup could not be read); authoritative token usage is recorded when the caller supplies it (`--usage <file> --provider <p>`, parsed by the §12 normaliser), absent → token buckets `unevaluated` (auto-extraction of usage from the tool's own stdout is a later cut). A `--report`ing run creates a §13 report from the captured output and records a **`tests-green` run-observation** (exit==0 **and** parsed test-count>0, §9 line "tests-green from a run's exit code") — this is an honest *observation of one passing run*, **not** a gate verdict: a green **checkable gate** still requires the §9 *proven-to-fire* attestation from the gate's own lane + canary (a single passing run has not fired the lane on a known-bad input), so M19 feeds gates the report/ratchet-baseline input and never writes a gate-audit verdict itself. *[Reconciled with §9 line 118 during M19 planning — the earlier "attests tests-green" wording is superseded by "records a tests-green observation"; the gate verdict stays with the command-gate.]*
 - **Deferred to post-shim (not v1): `aira run-input` (live stdin push).** It requires a per-run control plane (a socket/FIFO on the shim) and no dated pain motivates it — so it lands once the shim exists, not in the first runner. (Foreground runs still take `--stdin` at launch.)
-- **Execution fidelity.** Faithful cwd + env (an earlier project tests are cwd-sensitive); argv-parse care (a single leading `--`); interactive approval prompts stay out of scope.
+- **Execution fidelity.** Faithful cwd + env (the earlier project's tests were cwd-sensitive); argv-parse care (a single leading `--`); interactive approval prompts stay out of scope.
 
 **Phasing (§20):** a **runner-lite** — launch + file-direct capture + scoped cgroup-kill + `run-log`, *no detach / no run-input / no telemetry wiring* — depends on nothing beyond Phase-1 tickets/leases and **banks the headline safety win early** (Phase 3), instead of leaving the live footgun until the full runner (Phase 5). This grows AIRA into an execution/verification substrate — a conscious scope step the recorder framing survives, and one all three reviewers endorsed keeping (with sharper mechanism, not cutting).
 
@@ -197,7 +197,7 @@ CLI: `init · id <prefix> · new/create · ls/list [<q>] [--by F] · count [q] -
 
 ## Phase 0 — bootstrap process docs (the non-tool deliverable)
 
-Before any AIRA feature work, lay down the V-model process **in this repo**, so agents follow it from commit #1 — adapted from `~/claude/an earlier project` for **Go**:
+Before any AIRA feature work, lay down the V-model process **in this repo**, so agents follow it from commit #1 — adapted from `an earlier project` for **Go**:
 
 - **`CLAUDE.md`** — the loop, worktrees-never-root, git-stash-named-refs, `whale-run` for heavy commands (and *target-your-own-scope, never the shared slice*), review-as-durable-artifact, pointers below.
 - **`docs/dev/agentic-development-loop.md`** — the lifecycle in the §9 phase vocabulary (`plan → plan-review (Codex+Gemini) → plan gate (Fable) → plan-fix → implement (TDD) → work-review (Codex, then Fable two-loop) → work-fix → build gate → PR → Merge`), a per-step Who/Gate table, and an explicit **lighter path for trivial changes**.

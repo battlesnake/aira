@@ -77,7 +77,7 @@ may use the lighter path described in
   traceability convention. The enforcing fail-closed graph check arrives in
   Phase 3; it must not be invented as a vacuous Phase 0 gate.
 - Until AIRA's allocator exists, the seed registries are maintained manually.
-  The migration from `make id`/the an earlier project allocator to `aira id` is an
+  The migration from an external `make id` allocator to `aira id` is an
   explicit Phase 1 concern. Once `aira id` exists, never hand-pick IDs.
 
 ## Review and merge
