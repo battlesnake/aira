@@ -121,3 +121,51 @@ run. `malloc_trim` via `ctypes` (no new dependency). Reservations stay client-si
 (governor → `confine-reserve` → daemon), and bumps reuse the existing hold verb, so
 **no daemon restart** is required. Confirm during build that no daemon-side admission
 change is needed.
+
+## Plan-review v1 — BLOCKED (Sol, 2026-08-29; DeepSeek timed out)
+
+Sol code-grounded BLOCK; the v1 design above is insufficient. Findings:
+
+- **P0 — a pre-test-only measured reservation cannot prevent a ballooning test.** §2
+  reserves from one `statm` snapshot at protocol start; a test that balloons *after*
+  the sample exceeds `RSS + headroom` before the next hook and OOMs. Reactive
+  measurement (even a live sampler) cannot *prevent* a fast allocation burst. A hard
+  guarantee needs enforcement (a cap), not prediction.
+- **P0 — the governor currently FAILS OPEN.** On an unmet reservation the governor
+  logs "running ungoverned" and runs the test anyway; the daemon timeout only rejects
+  the waiter. So "block on unmet bump" as written still races to OOM, and workers all
+  blocking while holding partial reserves is a terminal hold-and-wait. The OOM-critical
+  path must fail *closed* (block, then fail/skip loud — never run ungoverned) and the
+  bump protocol must not deadlock.
+- **P1 — "additional confine-reserve holds, released on worker exit" does not compose
+  as one worker.** Each hold increments `outstandingJobs` (extra per-job headroom
+  charged per bump), and `ConfineReserve` clamps an oversized delta and grants less.
+  Needs a **daemon-side worker-keyed adjustable reservation** (one job/headroom per
+  worker) → a daemon change + restart (the "no daemon restart" claim was wrong).
+- **P1 — restart resilience:** confine-reserve holds are unreconstructable across a
+  daemon restart, so a worker loses its standing protection mid-suite.
+- **P2 — §3 shared-quota formula double-counts:** per-worker measured RSS already
+  includes the shared pages, so adding the keyed quota on top over-counts. Must
+  *subtract* shared pages from each worker charge, then add one keyed quota.
+
+### The load-bearing fork (owner decision)
+
+Sol's two P0s reduce to one question: **how strong an OOM guarantee?**
+
+- **(A) Hard, self-contained via per-worker `memory.max`.** Give each xdist worker its
+  own sub-cgroup capped at its granted reservation (`Σ caps ≤ slice`). A runaway then
+  OOMs *its own worker* — never a cross-session victim — and xdist reschedules its
+  work. This is the same per-scope-containment philosophy as #67, resolves the
+  ballooning-test P0 by *containment* (no prediction needed), and makes an
+  under-annotated heavy test fail loud and *targeted* (the "annotate or fix AIRA"
+  forcing function). Cost: per-worker cgroup + process migration, a daemon-side
+  worker-keyed reservation (daemon change/restart), and a genuine over-user is killed.
+- **(B) Best-effort soft.** Keep soft reservations + measured RSS, but fix fail-open →
+  fail-*closed* (block, then fail loud) and rely on the slice `oom.group` as the final
+  backstop. Simpler, no per-worker cgroups, but a fast-ballooning under-estimated test
+  can still take a cross-session victim (rare, not zero).
+
+Recommendation: **(A)** — it matches "`-n auto` safe *without* OOMing", turns a random
+cross-session kill into a targeted self-contained one, and reuses AIRA's existing
+per-scope-cap machinery. `malloc_trim` + measured-RSS + shared-quota-dedup still apply
+inside (A); the cap just makes the guarantee hard instead of hopeful.
