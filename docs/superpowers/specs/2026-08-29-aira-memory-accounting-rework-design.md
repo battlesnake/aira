@@ -227,3 +227,20 @@ keeping last-resort execution only when a positive old lease exists. Plus P2: th
 bounded-wait test is porous (fake helper ignores `--max-wait`; doesn't prove the old
 lease stays live during the growing test). Success path otherwise correct (order,
 stores `granted` not `desired`, teardown, statm, malloc_trim guard).
+
+## v3 — OWNER DECISION: ship the safe subset, defer the amortisation (2026-08-29)
+
+The standing-reservation was only there to amortise the per-test round-trip; that is
+the piece that deadlocks (build-review v2 P0). The OOM cure — sizing to measured RSS —
+works with the *existing* per-test acquire/release and cannot deadlock. So:
+
+- **SHIP NOW (safe, no daemon change/restart):** keep per-test acquire-in-protocol /
+  release-in-finally, but size each reservation to `max(aira_mem, measured_RSS +
+  growth_headroom)` instead of a per-test estimate + keep `gc→malloc_trim`. This fixes
+  the cumulative under-count (each test now reserves the worker's accumulated
+  footprint) — a strict improvement over today, no deadlock. Keep today's
+  fail-open-on-timeout unchanged (not a fail-closed change — separate concern).
+- **DEFER (focused daemon milestone, box-quiet):** the per-worker STANDING reservation
+  + the daemon-side atomic ADJUST op (amortise the round-trip; fix the fail-open hole)
+  + the keyed shared-quota. Efficiency/robustness, not the OOM cure — must not gate the
+  safety win or force a risky shared-daemon change under contention.
