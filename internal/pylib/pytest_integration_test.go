@@ -522,12 +522,18 @@ governor.gc = ProbeGC
 		}
 		_ = lockRealPytestSlot(t, slot)
 		started := time.Now()
+		// An incomplete population fails open by RAISING immediately (it never
+		// enters the poll-until-MAX_WAIT loop), so a correct governor adds ~0 and
+		// the elapsed time is dominated by pytest interpreter startup — which under
+		// a loaded box can approach a second or more. MAX_WAIT is deliberately large
+		// so that a REGRESSION which wrongly waited would be unmistakably long
+		// (~30s), keeping the bound discriminating while tolerant of startup jitter.
 		assertRealPytestItemRuns(t, pytest, map[string]string{
 			"AIRA_CPU_SLOTS_DIR":     slots,
 			"AIRA_CPU_POLL_INTERVAL": "0.02",
-			"AIRA_CPU_MAX_WAIT":      "2",
+			"AIRA_CPU_MAX_WAIT":      "30",
 		}, nil)
-		if elapsed := time.Since(started); elapsed > 1200*time.Millisecond {
+		if elapsed := time.Since(started); elapsed > 10*time.Second {
 			t.Fatalf("invalid loser population did not fail open promptly: %s", elapsed)
 		}
 	})
