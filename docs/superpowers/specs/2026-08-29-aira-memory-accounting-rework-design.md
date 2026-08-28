@@ -169,3 +169,41 @@ Recommendation: **(A)** — it matches "`-n auto` safe *without* OOMing", turns 
 cross-session kill into a targeted self-contained one, and reuses AIRA's existing
 per-scope-cap machinery. `malloc_trim` + measured-RSS + shared-quota-dedup still apply
 inside (A); the cap just makes the guarantee hard instead of hopeful.
+
+## v2 — RESOLUTION: (B) best-effort dynamic prevention (owner 2026-08-29)
+
+Owner chose **(B)**: not a hard fit — a reasonably-efficient DYNAMIC prevention.
+Priority: OOM is very bad; idling cores is a little bad; 100% packing efficiency is
+not worth machinery. So: strong backpressure to avoid over-admission, accept a rare
+residual OOM (slice `oom.group` is the final backstop), never idle forever. **No
+per-worker cgroup caps** (that was (A)).
+
+Clears Sol's structural findings; accepts his P0s by design.
+
+- **Per-worker reserve via `confine-reserve` REPLACE — clears P1 stacking + clamp, no
+  daemon change.** The governor holds exactly ONE `confine-reserve` per worker (one
+  job / one headroom, like today's per-test — NOT stacked), sized to
+  `max(aira_mem_current_test, measured_RSS + growth_headroom)`. A test that fits the
+  worker's CURRENT hold runs with no round-trip (the amortised common path — respects
+  the light-suite overhead constraint). A test that would grow the worker beyond its
+  hold triggers a REPLACE: acquire a new hold for the new total *while still holding
+  the old* (no under-reserve gap; the transient double-hold is conservative), then
+  release the old; record the granted amount so a daemon clamp is respected. One hold
+  per worker ⇒ one job-headroom, no stacking over-charge. (If the build finds a
+  daemon-side worker-keyed *adjust* op materially cleaner, that's an acceptable
+  escalation — it costs a daemon restart; prefer the client-side REPLACE.)
+- **Fail-CLOSED backpressure, not fail-open.** When the daemon can't grant the REPLACE
+  (slice full), the worker BLOCKS on the bounded admission wait BEFORE running the
+  growing test — this is the prevention: workers wait instead of piling on. No
+  deadlock in the common case (tests that fit their current hold keep running and
+  releasing, so a blocked bump is eventually granted). On the bounded-wait TIMEOUT
+  (slice genuinely stuck the full window) it degrades to today's run-ungoverned as a
+  LAST RESORT, with `oom.group` as the backstop — so fail-open is demoted from
+  "immediate" (today's bug) to "last resort after real backpressure".
+- **Accepted residuals (the (B) tradeoff, explicit):** a fast-ballooning
+  under-estimated test can still OOM (no cap contains it) — rare, caught by
+  `oom.group`; a daemon restart loses worker holds (re-established on the next growth).
+  Both acceptable for best-effort; neither is the common case.
+
+Unchanged from v1: gc → `malloc_trim` (§1); shared-quota deferred (§3); measured RSS
+via `/proc/self/statm`; 512 MB stays a soft default; round-trip only on growth.
