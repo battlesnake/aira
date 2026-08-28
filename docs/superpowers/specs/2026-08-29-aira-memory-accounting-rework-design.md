@@ -207,3 +207,23 @@ Clears Sol's structural findings; accepts his P0s by design.
 
 Unchanged from v1: gc → `malloc_trim` (§1); shared-quota deferred (§3); measured RSS
 via `/proc/self/statm`; 512 MB stays a soft default; round-trip only on growth.
+
+## Build-review v2 — BLOCKED (Sol, 2026-08-29)
+
+The client-side REPLACE (`5d0d422`) has a P0: acquire-new-**while-holding-old** means
+a bumping worker transiently needs `2X+delta` (old X + new X+delta) and the daemon
+charges the replacement as a whole extra job/headroom. Under contention, if all
+workers need a modest bump and no *full new* hold fits, they all block before `yield`
+holding standing leases that only release at session end → hold-and-wait; after the
+300 s wait they all fall back **ungoverned together** → concurrent OOM. That's worse
+than the accepted fast-balloon residual — it turns an ordinary annotated-growth case
+into an OOM. Client-side ordering CANNOT win here: acquire-first deadlocks (2X),
+release-first opens an unreserved gap that over-admits. **The correct fix is a
+daemon-side atomic per-worker reservation ADJUST** (change one existing entry by the
+delta, one headroom, no 2X) — the escalation this spec flagged as acceptable; it needs
+a daemon change + restart. Plus P1: a worker with NO prior lease that times out runs
+its first test at **zero** reservation (fail-open hole) — must fail/skip loud instead,
+keeping last-resort execution only when a positive old lease exists. Plus P2: the
+bounded-wait test is porous (fake helper ignores `--max-wait`; doesn't prove the old
+lease stays live during the growing test). Success path otherwise correct (order,
+stores `granted` not `desired`, teardown, statm, malloc_trim guard).
