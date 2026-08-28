@@ -419,6 +419,149 @@ governor.subprocess.Popen = immediate_grant_popen
 	}
 }
 
+func TestRealPytestRAMStandingReservationPrimitives(t *testing.T) {
+	pytest := requireRealPytest(t)
+	project, pythonDir := realPytestProject(t, "")
+	writeTestFile(t, project, "test_standing_primitives.py", `
+import builtins
+from types import SimpleNamespace
+from unittest.mock import mock_open, patch
+
+import aira_xdist_governor as governor
+
+def item(estimate):
+    marker = SimpleNamespace(args=(estimate,), kwargs={}) if estimate else None
+    return SimpleNamespace(nodeid="test.py::test_case", get_closest_marker=lambda name: marker)
+
+def test_statm_rss_uses_resident_pages():
+    with patch.object(builtins, "open", mock_open(read_data="101 7 0 0 0 0 0\n")):
+        with patch.object(governor.os, "sysconf", return_value=4096):
+            assert governor._read_rss_bytes() == 7 * 4096
+
+def test_desired_uses_absolute_marker_or_rss_plus_headroom(monkeypatch):
+    monkeypatch.setenv("AIRA_TEST_MEM_DEFAULT", "10")
+    monkeypatch.setenv("AIRA_TEST_MEM_GROWTH_HEADROOM", "8")
+    monkeypatch.setattr(governor, "_read_rss_bytes", lambda: 40)
+    assert governor._desired_standing_reservation(item("100")) == 100
+    assert governor._desired_standing_reservation(item("10")) == 48
+
+def test_malloc_trim_missing_symbol_is_best_effort(monkeypatch):
+    class NoTrim:
+        pass
+    monkeypatch.setattr(governor.ctypes, "CDLL", lambda _: NoTrim())
+    governor._collect_and_trim()
+`)
+	result := runPytest(t, pytest, project, pythonDir, map[string]string{
+		"AIRA_TEST_MEM_DEFAULT": "10",
+	})
+	if result.err != nil {
+		t.Fatalf("standing primitive pytest failed: %v\n%s", result.err, result.output)
+	}
+}
+
+func TestRealPytestRAMStandingReservationReplaceAndRatchet(t *testing.T) {
+	pytest := requireRealPytest(t)
+	project, pythonDir := realPytestProject(t, `
+import aira_xdist_governor as governor
+
+_rss = iter((20, 70, 50))
+governor._read_rss_bytes = lambda: next(_rss)
+`)
+	events := filepath.Join(project, "reserve-events")
+	helper := writeReserveHelper(t, project, `
+import fcntl, os, sys
+request = int(sys.argv[sys.argv.index("--bytes") + 1])
+granted = {30: 25, 80: 65}[request]
+path = os.environ["AIRA_TEST_RESERVE_EVENTS"]
+with open(path + ".lock", "a+") as lock:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    with open(path, "a", encoding="utf-8") as destination:
+        destination.write("acquire %d %d\n" % (request, granted))
+print("granted reserve=%d basis=pinned:client" % granted, flush=True)
+sys.stdin.buffer.read()
+with open(path + ".lock", "a+") as lock:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    with open(path, "a", encoding="utf-8") as destination:
+        destination.write("release %d\n" % granted)
+`)
+	writeTestFile(t, project, "test_standing_ratchet.py", `
+def test_one(): pass
+def test_two(): pass
+def test_three(): pass
+`)
+	result := runPytest(t, pytest, project, pythonDir, map[string]string{
+		"AIRA_TEST_MEM_GOVERNOR": "1", "AIRA_TEST_MEM_DEFAULT": "1",
+		"AIRA_TEST_MEM_GROWTH_HEADROOM": "10", "AIRA_CONFINE_RESERVE_CMD": helper,
+		"AIRA_TEST_RESERVE_EVENTS": events,
+	})
+	if result.err != nil {
+		t.Fatalf("standing replace pytest failed: %v\n%s", result.err, result.output)
+	}
+	data, err := os.ReadFile(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first test creates a 30-byte hold, the growing second test acquires
+	// its 80-byte replacement before releasing it, and the third test fits the
+	// *granted* 65-byte hold. This is deliberately incompatible with both the
+	// old per-test model and a request-not-grant implementation.
+	if got, want := string(data), "acquire 30 25\nacquire 80 65\nrelease 25\nrelease 65\n"; got != want {
+		t.Fatalf("reservation events=%q want=%q", got, want)
+	}
+}
+
+func TestRealPytestRAMGrowthWaitsBeforeLastResortUngoverned(t *testing.T) {
+	pytest := requireRealPytest(t)
+	project, pythonDir := realPytestProject(t, `
+import aira_xdist_governor as governor
+
+governor._DEFAULT_MAX_WAIT = 0.20
+governor._GRANT_READ_GRACE = 0.10
+_rss = iter((10, 30))
+governor._read_rss_bytes = lambda: next(_rss)
+`)
+	firstDone := filepath.Join(project, "first-done")
+	started := filepath.Join(project, "second-started")
+	helper := writeReserveHelper(t, project, `
+import sys, time
+request = int(sys.argv[sys.argv.index("--bytes") + 1])
+if request == 11:
+    print("granted reserve=11 basis=pinned:client", flush=True)
+    sys.stdin.buffer.read()
+else:
+    # Mimic a saturated daemon's bounded admission wait: no grant arrives.
+    time.sleep(1.0)
+`)
+	writeTestFile(t, project, "test_growth_wait.py", `
+import os, time
+def test_first():
+    with open(os.environ["AIRA_TEST_FIRST_DONE"], "w", encoding="utf-8") as destination:
+        destination.write(str(time.monotonic()))
+def test_growing():
+    with open(os.environ["AIRA_TEST_GROWTH_STARTED"], "w", encoding="utf-8") as destination:
+        destination.write(str(time.monotonic()))
+`)
+	result := runPytest(t, pytest, project, pythonDir, map[string]string{
+		"AIRA_TEST_MEM_GOVERNOR": "1", "AIRA_TEST_MEM_DEFAULT": "1",
+		"AIRA_TEST_MEM_GROWTH_HEADROOM": "1", "AIRA_CONFINE_RESERVE_CMD": helper,
+		"AIRA_TEST_FIRST_DONE": firstDone, "AIRA_TEST_GROWTH_STARTED": started,
+	})
+	if result.err != nil {
+		t.Fatalf("growth wait pytest failed: %v\n%s", result.err, result.output)
+	}
+	firstData, firstErr := os.ReadFile(firstDone)
+	data, err := os.ReadFile(started)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstAt, firstParseErr := strconv.ParseFloat(string(firstData), 64)
+	startedAt, parseErr := strconv.ParseFloat(string(data), 64)
+	delay := startedAt - firstAt
+	if firstErr != nil || firstParseErr != nil || parseErr != nil || delay < 0.28 || !strings.Contains(result.output, "bounded daemon admission wait elapsed; running ungoverned") {
+		t.Fatalf("growth did not wait before ungoverned: first=%q started=%q delay=%f errors=%v/%v/%v output=%s", firstData, data, delay, firstErr, firstParseErr, parseErr, result.output)
+	}
+}
+
 func TestRealPytestTotalFailOpen(t *testing.T) {
 	pytest := requireRealPytest(t)
 	t.Run("unset directory", func(t *testing.T) {
@@ -599,7 +742,10 @@ def test_fork_does_not_pin_slot():
 
 func TestRealPytestRAMMarkerPrecedencePinnedAndRegistered(t *testing.T) {
 	pytest := requireRealPytest(t)
-	project, pythonDir := realPytestProject(t, "")
+	project, pythonDir := realPytestProject(t, `
+import aira_xdist_governor as governor
+governor._read_rss_bytes = lambda: 0
+`)
 	requests := filepath.Join(project, "requests.jsonl")
 	helper := writeReserveHelper(t, project, `
 import json, os, sys
@@ -652,7 +798,8 @@ def test_parse_memory_size_rejects_invalid_input(raw):
 `)
 	result := runPytest(t, pytest, project, pythonDir, map[string]string{
 		"AIRA_TEST_MEM_GOVERNOR": "1", "AIRA_TEST_MEM_DEFAULT": "8M",
-		"AIRA_CONFINE_RESERVE_CMD": helper, "AIRA_TEST_REQUESTS": requests,
+		"AIRA_TEST_MEM_GROWTH_HEADROOM": "1",
+		"AIRA_CONFINE_RESERVE_CMD":      helper, "AIRA_TEST_REQUESTS": requests,
 		"PYTEST_ADDOPTS": "--strict-markers",
 	})
 	if result.err != nil {
@@ -662,13 +809,7 @@ def test_parse_memory_size_rejects_invalid_input(raw):
 	if err != nil {
 		t.Fatal(err)
 	}
-	wants := map[string]string{
-		"test_module_scope": "67108864", "test_class_scope": "33554432",
-		"test_test_scope": "16777216",
-		// "4GB" is a full-unit spelling (== 4GiB == 4<<30); decimal mantissas
-		// retain exact integer-byte precision on the marker path.
-		"test_full_unit_spelling": "4294967296", "test_decimal_marker": "1610612736",
-	}
+	var got []string
 	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
 		var argv []string
 		if err := json.Unmarshal([]byte(line), &argv); err != nil {
@@ -678,23 +819,22 @@ def test_parse_memory_size_rejects_invalid_input(raw):
 		if !strings.Contains(joined, " --pinned ") && !strings.Contains(joined, "--pinned") {
 			t.Fatalf("unpinned helper argv=%v", argv)
 		}
-		for node, estimate := range wants {
-			if strings.Contains(joined, node) {
-				if got := argv[indexOf(t, argv, "--bytes")+1]; got != estimate {
-					t.Fatalf("%s estimate=%s want=%s argv=%v", node, got, estimate, argv)
-				}
-				delete(wants, node)
-			}
-		}
+		got = append(got, argv[indexOf(t, argv, "--bytes")+1])
 	}
-	if len(wants) != 0 || strings.Contains(result.output, "invalid aira_mem marker") || strings.Contains(result.output, "PytestUnknownMarkWarning") {
-		t.Fatalf("missing=%v output=%s requests=%s", wants, result.output, data)
+	// Marker precedence is still exercised by the test module. Collection runs
+	// the unmarked parser tests first (8M), then the module marker (64M), and
+	// finally the 4GiB absolute peak; smaller markers perform no round trip.
+	if gotString := strings.Join(got, ","); gotString != "8388608,67108864,4294967296" || strings.Contains(result.output, "invalid aira_mem marker") || strings.Contains(result.output, "PytestUnknownMarkWarning") {
+		t.Fatalf("requests=%v output=%s", got, result.output)
 	}
 }
 
 func TestRealPytestRAMWeightedConcurrencySharesBudgetAcrossSuites(t *testing.T) {
 	pytest := requireRealPytest(t)
-	project, pythonDir := realPytestProject(t, "")
+	project, pythonDir := realPytestProject(t, `
+import aira_xdist_governor as governor
+governor._read_rss_bytes = lambda: 0
+`)
 	state := filepath.Join(project, "ram-state.json")
 	writeTestFile(t, project, "ram-state.json", `{"current":0,"maximum":0,"count":0,"max_count":0,"heavy":0,"heavy_max":0}`)
 	helper := writeReserveHelper(t, project, `
@@ -746,7 +886,8 @@ def test_participating_suite():
 		call.command.Dir = project
 		call.command.Env = realPytestEnv(pythonDir, map[string]string{
 			"AIRA_TEST_MEM_GOVERNOR": "1", "AIRA_TEST_MEM_DEFAULT": "10",
-			"AIRA_CONFINE_RESERVE_CMD": helper, "AIRA_RAM_STATE": state,
+			"AIRA_TEST_MEM_GROWTH_HEADROOM": "1",
+			"AIRA_CONFINE_RESERVE_CMD":      helper, "AIRA_RAM_STATE": state,
 			"AIRA_RAM_BUDGET": "100", "AIRA_CASE_ESTIMATE": estimate,
 		})
 		call.command.Stdout, call.command.Stderr = &call.output, &call.output

@@ -1,5 +1,7 @@
 """Cooperative cross-process pytest CPU and RAM governor distributed by AIRA."""
 
+import atexit
+import ctypes
 import fcntl
 import gc
 import math
@@ -17,6 +19,7 @@ import pytest
 _DEFAULT_POLL_INTERVAL = 0.75
 _DEFAULT_MAX_WAIT = 300.0
 _DEFAULT_AFTER_TEST_GC_INTERVAL = 10.0
+_DEFAULT_GROWTH_HEADROOM = 512 << 20
 _GRANT_READ_GRACE = 2.0
 # re.ASCII keeps case-folding ASCII-only, matching Go's byte-wise strings.ToUpper;
 # without it re.IGNORECASE would fold Unicode look-alikes (e.g. U+212A KELVIN SIGN
@@ -27,6 +30,8 @@ _GRANT_LINE = re.compile(r"^granted reserve=([1-9][0-9]*) basis=pinned:client$")
 _logged_failures = set()
 _held_slot_descriptors = set()
 _held_reservation_streams = set()
+_standing_reservation = None
+_standing_reservation_bytes = 0
 _plugin_active = False
 _last_after_test_gc = time.monotonic()
 
@@ -37,6 +42,7 @@ def _release_slot(descriptor):
 
 
 def _close_inherited_slots():
+    global _standing_reservation, _standing_reservation_bytes
     descriptors = tuple(_held_slot_descriptors)
     _held_slot_descriptors.clear()
     for descriptor in descriptors:
@@ -55,6 +61,8 @@ def _close_inherited_slots():
             stream.close()
         except Exception:
             pass
+    _standing_reservation = None
+    _standing_reservation_bytes = 0
 
 
 os.register_at_fork(after_in_child=_close_inherited_slots)
@@ -87,6 +95,21 @@ def _setting(name, default, *, allow_zero):
             "non-negative" if allow_zero else "positive",
         ))
     return value
+
+
+def _malloc_trim():
+    """Return glibc's free allocator arenas to the OS when available."""
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        # This is intentionally best-effort: musl, non-Linux Python builds, and
+        # libc implementations without malloc_trim must never affect a test.
+        pass
+
+
+def _collect_and_trim():
+    gc.collect()
+    _malloc_trim()
 
 
 def _visible_slots(directory):
@@ -147,7 +170,7 @@ def _acquire_slot():
             _log_once("maximum slot wait elapsed; running ungoverned")
             return None
         if not collected:
-            gc.collect()
+            _collect_and_trim()
             collected = True
         jittered = poll_interval * random.uniform(0.8, 1.2)
         time.sleep(min(remaining, jittered))
@@ -196,6 +219,38 @@ def _memory_estimate(item):
         return default
 
 
+def _growth_headroom():
+    raw = os.environ.get("AIRA_TEST_MEM_GROWTH_HEADROOM", "")
+    if raw == "":
+        return _DEFAULT_GROWTH_HEADROOM
+    return _parse_memory_size(raw)
+
+
+def _read_rss_bytes():
+    """Read this worker's resident RSS from Linux /proc/self/statm."""
+    with open("/proc/self/statm", encoding="ascii") as source:
+        fields = source.read().split()
+    if len(fields) < 2:
+        raise RuntimeError("/proc/self/statm has no resident field")
+    resident_pages = int(fields[1])
+    if resident_pages < 0:
+        raise RuntimeError("/proc/self/statm resident field is negative")
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    if page_size <= 0:
+        raise RuntimeError("SC_PAGE_SIZE is not positive")
+    return resident_pages * page_size
+
+
+def _desired_standing_reservation(item):
+    estimate = _memory_estimate(item)
+    if estimate is None:
+        return None
+    # aira_mem is an absolute peak estimate. The worker's cumulative resident
+    # footprint is the other candidate, with the configurable transient-growth
+    # headroom applied only to that measured path.
+    return max(estimate, _read_rss_bytes() + _growth_headroom())
+
+
 def _read_grant(process, timeout):
     descriptor = process.stdout.fileno()
     os.set_blocking(descriptor, False)
@@ -234,7 +289,7 @@ def _grant_ready(process):
         selector.close()
 
 
-def _stop_reservation(process):
+def _stop_reservation(process, *, abort=False):
     if process is None:
         return
     stdin = process.stdin
@@ -249,6 +304,11 @@ def _stop_reservation(process):
             process.stdout.close()
         except Exception:
             pass
+    if abort:
+        try:
+            process.terminate()
+        except Exception:
+            pass
     try:
         process.wait(timeout=1.0)
     except subprocess.TimeoutExpired:
@@ -260,12 +320,7 @@ def _stop_reservation(process):
             process.wait()
 
 
-def _acquire_reservation(item):
-    if not os.environ.get("AIRA_TEST_MEM_GOVERNOR"):
-        return None
-    estimate = _memory_estimate(item)
-    if estimate is None:
-        return None
+def _start_reservation(bytes_to_hold):
     command = os.environ.get("AIRA_CONFINE_RESERVE_CMD", "")
     if not command:
         _log_once("AIRA_CONFINE_RESERVE_CMD is unset; running ungoverned", domain="RAM")
@@ -274,8 +329,8 @@ def _acquire_reservation(item):
     try:
         process = subprocess.Popen(
             [
-                command, "confine-reserve", "--bytes", str(estimate), "--pinned",
-                "--signature", "pytest:" + item.nodeid,
+                command, "confine-reserve", "--bytes", str(bytes_to_hold), "--pinned",
+                "--signature", "pytest:worker:" + str(os.getpid()),
                 "--max-wait", "%gs" % (_DEFAULT_MAX_WAIT,),
             ],
             stdin=subprocess.PIPE,
@@ -285,36 +340,77 @@ def _acquire_reservation(item):
         )
         _held_reservation_streams.add(process.stdin)
         if not _grant_ready(process):
-            gc.collect()
-        _read_grant(process, _DEFAULT_MAX_WAIT + _GRANT_READ_GRACE)
-        return process
+            _collect_and_trim()
+        granted = _read_grant(process, _DEFAULT_MAX_WAIT + _GRANT_READ_GRACE)
+        return process, granted
     except Exception as exc:
         _log_once("%s; running ungoverned" % (exc,), domain="RAM")
-        _stop_reservation(process)
+        _stop_reservation(process, abort=True)
         return None
+
+
+def _acquire_standing_reservation(item):
+    """Grow the one worker lease, replacing it without an under-reserve gap."""
+    global _standing_reservation, _standing_reservation_bytes
+    if not os.environ.get("AIRA_TEST_MEM_GOVERNOR"):
+        return
+    desired = _desired_standing_reservation(item)
+    if desired is None or desired <= _standing_reservation_bytes:
+        return
+    replacement = _start_reservation(desired)
+    if replacement is None:
+        return
+    process, granted = replacement
+    previous = _standing_reservation
+    # The daemon can clamp an over-ceiling request. Store its actual grant (not
+    # the request), and only release the old lease after the new one is live.
+    _standing_reservation = process
+    _standing_reservation_bytes = granted
+    _stop_reservation(previous)
+
+
+def _release_standing_reservation():
+    global _standing_reservation, _standing_reservation_bytes
+    reservation = _standing_reservation
+    _standing_reservation = None
+    _standing_reservation_bytes = 0
+    try:
+        _stop_reservation(reservation)
+    except Exception as exc:
+        _log_once(exc, domain="RAM")
+
+
+atexit.register(_release_standing_reservation)
 
 
 def pytest_configure(config):
     global _plugin_active
     _plugin_active = True
     config.addinivalue_line(
-        "markers", "aira_mem(size): pinned per-test RAM estimate, e.g. 4G / 512MB / 1.5GB / 4GiB (1024-based)"
+        "markers", "aira_mem(size): absolute per-test peak RSS estimate, e.g. 4G / 512MB / 1.5GB / 4GiB (1024-based)"
     )
+
+
+def pytest_sessionfinish(session, exitstatus):
+    _release_standing_reservation()
+
+
+def pytest_unconfigure(config):
+    _release_standing_reservation()
 
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_protocol(item, nextitem):
-    """Hold CPU and optional RAM leases across setup, call, and teardown."""
+    """Hold CPU leases and ratchet the optional worker RAM lease."""
     global _last_after_test_gc
     descriptor = None
-    reservation = None
     try:
         try:
             descriptor = _acquire_slot()
         except Exception as exc:
             _log_once(exc)
         try:
-            reservation = _acquire_reservation(item)
+            _acquire_standing_reservation(item)
         except Exception as exc:
             _log_once("%s; running ungoverned" % (exc,), domain="RAM")
         yield
@@ -324,15 +420,11 @@ def pytest_runtest_protocol(item, nextitem):
             )
             now = time.monotonic()
             if interval != 0 and now - _last_after_test_gc >= interval:
-                gc.collect()
+                _collect_and_trim()
                 _last_after_test_gc = now
         except Exception as exc:
             _log_once("%s; skipping periodic post-test gc" % (exc,), domain="GC", disabled=False)
     finally:
-        try:
-            _stop_reservation(reservation)
-        except Exception as exc:
-            _log_once(exc, domain="RAM")
         if descriptor is not None:
             try:
                 _release_slot(descriptor)

@@ -16,7 +16,7 @@ aira confine -- make test
 
 That runs `make test` inside a machine-wide slice with a hard RAM cap and group-kill on OOM, niced down so it never freezes your desktop. It won't even start until there's memory for it, and if it goes rogue it dies inside its own slice instead of taking the machine down with it. Several sessions can `aira confine` at once, and AIRA keeps their combined footprint under the cap.
 
-For test suites, `--delegate-ram` beats reserving for the whole job up front. AIRA governs each test: it reserves RAM per test and gates pytest-xdist workers on a shared pool of CPU slots, so several sessions can all run `-n auto` and keep the box busy without OOMing each other.
+For test suites, `--delegate-ram` beats reserving for the whole job up front. AIRA holds one RAM reservation per pytest-xdist worker, ratcheting it upward from measured worker RSS and peak annotations, and gates workers on a shared pool of CPU slots. Several sessions can therefore run `-n auto` without losing track of cumulative worker memory.
 
 ```sh
 aira confine --delegate-ram --memory-reserve 512M -- pytest -n auto

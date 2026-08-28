@@ -16,13 +16,14 @@ var (
 )
 
 var governorEnvironmentKeys = map[string]struct{}{
-	"AIRA_PY_LIB":              {},
-	"AIRA_CPU_SLOTS_DIR":       {},
-	"AIRA_CPU_POLL_INTERVAL":   {},
-	"AIRA_CPU_MAX_WAIT":        {},
-	"AIRA_TEST_MEM_GOVERNOR":   {},
-	"AIRA_TEST_MEM_DEFAULT":    {},
-	"AIRA_CONFINE_RESERVE_CMD": {},
+	"AIRA_PY_LIB":                   {},
+	"AIRA_CPU_SLOTS_DIR":            {},
+	"AIRA_CPU_POLL_INTERVAL":        {},
+	"AIRA_CPU_MAX_WAIT":             {},
+	"AIRA_TEST_MEM_GOVERNOR":        {},
+	"AIRA_TEST_MEM_DEFAULT":         {},
+	"AIRA_TEST_MEM_GROWTH_HEADROOM": {},
+	"AIRA_CONFINE_RESERVE_CMD":      {},
 }
 
 const DefaultTestMemoryReserve = "512M"
@@ -92,6 +93,9 @@ func appendChildEnvironment(env []string, runtimeDir string, diagnostics io.Writ
 		result = upsertChildEnv(result, "AIRA_TEST_MEM_GOVERNOR", "1")
 		result = upsertChildEnv(result, "AIRA_TEST_MEM_DEFAULT", memoryDefault)
 		result = upsertChildEnv(result, "AIRA_CONFINE_RESERVE_CMD", reserveCommand)
+		if value, configured := os.LookupEnv("AIRA_TEST_MEM_GROWTH_HEADROOM"); configured {
+			result = upsertChildEnv(result, "AIRA_TEST_MEM_GROWTH_HEADROOM", value)
+		}
 	}
 	return result
 }

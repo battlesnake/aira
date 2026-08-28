@@ -1,9 +1,10 @@
 # AIRA pytest CPU and RAM governor
 
 This opt-in pytest plugin caps cooperating workers across independent test
-sessions using the slot files created by the AIRA daemon. It is advisory and
-fail-open: it does not provide fairness, and an unavailable governor never
-prevents a test from running.
+sessions using the slot files created by the AIRA daemon. CPU coordination is
+advisory; RAM coordination holds one standing reservation per worker and grows
+it before a test that would exceed the current hold. A saturated RAM growth
+waits for bounded daemon admission, then runs ungoverned only as a last resort.
 
 Add this import-time-safe snippet to the project's `conftest.py`:
 
@@ -53,5 +54,12 @@ The size is `[0-9]+` with an optional 1024-based unit — `K`/`KB`/`KiB`,
 `M`/`MB`/`MiB`, `G`/`GB`/`GiB`, `T`/`TB`/`TiB`, or a bare `B` — case-insensitive,
 every spelling a synonym (`4G` == `4GB` == `4GiB`). Integer only (write `1536M`,
 not `1.5G`). Unmarked tests use the nonzero pinned
-`AIRA_TEST_MEM_DEFAULT`. Reservations are advisory and fail open, while the
-delegate suite remains contained by `memory.oom.group` and the finite slice cap.
+`AIRA_TEST_MEM_DEFAULT`. The marker is an absolute peak-RSS estimate. Before
+each test the worker reads `/proc/self/statm` and holds
+`max(aira_mem, RSS + growth_headroom)`: the default growth headroom is 512 MiB
+and `AIRA_TEST_MEM_GROWTH_HEADROOM` overrides it with the same size syntax.
+The worker performs no reservation round trip unless that target exceeds its
+current granted hold. A growth REPLACEs the hold by acquiring the new total
+before releasing the old one; the daemon's granted (possibly clamped) value is
+the value retained. The delegate suite remains backstopped by `memory.oom.group`
+and the finite slice cap.
