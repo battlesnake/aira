@@ -16,7 +16,9 @@ AIRA is a single static Go binary. It keeps the durable record as plain markdown
 
 ### Track the work
 
-Adopt a repo and AIRA becomes the authority for tickets and their IDs. IDs are allocated atomically, so two sessions can never collide on one. Each ticket is a single markdown file, committed alongside your code — so agents on different tickets never touch the same file, and the record lives in git.
+The obvious way to keep a backlog in a repo — a `BACKLOG.md`, or a counter file for the next ID — falls apart the moment you have more than one worktree or clone. Two sessions both read "next ID is 42", both write `FOO-42`, and one of them quietly loses its ticket in a later rebase. A committed index file conflicts on nearly every merge. And there is no shared notion of who is working on what.
+
+AIRA sidesteps this by not sharing a file to fight over. Adopt a repo and it becomes the authority for tickets and their IDs: each ticket is its own markdown file (`.aira/tickets/FOO-42.md`), so two agents on different tickets never touch the same file. IDs are handed out atomically by a machine-local allocator — not an in-repo counter — so two sessions can't land on the same one, even from separate worktrees. Human-readable indexes like a backlog or roadmap are rendered on demand and never committed, so they can't merge-conflict. The database is only an index; the git files are the truth, and it rebuilds itself from them. Already tracking a backlog elsewhere? `aira import` pulls it in.
 
 ```sh
 aira init                                   # adopt this repo
@@ -65,14 +67,24 @@ aira check                                  # integrity and health sweep
 
 ### Run commands and keep the receipts
 
-AIRA can launch subprocesses for you — foreground or detached — capture their output, kill them cleanly by scope, and record what they cost. `aira time` wraps any command and records how long it ran and how it exited; test reports (JUnit or Go-JSON) are ingested, and flaky tests surfaced.
+AIRA can launch subprocesses for you — foreground or detached — capture their output, and kill them cleanly by scope. `aira run` records the whole run; `aira time` wraps any command and notes how long it took and how it exited.
 
 ```sh
 aira run -- pytest -q                       # run, capture, record
 aira time -- go build ./...                 # record timing and exit status
-aira test-report flaky                      # which tests flip
-aira insights                               # live gauges over all of the above
 ```
+
+### Measure the work, and keep it on your machine
+
+Every run leaves numbers behind, and AIRA keeps them: test outcomes and which tests are flaky, a run's peak memory and CPU and whether it was OOM-killed, per-command latency, and — where an agent reports them — token spend and provider quota by phase and model. `aira insights` turns all of that into live gauges: work in progress, flaky rate, review-loop cost, quota burn, command latency, and more.
+
+```sh
+aira test-report flaky                      # which tests flip
+aira spend ls                               # token and compute cost
+aira insights                               # live gauges over everything above
+```
+
+None of this leaves the machine. "Metrics" here means your own numbers, written to the local database and read back by you — there is no phone-home, no analytics endpoint, nothing about your work reported anywhere. The daemon talks over a local Unix socket, never a network one, and the only remotes AIRA ever reaches are the git remotes you explicitly hand it. The numbers are yours to grep, and they stay put.
 
 ### Referee the machine
 
@@ -97,10 +109,11 @@ def test_big_solve(): ...
 
 ### Capture the friction
 
-When something about the workflow is annoying or wrong, `aira rant` records it on the spot, with the git context attached, so papercuts get written down instead of forgotten.
+When something about the workflow is annoying or wrong, `aira rant` records it on the spot, with the git context attached, so papercuts get written down instead of evaporating. Skim the pile later; recurring friction becomes a to-do list, not a vague sense that something's off.
 
 ```sh
 aira rant "the --foo flag should default to bar"
+aira rant ls                                # read them back later
 ```
 
 ## One tool, several front ends
