@@ -246,14 +246,20 @@ func TestStatusTransitionGraph(t *testing.T) {
 		{StatusInProgress, StatusInReview},
 		{StatusInReview, StatusDone},
 		{StatusDone, StatusRetired},
+		{StatusDone, StatusInProgress}, // reopen: a done fix found partial returns to in-progress
 	}
 	for _, edge := range allowed {
 		if err := ValidateTransition(edge[0], edge[1]); err != nil {
 			t.Errorf("expected %s -> %s to be allowed: %v", edge[0], edge[1], err)
 		}
 	}
-	if err := ValidateTransition(StatusDone, StatusInProgress); err == nil {
-		t.Fatal("backward transition unexpectedly allowed")
+	// Reopen is scoped: done returns to in-progress only, never jumps back to planned.
+	if err := ValidateTransition(StatusDone, StatusPlanned); err == nil {
+		t.Fatal("done should reopen only to in-progress, not jump back to planned")
+	}
+	// Retired stays terminal — no reopen from it.
+	if err := ValidateTransition(StatusRetired, StatusInProgress); err == nil {
+		t.Fatal("retired must stay terminal")
 	}
 }
 

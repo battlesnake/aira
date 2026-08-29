@@ -111,7 +111,11 @@ func ValidateTransition(from, to Status) error {
 		StatusPlanned:    {StatusInProgress: true, StatusRetired: true, StatusSuperseded: true},
 		StatusInProgress: {StatusInReview: true, StatusPlanned: true, StatusRetired: true, StatusSuperseded: true},
 		StatusInReview:   {StatusInProgress: true, StatusDone: true, StatusRetired: true, StatusSuperseded: true},
-		StatusDone:       {StatusRetired: true, StatusSuperseded: true},
+		// Done is reopenable to in-progress: a fix marked done that later proves
+		// partial (e.g. a probabilistic-under-load failure that recurs) returns to
+		// in-progress rather than forcing a new ticket. It cannot jump back to
+		// planned/in-review — only forward-terminal (retire/supersede) or reopen.
+		StatusDone:       {StatusInProgress: true, StatusRetired: true, StatusSuperseded: true},
 		StatusRetired:    {},
 		StatusSuperseded: {},
 	}
