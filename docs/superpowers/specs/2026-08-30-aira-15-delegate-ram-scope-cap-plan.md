@@ -97,3 +97,42 @@ Daemon-side (admission ceiling) + client-side (enforce) → `systemctl --user re
 (preserve `WATCHDOG_MODE=enforce`; reserves reconstruct per #74), batching the merged reopen
 transition. Notify sessions (machine-wide confine change); retire the interim `--memory-max`
 mitigation guidance once live.
+
+## Plan-review round 1 (2026-08-30): Sol BLOCK, DeepSeek APPROVE-with-P1s (Fable pending)
+
+**Sol (BLOCK) — load-bearing:**
+- **P0-1 uncapped paths remain.** Removing the `!DelegateRAM` guard is not enough: daemon-down →
+  flock fallback (`admission.lock != nil`) and daemon `unevaluated` (slice unreadable, `admit.go:316`)
+  carry no `scope_ceiling`; a restart/deploy race launches uncapped. → the finite cap must be a
+  **launch precondition with a CLIENT-SIDE fail-closed fallback ceiling** — never a silent uncapped launch.
+- **P0-2 #74 conflict.** `admit.go:548` reconstructs every finite scope `memory.max` as an *adopted
+  reserve* on restart. A generous ceiling would then be charged as an admission reservation
+  (double-booking; can block per-test grants), contradicting "ceiling ≠ admission charge." → **tag the
+  containment ceiling distinctly** so reconstruction does NOT treat it as a reserve.
+- **P0-3 aggregate not eliminated.** Two scopes each below a 50–60 G ceiling sum to the 64 G slice →
+  slice OOM still possible, no scope having hit its own cap → collateral persists. → **narrow AIRA-15's
+  claim to single uncapped-runaway containment**; the multi-big-job aggregate bound is the scheduler's
+  Slice 3 (RAM-aware admission).
+- **P1** explicit `--memory-max` already charges admission (`confine_linux.go:389`) → double-book with
+  per-test; keep the whole-job charge separate from `min(explicit, ceiling)`.
+- **P1** watchdog (`watchdog.go:344,553,825`) force-exempts AIRA paths + only trips on host MemAvailable
+  → belt-and-braces: don't exempt a *genuinely uncapped* AIRA scope; treat as host-pressure defense only.
+- **P2** first-run "safe-high" is unsafe as a multi-job policy.
+
+**DeepSeek (APPROVE-PLAN):** core fix targets the root cause correctly; "ceiling = backstop, not
+admission charge" is right IN STEADY STATE; agrees it does not bound Σ(actual) for multi-big-job
+(acceptable if honestly deferred); add fail-closed finite fallback if the ceiling computation returns
+`max`; consider p99/max-history over p90 for outlier-spike suites; add a multi-scope concurrent test.
+
+## v2 direction (folding round 1; finalise after Fable)
+
+NARROW + fail-closed. AIRA-15 = **every delegate-ram scope ALWAYS gets a finite `memory.max` (launch
+precondition, client-side fail-closed fallback default when the daemon ceiling is unavailable) so its
+own `oom.group=1` contains an unbounded runaway** — the observed incident (a single uncapped hog) and
+the common case. The ceiling is a CONTAINMENT backstop, **tagged so #74 reconstruction does not adopt
+it as a reserve** (resolves P0-2), and it is **not** an admission charge (steady-state). Honest scope:
+this eliminates the single-uncapped-runaway collateral class; the multi-big-job `Σ(actual) ≤ slice`
+guarantee is explicitly the scheduler's Slice 3, NOT claimed here. Explicit `--memory-max` still wins
+when smaller, kept separate from the whole-job admission charge. Watchdog DiD (don't exempt a
+genuinely-uncapped AIRA scope) folded if cheap, else a follow-up. First-run default: bounded-generous,
+documented as containment-only (not an aggregate bound). Re-review v2 with Sol (it BLOCKed) before build.
