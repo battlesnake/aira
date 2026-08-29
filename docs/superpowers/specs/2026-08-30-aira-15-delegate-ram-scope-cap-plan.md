@@ -136,3 +136,70 @@ guarantee is explicitly the scheduler's Slice 3, NOT claimed here. Explicit `--m
 when smaller, kept separate from the whole-job admission charge. Watchdog DiD (don't exempt a
 genuinely-uncapped AIRA scope) folded if cheap, else a follow-up. First-run default: bounded-generous,
 documented as containment-only (not an aggregate bound). Re-review v2 with Sol (it BLOCKed) before build.
+
+## Plan-review round 1 — Fable GATE-FAIL (folds Sol + DeepSeek; all code-grounded)
+
+Fable confirmed the mechanism sound (`confine_linux.go:497` writes `oom.group=1` unconditionally →
+self-containment is real; `:654-657` reports whole-job scope peak per signature → history measures
+Σ(concurrent per-test RSS) at the right level; explicit `--memory-max` precedence via the
+`scopeMemoryMax<=0` gate; no double-booking while the daemon lives) — but GATE-FAILED the plan-as-written:
+
+- **P1-c (CATASTROPHIC, new):** "remove the `!DelegateRAM` exclusion at :509; use the daemon ceiling"
+  would enforce delegate-ram's `admission.reserve` — the pinned **512 MiB** overhead
+  (`confine_linux.go:379-384`, `pinned:client` early-return `admit.go:177-179`) — as `memory.max`,
+  instantly OOM-killing EVERY suite. The ceiling MUST be a **separate grant field**, never the reserve
+  field. Two omitted blockers: (1) the daemon cannot distinguish delegate-ram — no flag in the admit
+  frame (`admission_linux.go:337-342`) → add a protocol field (or return a ceiling on every confine
+  admit); (2) the pinned early-return skips history → ceiling computation must run **independently of
+  reserve resolution**.
+- **P1-a (= Sol P0-1):** `:509` excludes `admission.lock != nil` (flock fallback) and requires
+  `admitted`, so daemon-`unevaluated`, flock-`unevaluated`, and flock-`timeout` (`admission_linux.go:212`
+  returns nil → launch proceeds) all stay uncapped — including during the deploy restart. → client
+  **fail-closed** enforces `AIRA_DELEGATE_RAM_SCOPE_DEFAULT` itself when no daemon ceiling arrives.
+- **P1-b (= Sol P0-2, sharpened):** `admit.go:552-561` adopts every populated finite-cap scope at its
+  full `Cap`; delegate-ram is skipped today only because its cap is `max`. A finite generous ceiling
+  → a restart mid-suite adopts the full ceiling → `checkedAvailable` withholds most of the slice →
+  two suites freeze admission machine-wide. **The deploy restart triggers exactly this.**
+- **P2-d:** "residual OOM lands on the offender" over-claims — with Σ(actual) > 64 G, the slice OOM
+  (`oom.group=0`) picks the fattest process and kernel group-OOM kills that victim's whole capped
+  scope; an innocent under-ceiling neighbour can still die. Kills the **single-runaway** class; the
+  multi-offender aggregate defers to the scheduler.
+- **P2-e:** ceiling recompute must reuse the oom-escalation path so a legit grown suite escalates next
+  run rather than repeat-wedging.
+- **P2-f:** promote the watchdog belt-and-braces (drop the blanket exemption for *genuinely uncapped*
+  `.aira` scopes) to an explicit item or its own ticket; enumerate residual uncapped classes as gaps.
+
+## v2 — buildable resolution (folds all round-1 findings)
+
+**Scope (narrowed, honest):** AIRA-15 gives every `--delegate-ram` scope a finite `memory.max` so its
+own `oom.group=1` contains a single unbounded runaway (the observed incident + common case). It does
+NOT guarantee Σ(actual) ≤ slice for concurrent big suites — that aggregate bound is the scheduler's
+Slice 3; a multi-offender slice OOM can still kill an under-ceiling neighbour, now better-attributed.
+
+1. **Separate ceiling field (fixes P1-c).** The daemon returns `scope_ceiling` as a NEW admit-response
+   field, distinct from `reserve`. Computed per `ResourceSignature` from scope-peak history
+   (`max(history) × safety`, clamped `[AIRA_DELEGATE_RAM_SCOPE_MIN, slice_budget − headroom]`),
+   **independently of reserve resolution** (runs even on the pinned `pinned:client` early-return). Add a
+   `delegate_ram` bool to the admit frame so the daemon computes/returns the ceiling only for
+   delegate-ram. The client enforces `memory.max = scope_ceiling` — NEVER `admission.reserve`.
+   Discriminating test: a delegate-ram scope's `memory.max` == the ceiling and is never 512 MiB / the
+   reserve.
+2. **Fail-closed client fallback (fixes P1-a).** When no daemon `scope_ceiling` arrives (daemon-down,
+   `unevaluated`, flock fallback/timeout), the client enforces `AIRA_DELEGATE_RAM_SCOPE_DEFAULT`
+   (config, err-high) itself. A delegate-ram scope is NEVER launched uncapped — a launch precondition.
+3. **#74 adoption-safe (fixes P1-b).** Record the cap TYPE in the ConfineRecord: a `#67 reserve-cap`
+   (adopt at `Cap`, unchanged) vs an `AIRA-15 ceiling-cap` (adopt at `min(Cap, memory.current + margin)`
+   — current-only). `admit.go`'s adoption scan reads the type and never charges a ceiling at face value,
+   so the deploy restart cannot freeze admission. Discriminating test: a ceiling-capped scope adopts
+   current+margin, not the ceiling.
+4. **Stale-ceiling escalation (P2-e).** Ceiling recompute reuses the oom-escalation clamp so a suite
+   that OOM'd at its ceiling gets a higher ceiling next run (clamped to slice − headroom).
+5. **Honesty (P2-d).** Reword: kills the single-runaway collateral class; multi-offender aggregate →
+   scheduler. Enumerate the residual uncapped classes (non-delegate flock/`unevaluated` scopes stay
+   uncapped by design — out of AIRA-15's delegate-ram scope) as accepted gaps.
+6. **Watchdog DiD (P2-f) → follow-up ticket** (drop the blanket AIRA-exemption for genuinely-uncapped
+   scopes; + a slice-internal-pressure trigger). Keeps AIRA-15 focused; the residual uncapped classes
+   are the accepted gap until it lands.
+
+**Deploy:** daemon (ceiling field + adoption type) + client (enforce + fallback) → daemon restart,
+made safe by fix (3). Batches the reopen transition. Re-gate v2 (Fable) + Sol before build.
