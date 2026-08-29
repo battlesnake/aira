@@ -33,7 +33,8 @@ const (
 	confineReleaseFD        = 4
 	confineOOMScoreAdj      = 500
 	confineNice             = 19
-	confineIOPriorityClass  = 3
+	confineIOPriorityClass  = 2 // best-effort / IOPRIO_CLASS_BE
+	confineIOPriorityData   = 7 // Best-effort priority: 0 is highest, 7 is lowest.
 )
 
 type confineHandshake struct {
@@ -998,7 +999,7 @@ func RunConfineSetup(argv []string, diagnostics io.Writer) int {
 	result := confineHandshake{Schema: confineHandshakeSchema}
 	result.OOMScoreAdj = os.WriteFile("/proc/self/oom_score_adj", []byte(strconv.Itoa(oomAdj)+"\n"), 0o644) == nil
 	result.Nice = unix.Setpriority(unix.PRIO_PROCESS, 0, niceValue) == nil
-	_, _, errno := unix.Syscall(unix.SYS_IOPRIO_SET, uintptr(1), 0, uintptr(ioClass<<13))
+	_, _, errno := unix.Syscall(unix.SYS_IOPRIO_SET, uintptr(1), 0, uintptr(confineIOPriority(ioClass)))
 	result.IONice = errno == 0
 	if err := writeConfineHandshake(handshake, result); err != nil {
 		if diagnostics != nil {
@@ -1122,6 +1123,14 @@ func writeConfineHandshake(writer io.Writer, result confineHandshake) error {
 	return nil
 }
 
+// confineIOPriority encodes the ioprio_set value: the I/O class in the high bits
+// with the pinned lowest best-effort priority (confineIOPriorityData). The child
+// syscall and its test both call this, so the test pins the real callsite rather
+// than recomputing the expression.
+func confineIOPriority(ioClass int) int {
+	return ioClass<<13 | confineIOPriorityData
+}
+
 func parseConfineSetupArgs(argv []string) (handshakeFD, releaseFD, oomAdj, niceValue, ioClass int, target []string, err error) {
 	if len(argv) < 11 || argv[0] != "--handshake-fd" || argv[2] != "--release-fd" || argv[4] != "--oom-score-adj" || argv[6] != "--nice" || argv[8] != "--ionice-class" || argv[10] != "--" || len(argv) == 11 || argv[11] == "" {
 		return 0, 0, 0, 0, 0, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: malformed confine setup arguments")
@@ -1134,7 +1143,7 @@ func parseConfineSetupArgs(argv []string) (handshakeFD, releaseFD, oomAdj, niceV
 		}
 		*values[i] = value
 	}
-	if handshakeFD < 3 || releaseFD < 3 || handshakeFD == releaseFD || oomAdj < -1000 || oomAdj > 1000 || niceValue < -20 || niceValue > 19 || ioClass != 3 {
+	if handshakeFD < 3 || releaseFD < 3 || handshakeFD == releaseFD || oomAdj < -1000 || oomAdj > 1000 || niceValue < -20 || niceValue > 19 || ioClass != 2 {
 		return 0, 0, 0, 0, 0, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: malformed confine setup arguments")
 	}
 	return handshakeFD, releaseFD, oomAdj, niceValue, ioClass, append([]string(nil), argv[11:]...), nil

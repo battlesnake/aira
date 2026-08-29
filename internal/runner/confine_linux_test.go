@@ -190,6 +190,41 @@ func TestParseConfineHandshakeRequiresCompleteSuccessfulResult(t *testing.T) {
 	}
 }
 
+func TestParseConfineSetupArgsAcceptsOnlyBestEffortIOClass(t *testing.T) {
+	argv := []string{
+		"--handshake-fd", "3", "--release-fd", "4", "--oom-score-adj", "500", "--nice", "19", "--ionice-class", "2", "--", "/bin/true",
+	}
+	_, _, _, _, ioClass, target, err := parseConfineSetupArgs(argv)
+	if err != nil {
+		t.Fatalf("parse class 2: %v", err)
+	}
+	if ioClass != 2 || !reflect.DeepEqual(target, []string{"/bin/true"}) {
+		t.Fatalf("parse result class=%d target=%q", ioClass, target)
+	}
+
+	for _, ioClass := range []string{"0", "1", "3", "4"} {
+		t.Run("class-"+ioClass, func(t *testing.T) {
+			invalid := append([]string(nil), argv...)
+			invalid[9] = ioClass
+			if _, _, _, _, _, _, err := parseConfineSetupArgs(invalid); err == nil {
+				t.Fatalf("class %s unexpectedly accepted", ioClass)
+			}
+		})
+	}
+}
+
+func TestConfineIOPriorityEncodingIsLowestBestEffort(t *testing.T) {
+	if confineIOPriorityClass != 2 {
+		t.Fatalf("I/O priority class=%d, want best-effort class 2", confineIOPriorityClass)
+	}
+	if confineIOPriorityData != 7 {
+		t.Fatalf("I/O priority data=%d, want lowest best-effort priority 7", confineIOPriorityData)
+	}
+	if got := confineIOPriority(confineIOPriorityClass); got != 16391 {
+		t.Fatalf("encoded ioprio=%d, want 16391", got)
+	}
+}
+
 func TestFormatConfineStatusReportsIndependentFacets(t *testing.T) {
 	status := ConfineStatus{
 		Slice:        "whale.slice",
