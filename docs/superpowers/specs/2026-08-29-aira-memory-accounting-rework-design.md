@@ -244,3 +244,32 @@ works with the *existing* per-test acquire/release and cannot deadlock. So:
   + the daemon-side atomic ADJUST op (amortise the round-trip; fix the fail-open hole)
   + the keyed shared-quota. Efficiency/robustness, not the OOM cure — must not gate the
   safety win or force a risky shared-daemon change under contention.
+
+## SHIPPED — safe subset (2026-08-29, commit on branch aira-mem-accounting)
+
+Built (Terra), verified (Opus), reviewed (Sol APPROVE, no P0–P2). The two real
+deltas vs the prior per-test model:
+
+1. `gc.collect()` → also `malloc_trim(0)` (guarded best-effort) in `_collect_and_trim`.
+2. Per-test reservation sized to `max(aira_mem, measured_RSS + growth_headroom)`
+   (`_reservation_bytes` via `/proc/self/statm`), not the raw per-test estimate —
+   so each test reserves the worker's cumulative footprint. This is the OOM
+   under-count cure.
+
+Model: per-test acquire in `pytest_runtest_protocol` try, release in `finally`
+(one hold per test — structurally cannot deadlock). Signature `pytest:<nodeid>`.
+Fail-open-on-timeout unchanged (accepted (B) residual).
+
+Verify: `go test ./internal/pylib/... ./internal/runner/...` exit 0. `make test`
+exit 2 with exactly two failures — `TestMCPConfineKillOutsideProjectKeepsOwnershipAndStealChecks`
+and `TestTUIKeypressAndQuitWhileFetchAndQueueUpdateAreInFlight` — both **pass
+clean in isolation** (load-timing flakes: MCP populated-gate race + tview timing,
+neither touches pylib). Discriminating test `TestRealPytestRAMReservationUsesMeasuredRSS`
+(marker 10, RSS 40, headroom 10 → `--bytes 50`) revert-checked against raw estimate.
+
+Deploy: governor is `go:embed`ded + sizing is client-side → binary rebuild+swap
+(+ `aira skill install --force`), **no daemon restart**.
+
+STILL DEFERRED (focused daemon milestone, box-quiet): per-worker STANDING reserve
++ daemon-side atomic ADJUST (round-trip amortise; fixes fail-open hole), keyed
+shared-quota dedup (§3), restart-resilience of holds.
