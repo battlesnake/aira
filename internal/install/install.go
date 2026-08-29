@@ -736,13 +736,17 @@ func installHome(d installDeps) (string, error) {
 }
 
 func computeMemoryLimits(maximumArg, highArg, installed string, memTotalKB int64) (string, string, error) {
+	totalGiB := float64(memTotalKB) / float64(gibPerKiB)
 	maximum := maximumArg
 	if maximum == "" {
 		maximum = parseInstalledValue(installed, installedMemoryMaxRE)
 	}
 	if maximum == "" {
-		gib := float64(memTotalKB) / float64(gibPerKiB)
-		maximum = fmt.Sprintf("%dG", int64(math.Floor(gib*2/3)))
+		// Default cap: leave the host min(total/4, 16 GiB) of headroom — a
+		// share on small boxes, a flat 16 GiB desktop margin on large ones.
+		// Floored to whole GiB (conservative: a smaller cap = more headroom).
+		reserveGiB := math.Min(totalGiB/4, 16)
+		maximum = fmt.Sprintf("%dG", int64(math.Floor(totalGiB-reserveGiB)))
 	}
 	maxN, err := validateSize(maximum, "MemoryMax", true)
 	if err != nil {
@@ -750,7 +754,15 @@ func computeMemoryLimits(maximumArg, highArg, installed string, memTotalKB int64
 	}
 	high := highArg
 	if high == "" {
-		high = fmt.Sprintf("%dG", maxN-2)
+		// Default soft brake: throttle/reclaim min(total/16, 4 GiB) below the
+		// cap. Floored to whole GiB; guarded so a tiny cap can never drive the
+		// high watermark to 0 (which would throttle every allocation).
+		softGiB := int64(math.Floor(math.Min(totalGiB/16, 4)))
+		highN := maxN - softGiB
+		if highN < 1 {
+			highN = maxN
+		}
+		high = fmt.Sprintf("%dG", highN)
 	}
 	highN, err := validateSize(high, "MemoryHigh", false)
 	if err != nil {

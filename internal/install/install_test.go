@@ -21,10 +21,19 @@ func TestComputeMemoryLimitsPrecedenceAndValidation(t *testing.T) {
 		wantMax, wantHigh              string
 		wantErr                        bool
 	}{
-		{name: "flag wins", maximum: "48G", installed: "MemoryMax=40G\n", memKB: 96 * gibPerKiB, wantMax: "48G", wantHigh: "46G"},
-		{name: "installed wins", installed: "MemoryMax=40G\n", memKB: 96 * gibPerKiB, wantMax: "40G", wantHigh: "38G"},
-		{name: "two thirds RAM", memKB: 96 * gibPerKiB, wantMax: "64G", wantHigh: "62G"},
+		{name: "flag wins", maximum: "48G", installed: "MemoryMax=40G\n", memKB: 96 * gibPerKiB, wantMax: "48G", wantHigh: "44G"},
+		{name: "installed wins", installed: "MemoryMax=40G\n", memKB: 96 * gibPerKiB, wantMax: "40G", wantHigh: "36G"},
+		// Default cap = total - min(total/4, 16G); default high = cap - min(total/16, 4G).
+		{name: "default 16G", memKB: 16 * gibPerKiB, wantMax: "12G", wantHigh: "11G"},
+		{name: "default 32G", memKB: 32 * gibPerKiB, wantMax: "24G", wantHigh: "22G"},
+		{name: "default 64G (reserve cap kicks in)", memKB: 64 * gibPerKiB, wantMax: "48G", wantHigh: "44G"},
+		{name: "default 78G (this box)", memKB: 78 * gibPerKiB, wantMax: "62G", wantHigh: "58G"},
+		{name: "default 96G", memKB: 96 * gibPerKiB, wantMax: "80G", wantHigh: "76G"},
+		{name: "default 128G", memKB: 128 * gibPerKiB, wantMax: "112G", wantHigh: "108G"},
 		{name: "high override", maximum: "48G", high: "32G", wantMax: "48G", wantHigh: "32G"},
+		{name: "tiny cap on big box: high guard, no band", maximum: "4G", memKB: 96 * gibPerKiB, wantMax: "4G", wantHigh: "4G"},
+		{name: "default 6G floors to 4G cap, no band", memKB: 6 * gibPerKiB, wantMax: "4G", wantHigh: "4G"},
+		{name: "default 5G falls below the 4G cap floor", memKB: 5 * gibPerKiB, wantErr: true},
 		{name: "bad maximum syntax", maximum: "4GiB", wantErr: true},
 		{name: "maximum below floor", maximum: "3G", wantErr: true},
 		{name: "bad high syntax", maximum: "8G", high: "7g", wantErr: true},
