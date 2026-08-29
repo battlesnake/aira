@@ -1,6 +1,6 @@
 # AIRA — design spec (top-level scope + architecture)
 
-- **Status:** designed (this document); not yet built.
+- **Status:** Built. This is the original design map (2026-08-07); Phases 0–5 (§20) are all implemented and merged, plus a long tail of later hardening milestones (confinement, install, watchdog, daemon, project lifecycle, memory accounting). The per-subsystem specs in this directory and the live `.aira/` tracker hold the as-built detail; where a later spec supersedes a decision here, the later spec wins.
 - **Date:** 2026-08-07 (v4 — folds a three-lineage adversarial review: Gemini + Codex/GPT-5.6-Sol + Fable. The mechanism fixes below are load-bearing; the architecture, honesty discipline, and phasing survived the review intact).
 - **Scope:** whole-product scope, architecture, data model, phasing. Each subsystem gets its own spec → plan → build cycle. This is the map; "resolved in the Phase-N spec" is deliberate.
 - **Companion:** [Phase 0 process-docs plan](#phase-0--bootstrap-process-docs-the-non-tool-deliverable).
@@ -177,6 +177,8 @@ The useful JIRA subset, recast for agents — the *drill-down* is the point. **K
 ## 19. Command / tool surface (small + escape hatch)
 
 CLI: `init · id <prefix> · new/create · ls/list [<q>] [--by F] · count [q] --by F · show/get · set · mv <status> · claim/release/heartbeat · touch · link · find add|ls · req … · ready <id> · review <id> · import … · run … · run-kill · run-log · test-report add|ls · ratchet … · spend · quota … · grep · backlog · roadmap · stats · check · watch · exec "<cmds>" · mcp · tui · install · daemon`. (`run-input` lands post-shim, §14.) **`aira init`** is a first-class new-project scaffolder. **Token-efficient output:** MCP-only 50-row cap → distribution-over-one-field on overflow (never a silent truncation; the same discipline governs `run-log`); `--fields` opt-in; `count --by` size-before-fetch. **MCP tools — ~10 core + `aira_exec`, plus 3 runner tools that arrive with the runner:** core = `aira_create · aira_list · aira_get · aira_transition · aira_claim · aira_link · aira_finding · aira_ready · aira_review · aira_reconcile`; runner (Phase 3 lite / Phase 5) = `aira_run · aira_run_output · aira_run_kill`. Descriptions generated from the tables (§4.3).
+
+**As built (reconciled 2026-08-29).** `create`/`list`/`show` are the canonical spellings and `new`/`ls`/`get` are kept as aliases. The human indices `backlog`/`roadmap`/`stats` were **not** shipped as their own verbs — that role folded into `list`, `ready`, and `insights` (a live-query gauge surface, never a stored numeral, §17). `ratchet` became a **kind** of `gate` rather than a top-level verb. Later phases added a large surface this early list predates: `confine` (+ `--list`/`--kill`/`confine-reserve`), `install`, `eject`, `rant`, `time`, `git`, `run-input`, `gate`, `insights`, `reconcile`, and the `req`/`find` CRUD trees. `aira` with no verb prints the current authoritative dispatch list.
 
 ## 20. Phasing
 
