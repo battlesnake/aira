@@ -57,18 +57,22 @@ happens at the worker's cooperative checkpoint. Not a replacement for the slice
 
 ### 3.1 Priority baseline + aging (Slice 1 — closes AIRA-14, ships first)
 
-- Confined jobs launch at **`nice 5`** (was 19) so a young/bootstrapping job's CPU
-  (interpreter spin-up, imports) is not starved — this closes the AIRA-14 residual.
-  `ionice` stays best-effort-7 (already shipped).
-- A job **ages** toward `nice 19` over its lifetime (e.g. +1 at 10s, 30s, 1m, 5m, 10m,
-  30m, capping at 19), so a long-running job yields the desktop the way today's flat
-  nice-19 does, while fresh/short jobs stay responsive. `nice ∈ [5,19]`, never < 5.
-- **Mechanism (open question, §6):** either the confine supervisor periodically re-nices
-  the scope's descendants, or it decays the scope cgroup's `cpu.weight` (one knob,
-  covers all workers incl. those forked after launch). `cpu.weight` is the cleaner
-  candidate; to be decided in the build with a measurement.
-- Slice 1 keeps the flock unchanged — it is a pure priority change, independently
-  shippable, and is what AIRA-14 needs. It goes through its own two-loop.
+Mechanism (owner-decided 2026-08-30): **cgroup `cpu.weight` decay**, not re-nicing.
+
+- The confine supervisor sets the scope's `cpu.weight` **HIGH at launch** so a young /
+  bootstrapping scope competes well for CPU — the interpreter spin-up + imports get
+  scheduled, closing the AIRA-14 CPU-side residual (complementing the already-shipped
+  `ionice` best-effort-7 that fixed the bootstrap *I/O*).
+- It **decays** the scope's `cpu.weight` toward a low value over the job's lifetime
+  (e.g. steps at 10s, 30s, 1m, 5m, 10m, 30m), so a long-running job yields CPU to the
+  desktop and to newer jobs — the desktop protection today's flat nice-19 gives, but
+  age-graded.
+- `cpu.weight` is one cgroup knob and covers **all** workers, including those execnet
+  forks after launch — cleaner than re-nicing descendants. `nice` stays 19 (threads
+  share the scope's `cpu.weight` allocation; no per-descendant re-nice needed).
+- Validate in the build that a *young* scope's high weight doesn't disturb the desktop.
+- Slice 1 keeps the flock unchanged — a pure priority change, independently shippable,
+  and exactly what AIRA-14 needs. Its own two-loop; ships first.
 
 ### 3.2 The daemon cooperative scheduler (Slice 2 — replaces the flock)
 
@@ -128,10 +132,13 @@ scheduler is an optimisation over the hard backstop, never a correctness depende
    keep the flock. Small, independently valuable, its own two-loop. Ships first.
 2. **Slice 2 — the daemon scheduler.** Checkpoint protocol + active-set management +
    connection-held grants + cooperative park/activate. Cut the CPU governor from flock
-   → daemon. Keep the flock as the daemon-down fallback initially (belt-and-braces),
-   remove once the scheduler is proven.
-3. **Slice 3 — RAM-aware admission.** Fold the per-test `confine-reserve` RAM ledger
-   into the scheduler's active-set sizing (small-next-test-first). Unifies CPU + RAM.
+   → daemon and **REMOVE the flock** (owner-decided 2026-08-30): the daemon is the sole
+   scheduler, no parallel fallback mechanism. Daemon-down → the plugin fails open (runs
+   ungoverned, bounded by the slice cap + `oom.group`) — a trivial safety net for a
+   transient restart, not a second scheduler to maintain.
+3. **Slice 3 — RAM-aware admission (unify, owner-decided).** Fold the per-test
+   `confine-reserve` RAM ledger into the scheduler's active-set sizing
+   (small-next-test-first). One scheduler owns CPU + RAM, not two mechanisms.
 
 Each slice is a full plan→plan-review→build→build-review→verify→deploy cycle. Slices 2
 and 3 are daemon changes → a daemon restart deploys them (batch the `done→in-progress`
@@ -139,16 +146,15 @@ reopen transition, already merged, with the first such restart).
 
 ## 6. Open design questions (resolve in the per-slice specs)
 
-- **Aging mechanism:** re-nice descendants vs decay scope `cpu.weight`. Lean:
-  `cpu.weight` (one knob, covers forked workers). Decide with a measurement in Slice 1.
-- **Aging schedule + `nice 5` desktop impact:** validate the desktop stays smooth with
-  fresh jobs at `nice 5` + `ionice` best-effort-7; tune the decay curve.
+- **Resolved (owner 2026-08-30):** aging mechanism = cgroup `cpu.weight` decay; the
+  flock is REMOVED (daemon is the sole scheduler, fail-open ungoverned when down);
+  CPU + RAM are unified into one scheduler (Slice 3).
+- **Aging schedule + young-weight desktop impact:** validate the desktop stays smooth
+  with a fresh scope at high `cpu.weight` + `ionice` best-effort-7; tune the decay curve.
 - **CPU capacity signal:** how the daemon derives "≈ncores active" (NumCPU − reserve,
   as the flock did) and whether it accounts for non-AIRA load.
 - **Fairness policy:** exact young-first weighting + the minimum-share floor for long
   jobs; how "age" is measured (job age vs worker age vs held-RSS).
-- **Flock cutover:** keep as fallback vs remove; how the plugin chooses daemon vs flock
-  vs ungoverned.
 - **Non-pytest governed jobs:** whether/how `aira confine -- <non-pytest>` participates
   (today only the pytest plugin checkpoints; a whole-job confine has no per-test seam).
 
