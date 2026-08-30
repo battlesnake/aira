@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-11","project":"aira","title":"xdist -n16 under multi-session contention blanks to 0-collect (exit 5); governor is fail-open/per-test so not the crasher — likely execnet worker-bootstrap starvation under confine CPU-deprioritisation","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-11","project":"aira","title":"xdist -n16 under multi-session contention blanks to 0-collect (exit 5); governor is fail-open/per-test so not the crasher — likely execnet worker-bootstrap starvation under confine CPU-deprioritisation","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":[],"hold":false,"relations":[{"kind":"relates","from":"AIRA-14","to":"AIRA-11"},{"kind":"relates","from":"AIRA-17","to":"AIRA-11"}]}
 ---
 a peer session (an earlier ticket merge-gate). aira confine --delegate-ram ... -- make merge-gate: engine leg at -n16 (MemAvailable-derived) BLANKED under 3-way slice contention -> 'bringing up nodes... no tests ran in 2.02s', pytest exit=5 (0 collected). NOT OOM (no 137/cap-kill). Same --delegate-ram: non-xdist collect-only collects 16686 fine; -n8 runs the full suite clean (16663 passed). 
 

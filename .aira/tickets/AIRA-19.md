@@ -1,0 +1,11 @@
+---
+{"schema":1,"id":"AIRA-19","project":"aira","title":"Governor observability: split granted/reactivated log + end-to-end write-deadline regression test","status":"done","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["observability","scheduler","slice2"],"hold":false,"relations":[]}
+---
+Follow-up to AIRA-18. The enforce actuation log `governor enforce activated worker=… job=…` (governor.go:305) fires on ANY parked→active transition — both a fresh acquire (grant path, governor.go:312) and a reactivation of a parked worker (epoch path, governor.go:309). So "same UUID activated repeatedly" cannot distinguish reconnect-churn from healthy park/reactivate rotation. This ambiguity directly caused a misdiagnosis during the AIRA-18 validation (I read repeated "activated" as ongoing churn when it was pre-fix-daemon data + the restart storm; the fix was actually working).
+
+Do:
+1. Split the log by wake source in evaluate(): a fresh grant (w.grant, governor.go:312) → `governor enforce granted worker=… job=… (fresh acquire)`; a reactivation (w.epoch, governor.go:309) → `governor enforce reactivated worker=… job=… (resumed from park)`. Then reconnect-churn (repeated `granted`, no intervening `parked`) is instantly distinguishable from healthy rotation.
+2. Consider low-noise visibility for park-at-acquire (a worker parked immediately at acquire when capacity is full is currently silent — no log — so the active-set cap is invisible). Either a per-tick active-set summary (N active / M parked / K jobs) at a throttled cadence, or a one-line park-at-acquire log. Keep it non-spammy (avoid the observe-mode firehose class).
+3. Add the end-to-end regression test the AIRA-18 investigation recommended (codify probe #3): open a governor connection, keep it ACTIVE, send a checkpoint after connection-age > 30s, assert the reply arrives. This guards the stale-write-deadline reconnect-churn class at the governorConnection level (the AIRA-18 unit test only exercises the writeGovernorFrame helper, not the full handler across the 30s boundary). Probe sources kept at ~/tmp/govprobe/main.go + multi.go.
+
+Also fold RANT-12 (observe-mode "would park" firehose dedup) into this same daemon change so it rides the restart. Enables clean live validation of enforce preemption (parks), which gates the Slice 3 build (#80).
