@@ -1,11 +1,9 @@
 """Cooperative cross-process pytest CPU and RAM governor distributed by AIRA."""
 
 import ctypes
-import fcntl
 import gc
 import math
 import os
-import random
 import re
 import selectors
 import subprocess
@@ -15,7 +13,6 @@ import time
 import pytest
 
 
-_DEFAULT_POLL_INTERVAL = 0.75
 _DEFAULT_MAX_WAIT = 300.0
 _DEFAULT_AFTER_TEST_GC_INTERVAL = 10.0
 _DEFAULT_GROWTH_HEADROOM = 512 << 20
@@ -27,25 +24,16 @@ _MEMORY_SIZE = re.compile(r"^([0-9]+)(?:\.([0-9]+))?(B|KIB|KB|K|MIB|MB|M|GIB|GB|
 _MEMORY_SCALE = {"": 1, "B": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
 _GRANT_LINE = re.compile(r"^granted reserve=([1-9][0-9]*) basis=pinned:client$")
 _logged_failures = set()
-_held_slot_descriptors = set()
 _held_reservation_streams = set()
+_held_governor_streams = set()
 _plugin_active = False
 _last_after_test_gc = time.monotonic()
+_last_governor_checkpoint = 0.0
+_governor_process = None
+_governor_disabled = False
 
 
-def _release_slot(descriptor):
-    _held_slot_descriptors.discard(descriptor)
-    os.close(descriptor)
-
-
-def _close_inherited_slots():
-    descriptors = tuple(_held_slot_descriptors)
-    _held_slot_descriptors.clear()
-    for descriptor in descriptors:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
+def _close_inherited_streams():
     # Reservation stdin is a BufferedWriter (subprocess.PIPE). Close the STREAM
     # OBJECT (its write buffer is always empty — we only close it for EOF, never
     # write), so the inherited copy is released with a single clean fd close and
@@ -57,9 +45,21 @@ def _close_inherited_slots():
             stream.close()
         except Exception:
             pass
+    streams = tuple(_held_governor_streams)
+    _held_governor_streams.clear()
+    for stream in streams:
+        try:
+            stream.close()
+        except Exception:
+            pass
+    # A forked test child must never retain (or acquire) the worker's daemon
+    # grant. Its inherited relay descriptors were just closed above.
+    global _governor_process, _governor_disabled
+    _governor_process = None
+    _governor_disabled = True
 
 
-os.register_at_fork(after_in_child=_close_inherited_slots)
+os.register_at_fork(after_in_child=_close_inherited_streams)
 
 
 def _log_once(message, *, domain="CPU", disabled=True):
@@ -106,68 +106,85 @@ def _collect_and_trim():
     _malloc_trim()
 
 
-def _visible_slots(directory):
-    with os.scandir(directory) as entries:
-        indexed = []
-        for entry in entries:
-            if not entry.name.startswith("slot-"):
-                raise RuntimeError("unexpected entry in CPU slot population")
-            suffix = entry.name[len("slot-") :]
-            if not suffix.isdigit() or str(int(suffix)) != suffix:
-                raise RuntimeError("malformed CPU slot name")
-            if not entry.is_file(follow_symlinks=False):
-                raise RuntimeError("CPU slot is not a regular file")
-            indexed.append((int(suffix), entry.path))
-    if not indexed:
-        return []
-    indexed.sort()
-    if [index for index, _ in indexed] != list(range(len(indexed))):
-        raise RuntimeError("incomplete CPU slot population")
-    return [path for _, path in indexed]
+def _stop_governor(process=None):
+    global _governor_process
+    if process is None:
+        process = _governor_process
+    if process is None:
+        return
+    if process is _governor_process:
+        _governor_process = None
+    for stream in (process.stdin, process.stdout):
+        if stream is not None:
+            _held_governor_streams.discard(stream)
+            try:
+                stream.close()
+            except Exception:
+                pass
+    try:
+        process.wait(timeout=1.0)
+    except Exception:
+        # Closing stdin is the release protocol. The process is only cleaned up
+        # best-effort; a broken relay must never affect the pytest worker.
+        pass
 
 
-def _try_slots(paths):
-    random.shuffle(paths)
-    for path in paths:
-        descriptor = os.open(path, os.O_RDWR | os.O_CLOEXEC)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            _held_slot_descriptors.add(descriptor)
-            return descriptor
-        except BlockingIOError:
-            os.close(descriptor)
-        except Exception:
-            os.close(descriptor)
-            raise
-    return None
+def _disable_governor(error):
+    global _governor_disabled
+    _governor_disabled = True
+    _log_once("%s; running ungoverned" % (error,), domain="CPU")
+    _stop_governor()
 
 
-def _acquire_slot():
-    directory = os.environ.get("AIRA_CPU_SLOTS_DIR")
-    if not directory:
-        return None
-    poll_interval = _setting(
-        "AIRA_CPU_POLL_INTERVAL", _DEFAULT_POLL_INTERVAL, allow_zero=False
-    )
-    max_wait = _setting("AIRA_CPU_MAX_WAIT", _DEFAULT_MAX_WAIT, allow_zero=True)
-    deadline = time.monotonic() + max_wait
-    collected = False
-    while True:
-        paths = _visible_slots(directory)
-        if not paths:
-            return None
-        descriptor = _try_slots(paths)
-        if descriptor is not None:
-            return descriptor
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            _log_once("maximum slot wait elapsed; running ungoverned")
-            return None
-        if not collected:
-            _collect_and_trim()
-            collected = True
-        jittered = poll_interval * random.uniform(0.8, 1.2)
-        time.sleep(min(remaining, jittered))
+def _read_governor_reply(process):
+    # The relay guarantees a bounded reply (AIRA_GOVERNOR_MAX_WAIT); do not add
+    # a competing plugin timer. A worker parked longer than that runs
+    # ungoverned. That is rare because min-share rotation normally reaches it
+    # within active workers' test durations; the bound exists solely so a wedged
+    # daemon degrades instead of hanging an entire pytest suite.
+    if process.poll() is not None:
+        raise RuntimeError("governor relay exited without a reply")
+    line = process.stdout.readline()
+    if not line:
+        raise RuntimeError("governor relay exited without a reply")
+    reply = line.decode("utf-8", "strict").strip()
+    if reply not in ("active", "continue"):
+        raise RuntimeError("governor relay returned invalid reply %r" % (reply,))
+    return reply
+
+
+def _governor_checkpoint():
+    """Acquire once, then yield at bounded between-test checkpoints.
+
+    This hook runs before per-test RAM reservation. A daemon park can therefore
+    never occur while a confine-reserve grant is held.
+    """
+    global _governor_process, _governor_disabled, _last_governor_checkpoint
+    if _governor_disabled or os.environ.get("AIRA_GOVERNOR") == "off":
+        return
+    command = os.environ.get("AIRA_GOVERNOR_CMD", "")
+    if not command:
+        return
+    try:
+        if _governor_process is None:
+            process = subprocess.Popen(
+                [command, "governor-slot"], stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=None, close_fds=True,
+            )
+            _governor_process = process
+            _held_governor_streams.update((process.stdin, process.stdout))
+            _read_governor_reply(process)
+            _last_governor_checkpoint = time.monotonic()
+            return
+        if time.monotonic() - _last_governor_checkpoint < _DEFAULT_AFTER_TEST_GC_INTERVAL:
+            return
+        held_rss = _read_rss_bytes()
+        _governor_process.stdin.write(("checkpoint %d 0\n" % (held_rss,)).encode("ascii"))
+        _governor_process.stdin.flush()
+        _read_governor_reply(_governor_process)
+        _last_governor_checkpoint = time.monotonic()
+    except Exception as exc:
+        _disable_governor(exc)
 
 
 def _parse_memory_size(raw):
@@ -352,17 +369,24 @@ def pytest_configure(config):
     )
 
 
+def pytest_unconfigure(config):
+    global _plugin_active
+    _plugin_active = False
+    _stop_governor()
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_protocol(item, nextitem):
-    """Hold CPU and optional RAM leases across setup, call, and teardown."""
+    """Hold an optional RAM lease across one test's pytest phases."""
     global _last_after_test_gc
-    descriptor = None
     reservation = None
     try:
         try:
-            descriptor = _acquire_slot()
+            # This precedes _acquire_reservation deliberately: the cooperative
+            # daemon may park the worker only while it holds no RAM grant.
+            _governor_checkpoint()
         except Exception as exc:
-            _log_once(exc)
+            _disable_governor(exc)
         try:
             reservation = _acquire_reservation(item)
         except Exception as exc:
@@ -383,8 +407,3 @@ def pytest_runtest_protocol(item, nextitem):
             _stop_reservation(reservation)
         except Exception as exc:
             _log_once(exc, domain="RAM")
-        if descriptor is not None:
-            try:
-                _release_slot(descriptor)
-            except Exception as exc:
-                _log_once(exc)

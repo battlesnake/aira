@@ -18,6 +18,21 @@ func TestGovernorSlotFailOpenOnDialFailure(t *testing.T) {
 	}
 }
 
+func TestGovernorMaxWaitUsesGenerousDefaultOnInvalidSetting(t *testing.T) {
+	for _, raw := range []string{"", "not-a-duration", "0s", "-1s"} {
+		t.Run(raw, func(t *testing.T) {
+			t.Setenv("AIRA_GOVERNOR_MAX_WAIT", raw)
+			if got := governorMaxWait(); got != defaultGovernorMaxWait {
+				t.Fatalf("max wait for %q = %s, want %s", raw, got, defaultGovernorMaxWait)
+			}
+		})
+	}
+	t.Setenv("AIRA_GOVERNOR_MAX_WAIT", "750ms")
+	if got := governorMaxWait(); got != 750*time.Millisecond {
+		t.Fatalf("configured max wait=%s", got)
+	}
+}
+
 func TestGovernorSlotStdinEOFClosesHeldConnection(t *testing.T) {
 	server, client := net.Pipe()
 	defer server.Close()
@@ -110,6 +125,127 @@ func TestGovernorSlotAcquireWaitsForAdmissionAndEOFCloses(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("relay did not return after EOF")
+	}
+}
+
+func TestGovernorSlotStuckDaemonReplyFailsOpenWithinConfiguredBound(t *testing.T) {
+	// Revert-check: without the acquire read deadline this test times out below.
+	// The fake daemon accepts and consumes the acquire, so this is specifically a
+	// stuck-but-alive daemon rather than a dial failure.
+	t.Setenv("AIRA_GOVERNOR_MAX_WAIT", "200ms")
+	server, client := net.Pipe()
+	defer server.Close()
+	stdinReader, stdinWriter := net.Pipe()
+	output := &governorOutputSpy{writes: make(chan string, 2)}
+	accepted := make(chan struct{})
+	go func() {
+		var envelope governorWireRequest
+		_ = readGovernorFrame(server, &envelope)
+		var acquire governorWireRequest
+		_ = readGovernorFrame(server, &acquire)
+		close(accepted)
+		// Deliberately never write a reply.
+		var one [1]byte
+		_, _ = server.Read(one[:])
+	}()
+	done := make(chan int, 1)
+	go func() {
+		done <- GovernorSlot(context.Background(), GovernorSlotRequest{SocketPath: "fake", JobID: "job", Stdin: stdinReader, Stdout: output, UUID: "stable", Dial: func(context.Context, string) (net.Conn, error) { return client, nil }})
+	}()
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("daemon did not receive acquire")
+	}
+	select {
+	case got := <-output.writes:
+		if got != "continue\n" {
+			t.Fatalf("fail-open output=%q", got)
+		}
+	case <-time.After(700 * time.Millisecond):
+		t.Fatal("stuck acquire did not fail open within configured bound")
+	}
+	_ = stdinWriter.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("relay did not exit after fail-open")
+	}
+}
+
+func TestGovernorSlotReconnectDoesNotBlockFailOpenOutput(t *testing.T) {
+	t.Setenv("AIRA_GOVERNOR_MAX_WAIT", "200ms")
+	firstServer, firstClient := net.Pipe()
+	defer firstServer.Close()
+	stdinReader, stdinWriter := net.Pipe()
+	defer stdinWriter.Close()
+	output := &governorOutputSpy{writes: make(chan string, 4)}
+	outputSeen := make(chan struct{})
+	secondAccepted := make(chan struct{})
+	dials := 0
+	dial := func(context.Context, string) (net.Conn, error) {
+		dials++
+		if dials == 1 {
+			return firstClient, nil
+		}
+		client, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			var envelope governorWireRequest
+			_ = readGovernorFrame(server, &envelope)
+			var acquire governorWireRequest
+			_ = readGovernorFrame(server, &acquire)
+			select {
+			case <-outputSeen:
+			default:
+				t.Errorf("reconnect began before fail-open output")
+			}
+			close(secondAccepted)
+			var one [1]byte
+			_, _ = server.Read(one[:]) // Never reply to this re-acquire.
+		}()
+		return client, nil
+	}
+	go func() {
+		var envelope governorWireRequest
+		_ = readGovernorFrame(firstServer, &envelope)
+		var acquire governorWireRequest
+		_ = readGovernorFrame(firstServer, &acquire)
+		_ = writeGovernorFrame(firstServer, governorWireReply{State: "active"})
+		var checkpoint governorWireRequest
+		_ = readGovernorFrame(firstServer, &checkpoint)
+		// Keep the connection open but do not reply, exercising the bounded
+		// checkpoint read rather than a simple EOF.
+		var one [1]byte
+		_, _ = firstServer.Read(one[:])
+	}()
+	done := make(chan int, 1)
+	go func() {
+		done <- GovernorSlot(context.Background(), GovernorSlotRequest{SocketPath: "fake", JobID: "job", Stdin: stdinReader, Stdout: output, UUID: "stable", Dial: dial})
+	}()
+	if got := <-output.writes; got != "active\n" {
+		t.Fatalf("acquire output=%q", got)
+	}
+	_, _ = stdinWriter.Write([]byte("checkpoint\n"))
+	select {
+	case got := <-output.writes:
+		if got != "continue\n" {
+			t.Fatalf("checkpoint fail-open output=%q", got)
+		}
+		close(outputSeen)
+	case <-time.After(700 * time.Millisecond):
+		t.Fatal("checkpoint failure waited behind reconnect")
+	}
+	select {
+	case <-secondAccepted:
+	case <-time.After(time.Second):
+		t.Fatal("background reconnect did not start")
+	}
+	_ = stdinWriter.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("relay did not exit")
 	}
 }
 
@@ -214,6 +350,7 @@ func TestGovernorSlotReconnectsWithSameUUID(t *testing.T) {
 	var mu sync.Mutex
 	var seen []string
 	lost := make(chan struct{})
+	connected := make(chan struct{})
 	reconnected := make(chan struct{})
 	dials := 0
 	dial := func(context.Context, string) (net.Conn, error) {
@@ -232,6 +369,7 @@ func TestGovernorSlotReconnectsWithSameUUID(t *testing.T) {
 			seen = append(seen, acquire.WorkerUUID)
 			mu.Unlock()
 			_ = writeGovernorFrame(right, governorWireReply{State: "active"})
+			close(connected)
 			var checkpoint governorWireRequest
 			_ = readGovernorFrame(right, &checkpoint)
 			_ = writeGovernorFrame(right, governorWireReply{State: "continue"})
@@ -263,6 +401,11 @@ func TestGovernorSlotReconnectsWithSameUUID(t *testing.T) {
 	case <-lost:
 	case <-time.After(2 * time.Second):
 		t.Fatal("first checkpoint did not reach listener")
+	}
+	select {
+	case <-connected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay did not reconnect in background")
 	}
 	_, _ = stdinWriter.Write([]byte("checkpoint\n"))
 	select {

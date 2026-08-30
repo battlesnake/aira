@@ -190,11 +190,10 @@ func TestTimeChildReceivesExtractedSidecarEnvironment(t *testing.T) {
 	runtimeDir := filepath.Join(t.TempDir(), "runtime")
 	observed := filepath.Join(t.TempDir(), "time-env")
 	t.Setenv("XDG_DATA_HOME", dataHome)
-	t.Setenv("AIRA_CPU_POLL_INTERVAL", "0.2")
-	t.Setenv("AIRA_CPU_MAX_WAIT", "9")
+	t.Setenv("AIRA_GOVERNOR_MAX_WAIT", "9s")
 	s := &commandCoreStore{}
 	execution := commandSidecarRunner{runtimeDir: runtimeDir}
-	script := `printf '%s\n%s\n%s\n%s\n' "$AIRA_PY_LIB" "$AIRA_CPU_SLOTS_DIR" "$AIRA_CPU_POLL_INTERVAL" "$AIRA_CPU_MAX_WAIT" > "$1"`
+	script := `printf '%s\n%s\n%s\n' "$AIRA_PY_LIB" "$AIRA_GOVERNOR_CMD" "$AIRA_GOVERNOR_MAX_WAIT" > "$1"`
 	response := NewWithRunnerFace(s, execution, nil, FaceOutput{}).Do(context.Background(), Request{Verb: "time", Args: map[string]any{
 		"argv": []string{"sh", "-c", script, "time-env", observed},
 		"env":  []string{},
@@ -207,7 +206,7 @@ func TestTimeChildReceivesExtractedSidecarEnvironment(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) != 4 || lines[0] == "" || lines[1] != filepath.Join(runtimeDir, "cpuslots") || lines[2] != "0.2" || lines[3] != "9" {
+	if len(lines) != 3 || lines[0] == "" || lines[1] != "" || lines[2] != "9s" {
 		t.Fatalf("time sidecar environment=%q", data)
 	}
 	if _, err := os.Stat(filepath.Join(lines[0], "aira_xdist_governor", "__init__.py")); err != nil {
@@ -222,11 +221,11 @@ func TestTimeExtractionFailureStripsInheritedGovernorEnvironment(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("XDG_DATA_HOME", blockedDataHome)
-	for _, key := range []string{"AIRA_PY_LIB", "AIRA_CPU_SLOTS_DIR", "AIRA_CPU_POLL_INTERVAL", "AIRA_CPU_MAX_WAIT"} {
+	for _, key := range []string{"AIRA_PY_LIB", "AIRA_GOVERNOR_CMD", "AIRA_GOVERNOR_MAX_WAIT", "AIRA_CONFINE_SCOPE_ID"} {
 		t.Setenv(key, "/stale-"+key)
 	}
 	observed := filepath.Join(t.TempDir(), "time-env")
-	script := `env | grep '^AIRA_\(PY_LIB\|CPU_SLOTS_DIR\|CPU_POLL_INTERVAL\|CPU_MAX_WAIT\)=' > "$1" || :`
+	script := `env | grep '^AIRA_\(PY_LIB\|GOVERNOR_CMD\|GOVERNOR_MAX_WAIT\|CONFINE_SCOPE_ID\)=' > "$1" || :`
 	response := NewWithRunnerFace(&commandCoreStore{}, commandSidecarRunner{runtimeDir: runtimeDir}, nil, FaceOutput{}).Do(context.Background(), Request{Verb: "time", Args: map[string]any{
 		"argv": []string{"sh", "-c", script, "time-env", observed},
 		"env":  []string{},

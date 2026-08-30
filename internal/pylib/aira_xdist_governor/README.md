@@ -1,9 +1,8 @@
-# AIRA pytest CPU and RAM governor
+# AIRA pytest scheduler and RAM governor
 
-This opt-in pytest plugin caps cooperating workers across independent test
-sessions using the slot files created by the AIRA daemon. It is advisory and
-fail-open: it does not provide fairness, and an unavailable governor never
-prevents a test from running.
+This opt-in pytest plugin cooperates with AIRA's daemon-owned scheduler across
+independent test sessions. It is advisory and fail-open: if the scheduler or
+its relay is unavailable, tests continue ungoverned rather than being blocked.
 
 Add this import-time-safe snippet to the project's `conftest.py`:
 
@@ -24,12 +23,30 @@ except Exception:
 With `AIRA_PY_LIB` unset, the snippet is a no-op. The broad exception handler
 is intentional: extraction, importing, and registration must all fail open.
 
-`AIRA_CPU_POLL_INTERVAL` controls the randomized polling interval in seconds
-(default `0.75`). `AIRA_CPU_MAX_WAIT` bounds a wait in seconds (default `300`),
-after which the item runs ungoverned. Acquisition happens before pytest setup,
-call, and teardown, so the wait is excluded from their reported durations. A
-thread-method whole-item timeout can still include it; the maximum wait bounds
-that advisory edge.
+## Daemon scheduler relay
+
+When `AIRA_GOVERNOR` is not `off` and `AIRA_GOVERNOR_CMD` is set, each pytest
+worker starts the command as `governor-slot`. The relay acquires the worker's
+daemon scheduler connection before `pytest_runtest_protocol` yields, then sends
+roughly ten-second checkpoints between tests. A scheduler park therefore occurs
+before pytest setup/call/teardown timers begin and before the plugin reserves
+RAM for the next test.
+
+`AIRA_CONFINE_SCOPE_ID` identifies the confined scope used by the relay. The
+normal AIRA launcher sets `AIRA_GOVERNOR`, `AIRA_GOVERNOR_CMD`, and this scope
+ID; `AIRA_GOVERNOR=off` is the explicit kill switch.
+
+`AIRA_GOVERNOR_MAX_WAIT` is a Go duration accepted by the relay, with a
+generous default of `300s`. It bounds every daemon reply, including initial
+worker acquisition and checkpoints. Invalid or non-positive values use the
+compiled `300s` default. If it elapses, or the daemon fails, the relay emits
+`continue` immediately and attempts future reconnects only in the background.
+The worker proceeds ungoverned for that interval instead of hanging the suite.
+This also means a worker parked for longer than the bound becomes ungoverned;
+that is expected to be rare because min-share rotation normally reaches parked
+workers within the active workers' test durations.
+
+## RAM-weighted suites
 
 For RAM-weighted suites, launch under a small pinned framework reserve and
 delegate per-test RAM admission:
@@ -50,9 +67,9 @@ def test_large_corpus():
 ```
 
 The size is `[0-9]+` with an optional 1024-based unit — `K`/`KB`/`KiB`,
-`M`/`MB`/`MiB`, `G`/`GB`/`GiB`, `T`/`TB`/`TiB`, or a bare `B` — case-insensitive,
-every spelling a synonym (`4G` == `4GB` == `4GiB`). Integer only (write `1536M`,
-not `1.5G`). Unmarked tests use the nonzero pinned
+`M`/`MB`/`MiB`, `G`/`GB`/`GiB`, `T`/`TB`/`TiB`, or a bare `B` —
+case-insensitive, every spelling a synonym (`4G` == `4GB` == `4GiB`). Integer
+only (write `1536M`, not `1.5G`). Unmarked tests use the nonzero pinned
 `AIRA_TEST_MEM_DEFAULT`. The marker is an absolute peak-RSS estimate. For each
 test the worker reads `/proc/self/statm` and holds one reservation sized to
 `max(aira_mem, RSS + growth_headroom)`: the default growth headroom is 512 MiB

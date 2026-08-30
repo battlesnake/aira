@@ -290,12 +290,12 @@ func TestCommandCheckerStoresAuthoritativeRunnerEnvDigest(t *testing.T) {
 }
 
 func TestCommandCheckerIgnoresAllowedGovernorEnvironmentInDigest(t *testing.T) {
-	t.Setenv("AIRA_CPU_SLOTS_DIR", filepath.Join(t.TempDir(), "slots"))
+	t.Setenv("AIRA_GOVERNOR_CMD", filepath.Join(t.TempDir(), "aira"))
 	s, root := realCommandStore(t)
 	def := commandDefinition(gate.Command{
 		Argv:           gateHelperArgv("noop"),
 		Cwd:            "root",
-		EnvAllow:       []string{"AIRA_CPU_SLOTS_DIR"},
+		EnvAllow:       []string{"AIRA_GOVERNOR_CMD"},
 		TimeoutMS:      gateFastCommandTimeoutMS,
 		OutputCapBytes: 1024,
 		Predicate:      gate.CommandPredicateExitZero,

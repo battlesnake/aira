@@ -110,7 +110,6 @@ type Server struct {
 	discoverProject          func(context.Context, string) (app.Project, error)
 	adoptRebuild             func(context.Context, *store.Store) error
 	beforeEjectTransaction   func()
-	ensureCPUSlotsFn         func(string, int) (int, error)
 }
 
 func NewServer(paths Paths) *Server {
@@ -235,22 +234,10 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		s.governor.mu.Unlock()
 		s.governor.signal()
 	}
-	if slotErr == nil {
-		ensureSlots := ensureCPUSlots
-		if s.ensureCPUSlotsFn != nil {
-			ensureSlots = s.ensureCPUSlotsFn
-		}
-		var effectiveSlots int
-		effectiveSlots, slotErr = ensureSlots(s.Paths.RuntimeDir, desiredSlots)
-		if slotErr == nil {
-			log.Printf("aira daemon: CPU slots effective=%d requested=%d path=%s", effectiveSlots, desiredSlots, filepath.Join(s.Paths.RuntimeDir, cpuSlotsDirName))
-		}
-	}
 	if slotErr != nil {
-		// CPU coordination is advisory. A malformed reserve, unsupported
-		// renameat2 filesystem, or invalid prior population must not prevent
-		// the mandatory daemon from serving its other responsibilities.
-		log.Printf("aira daemon: CPU slot governor disabled: %v", slotErr)
+		// NewServer installed the safe capacity-1 fallback, so this governor is
+		// still enforcing. Do not claim it was disabled.
+		log.Printf("aira scheduler governor: using safe capacity-1 fallback (config error: %v)", slotErr)
 	}
 	if err := os.Remove(s.Paths.SocketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err

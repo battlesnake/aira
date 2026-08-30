@@ -10,11 +10,29 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
 )
+
+const defaultGovernorMaxWait = 300 * time.Second
+
+// governorMaxWait is deliberately generous: an admitted-at-start worker may be
+// parked for a real rotation. It is only a liveness backstop for a wedged daemon.
+func governorMaxWait() time.Duration {
+	raw := os.Getenv("AIRA_GOVERNOR_MAX_WAIT")
+	if raw == "" {
+		return defaultGovernorMaxWait
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil || value <= 0 {
+		return defaultGovernorMaxWait
+	}
+	return value
+}
 
 // GovernorSlotRequest is the line-protocol relay used by one pytest worker.
 // It is deliberately independent of the daemon package (which imports runner).
@@ -123,11 +141,9 @@ func governorDial(ctx context.Context, req GovernorSlotRequest) (net.Conn, error
 	return d.DialContext(ctx, "unix", req.SocketPath)
 }
 
-// connectGovernor holds the acquire connection until the daemon admits it.
-// Unlike a checkpoint reply, admission has no governance deadline: a worker
-// parked at start must not fail open merely because the active set is full.
-// EOF and context cancellation still interrupt the held connection promptly.
-func connectGovernor(ctx context.Context, req GovernorSlotRequest, uuid string, eof <-chan struct{}) (net.Conn, string, error) {
+// connectGovernor holds the acquire connection until the daemon admits it, up
+// to maxWait. EOF and context cancellation still interrupt it promptly.
+func connectGovernor(ctx context.Context, req GovernorSlotRequest, uuid string, eof <-chan struct{}, maxWait time.Duration) (net.Conn, string, error) {
 	conn, err := governorDial(ctx, req)
 	if err != nil {
 		return nil, "", err
@@ -155,7 +171,13 @@ func connectGovernor(ctx context.Context, req GovernorSlotRequest, uuid string, 
 		return fail(err)
 	}
 	var reply governorWireReply
+	if err := conn.SetReadDeadline(time.Now().Add(maxWait)); err != nil {
+		return fail(err)
+	}
 	if err := readGovernorFrame(conn, &reply); err != nil {
+		return fail(err)
+	}
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
 		return fail(err)
 	}
 	if reply.State != "active" && reply.State != "continue" {
@@ -181,6 +203,7 @@ func GovernorSlot(ctx context.Context, req GovernorSlotRequest) int {
 			return 0
 		}
 	}
+	maxWait := governorMaxWait()
 	lines := make(chan string, 1)
 	eof := make(chan struct{})
 	go func() {
@@ -252,34 +275,53 @@ func GovernorSlot(ctx context.Context, req GovernorSlotRequest) int {
 		connMu.Unlock()
 		return false
 	}
-	tryReconnect := func() {
-		select {
-		case <-eof:
-			return
-		default:
-		}
-		newConn, _, reconnectErr := connectGovernor(ctx, req, uuid, eof)
-		if reconnectErr != nil {
+	var reconnecting bool
+	scheduleReconnect := func() {
+		connMu.Lock()
+		if conn != nil || reconnecting {
+			connMu.Unlock()
 			return
 		}
-		if !installConn(newConn) {
-			_ = newConn.Close()
-		}
+		reconnecting = true
+		connMu.Unlock()
+		go func() {
+			defer func() {
+				connMu.Lock()
+				reconnecting = false
+				connMu.Unlock()
+			}()
+			if interrupted() {
+				return
+			}
+			newConn, _, reconnectErr := connectGovernor(ctx, req, uuid, eof, maxWait)
+			if reconnectErr != nil {
+				return
+			}
+			if !installConn(newConn) {
+				_ = newConn.Close()
+			}
+		}()
+	}
+	var logFailureOnce sync.Once
+	failOpen := func(err error) {
+		// The stdout reply comes before reconnecting: a daemon outage must never
+		// make the worker wait for a new acquire attempt.
+		_, _ = fmt.Fprintln(req.Stdout, "continue")
+		logFailureOnce.Do(func() { log.Printf("aira governor relay: fail-open: %v", err) })
 	}
 	// The relay is child-side crash safety in addition to the EOF watcher.
 	if !setGovernorParentDeathSignal() { /* non-Linux or unavailable: EOF remains the guard */
 	}
 	var err error
-	initialConn, state, err := connectGovernor(ctx, req, uuid, eof)
+	initialConn, state, err := connectGovernor(ctx, req, uuid, eof, maxWait)
 	if err != nil {
-		_, _ = fmt.Fprintln(req.Stdout, "continue")
-		return 0
-	}
-	if !installConn(initialConn) {
+		failOpen(err)
+	} else if !installConn(initialConn) {
 		_ = initialConn.Close()
 		return 0
+	} else {
+		_, _ = fmt.Fprintln(req.Stdout, state)
 	}
-	_, _ = fmt.Fprintln(req.Stdout, state)
 	for {
 		select {
 		case <-ctx.Done():
@@ -301,34 +343,36 @@ func GovernorSlot(ctx context.Context, req GovernorSlotRequest) int {
 			current := conn
 			connMu.Unlock()
 			if current == nil {
-				newConn, _, connectErr := connectGovernor(ctx, req, uuid, eof)
-				if connectErr != nil {
-					_, _ = fmt.Fprintln(req.Stdout, "continue")
-					continue
-				}
-				if !installConn(newConn) {
-					_ = newConn.Close()
-					_, _ = fmt.Fprintln(req.Stdout, "continue")
-					continue
-				}
-				current = newConn
+				// Do not make this checkpoint wait behind re-acquire. The next one
+				// may use a best-effort connection if it becomes available.
+				failOpen(errors.New("governor connection unavailable"))
+				scheduleReconnect()
+				continue
 			}
 			if err := writeGovernorFrame(current, governorWireRequest{Type: "checkpoint", HeldRSS: rss, NextTestEst: est}); err != nil {
 				closeConn()
-				tryReconnect()
-				_, _ = fmt.Fprintln(req.Stdout, "continue")
+				failOpen(err)
+				scheduleReconnect()
 				continue
 			}
 			// EOF closes current from the concurrent reader, so this long-poll
 			// read exits even if the daemon has parked this worker.
-			_ = current.SetReadDeadline(time.Now().Add(30 * time.Second))
+			if err := current.SetReadDeadline(time.Now().Add(maxWait)); err != nil {
+				closeConn()
+				failOpen(err)
+				scheduleReconnect()
+				continue
+			}
 			var reply governorWireReply
 			err = readGovernorFrame(current, &reply)
 			_ = current.SetReadDeadline(time.Time{})
 			if err != nil || (reply.State != "continue" && reply.State != "active") {
 				closeConn()
-				tryReconnect()
-				_, _ = fmt.Fprintln(req.Stdout, "continue")
+				if err == nil {
+					err = errors.New("invalid governor checkpoint reply")
+				}
+				failOpen(err)
+				scheduleReconnect()
 				continue
 			}
 			_, _ = fmt.Fprintln(req.Stdout, reply.State)

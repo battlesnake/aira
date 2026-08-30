@@ -947,9 +947,9 @@ func TestSidecarEnvironmentIsInjectedAfterDigestForExplicitEnv(t *testing.T) {
 		Env: []string{
 			"PATH=/bin",
 			"AIRA_PY_LIB=/stale",
-			"AIRA_CPU_SLOTS_DIR=/stale-slots",
-			"AIRA_CPU_POLL_INTERVAL=99",
-			"AIRA_CPU_MAX_WAIT=99",
+			"AIRA_GOVERNOR_CMD=/stale/aira",
+			"AIRA_CONFINE_SCOPE_ID=stale-scope",
+			"AIRA_GOVERNOR_MAX_WAIT=99s",
 		},
 		ExplicitEnv: true,
 	})
@@ -961,7 +961,7 @@ func TestSidecarEnvironmentIsInjectedAfterDigestForExplicitEnv(t *testing.T) {
 		t.Fatal(getErr)
 	}
 	values := testEnvironmentValues(t, childEnv)
-	if values["AIRA_PY_LIB"] == "" || values["AIRA_CPU_SLOTS_DIR"] != filepath.Join(r.inputRuntimeDir, "cpuslots") {
+	if values["AIRA_PY_LIB"] == "" || values["AIRA_GOVERNOR_CMD"] != "" || values["AIRA_CONFINE_SCOPE_ID"] != "" {
 		t.Fatalf("child sidecar env=%v", childEnv)
 	}
 	wantDigest, digestErr := EnvDigest([]EnvEntry{{Key: []byte("PATH"), Value: []byte("/bin")}})
@@ -980,7 +980,7 @@ func TestSidecarEnvironmentDigestIgnoresInheritedGovernorValues(t *testing.T) {
 		return errors.New("injected after environment observation")
 	}
 
-	governorKeys := []string{"AIRA_PY_LIB", "AIRA_CPU_SLOTS_DIR", "AIRA_CPU_POLL_INTERVAL", "AIRA_CPU_MAX_WAIT"}
+	governorKeys := []string{"AIRA_PY_LIB", "AIRA_GOVERNOR", "AIRA_GOVERNOR_CMD", "AIRA_GOVERNOR_MAX_WAIT", "AIRA_CONFINE_SCOPE_ID"}
 	for _, key := range governorKeys {
 		t.Setenv(key, "/stale-"+key)
 		if err := os.Unsetenv(key); err != nil {
@@ -1012,7 +1012,7 @@ func TestSidecarEnvironmentDigestIgnoresInheritedGovernorValues(t *testing.T) {
 		t.Fatalf("inherited governor values changed digest: with=%q without=%q", withGovernor.EnvDigest, withoutGovernor.EnvDigest)
 	}
 	values := testEnvironmentValues(t, childEnv)
-	if values["AIRA_PY_LIB"] == "" || values["AIRA_PY_LIB"] == "/stale-AIRA_PY_LIB" || values["AIRA_CPU_SLOTS_DIR"] != filepath.Join(r.inputRuntimeDir, "cpuslots") {
+	if values["AIRA_PY_LIB"] == "" || values["AIRA_PY_LIB"] == "/stale-AIRA_PY_LIB" || values["AIRA_GOVERNOR_CMD"] != "" || values["AIRA_CONFINE_SCOPE_ID"] != "" {
 		t.Fatalf("child did not receive authoritative governor values: %v", childEnv)
 	}
 }
@@ -1033,15 +1033,15 @@ func TestSidecarExtractionFailureDoesNotBlockLaunch(t *testing.T) {
 	_, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/true"}, Env: []string{
 		"PATH=/bin",
 		"AIRA_PY_LIB=/stale",
-		"AIRA_CPU_SLOTS_DIR=/stale-slots",
-		"AIRA_CPU_POLL_INTERVAL=99",
-		"AIRA_CPU_MAX_WAIT=99",
+		"AIRA_GOVERNOR_CMD=/stale/aira",
+		"AIRA_CONFINE_SCOPE_ID=stale-scope",
+		"AIRA_GOVERNOR_MAX_WAIT=99s",
 	}, ExplicitEnv: true})
 	if err == nil || !strings.Contains(err.Error(), "launch reached after sidecar failure") {
 		t.Fatalf("sidecar failure blocked or replaced launch result: %v", err)
 	}
 	values := testEnvironmentValues(t, childEnv)
-	for _, key := range []string{"AIRA_PY_LIB", "AIRA_CPU_SLOTS_DIR", "AIRA_CPU_POLL_INTERVAL", "AIRA_CPU_MAX_WAIT"} {
+	for _, key := range []string{"AIRA_PY_LIB", "AIRA_GOVERNOR", "AIRA_GOVERNOR_CMD", "AIRA_GOVERNOR_MAX_WAIT", "AIRA_CONFINE_SCOPE_ID"} {
 		if _, present := values[key]; present {
 			t.Fatalf("failed extraction retained %s: %v", key, childEnv)
 		}

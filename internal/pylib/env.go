@@ -5,7 +5,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -17,9 +16,10 @@ var (
 
 var governorEnvironmentKeys = map[string]struct{}{
 	"AIRA_PY_LIB":                   {},
-	"AIRA_CPU_SLOTS_DIR":            {},
-	"AIRA_CPU_POLL_INTERVAL":        {},
-	"AIRA_CPU_MAX_WAIT":             {},
+	"AIRA_GOVERNOR":                 {},
+	"AIRA_GOVERNOR_CMD":             {},
+	"AIRA_GOVERNOR_MAX_WAIT":        {},
+	"AIRA_CONFINE_SCOPE_ID":         {},
 	"AIRA_TEST_MEM_GOVERNOR":        {},
 	"AIRA_TEST_MEM_DEFAULT":         {},
 	"AIRA_TEST_MEM_GROWTH_HEADROOM": {},
@@ -49,21 +49,21 @@ func StripGovernorEnvironment(env []string) []string {
 	return result
 }
 
-// AppendChildEnvironment exposes the sidecar and machine-local slot set to a
-// child. Extraction is advisory: on any failure it returns an environment with
+// AppendChildEnvironment exposes the sidecar to a child. Extraction is
+// advisory: on any failure it returns an environment with
 // every governor variable stripped, disabling gating instead of using stale
 // inherited coordinates.
 func AppendChildEnvironment(env []string, runtimeDir string, diagnostics io.Writer) []string {
-	return appendChildEnvironment(env, runtimeDir, diagnostics, false, "", "")
+	return appendChildEnvironment(env, runtimeDir, diagnostics, false, "", "", "")
 }
 
 // AppendConfineChildEnvironment couples per-test RAM governance to an explicit
 // delegate-RAM confine launch. Every other launch strips these coordinates.
-func AppendConfineChildEnvironment(env []string, runtimeDir string, diagnostics io.Writer, delegateRAM bool, reserveCommand, memoryDefault string) []string {
-	return appendChildEnvironment(env, runtimeDir, diagnostics, delegateRAM, reserveCommand, memoryDefault)
+func AppendConfineChildEnvironment(env []string, runtimeDir string, diagnostics io.Writer, delegateRAM bool, reserveCommand, memoryDefault, scopeID string) []string {
+	return appendChildEnvironment(env, runtimeDir, diagnostics, delegateRAM, reserveCommand, memoryDefault, scopeID)
 }
 
-func appendChildEnvironment(env []string, runtimeDir string, diagnostics io.Writer, delegateRAM bool, reserveCommand, memoryDefault string) []string {
+func appendChildEnvironment(env []string, runtimeDir string, diagnostics io.Writer, delegateRAM bool, reserveCommand, memoryDefault, scopeID string) []string {
 	result := StripGovernorEnvironment(env)
 	if strings.TrimSpace(runtimeDir) == "" {
 		return result
@@ -72,16 +72,18 @@ func appendChildEnvironment(env []string, runtimeDir string, diagnostics io.Writ
 	if err != nil {
 		childEnvFailureOnce.Do(func() {
 			if diagnostics != nil {
-				_, _ = fmt.Fprintf(diagnostics, "aira CPU governor disabled: %v\n", err)
+				_, _ = fmt.Fprintf(diagnostics, "aira scheduler governor disabled: %v\n", err)
 				return
 			}
-			log.Printf("aira CPU governor disabled: %v", err)
+			log.Printf("aira scheduler governor disabled: %v", err)
 		})
 		return result
 	}
 	result = upsertChildEnv(result, "AIRA_PY_LIB", pythonDir)
-	result = upsertChildEnv(result, "AIRA_CPU_SLOTS_DIR", filepath.Join(runtimeDir, "cpuslots"))
-	for _, key := range []string{"AIRA_CPU_POLL_INTERVAL", "AIRA_CPU_MAX_WAIT"} {
+	if scopeID != "" {
+		result = upsertChildEnv(result, "AIRA_CONFINE_SCOPE_ID", scopeID)
+	}
+	for _, key := range []string{"AIRA_GOVERNOR_MAX_WAIT"} {
 		if value, configured := os.LookupEnv(key); configured {
 			result = append(result, key+"="+value)
 		}
@@ -93,6 +95,14 @@ func appendChildEnvironment(env []string, runtimeDir string, diagnostics io.Writ
 		result = upsertChildEnv(result, "AIRA_TEST_MEM_GOVERNOR", "1")
 		result = upsertChildEnv(result, "AIRA_TEST_MEM_DEFAULT", memoryDefault)
 		result = upsertChildEnv(result, "AIRA_CONFINE_RESERVE_CMD", reserveCommand)
+		// The relay uses the same resolved self binary as confine-reserve and
+		// identifies this confined pytest session by its scope id.
+		result = upsertChildEnv(result, "AIRA_GOVERNOR_CMD", reserveCommand)
+		governor := strings.TrimSpace(os.Getenv("AIRA_GOVERNOR"))
+		if governor != "off" {
+			governor = "daemon"
+		}
+		result = upsertChildEnv(result, "AIRA_GOVERNOR", governor)
 		if value, configured := os.LookupEnv("AIRA_TEST_MEM_GROWTH_HEADROOM"); configured {
 			result = upsertChildEnv(result, "AIRA_TEST_MEM_GROWTH_HEADROOM", value)
 		}

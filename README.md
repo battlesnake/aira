@@ -94,7 +94,7 @@ Heavy jobs run inside a memory-capped, deprioritised cgroup that only starts whe
 aira confine -- make test
 ```
 
-For test suites, `--delegate-ram` governs memory per test rather than reserving for the whole job up front, and gates pytest-xdist workers on a shared pool of CPU slots. Each test's reservation is sized to what its worker is actually holding, so several sessions can all run `-n auto` and keep the box busy without OOMing each other.
+For test suites, `--delegate-ram` governs memory per test rather than reserving for the whole job up front. The pytest plugin cooperates with the daemon scheduler between tests, so several sessions can all run `-n auto` while the daemon controls the active worker set. Each test's reservation is sized to what its worker is actually holding, helping keep the box busy without OOMing it.
 
 ```sh
 aira confine --delegate-ram --memory-reserve 512M -- pytest -n auto

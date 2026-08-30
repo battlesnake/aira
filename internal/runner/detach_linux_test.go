@@ -548,7 +548,7 @@ func TestDetachedLaunchReceivesSidecarEnvironmentFromCommonSeam(t *testing.T) {
 		t.Fatal("injected detached start failure did not propagate")
 	}
 	values := testEnvironmentValues(t, childEnv)
-	if values["AIRA_PY_LIB"] == "" || values["AIRA_CPU_SLOTS_DIR"] != filepath.Join(r.inputRuntimeDir, "cpuslots") {
+	if values["AIRA_PY_LIB"] == "" || values["AIRA_GOVERNOR_CMD"] != "" || values["AIRA_CONFINE_SCOPE_ID"] != "" {
 		t.Fatalf("detached child sidecar env=%v", childEnv)
 	}
 }

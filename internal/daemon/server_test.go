@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -92,6 +93,30 @@ func startServer(t *testing.T, server *Server) (context.CancelFunc, <-chan error
 		}
 	})
 	return cancel, done
+}
+
+func TestServerMalformedCPUReserveLogsCapacityOneFallback(t *testing.T) {
+	t.Setenv("AIRA_DAEMON_CPU_RESERVE", "not-a-number")
+	paths := testPaths(t)
+	server := NewServer(paths)
+	if server.governor == nil {
+		t.Fatal("governor is nil")
+	}
+	if server.governor.capacity != 1 {
+		t.Fatalf("governor capacity=%d, want enforced capacity-1 fallback", server.governor.capacity)
+	}
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	_, _ = startServer(t, server)
+	got := logs.String()
+	if !strings.Contains(got, "using safe capacity-1 fallback") || !strings.Contains(got, "AIRA_DAEMON_CPU_RESERVE") {
+		t.Fatalf("fallback log=%q", got)
+	}
+	if strings.Contains(got, "CPU governor disabled") {
+		t.Fatalf("fallback log falsely claims disabled: %q", got)
+	}
 }
 
 func TestServerRoutedRoundTripAndProtocolEvidence(t *testing.T) {

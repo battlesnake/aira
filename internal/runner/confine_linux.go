@@ -662,7 +662,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 			memoryDefault = pylib.DefaultTestMemoryReserve
 		}
 	}
-	cmd.Env = pylib.AppendConfineChildEnvironment(confineEnvironment(request.Env), request.RuntimeDir, diagnostics, request.DelegateRAM, reserveCommand, memoryDefault)
+	cmd.Env = pylib.AppendConfineChildEnvironment(confineEnvironment(request.Env), request.RuntimeDir, diagnostics, request.DelegateRAM, reserveCommand, memoryDefault, scopeID)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, diagnostics
 	cmd.ExtraFiles = []*os.File{handshakeWrite, releaseRead}
 	cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: scope.FD()}

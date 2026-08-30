@@ -1291,19 +1291,24 @@ func TestConfineKillingSignalMapsToShellExit(t *testing.T) {
 	}
 }
 
-func TestConfineInjectsCPUGovernorEnvironment(t *testing.T) {
+func TestConfineInjectsDaemonGovernorEnvironment(t *testing.T) {
 	runtimeDir := t.TempDir()
 	scope := &confineFakeScope{}
 	var stdout bytes.Buffer
+	deps := confineUnitDeps(scope)
+	// DelegateRAM triggers the #67/AIRA-15 scope-cap write; the fake scope has no
+	// real memory.max fd, so stub it as the other delegate-ram unit tests do.
+	deps.writeScopeMemoryCap = func(Scope, int64, int64, bool) error { return nil }
 	result, err := confineWithDeps(context.Background(), ConfineRequest{
-		Slice: "finite.slice", Argv: []string{"/bin/sh", "-c", "printf '%s' \"$AIRA_CPU_SLOTS_DIR\""},
+		Slice: "finite.slice", DelegateRAM: true, Name: "pytest", Argv: []string{"/bin/sh", "-c", "printf '%s|%s' \"$AIRA_CONFINE_SCOPE_ID\" \"$AIRA_GOVERNOR_CMD\""},
 		RuntimeDir: runtimeDir, SelfPath: os.Args[0], Stdout: &stdout, Stderr: io.Discard,
-	}, confineUnitDeps(scope))
+	}, deps)
 	if err != nil || result.Exit != 0 {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	if got, want := stdout.String(), runtimeDir+"/cpuslots"; got != want {
-		t.Fatalf("AIRA_CPU_SLOTS_DIR=%q, want %q", got, want)
+	parts := strings.Split(stdout.String(), "|")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		t.Fatalf("daemon governor environment=%q", stdout.String())
 	}
 }
 
