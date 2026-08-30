@@ -134,12 +134,22 @@ scheduler is an optimisation over the hard backstop, never a correctness depende
    delegation repair (fail-open, memory stays fail-closed); honest `cpu-weight=aging|unavailable`
    facet; FD-anchored fail-open decay writer stopped-and-joined before teardown. Flock unchanged.
    Live-verified (scope `cpu.weight=100`, parent propagates `+cpu`). See the Slice 1 plan spec.
-2. **Slice 2 — the daemon scheduler.** Checkpoint protocol + active-set management +
-   connection-held grants + cooperative park/activate. Cut the CPU governor from flock
-   → daemon and **REMOVE the flock** (owner-decided 2026-08-30): the daemon is the sole
-   scheduler, no parallel fallback mechanism. Daemon-down → the plugin fails open (runs
-   ungoverned, bounded by the slice cap + `oom.group`) — a trivial safety net for a
-   transient restart, not a second scheduler to maintain.
+2. **Slice 2 — the daemon scheduler. DONE + DEPLOYED (observe mode) 2026-08-30**
+   (Pass 1 `ea16f09` + Pass 2 `4790bce`). Checkpoint protocol + active-set management +
+   connection-held grants + cooperative park/activate; the flock is REMOVED. Job identity =
+   the confine scope; a HARD per-job floor of 1 + soft capacity (NumCPU−reserve),
+   youngest-first above the floor; `parkRequested` so preemption never over-admits (capacity
+   holds until a worker confirms park at its checkpoint); single-reader state machine +
+   close-to-reactivate (no #72 deadlock); worker-UUID idempotent re-acquire; bounded fail-open
+   (`AIRA_GOVERNOR_MAX_WAIT`, generous 300s default → a wedged daemon degrades to ungoverned,
+   never a hang). Plugin: the governor relay runs at worker-start + at a checkpoint placed
+   AFTER the per-test RAM reservation is released (so a park holds no RAM). Deployed default
+   `AIRA_SCHED_MODE=observe` (capacity-enforce, fairness-observe); **the enforce flip (full
+   young-first preemption) follows a soak.** Daemon-down / `AIRA_GOVERNOR=off` → the plugin
+   fails open (ungoverned, bounded by the slice cap + `oom.group`) — the only fallback (no flock).
+   **Honest scope (field-confirmed): this governs test EXECUTION, not pre-plugin execnet
+   BOOTSTRAP — so it does not directly fix the simultaneous-cold-start bootstrap blank; that is
+   AIRA-17 (whole-suite bootstrap-admission).**
 3. **Slice 3 — RAM-aware admission (unify, owner-decided).** Fold the per-test
    `confine-reserve` RAM ledger into the scheduler's active-set sizing
    (small-next-test-first). One scheduler owns CPU + RAM, not two mechanisms.

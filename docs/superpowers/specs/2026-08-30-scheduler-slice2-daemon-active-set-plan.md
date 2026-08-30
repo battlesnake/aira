@@ -1,9 +1,19 @@
 # Scheduler Slice 2 — the daemon active-set cooperative scheduler (replaces the flock)
 
-- **Status:** plan v2 (Sol + DeepSeek plan-review BLOCK folded; Fable code-gate pending). Owner-approved
-  design: `2026-08-30-aira-cooperative-scheduler-design.md` §3.2, §4, §5.2. **Read the "Plan-review
-  round 1" section at the bottom — v2 supersedes several v1 body claims (min-share, preemption latency,
-  the connection-held read model, crash-safety symmetry, worker identity).**
+- **Status:** DONE + MERGED (Pass 1 `ea16f09` + Pass 2 `4790bce`) + DEPLOYED **in observe mode**
+  2026-08-30. The flock is removed; the daemon active-set governor is live (`AIRA_SCHED_MODE=observe`
+  default = capacity-enforce, fairness-observe). Live-verified: a raw wire probe + the `aira
+  governor-slot` relay both get `{"state":"active"}` from the observe-mode daemon + a held connection;
+  fail-open confirmed (stdin EOF → `continue` + release); daemon NRestarts=0, WATCHDOG_MODE=enforce
+  preserved. Old binary backed up `~/tmp/aira-pre-slice2`. **REMAINING: flip `AIRA_SCHED_MODE=enforce`
+  after a soak** (the full young-first preemption) — a separate small step. Owner-approved design:
+  `2026-08-30-aira-cooperative-scheduler-design.md` §3.2, §4, §5.2.
+- Built through the full two-loop: Sol + DeepSeek plan-review BLOCK → v2; Fable code-gate GATE-PASS
+  (3 nits); Pass 1 Go core → Sol build-review BLOCK (4 P0, incl. capacity-violation-during-preemption
+  a green suite hid) → fixed; Pass 2 plugin/flock-removal → Sol build-review BLOCK (fail-open-hang P0 +
+  over-deleted RAM tests) → fixed. **Read the "Plan-review round 1/2" sections at the bottom** — they
+  supersede several v1 body claims (min-share floor, preemption latency = longest test, the
+  connection-held single-reader model, symmetric crash-safety, worker UUID).
 - Depends on Slice 1 (DONE — cpu.weight aging governs *bootstrap*; this slice governs *execution*).
 - **Deploys via a daemon restart** (daemon-side change) → batch the already-merged `done→in-progress`
   reopen transition; reserves reconstruct per #74, so the restart is safe.
