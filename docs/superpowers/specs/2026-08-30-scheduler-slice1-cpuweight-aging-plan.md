@@ -104,3 +104,54 @@ supervisor only (Slice 1 scoped to `aira confine`; detached = follow-up); honest
 not "close"); a real contention regression test; state the residuals (unbounded-young stream,
 crashed-supervisor-freeze). If cpu delegation proves un-addable cheaply, reconsider whether Slice 1 is
 worth shipping ahead of the daemon scheduler (Slice 2) — surface to owner.
+
+## Plan-review round 1 — Fable GATE-FAIL (folds Sol) → v2 buildable
+
+Fable confirmed the mechanism/seams/invariants/honesty sound and Slice 1 worth shipping (the observed
+AIRA-14 profile IS mixed-age contention this fixes; simultaneous-fresh → Slice 2). GATE-FAIL solely on:
+
+- **P0 — nothing enables `+cpu` on the scope's parent → cpu.weight often absent (the #59 inert class).**
+  Live: `aira.slice/cgroup.subtree_control` FLAPS `memory pids` ↔ `cpu memory pids` (systemd re-realizes
+  it); `cgroup.controllers` reliably has `cpu` (from `CPUWeight=50`), so the grant exists but nothing
+  propagates it. Both delegation writers enable only `+memory` (`ensureConfineDelegation`
+  confine_linux.go:258-293, re-asserted per-launch *because* systemd rewrites subtree_control;
+  install.go:1498-1513). Tests green on a cpu-enabled box, silently inert elsewhere. → **v2: extend
+  `ensureConfineDelegation` to also best-effort assert `+cpu` (cpu missing from `cgroup.controllers`, or
+  the write failing → aging-`unavailable`, NEVER a new E_CONFINE_UNAVAILABLE; `+memory` stays
+  fail-closed). Safe: aira.slice has no direct member processes (anchor in its own child). Real-cgroup
+  test: a fresh scope HAS `cpu.weight` after the step.**
+- **P1 — honesty facet.** `FormatConfineStatus` (confine_linux.go:684) must gain `cpu-weight=aging|
+  unavailable` so a controller-absent/EACCES host is distinguishable (repo rule: unestablishable →
+  `unavailable`, never a fake pass). Tests: fresh scope → `aging`; controller-absent → `unavailable`.
+- **P1 — fail-OPEN decay writer, not the fail-closed model.** `writeScopeMemoryCap` (:839) is fail-CLOSED
+  (caller aborts at :527-529). Use a DISTINCT FD-anchored writer like `writeScopeMemoryValue` (:864,
+  `unix.Openat(scope.FD(),…)` — path-free, immune to scope-recreation races) tolerating
+  ENOENT/ENODEV/EACCES mid-decay (teardown races the timer). Stop-and-JOIN the decay goroutine before
+  `cleanupConfineScope`/`scope.Remove` — reuse the `monitorStop`/`monitorResult` (:644-674) seam.
+
+## v2 — buildable
+
+- **Delegation (P0):** `ensureConfineDelegation` best-effort `+cpu` (in addition to `+memory`); failure →
+  aging-unavailable, not fatal.
+- **Write:** PARENT-side initial `cpu.weight` between `backend.Create` (:463) and start (race-free; the
+  child clones into the scope via CgroupFD :588). start=100 is the kernel default so it's semantically a
+  no-op — keep it only to drive the honesty facet. Keep `RunConfineSetup` child-local (nice/ionice).
+- **Decay:** a supervisor timer goroutine (foreground confine lives through `waitConfineCommand:661` for
+  the whole job) writes the scope `cpu.weight` per step via the FD-anchored fail-open writer; stopped+
+  joined before scope teardown.
+- **Curve (P2, named):** `100→70→50→30→20→10` at `10s,30s,1m,5m,10m,30m`. Rationale: AIRA-14 contenders
+  are merge-gate legs *minutes* old; by 1–5m they are 30→20 so a fresh 100 wins a solid majority share
+  (fresh = 100/(100+Σdecayed)). Config `AIRA_CONFINE_CPUWEIGHT_{START,FLOOR,SCHEDULE}` with compiled
+  defaults (parse error → compiled default, never inert-by-accident). Clamp [1,10000]; monotone-down.
+- **Facet (P1):** `cpu-weight=aging|unavailable` in the confine trailer.
+- **Honest scope + residuals (state all):** helps vs LONG-running/decayed contention (the observed
+  case), NOT simultaneous-fresh (Slice 2); floor is a positive proportional share for a FINITE runnable
+  set, not anti-starvation under an unbounded young stream; a SIGKILLed supervisor freezes a scope at its
+  last (maybe young) weight; `aira run`/`--detach` scopes (per-project `run.cgroup_parent`) are NOT aged
+  by Slice 1 — if parked under aira.slice they are never-decaying weight-100 siblings (accepted gap);
+  weight arbitrates BETWEEN scopes only — a suite's 16 xdist workers inside one scope still share equally
+  (intra-scope out of scope). Confine is foreground-only (Fable-verified) → no detached-confine gap.
+- **Test plan:** real-cgroup fresh-scope-has-cpu.weight-after-delegation + facet=aging; controller-absent
+  → fail-open launch + facet=unavailable; aging schedule monotone→floor (discriminating: revert decay →
+  aged-scope-floor test fails); FD-anchored writer tolerates a removed scope (no abort). Fable: "fit to
+  build" with these folded. Deploy: binary swap, NO daemon restart.
