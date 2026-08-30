@@ -83,6 +83,7 @@ type Server struct {
 	admitSliceHeadroomBase       int64
 	admitSliceHeadroomSupervisor int64
 	scopeReapGrace               time.Duration
+	governor                     *governorSet
 
 	// Test seams. Production always calls the Store methods and DB.Close.
 	reapScope                func(context.Context, *store.Store) (int, error)
@@ -113,6 +114,12 @@ type Server struct {
 }
 
 func NewServer(paths Paths) *Server {
+	capacity, err := desiredCPUSlots(runtime.NumCPU())
+	if err != nil {
+		// Serve reports the malformed setting before accepting requests. Keep a
+		// safe constructor default for unit tests which do not call Serve.
+		capacity = 1
+	}
 	server := &Server{
 		Paths: paths, DrainTimeout: 10 * time.Second, scopes: map[string]*scopeEntry{}, ejecting: map[string]struct{}{}, coveredWorktrees: map[string]struct{}{}, discoveryFailed: map[string]struct{}{},
 		projectUses: map[string]int{},
@@ -130,6 +137,7 @@ func NewServer(paths Paths) *Server {
 		storeOpHeavyTimeout:          5 * time.Minute,
 		storeOpWriteTimeout:          30 * time.Second,
 	}
+	server.governor = newGovernorSet(capacity, governorObserve, server)
 	server.projectCond = sync.NewCond(&server.mu)
 	return server
 }
@@ -217,6 +225,16 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		return err
 	}
 	desiredSlots, slotErr := desiredCPUSlots(runtime.NumCPU())
+	mode, modeErr := governorModeFromEnv(os.Getenv("AIRA_SCHED_MODE"))
+	if modeErr != nil {
+		return modeErr
+	}
+	if slotErr == nil && s.governor != nil {
+		s.governor.mu.Lock()
+		s.governor.capacity, s.governor.mode = desiredSlots, mode
+		s.governor.mu.Unlock()
+		s.governor.signal()
+	}
 	if slotErr == nil {
 		ensureSlots := ensureCPUSlots
 		if s.ensureCPUSlotsFn != nil {
@@ -348,6 +366,9 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	go func() {
 		connections.Wait()
 		s.pruneAdmitRegistry()
+		if s.governor != nil {
+			s.governor.stopOnce.Do(func() { close(s.governor.stop) })
+		}
 		<-reaperDone
 		<-flusherDone
 		<-discoveryDone
@@ -552,6 +573,17 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		wrote = true
 		_ = conn.SetReadDeadline(time.Time{})
 		s.admitConnection(conn, request.Request.Args)
+		return
+	}
+	if verb == "governor" {
+		if s.OnRequest != nil {
+			s.OnRequest(request.Scope, request.Request)
+		}
+		// governorConnection has one framed reader for the lifetime of this
+		// connection; never let the generic dispatcher read from it again.
+		wrote = true
+		_ = conn.SetReadDeadline(time.Time{})
+		s.governorConnection(conn, request.Request.Args)
 		return
 	}
 	if scope.ProjectID != "" {
