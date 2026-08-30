@@ -128,8 +128,12 @@ scheduler is an optimisation over the hard backstop, never a correctness depende
 
 ## 5. Staging
 
-1. **Slice 1 — priority-aging (closes AIRA-14).** `nice 5` launch + age-to-19;
-   keep the flock. Small, independently valuable, its own two-loop. Ships first.
+1. **Slice 1 — priority-aging (closes AIRA-14). DONE + DEPLOYED 2026-08-30 (`3708af5`).**
+   Implemented as cgroup `cpu.weight` decay (owner-decided, not re-nicing): fresh scope at
+   weight 100 decaying `100→70→50→30→20→10` over `10s,30s,1m,5m,10m,30m`; best-effort `+cpu`
+   delegation repair (fail-open, memory stays fail-closed); honest `cpu-weight=aging|unavailable`
+   facet; FD-anchored fail-open decay writer stopped-and-joined before teardown. Flock unchanged.
+   Live-verified (scope `cpu.weight=100`, parent propagates `+cpu`). See the Slice 1 plan spec.
 2. **Slice 2 — the daemon scheduler.** Checkpoint protocol + active-set management +
    connection-held grants + cooperative park/activate. Cut the CPU governor from flock
    → daemon and **REMOVE the flock** (owner-decided 2026-08-30): the daemon is the sole

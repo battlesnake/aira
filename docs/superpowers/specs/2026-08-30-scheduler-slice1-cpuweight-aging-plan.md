@@ -1,8 +1,19 @@
 # Scheduler Slice 1 — cgroup cpu.weight aging (AIRA-14 residual fix)
 
-- **Status:** plan (for plan-review). Owner-approved design (scheduler spec §3.1: cpu.weight decay).
-- Closes **AIRA-14** — the AIRA-11 CPU-side bootstrap residual (best-effort-7 fixed the I/O; the
-  interpreter/import CPU still starves at a flat share under peak contention). Ships first, keeps the
+- **Status:** DONE + MERGED (`3708af5`) + DEPLOYED + live-verified 2026-08-30. Closes **AIRA-14**.
+  Owner-approved design (scheduler spec §3.1: cpu.weight decay).
+- **Live verify:** a fresh confine scope carries `cpu.weight=100`, the parent's
+  `cgroup.subtree_control` now propagates `cpu memory pids` (the `+cpu` delegation repair the
+  Sol/Fable plan-review flagged as the #59 inert-class risk — proven live NOT inert), and the trailer
+  honestly reports `cpu-weight=aging`. Binary swapped (supervisor/client-side only, no daemon restart);
+  old binary backed up at `~/tmp/aira-pre-slice1`.
+- **Two-loop:** Sol+Fable plan-review BLOCK (cpu not delegated → v2 folds `+cpu` best-effort +
+  honesty facet + fail-open FD writer + named curve). Terra build → Sol build-review: implementation
+  CORRECT, BLOCK on 4 POROUS tests → Terra hardened all 4 (revert-checked) → Opus verified
+  discriminating + live. Mitigates mixed-age contention (the observed AIRA-14 case); simultaneous-fresh
+  remains the daemon scheduler (Slice 2).
+- Closed **AIRA-14** — the AIRA-11 CPU-side bootstrap residual (best-effort-7 fixed the I/O; the
+  interpreter/import CPU still starves at a flat share under peak contention). Shipped first, kept the
   flock; the daemon scheduler (Slices 2–3) comes later.
 
 ## Problem
