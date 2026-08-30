@@ -203,3 +203,43 @@ Slice 3; a multi-offender slice OOM can still kill an under-ceiling neighbour, n
 
 **Deploy:** daemon (ceiling field + adoption type) + client (enforce + fallback) → daemon restart,
 made safe by fix (3). Batches the reopen transition. Re-gate v2 (Fable) + Sol before build.
+
+## Plan-review round 2 — Fable re-gate GATE-FAIL (narrow) → v3
+
+Fable code-verified P1-c, P1-a, P2-d/e/f **closed** by v2 (separate `scope_ceiling` field is
+protocol-coherent incl. the mixed new-client/old-daemon window → E_PROTOCOL → flock fallback →
+client default caps it, never uncapped; the client fail-closed default covers every no-ceiling path
+provided a **compiled-in** default backs the env). Three residual items → v3:
+
+- **P1 (blocker) — the cap-TYPE has no restart-surviving carrier.** After a restart the daemon
+  registry is empty (#74's premise) and `listConfines` reads ONLY the cgroupfs (dirname →
+  name/pid/stamp `confine_manage_linux.go:74-79`, `cgroup.procs`, `memory.current`, `memory.max`);
+  `ConfineRecord` (`confine_manage.go:25-36`) has no cap facet and cgroupfs holds no metadata. A
+  daemon-DB record is porous (misses flock-launched delegate-ram scopes carrying the big client-default
+  cap — a later daemon adopts them at face value → freeze). **FIX: mark ceiling-capped scopes in the
+  SCOPE-ID/dirname.** The client knows `DelegateRAM` at `confineScopeID()` (`confine_linux.go:402-406`),
+  so emit a distinct **fixed positional marker segment** (e.g. `CONFINE-dr-<name>-<pid>-<rand>`) —
+  unambiguous and kept CLEAR of the user-suppliable `name` (which admits `-`) by being positional right
+  after `CONFINE-`. The adoption scan derives the type from the dirname: **marked → adopt at
+  `min(Cap, memory.current + margin)`; unmarked finite-cap → adopt at `Cap`** (today's #67 reserve-caps
+  + explicit `--memory-max`). Ripple sites (mechanical, no-compat): `confineScopeIDPattern` (admit.go:102),
+  `confineAdmitScopeName` (admit.go:813-825), `parseConfineScopeID`, #72 `validConfineScopeID`, #68 kill
+  selectors. Safe direction: an explicit-`--memory-max` delegate-ram scope adopting at `min` under-adopts
+  → over-admit, the direction `admit.go:548-552` already documents as safe.
+- **P2 — restore Sol's `:389-392` double-book guard into the buildable items.** Guard
+  `reserve = request.ScopeMemoryMax` with `!DelegateRAM`; for delegate-ram the scope cap =
+  `min(explicit --memory-max, ceiling)` and the whole-job admission charge stays the pinned framework
+  overhead (never charge the full explicit cap on top of per-test reserves).
+- **P3 (wording) — freeze window.** At the FIRST (deploy) restart, live delegate-ram scopes are
+  old-binary uncapped (`Cap="max"`) → already skipped at `admit.go:553-556` → no freeze. The risk begins
+  at the SECOND restart with ceiling-capped scopes live — which is exactly what the P1 fix prevents.
+
+**Build cautions (Fable, for Terra):** keep the #67 arm of `:509` intact for non-delegate jobs (ADD a
+delegate-ram branch, don't rewrite the condition); update the §6 rationale comment at
+`confine_linux.go:502-507` (it will otherwise contradict the new unevaluated-path behaviour); a
+compiled-in default backs `AIRA_DELEGATE_RAM_SCOPE_DEFAULT` (never uncapped on env unset/parse error);
+tests MUST include a **flock-fallback delegate-ram run asserting a finite `memory.max`** (the porous
+trap is testing only the daemon path) + the **adoption-type test** (marked→current+margin,
+unmarked→Cap); deploy = restart the daemon promptly after binary install to keep the flock window short.
+
+Fable: "v3 should pass." Proceeding to build v3 (the build-review is the second adversarial loop).
