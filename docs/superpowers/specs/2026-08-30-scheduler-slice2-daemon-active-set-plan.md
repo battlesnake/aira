@@ -1,7 +1,9 @@
 # Scheduler Slice 2 — the daemon active-set cooperative scheduler (replaces the flock)
 
-- **Status:** plan (drafting; code-grounded seam anchors pending the daemon map). Owner-approved
-  design: `2026-08-30-aira-cooperative-scheduler-design.md` §3.2, §4, §5.2.
+- **Status:** plan v2 (Sol + DeepSeek plan-review BLOCK folded; Fable code-gate pending). Owner-approved
+  design: `2026-08-30-aira-cooperative-scheduler-design.md` §3.2, §4, §5.2. **Read the "Plan-review
+  round 1" section at the bottom — v2 supersedes several v1 body claims (min-share, preemption latency,
+  the connection-held read model, crash-safety symmetry, worker identity).**
 - Depends on Slice 1 (DONE — cpu.weight aging governs *bootstrap*; this slice governs *execution*).
 - **Deploys via a daemon restart** (daemon-side change) → batch the already-merged `done→in-progress`
   reopen transition; reserves reconstruct per #74, so the restart is safe.
@@ -236,3 +238,100 @@ suite from flock to daemon-scheduler at once. Notify sessions; the change is mac
 - **Restart:** no active-set scan analog (unlike #74's `evaluateAdmitQueue` adopted-scan
   `admit.go:566-660`) — active set rebuilds as workers reconnect at their next checkpoint (≤10s window,
   fail-open). RAM reserves still reconstruct as today.
+
+## Plan-review round 1 — Sol BLOCK + DeepSeek BLOCK → v2 (folded below)
+
+Both lineages BLOCKED with convergent, real correctness holes. v2 resolutions:
+
+### A. Min-share vs capacity contradiction (both) → per-job floor is HARD, capacity is SOFT
+
+v1's "≥1 active per job" *and* "active ≤ capacity" are incompatible when `#jobs > capacity`. **v2:** the
+per-job floor of **1 active worker** is a HARD FLOOR; `capacity = NumCPU−reserve` is a SOFT TARGET.
+- `#jobs ≤ capacity` (the real case — `#jobs` = concurrent confine *suites*, ~1–4; capacity ~14):
+  active = capacity; the slots ABOVE the 1-per-job floor go youngest-job-first.
+- `#jobs > capacity` (pathological): **oversubscribe** to `#jobs` (one active per job). Accepted —
+  CPU over-admission is *degraded throughput, not OOM* (unlike RAM), and Slice-1 `cpu.weight` aging
+  arbitrates the oversubscription. A job is NEVER fully parked ⇒ **starvation is structurally
+  impossible** ⇒ invariant #2 holds trivially, and park/activate only ever shuffles ABOVE-FLOOR slots
+  (never a job's last worker). This is *simpler* than a time-slice round-robin (no quantum, no
+  park-the-last-worker lost-wakeup edge — architectural-simplicity). **Supersedes** the v1 "still open"
+  min-share tension.
+
+### B. Preemption latency is bounded by the longest TEST, not ~10s (both) → state honestly
+
+A worker only checkpoints *between* tests, so a worker inside a long test does not yield until that test
+ends (owner non-goal explicitly forbids hard mid-test SIGSTOP preemption). **v2 honest bound:** an
+ABOVE-FLOOR slot is reclaimed within `≤ max(current test durations of the active workers)`, NOT ≤10s.
+Acceptable because: (i) the hard floor means no job is EVER fully parked regardless of latency (slow to
+yield ≠ starved); (ii) Slice-1 cpu.weight aging shifts CPU toward young jobs *continuously*, independent
+of the checkpoint cadence; (iii) real pytest tests are short. Delete every false "≤10s"/"bounded passes"
+re-activation claim from the v1 body.
+
+### C. Connection read-ownership race (Sol) + lost-wakeup race (DeepSeek) → single-reader state machine
+
+The admit clone is unsound for a checkpoint *loop*: admit has ONE reader until grant then only
+EOF-watches; a governor needs continuous checkpoint reads, so a concurrent disconnect `conn.Read`
+goroutine would STEAL framed bytes. **v2 handler shape:** ONE reader goroutine owns `conn.Read` in a
+loop, decoding frames onto a `frameCh` (a checkpoint frame, or channel-CLOSE = EOF/disconnect). The
+handler state machine `select`s over `{frameCh, wakeCh, s.stopping}` — no second concurrent reader.
+Park transition (evaluate-then-signal, ONE mutex, no scan-under-lock — the #72/#74 rule): under the lock,
+**register `wakeCh` into the parked set AND free the slot AND set state=parked, THEN unlock and signal**
+the evaluator. Register-before-free-before-signal ⇒ a reactivation can never be lost. The evaluator
+reactivates only by sending on a registered `wakeCh`.
+
+### D. Crash-safety is asymmetric & incomplete (Sol: parked leak; DeepSeek: over-admit) → both directions
+
+- **Parked worker killed → relay blocked on the daemon read never sees stdin EOF → grant leaks
+  forever (Sol).** v2: the relay runs a CONCURRENT stdin-EOF watcher goroutine (always reading its
+  stdin from the plugin); on EOF (worker death) it closes the daemon connection and exits — so even
+  while parked (state machine on `wakeCh`), the daemon sees `frameCh` close and releases. Belt:
+  `PR_SET_PDEATHSIG(SIGKILL)` on the relay so worker death kernel-kills it.
+- **Governor channel dies while the worker LIVES → daemon frees the slot, worker keeps running →
+  over-admit (DeepSeek).** v2 DECISION: for CPU this is **fail-open-CONTINUE + RECONNECT**, NOT
+  DeepSeek's fail-stop. Rationale (defended): the daemon must NEVER be a liveness dependency (owner
+  rule — fail-stopping a live merge-gate on a daemon blip is unacceptable); CPU over-admit is
+  degraded-perf not OOM; the overshoot is BOUNDED by (workers active at loss) and TRANSIENT. The relay
+  actively **reconnects** (see E) to re-sync and minimise the overshoot window, rather than going
+  ungoverned-forever. This explicitly rejects fail-stop for CPU.
+
+### E. No stable per-worker session ID (both) → client-generated worker UUID + idempotent re-acquire
+
+Scope = job ≠ worker; daemon-assigned `workerSeq` can't dedupe reconnects. **v2:** the relay generates
+a stable **worker session UUID** at start (held for its life). Acquire/re-acquire carry `{workerUUID,
+jobID}`; the daemon keys the active set by `workerUUID` and REPLACES any stale record on re-acquire
+(idempotent) — no double-count. On daemon-channel loss while alive, an ACTIVE relay reconnects and
+re-acquires (D); a PARKED relay treats daemon loss as "continue" (releases the worker, re-acquires
+fresh) rather than staying blocked (DeepSeek). Post-daemon-restart the active set rebuilds keyed by
+reconnecting `workerUUID`s — safe, no scan needed, no double-count.
+
+### F. Seam corrections (Sol) → two plugin call sites + inject the scope ID
+
+- The `__init__.py:371-380` site is an after-test **GC condition**, not a loop or worker-start hook.
+  v2: the plugin ADDS (1) a **pre-first-test worker-start acquire** (in `pytest_runtest_protocol`
+  before the first `yield`, parkable) and (2) a **periodic post-test checkpoint** co-located with the
+  ~10s GC condition. Two sites, not one.
+- The child env does NOT export a scope ID ("as confine already does" was FALSE). v2: the confine
+  supervisor **injects `AIRA_CONFINE_SCOPE_ID`** into the child env (`AppendConfineChildEnvironment`
+  `env.go:62-101` / `confine_linux.go`), authoritative (the supervisor owns the scope ID). The relay
+  reads it as `jobID`. (Rejected: derive-from-cgroup, more fragile.)
+
+### G. Fail-open honesty (Sol) + nextTestEst guard (both)
+
+Fail-open loses CPU GOVERNANCE — `memory.max` + `oom.group` are memory-only backstops; they do NOT
+bound CPU fairness or oversubscription. State it as honest *degraded CPU scheduling*, transient,
+accepted; it applies on pre-grant daemon-unreachable, malformed/timeout, and `AIRA_GOVERNOR=off`.
+`nextTestEst` is validated+bounded on receipt, STORED but never ranked/gated on in Slice 2; a
+discriminating test asserts CPU selection is invariant to `nextTestEst` (Slice-3 seam, no Slice-2 trap).
+
+### Deploy (v2) — observe-then-enforce
+
+Add a daemon `AIRA_SCHED_MODE=observe|enforce` (default `observe` on first deploy): `observe` grants
+everything + logs the park/activate decisions it WOULD make (so the scheduler is exercised live without
+parking anyone); flip to `enforce` after a soak. Cheap insurance for a machine-wide flip with no flock
+fallback. `AIRA_GOVERNOR=off` (client) remains the per-session escape hatch.
+
+### v2 status
+
+Fable code-gate pending (adjudicate A–G against the real admit.go/server.go/plugin; confirm the
+single-reader state machine + register-before-signal + the PDEATHSIG/stdin-watch crash-safety are
+buildable on the cited seams). On GATE-PASS → Terra build.
