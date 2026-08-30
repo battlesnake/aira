@@ -1,0 +1,50 @@
+name: Release
+
+# Triggered on version tags matching ^v\d+(\.\d+)?$ — e.g. v0, v0.1, v1, v1.2
+# (two-part max; v1.2.3 does NOT match). Pushing such a tag builds a static
+# linux/amd64 binary and publishes it as a GitHub Release.
+on:
+  push:
+    tags:
+      - 'v[0-9]+'
+      - 'v[0-9]+.[0-9]+'
+
+permissions:
+  contents: write # required to create the release and upload assets
+
+jobs:
+  release:
+    name: build + publish release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # AIRA is a single static, cgo-free Go binary (Linux-only: cgroups,
+      # systemd, aira.slice). CGO_ENABLED=0 yields a fully static ELF;
+      # -trimpath strips local paths (reproducible, no path leakage);
+      # -ldflags "-s -w" strips debug info for a smaller artifact.
+      - name: Build static linux/amd64 binary
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          go build -trimpath -ldflags "-s -w" -o aira-linux-amd64 ./cmd/aira
+          sha256sum aira-linux-amd64 | tee aira-linux-amd64.sha256
+          file aira-linux-amd64
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            aira-linux-amd64 \
+            aira-linux-amd64.sha256 \
+            README.md
