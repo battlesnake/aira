@@ -39,10 +39,13 @@ func governorMaxWait() time.Duration {
 type GovernorSlotRequest struct {
 	SocketPath string
 	JobID      string
-	Stdin      io.Reader
-	Stdout     io.Writer
-	Dial       func(context.Context, string) (net.Conn, error) // test seam
-	UUID       string                                          // test seam; empty generates one
+	// Slice is the validated confine slice name carried in acquire. The daemon
+	// resolves it to the canonical ledger path once and keeps it immutable.
+	Slice  string
+	Stdin  io.Reader
+	Stdout io.Writer
+	Dial   func(context.Context, string) (net.Conn, error) // test seam
+	UUID   string                                          // test seam; empty generates one
 }
 
 type governorWireRequest struct {
@@ -55,6 +58,7 @@ type governorWireRequest struct {
 	Type        string `json:"type,omitempty"`
 	WorkerUUID  string `json:"worker_uuid,omitempty"`
 	JobID       string `json:"job_id,omitempty"`
+	Slice       string `json:"slice,omitempty"`
 	HeldRSS     int64  `json:"held_rss,omitempty"`
 	NextTestEst int64  `json:"next_test_est,omitempty"`
 }
@@ -167,7 +171,7 @@ func connectGovernor(ctx context.Context, req GovernorSlotRequest, uuid string, 
 	if err := writeGovernorFrame(conn, governorWireRequest{Proto: 5, Scope: map[string]any{}, Request: request}); err != nil {
 		return fail(err)
 	}
-	if err := writeGovernorFrame(conn, governorWireRequest{Type: "acquire", WorkerUUID: uuid, JobID: req.JobID}); err != nil {
+	if err := writeGovernorFrame(conn, governorWireRequest{Type: "acquire", WorkerUUID: uuid, JobID: req.JobID, Slice: req.Slice}); err != nil {
 		return fail(err)
 	}
 	var reply governorWireReply
@@ -193,6 +197,11 @@ func GovernorSlot(ctx context.Context, req GovernorSlotRequest) int {
 	if strings.TrimSpace(req.JobID) == "" {
 		_, _ = fmt.Fprintln(req.Stdout, "continue")
 		return 0
+	}
+	if strings.TrimSpace(req.Slice) == "" {
+		// Match confine-reserve's default charge target. The daemon resolves and
+		// validates this name to its canonical ledger path on acquire.
+		req.Slice = DefaultConfineSlice
 	}
 	uuid := req.UUID
 	if uuid == "" {

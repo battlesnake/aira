@@ -92,8 +92,8 @@ func TestConfineRAMGovernorEnvironmentIsCoupledToDelegateMode(t *testing.T) {
 		"AIRA_CONFINE_SCOPE_ID=stale-scope",
 		"AIRA_GOVERNOR=off",
 	}
-	nondelegate := childEnvValues(t, AppendConfineChildEnvironment(inherited, runtimeDir, nil, false, "", "", "ordinary-scope"))
-	for _, key := range []string{"AIRA_TEST_MEM_GOVERNOR", "AIRA_TEST_MEM_DEFAULT", "AIRA_TEST_MEM_GROWTH_HEADROOM", "AIRA_CONFINE_RESERVE_CMD", "AIRA_GOVERNOR_CMD", "AIRA_GOVERNOR"} {
+	nondelegate := childEnvValues(t, AppendConfineChildEnvironment(inherited, runtimeDir, nil, false, "", "", "ordinary-scope", "ordinary.slice"))
+	for _, key := range []string{"AIRA_TEST_MEM_GOVERNOR", "AIRA_TEST_MEM_DEFAULT", "AIRA_TEST_MEM_GROWTH_HEADROOM", "AIRA_CONFINE_RESERVE_CMD", "AIRA_GOVERNOR_CMD", "AIRA_GOVERNOR_SLICE", "AIRA_GOVERNOR"} {
 		if _, present := nondelegate[key]; present {
 			t.Fatalf("non-delegate launch retained %s: %v", key, nondelegate)
 		}
@@ -101,12 +101,12 @@ func TestConfineRAMGovernorEnvironmentIsCoupledToDelegateMode(t *testing.T) {
 	if nondelegate["AIRA_CONFINE_SCOPE_ID"] != "ordinary-scope" {
 		t.Fatalf("ordinary child scope=%q environment=%v", nondelegate["AIRA_CONFINE_SCOPE_ID"], nondelegate)
 	}
-	delegate := childEnvValues(t, AppendConfineChildEnvironment(inherited, runtimeDir, nil, true, "/opt/aira", "768M", "scope-123"))
-	if delegate["AIRA_TEST_MEM_GOVERNOR"] != "1" || delegate["AIRA_TEST_MEM_DEFAULT"] != "768M" || delegate["AIRA_TEST_MEM_GROWTH_HEADROOM"] != "768M" || delegate["AIRA_CONFINE_RESERVE_CMD"] != "/opt/aira" || delegate["AIRA_GOVERNOR_CMD"] != "/opt/aira" || delegate["AIRA_CONFINE_SCOPE_ID"] != "scope-123" || delegate["AIRA_GOVERNOR"] != "daemon" {
+	delegate := childEnvValues(t, AppendConfineChildEnvironment(inherited, runtimeDir, nil, true, "/opt/aira", "768M", "scope-123", "finite.slice"))
+	if delegate["AIRA_TEST_MEM_GOVERNOR"] != "1" || delegate["AIRA_TEST_MEM_DEFAULT"] != "768M" || delegate["AIRA_TEST_MEM_GROWTH_HEADROOM"] != "768M" || delegate["AIRA_CONFINE_RESERVE_CMD"] != "/opt/aira" || delegate["AIRA_GOVERNOR_CMD"] != "/opt/aira" || delegate["AIRA_CONFINE_SCOPE_ID"] != "scope-123" || delegate["AIRA_GOVERNOR_SLICE"] != "finite.slice" || delegate["AIRA_GOVERNOR"] != "daemon" {
 		t.Fatalf("delegate RAM environment=%v", delegate)
 	}
 	t.Setenv("AIRA_GOVERNOR", "off")
-	off := childEnvValues(t, AppendConfineChildEnvironment(inherited, runtimeDir, nil, true, "/opt/aira", "768M", "scope-off"))
+	off := childEnvValues(t, AppendConfineChildEnvironment(inherited, runtimeDir, nil, true, "/opt/aira", "768M", "scope-off", "finite.slice"))
 	if off["AIRA_GOVERNOR"] != "off" {
 		t.Fatalf("governor opt-out=%q environment=%v", off["AIRA_GOVERNOR"], off)
 	}

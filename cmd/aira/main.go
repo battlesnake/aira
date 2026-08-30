@@ -880,7 +880,11 @@ func runGovernorSlotCommand(ctx context.Context, options map[string]string, stdi
 		}
 		socket = paths.SocketPath
 	}
-	return runner.GovernorSlot(ctx, runner.GovernorSlotRequest{SocketPath: socket, JobID: jobID, Stdin: stdin, Stdout: stdout})
+	slice := strings.TrimSpace(os.Getenv("AIRA_GOVERNOR_SLICE"))
+	if slice == "" {
+		slice = runner.DefaultConfineSlice
+	}
+	return runner.GovernorSlot(ctx, runner.GovernorSlotRequest{SocketPath: socket, JobID: jobID, Slice: slice, Stdin: stdin, Stdout: stdout})
 }
 
 func resolveConfineOwner(ctx context.Context, explicit string) (string, error) {

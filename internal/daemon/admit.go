@@ -176,6 +176,37 @@ func (s *Server) admitOutstandingReserve(path string) (outstanding int64, outsta
 	return outstanding, outstandingJobs, adopted, adoptedJobs, true
 }
 
+// admitAvailable is the governor's advisory, read-only view of the same
+// headroom calculation used by an immediate admission grant. It deliberately
+// does not create a queue: a read-only governor lookup must not start an idle
+// queue evaluator. The global lock order is governorSet.mu ->
+// admitRegistryMu -> sliceQueue.mu; no admission path takes governorSet.mu.
+func (s *Server) admitAvailable(slicePath string) (int64, bool) {
+	var outstanding, adopted int64
+	var outstandingJobs, adoptedJobs int
+	s.admitRegistryMu.Lock()
+	queue := s.admitQueues[slicePath]
+	if queue != nil {
+		queue.mu.Lock()
+		outstanding, adopted = queue.outstanding, queue.adopted
+		outstandingJobs, adoptedJobs = queue.outstandingJobs, queue.adoptedJobs
+		queue.mu.Unlock()
+	}
+	s.admitRegistryMu.Unlock()
+
+	readMemory := s.admitReadMemory
+	if readMemory == nil {
+		readMemory = readSliceMemory
+	}
+	current, maximum, ok, _ := readMemory(slicePath)
+	if !ok {
+		return 0, false
+	}
+	jobs := addJobCountClamp(addJobCountClamp(outstandingJobs, adoptedJobs), 1)
+	headroom := s.admitSliceHeadroom(jobs)
+	return checkedAvailable(current, maximum, addClamp(outstanding, adopted), headroom), true
+}
+
 func (s *Server) admitCeiling(path string, maximum int64) int64 {
 	return subtractFloor(maximum, s.admitSliceHeadroom(s.admitOutstandingJobs(path)+1))
 }
@@ -757,6 +788,12 @@ func (s *Server) releaseAdmitWaiter(queue *sliceQueue, waiter *admitWaiter) {
 	waiter.state = admitReleased
 	queue.mu.Unlock()
 	queue.signal()
+	// A ledger release can make a parked RAM-aware worker fit. This is only the
+	// coalescing, lock-free signal: evaluate must never be called synchronously
+	// from this release path because it previously held queue.mu.
+	if s.governor != nil {
+		s.governor.signal()
+	}
 	s.pruneAdmitQueue(queue)
 }
 

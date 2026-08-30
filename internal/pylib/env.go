@@ -20,6 +20,7 @@ var governorEnvironmentKeys = map[string]struct{}{
 	"AIRA_GOVERNOR_CMD":             {},
 	"AIRA_GOVERNOR_MAX_WAIT":        {},
 	"AIRA_CONFINE_SCOPE_ID":         {},
+	"AIRA_GOVERNOR_SLICE":           {},
 	"AIRA_TEST_MEM_GOVERNOR":        {},
 	"AIRA_TEST_MEM_DEFAULT":         {},
 	"AIRA_TEST_MEM_GROWTH_HEADROOM": {},
@@ -54,16 +55,16 @@ func StripGovernorEnvironment(env []string) []string {
 // every governor variable stripped, disabling gating instead of using stale
 // inherited coordinates.
 func AppendChildEnvironment(env []string, runtimeDir string, diagnostics io.Writer) []string {
-	return appendChildEnvironment(env, runtimeDir, diagnostics, false, "", "", "")
+	return appendChildEnvironment(env, runtimeDir, diagnostics, false, "", "", "", "")
 }
 
 // AppendConfineChildEnvironment couples per-test RAM governance to an explicit
 // delegate-RAM confine launch. Every other launch strips these coordinates.
-func AppendConfineChildEnvironment(env []string, runtimeDir string, diagnostics io.Writer, delegateRAM bool, reserveCommand, memoryDefault, scopeID string) []string {
-	return appendChildEnvironment(env, runtimeDir, diagnostics, delegateRAM, reserveCommand, memoryDefault, scopeID)
+func AppendConfineChildEnvironment(env []string, runtimeDir string, diagnostics io.Writer, delegateRAM bool, reserveCommand, memoryDefault, scopeID, slice string) []string {
+	return appendChildEnvironment(env, runtimeDir, diagnostics, delegateRAM, reserveCommand, memoryDefault, scopeID, slice)
 }
 
-func appendChildEnvironment(env []string, runtimeDir string, diagnostics io.Writer, delegateRAM bool, reserveCommand, memoryDefault, scopeID string) []string {
+func appendChildEnvironment(env []string, runtimeDir string, diagnostics io.Writer, delegateRAM bool, reserveCommand, memoryDefault, scopeID, slice string) []string {
 	result := StripGovernorEnvironment(env)
 	if strings.TrimSpace(runtimeDir) == "" {
 		return result
@@ -98,6 +99,7 @@ func appendChildEnvironment(env []string, runtimeDir string, diagnostics io.Writ
 		// The relay uses the same resolved self binary as confine-reserve and
 		// identifies this confined pytest session by its scope id.
 		result = upsertChildEnv(result, "AIRA_GOVERNOR_CMD", reserveCommand)
+		result = upsertChildEnv(result, "AIRA_GOVERNOR_SLICE", slice)
 		governor := strings.TrimSpace(os.Getenv("AIRA_GOVERNOR"))
 		if governor != "off" {
 			governor = "daemon"

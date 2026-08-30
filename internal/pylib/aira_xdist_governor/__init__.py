@@ -153,7 +153,7 @@ def _read_governor_reply(process):
     return reply
 
 
-def _governor_checkpoint():
+def _governor_checkpoint(item):
     """Acquire once, then yield at bounded between-test checkpoints.
 
     This hook runs before per-test RAM reservation. A daemon park can therefore
@@ -179,7 +179,10 @@ def _governor_checkpoint():
         if time.monotonic() - _last_governor_checkpoint < _DEFAULT_AFTER_TEST_GC_INTERVAL:
             return
         held_rss = _read_rss_bytes()
-        _governor_process.stdin.write(("checkpoint %d 0\n" % (held_rss,)).encode("ascii"))
+        next_est = _reservation_bytes(item)
+        if next_est is None:
+            next_est = 0
+        _governor_process.stdin.write(("checkpoint %d %d\n" % (held_rss, next_est)).encode("ascii"))
         _governor_process.stdin.flush()
         _read_governor_reply(_governor_process)
         _last_governor_checkpoint = time.monotonic()
@@ -343,6 +346,7 @@ def _acquire_reservation(item):
             [
                 command, "confine-reserve", "--bytes", str(bytes_to_hold), "--pinned",
                 "--signature", "pytest:" + item.nodeid,
+                *(["--slice", _gov_slice] if (_gov_slice := os.environ.get("AIRA_GOVERNOR_SLICE", "").strip()) else []),
                 "--max-wait", "%gs" % (_DEFAULT_MAX_WAIT,),
             ],
             stdin=subprocess.PIPE,
@@ -384,7 +388,7 @@ def pytest_runtest_protocol(item, nextitem):
         try:
             # This precedes _acquire_reservation deliberately: the cooperative
             # daemon may park the worker only while it holds no RAM grant.
-            _governor_checkpoint()
+            _governor_checkpoint(item)
         except Exception as exc:
             _disable_governor(exc)
         try:

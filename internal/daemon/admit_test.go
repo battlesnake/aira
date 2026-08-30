@@ -758,6 +758,53 @@ func TestCheckedAvailableClampsWithoutOverflow(t *testing.T) {
 	}
 }
 
+func TestAdmitAvailableMatchesGrantHeadroomWithoutCreatingQueue(t *testing.T) {
+	// Revert-check: omitting the +1 prospective job term gives 46 rather than
+	// the grant-time 44 here; creating a missing queue changes the registry.
+	server := &Server{
+		admitQueues:                  map[string]*sliceQueue{},
+		admitSliceHeadroomBase:       10,
+		admitSliceHeadroomSupervisor: 2,
+		admitReadMemory: func(string) (int64, int64, bool, string) {
+			return 20, 100, true, ""
+		},
+	}
+	queue := &sliceQueue{outstanding: 30, outstandingJobs: 1, adopted: 10, adoptedJobs: 1}
+	server.admitQueues["/slice"] = queue
+	if available, ok := server.admitAvailable("/slice"); !ok || available != 44 {
+		t.Fatalf("available=%d ok=%v, want 44 true", available, ok)
+	}
+	if available, ok := server.admitAvailable("/missing"); !ok || available != 68 {
+		t.Fatalf("missing queue available=%d ok=%v, want 68 true", available, ok)
+	}
+	if len(server.admitQueues) != 1 || server.admitQueues["/missing"] != nil {
+		t.Fatalf("read-only lookup created a queue: %#v", server.admitQueues)
+	}
+	server.admitReadMemory = func(string) (int64, int64, bool, string) { return 0, 0, false, "read-error" }
+	if _, ok := server.admitAvailable("/slice"); ok {
+		t.Fatal("unreadable or uncapped slice was not reported uncertain")
+	}
+}
+
+func TestReleaseAdmitWaiterOnlySignalsGovernor(t *testing.T) {
+	// Revert-check: a synchronous evaluate here would activate the parked
+	// worker below. Keeping this path signal-only avoids queue.mu ->
+	// governorSet.mu -> sliceQueue.mu lock inversion.
+	g := testGovernor(1, governorEnforce)
+	parked := putGovernorWorker(g, "parked", "job", time.Now(), 1, governorParked)
+	server := &Server{admitQueues: map[string]*sliceQueue{}, governor: g}
+	queue := &sliceQueue{path: "/slice", waiters: []*admitWaiter{{state: admitGranted, accounted: true, reserve: 1}}, outstanding: 1, outstandingJobs: 1}
+	server.releaseAdmitWaiter(queue, queue.waiters[0])
+	if parked.state != governorParked {
+		t.Fatal("admission release synchronously evaluated governor")
+	}
+	select {
+	case <-g.kick:
+	default:
+		t.Fatal("admission release did not signal governor")
+	}
+}
+
 func validAdmitArgs(reserve, wait int64) map[string]any {
 	return map[string]any{"slice": "slice", "reserve": reserve, "max_wait_ms": wait, "signature": "", "pinned": true}
 }

@@ -332,6 +332,60 @@ sys.stdin.buffer.read()`)
 	}
 }
 
+func TestRealPytestRAMReservationUsesGovernorSlice(t *testing.T) {
+	pytest := requireRealPytest(t)
+	for _, test := range []struct {
+		name, slice string
+	}{
+		{name: "set", slice: "custom.slice"},
+		{name: "unset"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			project, pythonDir := realPytestProject(t, "")
+			invocation := filepath.Join(project, "reservation-argv.json")
+			helper := writeReserveHelper(t, project, `
+import json, os, sys
+open(os.environ["AIRA_TEST_RESERVATION_ARGV"], "w").write(json.dumps(sys.argv[1:]))
+estimate = sys.argv[sys.argv.index("--bytes") + 1]
+print("granted reserve=%s basis=pinned:client" % estimate, flush=True)
+sys.stdin.buffer.read()`)
+			writeTestFile(t, project, "test_ram_slice.py", "def test_runs(): pass")
+			result := runPytest(t, pytest, project, pythonDir, map[string]string{
+				"AIRA_TEST_MEM_GOVERNOR": "1", "AIRA_TEST_MEM_DEFAULT": "8M",
+				"AIRA_CONFINE_RESERVE_CMD": helper, "AIRA_TEST_RESERVATION_ARGV": invocation,
+				"AIRA_GOVERNOR_SLICE": test.slice,
+			})
+			if result.err != nil {
+				t.Fatalf("pytest reservation run failed: %v\n%s", result.err, result.output)
+			}
+			data, err := os.ReadFile(invocation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var argv []string
+			if err := json.Unmarshal(data, &argv); err != nil {
+				t.Fatalf("decode reservation argv %q: %v", data, err)
+			}
+			sliceIndex := -1
+			for index, value := range argv {
+				if value == "--slice" {
+					sliceIndex = index
+					break
+				}
+			}
+			if test.slice == "" {
+				if sliceIndex >= 0 {
+					t.Fatalf("unset governor slice unexpectedly reached confine-reserve: %v", argv)
+				}
+				return
+			}
+			if sliceIndex < 0 || sliceIndex+1 >= len(argv) || argv[sliceIndex+1] != test.slice {
+				t.Fatalf("confine-reserve slice argv=%v, want --slice %q", argv, test.slice)
+			}
+		})
+	}
+}
+
 func TestRealPytestTotalFailOpen(t *testing.T) {
 	pytest := requireRealPytest(t)
 	t.Run("RAM governor disabled", func(t *testing.T) { assertRealPytestItemRuns(t, pytest, nil, nil) })
@@ -735,7 +789,7 @@ func runPytest(t *testing.T, pytest, project, pythonDir string, overrides map[st
 func realPytestEnv(pythonDir string, overrides map[string]string) []string {
 	blocked := map[string]bool{
 		"AIRA_PY_LIB": true, "AIRA_GOVERNOR": true, "AIRA_GOVERNOR_CMD": true,
-		"AIRA_CONFINE_SCOPE_ID": true, "PYTHONPATH": true, "PYTEST_ADDOPTS": true,
+		"AIRA_CONFINE_SCOPE_ID": true, "AIRA_GOVERNOR_SLICE": true, "PYTHONPATH": true, "PYTEST_ADDOPTS": true,
 		"AIRA_CONFINE_RESERVE_CMD": true, "PYTEST_PLUGINS": true, "PYTHONDONTWRITEBYTECODE": true,
 		"PYTEST_DISABLE_PLUGIN_AUTOLOAD": true,
 	}

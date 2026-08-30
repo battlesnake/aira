@@ -18,6 +18,45 @@ func TestGovernorSlotFailOpenOnDialFailure(t *testing.T) {
 	}
 }
 
+func TestGovernorSlotCarriesSliceInAcquireFrame(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	stdin, stdinWriter := net.Pipe()
+	defer stdinWriter.Close()
+	var output bytes.Buffer
+	received := make(chan governorWireRequest, 1)
+	go func() {
+		var envelope governorWireRequest
+		_ = readGovernorFrame(server, &envelope)
+		var acquire governorWireRequest
+		_ = readGovernorFrame(server, &acquire)
+		received <- acquire
+		_ = writeGovernorFrame(server, governorWireReply{State: "active"})
+	}()
+	done := make(chan int, 1)
+	go func() {
+		done <- GovernorSlot(context.Background(), GovernorSlotRequest{SocketPath: "fake", JobID: "job", Slice: "finite.slice", Stdin: stdin, Stdout: &output, UUID: "stable", Dial: func(context.Context, string) (net.Conn, error) { return client, nil }})
+	}()
+	select {
+	case acquire := <-received:
+		if acquire.Type != "acquire" || acquire.Slice != "finite.slice" {
+			t.Fatalf("acquire frame=%+v", acquire)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("relay did not send acquire")
+	}
+	_ = stdinWriter.Close()
+	select {
+	case got := <-done:
+		if got != 0 {
+			t.Fatalf("exit=%d", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("relay did not exit after stdin EOF")
+	}
+}
+
 func TestGovernorMaxWaitUsesGenerousDefaultOnInvalidSetting(t *testing.T) {
 	for _, raw := range []string{"", "not-a-duration", "0s", "-1s"} {
 		t.Run(raw, func(t *testing.T) {
