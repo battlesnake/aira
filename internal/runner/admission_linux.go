@@ -30,14 +30,15 @@ func (systemClock) Now() time.Time                         { return time.Now() }
 func (systemClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
 
 type admissionResult struct {
-	state    string
-	reason   string
-	waitedMS int64
-	lock     *admitLock
-	release  io.Closer
-	reserve  int64
-	ceiling  int64
-	basis    string
+	state        string
+	reason       string
+	waitedMS     int64
+	lock         *admitLock
+	release      io.Closer
+	reserve      int64
+	ceiling      int64
+	scopeCeiling int64
+	basis        string
 }
 
 var errDetachKillIntent = errors.New("detached run has a pending kill intent")
@@ -99,11 +100,12 @@ type runnerAdmitResponseFrame struct {
 }
 
 type runnerAdmitGrant struct {
-	State    string `json:"state"`
-	Reason   string `json:"reason,omitempty"`
-	WaitedMS int64  `json:"waited_ms"`
-	Reserve  int64  `json:"reserve"`
-	Basis    string `json:"basis"`
+	State        string `json:"state"`
+	Reason       string `json:"reason,omitempty"`
+	WaitedMS     int64  `json:"waited_ms"`
+	Reserve      int64  `json:"reserve"`
+	Basis        string `json:"basis"`
+	ScopeCeiling int64  `json:"scope_ceiling,omitempty"`
 }
 
 type runnerAdmitRejection struct {
@@ -340,6 +342,9 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 		"signature":   req.ResourceSignature,
 		"pinned":      !req.DaemonEstimateMemory || req.MemoryReservePinned,
 	}
+	if req.DelegateRAM {
+		frame.Request.Args["delegate_ram"] = true
+	}
 	if req.ConfineScopeID != "" {
 		frame.Request.Args["scope_id"] = req.ConfineScopeID
 		frame.Request.Args["name"] = req.ConfineName
@@ -400,7 +405,7 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 	}
 	// A full, validated frame is the sole winning outcome even when its final
 	// byte races the transport deadline. The flock fallback is never entered.
-	return admissionResult{state: grant.State, reason: grant.Reason, waitedMS: grant.WaitedMS, release: conn, reserve: grant.Reserve, basis: grant.Basis}, true, nil
+	return admissionResult{state: grant.State, reason: grant.Reason, waitedMS: grant.WaitedMS, release: conn, reserve: grant.Reserve, basis: grant.Basis, scopeCeiling: grant.ScopeCeiling}, true, nil
 }
 
 const mathMaxInt64 = int64(^uint64(0) >> 1)

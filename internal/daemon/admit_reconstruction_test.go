@@ -191,6 +191,29 @@ func TestAdmitReconstructionNonFiniteCapsContributeNeitherBytesNorHeadroom(t *te
 	}
 }
 
+// verifies: the scope-ID marker, not volatile daemon registry metadata, carries
+// the cap type across restart. Ceiling caps adopt at current+margin; ordinary
+// #67 finite caps keep adopting at their full cap.
+func TestAdmitReconstructionUsesDelegateRAMCapType(t *testing.T) {
+	now := time.Unix(650, 0)
+	server := reconstructionTestServer(&now, func(string) (runner.ConfineListResult, error) {
+		populated := 1
+		markedCap, regularCap := "10737418240", "3221225472" // 10 GiB / 3 GiB
+		markedRSS := int64(1 << 30)
+		return runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{
+			{ScopeID: "CONFINE-@dr-suite-1-a", Populated: &populated, Cap: &markedCap, RSSBytes: &markedRSS},
+			{ScopeID: "CONFINE-reserve-cap-2-b", Populated: &populated, Cap: &regularCap, RSSBytes: &markedRSS},
+		}}, nil
+	})
+	queue := &sliceQueue{path: "/slice", server: server}
+	server.evaluateAdmitQueue(queue)
+	wantMarked := int64(1<<30) + delegateRAMAdoptionMargin
+	want := wantMarked + int64(3<<30)
+	if queue.adopted != want || queue.adoptedJobs != 2 {
+		t.Fatalf("adopted=%d jobs=%d, want marked current+margin %d plus unmarked cap %d", queue.adopted, queue.adoptedJobs, wantMarked, int64(3<<30))
+	}
+}
+
 func TestAdmitReconstructionSkipsEmptyAndUnknownScopes(t *testing.T) {
 	now := time.Unix(700, 0)
 	server := reconstructionTestServer(&now, func(string) (runner.ConfineListResult, error) {

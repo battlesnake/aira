@@ -23,6 +23,10 @@ func confineTestScopeID(name string, pid int, stamp int64) string {
 	return "CONFINE-" + name + "-" + strconv.Itoa(pid) + "-" + strconv.FormatInt(stamp, 36)
 }
 
+func confineTestDelegateScopeID(name string, pid int, stamp int64) string {
+	return "CONFINE-" + delegateRAMScopeIDMarker + "-" + name + "-" + strconv.Itoa(pid) + "-" + strconv.FormatInt(stamp, 36)
+}
+
 func writeConfineTestScope(t *testing.T, slice, scopeID, procs string) string {
 	t.Helper()
 	path := filepath.Join(slice, ".aira-"+scopeID)
@@ -47,9 +51,11 @@ func TestConfineScanUnionDeduplicatesAndRegistryOwnerWins(t *testing.T) {
 	now := time.Now()
 	owned := confineTestScopeID("build-name.with-dash", 4101, now.Add(-time.Minute).UnixNano())
 	scanOnly := confineTestScopeID("fallback", 4102, now.Add(-2*time.Minute).UnixNano())
+	marked := confineTestDelegateScopeID("ceiling-suite", 4105, now.Add(-3*time.Minute).UnixNano())
 	pending := confineTestScopeID("pending", 4103, now.UnixNano())
 	writeConfineTestScope(t, slice, owned, "51\n52\n")
 	writeConfineTestScope(t, slice, scanOnly, "61\n")
+	writeConfineTestScope(t, slice, marked, "62\n")
 	regular := confineTestScopeID("not-a-directory", 4104, now.UnixNano())
 	if err := os.WriteFile(filepath.Join(slice, ".aira-"+regular), []byte("not a cgroup"), 0o644); err != nil {
 		t.Fatal(err)
@@ -58,7 +64,7 @@ func TestConfineScanUnionDeduplicatesAndRegistryOwnerWins(t *testing.T) {
 	result, err := listConfinesWithDeps(context.Background(), slice, []ConfineRegistryEntry{{ScopeID: owned, Name: "build-name.with-dash", Owner: "session-a"}, {ScopeID: pending, Name: "pending", Owner: "session-a"}}, confineScanDeps{
 		now: time.Now, readField: readConfineScopeField, waitEmpty: waitEmpty,
 	})
-	if err != nil || result.Verdict != "pass" || len(result.Scopes) != 3 {
+	if err != nil || result.Verdict != "pass" || len(result.Scopes) != 4 {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 	seen := map[string]ConfineRecord{}
@@ -70,6 +76,9 @@ func TestConfineScanUnionDeduplicatesAndRegistryOwnerWins(t *testing.T) {
 	}
 	if record := seen[scanOnly]; record.Owner != ConfineUnknownOwner {
 		t.Fatalf("scan-only record=%+v", record)
+	}
+	if record := seen[marked]; record.Name != "ceiling-suite" || !validConfineScopeID(record.ScopeID) {
+		t.Fatalf("marked record=%+v", record)
 	}
 	if record := seen[pending]; !record.Pending || record.Owner != "session-a" || record.Populated != nil {
 		t.Fatalf("pending record=%+v", record)

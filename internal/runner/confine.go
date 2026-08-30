@@ -21,6 +21,9 @@ const (
 	// per-test reservations in queue.outstanding and could inflate via history to
 	// reject the whole suite E_ADMIT_TOO_LARGE.
 	DefaultDelegateRAMOverhead = int64(512 << 20)
+	// DefaultDelegateRAMScopeCeiling is the compiled-in containment cap used
+	// whenever a daemon ceiling is unavailable. It is not an admission charge.
+	DefaultDelegateRAMScopeCeiling = int64(48 << 30)
 )
 
 type ConfineAdmission string

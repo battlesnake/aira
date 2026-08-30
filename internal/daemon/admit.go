@@ -32,6 +32,9 @@ const (
 	admitConfineScanIntervalDefault           = time.Second
 	admitSliceHeadroomBaseDefault       int64 = 2 << 30
 	admitSliceHeadroomSupervisorDefault int64 = 64 << 20
+	delegateRAMScopeMinDefault          int64 = 4 << 30
+	delegateRAMScopeSafetyPct           int64 = 15
+	delegateRAMAdoptionMargin           int64 = 64 << 20
 )
 
 type admitWaiterState uint8
@@ -44,20 +47,21 @@ const (
 )
 
 type admitWaiter struct {
-	seq       int64
-	reserve   int64
-	state     admitWaiterState
-	grantedCh chan struct{}
-	enqueued  time.Time
-	waited    bool
-	accounted bool
-	outcome   string
-	reason    string
-	waitedMS  int64
-	basis     string
-	scopeID   string
-	name      string
-	owner     string
+	seq          int64
+	reserve      int64
+	state        admitWaiterState
+	grantedCh    chan struct{}
+	enqueued     time.Time
+	waited       bool
+	accounted    bool
+	outcome      string
+	reason       string
+	waitedMS     int64
+	basis        string
+	scopeID      string
+	name         string
+	owner        string
+	scopeCeiling int64
 }
 
 type sliceQueue struct {
@@ -81,25 +85,27 @@ type sliceQueue struct {
 // AdmitResponse is the one grant payload sent before the daemon holds the
 // connection as the reservation lease.
 type AdmitResponse struct {
-	State    string `json:"state"`
-	Reason   string `json:"reason,omitempty"`
-	WaitedMS int64  `json:"waited_ms"`
-	Reserve  int64  `json:"reserve"`
-	Basis    string `json:"basis"`
+	State        string `json:"state"`
+	Reason       string `json:"reason,omitempty"`
+	WaitedMS     int64  `json:"waited_ms"`
+	Reserve      int64  `json:"reserve"`
+	Basis        string `json:"basis"`
+	ScopeCeiling int64  `json:"scope_ceiling,omitempty"`
 }
 
 type admitRequest struct {
-	slice     string
-	reserve   int64
-	maxWait   int64
-	signature string
-	pinned    bool
-	scopeID   string
-	name      string
-	owner     string
+	slice       string
+	reserve     int64
+	maxWait     int64
+	signature   string
+	pinned      bool
+	scopeID     string
+	name        string
+	owner       string
+	delegateRAM bool
 }
 
-var confineScopeIDPattern = regexp.MustCompile(`^CONFINE-[A-Za-z0-9._-]+-[0-9]+-[0-9a-z]+$`)
+var confineScopeIDPattern = regexp.MustCompile(`^CONFINE-(?:@dr-)?[A-Za-z0-9._-]+-[0-9]+-[0-9a-z]+$`)
 
 type admitRejection struct {
 	Required int64  `json:"required,omitempty"`
@@ -249,6 +255,73 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 	return request.reserve, "fallback:no-history"
 }
 
+// resolveDelegateRAMScopeCeiling is intentionally separate from reserve
+// resolution: delegate-ram reserves are pinned framework overhead, while this
+// value is a whole-scope containment backstop. In particular, pinned:client
+// must still consult the scope's own peak history.
+func (s *Server) resolveDelegateRAMScopeCeiling(request admitRequest, maximum, headroom int64) int64 {
+	upper := subtractFloor(maximum, headroom)
+	if upper <= 0 {
+		return 0
+	}
+	minimum := delegateRAMScopeMinimum()
+	if minimum > upper {
+		minimum = upper
+	}
+	candidate := delegateRAMScopeDefault()
+	if request.signature != "" {
+		readCtx, cancel := context.WithTimeout(context.Background(), admitHistoryTimeout)
+		defer cancel()
+		read := s.admitPeakHistory
+		if read == nil && s.db != nil {
+			read = s.db.ConfinePeakHistory
+		}
+		if read != nil {
+			if stats, err := read(readCtx, request.signature); err == nil && stats.PeakMax > 0 {
+				candidate = delegateRAMScopeWithSafety(stats.PeakMax)
+				if stats.OOMCount > 0 && stats.MaxOOMPeak > 0 {
+					candidate = delegateRAMScopeOOMEscalation(stats.MaxOOMPeak)
+				}
+			}
+		}
+	}
+	if candidate < minimum {
+		return minimum
+	}
+	if candidate > upper {
+		return upper
+	}
+	return candidate
+}
+
+func delegateRAMScopeMinimum() int64 {
+	if parsed, err := runner.ParseMemorySize(strings.TrimSpace(os.Getenv("AIRA_DELEGATE_RAM_SCOPE_MIN"))); err == nil && parsed > 0 {
+		return parsed
+	}
+	return delegateRAMScopeMinDefault
+}
+
+func delegateRAMScopeDefault() int64 {
+	if parsed, err := runner.ParseMemorySize(strings.TrimSpace(os.Getenv("AIRA_DELEGATE_RAM_SCOPE_DEFAULT"))); err == nil && parsed > 0 {
+		return parsed
+	}
+	return runner.DefaultDelegateRAMScopeCeiling
+}
+
+func delegateRAMScopeWithSafety(peak int64) int64 {
+	if peak <= 0 || peak > math.MaxInt64/delegateRAMScopeSafetyPct {
+		return math.MaxInt64
+	}
+	return addClamp(peak, peak*delegateRAMScopeSafetyPct/100)
+}
+
+func delegateRAMScopeOOMEscalation(peak int64) int64 {
+	if peak <= 0 || peak > math.MaxInt64-peak/2 {
+		return math.MaxInt64
+	}
+	return peak + peak/2
+}
+
 func (s *Server) cachedAdmitPeakP90(ctx context.Context) (int64, bool) {
 	now := s.admitNowTime()
 	s.admitPriorMu.Lock()
@@ -313,13 +386,19 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	if !ok {
 		// The daemon answered; only the slice's live usage was unreadable. Report
 		// that honestly (NOT "daemon-unavailable") so the operator-facing basis is
-		// truthful, and the client leaves the scope uncapped (state != admitted).
+		// truthful. A non-delegate scope is left uncapped here (state != admitted);
+		// a delegate-ram scope gets no daemon scope_ceiling and so falls back to the
+		// finite client-side default (AIRA-15) — never uncapped.
 		s.writeAdmitGrant(conn, AdmitResponse{State: "unevaluated", Reason: reason, Reserve: request.reserve, Basis: "fallback:slice-unreadable"})
 		return
 	}
 	jobs := s.admitOutstandingJobs(path)
 	headroom := s.admitSliceHeadroom(jobs + 1)
 	ceiling := subtractFloor(maximum, headroom)
+	scopeCeiling := int64(0)
+	if request.delegateRAM {
+		scopeCeiling = s.resolveDelegateRAMScopeCeiling(request, maximum, headroom)
+	}
 	reserve, basis := s.resolveAdmitReserve(request, ceiling)
 	if reserve > ceiling {
 		s.writeAdmitRejection(conn, CodeAdmitTooLarge, admitRejection{Required: reserve, Ceiling: ceiling, Basis: basis})
@@ -334,6 +413,7 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		}
 		return
 	}
+	waiter.scopeCeiling = scopeCeiling
 	peerCtx, cancelPeer := context.WithCancel(context.Background())
 	defer cancelPeer()
 	go func() {
@@ -385,7 +465,7 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		queue.mu.Unlock()
 		return
 	}
-	grant := AdmitResponse{State: waiter.outcome, Reason: waiter.reason, WaitedMS: waiter.waitedMS, Reserve: waiter.reserve, Basis: waiter.basis}
+	grant := AdmitResponse{State: waiter.outcome, Reason: waiter.reason, WaitedMS: waiter.waitedMS, Reserve: waiter.reserve, Basis: waiter.basis, ScopeCeiling: waiter.scopeCeiling}
 	queue.mu.Unlock()
 
 	if s.admitBeforeWrite != nil {
@@ -556,6 +636,19 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 				cap, err := strconv.ParseInt(strings.TrimSpace(*record.Cap), 10, 64)
 				if err != nil || cap < 0 {
 					continue
+				}
+				if runner.IsDelegateRAMScopeID(record.ScopeID) {
+					// AIRA-15 ceiling caps are containment backstops, never a
+					// whole-job reservation. After daemon restart only the dirname
+					// survives, so its positional marker selects current+margin
+					// reconstruction instead of adopting the generous ceiling.
+					if record.RSSBytes == nil || *record.RSSBytes < 0 {
+						continue
+					}
+					currentWithMargin := addClamp(*record.RSSBytes, delegateRAMAdoptionMargin)
+					if currentWithMargin < cap {
+						cap = currentWithMargin
+					}
 				}
 				adopted = addClamp(adopted, cap)
 				adoptedJobs = addJobCountClamp(adoptedJobs, 1)
@@ -740,11 +833,11 @@ func elapsedMilliseconds(start, end time.Time) int64 {
 }
 
 func validateAdmitArgs(args map[string]any) (admitRequest, error) {
-	if len(args) < 3 || len(args) > 8 {
-		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, max_wait_ms, optional signature/pinned, and an optional complete scope_id/name/owner tuple", CodeProtocol)
+	if len(args) < 3 || len(args) > 9 {
+		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, max_wait_ms, optional signature/pinned/delegate_ram, and an optional complete scope_id/name/owner tuple", CodeProtocol)
 	}
 	for name := range args {
-		if name != "slice" && name != "reserve" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "scope_id" && name != "name" && name != "owner" {
+		if name != "slice" && name != "reserve" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "delegate_ram" && name != "scope_id" && name != "name" && name != "owner" {
 			return admitRequest{}, fmt.Errorf("%s: unexpected admit field %q", CodeProtocol, name)
 		}
 	}
@@ -783,6 +876,14 @@ func validateAdmitArgs(args map[string]any) (admitRequest, error) {
 			return admitRequest{}, fmt.Errorf("%s: admit pinned must be boolean", CodeProtocol)
 		}
 	}
+	delegateRAM := false
+	if raw, exists := args["delegate_ram"]; exists {
+		var valid bool
+		delegateRAM, valid = raw.(bool)
+		if !valid {
+			return admitRequest{}, fmt.Errorf("%s: admit delegate_ram must be boolean", CodeProtocol)
+		}
+	}
 	scopeID, hasScope := args["scope_id"]
 	name, hasName := args["name"]
 	owner, hasOwner := args["owner"]
@@ -805,13 +906,16 @@ func validateAdmitArgs(args map[string]any) (admitRequest, error) {
 		if !ownerOK || runner.ValidateConfineIdentity(ownerText) != nil {
 			return admitRequest{}, fmt.Errorf("%s: admit owner is invalid", CodeProtocol)
 		}
-		return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, scopeID: scopeText, name: nameText, owner: ownerText}, nil
+		return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM, scopeID: scopeText, name: nameText, owner: ownerText}, nil
 	}
-	return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned}, nil
+	return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM}, nil
 }
 
 func confineAdmitScopeName(scopeID string) (string, bool) {
 	rest := strings.TrimPrefix(scopeID, "CONFINE-")
+	if strings.HasPrefix(rest, "@dr-") {
+		rest = strings.TrimPrefix(rest, "@dr-")
+	}
 	last := strings.LastIndexByte(rest, '-')
 	if last <= 0 {
 		return "", false

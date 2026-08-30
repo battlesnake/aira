@@ -239,6 +239,9 @@ func parseConfineScopeID(scopeID string) (string, int, int64, bool) {
 		return "", 0, 0, false
 	}
 	rest := strings.TrimPrefix(scopeID, "CONFINE-")
+	if strings.HasPrefix(rest, delegateRAMScopeIDMarker+"-") {
+		rest = strings.TrimPrefix(rest, delegateRAMScopeIDMarker+"-")
+	}
 	last := strings.LastIndexByte(rest, '-')
 	if last <= 0 || last == len(rest)-1 {
 		return "", 0, 0, false
@@ -258,6 +261,13 @@ func parseConfineScopeID(scopeID string) (string, int, int64, bool) {
 		return "", 0, 0, false
 	}
 	return name, int(pid64), stamp, true
+}
+
+// IsDelegateRAMScopeID reports the restart-surviving cap type carrier. The
+// marker uses '@', which cannot occur in a user-supplied confine name, so it is
+// unambiguous even though names themselves may contain '-'.
+func IsDelegateRAMScopeID(scopeID string) bool {
+	return strings.HasPrefix(scopeID, "CONFINE-"+delegateRAMScopeIDMarker+"-")
 }
 
 func killConfine(ctx context.Context, slicePath, selector, callerOwner string, steal bool, registry []ConfineRegistryEntry, freshOwner ConfineOwnerLookup, timeout time.Duration) (ConfineKillResult, error) {

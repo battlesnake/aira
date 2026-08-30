@@ -57,6 +57,76 @@ func TestConfineOOMAtCeilingIsGenuinelyTooLargeAndPinWins(t *testing.T) {
 	}
 }
 
+// verifies: the delegate-ram containment ceiling is a separate, history-sized
+// grant even when the admission reserve takes the pinned:client early return.
+// RED against routing scope ceiling through reserve (the old 512 MiB overhead).
+func TestDelegateRAMScopeCeilingIsIndependentOfPinnedReserve(t *testing.T) {
+	t.Setenv("AIRA_DELEGATE_RAM_SCOPE_MIN", "1G")
+	server := NewServer(Paths{})
+	server.admitPeakHistory = func(context.Context, string) (runner.PeakRSSStats, error) {
+		return runner.PeakRSSStats{TotalCount: 1, SampleCount: 1, PeakMax: 8 << 30}, nil
+	}
+	request := admitRequest{delegateRAM: true, pinned: true, reserve: runner.DefaultDelegateRAMOverhead, signature: "suite"}
+	reserve, basis := server.resolveAdmitReserve(request, 60<<30)
+	ceiling := server.resolveDelegateRAMScopeCeiling(request, 64<<30, 2<<30)
+	want := int64(8<<30) + int64(8<<30)*delegateRAMScopeSafetyPct/100
+	if reserve != runner.DefaultDelegateRAMOverhead || basis != "pinned:client" || ceiling != want || ceiling == reserve {
+		t.Fatalf("reserve=%d basis=%q ceiling=%d, want %d/pinned:client/%d", reserve, basis, ceiling, runner.DefaultDelegateRAMOverhead, want)
+	}
+}
+
+func TestDelegateRAMPinnedAdmitGrantIncludesScopeCeiling(t *testing.T) {
+	t.Setenv("AIRA_DELEGATE_RAM_SCOPE_MIN", "1G")
+	server := NewServer(Paths{})
+	server.stopping = make(chan struct{})
+	server.admitResolveSlice = func(string) (string, bool, string) { return "/slice", true, "" }
+	server.admitReadMemory = func(string) (int64, int64, bool, string) { return 0, 64 << 30, true, "" }
+	server.admitConfineScan = noConfinesScan
+	server.admitPeakHistory = func(context.Context, string) (runner.PeakRSSStats, error) {
+		return runner.PeakRSSStats{TotalCount: 1, SampleCount: 1, PeakMax: 8 << 30}, nil
+	}
+	serverConn, clientConn := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer serverConn.Close()
+		server.admitConnection(serverConn, map[string]any{
+			"slice": "slice", "reserve": runner.DefaultDelegateRAMOverhead, "max_wait_ms": int64(1000),
+			"signature": "suite", "pinned": true, "delegate_ram": true,
+		})
+	}()
+	var frame ResponseFrame
+	if err := readFrame(clientConn, &frame); err != nil {
+		t.Fatal(err)
+	}
+	grant := admitGrantData(t, frame)
+	if grant.Reserve != runner.DefaultDelegateRAMOverhead || grant.ScopeCeiling != int64(8<<30)+int64(8<<30)*delegateRAMScopeSafetyPct/100 || grant.ScopeCeiling == grant.Reserve {
+		t.Fatalf("grant=%+v", grant)
+	}
+	_ = clientConn.Close()
+	<-done
+}
+
+func TestDelegateRAMScopeCeilingClampAndOOMEscalation(t *testing.T) {
+	t.Setenv("AIRA_DELEGATE_RAM_SCOPE_MIN", "4G")
+	t.Setenv("AIRA_DELEGATE_RAM_SCOPE_DEFAULT", "40G")
+	server := NewServer(Paths{})
+	server.admitPeakHistory = func(context.Context, string) (runner.PeakRSSStats, error) {
+		return runner.PeakRSSStats{TotalCount: 1, SampleCount: 1, PeakMax: 20 << 30, OOMCount: 1, MaxOOMPeak: 20 << 30}, nil
+	}
+	request := admitRequest{delegateRAM: true, signature: "suite"}
+	if got := server.resolveDelegateRAMScopeCeiling(request, 64<<30, 2<<30); got != 30<<30 {
+		t.Fatalf("ceiling=%d want OOM escalation %d", got, int64(30<<30))
+	}
+	if got := server.resolveDelegateRAMScopeCeiling(request, 24<<30, 2<<30); got != 22<<30 {
+		t.Fatalf("ceiling=%d want upper clamp %d", got, int64(22<<30))
+	}
+	server.admitPeakHistory = func(context.Context, string) (runner.PeakRSSStats, error) { return runner.PeakRSSStats{}, nil }
+	if got := server.resolveDelegateRAMScopeCeiling(request, 64<<30, 2<<30); got != 40<<30 {
+		t.Fatalf("ceiling=%d want default %d", got, int64(40<<30))
+	}
+}
+
 func TestConfineEstimatorP90PriorNotMedianOrFlat(t *testing.T) {
 	server := NewServer(Paths{})
 	server.stopping = make(chan struct{})

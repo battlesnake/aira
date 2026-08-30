@@ -1095,6 +1095,31 @@ func TestConfineAdmitFrameCarriesScopeNameAndOwner(t *testing.T) {
 	result.releaseAdmission()
 }
 
+func TestDelegateRAMAdmitFrameAndGrantCarryScopeCeiling(t *testing.T) {
+	r, _ := gateOnlyRunner(t, newInstantClock(), func(string) (int64, int64, bool, string) { return 0, 100, true, "" })
+	client, server := net.Pipe()
+	r.admitDialFn = func(context.Context, string) (net.Conn, error) { return client, nil }
+	go func() {
+		defer server.Close()
+		var request runnerAdmitRequestFrame
+		if err := readRunnerAdmitFrame(server, &request); err != nil {
+			return
+		}
+		if request.Request.Args["delegate_ram"] != true {
+			t.Errorf("delegate_ram args=%v", request.Request.Args)
+		}
+		data, _ := json.Marshal(runnerAdmitGrant{State: "immediate", Reserve: DefaultDelegateRAMOverhead, Basis: "pinned:client", ScopeCeiling: 8 << 30})
+		_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{OK: true, Code: "OK", Data: data})
+		var one [1]byte
+		_, _ = server.Read(one[:])
+	}()
+	result, err := r.admit(context.Background(), Request{DelegateRAM: true})
+	if err != nil || result.scopeCeiling != 8<<30 || result.scopeCeiling == result.reserve {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	result.releaseAdmission()
+}
+
 func TestDaemonAdmitFrameUsesOverrideReserve(t *testing.T) {
 	positive, zero, negative := int64(70), int64(0), int64(-1)
 	for _, test := range []struct {

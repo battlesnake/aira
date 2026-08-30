@@ -386,7 +386,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 			reserve = DefaultConfineMemoryReserve
 		}
 	}
-	if request.ScopeMemoryMax > 0 {
+	if !request.DelegateRAM && request.ScopeMemoryMax > 0 {
 		reserve = request.ScopeMemoryMax
 		pinned = true
 	}
@@ -402,7 +402,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	if request.Name == "" {
 		request.Name = "job"
 	}
-	scopeID := confineScopeID(request.Name)
+	scopeID := confineScopeID(request.Name, request.DelegateRAM)
 	request.ScopeID = scopeID
 	// Admission can legitimately block: a reserve-contended slice queues this job
 	// behind other sessions' in-flight jobs under the shared cap, and the client
@@ -501,13 +501,27 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	scopeMemoryMax := request.ScopeMemoryMax
 	// Only an ADMITTED (accounted) daemon grant carries an estimate-sized reserve
 	// that both bounds Σ(reserve) ≤ cap-headroom AND may be enforced as the scope
-	// memory.max. An "unevaluated" daemon grant (the daemon answered but could not
-	// read the slice's live usage) was never accounted and carries only the flat
-	// fallback reserve — enforcing it as a hard sub-cap would false-fail a heavy
-	// job although admission was never evaluated (design §6: no sub-cap here).
+	// memory.max for non-delegate jobs. Delegate-ram's pinned framework reserve is
+	// never a scope cap: it uses a separate daemon ceiling or a finite client
+	// fallback when the daemon cannot provide one.
 	admitted := admission.state == "immediate" || admission.state == "waited"
 	if !request.DelegateRAM && scopeMemoryMax <= 0 && admitted && admission.lock == nil && admission.release != nil && admission.reserve > 0 {
 		scopeMemoryMax = admission.reserve
+	}
+	// Delegate-ram: an explicit --memory-max (scopeMemoryMax > 0) is the user's
+	// informed, still-finite-and-contained choice and WINS — it is never lowered by
+	// the learned ceiling, which would false-kill a suite the user deliberately sized
+	// larger (and which is exactly the interim --memory-max mitigation others rely on).
+	// The ceiling only supplies a finite cap when there is no explicit one; a compiled-in
+	// fallback backs it when the daemon provides none, so the scope is never uncapped.
+	if request.DelegateRAM && scopeMemoryMax <= 0 {
+		scopeMemoryMax = admission.scopeCeiling
+		if scopeMemoryMax <= 0 {
+			scopeMemoryMax = delegateRAMScopeFallback()
+		}
+	}
+	if request.DelegateRAM && scopeMemoryMax <= 0 {
+		return result, confineUnavailable(sliceName, errors.New("delegate-ram scope has no finite memory.max"))
 	}
 	if scopeMemoryMax > 0 {
 		if err := deps.writeScopeMemoryCap(scope, scopeMemoryMax, request.ScopeMemoryHigh, false); err != nil {
@@ -683,7 +697,7 @@ func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool
 		peak = FormatConfineBytes(*peakRSS)
 	}
 	if oom {
-		return fmt.Sprintf("confine: job OOM-killed at its reserved cap %s (peak RSS %s); raise --memory-reserve for this job or split heavy work under --delegate-ram", FormatConfineBytes(scopeMemoryMax), peak)
+		return fmt.Sprintf("confine: job OOM-killed at its memory cap %s (peak RSS %s); raise the cap with --memory-max (or --memory-reserve for a whole-job reserve), or split heavy work", FormatConfineBytes(scopeMemoryMax), peak)
 	}
 	// Overflow-safe threshold: never multiply a byte count that the input domain
 	// allows to approach MaxInt64. `scopeMemoryMax - scopeMemoryMax/10` is a
@@ -723,6 +737,7 @@ func admitConfine(ctx context.Context, path string, request ConfineRequest, rese
 		ResourceSignature:    request.ResourceSignature,
 		MemoryReservePinned:  request.MemoryReservePinned,
 		DaemonEstimateMemory: true,
+		DelegateRAM:          request.DelegateRAM,
 		ConfineScopeID:       request.ScopeID,
 		ConfineName:          request.Name,
 		ConfineOwner:         request.Owner,
@@ -760,11 +775,24 @@ func validateConfineName(name string) error {
 	return nil
 }
 
-func confineScopeID(name string) string {
+const delegateRAMScopeIDMarker = "@dr"
+
+func confineScopeID(name string, delegateRAM bool) string {
 	if name == "" {
 		name = "job"
 	}
+	if delegateRAM {
+		return "CONFINE-" + delegateRAMScopeIDMarker + "-" + name + "-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
 	return "CONFINE-" + name + "-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+}
+
+func delegateRAMScopeFallback() int64 {
+	value := strings.TrimSpace(os.Getenv("AIRA_DELEGATE_RAM_SCOPE_DEFAULT"))
+	if parsed, err := ParseMemorySize(value); err == nil && parsed > 0 {
+		return parsed
+	}
+	return DefaultDelegateRAMScopeCeiling
 }
 
 func confineUnavailable(slice string, err error) error {
