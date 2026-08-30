@@ -62,6 +62,16 @@ const (
 	ConfinePrioritiesUnverified ConfinePriorities = "unverified"
 )
 
+// ConfineCPUWeight reports whether the foreground supervisor established the
+// optional CPU-weight aging control. It is deliberately independent of the
+// fail-closed memory confinement facets.
+type ConfineCPUWeight string
+
+const (
+	ConfineCPUWeightAging       ConfineCPUWeight = "aging"
+	ConfineCPUWeightUnavailable ConfineCPUWeight = "unavailable"
+)
+
 // ConfineStatus keeps the independently verified cap, admission, placement,
 // OOM-group, and priority facets separate. In particular, a successful
 // admission never fabricates a cap snapshot or implies priority success.
@@ -78,6 +88,7 @@ type ConfineStatus struct {
 	DescendantEscape     *DescendantEscapeEvidence
 	OOMGroup             ConfineOOMGroup
 	Priorities           ConfinePriorities
+	CPUWeight            ConfineCPUWeight
 	ScopeMemoryMax       int64
 	ScopeMemoryHigh      int64
 	ScopeMemoryBinding   string
@@ -208,6 +219,11 @@ func FormatConfineStatus(status ConfineStatus) string {
 	}
 	line += " oom.group=" + string(status.OOMGroup)
 	line += " priorities=" + string(status.Priorities)
+	cpuWeight := status.CPUWeight
+	if cpuWeight == "" {
+		cpuWeight = ConfineCPUWeightUnavailable
+	}
+	line += " cpu-weight=" + string(cpuWeight)
 	if status.ScopeMemoryMax <= 0 {
 		line += " scope-memory.max=not-requested"
 	} else {

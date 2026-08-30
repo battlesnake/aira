@@ -143,10 +143,12 @@ func TestConfineDelegationResetFailsClosedBeforeCreate(t *testing.T) {
 	started := false
 	deps := confineDeps{
 		resolveSlicePath: func(string) (string, bool, string) { return "/cg/aira.slice", true, "" },
-		ensureDelegation: func(string) error { return errors.New("memory missing from cgroup.subtree_control") },
-		newBackend:       func(string) ScopeBackend { return confineCreateTrackingBackend{created: &created} },
-		readCap:          func(string) (int64, bool) { return 16 << 30, true },
-		start:            func(*confineCommand) error { started = true; return nil },
+		ensureDelegation: func(string) (confineDelegation, error) {
+			return confineDelegation{}, errors.New("memory missing from cgroup.subtree_control")
+		},
+		newBackend: func(string) ScopeBackend { return confineCreateTrackingBackend{created: &created} },
+		readCap:    func(string) (int64, bool) { return 16 << 30, true },
+		start:      func(*confineCommand) error { started = true; return nil },
 	}
 	_, err := confineWithDeps(context.Background(), ConfineRequest{Slice: "aira.slice", Argv: []string{"must-not-run"}, Stderr: io.Discard}, deps)
 	if err == nil || !strings.Contains(err.Error(), "E_CONFINE_UNAVAILABLE") || !strings.Contains(err.Error(), "subtree_control") {
@@ -239,7 +241,7 @@ func TestFormatConfineStatusReportsIndependentFacets(t *testing.T) {
 	line := FormatConfineStatus(status)
 	for _, want := range []string{
 		"slice=whale.slice", "cap=enforced", "reserve=4G", "scope=placed",
-		"oom.group=set", "priorities=unverified",
+		"oom.group=set", "priorities=unverified", "cpu-weight=unavailable",
 	} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("status %q lacks %q", line, want)
@@ -256,6 +258,190 @@ func TestFormatConfineStatusReportsIndependentFacets(t *testing.T) {
 	})
 	if !strings.Contains(unevaluated, "cap=unevaluated") || strings.Contains(unevaluated, "cap=enforced") {
 		t.Fatalf("uncapped status dishonest: %q", unevaluated)
+	}
+}
+
+// verifies: CPU aging is an independent honesty facet. A successful memory
+// confine must not fabricate aging when cpu delegation or its initial write
+// could not be established.
+func TestFormatConfineStatusReportsCPUWeightFacet(t *testing.T) {
+	aging := FormatConfineStatus(ConfineStatus{CPUWeight: ConfineCPUWeightAging})
+	if !strings.Contains(aging, "cpu-weight=aging") || strings.Contains(aging, "cpu-weight=unavailable") {
+		t.Fatalf("aging status=%q", aging)
+	}
+	unavailable := FormatConfineStatus(ConfineStatus{})
+	if !strings.Contains(unavailable, "cpu-weight=unavailable") || strings.Contains(unavailable, "cpu-weight=aging") {
+		t.Fatalf("unavailable status=%q", unavailable)
+	}
+}
+
+// verifies: the real delegation policy keeps a missing CPU controller
+// fail-open, while a failing memory enable remains fail-closed. The injected
+// file operations exercise ensureConfineDelegation's production decision path,
+// rather than stubbing it out at the launch layer.
+func TestEnsureConfineDelegationSeparatesCPUFailOpenFromMemoryFailClosed(t *testing.T) {
+	const parent = "/cg/parent"
+	newOps := func(controllers string, memoryWriteErr error) confineControllerOps {
+		subtree := ""
+		return confineControllerOps{
+			readFile: func(path string) ([]byte, error) {
+				switch path {
+				case filepath.Join(parent, "cgroup.controllers"):
+					return []byte(controllers), nil
+				case filepath.Join(parent, "cgroup.subtree_control"):
+					return []byte(subtree), nil
+				default:
+					return nil, fmt.Errorf("unexpected cgroup path %q", path)
+				}
+			},
+			writeFile: func(path string, value []byte) error {
+				if path != filepath.Join(parent, "cgroup.subtree_control") {
+					return fmt.Errorf("unexpected subtree path %q", path)
+				}
+				if string(value) == "+memory\n" && memoryWriteErr != nil {
+					return memoryWriteErr
+				}
+				subtree = strings.TrimPrefix(string(value), "+")
+				return nil
+			},
+		}
+	}
+
+	t.Run("cpu absent is unavailable, not fatal", func(t *testing.T) {
+		delegation, err := ensureConfineDelegationWithOps(parent, newOps("memory io", nil))
+		if err != nil || delegation != (confineDelegation{}) {
+			t.Fatalf("delegation=%+v err=%v, want cpuWeight=false and nil", delegation, err)
+		}
+	})
+	t.Run("memory enable failure is fatal", func(t *testing.T) {
+		delegation, err := ensureConfineDelegationWithOps(parent, newOps("memory cpu", errors.New("injected memory write failure")))
+		if err == nil || delegation != (confineDelegation{}) {
+			t.Fatalf("delegation=%+v err=%v, want memory delegation error", delegation, err)
+		}
+	})
+}
+
+// verifies: even after successful +cpu delegation, an initial cpu.weight
+// write failure is informational only. This is deliberately unlike the memory
+// cap writer, whose failure correctly prevents launch.
+func TestConfineCPUWeightInitialWriteFailureIsFailOpen(t *testing.T) {
+	scope := &confineFakeScope{}
+	deps := confineUnitDeps(scope)
+	deps.writeScopeCPUWeight = func(Scope, int64) bool { return false }
+	result, err := confineWithDeps(context.Background(), ConfineRequest{
+		Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard,
+	}, deps)
+	if err != nil || result.Exit != 0 || result.Status.CPUWeight != ConfineCPUWeightUnavailable {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+// verifies: the parent writes the initial weight before starting the child,
+// which keeps the child-side setup limited to nice/ionice and avoids a
+// post-clone race.
+func TestConfineInitialCPUWeightWritePrecedesStart(t *testing.T) {
+	scope := &confineFakeScope{}
+	deps := confineUnitDeps(scope)
+	written := false
+	deps.writeScopeCPUWeight = func(_ Scope, weight int64) bool {
+		if weight != 100 {
+			t.Fatalf("initial cpu.weight=%d, want 100", weight)
+		}
+		written = true
+		return true
+	}
+	innerStart := deps.start
+	deps.start = func(command *confineCommand) error {
+		if !written {
+			t.Fatal("target start preceded parent cpu.weight write")
+		}
+		return innerStart(command)
+	}
+	result, err := confineWithDeps(context.Background(), ConfineRequest{
+		Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard,
+	}, deps)
+	if err != nil || result.Exit != 0 || result.Status.CPUWeight != ConfineCPUWeightAging {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+// verifies: decay uses the elapsed schedule, never raises a weight, and
+// reaches the floor. Removing the timer writes makes the final-floor assertion
+// fail, rather than merely testing static configuration.
+func TestCPUWeightDecayScheduleIsMonotoneAndReachesFloor(t *testing.T) {
+	steps := []cpuWeightStep{{After: time.Millisecond, Weight: 70}, {After: 2 * time.Millisecond, Weight: 10}}
+	weights := make(chan int64, len(steps))
+	stop := startCPUWeightDecay(nil, steps, func(_ Scope, weight int64) bool {
+		weights <- weight
+		return true
+	})
+	defer stop()
+	got := make([]int64, 0, len(steps))
+	deadline := time.After(time.Second)
+	for len(got) < len(steps) {
+		select {
+		case weight := <-weights:
+			got = append(got, weight)
+		case <-deadline:
+			t.Fatalf("decay writes=%v, want schedule through floor", got)
+		}
+	}
+	if got[len(got)-1] != 10 {
+		t.Fatalf("aged scope weight=%d, want floor 10", got[len(got)-1])
+	}
+	for index := 1; index < len(got); index++ {
+		if got[index] > got[index-1] {
+			t.Fatalf("weights rose: %v", got)
+		}
+	}
+}
+
+func TestCPUWeightDefaultCurve(t *testing.T) {
+	t.Setenv("AIRA_CONFINE_CPUWEIGHT_START", "")
+	t.Setenv("AIRA_CONFINE_CPUWEIGHT_FLOOR", "")
+	t.Setenv("AIRA_CONFINE_CPUWEIGHT_SCHEDULE", "")
+	config := confineCPUWeightConfig()
+	want := []cpuWeightStep{
+		{After: 10 * time.Second, Weight: 100},
+		{After: 30 * time.Second, Weight: 70},
+		{After: time.Minute, Weight: 50},
+		{After: 5 * time.Minute, Weight: 30},
+		{After: 10 * time.Minute, Weight: 20},
+		{After: 30 * time.Minute, Weight: 10},
+	}
+	if config.Start != 100 || config.Floor != 10 || !reflect.DeepEqual(config.Steps, want) {
+		t.Fatalf("default curve=%+v, want start=100 floor=10 steps=%+v", config, want)
+	}
+	for index := 1; index < len(config.Steps); index++ {
+		if config.Steps[index].Weight > config.Steps[index-1].Weight {
+			t.Fatalf("normal curve rose: %+v", config.Steps)
+		}
+	}
+}
+
+func TestCPUWeightConfigClampsStartFloorAndScheduleBounds(t *testing.T) {
+	t.Setenv("AIRA_CONFINE_CPUWEIGHT_START", "99999")
+	t.Setenv("AIRA_CONFINE_CPUWEIGHT_FLOOR", "0")
+	t.Setenv("AIRA_CONFINE_CPUWEIGHT_SCHEDULE", "1s:99999,2s:0")
+	config := confineCPUWeightConfig()
+	if config.Start != 10000 || config.Floor != 1 {
+		t.Fatalf("high-start/low-floor config=%+v, want start=10000 floor=1", config)
+	}
+	if want := []cpuWeightStep{{After: time.Second, Weight: 10000}, {After: 2 * time.Second, Weight: 1}}; !reflect.DeepEqual(config.Steps, want) {
+		t.Fatalf("out-of-range schedule=%+v, want %+v", config.Steps, want)
+	}
+
+	t.Setenv("AIRA_CONFINE_CPUWEIGHT_FLOOR", "99999")
+	config = confineCPUWeightConfig()
+	if config.Start != 10000 || config.Floor != 10000 {
+		t.Fatalf("high-floor config=%+v, want start=floor=10000", config)
+	}
+
+	t.Setenv("AIRA_CONFINE_CPUWEIGHT_START", "0")
+	t.Setenv("AIRA_CONFINE_CPUWEIGHT_FLOOR", "0")
+	config = confineCPUWeightConfig()
+	if config.Start != 1 || config.Floor != 1 {
+		t.Fatalf("low-start/low-floor config=%+v, want start=floor=1", config)
 	}
 }
 
@@ -598,7 +784,7 @@ func TestConfineRejectedAdmissionCreatesNoScopeAndStartsNoChild(t *testing.T) {
 			created, started := false, false
 			deps := confineDeps{
 				resolveSlicePath: func(string) (string, bool, string) { return "/fake/finite.slice", true, "" },
-				ensureDelegation: func(string) error { return nil },
+				ensureDelegation: func(string) (confineDelegation, error) { return confineDelegation{}, nil },
 				readCap:          func(string) (int64, bool) { return 64 << 30, true },
 				newBackend:       func(string) ScopeBackend { return confineCreateTrackingBackend{created: &created} },
 				start:            func(*confineCommand) error { started = true; return nil },
@@ -1170,9 +1356,10 @@ func TestConfineLaunchWiresCgroupPlacement(t *testing.T) {
 
 func confineUnitDeps(scope *confineFakeScope) confineDeps {
 	return confineDeps{
-		resolveSlicePath: func(string) (string, bool, string) { return "/fake/finite.slice", true, "" },
-		ensureDelegation: func(string) error { return nil },
-		newBackend:       func(string) ScopeBackend { return confineFakeBackend{scope: scope} },
+		resolveSlicePath:    func(string) (string, bool, string) { return "/fake/finite.slice", true, "" },
+		ensureDelegation:    func(string) (confineDelegation, error) { return confineDelegation{cpuWeight: true}, nil },
+		writeScopeCPUWeight: func(Scope, int64) bool { return true },
+		newBackend:          func(string) ScopeBackend { return confineFakeBackend{scope: scope} },
 		admit: func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
 			return admissionResult{state: "immediate"}, nil
 		},
@@ -1286,6 +1473,33 @@ func TestWriteConfineOOMGroupVerifiesThroughScopeFD(t *testing.T) {
 	scope := &confineReferenceMismatchScope{confineFakeScope: confineFakeScope{}, fd: int(dir.Fd()), reference: referenceDir}
 	if err := writeConfineOOMGroup(scope); err == nil {
 		t.Fatal("mismatched reference falsely verified a different memory.oom.group")
+	}
+}
+
+// verifies: the optional decay writer is FD-anchored and a scope that vanishes
+// before a timer tick is harmless. Replacing it with the fail-closed memory
+// writer would turn this teardown race into a launch/lifecycle failure.
+func TestWriteScopeCPUWeightFailOpenToleratesRemovedScope(t *testing.T) {
+	dirPath := t.TempDir()
+	dir, err := os.Open(dirPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	if err := os.Remove(dirPath); err != nil {
+		t.Fatal(err)
+	}
+	reference := t.TempDir()
+	sentinel := filepath.Join(reference, "cpu.weight")
+	if err := os.WriteFile(sentinel, []byte("777\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	scope := &confineReferenceMismatchScope{confineFakeScope: confineFakeScope{}, fd: int(dir.Fd()), reference: reference}
+	if writeScopeCPUWeightFailOpen(scope, 10) {
+		t.Fatal("removed scope unexpectedly accepted cpu.weight write")
+	}
+	if data, err := os.ReadFile(sentinel); err != nil || string(data) != "777\n" {
+		t.Fatalf("reference sentinel changed to %q (err=%v): writer followed Reference instead of scope FD", data, err)
 	}
 }
 
@@ -1648,7 +1862,52 @@ func TestConfineRealMissingSubtreeDelegationIsRepairedBeforeLaunch(t *testing.T)
 	}
 }
 
-type confineScopeObservation struct{ oomGroup string }
+// verifies: after the per-launch delegation repair, a fresh real scope has
+// cpu.weight=100 and honestly reports aging. This mitigates contention with
+// long-running, decayed scopes; simultaneous fresh scopes remain Slice 2.
+func TestConfineRealCPUWeightStartsAging(t *testing.T) {
+	parent := confineMemoryParent(t, "134217728")
+	controllers, err := os.ReadFile(filepath.Join(parent, "cgroup.controllers"))
+	if err != nil || !confineHasToken(controllers, "cpu") {
+		cgrouptest.SkipOrFailRealCgroup(t, "cpu controller unavailable to %s: %q err=%v", parent, controllers, err)
+	}
+	// Start from a parent where cpu is deliberately not delegated. A fresh child
+	// must not expose cpu.weight until this launch's ensureConfineDelegation
+	// repairs +cpu; otherwise this test would pass with the repair removed.
+	if err := os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"), []byte("-cpu"), 0o644); err != nil {
+		cgrouptest.SkipOrFailRealCgroup(t, "cannot de-delegate cpu from %s: %v", parent, err)
+	}
+	wouldBeScope := filepath.Join(parent, "without-cpu")
+	if err := os.Mkdir(wouldBeScope, 0o755); err != nil {
+		cgrouptest.SkipOrFailRealCgroup(t, "cannot create undelegated cpu probe scope: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(wouldBeScope, "cpu.weight")); !errors.Is(err, fs.ErrNotExist) {
+		_ = os.Remove(wouldBeScope)
+		t.Fatalf("cpu.weight exists before +cpu repair (err=%v)", err)
+	}
+	if err := os.Remove(wouldBeScope); err != nil {
+		t.Fatal(err)
+	}
+	observation := &confineScopeObservation{}
+	deps := defaultConfineDeps()
+	deps.newBackend = func(path string) ScopeBackend {
+		return confineObservingBackend{ScopeBackend: newDefaultBackend(path), observation: observation}
+	}
+	result, err := confineWithDeps(context.Background(), ConfineRequest{
+		Slice: parent, MemoryReserve: 1, Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard,
+	}, deps)
+	if err != nil {
+		cgrouptest.SkipOrFailRealCgroup(t, "CPU-weight confine fixture unavailable: %v", err)
+	}
+	if result.Exit != 0 || result.Status.CPUWeight != ConfineCPUWeightAging || observation.cpuWeight != "100" {
+		t.Fatalf("result=%+v cpu.weight=%q", result, observation.cpuWeight)
+	}
+}
+
+type confineScopeObservation struct {
+	oomGroup  string
+	cpuWeight string
+}
 
 type confineObservingBackend struct {
 	ScopeBackend
@@ -1671,6 +1930,9 @@ type confineObservingScope struct {
 func (scope *confineObservingScope) Remove() error {
 	if data, err := os.ReadFile(filepath.Join(scope.Reference(), "memory.oom.group")); err == nil {
 		scope.observation.oomGroup = strings.TrimSpace(string(data))
+	}
+	if data, err := os.ReadFile(filepath.Join(scope.Reference(), "cpu.weight")); err == nil {
+		scope.observation.cpuWeight = strings.TrimSpace(string(data))
 	}
 	return scope.Scope.Remove()
 }

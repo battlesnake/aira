@@ -35,7 +35,44 @@ const (
 	confineNice             = 19
 	confineIOPriorityClass  = 2 // best-effort / IOPRIO_CLASS_BE
 	confineIOPriorityData   = 7 // Best-effort priority: 0 is highest, 7 is lowest.
+	defaultCPUWeightStart   = int64(100)
+	defaultCPUWeightFloor   = int64(10)
 )
+
+type confineDelegation struct {
+	cpuWeight bool
+}
+
+// confineControllerOps keeps the cgroup controller files behind the smallest
+// useful seam: delegation policy remains in ensureConfineDelegation, while its
+// file protocol can be exercised without a privileged cgroup fixture.
+type confineControllerOps struct {
+	readFile  func(string) ([]byte, error)
+	writeFile func(string, []byte) error
+}
+
+// cpuWeightStep is elapsed time from scope creation, rather than a delay from
+// the preceding step. The default leaves a just-created scope at 100 and then
+// decays it over the long-running contention window observed in AIRA-14.
+type cpuWeightStep struct {
+	After  time.Duration
+	Weight int64
+}
+
+type cpuWeightConfig struct {
+	Start int64
+	Floor int64
+	Steps []cpuWeightStep
+}
+
+var defaultCPUWeightSteps = []cpuWeightStep{
+	{After: 10 * time.Second, Weight: 100},
+	{After: 30 * time.Second, Weight: 70},
+	{After: time.Minute, Weight: 50},
+	{After: 5 * time.Minute, Weight: 30},
+	{After: 10 * time.Minute, Weight: 20},
+	{After: 30 * time.Minute, Weight: 10},
+}
 
 type confineHandshake struct {
 	Schema      int  `json:"schema"`
@@ -100,11 +137,12 @@ type confineDeps struct {
 	resolveSlicePath      func(string) (string, bool, string)
 	resolveSlicePathExact func(string) (string, error)
 	managedUnitPresent    func(string) (bool, error)
-	ensureDelegation      func(string) error
+	ensureDelegation      func(string) (confineDelegation, error)
 	newBackend            func(string) ScopeBackend
 	admit                 func(context.Context, string, ConfineRequest, int64) (admissionResult, error)
 	writeOOMGroup         func(Scope) error
 	writeScopeMemoryCap   func(Scope, int64, int64, bool) error
+	writeScopeCPUWeight   func(Scope, int64) bool
 	start                 func(*confineCommand) error
 	readHandshake         func(*os.File, time.Duration) ([]byte, error)
 	readCap               func(string) (int64, bool)
@@ -132,6 +170,7 @@ func defaultConfineDeps() confineDeps {
 		admit:                 admitConfine,
 		writeOOMGroup:         writeConfineOOMGroup,
 		writeScopeMemoryCap:   writeScopeMemoryCap,
+		writeScopeCPUWeight:   writeScopeCPUWeightFailOpen,
 		start:                 func(command *confineCommand) error { return command.Start() },
 		readHandshake:         readConfineHandshake,
 		readCap:               effectiveConfineCap,
@@ -166,6 +205,9 @@ func fillConfineDeps(deps confineDeps) confineDeps {
 	}
 	if deps.writeScopeMemoryCap == nil {
 		deps.writeScopeMemoryCap = defaults.writeScopeMemoryCap
+	}
+	if deps.writeScopeCPUWeight == nil {
+		deps.writeScopeCPUWeight = defaults.writeScopeCPUWeight
 	}
 	if deps.start == nil {
 		deps.start = defaults.start
@@ -255,39 +297,65 @@ func managedConfineUnitPresent(unit string) (bool, error) {
 	return string(first) == "# aira-managed: "+unit, nil
 }
 
-func ensureConfineDelegation(parent string) error {
-	controllers, err := os.ReadFile(filepath.Join(parent, "cgroup.controllers"))
+func ensureConfineDelegation(parent string) (confineDelegation, error) {
+	return ensureConfineDelegationWithOps(parent, confineControllerOps{
+		readFile:  os.ReadFile,
+		writeFile: writeConfineSubtreeControl,
+	})
+}
+
+func ensureConfineDelegationWithOps(parent string, ops confineControllerOps) (confineDelegation, error) {
+	controllers, err := ops.readFile(filepath.Join(parent, "cgroup.controllers"))
 	if err != nil {
-		return fmt.Errorf("read cgroup.controllers: %w", err)
+		return confineDelegation{}, fmt.Errorf("read cgroup.controllers: %w", err)
 	}
 	if !confineHasToken(controllers, "memory") {
-		return errors.New("memory is absent from cgroup.controllers")
+		return confineDelegation{}, errors.New("memory is absent from cgroup.controllers")
 	}
+	if err := enableConfineControllerWithOps(parent, "memory", ops); err != nil {
+		return confineDelegation{}, err
+	}
+	// CPU aging is intentionally best effort. Some delegated parents do not
+	// expose cpu, and systemd can reset subtree_control between launches; either
+	// case means only that aging is unavailable, never that memory confinement
+	// should refuse an otherwise safe job.
+	delegation := confineDelegation{}
+	if confineHasToken(controllers, "cpu") {
+		delegation.cpuWeight = enableConfineControllerWithOps(parent, "cpu", ops) == nil
+	}
+	return delegation, nil
+}
+
+func writeConfineSubtreeControl(path string, value []byte) error {
+	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	_, writeErr := file.Write(value)
+	closeErr := file.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	return closeErr
+}
+
+func enableConfineControllerWithOps(parent, controller string, ops confineControllerOps) error {
 	subtree := filepath.Join(parent, "cgroup.subtree_control")
-	current, err := os.ReadFile(subtree)
+	current, err := ops.readFile(subtree)
 	if err != nil {
 		return fmt.Errorf("read cgroup.subtree_control: %w", err)
 	}
-	if !confineHasToken(current, "memory") {
-		file, openErr := os.OpenFile(subtree, os.O_WRONLY, 0)
-		if openErr != nil {
-			return fmt.Errorf("open cgroup.subtree_control: %w", openErr)
-		}
-		_, writeErr := file.WriteString("+memory\n")
-		closeErr := file.Close()
-		if writeErr != nil {
-			return fmt.Errorf("write +memory to cgroup.subtree_control: %w", writeErr)
-		}
-		if closeErr != nil {
-			return fmt.Errorf("close cgroup.subtree_control: %w", closeErr)
+	if !confineHasToken(current, controller) {
+		if err := ops.writeFile(subtree, []byte("+"+controller+"\n")); err != nil {
+			return fmt.Errorf("write +%s to cgroup.subtree_control: %w", controller, err)
 		}
 	}
-	verified, err := os.ReadFile(subtree)
+	verified, err := ops.readFile(subtree)
 	if err != nil {
 		return fmt.Errorf("verify cgroup.subtree_control: %w", err)
 	}
-	if !confineHasToken(verified, "memory") {
-		return errors.New("memory missing from cgroup.subtree_control after enable")
+	if !confineHasToken(verified, controller) {
+		return fmt.Errorf("%s missing from cgroup.subtree_control after enable", controller)
 	}
 	return nil
 }
@@ -311,7 +379,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	result := ConfineResult{Status: ConfineStatus{
 		Cap: ConfineCapUnevaluated, Admission: ConfineAdmissionUnevaluated,
 		Scope: ConfineScopeUnverified, OOMGroup: ConfineOOMGroupUnverified,
-		Priorities: ConfinePrioritiesUnverified,
+		Priorities: ConfinePrioritiesUnverified, CPUWeight: ConfineCPUWeightUnavailable,
 	}}
 	if len(request.Argv) == 0 || request.Argv[0] == "" {
 		result.Status.Slice = attemptedSlice
@@ -369,7 +437,8 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	}
 	result.Status.Cap = ConfineCapEnforced
 	result.Status.CapBytes = maximum
-	if err := deps.ensureDelegation(path); err != nil {
+	delegation, err := deps.ensureDelegation(path)
+	if err != nil {
 		return result, confineUnavailable(sliceName, fmt.Errorf("ensure memory delegation: %w", err))
 	}
 
@@ -467,10 +536,21 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	var started atomic.Bool
 	var interrupted atomic.Bool
 	var cleanupOnce sync.Once
+	cpuWeightStop := func() {}
 	cleanup := func() {
-		cleanupOnce.Do(func() { cleanupConfineScope(scope, started.Load() || interrupted.Load()) })
+		cleanupOnce.Do(func() {
+			cpuWeightStop()
+			cleanupConfineScope(scope, started.Load() || interrupted.Load())
+		})
 	}
 	defer cleanup()
+	if delegation.cpuWeight {
+		config := confineCPUWeightConfig()
+		if deps.writeScopeCPUWeight(scope, config.Start) {
+			result.Status.CPUWeight = ConfineCPUWeightAging
+			cpuWeightStop = startCPUWeightDecay(scope, config.Steps, deps.writeScopeCPUWeight)
+		}
+	}
 
 	var commandMu sync.RWMutex
 	var command *confineCommand
@@ -879,6 +959,153 @@ func writeScopeMemoryValue(scope Scope, name string, value int64) error {
 		return fmt.Errorf("close %s: %w", name, err)
 	}
 	return nil
+}
+
+// writeScopeCPUWeightFailOpen is deliberately unlike writeScopeMemoryValue:
+// CPU aging is an optional contention mitigation, so a vanished or
+// undelegated controller must never abort the foreground launch. Openat keeps
+// the write anchored to the already-open scope and cannot follow a recreated
+// scope name after teardown.
+func writeScopeCPUWeightFailOpen(scope Scope, weight int64) bool {
+	fd, err := unix.Openat(scope.FD(), "cpu.weight", unix.O_WRONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return false
+	}
+	file := os.NewFile(uintptr(fd), "cpu.weight")
+	if file == nil {
+		_ = unix.Close(fd)
+		return false
+	}
+	_, writeErr := file.WriteString(strconv.FormatInt(weight, 10) + "\n")
+	closeErr := file.Close()
+	return writeErr == nil && closeErr == nil
+}
+
+func confineCPUWeightConfig() cpuWeightConfig {
+	start := parseCPUWeightEnv("AIRA_CONFINE_CPUWEIGHT_START", defaultCPUWeightStart)
+	floor := parseCPUWeightEnv("AIRA_CONFINE_CPUWEIGHT_FLOOR", defaultCPUWeightFloor)
+	if floor > start {
+		floor = start
+	}
+	steps := append([]cpuWeightStep(nil), defaultCPUWeightSteps...)
+	if raw := strings.TrimSpace(os.Getenv("AIRA_CONFINE_CPUWEIGHT_SCHEDULE")); raw != "" {
+		if parsed, err := parseCPUWeightSchedule(raw); err == nil {
+			steps = parsed
+		}
+	}
+	previous := start
+	for index := range steps {
+		steps[index].Weight = clampCPUWeight(steps[index].Weight)
+		if steps[index].Weight < floor {
+			steps[index].Weight = floor
+		}
+		if steps[index].Weight > previous {
+			steps[index].Weight = previous
+		}
+		previous = steps[index].Weight
+	}
+	// Every valid schedule reaches the configured positive floor. This is a
+	// proportional-share mitigation for a finite runnable set, not an
+	// anti-starvation guarantee for an unbounded stream of fresh scopes.
+	steps[len(steps)-1].Weight = floor
+	return cpuWeightConfig{Start: start, Floor: floor, Steps: steps}
+}
+
+func parseCPUWeightEnv(name string, fallback int64) int64 {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return clampCPUWeight(value)
+}
+
+// parseCPUWeightSchedule accepts elapsed-time steps such as
+// "10s:100,30s:70,1m:50,5m:30,10m:20,30m:10". '=' is also accepted so an
+// environment value is convenient to write in shells and service files.
+func parseCPUWeightSchedule(raw string) ([]cpuWeightStep, error) {
+	parts := strings.Split(raw, ",")
+	if len(parts) == 0 {
+		return nil, errors.New("cpu weight schedule is empty")
+	}
+	steps := make([]cpuWeightStep, 0, len(parts))
+	var previous time.Duration
+	var previousWeight int64 = 10000
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		separator := ":"
+		if !strings.Contains(part, separator) {
+			separator = "="
+		}
+		delayText, weightText, ok := strings.Cut(part, separator)
+		if !ok || strings.TrimSpace(delayText) == "" || strings.TrimSpace(weightText) == "" {
+			return nil, errors.New("invalid cpu weight schedule step")
+		}
+		delay, err := time.ParseDuration(strings.TrimSpace(delayText))
+		if err != nil || delay <= 0 || delay <= previous {
+			return nil, errors.New("cpu weight schedule delays must increase")
+		}
+		weight, err := strconv.ParseInt(strings.TrimSpace(weightText), 10, 64)
+		if err != nil {
+			return nil, errors.New("invalid cpu weight schedule weight")
+		}
+		weight = clampCPUWeight(weight)
+		if weight > previousWeight {
+			return nil, errors.New("cpu weight schedule must be monotone")
+		}
+		steps = append(steps, cpuWeightStep{After: delay, Weight: weight})
+		previous, previousWeight = delay, weight
+	}
+	return steps, nil
+}
+
+func clampCPUWeight(weight int64) int64 {
+	if weight < 1 {
+		return 1
+	}
+	if weight > 10000 {
+		return 10000
+	}
+	return weight
+}
+
+// startCPUWeightDecay owns a single timer goroutine for this foreground
+// supervisor. Its returned stopper closes and joins it before scope removal,
+// preventing a late write to a deleted scope.
+func startCPUWeightDecay(scope Scope, steps []cpuWeightStep, write func(Scope, int64) bool) func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var stopOnce sync.Once
+	go func() {
+		defer close(done)
+		started := time.Now()
+		for _, step := range steps {
+			delay := time.Until(started.Add(step.After))
+			if delay < 0 {
+				delay = 0
+			}
+			timer := time.NewTimer(delay)
+			select {
+			case <-stop:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return
+			case <-timer.C:
+				_ = write(scope, step.Weight)
+			}
+		}
+	}()
+	return func() {
+		stopOnce.Do(func() { close(stop) })
+		<-done
+	}
 }
 
 func verifyScopeMemoryValue(scope Scope, name string, want int64) error {
