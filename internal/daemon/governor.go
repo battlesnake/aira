@@ -21,6 +21,11 @@ const (
 	governorEnforce
 )
 
+// governorWriteTimeout bounds each governor reply write so it never inherits the
+// stale connect-time deadline (server.go SetDeadline), which otherwise force-closed
+// long-lived governor connections ~30s after they opened (AIRA-18).
+const governorWriteTimeout = 10 * time.Second
+
 type governorWorkerState uint8
 
 const (
@@ -351,9 +356,14 @@ func validateGovernorCheckpoint(frame governorRequestFrame) error {
 	return nil
 }
 
+func writeGovernorFrame(conn net.Conn, frame any) error {
+	_ = conn.SetWriteDeadline(time.Now().Add(governorWriteTimeout))
+	return writeFrame(conn, frame)
+}
+
 func (s *Server) governorConnection(conn net.Conn, _ map[string]any) {
 	if s.governor == nil {
-		_ = writeFrame(conn, governorReplyFrame{State: "continue"})
+		_ = writeGovernorFrame(conn, governorReplyFrame{State: "continue"})
 		return
 	}
 	frames := make(chan governorRequestFrame, 8)
@@ -386,13 +396,13 @@ func (s *Server) governorConnection(conn net.Conn, _ map[string]any) {
 		return
 	}
 	if first.Type != "acquire" || validateGovernorAcquire(first) != nil {
-		_ = writeFrame(conn, governorReplyFrame{State: "continue"})
+		_ = writeGovernorFrame(conn, governorReplyFrame{State: "continue"})
 		return
 	}
 	w = s.governor.add(first.WorkerUUID, first.JobID)
 	select {
 	case <-w.grant:
-		if err := writeFrame(conn, governorReplyFrame{State: "active"}); err != nil {
+		if err := writeGovernorFrame(conn, governorReplyFrame{State: "active"}); err != nil {
 			return
 		}
 	case <-frames:
@@ -407,7 +417,7 @@ func (s *Server) governorConnection(conn net.Conn, _ map[string]any) {
 				return
 			}
 			if frame.Type != "checkpoint" || validateGovernorCheckpoint(frame) != nil {
-				_ = writeFrame(conn, governorReplyFrame{State: "continue"})
+				_ = writeGovernorFrame(conn, governorReplyFrame{State: "continue"})
 				continue
 			}
 			parked, epoch, err := s.governor.checkpoint(w, frame.HeldRSS, frame.NextTestEst)
@@ -415,7 +425,7 @@ func (s *Server) governorConnection(conn net.Conn, _ map[string]any) {
 				return
 			}
 			if !parked {
-				if err := writeFrame(conn, governorReplyFrame{State: "continue"}); err != nil {
+				if err := writeGovernorFrame(conn, governorReplyFrame{State: "continue"}); err != nil {
 					return
 				}
 				continue
@@ -426,7 +436,7 @@ func (s *Server) governorConnection(conn net.Conn, _ map[string]any) {
 			for !resumed {
 				select {
 				case <-epoch:
-					if err := writeFrame(conn, governorReplyFrame{State: "continue"}); err != nil {
+					if err := writeGovernorFrame(conn, governorReplyFrame{State: "continue"}); err != nil {
 						return
 					}
 					resumed = true

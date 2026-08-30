@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"net"
 	"testing"
 	"time"
 )
@@ -27,6 +28,46 @@ func activeGovernorWorkers(g *governorSet) int {
 		}
 	}
 	return n
+}
+
+func TestWriteGovernorFrameRefreshesExpiredWriteDeadline(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	if err := server.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatalf("set expired write deadline: %v", err)
+	}
+	if err := writeFrame(server, governorReplyFrame{State: "raw"}); err == nil {
+		t.Fatal("raw writeFrame succeeded with an expired write deadline")
+	} else if timeoutErr, ok := err.(interface{ Timeout() bool }); !ok || !timeoutErr.Timeout() {
+		t.Fatalf("raw writeFrame error is not a timeout: %T %v", err, err)
+	}
+
+	received := make(chan governorReplyFrame, 1)
+	errs := make(chan error, 1)
+	go func() {
+		var frame governorReplyFrame
+		if err := readFrame(client, &frame); err != nil {
+			errs <- err
+			return
+		}
+		received <- frame
+	}()
+
+	if err := writeGovernorFrame(server, governorReplyFrame{State: "continue"}); err != nil {
+		t.Fatalf("writeGovernorFrame: %v", err)
+	}
+	select {
+	case err := <-errs:
+		t.Fatalf("read reply: %v", err)
+	case frame := <-received:
+		if frame.State != "continue" {
+			t.Fatalf("reply state = %q, want continue", frame.State)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for governor reply")
+	}
 }
 
 func TestGovernorCapacityAndYoungestFirst(t *testing.T) {
