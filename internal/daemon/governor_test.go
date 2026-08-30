@@ -70,6 +70,57 @@ func TestWriteGovernorFrameRefreshesExpiredWriteDeadline(t *testing.T) {
 	}
 }
 
+func TestGovernorConnectionRefreshesExpiredWriteDeadline(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	s := &Server{}
+	s.governor = newGovernorSet(1, governorEnforce, s)
+	handlerDone := make(chan struct{})
+	go func() {
+		s.governorConnection(serverConn, nil)
+		close(handlerDone)
+	}()
+	t.Cleanup(func() {
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+		select {
+		case <-handlerDone:
+		case <-time.After(time.Second):
+			t.Error("governor connection did not exit")
+		}
+		s.governor.stopOnce.Do(func() { close(s.governor.stop) })
+	})
+
+	if err := clientConn.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set client deadline: %v", err)
+	}
+	if err := writeFrame(clientConn, governorRequestFrame{Type: "acquire", WorkerUUID: "worker", JobID: "job"}); err != nil {
+		t.Fatalf("write acquire: %v", err)
+	}
+	var active governorReplyFrame
+	if err := readFrame(clientConn, &active); err != nil {
+		t.Fatalf("read acquire reply: %v", err)
+	}
+	if active.State != "active" {
+		t.Fatalf("acquire reply state = %q, want active", active.State)
+	}
+
+	if err := serverConn.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatalf("set expired server write deadline: %v", err)
+	}
+	if err := writeFrame(clientConn, governorRequestFrame{Type: "checkpoint"}); err != nil {
+		t.Fatalf("write checkpoint: %v", err)
+	}
+	// Revert-check: raw writeFrame in governorConnection would inherit the
+	// expired deadline above, so this handler-level continue reply would fail.
+	var reply governorReplyFrame
+	if err := readFrame(clientConn, &reply); err != nil {
+		t.Fatalf("read checkpoint reply after expired server deadline: %v", err)
+	}
+	if reply.State != "continue" {
+		t.Fatalf("checkpoint reply state = %q, want continue", reply.State)
+	}
+}
+
 func TestGovernorCapacityAndYoungestFirst(t *testing.T) {
 	g := testGovernor(2, governorEnforce)
 	old := time.Now().Add(-time.Hour)

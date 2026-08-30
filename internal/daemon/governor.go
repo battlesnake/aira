@@ -37,6 +37,9 @@ type governorWorker struct {
 	workerUUID string
 	jobID      string
 	state      governorWorkerState
+	// wouldParkLogged suppresses repeat observe-mode would-park messages for
+	// one continuous above-target episode.
+	wouldParkLogged bool
 	// parkRequested records an enforce-mode preemption that must be completed
 	// at the worker's next checkpoint. An active requested worker still owns
 	// its physical CPU slot until that checkpoint arrives.
@@ -63,6 +66,12 @@ type governorSet struct {
 	stopOnce sync.Once
 	seq      uint64
 	server   *Server
+	// lastSummaryActive, lastSummaryParked and lastSummaryJobs are the most
+	// recent enforce-mode active-set composition logged by evaluate.
+	lastSummaryActive int
+	lastSummaryParked int
+	lastSummaryJobs   int
+	summaryLogged     bool
 }
 
 func newGovernorSet(capacity int, mode governorMode, server *Server) *governorSet {
@@ -109,6 +118,7 @@ func (g *governorSet) add(workerUUID, jobID string) *governorWorker {
 	g.mu.Lock()
 	if stale := g.workers[workerUUID]; stale != nil {
 		stale.released = true
+		stale.wouldParkLogged = false
 	}
 	age := g.jobAges[jobID]
 	if age.IsZero() {
@@ -133,6 +143,7 @@ func (g *governorSet) release(w *governorWorker) {
 		return
 	}
 	w.released = true
+	w.wouldParkLogged = false
 	delete(g.workers, w.workerUUID)
 	// Job ages are deliberately daemon-assigned per live job. A later new job
 	// gets a new age after its final worker has gone away.
@@ -302,7 +313,11 @@ func (g *governorSet) evaluate() {
 		}
 		if want && active < target {
 			if g.mode == governorEnforce {
-				log.Printf("aira daemon: governor enforce activated worker=%s job=%s", w.workerUUID, w.jobID)
+				if w.epoch != nil {
+					log.Printf("aira daemon: governor enforce reactivated worker=%s job=%s (resumed from park)", w.workerUUID, w.jobID)
+				} else {
+					log.Printf("aira daemon: governor enforce granted worker=%s job=%s (fresh acquire)", w.workerUUID, w.jobID)
+				}
 			}
 			w.state = governorActive
 			active++
@@ -316,9 +331,35 @@ func (g *governorSet) evaluate() {
 	}
 	if g.mode == governorObserve {
 		for _, w := range g.workers {
-			if w.state == governorActive && !desired[w] {
-				log.Printf("aira daemon: governor observe would park worker=%s job=%s", w.workerUUID, w.jobID)
+			wouldPark := !w.released && w.state == governorActive && !desired[w]
+			if wouldPark {
+				if !w.wouldParkLogged {
+					log.Printf("aira daemon: governor observe would park worker=%s job=%s", w.workerUUID, w.jobID)
+					w.wouldParkLogged = true
+				}
+			} else {
+				w.wouldParkLogged = false
 			}
+		}
+	}
+	if g.mode == governorEnforce {
+		active, parked := 0, 0
+		for _, w := range g.workers {
+			if w.released {
+				continue
+			}
+			if w.state == governorActive {
+				active++
+			} else {
+				parked++
+			}
+		}
+		if !g.summaryLogged || active != g.lastSummaryActive || parked != g.lastSummaryParked || len(jobs) != g.lastSummaryJobs {
+			log.Printf("aira daemon: governor active-set active=%d parked=%d jobs=%d", active, parked, len(jobs))
+			g.lastSummaryActive = active
+			g.lastSummaryParked = parked
+			g.lastSummaryJobs = len(jobs)
+			g.summaryLogged = true
 		}
 	}
 	g.mu.Unlock()
