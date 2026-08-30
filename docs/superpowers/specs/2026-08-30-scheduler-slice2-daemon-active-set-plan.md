@@ -335,3 +335,46 @@ fallback. `AIRA_GOVERNOR=off` (client) remains the per-session escape hatch.
 Fable code-gate pending (adjudicate A–G against the real admit.go/server.go/plugin; confirm the
 single-reader state machine + register-before-signal + the PDEATHSIG/stdin-watch crash-safety are
 buildable on the cited seams). On GATE-PASS → Terra build.
+
+## Plan-review round 2 — Fable GATE-PASS (3 nits folded) → fit to build
+
+Fable verified every seam claim against real code and gated A–G CORRECT/SOUND/BUILDABLE. Three binding
+amendments (fold into the build):
+
+- **Nit 1 — enforce the floor on LOSS, not just refuse to park the last.** A job's last active worker
+  can *crash* while its siblings are parked ⇒ 0 active for a job that still has parked workers. The
+  evaluator must, every pass, reactivate a parked worker of any job whose active count fell below its
+  floor (1) — the floor is a positive guarantee, not merely a park-refusal.
+- **Nit 2 — reactivate by CLOSE, never send.** Sending on an unbuffered `wakeCh` from the evaluator
+  (which holds `queue.mu`, and the receiver also needs it) is the #72 deadlock class. Use admit's exact
+  idiom: each park allocates a fresh per-epoch channel that the evaluator **`close()`s** to reactivate
+  (mirror `close(grantedCh)` admit.go:706); the handler's state machine selects on it; disconnect
+  deregisters the waiter **under the lock** so a concurrent reactivate is a no-op.
+- **Nit 3 (sharpest) — the checkpoint/park must NOT hold the per-test RAM reservation.** The ~10s GC
+  site (`__init__.py:371-380`) is INSIDE the per-test try, BEFORE the `finally` that runs
+  `_stop_reservation` (:381-385). Parking there blocks the worker for minutes while it still holds its
+  confine-reserve RAM grant ⇒ phantom ledger bytes starving other jobs' RAM admission. **Place the
+  checkpoint/park AFTER `_stop_reservation`** (between tests, holding no RAM grant) — e.g. at the top of
+  the next `pytest_runtest_protocol` before `_acquire_reservation`, or after the finally. The
+  worker-start acquire likewise runs before the first `_acquire_reservation`.
+
+Additional confirmations to honour in the build:
+- **E (UUID replace):** on idempotent re-acquire, mark the stale worker record **released** so its
+  deferred release becomes a no-op (mirror the released-state guard at admit.go:741) — else a late
+  disconnect of the old connection double-frees.
+- **Capacity liveness:** `desiredCPUSlots` min-1 clamp (cpuslots.go) guarantees capacity ≥ 1.
+- **PDEATHSIG:** no `Pdeathsig` exists in the repo; the relay self-`prctl(PR_SET_PDEATHSIG, SIGKILL)`
+  after fork **and** re-checks `getppid()` (the fork/prctl race) — belt to the stdin-EOF watcher, not a
+  replacement for it.
+- **Scope-ID injection:** the supervisor has the scope ID at confine_linux.go:474-475, well before env
+  build (:665) → `AppendConfineChildEnvironment` sets `AIRA_CONFINE_SCOPE_ID` trivially.
+
+**Observe-mode refinement (Opus, fold into the build):** `AIRA_SCHED_MODE=observe` must still ENFORCE
+the hard capacity cap (parity with the removed flock — otherwise the observe soak is a CPU-governance
+regression back to the AIRA-14 regime) and only observe-LOG the fairness/young-first *preemption* layer.
+I.e. observe = "capacity-enforce, fairness-observe"; `enforce` = full park/activate fairness. Default
+`observe` on first deploy; flip to `enforce` after a soak.
+
+**Status: GATE-PASSED, fit to build** (Sol+DeepSeek plan-review BLOCK folded → v2; Fable GATE-PASS +
+3 nits folded). Next: Terra build (TDD, discriminating tests per the test plan), then Sol build-review
++ Opus verify.
