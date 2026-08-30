@@ -166,6 +166,7 @@ func (g *governorSet) checkpoint(w *governorWorker, heldRSS, nextEst int64) (par
 	// reactivation cannot lose its close-to-wake event.
 	w.state = governorParked
 	w.parkRequested = false
+	log.Printf("aira daemon: governor enforce parked worker=%s job=%s", w.workerUUID, w.jobID)
 	w.epoch = make(chan struct{})
 	epoch = w.epoch
 	g.mu.Unlock()
@@ -287,11 +288,17 @@ func (g *governorSet) evaluate() {
 				// wanted again before its next checkpoint.
 				w.parkRequested = false
 			} else {
+				if !w.parkRequested {
+					log.Printf("aira daemon: governor enforce preempt-requested worker=%s job=%s", w.workerUUID, w.jobID)
+				}
 				w.parkRequested = true
 			}
 			continue
 		}
 		if want && active < target {
+			if g.mode == governorEnforce {
+				log.Printf("aira daemon: governor enforce activated worker=%s job=%s", w.workerUUID, w.jobID)
+			}
 			w.state = governorActive
 			active++
 			if w.epoch != nil {
