@@ -32,12 +32,12 @@ func activeGovernorWorkers(g *governorSet) int {
 
 func testRAMGovernor(t *testing.T, capacity int, current, maximum int64, readable bool) *governorSet {
 	t.Helper()
-	return testRAMGovernorWithMemory(t, capacity, func(string) (int64, int64, bool, string) {
-		return current, maximum, readable, "injected"
+	return testRAMGovernorWithMemory(t, capacity, func(string) (int64, int64, int64, bool, string) {
+		return current, maximum, 0, readable, "injected"
 	})
 }
 
-func testRAMGovernorWithMemory(t *testing.T, capacity int, readMemory func(string) (int64, int64, bool, string)) *governorSet {
+func testRAMGovernorWithMemory(t *testing.T, capacity int, readMemory func(string) (int64, int64, int64, bool, string)) *governorSet {
 	t.Helper()
 	t.Setenv("AIRA_GOVERNOR_RAM_LOW_MARK", "20")
 	t.Setenv("AIRA_GOVERNOR_RAM_HIGH_MARK", "40")
@@ -396,11 +396,11 @@ func TestGovernorRAMCandidateSortGroupsSlicesIntoTotalOrder(t *testing.T) {
 	// then sequence: /alpha's job y wins before /beta's lexically earlier job a,
 	// and /alpha's next estimates are ignored because that slice is RAM-off.
 	for run := 0; run < 16; run++ {
-		g := testRAMGovernorWithMemory(t, 4, func(slice string) (int64, int64, bool, string) {
+		g := testRAMGovernorWithMemory(t, 4, func(slice string) (int64, int64, int64, bool, string) {
 			if slice == "/beta" {
-				return 90, 100, true, "injected" // avail=10: RAM-on
+				return 90, 100, 0, true, "injected" // avail=10: RAM-on
 			}
-			return 10, 100, true, "injected" // avail=90: RAM-off
+			return 10, 100, 0, true, "injected" // avail=90: RAM-off
 		})
 		age := time.Now()
 		putRAMGovernorWorker(g, "floor-a", "a", age, 1, governorActive, 1)
@@ -457,6 +457,25 @@ func TestGovernorRAMNeverPreemptsAnActiveWorker(t *testing.T) {
 	g.evaluate()
 	if active.state != governorActive || active.parkRequested {
 		t.Fatalf("RAM-preempted active worker: state=%v parkRequested=%v", active.state, active.parkRequested)
+	}
+}
+
+func TestGovernorRAMCacheDiscountDoesNotPreemptActiveWorker(t *testing.T) {
+	// The larger reclaimable-aware advisory value turns RAM ordering off; it
+	// must not park a worker that is already running.
+	g := testRAMGovernorWithMemory(t, 2, func(string) (int64, int64, int64, bool, string) {
+		return 90, 100, 80, true, "injected"
+	})
+	if available, ok := g.server.admitAvailable("/slice"); !ok || available != 90 {
+		t.Fatalf("cache-discount availability=%d ok=%v, want 90 true", available, ok)
+	}
+	age := time.Now()
+	putRAMGovernorWorker(g, "floor", "job", age, 1, governorActive, 1)
+	active := putRAMGovernorWorker(g, "active", "job", age, 2, governorActive, 1<<40)
+	putRAMGovernorWorker(g, "small", "job", age, 3, governorParked, 5)
+	g.evaluate()
+	if active.state != governorActive || active.parkRequested {
+		t.Fatalf("cache discount RAM-preempted active worker: state=%v parkRequested=%v", active.state, active.parkRequested)
 	}
 }
 
@@ -544,8 +563,8 @@ func TestGovernorRAMOrderingTurnsOffAboveHighMark(t *testing.T) {
 
 func TestGovernorRAMOrderingHysteresisTransition(t *testing.T) {
 	current := int64(90) // avail=10: below low mark, RAM ordering turns on.
-	g := testRAMGovernorWithMemory(t, 2, func(string) (int64, int64, bool, string) {
-		return current, 100, true, "injected"
+	g := testRAMGovernorWithMemory(t, 2, func(string) (int64, int64, int64, bool, string) {
+		return current, 100, 0, true, "injected"
 	})
 	age := time.Now()
 	putRAMGovernorWorker(g, "floor", "job", age, 1, governorActive, 1)

@@ -92,7 +92,7 @@ type Server struct {
 	watchEventsSince         func(context.Context, *store.Store, int64, int) ([]store.WatchEvent, int64, error)
 	watchAfterWake           func()
 	admitResolveSlice        func(string) (string, bool, string)
-	admitReadMemory          func(string) (int64, int64, bool, string)
+	admitReadMemory          func(string) (int64, int64, int64, bool, string)
 	admitConfineScan         func(string) (runner.ConfineListResult, error)
 	admitConfineScanInterval time.Duration
 	admitNow                 func() time.Time

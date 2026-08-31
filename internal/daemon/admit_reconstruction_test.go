@@ -24,8 +24,8 @@ func reconstructionTestServer(now *time.Time, scan func(string) (runner.ConfineL
 	server.admitConfineScan = scan
 	server.admitSliceHeadroomBase = 0
 	server.admitSliceHeadroomSupervisor = 0
-	server.admitReadMemory = func(string) (int64, int64, bool, string) {
-		return 0, 100, true, ""
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+		return 0, 100, 0, true, ""
 	}
 	return server
 }
@@ -173,7 +173,7 @@ func TestAdmitReconstructionNonFiniteCapsContributeNeitherBytesNorHeadroom(t *te
 	})
 	// Non-zero per-job headroom so a spurious job count would shrink the ceiling.
 	server.admitSliceHeadroomSupervisor = 10
-	server.admitReadMemory = func(string) (int64, int64, bool, string) { return 0, 100, true, "" }
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, 100, 0, true, "" }
 	// A queued waiter whose reserve fits ONLY if the four non-finite scopes added
 	// neither bytes nor headroom-jobs: ceiling = 100 − headroom(adoptedJobs 1 + 1)*10
 	// = 80; available = 80 − max(0+12, 0) = 68. If the non-finite scopes had each been
@@ -252,10 +252,10 @@ func TestAdmitReconstructionGrantWindowCountsEachHeldJobOnce(t *testing.T) {
 
 func TestAdmitChargeInvariantIncludesAdopted(t *testing.T) {
 	charge := addClamp(20, 50)
-	if got := checkedAvailable(40, 100, charge, 10); got != 20 {
+	if got := checkedAvailable(40, 100, 0, charge, 10); got != 20 {
 		t.Fatalf("available=%d, want ceiling(90)-max(70,40)=20", got)
 	}
-	if got := checkedAvailable(80, 100, charge, 10); got != 10 {
+	if got := checkedAvailable(80, 100, 0, charge, 10); got != 10 {
 		t.Fatalf("available=%d, want ceiling(90)-max(70,80)=10", got)
 	}
 }

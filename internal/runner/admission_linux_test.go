@@ -379,6 +379,24 @@ func TestAdmissionT4ExactFakeClockTimeout(t *testing.T) {
 	}
 }
 
+func TestAdmissionFlockFallbackChargesRawCurrent(t *testing.T) {
+	clock := newInstantClock()
+	var lockAttempts atomic.Int64
+	r, _ := gateOnlyRunner(t, clock, func(string) (int64, int64, bool, string) { return 90, 100, true, "" })
+	r.memoryReserve = 30
+	r.admissionMaxWait = time.Millisecond
+	r.lockAttemptFn = func(string) (*admitLock, error) {
+		lockAttempts.Add(1)
+		return &admitLock{}, nil
+	}
+
+	result, err := r.admit(context.Background(), Request{})
+
+	if err != nil || result.state != "timeout" || lockAttempts.Load() != 0 {
+		t.Fatalf("raw fallback result=%+v lockAttempts=%d err=%v", result, lockAttempts.Load(), err)
+	}
+}
+
 func TestAdmissionOverrideControlsBothFlockChecksAndDiagnostic(t *testing.T) {
 	override := int64(70)
 	t.Run("pre-lock threshold", func(t *testing.T) {

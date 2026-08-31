@@ -149,8 +149,8 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 
 	t.Run("established", func(t *testing.T) {
 		server, _ := setup(t)
-		server.admitReadMemory = func(string) (int64, int64, bool, string) {
-			return 0, maximum, true, ""
+		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+			return 0, maximum, 0, true, ""
 		}
 		response := server.confineManagement(context.Background(), request)
 		result, ok := response.Data.(runner.ConfineListResult)
@@ -169,8 +169,8 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		server, path := setup(t)
 		server.admitQueues[path].outstanding = 0
 		server.admitQueues[path].outstandingJobs = 0
-		server.admitReadMemory = func(string) (int64, int64, bool, string) {
-			return 0, maximum, true, ""
+		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+			return 0, maximum, 0, true, ""
 		}
 		response := server.confineManagement(context.Background(), request)
 		result, ok := response.Data.(runner.ConfineListResult)
@@ -185,8 +185,8 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 
 	t.Run("memory-unavailable", func(t *testing.T) {
 		server, _ := setup(t)
-		server.admitReadMemory = func(string) (int64, int64, bool, string) {
-			return 0, 0, false, "read-error"
+		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+			return 0, 0, 0, false, "read-error"
 		}
 		response := server.confineManagement(context.Background(), request)
 		result, ok := response.Data.(runner.ConfineListResult)

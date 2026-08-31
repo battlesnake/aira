@@ -124,7 +124,7 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		if readMemory == nil {
 			readMemory = readSliceMemory
 		}
-		_, maximum, ok, _ := readMemory(path)
+		_, maximum, _, ok, _ := readMemory(path)
 		if ok {
 			outstanding, outstandingJobs, adopted, adoptedJobs, _ := s.admitOutstandingReserve(path)
 			totalJobs := addJobCountClamp(outstandingJobs, adoptedJobs)

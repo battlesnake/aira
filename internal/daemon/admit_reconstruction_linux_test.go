@@ -50,8 +50,8 @@ func TestAdmitReconstructionRealCgroupEvaluationDoesNotDeadlock(t *testing.T) {
 	server := NewServer(Paths{})
 	server.admitSliceHeadroomBase = 0
 	server.admitSliceHeadroomSupervisor = 0
-	server.admitReadMemory = func(string) (int64, int64, bool, string) {
-		return 0, 24 << 20, true, ""
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+		return 0, 24 << 20, 0, true, ""
 	}
 	waiter := &admitWaiter{seq: 1, reserve: 9 << 20, state: admitQueued, grantedCh: make(chan struct{}), enqueued: time.Now()}
 	queue := &sliceQueue{path: parent, server: server, waiters: []*admitWaiter{waiter}}

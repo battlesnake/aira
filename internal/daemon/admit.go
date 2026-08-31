@@ -82,6 +82,8 @@ type sliceQueue struct {
 	server            *Server
 }
 
+var sliceMemoryStatDegradeOnce sync.Once
+
 // AdmitResponse is the one grant payload sent before the daemon holds the
 // connection as the reservation lease.
 type AdmitResponse struct {
@@ -198,13 +200,13 @@ func (s *Server) admitAvailable(slicePath string) (int64, bool) {
 	if readMemory == nil {
 		readMemory = readSliceMemory
 	}
-	current, maximum, ok, _ := readMemory(slicePath)
+	current, maximum, reclaimable, ok, _ := readMemory(slicePath)
 	if !ok {
 		return 0, false
 	}
 	jobs := addJobCountClamp(addJobCountClamp(outstandingJobs, adoptedJobs), 1)
 	headroom := s.admitSliceHeadroom(jobs)
-	return checkedAvailable(current, maximum, addClamp(outstanding, adopted), headroom), true
+	return checkedAvailable(current, maximum, reclaimable, addClamp(outstanding, adopted), headroom), true
 }
 
 func (s *Server) admitCeiling(path string, maximum int64) int64 {
@@ -413,7 +415,7 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	if readMemory == nil {
 		readMemory = readSliceMemory
 	}
-	_, maximum, ok, reason := readMemory(path)
+	_, maximum, _, ok, reason := readMemory(path)
 	if !ok {
 		// The daemon answered; only the slice's live usage was unreadable. Report
 		// that honestly (NOT "daemon-unavailable") so the operator-facing basis is
@@ -693,7 +695,7 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	if readMemory == nil {
 		readMemory = readSliceMemory
 	}
-	current, maximum, ok, _ := readMemory(queue.path)
+	current, maximum, reclaimable, ok, _ := readMemory(queue.path)
 	if !ok {
 		// Fail CLOSED: without a slice-memory read the ceiling cannot be
 		// established, so granting queued waiters would be uncounted (no
@@ -711,7 +713,7 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		}
 		jobs := addJobCountClamp(addJobCountClamp(queue.outstandingJobs, queue.adoptedJobs), 1)
 		headroom := s.admitSliceHeadroom(jobs)
-		available := checkedAvailable(current, maximum, addClamp(queue.outstanding, queue.adopted), headroom)
+		available := checkedAvailable(current, maximum, reclaimable, addClamp(queue.outstanding, queue.adopted), headroom)
 		if frozen {
 			waiter.waited = true
 			continue
@@ -738,14 +740,18 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	}
 }
 
-func checkedAvailable(current, maximum, outstanding, headroom int64) int64 {
+func checkedAvailable(current, maximum, reclaimable, outstanding, headroom int64) int64 {
 	if current < 0 || maximum < 0 || outstanding < 0 || headroom < 0 || maximum <= headroom {
 		return 0
 	}
+	if reclaimable < 0 {
+		reclaimable = 0
+	}
+	effectiveCurrent := subtractFloor(current, reclaimable)
 	ceiling := maximum - headroom
 	charge := outstanding
-	if current > charge {
-		charge = current
+	if effectiveCurrent > charge {
+		charge = effectiveCurrent
 	}
 	if charge >= ceiling {
 		return 0
@@ -987,27 +993,65 @@ func exactAdmitInt64(value any) (int64, bool) {
 	}
 }
 
-func readSliceMemory(path string) (cur, max int64, ok bool, reason string) {
+func readSliceMemory(path string) (cur, max, reclaimable int64, ok bool, reason string) {
 	currentData, err := os.ReadFile(filepath.Join(path, "memory.current"))
 	if err != nil {
-		return 0, 0, false, "read-error"
+		return 0, 0, 0, false, "read-error"
 	}
 	maxData, err := os.ReadFile(filepath.Join(path, "memory.max"))
 	if err != nil {
-		return 0, 0, false, "read-error"
+		return 0, 0, 0, false, "read-error"
 	}
 	current, valid := parseAdmitMemory(currentData)
 	if !valid {
-		return 0, 0, false, "parse-error"
+		return 0, 0, 0, false, "parse-error"
 	}
 	if strings.TrimSpace(string(maxData)) == "max" {
-		return 0, 0, false, "unbounded"
+		return 0, 0, 0, false, "unbounded"
 	}
 	limit, valid := parseAdmitMemory(maxData)
 	if !valid {
-		return 0, 0, false, "parse-error"
+		return 0, 0, 0, false, "parse-error"
 	}
-	return current, limit, true, ""
+	if current < 0 || limit < 0 {
+		return 0, 0, 0, false, "parse-error"
+	}
+	statData, err := os.ReadFile(filepath.Join(path, "memory.stat"))
+	if err == nil {
+		reclaimable, valid = parseSliceMemoryStat(statData)
+	}
+	if err != nil || !valid {
+		sliceMemoryStatDegradeOnce.Do(func() {
+			log.Printf("aira daemon: slice memory.stat unavailable or incomplete; using raw memory.current")
+		})
+		reclaimable = 0
+	}
+	return current, limit, reclaimable, true, ""
+}
+
+func parseSliceMemoryStat(data []byte) (reclaimable int64, ok bool) {
+	var inactiveFile, activeFile int64
+	var inactiveFound, activeFound bool
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		value, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil || value < 0 {
+			continue
+		}
+		switch fields[0] {
+		case "inactive_file":
+			inactiveFile, inactiveFound = value, true
+		case "active_file":
+			activeFile, activeFound = value, true
+		}
+	}
+	if !inactiveFound || !activeFound {
+		return 0, false
+	}
+	return addClamp(inactiveFile, activeFile), true
 }
 
 func parseAdmitMemory(data []byte) (int64, bool) {

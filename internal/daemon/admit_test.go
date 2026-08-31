@@ -23,8 +23,8 @@ func admitTestServer(maximum *atomic.Int64) *Server {
 	server.admitSliceHeadroomSupervisor = 0
 	server.admitResolveSlice = func(string) (string, bool, string) { return "/slice", true, "" }
 	server.admitConfineScan = noConfinesScan
-	server.admitReadMemory = func(string) (int64, int64, bool, string) {
-		return 0, maximum.Load(), true, ""
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+		return 0, maximum.Load(), 0, true, ""
 	}
 	return server
 }
@@ -178,7 +178,7 @@ func TestAdmitBackfillFreezesForAnOldBlockedHead(t *testing.T) {
 	current := int64(50)
 	server.admitNow = func() time.Time { return now }
 	server.admitBackfillGrace = 10 * time.Second
-	server.admitReadMemory = func(string) (int64, int64, bool, string) { return current, maximum.Load(), true, "" }
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return current, maximum.Load(), 0, true, "" }
 	head := &admitWaiter{seq: 1, reserve: 60, state: admitQueued, grantedCh: make(chan struct{}), enqueued: now.Add(-10 * time.Second)}
 	small := &admitWaiter{seq: 2, reserve: 30, state: admitQueued, grantedCh: make(chan struct{}), enqueued: now}
 	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, small}}
@@ -245,9 +245,9 @@ func TestAdmitBlockedHeadRejectsSaturatedAtWaitCap(t *testing.T) {
 	}
 	server.admitBackfillGrace = 10 * time.Second
 	var evaluations atomic.Int64
-	server.admitReadMemory = func(string) (int64, int64, bool, string) {
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 		evaluations.Add(1)
-		return 50, 100, true, ""
+		return 50, 100, 0, true, ""
 	}
 	timerReady := make(chan struct{})
 	var deadline chan time.Time
@@ -472,7 +472,7 @@ func TestAdmitSaturationRejectUsesUnequalDeadlines(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(10)
 	server := admitTestServer(&maximum)
-	server.admitReadMemory = func(string) (int64, int64, bool, string) { return 10, 10, true, "" }
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 10, 10, 0, true, "" }
 	aServer, aClient := net.Pipe()
 	bServer, bClient := net.Pipe()
 	defer aClient.Close()
@@ -630,7 +630,7 @@ func TestAdmitShutdownHandlerOwnsReleaseAndPrunesAfterDrain(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(10)
 	server := admitTestServer(&maximum)
-	server.admitReadMemory = func(string) (int64, int64, bool, string) { return 10, 10, true, "" }
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 10, 10, 0, true, "" }
 	serverConn, clientConn := net.Pipe()
 	done := make(chan struct{})
 	go func() {
@@ -752,8 +752,8 @@ func TestCheckedAvailableClampsWithoutOverflow(t *testing.T) {
 		{100, 100, 0, 0, 0}, {101, 100, 0, 0, 0},
 		{0, math.MaxInt64, math.MaxInt64, 0, 0}, {-1, math.MaxInt64, 0, 0, 0},
 	} {
-		if got := checkedAvailable(test.current, test.maximum, test.outstanding, test.headroom); got != test.want {
-			t.Fatalf("checkedAvailable(%d,%d,%d,%d)=%d want=%d", test.current, test.maximum, test.outstanding, test.headroom, got, test.want)
+		if got := checkedAvailable(test.current, test.maximum, 0, test.outstanding, test.headroom); got != test.want {
+			t.Fatalf("checkedAvailable(%d,%d,%d,%d,%d)=%d want=%d", test.current, test.maximum, 0, test.outstanding, test.headroom, got, test.want)
 		}
 	}
 }
@@ -765,8 +765,8 @@ func TestAdmitAvailableMatchesGrantHeadroomWithoutCreatingQueue(t *testing.T) {
 		admitQueues:                  map[string]*sliceQueue{},
 		admitSliceHeadroomBase:       10,
 		admitSliceHeadroomSupervisor: 2,
-		admitReadMemory: func(string) (int64, int64, bool, string) {
-			return 20, 100, true, ""
+		admitReadMemory: func(string) (int64, int64, int64, bool, string) {
+			return 20, 100, 0, true, ""
 		},
 	}
 	queue := &sliceQueue{outstanding: 30, outstandingJobs: 1, adopted: 10, adoptedJobs: 1}
@@ -780,7 +780,7 @@ func TestAdmitAvailableMatchesGrantHeadroomWithoutCreatingQueue(t *testing.T) {
 	if len(server.admitQueues) != 1 || server.admitQueues["/missing"] != nil {
 		t.Fatalf("read-only lookup created a queue: %#v", server.admitQueues)
 	}
-	server.admitReadMemory = func(string) (int64, int64, bool, string) { return 0, 0, false, "read-error" }
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, 0, 0, false, "read-error" }
 	if _, ok := server.admitAvailable("/slice"); ok {
 		t.Fatal("unreadable or uncapped slice was not reported uncertain")
 	}

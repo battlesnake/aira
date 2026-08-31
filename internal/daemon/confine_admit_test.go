@@ -80,7 +80,7 @@ func TestDelegateRAMPinnedAdmitGrantIncludesScopeCeiling(t *testing.T) {
 	server := NewServer(Paths{})
 	server.stopping = make(chan struct{})
 	server.admitResolveSlice = func(string) (string, bool, string) { return "/slice", true, "" }
-	server.admitReadMemory = func(string) (int64, int64, bool, string) { return 0, 64 << 30, true, "" }
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, 64 << 30, 0, true, "" }
 	server.admitConfineScan = noConfinesScan
 	server.admitPeakHistory = func(context.Context, string) (runner.PeakRSSStats, error) {
 		return runner.PeakRSSStats{TotalCount: 1, SampleCount: 1, PeakMax: 8 << 30}, nil
@@ -146,7 +146,7 @@ func TestAdmitConcurrencyScaledHeadroomAndLifetimeCapacity(t *testing.T) {
 	server.admitConfineScan = noConfinesScan
 	server.stopping = make(chan struct{})
 	server.admitPollInterval = time.Hour
-	server.admitReadMemory = func(string) (int64, int64, bool, string) { return 0, 64 << 30, true, "" }
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, 64 << 30, 0, true, "" }
 	queue := &sliceQueue{path: "/slice", server: server}
 	for index := 0; index < 5; index++ {
 		queue.waiters = append(queue.waiters, &admitWaiter{seq: int64(index + 1), reserve: 15 << 30, state: admitQueued, grantedCh: make(chan struct{})})
@@ -179,7 +179,7 @@ func TestAdmitScaledHeadroomDiscriminatesPerSupervisorTerm(t *testing.T) {
 	server.admitPollInterval = time.Hour
 	server.admitSliceHeadroomBase = 2 << 30
 	server.admitSliceHeadroomSupervisor = 2 << 30
-	server.admitReadMemory = func(string) (int64, int64, bool, string) { return 0, 64 << 30, true, "" }
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, 64 << 30, 0, true, "" }
 	queue := &sliceQueue{path: "/slice", server: server}
 	for index := 0; index < 6; index++ {
 		queue.waiters = append(queue.waiters, &admitWaiter{seq: int64(index + 1), reserve: 10 << 30, state: admitQueued, grantedCh: make(chan struct{})})
@@ -210,11 +210,11 @@ func TestAdmitReadFailureKeepsWaitersQueuedUncounted(t *testing.T) {
 	server.stopping = make(chan struct{})
 	server.admitPollInterval = time.Hour
 	readable := false
-	server.admitReadMemory = func(string) (int64, int64, bool, string) {
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 		if !readable {
-			return 0, 0, false, "unbounded"
+			return 0, 0, 0, false, "unbounded"
 		}
-		return 0, 64 << 30, true, ""
+		return 0, 64 << 30, 0, true, ""
 	}
 	queue := &sliceQueue{path: "/slice", server: server}
 	for index := 0; index < 3; index++ {
@@ -246,7 +246,7 @@ func TestPinnedTooLargeRejectedBeforeQueue(t *testing.T) {
 	server := NewServer(Paths{})
 	server.stopping = make(chan struct{})
 	server.admitResolveSlice = func(string) (string, bool, string) { return "/slice", true, "" }
-	server.admitReadMemory = func(string) (int64, int64, bool, string) { return 0, 8 << 30, true, "" }
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, 8 << 30, 0, true, "" }
 	serverConn, clientConn := net.Pipe()
 	done := make(chan struct{})
 	go func() {
