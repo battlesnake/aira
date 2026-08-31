@@ -1013,9 +1013,9 @@ func readSliceMemory(path string) (cur, max, reclaimable int64, ok bool, reason 
 	if !valid {
 		return 0, 0, 0, false, "parse-error"
 	}
-	if current < 0 || limit < 0 {
-		return 0, 0, 0, false, "parse-error"
-	}
+	// current and limit are already guaranteed >= 0 by parseAdmitMemory (valid
+	// implies non-negative), and checkedAvailable independently guards current<0
+	// before the reclaimable discount — so no further negative check is needed here.
 	statData, err := os.ReadFile(filepath.Join(path, "memory.stat"))
 	if err == nil {
 		reclaimable, valid = parseSliceMemoryStat(statData)

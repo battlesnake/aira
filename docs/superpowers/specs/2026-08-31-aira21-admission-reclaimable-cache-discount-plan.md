@@ -97,13 +97,20 @@ if field data shows dirty-driven throttling.
    dir and return a fifth value `reclaimable int64`. New signature:
    `readSliceMemory(path) (current, maximum, reclaimable int64, ok bool, reason string)`.
    - `memory.current` / `memory.max` unreadable / unbounded (`"max"`) / parse-error →
-     `ok=false` (HARD fail-closed, exactly as today — waiters stay queued). The existing
-     raw `current < 0` / `maximum < 0` guards are preserved **ahead of** any discount.
+     `ok=false` (HARD fail-closed, exactly as today — waiters stay queued). `parseAdmitMemory`
+     already guarantees `current`/`maximum` are non-negative when valid, and the
+     genuinely-preserved raw `current < 0` guard is the one in `checkedAvailable`
+     (`admit.go:744`), which sits **ahead of** the reclaimable discount — so `readSliceMemory`
+     needs no separate negative check.
    - `memory.stat` missing / unparseable / either LRU field absent → `reclaimable = 0`,
      `ok=true` (SOFT — degrade to today's raw-current behaviour; **never fabricate a
-     discount**). Emit a **throttled one-time log** on first soft-degrade per queue
-     (modelled on the `adoptedScanFailed` one-shot log at `admit.go:632-636`) so the field
-     behaviour is not silently different — addresses the observability nit.
+     discount**). Emit a **one-time log** on first soft-degrade via a **package-level
+     `sync.Once`** (not per-queue): `memory.stat` availability is a machine/kernel-level
+     property (if the kernel exposes it for one cgroup it exposes it for all), so a single
+     process-lifetime warning is the right granularity and avoids per-slice log machinery
+     for a global condition. (This is a deliberate deviation from the per-queue
+     `adoptedScanFailed` model, which is genuinely per-slice because a scope dir can be
+     transiently unreadable; `memory.stat` presence is not.)
 
 3. **Widen the seam.** `admitReadMemory` (`server.go:95`) becomes
    `func(string) (current, maximum, reclaimable int64, ok bool, reason string)`. All four
