@@ -810,7 +810,7 @@ func TestConfineRejectedAdmissionCreatesNoScopeAndStartsNoChild(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), code) || created || started {
 				t.Fatalf("result=%+v err=%v created=%v started=%v", result, err, created, started)
 			}
-			if code == "E_ADMIT_SATURATED" && (!strings.Contains(err.Error(), "slice genuinely saturated") || !strings.Contains(err.Error(), "reserve")) {
+			if code == "E_ADMIT_SATURATED" && (!strings.Contains(err.Error(), "slice contended") || !strings.Contains(err.Error(), "reserve")) {
 				t.Fatalf("saturated rejection is not explicit: %v", err)
 			}
 			if result.Status.ReserveBasis != map[string]string{"E_ADMIT_TOO_LARGE": "reject:too-large", "E_ADMIT_SATURATED": "reject:saturated"}[code] {

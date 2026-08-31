@@ -248,7 +248,10 @@ func TestConfineMemoryFlagsThreadIntoRequest(t *testing.T) {
 func TestConfineAdmitTimeoutValidationAndThreading(t *testing.T) {
 	original := runConfined
 	t.Cleanup(func() { runConfined = original })
-	for _, raw := range []string{"0", "-1s"} {
+	// Sub-1ms values (500us, 999us) must ALSO be rejected: the wire value is
+	// max_wait_ms and Milliseconds() truncates them to 0, which would reintroduce
+	// the deferred zero-wait evaluator race (a false "saturated" reject).
+	for _, raw := range []string{"0", "-1s", "500us", "999us"} {
 		if _, _, err := parseArgs("confine", []string{"--admit-timeout", raw, "--", "true"}); err == nil || !strings.Contains(err.Error(), "--admit-timeout") {
 			t.Fatalf("--admit-timeout %q err=%v, want CLI rejection", raw, err)
 		}

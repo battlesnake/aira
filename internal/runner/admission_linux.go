@@ -376,7 +376,11 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 					if rejection.Ceiling > 0 {
 						ceiling = FormatConfineBytes(rejection.Ceiling)
 					}
-					message = fmt.Sprintf("E_ADMIT_SATURATED: confine: admission rejected after %s — slice genuinely saturated (reserve %s/%s)", time.Since(admissionStarted).Round(time.Second), FormatConfineBytes(resolved), ceiling)
+					// Honest wording: E_ADMIT_SATURATED means the wait window expired
+					// without a grant — the slice was contended for the duration — not
+					// that it is persistently "genuinely saturated" (a state the daemon
+					// never establishes on this path).
+					message = fmt.Sprintf("E_ADMIT_SATURATED: confine: admission rejected after %s — slice contended, no memory admission within the wait (reserve %s/%s)", time.Since(admissionStarted).Round(time.Second), FormatConfineBytes(resolved), ceiling)
 				}
 				if message == "" {
 					message = response.Code + ": " + rejection.Basis

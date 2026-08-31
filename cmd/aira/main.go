@@ -639,9 +639,12 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 	}
 	if raw, present := options["admit-timeout"]; present {
 		wait, err := time.ParseDuration(raw)
-		if err != nil || wait <= 0 {
+		// Reject below 1ms: the wire value is max_wait_ms (Milliseconds() truncates
+		// toward zero), so a sub-1ms timeout reaches the daemon as 0 — the deferred
+		// zero-wait evaluator race that falsely rejects an admissible job.
+		if err != nil || wait < time.Millisecond {
 			if err == nil {
-				err = errors.New("must be positive")
+				err = errors.New("must be at least 1ms")
 			}
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --admit-timeout: %w", err)
 		}
@@ -796,9 +799,9 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 	admitTimeout := time.Duration(0)
 	if raw := options["admit-timeout"]; raw != "" {
 		admitTimeout, err = time.ParseDuration(raw)
-		if err != nil || admitTimeout <= 0 {
+		if err != nil || admitTimeout < time.Millisecond {
 			if err == nil {
-				err = errors.New("must be positive")
+				err = errors.New("must be at least 1ms")
 			}
 			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --admit-timeout: %v\n", err)
 			return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
