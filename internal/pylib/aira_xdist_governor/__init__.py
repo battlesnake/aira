@@ -15,7 +15,7 @@ import pytest
 
 _DEFAULT_MAX_WAIT = 300.0
 _DEFAULT_AFTER_TEST_GC_INTERVAL = 10.0
-_DEFAULT_GROWTH_HEADROOM = 512 << 20
+_DEFAULT_GROWTH_HEADROOM = 128 << 20
 _GRANT_READ_GRACE = 2.0
 # re.ASCII keeps case-folding ASCII-only, matching Go's byte-wise strings.ToUpper;
 # without it re.IGNORECASE would fold Unicode look-alikes (e.g. U+212A KELVIN SIGN
@@ -31,6 +31,7 @@ _last_after_test_gc = time.monotonic()
 _last_governor_checkpoint = 0.0
 _governor_process = None
 _governor_disabled = False
+_INVALID_MEMORY_ESTIMATE = object()
 
 
 def _close_inherited_streams():
@@ -220,10 +221,12 @@ def _memory_estimate(item):
         default = _parse_memory_size(default_raw)
     except Exception as exc:
         _log_once("invalid AIRA_TEST_MEM_DEFAULT %r: %s; running ungoverned" % (default_raw, exc), domain="RAM")
-        return None
+        return _INVALID_MEMORY_ESTIMATE
     marker = item.get_closest_marker("aira_mem")
     if marker is None:
-        return default
+        # The injected default remains the fallback for a malformed marker, but
+        # it is no longer an unmarked-test reserve floor.
+        return None
     try:
         if len(marker.args) != 1 or marker.kwargs:
             raise ValueError("aira_mem requires exactly one positional value")
@@ -257,12 +260,15 @@ def _read_rss_bytes():
 
 def _reservation_bytes(item):
     estimate = _memory_estimate(item)
-    if estimate is None:
+    if estimate is _INVALID_MEMORY_ESTIMATE:
         return None
-    # aira_mem is an absolute peak estimate. The worker's cumulative resident
-    # footprint is the other candidate, with the configurable transient-growth
-    # headroom applied only to that measured path.
-    return max(estimate, _read_rss_bytes() + _growth_headroom())
+    measured = _read_rss_bytes() + _growth_headroom()
+    if estimate is None:
+        return measured
+    # aira_mem remains an absolute peak estimate. The worker's cumulative
+    # resident footprint plus configurable forward-growth pad is the other
+    # candidate, so a marked test holds the larger of the two.
+    return max(estimate, measured)
 
 
 def _read_grant(process, timeout):

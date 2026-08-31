@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -329,6 +330,47 @@ sys.stdin.buffer.read()`)
 	// the raw marker instead regresses #69 and fails this discriminating check.
 	if got, want := string(data), "50"; got != want {
 		t.Fatalf("reservation bytes=%q want=%q", got, want)
+	}
+}
+
+// verifies: Slice 1 reserves only measured RSS plus the 128 MiB forward pad
+// for unmarked tests. This is deliberately RED against the old rss+512 MiB
+// path even though AIRA_TEST_MEM_DEFAULT remains injected for marker fallback.
+func TestRealPytestRAMReservationShrinksUnmarkedPadKeepsAbsoluteMarker(t *testing.T) {
+	pytest := requireRealPytest(t)
+	project, pythonDir := realPytestProject(t, "import aira_xdist_governor as governor\ngovernor._read_rss_bytes = lambda: 1")
+	requests := filepath.Join(project, "reservation-bytes")
+	helper := writeReserveHelper(t, project, `
+import os, sys
+bytes_to_hold = sys.argv[sys.argv.index("--bytes") + 1]
+with open(os.environ["AIRA_TEST_RESERVATION_BYTES"], "a") as target:
+    target.write(bytes_to_hold + "\n")
+print("granted reserve=%s basis=pinned:client" % bytes_to_hold, flush=True)
+sys.stdin.buffer.read()`)
+	writeTestFile(t, project, "test_slice1_reservation.py", `
+import pytest
+def test_unmarked_reservation(): pass
+@pytest.mark.aira_mem("512M")
+def test_marked_reservation(): pass`)
+	result := runPytest(t, pytest, project, pythonDir, map[string]string{
+		"AIRA_TEST_MEM_GOVERNOR": "1", "AIRA_TEST_MEM_DEFAULT": "512M",
+		"AIRA_CONFINE_RESERVE_CMD": helper, "AIRA_TEST_RESERVATION_BYTES": requests,
+	})
+	if result.err != nil {
+		t.Fatalf("Slice 1 RAM reservation pytest failed: %v\n%s", result.err, result.output)
+	}
+	data, err := os.ReadFile(requests)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Fields(string(data))
+	newUnmarked := int64(1 + (128 << 20))
+	oldUnmarked := int64(1 + (512 << 20))
+	if len(got) != 2 || got[0] != strconv.FormatInt(newUnmarked, 10) || got[1] != strconv.FormatInt(512<<20, 10) {
+		t.Fatalf("reservation bytes=%q want unmarked=%d marked=%d", data, newUnmarked, int64(512<<20))
+	}
+	if newUnmarked >= oldUnmarked {
+		t.Fatalf("Slice 1 unmarked reserve=%d did not reduce old rss+512MiB=%d", newUnmarked, oldUnmarked)
 	}
 }
 

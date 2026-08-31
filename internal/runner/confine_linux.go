@@ -478,6 +478,8 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// waits on a single socket read for up to its maxWait. Emit a periodic progress
 	// line so a bounded wait is never mistaken for a hang. Nothing prints when
 	// admission returns promptly; the goroutine is stopped and joined first.
+	// deferred: AIRA-24 visibility needs a separate daemon --list connection per
+	// tick; do not multiplex this blocked admission socket.
 	admitDiag := request.Stderr
 	if admitDiag == nil {
 		admitDiag = os.Stderr

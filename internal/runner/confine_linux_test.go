@@ -810,8 +810,68 @@ func TestConfineRejectedAdmissionCreatesNoScopeAndStartsNoChild(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), code) || created || started {
 				t.Fatalf("result=%+v err=%v created=%v started=%v", result, err, created, started)
 			}
+			if code == "E_ADMIT_SATURATED" && (!strings.Contains(err.Error(), "slice genuinely saturated") || !strings.Contains(err.Error(), "reserve")) {
+				t.Fatalf("saturated rejection is not explicit: %v", err)
+			}
 			if result.Status.ReserveBasis != map[string]string{"E_ADMIT_TOO_LARGE": "reject:too-large", "E_ADMIT_SATURATED": "reject:saturated"}[code] {
 				t.Fatalf("rejection basis=%q", result.Status.ReserveBasis)
+			}
+		})
+	}
+}
+
+func TestConfineDaemonAdmissionTimeoutUsesRequestedOrDefaultWait(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		wait time.Duration
+		want time.Duration
+	}{
+		{name: "positive", wait: 25 * time.Millisecond, want: 25 * time.Millisecond},
+		{name: "default", want: 30 * time.Minute},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			socket := filepath.Join(t.TempDir(), "admit.sock")
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			frames := make(chan runnerAdmitRequestFrame, 1)
+			go func() {
+				conn, acceptErr := listener.Accept()
+				if acceptErr != nil {
+					return
+				}
+				defer conn.Close()
+				var frame runnerAdmitRequestFrame
+				if readErr := readRunnerAdmitFrame(conn, &frame); readErr != nil {
+					return
+				}
+				frames <- frame
+				data, _ := json.Marshal(runnerAdmitRejection{Basis: "reject:saturated", Ceiling: 8 << 30})
+				_ = writeRunnerAdmitFrame(conn, runnerAdmitResponseFrame{Code: "E_ADMIT_SATURATED", Error: "E_ADMIT_SATURATED: capacity remained full", Data: data})
+			}()
+			deps := confineUnitDeps(&confineFakeScope{})
+			deps.admit = admitConfine
+			started := time.Now()
+			_, err = confineWithDeps(context.Background(), ConfineRequest{
+				Slice: "finite.slice", MemoryReserve: 4 << 20, Argv: []string{"must-not-run"},
+				AdmitSocketPath: socket, AdmissionMaxWait: test.wait, Stderr: io.Discard,
+			}, deps)
+			if err == nil || !strings.Contains(err.Error(), "E_ADMIT_SATURATED") {
+				t.Fatalf("err=%v, want terminal saturated rejection", err)
+			}
+			if elapsed := time.Since(started); elapsed > test.want+time.Second {
+				t.Fatalf("saturated daemon rejection took %s, want within requested wait %s", elapsed, test.want)
+			}
+			select {
+			case frame := <-frames:
+				got, ok := frame.Request.Args["max_wait_ms"].(float64)
+				if !ok || int64(got) != test.want.Milliseconds() {
+					t.Fatalf("max_wait_ms=%v want=%d", frame.Request.Args["max_wait_ms"], test.want.Milliseconds())
+				}
+			case <-time.After(time.Second):
+				t.Fatal("daemon did not receive admission request")
 			}
 		})
 	}

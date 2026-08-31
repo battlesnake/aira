@@ -609,7 +609,7 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 			options[name] = "true"
 			continue
 		}
-		if name != "slice" && name != "name" && name != "owner" && name != "memory-reserve" && name != "memory-max" && name != "memory-high" {
+		if name != "slice" && name != "name" && name != "owner" && name != "memory-reserve" && name != "memory-max" && name != "memory-high" && name != "admit-timeout" {
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for confine", name)
 		}
 		if i+1 >= delimiter || strings.HasPrefix(argv[i+1], "--") {
@@ -635,6 +635,15 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 				err = errors.New("must be at least 1MiB")
 			}
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --memory-reserve: %w", err)
+		}
+	}
+	if raw, present := options["admit-timeout"]; present {
+		wait, err := time.ParseDuration(raw)
+		if err != nil || wait <= 0 {
+			if err == nil {
+				err = errors.New("must be positive")
+			}
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --admit-timeout: %w", err)
 		}
 	}
 	return target, options, nil
@@ -784,6 +793,17 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 	if maximum > 0 {
 		reserve, reservePinned = maximum, true
 	}
+	admitTimeout := time.Duration(0)
+	if raw := options["admit-timeout"]; raw != "" {
+		admitTimeout, err = time.ParseDuration(raw)
+		if err != nil || admitTimeout <= 0 {
+			if err == nil {
+				err = errors.New("must be positive")
+			}
+			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --admit-timeout: %v\n", err)
+			return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		}
+	}
 	owner, err := resolveConfineOwner(ctx, options["owner"])
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --owner: %v\n", err)
@@ -795,7 +815,8 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		MemoryReserve: reserve, MemoryReservePinned: reservePinned,
 		DelegateRAM:    options["delegate-ram"] == "true",
 		ScopeMemoryMax: maximum, ScopeMemoryHigh: high,
-		Stdin: stdin, Stdout: stdout, Stderr: stderr,
+		AdmissionMaxWait: admitTimeout,
+		Stdin:            stdin, Stdout: stdout, Stderr: stderr,
 	}
 	if paths, err := daemon.PathsFromEnv(); err == nil {
 		request.RuntimeDir = paths.RuntimeDir

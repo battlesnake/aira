@@ -245,6 +245,25 @@ func TestConfineMemoryFlagsThreadIntoRequest(t *testing.T) {
 	}
 }
 
+func TestConfineAdmitTimeoutValidationAndThreading(t *testing.T) {
+	original := runConfined
+	t.Cleanup(func() { runConfined = original })
+	for _, raw := range []string{"0", "-1s"} {
+		if _, _, err := parseArgs("confine", []string{"--admit-timeout", raw, "--", "true"}); err == nil || !strings.Contains(err.Error(), "--admit-timeout") {
+			t.Fatalf("--admit-timeout %q err=%v, want CLI rejection", raw, err)
+		}
+	}
+	runConfined = func(_ context.Context, request runner.ConfineRequest) (runner.ConfineResult, error) {
+		if request.AdmissionMaxWait != 25*time.Millisecond {
+			t.Fatalf("AdmissionMaxWait=%s want 25ms", request.AdmissionMaxWait)
+		}
+		return runner.ConfineResult{}, nil
+	}
+	if exit := runWithInput([]string{"confine", "--admit-timeout", "25ms", "--", "true"}, io.Discard, io.Discard, strings.NewReader("")); exit != 0 {
+		t.Fatalf("exit=%d", exit)
+	}
+}
+
 func TestConfineDelegateRAMFlagThreadsIntoRequest(t *testing.T) {
 	original := runConfined
 	t.Cleanup(func() { runConfined = original })
@@ -374,7 +393,7 @@ func TestConfineDescriptorIsClientExecuteWithoutMCP(t *testing.T) {
 			continue
 		}
 		found = true
-		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--delegate-ram] -- <argv...>" {
+		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--admit-timeout D] [--delegate-ram] -- <argv...>" {
 			t.Fatalf("descriptor=%+v", descriptor)
 		}
 	}

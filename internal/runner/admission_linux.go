@@ -238,6 +238,7 @@ func (r *Runner) admitWithFlock(ctx context.Context, req Request, path string, s
 }
 
 func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveReserve int64) (admissionResult, bool, error) {
+	admissionStarted := time.Now()
 	dial := r.admitDialFn
 	if dial == nil {
 		if strings.TrimSpace(r.admitSocketPath) == "" {
@@ -362,19 +363,25 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 			var rejection runnerAdmitRejection
 			if err := json.Unmarshal(response.Data, &rejection); err == nil && validRunnerAdmitRejection(response.Code, rejection) {
 				_ = conn.Close()
-				message := response.Error
-				if message == "" {
-					message = response.Code + ": " + rejection.Basis
-				}
 				resolved := rejection.Required
 				if resolved <= 0 {
 					resolved = effectiveReserve
 				}
 				basis := "reject:saturated"
+				message := response.Error
 				if response.Code == "E_ADMIT_TOO_LARGE" {
 					basis = "reject:too-large"
+				} else {
+					ceiling := "unknown"
+					if rejection.Ceiling > 0 {
+						ceiling = FormatConfineBytes(rejection.Ceiling)
+					}
+					message = fmt.Sprintf("E_ADMIT_SATURATED: confine: admission rejected after %s — slice genuinely saturated (reserve %s/%s)", time.Since(admissionStarted).Round(time.Second), FormatConfineBytes(resolved), ceiling)
 				}
-				return admissionResult{state: strings.TrimPrefix(strings.ToLower(response.Code), "e_admit_"), reserve: resolved, ceiling: rejection.Ceiling, basis: basis}, true, errors.New(message)
+				if message == "" {
+					message = response.Code + ": " + rejection.Basis
+				}
+				return admissionResult{state: strings.TrimPrefix(strings.ToLower(response.Code), "e_admit_"), waitedMS: time.Since(admissionStarted).Milliseconds(), reserve: resolved, ceiling: rejection.Ceiling, basis: basis}, true, errors.New(message)
 			}
 		}
 		return fail()

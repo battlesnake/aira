@@ -758,6 +758,42 @@ func TestCheckedAvailableClampsWithoutOverflow(t *testing.T) {
 	}
 }
 
+// verifies: Slice 1 relies on the honest effective-current floor, not the
+// porous outstanding>=current assertion. In particular, outstanding may be
+// below current after a worker grows, but checkedAvailable still never exposes
+// headroom once effectiveCurrent reaches the cap-minus-headroom ceiling.
+func TestCheckedAvailablePreservesEffectiveCurrentFloorBelowOutstanding(t *testing.T) {
+	for _, outstanding := range []int64{0, 1, 50} {
+		if got := checkedAvailable(100, 100, 1, outstanding, 1); got != 0 {
+			t.Fatalf("outstanding=%d available=%d, want zero: effectiveCurrent reaches the ceiling", outstanding, got)
+		}
+	}
+}
+
+// verifies: reduced per-worker pads stop their sum from falsely gating a
+// small waiter while the honest effective current remains well below the cap.
+// The old rss+512 MiB grants would leave no availability in this same queue.
+func TestEvaluateAdmitQueueReducedPerWorkerPadAvoidsFalseBlock(t *testing.T) {
+	var maximum atomic.Int64
+	maximum.Store(1 << 30)
+	server := admitTestServer(&maximum)
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+		return 200 << 20, maximum.Load(), 0, true, ""
+	}
+	rss := int64(1 << 20)
+	workers := int64(4)
+	reducedOutstanding := workers * (rss + (128 << 20))
+	oldOutstanding := workers * (rss + (512 << 20))
+	small := int64(64 << 20)
+	if oldAvailable := checkedAvailable(200<<20, maximum.Load(), 0, oldOutstanding, 0); oldAvailable >= small {
+		t.Fatalf("old 512MiB-pad grants unexpectedly admit: available=%d reserve=%d", oldAvailable, small)
+	}
+	waiter := &admitWaiter{seq: 1, reserve: small, state: admitQueued, grantedCh: make(chan struct{}), enqueued: time.Now()}
+	queue := &sliceQueue{path: "/slice", server: server, outstanding: reducedOutstanding, outstandingJobs: int(workers), waiters: []*admitWaiter{waiter}}
+	server.evaluateAdmitQueue(queue)
+	waitAdmitGrant(t, waiter)
+}
+
 func TestAdmitAvailableMatchesGrantHeadroomWithoutCreatingQueue(t *testing.T) {
 	// Revert-check: omitting the +1 prospective job term gives 46 rather than
 	// the grant-time 44 here; creating a missing queue changes the registry.

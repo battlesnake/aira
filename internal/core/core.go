@@ -1676,7 +1676,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return result, err
 		}},
-		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--delegate-ram] -- <argv...>", Args: []ArgSpec{
+		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--admit-timeout D] [--delegate-ram] -- <argv...>", Args: []ArgSpec{
 			listSpec("argv", true, true, "Exact target argv after the launch delimiter"),
 			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
 			stringSpec("name", false, false, "Scope name component"),
@@ -1684,6 +1684,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("memory_reserve", false, false, "Pinned admission reserve (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			stringSpec("memory_max", false, false, "Scope memory.max (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			stringSpec("memory_high", false, false, "Scope memory.high reclaim pressure (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
+			stringSpec("admit_timeout", false, false, "Positive bounded daemon admission wait"),
 			boolSpec("delegate_ram", false, false, "Delegate RAM admission to per-test pinned reservations"),
 		}, Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			_ = ctx
@@ -1694,6 +1695,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringArg(args, "memory_reserve")
 			_ = stringArg(args, "memory_max")
 			_ = stringArg(args, "memory_high")
+			_ = stringArg(args, "admit_timeout")
 			_ = boolArg(args, "delegate_ram")
 			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine is a direct CLI-only foreground verb")
 		}},
