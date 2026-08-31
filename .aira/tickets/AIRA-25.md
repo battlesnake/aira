@@ -1,0 +1,12 @@
+---
+{"schema":1,"id":"AIRA-25","project":"aira","title":"Confine admission class-split + per-test delta tightening (removes Σ(file-resident) over-charge)","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","daemon","deferred"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-25","to":"AIRA-26"}]}
+---
+DEFERRED (owner chose to stop at per-worker-admission Slice 1, 2026-09-01). This was "reshaped Slice 2" after the plan-review dissolved the per-worker-base concept (see AIRA-26).
+
+WHAT: split the confine admission ledger into PEAK-class (whole-job reserves, kept in the existing `outstanding`, charged via `max(effectiveCurrent, Σpeak+adopted)`) and DELTA-class (per-test forward increments, a new `deltaOutstanding`, charged as `+ Σdelta`), and change the per-test reserve from Slice-1's cumulative `max(marker, RSS+pad)` to the INCREMENT `max(marker, RSS+pad) − B` (B = the worker's frozen post-import/post-trim resident baseline). So `charge = max(effectiveCurrent, Σpeak+adopted) + Σdelta`.
+
+WIN (modest): Slice 1 over-charges by `Σ(RSS_i) − effectiveCurrent ≈ Σ(file-resident_i)` (~0.5–2GiB at -n16) because each worker's mapped-file pages are in its statm RSS but discounted out of effectiveCurrent by AIRA-21. The delta form uses `current` (cache-discounted) + growth-only deltas, removing that over-charge; also tightens marked tests. NO per-worker base lease (dropped — it is a no-op, AIRA-26).
+
+VERIFIED (Fable, code-grounded 2026-09-01): the class-split arithmetic is a SOUND non-OOM bound (monotone grant argument preserves Σreserve ≤ cap−headroom; delta double-count of materialised growth is bounded — exactly one delta lease per worker at a time — and strictly over-reserve, never OOM). Classifier gaps to fix if built: (1) `admitWaiter` carries no class field; (2) `confine-reserve` requests carry no class (delegate_ram is set only on the whole-job scope admission) → add a `--class peak|delta` tag; extend `checkedAvailable` (2 prod callers admit.go:209,716 + ~6 test sites), the headroom-job counters (admit.go:207/213/428/557/714), and the #73 `--list` reserve summary to surface Σdelta.
+
+WHY DEFERRED: Slice 1 already delivered the big everyday false-block win; this is a modest tightening for a DAEMON-RESTART change — low ROI per architectural-simplicity. Revisit if field data shows the file-resident/marked over-charge is still causing blocks. relates: Slice 1 (master 9af4a67), AIRA-26, #67/#69/#74.
