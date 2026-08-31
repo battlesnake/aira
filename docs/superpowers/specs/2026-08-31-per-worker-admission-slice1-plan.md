@@ -1,150 +1,174 @@
-# Per-worker admission — Slice 1: per-test forward INCREMENTS (lean on memory.current) + saturation-wait UX
+# Per-worker admission — Slice 1: shrink the per-test forward-growth over-reservation
 
-**Status:** plan (pre-review)
+**Status:** plan v2 (post plan-review: Sol BLOCK + Fable FAIL folded, DeepSeek nits)
 **Branch:** `per-worker-admission-slice1`
-**Relates:** AIRA-24 (saturation UX, folded here), AIRA-17 (cold-start → Slice 2)
-**Author:** Opus, grounded on a 4-reader understand pass + owner design dialogue.
+**Relates:** AIRA-24 (saturation UX — safe subset folded), AIRA-17 (cold-start → Slice 2)
+**Author:** Opus, grounded on a 4-reader understand pass + the Sol/DeepSeek/Fable two-loop.
 
 ## 1. Problem
 
-`--delegate-ram` test runs get **blocked despite ample RAM**. The admission charge is
-`charge = max(memory.current − reclaimable, outstanding + adopted)` (`admit.go:743-760`)
-— a **max**, where `memory.current` is the honest real-time RSS (cache-discounted post
-AIRA-21) and `outstanding` is the summed *forecasts*: the 512MiB job overhead **plus one
-per-test reserve per active test**, each sized to the worker's **cumulative RSS + 512MiB
-growth** (`aira_xdist_governor/__init__.py:258-265`). Because each per-test reserve
-re-includes the whole worker RSS, `outstanding` climbs **above** the honest
-`memory.current`, the `max` picks the inflated forecast, and admission gates on
-reserve-contention while real RAM is free (the subpipe/altium report, and AIRA-24).
+`--delegate-ram` test runs get **blocked despite ample RAM**. Admission charges
+`charge = max(memory.current − reclaimable, outstanding + adopted)` (`admit.go:743-760`),
+where `memory.current − reclaimable` (reclaimable = `active_file + inactive_file`,
+`admit.go:1032-1056`) is the honest cache-discounted live RSS (call it `effectiveCurrent`),
+and `outstanding` is the summed *forecasts*: the 512MiB job overhead **plus one per-test
+reserve per active test**, each `max(estimate, RSS + growth_headroom)` with
+`growth_headroom = 512MiB` and an injected `AIRA_TEST_MEM_DEFAULT = 512MiB`
+(`__init__.py:18,258-265`, `env.go:30,92-97`).
 
-## 2. Root cause (precise)
+## 2. Root cause (precise, code-grounded)
 
-Each per-test reserve is `max(estimate, RSS + growth_headroom)`; for an unmarked test that
-is `RSS + 512MiB`. Summed over the ~N active tests (one per active worker),
-`outstanding ≈ Σ(RSS_i) + N·512MiB + 512MiB_job`. The `Σ(RSS_i)` term ≈ the slice's own
-`memory.current` (each worker's RSS, counted once), so the `max` does **not** double-count
-RSS — it resolves to `charge ≈ memory.current + N·512MiB`. **The false-block is the summed
-forward-growth headroom `N·512MiB`** — a fixed 512MiB of forward reservation per active
-worker, charged even when a test does not actually grow. At `-n16` that is ~8GiB of
-head-of-line reservation on top of the honest `memory.current`, which is what tips the
-`max` above real usage and gates a new job while RAM is free.
+For an unmarked test `RSS + 512MiB ≥ 512MiB` always, so the reserve is effectively
+`RSS + 512MiB`; one is held per worker-in-test across the test (`__init__.py:395,409-411`).
+Summed over ~N active workers:
+`outstanding ≈ Σ(RSS_i) + N·512MiB + 512MiB_job`. Because `charge` is a **max** (not a sum),
+the `Σ(RSS_i)` term does not double-count against `effectiveCurrent` — it resolves to
+`charge ≈ effectiveCurrent + N·512MiB`. **The dominant false-block term is the summed
+forward-growth headroom `N·512MiB`** (~8GiB at `-n16`): a fixed 512MiB of forward
+reservation per active worker, charged even when a test does not grow.
 
-So the target is: **reduce the summed forward-growth over-reservation while keeping the
-charge a sound forward bound**, with the per-scope `memory.max` + `oom.group` as the HARD
-OOM backstop (the reserve is a pacing heuristic — a scope that outgrows its cap is
-`oom.group`-killed, contained; the reserve exists to avoid gratuitously hitting that).
+**Two secondary terms (named for honesty; the fix removes only the dominant one):**
+(a) `Σ(RSS_i)` **exceeds** `effectiveCurrent` by roughly `Σ(file-resident_i)` (~0.5–2GiB at
+`-n16`): each worker's mapped file pages (shared libs, mmapped fixtures) are in its `statm`
+RSS once per process, but are discounted out of `effectiveCurrent` by AIRA-21's
+`active_file+inactive_file` subtraction. This over-charge **survives Model 1** and
+strengthens the Slice-2 case. (b) Reserves freeze acquisition-time RSS while `current`
+grows, and between-test workers hold nothing — both push the other way.
 
-## 3. Design — shrink the forward-growth over-reservation (the two candidate models)
+## 3. Design — Model 1: reduce the per-test forward padding (keep the `max` model)
 
-The plan-review must pick between two models; both keep AIRA-21's reclaimable discount and
-the per-scope cap/oom.group backstop untouched. My lean is **Model 1** for Slice 1
-(simple, sound, delivers the everyday win) with Model 2's structural change deferred to
-Slice 2 where it is coupled to the per-worker base.
+The reserve headroom is **best-effort forward padding above the honest current-floor**, not
+a hard forward bound. Shrink the padding so `outstanding` stops gratuitously exceeding
+`effectiveCurrent`, and let the `max`'s current-floor carry OOM-safety.
 
-### Model 1 (RECOMMENDED for Slice 1) — keep the `max` model, shrink/adapt the growth headroom
+### 3.1 Sizing change (`aira_xdist_governor/__init__.py`)
 
-Keep the reserve form `RSS + growth` (so `outstanding ≥ memory.current` and the existing
-`charge = max(current, outstanding)` stays a valid forward bound — no daemon change), but
-cut the per-test **growth headroom** from a flat 512MiB to a smaller default (proposed
-128MiB, `AIRA_TEST_MEM_GROWTH_HEADROOM`) and let a marked test still reserve its absolute
-`max(marker, RSS + growth)`. This shrinks the summed over-reservation ~4× (N·512→N·128)
-so far fewer runs false-block, while `outstanding ≥ current` keeps every test's forward
-growth reserved. Cost: a test that grows > headroom above its RSS may hit its per-scope
-cap (contained `oom.group` kill) more often — bounded and the accepted trade. Change is a
-one-constant tune + tests. **Sound by construction (outstanding never drops below current).**
+```
+rss    = worker current RSS (/proc/self/statm, as today)
+pad    = GROWTH_PAD           # AIRA_TEST_MEM_GROWTH_HEADROOM, default 512MiB → 128MiB
+marker = aira_mem(item)       # absolute peak, UNCHANGED semantics
+reserve = marker is not None ? max(marker, rss + pad) : rss + pad
+```
 
-### Model 2 (structural, Slice 2) — per-test forward INCREMENT + `current + Σincrement`
+- **Drop the flat 512MiB `AIRA_TEST_MEM_DEFAULT` floor for unmarked tests** — replace it
+  with `rss + pad`, so a low-RSS worker is no longer charged a flat 512MiB (the miss Sol/
+  Fable caught). Marked tests still reserve `max(marker, rss + pad)` so a known peak is
+  protected. Markers stay ABSOLUTE (no re-spec; that is Slice 2).
+- Summed forward padding drops from `N·512MiB` to `N·128MiB`; the low-RSS default floor is
+  gone. This is the everyday relief.
 
-Size the reserve as the *increment* `max(marker − RSS, floor)` (drop the `RSS +` term) so
-`outstanding` is only pending growth, AND change the daemon charge from
-`max(current, outstanding)` to a **sum** `current + outstanding` for the increment class,
-because with pure increments `outstanding` falls below `current` and the `max` would stop
-reserving pending growth (concurrent admit-then-grow could overshoot). This is the tight,
-elegant model — but it is a real daemon change that must NOT break **whole-job reserves**,
-which are peaks that correctly want `max(current, reserve)` (summing a whole-job peak with
-its own `current` double-books). So Model 2 needs the ledger to distinguish delta-class
-(delegate-ram per-test) from peak-class (whole-job) charges — genuinely more machinery,
-and it pairs naturally with the Slice-2 per-worker base (baseline held per worker,
-increment per test). **Deferred to Slice 2.**
+### 3.2 Why it is OOM-safe (the CORRECT rationale — current-floor, not a forward invariant)
+
+`charge = max(effectiveCurrent, outstanding + adopted)` (`admit.go:750-755`) **always
+charges at least `effectiveCurrent`** — the honest live cache-discounted RSS. So admission
+never grants while the slice's real usage is already within headroom of the cap, regardless
+of how small `outstanding` is. `outstanding ≥ current` is **NOT** an invariant (it fails on
+between-test workers, mid-test growth after acquisition, the xdist controller and
+test-spawned subprocesses that are in slice `current` but in no per-test reserve, and the
+AIRA-21 discount) — and the plan does **not** rely on it. The reserve headroom is only
+forward *padding* above that floor: cutting 512→128MiB raises a test's **unreserved
+concurrent-growth exposure** from `>512MiB` to `>128MiB` per test — a bounded pacing trade,
+not an OOM hole.
+
+**Honest containment note.** New exposure is **in-slice only**. Under-reserved concurrent
+growth can breach the slice `memory.max`; the kernel then OOM-kills inside the slice, and
+`oom.group` contains the kill to one scope — but for `@dr` jobs whose per-scope ceiling
+(48GiB, `confine.go:26`) exceeds the slice, the **binding** limit is the slice cap and the
+group-killed victim can be a **sibling** scope, not the overgrower. This is a small,
+bounded re-widening of #67's random-victim strictness — **already possible today** whenever
+a test grows >512MiB above its reserve; Model 1 widens the window from >512MiB to >128MiB.
+The per-scope `memory.max` + `oom.group` machinery is otherwise untouched (no scope-creation
+change), so there is **no host-OOM path**. Post-deploy we **monitor the per-scope
+oom.group kill rate** (DeepSeek); if it rises materially, raise `pad` or advance Slice 2.
 
 ### 3.3 Accepted limitation → Slice 2 (cold start)
 
-Neither model reserves a worker's **baseline** (imports) during a wide-`-n` **cold start**
-before it shows in `memory.current`; for narrow `-n` the 512MiB job overhead absorbs it,
-for wide `-n` it is a documented gap Slice 2 closes with the lazy per-worker base
-(= AIRA-17). Slice 1 (Model 1) does not regress today here — today's per-test reserves are
-also acquired only after a worker starts running.
+No per-test reserve covers a worker's **baseline** (imports) during a wide-`-n` cold start
+before it shows in `current`; the 512MiB job overhead absorbs narrow `-n`, wide `-n` is a
+documented gap Slice 2 closes with the lazy per-worker base (= AIRA-17). Slice 1 does not
+regress here (today's per-test reserves are also acquired only after a worker runs).
 
-## 4. Saturation-wait UX (AIRA-24, folded — focused subset)
+## 4. Saturation-wait UX (AIRA-24 — SAFE subset folded; racy parts deferred)
 
-When the slice is **genuinely** saturated a big reservation still cannot run; the friction
-is the blind 30-min wait then silent `E_ADMIT_SATURATED`. Slice 1 folds the high-value,
-low-risk parts:
+Fable confirmed the daemon already honours a per-request `max_wait_ms` (`admit.go:896-904,
+468-489`) with no daemon change. Slice 1 folds only the parts that are sound client-side:
 
-1. **Configurable faster-fail** — a `--admit-timeout <dur>` flag on `aira confine`
-   (and `--no-wait` = timeout 0 → immediate `E_ADMIT_SATURATED` if it cannot admit now),
-   threading into the existing `maxWait` (`admission_linux.go:82,251-261`) which is a
-   fixed 30-min cap today. Default unchanged (30 min) so existing behaviour is preserved.
-2. **Waiter visibility** — extend the existing client periodic line (#71:
-   "waiting for memory admission (reserve X, waited Ns)") to include the slice's granted
-   reserve / ceiling (the daemon already computes this for `--list`, #73), so the operator
-   sees *why* it waits (reserve-contended vs genuinely full).
-3. **Clearer terminal reject** — the client already exits 1 with `reject:saturated`; make
-   the final message explicit ("admission rejected after Ns: slice reserve X/Y across N
-   jobs — genuinely saturated") so a reject is not mistaken for "still running".
+1. **Configurable shorter faster-fail** — `--admit-timeout <dur>` on `aira confine`
+   threads into the client's `admissionMaxWait` (`admission_linux.go:341`,
+   `runnerAdmitWaitCap` cap unchanged). It must be a **positive** duration; the default is
+   unchanged (30 min). **NOT** a zero/`--no-wait`: `confine_linux.go:803-805` coerces
+   `maxWait ≤ 0` to 30 min (the inverse of "reject now"), and a literal 0 races the
+   enqueue-kick evaluator against an immediately-firing deadline (`admit.go:468-489` vs
+   `queue.signal()` :573) → a job that could admit now would flakily reject. **Zero-wait
+   `--no-wait` is DEFERRED** to AIRA-24 proper, where it needs an explicit NoWait flag +
+   an evaluate-before-reject protocol change, not a client timeout.
+2. **Clearer terminal reject** — on `reject:saturated`, print an explicit line ("admission
+   rejected after Ns — slice genuinely saturated") so a reject is not mistaken for "still
+   running".
+3. **Waiter visibility** — extend the existing client periodic waiting line
+   (`confine_linux.go:489-505`, printed by a client goroutine while the admit socket
+   blocks) to include the slice granted-reserve/ceiling via a **second** daemon connection
+   per tick (the #73 `--list` reserve query) — do NOT multiplex the blocked admit socket.
+   Note: it explains reserve-contention, not the `effectiveCurrent` half of the `max`.
 
-Deferred (Slice 2 / later): a precise queue-position/ETA and an admitted-with-backpressure
-mode — heavier, not needed for the immediate relief.
+Deferred: precise queue-position/ETA, admitted-with-backpressure, and daemon-side
+`--no-wait` (AIRA-24 proper). On the **flock fallback** path (daemon down) a short/zero wait
+yields state `timeout` and the job **launches without a lock** (`admission_linux.go:211-214`
+→ `confine_linux.go:526-527`): document that `--admit-timeout`'s hard behaviour is
+daemon-path only; the fallback keeps today's advisory launch.
 
-## 5. Scope boundaries — what stays unchanged
+## 5. Scope boundaries — unchanged
 
-- The daemon ledger accounting (`outstanding`/`adopted`, `checkedAvailable`,
-  `evaluateAdmitQueue`) is **untouched** — only the *values* the plugin reserves change.
-- The 512MiB per-job `DefaultDelegateRAMOverhead` stays (coarse cold-start buffer +
-  controller overhead) until Slice 2 reconsiders it.
-- The governor (park/activate, RAM-ordering, AIRA-21 `admitAvailable` read) is untouched.
-- Non-delegate whole-job reserves are untouched.
-- No per-worker base, no governor charging, no marker re-spec (all Slice 2).
+Daemon ledger accounting (`outstanding`/`adopted`, `checkedAvailable`, `evaluateAdmitQueue`)
+is untouched — only the plugin's reserve *values* and the client `--admit-timeout`/reject
+strings change. The 512MiB job overhead, the governor, AIRA-21's discount, non-delegate
+whole-job reserves, and all per-scope cap/oom.group machinery are untouched. No per-worker
+base, no daemon charge change, no marker re-spec, no class-split ledger (all Slice 2).
 
-## 6. Tests
+## 6. Tests (true properties — NOT the false invariant)
 
-1. **Reduced growth-headroom sizing** (pylib, Model 1): an unmarked test reserves
-   `RSS + growth` with the NEW smaller `growth` (128MiB), and a marked test reserves
-   `max(marker, RSS + growth)`; a discriminating real-pytest test (like the existing
-   `TestRealPytestRAMReservationUsesMeasuredRSS`, `internal/pylib`) pins the new headroom
-   and proves `outstanding ≥ memory.current` still holds.
-2. **Reduced false-block admission** (daemon): with several active reduced-headroom grants
-   + an honest `memory.current`, a new small job admits where the OLD 512MiB-headroom
-   grants would have gated it — a discriminating test through `evaluateAdmitQueue` proving
-   the summed forward reservation no longer falsely saturates.
-3. **Forward-bound preserved** (daemon/unit): `outstanding ≥ memory.current` still holds
-   under Model 1, so every active test's growth stays reserved (no concurrent-overshoot
-   regression); the per-scope cap/oom.group remains the hard backstop.
-4. **Faster-fail** (`--no-wait` / `--admit-timeout`): a job that cannot admit now rejects
-   immediately with `E_ADMIT_SATURATED` under `--no-wait`; default (no flag) still waits.
-5. **Reject/visibility strings** — the waiting line carries reserve/ceiling; the terminal
-   reject states saturation explicitly.
+1. **Reduced sizing** (pylib real-pytest, like `TestRealPytestRAMReservationUsesMeasuredRSS`):
+   an unmarked test reserves `rss + 128MiB` (the 512MiB default no longer wins for low RSS);
+   a marked test reserves `max(marker, rss + 128MiB)`. Pin the new pad and the dropped
+   default; compare against the OLD `rss + 512MiB` to prove the reduction.
+2. **Reduced false-block** (daemon): with several active reduced-pad grants and an honest
+   `effectiveCurrent`, a new small job admits where the OLD 512MiB-pad grants would gate it
+   — a discriminating `evaluateAdmitQueue` test proving the summed padding no longer falsely
+   saturates. (This does not assert `outstanding ≥ current`.)
+3. **Current-floor preserved** (daemon/unit — the TRUE safety property, replacing the porous
+   invariant test): `checkedAvailable` never returns headroom that would admit while
+   `effectiveCurrent` is already within `headroom` of `maximum`; i.e. `charge ≥
+   effectiveCurrent` for any `outstanding`, including `outstanding < effectiveCurrent`.
+4. **`--admit-timeout`** (positive): a job that cannot admit within a short positive timeout
+   rejects with `E_ADMIT_SATURATED` on the daemon path; the default (no flag) still waits
+   30 min; a `≤ 0` value is rejected at the CLI (not coerced to 30 min). Fallback-path note
+   asserted separately (advisory launch, no hard reject).
+5. **Reject / visibility strings** — terminal reject states saturation; the waiting line
+   carries reserve/ceiling from the second connection.
 6. Full daemon + runner + pylib suites green under `aira confine`, `-race` clean.
 
 ## 7. Expected yield
 
-Steady-state `--delegate-ram` runs stop false-blocking on reserve-contention when real RAM
-is ample (the everyday win). Genuinely-saturated runs get a faster, legible reject. No new
-host-OOM exposure. Wide-`-n` cold start unchanged (Slice 2).
+Steady-state `--delegate-ram` runs stop false-blocking on the summed `N·512MiB` forward
+padding when real RAM is ample (the everyday win), and low-RSS workers stop paying the flat
+512MiB default. Genuinely-saturated runs get a configurable faster-fail + a legible reject.
+No host-OOM exposure; a bounded, monitored increase in contained per-scope kills. The
+`Σ(file-resident)` secondary over-charge and cold-start remain for Slice 2.
 
 ## 8. Rollout
 
-Plugin change is `go:embed`ded → a binary rebuild + swap + `aira skill install` ships it;
-the CLI flags + the AIRA-24 waiter/reject strings are client-side; the `--admit-timeout`
-wiring is client-side (the daemon already honours the client's `max_wait_ms`). **No daemon
-restart is required for the sizing change** (it is entirely client/plugin side) — confirm
-in review whether any daemon-side change (none planned) sneaks in. Deploy watched.
+The plugin is `go:embed`ded → a binary rebuild + swap + `aira skill install` ships the
+sizing change; `--admit-timeout` + reject/visibility strings are client-side. **No daemon
+restart is required** (confirmed: no daemon-side change). Deploy watched; monitor the
+oom.group kill rate.
 
 ## 9. Slice 2 (outline, not built here)
 
-Lazy **per-worker base** (~256MiB, `AIRA_DELEGATE_RAM_WORKER_BASE`) charged as each xdist
-worker registers with the governor (keyed by `jobID == scope id`), released on worker
-teardown — a NEW governor-side ledger charge (the governor is read-only today). Covers the
-cold-start baseline (AIRA-17). Requires deciding: fold/shrink the 512MiB per-job overhead,
-the base-vs-increment interaction (base = baseline held per worker; increment = growth per
-test, already Slice 1), and marker reconciliation. Specced separately after Slice 1 soaks.
+Model 2 (per-test **increment** `max(marker−RSS, floor)` + a **class-split** ledger charging
+delegate-ram delta-class as `current + Σincrement` while whole-job peak-class keeps
+`max(current, reserve)` — Fable verified summing the same sliceQueue would double-book
+peaks) **coupled** with the lazy **per-worker base** (~256MiB, charged as each worker
+registers with the governor, keyed by scope id → covers cold-start = AIRA-17) and the
+`Σ(file-resident)` shared-page handling. DeepSeek's **shared/capped growth pool**
+(`current + overhead + min(N,k)·pad`) is a candidate here to cap the N-scaling entirely.
+Plus daemon-side `--no-wait` (AIRA-24 proper). Specced separately after Slice 1 soaks.
