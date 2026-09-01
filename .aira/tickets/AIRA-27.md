@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-27","project":"aira","title":"Admission reserves but doesn't ENFORCE → slice over-commit OOMs well-behaved confined neighbours (flat oom_score_adj=500)","status":"done","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","dogfood","oom","shared-slice"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-27","project":"aira","title":"Admission reserves but doesn't ENFORCE → slice over-commit OOMs well-behaved confined neighbours (flat oom_score_adj=500)","status":"done","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","dogfood","oom","shared-slice"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-28","to":"AIRA-27"}]}
 ---
 Reported convergently by two dogfooding sessions 2026-09-01 (subpipe/altium inc-4b + money), confirmed by slice telemetry.
 
