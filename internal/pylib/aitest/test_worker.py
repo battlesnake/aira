@@ -1,7 +1,9 @@
+import io
 import os
 import time
 
 from aitest.worker import fork_worker, place_self
+from aitest.worker import run_one, run_worker_loop
 
 
 def test_place_self_writes_pid_to_cgroup_procs(tmp_path):
@@ -72,3 +74,70 @@ def test_fork_worker_exits_child_without_propagating_when_place_self_fails(tmp_p
     _, status = os.waitpid(pid, 0)
     assert os.WIFEXITED(status), "child did not exit cleanly: status=%r" % status
     assert os.WEXITSTATUS(status) == 70
+
+
+def test_run_one_reports_passed_and_failed_outcomes(pytester):
+    items = pytester.getitems("""
+        def test_passes():
+            assert True
+
+        def test_fails():
+            assert False
+    """)
+    by_name = {item.name: item for item in items}
+    assert run_one(by_name["test_passes"]) == "passed"
+    assert run_one(by_name["test_fails"]) == "failed"
+
+
+def test_run_one_reports_skipped_outcome_distinctly(pytester):
+    """A skip is pytest's own well-defined, intentional outcome -- it must
+    never be folded into "error"/"unevaluated" downstream (Task 15's
+    crash/retry aggregation, Task 17's e2e assertions)."""
+    items = pytester.getitems("""
+        import pytest
+
+        def test_skipped():
+            pytest.skip("not applicable")
+    """)
+    assert run_one(items[0]) == "skipped"
+
+
+def test_run_one_tears_down_and_rebuilds_session_scoped_fixtures_per_test(pytester):
+    """Proves the accepted nextitem=None limitation documented above: with
+    plain pytest, a module-scoped fixture shared by two tests sets up ONCE;
+    here it is torn down and rebuilt after EVERY item, so the counter below
+    reaches 2, not 1."""
+    items = pytester.getitems("""
+        import pytest
+
+        _counter = {"value": 0}
+
+        @pytest.fixture(scope="module")
+        def counting_fixture():
+            _counter["value"] += 1
+            yield _counter["value"]
+
+        def test_first(counting_fixture):
+            pass
+
+        def test_second(counting_fixture):
+            pass
+    """)
+    assert len(items) == 2
+    for item in items:
+        assert run_one(item) == "passed"
+    assert items[0].module._counter["value"] == 2
+
+
+def test_run_worker_loop_dispatch_and_result_round_trip(pytester):
+    items = pytester.getitems("""
+        def test_ok():
+            assert True
+    """)
+    items_by_nodeid = {item.nodeid: item for item in items}
+    nodeid = next(iter(items_by_nodeid))
+    pipe_in = io.StringIO(nodeid + "\n__stop__\n")
+    pipe_out = io.StringIO()
+    run_worker_loop(None, items_by_nodeid, pipe_in, pipe_out)
+    pipe_out.seek(0)
+    assert pipe_out.read().splitlines() == ["%s passed" % nodeid]

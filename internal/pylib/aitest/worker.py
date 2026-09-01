@@ -53,3 +53,78 @@ def place_self(scope_path):
     clone-into-cgroup."""
     with open(os.path.join(scope_path, "cgroup.procs"), "w") as handle:
         handle.write(str(os.getpid()))
+
+
+class _OutcomeCollector:
+    """Captures the worst-of outcome across setup/call/teardown reports for
+    one pytest_runtest_protocol call. Registered on item.config.pluginmanager
+    only for the duration of that one call -- see run_one."""
+
+    _RANK = {"passed": 0, "skipped": 1, "failed": 2}
+
+    def __init__(self):
+        self.worst = "passed"
+
+    def pytest_runtest_logreport(self, report):
+        outcome = report.outcome if report.outcome in self._RANK else "failed"
+        if self._RANK[outcome] > self._RANK.get(self.worst, 0):
+            self.worst = outcome
+
+
+def run_one(item):
+    """Executes one already-collected pytest Item through pytest's own item
+    protocol (setup/call/teardown), returning "passed", "failed", "skipped",
+    or "error".
+
+    UNCERTAIN, flagged for verification during implementation: calling
+    item.ihook.pytest_runtest_protocol(item=item, nextitem=None) directly,
+    outside pytest's own Session.main() loop, is not a path this plugin has
+    exercised against a real pytest version yet. It is pytest's own
+    documented per-item hook (the same one xdist's worker calls per design
+    spec 3.2) and SHOULD behave identically to normal collection -- but the
+    exact hookimpl/pluginmanager registration dance below needs a real-pytest
+    verification pass before it is trusted, not a guess presented as
+    certain.
+
+    ACCEPTED SLICE 1 LIMITATION: nextitem=None is pytest's own signal that
+    this is the LAST item in the session, so it tears down and rebuilds the
+    ENTIRE fixture stack -- including session/module/class-scoped fixtures
+    -- after every single test, unlike plain pytest or xdist (which look
+    ahead to supply the real next item so a fixture shared across tests
+    persists). A suite relying on expensive or stateful session-scoped
+    fixtures will see them re-run per test in Slice 1. Real look-ahead
+    dispatch is deferred, a candidate for a later slice (see this task's own
+    Interfaces note and the test proving this behavior below).
+    """
+    collector = _OutcomeCollector()
+    plugin_manager = item.config.pluginmanager
+    plugin_manager.register(collector, name="aitest-outcome-collector")
+    try:
+        item.ihook.pytest_runtest_protocol(item=item, nextitem=None)
+    finally:
+        plugin_manager.unregister(collector)
+    if collector.worst == "passed":
+        return "passed"
+    if collector.worst == "skipped":
+        return "skipped"
+    if collector.worst == "failed":
+        return "failed"
+    return "error"
+
+
+def run_worker_loop(scope_path, items_by_nodeid, pipe_in, pipe_out):
+    """Child-side loop: read one nodeid per line from pipe_in, run it via
+    run_one, write "<nodeid> <outcome>" back to pipe_out per completed test.
+    An empty line means no work right now -- read again. The line
+    "__stop__" ends the loop cleanly. scope_path is unused until Task 14's
+    recycle checks; kept as a parameter now for API stability."""
+    for line in pipe_in:
+        nodeid = line.rstrip("\n")
+        if nodeid == "":
+            continue
+        if nodeid == "__stop__":
+            break
+        item = items_by_nodeid[nodeid]
+        outcome = run_one(item)
+        pipe_out.write("%s %s\n" % (nodeid, outcome))
+        pipe_out.flush()
