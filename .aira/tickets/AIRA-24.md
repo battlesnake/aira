@@ -11,3 +11,5 @@ This is GENUINE reserve over-subscription (the slice was really full of sibling-
 4. Consider an admitted-with-backpressure mode (admit but throttle) as an alternative to head-of-line blocking for big reservations — heavier design, lower priority.
 
 relates: #71 (admission hang diagnostic), #73 (--list reserve summary), #67 (reserve ledger), AIRA-4 (backfill). Owner-facing UX polish; not a correctness bug.
+
+**CORRECTION (2026-09-01):** the reported reserve was NOT 512M. `--memory-max 32G` UP-CHARGES the admission reserve to 32G (`main.go:796-798`; `--memory-reserve 512M` is discarded) — so the job waited for a **32G** reserve, and a 30-min wait then reject for 32G under genuine saturation is EXPECTED, not anomalous. The UX asks above (visibility / faster-fail / clearer reject) all still stand — they're about the wait experience regardless of reserve size. See AIRA-27's correction for the up-charge semantics.
