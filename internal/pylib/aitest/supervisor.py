@@ -590,9 +590,21 @@ class Supervisor:
         # trying to remove -- it only ever succeeds AFTER this process
         # exits, which is after this call returns. Attempted anyway because
         # it is free and occasionally correct (e.g. non-real-cgroup test
-        # doubles); #72's existing orphaned-scope reaper is the real
-        # backstop that cleans this up machine-wide once the process is
-        # actually gone.
+        # doubles).
+        #
+        # CORRECTION (found after this was first written, do not trust the
+        # original claim below if you see it elsewhere): #72's existing
+        # orphaned-scope reaper does a SINGLE-LEVEL rmdir and is NOT
+        # currently a working backstop for this nested case -- a crashed
+        # supervisor/worker (spec 3.6's normal, expected death-by-OOM path,
+        # where NOTHING here runs) leaves the outer scope permanently
+        # un-reapable, since the kernel refuses to remove a cgroup with
+        # live children and the reaper has no recursive-descent logic.
+        # Real, unbounded orphan accumulation confirmed live on this exact
+        # host. Tracked as its own fix (recursive/subtree-aware reaper,
+        # confine-layer, not an aitest change) -- see AIRA-30's related
+        # tickets for the current status before assuming this comment is
+        # stale.
         if self.supervisor_scope:
             try:
                 os.rmdir(self.supervisor_scope)
