@@ -578,6 +578,18 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		s.governorConnection(conn, request.Request.Args)
 		return
 	}
+	if verb == "worker-admit" {
+		if s.OnRequest != nil {
+			s.OnRequest(request.Scope, request.Request)
+		}
+		// workerAdmitConnection owns its only frame and the lease-release
+		// path, exactly like admit/governor above — never let the generic
+		// dispatcher touch this connection again.
+		wrote = true
+		_ = conn.SetReadDeadline(time.Time{})
+		s.workerAdmitConnection(conn, request.Request.Args)
+		return
+	}
 	if scope.ProjectID != "" {
 		release, err := s.beginProjectUse(scope.ProjectID)
 		if err != nil {
