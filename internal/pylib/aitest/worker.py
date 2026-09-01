@@ -1,4 +1,42 @@
 import os
+import time
+
+
+_DEFAULT_MAX_SECONDS = 600
+_DEFAULT_MAX_TESTS = 200
+_DEFAULT_HIGH_WATERMARK_PCT = 80
+
+
+def _read_cgroup_int(scope_path, filename):
+    with open(os.path.join(scope_path, filename), encoding="ascii") as handle:
+        raw = handle.read().strip()
+    if raw == "max":
+        return None
+    return int(raw)
+
+
+def _should_recycle(scope_path, started_at, completed_count):
+    max_seconds = int(os.environ.get("AIRA_AITEST_WORKER_MAX_SECONDS", str(_DEFAULT_MAX_SECONDS)))
+    if time.monotonic() - started_at > max_seconds:
+        return True
+    max_tests = int(os.environ.get("AIRA_AITEST_WORKER_MAX_TESTS", str(_DEFAULT_MAX_TESTS)))
+    # >= , not >: with AIRA_AITEST_WORKER_MAX_TESTS=1 and exactly one
+    # completed test, 1 > 1 is false and recycle would never fire at all.
+    if completed_count >= max_tests:
+        return True
+    if scope_path is None:
+        # Daemon-down fallback mode (Task 16): no granted cgroup scope to
+        # watermark-check; time/count bounds above still apply.
+        return False
+    watermark_pct = float(os.environ.get("AIRA_AITEST_WORKER_HIGH_WATERMARK_PCT", str(_DEFAULT_HIGH_WATERMARK_PCT)))
+    try:
+        current = _read_cgroup_int(scope_path, "memory.current")
+        high = _read_cgroup_int(scope_path, "memory.high")
+    except (OSError, ValueError):
+        return False
+    if current is None or high is None or high <= 0:
+        return False
+    return (current * 100.0 / high) > watermark_pct
 
 
 def fork_worker(scope_path):
@@ -113,11 +151,8 @@ def run_one(item):
 
 
 def run_worker_loop(scope_path, items_by_nodeid, pipe_in, pipe_out):
-    """Child-side loop: read one nodeid per line from pipe_in, run it via
-    run_one, write "<nodeid> <outcome>" back to pipe_out per completed test.
-    An empty line means no work right now -- read again. The line
-    "__stop__" ends the loop cleanly. scope_path is unused until Task 14's
-    recycle checks; kept as a parameter now for API stability."""
+    started_at = time.monotonic()
+    completed_count = 0
     for line in pipe_in:
         nodeid = line.rstrip("\n")
         if nodeid == "":
@@ -126,5 +161,10 @@ def run_worker_loop(scope_path, items_by_nodeid, pipe_in, pipe_out):
             break
         item = items_by_nodeid[nodeid]
         outcome = run_one(item)
+        completed_count += 1
         pipe_out.write("%s %s\n" % (nodeid, outcome))
         pipe_out.flush()
+        if _should_recycle(scope_path, started_at, completed_count):
+            pipe_out.write("__recycle__\n")
+            pipe_out.flush()
+            return

@@ -7,6 +7,10 @@ import time
 from aitest.worker import fork_worker, run_worker_loop
 
 
+_STOP_LINE = "__stop__"
+_RECYCLE_LINE = "__recycle__"
+
+
 class WorkerAdmitUnavailable(Exception):
     """The daemon is genuinely unreachable at the connection level: a dial
     failure, the worker-admit CLI itself could not even be launched, or its
@@ -356,7 +360,85 @@ class Supervisor:
             pass
         state["admit_process"].stdin.close()
         state["admit_process"].wait(timeout=5)
+        grant = state.get("grant")
+        if grant is not None:
+            # Best-effort: this is the NEW per-worker child scope aitest
+            # itself created (CreateWorkerScope, Task 7) -- not the outer
+            # confine scope, which is `aira confine`'s own job to tear down
+            # when the whole launch exits. The worker process was just
+            # waited on above, so (unlike the supervisor's own scope,
+            # which the process calling rmdir is itself still inside of)
+            # this one's cgroup should now be empty and actually
+            # removable. Log and continue on failure rather than let a
+            # cleanup race crash the supervisor -- an orphaned empty scope
+            # directory is a cosmetic leak, not a correctness problem, and
+            # #72's existing orphan-scope reaper already sweeps these up
+            # machine-wide as a backstop.
+            try:
+                os.rmdir(grant["scope"])
+            except OSError as exc:
+                sys.stderr.write("aira aitest: could not remove worker scope %s: %s\n" % (grant["scope"], exc))
         del self.workers[pid]
+
+    def _replace_worker(self):
+        """Acquire a fresh worker if queue work remains -- shared by the
+        recycle (this task) and crash/retry (Task 15) paths."""
+        if not self.queue:
+            return
+        self.spawn_worker(self._run_estimated_bytes, max_wait=self._run_max_wait)
+
+    def _drain_worker(self, pid, state):
+        """Handles every line CURRENTLY AVAILABLE for this worker's result
+        pipe in one pass via _drain_available_lines (module-level, defined
+        alongside WorkerPlacementFailed), not just the first. A
+        completed-test result line and an immediately-following
+        __recycle__ sentinel can both already be available by the time
+        select() wakes the caller (the worker writes the result line,
+        flushes, then -- if recycling -- writes __recycle__ and flushes
+        again, in rapid succession with no intervening syscall that would
+        let the parent's select() wake in between). Reading only the FIRST
+        line per wakeup and letting _dispatch_to_idle_workers run before a
+        pending recycle is checked is exactly the race this drains: it
+        would hand a fresh nodeid to a worker that is already retiring,
+        silently losing that dispatch (and, once Task 15's crash detection
+        exists, wrongly reclassifying the loss as a crash and burning that
+        nodeid's one genuine retry on a fictitious one). Must run to
+        completion for a ready worker BEFORE _dispatch_to_idle_workers is
+        called for this select() wakeup. See _drain_available_lines's own
+        docstring for why this reads a raw fd directly rather than
+        select()-checking a buffered file object.
+
+        EOF (no lines at all, and _drain_available_lines set
+        state["result_eof"]) means the worker's result pipe closed without
+        a terminating record for its in-flight nodeid -- a crash (kernel
+        OOM, host watchdog, any non-reporting exit). Task 15 defines
+        _handle_worker_exit; until Task 15 lands, that call is a no-op
+        placeholder (see Task 15's own Step 1)."""
+        lines = _drain_available_lines(state["result_fd"], state)
+        if not lines:
+            if state.get("result_eof"):
+                self._handle_worker_exit(pid, state)
+            return
+        for line in lines:
+            if line == _RECYCLE_LINE:
+                self._retire_worker(pid, state)
+                self._replace_worker()
+                return
+            nodeid, _, outcome = line.partition(" ")
+            self.results[nodeid] = outcome
+            state["in_flight"] = None
+
+    def _handle_worker_exit(self, pid, state):
+        """Minimal stub so _drain_worker's EOF branch above has something
+        safe to call in this task -- just retires and tries to keep the
+        queue moving, with NO requeue/unevaluated bookkeeping yet. Task 15
+        replaces this with the real requeue-once-then-unevaluated version;
+        this task's own tests never intentionally crash a worker, so this
+        stub is never exercised by Task 14's test suite, only present so a
+        genuinely unexpected crash during this task's tests fails loudly
+        and comprehensibly rather than with an AttributeError."""
+        self._retire_worker(pid, state)
+        self._replace_worker()
 
     def run(self, estimated_bytes, worker_count=1, max_wait="30s"):
         """Slice 1's whole dispatch loop: spawn up to worker_count workers,
@@ -388,15 +470,11 @@ class Supervisor:
                 pid = fd_to_pid[fd]
                 if pid not in self.workers:
                     continue
-                state = self.workers[pid]
-                for line in _drain_available_lines(fd, state):
-                    nodeid, _, outcome = line.partition(" ")
-                    self.results[nodeid] = outcome
-                    state["in_flight"] = None
+                self._drain_worker(pid, self.workers[pid])
             self._dispatch_to_idle_workers()
             if not self.queue and all(state["in_flight"] is None for state in self.workers.values()):
                 for pid, state in list(self.workers.items()):
-                    state["dispatch_write"].write("__stop__\n")
+                    state["dispatch_write"].write(_STOP_LINE + "\n")
                     state["dispatch_write"].flush()
                     self._retire_worker(pid, state)
         # Best-effort: rmdir the supervisor's OWN child scope this run

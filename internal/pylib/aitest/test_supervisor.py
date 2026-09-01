@@ -1,4 +1,5 @@
 import os
+import time
 
 from aitest.supervisor import Supervisor, WorkerAdmitDenied, WorkerAdmitUnavailable
 
@@ -154,3 +155,107 @@ def test_next_nodeid_and_requeue_once_semantics():
     assert again == first
     assert supervisor.attempts[first] == 2
     assert supervisor.requeue_once(first) is False
+
+
+def test_recycle_after_max_tests_respawns_a_fresh_worker(tmp_path, monkeypatch, pytester):
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+import sys
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+sys.exit(0)
+""")
+    admit_calls = tmp_path / "admit-calls"
+    admit = _write_stub(tmp_path / "worker-admit", f"""
+import os, sys
+open({str(admit_calls)!r}, "a").write("x")
+scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+os.makedirs(scope, exist_ok=True)
+print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", "1")
+
+    items = pytester.getitems("""
+        def test_one():
+            assert True
+
+        def test_two():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+
+    assert len(results) == 2
+    assert all(outcome == "passed" for outcome in results.values())
+    # One worker per test proves exactly one recycle event fired between them.
+    assert admit_calls.read_text().count("x") == 2
+
+
+def test_recycle_with_two_concurrent_workers_does_not_hang_on_retirement(tmp_path, monkeypatch, pytester):
+    """A forked child inherits DUPLICATES of every already-open fd in the
+    parent's fd table (fork() copies the whole table; there is no exec()
+    here for CLOEXEC to ever fire) -- without closing every OTHER
+    already-known worker's fds before entering its own loop, a
+    later-forked worker (here, worker 2) keeps a live copy of an EARLIER
+    worker's (worker 1's) admit-lease pipe write end. When the supervisor
+    then closes ITS OWN copy of worker 1's admit_process.stdin to retire it
+    (recycle, at AIRA_AITEST_WORKER_MAX_TESTS=1), the daemon-side stub's
+    stdin-read never sees EOF unless worker 2 ALSO closed its inherited
+    duplicate -- admit_process.wait(timeout=5) would then hang/raise. This
+    test needs TWO concurrent workers specifically to make that
+    fd-inheritance bug observable: Task 13's own test and this file's other
+    recycle test above both use worker_count=1, which cannot exercise it at
+    all (worker_count=1's startup loop never has two workers registered in
+    self.workers at the same time)."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+import sys
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+sys.exit(0)
+""")
+    admit_calls = tmp_path / "admit-calls-2"
+    admit = _write_stub(tmp_path / "worker-admit-2", f"""
+import os, sys
+open({str(admit_calls)!r}, "a").write("x")
+scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+os.makedirs(scope, exist_ok=True)
+print("granted scope=%s worker_id=%d memory_max=104857600 memory_high=83886080" % (scope, os.getpid()))
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", "1")
+
+    items = pytester.getitems("""
+        def test_one():
+            assert True
+
+        def test_two():
+            assert True
+
+        def test_three():
+            assert True
+
+        def test_four():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+
+    started = time.monotonic()
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=2)
+    elapsed = time.monotonic() - started
+
+    assert len(results) == 4
+    assert all(outcome == "passed" for outcome in results.values())
+    # A hang on the fd-inheritance bug would show up as admit_process.wait's
+    # own 5-second timeout firing at least once across the four
+    # retirements; a healthy run completes in a small fraction of that.
+    assert elapsed < 4.0, "run() took %.1fs -- looks like a retirement hang (fd-inheritance bug)" % elapsed
