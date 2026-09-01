@@ -294,6 +294,45 @@ sys.stdin.buffer.read()
     assert supervisor.attempts[nodeid] == 2
 
 
+def test_drain_worker_handles_eof_arriving_with_final_result_in_one_pass():
+    """Regression test for a real bug build-review found: a worker that
+    flushes its LAST result and then crashes immediately afterward (spec
+    3.4 calls an OOM-between-tests exactly this: "a normal, expected
+    event") can deliver that result line AND EOF together in a single
+    _drain_available_lines call. The original code only ran crash
+    handling when NO lines were read at all, so this case fell through:
+    the result got recorded correctly, in_flight was cleared (the worker
+    now looks idle), and the very next dispatch into its dead pipe would
+    raise an unguarded BrokenPipeError, crashing the whole run and losing
+    every remaining result -- on an event class the spec explicitly
+    requires this loop to tolerate. Exercises _drain_worker directly
+    (not through a real fork) so the EOF-with-trailing-result timing is
+    deterministic rather than racy."""
+    result_read, result_write = os.pipe()
+    os.write(result_write, b"pkg/test_mod.py::test_x passed\n")
+    os.close(result_write)  # EOF immediately after the final result.
+    os.set_blocking(result_read, False)
+    dispatch_read, dispatch_write = os.pipe()
+
+    supervisor = Supervisor()
+    pid = 999999  # Not a real child -- os.waitpid raises ChildProcessError,
+    # which _retire_worker already catches; no real subprocess is needed
+    # to exercise this parsing/bookkeeping path in isolation.
+    state = {
+        "result_fd": result_read, "read_buffer": b"", "result_eof": False,
+        "in_flight": "pkg/test_mod.py::test_x",
+        "dispatch_write": os.fdopen(dispatch_write, "w"),
+        "admit_process": None, "grant": None,
+    }
+    supervisor.workers[pid] = state
+
+    supervisor._drain_worker(pid, state)
+
+    assert supervisor.results == {"pkg/test_mod.py::test_x": "passed"}
+    assert pid not in supervisor.workers, "worker must be retired, not left registered as idle"
+    os.close(dispatch_read)
+
+
 def test_daemon_down_fallback_completes_suite_with_one_warning_no_admit_subprocess(tmp_path, monkeypatch, pytester, capsys):
     monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", str(tmp_path / "missing-bootstrap"))
     monkeypatch.setenv("AIRA_AITEST_MAX_WORKERS_FALLBACK", "2")
@@ -374,6 +413,97 @@ sys.stdin.buffer.read()
     # unrelated to whether admission fell back to unconfined workers.
     stderr = capsys.readouterr().err
     assert "falling back to" not in stderr and "UNCONFINED" not in stderr, stderr
+
+
+def test_persistent_denial_never_disables_daemon_or_falls_back(tmp_path, monkeypatch, pytester):
+    """Regression test for a real bug build-review found LIVE (reproduced
+    end to end: a persistently `denied` -- never `unavailable` -- daemon
+    still ran the rest of the suite unconfined): run()'s startup-retry
+    loop must keep polling a plain WorkerAdmitDenied INDEFINITELY, never
+    give up and call _disable_daemon on exhaustion. Denies the first 8
+    attempts (well past the old bounded-retry count of 5) before
+    granting, proving the retry is genuinely unbounded, not just given a
+    slightly bigger budget."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+import sys
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+sys.exit(0)
+""")
+    denial_state = tmp_path / "denials-remaining"
+    denial_state.write_text("8")
+    admit = _write_stub(tmp_path / "worker-admit", f"""
+import os, sys
+state_path = {str(denial_state)!r}
+remaining = int(open(state_path).read())
+if remaining > 0:
+    open(state_path, "w").write(str(remaining - 1))
+    sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit denied: fallback:insufficient-headroom\\n")
+    sys.exit(1)
+scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+os.makedirs(scope, exist_ok=True)
+print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    monkeypatch.setattr("aitest.supervisor._STARTUP_DENIAL_RETRY_SECONDS", 0.01)
+
+    items = pytester.getitems("""
+        def test_one():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+
+    assert len(results) == 1
+    assert all(outcome == "passed" for outcome in results.values())
+    assert supervisor.daemon_available is True
+
+
+def test_dispatch_handles_parametrized_nodeid_containing_a_space(tmp_path, monkeypatch, pytester):
+    """Regression test for a real bug build-review found via live repro
+    against real pytest (both review lineages independently, same root
+    cause): a parametrized nodeid like test_p[a b] legitimately contains a
+    space. _drain_worker's result-line parsing used to split on the FIRST
+    space (str.partition), truncating the nodeid and losing the real
+    result under a wrong key -- a genuinely passing test was reported
+    unevaluated. Fixed by splitting on the LAST space (rpartition)
+    instead, since outcome never contains one."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+import sys
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+sys.exit(0)
+""")
+    admit = _write_stub(tmp_path / "worker-admit", f"""
+import os, sys
+scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+os.makedirs(scope, exist_ok=True)
+print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+
+    items = pytester.getitems("""
+        import pytest
+
+        @pytest.mark.parametrize("value", ["a b"])
+        def test_parametrized(value):
+            assert value == "a b"
+    """)
+    assert " " in items[0].nodeid, "fixture setup did not produce a space-bearing nodeid: %r" % items[0].nodeid
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+
+    assert results == {items[0].nodeid: "passed"}
 
 
 def test_fallback_worker_count_capped_at_pool_size_not_added_on_top(tmp_path, monkeypatch, pytester):

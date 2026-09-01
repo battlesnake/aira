@@ -8,8 +8,13 @@ from aitest.worker import _RECYCLE_SUFFIX, fork_worker, run_worker_loop
 
 
 _STOP_LINE = "__stop__"
-_STARTUP_DENIAL_RETRY_ATTEMPTS = 5
 _STARTUP_DENIAL_RETRY_SECONDS = 1.0
+# How often (in retry attempts, i.e. roughly every N seconds at the above
+# interval) to remind stderr that a run is stalled waiting on a reachable
+# but saturated daemon -- see run()'s startup-retry loop. A stuck run must
+# never be SILENT, even though it must also never fall back to unconfined
+# just because the wait is long.
+_STARTUP_DENIAL_WARN_EVERY = 30
 
 
 class WorkerAdmitUnavailable(Exception):
@@ -466,28 +471,53 @@ class Supervisor:
         already decided, but not yet said, that it was retiring --
         silently losing that dispatch with nothing to detect the loss by.
 
-        EOF (no lines at all, and _drain_available_lines set
-        state["result_eof"]) means the worker's result pipe closed without
-        a terminating record for its in-flight nodeid -- a crash (kernel
-        OOM, host watchdog, any non-reporting exit). Task 15 defines
-        _handle_worker_exit; until Task 15 lands, that call is a no-op
-        placeholder (see Task 15's own Step 1)."""
+        EOF (_drain_available_lines set state["result_eof"]) means the
+        worker's result pipe closed without a terminating record for its
+        in-flight nodeid -- a crash (kernel OOM, host watchdog, any
+        non-reporting exit).
+
+        CORRECTED by build-review: a worker can flush its LAST result and
+        then crash immediately afterward (e.g. an OOM triggered by
+        whatever it does right after reporting, between tests -- spec 3.4
+        calls exactly this "a normal, expected event"), so a single
+        _drain_available_lines call can return that final result line AND
+        set result_eof TOGETHER, in one pass. The original version only
+        checked result_eof when `lines` was completely empty, so this case
+        fell through: the result got recorded, in_flight was cleared
+        (making the worker look idle), and the caller's very next
+        _dispatch_to_idle_workers (or a __stop__ broadcast) tried to write
+        into the dead worker's dispatch pipe -- an unguarded
+        BrokenPipeError that propagated out of run() and lost every
+        remaining result, on a crash the spec explicitly requires this
+        loop to tolerate gracefully. Checking result_eof AFTER the loop,
+        unconditionally, closes this: by then in_flight is already None
+        (this result's own outcome, correctly recorded), so
+        _handle_worker_exit's nodeid = state["in_flight"] is None and it
+        skips straight to retiring and replacing the worker -- no
+        double-write to results, just cleanup, exactly like a worker that
+        crashed with no trailing result at all."""
         lines = _drain_available_lines(state["result_fd"], state)
-        if not lines:
-            if state.get("result_eof"):
-                self._handle_worker_exit(pid, state)
-            return
         for line in lines:
             recycling = line.endswith(_RECYCLE_SUFFIX)
             if recycling:
                 line = line[: -len(_RECYCLE_SUFFIX)]
-            nodeid, _, outcome = line.partition(" ")
+            # rpartition, not partition: a parametrized pytest nodeid can
+            # legitimately contain a space (e.g. test_p[a b]) -- outcome
+            # never does (always one of passed/failed/skipped/error), so
+            # splitting on the LAST space is the only correct split.
+            # partition() split on the FIRST space instead, truncating any
+            # space-bearing nodeid and losing its real result -- found by
+            # build-review via live repro against real pytest (both
+            # review lineages independently, same root cause and fix).
+            nodeid, _, outcome = line.rpartition(" ")
             self.results[nodeid] = outcome
             state["in_flight"] = None
             if recycling:
                 self._retire_worker(pid, state)
                 self._replace_worker()
                 return
+        if state.get("result_eof"):
+            self._handle_worker_exit(pid, state)
 
     def _handle_worker_exit(self, pid, state):
         """A worker's result pipe hit EOF without a terminating record for
@@ -532,16 +562,35 @@ class Supervisor:
             # containment (denied != unavailable, above) -- but with ZERO
             # workers admitted yet there is also no later retirement to
             # hook a retry off of (_replace_worker only fires when an
-            # EXISTING worker retires). Retry getting AT LEAST one worker
-            # running a small bounded number of times; only if that still
-            # never succeeds do we fall back for this run rather than
-            # silently completing with an empty result set while the
-            # queue still has work.
+            # EXISTING worker retires). Keep retrying to get AT LEAST one
+            # worker running, INDEFINITELY on a plain denial, with a loud
+            # periodic warning so a stuck run is never silent -- never a
+            # bounded give-up-and-fall-back-to-unconfined here.
+            #
+            # CORRECTED by build-review: this loop originally gave up after
+            # a small bounded number of attempts and called
+            # _disable_daemon on exhaustion -- exactly the "one saturated
+            # moment permanently strips containment" bug this whole
+            # daemon-reachable/denied vs. daemon-unavailable split exists
+            # to prevent (spec 3.7), reproduced live: a persistently
+            # `denied` (never `unavailable`) response still ran the rest
+            # of the suite unconfined. Only a genuine WorkerAdmitUnavailable
+            # or WorkerPlacementFailed may ever call _disable_daemon --
+            # never exhausting a denial-retry budget. A daemon that stays
+            # saturated forever means this run genuinely waits forever,
+            # which is the honest outcome; it is the caller's job (a
+            # human, or an outer CI timeout) to notice and intervene, not
+            # this method's job to silently degrade safety instead.
             attempt = 0
-            while (self.daemon_available and not self.workers and self.queue
-                   and attempt < _STARTUP_DENIAL_RETRY_ATTEMPTS):
+            while self.daemon_available and not self.workers and self.queue:
                 attempt += 1
                 time.sleep(_STARTUP_DENIAL_RETRY_SECONDS)
+                if attempt % _STARTUP_DENIAL_WARN_EVERY == 0:
+                    sys.stderr.write(
+                        "aira aitest: still waiting for worker admission after %d attempts "
+                        "(daemon reachable, budget contended) -- containment preserved, "
+                        "not falling back to unconfined\n" % attempt
+                    )
                 try:
                     self.spawn_worker(estimated_bytes, max_wait=max_wait)
                 except WorkerAdmitDenied:
@@ -549,8 +598,6 @@ class Supervisor:
                 except (WorkerAdmitUnavailable, WorkerPlacementFailed) as exc:
                     self._disable_daemon(str(exc))
                     break
-            if self.daemon_available and not self.workers and self.queue:
-                self._disable_daemon("worker-admit stayed denied after %d retries" % _STARTUP_DENIAL_RETRY_ATTEMPTS)
         if not self.daemon_available:
             # Cap TOTAL concurrent workers (already-admitted + fallback) at
             # the configured pool size -- min(worker_count,
