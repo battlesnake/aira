@@ -115,6 +115,19 @@ instead of execnet), worker spawn/recycle policy (aira-admitted,
 time/count/RSS-bounded instead of "spawn N once, live forever"), and the
 scheduler (RAM-aware dynamic pull instead of xdist's own).
 
+**Accepted Slice 1 limitation: no look-ahead `nextitem`.** Real xdist (and
+plain pytest) supplies each item's actual *next* item to the item protocol,
+so a session/module/class-scoped fixture shared by consecutive tests is set
+up once and persists across them. Slice 1's worker instead runs every item
+with `nextitem=None` (pytest's own "this is the last item" signal), which
+tears down and rebuilds the entire fixture stack after every single test —
+a real behavioral deviation for suites with expensive or stateful
+session-scoped fixtures, not just an internal-API uncertainty. Implementing
+real look-ahead dispatch is deferred past Slice 1 (closely related to, and
+no more urgent than, the loadscope/loadgroup fixture-affinity grouping §2
+already defers); not needed to validate this slice's core admission/
+lifecycle loop.
+
 **Rejected alternative:** patching xdist's own scheduler via
 `pytest_xdist_make_scheduler` and leaving execnet as transport. xdist's
 gateway/spawn model hard-assumes all N workers are spawned once at session
@@ -229,15 +242,31 @@ set by `confine-reserve` (`confineReserveWithRunner`,
 `confine_reserve_linux.go:31-70`: daemon-only, returns
 `E_CONFINE_UNAVAILABLE` rather than falling back). But the supervisor, like
 today's CPU/RAM governor plugin on its own timeout/error path, degrades
-**open**: on `worker-admit` being unreachable or erroring, emit a visible
+**open**: on `worker-admit` being genuinely unreachable, emit a visible
 warning on the suite's own output (not just a log line — a suite running
 this way has silently lost containment for the rest of the run) and cap the
-fallback pool at **`n_workers ≤ NumCPU`** (owner decision — proportional to
-the host, not a guessed constant) with **no cgroup placement at all** —
-identical in spirit to "prints `continue`, worker runs ungoverned" in the
-current plugin. This is deliberately not a new half-daemon local-cgroup
-mechanism; it reuses the exact fail-open shape the existing governor already
-has, just applied to worker spawn instead of per-test checkpoints.
+fallback pool at **`n_workers ≤ min(requested worker count, NumCPU)`** (owner
+decision — proportional to the host, not a guessed constant, and never
+grown beyond what `--aitest-workers` actually asked for) with **no cgroup
+placement at all** — identical in spirit to "prints `continue`, worker runs
+ungoverned" in the current plugin. This is deliberately not a new
+half-daemon local-cgroup mechanism; it reuses the exact fail-open shape the
+existing governor already has, just applied to worker spawn instead of
+per-test checkpoints.
+
+**Genuinely unreachable, not merely declined.** The permanent, whole-run
+fallback above triggers ONLY when there is no daemon to talk to at all — a
+dial/connect failure, the CLI itself failing to launch, or a malformed
+response. It must NOT trigger on an ordinary `denied` (budget exhausted
+right now) or `timeout` (the daemon is up, just busy/contended, and the
+request waited out its own poll window) response from a daemon that is
+plainly still there: those mean "don't add a worker at this moment," not
+"abandon containment for the rest of the run." Conflating the three
+(exactly what an earlier revision of this design did) defeats the point of
+admission — a single contended moment would otherwise permanently strip
+containment from everything after it. The two client-side exception types
+this distinction requires (`WorkerAdmitUnavailable` vs. `WorkerAdmitDenied`)
+are an implementation detail of the supervisor, not a wire-protocol change.
 
 ### 3.8 Deletion, retention, generalisation
 

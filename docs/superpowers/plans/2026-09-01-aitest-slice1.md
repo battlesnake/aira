@@ -164,6 +164,16 @@ git commit -m "feat(aitest): add WorkerScopeChildPath shared path-joining helper
 Explicit outer scope keeps this function pure cgroup-mutation logic, testable
 against a stand-in subprocess rather than the test binary's own PID.
 
+**Contract note (real, not aspirational):** this function is safe for
+EXACTLY ONE call per process tree. It is NOT safe to retry from a fresh CLI
+invocation after a prior partial success: a retry would self-discover its
+outer scope via `CurrentCgroupPath()` (Task 3) from INSIDE the
+already-relocated `.aira-supervisor` scope left by the first call, and
+would nest `.aira-supervisor/.aira-supervisor` instead of reopening the
+original. Slice 1's supervisor (Task 11) never retries this call for
+exactly this reason — do not add a bootstrap retry loop without first
+handling re-entry detection.
+
 - [ ] **Step 1: Write the failing test**
 
 ```go
@@ -291,9 +301,12 @@ import (
 // cgroup v2 forbids a cgroup from delegating controllers to children while
 // it still holds member processes of its own.
 //
-// Idempotent: a second call with the pid already relocated re-verifies
-// rather than erroring, so a supervisor that retries a failed first attempt
-// is safe.
+// Safe for exactly one call per process tree. NOT safe to retry from a
+// fresh CLI invocation after a prior partial success: a retry would
+// self-discover its outer scope from INSIDE the already-relocated
+// supervisor scope (CurrentCgroupPath, Task 3) and nest incorrectly rather
+// than reopening the original. Slice 1's supervisor (internal/pylib/aitest,
+// Task 11) never retries this call for exactly this reason.
 func BootstrapAitestSupervisor(ctx context.Context, outerScope string, supervisorPID int) (string, error) {
 	if supervisorPID <= 0 {
 		return "", fmt.Errorf("aitest bootstrap: invalid supervisor pid %d", supervisorPID)
@@ -425,6 +438,7 @@ git commit -m "feat(aitest): add BootstrapAitestSupervisor outer-to-supervisor r
 **Files:**
 - Create: `internal/runner/aitest_bootstrap_selfpath_linux.go` (adds `CurrentCgroupPath`)
 - Create: `internal/runner/aitest_bootstrap_selfpath_stub.go`
+- Test: `internal/runner/aitest_bootstrap_selfpath_linux_test.go`
 - Modify: `cmd/aira/main.go`
 - Test: `cmd/aira/aitest_bootstrap_test.go`
 
@@ -571,7 +585,7 @@ Run: `aira confine -- go test ./cmd/aira/ -run TestParseAitestBootstrapArgs -v` 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add internal/runner/aitest_bootstrap_selfpath_linux.go internal/runner/aitest_bootstrap_selfpath_stub.go cmd/aira/main.go cmd/aira/aitest_bootstrap_test.go
+git add internal/runner/aitest_bootstrap_selfpath_linux.go internal/runner/aitest_bootstrap_selfpath_stub.go internal/runner/aitest_bootstrap_selfpath_linux_test.go cmd/aira/main.go cmd/aira/aitest_bootstrap_test.go
 git commit -m "feat(aitest): add aira aitest-bootstrap CLI verb"
 ```
 
@@ -585,8 +599,8 @@ git commit -m "feat(aitest): add aira aitest-bootstrap CLI verb"
 - Modify: `internal/daemon/server.go` (add fields to `Server` struct only — wiring is Task 6)
 
 **Interfaces:**
-- Consumes: `s.admitReadMemory func(string) (int64, int64, int64, bool, string)` (existing test seam, defaults to `readSliceMemory`), `s.admitSliceHeadroom(jobs int) int64` (existing), `runner.WorkerScopeChildPath` (Task 1).
-- Produces: `WorkerAdmitResponse` (JSON wire type), `workerAdmitRequest`, `func (s *Server) evaluateWorkerAdmit(req workerAdmitRequest) WorkerAdmitResponse`, `func (s *Server) releaseWorkerGrant(jobID, workerID string)`, `func validateWorkerAdmitArgs(args map[string]any) (workerAdmitRequest, error)`. Task 5 consumes all four.
+- Consumes: `s.admitReadMemory func(string) (int64, int64, int64, bool, string)` (existing test seam, defaults to `readSliceMemory`), `runner.WorkerScopeChildPath` (Task 1), `exactAdmitInt64`/`admitMaxReserve`/`admitWaitCapMs` (existing, `admit.go`, same package — reused for overflow-safe argument parsing and bound checks). Deliberately does NOT consume `s.admitSliceHeadroom` — that constant is sized for the whole machine-wide slice (2 GiB); this task introduces its own much smaller, aitest-appropriate `workerAdmitHeadroom` field instead (see below).
+- Produces: `WorkerAdmitResponse` (JSON wire type), `workerAdmitRequest`, `func (s *Server) evaluateWorkerAdmit(req workerAdmitRequest) WorkerAdmitResponse`, `func (s *Server) releaseWorkerGrant(jobID, outerScope, workerID string)`, `func validateWorkerAdmitArgs(args map[string]any) (workerAdmitRequest, error)`. Task 5 consumes all four.
 
 This ledger is deliberately simpler than `admit.go`'s `sliceQueue`: one job's own worker pool has no cross-job fairness question, so a mutex-guarded map plus the caller polling (Task 5) is the whole mechanism — no waiter channels, no evaluator goroutine.
 
@@ -595,25 +609,30 @@ This ledger is deliberately simpler than `admit.go`'s `sliceQueue`: one job's ow
 ```go
 package daemon
 
-import "testing"
+import (
+	"testing"
 
+	"aira/internal/runner"
+)
+
+// admitReadMemoryFixture stands in for readSliceMemory. evaluateWorkerAdmit
+// now reads ONLY the OUTER scope's own live memory.current (hierarchical:
+// already includes the supervisor plus every placed worker, spec 3.3) — it
+// no longer sums per-worker grants separately (that summation both
+// double-counted against, and could still under-count relative to, what
+// the kernel's own memory.oom.group actually acts on). So this fixture
+// answers any outer_scope path uniformly against current[path], defaulting
+// to 0 (an idle scope) when unset, always readable.
 func admitReadMemoryFixture(current map[string]int64, outerMax int64) func(string) (int64, int64, int64, bool, string) {
 	return func(path string) (int64, int64, int64, bool, string) {
-		if path == "/outer" {
-			return 0, outerMax, 0, true, ""
-		}
-		if value, ok := current[path]; ok {
-			return value, 0, 0, true, ""
-		}
-		return 0, 0, 0, false, "fallback:unreadable"
+		return current[path], outerMax, 0, true, ""
 	}
 }
 
 func TestEvaluateWorkerAdmitGrantsWithinHeadroom(t *testing.T) {
 	server := NewServer(Paths{})
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
-	server.admitSliceHeadroomBase = 0
-	server.admitSliceHeadroomSupervisor = 0
+	server.workerAdmitHeadroom = 0
 	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400, maxWaitMS: 0})
 	if response.State != "granted" || response.WorkerID == "" || response.MemoryMax != 400 || response.MemoryHigh != 320 {
 		t.Fatalf("response=%+v", response)
@@ -631,51 +650,97 @@ func TestEvaluateWorkerAdmitGrantsWithinHeadroom(t *testing.T) {
 
 func TestEvaluateWorkerAdmitDeniesOverBudgetAccountingLiveUsage(t *testing.T) {
 	server := NewServer(Paths{})
-	server.admitSliceHeadroomBase = 0
-	server.admitSliceHeadroomSupervisor = 0
+	server.workerAdmitHeadroom = 0
 	live := map[string]int64{}
 	server.admitReadMemory = admitReadMemoryFixture(live, 1000)
 	first := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
 	if first.State != "granted" {
 		t.Fatalf("first=%+v", first)
 	}
-	// The first worker's LIVE usage (not its held cap) governs the second
-	// decision: even though 700+700 > 1000, a low live reading admits it.
-	live[first.ScopePath] = 100
+	// The OUTER scope's own live usage (hierarchically includes the
+	// supervisor plus every worker) governs the second decision, not a sum
+	// of held worker caps: even though 700+700 > 1000, a low live reading
+	// on the outer scope itself still admits it.
+	live["/outer"] = 100
 	second := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
 	if second.State != "granted" {
 		t.Fatalf("second (live-usage-based) =%+v", second)
 	}
 }
 
-func TestEvaluateWorkerAdmitChargesFullCapWhenLiveUsageUnreadable(t *testing.T) {
+func TestEvaluateWorkerAdmitReturnsUnevaluatedWhenOuterScopeLiveUsageUnreadable(t *testing.T) {
+	// Fail toward safety, ported to the single-read model: admission no
+	// longer reads individual worker-scope paths at all (dropped along
+	// with the per-worker summation), so the one signal that can still be
+	// unreadable is the OUTER scope's own memory.current/memory.max read
+	// itself — that must never silently admit.
 	server := NewServer(Paths{})
-	server.admitSliceHeadroomBase = 0
-	server.admitSliceHeadroomSupervisor = 0
-	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000) // scope paths absent from the fixture read as unreadable
-	first := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
-	if first.State != "granted" {
-		t.Fatalf("first=%+v", first)
+	server.workerAdmitHeadroom = 0
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+		return 0, 0, 0, false, "fallback:outer-scope-unreadable"
 	}
-	second := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400, maxWaitMS: 0})
-	if second.State != "denied" {
-		t.Fatalf("second must be denied when the first grant's usage is unreadable (charge its full cap): %+v", second)
+	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400, maxWaitMS: 0})
+	if response.State != "unevaluated" {
+		t.Fatalf("response=%+v, want unevaluated when the outer scope's own live usage cannot be read", response)
 	}
 }
 
-func TestReleaseWorkerGrantFreesLedgerSpace(t *testing.T) {
+func TestEvaluateWorkerAdmitDeniesImmediatelyWhenRequestExceedsCeilingEvenAtZeroUsage(t *testing.T) {
+	// A request that could never fit even with the WHOLE ceiling free right
+	// now is a stable "never going to work" fact about the request, not a
+	// transient contention moment — this is the one case Slice 1 makes
+	// "denied" genuinely reachable for (see workerAdmitConnection, Task 5):
+	// everything else that isn't available right now polls/retries and
+	// eventually becomes "timeout" instead.
 	server := NewServer(Paths{})
-	server.admitSliceHeadroomBase = 0
-	server.admitSliceHeadroomSupervisor = 0
+	server.workerAdmitHeadroom = 0
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 1001, maxWaitMS: 0})
+	if response.State != "denied" || response.Reason != "reject:exceeds-ceiling" {
+		t.Fatalf("response=%+v, want denied/reject:exceeds-ceiling", response)
+	}
+}
+
+func TestReleaseWorkerGrantIsIdempotent(t *testing.T) {
+	// A worker-admit decision no longer depends on job.grants bookkeeping
+	// for its arithmetic (admission now reads the outer scope's own live
+	// memory.current directly, spec 3.3) — job.grants remains as worker-ID
+	// bookkeeping only. What matters here is the property Task 5's fixed
+	// workerAdmitConnection depends on: releaseWorkerGrant is safe to call
+	// more than once (a write-failure path there defers a release that may
+	// race a normal lease-close release of the same grant).
+	server := NewServer(Paths{})
+	server.workerAdmitHeadroom = 0
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
 	granted := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 900, maxWaitMS: 0})
 	if granted.State != "granted" {
 		t.Fatalf("granted=%+v", granted)
 	}
-	server.releaseWorkerGrant("job-1", granted.WorkerID)
+	server.releaseWorkerGrant("job-1", "/outer", granted.WorkerID)
+	server.releaseWorkerGrant("job-1", "/outer", granted.WorkerID) // must not panic
 	again := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 900, maxWaitMS: 0})
 	if again.State != "granted" {
-		t.Fatalf("released ledger space did not admit a second worker: %+v", again)
+		t.Fatalf("again=%+v", again)
+	}
+}
+
+func TestWorkerJobLedgerIsBoundToJobIDAndOuterScopeTogether(t *testing.T) {
+	// A job_id is caller-supplied and only as unique as the caller's own
+	// pid-reuse window — two concurrent requests that happen to reuse the
+	// same job_id with DIFFERENT outer_scope values must never get their
+	// scope accounting mixed together.
+	server := NewServer(Paths{})
+	server.workerAdmitHeadroom = 0
+	live := map[string]int64{"/outer-a": 900, "/outer-b": 0}
+	server.admitReadMemory = admitReadMemoryFixture(live, 1000)
+	// /outer-a is nearly saturated; /outer-b (same job_id!) is empty.
+	denied := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer-a", estimatedBytes: 500, maxWaitMS: 0})
+	if denied.State != "denied" {
+		t.Fatalf("denied=%+v", denied)
+	}
+	granted := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer-b", estimatedBytes: 500, maxWaitMS: 0})
+	if granted.State != "granted" {
+		t.Fatalf("same job_id, different outer_scope must not inherit the other scope's saturation: %+v", granted)
 	}
 }
 ```
@@ -694,6 +759,14 @@ import (
 	"aira/internal/runner"
 )
 
+// workerAdmitHeadroomDefault is a SEPARATE, much smaller headroom than
+// admitSliceHeadroomBase (2 GiB, sized for the whole machine-wide slice,
+// admit.go). Reusing the slice-wide constant here would swallow most of a
+// realistically-sized outer scope's own cap in production. This is a
+// build-time tunable, not yet sized from field data — a reasonable small
+// fixed default for Slice 1.
+const workerAdmitHeadroomDefault int64 = 64 << 20 // 64 MiB
+
 // WorkerAdmitResponse is the one grant/denial payload the worker-admit
 // connection sends before optionally holding itself open as the lease.
 type WorkerAdmitResponse struct {
@@ -707,8 +780,14 @@ type WorkerAdmitResponse struct {
 }
 
 type workerAdmitRequest struct {
-	jobID          string
-	outerScope     string
+	jobID      string
+	outerScope string
+	// signature is accepted on the wire (the key spec 3.3 names for a
+	// future per-suite peak-history-based cap-sizing backstop) but UNUSED
+	// for anything in Slice 1 — deferred past Slice 1; estimatedBytes
+	// alone governs the backstop cap for now (see also Task 17's
+	// _resolve_estimated_bytes, which states the same deferral on the
+	// Python side).
 	signature      string
 	estimatedBytes int64
 	maxWaitMS      int64
@@ -720,54 +799,81 @@ type workerGrant struct {
 }
 
 type workerJobState struct {
-	mu      sync.Mutex
-	nextSeq int
-	grants  map[string]*workerGrant
+	mu         sync.Mutex
+	outerScope string
+	nextSeq    int
+	grants     map[string]*workerGrant
 }
 
-func (s *Server) workerJobFor(jobID string) *workerJobState {
+// workerJobKey binds ledger state to the (job_id, outer_scope) PAIR, not
+// job_id alone — job_id is caller-supplied and only as unique as the
+// caller's own pid-reuse window, so two concurrent requests that reuse the
+// same job_id with DIFFERENT outer_scope values must never get their scope
+// accounting mixed together.
+func workerJobKey(jobID, outerScope string) string {
+	return jobID + "\x00" + outerScope
+}
+
+// workerJobs is never actively pruned once a job's last worker releases —
+// accepted Slice 1 gap: unbounded-but-slow growth, one entry per distinct
+// (job_id, outer_scope) pair across the daemon's lifetime. A real concern
+// only for a very long-lived daemon running very many distinct aitest
+// jobs; not worth cleanup machinery for Slice 1.
+func (s *Server) workerJobFor(jobID, outerScope string) *workerJobState {
+	key := workerJobKey(jobID, outerScope)
 	s.workerJobsMu.Lock()
 	defer s.workerJobsMu.Unlock()
 	if s.workerJobs == nil {
 		s.workerJobs = make(map[string]*workerJobState)
 	}
-	job := s.workerJobs[jobID]
+	job := s.workerJobs[key]
 	if job == nil {
-		job = &workerJobState{grants: make(map[string]*workerGrant)}
-		s.workerJobs[jobID] = job
+		job = &workerJobState{outerScope: outerScope, grants: make(map[string]*workerGrant)}
+		s.workerJobs[key] = job
 	}
 	return job
 }
 
-// evaluateWorkerAdmit makes one synchronous grant/deny decision for req,
-// admitting against the OUTER scope's live usage across this job's already-
-// granted workers (spec 3.3: live occupancy, never a held static reserve).
-// An unreadable grant's usage charges its full memory_max — fail toward
-// safety, matching resolveAdmitReserve's own bias elsewhere in this package.
+// evaluateWorkerAdmit makes one synchronous grant/deny decision for req.
+// "Used" is the OUTER scope's own live memory.current, read directly —
+// cgroup memory accounting is hierarchical, so this single read already
+// includes the supervisor's own RSS plus every already-placed worker's
+// (spec 3.3). Summing individually-read worker-scope grants separately (an
+// earlier version of this function did) was both redundant with that
+// hierarchical accounting AND unsafe: Σ(worker grants) + supervisor RSS
+// could exceed outerMax even when the ledger thought there was room,
+// risking an outer-scope-level memory.oom.group kill of the ENTIRE run —
+// precisely the incident class this design exists to prevent.
 func (s *Server) evaluateWorkerAdmit(req workerAdmitRequest) WorkerAdmitResponse {
 	readMemory := s.admitReadMemory
 	if readMemory == nil {
 		readMemory = readSliceMemory
 	}
-	_, outerMax, _, ok, reason := readMemory(req.outerScope)
+	used, outerMax, _, ok, reason := readMemory(req.outerScope)
 	if !ok {
 		return WorkerAdmitResponse{State: "unevaluated", Reason: reason}
 	}
-	job := s.workerJobFor(req.jobID)
+	headroom := s.workerAdmitHeadroom
+	if headroom < 0 {
+		headroom = 0
+	}
+	ceiling := outerMax - headroom
+	if req.estimatedBytes > ceiling {
+		// Could never fit even at zero current usage — a stable fact about
+		// THIS request, not a transient contention moment. Deny
+		// immediately (workerAdmitConnection, Task 5, breaks its poll loop
+		// on this reason) instead of waiting out the full poll timeout
+		// only to time out anyway.
+		return WorkerAdmitResponse{State: "denied", Reason: "reject:exceeds-ceiling"}
+	}
+	job := s.workerJobFor(req.jobID, req.outerScope)
 	job.mu.Lock()
 	defer job.mu.Unlock()
-
-	var used int64
-	for _, grant := range job.grants {
-		if current, _, _, ok, _ := readMemory(grant.scopePath); ok {
-			used += current
-		} else {
-			used += grant.memoryMax
-		}
-	}
-	headroom := s.admitSliceHeadroom(1)
-	available := outerMax - headroom - used
-	if req.estimatedBytes > available {
+	if req.estimatedBytes > ceiling-used {
+		// Not available RIGHT NOW (transient: current live usage), but
+		// could be granted once usage drops — the caller's poll loop keeps
+		// retrying this until granted or its own max_wait_ms deadline
+		// converts it to "timeout".
 		return WorkerAdmitResponse{State: "denied", Reason: "fallback:insufficient-headroom"}
 	}
 	job.nextSeq++
@@ -778,12 +884,15 @@ func (s *Server) evaluateWorkerAdmit(req workerAdmitRequest) WorkerAdmitResponse
 	return WorkerAdmitResponse{State: "granted", WorkerID: workerID, ScopePath: scopePath, MemoryMax: req.estimatedBytes, MemoryHigh: memoryHigh}
 }
 
-// releaseWorkerGrant frees one worker's ledger space. Called when its
-// connection closes (Task 5) — the same dies-with-socket lease shape admit
-// and governor already use.
-func (s *Server) releaseWorkerGrant(jobID, workerID string) {
+// releaseWorkerGrant frees one worker's ledger bookkeeping entry. Called
+// when its connection closes (Task 5) — the same dies-with-socket lease
+// shape admit and governor already use. Idempotent by construction (delete
+// on an absent map key is a no-op): Task 5's deferred release can race a
+// normal lease-close release of the same grant, and both must be safe.
+func (s *Server) releaseWorkerGrant(jobID, outerScope, workerID string) {
+	key := workerJobKey(jobID, outerScope)
 	s.workerJobsMu.Lock()
-	job := s.workerJobs[jobID]
+	job := s.workerJobs[key]
 	s.workerJobsMu.Unlock()
 	if job == nil {
 		return
@@ -819,25 +928,36 @@ func validateWorkerAdmitArgs(args map[string]any) (workerAdmitRequest, error) {
 	if req.signature, err = str("signature", false); err != nil {
 		return workerAdmitRequest{}, err
 	}
-	estimated, ok := args["estimated_bytes"].(float64) // JSON numbers decode as float64
-	if !ok || estimated <= 0 {
-		return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit estimated_bytes must be a positive number", CodeProtocol)
+	// exactAdmitInt64 (existing, admit.go) — overflow-safe float64->int64,
+	// reused rather than the naive int64(estimated) truncation this used
+	// to do, which let an arbitrary huge float64 truncate unchecked.
+	estimated, ok := exactAdmitInt64(args["estimated_bytes"])
+	if !ok || estimated <= 0 || estimated > admitMaxReserve {
+		return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit estimated_bytes must be a positive number no larger than %d", CodeProtocol, admitMaxReserve)
 	}
-	req.estimatedBytes = int64(estimated)
-	maxWait, ok := args["max_wait_ms"].(float64)
-	if !ok || maxWait < 0 {
-		return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit max_wait_ms must be a non-negative number", CodeProtocol)
+	req.estimatedBytes = estimated
+	maxWait, ok := exactAdmitInt64(args["max_wait_ms"])
+	if !ok || maxWait < 0 || maxWait > admitWaitCapMs {
+		return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit max_wait_ms must be in [0,%d]", CodeProtocol, admitWaitCapMs)
 	}
-	req.maxWaitMS = int64(maxWait)
+	req.maxWaitMS = maxWait
 	return req, nil
 }
 ```
 
-Add two fields to the `Server` struct in `internal/daemon/server.go` (near the existing `governor *governorSet` field):
+Add three fields to the `Server` struct in `internal/daemon/server.go` (near the existing `governor *governorSet` field):
 
 ```go
-	workerJobsMu sync.Mutex
-	workerJobs   map[string]*workerJobState
+	workerJobsMu        sync.Mutex
+	workerJobs          map[string]*workerJobState
+	workerAdmitHeadroom int64
+```
+
+Also initialize the new headroom field's default in `NewServer`'s literal
+(near the existing `admitSliceHeadroomSupervisor: admitSliceHeadroomSupervisorDefault,` line, `server.go:132-133`) — mirrors that exact existing init pattern so a fresh `Server` starts with the real default and a test overrides it explicitly (as `admitSliceHeadroomBase`/`admitSliceHeadroomSupervisor` already do):
+
+```go
+		workerAdmitHeadroom:          workerAdmitHeadroomDefault,
 ```
 
 - [ ] **Step 4: Run test to verify it passes** — PASS.
@@ -872,8 +992,7 @@ see Global Constraints. Add one field to `Server` for test speed:
 func TestWorkerAdmitConnectionGrantsThenHoldsUntilPeerCloses(t *testing.T) {
 	server := NewServer(Paths{})
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
-	server.admitSliceHeadroomBase = 0
-	server.admitSliceHeadroomSupervisor = 0
+	server.workerAdmitHeadroom = 0
 	server.workerAdmitPollInterval = time.Millisecond
 
 	serverConn, clientConn := net.Pipe()
@@ -905,20 +1024,25 @@ func TestWorkerAdmitConnectionGrantsThenHoldsUntilPeerCloses(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("connection did not release after peer close")
 	}
-	// The ledger space must be free again.
+	// Releasing must not leave the daemon in a broken state that then
+	// rejects everything.
 	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 1000, maxWaitMS: 0})
 	if response.State != "granted" {
-		t.Fatalf("released ledger space did not re-admit: %+v", response)
+		t.Fatalf("post-release admission unexpectedly broken: %+v", response)
 	}
 }
 
 func TestWorkerAdmitConnectionTimesOutWhenSaturated(t *testing.T) {
 	server := NewServer(Paths{})
-	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 500)
-	server.admitSliceHeadroomBase = 0
-	server.admitSliceHeadroomSupervisor = 0
+	// The outer scope's own live usage already consumes the entire
+	// ceiling — under the live-occupancy model (spec 3.3) there is no
+	// per-worker-grant summation to "saturate" separately; a prior grant
+	// alone does not change what a later admission decision sees unless
+	// the outer scope's own live memory.current reflects it, exactly like
+	// production (the daemon never tracks a synthetic reserve here).
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{"/outer": 500}, 500)
+	server.workerAdmitHeadroom = 0
 	server.workerAdmitPollInterval = time.Millisecond
-	server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 500, maxWaitMS: 0}) // saturate
 
 	serverConn, clientConn := net.Pipe()
 	go func() {
@@ -936,6 +1060,63 @@ func TestWorkerAdmitConnectionTimesOutWhenSaturated(t *testing.T) {
 		t.Fatalf("frame=%+v err=%v", frame, err)
 	}
 	_ = clientConn.Close()
+}
+
+func TestWorkerAdmitConnectionDeniesImmediatelyWithoutWaitingOutMaxWait(t *testing.T) {
+	server := NewServer(Paths{})
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 100)
+	server.workerAdmitHeadroom = 0
+	server.workerAdmitPollInterval = time.Millisecond
+
+	serverConn, clientConn := net.Pipe()
+	started := time.Now()
+	go func() {
+		defer serverConn.Close()
+		server.workerAdmitConnection(serverConn, map[string]any{
+			// 1000 bytes can never fit under a 100-byte outer ceiling no
+			// matter how long we wait -- must come back "denied" well
+			// before the (deliberately long) max_wait_ms elapses.
+			"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(1000), "max_wait_ms": float64(60000),
+		})
+	}()
+	var frame ResponseFrame
+	if err := readFrame(clientConn, &frame); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("denial took %v — looks like it waited out max_wait_ms instead of denying immediately", elapsed)
+	}
+	var response WorkerAdmitResponse
+	if err := json.Unmarshal(frame.Data, &response); err != nil || response.State != "denied" {
+		t.Fatalf("frame=%+v err=%v", frame, err)
+	}
+	_ = clientConn.Close()
+}
+
+func TestWorkerAdmitConnectionReleasesGrantWhenResponseWriteFails(t *testing.T) {
+	server := NewServer(Paths{})
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.workerAdmitHeadroom = 0
+	server.workerAdmitPollInterval = time.Millisecond
+
+	serverConn, clientConn := net.Pipe()
+	// Close the CLIENT side before the server ever gets to write its
+	// response -- a peer-vanished-in-the-exact-window race.
+	// evaluateWorkerAdmit already inserted the grant into the ledger by
+	// this point; the subsequent writeFrame on serverConn must then fail,
+	// and that grant must still be released rather than leaking against
+	// the job's ledger forever (the bug: the old code just `return`ed on a
+	// write failure with no release at all).
+	_ = clientConn.Close()
+	server.workerAdmitConnection(serverConn, map[string]any{
+		"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(900), "max_wait_ms": float64(0),
+	})
+	_ = serverConn.Close()
+
+	again := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 900, maxWaitMS: 0})
+	if again.State != "granted" {
+		t.Fatalf("write-failure path leaked the grant: %+v", again)
+	}
 }
 ```
 
@@ -969,6 +1150,16 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 		if response.State == "granted" || response.State == "unevaluated" {
 			break
 		}
+		if response.State == "denied" && response.Reason == "reject:exceeds-ceiling" {
+			// A stable "never going to fit" fact about this request, not a
+			// transient contention moment — surface "denied" to the client
+			// immediately instead of waiting out the full poll timeout
+			// only to time out anyway. Every OTHER non-granted state keeps
+			// polling below (a live-usage-driven "not right now" is
+			// retried until it clears or the deadline converts it to
+			// "timeout").
+			break
+		}
 		if !s.admitNowTime().Before(deadline) {
 			response = WorkerAdmitResponse{State: "timeout", Reason: "reject:saturated"}
 			break
@@ -982,6 +1173,27 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 		}
 	}
 
+	// A "granted" response has ALREADY inserted a ledger entry inside
+	// evaluateWorkerAdmit above. From this point on, EVERY exit path —
+	// a write failure, the peer vanishing in the exact window between
+	// grant and delivery, or the normal lease-close below — must release
+	// that grant exactly once, or it leaks against the job's ledger
+	// forever. Mirrors admitConnection's own deferred, idempotent release
+	// (admit.go:458-466); releaseWorkerGrant is idempotent by construction
+	// (delete on an absent key is a no-op), so a double-fire here (e.g. a
+	// write failure racing this deferred call with a direct call further
+	// down — there is none further down anymore, but the mirroring is
+	// deliberate) is always safe.
+	released := false
+	release := func() {
+		if released || response.State != "granted" {
+			return
+		}
+		released = true
+		s.releaseWorkerGrant(req.jobID, req.outerScope, response.WorkerID)
+	}
+	defer release()
+
 	_ = conn.SetWriteDeadline(time.Now().Add(admitWriteTimeout))
 	ok := response.State == "granted"
 	if err := writeFrame(conn, responseFrame(core.Response{OK: ok, Code: "OK", Data: response})); err != nil {
@@ -994,7 +1206,6 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 	case <-peerCtx.Done():
 	case <-s.stopping:
 	}
-	s.releaseWorkerGrant(req.jobID, response.WorkerID)
 }
 ```
 
@@ -1026,8 +1237,7 @@ func TestServerDispatchesWorkerAdmitVerbOverRealSocket(t *testing.T) {
 	paths := testPaths(t)
 	server := NewServer(paths)
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
-	server.admitSliceHeadroomBase = 0
-	server.admitSliceHeadroomSupervisor = 0
+	server.workerAdmitHeadroom = 0
 	_, _ = startServer(t, server)
 	scope := testScope(t, paths, "one")
 
@@ -1126,7 +1336,14 @@ func TestCreateWorkerScopeWritesVerifiedMemoryCap(t *testing.T) {
 		cgrouptest.SkipOrFailRealCgroup(t, "cannot delegate outer scope: %v", err)
 	}
 
-	scopePath, err := CreateWorkerScope(context.Background(), outer, "1", 134217728, 107374182)
+	// 134217728 (128 MiB) and 104857600 (100 MiB) are both exact multiples
+	// of the page size — writeScopeMemoryCap's own verification page-floors
+	// the value before comparing (confirmed against the real
+	// verifyScopeMemoryValue/floorMemoryPage code), so an unaligned value
+	// like 107374182 would be floored by the kernel to 107372544 and this
+	// verbatim-string comparison would fail even on a correct
+	// implementation.
+	scopePath, err := CreateWorkerScope(context.Background(), outer, "1", 134217728, 104857600)
 	if err != nil {
 		t.Fatalf("CreateWorkerScope: %v", err)
 	}
@@ -1136,7 +1353,7 @@ func TestCreateWorkerScopeWritesVerifiedMemoryCap(t *testing.T) {
 	if data, err := os.ReadFile(filepath.Join(scopePath, "memory.max")); err != nil || strings.TrimSpace(string(data)) != "134217728" {
 		t.Fatalf("memory.max=%q err=%v", data, err)
 	}
-	if data, err := os.ReadFile(filepath.Join(scopePath, "memory.high")); err != nil || strings.TrimSpace(string(data)) != "107374182" {
+	if data, err := os.ReadFile(filepath.Join(scopePath, "memory.high")); err != nil || strings.TrimSpace(string(data)) != "104857600" {
 		t.Fatalf("memory.high=%q err=%v", data, err)
 	}
 	if data, err := os.ReadFile(filepath.Join(scopePath, "memory.oom.group")); err != nil || strings.TrimSpace(string(data)) != "1" {
@@ -1208,6 +1425,10 @@ git commit -m "feat(aitest): add CreateWorkerScope nested per-worker cgroup cap"
 
 **Files:**
 - Create: `internal/runner/worker_admit_client_linux.go`
+- Create: `internal/runner/worker_admit_client_stub.go` (`//go:build !linux`) —
+  `cmd/aira/main.go` is cross-platform and calls `runner.RequestWorkerAdmit`
+  unconditionally; without a stub, `go build` fails on any non-Linux target,
+  mirroring the same gap Task 2/7 each closed for their own Linux-only piece.
 - Modify: `cmd/aira/main.go`
 - Test: `internal/runner/worker_admit_client_linux_test.go` (package `runner_test` — an
   EXTERNAL test package, so it can import both `aira/internal/runner` and
@@ -1243,6 +1464,7 @@ func TestRequestWorkerAdmitReturnsHeldLeaseOnGrant(t *testing.T) {
 	paths := daemonTestPaths(t) // small local helper: mirrors internal/daemon's own testPaths(t), sets XDG_STATE_HOME/XDG_RUNTIME_DIR under t.TempDir()
 	server := daemon.NewServer(paths)
 	server.SetAdmitReadMemoryForTest(func(string) (int64, int64, int64, bool, string) { return 0, 1000, 0, true, "" })
+	server.SetWorkerAdmitHeadroomForTest(0) // production default (64 MiB) would swallow this test's tiny synthetic byte values
 	ready := make(chan struct{}, 1)
 	server.Ready = ready
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1267,6 +1489,7 @@ func TestRequestWorkerAdmitReturnsErrorOnDenial(t *testing.T) {
 	paths := daemonTestPaths(t)
 	server := daemon.NewServer(paths)
 	server.SetAdmitReadMemoryForTest(func(string) (int64, int64, int64, bool, string) { return 0, 100, 0, true, "" })
+	server.SetWorkerAdmitHeadroomForTest(0)
 	ready := make(chan struct{}, 1)
 	server.Ready = ready
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1284,12 +1507,27 @@ func TestRequestWorkerAdmitReturnsErrorOnDenial(t *testing.T) {
 }
 ```
 
-This test needs one new tiny exported test seam on `*daemon.Server`:
-`func (s *Server) SetAdmitReadMemoryForTest(fn func(string) (int64, int64, int64, bool, string)) { s.admitReadMemory = fn }`
-(`internal/daemon/testing_seams.go`, new file — `admitReadMemory` itself stays
-private; this is the one export needed for an external package's test to
-drive it, matching the spirit of the existing `OnRequest`/`Ready` exported
-test seams already on `Server`.) Also add a small local `daemonTestPaths(t)`
+This test needs two new tiny exported test seams on `*daemon.Server`
+(`internal/daemon/testing_seams.go`, new file — the underlying fields stay
+private; these are the exports needed for an external package's test to
+drive them, matching the spirit of the existing `OnRequest`/`Ready` exported
+test seams already on `Server`):
+
+```go
+func (s *Server) SetAdmitReadMemoryForTest(fn func(string) (int64, int64, int64, bool, string)) {
+	s.admitReadMemory = fn
+}
+
+// SetWorkerAdmitHeadroomForTest overrides the production worker-admit
+// headroom default (64 MiB, worker_admit.go) so a test admitting against
+// small synthetic byte values (or a small real cgroup memory.max) is not
+// universally denied.
+func (s *Server) SetWorkerAdmitHeadroomForTest(value int64) {
+	s.workerAdmitHeadroom = value
+}
+```
+
+Also add a small local `daemonTestPaths(t)`
 helper in the same `_test.go` file, mirroring `internal/daemon/server_test.go`'s
 own `testPaths(t)` (same `XDG_STATE_HOME`/`XDG_RUNTIME_DIR`-under-`t.TempDir()`
 shape) since that helper is private to the `daemon` package's own tests.
@@ -1395,7 +1633,49 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) (*Wor
 
 - [ ] **Step 4: Run test to verify it passes** — PASS.
 
-- [ ] **Step 5: Wire the CLI verb.** In `cmd/aira/main.go`, alongside `confine-reserve`/`aitest-bootstrap`:
+- [ ] **Step 5: Add the non-Linux stub.** `cmd/aira/main.go` is cross-platform
+and calls `runner.RequestWorkerAdmit`/`runner.WorkerAdmitClientRequest`
+unconditionally in the CLI wiring added next — without this, `go build` on a
+non-Linux target fails with undefined symbols. Mirrors Task 2/7's own stub
+convention for their Linux-only pieces.
+
+`internal/runner/worker_admit_client_stub.go`:
+
+```go
+//go:build !linux
+
+package runner
+
+import (
+	"context"
+	"errors"
+	"time"
+)
+
+type WorkerAdmitLease struct {
+	WorkerID   string
+	ScopePath  string
+	MemoryMax  int64
+	MemoryHigh int64
+}
+
+func (l *WorkerAdmitLease) Close() error { return nil }
+
+type WorkerAdmitClientRequest struct {
+	SocketPath     string
+	JobID          string
+	OuterScope     string
+	Signature      string
+	EstimatedBytes int64
+	MaxWait        time.Duration
+}
+
+func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) (*WorkerAdmitLease, error) {
+	return nil, errors.New("aitest worker-admit: unsupported on this platform")
+}
+```
+
+- [ ] **Step 6: Wire the CLI verb.** In `cmd/aira/main.go`, alongside `confine-reserve`/`aitest-bootstrap`:
 
 ```go
 	if verb == "worker-admit" {
@@ -1487,7 +1767,7 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 }
 ```
 
-- [ ] **Step 6: Test the argv parser**
+- [ ] **Step 7: Test the argv parser**
 
 ```go
 package main
@@ -1507,10 +1787,10 @@ func TestParseWorkerAdmitArgsRequiresJobIDOuterScopeAndEstimatedBytes(t *testing
 
 Run: `aira confine -- go test ./cmd/aira/ -run TestParseWorkerAdmitArgs -v` — PASS.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add internal/runner/worker_admit_client_linux.go internal/runner/worker_admit_client_linux_test.go internal/daemon/testing_seams.go cmd/aira/main.go cmd/aira/worker_admit_test.go
+git add internal/runner/worker_admit_client_linux.go internal/runner/worker_admit_client_stub.go internal/runner/worker_admit_client_linux_test.go internal/daemon/testing_seams.go cmd/aira/main.go cmd/aira/worker_admit_test.go
 git commit -m "feat(aitest): add aira worker-admit CLI verb"
 ```
 
@@ -1905,10 +2185,17 @@ git commit -m "feat(aitest): inject aitest child environment on delegate-RAM lau
 - Create: `internal/pylib/pytest_aitest_supervisor_test.go`
 
 **Interfaces:**
-- Produces: `class WorkerAdmitDenied(Exception)`, `class Supervisor` with
-  `__init__`, `bootstrap()`, `collect(items)`, `next_nodeid()`,
-  `requeue_once(nodeid)`, `acquire_worker(estimated_bytes, max_wait="30s")` —
-  every later Python task in this plan extends this exact class.
+- Produces: `class WorkerAdmitUnavailable(Exception)` (the daemon is
+  genuinely unreachable — dial/connect failure, the CLI itself could not be
+  launched, or its response was malformed/garbage), `class
+  WorkerAdmitDenied(Exception)` (the daemon IS reachable and responded
+  normally with "denied" or "timeout" — busy/contended right now, not
+  down), `class Supervisor` with `__init__`, `bootstrap()`, `collect(items)`,
+  `next_nodeid()`, `requeue_once(nodeid)`,
+  `acquire_worker(estimated_bytes, max_wait="30s")` — every later Python
+  task in this plan extends this exact class. This two-exception split is
+  load-bearing for Task 16's fallback logic: only `WorkerAdmitUnavailable`
+  may ever disable daemon-backed admission for the rest of the run.
 - Consumes (via subprocess, at runtime): `AIRA_AITEST_BOOTSTRAP_CMD`,
   `AIRA_AITEST_WORKER_ADMIT_CMD` (Task 10) invoking the real `aira
   aitest-bootstrap` (Task 3) / `aira worker-admit` (Task 8) CLI verbs, whose
@@ -1932,7 +2219,7 @@ Go-side wiring is needed per task; only this one Go file is created, here.
 ```python
 import os
 
-from aitest.supervisor import Supervisor, WorkerAdmitDenied
+from aitest.supervisor import Supervisor, WorkerAdmitDenied, WorkerAdmitUnavailable
 
 
 def _write_stub(path, body):
@@ -1951,6 +2238,7 @@ sys.exit(0)
     supervisor = Supervisor()
     supervisor.bootstrap()
     assert supervisor.outer_scope == "/outer"
+    assert supervisor.supervisor_scope == "/outer/.aira-supervisor"
     assert supervisor.daemon_available is True
 
 
@@ -1993,21 +2281,35 @@ sys.stdin.buffer.read()
         process.wait(timeout=5)
 
 
-def test_acquire_worker_raises_when_daemon_unavailable():
+def test_acquire_worker_raises_unavailable_when_daemon_unavailable():
     supervisor = Supervisor()
     supervisor.daemon_available = False
     try:
         supervisor.acquire_worker(100)
-        assert False, "expected WorkerAdmitDenied"
-    except WorkerAdmitDenied:
+        assert False, "expected WorkerAdmitUnavailable"
+    except WorkerAdmitUnavailable:
         pass
 
 
-def test_acquire_worker_raises_on_denial(tmp_path, monkeypatch):
+def test_acquire_worker_raises_unavailable_when_command_unset():
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    try:
+        supervisor.acquire_worker(100)
+        assert False, "expected WorkerAdmitUnavailable"
+    except WorkerAdmitUnavailable:
+        pass
+
+
+def test_acquire_worker_raises_denied_on_daemon_denial(tmp_path, monkeypatch):
+    # Mirrors the real aira worker-admit CLI's actual failure shape
+    # (RequestWorkerAdmit, Task 8): a non-grant STATE response is wrapped
+    # as "worker-admit <state>: <reason>" on stderr with a nonzero exit —
+    # the daemon IS reachable here, it just declined this request.
     stub = _write_stub(tmp_path / "worker-admit-denied", """
 import sys
-print("denied reason=fallback:insufficient-headroom")
-sys.exit(0)
+sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit denied: fallback:insufficient-headroom\\n")
+sys.exit(1)
 """)
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
     supervisor = Supervisor()
@@ -2017,6 +2319,46 @@ sys.exit(0)
         assert False, "expected WorkerAdmitDenied"
     except WorkerAdmitDenied as exc:
         assert "denied" in str(exc)
+
+
+def test_acquire_worker_raises_denied_on_daemon_timeout_response(tmp_path, monkeypatch):
+    # A "timeout" wire response (the daemon waited out the full poll
+    # window, just busy/contended) is ALSO WorkerAdmitDenied, never
+    # WorkerAdmitUnavailable — the whole point of the split (fix for a real
+    # bug: one saturated moment must not permanently strip containment for
+    # the rest of the run, see Task 16).
+    stub = _write_stub(tmp_path / "worker-admit-timeout", """
+import sys
+sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit timeout: reject:saturated\\n")
+sys.exit(1)
+""")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    try:
+        supervisor.acquire_worker(100)
+        assert False, "expected WorkerAdmitDenied"
+    except WorkerAdmitDenied:
+        pass
+
+
+def test_acquire_worker_raises_unavailable_on_genuine_connection_failure(tmp_path, monkeypatch):
+    # A dial-level failure (no daemon to talk to at all) must NOT match the
+    # denied/timeout classification above, even though its text happens to
+    # come from the same E_CONFINE_UNAVAILABLE-prefixed error family.
+    stub = _write_stub(tmp_path / "worker-admit-dial-failure", """
+import sys
+sys.stderr.write("E_CONFINE_UNAVAILABLE: dial daemon: dial unix /run/aira.sock: connect: no such file or directory\\n")
+sys.exit(1)
+""")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    try:
+        supervisor.acquire_worker(100)
+        assert False, "expected WorkerAdmitUnavailable"
+    except WorkerAdmitUnavailable:
+        pass
 
 
 def test_next_nodeid_and_requeue_once_semantics():
@@ -2055,14 +2397,19 @@ import (
 // plugin's activation surface. Every later task in this plan (12 onward)
 // adds MORE test_*.py files under aitest/ that this same pytest discovery
 // run picks up automatically -- no further Go-side wiring is needed per
-// task.
+// task. --ignore=testdata excludes Task 17's testdata/ fixture suite: its
+// own conftest.py requires AIRA_AITEST_LIB to already be set (it imports
+// the extracted aitest package by that path), which this broader
+// source-directory run does not set -- testdata/ has its own dedicated Go
+// e2e test/invocation (Task 17, pytest_aitest_e2e_test.go) that sets it
+// correctly instead.
 func TestRealPytestAitestPackageUnitTests(t *testing.T) {
 	pytest := requireRealPytest(t)
 	aitestDir, err := filepath.Abs("aitest")
 	if err != nil {
 		t.Fatal(err)
 	}
-	command := exec.Command(pytest, "-q")
+	command := exec.Command(pytest, "-q", "--ignore=testdata")
 	command.Dir = aitestDir
 	command.Env = append(os.Environ(), "PYTHONPATH="+filepath.Dir(aitestDir), "PYTHONDONTWRITEBYTECODE=1")
 	output, err := command.CombinedOutput()
@@ -2087,7 +2434,21 @@ import subprocess
 import sys
 
 
+class WorkerAdmitUnavailable(Exception):
+    """The daemon is genuinely unreachable at the connection level: a dial
+    failure, the worker-admit CLI itself could not even be launched, or its
+    response was malformed/garbage -- there is no daemon to talk to. This
+    is the ONLY failure class that should ever disable daemon-backed
+    admission for the rest of the run (_disable_daemon, Task 16)."""
+    pass
+
+
 class WorkerAdmitDenied(Exception):
+    """The daemon IS reachable and responded normally with "denied" (budget
+    genuinely exhausted right now) or "timeout" (the request waited out its
+    full window -- the daemon is just busy/contended, not down). Means
+    "don't add a worker at this moment", never "abandon containment for the
+    rest of the run"."""
     pass
 
 
@@ -2099,6 +2460,7 @@ class Supervisor:
         self.queue = []
         self.attempts = {}  # nodeid -> attempt count (Task 15's retry-once rule)
         self.outer_scope = None
+        self.supervisor_scope = None
         self.daemon_available = True
         self.max_workers_fallback = max(1, int(os.environ.get("AIRA_AITEST_MAX_WORKERS_FALLBACK", "1")))
         self._fallback_warned = False
@@ -2125,6 +2487,8 @@ class Supervisor:
         for token in result.stdout.split():
             if token.startswith("outer="):
                 self.outer_scope = token[len("outer="):]
+            elif token.startswith("supervisor_scope="):
+                self.supervisor_scope = token[len("supervisor_scope="):]
         if not self.outer_scope:
             self._disable_daemon("aitest-bootstrap did not report an outer scope")
 
@@ -2163,17 +2527,25 @@ class Supervisor:
     def acquire_worker(self, estimated_bytes, max_wait="30s"):
         """Returns (grant: dict, process: subprocess.Popen) on success.
         process.stdin stays open as the daemon lease -- close it to release.
-        Raises WorkerAdmitDenied on any failure (daemon down, denied, timeout)."""
+        Raises WorkerAdmitUnavailable when there is no daemon to talk to at
+        all (dial/launch failure, malformed response); raises
+        WorkerAdmitDenied when the daemon responded normally but declined
+        (denied or timeout) -- the caller MUST treat these differently
+        (Task 16): only WorkerAdmitUnavailable may disable daemon-backed
+        admission for the rest of the run."""
         if not self.daemon_available:
-            raise WorkerAdmitDenied("daemon unavailable")
+            raise WorkerAdmitUnavailable("daemon unavailable")
         command = os.environ.get("AIRA_AITEST_WORKER_ADMIT_CMD", "")
         if not command:
-            raise WorkerAdmitDenied("AIRA_AITEST_WORKER_ADMIT_CMD is unset")
-        process = subprocess.Popen(
-            [command, "worker-admit", "--job-id", str(os.getpid()), "--outer-scope", self.outer_scope,
-             "--estimated-bytes", str(estimated_bytes), "--max-wait", max_wait],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True,
-        )
+            raise WorkerAdmitUnavailable("AIRA_AITEST_WORKER_ADMIT_CMD is unset")
+        try:
+            process = subprocess.Popen(
+                [command, "worker-admit", "--job-id", str(os.getpid()), "--outer-scope", self.outer_scope,
+                 "--estimated-bytes", str(estimated_bytes), "--max-wait", max_wait],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True,
+            )
+        except OSError as exc:
+            raise WorkerAdmitUnavailable(str(exc))
         line = process.stdout.readline().decode("utf-8", "strict").strip()
         if not line.startswith("granted "):
             stderr = process.stderr.read().decode("utf-8", "replace") if process.stderr else ""
@@ -2181,7 +2553,15 @@ class Supervisor:
                 process.wait(timeout=5)
             except Exception:
                 process.kill()
-            raise WorkerAdmitDenied(line or stderr or "worker-admit exited without a grant")
+            message = line or stderr or "worker-admit exited without a grant"
+            # RequestWorkerAdmit (Task 8) wraps a daemon-reachable-but-
+            # declined response as "worker-admit <state>: <reason>" on
+            # stderr -- ANYTHING else (a dial failure, a launch failure, a
+            # malformed response) means there is no daemon to talk to at
+            # all. This distinction is load-bearing (Task 16).
+            if "worker-admit denied" in message or "worker-admit timeout" in message:
+                raise WorkerAdmitDenied(message)
+            raise WorkerAdmitUnavailable(message)
         grant = {}
         for field in line[len("granted "):].split():
             key, _, value = field.partition("=")
@@ -2276,6 +2656,25 @@ def test_fork_worker_places_child_pid_into_real_scope_cgroup(tmp_path):
     os.waitpid(pid, 0)
     assert str(pid) in procs.split(), "child pid never appeared in scope cgroup.procs: %r" % procs
     assert marker.exists() and marker.read_text() == str(pid)
+
+
+def test_fork_worker_exits_child_without_propagating_when_place_self_fails(tmp_path):
+    """place_self() failing in the child (e.g. cgroup.procs itself is not
+    writable/does not exist) must never propagate as a normal Python
+    exception: that would unwind into the child's COW-duplicated copy of
+    the supervisor's own interpreter frames, producing a second, fully
+    UNCONFINED pytest process running arbitrary supervisor code -- a real
+    safety hazard, not just a bug. The child must os._exit() immediately
+    instead of ever reaching ordinary control flow."""
+    missing_scope = str(tmp_path / "does-not-exist")
+    pid, in_child = fork_worker(missing_scope)
+    if in_child:
+        # Unreachable if fork_worker's own guard is working -- only hit if
+        # the fix regresses and place_self's exception propagated here.
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    assert os.WIFEXITED(status), "child did not exit cleanly: status=%r" % status
+    assert os.WEXITSTATUS(status) == 70
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -2316,10 +2715,22 @@ def fork_worker(scope_path):
     Slice 1 as an architecturally-simpler choice than a raw-syscall
     workaround for a race this narrow (architectural-simplicity: no new
     machinery for a bounded, sub-millisecond gap) -- but call it out plainly
-    in plan-review rather than have it read as an oversight."""
+    in plan-review rather than have it read as an oversight.
+
+    Safety note: any exception place_self() raises happens in the CHILD --
+    it must never propagate through normal Python control flow from here,
+    since that would unwind into the child's COW-duplicated copy of the
+    supervisor's own interpreter frames and could run arbitrary supervisor
+    cleanup code fully UNCONFINED (a placement failure specifically means
+    containment was never established at all). os.fork() itself CAN also
+    raise, but only in the PARENT (no child exists yet in that case) --
+    that failure is deliberately left to propagate normally here."""
     pid = os.fork()
     if pid == 0:
-        place_self(scope_path)
+        try:
+            place_self(scope_path)
+        except BaseException:
+            os._exit(70)
         return 0, True
     return pid, False
 
@@ -2358,13 +2769,26 @@ git commit -m "feat(aitest): add worker fork + cgroup self-placement"
 - Create: `internal/pylib/aitest/conftest.py`
 
 **Interfaces:**
-- Produces (worker.py): `run_one(item) -> "passed"|"failed"|"error"`,
+- Produces (worker.py): `run_one(item) -> "passed"|"failed"|"skipped"|"error"`,
   `run_worker_loop(scope_path, items_by_nodeid, pipe_in, pipe_out)`.
 - Produces (supervisor.py): `Supervisor.spawn_worker(estimated_bytes,
   max_wait="30s") -> pid`, `Supervisor.run(estimated_bytes, worker_count=1,
   max_wait="30s") -> results dict` — Tasks 14/15/16 all extend `run()` and
   its helpers in place.
 - Consumes: `fork_worker` (Task 12).
+
+**Accepted Slice 1 limitation (nextitem=None):** `run_one` calls pytest's
+item protocol with `nextitem=None` for every single test — pytest's own
+documented signal that this is the LAST item in the session, which tears
+down the ENTIRE fixture stack (including session/module/class-scoped
+fixtures) after every individual test. Unlike plain pytest or xdist (which
+look ahead to supply the real next item so a fixture shared across tests
+persists), a Slice 1 suite relying on expensive or stateful session-scoped
+fixtures will see them re-run per test. Real look-ahead dispatch is a
+candidate for a later slice — it is closely related to, and no more urgent
+than, the loadscope/loadgroup fixture-affinity grouping spec §2 already
+defers past Slice 1. Not implemented here; see the test added below that
+proves (not just documents) the actual behavior.
 
 `conftest.py` enables pytest's own bundled `pytester` fixture (opt-in via
 `pytest_plugins` in a conftest, per pytest's own restriction against
@@ -2398,6 +2822,46 @@ def test_run_one_reports_passed_and_failed_outcomes(pytester):
     by_name = {item.name: item for item in items}
     assert run_one(by_name["test_passes"]) == "passed"
     assert run_one(by_name["test_fails"]) == "failed"
+
+
+def test_run_one_reports_skipped_outcome_distinctly(pytester):
+    """A skip is pytest's own well-defined, intentional outcome -- it must
+    never be folded into "error"/"unevaluated" downstream (Task 15's
+    crash/retry aggregation, Task 17's e2e assertions)."""
+    items = pytester.getitems("""
+        import pytest
+
+        def test_skipped():
+            pytest.skip("not applicable")
+    """)
+    assert run_one(items[0]) == "skipped"
+
+
+def test_run_one_tears_down_and_rebuilds_session_scoped_fixtures_per_test(pytester):
+    """Proves the accepted nextitem=None limitation documented above: with
+    plain pytest, a module-scoped fixture shared by two tests sets up ONCE;
+    here it is torn down and rebuilt after EVERY item, so the counter below
+    reaches 2, not 1."""
+    items = pytester.getitems("""
+        import pytest
+
+        _counter = {"value": 0}
+
+        @pytest.fixture(scope="module")
+        def counting_fixture():
+            _counter["value"] += 1
+            yield _counter["value"]
+
+        def test_first(counting_fixture):
+            pass
+
+        def test_second(counting_fixture):
+            pass
+    """)
+    assert len(items) == 2
+    for item in items:
+        assert run_one(item) == "passed"
+    assert items[0].module._counter["value"] == 2
 
 
 def test_run_worker_loop_dispatch_and_result_round_trip(pytester):
@@ -2442,7 +2906,8 @@ class _OutcomeCollector:
 
 def run_one(item):
     """Executes one already-collected pytest Item through pytest's own item
-    protocol (setup/call/teardown), returning "passed", "failed", or "error".
+    protocol (setup/call/teardown), returning "passed", "failed", "skipped",
+    or "error".
 
     UNCERTAIN, flagged for verification during implementation: calling
     item.ihook.pytest_runtest_protocol(item=item, nextitem=None) directly,
@@ -2453,6 +2918,16 @@ def run_one(item):
     exact hookimpl/pluginmanager registration dance below needs a real-pytest
     verification pass before it is trusted, not a guess presented as
     certain.
+
+    ACCEPTED SLICE 1 LIMITATION: nextitem=None is pytest's own signal that
+    this is the LAST item in the session, so it tears down and rebuilds the
+    ENTIRE fixture stack -- including session/module/class-scoped fixtures
+    -- after every single test, unlike plain pytest or xdist (which look
+    ahead to supply the real next item so a fixture shared across tests
+    persists). A suite relying on expensive or stateful session-scoped
+    fixtures will see them re-run per test in Slice 1. Real look-ahead
+    dispatch is deferred, a candidate for a later slice (see this task's own
+    Interfaces note and the test proving this behavior below).
     """
     collector = _OutcomeCollector()
     plugin_manager = item.config.pluginmanager
@@ -2463,6 +2938,8 @@ def run_one(item):
         plugin_manager.unregister(collector)
     if collector.worst == "passed":
         return "passed"
+    if collector.worst == "skipped":
+        return "skipped"
     if collector.worst == "failed":
         return "failed"
     return "error"
@@ -2498,35 +2975,198 @@ run_worker_loop`, then in `Supervisor.__init__` add:
         self._run_max_wait = "30s"
 ```
 
+Also add this new exception near `WorkerAdmitDenied`/`WorkerAdmitUnavailable`
+(Task 11) at the top of `supervisor.py`:
+
+```python
+class WorkerPlacementFailed(Exception):
+    """place_self() never completed (or its child-side placement ack never
+    arrived) -- the forked child died before we could confirm it actually
+    joined its granted cgroup scope. Distinct from a worker that WAS placed
+    and crashed later mid-test (Task 15's _handle_worker_exit path): a
+    placement failure means the admitted grant was never even used for a
+    test."""
+    pass
+
+
+def _read_line_blocking(fd, state):
+    """Blocking read of exactly one line from a raw fd, used only for the
+    one-time post-fork placement-ack wait (spawn_worker/
+    _spawn_fallback_worker) -- blocking IS the desired behaviour there.
+    Shares state["read_buffer"] with _drain_available_lines below (both
+    read the SAME fd over the worker's lifetime) so no byte a single
+    os.read() call happens to over-read past this line's newline is ever
+    lost to a later caller."""
+    buf = state.get("read_buffer", b"")
+    while b"\n" not in buf:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            state["result_eof"] = True
+            break
+        buf += chunk
+    line, sep, buf = buf.partition(b"\n")
+    state["read_buffer"] = buf
+    return line.decode("utf-8", "strict") if sep else ""
+
+
+def _drain_available_lines(fd, state):
+    """Non-blocking read of everything CURRENTLY available on fd, split
+    into complete lines; any trailing partial line is kept in
+    state["read_buffer"] for the next call. fd must already be in
+    non-blocking mode (spawn_worker sets this right after the placement
+    ack is read).
+
+    This exists instead of a select()-after-readline() check on a
+    buffered file object because that combination is a real, demonstrated
+    race: os.fdopen(fd, "r")'s TextIOWrapper commonly pulls MULTIPLE
+    already-flushed lines off the kernel pipe in a single underlying read
+    to satisfy one readline() call (a worker writes a result line, then --
+    if recycling -- an immediate __recycle__ line, both flushed in rapid
+    succession with no intervening syscall for a reader to wake between
+    them) -- so by the time readline() returns just the first line, the
+    kernel pipe can already be EMPTY while the wrapper's own internal
+    buffer silently holds the second. select() only sees kernel-level
+    readiness, so it reports "nothing more" even though a complete
+    __recycle__ line is sitting unread one layer up -- reproducing the
+    exact silently-dropped-dispatch race this whole mechanism exists to
+    close (spec 3.6). Reading raw bytes directly off a non-blocking fd
+    into one buffer this module fully owns removes that blind spot: there
+    is no second, invisible buffering layer between "what select saw" and
+    "what the caller can see"."""
+    buf = state.get("read_buffer", b"")
+    while True:
+        try:
+            chunk = os.read(fd, 65536)
+        except BlockingIOError:
+            break
+        if not chunk:
+            state["result_eof"] = True
+            break
+        buf += chunk
+    lines = []
+    while b"\n" in buf:
+        line, _, buf = buf.partition(b"\n")
+        lines.append(line.decode("utf-8", "strict"))
+    state["read_buffer"] = buf
+    return lines
+```
+
 and append these methods to the class:
 
 ```python
+    _PLACED_LINE = "__placed__"
+
+    def _child_close_other_workers_fds(self):
+        """A forked child inherits DUPLICATES of every fd already open in
+        the parent's fd table -- fork() copies the whole table and there is
+        no exec() here for CLOEXEC to ever fire. Without this, a
+        later-forked worker keeps a live copy of an EARLIER worker's
+        admit-lease pipe (and dispatch/result pipes). So when the
+        supervisor later closes ITS OWN copy of an earlier worker's
+        admit_process.stdin to retire it, the daemon-side `aira
+        worker-admit` CLI's stdin-EOF read never sees EOF (some OTHER fd
+        still holds the write end open), and admit_process.wait(timeout=5)
+        hangs/raises. Must run before this child does anything else --
+        BEFORE closing its own inherited copies of ITS OWN pipes too, so
+        order this first in both spawn_worker and _spawn_fallback_worker
+        (Task 16)."""
+        for state in self.workers.values():
+            try:
+                state["dispatch_write"].close()
+            except Exception:
+                pass
+            try:
+                os.close(state["result_fd"])
+            except OSError:
+                pass
+            admit_process = state.get("admit_process")
+            if admit_process is not None:
+                for stream in (admit_process.stdin, admit_process.stdout, admit_process.stderr):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+
     def spawn_worker(self, estimated_bytes, max_wait="30s"):
         """Admits and forks one worker, returning its pid. Raises
-        WorkerAdmitDenied if admission fails -- the caller (run()) decides
-        fallback policy."""
+        WorkerAdmitUnavailable/WorkerAdmitDenied if admission fails, or
+        WorkerPlacementFailed if the forked child died before confirming it
+        joined its granted cgroup scope -- the caller (run()) decides
+        fallback/retry policy for each.
+
+        Safety: the ENTIRE forked-child branch below is wrapped in one
+        broad try/except that os._exit()s on ANY exception. A forked child
+        must never be allowed to fall through to normal Python control
+        flow / interpreter shutdown -- that risks running supervisor-level
+        cleanup code fully UNCONFINED. (place_self() itself is separately
+        guarded the same way inside fork_worker, Task 12, since it can
+        raise before this function's own try even starts.)"""
         grant, admit_process = self.acquire_worker(estimated_bytes, max_wait=max_wait)
         dispatch_read, dispatch_write = os.pipe()
         result_read, result_write = os.pipe()
         pid, in_child = fork_worker(grant["scope"])
         if in_child:
-            os.close(dispatch_write)
-            os.close(result_read)
-            admit_process.stdin.close()
-            admit_process.stdout.close()
-            pipe_in = os.fdopen(dispatch_read, "r")
-            pipe_out = os.fdopen(result_write, "w")
-            run_worker_loop(grant["scope"], self.items_by_nodeid, pipe_in, pipe_out)
+            try:
+                self._child_close_other_workers_fds()
+                os.close(dispatch_write)
+                os.close(result_read)
+                admit_process.stdin.close()
+                admit_process.stdout.close()
+                pipe_in = os.fdopen(dispatch_read, "r")
+                pipe_out = os.fdopen(result_write, "w")
+                # Placement is already verified by the time we get here --
+                # fork_worker's own child branch os._exit()s before ever
+                # returning if place_self failed (Task 12) -- so reaching
+                # this line already IS the placement proof. One line down
+                # the result pipe lets the parent (below) tell "placed
+                # fine, died/recycled later" apart from "never even got
+                # placed" for its crash-handling logic (spec 4).
+                pipe_out.write(self._PLACED_LINE + "\n")
+                pipe_out.flush()
+                run_worker_loop(grant["scope"], self.items_by_nodeid, pipe_in, pipe_out)
+            except BaseException:
+                os._exit(70)
             os._exit(0)
         os.close(dispatch_read)
         os.close(result_write)
-        self.workers[pid] = {
+        # result_read is handled as a RAW fd with manual line-buffering
+        # (_read_line_blocking / _drain_available_lines below) for this
+        # worker's whole lifetime, never wrapped in os.fdopen()'s buffered
+        # TextIOWrapper -- see _drain_available_lines's docstring for why:
+        # a buffered readline() can silently pull more than one line off
+        # the kernel pipe in a single underlying read, and a later
+        # select()-on-the-wrapped-object check cannot see bytes already
+        # sitting in the wrapper's own buffer rather than the pipe.
+        state = {"result_fd": result_read, "read_buffer": b"", "result_eof": False}
+        ack = _read_line_blocking(result_read, state)
+        if ack != self._PLACED_LINE:
+            # The child died (os._exit'd, above, or from fork_worker's own
+            # guard) before ever confirming placement -- it never joined
+            # its granted cgroup scope. This is a PLACEMENT failure, not a
+            # mid-test crash (Task 15's _handle_worker_exit is for a worker
+            # that WAS placed and later died) -- release the now-dead
+            # admit lease and raise distinctly so the caller does not
+            # spend this nodeid's one-and-only crash-retry budget on it.
+            os.close(result_read)
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+            admit_process.stdin.close()
+            try:
+                admit_process.wait(timeout=5)
+            except Exception:
+                pass
+            raise WorkerPlacementFailed("worker %d exited before confirming cgroup placement" % pid)
+        os.set_blocking(result_read, False)
+        state.update({
             "grant": grant,
             "admit_process": admit_process,
             "dispatch_write": os.fdopen(dispatch_write, "w"),
-            "result_read": os.fdopen(result_read, "r"),
             "in_flight": None,
-        }
+        })
+        self.workers[pid] = state
         return pid
 
     def _dispatch_to_idle_workers(self):
@@ -2543,8 +3183,8 @@ and append these methods to the class:
     def _retire_worker(self, pid, state):
         state["dispatch_write"].close()
         try:
-            state["result_read"].close()
-        except Exception:
+            os.close(state["result_fd"])
+        except OSError:
             pass
         try:
             os.waitpid(pid, 0)
@@ -2576,24 +3216,43 @@ and append these methods to the class:
             self.spawn_worker(estimated_bytes, max_wait=max_wait)
         self._dispatch_to_idle_workers()
         while self.workers:
-            readers = [state["result_read"] for state in self.workers.values()]
-            ready, _, _ = select.select(readers, [], [], 1.0)
+            fd_to_pid = {state["result_fd"]: pid for pid, state in self.workers.items()}
+            ready, _, _ = select.select(list(fd_to_pid), [], [], 1.0)
             if not ready:
                 continue
-            for pid, state in list(self.workers.items()):
-                if state["result_read"] not in ready:
+            for fd in ready:
+                pid = fd_to_pid[fd]
+                if pid not in self.workers:
                     continue
-                line = state["result_read"].readline()
-                line = line.rstrip("\n")
-                nodeid, _, outcome = line.partition(" ")
-                self.results[nodeid] = outcome
-                state["in_flight"] = None
+                state = self.workers[pid]
+                for line in _drain_available_lines(fd, state):
+                    nodeid, _, outcome = line.partition(" ")
+                    self.results[nodeid] = outcome
+                    state["in_flight"] = None
             self._dispatch_to_idle_workers()
             if not self.queue and all(state["in_flight"] is None for state in self.workers.values()):
                 for pid, state in list(self.workers.items()):
                     state["dispatch_write"].write("__stop__\n")
                     state["dispatch_write"].flush()
                     self._retire_worker(pid, state)
+        # Best-effort: rmdir the supervisor's OWN child scope this run
+        # relocated itself into (bootstrap, Task 2/3/11). The OUTER scope
+        # itself is `aira confine`'s own job to tear down when the whole
+        # launch process exits -- this is only about the new child scope
+        # aitest itself created. NOTE: in the real-cgroup case this
+        # typically still fails here (EBUSY) since the supervisor process
+        # calling rmdir is itself still a live member of the scope it is
+        # trying to remove -- it only ever succeeds AFTER this process
+        # exits, which is after this call returns. Attempted anyway because
+        # it is free and occasionally correct (e.g. non-real-cgroup test
+        # doubles); #72's existing orphaned-scope reaper is the real
+        # backstop that cleans this up machine-wide once the process is
+        # actually gone.
+        if self.supervisor_scope:
+            try:
+                os.rmdir(self.supervisor_scope)
+            except OSError as exc:
+                sys.stderr.write("aira aitest: could not remove supervisor scope %s: %s\n" % (self.supervisor_scope, exc))
         return self.results
 ```
 
@@ -2629,7 +3288,9 @@ git commit -m "feat(aitest): add run_one item execution and the supervisor dispa
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `internal/pylib/aitest/test_supervisor.py`:
+Add `import time` to the top of `internal/pylib/aitest/test_supervisor.py`
+(needed by the two-worker timing test below). Append to
+`internal/pylib/aitest/test_supervisor.py`:
 
 ```python
 def test_recycle_after_max_tests_respawns_a_fresh_worker(tmp_path, monkeypatch, pytester):
@@ -2669,13 +3330,80 @@ sys.stdin.buffer.read()
     assert all(outcome == "passed" for outcome in results.values())
     # One worker per test proves exactly one recycle event fired between them.
     assert admit_calls.read_text().count("x") == 2
+
+
+def test_recycle_with_two_concurrent_workers_does_not_hang_on_retirement(tmp_path, monkeypatch, pytester):
+    """A forked child inherits DUPLICATES of every already-open fd in the
+    parent's fd table (fork() copies the whole table; there is no exec()
+    here for CLOEXEC to ever fire) -- without closing every OTHER
+    already-known worker's fds before entering its own loop, a
+    later-forked worker (here, worker 2) keeps a live copy of an EARLIER
+    worker's (worker 1's) admit-lease pipe write end. When the supervisor
+    then closes ITS OWN copy of worker 1's admit_process.stdin to retire it
+    (recycle, at AIRA_AITEST_WORKER_MAX_TESTS=1), the daemon-side stub's
+    stdin-read never sees EOF unless worker 2 ALSO closed its inherited
+    duplicate -- admit_process.wait(timeout=5) would then hang/raise. This
+    test needs TWO concurrent workers specifically to make that
+    fd-inheritance bug observable: Task 13's own test and this file's other
+    recycle test above both use worker_count=1, which cannot exercise it at
+    all (worker_count=1's startup loop never has two workers registered in
+    self.workers at the same time)."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+import sys
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+sys.exit(0)
+""")
+    admit_calls = tmp_path / "admit-calls-2"
+    admit = _write_stub(tmp_path / "worker-admit-2", f"""
+import os, sys
+open({str(admit_calls)!r}, "a").write("x")
+scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+os.makedirs(scope, exist_ok=True)
+print("granted scope=%s worker_id=%d memory_max=104857600 memory_high=83886080" % (scope, os.getpid()))
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", "1")
+
+    items = pytester.getitems("""
+        def test_one():
+            assert True
+
+        def test_two():
+            assert True
+
+        def test_three():
+            assert True
+
+        def test_four():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+
+    started = time.monotonic()
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=2)
+    elapsed = time.monotonic() - started
+
+    assert len(results) == 4
+    assert all(outcome == "passed" for outcome in results.values())
+    # A hang on the fd-inheritance bug would show up as admit_process.wait's
+    # own 5-second timeout firing at least once across the four
+    # retirements; a healthy run completes in a small fraction of that.
+    assert elapsed < 4.0, "run() took %.1fs -- looks like a retirement hang (fd-inheritance bug)" % elapsed
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `aira confine -- go test ./internal/pylib/ -run TestRealPytestAitestPackageUnitTests -v`
 Expected: FAIL (both workers admitted at once / no recycle event — assertion
-on `admit_calls` content fails)
+on `admit_calls` content fails; the two-worker test additionally exercises a
+retirement hang once `_should_recycle`/dispatch exist without the
+fd-inheritance and drain-before-dispatch fixes applied)
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -2701,7 +3429,9 @@ def _should_recycle(scope_path, started_at, completed_count):
     if time.monotonic() - started_at > max_seconds:
         return True
     max_tests = int(os.environ.get("AIRA_AITEST_WORKER_MAX_TESTS", str(_DEFAULT_MAX_TESTS)))
-    if completed_count > max_tests:
+    # >= , not >: with AIRA_AITEST_WORKER_MAX_TESTS=1 and exactly one
+    # completed test, 1 > 1 is false and recycle would never fire at all.
+    if completed_count >= max_tests:
         return True
     if scope_path is None:
         # Daemon-down fallback mode (Task 16): no granted cgroup scope to
@@ -2751,7 +3481,45 @@ _STOP_LINE = "__stop__"
 _RECYCLE_LINE = "__recycle__"
 ```
 
-Add this new method to `Supervisor`:
+Replace `_retire_worker` (Task 13) to also tear down the worker's own scope
+directory, best-effort, once its process has actually exited (the
+`os.waitpid` call just above already guarantees that):
+
+```python
+    def _retire_worker(self, pid, state):
+        state["dispatch_write"].close()
+        try:
+            os.close(state["result_fd"])
+        except OSError:
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+        state["admit_process"].stdin.close()
+        state["admit_process"].wait(timeout=5)
+        grant = state.get("grant")
+        if grant is not None:
+            # Best-effort: this is the NEW per-worker child scope aitest
+            # itself created (CreateWorkerScope, Task 7) -- not the outer
+            # confine scope, which is `aira confine`'s own job to tear down
+            # when the whole launch exits. The worker process was just
+            # waited on above, so (unlike the supervisor's own scope,
+            # which the process calling rmdir is itself still inside of)
+            # this one's cgroup should now be empty and actually
+            # removable. Log and continue on failure rather than let a
+            # cleanup race crash the supervisor -- an orphaned empty scope
+            # directory is a cosmetic leak, not a correctness problem, and
+            # #72's existing orphan-scope reaper already sweeps these up
+            # machine-wide as a backstop.
+            try:
+                os.rmdir(grant["scope"])
+            except OSError as exc:
+                sys.stderr.write("aira aitest: could not remove worker scope %s: %s\n" % (grant["scope"], exc))
+        del self.workers[pid]
+```
+
+Add these two new methods to `Supervisor`:
 
 ```python
     def _replace_worker(self):
@@ -2760,22 +3528,71 @@ Add this new method to `Supervisor`:
         if not self.queue:
             return
         self.spawn_worker(self._run_estimated_bytes, max_wait=self._run_max_wait)
+
+    def _drain_worker(self, pid, state):
+        """Handles every line CURRENTLY AVAILABLE for this worker's result
+        pipe in one pass via _drain_available_lines (module-level, defined
+        alongside WorkerPlacementFailed), not just the first. A
+        completed-test result line and an immediately-following
+        __recycle__ sentinel can both already be available by the time
+        select() wakes the caller (the worker writes the result line,
+        flushes, then -- if recycling -- writes __recycle__ and flushes
+        again, in rapid succession with no intervening syscall that would
+        let the parent's select() wake in between). Reading only the FIRST
+        line per wakeup and letting _dispatch_to_idle_workers run before a
+        pending recycle is checked is exactly the race this drains: it
+        would hand a fresh nodeid to a worker that is already retiring,
+        silently losing that dispatch (and, once Task 15's crash detection
+        exists, wrongly reclassifying the loss as a crash and burning that
+        nodeid's one genuine retry on a fictitious one). Must run to
+        completion for a ready worker BEFORE _dispatch_to_idle_workers is
+        called for this select() wakeup. See _drain_available_lines's own
+        docstring for why this reads a raw fd directly rather than
+        select()-checking a buffered file object.
+
+        EOF (no lines at all, and _drain_available_lines set
+        state["result_eof"]) means the worker's result pipe closed without
+        a terminating record for its in-flight nodeid -- a crash (kernel
+        OOM, host watchdog, any non-reporting exit). Task 15 defines
+        _handle_worker_exit; until Task 15 lands, that call is a no-op
+        placeholder (see Task 15's own Step 1)."""
+        lines = _drain_available_lines(state["result_fd"], state)
+        if not lines:
+            if state.get("result_eof"):
+                self._handle_worker_exit(pid, state)
+            return
+        for line in lines:
+            if line == _RECYCLE_LINE:
+                self._retire_worker(pid, state)
+                self._replace_worker()
+                return
+            nodeid, _, outcome = line.partition(" ")
+            self.results[nodeid] = outcome
+            state["in_flight"] = None
+
+    def _handle_worker_exit(self, pid, state):
+        """Minimal stub so _drain_worker's EOF branch above has something
+        safe to call in this task -- just retires and tries to keep the
+        queue moving, with NO requeue/unevaluated bookkeeping yet. Task 15
+        replaces this with the real requeue-once-then-unevaluated version;
+        this task's own tests never intentionally crash a worker, so this
+        stub is never exercised by Task 14's test suite, only present so a
+        genuinely unexpected crash during this task's tests fails loudly
+        and comprehensibly rather than with an AttributeError."""
+        self._retire_worker(pid, state)
+        self._replace_worker()
 ```
 
-Replace `Supervisor.run`'s per-line body inside the `for pid, state in
-list(self.workers.items()):` loop (the `line = state["result_read"].readline()`
-block) with:
+Replace `Supervisor.run`'s per-worker body inside the `for fd in ready:`
+loop (the `for line in _drain_available_lines(fd, state): ...` block
+Task 13 introduced) with a call to the new helper:
 
 ```python
-                line = state["result_read"].readline()
-                line = line.rstrip("\n")
-                if line == _RECYCLE_LINE:
-                    self._retire_worker(pid, state)
-                    self._replace_worker()
+            for fd in ready:
+                pid = fd_to_pid[fd]
+                if pid not in self.workers:
                     continue
-                nodeid, _, outcome = line.partition(" ")
-                self.results[nodeid] = outcome
-                state["in_flight"] = None
+                self._drain_worker(pid, self.workers[pid])
 ```
 
 Also replace the `"__stop__"` literal at the bottom of `run()` with
@@ -2857,7 +3674,9 @@ corrupting `self.results`, not `unevaluated`)
 
 - [ ] **Step 3: Write minimal implementation**
 
-Add this new method to `Supervisor` in `internal/pylib/aitest/supervisor.py`:
+Replace `Supervisor._handle_worker_exit` in `internal/pylib/aitest/supervisor.py`
+-- Task 14 added a minimal stub (retire + replace, no requeue) so its own
+`_drain_worker` had something safe to call; this is the real version:
 
 ```python
     def _handle_worker_exit(self, pid, state):
@@ -2873,23 +3692,9 @@ Add this new method to `Supervisor` in `internal/pylib/aitest/supervisor.py`:
         self._replace_worker()
 ```
 
-Replace the per-line body inside `run()`'s ready-handling loop again, this
-time checking for EOF first:
-
-```python
-                line = state["result_read"].readline()
-                if line == "":
-                    self._handle_worker_exit(pid, state)
-                    continue
-                line = line.rstrip("\n")
-                if line == _RECYCLE_LINE:
-                    self._retire_worker(pid, state)
-                    self._replace_worker()
-                    continue
-                nodeid, _, outcome = line.partition(" ")
-                self.results[nodeid] = outcome
-                state["in_flight"] = None
-```
+`_drain_worker` itself is unchanged from Task 14 -- it already calls
+`self._handle_worker_exit(pid, state)` on EOF (via `_drain_available_lines`'s
+`state["result_eof"]` flag); this task only replaces what that method DOES.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -2942,6 +3747,125 @@ def test_daemon_down_fallback_completes_suite_with_one_warning_no_admit_subproce
     assert supervisor.daemon_available is False
     stderr = capsys.readouterr().err
     assert stderr.count("aira aitest:") == 1
+
+
+def test_worker_admit_denied_does_not_disable_daemon_and_still_completes(tmp_path, monkeypatch, pytester, capsys):
+    """A "denied" response means the daemon is reachable and just declined
+    THIS request right now -- it must NOT disable daemon-backed admission
+    or fall back to unconfined workers (the bug this fixes: one saturated
+    moment permanently stripping containment for the rest of the run).
+    This stub denies the first two admission attempts, then grants; the
+    suite must still complete with containment intact throughout (no
+    fallback warning emitted at all)."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+import sys
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+sys.exit(0)
+""")
+    denial_state = tmp_path / "denials-remaining"
+    denial_state.write_text("2")
+    admit = _write_stub(tmp_path / "worker-admit", f"""
+import os, sys
+state_path = {str(denial_state)!r}
+remaining = int(open(state_path).read())
+if remaining > 0:
+    open(state_path, "w").write(str(remaining - 1))
+    sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit denied: fallback:insufficient-headroom\\n")
+    sys.exit(1)
+scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+os.makedirs(scope, exist_ok=True)
+print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+
+    items = pytester.getitems("""
+        def test_one():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+
+    assert len(results) == 1
+    assert all(outcome == "passed" for outcome in results.values())
+    assert supervisor.daemon_available is True
+    assert capsys.readouterr().err == ""
+
+
+def test_fallback_worker_count_capped_at_pool_size_not_added_on_top(tmp_path, monkeypatch, pytester):
+    """Fallback spawning must respect min(requested_worker_count,
+    max_workers_fallback) as the TOTAL pool size -- not spawn up to
+    max_workers_fallback ON TOP OF whatever was already admitted before
+    the daemon was marked unavailable mid-startup, and not ignore
+    --aitest-workers by always growing to the (possibly NumCPU-sized)
+    fallback cap regardless of what was actually requested. The first
+    worker-admit call succeeds (one confined worker gets running); the
+    second reveals the daemon is genuinely unreachable."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+import sys
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+sys.exit(0)
+""")
+    admit_state = tmp_path / "admit-count"
+    admit_state.write_text("0")
+    admit = _write_stub(tmp_path / "worker-admit", f"""
+import os, sys
+state_path = {str(admit_state)!r}
+count = int(open(state_path).read())
+open(state_path, "w").write(str(count + 1))
+if count == 0:
+    scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+    os.makedirs(scope, exist_ok=True)
+    print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+    sys.stdout.flush()
+    sys.stdin.buffer.read()
+else:
+    sys.stderr.write("E_CONFINE_UNAVAILABLE: dial daemon: connection refused\\n")
+    sys.exit(1)
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    monkeypatch.setenv("AIRA_AITEST_MAX_WORKERS_FALLBACK", "5")
+
+    items = pytester.getitems("""
+        def test_one():
+            assert True
+
+        def test_two():
+            assert True
+
+        def test_three():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    fallback_spawns = []
+    original_spawn_fallback = supervisor._spawn_fallback_worker
+
+    def counting_spawn_fallback():
+        pid = original_spawn_fallback()
+        fallback_spawns.append(pid)
+        return pid
+
+    supervisor._spawn_fallback_worker = counting_spawn_fallback
+
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=3)
+
+    assert len(results) == 3
+    assert all(outcome == "passed" for outcome in results.values())
+    assert supervisor.daemon_available is False
+    # 1 confined worker was already admitted before unavailability was
+    # detected -- the fallback loop must add at most 2 MORE (pool size 3 =
+    # min(worker_count=3, max_workers_fallback=5), minus the 1 already
+    # running), never up to 5 on top of it.
+    assert len(fallback_spawns) <= 2
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -2960,37 +3884,55 @@ Add this new method to `Supervisor` in `internal/pylib/aitest/supervisor.py`:
         """No admission, no cgroup placement -- reuses worker.py's own
         execution loop with scope_path=None. The already-emitted
         _disable_daemon warning is the ONLY notice; never warn again per
-        worker."""
+        worker. Wrapped the same way spawn_worker (Task 13) is: the entire
+        forked-child branch os._exit()s on any exception rather than ever
+        falling through to normal Python control flow, and every OTHER
+        already-known worker's fds are closed before this child does
+        anything else (same fd-inheritance hazard as spawn_worker -- this
+        is a second, independent os.fork() call site with the identical
+        fd-table-copy problem)."""
         dispatch_read, dispatch_write = os.pipe()
         result_read, result_write = os.pipe()
         pid = os.fork()
         if pid == 0:
-            os.close(dispatch_write)
-            os.close(result_read)
-            pipe_in = os.fdopen(dispatch_read, "r")
-            pipe_out = os.fdopen(result_write, "w")
-            run_worker_loop(None, self.items_by_nodeid, pipe_in, pipe_out)
+            try:
+                self._child_close_other_workers_fds()
+                os.close(dispatch_write)
+                os.close(result_read)
+                pipe_in = os.fdopen(dispatch_read, "r")
+                pipe_out = os.fdopen(result_write, "w")
+                run_worker_loop(None, self.items_by_nodeid, pipe_in, pipe_out)
+            except BaseException:
+                os._exit(70)
             os._exit(0)
         os.close(dispatch_read)
         os.close(result_write)
+        # Same raw-fd, non-blocking treatment as spawn_worker (Task 13) --
+        # no placement ack to wait for here (scope_path=None, nothing to
+        # place into), so just flip to non-blocking immediately.
+        os.set_blocking(result_read, False)
         self.workers[pid] = {
             "grant": None,
             "admit_process": None,
             "dispatch_write": os.fdopen(dispatch_write, "w"),
-            "result_read": os.fdopen(result_read, "r"),
+            "result_fd": result_read,
+            "read_buffer": b"",
+            "result_eof": False,
             "in_flight": None,
         }
         return pid
 ```
 
-Replace `_retire_worker` to guard the now-possibly-`None` `admit_process`:
+Replace `_retire_worker` (Task 14's version, which already tears down the
+worker's own scope directory) to also guard the now-possibly-`None`
+`admit_process`/`grant` a fallback worker has:
 
 ```python
     def _retire_worker(self, pid, state):
         state["dispatch_write"].close()
         try:
-            state["result_read"].close()
-        except Exception:
+            os.close(state["result_fd"])
+        except OSError:
             pass
         try:
             os.waitpid(pid, 0)
@@ -2999,26 +3941,55 @@ Replace `_retire_worker` to guard the now-possibly-`None` `admit_process`:
         if state["admit_process"] is not None:
             state["admit_process"].stdin.close()
             state["admit_process"].wait(timeout=5)
+        grant = state.get("grant")
+        if grant is not None:
+            try:
+                os.rmdir(grant["scope"])
+            except OSError as exc:
+                sys.stderr.write("aira aitest: could not remove worker scope %s: %s\n" % (grant["scope"], exc))
         del self.workers[pid]
 ```
 
-Replace `_replace_worker` to fall back when the daemon path fails or is
-already down:
+Replace `_replace_worker` to route the two admission-failure exception
+types differently, and fall back to unconfined only on the ones that
+actually mean "no daemon":
 
 ```python
     def _replace_worker(self):
         """Acquire a fresh worker if queue work remains -- shared by the
-        recycle and crash/retry paths. Falls back to an unconfined worker
-        if the daemon path is (or becomes) unavailable."""
+        recycle and crash/retry paths.
+
+        WorkerAdmitDenied (the daemon IS reachable, it just declined this
+        particular request right now -- budget exhausted or contended)
+        leaves daemon_available untouched: simply don't replace this
+        worker yet. The NEXT retirement's _replace_worker call (or a later
+        dispatch pass) tries again -- one saturated moment must never
+        permanently strip containment for the rest of the run.
+
+        WorkerAdmitUnavailable (no daemon to talk to at all) and
+        WorkerPlacementFailed (the cgroup mechanism itself is broken
+        locally, not just momentarily busy) both fall back to an
+        unconfined worker for the rest of the run -- these are the only
+        two failure classes that mean the daemon path is genuinely not
+        going to work."""
         if not self.queue:
             return
         if self.daemon_available:
             try:
                 self.spawn_worker(self._run_estimated_bytes, max_wait=self._run_max_wait)
                 return
-            except WorkerAdmitDenied as exc:
+            except WorkerAdmitDenied:
+                return
+            except (WorkerAdmitUnavailable, WorkerPlacementFailed) as exc:
                 self._disable_daemon(str(exc))
         self._spawn_fallback_worker()
+```
+
+Add these two new module-level constants alongside `_STOP_LINE`/`_RECYCLE_LINE`:
+
+```python
+_STARTUP_DENIAL_RETRY_ATTEMPTS = 5
+_STARTUP_DENIAL_RETRY_SECONDS = 1.0
 ```
 
 Replace `run()`'s startup section (everything from `self.bootstrap()` through
@@ -3036,11 +4007,47 @@ the first `self._dispatch_to_idle_workers()` call) with:
                     break
                 try:
                     self.spawn_worker(estimated_bytes, max_wait=max_wait)
-                except WorkerAdmitDenied as exc:
+                except WorkerAdmitDenied:
+                    # Contended/no budget RIGHT NOW -- the daemon is still
+                    # there. Stop trying to grow the pool this instant and
+                    # start dispatching to however many DID get admitted;
+                    # a later retirement's _replace_worker tries for more.
+                    break
+                except (WorkerAdmitUnavailable, WorkerPlacementFailed) as exc:
                     self._disable_daemon(str(exc))
                     break
+            # A denied/contended daemon must never silently strip
+            # containment (denied != unavailable, above) -- but with ZERO
+            # workers admitted yet there is also no later retirement to
+            # hook a retry off of (_replace_worker only fires when an
+            # EXISTING worker retires). Retry getting AT LEAST one worker
+            # running a small bounded number of times; only if that still
+            # never succeeds do we fall back for this run rather than
+            # silently completing with an empty result set while the
+            # queue still has work.
+            attempt = 0
+            while (self.daemon_available and not self.workers and self.queue
+                   and attempt < _STARTUP_DENIAL_RETRY_ATTEMPTS):
+                attempt += 1
+                time.sleep(_STARTUP_DENIAL_RETRY_SECONDS)
+                try:
+                    self.spawn_worker(estimated_bytes, max_wait=max_wait)
+                except WorkerAdmitDenied:
+                    continue
+                except (WorkerAdmitUnavailable, WorkerPlacementFailed) as exc:
+                    self._disable_daemon(str(exc))
+                    break
+            if self.daemon_available and not self.workers and self.queue:
+                self._disable_daemon("worker-admit stayed denied after %d retries" % _STARTUP_DENIAL_RETRY_ATTEMPTS)
         if not self.daemon_available:
-            for _ in range(self.max_workers_fallback):
+            # Cap TOTAL concurrent workers (already-admitted + fallback) at
+            # the configured pool size -- min(worker_count,
+            # max_workers_fallback), never NumCPU regardless of what
+            # --aitest-workers actually asked for, and never on top of
+            # whatever got admitted before the daemon was marked
+            # unavailable mid-startup-loop.
+            remaining_pool = max(0, min(worker_count, self.max_workers_fallback) - len(self.workers))
+            for _ in range(remaining_pool):
                 if not self.queue:
                     break
                 self._spawn_fallback_worker()
@@ -3068,7 +4075,6 @@ git commit -m "feat(aitest): add daemon-down fallback to an unconfined worker po
 
 **Files:**
 - Modify: `internal/pylib/aitest/__init__.py`
-- Modify: `internal/daemon/testing_seams.go`
 - Create: `internal/pylib/aitest/testdata/conftest.py`
 - Create: `internal/pylib/aitest/testdata/test_pass.py`
 - Create: `internal/pylib/aitest/testdata/test_fail.py`
@@ -3085,13 +4091,13 @@ git commit -m "feat(aitest): add daemon-down fallback to an unconfined worker po
   own goal — driving the chain through a real `pytest` subprocess — is not
   achievable without it. Flagged for extra review scrutiny; see this task's
   Step 3 note.
-- Produces (`testing_seams.go`): `func (s *Server)
-  SetAdmitSliceHeadroomForTest(base, perJob int64)` — the real-daemon e2e
-  test needs to zero the production headroom defaults (2 GiB base + 64 MiB/job,
-  `admit.go`) to admit workers against the small real cgroup caps this test
-  uses; `SetAdmitReadMemoryForTest` (Task 8) already established the pattern
-  of adding a tiny exported seam per need rather than exporting the fields
-  themselves.
+- Consumes (`testing_seams.go`): `SetWorkerAdmitHeadroomForTest` (Task 8) —
+  the real-daemon e2e test zeros it so admission isn't universally denied
+  against the small real cgroup `memory.max` this test uses. No new
+  worker-admit-specific seam is needed here; `worker-admit` is the only
+  daemon verb this e2e test exercises (it never issues a plain `admit`
+  request), so the general `admit`-verb headroom fields are irrelevant to
+  it.
 - Consumes: `Supervisor` (Tasks 11-16), `aira aitest-bootstrap` (Task 3),
   `aira worker-admit` (Task 8), `daemon.NewServer`/`Paths`/`PathsFromEnv`
   (existing), `cgrouptest.IsolatedScopeParent`/`SkipOrFailRealCgroup`
@@ -3180,7 +4186,6 @@ import (
 	"strings"
 	"syscall"
 	"testing"
-	"time"
 
 	"aira/internal/cgrouptest"
 	"aira/internal/daemon"
@@ -3220,6 +4225,14 @@ func TestRealPytestAitestEndToEndFallback(t *testing.T) {
 	if strings.Count(text, "aira aitest:") != 1 {
 		t.Fatalf("expected exactly one fallback warning: %v\n%s", err, text)
 	}
+	// AIRA_REAL_CGROUP is unset in this fallback run, so test_oom.py skips
+	// itself -- and a skip must be its own genuine outcome, never folded
+	// into "unevaluated" (a check that could not establish a result). This
+	// also makes the negative assertion below meaningful rather than
+	// vacuous: it only holds if skip is genuinely NOT unevaluated.
+	if !strings.Contains(text, "test_oom.py::test_deliberate_oom skipped") {
+		t.Fatalf("pytest output missing expected skipped line: %v\n%s", err, text)
+	}
 	if strings.Contains(text, "unevaluated") {
 		t.Fatalf("fallback run unexpectedly reported unevaluated: %s", text)
 	}
@@ -3255,7 +4268,14 @@ func TestRealPytestAitestEndToEndRealDaemonAndCgroup(t *testing.T) {
 	}
 
 	binary := filepath.Join(t.TempDir(), "aira")
-	build := exec.Command("go", "build", "-o", binary, "aira/cmd/aira")
+	// aira confine -- wraps this build, per this plan's own Global
+	// Constraints ("every go build/go test ... MUST be prefixed with aira
+	// confine --"). It nests under the confinement the outer `aira confine
+	// -- go test ...` invocation (Step 2/4/5's Run: lines) already applies
+	// to this whole test binary -- a normal, supported nested scope, not a
+	// circular dependency: this is the machine's already-installed `aira`
+	// on PATH wrapping a build of a FRESH `aira` binary into a temp dir.
+	build := exec.Command("aira", "confine", "--", "go", "build", "-o", binary, "aira/cmd/aira")
 	if buildOutput, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build aira binary: %v\n%s", err, buildOutput)
 	}
@@ -3267,7 +4287,7 @@ func TestRealPytestAitestEndToEndRealDaemonAndCgroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := daemon.NewServer(paths)
-	server.SetAdmitSliceHeadroomForTest(0, 0)
+	server.SetWorkerAdmitHeadroomForTest(0)
 	ready := make(chan struct{}, 1)
 	server.Ready = ready
 	ctx, cancel := context.WithCancel(context.Background())
@@ -3314,13 +4334,6 @@ func TestRealPytestAitestEndToEndRealDaemonAndCgroup(t *testing.T) {
 	output, err := command.CombinedOutput()
 	text := string(output)
 
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		if strings.Contains(text, "test_pass.py::test_one") {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
 	if !strings.Contains(text, "test_pass.py::test_one passed") {
 		t.Fatalf("pytest output missing expected pass line: %v\n%s", err, text)
 	}
@@ -3373,7 +4386,7 @@ def pytest_runtestloop(session):
         estimated_bytes=_resolve_estimated_bytes(),
         worker_count=_resolve_worker_count(workers_option),
     )
-    passed = failed = unevaluated = 0
+    passed = failed = skipped = unevaluated = 0
     for item in session.items:
         outcome = results.get(item.nodeid, "unevaluated")
         print("%s %s" % (item.nodeid, outcome))
@@ -3381,9 +4394,14 @@ def pytest_runtestloop(session):
             passed += 1
         elif outcome == "failed":
             failed += 1
+        elif outcome == "skipped":
+            # A skip is pytest's own well-defined, intentional outcome --
+            # never folded into unevaluated ("a check that could not
+            # establish its result") or failed.
+            skipped += 1
         else:
             unevaluated += 1
-    print("aitest: %d passed, %d failed, %d unevaluated" % (passed, failed, unevaluated))
+    print("aitest: %d passed, %d failed, %d skipped, %d unevaluated" % (passed, failed, skipped, unevaluated))
     session.testsfailed = failed + unevaluated
     return True
 
@@ -3414,19 +4432,11 @@ def _resolve_estimated_bytes():
 Add `import os` at the top of `internal/pylib/aitest/__init__.py` (it
 currently has no imports).
 
-Add to `internal/daemon/testing_seams.go`:
-
-```go
-// SetAdmitSliceHeadroomForTest overrides the production worker-admit
-// headroom constants (2 GiB base + 64 MiB/job by default, admit.go) so a
-// test admitting against a small real cgroup memory.max is not universally
-// denied. Mirrors SetAdmitReadMemoryForTest's shape: a tiny exported seam
-// per need, not the fields themselves.
-func (s *Server) SetAdmitSliceHeadroomForTest(base, perJob int64) {
-	s.admitSliceHeadroomBase = base
-	s.admitSliceHeadroomSupervisor = perJob
-}
-```
+No `testing_seams.go` change is needed in this task — `SetWorkerAdmitHeadroomForTest`
+(Task 8) already covers the one seam this e2e test needs (see Step 1's
+`server.SetWorkerAdmitHeadroomForTest(0)` call above); this task exercises
+only the `aitest-bootstrap`/`worker-admit` verbs, never the general `admit`
+verb, so no `admit`-specific headroom seam applies here.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -3446,6 +4456,6 @@ without delegation)
 - [ ] **Step 6: Commit**
 
 ```bash
-git add internal/pylib/aitest/__init__.py internal/daemon/testing_seams.go internal/pylib/aitest/testdata internal/pylib/pytest_aitest_e2e_test.go
+git add internal/pylib/aitest/__init__.py internal/pylib/aitest/testdata internal/pylib/pytest_aitest_e2e_test.go
 git commit -m "feat(aitest): wire pytest_runtestloop activation and add the Slice 1 e2e test"
 ```
