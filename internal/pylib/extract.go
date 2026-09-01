@@ -17,9 +17,10 @@ import (
 )
 
 const (
-	embeddedRoot = "aira_xdist_governor"
-	readyName    = ".ready"
-	tempPrefix   = ".tmp-"
+	embeddedRoot       = "aira_xdist_governor"
+	embeddedAitestRoot = "aitest"
+	readyName          = ".ready"
+	tempPrefix         = ".tmp-"
 )
 
 // all: is load-bearing: Python packages and the extraction hygiene file begin
@@ -36,6 +37,24 @@ func ExtractPyLib() (string, error) {
 		return "", err
 	}
 	return extractPyLibFS(embeddedPyLib, embeddedRoot, dataHome)
+}
+
+// all: is load-bearing here too: aitest's own "_"/"." prefixed files (a
+// Python package's __init__.py, the extraction hygiene file) would be
+// omitted by a plain directory embed.
+//
+//go:embed all:aitest
+var embeddedAitest embed.FS
+
+// ExtractAitest publishes the embedded aitest pytest plugin beneath a
+// content hash, mirroring ExtractPyLib's extraction contract exactly (AIRA
+// distributes these bytes but never imports or executes them).
+func ExtractAitest() (string, error) {
+	dataHome, err := dataHomeFromEnv()
+	if err != nil {
+		return "", err
+	}
+	return extractPyLibFS(embeddedAitest, embeddedAitestRoot, dataHome)
 }
 
 func dataHomeFromEnv() (string, error) {
