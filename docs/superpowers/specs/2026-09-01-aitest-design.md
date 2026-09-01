@@ -168,12 +168,25 @@ early disconnect):
    "scope_path":"<child cgroup path>","memory_max":N,"memory_high":N}
 ```
 
-On `granted`, the supervisor places the forked worker into `scope_path` using
-the *same* verified-placement handshake `RunConfineSetup` already implements
-for top-level confine jobs (`confine_linux.go:1272+`,
-`clone3(CLONE_INTO_CGROUP)` + parent/child release-pipe verification before
-any target code runs) — factor that handshake into a function shared between
-`confine` and this new call site rather than duplicate it.
+On `granted`, the supervisor places the forked worker into `scope_path`. This
+reuses `RunConfineSetup`'s verified-placement handshake
+(`confine_linux.go:1272+`, `clone3(CLONE_INTO_CGROUP)` + parent/child
+release-pipe verification before any target code runs) only on the **Go
+side** — the bootstrap step that relocates the supervisor itself out of the
+outer scope (§3.4) is a Go CLI verb and factors real, shared cgroup-creation
+code with `confine`. The **worker fork itself cannot reuse the atomic
+handshake**: it is a Python-level `os.fork()` of the already-running,
+warm-imported supervisor (the entire point being COW-shared interpreter
+state), and Python's stdlib has no `clone3`/`CLONE_INTO_CGROUP` binding —
+that mechanism is Go `os/exec`-only. The forked child instead calls
+`place_self()` (a plain `cgroup.procs` write) immediately after `fork()`
+returns, before any test code runs. This leaves a narrow, bounded window —
+pure interpreter overhead, ending before any test-driven allocation, and
+still contained by the *outer* scope's hierarchical cap throughout — where
+the child is transiently a member of the supervisor's scope rather than its
+own. Accepted for Slice 1 (architectural-simplicity: a raw ctypes clone3
+syscall to close a sub-millisecond, already-bounded gap is not worth the
+added risk); documented here rather than left implicit.
 
 ### 3.4 Worker lifecycle and recycling
 
