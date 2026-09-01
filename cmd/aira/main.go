@@ -126,6 +126,13 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		return runAitestBootstrapCommand(context.Background(), options, stdout, stderr)
 	}
+	if verb == "worker-admit" {
+		if jsonOutput {
+			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for worker-admit", Exit: store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
+			return render(response, true, stdout, stderr)
+		}
+		return runWorkerAdmitCommand(context.Background(), options, stdin, stdout, stderr)
+	}
 	if verb == "confine-list" || verb == "confine-kill" {
 		request, requestErr := buildRequest(verb, positional, options)
 		if requestErr != nil {
@@ -457,6 +464,9 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 	if verb == "aitest-bootstrap" {
 		return parseAitestBootstrapArgs(argv)
 	}
+	if verb == "worker-admit" {
+		return parseWorkerAdmitArgs(argv)
+	}
 	if verb == "run" {
 		return parseRunArgs(argv)
 	}
@@ -750,6 +760,28 @@ func parseAitestBootstrapArgs(argv []string) ([]string, map[string]string, error
 	return nil, options, nil
 }
 
+func parseWorkerAdmitArgs(argv []string) ([]string, map[string]string, error) {
+	options := map[string]string{}
+	valid := map[string]bool{"job-id": true, "outer-scope": true, "estimated-bytes": true, "signature": true, "max-wait": true}
+	for i := 0; i < len(argv); i++ {
+		name := strings.TrimPrefix(argv[i], "--")
+		if !valid[name] {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for worker-admit", name)
+		}
+		if i+1 >= len(argv) || strings.HasPrefix(argv[i+1], "--") {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s requires a value", name)
+		}
+		i++
+		options[name] = argv[i]
+	}
+	for _, required := range []string{"job-id", "outer-scope", "estimated-bytes"} {
+		if _, present := options[required]; !present {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --%s is required for worker-admit", required)
+		}
+	}
+	return nil, options, nil
+}
+
 func parseConfineManagementArgs(argv []string) ([]string, map[string]string, error) {
 	options := map[string]string{}
 	for i := 0; i < len(argv); i++ {
@@ -935,6 +967,56 @@ func runAitestBootstrapCommand(ctx context.Context, options map[string]string, s
 		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
 	}
 	_, _ = fmt.Fprintf(stdout, "bootstrapped outer=%s supervisor_scope=%s\n", outer, supervisorScope)
+	return 0
+}
+
+func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin io.Reader, stdout, stderr io.Writer) int {
+	estimatedBytes, err := runner.ParseMemorySize(options["estimated-bytes"])
+	if err != nil || estimatedBytes <= 0 {
+		_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --estimated-bytes: %v\n", err)
+		return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+	}
+	maxWait := runner.DefaultConfineReserveMaxWait
+	if raw := options["max-wait"]; raw != "" {
+		if maxWait, err = time.ParseDuration(raw); err != nil || maxWait <= 0 {
+			_, _ = fmt.Fprintln(stderr, "E_CONFINE_ARGUMENT_INVALID: invalid --max-wait")
+			return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		}
+	}
+	paths, err := daemon.PathsFromEnv()
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: daemon paths unavailable: %v\n", err)
+		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
+	}
+	signalCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	lease, err := runner.RequestWorkerAdmit(signalCtx, runner.WorkerAdmitClientRequest{
+		SocketPath: paths.SocketPath, JobID: options["job-id"], OuterScope: options["outer-scope"],
+		Signature: options["signature"], EstimatedBytes: estimatedBytes, MaxWait: maxWait,
+	})
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
+	}
+	scopePath, err := runner.CreateWorkerScope(ctx, options["outer-scope"], lease.WorkerID, lease.MemoryMax, lease.MemoryHigh)
+	if err != nil {
+		_ = lease.Close()
+		_, _ = fmt.Fprintln(stderr, err)
+		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
+	}
+	if _, err := fmt.Fprintf(stdout, "granted scope=%s worker_id=%s memory_max=%d memory_high=%d\n", scopePath, lease.WorkerID, lease.MemoryMax, lease.MemoryHigh); err != nil {
+		_ = lease.Close()
+		_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: write grant: %v\n", err)
+		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
+	}
+	// Hold stdin open as the release signal, exactly mirroring confine-reserve.
+	done := make(chan struct{})
+	go func() { _, _ = io.Copy(io.Discard, stdin); close(done) }()
+	select {
+	case <-done:
+	case <-signalCtx.Done():
+	}
+	_ = lease.Close()
 	return 0
 }
 
