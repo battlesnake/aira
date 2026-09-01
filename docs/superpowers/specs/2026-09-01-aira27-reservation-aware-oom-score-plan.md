@@ -33,14 +33,26 @@ desktop protection the flat 500 provides (confined ≥ 500 > host 0).
 Set the scope's `oom_score_adj` by **class** at scope start (no daemon machinery):
 - **Non-delegate (airtight)** scopes keep `500` — provably can't over-commit; the class we
   most want to PROTECT.
-- **Delegate-ram** scopes get a **higher** value (proposed `700`, `confineDelegateOOMScoreAdj`)
+- **Delegate-ram** scopes get a **higher** value (proposed `800`, `confineDelegateOOMScoreAdj`)
   — the only class that can over-commit (unbounded ceiling + fail-open gate).
 
-Under a slice-level (or global) OOM, delegate-ram scopes are then preferred victims over
-airtight non-delegate jobs, and **RSS badness differentiates within the delegate class** —
-the fattest delegate scope (the biggest over-commit contributor) is picked first, while a
-lean compliant delegate suite (lower RSS) is less likely. All confined tasks stay `≥ 500 >`
-host `0`, so **desktop protection is preserved** and even strengthened for delegate jobs.
+Under a slice-level (or global) OOM the kernel scores each **task** `badness ≈ RSS +
+adj·total/1000` and kills the max; because every scope carries `memory.oom.group=1` (slice
+= 0), killing that one task promotes to a **whole-scope** kill (`mem_cgroup_get_oom_group`,
+`confine_linux.go:579-581`). So raising delegate-ram to a higher adj is a **strong BIAS**
+toward killing a delegate scope — **not an absolute guarantee**: at this slice a 300-pt delta
+≈ ~19 GiB RSS-equivalent, decisive over LIGHT/small airtight jobs and over host (all confined
+stay `≥ 500 > 0`, desktop protection preserved), and the scope-group-kill means picking ANY
+delegate worker releases the whole over-committing scope at once. **Honest limitation:**
+selection is per-PROCESS, so a delegate suite's aggregate is spread thin across many small
+workers, and a LARGE single airtight process (≳ the delta-equivalent GiB fatter than every
+delegate task) can still out-score the bias and be picked. So Option A reliably protects
+**light** airtight jobs (money's 10 MB waiter) and biases hard toward delegate victims, but
+does NOT robustly protect a **large** airtight job (subpipe's 32 GiB gate) — that needs the
+**structural fix** (bound the delegate aggregate so no slice-OOM fires at all; next milestone,
+per the owner's decision). Env overrides (`AIRA_CONFINE_OOM_SCORE_ADJ` / `..._DELEGATE`) are
+**validated + clamped** so `1000 ≥ delegate > non-delegate ≥ 500` (a value < 500 would erode
+the desktop floor; an out-of-range value is rejected at argv-build, not silently written).
 
 - **Rationale for the class proxy:** we can only *guarantee* airtightness for non-delegate
   (RSS ≤ reserve by kernel cap). A delegate scope, even a "well-behaved" one, *can*
@@ -93,16 +105,29 @@ over-committing delegate scopes). Deferred because:
 
 ## 4. Tests
 
-1. **Class assignment** (runner unit / real-cgroup): a non-delegate confine writes
-   `oom_score_adj=500` to its setup child; a `--delegate-ram` confine writes `700`; both are
-   inherited by descendants (read `/proc/<child>/oom_score_adj`, mirroring the existing
-   `TestConfineReal…` real-cgroup pattern). Env overrides honoured.
-2. **Ordering property** (unit): the delegate value > the non-delegate value > 0 (host),
-   so under equal RSS a delegate scope out-scores a non-delegate one and both out-score host.
+1. **Class assignment** (runner real-cgroup): a non-delegate confine writes
+   `oom_score_adj=500` to its setup child; a `--delegate-ram` confine writes `800`; both are
+   inherited by descendants (read `/proc/<child>/oom_score_adj`, via the existing REAL
+   `RunConfineSetup` real-cgroup pattern at `confine_linux_test.go:1789` — a delegate-ram
+   real-cgroup variant launches daemonless via `delegateRAMScopeFallback()`, no daemon
+   needed). **MUST-FIX porous fixture (Fable):** `runConfineTestSetup`
+   (`detach_linux_test.go:36-49`) currently DISCARDS the parsed `oomAdj` and hardcodes
+   `500\n` — so any class-value assertion routed through it is vacuous. Make the fixture
+   write the PARSED value so the delegate class is observable.
+2. **Ordering + clamp** (unit): the delegate value > the non-delegate value > 0 (host); env
+   overrides are validated + clamped to `1000 ≥ delegate > non-delegate ≥ 500` at argv-build
+   (an out-of-range or inverted value is rejected, not silently written / not left
+   `priorities=unverified`).
 3. **No side effects**: the reserve/admission/`memory.max` paths are byte-identical (the
-   change is isolated to the oom_score_adj value); confirm via the existing confine trailer
-   (`priorities=applied` unchanged) and that admission tests are untouched.
-4. Full daemon + runner suites green under `aira confine`, `-race` clean.
+   change is isolated to the oom_score_adj value); confirm the confine trailer
+   (`priorities=applied` unchanged) and that admission tests are untouched. Existing pins
+   `confine_linux_test.go:197/1319-1338/1794-1804` are all non-delegate → stay `500`.
+4. **Fan-out honesty test** (Sol): a realistic cross-scope case — one non-delegate airtight
+   process vs a delegate suite spread over many small workers — documenting that the bias +
+   scope-group-kill picks the delegate scope for MODERATE airtight sizes, and (honestly) that
+   a sufficiently large single airtight process is not protected. This test PINS the bias's
+   documented boundary, it does not assert a false guarantee.
+5. Full daemon + runner suites green under `aira confine`, `-race` clean.
 
 ## 5. Rollout
 
