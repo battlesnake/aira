@@ -119,6 +119,13 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		return runGovernorSlotCommand(context.Background(), options, stdin, stdout, stderr)
 	}
+	if verb == "aitest-bootstrap" {
+		if jsonOutput {
+			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for aitest-bootstrap", Exit: store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
+			return render(response, true, stdout, stderr)
+		}
+		return runAitestBootstrapCommand(context.Background(), options, stdout, stderr)
+	}
 	if verb == "confine-list" || verb == "confine-kill" {
 		request, requestErr := buildRequest(verb, positional, options)
 		if requestErr != nil {
@@ -447,6 +454,9 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 	if verb == "governor-slot" {
 		return parseGovernorSlotArgs(argv)
 	}
+	if verb == "aitest-bootstrap" {
+		return parseAitestBootstrapArgs(argv)
+	}
 	if verb == "run" {
 		return parseRunArgs(argv)
 	}
@@ -721,6 +731,25 @@ func parseGovernorSlotArgs(argv []string) ([]string, map[string]string, error) {
 	return nil, options, nil
 }
 
+func parseAitestBootstrapArgs(argv []string) ([]string, map[string]string, error) {
+	options := map[string]string{}
+	for i := 0; i < len(argv); i++ {
+		name := strings.TrimPrefix(argv[i], "--")
+		if argv[i] != "--supervisor-pid" {
+			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for aitest-bootstrap", name)
+		}
+		if i+1 >= len(argv) {
+			return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: option --supervisor-pid requires a value")
+		}
+		i++
+		options["supervisor-pid"] = argv[i]
+	}
+	if _, present := options["supervisor-pid"]; !present {
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --supervisor-pid is required")
+	}
+	return nil, options, nil
+}
+
 func parseConfineManagementArgs(argv []string) ([]string, map[string]string, error) {
 	options := map[string]string{}
 	for i := 0; i < len(argv); i++ {
@@ -886,6 +915,26 @@ func runConfineReserveCommand(ctx context.Context, options map[string]string, st
 	case <-done:
 	case <-signalCtx.Done():
 	}
+	return 0
+}
+
+func runAitestBootstrapCommand(ctx context.Context, options map[string]string, stdout, stderr io.Writer) int {
+	pid, err := strconv.Atoi(options["supervisor-pid"])
+	if err != nil || pid <= 0 {
+		_, _ = fmt.Fprintln(stderr, "E_CONFINE_ARGUMENT_INVALID: --supervisor-pid must be a positive integer")
+		return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+	}
+	outer, err := runner.CurrentCgroupPath()
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: discover outer scope: %v\n", err)
+		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
+	}
+	supervisorScope, err := runner.BootstrapAitestSupervisor(ctx, outer, pid)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
+	}
+	_, _ = fmt.Fprintf(stdout, "bootstrapped outer=%s supervisor_scope=%s\n", outer, supervisorScope)
 	return 0
 }
 
