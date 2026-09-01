@@ -23,7 +23,15 @@ type confineScanDeps struct {
 	now       func() time.Time
 	readField func(*linuxScope, string, int64) ([]byte, error)
 	waitEmpty func(context.Context, Scope, time.Duration) error
+	// afterReapEmptyProof is a test seam for the phase-one/phase-two race.
+	afterReapEmptyProof func()
 }
+
+const confineReapMaxDepth = 32
+
+// confineReapOpenat is a seam for the O_NOFOLLOW flag unit test. Production
+// always uses unix.Openat.
+var confineReapOpenat = unix.Openat
 
 func defaultConfineScanDeps() confineScanDeps {
 	return confineScanDeps{now: time.Now, readField: readConfineScopeField, waitEmpty: waitEmpty}
@@ -162,20 +170,112 @@ func reapOrphanedConfineScopesWithDeps(ctx context.Context, slicePath string, gr
 			result.Skipped++
 			continue
 		}
-		// Remove anchored to the O_NOFOLLOW parent fd, never by reconstructed path:
-		// AT_REMOVEDIR is an atomic rmdir that the kernel performs ONLY on a
-		// genuinely empty cgroup (a repopulated scope, a scope that grew a child
-		// cgroup, or a name swapped to a symlink all fail with EBUSY/ENOTDIR →
-		// Skipped, never a fabricated reap). Scope IDs are unique per launch, so a
-		// mid-launch scope can never reuse this name.
 		childName := ".aira-" + record.ScopeID
-		if err := unix.Unlinkat(parentFD, childName, unix.AT_REMOVEDIR); err != nil {
+		reaped, reapErr := reapEmptyConfineScopeTree(parentFD, childName, deps.afterReapEmptyProof)
+		if reapErr != nil || !reaped {
 			result.Skipped++
 			continue
 		}
 		result.Reaped = append(result.Reaped, record.ScopeID)
 	}
 	return result, nil
+}
+
+type confineReapTree struct {
+	name     string
+	dir      *os.File
+	children []*confineReapTree
+}
+
+// reapEmptyConfineScopeTree performs the two reaper phases for one candidate.
+// Its tree walk never rebuilds a child path: every Openat and Unlinkat is
+// anchored to the parent cgroup's already-open O_NOFOLLOW directory fd.
+func reapEmptyConfineScopeTree(parentFD int, childName string, afterEmptyProof func()) (bool, error) {
+	root, err := openConfineReapDirectory(parentFD, childName)
+	if err != nil {
+		return false, err
+	}
+	empty, err := (&linuxScope{fd: root}).Empty()
+	if err != nil || !empty {
+		_ = root.Close()
+		return false, err
+	}
+	if afterEmptyProof != nil {
+		afterEmptyProof()
+	}
+	tree, err := readConfineReapTree(root, childName, 0)
+	if err != nil {
+		return false, err // readConfineReapTree closed every owned fd.
+	}
+	defer tree.close()
+	if err := removeConfineReapTree(parentFD, tree); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func openConfineReapDirectory(parentFD int, name string) (*os.File, error) {
+	fd, err := confineReapOpenat(parentFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), name)
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, errors.New("open confine reap directory")
+	}
+	return file, nil
+}
+
+// readConfineReapTree builds the complete post-order plan before the first
+// Unlinkat. An unreadable or unexpectedly deep subtree is therefore skipped as
+// a whole scope without stripping any empty sibling beforehand.
+func readConfineReapTree(dir *os.File, name string, depth int) (*confineReapTree, error) {
+	tree := &confineReapTree{name: name, dir: dir}
+	entries, err := dir.ReadDir(-1)
+	if err != nil {
+		tree.close()
+		return nil, err
+	}
+	for _, entry := range entries {
+		// A cgroup directory contains many regular interface files. Directories
+		// are the only child cgroups; a symlink is never followed.
+		if entry.Type()&os.ModeSymlink != 0 || !entry.IsDir() {
+			continue
+		}
+		if depth >= confineReapMaxDepth {
+			tree.close()
+			return nil, errors.New("confine reap subtree exceeds maximum depth")
+		}
+		child, err := openConfineReapDirectory(int(dir.Fd()), entry.Name())
+		if err != nil {
+			tree.close()
+			return nil, err
+		}
+		childTree, err := readConfineReapTree(child, entry.Name(), depth+1)
+		if err != nil {
+			tree.close()
+			return nil, err
+		}
+		tree.children = append(tree.children, childTree)
+	}
+	return tree, nil
+}
+
+func (tree *confineReapTree) close() {
+	for _, child := range tree.children {
+		child.close()
+	}
+	_ = tree.dir.Close()
+}
+
+func removeConfineReapTree(parentFD int, tree *confineReapTree) error {
+	for _, child := range tree.children {
+		if err := removeConfineReapTree(int(tree.dir.Fd()), child); err != nil {
+			return err
+		}
+	}
+	return unix.Unlinkat(parentFD, tree.name, unix.AT_REMOVEDIR)
 }
 
 func pidIsDead(pid int) bool {
