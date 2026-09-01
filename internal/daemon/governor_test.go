@@ -607,15 +607,26 @@ func TestGovernorRAMUnreadableLedgerFailsOpen(t *testing.T) {
 }
 
 func TestGovernorWholeChargedDelegateBypassesRAMOrderingNearCeiling(t *testing.T) {
-	// Deliberately exercise the enabled regime: available=10 is below the
-	// low mark (20), and a normal 50-byte estimate would be parked.
-	g := testRAMGovernor(t, 2, 90, 100, true)
+	// Deliberately exercise the enabled regime: available=10 is below the low
+	// mark (20), so a normal 50-byte estimate is RAM-gated and parked.
+	//
+	// Non-porous construction: the @drc- suite already has its OWN active floor
+	// worker (drc-floor), so `whole` is an ABOVE-FLOOR RAM-ordering candidate —
+	// its activation is decided by the Slice-3 exemption branch, NOT by
+	// floor-repair (which would activate a sole worker before RAM ordering runs
+	// and make the exemption untested). Capacity 3 leaves exactly one fill slot
+	// after the two floors; `whole` (exempt) must take it and `blocked` (ordinary,
+	// same 50-byte estimate) must lose it. If the exemption were removed, `whole`
+	// is RAM-gated exactly like `blocked` (50 > avail 10) and stays parked, so
+	// this assertion fails — the test is a real guard for the MF1 fix.
+	g := testRAMGovernor(t, 3, 90, 100, true)
 	queue := &sliceQueue{outstanding: 90, outstandingJobs: 1}
 	g.server.admitQueues["/slice"] = queue
 	age := time.Now()
 	putRAMGovernorWorker(g, "floor", "ordinary", age, 1, governorActive, 1)
-	whole := putRAMGovernorWorker(g, "whole", "CONFINE-@drc-suite-1-a", age, 2, governorParked, 50)
-	blocked := putRAMGovernorWorker(g, "blocked", "ordinary", age, 3, governorParked, 50)
+	putRAMGovernorWorker(g, "drc-floor", "CONFINE-@drc-suite-1-a", age, 2, governorActive, 1)
+	whole := putRAMGovernorWorker(g, "whole", "CONFINE-@drc-suite-1-a", age, 3, governorParked, 50)
+	blocked := putRAMGovernorWorker(g, "blocked", "ordinary", age, 4, governorParked, 50)
 	g.evaluate()
 	if whole.state != governorActive || blocked.state != governorParked || !g.ramAware["/slice"] {
 		t.Fatalf("whole-charged worker was not exempt in RAM-aware regime: whole=%v blocked=%v aware=%v", whole.state, blocked.state, g.ramAware["/slice"])
