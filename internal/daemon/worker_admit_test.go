@@ -42,7 +42,20 @@ func TestEvaluateWorkerAdmitGrantsWithinHeadroom(t *testing.T) {
 	}
 }
 
-func TestEvaluateWorkerAdmitDeniesOverBudgetAccountingLiveUsage(t *testing.T) {
+func TestEvaluateWorkerAdmitDeniesWhenAggregateCapsWouldExceedCeiling(t *testing.T) {
+	// CORRECTED by build-review: an earlier version of this test asserted
+	// the OPPOSITE as correct -- that a low live-usage reading alone was
+	// enough to grant a second 700-byte worker under a 1000-byte ceiling
+	// even with 700 already committed to a sibling. That is a real
+	// aggregate-OOM hazard: if both workers later grow to their own full
+	// caps simultaneously, their sum (1400) exceeds the outer ceiling
+	// (1000), and the outer scope's own memory.oom.group can then kill the
+	// whole run -- supervisor and every sibling worker, not just the one
+	// that grew -- directly contradicting the design spec's Goal 2
+	// ("a leaking or mis-annotated test cannot threaten a sibling worker
+	// or the run as a whole"). evaluateWorkerAdmit now guards the WORST
+	// CASE (sum of already-granted memory.max, not just current live
+	// usage) alongside the live-usage check.
 	server := NewServer(Paths{})
 	server.workerAdmitHeadroom = 0
 	live := map[string]int64{}
@@ -51,14 +64,20 @@ func TestEvaluateWorkerAdmitDeniesOverBudgetAccountingLiveUsage(t *testing.T) {
 	if first.State != "granted" {
 		t.Fatalf("first=%+v", first)
 	}
-	// The OUTER scope's own live usage (hierarchically includes the
-	// supervisor plus every worker) governs the second decision, not a sum
-	// of held worker caps: even though 700+700 > 1000, a low live reading
-	// on the outer scope itself still admits it.
+	// Live usage on the outer scope stays low (both workers just started) --
+	// the live-usage check alone would admit this, but 700+700 > 1000 means
+	// the aggregate guard must deny it regardless.
 	live["/outer"] = 100
 	second := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
-	if second.State != "granted" {
-		t.Fatalf("second (live-usage-based) =%+v", second)
+	if second.State != "denied" || second.Reason != "fallback:aggregate-cap-exceeded" {
+		t.Fatalf("second (aggregate-cap-guarded) =%+v", second)
+	}
+	// The denial is pollable, not permanent: releasing the first grant
+	// frees its committed share, and the identical request now fits.
+	server.releaseWorkerGrant("job-1", "/outer", first.WorkerID)
+	third := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
+	if third.State != "granted" {
+		t.Fatalf("third (after release) =%+v", third)
 	}
 }
 

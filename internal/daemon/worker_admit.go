@@ -128,6 +128,28 @@ func (s *Server) evaluateWorkerAdmit(req workerAdmitRequest) WorkerAdmitResponse
 		// converts it to "timeout".
 		return WorkerAdmitResponse{State: "denied", Reason: "fallback:insufficient-headroom"}
 	}
+	// Worst-case guard, on top of the live-usage check above: live usage
+	// having room RIGHT NOW does not mean it always will. Sum the
+	// memory.max already promised to this job's other workers — if every
+	// one of them simultaneously grew to its own full cap, the total must
+	// still fit under ceiling, or an outer-scope memory.oom.group kill can
+	// take out the whole run (supervisor plus every sibling worker), not
+	// just the one that grew — precisely what Goal 2 in the design spec
+	// requires this NOT be able to do. This trades a little utilization
+	// (the live-usage check alone would admit a worker whose siblings
+	// simply haven't grown to their peaks YET) for that hard guarantee —
+	// the same aggregate-not-bound failure class AIRA-27/28/29 already
+	// fixed at whole-job granularity, found here at worker granularity by
+	// build-review (a live-usage-only check is silent on the SUM of caps,
+	// only on CURRENT usage). Pollable, not an immediate reject: an
+	// existing worker retiring frees its share of committed capacity.
+	var committed int64
+	for _, grant := range job.grants {
+		committed += grant.memoryMax
+	}
+	if req.estimatedBytes > ceiling-committed {
+		return WorkerAdmitResponse{State: "denied", Reason: "fallback:aggregate-cap-exceeded"}
+	}
 	job.nextSeq++
 	workerID := fmt.Sprintf("%d", job.nextSeq)
 	scopePath := runner.WorkerScopeChildPath(req.outerScope, "worker-"+workerID)
