@@ -473,9 +473,21 @@ func TestReapOrphanedConfineScopesKeepsEmptySiblingOfLiveNestedBranch(t *testing
 	parent, deadPID := reaperTestParentAndDeadPID(t)
 	id := confineTestScopeID("nested-live", deadPID, time.Now().Add(-10*time.Second).UnixNano())
 	root := createReaperTestScope(t, parent, id)
+	// A naive post-order walk (no cgroup.events proof) aborts on the first child
+	// whose rmdir fails (the live branch), so whether an empty sibling is stripped
+	// depends on kernfs enumeration order (which is NOT creation order). Create
+	// SEVERAL empty siblings plus a deep one so at least one is near-certain to be
+	// enumerated before the live branch: a Phase-1 regression would then strip it
+	// and fail this test, while the real code skips the whole non-empty scope
+	// order-independently.
+	survivors := []string{root}
+	for _, n := range []string{"empty0", "empty1", "empty2", "empty3", "empty4", "empty5"} {
+		survivors = append(survivors, mkdirReaperTestCgroup(t, root, n))
+	}
+	deep := mkdirReaperTestCgroup(t, root, "deep")
+	survivors = append(survivors, deep, mkdirReaperTestCgroup(t, deep, "grandchild"))
 	live := mkdirReaperTestCgroup(t, root, "live")
-	empty := mkdirReaperTestCgroup(t, root, "empty")
-	emptyGrandchild := mkdirReaperTestCgroup(t, empty, "grandchild")
+	survivors = append(survivors, live)
 	sleeper := startReaperTestSleeper(t, live)
 	t.Cleanup(func() { stopReaperTestSleeper(sleeper) })
 
@@ -483,7 +495,7 @@ func TestReapOrphanedConfineScopesKeepsEmptySiblingOfLiveNestedBranch(t *testing
 	if err != nil || len(result.Reaped) != 0 || result.Skipped != 1 {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	for _, path := range []string{root, live, empty, emptyGrandchild} {
+	for _, path := range survivors {
 		if _, statErr := os.Stat(path); statErr != nil {
 			t.Fatalf("nested live tree changed at %s: %v", path, statErr)
 		}
