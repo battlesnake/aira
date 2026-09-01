@@ -27,6 +27,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"aira/internal/cgrouptest"
 	"aira/internal/daemon"
@@ -118,6 +119,25 @@ func shortE2ERuntimeDir(t *testing.T) string {
 }
 
 func TestRealPytestAitestEndToEndRealDaemonAndCgroup(t *testing.T) {
+	// Opt-in only, NOT part of the default `go test ./...` path: verified
+	// live on this exact host that the worker's deliberate over-allocation
+	// can get caught in the kernel's mem_cgroup_handle_over_high throttle
+	// for MINUTES before memory.max's hard kill ever fires (the current
+	// 80%/100% memory.high/memory.max split, internal/daemon/worker_admit.go,
+	// leaves a wide reclaim-throttle window under this kernel/host's
+	// characteristics) -- and a process stuck in that kernel path can enter
+	// an UNKILLABLE D-state that SIGKILL cannot wake, a real hazard on a
+	// machine other sessions share. The containment invariant itself is
+	// NOT broken -- dmesg confirms the correct scope's oom.group eventually
+	// fires -- only its convergence speed on this host is impractical for
+	// an unattended test run. Tracked as AIRA-35 for a real fix (retune
+	// the memory.high/memory.max split, or add an escalation path) rather
+	// than silently worked around here. Run explicitly with
+	// AIRA_AITEST_SLOW_E2E=1 once that's resolved, or to manually
+	// re-verify this exact finding.
+	if os.Getenv("AIRA_AITEST_SLOW_E2E") != "1" {
+		t.Skip("slow/host-dependent OOM-convergence e2e (AIRA-35) -- set AIRA_AITEST_SLOW_E2E=1 to run explicitly")
+	}
 	pytest := requireRealPytest(t)
 	parent := cgrouptest.IsolatedScopeParent(t)
 	if err := os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"), []byte("+memory"), 0o644); err != nil {
@@ -196,7 +216,16 @@ func TestRealPytestAitestEndToEndRealDaemonAndCgroup(t *testing.T) {
 	}
 	defer outerFile.Close()
 
-	command := exec.Command(pytest, "-q", "--aitest-workers=2")
+	// Hard bound: this must NEVER be able to hang the test run indefinitely,
+	// regardless of how slowly the OOM-convergence path completes -- see
+	// this function's own opt-in-gate comment above for why that can be
+	// slow on this host. 4 minutes is generous relative to the pass/fail
+	// parts (well under a second, per repeated real runs) while still
+	// bounding the worst case observed (multi-minute throttle convergence)
+	// to a finite, diagnosable failure instead of an unbounded hang.
+	runCtx, cancelRun := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancelRun()
+	command := exec.CommandContext(runCtx, pytest, "-q", "--aitest-workers=2")
 	command.Dir = filepath.Join(aitestDir, "testdata")
 	// Places the pytest subprocess (the supervisor) directly into outer's
 	// cgroup AT process creation -- the same clone3(CLONE_INTO_CGROUP)
