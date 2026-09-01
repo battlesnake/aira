@@ -35,7 +35,7 @@ func TestMain(m *testing.M) {
 }
 
 func runConfineTestSetup(argv []string) int {
-	handshakeFD, releaseFD, _, _, _, target, err := parseConfineSetupArgs(argv)
+	handshakeFD, releaseFD, oomAdj, _, _, target, err := parseConfineSetupArgs(argv)
 	if err != nil {
 		return 127
 	}
@@ -46,7 +46,7 @@ func runConfineTestSetup(argv []string) int {
 	}
 	defer handshake.Close()
 	defer release.Close()
-	_ = os.WriteFile("/proc/self/oom_score_adj", []byte("500\n"), 0o644)
+	_ = os.WriteFile("/proc/self/oom_score_adj", []byte(strconv.Itoa(oomAdj)+"\n"), 0o644)
 	if err := writeConfineHandshake(handshake, confineHandshake{
 		Schema: confineHandshakeSchema, OOMScoreAdj: true, Nice: true, IONice: true,
 	}); err != nil {

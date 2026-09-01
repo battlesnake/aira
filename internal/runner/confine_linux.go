@@ -27,16 +27,17 @@ import (
 )
 
 const (
-	confineHandshakeSchema  = 1
-	confineHandshakeMaxSize = 4096
-	confineSetupFD          = 3
-	confineReleaseFD        = 4
-	confineOOMScoreAdj      = 500
-	confineNice             = 19
-	confineIOPriorityClass  = 2 // best-effort / IOPRIO_CLASS_BE
-	confineIOPriorityData   = 7 // Best-effort priority: 0 is highest, 7 is lowest.
-	defaultCPUWeightStart   = int64(100)
-	defaultCPUWeightFloor   = int64(10)
+	confineHandshakeSchema     = 1
+	confineHandshakeMaxSize    = 4096
+	confineSetupFD             = 3
+	confineReleaseFD           = 4
+	confineOOMScoreAdj         = 500
+	confineDelegateOOMScoreAdj = 800
+	confineNice                = 19
+	confineIOPriorityClass     = 2 // best-effort / IOPRIO_CLASS_BE
+	confineIOPriorityData      = 7 // Best-effort priority: 0 is highest, 7 is lowest.
+	defaultCPUWeightStart      = int64(100)
+	defaultCPUWeightFloor      = int64(10)
 )
 
 type confineDelegation struct {
@@ -638,7 +639,10 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	if self == "" {
 		self = "/proc/self/exe"
 	}
-	setupArgv := confineSetupArgv(request.Argv)
+	setupArgv, err := confineSetupArgv(request.Argv, request.DelegateRAM)
+	if err != nil {
+		return result, err
+	}
 	diagnostics := request.Stderr
 	if diagnostics == nil {
 		diagnostics = os.Stderr
@@ -1132,14 +1136,49 @@ func verifyScopeMemoryValue(scope Scope, name string, want int64) error {
 	return nil
 }
 
-func confineSetupArgv(target []string) []string {
+func confineSetupArgv(target []string, delegateRAM bool) ([]string, error) {
+	nonDelegate, delegate, err := confineOOMScoreAdjValues()
+	if err != nil {
+		return nil, err
+	}
+	oomAdj := nonDelegate
+	if delegateRAM {
+		oomAdj = delegate
+	}
 	argv := []string{
 		"__confine-setup", "--handshake-fd", strconv.Itoa(confineSetupFD),
 		"--release-fd", strconv.Itoa(confineReleaseFD),
-		"--oom-score-adj", strconv.Itoa(confineOOMScoreAdj), "--nice", strconv.Itoa(confineNice),
+		"--oom-score-adj", strconv.Itoa(oomAdj), "--nice", strconv.Itoa(confineNice),
 		"--ionice-class", strconv.Itoa(confineIOPriorityClass), "--",
 	}
-	return append(argv, target...)
+	return append(argv, target...), nil
+}
+
+func confineOOMScoreAdjValues() (nonDelegate, delegate int, err error) {
+	nonDelegate, err = parseConfineOOMScoreAdjEnv("AIRA_CONFINE_OOM_SCORE_ADJ", confineOOMScoreAdj)
+	if err != nil {
+		return 0, 0, err
+	}
+	delegate, err = parseConfineOOMScoreAdjEnv("AIRA_CONFINE_OOM_SCORE_ADJ_DELEGATE", confineDelegateOOMScoreAdj)
+	if err != nil {
+		return 0, 0, err
+	}
+	if delegate <= nonDelegate {
+		return 0, 0, errors.New("E_CONFINE_ARGUMENT_INVALID: AIRA_CONFINE_OOM_SCORE_ADJ_DELEGATE must be greater than AIRA_CONFINE_OOM_SCORE_ADJ")
+	}
+	return nonDelegate, delegate, nil
+}
+
+func parseConfineOOMScoreAdjEnv(name string, fallback int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < confineOOMScoreAdj || value > 1000 {
+		return 0, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: %s must be an integer in [%d, 1000]", name, confineOOMScoreAdj)
+	}
+	return value, nil
 }
 
 func readConfineHandshake(reader *os.File, timeout time.Duration) ([]byte, error) {
