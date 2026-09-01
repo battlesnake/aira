@@ -408,7 +408,15 @@ class Supervisor:
             pass
         if state["admit_process"] is not None:
             state["admit_process"].stdin.close()
-            state["admit_process"].wait(timeout=5)
+            try:
+                state["admit_process"].wait(timeout=5)
+            except Exception:
+                # A wedged admit-relay process must never abort the whole
+                # run over a best-effort wait -- matches the identical
+                # guard on this same call in spawn_worker's own failure
+                # path (build-review P2: this one was the sole unguarded
+                # copy).
+                pass
         grant = state.get("grant")
         if grant is not None:
             try:
