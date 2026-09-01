@@ -82,6 +82,9 @@ type Server struct {
 	admitPriorAt                 time.Time
 	admitSliceHeadroomBase       int64
 	admitSliceHeadroomSupervisor int64
+	workerJobsMu                 sync.Mutex
+	workerJobs                   map[string]*workerJobState
+	workerAdmitHeadroom          int64
 	scopeReapGrace               time.Duration
 	governor                     *governorSet
 
@@ -131,6 +134,7 @@ func NewServer(paths Paths) *Server {
 		admitConfineScanInterval:     admitConfineScanIntervalDefault,
 		admitSliceHeadroomBase:       admitSliceHeadroomBaseDefault,
 		admitSliceHeadroomSupervisor: admitSliceHeadroomSupervisorDefault,
+		workerAdmitHeadroom:          workerAdmitHeadroomDefault,
 		scopeReapGrace:               defaultScopeReapGrace,
 		storeOpAppendTimeout:         30 * time.Second,
 		storeOpHeavyTimeout:          5 * time.Minute,
