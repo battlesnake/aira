@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -57,25 +58,21 @@ func TestConfineOOMAtCeilingIsGenuinelyTooLargeAndPinWins(t *testing.T) {
 	}
 }
 
-// verifies: the delegate-ram containment ceiling is a separate, history-sized
-// grant even when the admission reserve takes the pinned:client early return.
-// RED against routing scope ceiling through reserve (the old 512 MiB overhead).
-func TestDelegateRAMScopeCeilingIsIndependentOfPinnedReserve(t *testing.T) {
+func TestDelegateRAMEstimateChargeUsesWholeSuiteCeiling(t *testing.T) {
 	t.Setenv("AIRA_DELEGATE_RAM_SCOPE_MIN", "1G")
 	server := NewServer(Paths{})
 	server.admitPeakHistory = func(context.Context, string) (runner.PeakRSSStats, error) {
 		return runner.PeakRSSStats{TotalCount: 1, SampleCount: 1, PeakMax: 8 << 30}, nil
 	}
-	request := admitRequest{delegateRAM: true, pinned: true, reserve: runner.DefaultDelegateRAMOverhead, signature: "suite"}
-	reserve, basis := server.resolveAdmitReserve(request, 60<<30)
-	ceiling := server.resolveDelegateRAMScopeCeiling(request, 64<<30, 2<<30)
-	want := int64(8<<30) + int64(8<<30)*delegateRAMScopeSafetyPct/100
-	if reserve != runner.DefaultDelegateRAMOverhead || basis != "pinned:client" || ceiling != want || ceiling == reserve {
-		t.Fatalf("reserve=%d basis=%q ceiling=%d, want %d/pinned:client/%d", reserve, basis, ceiling, runner.DefaultDelegateRAMOverhead, want)
+	request := admitRequest{delegateRAM: true, pinned: true, reserve: runner.DefaultDelegateRAMOverhead, signature: "suite", delegateCharge: delegateCharge{mode: "estimate"}}
+	got := server.resolveDelegateRAMScopeCeiling(request, 64<<30, 2<<30)
+	want := int64(8<<30) + int64(8<<30)*delegateSuiteSafetyPct/100
+	if got != want || got == runner.DefaultDelegateRAMOverhead {
+		t.Fatalf("whole-suite charge=%d, want %d", got, want)
 	}
 }
 
-func TestDelegateRAMPinnedAdmitGrantIncludesScopeCeiling(t *testing.T) {
+func TestDelegateRAMAdmitGrantChargesAndCapsSameReserve(t *testing.T) {
 	t.Setenv("AIRA_DELEGATE_RAM_SCOPE_MIN", "1G")
 	server := NewServer(Paths{})
 	server.stopping = make(chan struct{})
@@ -92,7 +89,7 @@ func TestDelegateRAMPinnedAdmitGrantIncludesScopeCeiling(t *testing.T) {
 		defer serverConn.Close()
 		server.admitConnection(serverConn, map[string]any{
 			"slice": "slice", "reserve": runner.DefaultDelegateRAMOverhead, "max_wait_ms": int64(1000),
-			"signature": "suite", "pinned": true, "delegate_ram": true,
+			"signature": "suite", "pinned": true, "delegate_ram": true, "delegate_charge": map[string]any{"mode": "estimate"},
 		})
 	}()
 	var frame ResponseFrame
@@ -100,7 +97,7 @@ func TestDelegateRAMPinnedAdmitGrantIncludesScopeCeiling(t *testing.T) {
 		t.Fatal(err)
 	}
 	grant := admitGrantData(t, frame)
-	if grant.Reserve != runner.DefaultDelegateRAMOverhead || grant.ScopeCeiling != int64(8<<30)+int64(8<<30)*delegateRAMScopeSafetyPct/100 || grant.ScopeCeiling == grant.Reserve {
+	if grant.Reserve != int64(8<<30)+int64(8<<30)*delegateSuiteSafetyPct/100 {
 		t.Fatalf("grant=%+v", grant)
 	}
 	_ = clientConn.Close()
@@ -122,8 +119,34 @@ func TestDelegateRAMScopeCeilingClampAndOOMEscalation(t *testing.T) {
 		t.Fatalf("ceiling=%d want upper clamp %d", got, int64(22<<30))
 	}
 	server.admitPeakHistory = func(context.Context, string) (runner.PeakRSSStats, error) { return runner.PeakRSSStats{}, nil }
-	if got := server.resolveDelegateRAMScopeCeiling(request, 64<<30, 2<<30); got != 40<<30 {
-		t.Fatalf("ceiling=%d want default %d", got, int64(40<<30))
+	wantCold := delegateSuiteBase + int64(runtime.NumCPU())*delegateSuitePerWorkerDefault
+	if wantCold > 62<<30 {
+		wantCold = 62 << 30
+	}
+	if got := server.resolveDelegateRAMScopeCeiling(request, 64<<30, 2<<30); got != wantCold {
+		t.Fatalf("ceiling=%d want cold start %d", got, wantCold)
+	}
+}
+
+func TestDelegateSuiteColdStartWorkerParsingAndOOMRatchet(t *testing.T) {
+	if got := delegateSuiteWorkers("pytest\x00-n16"); got != 16 {
+		t.Fatalf("-n16 workers=%d", got)
+	}
+	if got := delegateSuiteWorkers("pytest\x00--numprocesses\x0016"); got != 16 {
+		t.Fatalf("long workers=%d", got)
+	}
+	if got := delegateSuiteWorkers("pytest\x00-n\x00auto"); got != runtime.NumCPU() {
+		t.Fatalf("auto workers=%d", got)
+	}
+	if got := delegateSuiteWorkers("pytest\x00-q"); got != runtime.NumCPU() {
+		t.Fatalf("fallback workers=%d", got)
+	}
+	server := NewServer(Paths{})
+	server.admitPeakHistory = func(context.Context, string) (runner.PeakRSSStats, error) {
+		return runner.PeakRSSStats{PeakMax: 8 << 30, OOMCount: 1, MaxOOMPeak: 8 << 30}, nil
+	}
+	if got := server.resolveDelegateRAMScopeCeiling(admitRequest{signature: "pytest\x00-n\x001"}, 64<<30, 2<<30); got != 12<<30 {
+		t.Fatalf("OOM ratchet=%d", got)
 	}
 }
 

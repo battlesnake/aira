@@ -379,7 +379,7 @@ func TestGovernorStoresNextEstimateWithoutRankingOnIt(t *testing.T) {
 func TestGovernorRAMOrdersFittingParkedWorkerAheadOfBigWorker(t *testing.T) {
 	// Revert-check: the pre-Slice-3 sequence-only fill chooses big (seq=2)
 	// before small (seq=3). Near the ledger limit only small fits.
-	g := testRAMGovernor(t, 2, 90, 100, true)
+	g := testRAMGovernor(t, 3, 90, 100, true)
 	age := time.Now()
 	floor := putRAMGovernorWorker(g, "floor", "job", age, 1, governorActive, 1)
 	big := putRAMGovernorWorker(g, "big", "job", age, 2, governorParked, 20)
@@ -603,6 +603,22 @@ func TestGovernorRAMUnreadableLedgerFailsOpen(t *testing.T) {
 	g.evaluate()
 	if waiter.state != governorActive {
 		t.Fatal("unreadable ledger did not fail open")
+	}
+}
+
+func TestGovernorWholeChargedDelegateBypassesRAMOrderingNearCeiling(t *testing.T) {
+	// Deliberately exercise the enabled regime: available=10 is below the
+	// low mark (20), and a normal 50-byte estimate would be parked.
+	g := testRAMGovernor(t, 2, 90, 100, true)
+	queue := &sliceQueue{outstanding: 90, outstandingJobs: 1}
+	g.server.admitQueues["/slice"] = queue
+	age := time.Now()
+	putRAMGovernorWorker(g, "floor", "ordinary", age, 1, governorActive, 1)
+	whole := putRAMGovernorWorker(g, "whole", "CONFINE-@drc-suite-1-a", age, 2, governorParked, 50)
+	blocked := putRAMGovernorWorker(g, "blocked", "ordinary", age, 3, governorParked, 50)
+	g.evaluate()
+	if whole.state != governorActive || blocked.state != governorParked || !g.ramAware["/slice"] {
+		t.Fatalf("whole-charged worker was not exempt in RAM-aware regime: whole=%v blocked=%v aware=%v", whole.state, blocked.state, g.ramAware["/slice"])
 	}
 }
 

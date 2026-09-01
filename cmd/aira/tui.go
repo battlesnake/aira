@@ -15,6 +15,7 @@ import (
 	"aira/internal/core"
 	"aira/internal/daemon"
 	"aira/internal/store"
+
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )

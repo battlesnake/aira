@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,8 +34,10 @@ const (
 	admitSliceHeadroomBaseDefault       int64 = 2 << 30
 	admitSliceHeadroomSupervisorDefault int64 = 64 << 20
 	delegateRAMScopeMinDefault          int64 = 4 << 30
-	delegateRAMScopeSafetyPct           int64 = 15
+	delegateSuiteSafetyPct              int64 = 22
 	delegateRAMAdoptionMargin           int64 = 64 << 20
+	delegateSuiteBase                   int64 = 1 << 30
+	delegateSuitePerWorkerDefault       int64 = 768 << 20
 )
 
 type admitWaiterState uint8
@@ -47,21 +50,20 @@ const (
 )
 
 type admitWaiter struct {
-	seq          int64
-	reserve      int64
-	state        admitWaiterState
-	grantedCh    chan struct{}
-	enqueued     time.Time
-	waited       bool
-	accounted    bool
-	outcome      string
-	reason       string
-	waitedMS     int64
-	basis        string
-	scopeID      string
-	name         string
-	owner        string
-	scopeCeiling int64
+	seq       int64
+	reserve   int64
+	state     admitWaiterState
+	grantedCh chan struct{}
+	enqueued  time.Time
+	waited    bool
+	accounted bool
+	outcome   string
+	reason    string
+	waitedMS  int64
+	basis     string
+	scopeID   string
+	name      string
+	owner     string
 }
 
 type sliceQueue struct {
@@ -72,6 +74,7 @@ type sliceQueue struct {
 	outstandingJobs   int
 	adopted           int64
 	adoptedJobs       int
+	pending           map[string]int64
 	adoptedAt         time.Time
 	adoptedScanFailed bool
 	seq               int64
@@ -87,27 +90,32 @@ var sliceMemoryStatDegradeOnce sync.Once
 // AdmitResponse is the one grant payload sent before the daemon holds the
 // connection as the reservation lease.
 type AdmitResponse struct {
-	State        string `json:"state"`
-	Reason       string `json:"reason,omitempty"`
-	WaitedMS     int64  `json:"waited_ms"`
-	Reserve      int64  `json:"reserve"`
-	Basis        string `json:"basis"`
-	ScopeCeiling int64  `json:"scope_ceiling,omitempty"`
+	State    string `json:"state"`
+	Reason   string `json:"reason,omitempty"`
+	WaitedMS int64  `json:"waited_ms"`
+	Reserve  int64  `json:"reserve"`
+	Basis    string `json:"basis"`
 }
 
 type admitRequest struct {
-	slice       string
-	reserve     int64
-	maxWait     int64
-	signature   string
-	pinned      bool
-	scopeID     string
-	name        string
-	owner       string
-	delegateRAM bool
+	slice          string
+	reserve        int64
+	maxWait        int64
+	signature      string
+	pinned         bool
+	scopeID        string
+	name           string
+	owner          string
+	delegateRAM    bool
+	delegateCharge delegateCharge
 }
 
-var confineScopeIDPattern = regexp.MustCompile(`^CONFINE-(?:@dr-)?[A-Za-z0-9._-]+-[0-9]+-[0-9a-z]+$`)
+type delegateCharge struct {
+	mode  string
+	bytes int64
+}
+
+var confineScopeIDPattern = regexp.MustCompile(`^CONFINE-(?:@dr(?:c)?-)?[A-Za-z0-9._-]+-[0-9]+-[0-9a-z]+$`)
 
 type admitRejection struct {
 	Required int64  `json:"required,omitempty"`
@@ -288,10 +296,8 @@ func (s *Server) resolveAdmitReserve(request admitRequest, ceiling int64) (int64
 	return request.reserve, "fallback:no-history"
 }
 
-// resolveDelegateRAMScopeCeiling is intentionally separate from reserve
-// resolution: delegate-ram reserves are pinned framework overhead, while this
-// value is a whole-scope containment backstop. In particular, pinned:client
-// must still consult the scope's own peak history.
+// resolveDelegateRAMScopeCeiling resolves the whole-suite charge and cap for
+// estimate-mode delegate scopes. It deliberately bypasses pinned:client.
 func (s *Server) resolveDelegateRAMScopeCeiling(request admitRequest, maximum, headroom int64) int64 {
 	upper := subtractFloor(maximum, headroom)
 	if upper <= 0 {
@@ -301,7 +307,8 @@ func (s *Server) resolveDelegateRAMScopeCeiling(request admitRequest, maximum, h
 	if minimum > upper {
 		minimum = upper
 	}
-	candidate := delegateRAMScopeDefault()
+	candidate := int64(0)
+	historyFound := false
 	if request.signature != "" {
 		readCtx, cancel := context.WithTimeout(context.Background(), admitHistoryTimeout)
 		defer cancel()
@@ -311,12 +318,23 @@ func (s *Server) resolveDelegateRAMScopeCeiling(request admitRequest, maximum, h
 		}
 		if read != nil {
 			if stats, err := read(readCtx, request.signature); err == nil && stats.PeakMax > 0 {
+				historyFound = true
 				candidate = delegateRAMScopeWithSafety(stats.PeakMax)
 				if stats.OOMCount > 0 && stats.MaxOOMPeak > 0 {
 					candidate = delegateRAMScopeOOMEscalation(stats.MaxOOMPeak)
 				}
 			}
 		}
+	}
+	if !historyFound {
+		// Cold-start is intentionally a whole-suite reservation. The argv
+		// signature is NUL-joined, so wrappers/config-hidden -n conservatively
+		// fall back to NumCPU.
+		candidate = delegateSuiteColdStart(request.signature)
+		if candidate > upper {
+			return upper
+		}
+		return candidate
 	}
 	if candidate < minimum {
 		return minimum
@@ -334,18 +352,51 @@ func delegateRAMScopeMinimum() int64 {
 	return delegateRAMScopeMinDefault
 }
 
-func delegateRAMScopeDefault() int64 {
-	if parsed, err := runner.ParseMemorySize(strings.TrimSpace(os.Getenv("AIRA_DELEGATE_RAM_SCOPE_DEFAULT"))); err == nil && parsed > 0 {
-		return parsed
-	}
-	return runner.DefaultDelegateRAMScopeCeiling
-}
-
 func delegateRAMScopeWithSafety(peak int64) int64 {
-	if peak <= 0 || peak > math.MaxInt64/delegateRAMScopeSafetyPct {
+	if peak <= 0 || peak > math.MaxInt64/delegateSuiteSafetyPct {
 		return math.MaxInt64
 	}
-	return addClamp(peak, peak*delegateRAMScopeSafetyPct/100)
+	return addClamp(peak, peak*delegateSuiteSafetyPct/100)
+}
+
+func delegateSuiteColdStart(signature string) int64 {
+	workers := delegateSuiteWorkers(signature)
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > int(math.MaxInt64/delegateSuitePerWorkerDefault) {
+		return math.MaxInt64
+	}
+	return addClamp(delegateSuiteBase, int64(workers)*delegateSuitePerWorkerDefault)
+}
+
+func delegateSuiteWorkers(signature string) int {
+	fallback := runtime.NumCPU()
+	if fallback < 1 {
+		fallback = 1
+	}
+	args := strings.Split(signature, "\x00")
+	for index, arg := range args {
+		value := ""
+		switch {
+		case arg == "-n" || arg == "--numprocesses":
+			if index+1 < len(args) {
+				value = args[index+1]
+			}
+		case strings.HasPrefix(arg, "-n") && len(arg) > 2:
+			value = arg[2:]
+		case strings.HasPrefix(arg, "--numprocesses="):
+			value = strings.TrimPrefix(arg, "--numprocesses=")
+		}
+		value = strings.TrimSpace(value)
+		if value == "auto" || value == "logical" {
+			return fallback
+		}
+		if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return fallback
 }
 
 func delegateRAMScopeOOMEscalation(peak int64) int64 {
@@ -419,20 +470,23 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	if !ok {
 		// The daemon answered; only the slice's live usage was unreadable. Report
 		// that honestly (NOT "daemon-unavailable") so the operator-facing basis is
-		// truthful. A non-delegate scope is left uncapped here (state != admitted);
-		// a delegate-ram scope gets no daemon scope_ceiling and so falls back to the
-		// finite client-side default (AIRA-15) — never uncapped.
+		// truthful. Whole-charged delegate clients reject this non-admission.
 		s.writeAdmitGrant(conn, AdmitResponse{State: "unevaluated", Reason: reason, Reserve: request.reserve, Basis: "fallback:slice-unreadable"})
 		return
 	}
 	jobs := s.admitOutstandingJobs(path)
 	headroom := s.admitSliceHeadroom(jobs + 1)
 	ceiling := subtractFloor(maximum, headroom)
-	scopeCeiling := int64(0)
-	if request.delegateRAM {
-		scopeCeiling = s.resolveDelegateRAMScopeCeiling(request, maximum, headroom)
-	}
 	reserve, basis := s.resolveAdmitReserve(request, ceiling)
+	if request.delegateRAM {
+		if request.delegateCharge.mode == "estimate" {
+			reserve = s.resolveDelegateRAMScopeCeiling(request, maximum, headroom)
+			basis = "estimate:delegate-suite"
+		} else {
+			reserve = request.delegateCharge.bytes
+			basis = "pinned:delegate-explicit"
+		}
+	}
 	if reserve > ceiling {
 		s.writeAdmitRejection(conn, CodeAdmitTooLarge, admitRejection{Required: reserve, Ceiling: ceiling, Basis: basis})
 		return
@@ -446,7 +500,6 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		}
 		return
 	}
-	waiter.scopeCeiling = scopeCeiling
 	peerCtx, cancelPeer := context.WithCancel(context.Background())
 	defer cancelPeer()
 	go func() {
@@ -498,7 +551,7 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		queue.mu.Unlock()
 		return
 	}
-	grant := AdmitResponse{State: waiter.outcome, Reason: waiter.reason, WaitedMS: waiter.waitedMS, Reserve: waiter.reserve, Basis: waiter.basis, ScopeCeiling: waiter.scopeCeiling}
+	grant := AdmitResponse{State: waiter.outcome, Reason: waiter.reason, WaitedMS: waiter.waitedMS, Reserve: waiter.reserve, Basis: waiter.basis}
 	queue.mu.Unlock()
 
 	if s.admitBeforeWrite != nil {
@@ -645,17 +698,29 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			}
 			adopted := int64(0)
 			adoptedJobs := 0
+			livePending := make(map[string]bool)
 			for _, record := range scanResult.Scopes {
-				// Populated is the scope's LEAF cgroup.procs count, not the
-				// subtree-aware cgroup.events populated the #72 reaper uses. A live
-				// workload nested in a child cgroup it created reads empty here and is
-				// SKIPPED — the safe direction (its reserve is under-counted → over-
-				// admit, exactly as a fully forgotten pre-restart ledger, never worse).
-				// Subtree-aware liveness for adopted is a v2 item.
-				if record.Populated == nil || *record.Populated <= 0 {
+				if _, connectionHeld := held[record.ScopeID]; connectionHeld {
 					continue
 				}
-				if _, connectionHeld := held[record.ScopeID]; connectionHeld {
+				if reserve, pending := queue.pending[record.ScopeID]; pending {
+					// EOF can race scope teardown. Keep a whole-charged scope's
+					// grant in the adopted/pending ledger until cgroup.events says
+					// its entire subtree is empty.
+					if record.SubtreePopulated == nil || *record.SubtreePopulated {
+						adopted = addClamp(adopted, reserve)
+						adoptedJobs = addJobCountClamp(adoptedJobs, 1)
+						livePending[record.ScopeID] = true
+					}
+					continue
+				}
+				// New whole-charged scopes need subtree liveness: a test runner
+				// can leave the leaf while workers continue in child cgroups.
+				if runner.IsDelegateRAMScopeID(record.ScopeID) {
+					if record.SubtreePopulated == nil || !*record.SubtreePopulated {
+						continue
+					}
+				} else if record.Populated == nil || *record.Populated <= 0 {
 					continue
 				}
 				// A non-finite cap (delegate-ram "max", nil, malformed, negative)
@@ -670,11 +735,10 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 				if err != nil || cap < 0 {
 					continue
 				}
-				if runner.IsDelegateRAMScopeID(record.ScopeID) {
-					// AIRA-15 ceiling caps are containment backstops, never a
-					// whole-job reservation. After daemon restart only the dirname
-					// survives, so its positional marker selects current+margin
-					// reconstruction instead of adopting the generous ceiling.
+				if strings.HasPrefix(record.ScopeID, "CONFINE-@dr-") {
+					// Legacy @dr- scopes had generous containment-only caps. Their
+					// positional marker preserves current+margin reconstruction;
+					// @drc- falls through to full-cap adoption above.
 					if record.RSSBytes == nil || *record.RSSBytes < 0 {
 						continue
 					}
@@ -685,6 +749,11 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 				}
 				adopted = addClamp(adopted, cap)
 				adoptedJobs = addJobCountClamp(adoptedJobs, 1)
+			}
+			for scopeID := range queue.pending {
+				if !livePending[scopeID] {
+					delete(queue.pending, scopeID)
+				}
 			}
 			queue.adopted = adopted
 			queue.adoptedJobs = adoptedJobs
@@ -782,6 +851,14 @@ func (s *Server) releaseAdmitWaiter(queue *sliceQueue, waiter *admitWaiter) {
 	if waiter.state == admitGranted && waiter.accounted {
 		queue.outstanding -= waiter.reserve
 		queue.outstandingJobs--
+		if strings.HasPrefix(waiter.scopeID, "CONFINE-@drc-") {
+			if queue.pending == nil {
+				queue.pending = make(map[string]int64)
+			}
+			queue.pending[waiter.scopeID] = waiter.reserve
+			queue.adopted = addClamp(queue.adopted, waiter.reserve)
+			queue.adoptedJobs = addJobCountClamp(queue.adoptedJobs, 1)
+		}
 	}
 	for index, candidate := range queue.waiters {
 		if candidate == waiter {
@@ -807,7 +884,7 @@ func (s *Server) pruneAdmitQueue(queue *sliceQueue) {
 	// Fixed lock order: registry then slice. Callers never retain queue.mu.
 	s.admitRegistryMu.Lock()
 	queue.mu.Lock()
-	if len(queue.waiters) == 0 && s.admitQueues[queue.path] == queue {
+	if len(queue.waiters) == 0 && len(queue.pending) == 0 && s.admitQueues[queue.path] == queue {
 		delete(s.admitQueues, queue.path)
 		queue.stopOnce.Do(func() { close(queue.stop) })
 	}
@@ -819,7 +896,7 @@ func (s *Server) pruneAdmitRegistry() {
 	s.admitRegistryMu.Lock()
 	for path, queue := range s.admitQueues {
 		queue.mu.Lock()
-		if len(queue.waiters) == 0 {
+		if len(queue.waiters) == 0 && len(queue.pending) == 0 {
 			delete(s.admitQueues, path)
 			queue.stopOnce.Do(func() { close(queue.stop) })
 		}
@@ -876,11 +953,11 @@ func elapsedMilliseconds(start, end time.Time) int64 {
 }
 
 func validateAdmitArgs(args map[string]any) (admitRequest, error) {
-	if len(args) < 3 || len(args) > 9 {
-		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, max_wait_ms, optional signature/pinned/delegate_ram, and an optional complete scope_id/name/owner tuple", CodeProtocol)
+	if len(args) < 3 || len(args) > 10 {
+		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, max_wait_ms, optional signature/pinned/delegate_ram/delegate_charge, and an optional complete scope_id/name/owner tuple", CodeProtocol)
 	}
 	for name := range args {
-		if name != "slice" && name != "reserve" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "delegate_ram" && name != "scope_id" && name != "name" && name != "owner" {
+		if name != "slice" && name != "reserve" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "delegate_ram" && name != "delegate_charge" && name != "scope_id" && name != "name" && name != "owner" {
 			return admitRequest{}, fmt.Errorf("%s: unexpected admit field %q", CodeProtocol, name)
 		}
 	}
@@ -927,6 +1004,36 @@ func validateAdmitArgs(args map[string]any) (admitRequest, error) {
 			return admitRequest{}, fmt.Errorf("%s: admit delegate_ram must be boolean", CodeProtocol)
 		}
 	}
+	charge := delegateCharge{}
+	if delegateRAM {
+		raw, exists := args["delegate_charge"]
+		if !exists {
+			return admitRequest{}, fmt.Errorf("%s: delegate admit requires delegate_charge", CodeProtocol)
+		}
+		object, valid := raw.(map[string]any)
+		if !valid || len(object) < 1 || len(object) > 2 {
+			return admitRequest{}, fmt.Errorf("%s: delegate_charge must be an object", CodeProtocol)
+		}
+		mode, valid := object["mode"].(string)
+		if !valid {
+			return admitRequest{}, fmt.Errorf("%s: delegate_charge mode is invalid", CodeProtocol)
+		}
+		charge.mode = mode
+		switch mode {
+		case "estimate":
+			if len(object) != 1 {
+				return admitRequest{}, fmt.Errorf("%s: estimate delegate_charge has no bytes", CodeProtocol)
+			}
+		case "explicit":
+			bytes, ok := exactAdmitInt64(object["bytes"])
+			if !ok || bytes <= 0 || bytes != reserve || len(object) != 2 {
+				return admitRequest{}, fmt.Errorf("%s: explicit delegate_charge bytes must equal reserve", CodeProtocol)
+			}
+			charge.bytes = bytes
+		default:
+			return admitRequest{}, fmt.Errorf("%s: delegate_charge mode is invalid", CodeProtocol)
+		}
+	}
 	scopeID, hasScope := args["scope_id"]
 	name, hasName := args["name"]
 	owner, hasOwner := args["owner"]
@@ -949,14 +1056,16 @@ func validateAdmitArgs(args map[string]any) (admitRequest, error) {
 		if !ownerOK || runner.ValidateConfineIdentity(ownerText) != nil {
 			return admitRequest{}, fmt.Errorf("%s: admit owner is invalid", CodeProtocol)
 		}
-		return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM, scopeID: scopeText, name: nameText, owner: ownerText}, nil
+		return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM, delegateCharge: charge, scopeID: scopeText, name: nameText, owner: ownerText}, nil
 	}
-	return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM}, nil
+	return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM, delegateCharge: charge}, nil
 }
 
 func confineAdmitScopeName(scopeID string) (string, bool) {
 	rest := strings.TrimPrefix(scopeID, "CONFINE-")
-	if strings.HasPrefix(rest, "@dr-") {
+	if strings.HasPrefix(rest, "@drc-") {
+		rest = strings.TrimPrefix(rest, "@drc-")
+	} else if strings.HasPrefix(rest, "@dr-") {
 		rest = strings.TrimPrefix(rest, "@dr-")
 	}
 	last := strings.LastIndexByte(rest, '-')

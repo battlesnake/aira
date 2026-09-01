@@ -1113,7 +1113,7 @@ func TestConfineAdmitFrameCarriesScopeNameAndOwner(t *testing.T) {
 	result.releaseAdmission()
 }
 
-func TestDelegateRAMAdmitFrameAndGrantCarryScopeCeiling(t *testing.T) {
+func TestDelegateRAMAdmitFrameCarriesEstimateCharge(t *testing.T) {
 	r, _ := gateOnlyRunner(t, newInstantClock(), func(string) (int64, int64, bool, string) { return 0, 100, true, "" })
 	client, server := net.Pipe()
 	r.admitDialFn = func(context.Context, string) (net.Conn, error) { return client, nil }
@@ -1126,16 +1126,32 @@ func TestDelegateRAMAdmitFrameAndGrantCarryScopeCeiling(t *testing.T) {
 		if request.Request.Args["delegate_ram"] != true {
 			t.Errorf("delegate_ram args=%v", request.Request.Args)
 		}
-		data, _ := json.Marshal(runnerAdmitGrant{State: "immediate", Reserve: DefaultDelegateRAMOverhead, Basis: "pinned:client", ScopeCeiling: 8 << 30})
+		if charge, ok := request.Request.Args["delegate_charge"].(map[string]any); !ok || charge["mode"] != "estimate" {
+			t.Errorf("delegate_charge args=%v", request.Request.Args)
+		}
+		data, _ := json.Marshal(runnerAdmitGrant{State: "immediate", Reserve: 8 << 30, Basis: "estimate:delegate-suite"})
 		_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{OK: true, Code: "OK", Data: data})
 		var one [1]byte
 		_, _ = server.Read(one[:])
 	}()
 	result, err := r.admit(context.Background(), Request{DelegateRAM: true})
-	if err != nil || result.scopeCeiling != 8<<30 || result.scopeCeiling == result.reserve {
+	if err != nil || result.reserve != 8<<30 {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 	result.releaseAdmission()
+}
+
+func TestDelegateRAMDaemonFailureDoesNotFallBackToFlock(t *testing.T) {
+	r, _ := gateOnlyRunner(t, newInstantClock(), func(string) (int64, int64, bool, string) {
+		return 0, 1 << 40, true, ""
+	})
+	r.admitDialFn = func(context.Context, string) (net.Conn, error) {
+		return nil, errors.New("daemon unavailable")
+	}
+	result, err := r.admit(context.Background(), Request{DelegateRAM: true})
+	if err == nil || result.lock != nil || result.release != nil {
+		t.Fatalf("delegate daemon failure fell back: result=%+v err=%v", result, err)
+	}
 }
 
 func TestDaemonAdmitFrameUsesOverrideReserve(t *testing.T) {

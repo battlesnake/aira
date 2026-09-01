@@ -15,15 +15,10 @@ const (
 	// A project-less invocation has no per-project peak-RSS history. Four GiB is
 	// a conservative #50 no-history fallback; injected callers may override it.
 	DefaultConfineMemoryReserve = int64(4 << 30)
-	// Under --delegate-ram the suite delegates RAM accounting to its per-test
-	// reservations, so its OWN reserve must be a small PINNED framework overhead —
-	// never the unpinned whole-command estimate, which would double-book the
-	// per-test reservations in queue.outstanding and could inflate via history to
-	// reject the whole suite E_ADMIT_TOO_LARGE.
+	// Under --delegate-ram the daemon charges the whole-suite estimate and the
+	// scope is capped at that same charged reserve. This compatibility value is
+	// sent only while the daemon resolves that estimate; it is never the charge.
 	DefaultDelegateRAMOverhead = int64(512 << 20)
-	// DefaultDelegateRAMScopeCeiling is the compiled-in containment cap used
-	// whenever a daemon ceiling is unavailable. It is not an admission charge.
-	DefaultDelegateRAMScopeCeiling = int64(48 << 30)
 )
 
 type ConfineAdmission string
@@ -109,16 +104,21 @@ type ConfineRequest struct {
 	MemoryReserve       int64
 	MemoryReservePinned bool
 	DelegateRAM         bool
-	ScopeMemoryMax      int64
-	ScopeMemoryHigh     int64
-	AdmissionMaxWait    time.Duration
-	PollInterval        time.Duration
-	HandshakeTimeout    time.Duration
-	Stdin               io.Reader
-	Stdout              io.Writer
-	Stderr              io.Writer
-	SelfPath            string
-	ResourceSignature   string
+	// DelegateRAMChargeExplicit is computed during confine setup: true when a
+	// delegate-ram suite carries a user-supplied reserve or --memory-max (charge
+	// it verbatim) vs the estimate mode where the daemon resolves the whole-suite
+	// reserve. Internal only; propagated to the admit Request.
+	DelegateRAMChargeExplicit bool
+	ScopeMemoryMax            int64
+	ScopeMemoryHigh           int64
+	AdmissionMaxWait          time.Duration
+	PollInterval              time.Duration
+	HandshakeTimeout          time.Duration
+	Stdin                     io.Reader
+	Stdout                    io.Writer
+	Stderr                    io.Writer
+	SelfPath                  string
+	ResourceSignature         string
 }
 
 const ConfineUnknownOwner = "unknown"

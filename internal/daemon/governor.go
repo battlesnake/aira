@@ -391,6 +391,15 @@ func (g *governorSet) evaluate() {
 			return result
 		}
 		ramOrdering := func(w *governorWorker) (availability, bool) {
+			// A whole-charged delegate suite has already reserved its entire
+			// memory.max in the admission ledger. Comparing a worker estimate to
+			// the remaining slice ledger would double-book it, so make every
+			// Slice-3 RAM-ordering lever inert for this worker.
+			if runner.IsDelegateRAMScopeID(w.jobID) {
+				w.ramSkips = 0
+				w.ramSkipLogged = false
+				return availability{}, false
+			}
 			result := lookup(w.slice)
 			if !result.ok {
 				w.ramSkips = 0

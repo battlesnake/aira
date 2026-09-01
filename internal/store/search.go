@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"aira/internal/domain"
+
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )

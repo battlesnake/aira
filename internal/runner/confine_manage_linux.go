@@ -86,7 +86,7 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 		path := filepath.Join(slicePath, entry.Name())
 		fd, openErr := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 		if openErr != nil {
-			record.UnevaluatedFields = append(record.UnevaluatedFields, "populated", "rss", "cap")
+			record.UnevaluatedFields = append(record.UnevaluatedFields, "populated", "subtree_populated", "rss", "cap")
 			byID[scopeID] = record
 			continue
 		}
@@ -97,6 +97,15 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 			record.Populated = &count
 		} else {
 			record.UnevaluatedFields = append(record.UnevaluatedFields, "populated")
+		}
+		if data, readErr := deps.readField(scope, "cgroup.events", 256); readErr == nil {
+			if populated, parseErr := parseCgroupEventsPopulated(data); parseErr == nil {
+				record.SubtreePopulated = &populated
+			} else {
+				record.UnevaluatedFields = append(record.UnevaluatedFields, "subtree_populated")
+			}
+		} else {
+			record.UnevaluatedFields = append(record.UnevaluatedFields, "subtree_populated")
 		}
 		if data, readErr := deps.readField(scope, "memory.current", 64); readErr == nil {
 			if value, parseErr := parseConfineInt(data); parseErr == nil {
@@ -229,6 +238,21 @@ func parseConfineInt(data []byte) (int64, error) {
 	return value, nil
 }
 
+func parseCgroupEventsPopulated(data []byte) (bool, error) {
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || fields[0] != "populated" {
+			continue
+		}
+		value, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil || (value != 0 && value != 1) {
+			return false, errors.New("invalid cgroup.events populated")
+		}
+		return value == 1, nil
+	}
+	return false, errors.New("missing cgroup.events populated")
+}
+
 func validConfineScopeID(scopeID string) bool {
 	_, _, _, ok := parseConfineScopeID(scopeID)
 	return ok
@@ -241,6 +265,8 @@ func parseConfineScopeID(scopeID string) (string, int, int64, bool) {
 	rest := strings.TrimPrefix(scopeID, "CONFINE-")
 	if strings.HasPrefix(rest, delegateRAMScopeIDMarker+"-") {
 		rest = strings.TrimPrefix(rest, delegateRAMScopeIDMarker+"-")
+	} else if strings.HasPrefix(rest, legacyDelegateRAMScopeIDMarker+"-") {
+		rest = strings.TrimPrefix(rest, legacyDelegateRAMScopeIDMarker+"-")
 	}
 	last := strings.LastIndexByte(rest, '-')
 	if last <= 0 || last == len(rest)-1 {

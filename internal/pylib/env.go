@@ -93,9 +93,9 @@ func appendChildEnvironment(env []string, runtimeDir string, diagnostics io.Writ
 		if strings.TrimSpace(memoryDefault) == "" {
 			memoryDefault = DefaultTestMemoryReserve
 		}
-		result = upsertChildEnv(result, "AIRA_TEST_MEM_GOVERNOR", "1")
-		// Kept for the plugin's malformed-marker fallback. Unmarked tests reserve
-		// measured RSS plus growth headroom; this value is no longer their floor.
+		// RAM is prepaid by the whole-suite admission charge. Leave the plugin's
+		// CPU relay enabled below, but do not enable its per-test RAM lease path.
+		// Kept for the plugin's malformed-marker fallback.
 		result = upsertChildEnv(result, "AIRA_TEST_MEM_DEFAULT", memoryDefault)
 		result = upsertChildEnv(result, "AIRA_CONFINE_RESERVE_CMD", reserveCommand)
 		// The relay uses the same resolved self binary as confine-reserve and

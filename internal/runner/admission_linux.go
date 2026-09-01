@@ -30,15 +30,14 @@ func (systemClock) Now() time.Time                         { return time.Now() }
 func (systemClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
 
 type admissionResult struct {
-	state        string
-	reason       string
-	waitedMS     int64
-	lock         *admitLock
-	release      io.Closer
-	reserve      int64
-	ceiling      int64
-	scopeCeiling int64
-	basis        string
+	state    string
+	reason   string
+	waitedMS int64
+	lock     *admitLock
+	release  io.Closer
+	reserve  int64
+	ceiling  int64
+	basis    string
 }
 
 var errDetachKillIntent = errors.New("detached run has a pending kill intent")
@@ -100,12 +99,11 @@ type runnerAdmitResponseFrame struct {
 }
 
 type runnerAdmitGrant struct {
-	State        string `json:"state"`
-	Reason       string `json:"reason,omitempty"`
-	WaitedMS     int64  `json:"waited_ms"`
-	Reserve      int64  `json:"reserve"`
-	Basis        string `json:"basis"`
-	ScopeCeiling int64  `json:"scope_ceiling,omitempty"`
+	State    string `json:"state"`
+	Reason   string `json:"reason,omitempty"`
+	WaitedMS int64  `json:"waited_ms"`
+	Reserve  int64  `json:"reserve"`
+	Basis    string `json:"basis"`
 }
 
 type runnerAdmitRejection struct {
@@ -127,7 +125,14 @@ func (r *Runner) admit(ctx context.Context, req Request) (admissionResult, error
 	}
 	start := r.clock.Now()
 	if result, granted, err := r.admitThroughDaemon(ctx, req, effectiveReserve); granted || err != nil {
+		if req.DelegateRAM && err == nil && (result.state != "immediate" && result.state != "waited") {
+			result.releaseAdmission()
+			return admissionResult{}, errors.New("E_CONFINE_UNAVAILABLE: daemon admission unavailable for whole-charged delegate-ram scope")
+		}
 		return result, err
+	}
+	if req.DelegateRAM {
+		return admissionResult{}, errors.New("E_CONFINE_UNAVAILABLE: daemon admission unavailable for whole-charged delegate-ram scope")
 	}
 	daemonWaited := false
 	if r.admitDialFn != nil || strings.TrimSpace(r.admitSocketPath) != "" {
@@ -345,6 +350,11 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 	}
 	if req.DelegateRAM {
 		frame.Request.Args["delegate_ram"] = true
+		charge := map[string]any{"mode": "estimate"}
+		if req.DelegateRAMChargeExplicit {
+			charge = map[string]any{"mode": "explicit", "bytes": effectiveReserve}
+		}
+		frame.Request.Args["delegate_charge"] = charge
 	}
 	if req.ConfineScopeID != "" {
 		frame.Request.Args["scope_id"] = req.ConfineScopeID
@@ -416,7 +426,7 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 	}
 	// A full, validated frame is the sole winning outcome even when its final
 	// byte races the transport deadline. The flock fallback is never entered.
-	return admissionResult{state: grant.State, reason: grant.Reason, waitedMS: grant.WaitedMS, release: conn, reserve: grant.Reserve, basis: grant.Basis, scopeCeiling: grant.ScopeCeiling}, true, nil
+	return admissionResult{state: grant.State, reason: grant.Reason, waitedMS: grant.WaitedMS, release: conn, reserve: grant.Reserve, basis: grant.Basis}, true, nil
 }
 
 const mathMaxInt64 = int64(^uint64(0) >> 1)

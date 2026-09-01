@@ -28,6 +28,7 @@ type ConfineRecord struct {
 	SupervisorPID     *int     `json:"supervisor_pid"`
 	ScopeID           string   `json:"scope_id"`
 	Populated         *int     `json:"populated"`
+	SubtreePopulated  *bool    `json:"subtree_populated"`
 	RSSBytes          *int64   `json:"rss_bytes"`
 	AgeSeconds        *int64   `json:"age_seconds"`
 	Cap               *string  `json:"cap"`

@@ -10,7 +10,8 @@ import (
 )
 
 func confineScanRecord(scopeID string, populated int, cap string) runner.ConfineRecord {
-	return runner.ConfineRecord{ScopeID: scopeID, Populated: &populated, Cap: &cap}
+	subtree := populated > 0
+	return runner.ConfineRecord{ScopeID: scopeID, Populated: &populated, SubtreePopulated: &subtree, Cap: &cap}
 }
 
 func noConfinesScan(string) (runner.ConfineListResult, error) {
@@ -194,23 +195,51 @@ func TestAdmitReconstructionNonFiniteCapsContributeNeitherBytesNorHeadroom(t *te
 // verifies: the scope-ID marker, not volatile daemon registry metadata, carries
 // the cap type across restart. Ceiling caps adopt at current+margin; ordinary
 // #67 finite caps keep adopting at their full cap.
-func TestAdmitReconstructionUsesDelegateRAMCapType(t *testing.T) {
+func TestAdmitReconstructionAdoptsWholeChargedAtFullCapAndLegacyWithMargin(t *testing.T) {
 	now := time.Unix(650, 0)
 	server := reconstructionTestServer(&now, func(string) (runner.ConfineListResult, error) {
 		populated := 1
 		markedCap, regularCap := "10737418240", "3221225472" // 10 GiB / 3 GiB
 		markedRSS := int64(1 << 30)
+		subtree := true
 		return runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{
-			{ScopeID: "CONFINE-@dr-suite-1-a", Populated: &populated, Cap: &markedCap, RSSBytes: &markedRSS},
+			{ScopeID: "CONFINE-@drc-suite-1-a", Populated: &populated, SubtreePopulated: &subtree, Cap: &markedCap, RSSBytes: &markedRSS},
+			{ScopeID: "CONFINE-@dr-legacy-1-a", Populated: &populated, Cap: &markedCap, RSSBytes: &markedRSS},
 			{ScopeID: "CONFINE-reserve-cap-2-b", Populated: &populated, Cap: &regularCap, RSSBytes: &markedRSS},
 		}}, nil
 	})
 	queue := &sliceQueue{path: "/slice", server: server}
 	server.evaluateAdmitQueue(queue)
-	wantMarked := int64(1<<30) + delegateRAMAdoptionMargin
-	want := wantMarked + int64(3<<30)
-	if queue.adopted != want || queue.adoptedJobs != 2 {
-		t.Fatalf("adopted=%d jobs=%d, want marked current+margin %d plus unmarked cap %d", queue.adopted, queue.adoptedJobs, wantMarked, int64(3<<30))
+	wantLegacy := int64(1<<30) + delegateRAMAdoptionMargin
+	want := int64(10<<30) + wantLegacy + int64(3<<30)
+	if queue.adopted != want || queue.adoptedJobs != 3 {
+		t.Fatalf("adopted=%d jobs=%d, want whole cap %d + legacy margin %d + cap %d", queue.adopted, queue.adoptedJobs, int64(10<<30), wantLegacy, int64(3<<30))
+	}
+}
+
+func TestAdmitReleaseHoldsWholeChargedScopeUntilSubtreeEmpty(t *testing.T) {
+	now := time.Unix(750, 0)
+	subtree := true
+	cap := "40"
+	scopeID := "CONFINE-@drc-suite-1-a"
+	server := reconstructionTestServer(&now, func(string) (runner.ConfineListResult, error) {
+		return runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{{ScopeID: scopeID, SubtreePopulated: &subtree, Cap: &cap}}}, nil
+	})
+	waiter := &admitWaiter{state: admitGranted, accounted: true, reserve: 40, scopeID: scopeID}
+	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{waiter}, outstanding: 40, outstandingJobs: 1}
+	server.releaseAdmitWaiter(queue, waiter)
+	if queue.adopted != 40 || queue.adoptedJobs != 1 {
+		t.Fatalf("immediate hold adopted=%d jobs=%d", queue.adopted, queue.adoptedJobs)
+	}
+	server.evaluateAdmitQueue(queue)
+	if queue.adopted != 40 {
+		t.Fatalf("live subtree released hold=%d", queue.adopted)
+	}
+	subtree = false
+	now = now.Add(time.Second)
+	server.evaluateAdmitQueue(queue)
+	if queue.adopted != 0 || len(queue.pending) != 0 {
+		t.Fatalf("empty subtree hold=%d pending=%v", queue.adopted, queue.pending)
 	}
 }
 

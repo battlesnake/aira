@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"aira/internal/pylib"
+
 	"golang.org/x/sys/unix"
 )
 
@@ -444,22 +445,24 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	}
 
 	reserve := request.MemoryReserve
+	delegateExplicitReserve := request.DelegateRAM && reserve > 0
 	pinned := request.MemoryReservePinned || reserve > 0
 	if reserve <= 0 {
 		if request.DelegateRAM {
-			// Delegate-ram: pin a small framework overhead so the suite's own
-			// reserve never takes the unpinned whole-command estimate path (which
-			// would double-book the per-test reservations, §2a).
+			// This placeholder is ignored by the daemon's estimate-mode delegate
+			// charge descriptor; it retains compatibility with the common admit
+			// wire while the daemon resolves the whole-suite reserve.
 			reserve = DefaultDelegateRAMOverhead
 			pinned = true
 		} else {
 			reserve = DefaultConfineMemoryReserve
 		}
 	}
-	if !request.DelegateRAM && request.ScopeMemoryMax > 0 {
+	if request.ScopeMemoryMax > 0 {
 		reserve = request.ScopeMemoryMax
 		pinned = true
 	}
+	request.DelegateRAMChargeExplicit = request.DelegateRAM && (request.ScopeMemoryMax > 0 || delegateExplicitReserve)
 	signature := request.ResourceSignature
 	if signature == "" {
 		if computed, signatureErr := ResourceSignature(nil, nil, request.Argv); signatureErr == nil {
@@ -584,24 +587,13 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	scopeMemoryMax := request.ScopeMemoryMax
 	// Only an ADMITTED (accounted) daemon grant carries an estimate-sized reserve
 	// that both bounds Σ(reserve) ≤ cap-headroom AND may be enforced as the scope
-	// memory.max for non-delegate jobs. Delegate-ram's pinned framework reserve is
-	// never a scope cap: it uses a separate daemon ceiling or a finite client
-	// fallback when the daemon cannot provide one.
+	// memory.max. Whole-charged delegate grants use this same airtight path.
 	admitted := admission.state == "immediate" || admission.state == "waited"
-	if !request.DelegateRAM && scopeMemoryMax <= 0 && admitted && admission.lock == nil && admission.release != nil && admission.reserve > 0 {
+	if scopeMemoryMax <= 0 && admitted && admission.lock == nil && admission.release != nil && admission.reserve > 0 {
 		scopeMemoryMax = admission.reserve
 	}
-	// Delegate-ram: an explicit --memory-max (scopeMemoryMax > 0) is the user's
-	// informed, still-finite-and-contained choice and WINS — it is never lowered by
-	// the learned ceiling, which would false-kill a suite the user deliberately sized
-	// larger (and which is exactly the interim --memory-max mitigation others rely on).
-	// The ceiling only supplies a finite cap when there is no explicit one; a compiled-in
-	// fallback backs it when the daemon provides none, so the scope is never uncapped.
-	if request.DelegateRAM && scopeMemoryMax <= 0 {
-		scopeMemoryMax = admission.scopeCeiling
-		if scopeMemoryMax <= 0 {
-			scopeMemoryMax = delegateRAMScopeFallback()
-		}
+	if request.DelegateRAM && admitted && admission.lock == nil && admission.release != nil && admission.reserve > 0 && scopeMemoryMax != admission.reserve {
+		return result, confineUnavailable(sliceName, errors.New("delegate-ram admission reserve does not match scope memory.max"))
 	}
 	if request.DelegateRAM && scopeMemoryMax <= 0 {
 		return result, confineUnavailable(sliceName, errors.New("delegate-ram scope has no finite memory.max"))
@@ -820,13 +812,14 @@ func admitConfine(ctx context.Context, path string, request ConfineRequest, rese
 		diagnostics: request.Stderr, admitSocketPath: request.AdmitSocketPath,
 	}
 	return admitter.admit(ctx, Request{
-		ResourceSignature:    request.ResourceSignature,
-		MemoryReservePinned:  request.MemoryReservePinned,
-		DaemonEstimateMemory: true,
-		DelegateRAM:          request.DelegateRAM,
-		ConfineScopeID:       request.ScopeID,
-		ConfineName:          request.Name,
-		ConfineOwner:         request.Owner,
+		ResourceSignature:         request.ResourceSignature,
+		MemoryReservePinned:       request.MemoryReservePinned,
+		DaemonEstimateMemory:      true,
+		DelegateRAM:               request.DelegateRAM,
+		DelegateRAMChargeExplicit: request.DelegateRAMChargeExplicit,
+		ConfineScopeID:            request.ScopeID,
+		ConfineName:               request.Name,
+		ConfineOwner:              request.Owner,
 	})
 }
 
@@ -861,7 +854,10 @@ func validateConfineName(name string) error {
 	return nil
 }
 
-const delegateRAMScopeIDMarker = "@dr"
+const (
+	delegateRAMScopeIDMarker       = "@drc"
+	legacyDelegateRAMScopeIDMarker = "@dr"
+)
 
 func confineScopeID(name string, delegateRAM bool) string {
 	if name == "" {
@@ -871,14 +867,6 @@ func confineScopeID(name string, delegateRAM bool) string {
 		return "CONFINE-" + delegateRAMScopeIDMarker + "-" + name + "-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	}
 	return "CONFINE-" + name + "-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
-}
-
-func delegateRAMScopeFallback() int64 {
-	value := strings.TrimSpace(os.Getenv("AIRA_DELEGATE_RAM_SCOPE_DEFAULT"))
-	if parsed, err := ParseMemorySize(value); err == nil && parsed > 0 {
-		return parsed
-	}
-	return DefaultDelegateRAMScopeCeiling
 }
 
 func confineUnavailable(slice string, err error) error {
