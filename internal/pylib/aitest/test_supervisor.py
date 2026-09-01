@@ -292,3 +292,156 @@ sys.stdin.buffer.read()
 
     assert results[nodeid] == "unevaluated"
     assert supervisor.attempts[nodeid] == 2
+
+
+def test_daemon_down_fallback_completes_suite_with_one_warning_no_admit_subprocess(tmp_path, monkeypatch, pytester, capsys):
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", str(tmp_path / "missing-bootstrap"))
+    monkeypatch.setenv("AIRA_AITEST_MAX_WORKERS_FALLBACK", "2")
+    monkeypatch.delenv("AIRA_AITEST_WORKER_ADMIT_CMD", raising=False)
+
+    items = pytester.getitems("""
+        def test_one():
+            assert True
+
+        def test_two():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=2)
+
+    assert len(results) == 2
+    assert all(outcome == "passed" for outcome in results.values())
+    assert supervisor.daemon_available is False
+    stderr = capsys.readouterr().err
+    assert stderr.count("aira aitest:") == 1
+
+
+def test_worker_admit_denied_does_not_disable_daemon_and_still_completes(tmp_path, monkeypatch, pytester, capsys):
+    """A "denied" response means the daemon is reachable and just declined
+    THIS request right now -- it must NOT disable daemon-backed admission
+    or fall back to unconfined workers (the bug this fixes: one saturated
+    moment permanently stripping containment for the rest of the run).
+    This stub denies the first two admission attempts, then grants; the
+    suite must still complete with containment intact throughout (no
+    fallback warning emitted at all)."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+import sys
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+sys.exit(0)
+""")
+    denial_state = tmp_path / "denials-remaining"
+    denial_state.write_text("2")
+    admit = _write_stub(tmp_path / "worker-admit", f"""
+import os, sys
+state_path = {str(denial_state)!r}
+remaining = int(open(state_path).read())
+if remaining > 0:
+    open(state_path, "w").write(str(remaining - 1))
+    sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit denied: fallback:insufficient-headroom\\n")
+    sys.exit(1)
+scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+os.makedirs(scope, exist_ok=True)
+print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+
+    items = pytester.getitems("""
+        def test_one():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+
+    assert len(results) == 1
+    assert all(outcome == "passed" for outcome in results.values())
+    assert supervisor.daemon_available is True
+    # The real invariant this test protects (per its own docstring) is "no
+    # fallback warning was emitted" -- not "stderr is byte-for-byte empty".
+    # _retire_worker's best-effort rmdir of a worker/supervisor scope
+    # legitimately logs a diagnostic line when that rmdir fails (e.g. here,
+    # because the test-double worker-admit stub grants a plain tmp_path
+    # directory, not a real cgroupfs mount, so place_self()'s
+    # cgroup.procs write leaves a stray regular file an ordinary rmdir
+    # can't remove) -- that's an orthogonal, already-accepted "cosmetic,
+    # backstopped by #72's reaper" cleanup path (see _retire_worker),
+    # unrelated to whether admission fell back to unconfined workers.
+    stderr = capsys.readouterr().err
+    assert "falling back to" not in stderr and "UNCONFINED" not in stderr, stderr
+
+
+def test_fallback_worker_count_capped_at_pool_size_not_added_on_top(tmp_path, monkeypatch, pytester):
+    """Fallback spawning must respect min(requested_worker_count,
+    max_workers_fallback) as the TOTAL pool size -- not spawn up to
+    max_workers_fallback ON TOP OF whatever was already admitted before
+    the daemon was marked unavailable mid-startup, and not ignore
+    --aitest-workers by always growing to the (possibly NumCPU-sized)
+    fallback cap regardless of what was actually requested. The first
+    worker-admit call succeeds (one confined worker gets running); the
+    second reveals the daemon is genuinely unreachable."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+import sys
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+sys.exit(0)
+""")
+    admit_state = tmp_path / "admit-count"
+    admit_state.write_text("0")
+    admit = _write_stub(tmp_path / "worker-admit", f"""
+import os, sys
+state_path = {str(admit_state)!r}
+count = int(open(state_path).read())
+open(state_path, "w").write(str(count + 1))
+if count == 0:
+    scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+    os.makedirs(scope, exist_ok=True)
+    print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+    sys.stdout.flush()
+    sys.stdin.buffer.read()
+else:
+    sys.stderr.write("E_CONFINE_UNAVAILABLE: dial daemon: connection refused\\n")
+    sys.exit(1)
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    monkeypatch.setenv("AIRA_AITEST_MAX_WORKERS_FALLBACK", "5")
+
+    items = pytester.getitems("""
+        def test_one():
+            assert True
+
+        def test_two():
+            assert True
+
+        def test_three():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    fallback_spawns = []
+    original_spawn_fallback = supervisor._spawn_fallback_worker
+
+    def counting_spawn_fallback():
+        pid = original_spawn_fallback()
+        fallback_spawns.append(pid)
+        return pid
+
+    supervisor._spawn_fallback_worker = counting_spawn_fallback
+
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=3)
+
+    assert len(results) == 3
+    assert all(outcome == "passed" for outcome in results.values())
+    assert supervisor.daemon_available is False
+    # 1 confined worker was already admitted before unavailability was
+    # detected -- the fallback loop must add at most 2 MORE (pool size 3 =
+    # min(worker_count=3, max_workers_fallback=5), minus the 1 already
+    # running), never up to 5 on top of it.
+    assert len(fallback_spawns) <= 2

@@ -6,6 +6,13 @@ _DEFAULT_MAX_SECONDS = 600
 _DEFAULT_MAX_TESTS = 200
 _DEFAULT_HIGH_WATERMARK_PCT = 80
 
+# Appended to a result line ("<nodeid> <outcome>") when this is the LAST
+# test this worker will run before retiring -- never sent as a separate
+# message. supervisor.py's _drain_worker strips this suffix to learn the
+# same fact atomically with the result, closing the race described in
+# run_worker_loop's recycle branch above.
+_RECYCLE_SUFFIX = " __recycle_next__"
+
 
 def _read_cgroup_int(scope_path, filename):
     with open(os.path.join(scope_path, filename), encoding="ascii") as handle:
@@ -162,9 +169,20 @@ def run_worker_loop(scope_path, items_by_nodeid, pipe_in, pipe_out):
         item = items_by_nodeid[nodeid]
         outcome = run_one(item)
         completed_count += 1
-        pipe_out.write("%s %s\n" % (nodeid, outcome))
+        recycling = _should_recycle(scope_path, started_at, completed_count)
+        # The recycle decision rides in the SAME line as the result, not a
+        # separate write -- two independent write()+flush() calls left a
+        # real window (not just a buffering artifact; a genuine scheduling
+        # gap between "send result" and "check+send recycle") where the
+        # supervisor could see this worker as idle (in_flight cleared) and
+        # dispatch it a fresh nodeid before the recycle line ever arrived,
+        # silently losing that dispatch with no crash/EOF to detect it by
+        # (worker.py's own recycle check runs strictly after the result is
+        # already sent). One atomic message removes the window entirely.
+        line = "%s %s" % (nodeid, outcome)
+        if recycling:
+            line += _RECYCLE_SUFFIX
+        pipe_out.write(line + "\n")
         pipe_out.flush()
-        if _should_recycle(scope_path, started_at, completed_count):
-            pipe_out.write("__recycle__\n")
-            pipe_out.flush()
+        if recycling:
             return

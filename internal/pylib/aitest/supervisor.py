@@ -4,11 +4,12 @@ import subprocess
 import sys
 import time
 
-from aitest.worker import fork_worker, run_worker_loop
+from aitest.worker import _RECYCLE_SUFFIX, fork_worker, run_worker_loop
 
 
 _STOP_LINE = "__stop__"
-_RECYCLE_LINE = "__recycle__"
+_STARTUP_DENIAL_RETRY_ATTEMPTS = 5
+_STARTUP_DENIAL_RETRY_SECONDS = 1.0
 
 
 class WorkerAdmitUnavailable(Exception):
@@ -337,6 +338,48 @@ class Supervisor:
         self.workers[pid] = state
         return pid
 
+    def _spawn_fallback_worker(self):
+        """No admission, no cgroup placement -- reuses worker.py's own
+        execution loop with scope_path=None. The already-emitted
+        _disable_daemon warning is the ONLY notice; never warn again per
+        worker. Wrapped the same way spawn_worker (Task 13) is: the entire
+        forked-child branch os._exit()s on any exception rather than ever
+        falling through to normal Python control flow, and every OTHER
+        already-known worker's fds are closed before this child does
+        anything else (same fd-inheritance hazard as spawn_worker -- this
+        is a second, independent os.fork() call site with the identical
+        fd-table-copy problem)."""
+        dispatch_read, dispatch_write = os.pipe()
+        result_read, result_write = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            try:
+                self._child_close_other_workers_fds()
+                os.close(dispatch_write)
+                os.close(result_read)
+                pipe_in = os.fdopen(dispatch_read, "r")
+                pipe_out = os.fdopen(result_write, "w")
+                run_worker_loop(None, self.items_by_nodeid, pipe_in, pipe_out)
+            except BaseException:
+                os._exit(70)
+            os._exit(0)
+        os.close(dispatch_read)
+        os.close(result_write)
+        # Same raw-fd, non-blocking treatment as spawn_worker (Task 13) --
+        # no placement ack to wait for here (scope_path=None, nothing to
+        # place into), so just flip to non-blocking immediately.
+        os.set_blocking(result_read, False)
+        self.workers[pid] = {
+            "grant": None,
+            "admit_process": None,
+            "dispatch_write": os.fdopen(dispatch_write, "w"),
+            "result_fd": result_read,
+            "read_buffer": b"",
+            "result_eof": False,
+            "in_flight": None,
+        }
+        return pid
+
     def _dispatch_to_idle_workers(self):
         for state in self.workers.values():
             if state["in_flight"] is not None:
@@ -358,22 +401,11 @@ class Supervisor:
             os.waitpid(pid, 0)
         except ChildProcessError:
             pass
-        state["admit_process"].stdin.close()
-        state["admit_process"].wait(timeout=5)
+        if state["admit_process"] is not None:
+            state["admit_process"].stdin.close()
+            state["admit_process"].wait(timeout=5)
         grant = state.get("grant")
         if grant is not None:
-            # Best-effort: this is the NEW per-worker child scope aitest
-            # itself created (CreateWorkerScope, Task 7) -- not the outer
-            # confine scope, which is `aira confine`'s own job to tear down
-            # when the whole launch exits. The worker process was just
-            # waited on above, so (unlike the supervisor's own scope,
-            # which the process calling rmdir is itself still inside of)
-            # this one's cgroup should now be empty and actually
-            # removable. Log and continue on failure rather than let a
-            # cleanup race crash the supervisor -- an orphaned empty scope
-            # directory is a cosmetic leak, not a correctness problem, and
-            # #72's existing orphan-scope reaper already sweeps these up
-            # machine-wide as a backstop.
             try:
                 os.rmdir(grant["scope"])
             except OSError as exc:
@@ -382,31 +414,57 @@ class Supervisor:
 
     def _replace_worker(self):
         """Acquire a fresh worker if queue work remains -- shared by the
-        recycle (this task) and crash/retry (Task 15) paths."""
+        recycle and crash/retry paths.
+
+        WorkerAdmitDenied (the daemon IS reachable, it just declined this
+        particular request right now -- budget exhausted or contended)
+        leaves daemon_available untouched: simply don't replace this
+        worker yet. The NEXT retirement's _replace_worker call (or a later
+        dispatch pass) tries again -- one saturated moment must never
+        permanently strip containment for the rest of the run.
+
+        WorkerAdmitUnavailable (no daemon to talk to at all) and
+        WorkerPlacementFailed (the cgroup mechanism itself is broken
+        locally, not just momentarily busy) both fall back to an
+        unconfined worker for the rest of the run -- these are the only
+        two failure classes that mean the daemon path is genuinely not
+        going to work."""
         if not self.queue:
             return
-        self.spawn_worker(self._run_estimated_bytes, max_wait=self._run_max_wait)
+        if self.daemon_available:
+            try:
+                self.spawn_worker(self._run_estimated_bytes, max_wait=self._run_max_wait)
+                return
+            except WorkerAdmitDenied:
+                return
+            except (WorkerAdmitUnavailable, WorkerPlacementFailed) as exc:
+                self._disable_daemon(str(exc))
+        self._spawn_fallback_worker()
 
     def _drain_worker(self, pid, state):
         """Handles every line CURRENTLY AVAILABLE for this worker's result
         pipe in one pass via _drain_available_lines (module-level, defined
-        alongside WorkerPlacementFailed), not just the first. A
-        completed-test result line and an immediately-following
-        __recycle__ sentinel can both already be available by the time
-        select() wakes the caller (the worker writes the result line,
-        flushes, then -- if recycling -- writes __recycle__ and flushes
-        again, in rapid succession with no intervening syscall that would
-        let the parent's select() wake in between). Reading only the FIRST
-        line per wakeup and letting _dispatch_to_idle_workers run before a
-        pending recycle is checked is exactly the race this drains: it
-        would hand a fresh nodeid to a worker that is already retiring,
-        silently losing that dispatch (and, once Task 15's crash detection
-        exists, wrongly reclassifying the loss as a crash and burning that
-        nodeid's one genuine retry on a fictitious one). Must run to
-        completion for a ready worker BEFORE _dispatch_to_idle_workers is
-        called for this select() wakeup. See _drain_available_lines's own
-        docstring for why this reads a raw fd directly rather than
-        select()-checking a buffered file object.
+        alongside WorkerPlacementFailed), not just the first -- multiple
+        already-flushed result lines (e.g. from a burst of fast tests) can
+        legitimately be available at once by the time select() wakes the
+        caller. Must run to completion for a ready worker BEFORE
+        _dispatch_to_idle_workers is called for this select() wakeup. See
+        _drain_available_lines's own docstring for why this reads a raw fd
+        directly rather than select()-checking a buffered file object.
+
+        A result line ending in worker._RECYCLE_SUFFIX means this worker
+        is retiring after this test -- worker.py sends that as PART OF the
+        same line as the result, never as a separate later message,
+        specifically so this method never has a window where it has
+        cleared state["in_flight"] (making the worker look idle to
+        _dispatch_to_idle_workers) without ALSO already knowing the worker
+        is retiring. An earlier design sent a standalone "__recycle__"
+        line after the result; that left a real race (not just a buffering
+        artifact -- a genuine scheduling gap between the worker sending its
+        result and separately checking+sending recycle) where the
+        supervisor could dispatch a fresh nodeid to a worker that had
+        already decided, but not yet said, that it was retiring --
+        silently losing that dispatch with nothing to detect the loss by.
 
         EOF (no lines at all, and _drain_available_lines set
         state["result_eof"]) means the worker's result pipe closed without
@@ -420,13 +478,16 @@ class Supervisor:
                 self._handle_worker_exit(pid, state)
             return
         for line in lines:
-            if line == _RECYCLE_LINE:
-                self._retire_worker(pid, state)
-                self._replace_worker()
-                return
+            recycling = line.endswith(_RECYCLE_SUFFIX)
+            if recycling:
+                line = line[: -len(_RECYCLE_SUFFIX)]
             nodeid, _, outcome = line.partition(" ")
             self.results[nodeid] = outcome
             state["in_flight"] = None
+            if recycling:
+                self._retire_worker(pid, state)
+                self._replace_worker()
+                return
 
     def _handle_worker_exit(self, pid, state):
         """A worker's result pipe hit EOF without a terminating record for
@@ -448,18 +509,60 @@ class Supervisor:
         15), and daemon-down fallback (Task 16) extend this method in
         place."""
         self.bootstrap()
-        # gc.freeze() moves already-imported objects into the permanent
-        # generation before any fork, per design spec 3.1: post-fork COW
-        # pages a worker's own GC scanning would otherwise touch (and
-        # dirty) shrink to near nothing.
         import gc
         gc.freeze()
         self._run_estimated_bytes = estimated_bytes
         self._run_max_wait = max_wait
-        for _ in range(worker_count):
-            if not self.queue:
-                break
-            self.spawn_worker(estimated_bytes, max_wait=max_wait)
+        if self.daemon_available:
+            for _ in range(worker_count):
+                if not self.queue:
+                    break
+                try:
+                    self.spawn_worker(estimated_bytes, max_wait=max_wait)
+                except WorkerAdmitDenied:
+                    # Contended/no budget RIGHT NOW -- the daemon is still
+                    # there. Stop trying to grow the pool this instant and
+                    # start dispatching to however many DID get admitted;
+                    # a later retirement's _replace_worker tries for more.
+                    break
+                except (WorkerAdmitUnavailable, WorkerPlacementFailed) as exc:
+                    self._disable_daemon(str(exc))
+                    break
+            # A denied/contended daemon must never silently strip
+            # containment (denied != unavailable, above) -- but with ZERO
+            # workers admitted yet there is also no later retirement to
+            # hook a retry off of (_replace_worker only fires when an
+            # EXISTING worker retires). Retry getting AT LEAST one worker
+            # running a small bounded number of times; only if that still
+            # never succeeds do we fall back for this run rather than
+            # silently completing with an empty result set while the
+            # queue still has work.
+            attempt = 0
+            while (self.daemon_available and not self.workers and self.queue
+                   and attempt < _STARTUP_DENIAL_RETRY_ATTEMPTS):
+                attempt += 1
+                time.sleep(_STARTUP_DENIAL_RETRY_SECONDS)
+                try:
+                    self.spawn_worker(estimated_bytes, max_wait=max_wait)
+                except WorkerAdmitDenied:
+                    continue
+                except (WorkerAdmitUnavailable, WorkerPlacementFailed) as exc:
+                    self._disable_daemon(str(exc))
+                    break
+            if self.daemon_available and not self.workers and self.queue:
+                self._disable_daemon("worker-admit stayed denied after %d retries" % _STARTUP_DENIAL_RETRY_ATTEMPTS)
+        if not self.daemon_available:
+            # Cap TOTAL concurrent workers (already-admitted + fallback) at
+            # the configured pool size -- min(worker_count,
+            # max_workers_fallback), never NumCPU regardless of what
+            # --aitest-workers actually asked for, and never on top of
+            # whatever got admitted before the daemon was marked
+            # unavailable mid-startup-loop.
+            remaining_pool = max(0, min(worker_count, self.max_workers_fallback) - len(self.workers))
+            for _ in range(remaining_pool):
+                if not self.queue:
+                    break
+                self._spawn_fallback_worker()
         self._dispatch_to_idle_workers()
         while self.workers:
             fd_to_pid = {state["result_fd"]: pid for pid, state in self.workers.items()}
