@@ -5,6 +5,8 @@ import (
 	"io"
 	"log"
 	"os"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -12,7 +14,62 @@ import (
 var (
 	extractForChild     = ExtractPyLib
 	childEnvFailureOnce = new(sync.Once)
+
+	extractAitestForChild = ExtractAitest
+	aitestEnvFailureOnce  = new(sync.Once)
 )
+
+var aitestEnvironmentKeys = map[string]struct{}{
+	"AIRA_AITEST_LIB":                  {},
+	"AIRA_AITEST_WORKER_ADMIT_CMD":     {},
+	"AIRA_AITEST_BOOTSTRAP_CMD":        {},
+	"AIRA_AITEST_MAX_WORKERS_FALLBACK": {},
+}
+
+// IsAitestEnvironmentKey reports whether key is aitest launch coordination
+// rather than part of the tested child environment identity.
+func IsAitestEnvironmentKey(key string) bool {
+	_, ok := aitestEnvironmentKeys[key]
+	return ok
+}
+
+// StripAitestEnvironment removes inherited or explicitly supplied aitest
+// coordinates. Failed setup must disable aitest rather than retain stale
+// state.
+func StripAitestEnvironment(env []string) []string {
+	result := make([]string, 0, len(env))
+	for _, entry := range env {
+		key, _, ok := strings.Cut(entry, "=")
+		if ok && IsAitestEnvironmentKey(key) {
+			continue
+		}
+		result = append(result, entry)
+	}
+	return result
+}
+
+func AppendAitestChildEnvironment(env []string, runtimeDir string, diagnostics io.Writer, workerAdmitCommand string) []string {
+	result := StripAitestEnvironment(env)
+	if strings.TrimSpace(runtimeDir) == "" || strings.TrimSpace(workerAdmitCommand) == "" {
+		return result
+	}
+	aitestDir, err := extractAitestForChild()
+	if err != nil {
+		aitestEnvFailureOnce.Do(func() {
+			if diagnostics != nil {
+				_, _ = fmt.Fprintf(diagnostics, "aitest disabled: %v\n", err)
+				return
+			}
+			log.Printf("aitest disabled: %v", err)
+		})
+		return result
+	}
+	result = upsertChildEnv(result, "AIRA_AITEST_LIB", aitestDir)
+	result = upsertChildEnv(result, "AIRA_AITEST_WORKER_ADMIT_CMD", workerAdmitCommand)
+	result = upsertChildEnv(result, "AIRA_AITEST_BOOTSTRAP_CMD", workerAdmitCommand)
+	result = upsertChildEnv(result, "AIRA_AITEST_MAX_WORKERS_FALLBACK", strconv.Itoa(runtime.NumCPU()))
+	return result
+}
 
 var governorEnvironmentKeys = map[string]struct{}{
 	"AIRA_PY_LIB":                   {},

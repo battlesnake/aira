@@ -669,6 +669,16 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		}
 	}
 	cmd.Env = pylib.AppendConfineChildEnvironment(confineEnvironment(request.Env), request.RuntimeDir, diagnostics, request.DelegateRAM, reserveCommand, memoryDefault, scopeID, sliceName)
+	if request.DelegateRAM {
+		// aitest is only meaningful for a delegate-RAM launch (worker-admit
+		// grants nested sub-scopes under THIS job's own outer scope); every
+		// other launch gets no aitest coordinates at all, mirroring
+		// AppendConfineChildEnvironment's own delegateRAM gate immediately
+		// above. reserveCommand is the SAME resolved self binary already
+		// computed for the RAM governor a few lines up — both worker-admit
+		// and aitest-bootstrap are verbs on that one aira binary.
+		cmd.Env = pylib.AppendAitestChildEnvironment(cmd.Env, request.RuntimeDir, diagnostics, reserveCommand)
+	}
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, diagnostics
 	cmd.ExtraFiles = []*os.File{handshakeWrite, releaseRead}
 	cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: scope.FD()}
