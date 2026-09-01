@@ -216,14 +216,15 @@ set by `confine-reserve` (`confineReserveWithRunner`,
 `confine_reserve_linux.go:31-70`: daemon-only, returns
 `E_CONFINE_UNAVAILABLE` rather than falling back). But the supervisor, like
 today's CPU/RAM governor plugin on its own timeout/error path, degrades
-**open**: on `worker-admit` being unreachable or erroring, log a single clear
-warning and fall back to a fixed-size pool of workers (a build-time constant,
-not proportional to admitted-worker sizing — exact value deferred to build,
-§6) with **no cgroup placement at all** — identical in spirit to "prints
-`continue`, worker runs ungoverned" in the current plugin. This is
-deliberately not a new half-daemon local-cgroup mechanism; it reuses the
-exact fail-open shape the existing governor already has, just applied to
-worker spawn instead of per-test checkpoints.
+**open**: on `worker-admit` being unreachable or erroring, emit a visible
+warning on the suite's own output (not just a log line — a suite running
+this way has silently lost containment for the rest of the run) and cap the
+fallback pool at **`n_workers ≤ NumCPU`** (owner decision — proportional to
+the host, not a guessed constant) with **no cgroup placement at all** —
+identical in spirit to "prints `continue`, worker runs ungoverned" in the
+current plugin. This is deliberately not a new half-daemon local-cgroup
+mechanism; it reuses the exact fail-open shape the existing governor already
+has, just applied to worker spawn instead of per-test checkpoints.
 
 ### 3.8 Deletion, retention, generalisation
 
@@ -288,9 +289,8 @@ runner could speak it without a protocol change.
   the backstop cap, not the admission signal.
 - Exact `memory.high`-crossing fraction for the proactive-recycle watermark —
   needs field data from Slice 1, not a guess now.
-- Exact size of the daemon-unavailable fallback pool (§3.7) — a small
-  build-time constant; needs Slice 1 field data to pick sensibly rather than
-  guessing now, same reasoning as the watermark fraction above.
+- ~~Exact size of the daemon-unavailable fallback pool~~ — resolved
+  (owner, 2026-09-01): `n_workers ≤ NumCPU`, visible on-output warning (§3.7).
 - Whether any other AIRA workload still has a legitimate use for
   `internal/daemon/governor.go`'s CPU park/active-set machinery once `aitest`
   ships. Everything found during investigation for this spec points to it
