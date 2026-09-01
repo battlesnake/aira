@@ -1,9 +1,13 @@
 package daemon
 
 import (
+	"context"
 	"fmt"
+	"net"
 	"sync"
+	"time"
 
+	"aira/internal/core"
 	"aira/internal/runner"
 )
 
@@ -190,4 +194,87 @@ func validateWorkerAdmitArgs(args map[string]any) (workerAdmitRequest, error) {
 	}
 	req.maxWaitMS = maxWait
 	return req, nil
+}
+
+func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
+	req, err := validateWorkerAdmitArgs(args)
+	if err != nil {
+		_ = writeFrame(conn, errorFrame(CodeProtocol, err.Error()))
+		return
+	}
+	peerCtx, cancelPeer := context.WithCancel(context.Background())
+	defer cancelPeer()
+	go func() {
+		var one [1]byte
+		_, _ = conn.Read(one[:])
+		cancelPeer()
+	}()
+
+	poll := s.workerAdmitPollInterval
+	if poll <= 0 {
+		poll = 200 * time.Millisecond
+	}
+	deadline := s.admitNowTime().Add(time.Duration(req.maxWaitMS) * time.Millisecond)
+	var response WorkerAdmitResponse
+	for {
+		response = s.evaluateWorkerAdmit(req)
+		if response.State == "granted" || response.State == "unevaluated" {
+			break
+		}
+		if response.State == "denied" && response.Reason == "reject:exceeds-ceiling" {
+			// A stable "never going to fit" fact about this request, not a
+			// transient contention moment — surface "denied" to the client
+			// immediately instead of waiting out the full poll timeout
+			// only to time out anyway. Every OTHER non-granted state keeps
+			// polling below (a live-usage-driven "not right now" is
+			// retried until it clears or the deadline converts it to
+			// "timeout").
+			break
+		}
+		if !s.admitNowTime().Before(deadline) {
+			response = WorkerAdmitResponse{State: "timeout", Reason: "reject:saturated"}
+			break
+		}
+		select {
+		case <-time.After(poll):
+		case <-peerCtx.Done():
+			return
+		case <-s.stopping:
+			return
+		}
+	}
+
+	// A "granted" response has ALREADY inserted a ledger entry inside
+	// evaluateWorkerAdmit above. From this point on, EVERY exit path —
+	// a write failure, the peer vanishing in the exact window between
+	// grant and delivery, or the normal lease-close below — must release
+	// that grant exactly once, or it leaks against the job's ledger
+	// forever. Mirrors admitConnection's own deferred, idempotent release
+	// (admit.go:458-466); releaseWorkerGrant is idempotent by construction
+	// (delete on an absent key is a no-op), so a double-fire here (e.g. a
+	// write failure racing this deferred call with a direct call further
+	// down — there is none further down anymore, but the mirroring is
+	// deliberate) is always safe.
+	released := false
+	release := func() {
+		if released || response.State != "granted" {
+			return
+		}
+		released = true
+		s.releaseWorkerGrant(req.jobID, req.outerScope, response.WorkerID)
+	}
+	defer release()
+
+	_ = conn.SetWriteDeadline(time.Now().Add(admitWriteTimeout))
+	ok := response.State == "granted"
+	if err := writeFrame(conn, responseFrame(core.Response{OK: ok, Code: "OK", Data: response})); err != nil {
+		return
+	}
+	if !ok {
+		return
+	}
+	select {
+	case <-peerCtx.Done():
+	case <-s.stopping:
+	}
 }

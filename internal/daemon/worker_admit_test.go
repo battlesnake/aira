@@ -1,7 +1,10 @@
 package daemon
 
 import (
+	"encoding/json"
+	"net"
 	"testing"
+	"time"
 
 	"aira/internal/runner"
 )
@@ -132,5 +135,135 @@ func TestWorkerJobLedgerIsBoundToJobIDAndOuterScopeTogether(t *testing.T) {
 	granted := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer-b", estimatedBytes: 500, maxWaitMS: 0})
 	if granted.State != "granted" {
 		t.Fatalf("same job_id, different outer_scope must not inherit the other scope's saturation: %+v", granted)
+	}
+}
+
+func TestWorkerAdmitConnectionGrantsThenHoldsUntilPeerCloses(t *testing.T) {
+	server := NewServer(Paths{})
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.workerAdmitHeadroom = 0
+	server.workerAdmitPollInterval = time.Millisecond
+
+	serverConn, clientConn := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer serverConn.Close()
+		server.workerAdmitConnection(serverConn, map[string]any{
+			"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(400), "max_wait_ms": float64(0),
+		})
+	}()
+
+	var frame ResponseFrame
+	if err := readFrame(clientConn, &frame); err != nil {
+		t.Fatal(err)
+	}
+	var grant WorkerAdmitResponse
+	if err := json.Unmarshal(frame.Data, &grant); err != nil || grant.State != "granted" {
+		t.Fatalf("frame=%+v err=%v", frame, err)
+	}
+	select {
+	case <-done:
+		t.Fatal("connection released before peer closed")
+	case <-time.After(20 * time.Millisecond):
+	}
+	_ = clientConn.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("connection did not release after peer close")
+	}
+	// Releasing must not leave the daemon in a broken state that then
+	// rejects everything.
+	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 1000, maxWaitMS: 0})
+	if response.State != "granted" {
+		t.Fatalf("post-release admission unexpectedly broken: %+v", response)
+	}
+}
+
+func TestWorkerAdmitConnectionTimesOutWhenSaturated(t *testing.T) {
+	server := NewServer(Paths{})
+	// The outer scope's own live usage already consumes the entire
+	// ceiling — under the live-occupancy model (spec 3.3) there is no
+	// per-worker-grant summation to "saturate" separately; a prior grant
+	// alone does not change what a later admission decision sees unless
+	// the outer scope's own live memory.current reflects it, exactly like
+	// production (the daemon never tracks a synthetic reserve here).
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{"/outer": 500}, 500)
+	server.workerAdmitHeadroom = 0
+	server.workerAdmitPollInterval = time.Millisecond
+
+	serverConn, clientConn := net.Pipe()
+	go func() {
+		defer serverConn.Close()
+		server.workerAdmitConnection(serverConn, map[string]any{
+			"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(100), "max_wait_ms": float64(5),
+		})
+	}()
+	var frame ResponseFrame
+	if err := readFrame(clientConn, &frame); err != nil {
+		t.Fatal(err)
+	}
+	var response WorkerAdmitResponse
+	if err := json.Unmarshal(frame.Data, &response); err != nil || response.State != "timeout" {
+		t.Fatalf("frame=%+v err=%v", frame, err)
+	}
+	_ = clientConn.Close()
+}
+
+func TestWorkerAdmitConnectionDeniesImmediatelyWithoutWaitingOutMaxWait(t *testing.T) {
+	server := NewServer(Paths{})
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 100)
+	server.workerAdmitHeadroom = 0
+	server.workerAdmitPollInterval = time.Millisecond
+
+	serverConn, clientConn := net.Pipe()
+	started := time.Now()
+	go func() {
+		defer serverConn.Close()
+		server.workerAdmitConnection(serverConn, map[string]any{
+			// 1000 bytes can never fit under a 100-byte outer ceiling no
+			// matter how long we wait -- must come back "denied" well
+			// before the (deliberately long) max_wait_ms elapses.
+			"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(1000), "max_wait_ms": float64(60000),
+		})
+	}()
+	var frame ResponseFrame
+	if err := readFrame(clientConn, &frame); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("denial took %v — looks like it waited out max_wait_ms instead of denying immediately", elapsed)
+	}
+	var response WorkerAdmitResponse
+	if err := json.Unmarshal(frame.Data, &response); err != nil || response.State != "denied" {
+		t.Fatalf("frame=%+v err=%v", frame, err)
+	}
+	_ = clientConn.Close()
+}
+
+func TestWorkerAdmitConnectionReleasesGrantWhenResponseWriteFails(t *testing.T) {
+	server := NewServer(Paths{})
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.workerAdmitHeadroom = 0
+	server.workerAdmitPollInterval = time.Millisecond
+
+	serverConn, clientConn := net.Pipe()
+	// Close the CLIENT side before the server ever gets to write its
+	// response -- a peer-vanished-in-the-exact-window race.
+	// evaluateWorkerAdmit already inserted the grant into the ledger by
+	// this point; the subsequent writeFrame on serverConn must then fail,
+	// and that grant must still be released rather than leaking against
+	// the job's ledger forever (the bug: the old code just `return`ed on a
+	// write failure with no release at all).
+	_ = clientConn.Close()
+	server.workerAdmitConnection(serverConn, map[string]any{
+		"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(900), "max_wait_ms": float64(0),
+	})
+	_ = serverConn.Close()
+
+	again := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 900, maxWaitMS: 0})
+	if again.State != "granted" {
+		t.Fatalf("write-failure path leaked the grant: %+v", again)
 	}
 }

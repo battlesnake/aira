@@ -73,6 +73,7 @@ type Server struct {
 	watchPollInterval            time.Duration
 	admitSlots                   chan struct{}
 	admitPollInterval            time.Duration
+	workerAdmitPollInterval      time.Duration
 	admitBackfillGrace           time.Duration
 	admitRegistryMu              sync.Mutex
 	admitQueues                  map[string]*sliceQueue
