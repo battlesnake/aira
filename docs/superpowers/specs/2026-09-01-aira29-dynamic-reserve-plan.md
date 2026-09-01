@@ -1,97 +1,115 @@
-# AIRA-29 — dynamic reserve: charge admission by live memory.current, fill the slice to real capacity
+# AIRA-29 — dynamic reserve: charge admission by live cgroup usage, fill the slice to real capacity
 
-**Status:** plan (pre-review)
-**Ticket:** AIRA-29 (P1). Supersedes AIRA-28 (airtight whole-suite charge — built, shelved un-deployed).
+**Status:** plan v2 — folds Sol + DeepSeek + Fable plan-review (all BLOCK/GATE-FAIL, **direction confirmed sound**; every code citation Fable-verified to the line). 5 must-fix + the per-scope-`memory.high` upgrade folded.
+**Ticket:** AIRA-29 (P1). Supersedes AIRA-28 (airtight — built, shelved).
 **Branch:** `aira29-dynamic-reserve`
-**Author:** Opus, grounded on the 3-reader understand pass (`wf_e7e13cfa-9f6`, all code-cited @ master `2734a04`) + the live field measurement.
+**Author:** Opus, grounded on understand pass `wf_e7e13cfa-9f6` + the three-lineage review, all @ master `2734a04`.
+
+## 0. What the review changed (v1 → v2)
+
+The seam, lock discipline, count-only guards, the double-book, and the flat-500 return were all verified exactly as claimed. Five holes are folded:
+
+1. **Ledger arithmetic under replacement** was undefined → an explicit per-waiter `effectiveCharge` with a conservation invariant (§3.1). *Never mutate `outstanding` incrementally-and-then-replace — that drifts/goes negative (the #74 bug class).*
+2. **The delegate cold floor was vacuous** — a delegate waiter's reserve is the pinned 512 MiB overhead, so "hold the estimate" held ~nothing for the class that actually over-commits → cold floor now uses the per-signature suite-peak ceiling (§3.2).
+3. **Leaf-`Populated` skip / not-yet-created window** could silently drop a live scope from the charge → one rule: **dynamic replacement only with a usable scan record; else the frozen reserve stands** (§3.4).
+4. **peakSoFar was self-contradictory** (windowed vs lifetime) → **lifetime ratchet** (§3.3), which keeps the win and removes the re-growth race.
+5. **Slice 1 alone is a strict safety regression** for the currently-airtight non-delegate class → ship-together precondition + corrected, well-defined Slice 2 (§3.6, §4).
+
+Plus the **per-scope `memory.high = effectiveCharge`** upgrade (DeepSeek): the kernel soft-throttles a scope at its charge, and the existing per-scope `memory.max = cap` self-OOMs a single runaway — so a *steered* slice-OOM is only needed for the genuine aggregate-full case.
 
 ## 1. Problem
 
-Admission reserves the **estimated peak** and holds it for the whole job **lifetime**. Peaks are brief and rarely coincide, so the ledger saturates long before physical RAM does. **Measured live:** a non-delegate `aira confine -- make merge-gate` reserved **33.6 G** (`estimate:p90-prior`, airtight) while using **2.6 G RSS** for 62 min; the ledger showed 39.4 G granted / 63.2 G ceiling while the slice's physical `memory.current` was only **15.4 G / 64 G** — so new jobs block though ~48 G RAM and most of 16 cores sit idle (`FASTEST_XDIST_WORKERS=8` → 8/16 → "half busy, half idle"). Owner pivot (2026-09-01): reserve against **actual** usage, not worst-case peak; fill the slice to real capacity; make the rare peak-coincidence *graceful*, not prevented by over-reservation.
+Admission reserves the **estimated peak** and holds it for the whole **lifetime**. Measured live: a non-delegate `make merge-gate` reserved **33.6 G** (`estimate:p90-prior`) while using **2.6 G** for 62 min; ledger 39.4 G granted / 63.2 G ceiling while physical slice usage was **15.4 G / 64 G** — new jobs blocked while ~48 G RAM and half of 16 cores sat idle. Owner pivot: reserve against **actual** usage; fill the slice; make the rare peak-coincidence graceful, not prevented by over-reservation.
 
-## 2. The key insight — the charge is already 90% dynamic
+## 2. The seam (Fable-confirmed implementable)
 
-`checkedAvailable` **already** computes `charge = max(sliceCurrent − reclaimable, Σoutstanding + Σadopted)`, `available = (max − headroom) − charge` (`admit.go:743-760`). The *only* static piece is `queue.outstanding`: each granted job's reserve is set once at enqueue (`admit.go:571`) and never re-read (`admit.go:731/782`). And the **#74 delegate-adoption path already does exactly the dynamic charge we want** — for a restart-orphan `@dr-` scope it charges `min(cap, RSS + 64 MiB margin)`, refreshed every ~1 s from the `ListConfines` scan (`admit.go:673-687`, margin `admit.go:37`). The `evaluateAdmitQueue` evaluator already reads every scope's live `memory.current` (as `RSSBytes`) and `memory.max` (as `Cap`) each scan, **lock-free, before `queue.mu`** (`admit.go:611-628`; `confine_manage_linux.go:101-118`). It holds only `queue.mu`, so the change needs **zero new locks or scan machinery** (lock-order `governorSet.mu → admitRegistryMu → sliceQueue.mu` preserved — `admit.go:181-185`).
+`checkedAvailable` already charges `max(sliceCurrent − reclaimable, outstanding + adopted)`, `available = (max − headroom) − charge` (`admit.go:743-760`, caller `:716`). `queue.outstanding` is the only static per-scope term (frozen at `:571`, `+=` `:731`, `-=` `:783`, never re-read). The **#74 adoption block already does `min(cap, RSS+64 MiB)` per ~1 s scan — but only for `@dr-` scopes** (`admit.go:673`); non-delegate orphans adopt full `Cap`. The scan reads each scope's hierarchical `memory.current` (`RSSBytes`) + `memory.max` (`Cap`) lock-free **before** `queue.mu` (`admit.go:608-626`, lock `:628`); held waiters carry `scopeID` (`:571`), so matching scan records to held waiters under `queue.mu` alone needs **zero new locks** and preserves the `governorSet.mu → admitRegistryMu → sliceQueue.mu` order (`:181-185`). Too-large guard (`:557`) + headroom (`:714`) are genuinely **count-only** → a byte change is safe.
 
-**So the core change is one thing:** in `evaluateAdmitQueue`, compute each **live (connection-held)** scope's contribution to the effective `outstanding` as `max(coldFloor_i, RSS_i + margin_i)` (capped at its `memory.max`) instead of the frozen `waiter.reserve` — i.e. **generalise the #74 adoption formula from restart-orphans to all live scopes**, and drop those scopes' static `outstanding` contribution. The held-set that today excludes connection-held scopes from adoption (`admit.go:640-645, 658-660`) is the exact seam: re-plumb it to *replace* the static charge, not merely exclude. Counts (`outstandingJobs`) stay static for the too-large guard + headroom scaling (`admit.go:557, 714` — both use counts, not bytes), so those guards are untouched.
+Note "usage" = cgroup `memory.current` (includes cache/kernel), not RSS — hierarchical, so one read covers all a suite's workers.
 
 ## 3. Design
 
-### 3.1 Dynamic per-scope charge (Slice 1 — the utilisation win)
+### 3.1 The ledger model — a per-waiter `effectiveCharge` (MF2 / Sol P0-2)
 
-Each daemon scan (~1 s, `admitConfineScanIntervalDefault`), for every live confine scope, the effective ledger contribution is:
+Add `effectiveCharge` to each granted waiter. `queue.outstanding` becomes `Σ effectiveCharge`, maintained so it is **conservation-safe**:
+
+- **Grant:** `effectiveCharge = reserve` (the resolved estimate); `outstanding += effectiveCharge` (`:731` unchanged in form).
+- **Each scan** (≤1/s), for a matched held waiter with a usable record (§3.4): recompute `newCharge` (§3.2/3.3); `outstanding += (newCharge − effectiveCharge)`; store `effectiveCharge = newCharge`. `evaluateAdmitQueue` runs on every kick but the scope scan is throttled to ~1 s, so cache `effectiveCharge` between refreshes.
+- **Release:** `outstanding -= effectiveCharge` (the **current** value, not the frozen reserve — `:783`).
+- `outstandingJobs` stays grant/release-based (count). **Plain `admit`-verb waiters (no `scopeID`) stay fully static** (never dynamically replaced).
+- The three `outstanding` readers — `admitAvailable` (governor, `:186-210`), `admitOutstandingReserve` (`confine --list`, `:166-179` → `confine_manage.go:129-138`), admission `checkedAvailable` — then all reflect the effective sum. **Conservation test (MF2, §5):** after all releases `outstanding == 0` exactly; never negative; a release between scans subtracts the last effective value.
+
+### 3.2 The charge formula + class-correct cold floor (MF1, MF4)
 
 ```
-charge_i = min( cap_i , max( coldFloor_i(age) , RSS_i + margin_i ) )
+effectiveCharge_i = min( cap_i , max( coldFloor_i(elapsedSinceGrant) , peakSoFar_i + margin_i ) )
 ```
 
-- `RSS_i` = the scope's live `memory.current` (hierarchical — covers all pytest workers in one read; sidesteps the anonymous per-test-lease attribution problem entirely).
-- `margin_i` = growth headroom (a design constant — see §4 fork A; candidate: `max(fixed 256 MiB, pct×RSS)`).
-- `cap_i` = the scope's `memory.max` (the estimate/`--memory-max`) — a scope never charges more than its own hard cap.
-- **`coldFloor_i(age)` = the cold-start floor** (§3.2): the estimate, held over a warm-up window, decaying to 0 as the job proves stable. This prevents a fresh `RSS≈0` scope from freeing space it will grow into.
+- `cap_i` = the scope's `memory.max` (its admission estimate / `--memory-max`) — a scope never charges above its own hard cap.
+- `margin_i` = `max( 256 MiB , growthPct × RSS_i )` and **≥ a floor covering one scan's growth** (DeepSeek P1: `≥ observedGrowthRate × scanInterval`) — a design constant (fork A; recommend `growthPct = 12%`).
+- **`coldFloor_i` (MF1):** the scope's **class-correct estimate**, held for a warm-up window then decayed to 0:
+  - non-delegate: its `reserve` (== `memory.max`, already the estimate).
+  - **delegate-ram: `resolveDelegateRAMScopeCeiling` (the per-signature suite-peak+15%, already stored on the waiter at `admit.go:449`)** — **NOT** the 512 MiB `DefaultDelegateRAMOverhead`. With no history, a sane default (e.g. `perWorkerDefault × W`), never the raw 48 G ceiling (which would block everything).
+  - **Keyed on elapsed-since-GRANT, not scope-ID age (Sol P0-3):** the scope-ID timestamp predates admission (`confine_linux.go:475`), so a long-queued job would arrive already-warm. Use `waiter.enqueued`/grant time, or first successful scope observation.
+- **`peakSoFar_i` is a LIFETIME ratchet (MF4):** the max `RSS_i` observed across this run's scans; the charge only ever ratchets **up** to a new peak, capped at `cap`. This keeps the win — the money job charges its *actual* run-peak (~4 G) not the 33.6 G estimate — **and removes the peak-drop-regrow race** (the charge never frees space below a level the job has already used). Documented residual: a job that peaks late still over-reserves *after* its own peak (up to its demonstrated peak only), and a never-yet-peaked slow-ramp job relies on the per-scope `memory.high` throttle (§3.5) during its first climb.
 
-`Σ charge_i + Σ adopted ≤ ceiling` gates admission via the existing `checkedAvailable`. The money job's charge falls 33.6 G → ~3–4 G once warm; the ledger reflects real usage; the slice fills.
+### 3.3 Where `peakSoFar` comes from (MF4 mechanism, #70 honesty lesson)
 
-**Fail-closed (preserve the existing discipline `admit.go:699-707`):** if a scope's RSS read is missing/stale/zero-for-a-live-scope, charge its **estimate** (the safe over-direction), never ~0.
+`ListConfines` reads no `memory.peak` today (`confine_manage_linux.go:61-133`). Two options: (a) **daemon-side max-across-scans** (portable, forgets across restart — the safe direction, re-warms via cold floor after restart); (b) read cgroup `memory.peak` (kernel ≥ 5.19 — with an honest fallback to (a) when absent, per the #70 `pids.peak` lesson). Recommend **(a)** for portability; it needs no kernel floor.
 
-### 3.2 Cold-start floor (fork B) — the structural trap
+### 3.4 The MF3 rule — dynamic replacement only with a usable scan record
 
-`checkedAvailable` takes `max(current, outstanding)`; a just-launched scope reads `RSS≈0`, so if its charge is `RSS+margin ≈ margin`, neighbours are admitted into the space it will grow into → over-commit at its growth. So a new scope must **hold its estimate** until it demonstrates it won't use it. Policy:
+A held waiter is charged its **frozen `reserve`** (not a dynamic value) whenever: no matching scan record; `RSSBytes` unevaluated; or the record is `Populated`-leaf-skipped. **Never gate a *held* scope's usage read on `Populated > 0`** — that gate is an adoption-liveness heuristic (`admit.go:655`) and leaf `cgroup.procs` misses nested-cgroup workloads by construction (`cgroup_linux.go:238-257`); a held connection already proves liveness, and `memory.current` is hierarchical so the value is correct. This one rule closes the **grant → `backend.Create` window** (every launch has it, `confine_linux.go:509→535`), teardown-before-lease-close, nested-cgroup suites, and bad reads — all in the safe (over-charge) direction. §5 tests the not-yet-created window explicitly.
 
-- **coldFloor = estimate for a warm-up window `W`, then decay** (linear or step) to 0 over a further window, so the charge relaxes to `RSS+margin` only after the job has had time to reach its working set. `peakSoFar` is tracked as a secondary floor within the window.
-- After warm-up, the charge **tracks `RSS+margin` and decays after peaks** (this is what recovers the temporal waste — the money job's brief peak no longer pins the charge for 62 min). The consequence — a job that peaks, drops, then **re-grows** can transiently over-commit — is the accepted growth-race, absorbed by §3.4. **This is the deliberate not-airtight trade the owner chose.**
+### 3.5 Per-scope `memory.high = effectiveCharge` (DeepSeek P0 — the enforcement seam)
 
-### 3.3 Drop the #69 per-test RAM lease (no double-book)
+Each scan, write each live scope's `memory.high = effectiveCharge_i` (the daemon writes the scope cgroup file; `writeScopeMemoryValue` already writes `memory.high` conditionally at setup — `confine_linux.go:931-943` — this generalises it to a periodic re-writer). Effect: a scope growing past its charge is **kernel reclaim-throttled** (soft — it slows, doesn't block), giving the ≤1 s scan time to observe the new peak and re-charge (ratcheting `peakSoFar`) or to refuse new admissions. A scope that keeps allocating **unreclaimable** memory past its charge rises to its own `memory.max = cap` and **self-OOMs its own `oom.group` (contained)** — so a *single* runaway never reaches the slice. This converts over-subscription from "hope the slice backstop catches it" into "per-scope soft-throttle + per-scope self-containment." **This is what makes Slice 1's over-subscription safe against a single grower.**
 
-Scope-current charging already includes every running test's RSS, so *also* holding each test's `confine-reserve` pinned lease books the same bytes twice (`admit.go:731` sums both on the same slice queue — the §2a hazard the code already warns about at `confine_linux.go:450-452`). **Remove the per-test RAM reservation** (the `AIRA_TEST_MEM_GOVERNOR`/`confine-reserve` path), **keep the CPU governor** (separable at `aira_xdist_governor/__init__.py:395-401`). This also **retires the anonymous-lease attribution problem**. Trade: loses per-test forward-looking admission backpressure (a non-fitting test currently *waits* at the door) — replaced by scope-level `memory.high` reclaim (§3.4). This also means the AIRA-28 Slice-3-inert hack is unnecessary: once `admitAvailable` reflects real free RAM, the governor's RAM-ordering engages correctly only near true physical saturation (`admit.go:186-210`, verified reader 3 Q4).
+### 3.6 The graduated slice backstop (Slice 2 — for the genuine aggregate-full case)
 
-### 3.4 The graduated backstop (Slice 1 + Slice 2)
+With §3.5, the only remaining slice-OOM trigger is **many scopes each within their own cap but `Σ(actual)` racing past 64 G** (Fable's all-compliant-aggregate case) + a fast unreclaimable burst outrunning the scan. Two backstops:
 
-Dynamic reserve is **not airtight** — `memory.max` stays each scope's hard cap (fork C), so `Σ(memory.max)` may exceed the slice cap, and a growth-race can push `Σactual` over the ceiling between scans. The backstop must absorb or correctly target that:
+- **Widen `memory.high` (Slice 1, cheap, plumbed):** lower the slice `memory.high` (e.g. 60 → 52 G) via the install formula (`install.go:755-766`, `--memory-high`) to enlarge the reclaim/throttle band. **Honest (Sol P1-4): `memory.high` is not reserved runway** — usage runs above it under reclaim; it is a throttle, not a wall. Swap stays 8 G.
+- **Reservation-compliance-aware `oom_score` (Slice 2 — corrected, load-bearing):** the daemon raises the `oom_score_adj` of the scope **most over its admitted estimate** — baseline `RSS − estimate` (the *fixed* admission reserve, **not** the dynamic charge, which can't fire the trigger — Sol P0-1), scaled toward 1000, restored to the class base (500/800) when compliant (with hysteresis/cooldown). So a genuine aggregate-full slice-OOM kills the scope consuming most beyond what admission planned, protecting within-estimate jobs — for **both** classes (closing the non-delegate flat-500 return). Specifics (Fable MF5): **subtree-aware pid enumeration** (leaf `cgroup.procs` misses nested pids — the same workload §3.4 under-charges, so leaf-only steering is inert exactly where it's needed); the re-writer lives on a **daemon-wide cadence** (watchdog/reaper-style — the per-slice queue evaluator is pruned when waiters empty and absent for orphan-only slices); **test the restore-DOWN direction** (a stuck-high adj permanently mis-targets a recovered scope); preserve the AIRA-27 env seam (`[500,1000]`, delegate > non-delegate, `confine_linux.go:1157-1182`).
 
-- **memory.high reclaim runway (Slice 1, cheap, already plumbed).** Today `high=60 G / max=64 G` = only 4 G runway. **Lower `memory.high` (e.g. 52 G)** to widen the reclaim/throttle band that absorbs inter-tick growth before the 64 G hard OOM (`install.go:755-766`, `aira install --memory-high`; formula param). Cost: sustained aggregate above the watermark pays a reclaim tax earlier — acceptable, that *is* the throttle. Swap stays 8 G.
-- **Reservation-compliance-aware oom_score (Slice 2 — the load-bearing backstop; this is AIRA-27's deferred Option B, now UNBLOCKED).** Under dynamic reserve the over-growers are **non-delegate too** (the money case), but `oom_score_adj` is class-flat (delegate 800 / non-delegate 500 — `confine_linux.go:34-35, 1144-1147`). So a non-delegate over-grower is *not* preferentially OOM-targeted → **this re-opens the exact AIRA-27 flat-500 collateral-kill.** Dynamic reserve gives us precisely the per-scope RSS-vs-charge signal Option B was blocked on (the anonymous-lease problem is gone). So: the daemon, each scan, **raises the `oom_score_adj` of a scope whose `RSS > charge` (an over-grower)** toward 1000 (scaled by over-fraction), and lowers it back to the class base when compliant — writing `/proc/<pid>/oom_score_adj` across the scope's pids (raising is always permitted; keep ≥ 0). A slice-OOM then kills the actual over-committer, not a bystander, for **both** classes.
+### 3.7 Post-restart adoption must also track-actual (Fable nit)
 
-### 3.5 Slicing
+Non-`@dr` orphans currently adopt at full `Cap` (`admit.go:669-686`) → after **every daemon restart** all live jobs re-pin their full estimates until exit, resurrecting the 33.6 G-for-2.6 G problem. Generalise non-delegate orphan adoption to `min(cap, max(coldFloor(scopeAge), RSS+margin))` too — `Cap == estimate` for that class and the scope-stamp age keys the floor even without daemon memory. Safe-direction only; without it the headline win regresses on every deploy.
 
-- **Slice 1 (utilisation):** §3.1 dynamic charge + §3.2 cold-floor + §3.3 drop per-test RAM lease + §3.4 widen `memory.high`. Delivers the fill-the-slice win.
-- **Slice 2 (backstop):** §3.4 compliance-aware oom_score.
+## 4. Forks / precondition (owner gate)
 
-**Fork D — do they ship together?** Slice 1 over-subscribes; without Slice 2 a non-delegate over-grower's OOM can hit a bystander (flat 500), re-opening AIRA-27. Slice 1 alone is only safe if the widened `memory.high` + swap reliably absorb the growth-race short of a hard OOM — a bet. **Recommendation: ship Slice 1 and Slice 2 together** (the compliance-oom-score is what makes over-subscription safe), or Slice 1 first *only* with an aggressively widened `memory.high` (e.g. 48 G) as an explicit interim + Slice 2 fast-follow. This is the primary owner-gate decision.
+- **A — `margin` sizing** (§3.2): recommend `max(256 MiB, 12%×RSS)` with the one-scan-growth floor.
+- **B — cold-start warm-up window `W` + decay curve** (§3.2): recommend hold-at-estimate ~60–90 s from grant, then decay; `peakSoFar` (lifetime) takes over as the real floor once the job has run.
+- **C — `memory.max` stays the estimate** (per-scope containment) — recommended; §3.5 self-OOM + §3.6 steering answer aggregate over-commit.
+- **D — SHIP-TOGETHER PRECONDITION (MF5):** Slice 1 without Slice 2 is a **strict safety regression** for the currently-airtight non-delegate class (reserve == `memory.max` today → cannot over-commit; `confine_linux.go:459-461`) — it re-opens the P1 fixed 2026-09-01. **Building Slice 1 requires Slice 2 in the same deploy, OR explicit owner acceptance of an aggressive-`memory.high` interim.** Not a soft recommendation.
 
-## 4. Design forks (for the plan-review + owner gate)
+## 5. Safety & invariants (honest — NOT airtight)
 
-- **A — `margin_i` sizing:** flat (256 MiB? 512 MiB?) vs percent-of-RSS vs a blend. Bigger margin = safer growth-race, less utilisation. Recommend a blend `max(256 MiB, 12% × RSS)`.
-- **B — cold-start floor shape:** warm-up window `W` + decay curve. Recommend `W` ≈ 60–90 s hold at estimate, then linear decay to `RSS+margin` over a further ~60 s, with `peakSoFar+margin` as a floor throughout the job.
-- **C — does `memory.max` also track down?** If it stays at the estimate (recommended — keeps per-scope containment), `Σ(memory.max)` can exceed the slice cap → backstop load-bearing. If it tracks down toward `RSS+margin`, you regain a form of airtight containment but lose burst headroom and risk self-OOMing a legitimately-growing scope. Recommend **stays high**; the backstop (§3.4) is the answer to aggregate over-commit.
-- **D — Slice 1 alone vs Slice 1+2 together** (§3.5) — the safety-vs-speed call.
-
-## 5. Safety & invariants (honest — this is NOT airtight)
-
-- **Utilisation invariant:** a live scope charges `≈ RSS + margin` (warm), so `Σcharge ≈ Σactual + Σmargin` — the ledger tracks physical usage; admission stops only near real capacity, not at Σpeak.
-- **NOT an over-commit *bound*.** `Σ(memory.max) > sliceCap` is allowed; a growth-race can transiently exceed the ceiling. Safety is the **graduated backstop**: `memory.high` reclaim/throttle → swap → compliance-aware `oom_score` steering a hard OOM onto the over-grower (contained by its own `oom.group`). This is a *bias/absorb* model, the direction the owner chose over airtight.
-- **Fail-closed on uncertainty:** missing/stale per-scope RSS → charge the estimate; slice read failure → leave waiters queued (existing `admit.go:699-707`).
-- **Preserved:** the count-based too-large guard + headroom (`admit.go:557, 714`), the lock order, the #74 restart adoption (generalised, not broken), non-delegate/ delegate cap containment.
-- **Residual (documented):** between the last scan and a fast re-growth, or at genuine 64 G physical saturation, a slice-OOM can still fire; Slice 2 ensures it targets the over-committer. A large, compliant, single scope that legitimately needs its whole cap still gets it (charged at its cap).
+- **Utilisation:** a warm scope charges `≈ peakSoFar + margin` ≤ its cap → `Σcharge` tracks physical usage; admission stops near real capacity, not Σpeak.
+- **Per-scope containment (§3.5):** `memory.high = charge` soft-throttles growth; `memory.max = cap` self-OOMs a single runaway (contained by its `oom.group`) before it reaches the slice.
+- **Ledger conservation (§3.1):** `outstanding = Σ effectiveCharge`, returns to 0, never negative.
+- **Fail-closed:** no usable scan record → frozen reserve (§3.4); missing slice read → waiters stay queued (`admit.go:699-707`); scan-forgotten peak after restart → cold-floor re-warm.
+- **Residuals (documented):** (a) the genuine aggregate-full case — many within-cap scopes `Σ`-racing past 64 G + a fast unreclaimable burst — can still fire a slice-OOM; Slice 2 steers it to the most-over-estimate scope, but it may still be a *compliant* scope if all are compliant. (b) a late-peaking job over-reserves after its own peak (up to its demonstrated peak only). (c) `memory.high` is a throttle not a wall.
 
 ## 6. Tests
 
-1. **Charge tracks actual (unit, daemon):** a live held scope with `RSS=2.6 G`, `estimate/cap=33.6 G`, past warm-up → its ledger contribution is `≈ RSS+margin` (not 33.6 G); a fresh scope (age < W) with `RSS≈0` → contributes its **estimate** (cold-floor holds). Pin both directions; the false-pass is a test that only checks the warm case (misses the cold-start over-admit).
-2. **No double-book (unit):** with the per-test RAM lease removed, a delegate `@dr` scope + its N tests charge the ledger **once** (scope current), not scope + Σtests. Assert `outstanding` == the scope charge, and the CPU governor still functions.
-3. **Cold-start over-admit guard (real-cgroup or sim):** admit a fresh scope whose estimate nearly fills the ceiling; a neighbour needing the balance is **refused** until the fresh scope proves low usage (cold-floor), not admitted-then-OOM.
-4. **Fail-closed:** a live scope whose RSS read returns 0/error is charged its estimate, not ~0 (no over-admit on a bad read).
-5. **Compliance oom_score (Slice 2, real-cgroup):** a scope with `RSS > charge` gets `oom_score_adj` raised above its class base; a compliant neighbour stays at base; under a forced slice-OOM the over-grower's scope is killed and the neighbour survives (extends `TestRealRunScopeMemoryCapIsolation`).
-6. **Display honesty:** `confine --list` granted line reflects the dynamic sum (`confine_manage.go:129-138`), not the static reserve.
-7. **Growth-race sim:** model Σ(per-scope growth) between scans vs the widened `memory.high` band; assert reclaim engages before `memory.max`. Document the cadence/runway relationship.
-8. Full daemon+runner suites green under `aira confine`; gate `make ci` (mind AIRA-20 `-race` flakes).
+1. **Charge tracks actual + cold floor (unit):** warm held scope RSS 2.6 G / cap 33.6 G → charges `≈ peakSoFar+margin`; **fresh** scope (elapsed < W) RSS≈0 → charges its **class estimate** (delegate variant pins the **suite-peak ceiling, not 512 MiB** — MF1); false-pass guard = a test that only checks the warm case.
+2. **Ledger conservation (MF2):** grant/scan/release sequence → `outstanding` returns to exactly 0, never negative; release-between-scans subtracts the last effective value; plain-`admit` waiters stay static.
+3. **No double-book:** per-test RAM lease removed → a delegate `@dr` scope + N tests charge the ledger once (scope usage); CPU governor still functions.
+4. **MF3 rule:** a held waiter with no scan record / unevaluated RSS / leaf-`Populated`-skip / grant-before-create → charged its **frozen reserve** (no under-charge). Explicitly include the not-yet-created window.
+5. **Per-scope throttle + containment (real-cgroup):** a scope growing past its charge gets `memory.high=charge` written and is throttled; one allocating unreclaimably past its cap self-OOMs its own scope; a co-resident neighbour survives.
+6. **Compliance `oom_score` (Slice 2, real-cgroup):** a scope with `RSS ≫ estimate` gets adj raised (subtree pids); a within-estimate neighbour stays at base and **survives** a forced slice-OOM; **restore-DOWN** returns a recovered scope to base; env seam honored.
+7. **confine --list honesty:** granted line = dynamic sum.
+8. **Post-restart (MF nit):** a non-delegate orphan re-adopts at `max(coldFloor(age), RSS+margin)`, not full Cap.
+9. Full daemon+runner suites green under `aira confine`; `make ci` (mind AIRA-20 `-race` flakes).
 
 ## 7. Rollout
 
-Daemon-side (the charge) + install (`memory.high`) + plugin (drop per-test RAM lease) ⇒ **daemon restart** (#74 reconstructs on startup — safe). Widening `memory.high` is a unit rewrite + `systemctl reload`/re-install, shippable independently as an immediate partial relief. Deploy **watched, owner-gated**, rollback-ready (binary backup + old unit). After deploy, notify all sessions (admission fills more aggressively; per-test WAIT backpressure is gone; possible new reclaim-tax under sustained load). **Verify live:** the money-class merge-gate charges `≈ RSS+margin` and a neighbour co-admits into the freed reserve.
+Daemon (charge + `memory.high` re-writer + compliance loop) + install (`memory.high`) + plugin (drop per-test RAM lease) ⇒ **daemon restart** (#74 reconstructs — §3.7 makes reconstruction track-actual). `memory.high` widening ships independently as immediate partial relief. **Slice 1 + Slice 2 together (fork D).** Deploy watched, owner-gated, rollback-ready; notify all sessions (admission fills more; per-test WAIT gone; reclaim-tax possible under sustained load). Verify live: the money-class merge-gate charges `≈ peakSoFar+margin` and a neighbour co-admits into the freed reserve.
 
 ## 8. Deferrals / open
 
-- Runtime `memory.high` re-writer (daemon adjusting the slice watermark dynamically) — install-time only for now.
-- The `Populated`/leaf-cgroup liveness skip (`admit.go:655`) vs xdist workers in nested child cgroups — **must verify in the build** that a live suite is not skipped from the dynamic charge (under-charge/over-admit); if it can be, the RSS read must not gate on leaf-populated.
-- AIRA-24 saturation-wait UX interaction (per-test WAIT was a self-throttle at the door; removed here) — re-evaluate the UX after the shift to scope-level `memory.high`.
-- AIRA-25 (peak/delta ledger split) is subsumed/mooted by dynamic reserve — revisit.
+- Runtime slice-`memory.high` re-writer (daemon adjusting the slice watermark live) — install-time for now.
+- AIRA-24 saturation-wait UX — the per-test WAIT self-throttle is removed; re-evaluate after the shift to scope `memory.high`.
+- AIRA-25 (peak/delta split) is **subsumed** by dynamic reserve — close it.
+- The all-compliant-aggregate-over residual (§5a) — a smarter victim policy (fastest-recent-grower) is a possible Slice-2 follow-up.
