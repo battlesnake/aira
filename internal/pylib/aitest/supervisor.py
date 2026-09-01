@@ -429,15 +429,15 @@ class Supervisor:
             state["in_flight"] = None
 
     def _handle_worker_exit(self, pid, state):
-        """Minimal stub so _drain_worker's EOF branch above has something
-        safe to call in this task -- just retires and tries to keep the
-        queue moving, with NO requeue/unevaluated bookkeeping yet. Task 15
-        replaces this with the real requeue-once-then-unevaluated version;
-        this task's own tests never intentionally crash a worker, so this
-        stub is never exercised by Task 14's test suite, only present so a
-        genuinely unexpected crash during this task's tests fails loudly
-        and comprehensibly rather than with an AttributeError."""
+        """A worker's result pipe hit EOF without a terminating record for
+        its in-flight nodeid: a crash (kernel OOM, host watchdog, any
+        non-reporting exit). Requeue once; a second failure here is
+        unevaluated -- distinct from failed everywhere results are
+        aggregated, never silently folded into either outcome."""
+        nodeid = state["in_flight"]
         self._retire_worker(pid, state)
+        if nodeid is not None and not self.requeue_once(nodeid):
+            self.results[nodeid] = "unevaluated"
         self._replace_worker()
 
     def run(self, estimated_bytes, worker_count=1, max_wait="30s"):

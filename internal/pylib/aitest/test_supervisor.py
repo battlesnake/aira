@@ -259,3 +259,36 @@ sys.stdin.buffer.read()
     # own 5-second timeout firing at least once across the four
     # retirements; a healthy run completes in a small fraction of that.
     assert elapsed < 4.0, "run() took %.1fs -- looks like a retirement hang (fd-inheritance bug)" % elapsed
+
+
+def test_crash_mid_test_requeues_once_then_reports_unevaluated(tmp_path, monkeypatch, pytester):
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+import sys
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+sys.exit(0)
+""")
+    admit = _write_stub(tmp_path / "worker-admit", f"""
+import os, sys
+scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+os.makedirs(scope, exist_ok=True)
+print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+
+    items = pytester.getitems("""
+        import os
+        def test_crashes():
+            os._exit(137)
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    nodeid = items[0].nodeid
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+
+    assert results[nodeid] == "unevaluated"
+    assert supervisor.attempts[nodeid] == 2
