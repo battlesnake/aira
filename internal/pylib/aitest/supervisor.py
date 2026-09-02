@@ -259,6 +259,34 @@ class Supervisor:
         for field in line[len("granted "):].split():
             key, _, value = field.partition("=")
             grant[key] = value
+        required = ("scope", "worker_id", "memory_max", "memory_high")
+        missing = [key for key in required if key not in grant]
+        malformed = None
+        if missing:
+            malformed = "missing required field%s: %s" % (
+                "s" if len(missing) != 1 else "", ", ".join(missing)
+            )
+        else:
+            for key in ("memory_max", "memory_high"):
+                try:
+                    value = int(grant[key])
+                except ValueError as exc:
+                    malformed = "%s must be a positive integer (got %r: %s)" % (key, grant[key], exc)
+                    break
+                if value <= 0:
+                    malformed = "%s must be a positive integer (got %r)" % (key, grant[key])
+                    break
+        if malformed is not None:
+            # A malformed grant means the relay cannot be trusted as a
+            # daemon-backed admission. Release it exactly as for every
+            # other non-usable response, rather than leaving its lease and
+            # pipes around until the supervisor later falls back.
+            stderr = process.stderr.read().decode("utf-8", "replace") if process.stderr else ""
+            try:
+                process.wait(timeout=5)
+            except Exception:
+                process.kill()
+            raise WorkerAdmitUnavailable("worker-admit malformed grant: %s" % malformed)
         return grant, process
 
     def _child_close_other_workers_fds(self):
@@ -319,6 +347,7 @@ class Supervisor:
                 os.close(result_read)
                 admit_process.stdin.close()
                 admit_process.stdout.close()
+                admit_process.stderr.close()
                 pipe_in = os.fdopen(dispatch_read, "r")
                 pipe_out = os.fdopen(result_write, "w")
                 # Placement is already verified by the time we get here --
@@ -355,6 +384,7 @@ class Supervisor:
             # admit lease and raise distinctly so the caller does not
             # spend this nodeid's one-and-only crash-retry budget on it.
             os.close(result_read)
+            os.close(dispatch_write)
             try:
                 os.waitpid(pid, 0)
             except ChildProcessError:
@@ -645,6 +675,16 @@ class Supervisor:
             # build-review via live repro against real pytest (both
             # review lineages independently, same root cause and fix).
             nodeid, _, outcome = line.rpartition(" ")
+            if nodeid != state["in_flight"]:
+                # A corrupted result record must never be attributed to a
+                # garbage nodeid. Leave the real in-flight nodeid intact
+                # and use the ordinary crash path so it receives its
+                # requeue-once/unevaluated treatment instead.
+                sys.stderr.write(
+                    "aira aitest: worker %d reported result for %r while running %r; treating worker as crashed\n"
+                    % (pid, nodeid, state["in_flight"])
+                )
+                return self._handle_worker_exit(pid, state)
             self.results[nodeid] = outcome
             state["in_flight"] = None
             if recycling:

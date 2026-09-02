@@ -1,7 +1,8 @@
 import os
 import time
 
-from aitest.supervisor import Supervisor, WorkerAdmitDenied, WorkerAdmitRequestTooLarge, WorkerAdmitUnavailable
+import aitest.supervisor as supervisor_module
+from aitest.supervisor import Supervisor, WorkerAdmitDenied, WorkerAdmitRequestTooLarge, WorkerAdmitUnavailable, WorkerPlacementFailed
 
 
 def _write_stub(path, body):
@@ -163,6 +164,49 @@ sys.exit(1)
         pass
 
 
+def test_acquire_worker_releases_malformed_grant_missing_required_field(tmp_path, monkeypatch):
+    pid_path = tmp_path / "malformed-grant-pid"
+    stub = _write_stub(tmp_path / "worker-admit-missing-memory-high", f"""
+import os, sys
+open({str(pid_path)!r}, "w").write(str(os.getpid()))
+print("granted scope=/outer/.aira-worker-1 worker_id=1 memory_max=400")
+sys.stdout.flush()
+sys.exit(0)
+""")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    try:
+        supervisor.acquire_worker(400)
+        assert False, "expected WorkerAdmitUnavailable"
+    except WorkerAdmitUnavailable as exc:
+        assert "memory_high" in str(exc)
+
+    assert not os.path.exists("/proc/%s" % pid_path.read_text()), "malformed grant relay must be reaped"
+
+
+def test_acquire_worker_releases_malformed_grant_invalid_memory_limit(tmp_path, monkeypatch):
+    pid_path = tmp_path / "malformed-grant-pid"
+    stub = _write_stub(tmp_path / "worker-admit-invalid-memory-max", f"""
+import os, sys
+open({str(pid_path)!r}, "w").write(str(os.getpid()))
+print("granted scope=/outer/.aira-worker-1 worker_id=1 memory_max=notanumber memory_high=320")
+sys.stdout.flush()
+sys.exit(0)
+""")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    try:
+        supervisor.acquire_worker(400)
+        assert False, "expected WorkerAdmitUnavailable"
+    except WorkerAdmitUnavailable as exc:
+        assert "memory_max" in str(exc)
+        assert "notanumber" in str(exc)
+
+    assert not os.path.exists("/proc/%s" % pid_path.read_text()), "malformed grant relay must be reaped"
+
+
 def test_next_nodeid_and_requeue_once_semantics():
     supervisor = Supervisor()
     supervisor.queue = ["test_a.py::test_one", "test_b.py::test_two"]
@@ -281,6 +325,106 @@ sys.stdin.buffer.read()
     assert elapsed < 4.0, "run() took %.1fs -- looks like a retirement hang (fd-inheritance bug)" % elapsed
 
 
+def test_spawn_worker_child_closes_its_admit_stderr_fd(tmp_path, monkeypatch):
+    """A worker is forked without exec(), so it inherits the admit relay's
+    stderr pipe read end as well as stdin/stdout. Once the parent closes
+    its copy, the relay must immediately see EPIPE on stderr while that
+    worker is still alive; otherwise the child is an invisible reader and
+    a large relay diagnostic blocks forever. This exercises spawn_worker
+    directly because closing the dispatch pipe first (normal retirement)
+    lets the worker exit and masks its still-live duplicate."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    admit = _write_stub(tmp_path / "worker-admit-stderr-fd", f"""
+import os, sys
+scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+os.makedirs(scope, exist_ok=True)
+print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+sys.stdout.flush()
+sys.stdin.buffer.read()
+try:
+    sys.stderr.write("x" * (1 << 20))
+    sys.stderr.flush()
+except BrokenPipeError:
+    pass
+""")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+
+    supervisor = Supervisor()
+    supervisor.outer_scope = str(outer)
+    pid = supervisor.spawn_worker(100 * (1 << 20))
+    state = supervisor.workers[pid]
+    admit_process = state["admit_process"]
+    # Drop the parent's reader while the worker is still alive. The child
+    # must already have closed its inherited duplicate for the relay's
+    # diagnostic write above to fail rather than fill a pipe and hang.
+    admit_process.stderr.close()
+    admit_process.stdin.close()
+    try:
+        admit_process.wait(timeout=2)
+    finally:
+        # stdin has already released this relay, so leave ordinary worker
+        # retirement to clean its pipes and child without closing it again.
+        state["admit_process"] = None
+        supervisor._retire_worker(pid, state)
+
+
+def test_spawn_worker_closes_dispatch_write_when_placement_ack_is_missing(monkeypatch):
+    """The placement-ack failure happens before dispatch_write is wrapped
+    into state, so it needs an explicit raw-fd close. A child that exits
+    before sending __placed__ makes that branch deterministic without any
+    cgroup setup or worker loop."""
+    class Stream:
+        def close(self):
+            pass
+
+    class AdmitProcess:
+        def __init__(self):
+            self.stdin = Stream()
+            self.stdout = Stream()
+            self.stderr = Stream()
+
+        def wait(self, timeout):
+            pass
+
+    pipes = []
+    real_pipe = os.pipe
+
+    def recording_pipe():
+        pair = real_pipe()
+        pipes.append(pair)
+        return pair
+
+    def child_that_never_acks(scope):
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        return pid, False
+
+    supervisor = Supervisor()
+    supervisor.acquire_worker = lambda estimated_bytes, max_wait: (
+        {"scope": "/unused", "worker_id": "1", "memory_max": "1", "memory_high": "1"}, AdmitProcess()
+    )
+    monkeypatch.setattr(supervisor_module.os, "pipe", recording_pipe)
+    monkeypatch.setattr(supervisor_module, "fork_worker", child_that_never_acks)
+
+    try:
+        supervisor.spawn_worker(1)
+        assert False, "expected WorkerPlacementFailed"
+    except WorkerPlacementFailed:
+        pass
+
+    dispatch_write = pipes[0][1]
+    try:
+        os.fstat(dispatch_write)
+        still_open = True
+    except OSError:
+        still_open = False
+    if still_open:
+        os.close(dispatch_write)
+    assert still_open is False, "placement failure must not leak the raw dispatch write fd"
+
+
 def test_crash_mid_test_requeues_once_then_reports_unevaluated(tmp_path, monkeypatch, pytester):
     outer = tmp_path / "outer"
     outer.mkdir()
@@ -350,6 +494,75 @@ def test_drain_worker_handles_eof_arriving_with_final_result_in_one_pass():
 
     assert supervisor.results == {"pkg/test_mod.py::test_x": "passed"}
     assert pid not in supervisor.workers, "worker must be retired, not left registered as idle"
+    os.close(dispatch_read)
+
+
+def test_drain_worker_requeues_real_nodeid_when_result_nodeid_is_wrong(monkeypatch, capsys):
+    """A result record for the wrong nodeid is a worker protocol failure,
+    not an outcome for that garbage key. _handle_worker_exit owns the
+    established first-crash retry bookkeeping, so exercise its direct
+    pipe path with a first attempt while stubbing replacement spawning."""
+    result_read, result_write = os.pipe()
+    real_nodeid = "pkg/test_mod.py::test_real"
+    wrong_nodeid = "pkg/test_mod.py::test_WRONG"
+    os.write(result_write, (wrong_nodeid + " passed\n").encode("utf-8"))
+    os.close(result_write)
+    os.set_blocking(result_read, False)
+    dispatch_read, dispatch_write = os.pipe()
+
+    supervisor = Supervisor()
+    supervisor.attempts[real_nodeid] = 1
+    monkeypatch.setattr(supervisor, "_replace_worker", lambda: None)
+    pid = 999997
+    state = {
+        "result_fd": result_read, "read_buffer": b"", "result_eof": False,
+        "in_flight": real_nodeid,
+        "dispatch_write": os.fdopen(dispatch_write, "w"),
+        "admit_process": None, "grant": None,
+    }
+    supervisor.workers[pid] = state
+
+    supervisor._drain_worker(pid, state)
+
+    assert wrong_nodeid not in supervisor.results
+    assert supervisor.queue == [real_nodeid], "the real first-attempt nodeid must be requeued"
+    assert supervisor.attempts[real_nodeid] == 1
+    assert pid not in supervisor.workers, "protocol-violating worker must be retired"
+    stderr = capsys.readouterr().err
+    assert real_nodeid in stderr and wrong_nodeid in stderr
+    os.close(dispatch_read)
+
+
+def test_drain_worker_marks_real_nodeid_unevaluated_on_second_wrong_result(monkeypatch):
+    """The second malformed result for the same in-flight nodeid consumes
+    its one retry just like a second crash: it is honestly unevaluated and
+    never recorded under the wrong protocol value."""
+    result_read, result_write = os.pipe()
+    real_nodeid = "pkg/test_mod.py::test_real"
+    wrong_nodeid = "pkg/test_mod.py::test_WRONG"
+    os.write(result_write, (wrong_nodeid + " passed\n").encode("utf-8"))
+    os.close(result_write)
+    os.set_blocking(result_read, False)
+    dispatch_read, dispatch_write = os.pipe()
+
+    supervisor = Supervisor()
+    supervisor.attempts[real_nodeid] = 2
+    monkeypatch.setattr(supervisor, "_replace_worker", lambda: None)
+    pid = 999996
+    state = {
+        "result_fd": result_read, "read_buffer": b"", "result_eof": False,
+        "in_flight": real_nodeid,
+        "dispatch_write": os.fdopen(dispatch_write, "w"),
+        "admit_process": None, "grant": None,
+    }
+    supervisor.workers[pid] = state
+
+    supervisor._drain_worker(pid, state)
+
+    assert wrong_nodeid not in supervisor.results
+    assert supervisor.results[real_nodeid] == "unevaluated"
+    assert supervisor.queue == []
+    assert pid not in supervisor.workers, "protocol-violating worker must be retired"
     os.close(dispatch_read)
 
 
@@ -471,6 +684,45 @@ def test_daemon_down_fallback_completes_suite_with_one_warning_no_admit_subproce
     assert supervisor.daemon_available is False
     stderr = capsys.readouterr().err
     assert stderr.count("aira aitest:") == 1
+
+
+def test_malformed_worker_grant_falls_back_without_losing_collected_results(tmp_path, monkeypatch, pytester, capsys):
+    """A relay that was killed partway through a grant can emit its
+    "granted " prefix but omit fields. That is daemon unavailability, so
+    run() must disable admission and finish every already-collected item
+    with the existing bounded unconfined fallback rather than propagate a
+    later KeyError out of spawn_worker and lose the whole suite."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+import sys
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+sys.exit(0)
+""")
+    admit = _write_stub(tmp_path / "worker-admit-malformed", """
+import sys
+print("granted scope=/outer/.aira-worker-1 worker_id=1 memory_max=104857600")
+sys.stdout.flush()
+sys.exit(0)
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+
+    items = pytester.getitems("""
+        def test_one():
+            assert True
+
+        def test_two():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+
+    assert results == {item.nodeid: "passed" for item in items}
+    assert supervisor.daemon_available is False
+    stderr = capsys.readouterr().err
+    assert "memory_high" in stderr and "falling back to" in stderr
 
 
 def test_worker_admit_denied_does_not_disable_daemon_and_still_completes(tmp_path, monkeypatch, pytester, capsys):
