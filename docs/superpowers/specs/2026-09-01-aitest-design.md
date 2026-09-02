@@ -291,11 +291,18 @@ runner could speak it without a protocol change.
 
 ## 4. Hard invariants
 
-- A worker never runs test code before its cgroup placement is verified by
-  the same two-way handshake `confine` already uses — no test ever executes
-  outside a real, checked scope (fallback mode in §3.7 is the sole,
-  explicitly-labelled exception, and it places zero cgroup expectation on
-  itself).
+- A worker never runs test code before its cgroup placement is verified —
+  no test ever executes outside a real, checked scope (fallback mode in
+  §3.7 is the sole, explicitly-labelled exception, and it places zero
+  cgroup expectation on itself). Verification is NOT the same two-way
+  handshake `confine` itself uses for a top-level launch (that requires
+  `clone3(CLONE_INTO_CGROUP)` at process-creation time, a Go/`os/exec`-only
+  mechanism — see §3.3's own correction) — a worker instead confirms
+  placement by writing its own pid into the granted scope's
+  `cgroup.procs` and sending one `__placed__` acknowledgement down its
+  result pipe before running any test code; the supervisor treats a
+  worker that dies before that ack as `WorkerPlacementFailed`, distinct
+  from a mid-test crash.
 - A killed-mid-test outcome is never reported as `passed` or silently
   dropped; it is `unevaluated` after one failed retry (§3.6).
 - Recycle checks fire only at test boundaries; a running test is never
