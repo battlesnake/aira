@@ -971,8 +971,19 @@ func runAitestBootstrapCommand(ctx context.Context, options map[string]string, s
 }
 
 func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin io.Reader, stdout, stderr io.Writer) int {
+	// Mirrors --memory-reserve's identical 1MiB floor (parseConfineArgs,
+	// above) -- this used to only reject <=0, so an out-of-range value below
+	// the daemon's own workerAdmitEstimatedBytesMin floor reached a live,
+	// healthy daemon, got rejected at the protocol level, and was wrapped by
+	// RequestWorkerAdmit as a generic "request rejected" message matching
+	// none of supervisor.py's denied/timeout/unevaluated substrings --
+	// misclassified as total daemon unavailability instead of a client
+	// argument mistake (found by Sol build-review, AIRA-38 review wave).
 	estimatedBytes, err := runner.ParseMemorySize(options["estimated-bytes"])
-	if err != nil || estimatedBytes <= 0 {
+	if err != nil || estimatedBytes < 1<<20 {
+		if err == nil {
+			err = errors.New("must be at least 1MiB")
+		}
 		_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --estimated-bytes: %v\n", err)
 		return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 	}
@@ -1001,7 +1012,19 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 	scopePath, err := runner.CreateWorkerScope(ctx, options["outer-scope"], lease.WorkerID, lease.MemoryMax, lease.MemoryHigh)
 	if err != nil {
 		_ = lease.Close()
-		_, _ = fmt.Fprintln(stderr, err)
+		// A distinct "worker-admit local-placement-failed" marker, not a
+		// bare error dump: the daemon ALREADY granted admission here (a
+		// healthy, reachable daemon) -- only the LOCAL cgroup scope
+		// creation then failed. Without this marker the raw error matches
+		// none of supervisor.py's recognized denied/timeout/unevaluated
+		// substrings, so it was indistinguishable from genuine daemon
+		// unreachability and permanently disabled daemon-backed admission
+		// for the rest of the run over what may be a one-off local
+		// resource hiccup (found by Sol build-review, AIRA-38 review
+		// wave). supervisor.py classifies this marker as
+		// WorkerPlacementFailed -- same fallback behavior as before, but
+		// now with an honest diagnostic instead of a misleading one.
+		_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: worker-admit local-placement-failed: %v\n", err)
 		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
 	}
 	if _, err := fmt.Fprintf(stdout, "granted scope=%s worker_id=%s memory_max=%d memory_high=%d\n", scopePath, lease.WorkerID, lease.MemoryMax, lease.MemoryHigh); err != nil {
