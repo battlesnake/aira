@@ -4,6 +4,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +13,8 @@ import (
 	"testing"
 
 	"aira/internal/cgrouptest"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestBootstrapAitestSupervisorRelocatesAndDelegates(t *testing.T) {
@@ -72,6 +75,35 @@ func startStandInProcess(t *testing.T) int {
 	}
 	t.Cleanup(func() { _ = stdin.Close(); _ = cmd.Wait() })
 	return cmd.Process.Pid
+}
+
+func TestMoveIntoScopeTreatsExitedPIDAsDrained(t *testing.T) {
+	parent := cgrouptest.IsolatedScopeParent(t)
+	scope, err := newDefaultBackend(parent).Create(context.Background(), "dead-pid")
+	if err != nil {
+		cgrouptest.SkipOrFailRealCgroup(t, "cannot create target scope: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := scope.Remove(); err != nil {
+			t.Errorf("remove target scope: %v", err)
+		}
+	})
+
+	cmd := exec.Command("/bin/true")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	if err := cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Kill(pid, 0); !errors.Is(err, unix.ESRCH) {
+		t.Fatalf("pid %d must be reaped before move, kill(0) error=%v", pid, err)
+	}
+
+	if err := moveIntoScope(scope, strconv.Itoa(pid)); err != nil {
+		t.Fatalf("move exited pid %d: %v", pid, err)
+	}
 }
 
 func containsField(fields []string, want string) bool {

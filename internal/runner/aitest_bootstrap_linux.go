@@ -4,6 +4,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -88,6 +89,10 @@ func drainIntoScope(outerScope string, scope Scope) error {
 	return fmt.Errorf("outer scope still had member processes after %d drain attempts", maxDrainAttempts)
 }
 
+// moveIntoScope treats ESRCH as success: a process read from outer's
+// cgroup.procs may exit, or remain as a not-yet-reaped zombie, before this
+// write reaches the kernel. Propagating that harmless race would abort the
+// whole bootstrap and disable cgroup admission and per-worker caps.
 func moveIntoScope(scope Scope, pid string) error {
 	fd, err := unix.Openat(scope.FD(), "cgroup.procs", unix.O_WRONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -100,6 +105,9 @@ func moveIntoScope(scope Scope, pid string) error {
 	}
 	defer file.Close()
 	if _, err := file.WriteString(pid + "\n"); err != nil {
+		if errors.Is(err, unix.ESRCH) {
+			return nil
+		}
 		return fmt.Errorf("write cgroup.procs: %w", err)
 	}
 	return nil
