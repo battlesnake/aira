@@ -3,6 +3,8 @@ package daemon
 import (
 	"encoding/json"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -22,6 +24,19 @@ import (
 func admitReadMemoryFixture(current map[string]int64, outerMax int64) func(string) (int64, int64, int64, bool, string) {
 	return func(path string) (int64, int64, int64, bool, string) {
 		return current[path], outerMax, 0, true, ""
+	}
+}
+
+// admitReadWorkerSupervisorMemoryFixture stands in for
+// readWorkerSupervisorMemory (the aggregate guard's supervisor-scope read,
+// a SEPARATE seam from admitReadMemoryFixture above): unlike the outer-scope
+// read, this one carries no memory.max/ceiling at all, matching the real
+// supervisor scope's deliberately-uncapped memory.max ("max") — see
+// readWorkerSupervisorMemory's own doc comment for why reusing the
+// outer-scope reader here was a real bug (AIRA-38).
+func admitReadWorkerSupervisorMemoryFixture(current map[string]int64) func(string) (int64, int64, bool, string) {
+	return func(path string) (int64, int64, bool, string) {
+		return current[path], 0, true, ""
 	}
 }
 
@@ -130,6 +145,7 @@ func TestValidateWorkerAdmitArgsRejectsInvalidRequiredFields(t *testing.T) {
 func TestEvaluateWorkerAdmitGrantsWithinHeadroom(t *testing.T) {
 	server := NewServer(Paths{})
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
 	server.workerAdmitHeadroom = 0
 	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400, maxWaitMS: 0})
 	if response.State != "granted" || response.WorkerID == "" || response.MemoryMax != 400 || response.MemoryHigh != 320 {
@@ -164,6 +180,7 @@ func TestEvaluateWorkerAdmitDeniesWhenAggregateCapsWouldExceedCeiling(t *testing
 	server.workerAdmitHeadroom = 0
 	live := map[string]int64{}
 	server.admitReadMemory = admitReadMemoryFixture(live, 1000)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
 	first := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
 	if first.State != "granted" {
 		t.Fatalf("first=%+v", first)
@@ -196,9 +213,9 @@ func TestEvaluateWorkerAdmitAggregateGuardAccountsForSupervisorRSS(t *testing.T)
 	// denied here once the supervisor's own usage is accounted for.
 	server := NewServer(Paths{})
 	server.workerAdmitHeadroom = 0
-	live := map[string]int64{}
-	server.admitReadMemory = admitReadMemoryFixture(live, 1000)
-	live[runner.WorkerScopeChildPath("/outer", "supervisor")] = 400
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	supervisorLive := map[string]int64{runner.WorkerScopeChildPath("/outer", "supervisor"): 400}
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(supervisorLive)
 	// 700 alone fits under the outer ceiling (1000) and under the old
 	// committed-only guard (committed=0 before any grant) -- but
 	// supervisor(400)+700=1100 > 1000, so this must now be denied.
@@ -226,6 +243,7 @@ func TestEvaluateWorkerAdmitDiscountsReclaimableOuterCache(t *testing.T) {
 		}
 		return 0, 1000, 0, true, ""
 	}
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
 	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 500})
 	if response.State != "granted" {
 		t.Fatalf("response=%+v, want reclaimable outer cache discounted", response)
@@ -239,11 +257,12 @@ func TestEvaluateWorkerAdmitDiscountsReclaimableSupervisorCache(t *testing.T) {
 	server := NewServer(Paths{})
 	server.workerAdmitHeadroom = 0
 	supervisorScope := runner.WorkerScopeChildPath("/outer", "supervisor")
-	server.admitReadMemory = func(path string) (int64, int64, int64, bool, string) {
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.admitReadWorkerSupervisorMemory = func(path string) (int64, int64, bool, string) {
 		if path == supervisorScope {
-			return 900, 1000, 500, true, ""
+			return 900, 500, true, ""
 		}
-		return 0, 1000, 0, true, ""
+		return 0, 0, true, ""
 	}
 	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 500})
 	if response.State != "granted" {
@@ -263,6 +282,7 @@ func TestEvaluateWorkerAdmitFloorsReclaimableDiscountAtZero(t *testing.T) {
 		}
 		return 0, 1000, 0, true, ""
 	}
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
 	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 1000})
 	if response.State != "granted" {
 		t.Fatalf("response=%+v, want reclaimable discount floored at zero", response)
@@ -275,15 +295,58 @@ func TestEvaluateWorkerAdmitReturnsUnevaluatedWhenSupervisorScopeUnreadable(t *t
 	// same philosophy as the outer-scope-unreadable case below.
 	server := NewServer(Paths{})
 	server.workerAdmitHeadroom = 0
-	server.admitReadMemory = func(path string) (int64, int64, int64, bool, string) {
-		if path == "/outer" {
-			return 0, 1000, 0, true, ""
-		}
-		return 0, 0, 0, false, "fallback:supervisor-scope-unreadable"
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.admitReadWorkerSupervisorMemory = func(string) (int64, int64, bool, string) {
+		return 0, 0, false, "fallback:supervisor-scope-unreadable"
 	}
 	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400, maxWaitMS: 0})
 	if response.State != "unevaluated" {
 		t.Fatalf("response=%+v", response)
+	}
+}
+
+func TestEvaluateWorkerAdmitAccountsForSupervisorRSSWhenSupervisorScopeIsUncapped(t *testing.T) {
+	// Real-world regression (AIRA-38, found live via the real-cgroup e2e
+	// test): the supervisor's own child scope is NEVER given a memory.max
+	// by BootstrapAitestSupervisor -- it stays at the cgroup default "max"
+	// (uncapped) by design, since it is meant to be contained transitively
+	// by the OUTER scope's cap, not individually. Before this fix,
+	// evaluateWorkerAdmit reused the OUTER-scope reader (readSliceMemory)
+	// for the supervisor-scope read too, and that reader treats an
+	// uncapped memory.max as a hard read failure (a correct precondition
+	// for the outer scope, which IS always explicitly capped by
+	// construction -- but wrong here) -- so the aggregate guard reported
+	// "unevaluated" on EVERY real invocation, and the granted (confined)
+	// path was never actually reachable outside a mocked unit test. Pin
+	// the real, unbounded-supervisor-scope shape directly here via
+	// readWorkerSupervisorMemory (the real function, not a fixture) over a
+	// real temp-directory cgroupfs-shaped layout.
+	server := NewServer(Paths{})
+	server.workerAdmitHeadroom = 0
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	supervisorScope := t.TempDir()
+	if err := os.WriteFile(filepath.Join(supervisorScope, "memory.current"), []byte("400"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(supervisorScope, "memory.max"), []byte("max"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server.admitReadWorkerSupervisorMemory = func(path string) (int64, int64, bool, string) {
+		if path != runner.WorkerScopeChildPath("/outer", "supervisor") {
+			t.Fatalf("unexpected supervisor scope path %q", path)
+		}
+		return readWorkerSupervisorMemory(supervisorScope)
+	}
+	// supervisor(400)+700=1100 > 1000 ceiling: must be denied, not
+	// unevaluated -- an uncapped memory.max is a normal, expected read,
+	// not a failure.
+	denied := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
+	if denied.State != "denied" || denied.Reason != "fallback:aggregate-cap-exceeded" {
+		t.Fatalf("denied=%+v", denied)
+	}
+	granted := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 500, maxWaitMS: 0})
+	if granted.State != "granted" {
+		t.Fatalf("granted=%+v", granted)
 	}
 }
 
@@ -331,6 +394,7 @@ func TestReleaseWorkerGrantIsIdempotent(t *testing.T) {
 	server := NewServer(Paths{})
 	server.workerAdmitHeadroom = 0
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
 	granted := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 900, maxWaitMS: 0})
 	if granted.State != "granted" {
 		t.Fatalf("granted=%+v", granted)
@@ -352,6 +416,7 @@ func TestWorkerJobLedgerIsBoundToJobIDAndOuterScopeTogether(t *testing.T) {
 	server.workerAdmitHeadroom = 0
 	live := map[string]int64{"/outer-a": 900, "/outer-b": 0}
 	server.admitReadMemory = admitReadMemoryFixture(live, 1000)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
 	// /outer-a is nearly saturated; /outer-b (same job_id!) is empty.
 	denied := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer-a", estimatedBytes: 500, maxWaitMS: 0})
 	if denied.State != "denied" {
@@ -370,6 +435,7 @@ func TestWorkerAdmitOuterScopeIsOwnedByFirstJob(t *testing.T) {
 	server := NewServer(Paths{})
 	server.workerAdmitHeadroom = 0
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
 	first := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 200, maxWaitMS: 0})
 	if first.State != "granted" {
 		t.Fatalf("first=%+v", first)
@@ -387,6 +453,7 @@ func TestWorkerAdmitOuterScopeIsOwnedByFirstJob(t *testing.T) {
 func TestWorkerAdmitConnectionGrantsThenHoldsUntilPeerCloses(t *testing.T) {
 	server := NewServer(Paths{})
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 4*workerAdmitEstimatedBytesMin)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
 	server.workerAdmitHeadroom = 0
 	server.workerAdmitPollInterval = time.Millisecond
 	now := time.Unix(1000, 0)
@@ -447,11 +514,9 @@ func TestWorkerAdmitConnectionPollLoopReEvaluatesAndGrantsBeforeDeadline(t *test
 		if path == outerScope {
 			return atomic.LoadInt64(&liveUsage), 2 * workerAdmitEstimatedBytesMin, 0, true, ""
 		}
-		if path == runner.WorkerScopeChildPath(outerScope, "supervisor") {
-			return 0, 2 * workerAdmitEstimatedBytesMin, 0, true, ""
-		}
 		return 0, 2 * workerAdmitEstimatedBytesMin, 0, true, ""
 	}
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
 	server.workerAdmitHeadroom = 0
 	server.workerAdmitPollInterval = 5 * time.Millisecond
 
@@ -578,6 +643,7 @@ func TestWorkerAdmitConnectionDeniesImmediatelyWithoutWaitingOutMaxWait(t *testi
 func TestWorkerAdmitConnectionReleasesGrantWhenResponseWriteFails(t *testing.T) {
 	server := NewServer(Paths{})
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 2*workerAdmitEstimatedBytesMin)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
 	server.workerAdmitHeadroom = 0
 	server.workerAdmitPollInterval = time.Millisecond
 

@@ -29,10 +29,13 @@ class WorkerAdmitUnavailable(Exception):
 
 class WorkerAdmitDenied(Exception):
     """The daemon IS reachable and responded normally with "denied" (budget
-    genuinely exhausted right now) or "timeout" (the request waited out its
-    full window -- the daemon is just busy/contended, not down). Means
-    "don't add a worker at this moment", never "abandon containment for the
-    rest of the run"."""
+    genuinely exhausted right now), "timeout" (the request waited out its
+    full window -- the daemon is just busy/contended, not down), or
+    "unevaluated" (a live memory read failed on an otherwise-reachable
+    daemon -- AIRA-38: treated as retriable, not as daemon-unavailable,
+    since the daemon plainly answered, it just could not establish a
+    result this instant). Means "don't add a worker at this moment", never
+    "abandon containment for the rest of the run"."""
     pass
 
 
@@ -250,9 +253,20 @@ class Supervisor:
             # stderr -- ANYTHING else (a dial failure, a launch failure, a
             # malformed response) means there is no daemon to talk to at
             # all. This distinction is load-bearing (Task 16).
+            #
+            # "worker-admit unevaluated" (AIRA-38) is included here
+            # deliberately, not an oversight: evaluateWorkerAdmit returns
+            # State="unevaluated" when the daemon IS reachable but a live
+            # memory.current read (outer or supervisor scope) failed --
+            # AIRA's own rule that a check which cannot establish its
+            # result reports unevaluated rather than a fake pass/fail
+            # (never "no daemon at all"). A single transient read glitch on
+            # an otherwise-live daemon must not permanently strip
+            # containment for the rest of the run, so this is classified
+            # exactly like a plain denial: retriable, not terminal.
             if "reject:exceeds-ceiling" in message:
                 raise WorkerAdmitRequestTooLarge(message)
-            if "worker-admit denied" in message or "worker-admit timeout" in message:
+            if "worker-admit denied" in message or "worker-admit timeout" in message or "worker-admit unevaluated" in message:
                 raise WorkerAdmitDenied(message)
             raise WorkerAdmitUnavailable(message)
         grant = {}

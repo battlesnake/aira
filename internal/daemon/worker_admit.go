@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -106,6 +108,41 @@ func (s *Server) workerJobFor(jobID, outerScope string) (*workerJobState, bool) 
 	return job, true
 }
 
+// readWorkerSupervisorMemory reads a scope's live memory.current (plus its
+// memory.stat reclaimable-cache figure) WITHOUT requiring memory.max to be
+// set. This is deliberately narrower than readSliceMemory (admit.go), which
+// treats memory.max=="max" (uncapped) as a read failure — a correct,
+// defensive precondition for the OUTER-scope ledger read above (every
+// confine-launched outer scope IS always given an explicit finite cap by
+// construction, so "unbounded" there is a genuine anomaly worth failing
+// loudly on) but WRONG for the supervisor's own child scope: bootstrap
+// (BootstrapAitestSupervisor, aitest_bootstrap_linux.go) deliberately never
+// writes memory.max on it at all -- the supervisor is meant to be contained
+// transitively by the OUTER scope's cap, never capped individually. Found
+// live (AIRA-38, real-cgroup e2e): reusing readSliceMemory for this read
+// meant the aggregate guard's supervisor-RSS check (below) reported
+// "unevaluated" on EVERY real invocation, since the supervisor scope's own
+// memory.max is unconditionally "max" -- the granted (confined) path was
+// never actually reachable outside a mocked unit test.
+func readWorkerSupervisorMemory(path string) (current, reclaimable int64, ok bool, reason string) {
+	currentData, err := os.ReadFile(filepath.Join(path, "memory.current"))
+	if err != nil {
+		return 0, 0, false, "read-error"
+	}
+	current, valid := parseAdmitMemory(currentData)
+	if !valid {
+		return 0, 0, false, "parse-error"
+	}
+	statData, err := os.ReadFile(filepath.Join(path, "memory.stat"))
+	if err == nil {
+		reclaimable, valid = parseSliceMemoryStat(statData)
+	}
+	if err != nil || !valid {
+		reclaimable = 0
+	}
+	return current, reclaimable, true, ""
+}
+
 // evaluateWorkerAdmit makes one synchronous grant/deny decision for req.
 // "Used" is the OUTER scope's own live memory.current, read directly —
 // cgroup memory accounting is hierarchical, so this single read already
@@ -191,9 +228,18 @@ func (s *Server) evaluateWorkerAdmit(req workerAdmitRequest) WorkerAdmitResponse
 	// subtracting it here closes that gap; an unreadable supervisor
 	// scope reports unevaluated (fail toward safety — this codebase never
 	// silently admits on a read it cannot establish), same as an
-	// unreadable outer scope above.
+	// unreadable outer scope above. Uses readWorkerSupervisorMemory (a
+	// SEPARATE seam from readMemory above), not readMemory/readSliceMemory:
+	// the supervisor scope is deliberately never given its own memory.max
+	// (see readWorkerSupervisorMemory's own doc comment) — reusing the
+	// outer-scope reader here made this guard report unevaluated on EVERY
+	// real invocation, an AIRA-38 finding.
+	readSupervisorMemory := s.admitReadWorkerSupervisorMemory
+	if readSupervisorMemory == nil {
+		readSupervisorMemory = readWorkerSupervisorMemory
+	}
 	supervisorScope := runner.WorkerScopeChildPath(req.outerScope, "supervisor")
-	supervisorUsed, _, supervisorReclaimable, supervisorOK, supervisorReason := readMemory(supervisorScope)
+	supervisorUsed, supervisorReclaimable, supervisorOK, supervisorReason := readSupervisorMemory(supervisorScope)
 	if !supervisorOK {
 		return WorkerAdmitResponse{State: "unevaluated", Reason: "supervisor scope unreadable: " + supervisorReason}
 	}

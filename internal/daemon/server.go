@@ -91,30 +91,38 @@ type Server struct {
 	governor                     *governorSet
 
 	// Test seams. Production always calls the Store methods and DB.Close.
-	reapScope                func(context.Context, *store.Store) (int, error)
-	flushScopeFn             func(context.Context, *store.Store) (int, error)
-	closeDB                  func(*store.DB) error
-	watchEventsSince         func(context.Context, *store.Store, int64, int) ([]store.WatchEvent, int64, error)
-	watchAfterWake           func()
-	admitResolveSlice        func(string) (string, bool, string)
-	admitReadMemory          func(string) (int64, int64, int64, bool, string)
-	admitConfineScan         func(string) (runner.ConfineListResult, error)
-	admitConfineScanInterval time.Duration
-	admitNow                 func() time.Time
-	admitAfter               func(time.Duration) <-chan time.Time
-	admitWriteFrame          func(net.Conn, any) error
-	admitBeforeWrite         func(*admitWaiter)
-	admitPeakHistory         func(context.Context, string) (runner.PeakRSSStats, error)
-	admitPeakP90             func(context.Context) (int64, bool, error)
-	peerCredential           func(net.Conn) (int, int, error)
-	storeOpAppendTimeout     time.Duration
-	storeOpHeavyTimeout      time.Duration
-	storeOpWriteTimeout      time.Duration
-	storeOpRun               func(context.Context, *store.Store, StoreOpFrame) (any, error)
-	listRegistryEntries      func(string) ([]store.RegistryEntry, error)
-	discoverProject          func(context.Context, string) (app.Project, error)
-	adoptRebuild             func(context.Context, *store.Store) error
-	beforeEjectTransaction   func()
+	reapScope         func(context.Context, *store.Store) (int, error)
+	flushScopeFn      func(context.Context, *store.Store) (int, error)
+	closeDB           func(*store.DB) error
+	watchEventsSince  func(context.Context, *store.Store, int64, int) ([]store.WatchEvent, int64, error)
+	watchAfterWake    func()
+	admitResolveSlice func(string) (string, bool, string)
+	admitReadMemory   func(string) (int64, int64, int64, bool, string)
+	// admitReadWorkerSupervisorMemory is a SEPARATE seam from admitReadMemory
+	// above: the aggregate guard's supervisor-scope read (worker_admit.go)
+	// must tolerate an uncapped memory.max (the supervisor's scope is never
+	// individually capped by design), which admitReadMemory's default
+	// (readSliceMemory) deliberately refuses to do for the OUTER-scope
+	// ledger read's own safety precondition. Defaults to
+	// readWorkerSupervisorMemory.
+	admitReadWorkerSupervisorMemory func(string) (int64, int64, bool, string)
+	admitConfineScan                func(string) (runner.ConfineListResult, error)
+	admitConfineScanInterval        time.Duration
+	admitNow                        func() time.Time
+	admitAfter                      func(time.Duration) <-chan time.Time
+	admitWriteFrame                 func(net.Conn, any) error
+	admitBeforeWrite                func(*admitWaiter)
+	admitPeakHistory                func(context.Context, string) (runner.PeakRSSStats, error)
+	admitPeakP90                    func(context.Context) (int64, bool, error)
+	peerCredential                  func(net.Conn) (int, int, error)
+	storeOpAppendTimeout            time.Duration
+	storeOpHeavyTimeout             time.Duration
+	storeOpWriteTimeout             time.Duration
+	storeOpRun                      func(context.Context, *store.Store, StoreOpFrame) (any, error)
+	listRegistryEntries             func(string) ([]store.RegistryEntry, error)
+	discoverProject                 func(context.Context, string) (app.Project, error)
+	adoptRebuild                    func(context.Context, *store.Store) error
+	beforeEjectTransaction          func()
 }
 
 func NewServer(paths Paths) *Server {

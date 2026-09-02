@@ -32,6 +32,7 @@ func TestRequestWorkerAdmitReturnsHeldLeaseOnGrant(t *testing.T) {
 	paths := daemonTestPaths(t) // small local helper: mirrors internal/daemon's own testPaths(t), sets XDG_STATE_HOME/XDG_RUNTIME_DIR under t.TempDir()
 	server := daemon.NewServer(paths)
 	server.SetAdmitReadMemoryForTest(func(string) (int64, int64, int64, bool, string) { return 0, 20 * (1 << 20), 0, true, "" })
+	server.SetAdmitReadWorkerSupervisorMemoryForTest(func(string) (int64, int64, bool, string) { return 0, 0, true, "" })
 	server.SetWorkerAdmitHeadroomForTest(0) // production default (64 MiB) would swallow this test's tiny synthetic byte values
 	ready := make(chan struct{}, 1)
 	server.Ready = ready

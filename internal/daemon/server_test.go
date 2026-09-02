@@ -1319,6 +1319,7 @@ func TestServerDispatchesWorkerAdmitVerbOverRealSocket(t *testing.T) {
 	paths := testPaths(t)
 	server := NewServer(paths)
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 4*workerAdmitEstimatedBytesMin)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
 	server.workerAdmitHeadroom = 0
 	_, _ = startServer(t, server)
 	scope := testScope(t, paths, "one")

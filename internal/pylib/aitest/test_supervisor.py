@@ -146,6 +146,31 @@ sys.exit(1)
         pass
 
 
+def test_acquire_worker_raises_denied_on_daemon_unevaluated_response(tmp_path, monkeypatch):
+    # A "unevaluated" wire response (AIRA-38) means the daemon IS reachable
+    # and answered -- it just couldn't establish a live memory read this
+    # instant (e.g. a transient outer-scope memory.current read failure),
+    # AIRA's own "report unevaluated, never a fake pass" rule applied to
+    # this check. That is a retriable, not a permanent, condition -- it
+    # must classify as WorkerAdmitDenied, never WorkerAdmitUnavailable, or
+    # one transient read glitch would silently strip containment for the
+    # rest of the run exactly like the denied/timeout bug this same task
+    # already fixed.
+    stub = _write_stub(tmp_path / "worker-admit-unevaluated", """
+import sys
+sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit unevaluated: fallback:outer-scope-unreadable\\n")
+sys.exit(1)
+""")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    try:
+        supervisor.acquire_worker(100)
+        assert False, "expected WorkerAdmitDenied"
+    except WorkerAdmitDenied as exc:
+        assert "unevaluated" in str(exc)
+
+
 def test_acquire_worker_raises_unavailable_on_genuine_connection_failure(tmp_path, monkeypatch):
     # A dial-level failure (no daemon to talk to at all) must NOT match the
     # denied/timeout classification above, even though its text happens to
