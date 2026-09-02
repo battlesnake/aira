@@ -179,6 +179,32 @@ sys.exit(1)
         assert False, "a client argument mistake must not be conflated with daemon unavailability"
 
 
+def test_acquire_worker_raises_request_too_large_on_daemon_protocol_rejection(tmp_path, monkeypatch):
+    """Regression test for a real coverage gap (Fable re-gate round 3): the
+    E_DAEMON_PROTOCOL classifier branch (a value slipping past BOTH the
+    CLI and Python clamps, e.g. estimated_bytes above the daemon's own
+    admitMaxReserve) had no test of its own, unlike its sibling
+    E_CONFINE_ARGUMENT_INVALID branch directly above -- a later reorder
+    or drop of the substring in the classifier's or-chain would leave
+    every other test green while reverting this path to the pre-fix
+    misclassification as WorkerAdmitUnavailable."""
+    stub = _write_stub(tmp_path / "worker-admit-daemon-protocol", """
+import sys
+sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit request rejected: E_DAEMON_PROTOCOL: worker-admit estimated_bytes must be no larger than 1125899906842624\\n")
+sys.exit(1)
+""")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    try:
+        supervisor.acquire_worker(100)
+        assert False, "expected WorkerAdmitRequestTooLarge"
+    except WorkerAdmitRequestTooLarge as exc:
+        assert "E_DAEMON_PROTOCOL" in str(exc)
+    except WorkerAdmitUnavailable:
+        assert False, "a daemon-side protocol rejection must not be conflated with daemon unavailability"
+
+
 def test_acquire_worker_raises_denied_on_daemon_timeout_response(tmp_path, monkeypatch):
     # A "timeout" wire response (the daemon waited out the full poll
     # window, just busy/contended) is ALSO WorkerAdmitDenied, never

@@ -183,7 +183,13 @@ func TestRealPytestAitestEndToEndFallbackAllPassingExitsZero(t *testing.T) {
 	// deliberately failing and real-cgroup-only fixture files alongside it.
 	command := exec.Command(pytest, "-q", "--aitest-workers=2", "test_pass.py")
 	command.Dir = filepath.Join(aitestDir, "testdata")
-	command.Env = append(os.Environ(),
+	// environWithoutAiraRealCgroup, not os.Environ() (Fable re-gate round
+	// 3): this is a FALLBACK run (missing bootstrap command, no per-worker
+	// containment) same as the sibling test above, so it must not forward
+	// this Go test binary's own ambient AIRA_REAL_CGROUP=1 either -- only
+	// safe today because test_pass.py's explicit file argument keeps
+	// testdata/test_oom.py out of collection; latent otherwise.
+	command.Env = append(environWithoutAiraRealCgroup(),
 		"PYTHONPATH="+filepath.Dir(aitestDir),
 		"PYTHONDONTWRITEBYTECODE=1",
 		"AIRA_AITEST_LIB="+pythonDir,

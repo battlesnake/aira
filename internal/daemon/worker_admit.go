@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -378,7 +379,22 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 		if response.State == "granted" || response.State == "unevaluated" {
 			break
 		}
-		if response.State == "denied" && (response.Reason == "reject:exceeds-ceiling" || response.Reason == "reject:outer-scope-owned-by-another-job") {
+		// Prefix-matched, not a two-string whitelist (Fable re-gate round
+		// 3): the spec's own §3.3 amendment declares "reject:" vs
+		// "fallback:" a load-bearing convention every reject:* reason
+		// implements, not just the two that happened to exist when this
+		// loop was written -- a future third permanent reason added only
+		// to evaluateWorkerAdmit without also touching this whitelist
+		// would poll out to "timeout: reject:saturated" and get retried
+		// indefinitely by the (correctly prefix-parsing) client,
+		// resurrecting the exact hang class this branch's review rounds
+		// already fixed, from the daemon side instead. Scoped to "denied"
+		// only, never "timeout": reject:saturated's own reason text
+		// coincidentally also starts "reject:", but state=timeout means
+		// the CLIENT's own wait budget merely expired -- genuinely
+		// retriable with a fresh request, never a stable daemon-side
+		// verdict.
+		if response.State == "denied" && strings.HasPrefix(response.Reason, "reject:") {
 			// A stable "never going to fit" fact about this request, not a
 			// transient contention moment — surface "denied" to the client
 			// immediately instead of waiting out the full poll timeout
