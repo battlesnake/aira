@@ -71,24 +71,39 @@ func workerJobKey(jobID, outerScope string) string {
 	return jobID + "\x00" + outerScope
 }
 
-// workerJobs is never actively pruned once a job's last worker releases —
-// accepted Slice 1 gap: unbounded-but-slow growth, one entry per distinct
-// (job_id, outer_scope) pair across the daemon's lifetime. A real concern
-// only for a very long-lived daemon running very many distinct aitest
-// jobs; not worth cleanup machinery for Slice 1.
-func (s *Server) workerJobFor(jobID, outerScope string) *workerJobState {
+// workerJobFor returns the ledger for an outer scope's owning job. The
+// aggregate guard sums only one job's own grants, so each outer_scope must
+// have exactly one owning job_id or that guard is defeated for the scope.
+//
+// workerJobs and workerScopeOwner are never actively pruned once a job's last
+// worker releases — accepted Slice 1 gap: unbounded-but-slow growth, one
+// entry per distinct (job_id, outer_scope) pair and outer_scope respectively
+// across the daemon's lifetime. Ownership is deliberately permanent: clearing
+// it during a transient zero-grant window would let another job claim the
+// scope and reopen the aggregate-guard gap this prevents.
+func (s *Server) workerJobFor(jobID, outerScope string) (*workerJobState, bool) {
 	key := workerJobKey(jobID, outerScope)
 	s.workerJobsMu.Lock()
 	defer s.workerJobsMu.Unlock()
 	if s.workerJobs == nil {
 		s.workerJobs = make(map[string]*workerJobState)
 	}
+	if s.workerScopeOwner == nil {
+		s.workerScopeOwner = make(map[string]string)
+	}
+	owner, exists := s.workerScopeOwner[outerScope]
+	if exists && owner != jobID {
+		return nil, false
+	}
+	if !exists {
+		s.workerScopeOwner[outerScope] = jobID
+	}
 	job := s.workerJobs[key]
 	if job == nil {
 		job = &workerJobState{outerScope: outerScope, grants: make(map[string]*workerGrant)}
 		s.workerJobs[key] = job
 	}
-	return job
+	return job, true
 }
 
 // evaluateWorkerAdmit makes one synchronous grant/deny decision for req.
@@ -131,7 +146,10 @@ func (s *Server) evaluateWorkerAdmit(req workerAdmitRequest) WorkerAdmitResponse
 		// only to time out anyway.
 		return WorkerAdmitResponse{State: "denied", Reason: "reject:exceeds-ceiling"}
 	}
-	job := s.workerJobFor(req.jobID, req.outerScope)
+	job, ownerOK := s.workerJobFor(req.jobID, req.outerScope)
+	if !ownerOK {
+		return WorkerAdmitResponse{State: "denied", Reason: "reject:outer-scope-owned-by-another-job"}
+	}
 	job.mu.Lock()
 	defer job.mu.Unlock()
 	if req.estimatedBytes > ceiling-used {
@@ -293,7 +311,7 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 		if response.State == "granted" || response.State == "unevaluated" {
 			break
 		}
-		if response.State == "denied" && response.Reason == "reject:exceeds-ceiling" {
+		if response.State == "denied" && (response.Reason == "reject:exceeds-ceiling" || response.Reason == "reject:outer-scope-owned-by-another-job") {
 			// A stable "never going to fit" fact about this request, not a
 			// transient contention moment — surface "denied" to the client
 			// immediately instead of waiting out the full poll timeout

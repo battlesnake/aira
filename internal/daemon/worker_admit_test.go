@@ -312,6 +312,27 @@ func TestWorkerJobLedgerIsBoundToJobIDAndOuterScopeTogether(t *testing.T) {
 	}
 }
 
+func TestWorkerAdmitOuterScopeIsOwnedByFirstJob(t *testing.T) {
+	// The aggregate-cap guard only sums grants for one (job_id, outer_scope)
+	// ledger. A second caller-chosen job_id must not build a separate ledger
+	// against an outer scope already claimed by the first job.
+	server := NewServer(Paths{})
+	server.workerAdmitHeadroom = 0
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	first := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 200, maxWaitMS: 0})
+	if first.State != "granted" {
+		t.Fatalf("first=%+v", first)
+	}
+	other := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-2", outerScope: "/outer", estimatedBytes: 200, maxWaitMS: 0})
+	if other.State != "denied" || other.Reason != "reject:outer-scope-owned-by-another-job" {
+		t.Fatalf("other=%+v", other)
+	}
+	again := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 200, maxWaitMS: 0})
+	if again.State != "granted" {
+		t.Fatalf("again=%+v", again)
+	}
+}
+
 func TestWorkerAdmitConnectionGrantsThenHoldsUntilPeerCloses(t *testing.T) {
 	server := NewServer(Paths{})
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 4*workerAdmitEstimatedBytesMin)

@@ -85,6 +85,7 @@ type Server struct {
 	admitSliceHeadroomSupervisor int64
 	workerJobsMu                 sync.Mutex
 	workerJobs                   map[string]*workerJobState
+	workerScopeOwner             map[string]string
 	workerAdmitHeadroom          int64
 	scopeReapGrace               time.Duration
 	governor                     *governorSet
