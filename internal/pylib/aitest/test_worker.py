@@ -239,3 +239,60 @@ def test_should_recycle_uses_default_for_invalid_high_watermark(monkeypatch, cap
         time.monotonic(),
         0,
     )
+
+
+def _clear_recycle_env(monkeypatch):
+    for env_name in (
+        "AIRA_AITEST_WORKER_MAX_SECONDS",
+        "AIRA_AITEST_WORKER_MAX_TESTS",
+        "AIRA_AITEST_WORKER_HIGH_WATERMARK_PCT",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+
+def test_should_recycle_uses_elapsed_time_default_in_both_directions(monkeypatch, clear_invalid_recycle_env_warnings):
+    _clear_recycle_env(monkeypatch)
+
+    assert _should_recycle(None, time.monotonic() - _DEFAULT_MAX_SECONDS - 1, 0) is True
+    assert _should_recycle(None, time.monotonic(), 0) is False
+
+
+def test_should_recycle_uses_memory_watermark_default_in_both_directions(tmp_path, monkeypatch, clear_invalid_recycle_env_warnings):
+    _clear_recycle_env(monkeypatch)
+    over_watermark = tmp_path / "over-watermark"
+    over_watermark.mkdir()
+    (over_watermark / "memory.current").write_text("90")
+    (over_watermark / "memory.high").write_text("100")
+    below_watermark = tmp_path / "below-watermark"
+    below_watermark.mkdir()
+    (below_watermark / "memory.current").write_text("50")
+    (below_watermark / "memory.high").write_text("100")
+
+    assert _should_recycle(str(over_watermark), time.monotonic(), 0) is True
+    assert _should_recycle(str(below_watermark), time.monotonic(), 0) is False
+
+
+def test_should_recycle_fails_open_for_unbounded_memory_high(tmp_path, monkeypatch, clear_invalid_recycle_env_warnings):
+    _clear_recycle_env(monkeypatch)
+    scope_dir = tmp_path / "unbounded-memory-high"
+    scope_dir.mkdir()
+    (scope_dir / "memory.current").write_text("90")
+    (scope_dir / "memory.high").write_text("max")
+
+    assert _should_recycle(str(scope_dir), time.monotonic(), 0) is False
+
+
+def test_should_recycle_fails_open_for_unreadable_memory_scope(tmp_path, monkeypatch, clear_invalid_recycle_env_warnings):
+    _clear_recycle_env(monkeypatch)
+
+    assert _should_recycle(str(tmp_path / "does-not-exist"), time.monotonic(), 0) is False
+
+
+def test_should_recycle_fails_open_for_nonpositive_memory_high(tmp_path, monkeypatch, clear_invalid_recycle_env_warnings):
+    _clear_recycle_env(monkeypatch)
+    scope_dir = tmp_path / "zero-memory-high"
+    scope_dir.mkdir()
+    (scope_dir / "memory.current").write_text("90")
+    (scope_dir / "memory.high").write_text("0")
+
+    assert _should_recycle(str(scope_dir), time.monotonic(), 0) is False

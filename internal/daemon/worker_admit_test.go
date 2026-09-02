@@ -3,6 +3,8 @@ package daemon
 import (
 	"encoding/json"
 	"net"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -73,6 +75,55 @@ func TestValidateWorkerAdmitArgsRejectsBelowMinimumEstimatedBytes(t *testing.T) 
 	request, err := validateWorkerAdmitArgs(args)
 	if err != nil || request.estimatedBytes != workerAdmitEstimatedBytesMin {
 		t.Fatalf("request=%+v err=%v, want exact 1 MiB boundary accepted", request, err)
+	}
+}
+
+func TestValidateWorkerAdmitArgsParsesAllFields(t *testing.T) {
+	args := map[string]any{
+		"job_id": "job-123", "outer_scope": "/outer/scope", "signature": "suite:abc123",
+		"estimated_bytes": int64(4 * workerAdmitEstimatedBytesMin), "max_wait_ms": int64(1234),
+	}
+	request, err := validateWorkerAdmitArgs(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.jobID != "job-123" || request.outerScope != "/outer/scope" || request.signature != "suite:abc123" || request.estimatedBytes != 4*workerAdmitEstimatedBytesMin || request.maxWaitMS != 1234 {
+		t.Fatalf("request=%+v, want every valid wire field preserved", request)
+	}
+}
+
+func TestValidateWorkerAdmitArgsRejectsInvalidRequiredFields(t *testing.T) {
+	base := map[string]any{
+		"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": workerAdmitEstimatedBytesMin, "max_wait_ms": int64(0),
+	}
+	for _, test := range []struct {
+		name      string
+		change    func(map[string]any)
+		wantField string
+	}{
+		{name: "missing job ID", change: func(args map[string]any) { delete(args, "job_id") }, wantField: "job_id"},
+		{name: "missing outer scope", change: func(args map[string]any) { delete(args, "outer_scope") }, wantField: "outer_scope"},
+		{name: "missing estimated bytes", change: func(args map[string]any) { delete(args, "estimated_bytes") }, wantField: "estimated_bytes"},
+		{name: "non-string job ID", change: func(args map[string]any) { args["job_id"] = float64(1) }, wantField: "job_id"},
+		{name: "non-string outer scope", change: func(args map[string]any) { args["outer_scope"] = int64(1) }, wantField: "outer_scope"},
+		{name: "zero estimated bytes", change: func(args map[string]any) { args["estimated_bytes"] = int64(0) }, wantField: "estimated_bytes"},
+		{name: "negative estimated bytes", change: func(args map[string]any) { args["estimated_bytes"] = int64(-1) }, wantField: "estimated_bytes"},
+		{name: "estimated bytes above maximum", change: func(args map[string]any) { args["estimated_bytes"] = admitMaxReserve + 1 }, wantField: "estimated_bytes"},
+		// 1e30 is intentionally far beyond math.MaxInt64: rejection proves
+		// the float64 wire value cannot silently wrap or truncate into a
+		// plausible small reserve before the upper-bound check sees it.
+		{name: "overflowing estimated bytes float", change: func(args map[string]any) { args["estimated_bytes"] = 1e30 }, wantField: "estimated_bytes"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			args := make(map[string]any, len(base))
+			for key, value := range base {
+				args[key] = value
+			}
+			test.change(args)
+			if _, err := validateWorkerAdmitArgs(args); err == nil || !strings.Contains(err.Error(), test.wantField) {
+				t.Fatalf("args=%v err=%v, want rejection mentioning %q", args, err, test.wantField)
+			}
+		})
 	}
 }
 
@@ -385,6 +436,62 @@ func TestWorkerAdmitConnectionGrantsThenHoldsUntilPeerCloses(t *testing.T) {
 	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 4 * workerAdmitEstimatedBytesMin, maxWaitMS: 0})
 	if response.State != "granted" {
 		t.Fatalf("post-release admission unexpectedly broken: %+v", response)
+	}
+}
+
+func TestWorkerAdmitConnectionPollLoopReEvaluatesAndGrantsBeforeDeadline(t *testing.T) {
+	server := NewServer(Paths{})
+	const outerScope = "/outer"
+	var liveUsage int64 = 2 * workerAdmitEstimatedBytesMin
+	server.admitReadMemory = func(path string) (int64, int64, int64, bool, string) {
+		if path == outerScope {
+			return atomic.LoadInt64(&liveUsage), 2 * workerAdmitEstimatedBytesMin, 0, true, ""
+		}
+		if path == runner.WorkerScopeChildPath(outerScope, "supervisor") {
+			return 0, 2 * workerAdmitEstimatedBytesMin, 0, true, ""
+		}
+		return 0, 2 * workerAdmitEstimatedBytesMin, 0, true, ""
+	}
+	server.workerAdmitHeadroom = 0
+	server.workerAdmitPollInterval = 5 * time.Millisecond
+
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer serverConn.Close()
+		server.workerAdmitConnection(serverConn, map[string]any{
+			"job_id": "job-1", "outer_scope": outerScope, "estimated_bytes": float64(workerAdmitEstimatedBytesMin), "max_wait_ms": float64(2000),
+		})
+	}()
+
+	// Keep the fixture saturated across several real poll intervals. A
+	// connection that cached only its first denial would remain stuck even
+	// after the atomically published live-usage change below.
+	time.Sleep(30 * time.Millisecond)
+	atomic.StoreInt64(&liveUsage, 0)
+
+	frameReady := make(chan error, 1)
+	var frame ResponseFrame
+	go func() { frameReady <- readFrame(clientConn, &frame) }()
+	select {
+	case err := <-frameReady:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker-admit connection did not grant after live usage cleared")
+	}
+	var response WorkerAdmitResponse
+	if err := json.Unmarshal(frame.Data, &response); err != nil || response.State != "granted" {
+		t.Fatalf("frame=%+v err=%v", frame, err)
+	}
+	_ = clientConn.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("connection did not release after peer close")
 	}
 }
 

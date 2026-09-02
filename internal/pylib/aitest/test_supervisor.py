@@ -1,4 +1,5 @@
 import os
+import subprocess
 import time
 
 import aitest.supervisor as supervisor_module
@@ -297,6 +298,18 @@ sys.stdin.buffer.read()
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
     monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", "1")
 
+    timed_out_waits = []
+    original_wait = subprocess.Popen.wait
+
+    def observe_wait(process, *args, **kwargs):
+        try:
+            return original_wait(process, *args, **kwargs)
+        except subprocess.TimeoutExpired:
+            timed_out_waits.append(process.args)
+            raise
+
+    monkeypatch.setattr(subprocess.Popen, "wait", observe_wait)
+
     items = pytester.getitems("""
         def test_one():
             assert True
@@ -312,17 +325,14 @@ sys.stdin.buffer.read()
     """)
     supervisor = Supervisor()
     supervisor.collect(items)
-
-    started = time.monotonic()
     results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=2)
-    elapsed = time.monotonic() - started
 
     assert len(results) == 4
     assert all(outcome == "passed" for outcome in results.values())
-    # A hang on the fd-inheritance bug would show up as admit_process.wait's
-    # own 5-second timeout firing at least once across the four
-    # retirements; a healthy run completes in a small fraction of that.
-    assert elapsed < 4.0, "run() took %.1fs -- looks like a retirement hang (fd-inheritance bug)" % elapsed
+    # _retire_worker deliberately swallows a TimeoutExpired from this
+    # best-effort wait, so observe that actual event directly instead of
+    # inferring it from a wall-clock completion bound on a loaded host.
+    assert timed_out_waits == [], "retirement timed out waiting for admit relay(s): %r" % timed_out_waits
 
 
 def test_spawn_worker_child_closes_its_admit_stderr_fd(tmp_path, monkeypatch):
@@ -456,6 +466,61 @@ sys.stdin.buffer.read()
 
     assert results[nodeid] == "unevaluated"
     assert supervisor.attempts[nodeid] == 2
+
+
+def test_crash_on_one_worker_does_not_corrupt_sibling_worker_results(tmp_path, monkeypatch, pytester):
+    """A worker crash is expected containment machinery, but handling its
+    EOF/requeue path must touch only that worker's in-flight nodeid: a live
+    sibling can be reporting ordinary results at the same time, and those
+    results must never be lost, duplicated, or relabelled unevaluated.
+    Two workers and three non-crashing items make the single-worker crash
+    test above insufficient for this regression."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+import sys
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+sys.exit(0)
+""")
+    admit = _write_stub(tmp_path / "worker-admit", f"""
+import os, sys
+scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+os.makedirs(scope, exist_ok=True)
+print("granted scope=%s worker_id=%d memory_max=104857600 memory_high=83886080" % (scope, os.getpid()))
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+
+    items = pytester.getitems("""
+        import os
+
+        def test_crashes():
+            os._exit(137)
+
+        def test_one():
+            assert True
+
+        def test_two():
+            assert True
+
+        def test_three():
+            assert True
+    """)
+    by_name = {item.name: item for item in items}
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=2)
+
+    crashed = by_name["test_crashes"].nodeid
+    assert results[crashed] == "unevaluated"
+    assert supervisor.attempts[crashed] == 2
+    for name in ("test_one", "test_two", "test_three"):
+        assert results[by_name[name].nodeid] == "passed"
+    assert len(results) == 4
+    assert list(results.values()).count("passed") == 3
+    assert list(results.values()).count("unevaluated") == 1
 
 
 def test_drain_worker_handles_eof_arriving_with_final_result_in_one_pass():
