@@ -604,6 +604,25 @@ git commit -m "feat(aitest): add aira aitest-bootstrap CLI verb"
 
 This ledger is deliberately simpler than `admit.go`'s `sliceQueue`: one job's own worker pool has no cross-job fairness question, so a mutex-guarded map plus the caller polling (Task 5) is the whole mechanism — no waiter channels, no evaluator goroutine.
 
+**Post-implementation drift note (AIRA-37/AIRA-38):** the Step 3 code below
+reflects the mid-Slice-1 state — live-usage-only admission, right after the
+"stop double-summing per-worker grants" correction — not the final shipped
+`internal/daemon/worker_admit.go`. Two later build-review rounds added, on
+top of what is shown here: a worst-case aggregate guard (Σ already-granted
+worker `memory.max` plus the supervisor scope's own live `memory.current`,
+checked in ADDITION to, not instead of, the live-usage check — a live
+reading alone is silent on what happens if every sibling worker grows to
+its own cap simultaneously); a reclaimable-file-cache discount on both the
+outer and supervisor reads, matching `checkedAvailable`'s own arithmetic;
+an `estimated_bytes` floor (`workerAdmitEstimatedBytesMin`, not just `> 0`)
+so a sub-page estimate can never floor a granted `memory.max` to zero
+pages; `max_wait_ms` clamped to `admitWaitCapMs` rather than rejected when
+out of range; and `workerJobFor` returning `(*workerJobState, bool)` so a
+second `job_id` targeting an already-owned `outer_scope` is denied rather
+than silently sharing that scope's ledger. Treat the actual `.go` file as
+authoritative for current behavior; this step's code is kept as the
+historical TDD record of how Task 4 was originally built.
+
 - [ ] **Step 1: Write the failing test**
 
 ```go
@@ -2795,6 +2814,18 @@ proves (not just documents) the actual behavior.
 declaring it elsewhere), needed to get real, in-process pytest `Item` objects
 for `run_one`'s test without a subprocess.
 
+**Post-implementation drift note (AIRA-38):** the `_OutcomeCollector._RANK`
+table shown in Step 3 below — `{"passed": 0, "skipped": 1, "failed": 2}` —
+predates a build-review fix: the shipped table in
+`internal/pylib/aitest/worker.py` adds `"error": 3`, and
+`pytest_runtest_logreport` reclassifies a `setup`/`teardown`-phase
+`"failed"` report as `"error"`, matching pytest's own terminal-reporter
+convention (a failure in the test call itself stays `"failed"`; a fixture
+setup/teardown failure is an `"error"`). `run_one` genuinely returns
+`"error"` in the shipped code — the three places in this plan and the spec
+that document that contract are correct about the eventual behavior, just
+not about what Step 3 below implements on its own.
+
 - [ ] **Step 1: Write the failing tests**
 
 `internal/pylib/aitest/conftest.py`:
@@ -3662,6 +3693,19 @@ git commit -m "feat(aitest): add time/count/watermark worker recycle conditions"
 - Produces: `Supervisor._handle_worker_exit(pid, state)` (module-private).
 - Consumes: `Supervisor.requeue_once` (Task 11), `Supervisor._replace_worker`
   (Task 14).
+
+**Post-implementation drift note (build-review, AIRA-38):**
+`_handle_worker_exit` itself is unchanged from Step 3 below — the drift is
+in what it calls at the end. `_replace_worker` (Task 14, extended by Task
+16) originally fell back to spawning an unconfined worker immediately on
+ANY denial when `self.workers` was already empty; build-review found this
+could end a run early on a merely-contended-but-reachable daemon at the
+exact moment the last worker retires. The shipped `_replace_worker` calls
+a shared `_wait_for_admission_or_disable` helper in that case instead — it
+waits out admission indefinitely (mirroring `run()`'s own startup wait,
+Task 16), and only actually disables the daemon (falling through to
+fallback spawning) on a genuine `WorkerAdmitUnavailable`. See
+`internal/pylib/aitest/supervisor.py`.
 
 - [ ] **Step 1: Write the failing test**
 

@@ -137,7 +137,7 @@ patching xdist internals it wasn't designed to expose, on a dependency whose
 release cadence we don't control. Rejected as the same retrofitting problem
 this spec exists to get away from.
 
-### 3.3 Admission model — nested scopes, live occupancy, not held estimates
+### 3.3 Admission model — nested scopes, live occupancy plus a worst-case aggregate guard
 
 Two cgroup levels:
 
@@ -151,11 +151,36 @@ Two cgroup levels:
   under the outer scope. This is the genuinely new piece, and it should adopt
   AIRA-29's chosen mechanisms rather than reinvent them, at worker instead of
   whole-job granularity:
-  - Admission for a *new* worker is decided against **live `memory.current`
-    summed across that job's already-granted worker scopes**, re-evaluated
-    each daemon tick — not a static peak held for the run's lifetime. This is
-    what actually fixes the utilisation problem (AIRA-29's own numbers:
-    33.6G reserved vs 2.6G used for one job).
+  - Admission for a *new* worker is decided primarily against the OUTER
+    scope's own **live `memory.current`** — a single read, not a sum of
+    individually-read worker scopes: cgroup memory accounting is
+    hierarchical, so that one number already includes the supervisor's own
+    RSS plus every already-placed worker's, and re-summing the children
+    separately would be both redundant with that accounting and unsafe
+    (it can under-count relative to what the kernel's own
+    `memory.oom.group` actually acts on). Re-evaluated each daemon tick —
+    not a static peak held for the run's lifetime. This is what actually
+    fixes the utilisation problem (AIRA-29's own numbers: 33.6G reserved
+    vs 2.6G used for one job).
+  - **Amended past the original design (build-review, Slice 1):** a
+    live-usage-only admission is silent on the *sum of already-granted
+    caps* — it can pack workers up to the ceiling while every one of them
+    still has headroom left to grow toward its own `memory.max`, so if
+    they all grew simultaneously the outer scope could still be pushed
+    over its cap and trip its own `memory.oom.group`, killing the whole
+    run (supervisor plus every sibling worker) — exactly the incident
+    class this design exists to prevent (Goal 2), and the same
+    aggregate-not-bound failure class AIRA-27/28/29 already fixed at
+    whole-job granularity, found here at worker granularity instead. A
+    second, worst-case guard therefore runs on top of — not instead of —
+    the live-usage check: Σ(already-granted worker `memory.max`) plus the
+    supervisor scope's own live `memory.current` must still fit under the
+    ceiling before a new grant is issued. This trades a little
+    utilisation (a live-usage-only check would admit a worker whose
+    siblings simply haven't grown to their peaks yet) for that hard
+    guarantee. Both checks are re-evaluated every poll tick, so a sibling
+    worker retiring (freeing its committed cap) or shrinking (freeing live
+    usage) can unblock a grant that either check alone was blocking.
   - Each worker scope gets both a `memory.high` (soft throttle, set below its
     cap) and `memory.max` (hard containment) — AIRA-29 v2's
     "`memory.high = effectiveCharge`, `memory.max` = self-OOM cap" split,
@@ -308,10 +333,14 @@ runner could speak it without a protocol change.
 - Recycle checks fire only at test boundaries; a running test is never
   interrupted.
 - Per-worker `memory.max` is always ≤ the outer scope's own cap, and new
-  worker grants are evaluated against live summed occupancy, not a
-  once-computed static split — a job that isn't using its granted headroom
+  worker grants are evaluated against BOTH the outer scope's live occupancy
+  AND a worst-case guard on Σ(already-granted worker caps) plus the
+  supervisor's own live usage (§3.3, amended past the original
+  once-computed-static-split framing by build-review) — never a
+  once-computed static split. A job that isn't using its granted headroom
   yields it to sibling worker grants within the same tick cadence AIRA-29
-  establishes for the outer ledger.
+  establishes for the outer ledger, but a grant that would push the WORST
+  case over the ceiling is refused even while live usage still has room.
 
 ## 5. Staging
 
