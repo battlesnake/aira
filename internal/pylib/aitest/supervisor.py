@@ -240,13 +240,20 @@ class Supervisor:
             )
         except OSError as exc:
             raise WorkerAdmitUnavailable(str(exc))
-        line = process.stdout.readline().decode("utf-8", "strict").strip()
+        # "replace", not "strict" (Sol build-review, AIRA-38 review wave): a
+        # corrupted/truncated write or a stray binary byte from a
+        # misbehaving relay build must degrade to a malformed, unrecognized
+        # line (falling through to WorkerAdmitUnavailable below, the
+        # documented "malformed response" treatment) rather than raise an
+        # uncaught UnicodeDecodeError that crashes the whole pytest process.
+        line = process.stdout.readline().decode("utf-8", "replace").strip()
         if not line.startswith("granted "):
             stderr = process.stderr.read().decode("utf-8", "replace") if process.stderr else ""
             try:
                 process.wait(timeout=5)
             except Exception:
                 process.kill()
+                process.wait()  # reap immediately rather than leave a zombie
             message = line or stderr or "worker-admit exited without a grant"
             # RequestWorkerAdmit (Task 8) wraps a daemon-reachable-but-
             # declined response as "worker-admit <state>: <reason>" on
@@ -264,6 +271,19 @@ class Supervisor:
             # an otherwise-live daemon must not permanently strip
             # containment for the rest of the run, so this is classified
             # exactly like a plain denial: retriable, not terminal.
+            # "worker-admit local-placement-failed" (AIRA-38, Sol build-
+            # review): runWorkerAdmitCommand prints this specific marker
+            # when the DAEMON already granted admission (reachable,
+            # healthy) but the LOCAL cgroup scope creation then failed --
+            # distinct from every state above, which all describe the
+            # daemon's own admission verdict. Classified as
+            # WorkerPlacementFailed (same fallback behavior as
+            # WorkerAdmitUnavailable downstream, per _replace_worker's own
+            # docstring) rather than the generic unavailable bucket, so a
+            # future reader of this diagnostic is not misled into
+            # suspecting the daemon itself.
+            if "worker-admit local-placement-failed" in message:
+                raise WorkerPlacementFailed(message)
             if "reject:exceeds-ceiling" in message:
                 raise WorkerAdmitRequestTooLarge(message)
             if "worker-admit denied" in message or "worker-admit timeout" in message or "worker-admit unevaluated" in message:
@@ -295,11 +315,24 @@ class Supervisor:
             # daemon-backed admission. Release it exactly as for every
             # other non-usable response, rather than leaving its lease and
             # pipes around until the supervisor later falls back.
+            #
+            # stdin MUST close BEFORE the blocking stderr read below (Sol
+            # build-review, AIRA-38 review wave): per runWorkerAdmitCommand's
+            # own confirmed contract, once "granted" is printed the CLI
+            # relay blocks on ITS OWN stdin reaching EOF before it exits
+            # (or writes anything further to stderr) -- reading stderr
+            # first deadlocks unconditionally against a process that will
+            # never close its own stderr until stdin closes.
+            try:
+                process.stdin.close()
+            except BrokenPipeError:
+                pass
             stderr = process.stderr.read().decode("utf-8", "replace") if process.stderr else ""
             try:
                 process.wait(timeout=5)
             except Exception:
                 process.kill()
+                process.wait()  # reap immediately rather than leave a zombie
             raise WorkerAdmitUnavailable("worker-admit malformed grant: %s" % malformed)
         return grant, process
 
@@ -470,7 +503,27 @@ class Supervisor:
         unguarded BrokenPipeError straight out of run(), crashing the
         whole suite and losing every remaining result. list(...) snapshots
         self.workers since _handle_worker_exit (via _retire_worker) can
-        mutate it mid-iteration."""
+        mutate it mid-iteration.
+
+        CORRECTED AGAIN (Sol build-review, AIRA-38 review wave): the
+        BrokenPipeError branch's _handle_worker_exit call can itself add a
+        FRESH replacement worker to self.workers (via _replace_worker) --
+        but that new worker is invisible to the `list(...)` snapshot this
+        pass already took, so it never gets a nodeid dispatched to it here.
+        If it is the only live worker left (--aitest-workers=1, or simply
+        the last one standing), nothing will ever make its result_fd ready
+        in run()'s select() loop, since it has nothing in flight to report
+        -- the run hangs forever with queue work still pending, since
+        run()'s own select-timeout branch never re-calls this method on
+        its own (it only re-dispatches after an actual drain). Re-invoke
+        once more whenever this pass added a worker that this same pass's
+        snapshot could not see, so a same-pass replacement gets its first
+        nodeid immediately rather than waiting on an event that may never
+        arrive. Bounded: each further BrokenPipeError requires an actual
+        subprocess round-trip through _replace_worker/spawn_worker before
+        recursing again, and requeue_once caps any one nodeid at two
+        attempts."""
+        before = set(self.workers)
         for pid, state in list(self.workers.items()):
             if state["in_flight"] is not None:
                 continue
@@ -487,6 +540,8 @@ class Supervisor:
                 # requeue-once/unevaluated bookkeeping applies exactly as
                 # it does for a worker that dies mid-test.
                 self._handle_worker_exit(pid, state)
+        if set(self.workers) - before:
+            self._dispatch_to_idle_workers()
 
     def _retire_worker(self, pid, state):
         try:

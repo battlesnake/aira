@@ -1,5 +1,6 @@
 import os
 import subprocess
+import threading
 import time
 
 import aitest.supervisor as supervisor_module
@@ -190,6 +191,32 @@ sys.exit(1)
         pass
 
 
+def test_acquire_worker_raises_placement_failed_on_local_scope_creation_failure(tmp_path, monkeypatch):
+    # runWorkerAdmitCommand prints "worker-admit local-placement-failed"
+    # (AIRA-38, Sol build-review) when the DAEMON already granted
+    # admission (reachable, healthy) but the LOCAL cgroup scope creation
+    # then failed -- e.g. a transient EBUSY/ENOENT/cgroupfs hiccup. Before
+    # this classification existed, the raw CreateWorkerScope error matched
+    # none of the recognized substrings and was misclassified as total
+    # daemon unavailability, permanently disabling containment for the
+    # rest of the run over a one-off local hiccup.
+    stub = _write_stub(tmp_path / "worker-admit-local-placement-failed", """
+import sys
+sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit local-placement-failed: aitest worker scope: create: mkdir /outer/.aira-worker-1: device or resource busy\\n")
+sys.exit(1)
+""")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    try:
+        supervisor.acquire_worker(100)
+        assert False, "expected WorkerPlacementFailed"
+    except WorkerPlacementFailed as exc:
+        assert "local-placement-failed" in str(exc)
+    except WorkerAdmitUnavailable:
+        assert False, "a local placement failure after a genuine grant must not be conflated with daemon unavailability"
+
+
 def test_acquire_worker_releases_malformed_grant_missing_required_field(tmp_path, monkeypatch):
     pid_path = tmp_path / "malformed-grant-pid"
     stub = _write_stub(tmp_path / "worker-admit-missing-memory-high", f"""
@@ -231,6 +258,45 @@ sys.exit(0)
         assert "notanumber" in str(exc)
 
     assert not os.path.exists("/proc/%s" % pid_path.read_text()), "malformed grant relay must be reaped"
+
+
+def test_acquire_worker_malformed_grant_does_not_deadlock_on_a_relay_holding_stdin_open(tmp_path, monkeypatch):
+    """Regression test for a real DEADLOCK (Sol build-review, AIRA-38
+    review wave): acquire_worker's malformed-grant cleanup path used to
+    read process.stderr to EOF BEFORE ever closing process.stdin. Per
+    runWorkerAdmitCommand's own confirmed contract (cmd/aira/main.go),
+    once "granted" is printed the REAL relay blocks on its OWN stdin
+    reaching EOF before it exits or writes anything further to stderr --
+    unlike the sibling test above, whose stub calls sys.exit(0) right
+    after printing (never reproducing this). This stub instead blocks on
+    stdin exactly like the real CLI does, writing nothing further to
+    stderr -- reading stderr first here deadlocks unconditionally. Run
+    acquire_worker in a background thread with a bounded join so a
+    regression hangs only this ONE test, never the whole suite."""
+    stub = _write_stub(tmp_path / "worker-admit-malformed-grant-holds-stdin", """
+import sys
+print("granted scope=/outer/.aira-worker-1 worker_id=1 memory_max=notanumber memory_high=320")
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+
+    outcome = {}
+
+    def call():
+        try:
+            supervisor.acquire_worker(400)
+        except BaseException as exc:
+            outcome["exc"] = exc
+
+    thread = threading.Thread(target=call, daemon=True)
+    thread.start()
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "acquire_worker deadlocked on the malformed-grant cleanup path"
+    assert isinstance(outcome.get("exc"), WorkerAdmitUnavailable), outcome.get("exc")
+    assert "memory_max" in str(outcome["exc"])
 
 
 def test_next_nodeid_and_requeue_once_semantics():
@@ -656,6 +722,70 @@ def test_drain_worker_marks_real_nodeid_unevaluated_on_second_wrong_result(monke
     os.close(dispatch_read)
 
 
+def test_dispatch_to_idle_workers_dispatches_to_a_same_pass_replacement(monkeypatch):
+    """Regression test for a real HANG (Sol build-review, AIRA-38 review
+    wave), distinct from the "worker that died since last drain" test
+    below: that test deliberately stubs _replace_worker to a no-op
+    specifically to isolate crash-detection from replacement, which meant
+    nothing ever exercised what happens to a replacement worker spawned
+    DURING this same _dispatch_to_idle_workers pass. A worker's write pipe
+    breaking here triggers _handle_worker_exit -> _replace_worker ->
+    spawn_worker, adding a fresh worker to self.workers AFTER this same
+    call's list(...) snapshot was already taken -- without the fix, that
+    replacement never gets a nodeid THIS pass, and if it is the only
+    worker left, nothing else will ever make run()'s select() loop
+    re-invoke this method: the run hangs forever with queue work still
+    pending. spawn_worker (not _replace_worker) is mocked here -- the
+    narrowest boundary that lets _retire_worker/_handle_worker_exit/
+    _replace_worker's REAL requeue-once logic run, without a real
+    subprocess/fork."""
+    dead_dispatch_read, dead_dispatch_write = os.pipe()
+    os.close(dead_dispatch_read)  # the worker (and its read end) is already gone
+    dead_result_read, dead_result_write = os.pipe()
+    os.set_blocking(dead_result_read, False)
+
+    replacement_dispatch_read, replacement_dispatch_write = os.pipe()
+    os.set_blocking(replacement_dispatch_read, False)
+    replacement_result_read, replacement_result_write = os.pipe()
+
+    supervisor = Supervisor()
+    supervisor.queue = ["pkg/test_mod.py::test_x"]
+    dead_pid = 999997
+    supervisor.workers[dead_pid] = {
+        "result_fd": dead_result_read, "read_buffer": b"", "result_eof": False,
+        "in_flight": None,
+        "dispatch_write": os.fdopen(dead_dispatch_write, "w"),
+        "admit_process": None, "grant": None,
+    }
+    replacement_pid = 999998
+
+    def fake_spawn_worker(estimated_bytes, max_wait="30s"):
+        supervisor.workers[replacement_pid] = {
+            "result_fd": replacement_result_read, "read_buffer": b"", "result_eof": False,
+            "in_flight": None,
+            "dispatch_write": os.fdopen(replacement_dispatch_write, "w"),
+            "admit_process": None, "grant": None,
+        }
+        return replacement_pid
+
+    monkeypatch.setattr(supervisor, "spawn_worker", fake_spawn_worker)
+
+    supervisor._dispatch_to_idle_workers()  # must not hang or raise
+
+    assert dead_pid not in supervisor.workers, "dead worker must be retired, not left registered"
+    assert replacement_pid in supervisor.workers, "spawn_worker's replacement must be registered"
+    assert supervisor.workers[replacement_pid]["in_flight"] == "pkg/test_mod.py::test_x", (
+        "the requeued nodeid must reach the SAME-PASS replacement worker, not sit stranded in the queue"
+    )
+    assert supervisor.attempts["pkg/test_mod.py::test_x"] == 2, "one dispatch to the dead worker, one to its replacement"
+    dispatched = os.read(replacement_dispatch_read, 4096)
+    assert dispatched == b"pkg/test_mod.py::test_x\n", "the replacement's own pipe must carry the nodeid, not just in_flight bookkeeping"
+    os.close(dead_result_write)
+    os.close(replacement_dispatch_read)
+    os.close(replacement_result_read)
+    os.close(replacement_result_write)
+
+
 def test_dispatch_to_idle_workers_handles_worker_that_died_since_last_drain(monkeypatch):
     """Regression test for a real bug a second review round found: a
     worker that reports its result (marked idle by _drain_worker) can
@@ -872,6 +1002,71 @@ sys.stdin.buffer.read()
     # unrelated to whether admission fell back to unconfined workers.
     stderr = capsys.readouterr().err
     assert "falling back to" not in stderr and "UNCONFINED" not in stderr, stderr
+
+
+def test_request_too_large_at_last_worker_replacement_marks_queue_unevaluated(tmp_path, monkeypatch, pytester, capsys):
+    """Regression test for an untested code path (Sol build-review,
+    AIRA-38 review wave): _replace_worker's OWN try/except around
+    _wait_for_admission_or_disable -- reached only when this is the LAST
+    worker, its replacement is denied a few times, and THEN the daemon
+    returns a permanent reject:exceeds-ceiling -- is distinct from both
+    (a) the simpler top-level path in run()'s own startup loop (covered
+    by the sibling test below, whose very first spawn_worker call raises
+    WorkerAdmitRequestTooLarge directly) and (b) the transient-denial-
+    then-eventual-grant path (test_persistent_denial_at_last_worker_
+    retirement_never_ends_run_early, above). _wait_for_admission_or_
+    disable's own try/except does not catch WorkerAdmitRequestTooLarge at
+    all, so it must propagate through THIS nested try/except -- exactly
+    the path no other test drives. One worker completes and recycles
+    normally first, so its replacement attempt is a genuine "last worker
+    retiring" case, not the startup path."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+import sys
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+sys.exit(0)
+""")
+    call_state = tmp_path / "admit-calls"
+    call_state.write_text("0")
+    admit = _write_stub(tmp_path / "worker-admit", f"""
+import os, sys
+state_path = {str(call_state)!r}
+count = int(open(state_path).read())
+open(state_path, "w").write(str(count + 1))
+if count == 0:
+    scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+    os.makedirs(scope, exist_ok=True)
+    print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+    sys.stdout.flush()
+    sys.stdin.buffer.read()
+elif count == 1:
+    sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit denied: fallback:insufficient-headroom\\n")
+    sys.exit(1)
+else:
+    sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit denied: reject:exceeds-ceiling\\n")
+    sys.exit(1)
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", "1")  # force recycle after test_one
+
+    items = pytester.getitems("""
+        def test_one():
+            assert True
+
+        def test_two():
+            assert True
+    """)
+    by_name = {item.name: item for item in items}
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+
+    assert results[by_name["test_one"].nodeid] == "passed"
+    assert results[by_name["test_two"].nodeid] == "unevaluated"
+    assert supervisor.daemon_available is True, "a permanent sizing rejection is not daemon unavailability"
+    assert "falling back to" not in capsys.readouterr().err
 
 
 def test_worker_admit_request_too_large_marks_queue_unevaluated_without_disabling_daemon(tmp_path, monkeypatch, pytester, capsys):
