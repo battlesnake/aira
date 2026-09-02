@@ -126,6 +126,33 @@ sys.exit(1)
         assert "reject:exceeds-ceiling" in str(exc)
 
 
+def test_acquire_worker_raises_request_too_large_on_reject_outer_scope_owned_by_another_job(tmp_path, monkeypatch):
+    """Regression test for a real bug (Fable re-gate): the daemon's own
+    poll loop (workerAdmitConnection) deliberately breaks immediately on
+    EVERY "denied" reason with the "reject:" prefix as a stable "never
+    going to resolve" fact -- not just reject:exceeds-ceiling, which was
+    the only one the classifier previously recognized. workerJobFor's
+    outer-scope ownership binding is permanent by its own documented
+    design (never released once claimed), so this rejection was retried
+    INDEFINITELY under a misleading "budget contended" warning instead of
+    being treated as the terminal condition it actually is."""
+    stub = _write_stub(tmp_path / "worker-admit-owned-by-another-job", """
+import sys
+sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit denied: reject:outer-scope-owned-by-another-job\\n")
+sys.exit(1)
+""")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    try:
+        supervisor.acquire_worker(100)
+        assert False, "expected WorkerAdmitRequestTooLarge"
+    except WorkerAdmitRequestTooLarge as exc:
+        assert "reject:outer-scope-owned-by-another-job" in str(exc)
+    except WorkerAdmitDenied:
+        assert False, "a permanent ownership rejection retried forever is a real hang, not a transient denial"
+
+
 def test_acquire_worker_raises_request_too_large_on_cli_argument_invalid(tmp_path, monkeypatch):
     """Regression test for a real bug (Fable build-review, final gate): the
     CLI's own pre-dial E_CONFINE_ARGUMENT_INVALID rejection (e.g. the
@@ -196,6 +223,39 @@ sys.exit(1)
         assert False, "expected WorkerAdmitDenied"
     except WorkerAdmitDenied as exc:
         assert "unevaluated" in str(exc)
+
+
+def test_acquire_worker_raises_unavailable_not_denied_on_unbounded_outer_scope(tmp_path, monkeypatch):
+    """Regression test for a real deterministic HANG (Fable re-gate): an
+    "unevaluated: unbounded" response means the OUTER scope's own
+    memory.max read came back "unbounded" -- a structural fact (a
+    genuine confine-launched outer scope always has a finite memory.max
+    from the moment it's queryable), not a transient read glitch like
+    the generic unevaluated case above. Found live: a SECOND
+    aitest-enabled pytest invocation inside one --delegate-ram confine
+    job can discover a PRIOR run's own uncapped .aira-supervisor scope
+    as its "outer" (that prior run's controlling process was itself
+    drained into it during its own bootstrap). Classifying this as
+    WorkerAdmitDenied (like the sibling test above) retries INDEFINITELY
+    against a scope that will never become capped -- a genuine hang, not
+    a slow-but-eventually-successful wait. Must be WorkerAdmitUnavailable
+    instead: the run still ends up hierarchically bounded by the REAL
+    outer confine job's own cap either way, so falling back is safe."""
+    stub = _write_stub(tmp_path / "worker-admit-unbounded", """
+import sys
+sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit unevaluated: unbounded\\n")
+sys.exit(1)
+""")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    try:
+        supervisor.acquire_worker(100)
+        assert False, "expected WorkerAdmitUnavailable"
+    except WorkerAdmitUnavailable as exc:
+        assert "unbounded" in str(exc)
+    except WorkerAdmitDenied:
+        assert False, "an unbounded outer scope is structural, not transient -- retrying it forever is a real hang"
 
 
 def test_acquire_worker_raises_unavailable_on_genuine_connection_failure(tmp_path, monkeypatch):

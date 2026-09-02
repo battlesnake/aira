@@ -103,6 +103,8 @@ def _resolve_worker_count(workers_option):
 _ESTIMATED_BYTES_MIN = 1 << 20  # must match the daemon's own
 # workerAdmitEstimatedBytesMin (internal/daemon/worker_admit.go) and the
 # CLI's mirrored client-side floor (runWorkerAdmitCommand, cmd/aira/main.go)
+_ESTIMATED_BYTES_MAX = 1 << 50  # must match the daemon's own admitMaxReserve
+# (internal/daemon/admit.go) and the CLI's mirrored client-side ceiling
 
 
 def _resolve_estimated_bytes():
@@ -135,4 +137,19 @@ def _resolve_estimated_bytes():
             "minimum; using %d\n" % (value, _ESTIMATED_BYTES_MIN, _ESTIMATED_BYTES_MIN)
         )
         return _ESTIMATED_BYTES_MIN
+    if value > _ESTIMATED_BYTES_MAX:
+        # Clamp DOWN here too (Fable re-gate): the mirror-image bug of the
+        # floor case above -- an oversized value (e.g. a bytes-vs-MiB units
+        # typo the other direction) used to sail past this resolver
+        # unclamped, reach the CLI's own now-added top-end check, and if it
+        # somehow got past THAT too, hit the daemon's protocol-level
+        # rejection (E_DAEMON_PROTOCOL) -- a code the classifier does not
+        # recognize either, falling through to WorkerAdmitUnavailable and
+        # permanently stripping containment on a healthy daemon, same as
+        # the floor case.
+        sys.stderr.write(
+            "aira aitest: AIRA_AITEST_ESTIMATED_BYTES=%d is above the %d-byte "
+            "maximum; using %d\n" % (value, _ESTIMATED_BYTES_MAX, _ESTIMATED_BYTES_MAX)
+        )
+        return _ESTIMATED_BYTES_MAX
     return value

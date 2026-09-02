@@ -979,10 +979,18 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 	// none of supervisor.py's denied/timeout/unevaluated substrings --
 	// misclassified as total daemon unavailability instead of a client
 	// argument mistake (found by Sol build-review, AIRA-38 review wave).
+	// The 1<<50 (1 PiB) top end mirrors the daemon's own admitMaxReserve
+	// (internal/daemon/admit.go, unexported -- hardcoded here exactly as
+	// the floor already is, matching --memory-reserve's own precedent): an
+	// oversized value used to sail through this check and hit the daemon's
+	// protocol-level rejection (E_DAEMON_PROTOCOL) instead, which ALSO
+	// matched none of the classifier's substrings -- the identical
+	// misclassification bug at the opposite extreme (found by Fable
+	// re-gate).
 	estimatedBytes, err := runner.ParseMemorySize(options["estimated-bytes"])
-	if err != nil || estimatedBytes < 1<<20 {
+	if err != nil || estimatedBytes < 1<<20 || estimatedBytes > 1<<50 {
 		if err == nil {
-			err = errors.New("must be at least 1MiB")
+			err = errors.New("must be at least 1MiB and no larger than 1PiB")
 		}
 		_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --estimated-bytes: %v\n", err)
 		return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")

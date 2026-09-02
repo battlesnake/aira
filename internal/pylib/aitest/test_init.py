@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-from aitest import _ESTIMATED_BYTES_MIN, _resolve_estimated_bytes, _resolve_worker_count
+from aitest import _ESTIMATED_BYTES_MAX, _ESTIMATED_BYTES_MIN, _resolve_estimated_bytes, _resolve_worker_count
 
 
 def test_resolve_worker_count_accepts_auto_and_positive_integer():
@@ -62,6 +62,21 @@ def test_resolve_estimated_bytes_clamps_a_below_floor_value_up_with_a_warning(mo
     assert _resolve_estimated_bytes() == _ESTIMATED_BYTES_MIN
     stderr = capsys.readouterr().err
     assert "524288" in stderr and str(_ESTIMATED_BYTES_MIN) in stderr
+
+
+def test_resolve_estimated_bytes_clamps_an_above_ceiling_value_down_with_a_warning(monkeypatch, capsys):
+    """Regression test for a real bug (Fable re-gate): the mirror-image of
+    the floor-clamp bug above -- an unclamped too-large value (e.g. a
+    bytes-vs-MiB units typo the OTHER direction) used to sail past this
+    resolver, reach the daemon's own protocol-level rejection
+    (E_DAEMON_PROTOCOL, admitMaxReserve), and that rejection's message
+    matched none of acquire_worker's recognized substrings either --
+    misclassified as WorkerAdmitUnavailable, permanently stripping
+    containment for the WHOLE run on a plainly healthy daemon."""
+    monkeypatch.setenv("AIRA_AITEST_ESTIMATED_BYTES", str(_ESTIMATED_BYTES_MAX + 1))
+    assert _resolve_estimated_bytes() == _ESTIMATED_BYTES_MAX
+    stderr = capsys.readouterr().err
+    assert str(_ESTIMATED_BYTES_MAX + 1) in stderr and str(_ESTIMATED_BYTES_MAX) in stderr
 
 
 def test_unevaluated_outcome_produces_a_nonzero_pytest_exit_code(pytester, monkeypatch):

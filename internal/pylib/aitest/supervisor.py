@@ -289,7 +289,9 @@ class Supervisor:
             # (never "no daemon at all"). A single transient read glitch on
             # an otherwise-live daemon must not permanently strip
             # containment for the rest of the run, so this is classified
-            # exactly like a plain denial: retriable, not terminal.
+            # exactly like a plain denial: retriable, not terminal -- EXCEPT
+            # for the specific "unbounded" reason handled separately just
+            # below, which is a structural fact, not a transient glitch.
             # "worker-admit local-placement-failed" (AIRA-38, Sol build-
             # review): runWorkerAdmitCommand prints this specific marker
             # when the DAEMON already granted admission (reachable,
@@ -303,6 +305,40 @@ class Supervisor:
             # suspecting the daemon itself.
             if "worker-admit local-placement-failed" in message:
                 raise WorkerPlacementFailed(message)
+            # "worker-admit unevaluated: unbounded" (Fable re-gate) is a
+            # DIFFERENT case from the generic "unevaluated" handled below,
+            # deliberately NOT folded into it: it means the OUTER scope's
+            # own memory.max read came back "unbounded" (readSliceMemory,
+            # admit.go) -- and a genuine confine-launched outer scope is
+            # ALWAYS given a finite memory.max by the daemon as part of the
+            # SAME atomic admission grant that launches it, before it is
+            # ever queryable (AIRA-27/67). An "unbounded" outer scope is
+            # therefore not a transient read glitch retrying could fix --
+            # it is a structural sign the discovered "outer_scope" is not
+            # a real, daemon-admitted confine scope at all. Found live: a
+            # SECOND aitest-enabled pytest invocation inside one
+            # --delegate-ram confine job (e.g. `make test` running pytest
+            # twice) can discover a PRIOR run's own uncapped
+            # .aira-supervisor scope as its "outer", since that prior run's
+            # own controlling process (make, a shell) was itself drained
+            # into that scope during ITS bootstrap (drainIntoScope moves
+            # EVERY pid in outer, not just the supervisor's own pid --
+            # aitest_bootstrap_linux.go). Without this check, that
+            # structural-not-transient "unevaluated" was classified
+            # retriable, and _wait_for_admission_or_disable retried
+            # INDEFINITELY under a misleading "budget contended" warning --
+            # a genuine, deterministic hang. Classified WorkerAdmitUnavailable
+            # instead (not retriable): this run's workers still end up
+            # hierarchically bounded by the REAL outer confine job's own
+            # cap either way -- cgroup memory limits enforce down the whole
+            # tree regardless of what an uncapped descendant itself
+            # reports -- so falling back is safe, and it is strictly better
+            # than hanging forever against a scope that will never become
+            # capped. The deeper root cause (bootstrap discovering the
+            # wrong scope when nested) is a separate, tracked gap -- this
+            # is the safety net that keeps it from hanging the run.
+            if "worker-admit unevaluated" in message and "unbounded" in message:
+                raise WorkerAdmitUnavailable(message)
             # "E_CONFINE_ARGUMENT_INVALID" (Fable build-review, final
             # gate): the CLI's own pre-dial argument validation (e.g. the
             # --estimated-bytes 1MiB floor, AIRA-38) rejects BEFORE ever
@@ -314,7 +350,43 @@ class Supervisor:
             # it correctly regardless -- ANY future CLI argument
             # validation failure reaching here must never be conflated
             # with genuine daemon unavailability.
-            if "reject:exceeds-ceiling" in message or "E_CONFINE_ARGUMENT_INVALID" in message:
+            #
+            # "E_DAEMON_PROTOCOL" (Fable re-gate): the DAEMON's own
+            # protocol-level argument validation (validateWorkerAdmitArgs,
+            # worker_admit.go -- e.g. estimated_bytes above admitMaxReserve,
+            # the mirror-image case of the CLI floor above) is likewise a
+            # permanent, static fact about THIS request, discovered one
+            # hop further along but still never a reason to distrust the
+            # daemon itself. _resolve_estimated_bytes now clamps the top
+            # end too, but as with the floor, this classifies it correctly
+            # regardless of whether some future value or field slips past
+            # that clamp.
+            # "worker-admit denied: reject:*" (Fable re-gate) generalizes
+            # what used to be a single hand-picked substring
+            # ("reject:exceeds-ceiling" only) to the daemon's own designed
+            # "reject:" (permanent) vs "fallback:" (transient) reason-prefix
+            # convention (worker_admit.go's evaluateWorkerAdmit/
+            # workerAdmitConnection: EVERY "denied" reason starting
+            # "reject:" -- exceeds-ceiling, outer-scope-owned-by-another-
+            # job, and any future one -- deliberately breaks the daemon's
+            # OWN poll loop immediately as a stable "never going to
+            # resolve" fact, exactly like exceeds-ceiling; only
+            # "fallback:"-prefixed reasons keep polling). The ownership
+            # rejection was previously left out, matched only "worker-admit
+            # denied" below, and was retried INDEFINITELY against a
+            # permanently (by design -- workerJobFor's own ownership
+            # binding is never released) impossible request, under a
+            # misleading "budget contended" warning. Scoped to "worker-admit
+            # denied" specifically, NOT "worker-admit timeout": a timeout's
+            # own reason text ("reject:saturated") also contains "reject:"
+            # by coincidental wording, but state=timeout means the CLIENT's
+            # own wait budget merely expired -- genuinely retriable with a
+            # fresh request, never a stable daemon-side verdict.
+            if (
+                ("worker-admit denied" in message and "reject:" in message)
+                or "E_CONFINE_ARGUMENT_INVALID" in message
+                or "E_DAEMON_PROTOCOL" in message
+            ):
                 raise WorkerAdmitRequestTooLarge(message)
             if "worker-admit denied" in message or "worker-admit timeout" in message or "worker-admit unevaluated" in message:
                 raise WorkerAdmitDenied(message)
