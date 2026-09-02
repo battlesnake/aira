@@ -202,9 +202,18 @@ early disconnect):
 → {"verb":"worker-admit","job_id":"...","outer_scope":"<cgroup path>",
    "signature":"pytest-worker:<suite-hash>","estimated_bytes":N,
    "max_wait_ms":N}
-← {"state":"granted"|"denied"|"timeout","reason":"...","waited_ms":N,
+← {"state":"granted"|"denied"|"timeout"|"unevaluated","reason":"...","waited_ms":N,
    "scope_path":"<child cgroup path>","memory_max":N,"memory_high":N}
 ```
+
+A future client speaking this wire shape (§3.8's generalisation goal) must
+treat `unevaluated` as retriable, the same as `denied`/`timeout` — it means
+the daemon is reachable and answered, only that a live memory read could not
+be established this instant (AIRA's own "report unevaluated, never a fake
+pass" rule applied to this check), never that there is no daemon to talk to
+at all. Routing it into permanent unconfined fallback (the treatment correct
+only for genuine unreachability, §3.7) would strip containment for the rest
+of the run over what is usually a transient glitch.
 
 On `granted`, the supervisor places the forked worker into `scope_path`. This
 reuses `RunConfineSetup`'s verified-placement handshake
