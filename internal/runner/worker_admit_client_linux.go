@@ -57,9 +57,28 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) (*Wor
 	if err != nil {
 		return nil, fmt.Errorf("E_CONFINE_UNAVAILABLE: dial daemon: %w", err)
 	}
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
+	// The daemon's own poll loop is bounded by max_wait_ms and degrades to a
+	// clean "timeout" response within that budget -- but nothing protected
+	// THIS side if the daemon hung before ever writing a response: the CLI's
+	// actual ctx (runWorkerAdmitCommand's signalCtx, cmd/aira/main.go) is
+	// built from context.Background() via signal.NotifyContext, which adds
+	// cancellation on a signal but never a deadline, so `ctx.Deadline()`
+	// below was never ok and no socket deadline was ever set (found by Sol
+	// build-review). Mirror admitThroughDaemon's own transport-deadline
+	// pattern (admission_linux.go, same package): grant the daemon its full
+	// declared wait budget plus a fixed grace margin to answer even at the
+	// very edge of that budget, then bound the read regardless of what ctx
+	// itself carries -- still honoring an EARLIER caller deadline if one is
+	// present.
+	deadlineWait := req.MaxWait
+	if deadlineWait > time.Duration(mathMaxInt64)-admitTransportGrace {
+		deadlineWait = time.Duration(mathMaxInt64) - admitTransportGrace
 	}
+	transportDeadline := time.Now().Add(deadlineWait + admitTransportGrace)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(transportDeadline) {
+		transportDeadline = ctxDeadline
+	}
+	_ = conn.SetDeadline(transportDeadline)
 	frame := runnerAdmitRequestFrame{Proto: runnerDaemonProtocolVersion, Scope: map[string]any{}}
 	frame.Request.Verb = "worker-admit"
 	frame.Request.Args = map[string]any{

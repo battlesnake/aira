@@ -15,6 +15,21 @@ import (
 // memory.oom.group=1 so a runaway inside this one worker self-contains
 // (spec 3.3: per-worker hard cap, not a pool-level cap only).
 func CreateWorkerScope(ctx context.Context, outerScope, workerID string, memoryMax, memoryHigh int64) (string, error) {
+	// Enforced HERE, not in the shared writeScopeMemoryCap (confine_linux.go,
+	// used by other scope kinds too with their own semantics): spec 3.3
+	// requires memory.high be "set below its cap" for a worker scope
+	// specifically, a soft throttle before the hard memory.max cap. This
+	// currently holds only because evaluateWorkerAdmit (the sole caller) always
+	// computes memoryHigh = estimatedBytes*4/5 < memoryMax by construction --
+	// CreateWorkerScope itself had no independent check, so a future call site
+	// or daemon-side formula change producing memory_high >= memory_max would
+	// be silently accepted, defeating the soft-throttle-before-hard-cap design
+	// (found by Sol build-review, AIRA-38 review wave). memoryHigh <= 0 is
+	// still valid -- writeScopeMemoryCap already treats that as "no watermark
+	// configured, skip memory.high entirely".
+	if memoryHigh > 0 && memoryHigh >= memoryMax {
+		return "", fmt.Errorf("aitest worker scope: memory_high (%d) must be below memory_max (%d)", memoryHigh, memoryMax)
+	}
 	backend := newDefaultBackend(outerScope)
 	scope, err := backend.Create(ctx, "worker-"+workerID)
 	if err != nil {

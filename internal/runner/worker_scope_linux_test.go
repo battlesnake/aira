@@ -52,6 +52,42 @@ func TestCreateWorkerScopeWritesVerifiedMemoryCap(t *testing.T) {
 	_ = strconv.Itoa // silence unused import if trimmed during edit
 }
 
+func TestCreateWorkerScopeRejectsMemoryHighAtOrAboveMemoryMax(t *testing.T) {
+	// Spec 3.3 requires memory.high be "set below its cap" for a worker
+	// scope -- a soft throttle before the hard memory.max cap. This
+	// currently held only because evaluateWorkerAdmit (the sole real
+	// caller) always computes memoryHigh = estimatedBytes*4/5 < memoryMax
+	// by construction; CreateWorkerScope itself had no independent check
+	// (found by Sol build-review, AIRA-38 review wave). No real cgroup
+	// needed: this validation must reject before ever touching the
+	// filesystem.
+	outer := t.TempDir()
+	for _, test := range []struct {
+		name        string
+		memoryMax   int64
+		memoryHigh  int64
+		wantRejects bool
+	}{
+		{name: "high equal to max", memoryMax: 100 << 20, memoryHigh: 100 << 20, wantRejects: true},
+		{name: "high above max", memoryMax: 100 << 20, memoryHigh: 120 << 20, wantRejects: true},
+		{name: "high zero (no watermark configured) is still valid", memoryMax: 100 << 20, memoryHigh: 0, wantRejects: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := CreateWorkerScope(context.Background(), outer, "reject-"+test.name, test.memoryMax, test.memoryHigh)
+			if test.wantRejects && err == nil {
+				t.Fatalf("CreateWorkerScope unexpectedly succeeded with memory_high=%d >= memory_max=%d", test.memoryHigh, test.memoryMax)
+			}
+			// The zero-high case is expected to fail too, but for an
+			// UNRELATED reason (outer here is a plain temp dir, not a real
+			// delegated cgroup) -- only assert it does NOT fail with this
+			// specific validation's own error text.
+			if !test.wantRejects && err != nil && strings.Contains(err.Error(), "must be below") {
+				t.Fatalf("memory_high=0 (no watermark) incorrectly rejected by the high<max validation: %v", err)
+			}
+		})
+	}
+}
+
 func TestCreateWorkerScopeRemovesScopeOnMemoryCapFailure(t *testing.T) {
 	parent := cgrouptest.IsolatedScopeParent(t)
 	if err := os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"), []byte("+memory"), 0o644); err != nil {

@@ -2,6 +2,7 @@ package runner_test
 
 import (
 	"context"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -75,5 +76,55 @@ func TestRequestWorkerAdmitReturnsErrorOnDenial(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected an error for a request over budget")
+	}
+}
+
+func TestRequestWorkerAdmitBoundsWaitWhenDaemonAcceptsButNeverResponds(t *testing.T) {
+	// Regression test for a real bug (Sol build-review, AIRA-38 review
+	// wave): RequestWorkerAdmit only called conn.SetDeadline when the
+	// caller's OWN ctx had a deadline -- but the real CLI caller
+	// (runWorkerAdmitCommand, cmd/aira/main.go) builds its context from
+	// context.Background() via signal.NotifyContext, which never adds
+	// one. A daemon that accepts the connection but stalls before writing
+	// ANY response (a daemon-side hang/bug -- distinct from a normal
+	// denied/timeout the daemon's own poll loop would otherwise return,
+	// which the sibling test above already covers) used to hang this read
+	// forever regardless of --max-wait. A raw stalling listener stands in
+	// for the daemon here -- the real daemon.Server always eventually
+	// responds on its own poll loop, so it cannot reproduce a genuine
+	// server-side hang.
+	socketPath := filepath.Join(t.TempDir(), "stall.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		accepted <- conn // held open, nothing ever written -- the stall
+	}()
+
+	start := time.Now()
+	_, err = runner.RequestWorkerAdmit(context.Background(), runner.WorkerAdmitClientRequest{
+		SocketPath: socketPath, JobID: "job-1", OuterScope: "/outer", EstimatedBytes: 5 * (1 << 20), MaxWait: 200 * time.Millisecond,
+	})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected an error from a daemon that accepts a connection but never responds")
+	}
+	// Generous bound (MaxWait + the fixed transport grace + real
+	// scheduling slack) that a fix completes well inside, but an
+	// unconditional hang would never reach.
+	if elapsed > 5*time.Second {
+		t.Fatalf("RequestWorkerAdmit took %s against a 200ms MaxWait -- looks like the unbounded-read regression", elapsed)
+	}
+	select {
+	case conn := <-accepted:
+		_ = conn.Close()
+	default:
 	}
 }
