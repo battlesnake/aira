@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -199,6 +200,54 @@ func TestEvaluateWorkerAdmitDeniesWhenAggregateCapsWouldExceedCeiling(t *testing
 	third := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
 	if third.State != "granted" {
 		t.Fatalf("third (after release) =%+v", third)
+	}
+}
+
+func TestEvaluateWorkerAdmitAggregateGuardHoldsUnderConcurrentAdmission(t *testing.T) {
+	// The design spec's own test plan (section 7) requires proving
+	// "Σ(worker sub-caps) never exceeds the outer scope's cap under
+	// concurrent admission" -- every OTHER aggregate-guard test in this
+	// file (including the sequential one directly above) calls
+	// evaluateWorkerAdmit from a single goroutine, which cannot catch a
+	// regression that moves job.mu.Lock() to AFTER the committed-cap
+	// summation instead of wrapping it (found missing by Sol build-review,
+	// AIRA-38 review wave): two truly simultaneous requests could then
+	// both read committed=0 and both grant, defeating the guard exactly
+	// the way AIRA-27/28/29 already fixed at whole-job granularity.
+	server := NewServer(Paths{})
+	server.workerAdmitHeadroom = 0
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
+
+	const concurrency = 8
+	var wg sync.WaitGroup
+	var start sync.WaitGroup
+	start.Add(1)
+	responses := make([]WorkerAdmitResponse, concurrency)
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			start.Wait() // maximize actual overlap rather than a staggered start
+			responses[i] = server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
+		}(i)
+	}
+	start.Done()
+	wg.Wait()
+
+	granted := 0
+	for _, response := range responses {
+		if response.State == "granted" {
+			granted++
+		}
+	}
+	// Live usage stays at 0 throughout (the fixture never changes it), so
+	// only the aggregate committed-cap guard -- not the live-usage check --
+	// stands between "exactly one grant" and "every concurrent request
+	// granted": 700*2=1400 exceeds the 1000-byte ceiling, so a second
+	// concurrent grant would mean the guard was racy.
+	if granted != 1 {
+		t.Fatalf("granted=%d of %d concurrent 700-byte requests against a 1000-byte ceiling (Σcaps must never exceed it), want exactly 1", granted, concurrency)
 	}
 }
 

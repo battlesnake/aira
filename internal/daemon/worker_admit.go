@@ -187,6 +187,27 @@ func (s *Server) evaluateWorkerAdmit(req workerAdmitRequest) WorkerAdmitResponse
 	if !ownerOK {
 		return WorkerAdmitResponse{State: "denied", Reason: "reject:outer-scope-owned-by-another-job"}
 	}
+	// job.mu stays held across the supervisor-scope read and the
+	// committed-cap sum below (Sol build-review raised this: a concurrent
+	// second request for the SAME job/outer_scope blocks on this lock,
+	// uninterruptible and not itself deadline-aware, for as long as this
+	// one's filesystem reads take). Deliberately kept this way, not
+	// loosened: unlike evaluateAdmitQueue's directory scan (admit.go),
+	// which is lock-free only because it has exactly one caller (a
+	// dedicated single-writer evaluator goroutine), evaluateWorkerAdmit is
+	// called directly from EVERY worker-admit connection goroutine for
+	// this job — moving the read outside the lock would let two
+	// concurrent requests both read committed=0 and both grant, exactly
+	// the aggregate-guard-defeating race AIRA-27/28/29 already fixed at
+	// whole-job granularity (worker_admit_test.go pins the sequential
+	// case; a genuinely concurrent version of that same test would show
+	// this). The reads themselves are two local cgroupfs file reads
+	// (memory.current, memory.stat), not network I/O — a few microseconds
+	// under normal conditions — and the client-side transport deadline
+	// (RequestWorkerAdmit, worker_admit_client_linux.go) now independently
+	// bounds a caller's worst-case wait even if this lock is ever held
+	// unusually long, so the correctness win is kept without leaving the
+	// caller unprotected.
 	job.mu.Lock()
 	defer job.mu.Unlock()
 	if req.estimatedBytes > ceiling-used {
@@ -367,12 +388,25 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 			// "timeout").
 			break
 		}
-		if !s.admitNowTime().Before(deadline) {
+		remaining := deadline.Sub(s.admitNowTime())
+		if remaining <= 0 {
 			response = WorkerAdmitResponse{State: "timeout", Reason: "reject:saturated"}
 			break
 		}
+		// Clamp the sleep to whatever's left of the caller's own declared
+		// deadline, not the unconditional fixed poll interval (found by
+		// Sol build-review, AIRA-38 review wave): sleeping the full
+		// interval when only a fraction of it remains let waited_ms
+		// overshoot the caller's max_wait_ms by up to one poll interval
+		// before the NEXT loop iteration's evaluate ever ran -- low
+		// impact (a late grant is a strictly better outcome than a
+		// spurious timeout), but a genuine budget-precision violation.
+		sleep := poll
+		if remaining < sleep {
+			sleep = remaining
+		}
 		select {
-		case <-time.After(poll):
+		case <-time.After(sleep):
 		case <-peerCtx.Done():
 			return
 		case <-s.stopping:
