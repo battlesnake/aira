@@ -127,3 +127,70 @@ func childEnvValues(t *testing.T, env []string) map[string]string {
 	}
 	return values
 }
+
+func TestAppendAitestChildEnvironmentInjectsAndStripsStaleKeys(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	runtimeDir := filepath.Join(t.TempDir(), "runtime")
+	inherited := []string{
+		"PATH=/bin",
+		"AIRA_AITEST_LIB=/stale",
+		"AIRA_AITEST_WORKER_ADMIT_CMD=/stale/aira",
+		"AIRA_AITEST_BOOTSTRAP_CMD=/stale/aira",
+		"AIRA_AITEST_MAX_WORKERS_FALLBACK=999",
+	}
+	got := childEnvValues(t, AppendAitestChildEnvironment(inherited, runtimeDir, nil, "/opt/aira"))
+	if got["AIRA_AITEST_LIB"] == "" || got["AIRA_AITEST_LIB"] == "/stale" {
+		t.Fatalf("AIRA_AITEST_LIB=%q", got["AIRA_AITEST_LIB"])
+	}
+	if got["AIRA_AITEST_WORKER_ADMIT_CMD"] != "/opt/aira" || got["AIRA_AITEST_BOOTSTRAP_CMD"] != "/opt/aira" {
+		t.Fatalf("worker admit/bootstrap cmd=%v", got)
+	}
+	if got["AIRA_AITEST_MAX_WORKERS_FALLBACK"] == "999" || got["AIRA_AITEST_MAX_WORKERS_FALLBACK"] == "" {
+		t.Fatalf("stale fallback count was not replaced: %q", got["AIRA_AITEST_MAX_WORKERS_FALLBACK"])
+	}
+	if _, err := os.Stat(filepath.Join(got["AIRA_AITEST_LIB"], "aitest", "__init__.py")); err != nil {
+		t.Fatalf("injected aitest lib path is not importable: %v", err)
+	}
+}
+
+func TestAppendAitestChildEnvironmentEmptyArgsAreSideEffectFree(t *testing.T) {
+	dataHome := filepath.Join(t.TempDir(), "must-not-exist")
+	t.Setenv("XDG_DATA_HOME", dataHome)
+	input := []string{"PATH=/bin", "AIRA_AITEST_WORKER_ADMIT_CMD=/stale/aira"}
+
+	byEmptyRuntimeDir := AppendAitestChildEnvironment(input, "", nil, "/opt/aira")
+	if strings.Join(byEmptyRuntimeDir, "\x00") != "PATH=/bin" {
+		t.Fatalf("empty runtimeDir retained aitest environment: %v", byEmptyRuntimeDir)
+	}
+	byEmptyCommand := AppendAitestChildEnvironment(input, filepath.Join(t.TempDir(), "runtime"), nil, "")
+	if strings.Join(byEmptyCommand, "\x00") != "PATH=/bin" {
+		t.Fatalf("empty workerAdmitCommand retained aitest environment: %v", byEmptyCommand)
+	}
+	if _, err := os.Stat(dataHome); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("side-effect-free call extracted aitest lib: %v", err)
+	}
+}
+
+func TestAppendAitestChildEnvironmentSkipsEverythingOnExtractionFailure(t *testing.T) {
+	previousExtract := extractAitestForChild
+	previousOnce := aitestEnvFailureOnce
+	extractAitestForChild = func() (string, error) { return "", errors.New("injected aitest extraction failure") }
+	aitestEnvFailureOnce = new(sync.Once)
+	t.Cleanup(func() {
+		extractAitestForChild = previousExtract
+		aitestEnvFailureOnce = previousOnce
+	})
+	input := []string{"PATH=/bin", "AIRA_AITEST_LIB=/stale", "AIRA_AITEST_WORKER_ADMIT_CMD=/stale/aira"}
+	var diagnostics bytes.Buffer
+	first := AppendAitestChildEnvironment(input, t.TempDir(), &diagnostics, "/opt/aira")
+	second := AppendAitestChildEnvironment(input, t.TempDir(), &diagnostics, "/opt/aira")
+	for _, got := range [][]string{first, second} {
+		values := childEnvValues(t, got)
+		if len(values) != 1 || values["PATH"] != "/bin" {
+			t.Fatalf("failure retained aitest environment: %v", got)
+		}
+	}
+	if strings.Count(diagnostics.String(), "injected aitest extraction failure") != 1 {
+		t.Fatalf("failure was not logged once: %q", diagnostics.String())
+	}
+}

@@ -103,6 +103,13 @@ func removeScopeTree(t *testing.T, parent string) {
 // cgroups (a cgroup holds many regular interface files); after the caller's
 // hierarchical cgroup.kill has drained the subtree, each empty descendant rmdirs
 // cleanly. Best-effort: a still-populated node just fails its rmdir and is retried.
+//
+// Depth-first matters: a child that itself has child cgroups (a nested test
+// tree, like aitest's own outer -> .aira-supervisor / .aira-worker-N layout)
+// cannot be rmdir'd until its own children are gone first, so a single-level
+// sweep would leak nested trees onto the live shared slice -- found live by
+// Fable's final build-review gate on AIRA-30, independently rediscovered and
+// fixed the same way on AIRA-36.
 func removeCgroupSubtreeChildren(dir string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {

@@ -23,6 +23,45 @@ func TestEmbeddedPyLibIncludesImportPackageAndDocumentation(t *testing.T) {
 	}
 }
 
+func TestEmbeddedAitestIncludesImportPackageAndDocumentation(t *testing.T) {
+	for _, name := range []string{
+		"aitest/__init__.py",
+		"aitest/.gitignore",
+		"aitest/README.md",
+	} {
+		if _, err := fs.Stat(embeddedAitest, name); err != nil {
+			t.Fatalf("embedded aitest tree is missing %s: %v", name, err)
+		}
+	}
+}
+
+func TestExtractAitestIsIdempotent(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	first, err := ExtractAitest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := os.ReadFile(filepath.Join(first, readyName))
+	if err != nil || strings.TrimSpace(string(ready)) != filepath.Base(first) {
+		t.Fatalf("ready=%q err=%v target=%s", ready, err, first)
+	}
+
+	marker := filepath.Join(first, "caller-marker")
+	if err := os.WriteFile(marker, []byte("preserved"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := ExtractAitest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second != first {
+		t.Fatalf("second extraction path=%q want %q", second, first)
+	}
+	if got, err := os.ReadFile(marker); err != nil || string(got) != "preserved" {
+		t.Fatalf("fast path rewrote published tree: got=%q err=%v", got, err)
+	}
+}
+
 func TestExtractPyLibIsIdempotentAndReadyLast(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", t.TempDir())
 	first, err := ExtractPyLib()

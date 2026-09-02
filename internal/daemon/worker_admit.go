@@ -1,0 +1,470 @@
+package daemon
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"aira/internal/core"
+	"aira/internal/runner"
+)
+
+// workerAdmitHeadroomDefault is a SEPARATE, much smaller headroom than
+// admitSliceHeadroomBase (2 GiB, sized for the whole machine-wide slice,
+// admit.go). Reusing the slice-wide constant here would swallow most of a
+// realistically-sized outer scope's own cap in production. This is a
+// build-time tunable, not yet sized from field data — a reasonable small
+// fixed default for Slice 1.
+const workerAdmitHeadroomDefault int64 = 64 << 20 // 64 MiB
+
+// workerAdmitEstimatedBytesMin matches --memory-reserve's minimum
+// (cmd/aira/main.go), so a sub-page estimate can never floor memory.max to
+// zero pages and instant-OOM the worker on placement.
+const workerAdmitEstimatedBytesMin int64 = 1 << 20 // 1 MiB
+
+// WorkerAdmitResponse is the one grant/denial payload the worker-admit
+// connection sends before optionally holding itself open as the lease.
+type WorkerAdmitResponse struct {
+	State      string `json:"state"` // "granted" | "denied" | "timeout" | "unevaluated"
+	Reason     string `json:"reason,omitempty"`
+	WaitedMS   int64  `json:"waited_ms"`
+	WorkerID   string `json:"worker_id,omitempty"`
+	ScopePath  string `json:"scope_path,omitempty"`
+	MemoryMax  int64  `json:"memory_max,omitempty"`
+	MemoryHigh int64  `json:"memory_high,omitempty"`
+}
+
+type workerAdmitRequest struct {
+	jobID      string
+	outerScope string
+	// signature is accepted on the wire (the key spec 3.3 names for a
+	// future per-suite peak-history-based cap-sizing backstop) but UNUSED
+	// for anything in Slice 1 — deferred past Slice 1; estimatedBytes
+	// alone governs the backstop cap for now (see also Task 17's
+	// _resolve_estimated_bytes, which states the same deferral on the
+	// Python side).
+	signature      string
+	estimatedBytes int64
+	maxWaitMS      int64
+}
+
+type workerGrant struct {
+	scopePath string
+	memoryMax int64
+}
+
+type workerJobState struct {
+	mu         sync.Mutex
+	outerScope string
+	nextSeq    int
+	grants     map[string]*workerGrant
+}
+
+// workerJobKey binds ledger state to the (job_id, outer_scope) PAIR, not
+// job_id alone — job_id is caller-supplied and only as unique as the
+// caller's own pid-reuse window, so two concurrent requests that reuse the
+// same job_id with DIFFERENT outer_scope values must never get their scope
+// accounting mixed together.
+func workerJobKey(jobID, outerScope string) string {
+	return jobID + "\x00" + outerScope
+}
+
+// workerJobFor returns the ledger for an outer scope's owning job. The
+// aggregate guard sums only one job's own grants, so each outer_scope must
+// have exactly one owning job_id or that guard is defeated for the scope.
+//
+// workerJobs and workerScopeOwner are never actively pruned once a job's last
+// worker releases — accepted Slice 1 gap: unbounded-but-slow growth, one
+// entry per distinct (job_id, outer_scope) pair and outer_scope respectively
+// across the daemon's lifetime. Ownership is deliberately permanent: clearing
+// it during a transient zero-grant window would let another job claim the
+// scope and reopen the aggregate-guard gap this prevents.
+func (s *Server) workerJobFor(jobID, outerScope string) (*workerJobState, bool) {
+	key := workerJobKey(jobID, outerScope)
+	s.workerJobsMu.Lock()
+	defer s.workerJobsMu.Unlock()
+	if s.workerJobs == nil {
+		s.workerJobs = make(map[string]*workerJobState)
+	}
+	if s.workerScopeOwner == nil {
+		s.workerScopeOwner = make(map[string]string)
+	}
+	owner, exists := s.workerScopeOwner[outerScope]
+	if exists && owner != jobID {
+		return nil, false
+	}
+	if !exists {
+		s.workerScopeOwner[outerScope] = jobID
+	}
+	job := s.workerJobs[key]
+	if job == nil {
+		job = &workerJobState{outerScope: outerScope, grants: make(map[string]*workerGrant)}
+		s.workerJobs[key] = job
+	}
+	return job, true
+}
+
+// readWorkerSupervisorMemory reads a scope's live memory.current (plus its
+// memory.stat reclaimable-cache figure) WITHOUT requiring memory.max to be
+// set. This is deliberately narrower than readSliceMemory (admit.go), which
+// treats memory.max=="max" (uncapped) as a read failure — a correct,
+// defensive precondition for the OUTER-scope ledger read above (every
+// confine-launched outer scope IS always given an explicit finite cap by
+// construction, so "unbounded" there is a genuine anomaly worth failing
+// loudly on) but WRONG for the supervisor's own child scope: bootstrap
+// (BootstrapAitestSupervisor, aitest_bootstrap_linux.go) deliberately never
+// writes memory.max on it at all -- the supervisor is meant to be contained
+// transitively by the OUTER scope's cap, never capped individually. Found
+// live (AIRA-38, real-cgroup e2e): reusing readSliceMemory for this read
+// meant the aggregate guard's supervisor-RSS check (below) reported
+// "unevaluated" on EVERY real invocation, since the supervisor scope's own
+// memory.max is unconditionally "max" -- the granted (confined) path was
+// never actually reachable outside a mocked unit test.
+func readWorkerSupervisorMemory(path string) (current, reclaimable int64, ok bool, reason string) {
+	currentData, err := os.ReadFile(filepath.Join(path, "memory.current"))
+	if err != nil {
+		return 0, 0, false, "read-error"
+	}
+	current, valid := parseAdmitMemory(currentData)
+	if !valid {
+		return 0, 0, false, "parse-error"
+	}
+	statData, err := os.ReadFile(filepath.Join(path, "memory.stat"))
+	if err == nil {
+		reclaimable, valid = parseSliceMemoryStat(statData)
+	}
+	if err != nil || !valid {
+		reclaimable = 0
+	}
+	return current, reclaimable, true, ""
+}
+
+// evaluateWorkerAdmit makes one synchronous grant/deny decision for req.
+// "Used" is the OUTER scope's own live memory.current, read directly —
+// cgroup memory accounting is hierarchical, so this single read already
+// includes the supervisor's own RSS plus every already-placed worker's
+// (spec 3.3). Summing individually-read worker-scope grants separately (an
+// earlier version of this function did) was both redundant with that
+// hierarchical accounting AND unsafe: Σ(worker grants) + supervisor RSS
+// could exceed outerMax even when the ledger thought there was room,
+// risking an outer-scope-level memory.oom.group kill of the ENTIRE run —
+// precisely the incident class this design exists to prevent.
+func (s *Server) evaluateWorkerAdmit(req workerAdmitRequest) WorkerAdmitResponse {
+	readMemory := s.admitReadMemory
+	if readMemory == nil {
+		readMemory = readSliceMemory
+	}
+	used, outerMax, reclaimable, ok, reason := readMemory(req.outerScope)
+	if !ok {
+		return WorkerAdmitResponse{State: "unevaluated", Reason: reason}
+	}
+	// memory.stat's file pages are reclaimable cache, not non-negotiable
+	// worker pressure. Match checkedAvailable's exact floor-and-discount
+	// arithmetic so a read-heavy test suite is not persistently denied even
+	// though the kernel can reclaim this cache below the outer cap.
+	if reclaimable < 0 {
+		reclaimable = 0
+	}
+	used = subtractFloor(used, reclaimable)
+	headroom := s.workerAdmitHeadroom
+	if headroom < 0 {
+		headroom = 0
+	}
+	ceiling := outerMax - headroom
+	if req.estimatedBytes > ceiling {
+		// Could never fit even at zero current usage — a stable fact about
+		// THIS request, not a transient contention moment. Deny
+		// immediately (workerAdmitConnection, Task 5, breaks its poll loop
+		// on this reason) instead of waiting out the full poll timeout
+		// only to time out anyway.
+		return WorkerAdmitResponse{State: "denied", Reason: "reject:exceeds-ceiling"}
+	}
+	job, ownerOK := s.workerJobFor(req.jobID, req.outerScope)
+	if !ownerOK {
+		return WorkerAdmitResponse{State: "denied", Reason: "reject:outer-scope-owned-by-another-job"}
+	}
+	// job.mu stays held across the supervisor-scope read and the
+	// committed-cap sum below (Sol build-review raised this: a concurrent
+	// second request for the SAME job/outer_scope blocks on this lock,
+	// uninterruptible and not itself deadline-aware, for as long as this
+	// one's filesystem reads take). Deliberately kept this way, not
+	// loosened: unlike evaluateAdmitQueue's directory scan (admit.go),
+	// which is lock-free only because it has exactly one caller (a
+	// dedicated single-writer evaluator goroutine), evaluateWorkerAdmit is
+	// called directly from EVERY worker-admit connection goroutine for
+	// this job — moving the read outside the lock would let two
+	// concurrent requests both read committed=0 and both grant, exactly
+	// the aggregate-guard-defeating race AIRA-27/28/29 already fixed at
+	// whole-job granularity (worker_admit_test.go pins the sequential
+	// case; a genuinely concurrent version of that same test would show
+	// this). The reads themselves are two local cgroupfs file reads
+	// (memory.current, memory.stat), not network I/O — a few microseconds
+	// under normal conditions — and the client-side transport deadline
+	// (RequestWorkerAdmit, worker_admit_client_linux.go) now independently
+	// bounds a caller's worst-case wait even if this lock is ever held
+	// unusually long, so the correctness win is kept without leaving the
+	// caller unprotected.
+	job.mu.Lock()
+	defer job.mu.Unlock()
+	if req.estimatedBytes > ceiling-used {
+		// Not available RIGHT NOW (transient: current live usage), but
+		// could be granted once usage drops — the caller's poll loop keeps
+		// retrying this until granted or its own max_wait_ms deadline
+		// converts it to "timeout".
+		return WorkerAdmitResponse{State: "denied", Reason: "fallback:insufficient-headroom"}
+	}
+	// Worst-case guard, on top of the live-usage check above: live usage
+	// having room RIGHT NOW does not mean it always will. Sum the
+	// memory.max already promised to this job's other workers — if every
+	// one of them simultaneously grew to its own full cap, the total must
+	// still fit under ceiling, or an outer-scope memory.oom.group kill can
+	// take out the whole run (supervisor plus every sibling worker), not
+	// just the one that grew — precisely what Goal 2 in the design spec
+	// requires this NOT be able to do. This trades a little utilization
+	// (the live-usage check alone would admit a worker whose siblings
+	// simply haven't grown to their peaks YET) for that hard guarantee —
+	// the same aggregate-not-bound failure class AIRA-27/28/29 already
+	// fixed at whole-job granularity, found here at worker granularity by
+	// build-review (a live-usage-only check is silent on the SUM of caps,
+	// only on CURRENT usage). Pollable, not an immediate reject: an
+	// existing worker retiring frees its share of committed capacity.
+	//
+	// CORRECTED (found by a second review round: the first version of
+	// this guard omitted the supervisor's own footprint entirely). The
+	// worst case isn't just Σ(worker caps) — it's supervisor RSS PLUS
+	// Σ(worker caps), and a warm-imported pytest supervisor (spec 3.1/3.2:
+	// COW-shared interpreter state is the whole point of this design) can
+	// routinely hold hundreds of MiB, far more than headroom (64MiB
+	// default) alone budgets for. Concretely: an 8G outer cap with a 600M
+	// supervisor and eight workers each admitted at 970M (low live usage
+	// at grant time) would pass both checks above (Σcaps=7.76G ≤
+	// ceiling≈7.94G) yet still exceed the outer cap once every worker
+	// grows to its own peak (600M+7.76G=8.36G > 8G) — the exact
+	// outer-scope oom.group incident Goal 2 requires be impossible.
+	// Reading the supervisor scope's own live memory.current and
+	// subtracting it here closes that gap; an unreadable supervisor
+	// scope reports unevaluated (fail toward safety — this codebase never
+	// silently admits on a read it cannot establish), same as an
+	// unreadable outer scope above. Uses readWorkerSupervisorMemory (a
+	// SEPARATE seam from readMemory above), not readMemory/readSliceMemory:
+	// the supervisor scope is deliberately never given its own memory.max
+	// (see readWorkerSupervisorMemory's own doc comment) — reusing the
+	// outer-scope reader here made this guard report unevaluated on EVERY
+	// real invocation, an AIRA-38 finding.
+	readSupervisorMemory := s.admitReadWorkerSupervisorMemory
+	if readSupervisorMemory == nil {
+		readSupervisorMemory = readWorkerSupervisorMemory
+	}
+	supervisorScope := runner.WorkerScopeChildPath(req.outerScope, "supervisor")
+	supervisorUsed, supervisorReclaimable, supervisorOK, supervisorReason := readSupervisorMemory(supervisorScope)
+	if !supervisorOK {
+		return WorkerAdmitResponse{State: "unevaluated", Reason: "supervisor scope unreadable: " + supervisorReason}
+	}
+	// Apply the same reclaimable-cache discount to the supervisor half of the
+	// aggregate guard. Its memory.current is otherwise a second source of
+	// spurious denials after the supervisor has populated page cache.
+	if supervisorReclaimable < 0 {
+		supervisorReclaimable = 0
+	}
+	supervisorUsed = subtractFloor(supervisorUsed, supervisorReclaimable)
+	var committed int64
+	for _, grant := range job.grants {
+		committed += grant.memoryMax
+	}
+	if req.estimatedBytes > ceiling-committed-supervisorUsed {
+		return WorkerAdmitResponse{State: "denied", Reason: "fallback:aggregate-cap-exceeded"}
+	}
+	job.nextSeq++
+	workerID := fmt.Sprintf("%d", job.nextSeq)
+	scopePath := runner.WorkerScopeChildPath(req.outerScope, "worker-"+workerID)
+	memoryHigh := req.estimatedBytes * 4 / 5
+	job.grants[workerID] = &workerGrant{scopePath: scopePath, memoryMax: req.estimatedBytes}
+	return WorkerAdmitResponse{State: "granted", WorkerID: workerID, ScopePath: scopePath, MemoryMax: req.estimatedBytes, MemoryHigh: memoryHigh}
+}
+
+// releaseWorkerGrant frees one worker's ledger bookkeeping entry. Called
+// when its connection closes (Task 5) — the same dies-with-socket lease
+// shape admit and governor already use. Idempotent by construction (delete
+// on an absent map key is a no-op): Task 5's deferred release can race a
+// normal lease-close release of the same grant, and both must be safe.
+func (s *Server) releaseWorkerGrant(jobID, outerScope, workerID string) {
+	key := workerJobKey(jobID, outerScope)
+	s.workerJobsMu.Lock()
+	job := s.workerJobs[key]
+	s.workerJobsMu.Unlock()
+	if job == nil {
+		return
+	}
+	job.mu.Lock()
+	delete(job.grants, workerID)
+	job.mu.Unlock()
+}
+
+func validateWorkerAdmitArgs(args map[string]any) (workerAdmitRequest, error) {
+	req := workerAdmitRequest{}
+	str := func(key string, required bool) (string, error) {
+		raw, exists := args[key]
+		if !exists {
+			if required {
+				return "", fmt.Errorf("%s: worker-admit %s is required", CodeProtocol, key)
+			}
+			return "", nil
+		}
+		value, ok := raw.(string)
+		if !ok || (required && value == "") {
+			return "", fmt.Errorf("%s: worker-admit %s must be a non-empty string", CodeProtocol, key)
+		}
+		return value, nil
+	}
+	var err error
+	if req.jobID, err = str("job_id", true); err != nil {
+		return workerAdmitRequest{}, err
+	}
+	if req.outerScope, err = str("outer_scope", true); err != nil {
+		return workerAdmitRequest{}, err
+	}
+	if req.signature, err = str("signature", false); err != nil {
+		return workerAdmitRequest{}, err
+	}
+	// exactAdmitInt64 (existing, admit.go) — overflow-safe float64->int64,
+	// reused rather than the naive int64(estimated) truncation this used
+	// to do, which let an arbitrary huge float64 truncate unchecked.
+	estimated, ok := exactAdmitInt64(args["estimated_bytes"])
+	if !ok || estimated < workerAdmitEstimatedBytesMin || estimated > admitMaxReserve {
+		return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit estimated_bytes must be at least %d bytes and no larger than %d", CodeProtocol, workerAdmitEstimatedBytesMin, admitMaxReserve)
+	}
+	req.estimatedBytes = estimated
+	maxWait, ok := exactAdmitInt64(args["max_wait_ms"])
+	if !ok {
+		return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit max_wait_ms must be an integer", CodeProtocol)
+	}
+	if maxWait < 0 {
+		maxWait = 0
+	}
+	if maxWait > admitWaitCapMs {
+		maxWait = admitWaitCapMs
+	}
+	req.maxWaitMS = maxWait
+	return req, nil
+}
+
+func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
+	start := s.admitNowTime()
+	req, err := validateWorkerAdmitArgs(args)
+	if err != nil {
+		_ = writeFrame(conn, errorFrame(CodeProtocol, err.Error()))
+		return
+	}
+	peerCtx, cancelPeer := context.WithCancel(context.Background())
+	defer cancelPeer()
+	go func() {
+		var one [1]byte
+		_, _ = conn.Read(one[:])
+		cancelPeer()
+	}()
+
+	poll := s.workerAdmitPollInterval
+	if poll <= 0 {
+		poll = 200 * time.Millisecond
+	}
+	deadline := s.admitNowTime().Add(time.Duration(req.maxWaitMS) * time.Millisecond)
+	var response WorkerAdmitResponse
+	for {
+		response = s.evaluateWorkerAdmit(req)
+		if response.State == "granted" || response.State == "unevaluated" {
+			break
+		}
+		// Prefix-matched, not a two-string whitelist (Fable re-gate round
+		// 3): the spec's own §3.3 amendment declares "reject:" vs
+		// "fallback:" a load-bearing convention every reject:* reason
+		// implements, not just the two that happened to exist when this
+		// loop was written -- a future third permanent reason added only
+		// to evaluateWorkerAdmit without also touching this whitelist
+		// would poll out to "timeout: reject:saturated" and get retried
+		// indefinitely by the (correctly prefix-parsing) client,
+		// resurrecting the exact hang class this branch's review rounds
+		// already fixed, from the daemon side instead. Scoped to "denied"
+		// only, never "timeout": reject:saturated's own reason text
+		// coincidentally also starts "reject:", but state=timeout means
+		// the CLIENT's own wait budget merely expired -- genuinely
+		// retriable with a fresh request, never a stable daemon-side
+		// verdict.
+		if response.State == "denied" && strings.HasPrefix(response.Reason, "reject:") {
+			// A stable "never going to fit" fact about this request, not a
+			// transient contention moment — surface "denied" to the client
+			// immediately instead of waiting out the full poll timeout
+			// only to time out anyway. Every OTHER non-granted state keeps
+			// polling below (a live-usage-driven "not right now" is
+			// retried until it clears or the deadline converts it to
+			// "timeout").
+			break
+		}
+		remaining := deadline.Sub(s.admitNowTime())
+		if remaining <= 0 {
+			response = WorkerAdmitResponse{State: "timeout", Reason: "reject:saturated"}
+			break
+		}
+		// Clamp the sleep to whatever's left of the caller's own declared
+		// deadline, not the unconditional fixed poll interval (found by
+		// Sol build-review, AIRA-38 review wave): sleeping the full
+		// interval when only a fraction of it remains let waited_ms
+		// overshoot the caller's max_wait_ms by up to one poll interval
+		// before the NEXT loop iteration's evaluate ever ran -- low
+		// impact (a late grant is a strictly better outcome than a
+		// spurious timeout), but a genuine budget-precision violation.
+		sleep := poll
+		if remaining < sleep {
+			sleep = remaining
+		}
+		select {
+		case <-time.After(sleep):
+		case <-peerCtx.Done():
+			return
+		case <-s.stopping:
+			return
+		}
+	}
+	// Every response below is written as a single terminal decision. Use the
+	// admit clock seam (rather than time.Now) so its observed wait is both
+	// consistent with deadline handling and deterministic in tests.
+	response.WaitedMS = elapsedMilliseconds(start, s.admitNowTime())
+
+	// A "granted" response has ALREADY inserted a ledger entry inside
+	// evaluateWorkerAdmit above. From this point on, EVERY exit path —
+	// a write failure, the peer vanishing in the exact window between
+	// grant and delivery, or the normal lease-close below — must release
+	// that grant exactly once, or it leaks against the job's ledger
+	// forever. Mirrors admitConnection's own deferred, idempotent release
+	// (admit.go:458-466); releaseWorkerGrant is idempotent by construction
+	// (delete on an absent key is a no-op), so a double-fire here (e.g. a
+	// write failure racing this deferred call with a direct call further
+	// down — there is none further down anymore, but the mirroring is
+	// deliberate) is always safe.
+	released := false
+	release := func() {
+		if released || response.State != "granted" {
+			return
+		}
+		released = true
+		s.releaseWorkerGrant(req.jobID, req.outerScope, response.WorkerID)
+	}
+	defer release()
+
+	_ = conn.SetWriteDeadline(time.Now().Add(admitWriteTimeout))
+	ok := response.State == "granted"
+	if err := writeFrame(conn, responseFrame(core.Response{OK: ok, Code: "OK", Data: response})); err != nil {
+		return
+	}
+	if !ok {
+		return
+	}
+	select {
+	case <-peerCtx.Done():
+	case <-s.stopping:
+	}
+}

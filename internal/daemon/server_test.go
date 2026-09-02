@@ -1314,3 +1314,34 @@ func TestPathsNamespaceStateIdentity(t *testing.T) {
 		t.Fatalf("state identities alias: first=%+v second=%+v", first, second)
 	}
 }
+
+func TestServerDispatchesWorkerAdmitVerbOverRealSocket(t *testing.T) {
+	paths := testPaths(t)
+	server := NewServer(paths)
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 4*workerAdmitEstimatedBytesMin)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
+	server.workerAdmitHeadroom = 0
+	_, _ = startServer(t, server)
+	scope := testScope(t, paths, "one")
+
+	conn, err := net.Dial("unix", paths.SocketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := writeFrame(conn, RequestFrame{
+		Proto: ProtocolVersion, Scope: scope,
+		Request: core.Request{Verb: "worker-admit", Args: map[string]any{
+			"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(workerAdmitEstimatedBytesMin), "max_wait_ms": float64(0),
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var frame ResponseFrame
+	if err := readFrame(conn, &frame); err != nil {
+		t.Fatal(err)
+	}
+	if !frame.OK {
+		t.Fatalf("frame=%+v", frame)
+	}
+}

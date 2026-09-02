@@ -113,3 +113,25 @@ func TestReadSliceMemoryReclaimableIntegrationAndDegrade(t *testing.T) {
 		t.Fatalf("missing current ok=%v reason=%q, want false/read-error", ok, reason)
 	}
 }
+
+func TestReadSliceMemoryReportsUnboundedReasonLiteral(t *testing.T) {
+	// Pins the exact "unbounded" reason string against its real producer
+	// (Fable re-gate round 3): every other test of this specific reason
+	// (the Python classifier, evaluateWorkerAdmit's own unevaluated tests,
+	// the CLI-stderr boundary test) exercises it via a hand-written stub
+	// or an invented reason, never against readSliceMemory itself. A
+	// future rename of this literal (e.g. to "uncapped") would leave every
+	// one of those other suites green while silently breaking the real
+	// wire message supervisor.py's classifier matches on -- reintroducing
+	// the round-2 P1 indefinite-retry hang this literal exists to prevent.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "memory.current"), []byte("90\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "memory.max"), []byte("max\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, ok, reason := readSliceMemory(dir); ok || reason != "unbounded" {
+		t.Fatalf("memory.max=max: ok=%v reason=%q, want false/%q", ok, reason, "unbounded")
+	}
+}
