@@ -281,6 +281,20 @@ func TestRealPytestAitestEndToEndRealDaemonAndCgroupPassFailOnly(t *testing.T) {
 	if !strings.Contains(text, "test_fail.py::test_deliberate_failure failed") {
 		t.Fatalf("pytest output missing expected fail line: %v\n%s", err, text)
 	}
+	// Positive proof this test actually exercises the GRANTED (confined)
+	// path, not a silent total fallback to unconfined execution (found by
+	// Sol build-review, AIRA-38 review wave): the fallback-mode pytest run
+	// (TestRealPytestAitestEndToEndFallback) produces these IDENTICAL
+	// pass/fail lines, so checking only those two lines cannot distinguish
+	// real containment from a bootstrap/placement regression that fell
+	// back silently -- exactly the AIRA-38 class of bug this branch
+	// already had once (the aggregate guard's supervisor-scope read).
+	// _disable_daemon (supervisor.py) emits this exact warning on EVERY
+	// path that disables daemon-backed admission -- its absence is direct
+	// evidence containment held throughout this run.
+	if strings.Contains(text, "falling back to") || strings.Contains(text, "UNCONFINED") {
+		t.Fatalf("real daemon+cgroup run unexpectedly fell back to unconfined execution:\n%s", text)
+	}
 }
 
 func TestRealPytestAitestEndToEndRealDaemonAndCgroup(t *testing.T) {
