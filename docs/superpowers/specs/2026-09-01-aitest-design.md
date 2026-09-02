@@ -289,18 +289,32 @@ existing governor already has, just applied to worker spawn instead of
 per-test checkpoints.
 
 **Genuinely unreachable, not merely declined.** The permanent, whole-run
-fallback above triggers ONLY when there is no daemon to talk to at all — a
+fallback above triggers when there is no daemon to talk to at all — a
 dial/connect failure, the CLI itself failing to launch, or a malformed
-response. It must NOT trigger on an ordinary `denied` (budget exhausted
-right now) or `timeout` (the daemon is up, just busy/contended, and the
-request waited out its own poll window) response from a daemon that is
-plainly still there: those mean "don't add a worker at this moment," not
-"abandon containment for the rest of the run." Conflating the three
-(exactly what an earlier revision of this design did) defeats the point of
-admission — a single contended moment would otherwise permanently strip
-containment from everything after it. The two client-side exception types
-this distinction requires (`WorkerAdmitUnavailable` vs. `WorkerAdmitDenied`)
-are an implementation detail of the supervisor, not a wire-protocol change.
+response — **or** when the LOCAL cgroup mechanism itself is what failed:
+the daemon granted admission (reachable, healthy) but the child never
+confirmed its own placement into the granted scope (a forked child dying
+before its `__placed__` ack, or — found during implementation — the CLI's
+own `CreateWorkerScope` call failing after a genuine grant, e.g. a
+transient EBUSY/ENOENT/cgroupfs hiccup). Both are deliberate fallback
+triggers: a daemon that answers is not the thing that's broken in either
+case, but the cgroup mechanism itself demonstrably is, and there is no
+"try again" that fixes a locally-broken placement path the way waiting
+out contention fixes a `denied`. It must NOT trigger on an ordinary
+`denied` (budget exhausted right now), `timeout` (the daemon is up, just
+busy/contended, and the request waited out its own poll window), or
+`unevaluated` (a live memory read momentarily failed on an otherwise-live
+daemon) response from a daemon that is plainly still there: those mean
+"don't add a worker at this moment," not "abandon containment for the
+rest of the run." Conflating fallback-worthy conditions with merely-
+declined ones (exactly what an earlier revision of this design did)
+defeats the point of admission — a single contended moment would
+otherwise permanently strip containment from everything after it. The
+client-side exception types this distinction requires
+(`WorkerAdmitUnavailable`, `WorkerPlacementFailed` — both fallback-
+triggering; `WorkerAdmitDenied`, `WorkerAdmitRequestTooLarge` — both
+retriable/terminal-but-scoped, never fallback-triggering) are an
+implementation detail of the supervisor, not a wire-protocol change.
 
 ### 3.8 Deletion, retention, generalisation
 
