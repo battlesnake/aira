@@ -1474,6 +1474,33 @@ func TestConfineInjectsDaemonGovernorEnvironment(t *testing.T) {
 	}
 }
 
+func TestConfineNonDelegateLaunchStripsInheritedAitestEnvironment(t *testing.T) {
+	// Regression test for a real leak (Fable build-review, final gate):
+	// AppendAitestChildEnvironment (which strips stale AIRA_AITEST_*
+	// coordinates before optionally re-adding fresh ones) used to be
+	// called ONLY inside the `if request.DelegateRAM` branch, so a
+	// non-delegate launch's cmd.Env kept whatever AIRA_AITEST_* it
+	// inherited from its own parent process untouched -- e.g. a shell or
+	// test inside a delegate-RAM aitest job launching `aira confine --
+	// ...` without --delegate-ram would hand its child stale coordinates
+	// pointing at the outer job's (possibly since-deleted) extraction dir
+	// and relay binary.
+	scope := &confineFakeScope{}
+	var stdout bytes.Buffer
+	result, err := confineWithDeps(context.Background(), ConfineRequest{
+		Slice: "finite.slice", DelegateRAM: false,
+		Env:      []string{"PATH=" + os.Getenv("PATH"), "AIRA_AITEST_LIB=/stale/path/from/parent"},
+		Argv:     []string{"/bin/sh", "-c", "printf 'lib=[%s]' \"$AIRA_AITEST_LIB\""},
+		SelfPath: os.Args[0], Stdout: &stdout, Stderr: io.Discard,
+	}, confineUnitDeps(scope))
+	if err != nil || result.Exit != 0 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if got := stdout.String(); got != "lib=[]" {
+		t.Fatalf("child saw AIRA_AITEST_LIB=%q, want it stripped on a non-delegate launch", got)
+	}
+}
+
 func TestConfineWritesNoLedgerOrRunRecord(t *testing.T) {
 	working := t.TempDir()
 	t.Chdir(working)

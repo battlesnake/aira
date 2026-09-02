@@ -678,6 +678,18 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		// computed for the RAM governor a few lines up — both worker-admit
 		// and aitest-bootstrap are verbs on that one aira binary.
 		cmd.Env = pylib.AppendAitestChildEnvironment(cmd.Env, request.RuntimeDir, diagnostics, reserveCommand)
+	} else {
+		// Strip unconditionally, not just skip appending (Fable build-review,
+		// final gate): AppendAitestChildEnvironment was previously called
+		// ONLY inside the branch above, so a non-delegate launch's cmd.Env
+		// kept whatever AIRA_AITEST_* coordinates it inherited from ITS OWN
+		// parent process untouched -- e.g. a shell or test inside a
+		// delegate-RAM aitest job launching `aira confine -- ...` without
+		// --delegate-ram would hand its child stale coordinates pointing at
+		// the outer job's (possibly since-deleted) extraction dir and relay
+		// binary. Mirrors StripGovernorEnvironment's own unconditional
+		// strip on every confine launch (runner_linux.go).
+		cmd.Env = pylib.StripAitestEnvironment(cmd.Env)
 	}
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, diagnostics
 	cmd.ExtraFiles = []*os.File{handshakeWrite, releaseRead}
