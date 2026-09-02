@@ -75,6 +75,14 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) (*Wor
 		_ = conn.Close()
 		return nil, fmt.Errorf("E_CONFINE_UNAVAILABLE: read worker-admit response: %w", err)
 	}
+	if response.Code != "OK" {
+		_ = conn.Close()
+		reason := response.Error
+		if reason == "" {
+			reason = response.Code
+		}
+		return nil, fmt.Errorf("E_CONFINE_UNAVAILABLE: worker-admit request rejected: %s", reason)
+	}
 	var grant workerAdmitGrant
 	if err := json.Unmarshal(response.Data, &grant); err != nil {
 		_ = conn.Close()

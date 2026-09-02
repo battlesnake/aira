@@ -1,7 +1,7 @@
 import os
 import time
 
-from aitest.supervisor import Supervisor, WorkerAdmitDenied, WorkerAdmitUnavailable
+from aitest.supervisor import Supervisor, WorkerAdmitDenied, WorkerAdmitRequestTooLarge, WorkerAdmitUnavailable
 
 
 def _write_stub(path, body):
@@ -101,6 +101,26 @@ sys.exit(1)
         assert False, "expected WorkerAdmitDenied"
     except WorkerAdmitDenied as exc:
         assert "denied" in str(exc)
+
+
+def test_acquire_worker_raises_request_too_large_on_reject_exceeds_ceiling(tmp_path, monkeypatch):
+    # A reject:exceeds-ceiling denial is a PERMANENT sizing verdict, not a
+    # transient one -- it must classify distinctly from a plain
+    # WorkerAdmitDenied even though its stderr text also contains the
+    # substring "worker-admit denied" (Task 38).
+    stub = _write_stub(tmp_path / "worker-admit-too-large", """
+import sys
+sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit denied: reject:exceeds-ceiling\\n")
+sys.exit(1)
+""")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    try:
+        supervisor.acquire_worker(100)
+        assert False, "expected WorkerAdmitRequestTooLarge"
+    except WorkerAdmitRequestTooLarge as exc:
+        assert "reject:exceeds-ceiling" in str(exc)
 
 
 def test_acquire_worker_raises_denied_on_daemon_timeout_response(tmp_path, monkeypatch):
@@ -508,6 +528,56 @@ sys.stdin.buffer.read()
     # can't remove) -- that's an orthogonal, already-accepted "cosmetic,
     # backstopped by #72's reaper" cleanup path (see _retire_worker),
     # unrelated to whether admission fell back to unconfined workers.
+    stderr = capsys.readouterr().err
+    assert "falling back to" not in stderr and "UNCONFINED" not in stderr, stderr
+
+
+def test_worker_admit_request_too_large_marks_queue_unevaluated_without_disabling_daemon(tmp_path, monkeypatch, pytester, capsys):
+    """A reject:exceeds-ceiling denial is a permanent sizing verdict for
+    this run's estimated_bytes -- unlike a plain transient denial, it
+    never resolves no matter how long the run waits, so the same
+    indefinite-retry loop used for plain denials would hang the whole
+    suite forever. Every call to worker-admit here returns
+    reject:exceeds-ceiling, never a grant. The suite must still terminate
+    promptly, with every queued nodeid honestly reported unevaluated
+    (never silently dropped), the daemon left available (this is a sizing
+    fact, not daemon unreachability), and no unconfined fallback spawned
+    (that would silently strip RAM containment for a condition where
+    containment was never actually unavailable)."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+import sys
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+sys.exit(0)
+""")
+    admit = _write_stub(tmp_path / "worker-admit", """
+import sys
+sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit denied: reject:exceeds-ceiling\\n")
+sys.exit(1)
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+
+    items = pytester.getitems("""
+        def test_one():
+            assert True
+
+        def test_two():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    started = time.monotonic()
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+    elapsed = time.monotonic() - started
+
+    assert results == {item.nodeid: "unevaluated" for item in items}
+    assert supervisor.daemon_available is True
+    # A permanent sizing rejection is returned immediately, so this is a
+    # generous completion bound that catches accidental entry into the
+    # indefinite transient-denial retry loop above.
+    assert elapsed < 4.0, "run() took %.1fs -- looks like it retried a permanent sizing rejection" % elapsed
     stderr = capsys.readouterr().err
     assert "falling back to" not in stderr and "UNCONFINED" not in stderr, stderr
 

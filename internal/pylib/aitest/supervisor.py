@@ -36,6 +36,17 @@ class WorkerAdmitDenied(Exception):
     pass
 
 
+class WorkerAdmitRequestTooLarge(Exception):
+    """The daemon's own reject:exceeds-ceiling verdict: this request's
+    estimated-byte sizing can never fit under the outer scope's cap, even
+    without transient contention. Retrying would wait forever with zero
+    chance of success, while falling back to an unconfined worker would
+    silently remove RAM containment for the rest of the run. It is instead
+    a terminal failure for the affected queued work only, which is marked
+    unevaluated without declaring the daemon unavailable."""
+    pass
+
+
 class WorkerPlacementFailed(Exception):
     """place_self() never completed (or its child-side placement ack never
     arrived) -- the forked child died before we could confirm it actually
@@ -122,6 +133,7 @@ class Supervisor:
         self.daemon_available = True
         self.max_workers_fallback = max(1, int(os.environ.get("AIRA_AITEST_MAX_WORKERS_FALLBACK", "1")))
         self._fallback_warned = False
+        self._admission_too_large_warned = False
         self.items_by_nodeid = {}
         self.workers = {}
         self.results = {}
@@ -164,6 +176,20 @@ class Supervisor:
                 % (reason, self.max_workers_fallback)
             )
 
+    def _fail_queue_too_large(self, reason):
+        """Mark queued work unevaluated after a permanent daemon sizing
+        rejection, preserving daemon availability and therefore never
+        triggering an unconfined fallback for this condition."""
+        if not self._admission_too_large_warned:
+            self._admission_too_large_warned = True
+            sys.stderr.write(
+                "aira aitest: %s -- remaining queued tests cannot be admitted at this sizing; "
+                "marking them unevaluated rather than waiting forever or running unconfined\n" % reason
+            )
+        while self.queue:
+            nodeid = self.queue.pop(0)
+            self.results.setdefault(nodeid, "unevaluated")
+
     def collect(self, items):
         """items: the pytest-collected Item objects. Session collection
         already ran in this process before bootstrap; the forked worker
@@ -193,9 +219,11 @@ class Supervisor:
         Raises WorkerAdmitUnavailable when there is no daemon to talk to at
         all (dial/launch failure, malformed response); raises
         WorkerAdmitDenied when the daemon responded normally but declined
-        (denied or timeout) -- the caller MUST treat these differently
-        (Task 16): only WorkerAdmitUnavailable may disable daemon-backed
-        admission for the rest of the run."""
+        transiently (denied or timeout), and WorkerAdmitRequestTooLarge
+        when reject:exceeds-ceiling makes this sizing permanently
+        inadmissible. The caller MUST treat these differently (Task 16):
+        only WorkerAdmitUnavailable may disable daemon-backed admission
+        for the rest of the run."""
         if not self.daemon_available:
             raise WorkerAdmitUnavailable("daemon unavailable")
         command = os.environ.get("AIRA_AITEST_WORKER_ADMIT_CMD", "")
@@ -222,6 +250,8 @@ class Supervisor:
             # stderr -- ANYTHING else (a dial failure, a launch failure, a
             # malformed response) means there is no daemon to talk to at
             # all. This distinction is load-bearing (Task 16).
+            if "reject:exceeds-ceiling" in message:
+                raise WorkerAdmitRequestTooLarge(message)
             if "worker-admit denied" in message or "worker-admit timeout" in message:
                 raise WorkerAdmitDenied(message)
             raise WorkerAdmitUnavailable(message)
@@ -265,10 +295,11 @@ class Supervisor:
 
     def spawn_worker(self, estimated_bytes, max_wait="30s"):
         """Admits and forks one worker, returning its pid. Raises
-        WorkerAdmitUnavailable/WorkerAdmitDenied if admission fails, or
+        WorkerAdmitUnavailable/WorkerAdmitDenied if admission fails,
+        WorkerAdmitRequestTooLarge if this sizing can never fit, or
         WorkerPlacementFailed if the forked child died before confirming it
         joined its granted cgroup scope -- the caller (run()) decides
-        fallback/retry policy for each.
+        fallback/retry/terminal-queue policy for each.
 
         Safety: the ENTIRE forked-child branch below is wrapped in one
         broad try/except that os._exit()s on ANY exception. A forked child
@@ -455,8 +486,11 @@ class Supervisor:
         attempt) INDEFINITELY on WorkerAdmitDenied, with a loud periodic
         stderr warning so a stalled run is never silent. Returns on
         success, or on WorkerAdmitUnavailable/WorkerPlacementFailed
-        (which _disable_daemon and the caller's own fallback handle) --
-        never on denial-exhaustion, because there is no such thing here:
+        (which _disable_daemon and the caller's own fallback handle).
+        WorkerAdmitRequestTooLarge deliberately propagates to the caller,
+        which marks the affected queue unevaluated rather than retrying or
+        silently falling back unconfined. Never returns on
+        denial-exhaustion, because there is no such thing here:
         a daemon that stays reachable but saturated forever means the run
         genuinely waits forever, which is the honest outcome, not this
         method's job to silently degrade safety instead.
@@ -504,6 +538,10 @@ class Supervisor:
         run()'s startup path does rather than let the run end with queue
         work still undone.
 
+        WorkerAdmitRequestTooLarge is instead a permanent sizing verdict:
+        drain the remaining queue to unevaluated without disabling the
+        still-healthy daemon or spawning an unconfined fallback worker.
+
         WorkerAdmitUnavailable (no daemon to talk to at all) and
         WorkerPlacementFailed (the cgroup mechanism itself is broken
         locally, not just momentarily busy) both fall back to an
@@ -521,9 +559,13 @@ class Supervisor:
                     # Another worker is still running; ITS eventual
                     # retirement calls _replace_worker again and retries.
                     return
-                self._wait_for_admission_or_disable(
-                    lambda: self.spawn_worker(self._run_estimated_bytes, max_wait=self._run_max_wait)
-                )
+                try:
+                    self._wait_for_admission_or_disable(
+                        lambda: self.spawn_worker(self._run_estimated_bytes, max_wait=self._run_max_wait)
+                    )
+                except WorkerAdmitRequestTooLarge as exc:
+                    self._fail_queue_too_large(str(exc))
+                    return
                 if self.daemon_available:
                     return  # the wait succeeded -- a confined worker now exists
                 # else: the wait's own WorkerAdmitUnavailable/
@@ -532,6 +574,9 @@ class Supervisor:
                 # fallback-spawn every other daemon-unavailable path in
                 # this function already uses, rather than return here and
                 # leave the pool empty with queue work still undone.
+            except WorkerAdmitRequestTooLarge as exc:
+                self._fail_queue_too_large(str(exc))
+                return
             except (WorkerAdmitUnavailable, WorkerPlacementFailed) as exc:
                 self._disable_daemon(str(exc))
         self._spawn_fallback_worker()
@@ -645,6 +690,9 @@ class Supervisor:
                     # start dispatching to however many DID get admitted;
                     # a later retirement's _replace_worker tries for more.
                     break
+                except WorkerAdmitRequestTooLarge as exc:
+                    self._fail_queue_too_large(str(exc))
+                    break
                 except (WorkerAdmitUnavailable, WorkerPlacementFailed) as exc:
                     self._disable_daemon(str(exc))
                     break
@@ -660,7 +708,10 @@ class Supervisor:
             # means this run genuinely waits forever, which is the honest
             # outcome, never a silent degrade to unconfined).
             if self.daemon_available and not self.workers and self.queue:
-                self._wait_for_admission_or_disable(lambda: self.spawn_worker(estimated_bytes, max_wait=max_wait))
+                try:
+                    self._wait_for_admission_or_disable(lambda: self.spawn_worker(estimated_bytes, max_wait=max_wait))
+                except WorkerAdmitRequestTooLarge as exc:
+                    self._fail_queue_too_large(str(exc))
         if not self.daemon_available:
             # Cap TOTAL concurrent workers (already-admitted + fallback) at
             # the configured pool size -- min(worker_count,

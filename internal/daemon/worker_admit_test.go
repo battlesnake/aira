@@ -23,6 +23,32 @@ func admitReadMemoryFixture(current map[string]int64, outerMax int64) func(strin
 	}
 }
 
+func TestValidateWorkerAdmitArgsClampsMaxWait(t *testing.T) {
+	base := map[string]any{
+		"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": int64(1),
+	}
+	for _, test := range []struct {
+		name string
+		wait int64
+		want int64
+	}{
+		{name: "over cap", wait: admitWaitCapMs + 1, want: admitWaitCapMs},
+		{name: "negative", wait: -1, want: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			args := make(map[string]any, len(base)+1)
+			for key, value := range base {
+				args[key] = value
+			}
+			args["max_wait_ms"] = test.wait
+			request, err := validateWorkerAdmitArgs(args)
+			if err != nil || request.maxWaitMS != test.want {
+				t.Fatalf("request=%+v err=%v, want maxWaitMS=%d", request, err, test.want)
+			}
+		})
+	}
+}
+
 func TestEvaluateWorkerAdmitGrantsWithinHeadroom(t *testing.T) {
 	server := NewServer(Paths{})
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)

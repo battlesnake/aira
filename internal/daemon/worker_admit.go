@@ -234,8 +234,14 @@ func validateWorkerAdmitArgs(args map[string]any) (workerAdmitRequest, error) {
 	}
 	req.estimatedBytes = estimated
 	maxWait, ok := exactAdmitInt64(args["max_wait_ms"])
-	if !ok || maxWait < 0 || maxWait > admitWaitCapMs {
-		return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit max_wait_ms must be in [0,%d]", CodeProtocol, admitWaitCapMs)
+	if !ok {
+		return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit max_wait_ms must be an integer", CodeProtocol)
+	}
+	if maxWait < 0 {
+		maxWait = 0
+	}
+	if maxWait > admitWaitCapMs {
+		maxWait = admitWaitCapMs
 	}
 	req.maxWaitMS = maxWait
 	return req, nil
