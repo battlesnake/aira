@@ -126,6 +126,32 @@ sys.exit(1)
         assert "reject:exceeds-ceiling" in str(exc)
 
 
+def test_acquire_worker_raises_request_too_large_on_cli_argument_invalid(tmp_path, monkeypatch):
+    """Regression test for a real bug (Fable build-review, final gate): the
+    CLI's own pre-dial E_CONFINE_ARGUMENT_INVALID rejection (e.g. the
+    --estimated-bytes 1MiB floor, AIRA-38) is a permanent, static fact
+    about THIS request's arguments -- the daemon was never even dialed --
+    but used to match none of the recognized substrings and fall through
+    to WorkerAdmitUnavailable, misdiagnosing a purely local client mistake
+    as the daemon being unreachable and stripping containment for the
+    rest of the run."""
+    stub = _write_stub(tmp_path / "worker-admit-argument-invalid", """
+import sys
+sys.stderr.write("E_CONFINE_ARGUMENT_INVALID: --estimated-bytes: must be at least 1MiB\\n")
+sys.exit(1)
+""")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    try:
+        supervisor.acquire_worker(100)
+        assert False, "expected WorkerAdmitRequestTooLarge"
+    except WorkerAdmitRequestTooLarge as exc:
+        assert "E_CONFINE_ARGUMENT_INVALID" in str(exc)
+    except WorkerAdmitUnavailable:
+        assert False, "a client argument mistake must not be conflated with daemon unavailability"
+
+
 def test_acquire_worker_raises_denied_on_daemon_timeout_response(tmp_path, monkeypatch):
     # A "timeout" wire response (the daemon waited out the full poll
     # window, just busy/contended) is ALSO WorkerAdmitDenied, never
@@ -215,6 +241,34 @@ sys.exit(1)
         assert "local-placement-failed" in str(exc)
     except WorkerAdmitUnavailable:
         assert False, "a local placement failure after a genuine grant must not be conflated with daemon unavailability"
+
+
+def test_acquire_worker_removes_the_granted_scope_dir_on_malformed_grant(tmp_path, monkeypatch):
+    """Regression test for a real leak (Fable build-review, final gate):
+    acquire_worker's malformed-grant path released the admit lease but
+    never rmdir'd the granted worker scope CreateWorkerScope already made
+    -- unlike _retire_worker's identical cleanup on every normal
+    retirement. Uses a REAL directory (not a fake path string) so the
+    rmdir is genuinely exercised, not just silently swallowed as an
+    OSError on a nonexistent path."""
+    scope_dir = tmp_path / "granted-scope"
+    scope_dir.mkdir()
+    admit = _write_stub(tmp_path / "worker-admit-malformed-real-scope", f"""
+import sys
+print("granted scope={scope_dir} worker_id=1 memory_max=notanumber memory_high=320")
+sys.stdout.flush()
+sys.exit(0)
+""")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    try:
+        supervisor.acquire_worker(400)
+        assert False, "expected WorkerAdmitUnavailable"
+    except WorkerAdmitUnavailable:
+        pass
+
+    assert not scope_dir.exists(), "the malformed grant's own scope directory must be removed, not leaked"
 
 
 def test_acquire_worker_releases_malformed_grant_missing_required_field(tmp_path, monkeypatch):
@@ -526,6 +580,50 @@ def test_spawn_worker_closes_dispatch_write_when_placement_ack_is_missing(monkey
     assert still_open is False, "placement failure must not leak the raw dispatch write fd"
 
 
+def test_spawn_worker_removes_the_granted_scope_dir_on_placement_failure(tmp_path, monkeypatch):
+    """Regression test for a real leak (Fable build-review, final gate):
+    spawn_worker's placement-failure path released the admit lease but
+    never rmdir'd the granted worker scope CreateWorkerScope already
+    made -- unlike _retire_worker's identical cleanup on every normal
+    retirement. Uses a REAL directory so the rmdir is genuinely
+    exercised. Mirrors the fixture pattern of the sibling test above,
+    which pins the same failure branch's dispatch-fd cleanup."""
+    class Stream:
+        def close(self):
+            pass
+
+    class AdmitProcess:
+        def __init__(self):
+            self.stdin = Stream()
+            self.stdout = Stream()
+            self.stderr = Stream()
+
+        def wait(self, timeout):
+            pass
+
+    def child_that_never_acks(scope):
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        return pid, False
+
+    scope_dir = tmp_path / "granted-scope"
+    scope_dir.mkdir()
+    supervisor = Supervisor()
+    supervisor.acquire_worker = lambda estimated_bytes, max_wait: (
+        {"scope": str(scope_dir), "worker_id": "1", "memory_max": "1", "memory_high": "1"}, AdmitProcess()
+    )
+    monkeypatch.setattr(supervisor_module, "fork_worker", child_that_never_acks)
+
+    try:
+        supervisor.spawn_worker(1)
+        assert False, "expected WorkerPlacementFailed"
+    except WorkerPlacementFailed:
+        pass
+
+    assert not scope_dir.exists(), "the placement-failed worker's own scope directory must be removed, not leaked"
+
+
 def test_crash_mid_test_requeues_once_then_reports_unevaluated(tmp_path, monkeypatch, pytester):
     outer = tmp_path / "outer"
     outer.mkdir()
@@ -686,6 +784,41 @@ def test_drain_worker_requeues_real_nodeid_when_result_nodeid_is_wrong(monkeypat
     assert pid not in supervisor.workers, "protocol-violating worker must be retired"
     stderr = capsys.readouterr().err
     assert real_nodeid in stderr and wrong_nodeid in stderr
+    os.close(dispatch_read)
+
+
+def test_drain_worker_treats_invalid_utf8_on_the_result_pipe_as_a_crash_not_a_process_crash(monkeypatch):
+    """Regression test for a real bug (Fable build-review, final gate): a
+    stray non-UTF-8 byte on a worker's result pipe used to raise an
+    uncaught UnicodeDecodeError (errors="strict") straight out of
+    _drain_worker, crashing the WHOLE pytest process and losing every
+    result. With errors="replace" the garbage line instead decodes to
+    something that fails the existing nodeid-mismatch guard and is
+    handled as an ordinary worker crash: requeue-once, not an
+    unhandled exception."""
+    result_read, result_write = os.pipe()
+    real_nodeid = "pkg/test_mod.py::test_real"
+    os.write(result_write, b"\xff\xfe not valid utf-8 passed\n")
+    os.close(result_write)
+    os.set_blocking(result_read, False)
+    dispatch_read, dispatch_write = os.pipe()
+
+    supervisor = Supervisor()
+    supervisor.attempts[real_nodeid] = 1
+    monkeypatch.setattr(supervisor, "_replace_worker", lambda: None)
+    pid = 999996
+    state = {
+        "result_fd": result_read, "read_buffer": b"", "result_eof": False,
+        "in_flight": real_nodeid,
+        "dispatch_write": os.fdopen(dispatch_write, "w"),
+        "admit_process": None, "grant": None,
+    }
+    supervisor.workers[pid] = state
+
+    supervisor._drain_worker(pid, state)  # must not raise UnicodeDecodeError
+
+    assert supervisor.queue == [real_nodeid], "the real in-flight nodeid must be requeued, not lost"
+    assert pid not in supervisor.workers, "the worker reporting garbage must be retired"
     os.close(dispatch_read)
 
 
@@ -1208,6 +1341,67 @@ sys.stdin.buffer.read()
     results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=1)
 
     assert results == {items[0].nodeid: "passed"}
+
+
+def test_replace_worker_respects_pool_cap_when_daemon_goes_unavailable_mid_run(monkeypatch):
+    """Regression test for a real bug (Fable build-review, final gate):
+    _replace_worker's daemon-unavailable branch used to call
+    _spawn_fallback_worker() UNCONDITIONALLY on every retirement, never
+    checking the min(worker_count, max_workers_fallback) TOTAL-pool cap
+    run()'s own startup path enforces -- so a daemon that went
+    unreachable mid-run (with N confined workers already live) converged
+    the pool back up to N concurrent UNCONFINED workers instead of
+    draining down to the promised cap, directly contradicting
+    _disable_daemon's own warning text. Sibling test below
+    (test_fallback_worker_count_capped_at_pool_size_not_added_on_top)
+    covers only the mid-STARTUP case; this is a focused unit-level test
+    of _replace_worker's own gate, deterministic (no real fork/timing),
+    for the mid-run case specifically."""
+    supervisor = Supervisor()
+    supervisor.queue = ["test_a.py::test_one"]
+    supervisor._run_worker_count = 2
+    supervisor.max_workers_fallback = 1
+    supervisor.daemon_available = True
+    # One sibling worker is already live (the survivor of whichever
+    # retirement triggered this _replace_worker call) -- already AT the
+    # min(2, 1)=1 cap.
+    supervisor.workers[111] = {"in_flight": None}
+    monkeypatch.setattr(
+        supervisor, "spawn_worker",
+        lambda estimated_bytes, max_wait: (_ for _ in ()).throw(WorkerAdmitUnavailable("daemon gone")),
+    )
+    fallback_calls = []
+    monkeypatch.setattr(supervisor, "_spawn_fallback_worker", lambda: fallback_calls.append(1))
+
+    supervisor._replace_worker()
+
+    assert supervisor.daemon_available is False
+    assert fallback_calls == [], "pool already at the min(worker_count, max_workers_fallback) cap -- must not grow back up"
+
+
+def test_replace_worker_still_spawns_fallback_when_under_the_pool_cap(monkeypatch):
+    """Complement to the test above: the cap must not become "never
+    spawn a fallback worker at all" -- when the live pool is genuinely
+    under min(worker_count, max_workers_fallback), a fallback worker
+    must still be spawned so queue work keeps draining."""
+    supervisor = Supervisor()
+    supervisor.queue = ["test_a.py::test_one"]
+    supervisor._run_worker_count = 2
+    supervisor.max_workers_fallback = 1
+    supervisor.daemon_available = True
+    # No sibling worker survives this retirement -- pool is empty, under
+    # the min(2, 1)=1 cap.
+    monkeypatch.setattr(
+        supervisor, "spawn_worker",
+        lambda estimated_bytes, max_wait: (_ for _ in ()).throw(WorkerAdmitUnavailable("daemon gone")),
+    )
+    fallback_calls = []
+    monkeypatch.setattr(supervisor, "_spawn_fallback_worker", lambda: fallback_calls.append(1))
+
+    supervisor._replace_worker()
+
+    assert supervisor.daemon_available is False
+    assert fallback_calls == [1], "pool is under the cap -- a fallback worker must still be spawned"
 
 
 def test_fallback_worker_count_capped_at_pool_size_not_added_on_top(tmp_path, monkeypatch, pytester):

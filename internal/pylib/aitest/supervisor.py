@@ -40,12 +40,20 @@ class WorkerAdmitDenied(Exception):
 
 
 class WorkerAdmitRequestTooLarge(Exception):
-    """The daemon's own reject:exceeds-ceiling verdict: this request's
-    estimated-byte sizing can never fit under the outer scope's cap, even
-    without transient contention. Retrying would wait forever with zero
-    chance of success, while falling back to an unconfined worker would
-    silently remove RAM containment for the rest of the run. It is instead
-    a terminal failure for the affected queued work only, which is marked
+    """A PERMANENT, STATIC verdict about this specific request that no
+    amount of retrying or waiting can change -- either the daemon's own
+    reject:exceeds-ceiling (this request's estimated-byte sizing can
+    never fit under the outer scope's cap, even without transient
+    contention) or the CLI's own pre-dial E_CONFINE_ARGUMENT_INVALID
+    rejection (a malformed client argument, e.g. an estimated_bytes value
+    below the daemon's floor -- Fable build-review, final gate: this used
+    to fall through to WorkerAdmitUnavailable, misdiagnosing a purely
+    local, static client mistake as the daemon being unreachable and
+    stripping containment for the rest of the run). Retrying would wait
+    forever (or dial a perfectly healthy daemon) with zero chance of
+    success, while falling back to an unconfined worker would silently
+    remove RAM containment for the rest of the run. It is instead a
+    terminal failure for the affected queued work only, which is marked
     unevaluated without declaring the daemon unavailable."""
     pass
 
@@ -77,7 +85,15 @@ def _read_line_blocking(fd, state):
         buf += chunk
     line, sep, buf = buf.partition(b"\n")
     state["read_buffer"] = buf
-    return line.decode("utf-8", "strict") if sep else ""
+    # "replace", not "strict" (Fable build-review, final gate): a stray
+    # non-UTF-8 byte from a test that writes garbage onto this fd (e.g. a
+    # forked-not-execed child inheriting the write end, the same surface
+    # AIRA-40 documents for the pipe being held OPEN, except here the
+    # inheritor WRITES) must degrade to an ordinary malformed/unmatched
+    # line -- handled by the existing nodeid-mismatch/placement-ack
+    # guards below -- rather than raise an uncaught UnicodeDecodeError
+    # that crashes the whole pytest process and loses every result.
+    return line.decode("utf-8", "replace") if sep else ""
 
 
 def _drain_available_lines(fd, state):
@@ -117,7 +133,9 @@ def _drain_available_lines(fd, state):
     lines = []
     while b"\n" in buf:
         line, _, buf = buf.partition(b"\n")
-        lines.append(line.decode("utf-8", "strict"))
+        # "replace", not "strict" -- see _read_line_blocking's identical
+        # comment just above (Fable build-review, final gate).
+        lines.append(line.decode("utf-8", "replace"))
     state["read_buffer"] = buf
     return lines
 
@@ -142,6 +160,7 @@ class Supervisor:
         self.results = {}
         self._run_estimated_bytes = 0
         self._run_max_wait = "30s"
+        self._run_worker_count = 1
 
     def bootstrap(self):
         """Relocate this process into its own child scope so the outer scope
@@ -284,7 +303,18 @@ class Supervisor:
             # suspecting the daemon itself.
             if "worker-admit local-placement-failed" in message:
                 raise WorkerPlacementFailed(message)
-            if "reject:exceeds-ceiling" in message:
+            # "E_CONFINE_ARGUMENT_INVALID" (Fable build-review, final
+            # gate): the CLI's own pre-dial argument validation (e.g. the
+            # --estimated-bytes 1MiB floor, AIRA-38) rejects BEFORE ever
+            # talking to the daemon -- a permanent, static fact about
+            # THIS request's arguments, not a daemon condition at all.
+            # _resolve_estimated_bytes (aitest/__init__.py) now clamps
+            # the one user-facing knob that could realistically trigger
+            # this before it ever reaches the wire, but this classifies
+            # it correctly regardless -- ANY future CLI argument
+            # validation failure reaching here must never be conflated
+            # with genuine daemon unavailability.
+            if "reject:exceeds-ceiling" in message or "E_CONFINE_ARGUMENT_INVALID" in message:
                 raise WorkerAdmitRequestTooLarge(message)
             if "worker-admit denied" in message or "worker-admit timeout" in message or "worker-admit unevaluated" in message:
                 raise WorkerAdmitDenied(message)
@@ -333,6 +363,19 @@ class Supervisor:
             except Exception:
                 process.kill()
                 process.wait()  # reap immediately rather than leave a zombie
+            # Mirrors _retire_worker's best-effort scope cleanup (Fable
+            # build-review, final gate): a malformed grant can still name
+            # a real, already-created scope (e.g. a bad memory_max value
+            # alongside a fine scope path) -- "scope" itself may be one of
+            # the missing fields, so this is guarded, unlike the
+            # unconditional rmdir in spawn_worker's placement-failure path
+            # where "grant" is always fully well-formed by construction.
+            scope = grant.get("scope")
+            if scope:
+                try:
+                    os.rmdir(scope)
+                except OSError as exc:
+                    sys.stderr.write("aira aitest: could not remove worker scope %s: %s\n" % (scope, exc))
             raise WorkerAdmitUnavailable("worker-admit malformed grant: %s" % malformed)
         return grant, process
 
@@ -441,6 +484,17 @@ class Supervisor:
                 admit_process.wait(timeout=5)
             except Exception:
                 pass
+            # Mirrors _retire_worker's best-effort scope cleanup (Fable
+            # build-review, final gate): the daemon already granted and
+            # CreateWorkerScope already made this directory before the
+            # child died -- without this, every placement failure leaks
+            # one empty scope directory under the outer scope, and the
+            # AIRA-36 reaper cannot sweep it until the whole job's
+            # supervisor process is gone (>=2 minutes later).
+            try:
+                os.rmdir(grant["scope"])
+            except OSError as exc:
+                sys.stderr.write("aira aitest: could not remove worker scope %s: %s\n" % (grant["scope"], exc))
             raise WorkerPlacementFailed("worker %d exited before confirming cgroup placement" % pid)
         os.set_blocking(result_read, False)
         state.update({
@@ -508,40 +562,51 @@ class Supervisor:
         CORRECTED AGAIN (Sol build-review, AIRA-38 review wave): the
         BrokenPipeError branch's _handle_worker_exit call can itself add a
         FRESH replacement worker to self.workers (via _replace_worker) --
-        but that new worker is invisible to the `list(...)` snapshot this
-        pass already took, so it never gets a nodeid dispatched to it here.
-        If it is the only live worker left (--aitest-workers=1, or simply
-        the last one standing), nothing will ever make its result_fd ready
-        in run()'s select() loop, since it has nothing in flight to report
-        -- the run hangs forever with queue work still pending, since
-        run()'s own select-timeout branch never re-calls this method on
-        its own (it only re-dispatches after an actual drain). Re-invoke
-        once more whenever this pass added a worker that this same pass's
-        snapshot could not see, so a same-pass replacement gets its first
-        nodeid immediately rather than waiting on an event that may never
-        arrive. Bounded: each further BrokenPipeError requires an actual
-        subprocess round-trip through _replace_worker/spawn_worker before
-        recursing again, and requeue_once caps any one nodeid at two
-        attempts."""
-        before = set(self.workers)
-        for pid, state in list(self.workers.items()):
-            if state["in_flight"] is not None:
-                continue
-            nodeid = self.next_nodeid()
-            if nodeid is None:
-                continue
-            state["in_flight"] = nodeid
-            try:
-                state["dispatch_write"].write(nodeid + "\n")
-                state["dispatch_write"].flush()
-            except BrokenPipeError:
-                # in_flight already correctly holds the nodeid we just
-                # tried to send -- _handle_worker_exit's normal
-                # requeue-once/unevaluated bookkeeping applies exactly as
-                # it does for a worker that dies mid-test.
-                self._handle_worker_exit(pid, state)
-        if set(self.workers) - before:
-            self._dispatch_to_idle_workers()
+        but that new worker is invisible to a `list(...)` snapshot this
+        pass already took, so it would never get a nodeid dispatched to it
+        THIS pass. If it is the only live worker left (--aitest-workers=1,
+        or simply the last one standing), nothing would ever make its
+        result_fd ready in run()'s select() loop, since it has nothing in
+        flight to report -- the run hangs forever with queue work still
+        pending, since run()'s own select-timeout branch never re-calls
+        this method on its own (it only re-dispatches after an actual
+        drain). Re-scan whenever a pass crashes a worker, so a same-pass
+        replacement gets its first nodeid immediately rather than waiting
+        on an event that may never arrive.
+
+        SIMPLIFIED (Fable build-review, final gate): an earlier version of
+        this fix re-invoked itself recursively, terminated by comparing
+        `set(self.workers)` before and after each pass -- correct in every
+        practically reachable case, but with two real (if unlikely) edges
+        an iterative loop is immune to: a systemic instantly-dying-worker
+        pathology could in principle recurse deep enough to hit CPython's
+        default 1000-frame limit (bounded only by requeue_once's own
+        per-nodeid cap, roughly 2x the remaining queue), and the pid-set
+        diff has a pid-reuse blind spot (astronomically rare, but
+        structurally avoidable). Looping on "did this pass crash a
+        worker" instead of "did the pid set change" removes both -- no
+        recursion depth at all, and no dependence on pid identity."""
+        while True:
+            crashed_this_pass = False
+            for pid, state in list(self.workers.items()):
+                if state["in_flight"] is not None:
+                    continue
+                nodeid = self.next_nodeid()
+                if nodeid is None:
+                    continue
+                state["in_flight"] = nodeid
+                try:
+                    state["dispatch_write"].write(nodeid + "\n")
+                    state["dispatch_write"].flush()
+                except BrokenPipeError:
+                    # in_flight already correctly holds the nodeid we just
+                    # tried to send -- _handle_worker_exit's normal
+                    # requeue-once/unevaluated bookkeeping applies exactly
+                    # as it does for a worker that dies mid-test.
+                    crashed_this_pass = True
+                    self._handle_worker_exit(pid, state)
+            if not crashed_this_pass:
+                return
 
     def _retire_worker(self, pid, state):
         try:
@@ -678,7 +743,17 @@ class Supervisor:
                 return
             except (WorkerAdmitUnavailable, WorkerPlacementFailed) as exc:
                 self._disable_daemon(str(exc))
-        self._spawn_fallback_worker()
+        # Enforce the SAME min(worker_count, max_workers_fallback) TOTAL
+        # pool cap run()'s own startup path already enforces (Fable
+        # build-review, final gate): this call used to spawn a fallback
+        # worker unconditionally on every mid-run retirement once the
+        # daemon went unavailable, so a run that had admitted N confined
+        # workers before a mid-run daemon crash converged back to N
+        # concurrent UNCONFINED workers instead of draining down to the
+        # promised cap -- directly contradicting _disable_daemon's own
+        # warning text ("falling back to n_workers<=%d").
+        if len(self.workers) < min(self._run_worker_count, self.max_workers_fallback):
+            self._spawn_fallback_worker()
 
     def _drain_worker(self, pid, state):
         """Handles every line CURRENTLY AVAILABLE for this worker's result
@@ -787,6 +862,7 @@ class Supervisor:
         gc.freeze()
         self._run_estimated_bytes = estimated_bytes
         self._run_max_wait = max_wait
+        self._run_worker_count = worker_count
         if self.daemon_available:
             for _ in range(worker_count):
                 if not self.queue:

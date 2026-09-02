@@ -8,6 +8,7 @@ is driven from a pytest_runtestloop hookimpl added in Task 17, once
 """
 
 import os
+import sys
 
 import pytest
 
@@ -99,6 +100,11 @@ def _resolve_worker_count(workers_option):
     return count
 
 
+_ESTIMATED_BYTES_MIN = 1 << 20  # must match the daemon's own
+# workerAdmitEstimatedBytesMin (internal/daemon/worker_admit.go) and the
+# CLI's mirrored client-side floor (runWorkerAdmitCommand, cmd/aira/main.go)
+
+
 def _resolve_estimated_bytes():
     # Slice 1: a pinned per-worker memory.max backstop from an env var.
     # Suite-signature-based sizing (design spec 3.3) is a safety-backstop
@@ -109,4 +115,24 @@ def _resolve_estimated_bytes():
         value = int(raw)
     except ValueError:
         value = 0
-    return value if value > 0 else (512 << 20)
+    if value <= 0:
+        return 512 << 20
+    if value < _ESTIMATED_BYTES_MIN:
+        # Clamp UP here, before this value ever reaches the wire (Fable
+        # build-review, final gate): an unclamped too-small value used to
+        # reach the CLI's own floor rejection unchanged, whose
+        # E_CONFINE_ARGUMENT_INVALID-prefixed stderr message matched none
+        # of acquire_worker's recognized denied/timeout/unevaluated/
+        # local-placement-failed substrings and fell through to
+        # WorkerAdmitUnavailable -- permanently stripping containment for
+        # the WHOLE run over a user typo in this env var, on a daemon
+        # that was never actually unreachable. This is a purely local,
+        # static mistake, not a daemon condition at all, so it is fixed
+        # here rather than by teaching the classifier yet another
+        # substring.
+        sys.stderr.write(
+            "aira aitest: AIRA_AITEST_ESTIMATED_BYTES=%d is below the %d-byte "
+            "minimum; using %d\n" % (value, _ESTIMATED_BYTES_MIN, _ESTIMATED_BYTES_MIN)
+        )
+        return _ESTIMATED_BYTES_MIN
+    return value
