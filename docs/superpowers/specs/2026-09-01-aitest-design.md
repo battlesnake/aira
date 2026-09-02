@@ -213,7 +213,25 @@ be established this instant (AIRA's own "report unevaluated, never a fake
 pass" rule applied to this check), never that there is no daemon to talk to
 at all. Routing it into permanent unconfined fallback (the treatment correct
 only for genuine unreachability, §3.7) would strip containment for the rest
-of the run over what is usually a transient glitch.
+of the run over what is usually a transient glitch — the one named exception
+being the structural `unevaluated: unbounded` case §3.7 itself calls out.
+
+**Reason-string convention.** A `denied` response's `reason` is always
+prefixed `reject:` or `fallback:`, and the distinction is load-bearing, not
+decorative: `reject:*` (e.g. `reject:exceeds-ceiling`, the request's own
+sizing can never fit; `reject:outer-scope-owned-by-another-job`, ownership
+binds permanently and is never released) is a stable, request-level fact the
+daemon itself already knows will never change — its own poll loop
+(`workerAdmitConnection`) breaks on it immediately rather than waiting out
+`max_wait_ms`, and a client must treat it as terminal for the affected work
+(mark unevaluated, never retry, never disable the daemon). `fallback:*`
+(e.g. `fallback:insufficient-headroom`, `fallback:aggregate-cap-exceeded`)
+is the ordinary transient case — live occupancy or committed capacity has no
+room *right now*, and the daemon's own poll loop keeps retrying until it
+clears or `max_wait_ms` converts it to `timeout`. A future client must parse
+this prefix explicitly rather than hand-matching individual reason strings,
+or it will silently misclassify any new `reject:*` reason the daemon adds
+later as retriable.
 
 On `granted`, the supervisor places the forked worker into `scope_path`. This
 reuses `RunConfineSetup`'s verified-placement handshake
@@ -306,8 +324,19 @@ busy/contended, and the request waited out its own poll window), or
 `unevaluated` (a live memory read momentarily failed on an otherwise-live
 daemon) response from a daemon that is plainly still there: those mean
 "don't add a worker at this moment," not "abandon containment for the
-rest of the run." Conflating fallback-worthy conditions with merely-
-declined ones (exactly what an earlier revision of this design did)
+rest of the run." **One `unevaluated` sub-case IS a fallback trigger,
+not a transient one, and is genuinely structural**: an outer scope whose
+own `memory.max` reads back `"unbounded"` (reason `unbounded`) can never
+become capped by waiting, since a real confine-launched outer scope is
+always given a finite `memory.max` by the daemon as part of the same
+atomic grant that launches it — before it is ever queryable. This
+specific shape signals the client asked about a scope that isn't a real,
+daemon-admitted outer scope at all (found live: a second aitest-enabled
+pytest invocation nested inside one confine job can discover a prior
+run's own uncapped supervisor scope as its "outer"), so it is classified
+alongside the two triggers above rather than retried forever. Conflating
+fallback-worthy conditions with merely-declined ones (exactly what an
+earlier revision of this design did)
 defeats the point of admission — a single contended moment would
 otherwise permanently strip containment from everything after it. The
 client-side exception types this distinction requires
