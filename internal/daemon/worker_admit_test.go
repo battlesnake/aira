@@ -81,6 +81,52 @@ func TestEvaluateWorkerAdmitDeniesWhenAggregateCapsWouldExceedCeiling(t *testing
 	}
 }
 
+func TestEvaluateWorkerAdmitAggregateGuardAccountsForSupervisorRSS(t *testing.T) {
+	// Found by a second review round: the first version of the aggregate
+	// guard summed only worker memory.max caps, entirely omitting the
+	// supervisor's own live footprint -- a warm-imported pytest
+	// supervisor (spec 3.1/3.2: COW-shared interpreter state is the whole
+	// design premise) can routinely hold hundreds of MiB, far more than
+	// the default 64MiB headroom alone budgets for. Even the VERY FIRST
+	// grant (committed == 0, so the old check trivially passed) must be
+	// denied here once the supervisor's own usage is accounted for.
+	server := NewServer(Paths{})
+	server.workerAdmitHeadroom = 0
+	live := map[string]int64{}
+	server.admitReadMemory = admitReadMemoryFixture(live, 1000)
+	live[runner.WorkerScopeChildPath("/outer", "supervisor")] = 400
+	// 700 alone fits under the outer ceiling (1000) and under the old
+	// committed-only guard (committed=0 before any grant) -- but
+	// supervisor(400)+700=1100 > 1000, so this must now be denied.
+	denied := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
+	if denied.State != "denied" || denied.Reason != "fallback:aggregate-cap-exceeded" {
+		t.Fatalf("denied (supervisor-rss-guarded) =%+v", denied)
+	}
+	// A request that fits alongside the supervisor's footprint is granted.
+	granted := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 500, maxWaitMS: 0})
+	if granted.State != "granted" {
+		t.Fatalf("granted (fits alongside supervisor rss) =%+v", granted)
+	}
+}
+
+func TestEvaluateWorkerAdmitReturnsUnevaluatedWhenSupervisorScopeUnreadable(t *testing.T) {
+	// Fail toward safety: an unreadable supervisor-scope read must never
+	// silently admit (it could hide an arbitrarily large real footprint) --
+	// same philosophy as the outer-scope-unreadable case below.
+	server := NewServer(Paths{})
+	server.workerAdmitHeadroom = 0
+	server.admitReadMemory = func(path string) (int64, int64, int64, bool, string) {
+		if path == "/outer" {
+			return 0, 1000, 0, true, ""
+		}
+		return 0, 0, 0, false, "fallback:supervisor-scope-unreadable"
+	}
+	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400, maxWaitMS: 0})
+	if response.State != "unevaluated" {
+		t.Fatalf("response=%+v", response)
+	}
+}
+
 func TestEvaluateWorkerAdmitReturnsUnevaluatedWhenOuterScopeLiveUsageUnreadable(t *testing.T) {
 	// Fail toward safety, ported to the single-read model: admission no
 	// longer reads individual worker-scope paths at all (dropped along

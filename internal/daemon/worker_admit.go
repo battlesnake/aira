@@ -143,11 +143,34 @@ func (s *Server) evaluateWorkerAdmit(req workerAdmitRequest) WorkerAdmitResponse
 	// build-review (a live-usage-only check is silent on the SUM of caps,
 	// only on CURRENT usage). Pollable, not an immediate reject: an
 	// existing worker retiring frees its share of committed capacity.
+	//
+	// CORRECTED (found by a second review round: the first version of
+	// this guard omitted the supervisor's own footprint entirely). The
+	// worst case isn't just Σ(worker caps) — it's supervisor RSS PLUS
+	// Σ(worker caps), and a warm-imported pytest supervisor (spec 3.1/3.2:
+	// COW-shared interpreter state is the whole point of this design) can
+	// routinely hold hundreds of MiB, far more than headroom (64MiB
+	// default) alone budgets for. Concretely: an 8G outer cap with a 600M
+	// supervisor and eight workers each admitted at 970M (low live usage
+	// at grant time) would pass both checks above (Σcaps=7.76G ≤
+	// ceiling≈7.94G) yet still exceed the outer cap once every worker
+	// grows to its own peak (600M+7.76G=8.36G > 8G) — the exact
+	// outer-scope oom.group incident Goal 2 requires be impossible.
+	// Reading the supervisor scope's own live memory.current and
+	// subtracting it here closes that gap; an unreadable supervisor
+	// scope reports unevaluated (fail toward safety — this codebase never
+	// silently admits on a read it cannot establish), same as an
+	// unreadable outer scope above.
+	supervisorScope := runner.WorkerScopeChildPath(req.outerScope, "supervisor")
+	supervisorUsed, _, _, supervisorOK, supervisorReason := readMemory(supervisorScope)
+	if !supervisorOK {
+		return WorkerAdmitResponse{State: "unevaluated", Reason: "supervisor scope unreadable: " + supervisorReason}
+	}
 	var committed int64
 	for _, grant := range job.grants {
 		committed += grant.memoryMax
 	}
-	if req.estimatedBytes > ceiling-committed {
+	if req.estimatedBytes > ceiling-committed-supervisorUsed {
 		return WorkerAdmitResponse{State: "denied", Reason: "fallback:aggregate-cap-exceeded"}
 	}
 	job.nextSeq++
