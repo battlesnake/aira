@@ -8,13 +8,14 @@ from aitest.worker import _RECYCLE_SUFFIX, fork_worker, run_worker_loop
 
 
 _STOP_LINE = "__stop__"
-_STARTUP_DENIAL_RETRY_SECONDS = 1.0
+_DENIAL_RETRY_SECONDS = 1.0
 # How often (in retry attempts, i.e. roughly every N seconds at the above
 # interval) to remind stderr that a run is stalled waiting on a reachable
-# but saturated daemon -- see run()'s startup-retry loop. A stuck run must
-# never be SILENT, even though it must also never fall back to unconfined
-# just because the wait is long.
-_STARTUP_DENIAL_WARN_EVERY = 30
+# but saturated daemon -- see _wait_for_admission_or_disable, shared by
+# run()'s startup path and _replace_worker's "this was the last worker"
+# path. A stuck run must never be SILENT, even though it must also never
+# fall back to unconfined just because the wait is long.
+_DENIAL_WARN_EVERY = 30
 
 
 class WorkerAdmitUnavailable(Exception):
@@ -386,18 +387,42 @@ class Supervisor:
         return pid
 
     def _dispatch_to_idle_workers(self):
-        for state in self.workers.values():
+        """CORRECTED by a second review round: a worker that reports its
+        result (cleared to idle by _drain_worker) can still die -- crash,
+        OOM -- in the gap between that drain and this dispatch, one
+        select() wakeup later than the same-pass EOF case the previous
+        fix closed. Without a guard here, the write below raises an
+        unguarded BrokenPipeError straight out of run(), crashing the
+        whole suite and losing every remaining result. list(...) snapshots
+        self.workers since _handle_worker_exit (via _retire_worker) can
+        mutate it mid-iteration."""
+        for pid, state in list(self.workers.items()):
             if state["in_flight"] is not None:
                 continue
             nodeid = self.next_nodeid()
             if nodeid is None:
                 continue
             state["in_flight"] = nodeid
-            state["dispatch_write"].write(nodeid + "\n")
-            state["dispatch_write"].flush()
+            try:
+                state["dispatch_write"].write(nodeid + "\n")
+                state["dispatch_write"].flush()
+            except BrokenPipeError:
+                # in_flight already correctly holds the nodeid we just
+                # tried to send -- _handle_worker_exit's normal
+                # requeue-once/unevaluated bookkeeping applies exactly as
+                # it does for a worker that dies mid-test.
+                self._handle_worker_exit(pid, state)
 
     def _retire_worker(self, pid, state):
-        state["dispatch_write"].close()
+        try:
+            state["dispatch_write"].close()
+        except BrokenPipeError:
+            # close() on a buffered writer flushes first -- if the
+            # worker's already dead (found by the same test that caught
+            # the dispatch/stop-write gaps above), the flush itself
+            # raises. Retirement must proceed regardless; there is
+            # nothing left to flush TO.
+            pass
         try:
             os.close(state["result_fd"])
         except OSError:
@@ -425,6 +450,46 @@ class Supervisor:
                 sys.stderr.write("aira aitest: could not remove worker scope %s: %s\n" % (grant["scope"], exc))
         del self.workers[pid]
 
+    def _wait_for_admission_or_disable(self, spawn):
+        """Retries spawn() (a zero-arg callable performing one admission
+        attempt) INDEFINITELY on WorkerAdmitDenied, with a loud periodic
+        stderr warning so a stalled run is never silent. Returns on
+        success, or on WorkerAdmitUnavailable/WorkerPlacementFailed
+        (which _disable_daemon and the caller's own fallback handle) --
+        never on denial-exhaustion, because there is no such thing here:
+        a daemon that stays reachable but saturated forever means the run
+        genuinely waits forever, which is the honest outcome, not this
+        method's job to silently degrade safety instead.
+
+        Shared by two callers that hit the identical "zero workers, queue
+        still has work, no other retirement left to hook a retry off of"
+        hazard: run()'s startup path (before any worker has ever been
+        admitted) and _replace_worker's "this was the LAST worker"
+        path (found by a second review round -- the original fix only
+        covered the startup case; retiring the last worker on a plain
+        denial left the exact same hazard unaddressed one level later,
+        since _dispatch_to_idle_workers never fires and the main loop's
+        `while self.workers:` would simply exit with the queue still
+        non-empty, dropping every remaining nodeid to unevaluated)."""
+        attempt = 0
+        while self.daemon_available:
+            try:
+                spawn()
+                return
+            except WorkerAdmitDenied:
+                pass
+            except (WorkerAdmitUnavailable, WorkerPlacementFailed) as exc:
+                self._disable_daemon(str(exc))
+                return
+            attempt += 1
+            time.sleep(_DENIAL_RETRY_SECONDS)
+            if attempt % _DENIAL_WARN_EVERY == 0:
+                sys.stderr.write(
+                    "aira aitest: still waiting for worker admission after %d attempts "
+                    "(daemon reachable, budget contended) -- containment preserved, "
+                    "not falling back to unconfined\n" % attempt
+                )
+
     def _replace_worker(self):
         """Acquire a fresh worker if queue work remains -- shared by the
         recycle and crash/retry paths.
@@ -432,9 +497,12 @@ class Supervisor:
         WorkerAdmitDenied (the daemon IS reachable, it just declined this
         particular request right now -- budget exhausted or contended)
         leaves daemon_available untouched: simply don't replace this
-        worker yet. The NEXT retirement's _replace_worker call (or a later
-        dispatch pass) tries again -- one saturated moment must never
-        permanently strip containment for the rest of the run.
+        worker yet -- UNLESS this was the last worker (self.workers is
+        already empty by the time this runs; the caller always retires
+        before replacing), in which case there is no other retirement
+        left to hook a later retry off of, so wait it out the same way
+        run()'s startup path does rather than let the run end with queue
+        work still undone.
 
         WorkerAdmitUnavailable (no daemon to talk to at all) and
         WorkerPlacementFailed (the cgroup mechanism itself is broken
@@ -449,7 +517,21 @@ class Supervisor:
                 self.spawn_worker(self._run_estimated_bytes, max_wait=self._run_max_wait)
                 return
             except WorkerAdmitDenied:
-                return
+                if self.workers:
+                    # Another worker is still running; ITS eventual
+                    # retirement calls _replace_worker again and retries.
+                    return
+                self._wait_for_admission_or_disable(
+                    lambda: self.spawn_worker(self._run_estimated_bytes, max_wait=self._run_max_wait)
+                )
+                if self.daemon_available:
+                    return  # the wait succeeded -- a confined worker now exists
+                # else: the wait's own WorkerAdmitUnavailable/
+                # WorkerPlacementFailed branch already called
+                # _disable_daemon -- fall through to the SAME
+                # fallback-spawn every other daemon-unavailable path in
+                # this function already uses, rather than return here and
+                # leave the pool empty with queue work still undone.
             except (WorkerAdmitUnavailable, WorkerPlacementFailed) as exc:
                 self._disable_daemon(str(exc))
         self._spawn_fallback_worker()
@@ -570,42 +652,15 @@ class Supervisor:
             # containment (denied != unavailable, above) -- but with ZERO
             # workers admitted yet there is also no later retirement to
             # hook a retry off of (_replace_worker only fires when an
-            # EXISTING worker retires). Keep retrying to get AT LEAST one
-            # worker running, INDEFINITELY on a plain denial, with a loud
-            # periodic warning so a stuck run is never silent -- never a
-            # bounded give-up-and-fall-back-to-unconfined here.
-            #
-            # CORRECTED by build-review: this loop originally gave up after
-            # a small bounded number of attempts and called
-            # _disable_daemon on exhaustion -- exactly the "one saturated
-            # moment permanently strips containment" bug this whole
-            # daemon-reachable/denied vs. daemon-unavailable split exists
-            # to prevent (spec 3.7), reproduced live: a persistently
-            # `denied` (never `unavailable`) response still ran the rest
-            # of the suite unconfined. Only a genuine WorkerAdmitUnavailable
-            # or WorkerPlacementFailed may ever call _disable_daemon --
-            # never exhausting a denial-retry budget. A daemon that stays
-            # saturated forever means this run genuinely waits forever,
-            # which is the honest outcome; it is the caller's job (a
-            # human, or an outer CI timeout) to notice and intervene, not
-            # this method's job to silently degrade safety instead.
-            attempt = 0
-            while self.daemon_available and not self.workers and self.queue:
-                attempt += 1
-                time.sleep(_STARTUP_DENIAL_RETRY_SECONDS)
-                if attempt % _STARTUP_DENIAL_WARN_EVERY == 0:
-                    sys.stderr.write(
-                        "aira aitest: still waiting for worker admission after %d attempts "
-                        "(daemon reachable, budget contended) -- containment preserved, "
-                        "not falling back to unconfined\n" % attempt
-                    )
-                try:
-                    self.spawn_worker(estimated_bytes, max_wait=max_wait)
-                except WorkerAdmitDenied:
-                    continue
-                except (WorkerAdmitUnavailable, WorkerPlacementFailed) as exc:
-                    self._disable_daemon(str(exc))
-                    break
+            # EXISTING worker retires). Wait it out via the same shared,
+            # INDEFINITELY-retrying-on-denial helper _replace_worker uses
+            # for its own "last worker" case -- see
+            # _wait_for_admission_or_disable's docstring for the full
+            # rationale (spec 3.7; a daemon that stays saturated forever
+            # means this run genuinely waits forever, which is the honest
+            # outcome, never a silent degrade to unconfined).
+            if self.daemon_available and not self.workers and self.queue:
+                self._wait_for_admission_or_disable(lambda: self.spawn_worker(estimated_bytes, max_wait=max_wait))
         if not self.daemon_available:
             # Cap TOTAL concurrent workers (already-admitted + fallback) at
             # the configured pool size -- min(worker_count,
@@ -632,8 +687,11 @@ class Supervisor:
             self._dispatch_to_idle_workers()
             if not self.queue and all(state["in_flight"] is None for state in self.workers.values()):
                 for pid, state in list(self.workers.items()):
-                    state["dispatch_write"].write(_STOP_LINE + "\n")
-                    state["dispatch_write"].flush()
+                    try:
+                        state["dispatch_write"].write(_STOP_LINE + "\n")
+                        state["dispatch_write"].flush()
+                    except BrokenPipeError:
+                        pass  # already dead -- nothing to signal, retire below regardless
                     self._retire_worker(pid, state)
         # Best-effort: rmdir the supervisor's OWN child scope this run
         # relocated itself into (bootstrap, Task 2/3/11). The OUTER scope

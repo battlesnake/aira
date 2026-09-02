@@ -333,6 +333,103 @@ def test_drain_worker_handles_eof_arriving_with_final_result_in_one_pass():
     os.close(dispatch_read)
 
 
+def test_dispatch_to_idle_workers_handles_worker_that_died_since_last_drain(monkeypatch):
+    """Regression test for a real bug a second review round found: a
+    worker that reports its result (marked idle by _drain_worker) can
+    still die -- crash, OOM -- in the gap BEFORE its next dispatch, one
+    select() wakeup later than the same-pass EOF case the earlier fix
+    closed. Without a guard, the write below raises an unguarded
+    BrokenPipeError straight out of run(), crashing the whole suite and
+    losing every remaining result. _replace_worker is stubbed out to
+    isolate this test to the dispatch/crash-detection path itself,
+    without cascading into a real replacement-worker spawn."""
+    dispatch_read, dispatch_write = os.pipe()
+    os.close(dispatch_read)  # the worker (and its read end) is already gone
+
+    result_read, result_write = os.pipe()
+    os.set_blocking(result_read, False)
+
+    supervisor = Supervisor()
+    supervisor.queue = ["pkg/test_mod.py::test_x"]
+    monkeypatch.setattr(supervisor, "_replace_worker", lambda: None)
+    pid = 999998
+    state = {
+        "result_fd": result_read, "read_buffer": b"", "result_eof": False,
+        "in_flight": None,
+        "dispatch_write": os.fdopen(dispatch_write, "w"),
+        "admit_process": None, "grant": None,
+    }
+    supervisor.workers[pid] = state
+
+    supervisor._dispatch_to_idle_workers()  # must not raise BrokenPipeError
+
+    assert pid not in supervisor.workers, "dead worker must be retired, not left registered"
+    assert supervisor.queue == ["pkg/test_mod.py::test_x"], "nodeid requeued (attempt 1 of 2), not lost"
+    assert "pkg/test_mod.py::test_x" not in supervisor.results
+    os.close(result_write)
+
+
+def test_persistent_denial_at_last_worker_retirement_never_ends_run_early(tmp_path, monkeypatch, pytester):
+    """Regression test for a real bug a second review round found: when
+    the LAST live worker retires (here, via recycle) and its replacement
+    is denied, _replace_worker used to just return without spawning,
+    relying on "the next retirement" to try again -- but there IS no next
+    retirement when the pool is already empty, so the main loop's
+    `while self.workers:` would exit immediately with the queue still
+    non-empty, dropping every remaining nodeid to unevaluated. Forces
+    exactly this: worker_count=1, recycle after 1 test, and the
+    replacement admission call denies several times before granting."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+import sys
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+sys.exit(0)
+""")
+    denial_state = tmp_path / "denials-remaining"
+    denial_state.write_text("5")
+    call_count_path = tmp_path / "admit-call-count"
+    call_count_path.write_text("0")
+    admit = _write_stub(tmp_path / "worker-admit", f"""
+import os, sys
+calls = int(open({str(call_count_path)!r}).read()) + 1
+open({str(call_count_path)!r}, "w").write(str(calls))
+# Only the replacement call (after the first worker recycles) is denied a
+# few times -- the very first call must succeed so a worker actually
+# starts and can complete a test to trigger recycle.
+if calls > 1:
+    remaining = int(open({str(denial_state)!r}).read())
+    if remaining > 0:
+        open({str(denial_state)!r}, "w").write(str(remaining - 1))
+        sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit denied: fallback:insufficient-headroom\\n")
+        sys.exit(1)
+scope = os.path.join({str(outer)!r}, "worker-scope-%d-%d" % (os.getpid(), calls))
+os.makedirs(scope, exist_ok=True)
+print("granted scope=%s worker_id=%d memory_max=104857600 memory_high=83886080" % (scope, calls))
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", "1")
+    monkeypatch.setattr("aitest.supervisor._DENIAL_RETRY_SECONDS", 0.01)
+
+    items = pytester.getitems("""
+        def test_one():
+            assert True
+
+        def test_two():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+
+    assert len(results) == 2
+    assert all(outcome == "passed" for outcome in results.values())
+    assert supervisor.daemon_available is True
+
+
 def test_daemon_down_fallback_completes_suite_with_one_warning_no_admit_subprocess(tmp_path, monkeypatch, pytester, capsys):
     monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", str(tmp_path / "missing-bootstrap"))
     monkeypatch.setenv("AIRA_AITEST_MAX_WORKERS_FALLBACK", "2")
@@ -449,7 +546,7 @@ sys.stdin.buffer.read()
 """)
     monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
-    monkeypatch.setattr("aitest.supervisor._STARTUP_DENIAL_RETRY_SECONDS", 0.01)
+    monkeypatch.setattr("aitest.supervisor._DENIAL_RETRY_SECONDS", 0.01)
 
     items = pytester.getitems("""
         def test_one():
