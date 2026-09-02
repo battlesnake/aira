@@ -80,13 +80,7 @@ func removeScopeTree(t *testing.T, parent string) {
 	t.Helper()
 	_ = os.WriteFile(filepath.Join(parent, "cgroup.kill"), []byte("1"), 0o644)
 	for i := 0; i < 200; i++ {
-		if entries, err := os.ReadDir(parent); err == nil {
-			for _, e := range entries {
-				if e.IsDir() {
-					_ = os.Remove(filepath.Join(parent, e.Name()))
-				}
-			}
-		}
+		removeScopeTreeChildren(parent)
 		if os.Remove(parent) == nil {
 			return
 		}
@@ -96,6 +90,31 @@ func removeScopeTree(t *testing.T, parent string) {
 		t.Errorf("cgroup scope parent leaked (not removed within budget): %s", parent)
 	} else {
 		t.Logf("cgroup scope parent leaked (not removed within budget): %s", parent)
+	}
+}
+
+// removeScopeTreeChildren makes one best-effort DEPTH-FIRST pass, removing a
+// directory's own children before the directory itself -- a cgroup directory
+// with live children can never be removed by a plain os.Remove. Found live
+// by Fable's final build-review gate (AIRA-30): the previous single-level
+// version only ever tried removing removeScopeTree's immediate children,
+// which could never drain a nested scope tree like aitest's own
+// outer -> .aira-supervisor / .aira-worker-N layout -- every real-cgroup
+// aitest test hard-FAILed under AIRA_REAL_CGROUP=1 ("cgroup scope parent
+// leaked"), and every default-tier run silently leaked the tree into the
+// live shared aira.slice instead.
+func removeScopeTreeChildren(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		child := filepath.Join(dir, e.Name())
+		removeScopeTreeChildren(child)
+		_ = os.Remove(child)
 	}
 }
 
