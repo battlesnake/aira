@@ -78,15 +78,14 @@ func SkipOrFailRealCgroup(t *testing.T, format string, args ...any) {
 // surfaced (hard-failed under mandatory-real mode) rather than left silently green.
 func removeScopeTree(t *testing.T, parent string) {
 	t.Helper()
+	// cgroup.kill is hierarchical — it kills every process in the subtree, so one
+	// write to the parent drains grandchildren too.
 	_ = os.WriteFile(filepath.Join(parent, "cgroup.kill"), []byte("1"), 0o644)
 	for i := 0; i < 200; i++ {
-		if entries, err := os.ReadDir(parent); err == nil {
-			for _, e := range entries {
-				if e.IsDir() {
-					_ = os.Remove(filepath.Join(parent, e.Name()))
-				}
-			}
-		}
+		// Remove descendant cgroups deepest-first: a child that itself has child
+		// cgroups (a nested test tree) cannot be rmdir'd until its own children
+		// are gone, so a depth-1 sweep would leak nested trees onto the live slice.
+		removeCgroupSubtreeChildren(parent)
 		if os.Remove(parent) == nil {
 			return
 		}
@@ -96,6 +95,26 @@ func removeScopeTree(t *testing.T, parent string) {
 		t.Errorf("cgroup scope parent leaked (not removed within budget): %s", parent)
 	} else {
 		t.Logf("cgroup scope parent leaked (not removed within budget): %s", parent)
+	}
+}
+
+// removeCgroupSubtreeChildren rmdirs every descendant cgroup directory of dir
+// deepest-first (post-order), leaving dir itself. Only directories are child
+// cgroups (a cgroup holds many regular interface files); after the caller's
+// hierarchical cgroup.kill has drained the subtree, each empty descendant rmdirs
+// cleanly. Best-effort: a still-populated node just fails its rmdir and is retried.
+func removeCgroupSubtreeChildren(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		child := filepath.Join(dir, e.Name())
+		removeCgroupSubtreeChildren(child)
+		_ = os.Remove(child)
 	}
 }
 
