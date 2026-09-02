@@ -19,6 +19,11 @@ import (
 // fixed default for Slice 1.
 const workerAdmitHeadroomDefault int64 = 64 << 20 // 64 MiB
 
+// workerAdmitEstimatedBytesMin matches --memory-reserve's minimum
+// (cmd/aira/main.go), so a sub-page estimate can never floor memory.max to
+// zero pages and instant-OOM the worker on placement.
+const workerAdmitEstimatedBytesMin int64 = 1 << 20 // 1 MiB
+
 // WorkerAdmitResponse is the one grant/denial payload the worker-admit
 // connection sends before optionally holding itself open as the lease.
 type WorkerAdmitResponse struct {
@@ -101,10 +106,18 @@ func (s *Server) evaluateWorkerAdmit(req workerAdmitRequest) WorkerAdmitResponse
 	if readMemory == nil {
 		readMemory = readSliceMemory
 	}
-	used, outerMax, _, ok, reason := readMemory(req.outerScope)
+	used, outerMax, reclaimable, ok, reason := readMemory(req.outerScope)
 	if !ok {
 		return WorkerAdmitResponse{State: "unevaluated", Reason: reason}
 	}
+	// memory.stat's file pages are reclaimable cache, not non-negotiable
+	// worker pressure. Match checkedAvailable's exact floor-and-discount
+	// arithmetic so a read-heavy test suite is not persistently denied even
+	// though the kernel can reclaim this cache below the outer cap.
+	if reclaimable < 0 {
+		reclaimable = 0
+	}
+	used = subtractFloor(used, reclaimable)
 	headroom := s.workerAdmitHeadroom
 	if headroom < 0 {
 		headroom = 0
@@ -162,10 +175,17 @@ func (s *Server) evaluateWorkerAdmit(req workerAdmitRequest) WorkerAdmitResponse
 	// silently admits on a read it cannot establish), same as an
 	// unreadable outer scope above.
 	supervisorScope := runner.WorkerScopeChildPath(req.outerScope, "supervisor")
-	supervisorUsed, _, _, supervisorOK, supervisorReason := readMemory(supervisorScope)
+	supervisorUsed, _, supervisorReclaimable, supervisorOK, supervisorReason := readMemory(supervisorScope)
 	if !supervisorOK {
 		return WorkerAdmitResponse{State: "unevaluated", Reason: "supervisor scope unreadable: " + supervisorReason}
 	}
+	// Apply the same reclaimable-cache discount to the supervisor half of the
+	// aggregate guard. Its memory.current is otherwise a second source of
+	// spurious denials after the supervisor has populated page cache.
+	if supervisorReclaimable < 0 {
+		supervisorReclaimable = 0
+	}
+	supervisorUsed = subtractFloor(supervisorUsed, supervisorReclaimable)
 	var committed int64
 	for _, grant := range job.grants {
 		committed += grant.memoryMax
@@ -229,8 +249,8 @@ func validateWorkerAdmitArgs(args map[string]any) (workerAdmitRequest, error) {
 	// reused rather than the naive int64(estimated) truncation this used
 	// to do, which let an arbitrary huge float64 truncate unchecked.
 	estimated, ok := exactAdmitInt64(args["estimated_bytes"])
-	if !ok || estimated <= 0 || estimated > admitMaxReserve {
-		return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit estimated_bytes must be a positive number no larger than %d", CodeProtocol, admitMaxReserve)
+	if !ok || estimated < workerAdmitEstimatedBytesMin || estimated > admitMaxReserve {
+		return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit estimated_bytes must be at least %d bytes and no larger than %d", CodeProtocol, workerAdmitEstimatedBytesMin, admitMaxReserve)
 	}
 	req.estimatedBytes = estimated
 	maxWait, ok := exactAdmitInt64(args["max_wait_ms"])
@@ -248,6 +268,7 @@ func validateWorkerAdmitArgs(args map[string]any) (workerAdmitRequest, error) {
 }
 
 func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
+	start := s.admitNowTime()
 	req, err := validateWorkerAdmitArgs(args)
 	if err != nil {
 		_ = writeFrame(conn, errorFrame(CodeProtocol, err.Error()))
@@ -294,6 +315,10 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 			return
 		}
 	}
+	// Every response below is written as a single terminal decision. Use the
+	// admit clock seam (rather than time.Now) so its observed wait is both
+	// consistent with deadline handling and deterministic in tests.
+	response.WaitedMS = elapsedMilliseconds(start, s.admitNowTime())
 
 	// A "granted" response has ALREADY inserted a ledger entry inside
 	// evaluateWorkerAdmit above. From this point on, EVERY exit path —

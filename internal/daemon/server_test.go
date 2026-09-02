@@ -1318,7 +1318,7 @@ func TestPathsNamespaceStateIdentity(t *testing.T) {
 func TestServerDispatchesWorkerAdmitVerbOverRealSocket(t *testing.T) {
 	paths := testPaths(t)
 	server := NewServer(paths)
-	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 4*workerAdmitEstimatedBytesMin)
 	server.workerAdmitHeadroom = 0
 	_, _ = startServer(t, server)
 	scope := testScope(t, paths, "one")
@@ -1331,7 +1331,7 @@ func TestServerDispatchesWorkerAdmitVerbOverRealSocket(t *testing.T) {
 	if err := writeFrame(conn, RequestFrame{
 		Proto: ProtocolVersion, Scope: scope,
 		Request: core.Request{Verb: "worker-admit", Args: map[string]any{
-			"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(400), "max_wait_ms": float64(0),
+			"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(workerAdmitEstimatedBytesMin), "max_wait_ms": float64(0),
 		}},
 	}); err != nil {
 		t.Fatal(err)

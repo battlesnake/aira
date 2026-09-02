@@ -25,7 +25,7 @@ func admitReadMemoryFixture(current map[string]int64, outerMax int64) func(strin
 
 func TestValidateWorkerAdmitArgsClampsMaxWait(t *testing.T) {
 	base := map[string]any{
-		"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": int64(1),
+		"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": workerAdmitEstimatedBytesMin,
 	}
 	for _, test := range []struct {
 		name string
@@ -46,6 +46,33 @@ func TestValidateWorkerAdmitArgsClampsMaxWait(t *testing.T) {
 				t.Fatalf("request=%+v err=%v, want maxWaitMS=%d", request, err, test.want)
 			}
 		})
+	}
+}
+
+func TestValidateWorkerAdmitArgsRejectsBelowMinimumEstimatedBytes(t *testing.T) {
+	// Keep the wire protocol aligned with --memory-reserve: smaller values
+	// can page-floor memory.max to zero and OOM a worker before it runs.
+	base := map[string]any{
+		"job_id": "job-1", "outer_scope": "/outer", "max_wait_ms": int64(0),
+	}
+	for _, estimated := range []int64{1, workerAdmitEstimatedBytesMin - 1} {
+		args := make(map[string]any, len(base)+1)
+		for key, value := range base {
+			args[key] = value
+		}
+		args["estimated_bytes"] = estimated
+		if _, err := validateWorkerAdmitArgs(args); err == nil {
+			t.Fatalf("estimated_bytes=%d accepted below 1 MiB minimum", estimated)
+		}
+	}
+	args := make(map[string]any, len(base)+1)
+	for key, value := range base {
+		args[key] = value
+	}
+	args["estimated_bytes"] = workerAdmitEstimatedBytesMin
+	request, err := validateWorkerAdmitArgs(args)
+	if err != nil || request.estimatedBytes != workerAdmitEstimatedBytesMin {
+		t.Fatalf("request=%+v err=%v, want exact 1 MiB boundary accepted", request, err)
 	}
 }
 
@@ -132,6 +159,62 @@ func TestEvaluateWorkerAdmitAggregateGuardAccountsForSupervisorRSS(t *testing.T)
 	granted := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 500, maxWaitMS: 0})
 	if granted.State != "granted" {
 		t.Fatalf("granted (fits alongside supervisor rss) =%+v", granted)
+	}
+}
+
+func TestEvaluateWorkerAdmitDiscountsReclaimableOuterCache(t *testing.T) {
+	// 900 bytes of raw outer memory.current would reject a 500-byte request
+	// under a 1000-byte ceiling. Of that, 500 bytes are reclaimable file
+	// cache, leaving 400 bytes of effective use and 100 bytes of real room
+	// after the request; admission must not treat cache as pinned RSS.
+	server := NewServer(Paths{})
+	server.workerAdmitHeadroom = 0
+	server.admitReadMemory = func(path string) (int64, int64, int64, bool, string) {
+		if path == "/outer" {
+			return 900, 1000, 500, true, ""
+		}
+		return 0, 1000, 0, true, ""
+	}
+	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 500})
+	if response.State != "granted" {
+		t.Fatalf("response=%+v, want reclaimable outer cache discounted", response)
+	}
+}
+
+func TestEvaluateWorkerAdmitDiscountsReclaimableSupervisorCache(t *testing.T) {
+	// Mirror the aggregate supervisor-RSS guard with a page-cache-heavy
+	// supervisor: raw 900 + request 500 would deny, while the 500 bytes of
+	// reclaimable cache leave effective supervisor use of 400 and permit it.
+	server := NewServer(Paths{})
+	server.workerAdmitHeadroom = 0
+	supervisorScope := runner.WorkerScopeChildPath("/outer", "supervisor")
+	server.admitReadMemory = func(path string) (int64, int64, int64, bool, string) {
+		if path == supervisorScope {
+			return 900, 1000, 500, true, ""
+		}
+		return 0, 1000, 0, true, ""
+	}
+	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 500})
+	if response.State != "granted" {
+		t.Fatalf("response=%+v, want reclaimable supervisor cache discounted", response)
+	}
+}
+
+func TestEvaluateWorkerAdmitFloorsReclaimableDiscountAtZero(t *testing.T) {
+	// A malformed or racing stat read can report more reclaimable cache than
+	// memory.current. subtractFloor must floor effective usage at zero rather
+	// than turning the subtraction into invented negative memory headroom.
+	server := NewServer(Paths{})
+	server.workerAdmitHeadroom = 0
+	server.admitReadMemory = func(path string) (int64, int64, int64, bool, string) {
+		if path == "/outer" {
+			return 100, 1000, 500, true, ""
+		}
+		return 0, 1000, 0, true, ""
+	}
+	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 1000})
+	if response.State != "granted" {
+		t.Fatalf("response=%+v, want reclaimable discount floored at zero", response)
 	}
 }
 
@@ -231,9 +314,18 @@ func TestWorkerJobLedgerIsBoundToJobIDAndOuterScopeTogether(t *testing.T) {
 
 func TestWorkerAdmitConnectionGrantsThenHoldsUntilPeerCloses(t *testing.T) {
 	server := NewServer(Paths{})
-	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 4*workerAdmitEstimatedBytesMin)
 	server.workerAdmitHeadroom = 0
 	server.workerAdmitPollInterval = time.Millisecond
+	now := time.Unix(1000, 0)
+	nowCalls := 0
+	server.admitNow = func() time.Time {
+		nowCalls++
+		if nowCalls >= 3 {
+			return now.Add(7 * time.Millisecond)
+		}
+		return now
+	}
 
 	serverConn, clientConn := net.Pipe()
 	done := make(chan struct{})
@@ -241,7 +333,7 @@ func TestWorkerAdmitConnectionGrantsThenHoldsUntilPeerCloses(t *testing.T) {
 		defer close(done)
 		defer serverConn.Close()
 		server.workerAdmitConnection(serverConn, map[string]any{
-			"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(400), "max_wait_ms": float64(0),
+			"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(workerAdmitEstimatedBytesMin), "max_wait_ms": float64(0),
 		})
 	}()
 
@@ -252,6 +344,9 @@ func TestWorkerAdmitConnectionGrantsThenHoldsUntilPeerCloses(t *testing.T) {
 	var grant WorkerAdmitResponse
 	if err := json.Unmarshal(frame.Data, &grant); err != nil || grant.State != "granted" {
 		t.Fatalf("frame=%+v err=%v", frame, err)
+	}
+	if grant.WaitedMS != 7 {
+		t.Fatalf("grant waited_ms=%d, want deterministic 7ms elapsed wait", grant.WaitedMS)
 	}
 	select {
 	case <-done:
@@ -266,7 +361,7 @@ func TestWorkerAdmitConnectionGrantsThenHoldsUntilPeerCloses(t *testing.T) {
 	}
 	// Releasing must not leave the daemon in a broken state that then
 	// rejects everything.
-	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 1000, maxWaitMS: 0})
+	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 4 * workerAdmitEstimatedBytesMin, maxWaitMS: 0})
 	if response.State != "granted" {
 		t.Fatalf("post-release admission unexpectedly broken: %+v", response)
 	}
@@ -280,15 +375,26 @@ func TestWorkerAdmitConnectionTimesOutWhenSaturated(t *testing.T) {
 	// alone does not change what a later admission decision sees unless
 	// the outer scope's own live memory.current reflects it, exactly like
 	// production (the daemon never tracks a synthetic reserve here).
-	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{"/outer": 500}, 500)
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{"/outer": 2 * workerAdmitEstimatedBytesMin}, 2*workerAdmitEstimatedBytesMin)
 	server.workerAdmitHeadroom = 0
 	server.workerAdmitPollInterval = time.Millisecond
+	now := time.Unix(1000, 0)
+	nowCalls := 0
+	server.admitNow = func() time.Time {
+		nowCalls++
+		switch nowCalls {
+		case 1, 2, 3:
+			return now
+		default:
+			return now.Add(5 * time.Millisecond)
+		}
+	}
 
 	serverConn, clientConn := net.Pipe()
 	go func() {
 		defer serverConn.Close()
 		server.workerAdmitConnection(serverConn, map[string]any{
-			"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(100), "max_wait_ms": float64(5),
+			"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(workerAdmitEstimatedBytesMin), "max_wait_ms": float64(5),
 		})
 	}()
 	var frame ResponseFrame
@@ -299,24 +405,29 @@ func TestWorkerAdmitConnectionTimesOutWhenSaturated(t *testing.T) {
 	if err := json.Unmarshal(frame.Data, &response); err != nil || response.State != "timeout" {
 		t.Fatalf("frame=%+v err=%v", frame, err)
 	}
+	if response.WaitedMS != 5 {
+		t.Fatalf("timeout waited_ms=%d, want deterministic 5ms elapsed wait", response.WaitedMS)
+	}
 	_ = clientConn.Close()
 }
 
 func TestWorkerAdmitConnectionDeniesImmediatelyWithoutWaitingOutMaxWait(t *testing.T) {
 	server := NewServer(Paths{})
-	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 100)
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, workerAdmitEstimatedBytesMin)
 	server.workerAdmitHeadroom = 0
 	server.workerAdmitPollInterval = time.Millisecond
+	now := time.Unix(1000, 0)
+	server.admitNow = func() time.Time { return now }
 
 	serverConn, clientConn := net.Pipe()
 	started := time.Now()
 	go func() {
 		defer serverConn.Close()
 		server.workerAdmitConnection(serverConn, map[string]any{
-			// 1000 bytes can never fit under a 100-byte outer ceiling no
+			// 2 MiB can never fit under a 1 MiB outer ceiling no
 			// matter how long we wait -- must come back "denied" well
 			// before the (deliberately long) max_wait_ms elapses.
-			"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(1000), "max_wait_ms": float64(60000),
+			"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(2 * workerAdmitEstimatedBytesMin), "max_wait_ms": float64(60000),
 		})
 	}()
 	var frame ResponseFrame
@@ -330,12 +441,15 @@ func TestWorkerAdmitConnectionDeniesImmediatelyWithoutWaitingOutMaxWait(t *testi
 	if err := json.Unmarshal(frame.Data, &response); err != nil || response.State != "denied" {
 		t.Fatalf("frame=%+v err=%v", frame, err)
 	}
+	if response.WaitedMS != 0 {
+		t.Fatalf("immediate denial waited_ms=%d, want zero", response.WaitedMS)
+	}
 	_ = clientConn.Close()
 }
 
 func TestWorkerAdmitConnectionReleasesGrantWhenResponseWriteFails(t *testing.T) {
 	server := NewServer(Paths{})
-	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 2*workerAdmitEstimatedBytesMin)
 	server.workerAdmitHeadroom = 0
 	server.workerAdmitPollInterval = time.Millisecond
 
@@ -349,11 +463,11 @@ func TestWorkerAdmitConnectionReleasesGrantWhenResponseWriteFails(t *testing.T) 
 	// write failure with no release at all).
 	_ = clientConn.Close()
 	server.workerAdmitConnection(serverConn, map[string]any{
-		"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(900), "max_wait_ms": float64(0),
+		"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(workerAdmitEstimatedBytesMin), "max_wait_ms": float64(0),
 	})
 	_ = serverConn.Close()
 
-	again := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 900, maxWaitMS: 0})
+	again := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: workerAdmitEstimatedBytesMin, maxWaitMS: 0})
 	if again.State != "granted" {
 		t.Fatalf("write-failure path leaked the grant: %+v", again)
 	}

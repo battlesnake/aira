@@ -5,6 +5,8 @@ package runner
 import (
 	"context"
 	"fmt"
+	"log"
+	"os"
 )
 
 // CreateWorkerScope creates one worker's cgroup as a child of outerScope
@@ -19,6 +21,13 @@ func CreateWorkerScope(ctx context.Context, outerScope, workerID string, memoryM
 		return "", fmt.Errorf("aitest worker scope: create: %w", err)
 	}
 	if err := writeScopeMemoryCap(scope, memoryMax, memoryHigh, true); err != nil {
+		// Nothing has entered this just-created scope yet, so remove its
+		// capless directory directly rather than asking Scope.Remove to read
+		// cgroup.events and prove it empty. Leaving it behind would permit a
+		// later process to enter without this worker's required memory.max.
+		if removeErr := os.Remove(scope.Reference()); removeErr != nil {
+			log.Printf("aitest worker scope: memory cap cleanup: remove %q: %v", scope.Reference(), removeErr)
+		}
 		return "", fmt.Errorf("aitest worker scope: memory cap: %w", err)
 	}
 	return WorkerScopeChildPath(outerScope, "worker-"+workerID), nil

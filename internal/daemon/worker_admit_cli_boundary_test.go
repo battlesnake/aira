@@ -27,14 +27,14 @@ func TestWorkerAdmitCLIStderrClassificationMatchesSupervisorBoundary(t *testing.
 	server.admitReadMemory = func(scope string) (int64, int64, int64, bool, string) {
 		switch scope {
 		case "/deny-ceiling":
-			// 1000 requested bytes exceed this 100-byte ceiling even at
+			// 2 MiB requested bytes exceed this 1 MiB ceiling even at
 			// zero usage, so workerAdmitConnection returns the permanent
 			// reject:exceeds-ceiling denial without polling.
-			return 0, 100, 0, true, ""
+			return 0, workerAdmitEstimatedBytesMin, 0, true, ""
 		case "/deny-timeout":
 			// Full live occupancy leaves this otherwise valid request with
 			// no headroom on every poll, forcing its own max-wait timeout.
-			return 500, 500, 0, true, ""
+			return 2 * workerAdmitEstimatedBytesMin, 2 * workerAdmitEstimatedBytesMin, 0, true, ""
 		default:
 			return 0, 0, 0, false, "unexpected scope in test fixture"
 		}
@@ -69,13 +69,13 @@ func TestWorkerAdmitCLIStderrClassificationMatchesSupervisorBoundary(t *testing.
 		return stdout.String(), stderr.String()
 	}
 
-	_, deniedStderr := runWorkerAdmit("/deny-ceiling", 1000, "5s")
+	_, deniedStderr := runWorkerAdmit("/deny-ceiling", 2*workerAdmitEstimatedBytesMin, "5s")
 	if !strings.Contains(deniedStderr, "worker-admit denied") || !strings.Contains(deniedStderr, "reject:exceeds-ceiling") {
 		t.Fatalf("permanent denial stderr missing supervisor classifier text:\n%s", deniedStderr)
 	}
 
 	started := time.Now()
-	_, timeoutStderr := runWorkerAdmit("/deny-timeout", 100, "50ms")
+	_, timeoutStderr := runWorkerAdmit("/deny-timeout", workerAdmitEstimatedBytesMin, "50ms")
 	if elapsed := time.Since(started); elapsed > 5*time.Second {
 		t.Fatalf("timeout worker-admit took %v — looks like it ignored max-wait", elapsed)
 	}
