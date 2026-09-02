@@ -85,6 +85,7 @@ func gitConfig(t *testing.T, root string, args ...string) {
 func runGit(t *testing.T, root string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+	cmd.Env = sanitizedGitEnv()
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %v: %v: %s", args, err, output)
 	}
@@ -92,9 +93,29 @@ func runGit(t *testing.T, root string, args ...string) {
 func runGitOutput(t *testing.T, root string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+	cmd.Env = sanitizedGitEnv()
 	output, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("git %v: %v", args, err)
 	}
 	return string(output)
+}
+
+// sanitizedGitEnv strips GIT_-prefixed variables (GIT_DIR, GIT_WORK_TREE,
+// etc.) from the inherited environment before shelling out to git. Git sets
+// these unconditionally for every hook invocation (pre-push, pre-commit,
+// ...), so without this, a git subprocess spawned from inside a hook -- even
+// one correctly scoped with "-C root" to an isolated t.TempDir() fixture --
+// silently operates on the REAL repository the hook is running against
+// instead of the fixture. This previously corrupted the shared repository
+// config and history when this test's process ran from within a pre-push
+// hook (AIRA-46).
+func sanitizedGitEnv() []string {
+	env := make([]string, 0, len(os.Environ()))
+	for _, e := range os.Environ() {
+		if !strings.HasPrefix(e, "GIT_") {
+			env = append(env, e)
+		}
+	}
+	return env
 }
