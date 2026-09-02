@@ -1,0 +1,10 @@
+---
+{"schema":1,"id":"AIRA-34","project":"aira","title":"confine scope-integrity reports `migrated` for legitimately-nested sub-scopes (leaf-only check)","status":"planned","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["accepted-gap","aitest","confine","deferred","telemetry"],"hold":false,"relations":[]}
+---
+Found during the aitest bootstrap-sequence spike (2026-09-01, ~/tmp/aitest-bootstrap-spike.sh): when a confined process relocates itself into a CHILD cgroup of its own scope (e.g. aitest's supervisor moving into `outer/.aira-supervisor` before enabling subtree_control + forking per-worker sub-scopes), confine's scope-integrity facet reports `scope-integrity=migrated` instead of `contained`. The process is still WITHIN the scope subtree (genuinely contained) — the check (#20/#70 ScopeContained attestation) verifies membership of the exact scope LEAF, so any move into a descendant cgroup reads as a migration/escape.
+
+IMPACT: telemetry-only. Per #70, ScopeContained has 0 production consumers — nothing functional breaks; the only cost is that every aitest outer scope (and any future legitimately-nested confine job) reports `migrated` forever, which is misleading noise in the trailer.
+
+DECISION (Opus + aitest, 2026-09-01): **DOCUMENT, do NOT build.** aitest documents `migrated` as its expected outer-scope status. A subtree-aware integrity check (a pid in ANY descendant cgroup of the scope = still contained) would be MORE correct, but per the architectural-simplicity rule (HARD, owner) telemetry-only signals never justify new machinery — "keep the primitive + document the gap" beats new code, exactly the #70 lesson. relates: aitest (nested per-worker sub-scopes make this the norm), #20 (descendant-escape attestation), #70 (ScopeContained telemetry-only, sampling gap accepted).
+
+BUILD ONLY IF: a real production consumer of scope-integrity emerges AND nested sub-scopes become common enough that the `migrated`-noise is actually harmful. Until then: deferred/accepted-gap.

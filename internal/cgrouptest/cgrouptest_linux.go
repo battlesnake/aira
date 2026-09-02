@@ -78,9 +78,14 @@ func SkipOrFailRealCgroup(t *testing.T, format string, args ...any) {
 // surfaced (hard-failed under mandatory-real mode) rather than left silently green.
 func removeScopeTree(t *testing.T, parent string) {
 	t.Helper()
+	// cgroup.kill is hierarchical — it kills every process in the subtree, so one
+	// write to the parent drains grandchildren too.
 	_ = os.WriteFile(filepath.Join(parent, "cgroup.kill"), []byte("1"), 0o644)
 	for i := 0; i < 200; i++ {
-		removeScopeTreeChildren(parent)
+		// Remove descendant cgroups deepest-first: a child that itself has child
+		// cgroups (a nested test tree) cannot be rmdir'd until its own children
+		// are gone, so a depth-1 sweep would leak nested trees onto the live slice.
+		removeCgroupSubtreeChildren(parent)
 		if os.Remove(parent) == nil {
 			return
 		}
@@ -93,17 +98,19 @@ func removeScopeTree(t *testing.T, parent string) {
 	}
 }
 
-// removeScopeTreeChildren makes one best-effort DEPTH-FIRST pass, removing a
-// directory's own children before the directory itself -- a cgroup directory
-// with live children can never be removed by a plain os.Remove. Found live
-// by Fable's final build-review gate (AIRA-30): the previous single-level
-// version only ever tried removing removeScopeTree's immediate children,
-// which could never drain a nested scope tree like aitest's own
-// outer -> .aira-supervisor / .aira-worker-N layout -- every real-cgroup
-// aitest test hard-FAILed under AIRA_REAL_CGROUP=1 ("cgroup scope parent
-// leaked"), and every default-tier run silently leaked the tree into the
-// live shared aira.slice instead.
-func removeScopeTreeChildren(dir string) {
+// removeCgroupSubtreeChildren rmdirs every descendant cgroup directory of dir
+// deepest-first (post-order), leaving dir itself. Only directories are child
+// cgroups (a cgroup holds many regular interface files); after the caller's
+// hierarchical cgroup.kill has drained the subtree, each empty descendant rmdirs
+// cleanly. Best-effort: a still-populated node just fails its rmdir and is retried.
+//
+// Depth-first matters: a child that itself has child cgroups (a nested test
+// tree, like aitest's own outer -> .aira-supervisor / .aira-worker-N layout)
+// cannot be rmdir'd until its own children are gone first, so a single-level
+// sweep would leak nested trees onto the live shared slice -- found live by
+// Fable's final build-review gate on AIRA-30, independently rediscovered and
+// fixed the same way on AIRA-36.
+func removeCgroupSubtreeChildren(dir string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
@@ -113,7 +120,7 @@ func removeScopeTreeChildren(dir string) {
 			continue
 		}
 		child := filepath.Join(dir, e.Name())
-		removeScopeTreeChildren(child)
+		removeCgroupSubtreeChildren(child)
 		_ = os.Remove(child)
 	}
 }

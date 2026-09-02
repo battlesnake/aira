@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"aira/internal/cgrouptest"
+
+	"golang.org/x/sys/unix"
 )
 
 func confineTestScopeID(name string, pid int, stamp int64) string {
@@ -447,6 +449,257 @@ func TestReapOrphanedConfineScopesRealCgroupSafetyGates(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(parent, ".aira-"+id)); err != nil {
 			t.Fatalf("guarded scope %s removed: %v", id, err)
 		}
+	}
+}
+
+func TestReapOrphanedConfineScopesReapsNestedEmptyTree(t *testing.T) {
+	parent, deadPID := reaperTestParentAndDeadPID(t)
+	id := confineTestScopeID("nested-empty", deadPID, time.Now().Add(-10*time.Second).UnixNano())
+	root := createReaperTestScope(t, parent, id)
+	child := mkdirReaperTestCgroup(t, root, "child")
+	mkdirReaperTestCgroup(t, child, "grandchild")
+
+	result, err := ReapOrphanedConfineScopes(context.Background(), parent, time.Second, reaperTestDead(deadPID), nil)
+	if err != nil || !reflect.DeepEqual(result.Reaped, []string{id}) || result.Skipped != 0 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	assertReaperTestMissing(t, root)
+}
+
+// This is deliberately not a lone live child: a naive post-order walk would
+// retain the live branch but still strip the empty sibling. The root's
+// cgroup.events populated proof must preserve the entire tree.
+func TestReapOrphanedConfineScopesKeepsEmptySiblingOfLiveNestedBranch(t *testing.T) {
+	parent, deadPID := reaperTestParentAndDeadPID(t)
+	id := confineTestScopeID("nested-live", deadPID, time.Now().Add(-10*time.Second).UnixNano())
+	root := createReaperTestScope(t, parent, id)
+	// A naive post-order walk (no cgroup.events proof) aborts on the first child
+	// whose rmdir fails (the live branch), so whether an empty sibling is stripped
+	// depends on kernfs enumeration order (which is NOT creation order). Create
+	// SEVERAL empty siblings plus a deep one so at least one is near-certain to be
+	// enumerated before the live branch: a Phase-1 regression would then strip it
+	// and fail this test, while the real code skips the whole non-empty scope
+	// order-independently.
+	survivors := []string{root}
+	for _, n := range []string{"empty0", "empty1", "empty2", "empty3", "empty4", "empty5"} {
+		survivors = append(survivors, mkdirReaperTestCgroup(t, root, n))
+	}
+	deep := mkdirReaperTestCgroup(t, root, "deep")
+	survivors = append(survivors, deep, mkdirReaperTestCgroup(t, deep, "grandchild"))
+	live := mkdirReaperTestCgroup(t, root, "live")
+	survivors = append(survivors, live)
+	sleeper := startReaperTestSleeper(t, live)
+	t.Cleanup(func() { stopReaperTestSleeper(sleeper) })
+
+	result, err := ReapOrphanedConfineScopes(context.Background(), parent, time.Second, reaperTestDead(deadPID), nil)
+	if err != nil || len(result.Reaped) != 0 || result.Skipped != 1 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	for _, path := range survivors {
+		if _, statErr := os.Stat(path); statErr != nil {
+			t.Fatalf("nested live tree changed at %s: %v", path, statErr)
+		}
+	}
+}
+
+func TestReapOrphanedConfineScopesDeepTreeSafety(t *testing.T) {
+	t.Run("empty", func(t *testing.T) {
+		parent, deadPID := reaperTestParentAndDeadPID(t)
+		id := confineTestScopeID("deep-empty", deadPID, time.Now().Add(-10*time.Second).UnixNano())
+		root := createReaperTestScope(t, parent, id)
+		one := mkdirReaperTestCgroup(t, root, "one")
+		two := mkdirReaperTestCgroup(t, one, "two")
+		mkdirReaperTestCgroup(t, two, "three")
+		result, err := ReapOrphanedConfineScopes(context.Background(), parent, time.Second, reaperTestDead(deadPID), nil)
+		if err != nil || !reflect.DeepEqual(result.Reaped, []string{id}) || result.Skipped != 0 {
+			t.Fatalf("result=%+v err=%v", result, err)
+		}
+		assertReaperTestMissing(t, root)
+	})
+	t.Run("deepest-live", func(t *testing.T) {
+		parent, deadPID := reaperTestParentAndDeadPID(t)
+		id := confineTestScopeID("deep-live", deadPID, time.Now().Add(-10*time.Second).UnixNano())
+		root := createReaperTestScope(t, parent, id)
+		one := mkdirReaperTestCgroup(t, root, "one")
+		two := mkdirReaperTestCgroup(t, one, "two")
+		three := mkdirReaperTestCgroup(t, two, "three")
+		sleeper := startReaperTestSleeper(t, three)
+		t.Cleanup(func() { stopReaperTestSleeper(sleeper) })
+		result, err := ReapOrphanedConfineScopes(context.Background(), parent, time.Second, reaperTestDead(deadPID), nil)
+		if err != nil || len(result.Reaped) != 0 || result.Skipped != 1 {
+			t.Fatalf("result=%+v err=%v", result, err)
+		}
+		for _, path := range []string{root, one, two, three} {
+			if _, statErr := os.Stat(path); statErr != nil {
+				t.Fatalf("deep live tree changed at %s: %v", path, statErr)
+			}
+		}
+	})
+}
+
+func TestReapOrphanedConfineScopesRepopulationAfterProof(t *testing.T) {
+	parent, deadPID := reaperTestParentAndDeadPID(t)
+	id := confineTestScopeID("repopulate", deadPID, time.Now().Add(-10*time.Second).UnixNano())
+	root := createReaperTestScope(t, parent, id)
+	empty := mkdirReaperTestCgroup(t, root, "empty")
+	live := mkdirReaperTestCgroup(t, root, "live")
+	var sleeper *exec.Cmd
+	deps := defaultConfineScanDeps()
+	deps.afterReapEmptyProof = func() { sleeper = startReaperTestSleeper(t, live) }
+	result, err := reapOrphanedConfineScopesWithDeps(context.Background(), parent, time.Second, reaperTestDead(deadPID), nil, deps)
+	if sleeper != nil {
+		t.Cleanup(func() { stopReaperTestSleeper(sleeper) })
+	}
+	if err != nil || len(result.Reaped) != 0 || result.Skipped != 1 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	for _, path := range []string{root, live} {
+		if _, statErr := os.Stat(path); statErr != nil {
+			t.Fatalf("repopulated node or ancestor removed at %s: %v", path, statErr)
+		}
+	}
+	// The empty sibling may have been removed before the live node became busy.
+	if _, statErr := os.Stat(empty); statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("empty sibling stat: %v", statErr)
+	}
+}
+
+func TestReapOrphanedConfineScopesPlainLeafUnchanged(t *testing.T) {
+	parent, deadPID := reaperTestParentAndDeadPID(t)
+	id := confineTestScopeID("plain-leaf", deadPID, time.Now().Add(-10*time.Second).UnixNano())
+	root := createReaperTestScope(t, parent, id)
+	result, err := ReapOrphanedConfineScopes(context.Background(), parent, time.Second, reaperTestDead(deadPID), nil)
+	if err != nil || !reflect.DeepEqual(result.Reaped, []string{id}) || result.Skipped != 0 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	assertReaperTestMissing(t, root)
+}
+
+func TestConfineReapWalkerUsesNoFollowDirectoryOpens(t *testing.T) {
+	parent := t.TempDir()
+	root := mkdirReaperTestCgroup(t, parent, "scope")
+	mkdirReaperTestCgroup(t, root, "child")
+	for _, path := range []string{root, filepath.Join(root, "child")} {
+		if err := os.WriteFile(filepath.Join(path, "cgroup.events"), []byte("populated 0\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	originalOpenat := confineReapOpenat
+	t.Cleanup(func() { confineReapOpenat = originalOpenat })
+	var flags []int
+	confineReapOpenat = func(dirfd int, path string, flag int, perm uint32) (int, error) {
+		flags = append(flags, flag)
+		return unix.Openat(dirfd, path, flag, perm)
+	}
+	parentFD, err := unix.Open(parent, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(parentFD)
+	// On a real cgroupfs, rmdir removes a cgroup despite its interface files;
+	// the walker (correctly) only rmdirs directories and never unlinks interface
+	// files (unlinking cgroup.events would EPERM on a real cgroup). A tmpdir
+	// cannot replicate that, so drop the simulated interface files after the
+	// empty-proof — mirroring the kernel — so the post-order rmdir can complete
+	// and the O_NOFOLLOW open flags (this test's actual subject) are exercised.
+	mimicCgroupfsRemoval := func() {
+		_ = os.Remove(filepath.Join(root, "child", "cgroup.events"))
+		_ = os.Remove(filepath.Join(root, "cgroup.events"))
+	}
+	if reaped, err := reapEmptyConfineScopeTree(parentFD, "scope", mimicCgroupfsRemoval); err != nil || !reaped {
+		t.Fatalf("reaped=%v err=%v", reaped, err)
+	}
+	if len(flags) < 2 {
+		t.Fatalf("directory opens=%d, want root and child", len(flags))
+	}
+	for _, flag := range flags {
+		if flag&(unix.O_NOFOLLOW|unix.O_DIRECTORY|unix.O_CLOEXEC) != unix.O_NOFOLLOW|unix.O_DIRECTORY|unix.O_CLOEXEC {
+			t.Fatalf("open flags %#x lack O_NOFOLLOW|O_DIRECTORY|O_CLOEXEC", flag)
+		}
+	}
+}
+
+func reaperTestParentAndDeadPID(t *testing.T) (string, int) {
+	t.Helper()
+	parent := cgrouptest.IsolatedScopeParent(t)
+	backend := newDefaultBackend(parent)
+	if err := backend.Probe(context.Background()); err != nil {
+		cgrouptest.SkipOrFailRealCgroup(t, "real confine reaper backend unavailable: %v", err)
+	}
+	exited := exec.Command("/bin/true")
+	if err := exited.Run(); err != nil {
+		t.Fatal(err)
+	}
+	return parent, exited.ProcessState.Pid()
+}
+
+func createReaperTestScope(t *testing.T, parent, id string) string {
+	t.Helper()
+	scope, err := newDefaultBackend(parent).Create(context.Background(), id)
+	if err != nil {
+		cgrouptest.SkipOrFailRealCgroup(t, "create real reaper scope %s: %v", id, err)
+	}
+	if err := scope.(*linuxScope).fd.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(parent, ".aira-"+id)
+}
+
+func mkdirReaperTestCgroup(t *testing.T, parent, name string) string {
+	t.Helper()
+	path := filepath.Join(parent, name)
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func startReaperTestSleeper(t *testing.T, cgroupPath string) *exec.Cmd {
+	t.Helper()
+	fd, err := os.OpenFile(cgroupPath, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("/bin/sleep", "60")
+	command.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(fd.Fd())}
+	if err := command.Start(); err != nil {
+		_ = fd.Close()
+		cgrouptest.SkipOrFailRealCgroup(t, "start real reaper workload: %v", err)
+	}
+	if err := fd.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		data, readErr := os.ReadFile(filepath.Join(cgroupPath, "cgroup.events"))
+		if readErr == nil && strings.Contains(string(data), "populated 1") {
+			break
+		}
+		if time.Now().After(deadline) {
+			stopReaperTestSleeper(command)
+			t.Fatalf("workload never populated %s: events=%q err=%v", cgroupPath, data, readErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return command
+}
+
+func stopReaperTestSleeper(command *exec.Cmd) {
+	if command == nil || command.Process == nil {
+		return
+	}
+	_ = command.Process.Kill()
+	_ = command.Wait()
+}
+
+func reaperTestDead(deadPID int) func(int) bool {
+	return func(pid int) bool { return pid == deadPID }
+}
+
+func assertReaperTestMissing(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("path still exists %s: %v", path, err)
 	}
 }
 
