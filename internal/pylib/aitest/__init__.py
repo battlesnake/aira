@@ -9,6 +9,8 @@ is driven from a pytest_runtestloop hookimpl added in Task 17, once
 
 import os
 
+import pytest
+
 
 def pytest_addoption(parser):
     group = parser.getgroup("aitest")
@@ -24,8 +26,10 @@ def pytest_addoption(parser):
 
 
 def pytest_configure(config):
-    if config.getoption("aitest_workers") is None:
+    workers_option = config.getoption("aitest_workers")
+    if workers_option is None:
         return
+    _resolve_worker_count(workers_option)
     # Real activation (pytest_runtestloop) is wired in Task 17; this task
     # only establishes the flag and its inert default.
     return
@@ -53,7 +57,7 @@ def pytest_runtestloop(session):
         estimated_bytes=_resolve_estimated_bytes(),
         worker_count=_resolve_worker_count(workers_option),
     )
-    passed = failed = skipped = unevaluated = 0
+    passed = failed = skipped = error = unevaluated = 0
     for item in session.items:
         outcome = results.get(item.nodeid, "unevaluated")
         print("%s %s" % (item.nodeid, outcome))
@@ -66,10 +70,14 @@ def pytest_runtestloop(session):
             # never folded into unevaluated ("a check that could not
             # establish its result") or failed.
             skipped += 1
+        elif outcome == "error":
+            # An environment-phase failure established a real result, but
+            # is neither unevaluated nor the test body's own failed result.
+            error += 1
         else:
             unevaluated += 1
-    print("aitest: %d passed, %d failed, %d skipped, %d unevaluated" % (passed, failed, skipped, unevaluated))
-    session.testsfailed = failed + unevaluated
+    print("aitest: %d passed, %d failed, %d skipped, %d error, %d unevaluated" % (passed, failed, skipped, error, unevaluated))
+    session.testsfailed = failed + error + unevaluated
     return True
 
 
@@ -79,8 +87,16 @@ def _resolve_worker_count(workers_option):
     try:
         count = int(workers_option)
     except ValueError:
-        count = 1
-    return max(1, count)
+        raise pytest.UsageError(
+            "--aitest-workers must be a positive integer or 'auto', got %r"
+            % workers_option
+        )
+    if count < 1:
+        raise pytest.UsageError(
+            "--aitest-workers must be a positive integer or 'auto', got %r"
+            % workers_option
+        )
+    return count
 
 
 def _resolve_estimated_bytes():

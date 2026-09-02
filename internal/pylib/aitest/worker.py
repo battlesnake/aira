@@ -1,10 +1,16 @@
 import os
+import sys
 import time
 
 
 _DEFAULT_MAX_SECONDS = 600
 _DEFAULT_MAX_TESTS = 200
 _DEFAULT_HIGH_WATERMARK_PCT = 80
+
+# _should_recycle runs after every completed test. Keep a malformed
+# environment setting from both killing the worker and repeating the same
+# diagnostic for every subsequent test in that worker.
+_WARNED_INVALID_ENV_VARS = set()
 
 # Appended to a result line ("<nodeid> <outcome>") when this is the LAST
 # test this worker will run before retiring -- never sent as a separate
@@ -22,11 +28,39 @@ def _read_cgroup_int(scope_path, filename):
     return int(raw)
 
 
+def _warn_invalid_env(name, raw, default):
+    if name in _WARNED_INVALID_ENV_VARS:
+        return
+    _WARNED_INVALID_ENV_VARS.add(name)
+    sys.stderr.write(
+        "aira aitest: %s has invalid value %r; using default %r\n"
+        % (name, raw, default)
+    )
+
+
+def _env_int(name, default):
+    raw = os.environ.get(name, str(default))
+    try:
+        return int(raw)
+    except ValueError:
+        _warn_invalid_env(name, raw, default)
+        return default
+
+
+def _env_float(name, default):
+    raw = os.environ.get(name, str(default))
+    try:
+        return float(raw)
+    except ValueError:
+        _warn_invalid_env(name, raw, default)
+        return default
+
+
 def _should_recycle(scope_path, started_at, completed_count):
-    max_seconds = int(os.environ.get("AIRA_AITEST_WORKER_MAX_SECONDS", str(_DEFAULT_MAX_SECONDS)))
+    max_seconds = _env_int("AIRA_AITEST_WORKER_MAX_SECONDS", _DEFAULT_MAX_SECONDS)
     if time.monotonic() - started_at > max_seconds:
         return True
-    max_tests = int(os.environ.get("AIRA_AITEST_WORKER_MAX_TESTS", str(_DEFAULT_MAX_TESTS)))
+    max_tests = _env_int("AIRA_AITEST_WORKER_MAX_TESTS", _DEFAULT_MAX_TESTS)
     # >= , not >: with AIRA_AITEST_WORKER_MAX_TESTS=1 and exactly one
     # completed test, 1 > 1 is false and recycle would never fire at all.
     if completed_count >= max_tests:
@@ -35,7 +69,7 @@ def _should_recycle(scope_path, started_at, completed_count):
         # Daemon-down fallback mode (Task 16): no granted cgroup scope to
         # watermark-check; time/count bounds above still apply.
         return False
-    watermark_pct = float(os.environ.get("AIRA_AITEST_WORKER_HIGH_WATERMARK_PCT", str(_DEFAULT_HIGH_WATERMARK_PCT)))
+    watermark_pct = _env_float("AIRA_AITEST_WORKER_HIGH_WATERMARK_PCT", _DEFAULT_HIGH_WATERMARK_PCT)
     try:
         current = _read_cgroup_int(scope_path, "memory.current")
         high = _read_cgroup_int(scope_path, "memory.high")
@@ -105,13 +139,17 @@ class _OutcomeCollector:
     one pytest_runtest_protocol call. Registered on item.config.pluginmanager
     only for the duration of that one call -- see run_one."""
 
-    _RANK = {"passed": 0, "skipped": 1, "failed": 2}
+    _RANK = {"passed": 0, "skipped": 1, "failed": 2, "error": 3}
 
     def __init__(self):
         self.worst = "passed"
 
     def pytest_runtest_logreport(self, report):
         outcome = report.outcome if report.outcome in self._RANK else "failed"
+        # Pytest's terminal reporter calls setup/teardown failures "errors",
+        # reserving "failed" for a failure in the test call itself.
+        if outcome == "failed" and report.when in ("setup", "teardown"):
+            outcome = "error"
         if self._RANK[outcome] > self._RANK.get(self.worst, 0):
             self.worst = outcome
 

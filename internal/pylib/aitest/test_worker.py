@@ -2,8 +2,12 @@ import io
 import os
 import time
 
+import pytest
+
+import aitest.worker as worker_module
 from aitest.worker import fork_worker, place_self
-from aitest.worker import run_one, run_worker_loop
+from aitest.worker import _DEFAULT_MAX_SECONDS, _DEFAULT_MAX_TESTS
+from aitest.worker import _should_recycle, run_one, run_worker_loop
 
 
 def test_place_self_writes_pid_to_cgroup_procs(tmp_path):
@@ -102,6 +106,35 @@ def test_run_one_reports_skipped_outcome_distinctly(pytester):
     assert run_one(items[0]) == "skipped"
 
 
+def test_run_one_reports_error_outcome_for_failing_setup_fixture(pytester):
+    items = pytester.getitems("""
+        import pytest
+
+        @pytest.fixture
+        def broken_setup():
+            raise RuntimeError("boom")
+
+        def test_uses_broken_setup(broken_setup):
+            pass
+    """)
+    assert run_one(items[0]) == "error"
+
+
+def test_run_one_reports_error_outcome_for_failing_teardown_fixture(pytester):
+    items = pytester.getitems("""
+        import pytest
+
+        @pytest.fixture
+        def broken_teardown():
+            yield
+            raise RuntimeError("boom")
+
+        def test_uses_broken_teardown(broken_teardown):
+            pass
+    """)
+    assert run_one(items[0]) == "error"
+
+
 def test_run_one_tears_down_and_rebuilds_session_scoped_fixtures_per_test(pytester):
     """Proves the accepted nextitem=None limitation documented above: with
     plain pytest, a module-scoped fixture shared by two tests sets up ONCE;
@@ -141,3 +174,68 @@ def test_run_worker_loop_dispatch_and_result_round_trip(pytester):
     run_worker_loop(None, items_by_nodeid, pipe_in, pipe_out)
     pipe_out.seek(0)
     assert pipe_out.read().splitlines() == ["%s passed" % nodeid]
+
+
+@pytest.fixture
+def clear_invalid_recycle_env_warnings():
+    worker_module._WARNED_INVALID_ENV_VARS.clear()
+    yield
+    worker_module._WARNED_INVALID_ENV_VARS.clear()
+
+
+def _assert_invalid_recycle_env_warns_once(monkeypatch, capsys, name, raw, scope_path, started_at, completed_count):
+    for env_name in (
+        "AIRA_AITEST_WORKER_MAX_SECONDS",
+        "AIRA_AITEST_WORKER_MAX_TESTS",
+        "AIRA_AITEST_WORKER_HIGH_WATERMARK_PCT",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setenv(name, raw)
+
+    assert _should_recycle(scope_path, started_at, completed_count) is True
+    stderr = capsys.readouterr().err
+    assert name in stderr
+    assert raw in stderr
+
+    assert _should_recycle(scope_path, started_at, completed_count) is True
+    assert capsys.readouterr().err == ""
+
+
+def test_should_recycle_uses_default_for_invalid_max_seconds(monkeypatch, capsys, clear_invalid_recycle_env_warnings):
+    _assert_invalid_recycle_env_warns_once(
+        monkeypatch,
+        capsys,
+        "AIRA_AITEST_WORKER_MAX_SECONDS",
+        "10m",
+        None,
+        time.monotonic() - _DEFAULT_MAX_SECONDS - 1,
+        0,
+    )
+
+
+def test_should_recycle_uses_default_for_invalid_max_tests(monkeypatch, capsys, clear_invalid_recycle_env_warnings):
+    _assert_invalid_recycle_env_warns_once(
+        monkeypatch,
+        capsys,
+        "AIRA_AITEST_WORKER_MAX_TESTS",
+        "two hundred",
+        None,
+        time.monotonic(),
+        _DEFAULT_MAX_TESTS,
+    )
+
+
+def test_should_recycle_uses_default_for_invalid_high_watermark(monkeypatch, capsys, tmp_path, clear_invalid_recycle_env_warnings):
+    scope_dir = tmp_path / "fake-scope"
+    scope_dir.mkdir()
+    (scope_dir / "memory.current").write_text("81")
+    (scope_dir / "memory.high").write_text("100")
+    _assert_invalid_recycle_env_warns_once(
+        monkeypatch,
+        capsys,
+        "AIRA_AITEST_WORKER_HIGH_WATERMARK_PCT",
+        "eighty percent",
+        str(scope_dir),
+        time.monotonic(),
+        0,
+    )
