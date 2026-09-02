@@ -48,6 +48,63 @@ func requireRealPytest(t *testing.T) string {
 	return ""
 }
 
+// environWithoutAiraRealCgroup returns os.Environ() with AIRA_REAL_CGROUP
+// filtered out (found by Fable's re-gate: a FALLBACK-mode e2e run must never
+// forward this Go test binary's OWN ambient AIRA_REAL_CGROUP=1 -- set when
+// running the project's own mandatory real-cgroup verification tier -- into
+// its child pytest process. testdata/test_oom.py's own skip guard reads this
+// exact variable directly from the child's environment to decide whether a
+// real cgroup cap is expected; a fallback run deliberately has none (its
+// AIRA_AITEST_BOOTSTRAP_CMD points at a missing binary), so an inherited
+// AIRA_REAL_CGROUP=1 defeats that guard and fires a real, uncapped 512MiB
+// allocation instead of skipping -- and made the mandatory verification tier
+// permanently unable to go green in one invocation of `go test
+// ./internal/pylib/...`, exactly the tier the branch's earlier P1 fix
+// (recursive cgroup scope removal) was meant to restore. Filtering, not
+// appending a duplicate key: duplicate-key env precedence is not guaranteed
+// consistent across getenv implementations.
+func environWithoutAiraRealCgroup() []string {
+	env := os.Environ()
+	filtered := make([]string, 0, len(env))
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "AIRA_REAL_CGROUP=") {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
+}
+
+func TestEnvironWithoutAiraRealCgroupFiltersItOut(t *testing.T) {
+	// Regression test for a real bug (Fable re-gate): TestRealPytestAitest
+	// EndToEndFallback used to forward os.Environ() verbatim into its child
+	// pytest, so this Go test binary's OWN ambient AIRA_REAL_CGROUP=1 (set
+	// when running the project's own mandatory real-cgroup verification
+	// tier) defeated testdata/test_oom.py's skip guard and fired a real,
+	// uncapped 512MiB allocation in a fallback (unconfined) run instead of
+	// skipping -- and made that mandatory tier permanently unable to go
+	// green in one invocation of `go test ./internal/pylib/...`.
+	t.Setenv("AIRA_REAL_CGROUP", "1")
+	t.Setenv("AIRA_ENVIRON_WITHOUT_REAL_CGROUP_PROBE", "still-here")
+
+	env := environWithoutAiraRealCgroup()
+
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "AIRA_REAL_CGROUP=") {
+			t.Fatalf("AIRA_REAL_CGROUP leaked into the filtered environment: %q", entry)
+		}
+	}
+	found := false
+	for _, entry := range env {
+		if entry == "AIRA_ENVIRON_WITHOUT_REAL_CGROUP_PROBE=still-here" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("filtering must remove ONLY AIRA_REAL_CGROUP, not the rest of the environment")
+	}
+}
+
 func TestRealPytestAitestEndToEndFallback(t *testing.T) {
 	pytest := requireRealPytest(t)
 	aitestDir, err := filepath.Abs("aitest")
@@ -62,7 +119,7 @@ func TestRealPytestAitestEndToEndFallback(t *testing.T) {
 
 	command := exec.Command(pytest, "-q", "--aitest-workers=2")
 	command.Dir = filepath.Join(aitestDir, "testdata")
-	command.Env = append(os.Environ(),
+	command.Env = append(environWithoutAiraRealCgroup(),
 		"PYTHONPATH="+filepath.Dir(aitestDir),
 		"PYTHONDONTWRITEBYTECODE=1",
 		"AIRA_AITEST_LIB="+pythonDir,
