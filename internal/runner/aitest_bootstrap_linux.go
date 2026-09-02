@@ -30,6 +30,22 @@ func BootstrapAitestSupervisor(ctx context.Context, outerScope string, superviso
 	if supervisorPID <= 0 {
 		return "", fmt.Errorf("aitest bootstrap: invalid supervisor pid %d", supervisorPID)
 	}
+	// Guard BEFORE the drain below, not just after it (Fable build-review,
+	// final gate): the normal flow always satisfies this trivially (aira
+	// confine --delegate-ram placed supervisorPID directly into outerScope
+	// via clone3(CLONE_INTO_CGROUP) before this verb ever runs, so it is
+	// already listed in outerScope's cgroup.procs at this point) -- but
+	// without this check, a caller invoking this verb by hand with a
+	// mismatched outerScope (e.g. from an interactive shell, whose current
+	// cgroup is a shared systemd session scope, not an aira-confine-owned
+	// one) relocates EVERY process sharing that cgroup -- other shells, an
+	// IDE, other agents -- into a fresh child scope before ever
+	// discovering the mismatch, with no undo on the later failure. A
+	// membership check this cheap belongs before any process is moved,
+	// not after.
+	if !scopeContainsPID(outerScope, supervisorPID) {
+		return "", fmt.Errorf("aitest bootstrap: supervisor pid %d is not a member of %s", supervisorPID, outerScope)
+	}
 	backend := newDefaultBackend(outerScope)
 	if err := backend.Probe(ctx); err != nil {
 		return "", fmt.Errorf("aitest bootstrap: probe outer scope: %w", err)
