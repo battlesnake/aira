@@ -134,6 +134,11 @@ func TestConfineCapsPinnedReserveOnNonDaemonAdmissionPaths(t *testing.T) {
 		// Below the floor a declared value is a token, not a containment request:
 		// capping at it could only kill the job at launch.
 		{name: "declared below the floor is a sentinel", state: "unevaluated", reserve: 1, pinned: true, wantCap: 0},
+		// Pinned but with NO usable number: the reserve is replaced by the 4GiB
+		// default further down, and capping at that default would be capping at a
+		// guess while calling it declared — precisely what the unpinned branch
+		// refuses to do. Validity, not just provenance, is required.
+		{name: "pinned with no value declared", state: "unevaluated", reserve: 0, pinned: true, wantCap: 0},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var gotCap int64

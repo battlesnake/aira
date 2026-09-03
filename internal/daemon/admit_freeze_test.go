@@ -91,9 +91,19 @@ func TestAdmitFreezeReArmsAfterYieldSoHeadKeepsProtection(t *testing.T) {
 	waitAdmitGrant(t, duringYield)
 	server.releaseAdmitWaiter(queue, duringYield)
 
-	// Past the full hold+yield cycle the freeze must arm again and block a new
-	// fitting arrival, holding capacity for the still-starved head.
+	// Past the full hold+yield cycle, the first pass is the guaranteed
+	// backfilling pass (a completed cycle always yields at least one evaluation
+	// before re-arming, so a cycle that elapsed entirely between passes still
+	// admits somebody). It clears the anchor without arming.
 	now = now.Add(60 * time.Second)
+	server.evaluateAdmitQueue(queue)
+	if !queue.freezeArmedAt.IsZero() {
+		t.Fatalf("completed cycle re-armed in the same pass (%v); it must yield one evaluation first", queue.freezeArmedAt)
+	}
+
+	// The NEXT pass arms again and blocks a new fitting arrival, holding capacity
+	// for the still-starved head. This is the half of the mechanism that must
+	// survive: bounded, not deleted.
 	afterCycle := queuedWaiter(3, 30, now)
 	queue.waiters = append(queue.waiters, afterCycle)
 	server.evaluateAdmitQueue(queue)
@@ -247,11 +257,21 @@ func TestAdmitFreezeDisabledBypassesThePhaseMachineEntirely(t *testing.T) {
 			server.admitFreezeMaxHold = maxHold
 
 			headA := queuedWaiter(1, 60, now.Add(-10*time.Second))
-			queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{headA}}
+			// A fitting follower behind the aged head. Without it, an implementation
+			// that disabled FREEZING altogether (rather than disabling only the duty
+			// cycle) would also pass this test — disabled must reproduce the original
+			// unbounded freeze, not the absence of one.
+			blocked := queuedWaiter(2, 30, now)
+			queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{headA, blocked}}
 			server.evaluateAdmitQueue(queue)
 			if !queue.freezeArmedAt.IsZero() {
 				t.Fatalf("disabled mode wrote phase state (%v): it must bypass the phase machine", queue.freezeArmedAt)
 			}
+			requireAdmitQueued(t, blocked)
+			// It stays frozen indefinitely — no yield ever arrives.
+			now = now.Add(10 * time.Minute)
+			server.evaluateAdmitQueue(queue)
+			requireAdmitQueued(t, blocked)
 
 			// headA departs; its successor is YOUNGER than the grace, so the
 			// original stateless rule does not freeze for it and a fitting waiter
@@ -469,6 +489,71 @@ func TestAdmitFreezeMaxHoldFromEnv(t *testing.T) {
 			}
 		})
 	}
+}
+
+// verifies: AIRA-59 — a completed hold/yield cycle must produce at least one
+// BACKFILLING evaluation before the freeze may re-arm.
+//
+// The phase is derived from wall time, but grants only happen during an
+// evaluator pass. If a whole yield window elapses BETWEEN passes, a purely
+// time-derived phase goes hold -> idle -> re-armed within a single pass and
+// admits nobody — freezing indefinitely while appearing to honour a 50% duty.
+// That is reachable whenever maxHold approaches the poll interval (any positive
+// duration is accepted) or a slow adopted-confine scan delays a pass.
+func TestAdmitFreezeYieldsAPassEvenWhenAWholeCycleElapsesBetweenPasses(t *testing.T) {
+	var maximum atomic.Int64
+	maximum.Store(100)
+	current := int64(50)
+	now := time.Unix(16000, 0)
+	server := freezeTestServer(t, &maximum, &current, &now)
+	server.admitBackfillGrace = 10 * time.Second
+	server.admitFreezeMaxHold = time.Minute
+
+	head := queuedWaiter(1, 60, now.Add(-10*time.Second))
+	fitting := queuedWaiter(2, 30, now)
+	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, fitting}}
+
+	server.evaluateAdmitQueue(queue) // arms
+	requireAdmitQueued(t, fitting)
+
+	// Leap clean past hold AND yield in one step, as a delayed pass would.
+	now = now.Add(10 * time.Minute)
+	server.evaluateAdmitQueue(queue)
+	waitAdmitGrant(t, fitting)
+}
+
+// verifies: the same guarantee under a pathological maxHold far shorter than the
+// evaluator's poll interval — every pass then lands a full cycle later, which a
+// purely time-derived phase would turn into a permanent freeze.
+func TestAdmitFreezeMakesProgressWhenMaxHoldIsShorterThanThePollInterval(t *testing.T) {
+	var maximum atomic.Int64
+	maximum.Store(100)
+	current := int64(50)
+	now := time.Unix(17000, 0)
+	server := freezeTestServer(t, &maximum, &current, &now)
+	server.admitBackfillGrace = time.Second
+	server.admitFreezeMaxHold = time.Millisecond // far below any real poll interval
+
+	head := queuedWaiter(1, 60, now.Add(-time.Second))
+	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head}}
+
+	granted := 0
+	for step := 0; step < 6; step++ {
+		fitting := queuedWaiter(int64(100+step), 30, now)
+		queue.waiters = append(queue.waiters, fitting)
+		now = now.Add(250 * time.Millisecond) // a realistic poll interval
+		server.evaluateAdmitQueue(queue)
+		select {
+		case <-fitting.grantedCh:
+			granted++
+			server.releaseAdmitWaiter(queue, fitting)
+		default:
+		}
+	}
+	if granted == 0 {
+		t.Fatal("no fitting waiter was ever admitted: every pass skipped the yield, so the freeze was permanent despite a bounded maxHold")
+	}
+	requireAdmitQueued(t, head)
 }
 
 // verifies: AIRA-59 diagnosability. Root-causing this ticket needed source

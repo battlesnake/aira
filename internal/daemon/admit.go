@@ -820,6 +820,21 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	// below uses, so hold and yield shift symmetrically if an adopted-confine scan
 	// delays the pass.
 	phase := admitFreezePhaseAt(queue.freezeArmedAt, now, maxHold)
+	if maxHold > 0 && phase == admitFreezeIdle && !queue.freezeArmedAt.IsZero() {
+		// A completed cycle must YIELD AT LEAST ONE EVALUATION before re-arming.
+		// The phase is derived from wall time, but grants only happen during an
+		// evaluator pass, so a yield window that elapses entirely BETWEEN passes
+		// would let the queue go hold -> idle -> re-armed in a single pass and
+		// backfill nothing at all — freezing forever while looking well-behaved.
+		// That happens whenever maxHold approaches the poll interval (any positive
+		// duration is accepted) or a slow adopted-confine scan delays a pass past
+		// a whole cycle. Clearing the anchor and treating THIS pass as a yield
+		// makes the guarantee "at least one backfilling pass per cycle", which is
+		// what actually admits waiters, rather than merely "some wall time spent
+		// nominally yielding".
+		queue.freezeArmedAt = time.Time{}
+		phase = admitFreezeYield
+	}
 	frozen := false
 	for _, waiter := range queue.waiters {
 		if waiter.state != admitQueued {

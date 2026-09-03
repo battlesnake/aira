@@ -451,7 +451,18 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// scope memory.max on the non-daemon paths — a token reserve enforced as a cap
 	// contains nothing and merely OOM-kills the job at launch (three real-cgroup
 	// tests passing MemoryReserve: 1 caught exactly that during this build).
-	declaredReserve := request.MemoryReservePinned
+	// Both facts are read from the ORIGINAL request, before any resolution below:
+	//   - provenance: MemoryReservePinned is about to be widened to true for ANY
+	//     positive reserve, after which it can no longer distinguish "the caller
+	//     declared this" from "the caller passed something".
+	//   - validity: a caller that pins WITHOUT a usable number has its reserve
+	//     replaced by the 4GiB default a few lines down, and capping at that
+	//     default would be capping at a guess while calling it declared — exactly
+	//     what the unpinned branch deliberately refuses to do.
+	// MemoryReserve is itself overwritten at the end of this block, so the byte
+	// count is captured here too rather than re-read at the cap site.
+	declaredReserve := request.MemoryReservePinned && request.MemoryReserve >= MinPinnedScopeCap
+	declaredReserveBytes := request.MemoryReserve
 	pinned := request.MemoryReservePinned || reserve > 0
 	if reserve <= 0 {
 		if request.DelegateRAM {
@@ -612,20 +623,20 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// memory.max contains nothing while killing the job at launch. The existing
 	// runner suite caught exactly that — three real-cgroup tests pass
 	// MemoryReserve: 1 to enable admission and were killed with "pid absent".
-	// Keyed on declaredReserve (captured before `pinned` was widened at :447), not
-	// on request.MemoryReservePinned, which by here is true for any positive
-	// reserve and so cannot tell a deliberate cap from a token value.
+	// Keyed on declaredReserve — provenance AND validity captured from the
+	// original request — never on request.MemoryReservePinned, which by here is
+	// true for any positive reserve and cannot tell a deliberate cap from a token
+	// value, and never on request.MemoryReserve, which by here may be a resolved
+	// default rather than anything the caller said.
 	//
-	// MinPinnedScopeCap is a safety valve on top of that provenance: a declared
-	// reserve below the minimum the CLI itself accepts cannot be a real
-	// containment request, and enforcing it could only OOM-kill the job at launch.
-	// Residual, documented gap: a PROGRAMMATIC caller that explicitly declares a
-	// sub-1MiB reserve is capped on the daemon path (:618, unchanged) but not
-	// here. The CLI cannot produce such a request (main.go rejects below 1MiB),
-	// and refusing it outright at the runner boundary is the better long-term
-	// answer — filed separately rather than widened into this change.
-	if !request.DelegateRAM && scopeMemoryMax <= 0 && declaredReserve && request.MemoryReserve >= MinPinnedScopeCap {
-		scopeMemoryMax = request.MemoryReserve
+	// Residual, documented gap: a PROGRAMMATIC caller that declares a sub-1MiB
+	// reserve is still capped on the daemon-grant path below (unchanged) but not
+	// here. The CLI cannot produce such a request (it rejects below 1MiB), and the
+	// better long-term answer is to refuse it outright at the runner boundary —
+	// filed separately rather than widened into this change, because adding a new
+	// refusal path could break programmatic callers neither ticket concerns.
+	if !request.DelegateRAM && scopeMemoryMax <= 0 && declaredReserve {
+		scopeMemoryMax = declaredReserveBytes
 	}
 	// An UNPINNED reserve stays restricted to an ADMITTED (accounted) daemon
 	// grant: only that carries a history-derived estimate the daemon has itself
