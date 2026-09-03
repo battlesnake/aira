@@ -34,8 +34,8 @@ const (
 	// there would permit unbounded concurrent retained connections. Its only
 	// caller, the aitest supervisor, uses waits two orders of magnitude smaller.
 	// Do not "unify" these without first bounding worker-admit's concurrency.
-	workerAdmitWaitCeilingMs int64 = 30 * 60 * 1000
-	admitMaxWaiters                = 256
+	workerAdmitWaitCeilingMs            int64 = 30 * 60 * 1000
+	admitMaxWaiters                           = 256
 	admitGlobalMax                            = 1024
 	admitMaxReserve                     int64 = 1 << 50
 	admitWriteTimeout                         = 5 * time.Second
@@ -96,8 +96,14 @@ type sliceQueue struct {
 
 	// AIRA-59 fairness-freeze duty cycle, held as a SINGLE anchor instant so the
 	// phase is DERIVED, never stored: idle while zero, hold for the first
-	// maxHold after it, yield for the second, idle again after. The only write is
-	// the arm itself, guarded by phase==idle.
+	// maxHold after it, yield for the second, idle again after.
+	//
+	// There are exactly TWO writes, and neither can lengthen a hold:
+	//   1. the arm, guarded by derived phase == idle;
+	//   2. the completed-cycle clear, taken ONLY when the derived phase is already
+	//      idle (the cycle is over), which forces one backfilling pass before the
+	//      next arm. Because it fires only from derived-idle it can shorten the
+	//      gap between cycles, never extend a freeze.
 	//
 	// That representation is load-bearing, not stylistic. With a stored phase plus
 	// a mutable deadline, three separate defects were expressible and had to be
@@ -240,44 +246,63 @@ func (s *Server) admitOutstandingJobs(path string) int {
 }
 
 func (s *Server) admitOutstandingReserve(path string) (outstanding int64, outstandingJobs int, adopted int64, adoptedJobs int, ok bool) {
-	s.admitRegistryMu.Lock()
-	queue := s.admitQueues[path]
-	if queue == nil {
-		s.admitRegistryMu.Unlock()
-		return 0, 0, 0, 0, false
-	}
-	queue.mu.Lock()
-	outstanding, outstandingJobs = queue.outstanding, queue.outstandingJobs
-	adopted, adoptedJobs = queue.adopted, queue.adoptedJobs
-	queue.mu.Unlock()
-	s.admitRegistryMu.Unlock()
-	return outstanding, outstandingJobs, adopted, adoptedJobs, true
+	snapshot := s.admitSliceSnapshot(path)
+	return snapshot.outstanding, snapshot.outstandingJobs, snapshot.adopted, snapshot.adoptedJobs, snapshot.present
 }
 
-// admitQueueDiagnostics reports the queued-but-ungranted waiter count and the
-// current fairness-freeze phase for a slice, for `confine --list`. Follows the
-// same registry->queue lock order as admitOutstandingReserve.
-//
-// An ABSENT queue is a genuine idle zero, not an unevaluated read: a queue only
-// exists while it has waiters, so its absence positively establishes that
-// nothing is waiting. Callers must not render this as "unknown".
-func (s *Server) admitQueueDiagnostics(path string) (queued int, phase string) {
+// admitSliceSnapshot reads the ledger AND the queue diagnostics in ONE locked
+// pass. Taking them in two rounds would let `confine --list` report a granted
+// total and a queued count from different moments — a self-inconsistent picture
+// in exactly the situation an operator reaches for it.
+type admitSnapshot struct {
+	outstanding     int64
+	outstandingJobs int
+	adopted         int64
+	adoptedJobs     int
+	queued          int
+	phase           string
+	present         bool
+}
+
+func (s *Server) admitSliceSnapshot(path string) admitSnapshot {
+	// With the duty cycle off a freeze may be actively blocking this queue, so
+	// reporting "idle" would state the opposite of the truth.
+	phase := admitFreezeIdle.String()
+	if s.admitFreezeMaxHold <= 0 {
+		phase = "disabled"
+	}
 	s.admitRegistryMu.Lock()
 	queue := s.admitQueues[path]
 	if queue == nil {
 		s.admitRegistryMu.Unlock()
-		return 0, admitFreezeIdle.String()
+		// An absent queue is a genuine idle zero, not an unevaluated read: a queue
+		// exists only while it has waiters, so its absence positively establishes
+		// that nothing is waiting. Callers must not render this as "unknown".
+		return admitSnapshot{phase: phase}
 	}
 	queue.mu.Lock()
+	snapshot := admitSnapshot{
+		outstanding: queue.outstanding, outstandingJobs: queue.outstandingJobs,
+		adopted: queue.adopted, adoptedJobs: queue.adoptedJobs,
+		phase: phase, present: true,
+	}
 	for _, waiter := range queue.waiters {
 		if waiter != nil && waiter.state == admitQueued {
-			queued++
+			snapshot.queued++
 		}
 	}
-	phase = admitFreezePhaseAt(queue.freezeArmedAt, s.admitNowTime(), s.admitFreezeMaxHold).String()
+	if s.admitFreezeMaxHold > 0 {
+		snapshot.phase = admitFreezePhaseAt(queue.freezeArmedAt, s.admitNowTime(), s.admitFreezeMaxHold).String()
+	}
 	queue.mu.Unlock()
 	s.admitRegistryMu.Unlock()
-	return queued, phase
+	return snapshot
+}
+
+// admitQueueDiagnostics is the diagnostics half of admitSliceSnapshot.
+func (s *Server) admitQueueDiagnostics(path string) (queued int, phase string) {
+	snapshot := s.admitSliceSnapshot(path)
+	return snapshot.queued, snapshot.phase
 }
 
 // admitAvailable is the governor's advisory, read-only view of the same
@@ -853,18 +878,24 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			if s.admitBackfillGrace <= 0 || now.Sub(waiter.enqueued) >= s.admitBackfillGrace {
 				switch {
 				case maxHold <= 0:
-					// Duty cycle disabled: bypass the phase machine ENTIRELY and use
-					// the original stateless rule, so "disabled reproduces today
-					// exactly" is literally true. Modelling it as one infinite phase
-					// would NOT be equivalent — it would survive holder departure and
-					// protect a successor younger than its own backfill grace.
+					// Duty cycle disabled: freeze exactly as before, and write NO phase
+					// state, so the anchor stays meaningless in this mode rather than
+					// accumulating values nothing reads.
+					//
+					// Note this branch is behaviourally equivalent to falling through
+					// (admitFreezePhaseAt returns idle when maxHold <= 0); it exists to
+					// keep the anchor untouched, not because freezing differs. An
+					// earlier comment here claimed disabled mode differed by protecting
+					// a successor younger than the backfill grace — that was wrong: the
+					// grace check above gates this switch in EVERY mode, so a young head
+					// never freezes either way.
 					frozen = true
 				case phase != admitFreezeYield:
 					frozen = true
 					if phase == admitFreezeIdle {
-						// The ONLY write to the anchor. Guarded by idle, so an active
-						// hold cannot renew itself and a departing holder cannot buy a
-						// fresh window.
+						// The arm: one of the two anchor writes (see the struct). Guarded
+						// by idle, so an active hold cannot renew itself and a departing
+						// holder cannot buy a fresh window.
 						queue.freezeArmedAt = now
 						phase = admitFreezeHold
 					}
@@ -893,16 +924,19 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		}
 		close(waiter.grantedCh)
 	}
+	// Log BEFORE clearing the diagnostics holder: a hold->yield transition is
+	// exactly the moment an operator wants to see WHICH waiter was being
+	// protected, and clearing first would strip that from the one line reporting it.
+	if maxHold > 0 && phase != queue.freezeLogged {
+		s.logAdmitFreezeTransition(queue, phase, now)
+		queue.freezeLogged = phase
+	}
 	if !frozen {
 		// The head fitted, was granted, or left. Clear only the DIAGNOSTICS seq —
 		// the anchor deliberately survives, because clearing it here would let
 		// repeated holder-fit churn restart fresh holds, which is the same
 		// unbounded-freeze defect as re-anchoring, by another route.
 		queue.freezeHolderSeq = 0
-	}
-	if maxHold > 0 && phase != queue.freezeLogged {
-		s.logAdmitFreezeTransition(queue, phase, now)
-		queue.freezeLogged = phase
 	}
 }
 

@@ -390,6 +390,18 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		result.Status.Slice = attemptedSlice
 		return result, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: %w", err)
 	}
+	// A DECLARED reserve below the minimum the CLI itself accepts is refused here
+	// rather than silently launched uncapped. Both are enforced on this value —
+	// the daemon-grant path makes a declared reserve the scope memory.max — so
+	// quietly dropping the cap for a sub-minimum value would recreate the very
+	// "same request, different containment" divergence this change closes, and
+	// would be another silent substitution of the kind AIRA-58 exists to remove.
+	// Symmetric with the CLI (main.go rejects below the same bound) and with the
+	// daemon's own behaviour.
+	if request.MemoryReservePinned && request.MemoryReserve > 0 && request.MemoryReserve < MinPinnedScopeCap {
+		result.Status.Slice = attemptedSlice
+		return result, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --memory-reserve: declared reserve %d is below the %d-byte minimum", request.MemoryReserve, MinPinnedScopeCap)
+	}
 	if err := validateConfineName(request.Name); err != nil {
 		result.Status.Slice = attemptedSlice
 		return result, err
@@ -454,14 +466,17 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// Both facts are read from the ORIGINAL request, before any resolution below:
 	//   - provenance: MemoryReservePinned is about to be widened to true for ANY
 	//     positive reserve, after which it can no longer distinguish "the caller
-	//     declared this" from "the caller passed something".
+	//     declared this" from "the caller passed something". Callers that pass a
+	//     token reserve without declaring it (several tests pass 1) must never
+	//     have it enforced as a cap — that contains nothing and kills the job.
 	//   - validity: a caller that pins WITHOUT a usable number has its reserve
 	//     replaced by the 4GiB default a few lines down, and capping at that
 	//     default would be capping at a guess while calling it declared — exactly
 	//     what the unpinned branch deliberately refuses to do.
-	// MemoryReserve is itself overwritten at the end of this block, so the byte
-	// count is captured here too rather than re-read at the cap site.
-	declaredReserve := request.MemoryReservePinned && request.MemoryReserve >= MinPinnedScopeCap
+	// A declared-but-too-small reserve was already refused above, so a positive
+	// declared value here is usable. MemoryReserve is overwritten at the end of
+	// this block, so the byte count is captured now rather than re-read later.
+	declaredReserve := request.MemoryReservePinned && request.MemoryReserve > 0
 	declaredReserveBytes := request.MemoryReserve
 	pinned := request.MemoryReservePinned || reserve > 0
 	if reserve <= 0 {
@@ -627,14 +642,9 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// original request — never on request.MemoryReservePinned, which by here is
 	// true for any positive reserve and cannot tell a deliberate cap from a token
 	// value, and never on request.MemoryReserve, which by here may be a resolved
-	// default rather than anything the caller said.
-	//
-	// Residual, documented gap: a PROGRAMMATIC caller that declares a sub-1MiB
-	// reserve is still capped on the daemon-grant path below (unchanged) but not
-	// here. The CLI cannot produce such a request (it rejects below 1MiB), and the
-	// better long-term answer is to refuse it outright at the runner boundary —
-	// filed separately rather than widened into this change, because adding a new
-	// refusal path could break programmatic callers neither ticket concerns.
+	// default rather than anything the caller said. A declared reserve too small
+	// to be a real cap was refused up front, so there is no silently-uncapped
+	// case left for this branch to hide.
 	if !request.DelegateRAM && scopeMemoryMax <= 0 && declaredReserve {
 		scopeMemoryMax = declaredReserveBytes
 	}

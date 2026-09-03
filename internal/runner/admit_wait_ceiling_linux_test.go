@@ -118,6 +118,7 @@ func TestConfineCapsPinnedReserveOnNonDaemonAdmissionPaths(t *testing.T) {
 		reserve int64
 		pinned  bool
 		wantCap int64
+		wantErr string
 	}{
 		{name: "fallback unevaluated, pinned", state: "unevaluated", reserve: 8 << 20, pinned: true, wantCap: 8 << 20},
 		{name: "fallback timeout, pinned", state: "timeout", reserve: 8 << 20, pinned: true, wantCap: 8 << 20},
@@ -131,9 +132,12 @@ func TestConfineCapsPinnedReserveOnNonDaemonAdmissionPaths(t *testing.T) {
 		// shape of the three real-cgroup tests that a provenance-blind version of
 		// this fix killed with a 1-byte memory.max.
 		{name: "positive reserve that was never declared", state: "unevaluated", reserve: 8 << 20, pinned: false, wantCap: 0},
-		// Below the floor a declared value is a token, not a containment request:
-		// capping at it could only kill the job at launch.
-		{name: "declared below the floor is a sentinel", state: "unevaluated", reserve: 1, pinned: true, wantCap: 0},
+		// A DECLARED reserve below the minimum is REFUSED, not silently launched
+		// uncapped. Silently dropping the cap would mean the same request is
+		// contained when the daemon answers and uncontained when it does not —
+		// the exact divergence this change closes, and another silent
+		// substitution of the kind AIRA-58 removed.
+		{name: "declared below the minimum is refused", state: "unevaluated", reserve: 1, pinned: true, wantErr: "E_CONFINE_ARGUMENT_INVALID"},
 		// Pinned but with NO usable number: the reserve is replaced by the 4GiB
 		// default further down, and capping at that default would be capping at a
 		// guess while calling it declared — precisely what the unpinned branch
@@ -152,10 +156,20 @@ func TestConfineCapsPinnedReserveOnNonDaemonAdmissionPaths(t *testing.T) {
 				gotCap = maximum
 				return nil
 			}
-			if _, err := confineWithDeps(context.Background(), ConfineRequest{
+			_, err := confineWithDeps(context.Background(), ConfineRequest{
 				Slice: "finite.slice", MemoryReserve: test.reserve, MemoryReservePinned: test.pinned,
 				Argv: []string{"/bin/true"}, Stderr: io.Discard,
-			}, deps); err != nil {
+			}, deps)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("err=%v, want a refusal containing %s", err, test.wantErr)
+				}
+				if capCalls != 0 {
+					t.Fatalf("a refused request still wrote a scope cap of %d", gotCap)
+				}
+				return
+			}
+			if err != nil {
 				t.Fatalf("confine: %v", err)
 			}
 			if test.wantCap == 0 {

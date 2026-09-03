@@ -44,8 +44,8 @@ const (
 	// than catastrophic. 0/"disabled" restores the old unbounded behaviour.
 	defaultAdmitFreezeMaxHold = 2 * time.Minute
 	defaultWatchdogInterval   = 2 * time.Second
-	defaultScopeReapInterval    = 5 * time.Minute
-	defaultScopeReapGrace       = 2 * time.Minute
+	defaultScopeReapInterval  = 5 * time.Minute
+	defaultScopeReapGrace     = 2 * time.Minute
 
 	// defaultStaleLeaseReleaseGrace is a LEASE-TTL policy, not a liveness
 	// proof: any admitGranted lease whose scope is STILL found empty this
@@ -144,10 +144,8 @@ func admitBackfillGraceFromEnv() (time.Duration, error) {
 
 // admitFreezeMaxHoldFromEnv follows the admitBackfillGraceFromEnv convention
 // exactly, including "disabled"/"0". Disabled means the fairness freeze is
-// UNBOUNDED again — the pre-AIRA-59 behaviour — and the evaluator then bypasses
-// the phase machine entirely rather than modelling it as an infinite phase,
-// because a persistent phase is observably different: it would survive holder
-// departure and protect a successor younger than its own backfill grace.
+// UNBOUNDED again — the pre-AIRA-59 behaviour — and the evaluator then leaves the
+// phase anchor untouched rather than writing state nothing reads.
 func admitFreezeMaxHoldFromEnv() (time.Duration, error) {
 	value, set := os.LookupEnv("AIRA_DAEMON_ADMIT_FREEZE_MAX_HOLD")
 	if !set || value == "" {
@@ -157,8 +155,13 @@ func admitFreezeMaxHoldFromEnv() (time.Duration, error) {
 		return 0, nil
 	}
 	hold, err := time.ParseDuration(value)
-	if err != nil || hold <= 0 {
-		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_ADMIT_FREEZE_MAX_HOLD must be a positive Go duration, disabled, or 0")
+	// Floor at one second, comfortably above any permitted poll interval
+	// (admitPollIntervalFromEnv caps at 10s but defaults to 250ms). A hold shorter
+	// than a poll interval is refused rather than merely tolerated: the evaluator
+	// would then routinely leap a whole hold/yield cycle between passes, which the
+	// duty cycle handles but which makes the setting meaningless.
+	if err != nil || hold < time.Second {
+		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_ADMIT_FREEZE_MAX_HOLD must be a Go duration of at least 1s, disabled, or 0")
 	}
 	return hold, nil
 }

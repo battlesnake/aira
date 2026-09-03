@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -59,6 +60,15 @@ func validateConfineReserveRequest(request ConfineReserveRequest) error {
 	}
 	if request.MaxWait < 0 {
 		return errors.New("E_CONFINE_ARGUMENT_INVALID: reserve max wait must be non-negative")
+	}
+	// AIRA-58: confine-reserve reaches admitThroughDaemon directly, so it does not
+	// inherit Runner.admit's ceiling check. Without this, a programmatic
+	// over-ceiling MaxWait is refused by the daemon and then wrapped as
+	// E_CONFINE_UNAVAILABLE, which the pytest governor treats as fail-open — the
+	// test would run unreserved. Refuse at this boundary too, against the same
+	// shared constant every other caller uses.
+	if request.MaxWait > AdmitWaitCeiling {
+		return fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: reserve max wait %s exceeds the ceiling of %s", request.MaxWait, AdmitWaitCeiling)
 	}
 	return nil
 }

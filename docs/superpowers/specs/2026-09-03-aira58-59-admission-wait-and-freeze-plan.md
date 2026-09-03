@@ -428,23 +428,23 @@ per-tick deadline renewal — flagged by both gates:
   (`admit.go:699-709`), so a transient unreadable-slice blip cannot advance or
   restart a phase (§7.4).
 
-**Accepted consequence of holder-independence.** Because the phase survives holder
-departure, a successor that is *younger than `grace`* can inherit protection it
-has not yet earned, for the remainder of an active hold. This is the deliberate
-flip side of closing the churn attack, it is bounded by `maxHold` and the 50%
-duty, and it is recorded rather than left as a surprise.
+**A claim removed as false (build review).** v4/v5 recorded an "accepted
+consequence" that a successor younger than `grace` could inherit protection it
+had not earned. That is wrong: the backfill-grace check gates the freeze in
+*every* mode, so a head younger than its grace never freezes at all. The claim
+described a behaviour the code does not have, and is deleted rather than
+carried forward.
 
 `admitBackfillGrace = 0`/`disabled` (strict FIFO) keeps its exact meaning: the arm
 condition short-circuits before any phase logic.
 
-**`maxHold = 0`/`disabled` must bypass the phase machine entirely**, not merely
-set an infinite deadline. Today's freeze is recomputed statelessly from each
-blocked waiter's own age on every pass (`admit.go:710-728`); a *persistent*
-unbounded phase would behave differently — surviving holder departure to protect a
-young successor before its grace, and surviving a temporarily all-fitting queue.
-So `disabled` routes through the existing stateless loop with no phase state at
-all. This is the only way "disabled reproduces today exactly" is a true statement
-rather than an approximate one.
+**`maxHold = 0`/`disabled`** freezes exactly as before and writes no phase state,
+so the anchor stays meaningless in that mode rather than accumulating values
+nothing reads. (Build review established this branch is *behaviourally*
+equivalent to falling through, since the derived phase is idle whenever
+`maxHold <= 0`; it is kept to leave the anchor untouched, not because freezing
+differs. An earlier draft justified it by a young-successor difference that does
+not exist — see above.)
 
 ### 5.6 Why the 60s grace is deliberately left alone
 
@@ -603,7 +603,7 @@ queued/freeze summary; the 2026-08-27 correction note; all tests above.
 - **`cmd/aira/main.go:857-859` forcing `reserve = --memory-max` even for
   delegate-ram**, silently overriding `--memory-reserve` (§2.2). Verified, and the
   confirmed source of the live 32G heads — but a memory-accounting change in the
-  over-commit direction needing its own safety argument. **Filed as its own P1.**
+  over-commit direction needing its own safety argument. **Filed as AIRA-62.**
 - Size-scoped freezing (§5.2); proportional-share earmark (§5.2); raising
   `defaultAdmitBackfillGrace` (§5.6); runtime-estimate backfill reservations.
 - **A concurrency bound for `worker-admit`** (it has none, §4.1) — a behavioural
@@ -722,3 +722,51 @@ Net: scope grew by two files and one error code; the freeze mechanism is
 that would each have shipped a plausible-looking wrong fix — two opening new
 out-of-ledger admission paths — were caught before any code was written; and a
 fourth, pre-existing containment gap was verified and half-closed.
+
+
+## 12. Build log — what the implementation phase itself found
+
+The two-loop kept finding real defects *after* the plan was settled. Recorded
+because each was a fix that looked correct and was not.
+
+1. **The existing runner suite caught a regression in my own fix.** The first
+   fallback-cap implementation keyed on `MemoryReservePinned`, which
+   `confine_linux.go` sets true for ANY positive reserve. Three real-cgroup tests
+   pass `MemoryReserve: 1` as a token, so a 1-byte `memory.max` was written and
+   the children were killed ("pid absent"). Fixed by capturing *provenance*
+   (`declaredReserve`) before that widening. This is exactly the class of bug the
+   plan predicted in §9.4 and it still took the suite to surface it.
+2. **Provenance alone was not enough** (Sol): a caller that pins *without* a
+   usable number has its reserve replaced by the 4GiB default, which was then
+   enforced as a "declared" cap — capping at a guess. Provenance now requires a
+   valid declared value.
+3. **The `MinPinnedScopeCap` floor was justified by a false claim** (Fable):
+   it was documented as what protects the token-reserve tests, but those tests
+   never set `MemoryReservePinned`, so provenance alone excludes them. Worse, the
+   floor silently uncapped a declared sub-minimum reserve while the daemon path
+   still capped it — reintroducing the very divergence §4.2 exists to remove.
+   Both lineages converged on refusing instead: a declared reserve below the
+   minimum is now `E_CONFINE_ARGUMENT_INVALID` at the runner boundary.
+4. **A duty cycle can be defeated by never being observed** (Sol). The phase is
+   derived from wall time, but grants only happen during an evaluator pass. If a
+   whole yield window elapsed *between* passes — reachable when `maxHold`
+   approaches the poll interval, or when a slow adopted-confine scan delays a
+   pass — the queue went hold → idle → re-armed within a single pass and
+   backfilled nobody: a permanent freeze that still reported a 50% duty. Fixed by
+   guaranteeing at least one backfilling *pass* per cycle, plus a 1s startup floor
+   on the setting.
+5. **Two anchor writes, not one.** The fix in (4) added a second write, making
+   the struct's "the only write is the arm" comment false. Corrected, with why
+   the clear cannot lengthen a hold.
+6. **Diagnostics were promised and initially unimplemented** (Sol). Now
+   implemented, read in ONE locked snapshot with the ledger so the summary cannot
+   contradict itself, and reporting `disabled` rather than `idle` when the duty
+   cycle is off — where a freeze may be actively blocking.
+7. **Test harness bugs of my own**: `admitConnection` deliberately blocks after
+   granting (it holds the connection as the lease), so the live repro's
+   completion channel signalled the wrong event; and malformed JSON in a response
+   *payload* breaks the enclosing frame, so it tested frame handling rather than
+   payload handling. Both corrected.
+
+Final evidence: `go vet ./...` and `go test ./...` both exit 0, and a 16-case
+mutation harness reports every case caught.

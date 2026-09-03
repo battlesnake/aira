@@ -38,17 +38,20 @@ const (
 	// becoming 30m on the wire while daemon tests passed. A caller that exceeds
 	// this is REFUSED and told the ceiling, never silently substituted.
 	AdmitWaitCeiling = 24 * time.Hour
-	// MinPinnedScopeCap is the smallest pinned reserve that may be enforced as a
-	// scope memory.max on the non-daemon admission paths. It mirrors the minimum
-	// `aira confine --memory-reserve` already accepts, so every value a real CLI
-	// caller can produce is still capped.
+	// MinPinnedScopeCap is the smallest reserve a caller may DECLARE. It mirrors
+	// the minimum `aira confine --memory-reserve` already accepts, so the CLI, the
+	// runner and the daemon all agree on one bound.
 	//
-	// The floor exists because MemoryReservePinned is a WEAKER signal than "the
-	// user declared a cap": confine_linux.go sets it true for ANY positive
-	// reserve, including token values a programmatic caller passes purely to
-	// enable admission. Enforcing a 1-byte sentinel as memory.max cannot contain
-	// anything — it can only OOM-kill the job at launch. Below this floor the
-	// value is treated as a sentinel, not a containment request.
+	// A declared reserve below it is REFUSED at the runner boundary, not silently
+	// launched uncapped: a declared reserve becomes the scope memory.max, so
+	// quietly dropping the cap for a sub-minimum value would mean the same request
+	// is contained when the daemon answers and uncontained when it does not —
+	// the divergence this whole change exists to remove, and another instance of
+	// the silent substitution AIRA-58 removed.
+	//
+	// Note this is NOT what protects callers that pass a token reserve (several
+	// tests pass 1): those never set MemoryReservePinned, so provenance alone
+	// excludes them. The two mechanisms are independent.
 	MinPinnedScopeCap = int64(1 << 20)
 )
 

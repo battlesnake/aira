@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"bytes"
+	"log"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -467,6 +469,10 @@ func TestAdmitFreezeMaxHoldFromEnv(t *testing.T) {
 		{name: "disabled", value: "disabled", want: 0},
 		{name: "malformed", value: "banana", wantErr: true},
 		{name: "negative", value: "-1m", wantErr: true},
+		// Refused rather than tolerated: a hold shorter than the evaluator's poll
+		// interval means passes routinely leap a whole hold/yield cycle, which the
+		// duty cycle survives but which makes the setting meaningless.
+		{name: "below the poll interval", value: "100ms", wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if test.value == "" {
@@ -596,6 +602,62 @@ func TestAdmitQueueDiagnosticsReportQueuedAndFreezePhase(t *testing.T) {
 	}
 	if queued != 1 {
 		t.Fatalf("after the yield admitted the fitting waiter: queued=%d, want 1 (only the unfittable head)", queued)
+	}
+}
+
+// verifies: AIRA-59 — freeze logging fires on TRANSITIONS ONLY, and a hold->yield
+// line still names the waiter it was protecting. Evaluator passes run at up to
+// 4/s, so logging an ongoing freeze every pass would itself be a regression on a
+// busy box; and a transition line without the head is useless for the diagnosis
+// this was added to support.
+func TestAdmitFreezeLogsTransitionsOnlyAndNamesTheHead(t *testing.T) {
+	var buffer bytes.Buffer
+	previousOutput, previousFlags := log.Writer(), log.Flags()
+	log.SetOutput(&buffer)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(previousOutput); log.SetFlags(previousFlags) })
+
+	var maximum atomic.Int64
+	maximum.Store(100)
+	current := int64(50)
+	now := time.Unix(18000, 0)
+	server := freezeTestServer(t, &maximum, &current, &now)
+	server.admitBackfillGrace = 10 * time.Second
+	server.admitFreezeMaxHold = time.Minute
+
+	head := queuedWaiter(7, 60, now.Add(-10*time.Second))
+	fitting := queuedWaiter(8, 30, now)
+	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, fitting}}
+
+	server.evaluateAdmitQueue(queue) // idle -> hold: exactly one line
+	holdLines := strings.Count(buffer.String(), "fairness-freeze hold")
+	if holdLines != 1 {
+		t.Fatalf("hold transition logged %d times, want exactly 1:\n%s", holdLines, buffer.String())
+	}
+	if !strings.Contains(buffer.String(), "seq=7") {
+		t.Fatalf("hold line does not name the protected head:\n%s", buffer.String())
+	}
+
+	// Twenty more passes inside the same hold must add NOTHING.
+	for step := 0; step < 20; step++ {
+		now = now.Add(time.Second)
+		server.evaluateAdmitQueue(queue)
+	}
+	if got := strings.Count(buffer.String(), "fairness-freeze hold"); got != 1 {
+		t.Fatalf("steady-state freeze logged %d hold lines across 21 passes, want 1 — this floods the journal at 4 passes/s:\n%s", got, buffer.String())
+	}
+
+	// The hold->yield transition logs once, and still names the head it was
+	// protecting (the diagnostics seq must not be cleared before the log).
+	buffer.Reset()
+	now = now.Add(41 * time.Second)
+	server.evaluateAdmitQueue(queue)
+	yieldText := buffer.String()
+	if strings.Count(yieldText, "fairness-freeze yield") != 1 {
+		t.Fatalf("yield transition logged %d times, want exactly 1:\n%s", strings.Count(yieldText, "fairness-freeze yield"), yieldText)
+	}
+	if !strings.Contains(yieldText, "seq=7") {
+		t.Fatalf("yield line lost the protected head, so the log cannot say what was blocking:\n%s", yieldText)
 	}
 }
 
