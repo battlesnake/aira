@@ -377,7 +377,7 @@ func buildGateCommand(command gate.Command, fields map[string]any) (gate.Command
 func buildCanaryDeclaration(definition gate.GateDefinition, canaryID string, fields map[string]any) (gate.CanaryDeclaration, bool, error) {
 	kind, ok := gateFieldString(fields, "mutation_kind")
 	if !ok {
-		for _, name := range []string{"mutation_file", "mutation_test", "mutation_occurrence", "mutation_pkgdir", "mutation_testname", "mutation_seed", "mutation_expected_result"} {
+		for _, name := range []string{"mutation_file", "mutation_test", "mutation_occurrence", "mutation_pkgdir", "mutation_testname", "mutation_content", "mutation_seed", "mutation_expected_result"} {
 			if gateFieldPresent(fields, name) {
 				return gate.CanaryDeclaration{}, false, errors.New("E_GATE_CANARY_INVALID: mutation fields require --mutation-kind")
 			}
@@ -388,6 +388,10 @@ func buildCanaryDeclaration(definition gate.GateDefinition, canaryID string, fie
 	if expected, present := gateFieldString(fields, "mutation_expected_result"); present {
 		seed.ExpectedResult = expected
 	}
+	// inject-file (AIRA-55) carries a literal body. Dropping it here would
+	// silently materialize a different canary than the caller asked for, which
+	// is the same class of defect AIRA-53 fixed.
+	seed.Content, _ = gateFieldString(fields, "mutation_content")
 	seed.File, _ = gateFieldString(fields, "mutation_file")
 	seed.Test, _ = gateFieldString(fields, "mutation_test")
 	seed.PkgDir, _ = gateFieldString(fields, "mutation_pkgdir")

@@ -2238,6 +2238,76 @@ func TestConfineAdmissionWaitEmitsProgressDiagnostic(t *testing.T) {
 	if !seen {
 		t.Fatalf("no admission-wait progress diagnostic emitted; stderr=%q", buf.String())
 	}
+	got := buf.String()
+	if !strings.Contains(got, "reserve 4G") {
+		t.Fatalf("pinned request must keep the exact granted-figure wording; stderr=%q", got)
+	}
+	if strings.Contains(got, "unpinned") {
+		t.Fatalf("pinned request must not carry the unpinned hedge; stderr=%q", got)
+	}
+}
+
+// AIRA-51: an UNPINNED request's admission-wait line must not present the
+// client's no-history fallback hint (DefaultConfineMemoryReserve) as if it
+// were the reserve the daemon is actually contending over — the daemon
+// resolves the real, admission-gating reserve from history/estimation before
+// queueing and can grant a wildly different figure (observed ~17x smaller in
+// dogfooding), which the client only learns on the final admit response. RED
+// against a message that states the unresolved hint as a bare "reserve".
+func TestConfineAdmissionWaitDiagnosticHedgesUnpinnedReserve(t *testing.T) {
+	var mu sync.Mutex
+	var buf bytes.Buffer
+	sink := writerFunc(func(p []byte) (int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return buf.Write(p)
+	})
+	proceed := make(chan struct{})
+	scope := &confineFakeScope{}
+	deps := confineUnitDeps(scope)
+	deps.admitWaitDiagInterval = 5 * time.Millisecond
+	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
+		<-proceed
+		return admissionResult{state: "waited", reserve: 232 << 20, basis: "estimate:p90-prior"}, nil
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// No MemoryReserve/MemoryReservePinned set: this is the unpinned,
+		// no-signature-history default path that falls back to
+		// DefaultConfineMemoryReserve (4G) purely as a request hint.
+		_, _ = confineWithDeps(context.Background(), ConfineRequest{
+			Slice: "finite.slice", Argv: []string{"/bin/true"},
+			SelfPath: os.Args[0], Stderr: sink,
+		}, deps)
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	seen := false
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := buf.String()
+		mu.Unlock()
+		if strings.Contains(got, "waiting for memory admission") {
+			seen = true
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	close(proceed)
+	<-done
+	if !seen {
+		t.Fatalf("no admission-wait progress diagnostic emitted; stderr=%q", buf.String())
+	}
+	got := buf.String()
+	if !strings.Contains(got, "requested reserve 4G") {
+		t.Fatalf("unpinned line must label the figure as a requested hint, not a bare reserve; stderr=%q", got)
+	}
+	if !strings.Contains(got, "unpinned") {
+		t.Fatalf("unpinned line must say so explicitly; stderr=%q", got)
+	}
+	if !strings.Contains(got, "daemon resolves the actual grant") {
+		t.Fatalf("unpinned line must warn the daemon's grant may differ; stderr=%q", got)
+	}
 }
 
 type writerFunc func([]byte) (int, error)

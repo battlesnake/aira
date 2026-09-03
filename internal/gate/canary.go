@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 type CanaryMode string
@@ -52,6 +53,11 @@ type CanaryDeclaration struct {
 
 // MutationSeed is a closed tagged union. The evaluator interprets only these
 // typed fields; it never executes seed content as a patch or command.
+//
+// Content belongs to the inject-file kind alone. It is literal file bytes the
+// evaluator writes verbatim into an isolated snapshot — never a patch, script,
+// or command the evaluator interprets — which keeps the language-agnostic kind
+// inside the same invariant as the two Go kinds.
 type MutationSeed struct {
 	SchemaVersion  int    `json:"schema_version"`
 	Kind           string `json:"kind"`
@@ -61,8 +67,14 @@ type MutationSeed struct {
 	Occurrence     int    `json:"occurrence,omitempty"`
 	PkgDir         string `json:"pkgdir,omitempty"`
 	TestName       string `json:"testname,omitempty"`
+	Content        string `json:"content,omitempty"`
 	ExpectedResult string `json:"expected_result"`
 }
+
+// maxMutationContentBytes bounds an inject-file body. A canary declaration is a
+// committed, digested file, not a payload channel; a small cap keeps the closed
+// union cheap to authenticate and cheap to read in review.
+const maxMutationContentBytes = 64 * 1024
 
 func ValidateCanary(c CanaryDeclaration) error {
 	if c.SchemaVersion != 1 && c.SchemaVersion != CurrentSchemaVersion {
@@ -151,12 +163,18 @@ func validateMutation(m MutationSeed) error {
 	}
 	switch m.Kind {
 	case "go-negate-assertion":
-		if !safeMutationPath(m.File) || m.Test == "" || m.Occurrence <= 0 || m.PkgDir != "" || m.TestName != "" {
+		if !safeMutationPath(m.File) || m.Test == "" || m.Occurrence <= 0 || m.PkgDir != "" || m.TestName != "" || m.Content != "" {
 			return errors.New("E_GATE_CANARY_INVALID: invalid go-negate-assertion seed")
 		}
 	case "go-inject-failing-test":
-		if !safeMutationPackagePath(m.PkgDir) || !strings.HasPrefix(m.TestName, "Test") || len(m.TestName) <= len("Test") || m.File != "" || m.Test != "" || m.Occurrence != 0 {
+		if !safeMutationPackagePath(m.PkgDir) || !strings.HasPrefix(m.TestName, "Test") || len(m.TestName) <= len("Test") || m.File != "" || m.Test != "" || m.Occurrence != 0 || m.Content != "" {
 			return errors.New("E_GATE_CANARY_INVALID: invalid go-inject-failing-test seed")
+		}
+	// inject-file is the language-agnostic kind: it names a target path and the
+	// literal body to write there, and carries none of the Go kinds' fields.
+	case "inject-file":
+		if !safeMutationPath(m.File) || m.Content == "" || len(m.Content) > maxMutationContentBytes || !utf8.ValidString(m.Content) || m.Test != "" || m.Occurrence != 0 || m.PkgDir != "" || m.TestName != "" {
+			return errors.New("E_GATE_CANARY_INVALID: invalid inject-file seed")
 		}
 	default:
 		return fmt.Errorf("E_GATE_CANARY_INVALID: unsupported mutation kind %q", m.Kind)

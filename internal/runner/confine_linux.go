@@ -491,6 +491,17 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	}
 	admitWaitDone := make(chan struct{})
 	admitWaitStopped := make(chan struct{})
+	// AIRA-51: an unpinned request's `reserve` here is only the client's
+	// no-history fallback hint (DefaultConfineMemoryReserve, or the delegate-ram
+	// overhead) sent to the daemon as a starting point — resolveAdmitReserve
+	// (internal/daemon/admit.go) resolves the real, admission-gating reserve from
+	// peak-RSS history or a machine-wide p90 prior before this job is even
+	// queued, and that resolved figure is what the daemon actually grants. The
+	// client learns it only on the single blocking admit response (deferred
+	// AIRA-24: no mid-wait channel exists to poll it), so while unpinned this
+	// progress line must not present the hint as the number the slice is
+	// contending over; a pinned request (explicit --memory-reserve or an implied
+	// pin) IS honored verbatim by the daemon, so that figure is accurate as-is.
 	go func() {
 		defer close(admitWaitStopped)
 		start := time.Now()
@@ -501,8 +512,14 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 			case <-admitWaitDone:
 				return
 			case <-ticker.C:
-				fmt.Fprintf(admitDiag, "confine: waiting for memory admission on %s (reserve %s, waited %ds)\n",
-					sliceName, FormatConfineBytes(reserve), int64(time.Since(start).Seconds()))
+				waited := int64(time.Since(start).Seconds())
+				if pinned {
+					fmt.Fprintf(admitDiag, "confine: waiting for memory admission on %s (reserve %s, waited %ds)\n",
+						sliceName, FormatConfineBytes(reserve), waited)
+				} else {
+					fmt.Fprintf(admitDiag, "confine: waiting for memory admission on %s (requested reserve %s, unpinned — the daemon resolves the actual grant, which may differ; waited %ds)\n",
+						sliceName, FormatConfineBytes(reserve), waited)
+				}
 			}
 		}
 	}()

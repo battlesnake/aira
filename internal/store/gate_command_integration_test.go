@@ -63,6 +63,39 @@ func TestGateCommandHelperProcess(t *testing.T) {
 	case "timeout":
 		time.Sleep(30 * time.Second)
 		os.Exit(0)
+	case "detect-marker":
+		// A deliberately language-neutral checker: it inspects no Go source and
+		// runs no Go toolchain, so a pass through it is evidence that a non-Go
+		// project can drive a command gate (AIRA-55). It scans file BODIES under
+		// the named directory rather than testing one path's existence, so an
+		// injection landing at the right path with the wrong bytes does not fire
+		// it, and an injection anywhere in the tree does.
+		if len(values) != 2 {
+			os.Exit(2)
+		}
+		found := false
+		_ = filepath.WalkDir(values[0], func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return nil
+			}
+			if entry.IsDir() {
+				if entry.Name() == ".git" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !entry.Type().IsRegular() {
+				return nil
+			}
+			if data, readErr := os.ReadFile(path); readErr == nil && strings.Contains(string(data), values[1]) {
+				found = true
+			}
+			return nil
+		})
+		if found {
+			os.Exit(1)
+		}
+		os.Exit(0)
 	case "source-go-test-json":
 		injected := false
 		files, _ := filepath.Glob("*.go")
@@ -356,4 +389,94 @@ func TestCommandGateProofBindsCurrentEnvironmentAndLaneReadOnly(t *testing.T) {
 	if err != nil || len(stale.Results) != 1 || stale.Results[0].Verdict != gate.VerdictUnevaluated || stale.Results[0].Code != "U_GATE_PROOF_STALE" {
 		t.Fatalf("changed lane check=%#v err=%v", stale, err)
 	}
+}
+
+// verifies: AIRA-55 — a project with no Go source reaches a trusted,
+// canary-proven command-gate pass. Nothing in this fixture is Go-specific: the
+// predicate is exit-zero with no parser, the mutation kind is inject-file, and
+// the checker never reads Go source. The canary must fire on the injected file,
+// so a no-op injection would surface as E_GATE_CANARY_DID_NOT_FIRE instead of
+// this trusted pass.
+func TestNonGoCommandGateReachesTrustedPassViaInjectFileCanary(t *testing.T) {
+	const canaryPath = "tests/aira_canary.rs"
+	const marker = "AIRA mutation"
+	s, root := nonGoCommandSubject(t, "")
+	def, canary := injectFileGateFixture(canaryPath, marker)
+	writeGateFixture(t, root, def, canary)
+	result, err := s.RunGate(context.Background(), def.ID)
+	if err != nil || result.Verdict != gate.VerdictPass || !result.Trusted || result.Code != "" {
+		t.Fatalf("non-Go command gate result=%#v err=%v", result, err)
+	}
+	checked, err := s.GateCheck(context.Background())
+	if err != nil || checked.Verdict != gate.VerdictPass || len(checked.Results) != 1 || !checked.Results[0].Trusted || checked.Results[0].Code != "" {
+		t.Fatalf("non-Go command gate check=%#v err=%v", checked, err)
+	}
+	// The same gate must still fail honestly on a subject that violates it, so
+	// the trusted pass above is not simply a checker that can never fail. The
+	// violation goes in a file other than the canary's target, which must stay
+	// free for the create-only injection to keep applying.
+	if err := os.WriteFile(filepath.Join(root, "tests", "broken.rs"), []byte("#[test]\nfn real() { panic!(\""+marker+"\"); }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "add", ".")
+	// GateCheck reports U_GATE_NO_RESULT for a subject it has no record of, so
+	// the honest-failure leg has to re-run the gate. The canary must still fire
+	// here, which is why the code is the subject's own failure rather than a
+	// canary or mutation-apply code.
+	failed, err := s.RunGate(context.Background(), def.ID)
+	if err != nil || failed.Verdict != gate.VerdictFail || failed.Code != "E_GATE_COMMAND_FAILED" || failed.Trusted {
+		t.Fatalf("violating subject result=%#v err=%v", failed, err)
+	}
+}
+
+// verifies: AIRA-55 — an inject-file target the subject's git excludes match is
+// dropped by the re-stage and never reaches the checker, so the gate reports the
+// hard E_GATE_CANARY_DID_NOT_FIRE rather than an unproven pass. This pins the
+// documented limitation of the kind as executable behaviour.
+func TestInjectFileCanaryIntoIgnoredPathDoesNotFire(t *testing.T) {
+	const canaryPath = "ignored/aira_canary.rs"
+	const marker = "AIRA mutation"
+	s, root := nonGoCommandSubject(t, "ignored/\n")
+	def, canary := injectFileGateFixture(canaryPath, marker)
+	writeGateFixture(t, root, def, canary)
+	result, err := s.RunGate(context.Background(), def.ID)
+	if err != nil || result.Verdict != gate.VerdictFail || result.Code != "E_GATE_CANARY_DID_NOT_FIRE" || result.Trusted {
+		t.Fatalf("ignored injection result=%#v err=%v", result, err)
+	}
+}
+
+// nonGoCommandSubject builds a tracked subject tree containing no Go source at
+// all, so a gate that passes over it cannot be relying on the Go toolchain.
+func nonGoCommandSubject(t *testing.T, ignore string) (*Store, string) {
+	t.Helper()
+	s, root := realCommandStore(t)
+	if err := os.MkdirAll(filepath.Join(root, "tests"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "Cargo.toml"), []byte("[package]\nname = \"sample\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "tests", "existing.rs"), []byte("#[test]\nfn existing() { assert!(true); }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if ignore != "" {
+		if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte(ignore), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gitRun(t, root, "add", ".")
+	return s, root
+}
+
+func injectFileGateFixture(canaryPath, marker string) (gate.GateDefinition, gate.CanaryDeclaration) {
+	def := gate.GateDefinition{SchemaVersion: 2, ID: "rust-tests", Name: "Rust tests", Kind: gate.KindCheckable,
+		AppliesTo: gate.AppliesTo{All: true}, Lane: gate.Lane{Name: "rust", Checker: string(gate.CheckerCommand), EvaluatorVersion: "1"},
+		ProofPolicy: gate.ProofPolicy{Mode: gate.ProofRequired, MaxAgeSecs: 3600, RequireCurrentCanary: true}, CanaryIDs: []string{"rust-tests-mutation"},
+		Command: &gate.Command{Argv: gateHelperArgv("detect-marker", ".", marker), Cwd: "root", TimeoutMS: gateFastCommandTimeoutMS,
+			OutputCapBytes: 8 * 1024 * 1024, Predicate: gate.CommandPredicateExitZero}, Enabled: true}
+	canary := gate.CanaryDeclaration{SchemaVersion: 1, ID: "rust-tests-mutation", GateID: def.ID, Mode: gate.CanaryMutation,
+		Mutation: &gate.MutationSeed{SchemaVersion: 1, Kind: "inject-file", Seed: 1, File: canaryPath,
+			Content: "#[test]\nfn aira_canary() { panic!(\"" + marker + "\"); }\n", ExpectedResult: gate.VerdictFail},
+		ExpectedGateResult: gate.VerdictFail, LaneBinding: "rust", Isolation: gate.IsolationTempGit, Cadence: gate.CadenceOnDemand}
+	return def, canary
 }

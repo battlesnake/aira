@@ -1851,12 +1851,12 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 		"gate": {Name: "gate", Usage: "gate <operation> [args]", Args: []ArgSpec{
 			stringSpec("subverb", true, true, "Gate operation", "add", "ls", "show", "set", "run", "check", "attest", "prove", "review", "canary-run", "canary-show", "baseline-pin", "baseline-show"),
 			stringSpec("gate_id", false, true, "Gate identifier"), stringSpec("canary_id", false, true, "Canary identifier"), stringSpec("verdict", false, false, "Attestation verdict", "pass", "fail"), stringSpec("actor", false, false, "Attestation actor"), stringSpec("reason", false, false, "Baseline pin reason"), stringSpec("report", false, false, "Comma-separated test report IDs"),
-			stringSpec("checker", false, false, "Gate checker", "check-dimension", "command", "manual-attestation", "ratchet"), stringSpec("predicate", false, false, "Command predicate", "exit-zero", "tests-green"),
+			stringSpec("checker", false, false, "Gate checker", "check-dimension", "command", "manual-attestation", "ratchet"), stringSpec("predicate", false, false, "Command predicate; tests-green requires parser go-test-json-v1, which reads go test -json output only, so exit-zero is the only predicate a non-Go command can use", "exit-zero", "tests-green"),
 			stringSpec("dimension", false, false, "Check dimension for a check-dimension gate", "traceability"),
-			listSpec("argv", false, false, "Exact command argv tokens"), stringSpec("cwd", false, false, "Command root or relative subdirectory"), listSpec("env_allow", false, false, "Allow-listed environment names"),
-			stringSpec("timeout_ms", false, false, "Command timeout in milliseconds"), stringSpec("output_cap_bytes", false, false, "Combined output cap in bytes"), stringSpec("parser", false, false, "Command output parser", "go-test-json-v1"),
-			stringSpec("mutation_kind", false, false, "Typed mutation kind", "go-negate-assertion", "go-inject-failing-test"), stringSpec("mutation_file", false, false, "Mutation target file"), stringSpec("mutation_test", false, false, "Mutation target test"),
-			stringSpec("mutation_occurrence", false, false, "Mutation assertion occurrence"), stringSpec("mutation_pkgdir", false, false, "Mutation package directory"), stringSpec("mutation_testname", false, false, "Injected mutation test name"), stringSpec("mutation_seed", false, false, "Mutation numeric seed"), stringSpec("mutation_expected_result", false, false, "Mutation expected result", "fail"),
+			listSpec("argv", false, false, "Exact command argv tokens"), stringSpec("cwd", false, false, "Command root or relative subdirectory"), listSpec("env_allow", false, false, "Allow-listed environment names; a relative argv[0] such as make resolves only when PATH is listed here, and a definition without it is refused E_GATE_INVALID"),
+			stringSpec("timeout_ms", false, false, "Command timeout in milliseconds"), stringSpec("output_cap_bytes", false, false, "Combined output cap in bytes"), stringSpec("parser", false, false, "Command output parser; required by predicate tests-green and refused with predicate exit-zero", "go-test-json-v1"),
+			stringSpec("mutation_kind", false, false, "Typed mutation kind; the go- kinds parse Go source, inject-file is the language-agnostic kind and should inject a compiling, failing test in the subject's own language, because a body that merely breaks the build proves only that the build breaks", "go-negate-assertion", "go-inject-failing-test", "inject-file"), stringSpec("mutation_file", false, false, "Mutation target file"), stringSpec("mutation_test", false, false, "Mutation target test"),
+			stringSpec("mutation_occurrence", false, false, "Mutation assertion occurrence"), stringSpec("mutation_pkgdir", false, false, "Mutation package directory"), stringSpec("mutation_testname", false, false, "Injected mutation test name"), stringSpec("mutation_content", false, false, "Literal file body of an inject-file mutation; gate add and gate set materialize a canary declaration from the mutation_ fields under .aira/gates/canaries, and the other gate verbs carry them for transport parity only"), stringSpec("mutation_seed", false, false, "Mutation numeric seed"), stringSpec("mutation_expected_result", false, false, "Mutation expected result", "fail"),
 		}, MCPTool: "aira_gate", MCPOperation: "subverb", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			subverb := strings.ToLower(stringArg(args, "subverb"))
 			switch subverb {
@@ -2367,7 +2367,7 @@ func stringSlice(args *argAccessor, key string) []string {
 
 func gateDefinitionInputFields(args *argAccessor) map[string]any {
 	fields := map[string]any{}
-	for _, name := range []string{"checker", "predicate", "dimension", "cwd", "timeout_ms", "output_cap_bytes", "parser", "mutation_kind", "mutation_file", "mutation_test", "mutation_occurrence", "mutation_pkgdir", "mutation_testname", "mutation_seed", "mutation_expected_result"} {
+	for _, name := range []string{"checker", "predicate", "dimension", "cwd", "timeout_ms", "output_cap_bytes", "parser", "mutation_kind", "mutation_file", "mutation_test", "mutation_occurrence", "mutation_pkgdir", "mutation_testname", "mutation_content", "mutation_seed", "mutation_expected_result"} {
 		if value := stringArg(args, name); value != "" {
 			fields[name] = value
 		}
@@ -2383,7 +2383,7 @@ func gateDefinitionInputFields(args *argAccessor) map[string]any {
 
 func mutationInputFields(args *argAccessor) map[string]any {
 	fields := map[string]any{}
-	for _, name := range []string{"mutation_kind", "mutation_file", "mutation_test", "mutation_occurrence", "mutation_pkgdir", "mutation_testname", "mutation_seed", "mutation_expected_result"} {
+	for _, name := range []string{"mutation_kind", "mutation_file", "mutation_test", "mutation_occurrence", "mutation_pkgdir", "mutation_testname", "mutation_content", "mutation_seed", "mutation_expected_result"} {
 		if value := stringArg(args, name); value != "" {
 			fields[name] = value
 		}
@@ -2392,7 +2392,7 @@ func mutationInputFields(args *argAccessor) map[string]any {
 }
 
 func gateDefinitionOperationArgs() []OperationArg {
-	names := []string{"gate_id", "checker", "predicate", "dimension", "canary_id", "argv", "cwd", "env_allow", "timeout_ms", "output_cap_bytes", "parser", "mutation_kind", "mutation_file", "mutation_test", "mutation_occurrence", "mutation_pkgdir", "mutation_testname", "mutation_seed", "mutation_expected_result"}
+	names := []string{"gate_id", "checker", "predicate", "dimension", "canary_id", "argv", "cwd", "env_allow", "timeout_ms", "output_cap_bytes", "parser", "mutation_kind", "mutation_file", "mutation_test", "mutation_occurrence", "mutation_pkgdir", "mutation_testname", "mutation_content", "mutation_seed", "mutation_expected_result"}
 	args := make([]OperationArg, 0, len(names))
 	for _, name := range names {
 		args = append(args, OperationArg{Name: name, Required: name == "gate_id"})
@@ -2401,7 +2401,7 @@ func gateDefinitionOperationArgs() []OperationArg {
 }
 
 func mutationOperationArgs() []OperationArg {
-	names := []string{"mutation_kind", "mutation_file", "mutation_test", "mutation_occurrence", "mutation_pkgdir", "mutation_testname", "mutation_seed", "mutation_expected_result"}
+	names := []string{"mutation_kind", "mutation_file", "mutation_test", "mutation_occurrence", "mutation_pkgdir", "mutation_testname", "mutation_content", "mutation_seed", "mutation_expected_result"}
 	args := make([]OperationArg, 0, len(names))
 	for _, name := range names {
 		args = append(args, OperationArg{Name: name})

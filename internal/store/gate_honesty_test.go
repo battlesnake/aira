@@ -267,6 +267,35 @@ func TestGateAddMaterializesMutationCanary(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-53 x AIRA-55
+// The language-agnostic inject-file mutation kind carries a literal body.
+// Materialization must round-trip it: dropping mutation_content would silently
+// write a different canary than the caller asked for.
+func TestGateAddMaterializesInjectFileCanary(t *testing.T) {
+	s, _ := newGateHonestyStore(t)
+	body := "def test_injected():\n    assert False\n"
+	value, err := s.GateActionWithFields(context.Background(), "add", "suite", "", map[string]any{
+		"checker": "command", "predicate": "exit-zero",
+		"argv": []string{"/usr/bin/true"}, "cwd": "root", "timeout_ms": "60000",
+		"mutation_kind": "inject-file", "mutation_file": "tests/test_injected.py", "mutation_content": body,
+	})
+	if err != nil {
+		t.Fatalf("inject-file add: %v", err)
+	}
+	result := value.(GateWriteResult)
+	if result.CanaryStatus != gateCanaryMaterialized {
+		t.Fatalf("canary status = %q, want %q", result.CanaryStatus, gateCanaryMaterialized)
+	}
+	declaration, err := s.canaryFor(result.Definition)
+	if err != nil {
+		t.Fatalf("generated inject-file canary does not resolve: %v", err)
+	}
+	if declaration.Mutation == nil || declaration.Mutation.Kind != "inject-file" ||
+		declaration.Mutation.File != "tests/test_injected.py" || declaration.Mutation.Content != body {
+		t.Fatalf("inject-file seed did not round-trip: %#v", declaration.Mutation)
+	}
+}
+
 // verifies: AIRA-53
 // add never silently overwrites, and a refused add leaves the original bytes.
 func TestGateAddRefusesExistingGateWithoutOverwriting(t *testing.T) {
