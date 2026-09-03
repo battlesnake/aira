@@ -579,7 +579,7 @@ func computeRatchetStatus(s *Store) (GaugeResult, error) {
 	} else if ok {
 		asOf["test_report_at_seq"] = seq
 	}
-	if digest, digestErr := digestEvaluationRoot(s.root); digestErr == nil {
+	if digest, digestErr := subjectTreeDigest(s.root); digestErr == nil {
 		asOf["tracked_worktree_digest"] = digest
 	}
 	universe := gaugeUniverse(len(ratchets), "project", asOf)
