@@ -1,222 +1,265 @@
-# AIRA-31: aitest Slice 2 — JUnit XML, coverage combine, TestReport replay — Implementation Plan (v2)
+# AIRA-31: aitest Slice 2 — JUnit XML, coverage combine, TestReport replay — Implementation Plan (v3)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Give aitest full xdist-equivalent output fidelity — real JUnit XML, real per-test terminal progress, real coverage.py combine — by streaming each worker's real pytest `TestReport` objects back to the supervisor and replaying them into the supervisor's own real pytest hooks, the same mechanism xdist itself uses (which turns out to be pytest's own public serialization contract, not xdist-specific — see "Verified design basis").
+**Goal:** Give aitest full xdist-equivalent output fidelity — real JUnit XML, real per-test terminal progress, real coverage combine — by streaming each worker's real pytest `TestReport` objects back to the supervisor and replaying them into the supervisor's own real pytest hooks, faithfully enough that a real assertion failure's traceback, captured output, and skip/xfail reason all survive the round-trip, and without ever silently duplicating or dropping a result.
 
-**Architecture:** Extend the existing worker→supervisor result pipe with new JSON-prefixed event lines (`logstart`, `report`, `logfinish`), but — unlike v1 — the supervisor does NOT replay them as they arrive. It STAGES them per in-flight nodeid and replays the whole staged batch, in order, only once that SAME nodeid's existing plain-text result line has been successfully received; a crash (EOF) or a corrupted/mismatched result before that point discards the staged batch instead of replaying it. The existing plain result line's own format and handling are completely unchanged. Coverage uses coverage.py's documented `patch = fork, _exit` mechanism (verified live against a real fork, not assumed) rather than relying on its bare interpreter-startup auto-start alone, which does not fire for a forked worker.
+**Architecture:** Same shape as v2 (JSON-prefixed event lines staged per in-flight nodeid, replayed only once that nodeid's existing plain-text result line is confirmed, discarded on crash) — but v3 fixes two things v2 got wrong and simplifies a third that both reviewers converged on as over-engineered:
 
-**What changed from v1 — two real P0s found by Sol/Codex's plan-review, both now resolved:**
+1. **JSON does not preserve pytest's tuple fields.** `pytest_report_to_serializable`'s output has tuple-typed fields (`longrepr`, `location`, `sections` entries) that plain `json.dumps`/`json.loads` silently turns into lists — and `pytest_report_from_serializable` does NOT restore them, because that restoration only exists on execnet's own typed wire format (which xdist uses), not on bare JSON. junitxml and terminalreporter both `assert isinstance(report.longrepr, tuple)` internally — replaying an untagged round-trip crashes the whole run on the first real skip or failure. v3 tags tuples explicitly through the JSON boundary (a small wrapper, verified live — see Task 1).
+2. **A synthesized report for the terminal "unevaluated" outcome.** v2's crash-atomicity fix (stage, discard-on-crash) correctly stops a retried attempt's events from being replayed twice — but it does not, on its own, make the FIRST crashed attempt's outcome visible anywhere. If a nodeid crashes twice (Slice 1's existing requeue-once exhausted) and both attempts' staged batches are discarded, junitxml ends up with NO `<testcase>` element for that nodeid at all — a real test run, silently missing from the report. v3 synthesizes one honest report through the same replay path for this terminal case (mirroring xdist's own `handle_crashitem` precedent), never a silent gap.
+3. **Coverage: don't bootstrap or own it — just make sure it survives the fork and the `os._exit`.** v1/v2 both tried to originate a coverage config and drive `process_startup()`/`combine()` from inside aitest. Both reviewers found this either doesn't work for a forked worker at all (v1) or actively conflicts with `pytest-cov`'s own already-running collector when `--cov` is in play (v2). v3 does neither: aitest makes NO assumption about how (or whether) coverage was started, and takes on exactly one small, narrow responsibility — in every path where a forked worker process is about to call `os._exit()`, if `coverage.Coverage.current()` is non-`None` (something, whatever it was, is measuring in this process), stop and save it first, since `os._exit()` is the one thing guaranteed to skip coverage's own normal atexit save. Whoever started coverage (`pytest-cov`, a bare `coverage run`, or nothing at all) remains entirely responsible for combining — aitest never calls `combine()` itself.
 
-1. **Coverage could not have worked as designed.** v1 proposed setting `COVERAGE_PROCESS_START` and relying on coverage.py's `.pth`-triggered `process_startup()` auto-start alone. Sol found (and a live probe on this machine confirmed independently, see Task 3) that this mechanism fires only at fresh Python interpreter startup — a worker created via `os.fork()` from an already-running, already-past-that-point interpreter never triggers it. Sol also found workers exit via `os._exit()` (worker.py), which bypasses the normal atexit-based coverage save entirely. coverage.py has a documented, purpose-built answer for exactly this: a `[run] patch = fork, _exit` config directive, which registers an `os.register_at_fork(after_in_child=...)` hook that restarts measurement in a forked child, and monkey-patches `os._exit` itself to save data first. **Verified live** on this machine (see Task 3's design note) — a probe script using `patch = fork, _exit` correctly produced separate, valid coverage data files from both a parent and its forked child, and `coverage combine` merged them correctly.
-2. **Report replay was not crash-atomic.** v1 replayed each JSON event into the supervisor's real pytest hooks as soon as it arrived, before that test's terminating plain result line. Sol found this can duplicate side effects: pipe backpressure can expose complete JSON events to `_drain_worker` before the trailing result line for the same test, and if the worker then crashes before sending that result line, Slice 1's existing crash path (`_handle_worker_exit`) requeues the SAME nodeid onto a fresh worker — but the first attempt's events were already replayed into junitxml/terminalreporter/coverage, so the retried attempt's eventual real result becomes a second, duplicate report for the same test. v2 fixes this by staging events per in-flight nodeid and replaying the whole batch ONLY once that nodeid's plain result line is actually, successfully received (the exact same trust boundary Slice 1's own crash-handling already uses for `self.results[nodeid] = outcome`) — a crash or corrupted line before that point means the batch is simply discarded, never replayed, matching the "retry the whole test cleanly" semantics Slice 1 already established for the plain outcome.
+**What changed, across review rounds — four real, distinct P0s found and fixed:**
 
-**Verified design basis (independently confirmed against real installed source, not recalled from training):** `pytest_report_to_serializable`/`pytest_report_from_serializable` are core pytest hooks (`_pytest/hookspec.py`, installed pytest 9.0.3; exact line numbers drift by version, do not hardcode them in a comment — cite the hook NAMES, not line numbers, in any code comment this plan produces), not xdist-specific — xdist's worker (`xdist/remote.py`, `pytest_runtest_logreport`) calls `self.config.hook.pytest_report_to_serializable(...)` and sends the dict; deserialization on the controller side happens in `xdist/workermanage.py`'s `process_from_remote` (NOT `dsession.py`, which only replays the already-deserialized report via `self.config.hook.pytest_runtest_logreport(report=rep)` — v1's design-basis section mis-attributed the deserialization call site to `dsession.py`; this correction matters if an implementer goes looking for a reference implementation to compare against). xdist also forwards `pytest_runtest_logstart`/`pytest_runtest_logfinish` separately — terminalreporter's live per-test progress line depends on these two, not just the final report — so this plan forwards them too.
+- **v1** relied on bare `COVERAGE_PROCESS_START`/`.pth` auto-start alone (doesn't fire for a forked, not exec'd, worker) and replayed events as they arrived (not crash-atomic). Sol/Codex: BLOCK on both.
+- **v2** fixed crash-atomicity via staging (Sol's round-2 confirmation: "the original crash/retry double-count race is closed" — this specific mechanism is UNCHANGED in v3, it was correct) and fixed the raw fork-measurement gap via coverage.py's own `patch = fork, _exit` config directive (verified live: a forked child under that config correctly produces valid coverage data, confirmed by both this session's own probe AND, independently, Sol's). But Sol's round-2 review still found a NEW P0: calling `coverage.process_startup()` unconditionally from `pytest_runtestloop` can start a SECOND, conflicting `Coverage` instance alongside whatever `pytest-cov` itself already started for `--cov`, with incompatible measurement settings risking silently-incomplete combined data. Fable, independently reviewing v1's design (its review landed after v2 was already drafted, but its findings apply to the coverage approach generally, not just v1's specific bare-env-var version), found the SAME class of problem from source: `pytest-cov`'s own `pytest_runtestloop` wrapper calls `combine()` (with `keep=False`, i.e. it DELETES the per-worker data files) after aitest's own loop returns — so aitest calling combine first, as v1/v2 both did, would race pytest-cov's own cleanup and could destroy data out from under it. Fable also independently confirmed the fork/`.pth` gap and — critically — found that even a NAIVE `patch=fork,_exit`-free child-side `Coverage.current().stop().save()` (no config origination at all) is coverage.py's OWN documented, simpler answer (`sqldata.py`'s "Looks like we forked!" auto-detection already handles the data-file identity problem once the child explicitly saves). v3 adopts this simpler, config-free, ownership-free design.
+- **Fable also found the tuple-serialization bug independently, via a live probe** (a real skipped test's `longrepr` round-tripped through JSON came back as a list; `junitxml.py`'s `append_skipped` immediately `assert isinstance(report.longrepr, tuple)`-crashed on it) and the missing-synthesized-report-for-unevaluated gap, both fixed in this v3.
+- **Sol's round-2 review, confirming v2's crash-atomicity fix, added one more precise requirement**: validate/deserialize the ENTIRE staged event batch before replaying the first real hook call, not dispatch-and-replay-as-you-go through the batch — otherwise a malformed LATER event in an otherwise-valid batch could leave earlier events already replayed with no way to un-replay them. v3's Task 2 incorporates this.
+- Fable additionally flagged (not blocking, but must be handled, not ignored): the forked child's COW-inherited `terminalreporter` plugin is still registered and would print its own per-test progress line directly to the shared terminal — combined with the supervisor's own replay-driven `terminalreporter` output, every test's progress would print TWICE. v3's Task 1 unregisters it in the child. Also: the existing Go-side end-to-end test (`internal/pylib/pytest_aitest_e2e_test.go`) asserts on Slice 1's plain `"<nodeid> <outcome>"` terminal lines and `"0 unevaluated"` text — v3's Task 4 explicitly decides what happens to those assertions now that real terminalreporter output exists too, rather than leaving it for an implementer to discover as a surprise test failure.
 
-**Spec:** `docs/superpowers/specs/2026-09-01-aitest-design.md` §3.2 and §5 Slice 2. §3.2's `nextitem=None` accepted-limitation paragraph stays out of scope for Slice 2 too (reporting fidelity only).
+**Verified design basis:** `pytest_report_to_serializable`/`pytest_report_from_serializable` are core pytest hooks (verified against real installed source; cite hook NAMES in code comments, never line numbers, which drift by version and were wrong in more than one of this plan's own earlier drafts). Deserialization on xdist's controller side happens in `xdist/workermanage.py`'s `process_from_remote`, not `dsession.py` (which only replays the already-deserialized report). xdist also forwards `pytest_runtest_logstart`/`pytest_runtest_logfinish` separately — this plan forwards them too.
+
+**Spec:** `docs/superpowers/specs/2026-09-01-aitest-design.md` §3.2 and §5 Slice 2.
 
 ## Global Constraints
 
-- No cgo; one static Go binary (unaffected — pure Python).
-- Every heavy command (`go test`, `pytest`, `make ci`) MUST be run via `aira confine --`.
-- Correctness-critical / architecturally subtle work: full two-loop before merge. Silently-wrong test reporting (a real failure showing as passed) is a much worse failure mode than a crash — treat every task's tests as needing to prove FIDELITY against real, rich failure content (tracebacks, captured output), not just trivial pass-case round-trips.
-- Do NOT change the wire format or handling of the EXISTING bare "nodeid outcome[recycle_suffix]" result line in any way. Every existing test covering that line's framing, the rpartition-on-space fix, the atomic recycle signal, and the post-crash `result_eof` ordering MUST still pass unmodified.
-- Do NOT replay any staged JSON event into the supervisor's real pytest hooks before that SAME nodeid's plain result line has been successfully received and validated (matches `nodeid == state["in_flight"]`). This is the single most important rule in this plan — it is what Task 2 exists to enforce, and what closes Sol's crash-atomicity P0.
-- Do NOT rely on coverage.py's bare `COVERAGE_PROCESS_START`/`.pth` auto-start alone for worker processes — it does not fire for a forked (not exec'd) child. Use `[run] patch = fork, _exit` (Task 3); this is verified working, not a guess.
+- No cgo; pure Python, unaffected on the Go side.
+- Every heavy command MUST be run via `aira confine --`.
+- Correctness-critical work: full two-loop before merge. Silently-wrong test reporting is worse than a crash.
+- Do NOT change the existing plain "nodeid outcome[recycle_suffix]" result line's wire format or handling.
+- Do NOT replay ANY staged event into the supervisor's real pytest hooks before (a) the whole batch for that nodeid has been successfully parsed/deserialized in full, AND (b) that nodeid's plain result line has been confirmed received. Both conditions, not either alone.
+- Do NOT round-trip a `TestReport`'s serialized form through bare `json.dumps`/`json.loads` without the tuple-tagging wrapper (Task 1) — this WILL crash on any real skip/failure/xfail, verified.
+- Do NOT have aitest originate a coverage config, call `coverage.process_startup()`, or call `coverage combine()`/`Coverage().combine()` anywhere. Its only coverage-related responsibility is: in a forked worker about to `os._exit()`, save whatever `coverage.Coverage.current()` already is, if it is not `None`.
 - Do NOT add a `pytest-xdist` dependency.
-- This repo has NO prior coverage.py integration (verified, v1's research pass). Task 3 originates the config from coverage.py's own documented `patch=` directive contract; do not invent a different scheme.
 
 ---
 
 ## File Structure
 
-- `internal/pylib/aitest/worker.py` — extend `_OutcomeCollector` to also capture each phase's real `TestReport` plus logstart/logfinish, serialized, as an ordered event list; `run_worker_loop` emits them as new JSON-prefixed lines before its existing, unchanged result line.
-- `internal/pylib/aitest/supervisor.py` — extend `_drain_worker` (or a helper it calls) to STAGE new-format JSON event lines per in-flight nodeid (do not replay yet), and replay the staged batch only at the point the existing code currently does `self.results[nodeid] = outcome` for that same nodeid — discard the staged batch (no replay) whenever `_handle_worker_exit` fires for an in-flight nodeid instead.
-- `internal/pylib/aitest/__init__.py` — coverage config origination (write a `.coveragerc`-equivalent with `parallel = true` and `patch = fork, _exit`, or merge those directives into whatever coverage config the project already has — decide and document, don't silently overwrite a user's existing `.coveragerc`), set `COVERAGE_PROCESS_START` in the environment BEFORE any worker fork can occur, and invoke `coverage combine` once after `supervisor.run(...)` returns, gated on coverage actually having been requested.
-- Tests: `internal/pylib/aitest/test_worker.py`, `test_supervisor.py`, plus a new/extended end-to-end test exercising REAL failure content (traceback, captured stdout/stderr) through the full JSON round-trip, not just a passing test.
+- `internal/pylib/aitest/worker.py` — tuple-tagging JSON codec; extend report/event capture; unregister `terminalreporter` in the forked child before running any test; centralize the child's `os._exit()` path through one helper that saves active coverage first.
+- `internal/pylib/aitest/supervisor.py` — stage events per in-flight nodeid; validate/deserialize the whole batch before replaying any of it; replay only once the result line confirms; on the terminal unevaluated outcome (second crash), synthesize and replay one honest report instead of leaving the nodeid unreported.
+- `internal/pylib/aitest/__init__.py` — no coverage-related changes at all in v3 (the whole point of the simplification); still needs `Supervisor` threaded a `pytest.Config`/hook-caller reference, as in v2.
+- Tests: `test_worker.py`, `test_supervisor.py`, plus the end-to-end layer — explicitly reconciled with Slice 1's existing Go-level plain-output assertions in Task 4.
 
-## Task 1: Worker side — capture and serialize real TestReports, forward logstart/logfinish
+## Task 1: Worker side — tuple-safe serialization, terminalreporter suppression, centralized coverage-safe exit
 
 **Files:**
 - Modify: `internal/pylib/aitest/worker.py`
 - Test: `internal/pylib/aitest/test_worker.py`
 
 **Interfaces:**
-- Consumes: `item.config.hook.pytest_report_to_serializable(config, report)`, `item.ihook.pytest_runtest_protocol` (already used).
-- Produces: `run_one` returns `(outcome, events)`; `run_worker_loop` writes one `"{" + json.dumps(event) + "\n"` line per event, in order, before its existing unchanged result line.
+- Produces: `run_one` returns `(outcome, events)` as before; a new small tuple-tagging codec (`_tag_tuples`/`_untag_tuples`, or equivalent naming — implementer's choice) used when building the JSON payload for each event; a new `_exit_child(code)` helper replacing every bare `os._exit(...)` call in the forked-child code path (worker.py:123, and — since this task owns the shared helper — supervisor.py's four sites at lines ~527/528/605/606 should import and use it too; coordinate with Task 2 on this, it is a worker.py-owned helper regardless of which file's code calls it).
 
 - [ ] **Step 1: Write the failing tests first**
 
-Same test set as v1's Task 1, PLUS (this is the fix for Sol's P1 — v1's round-trip test only exercised a passing test):
-
 ```python
-def test_run_one_serialized_reports_preserve_a_real_failures_traceback_and_captured_output(pytester):
+def test_json_tuple_codec_round_trips_a_real_serialized_skip_report_with_isinstance_tuple_intact(pytester):
     pytester.makepyfile("""
+        import pytest
         def test_it():
-            import sys
-            print("stdout marker")
-            sys.stderr.write("stderr marker\\n")
-            assert 1 == 2, "custom failure message"
+            pytest.skip("because")
     """)
     # ... collect the real item via this file's existing pytester convention ...
     outcome, events = run_one(item)
-    assert outcome == "failed"
-    call_report_event = next(e for e in events if e["kind"] == "report" and e["data"]["when"] == "call")
+    assert outcome == "skipped"
+    report_event = next(e for e in events if e["kind"] == "report" and e["data"] is not None and e["data"].get("when") == "call")
 
-    # Round-trip through REAL json.dumps/loads, not the in-memory dict directly
-    # -- this is the actual wire path, and the specific thing v1's test skipped.
-    wire = json.loads(json.dumps(call_report_event))
-    replayed = item.config.hook.pytest_report_from_serializable(config=item.config, data=wire["data"])
+    wire = json.loads(json.dumps(_tag_tuples(report_event["data"])))
+    restored_data = _untag_tuples(wire)
+    replayed = item.config.hook.pytest_report_from_serializable(config=item.config, data=restored_data)
 
-    assert replayed.outcome == "failed"
-    assert "custom failure message" in replayed.longreprtext
-    assert "stdout marker" in replayed.capstdout
-    assert "stderr marker" in replayed.capstderr
-```
-
-- [ ] **Step 2: Run to verify failure**
-
-- [ ] **Step 3: Implement** (same approach as v1's Task 1 — extend `_OutcomeCollector`, thread `config` through, register logstart/logfinish hookimpls per xdist's own shape).
-
-- [ ] **Step 4: Run to verify pass**
-
-- [ ] **Step 5: Commit** — `git commit -m "feat(aitest): worker streams real TestReport events with verified failure-content fidelity (AIRA-31)"`
-
-## Task 2: Supervisor side — stage events, replay only on a confirmed result (crash-atomic)
-
-**Files:**
-- Modify: `internal/pylib/aitest/supervisor.py`
-- Test: `internal/pylib/aitest/test_supervisor.py`
-
-**Interfaces:**
-- Consumes: Task 1's JSON event lines. Needs supervisor-level access to a `pytest.Config`/hook caller — thread it into `Supervisor` (via `__init__`, `.collect()`, or `.run()`, whichever of this file's existing method-shape conventions fits, matching how `worker_count`/`estimated_bytes` are already threaded through).
-- Produces: real `pytest_runtest_logreport`/`pytest_runtest_logstart`/`pytest_runtest_logfinish` calls on the supervisor's own `config.hook`, fired ONLY once per test, ONLY after that test's plain result line is confirmed, NEVER for a test whose result line never arrived (crash) or arrived corrupted.
-
-- [ ] **Step 1: Write the failing tests first**
-
-```python
-def test_drain_worker_stages_events_and_replays_them_only_after_the_result_line_arrives(...):
-    # Fake worker pipe: logstart, 3x report, logfinish, THEN the plain
-    # result line, all in one flush (mirrors a real single-flush batch).
-    # Assert NO replay happened until the plain line was processed, and
-    # that once it is, all 5 events replay in order via the spy plugin,
-    # THEN self.results[nodeid] is set exactly as it is today.
+    assert isinstance(replayed.longrepr, tuple)
+    # This is the exact assertion junitxml.py's append_skipped makes internally
+    # (verified against real installed pytest source) -- if this passes, a
+    # real junitxml plugin run against this replayed report will not crash.
 
 
-def test_drain_worker_discards_staged_events_on_a_crash_before_the_result_line(...):
-    # THE critical regression test for Sol's P0. Fake pipe: logstart,
-    # 3x report, logfinish -- NO trailing result line -- then EOF
-    # (result_eof). Assert: the spy plugin received ZERO replayed events
-    # (nothing staged is ever visible before its result line confirms
-    # it), _handle_worker_exit's existing requeue-once path still fires
-    # exactly as it does today, and after the SECOND (successful) attempt
-    # on a fresh worker completes normally, the events from THAT second
-    # attempt replay exactly once -- proving no double-counting across
-    # the crash+retry.
+def test_run_one_serialized_reports_preserve_a_real_failures_traceback_and_captured_output(pytester):
+    # Same as v2's Task 1 test -- a real assertion failure with custom
+    # message, stdout marker, stderr marker -- but now round-tripped
+    # through the REAL tag/untag codec end to end (not the bare dict),
+    # asserting replayed.longreprtext / capstdout / capstderr as before.
 
 
-def test_drain_worker_discards_staged_events_on_a_corrupted_nodeid_mismatch(...):
-    # Same shape as the existing corrupted-result-line crash test, but
-    # with staged events preceding the corrupted line. Assert zero
-    # replay, same _handle_worker_exit path as today.
+def test_run_worker_loop_unregisters_terminalreporter_before_running_any_test(pytester, capsys):
+    # Fable's finding: the forked child's COW-inherited terminalreporter
+    # would otherwise print its own progress line directly to the shared
+    # terminal, duplicating the supervisor's own replay-driven output.
+    # Run a real test through the worker loop in-process (this file's
+    # existing convention) and assert pytest's OWN default per-test
+    # progress marker (whatever terminalreporter would normally emit)
+    # does NOT appear in captured stdout/stderr from the worker side.
 
 
-def test_drain_worker_still_handles_the_existing_result_line_format_unmodified(...):
-    # Re-confirm every existing Slice 1 wire-format test (rpartition,
-    # recycle-suffix atomicity, post-crash result_eof ordering) passes
-    # verbatim -- same "stop and flag" rule as v1 if any needed to change.
+def test_exit_child_saves_active_coverage_before_exiting(monkeypatch):
+    # Fake coverage.Coverage.current() to return a spy object; call
+    # _exit_child via a monkeypatched os._exit that raises SystemExit
+    # instead of actually exiting (so the test can observe what happened
+    # before it); assert spy.stop() and spy.save() were both called,
+    # in that order, before the (faked) exit.
 
 
-def test_drain_worker_a_malformed_json_event_line_discards_any_staged_batch_and_crashes_the_worker(...):
-    # A line starting with "{" that fails json.loads, or an unrecognized
-    # "kind", goes through the crash path -- and per the staging design,
-    # this is now trivially safe: nothing for THIS nodeid was ever
-    # replayed yet, so "discard" is simply "do not replay", not a new
-    # code path needing its own undo logic.
+def test_exit_child_exits_normally_when_no_coverage_is_active(monkeypatch):
+    # coverage.Coverage.current() returns None (or coverage isn't
+    # importable at all -- handle ImportError too, since this must work
+    # in a project that never installed coverage.py) -- assert it exits
+    # cleanly with zero errors, no crash from a missing coverage module.
+
+
+def test_exit_child_still_exits_if_coverage_save_itself_raises(monkeypatch):
+    # A spy whose .save() raises -- assert _exit_child still calls the
+    # real os._exit with the requested code regardless (best-effort save,
+    # must NEVER prevent the process from actually exiting).
 ```
 
 - [ ] **Step 2: Run to verify failure**
 
 - [ ] **Step 3: Implement**
 
-Add a `state["pending_events"] = []` (reset wherever `state["in_flight"]` is set to a fresh nodeid at dispatch time — find that exact call site first, do not guess). In `_drain_worker`'s loop, a `{`-prefixed line appends to `state["pending_events"]` (via `json.loads`, with the SAME malformed-input → crash-path handling as the existing corrupted-nodeid branch). At the point the EXISTING code currently does `self.results[nodeid] = outcome` (i.e., only after the plain result line's `nodeid == state["in_flight"]` check has already passed): replay every event in `state["pending_events"]` in order via `self._replay_event(event)`, THEN clear `state["pending_events"] = []`, THEN proceed with the existing unchanged `self.results[nodeid] = outcome` / recycle / retire logic exactly as today. In `_handle_worker_exit`: simply clear `state["pending_events"]` without replaying (or rely on the worker/state object going out of scope — implementer's choice, but be explicit that this is a deliberate "never replay" path, not an oversight).
+Tuple-tagging codec (verified live on this machine before being written into this plan — a round-trip of `{"longrepr": (...), "sections": [(...)], "location": (...), "plain_list": [...]}` through tag→`json.dumps`→`json.loads`→untag correctly restored every tuple to a real `tuple` while leaving genuine lists as lists):
 
-`_replay_event` dispatches on `event["kind"]`: `"report"` → `self._config.hook.pytest_report_from_serializable(config=self._config, data=event["data"])` then `self._config.hook.pytest_runtest_logreport(report=replayed)`; `"logstart"`/`"logfinish"` → the corresponding real hook call (verify exact required arguments against the installed `_pytest/hookspec.py` directly, do not guess the signature).
+```python
+def _tag_tuples(obj):
+    if isinstance(obj, tuple):
+        return {"__tuple__": True, "items": [_tag_tuples(x) for x in obj]}
+    if isinstance(obj, list):
+        return [_tag_tuples(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _tag_tuples(v) for k, v in obj.items()}
+    return obj
+
+
+def _untag_tuples(obj):
+    if isinstance(obj, dict):
+        if obj.get("__tuple__") is True and "items" in obj:
+            return tuple(_untag_tuples(x) for x in obj["items"])
+        return {k: _untag_tuples(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_untag_tuples(x) for x in obj]
+    return obj
+```
+
+Wire every `"report"`-kind event's `data` through `_tag_tuples` before `json.dumps` on the worker side (supervisor side untags on replay — see Task 2).
+
+`_exit_child(code)`:
+
+```python
+def _exit_child(code):
+    try:
+        import coverage
+        current = coverage.Coverage.current()
+        if current is not None:
+            current.stop()
+            current.save()
+    except Exception:
+        pass  # best-effort only -- this must never prevent the process from exiting
+    os._exit(code)
+```
+
+Replace `worker.py:123`'s `os._exit(70)` with `_exit_child(70)`. Coordinate with Task 2 to replace `supervisor.py`'s four analogous sites the same way (import `_exit_child` from `aitest.worker`, matching how `_RECYCLE_SUFFIX`/`fork_worker`/`run_worker_loop` are already imported there).
+
+Unregister `terminalreporter` in the worker loop, before the first test runs (exact call site: wherever `run_worker_loop`/`fork_worker`'s child branch first gets access to the item's `config.pluginmanager`, before dispatching to `run_one` — find the precise point, do not guess; likely right after `place_self` returns in the child, using `item.config.pluginmanager.unregister(item.config.pluginmanager.get_plugin("terminalreporter"))`-shaped code, guarded for the plugin possibly already being absent).
 
 - [ ] **Step 4: Run to verify pass**
 
-- [ ] **Step 5: Commit** — `git commit -m "feat(aitest): supervisor stages and crash-atomically replays worker TestReport events (AIRA-31)"`
+- [ ] **Step 5: Commit** — `git commit -m "feat(aitest): tuple-safe report serialization, coverage-safe child exit, terminal suppression (AIRA-31)"`
 
-## Task 3: Coverage.py parallel-mode combine — verified fork-compatible design
+## Task 2: Supervisor side — validate-then-stage-then-replay, synthesized report for the unevaluated case
 
 **Files:**
-- Modify: `internal/pylib/aitest/__init__.py`
-- Test: new test file/addition covering `__init__.py`'s hookimpls.
+- Modify: `internal/pylib/aitest/supervisor.py`
+- Test: `internal/pylib/aitest/test_supervisor.py`
 
-**Design, verified live on this machine before being written into this plan** (probe: a `.coveragerc` with `[run]\nparallel = true\npatch = fork, _exit\n`, `COVERAGE_PROCESS_START` pointed at it, `coverage.process_startup()` called in the parent BEFORE an `os.fork()`, a real statement executed in both parent and forked child, child exits via `os._exit(0)` — result: separate valid `.coverage.<host>.<pid>.<rand>` data files from both processes, `coverage combine` merged them correctly, `coverage report` showed complete coverage of both call sites):
-
-1. In `pytest_runtestloop`, before `supervisor.collect`/`supervisor.run` can lead to any worker fork: if coverage was requested (see gate below), write (or locate/reuse — do not silently clobber a project's own `.coveragerc`; check for one first and if it exists, verify/append the needed directives rather than overwriting wholesale) a coverage config containing at minimum `parallel = true` and `patch = fork, _exit` under `[run]`, set `os.environ["COVERAGE_PROCESS_START"]` to its path, and call `coverage.process_startup()` in the CURRENT (supervisor) process — this both starts measuring the supervisor's own process AND, critically, is what registers the `patch=fork` `os.register_at_fork` hook that later makes each worker's fork correctly restart measurement in the child (this hook must be registered in the PARENT before the fork happens, which is why this must run before `fork_worker`/`spawn_worker` are ever called, not lazily inside them).
-2. Nothing else needs to change in `worker.py`/`fork_worker` itself — the `patch=fork`/`patch=_exit` mechanism is transparent to the forking code once registered in the parent.
-3. After `supervisor.run(...)` returns, if coverage was active, call `coverage combine` (subprocess or the `coverage.Coverage().combine()` API — implementer's choice, prefer the API to avoid an extra subprocess if it is not meaningfully harder) once. Confirm coverage.py's own behavior when there is nothing to combine (verify against source/docs, do not assume) and match it rather than treating an empty combine as an error.
-
-Design note to resolve during Step 1 (not left implicit): decide the exact gate for "coverage was requested" — prefer detecting `pytest-cov`'s own registration on `session.config.pluginmanager` (verify the real plugin/module name against whatever `pytest-cov` version is actually available in this environment, do not guess the string) over a new aitest-specific flag, matching how JUnit XML fidelity (Task 2) already "just works" via `--junit-xml` with zero aitest-specific config.
+**Interfaces:**
+- Consumes: Task 1's `_untag_tuples`, `_exit_child`. Needs supervisor-level `pytest.Config`/hook-caller access, threaded through as in prior plan drafts.
+- Produces: real `pytest_runtest_logreport`/`logstart`/`logfinish` calls, fired only once per test, only after (a) the WHOLE staged batch for that nodeid parses/deserializes successfully and (b) the plain result line for that same nodeid is confirmed; a synthesized, honestly-worded report replayed for the terminal "unevaluated" (twice-crashed) case instead of silence.
 
 - [ ] **Step 1: Write the failing tests first**
 
 ```python
-def test_pytest_runtestloop_registers_coverage_fork_patching_before_any_worker_is_spawned_when_coverage_is_active(...):
-    # Assert COVERAGE_PROCESS_START is set, the written/located config
-    # contains "patch" including "fork" and "_exit", and
-    # coverage.process_startup() (or equivalent) was called in the
-    # CURRENT process BEFORE supervisor.run/spawn_worker's first call --
-    # ordering matters here, assert it explicitly, not just the end
-    # state.
+def test_drain_worker_validates_the_whole_batch_before_replaying_any_of_it(...):
+    # Sol round-2's precise requirement. Fake pipe: a VALID logstart, a
+    # VALID report event, then a MALFORMED/unrecognized-kind event, then
+    # the plain result line. Assert: the spy plugin received ZERO
+    # replayed events (not even the two valid ones that came before the
+    # malformed one) -- validation of the ENTIRE batch happens before any
+    # real hook is called, not dispatch-as-you-parse.
 
-def test_pytest_runtestloop_does_not_touch_coverage_when_it_was_not_requested(...):
-    # No env var set, no config written, no combine attempted -- zero
-    # overhead when coverage isn't in play.
 
-def test_pytest_runtestloop_does_not_clobber_an_existing_project_coveragerc(...):
-    # If a .coveragerc already exists, assert this task's code does not
-    # silently overwrite unrelated existing directives in it.
+def test_drain_worker_stages_and_replays_a_fully_valid_batch_only_after_the_result_line(...):
+    # Same as v2's positive case: logstart, 3x report, logfinish, THEN
+    # the plain result line -- assert no replay before the result line,
+    # full ordered replay once it arrives, then self.results[nodeid] set
+    # exactly as today.
 
-def test_coverage_combine_runs_once_after_run_returns_when_coverage_was_active(...):
 
-def test_coverage_combine_handles_zero_worker_data_files_without_erroring(...):
-    # Match coverage.py's own real documented/observed behavior for an
-    # empty combine (verify, don't assume) rather than treating it as a
-    # crash.
+def test_drain_worker_discards_staged_events_on_a_crash_before_the_result_line(...):
+    # v2's critical regression test, unchanged in intent: crash before
+    # the result line -> zero replay, existing requeue-once path fires,
+    # a later successful retry's OWN events replay exactly once.
+
+
+def test_drain_worker_synthesizes_and_replays_an_honest_report_for_the_terminal_unevaluated_outcome(...):
+    # NEW in v3 (Fable's finding). Simulate the existing Slice 1
+    # requeue-once path exhausting: crash on attempt 1 (discard staged
+    # events, requeue), crash again on attempt 2 (no more retries --
+    # existing code already sets self.results[nodeid] = "unevaluated").
+    # Assert that at the point this terminal outcome is recorded, exactly
+    # ONE real report is replayed via the spy plugin for that nodeid --
+    # not zero (Fable's gap), not two (double-counting either crashed
+    # attempt) -- with an outcome/longrepr that honestly says something
+    # like "unevaluated: worker crashed twice while running this test"
+    # (exact wording is an implementer judgment call; it must be
+    # unambiguous that this was never actually observed to pass or fail,
+    # matching this project's own unevaluated-is-not-a-pass discipline).
+
+
+def test_drain_worker_still_handles_the_existing_result_line_format_unmodified(...):
+    # Re-confirm every existing Slice 1 wire-format test still passes
+    # verbatim.
 ```
 
 - [ ] **Step 2: Run to verify failure**
 
-- [ ] **Step 3: Implement** per the verified design above.
+- [ ] **Step 3: Implement**
+
+Extend `_drain_worker`'s `{`-prefixed branch: append the raw parsed-but-not-yet-untagged event to `state["pending_events"]` (reset at dispatch time, per v2's design — find the exact `state["in_flight"] = nodeid` site). Do NOT call `_replay_event` here. At the point the existing code currently does `self.results[nodeid] = outcome` (after the plain line's `nodeid == state["in_flight"]` check passes): first validate/deserialize the ENTIRE `state["pending_events"]` batch (untag tuples, resolve each `"kind"`, call `pytest_report_from_serializable` for report events) into a fully-materialized list — if ANY event in the batch fails this step, treat it exactly like the existing malformed-line crash path (log, `_handle_worker_exit`, no replay of anything from this batch) — only once the WHOLE batch is confirmed valid, replay each materialized item in order via the real hook calls, THEN clear `state["pending_events"]`, THEN proceed with the existing unchanged `self.results[nodeid] = outcome` / recycle / retire logic.
+
+In `_handle_worker_exit`: when this is the terminal `"unevaluated"` case (the existing second-crash branch that currently just does `self.results[nodeid] = "unevaluated"`), synthesize one minimal report-shaped event (implementer's judgment on the exact construction — likely easiest as a plain `pytest.TestReport`-compatible object built directly in Python rather than round-tripped through the JSON codec at all, since it never came from a worker pipe) and replay it through the same real hook call used for ordinary reports, so junitxml/terminalreporter see exactly one entry for this nodeid with an honest unevaluated-marking outcome/message. Clear whatever staged (now-discarded, since neither crashed attempt's batch was ever valid-and-confirmed) events remain.
 
 - [ ] **Step 4: Run to verify pass**
 
-- [ ] **Step 5: Commit** — `git commit -m "feat(aitest): coverage.py parallel-mode combine via verified patch=fork,_exit (AIRA-31)"`
+- [ ] **Step 5: Commit** — `git commit -m "feat(aitest): validate-then-replay staged reports, synthesize an honest report for the unevaluated case (AIRA-31)"`
 
-## Task 4: End-to-end verification against a real pytest sub-run
+## Task 3: End-to-end verification, including the Go-side test reconciliation
 
 **Files:**
-- New or extended real-pytest-driven test (via `pytester`, or `internal/pylib/pytest_aitest_e2e_test.go`'s real-subprocess pattern if that is where Slice 1's own end-to-end claims were verified — check which layer first).
+- New or extended real-pytest-driven test (`pytester`) for JUnit XML fidelity.
+- `internal/pylib/pytest_aitest_e2e_test.go` — Fable's finding: this file's existing assertions on Slice 1's plain `"<nodeid> <outcome>"` terminal lines and `"0 unevaluated"` text need an explicit decision now that real `terminalreporter` output exists too (via replay) alongside them.
 
 **Interfaces:**
-- Consumes: everything from Tasks 1-3.
+- Consumes: everything from Tasks 1-2.
 
-- [ ] **Step 1: Write the failing test first**
+- [ ] **Step 1: Decide the Go e2e test's fate, explicitly, before touching anything else**
 
-A fixture suite with: a trivially passing test, a skipped test, and — this is the fix for Sol's P1 on Task 4 specifically — a test that fails with a REAL assertion (rich diff/traceback) AND prints to both stdout and stderr. Run it both plainly and with `--aitest-workers=2 --junit-xml=<path>`. Assert the two XML outputs agree on: total counts per outcome, the exact set of test names present, AND that the failing test's `<failure>`/`<system-out>`/`<system-err>` elements in the aitest-driven run contain the SAME real diagnostic content (not a placeholder, not truncated, not missing) as the plain run's — this is the direct, end-to-end proof that Task 1's serialization + Task 2's staged replay carry real diagnostic content through faithfully, not just a bare pass/fail signal.
+Read `internal/pylib/pytest_aitest_e2e_test.go`'s exact assertions on Slice 1's plain-text lines. Decide (and document the decision in this task, do not leave it implicit): does Slice 1's own `print("%s %s" % (nodeid, outcome))`-style terminal output (if any remains in `__init__.py`/`supervisor.py` after Tasks 1-2) stay for a machine-parseable summary independent of full terminalreporter fidelity, or does it get removed now that real terminalreporter output covers the same information more completely? Whichever is chosen, update the Go test's assertions to match reality rather than leaving them to fail as a surprise. (Leaning toward: keep Slice 1's plain lines as a cheap, terminalreporter-independent sanity signal the Go e2e layer can keep depending on, and treat real terminalreporter/junitxml output as strictly additive — but this is not settled here on purpose; it needs an explicit implementer decision informed by actually running both and looking at the output, not a guess made in this planning document.)
 
-- [ ] **Step 2: Run to verify failure**
+- [ ] **Step 2: Write the failing end-to-end test first**
 
-- [ ] **Step 3-5:** No new implementation expected if Tasks 1-3 are correct. A failure here is a real integration gap in whichever task actually owns it — fix at the root, don't patch around it here.
+A fixture suite: a passing test, a skipped test, an xfail, a real assertion failure with a custom message printing to both stdout and stderr, and a setup-error case. Run both plainly and with `--aitest-workers=2 --junit-xml=<path>`. Assert the two XML outputs agree on: total counts per outcome, exact test-name set, AND (this is what Task 1's tuple fix and Task 2's validated-replay exist to guarantee) that the failing test's `<failure>`/`<system-out>`/`<system-err>` elements contain the SAME real diagnostic content in both, and that the skip/xfail elements are present and well-formed (not silently absent, which is exactly what the un-fixed tuple bug would have produced — a crash, not just missing content, so also assert the aitest-driven run's exit code and full run don't crash).
 
-- [ ] **Step 6: Full confined verification** — `aira confine -- make ci`, plus `aira confine -- python3 -m pytest -q internal/pylib/aitest/`
+- [ ] **Step 3: Run to verify failure**
 
-- [ ] **Step 7: Commit** — `git commit -m "test(aitest): end-to-end JUnit XML + coverage fidelity proof for --aitest-workers, real failure content (AIRA-31)"`
+- [ ] **Step 4-6:** No new implementation expected if Tasks 1-2 are correct; a failure here is a real gap in whichever task owns it.
+
+- [ ] **Step 7: Full confined verification** — `aira confine -- make ci`, plus `aira confine -- python3 -m pytest -q internal/pylib/aitest/`
+
+- [ ] **Step 8: Commit** — `git commit -m "test(aitest): end-to-end JUnit XML fidelity proof + Go e2e reconciliation (AIRA-31)"`
 
 ## Deferred / explicitly out of scope
 
-- Look-ahead dispatch / session-scoped fixture reuse across tests on the same worker — unchanged, deferred per spec.
-- xdist's `rep.node = node` worker-identity bookkeeping before replay — still not copied reflexively; add only if Task 4's end-to-end test reveals a real downstream need.
+- Look-ahead dispatch / session-scoped fixture reuse across tests on the same worker.
+- `-x`/`--maxfail` (`session.shouldfail`) is set by a replayed report per pytest's own hook implementation, but nothing in `Supervisor.run`'s dispatch loop currently checks it, so it is silently ignored under aitest. Document this as a known, deferred gap (not fixed in this plan) rather than leaving it undiscovered.
+- xdist's `rep.node = node` worker-identity bookkeeping — still not copied reflexively.
+- Coverage combine itself, branch-coverage config compatibility, and any interaction with a project's own custom `.coveragerc` — explicitly not this plan's concern per the simplified Task 1 design; whoever owns coverage in a given project (pytest-cov or a bare `coverage run`) owns all of that, unchanged, same as it would for any other pytest plugin's workers.
