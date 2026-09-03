@@ -416,9 +416,66 @@ func applyMutation(root string, mutation gate.MutationSeed) error {
 		return injectFailingTest(root, mutation)
 	case "go-negate-assertion":
 		return negateAssertion(root, mutation)
+	case "inject-file":
+		return injectFile(root, mutation)
 	default:
 		return errors.New("unsupported mutation kind")
 	}
+}
+
+// injectFile is the language-agnostic mutation kind. It writes the declared
+// literal body at the declared relative path inside the isolated mutation
+// snapshot, so a project with no Go source can still drive a canary that fires:
+// the Go kinds both require go/parser over .go files, which left a command gate
+// in any other toolchain permanently unable to reach a canary-proven pass
+// (E_GATE_CANARY_DID_NOT_FIRE is a hard fail, never unevaluated).
+//
+// It is deliberately create-only. O_EXCL refuses an existing target atomically,
+// so the mutation is provably additive: it can neither destroy subject content
+// nor report an injection it did not make.
+//
+// A target path matched by the subject's git excludes — its own .gitignore, or
+// the user's core.excludesFile — is dropped by the `git add -A` that re-stages
+// the mutated snapshot and never reaches the checker's `git ls-files --cached`
+// view. That surfaces as E_GATE_CANARY_DID_NOT_FIRE: loud, never a false pass.
+//
+// The proof this kind yields is weaker than go-inject-failing-test's, and a
+// declaration must be written knowing it. go-inject-failing-test injects a
+// compiling, failing test, so its fire proves the whole test-failure to
+// non-zero-exit pathway. inject-file proves only that the declared perturbation
+// produces a non-zero exit. Inject a compiling, failing test in the subject's
+// own language; a body that merely breaks the build proves only that the build
+// breaks. The concrete honest-mistake false pass this admits: a `make test`
+// recipe that aborts on a compile error but swallows real test failures fires
+// the canary on a syntax-broken injection and would never fire on a failing
+// test, so the lane earns a trusted pass it cannot actually back.
+func injectFile(root string, mutation gate.MutationSeed) error {
+	// The declaration validator already refuses an unsafe path, but this writes
+	// a new file, so the check is repeated locally rather than trusted from a
+	// caller. safeSnapshotPath is the same predicate the tracked snapshot uses:
+	// it refuses an absolute path, any .. traversal, and any .git segment. The
+	// last matters most here — a write into the snapshot's own .git (a config
+	// carrying core.fsmonitor, say) would be executed by the git add that
+	// re-stages the mutation.
+	if !safeSnapshotPath(mutation.File) {
+		return errors.New("mutation file escapes the snapshot root")
+	}
+	if mutation.Content == "" {
+		return errors.New("mutation content is empty")
+	}
+	path := filepath.Join(root, filepath.FromSlash(mutation.File))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return fmt.Errorf("mutation target is not injectable: %w", err)
+	}
+	if _, err := file.WriteString(mutation.Content); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
 }
 
 func injectFailingTest(root string, mutation gate.MutationSeed) error {

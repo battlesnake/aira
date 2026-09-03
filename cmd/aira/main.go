@@ -552,7 +552,7 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 		"confine-list": {"slice": true, "owner": true},
 		"confine-kill": {"steal": true, "slice": true, "owner": true},
 		"watch":        {"from": true, "from-start": true, "verb": true},
-		"gate":         {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "reason": true, "report": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-seed": true, "mutation-expected-result": true},
+		"gate":         {"gate_id": true, "canary_id": true, "verdict": true, "actor": true, "reason": true, "report": true, "checker": true, "predicate": true, "argv": true, "cwd": true, "env-allow": true, "timeout-ms": true, "output-cap-bytes": true, "parser": true, "mutation-kind": true, "mutation-file": true, "mutation-test": true, "mutation-occurrence": true, "mutation-pkgdir": true, "mutation-testname": true, "mutation-content": true, "mutation-seed": true, "mutation-expected-result": true},
 	}
 	for name := range options {
 		if !allowed[verb][name] {
@@ -1936,7 +1936,7 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 		default:
 			return core.Request{}, fmt.Errorf("unknown gate operation %q", args["subverb"])
 		}
-		for option, argument := range map[string]string{"checker": "checker", "predicate": "predicate", "cwd": "cwd", "timeout-ms": "timeout_ms", "output-cap-bytes": "output_cap_bytes", "parser": "parser", "mutation-kind": "mutation_kind", "mutation-file": "mutation_file", "mutation-test": "mutation_test", "mutation-occurrence": "mutation_occurrence", "mutation-pkgdir": "mutation_pkgdir", "mutation-testname": "mutation_testname", "mutation-seed": "mutation_seed", "mutation-expected-result": "mutation_expected_result"} {
+		for option, argument := range map[string]string{"checker": "checker", "predicate": "predicate", "cwd": "cwd", "timeout-ms": "timeout_ms", "output-cap-bytes": "output_cap_bytes", "parser": "parser", "mutation-kind": "mutation_kind", "mutation-file": "mutation_file", "mutation-test": "mutation_test", "mutation-occurrence": "mutation_occurrence", "mutation-pkgdir": "mutation_pkgdir", "mutation-testname": "mutation_testname", "mutation-content": "mutation_content", "mutation-seed": "mutation_seed", "mutation-expected-result": "mutation_expected_result"} {
 			if value := options[option]; value != "" {
 				args[argument] = value
 			}

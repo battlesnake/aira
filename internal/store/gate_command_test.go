@@ -116,3 +116,91 @@ func TestMutationIsolatedSnapshotOnlyAndUnavailableFailsClosed(t *testing.T) {
 		t.Fatal("unavailable materialisation was accepted")
 	}
 }
+
+// verifies: AIRA-55 — the inject-file mutation is provably additive. It writes
+// only into the isolated snapshot, creates missing parents, and refuses any
+// target that already exists rather than overwriting it, so a mutation can
+// neither silently no-op nor destroy subject content.
+func TestInjectFileMutationIsAdditiveAndRefusesExistingTarget(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "repo")
+	if err := os.MkdirAll(filepath.Join(root, "tests"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "init", "-q")
+	existing := []byte("#[test]\nfn existing() { assert!(true); }\n")
+	if err := os.WriteFile(filepath.Join(root, "Cargo.toml"), []byte("[package]\nname = \"sample\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "tests", "existing.rs"), existing, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, root, "add", ".")
+	snapshot, cleanup, err := materializeTrackedSnapshot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	body := "#[test]\nfn aira_canary() { panic!(\"AIRA mutation\"); }\n"
+	seed := gate.MutationSeed{SchemaVersion: 1, Kind: "inject-file", File: "tests/aira_canary.rs", Content: body, ExpectedResult: gate.VerdictFail}
+	if err := applyMutation(snapshot, seed); err != nil {
+		t.Fatalf("inject-file mutation failed: %v", err)
+	}
+	injected, err := os.ReadFile(filepath.Join(snapshot, "tests", "aira_canary.rs"))
+	if err != nil || string(injected) != body {
+		t.Fatalf("injection=%q err=%v", injected, err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "tests", "aira_canary.rs")); !os.IsNotExist(err) {
+		t.Fatalf("caller tree was mutated: %v", err)
+	}
+	// A missing parent directory must be created, not silently skipped.
+	nested := seed
+	nested.File = "tests/deep/nested/aira_canary.rs"
+	if err := applyMutation(snapshot, nested); err != nil {
+		t.Fatalf("nested inject-file mutation failed: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(snapshot, "tests", "deep", "nested", "aira_canary.rs")); err != nil || string(got) != body {
+		t.Fatalf("nested injection=%q err=%v", got, err)
+	}
+	// Re-applying must refuse rather than report a fresh injection it did not make.
+	if err := applyMutation(snapshot, seed); err == nil {
+		t.Fatal("re-injection over an existing target was accepted")
+	}
+	if got, err := os.ReadFile(filepath.Join(snapshot, "tests", "aira_canary.rs")); err != nil || string(got) != body {
+		t.Fatalf("refused re-injection changed the file: %q err=%v", got, err)
+	}
+	// Refusing a pre-existing tracked file must leave its bytes intact.
+	clobber := seed
+	clobber.File = "tests/existing.rs"
+	if err := applyMutation(snapshot, clobber); err == nil {
+		t.Fatal("inject-file overwrote a pre-existing tracked file")
+	}
+	preserved, err := os.ReadFile(filepath.Join(snapshot, "tests", "existing.rs"))
+	if err != nil || !bytes.Equal(preserved, existing) {
+		t.Fatalf("pre-existing content destroyed: %q err=%v", preserved, err)
+	}
+	// A directory occupying the target path is also an existing target.
+	directory := seed
+	directory.File = "tests/deep"
+	if err := applyMutation(snapshot, directory); err == nil {
+		t.Fatal("inject-file accepted a directory target")
+	}
+	// The apply step refuses an unsafe target independently of the declaration
+	// validator. A .git write matters most: a hook or a config carrying
+	// core.fsmonitor would be executed by the git add that re-stages the
+	// mutation. .git/hooks/aira-evil does not exist, so O_EXCL alone would
+	// happily create it.
+	for _, unsafe := range []string{".git/hooks/aira-evil", ".git/config", "tests/../.git/hooks/aira-evil", "../escape.rs", "/abs-escape.rs", ".", ".."} {
+		escape := seed
+		escape.File = unsafe
+		if err := applyMutation(snapshot, escape); err == nil {
+			t.Fatalf("inject-file accepted unsafe target %q", unsafe)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(snapshot, ".git", "hooks", "aira-evil")); !os.IsNotExist(err) {
+		t.Fatalf("inject-file wrote into the snapshot .git: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(filepath.Dir(snapshot), "escape.rs")); !os.IsNotExist(err) {
+		t.Fatalf("inject-file wrote outside the snapshot root: %v", err)
+	}
+}
