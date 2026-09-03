@@ -1009,12 +1009,27 @@ settle them.
    in-memory rebuild-per-query (the review's proposal)?
 7. **Watchdog PSI (candidate 22).** Delete the host-PSI decoration outright, or keep the parser
    for AIRA-16(2)'s slice-pressure trigger?
-8. **AIRA-33's precondition (§3.1a).** "AIRA's own dogfood suite has run clean on aitest" cannot
-   be discharged as written — AIRA has no Python dogfood suite. What is the substitute
-   criterion? *(Candidates: aitest's own Python suite green under aitest; or a named consumer
-   project has completed its migration.)*
+8. **AIRA-33's precondition (§3.1a) — RESOLVED (owner, 2026-09-04), split into two claims.**
+   "AIRA's own dogfood suite has run clean on aitest" is replaced by: fastest-ee's real
+   production usage of aitest is the substitute dogfood criterion, superseding the unsatisfiable
+   original wording. This settles *aitest's own correctness* — the owner: *"'aira confine' is
+   what is mostly being used at the moment by fastest-ee, and as far as I can currently tell,
+   it's working fine. We can consider fastest.ee as the dogfooding for aitest."*
+
+   **It does NOT, by itself, clear AIRA-33's second, separate precondition — that the xdist
+   stack has no remaining consumer.** Verified same night by `fastest-ee-9f` against that
+   project's own `docs/test-suites.md`: aitest is wired into `test-engine`/`test-lite`/
+   merge_gate's engine+lite legs only. The other six fastest-ee test targets
+   (backend/symgen/hosted/services/deploy/admin) still run the xdist+governor path this
+   plan's Phase 2 proposes deleting. Phase 2 remains blocked until either those six targets
+   migrate too, or fastest-ee confirms it no longer needs the old path for them — dogfooding
+   aitest and retiring what it doesn't yet replace are two different milestones. Do not read
+   this entry as clearing Phase 2 to start.
 9. **Cross-project coordination for Phase 2 (§3.1).** When does it happen, and who tells the
-   consumer session? This is not a code decision and has no owner today.
+   consumer session? Sharpened by item 8 above: the answer is now concretely "whoever is
+   coordinating with fastest-ee, once its remaining six targets migrate or it confirms it no
+   longer needs the xdist path" — still not a code decision, but no longer ownerless in the
+   abstract.
 10. **Ratchet gates (candidate 45) + the `test_reports` table (candidate 62), as one
     decision.** Wire a producer (`--junitxml` from an aitest run, then `test-report add`) and
     keep both, or cut both? The ratchet's only baseline source is that table, so they stand or
@@ -1178,6 +1193,21 @@ Seven accepted in full, one accepted in part.
 
 Counts after v3: 80 candidates — **48 CUT, 17 KEEP / DEFER, 10 UNCERTAIN, 4 ALREADY LANDED,
 1 not proposed.** §8 grew from nine questions to twelve; §9 gained risk 8.
+
+**v4 — owner decision on §8 Q8 (2026-09-04, same night).** The owner: *"'aira confine' is what
+is mostly being used at the moment by fastest-ee, and as far as I can currently tell, it's
+working fine. We can consider fastest.ee as the dogfooding for aitest."*
+
+This resolves AIRA-33's unsatisfiable "AIRA's own dogfood suite" precondition by substituting
+real production usage from a named external consumer — the second of the two candidates §8
+originally listed. **It settles aitest's own correctness, not Phase 2's readiness.** Per
+`fastest-ee-9f`'s same-night, source-verified finding (relayed into this plan, not re-verified
+independently by its author), aitest currently covers only `test-engine`/`test-lite`/merge_gate's
+engine+lite legs on that project; the other six fastest-ee test targets still run the xdist path
+Phase 2 proposes deleting. Q8 marked RESOLVED with this split; Q9 sharpened accordingly. **Phase
+2 remains blocked** until those six targets migrate or fastest-ee confirms it no longer needs the
+old path for them. Phases 0 and 1 are unaffected by this decision and were already clear to
+start.
 
 ---
 
