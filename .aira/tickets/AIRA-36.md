@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-36","project":"aira","title":"Recursive orphan-scope reaper: #72 reaper must reap NESTED scope subtrees (single-level rmdir fails on nested orphans)","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["aitest","cgroup","confine","daemon","reaper"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-36","project":"aira","title":"Recursive orphan-scope reaper: #72 reaper must reap NESTED scope subtrees (single-level rmdir fails on nested orphans)","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["aitest","cgroup","confine","daemon","reaper"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-49","to":"AIRA-36"}]}
 ---
 Found 2026-09-01 via the kill-rate monitor investigation (the OOM burst was benign contained self-OOM; the dig turned this up). PREREQUISITE for aitest's nested-scope model.
 

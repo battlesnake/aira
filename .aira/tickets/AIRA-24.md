@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-24","project":"aira","title":"Admission saturation-wait UX: queue position/ETA, faster-fail, clearer reject signal","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","dogfood","ux"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-27","to":"AIRA-24"}]}
+{"schema":1,"id":"AIRA-24","project":"aira","title":"Admission saturation-wait UX: queue position/ETA, faster-fail, clearer reject signal","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","dogfood","ux"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-27","to":"AIRA-24"},{"kind":"relates","from":"AIRA-49","to":"AIRA-24"}]}
 ---
 Reported by a dogfooding session (altium via subpipe) 2026-08-31: `aira confine --memory-max 32G --memory-reserve 512M -- make merge-gate` sat in admission-wait 1785s (~30 min) under genuine slice saturation (siblings ~40G/63G), then hard-rejected `E_ADMIT_SATURATED` (exit 1) with ZERO tests run — plus a "is it stuck/running/dead?" ambiguity because the job vanished from `aira confine --list` on reject with no distinct signal.
 
