@@ -46,6 +46,14 @@ type ConfineSliceReserve struct {
 	GrantedBytes int64 `json:"granted_bytes"`
 	CeilingBytes int64 `json:"ceiling_bytes"`
 	Jobs         int   `json:"jobs"`
+	// Queued and FreezePhase answer "what is stuck, and why" for the admission
+	// queue. Root-causing AIRA-59 required source reading precisely because
+	// `confine --list` reported only ADMITTED jobs: nothing surfaced waiters that
+	// were queued but ungranted, nor that a fairness freeze was holding them.
+	// A queue with no waiters reports a known zero and phase "idle" — never
+	// "unevaluated", which is reserved for state that could not be established.
+	Queued      int    `json:"queued"`
+	FreezePhase string `json:"freeze_phase,omitempty"`
 }
 
 type ConfineKillResult struct {

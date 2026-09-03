@@ -909,9 +909,14 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 	admitTimeout := time.Duration(0)
 	if raw := options["admit-timeout"]; raw != "" {
 		admitTimeout, err = time.ParseDuration(raw)
-		if err != nil || admitTimeout < time.Millisecond {
+		// AIRA-58: bound it HERE, synchronously, so the caller learns before any
+		// daemon round-trip — the same already-honest shape as
+		// `confine-reserve --max-wait`. The daemon enforces the same shared
+		// runner.AdmitWaitCeiling independently, since a non-CLI caller reaches
+		// the runner directly and an operator may run an older client.
+		if err != nil || admitTimeout < time.Millisecond || admitTimeout > runner.AdmitWaitCeiling {
 			if err == nil {
-				err = errors.New("must be at least 1ms")
+				err = fmt.Errorf("must be in [1ms,%s]", runner.AdmitWaitCeiling)
 			}
 			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --admit-timeout: %v\n", err)
 			return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
@@ -2225,6 +2230,24 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 			formatReserveBytes(result.SliceReserve.GrantedBytes),
 			formatReserveBytes(result.SliceReserve.CeilingBytes),
 			result.SliceReserve.Jobs, jobLabel)
+		// Why a job is WAITING, which the admitted-jobs table above cannot show.
+		// Printed unconditionally (including the zero) so "nothing is queued" is a
+		// stated fact rather than an absence the reader has to interpret.
+		if result.SliceReserve.FreezePhase != "" {
+			waiterLabel := "waiters"
+			if result.SliceReserve.Queued == 1 {
+				waiterLabel = "waiter"
+			}
+			note := ""
+			switch result.SliceReserve.FreezePhase {
+			case "hold":
+				note = " (fairness freeze holding capacity for the head waiter; it yields shortly)"
+			case "yield":
+				note = " (fairness freeze yielding; fitting waiters are being admitted)"
+			}
+			_, _ = fmt.Fprintf(stdout, "slice queue: %d queued %s, freeze %s%s\n",
+				result.SliceReserve.Queued, waiterLabel, result.SliceReserve.FreezePhase, note)
+		}
 	}
 	if response.Exit != 0 {
 		return response.Exit

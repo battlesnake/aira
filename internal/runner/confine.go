@@ -24,6 +24,35 @@ const (
 	// DefaultDelegateRAMScopeCeiling is the compiled-in containment cap used
 	// whenever a daemon ceiling is unavailable. It is not an admission charge.
 	DefaultDelegateRAMScopeCeiling = int64(48 << 30)
+	// AdmitWaitCeiling is the single upper bound on a requested admission wait,
+	// shared by the CLI, this runner, and the daemon (AIRA-58). It is a TYPO
+	// GUARD, not a policy: real waits on a contended shared slice routinely run
+	// into the hundreds or thousands of seconds, and the resources a long wait
+	// actually consumes are already bounded elsewhere (the daemon's per-slice
+	// admitMaxWaiters and its global admitGlobalMax connection gate).
+	//
+	// It is ONE constant on purpose. Three independent 30-minute ceilings had
+	// drifted into the codebase — daemon admit, daemon worker-admit, and this
+	// runner — and the runner's silently clamped every request BEFORE it reached
+	// the daemon, so a daemon-side-only fix left `--admit-timeout 2h` still
+	// becoming 30m on the wire while daemon tests passed. A caller that exceeds
+	// this is REFUSED and told the ceiling, never silently substituted.
+	AdmitWaitCeiling = 24 * time.Hour
+	// MinPinnedScopeCap is the smallest reserve a caller may DECLARE. It mirrors
+	// the minimum `aira confine --memory-reserve` already accepts, so the CLI, the
+	// runner and the daemon all agree on one bound.
+	//
+	// A declared reserve below it is REFUSED at the runner boundary, not silently
+	// launched uncapped: a declared reserve becomes the scope memory.max, so
+	// quietly dropping the cap for a sub-minimum value would mean the same request
+	// is contained when the daemon answers and uncontained when it does not —
+	// the divergence this whole change exists to remove, and another instance of
+	// the silent substitution AIRA-58 removed.
+	//
+	// Note this is NOT what protects callers that pass a token reserve (several
+	// tests pass 1): those never set MemoryReservePinned, so provenance alone
+	// excludes them. The two mechanisms are independent.
+	MinPinnedScopeCap = int64(1 << 20)
 )
 
 type ConfineAdmission string

@@ -57,6 +57,9 @@ var ExitCodes = map[string]int{
 	"E_RUN_INPUT_PARTIAL": 1, "E_RUN_INPUT_OUTCOME_UNKNOWN": 3, "E_RUN_INPUT_PROTOCOL": 2,
 	"E_RUN_INPUT_PATH_TOO_LONG":  2,
 	"E_CONFINE_ARGUMENT_INVALID": 2, "E_CONFINE_UNAVAILABLE": 4,
+	// A refused over-ceiling admission wait is a bad request, like any other
+	// argument error, so it exits 2 rather than falling through to a default.
+	"E_ADMIT_WAIT_TOO_LONG":      2,
 	"E_CONFINE_OWNER_UNVERIFIED": 1, "E_CONFINE_NOT_FOUND": 2,
 	"U_CONFINE_NOT_LAUNCHED": 3, "U_CONFINE_KILL_UNCONFIRMED": 3,
 	"E_INSTALL_ARGUMENT_INVALID": 2, "E_INSTALL_UNAVAILABLE": 4,

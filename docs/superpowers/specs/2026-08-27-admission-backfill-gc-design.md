@@ -174,3 +174,39 @@ most once per `interval` (default **10s**) per worker process:
 - **RAM-path pre-collect**: a worker that gets a CPU slot immediately then blocks
   on the RAM reservation performs exactly one before-block `gc.collect()` on the
   reservation wait (RED against today's no-collect RAM path).
+
+---
+
+## Correction (2026-09-03, AIRA-58 / AIRA-59)
+
+Two claims in this document are now known to be wrong, and are corrected here
+rather than left to contradict the code.
+
+**1. The starvation-freedom argument is conditional, not absolute.** This design
+argues that once the freeze engages, the fixed in-flight set drains, `available`
+rises to the full ceiling, and the head is admitted. That step does not hold:
+`checkedAvailable` charges `max(effectiveCurrent, outstanding + adopted)`, and
+neither `effectiveCurrent` (the slice's real RSS) nor `adopted` (scopes the
+ledger cannot reconstruct) is controlled by the queue. Freezing cannot force
+either to drain, so a head waiter can be blocked by memory the queue never
+granted and can never reclaim by waiting. This was already true when this
+document was written; AIRA-59 only made it visible.
+
+**2. "Ultimately bounded by the 30-min cap" was load-bearing, and that cap was a
+bug.** The freeze's blast radius was bounded only by the head waiter's own
+`max_wait_ms`, which was silently clamped to 30 minutes in three separate places
+(daemon admit, daemon worker-admit, and the runner before sending). AIRA-58
+removed the silent clamps and raised the ceiling to 24h, which would have
+extended the worst-case slice-wide stall from 30 minutes to whatever any single
+caller requested. The freeze therefore now carries its own bound
+(`admitFreezeMaxHold`, default 2m, `AIRA_DAEMON_ADMIT_FREEZE_MAX_HOLD`): it may
+hold continuously for at most that long, then must yield for the same duration
+before re-arming.
+
+What the freeze guarantees today, stated precisely: **no single continuous
+fairness hold exceeds `admitFreezeMaxHold`**, and over completed hold/yield
+cycles fairness costs at most half of wall time. It does **not** guarantee that a
+large head waiter is eventually admitted — see (1). Setting the hold to
+`0`/`disabled` restores this document's original unbounded behaviour exactly.
+
+See `2026-09-03-aira58-59-admission-wait-and-freeze-plan.md`.

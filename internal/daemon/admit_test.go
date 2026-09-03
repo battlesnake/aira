@@ -92,7 +92,7 @@ func TestValidateAdmitArgsRejectsTraversalShapedConfineScopeID(t *testing.T) {
 			args[key] = value
 		}
 		args["scope_id"] = scopeID
-		if _, err := validateAdmitArgs(args); err == nil {
+		if _, err := validateAdmitArgs(args, admitWaitCeilingMs); err == nil {
 			t.Fatalf("scope_id %q accepted", scopeID)
 		}
 	}
@@ -101,14 +101,14 @@ func TestValidateAdmitArgsRejectsTraversalShapedConfineScopeID(t *testing.T) {
 		valid[key] = value
 	}
 	valid["scope_id"] = "CONFINE-job-123-abc9"
-	request, err := validateAdmitArgs(valid)
+	request, err := validateAdmitArgs(valid, admitWaitCeilingMs)
 	if err != nil || request.scopeID != valid["scope_id"] || request.owner != "session-a" {
 		t.Fatalf("request=%+v err=%v", request, err)
 	}
 	valid["scope_id"] = "CONFINE-@dr-job-with-dash-123-abc9"
 	valid["name"] = "job-with-dash"
 	valid["delegate_ram"] = true
-	request, err = validateAdmitArgs(valid)
+	request, err = validateAdmitArgs(valid, admitWaitCeilingMs)
 	if err != nil || !request.delegateRAM || request.name != "job-with-dash" {
 		t.Fatalf("marked request=%+v err=%v", request, err)
 	}
@@ -253,7 +253,7 @@ func TestAdmitBlockedHeadRejectsSaturatedAtWaitCap(t *testing.T) {
 	var deadline chan time.Time
 	var deadlineAt time.Time
 	server.admitAfter = func(wait time.Duration) <-chan time.Time {
-		if wait != time.Duration(admitWaitCapMs)*time.Millisecond {
+		if wait != time.Duration(admitWaitCeilingMs)*time.Millisecond {
 			t.Fatalf("deadline wait=%s, want cap", wait)
 		}
 		nowMu.Lock()
@@ -268,7 +268,7 @@ func TestAdmitBlockedHeadRejectsSaturatedAtWaitCap(t *testing.T) {
 	go func() {
 		defer close(done)
 		defer serverConn.Close()
-		server.admitConnection(serverConn, validAdmitArgs(60, admitWaitCapMs))
+		server.admitConnection(serverConn, validAdmitArgs(60, admitWaitCeilingMs))
 	}()
 	select {
 	case <-timerReady:
@@ -686,8 +686,11 @@ func TestAdmitUnevaluatedImmediateWithoutEnqueue(t *testing.T) {
 }
 
 func TestAdmitValidationAndCaps(t *testing.T) {
-	if request, err := validateAdmitArgs(map[string]any{"slice": " x ", "reserve": int64(1), "max_wait_ms": admitWaitCapMs + 1, "signature": "a\x00b", "pinned": true}); err != nil || request.reserve != 1 || request.maxWait != admitWaitCapMs || request.signature != "a\x00b" || !request.pinned {
-		t.Fatalf("valid/clamped request=%+v err=%v", request, err)
+	// AIRA-58: a wait AT the ceiling is honoured exactly. This assertion used to
+	// pass max_wait_ms = cap+1 and require the result to equal the cap — it
+	// encoded the silent clamp, so it would have kept passing against the bug.
+	if request, err := validateAdmitArgs(map[string]any{"slice": " x ", "reserve": int64(1), "max_wait_ms": admitWaitCeilingMs, "signature": "a\x00b", "pinned": true}, admitWaitCeilingMs); err != nil || request.reserve != 1 || request.maxWait != admitWaitCeilingMs || request.signature != "a\x00b" || !request.pinned {
+		t.Fatalf("at-ceiling request=%+v err=%v", request, err)
 	}
 	for name, args := range map[string]map[string]any{
 		"missing":         {"slice": "x", "reserve": 1},
@@ -697,7 +700,7 @@ func TestAdmitValidationAndCaps(t *testing.T) {
 		"extra":           {"slice": "x", "reserve": 1, "max_wait_ms": 1, "extra": true},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := validateAdmitArgs(args); err == nil {
+			if _, err := validateAdmitArgs(args, admitWaitCeilingMs); err == nil {
 				t.Fatal("hostile request accepted")
 			}
 		})

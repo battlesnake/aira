@@ -305,7 +305,7 @@ func (s *Server) releaseWorkerGrant(jobID, outerScope, workerID string) {
 	job.mu.Unlock()
 }
 
-func validateWorkerAdmitArgs(args map[string]any) (workerAdmitRequest, error) {
+func validateWorkerAdmitArgs(args map[string]any, waitCeilingMs int64) (workerAdmitRequest, error) {
 	req := workerAdmitRequest{}
 	str := func(key string, required bool) (string, error) {
 		raw, exists := args[key]
@@ -346,8 +346,16 @@ func validateWorkerAdmitArgs(args map[string]any) (workerAdmitRequest, error) {
 	if maxWait < 0 {
 		maxWait = 0
 	}
-	if maxWait > admitWaitCapMs {
-		maxWait = admitWaitCapMs
+	// AIRA-58: refuse rather than silently clamp, same honesty fix as the admit
+	// path. The code stays CodeProtocol (NOT CodeAdmitWaitTooLong) on purpose:
+	// worker_admit_client_linux.go wraps every non-OK response as
+	// E_CONFINE_UNAVAILABLE, and the aitest supervisor responds to "unavailable"
+	// by disabling daemon admission and running UNCONFINED. It already classifies
+	// E_DAEMON_PROTOCOL as permanent, so refusing with that code fails closed
+	// instead of silently dropping confinement.
+	if maxWait > waitCeilingMs {
+		return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit max_wait_ms %d exceeds the ceiling of %d ms (%s)",
+			CodeProtocol, maxWait, waitCeilingMs, time.Duration(waitCeilingMs)*time.Millisecond)
 	}
 	req.maxWaitMS = maxWait
 	return req, nil
@@ -355,7 +363,7 @@ func validateWorkerAdmitArgs(args map[string]any) (workerAdmitRequest, error) {
 
 func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 	start := s.admitNowTime()
-	req, err := validateWorkerAdmitArgs(args)
+	req, err := validateWorkerAdmitArgs(args, workerAdmitWaitCeilingMs)
 	if err != nil {
 		_ = writeFrame(conn, errorFrame(CodeProtocol, err.Error()))
 		return

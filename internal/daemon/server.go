@@ -75,6 +75,7 @@ type Server struct {
 	admitPollInterval            time.Duration
 	workerAdmitPollInterval      time.Duration
 	admitBackfillGrace           time.Duration
+	admitFreezeMaxHold           time.Duration
 	admitRegistryMu              sync.Mutex
 	admitQueues                  map[string]*sliceQueue
 	admitPriorMu                 sync.Mutex
@@ -138,6 +139,7 @@ func NewServer(paths Paths) *Server {
 		projectUses: map[string]int{},
 		watchSlots:  make(chan struct{}, watchMaxConcurrent), watchPollInterval: defaultWatchPollInterval,
 		admitSlots: make(chan struct{}, admitGlobalMax), admitPollInterval: defaultAdmitPollInterval, admitBackfillGrace: defaultAdmitBackfillGrace,
+		admitFreezeMaxHold: defaultAdmitFreezeMaxHold,
 		admitQueues: map[string]*sliceQueue{},
 		admitConfineScan: func(path string) (runner.ConfineListResult, error) {
 			return runner.ListConfines(context.Background(), path, nil)
@@ -201,6 +203,11 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		return err
 	}
 	s.admitBackfillGrace = admitBackfillGrace
+	admitFreezeMaxHold, err := admitFreezeMaxHoldFromEnv()
+	if err != nil {
+		return err
+	}
+	s.admitFreezeMaxHold = admitFreezeMaxHold
 	if len(s.Paths.SocketPath) > maxUnixSocketPath {
 		// Fail fast with a clear code instead of a cryptic bind EINVAL. In
 		// production XDG_RUNTIME_DIR is short (/run/user/<uid>); an over-long one

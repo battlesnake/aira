@@ -22,7 +22,19 @@ import (
 )
 
 const (
-	admitWaitCapMs                      int64 = 30 * 60 * 1000
+	// admitWaitCeilingMs is runner.AdmitWaitCeiling expressed in milliseconds —
+	// ONE shared ceiling across CLI, runner and daemon (AIRA-58). It replaced a
+	// hardcoded 30-minute cap applied by SILENT SUBSTITUTION here and in two
+	// other places; over-ceiling requests are now refused and told the bound.
+	admitWaitCeilingMs = int64(runner.AdmitWaitCeiling / time.Millisecond)
+	// workerAdmitWaitCeilingMs deliberately stays at 30 minutes rather than
+	// adopting the shared ceiling. admitConnection is gated by admitSlots
+	// (admitGlobalMax), but workerAdmitConnection is NOT gated at all and holds a
+	// connection plus a polling goroutine for the whole wait, so a 24h ceiling
+	// there would permit unbounded concurrent retained connections. Its only
+	// caller, the aitest supervisor, uses waits two orders of magnitude smaller.
+	// Do not "unify" these without first bounding worker-admit's concurrency.
+	workerAdmitWaitCeilingMs            int64 = 30 * 60 * 1000
 	admitMaxWaiters                           = 256
 	admitGlobalMax                            = 1024
 	admitMaxReserve                     int64 = 1 << 50
@@ -81,6 +93,75 @@ type sliceQueue struct {
 	stopOnce          sync.Once
 	poll              time.Duration
 	server            *Server
+
+	// AIRA-59 fairness-freeze duty cycle, held as a SINGLE anchor instant so the
+	// phase is DERIVED, never stored: idle while zero, hold for the first
+	// maxHold after it, yield for the second, idle again after.
+	//
+	// There are exactly TWO writes, and neither can lengthen a hold:
+	//   1. the arm, guarded by derived phase == idle;
+	//   2. the completed-cycle clear, taken ONLY when the derived phase is already
+	//      idle (the cycle is over), which forces one backfilling pass before the
+	//      next arm. Because it fires only from derived-idle it can shorten the
+	//      gap between cycles, never extend a freeze.
+	//
+	// That representation is load-bearing, not stylistic. With a stored phase plus
+	// a mutable deadline, three separate defects were expressible and had to be
+	// forbidden in prose: renewing an active hold every pass (freeze becomes
+	// permanent one tick at a time), clearing the phase when the head happens to
+	// fit, and re-anchoring on holder change — each of which silently restores the
+	// ~100% freeze this bounds. Derived from one anchor, none of them can be
+	// written. The phase is QUEUE-LEVEL and independent of which waiter is
+	// protected: anchoring to a holder let a stream of unfittable heads (staggered
+	// merge-gates, or the retry loop AIRA-58 forced on callers) each claim a fresh
+	// full hold.
+	//
+	// Lifetime note: an empty queue is deleted by pruneAdmitQueue, so this anchor
+	// lives only as long as the queue. A yield cut short by quiescence is not a
+	// fairness leak — an empty queue has nobody to starve — but it does mean the
+	// 50% bound is over intervals where the queue is continuously non-empty.
+	freezeArmedAt   time.Time
+	freezeHolderSeq int64            // diagnostics only; never affects timing
+	freezeLogged    admitFreezePhase // last phase logged, so logs are transitions
+}
+
+// admitFreezePhaseAt derives the duty-cycle phase from the anchor instant. Held
+// separate and pure so it is directly testable and so no caller can invent a
+// fourth state. maxHold <= 0 means the duty cycle is disabled entirely.
+func admitFreezePhaseAt(armedAt, now time.Time, maxHold time.Duration) admitFreezePhase {
+	if maxHold <= 0 || armedAt.IsZero() {
+		return admitFreezeIdle
+	}
+	elapsed := now.Sub(armedAt)
+	if elapsed < maxHold {
+		// Includes a negative elapsed (clock moved backwards): treat as
+		// just-armed rather than silently skipping the protective hold.
+		return admitFreezeHold
+	}
+	// Subtracting first avoids overflowing on 2*maxHold for an absurd setting.
+	if elapsed-maxHold < maxHold {
+		return admitFreezeYield
+	}
+	return admitFreezeIdle
+}
+
+type admitFreezePhase uint8
+
+const (
+	admitFreezeIdle admitFreezePhase = iota
+	admitFreezeHold
+	admitFreezeYield
+)
+
+func (p admitFreezePhase) String() string {
+	switch p {
+	case admitFreezeHold:
+		return "hold"
+	case admitFreezeYield:
+		return "yield"
+	default:
+		return "idle"
+	}
 }
 
 var sliceMemoryStatDegradeOnce sync.Once
@@ -165,18 +246,63 @@ func (s *Server) admitOutstandingJobs(path string) int {
 }
 
 func (s *Server) admitOutstandingReserve(path string) (outstanding int64, outstandingJobs int, adopted int64, adoptedJobs int, ok bool) {
+	snapshot := s.admitSliceSnapshot(path)
+	return snapshot.outstanding, snapshot.outstandingJobs, snapshot.adopted, snapshot.adoptedJobs, snapshot.present
+}
+
+// admitSliceSnapshot reads the ledger AND the queue diagnostics in ONE locked
+// pass. Taking them in two rounds would let `confine --list` report a granted
+// total and a queued count from different moments — a self-inconsistent picture
+// in exactly the situation an operator reaches for it.
+type admitSnapshot struct {
+	outstanding     int64
+	outstandingJobs int
+	adopted         int64
+	adoptedJobs     int
+	queued          int
+	phase           string
+	present         bool
+}
+
+func (s *Server) admitSliceSnapshot(path string) admitSnapshot {
+	// With the duty cycle off a freeze may be actively blocking this queue, so
+	// reporting "idle" would state the opposite of the truth.
+	phase := admitFreezeIdle.String()
+	if s.admitFreezeMaxHold <= 0 {
+		phase = "disabled"
+	}
 	s.admitRegistryMu.Lock()
 	queue := s.admitQueues[path]
 	if queue == nil {
 		s.admitRegistryMu.Unlock()
-		return 0, 0, 0, 0, false
+		// An absent queue is a genuine idle zero, not an unevaluated read: a queue
+		// exists only while it has waiters, so its absence positively establishes
+		// that nothing is waiting. Callers must not render this as "unknown".
+		return admitSnapshot{phase: phase}
 	}
 	queue.mu.Lock()
-	outstanding, outstandingJobs = queue.outstanding, queue.outstandingJobs
-	adopted, adoptedJobs = queue.adopted, queue.adoptedJobs
+	snapshot := admitSnapshot{
+		outstanding: queue.outstanding, outstandingJobs: queue.outstandingJobs,
+		adopted: queue.adopted, adoptedJobs: queue.adoptedJobs,
+		phase: phase, present: true,
+	}
+	for _, waiter := range queue.waiters {
+		if waiter != nil && waiter.state == admitQueued {
+			snapshot.queued++
+		}
+	}
+	if s.admitFreezeMaxHold > 0 {
+		snapshot.phase = admitFreezePhaseAt(queue.freezeArmedAt, s.admitNowTime(), s.admitFreezeMaxHold).String()
+	}
 	queue.mu.Unlock()
 	s.admitRegistryMu.Unlock()
-	return outstanding, outstandingJobs, adopted, adoptedJobs, true
+	return snapshot
+}
+
+// admitQueueDiagnostics is the diagnostics half of admitSliceSnapshot.
+func (s *Server) admitQueueDiagnostics(path string) (queued int, phase string) {
+	snapshot := s.admitSliceSnapshot(path)
+	return snapshot.queued, snapshot.phase
 }
 
 // admitAvailable is the governor's advisory, read-only view of the same
@@ -398,9 +524,13 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		return
 	}
 
-	request, err := validateAdmitArgs(args)
+	request, err := validateAdmitArgs(args, admitWaitCeilingMs)
 	if err != nil {
-		s.writeAdmitError(conn, CodeProtocol, err.Error())
+		// The code is carried BY the error, not hardcoded here: a wait-ceiling
+		// refusal must reach the client as CodeAdmitWaitTooLong, which the runner
+		// treats as terminal. Sending it as CodeProtocol would make the runner fall
+		// through to the flock fallback and launch the job outside the ledger.
+		s.writeAdmitError(conn, admitErrorCode(err), err.Error())
 		return
 	}
 	resolve := s.admitResolveSlice
@@ -707,6 +837,29 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		// (timeoutAdmitWaiter → E_ADMIT_SATURATED) if it never does.
 		return
 	}
+	// AIRA-59 duty cycle. Deliberately placed AFTER the fail-closed slice-read
+	// return above, so a transient unreadable-slice pass can never advance or
+	// restart a phase — a blip must not hand anyone a fresh exclusive window.
+	maxHold := s.admitFreezeMaxHold
+	// Derived, not stored. Uses pass-start `now`, the same instant the grace check
+	// below uses, so hold and yield shift symmetrically if an adopted-confine scan
+	// delays the pass.
+	phase := admitFreezePhaseAt(queue.freezeArmedAt, now, maxHold)
+	if maxHold > 0 && phase == admitFreezeIdle && !queue.freezeArmedAt.IsZero() {
+		// A completed cycle must YIELD AT LEAST ONE EVALUATION before re-arming.
+		// The phase is derived from wall time, but grants only happen during an
+		// evaluator pass, so a yield window that elapses entirely BETWEEN passes
+		// would let the queue go hold -> idle -> re-armed in a single pass and
+		// backfill nothing at all — freezing forever while looking well-behaved.
+		// That happens whenever maxHold approaches the poll interval (any positive
+		// duration is accepted) or a slow adopted-confine scan delays a pass past
+		// a whole cycle. Clearing the anchor and treating THIS pass as a yield
+		// makes the guarantee "at least one backfilling pass per cycle", which is
+		// what actually admits waiters, rather than merely "some wall time spent
+		// nominally yielding".
+		queue.freezeArmedAt = time.Time{}
+		phase = admitFreezeYield
+	}
 	frozen := false
 	for _, waiter := range queue.waiters {
 		if waiter.state != admitQueued {
@@ -723,7 +876,31 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			waiter.waited = true
 			// now is pass-start time, so a slow adopted-confine scan can defer this freeze by its duration.
 			if s.admitBackfillGrace <= 0 || now.Sub(waiter.enqueued) >= s.admitBackfillGrace {
-				frozen = true
+				switch {
+				case maxHold <= 0:
+					// Duty cycle disabled: freeze exactly as before, and write NO phase
+					// state, so the anchor stays meaningless in this mode rather than
+					// accumulating values nothing reads.
+					//
+					// Note this branch is behaviourally equivalent to falling through
+					// (admitFreezePhaseAt returns idle when maxHold <= 0); it exists to
+					// keep the anchor untouched, not because freezing differs. An
+					// earlier comment here claimed disabled mode differed by protecting
+					// a successor younger than the backfill grace — that was wrong: the
+					// grace check above gates this switch in EVERY mode, so a young head
+					// never freezes either way.
+					frozen = true
+				case phase != admitFreezeYield:
+					frozen = true
+					if phase == admitFreezeIdle {
+						// The arm: one of the two anchor writes (see the struct). Guarded
+						// by idle, so an active hold cannot renew itself and a departing
+						// holder cannot buy a fresh window.
+						queue.freezeArmedAt = now
+						phase = admitFreezeHold
+					}
+					queue.freezeHolderSeq = waiter.seq
+				}
 			}
 			continue
 		}
@@ -747,6 +924,53 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		}
 		close(waiter.grantedCh)
 	}
+	// Log BEFORE clearing the diagnostics holder: a hold->yield transition is
+	// exactly the moment an operator wants to see WHICH waiter was being
+	// protected, and clearing first would strip that from the one line reporting it.
+	if maxHold > 0 && phase != queue.freezeLogged {
+		s.logAdmitFreezeTransition(queue, phase, now)
+		queue.freezeLogged = phase
+	}
+	if !frozen {
+		// The head fitted, was granted, or left. Clear only the DIAGNOSTICS seq —
+		// the anchor deliberately survives, because clearing it here would let
+		// repeated holder-fit churn restart fresh holds, which is the same
+		// unbounded-freeze defect as re-anchoring, by another route.
+		queue.freezeHolderSeq = 0
+	}
+}
+
+// logAdmitFreezeTransition reports ONLY phase transitions, never a steady state:
+// evaluator passes run at up to 4/s, so logging an ongoing freeze every pass
+// would itself be a regression on a busy box. Called with queue.mu held.
+func (s *Server) logAdmitFreezeTransition(queue *sliceQueue, phase admitFreezePhase, now time.Time) {
+	queued := 0
+	var holder *admitWaiter
+	for _, waiter := range queue.waiters {
+		if waiter == nil {
+			continue
+		}
+		if waiter.state == admitQueued {
+			queued++
+		}
+		if queue.freezeHolderSeq != 0 && waiter.seq == queue.freezeHolderSeq {
+			holder = waiter
+		}
+	}
+	if holder == nil {
+		log.Printf("aira daemon: admission fairness-freeze %s on %s (%d queued)", phase, queue.path, queued)
+		return
+	}
+	log.Printf("aira daemon: admission fairness-freeze %s on %s: head seq=%d reserve=%d queued-for=%s (%d also queued)",
+		phase, queue.path, holder.seq, holder.reserve,
+		now.Sub(holder.enqueued).Round(time.Second), subtractJobCount(queued, 1))
+}
+
+func subtractJobCount(value, subtract int) int {
+	if value <= subtract {
+		return 0
+	}
+	return value - subtract
 }
 
 func checkedAvailable(current, maximum, reclaimable, outstanding, headroom int64) int64 {
@@ -884,7 +1108,28 @@ func elapsedMilliseconds(start, end time.Time) int64 {
 	return end.Sub(start).Milliseconds()
 }
 
-func validateAdmitArgs(args map[string]any) (admitRequest, error) {
+// admitCodedError carries the wire code a validation failure must be reported
+// with. Callers hardcoded CodeProtocol before AIRA-58; that is wrong for a
+// wait-ceiling refusal, which the runner only treats as terminal when it arrives
+// as CodeAdmitWaitTooLong. Anything without an explicit code stays CodeProtocol.
+type admitCodedError struct {
+	code string
+	err  error
+}
+
+func (e admitCodedError) Error() string { return e.err.Error() }
+
+func (e admitCodedError) Unwrap() error { return e.err }
+
+func admitErrorCode(err error) string {
+	var coded admitCodedError
+	if errors.As(err, &coded) {
+		return coded.code
+	}
+	return CodeProtocol
+}
+
+func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, error) {
 	if len(args) < 3 || len(args) > 9 {
 		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, max_wait_ms, optional signature/pinned/delegate_ram, and an optional complete scope_id/name/owner tuple", CodeProtocol)
 	}
@@ -909,8 +1154,18 @@ func validateAdmitArgs(args map[string]any) (admitRequest, error) {
 	if maxWait < 0 {
 		maxWait = 0
 	}
-	if maxWait > admitWaitCapMs {
-		maxWait = admitWaitCapMs
+	// AIRA-58: REFUSE, never silently substitute. The old behaviour clamped to a
+	// hardcoded 30 minutes with no error, no warning, and no field in
+	// AdmitResponse in which an effective value could have been reported — and
+	// because the response is only written at GRANT time, a clamped caller could
+	// not have learned the truth until after waiting the wrong duration. Refusing
+	// here tells them synchronously, before anything is enqueued.
+	if maxWait > waitCeilingMs {
+		return admitRequest{}, admitCodedError{
+			code: CodeAdmitWaitTooLong,
+			err: fmt.Errorf("%s: admit max_wait_ms %d exceeds the ceiling of %d ms (%s)",
+				CodeAdmitWaitTooLong, maxWait, waitCeilingMs, time.Duration(waitCeilingMs)*time.Millisecond),
+		}
 	}
 	signature := ""
 	if raw, exists := args["signature"]; exists {

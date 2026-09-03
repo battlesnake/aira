@@ -390,6 +390,18 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		result.Status.Slice = attemptedSlice
 		return result, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: %w", err)
 	}
+	// A DECLARED reserve below the minimum the CLI itself accepts is refused here
+	// rather than silently launched uncapped. Both are enforced on this value —
+	// the daemon-grant path makes a declared reserve the scope memory.max — so
+	// quietly dropping the cap for a sub-minimum value would recreate the very
+	// "same request, different containment" divergence this change closes, and
+	// would be another silent substitution of the kind AIRA-58 exists to remove.
+	// Symmetric with the CLI (main.go rejects below the same bound) and with the
+	// daemon's own behaviour.
+	if request.MemoryReservePinned && request.MemoryReserve > 0 && request.MemoryReserve < MinPinnedScopeCap {
+		result.Status.Slice = attemptedSlice
+		return result, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --memory-reserve: declared reserve %d is below the %d-byte minimum", request.MemoryReserve, MinPinnedScopeCap)
+	}
 	if err := validateConfineName(request.Name); err != nil {
 		result.Status.Slice = attemptedSlice
 		return result, err
@@ -444,6 +456,28 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	}
 
 	reserve := request.MemoryReserve
+	// declaredReserve records PROVENANCE and must be read before the widening on
+	// the next line: `pinned` is about to become true for ANY positive reserve, so
+	// afterwards it can no longer distinguish "the caller declared this number" from
+	// "the caller passed some number". Only a declared value may become a hard
+	// scope memory.max on the non-daemon paths — a token reserve enforced as a cap
+	// contains nothing and merely OOM-kills the job at launch (three real-cgroup
+	// tests passing MemoryReserve: 1 caught exactly that during this build).
+	// Both facts are read from the ORIGINAL request, before any resolution below:
+	//   - provenance: MemoryReservePinned is about to be widened to true for ANY
+	//     positive reserve, after which it can no longer distinguish "the caller
+	//     declared this" from "the caller passed something". Callers that pass a
+	//     token reserve without declaring it (several tests pass 1) must never
+	//     have it enforced as a cap — that contains nothing and kills the job.
+	//   - validity: a caller that pins WITHOUT a usable number has its reserve
+	//     replaced by the 4GiB default a few lines down, and capping at that
+	//     default would be capping at a guess while calling it declared — exactly
+	//     what the unpinned branch deliberately refuses to do.
+	// A declared-but-too-small reserve was already refused above, so a positive
+	// declared value here is usable. MemoryReserve is overwritten at the end of
+	// this block, so the byte count is captured now rather than re-read later.
+	declaredReserve := request.MemoryReservePinned && request.MemoryReserve > 0
+	declaredReserveBytes := request.MemoryReserve
 	pinned := request.MemoryReservePinned || reserve > 0
 	if reserve <= 0 {
 		if request.DelegateRAM {
@@ -599,12 +633,46 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	}
 	result.Status.OOMGroup = ConfineOOMGroupSet
 	scopeMemoryMax := request.ScopeMemoryMax
-	// Only an ADMITTED (accounted) daemon grant carries an estimate-sized reserve
-	// that both bounds Σ(reserve) ≤ cap-headroom AND may be enforced as the scope
-	// memory.max for non-delegate jobs. Delegate-ram's pinned framework reserve is
-	// never a scope cap: it uses a separate daemon ceiling or a finite client
-	// fallback when the daemon cannot provide one.
 	admitted := admission.state == "immediate" || admission.state == "waited"
+	// A PINNED reserve is the user's own declared number (--memory-reserve, or
+	// --memory-max, which already set ScopeMemoryMax above) — not an estimate — so
+	// it is enforced as the scope cap regardless of how admission resolved: daemon
+	// grant, flock fallback, timeout, or unevaluated.
+	//
+	// This condition used to also require `admission.lock == nil`, which holds
+	// ONLY for a daemon grant (admitWithFlock always returns a lock). So the very
+	// same command produced a capped scope when the daemon answered and an
+	// UNCAPPED one when it did not — daemon restart, transport failure, or the
+	// client's own premature deadline. That divergence, not the fallback itself,
+	// was the containment gap: an uncapped scope can consume the entire slice and
+	// OOM well-behaved neighbours, bounded only by aira.slice's own cap.
+	// Deliberately keyed on pinned-ness rather than on admission state, because
+	// several launchable outcomes (fallback timeout/unevaluated, or a daemon
+	// `unevaluated`) hold no lock yet still create the scope.
+	// The MinPinnedScopeCap floor is load-bearing, not defensive padding: the
+	// pinned flag is set for ANY positive reserve (see :447), so it does not by
+	// itself prove a deliberate cap request, and a token reserve enforced as
+	// memory.max contains nothing while killing the job at launch. The existing
+	// runner suite caught exactly that — three real-cgroup tests pass
+	// MemoryReserve: 1 to enable admission and were killed with "pid absent".
+	// Keyed on declaredReserve — provenance AND validity captured from the
+	// original request — never on request.MemoryReservePinned, which by here is
+	// true for any positive reserve and cannot tell a deliberate cap from a token
+	// value, and never on request.MemoryReserve, which by here may be a resolved
+	// default rather than anything the caller said. A declared reserve too small
+	// to be a real cap was refused up front, so there is no silently-uncapped
+	// case left for this branch to hide.
+	if !request.DelegateRAM && scopeMemoryMax <= 0 && declaredReserve {
+		scopeMemoryMax = declaredReserveBytes
+	}
+	// An UNPINNED reserve stays restricted to an ADMITTED (accounted) daemon
+	// grant: only that carries a history-derived estimate the daemon has itself
+	// validated against Σ(reserve) ≤ cap-headroom. The client-side fallback
+	// default is explicitly a guess (DefaultConfineMemoryReserve), and enforcing a
+	// guess as a hard cap would OOM-kill jobs that succeed today — which is why
+	// the unpinned fallback is deliberately left uncapped rather than
+	// conservatively capped. Delegate-ram never takes either branch: its pinned
+	// reserve is framework overhead, and it gets a finite cap below.
 	if !request.DelegateRAM && scopeMemoryMax <= 0 && admitted && admission.lock == nil && admission.release != nil && admission.reserve > 0 {
 		scopeMemoryMax = admission.reserve
 	}
