@@ -32,6 +32,20 @@ const (
 	CodeBusy           = "E_DAEMON_BUSY"
 	CodeAdmitTooLarge  = "E_ADMIT_TOO_LARGE"
 	CodeAdmitSaturated = "E_ADMIT_SATURATED"
+	// CodeAdmitWaitTooLong refuses a requested admission wait above
+	// runner.AdmitWaitCeiling (AIRA-58). It is a DEDICATED code, not CodeProtocol,
+	// because the runner routes every code it does not explicitly recognise
+	// through fail() into the flock fallback — which launches OUTSIDE the daemon
+	// ledger. Refusing with an unrecognised code would therefore not refuse the
+	// job at all: it would launch it unaccounted, the exact over-commit direction
+	// admission exists to prevent. Any new admit-path refusal code MUST be added
+	// to the runner's terminal handling in the same change.
+	//
+	// Deliberately NOT used on the worker-admit path: that client wraps every
+	// non-OK response as E_CONFINE_UNAVAILABLE, which makes the aitest supervisor
+	// disable daemon admission and run unconfined. Worker-admit refuses with
+	// CodeProtocol, which the supervisor already classifies as permanent.
+	CodeAdmitWaitTooLong = "E_ADMIT_WAIT_TOO_LONG"
 )
 
 // WorktreeScope is the serialisable, client-discovered projection needed to

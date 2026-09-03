@@ -79,7 +79,6 @@ const (
 	runnerDaemonProtocolVersion = 5
 	runnerDaemonMaxFrameBytes   = 16 << 20
 	admitTransportGrace         = time.Second
-	runnerAdmitWaitCap          = 30 * time.Minute
 )
 
 type runnerAdmitRequestFrame struct {
@@ -124,6 +123,16 @@ func (r *Runner) admit(ctx context.Context, req Request) (admissionResult, error
 	}
 	if r.memorySlice == "" || r.memoryReserve == 0 {
 		return admissionResult{state: "disabled"}, nil
+	}
+	// AIRA-58: enforce the shared ceiling HERE, before either admission path.
+	// Neither the CLI parse check nor the daemon covers a programmatic caller when
+	// the daemon is DOWN: admitWithFlock waits on the raw r.admissionMaxWait, so
+	// an over-ceiling request would simply become an over-ceiling flock wait.
+	// Refused with the terminal code, never silently clamped.
+	if r.admissionMaxWait > AdmitWaitCeiling {
+		return admissionResult{state: "wait_too_long", basis: "reject:wait-too-long"}, fmt.Errorf(
+			"E_ADMIT_WAIT_TOO_LONG: requested admission wait %s exceeds the ceiling of %s",
+			r.admissionMaxWait, AdmitWaitCeiling)
 	}
 	start := r.clock.Now()
 	if result, granted, err := r.admitThroughDaemon(ctx, req, effectiveReserve); granted || err != nil {
@@ -249,12 +258,19 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 			return dialer.DialContext(ctx, "unix", path)
 		}
 	}
+	// AIRA-58: the requested wait goes on the wire AS-IS. This used to be silently
+	// clamped to a private 30-minute runnerAdmitWaitCap right here, BEFORE the
+	// request ever reached the daemon, so `--admit-timeout 2h` became 30m on the
+	// wire and NO daemon-side test could observe it. The ceiling now lives in
+	// exactly one place (runner.AdmitWaitCeiling) and is enforced by REFUSAL at
+	// the edges (CLI parse time, and the daemon), never by silent substitution.
 	maxWait := r.admissionMaxWait
-	if maxWait > runnerAdmitWaitCap {
-		maxWait = runnerAdmitWaitCap
-	}
-	// The client transport deadline is derived from the CAPPED maxWait (Sol build
-	// r1 #4): a wedged daemon must not strand the client past the advertised cap.
+	// The transport deadline follows the REQUESTED wait. Deriving it from a
+	// shorter clamped value tore the connection down while the daemon was still
+	// legitimately holding the request, and a torn connection routes into the
+	// flock fallback — an UNACCOUNTED launch — instead of an honest saturated
+	// rejection. A wedged daemon is still bounded, just at the caller's own
+	// declared budget rather than a hidden one.
 	deadlineWait := maxWait
 	if deadlineWait > time.Duration(mathMaxInt64)-admitTransportGrace {
 		deadlineWait = time.Duration(mathMaxInt64) - admitTransportGrace
@@ -359,6 +375,26 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 		return fail()
 	}
 	if !response.OK || response.Code != "OK" {
+		// AIRA-58: a wait-ceiling refusal is TERMINAL and must never reach fail(),
+		// which routes to the flock fallback and would launch the job outside the
+		// daemon ledger — turning a refusal into an unaccounted admission, strictly
+		// worse than the silent clamp it replaced. Deliberately handled BEFORE the
+		// structured-payload branch and WITHOUT depending on the payload parsing,
+		// so a malformed or absent rejection body still refuses rather than
+		// degrading. Any future admit-path refusal code needs the same treatment.
+		if response.Code == "E_ADMIT_WAIT_TOO_LONG" {
+			_ = conn.Close()
+			message := strings.TrimSpace(response.Error)
+			if message == "" {
+				message = response.Code + ": requested admission wait exceeds the daemon ceiling"
+			}
+			return admissionResult{
+				state:    "wait_too_long",
+				waitedMS: time.Since(admissionStarted).Milliseconds(),
+				reserve:  effectiveReserve,
+				basis:    "reject:wait-too-long",
+			}, true, errors.New(message)
+		}
 		if response.Code == "E_ADMIT_TOO_LARGE" || response.Code == "E_ADMIT_SATURATED" {
 			var rejection runnerAdmitRejection
 			if err := json.Unmarshal(response.Data, &rejection); err == nil && validRunnerAdmitRejection(response.Code, rejection) {

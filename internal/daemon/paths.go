@@ -34,7 +34,16 @@ const (
 	defaultWatchPollInterval    = 500 * time.Millisecond
 	defaultAdmitPollInterval    = 250 * time.Millisecond
 	defaultAdmitBackfillGrace   = time.Minute
-	defaultWatchdogInterval     = 2 * time.Second
+	// defaultAdmitFreezeMaxHold bounds how long the fairness freeze may block the
+	// whole queue CONTINUOUSLY before it must yield for the same duration — so
+	// fairness never costs more than half of wall time (AIRA-59). Before this, a
+	// freeze lasted until its head waiter's own timeout, so one ordinary
+	// oversized request stalled every session on the machine for up to 30 minutes
+	// on a visibly idle box. Crucially the bound is INDEPENDENT of max_wait_ms,
+	// which is what makes AIRA-58's far more generous wait ceiling safe rather
+	// than catastrophic. 0/"disabled" restores the old unbounded behaviour.
+	defaultAdmitFreezeMaxHold = 2 * time.Minute
+	defaultWatchdogInterval   = 2 * time.Second
 	defaultScopeReapInterval    = 5 * time.Minute
 	defaultScopeReapGrace       = 2 * time.Minute
 
@@ -131,6 +140,27 @@ func admitBackfillGraceFromEnv() (time.Duration, error) {
 		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_ADMIT_BACKFILL_GRACE must be a positive Go duration, disabled, or 0")
 	}
 	return grace, nil
+}
+
+// admitFreezeMaxHoldFromEnv follows the admitBackfillGraceFromEnv convention
+// exactly, including "disabled"/"0". Disabled means the fairness freeze is
+// UNBOUNDED again — the pre-AIRA-59 behaviour — and the evaluator then bypasses
+// the phase machine entirely rather than modelling it as an infinite phase,
+// because a persistent phase is observably different: it would survive holder
+// departure and protect a successor younger than its own backfill grace.
+func admitFreezeMaxHoldFromEnv() (time.Duration, error) {
+	value, set := os.LookupEnv("AIRA_DAEMON_ADMIT_FREEZE_MAX_HOLD")
+	if !set || value == "" {
+		return defaultAdmitFreezeMaxHold, nil
+	}
+	if value == "disabled" || value == "0" {
+		return 0, nil
+	}
+	hold, err := time.ParseDuration(value)
+	if err != nil || hold <= 0 {
+		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_ADMIT_FREEZE_MAX_HOLD must be a positive Go duration, disabled, or 0")
+	}
+	return hold, nil
 }
 
 func watchPollIntervalFromEnv() (time.Duration, error) {

@@ -860,9 +860,14 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 	admitTimeout := time.Duration(0)
 	if raw := options["admit-timeout"]; raw != "" {
 		admitTimeout, err = time.ParseDuration(raw)
-		if err != nil || admitTimeout < time.Millisecond {
+		// AIRA-58: bound it HERE, synchronously, so the caller learns before any
+		// daemon round-trip — the same already-honest shape as
+		// `confine-reserve --max-wait`. The daemon enforces the same shared
+		// runner.AdmitWaitCeiling independently, since a non-CLI caller reaches
+		// the runner directly and an operator may run an older client.
+		if err != nil || admitTimeout < time.Millisecond || admitTimeout > runner.AdmitWaitCeiling {
 			if err == nil {
-				err = errors.New("must be at least 1ms")
+				err = fmt.Errorf("must be in [1ms,%s]", runner.AdmitWaitCeiling)
 			}
 			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --admit-timeout: %v\n", err)
 			return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")

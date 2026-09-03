@@ -41,29 +41,44 @@ func admitReadWorkerSupervisorMemoryFixture(current map[string]int64) func(strin
 	}
 }
 
-func TestValidateWorkerAdmitArgsClampsMaxWait(t *testing.T) {
+// verifies: AIRA-58 — worker-admit REFUSES an over-ceiling wait instead of
+// silently clamping it. This test previously asserted the clamp (wait=cap+1 ->
+// want=cap), i.e. it encoded the bug and would have kept passing against it.
+func TestValidateWorkerAdmitArgsRefusesOverCeilingMaxWaitAndFloorsNegative(t *testing.T) {
 	base := map[string]any{
 		"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": workerAdmitEstimatedBytesMin,
 	}
-	for _, test := range []struct {
-		name string
-		wait int64
-		want int64
-	}{
-		{name: "over cap", wait: admitWaitCapMs + 1, want: admitWaitCapMs},
-		{name: "negative", wait: -1, want: 0},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			args := make(map[string]any, len(base)+1)
-			for key, value := range base {
-				args[key] = value
-			}
-			args["max_wait_ms"] = test.wait
-			request, err := validateWorkerAdmitArgs(args)
-			if err != nil || request.maxWaitMS != test.want {
-				t.Fatalf("request=%+v err=%v, want maxWaitMS=%d", request, err, test.want)
-			}
-		})
+	args := func(wait int64) map[string]any {
+		out := make(map[string]any, len(base)+1)
+		for key, value := range base {
+			out[key] = value
+		}
+		out["max_wait_ms"] = wait
+		return out
+	}
+
+	request, err := validateWorkerAdmitArgs(args(-1), workerAdmitWaitCeilingMs)
+	if err != nil || request.maxWaitMS != 0 {
+		t.Fatalf("negative wait: request=%+v err=%v, want maxWaitMS=0", request, err)
+	}
+
+	if request, err := validateWorkerAdmitArgs(args(workerAdmitWaitCeilingMs), workerAdmitWaitCeilingMs); err != nil || request.maxWaitMS != workerAdmitWaitCeilingMs {
+		t.Fatalf("at ceiling: request=%+v err=%v, want honoured exactly", request, err)
+	}
+
+	_, err = validateWorkerAdmitArgs(args(workerAdmitWaitCeilingMs+1), workerAdmitWaitCeilingMs)
+	if err == nil {
+		t.Fatal("over-ceiling worker-admit wait was accepted; it must be refused, never clamped")
+	}
+	// The code must stay E_DAEMON_PROTOCOL: worker_admit_client_linux.go wraps any
+	// non-OK response as E_CONFINE_UNAVAILABLE, and the aitest supervisor answers
+	// "unavailable" by disabling daemon admission and running UNCONFINED. It
+	// already classifies E_DAEMON_PROTOCOL as permanent, so this fails closed.
+	if !strings.Contains(err.Error(), CodeProtocol) {
+		t.Fatalf("worker-admit refusal = %v, want %s so the supervisor treats it as permanent", err, CodeProtocol)
+	}
+	if strings.Contains(err.Error(), CodeAdmitWaitTooLong) {
+		t.Fatalf("worker-admit must NOT use %s: the supervisor does not know it and would run unconfined (err=%v)", CodeAdmitWaitTooLong, err)
 	}
 }
 
@@ -79,7 +94,7 @@ func TestValidateWorkerAdmitArgsRejectsBelowMinimumEstimatedBytes(t *testing.T) 
 			args[key] = value
 		}
 		args["estimated_bytes"] = estimated
-		if _, err := validateWorkerAdmitArgs(args); err == nil {
+		if _, err := validateWorkerAdmitArgs(args, workerAdmitWaitCeilingMs); err == nil {
 			t.Fatalf("estimated_bytes=%d accepted below 1 MiB minimum", estimated)
 		}
 	}
@@ -88,7 +103,7 @@ func TestValidateWorkerAdmitArgsRejectsBelowMinimumEstimatedBytes(t *testing.T) 
 		args[key] = value
 	}
 	args["estimated_bytes"] = workerAdmitEstimatedBytesMin
-	request, err := validateWorkerAdmitArgs(args)
+	request, err := validateWorkerAdmitArgs(args, workerAdmitWaitCeilingMs)
 	if err != nil || request.estimatedBytes != workerAdmitEstimatedBytesMin {
 		t.Fatalf("request=%+v err=%v, want exact 1 MiB boundary accepted", request, err)
 	}
@@ -99,7 +114,7 @@ func TestValidateWorkerAdmitArgsParsesAllFields(t *testing.T) {
 		"job_id": "job-123", "outer_scope": "/outer/scope", "signature": "suite:abc123",
 		"estimated_bytes": int64(4 * workerAdmitEstimatedBytesMin), "max_wait_ms": int64(1234),
 	}
-	request, err := validateWorkerAdmitArgs(args)
+	request, err := validateWorkerAdmitArgs(args, workerAdmitWaitCeilingMs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +151,7 @@ func TestValidateWorkerAdmitArgsRejectsInvalidRequiredFields(t *testing.T) {
 				args[key] = value
 			}
 			test.change(args)
-			if _, err := validateWorkerAdmitArgs(args); err == nil || !strings.Contains(err.Error(), test.wantField) {
+			if _, err := validateWorkerAdmitArgs(args, workerAdmitWaitCeilingMs); err == nil || !strings.Contains(err.Error(), test.wantField) {
 				t.Fatalf("args=%v err=%v, want rejection mentioning %q", args, err, test.wantField)
 			}
 		})

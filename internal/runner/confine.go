@@ -24,6 +24,32 @@ const (
 	// DefaultDelegateRAMScopeCeiling is the compiled-in containment cap used
 	// whenever a daemon ceiling is unavailable. It is not an admission charge.
 	DefaultDelegateRAMScopeCeiling = int64(48 << 30)
+	// AdmitWaitCeiling is the single upper bound on a requested admission wait,
+	// shared by the CLI, this runner, and the daemon (AIRA-58). It is a TYPO
+	// GUARD, not a policy: real waits on a contended shared slice routinely run
+	// into the hundreds or thousands of seconds, and the resources a long wait
+	// actually consumes are already bounded elsewhere (the daemon's per-slice
+	// admitMaxWaiters and its global admitGlobalMax connection gate).
+	//
+	// It is ONE constant on purpose. Three independent 30-minute ceilings had
+	// drifted into the codebase — daemon admit, daemon worker-admit, and this
+	// runner — and the runner's silently clamped every request BEFORE it reached
+	// the daemon, so a daemon-side-only fix left `--admit-timeout 2h` still
+	// becoming 30m on the wire while daemon tests passed. A caller that exceeds
+	// this is REFUSED and told the ceiling, never silently substituted.
+	AdmitWaitCeiling = 24 * time.Hour
+	// MinPinnedScopeCap is the smallest pinned reserve that may be enforced as a
+	// scope memory.max on the non-daemon admission paths. It mirrors the minimum
+	// `aira confine --memory-reserve` already accepts, so every value a real CLI
+	// caller can produce is still capped.
+	//
+	// The floor exists because MemoryReservePinned is a WEAKER signal than "the
+	// user declared a cap": confine_linux.go sets it true for ANY positive
+	// reserve, including token values a programmatic caller passes purely to
+	// enable admission. Enforcing a 1-byte sentinel as memory.max cannot contain
+	// anything — it can only OOM-kill the job at launch. Below this floor the
+	// value is treated as a sentinel, not a containment request.
+	MinPinnedScopeCap = int64(1 << 20)
 )
 
 type ConfineAdmission string
