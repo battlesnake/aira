@@ -1,6 +1,6 @@
 # Confine supervisor CPU — the scope-membership sampler, not output relay
 
-**Status:** plan v1 (pre plan-review)
+**Status:** plan v2 (post Sol plan-review: REVISE → all points addressed, see §9)
 **Ticket:** TBD (owner to file after merge)
 **Branch:** `aira-confine-cpu-investigation` off master `994abee`
 **Author:** Fable (investigation + build), Sol plan-review
@@ -118,15 +118,20 @@ touched.
 TDD, red → green:
 
 - **New** `TestScopeMembershipSamplerIsRateLimited` (runner package, linux):
-  drive `monitorScopeMembership` against a counting fake scope (leader = the
-  test process, members = `[leader]`) for 300 ms; assert `Members()` calls ≤
-  (300 ms / interval) + 3. Red today (~150 calls), green after (~8).
-- **New** `TestScopeMembershipEventsDeliversModifyAndStops`: temp
-  `cgroup.events` file, fake scope pointing at it; modification delivers on the
-  channel; after `stop` the goroutine has closed its fd (verified via the
-  returned cleanup/done signal added for the test — see implementation).
+  asserts the period is at or above a 20 ms contract floor (red at 2 ms), then
+  drives `monitorScopeMembership` against a counting fake scope (leader = the
+  test process) for 300 ms and asserts `Members()` calls ≤ (300 ms / interval)
+  + 2; finally adds a live child to membership right before `stop` and asserts
+  the on-stop sample ran (one more `Members()` read) and reported
+  `HadDescendants`.
+- **New** `TestScopeMembershipEventsDeliversModifyAndReleasesFD`: temp
+  `cgroup.events` file, fake scope pointing at it; over three start/stop
+  cycles: no event before modification; **≤ 20 read syscalls during a 200 ms
+  idle window** (`/proc/self/io` `syscr`; the old busy-poll made ~200 — this is
+  the red→green guard); a modification delivers; a 20-write burst coalesces
+  without blocking; after `stop` the open-fd count returns to baseline.
 - **Re-tuned** real-cgroup dwells so each descendant is still observed at the
-  new period (≥ 3 periods): `sleep 0.03/0.05` → `sleep 0.2` in
+  new period (five periods): `sleep 0.03/0.05` → `sleep 0.25` in
   `TestRealCgroupCleanMultiProcessRunIsUnverified`,
   `TestRealCgroupNestedDescendantIsNeverEscaped`,
   `TestRealCgroupForkThenMigrateOutIsWitnessedNotContained`, and the
@@ -154,3 +159,74 @@ D ≈ 1-3%, C unchanged (out of scope), B ≈ A.
 - **Observation, not in scope**: across tonight's finished job logs
   `scope-integrity=unverified` outnumbers `contained` 1695:118 — worth an
   owner look at what drives `Gap`/`HadDescendants` in ordinary jobs.
+
+## 9. Plan-review outcome (Sol, GPT-5.6, verdict REVISE) and dispositions
+
+- Root cause confirmed: "13,000 reads/s matches 26 × 500Hz; case D confirms
+  per-member scaling; case C isolates the stderr relay as a separate cost".
+- 50 ms endorsed over 20 ms (aggregate load from 5-10 supervisors) and over
+  100 ms (doubles an already-widened window); final/event samples remain.
+- Inotify shutdown must be robust to an early read failure with `stop` never
+  closing → **done**: the closer goroutine selects on `stop` *or* reader
+  completion and owns the exactly-once `Close`; close-induced read errors are
+  normal shutdown.
+- The event test as first written passed on the old code and so guarded nothing
+  → **done**: an idle-window `syscr` assertion from `/proc/self/io` (old reader:
+  ~200 reads per 200 ms idle; new: none), a 20-write burst that must coalesce
+  without blocking, and three start/stop cycles. Proven red against the old
+  reader in a detached worktree at the plan commit (§10).
+- Call this a coverage *reduction* and change every "sub-2ms" claim → **done**
+  in `classifyLaunchScopeIntegrity`, `monitorScopeMembership`, the test
+  comment, and the 2026-08-24 attestation spec (§0, §1, §5 amendment).
+- Dwell re-tune is honest but prefer ≥ 250 ms → **done**: `sleep 0.25` (five
+  periods) in the six sampler-dependent tests (five real-cgroup tests in
+  `internal/runner`, one gate-command test in `internal/store`); the comments
+  state they prove detection of a dwelling escaper, never a shorter one.
+- Preserve and test the final on-stop sample → **done**: the rate test adds a
+  live child to membership immediately before `stop` and asserts
+  `HadDescendants` and one further `Members()` read.
+- Adaptive rate, open-fd `pread`, per-tick caching: keep deferred (agreed).
+- Not covered by tests, accepted: cgroup deletion/rename under the watcher;
+  sampler overrun (a tick longer than the period simply drops ticks — the
+  behaviour is unchanged from 2 ms, where overrun was the *normal* state on a
+  loaded tree).
+
+## 10. Build evidence
+
+Before = installed `aira` (master `994abee` build); after = this branch built
+with `aira confine -- go build -o ~/tmp/aira-confine-cpu/aira-fixed ./cmd/aira`
+(exit 0). Same harness, same 4 s sample windows, same loaded shared box.
+
+| case | scope tree | supervisor CPU before → after | reads/s before → after |
+|---|---|---|---|
+| A: `sleep 9` (quiet) | 1 | 12.8% → **0.8%** | 5,083 → 175 |
+| B2: `timeout 9 sh -c 'while :; do echo line; done'` (stdout, ~1M lines/s) | 2 | 14.8% → **1.0%** | 8,037 → 302 |
+| C: same loop to stderr (relay pipe, out of scope) | 1 | 97.2% → 58.2% | 383,000 → 215,000 |
+| D: 30 × `sleep 9 &` | 31 | 112.5% → **3.5%** | 96,000 → 3,864 |
+
+Case C is the untouched stderr relay and stays relay-dominated, as the plan
+predicted; the ~40-point drop there is the sampler's former share of that job.
+A live `--delegate-ram make merge-gate` after-sample needs the fixed binary
+installed machine-wide, so it is not in this table (before: 25.4%, 13,000
+reads/s, PID 3575024).
+
+TDD record: both new tests were run against the plan commit's code in a
+detached throwaway worktree (with only the constant introduced at its old 2 ms
+value so they compile): `TestScopeMembershipSamplerIsRateLimited` failed on the
+floor (`2ms is below the 20ms contract floor`) and
+`TestScopeMembershipEventsDeliversModifyAndReleasesFD` failed on idle cost
+(`255 read syscalls over 200ms idle`), exit 1. On this branch both pass, exit 0.
+The first full `internal/runner` run after the change exposed
+`TestRealCgroupConfineWitnessesSiblingEscape` (a fifth sampler-tuned dwell at
+`sleep 0.03` that the initial sweep missed — it read `contained` for a 30 ms
+escaper, i.e. the widened gap made visible); re-tuned to 0.25 s like its
+siblings. The first full `make ci` (exit 2) then exposed a sixth, outside the
+runner package: `internal/store` `TestCommandGateAdmitsMultiProcessGreenCommand`
+forks a `sleep 0.05` child to prove the gate admits an honest `unverified`
+multi-process run, and at 50 ms the child went unobserved (`got "contained"`);
+re-tuned to `sleep 0.25`, green 3/3. A repo-wide sweep found no further
+sampler-tuned dwells (the remaining short sleeps are Python polling loops in
+`pylib`). Final `make ci` on the rebased tree: see the PR. `TestM20LauncherDefersACKAndBoundsReadiness/handle_before_ack`
+failed once with `ack=""` (the test reads the ack file between its create and
+write) and passed 5/5 in isolation — a pre-existing race in a detach test
+this change does not touch; reported, not fixed here.

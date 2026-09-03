@@ -1332,7 +1332,7 @@ func TestRealCgroupReconcileRacePreservesWaitAndTerminalUniqueness(t *testing.T)
 
 func TestRealCgroupMigratedLaunchIsNotClean(t *testing.T) {
 	r := realRunner(t)
-	script := `set -eu; rel=$(awk -F: '$1=="0" {print $3}' /proc/self/cgroup); parent=/sys/fs/cgroup$(dirname "$rel"); target="$parent/.aira-migrate-$$"; mkdir "$target"; echo $$ > "$target/cgroup.procs"; printf migrated; sleep 0.1`
+	script := `set -eu; rel=$(awk -F: '$1=="0" {print $3}' /proc/self/cgroup); parent=/sys/fs/cgroup$(dirname "$rel"); target="$parent/.aira-migrate-$$"; mkdir "$target"; echo $$ > "$target/cgroup.procs"; printf migrated; sleep 0.25`
 	record, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/sh", "-c", script}})
 	if err != nil {
 		t.Fatal(err)
@@ -1374,9 +1374,9 @@ target="$parent/.aira-descendant-$$"
 mkdir "$target"
 proof=$(pwd)
 printf '%s\n' "$target" > "$proof/target"
-sh -c 'target=$1; proof=$2; printf "%s\n" "$$" > "$proof/pid"; sleep 0.03; echo $$ > "$target/cgroup.procs"; printf migrated > "$proof/migrated"; exec 1>&- 2>&-; exec sleep 30' sh "$target" "$proof" &
+sh -c 'target=$1; proof=$2; printf "%s\n" "$$" > "$proof/pid"; sleep 0.25; echo $$ > "$target/cgroup.procs"; printf migrated > "$proof/migrated"; exec 1>&- 2>&-; exec sleep 30' sh "$target" "$proof" &
 while [ ! -s "$proof/migrated" ]; do sleep 0.001; done
-sleep 0.03
+sleep 0.25
 exit 0`
 	record, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/sh", "-c", script}, Cwd: proofDir})
 	if err != nil {

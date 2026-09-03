@@ -18,8 +18,10 @@ witness.
 ## 0. Threat + the honest posture
 
 **The load-bearing honesty limit (Sol): sampling PROVES escape, never proves
-whole-tree non-escape.** A descendant can fork and migrate out BEFORE its first 2ms
-sample — it never enters the ever-member set, so a clean-empty scope at teardown
+whole-tree non-escape.** A descendant can fork and migrate out BEFORE its first
+sample (one sampler period, `scopeMembershipSampleInterval`: 2ms at the time of
+this design, 50ms since the 2026-09-03 amendment in §5) — it never enters the
+ever-member set, so a clean-empty scope at teardown
 proves only "empty now", NOT "every descendant stayed contained". Therefore this
 milestone **never upgrades `ScopeContained` to a whole-tree claim**: `contained` keeps
 its existing LEADER-only meaning; a run that spawned descendants has descendant
@@ -43,8 +45,9 @@ prevention (namespaces / seccomp-blocked cgroup writes) is a recorded deferral.
   `descendant-killed`, `unverified`, `handoff-unverified`. `IsSuccess`
   (`types.go:136`) requires `contained`.
 - The leader monitor `monitorScopeMembership` (`runner_linux.go:1389`) watches the
-  LEADER pid via a 2ms ticker + `cgroup.events` and returns "migrated" if the leader
-  is live but absent from `cgroup.procs`.
+  LEADER pid via a ticker (2ms then; `scopeMembershipSampleInterval` = 50ms since
+  2026-09-03, see §5) + `cgroup.events` and returns "migrated" if the leader is
+  live but absent from `cgroup.procs`.
 - `scope.Members()` = `cgroup.procs` (`cgroup_linux.go:224`); `Populated()` reads the
   authoritative `cgroup.events populated` bit (`cgroup_linux.go:239-249`);
   `scope.Kill()` = `cgroup.kill` (whole-scope, atomic).
@@ -168,6 +171,17 @@ never upgrades confidence.
   escapes AFTER the runner's monitor stops — the persistent daemon that owns the scope
   is the right place, a follow-up subsystem like the reconciler); `CLONE_NEWCGROUP` +
   mount/seccomp PREVENTION (needs userns / a bigger sandbox); per-descendant rusage.
+- **Amendment 2026-09-03 — sampler period 2ms → 50ms (a coverage REDUCTION, not a
+  tuning).** The 2ms tick cost every `confine`/`run` supervisor O(scope tree size)
+  `/proc` reads at 500Hz for its whole lifetime (13% of a core idle, 112% for a
+  31-process tree; 25-65% on real `make merge-gate` jobs), and the `cgroup.events`
+  watcher busy-polled its inotify fd at 1kHz. The period is now the named constant
+  `scopeMembershipSampleInterval` (50ms) and the watcher parks in the runtime
+  poller. Everything above that says "2ms" now reads "one sampler period (50ms)":
+  a descendant that forks and exits or migrates within 50ms is not observed and a
+  run with only such descendants can still read `contained`. `unverified` remains
+  the verdict whenever observation cannot establish containment. Evidence, cost
+  model and tests: `2026-09-03-confine-sampler-cpu-plan.md`.
 
 ## 6. Tests (TDD; pure decision + gated real-cgroup)
 
