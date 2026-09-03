@@ -190,7 +190,10 @@ func TestInjectFileMutationIsAdditiveAndRefusesExistingTarget(t *testing.T) {
 	// core.fsmonitor would be executed by the git add that re-stages the
 	// mutation. .git/hooks/aira-evil does not exist, so O_EXCL alone would
 	// happily create it.
-	for _, unsafe := range []string{".git/hooks/aira-evil", ".git/config", "tests/../.git/hooks/aira-evil", "../escape.rs", "/abs-escape.rs", ".", ".."} {
+	// The escape target is named after this run's snapshot directory so a
+	// leaked file from any other run cannot make this assertion lie.
+	escapeName := filepath.Base(snapshot) + "-escape.rs"
+	for _, unsafe := range []string{".git/hooks/aira-evil", ".git/config", "tests/../.git/hooks/aira-evil", "../" + escapeName, "/abs-escape.rs", ".", ".."} {
 		escape := seed
 		escape.File = unsafe
 		if err := applyMutation(snapshot, escape); err == nil {
@@ -200,7 +203,7 @@ func TestInjectFileMutationIsAdditiveAndRefusesExistingTarget(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(snapshot, ".git", "hooks", "aira-evil")); !os.IsNotExist(err) {
 		t.Fatalf("inject-file wrote into the snapshot .git: %v", err)
 	}
-	if _, err := os.Lstat(filepath.Join(filepath.Dir(snapshot), "escape.rs")); !os.IsNotExist(err) {
+	if _, err := os.Lstat(filepath.Join(filepath.Dir(snapshot), escapeName)); !os.IsNotExist(err) {
 		t.Fatalf("inject-file wrote outside the snapshot root: %v", err)
 	}
 }
