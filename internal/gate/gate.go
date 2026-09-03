@@ -135,6 +135,11 @@ func (r Ratchet) Validate() error {
 
 var slugPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`)
 
+// ValidSlug reports whether value is a legal gate or canary identifier.
+// ValidateGate checks the gate id but not the ids inside canary_ids, so a
+// caller minting a derived canary id must check it explicitly.
+func ValidSlug(value string) bool { return slugPattern.MatchString(value) }
+
 func (g GateDefinition) Validate(filename string) error { return ValidateGate(g, filename) }
 
 func ValidateGate(g GateDefinition, filename string) error {

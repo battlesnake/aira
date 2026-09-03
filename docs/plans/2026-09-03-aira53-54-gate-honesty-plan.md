@@ -130,6 +130,27 @@ Declared defaults (documented, not silently invented):
 | `enabled` | `true` |
 | `advisory`, `advisory_in_ready` | `false` |
 
+Input strictness, added in review round 2 — every one of these refuses rather
+than silently coercing:
+
+- `timeout_ms`, `output_cap_bytes`, `mutation_occurrence`, `mutation_seed` are
+  parsed with a strict `ParseInt`; a non-numeric value is `E_GATE_INVALID`, never
+  a silent `0` (a silent `0` timeout would be rejected by `Command.Validate`
+  anyway, but a silent `0` occurrence/seed would not).
+- `mutation_expected_result` defaults to `"fail"`, the only value
+  `validateMutation` accepts.
+- The derived canary id `<gate_id>-canary` can exceed the 64-character
+  `slugPattern` limit (gate.go:136) for a long gate id. Validated at `add` with a
+  clear `E_GATE_INVALID`, not left to produce a confusing downstream canary
+  error.
+- `--checker check-dimension` accepts **only** `--dimension traceability`.
+  `EvaluateDimension` (gate_eval.go:94) returns
+  `U_GATE_EVIDENCE_UNAVAILABLE: unsupported check dimension` for anything else,
+  so any other value would create a gate that can never evaluate. Refusing at
+  creation is fail-closed and avoids minting a knowably-unprovable gate.
+  (`ValidateGate` separately already refuses the `gates` and `check`
+  dimensions.)
+
 Payload by `--checker`:
 
 - `command` ⇒ `Command{Argv, Cwd, EnvAllow, TimeoutMS, OutputCapBytes, Parser,
@@ -240,6 +261,13 @@ that the gate cannot yet be proven. No existing test or caller depends on the
 current return shape (`GateAction` has zero test coverage today), so this is
 free. `show` keeps its current definition-only return.
 
+Round 2 addition: a canary-less `add` has a consequence the caller must not have
+to infer from `CanaryStatus`. Because the new gate applies to everything and has
+no result, `ready` marks **every ticket not-ready** with `U_GATE_NO_RESULT`. The
+result therefore carries an explicit `Warnings` entry saying so. That is correct
+behavior — an unproven gate should hold readiness — but it must be stated at the
+point of creation, not discovered later.
+
 ## Third fabricated green found in review: `gate prove` exits 0 on unevaluated
 
 Not in either ticket, found by review round 1 and verified. `GateAction`'s
@@ -262,6 +290,26 @@ on-demand proof minting would *break* that model, so the honest fix here is
 remedy (b) from AIRA-53 applied to `prove`: correct the `Summary` to say it reads
 back the latest recorded gate result and its proof linkage. Docs move to match
 reality; the security model does not move.
+
+## Fourth fabricated green found in review: `ready` swallows gate errors
+
+Found by review round 2 and verified. `Ready` (relation_ready.go:567-570)
+appends its `U_GATE_EVIDENCE_UNAVAILABLE` record **only when a selector is
+present** (`if hasSelector`). So an unselected `aira ready` against a *malformed
+or unreadable gate file* — a hard `GateCheck` error, not an empty set — lists
+every ticket as ready with no indication that the gate dimension could not be
+read at all. The sibling graph-unevaluated branch immediately above
+(relation_ready.go:559-565) does the opposite (`&& !hasSelector`), so the two are
+inconsistent and neither covers the unselected-error case.
+
+Fix: append the record unconditionally, mirroring the graph-unevaluated branch's
+`findingAlreadyRepresented` de-duplication. Tests cover both the selected and
+unselected branches with a deliberately malformed gate file.
+
+This is deliberately separated from the `ready` *empty-set* question below: a
+`GateCheck` **error** is an unambiguous "could not establish" and needs no policy
+judgement, whereas an empty set is the genuine policy fork that is being
+deferred.
 
 ## Deferrals (explicit)
 
@@ -318,16 +366,21 @@ AIRA-53:
    `canaryFor(def)` resolves it (proving lane binding and canary-id agreement),
    `CanaryStatus == "materialized"`.
 8. `add` without mutation flags ⇒ `CanaryStatus == "absent"`; `RunGate` fails
-   with `E_GATE_CANARY_INVALID`; `gate check` reports `unevaluated`, **not**
-   `pass` — the composed-fix test.
+   with `E_GATE_CANARY_INVALID`; `gate check` reports the gate
+   `unevaluated` with code **exactly** `U_GATE_NO_RESULT` (not merely
+   `!= pass`, which a lazy implementation could satisfy) — the composed-fix
+   test.
 9. `add` twice ⇒ second call `E_GATE_EXISTS`, and the on-disk bytes are byte-identical
    to after the first call (no partial overwrite).
 10. Invalid input (no `--checker`; `--checker command` with no `--timeout-ms`;
     `--checker ratchet`; `--checker check-dimension` with no `--dimension`;
     bad slug id) ⇒ `E_GATE_INVALID` **and no file created** — asserted by
     statting the gate directory.
-11. `set` on an existing gate ⇒ only the named field changes, everything else
-    byte-preserved; `set` on an absent gate ⇒ `E_NOT_FOUND`.
+11. `set` on an existing gate ⇒ only the named field changes, every other field
+    preserved — compared as **parsed definitions**, not bytes, because
+    `RenderGate` normalizes `OutputCapBytes` and would break a naive byte
+    comparison against a hand-authored file; `set` on an absent gate ⇒
+    `E_NOT_FOUND`.
 12. End-to-end through `core.Do` for `add` and `check`, so the fix is proven at
     the face the reporter actually used, not only at the store method.
 
@@ -343,12 +396,27 @@ Added in review round 1:
     "UNEVALUATED"` and `Exit == 3`, not `OK`/0.
 16. `add` then `rant --gate <id>` with no intervening reconcile ⇒ accepted,
     proving `IndexStatus == "refreshed"` is a real claim.
-17. Flag-parity test: every name in `gateDefinitionOperationArgs` is extracted by
-    `gateDefinitionInputFields` and declared in the verb `ArgSpec`, so a
-    half-wired flag fails the suite.
+17. ~~Flag-parity test~~ — **dropped as redundant.** `dispatch_metadata_test.go`
+    already enforces per-operation declared-vs-read argument parity, so a
+    half-wired `--dimension` fails the existing suite loudly. Duplicating that
+    guard would add a second maintenance point for no coverage. Cited rather
+    than rewritten.
 18. Canary-first write ordering: with an intentionally invalid gate payload but a
     valid mutation seed, no discoverable gate exists afterwards
     (`ListGates` empty) — the partial-write guard.
+
+Added in review round 2:
+19. Canary-invalid `add` (e.g. `--mutation-kind go-negate-assertion` with no
+    `--mutation-test`) ⇒ `E_GATE_CANARY_INVALID` **and no gate file created**.
+20. Canary-less `add` ⇒ `ready` marks every ticket not-ready with
+    `U_GATE_NO_RESULT`, and the `add` result carries the warning that says so.
+21. `ready` with a malformed gate file, **both** with and without a selector ⇒
+    an `U_GATE_EVIDENCE_UNAVAILABLE` record in both cases. The unselected branch
+    fails against today's code, which is the point.
+22. Strict-parse refusals: non-numeric `--timeout-ms` / `--mutation-seed`, an
+    over-long gate id whose derived canary id breaks the slug limit, and
+    `--checker check-dimension --dimension coverage` ⇒ `E_GATE_INVALID`, no file
+    written.
 
 ## Mutation testing (mandatory, per adversarial-verification.md)
 
@@ -359,6 +427,11 @@ Each fix is reverted in a throwaway copy and the new tests must fail:
 - `add` made to overwrite silently ⇒ test 9 must fail.
 - `add` made to write before validating ⇒ test 10 must fail.
 - Fix over-corrected to "always unevaluated" ⇒ test 4 must fail.
+- `checkGatesReadOnly` pass-skip reverted ⇒ test 13 must fail.
+- `prove` verdict unwrapped again ⇒ test 15 must fail.
+- `ready` gate-error append re-gated behind `hasSelector` ⇒ test 21's unselected
+  branch must fail.
+- Gate written before the canary ⇒ test 18 must fail.
 
 A test that cannot fail against the reintroduced bug proves nothing and will be
 rewritten. Exact exit codes are recorded; no green claim from truncated output.
@@ -408,3 +481,93 @@ part: `Enabled` is consulted by nothing at all (only `AdvisoryInReady` is read),
 so it cannot block readiness. The underlying observation — that `add` creates a
 globally-applicable unproven gate that does affect `ready` — stands, and is
 correct behavior: an unproven gate should hold readiness.
+
+### Round 2 — Fable (verdict: BLOCK)
+
+Independently confirmed the round-1 findings that mattered (`prove` exit 0, the
+`gates: pass` pre-seed, the genuine-pass downgrade, `hasGateContent` being false
+for an empty directory and true for a `canaries/`-only one — i.e. the exact
+opposite of v1's stated intent), and independently reached the same
+`U_TRACE_EMPTY` precedent conclusion, calling the v1 narrowing "a dodge". It also
+verified the composition claim (d) through the audit-ledger path and confirmed it
+holds. Changes folded in:
+
+| Fable finding | Response |
+|---|---|
+| P1 `ready` swallows GateCheck **errors** unless a selector is present | Fixed here (new section). Separated from the empty-set policy fork, which stays deferred |
+| P1 pass-downgrade needs a test that fails today | Test 13 sharpened to assert `Dimensions["gates"] == "pass"` for a RunGate-passed gate |
+| P1 wrap `prove`'s verdict; ticket the "records no proof" semantics separately | Adopted; `Summary` corrected in this change, no proof-minting invented |
+| P2 strict int parsing, `mutation_expected_result` default, over-long derived canary id, `check-dimension` only supports `traceability` | All adopted as explicit refusals |
+| P2 test 5 wrong as written; test 8 too weak; test 11 byte-compare invalid | All three rewritten |
+| P2 `--dimension` parity already enforced by `dispatch_metadata_test.go` | Test 17 **dropped as redundant** rather than duplicating an existing guard |
+| PARTIAL: "indefinite proof reuse" overstates, since reuse stays digest-bound | Accepted as partial; 604800 adopted anyway on the plan's own "never a silent default" principle |
+
+Fable's one substantive disagreement with Sol — that `ready` returning green for
+*zero* gates is "enumeration, not evaluation" and therefore defensible — matches
+this plan's own deferral rationale, and is why the empty-set half stays out of
+scope while the error half is fixed.
+
+### Live pre-fix evidence
+
+Captured on this worktree before any change, as durable proof the bugs are real
+rather than inferred from source:
+
+```text
+$ aira gate check          # repo has no .aira/gates directory at all
+verdict: pass
+{"Verdict":"pass","Results":[],"Failed":0,"Unevaluated":0,"Passed":0}
+EXIT=0
+
+$ aira check | jq .dimensions.gates
+"pass"
+```
+
+Both faces affirmatively claim `pass` for a gate set that does not exist.
+
+### Measured blast radius (the risk this plan flagged)
+
+The plan committed to reporting the aggregate-`check` blast radius as evidence
+rather than assuming it. Measured against the full suite: **four** failures and
+no more. Every other package stayed green (`cmd/aira`, `internal/app`,
+`internal/daemon`, `internal/domain`, `internal/gate`, `internal/gitcontext`,
+`internal/gitremote`, `internal/install`).
+
+Two were tests genuinely asserting the fabricated pass. Both were corrected to
+assert their real invariant rather than suppressed:
+
+- `TestCheckReportsAreaOverlapAsWarningOnly` asserted the aggregate verdict was
+  `pass` to prove an overlap is warning-only. That only held because the
+  gate-less fixture read `gates: pass`. It now asserts the actual invariant —
+  the `area-overlap` dimension is `warning` **and no fail finding was
+  produced** — a stricter statement of "warning only" than the verdict check it
+  replaces.
+- `TestTraceabilityCheckGoldenFindingsRemainByteForByte` is an exact-list golden
+  whose fixture defines no gates. It now records `U_GATE_SET_EMPTY` instead of
+  omitting the dimension.
+
+Two more came from this change over-reaching, and were reverted rather than
+absorbed: re-classifying `prove` from `SafetyMutate` to `SafetyRead` broke
+`TestRoutingCompletenessWithRecordingSentinels` and `TestSkillSafetyGolden`.
+`skill_test.go:134` pins `"gate/prove": SafetyMutate` as a deliberate golden, so
+that classification is intentional and changing it is a routing decision, not an
+honesty fix. Only the dishonest `Summary` was corrected.
+
+The small count is consistent with the `U_TRACE_EMPTY` precedent: because an
+empty requirement registry already forces `unevaluated`, most fixtures that would
+notice a gates change were already unevaluated for the sibling reason.
+
+### Self-review defects found and fixed before external review
+
+Two defects in this change's own new code, found by re-reading it:
+
+- The canary-presence check statted only `canaries/<id>.json`, but `canaryFor`
+  also accepts the `<gate>.canary.json` form, so a hand-authored canary in the
+  second form would have produced a false "cannot be proven" warning.
+  Resolvability is now decided by `canaryFor` itself, which additionally
+  enforces the gate and lane binding, so the reported status cannot claim a
+  canary that would not actually resolve.
+- `set` parsed the existing definition *before* acquiring the path lock, so a
+  concurrent writer's change would be silently clobbered by the merged copy. The
+  digest of the parsed bytes is now re-checked under the lock, and a mismatch
+  returns `E_WRITE_CONFLICT` — the same precondition discipline as
+  `materialiseIntent` (store.go:1849).

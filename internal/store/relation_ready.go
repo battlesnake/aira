@@ -565,8 +565,13 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 		})
 	}
 	if gateReport, gateErr := s.GateCheck(context.Background()); gateErr != nil {
-		if hasSelector {
-			result = append(result, ReadyRecord{Ticket: TicketRecord{Path: repoPath(s.root, s.root)}, Ready: false, Verdict: "unevaluated", Findings: []CheckFinding{{Code: "U_GATE_EVIDENCE_UNAVAILABLE", Subject: "gates", Message: gateErr.Error(), Kind: "unevaluated"}}})
+		// A GateCheck error is an unambiguous "could not establish", so it is
+		// recorded whether or not a selector narrowed the query. Gating this
+		// behind hasSelector left an unselected ready listing silently green
+		// over an unreadable or malformed gate file.
+		gateFinding := CheckFinding{Code: "U_GATE_EVIDENCE_UNAVAILABLE", Subject: "gates", Message: gateErr.Error(), Kind: "unevaluated"}
+		if !findingAlreadyRepresented(result, gateFinding) {
+			result = append(result, ReadyRecord{Ticket: TicketRecord{Path: repoPath(s.root, s.root)}, Ready: false, Verdict: "unevaluated", Findings: []CheckFinding{gateFinding}})
 		}
 	} else if len(gateReport.Results) > 0 {
 		definitions, _ := s.discoverGates()

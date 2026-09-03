@@ -364,6 +364,10 @@ func TestTraceabilityCheckGoldenFindingsRemainByteForByte(t *testing.T) {
 	wantUnevaluated := []CheckFinding{
 		{Code: "U_TRACE_UNSCANNED", Subject: "implementation.go:2", Message: "requirement AR-2 is unreadable at .aira/requirements/AR-2.md", Kind: "unevaluated"},
 		{Code: "U_TRACE_UNSCANNED", Subject: "implementation_test.go:2", Message: "requirement AR-3 is unreadable at .aira/requirements/AR-2.md", Kind: "unevaluated"},
+		// This fixture defines no gates, and an unpopulated gate set now
+		// reports unevaluated instead of a fabricated pass. The golden records
+		// that honestly rather than omitting the dimension.
+		{Code: GateSetEmptyCode, Subject: "gates", Message: "no gate definition is present", Kind: "unevaluated"},
 	}
 	if !reflect.DeepEqual(report.Findings, wantFindings) || !reflect.DeepEqual(report.UnevaluatedFindings, wantUnevaluated) {
 		t.Fatalf("golden trace findings=%#v unevaluated=%#v\nwant findings=%#v unevaluated=%#v", report.Findings, report.UnevaluatedFindings, wantFindings, wantUnevaluated)
