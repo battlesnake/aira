@@ -52,7 +52,10 @@ def pytest_runtestloop(session):
 
     from aitest.supervisor import Supervisor
 
-    supervisor = Supervisor()
+    # Slice 2: the supervisor needs this session's own Config as its hook
+    # caller, so each worker's real TestReports (and logstart/logfinish) can be
+    # replayed into the SAME hooks junitxml and terminalreporter listen on.
+    supervisor = Supervisor(config=session.config)
     supervisor.collect(session.items)
     results = supervisor.run(
         estimated_bytes=_resolve_estimated_bytes(),

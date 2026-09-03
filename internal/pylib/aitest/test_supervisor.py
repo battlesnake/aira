@@ -1,4 +1,6 @@
+import contextlib
 import errno
+import json
 import os
 import subprocess
 import threading
@@ -6,6 +8,7 @@ import time
 
 import aitest.supervisor as supervisor_module
 from aitest.supervisor import Supervisor, WorkerAdmitDenied, WorkerAdmitRequestTooLarge, WorkerAdmitUnavailable, WorkerPlacementFailed
+from aitest.worker import _EVENT_LINE_PREFIX, _tag_tuples, run_one
 
 
 def _write_stub(path, body):
@@ -1604,3 +1607,497 @@ def test_cleanup_supervisor_scope_is_a_noop_without_a_supervisor_scope(monkeypat
     supervisor._cleanup_supervisor_scope()
 
     assert capsys.readouterr().err == ""
+
+
+# ---------------------------------------------------------------------------
+# Slice 2 (AIRA-31): validate-then-stage-then-replay, and the synthesized
+# report for a nodeid that ends the run unevaluated.
+# ---------------------------------------------------------------------------
+
+
+class _ReplaySpy:
+    """Records everything the supervisor replays into the REAL pytest hooks."""
+
+    def __init__(self):
+        self.reports = []
+        self.logstarts = []
+        self.logfinishes = []
+
+    def pytest_runtest_logstart(self, nodeid, location):
+        self.logstarts.append((nodeid, location))
+
+    def pytest_runtest_logfinish(self, nodeid, location):
+        self.logfinishes.append((nodeid, location))
+
+    def pytest_runtest_logreport(self, report):
+        self.reports.append(report)
+
+
+@contextlib.contextmanager
+def _replay_spy(config):
+    spy = _ReplaySpy()
+    config.pluginmanager.register(spy, name="aitest-replay-spy")
+    try:
+        yield spy
+    finally:
+        config.pluginmanager.unregister(spy)
+
+
+def _real_event_lines(item):
+    """Produces REAL wire lines for one item by actually running it through
+    worker.run_one -- real serialized TestReports, not hand-built stand-ins,
+    so these tests exercise the same bytes a real worker writes."""
+    outcome, events = run_one(item)
+    lines = [
+        _EVENT_LINE_PREFIX + json.dumps(_tag_tuples(event), default=str)
+        for event in events
+    ]
+    return outcome, lines
+
+
+def _fake_worker_state(supervisor, nodeid, lines, close_after=True):
+    """Wires a fake worker whose result pipe already holds `lines`.
+
+    Returns (pid, state, cleanup_fds, write_fd) -- write_fd is None when the
+    pipe was closed (EOF) immediately, and otherwise stays open so a test can
+    _feed() a later line into the SAME worker."""
+    result_read, result_write = os.pipe()
+    payload = "".join(line + "\n" for line in lines)
+    os.write(result_write, payload.encode("utf-8"))
+    if close_after:
+        os.close(result_write)
+        result_write = None
+    os.set_blocking(result_read, False)
+    dispatch_read, dispatch_write = os.pipe()
+    pid = 999000 + len(supervisor.workers)
+    state = {
+        "result_fd": result_read, "read_buffer": b"", "result_eof": False,
+        "in_flight": nodeid,
+        "dispatch_write": os.fdopen(dispatch_write, "w"),
+        "admit_process": None, "grant": None,
+        "pending_events": [],
+    }
+    supervisor.workers[pid] = state
+    return pid, state, dispatch_read, result_write
+
+
+def _feed(write_fd, line):
+    os.write(write_fd, (line + "\n").encode("utf-8"))
+
+
+def test_drain_worker_stages_and_replays_a_fully_valid_batch_only_after_the_result_line(pytester, monkeypatch):
+    """The positive case: logstart, three real reports and logfinish stage
+    silently, and replay in order ONLY once the plain result line lands."""
+    items = pytester.getitems("""
+        def test_ok():
+            assert True
+    """)
+    item = items[0]
+    nodeid = item.nodeid
+    outcome, event_lines = _real_event_lines(item)
+    assert outcome == "passed"
+
+    supervisor = Supervisor(config=item.config)
+    supervisor.collect(items)
+    monkeypatch.setattr(supervisor, "_replace_worker", lambda: None)
+
+    # First pass: events only, no result line yet.
+    pid, state, dispatch_read, write_fd = _fake_worker_state(
+        supervisor, nodeid, event_lines, close_after=False
+    )
+    with _replay_spy(item.config) as spy:
+        supervisor._drain_worker(pid, state)
+        assert spy.reports == [] and spy.logstarts == [] and spy.logfinishes == [], (
+            "nothing may replay before the plain result line confirms the nodeid"
+        )
+        assert len(state["pending_events"]) == len(event_lines)
+        assert nodeid not in supervisor.results
+
+        # Second pass: the plain result line arrives.
+        _feed(write_fd, "%s passed" % nodeid)
+        supervisor._drain_worker(pid, state)
+
+        assert [report.when for report in spy.reports] == ["setup", "call", "teardown"]
+        assert all(report.nodeid == nodeid for report in spy.reports)
+        assert [n for n, _ in spy.logstarts] == [nodeid]
+        assert [n for n, _ in spy.logfinishes] == [nodeid]
+        assert isinstance(spy.logstarts[0][1], tuple), "location must survive as a tuple"
+    assert supervisor.results[nodeid] == "passed"
+    assert state["pending_events"] == []
+    os.close(dispatch_read)
+    os.close(write_fd)
+
+
+def test_drain_worker_validates_the_whole_batch_before_replaying_any_of_it(pytester, monkeypatch, capsys):
+    """Sol round-2's precise requirement: a malformed LATER event in an
+    otherwise-valid batch must leave ZERO events replayed -- not the two valid
+    ones that preceded it, which could never be un-replayed."""
+    items = pytester.getitems("""
+        def test_ok():
+            assert True
+    """)
+    item = items[0]
+    nodeid = item.nodeid
+    _outcome, event_lines = _real_event_lines(item)
+    # Valid logstart + valid report, then a well-formed JSON event of an
+    # unrecognized kind, then the plain result line.
+    poisoned = event_lines[:2] + [
+        _EVENT_LINE_PREFIX + json.dumps({"kind": "not-a-real-kind", "nodeid": nodeid}),
+    ] + ["%s passed" % nodeid]
+
+    supervisor = Supervisor(config=item.config)
+    supervisor.collect(items)
+    assert supervisor.next_nodeid() == nodeid  # first dispatch, exactly as run() does
+    monkeypatch.setattr(supervisor, "_replace_worker", lambda: None)
+    pid, state, dispatch_read, _write_fd = _fake_worker_state(supervisor, nodeid, poisoned)
+
+    with _replay_spy(item.config) as spy:
+        supervisor._drain_worker(pid, state)
+
+    assert spy.reports == [], "a malformed later event must un-do nothing, by replaying nothing"
+    assert spy.logstarts == []
+    assert spy.logfinishes == []
+    assert nodeid not in supervisor.results, "the poisoned batch must take the crash path"
+    assert supervisor.queue == [nodeid], "the crash path's requeue-once must fire"
+    assert pid not in supervisor.workers
+    assert "aira aitest:" in capsys.readouterr().err
+    os.close(dispatch_read)
+
+
+def test_drain_worker_rejects_a_well_formed_event_for_the_wrong_nodeid(pytester, monkeypatch, capsys):
+    """Sol round-2: EVERY staged event's own nodeid must match in_flight, not
+    just the plain result line's. A well-formed event for the WRONG nodeid
+    (e.g. from the AIRA-40-class inherited-fd surface) is a protocol failure
+    and takes the same crash path as a malformed one."""
+    items = pytester.getitems("""
+        def test_ok():
+            assert True
+
+        def test_other():
+            assert True
+    """)
+    by_name = {item.name: item for item in items}
+    item = by_name["test_ok"]
+    nodeid = item.nodeid
+    _outcome, event_lines = _real_event_lines(item)
+    _other_outcome, other_lines = _real_event_lines(by_name["test_other"])
+    mixed = event_lines[:2] + other_lines[1:2] + ["%s passed" % nodeid]
+
+    supervisor = Supervisor(config=item.config)
+    supervisor.collect(items)
+    assert supervisor.next_nodeid() == nodeid  # first dispatch, exactly as run() does
+    monkeypatch.setattr(supervisor, "_replace_worker", lambda: None)
+    pid, state, dispatch_read, _write_fd = _fake_worker_state(supervisor, nodeid, mixed)
+
+    with _replay_spy(item.config) as spy:
+        supervisor._drain_worker(pid, state)
+
+    assert spy.reports == []
+    assert nodeid not in supervisor.results
+    assert supervisor.queue == [nodeid, by_name["test_other"].nodeid], (
+        "the real in-flight nodeid must be requeued at the head, ahead of the "
+        "still-undispatched queue"
+    )
+    assert "aira aitest:" in capsys.readouterr().err
+    os.close(dispatch_read)
+
+
+def test_drain_worker_crashes_on_an_event_line_with_nothing_in_flight(pytester, monkeypatch, capsys):
+    """v5, Fable's precision fix: an event arriving with in_flight None is
+    never staged silently for a later batch check to notice -- it takes the
+    crash path immediately, so the diagnostic says where things went wrong."""
+    items = pytester.getitems("""
+        def test_ok():
+            assert True
+    """)
+    item = items[0]
+    _outcome, event_lines = _real_event_lines(item)
+
+    supervisor = Supervisor(config=item.config)
+    supervisor.collect(items)
+    monkeypatch.setattr(supervisor, "_replace_worker", lambda: None)
+    pid, state, dispatch_read, _write_fd = _fake_worker_state(supervisor, None, event_lines[:1])
+
+    with _replay_spy(item.config) as spy:
+        supervisor._drain_worker(pid, state)
+
+    assert spy.reports == []
+    assert pid not in supervisor.workers
+    assert "no test in flight" in capsys.readouterr().err
+    os.close(dispatch_read)
+
+
+def test_drain_worker_discards_staged_events_on_a_crash_before_the_result_line(tmp_path, monkeypatch, pytester):
+    """v2's critical crash-atomicity regression test, now at the replay level:
+    a crash before the result line must replay NOTHING, and the successful
+    retry's OWN events must then replay exactly once -- never the crashed
+    attempt's, never twice."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+import sys
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+sys.exit(0)
+""")
+    admit = _write_stub(tmp_path / "worker-admit", f"""
+import os, sys
+scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+os.makedirs(scope, exist_ok=True)
+print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+
+    marker = tmp_path / "attempt-marker"
+    items = pytester.getitems(f"""
+        import os
+
+        def test_crashes_once_then_passes():
+            marker = {str(marker)!r}
+            if not os.path.exists(marker):
+                open(marker, "w").write("1")
+                print("FIRST-ATTEMPT-OUTPUT")
+                os._exit(137)
+            print("SECOND-ATTEMPT-OUTPUT")
+    """)
+    item = items[0]
+    nodeid = item.nodeid
+    supervisor = Supervisor(config=item.config)
+    supervisor.collect(items)
+
+    with _replay_spy(item.config) as spy:
+        results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+
+    assert results[nodeid] == "passed"
+    assert supervisor.attempts[nodeid] == 2
+    call_reports = [r for r in spy.reports if r.when == "call"]
+    assert len(call_reports) == 1, (
+        "exactly one call report for this nodeid -- the crashed attempt's staged "
+        "events must have been discarded: %r" % (spy.reports,)
+    )
+    assert "SECOND-ATTEMPT-OUTPUT" in call_reports[0].capstdout
+    assert "FIRST-ATTEMPT-OUTPUT" not in call_reports[0].capstdout
+    assert len(spy.logstarts) == 1 and len(spy.logfinishes) == 1
+
+
+def test_run_synthesizes_and_replays_an_honest_report_for_a_twice_crashed_nodeid(tmp_path, monkeypatch, pytester):
+    """Fable's original finding, Sol round-2's report-shape correction, v5's
+    redesign to a post-run final pass: if both attempts crash, both staged
+    batches are (correctly) discarded, so junitxml would otherwise have NO
+    <testcase> element at all for a test that really ran -- a real result
+    silently missing from the report. Exactly one honest synthesized report
+    must be replayed instead: not zero, not two."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+import sys
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+sys.exit(0)
+""")
+    admit = _write_stub(tmp_path / "worker-admit", f"""
+import os, sys
+scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+os.makedirs(scope, exist_ok=True)
+print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+
+    items = pytester.getitems("""
+        import os
+        def test_crashes():
+            os._exit(137)
+    """)
+    item = items[0]
+    nodeid = item.nodeid
+    supervisor = Supervisor(config=item.config)
+    supervisor.collect(items)
+
+    with _replay_spy(item.config) as spy:
+        results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+
+    assert results[nodeid] == "unevaluated"
+    assert len(spy.reports) == 1, "exactly one report, never zero and never two: %r" % (spy.reports,)
+    report = spy.reports[0]
+    assert report.nodeid == nodeid
+    # NOT the literal string "unevaluated": junitxml silently IGNORES an
+    # outcome it does not recognize, which is exactly the failure this fix
+    # exists to prevent.
+    assert report.outcome == "failed"
+    assert "unevaluated" in str(report.longrepr)
+    assert report.start > 0 and report.stop >= report.start, (
+        "--durations and junit's own time= attribute read these directly"
+    )
+    assert [n for n, _ in spy.logstarts] == [nodeid]
+    assert [n for n, _ in spy.logfinishes] == [nodeid]
+
+
+def test_run_synthesizes_a_report_for_every_never_dispatched_nodeid_after_fail_queue_too_large(tmp_path, monkeypatch, pytester):
+    """The SAME post-run pass (not a per-site helper) must also cover
+    _fail_queue_too_large's own unevaluated-marking: nodes still queued, never
+    even dispatched, after a permanent daemon sizing rejection."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+import sys
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+sys.exit(0)
+""")
+    call_state = tmp_path / "admit-calls"
+    call_state.write_text("0")
+    admit = _write_stub(tmp_path / "worker-admit", f"""
+import os, sys
+state_path = {str(call_state)!r}
+count = int(open(state_path).read())
+open(state_path, "w").write(str(count + 1))
+if count == 0:
+    scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+    os.makedirs(scope, exist_ok=True)
+    print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+    sys.stdout.flush()
+    sys.stdin.buffer.read()
+else:
+    sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit denied: reject:exceeds-ceiling\\n")
+    sys.exit(1)
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", "1")  # force recycle after test_one
+
+    items = pytester.getitems("""
+        def test_one():
+            assert True
+
+        def test_two():
+            assert True
+    """)
+    by_name = {item.name: item for item in items}
+    supervisor = Supervisor(config=items[0].config)
+    supervisor.collect(items)
+
+    with _replay_spy(items[0].config) as spy:
+        results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+
+    assert results[by_name["test_one"].nodeid] == "passed"
+    assert results[by_name["test_two"].nodeid] == "unevaluated"
+
+    synthesized = [r for r in spy.reports if r.nodeid == by_name["test_two"].nodeid]
+    assert len(synthesized) == 1
+    assert synthesized[0].outcome == "failed"
+    assert "unevaluated" in str(synthesized[0].longrepr)
+    # The daemon's own permanent-rejection reason must survive into the
+    # synthesized message rather than being flattened to a generic string.
+    assert "reject:exceeds-ceiling" in str(synthesized[0].longrepr)
+    # test_one really ran, so its own three real reports replayed and it must
+    # NOT also get a synthesized one.
+    real = [r for r in spy.reports if r.nodeid == by_name["test_one"].nodeid]
+    assert [r.when for r in real] == ["setup", "call", "teardown"]
+
+
+def test_run_synthesizes_a_report_even_for_a_result_defaulted_by_init_pys_own_fallback(tmp_path, monkeypatch, pytester):
+    """v5, Fable's third-site finding.
+
+    FINDING (verified by reading every terminal path in Supervisor.run, not
+    guessed): __init__.py's `results.get(item.nodeid, "unevaluated")` default
+    has NO reachable trigger in today's supervisor -- every path that ends a
+    nodeid's life writes into self.results (_drain_worker's own assignment,
+    _handle_worker_exit's retry-exhausted branch, and _fail_queue_too_large's
+    setdefault drain), and _replace_worker only returns without spawning while
+    other workers are still live. It is a DEFENSIVE default.
+
+    That is precisely why the synthesis pass iterates self.items_by_nodeid and
+    reads self.results.get(nodeid, "unevaluated") rather than iterating
+    self.results' own keys (Sol round-3, mandatory): iterating self.results
+    could not possibly see a nodeid missing from it entirely. This test pins
+    that structural guarantee by forcing the exact condition the default
+    guards against -- run() returning with collected nodeids never recorded --
+    via a worker replacement that does not happen, so a future change that
+    makes it genuinely reachable cannot silently drop those tests from the
+    report."""
+    monkeypatch.delenv("AIRA_AITEST_BOOTSTRAP_CMD", raising=False)
+    monkeypatch.delenv("AIRA_AITEST_WORKER_ADMIT_CMD", raising=False)
+
+    items = pytester.getitems("""
+        import os
+
+        def test_crashes():
+            os._exit(137)
+
+        def test_never_dispatched():
+            assert True
+    """)
+    by_name = {item.name: item for item in items}
+    supervisor = Supervisor(config=items[0].config)
+    supervisor.collect(items)
+    # The pool never refills, so run() ends with BOTH nodeids absent from
+    # self.results -- the __init__.py-default condition, reproduced exactly.
+    monkeypatch.setattr(supervisor, "_replace_worker", lambda: None)
+
+    with _replay_spy(items[0].config) as spy:
+        results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+
+    for name in ("test_crashes", "test_never_dispatched"):
+        nodeid = by_name[name].nodeid
+        assert nodeid not in results, (
+            "precondition: this test only proves anything if run() really did "
+            "leave %r absent from results" % nodeid
+        )
+        synthesized = [r for r in spy.reports if r.nodeid == nodeid]
+        assert len(synthesized) == 1, "%s: %r" % (name, spy.reports)
+        assert synthesized[0].outcome == "failed"
+        assert "unevaluated" in str(synthesized[0].longrepr)
+
+
+def test_drain_worker_still_handles_the_existing_result_line_format_unmodified(pytester, monkeypatch):
+    """Slice 1's plain result line is untouched: with no events staged at all,
+    a bare "<nodeid> <outcome>" line still records exactly as it did, and
+    replays nothing."""
+    items = pytester.getitems("""
+        def test_ok():
+            assert True
+    """)
+    item = items[0]
+    nodeid = item.nodeid
+    supervisor = Supervisor(config=item.config)
+    supervisor.collect(items)
+    monkeypatch.setattr(supervisor, "_replace_worker", lambda: None)
+    pid, state, dispatch_read, _write_fd = _fake_worker_state(supervisor, nodeid, ["%s passed" % nodeid])
+
+    with _replay_spy(item.config) as spy:
+        supervisor._drain_worker(pid, state)
+
+    assert supervisor.results == {nodeid: "passed"}
+    assert spy.reports == []
+    os.close(dispatch_read)
+
+
+def test_supervisor_without_a_config_replays_nothing_and_still_records_results(pytester, monkeypatch):
+    """Supervisor(config=None) stays fully usable (every Slice 1 test builds
+    one that way): with no hook caller there is nothing to replay into, and
+    the plain result bookkeeping is unchanged."""
+    items = pytester.getitems("""
+        def test_ok():
+            assert True
+    """)
+    item = items[0]
+    nodeid = item.nodeid
+    _outcome, event_lines = _real_event_lines(item)
+
+    supervisor = Supervisor()
+    assert supervisor.config is None
+    supervisor.collect(items)
+    monkeypatch.setattr(supervisor, "_replace_worker", lambda: None)
+    pid, state, dispatch_read, _write_fd = _fake_worker_state(
+        supervisor, nodeid, event_lines + ["%s passed" % nodeid]
+    )
+
+    with _replay_spy(item.config) as spy:
+        supervisor._drain_worker(pid, state)
+
+    assert supervisor.results == {nodeid: "passed"}
+    assert spy.reports == []
+    os.close(dispatch_read)

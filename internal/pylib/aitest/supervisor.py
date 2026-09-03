@@ -148,7 +148,22 @@ class Supervisor:
 
     _PLACED_LINE = "__placed__"
 
-    def __init__(self):
+    def __init__(self, config=None):
+        # config is the supervisor's own pytest.Config -- the hook caller
+        # every replayed report/logstart/logfinish goes through (Slice 2).
+        # It stays optional: Supervisor(config=None) is fully usable and
+        # simply replays nothing, which is what Slice 1's own dispatch/
+        # admission tests construct.
+        self.config = config
+        # Nodeids for which a REAL (worker-produced) report was replayed.
+        # Synthesized reports deliberately do NOT go in here at replay time --
+        # they are added by the synthesis pass itself, so a synthesized report
+        # can never make a nodeid look "already reported" to that same pass.
+        self._replayed_nodeids = set()
+        # nodeid -> the specific reason it ended up unevaluated, so a
+        # synthesized report can say something true and specific instead of a
+        # generic string.
+        self._unevaluated_reasons = {}
         self.queue = []
         self.attempts = {}  # nodeid -> attempt count (Task 15's retry-once rule)
         self.outer_scope = None
@@ -213,6 +228,7 @@ class Supervisor:
         while self.queue:
             nodeid = self.queue.pop(0)
             self.results.setdefault(nodeid, "unevaluated")
+            self._unevaluated_reasons.setdefault(nodeid, reason)
 
     def collect(self, items):
         """items: the pytest-collected Item objects. Session collection
@@ -940,6 +956,23 @@ class Supervisor:
                     % (pid, nodeid, state["in_flight"])
                 )
                 return self._handle_worker_exit(pid, state)
+            # BOTH conditions, never either alone: the whole staged batch must
+            # validate/deserialize AND this nodeid's plain result line must be
+            # confirmed (the check just above) before ANY of it reaches a real
+            # pytest hook. Validating the ENTIRE batch first -- rather than
+            # dispatching as we parse -- is Sol round-2's requirement: a
+            # malformed LATER event in an otherwise-valid batch would otherwise
+            # leave earlier events already replayed with no way to un-replay
+            # them.
+            materialized = self._materialize_events(state.get("pending_events", ()), nodeid)
+            if materialized is None:
+                sys.stderr.write(
+                    "aira aitest: worker %d sent an invalid report batch for %r; "
+                    "treating worker as crashed\n" % (pid, nodeid)
+                )
+                return self._handle_worker_exit(pid, state)
+            for event in materialized:
+                self._replay_event(event)
             state["pending_events"] = []
             self.results[nodeid] = outcome
             state["in_flight"] = None
@@ -949,6 +982,146 @@ class Supervisor:
                 return
         if state.get("result_eof"):
             self._handle_worker_exit(pid, state)
+
+    def _materialize_events(self, raw_events, nodeid):
+        """Validates and fully deserializes an ENTIRE staged batch, returning
+        a list of replayable ("kind", payload) pairs, or None if ANY entry in
+        it is unusable. Calls no pytest hook that has an observable effect --
+        pytest_report_from_serializable is a pure constructor.
+
+        Returns [] when this Supervisor has no config: with no hook caller
+        there is nothing to replay into (Slice 1's own tests construct
+        Supervisor() that way), and staging silently degrades to a no-op
+        rather than to a fabricated result."""
+        if self.config is None:
+            return []
+        materialized = []
+        for raw in raw_events:
+            try:
+                event = _untag_tuples(raw)
+            except Exception:
+                return None
+            if not isinstance(event, dict):
+                return None
+            # EVERY event's own nodeid must match in_flight, not just the plain
+            # result line's (Sol round-2): a WELL-FORMED event for the WRONG
+            # nodeid -- e.g. from the AIRA-40-class inherited-fd surface, where
+            # some other forked process holds this pipe's write end -- must go
+            # through the same crash path as a malformed one, never be
+            # attributed to the test actually running here.
+            if event.get("nodeid") != nodeid:
+                return None
+            kind = event.get("kind")
+            if kind in ("logstart", "logfinish"):
+                location = event.get("location")
+                if not isinstance(location, tuple):
+                    return None
+                materialized.append((kind, (nodeid, location)))
+            elif kind == "report":
+                data = event.get("data")
+                # pytest's own serialization stamps $report_type
+                # (pytest_report_to_serializable). Checking it here catches a
+                # malformed or foreign payload earlier and far more precisely
+                # than waiting for a downstream AttributeError -- and
+                # pytest_report_from_serializable itself returns None for a
+                # payload without it, which would be a silent drop.
+                if not isinstance(data, dict) or data.get("$report_type") != "TestReport":
+                    return None
+                try:
+                    report = self.config.hook.pytest_report_from_serializable(
+                        config=self.config, data=data
+                    )
+                except Exception:
+                    return None
+                if report is None or getattr(report, "nodeid", None) != nodeid:
+                    return None
+                materialized.append(("report", report))
+            else:
+                return None
+        return materialized
+
+    def _replay_event(self, event):
+        """Fires ONE already-validated event into the supervisor's own real
+        pytest hooks -- the same hooks junitxml and terminalreporter listen on,
+        which is the entire point of Slice 2."""
+        kind, payload = event
+        if kind == "report":
+            self.config.hook.pytest_runtest_logreport(report=payload)
+            self._replayed_nodeids.add(payload.nodeid)
+            return
+        nodeid, location = payload
+        if kind == "logstart":
+            self.config.hook.pytest_runtest_logstart(nodeid=nodeid, location=location)
+        else:
+            self.config.hook.pytest_runtest_logfinish(nodeid=nodeid, location=location)
+
+    def _synthesize_unevaluated_reports(self):
+        """ONE structurally complete final pass, run after the dispatch loop
+        finishes -- not a hunt for every call site that can leave a nodeid
+        unevaluated (v4's approach, which review found still missed a third
+        site).
+
+        Iterating self.items_by_nodeid is MANDATORY, not a style choice (Sol
+        round-3): it is the full universe of collected items, so it is the only
+        collection that can catch a nodeid missing from self.results ENTIRELY --
+        exactly the `results.get(nodeid, "unevaluated")` default case that
+        motivated this redesign. Iterating self.results' own keys would leave
+        that gap completely intact.
+
+        Report shape: outcome="failed", never the literal string "unevaluated".
+        TestReport.outcome is only ever meaningfully passed/failed/skipped to
+        junitxml and terminalreporter; an unrecognized outcome is silently
+        IGNORED by junitxml's own rendering, which is precisely the
+        silently-missing-result failure this exists to prevent. This mirrors
+        xdist's own handle_crashitem precedent: a synthetic failure report,
+        never a fabricated pass, whenever a real report can never arrive."""
+        if self.config is None:
+            return
+        # pytest.TestReport, the PUBLIC export (verified identical to
+        # _pytest.reports.TestReport on the installed version), imported here
+        # rather than at module scope so supervisor.py keeps importing cleanly
+        # in a context without pytest on the path.
+        from pytest import TestReport
+
+        for nodeid, item in self.items_by_nodeid.items():
+            if self.results.get(nodeid, "unevaluated") != "unevaluated":
+                continue
+            if nodeid in self._replayed_nodeids:
+                continue
+            reason = self._unevaluated_reasons.get(
+                nodeid, "no worker ever reported a result for it"
+            )
+            location = getattr(item, "location", None)
+            if not isinstance(location, tuple) or len(location) != 3:
+                fspath = nodeid.split("::")[0]
+                location = (fspath, None, nodeid)
+            now = time.time()
+            report = TestReport(
+                nodeid=nodeid,
+                location=location,
+                keywords={name: 1 for name in getattr(item, "keywords", ())},
+                outcome="failed",
+                longrepr="unevaluated: %s" % reason,
+                # when="call" is a deliberate choice, verified against real
+                # junitxml output: it renders as <failure message="unevaluated:
+                # ..."/>, whereas a synthetic non-call phase renders as
+                # <error message='failed on setup with "..."'/> -- text that
+                # would be actively untrue here, since setup was never even
+                # reached.
+                when="call",
+                sections=[],
+                duration=0.0,
+                # --durations and junit's own time= attribute read start/stop
+                # directly; leaving them at the constructor's 0 default is a
+                # small but real, easily-avoided fidelity gap.
+                start=now,
+                stop=now,
+                user_properties=[],
+            )
+            self.config.hook.pytest_runtest_logstart(nodeid=nodeid, location=location)
+            self.config.hook.pytest_runtest_logreport(report=report)
+            self.config.hook.pytest_runtest_logfinish(nodeid=nodeid, location=location)
+            self._replayed_nodeids.add(nodeid)
 
     def _handle_worker_exit(self, pid, state):
         """A worker's result pipe hit EOF without a terminating record for
@@ -960,6 +1133,11 @@ class Supervisor:
         self._retire_worker(pid, state)
         if nodeid is not None and not self.requeue_once(nodeid):
             self.results[nodeid] = "unevaluated"
+            self._unevaluated_reasons.setdefault(
+                nodeid,
+                "worker %d stopped reporting while running it, and the one "
+                "retry did too" % pid,
+            )
         self._replace_worker()
 
     def run(self, estimated_bytes, worker_count=1, max_wait="30s"):
@@ -1042,6 +1220,10 @@ class Supervisor:
                         pass  # already dead -- nothing to signal, retire below regardless
                     self._retire_worker(pid, state)
         self._cleanup_supervisor_scope()
+        # ONE structurally complete pass, after every other path has had its
+        # say -- see _synthesize_unevaluated_reports for why this is a single
+        # post-run pass over items_by_nodeid rather than per-call-site fixes.
+        self._synthesize_unevaluated_reports()
         return self.results
 
     def _cleanup_supervisor_scope(self):

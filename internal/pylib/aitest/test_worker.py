@@ -539,3 +539,196 @@ def test_exit_child_still_exits_if_coverage_save_itself_raises(monkeypatch):
 
     assert spy.calls == ["stop", ("get_option", "run:parallel"), "save"]
     assert exits == [70]
+def _require_pytest_cov():
+    try:
+        import pytest_cov  # noqa: F401
+    except ImportError as exc:
+        if os.environ.get("AIRA_REAL_COVERAGE") == "1":
+            pytest.fail("AIRA_REAL_COVERAGE=1 but pytest-cov is unavailable: %s" % exc)
+        pytest.skip("real pytest-cov integration requires pytest-cov: %s" % exc)
+
+
+def test_exit_child_saving_a_real_pytest_cov_active_instance_does_not_disturb_the_parents_own_collector(tmp_path):
+    """Sol round-2, required: a spy-based test alone cannot prove the
+    pytest-cov integration -- it needs pytest-cov actually active.
+
+    Runs a REAL pytest sub-process with --cov AND --aitest-workers=2, and
+    asserts (a) the run completes cleanly, (b) the parent's own
+    pytest-cov-owned Coverage instance still completes its own combine
+    (a non-empty .coverage exists afterwards), and (c) a line executed ONLY
+    inside a forked worker -- never during collection or in the supervisor --
+    shows up as covered in the final combined data. That last part is what
+    proves the child's stop()/save() on the COW-shared Coverage object
+    mutated only the forked copy."""
+    _require_pytest_cov()
+    pylib_dir = os.path.dirname(os.path.dirname(os.path.abspath(worker_module.__file__)))
+
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "conftest.py").write_text('pytest_plugins = ("aitest",)\n')
+    # only_in_worker()'s BODY runs exclusively inside a forked worker: import
+    # (collection) touches the def line, but nothing in the supervisor ever
+    # calls it.
+    (suite / "worker_only.py").write_text(
+        "def only_in_worker():\n"
+        "    marker = 'executed-inside-the-forked-worker'\n"
+        "    return marker\n"
+    )
+    (suite / "test_cov.py").write_text(
+        "import worker_only\n"
+        "\n"
+        "def test_uses_worker_only():\n"
+        "    assert worker_only.only_in_worker() == 'executed-inside-the-forked-worker'\n"
+    )
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join([pylib_dir, str(suite)])
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # No daemon: the fallback (unconfined) worker path forks exactly the same
+    # way, which is all this test is about.
+    env["AIRA_AITEST_BOOTSTRAP_CMD"] = str(tmp_path / "missing-aira")
+    env.pop("AIRA_REAL_CGROUP", None)
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         "--aitest-workers=2", "--cov=worker_only", "--cov-report=term-missing",
+         "test_cov.py"],
+        cwd=str(suite), env=env, capture_output=True, text=True, timeout=300,
+    )
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, "real --cov run failed:\n%s" % output
+
+    data_file = suite / ".coverage"
+    assert data_file.exists(), "pytest-cov's own combined data file is missing:\n%s" % output
+    assert data_file.stat().st_size > 0, "pytest-cov's own combined data file is empty"
+
+    worker_only_row = [
+        line for line in output.splitlines() if line.startswith("worker_only.py")
+    ]
+    assert worker_only_row, "no coverage row for worker_only.py:\n%s" % output
+    assert "100%" in worker_only_row[0], (
+        "the worker-only line was NOT measured -- the forked child's "
+        "stop()/save() did not reach the combined data:\n%s" % output
+    )
+
+
+@pytest.fixture
+def clear_invalid_recycle_env_warnings():
+    worker_module._WARNED_INVALID_ENV_VARS.clear()
+    yield
+    worker_module._WARNED_INVALID_ENV_VARS.clear()
+
+
+def _assert_invalid_recycle_env_warns_once(monkeypatch, capsys, name, raw, scope_path, started_at, completed_count):
+    for env_name in (
+        "AIRA_AITEST_WORKER_MAX_SECONDS",
+        "AIRA_AITEST_WORKER_MAX_TESTS",
+        "AIRA_AITEST_WORKER_HIGH_WATERMARK_PCT",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setenv(name, raw)
+
+    assert _should_recycle(scope_path, started_at, completed_count) is True
+    stderr = capsys.readouterr().err
+    assert name in stderr
+    assert raw in stderr
+
+    assert _should_recycle(scope_path, started_at, completed_count) is True
+    assert capsys.readouterr().err == ""
+
+
+def test_should_recycle_uses_default_for_invalid_max_seconds(monkeypatch, capsys, clear_invalid_recycle_env_warnings):
+    _assert_invalid_recycle_env_warns_once(
+        monkeypatch,
+        capsys,
+        "AIRA_AITEST_WORKER_MAX_SECONDS",
+        "10m",
+        None,
+        time.monotonic() - _DEFAULT_MAX_SECONDS - 1,
+        0,
+    )
+
+
+def test_should_recycle_uses_default_for_invalid_max_tests(monkeypatch, capsys, clear_invalid_recycle_env_warnings):
+    _assert_invalid_recycle_env_warns_once(
+        monkeypatch,
+        capsys,
+        "AIRA_AITEST_WORKER_MAX_TESTS",
+        "two hundred",
+        None,
+        time.monotonic(),
+        _DEFAULT_MAX_TESTS,
+    )
+
+
+def test_should_recycle_uses_default_for_invalid_high_watermark(monkeypatch, capsys, tmp_path, clear_invalid_recycle_env_warnings):
+    scope_dir = tmp_path / "fake-scope"
+    scope_dir.mkdir()
+    (scope_dir / "memory.current").write_text("81")
+    (scope_dir / "memory.high").write_text("100")
+    _assert_invalid_recycle_env_warns_once(
+        monkeypatch,
+        capsys,
+        "AIRA_AITEST_WORKER_HIGH_WATERMARK_PCT",
+        "eighty percent",
+        str(scope_dir),
+        time.monotonic(),
+        0,
+    )
+
+
+def _clear_recycle_env(monkeypatch):
+    for env_name in (
+        "AIRA_AITEST_WORKER_MAX_SECONDS",
+        "AIRA_AITEST_WORKER_MAX_TESTS",
+        "AIRA_AITEST_WORKER_HIGH_WATERMARK_PCT",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+
+def test_should_recycle_uses_elapsed_time_default_in_both_directions(monkeypatch, clear_invalid_recycle_env_warnings):
+    _clear_recycle_env(monkeypatch)
+
+    assert _should_recycle(None, time.monotonic() - _DEFAULT_MAX_SECONDS - 1, 0) is True
+    assert _should_recycle(None, time.monotonic(), 0) is False
+
+
+def test_should_recycle_uses_memory_watermark_default_in_both_directions(tmp_path, monkeypatch, clear_invalid_recycle_env_warnings):
+    _clear_recycle_env(monkeypatch)
+    over_watermark = tmp_path / "over-watermark"
+    over_watermark.mkdir()
+    (over_watermark / "memory.current").write_text("90")
+    (over_watermark / "memory.high").write_text("100")
+    below_watermark = tmp_path / "below-watermark"
+    below_watermark.mkdir()
+    (below_watermark / "memory.current").write_text("50")
+    (below_watermark / "memory.high").write_text("100")
+
+    assert _should_recycle(str(over_watermark), time.monotonic(), 0) is True
+    assert _should_recycle(str(below_watermark), time.monotonic(), 0) is False
+
+
+def test_should_recycle_fails_open_for_unbounded_memory_high(tmp_path, monkeypatch, clear_invalid_recycle_env_warnings):
+    _clear_recycle_env(monkeypatch)
+    scope_dir = tmp_path / "unbounded-memory-high"
+    scope_dir.mkdir()
+    (scope_dir / "memory.current").write_text("90")
+    (scope_dir / "memory.high").write_text("max")
+
+    assert _should_recycle(str(scope_dir), time.monotonic(), 0) is False
+
+
+def test_should_recycle_fails_open_for_unreadable_memory_scope(tmp_path, monkeypatch, clear_invalid_recycle_env_warnings):
+    _clear_recycle_env(monkeypatch)
+
+    assert _should_recycle(str(tmp_path / "does-not-exist"), time.monotonic(), 0) is False
+
+
+def test_should_recycle_fails_open_for_nonpositive_memory_high(tmp_path, monkeypatch, clear_invalid_recycle_env_warnings):
+    _clear_recycle_env(monkeypatch)
+    scope_dir = tmp_path / "zero-memory-high"
+    scope_dir.mkdir()
+    (scope_dir / "memory.current").write_text("90")
+    (scope_dir / "memory.high").write_text("0")
+
+    assert _should_recycle(str(scope_dir), time.monotonic(), 0) is False
