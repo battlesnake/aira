@@ -264,9 +264,28 @@ stay **true and unchanged**; only the "no `--delegate-ram`" clause is false.
      `XDG_DATA_HOME` to `t.TempDir()` since extraction writes there
      (`extract.go:52-70`).
 
-3. **AIRA-77 ticket body** — append the verified trace (the ticket currently says
-   "not investigated further"), since this change's own recommendation is what
-   makes AIRA-77 bite.
+3. **AIRA-77 trace recorded** — the ticket says "not investigated further", and
+   this change's own recommendation is what makes AIRA-77 bite, so the verified
+   trace must be attached to it.
+
+   **Delivered as a structured finding, not a body edit** (wording revised after
+   the final gate flagged the original as undelivered). Ticket markdown is
+   untracked in the root checkout and absent from every feature worktree, so a
+   body edit cannot ride in this PR. The trace is instead recorded via
+   `aira finding add` against AIRA-77 — AIRA's own primitive for durable
+   evidence, queryable and attached to the ticket — plus an
+   `AIRA-71 relates AIRA-77` link. The finding also corrects AIRA-77's own
+   framing: the two mechanisms charge **different** ledgers, so the cost is
+   redundant reservation and slice contention, not one ledger double-booked.
+
+4. **`AIRA_AITEST_ESTIMATED_BYTES` units** (added after the final gate). The
+   variable is parsed `int(raw)` (`aitest/__init__.py:141-146`); a `4G`-style
+   value raises `ValueError` and silently falls back to the 512M default with
+   **no** warning, while only out-of-range integers warn. Every other size in
+   SKILL.md accepts K/M/G, so naming this variable without its units would
+   reproduce this ticket's own defect class. The default and the plain-integer
+   requirement are now documented and test-pinned. Making the malformed case
+   warn is code, and is correctly out of scope here.
 
 ### Explicitly out of scope (deferred, written down, never silent)
 

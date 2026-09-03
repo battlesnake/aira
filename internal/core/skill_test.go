@@ -507,6 +507,14 @@ func TestSkillAitestGuidanceRecommendsAnInvocationThatWorks(t *testing.T) {
 			// per test, and a delegate scope adopted after a daemon restart is
 			// reconstructed at live RSS plus margin.
 			"adds no slice-ledger charge",
+			// AIRA_AITEST_ESTIMATED_BYTES is parsed with int(raw)
+			// (internal/pylib/aitest/__init__.py:141-146): a "4G"-style value
+			// raises ValueError and silently falls back to the 512M default,
+			// with no warning at all (only out-of-range integers warn).
+			// Naming the variable without its units would reproduce this
+			// ticket's own defect class, so the units are pinned.
+			"PLAIN INTEGER BYTE COUNT",
+			"AIRA_AITEST_ESTIMATED_BYTES=4294967296",
 		} {
 			if !strings.Contains(section, want) {
 				t.Fatalf("%s aitest section missing %q", document.name, want)
