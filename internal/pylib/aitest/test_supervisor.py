@@ -1,3 +1,4 @@
+import errno
 import os
 import subprocess
 import threading
@@ -1559,3 +1560,47 @@ else:
     # min(worker_count=3, max_workers_fallback=5), minus the 1 already
     # running), never up to 5 on top of it.
     assert len(fallback_spawns) <= 2
+
+
+def test_cleanup_supervisor_scope_is_silent_on_ebusy(tmp_path, monkeypatch, capsys):
+    scope = str(tmp_path / ".aira-supervisor")
+    supervisor = Supervisor()
+    supervisor.supervisor_scope = scope
+
+    def raise_ebusy(path):
+        assert path == scope
+        raise OSError(errno.EBUSY, "Device or resource busy", path)
+
+    monkeypatch.setattr(supervisor_module.os, "rmdir", raise_ebusy)
+    supervisor._cleanup_supervisor_scope()
+
+    assert capsys.readouterr().err == ""
+
+
+def test_cleanup_supervisor_scope_still_reports_an_unexpected_errno(tmp_path, monkeypatch, capsys):
+    scope = str(tmp_path / ".aira-supervisor")
+    supervisor = Supervisor()
+    supervisor.supervisor_scope = scope
+
+    def raise_eperm(path):
+        raise OSError(errno.EPERM, "Operation not permitted", path)
+
+    monkeypatch.setattr(supervisor_module.os, "rmdir", raise_eperm)
+    supervisor._cleanup_supervisor_scope()
+
+    err = capsys.readouterr().err
+    assert "could not remove supervisor scope" in err
+    assert scope in err
+
+
+def test_cleanup_supervisor_scope_is_a_noop_without_a_supervisor_scope(monkeypatch, capsys):
+    supervisor = Supervisor()
+    assert supervisor.supervisor_scope is None
+
+    def fail_if_called(path):
+        raise AssertionError("rmdir must not be called when supervisor_scope is unset")
+
+    monkeypatch.setattr(supervisor_module.os, "rmdir", fail_if_called)
+    supervisor._cleanup_supervisor_scope()
+
+    assert capsys.readouterr().err == ""

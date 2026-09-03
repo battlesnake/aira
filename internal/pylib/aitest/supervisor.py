@@ -1,3 +1,4 @@
+import errno
 import os
 import select
 import subprocess
@@ -1001,33 +1002,50 @@ class Supervisor:
                     except BrokenPipeError:
                         pass  # already dead -- nothing to signal, retire below regardless
                     self._retire_worker(pid, state)
-        # Best-effort: rmdir the supervisor's OWN child scope this run
-        # relocated itself into (bootstrap, Task 2/3/11). The OUTER scope
-        # itself is `aira confine`'s own job to tear down when the whole
-        # launch process exits -- this is only about the new child scope
-        # aitest itself created. NOTE: in the real-cgroup case this
-        # typically still fails here (EBUSY) since the supervisor process
-        # calling rmdir is itself still a live member of the scope it is
-        # trying to remove -- it only ever succeeds AFTER this process
-        # exits, which is after this call returns. Attempted anyway because
-        # it is free and occasionally correct (e.g. non-real-cgroup test
-        # doubles).
-        #
-        # #72's orphaned-scope reaper IS the real backstop for the nested
-        # case this rmdir usually can't finish itself (a crashed
-        # supervisor/worker -- spec 3.6's normal, expected death-by-OOM
-        # path, where nothing here runs -- leaves live-then-dead child
-        # scopes under the outer scope). This was a real, confirmed gap
-        # for a while (the reaper only did a single-level rmdir, which the
-        # kernel refuses on a cgroup with live children, so nested orphans
-        # accumulated unbounded) -- fixed and deployed as AIRA-36
-        # (reapEmptyConfineScopeTree, internal/runner/confine_manage_linux.go,
-        # master 826f33b): whole-subtree-empty positive-proof-gated,
-        # fd-anchored, never touches a scope with a live worker anywhere
-        # in its subtree. Live-verified sweeping this exact nested shape.
-        if self.supervisor_scope:
-            try:
-                os.rmdir(self.supervisor_scope)
-            except OSError as exc:
-                sys.stderr.write("aira aitest: could not remove supervisor scope %s: %s\n" % (self.supervisor_scope, exc))
+        self._cleanup_supervisor_scope()
         return self.results
+
+    def _cleanup_supervisor_scope(self):
+        """Best-effort: rmdir the supervisor's OWN child scope this run
+        relocated itself into (bootstrap, Task 2/3/11). The OUTER scope
+        itself is `aira confine`'s own job to tear down when the whole
+        launch process exits -- this is only about the new child scope
+        aitest itself created. NOTE: in the real-cgroup case this
+        typically still fails here (EBUSY) since the supervisor process
+        calling rmdir is itself still a live member of the scope it is
+        trying to remove -- it only ever succeeds AFTER this process
+        exits, which is after this call returns. Attempted anyway because
+        it is free and occasionally correct (e.g. non-real-cgroup test
+        doubles).
+
+        #72's orphaned-scope reaper IS the real backstop for the nested
+        case this rmdir usually can't finish itself (a crashed
+        supervisor/worker -- spec 3.6's normal, expected death-by-OOM
+        path, where nothing here runs -- leaves live-then-dead child
+        scopes under the outer scope). This was a real, confirmed gap
+        for a while (the reaper only did a single-level rmdir, which the
+        kernel refuses on a cgroup with live children, so nested orphans
+        accumulated unbounded) -- fixed and deployed as AIRA-36
+        (reapEmptyConfineScopeTree, internal/runner/confine_manage_linux.go,
+        master 826f33b): whole-subtree-empty positive-proof-gated,
+        fd-anchored, never touches a scope with a live worker anywhere
+        in its subtree. Live-verified sweeping this exact nested shape.
+        """
+        if not self.supervisor_scope:
+            return
+        try:
+            os.rmdir(self.supervisor_scope)
+        except OSError as exc:
+            # EBUSY here is the EXPECTED outcome documented above (found live via
+            # fastest-ee-dc dogfooding, 2026-09-02: even with cgroup.procs already
+            # empty, cgroup-v2 destruction is not synchronous with the last process
+            # leaving -- the kernel's own deferred css-offline accounting can hold
+            # the directory busy for a brief settling window after this call, well
+            # before the #72/AIRA-36 reaper's grace period would ever consider it
+            # orphaned). Printing an alarming "could not remove" line for this on
+            # EVERY real-cgroup run trains users to ignore aitest's stderr output
+            # entirely, which is exactly the failure mode this project's honesty
+            # discipline exists to prevent for messages that ARE diagnostic. Any
+            # OTHER errno is still surfaced -- that is genuinely unexpected.
+            if exc.errno != errno.EBUSY:
+                sys.stderr.write("aira aitest: could not remove supervisor scope %s: %s\n" % (self.supervisor_scope, exc))
