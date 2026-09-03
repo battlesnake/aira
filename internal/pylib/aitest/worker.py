@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import time
@@ -18,6 +19,164 @@ _WARNED_INVALID_ENV_VARS = set()
 # same fact atomically with the result, closing the race described in
 # run_worker_loop's recycle branch above.
 _RECYCLE_SUFFIX = " __recycle_next__"
+
+# Every JSON event line a worker writes carries this explicit sentinel, and
+# supervisor.py's _drain_worker matches on it EXPLICITLY -- never on a bare
+# line.startswith("{") JSON-shape guess (Sol round-2: a pytest nodeid can in
+# principle legally begin with "{", so a shape guess is ambiguous against the
+# plain result line whose wire format Slice 2 must not change). \x01 is safe
+# here for a positive, verified reason rather than by assumption: pytest runs
+# every parametrized id through compat.ascii_escaped(), which translates
+# non-printable ASCII into a literal backslash-x-hex escape, so no real nodeid
+# can carry a raw \x01 -- and the remaining nodeid prefix is a filesystem path.
+# A (pathological) nodeid that DID start with \x01 would make its plain result
+# line take the malformed-event crash path: a fail-closed requeue/unevaluated,
+# never a silently misattributed result.
+_EVENT_LINE_PREFIX = "\x01"
+
+# Tuple-tagging codec markers. json.dumps/json.loads silently degrades every
+# tuple to a list, and pytest_report_from_serializable does NOT restore them
+# (that restoration only exists on execnet's own typed wire format, which xdist
+# uses) -- while junitxml's append_skipped does `assert isinstance(
+# report.longrepr, tuple)` (verified against the real installed
+# _pytest/junitxml.py). An untagged round trip therefore CRASHES the whole run
+# on the first real skip.
+_TUPLE_MARKER = "__aitest_tuple__"
+_ESCAPED_MARKER = "__aitest_escaped__"
+
+
+def _tag_tuples(obj):
+    if isinstance(obj, tuple):
+        return {_TUPLE_MARKER: [_tag_tuples(x) for x in obj]}
+    if isinstance(obj, list):
+        return [_tag_tuples(x) for x in obj]
+    if isinstance(obj, dict):
+        tagged = {k: _tag_tuples(v) for k, v in obj.items()}
+        if _TUPLE_MARKER in obj or _ESCAPED_MARKER in obj:
+            # A REAL dict that happens to already look like one of our
+            # markers must be escaped, or decoding it would silently turn
+            # it into a tuple (or unwrap a fake "escape") instead of the
+            # real dict it actually is. Wrapping is recursive-safe: an
+            # already-escaped dict containing another marker-shaped dict
+            # gets escaped again, one layer per occurrence, and _untag_tuples
+            # peels exactly one layer per marker it encounters.
+            return {_ESCAPED_MARKER: tagged}
+        return tagged
+    return obj
+
+
+def _untag_tuples(obj):
+    if isinstance(obj, dict):
+        if _ESCAPED_MARKER in obj and len(obj) == 1:
+            return {k: _untag_tuples(v) for k, v in obj[_ESCAPED_MARKER].items()}
+        if _TUPLE_MARKER in obj and len(obj) == 1:
+            return tuple(_untag_tuples(x) for x in obj[_TUPLE_MARKER])
+        return {k: _untag_tuples(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_untag_tuples(x) for x in obj]
+    return obj
+
+
+def _exit_child(code):
+    """The ONE exit path for a forked worker child -- replaces every bare
+    os._exit() in the child branches of worker.py, spawn_worker and
+    _spawn_fallback_worker.
+
+    Coverage responsibility, deliberately minimal (v3's "own nothing"
+    design): aitest makes NO assumption about how, or whether, coverage was
+    started. It never originates a coverage config, never calls
+    coverage.process_startup(), and NEVER calls combine() -- whoever started
+    coverage (pytest-cov, a bare `coverage run`, or nothing at all) owns all
+    of that, unchanged, exactly as it would for any other plugin's workers.
+    The single narrow thing aitest does owe is this: os._exit() is the one
+    call guaranteed to skip coverage's own normal atexit save, so if
+    something IS measuring in this process, stop and save it first.
+    coverage.py's own sqldata "Looks like we forked!" pid check then gives
+    the child its own data file, so this mutates only the forked copy.
+
+    LIMITATION, documented rather than silently assumed: a project using a
+    bare `coverage run -m pytest` with NO parallel-mode / data_suffix config
+    gets no correctness guarantee from this mechanism, because the child and
+    the parent would choose the SAME data filename and the child's own
+    first-use erase() would destroy what the parent already flushed (verified
+    live: a measurable coverage regression, not merely wasted work). That is
+    exactly why the save below is gated on the active instance's own
+    run:parallel option. A project wanting correct coverage across aitest
+    workers owns its OWN parallel-mode-aware coverage config -- precisely as
+    it already would for xdist."""
+    try:
+        import coverage
+        current = coverage.Coverage.current()
+        if current is not None:
+            current.stop()
+            if current.get_option("run:parallel"):
+                current.save()
+    except BaseException:
+        # Best-effort only -- this must never prevent the process from
+        # exiting. BaseException (v5, Fable's finding), not Exception: this
+        # is called from except BaseException handlers whose entire point
+        # is never falling through into the child's COW copy of the
+        # supervisor's own control flow -- a KeyboardInterrupt/SystemExit/
+        # MemoryError raised inside coverage's own save() must not escape
+        # this function and defeat that.
+        pass
+    finally:
+        os._exit(code)
+
+
+def _init_forked_child(config):
+    """Per-process re-initialisation every forked worker child must perform
+    before it runs ANY test. Called once at the top of run_worker_loop --
+    the single convergence point for BOTH fork sites (spawn_worker's
+    confined path and _spawn_fallback_worker's bare os.fork(), which never
+    calls fork_worker/place_self at all), so neither can be missed.
+
+    1. Unregister the COW-inherited terminalreporter. Otherwise the child
+       prints its own per-test progress line straight to the shared terminal
+       and, combined with the supervisor's own replay-driven terminalreporter
+       output, every test's progress prints TWICE.
+
+    2. Replace the COW-inherited global capture object. pytest's FDCaptureBase
+       creates ONE TemporaryFile per stream in the PARENT at session start and
+       dup2()s it onto real fd 1/2; os.fork() shares the underlying open file
+       DESCRIPTION -- including its current offset -- so every worker's
+       captured output writes into the SAME file at whatever position sibling
+       workers left it, and FDCapture.snap()'s seek(0)/read()/truncate() then
+       hands one test its siblings' output. Live-verified with 4 concurrent
+       workers each printing 20 tagged lines: one test's captured output held
+       73 lines, only 18 of them its own; another captured none of its own.
+       That is silently-WRONG <system-out>/<system-err> content attributed to
+       the wrong test -- exactly the failure class this whole feature exists
+       to prevent, and invisible in Slice 1 only because Slice 1 discarded
+       captured output entirely.
+
+    Do NOT "simplify" step 2 into capman.stop_global_capturing(): that public
+    method calls pop_outerr_to_orig() FIRST, which snaps the still-shared
+    capture file and writes it to the original stream -- stealing whatever
+    sibling workers have written into it mid-test (a real risk: _replace_worker
+    forks a NEW worker while other workers are mid-test). The sequence below
+    instead DISCARDS the inherited (shared, corrupt-by-construction) object
+    without reading it, then lets start_global_capturing() create genuinely
+    fresh, per-process capture files.
+
+    Run this unconditionally, every time -- do NOT gate it on the capture
+    method being "fd". The sys/tee-sys/no modes are unaffected by the
+    underlying bug (in-memory, COW-private buffers rather than a shared
+    fd-backed file), but this sequence is correct for them too via their own
+    stop_capturing()/start_global_capturing() machinery, and a mode-conditional
+    branch would add risk for no benefit."""
+    pm = config.pluginmanager
+    terminalreporter = pm.get_plugin("terminalreporter")
+    if terminalreporter is not None:
+        pm.unregister(terminalreporter)
+    capman = pm.get_plugin("capturemanager")
+    if capman is not None:
+        old = capman._global_capturing
+        if old is not None:
+            capman._global_capturing = None
+            old.stop_capturing()
+        capman.start_global_capturing()
+        capman.suspend_global_capture()
 
 
 def _read_cgroup_int(scope_path, filename):
@@ -120,7 +279,7 @@ def fork_worker(scope_path):
         try:
             place_self(scope_path)
         except BaseException:
-            os._exit(70)
+            _exit_child(70)
         return 0, True
     return pid, False
 
@@ -136,15 +295,35 @@ def place_self(scope_path):
 
 class _OutcomeCollector:
     """Captures the worst-of outcome across setup/call/teardown reports for
-    one pytest_runtest_protocol call. Registered on item.config.pluginmanager
-    only for the duration of that one call -- see run_one."""
+    one pytest_runtest_protocol call, AND records the full ordered event
+    stream (logstart, every TestReport, logfinish) the supervisor replays
+    into its own real pytest hooks. Registered on item.config.pluginmanager
+    only for the duration of that one call -- see run_one.
+
+    Reports are serialized here, in the child, via pytest's own
+    pytest_report_to_serializable hook (cited by NAME, never by line number
+    -- those drift by version and were wrong in more than one earlier draft
+    of this design). logstart/logfinish are forwarded separately, exactly as
+    xdist forwards them."""
 
     _RANK = {"passed": 0, "skipped": 1, "failed": 2, "error": 3}
 
-    def __init__(self):
+    def __init__(self, config):
         self.worst = "passed"
+        self.events = []
+        self._config = config
+
+    def pytest_runtest_logstart(self, nodeid, location):
+        self.events.append({"kind": "logstart", "nodeid": nodeid, "location": location})
+
+    def pytest_runtest_logfinish(self, nodeid, location):
+        self.events.append({"kind": "logfinish", "nodeid": nodeid, "location": location})
 
     def pytest_runtest_logreport(self, report):
+        data = self._config.hook.pytest_report_to_serializable(
+            config=self._config, report=report
+        )
+        self.events.append({"kind": "report", "nodeid": report.nodeid, "data": data})
         outcome = report.outcome if report.outcome in self._RANK else "failed"
         # Pytest's terminal reporter calls setup/teardown failures "errors",
         # reserving "failed" for a failure in the test call itself.
@@ -156,8 +335,10 @@ class _OutcomeCollector:
 
 def run_one(item):
     """Executes one already-collected pytest Item through pytest's own item
-    protocol (setup/call/teardown), returning "passed", "failed", "skipped",
-    or "error".
+    protocol (setup/call/teardown), returning
+    (outcome, events) -- outcome being "passed", "failed", "skipped", or
+    "error", and events the ordered list of serializable dicts the
+    supervisor replays into its own real pytest hooks (Slice 2).
 
     UNCERTAIN, flagged for verification during implementation: calling
     item.ihook.pytest_runtest_protocol(item=item, nextitem=None) directly,
@@ -179,7 +360,7 @@ def run_one(item):
     dispatch is deferred, a candidate for a later slice (see this task's own
     Interfaces note and the test proving this behavior below).
     """
-    collector = _OutcomeCollector()
+    collector = _OutcomeCollector(item.config)
     plugin_manager = item.config.pluginmanager
     plugin_manager.register(collector, name="aitest-outcome-collector")
     try:
@@ -187,15 +368,26 @@ def run_one(item):
     finally:
         plugin_manager.unregister(collector)
     if collector.worst == "passed":
-        return "passed"
-    if collector.worst == "skipped":
-        return "skipped"
-    if collector.worst == "failed":
-        return "failed"
-    return "error"
+        outcome = "passed"
+    elif collector.worst == "skipped":
+        outcome = "skipped"
+    elif collector.worst == "failed":
+        outcome = "failed"
+    else:
+        outcome = "error"
+    return outcome, collector.events
 
 
 def run_worker_loop(scope_path, items_by_nodeid, pipe_in, pipe_out):
+    # The single convergence point for BOTH fork sites -- spawn_worker's
+    # confined path (which goes through fork_worker/place_self) and
+    # _spawn_fallback_worker's separate bare os.fork() (which does not).
+    # Child-init MUST live here, not beside either fork call, or the fallback
+    # workers -- the exact path the fd-capture P0 was first found on -- would
+    # stay contaminated.
+    for item in items_by_nodeid.values():
+        _init_forked_child(item.config)
+        break
     started_at = time.monotonic()
     completed_count = 0
     for line in pipe_in:
@@ -205,9 +397,28 @@ def run_worker_loop(scope_path, items_by_nodeid, pipe_in, pipe_out):
         if nodeid == "__stop__":
             break
         item = items_by_nodeid[nodeid]
-        outcome = run_one(item)
+        outcome, events = run_one(item)
         completed_count += 1
         recycling = _should_recycle(scope_path, started_at, completed_count)
+        # Every event line goes out BEFORE this nodeid's plain result line,
+        # into the same stream, with ONE flush after the result line: the
+        # supervisor's stage-then-replay contract depends on never seeing the
+        # result line ahead of the events it confirms.
+        #
+        # default=str is required, not optional (v5/v6): a test calling
+        # record_property("x", <non-JSON-serializable object>) otherwise makes
+        # json.dumps raise TypeError inside this child's own hookimpl, which
+        # propagates out through run_one into the broad
+        # `except BaseException: _exit_child(70)` guard and kills the WORKER --
+        # turning a genuinely PASSING test into "unevaluated" once the retry
+        # crashes the same way. str, NOT repr: the real installed junitxml
+        # plugin applies str(propvalue) to a property value, so repr would
+        # silently emit DIFFERENT XML than a plain, non-aitest run for any
+        # object whose __str__/__repr__ differ.
+        for event in events:
+            pipe_out.write(
+                _EVENT_LINE_PREFIX + json.dumps(_tag_tuples(event), default=str) + "\n"
+            )
         # The recycle decision rides in the SAME line as the result, not a
         # separate write -- two independent write()+flush() calls left a
         # real window (not just a buffering artifact; a genuine scheduling

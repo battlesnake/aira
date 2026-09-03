@@ -1,11 +1,12 @@
 import errno
+import json
 import os
 import select
 import subprocess
 import sys
 import time
 
-from aitest.worker import _RECYCLE_SUFFIX, fork_worker, run_worker_loop
+from aitest.worker import _EVENT_LINE_PREFIX, _RECYCLE_SUFFIX, _exit_child, _untag_tuples, fork_worker, run_worker_loop
 
 
 _STOP_LINE = "__stop__"
@@ -493,7 +494,8 @@ class Supervisor:
         fallback/retry/terminal-queue policy for each.
 
         Safety: the ENTIRE forked-child branch below is wrapped in one
-        broad try/except that os._exit()s on ANY exception. A forked child
+        broad try/except that _exit_child()s (worker.py's coverage-safe
+        os._exit wrapper) on ANY exception. A forked child
         must never be allowed to fall through to normal Python control
         flow / interpreter shutdown -- that risks running supervisor-level
         cleanup code fully UNCONFINED. (place_self() itself is separately
@@ -524,8 +526,8 @@ class Supervisor:
                 pipe_out.flush()
                 run_worker_loop(grant["scope"], self.items_by_nodeid, pipe_in, pipe_out)
             except BaseException:
-                os._exit(70)
-            os._exit(0)
+                _exit_child(70)
+            _exit_child(0)
         os.close(dispatch_read)
         os.close(result_write)
         # result_read is handled as a RAW fd with manual line-buffering
@@ -584,7 +586,8 @@ class Supervisor:
         execution loop with scope_path=None. The already-emitted
         _disable_daemon warning is the ONLY notice; never warn again per
         worker. Wrapped the same way spawn_worker (Task 13) is: the entire
-        forked-child branch os._exit()s on any exception rather than ever
+        forked-child branch _exit_child()s (worker.py's coverage-safe
+        os._exit wrapper) on any exception rather than ever
         falling through to normal Python control flow, and every OTHER
         already-known worker's fds are closed before this child does
         anything else (same fd-inheritance hazard as spawn_worker -- this
@@ -602,8 +605,8 @@ class Supervisor:
                 pipe_out = os.fdopen(result_write, "w")
                 run_worker_loop(None, self.items_by_nodeid, pipe_in, pipe_out)
             except BaseException:
-                os._exit(70)
-            os._exit(0)
+                _exit_child(70)
+            _exit_child(0)
         os.close(dispatch_read)
         os.close(result_write)
         # Same raw-fd, non-blocking treatment as spawn_worker (Task 13) --
@@ -668,6 +671,9 @@ class Supervisor:
                 if nodeid is None:
                     continue
                 state["in_flight"] = nodeid
+                # Fresh staging buffer per dispatch -- nothing a previous
+                # nodeid left behind may ever be replayed against this one.
+                state["pending_events"] = []
                 try:
                     state["dispatch_write"].write(nodeid + "\n")
                     state["dispatch_write"].flush()
@@ -880,6 +886,38 @@ class Supervisor:
         crashed with no trailing result at all."""
         lines = _drain_available_lines(state["result_fd"], state)
         for line in lines:
+            if line.startswith(_EVENT_LINE_PREFIX):
+                # A Slice 2 event line: STAGE it against the current in-flight
+                # nodeid, never replay it here. Nothing from this batch may
+                # reach a real pytest hook until (a) the whole batch has been
+                # validated/deserialized AND (b) this nodeid's plain result
+                # line has been confirmed -- both, not either. Staging is what
+                # makes replay crash-atomic: a worker that dies before its
+                # result line leaves its staged batch discarded with the
+                # worker's own state dict, so a later retry's events can never
+                # be replayed twice.
+                #
+                # An event line with NOTHING in flight, or one whose JSON does
+                # not even parse, takes the crash path IMMEDIATELY (v5, Fable's
+                # precision fix) rather than being staged for the later batch
+                # check to catch: it keeps the crash diagnostic accurate about
+                # where things actually went wrong.
+                if state["in_flight"] is None:
+                    sys.stderr.write(
+                        "aira aitest: worker %d sent a report event with no test in flight; "
+                        "treating worker as crashed\n" % pid
+                    )
+                    return self._handle_worker_exit(pid, state)
+                try:
+                    event = json.loads(line[len(_EVENT_LINE_PREFIX):])
+                except ValueError as exc:
+                    sys.stderr.write(
+                        "aira aitest: worker %d sent an unparseable report event while running %r "
+                        "(%s); treating worker as crashed\n" % (pid, state["in_flight"], exc)
+                    )
+                    return self._handle_worker_exit(pid, state)
+                state.setdefault("pending_events", []).append(event)
+                continue
             recycling = line.endswith(_RECYCLE_SUFFIX)
             if recycling:
                 line = line[: -len(_RECYCLE_SUFFIX)]
@@ -902,6 +940,7 @@ class Supervisor:
                     % (pid, nodeid, state["in_flight"])
                 )
                 return self._handle_worker_exit(pid, state)
+            state["pending_events"] = []
             self.results[nodeid] = outcome
             state["in_flight"] = None
             if recycling:
