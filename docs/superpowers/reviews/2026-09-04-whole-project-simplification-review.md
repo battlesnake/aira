@@ -971,6 +971,20 @@ rewrite=true)` never called with `true`; three no-op branches
 `i`/`B` suffixes) governs every CLI flag. `memory_headroom: "1.5G"` is refused
 while `--memory-max 1.5G` is accepted. P1 makes it one parser.
 
+### B16 — The git hooks run an unconfined `go vet`/`go build` against the shared root checkout on every commit and push from any worktree (MEDIUM, observed)
+
+`core.hooksPath` is `/home/mark/claude/aira/.githooks`; `pre-commit` is
+`exec make -C "$ROOT_DIR" fmt-check vet build` and `pre-push` runs the full
+suite, both with `ROOT_DIR` resolved from the hook file's own location — the
+root checkout — regardless of which worktree is committing. Committing this
+Markdown file failed `fmt-check` on another session's unformatted
+`internal/daemon/server.go` in the root tree, and the build it would have run
+is exactly the heavy, unconfined Go work `CLAUDE.md` forbids outside
+`aira confine`. The pre-push half was already known tonight; the pre-commit
+half is the same flaw one step earlier. Fix: resolve `ROOT_DIR` from
+`git rev-parse --show-toplevel` of the committing worktree and wrap the heavy
+targets in `aira confine --`, or drop the hooks in favour of CI.
+
 ### Adjacent to PR #7 (noted, not re-derived)
 
 - **Peak-RSS history is mostly singletons.** 5,103 of 10,253
