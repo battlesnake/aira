@@ -181,6 +181,37 @@ func reapOrphanedConfineScopesWithDeps(ctx context.Context, slicePath string, gr
 	return result, nil
 }
 
+// ReapScopeIfEmpty attempts to physically remove ONE named scope's
+// directory tree via the exact fd-anchored, kernel-enforced removal every
+// other reap path in this file uses (reapEmptyConfineScopeTree). Success
+// is authoritative, fresh, subtree-aware, TOCTOU-immune proof the scope
+// was genuinely, fully empty at removal time -- the kernel itself refuses
+// Unlinkat(AT_REMOVEDIR) on anything non-empty, anywhere in the subtree,
+// even if it was proven empty a moment earlier (see
+// TestReapScopeIfEmptyDoesNotRemoveAScopeRepopulatedAfterTheEmptyProof).
+// Failure means "not empty (yet)"; callers must never treat it as an
+// error to escalate, only as "try again later, if at all."
+//
+// This proves ONLY that the scope was empty at removal time -- it does
+// NOT prove the scope's owner will never populate it later (a scope can
+// be genuinely, temporarily empty mid-launch, before its process is
+// placed into it). Callers making an irreversible decision (releasing an
+// admission lease, e.g.) from a successful reap MUST additionally gate on
+// an age signal immune to queueing/launch delay -- see AIRA-49's
+// admitWaiter.grantedAt for why enqueue time and directory-mtime-derived
+// age were both found unsafe for this across three review rounds.
+func ReapScopeIfEmpty(slicePath, scopeID string, afterEmptyProof func()) (bool, error) {
+	if !validConfineScopeID(scopeID) {
+		return false, fmt.Errorf("invalid scope id")
+	}
+	parentFD, err := unix.Open(slicePath, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return false, fmt.Errorf("open confine slice: %w", err)
+	}
+	defer unix.Close(parentFD)
+	return reapEmptyConfineScopeTree(parentFD, ".aira-"+scopeID, afterEmptyProof)
+}
+
 type confineReapTree struct {
 	name     string
 	dir      *os.File
