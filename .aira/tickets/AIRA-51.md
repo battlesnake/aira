@@ -1,0 +1,10 @@
+---
+{"schema":1,"id":"AIRA-51","project":"aira","title":"confine's \"waiting for admission\" progress line shows a stale reserve that disagrees with what's actually granted","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["confine","dogfood","ux"],"hold":false,"relations":[]}
+---
+Surfaced during AIRA-31's build: `aira confine -- python3 -m pytest -q internal/pylib/aitest/` (no estimator history for that exact argv) printed `confine: waiting for memory admission on aira.slice (reserve 4G, waited Ns)` repeatedly while queued (20+ minutes under real contention that day — three jobs holding 41.7G of a 63.2G ceiling), but the job's own eventual grant, reported in the same run's final confine summary line, was `reserve=243094323` (~232MB) — the waiting message and the actually-granted reserve disagree by roughly 17x.
+
+A DIFFERENT invocation of the same underlying test suite with `-p no:cacheprovider` (a different argv signature, which DID have estimator history) was correctly sized at 232MB from the start, with no long wait — confirming the 4G figure in the waiting message wasn't a fluke; it's whatever the (unpinned, no-history) request initially asked for, not what the daemon actually ends up granting once evaluated/admitted.
+
+This is misleading to an operator (or an agent) watching the progress line: "waiting on a 4G reserve" reads as "this job needs 4G and the slice is genuinely that tight," when the job's real footprint turned out to be ~232MB — a completely different picture of what's actually contending for the slice. Worth checking whether the initial estimate itself is the problem (an overly conservative no-history default, relates AIRA-24/AIRA-49's build-review dogfood note about oversized-estimate head-of-line blocking) or just the progress line failing to reflect a resize/re-evaluation that happens before the actual grant — these may be two different bugs wearing one symptom.
+
+Not investigated further — a dogfood observation from AIRA-31's build run, not this ticket's own root-cause analysis. relates AIRA-24, AIRA-49.
