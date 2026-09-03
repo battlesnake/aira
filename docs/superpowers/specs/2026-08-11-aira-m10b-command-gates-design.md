@@ -325,6 +325,13 @@ M10b initially supports:
 |---|---|---|
 | `go-negate-assertion` | Relative file path, exact test function name, assertion occurrence number | Negates the selected boolean assertion using a fixed AST transformation. |
 | `go-inject-failing-test` | Relative package directory, reviewed test name | Adds a fixed-template test whose assertion is always false. |
+| `inject-file` | Relative target path, literal file body (bounded, UTF-8) | Creates the named file with the declared body. Create-only: an existing target is refused, never overwritten. |
+
+Both `go-` kinds drive `go/parser` over `.go` files. Until `inject-file` existed they were the whole union, so a command gate in any other toolchain could never reach a canary-proven pass: the required canary could not fire, and `E_GATE_CANARY_DID_NOT_FIRE` is a hard fail rather than `unevaluated`. `inject-file` is the language-agnostic kind that closes that gap (AIRA-55). Its body is literal file bytes written verbatim into the isolated snapshot — never a patch, script, or command the evaluator interprets — so the union stays closed and this section's no-executable-content rule holds.
+
+`inject-file` yields a weaker proof than `go-inject-failing-test`, and a declaration must be authored knowing it. `go-inject-failing-test` injects a compiling, failing test, so its fire proves the whole test-failure-to-nonzero-exit pathway; `inject-file` proves only that the declared perturbation produces a nonzero exit. A declaration should therefore inject a compiling, failing test in the subject's own language: a body that merely breaks the build proves only that the build breaks. The honest-mistake false pass this admits is a `make test` recipe that aborts on a compile error but swallows real test failures — it fires on a syntax-broken injection and would never fire on a failing test, so the lane earns a trusted pass it cannot back. This is a documented, accepted limitation of the kind, not a defect in the fold.
+
+A target path matched by the subject's git excludes (its own `.gitignore`, or the user's `core.excludesFile`) never reaches the checker's tracked-snapshot view and so produces `E_GATE_CANARY_DID_NOT_FIRE` rather than a pass.
 
 The seed also contains:
 
@@ -546,6 +553,8 @@ Tests are TDD additions to the M10a matrix. Every confirmed counterexample becom
 
 49. `go-negate-assertion` changes only the selected assertion in the isolated copy.
 50. `go-inject-failing-test` uses the fixed failing-test template.
+50a. `inject-file` creates only its declared target in the isolated copy, creates any missing parent directory, and refuses an existing target rather than overwriting it, so the mutation is provably additive.
+50b. An `inject-file` target the subject's git excludes match never reaches the checker and produces `E_GATE_CANARY_DID_NOT_FIRE`.
 51. The same command argv, cwd, environment, timeout, cap, parser, and predicate are used for the mutation run.
 52. A mutation causing nonzero exit fires an `exit-zero` canary.
 53. A mutation causing `tests-green` to fail fires a `tests-green` canary.

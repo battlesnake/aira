@@ -244,6 +244,71 @@ func TestMutationSeedIsClosedAndRequiresFail(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-55 — inject-file is the language-agnostic mutation kind, its
+// seed stays a closed union, and its injected body is authenticated by the
+// declaration digest so a mutation cannot be swapped under a stable digest.
+func TestInjectFileMutationSeedIsClosedAndDigestCoversContent(t *testing.T) {
+	body := "#[test]\nfn aira_canary() { panic!(\"AIRA mutation\"); }\n"
+	base := CanaryDeclaration{SchemaVersion: 1, ID: "inject-canary", GateID: "unit-command", Mode: CanaryMutation,
+		ExpectedGateResult: VerdictFail, LaneBinding: "local", Isolation: IsolationTempGit, Cadence: CadenceOnDemand,
+		Mutation: &MutationSeed{SchemaVersion: 1, Kind: "inject-file", Seed: 3, File: "tests/aira_canary.rs", Content: body, ExpectedResult: VerdictFail}}
+	if err := ValidateCanary(base); err != nil {
+		t.Fatalf("valid inject-file seed rejected: %v", err)
+	}
+	for name, edit := range map[string]func(*MutationSeed){
+		"empty content":       func(m *MutationSeed) { m.Content = "" },
+		"oversized content":   func(m *MutationSeed) { m.Content = strings.Repeat("x", maxMutationContentBytes+1) },
+		"invalid utf8":        func(m *MutationSeed) { m.Content = "\xff\xfe" },
+		"empty file":          func(m *MutationSeed) { m.File = "" },
+		"absolute file":       func(m *MutationSeed) { m.File = "/etc/passwd" },
+		"parent escape":       func(m *MutationSeed) { m.File = "../outside" },
+		"git segment":         func(m *MutationSeed) { m.File = ".git/hooks/pre-commit" },
+		"nested git segment":  func(m *MutationSeed) { m.File = "tests/.git/x" },
+		"nul in file":         func(m *MutationSeed) { m.File = "tests/a\x00b" },
+		"cross-kind pkgdir":   func(m *MutationSeed) { m.PkgDir = "." },
+		"cross-kind testname": func(m *MutationSeed) { m.TestName = "TestInjected" },
+		"cross-kind test":     func(m *MutationSeed) { m.Test = "TestSomething" },
+		"cross-kind occurs":   func(m *MutationSeed) { m.Occurrence = 1 },
+		"expected pass":       func(m *MutationSeed) { m.ExpectedResult = VerdictPass },
+	} {
+		candidate := base
+		mutation := *base.Mutation
+		edit(&mutation)
+		candidate.Mutation = &mutation
+		err := ValidateCanary(candidate)
+		if err == nil || !strings.HasPrefix(err.Error(), "E_GATE_CANARY_INVALID") {
+			t.Fatalf("%s accepted: %v", name, err)
+		}
+	}
+	// The Go kinds must reject the new field too, or ignored cross-kind data
+	// silently becomes valid and the union stops being closed.
+	for _, seed := range []MutationSeed{
+		{SchemaVersion: 1, Kind: "go-inject-failing-test", PkgDir: ".", TestName: "TestInjected", Content: body, ExpectedResult: VerdictFail},
+		{SchemaVersion: 1, Kind: "go-negate-assertion", File: "value_test.go", Test: "TestValue", Occurrence: 1, Content: body, ExpectedResult: VerdictFail},
+	} {
+		candidate := base
+		candidate.Mutation = &seed
+		if err := ValidateCanary(candidate); err == nil {
+			t.Fatalf("%s accepted a content field", seed.Kind)
+		}
+	}
+	baseDigest, err := base.DeclarationDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	swapped := base
+	mutation := *base.Mutation
+	mutation.Content = "#[test]\nfn aira_canary() { panic!(\"swapped body\"); }\n"
+	swapped.Mutation = &mutation
+	swappedDigest, err := swapped.DeclarationDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if swappedDigest == baseDigest {
+		t.Fatal("declaration digest does not cover the injected mutation content")
+	}
+}
+
 func TestSyntheticRatchetCanaryRequiresActualNewFailure(t *testing.T) {
 	base := CanaryDeclaration{SchemaVersion: 2, ID: "ratchet-canary", GateID: "ratchet", Mode: CanarySyntheticRatchet,
 		BaselineFailing: []string{"A"}, CurrentFailing: []string{"A", "B"}, Expected: "regressed",
