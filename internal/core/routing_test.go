@@ -586,12 +586,6 @@ func routingFixtures(descriptors []DispatchDescriptor, findingID string) []Reque
 			base["selector"] = findingID
 			base["by"] = "source"
 			base["requirement"] = "AR-1"
-		case "gate":
-			// The single gate fixture is the "add" subverb, which is now a real
-			// creation verb and refuses to overwrite an existing definition.
-			// Point it at an id the seed does not define, so the fixture
-			// exercises creation instead of colliding with command-fixture.
-			base["gate_id"] = "routing-created-gate"
 		case "req":
 			base["selector"] = "AR-1"
 			base["status"] = "built"
@@ -662,6 +656,13 @@ func routingFixtures(descriptors []DispatchDescriptor, findingID string) []Reque
 				}
 			case "gate":
 				switch operation.Name {
+				case "add":
+					// add is a real creation verb and refuses to overwrite an
+					// existing definition, so it needs an id the seed does not
+					// define. Only add is retargeted: run and the rest still
+					// need the seeded command-fixture gate, which has a canary
+					// and so actually reaches the execution sentinel.
+					args["gate_id"] = "routing-created-gate"
 				case "attest":
 					args["gate_id"] = "manual-fixture"
 					args["verdict"] = "fail"

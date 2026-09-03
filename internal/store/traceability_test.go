@@ -335,7 +335,17 @@ func TestTraceabilityNoRequirementPrefixPreservesMalformedFinding(t *testing.T) 
 	if len(report.Findings) != 1 || report.Findings[0].Code != "E_REQUIREMENT_INVALID" || report.Findings[0].Subject != ".aira/requirements/AR-1.md" || report.Findings[0].Message != "E_REQUIREMENT_INVALID: missing requirement frontmatter" {
 		t.Fatalf("no-prefix malformed findings=%#v", report.Findings)
 	}
-	if len(report.UnevaluatedFindings) != 1 || report.UnevaluatedFindings[0].Code != "U_TRACE_EMPTY" || report.UnevaluatedFindings[0].Subject != "traceability" || report.UnevaluatedFindings[0].Message != "requirement registry is empty" {
+	// Scoped to the dimension under test: this fixture also defines no gates,
+	// which now honestly contributes its own U_GATE_SET_EMPTY finding instead
+	// of a fabricated pass, so an exact whole-list length check would assert
+	// something this test is not about.
+	traceUnevaluated := []CheckFinding{}
+	for _, finding := range report.UnevaluatedFindings {
+		if finding.Subject == "traceability" {
+			traceUnevaluated = append(traceUnevaluated, finding)
+		}
+	}
+	if len(traceUnevaluated) != 1 || traceUnevaluated[0].Code != "U_TRACE_EMPTY" || traceUnevaluated[0].Message != "requirement registry is empty" {
 		t.Fatalf("no-prefix empty diagnostic=%#v", report.UnevaluatedFindings)
 	}
 	result, err := s.ComputeGauge("traceability-status")
