@@ -143,6 +143,35 @@ func TestGovernorPerTestReservationsAreNotStalledByALargeNeighbourHead(t *testin
 	}
 	settle()
 
+	// All eight must actually be ENQUEUED before the clock advances, or scheduling
+	// could let them arrive during the yield and the test would prove nothing
+	// about the freeze at all.
+	queuedNow := func() int {
+		server.admitRegistryMu.Lock()
+		queue := server.admitQueues["/slice"]
+		server.admitRegistryMu.Unlock()
+		if queue == nil {
+			return 0
+		}
+		queue.mu.Lock()
+		defer queue.mu.Unlock()
+		count := 0
+		for _, waiter := range queue.waiters {
+			if waiter != nil && waiter.state == admitQueued && waiter.reserve == gib {
+				count++
+			}
+		}
+		return count
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for queuedNow() < len(perTest) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+		settle()
+	}
+	if got := queuedNow(); got != len(perTest) {
+		t.Fatalf("only %d/%d per-test reservations were queued before the clock advanced; the freeze was never actually exercised", got, len(perTest))
+	}
+
 	// While the freeze holds, they are blocked. This is the CORRECT half of the
 	// mechanism — head-of-line protection — and must survive the fix.
 	if granted := grantsOf(gib); granted != 0 {

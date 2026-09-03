@@ -125,9 +125,15 @@ func TestConfineCapsPinnedReserveOnNonDaemonAdmissionPaths(t *testing.T) {
 		// Unpinned: the client holds only its own guess, and enforcing a guess as
 		// a hard cap would OOM-kill jobs that succeed today. Deliberately uncapped.
 		{name: "fallback unevaluated, unpinned", state: "unevaluated", reserve: 0, pinned: false, wantCap: 0},
-		// Below the floor the pinned value is a token, not a containment request:
+		// PROVENANCE: a positive reserve the caller did not DECLARE must not become
+		// a hard cap. confine_linux.go widens `pinned` to true for any positive
+		// reserve, so the post-widening flag cannot be used here. This is the exact
+		// shape of the three real-cgroup tests that a provenance-blind version of
+		// this fix killed with a 1-byte memory.max.
+		{name: "positive reserve that was never declared", state: "unevaluated", reserve: 8 << 20, pinned: false, wantCap: 0},
+		// Below the floor a declared value is a token, not a containment request:
 		// capping at it could only kill the job at launch.
-		{name: "pinned below the floor is a sentinel", state: "unevaluated", reserve: 1, pinned: true, wantCap: 0},
+		{name: "declared below the floor is a sentinel", state: "unevaluated", reserve: 1, pinned: true, wantCap: 0},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var gotCap int64

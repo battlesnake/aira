@@ -444,6 +444,14 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	}
 
 	reserve := request.MemoryReserve
+	// declaredReserve records PROVENANCE and must be read before the widening on
+	// the next line: `pinned` is about to become true for ANY positive reserve, so
+	// afterwards it can no longer distinguish "the caller declared this number" from
+	// "the caller passed some number". Only a declared value may become a hard
+	// scope memory.max on the non-daemon paths — a token reserve enforced as a cap
+	// contains nothing and merely OOM-kills the job at launch (three real-cgroup
+	// tests passing MemoryReserve: 1 caught exactly that during this build).
+	declaredReserve := request.MemoryReservePinned
 	pinned := request.MemoryReservePinned || reserve > 0
 	if reserve <= 0 {
 		if request.DelegateRAM {
@@ -604,7 +612,19 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// memory.max contains nothing while killing the job at launch. The existing
 	// runner suite caught exactly that — three real-cgroup tests pass
 	// MemoryReserve: 1 to enable admission and were killed with "pid absent".
-	if !request.DelegateRAM && scopeMemoryMax <= 0 && request.MemoryReservePinned && request.MemoryReserve >= MinPinnedScopeCap {
+	// Keyed on declaredReserve (captured before `pinned` was widened at :447), not
+	// on request.MemoryReservePinned, which by here is true for any positive
+	// reserve and so cannot tell a deliberate cap from a token value.
+	//
+	// MinPinnedScopeCap is a safety valve on top of that provenance: a declared
+	// reserve below the minimum the CLI itself accepts cannot be a real
+	// containment request, and enforcing it could only OOM-kill the job at launch.
+	// Residual, documented gap: a PROGRAMMATIC caller that explicitly declares a
+	// sub-1MiB reserve is capped on the daemon path (:618, unchanged) but not
+	// here. The CLI cannot produce such a request (main.go rejects below 1MiB),
+	// and refusing it outright at the runner boundary is the better long-term
+	// answer — filed separately rather than widened into this change.
+	if !request.DelegateRAM && scopeMemoryMax <= 0 && declaredReserve && request.MemoryReserve >= MinPinnedScopeCap {
 		scopeMemoryMax = request.MemoryReserve
 	}
 	// An UNPINNED reserve stays restricted to an ADMITTED (accounted) daemon

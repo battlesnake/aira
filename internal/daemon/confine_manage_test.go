@@ -160,7 +160,10 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		wantJobs := jobs + adoptedJobs
 		// Ceiling scales headroom by TOTAL admitted jobs (outstanding+adopted)+1.
 		wantCeiling := maximum - base - int64(jobs+adoptedJobs+1)*supervisor
-		if got := *result.SliceReserve; got != (runner.ConfineSliceReserve{GrantedBytes: granted + adopted, CeilingBytes: wantCeiling, Jobs: wantJobs}) {
+		// Queued/FreezePhase are the AIRA-59 diagnostics. This fixture has no
+		// queued waiters, so a KNOWN zero and "idle" are the correct report —
+		// never "unevaluated", which is reserved for state that cannot be read.
+		if got := *result.SliceReserve; got != (runner.ConfineSliceReserve{GrantedBytes: granted + adopted, CeilingBytes: wantCeiling, Jobs: wantJobs, Queued: 0, FreezePhase: "idle"}) {
 			t.Fatalf("slice reserve=%+v, want granted=%d ceiling=%d jobs=%d", got, granted+adopted, wantCeiling, wantJobs)
 		}
 	})
@@ -178,7 +181,7 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 			t.Fatalf("response=%+v result=%+v", response, result)
 		}
 		wantCeiling := maximum - base - int64(adoptedJobs+1)*supervisor
-		if got := *result.SliceReserve; got != (runner.ConfineSliceReserve{GrantedBytes: adopted, CeilingBytes: wantCeiling, Jobs: adoptedJobs}) {
+		if got := *result.SliceReserve; got != (runner.ConfineSliceReserve{GrantedBytes: adopted, CeilingBytes: wantCeiling, Jobs: adoptedJobs, Queued: 0, FreezePhase: "idle"}) {
 			t.Fatalf("slice reserve=%+v, want adopted-only granted=%d ceiling=%d jobs=%d", got, adopted, wantCeiling, adoptedJobs)
 		}
 	})

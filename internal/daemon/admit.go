@@ -254,6 +254,32 @@ func (s *Server) admitOutstandingReserve(path string) (outstanding int64, outsta
 	return outstanding, outstandingJobs, adopted, adoptedJobs, true
 }
 
+// admitQueueDiagnostics reports the queued-but-ungranted waiter count and the
+// current fairness-freeze phase for a slice, for `confine --list`. Follows the
+// same registry->queue lock order as admitOutstandingReserve.
+//
+// An ABSENT queue is a genuine idle zero, not an unevaluated read: a queue only
+// exists while it has waiters, so its absence positively establishes that
+// nothing is waiting. Callers must not render this as "unknown".
+func (s *Server) admitQueueDiagnostics(path string) (queued int, phase string) {
+	s.admitRegistryMu.Lock()
+	queue := s.admitQueues[path]
+	if queue == nil {
+		s.admitRegistryMu.Unlock()
+		return 0, admitFreezeIdle.String()
+	}
+	queue.mu.Lock()
+	for _, waiter := range queue.waiters {
+		if waiter != nil && waiter.state == admitQueued {
+			queued++
+		}
+	}
+	phase = admitFreezePhaseAt(queue.freezeArmedAt, s.admitNowTime(), s.admitFreezeMaxHold).String()
+	queue.mu.Unlock()
+	s.admitRegistryMu.Unlock()
+	return queued, phase
+}
+
 // admitAvailable is the governor's advisory, read-only view of the same
 // headroom calculation used by an immediate admission grant. It deliberately
 // does not create a queue: a read-only governor lookup must not start an idle

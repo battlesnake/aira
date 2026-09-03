@@ -2127,6 +2127,24 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 			formatReserveBytes(result.SliceReserve.GrantedBytes),
 			formatReserveBytes(result.SliceReserve.CeilingBytes),
 			result.SliceReserve.Jobs, jobLabel)
+		// Why a job is WAITING, which the admitted-jobs table above cannot show.
+		// Printed unconditionally (including the zero) so "nothing is queued" is a
+		// stated fact rather than an absence the reader has to interpret.
+		if result.SliceReserve.FreezePhase != "" {
+			waiterLabel := "waiters"
+			if result.SliceReserve.Queued == 1 {
+				waiterLabel = "waiter"
+			}
+			note := ""
+			switch result.SliceReserve.FreezePhase {
+			case "hold":
+				note = " (fairness freeze holding capacity for the head waiter; it yields shortly)"
+			case "yield":
+				note = " (fairness freeze yielding; fitting waiters are being admitted)"
+			}
+			_, _ = fmt.Fprintf(stdout, "slice queue: %d queued %s, freeze %s%s\n",
+				result.SliceReserve.Queued, waiterLabel, result.SliceReserve.FreezePhase, note)
+		}
 	}
 	if response.Exit != 0 {
 		return response.Exit

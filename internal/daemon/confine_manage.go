@@ -128,6 +128,7 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		if ok {
 			outstanding, outstandingJobs, adopted, adoptedJobs, _ := s.admitOutstandingReserve(path)
 			totalJobs := addJobCountClamp(outstandingJobs, adoptedJobs)
+			queued, freezePhase := s.admitQueueDiagnostics(path)
 			result.SliceReserve = &runner.ConfineSliceReserve{
 				GrantedBytes: addClamp(outstanding, adopted),
 				// Ceiling is what one MORE job would face; scale headroom by the
@@ -135,6 +136,8 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				// with the Jobs shown, not just the connection-held ones.
 				CeilingBytes: subtractFloor(maximum, s.admitSliceHeadroom(addJobCountClamp(totalJobs, 1))),
 				Jobs:         totalJobs,
+				Queued:       queued,
+				FreezePhase:  freezePhase,
 			}
 		}
 		return core.Response{OK: true, Code: "OK", Data: result}

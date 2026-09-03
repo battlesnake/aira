@@ -152,7 +152,11 @@ func TestAdmitFreezeHolderChurnDoesNotExtendTheFreeze(t *testing.T) {
 	server.admitFreezeMaxHold = time.Minute
 
 	headA := queuedWaiter(1, 60, now.Add(-10*time.Second))
-	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{headA}}
+	// A tail waiter keeps the queue non-empty, so releasing headA below does not
+	// trip pruneAdmitQueue into destroying the queue underneath the test — which
+	// would make this assert against a stale object rather than live behaviour.
+	tail := queuedWaiter(99, 70, now.Add(-10*time.Second))
+	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{headA, tail}}
 	server.evaluateAdmitQueue(queue)
 	armedAt := queue.freezeArmedAt
 
@@ -319,7 +323,11 @@ func TestAdmitFreezeYieldRespectsCeilingWhenAdoptedDominates(t *testing.T) {
 
 	head := queuedWaiter(1, 95, now.Add(-10*time.Second))
 	small := queuedWaiter(2, 30, now)
-	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, small}}
+	// A trailing waiter that does NOT fit even after the yield. Without it, an
+	// implementation that skipped the fit test for backfill candidates would still
+	// pass, because every remaining candidate happened to fit.
+	tooBig := queuedWaiter(3, 50, now)
+	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, small, tooBig}}
 	// Adopted (not live RSS) is what makes the head unfittable here.
 	queue.adopted = 60
 	queue.adoptedJobs = 1
@@ -333,6 +341,8 @@ func TestAdmitFreezeYieldRespectsCeilingWhenAdoptedDominates(t *testing.T) {
 	server.evaluateAdmitQueue(queue)
 
 	// available = 100 - (adopted 60) = 40, so the 30 fits and nothing more may.
+	waitAdmitGrant(t, small)
+	requireAdmitQueued(t, tooBig)
 	charge := queue.outstanding + queue.adopted
 	ceiling := maximum.Load() - server.admitSliceHeadroom(queue.outstandingJobs+queue.adoptedJobs+1)
 	if charge > ceiling {
@@ -340,6 +350,42 @@ func TestAdmitFreezeYieldRespectsCeilingWhenAdoptedDominates(t *testing.T) {
 	}
 	if queue.outstanding != 30 {
 		t.Fatalf("outstanding=%d, want exactly the one granted 30", queue.outstanding)
+	}
+}
+
+// verifies: the same ceiling guarantee across a yield when live RSS
+// (effectiveCurrent), rather than the ledger, is what dominates the charge.
+// checkedAvailable takes max(effectiveCurrent, outstanding+adopted), so an
+// implementation that consulted only the ledger would over-admit here and OOM a
+// neighbour — the exact direction this subsystem exists to prevent.
+func TestAdmitFreezeYieldRespectsCeilingWhenEffectiveCurrentDominates(t *testing.T) {
+	var maximum atomic.Int64
+	maximum.Store(100)
+	current := int64(70) // live usage, with an empty ledger
+	now := time.Unix(14000, 0)
+	server := freezeTestServer(t, &maximum, &current, &now)
+	server.admitBackfillGrace = 10 * time.Second
+	server.admitFreezeMaxHold = time.Minute
+
+	head := queuedWaiter(1, 95, now.Add(-10*time.Second))
+	small := queuedWaiter(2, 20, now)  // fits in available 30
+	tooBig := queuedWaiter(3, 40, now) // does not fit even after the yield
+	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, small, tooBig}}
+
+	server.evaluateAdmitQueue(queue)
+	requireAdmitQueued(t, small)
+
+	now = now.Add(61 * time.Second)
+	server.evaluateAdmitQueue(queue)
+
+	waitAdmitGrant(t, small)
+	requireAdmitQueued(t, tooBig)
+	requireAdmitQueued(t, head)
+	if queue.outstanding != 20 {
+		t.Fatalf("outstanding=%d, want exactly the one granted 20", queue.outstanding)
+	}
+	if charge := current + queue.outstanding; charge > maximum.Load() {
+		t.Fatalf("yield admitted past live usage: current=%d outstanding=%d exceeds %d", current, queue.outstanding, maximum.Load())
 	}
 }
 
@@ -422,6 +468,49 @@ func TestAdmitFreezeMaxHoldFromEnv(t *testing.T) {
 				t.Fatalf("hold=%v err=%v, want %v", hold, err, test.want)
 			}
 		})
+	}
+}
+
+// verifies: AIRA-59 diagnosability. Root-causing this ticket needed source
+// reading because nothing reported queued-but-ungranted waiters or that a
+// fairness freeze was holding them; `confine --list` showed only ADMITTED jobs.
+// An absent queue must report a known zero and "idle", never "unevaluated" —
+// a queue exists only while it has waiters, so its absence positively
+// establishes that nothing is waiting.
+func TestAdmitQueueDiagnosticsReportQueuedAndFreezePhase(t *testing.T) {
+	var maximum atomic.Int64
+	maximum.Store(100)
+	current := int64(50)
+	now := time.Unix(15000, 0)
+	server := freezeTestServer(t, &maximum, &current, &now)
+	server.admitBackfillGrace = 10 * time.Second
+	server.admitFreezeMaxHold = time.Minute
+
+	if queued, phase := server.admitQueueDiagnostics("/slice"); queued != 0 || phase != "idle" {
+		t.Fatalf("absent queue reported queued=%d phase=%q, want a known 0/idle", queued, phase)
+	}
+
+	head := queuedWaiter(1, 60, now.Add(-10*time.Second))
+	small := queuedWaiter(2, 30, now)
+	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{head, small}}
+	server.admitRegistryMu.Lock()
+	server.admitQueues["/slice"] = queue
+	server.admitRegistryMu.Unlock()
+
+	server.evaluateAdmitQueue(queue)
+	queued, phase := server.admitQueueDiagnostics("/slice")
+	if queued != 2 || phase != "hold" {
+		t.Fatalf("during the freeze: queued=%d phase=%q, want 2/hold — this is the state that was invisible during the incident", queued, phase)
+	}
+
+	now = now.Add(61 * time.Second)
+	server.evaluateAdmitQueue(queue)
+	queued, phase = server.admitQueueDiagnostics("/slice")
+	if phase != "yield" {
+		t.Fatalf("after the hold: phase=%q, want yield", phase)
+	}
+	if queued != 1 {
+		t.Fatalf("after the yield admitted the fitting waiter: queued=%d, want 1 (only the unfittable head)", queued)
 	}
 }
 
