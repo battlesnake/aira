@@ -125,6 +125,20 @@ type staleLeaseCandidate struct {
 //   - Like reapOrphanedScopesPass, this only ever consults the ledger's own
 //     admitQueues. It makes no claim about any slice this daemon has never been
 //     asked to admit against; that is the sweep's defined scope, not a gap.
+//   - A job legitimately older than the grace can have a genuinely empty scope
+//     for a brief window on its OWN successful exit path too: after cmd.Wait()
+//     returns but before the launcher's deferred cleanup actually removes the
+//     scope and reports usage/attests teardown (confine_linux.go -- readUsage,
+//     reportPeak, attestScopeTeardown, cleanupConfineScope). A sweep tick
+//     landing in that sub-second window reaps the directory and reclaims the
+//     lease a little early. Build-review traced this and confirmed it is
+//     harmless: release is idempotent (the launcher's own later release is a
+//     no-op), the exit code is unaffected, and the launcher's own usage/
+//     attestation calls correctly observe the gone scope as an honest
+//     unevaluated/unverified outcome rather than fabricating a result -- never
+//     a false pass. Not worth a code-level fix (architectural-simplicity): it
+//     costs nothing but occasionally losing one legitimate job's peak-RSS
+//     sample from the estimate history a little early.
 func (s *Server) staleGrantedLeases(grace time.Duration) []staleLeaseCandidate {
 	s.admitRegistryMu.Lock()
 	queues := make(map[string]*sliceQueue, len(s.admitQueues))
@@ -173,7 +187,7 @@ func (s *Server) releaseStaleGrantedLeasesPass(ctx context.Context) {
 	for _, candidate := range s.staleGrantedLeases(grace) {
 		if err := ctx.Err(); err != nil {
 			if len(released) > 0 {
-				log.Printf("aira daemon: scope-reaper: released %d stale confine lease(s) before cancellation: %s", len(released), strings.Join(released, ", "))
+				log.Printf("aira daemon: scope-reaper: reclaimed %d stale confine lease(s) before cancellation: %s", len(released), strings.Join(released, ", "))
 			}
 			return
 		}

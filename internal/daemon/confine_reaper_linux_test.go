@@ -21,17 +21,19 @@ import (
 // test, published through AIRA_CONFINE_SLICE and then read back through the
 // daemon's own resolver.
 //
-// Positive control (Fable round-4): this package had never resolved a slice via
-// AIRA_CONFINE_SLICE before AIRA-49 — every prior test keys admitQueues by
-// whatever path it constructs, bypassing ResolveConfineManagementSlice
-// entirely. If that resolution silently failed here, the sweep would find
-// nothing and every "leaves alone" case below would pass VACUOUSLY rather than
-// for the right reason. Worse, a resolution that ignored the environment would
-// hand back the MACHINE DEFAULT slice, and these tests would then create and
-// physically reap directories inside the live aira.slice. So assert resolution
-// actually landed on this test's own isolated parent, comparing against what
-// resolution itself returns (it is EvalSymlinks-canonicalised, so the raw
-// t.Setenv value need not match byte-for-byte).
+// Positive control (Fable round-4, corrected by build-review): this package
+// had never resolved a slice via AIRA_CONFINE_SLICE before AIRA-49 — every
+// prior test keys admitQueues by whatever path it constructs, bypassing
+// ResolveConfineManagementSlice entirely. releaseStaleGrantedLeasesPass itself
+// never calls that resolver (it iterates admitQueues directly, by design, to
+// cover every registered slice) -- but this helper still does, specifically so
+// the fixture's admitQueues KEY and its real, physically-created scope
+// directory PATH are provably the same path, comparing against what resolution
+// itself returns (it is EvalSymlinks-canonicalised, so the raw t.Setenv value
+// need not match byte-for-byte). A silent mismatch here would key the ledger
+// fixture by one path while creating/reaping directories under a different
+// one, making every case below pass or fail for the wrong reason regardless of
+// whether the sweep logic itself is correct.
 //
 // t.Setenv forbids t.Parallel in every test that calls this.
 func staleLeaseTestSliceRoot(t *testing.T) string {
