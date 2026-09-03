@@ -217,7 +217,7 @@ func TestCommandCheckerCleanNonzeroIsFailure(t *testing.T) {
 }
 
 // TestCommandGateAdmitsMultiProcessGreenCommand is the discriminating guard for
-// task #20: `/bin/sh -c "sleep 0.05; printf ..."` forks a real `sleep` child, so
+// task #20: `/bin/sh -c "sleep 0.25; printf ..."` forks a real `sleep` child, so
 // the run is a genuine multi-process command exactly like `go test`/builds/
 // linters — the descendant is observed and the record is classified
 // ScopeUnverified, not ScopeContained. A green such command must still produce a
@@ -231,7 +231,11 @@ func TestCommandGateAdmitsMultiProcessGreenCommand(t *testing.T) {
 		"{\"Action\":\"run\",\"Package\":\"p\",\"Test\":\"TestX\"}\\n" +
 		"{\"Action\":\"pass\",\"Package\":\"p\",\"Test\":\"TestX\"}\\n" +
 		"{\"Action\":\"pass\",\"Package\":\"p\"}\\n"
-	def := commandDefinition(gate.Command{Argv: []string{"/bin/sh", "-c", "sleep 0.05; printf '" + greenOutput + "'"}, Cwd: "root", TimeoutMS: gateFastCommandTimeoutMS, OutputCapBytes: 4096, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
+	// The forked `sleep` must dwell for several scope-sampler periods
+	// (runner.scopeMembershipSampleInterval, 50ms) to be observed as a
+	// descendant; a shorter child is the sampler's documented coverage gap and
+	// would read contained, defeating the unverified-admission path this proves.
+	def := commandDefinition(gate.Command{Argv: []string{"/bin/sh", "-c", "sleep 0.25; printf '" + greenOutput + "'"}, Cwd: "root", TimeoutMS: gateFastCommandTimeoutMS, OutputCapBytes: 4096, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
 	evaluation, err := s.runCommandChecker(context.Background(), def, root)
 	if err != nil {
 		t.Fatal(err)

@@ -1385,7 +1385,8 @@ type processCgroupObservation struct {
 // best-effort positive: it means the leader was positively verified in the scope
 // and no descendant was observed across the samples taken. It is NOT a whole-tree
 // proof — a descendant that forks and migrates out entirely within a single
-// sub-2ms sampler gap is never observed and such a run can still read Contained.
+// sampler period (scopeMembershipSampleInterval, 50ms) is never observed and such
+// a run can still read Contained.
 // This is an accepted coverage gap (written down per the review policy): cgroup-v2
 // exposes no cheap process-granular cumulative witness to close it (pids.peak
 // counts TIDs, not processes, so it is inflated by the leader's own threads and by
@@ -1504,11 +1505,25 @@ func processStartTick(pid int) uint64 {
 	return tick
 }
 
+// scopeMembershipSampleInterval is the period of the scope-membership sampler.
+// It is the accepted coverage gap of scope-integrity attestation: a descendant
+// that forks and exits or migrates out within one period is never observed.
+// It is also the supervisor's steady-state CPU budget, because every tick reads
+// cgroup.procs plus O(scope tree size) /proc entries for the whole lifetime of
+// every `aira confine` and `aira run` supervisor. At 2ms (500Hz) an idle
+// single-process supervisor burned ~13% of a core and a 31-process tree ~112%
+// (2026-09-03, docs/superpowers/specs/2026-09-03-confine-sampler-cpu-plan.md);
+// at 50ms those are ~0.1% and ~2%. Widening the period is a coverage
+// reduction, written down here and in the attestation spec, not a tuning.
+const scopeMembershipSampleInterval = 50 * time.Millisecond
+
 func monitorScopeMembership(scope Scope, leader PIDIdentity, initialMembers []int, stop <-chan struct{}, result chan<- scopeMonitorResult) {
 	// Sampling can prove a live escape but cannot prove that no descendant
 	// escaped between samples. The ever-member inventory is therefore evidence
 	// for witnessed escapes and teardown honesty, never a whole-tree guarantee.
-	ticker := time.NewTicker(2 * time.Millisecond)
+	// A tick that overruns the period is simply followed by the next sample
+	// (the ticker drops, never queues, missed ticks).
+	ticker := time.NewTicker(scopeMembershipSampleInterval)
 	defer ticker.Stop()
 	events := scopeMembershipEvents(scope, stop)
 	summary := scopeMonitorResult{}
@@ -1755,28 +1770,53 @@ func scopeMembershipEvents(scope Scope, stop <-chan struct{}) <-chan struct{} {
 		_ = unix.Close(fd)
 		return result
 	}
+	// The fd is non-blocking, so os.NewFile registers it with the runtime
+	// poller and Read parks in epoll — zero syscalls until an event arrives or
+	// the file is closed. The previous reader busy-polled the raw fd (read →
+	// EAGAIN → sleep 1ms): ~2,000 syscalls/s per supervisor doing nothing.
+	file := os.NewFile(uintptr(fd), source.EventsPath())
+	if file == nil {
+		_ = unix.Close(fd)
+		return result
+	}
+	readerDone := make(chan struct{})
 	go func() {
-		defer unix.Close(fd)
+		// Exactly-once close, owned here. Closing unblocks a parked Read (it
+		// returns ErrClosed) so the reader exits; selecting on readerDone as
+		// well means an early read failure never leaves this goroutine, or the
+		// fd, waiting on a stop that may never come.
+		select {
+		case <-stop:
+		case <-readerDone:
+		}
+		_ = file.Close()
+	}()
+	go func() {
+		defer close(readerDone)
 		buffer := make([]byte, 4096)
 		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			n, readErr := unix.Read(fd, buffer)
+			n, readErr := file.Read(buffer)
 			if n > 0 {
 				select {
 				case result <- struct{}{}:
 				default:
 				}
 			}
-			if readErr != nil && !errors.Is(readErr, unix.EAGAIN) && !errors.Is(readErr, unix.EINTR) {
-				return
+			if readErr == nil {
+				continue
 			}
-			if n == 0 || errors.Is(readErr, unix.EAGAIN) {
-				time.Sleep(time.Millisecond)
+			if errors.Is(readErr, unix.EAGAIN) {
+				// Only reachable if the runtime could not register the fd with
+				// the poller (never observed for inotify on Linux): degrade to a
+				// slow poll rather than spin.
+				select {
+				case <-stop:
+					return
+				case <-time.After(10 * time.Millisecond):
+				}
+				continue
 			}
+			return
 		}
 	}()
 	return result
