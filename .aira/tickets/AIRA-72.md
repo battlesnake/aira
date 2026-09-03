@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-72","project":"aira","title":"Gate attestation digest scope is Go-only — a stored pass never invalidates on non-Go changes","status":"planned","kind":"bug","severity":"P0","assignee":null,"milestone":null,"labels":["dogfood","gate","honesty"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-72","project":"aira","title":"Gate attestation digest scope is Go-only \u2014 a stored pass never invalidates on non-Go changes","status":"done","kind":"bug","severity":"P0","assignee":null,"milestone":null,"labels":["dogfood","gate","honesty"],"hold":false,"relations":[]}
 ---
 ## Symptom (found during the whole-project simplification review, PR #12, verified independently against source)
 
