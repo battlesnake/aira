@@ -828,6 +828,12 @@ func TestConfineDaemonAdmissionTimeoutUsesRequestedOrDefaultWait(t *testing.T) {
 	}{
 		{name: "positive", wait: 25 * time.Millisecond, want: 25 * time.Millisecond},
 		{name: "default", want: 30 * time.Minute},
+		// AIRA-58: a wait above the old private runnerAdmitWaitCap must reach the
+		// daemon INTACT. The runner used to clamp it to 30m before sending, so
+		// `--admit-timeout 2h` silently became 30m on the wire while every
+		// daemon-side test still passed. This table previously had no over-clamp
+		// case at all, which is why the bug survived.
+		{name: "above the old 30m runner clamp", wait: 2 * time.Hour, want: 2 * time.Hour},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			socket := filepath.Join(t.TempDir(), "admit.sock")
