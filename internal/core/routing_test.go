@@ -586,6 +586,12 @@ func routingFixtures(descriptors []DispatchDescriptor, findingID string) []Reque
 			base["selector"] = findingID
 			base["by"] = "source"
 			base["requirement"] = "AR-1"
+		case "gate":
+			// The single gate fixture is the "add" subverb, which is now a real
+			// creation verb and refuses to overwrite an existing definition.
+			// Point it at an id the seed does not define, so the fixture
+			// exercises creation instead of colliding with command-fixture.
+			base["gate_id"] = "routing-created-gate"
 		case "req":
 			base["selector"] = "AR-1"
 			base["status"] = "built"

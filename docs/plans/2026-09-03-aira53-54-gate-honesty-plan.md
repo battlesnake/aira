@@ -527,13 +527,21 @@ Both faces affirmatively claim `pass` for a gate set that does not exist.
 ### Measured blast radius (the risk this plan flagged)
 
 The plan committed to reporting the aggregate-`check` blast radius as evidence
-rather than assuming it. Measured against the full suite: **four** failures and
-no more. Every other package stayed green (`cmd/aira`, `internal/app`,
-`internal/daemon`, `internal/domain`, `internal/gate`, `internal/gitcontext`,
-`internal/gitremote`, `internal/install`).
+rather than assuming it. **An intermediate count of "four, and no more" recorded
+here earlier was wrong** — it came from a targeted `-run` subset plus a partial
+full run, and is corrected here rather than left standing. The measured total
+against the complete suite is **eleven** failures across three categories. Every
+package other than `internal/store` and `internal/core` stayed green
+(`cmd/aira`, `internal/app`, `internal/daemon`, `internal/domain`,
+`internal/gate`, `internal/gitcontext`, `internal/gitremote`, `internal/install`,
+`internal/pylib`, `internal/runner`).
 
-Two were tests genuinely asserting the fabricated pass. Both were corrected to
-assert their real invariant rather than suppressed:
+Category 1 — nine tests genuinely asserting the fabricated pass. Seven
+traceability tests plus `TestComputeMismatchIsStoredAndRaisesWarningFinding` used
+`report.Verdict != "pass"` as a *proxy* for "warned but nothing failed", which
+only held because their gate-less fixtures read `gates: pass`. Each now asserts
+the real invariant, `len(report.Findings) != 0` — a stricter check than the
+aggregate verdict it replaces, and independent of unrelated dimensions. Plus:
 
 - `TestCheckReportsAreaOverlapAsWarningOnly` asserted the aggregate verdict was
   `pass` to prove an overlap is warning-only. That only held because the
@@ -545,12 +553,20 @@ assert their real invariant rather than suppressed:
   whose fixture defines no gates. It now records `U_GATE_SET_EMPTY` instead of
   omitting the dimension.
 
-Two more came from this change over-reaching, and were reverted rather than
+Category 2 — one test broken by this change over-reaching, reverted rather than
 absorbed: re-classifying `prove` from `SafetyMutate` to `SafetyRead` broke
-`TestRoutingCompletenessWithRecordingSentinels` and `TestSkillSafetyGolden`.
-`skill_test.go:134` pins `"gate/prove": SafetyMutate` as a deliberate golden, so
-that classification is intentional and changing it is a routing decision, not an
-honesty fix. Only the dishonest `Summary` was corrected.
+`TestSkillSafetyGolden`. `skill_test.go:134` pins `"gate/prove": SafetyMutate` as
+a deliberate golden, so that classification is intentional and changing it is a
+routing decision, not an honesty fix. Only the dishonest `Summary` was corrected.
+
+Category 3 — one test whose failure is itself evidence the fix works.
+`TestRoutingCompletenessWithRecordingSentinels` drives every subverb through a
+shared fixture with `gate_id: command-fixture`, a gate the seed already defines.
+Now that `add` genuinely creates and refuses to overwrite, it correctly returned
+`E_GATE_EXISTS`, and the test requires every daemon-routed request to report OK.
+The fixture is a *routing*-completeness probe, so it was retargeted at an id the
+seed does not define (`routing-created-gate`), letting it exercise creation. The
+refusal was correct behavior, not a regression.
 
 The small count is consistent with the `U_TRACE_EMPTY` precedent: because an
 empty requirement registry already forces `unevaluated`, most fixtures that would

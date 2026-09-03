@@ -275,8 +275,11 @@ func buildGateDefinition(gateID, canaryID string, fields map[string]any) (gate.G
 // input and deliberately refuses a checker change, which would require a kind
 // and payload migration that belongs in the file, not in a flag.
 func applyGateFields(definition gate.GateDefinition, fields map[string]any) (gate.GateDefinition, error) {
-	if _, ok := gateFieldString(fields, "checker"); ok {
-		return gate.GateDefinition{}, errors.New("E_GATE_INVALID: gate set cannot change --checker; edit .aira/gates/<id>.json or re-add the gate")
+	// Restating the gate's current checker is a no-op and is accepted; only an
+	// actual change is refused, because switching checker would require a kind
+	// and payload migration that belongs in the file, not in a flag.
+	if checker, ok := gateFieldString(fields, "checker"); ok && checker != definition.Lane.Checker {
+		return gate.GateDefinition{}, fmt.Errorf("E_GATE_INVALID: gate set cannot change --checker from %q to %q; edit .aira/gates/<id>.json or re-add the gate", definition.Lane.Checker, checker)
 	}
 	if dimension, ok := gateFieldString(fields, "dimension"); ok {
 		if definition.Checkable == nil {

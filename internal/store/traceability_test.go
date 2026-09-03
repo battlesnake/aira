@@ -73,8 +73,13 @@ func TestTraceabilityBuiltWithoutCoversWarnsButPasses(t *testing.T) {
 	writeTraceSource(t, root, "implementation_test.go", "package example\n// verifies: AR-1\nfunc TestImplementation(t *testing.T) {}\n")
 
 	report := runTraceabilityCheck(t, s)
-	if report.Verdict != "pass" || report.Dimensions["traceability"] != "warning" {
-		t.Fatalf("report=%#v, want warning with overall pass", report)
+	// These fixtures define no gates, and an unpopulated gate set now reports
+	// unevaluated instead of a fabricated pass, so the aggregate verdict is no
+	// longer a usable proxy for "traceability warned but nothing failed".
+	// Assert that invariant directly: no fail finding was produced. This is
+	// also a stricter check than the aggregate verdict it replaces.
+	if len(report.Findings) != 0 || report.Dimensions["traceability"] != "warning" {
+		t.Fatalf("report=%#v, want warning with no failures", report)
 	}
 	if !hasFinding(report.Warnings, "W_TRACE_UNCOVERED") || hasFinding(report.Warnings, "W_TRACE_UNVERIFIED") {
 		t.Fatalf("warnings=%#v, want only uncovered", report.Warnings)
@@ -87,7 +92,7 @@ func TestTraceabilityBuiltWithCoversWithoutVerifiesWarns(t *testing.T) {
 	writeTraceSource(t, root, "implementation.go", "package example\n// covers: AR-1\nfunc implementation() {}\n")
 
 	report := runTraceabilityCheck(t, s)
-	if report.Verdict != "pass" || report.Dimensions["traceability"] != "warning" {
+	if len(report.Findings) != 0 || report.Dimensions["traceability"] != "warning" {
 		t.Fatalf("report=%#v, want warning with overall pass", report)
 	}
 	if !hasFinding(report.Warnings, "W_TRACE_UNVERIFIED") || hasFinding(report.Warnings, "W_TRACE_UNCOVERED") {
@@ -100,7 +105,7 @@ func TestTraceabilityPartialWithoutCoversWarnsButDoesNotRequireVerifies(t *testi
 	addTraceRequirement(t, s, domain.RequirementPartial)
 
 	report := runTraceabilityCheck(t, s)
-	if report.Verdict != "pass" || !hasFinding(report.Warnings, "W_TRACE_UNCOVERED") || hasFinding(report.Warnings, "W_TRACE_UNVERIFIED") {
+	if len(report.Findings) != 0 || !hasFinding(report.Warnings, "W_TRACE_UNCOVERED") || hasFinding(report.Warnings, "W_TRACE_UNVERIFIED") {
 		t.Fatalf("report=%#v, want only uncovered warning", report)
 	}
 }
@@ -114,7 +119,7 @@ func TestTraceabilityExemptStatusesDoNotWarn(t *testing.T) {
 			s, _ := newTraceabilityStore(t)
 			addTraceRequirement(t, s, status)
 			report := runTraceabilityCheck(t, s)
-			if report.Verdict != "pass" || hasFinding(report.Warnings, "W_TRACE_UNCOVERED") || hasFinding(report.Warnings, "W_TRACE_UNVERIFIED") {
+			if len(report.Findings) != 0 || hasFinding(report.Warnings, "W_TRACE_UNCOVERED") || hasFinding(report.Warnings, "W_TRACE_UNVERIFIED") {
 				t.Fatalf("status %q report=%#v, want no trace warning", status, report)
 			}
 		})
@@ -219,7 +224,7 @@ func TestTraceabilityFullyCoveredAndVerifiedBuiltPasses(t *testing.T) {
 	writeTraceSource(t, root, "implementation_test.go", "package example\n// verifies: AR-1\nfunc TestImplementation(t *testing.T) {}\n")
 
 	report := runTraceabilityCheck(t, s)
-	if report.Verdict != "pass" || report.Dimensions["traceability"] != "pass" || hasFinding(report.Warnings, "W_TRACE_UNCOVERED") || hasFinding(report.Warnings, "W_TRACE_UNVERIFIED") {
+	if len(report.Findings) != 0 || report.Dimensions["traceability"] != "pass" || hasFinding(report.Warnings, "W_TRACE_UNCOVERED") || hasFinding(report.Warnings, "W_TRACE_UNVERIFIED") {
 		t.Fatalf("report=%#v, want clean pass", report)
 	}
 }
@@ -262,7 +267,7 @@ func TestTraceabilityIgnoresUntrackedGeneratedAndMalformedGo(t *testing.T) {
 	writeTraceSourceUntracked(t, root, "generated_malformed.go", "package example\nfunc generated(\n")
 
 	report := runTraceabilityCheck(t, s)
-	if report.Verdict != "pass" || report.Dimensions["traceability"] != "pass" || hasFinding(report.Findings, "E_TRACE_DANGLING") || hasFinding(report.UnevaluatedFindings, "U_TRACE_UNSCANNED") {
+	if len(report.Findings) != 0 || report.Dimensions["traceability"] != "pass" || hasFinding(report.Findings, "E_TRACE_DANGLING") || hasFinding(report.UnevaluatedFindings, "U_TRACE_UNSCANNED") {
 		t.Fatalf("report=%#v, want untracked files ignored", report)
 	}
 }
