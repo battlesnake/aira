@@ -1,6 +1,8 @@
-# AIRA-31: aitest Slice 2 — JUnit XML, coverage combine, TestReport replay — Implementation Plan (v4)
+# AIRA-31: aitest Slice 2 — JUnit XML, coverage combine, TestReport replay — Implementation Plan (v5)
 
 **v4 changelog:** Sol's round-2 confirmation of v3 rendered PASS WITH FIXES (no more BLOCKs — the coverage-ownership-free design and crash-atomic staging were both confirmed correct against real source and a live probe). Five precise fixes applied: (1) the tuple-tagging codec's marker was not collision-safe against a real dict that happens to be shaped like the marker — fixed with a proper escaping scheme, and now applied to whole events (including `logstart`/`logfinish` locations), not just report `data`; (2) the `{`-prefix wire discriminator is ambiguous against a legally-`{`-prefixed nodeid — replaced with an explicit sentinel; (3) every staged event's own nodeid must match `in_flight`, not just the plain line's; (4) the synthesized-unevaluated-report fix only covered the twice-crashed case — `_fail_queue_too_large`'s separate unevaluated-marking path needed the same treatment, via one centralized helper; (5) the synthesized report must use `outcome="failed"` with an honest message, since a literal `outcome="unevaluated"` is not a real pytest outcome and junitxml silently ignores it — the original design would not actually have worked. Also added a real `pytest --cov` regression test (a spy test alone can't prove the pytest-cov integration) and a `junit_logging` config note for the e2e test.
+
+**v5 changelog — a genuinely new, previously-undiscovered P0, live-verified, plus precision fixes:** Fable's confirmation review of v3 found something no prior round caught: pytest's own fd-capture mechanism (`FDCaptureBase`) creates ONE `TemporaryFile` per stream (stdout/stderr) in the PARENT process at session start and `dup2`s it onto real fd 1/2. `os.fork()` shares the underlying open file description — INCLUDING its current offset — across every forked worker, so every worker's captured output writes into the SAME shared file at whatever position sibling workers have left it. Live-verified with the real plugin, 4 concurrent workers each printing 20 tagged lines: one test's captured output contained 73 lines (only 18 its own, 55 stolen from siblings), another captured zero of its own. This would have shipped SILENTLY WRONG `<system-out>`/`<system-err>` content and "Captured stdout" sections attributed to the wrong test — not a crash, wrong data, exactly the failure class this whole feature exists to prevent, and invisible in Slice 1 only because Slice 1 discards captured output entirely. Fixed in Task 1 (below) by re-initializing per-process capture in the child immediately after fork, before any test runs — using the specific, verified-safe capturemanager sequence Fable's own live probe confirmed does not steal a sibling's in-flight output. Also fixed: a coverage-save guard (only save when the active instance's own `run:parallel` option is true — Fable verified a non-parallel setup lets the child's save DESTROY the parent's already-flushed data by writing to the identical filename); `json.dumps(..., default=repr)` so a non-JSON-serializable `user_properties` value can never crash a worker mid-test; `_exit_child` widened to `except BaseException`/`finally` so it always actually exits even if `coverage.save()` itself raises something unusual; and the unevaluated-report synthesis redesigned from "hunt down and centralize every call site that can produce one" (v4's approach, which Fable found still missed a third site) to a single, structurally complete final pass after `supervisor.run()` returns — synthesize for every collected item with no replayed report, tracked via one "replayed" set, regardless of which code path left it that way.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -191,7 +193,7 @@ def _untag_tuples(obj):
 
 Apply `_tag_tuples`/`_untag_tuples` to the **whole event dict**, not just a report event's `data` payload — `logstart`/`logfinish` events carry their own `location` tuples (Sol round-2: "preserving logstart/logfinish locations") and need the identical treatment, not just report events.
 
-`run_worker_loop` writes each event line with the explicit `_EVENT_LINE_PREFIX` sentinel defined in Task 2 (do not use a bare `"{"`-starts-with check anywhere — Sol round-2 found this is ambiguous against a legal pytest nodeid), followed by `json.dumps(_tag_tuples(event))`, one per line, before the existing unchanged plain result line.
+`run_worker_loop` writes each event line with the explicit `_EVENT_LINE_PREFIX` sentinel defined in Task 2 (do not use a bare `"{"`-starts-with check anywhere — Sol round-2 found this is ambiguous against a legal pytest nodeid), followed by `json.dumps(_tag_tuples(event), default=repr)`, one per line, before the existing unchanged plain result line. The `default=repr` is required, not optional (v5, Fable's finding, verified live): a test that calls `record_property("x", <some non-JSON-serializable object>)` produces a `user_properties` value `json.dumps` would otherwise raise `TypeError` on — inside the child's own hookimpl, which propagates out through `run_one`'s broad `except BaseException: _exit_child(70)` and crashes the WORKER (not just that one event), turning a genuinely PASSING test into "unevaluated" after the retry also crashes the same way. junitxml itself just `str()`s property values regardless, so falling back to `repr()` here is a safe, harmless, honest choice for whatever wasn't natively JSON-safe.
 
 `_exit_child(code)`:
 
@@ -202,15 +204,42 @@ def _exit_child(code):
         current = coverage.Coverage.current()
         if current is not None:
             current.stop()
-            current.save()
-    except Exception:
-        pass  # best-effort only -- this must never prevent the process from exiting
-    os._exit(code)
+            if current.get_option("run:parallel"):
+                current.save()
+    except BaseException:
+        # Best-effort only -- this must never prevent the process from
+        # exiting. BaseException (v5, Fable's finding), not Exception: this
+        # is called from except BaseException handlers whose entire point
+        # is never falling through into the child's COW copy of the
+        # supervisor's own control flow -- a KeyboardInterrupt/SystemExit/
+        # MemoryError raised inside coverage's own save() must not escape
+        # this function and defeat that.
+        pass
+    finally:
+        os._exit(code)
 ```
 
 Replace `worker.py:123`'s `os._exit(70)` with `_exit_child(70)`. Coordinate with Task 2 to replace `supervisor.py`'s four analogous sites the same way (import `_exit_child` from `aitest.worker`, matching how `_RECYCLE_SUFFIX`/`fork_worker`/`run_worker_loop` are already imported there).
 
 Unregister `terminalreporter` in the worker loop, before the first test runs (exact call site: wherever `run_worker_loop`/`fork_worker`'s child branch first gets access to the item's `config.pluginmanager`, before dispatching to `run_one` — find the precise point, do not guess; likely right after `place_self` returns in the child, using `item.config.pluginmanager.unregister(item.config.pluginmanager.get_plugin("terminalreporter"))`-shaped code, guarded for the plugin possibly already being absent).
+
+**Fd-capture re-initialization — required, load-bearing (v5, Fable's new P0 finding), at the SAME child-init point as the terminalreporter unregistration, before any test runs:**
+
+```python
+pm = item.config.pluginmanager
+capman = pm.get_plugin("capturemanager")
+if capman is not None:
+    old = capman._global_capturing
+    if old is not None:
+        capman._global_capturing = None
+        old.stop_capturing()
+    capman.start_global_capturing()
+    capman.suspend_global_capture()
+```
+
+Do NOT use `capman.stop_global_capturing()` (the public method) for this — Fable's own probe found its `pop_outerr_to_orig()` snaps the SHARED (still fork-inherited) capture file, which would steal whatever output sibling workers have already written into it mid-test (a real, live risk: `_replace_worker` forks a NEW worker while OTHER workers are still mid-test). The sequence above discards the fork-inherited (shared, corrupt-by-construction) capture object without reading it, then has `start_global_capturing()` create genuinely fresh, per-process capture files, which is what actually fixes the cross-contamination — verified live (4 concurrent workers each printing 20 tagged lines; without this fix, one test's captured output contained 55 lines stolen from siblings; with it, each worker's own capture is isolated). `--capture=sys`/`tee-sys`/`no` are unaffected by this bug in the first place (in-memory per-process buffers, not shared fd-backed files) — this fix is specifically for the (pytest's own) default fd-capture mode.
+
+**Coverage-save guard (v5, Fable's finding):** in `_exit_child`, only call `.save()` (after `.stop()`) when the active `Coverage` instance's own `run:parallel` option is true (`current.get_option("run:parallel")` — coverage sets this automatically whenever a real `data_suffix` is in play, which is always true for `pytest-cov` and for a project's own explicit `parallel = true`). Skip the save (do nothing beyond `.stop()`, or skip entirely — implementer's judgment, document whichever) when it is false: a non-parallel setup (bare `coverage run` with no `parallel`/suffix config) would otherwise make the child choose the SAME data filename as the parent, and the child's own first-use `erase()` would destroy whatever the parent had already flushed — verified live (a measurable coverage regression, not just wasted work).
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -224,7 +253,7 @@ Unregister `terminalreporter` in the worker loop, before the first test runs (ex
 
 **Interfaces:**
 - Consumes: Task 1's `_untag_tuples`, `_exit_child`. Needs supervisor-level `pytest.Config`/hook-caller access, threaded through as in prior plan drafts.
-- Produces: real `pytest_runtest_logreport`/`logstart`/`logfinish` calls, fired only once per test, only after (a) the WHOLE staged batch for that nodeid parses/deserializes successfully AND every event's own nodeid matches `state["in_flight"]` (Sol round-2 — not just the plain line's nodeid, EVERY staged event's nodeid must match; a well-formed event for the WRONG nodeid, e.g. from the AIRA-40-class inherited-fd surface, must go through the same crash path as a malformed event) and (b) the plain result line for that same nodeid is confirmed; a single, centralized `_synthesize_and_replay_unevaluated(nodeid, reason)` helper (see below) called from EVERY site that currently sets a result to `"unevaluated"` — not just the twice-crashed case — so no unevaluated nodeid is ever silently absent from JUnit XML.
+- Produces: real `pytest_runtest_logreport`/`logstart`/`logfinish` calls, fired only once per test, only after (a) the WHOLE staged batch for that nodeid parses/deserializes successfully AND every event's own nodeid matches `state["in_flight"]` (Sol round-2 — not just the plain line's nodeid, EVERY staged event's nodeid must match; a well-formed event for the WRONG nodeid, e.g. from the AIRA-40-class inherited-fd surface, must go through the same crash path as a malformed event) and (b) the plain result line for that same nodeid is confirmed; PLUS one structurally-complete final pass in `run()` (v5's redesign, see below) that synthesizes and replays an honest report for every nodeid that ends the whole run still `"unevaluated"` and was never actually replayed — covering every current and future way that can happen, not a per-site list.
 
 **Wire-format discriminator fix (Sol round-2):** the prior draft distinguished a JSON event line from the existing plain result line by checking `line.startswith("{")`. A pytest nodeid CAN legally contain `{` as its first character in principle (an unusual but valid parametrize ID), so this is ambiguous. Use an explicit, unambiguous magic prefix instead — e.g. a fixed sentinel `_EVENT_LINE_PREFIX = "\x01"` (or any byte/short string this project's nodeid grammar can never legally start with — verify against pytest's actual nodeid character rules rather than assuming, and pick accordingly) prepended to every JSON event line on the worker side and checked for explicitly (not inferred from JSON-parseability) on the supervisor side; the existing plain result line is emitted with no prefix at all, exactly as today.
 
@@ -253,31 +282,40 @@ def test_drain_worker_discards_staged_events_on_a_crash_before_the_result_line(.
     # a later successful retry's OWN events replay exactly once.
 
 
-def test_drain_worker_synthesizes_and_replays_an_honest_report_for_the_terminal_unevaluated_outcome(...):
-    # Fable's original finding, Sol round-2's report-shape correction.
-    # Simulate the existing Slice 1 requeue-once path exhausting: crash on
-    # attempt 1 (discard staged events, requeue), crash again on attempt
-    # 2 (no more retries -- existing code sets self.results[nodeid] =
-    # "unevaluated" via the new centralized helper). Assert that at the
-    # point this terminal outcome is recorded, exactly ONE real report is
-    # replayed via the spy plugin for that nodeid -- not zero (Fable's
-    # gap), not two (double-counting either crashed attempt) -- with
-    # outcome == "failed" (NOT the literal string "unevaluated", which
-    # junitxml silently ignores) and a longrepr string that plainly says
-    # this was never actually observed to pass or fail (e.g. mentions
-    # "unevaluated" and the crash reason in its text), matching this
-    # project's own unevaluated-is-not-a-pass discipline while still
-    # rendering as a real, visible entry in junitxml/terminal output.
+def test_run_synthesizes_and_replays_an_honest_report_for_a_twice_crashed_nodeid(...):
+    # Fable's original finding, Sol round-2's report-shape correction, v5's
+    # redesign to a post-run final pass. Simulate the existing Slice 1
+    # requeue-once path exhausting: crash on attempt 1 (discard staged
+    # events, requeue), crash again on attempt 2 (no more retries --
+    # existing code sets self.results[nodeid] = "unevaluated", unchanged).
+    # Run the WHOLE supervisor.run() to completion (not just _drain_worker
+    # in isolation, since the synthesis now happens in run()'s own final
+    # pass) and assert exactly ONE real report was replayed via the spy
+    # plugin for that nodeid -- not zero (Fable's original gap), not two
+    # (double-counting either crashed attempt) -- with outcome == "failed"
+    # (NOT the literal string "unevaluated", which junitxml silently
+    # ignores) and a longrepr string that plainly says this was never
+    # actually observed to pass or fail. Also assert a logstart/logfinish
+    # pair fired for it.
 
 
-def test_fail_queue_too_large_also_synthesizes_a_report_for_every_never_dispatched_nodeid(...):
-    # Sol round-2: the SAME centralized synthesis helper must also cover
-    # _fail_queue_too_large's own unevaluated-marking loop (nodes that
-    # were still queued, never even dispatched to any worker, after a
-    # permanent daemon sizing rejection) -- not just the twice-crashed
-    # case. Call _fail_queue_too_large directly with a few queued nodeids
-    # and assert the spy plugin receives exactly one synthesized,
-    # outcome="failed" report per nodeid, none silently absent.
+def test_run_synthesizes_a_report_for_every_never_dispatched_nodeid_after_fail_queue_too_large(...):
+    # v5: the SAME post-run final pass (not a separate per-site helper)
+    # must cover _fail_queue_too_large's own unevaluated-marking (nodes
+    # still queued, never even dispatched, after a permanent daemon
+    # sizing rejection) -- run a scenario that triggers it mid-run, let
+    # run() complete, and assert the spy plugin received exactly one
+    # synthesized outcome="failed" report per affected nodeid.
+
+
+def test_run_synthesizes_a_report_even_for_a_result_defaulted_by_init_pys_own_fallback(...):
+    # v5, Fable's third-site finding: whatever produces __init__.py's own
+    # results.get(nodeid, "unevaluated") default must ALSO be covered --
+    # this is exactly why v5 moved to a single post-run pass over every
+    # collected nodeid rather than chasing individual call sites. Find
+    # this specific fallback's real trigger condition before writing the
+    # test (do not guess it), reproduce it, and assert the same one-report
+    # guarantee holds.
 
 
 def test_drain_worker_still_handles_the_existing_result_line_format_unmodified(...):
@@ -289,9 +327,11 @@ def test_drain_worker_still_handles_the_existing_result_line_format_unmodified(.
 
 - [ ] **Step 3: Implement**
 
-Extend `_drain_worker`'s event-line branch (matched via `_EVENT_LINE_PREFIX`, never a bare `"{"` check): append the raw parsed-but-not-yet-untagged event to `state["pending_events"]` (reset at dispatch time, per v2's design — find the exact `state["in_flight"] = nodeid` site). Do NOT call `_replay_event` here. At the point the existing code currently does `self.results[nodeid] = outcome` (after the plain line's `nodeid == state["in_flight"]` check passes): first validate/deserialize the ENTIRE `state["pending_events"]` batch (untag tuples, resolve each `"kind"`, call `pytest_report_from_serializable` for report events, and confirm EVERY event's own carried nodeid — not just the plain line's — equals `state["in_flight"]`) into a fully-materialized list — if ANY event in the batch fails this step, treat it exactly like the existing malformed-line crash path (log, `_handle_worker_exit`, no replay of anything from this batch) — only once the WHOLE batch is confirmed valid, replay each materialized item in order via the real hook calls, THEN clear `state["pending_events"]`, THEN proceed with the existing unchanged `self.results[nodeid] = outcome` / recycle / retire logic.
+Extend `_drain_worker`'s event-line branch (matched via `_EVENT_LINE_PREFIX`, never a bare `"{"` check): append the raw parsed-but-not-yet-untagged event to `state["pending_events"]` (reset at dispatch time, per v2's design — find the exact `state["in_flight"] = nodeid` site). Do NOT call `_replay_event` here. **An event line arriving while `state["in_flight"] is None`, or a `json.loads` failure on an event line at receive time, must ALSO take the crash path immediately (v5, Fable's precision fix) — never staged silently for later, even though the batch-validation step below would eventually catch a staged-but-invalid entry; catching it as early as possible keeps the crash-diagnostic message accurate about WHERE things went wrong.** At the point the existing code currently does `self.results[nodeid] = outcome` (after the plain line's `nodeid == state["in_flight"]` check passes): first validate/deserialize the ENTIRE `state["pending_events"]` batch (untag tuples, resolve each `"kind"`, call `pytest_report_from_serializable` for report events, confirm each report's own `"$report_type" == "TestReport"` marker — v5, Fable's finding: pytest's own serialization includes this, checking it catches a malformed/foreign payload earlier and more precisely than waiting for a downstream `AttributeError` — and confirm EVERY event's own carried nodeid — not just the plain line's — equals `state["in_flight"]`) into a fully-materialized list — if ANY event in the batch fails this step, treat it exactly like the existing malformed-line crash path (log, `_handle_worker_exit`, no replay of anything from this batch) — only once the WHOLE batch is confirmed valid, replay each materialized item in order via the real hook calls (adding each report's nodeid to `self._replayed_nodeids`, see below), THEN clear `state["pending_events"]`, THEN proceed with the existing unchanged `self.results[nodeid] = outcome` / recycle / retire logic.
 
-**Centralized, exactly-once synthesis for EVERY unevaluated result (Sol round-2 — broader than the twice-crash case alone):** grep this file for every existing site that assigns `self.results[nodeid] = "unevaluated"` or `self.results.setdefault(nodeid, "unevaluated")` before implementing this — the plan's own research found at least TWO: `_handle_worker_exit`'s terminal second-crash branch, AND `_fail_queue_too_large` (marks every STILL-QUEUED, never-even-dispatched nodeid unevaluated after a permanent daemon sizing rejection). Both must produce a real, replayed report — a synthesized report ONLY for the crash case and silence for the sizing-rejection case would just move Fable's original "silently absent from JUnit" gap to a different trigger, not close it. Add one shared helper, e.g. `_synthesize_and_replay_unevaluated(self, nodeid, reason)`, called from both sites (and any other such site this grep turns up), replacing their direct `self.results[...] = "unevaluated"` assignment with a call to this helper (which itself still sets `self.results[nodeid] = "unevaluated"` — that dict's own semantics are unchanged — but ALSO synthesizes and replays a report first).
+**One structurally complete final pass, not per-site centralization (v5 — Fable round-2 found v4's "hunt down every call site" approach still missed a third site: the `results.get(nodeid, "unevaluated")` default read elsewhere in `__init__.py`, beyond the two v4 already found in `_handle_worker_exit` and `_fail_queue_too_large`).** Rather than continuing to hunt for every current AND future place that could leave a nodeid unevaluated, track which nodeids actually had a real report replayed (a `self._replayed_nodeids = set()`, added to whenever `_replay_event` fires a real `"report"`-kind hook call — NOT for synthesized ones, to avoid a synthesized report making a nodeid look "replayed" to this same check). After `run()`'s existing dispatch loop completes (immediately before `run()` returns `self.results`, wherever that currently is — do not disturb the existing loop's own logic), do ONE pass over every nodeid in `self.results` (or, more completely, every nodeid `self.collect()` ever registered, in case some path leaves a nodeid missing from `self.results` entirely rather than merely lacking a replay — verify against the real `results` dict's actual population guarantees before choosing) whose outcome is `"unevaluated"` and is NOT in `self._replayed_nodeids`: synthesize and replay one honest `outcome="failed"` report for it (see Report shape below), then add it to `self._replayed_nodeids`. This single site is complete by construction regardless of how many distinct code paths can produce "unevaluated" — current (`_handle_worker_exit`, `_fail_queue_too_large`, the `__init__.py` default) or future.
+
+Also fire the corresponding `logstart`/`logfinish` hooks for each synthesized nodeid (Fable: terminal `-v`/`[100%]` progress depends on these too, not just the final report), using the real collected `Item`'s own `nodeid`/`location`/`keywords` (the supervisor already holds these from `collect()`).
 
 **Report shape (Sol round-2 — the previous draft's plan was underspecified here and would not actually have worked):** pytest's `TestReport.outcome` is only ever meaningfully one of `"passed"/"failed"/"skipped"` to junitxml/terminalreporter — a literal `outcome="unevaluated"` is not a real pytest outcome and is simply IGNORED by junitxml's own rendering (silently, which is exactly the failure mode this fix exists to prevent). Synthesize the report as `outcome="failed"`, `when="call"` (or a clearly-synthetic non-call phase if that renders more honestly in this project's actual junitxml output — verify against real output, implementer's call), with a `longrepr` string that says plainly this was never actually observed to pass or fail (e.g. `"unevaluated: %s" % reason`, where `reason` is whatever the caller already has — the crash message, or `_fail_queue_too_large`'s own daemon-rejection reason) — mirroring xdist's own precedent for exactly this situation (`handle_crashitem`: a synthetic failure report, not a fabricated pass, whenever a real report can never arrive). Construct it directly as a Python object matching whatever fields `pytest_runtest_logreport`/junitxml actually read (verify against real installed pytest source which fields are load-bearing, do not guess) — it never came from a worker pipe, so there's no need to round-trip it through the JSON codec at all.
 
@@ -314,7 +354,7 @@ Read `internal/pylib/pytest_aitest_e2e_test.go`'s exact assertions on Slice 1's 
 
 - [ ] **Step 2: Write the failing end-to-end test first**
 
-A fixture suite: a passing test, a skipped test, an xfail, a real assertion failure with a custom message printing to both stdout and stderr, and a setup-error case. **Both runs (plain and aitest-driven) MUST pass `--junit-logging=all` (or `=system-out`/whatever exact option name this project's installed pytest version uses — verify, pytest's default `junit_logging` setting emits NO `<system-out>`/`<system-err>` elements at all, which would make this test's own captured-output assertions fail for a reason having nothing to do with this plan's fix, per Sol round-2).** Run both plainly and with `--aitest-workers=2 --junit-xml=<path>`. Assert the two XML outputs agree on: total counts per outcome, exact test-name set, AND (this is what Task 1's tuple fix and Task 2's validated-replay exist to guarantee) that the failing test's `<failure>`/`<system-out>`/`<system-err>` elements contain the SAME real diagnostic content in both, and that the skip/xfail elements are present and well-formed (not silently absent, which is exactly what the un-fixed tuple bug would have produced — a crash, not just missing content, so also assert the aitest-driven run's exit code and full run don't crash).
+A fixture suite: a passing test, a skipped test, an xfail, a real assertion failure with a custom message printing to both stdout and stderr, and a setup-error case — **plus at least one test where several workers print CONCURRENTLY-overlapping chatty output** (v5: this is the direct end-to-end regression case for Fable's fd-capture P0 — without it, Task 3's fixture is exactly the "cannot catch it" case Fable's review called out, since a single quiet test never exercises cross-worker capture contamination at all). **Both runs (plain and aitest-driven) MUST pass `--junit-logging=all` (or `=system-out`/whatever exact option name this project's installed pytest version uses — verify, pytest's default `junit_logging` setting emits NO `<system-out>`/`<system-err>` elements at all, which would make this test's own captured-output assertions fail for a reason having nothing to do with this plan's fix, per Sol round-2).** Run both plainly and with `--aitest-workers=2 --junit-xml=<path>`. Assert the two XML outputs agree on: total counts per outcome, exact test-name set, AND (this is what Task 1's tuple fix and Task 2's validated-replay exist to guarantee) that the failing test's `<failure>`/`<system-out>`/`<system-err>` elements contain the SAME real diagnostic content in both — for the chatty-concurrent tests specifically, assert each one's captured output contains ONLY its own lines and nothing from any sibling — and that the skip/xfail elements are present and well-formed (not silently absent, which is exactly what the un-fixed tuple bug would have produced — a crash, not just missing content, so also assert the aitest-driven run's exit code and full run don't crash). When comparing the two XML trees, normalize (strip or ignore) `time=`/`timestamp=`/`hostname=` attributes first (v5, Fable's finding) — these legitimately differ between any two real runs and are not part of what this plan's fidelity guarantee covers.
 
 - [ ] **Step 3: Run to verify failure**
 
@@ -330,3 +370,6 @@ A fixture suite: a passing test, a skipped test, an xfail, a real assertion fail
 - `-x`/`--maxfail` (`session.shouldfail`) is set by a replayed report per pytest's own hook implementation, but nothing in `Supervisor.run`'s dispatch loop currently checks it, so it is silently ignored under aitest. Document this as a known, deferred gap (not fixed in this plan) rather than leaving it undiscovered.
 - xdist's `rep.node = node` worker-identity bookkeeping — still not copied reflexively.
 - Coverage combine itself, branch-coverage config compatibility, and any interaction with a project's own custom `.coveragerc` — explicitly not this plan's concern per the simplified Task 1 design; whoever owns coverage in a given project (pytest-cov or a bare `coverage run`) owns all of that, unchanged, same as it would for any other pytest plugin's workers.
+- `pytest_warning_recorded` is not forwarded from worker to supervisor (v5, Fable's finding — xdist does forward it); combined with the child's own terminalreporter being unregistered, a test-time warning is silently absent from the parent's warnings summary under aitest. Document as deferred, not fixed here.
+- `log_cli` live logging: the forked child's `LoggingPlugin` still retains its own reference to the (unregistered-for-progress-printing, but not otherwise disabled) terminalreporter and may still write live log lines to the shared terminal directly from the child. Not fixed in this plan; document the interaction.
+- The plain terminal SUMMARY LINE aitest already prints (`__init__.py`, Slice 1) and the real terminalreporter's own summary (now populated via replay) can disagree in wording for a synthesized-unevaluated nodeid — the plain line says "unevaluated", the replayed summary counts it as failed/error (per the Report shape decision above, deliberately, since that is the only way to make it visible in JUnit at all). State this explicitly in Task 3's own test/documentation rather than let it read as an inconsistency bug.
