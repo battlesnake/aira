@@ -656,6 +656,13 @@ func routingFixtures(descriptors []DispatchDescriptor, findingID string) []Reque
 				}
 			case "gate":
 				switch operation.Name {
+				case "add":
+					// add is a real creation verb and refuses to overwrite an
+					// existing definition, so it needs an id the seed does not
+					// define. Only add is retargeted: run and the rest still
+					// need the seeded command-fixture gate, which has a canary
+					// and so actually reaches the execution sentinel.
+					args["gate_id"] = "routing-created-gate"
 				case "attest":
 					args["gate_id"] = "manual-fixture"
 					args["verdict"] = "fail"

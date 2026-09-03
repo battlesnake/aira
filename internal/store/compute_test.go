@@ -255,7 +255,11 @@ func TestComputeMismatchIsStoredAndRaisesWarningFinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Verdict != "pass" || len(report.Warnings) == 0 || report.Warnings[0].Code != domain.ComputeCodeConservation {
+	// This fixture defines no gates, and an unpopulated gate set now reports
+	// unevaluated rather than a fabricated pass, so the aggregate verdict is no
+	// longer a proxy for "raised a warning, not a failure". Assert that
+	// directly: no fail finding was produced.
+	if len(report.Findings) != 0 || len(report.Warnings) == 0 || report.Warnings[0].Code != domain.ComputeCodeConservation {
 		t.Fatalf("check = %#v", report)
 	}
 }

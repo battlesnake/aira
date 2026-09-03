@@ -362,7 +362,12 @@ func (s *Store) AttestGate(ctx context.Context, id, verdict, actor string) (Gate
 // workflow; these actions never mint a verdict from SQLite.
 func (s *Store) GateAction(ctx context.Context, operation, gateID, canaryID string) (any, error) {
 	switch operation {
-	case "add", "set", "show":
+	case "add", "set":
+		// Materialization needs the parsed input fields. A bare lookup here
+		// would report success for a definition this call did not create,
+		// which is the defect AIRA-53 recorded.
+		return nil, fmt.Errorf("E_GATE_INVALID: gate %s requires the field-carrying GateActionWithFields seam", operation)
+	case "show":
 		gates, err := s.ListGates()
 		if err != nil {
 			return nil, err
@@ -456,12 +461,14 @@ func (s *Store) GateAction(ctx context.Context, operation, gateID, canaryID stri
 	}
 }
 
-// GateActionWithFields is the transport-parity seam for the extended gate
-// descriptors. Gate files remain the authenticated source of truth; fields are
-// passed through for callers that materialize content changes and are not used
-// to mint a verdict directly.
+// GateActionWithFields is the seam for the extended gate descriptors. Gate
+// files remain the authenticated source of truth: add and set materialize a
+// validated definition on disk, and no input field is used to mint a verdict.
 func (s *Store) GateActionWithFields(ctx context.Context, operation, gateID, canaryID string, fields map[string]any) (any, error) {
-	_ = fields
+	switch operation {
+	case "add", "set":
+		return s.writeGateDefinition(ctx, operation, gateID, canaryID, fields)
+	}
 	return s.GateAction(ctx, operation, gateID, canaryID)
 }
 
@@ -608,7 +615,11 @@ func (s *Store) GateCheck(ctx context.Context) (GateCheckReport, error) {
 		return GateCheckReport{}, err
 	}
 	report := GateCheckReport{Verdict: gate.VerdictPass, Results: []GateCheckResult{}}
+	// An unpopulated gate set establishes nothing. Reporting pass here would
+	// assert a positive fact -- that nothing failed -- which was never
+	// evaluated, so the verdict is unevaluated with a distinguishing reason.
 	if len(discovered) == 0 {
+		report.Verdict, report.Code = gate.VerdictUnevaluated, GateSetEmptyCode
 		return report, nil
 	}
 	audit, err := OpenGateAudit(s.commonDir, false)
@@ -733,7 +744,23 @@ func (s *Store) checkGatesReadOnly(report *CheckReport) error {
 	if err != nil {
 		return err
 	}
+	// Check pre-seeds Dimensions["gates"] = "pass", so an unpopulated gate set
+	// would otherwise leave an affirmative claim that the gate dimension
+	// passed. Retract it: nothing was evaluated. This matches the established
+	// treatment of an empty requirement registry, which reports U_TRACE_EMPTY
+	// rather than a vacuous traceability pass.
+	if len(gateReport.Results) == 0 && gateReport.Code == GateSetEmptyCode {
+		addFinding(report, CheckFinding{Code: GateSetEmptyCode, Subject: "gates", Message: "no gate definition is present", Kind: "unevaluated"}, "gates")
+		return nil
+	}
 	for _, result := range gateReport.Results {
+		// A pass out of GateCheck is already proof-validated and trusted: an
+		// untrusted pass is downgraded before it reaches here. Recording it as
+		// an unevaluated finding would discard established truth and flip the
+		// aggregate verdict, so an established pass contributes no finding.
+		if result.Verdict == gate.VerdictPass {
+			continue
+		}
 		finding := CheckFinding{Code: result.Code, Subject: result.GateID, Message: result.Verdict, Kind: "unevaluated"}
 		if result.Verdict == gate.VerdictFail {
 			finding.Kind = "fail"

@@ -73,8 +73,13 @@ func TestTraceabilityBuiltWithoutCoversWarnsButPasses(t *testing.T) {
 	writeTraceSource(t, root, "implementation_test.go", "package example\n// verifies: AR-1\nfunc TestImplementation(t *testing.T) {}\n")
 
 	report := runTraceabilityCheck(t, s)
-	if report.Verdict != "pass" || report.Dimensions["traceability"] != "warning" {
-		t.Fatalf("report=%#v, want warning with overall pass", report)
+	// These fixtures define no gates, and an unpopulated gate set now reports
+	// unevaluated instead of a fabricated pass, so the aggregate verdict is no
+	// longer a usable proxy for "traceability warned but nothing failed".
+	// Assert that invariant directly: no fail finding was produced. This is
+	// also a stricter check than the aggregate verdict it replaces.
+	if len(report.Findings) != 0 || report.Dimensions["traceability"] != "warning" {
+		t.Fatalf("report=%#v, want warning with no failures", report)
 	}
 	if !hasFinding(report.Warnings, "W_TRACE_UNCOVERED") || hasFinding(report.Warnings, "W_TRACE_UNVERIFIED") {
 		t.Fatalf("warnings=%#v, want only uncovered", report.Warnings)
@@ -87,7 +92,7 @@ func TestTraceabilityBuiltWithCoversWithoutVerifiesWarns(t *testing.T) {
 	writeTraceSource(t, root, "implementation.go", "package example\n// covers: AR-1\nfunc implementation() {}\n")
 
 	report := runTraceabilityCheck(t, s)
-	if report.Verdict != "pass" || report.Dimensions["traceability"] != "warning" {
+	if len(report.Findings) != 0 || report.Dimensions["traceability"] != "warning" {
 		t.Fatalf("report=%#v, want warning with overall pass", report)
 	}
 	if !hasFinding(report.Warnings, "W_TRACE_UNVERIFIED") || hasFinding(report.Warnings, "W_TRACE_UNCOVERED") {
@@ -100,7 +105,7 @@ func TestTraceabilityPartialWithoutCoversWarnsButDoesNotRequireVerifies(t *testi
 	addTraceRequirement(t, s, domain.RequirementPartial)
 
 	report := runTraceabilityCheck(t, s)
-	if report.Verdict != "pass" || !hasFinding(report.Warnings, "W_TRACE_UNCOVERED") || hasFinding(report.Warnings, "W_TRACE_UNVERIFIED") {
+	if len(report.Findings) != 0 || !hasFinding(report.Warnings, "W_TRACE_UNCOVERED") || hasFinding(report.Warnings, "W_TRACE_UNVERIFIED") {
 		t.Fatalf("report=%#v, want only uncovered warning", report)
 	}
 }
@@ -114,7 +119,7 @@ func TestTraceabilityExemptStatusesDoNotWarn(t *testing.T) {
 			s, _ := newTraceabilityStore(t)
 			addTraceRequirement(t, s, status)
 			report := runTraceabilityCheck(t, s)
-			if report.Verdict != "pass" || hasFinding(report.Warnings, "W_TRACE_UNCOVERED") || hasFinding(report.Warnings, "W_TRACE_UNVERIFIED") {
+			if len(report.Findings) != 0 || hasFinding(report.Warnings, "W_TRACE_UNCOVERED") || hasFinding(report.Warnings, "W_TRACE_UNVERIFIED") {
 				t.Fatalf("status %q report=%#v, want no trace warning", status, report)
 			}
 		})
@@ -219,7 +224,7 @@ func TestTraceabilityFullyCoveredAndVerifiedBuiltPasses(t *testing.T) {
 	writeTraceSource(t, root, "implementation_test.go", "package example\n// verifies: AR-1\nfunc TestImplementation(t *testing.T) {}\n")
 
 	report := runTraceabilityCheck(t, s)
-	if report.Verdict != "pass" || report.Dimensions["traceability"] != "pass" || hasFinding(report.Warnings, "W_TRACE_UNCOVERED") || hasFinding(report.Warnings, "W_TRACE_UNVERIFIED") {
+	if len(report.Findings) != 0 || report.Dimensions["traceability"] != "pass" || hasFinding(report.Warnings, "W_TRACE_UNCOVERED") || hasFinding(report.Warnings, "W_TRACE_UNVERIFIED") {
 		t.Fatalf("report=%#v, want clean pass", report)
 	}
 }
@@ -262,7 +267,7 @@ func TestTraceabilityIgnoresUntrackedGeneratedAndMalformedGo(t *testing.T) {
 	writeTraceSourceUntracked(t, root, "generated_malformed.go", "package example\nfunc generated(\n")
 
 	report := runTraceabilityCheck(t, s)
-	if report.Verdict != "pass" || report.Dimensions["traceability"] != "pass" || hasFinding(report.Findings, "E_TRACE_DANGLING") || hasFinding(report.UnevaluatedFindings, "U_TRACE_UNSCANNED") {
+	if len(report.Findings) != 0 || report.Dimensions["traceability"] != "pass" || hasFinding(report.Findings, "E_TRACE_DANGLING") || hasFinding(report.UnevaluatedFindings, "U_TRACE_UNSCANNED") {
 		t.Fatalf("report=%#v, want untracked files ignored", report)
 	}
 }
@@ -330,7 +335,17 @@ func TestTraceabilityNoRequirementPrefixPreservesMalformedFinding(t *testing.T) 
 	if len(report.Findings) != 1 || report.Findings[0].Code != "E_REQUIREMENT_INVALID" || report.Findings[0].Subject != ".aira/requirements/AR-1.md" || report.Findings[0].Message != "E_REQUIREMENT_INVALID: missing requirement frontmatter" {
 		t.Fatalf("no-prefix malformed findings=%#v", report.Findings)
 	}
-	if len(report.UnevaluatedFindings) != 1 || report.UnevaluatedFindings[0].Code != "U_TRACE_EMPTY" || report.UnevaluatedFindings[0].Subject != "traceability" || report.UnevaluatedFindings[0].Message != "requirement registry is empty" {
+	// Scoped to the dimension under test: this fixture also defines no gates,
+	// which now honestly contributes its own U_GATE_SET_EMPTY finding instead
+	// of a fabricated pass, so an exact whole-list length check would assert
+	// something this test is not about.
+	traceUnevaluated := []CheckFinding{}
+	for _, finding := range report.UnevaluatedFindings {
+		if finding.Subject == "traceability" {
+			traceUnevaluated = append(traceUnevaluated, finding)
+		}
+	}
+	if len(traceUnevaluated) != 1 || traceUnevaluated[0].Code != "U_TRACE_EMPTY" || traceUnevaluated[0].Message != "requirement registry is empty" {
 		t.Fatalf("no-prefix empty diagnostic=%#v", report.UnevaluatedFindings)
 	}
 	result, err := s.ComputeGauge("traceability-status")
@@ -364,6 +379,10 @@ func TestTraceabilityCheckGoldenFindingsRemainByteForByte(t *testing.T) {
 	wantUnevaluated := []CheckFinding{
 		{Code: "U_TRACE_UNSCANNED", Subject: "implementation.go:2", Message: "requirement AR-2 is unreadable at .aira/requirements/AR-2.md", Kind: "unevaluated"},
 		{Code: "U_TRACE_UNSCANNED", Subject: "implementation_test.go:2", Message: "requirement AR-3 is unreadable at .aira/requirements/AR-2.md", Kind: "unevaluated"},
+		// This fixture defines no gates, and an unpopulated gate set now
+		// reports unevaluated instead of a fabricated pass. The golden records
+		// that honestly rather than omitting the dimension.
+		{Code: GateSetEmptyCode, Subject: "gates", Message: "no gate definition is present", Kind: "unevaluated"},
 	}
 	if !reflect.DeepEqual(report.Findings, wantFindings) || !reflect.DeepEqual(report.UnevaluatedFindings, wantUnevaluated) {
 		t.Fatalf("golden trace findings=%#v unevaluated=%#v\nwant findings=%#v unevaluated=%#v", report.Findings, report.UnevaluatedFindings, wantFindings, wantUnevaluated)

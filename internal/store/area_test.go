@@ -390,7 +390,11 @@ func TestCheckReportsAreaOverlapAsWarningOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Verdict != "pass" || report.Dimensions["area-overlap"] != "warning" {
+	// "Warning only" means the overlap produced no fail finding, which this now
+	// asserts directly instead of leaning on the aggregate verdict: for a
+	// fixture with no gates that verdict is honestly unevaluated rather than a
+	// pass, since the gate dimension establishes nothing.
+	if report.Dimensions["area-overlap"] != "warning" || len(report.Findings) != 0 {
 		t.Fatalf("overlap check report=%#v", report)
 	}
 	found := false

@@ -1852,15 +1852,21 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("subverb", true, true, "Gate operation", "add", "ls", "show", "set", "run", "check", "attest", "prove", "review", "canary-run", "canary-show", "baseline-pin", "baseline-show"),
 			stringSpec("gate_id", false, true, "Gate identifier"), stringSpec("canary_id", false, true, "Canary identifier"), stringSpec("verdict", false, false, "Attestation verdict", "pass", "fail"), stringSpec("actor", false, false, "Attestation actor"), stringSpec("reason", false, false, "Baseline pin reason"), stringSpec("report", false, false, "Comma-separated test report IDs"),
 			stringSpec("checker", false, false, "Gate checker", "check-dimension", "command", "manual-attestation", "ratchet"), stringSpec("predicate", false, false, "Command predicate; tests-green requires parser go-test-json-v1, which reads go test -json output only, so exit-zero is the only predicate a non-Go command can use", "exit-zero", "tests-green"),
+			stringSpec("dimension", false, false, "Check dimension for a check-dimension gate", "traceability"),
 			listSpec("argv", false, false, "Exact command argv tokens"), stringSpec("cwd", false, false, "Command root or relative subdirectory"), listSpec("env_allow", false, false, "Allow-listed environment names; a relative argv[0] such as make resolves only when PATH is listed here, and a definition without it is refused E_GATE_INVALID"),
 			stringSpec("timeout_ms", false, false, "Command timeout in milliseconds"), stringSpec("output_cap_bytes", false, false, "Combined output cap in bytes"), stringSpec("parser", false, false, "Command output parser; required by predicate tests-green and refused with predicate exit-zero", "go-test-json-v1"),
 			stringSpec("mutation_kind", false, false, "Typed mutation kind; the go- kinds parse Go source, inject-file is the language-agnostic kind and should inject a compiling, failing test in the subject's own language, because a body that merely breaks the build proves only that the build breaks", "go-negate-assertion", "go-inject-failing-test", "inject-file"), stringSpec("mutation_file", false, false, "Mutation target file"), stringSpec("mutation_test", false, false, "Mutation target test"),
-			stringSpec("mutation_occurrence", false, false, "Mutation assertion occurrence"), stringSpec("mutation_pkgdir", false, false, "Mutation package directory"), stringSpec("mutation_testname", false, false, "Injected mutation test name"), stringSpec("mutation_content", false, false, "Literal file body of an inject-file mutation, recorded in the hand-authored canary declaration under .aira/gates; like every mutation_ field here it is transport parity only and this verb does not write a declaration from it"), stringSpec("mutation_seed", false, false, "Mutation numeric seed"), stringSpec("mutation_expected_result", false, false, "Mutation expected result", "fail"),
+			stringSpec("mutation_occurrence", false, false, "Mutation assertion occurrence"), stringSpec("mutation_pkgdir", false, false, "Mutation package directory"), stringSpec("mutation_testname", false, false, "Injected mutation test name"), stringSpec("mutation_content", false, false, "Literal file body of an inject-file mutation; gate add and gate set materialize a canary declaration from the mutation_ fields under .aira/gates/canaries, and the other gate verbs carry them for transport parity only"), stringSpec("mutation_seed", false, false, "Mutation numeric seed"), stringSpec("mutation_expected_result", false, false, "Mutation expected result", "fail"),
 		}, MCPTool: "aira_gate", MCPOperation: "subverb", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			subverb := strings.ToLower(stringArg(args, "subverb"))
 			switch subverb {
 			case "show", "add", "set", "run", "attest", "prove", "review", "baseline-pin", "baseline-show":
 				_ = stringArg(args, "gate_id")
+				if subverb == "add" || subverb == "set" {
+					// add/set accept an explicit canary id override, which the
+					// materializing store binds into canary_ids.
+					_ = stringArg(args, "canary_id")
+				}
 				if subverb == "attest" {
 					_ = stringArg(args, "verdict")
 					_ = stringArg(args, "actor")
@@ -1937,10 +1943,23 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				if !ok {
 					return nil, errors.New("E_GATE_INVALID: gate action is unavailable")
 				}
+				var value any
+				var actionErr error
 				if inputStore, ok := c.store.(gateActionInputStore); ok {
-					return inputStore.GateActionWithFields(ctx, subverb, stringArg(args, "gate_id"), stringArg(args, "canary_id"), inputFields)
+					value, actionErr = inputStore.GateActionWithFields(ctx, subverb, stringArg(args, "gate_id"), stringArg(args, "canary_id"), inputFields)
+				} else {
+					value, actionErr = actionStore.GateAction(ctx, subverb, stringArg(args, "gate_id"), stringArg(args, "canary_id"))
 				}
-				return actionStore.GateAction(ctx, subverb, stringArg(args, "gate_id"), stringArg(args, "canary_id"))
+				if actionErr != nil {
+					return nil, actionErr
+				}
+				// A gate result carries an established verdict. Returning it
+				// unwrapped reported OK/exit 0 for an unevaluated or failing
+				// gate, so the verdict is plumbed to the exit code here.
+				if result, ok := value.(store.GateCheckResult); ok {
+					return handlerData{Data: result, Verdict: result.Verdict}, nil
+				}
+				return value, nil
 			default:
 				return nil, fmt.Errorf("E_GATE_INVALID: unknown gate operation %q", subverb)
 			}
@@ -2020,7 +2039,12 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 			{Name: "run", Summary: "Evaluate a gate", Safety: SafetyReconcile, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"run", "traceability"}},
 			{Name: "check", Summary: "Read the latest gate result", Safety: SafetyRead, Args: nil, Example: []string{"check"}},
 			{Name: "attest", Summary: "Answer a manual gate challenge", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}, {Name: "verdict", Required: true}, {Name: "actor", Required: true}}, Example: []string{"attest", "review", "--verdict", "pass", "--actor", "human"}},
-			{Name: "prove", Summary: "Record proof of fire", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"prove", "traceability"}},
+			// Safety stays SafetyMutate: the operation is read-only in fact, but
+			// re-classifying it changes request routing, which is out of scope
+			// here. The Summary is what was dishonest -- prove records no
+			// proof-of-fire. Only RunGate and AttestGate mint one, from real
+			// canary evidence, which is the point of the security model.
+			{Name: "prove", Summary: "Read back the latest gate result and its proof linkage", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"prove", "traceability"}},
 			{Name: "review", Summary: "Request manual gate review", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"review", "review"}},
 			{Name: "canary-run", Summary: "Run a named canary", Safety: SafetyReconcile, Args: append([]OperationArg{{Name: "canary_id", Required: true}}, mutationOperationArgs()...), Example: []string{"canary-run", "unit-tests-mutation", "--mutation-kind", "go-inject-failing-test", "--mutation-pkgdir", ".", "--mutation-testname", "TestInjected"}},
 			{Name: "canary-show", Summary: "Show a canary declaration", Safety: SafetyRead, Args: append([]OperationArg{{Name: "canary_id", Required: true}}, mutationOperationArgs()...), Example: []string{"canary-show", "unit-tests-mutation"}},
@@ -2343,7 +2367,7 @@ func stringSlice(args *argAccessor, key string) []string {
 
 func gateDefinitionInputFields(args *argAccessor) map[string]any {
 	fields := map[string]any{}
-	for _, name := range []string{"checker", "predicate", "cwd", "timeout_ms", "output_cap_bytes", "parser", "mutation_kind", "mutation_file", "mutation_test", "mutation_occurrence", "mutation_pkgdir", "mutation_testname", "mutation_content", "mutation_seed", "mutation_expected_result"} {
+	for _, name := range []string{"checker", "predicate", "dimension", "cwd", "timeout_ms", "output_cap_bytes", "parser", "mutation_kind", "mutation_file", "mutation_test", "mutation_occurrence", "mutation_pkgdir", "mutation_testname", "mutation_content", "mutation_seed", "mutation_expected_result"} {
 		if value := stringArg(args, name); value != "" {
 			fields[name] = value
 		}
@@ -2368,7 +2392,7 @@ func mutationInputFields(args *argAccessor) map[string]any {
 }
 
 func gateDefinitionOperationArgs() []OperationArg {
-	names := []string{"gate_id", "checker", "predicate", "argv", "cwd", "env_allow", "timeout_ms", "output_cap_bytes", "parser", "mutation_kind", "mutation_file", "mutation_test", "mutation_occurrence", "mutation_pkgdir", "mutation_testname", "mutation_content", "mutation_seed", "mutation_expected_result"}
+	names := []string{"gate_id", "checker", "predicate", "dimension", "canary_id", "argv", "cwd", "env_allow", "timeout_ms", "output_cap_bytes", "parser", "mutation_kind", "mutation_file", "mutation_test", "mutation_occurrence", "mutation_pkgdir", "mutation_testname", "mutation_content", "mutation_seed", "mutation_expected_result"}
 	args := make([]OperationArg, 0, len(names))
 	for _, name := range names {
 		args = append(args, OperationArg{Name: name, Required: name == "gate_id"})

@@ -27,13 +27,22 @@ type GateCheckResult struct {
 	Seq     uint64
 }
 
+// GateCheckReport carries the folded gate verdict. Code is the report-level
+// reason and is set when the verdict cannot be established from the gate set
+// itself, for example when no gate is defined at all.
 type GateCheckReport struct {
 	Verdict     string
+	Code        string
 	Results     []GateCheckResult
 	Failed      int
 	Unevaluated int
 	Passed      int
 }
+
+// GateSetEmptyCode marks a gate report whose verdict could not be established
+// because no gate definition was discovered. An unpopulated gate set evaluates
+// nothing, so it is never a pass.
+const GateSetEmptyCode = "U_GATE_SET_EMPTY"
 
 type discoveredGate struct {
 	Definition gate.GateDefinition
