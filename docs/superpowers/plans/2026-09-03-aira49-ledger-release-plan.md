@@ -1,299 +1,361 @@
-# AIRA-49: Release stuck confine ledger leases on confirmed-dead supervisors — Implementation Plan (v2)
+# AIRA-49: Reclaim stuck confine ledger leases past a lease-TTL — Implementation Plan (v5)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** When a confine job's owning process dies without releasing its admission lease (external SIGKILL of the wrapping `aira confine` launcher, or any other non-graceful death), the daemon must eventually release the stuck ledger reservation on its own — never leaving a permanently unrecoverable reservation, and never requiring a daemon restart to clear it — and it must do so with a safety property AT LEAST as strong as the one the existing physical-directory reaper already has, not a weaker one.
+**Goal:** When a confine job's owning process dies without releasing its admission lease, the daemon must eventually reclaim the stuck ledger reservation on its own — never leaving it permanently unrecoverable, never requiring a daemon restart — via a policy whose consequences are honestly documented, not a claim of having *proven* the owner dead (a claim this project's own review process has now shown, twice, cannot actually be made from any signal available here).
 
-**Architecture (v2 — revised after a v1 plan-review BLOCK from Codex/Sol; see "What changed from v1" below):** A daemon-side sweep pass finds ledger-granted leases whose scope LOOKS dead by a cheap, coarse, list-scan-based pre-filter (empty by leaf-only `cgroup.procs`, recorded supervisor PID not found via `kill(pid,0)`, past a grace window, not mid-launch). For each such candidate, it ATTEMPTS THE ACTUAL PHYSICAL REAP of that scope's directory tree, reusing the exact same fd-anchored, kernel-enforced removal (`reapEmptyConfineScopeTree`) the existing orphaned-scope reaper (AIRA-36/#72) already uses and already trusts. `Unlinkat(AT_REMOVEDIR)` on a cgroup directory that still has ANY live process anywhere in its subtree fails at the kernel level (`ENOTEMPTY`) — unconditionally, atomically, and with no window for a stale userspace signal to matter. **Only if that physical reap actually succeeds** does the pass release the ledger lease. The coarse pre-filter is now explicitly just a cheap "is this candidate worth attempting" gate, not a safety proof; the kernel's own atomic removal is the sole safety gate, exactly mirroring how the existing orphan reaper is already safe today.
+**Architecture (v5 — four plan-review rounds, three BLOCKs and one PASS-WITH-FIXES; see "What changed" below):** Every granted admission lease is, from this point on, understood to carry an implicit **maximum unused lifetime**: if `staleLeaseReleaseGrace` (default 15 minutes) elapses after grant with the scope still found empty, the daemon reclaims it — a lease-TTL policy, not a liveness proof. A background sweep, run across **every currently registered admission-queue slice** (not just the default one — see Task 3), finds `admitGranted` waiters whose lease was GRANTED (not merely enqueued — see below) at least `staleLeaseReleaseGrace` ago. For each, it attempts to physically remove that scope's cgroup directory tree via the exact fd-anchored, kernel-enforced removal (`reapEmptyConfineScopeTree`) the existing orphaned-scope reaper (AIRA-36/#72) already uses. **Only on a confirmed-successful physical removal** does the pass reclaim the ledger lease. Two facts gate the action: how long the ledger itself has held the GRANT (an in-process timestamp set at the exact moment of grant, immune to admission-queue contention), and whether the kernel itself just proved the scope is empty right now — but the plan explicitly does NOT claim these together prove the owner is dead (see v5's changelog entry for why that claim doesn't hold, and why the fix is honest framing plus a conservative default rather than a fifth attempt at a stronger proof that does not exist).
 
-**What changed from v1, and why:** v1 proposed releasing the lease based on the list-scan's `Populated` field directly, reasoning it reused "the same proof" the existing reaper already trusts. Codex/Sol's plan-review (BLOCK) found this was actually a materially WEAKER signal than v1 claimed: `ConfineRecord.Populated` (`internal/runner/confine_manage_linux.go`, `listConfinesWithDeps`) is populated from `scope.Members()` — a read of `cgroup.procs`, which is **leaf-only** (a cgroup-v2 directory with a live nested child cgroup, e.g. aitest's own `.aira-supervisor` holding worker sub-scopes, correctly shows ZERO entries in ITS OWN `cgroup.procs` even while its subtree is very much alive). The existing reaper's actual safety comes from a SEPARATE mechanism: `reapEmptyConfineScopeTree` re-opens the scope fresh and calls `Empty()` (subtree-aware, via `cgroup.events`'s `populated` field) immediately before removal, AND the kernel itself refuses to remove a non-empty directory regardless — so even a wrong candidate selection there is harmless (the `Unlinkat` just fails, `Skipped++`). v1's release path had no equivalent: releasing a ledger entry is not a kernel-guarded operation, so a wrong "empty" verdict there is not self-correcting. Sol also found this made the plan's own PID-namespace safety concern (which v1 flagged but did not resolve) moot in the WRONG direction — a `kill(pid,0)` false-negative on a genuinely-live supervisor would have gone straight through to an unsafe release. v2's reap-first-release-second design fixes this at the root: it makes the SAME kernel-enforced check the existing reaper already relies on the sole gate for release too, so a wrong pre-filter guess (whatever its cause — leaf-vs-subtree, PID-namespace weirdness, a race) can only ever result in a harmless failed reap attempt, never an unsafe release. Sol also caught a literal no-op bug in v1's pseudocode (the candidate function's nil-`supervisorDead` fail-closed guard was never given a real default, so the daemon's own call site — passing `nil` expecting an internal default — would have made the whole feature inert) and porous/unrunnable test scaffolding (hardcoded real-slice resolution with no path-injection seam, and a misunderstanding of `scopeReapGrace`'s zero-value fallback). v2 fixes all of these directly in the design below, not as afterthoughts.
+**What changed, across three review rounds:**
 
-**Tech Stack:** Go (`internal/runner`, `internal/daemon`), existing `pytest`/`go test` toolchains unaffected.
+- **v1** released a lease based on a list-scan's `Populated` field (leaf-only `cgroup.procs`, not subtree-aware — misses a live NESTED child cgroup). Sol/Codex: BLOCK. Also found a TOCTOU race, an unresolved PID-namespace concern, a literal no-op bug, and unrunnable tests.
+- **v2** fixed subtree-safety/TOCTOU by requiring the kernel's own `Unlinkat` to succeed before releasing (reap-first, release-on-success). Sol/Codex, round 2: still BLOCK — a kernel-confirmed-empty scope only proves emptiness *at that instant*, not that nothing will populate it later; the age signal v2 used (a scope directory's filesystem mtime) starts ticking from `confineScopeID`'s mint time, which happens *before* admission is even granted (`internal/runner/confine_linux.go`), so a job that merely queued for a while under contention could already look "stuck" the moment it launches. Fable independently found the identical class of gap reviewing the same v2, with exact line citations (`confine_linux.go:475` scope-ID mint before `:509` admit, scope created at `:535`, child placed at `:703`) and rendered PASS WITH FIXES with a long, precise list (reuse this file's *existing* real-cgroup reaper test fixtures by name rather than hand-rolling new ones; thread an `afterEmptyProof` seam through so a repopulation-after-proof race is actually testable; log releases made before an early ctx-cancel return; document the no-directory-lease and PID-reuse-liveness gaps explicitly; and — importantly — traced that a SIGKILLed launcher's connection-close *should already* release the lease via the existing `admitConnection`/`cancelPeer` path, `admit.go:452-521`, meaning the ORIGINAL reported stuck state's root cause is not actually fully explained by "nothing releases it" and needs a post-deploy repro check, not just a plausible-sounding narrative).
+- **v3 (drafted, then superseded before a fourth review round)** dropped the list-scan/`kill(pid,0)` heuristic entirely in favor of the daemon's OWN `admitWaiter.enqueued` timestamp as the age signal. This turned out to have the SAME underlying flaw Fable had just found for v2, one field over: `enqueued` (`internal/daemon/admit.go:571`) is set once, at waiter CREATION — i.e. at the moment a request first arrives and is queued (`state: admitQueued`) — and is NEVER updated when the waiter later actually transitions to `admitGranted` (`admit.go:729`). A job that waited a long time in the admission queue under contention would therefore look old the instant it's granted, exactly the same "queueing delay masquerading as launch-abandonment" confusion Fable flagged for v2's scope-ID-mint-based age, just measured from a different starting point with the identical defect.
+- **v4 added a genuinely new, dedicated `admitWaiter.grantedAt` timestamp**, set only at the exact moment `waiter.state = admitGranted` fires (`admit.go:729`) — the one moment in this whole system that authoritatively marks "the daemon just decided this job may proceed," closing the queueing-contention defect both Sol and Fable found (independently) at its true root. Sol's round-4 review confirmed this specific fix works ("no admission contention remains afterward") — but still BLOCKed on two further, narrower points: (1) `grantedAt` closes the *contention* defect but the plan's framing still implicitly claimed the kernel-empty-reap + age combination *proves* the owner is gone, which is not actually true — a live launcher can be legitimately `SIGSTOP`ed, cgroup-frozen, or stuck in an unbounded kernel/filesystem operation for longer than any fixed grace, and reclaiming its lease mid-pause would break a launch that was never actually abandoned; Sol's own suggested resolution: "either define this explicitly as a lease-expiry policy... or add a protocol/state transition" — v5 takes the first option, since it needs no new code and matches this system's own existing "lease" vocabulary exactly (a lease with a bounded lifetime that reclaims on non-use is the ordinary, well-understood semantics of a lease, not a novel concept requiring new machinery); (2) the sweep only ever resolved ONE default slice path (`ResolveConfineManagementSlice("")`), silently missing any lease admitted against an explicitly-specified `--slice` — v5 fixes this concretely (Task 3).
+- **v5 (this plan)** reframes the grace period as an explicit, honestly-documented lease-TTL/reclaim policy rather than a liveness-detection claim (Global Constraints and Task 3's doc comment both state the SIGSTOP/paused-launcher tradeoff plainly — this is a deliberate, accepted policy consequence, not an oversight), and fixes the sweep to iterate every registered admission-queue slice, not just the default.
 
-**Spec:** Ticket AIRA-49 (`.aira/tickets/AIRA-49.md`) carries the original root-cause analysis. This plan document's "What changed from v1" section above carries the plan-review findings that shaped the actual design; read both.
+**Tech Stack:** Go (`internal/daemon`, `internal/runner`).
+
+**Spec:** Ticket AIRA-49 (`.aira/tickets/AIRA-49.md`, original root-cause analysis) plus this plan's "What changed" section (three real review rounds' findings) — read both.
 
 ## Global Constraints
 
 - No cgo; one static Go binary.
 - Every heavy command (`go build`, `go test`, `go vet`) MUST be run via `aira confine --`.
-- Correctness-critical work: full two-loop (plan-review, Fable gate, implement, build-review, Fable/build gate) before merge.
-- Reuse existing primitives; do not duplicate the reap machinery. The physical removal in this plan MUST go through `reapEmptyConfineScopeTree` (the exact function the existing orphan reaper calls) — do not write a second removal implementation, and do not release a lease based on any signal OTHER than that function's own success return.
-- `defaultScopeReapInterval` is 5 minutes and `defaultScopeReapGrace` is 2 minutes (`internal/daemon/paths.go`). Worst-case time to release a genuinely stuck lease is therefore up to grace+interval (~7 minutes), not "within 2 minutes" — state this accurately in code comments and commit messages; do not imply a tighter bound than the code actually delivers.
+- Correctness-critical work: full two-loop before merge.
+- The physical removal MUST go through `reapEmptyConfineScopeTree` — do not write a second removal implementation.
+- Do NOT use `kill(pid,0)` / any OS-level PID-liveness check anywhere in this feature. Three review rounds converged on this: the release decision needs no such check, only (a) `grantedAt` age and (b) kernel-confirmed physical removal.
+- Do NOT use `admitWaiter.enqueued` for this feature's age gate — it measures time since a request was first submitted, not time since it was granted, and conflates ordinary admission-queue contention with launch abandonment. Use the new `grantedAt` field (Task 1) exclusively.
+- `staleLeaseReleaseGrace`'s default (Task 2) is a NEW, dedicated constant — do not reuse `defaultScopeReapGrace` (2 minutes; a different mechanism, protected by the unrelated and already-safe `!hasLiveLease` gate).
+- Before considering this plan "done," re-run (or arrange for fastest-ee-dc to re-run) the ORIGINAL reported repro (`aira confine --delegate-ram -- <long job>`, external-kill the wrapper, wait) against the deployed fix and confirm release actually happens within the expected bound. Fable's review traced that the ordinary connection-close release path (`admit.go:452-521`) *should* already have handled a plain SIGKILL of the launcher, which means the original stuck-lease report's true trigger is not fully explained by "nothing releases it" — this sweep is a correct and valuable backstop regardless of the original trigger's exact mechanism, but do not close this out as "root-caused and fixed" without that honest caveat and, where practical, a live confirmation.
 
 ---
 
 ## File Structure
 
-- `internal/runner/confine_manage_linux.go` — refactor `reapOrphanedConfineScopesWithDeps`'s per-candidate removal into a small reusable helper (`reapConfineScopeByID`, taking an already-open slice parent fd), and add `ReleaseStaleGrantedLeases`, the new exported entry point the daemon calls.
-- `internal/runner/confine_manage.go` — add `orphanHeuristicMatch` (renamed and reframed from v1's `isOrphanProven` — same fields, but the new name and doc comment make clear it is a coarse pre-filter, not a safety proof) and its two callers: the existing `orphanedConfineScopeCandidates` (unchanged behavior, just now built on the shared helper) and the new `staleGrantedLeaseCandidates` (unexported now — v1 exported it as `StaleGrantedLeaseCandidates` for the daemon to call directly, but v2 moves the daemon-facing entry point to `ReleaseStaleGrantedLeases` in the linux file instead, since release now requires the linux-only physical-reap step; keep the pure candidate-selection function unexported and package-internal).
-- `internal/daemon/confine_reaper.go` — add `releaseStaleGrantedLeasesPass`, calling `runner.ReleaseStaleGrantedLeases` with `s.releaseActiveConfine` as the release callback, wired into `runScopeReaper`'s loop immediately before the existing `reapOrphanedScopesPass` call (a lease released in this pass becomes eligible for the immediately-following `reapOrphanedScopesPass` in the SAME tick as a bonus, though it is no longer load-bearing for correctness the way v1's ordering was, since this pass now does its own physical reap directly).
-- Tests: alongside `orphanedConfineScopeCandidates`'s existing tests (find that file first) for the pre-filter; a new or existing real-cgroup test file (gated the same way the rest of this package's real-cgroup tests are, using `cgrouptest.IsolatedScopeParent`) for `ReleaseStaleGrantedLeases`, since its core safety property can only be meaningfully tested against a REAL cgroup tree (a fake/mocked `Empty()`/`Unlinkat` would just test the mock, not the kernel behavior the whole design leans on); a daemon-level test for `releaseStaleGrantedLeasesPass`'s wiring/callback plumbing (this one CAN use a fake, since it's testing plumbing, not kernel semantics).
+- `internal/daemon/admit.go` — add `grantedAt time.Time` to `admitWaiter`; set it at the existing `waiter.state = admitGranted` transition (line ~729).
+- `internal/runner/confine_manage_linux.go` — add `ReapScopeIfEmpty(slicePath, scopeID string, afterEmptyProof func()) (bool, error)`, wrapping the existing `reapEmptyConfineScopeTree` (open the slice fd, delegate, close). The `afterEmptyProof` parameter exists specifically so a test can inject a repopulation race between the empty-proof and the actual removal (mirroring whatever seam the existing orphan-reap tests already use for the identical purpose — reuse it, do not invent a second one).
+- `internal/daemon/confine_reaper.go` — add `releaseStaleGrantedLeasesPass` and `staleGrantedLeases`, wired into `runScopeReaper`'s loop immediately before the existing `reapOrphanedScopesPass` call.
+- `internal/daemon/paths.go` — add `defaultStaleLeaseReleaseGrace = 15 * time.Minute`.
+- `internal/daemon/server.go` — add a `staleLeaseReleaseGrace time.Duration` field to `*Server`, mirroring `scopeReapGrace`'s exact existing field/init pattern.
+- Tests:
+  - `internal/runner/confine_manage_linux_test.go` — for `ReapScopeIfEmpty`. **Before writing anything, read this file's existing real-cgroup reaper test helpers and reuse them by name**: `reaperTestParentAndDeadPID`, `createReaperTestScope`, `mkdirReaperTestCgroup`, `startReaperTestSleeper` (waits for `populated 1` before returning — belt-and-braces against a vacuous pass), `stopReaperTestSleeper`, `assertReaperTestMissing`, `reaperTestDead`, `confineTestScopeID`, and use `TestReapOrphanedConfineScopesKeepsEmptySiblingOfLiveNestedBranch` (around line 472) as the template for the live-nested-child case, and `TestReapOrphanedConfineScopesRepopulationAfterProof` (around line 540) as the template for the `afterEmptyProof`-seam race case. Do not hand-roll new fixture helpers that duplicate these.
+  - `internal/daemon/confine_reaper_test.go` (new, or extend an existing daemon-level reaper test file — check first) — for the daemon-side pass. Use `t.Setenv("AIRA_CONFINE_SLICE", cgrouptest.IsolatedScopeParent(t))` (this daemon package already imports `cgrouptest`, e.g. `admit_reconstruction_linux_test.go`) for a REAL confine slice path a real-cgroup test can target, and the hand-built `sliceQueue`/`admitWaiter{state: admitGranted, ...}` fixture pattern already used at `internal/daemon/confine_manage_test.go:39-50` for constructing a granted waiter — reuse both rather than reinventing them. Note `t.Setenv` forbids `t.Parallel`. Note also that `NewServer` sets `scopeReapGrace` to 2 minutes by default (`server.go:148`), not zero — irrelevant to THIS feature's own `staleLeaseReleaseGrace` field (which this plan introduces with its own explicit default), but be precise about which field a test is setting.
 
-## Task 1: Extract a shared coarse pre-filter (not a safety proof) and its inverse
-
-**Files:**
-- Modify: `internal/runner/confine_manage.go` (the existing `orphanedConfineScopeCandidates` function)
-- Test: wherever `orphanedConfineScopeCandidates`'s existing tests currently live (find them first)
-
-**Interfaces:**
-- Produces: `orphanHeuristicMatch(record ConfineRecord, graceSeconds int64, supervisorDead func(pid int) bool) bool` (unexported) and `staleGrantedLeaseCandidates(records []ConfineRecord, grace time.Duration, supervisorDead func(pid int) bool, hasLiveLease func(scopeID string) bool) []ConfineRecord` (unexported — package-internal only, called from `ReleaseStaleGrantedLeases` in Task 2, NOT called directly by the daemon).
-- Consumes: `ConfineRecord` (existing), `pidIsDead` (existing, `confine_manage_linux.go`).
-
-- [ ] **Step 1: Write the failing tests first**
-
-Read the existing tests for `orphanedConfineScopeCandidates` before writing new ones — match their existing fixture-building style exactly.
-
-```go
-func TestStaleGrantedLeaseCandidatesMatchesTheSameHeuristicAsOrphanReapingInverted(t *testing.T) {
-	grace := 2 * time.Minute
-	deadPID := func(pid int) bool { return pid == 111 }
-	hasLease := func(scopeID string) bool { return scopeID == "granted-and-looks-dead" || scopeID == "granted-but-alive" }
-
-	populatedZero, populatedOne := 0, 1
-	oldEnough, tooYoung := int64(200), int64(10)
-	pid, alivePID := 111, 222
-
-	records := []ConfineRecord{
-		{ScopeID: "granted-and-looks-dead", SupervisorPID: &pid, Populated: &populatedZero, AgeSeconds: &oldEnough},
-		{ScopeID: "granted-but-alive", SupervisorPID: &alivePID, Populated: &populatedZero, AgeSeconds: &oldEnough},
-		{ScopeID: "granted-but-too-young", SupervisorPID: &pid, Populated: &populatedZero, AgeSeconds: &tooYoung},
-		{ScopeID: "granted-but-leaf-nonempty", SupervisorPID: &pid, Populated: &populatedOne, AgeSeconds: &oldEnough},
-		{ScopeID: "looks-dead-but-no-lease", SupervisorPID: &pid, Populated: &populatedZero, AgeSeconds: &oldEnough},
-	}
-
-	got := staleGrantedLeaseCandidates(records, grace, deadPID, hasLease)
-
-	if len(got) != 1 || got[0].ScopeID != "granted-and-looks-dead" {
-		t.Fatalf("candidates=%+v, want exactly [granted-and-looks-dead] -- this is a CANDIDATE list, not proof of anything; Task 2's physical-reap step is what actually decides", got)
-	}
-}
-```
-
-Plus the fail-closed-on-unknown-facets and nil-func-returns-none cases from v1 (unchanged reasoning — keep them, adjust names to `staleGrantedLeaseCandidates`).
-
-Also confirm (re-run or write, if missing) a test that `orphanedConfineScopeCandidates`'s own existing behavior is byte-for-byte unchanged by this extraction.
-
-- [ ] **Step 2: Run to verify failure** — `aira confine -- go test ./internal/runner/... -run 'StaleGrantedLeaseCandidates' -v` — expect FAIL (undefined function).
-
-- [ ] **Step 3: Implement**
-
-```go
-// orphanHeuristicMatch is a CHEAP, COARSE pre-filter shared by orphan
-// directory reaping and stale-lease release candidate selection. It is
-// NOT proof of anything by itself -- Populated here is leaf-only
-// (cgroup.procs via scope.Members(), NOT the subtree-aware cgroup.events
-// populated field), so a cgroup with a live NESTED child (e.g. aitest's
-// own .aira-supervisor holding worker sub-scopes) can match this heuristic
-// while genuinely still being alive. Both real callers require a SEPARATE,
-// authoritative confirmation before acting: orphan reaping gets it from the
-// kernel itself refusing Unlinkat(AT_REMOVEDIR) on a non-empty directory;
-// stale-lease release (Task 2) gets it by requiring that SAME kernel-enforced
-// removal to actually succeed before releasing anything. Never wire this
-// heuristic's output directly to an irreversible action.
-func orphanHeuristicMatch(record ConfineRecord, graceSeconds int64, supervisorDead func(pid int) bool) bool {
-	return record.Populated != nil && *record.Populated == 0 &&
-		record.SupervisorPID != nil && supervisorDead(*record.SupervisorPID) &&
-		record.AgeSeconds != nil && *record.AgeSeconds >= graceSeconds &&
-		!record.Pending
-}
-
-func orphanedConfineScopeCandidates(records []ConfineRecord, grace time.Duration, supervisorDead func(pid int) bool, hasLiveLease func(scopeID string) bool) []ConfineRecord {
-	graceSeconds := int64(grace / time.Second)
-	candidates := make([]ConfineRecord, 0)
-	if supervisorDead == nil {
-		return candidates
-	}
-	for _, record := range records {
-		if !orphanHeuristicMatch(record, graceSeconds, supervisorDead) ||
-			(hasLiveLease != nil && hasLiveLease(record.ScopeID)) {
-			continue
-		}
-		candidates = append(candidates, record)
-	}
-	return candidates
-}
-
-// staleGrantedLeaseCandidates is orphanedConfineScopeCandidates's mirror
-// image (AIRA-49): scopes that STILL HOLD a granted ledger lease
-// (hasLiveLease true) despite matching the same coarse heuristic. This is
-// package-internal on purpose -- ReleaseStaleGrantedLeases (confine_manage_linux.go)
-// is the only sanctioned caller, since a candidate from this list must NEVER
-// be released without first passing the physical-reap confirmation it wraps.
-func staleGrantedLeaseCandidates(records []ConfineRecord, grace time.Duration, supervisorDead func(pid int) bool, hasLiveLease func(scopeID string) bool) []ConfineRecord {
-	graceSeconds := int64(grace / time.Second)
-	candidates := make([]ConfineRecord, 0)
-	if supervisorDead == nil || hasLiveLease == nil {
-		return candidates
-	}
-	for _, record := range records {
-		if !orphanHeuristicMatch(record, graceSeconds, supervisorDead) || !hasLiveLease(record.ScopeID) {
-			continue
-		}
-		candidates = append(candidates, record)
-	}
-	return candidates
-}
-```
-
-- [ ] **Step 4: Run to verify pass** — `aira confine -- go test ./internal/runner/... -run 'OrphanedConfineScopeCandidates|StaleGrantedLeaseCandidates' -v`
-
-- [ ] **Step 5: Commit** — `git commit -m "refactor(runner): extract shared orphan pre-filter heuristic (AIRA-49)"`
-
-## Task 2: Reap-first, release-second — the actual safety-bearing change
+## Task 1: `grantedAt` — the authoritative, contention-immune age signal
 
 **Files:**
-- Modify: `internal/runner/confine_manage_linux.go` (extract `reapConfineScopeByID`; add `ReleaseStaleGrantedLeases`)
-- Test: a NEW real-cgroup test file (or an existing one covering `ReapOrphanedConfineScopes` at this level — check `internal/runner/confine_manage_linux_test.go` first), following the SAME `cgrouptest.IsolatedScopeParent(t)` + `AIRA_REAL_CGROUP` convention every other real-cgroup test in this package already uses. **Do not test this task's core safety property against a mock** — the entire point of the redesign is that the kernel's own `Unlinkat` behavior is the safety gate, so the test must exercise a REAL cgroup tree.
+- Modify: `internal/daemon/admit.go`
+- Test: wherever this package's existing admit-grant tests live (find them first — likely covering the `admitQueued`→`admitGranted` transition already, e.g. near `TestEvaluateAdmitQueueDiscountsOnlyReclaimableFileLRU` or similar).
 
 **Interfaces:**
-- Consumes: `reapEmptyConfineScopeTree` (existing, this file), `staleGrantedLeaseCandidates` (Task 1), `runner.ListConfines` (existing).
-- Produces: `func ReleaseStaleGrantedLeases(ctx context.Context, slicePath string, grace time.Duration, supervisorDead func(pid int) bool, hasLiveLease func(scopeID string) bool, release func(scopeID string)) (ConfineReapResult, error)` — reuses `ConfineReapResult` (already has `Reaped []string`/`Skipped int`, which map naturally onto "released" / "attempted but still populated (left alone, correctly)").
+- Produces: `admitWaiter.grantedAt time.Time` (new field), set exactly once, at the same point `waiter.state = admitGranted` is set.
+- Consumes: `s.admitNowTime()` (existing, already used for `enqueued`/`waitedMS` — use it for consistency and test-clock-overridability, not `time.Now()` directly).
 
 - [ ] **Step 1: Write the failing test first**
 
-This MUST be a real-cgroup test (skips under `SkipOrFailRealCgroup` when unavailable, hard-fails under `AIRA_REAL_CGROUP=1` per this package's established convention — follow whatever existing real-cgroup test in this file already does verbatim for the skip/fail-mode boilerplate). Cases:
-
-1. **The property this whole plan exists to deliver:** a scope directory with NO live processes anywhere in its subtree (use `cgrouptest.IsolatedScopeParent` to get a real delegated cgroup, do NOT put any live process in it), a `hasLiveLease` fake reporting it as leased, a `supervisorDead` fake reporting its recorded PID as dead, age past grace → `ReleaseStaleGrantedLeases` returns it in `Reaped`, the `release` callback is invoked exactly once with its scope ID, and the directory is actually gone from disk afterward.
-2. **The property v1 was missing and Sol caught:** a scope directory with a LIVE NESTED CHILD cgroup holding a real live process (fork a real long-lived child process — e.g. `sleep 30` — placed into a child cgroup one level under the candidate scope, so the candidate's OWN leaf `cgroup.procs` is empty but its subtree is not) with the SAME `hasLiveLease`/`supervisorDead`/age fakes as case 1 (i.e., it WOULD have matched v1's flawed release logic) → `ReleaseStaleGrantedLeases` must NOT release it: the `release` callback must NOT be called, the directory must still exist, and it should appear in `Skipped` (or an equivalent "attempted but not empty" outcome) — kill the child process and clean up the fixture at test end regardless of outcome.
-3. A scope where `hasLiveLease` reports false (no lease held) → not a candidate at all, `release` never called (this is `staleGrantedLeaseCandidates`'s job from Task 1, but confirm the wiring here too).
-4. A scope too young (age < grace) → not released even though otherwise heuristic-matching.
-
-- [ ] **Step 2: Run to verify failure** — expect FAIL (undefined function / or case 2 failing against a naive implementation if you write the naive version first to confirm the test actually catches the v1 bug class before writing the real fix — recommended, since this is the single most important test in this entire plan).
-
-- [ ] **Step 3: Implement**
-
 ```go
-// reapConfineScopeByID attempts to physically remove ONE named scope's
-// directory tree via the exact fd-anchored, kernel-enforced removal every
-// other reap path in this file uses. Extracted from
-// reapOrphanedConfineScopesWithDeps so ReleaseStaleGrantedLeases (below)
-// gets the identical safety property with zero duplicated logic: success
-// is authoritative, fresh, subtree-aware proof of emptiness (the kernel
-// itself refuses AT_REMOVEDIR on anything non-empty); failure just means
-// "not empty (yet)", never an error to escalate.
-func reapConfineScopeByID(parentFD int, scopeID string, afterEmptyProof func()) (bool, error) {
-	if !validConfineScopeID(scopeID) {
-		return false, fmt.Errorf("invalid scope id")
-	}
-	return reapEmptyConfineScopeTree(parentFD, ".aira-"+scopeID, afterEmptyProof)
+func TestGrantSetsGrantedAtDistinctFromEnqueuedUnderQueueingDelay(t *testing.T) {
+	// Construct whatever this package's existing admit-evaluation test
+	// fixture is (reuse it, do not hand-roll a new one), enqueue a waiter,
+	// advance the fake clock (if this package's admitNowTime is
+	// test-overridable -- check first) or otherwise simulate a queueing
+	// delay before the waiter is actually granted, then grant it. Assert
+	// waiter.grantedAt is at (or very close to) the grant moment, NOT
+	// waiter.enqueued, and that grantedAt.Sub(enqueued) reflects the
+	// simulated queueing delay (i.e. they are genuinely different values
+	// under contention, not just two names for the same timestamp).
 }
 ```
-
-Update `reapOrphanedConfineScopesWithDeps`'s existing loop body to call `reapConfineScopeByID(parentFD, record.ScopeID, deps.afterReapEmptyProof)` instead of its current inlined `childName := ".aira-" + record.ScopeID; reapEmptyConfineScopeTree(parentFD, childName, ...)` — pure deduplication, no behavior change (add/keep a test confirming this).
-
-```go
-// ReleaseStaleGrantedLeases finds ledger-granted leases whose scope matches
-// the coarse "might be dead" heuristic (staleGrantedLeaseCandidates, Task 1),
-// then for each one ATTEMPTS THE ACTUAL PHYSICAL REAP of its scope directory
-// via reapConfineScopeByID -- the same kernel-enforced removal the ordinary
-// orphan-scope reaper already relies on. release(scopeID) is invoked ONLY
-// when that physical reap actually succeeds: a successful Unlinkat is
-// authoritative, TOCTOU-immune, subtree-aware proof the scope was genuinely,
-// fully empty at that instant, regardless of whether the coarse heuristic's
-// leaf-only Populated field or kill(pid,0)'s PID-namespace assumptions were
-// individually trustworthy -- a wrong heuristic match just costs one failed,
-// harmless reap attempt. release is called synchronously, in scope-id order,
-// before this function returns.
-func ReleaseStaleGrantedLeases(ctx context.Context, slicePath string, grace time.Duration, supervisorDead func(pid int) bool, hasLiveLease func(scopeID string) bool, release func(scopeID string)) (ConfineReapResult, error) {
-	listed, err := listConfinesWithDeps(ctx, slicePath, nil, defaultConfineScanDeps())
-	if err != nil {
-		return ConfineReapResult{}, err
-	}
-	if listed.Verdict == "unevaluated" {
-		return ConfineReapResult{Verdict: "unevaluated", Reason: listed.Reason, Reaped: []string{}}, nil
-	}
-	if supervisorDead == nil {
-		supervisorDead = pidIsDead
-	}
-	candidates := staleGrantedLeaseCandidates(listed.Scopes, grace, supervisorDead, hasLiveLease)
-	result := ConfineReapResult{Verdict: "pass", Reaped: []string{}}
-	if len(candidates) == 0 {
-		return result, nil
-	}
-	parentFD, err := unix.Open(slicePath, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return result, fmt.Errorf("open confine slice for stale-lease release: %w", err)
-	}
-	defer unix.Close(parentFD)
-	for _, record := range candidates {
-		if err := ctx.Err(); err != nil {
-			return result, err
-		}
-		reaped, reapErr := reapConfineScopeByID(parentFD, record.ScopeID, nil)
-		if reapErr != nil || !reaped {
-			result.Skipped++
-			continue
-		}
-		if release != nil {
-			release(record.ScopeID)
-		}
-		result.Reaped = append(result.Reaped, record.ScopeID)
-	}
-	return result, nil
-}
-```
-
-Note the important difference in call ORDER from the reasoning above: physical reap happens BEFORE the release callback, and release only fires on a confirmed-successful reap — this is the crux of the whole redesign, do not reorder it.
-
-- [ ] **Step 4: Run to verify pass** — `AIRA_REAL_CGROUP=1 aira confine -- go test ./internal/runner/... -run 'ReleaseStaleGrantedLeases|ReapOrphanedConfineScopes' -v`. Case 2 above (live nested child) passing is the single most important assertion in this plan — if it doesn't exist or doesn't fail against a naive Populated-trusting implementation, this task is not actually done regardless of what else passes.
-
-- [ ] **Step 5: Commit** — `git commit -m "fix(runner): reap-first-release-second stale confine lease recovery (AIRA-49)"`
-
-## Task 3: Wire the daemon-side pass into the existing reaper loop
-
-**Files:**
-- Modify: `internal/daemon/confine_reaper.go`
-- Test: `internal/daemon/confine_reaper_test.go` (new, or extend an existing one if `reapOrphanedScopesPass` already has `*Server`-level tests — check first, and reuse whatever fixture constructs a `*Server` with a fake/injectable confine slice path; if `runner.ResolveConfineManagementSlice("")` truly cannot be overridden for a test double, that is itself a real gap this task must either close with a minimal seam or explicitly document as an accepted, deliberate real-cgroup-only test boundary matching how `reapOrphanedScopesPass` itself is presumably already tested — find out which before writing new tests, do not assume).
-
-**Interfaces:**
-- Consumes: `runner.ReleaseStaleGrantedLeases` (Task 2), `s.activeConfines(path)` (existing), `s.releaseActiveConfine` (existing, passed as the `release` callback), `s.scopeReapGrace`/`defaultScopeReapGrace` (existing).
-- Produces: `func (s *Server) releaseStaleGrantedLeasesPass(ctx context.Context)`.
-
-- [ ] **Step 1: Write the failing test first**
-
-Whatever test scaffolding this needs, get the EXACT existing fixture-construction pattern for `*Server` + fake confine slice + a real `admitGranted` waiter from the daemon package's own existing admit/reaper tests before writing anything new (do not hand-roll a second way to do this). Cover:
-1. A granted lease whose scope was genuinely, physically reaped by the underlying call → `s.releaseActiveConfine` was invoked with that scope ID (assert via `s.activeConfines(path)` no longer listing it, matching v1's original assertion style, which is still valid here).
-2. `s.scopeReapGrace` left at its zero value must use `defaultScopeReapGrace` (2 minutes), NOT zero — do not repeat v1's test-comment error claiming `scopeReapGrace=0` means "no grace wait"; if a test needs a short grace for speed, set `s.scopeReapGrace` to an explicit small nonzero duration and account for it, or use a fixture whose `AgeSeconds` is already comfortably past whatever grace is actually in effect.
-3. `releaseStaleGrantedLeasesPass` then `reapOrphanedScopesPass` called back to back (mirroring `runScopeReaper`'s real ordering) is no longer required to prove the directory disappears (Task 2's own real-cgroup test already proves that at the `runner` layer) — this daemon-level test only needs to prove the WIRING: that the daemon supplies the right path/grace/registry-derived `hasLiveLease` to `runner.ReleaseStaleGrantedLeases` and that its `release` callback is really `s.releaseActiveConfine`. Keep this test at the plumbing level; do not re-derive Task 2's kernel-behavior coverage here.
 
 - [ ] **Step 2: Run to verify failure**
 
 - [ ] **Step 3: Implement**
 
+Add the field to the `admitWaiter` struct (`admit.go`, near `enqueued`):
+
 ```go
-func (s *Server) releaseStaleGrantedLeasesPass(ctx context.Context) {
-	_, path, err := runner.ResolveConfineManagementSlice("")
-	if err != nil {
-		return
-	}
-	grace := s.scopeReapGrace
-	if grace <= 0 {
-		grace = defaultScopeReapGrace
-	}
-	registry := s.activeConfines(path)
-	if len(registry) == 0 {
-		return
-	}
-	hasLiveLease := func(scopeID string) bool {
-		for _, entry := range registry {
-			if entry.ScopeID == scopeID {
-				return true
-			}
-		}
-		return false
-	}
-	result, err := runner.ReleaseStaleGrantedLeases(ctx, path, grace, nil, hasLiveLease, func(scopeID string) {
-		s.releaseActiveConfine(path, scopeID)
-	})
-	if err != nil {
-		log.Printf("aira daemon: scope-reaper: stale-lease release sweep error: %v", err)
-		return
-	}
-	if len(result.Reaped) > 0 {
-		log.Printf("aira daemon: scope-reaper: released %d stale confine lease(s) (confirmably-dead supervisor, physically reaped): %s", len(result.Reaped), strings.Join(result.Reaped, ", "))
+	grantedAt    time.Time
+```
+
+At the existing grant transition:
+
+```go
+		waiter.state = admitGranted
+		waiter.grantedAt = s.admitNowTime()
+		waiter.accounted = true
+```
+
+- [ ] **Step 4: Run to verify pass**
+
+- [ ] **Step 5: Commit** — `git commit -m "feat(daemon): track admitWaiter.grantedAt distinct from enqueue time (AIRA-49)"`
+
+## Task 2: `ReapScopeIfEmpty` — single-scope kernel-enforced removal, with a testable repopulation seam
+
+**Files:**
+- Modify: `internal/runner/confine_manage_linux.go`
+- Test: `internal/runner/confine_manage_linux_test.go`, reusing the exact fixture helpers named in "File Structure" above.
+
+**Interfaces:**
+- Produces: `func ReapScopeIfEmpty(slicePath, scopeID string, afterEmptyProof func()) (bool, error)`.
+- Consumes: `reapEmptyConfineScopeTree` (existing, unchanged — it already accepts an `afterEmptyProof func()` parameter; thread this function's own parameter straight through, do not swallow it as `nil`), `validConfineScopeID` (existing).
+
+- [ ] **Step 1: Write the failing tests first**
+
+```go
+func TestReapScopeIfEmptyRemovesAGenuinelyEmptyScope(t *testing.T) {
+	// Using createReaperTestScope / this file's existing real-cgroup
+	// convention: a real delegated cgroup-v2 directory, no live process
+	// anywhere in it. ReapScopeIfEmpty(slicePath, scopeID, nil) -> (true,
+	// nil), directory actually gone from disk afterward.
+}
+
+func TestReapScopeIfEmptyLeavesALiveNestedChildAlone(t *testing.T) {
+	// Mirror TestReapOrphanedConfineScopesKeepsEmptySiblingOfLiveNestedBranch's
+	// fixture exactly: startReaperTestSleeper in a CHILD cgroup one level
+	// under the candidate scope (so the candidate's own leaf cgroup.procs
+	// is empty but its subtree is not). ReapScopeIfEmpty -> (false, ...),
+	// directory still exists. stopReaperTestSleeper + cleanup regardless
+	// of outcome.
+}
+
+func TestReapScopeIfEmptyDoesNotRemoveAScopeRepopulatedAfterTheEmptyProof(t *testing.T) {
+	// Mirror TestReapOrphanedConfineScopesRepopulationAfterProof exactly,
+	// via the new afterEmptyProof parameter: inject a live process into
+	// the scope from inside the callback, AFTER the empty check has
+	// already passed but BEFORE the actual Unlinkat. Assert the kernel
+	// itself still correctly refuses removal -- (false, ...), directory
+	// (and the injected process) still present. This is the direct proof
+	// that "reap succeeded" really is TOCTOU-immune, not merely
+	// TOCTOU-unlikely.
+}
+
+func TestReapScopeIfEmptyRejectsAnInvalidScopeID(t *testing.T) {
+	ok, err := ReapScopeIfEmpty(t.TempDir(), "../not-a-real-scope-id", nil)
+	if ok || err == nil {
+		t.Fatalf("got (%v, %v), want a rejection", ok, err)
 	}
 }
 ```
+
+- [ ] **Step 2: Run to verify failure** — `AIRA_REAL_CGROUP=1 aira confine -- go test ./internal/runner/... -run 'TestReapScopeIfEmpty' -v`
+
+- [ ] **Step 3: Implement**
+
+```go
+// ReapScopeIfEmpty attempts to physically remove ONE named scope's
+// directory tree via the exact fd-anchored, kernel-enforced removal every
+// other reap path in this file uses (reapEmptyConfineScopeTree). Success
+// is authoritative, fresh, subtree-aware, TOCTOU-immune proof the scope
+// was genuinely, fully empty at removal time -- the kernel itself refuses
+// Unlinkat(AT_REMOVEDIR) on anything non-empty, anywhere in the subtree,
+// even if it was proven empty a moment earlier (see
+// TestReapScopeIfEmptyDoesNotRemoveAScopeRepopulatedAfterTheEmptyProof).
+// Failure means "not empty (yet)"; callers must never treat it as an
+// error to escalate, only as "try again later, if at all."
+//
+// This proves ONLY that the scope was empty at removal time -- it does
+// NOT prove the scope's owner will never populate it later (a scope can
+// be genuinely, temporarily empty mid-launch, before its process is
+// placed into it). Callers making an irreversible decision (releasing an
+// admission lease, e.g.) from a successful reap MUST additionally gate on
+// an age signal immune to queueing/launch delay -- see AIRA-49's
+// admitWaiter.grantedAt for why enqueue time and directory-mtime-derived
+// age were both found unsafe for this across three review rounds.
+func ReapScopeIfEmpty(slicePath, scopeID string, afterEmptyProof func()) (bool, error) {
+	if !validConfineScopeID(scopeID) {
+		return false, fmt.Errorf("invalid scope id")
+	}
+	parentFD, err := unix.Open(slicePath, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return false, fmt.Errorf("open confine slice: %w", err)
+	}
+	defer unix.Close(parentFD)
+	return reapEmptyConfineScopeTree(parentFD, ".aira-"+scopeID, afterEmptyProof)
+}
+```
+
+- [ ] **Step 4: Run to verify pass** — all four cases, including the repopulation-after-proof race.
+
+- [ ] **Step 5: Commit** — `git commit -m "feat(runner): ReapScopeIfEmpty, a single-scope kernel-enforced removal primitive with a testable repopulation seam (AIRA-49)"`
+
+## Task 3: Daemon-side sweep, gated on `grantedAt`
+
+**Files:**
+- Modify: `internal/daemon/confine_reaper.go`, `internal/daemon/paths.go`, `internal/daemon/server.go`
+- Test: `internal/daemon/confine_reaper_test.go` (new, or extend existing), using the `AIRA_CONFINE_SLICE` + `cgrouptest.IsolatedScopeParent(t)` seam and the `confine_manage_test.go:39-50` granted-waiter fixture (both named in "File Structure" above).
+
+**Interfaces:**
+- Consumes: `runner.ReapScopeIfEmpty` (Task 2), `admitWaiter.grantedAt` (Task 1), the existing `s.admitQueues`/`s.admitRegistryMu` locking pattern (match `activeConfines`'s exact lock order — registry mutex then queue mutex, never the reverse), `s.releaseActiveConfine` (existing), `s.admitNowTime()` (existing, for consistency with how grantedAt was set).
+- Produces: `func (s *Server) releaseStaleGrantedLeasesPass(ctx context.Context)`, `func (s *Server) staleGrantedLeases(grace time.Duration) []staleLeaseCandidate` where `staleLeaseCandidate` is `{path, scopeID string; grantedFor time.Duration}` — note `staleGrantedLeases` takes NO path parameter; it iterates every registered `s.admitQueues` slice itself (Sol round-4: the single-slice version silently missed leases on a non-default `--slice`).
+
+- [ ] **Step 1: Write the failing tests first**
+
+```go
+func TestReleaseStaleGrantedLeasesPassReleasesAWaiterGrantedLongAgoOnceItsScopeReapsEmpty(t *testing.T) {
+	// t.Setenv("AIRA_CONFINE_SLICE", cgrouptest.IsolatedScopeParent(t)) for
+	// a real confine slice; build a *Server; hand-construct a sliceQueue
+	// with an admitWaiter{state: admitGranted, scopeID: ..., grantedAt:
+	// s.admitNowTime().Add(-time.Hour), ...} per confine_manage_test.go's
+	// existing pattern; create a REAL, empty ".aira-<scopeID>" cgroup
+	// directory under the slice path (createReaperTestScope-equivalent).
+	// s.staleLeaseReleaseGrace = time.Second (fast test, well under the
+	// simulated hour-old grant).
+	//
+	// s.releaseStaleGrantedLeasesPass(ctx)
+	//
+	// Assert: s.activeConfines(path) no longer lists the scope, the scope
+	// directory is gone from disk, AND (Sol round-4: don't stop at the
+	// registry-listing check alone) the SAME sliceQueue's own
+	// queue.outstanding and queue.outstandingJobs have been decremented
+	// back to whatever they were before this waiter was granted (reach
+	// into the test's own hand-constructed sliceQueue to check this
+	// directly) -- proving the ledger's accounting, not just its
+	// listing, is actually correct after release.
+}
+
+func TestReleaseStaleGrantedLeasesPassLeavesARecentlyGrantedWaiterAlone(t *testing.T) {
+	// Same shape, grantedAt = s.admitNowTime() (fresh). Assert the lease
+	// is still present in activeConfines afterward, and (if the scope
+	// directory was created empty for the test) it is untouched.
+}
+
+func TestReleaseStaleGrantedLeasesPassLeavesALiveNestedChildScopeAlone(t *testing.T) {
+	// grantedAt old enough to pass the age gate, but the scope has a live
+	// nested child (startReaperTestSleeper) -- assert NOT released, same
+	// as Task 2's equivalent case, proving the daemon-level wiring
+	// preserves Task 2's own safety property end to end.
+}
+
+func TestStaleGrantedLeasesNeverReadsEnqueuedForItsAgeDecision(t *testing.T) {
+	// A waiter with enqueued set very old (simulating a long queueing
+	// wait) but grantedAt set recently (simulating "just granted after a
+	// long queue wait") must NOT be selected as a candidate even though
+	// enqueued alone would suggest staleness -- this is the direct
+	// regression test for the v3 defect this plan's Task 1 exists to fix.
+}
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+- [ ] **Step 3: Implement**
+
+`internal/daemon/paths.go`, alongside the other `default*` constants:
+
+```go
+// defaultStaleLeaseReleaseGrace is a LEASE-TTL policy, not a liveness
+// proof: any admitGranted lease whose scope is STILL found empty this
+// long after grantedAt (the daemon's own in-memory record of the exact
+// grant moment -- never enqueue time, which conflates ordinary
+// admission-queue contention with launch abandonment, and never any
+// external PID/filesystem signal) is reclaimed, unconditionally, once the
+// kernel itself confirms the scope is empty at reclaim time. This is
+// deliberately NOT framed as "the owner is dead": Sol/Codex's round-4
+// review established that no signal available to this daemon can
+// actually prove that -- a live launcher can be legitimately SIGSTOPed,
+// cgroup-frozen, or stuck in an unbounded kernel/filesystem operation for
+// longer than any fixed bound, and THIS POLICY WILL RECLAIM ITS LEASE
+// ANYWAY if that exceeds 15 minutes, which could break a launch that was
+// never actually abandoned. This is an accepted, deliberate trade-off
+// (an ordinary lease has always had this shape: bounded lifetime,
+// reclaimed on non-use, regardless of whether the holder could in
+// principle still resume) chosen because the alternative -- a
+// renewal/heartbeat protocol so an in-progress launch can explicitly
+// extend its own lease -- is real new machinery this project's
+// architectural-simplicity preference weighs against for a scenario
+// (a launcher paused for over 15 minutes before ever populating its
+// scope) with no evidence of ever occurring in practice. 15 minutes is
+// chosen because ordinary grant-to-populated latency is a fraction of a
+// second (scope creation immediately followed by child placement,
+// internal/runner/confine_linux.go) -- two to three orders of magnitude
+// of margin over anything this project has observed, not because it
+// proves anything. See AIRA-49's plan changelog (v1 through v5) for the
+// four review rounds that shaped this.
+defaultStaleLeaseReleaseGrace = 15 * time.Minute
+```
+
+`internal/daemon/server.go`: add `staleLeaseReleaseGrace time.Duration` to `*Server`, mirroring `scopeReapGrace`'s exact existing field/init pattern.
+
+`internal/daemon/confine_reaper.go`:
+
+```go
+type staleLeaseCandidate struct {
+	path       string
+	scopeID    string
+	grantedFor time.Duration
+}
+
+// staleGrantedLeases returns admitGranted waiters across EVERY currently
+// registered admission-queue slice (Sol round-4: the prior draft only
+// ever resolved the one default slice via ResolveConfineManagementSlice(""),
+// silently missing any lease admitted against an explicitly-specified
+// --slice) whose lease has been held, per grantedAt (Task 1 -- the
+// daemon's own authoritative grant-moment record, never enqueue time and
+// never any OS-derived signal), for at least `grace`.
+func (s *Server) staleGrantedLeases(grace time.Duration) []staleLeaseCandidate {
+	s.admitRegistryMu.Lock()
+	queues := make(map[string]*sliceQueue, len(s.admitQueues))
+	for path, queue := range s.admitQueues {
+		queues[path] = queue
+	}
+	s.admitRegistryMu.Unlock()
+	now := s.admitNowTime()
+	var stale []staleLeaseCandidate
+	for path, queue := range queues {
+		queue.mu.Lock()
+		for _, waiter := range queue.waiters {
+			if waiter == nil || waiter.state != admitGranted || waiter.scopeID == "" || waiter.grantedAt.IsZero() {
+				continue
+			}
+			if age := now.Sub(waiter.grantedAt); age >= grace {
+				stale = append(stale, staleLeaseCandidate{path: path, scopeID: waiter.scopeID, grantedFor: age})
+			}
+		}
+		queue.mu.Unlock()
+	}
+	return stale
+}
+
+// releaseStaleGrantedLeasesPass is AIRA-49's backstop: a granted lease
+// that never transitions out of "granted" -- for whatever reason, known
+// or not (see this plan's "root-cause honesty" note; the ordinary
+// connection-close release path is expected to handle a plain SIGKILL of
+// the launcher, so a lease reaching this backstop may indicate a rarer
+// path than originally assumed) -- would otherwise be permanently stuck:
+// ConfineKill's own empty-scope path returns a "retry" error that can
+// never resolve, and the ordinary orphan reaper explicitly treats any
+// granted lease as proof of life and skips it. For each lease past its
+// TTL (per staleGrantedLeases -- grantedAt-based, immune to queueing
+// delay; see defaultStaleLeaseReleaseGrace's doc comment for why this is
+// a reclaim POLICY, not a death proof), this attempts the same
+// kernel-enforced physical reap the ordinary orphan reaper trusts
+// (runner.ReapScopeIfEmpty) and reclaims the ledger lease ONLY on a
+// confirmed-successful reap -- never on the age signal alone.
+func (s *Server) releaseStaleGrantedLeasesPass(ctx context.Context) {
+	grace := s.staleLeaseReleaseGrace
+	if grace <= 0 {
+		grace = defaultStaleLeaseReleaseGrace
+	}
+	var released []string
+	for _, candidate := range s.staleGrantedLeases(grace) {
+		if err := ctx.Err(); err != nil {
+			if len(released) > 0 {
+				log.Printf("aira daemon: scope-reaper: released %d stale confine lease(s) before cancellation: %s", len(released), strings.Join(released, ", "))
+			}
+			return
+		}
+		reaped, reapErr := runner.ReapScopeIfEmpty(candidate.path, candidate.scopeID, nil)
+		if reapErr != nil || !reaped {
+			continue
+		}
+		s.releaseActiveConfine(candidate.path, candidate.scopeID)
+		released = append(released, candidate.scopeID)
+		log.Printf("aira daemon: scope-reaper: reclaimed stale confine lease (granted %s ago, past its %s TTL, scope physically reaped as empty): scope=%s slice=%s", candidate.grantedFor.Round(time.Second), grace, candidate.scopeID, candidate.path)
+	}
+}
+```
+
+Note this pass no longer calls `runner.ResolveConfineManagementSlice("")` at all — it derives every slice path it needs directly from `s.admitQueues`'s own keys, which is exactly the set of slices that could possibly hold a granted lease. (The separate, existing `reapOrphanedScopesPass` still only resolves the default slice — a pre-existing limitation of that unrelated mechanism, out of scope for this plan; do not fix it here, but do not accidentally copy its limitation into this new code either.)
 
 Wire into `runScopeReaper`, immediately before the existing reap call:
 
@@ -302,13 +364,26 @@ Wire into `runScopeReaper`, immediately before the existing reap call:
 		s.reapOrphanedScopesPass(ctx)
 ```
 
+Document explicitly (code comment on `staleGrantedLeases` or `releaseStaleGrantedLeasesPass`, implementer's choice of exact placement) two accepted, deliberate residual gaps, per Fable's review — do not silently omit either:
+- A granted waiter whose scope directory does not exist yet at all (genuinely still mid-launch, before scope creation) is correctly never a candidate for THIS pass (`ReapScopeIfEmpty` fails to open it, `reaped=false`) — its only current release path if abandoned before ever creating a scope is the connection-close path. This is acceptable: such a window is bounded by however long scope creation itself can plausibly take, which this project has no evidence is ever close to `staleLeaseReleaseGrace`.
+- PID reuse on top of a dead supervisor is not this pass's concern at all (it uses no PID signal); a stuck lease whose SCOPE remains genuinely populated (e.g. by an unrelated process that happened to land in the same, still-existing cgroup after the real supervisor died — an unlikely but not impossible scenario) would simply never satisfy the physical-reap gate and would stay stuck, same safe-direction liveness gap the existing orphan reaper already accepts for the identical reason.
+
 - [ ] **Step 4: Run to verify pass**
 
 - [ ] **Step 5: Full confined verification** — `aira confine -- make ci`, plus `AIRA_REAL_CGROUP=1 aira confine -- go test ./internal/runner/... ./internal/daemon/...`
 
-- [ ] **Step 6: Commit** — `git commit -m "fix(daemon): wire stale-lease release into the scope-reaper loop (AIRA-49)"`
+- [ ] **Step 6: Commit** — `git commit -m "fix(daemon): release stale confine leases gated on grantedAt + kernel-confirmed empty reap (AIRA-49)"`
+
+## Task 4: Post-deploy verification against the original repro
+
+**Not a code task.** After Task 3 is merged and deployed:
+
+- [ ] Re-run (or ask fastest-ee-dc to re-run, since they hold the original repro details — scope_id `CONFINE-@dr-job-4017698-dl50y3eb6xkj` pattern, `aira confine --delegate-ram -- <long job>` then external-kill the wrapper) the original AIRA-49 repro against the deployed fix.
+- [ ] Confirm the lease actually releases within the expected bound (grace + reaper interval).
+- [ ] If it releases via the ORDINARY connection-close path before this sweep ever gets a chance to (plausible per Fable's trace of `admit.go:452-521`) — that is fine and expected for a plain SIGKILL; this sweep exists as the backstop for whatever OTHER, still-unexplained mechanism produced the original stuck state. Update AIRA-49's ticket with whatever is actually observed, honestly, rather than declaring the original root cause confirmed without having watched it happen.
 
 ## Deferred / explicitly out of scope
 
-- Improving `ConfineKill`'s `U_CONFINE_NOT_LAUNCHED` message for the transient case: still deferred, same reasoning as v1 — this fix means a manual retry loop is no longer the only recovery path (worst case ~7 minutes, not forever).
-- Hardening the admit-connection-close release path for delegate-ram: still deferred, same reasoning as v1 — this sweep is now a correctness backstop regardless of that path's behavior, not a workaround for it.
+- Improving `ConfineKill`'s `U_CONFINE_NOT_LAUNCHED` message for the transient case.
+- Hardening the admit-connection-close release path itself — this sweep is a backstop regardless of that path's behavior, and Task 4 may reveal that path already works correctly for the common case.
+- Shortening `staleLeaseReleaseGrace` below 15 minutes — deliberately conservative given three review rounds on getting the safety direction right; tighten later as a lower-risk follow-up if the ~20-minute worst-case recovery time proves to matter in practice.
