@@ -500,16 +500,35 @@ func TestSkillAitestGuidanceRecommendsAnInvocationThatWorks(t *testing.T) {
 			"pytest_plugins",
 			// AIRA-77: --delegate-ram also arms the legacy xdist governor.
 			"-p no:aira_xdist_governor",
+			// The accounting claim must stay scoped to what worker-admit
+			// actually does. An earlier draft overstated this as "the slice
+			// only ever holds this job's 512M framework overhead", which is
+			// false: a registered aira_xdist_governor still charges the ledger
+			// per test, and a delegate scope adopted after a daemon restart is
+			// reconstructed at live RSS plus margin.
+			"adds no slice-ledger charge",
 		} {
 			if !strings.Contains(section, want) {
 				t.Fatalf("%s aitest section missing %q", document.name, want)
 			}
 		}
-		// The exact retracted claim, backticked as it was generated. Matching a
-		// looser phrase would false-fail on the corrected text's legitimate
-		// "without `--delegate-ram`" explanation of the failure mode.
-		if strings.Contains(section, "no `--delegate-ram`") {
-			t.Fatalf("%s aitest section still tells agents to omit --delegate-ram", document.name)
+		// Retracted claims, pinned as the exact strings that were generated.
+		//
+		// Coverage gap, stated rather than implied: these are substring
+		// assertions, so they pin the specific wrong claims this section has
+		// actually shipped -- they cannot prove the prose is semantically
+		// correct, and a reviewer must still read it. They exist so a KNOWN
+		// regression cannot return silently.
+		for _, forbidden := range []struct{ text, why string }{
+			// Matching a looser phrase here would false-fail on the corrected
+			// text's legitimate "WITHOUT `--delegate-ram`" failure-mode note.
+			{"no `--delegate-ram`", "tells agents to omit --delegate-ram (the flag aitest requires)"},
+			{"only a `--delegate-ram` launch is guaranteed", "claims delegate-ram is the only shape with a finite outer cap; --memory-max and a declared --memory-reserve are finite too, they just never receive the coordinates"},
+			{"the slice only ever holds", "overstates slice accounting; see the adds-no-slice-ledger-charge assertion above"},
+		} {
+			if strings.Contains(section, forbidden.text) {
+				t.Fatalf("%s aitest section %s: found %q", document.name, forbidden.why, forbidden.text)
+			}
 		}
 	}
 }
