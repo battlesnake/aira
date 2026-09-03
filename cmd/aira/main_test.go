@@ -559,8 +559,17 @@ func TestCLIRunRealCgroupOrClearSkip(t *testing.T) {
 	if exit := runInProcess([]string{"run", "--", "/bin/sh", "-c", "printf cli-run"}, &stdout, &stderr); exit != 0 {
 		t.Fatalf("text run exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "cli-run\n{") || stderr.Len() != 0 {
+	// stdout here is a bytes.Buffer, not a real terminal, and --json was not
+	// passed, so the TTY-aware rendering default (AIRA-57) renders the
+	// trailing summary as compact JSON immediately after the live-streamed
+	// child bytes — no human-mode separator, no indented dump.
+	const prefix = "cli-run"
+	if !strings.HasPrefix(stdout.String(), prefix) || stderr.Len() != 0 {
 		t.Fatalf("text run did not tee before summary: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	var summary core.Response
+	if err := json.Unmarshal(stdout.Bytes()[len(prefix):], &summary); err != nil || !summary.OK || summary.Code != "OK" {
+		t.Fatalf("text run summary not valid trailing JSON: stdout=%q err=%v", stdout.String(), err)
 	}
 }
 

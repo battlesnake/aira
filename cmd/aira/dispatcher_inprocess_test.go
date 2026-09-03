@@ -1411,8 +1411,11 @@ func TestEjectWithoutSelectorAndWithoutCurrentConfigIsENoProject(t *testing.T) {
 	if exit := runWithInputDispatcher([]string{"eject"}, &stdout, &stderr, strings.NewReader(""), dispatcher); exit != store.ExitForCode("E_NO_PROJECT") {
 		t.Fatalf("exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
 	}
-	if called || !strings.Contains(stderr.String(), "E_NO_PROJECT") {
-		t.Fatalf("called=%v stderr=%q", called, stderr.String())
+	// stdout here is a bytes.Buffer, not a real terminal, so the TTY-aware
+	// rendering default (AIRA-57) renders this error as JSON on stdout
+	// rather than plain text on stderr.
+	if called || !strings.Contains(stdout.String(), "E_NO_PROJECT") {
+		t.Fatalf("called=%v stdout=%q stderr=%q", called, stdout.String(), stderr.String())
 	}
 }
 

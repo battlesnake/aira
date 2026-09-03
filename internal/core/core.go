@@ -52,7 +52,7 @@ func (response Response) MarshalJSON() ([]byte, error) {
 	data := response.RawData
 	if len(data) == 0 && response.Data != nil {
 		var err error
-		data, err = json.Marshal(response.Data)
+		data, err = marshalNoEscape(response.Data)
 		if err != nil {
 			return nil, err
 		}
@@ -65,10 +65,27 @@ func (response Response) MarshalJSON() ([]byte, error) {
 		Warnings []string        `json:"warnings,omitempty"`
 		Exit     int             `json:"exit,omitempty"`
 	}
-	return json.Marshal(responseJSON{
+	return marshalNoEscape(responseJSON{
 		OK: response.OK, Code: response.Code, Data: data, Error: response.Error,
 		Warnings: response.Warnings, Exit: response.Exit,
 	})
+}
+
+// marshalNoEscape mirrors json.Marshal but disables Go's default HTML
+// escaping of '<', '>', and '&'. Neither the daemon wire protocol nor a
+// terminal/JSON-pipe consumer is an HTML context, so that escaping only
+// makes selector placeholders like "<id>" harder to read (AIRA-57). Escaping
+// applied at any single hop in a marshal chain survives every later hop, so
+// every place that (re-)marshals response data — here and in the CLI's
+// render/renderHuman and the daemon's wire encoder — must use this.
+func marshalNoEscape(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 type Initializer func(context.Context, map[string]any) (any, error)
@@ -2082,7 +2099,11 @@ type verbMetadata struct {
 func (c *Core) Help() []map[string]string {
 	result := make([]map[string]string, 0, len(c.verbs))
 	for _, spec := range c.verbs {
-		result = append(result, map[string]string{"verb": spec.Name, "usage": spec.Usage})
+		entry := map[string]string{"verb": spec.Name, "usage": spec.Usage}
+		if spec.Summary != "" {
+			entry["summary"] = spec.Summary
+		}
+		result = append(result, entry)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i]["verb"] < result[j]["verb"] })
 	return result
