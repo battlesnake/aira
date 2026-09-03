@@ -16,6 +16,8 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"golang.org/x/term"
+
 	"aira/internal/app"
 	"aira/internal/core"
 	"aira/internal/daemon"
@@ -76,9 +78,24 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		return runSkill(argv[1:], stdout, stderr)
 	}
 	args, jsonOutput := removeJSON(argv)
+	// renderJSON is the TTY-aware rendering default: JSON unless stdout is a
+	// real terminal and --json was not explicitly requested. Piped/redirected
+	// output (the dominant case for an agent invoking this CLI via a
+	// subprocess) defaults to JSON; an interactive terminal defaults to
+	// genuine human-readable text (AIRA-57). Verbs whose current behaviour
+	// doesn't route through the generic (previously JSON-dump-as-"human")
+	// rendering decision at all deliberately keep using the explicit
+	// jsonOutput flag below, unaffected by this default: confine and friends
+	// (which reject --json outright), watch, run/git/time's live byte
+	// streaming during dispatch, and the deliberate non-JSON suppression
+	// contracts of time's and run-log's trailing summaries (see below).
+	renderJSON := jsonOutput || !stdoutIsTerminal(stdout)
 	if len(args) == 0 || args[0] == "help" || args[0] == "--help" {
 		response := core.New(nil).Do(context.Background(), core.Request{Verb: "help"})
-		return render(response, jsonOutput, stdout, stderr)
+		if !renderJSON && response.OK {
+			return renderHelp(response, stdout, stderr)
+		}
+		return render(response, renderJSON, stdout, stderr)
 	}
 	verb := strings.ToLower(args[0])
 	positional, options, err := parseArgs(verb, args[1:])
@@ -88,7 +105,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 			code = "E_SELECTOR_INVALID"
 		}
 		response := core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
-		return render(response, jsonOutput, stdout, stderr)
+		return render(response, renderJSON, stdout, stderr)
 	}
 	if verb == "tui" && jsonOutput {
 		response := core.Response{Code: "E_SELECTOR_INVALID", Error: "option --json is not valid for tui", Exit: store.ExitForCode("E_SELECTOR_INVALID")}
@@ -153,23 +170,23 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		request, requestErr := buildRequest(verb, positional, options)
 		if requestErr != nil {
 			code := store.ErrorCode(requestErr)
-			return render(core.Response{Code: code, Error: requestErr.Error(), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
+			return render(core.Response{Code: code, Error: requestErr.Error(), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
 		}
 		if request.Args["project"] == "" && request.Args["prefix"] == "" {
 			project, discoverErr := app.Discover(context.Background(), ".")
 			if discoverErr != nil {
-				return render(core.Response{Code: "E_NO_PROJECT", Error: "E_NO_PROJECT: no selector and no current .aira/config", Exit: store.ExitForCode("E_NO_PROJECT")}, jsonOutput, stdout, stderr)
+				return render(core.Response{Code: "E_NO_PROJECT", Error: "E_NO_PROJECT: no selector and no current .aira/config", Exit: store.ExitForCode("E_NO_PROJECT")}, renderJSON, stdout, stderr)
 			}
 			request.Args["project"] = project.ProjectID
 		}
 		dispatcher := injected
 		if dispatcher == nil {
-			dispatcher, err = newDaemonDispatcher(stdin, stdout, stderr, jsonOutput)
+			dispatcher, err = newDaemonDispatcher(stdin, stdout, stderr, renderJSON)
 			if err != nil {
-				return render(transportErrorResponse(err), jsonOutput, stdout, stderr)
+				return render(transportErrorResponse(err), renderJSON, stdout, stderr)
 			}
 		}
-		return render(dispatcher.Dispatch(context.Background(), daemon.WorktreeScope{}, request), jsonOutput, stdout, stderr)
+		return render(dispatcher.Dispatch(context.Background(), daemon.WorktreeScope{}, request), renderJSON, stdout, stderr)
 	}
 
 	if verb == "init" {
@@ -182,23 +199,23 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		paths, pathErr := daemon.PathsFromEnv()
 		if pathErr != nil {
-			return render(transportErrorResponse(pathErr), jsonOutput, stdout, stderr)
+			return render(transportErrorResponse(pathErr), renderJSON, stdout, stderr)
 		}
 		project, discoverErr := app.DiscoverBootstrap(context.Background(), ".")
 		if discoverErr != nil {
 			code := appErrorCode(discoverErr)
-			return render(core.Response{Code: code, Error: discoverErr.Error(), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
+			return render(core.Response{Code: code, Error: discoverErr.Error(), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
 		}
 		dispatcher := injected
 		if dispatcher == nil {
-			dispatcher, err = newDaemonDispatcher(stdin, stdout, stderr, jsonOutput)
+			dispatcher, err = newDaemonDispatcher(stdin, stdout, stderr, renderJSON)
 			if err != nil {
-				return render(transportErrorResponse(err), jsonOutput, stdout, stderr)
+				return render(transportErrorResponse(err), renderJSON, stdout, stderr)
 			}
 		}
 		response := dispatcher.Dispatch(context.Background(), bootstrapScope(project, paths), core.Request{Verb: "init", Args: requestArgs})
 		relativiseInitResponse(&response, ".")
-		return render(response, jsonOutput, stdout, stderr)
+		return render(response, renderJSON, stdout, stderr)
 	}
 
 	request, err := buildRequest(verb, positional, options)
@@ -207,7 +224,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		if code == "E_INTERNAL" {
 			code = "E_SELECTOR_INVALID"
 		}
-		return render(core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
+		return render(core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
 	}
 	if verb == "test-report" && len(positional) > 0 && strings.EqualFold(positional[0], "add") {
 		path := "-"
@@ -222,7 +239,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		if err != nil {
 			code := "E_TESTREPORT_INVALID"
-			return render(core.Response{Code: code, Error: fmt.Sprintf("%s: %v", code, err), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
+			return render(core.Response{Code: code, Error: fmt.Sprintf("%s: %v", code, err), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
 		}
 		request.Args["raw"] = data
 	}
@@ -231,7 +248,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		usageFile := options["usage-file"]
 		if usageFile != "" && len(bucketValues) > 0 {
 			code := store.ErrorCode(fmt.Errorf("%s: --usage-file and --bucket are mutually exclusive", domain.ComputeCodeInvalid))
-			return render(core.Response{Code: code, Error: fmt.Sprintf("%s: --usage-file and --bucket are mutually exclusive", code), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
+			return render(core.Response{Code: code, Error: fmt.Sprintf("%s: --usage-file and --bucket are mutually exclusive", code), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
 		}
 		var data []byte
 		if usageFile != "" {
@@ -241,12 +258,12 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		if err != nil {
 			code := domain.ComputeCodeInvalid
-			return render(core.Response{Code: code, Error: fmt.Sprintf("%s: %v", code, err), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
+			return render(core.Response{Code: code, Error: fmt.Sprintf("%s: %v", code, err), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
 		}
 		if len(bucketValues) > 0 {
 			if strings.TrimSpace(string(data)) != "" {
 				code := domain.ComputeCodeInvalid
-				return render(core.Response{Code: code, Error: code + ": payload and --bucket are mutually exclusive", Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
+				return render(core.Response{Code: code, Error: code + ": payload and --bucket are mutually exclusive", Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
 			}
 			request.Args["bucket"] = bucketValues
 		} else {
@@ -255,16 +272,16 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	}
 	if err := prepareImportContent(&request); err != nil {
 		code := store.ErrorCode(err)
-		return render(core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
+		return render(core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
 	}
 	paths, err := daemon.PathsFromEnv()
 	if err != nil {
-		return render(transportErrorResponse(err), jsonOutput, stdout, stderr)
+		return render(transportErrorResponse(err), renderJSON, stdout, stderr)
 	}
 	scope, err := scopeForCWD(context.Background(), ".", paths)
 	if err != nil {
 		code := appErrorCode(err)
-		return render(core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
+		return render(core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
 	}
 	if verb == "tui" {
 		dispatcher := injected
@@ -272,11 +289,11 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		if dispatcher == nil {
 			dispatcher, err = newDaemonDispatcher(stdin, io.Discard, io.Discard, false)
 			if err != nil {
-				return render(transportErrorResponse(err), jsonOutput, stdout, stderr)
+				return render(transportErrorResponse(err), renderJSON, stdout, stderr)
 			}
 			executeDispatcher, err = newDaemonDispatcher(stdin, stdout, stderr, false)
 			if err != nil {
-				return render(transportErrorResponse(err), jsonOutput, stdout, stderr)
+				return render(transportErrorResponse(err), renderJSON, stdout, stderr)
 			}
 		}
 		return runTUI(context.Background(), dispatcher, executeDispatcher, scope, stdin, stdout, stderr)
@@ -284,9 +301,15 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	faceStdout := &lineTrackingWriter{w: stdout}
 	dispatcher := injected
 	if dispatcher == nil {
+		// The dispatcher's own jsonOutput field controls run/git/time's live
+		// output streaming (captured-for-JSON vs streamed-raw), which must stay
+		// tied to the EXPLICIT --json flag rather than the TTY-aware default:
+		// a piped `aira run -- cmd` must keep streaming raw child bytes exactly
+		// as before, never silently switch to buffering them into a JSON blob
+		// merely because stdout isn't a terminal.
 		dispatcher, err = newDaemonDispatcher(stdin, faceStdout, stderr, jsonOutput)
 		if err != nil {
-			return render(transportErrorResponse(err), jsonOutput, stdout, stderr)
+			return render(transportErrorResponse(err), renderJSON, stdout, stderr)
 		}
 	} else if local, ok := dispatcher.(*inProcessDispatcher); ok {
 		local.stdin, local.stdout, local.diagnostics, local.jsonOutput = stdin, faceStdout, stderr, jsonOutput
@@ -297,16 +320,27 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		return runWatchLoop(watchCtx, dispatcher, scope, request, jsonOutput, stdout, stderr)
 	}
 	response := dispatcher.Dispatch(context.Background(), scope, request)
+	// time, like run-log, stays keyed on the explicit flag: its own summary
+	// says output is not captured, and renderTime deliberately suppresses the
+	// trailing response body in non-JSON mode (the timed command's own output
+	// already streamed live) — that suppression is a deliberate contract, not
+	// an instance of the generic JSON-dump bug, so it must not start emitting
+	// a JSON envelope merely because stdout isn't a terminal.
 	if verb == "time" && !jsonOutput {
 		return renderTime(response, stdout, stderr)
 	}
+	// run-log stays keyed on the explicit flag: its non-JSON mode already
+	// writes raw replayed bytes to stdout (with JSON metadata on stderr),
+	// which is exactly the byte-transparent behaviour a piped/subprocess
+	// consumer wants — switching it to a JSON-enveloped (base64) body by
+	// default when piped would be a regression, not a fix.
 	if verb == "run-log" && !jsonOutput {
 		return renderRunLog(response, stdout, stderr)
 	}
-	if (verb == "run" || verb == "git") && !jsonOutput && response.OK && faceStdout.needsSeparator() {
+	if (verb == "run" || verb == "git") && !renderJSON && response.OK && faceStdout.needsSeparator() {
 		_, _ = io.WriteString(stdout, "\n")
 	}
-	return render(response, jsonOutput, stdout, stderr)
+	return render(response, renderJSON, stdout, stderr)
 }
 
 func runSupervisor(argv []string, diagnostics io.Writer) int {
@@ -446,6 +480,21 @@ func removeJSON(argv []string) ([]string, bool) {
 		}
 	}
 	return result, jsonOutput
+}
+
+// stdoutIsTerminal reports whether w is the process's own stdout attached to
+// a real terminal. This deliberately checks the OUTPUT stream, not stdin: a
+// command's rendering decision depends on who is READING its result, and
+// this project's own daemon/MCP faces separately read structured input from
+// stdin in some paths, so stdin's TTY-ness is a different question entirely
+// (AIRA-57). A non-*os.File writer (a buffer, a pipe abstraction in tests)
+// is never a terminal.
+func stdoutIsTerminal(w io.Writer) bool {
+	file, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	return term.IsTerminal(int(file.Fd()))
 }
 
 func parseArgs(verb string, argv []string) ([]string, map[string]string, error) {
@@ -2046,7 +2095,7 @@ func relativiseInitResponse(response *core.Response, cwd string) {
 			*path = filepath.ToSlash(relative)
 		}
 	}
-	encoded, err := json.Marshal(result)
+	encoded, err := marshalNoEscape(result)
 	if err != nil {
 		return
 	}
@@ -2054,10 +2103,64 @@ func relativiseInitResponse(response *core.Response, cwd string) {
 	response.RawData = encoded
 }
 
+// marshalNoEscape mirrors json.Marshal but disables Go's default HTML
+// escaping of '<', '>', and '&'. There's no HTML context on a terminal or in
+// a JSON pipe, so that escaping only makes selector placeholders like "<id>"
+// harder to read (AIRA-57).
+func marshalNoEscape(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+// marshalIndentNoEscape mirrors json.MarshalIndent without HTML escaping.
+func marshalIndentNoEscape(v any, indent string) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", indent)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+// renderHelp is the "help" verb's dedicated human formatter: a git-help-style
+// listing of verb, usage, and (when the dispatch table carries one) a
+// one-line summary — never the raw dispatch-table JSON dump (AIRA-57). It is
+// only reached in human mode (a real terminal, --json not requested); the
+// TTY-aware default in runWithInputDispatcher decides WHEN to use it.
+func renderHelp(response core.Response, stdout, stderr io.Writer) int {
+	entries, ok := response.Data.([]map[string]string)
+	if !ok {
+		// Shape surprise: fall back to the generic renderer rather than
+		// fabricating a listing.
+		return render(response, false, stdout, stderr)
+	}
+	table := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+	for _, entry := range entries {
+		_, _ = fmt.Fprintf(table, "%s\t%s\t%s\n", entry["verb"], entry["usage"], entry["summary"])
+	}
+	if err := table.Flush(); err != nil {
+		return exitForError("E_RUN_DETACH_FAILED")
+	}
+	for _, warning := range response.Warnings {
+		_, _ = fmt.Fprintf(stdout, "warning: %s\n", warning)
+	}
+	if response.Exit != 0 {
+		return response.Exit
+	}
+	return 0
+}
+
 func render(response core.Response, jsonOutput bool, stdout, stderr io.Writer) int {
 	var writeErr error
 	if jsonOutput {
-		data, _ := json.Marshal(response)
+		data, _ := marshalNoEscape(response)
 		_, writeErr = fmt.Fprintln(stdout, string(data))
 	} else if response.OK {
 		writeErr = renderHuman(response, stdout)
@@ -2192,7 +2295,7 @@ func renderHuman(response core.Response, out io.Writer) error {
 		if report, ok := response.Data.(interface{}); ok {
 			data := response.RawData
 			if len(data) == 0 {
-				data, _ = json.Marshal(report)
+				data, _ = marshalNoEscape(report)
 			}
 			if _, err := fmt.Fprintf(out, "verdict: %s\n%s\n", strings.ToLower(response.Code), data); err != nil {
 				return err
@@ -2213,7 +2316,7 @@ func renderHuman(response core.Response, out io.Writer) error {
 		}
 	}
 	if len(data) == 0 {
-		data, _ = json.MarshalIndent(response.Data, "", "  ")
+		data, _ = marshalIndentNoEscape(response.Data, "  ")
 	}
 	if _, err := fmt.Fprintln(out, string(data)); err != nil {
 		return err
