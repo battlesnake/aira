@@ -37,6 +37,40 @@ const (
 	defaultWatchdogInterval     = 2 * time.Second
 	defaultScopeReapInterval    = 5 * time.Minute
 	defaultScopeReapGrace       = 2 * time.Minute
+
+	// defaultStaleLeaseReleaseGrace is a LEASE-TTL policy, not a liveness
+	// proof: any admitGranted lease whose scope is STILL found empty this
+	// long after grantedAt (the daemon's own in-memory record of the exact
+	// grant moment -- never enqueue time, which conflates ordinary
+	// admission-queue contention with launch abandonment, and never any
+	// external PID/filesystem signal) is reclaimed, unconditionally, once the
+	// kernel itself confirms the scope is empty at reclaim time. This is
+	// deliberately NOT framed as "the owner is dead": Sol/Codex's round-4
+	// review established that no signal available to this daemon can
+	// actually prove that -- a live launcher can be legitimately SIGSTOPed,
+	// cgroup-frozen, or stuck in an unbounded kernel/filesystem operation for
+	// longer than any fixed bound, and THIS POLICY WILL RECLAIM ITS LEASE
+	// ANYWAY if that exceeds 15 minutes, which could break a launch that was
+	// never actually abandoned. This is an accepted, deliberate trade-off
+	// (an ordinary lease has always had this shape: bounded lifetime,
+	// reclaimed on non-use, regardless of whether the holder could in
+	// principle still resume) chosen because the alternative -- a
+	// renewal/heartbeat protocol so an in-progress launch can explicitly
+	// extend its own lease -- is real new machinery this project's
+	// architectural-simplicity preference weighs against for a scenario
+	// (a launcher paused for over 15 minutes before ever populating its
+	// scope) with no evidence of ever occurring in practice. 15 minutes is
+	// chosen because ordinary grant-to-populated latency is a fraction of a
+	// second (scope creation immediately followed by child placement,
+	// internal/runner/confine_linux.go) -- two to three orders of magnitude
+	// of margin over anything this project has observed, not because it
+	// proves anything. See AIRA-49's plan changelog (v1 through v5) for the
+	// four review rounds that shaped this.
+	//
+	// It is a NEW, dedicated constant: defaultScopeReapGrace (2 minutes) is a
+	// different mechanism, protected by the unrelated and already-safe
+	// !hasLiveLease gate, and must not be reused here.
+	defaultStaleLeaseReleaseGrace = 15 * time.Minute
 )
 
 type watchdogMode string
