@@ -881,3 +881,51 @@ func TestAdmitServeConnectionInterceptsClientOnlyVerb(t *testing.T) {
 func coreRequestAdmit(args map[string]any) core.Request {
 	return core.Request{Verb: "admit", Args: args}
 }
+
+// verifies: grantedAt records the moment the daemon GRANTS a lease, never the
+// moment the request first arrived in the queue. A waiter that sits in the
+// admission queue under contention and is granted much later must show
+// grantedAt at the grant moment; reading enqueued instead (AIRA-49's v3
+// defect, found independently by Sol and Fable) makes ordinary
+// admission-queue contention look identical to launch abandonment to the
+// stale-lease sweep that consumes this field.
+func TestGrantSetsGrantedAtDistinctFromEnqueuedUnderQueueingDelay(t *testing.T) {
+	var maximum atomic.Int64
+	maximum.Store(100)
+	server := admitTestServer(&maximum)
+	enqueuedAt := time.Unix(5000, 0)
+	now := enqueuedAt
+	server.admitNow = func() time.Time { return now }
+	server.admitBackfillGrace = 0
+	current := int64(90)
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+		return current, maximum.Load(), 0, true, ""
+	}
+	waiter := &admitWaiter{seq: 1, reserve: 60, state: admitQueued, grantedCh: make(chan struct{}), enqueued: enqueuedAt}
+	queue := &sliceQueue{path: "/slice", server: server, waiters: []*admitWaiter{waiter}}
+
+	// Contention: the slice has no room, so the waiter stays queued and no
+	// grant moment exists yet.
+	server.evaluateAdmitQueue(queue)
+	requireAdmitQueued(t, waiter)
+	if !waiter.grantedAt.IsZero() {
+		t.Fatalf("grantedAt=%v recorded while still queued, want the zero value", waiter.grantedAt)
+	}
+
+	// The queueing delay elapses, then room appears and the grant fires.
+	const queueingDelay = 17 * time.Minute
+	now = enqueuedAt.Add(queueingDelay)
+	current = 0
+	server.evaluateAdmitQueue(queue)
+	waitAdmitGrant(t, waiter)
+
+	if !waiter.grantedAt.Equal(now) {
+		t.Fatalf("grantedAt=%v, want the grant moment %v", waiter.grantedAt, now)
+	}
+	if !waiter.enqueued.Equal(enqueuedAt) {
+		t.Fatalf("enqueued=%v moved, want the original arrival %v", waiter.enqueued, enqueuedAt)
+	}
+	if delay := waiter.grantedAt.Sub(waiter.enqueued); delay != queueingDelay {
+		t.Fatalf("grantedAt-enqueued=%s, want the simulated queueing delay %s", delay, queueingDelay)
+	}
+}
