@@ -1,0 +1,4 @@
+---
+{"schema":1,"id":"AIRA-73","project":"aira","title":"outbox.resolution is never written — one write conflict permanently bricks a ticket path and blocks eject","status":"planned","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["dogfood","store"],"hold":false,"relations":[]}
+---
+Found during the whole-project simplification review (PR #12). `outbox.resolution` is never written anywhere in the codebase, so once a write conflict lands a path in `E_PATH_INTENT_BUSY`, there is no path back to resolved — it's permanent for that ticket, and it also blocks `eject`. Needs tracing to find where resolution SHOULD be written (or whether the outbox mechanism itself needs reconsidering — see PR #12's broader "one truth per entity" proposal, which recommends deleting several write-only tables; this may be one of them, or it may need an actual fix if the outbox mechanism is meant to stay). Not investigated further — flagging so it isn't lost.

@@ -102,3 +102,7 @@ contradict the code.
 
 Plan and full review history:
 `docs/superpowers/specs/2026-09-03-aira58-59-admission-wait-and-freeze-plan.md`.
+
+## Deployed
+
+See AIRA-58's "Deployed" note — same binary, same restart, same reasoning for the timing.

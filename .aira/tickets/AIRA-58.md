@@ -69,3 +69,7 @@ despite `--memory-reserve 512M`. That is a separate defect, now filed as
 
 Plan and full review history:
 `docs/superpowers/specs/2026-09-03-aira58-59-admission-wait-and-freeze-plan.md`.
+
+## Deployed
+
+Binary rebuilt from merged master (`9a65d47`) and the daemon restarted the same night, after holding the redeploy during a separate live-incident investigation (AIRA-67) so the restart wouldn't destroy forensic state. AIRA-67 concluded the incident was an external kill, unrelated to this subsystem, clearing the way to deploy. The temporary `AIRA_DAEMON_ADMIT_BACKFILL_GRACE=2h` mitigation applied earlier that night was removed before this restart — it's superseded by this fix's own dedicated, reviewed bounding mechanism (`admitFreezeMaxHold`), and keeping it would have run the new freeze logic outside the configuration it was actually tested under.
