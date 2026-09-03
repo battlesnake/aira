@@ -52,12 +52,39 @@ def pytest_runtestloop(session):
 
     from aitest.supervisor import Supervisor
 
-    supervisor = Supervisor()
+    # Slice 2: the supervisor needs this session's own Config as its hook
+    # caller, so each worker's real TestReports (and logstart/logfinish) can be
+    # replayed into the SAME hooks junitxml and terminalreporter listen on.
+    supervisor = Supervisor(config=session.config)
     supervisor.collect(session.items)
     results = supervisor.run(
         estimated_bytes=_resolve_estimated_bytes(),
         worker_count=_resolve_worker_count(workers_option),
     )
+    # Slice 2 decision (AIRA-31 Task 3, Step 1): these plain per-nodeid lines
+    # and the aggregate summary below STAY, and real terminalreporter/junitxml
+    # output is strictly ADDITIVE on top of them. Three reasons, none of them
+    # habit:
+    #
+    #  1. "unevaluated" is not a pytest outcome. The synthesized report for a
+    #     never-observed test deliberately renders as a FAILURE, because that
+    #     is the only shape junitxml will not silently ignore -- so these plain
+    #     lines are the only place aitest's honest three-way pass / fail /
+    #     unevaluated distinction survives on the terminal at all.
+    #  2. They are terminalreporter-independent: they still work under
+    #     -p no:terminal, and whenever replay is inert.
+    #  3. They are cheap and machine-parseable, which is exactly what the
+    #     Go-side e2e layer (internal/pylib/pytest_aitest_e2e_test.go) depends
+    #     on as a signal independent of full report fidelity.
+    #
+    # The one deliberate consequence, stated rather than left to read as a bug:
+    # for a synthesized-unevaluated nodeid the plain line says "unevaluated"
+    # while the replayed pytest summary counts it as a failure. That divergence
+    # is the point -- the plain line is what keeps the honest word visible.
+    #
+    # The leading newline stops the first plain line from being glued onto
+    # terminalreporter's own unterminated progress line ("Fs..").
+    print("")
     passed = failed = skipped = error = unevaluated = 0
     for item in session.items:
         outcome = results.get(item.nodeid, "unevaluated")
