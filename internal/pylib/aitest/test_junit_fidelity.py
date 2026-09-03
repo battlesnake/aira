@@ -127,6 +127,17 @@ def broken_setup():
 
 def test_setup_error(broken_setup):
     assert True
+
+
+def test_fails_with_a_rich_diff():
+    # A genuine pytest-assertion-rewritten rich diff (not a bare message) --
+    # this is the specific shape build-review finding 3 needs: with
+    # hasmarkup=True (--color=yes) this renders through pygments/ANSI
+    # highlighting, which only survives identically between a plain run and
+    # an aitest-driven one if the child's terminalreporter is MUTED (keeps
+    # the parent-computed hasmarkup/code_highlight) rather than replaced by a
+    # fresh writer that would recompute hasmarkup against a non-TTY pipe.
+    assert [1, 2, 3, "RICH-DIFF-MARKER"] == [1, 2, 4, "RICH-DIFF-MARKER"]
 '''
 
 
@@ -365,7 +376,10 @@ def test_aitest_terminal_output_carries_both_the_plain_lines_and_real_terminalre
     # emits them in its own KNOWN_TYPES order (failed, passed, skipped,
     # deselected, xfailed, xpassed, warnings, error), so a joined literal would
     # be pinning that ordering rather than the counts.
-    for fragment in ("1 failed", "3 passed", "1 skipped", "1 xfailed", "1 error"):
+    # test_fails_with_a_rich_diff (added for build-review finding 3) is a
+    # SECOND deliberate failure in this same shared suite, so "2 failed" here
+    # -- not a magic number, matches _TEST_B_OUTCOMES' actual content.
+    for fragment in ("2 failed", "3 passed", "1 skipped", "1 xfailed", "1 error"):
         assert fragment in output, "missing %r in pytest's own summary:\n%s" % (fragment, output)
 
     # Nothing is reported twice. This catches a whole class of duplication
@@ -448,3 +462,56 @@ def test_pytest_cov_is_available_for_the_real_coverage_regression_test():
             "test is being SKIPPED, not passing. Install pytest-cov (or set "
             "AIRA_REAL_COVERAGE=1 to make its absence a hard failure)."
         )
+
+
+def test_rich_assertion_diff_is_byte_identical_under_color_between_plain_and_aitest(tmp_path):
+    """Build-review finding 3 (AIRA-31): the main fidelity test runs both
+    sides as non-TTY subprocesses, where pytest's own hasmarkup/_highlight
+    logic is a no-op EITHER WAY (mute vs a fresh replacement writer look
+    identical) -- so it cannot actually distinguish "the child's
+    terminalreporter is muted, preserving the parent-computed hasmarkup" from
+    "the child got some other writer that happens not to crash". Forcing
+    --color=yes makes create_terminal_writer set hasmarkup=True regardless of
+    TTY-ness, so pygments genuinely renders the diff -- exactly the axis a
+    mutant that swaps in a fresh TerminalWriter(open(devnull)) (rather than
+    muting the real one) would break, since a fresh writer recomputes its own
+    hasmarkup from ITS OWN (non-TTY) file rather than inheriting the parent's
+    --color=yes-forced True."""
+    suite = _build_suite(tmp_path, "color_suite")
+    plain_xml = tmp_path / "plain_color.xml"
+    aitest_xml = tmp_path / "aitest_color.xml"
+    plain_barrier = _fresh_barrier(suite, "plain_color")
+    aitest_barrier = _fresh_barrier(suite, "aitest_color")
+
+    color_args = ["--color=yes", "-vv"]
+    plain = _run_suite(suite, plain_barrier, plain_xml, color_args, tmp_path)
+    aitest = _run_suite(
+        suite, aitest_barrier, aitest_xml, color_args + ["--aitest-workers=2"], tmp_path
+    )
+
+    assert plain.returncode == aitest.returncode == 1, (
+        "plain:\n%s\naitest:\n%s" % (plain.stdout + plain.stderr, aitest.stdout + aitest.stderr)
+    )
+
+    plain_cases = _normalized_cases(plain_xml)
+    aitest_cases = _normalized_cases(aitest_xml)
+    key = ("test_b_outcomes", "test_fails_with_a_rich_diff")
+    assert key in plain_cases and key in aitest_cases, (sorted(plain_cases), sorted(aitest_cases))
+
+    plain_failure = _child_text(plain_cases[key], "failure")
+    aitest_failure = _child_text(aitest_cases[key], "failure")
+    assert plain_failure is not None and aitest_failure is not None
+    # bin_xml_escape renders ESC as the literal text "#x1B", not a raw byte --
+    # so this substring check is real, not defeated by XML escaping.
+    assert "#x1B" in plain_failure, (
+        "the plain run's own diff was not actually highlighted under "
+        "--color=yes -- this test's premise is broken, not the code under "
+        "review: %r" % plain_failure
+    )
+    assert plain_failure == aitest_failure, (
+        "a rich, colour-highlighted assertion diff differs between the plain "
+        "and aitest-driven runs -- the child's terminal writer is producing "
+        "different markup/highlighting than the parent would have\n"
+        "plain:\n%r\naitest:\n%r" % (plain_failure, aitest_failure)
+    )
+    assert "RICH-DIFF-MARKER" in aitest_failure

@@ -59,6 +59,14 @@ would for xdist.
   done here.
 - **Look-ahead dispatch.** `run_one` still passes `nextitem=None`, so
   session/module/class-scoped fixtures are torn down and rebuilt per test.
+- **`record_xml_attribute`/`record_testsuite_property`** write into the
+  child's own COW-forked `LogXML` plugin instance and are lost — same
+  limitation as xdist workers, not a regression against the design target.
+- **`--setup-show`/`--setup-only` output goes nowhere** in a worker: muting
+  (rather than unregistering) the terminalreporter keeps assertion-repr
+  rendering correct, but these two flags' own output still depends on a live
+  terminal writer the child doesn't have wired up for this purpose — silently
+  absent rather than crashing (unregistering would have crashed instead).
 - **Wording divergence, by design.** For a nodeid that ends the run
   unevaluated, aitest's own plain summary line says `unevaluated` while the
   replayed pytest/JUnit summary counts it as a failure. `unevaluated` is not a

@@ -2101,3 +2101,77 @@ def test_supervisor_without_a_config_replays_nothing_and_still_records_results(p
     assert supervisor.results == {nodeid: "passed"}
     assert spy.reports == []
     os.close(dispatch_read)
+
+
+def test_drain_worker_replays_nothing_when_staged_events_are_followed_by_eof(pytester, monkeypatch):
+    """Build-review finding 1 (AIRA-31): crash-atomicity in the shape that
+    actually happens under memory pressure -- the worker's buffered event
+    lines were (partially) flushed to the pipe, then it was group-killed
+    BEFORE its plain result line. Staged events + EOF must replay NOTHING and
+    take the requeue-once path. The existing crash test os._exit()s inside
+    the test body, so its crashed attempt never emits an event and never
+    reaches this branch -- a mutant that replays the staged batch from inside
+    _handle_worker_exit survived all 102 tests without this one."""
+    items = pytester.getitems("""
+        def test_ok():
+            assert True
+    """)
+    item = items[0]
+    nodeid = item.nodeid
+    _outcome, event_lines = _real_event_lines(item)
+    supervisor = Supervisor(config=item.config)
+    supervisor.collect(items)
+    assert supervisor.next_nodeid() == nodeid
+    monkeypatch.setattr(supervisor, "_replace_worker", lambda: None)
+    pid, state, dispatch_read, _write_fd = _fake_worker_state(supervisor, nodeid, event_lines, close_after=True)
+
+    with _replay_spy(item.config) as spy:
+        supervisor._drain_worker(pid, state)
+
+    assert spy.reports == [] and spy.logstarts == [] and spy.logfinishes == [], (
+        "staged events were replayed on a crash before the result line: %r" % (spy.reports,)
+    )
+    assert nodeid not in supervisor.results
+    assert supervisor.queue == [nodeid]
+    assert pid not in supervisor.workers
+    os.close(dispatch_read)
+
+
+def test_drain_worker_rejects_a_logstart_event_for_the_wrong_nodeid(pytester, monkeypatch, capsys):
+    """Build-review finding 2 (AIRA-31), Sol round-2: EVERY event's nodeid
+    must match in_flight -- including a logstart/logfinish, whose ONLY nodeid
+    is the top-level one. A report event carries a second copy inside its
+    serialized data, which is what the existing wrong-nodeid test exercises;
+    that second check alone would let a wrong-nodeid logstart be silently
+    replayed under the in-flight nodeid (the AIRA-40-class inherited-fd
+    surface) -- a mutant deleting the top-level nodeid check survived all
+    102 tests without this one."""
+    items = pytester.getitems("""
+        def test_ok():
+            assert True
+
+        def test_other():
+            assert True
+    """)
+    by_name = {item.name: item for item in items}
+    item = by_name["test_ok"]
+    nodeid = item.nodeid
+    _o, event_lines = _real_event_lines(item)
+    _o2, other_lines = _real_event_lines(by_name["test_other"])
+    mixed = event_lines[:1] + other_lines[:1] + event_lines[1:] + ["%s passed" % nodeid]
+
+    supervisor = Supervisor(config=item.config)
+    supervisor.collect(items)
+    assert supervisor.next_nodeid() == nodeid
+    monkeypatch.setattr(supervisor, "_replace_worker", lambda: None)
+    pid, state, dispatch_read, _write_fd = _fake_worker_state(supervisor, nodeid, mixed)
+
+    with _replay_spy(item.config) as spy:
+        supervisor._drain_worker(pid, state)
+
+    assert spy.reports == [] and spy.logstarts == [], (
+        "a logstart for the WRONG nodeid was accepted and replayed: %r" % (spy.logstarts,)
+    )
+    assert nodeid not in supervisor.results
+    assert "aira aitest:" in capsys.readouterr().err
+    os.close(dispatch_read)
