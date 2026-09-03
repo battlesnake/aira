@@ -88,6 +88,7 @@ type Server struct {
 	workerScopeOwner             map[string]string
 	workerAdmitHeadroom          int64
 	scopeReapGrace               time.Duration
+	staleLeaseReleaseGrace       time.Duration
 	governor                     *governorSet
 
 	// Test seams. Production always calls the Store methods and DB.Close.
@@ -146,6 +147,7 @@ func NewServer(paths Paths) *Server {
 		admitSliceHeadroomSupervisor: admitSliceHeadroomSupervisorDefault,
 		workerAdmitHeadroom:          workerAdmitHeadroomDefault,
 		scopeReapGrace:               defaultScopeReapGrace,
+		staleLeaseReleaseGrace:       defaultStaleLeaseReleaseGrace,
 		storeOpAppendTimeout:         30 * time.Second,
 		storeOpHeavyTimeout:          5 * time.Minute,
 		storeOpWriteTimeout:          30 * time.Second,

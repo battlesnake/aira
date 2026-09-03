@@ -52,6 +52,7 @@ type admitWaiter struct {
 	state        admitWaiterState
 	grantedCh    chan struct{}
 	enqueued     time.Time
+	grantedAt    time.Time
 	waited       bool
 	accounted    bool
 	outcome      string
@@ -726,7 +727,15 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			}
 			continue
 		}
+		// grantedAt is the one moment in this system that authoritatively marks
+		// "the daemon just decided this job may proceed". It is deliberately
+		// separate from enqueued (set once, at waiter creation): a waiter that
+		// queued for a long time under contention is granted here, now, and
+		// measuring its lease age from enqueued would conflate ordinary
+		// admission-queue contention with launch abandonment — the AIRA-49 v3
+		// defect. Nothing but this line may ever set it.
 		waiter.state = admitGranted
+		waiter.grantedAt = s.admitNowTime()
 		waiter.accounted = true
 		queue.outstanding += waiter.reserve
 		queue.outstandingJobs++
