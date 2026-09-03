@@ -1507,6 +1507,122 @@ func TestConfineNonDelegateLaunchStripsInheritedAitestEnvironment(t *testing.T) 
 	}
 }
 
+// aitestCoordinateKeys is the full set of coordinates a supervisor needs to
+// reach worker-admit; a partial check would let three of four leak.
+var aitestCoordinateKeys = []string{
+	"AIRA_AITEST_LIB",
+	"AIRA_AITEST_WORKER_ADMIT_CMD",
+	"AIRA_AITEST_BOOTSTRAP_CMD",
+	"AIRA_AITEST_MAX_WORKERS_FALLBACK",
+}
+
+// reportChildEnv builds a shell command printing each key's value, "|"-joined
+// in order, so one confined launch reports a whole environment slice.
+func reportChildEnv(keys ...string) []string {
+	verbs := make([]string, len(keys))
+	args := make([]string, len(keys))
+	for i, key := range keys {
+		verbs[i] = "%s"
+		args[i] = `"$` + key + `"`
+	}
+	return []string{"/bin/sh", "-c", "printf '" + strings.Join(verbs, "|") + "' " + strings.Join(args, " ")}
+}
+
+// TestConfineNonDelegateWithPopulatedRuntimeDirDeliversNoAitestCoordinates
+// pins the contract AIRA-71's wrong documentation claimed to satisfy: a PLAIN
+// `aira confine -- pytest --aitest-workers=auto` delivers aitest nothing.
+//
+// This is deliberately NOT a duplicate of
+// TestConfineNonDelegateLaunchStripsInheritedAitestEnvironment above. That one
+// passes RuntimeDir:"", and AppendAitestChildEnvironment early-returns right
+// after stripping when runtimeDir is empty (internal/pylib/env.go:53) -- so it
+// passes identically whether the DelegateRAM gate at confine_linux.go:757
+// exists or is removed. It cannot distinguish the two candidate fixes for
+// AIRA-71, and therefore cannot pin this contract. With a POPULATED
+// RuntimeDir, removing that gate makes this test fail.
+func TestConfineNonDelegateWithPopulatedRuntimeDirDeliversNoAitestCoordinates(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", dataHome)
+	scope := &confineFakeScope{}
+	var stdout bytes.Buffer
+	result, err := confineWithDeps(context.Background(), ConfineRequest{
+		Slice: "finite.slice", DelegateRAM: false, Name: "pytest",
+		Env: []string{
+			"PATH=" + os.Getenv("PATH"),
+			"XDG_DATA_HOME=" + dataHome,
+			// Stale coordinates as an outer delegate-ram aitest job would leak
+			// them into a nested plain `aira confine` (the leak the strip at
+			// confine_linux.go:766-777 exists to stop). They must not survive,
+			// and must not be replaced by fresh ones either.
+			"AIRA_AITEST_LIB=/stale/lib",
+			"AIRA_AITEST_WORKER_ADMIT_CMD=/stale/aira",
+			"AIRA_AITEST_BOOTSTRAP_CMD=/stale/aira",
+			"AIRA_AITEST_MAX_WORKERS_FALLBACK=999",
+		},
+		Argv:       reportChildEnv(append(append([]string{}, aitestCoordinateKeys...), "AIRA_PY_LIB", "AIRA_CONFINE_SCOPE_ID")...),
+		RuntimeDir: t.TempDir(), SelfPath: os.Args[0], Stdout: &stdout, Stderr: io.Discard,
+	}, confineUnitDeps(scope))
+	if err != nil || result.Exit != 0 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	fields := strings.Split(stdout.String(), "|")
+	if len(fields) != len(aitestCoordinateKeys)+2 {
+		t.Fatalf("child environment report=%q", stdout.String())
+	}
+	for i, key := range aitestCoordinateKeys {
+		if fields[i] != "" {
+			t.Fatalf("non-delegate launch delivered %s=%q, want empty", key, fields[i])
+		}
+	}
+	// Anti-porosity, and the whole reason this test is not a copy of the one
+	// above: prove the populated RuntimeDir was genuinely exercised. If
+	// extraction had failed, appendChildEnvironment returns early
+	// (internal/pylib/env.go:130-139) and every assertion above would pass for
+	// the wrong reason -- as vacuously as the RuntimeDir:"" test does.
+	if fields[len(aitestCoordinateKeys)] == "" {
+		t.Fatal("AIRA_PY_LIB absent: extraction never ran, so the aitest-coordinate assertions above prove nothing")
+	}
+	if fields[len(aitestCoordinateKeys)+1] == "" {
+		t.Fatal("AIRA_CONFINE_SCOPE_ID absent: the confine child environment was not populated")
+	}
+}
+
+// TestConfineDelegateRAMDeliversAitestCoordinates is the positive half of the
+// pair: --delegate-ram is what actually wires aitest, so SKILL.md must
+// recommend it (AIRA-71). Together the two tests bracket the gate in both the
+// false-fail and false-pass directions.
+func TestConfineDelegateRAMDeliversAitestCoordinates(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	scope := &confineFakeScope{}
+	var stdout bytes.Buffer
+	deps := confineUnitDeps(scope)
+	// DelegateRAM triggers the #67/AIRA-15 scope-cap write; the fake scope has
+	// no real memory.max fd, so stub it as the other delegate-ram unit tests do.
+	deps.writeScopeMemoryCap = func(Scope, int64, int64, bool) error { return nil }
+	result, err := confineWithDeps(context.Background(), ConfineRequest{
+		Slice: "finite.slice", DelegateRAM: true, Name: "pytest",
+		Argv:       reportChildEnv(aitestCoordinateKeys...),
+		RuntimeDir: t.TempDir(), SelfPath: os.Args[0], Stdout: &stdout, Stderr: io.Discard,
+	}, deps)
+	if err != nil || result.Exit != 0 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	fields := strings.Split(stdout.String(), "|")
+	if len(fields) != len(aitestCoordinateKeys) {
+		t.Fatalf("child environment report=%q", stdout.String())
+	}
+	for i, key := range aitestCoordinateKeys {
+		if fields[i] == "" {
+			t.Fatalf("delegate-ram launch delivered no %s", key)
+		}
+	}
+	// The coordinate must point at a real extracted tree, not merely be set:
+	// a supervisor cannot import a plugin from a path that does not exist.
+	if _, err := os.Stat(filepath.Join(fields[0], "aitest", "__init__.py")); err != nil {
+		t.Fatalf("AIRA_AITEST_LIB=%q is not a real extracted aitest tree: %v", fields[0], err)
+	}
+}
+
 func TestConfineWritesNoLedgerOrRunRecord(t *testing.T) {
 	working := t.TempDir()
 	t.Chdir(working)

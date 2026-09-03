@@ -442,3 +442,101 @@ func TestSkillCommandShellQuotesMetacharacters(t *testing.T) {
 		t.Fatalf("touch Command does not shell-quote the glob: %q", touch.Command)
 	}
 }
+
+// aitestSkillSection returns the body of the generated aitest section.
+//
+// It fails closed on a missing or empty heading rather than returning "": a
+// renamed heading would otherwise make every negative assertion below
+// vacuously true, which is the failure mode this whole test exists to prevent.
+func aitestSkillSection(t *testing.T, name, document string) string {
+	t.Helper()
+	const heading = "## Running pytest suites with aitest"
+	start := strings.Index(document, heading)
+	if start < 0 {
+		t.Fatalf("%s has no %q section", name, heading)
+	}
+	body := document[start+len(heading):]
+	if end := strings.Index(body, "\n## "); end >= 0 {
+		body = body[:end]
+	}
+	if strings.TrimSpace(body) == "" {
+		t.Fatalf("%s %q section is empty", name, heading)
+	}
+	return body
+}
+
+// TestSkillAitestGuidanceRecommendsAnInvocationThatWorks is the doc half of
+// AIRA-71.
+//
+// The generated aitest section used to instruct every agent to launch as a
+// PLAIN `aira confine -- pytest --aitest-workers=auto` with "no
+// --delegate-ram". internal/runner/confine_linux.go:757-778 wires aitest's four
+// AIRA_AITEST_* coordinates ONLY when DelegateRAM is true and strips them
+// otherwise, so the documented form could never reach worker-admit; it
+// degraded to a single uncontained worker. The runner half of this contract is
+// pinned by TestConfineNonDelegateWithPopulatedRuntimeDirDeliversNoAitestCoordinates
+// and TestConfineDelegateRAMDeliversAitestCoordinates.
+func TestSkillAitestGuidanceRecommendsAnInvocationThatWorks(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, document := range []struct{ name, body string }{
+		{"SKILL.md", string(artifacts.SkillMD)},
+		{"guide", string(artifacts.Guide)},
+	} {
+		// Scoped to the aitest section deliberately. The confinement section
+		// (skill.go:324) already contains "--delegate-ram" several times, so a
+		// whole-document strings.Contains -- the style used by
+		// TestSkillMandatesConfineAndFramesCoordinationOptIn above -- would
+		// pass regardless of what this section actually recommends.
+		section := aitestSkillSection(t, document.name, document.body)
+		for _, want := range []string{
+			// The exact invocation that actually wires the coordinates.
+			"aira confine --delegate-ram -- pytest --aitest-workers=auto",
+			// Registration is a second, independent precondition: nothing sets
+			// PYTHONPATH, so AIRA_AITEST_LIB alone does not load the plugin.
+			"conftest.py",
+			"pytest_plugins",
+			// AIRA-77: --delegate-ram also arms the legacy xdist governor.
+			"-p no:aira_xdist_governor",
+			// The accounting claim must stay scoped to what worker-admit
+			// actually does. An earlier draft overstated this as "the slice
+			// only ever holds this job's 512M framework overhead", which is
+			// false: a registered aira_xdist_governor still charges the ledger
+			// per test, and a delegate scope adopted after a daemon restart is
+			// reconstructed at live RSS plus margin.
+			"adds no slice-ledger charge",
+			// AIRA_AITEST_ESTIMATED_BYTES is parsed with int(raw)
+			// (internal/pylib/aitest/__init__.py:141-146): a "4G"-style value
+			// raises ValueError and silently falls back to the 512M default,
+			// with no warning at all (only out-of-range integers warn).
+			// Naming the variable without its units would reproduce this
+			// ticket's own defect class, so the units are pinned.
+			"PLAIN INTEGER BYTE COUNT",
+			"AIRA_AITEST_ESTIMATED_BYTES=4294967296",
+		} {
+			if !strings.Contains(section, want) {
+				t.Fatalf("%s aitest section missing %q", document.name, want)
+			}
+		}
+		// Retracted claims, pinned as the exact strings that were generated.
+		//
+		// Coverage gap, stated rather than implied: these are substring
+		// assertions, so they pin the specific wrong claims this section has
+		// actually shipped -- they cannot prove the prose is semantically
+		// correct, and a reviewer must still read it. They exist so a KNOWN
+		// regression cannot return silently.
+		for _, forbidden := range []struct{ text, why string }{
+			// Matching a looser phrase here would false-fail on the corrected
+			// text's legitimate "WITHOUT `--delegate-ram`" failure-mode note.
+			{"no `--delegate-ram`", "tells agents to omit --delegate-ram (the flag aitest requires)"},
+			{"only a `--delegate-ram` launch is guaranteed", "claims delegate-ram is the only shape with a finite outer cap; --memory-max and a declared --memory-reserve are finite too, they just never receive the coordinates"},
+			{"the slice only ever holds", "overstates slice accounting; see the adds-no-slice-ledger-charge assertion above"},
+		} {
+			if strings.Contains(section, forbidden.text) {
+				t.Fatalf("%s aitest section %s: found %q", document.name, forbidden.why, forbidden.text)
+			}
+		}
+	}
+}
