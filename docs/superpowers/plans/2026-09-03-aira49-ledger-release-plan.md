@@ -220,6 +220,11 @@ func TestReleaseStaleGrantedLeasesPassLeavesARecentlyGrantedWaiterAlone(t *testi
 	// is still present in activeConfines afterward, and (if the scope
 	// directory was created empty for the test) it is untouched.
 }
+```
+
+**Positive control, required (Fable round-4 confirmation):** this daemon package has never resolved a slice via `AIRA_CONFINE_SLICE` before this plan (existing tests key `admitQueues` directly by whatever path they construct, bypassing `ResolveConfineManagementSlice` entirely). If that resolution silently failed in a test environment, `releaseStaleGrantedLeasesPass` would find nothing and every "leaves alone" test would pass VACUOUSLY, not for the right reason. Before trusting any of this task's tests: assert `runner.ResolveConfineManagementSlice("")`'s returned path actually equals the key used for `server.admitQueues[...]` in the test (it is `EvalSymlinks`-canonicalised, so a naive string comparison against the raw `t.Setenv` value may not match — compare against what resolution itself returns, not the input), and put `TestReleaseStaleGrantedLeasesPassReleasesAWaiterGrantedLongAgoOnceItsScopeReapsEmpty`'s positive case first/prominently so a resolution failure shows up as an obvious failure there rather than as silent vacuous passes in the negative-case tests.
+
+```go
 
 func TestReleaseStaleGrantedLeasesPassLeavesALiveNestedChildScopeAlone(t *testing.T) {
 	// grantedAt old enough to pass the age gate, but the scope has a live
@@ -247,6 +252,23 @@ func TestStaleGrantedLeasesCoversEveryRegisteredSliceNotJustTheDefault(t *testin
 	// full pass) and assert candidates from BOTH paths are returned --
 	// this is what actually locks in "iterates every registered queue",
 	// not just "works for the one path a test happens to construct".
+}
+
+func TestStaleGrantedLeasesSkipsAWaiterWithNoGrantedAtRecordEvenIfEnqueuedIsVeryOld(t *testing.T) {
+	// Fable round-4 confirmation: the DIRECT regression test for the
+	// waiter.grantedAt.IsZero() fail-closed default -- "no grant record
+	// means never released by this pass". Every hand-built
+	// admitWaiter{state: admitGranted} fixture ELSEWHERE in this test
+	// suite naturally has a zero grantedAt (the field didn't exist before
+	// this plan), so this is a realistic drift risk, not a hypothetical:
+	// construct a waiter with grantedAt left as its zero value and
+	// enqueued set an hour old, and assert it is NOT selected -- proving
+	// the fallback is the safe "never release" direction, not an
+	// accidental "fall back to enqueued and release anyway" one. This is
+	// the test that would have caught the v3 defect coming back through
+	// an uninitialized field, which
+	// TestStaleGrantedLeasesNeverReadsEnqueuedForItsAgeDecision alone
+	// (whose grantedAt is always set, just recently) does not exercise.
 }
 ```
 
@@ -378,9 +400,12 @@ Wire into `runScopeReaper`, immediately before the existing reap call:
 		s.reapOrphanedScopesPass(ctx)
 ```
 
-Document explicitly (code comment on `staleGrantedLeases` or `releaseStaleGrantedLeasesPass`, implementer's choice of exact placement) two accepted, deliberate residual gaps, per Fable's review — do not silently omit either:
-- A granted waiter whose scope directory does not exist yet at all (genuinely still mid-launch, before scope creation) is correctly never a candidate for THIS pass (`ReapScopeIfEmpty` fails to open it, `reaped=false`) — its only current release path if abandoned before ever creating a scope is the connection-close path. This is acceptable: such a window is bounded by however long scope creation itself can plausibly take, which this project has no evidence is ever close to `staleLeaseReleaseGrace`.
-- PID reuse on top of a dead supervisor is not this pass's concern at all (it uses no PID signal); a stuck lease whose SCOPE remains genuinely populated (e.g. by an unrelated process that happened to land in the same, still-existing cgroup after the real supervisor died — an unlikely but not impossible scenario) would simply never satisfy the physical-reap gate and would stay stuck, same safe-direction liveness gap the existing orphan reaper already accepts for the identical reason.
+Document explicitly (code comment on `staleGrantedLeases` or `releaseStaleGrantedLeasesPass`, implementer's choice of exact placement) these accepted, deliberate residual gaps — do not silently omit any:
+- A granted waiter whose scope directory does not exist yet at all (genuinely still mid-launch, before scope creation) is correctly never a candidate for THIS pass (`ReapScopeIfEmpty` fails to open it, `reaped=false`) — its only current release path if abandoned before ever creating a scope is the connection-close path. This is acceptable: such a window is bounded by however long scope creation itself can plausibly take, which Fable's round-4 trace found is normally a fraction of a second (one socket frame, an `Mkdir`, a handful of cgroupfs writes, then `clone3(CLONE_INTO_CGROUP)` — no locks, no queueing, no I/O beyond local cgroupfs) — nowhere close to `staleLeaseReleaseGrace`.
+- The one residual false-positive direction (a launcher legitimately `SIGSTOP`ed/frozen inside that sub-second window for longer than the grace) is **fail-closed, confirmed by trace**: when it resumes, its cgroup fd is already gone, so its own next cgroupfs write returns `ENOENT`/`ENODEV`, the launch fails cleanly, and the job's own deferred cleanup runs — it never ends up running uncontained. State this plainly in the doc comment so a future reader does not have to re-derive it.
+- PID reuse on top of a dead supervisor is not this pass's concern at all (it uses no PID signal); a stuck lease whose SCOPE remains genuinely populated (e.g. by an unrelated process that happened to land in the same, still-existing cgroup after the real supervisor died) would simply never satisfy the physical-reap gate and would stay stuck, same safe-direction liveness gap the existing orphan reaper already accepts for the identical reason.
+- This sweep only ever frees LEDGER accounting. If a peer connection genuinely IS still open on the daemon side (the original, still-not-fully-explained case — see Task 4), that connection's parked goroutine, its admit slot, and its socket fd all persist regardless of what this sweep does; they are released only by that connection's own eventual close. Nobody should expect this sweep to close a live connection — it only ever un-sticks the ledger's own bookkeeping.
+- This sweep, like the existing `reapOrphanedScopesPass`, only ever consults the ledger's own `admitQueues` — it makes no claim about any slice this daemon has never been asked to admit against, which is not a gap, simply the sweep's defined scope.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -390,11 +415,13 @@ Document explicitly (code comment on `staleGrantedLeases` or `releaseStaleGrante
 
 ## Task 4: Post-deploy verification against the original repro
 
-**Not a code task.** After Task 3 is merged and deployed:
+**Not a code task.** After Task 3 is merged and deployed, re-run (or ask fastest-ee-dc to re-run, since they hold the original repro details — scope_id `CONFINE-@dr-job-4017698-dl50y3eb6xkj` pattern, `aira confine --delegate-ram -- <long job>` then external-kill the wrapper) the original AIRA-49 repro against the deployed fix, with Fable round-4's specific measurement protocol — because the most parsimonious reading of the ORIGINAL report, consistent with every fact in it, is that there may never have been a stuck LEDGER at all:
 
-- [ ] Re-run (or ask fastest-ee-dc to re-run, since they hold the original repro details — scope_id `CONFINE-@dr-job-4017698-dl50y3eb6xkj` pattern, `aira confine --delegate-ram -- <long job>` then external-kill the wrapper) the original AIRA-49 repro against the deployed fix.
-- [ ] Confirm the lease actually releases within the expected bound (grace + reaper interval).
-- [ ] If it releases via the ORDINARY connection-close path before this sweep ever gets a chance to (plausible per Fable's trace of `admit.go:452-521`) — that is fine and expected for a plain SIGKILL; this sweep exists as the backstop for whatever OTHER, still-unexplained mechanism produced the original stuck state. Update AIRA-49's ticket with whatever is actually observed, honestly, rather than declaring the original root cause confirmed without having watched it happen.
+- [ ] Before the external kill: run `aira confine --list` and record the exact `slice reserve: <granted>/<ceiling> across N job(s)` line (`cmd/aira/main.go`'s list output).
+- [ ] Externally kill the launcher (not via `aira confine --kill`) as in the original repro.
+- [ ] Immediately after (within a few seconds, well before any reaper grace/interval could apply): run `aira confine --list` again and record the SAME line.
+- [ ] **If `granted` drops immediately** — the ledger was never actually stuck; the SIGKILLed launcher's socket close correctly freed the lease right away via the existing `admitConnection`/`cancelPeer`/deferred-`release()` path (`admit.go:452-521`), exactly as Fable's trace predicts. What lingered in the original report was the now-empty scope DIRECTORY, still visible for its ordinary 2-minute-grace + up-to-5-minute-interval reaper window (≤7 minutes) — during which `--list` correctly still shows it (owner unknown) and `--kill --steal` correctly says `U_CONFINE_NOT_LAUNCHED`, which is confusing wording for a normal, bounded, already-working condition, not evidence of a stuck ledger. If this is what's observed: update AIRA-49's ticket to say so plainly — the ledger-release mechanism built in Tasks 1-3 is still a correct, valuable, genuinely-needed backstop for whatever OTHER, still-unidentified path could leave a lease truly stuck (a peer connection that never gets an EOF at all, e.g.), but it was not what produced THIS specific original report, and the confusing `U_CONFINE_NOT_LAUNCHED` wording during the normal reaper window is the more accurate description of what fastest-ee-dc actually hit. Consider it a separate, smaller, real UX finding worth its own follow-up ticket rather than folding it silently into AIRA-49's "fixed" narrative.
+- [ ] **If `granted` does NOT drop immediately** and the lease is only recovered later by this plan's own sweep (confirm via the new `"released stale confine lease"` log line) — the original diagnosis stands as originally reported, and this fix directly, demonstrably resolves it. Record which of the two outcomes was actually observed; do not assume either without watching it happen.
 
 ## Deferred / explicitly out of scope
 
