@@ -4,7 +4,7 @@
 
 **Goal:** When a confine job's owning process dies without releasing its admission lease, the daemon must eventually reclaim the stuck ledger reservation on its own — never leaving it permanently unrecoverable, never requiring a daemon restart — via a policy whose consequences are honestly documented, not a claim of having *proven* the owner dead (a claim this project's own review process has now shown, twice, cannot actually be made from any signal available here).
 
-**Architecture (v5 — four plan-review rounds, three BLOCKs and one PASS-WITH-FIXES; see "What changed" below):** Every granted admission lease is, from this point on, understood to carry an implicit **maximum unused lifetime**: if `staleLeaseReleaseGrace` (default 15 minutes) elapses after grant with the scope still found empty, the daemon reclaims it — a lease-TTL policy, not a liveness proof. A background sweep, run across **every currently registered admission-queue slice** (not just the default one — see Task 3), finds `admitGranted` waiters whose lease was GRANTED (not merely enqueued — see below) at least `staleLeaseReleaseGrace` ago. For each, it attempts to physically remove that scope's cgroup directory tree via the exact fd-anchored, kernel-enforced removal (`reapEmptyConfineScopeTree`) the existing orphaned-scope reaper (AIRA-36/#72) already uses. **Only on a confirmed-successful physical removal** does the pass reclaim the ledger lease. Two facts gate the action: how long the ledger itself has held the GRANT (an in-process timestamp set at the exact moment of grant, immune to admission-queue contention), and whether the kernel itself just proved the scope is empty right now — but the plan explicitly does NOT claim these together prove the owner is dead (see v5's changelog entry for why that claim doesn't hold, and why the fix is honest framing plus a conservative default rather than a fifth attempt at a stronger proof that does not exist).
+**Architecture (v5 — four plan-review rounds, three BLOCKs and one PASS-WITH-FIXES; see "What changed" below):** Every granted admission lease is, from this point on, understood to carry an implicit reclaim policy — precisely: **minimum grant age plus empty-at-reclaim-time** (Sol round-5's more accurate phrasing; "maximum unused lifetime" wrongly suggests continuous non-use is tracked, which it is not — only the two point-in-time facts below are). If `staleLeaseReleaseGrace` (default 15 minutes) has elapsed since `grantedAt` AND the scope is found empty at the moment of the sweep, the daemon reclaims it — a lease-TTL policy, not a liveness proof. A background sweep, run across **every currently registered admission-queue slice** (not just the default one — see Task 3), finds `admitGranted` waiters whose lease was GRANTED (not merely enqueued — see below) at least `staleLeaseReleaseGrace` ago. For each, it attempts to physically remove that scope's cgroup directory tree via the exact fd-anchored, kernel-enforced removal (`reapEmptyConfineScopeTree`) the existing orphaned-scope reaper (AIRA-36/#72) already uses. **Only on a confirmed-successful physical removal** does the pass reclaim the ledger lease. Two facts gate the action: how long the ledger itself has held the GRANT (an in-process timestamp set at the exact moment of grant, immune to admission-queue contention), and whether the kernel itself just proved the scope is empty right now — but the plan explicitly does NOT claim these together prove the owner is dead (see v5's changelog entry for why that claim doesn't hold, and why the fix is honest framing plus a conservative default rather than a fifth attempt at a stronger proof that does not exist).
 
 **What changed, across three review rounds:**
 
@@ -94,6 +94,7 @@ At the existing grant transition:
 
 **Files:**
 - Modify: `internal/runner/confine_manage_linux.go`
+- Modify: `internal/runner/confine_manage_stub.go` — **required, not optional** (Sol round-5: caught as a build-break, not a style nit). `internal/daemon/confine_reaper.go` (Task 3) is NOT Linux-gated and calls `runner.ReapScopeIfEmpty` unconditionally — every other cross-platform daemon file that calls into this package's Linux-only real implementations (`ReapOrphanedConfineScopes`, `ResolveConfineManagementSlice`, etc.) has a matching stub here for `!linux` builds; add `ReapScopeIfEmpty`'s stub in the same style (`return false, errors.New("E_CONFINE_UNAVAILABLE: confine management requires Linux")`), or every non-Linux build of this repo fails with an undefined symbol. Verify with a non-Linux cross-compile (`GOOS=darwin aira confine -- go build ./...` or equivalent) as part of this task's own verification, not just `go build ./...` on this machine.
 - Test: `internal/runner/confine_manage_linux_test.go`, reusing the exact fixture helpers named in "File Structure" above.
 
 **Interfaces:**
@@ -233,6 +234,19 @@ func TestStaleGrantedLeasesNeverReadsEnqueuedForItsAgeDecision(t *testing.T) {
 	// long queue wait") must NOT be selected as a candidate even though
 	// enqueued alone would suggest staleness -- this is the direct
 	// regression test for the v3 defect this plan's Task 1 exists to fix.
+}
+
+func TestStaleGrantedLeasesCoversEveryRegisteredSliceNotJustTheDefault(t *testing.T) {
+	// Sol round-4/5: the direct regression test for the multi-slice
+	// defect. Build a *Server with TWO distinct sliceQueue entries under
+	// s.admitQueues, keyed by two different, real, distinct slice paths
+	// (e.g. two separate cgrouptest.IsolatedScopeParent(t) directories --
+	// neither the daemon's ordinary default-resolved path), each holding
+	// its own old-enough admitGranted waiter with a matching empty real
+	// scope directory. Call s.staleGrantedLeases(grace) directly (not the
+	// full pass) and assert candidates from BOTH paths are returned --
+	// this is what actually locks in "iterates every registered queue",
+	// not just "works for the one path a test happens to construct".
 }
 ```
 
