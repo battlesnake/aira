@@ -1,4 +1,6 @@
-# AIRA-31: aitest Slice 2 — JUnit XML, coverage combine, TestReport replay — Implementation Plan (v3)
+# AIRA-31: aitest Slice 2 — JUnit XML, coverage combine, TestReport replay — Implementation Plan (v4)
+
+**v4 changelog:** Sol's round-2 confirmation of v3 rendered PASS WITH FIXES (no more BLOCKs — the coverage-ownership-free design and crash-atomic staging were both confirmed correct against real source and a live probe). Five precise fixes applied: (1) the tuple-tagging codec's marker was not collision-safe against a real dict that happens to be shaped like the marker — fixed with a proper escaping scheme, and now applied to whole events (including `logstart`/`logfinish` locations), not just report `data`; (2) the `{`-prefix wire discriminator is ambiguous against a legally-`{`-prefixed nodeid — replaced with an explicit sentinel; (3) every staged event's own nodeid must match `in_flight`, not just the plain line's; (4) the synthesized-unevaluated-report fix only covered the twice-crashed case — `_fail_queue_too_large`'s separate unevaluated-marking path needed the same treatment, via one centralized helper; (5) the synthesized report must use `outcome="failed"` with an honest message, since a literal `outcome="unevaluated"` is not a real pytest outcome and junitxml silently ignores it — the original design would not actually have worked. Also added a real `pytest --cov` regression test (a spy test alone can't prove the pytest-cov integration) and a `junit_logging` config note for the e2e test.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -107,6 +109,37 @@ def test_exit_child_exits_normally_when_no_coverage_is_active(monkeypatch):
     # cleanly with zero errors, no crash from a missing coverage module.
 
 
+def test_exit_child_saving_a_real_pytest_cov_active_instance_does_not_disturb_the_parents_own_collector(pytester):
+    # Sol round-2, required: a spy-based test alone cannot prove this --
+    # it needs pytest-cov actually active. Run a real pytest sub-process
+    # (pytester or a real subprocess invocation, whichever this project's
+    # coverage/pytest-cov test conventions elsewhere already establish --
+    # if none exist yet, this is the first) with `--cov` AND
+    # `--aitest-workers=2` against a small real fixture suite, and assert:
+    # (a) the run completes without error, (b) the PARENT process's own
+    # pytest-cov-owned Coverage instance still completes its own combine
+    # normally afterward (its usual `.coverage`-shaped output exists and
+    # is non-empty), (c) lines exercised ONLY inside a forked worker
+    # (not the supervisor/collection phase) appear as covered in the
+    # final combined data -- proving the child's stop()/save() on the
+    # COW-shared pytest-cov Coverage object correctly mutated only the
+    # forked copy, per Sol's source-verified finding, without this
+    # plan's own docs merely asserting that verification happened
+    # somewhere else.
+    #
+    # Document explicitly, in this task's code comments (not left
+    # implicit): a project using a bare `coverage run -m pytest` (no
+    # pytest-cov, no parallel-mode config) rather than `--cov` gets NO
+    # correctness guarantee from this mechanism on its own -- without
+    # coverage's own parallel-mode / suffixed-data-file setting, the
+    # child and parent can both write to the SAME data file and overwrite
+    # each other. aitest deliberately owns none of that configuration
+    # (see this task's "own nothing" design) -- a project wanting correct
+    # coverage across aitest workers is responsible for its OWN
+    # parallel-mode-aware coverage config, exactly as it already would be
+    # for xdist.
+
+
 def test_exit_child_still_exits_if_coverage_save_itself_raises(monkeypatch):
     # A spy whose .save() raises -- assert _exit_child still calls the
     # real os._exit with the requested code regardless (best-effort save,
@@ -117,30 +150,48 @@ def test_exit_child_still_exits_if_coverage_save_itself_raises(monkeypatch):
 
 - [ ] **Step 3: Implement**
 
-Tuple-tagging codec (verified live on this machine before being written into this plan — a round-trip of `{"longrepr": (...), "sections": [(...)], "location": (...), "plain_list": [...]}` through tag→`json.dumps`→`json.loads`→untag correctly restored every tuple to a real `tuple` while leaving genuine lists as lists):
+Tuple-tagging codec — **collision-safe (Sol round-2 fix)**: the plan's first draft used a bare `{"__tuple__": True, "items": [...]}` marker, which is NOT injective — a real report field (a plugin-added `user_properties` entry, e.g.) that happens to be a dict shaped exactly like that marker would be silently misinterpreted as a tuple on decode. The corrected version below ESCAPES any real dict that already contains a marker key, so the mapping is truly one-to-one in both directions, verified live (round-tripping both an ordinary nested tuple/list/dict structure AND a deliberately adversarial dict containing a real key equal to the marker, confirming the adversarial case decodes back to the exact same real dict, not a tuple):
 
 ```python
+_TUPLE_MARKER = "__aitest_tuple__"
+_ESCAPED_MARKER = "__aitest_escaped__"
+
+
 def _tag_tuples(obj):
     if isinstance(obj, tuple):
-        return {"__tuple__": True, "items": [_tag_tuples(x) for x in obj]}
+        return {_TUPLE_MARKER: [_tag_tuples(x) for x in obj]}
     if isinstance(obj, list):
         return [_tag_tuples(x) for x in obj]
     if isinstance(obj, dict):
-        return {k: _tag_tuples(v) for k, v in obj.items()}
+        tagged = {k: _tag_tuples(v) for k, v in obj.items()}
+        if _TUPLE_MARKER in obj or _ESCAPED_MARKER in obj:
+            # A REAL dict that happens to already look like one of our
+            # markers must be escaped, or decoding it would silently turn
+            # it into a tuple (or unwrap a fake "escape") instead of the
+            # real dict it actually is. Wrapping is recursive-safe: an
+            # already-escaped dict containing another marker-shaped dict
+            # gets escaped again, one layer per occurrence, and _untag_tuples
+            # peels exactly one layer per marker it encounters.
+            return {_ESCAPED_MARKER: tagged}
+        return tagged
     return obj
 
 
 def _untag_tuples(obj):
     if isinstance(obj, dict):
-        if obj.get("__tuple__") is True and "items" in obj:
-            return tuple(_untag_tuples(x) for x in obj["items"])
+        if _ESCAPED_MARKER in obj and len(obj) == 1:
+            return {k: _untag_tuples(v) for k, v in obj[_ESCAPED_MARKER].items()}
+        if _TUPLE_MARKER in obj and len(obj) == 1:
+            return tuple(_untag_tuples(x) for x in obj[_TUPLE_MARKER])
         return {k: _untag_tuples(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [_untag_tuples(x) for x in obj]
     return obj
 ```
 
-Wire every `"report"`-kind event's `data` through `_tag_tuples` before `json.dumps` on the worker side (supervisor side untags on replay — see Task 2).
+Apply `_tag_tuples`/`_untag_tuples` to the **whole event dict**, not just a report event's `data` payload — `logstart`/`logfinish` events carry their own `location` tuples (Sol round-2: "preserving logstart/logfinish locations") and need the identical treatment, not just report events.
+
+`run_worker_loop` writes each event line with the explicit `_EVENT_LINE_PREFIX` sentinel defined in Task 2 (do not use a bare `"{"`-starts-with check anywhere — Sol round-2 found this is ambiguous against a legal pytest nodeid), followed by `json.dumps(_tag_tuples(event))`, one per line, before the existing unchanged plain result line.
 
 `_exit_child(code)`:
 
@@ -173,7 +224,9 @@ Unregister `terminalreporter` in the worker loop, before the first test runs (ex
 
 **Interfaces:**
 - Consumes: Task 1's `_untag_tuples`, `_exit_child`. Needs supervisor-level `pytest.Config`/hook-caller access, threaded through as in prior plan drafts.
-- Produces: real `pytest_runtest_logreport`/`logstart`/`logfinish` calls, fired only once per test, only after (a) the WHOLE staged batch for that nodeid parses/deserializes successfully and (b) the plain result line for that same nodeid is confirmed; a synthesized, honestly-worded report replayed for the terminal "unevaluated" (twice-crashed) case instead of silence.
+- Produces: real `pytest_runtest_logreport`/`logstart`/`logfinish` calls, fired only once per test, only after (a) the WHOLE staged batch for that nodeid parses/deserializes successfully AND every event's own nodeid matches `state["in_flight"]` (Sol round-2 — not just the plain line's nodeid, EVERY staged event's nodeid must match; a well-formed event for the WRONG nodeid, e.g. from the AIRA-40-class inherited-fd surface, must go through the same crash path as a malformed event) and (b) the plain result line for that same nodeid is confirmed; a single, centralized `_synthesize_and_replay_unevaluated(nodeid, reason)` helper (see below) called from EVERY site that currently sets a result to `"unevaluated"` — not just the twice-crashed case — so no unevaluated nodeid is ever silently absent from JUnit XML.
+
+**Wire-format discriminator fix (Sol round-2):** the prior draft distinguished a JSON event line from the existing plain result line by checking `line.startswith("{")`. A pytest nodeid CAN legally contain `{` as its first character in principle (an unusual but valid parametrize ID), so this is ambiguous. Use an explicit, unambiguous magic prefix instead — e.g. a fixed sentinel `_EVENT_LINE_PREFIX = "\x01"` (or any byte/short string this project's nodeid grammar can never legally start with — verify against pytest's actual nodeid character rules rather than assuming, and pick accordingly) prepended to every JSON event line on the worker side and checked for explicitly (not inferred from JSON-parseability) on the supervisor side; the existing plain result line is emitted with no prefix at all, exactly as today.
 
 - [ ] **Step 1: Write the failing tests first**
 
@@ -201,18 +254,30 @@ def test_drain_worker_discards_staged_events_on_a_crash_before_the_result_line(.
 
 
 def test_drain_worker_synthesizes_and_replays_an_honest_report_for_the_terminal_unevaluated_outcome(...):
-    # NEW in v3 (Fable's finding). Simulate the existing Slice 1
-    # requeue-once path exhausting: crash on attempt 1 (discard staged
-    # events, requeue), crash again on attempt 2 (no more retries --
-    # existing code already sets self.results[nodeid] = "unevaluated").
-    # Assert that at the point this terminal outcome is recorded, exactly
-    # ONE real report is replayed via the spy plugin for that nodeid --
-    # not zero (Fable's gap), not two (double-counting either crashed
-    # attempt) -- with an outcome/longrepr that honestly says something
-    # like "unevaluated: worker crashed twice while running this test"
-    # (exact wording is an implementer judgment call; it must be
-    # unambiguous that this was never actually observed to pass or fail,
-    # matching this project's own unevaluated-is-not-a-pass discipline).
+    # Fable's original finding, Sol round-2's report-shape correction.
+    # Simulate the existing Slice 1 requeue-once path exhausting: crash on
+    # attempt 1 (discard staged events, requeue), crash again on attempt
+    # 2 (no more retries -- existing code sets self.results[nodeid] =
+    # "unevaluated" via the new centralized helper). Assert that at the
+    # point this terminal outcome is recorded, exactly ONE real report is
+    # replayed via the spy plugin for that nodeid -- not zero (Fable's
+    # gap), not two (double-counting either crashed attempt) -- with
+    # outcome == "failed" (NOT the literal string "unevaluated", which
+    # junitxml silently ignores) and a longrepr string that plainly says
+    # this was never actually observed to pass or fail (e.g. mentions
+    # "unevaluated" and the crash reason in its text), matching this
+    # project's own unevaluated-is-not-a-pass discipline while still
+    # rendering as a real, visible entry in junitxml/terminal output.
+
+
+def test_fail_queue_too_large_also_synthesizes_a_report_for_every_never_dispatched_nodeid(...):
+    # Sol round-2: the SAME centralized synthesis helper must also cover
+    # _fail_queue_too_large's own unevaluated-marking loop (nodes that
+    # were still queued, never even dispatched to any worker, after a
+    # permanent daemon sizing rejection) -- not just the twice-crashed
+    # case. Call _fail_queue_too_large directly with a few queued nodeids
+    # and assert the spy plugin receives exactly one synthesized,
+    # outcome="failed" report per nodeid, none silently absent.
 
 
 def test_drain_worker_still_handles_the_existing_result_line_format_unmodified(...):
@@ -224,9 +289,11 @@ def test_drain_worker_still_handles_the_existing_result_line_format_unmodified(.
 
 - [ ] **Step 3: Implement**
 
-Extend `_drain_worker`'s `{`-prefixed branch: append the raw parsed-but-not-yet-untagged event to `state["pending_events"]` (reset at dispatch time, per v2's design — find the exact `state["in_flight"] = nodeid` site). Do NOT call `_replay_event` here. At the point the existing code currently does `self.results[nodeid] = outcome` (after the plain line's `nodeid == state["in_flight"]` check passes): first validate/deserialize the ENTIRE `state["pending_events"]` batch (untag tuples, resolve each `"kind"`, call `pytest_report_from_serializable` for report events) into a fully-materialized list — if ANY event in the batch fails this step, treat it exactly like the existing malformed-line crash path (log, `_handle_worker_exit`, no replay of anything from this batch) — only once the WHOLE batch is confirmed valid, replay each materialized item in order via the real hook calls, THEN clear `state["pending_events"]`, THEN proceed with the existing unchanged `self.results[nodeid] = outcome` / recycle / retire logic.
+Extend `_drain_worker`'s event-line branch (matched via `_EVENT_LINE_PREFIX`, never a bare `"{"` check): append the raw parsed-but-not-yet-untagged event to `state["pending_events"]` (reset at dispatch time, per v2's design — find the exact `state["in_flight"] = nodeid` site). Do NOT call `_replay_event` here. At the point the existing code currently does `self.results[nodeid] = outcome` (after the plain line's `nodeid == state["in_flight"]` check passes): first validate/deserialize the ENTIRE `state["pending_events"]` batch (untag tuples, resolve each `"kind"`, call `pytest_report_from_serializable` for report events, and confirm EVERY event's own carried nodeid — not just the plain line's — equals `state["in_flight"]`) into a fully-materialized list — if ANY event in the batch fails this step, treat it exactly like the existing malformed-line crash path (log, `_handle_worker_exit`, no replay of anything from this batch) — only once the WHOLE batch is confirmed valid, replay each materialized item in order via the real hook calls, THEN clear `state["pending_events"]`, THEN proceed with the existing unchanged `self.results[nodeid] = outcome` / recycle / retire logic.
 
-In `_handle_worker_exit`: when this is the terminal `"unevaluated"` case (the existing second-crash branch that currently just does `self.results[nodeid] = "unevaluated"`), synthesize one minimal report-shaped event (implementer's judgment on the exact construction — likely easiest as a plain `pytest.TestReport`-compatible object built directly in Python rather than round-tripped through the JSON codec at all, since it never came from a worker pipe) and replay it through the same real hook call used for ordinary reports, so junitxml/terminalreporter see exactly one entry for this nodeid with an honest unevaluated-marking outcome/message. Clear whatever staged (now-discarded, since neither crashed attempt's batch was ever valid-and-confirmed) events remain.
+**Centralized, exactly-once synthesis for EVERY unevaluated result (Sol round-2 — broader than the twice-crash case alone):** grep this file for every existing site that assigns `self.results[nodeid] = "unevaluated"` or `self.results.setdefault(nodeid, "unevaluated")` before implementing this — the plan's own research found at least TWO: `_handle_worker_exit`'s terminal second-crash branch, AND `_fail_queue_too_large` (marks every STILL-QUEUED, never-even-dispatched nodeid unevaluated after a permanent daemon sizing rejection). Both must produce a real, replayed report — a synthesized report ONLY for the crash case and silence for the sizing-rejection case would just move Fable's original "silently absent from JUnit" gap to a different trigger, not close it. Add one shared helper, e.g. `_synthesize_and_replay_unevaluated(self, nodeid, reason)`, called from both sites (and any other such site this grep turns up), replacing their direct `self.results[...] = "unevaluated"` assignment with a call to this helper (which itself still sets `self.results[nodeid] = "unevaluated"` — that dict's own semantics are unchanged — but ALSO synthesizes and replays a report first).
+
+**Report shape (Sol round-2 — the previous draft's plan was underspecified here and would not actually have worked):** pytest's `TestReport.outcome` is only ever meaningfully one of `"passed"/"failed"/"skipped"` to junitxml/terminalreporter — a literal `outcome="unevaluated"` is not a real pytest outcome and is simply IGNORED by junitxml's own rendering (silently, which is exactly the failure mode this fix exists to prevent). Synthesize the report as `outcome="failed"`, `when="call"` (or a clearly-synthetic non-call phase if that renders more honestly in this project's actual junitxml output — verify against real output, implementer's call), with a `longrepr` string that says plainly this was never actually observed to pass or fail (e.g. `"unevaluated: %s" % reason`, where `reason` is whatever the caller already has — the crash message, or `_fail_queue_too_large`'s own daemon-rejection reason) — mirroring xdist's own precedent for exactly this situation (`handle_crashitem`: a synthetic failure report, not a fabricated pass, whenever a real report can never arrive). Construct it directly as a Python object matching whatever fields `pytest_runtest_logreport`/junitxml actually read (verify against real installed pytest source which fields are load-bearing, do not guess) — it never came from a worker pipe, so there's no need to round-trip it through the JSON codec at all.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -247,7 +314,7 @@ Read `internal/pylib/pytest_aitest_e2e_test.go`'s exact assertions on Slice 1's 
 
 - [ ] **Step 2: Write the failing end-to-end test first**
 
-A fixture suite: a passing test, a skipped test, an xfail, a real assertion failure with a custom message printing to both stdout and stderr, and a setup-error case. Run both plainly and with `--aitest-workers=2 --junit-xml=<path>`. Assert the two XML outputs agree on: total counts per outcome, exact test-name set, AND (this is what Task 1's tuple fix and Task 2's validated-replay exist to guarantee) that the failing test's `<failure>`/`<system-out>`/`<system-err>` elements contain the SAME real diagnostic content in both, and that the skip/xfail elements are present and well-formed (not silently absent, which is exactly what the un-fixed tuple bug would have produced — a crash, not just missing content, so also assert the aitest-driven run's exit code and full run don't crash).
+A fixture suite: a passing test, a skipped test, an xfail, a real assertion failure with a custom message printing to both stdout and stderr, and a setup-error case. **Both runs (plain and aitest-driven) MUST pass `--junit-logging=all` (or `=system-out`/whatever exact option name this project's installed pytest version uses — verify, pytest's default `junit_logging` setting emits NO `<system-out>`/`<system-err>` elements at all, which would make this test's own captured-output assertions fail for a reason having nothing to do with this plan's fix, per Sol round-2).** Run both plainly and with `--aitest-workers=2 --junit-xml=<path>`. Assert the two XML outputs agree on: total counts per outcome, exact test-name set, AND (this is what Task 1's tuple fix and Task 2's validated-replay exist to guarantee) that the failing test's `<failure>`/`<system-out>`/`<system-err>` elements contain the SAME real diagnostic content in both, and that the skip/xfail elements are present and well-formed (not silently absent, which is exactly what the un-fixed tuple bug would have produced — a crash, not just missing content, so also assert the aitest-driven run's exit code and full run don't crash).
 
 - [ ] **Step 3: Run to verify failure**
 
