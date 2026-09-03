@@ -3,7 +3,6 @@ package store
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -19,12 +18,6 @@ import (
 	"aira/internal/gate"
 	"aira/internal/runner"
 )
-
-type trackedSnapshotFile struct {
-	path string
-	data []byte
-	mode os.FileMode
-}
 
 func (s *Store) evaluateChecker(ctx context.Context, def gate.GateDefinition, root string) (DimensionEvaluation, error) {
 	switch def.Lane.Checker {
@@ -53,15 +46,11 @@ func (s *Store) runCommandChecker(ctx context.Context, def gate.GateDefinition, 
 	if err := command.Validate(); err != nil {
 		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_COMMAND_RUN_UNEVALUATED"}, err
 	}
-	snapshot, cleanup, err := materializeTrackedSnapshot(sourceRoot)
+	snapshot, rootDigest, cleanup, err := materializeTrackedSnapshot(sourceRoot)
 	if err != nil {
 		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_COMMAND_RUN_UNEVALUATED"}, fmt.Errorf("U_GATE_COMMAND_RUN_UNEVALUATED: materialize subject: %w", err)
 	}
 	defer cleanup()
-	rootDigest, err := digestTrackedRoot(snapshot)
-	if err != nil {
-		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_COMMAND_RUN_UNEVALUATED", Root: EvaluationRoot{Path: snapshot}}, err
-	}
 	cwd, err := resolveCommandCwd(snapshot, command.Cwd)
 	if err != nil {
 		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_COMMAND_RUN_UNEVALUATED", Root: EvaluationRoot{Path: snapshot, Digest: rootDigest}}, err
@@ -283,53 +272,63 @@ func hasRunnerCodeExcept(record *runner.RunRecord, allowed string) bool {
 	return false
 }
 
-func materializeTrackedSnapshot(sourceRoot string) (string, func(), error) {
-	paths, err := trackedSnapshotPaths(sourceRoot)
+// materializeTrackedSnapshot copies the source's tracked files into an isolated
+// tree a command may execute in, and returns the digest of the very bytes it
+// copied.
+//
+// Returning the digest of the capture -- rather than letting the caller hash
+// something afterwards -- is what makes the command lane's proof-time subject
+// agree with GateCheck's check-time subject by construction (AIRA-72, invariant
+// I3). Two alternatives are both wrong. Hashing the materialised directory,
+// which is what this used to do, hashes a re-indexed tree: `git add -A` below
+// silently drops any file matched by the copied .gitignore or the user's
+// core.excludesFile, so a file that is both tracked and ignored in the source
+// (legal in git) is absent from the proof digest and present in the check
+// digest, permanently invalidating a genuine pass. Re-reading sourceRoot after
+// this returns would instead open a window in which the tree changes between
+// the bytes that ran and the bytes that were bound -- a small false pass.
+func materializeTrackedSnapshot(sourceRoot string) (string, string, func(), error) {
+	entries, err := stableSubjectEntries(sourceRoot)
 	if err != nil {
-		return "", func() {}, err
+		return "", "", func() {}, err
 	}
-	first, err := readTrackedSnapshot(sourceRoot, paths)
-	if err != nil {
-		return "", func() {}, err
-	}
-	second, err := readTrackedSnapshot(sourceRoot, paths)
-	if err != nil || len(first) != len(second) {
-		return "", func() {}, errors.New("tracked snapshot changed during materialisation")
-	}
-	for i := range first {
-		if first[i].path != second[i].path || first[i].mode.Perm() != second[i].mode.Perm() || !bytes.Equal(first[i].data, second[i].data) {
-			return "", func() {}, errors.New("tracked snapshot changed during materialisation")
-		}
-	}
+	digest := digestSubjectEntries(entries)
 	dir, err := os.MkdirTemp("", "aira-gate-subject-")
 	if err != nil {
-		return "", func() {}, err
+		return "", "", func() {}, err
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
-	for _, file := range first {
-		path := filepath.Join(dir, filepath.FromSlash(file.path))
+	for _, entry := range entries {
+		// A command runs in a real working tree, so this refuses what it cannot
+		// reproduce faithfully rather than dereferencing it. The digest above is
+		// broader on purpose: it must describe entries the materialiser rejects.
+		if !entry.regular() {
+			cleanup()
+			return "", "", func() {}, fmt.Errorf("tracked path %s is not a regular file", entry.path)
+		}
+		path := filepath.Join(dir, filepath.FromSlash(entry.path))
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			cleanup()
-			return "", func() {}, err
+			return "", "", func() {}, err
 		}
-		if err := os.WriteFile(path, file.data, file.mode.Perm()); err != nil {
+		if err := os.WriteFile(path, entry.payload, entry.perm.Perm()); err != nil {
 			cleanup()
-			return "", func() {}, err
+			return "", "", func() {}, err
 		}
-		if err := os.Chmod(path, file.mode.Perm()); err != nil {
+		if err := os.Chmod(path, entry.perm.Perm()); err != nil {
 			cleanup()
-			return "", func() {}, err
+			return "", "", func() {}, err
 		}
 	}
 	if _, stderr, err := runGit(dir, "init", "-q"); err != nil {
 		cleanup()
-		return "", func() {}, fmt.Errorf("git init: %w: %s", err, strings.TrimSpace(stderr))
+		return "", "", func() {}, fmt.Errorf("git init: %w: %s", err, strings.TrimSpace(stderr))
 	}
 	if _, stderr, err := runGit(dir, "add", "-A"); err != nil {
 		cleanup()
-		return "", func() {}, fmt.Errorf("git add: %w: %s", err, strings.TrimSpace(stderr))
+		return "", "", func() {}, fmt.Errorf("git add: %w: %s", err, strings.TrimSpace(stderr))
 	}
-	return dir, cleanup, nil
+	return dir, digest, cleanup, nil
 }
 
 func trackedSnapshotPaths(root string) ([]string, error) {
@@ -352,22 +351,9 @@ func trackedSnapshotPaths(root string) ([]string, error) {
 	return paths, nil
 }
 
-func readTrackedSnapshot(root string, paths []string) ([]trackedSnapshotFile, error) {
-	files := make([]trackedSnapshotFile, 0, len(paths))
-	for _, path := range paths {
-		absolute := filepath.Join(root, filepath.FromSlash(path))
-		info, err := os.Lstat(absolute)
-		if err != nil || !info.Mode().IsRegular() {
-			return nil, fmt.Errorf("tracked path %s is unavailable or not regular", path)
-		}
-		data, err := os.ReadFile(absolute)
-		if err != nil {
-			return nil, err
-		}
-		files = append(files, trackedSnapshotFile{path: path, data: data, mode: info.Mode()})
-	}
-	return files, nil
-}
+// Tracked-tree reading now lives in gate_subject.go as captureSubjectEntries,
+// shared by the subject digest and this materialiser so the bytes that are
+// bound and the bytes that are executed come from one read (AIRA-72).
 
 func safeSnapshotPath(path string) bool {
 	clean := filepath.ToSlash(filepath.Clean(filepath.FromSlash(path)))
@@ -382,33 +368,10 @@ func safeSnapshotPath(path string) bool {
 	return true
 }
 
-func digestTrackedRoot(root string) (string, error) {
-	paths, err := trackedSnapshotPaths(root)
-	if err != nil {
-		return "", err
-	}
-	files, err := readTrackedSnapshot(root, paths)
-	if err != nil {
-		return "", err
-	}
-	return digestSnapshotFiles(files), nil
-}
-
-func digestSnapshotFiles(files []trackedSnapshotFile) string {
-	var data bytes.Buffer
-	for _, file := range files {
-		data.WriteString(file.path)
-		data.WriteByte(0)
-		data.Write(file.data)
-		data.WriteByte(0)
-	}
-	return sha256Hex(data.Bytes())
-}
-
-func sha256Hex(data []byte) string {
-	sum := sha256.Sum256(data)
-	return fmt.Sprintf("%x", sum[:])
-}
+// The tracked-tree digest lives in gate_subject.go as subjectTreeDigest, the
+// single producer of every gate subject digest. It used to be duplicated here
+// with a different scope from the one gate_eval.go used, which is how AIRA-72
+// -- a Go-only subject digest on every non-command checker -- survived.
 
 func applyMutation(root string, mutation gate.MutationSeed) error {
 	switch mutation.Kind {

@@ -2,8 +2,6 @@ package store
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -60,24 +58,6 @@ func appendCanaryUnevaluated(audit *GateAudit, def gate.GateDefinition, definiti
 	return audit.Append("result", fields)
 }
 
-func digestEvaluationRoot(root string) (string, error) {
-	paths, err := trackedTracePaths(root)
-	if err != nil {
-		return "", err
-	}
-	h := sha256.New()
-	for _, path := range paths {
-		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(path)))
-		if err != nil {
-			return "", err
-		}
-		_, _ = h.Write([]byte(path + "\x00"))
-		_, _ = h.Write(data)
-		_, _ = h.Write([]byte{0})
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
 func EvaluateDimension(root, dimension string) (DimensionEvaluation, error) {
 	if strings.TrimSpace(root) == "" {
 		return DimensionEvaluation{}, errors.New("U_GATE_EVIDENCE_UNAVAILABLE: evaluation root is empty")
@@ -86,7 +66,7 @@ func EvaluateDimension(root, dimension string) (DimensionEvaluation, error) {
 	if err != nil || !info.IsDir() {
 		return DimensionEvaluation{}, fmt.Errorf("U_GATE_EVIDENCE_UNAVAILABLE: evaluation root: %w", err)
 	}
-	digest, err := digestEvaluationRoot(root)
+	digest, err := subjectTreeDigest(root)
 	if err != nil {
 		return DimensionEvaluation{}, fmt.Errorf("U_GATE_EVIDENCE_UNAVAILABLE: %w", err)
 	}
@@ -152,7 +132,7 @@ func (s *Store) RunGate(ctx context.Context, id string) (GateCheckResult, error)
 	}
 	def := found.Definition
 	if def.Kind == gate.KindManual {
-		subjectDigest, digestErr := digestEvaluationRoot(s.root)
+		subjectDigest, digestErr := subjectTreeDigest(s.root)
 		if digestErr != nil {
 			return GateCheckResult{}, digestErr
 		}
@@ -198,7 +178,7 @@ func (s *Store) RunGate(ctx context.Context, id string) (GateCheckResult, error)
 	if err != nil {
 		subject := subjectEval.Root.Digest
 		if subject == "" {
-			subject, _ = digestEvaluationRoot(s.root)
+			subject, _ = subjectTreeDigest(s.root)
 		}
 		audit, auditErr := OpenGateAudit(s.commonDir, true)
 		if auditErr != nil {
@@ -288,7 +268,7 @@ func (s *Store) AttestGate(ctx context.Context, id, verdict, actor string) (Gate
 	if strings.TrimSpace(actor) == "" {
 		return GateCheckResult{}, errors.New("E_GATE_ATTESTATION_INVALID: actor is required")
 	}
-	subject, err := digestEvaluationRoot(s.root)
+	subject, err := subjectTreeDigest(s.root)
 	if err != nil {
 		return GateCheckResult{}, err
 	}
@@ -398,7 +378,7 @@ func (s *Store) GateAction(ctx context.Context, operation, gateID, canaryID stri
 			if definition.Definition.ID != gateID {
 				continue
 			}
-			subject, digestErr := digestEvaluationRoot(s.root)
+			subject, digestErr := subjectTreeDigest(s.root)
 			if digestErr != nil {
 				return nil, digestErr
 			}
@@ -528,7 +508,7 @@ func (s *Store) runCanary(ctx context.Context, c gate.CanaryDeclaration, def gat
 		if c.Mutation == nil {
 			return DimensionEvaluation{}, EvaluationRoot{}, errors.New("U_GATE_MUTATION_APPLY_FAILED: mutation seed is missing")
 		}
-		mutationRoot, mutationCleanup, materializeErr := materializeTrackedSnapshot(s.root)
+		mutationRoot, _, mutationCleanup, materializeErr := materializeTrackedSnapshot(s.root)
 		if materializeErr != nil {
 			return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_MUTATION_APPLY_FAILED"}, EvaluationRoot{}, fmt.Errorf("U_GATE_MUTATION_APPLY_FAILED: %w", materializeErr)
 		}
@@ -644,18 +624,16 @@ func (s *Store) GateCheck(ctx context.Context) (GateCheckReport, error) {
 			proofs = append(proofs, record)
 		}
 	}
-	subjectDigest, err := digestEvaluationRoot(s.root)
+	subjectDigest, err := subjectTreeDigest(s.root)
 	if err != nil {
 		return GateCheckReport{}, err
 	}
 	for _, d := range discovered {
+		// Every checker binds to the same whole-tracked-tree subject digest.
+		// This used to branch on CheckerCommand, because command gates were the
+		// only ones given the correct scope (AIRA-72); the branch also rehashed
+		// the entire tree once per command gate.
 		currentSubjectDigest := subjectDigest
-		if d.Definition.Lane.Checker == string(gate.CheckerCommand) {
-			currentSubjectDigest, err = digestTrackedRoot(s.root)
-			if err != nil {
-				return GateCheckReport{}, err
-			}
-		}
 		record, ok := latest[d.Definition.ID+"\x00"+currentSubjectDigest]
 		if !ok {
 			report.Results = append(report.Results, GateCheckResult{GateID: d.Definition.ID, Kind: string(d.Definition.Kind), Subject: currentSubjectDigest, Verdict: gate.VerdictUnevaluated, Code: "U_GATE_NO_RESULT", Suspect: true})

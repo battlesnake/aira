@@ -111,7 +111,7 @@ func compareCoverage(snapshot RatchetSnapshot, currentPcts []float64) RatchetCom
 func (s *Store) evaluateRatchet(ctx context.Context, def gate.GateDefinition, root string) (DimensionEvaluation, error) {
 	evaluation := DimensionEvaluation{Root: EvaluationRoot{Path: root}}
 	if root != "" {
-		digest, err := digestEvaluationRoot(root)
+		digest, err := subjectTreeDigest(root)
 		if err != nil {
 			evaluation.Predicate, evaluation.Code = gate.PredicateUnevaluated, "U_GATE_EVIDENCE_UNAVAILABLE"
 			return evaluation, nil

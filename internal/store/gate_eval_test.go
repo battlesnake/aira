@@ -138,7 +138,7 @@ func TestFixtureSentinelUsesFixtureRootAndLeavesCallerUnchanged(t *testing.T) {
 
 func snapshotTreeForTest(t *testing.T, root string) string {
 	t.Helper()
-	digest, err := digestEvaluationRoot(root)
+	digest, err := subjectTreeDigest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,6 @@ func TestSeedDigestInvalidatesOnDemandProof(t *testing.T) {
 		t.Fatal(err)
 	}
 	gitRun(t, root, "init", "-q")
-	def, canary := testTraceGate(t, root)
 	requirement, err := domain.NewRequirement(domain.RequirementInput{ID: "AR-1", Text: "caller", Status: domain.RequirementBuilt})
 	if err != nil {
 		t.Fatal(err)
@@ -200,6 +199,12 @@ func TestSeedDigestInvalidatesOnDemandProof(t *testing.T) {
 		t.Fatal(err)
 	}
 	gitRun(t, root, "add", ".")
+	// Written after `git add` so the canary declaration stays untracked and the
+	// subject digest is constant across the seed edit below. Since AIRA-72 the
+	// subject digest covers the whole tracked tree; isolating the variable keeps
+	// this test proving declaration staleness specifically, rather than passing
+	// on a subject-digest change it did not intend to make.
+	def, canary := testTraceGate(t, root)
 	s := testStore(t, root, common, state)
 	if _, err := s.RunGate(context.Background(), def.ID); err != nil {
 		t.Fatal(err)
@@ -269,7 +274,6 @@ func TestManualChallengeRequiresNegativeThenPositiveAttestation(t *testing.T) {
 func TestGateCheckRejectsPassAfterDefinitionBindingChanges(t *testing.T) {
 	base, root := t.TempDir(), t.TempDir()
 	gitRun(t, root, "init", "-q")
-	def, canary := testTraceGate(t, root)
 	requirement, err := domain.NewRequirement(domain.RequirementInput{ID: "AR-1", Text: "caller", Status: domain.RequirementBuilt})
 	if err != nil {
 		t.Fatal(err)
@@ -291,6 +295,15 @@ func TestGateCheckRejectsPassAfterDefinitionBindingChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	gitRun(t, root, "add", ".")
+	// The gate fixture is written after `git add` so it stays untracked and the
+	// subject digest is constant across the definition edit below. Since AIRA-72
+	// the subject digest covers the whole tracked tree, so a tracked gate file
+	// edit also moves the subject and the result would arrive as
+	// U_GATE_NO_RESULT -- an honest refusal, but not the one this test exists to
+	// prove. Isolating the variable keeps the strict U_GATE_PROOF_STALE
+	// assertion below meaningful; the tracked-gate-file behaviour is covered
+	// separately by TestTrackedGateFileEditInvalidatesStoredPass.
+	def, canary := testTraceGate(t, root)
 	s := testStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
 	if result, err := s.RunGate(context.Background(), def.ID); err != nil || result.Verdict != gate.VerdictPass {
 		t.Fatalf("run=%#v err=%v", result, err)
@@ -500,7 +513,7 @@ func TestGateProjectionRebuildsFromAuditAndIgnoresDBOnlyPass(t *testing.T) {
 	gitRun(t, root2, "init", "-q")
 	def2, _ := testTraceGate(t, root2)
 	s2 := testStore(t, root2, filepath.Join(base2, "common"), filepath.Join(base2, "state"))
-	subject, err := digestEvaluationRoot(root2)
+	subject, err := subjectTreeDigest(root2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -539,7 +552,7 @@ func TestPassWithoutProofCannotResurfaceThroughReadOnlyCheck(t *testing.T) {
 	}
 	gitRun(t, root, "add", ".")
 	s := testStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
-	subject, err := digestEvaluationRoot(root)
+	subject, err := subjectTreeDigest(root)
 	if err != nil {
 		t.Fatal(err)
 	}
