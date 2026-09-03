@@ -209,7 +209,7 @@ def test_run_worker_loop_dispatch_and_result_round_trip(pytester):
     assert all(event["nodeid"] == nodeid for event in events)
 
 
-def test_run_worker_loop_unregisters_terminalreporter_before_running_any_test(pytester, capsys):
+def test_run_worker_loop_mutes_terminalreporter_before_running_any_test(pytester, capsys):
     """Fable's finding: the forked child's COW-inherited terminalreporter is
     still registered and would print its OWN per-test progress line straight
     to the shared terminal -- so with the supervisor also replaying reports
@@ -236,9 +236,46 @@ def test_run_worker_loop_unregisters_terminalreporter_before_running_any_test(py
     run_worker_loop(None, items_by_nodeid, pipe_in, pipe_out)
     captured = capsys.readouterr()
 
-    assert config.pluginmanager.get_plugin("terminalreporter") is None
     assert captured.out == "", "child-side terminalreporter still printed: %r" % captured.out
     assert captured.err == ""
+
+
+def test_run_worker_loop_keeps_terminalreporter_registered_so_assertion_reprs_survive(pytester):
+    """Regression test for a REAL bug this branch's own end-to-end JUnit XML
+    fidelity test caught -- and that no plan-review round did: the obvious way
+    to silence the child reporter, pm.unregister(terminalreporter), breaks
+    pytest's rich assertion comparisons.
+
+    _pytest.assertion.util.assertrepr_compare calls
+    config.get_terminal_writer()._highlight on every `assert a == b`, and
+    Config.get_terminal_writer() does `assert terminalreporter is not None`
+    against the plugin registered under exactly that name. Unregistering it
+    turned a worker's `assert 1 == 2, "CUSTOM-MESSAGE"` failure into a bare
+    "AssertionError" plus an internal meta-traceback about get_terminal_writer,
+    destroying the real diagnostic -- while every other test stayed green.
+
+    Muting only the writer's underlying FILE keeps hasmarkup/code_highlight/
+    width exactly as the parent computed them, so the highlighter behaves
+    identically to a plain, non-aitest run."""
+    items = pytester.getitems("""
+        def test_ok():
+            assert True
+    """)
+    config = items[0].config
+    original_file = config.pluginmanager.get_plugin("terminalreporter")._tw._file
+
+    items_by_nodeid = {item.nodeid: item for item in items}
+    nodeid = next(iter(items_by_nodeid))
+    run_worker_loop(None, items_by_nodeid, io.StringIO(nodeid + "\n__stop__\n"), io.StringIO())
+
+    reporter = config.pluginmanager.get_plugin("terminalreporter")
+    assert reporter is not None, (
+        "the reporter must stay REGISTERED -- config.get_terminal_writer() "
+        "looks it up by that name and asserts it exists"
+    )
+    assert config.get_terminal_writer() is reporter._tw
+    assert reporter._tw._file is not original_file, "its writer must actually be muted"
+    assert reporter._tw._file.name == os.devnull
 
 
 def test_run_worker_loop_reinitializes_capture_so_it_is_not_the_fork_inherited_object(pytester):
@@ -408,13 +445,20 @@ def test_run_one_serialized_reports_preserve_a_real_failures_traceback_and_captu
     assert all(isinstance(section, tuple) for section in call.sections)
 
 
-def test_run_one_serializes_a_non_json_user_property_via_str_not_repr(pytester):
+def test_run_worker_loop_serializes_a_non_json_user_property_via_str_not_repr(pytester):
     """v5/v6: record_property with a non-JSON-serializable value would make
     json.dumps raise TypeError inside the child's own hookimpl, crash the
-    WORKER, and turn a genuinely PASSING test into "unevaluated" after the
-    retry crashed the same way. default=str (NOT repr) is required: the real
+    WORKER through run_one's broad `except BaseException: _exit_child(70)`
+    guard, and turn a genuinely PASSING test into "unevaluated" once the retry
+    crashed the same way. default=str (NOT repr) is required: the real
     installed junitxml applies str(propvalue) to a property value, so repr
-    would silently emit DIFFERENT XML than a plain, non-aitest run."""
+    would silently emit DIFFERENT XML than a plain, non-aitest run.
+
+    Deliberately driven through run_worker_loop's REAL emission, not a
+    re-encode in the test body: an earlier version of this test called
+    json.dumps(..., default=str) itself and therefore stayed green against a
+    worker.py mutated to default=repr -- a porous test that proved nothing.
+    Caught by mutation-testing this very file."""
     items = pytester.getitems("""
         class Weird:
             def __str__(self):
@@ -425,17 +469,19 @@ def test_run_one_serializes_a_non_json_user_property_via_str_not_repr(pytester):
         def test_records(record_property):
             record_property("weird", Weird())
     """)
-    item = items[0]
-    outcome, events = run_one(item)
-    assert outcome == "passed"
+    items_by_nodeid = {item.nodeid: item for item in items}
+    nodeid = next(iter(items_by_nodeid))
+    pipe_out = io.StringIO()
+    run_worker_loop(None, items_by_nodeid, io.StringIO(nodeid + "\n__stop__\n"), pipe_out)
+    pipe_out.seek(0)
+    raw = pipe_out.read()
 
-    encoded = [
-        json.dumps(_tag_tuples(event), default=str)
-        for event in events
-    ]
-    blob = "\n".join(encoded)
-    assert "STR-FORM" in blob
-    assert "REPR-FORM" not in blob
+    assert raw.splitlines()[-1] == "%s passed" % nodeid, (
+        "the worker must SURVIVE a non-JSON-serializable user property and "
+        "still report the real outcome: %r" % raw
+    )
+    assert "STR-FORM" in raw
+    assert "REPR-FORM" not in raw
 
 
 def _fake_coverage_module(instance):

@@ -131,10 +131,35 @@ def _init_forked_child(config):
     confined path and _spawn_fallback_worker's bare os.fork(), which never
     calls fork_worker/place_self at all), so neither can be missed.
 
-    1. Unregister the COW-inherited terminalreporter. Otherwise the child
-       prints its own per-test progress line straight to the shared terminal
-       and, combined with the supervisor's own replay-driven terminalreporter
+    1. MUTE the COW-inherited terminalreporter. Otherwise the child prints its
+       own per-test progress line straight to the shared terminal and,
+       combined with the supervisor's own replay-driven terminalreporter
        output, every test's progress prints TWICE.
+
+       Mute, NOT unregister -- a deliberate correction to this slice's plan,
+       found by its own end-to-end test rather than by review.
+       _pytest.assertion.util.assertrepr_compare reaches for
+       config.get_terminal_writer()._highlight on EVERY rich assertion
+       comparison, and Config.get_terminal_writer() does
+       `assert terminalreporter is not None` against the plugin registered
+       under exactly that name (verified in the real installed
+       _pytest/config/__init__.py and _pytest/assertion/util.py).
+       pm.unregister(terminalreporter) therefore turned every `assert a == b`
+       failure inside a worker into a bare "AssertionError" plus an internal
+       meta-traceback about get_terminal_writer, silently destroying the real
+       diagnostic -- exactly the wrong-data failure class this whole slice
+       exists to prevent, and invisible to any test that does not compare a
+       real failure's rendered traceback against a plain pytest run's.
+
+       Swapping only the underlying FILE, rather than the whole TerminalWriter,
+       keeps hasmarkup/code_highlight/terminal width precisely as the parent
+       computed them, so the highlighter behaves identically to a plain,
+       non-aitest run. Everything the child's reporter would emit -- per-test
+       progress, and the OSC 9;4 progress sequences the separate progress
+       plugin writes through this SAME writer -- goes to /dev/null instead of
+       the shared terminal. It also means a worker's log_cli live-log lines
+       (which route through the same reporter) stop reaching the shared
+       terminal; forwarding them properly is still deferred.
 
     2. Replace the COW-inherited global capture object. pytest's FDCaptureBase
        creates ONE TemporaryFile per stream in the PARENT at session start and
@@ -167,8 +192,9 @@ def _init_forked_child(config):
     branch would add risk for no benefit."""
     pm = config.pluginmanager
     terminalreporter = pm.get_plugin("terminalreporter")
-    if terminalreporter is not None:
-        pm.unregister(terminalreporter)
+    writer = getattr(terminalreporter, "_tw", None)
+    if writer is not None:
+        writer._file = open(os.devnull, "w", encoding="utf-8")
     capman = pm.get_plugin("capturemanager")
     if capman is not None:
         old = capman._global_capturing

@@ -161,6 +161,28 @@ func TestRealPytestAitestEndToEndFallback(t *testing.T) {
 	if !strings.Contains(text, "0 unevaluated") {
 		t.Fatalf("fallback run unexpectedly reported a nonzero unevaluated count: %s", text)
 	}
+	// AIRA-31 Slice 2, Task 3 Step 1's explicit decision, pinned here rather
+	// than left implicit: Slice 1's plain "<nodeid> <outcome>" lines and the
+	// aggregate summary asserted above STAY (they are the only place the
+	// honest pass/fail/unevaluated three-way survives -- "unevaluated" is not
+	// a pytest outcome, and its synthesized report deliberately renders as a
+	// failure), and real terminalreporter output is strictly ADDITIVE.
+	//
+	// These assertions are what make that additive half non-optional: without
+	// Slice 2's report replay the plain lines alone still pass every check
+	// above, so a regression that silently stopped replaying reports would go
+	// completely unnoticed at this layer. The traceback body in particular can
+	// only come from a worker's real TestReport surviving the round trip.
+	for _, want := range []string{
+		"FAILURES",
+		"this test is meant to fail",
+		"short test summary info",
+		"1 failed, 2 passed, 1 skipped",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("replayed terminalreporter output missing %q:\n%s", want, text)
+		}
+	}
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) || exitErr.ExitCode() == 0 {
 		t.Fatalf("fallback run error=%v, want nonzero pytest *exec.ExitError for the deliberate failure\n%s", err, text)
@@ -207,6 +229,11 @@ func TestRealPytestAitestEndToEndFallbackAllPassingExitsZero(t *testing.T) {
 	// assert its numeric form so this genuinely catches lost outcomes.
 	if !strings.Contains(text, "0 unevaluated") {
 		t.Fatalf("all-passing fallback run unexpectedly reported unevaluated work: %s", text)
+	}
+	// Slice 2: pytest's OWN summary, driven entirely by replayed reports,
+	// alongside the plain lines above (see the sibling test for the decision).
+	if !strings.Contains(text, "2 passed") {
+		t.Fatalf("replayed terminalreporter summary missing from an all-passing run:\n%s", text)
 	}
 }
 
@@ -357,6 +384,13 @@ func TestRealPytestAitestEndToEndRealDaemonAndCgroupPassFailOnly(t *testing.T) {
 	// evidence containment held throughout this run.
 	if strings.Contains(text, "falling back to") || strings.Contains(text, "UNCONFINED") {
 		t.Fatalf("real daemon+cgroup run unexpectedly fell back to unconfined execution:\n%s", text)
+	}
+	// Slice 2: a real CONFINED worker's TestReport must survive the round trip
+	// too, not only a fallback worker's -- the confined path forks through
+	// spawn_worker/place_self rather than _spawn_fallback_worker, and both must
+	// converge on the same child-init and event wire.
+	if !strings.Contains(text, "this test is meant to fail") {
+		t.Fatalf("confined run lost the replayed failure traceback:\n%s", text)
 	}
 }
 
