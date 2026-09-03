@@ -575,6 +575,83 @@ func TestReapOrphanedConfineScopesPlainLeafUnchanged(t *testing.T) {
 	assertReaperTestMissing(t, root)
 }
 
+// verifies: ReapScopeIfEmpty's success is the AIRA-49 release gate, so a
+// genuinely empty scope must actually be removed from disk — a gate that never
+// succeeds would silently make the whole stale-lease sweep inert.
+func TestReapScopeIfEmptyRemovesAGenuinelyEmptyScope(t *testing.T) {
+	parent, deadPID := reaperTestParentAndDeadPID(t)
+	id := confineTestScopeID("single-empty", deadPID, time.Now().Add(-10*time.Second).UnixNano())
+	root := createReaperTestScope(t, parent, id)
+
+	reaped, err := ReapScopeIfEmpty(parent, id, nil)
+	if err != nil || !reaped {
+		t.Fatalf("ReapScopeIfEmpty=(%v, %v), want (true, nil)", reaped, err)
+	}
+	assertReaperTestMissing(t, root)
+}
+
+// verifies: the emptiness proof is SUBTREE-aware, not leaf-only. The candidate's
+// own cgroup.procs is empty here while a nested child holds a live process —
+// AIRA-49 v1's leaf-only Populated check would have released the ledger lease of
+// a job that is still running.
+func TestReapScopeIfEmptyLeavesALiveNestedChildAlone(t *testing.T) {
+	parent, deadPID := reaperTestParentAndDeadPID(t)
+	id := confineTestScopeID("single-nested-live", deadPID, time.Now().Add(-10*time.Second).UnixNano())
+	root := createReaperTestScope(t, parent, id)
+	live := mkdirReaperTestCgroup(t, root, "live")
+	sleeper := startReaperTestSleeper(t, live)
+	t.Cleanup(func() { stopReaperTestSleeper(sleeper) })
+
+	reaped, err := ReapScopeIfEmpty(parent, id, nil)
+	if reaped {
+		t.Fatalf("ReapScopeIfEmpty=(%v, %v), want a refusal for a live nested child", reaped, err)
+	}
+	for _, path := range []string{root, live} {
+		if _, statErr := os.Stat(path); statErr != nil {
+			t.Fatalf("live nested tree changed at %s: %v", path, statErr)
+		}
+	}
+}
+
+// verifies: "reap succeeded" is TOCTOU-IMMUNE, not merely TOCTOU-unlikely. A
+// process is injected into the scope after the empty proof has already passed
+// but before the Unlinkat, and the kernel itself must still refuse the removal.
+// This is the direct proof behind AIRA-49's release-only-on-confirmed-reap gate.
+func TestReapScopeIfEmptyDoesNotRemoveAScopeRepopulatedAfterTheEmptyProof(t *testing.T) {
+	parent, deadPID := reaperTestParentAndDeadPID(t)
+	id := confineTestScopeID("single-repopulate", deadPID, time.Now().Add(-10*time.Second).UnixNano())
+	root := createReaperTestScope(t, parent, id)
+	empty := mkdirReaperTestCgroup(t, root, "empty")
+	live := mkdirReaperTestCgroup(t, root, "live")
+	var sleeper *exec.Cmd
+
+	reaped, err := ReapScopeIfEmpty(parent, id, func() { sleeper = startReaperTestSleeper(t, live) })
+	if sleeper != nil {
+		t.Cleanup(func() { stopReaperTestSleeper(sleeper) })
+	}
+	if reaped {
+		t.Fatalf("ReapScopeIfEmpty=(%v, %v), want a refusal after post-proof repopulation", reaped, err)
+	}
+	for _, path := range []string{root, live} {
+		if _, statErr := os.Stat(path); statErr != nil {
+			t.Fatalf("repopulated node or ancestor removed at %s: %v", path, statErr)
+		}
+	}
+	// The empty sibling may have been removed before the live node became busy.
+	if _, statErr := os.Stat(empty); statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("empty sibling stat: %v", statErr)
+	}
+}
+
+// verifies: a scope id is validated before any path is built from it, so a
+// traversal-shaped id can never reach Openat/Unlinkat.
+func TestReapScopeIfEmptyRejectsAnInvalidScopeID(t *testing.T) {
+	ok, err := ReapScopeIfEmpty(t.TempDir(), "../not-a-real-scope-id", nil)
+	if ok || err == nil {
+		t.Fatalf("got (%v, %v), want a rejection", ok, err)
+	}
+}
+
 func TestConfineReapWalkerUsesNoFollowDirectoryOpens(t *testing.T) {
 	parent := t.TempDir()
 	root := mkdirReaperTestCgroup(t, parent, "scope")
