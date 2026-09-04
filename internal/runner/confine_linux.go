@@ -455,9 +455,8 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		return result, confineUnavailable(sliceName, fmt.Errorf("ensure memory delegation: %w", err))
 	}
 
-	reserve := request.MemoryReserve
-	// declaredReserve records PROVENANCE and must be read before the widening on
-	// the next line: `pinned` is about to become true for ANY positive reserve, so
+	// declaredReserve records PROVENANCE and must be read before ResolveConfineReserve
+	// widens anything: `pinned` becomes true for ANY positive reserve, so
 	// afterwards it can no longer distinguish "the caller declared this number" from
 	// "the caller passed some number". Only a declared value may become a hard
 	// scope memory.max on the non-daemon paths — a token reserve enforced as a cap
@@ -470,30 +469,19 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	//     token reserve without declaring it (several tests pass 1) must never
 	//     have it enforced as a cap — that contains nothing and kills the job.
 	//   - validity: a caller that pins WITHOUT a usable number has its reserve
-	//     replaced by the 4GiB default a few lines down, and capping at that
-	//     default would be capping at a guess while calling it declared — exactly
-	//     what the unpinned branch deliberately refuses to do.
+	//     replaced by the 4GiB default inside ResolveConfineReserve, and capping at
+	//     that default would be capping at a guess while calling it declared —
+	//     exactly what the unpinned branch deliberately refuses to do.
 	// A declared-but-too-small reserve was already refused above, so a positive
-	// declared value here is usable. MemoryReserve is overwritten at the end of
-	// this block, so the byte count is captured now rather than re-read later.
+	// declared value here is usable. MemoryReserve is overwritten a few lines below,
+	// so the byte count is captured now rather than re-read later.
 	declaredReserve := request.MemoryReservePinned && request.MemoryReserve > 0
 	declaredReserveBytes := request.MemoryReserve
-	pinned := request.MemoryReservePinned || reserve > 0
-	if reserve <= 0 {
-		if request.DelegateRAM {
-			// Delegate-ram: pin a small framework overhead so the suite's own
-			// reserve never takes the unpinned whole-command estimate path (which
-			// would double-book the per-test reservations, §2a).
-			reserve = DefaultDelegateRAMOverhead
-			pinned = true
-		} else {
-			reserve = DefaultConfineMemoryReserve
-		}
-	}
-	if !request.DelegateRAM && request.ScopeMemoryMax > 0 {
-		reserve = request.ScopeMemoryMax
-		pinned = true
-	}
+	// AIRA-62: the ledger charge is decided HERE and only here — never upstream in a
+	// face. Both request fields are overwritten with the result a few lines below,
+	// and MemoryReservePinned is the one admitConfine puts on the admit wire, so
+	// admission always sees the RESOLVED pair rather than what a caller typed.
+	reserve, pinned := ResolveConfineReserve(request)
 	signature := request.ResourceSignature
 	if signature == "" {
 		if computed, signatureErr := ResourceSignature(nil, nil, request.Argv); signatureErr == nil {
