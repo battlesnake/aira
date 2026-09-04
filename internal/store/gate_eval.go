@@ -799,11 +799,13 @@ func (s *Store) checkGatesReadOnly(report *CheckReport) error {
 	if err != nil {
 		return err
 	}
-	// Check pre-seeds Dimensions["gates"] = "pass", so an unpopulated gate set
-	// would otherwise leave an affirmative claim that the gate dimension
-	// passed. Retract it: nothing was evaluated. This matches the established
-	// treatment of an empty requirement registry, which reports U_TRACE_EMPTY
-	// rather than a vacuous traceability pass.
+	// An unpopulated gate set evaluates nothing, so it carries its own
+	// unevaluated reason rather than returning silently and letting Check
+	// establish the dimension. This matches the treatment of an empty
+	// requirement registry, which reports U_TRACE_EMPTY rather than a vacuous
+	// traceability pass. Check no longer seeds Dimensions["gates"] = "pass"
+	// (AIRA-86), so the recorded finding is now what keeps the dimension
+	// honest in both directions.
 	if len(gateReport.Results) == 0 && gateReport.Code == GateSetEmptyCode {
 		addFinding(report, CheckFinding{Code: GateSetEmptyCode, Subject: "gates", Message: "no gate definition is present", Kind: "unevaluated"}, "gates")
 		return nil
@@ -824,6 +826,15 @@ func (s *Store) checkGatesReadOnly(report *CheckReport) error {
 			}
 		}
 		addFinding(report, finding, "gates")
+	}
+	// Only a report that carried results evaluated anything, so only that case
+	// may establish the dimension. Today every discovered gate contributes
+	// exactly one result, which makes a results-empty report the unpopulated
+	// set handled above; the guard keeps the claim tied to evidence anyway, so
+	// a future skip arm cannot turn "evaluated nothing" back into a pass
+	// (AIRA-86). That arm is unreachable today and therefore untested.
+	if len(gateReport.Results) > 0 {
+		establishDimension(report, "gates")
 	}
 	return nil
 }

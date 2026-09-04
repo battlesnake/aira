@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-86","project":"aira","title":"check seeds all fourteen honesty dimensions as pass, so an unwired dimension reports a fabricated green","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["check","honesty","store"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-86","project":"aira","title":"check seeds all fourteen honesty dimensions as pass, so an unwired dimension reports a fabricated green","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["check","honesty","store"],"hold":false,"relations":[]}
 ---
 PR #12 finding **B8 / P9** / plan candidate **76**, filed by the simplification programme's
 Phase 0 (plan §4.3). Source-verified against master `22cedd6`.
@@ -71,3 +71,93 @@ the two gate files:
   results-empty report is unevaluated rather than vacuously green.
 
 Plan: docs/superpowers/plans/2026-09-04-aira80-81-60-86-captured-subject-plan.md
+
+## Resolution (2026-09-05): the headline `check.go` seed site
+
+Closed. `Check` no longer seeds any result. `newCheckReport` starts with an
+empty `Dimensions` map, `checkDimensions` is the canonical list of the fourteen
+(a list of names, not of results), and a dimension is reported only because
+something put a result there:
+
+- `establishDimension` raises a dimension to `pass`, called only where a checker
+  ran and established a clean result. It never overwrites a recorded fail,
+  warning or unevaluated, in either order.
+- `finaliseDimensions` reports every dimension nothing established as
+  `unevaluated` with a `U_CHECK_UNEVALUATED` finding naming it, and that demotes
+  the rollup verdict the way any other unevaluated result does. An unwired
+  checker, a checker that returns early, or a dimension added to the list ahead
+  of its evaluator now reads as unevaluated instead of a fabricated green.
+- `unevaluateDimension` records "no result established" for the callers that
+  hold the reason as a finding of their own; it keeps a recorded `fail` rather
+  than laundering it into an unevaluated.
+
+The mandatory condition this ticket set -- a test that each dimension's pass path
+still reaches pass, so the fix does not trade a silent false green for a silent
+false unevaluated -- is
+`TestCheckReportsEveryDimensionPassWhenEveryCheckerEstablishesIt`: one fixture
+(git worktree + requirement registry + covered and verified built requirement +
+proven gate) in which all fourteen establish, asserted per dimension. Deleting
+any single establishment site fails it, verified by mutation.
+
+### Behaviour changes this exposed, not papered over
+
+- **A non-git root now reports traceability `unevaluated`, not `pass`.**
+  `checkTraceability` returned early for a non-git ticket-only project without
+  evaluating anything, and the seed left `pass` behind -- the exact defect, live.
+  That arm now records `U_TRACE_UNSCANNED` with its reason. Ticket-only non-git
+  fixtures therefore report an unevaluated verdict where they used to report
+  pass; real projects are git worktrees and are unaffected.
+- **`checkDuplicateIDs` marks `ticket-file-integrity` unevaluated for a worktree
+  it could not scan.** The same failed ticket scan is the only evidence either
+  dimension has for that worktree, so establishing one and not the other would
+  have kept a narrower version of the same fabricated pass.
+- **`checkGatesReadOnly` establishes its own `gates` dimension**, guarded on the
+  gate report carrying at least one result, like `checkTraceability`. Honest
+  coverage gap: a results-empty report with any code other than
+  `U_GATE_SET_EMPTY` is unreachable today (every discovered gate contributes
+  exactly one result), so that guard arm is untested.
+- `U_CHECK_UNEVALUATED` is now registered in the exit-code catalog. It was
+  already emitted on the cancelled-context path without being catalogued.
+
+### Build review (DeepSeek-pro, independent lineage): two confirmed, two not
+
+Both confirmed findings were real holes the establishment sites would otherwise
+have perpetuated, and each is now a regression test:
+
+- **A partly-unreadable requirement registry reported traceability `pass`.** A
+  malformed node is an `E_REQUIREMENT_INVALID` fail finding carried with no
+  dimension of its own, and only an edge that references it demoted the
+  dimension. One readable requirement plus one unreadable one that nothing
+  annotates reached the establishment arm and claimed the whole graph.
+  `checkTraceability` now records `U_TRACE_UNSCANNED` whenever any node is
+  unreadable, not only when none is readable
+  (`TestTraceabilityIsNotEstablishedWhileARequirementIsUnreadable`; the
+  byte-for-byte golden was updated deliberately, with the reason in the test).
+- **`finaliseDimensions` depended on `addFinding` to write the dimension**, and
+  `addFinding`'s unevaluated branch dedupes on (Code, Subject) and returns
+  before it touches the dimension. Unreachable today, but the one place whose
+  entire job is to never leave a dimension unset should not depend on a dedupe.
+  The dimension is now written first
+  (`TestFinaliseDimensionsWritesTheDimensionEvenWhenItsFindingIsADuplicate`).
+
+Not accepted, with reasons:
+
+- "The rollup ignores direct dimension failures" — refuted against source: all
+  nine `Dimensions["allocated-id-file"] = "fail"` sites append a finding in the
+  same block, so the verdict is `fail`.
+- "`addFinding`'s unevaluated branch overwrites a recorded `fail`" — real, and
+  inconsistent with the traceability rank system where `fail` outranks
+  `unevaluated`, but pre-existing, out of this ticket's scope, and not a false
+  pass (the verdict stays `fail` because the findings list is non-empty). Filed
+  as an observation here rather than changed under an AIRA-86 PR. Note the new
+  `unevaluateDimension` takes the opposite (fail-preserving) rule deliberately.
+
+### Named, not fixed
+
+`test-reports` is a fifteenth dimension that materialises in the map only when a
+flaky-report finding demotes it: it is never seeded and never established, so a
+consumer cannot tell "evaluated, nothing wrong" from "not evaluated". That is
+not a fabricated pass (an absent key claims nothing) and it is out of this
+ticket's fourteen-dimension scope, so it is reported here rather than changed.
+
+Plan: docs/superpowers/plans/2026-09-04-backlog-remediation-plan.md (Phase 2)
