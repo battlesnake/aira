@@ -85,6 +85,55 @@ func captureTraceSnapshot(root string, hook func()) (traceSnapshot, error) {
 	return traceSnapshot{Files: first}, nil
 }
 
+// isTracePath is the traceability parser's input selector: go/parser runs over
+// every non-requirement file in the set, so it must stay Go plus the requirement
+// registry.
+//
+// It is one function rather than two because both the check lane
+// (trackedTracePaths, which lists the tree itself) and the gate lane
+// (traceSnapshotFromSubject, which filters an already-captured subject) select
+// with it. A second copy is exactly how a selector drifts, and a drifted
+// selector on the gate side is a subject that claims coverage it does not have.
+func isTracePath(path string) bool {
+	if strings.HasSuffix(path, ".go") && !strings.HasPrefix(path, "vendor/") {
+		return true
+	}
+	return strings.HasPrefix(path, ".aira/requirements/") && strings.HasSuffix(path, ".md")
+}
+
+// traceSnapshotFromSubject derives the traceability parser's input from an
+// already-captured subject instead of re-reading the tree (AIRA-80). The
+// subject's digest is then a digest of the very bytes parsed here.
+//
+// The non-regular refusal mirrors readTraceSnapshotFiles: a tracked symlink
+// named *.go is not parseable source, and parsing its target's path bytes as Go
+// would be evidence about a file that was never read.
+func traceSnapshotFromSubject(subject capturedSubject) (traceSnapshot, error) {
+	// A directory readability probe, not a content read: it cannot tear, and
+	// dropping it would silently widen the lane in the one case it catches.
+	if err := validateTraceRequirementsDirectory(subject.root); err != nil {
+		return traceSnapshot{}, err
+	}
+	files := make([]traceSnapshotFile, 0, len(subject.entries))
+	for _, entry := range subject.entries {
+		if !isTracePath(entry.path) {
+			continue
+		}
+		if entry.kind == subjectEntrySymlink {
+			return traceSnapshot{}, fmt.Errorf("U_TRACE_UNSCANNED: tracked file %s is not regular", entry.path)
+		}
+		files = append(files, traceSnapshotFile{Path: entry.path, Data: entry.payload, Requirement: strings.HasPrefix(entry.path, ".aira/requirements/")})
+	}
+	return traceSnapshot{Files: files}, nil
+}
+
+// trackedTracePaths serves the check lane, which walks every registered
+// worktree. It is deliberately NOT rebased onto the whole-tree capture: it has
+// no persisted digest binding, so a torn read there cannot mint or re-serve a
+// stale pass, while widening it would read every byte of every worktree on
+// every `aira check` and would import captureSubjectEntries' gitlink refusal
+// (AIRA-79) into a lane that does not need it, making check fail closed on any
+// repository with a submodule.
 func trackedTracePaths(root string) ([]string, error) {
 	if err := validateTraceRequirementsDirectory(root); err != nil {
 		return nil, err
@@ -99,11 +148,7 @@ func trackedTracePaths(root string) ([]string, error) {
 		if path == "" {
 			continue
 		}
-		if strings.HasSuffix(path, ".go") && !strings.HasPrefix(path, "vendor/") {
-			paths = append(paths, path)
-			continue
-		}
-		if strings.HasPrefix(path, ".aira/requirements/") && strings.HasSuffix(path, ".md") {
+		if isTracePath(path) {
 			paths = append(paths, path)
 		}
 	}

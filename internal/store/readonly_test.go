@@ -168,7 +168,7 @@ func TestOpenReadOnlyServesRatchetTestReportReadsFromWAL(t *testing.T) {
 		ParserComplete: true, SourceDigest: "current-after-reader-open",
 		Results: []domain.TestResult{{Name: "A", Outcome: domain.OutcomeFail}, {Name: "B", Outcome: domain.OutcomePass}},
 	})
-	evaluation, err := reader.evaluateRatchet(context.Background(), definition, root)
+	evaluation, err := reader.evaluateRatchet(context.Background(), definition, captureFor(t, root))
 	if err != nil || evaluation.Predicate != gate.PredicatePass || !evaluation.Evidence {
 		t.Fatalf("read-only ratchet evaluation=%+v err=%v", evaluation, err)
 	}
