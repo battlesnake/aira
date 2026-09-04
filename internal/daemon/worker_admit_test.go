@@ -1452,3 +1452,29 @@ func TestWorkerScopeLockReleasesOnCancelledWaiter(t *testing.T) {
 	}
 	state.release()
 }
+
+// verifies: AIRA-39 — an ALREADY-cancelled caller must never acquire the outer
+// scope lock, deterministically. select picks uniformly at random among ready
+// cases, so with a free lock and a done context the bare select took the lock
+// about half the time and went on to create a worker scope for a peer that was
+// already gone (CreateWorkerScope does not observe ctx) -- an orphan scope
+// charging the ledger until job teardown. Found by Sol build-review round 2.
+// The loop is what makes this a real check: a single attempt passes ~50% of the
+// time against the unfixed code, which is exactly the kind of coin-flip
+// "evidence" this repo treats as no evidence at all.
+func TestWorkerScopeLockIsNeverTakenByAnAlreadyCancelledCaller(t *testing.T) {
+	server := NewServer(Paths{})
+	state := server.workerScopeFor("/outer")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for i := 0; i < 200; i++ {
+		if server.acquireWorkerScope(ctx, state) {
+			t.Fatalf("attempt %d: an already-cancelled caller took the lock and would go on to create an orphan worker scope", i)
+		}
+	}
+	// The lock is still free for a live caller — the refusals took no token.
+	if !server.acquireWorkerScope(context.Background(), state) {
+		t.Fatal("the lock was left held after the cancelled attempts")
+	}
+	state.release()
+}

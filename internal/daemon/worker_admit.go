@@ -148,6 +148,21 @@ func (s *Server) workerScopeFor(outerScope string) *workerScopeState {
 // context is done or the daemon is stopping. The ONLY statement permitted
 // after a true return is `defer state.release()`.
 func (s *Server) acquireWorkerScope(ctx context.Context, state *workerScopeState) bool {
+	// Checked BEFORE the select below, because select picks uniformly at random
+	// among ready cases: with an already-cancelled peer AND a free lock, the bare
+	// select took the lock about half the time and went on to create a worker
+	// scope for a peer that was already gone (CreateWorkerScope does not observe
+	// ctx). That orphan scope then charges the ledger until job teardown. This
+	// makes the already-cancelled case deterministic; it narrows but cannot close
+	// the race against a peer that vanishes mid-acquire, whose residue is the
+	// same safe over-charge (Sol build-review round 2).
+	select {
+	case <-ctx.Done():
+		return false
+	case <-s.stopping:
+		return false
+	default:
+	}
 	select {
 	case state.lock <- struct{}{}:
 		return true
