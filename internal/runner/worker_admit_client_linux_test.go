@@ -35,6 +35,10 @@ func TestRequestWorkerAdmitReturnsHeldLeaseOnGrant(t *testing.T) {
 	server.SetAdmitReadMemoryForTest(func(string) (int64, int64, int64, bool, string) { return 0, 20 * (1 << 20), 0, true, "" })
 	server.SetAdmitReadWorkerSupervisorMemoryForTest(func(string) (int64, int64, bool, string) { return 0, 0, true, "" })
 	server.SetWorkerAdmitHeadroomForTest(0) // production default (64 MiB) would swallow this test's tiny synthetic byte values
+	// AIRA-39: the ledger now sums the outer scope's real `.aira-worker-*`
+	// children and the daemon creates the granted scope itself. "/outer" is not
+	// a real cgroup here, so both seams are answered by an in-memory tree.
+	server.SetWorkerScopeTreeForTest()
 	ready := make(chan struct{}, 1)
 	server.Ready = ready
 	ctx, cancel := context.WithCancel(context.Background())

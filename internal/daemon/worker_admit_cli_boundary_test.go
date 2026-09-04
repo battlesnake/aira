@@ -22,6 +22,11 @@ func TestWorkerAdmitCLIStderrClassificationMatchesSupervisorBoundary(t *testing.
 
 	paths := testPaths(t)
 	server := NewServer(paths)
+	// AIRA-39: the ledger sums the outer scope's real `.aira-worker-*` children
+	// and the daemon creates the granted scope itself. The fixture scopes below
+	// are not real cgroups, so both seams are stubbed; neither denial path in
+	// this test reaches a create.
+	_ = newWorkerScopeTree().install(server)
 	server.workerAdmitHeadroom = 0
 	server.workerAdmitPollInterval = time.Millisecond
 	server.admitReadMemory = func(scope string) (int64, int64, int64, bool, string) {
@@ -84,5 +89,31 @@ func TestWorkerAdmitCLIStderrClassificationMatchesSupervisorBoundary(t *testing.
 	}
 	if strings.Contains(timeoutStderr, "reject:exceeds-ceiling") {
 		t.Fatalf("timeout unexpectedly used the permanent sizing rejection:\n%s", timeoutStderr)
+	}
+
+	// AIRA-63, proven through the REAL client rather than the in-process
+	// response struct: an admitSlots-saturated worker-admit must reach
+	// supervisor.py as a RETRIABLE denial. Delivered as an error frame it would
+	// arrive as "worker-admit request rejected", which matches none of the
+	// classifier's denial substrings, falls through to WorkerAdmitUnavailable,
+	// and makes _disable_daemon run the whole suite UNCONFINED.
+	for i := 0; i < admitGlobalMax; i++ {
+		server.admitSlots <- struct{}{}
+	}
+	_, saturatedStderr := runWorkerAdmit("/deny-ceiling", workerAdmitEstimatedBytesMin, "5s")
+	for i := 0; i < admitGlobalMax; i++ {
+		<-server.admitSlots
+	}
+	if !strings.Contains(saturatedStderr, "worker-admit denied") {
+		t.Fatalf("saturation stderr does not match the supervisor's denial classifier at all:\n%s", saturatedStderr)
+	}
+	if !strings.Contains(saturatedStderr, "fallback:admit-slots-saturated") {
+		t.Fatalf("saturation stderr missing the slot-saturation reason:\n%s", saturatedStderr)
+	}
+	if strings.Contains(saturatedStderr, "reject:") {
+		t.Fatalf("saturation stderr is reject:-prefixed, so the supervisor marks the queue unevaluated instead of retrying once a slot frees:\n%s", saturatedStderr)
+	}
+	if strings.Contains(saturatedStderr, "request rejected") {
+		t.Fatalf("saturation was delivered as an error frame; supervisor.py classifies that as unavailable and answers by running the suite unconfined:\n%s", saturatedStderr)
 	}
 }

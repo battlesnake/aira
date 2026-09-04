@@ -1108,25 +1108,15 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 		_, _ = fmt.Fprintln(stderr, err)
 		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
 	}
-	scopePath, err := runner.CreateWorkerScope(ctx, options["outer-scope"], lease.WorkerID, lease.MemoryMax, lease.MemoryHigh)
-	if err != nil {
-		_ = lease.Close()
-		// A distinct "worker-admit local-placement-failed" marker, not a
-		// bare error dump: the daemon ALREADY granted admission here (a
-		// healthy, reachable daemon) -- only the LOCAL cgroup scope
-		// creation then failed. Without this marker the raw error matches
-		// none of supervisor.py's recognized denied/timeout/unevaluated
-		// substrings, so it was indistinguishable from genuine daemon
-		// unreachability and permanently disabled daemon-backed admission
-		// for the rest of the run over what may be a one-off local
-		// resource hiccup (found by Sol build-review, AIRA-38 review
-		// wave). supervisor.py classifies this marker as
-		// WorkerPlacementFailed -- same fallback behavior as before, but
-		// now with an honest diagnostic instead of a misleading one.
-		_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: worker-admit local-placement-failed: %v\n", err)
-		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
-	}
-	if _, err := fmt.Fprintf(stdout, "granted scope=%s worker_id=%s memory_max=%d memory_high=%d\n", scopePath, lease.WorkerID, lease.MemoryMax, lease.MemoryHigh); err != nil {
+	// AIRA-39: the DAEMON creates the worker scope now, inside the same
+	// critical section that decided to grant, so there is no local
+	// CreateWorkerScope call here any more and no grant->creation window for a
+	// dying client to leave open. The scope named below already exists, with
+	// its memory.max, memory.high and memory.oom.group verified daemon-side.
+	// The "worker-admit local-placement-failed" marker went with the call site;
+	// a daemon-side creation failure is now a reject:worker-scope-create-failed
+	// denial, which supervisor.py already classifies as terminal.
+	if _, err := fmt.Fprintf(stdout, "granted scope=%s worker_id=%s memory_max=%d memory_high=%d\n", lease.ScopePath, lease.WorkerID, lease.MemoryMax, lease.MemoryHigh); err != nil {
 		_ = lease.Close()
 		_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: write grant: %v\n", err)
 		return store.ExitForCode("E_CONFINE_UNAVAILABLE")

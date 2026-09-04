@@ -61,9 +61,14 @@ func TestFrameRoundTripPreservesRequestContent(t *testing.T) {
 	}
 }
 
-func TestStoreWriteRelayUsesProtocolVersionFive(t *testing.T) {
-	if ProtocolVersion != 5 {
-		t.Fatalf("ProtocolVersion = %d, want 5 for compute git-context relay", ProtocolVersion)
+// verifies: AIRA-39 — the bump from 5 to 6 is load-bearing, not cosmetic.
+// Daemon-side worker-scope creation changes wire SEMANTICS without changing the
+// wire SHAPE, so the version mismatch is the only thing standing between a
+// stale client and a whole aitest suite silently running unconfined (see
+// ProtocolVersion's own comment). A later "consistency" revert must fail here.
+func TestStoreWriteRelayUsesProtocolVersionSix(t *testing.T) {
+	if ProtocolVersion != 6 {
+		t.Fatalf("ProtocolVersion = %d, want 6 for compute git-context relay and AIRA-39 daemon-side worker-scope creation", ProtocolVersion)
 	}
 }
 

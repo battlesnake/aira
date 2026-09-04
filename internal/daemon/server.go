@@ -21,6 +21,7 @@ import (
 	"aira/internal/core"
 	"aira/internal/runner"
 	"aira/internal/store"
+
 	"golang.org/x/sys/unix"
 )
 
@@ -84,9 +85,8 @@ type Server struct {
 	admitPriorAt                 time.Time
 	admitSliceHeadroomBase       int64
 	admitSliceHeadroomSupervisor int64
-	workerJobsMu                 sync.Mutex
-	workerJobs                   map[string]*workerJobState
-	workerScopeOwner             map[string]string
+	workerScopesMu               sync.Mutex
+	workerScopes                 map[string]*workerScopeState
 	workerAdmitHeadroom          int64
 	scopeReapGrace               time.Duration
 	staleLeaseReleaseGrace       time.Duration
@@ -110,21 +110,28 @@ type Server struct {
 	admitReadWorkerSupervisorMemory func(string) (int64, int64, bool, string)
 	admitConfineScan                func(string) (runner.ConfineListResult, error)
 	admitConfineScanInterval        time.Duration
-	admitNow                        func() time.Time
-	admitAfter                      func(time.Duration) <-chan time.Time
-	admitWriteFrame                 func(net.Conn, any) error
-	admitBeforeWrite                func(*admitWaiter)
-	admitPeakHistory                func(context.Context, string) (runner.PeakRSSStats, error)
-	admitPeakP90                    func(context.Context) (int64, bool, error)
-	peerCredential                  func(net.Conn) (int, int, error)
-	storeOpAppendTimeout            time.Duration
-	storeOpHeavyTimeout             time.Duration
-	storeOpWriteTimeout             time.Duration
-	storeOpRun                      func(context.Context, *store.Store, StoreOpFrame) (any, error)
-	listRegistryEntries             func(string) ([]store.RegistryEntry, error)
-	discoverProject                 func(context.Context, string) (app.Project, error)
-	adoptRebuild                    func(context.Context, *store.Store) error
-	beforeEjectTransaction          func()
+	// workerScopeScan / workerScopeCreate are the worker-admit ledger's two
+	// cgroupfs seams (AIRA-39). Production uses scanWorkerScopeChildren and
+	// runner.CreateWorkerScope; tests substitute fakes so the ledger's
+	// arithmetic is exercised without a real delegated cgroup.
+	workerScopeScan         func(string) (workerScopeChildren, error)
+	workerScopeCreate       func(context.Context, string, string, int64, int64) (string, error)
+	workerScopeScanInterval time.Duration
+	admitNow                func() time.Time
+	admitAfter              func(time.Duration) <-chan time.Time
+	admitWriteFrame         func(net.Conn, any) error
+	admitBeforeWrite        func(*admitWaiter)
+	admitPeakHistory        func(context.Context, string) (runner.PeakRSSStats, error)
+	admitPeakP90            func(context.Context) (int64, bool, error)
+	peerCredential          func(net.Conn) (int, int, error)
+	storeOpAppendTimeout    time.Duration
+	storeOpHeavyTimeout     time.Duration
+	storeOpWriteTimeout     time.Duration
+	storeOpRun              func(context.Context, *store.Store, StoreOpFrame) (any, error)
+	listRegistryEntries     func(string) ([]store.RegistryEntry, error)
+	discoverProject         func(context.Context, string) (app.Project, error)
+	adoptRebuild            func(context.Context, *store.Store) error
+	beforeEjectTransaction  func()
 }
 
 func NewServer(paths Paths) *Server {
@@ -145,6 +152,7 @@ func NewServer(paths Paths) *Server {
 			return runner.ListConfines(context.Background(), path, nil)
 		},
 		admitConfineScanInterval:     admitConfineScanIntervalDefault,
+		workerScopeScanInterval:      workerScopeScanIntervalDefault,
 		admitSliceHeadroomBase:       admitSliceHeadroomBaseDefault,
 		admitSliceHeadroomSupervisor: admitSliceHeadroomSupervisorDefault,
 		workerAdmitHeadroom:          workerAdmitHeadroomDefault,

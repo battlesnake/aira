@@ -634,17 +634,21 @@ class Supervisor:
             # "reject:" (permanent) vs "fallback:" (transient) reason-prefix
             # convention (worker_admit.go's evaluateWorkerAdmit/
             # workerAdmitConnection: EVERY "denied" reason starting
-            # "reject:" -- exceeds-ceiling, outer-scope-owned-by-another-
-            # job, and any future one -- deliberately breaks the daemon's
-            # OWN poll loop immediately as a stable "never going to
-            # resolve" fact, exactly like exceeds-ceiling; only
-            # "fallback:"-prefixed reasons keep polling). The ownership
-            # rejection was previously left out, matched only "worker-admit
-            # denied" below, and was retried INDEFINITELY against a
-            # permanently (by design -- workerJobFor's own ownership
-            # binding is never released) impossible request, under a
-            # misleading "budget contended" warning. Scoped to "worker-admit
-            # denied" specifically, NOT "worker-admit timeout": a timeout's
+            # "reject:" -- exceeds-ceiling, worker-scope-create-failed, and
+            # any future one -- deliberately breaks the daemon's OWN poll
+            # loop immediately as a stable "never going to resolve" fact;
+            # only "fallback:"-prefixed reasons keep polling, e.g.
+            # insufficient-headroom, aggregate-cap-exceeded,
+            # admit-slots-saturated and worker-scope-id-collision).
+            #
+            # AIRA-39 note: the outer-scope-owned-by-another-job rejection
+            # this comment used to cite is GONE. The ledger now sums the
+            # outer scope's real .aira-worker-* children rather than one
+            # job's own grants, so two job ids sharing one outer scope are
+            # counted together instead of the second being refused.
+            #
+            # Scoped to "worker-admit denied" specifically, NOT
+            # "worker-admit timeout": a timeout's
             # own reason text ("reject:saturated") also contains "reject:"
             # by coincidental wording, but state=timeout means the CLIENT's
             # own wait budget merely expired -- genuinely retriable with a

@@ -1,10 +1,16 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,6 +19,128 @@ import (
 
 	"aira/internal/runner"
 )
+
+// workerScopeTree is an in-memory stand-in for the outer scope's real
+// `.aira-worker-*` children — the cgroupfs the worker-admit ledger now sums
+// (AIRA-39). It backs both daemon seams (workerScopeScan, workerScopeCreate)
+// from one structure, so a test that creates a scope through the daemon sees
+// exactly that scope in the next scan, the way the real tree does.
+type workerScopeTree struct {
+	mu       sync.Mutex
+	caps     map[string]map[string]int64 // outer scope -> child dir name -> memory.max
+	scanErr  map[string]error
+	scans    map[string]int
+	createFn func(outer, workerID string) error
+}
+
+func newWorkerScopeTree() *workerScopeTree {
+	return &workerScopeTree{
+		caps:    map[string]map[string]int64{},
+		scanErr: map[string]error{},
+		scans:   map[string]int{},
+	}
+}
+
+// install wires the tree into a server and returns it. Every worker-admit test
+// needs it: with no seam the default scan reads a real directory that does not
+// exist, which is honestly "unevaluated" but tells us nothing about the ledger.
+//
+// The scan throttle is set to one nanosecond so ledger-ARITHMETIC tests see the
+// tree as it is, not as it was up to a second ago. The throttle's own behaviour
+// is tested separately, by the tests that set workerScopeScanInterval
+// themselves; leaving the production default here would silently turn every
+// other test into a test of the cache instead.
+func (tree *workerScopeTree) install(server *Server) *workerScopeTree {
+	server.workerScopeScan = tree.scan
+	server.workerScopeCreate = tree.create
+	server.workerScopeScanInterval = time.Nanosecond
+	return tree
+}
+
+// put adds a child cgroup directly, standing in for a scope that already
+// existed before this daemon process did — the AIRA-39 restart case — or for
+// one created by something other than this daemon.
+func (tree *workerScopeTree) put(outerScope, childName string, memoryMax int64) {
+	tree.mu.Lock()
+	defer tree.mu.Unlock()
+	if tree.caps[outerScope] == nil {
+		tree.caps[outerScope] = map[string]int64{}
+	}
+	tree.caps[outerScope][childName] = memoryMax
+}
+
+func (tree *workerScopeTree) remove(outerScope, childName string) {
+	tree.mu.Lock()
+	defer tree.mu.Unlock()
+	delete(tree.caps[outerScope], childName)
+}
+
+func (tree *workerScopeTree) failScan(outerScope string, err error) {
+	tree.mu.Lock()
+	defer tree.mu.Unlock()
+	tree.scanErr[outerScope] = err
+}
+
+func (tree *workerScopeTree) scanCount(outerScope string) int {
+	tree.mu.Lock()
+	defer tree.mu.Unlock()
+	return tree.scans[outerScope]
+}
+
+func (tree *workerScopeTree) scan(outerScope string) (workerScopeChildren, error) {
+	tree.mu.Lock()
+	defer tree.mu.Unlock()
+	tree.scans[outerScope]++
+	if err := tree.scanErr[outerScope]; err != nil {
+		return workerScopeChildren{}, err
+	}
+	var children workerScopeChildren
+	for name, value := range tree.caps[outerScope] {
+		if !strings.HasPrefix(name, workerScopeChildPrefix) {
+			continue
+		}
+		children.committed = addClamp(children.committed, value)
+		children.count++
+		if index, err := strconv.Atoi(strings.TrimPrefix(name, workerScopeChildPrefix)); err == nil && index > children.maxIndex {
+			children.maxIndex = index
+		}
+	}
+	return children, nil
+}
+
+func (tree *workerScopeTree) create(_ context.Context, outerScope, workerID string, memoryMax, memoryHigh int64) (string, error) {
+	tree.mu.Lock()
+	defer tree.mu.Unlock()
+	if tree.createFn != nil {
+		if err := tree.createFn(outerScope, workerID); err != nil {
+			return "", err
+		}
+	}
+	name := workerScopeChildPrefix + workerID
+	if tree.caps[outerScope] == nil {
+		tree.caps[outerScope] = map[string]int64{}
+	}
+	if _, exists := tree.caps[outerScope][name]; exists {
+		// Exactly what os.Mkdir does through runner.CreateWorkerScope.
+		return "", fmt.Errorf("aitest worker scope: create: mkdir %s: %w", name, fs.ErrExist)
+	}
+	if memoryHigh > 0 && memoryHigh >= memoryMax {
+		return "", fmt.Errorf("aitest worker scope: memory_high (%d) must be below memory_max (%d)", memoryHigh, memoryMax)
+	}
+	tree.caps[outerScope][name] = memoryMax
+	return runner.WorkerScopeChildPath(outerScope, "worker-"+workerID), nil
+}
+
+// evaluateWorkerAdmitForTest calls the evaluator with a live context and fails
+// the test on the abandon path, which no unit test here intends to exercise.
+func evaluateWorkerAdmitForTest(t *testing.T, server *Server, req workerAdmitRequest) WorkerAdmitResponse {
+	t.Helper()
+	response, proceed := server.evaluateWorkerAdmit(context.Background(), req)
+	if !proceed {
+		t.Fatalf("evaluateWorkerAdmit abandoned the outer-scope lock unexpectedly for %+v", req)
+	}
+	return response
+}
 
 // admitReadMemoryFixture stands in for readSliceMemory. evaluateWorkerAdmit
 // now reads ONLY the OUTER scope's own live memory.current (hierarchical:
@@ -160,10 +288,11 @@ func TestValidateWorkerAdmitArgsRejectsInvalidRequiredFields(t *testing.T) {
 
 func TestEvaluateWorkerAdmitGrantsWithinHeadroom(t *testing.T) {
 	server := NewServer(Paths{})
+	_ = newWorkerScopeTree().install(server)
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
 	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
 	server.workerAdmitHeadroom = 0
-	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400, maxWaitMS: 0})
+	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400, maxWaitMS: 0})
 	if response.State != "granted" || response.WorkerID == "" || response.MemoryMax != 400 || response.MemoryHigh != 320 {
 		t.Fatalf("response=%+v", response)
 	}
@@ -193,11 +322,12 @@ func TestEvaluateWorkerAdmitDeniesWhenAggregateCapsWouldExceedCeiling(t *testing
 	// CASE (sum of already-granted memory.max, not just current live
 	// usage) alongside the live-usage check.
 	server := NewServer(Paths{})
+	tree := newWorkerScopeTree().install(server)
 	server.workerAdmitHeadroom = 0
 	live := map[string]int64{}
 	server.admitReadMemory = admitReadMemoryFixture(live, 1000)
 	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
-	first := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
+	first := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
 	if first.State != "granted" {
 		t.Fatalf("first=%+v", first)
 	}
@@ -205,16 +335,18 @@ func TestEvaluateWorkerAdmitDeniesWhenAggregateCapsWouldExceedCeiling(t *testing
 	// the live-usage check alone would admit this, but 700+700 > 1000 means
 	// the aggregate guard must deny it regardless.
 	live["/outer"] = 100
-	second := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
+	second := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
 	if second.State != "denied" || second.Reason != "fallback:aggregate-cap-exceeded" {
 		t.Fatalf("second (aggregate-cap-guarded) =%+v", second)
 	}
-	// The denial is pollable, not permanent: releasing the first grant
-	// frees its committed share, and the identical request now fits.
-	server.releaseWorkerGrant("job-1", "/outer", first.WorkerID)
-	third := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
+	// AIRA-39/AIRA-41: capacity is freed by the SCOPE going away (supervisor.py's
+	// _retire_worker rmdirs it after reaping the worker), not by a connection
+	// closing. Removing the child is what the previous releaseWorkerGrant call
+	// stood for, and it is the only thing that may free the ledger now.
+	tree.remove("/outer", workerScopeChildPrefix+first.WorkerID)
+	third := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
 	if third.State != "granted" {
-		t.Fatalf("third (after release) =%+v", third)
+		t.Fatalf("third (after the retired worker's scope is removed) =%+v", third)
 	}
 }
 
@@ -230,6 +362,7 @@ func TestEvaluateWorkerAdmitAggregateGuardHoldsUnderConcurrentAdmission(t *testi
 	// both read committed=0 and both grant, defeating the guard exactly
 	// the way AIRA-27/28/29 already fixed at whole-job granularity.
 	server := NewServer(Paths{})
+	_ = newWorkerScopeTree().install(server)
 	server.workerAdmitHeadroom = 0
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
 	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
@@ -244,7 +377,7 @@ func TestEvaluateWorkerAdmitAggregateGuardHoldsUnderConcurrentAdmission(t *testi
 		go func(i int) {
 			defer wg.Done()
 			start.Wait() // maximize actual overlap rather than a staggered start
-			responses[i] = server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
+			responses[i] = evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
 		}(i)
 	}
 	start.Done()
@@ -276,6 +409,7 @@ func TestEvaluateWorkerAdmitAggregateGuardAccountsForSupervisorRSS(t *testing.T)
 	// grant (committed == 0, so the old check trivially passed) must be
 	// denied here once the supervisor's own usage is accounted for.
 	server := NewServer(Paths{})
+	_ = newWorkerScopeTree().install(server)
 	server.workerAdmitHeadroom = 0
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
 	supervisorLive := map[string]int64{runner.WorkerScopeChildPath("/outer", "supervisor"): 400}
@@ -283,12 +417,12 @@ func TestEvaluateWorkerAdmitAggregateGuardAccountsForSupervisorRSS(t *testing.T)
 	// 700 alone fits under the outer ceiling (1000) and under the old
 	// committed-only guard (committed=0 before any grant) -- but
 	// supervisor(400)+700=1100 > 1000, so this must now be denied.
-	denied := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
+	denied := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
 	if denied.State != "denied" || denied.Reason != "fallback:aggregate-cap-exceeded" {
 		t.Fatalf("denied (supervisor-rss-guarded) =%+v", denied)
 	}
 	// A request that fits alongside the supervisor's footprint is granted.
-	granted := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 500, maxWaitMS: 0})
+	granted := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 500, maxWaitMS: 0})
 	if granted.State != "granted" {
 		t.Fatalf("granted (fits alongside supervisor rss) =%+v", granted)
 	}
@@ -300,6 +434,7 @@ func TestEvaluateWorkerAdmitDiscountsReclaimableOuterCache(t *testing.T) {
 	// cache, leaving 400 bytes of effective use and 100 bytes of real room
 	// after the request; admission must not treat cache as pinned RSS.
 	server := NewServer(Paths{})
+	_ = newWorkerScopeTree().install(server)
 	server.workerAdmitHeadroom = 0
 	server.admitReadMemory = func(path string) (int64, int64, int64, bool, string) {
 		if path == "/outer" {
@@ -308,7 +443,7 @@ func TestEvaluateWorkerAdmitDiscountsReclaimableOuterCache(t *testing.T) {
 		return 0, 1000, 0, true, ""
 	}
 	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
-	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 500})
+	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 500})
 	if response.State != "granted" {
 		t.Fatalf("response=%+v, want reclaimable outer cache discounted", response)
 	}
@@ -319,6 +454,7 @@ func TestEvaluateWorkerAdmitDiscountsReclaimableSupervisorCache(t *testing.T) {
 	// supervisor: raw 900 + request 500 would deny, while the 500 bytes of
 	// reclaimable cache leave effective supervisor use of 400 and permit it.
 	server := NewServer(Paths{})
+	_ = newWorkerScopeTree().install(server)
 	server.workerAdmitHeadroom = 0
 	supervisorScope := runner.WorkerScopeChildPath("/outer", "supervisor")
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
@@ -328,7 +464,7 @@ func TestEvaluateWorkerAdmitDiscountsReclaimableSupervisorCache(t *testing.T) {
 		}
 		return 0, 0, true, ""
 	}
-	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 500})
+	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 500})
 	if response.State != "granted" {
 		t.Fatalf("response=%+v, want reclaimable supervisor cache discounted", response)
 	}
@@ -339,6 +475,7 @@ func TestEvaluateWorkerAdmitFloorsReclaimableDiscountAtZero(t *testing.T) {
 	// memory.current. subtractFloor must floor effective usage at zero rather
 	// than turning the subtraction into invented negative memory headroom.
 	server := NewServer(Paths{})
+	_ = newWorkerScopeTree().install(server)
 	server.workerAdmitHeadroom = 0
 	server.admitReadMemory = func(path string) (int64, int64, int64, bool, string) {
 		if path == "/outer" {
@@ -347,7 +484,7 @@ func TestEvaluateWorkerAdmitFloorsReclaimableDiscountAtZero(t *testing.T) {
 		return 0, 1000, 0, true, ""
 	}
 	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
-	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 1000})
+	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 1000})
 	if response.State != "granted" {
 		t.Fatalf("response=%+v, want reclaimable discount floored at zero", response)
 	}
@@ -358,12 +495,13 @@ func TestEvaluateWorkerAdmitReturnsUnevaluatedWhenSupervisorScopeUnreadable(t *t
 	// silently admit (it could hide an arbitrarily large real footprint) --
 	// same philosophy as the outer-scope-unreadable case below.
 	server := NewServer(Paths{})
+	_ = newWorkerScopeTree().install(server)
 	server.workerAdmitHeadroom = 0
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
 	server.admitReadWorkerSupervisorMemory = func(string) (int64, int64, bool, string) {
 		return 0, 0, false, "fallback:supervisor-scope-unreadable"
 	}
-	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400, maxWaitMS: 0})
+	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400, maxWaitMS: 0})
 	if response.State != "unevaluated" {
 		t.Fatalf("response=%+v", response)
 	}
@@ -386,6 +524,7 @@ func TestEvaluateWorkerAdmitAccountsForSupervisorRSSWhenSupervisorScopeIsUncappe
 	// readWorkerSupervisorMemory (the real function, not a fixture) over a
 	// real temp-directory cgroupfs-shaped layout.
 	server := NewServer(Paths{})
+	_ = newWorkerScopeTree().install(server)
 	server.workerAdmitHeadroom = 0
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
 	supervisorScope := t.TempDir()
@@ -404,11 +543,11 @@ func TestEvaluateWorkerAdmitAccountsForSupervisorRSSWhenSupervisorScopeIsUncappe
 	// supervisor(400)+700=1100 > 1000 ceiling: must be denied, not
 	// unevaluated -- an uncapped memory.max is a normal, expected read,
 	// not a failure.
-	denied := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
+	denied := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
 	if denied.State != "denied" || denied.Reason != "fallback:aggregate-cap-exceeded" {
 		t.Fatalf("denied=%+v", denied)
 	}
-	granted := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 500, maxWaitMS: 0})
+	granted := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 500, maxWaitMS: 0})
 	if granted.State != "granted" {
 		t.Fatalf("granted=%+v", granted)
 	}
@@ -421,11 +560,12 @@ func TestEvaluateWorkerAdmitReturnsUnevaluatedWhenOuterScopeLiveUsageUnreadable(
 	// unreadable is the OUTER scope's own memory.current/memory.max read
 	// itself — that must never silently admit.
 	server := NewServer(Paths{})
+	_ = newWorkerScopeTree().install(server)
 	server.workerAdmitHeadroom = 0
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 		return 0, 0, 0, false, "fallback:outer-scope-unreadable"
 	}
-	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400, maxWaitMS: 0})
+	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400, maxWaitMS: 0})
 	if response.State != "unevaluated" {
 		t.Fatalf("response=%+v, want unevaluated when the outer scope's own live usage cannot be read", response)
 	}
@@ -439,35 +579,110 @@ func TestEvaluateWorkerAdmitDeniesImmediatelyWhenRequestExceedsCeilingEvenAtZero
 	// everything else that isn't available right now polls/retries and
 	// eventually becomes "timeout" instead.
 	server := NewServer(Paths{})
+	_ = newWorkerScopeTree().install(server)
 	server.workerAdmitHeadroom = 0
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
-	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 1001, maxWaitMS: 0})
+	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 1001, maxWaitMS: 0})
 	if response.State != "denied" || response.Reason != "reject:exceeds-ceiling" {
 		t.Fatalf("response=%+v, want denied/reject:exceeds-ceiling", response)
 	}
 }
 
-func TestReleaseWorkerGrantIsIdempotent(t *testing.T) {
-	// A worker-admit decision no longer depends on job.grants bookkeeping
-	// for its arithmetic (admission now reads the outer scope's own live
-	// memory.current directly, spec 3.3) — job.grants remains as worker-ID
-	// bookkeeping only. What matters here is the property Task 5's fixed
-	// workerAdmitConnection depends on: releaseWorkerGrant is safe to call
-	// more than once (a write-failure path there defers a release that may
-	// race a normal lease-close release of the same grant).
+// verifies: AIRA-41 — the ledger charges the SCOPE, not the relay connection.
+// This replaces TestReleaseWorkerGrantIsIdempotent: releaseWorkerGrant is gone
+// because a connection closing is no longer allowed to free capacity at all.
+// The old test's own premise ("job.grants remains as worker-ID bookkeeping
+// only") is exactly what AIRA-41 reported as the hole.
+func TestWorkerAdmitLedgerKeepsChargingAfterRelayCloses(t *testing.T) {
 	server := NewServer(Paths{})
+	tree := newWorkerScopeTree().install(server)
 	server.workerAdmitHeadroom = 0
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
 	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
-	granted := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 900, maxWaitMS: 0})
+	granted := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 900, maxWaitMS: 0})
 	if granted.State != "granted" {
 		t.Fatalf("granted=%+v", granted)
 	}
-	server.releaseWorkerGrant("job-1", "/outer", granted.WorkerID)
-	server.releaseWorkerGrant("job-1", "/outer", granted.WorkerID) // must not panic
-	again := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 900, maxWaitMS: 0})
-	if again.State != "granted" {
-		t.Fatalf("again=%+v", again)
+	// The relay dies (killed, crashed, or simply closed) while the worker
+	// itself is still alive inside its still-capped scope. Nothing in the
+	// daemon may free the 900 bytes: the scope is still there.
+	second := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 900, maxWaitMS: 0})
+	if second.State != "denied" || second.Reason != "fallback:aggregate-cap-exceeded" {
+		t.Fatalf("second=%+v, want the killed relay's 900-byte scope still charged (AIRA-41)", second)
+	}
+	// Only the scope actually going away frees it — which supervisor.py does
+	// after waitpid confirms the worker is gone.
+	tree.remove("/outer", workerScopeChildPrefix+granted.WorkerID)
+	third := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 900, maxWaitMS: 0})
+	if third.State != "granted" {
+		t.Fatalf("third=%+v, want a grant once the worker's scope is actually removed", third)
+	}
+}
+
+// verifies: AIRA-39 — the committed sum is reconstructed from the cgroup tree,
+// so a daemon that has just restarted (no in-memory state at all) still sees
+// the live workers it never granted.
+func TestWorkerAdmitLedgerReconstructsCommittedFromCgroupTreeAcrossRestart(t *testing.T) {
+	server := NewServer(Paths{})
+	tree := newWorkerScopeTree().install(server)
+	server.workerAdmitHeadroom = 0
+	// Live usage stays LOW: the workers have started but not yet grown, which
+	// is precisely why the live-usage check alone does not catch this and the
+	// worst-case aggregate guard has to.
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{"/outer": 50}, 1000)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
+	tree.put("/outer", workerScopeChildPrefix+"1", 400)
+	tree.put("/outer", workerScopeChildPrefix+"2", 400)
+
+	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400, maxWaitMS: 0})
+	if response.State != "denied" || response.Reason != "fallback:aggregate-cap-exceeded" {
+		t.Fatalf("response=%+v, want denied/fallback:aggregate-cap-exceeded: two pre-existing 400-byte worker scopes plus a third would exceed the 1000-byte ceiling. Against a purely in-memory ledger this grants, and the outer scope's memory.oom.group kills the whole run (AIRA-39)", response)
+	}
+	// The same daemon still grants what genuinely fits alongside them.
+	fits := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 200, maxWaitMS: 0})
+	if fits.State != "granted" {
+		t.Fatalf("fits=%+v, want a grant for a request that does fit alongside the reconstructed 800", fits)
+	}
+}
+
+// verifies: AIRA-39 — worker ids are reconstructed from the tree too. Restarting
+// at 1 would collide with an existing .aira-worker-1 on every restart.
+func TestWorkerAdmitReconstructsNextWorkerIDFromExistingChildren(t *testing.T) {
+	server := NewServer(Paths{})
+	tree := newWorkerScopeTree().install(server)
+	server.workerAdmitHeadroom = 0
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 10000)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
+	for _, id := range []string{"1", "2", "3"} {
+		tree.put("/outer", workerScopeChildPrefix+id, 100)
+	}
+	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 100, maxWaitMS: 0})
+	if response.State != "granted" || response.WorkerID != "4" {
+		t.Fatalf("response=%+v, want worker id 4 reconstructed from the existing .aira-worker-1..3", response)
+	}
+	if want := runner.WorkerScopeChildPath("/outer", "worker-4"); response.ScopePath != want {
+		t.Fatalf("ScopePath=%q want %q", response.ScopePath, want)
+	}
+}
+
+// verifies: AIRA-39 — a `.aira-worker-*` child whose suffix is NOT numeric is
+// still CHARGED (CreateWorkerScope accepts any slashless id), while it must not
+// perturb id allocation. Charging only numeric suffixes silently under-counts.
+func TestWorkerAdmitChargesNonNumericWorkerScopeChildren(t *testing.T) {
+	server := NewServer(Paths{})
+	tree := newWorkerScopeTree().install(server)
+	server.workerAdmitHeadroom = 0
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
+	tree.put("/outer", workerScopeChildPrefix+"foo", 800)
+
+	denied := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400, maxWaitMS: 0})
+	if denied.State != "denied" || denied.Reason != "fallback:aggregate-cap-exceeded" {
+		t.Fatalf("denied=%+v, want the non-numeric .aira-worker-foo child's 800-byte cap charged", denied)
+	}
+	granted := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 100, maxWaitMS: 0})
+	if granted.State != "granted" || granted.WorkerID != "1" {
+		t.Fatalf("granted=%+v, want worker id 1: a non-numeric suffix contributes nothing to id allocation", granted)
 	}
 }
 
@@ -477,45 +692,64 @@ func TestWorkerJobLedgerIsBoundToJobIDAndOuterScopeTogether(t *testing.T) {
 	// same job_id with DIFFERENT outer_scope values must never get their
 	// scope accounting mixed together.
 	server := NewServer(Paths{})
+	_ = newWorkerScopeTree().install(server)
 	server.workerAdmitHeadroom = 0
 	live := map[string]int64{"/outer-a": 900, "/outer-b": 0}
 	server.admitReadMemory = admitReadMemoryFixture(live, 1000)
 	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
 	// /outer-a is nearly saturated; /outer-b (same job_id!) is empty.
-	denied := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer-a", estimatedBytes: 500, maxWaitMS: 0})
+	denied := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer-a", estimatedBytes: 500, maxWaitMS: 0})
 	if denied.State != "denied" {
 		t.Fatalf("denied=%+v", denied)
 	}
-	granted := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer-b", estimatedBytes: 500, maxWaitMS: 0})
+	granted := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer-b", estimatedBytes: 500, maxWaitMS: 0})
 	if granted.State != "granted" {
 		t.Fatalf("same job_id, different outer_scope must not inherit the other scope's saturation: %+v", granted)
 	}
 }
 
-func TestWorkerAdmitOuterScopeIsOwnedByFirstJob(t *testing.T) {
-	// The aggregate-cap guard only sums grants for one (job_id, outer_scope)
-	// ledger. A second caller-chosen job_id must not build a separate ledger
-	// against an outer scope already claimed by the first job.
+// verifies: AIRA-39 — deleting workerScopeOwner is only safe because the sum is
+// now over the SCOPE. Two job ids sharing one outer scope (a real case: a second
+// aitest-enabled pytest run inside one confine job) must be counted TOGETHER,
+// not refused. Replaces TestWorkerAdmitOuterScopeIsOwnedByFirstJob, whose
+// terminal reject:outer-scope-owned-by-another-job no longer exists.
+func TestWorkerAdmitTwoJobsShareOneOuterScopeAndAreCountedTogether(t *testing.T) {
 	server := NewServer(Paths{})
+	tree := newWorkerScopeTree().install(server)
 	server.workerAdmitHeadroom = 0
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
 	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
-	first := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 200, maxWaitMS: 0})
+	first := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
 	if first.State != "granted" {
 		t.Fatalf("first=%+v", first)
 	}
-	other := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-2", outerScope: "/outer", estimatedBytes: 200, maxWaitMS: 0})
-	if other.State != "denied" || other.Reason != "reject:outer-scope-owned-by-another-job" {
-		t.Fatalf("other=%+v", other)
+	// A DIFFERENT job id on the same outer scope. It must be denied for the
+	// arithmetic reason (700+700 > 1000), never with an ownership rejection —
+	// and the denial must be the retriable fallback: kind, so it clears once
+	// job-1's worker retires.
+	other := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-2", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
+	if other.State != "denied" || other.Reason != "fallback:aggregate-cap-exceeded" {
+		t.Fatalf("other=%+v, want the second job counted against the first job's scope, not rejected for ownership", other)
 	}
-	again := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 200, maxWaitMS: 0})
+	if strings.Contains(other.Reason, "owned-by-another-job") {
+		t.Fatalf("ownership rejection resurrected: %+v", other)
+	}
+	// What genuinely fits alongside is granted to the second job, and gets its
+	// own distinct worker id from the same per-scope sequence.
+	fits := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-2", outerScope: "/outer", estimatedBytes: 200, maxWaitMS: 0})
+	if fits.State != "granted" || fits.WorkerID == first.WorkerID {
+		t.Fatalf("fits=%+v (first=%+v), want a grant with a distinct worker id from the shared per-scope sequence", fits, first)
+	}
+	tree.remove("/outer", workerScopeChildPrefix+first.WorkerID)
+	again := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-2", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
 	if again.State != "granted" {
-		t.Fatalf("again=%+v", again)
+		t.Fatalf("again=%+v, want job-2 admitted once job-1's worker scope is gone", again)
 	}
 }
 
 func TestWorkerAdmitConnectionGrantsThenHoldsUntilPeerCloses(t *testing.T) {
 	server := NewServer(Paths{})
+	_ = newWorkerScopeTree().install(server)
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 4*workerAdmitEstimatedBytesMin)
 	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
 	server.workerAdmitHeadroom = 0
@@ -562,16 +796,23 @@ func TestWorkerAdmitConnectionGrantsThenHoldsUntilPeerCloses(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("connection did not release after peer close")
 	}
-	// Releasing must not leave the daemon in a broken state that then
-	// rejects everything.
-	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 4 * workerAdmitEstimatedBytesMin, maxWaitMS: 0})
+	// The lease closing must not leave the daemon in a broken state that then
+	// rejects everything. It also must not FREE the grant: the worker's scope
+	// is still on the tree (AIRA-41), so what still fits is 4 MiB minus the
+	// 1 MiB already charged.
+	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 3 * workerAdmitEstimatedBytesMin, maxWaitMS: 0})
 	if response.State != "granted" {
 		t.Fatalf("post-release admission unexpectedly broken: %+v", response)
+	}
+	overCommitted := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: workerAdmitEstimatedBytesMin, maxWaitMS: 0})
+	if overCommitted.State != "denied" {
+		t.Fatalf("post-release admission=%+v, want the closed lease's scope still charged (AIRA-41)", overCommitted)
 	}
 }
 
 func TestWorkerAdmitConnectionPollLoopReEvaluatesAndGrantsBeforeDeadline(t *testing.T) {
 	server := NewServer(Paths{})
+	_ = newWorkerScopeTree().install(server)
 	const outerScope = "/outer"
 	var liveUsage int64 = 2 * workerAdmitEstimatedBytesMin
 	server.admitReadMemory = func(path string) (int64, int64, int64, bool, string) {
@@ -626,6 +867,7 @@ func TestWorkerAdmitConnectionPollLoopReEvaluatesAndGrantsBeforeDeadline(t *test
 
 func TestWorkerAdmitConnectionTimesOutWhenSaturated(t *testing.T) {
 	server := NewServer(Paths{})
+	_ = newWorkerScopeTree().install(server)
 	// The outer scope's own live usage already consumes the entire
 	// ceiling — under the live-occupancy model (spec 3.3) there is no
 	// per-worker-grant summation to "saturate" separately; a prior grant
@@ -670,6 +912,7 @@ func TestWorkerAdmitConnectionTimesOutWhenSaturated(t *testing.T) {
 
 func TestWorkerAdmitConnectionDeniesImmediatelyWithoutWaitingOutMaxWait(t *testing.T) {
 	server := NewServer(Paths{})
+	_ = newWorkerScopeTree().install(server)
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, workerAdmitEstimatedBytesMin)
 	server.workerAdmitHeadroom = 0
 	server.workerAdmitPollInterval = time.Millisecond
@@ -704,29 +947,398 @@ func TestWorkerAdmitConnectionDeniesImmediatelyWithoutWaitingOutMaxWait(t *testi
 	_ = clientConn.Close()
 }
 
-func TestWorkerAdmitConnectionReleasesGrantWhenResponseWriteFails(t *testing.T) {
+// verifies: AIRA-39 — a grant whose response write fails keeps its scope on the
+// tree, and keeps charging. Replaces
+// TestWorkerAdmitConnectionReleasesGrantWhenResponseWriteFails, whose in-memory
+// release no longer exists. The daemon deliberately does NOT rmdir the scope
+// here: writeFrameBytes discards n on error, so a fully delivered frame followed
+// by a write error is possible, and removing a scope a live client is about to
+// fork into hits WorkerPlacementFailed -> _disable_daemon -> the whole suite
+// unconfined. Over-charging produces a loud, retriable denial instead.
+func TestWorkerAdmitConnectionKeepsScopeChargedWhenResponseWriteFails(t *testing.T) {
 	server := NewServer(Paths{})
+	tree := newWorkerScopeTree().install(server)
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 2*workerAdmitEstimatedBytesMin)
 	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
 	server.workerAdmitHeadroom = 0
 	server.workerAdmitPollInterval = time.Millisecond
 
 	serverConn, clientConn := net.Pipe()
-	// Close the CLIENT side before the server ever gets to write its
-	// response -- a peer-vanished-in-the-exact-window race.
-	// evaluateWorkerAdmit already inserted the grant into the ledger by
-	// this point; the subsequent writeFrame on serverConn must then fail,
-	// and that grant must still be released rather than leaking against
-	// the job's ledger forever (the bug: the old code just `return`ed on a
-	// write failure with no release at all).
+	// Close the CLIENT side before the server ever gets to write its response —
+	// a peer-vanished-in-the-exact-window race. The scope has already been
+	// created by then.
 	_ = clientConn.Close()
 	server.workerAdmitConnection(serverConn, map[string]any{
 		"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(workerAdmitEstimatedBytesMin), "max_wait_ms": float64(0),
 	})
 	_ = serverConn.Close()
 
-	again := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: workerAdmitEstimatedBytesMin, maxWaitMS: 0})
-	if again.State != "granted" {
-		t.Fatalf("write-failure path leaked the grant: %+v", again)
+	if got := tree.scanCount("/outer"); got == 0 {
+		t.Fatalf("the ledger never scanned the outer scope at all (scans=%d)", got)
 	}
+	children, err := tree.scan("/outer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if children.count != 1 || children.committed != workerAdmitEstimatedBytesMin {
+		t.Fatalf("children=%+v, want the undelivered grant's scope still present and still charged", children)
+	}
+	// 2 MiB ceiling, 1 MiB already charged: a second 2 MiB request cannot fit.
+	again := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 2 * workerAdmitEstimatedBytesMin, maxWaitMS: 0})
+	if again.State != "denied" {
+		t.Fatalf("again=%+v, want the undelivered grant still charged against the ledger", again)
+	}
+}
+
+// verifies: AIRA-63 — worker-admit is bounded by admitSlots, and saturation is
+// delivered as a RETRIABLE denial. Emitting it as an error frame (the way
+// admitConnection's CodeBusy does) would reach RequestWorkerAdmit's
+// `Code != "OK"` branch, match none of supervisor.py's denial substrings, and
+// make _disable_daemon run the whole suite UNCONFINED.
+func TestWorkerAdmitConnectionDeniesRetriablyWhenAdmitSlotsSaturated(t *testing.T) {
+	server := NewServer(Paths{})
+	_ = newWorkerScopeTree().install(server)
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 2*workerAdmitEstimatedBytesMin)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
+	server.workerAdmitHeadroom = 0
+	for i := 0; i < admitGlobalMax; i++ {
+		server.admitSlots <- struct{}{}
+	}
+	t.Cleanup(func() {
+		for i := 0; i < admitGlobalMax; i++ {
+			<-server.admitSlots
+		}
+	})
+
+	serverConn, clientConn := net.Pipe()
+	go func() {
+		defer serverConn.Close()
+		server.workerAdmitConnection(serverConn, map[string]any{
+			"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(workerAdmitEstimatedBytesMin), "max_wait_ms": float64(0),
+		})
+	}()
+	var frame ResponseFrame
+	if err := readFrame(clientConn, &frame); err != nil {
+		t.Fatal(err)
+	}
+	_ = clientConn.Close()
+	// Code MUST stay "OK" so RequestWorkerAdmit parses the payload as a grant
+	// decision rather than wrapping it as "request rejected".
+	if frame.Code != "OK" {
+		t.Fatalf("saturation frame code=%q, want %q: any other code makes the client report 'request rejected', which supervisor.py classifies as unavailable and answers by running unconfined", frame.Code, "OK")
+	}
+	var response WorkerAdmitResponse
+	if err := json.Unmarshal(frame.Data, &response); err != nil {
+		t.Fatalf("frame=%+v err=%v", frame, err)
+	}
+	if response.State != "denied" || response.Reason != "fallback:admit-slots-saturated" {
+		t.Fatalf("response=%+v, want denied/fallback:admit-slots-saturated", response)
+	}
+	// The load-bearing half: NOT reject:-prefixed, so supervisor.py raises the
+	// retriable WorkerAdmitDenied rather than the terminal
+	// WorkerAdmitRequestTooLarge.
+	if strings.Contains(response.Reason, "reject:") {
+		t.Fatalf("saturation reason %q is reject:-prefixed, which makes supervisor.py mark the queue unevaluated instead of retrying once a slot frees", response.Reason)
+	}
+}
+
+// verifies: AIRA-63 — the bound really is the shared semaphore, i.e. a
+// worker-admit waiter consumes and returns a slot. Without the release, one
+// worker-admit call would permanently cost a slot.
+func TestWorkerAdmitConnectionReleasesItsAdmitSlot(t *testing.T) {
+	server := NewServer(Paths{})
+	_ = newWorkerScopeTree().install(server)
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, workerAdmitEstimatedBytesMin)
+	server.workerAdmitHeadroom = 0
+	serverConn, clientConn := net.Pipe()
+	go func() {
+		defer serverConn.Close()
+		// A permanent reject:, so the call returns without holding a lease.
+		server.workerAdmitConnection(serverConn, map[string]any{
+			"job_id": "job-1", "outer_scope": "/outer", "estimated_bytes": float64(2 * workerAdmitEstimatedBytesMin), "max_wait_ms": float64(0),
+		})
+	}()
+	var frame ResponseFrame
+	if err := readFrame(clientConn, &frame); err != nil {
+		t.Fatal(err)
+	}
+	_ = clientConn.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for len(server.admitSlots) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("admitSlots still holds %d token(s) after worker-admit returned", len(server.admitSlots))
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// verifies: AIRA-39 — the cgroupfs scan is throttled. evaluateWorkerAdmit runs
+// once per 200ms poll per waiter, so an unbounded per-poll walk is the AIRA-61
+// CPU-regression class (25-65% supervisor CPU before af407be fixed it once).
+func TestWorkerAdmitScanIsThrottledToAtMostOncePerInterval(t *testing.T) {
+	server := NewServer(Paths{})
+	tree := newWorkerScopeTree().install(server)
+	server.workerScopeScanInterval = time.Second
+	server.workerAdmitHeadroom = 0
+	now := time.Unix(1000, 0)
+	server.admitNow = func() time.Time { return now }
+	// Saturated: every evaluation takes the CONTENDED path, which is the one
+	// that must not scan on each poll.
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
+	tree.put("/outer", workerScopeChildPrefix+"1", 900)
+
+	for i := 0; i < 20; i++ {
+		if response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400}); response.State != "denied" {
+			t.Fatalf("poll %d response=%+v, want a contended denial", i, response)
+		}
+	}
+	if got := tree.scanCount("/outer"); got != 1 {
+		t.Fatalf("scans=%d over 20 polls inside one interval, want exactly 1 (an unthrottled per-poll cgroupfs walk is the AIRA-61 regression)", got)
+	}
+	// Past the interval, one more scan — not twenty.
+	now = now.Add(2 * time.Second)
+	if response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400}); response.State != "denied" {
+		t.Fatalf("response=%+v", response)
+	}
+	if got := tree.scanCount("/outer"); got != 2 {
+		t.Fatalf("scans=%d after the interval elapsed, want 2", got)
+	}
+}
+
+// verifies: AIRA-39 — a CACHED sum may never be the basis of a GRANT. A child
+// that appeared since the last scan is invisible to the cache and need not
+// collide with the id about to be allocated, so the grant path forces a fresh
+// scan. Against a cache-only implementation this test grants and over-admits.
+func TestWorkerAdmitGrantAlwaysScansFreshBeforeGranting(t *testing.T) {
+	server := NewServer(Paths{})
+	tree := newWorkerScopeTree().install(server)
+	server.workerScopeScanInterval = time.Hour // the cache can never expire here
+	server.workerAdmitHeadroom = 0
+	now := time.Unix(1000, 0)
+	server.admitNow = func() time.Time { return now }
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
+
+	// Seed the cache while the tree is empty.
+	if response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 100}); response.State != "granted" {
+		t.Fatalf("seed response=%+v", response)
+	}
+	scansAfterSeed := tree.scanCount("/outer")
+	// A worker scope appears that the cached sum knows nothing about, and whose
+	// NON-NUMERIC name cannot collide with the next id either — so EEXIST can
+	// never catch it. Only a fresh scan can.
+	tree.put("/outer", workerScopeChildPrefix+"external", 850)
+
+	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 100})
+	if response.State != "denied" || response.Reason != "fallback:aggregate-cap-exceeded" {
+		t.Fatalf("response=%+v, want denied: 100(seeded)+850(external)+100 > 1000. A cached sum was used to admit", response)
+	}
+	if got := tree.scanCount("/outer"); got <= scansAfterSeed {
+		t.Fatalf("scans=%d (was %d): the grant path did not force a fresh scan", got, scansAfterSeed)
+	}
+}
+
+// verifies: AIRA-39 — EEXIST proves the cached sum was stale-LOW, so it must
+// invalidate and deny RETRIABLY. "Take the next id and grant instead" would
+// admit against a sum omitting the colliding child: the exact over-admit.
+func TestWorkerAdmitEEXISTInvalidatesCacheAndDeniesRetriably(t *testing.T) {
+	server := NewServer(Paths{})
+	tree := newWorkerScopeTree().install(server)
+	server.workerScopeScanInterval = time.Hour
+	server.workerAdmitHeadroom = 0
+	now := time.Unix(1000, 0)
+	server.admitNow = func() time.Time { return now }
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
+
+	// The scan seam reports an EMPTY tree while the create seam sees an
+	// existing .aira-worker-1 — precisely a child that appeared after the scan.
+	hidden := map[string]int64{workerScopeChildPrefix + "1": 900}
+	server.workerScopeScan = func(outerScope string) (workerScopeChildren, error) {
+		children, err := tree.scan(outerScope)
+		return children, err
+	}
+	server.workerScopeCreate = func(ctx context.Context, outerScope, workerID string, memoryMax, memoryHigh int64) (string, error) {
+		if _, exists := hidden[workerScopeChildPrefix+workerID]; exists {
+			return "", fmt.Errorf("aitest worker scope: create: mkdir: %w", fs.ErrExist)
+		}
+		return tree.create(ctx, outerScope, workerID, memoryMax, memoryHigh)
+	}
+
+	first := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400})
+	if first.State != "denied" || first.Reason != "fallback:worker-scope-id-collision" {
+		t.Fatalf("first=%+v, want a retriable fallback:worker-scope-id-collision. Advancing to the next id and granting would admit 400 against a sum that omits the colliding 900-byte child", first)
+	}
+	if strings.Contains(first.Reason, "reject:") {
+		t.Fatalf("collision denial %q is reject:-prefixed and would terminate the run instead of re-evaluating", first.Reason)
+	}
+	// The collision invalidated the cache; the retry now sees the real tree and
+	// denies for the honest arithmetic reason.
+	for name, value := range hidden {
+		tree.put("/outer", name, value)
+	}
+	second := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400})
+	if second.State != "denied" || second.Reason != "fallback:aggregate-cap-exceeded" {
+		t.Fatalf("second=%+v, want the re-evaluation to see the collided child and deny on the sum", second)
+	}
+}
+
+// verifies: AIRA-39 — a create failure that is NOT a collision is fail-closed
+// and terminal: no grant is recorded, and the reason is reject:-prefixed so
+// supervisor.py marks the queue unevaluated rather than retrying forever
+// against broken daemon-side cgroupfs access.
+func TestWorkerAdmitDeniesTerminallyWhenScopeCreateFails(t *testing.T) {
+	server := NewServer(Paths{})
+	tree := newWorkerScopeTree().install(server)
+	server.workerAdmitHeadroom = 0
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
+	tree.createFn = func(string, string) error { return errors.New("permission denied") }
+
+	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400})
+	if response.State != "denied" {
+		t.Fatalf("response=%+v, want a denial: a grant whose scope could not be created must never be issued", response)
+	}
+	if !strings.HasPrefix(response.Reason, "reject:worker-scope-create-failed:") {
+		t.Fatalf("reason=%q, want a reject:worker-scope-create-failed: prefix so supervisor.py terminates instead of retrying indefinitely", response.Reason)
+	}
+	if !strings.Contains(response.Reason, "permission denied") {
+		t.Fatalf("reason=%q, want the underlying cause named", response.Reason)
+	}
+	// And nothing was charged: the ledger has no phantom entry.
+	children, err := tree.scan("/outer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if children.count != 0 {
+		t.Fatalf("children=%+v, want no scope created", children)
+	}
+}
+
+// verifies: AIRA-39 — the granted scope path is the one the daemon actually
+// created, and no grant is possible without a create.
+func TestWorkerAdmitCreatesWorkerScopeBeforeGranting(t *testing.T) {
+	server := NewServer(Paths{})
+	tree := newWorkerScopeTree().install(server)
+	server.workerAdmitHeadroom = 0
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
+	var created []string
+	inner := server.workerScopeCreate
+	server.workerScopeCreate = func(ctx context.Context, outerScope, workerID string, memoryMax, memoryHigh int64) (string, error) {
+		path, err := inner(ctx, outerScope, workerID, memoryMax, memoryHigh)
+		if err == nil {
+			created = append(created, path)
+		}
+		return path, err
+	}
+	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400})
+	if response.State != "granted" {
+		t.Fatalf("response=%+v", response)
+	}
+	if len(created) != 1 || created[0] != response.ScopePath {
+		t.Fatalf("created=%v, granted ScopePath=%q: the grant must name the scope the daemon created", created, response.ScopePath)
+	}
+	// The scope exists in the tree BEFORE the response is returned, so the
+	// grant->creation window is closed by construction.
+	children, err := tree.scan("/outer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if children.count != 1 || children.committed != 400 {
+		t.Fatalf("children=%+v, want the created scope present and charged", children)
+	}
+}
+
+// verifies: AIRA-39 — the aggregate guard must not WRAP once a tree-derived
+// committed sum saturates. The old subtractive form (`estimated >
+// ceiling-committed-supervisorUsed`) wraps positive and GRANTS.
+func TestWorkerAdmitAggregateGuardDoesNotWrapOnSaturatedCommitted(t *testing.T) {
+	server := NewServer(Paths{})
+	_ = newWorkerScopeTree().install(server)
+	server.workerAdmitHeadroom = 0
+	// ceiling = 1000, committed saturated at MaxInt64, supervisorUsed = 2:
+	// 1000 - MaxInt64 - 2 wraps to a huge positive number.
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(
+		map[string]int64{runner.WorkerScopeChildPath("/outer", "supervisor"): 2})
+	server.workerScopeScan = func(string) (workerScopeChildren, error) {
+		return workerScopeChildren{committed: math.MaxInt64, count: 1, maxIndex: 1}, nil
+	}
+	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 100})
+	if response.State != "denied" || response.Reason != "fallback:aggregate-cap-exceeded" {
+		t.Fatalf("response=%+v, want a denial: a saturated committed sum must never wrap into apparent headroom", response)
+	}
+}
+
+// verifies: AIRA-39 — a scan the daemon cannot establish is "unevaluated",
+// never a fabricated zero (which is exactly the AIRA-39 over-admit).
+func TestWorkerAdmitReturnsUnevaluatedWhenChildCapUnreadable(t *testing.T) {
+	server := NewServer(Paths{})
+	tree := newWorkerScopeTree().install(server)
+	server.workerAdmitHeadroom = 0
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
+	tree.failScan("/outer", errors.New(`worker scope /outer/.aira-worker-1: memory.max is not a finite byte count ("max")`))
+
+	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 100})
+	if response.State != "unevaluated" {
+		t.Fatalf("response=%+v, want unevaluated: an unreadable child cap must never be treated as zero committed", response)
+	}
+	if !strings.Contains(response.Reason, "memory.max") {
+		t.Fatalf("reason=%q, want the underlying scan failure named", response.Reason)
+	}
+}
+
+// verifies: AIRA-39 — outer-scope identity is canonicalised before anything
+// keys on it, so `/outer`, `/outer/` and `/outer/.` cannot take three different
+// ledger cells while mutating one cgroup.
+func TestValidateWorkerAdmitArgsCleansAndRequiresAbsoluteOuterScope(t *testing.T) {
+	args := func(outer string) map[string]any {
+		return map[string]any{
+			"job_id": "job-1", "outer_scope": outer,
+			"estimated_bytes": workerAdmitEstimatedBytesMin, "max_wait_ms": int64(0),
+		}
+	}
+	for _, outer := range []string{"/outer", "/outer/", "/outer/.", "/a/../outer"} {
+		request, err := validateWorkerAdmitArgs(args(outer), workerAdmitWaitCeilingMs)
+		if err != nil {
+			t.Fatalf("outer_scope=%q: %v", outer, err)
+		}
+		if request.outerScope != "/outer" {
+			t.Fatalf("outer_scope=%q normalised to %q, want %q: aliases must share one ledger cell and one lock", outer, request.outerScope, "/outer")
+		}
+	}
+	if _, err := validateWorkerAdmitArgs(args("relative/scope"), workerAdmitWaitCeilingMs); err == nil {
+		t.Fatal("a relative outer_scope was accepted; it must be refused rather than resolved against the daemon's own working directory")
+	}
+}
+
+// verifies: AIRA-63/AIRA-39 — a waiter abandoned while queued on the outer
+// scope's lock leaves the token untaken, so the next acquirer proceeds. A
+// sync.Mutex here would block it uninterruptibly while holding an admit slot.
+func TestWorkerScopeLockReleasesOnCancelledWaiter(t *testing.T) {
+	server := NewServer(Paths{})
+	state := server.workerScopeFor("/outer")
+	if !server.acquireWorkerScope(context.Background(), state) {
+		t.Fatal("first acquire failed")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	blocked := make(chan bool, 1)
+	go func() { blocked <- server.acquireWorkerScope(ctx, state) }()
+	cancel()
+	select {
+	case got := <-blocked:
+		if got {
+			t.Fatal("a cancelled waiter reported that it acquired the lock")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a cancelled waiter stayed blocked on the outer-scope lock")
+	}
+	state.release()
+	if !server.acquireWorkerScope(context.Background(), state) {
+		t.Fatal("the next acquirer could not take the lock: the cancelled waiter consumed the token")
+	}
+	state.release()
 }

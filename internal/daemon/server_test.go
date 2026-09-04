@@ -1320,6 +1320,11 @@ func TestServerDispatchesWorkerAdmitVerbOverRealSocket(t *testing.T) {
 	server := NewServer(paths)
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 4*workerAdmitEstimatedBytesMin)
 	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
+	// AIRA-39: the worker-admit ledger now sums the outer scope's real
+	// `.aira-worker-*` children and creates the granted scope itself, so this
+	// dispatch test needs a stand-in tree — "/outer" is not a real cgroup here,
+	// and without the seam the honest answer would be "unevaluated".
+	_ = newWorkerScopeTree().install(server)
 	server.workerAdmitHeadroom = 0
 	_, _ = startServer(t, server)
 	scope := testScope(t, paths, "one")
