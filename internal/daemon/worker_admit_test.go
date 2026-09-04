@@ -1341,6 +1341,59 @@ func TestWorkerAdmitEEXISTInvalidatesCacheAndDeniesRetriably(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-39, AIRA-42 — an EEXIST collision SELF-HEALS on the retry: it
+// does not collide identically forever.
+//
+// Written to answer a DeepSeek build-review P1 on the AIRA-42 merge, which read
+// the `contended` (retriable) class on this row as retry-forever and argued the
+// row should be terminal, on the grounds that "invalidating the cached sum does
+// not clear the existing cgroup". True but beside the point — the retry does not
+// need the child GONE, it needs it COUNTED. `state.invalidate()` forces the next
+// evaluation to rescan, the rescan lifts `maxIndex` past the colliding child,
+// and the id therefore advances rather than repeating.
+//
+// The existing test above only shows the retry DENYING on the corrected
+// aggregate, which does not distinguish the two readings. This one shows the id
+// advancing and the request being GRANTED, which does. Kept as a permanent test
+// because the property is load-bearing for the retriable classification and was
+// not previously pinned anywhere.
+func TestWorkerAdmitEEXISTRetryAdvancesTheWorkerIDInsteadOfRepeating(t *testing.T) {
+	server := NewServer(Paths{})
+	tree := newWorkerScopeTree().install(server)
+	server.workerAdmitHeadroom = 0
+	// Deliberately roomy, so nothing but the collision can deny: the point of
+	// this test is the ID, not the arithmetic.
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 10000)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
+
+	// A child invisible to the scan but present to create: exactly the
+	// stale-low cache this branch exists for.
+	hidden := map[string]int64{workerScopeChildPrefix + "1": 100}
+	server.workerScopeCreate = func(ctx context.Context, outer, workerID string, memoryMax, memoryHigh int64) (string, error) {
+		if _, exists := hidden[workerScopeChildPrefix+workerID]; exists {
+			return "", fmt.Errorf("aitest worker scope: create: mkdir: %w", fs.ErrExist)
+		}
+		return tree.create(ctx, outer, workerID, memoryMax, memoryHigh)
+	}
+
+	first := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400})
+	if first.Class != runner.WorkerAdmitClassContended || first.Reason != runner.WorkerAdmitReasonWorkerScopeIDCollision {
+		t.Fatalf("first=%+v, want the retriable collision verdict", first)
+	}
+	// The invalidation is what makes the next scan see the child.
+	for name, value := range hidden {
+		tree.put("/outer", name, value)
+	}
+	second := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400})
+	if second.State != runner.WorkerAdmitStateGranted {
+		t.Fatalf("second=%+v, want a GRANT: a collision that cannot clear would make `contended` a "+
+			"retry-forever stall, which is the reading this test exists to refute", second)
+	}
+	if second.WorkerID == "1" {
+		t.Fatalf("second=%+v reused the colliding id: the rescan must lift maxIndex past it", second)
+	}
+}
+
 // verifies: AIRA-39, AIRA-42 — a create failure that is NOT a collision is
 // fail-closed and terminal: no grant is recorded, and the verdict carries the
 // TERMINAL class so supervisor.py marks the queue unevaluated rather than

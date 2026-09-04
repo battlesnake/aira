@@ -472,6 +472,20 @@ All seven were killed; the harness is `~/tmp/aira-fix2/mutate.py`.
 | M7 | pre-dispatch argument errors emit no outcome line | `TestWorkerAdmitPreDispatchFailuresSpeakTheOutcomeChannel` ×2 |
 | M8 | drop the grant-payload validation (build-review P0) | `TestRequestWorkerAdmitClassifiesEndToEnd` ×6 sub-cases |
 | M9 | every dial error is `admission-unusable` again | `…EndToEnd/local_resource_exhaustion_on_dial_is_retriable` |
+| M10 | stop query-escaping `detail` (re-run post-merge, §12.3) | `TestWorkerAdmitOutcomeLineRoundTrips` ×2 sub-cases |
+
+**M10 is M5 re-applied after the merge**, because §12.3 deletes the `"unbounded"`
+mangling and the escaping is now the ONLY thing standing between
+operator-controlled text and the classifier. Recorded honestly: M10 was already
+killed by the assertions M5 killed on — the new token-count assertion added
+alongside it is a **precision and diagnostic** improvement, not a new kill. It
+asserts the STRUCTURE (a hostile detail must not split the line into extra
+tokens) rather than only the resulting field values, which is the property the
+mangling's deletion actually rests on. The new
+`detail carrying the token the retired classifier keyed on` sub-case uses the
+two real strings that used to trigger the hazard: an operator's
+`aira confine --name unbounded-suite` echoed into a cgroup path, and raw
+`memory.max` bytes quoted back through `%q`.
 
 ## 10. Build-review disposition
 
@@ -689,3 +703,90 @@ compat rule.
   in `worker_admit.go` is on a cgroup DIRECTORY NAME (`.aira-worker-`), which
   is structural framing on a filesystem entry, not classification of a
   message.
+
+### 12.7 Review coverage of the integration — a stated gap
+
+The pre-merge diff got the full two-loop: two plan-review lineages and two
+adversarial build-review lineages (§8, §10). **The merge integration itself
+(§12.1–§12.5) did not.**
+
+- **Codex/Sol: UNAVAILABLE.** The account hit its usage limit mid-review
+  (`ERROR: You've hit your usage limit ... try again at Sep 7th`). Per this
+  project's sidecar policy an unavailable lineage is noted and not blocking,
+  but the loss is real: Sol is the lineage that found the P0 in the pre-merge
+  round.
+- **DeepSeek-pro: attempted three times, no usable response.** A 98 KB payload
+  returned empty at exit 0 twice (once via the CLI, once via MCP); a focused
+  ~4 KB prompt was still running at the time of writing. A small ping to the
+  same model succeeded, so the model is up and the payload size is the
+  suspected cause. If the focused run lands before merge its findings belong
+  in this section; if not, this gap stands as written.
+- **What DID cover the integration:** my own structured pass, which found and
+  fixed three staleness spots (comments in `workerAdmitGrantProblem`, its call
+  site, and its test, all describing the CLI `CreateWorkerScope` path AIRA-39
+  deleted), plus the empirical escaping probe that became the M10 mutation and
+  the token-count assertion above.
+
+**The areas a reviewer should weight most**, because they are exactly what the
+missing lineages would have attacked: the five re-derived daemon
+classifications in §12.2 (especially the two TERMINAL ones, rows 9 and 10, and
+whether `contended` on the EEXIST and slot-saturation rows should instead
+return promptly rather than poll); the deleted `"unbounded"` mangling in §12.3;
+and the two overturned decisions in §12.4.
+
+### 12.8 Integration build review — DeepSeek-pro (BLOCK), disposition
+
+A focused re-run of the DeepSeek-pro lineage on the re-derived classification
+table did land, after three failed attempts on larger payloads (§12.7).
+**Verdict: BLOCK, 2×P1 + 2×P2.** Every finding was checked against source
+before being accepted or declined; two were checked by writing a probe.
+
+**Accepted as an observation, recorded, not fixed here:**
+
+- **P2 — rows 9/10 are terminal but `request-invalid` is the wrong NAME for
+  them** ("these are daemon-side infrastructure faults"). DeepSeek reached
+  independently the same objection §12.2 already records, which is
+  corroboration worth having. Its proposed home, `contract-violation`, is
+  DECLINED: that class means specifically *the two sides disagree about the
+  channel* — an uncatalogued value, a self-contradicting pair, an unparseable
+  line — and a cgroupfs `EPERM` is a well-formed verdict the daemon reports
+  correctly. Both classes are terminal with identical supervisor behaviour, so
+  the only real difference is the diagnostic, and "relay and supervisor are out
+  of lockstep" would be actively false. Resolved as §12.2 already did: the
+  class doc now names the disposition rather than asserting a diagnosis. Adding
+  a seventh class for a naming nuance is the complexity this project's
+  architectural-simplicity rule exists to refuse.
+- **P2 — row 2 can hide a PERMANENT `ENOENT`/`EACCES` behind a retriable
+  class, and retry forever.** Real, and worth a ticket. But it is *pre-existing
+  behaviour*, unchanged by this fix: before AIRA-42 the identical case produced
+  "unevaluated" without the "unbounded" token, which the substring classifier
+  also mapped to the retriable `WorkerAdmitDenied`. No row's retriability moves
+  in this PR, per the same scope line §10 already drew on retry POLICY.
+  Recommended follow-on: split `outer-scope-unreadable` by errno the way
+  `classifyWorkerAdmitDialFailure` splits dial errors.
+
+**Declined — verified false against source:**
+
+- **P1 — "row 8 (EEXIST) is retry-forever; make it terminal."** DeepSeek
+  argued that "invalidating the cached sum does not clear the existing cgroup",
+  so the retry collides identically until the deadline. True premise, wrong
+  conclusion: the retry does not need the child GONE, it needs it COUNTED.
+  `state.invalidate()` forces a rescan, the rescan lifts `maxIndex` past the
+  colliding child, and the id advances. **Proved by probe, now kept as a
+  permanent test** — `TestWorkerAdmitEEXISTRetryAdvancesTheWorkerIDInstead
+  OfRepeating` shows the first attempt colliding at id 1 and the retry
+  GRANTING at id 2. The pre-existing test only showed the retry denying on the
+  corrected aggregate, which does not distinguish the two readings, so this
+  finding did expose a genuine coverage gap even though its conclusion was
+  wrong. Net effect: one new test, no behaviour change.
+- **P1 — "row 1 strips containment too eagerly; ancestor enforcement is not
+  guaranteed."** The kernel claim is wrong: cgroup-v2 `memory.max` IS enforced
+  hierarchically, so a descendant reading back `max` remains bounded by every
+  ancestor's limit — which is precisely the design spec's stated reasoning
+  (§3.7). Beyond that, this row's disposition is a spec decision that predates
+  this fix, was re-affirmed against a plan-reviewer's objection (§10), and is
+  only re-ENCODED here. Changing it is a design change needing owner sign-off,
+  not a merge-resolution edit.
+
+Codex/Sol remained unavailable (usage limit), so the integration carries one
+adversarial lineage rather than two. The gap stated in §12.7 stands.

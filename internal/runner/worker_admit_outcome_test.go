@@ -31,6 +31,24 @@ func TestWorkerAdmitOutcomeLineRoundTrips(t *testing.T) {
 			},
 		},
 		{
+			// AIRA-42's merge with AIRA-39 DELETED a defensive hack that
+			// mangled the token "unbounded" into "un-bounded" in exactly this
+			// kind of diagnostic, because the retired substring classifier
+			// read any "unevaluated" message containing it as an uncapped
+			// outer scope and ran the whole suite unconfined. Both strings
+			// below are the real shapes that triggered it: an operator's
+			// `aira confine --name unbounded-suite` echoed into a cgroup path,
+			// and raw memory.max bytes quoted back through %q. They must now
+			// survive VERBATIM while changing nothing about the verdict.
+			name: "detail carrying the token the retired classifier keyed on",
+			outcome: WorkerAdmitOutcome{
+				State: WorkerAdmitStateUnevaluated, Class: WorkerAdmitClassContended,
+				Reason: WorkerAdmitReasonWorkerScopesUnreadable,
+				Detail: `worker scope /sys/fs/cgroup/.aira-CONFINE-unbounded-suite-1/.aira-worker-2: ` +
+					`memory.max is not a finite byte count ("unbounded")`,
+			},
+		},
+		{
 			name: "granted with placement fields",
 			outcome: WorkerAdmitOutcome{
 				State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted,
@@ -49,6 +67,31 @@ func TestWorkerAdmitOutcomeLineRoundTrips(t *testing.T) {
 			}
 			if strings.ContainsAny(line, "\n\r") {
 				t.Fatalf("outcome line must stay on one line: %q", line)
+			}
+			// Token COUNT, not just field values: this is the direct check
+			// that escaped free text cannot split into extra tokens. Without
+			// it, a renderer that stopped escaping `detail` could still pass
+			// every assertion below as long as the forged keys happened to
+			// land on values equal to the real ones — and the whole reason
+			// AIRA-39's "unbounded" mangling could be deleted is that
+			// tokenisation is structurally safe, so it is worth asserting
+			// structurally.
+			wantTokens := 1 // the frame marker
+			for _, present := range []bool{
+				true, true, // state, class — always rendered
+				test.outcome.Reason != "",
+				test.outcome.Detail != "",
+			} {
+				if present {
+					wantTokens++
+				}
+			}
+			if test.grant != nil {
+				wantTokens += 4 // scope, worker_id, memory_max, memory_high
+			}
+			if got := len(strings.Fields(line)); got != wantTokens {
+				t.Fatalf("line split into %d tokens, want %d — free text broke tokenisation: %q",
+					got, wantTokens, line)
 			}
 			fields, err := ParseWorkerAdmitOutcomeLine(line)
 			if err != nil {
