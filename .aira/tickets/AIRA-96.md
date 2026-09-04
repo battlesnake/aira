@@ -1,0 +1,10 @@
+---
+{"schema":1,"id":"AIRA-96","project":"aira","title":"TestScopeMembershipEventsDeliversModifyAndReleasesFD fails when fs.inotify.max_user_instances is near exhausted","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["environmental","runner","testing"],"hold":false,"relations":[]}
+---
+Found during the AIRA-16 watchdog fix's independent code review (2026-09-04). Deliberately not filed by the reviewing agent at the time, to avoid racing ticket-ID allocation with other concurrently-running batch agents -- filed now by the coordinating session instead, no longer racing.
+
+TestScopeMembershipEventsDeliversModifyAndReleasesFD (internal/runner) fails when fs.inotify.max_user_instances is near exhausted on the host -- observed at 119/128 instances in use. Reproduced identically on an unmodified base commit, so this is a genuine environmental flake, not a regression introduced by AIRA-16 or anything else in that batch.
+
+Likely a real, if narrow, reliability gap: on a machine running many concurrent AIRA sessions/agents (each of which may hold inotify watches for confine scope membership, aitest worker liveness, or similar), the shared per-user inotify instance limit can genuinely run low, and this test (and potentially the runtime code path it tests) has no graceful degradation for that condition -- it simply fails/would fail when the limit is hit.
+
+Not investigated beyond the reproduction above. Suggested next steps, not decided: (1) check whether the production code path this test covers (scope-membership inotify watching) has any fallback or graceful-degradation behavior when inotify_init fails with EMFILE/ENOSPC, or whether it fails hard; (2) consider whether the test itself should skip or raise a clearer diagnostic when the host is near its inotify instance limit rather than failing with a generic assertion error; (3) check whether AIRA's own processes are contributing disproportionately to inotify instance exhaustion on this shared machine, independent of whether the test itself needs hardening.
