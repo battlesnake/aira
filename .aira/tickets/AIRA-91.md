@@ -540,3 +540,16 @@ the first positive evidence of a second, still-unexplained mechanism.
 Update this ticket with the result once it lands -- this is the last
 confirmatory step before treating the root cause as fully closed rather
 than "confirmed with one outstanding falsifiable check."
+
+**`services` re-run: clean negative, not a falsification (qual, same night).**
+Completed normally, rc=2 (known pre-existing unrelated billing-gate test
+failures, "8 failed, 1446 passed ... in 474.94s"), `make: *** Error 1`
+printed normally -- no truncation, no 137. Continuous `systemd-oomd` journal
+tail showed no new activity during this run (the only oomd line present was
+backlog from the earlier `hosted` kill already reported, printed by
+`journalctl -f`'s history replay on startup, not a live event). Consistent
+with the mechanism being genuinely contention-dependent -- this run
+apparently didn't hit sufficient system-wide memory pressure, which is
+exactly what the theory predicts sometimes happens, not a counter-example
+to it. `pipeline` (the actual falsification target) is still running,
+82%+ with no truncation signs yet as of this update.
