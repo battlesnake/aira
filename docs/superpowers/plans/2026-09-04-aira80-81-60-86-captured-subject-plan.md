@@ -446,6 +446,54 @@ regression test that was mutation-checked.
    it would have to defeat is tested directly instead (§4 test 3).
 4. AIRA-86's ratchet seed flip is behaviour-preserving by construction and no
    test can distinguish it — see §6.
+5. **Added by the independent verification pass (§5b), correcting this section.**
+   The dispatch-wide zero-subject guard in `evaluateChecker` is **not** covered
+   by any test: deleting it leaves the whole `internal/store` suite green. The
+   table above said "mutation-killed" of that guard, which was wrong — the named
+   test kills the `insights.go` guard (M8), a different change in the same fix.
+   The dispatch guard is unreachable defence-in-depth today, because every
+   remaining caller either captures or is refused; it is kept, and the claim is
+   corrected rather than the test invented.
+6. **Also added by the verification pass.** `RunGate` sharing one capture between
+   the subject evaluation and the canary is not discriminated by any test —
+   re-capturing separately for the canary leaves the suite green. It is in the
+   same class as gap 3: distinguishing the two requires the tree to change
+   between the two reads, which is not deterministically drivable without a
+   production hook. The property is enforced by the call shape, not by a test.
+
+## 5b. Independent verification record (2026-09-04)
+
+A separate agent verified this PR against source rather than against the build
+report: it re-read every source hunk, re-ran the whole suite in a fresh detached
+worktree at the PR head (`go test ./... -count=1`, **exit 0**, `internal/runner`
+included), and ran its own eleven-mutation battery instead of trusting §4's.
+
+- All five mutations §4 reports as killed (M2, M3, M4, M8, M9) reproduced as
+  killed. The mutation record is accurate.
+- Two further mutations survived the entire `internal/store` suite and are now
+  recorded as gaps 5 and 6 above.
+- **One new defect was found and is fixed in this PR** (`runFixtureCanary`,
+  below). It is the only finding that changed code.
+
+**The finding.** `runFixtureCanary` — the M10a compatibility seam — passes the
+*zero* `capturedSubject`. Before this fix that was harmless, because the seam
+delegated to a `runCanary` that read `s.root` itself. After it, the mutation
+lane materialises *the subject it is handed*: given the zero value it
+materialises an **empty tree**, injects the declared mutation into it, and
+evaluates the checker against a tree holding the mutation and nothing else. A
+checker that fails there records a canary that **fired**, minting proof-of-fire
+from the subject's *absence* — AIRA-81's harm shape, reintroduced through the
+one caller that does not capture, by the very change that closes AIRA-81.
+
+Latent, not live: no production caller reaches the seam with a mutation
+declaration (`runFixtureCanary` has no non-test caller, and both test call sites
+pass `CanaryFixture`). Fixed by refusing `CanaryMutation` at the seam rather
+than by a comment asserting the invariant. Pinned by
+`TestFixtureCanarySeamRefusesTheMutationMode`, which was mutation-checked: with
+the refusal removed it fails with `Predicate:"fail"`,
+`Code:"E_GATE_COMMAND_FAILED"` and an evaluation root of
+`/tmp/aira-gate-subject-…` — a fired canary bound to a tree that was never the
+subject.
 
 ## 6. Plan-review record
 

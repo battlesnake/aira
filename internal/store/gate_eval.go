@@ -589,9 +589,23 @@ func (s *Store) runCanary(ctx context.Context, c gate.CanaryDeclaration, def gat
 }
 
 // runFixtureCanary is retained as a compatibility seam for M10a tests and
-// delegates to the mode-dispatched implementation. The zero subject is correct:
-// a fixture canary seeds and captures its own tree and never reads the caller's.
+// delegates to the mode-dispatched implementation. The zero subject is correct
+// for the modes it serves: a fixture canary seeds and captures its own tree and
+// never reads the caller's, and a synthetic-ratchet canary touches no tree.
+//
+// It refuses the mutation mode rather than passing the zero subject on, because
+// runCanary's mutation lane materialises the SUBJECT: handed the zero value it
+// would materialise an EMPTY tree, inject the declared mutation into it, and
+// evaluate the checker against a tree holding the mutation and nothing else. A
+// checker that fails on that mints proof-of-fire from a fire caused by the
+// subject being ABSENT -- AIRA-81's harm shape, reintroduced through the one
+// caller that does not capture. No production caller passes mutation mode here
+// today; the refusal is what keeps that true rather than a comment asserting it.
+// Pinned by TestFixtureCanarySeamRefusesTheMutationMode.
 func (s *Store) runFixtureCanary(ctx context.Context, c gate.CanaryDeclaration, def gate.GateDefinition) (DimensionEvaluation, EvaluationRoot, error) {
+	if c.Mode == gate.CanaryMutation {
+		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_CANARY_UNEVALUATED"}, EvaluationRoot{}, errors.New("U_GATE_CANARY_UNEVALUATED: the fixture-canary seam has no captured subject to mutate")
+	}
 	return s.runCanary(ctx, c, def, capturedSubject{})
 }
 

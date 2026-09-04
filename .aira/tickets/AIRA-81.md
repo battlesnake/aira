@@ -32,4 +32,13 @@ End-to-end counterexample committed as
 fails with `Verdict:"pass", Trusted:true` -- a trusted pass licensed by a canary
 that fired on the drop rather than on its mutation.
 
+Found and fixed during independent verification, before merge: the fix's own
+`runFixtureCanary` seam (the M10a compatibility caller, no production users)
+passes the ZERO capturedSubject, and the mutation lane materialises whatever
+subject it is handed -- so that seam would have materialised an EMPTY tree,
+injected the mutation into it, and minted proof-of-fire from the subject's
+absence. Exactly this ticket's harm shape, reintroduced through the one caller
+that does not capture. The seam now refuses `CanaryMutation` outright; pinned by
+`TestFixtureCanarySeamRefusesTheMutationMode`, mutation-checked.
+
 Plan: docs/superpowers/plans/2026-09-04-aira80-81-60-86-captured-subject-plan.md

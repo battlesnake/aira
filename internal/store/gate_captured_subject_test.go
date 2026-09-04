@@ -342,6 +342,48 @@ func TestIgnoredTrackedFileDropDoesNotMintProofOfFire(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-81 -- the same harm shape, through the one caller that has no
+// captured subject to give.
+//
+// runFixtureCanary is a test-only compatibility seam and passes the ZERO
+// capturedSubject. Handed that, runCanary's mutation lane would materialise an
+// EMPTY tree, inject the declared mutation into it, and evaluate the checker
+// against a tree holding the mutation and nothing else. This checker fails when
+// it finds the marker, and the mutation is the only thing carrying it, so the
+// canary fires -- but it fires against a subject that was never captured, which
+// is proof-of-fire minted from the subject's ABSENCE. That is AIRA-81's harm
+// reintroduced through the back door, so the seam refuses the mode outright
+// rather than passing the zero value on.
+//
+// Found by the independent verification pass on the captured-subject PR, not by
+// the build. It is latent, not live: no production caller reaches this seam with
+// a mutation declaration today. The refusal is what keeps that true.
+func TestFixtureCanarySeamRefusesTheMutationMode(t *testing.T) {
+	s, root := realCommandStore(t)
+	def, canary := injectFileGateFixture("tests/aira_canary.rs", "AIRA mutation")
+	if canary.Mode != gate.CanaryMutation {
+		t.Fatalf("fixture is not discriminating: canary mode = %q", canary.Mode)
+	}
+	// The subject genuinely does not carry the marker, so an honest evaluation of
+	// it cannot fire this canary; only the empty-tree materialisation can.
+	for _, entry := range captureFor(t, root).entries {
+		if strings.Contains(string(entry.payload), "AIRA mutation") {
+			t.Fatalf("fixture is not discriminating: tracked %s already carries the marker", entry.path)
+		}
+	}
+
+	evaluation, evaluationRoot, err := s.runFixtureCanary(context.Background(), canary, def)
+	if err == nil {
+		t.Fatalf("the seam evaluated a mutation canary with no captured subject: evaluation=%#v root=%#v", evaluation, evaluationRoot)
+	}
+	if evaluation.Predicate == gate.PredicateFail {
+		t.Fatalf("the canary fired against a tree that was never the subject: %#v", evaluation)
+	}
+	if ErrorCode(err) != "U_GATE_CANARY_UNEVALUATED" {
+		t.Fatalf("refusal code = %q, want U_GATE_CANARY_UNEVALUATED (err=%v)", ErrorCode(err), err)
+	}
+}
+
 // verifies: AIRA-80, AIRA-81 -- `git ls-files --cached` lists an unmerged path
 // once per stage, so a conflicted index makes the same file appear several times
 // in one capture. Left as-is the digest is over a multiset while the
