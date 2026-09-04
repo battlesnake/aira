@@ -106,6 +106,15 @@ type workerScopeState struct {
 	maxIndex       int
 	committedAt    time.Time // last scan ATTEMPT, successful or not
 	scanned        bool
+	// scanErr is the last attempt's failure, held for the same interval a
+	// successful sum is. Without it the throttle below is defeated on exactly
+	// the path that most needs it: `scanned` is false after a failure, so every
+	// poll would walk the tree again -- the AIRA-61 CPU-regression shape, on a
+	// filesystem already misbehaving. Replaying the error (rather than the last
+	// good sum) keeps the answer honestly "unevaluated" instead of silently
+	// reverting to a stale number. Found independently by Sol and DeepSeek
+	// build-review.
+	scanErr error
 }
 
 // workerScopeScanIntervalDefault throttles the per-outer-scope child scan to
@@ -158,6 +167,7 @@ func (state *workerScopeState) release() { <-state.lock }
 func (state *workerScopeState) invalidate() {
 	state.committedAt = time.Time{}
 	state.scanned = false
+	state.scanErr = nil
 }
 
 // scanWorkerScopeChildren sums memory.max over outerScope's `.aira-worker-*`
@@ -238,8 +248,17 @@ func (s *Server) workerCommitted(state *workerScopeState, force bool) (int64, er
 		interval = workerScopeScanIntervalDefault
 	}
 	now := s.admitNowTime()
-	if !force && state.scanned && !state.committedAt.IsZero() && now.Sub(state.committedAt) < interval {
-		return state.committed, nil
+	if !force && !state.committedAt.IsZero() && now.Sub(state.committedAt) < interval {
+		// A FAILED attempt is throttled exactly like a successful one, by
+		// replaying its error. Gating this on `scanned` (as it first did) meant a
+		// failing scan cleared the flag and every subsequent poll rescanned,
+		// which is the per-poll O(tree) walk the cadence bound exists to prevent.
+		if state.scanErr != nil {
+			return 0, state.scanErr
+		}
+		if state.scanned {
+			return state.committed, nil
+		}
 	}
 	scan := s.workerScopeScan
 	if scan == nil {
@@ -250,11 +269,33 @@ func (s *Server) workerCommitted(state *workerScopeState, force bool) (int64, er
 	// filesystem does not turn every poll into another scan.
 	state.committedAt = now
 	if err != nil {
-		state.scanned = false
+		state.scanned, state.scanErr = false, err
 		return 0, err
 	}
-	state.committed, state.maxIndex, state.scanned = children.committed, children.maxIndex, true
+	state.committed, state.maxIndex, state.scanned, state.scanErr = children.committed, children.maxIndex, true, nil
 	return children.committed, nil
+}
+
+// workerScopesUnreadableReason builds the "unevaluated" reason for a scan the
+// daemon could not establish.
+//
+// The detail is FREE-FORM: it embeds cgroup paths (which carry the operator's
+// own `aira confine --name`) and raw memory.max file contents. supervisor.py's
+// classifier disables daemon-backed admission outright -- running the WHOLE
+// pytest suite UNCONFINED on this RAM-capped shared machine -- for any
+// "worker-admit unevaluated" message that also contains the literal token
+// "unbounded", which is readSliceMemory's deliberate reason for a genuinely
+// uncapped outer scope. A job named "unbounded-suite", or a corrupt memory.max
+// whose bytes are echoed back through %q, would otherwise be read as that
+// condition and silently drop containment for the whole run (found
+// independently by Sol and DeepSeek build-review).
+//
+// Neutralising the token in free-form detail is the narrow fix: a slightly
+// mangled diagnostic beats an unconfined suite, and the honest "unevaluated"
+// state is unchanged. Fix 2's structured outcome channel removes the need for
+// substring matching altogether.
+func workerScopesUnreadableReason(err error) string {
+	return "worker scopes unreadable: " + strings.ReplaceAll(err.Error(), "unbounded", "un-bounded")
 }
 
 // readWorkerSupervisorMemory reads a scope's live memory.current (plus its
@@ -434,7 +475,7 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 	// is the 200ms-per-waiter poll path AIRA-61's CPU regression was about.
 	committed, err := s.workerCommitted(state, false)
 	if err != nil {
-		return WorkerAdmitResponse{State: "unevaluated", Reason: "worker scopes unreadable: " + err.Error()}, true
+		return WorkerAdmitResponse{State: "unevaluated", Reason: workerScopesUnreadableReason(err)}, true
 	}
 	if !fits(committed) {
 		return WorkerAdmitResponse{State: "denied", Reason: "fallback:aggregate-cap-exceeded"}, true
@@ -446,7 +487,7 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 	// costs one scan per ADMITTED WORKER (a handful per suite), never one per
 	// poll, so the cadence bound above is untouched.
 	if committed, err = s.workerCommitted(state, true); err != nil {
-		return WorkerAdmitResponse{State: "unevaluated", Reason: "worker scopes unreadable: " + err.Error()}, true
+		return WorkerAdmitResponse{State: "unevaluated", Reason: workerScopesUnreadableReason(err)}, true
 	}
 	if !fits(committed) {
 		return WorkerAdmitResponse{State: "denied", Reason: "fallback:aggregate-cap-exceeded"}, true

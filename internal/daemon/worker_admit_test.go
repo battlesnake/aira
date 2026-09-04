@@ -1113,6 +1113,88 @@ func TestWorkerAdmitScanIsThrottledToAtMostOncePerInterval(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-39 — a FAILING scan is throttled exactly like a succeeding one.
+// The first implementation gated the throttle on `scanned`, which a failure
+// clears, so every 200ms poll rescanned a filesystem that was already
+// misbehaving: the AIRA-61 per-poll O(tree) regression, on the worst possible
+// path. Found independently by Sol and DeepSeek build-review.
+func TestWorkerAdmitFailingScanIsThrottledLikeASuccessfulOne(t *testing.T) {
+	server := NewServer(Paths{})
+	tree := newWorkerScopeTree().install(server)
+	server.workerScopeScanInterval = time.Second
+	server.workerAdmitHeadroom = 0
+	now := time.Unix(1000, 0)
+	server.admitNow = func() time.Time { return now }
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
+	tree.failScan("/outer", errors.New("worker scope /outer/.aira-worker-1: read memory.max: input/output error"))
+
+	for i := 0; i < 20; i++ {
+		response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400})
+		// Every poll must still answer honestly — the throttle replays the
+		// error, it never falls back to a stale or fabricated sum.
+		if response.State != "unevaluated" {
+			t.Fatalf("poll %d response=%+v, want unevaluated on every poll", i, response)
+		}
+		if !strings.Contains(response.Reason, "input/output error") {
+			t.Fatalf("poll %d reason=%q, want the underlying failure replayed", i, response.Reason)
+		}
+	}
+	if got := tree.scanCount("/outer"); got != 1 {
+		t.Fatalf("scans=%d over 20 failing polls inside one interval, want exactly 1", got)
+	}
+	// Past the interval it retries — a throttle, not a latch.
+	now = now.Add(2 * time.Second)
+	if response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400}); response.State != "unevaluated" {
+		t.Fatalf("response=%+v", response)
+	}
+	if got := tree.scanCount("/outer"); got != 2 {
+		t.Fatalf("scans=%d after the interval elapsed, want 2: the throttle must expire, not latch", got)
+	}
+}
+
+// verifies: AIRA-39 — an "unevaluated" reason carries free-form text (cgroup
+// paths containing the operator's own job name, and raw memory.max bytes).
+// supervisor.py disables daemon admission entirely — running the whole suite
+// UNCONFINED — for a "worker-admit unevaluated" message that also contains the
+// token "unbounded". That token must never reach the wire by accident.
+// Found independently by Sol and DeepSeek build-review.
+func TestWorkerAdmitUnevaluatedReasonNeverCarriesTheUnboundedToken(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		// The operator named the confine job "unbounded-suite"; the path is
+		// echoed into the diagnostic.
+		{name: "job name in the cgroup path",
+			err: errors.New("worker scope /sys/fs/cgroup/user.slice/.aira-CONFINE-unbounded-suite-1234-abc/.aira-worker-2: read memory.max: permission denied")},
+		// A corrupt memory.max whose bytes are echoed back through %q.
+		{name: "corrupt memory.max contents",
+			err: errors.New(`worker scope /outer/.aira-worker-2: memory.max is not a finite byte count ("unbounded")`)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := NewServer(Paths{})
+			tree := newWorkerScopeTree().install(server)
+			server.workerAdmitHeadroom = 0
+			server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+			server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
+			tree.failScan("/outer", test.err)
+
+			response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 100})
+			if response.State != "unevaluated" {
+				t.Fatalf("response=%+v, want unevaluated", response)
+			}
+			if strings.Contains(response.Reason, "unbounded") {
+				t.Fatalf("reason=%q contains supervisor.py's \"unbounded\" token: the classifier reads that as an uncapped outer scope, disables daemon admission and runs the WHOLE suite unconfined", response.Reason)
+			}
+			// Still diagnosable: the offending child is named.
+			if !strings.Contains(response.Reason, ".aira-worker-2") {
+				t.Fatalf("reason=%q, want the offending child still named", response.Reason)
+			}
+		})
+	}
+}
+
 // verifies: AIRA-39 — a CACHED sum may never be the basis of a GRANT. A child
 // that appeared since the last scan is invisible to the cache and need not
 // collide with the id about to be allocated, so the grant path forces a fresh

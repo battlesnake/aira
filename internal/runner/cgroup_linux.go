@@ -220,8 +220,18 @@ func (b *linuxScopeBackend) Open(ctx context.Context, reference string) (Scope, 
 	return &linuxScope{path: path, fd: fd}, nil
 }
 
-func (s *linuxScope) Reference() string  { return s.path }
-func (s *linuxScope) FD() int            { return int(s.fd.Fd()) }
+func (s *linuxScope) Reference() string { return s.path }
+func (s *linuxScope) FD() int           { return int(s.fd.Fd()) }
+
+// Close releases the scope's directory FD. It is deliberately NOT on the Scope
+// interface: long-lived holders (a confine job's own scope) keep the FD for the
+// life of the job by design. It exists for callers that only needed the scope in
+// order to CREATE and configure it and then hand back a path -- CreateWorkerScope.
+// Since AIRA-39 that path runs inside the long-lived DAEMON rather than a
+// short-lived CLI process, so the FD is no longer reclaimed by process exit, and
+// leaning on the *os.File finalizer would let one FD per aitest worker
+// accumulate between GCs (found by Sol build-review).
+func (s *linuxScope) Close() error       { return s.fd.Close() }
 func (s *linuxScope) EventsPath() string { return filepath.Join(s.path, "cgroup.events") }
 func (s *linuxScope) openFile(name string, flags int) (*os.File, error) {
 	fd, err := unix.Openat(s.FD(), name, flags|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)

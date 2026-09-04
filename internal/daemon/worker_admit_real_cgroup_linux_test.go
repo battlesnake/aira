@@ -32,6 +32,54 @@ func realOuterScope(t *testing.T) string {
 	return outer
 }
 
+// verifies: AIRA-39 — creating worker scopes must not leak file descriptors.
+// runner.CreateWorkerScope used to run in the short-lived `aira worker-admit`
+// CLI, where the directory FD the cgroup backend opens was reclaimed by process
+// exit. It now runs in the LONG-LIVED daemon, once per aitest worker on the
+// machine, so an unclosed FD accumulates until the *os.File finalizer happens to
+// run — and exhausting the daemon's FDs turns every later admission into a
+// terminal create failure. Found by Sol build-review.
+func TestCreatingWorkerScopesDoesNotLeakFileDescriptors(t *testing.T) {
+	outer := realOuterScope(t)
+	openFDs := func() int {
+		t.Helper()
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			cgrouptest.SkipOrFailRealCgroup(t, "cannot count open fds: %v", err)
+		}
+		return len(entries)
+	}
+
+	server := NewServer(Paths{})
+	server.workerAdmitHeadroom = 0
+	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, 1 << 40, 0, true, "" }
+	server.admitReadWorkerSupervisorMemory = func(string) (int64, int64, bool, string) { return 0, 0, true, "" }
+
+	// One warm-up create first: the very first call can legitimately open
+	// long-lived things (the cgroup mount lookup), which is not the leak.
+	if response, _ := server.evaluateWorkerAdmit(context.Background(), workerAdmitRequest{
+		jobID: "job-1", outerScope: outer, estimatedBytes: 1 << 20}); response.State != "granted" {
+		t.Fatalf("warm-up response=%+v", response)
+	}
+
+	const creations = 30
+	before := openFDs()
+	for i := 0; i < creations; i++ {
+		response, proceed := server.evaluateWorkerAdmit(context.Background(), workerAdmitRequest{
+			jobID: "job-1", outerScope: outer, estimatedBytes: 1 << 20})
+		if !proceed || response.State != "granted" {
+			t.Fatalf("create %d: response=%+v proceed=%v", i, response, proceed)
+		}
+	}
+	// Generous: the leak is one FD per creation, so an unfixed build lands at
+	// +30 while a fixed one stays flat. The margin only absorbs unrelated
+	// runtime churn, never the defect.
+	if growth := openFDs() - before; growth > creations/3 {
+		t.Fatalf("open fds grew by %d across %d worker-scope creations (before=%d): the cgroup directory FD is not being closed, and the daemon holds it for its whole lifetime",
+			growth, creations, before)
+	}
+}
+
 // verifies: AIRA-39 — end to end against a real cgroup: the daemon creates the
 // worker scope itself, the grant names the scope it created, the kernel really
 // carries the granted memory.max and memory.oom.group, and the very next
