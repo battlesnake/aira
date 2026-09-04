@@ -131,10 +131,6 @@ func (e *tuiExecutor) submit(command tuiCmd) bool {
 	return true
 }
 
-func (e *tuiExecutor) submitPalette(request core.Request) bool {
-	return e.submit(tuiCmd{Kind: cmdPalette, Palette: &request})
-}
-
 func (e *tuiExecutor) submitDetached(launch executeLaunch) bool {
 	launch = cloneExecuteLaunch(launch)
 	return e.submit(tuiCmd{Kind: cmdExecuteDetached, Execute: &launch})

@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -136,15 +135,22 @@ type InitPlan struct {
 	Adopt   bool
 }
 
-func Discover(ctx context.Context, cwd string) (Project, error) {
+// discoverGitRoot resolves the absolute worktree root, reporting the caller's
+// own E_NOT_PROJECT wording so `init` and ordinary discovery keep their
+// distinct messages.
+func discoverGitRoot(ctx context.Context, cwd, notProject string) (string, error) {
 	root, err := gitValue(ctx, cwd, "--show-toplevel")
 	if err != nil {
-		return Project{}, errors.New("E_NOT_PROJECT: current directory is not a git worktree")
+		return "", errors.New("E_NOT_PROJECT: " + notProject)
 	}
-	root, err = filepath.Abs(strings.TrimSpace(root))
-	if err != nil {
-		return Project{}, err
-	}
+	return filepath.Abs(strings.TrimSpace(root))
+}
+
+// gitIdentity resolves the common directory, the worktree git directory and the
+// two derived identities for an already-resolved root. Discover,
+// DiscoverBootstrap and PrepareInit all need exactly this and nothing else;
+// keeping one copy is what stops the three drifting apart.
+func gitIdentity(ctx context.Context, root string) (Project, error) {
 	common, err := gitValue(ctx, root, "--git-common-dir")
 	if err != nil {
 		return Project{}, errors.New("E_NOT_PROJECT: git common directory is unavailable")
@@ -155,6 +161,34 @@ func Discover(ctx context.Context, cwd string) (Project, error) {
 		return Project{}, errors.New("E_NOT_PROJECT: worktree git directory is unavailable")
 	}
 	gitDir = absoluteGitPath(root, strings.TrimSpace(gitDir))
+	canonicalCommon, err := filepath.EvalSymlinks(common)
+	if err != nil {
+		canonicalCommon = common
+	}
+	canonicalGitDir, err := filepath.EvalSymlinks(gitDir)
+	if err != nil {
+		canonicalGitDir = gitDir
+	}
+	state, err := store.DefaultStateDir()
+	if err != nil {
+		return Project{}, err
+	}
+	return Project{
+		Root: root, CommonDir: common, GitDir: gitDir,
+		ProjectID: hashID(canonicalCommon), WorktreeID: hashID(canonicalGitDir),
+		StateDir: state,
+	}, nil
+}
+
+func Discover(ctx context.Context, cwd string) (Project, error) {
+	root, err := discoverGitRoot(ctx, cwd, "current directory is not a git worktree")
+	if err != nil {
+		return Project{}, err
+	}
+	project, err := gitIdentity(ctx, root)
+	if err != nil {
+		return Project{}, err
+	}
 	configPath, err := findConfig(root)
 	if err != nil {
 		return Project{}, err
@@ -163,54 +197,18 @@ func Discover(ctx context.Context, cwd string) (Project, error) {
 	if err != nil {
 		return Project{}, err
 	}
-	canonicalCommon, err := filepath.EvalSymlinks(common)
-	if err != nil {
-		canonicalCommon = common
-	}
-	canonicalGitDir, err := filepath.EvalSymlinks(gitDir)
-	if err != nil {
-		canonicalGitDir = gitDir
-	}
-	return Project{
-		Root: root, CommonDir: common, GitDir: gitDir,
-		ProjectID: hashID(canonicalCommon), WorktreeID: hashID(canonicalGitDir),
-		ConfigPath: configPath, Config: config, StateDir: stateDir(),
-	}, nil
+	project.ConfigPath, project.Config = configPath, config
+	return project, nil
 }
 
 // DiscoverBootstrap returns git identity before .aira/config exists. It is
 // read-only and is used by the client to describe a routed init request.
 func DiscoverBootstrap(ctx context.Context, cwd string) (Project, error) {
-	root, err := gitValue(ctx, cwd, "--show-toplevel")
-	if err != nil {
-		return Project{}, errors.New("E_NOT_PROJECT: aira init requires a git repository")
-	}
-	root, err = filepath.Abs(strings.TrimSpace(root))
+	root, err := discoverGitRoot(ctx, cwd, "aira init requires a git repository")
 	if err != nil {
 		return Project{}, err
 	}
-	common, err := gitValue(ctx, root, "--git-common-dir")
-	if err != nil {
-		return Project{}, errors.New("E_NOT_PROJECT: git common directory is unavailable")
-	}
-	common = absoluteGitPath(root, strings.TrimSpace(common))
-	gitDir, err := gitValue(ctx, root, "--git-dir")
-	if err != nil {
-		return Project{}, errors.New("E_NOT_PROJECT: worktree git directory is unavailable")
-	}
-	gitDir = absoluteGitPath(root, strings.TrimSpace(gitDir))
-	canonicalCommon, err := filepath.EvalSymlinks(common)
-	if err != nil {
-		canonicalCommon = common
-	}
-	canonicalGitDir, err := filepath.EvalSymlinks(gitDir)
-	if err != nil {
-		canonicalGitDir = gitDir
-	}
-	return Project{
-		Root: root, CommonDir: common, GitDir: gitDir,
-		ProjectID: hashID(canonicalCommon), WorktreeID: hashID(canonicalGitDir), StateDir: stateDir(),
-	}, nil
+	return gitIdentity(ctx, root)
 }
 
 func Open(ctx context.Context, cwd string) (*store.Store, Project, error) {
@@ -407,11 +405,7 @@ func Init(ctx context.Context, cwd string, args map[string]any) (InitResult, err
 // PrepareInit validates and discovers an init bootstrap without opening state.db
 // or writing .aira/config.
 func PrepareInit(ctx context.Context, cwd string, args map[string]any) (InitPlan, error) {
-	root, err := gitValue(ctx, cwd, "--show-toplevel")
-	if err != nil {
-		return InitPlan{}, errors.New("E_NOT_PROJECT: aira init requires a git repository")
-	}
-	root, err = filepath.Abs(strings.TrimSpace(root))
+	root, err := discoverGitRoot(ctx, cwd, "aira init requires a git repository")
 	if err != nil {
 		return InitPlan{}, err
 	}
@@ -470,29 +464,12 @@ func PrepareInit(ctx context.Context, cwd string, args map[string]any) (InitPlan
 		}
 		data = append(data, '\n')
 	}
-	common, err := gitValue(ctx, root, "--git-common-dir")
+	project, err := gitIdentity(ctx, root)
 	if err != nil {
-		return InitPlan{}, errors.New("E_NOT_PROJECT: git common directory is unavailable")
+		return InitPlan{}, err
 	}
-	common = absoluteGitPath(root, strings.TrimSpace(common))
-	gitDir, err := gitValue(ctx, root, "--git-dir")
-	if err != nil {
-		return InitPlan{}, errors.New("E_NOT_PROJECT: worktree git directory is unavailable")
-	}
-	gitDir = absoluteGitPath(root, strings.TrimSpace(gitDir))
-	canonicalCommon, err := filepath.EvalSymlinks(common)
-	if err != nil {
-		canonicalCommon = common
-	}
-	canonicalGitDir, err := filepath.EvalSymlinks(gitDir)
-	if err != nil {
-		canonicalGitDir = gitDir
-	}
-	return InitPlan{Project: Project{
-		Root: root, CommonDir: common, GitDir: gitDir,
-		ProjectID: hashID(canonicalCommon), WorktreeID: hashID(canonicalGitDir),
-		ConfigPath: configPath, Config: config, StateDir: stateDir(),
-	}, Data: data, Adopt: adopt}, nil
+	project.ConfigPath, project.Config = configPath, config
+	return InitPlan{Project: project, Data: data, Adopt: adopt}, nil
 }
 
 // CommitInit writes the config prepared by PrepareInit.
@@ -680,9 +657,12 @@ func parsedRunAdmission(config RunConfig) (int64, time.Duration, bool, error) {
 	var reserve int64
 	var err error
 	if headroom != "" {
-		reserve, err = parseByteCount(headroom)
+		reserve, err = runner.ParseMemorySize(headroom)
 		if err != nil {
 			return 0, 0, false, fmt.Errorf("E_CONFIG_INVALID: run.memory_headroom: %w", err)
+		}
+		if reserve <= 0 {
+			return 0, 0, false, errors.New("E_CONFIG_INVALID: run.memory_headroom must be a positive byte count")
 		}
 		if config.MemoryEstimate && reserve > maxMemoryEstimateReserve {
 			return 0, 0, false, errors.New("E_CONFIG_INVALID: run.memory_headroom exceeds the memory estimate reserve cap")
@@ -744,34 +724,6 @@ func runnerDaemonScope(project Project) (map[string]any, error) {
 		"max_quota_snapshots": project.Config.Project.Compute.MaxQuotaSnapshots,
 		"lease_ttl_ns":        leaseTTLNS(project.Config), "config_digest": hex.EncodeToString(digest[:]),
 	}, nil
-}
-
-func parseByteCount(value string) (int64, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return 0, errors.New("empty byte count")
-	}
-	multiplier := int64(1)
-	last := value[len(value)-1]
-	switch last {
-	case 'k', 'K':
-		multiplier = 1 << 10
-		value = value[:len(value)-1]
-	case 'm', 'M':
-		multiplier = 1 << 20
-		value = value[:len(value)-1]
-	case 'g', 'G':
-		multiplier = 1 << 30
-		value = value[:len(value)-1]
-	case 't', 'T':
-		multiplier = 1 << 40
-		value = value[:len(value)-1]
-	}
-	parsed, err := strconv.ParseInt(value, 10, 64)
-	if err != nil || parsed <= 0 || parsed > int64(^uint64(0)>>1)/multiplier {
-		return 0, errors.New("byte count must be a positive 1024-based integer without overflow")
-	}
-	return parsed * multiplier, nil
 }
 
 func writeConfig(path string, data []byte) error {
@@ -837,17 +789,6 @@ func absoluteGitPath(root, path string) string {
 func hashID(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
-}
-
-func stateDir() string {
-	if value := os.Getenv("XDG_STATE_HOME"); value != "" {
-		return filepath.Join(value, "aira")
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join(os.TempDir(), "aira-state")
-	}
-	return filepath.Join(home, ".local", "state", "aira")
 }
 
 func stringArg(args map[string]any, key string) string {

@@ -91,15 +91,21 @@ type reapCandidate struct {
 	generation int64
 }
 
-func defaultLeaseStateDir() string {
-	if value := os.Getenv("XDG_STATE_HOME"); value != "" {
-		return filepath.Join(value, "aira")
+// DefaultStateDir resolves the machine-local AIRA state directory the same way
+// the daemon does (daemon.PathsFromEnvironment): XDG_STATE_HOME when set,
+// otherwise ~/.local/state. It REFUSES when neither is resolvable rather than
+// substituting a temp path — a client that silently relocated its state to
+// $TMPDIR/aira-state would open a different, reboot-volatile database from the
+// one the daemon owns, and report success for writes nothing else can see.
+func DefaultStateDir() (string, error) {
+	if value := strings.TrimSpace(os.Getenv("XDG_STATE_HOME")); value != "" {
+		return filepath.Join(value, "aira"), nil
 	}
 	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join(os.TempDir(), "aira-state")
+	if err != nil || strings.TrimSpace(home) == "" {
+		return "", errors.New("E_CONFIG_MISSING: HOME is unset; cannot resolve XDG_STATE_HOME")
 	}
-	return filepath.Join(home, ".local", "state", "aira")
+	return filepath.Join(home, ".local", "state", "aira"), nil
 }
 
 func (s *Store) leaseTokenPath(id string) string {

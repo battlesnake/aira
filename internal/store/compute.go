@@ -87,12 +87,6 @@ func (s *Store) SpendByPhase(ctx context.Context, query string) ([]ComputePhaseS
 	return result, nil
 }
 
-// ListComputeSpendByPhase is the descriptive alias used by callers that
-// treat this aggregate as a list operation.
-func (s *Store) ListComputeSpendByPhase(ctx context.Context, query string) ([]ComputePhaseSummary, error) {
-	return s.SpendByPhase(ctx, query)
-}
-
 func (s *Store) AddComputeEvent(ctx context.Context, input domain.ComputeEventInput) (ComputeEventAddResult, error) {
 	input.TicketID = strings.TrimSpace(input.TicketID)
 	input.Phase = strings.TrimSpace(input.Phase)

@@ -103,12 +103,6 @@ func skillVersion(manifest SkillManifest, skillMD, guide []byte) (string, error)
 	return hex.EncodeToString(digest[:]), nil
 }
 
-// GenerateSkill is the concise alias used by callers that need the complete
-// generated Skill package.
-func GenerateSkill(descriptors []DispatchDescriptor) (SkillArtifacts, error) {
-	return GenerateSkillArtifacts(descriptors)
-}
-
 func normaliseSkillActions(descriptors []DispatchDescriptor) ([]SkillAction, error) {
 	actions := make([]SkillAction, 0)
 	seen := map[string]bool{}

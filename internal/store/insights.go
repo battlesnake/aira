@@ -90,14 +90,6 @@ func gaugeCellUnevaluated(reason string) GaugeCell {
 	return GaugeCell{Unevaluated: true, UnevaluatedReason: reason}
 }
 
-func copyAsOf(values map[string]any) map[string]any {
-	result := make(map[string]any, len(values))
-	for key, value := range values {
-		result[key] = value
-	}
-	return result
-}
-
 var insightRegistry = []Gauge{
 	{Name: "admission-reserve-adequacy", Title: "Admission reserve vs observed peak RSS", Kind: GaugeKindRatio},
 	{Name: "reviewer-verdict-ratio", Title: "Reviewer verdict kill-rate by source", Kind: GaugeKindRatio},

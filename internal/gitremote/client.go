@@ -879,7 +879,7 @@ func (c *Client) syntheticName(ctx context.Context) (string, error) {
 }
 
 func commandEnv(extra []string, connect time.Duration) []string {
-	env := scrubEnv(os.Environ(), false)
+	env := scrubEnv(os.Environ())
 	env = append(env,
 		"GIT_TERMINAL_PROMPT=0",
 		"GCM_INTERACTIVE=never",
@@ -905,14 +905,11 @@ func rewriteFreeEnv(env []string) []string {
 	return append(out, "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
 }
 
-func scrubEnv(env []string, rewrite bool) []string {
+func scrubEnv(env []string) []string {
 	out := make([]string, 0, len(env))
 	for _, item := range env {
 		key, _, _ := strings.Cut(item, "=")
 		if key == "GIT_TERMINAL_PROMPT" || key == "GCM_INTERACTIVE" || key == "GIT_SSH_COMMAND" {
-			continue
-		}
-		if rewrite && (key == "GIT_CONFIG_COUNT" || key == "GIT_CONFIG_PARAMETERS" || key == "GIT_CONFIG_GLOBAL" || key == "GIT_CONFIG_SYSTEM" || strings.HasPrefix(key, "GIT_CONFIG_KEY_") || strings.HasPrefix(key, "GIT_CONFIG_VALUE_")) {
 			continue
 		}
 		out = append(out, item)

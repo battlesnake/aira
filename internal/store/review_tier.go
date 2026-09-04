@@ -18,9 +18,6 @@ type ReviewPathTier struct {
 	Tier int    `json:"tier"`
 }
 
-// PathTier is a short compatibility name for a path-to-tier rule.
-type PathTier = ReviewPathTier
-
 // ReviewPolicy is the static project policy used by the review-depth engine.
 // DefaultTier is a pointer because an omitted value inside a present review
 // block is malformed, while the absent review block has a documented default.
