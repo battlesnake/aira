@@ -1,10 +1,15 @@
 # Backlog remediation plan
 
 **Date:** 2026-09-04
-**Status:** REVISED — 4 automated Fable review rounds (GATE-PASS-WITH-CHANGES
-each round, converging: 16 → 17 → 9 → 10 required changes) plus one manual
-revision pass addressing round 4's full list in full; pending a final
-targeted confirmation check before execution.
+**Status:** APPROVED FOR EXECUTION. 4 automated Fable review rounds
+(GATE-PASS-WITH-CHANGES each round, converging 16 → 17 → 9 → 10 required
+changes) plus two manual revision passes: one applying round 4's full list,
+one applying a final targeted Fable confirmation check (6 of 10 items
+verified correct on the first pass; the remaining 4 — the §8 CPU-regression
+bullet that had been promised but not written, the Fix-1-deploy-vs-probe-
+commit ordering conflict, AIRA-78's contradictory "executor default" wording,
+and Fix 4's mis-justified `storeops.go` scoping — corrected precisely per
+that check's own exact instructions).
 **Input:** [`docs/superpowers/reviews/2026-09-04-fable-backlog-simplification-sweep.md`](../reviews/2026-09-04-fable-backlog-simplification-sweep.md)
 (four parallel Fable-model cluster reviews of all 49 open tickets, each verified
 against current source, not trusted from ticket text)
@@ -173,8 +178,9 @@ box: the real-cgroup tests place scopes directly under `aira.slice`
 to be stopped, `kill <PID>` (or `kill -INT <PID>`) the `aira confine`
 process that was started for it — **never** `systemctl --user stop
 aira.slice` (or `aira-daemon.service`, outside a deliberate, coordinated
-Phase 1 deploy step, §8), which would hit every other session on the
-machine.
+Phase 0/1 deploy step, §8 — corrected this revision: §8's restart policy now
+also schedules a Phase 0 restart for AIRA-52+23/AIRA-75, not only Phase 1),
+which would hit every other session on the machine.
 
 ## 3. Phase 1 — Structural fixes (Tier A, full two-loop)
 
@@ -217,7 +223,7 @@ the confine-kill dispatch)**, `internal/runner/confine_linux.go:966-968`, `inter
 | 1. Worker-admit ledger = cgroup tree (+ AIRA-63 gate) | `internal/daemon/worker_admit.go`, `internal/runner/worker_scope_linux.go`, `cmd/aira/main.go:1080`, `internal/runner/worker_admit_client_linux.go` | 2 — the last two files are Fix 2's (§3.1); this makes the 1 → 2 order load-bearing, not just convenient. **Neither Fix touches `internal/daemon/admit.go`** — corrected this revision; a prior draft's prose wrongly implied otherwise (see intro paragraph above and the §3.2/§4 AIRA-24 correction). |
 | 2. Structured daemon↔client outcome codes | `internal/daemon/worker_admit.go` (the `WorkerAdmitResponse` type lives here, not in `protocol.go` — corrected from a prior draft), `internal/runner/worker_admit_client_linux.go`, `cmd/aira/main.go`, `internal/pylib/aitest/supervisor.py`, and — because this fix bumps the wire protocol version — `internal/daemon/protocol.go:21` (`ProtocolVersion = 5`) and, unless AIRA-83 item 3 (§2) already derives it from that constant, `internal/runner/admission_linux.go:79` | 1 (same worker-admit files, above); **4, corrected this revision — the real overlap is `protocol.go:21`, not `main.go`: Fix 4 edits `protocol.go`'s `exchange()` (`:337-341`) and `server.go:527`, the same file this fix bumps the version constant in** |
 | 3. Captured-subject gate evaluator (+ AIRA-60, AIRA-86 seed sites) | `internal/store/gate_eval.go`, `gate_command.go`, `gate_ratchet.go`, `internal/gate/canary.go`, `traceability.go`, **`gate_subject.go` (`stableSubjectEntries`, `:160` — added this revision, was missing from the primary file list despite being this fix's core capture primitive)** | Phase 0 AIRA-60 (`gate_command.go:358`, `canary.go:189`, `gate_eval.go:535`) and Phase 2 AIRA-86 (`gate_eval.go:99`, `gate_eval.go:597`, `gate_ratchet.go:80`) share these exact files — folded in below, not independent (§3.5) |
-| 4. Symmetric deadline-policy seam | `internal/daemon/server.go:527`, `internal/daemon/protocol.go` (`exchange()`, `:337-341`) | 2, corrected this revision — the shared file is `protocol.go:21` (above), not `main.go` |
+| 4. Symmetric deadline-policy seam | `internal/daemon/server.go:527,155,668`, `internal/daemon/protocol.go` (`exchange()`, `:337-341`) — **`server.go:155,668` added this revision, the seam's actual in-scope boundary (§3.4)** | 2, corrected this revision — the shared file is `protocol.go:21` (above), not `main.go` |
 | 5. Confine trailer kill-attribution (AIRA-70 + AIRA-91 Part A) — added this revision, §3.6 | `internal/runner/confine_linux.go` (`FormatConfineStatus`, `formatConfineReserveAdvisory:872-890`, the signal handler), `internal/daemon/confine_manage.go:160-172` (`confine-kill` dispatch — **precision correction, this revision:** `confine_manage.go:141-152` is the `--list` summary struct, not the kill dispatch; the finding that no `log.` call exists anywhere in the file still holds either way) | Phase 0's AIRA-44 and AIRA-52+23 share `confine_linux.go` — starts once Phase 0 has merged; **also shares `internal/daemon/confine_manage.go` with Phase 0's AIRA-52+23, added this revision** (AIRA-52's `:164` `freshConfineOwner`-caller deletion and this fix's new log line at `:160-172` are the same block — the existing "Fix 5 starts after Phase 0" ordering already covers it, named explicitly here per plan-review); independent of the 1 → 2 → 4 chain (touches neither `worker_admit.go` nor `admit.go`) and, **corrected this revision, no longer "same as Fix 3"** — Fix 3 itself now starts immediately, not gated on Phase 0 (§3.5) |
 
 **Order: Phase 0 excluding AIRA-35 merges first — corrected this revision, all
@@ -292,12 +298,16 @@ flow, and is dropped:** `BootstrapAitestSupervisor`
 `mkdir`/`memory.max`-write failure at admit time is not transient — it means
 the daemon's cgroupfs access is broken. The denial **must** therefore be
 `reject:worker-scope-create-failed:<errno>` (terminal — routes to
-`WorkerAdmitRequestTooLarge`, and the queue is marked `unevaluated`, per
-`supervisor.py:653-655`), **never** a `fallback:`-prefixed reason:
-`supervisor.py`'s classifier treats any `fallback:`-prefixed denial as
-retriable (`:657-659`, `:1066`) and retries it indefinitely — a daemon-side
-cgroupfs failure emitted as `fallback:` would silently stall every aitest run
-on the machine forever, not just the job that hit it. Note for the builder:
+`WorkerAdmitRequestTooLarge`, and the queue is marked `unevaluated`, around
+`worker_admit.go:416-428` — corrected this revision, `supervisor.py:652-659`
+is the classifier, not the queue-marking site), **never** a `fallback:`-
+prefixed reason: **reworded this revision for mechanism accuracy** —
+`supervisor.py`'s classifier treats any denial message *lacking* the literal
+substring `reject:` — including, but not specifically because of, a
+`fallback:`-prefixed one — as retriable (`:652-659`, `:1064`) and retries it
+indefinitely; a daemon-side cgroupfs failure emitted without `reject:` would
+silently stall every aitest run on the machine forever, not just the job
+that hit it. Note for the builder:
 `~/.config/systemd/user/aira-daemon.service` carries no
 `ProtectControlGroups`/cgroup sandboxing, so a daemon-side `mkdir` under a
 user-delegated outer scope is expected to work in the normal case — the
@@ -517,21 +527,38 @@ AIRA-92) — worth naming as a durable convention in the commit, not just a
 one-off patch, since a `forbidigo` rule (Phase 2, tooling) will hold it there
 going forward.
 
-**Closed site list, stated explicitly this revision — the AIRA-84 ticket
-itself names only `server.go:527` (and the `:668` write); this plan already
-widens that to the client `exchange()` (`protocol.go:337-341`).** Two more
-30-second constants exist in this codebase and this plan states explicitly
-whether each is in or out of the seam, so "symmetric" has a defined boundary
-rather than an implicit one an implementer has to guess at: `internal/daemon/storeops.go:191`
-(the store-op timeout — **in scope**, since the ticket's own text already
-frames this as "the same treatment as store-ops"; folding it into the same
-seam is the unification this plan prefers over a second, parallel
-30-second constant surviving elsewhere) and `cmd/aira/watch.go:18`
-(`watchExchangeTimeout` — **out of scope** for this fix: `aira watch` is a
-long-lived streaming connection by design, not a request/response
-round-trip, so the same short-connect/verb-declared-budget shape does not
-apply to it without its own separate design; leave it as-is here rather
-than silently folding it in).
+**Closed site list, corrected this revision — a prior wording put
+`storeops.go:191` in scope for the wrong reason.** The AIRA-84 ticket names
+only `server.go:527` (the connect deadline) and its `:668` routed write; this
+plan widens that to the client `exchange()` (`protocol.go:337-341`, `:337`
+for the deadline itself). Four constants total, each stated explicitly so
+"symmetric" has a defined boundary:
+- **In scope:** `server.go:527` (the connect deadline this fix replaces),
+  `server.go:668` (the routed write — this is what needs the actual seam,
+  since it currently writes under the same stale connect-time deadline),
+  `protocol.go:337` (client `exchange()`'s mirrored deadline), and
+  `server.go:155` (`storeOpWriteTimeout`, the store-op *write* deadline —
+  this is the genuine "same treatment as store-ops" precedent AIRA-84's own
+  text points at: the socket-level `SetReadDeadline(time.Time{})` /
+  `SetWriteDeadline(storeOpWriteTimeout)` pattern at `server.go:548-551`,
+  which the routed path lacks and this fix gives it).
+- **Out of scope:** `internal/daemon/storeops.go:191` and `server.go:153`
+  (`storeOpAppendTimeout`) — **corrected, this revision: these are
+  `context.WithTimeout` execution-*budget* fallbacks for an op's own work,
+  not socket deadlines, and `:191` is reached only when
+  `storeOpAppendTimeout`/`storeOpHeavyTimeout` are configured `≤0`; both
+  default to positive values at `server.go:153-155`, so `:191` is
+  effectively dead in the normal case.** They answer "how long may this
+  operation run," not "how long may the connection sit idle," and folding
+  them into the connection-deadline seam would conflate two different
+  budgets. `cmd/aira/watch.go:18` (`watchExchangeTimeout`) stays **out of
+  scope** as already stated: `aira watch` is a long-lived streaming
+  connection by design, not a request/response round-trip, so the same
+  short-connect/verb-declared-budget shape does not apply without its own
+  separate design.
+
+Add the in-scope files (`server.go:527,155,668`, `protocol.go:337`) to the
+§3 file-touch matrix's Fix 4 row.
 
 ### 3.5 Fix 3 — Captured-subject type for gate evaluators (+ AIRA-60, AIRA-86 seed sites)
 
@@ -542,9 +569,11 @@ prior revision imposed here is spurious and is dropped:** that gate was
 justified by AIRA-60 and AIRA-86 sharing this fix's exact files, but AIRA-60
 and AIRA-86's `gate_eval.go`/`gate_ratchet.go` sites are folded **into** this
 fix rather than staying separate Phase 0/Phase 2 items (below) — once folded
-in, no *remaining* Phase 0 item touches any of this fix's five files
+in, no *remaining* Phase 0 item touches any of this fix's six files
 (`gate_eval.go`, `gate_command.go`, `gate_ratchet.go`, `canary.go`,
-`traceability.go`): AIRA-89 only deletes symbols in `gate_index.go`,
+`traceability.go`, `gate_subject.go` — corrected this revision from "five",
+matching the matrix's addition of `gate_subject.go` above): AIRA-89 only
+deletes symbols in `gate_index.go`,
 `gate_audit.go`, `testreport.go`, and AIRA-56 only touches
 `relation_ready.go`/`gate_index.go` — none of Fix 3's files. **Fix 3 therefore
 starts immediately, in its own worktree, not gated on Phase 0 at all** — its
@@ -634,13 +663,18 @@ anywhere, contrary to this repo's CLAUDE.md committed-reproduction rule.**
 `~/tmp/aira91-probe/` (a Makefile plus `selfkill`/`groupkill`/`groupkill_dr`/
 `hog` logs) exists on this machine but is untracked (`git ls-files` finds
 nothing under it; only `.aira/tickets/AIRA-91.md:460` and this plan mention
-it). **Fix 5's PR must commit the probe** — either the probe Makefile itself
-under a repo path, or an equivalent Go test in `internal/runner` that writes
-to a confine scope's `cgroup.kill` and asserts
-`terminated-by=external-cgroup-kill` — so the two-loop reviewers can
-reproduce the verification without depending on that uncommitted `~/tmp`
-directory. Once committed, confirm the `groupkill`/`groupkill_dr` probes
-report `external-cgroup-kill`, and the `selfkill` probe continues to report
+it). **Ordering, corrected this revision (see §8):** the probe commit is
+split out and lands *before* Fix 1, not inside Fix 5's own PR, so Fix 1's
+deploy is never silently gated on Fix 5 merging first — either the probe
+Makefile itself under a repo path, or an equivalent Go test in
+`internal/runner` that writes to a confine scope's `cgroup.kill`, committed
+as its own small tests-only commit ahead of both Fix 1 and Fix 5. **Fix 5's
+PR then extends that already-committed probe** with the assertion that the
+new `terminated-by=` field reports `external-cgroup-kill` against it — so the
+two-loop reviewers can reproduce the verification without depending on an
+uncommitted `~/tmp` directory. Once committed, confirm the
+`groupkill`/`groupkill_dr` probes report `external-cgroup-kill`, and the
+`selfkill` probe continues to report
 the correct path (kernel-OOM advisory or signal-forwarding, per which probe
 targets which mechanism).
 
@@ -737,20 +771,25 @@ first, within that constraint.
    fix is net-negative lines, so proceeding is the safe default while the
    owner's answer on (b) deferral or (c) deletion is pending; if the owner
    answers (b) or (c) before Fix 3's worktree starts, that answer overrides
-   this default. **A second, narrower executor default, added this
-   revision: AIRA-78 itself is P0, and the default above only answers
-   whether Fix 3's general Tier-A work proceeds — it does not answer AIRA-78's
-   own keep-vs-delete fork, which had been left with no default, parking a P0
-   on an undated call exactly as this plan already avoids for its other
-   decision points.** Default for AIRA-78 specifically = **delete the ratchet
-   gate kind** (the narrow form of option (c) above; consistent with §0's
-   deletion preference; closes the P0 structurally rather than leaving it
-   open indefinitely). **Fallback:** if the owner wants to keep the ratchet
-   gate, apply the Fix-3 captured-subject pattern to it once a test-report
-   producer exists — the original, larger option. **Either way, Phase 0 must
-   record in AIRA-78's own ticket text why a P0 is not being built now** ("no
-   producer → latent, not live" — see the new Phase 0 row, §2) so the
-   severity is not silently ignored by a reader of the ticket alone.
+   this default. **A second, narrower point, added this revision — corrected
+   from an "executor default" framing that would have contradicted §1, §3.5
+   and §7's own "AIRA-78 is decision-only, not built" statements: AIRA-78
+   itself is P0, and the default above only answers whether Fix 3's general
+   Tier-A work proceeds — it does not answer AIRA-78's own keep-vs-delete
+   fork, which had been left unaddressed, parking a P0 with no recorded
+   reasoning at all.** **Recommended disposition, recorded on the ticket
+   (§2's new Phase 0 row), awaiting explicit owner sign-off — NOT actioned
+   anywhere in this plan's build (consistent with §1, §3.5, §7):** delete the
+   ratchet gate kind (the narrow form of option (c) above; consistent with
+   §0's deletion preference). **Fallback if the owner keeps it instead:**
+   apply the Fix-3 captured-subject pattern to it once a test-report producer
+   exists — the original, larger option. **Either way, Phase 0's ticket-text
+   commit records on AIRA-78 itself why this P0 is not being built now** ("no
+   producer → latent, not live") so the severity is not silently ignored by a
+   reader of the ticket alone — but building either the deletion or the
+   fallback remains gated on the owner's answer, exactly like AIRA-28/29 and
+   AIRA-91 Part B elsewhere in this plan, not scheduled as a default the
+   executor proceeds on.
 3. **AIRA-85's structural gap** ("nothing enforces single-writer beyond
    convention") is only partially closed by folding in the detached
    supervisor's writes (Phase 2, AIRA-85). **Correction, this revision — the
@@ -930,6 +969,15 @@ fix, §4, plus a review-checklist note).
 
 ## 8. Risks
 
+- **Fix 1's per-poll cgroupfs scan is a CPU-regression risk — added this
+  revision, promised by §3.1 but missing from here until now.** AIRA-61
+  precedent: a ~2ms O(tree) sweep on every poll produced 25–65% supervisor
+  CPU before it was fixed (`af407be`). Mitigation, per §3.1: a
+  per-outer-scope child-sum cache refreshed at most once per second,
+  invalidated only on the daemon's own create/release of a worker scope —
+  never a scan on the 200ms poll path. The PR must demonstrate the poll loop
+  performs no cgroupfs walk on the cached path (a benchmark or a test
+  asserting call count, not just a code read).
 - **Phase 1 sequencing is the load-bearing planning decision in this document.**
   If Fable finds the 1→2→4 order wrong, or finds an overlap this plan missed,
   that changes worktree assignment for the whole phase — check it first,
@@ -971,10 +1019,12 @@ fix, §4, plus a review-checklist note).
   against the synthetic repro the ticket already built**
   (`~/tmp/aira91-probe/`: `selfkill`/`groupkill`/`groupkill_dr` probes
   reproducing the real incident artifact on 12/13 trailer fields) — **not yet
-  committed to the repository as of this revision (corrected, §3.6): Fix 5's
-  PR must commit the probe (or an equivalent Go test) so this verification is
-  actually reproducible by the two-loop reviewers, not dependent on an
-  uncommitted `~/tmp` directory on one machine** — confirm the new
+  committed to the repository as of this revision. Corrected, §3.6: the probe
+  (or an equivalent Go test) is committed as its own small commit *before*
+  Fix 1, not inside Fix 5's PR**, so this verification is actually
+  reproducible by the two-loop reviewers from the start of Phase 1, not
+  dependent on an uncommitted `~/tmp` directory on one machine, and Fix 1's
+  own deploy is never silently gated on Fix 5 merging first — confirm the new
   `terminated-by=` field (§3.6) correctly reports `external-cgroup-kill`
   against the `groupkill` probe, and confirm AIRA-35's `memory.high` removal
   doesn't change the PSI profile in a way the probe can't already
@@ -1000,7 +1050,13 @@ fix, §4, plus a review-checklist note).
   unnecessarily or under-specify the protocol-bump deploy. **Policy, stated
   explicitly:** Fix 1 (§3.1) deploys on its own restart as soon as it merges
   — it closes P0 AIRA-39, and its correctness is verified against the
-  committed probe (§3.6) before that restart, not after. Fixes 2 and 4
+  committed probe before that restart, not after. **Ordering fix, added this
+  revision:** the probe commit is split out of Fix 5 and lands as its own
+  small commit (tests only, `internal/runner`) *before* Fix 1's PR, rather
+  than waiting for Fix 5 (which starts at the same time as Fix 1 and could
+  plausibly merge after it, silently gating Fix 1's deploy on an unrelated
+  fix) — Fix 5's own PR then extends that already-committed probe with the
+  `terminated-by=` assertion (§3.6). Fixes 2 and 4
   (§3.3, §3.4) deploy together as one atomic reinstall+restart (Fix 2 bumps
   the protocol version; see the dedicated bullet below). Fix 3 (store code,
   runs inside the DB-owning daemon) and Fix 5's daemon-side log line (§3.6)
