@@ -23,10 +23,18 @@ const (
 	tempPrefix         = ".tmp-"
 )
 
-// all: is load-bearing: Python packages and the extraction hygiene file begin
-// with '_' and '.', which a plain directory embed would omit.
+// A '*.py' GLOB, never 'all:' and never a bare directory (AIRA-66). go:embed's
+// '.'/'_' exclusion applies only when a pattern names a DIRECTORY and go walks
+// its subtree, so a glob matching files directly still picks up a Python
+// package's __init__.py while a bare directory embed would drop it. 'all:'
+// defeats that exclusion wholesale and thereby swept whatever untracked scratch
+// happened to be lying in the tree — __pycache__/*.pyc, .pytest_cache/v/cache/
+// lastfailed — into the shipped binary, so two developers on the same commit
+// produced different binaries. The glob declares the embedded set instead of
+// inheriting it, and TestEmbeddedTreesMatchTrackedSources holds it equal to the
+// git-tracked sources.
 //
-//go:embed all:aira_xdist_governor
+//go:embed aira_xdist_governor/*.py
 var embeddedPyLib embed.FS
 
 // ExtractPyLib publishes the embedded Python sidecar beneath a content hash.
@@ -39,11 +47,18 @@ func ExtractPyLib() (string, error) {
 	return extractPyLibFS(embeddedPyLib, embeddedRoot, dataHome)
 }
 
-// all: is load-bearing here too: aitest's own "_"/"." prefixed files (a
-// Python package's __init__.py, the extraction hygiene file) would be
-// omitted by a plain directory embed.
+// Same '*.py' glob as embeddedPyLib above, for the same reason (AIRA-66).
 //
-//go:embed all:aitest
+// Two consequences are DECIDED, not incidental:
+//   - aitest's co-located conftest.py and test_*.py stay embedded. A glob cannot
+//     exclude them from aitest/*.py, and the alternative — moving them to a
+//     tests/ subdirectory — reshapes the source-level Python test tier for a few
+//     KB. They are git-tracked, so they cost hermeticity nothing, and pytest
+//     never collects a conftest.py reached only through PYTHONPATH.
+//   - aitest/testdata/ is NOT embedded: a glob does not recurse. Those are
+//     fixtures for aitest's own source-tree test tier, never runtime inputs.
+//
+//go:embed aitest/*.py
 var embeddedAitest embed.FS
 
 // ExtractAitest publishes the embedded aitest pytest plugin beneath a
