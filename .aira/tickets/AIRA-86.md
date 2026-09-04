@@ -119,6 +119,39 @@ any single establishment site fails it, verified by mutation.
 - `U_CHECK_UNEVALUATED` is now registered in the exit-code catalog. It was
   already emitted on the cancelled-context path without being catalogued.
 
+### Build review (DeepSeek-pro, independent lineage): two confirmed, two not
+
+Both confirmed findings were real holes the establishment sites would otherwise
+have perpetuated, and each is now a regression test:
+
+- **A partly-unreadable requirement registry reported traceability `pass`.** A
+  malformed node is an `E_REQUIREMENT_INVALID` fail finding carried with no
+  dimension of its own, and only an edge that references it demoted the
+  dimension. One readable requirement plus one unreadable one that nothing
+  annotates reached the establishment arm and claimed the whole graph.
+  `checkTraceability` now records `U_TRACE_UNSCANNED` whenever any node is
+  unreadable, not only when none is readable
+  (`TestTraceabilityIsNotEstablishedWhileARequirementIsUnreadable`; the
+  byte-for-byte golden was updated deliberately, with the reason in the test).
+- **`finaliseDimensions` depended on `addFinding` to write the dimension**, and
+  `addFinding`'s unevaluated branch dedupes on (Code, Subject) and returns
+  before it touches the dimension. Unreachable today, but the one place whose
+  entire job is to never leave a dimension unset should not depend on a dedupe.
+  The dimension is now written first
+  (`TestFinaliseDimensionsWritesTheDimensionEvenWhenItsFindingIsADuplicate`).
+
+Not accepted, with reasons:
+
+- "The rollup ignores direct dimension failures" — refuted against source: all
+  nine `Dimensions["allocated-id-file"] = "fail"` sites append a finding in the
+  same block, so the verdict is `fail`.
+- "`addFinding`'s unevaluated branch overwrites a recorded `fail`" — real, and
+  inconsistent with the traceability rank system where `fail` outranks
+  `unevaluated`, but pre-existing, out of this ticket's scope, and not a false
+  pass (the verdict stays `fail` because the findings list is non-empty). Filed
+  as an observation here rather than changed under an AIRA-86 PR. Note the new
+  `unevaluateDimension` takes the opposite (fail-preserving) rule deliberately.
+
 ### Named, not fixed
 
 `test-reports` is a fifteenth dimension that materialises in the map only when a

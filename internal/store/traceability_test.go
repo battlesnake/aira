@@ -377,6 +377,12 @@ func TestTraceabilityCheckGoldenFindingsRemainByteForByte(t *testing.T) {
 		{Code: "E_TRACE_DANGLING", Subject: "implementation.go:2", Message: "covers annotation references absent requirement AR-999", Kind: "fail"},
 	}
 	wantUnevaluated := []CheckFinding{
+		// The registry itself could not be read in full (AR-2.md is malformed),
+		// which is recorded before the per-edge findings: without it a registry
+		// whose unreadable node happens to have no annotation would have
+		// reached the establishment arm and claimed a traceability pass over a
+		// graph it could only partly read (AIRA-86, build review).
+		{Code: "U_TRACE_UNSCANNED", Subject: "traceability", Message: "requirement registry contains unreadable nodes", Kind: "unevaluated"},
 		{Code: "U_TRACE_UNSCANNED", Subject: "implementation.go:2", Message: "requirement AR-2 is unreadable at .aira/requirements/AR-2.md", Kind: "unevaluated"},
 		{Code: "U_TRACE_UNSCANNED", Subject: "implementation_test.go:2", Message: "requirement AR-3 is unreadable at .aira/requirements/AR-2.md", Kind: "unevaluated"},
 		// This fixture defines no gates, and an unpopulated gate set now

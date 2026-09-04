@@ -211,6 +211,59 @@ func TestCancelledCheckReportsEveryDimensionUnevaluated(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-86
+// Build-review finding (DeepSeek, confirmed against source). A malformed
+// requirement node is reported as an E_REQUIREMENT_INVALID fail finding with no
+// dimension of its own, and the per-edge unevaluated only fires for edges that
+// reference it. A registry holding one readable requirement and one unreadable
+// one, with nothing annotating the unreadable one, therefore reached the
+// establishment arm with the malformed node never touching the dimension: the
+// scan covered part of the graph and claimed the whole of it.
+func TestTraceabilityIsNotEstablishedWhileARequirementIsUnreadable(t *testing.T) {
+	s, root := newTraceabilityStore(t)
+	addTraceRequirement(t, s, domain.RequirementBuilt) // AR-1, made unreadable below.
+	if err := os.WriteFile(filepath.Join(root, ".aira", "requirements", "AR-1.md"), []byte("bad\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	addTraceRequirement(t, s, domain.RequirementBuilt) // AR-2, fully annotated below.
+	writeTraceSource(t, root, "implementation.go", "package example\n// covers: AR-2\nfunc implementation() {}\n")
+	writeTraceSource(t, root, "implementation_test.go", "package example\n// verifies: AR-2\nfunc TestImplementation(t *testing.T) {}\n")
+
+	report := runTraceabilityCheck(t, s)
+	if report.Dimensions["traceability"] == "pass" {
+		t.Fatalf("traceability claimed a pass over a registry it could only partly read: %#v", report)
+	}
+	if report.Dimensions["traceability"] != "unevaluated" {
+		t.Fatalf("traceability dimension = %q, want unevaluated; report=%#v", report.Dimensions["traceability"], report)
+	}
+	if !hasFinding(report.Findings, "E_REQUIREMENT_INVALID") {
+		t.Fatalf("the unreadable node must still be a fail finding: %#v", report.Findings)
+	}
+	if !hasFinding(report.UnevaluatedFindings, "U_TRACE_UNSCANNED") {
+		t.Fatalf("missing the reason the dimension is unevaluated: %#v", report.UnevaluatedFindings)
+	}
+}
+
+// verifies: AIRA-86
+// Build-review finding (DeepSeek, confirmed against source). addFinding's
+// unevaluated branch dedupes on (Code, Subject) and returns before it writes
+// the dimension, so finaliseDimensions must not depend on that write: a
+// dimension left absent is read as "" by consumers such as the daemon's eject
+// durability gate, which treats "" as nothing to report.
+func TestFinaliseDimensionsWritesTheDimensionEvenWhenItsFindingIsADuplicate(t *testing.T) {
+	report := CheckReport{Verdict: "pass", Dimensions: map[string]string{}}
+	report.UnevaluatedFindings = []CheckFinding{{Code: "U_CHECK_UNEVALUATED", Subject: "gates", Message: "already recorded", Kind: "unevaluated"}}
+
+	finaliseDimensions(&report)
+
+	if report.Dimensions["gates"] != "unevaluated" {
+		t.Fatalf("gates dimension = %q, want unevaluated even though its finding deduped", report.Dimensions["gates"])
+	}
+	if !report.Unevaluated {
+		t.Fatal("the report must still be marked unevaluated")
+	}
+}
+
 // newFullyEstablishedStore builds the one project shape in which every
 // dimension has something to establish it: a git worktree with a requirement
 // registry, a built requirement that is both covered and verified, and a

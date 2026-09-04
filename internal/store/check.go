@@ -175,6 +175,11 @@ func finaliseDimensions(report *CheckReport) {
 		if _, recorded := report.Dimensions[dimension]; recorded {
 			continue
 		}
+		// The dimension is written first, independently of the finding landing:
+		// addFinding's unevaluated branch dedupes on (Code, Subject) and returns
+		// before it touches the dimension, and a dimension left absent reads as
+		// "" to consumers that treat "" as nothing to report.
+		unevaluateDimension(report, dimension)
 		addFinding(report, CheckFinding{
 			Code: "U_CHECK_UNEVALUATED", Subject: dimension,
 			Message: "no checker established this dimension", Kind: "unevaluated",

@@ -447,8 +447,19 @@ func (s *Store) checkTraceability(report *CheckReport) error {
 		addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_EMPTY", Subject: "traceability", Message: "requirement registry is empty", Kind: "unevaluated"})
 		return nil
 	}
-	if len(scan.requirements) == 0 && len(malformed) > 0 {
-		addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_UNSCANNED", Subject: "traceability", Message: "requirement registry contains no readable nodes", Kind: "unevaluated"})
+	// An unreadable requirement node is carried as an E_REQUIREMENT_INVALID
+	// fail finding with no dimension of its own, and only an edge that happens
+	// to reference it demotes the dimension. Coverage for a node nobody could
+	// read is not established either way, so the scan records that here instead
+	// of claiming the whole graph below (AIRA-86, found on build review: a
+	// registry with one readable and one unreadable node, nothing annotating
+	// the unreadable one, reported traceability pass).
+	if len(malformed) > 0 {
+		message := "requirement registry contains unreadable nodes"
+		if len(scan.requirements) == 0 {
+			message = "requirement registry contains no readable nodes"
+		}
+		addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_UNSCANNED", Subject: "traceability", Message: message, Kind: "unevaluated"})
 	}
 	if err := resolveTraceabilityEdges(report, scan.edges, scan.requirements, malformed); err != nil {
 		return err
