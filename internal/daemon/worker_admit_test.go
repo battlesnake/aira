@@ -668,6 +668,13 @@ func TestWorkerAdmitReconstructsNextWorkerIDFromExistingChildren(t *testing.T) {
 // verifies: AIRA-39 — a `.aira-worker-*` child whose suffix is NOT numeric is
 // still CHARGED (CreateWorkerScope accepts any slashless id), while it must not
 // perturb id allocation. Charging only numeric suffixes silently under-counts.
+//
+// Layer note (a mutation run made this worth spelling out): this test drives the
+// EVALUATOR through the fake tree, so it pins that the evaluator honours whatever
+// the scan charges. It does NOT reach sumWorkerScopeChildren, where the
+// charge-every-suffix decision actually lives — restricting that to numeric
+// suffixes leaves this test green. TestScanWorkerScopeChildrenSumsCappedWorkerChildrenOnly
+// (worker_scope_scan_test.go) is what kills that mutation; the two are a pair.
 func TestWorkerAdmitChargesNonNumericWorkerScopeChildren(t *testing.T) {
 	server := NewServer(Paths{})
 	tree := newWorkerScopeTree().install(server)
@@ -1120,22 +1127,30 @@ func TestWorkerAdmitGrantAlwaysScansFreshBeforeGranting(t *testing.T) {
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
 	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
 
-	// Seed the cache while the tree is empty.
-	if response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 100}); response.State != "granted" {
-		t.Fatalf("seed response=%+v", response)
-	}
-	scansAfterSeed := tree.scanCount("/outer")
-	// A worker scope appears that the cached sum knows nothing about, and whose
-	// NON-NUMERIC name cannot collide with the next id either — so EEXIST can
-	// never catch it. Only a fresh scan can.
+	// One worker already exists, and the cache is WARM and VALID for exactly it.
+	// Seeding that cache by GRANTING would not do: a grant invalidates on its
+	// way out, so the next evaluation would rescan for that reason alone and the
+	// forced scan would prove nothing. This test did seed by granting, and
+	// passed against a grant path that used the cached sum, until the mutation
+	// run caught it — so the warm state is now installed directly.
+	tree.put("/outer", workerScopeChildPrefix+"1", 100)
+	state := server.workerScopeFor("/outer")
+	state.committed, state.maxIndex, state.scanned, state.committedAt = 100, 1, true, now
+
+	// A worker scope the warm cache knows nothing about, whose NON-NUMERIC name
+	// cannot collide with the next id either — so EEXIST can never catch it.
+	// Only a forced scan on the grant path can.
 	tree.put("/outer", workerScopeChildPrefix+"external", 850)
+	scansBefore := tree.scanCount("/outer")
 
 	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 100})
 	if response.State != "denied" || response.Reason != "fallback:aggregate-cap-exceeded" {
-		t.Fatalf("response=%+v, want denied: 100(seeded)+850(external)+100 > 1000. A cached sum was used to admit", response)
+		t.Fatalf("response=%+v, want denied: 100(existing)+850(external)+100 > 1000. A cached sum was used to admit", response)
 	}
-	if got := tree.scanCount("/outer"); got <= scansAfterSeed {
-		t.Fatalf("scans=%d (was %d): the grant path did not force a fresh scan", got, scansAfterSeed)
+	// Exactly one: the contended DENIAL path must still read the cache (the
+	// AIRA-61 cadence bound), and only the grant path may force a refresh.
+	if got := tree.scanCount("/outer"); got != scansBefore+1 {
+		t.Fatalf("scans=%d (was %d), want exactly one forced scan on the grant path and none from the cached check", got, scansBefore)
 	}
 }
 
@@ -1255,18 +1270,31 @@ func TestWorkerAdmitCreatesWorkerScopeBeforeGranting(t *testing.T) {
 // committed sum saturates. The old subtractive form (`estimated >
 // ceiling-committed-supervisorUsed`) wraps positive and GRANTS.
 func TestWorkerAdmitAggregateGuardDoesNotWrapOnSaturatedCommitted(t *testing.T) {
+	// The subtractive form `estimatedBytes <= ceiling-committed-supervisorUsed`
+	// only wraps when ceiling-MaxInt64-supervisorUsed underflows past MinInt64,
+	// which needs supervisorUsed > ceiling+1. This test originally used
+	// ceiling=1000 with supervisorUsed=2, which does NOT reach that (the result
+	// is merely hugely negative, so the subtractive form denies too) — it passed
+	// against the very bug it claims to pin until a mutation run caught it.
+	// estimatedBytes must also stay <= ceiling, or the earlier
+	// reject:exceeds-ceiling branch short-circuits before the aggregate guard.
+	// var, not const: Go evaluates constant arithmetic exactly and REFUSES to
+	// compile the overflow this test is about, so the wrap has to happen at
+	// runtime the way it does in production.
+	var ceiling, supervisorUsed, requested int64 = 100, 200, 100
+	if wrapped := ceiling - int64(math.MaxInt64) - supervisorUsed; wrapped <= 0 {
+		t.Fatalf("test setup never reaches the wrap: ceiling-MaxInt64-supervisorUsed = %d, want a POSITIVE (wrapped) value, or this test cannot distinguish the two forms", wrapped)
+	}
 	server := NewServer(Paths{})
 	_ = newWorkerScopeTree().install(server)
 	server.workerAdmitHeadroom = 0
-	// ceiling = 1000, committed saturated at MaxInt64, supervisorUsed = 2:
-	// 1000 - MaxInt64 - 2 wraps to a huge positive number.
-	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, ceiling)
 	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(
-		map[string]int64{runner.WorkerScopeChildPath("/outer", "supervisor"): 2})
+		map[string]int64{runner.WorkerScopeChildPath("/outer", "supervisor"): supervisorUsed})
 	server.workerScopeScan = func(string) (workerScopeChildren, error) {
 		return workerScopeChildren{committed: math.MaxInt64, count: 1, maxIndex: 1}, nil
 	}
-	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 100})
+	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: requested})
 	if response.State != "denied" || response.Reason != "fallback:aggregate-cap-exceeded" {
 		t.Fatalf("response=%+v, want a denial: a saturated committed sum must never wrap into apparent headroom", response)
 	}
