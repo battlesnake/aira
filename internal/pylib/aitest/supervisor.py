@@ -371,6 +371,10 @@ class Supervisor:
         self._admission_too_large_warned = False
         self.items_by_nodeid = {}
         self.workers = {}
+        # Worker scopes whose rmdir failed, for a later retry. See
+        # _forget_worker_scope: AIRA-39 turned an unremoved scope from a stray
+        # empty directory into a permanent charge against this run's own budget.
+        self._unremoved_scopes = set()
         self.results = {}
         self._run_estimated_bytes = 0
         self._run_max_wait = "30s"
@@ -634,17 +638,21 @@ class Supervisor:
             # "reject:" (permanent) vs "fallback:" (transient) reason-prefix
             # convention (worker_admit.go's evaluateWorkerAdmit/
             # workerAdmitConnection: EVERY "denied" reason starting
-            # "reject:" -- exceeds-ceiling, outer-scope-owned-by-another-
-            # job, and any future one -- deliberately breaks the daemon's
-            # OWN poll loop immediately as a stable "never going to
-            # resolve" fact, exactly like exceeds-ceiling; only
-            # "fallback:"-prefixed reasons keep polling). The ownership
-            # rejection was previously left out, matched only "worker-admit
-            # denied" below, and was retried INDEFINITELY against a
-            # permanently (by design -- workerJobFor's own ownership
-            # binding is never released) impossible request, under a
-            # misleading "budget contended" warning. Scoped to "worker-admit
-            # denied" specifically, NOT "worker-admit timeout": a timeout's
+            # "reject:" -- exceeds-ceiling, worker-scope-create-failed, and
+            # any future one -- deliberately breaks the daemon's OWN poll
+            # loop immediately as a stable "never going to resolve" fact;
+            # only "fallback:"-prefixed reasons keep polling, e.g.
+            # insufficient-headroom, aggregate-cap-exceeded,
+            # admit-slots-saturated and worker-scope-id-collision).
+            #
+            # AIRA-39 note: the outer-scope-owned-by-another-job rejection
+            # this comment used to cite is GONE. The ledger now sums the
+            # outer scope's real .aira-worker-* children rather than one
+            # job's own grants, so two job ids sharing one outer scope are
+            # counted together instead of the second being refused.
+            #
+            # Scoped to "worker-admit denied" specifically, NOT
+            # "worker-admit timeout": a timeout's
             # own reason text ("reject:saturated") also contains "reject:"
             # by coincidental wording, but state=timeout means the CLIENT's
             # own wait budget merely expired -- genuinely retriable with a
@@ -752,12 +760,7 @@ class Supervisor:
             # the missing fields, so this is guarded, unlike the
             # unconditional rmdir in spawn_worker's placement-failure path
             # where "grant" is always fully well-formed by construction.
-            scope = grant.get("scope")
-            if scope:
-                try:
-                    os.rmdir(scope)
-                except OSError as exc:
-                    sys.stderr.write("aira aitest: could not remove worker scope %s: %s\n" % (scope, exc))
+            self._forget_worker_scope(grant.get("scope"))
             raise WorkerAdmitUnavailable("worker-admit malformed grant: %s" % malformed)
         return grant, process
 
@@ -884,10 +887,7 @@ class Supervisor:
             # one empty scope directory under the outer scope, and the
             # AIRA-36 reaper cannot sweep it until the whole job's
             # supervisor process is gone (>=2 minutes later).
-            try:
-                os.rmdir(grant["scope"])
-            except OSError as exc:
-                sys.stderr.write("aira aitest: could not remove worker scope %s: %s\n" % (grant["scope"], exc))
+            self._forget_worker_scope(grant["scope"])
             if ack_timed_out:
                 # A TIMEOUT is not proof the local cgroup mechanism is broken,
                 # which is exactly what WorkerPlacementFailed asserts and what
@@ -1055,11 +1055,56 @@ class Supervisor:
             _terminate_process(state["admit_process"])
         grant = state.get("grant")
         if grant is not None:
-            try:
-                os.rmdir(grant["scope"])
-            except OSError as exc:
-                sys.stderr.write("aira aitest: could not remove worker scope %s: %s\n" % (grant["scope"], exc))
+            self._forget_worker_scope(grant["scope"])
+        # An earlier retirement whose rmdir failed is still charging the ledger;
+        # this is the natural moment to try again.
+        self._sweep_unremoved_scopes()
         del self.workers[pid]
+
+    def _forget_worker_scope(self, scope):
+        """Remove one worker's cgroup scope, remembering it for retry on failure.
+
+        AIRA-39 made this load-bearing rather than best-effort. The daemon's
+        ledger is now SUM(memory.max) over the outer scope's real
+        .aira-worker-* children, so a scope that is not removed KEEPS CHARGING
+        against this run's budget for the rest of the run -- where the previous
+        in-memory ledger released the grant when the relay closed. One EBUSY (a
+        reaped worker that left a short-lived descendant behind) would otherwise
+        permanently shrink the worker budget, and in the worst case leave
+        _wait_for_admission_or_disable retrying forever against capacity that is
+        never coming back (found by Sol build-review round 2).
+        """
+        if not scope:
+            return
+        try:
+            os.rmdir(scope)
+        except FileNotFoundError:
+            self._unremoved_scopes.discard(scope)
+        except OSError as exc:
+            self._unremoved_scopes.add(scope)
+            sys.stderr.write(
+                "aira aitest: could not remove worker scope %s: %s (will retry)\n" % (scope, exc)
+            )
+        else:
+            self._unremoved_scopes.discard(scope)
+
+    def _sweep_unremoved_scopes(self):
+        """Re-attempt every removal that failed earlier.
+
+        At most a handful of rmdir calls, and called exactly where a stuck scope
+        would otherwise hurt: before retiring another worker, and on every
+        admission retry -- so a transient EBUSY self-heals into freed budget
+        instead of a permanently smaller pool or a stalled run.
+        """
+        for scope in sorted(self._unremoved_scopes):
+            try:
+                os.rmdir(scope)
+            except FileNotFoundError:
+                self._unremoved_scopes.discard(scope)
+            except OSError:
+                continue
+            else:
+                self._unremoved_scopes.discard(scope)
 
     def _wait_for_admission_or_disable(self, spawn):
         """Retries spawn() (a zero-arg callable performing one admission
@@ -1096,6 +1141,9 @@ class Supervisor:
                 self._disable_daemon(str(exc))
                 return
             attempt += 1
+            # A denial may be caused by capacity a failed rmdir is still holding.
+            # Retrying it here is what turns "retry forever" back into progress.
+            self._sweep_unremoved_scopes()
             time.sleep(_DENIAL_RETRY_SECONDS)
             if attempt % _DENIAL_WARN_EVERY == 0:
                 sys.stderr.write(

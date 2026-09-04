@@ -2523,3 +2523,67 @@ def test_env_seconds_never_disables_a_bound(monkeypatch, capsys):
     monkeypatch.delenv("AIRA_AITEST_PROBE_SECONDS")
     assert supervisor_module._env_seconds("AIRA_AITEST_PROBE_SECONDS", 7.0) == 7.0
     assert "invalid value" in capsys.readouterr().err
+
+
+def test_a_failed_worker_scope_removal_is_retried_not_charged_forever(tmp_path):
+    """AIRA-39 made an unremoved worker scope a PERMANENT charge.
+
+    The daemon's ledger is now SUM(memory.max) over the outer scope's real
+    .aira-worker-* children, so a scope whose rmdir fails keeps consuming this
+    run's budget for the rest of the run -- where the previous in-memory ledger
+    released the grant when the relay closed. _retire_worker did a ONE-SHOT
+    rmdir and only warned, so a single EBUSY (a reaped worker that left a
+    short-lived descendant behind) permanently shrank the worker pool, and in
+    the worst case left _wait_for_admission_or_disable retrying forever against
+    capacity that was never coming back. Found by Sol build-review round 2.
+    """
+    scope = tmp_path / ".aira-worker-1"
+    scope.mkdir()
+    # Non-empty, so rmdir fails with ENOTEMPTY -- standing in for the EBUSY a
+    # still-populated cgroup returns.
+    (scope / "occupant").write_text("")
+
+    supervisor = Supervisor()
+
+    class DispatchWrite:
+        def close(self):
+            pass
+
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    state = {
+        "dispatch_write": DispatchWrite(),
+        "result_fd": read_fd,
+        "admit_process": None,
+        "grant": {"scope": str(scope)},
+        "in_flight": None,
+    }
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)
+    supervisor.workers[pid] = state
+    supervisor._retire_worker(pid, state)
+
+    assert str(scope) in supervisor._unremoved_scopes, (
+        "a failed worker-scope removal must be remembered for retry: under the "
+        "tree-derived ledger it is still charging this run's own budget"
+    )
+    assert scope.exists()
+
+    # The obstruction clears (the stray descendant exits). The next sweep must
+    # actually free that budget rather than leave it charged for the whole run.
+    (scope / "occupant").unlink()
+    supervisor._sweep_unremoved_scopes()
+    assert not scope.exists(), "the retry never removed the now-empty scope"
+    assert supervisor._unremoved_scopes == set()
+
+
+def test_scope_removal_retry_gives_up_cleanly_on_a_vanished_scope(tmp_path):
+    """A scope removed by something else (the daemon's orphan reaper, or the
+    outer job's own teardown) must drop out of the retry set rather than
+    accumulate in it for the life of the run."""
+    scope = tmp_path / ".aira-worker-2"
+    supervisor = Supervisor()
+    supervisor._unremoved_scopes.add(str(scope))
+    supervisor._sweep_unremoved_scopes()
+    assert supervisor._unremoved_scopes == set()

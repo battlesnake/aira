@@ -27,12 +27,17 @@ const (
 	// other places; over-ceiling requests are now refused and told the bound.
 	admitWaitCeilingMs = int64(runner.AdmitWaitCeiling / time.Millisecond)
 	// workerAdmitWaitCeilingMs deliberately stays at 30 minutes rather than
-	// adopting the shared ceiling. admitConnection is gated by admitSlots
-	// (admitGlobalMax), but workerAdmitConnection is NOT gated at all and holds a
-	// connection plus a polling goroutine for the whole wait, so a 24h ceiling
-	// there would permit unbounded concurrent retained connections. Its only
-	// caller, the aitest supervisor, uses waits two orders of magnitude smaller.
-	// Do not "unify" these without first bounding worker-admit's concurrency.
+	// adopting the shared ceiling. AIRA-63 has now given workerAdmitConnection
+	// the same admitSlots bound admitConnection has, so the ORIGINAL reason for
+	// the split ("worker-admit is not gated at all, and a 24h ceiling would
+	// permit unbounded concurrent retained connections") no longer holds — but
+	// unifying the two ceilings is deliberately NOT part of that fix. Raising
+	// worker-admit's ceiling 48x changes how long a saturated aitest run may sit
+	// holding shared admission slots that ordinary `aira confine` admission also
+	// draws from, which needs its own sizing decision rather than riding along
+	// with a ledger change. Its only caller, the aitest supervisor, uses waits
+	// two orders of magnitude smaller either way. Revisit deliberately, in its
+	// own change, not as a "consistency" refactor.
 	workerAdmitWaitCeilingMs            int64 = 30 * 60 * 1000
 	admitMaxWaiters                           = 256
 	admitGlobalMax                            = 1024
@@ -629,7 +634,14 @@ func (s *Server) cachedAdmitPeakP90(ctx context.Context) (int64, bool) {
 	return peak, ok
 }
 
-func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
+// acquireAdmitSlot takes one of the admitGlobalMax concurrency slots, or
+// reports false when they are all held. Shared by admitConnection and (since
+// AIRA-63) workerAdmitConnection, which previously had no bound at all —
+// factored out rather than duplicated so the two paths can never drift on
+// which of them is bounded. Each caller renders saturation in ITS OWN client's
+// vocabulary: admit answers CodeBusy, worker-admit answers a retriable
+// "denied" (see workerAdmitConnection for why an error frame is unsafe there).
+func (s *Server) acquireAdmitSlot() bool {
 	if s.admitSlots == nil {
 		s.admitRegistryMu.Lock()
 		if s.admitSlots == nil {
@@ -639,11 +651,20 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 	}
 	select {
 	case s.admitSlots <- struct{}{}:
-		defer func() { <-s.admitSlots }()
+		return true
 	default:
+		return false
+	}
+}
+
+func (s *Server) releaseAdmitSlot() { <-s.admitSlots }
+
+func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
+	if !s.acquireAdmitSlot() {
 		s.writeAdmitError(conn, CodeBusy, CodeBusy+": too many concurrent admission requests")
 		return
 	}
+	defer s.releaseAdmitSlot()
 
 	request, err := validateAdmitArgs(args, admitWaitCeilingMs)
 	if err != nil {

@@ -17,8 +17,19 @@ import (
 	"aira/internal/store"
 )
 
+// ProtocolVersion 6 (was 5): AIRA-39 moved aitest worker-scope CREATION from
+// the CLI into the daemon. The JSON shape of WorkerAdmitResponse is unchanged,
+// but its SEMANTICS are not, and both mixed-version directions lose
+// containment SILENTLY: an old client against a new daemon re-creates the
+// already-created scope, gets EEXIST, prints "local-placement-failed", and
+// supervisor.py's _disable_daemon then runs the whole suite UNCONFINED; a new
+// client against an old daemon finds no scope at all and reaches the same
+// fallback. A version mismatch instead answers E_DAEMON_PROTOCOL, which
+// supervisor.py treats as terminal and reports unevaluated — loud, per this
+// project's own honesty rule. Bumping this REQUIRES an atomic reinstall of the
+// PATH binary alongside the daemon restart.
 const (
-	ProtocolVersion = 5
+	ProtocolVersion = 6
 	MaxFrameBytes   = 16 << 20
 	StoreOpBodyMax  = uint64(store.StoreOpBodyMax)
 )

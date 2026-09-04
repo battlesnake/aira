@@ -494,9 +494,12 @@ func TestNewerClientReplacesOlderProtocolDaemon(t *testing.T) {
 	}
 }
 
-func TestProtocolFiveComputeGitContextStoreOpReplacesLiveProtocolFourDaemon(t *testing.T) {
-	if daemon.ProtocolVersion != 5 {
-		t.Fatalf("protocol=%d want=5", daemon.ProtocolVersion)
+func TestProtocolSixComputeGitContextStoreOpReplacesLiveOlderDaemon(t *testing.T) {
+	// AIRA-39 bumped this 5 -> 6 (daemon-side worker-scope creation changes wire
+	// semantics without changing wire shape); the replacement behaviour under
+	// test is the same for any older protocol.
+	if daemon.ProtocolVersion != 6 {
+		t.Fatalf("protocol=%d want=6", daemon.ProtocolVersion)
 	}
 	dispatcher := autoStartDispatcher(t)
 	older := startProtocolDaemonProcess(t)
@@ -516,7 +519,7 @@ func TestProtocolFiveComputeGitContextStoreOpReplacesLiveProtocolFourDaemon(t *t
 		if exchanges.Add(1) == 1 {
 			return daemon.ResponseFrame{Proto: 4, Code: daemon.CodeProtocol, Error: daemon.CodeProtocol + ": protocol-4 daemon"}, nil
 		}
-		return daemon.ResponseFrame{Proto: 5, OK: true, Code: "OK"}, nil
+		return daemon.ResponseFrame{Proto: daemon.ProtocolVersion, OK: true, Code: "OK"}, nil
 	}
 	response, err := dispatcher.exchangeWithReplacement(context.Background(), func(ctx context.Context) (daemon.ResponseFrame, error) {
 		return dispatcher.exchangeOrStartStoreOp(ctx, frame)

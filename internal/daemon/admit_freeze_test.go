@@ -442,16 +442,19 @@ func TestValidateAdmitArgsRefusesOverCeilingWaitAndNamesTheCeiling(t *testing.T)
 	}
 }
 
-// verifies: AIRA-58 — the daemon and worker-admit ceilings are deliberately
-// DIFFERENT, and worker-admit's is the smaller one. workerAdmitConnection has no
-// admitSlots gate, so raising it to the shared 24h ceiling would permit unbounded
-// concurrent retained connections. A later "consistency" refactor must fail here.
+// verifies: AIRA-58/AIRA-63 — the daemon and worker-admit ceilings are
+// deliberately DIFFERENT, and worker-admit's is the smaller one. AIRA-63 has
+// given worker-admit the admitSlots bound it lacked, so the ceilings COULD now
+// be unified — but that is deliberately left to its own change: raising
+// worker-admit's ceiling 48x changes how long a saturated aitest run may hold
+// slots that ordinary admission also draws from. A "consistency" refactor that
+// unifies them as a side effect must still fail here.
 func TestWorkerAdmitCeilingStaysBelowTheSharedAdmitCeiling(t *testing.T) {
 	if workerAdmitWaitCeilingMs >= admitWaitCeilingMs {
-		t.Fatalf("worker-admit ceiling %d must stay below the shared admit ceiling %d: worker-admit has no concurrency bound", workerAdmitWaitCeilingMs, admitWaitCeilingMs)
+		t.Fatalf("worker-admit ceiling %d must stay below the shared admit ceiling %d until the unification is made deliberately", workerAdmitWaitCeilingMs, admitWaitCeilingMs)
 	}
 	if workerAdmitWaitCeilingMs != int64(30*time.Minute/time.Millisecond) {
-		t.Fatalf("worker-admit ceiling = %d ms, want 30m until worker-admit is given a concurrency bound", workerAdmitWaitCeilingMs)
+		t.Fatalf("worker-admit ceiling = %d ms, want 30m until the ceilings are unified in their own change", workerAdmitWaitCeilingMs)
 	}
 }
 

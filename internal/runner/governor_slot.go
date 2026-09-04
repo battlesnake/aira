@@ -168,7 +168,11 @@ func connectGovernor(ctx context.Context, req GovernorSlotRequest, uuid string, 
 		Verb string         `json:"verb"`
 		Args map[string]any `json:"args"`
 	}{Verb: "governor", Args: map[string]any{}}
-	if err := writeGovernorFrame(conn, governorWireRequest{Proto: 5, Scope: map[string]any{}, Request: request}); err != nil {
+	// DaemonProtocolVersion, never a literal: this was hand-written as `5` and
+	// would have silently mismatched the daemon the moment ProtocolVersion moved
+	// (found while bumping it for AIRA-39). It is the same hand-copied-constant
+	// class AIRA-83 item 3 pinned for DaemonProtocolVersion itself.
+	if err := writeGovernorFrame(conn, governorWireRequest{Proto: DaemonProtocolVersion, Scope: map[string]any{}, Request: request}); err != nil {
 		return fail(err)
 	}
 	if err := writeGovernorFrame(conn, governorWireRequest{Type: "acquire", WorkerUUID: uuid, JobID: req.JobID, Slice: req.Slice}); err != nil {
