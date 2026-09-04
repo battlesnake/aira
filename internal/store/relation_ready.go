@@ -594,6 +594,7 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 		// is more machinery than this honesty gap justifies. Recorded as an
 		// accepted gap, not silently dropped: a project whose gates were deleted
 		// after recording results is surfaced but not held.
+		//
 		// Attached only to records that are still READY. Those are the ones
 		// making the claim this ticket is about — "ready: true" with no gate
 		// signal, where "nothing was checked" reads as "nothing is wrong". A

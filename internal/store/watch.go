@@ -28,9 +28,17 @@ import (
 // AIRA-75 filed this as "voiding the journal's gap-detection". Re-verified: no
 // gap-detection over `events.seq` exists to void — nothing in this package reads
 // seq contiguity, and the journal is keyed by (project, seq) lookups
-// (journalEventFor), never by "every seq must be present". So the seq these rows
-// consume costs nothing beyond a number, and the invariant to keep is the honest
-// one stated here: watchdog rows are watch-visible and never journaled.
+// (journalEventFor), never by "every seq must be present".
+//
+// KNOWN OPEN CONSEQUENCE, and NOT the one the ticket named (build-review, Sol):
+// the seq is still not free. Rebuild reconstructs `event_counters.next_seq` from
+// the receipts and journal alone, and these rows appear in neither — so after a
+// database loss their sequence numbers are forgotten and REISSUED to new events,
+// and an `aira watch` consumer resuming from its old cursor (`seq > from`)
+// silently skips them. The fix is for Rebuild to take its high-water mark from
+// the events table's own MAX(seq) as well; that is crash-recovery semantics and
+// is tracked on AIRA-75 rather than bolted on here. An earlier version of this
+// comment claimed the seq "costs nothing beyond a number" — that is retracted.
 //
 // Measured on this machine, 2026-09-04: 245 of this project's 541 events (45.3%)
 // are journaled=0, and every one of them is an `aira-watchdog` actor row
