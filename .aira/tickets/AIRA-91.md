@@ -236,3 +236,17 @@ practical conclusion: no XML for that run.)
 PR #19 fixes AIRA-92's reproduced defect (unbounded blocking reads on the dispatch
 loop). That may reduce AIRA-91's exposure if the two share a stall, but **AIRA-91
 should not be closed by that PR** — its root cause is still open.
+
+### Candidate 1 (tee/PIPESTATUS harness artifact) ruled out for qual's own repros (2026-09-04)
+
+qual confirmed their `merge_gate.sh` `run_suite` uses `(eval "$cmd") >"$log" 2>&1`
+with `rc=$?` capturing the subshell's own exit directly — no `tee`, no pipe
+anywhere in the chain. Their standalone ad-hoc repros (`aira confine
+--delegate-ram -- make test-services > log 2>&1 &`) are the same: direct `>`,
+no pipe. So the observed `rc=0` on qual's three repros is genuinely pytest's
+(or aitest's) own reported exit status, not a harness-piping artifact — still
+worth checking for *other* callers' harnesses in general, but eliminated as
+the explanation for the evidence this ticket is actually built on. Narrows
+the remaining live candidates to: the daemon-restart-mid-run
+whole-tree-OOM hypothesis (needs `journalctl` correlation against exact
+incident timestamps), and whatever else a fresh investigation surfaces.
