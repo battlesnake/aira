@@ -335,13 +335,18 @@ func claudeDescendants(procs map[int]watchdogProc) map[int]bool {
 	return seen
 }
 
+// selectOffender applies the four-predicate false-positive guard. Uncapped is
+// decided solely by classifyWatchdogCgroup's ancestry walk: an AIRA-created
+// scope used to be force-exempted here on the assumption that every such scope
+// is self-capped, which is not true (AIRA-16) — a genuinely uncapped one is the
+// offender, not an exception.
 func selectOffender(procs map[int]watchdogProc, minRSS int64, daemonPID int, daemonCgroup string) (*watchdogProc, map[int]watchdogPredicates) {
 	descendants := claudeDescendants(procs)
 	verdicts := make(map[int]watchdogPredicates, len(procs))
 	var selected *watchdogProc
 	for pid, proc := range procs {
 		verdict := watchdogPredicates{
-			Uncapped:          proc.cgroup.uncapped && !hasAIRAComponent(proc.cgroup.path),
+			Uncapped:          proc.cgroup.uncapped,
 			AgentAttributable: descendants[pid],
 			Heavy:             proc.rss >= minRSS,
 			NotProtected:      !watchdogProtected(pid, proc.cgroup.path, daemonPID, daemonCgroup),
@@ -392,9 +397,9 @@ func handleArmed(ctx context.Context, mode watchdogMode, deps watchdogDeps, psi 
 	}
 	defer release()
 	// offenderSubtree establishes ancestry only. Before every signal below,
-	// revalidateWatchdogTarget freshly re-checks the safety predicates (cgroup,
-	// AIRA/protected status, and process identity) for each target. The remaining
-	// revalidate-to-signal gap is unavoidable and deliberately kept minimal.
+	// revalidateWatchdogTarget freshly re-checks the safety predicates (still
+	// uncapped, still not protected, and process identity) for each target. The
+	// remaining revalidate-to-signal gap is unavoidable and deliberately kept minimal.
 	targets := offenderSubtree(procs, offender.pid)
 	type openedTarget struct {
 		proc watchdogProc
@@ -550,7 +555,7 @@ func revalidateWatchdogTarget(proc watchdogProc, deps watchdogDeps) (bool, strin
 	if !ok {
 		return false, "cgroup:" + reason
 	}
-	if !cgroup.uncapped || hasAIRAComponent(cgroup.path) {
+	if !cgroup.uncapped {
 		return false, "cgroup-now-capped"
 	}
 	if watchdogProtected(proc.pid, cgroup.path, deps.daemonPID, deps.daemonCgroup) {
@@ -591,15 +596,6 @@ func watchdogProtected(pid int, cgroup string, daemonPID int, daemonCgroup strin
 	}
 	for _, component := range strings.Split(filepath.Clean(cgroup), string(filepath.Separator)) {
 		if component == "system.slice" || component == "init.scope" {
-			return true
-		}
-	}
-	return false
-}
-
-func hasAIRAComponent(cgroup string) bool {
-	for _, component := range strings.Split(filepath.Clean(cgroup), string(filepath.Separator)) {
-		if strings.HasPrefix(component, ".aira-") {
 			return true
 		}
 	}
@@ -817,14 +813,24 @@ func watchdogCgroupForPID(pid int, mount string, mountErr error) (watchdogCgroup
 		if rel == "" || !strings.HasPrefix(rel, "/") {
 			return watchdogCgroup{}, false, "parse-error"
 		}
-		path := filepath.Join(mount, strings.TrimPrefix(rel, "/"))
-		_, finite, evaluated := effectiveWatchdogCapEvaluated(mount, path)
-		if !evaluated {
-			return watchdogCgroup{path: rel}, false, "memory-max-unevaluated"
-		}
-		return watchdogCgroup{path: rel, uncapped: !finite && !hasAIRAComponent(rel)}, true, ""
+		return classifyWatchdogCgroup(mount, rel)
 	}
 	return watchdogCgroup{}, false, "unified-cgroup-absent"
+}
+
+// classifyWatchdogCgroup decides the one load-bearing safety fact about a
+// cgroup relpath: whether it is UNCAPPED, i.e. has no finite `memory.max`
+// anywhere in its ancestry up to the cgroup2 mount root. Capping is the only
+// exemption. Bounded work — whatever slice or scope bounds it — cannot drive
+// the host to OOM, so it is never this watchdog's victim; unbounded work is,
+// whoever created the cgroup.
+func classifyWatchdogCgroup(mount, rel string) (watchdogCgroup, bool, string) {
+	path := filepath.Join(mount, strings.TrimPrefix(rel, "/"))
+	_, finite, evaluated := effectiveWatchdogCapEvaluated(mount, path)
+	if !evaluated {
+		return watchdogCgroup{path: rel}, false, "memory-max-unevaluated"
+	}
+	return watchdogCgroup{path: rel, uncapped: !finite}, true, ""
 }
 
 func effectiveWatchdogCapFrom(mount, path string) (int64, bool) {

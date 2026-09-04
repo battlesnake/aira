@@ -101,6 +101,30 @@ A candidate is killed only if it satisfies EVERY one of:
    work is already bounded and **cannot drive host-OOM**, so it is NEVER a victim.
    Only genuinely uncapped heavy work qualifies. (This closes the §0 threat model:
    "work inside a capped slice/scope is not this watchdog's job.")
+
+   **Amendment 2026-09-05 (AIRA-16, first half) — the `.aira-` clause is DELETED;
+   the finite-ancestor test is the whole predicate.** The `AND no /.aira-
+   component` conjunct was an extra exemption resting on an assumption AIRA-15
+   disproved: that every AIRA-created scope is self-capped. It is not. `aira run`
+   creates `.aira-<id>` scopes in the caller's ambient cgroup with **no
+   finite-cap precondition** (`runner_linux.go:966`; `--memory-max` is optional),
+   and confine's non-delegate unpinned-reserve fallback is *deliberately* left
+   uncapped (`confine_linux.go:662`). So a heavy agent runaway in an uncapped
+   AIRA scope was **blanket-exempt from the killer**, which is the opposite of
+   the intent. Post-amendment, capping is the ONLY exemption and it is decided
+   solely by the ancestry walk, so nothing above changes for a scope that IS
+   bounded: an `aira confine` job under `aira.slice` (a finite cap is a launch
+   precondition, `confine_linux.go:1476`) and aitest's deliberately-uncapped
+   `.aira-supervisor` / `.aira-worker-*` children of a capped outer scope
+   (`worker_admit.go:74`) all still classify capped, via the finite ancestor —
+   never via their name. The v1 warning above stands unchanged and is in fact
+   the same rule read the other way: cgroup NAMES never decide this predicate,
+   in either direction. The **second** half of AIRA-16 (a slice-internal
+   pressure trigger, so the watchdog is not blind to an `aira.slice`-internal
+   OOM while the host still has headroom) is NOT built by this amendment: it is
+   deferred to the AIRA-91 Part B owner decision — who kills what under
+   slice-internal pressure, `systemd-oomd` or this watchdog — since building one
+   answer here would pre-empt that decision.
 2. **Agent-attributable** — it is a BFS descendant of a process whose `comm=="claude"`
    (exact match on `/proc/<pid>/status` `Name:`), EXCLUDING the claude procs
    themselves. This is the blast-radius guard: a browser/IDE/user-session process is
@@ -255,7 +279,8 @@ events tail, not just `log.Printf`. A failed non-ESRCH kill is recorded as a fai
   unreadable resets; **LATCH after acting** — a SECOND sustained window while still
   unrecovered must NOT re-kill; re-arm only after a genuine recovery — Fable MUST-FIX);
   the four-predicate offender selection (each predicate independently gates — a
-  **capped [`.aira-` OR finite-`memory.max`-ancestor]** / non-agent / light / protected
+  **capped [finite-`memory.max`-ancestor; the `.aira-` disjunct is deleted per §2's
+  AIRA-16 amendment]** / non-agent / light / protected
   candidate is NEVER selected; none-qualifies → defer); mode gating (off = no-op,
   observe = WOULD-kill-no-signal, enforce = kill); the audit event content. Each proven
   RED against the wrong impl (both directions).
