@@ -1434,6 +1434,16 @@ func forwardConfineSignals(forward <-chan os.Signal, process func() *os.Process,
 				if !ok {
 					return
 				}
+				// Go's select picks at random among ready cases, so a still-hot
+				// signal channel could otherwise keep winning over a closed
+				// `done` and stretch the join out indefinitely. Checking `done`
+				// first bounds it: once stop has been called, at most this one
+				// already-dequeued signal is handled.
+				select {
+				case <-done:
+					return
+				default:
+				}
 				if onSignal != nil {
 					onSignal(received)
 				}
@@ -1487,27 +1497,39 @@ func waitConfineCommand(cmd *exec.Cmd) (int, confineTermination) {
 // docs/superpowers/plans/2026-09-05-aira70-91a-terminated-by-trailer-plan.md
 // section 3.2; the short form:
 //
-//  1. no decoded wait status                     -> unevaluated
-//  2. SIGKILLed and oom_kill readable and >0      -> oom
-//  3. this supervisor was signalled               -> supervisor-signal:<NAME>
-//  4. not signalled                               -> normal
-//  5. signal is not SIGKILL                       -> child-signal:<NAME>
-//  6. oom_kill not readable                       -> unevaluated
-//  7. SIGKILL with oom_kill == 0                  -> unattributed-sigkill
+//  1. no decoded wait status                        -> unevaluated
+//  2. SIGKILLed and LOCAL oom_kill readable and >0   -> oom
+//  3. this supervisor was signalled                  -> supervisor-signal:<NAME>
+//  4. not signalled                                  -> normal
+//  5. signal is not SIGKILL                          -> child-signal:<NAME>
+//  6. local oom_kill not readable                    -> unevaluated
+//  7. SIGKILL with local oom_kill == 0               -> unattributed-sigkill
 //
-// Step 2 requires the child to have been killed BY SIGKILL SPECIFICALLY,
-// because memcg events propagate UPWARD: a descendant cgroup the job made
-// inside its own scope, OOM-killed at its own limit, raises this scope's
-// counter while our own leader dies of something else entirely -- or exits
-// perfectly normally. The OOM killer, and memory.oom.group with it, deliver
-// SIGKILL and nothing else, so requiring SIGKILL keeps a leader that died of
-// SIGTERM from being relabelled by a descendant's OOM (build-review P1).
+// Step 2 rests on TWO independent guards, both added by build review, because
+// memcg events propagate UPWARD and this project's own aitest worker scopes are
+// exactly the descendant cgroups that exploit that:
+//
+//   - It reads memory.events.LOCAL, not the hierarchical memory.events. A
+//     worker sub-cgroup OOM-killed at its own cap raises the hierarchical
+//     counter on this scope while this scope's leader is untouched; the local
+//     counter stays at zero for that, and rises only for an OOM at THIS
+//     scope's own limit. Measured, not assumed --
+//     TestMemoryEventsLocalDistinguishesOwnLimitFromDescendantOOM pins all
+//     three shapes against real cgroups.
+//   - It requires SIGKILL specifically. The OOM killer, and memory.oom.group
+//     with it, deliver SIGKILL and nothing else, so a leader that died of
+//     SIGTERM was not OOM-killed whatever any counter says.
+//
 // Step 2 precedes step 3 because cgroup.kill -- which is how our own cleanup()
 // tears a job down -- never increments oom_kill, so a positive counter can
 // never be our doing. Step 3 precedes step 4 because a child may CATCH the
 // forwarded SIGTERM and exit non-signalled; the operator's Ctrl-C still ended
 // it. Steps 5 and 6 precede step 7 so that a crashing child and an unreadable
 // counter are never swept into AIRA-91's bucket.
+//
+// The HIERARCHICAL counter is deliberately left to formatConfineReserveAdvisory
+// and the peak-RSS report, which ask a different question -- "did anything
+// under this scope hit a memory wall" -- and are unchanged by this fix.
 //
 // supervisorSignal must be a snapshot taken immediately after the wait returned
 // (see confineWithDeps): the handler stays live through the post-run teardown,
@@ -1518,9 +1540,9 @@ func classifyConfineTermination(term confineTermination, usage cgroupUsage, supe
 	if !term.Decoded {
 		return ConfineTerminatedUnevaluated
 	}
-	oomEvaluated := usage.OOMKill != nil
+	oomEvaluated := usage.OOMKillLocal != nil
 	killed := term.Signaled && term.Signal == syscall.SIGKILL
-	if killed && oomEvaluated && *usage.OOMKill > 0 {
+	if killed && oomEvaluated && *usage.OOMKillLocal > 0 {
 		return ConfineTerminatedOOM
 	}
 	if supervisorSignal != nil {

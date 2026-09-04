@@ -27,7 +27,17 @@ func TestClassifyConfineTermination(t *testing.T) {
 		return confineTermination{Decoded: true, Signaled: true, Signal: sig}
 	}
 	exited := confineTermination{Decoded: true}
-	readable := func(count int64) cgroupUsage { return cgroupUsage{OOMKill: int64ptr(count)} }
+	// Both counters set together, EXCEPT where a row deliberately separates them:
+	// the classifier reads memory.events.LOCAL, and the descendant rows below
+	// pin that it ignores the hierarchical one.
+	readable := func(count int64) cgroupUsage {
+		return cgroupUsage{OOMKill: int64ptr(count), OOMKillLocal: int64ptr(count)}
+	}
+	// descendantOOM is the shape a worker sub-cgroup OOM-killed at ITS OWN cap
+	// leaves on this scope: the hierarchical counter rises, the local one does
+	// not. Measured against real cgroups by
+	// TestMemoryEventsLocalDistinguishesOwnLimitFromDescendantOOM.
+	descendantOOM := cgroupUsage{OOMKill: int64ptr(2), OOMKillLocal: int64ptr(0)}
 	unreadable := cgroupUsage{}
 
 	for _, test := range []struct {
@@ -59,14 +69,24 @@ func TestClassifyConfineTermination(t *testing.T) {
 			why:  "branch 2 requires a kill: memcg events propagate UPWARD, so a child cgroup's OOM shows on our counter while our leader exits normally",
 		},
 		{
-			name: "a SIGTERMed leader is never relabelled by a descendant's OOM", term: signalled(syscall.SIGTERM), usage: readable(3),
+			name: "a SIGTERMed leader is never relabelled by an OOM at our own limit", term: signalled(syscall.SIGTERM), usage: readable(3),
 			want: "child-signal:SIGTERM",
-			why:  "branch 2 requires SIGKILL: the OOM killer and memory.oom.group deliver SIGKILL and nothing else, so a SIGTERMed leader was not OOM-killed no matter what a descendant did to the counter (build-review P1)",
+			why:  "branch 2 requires SIGKILL: the OOM killer and memory.oom.group deliver SIGKILL and nothing else, so a SIGTERMed leader was not OOM-killed no matter what the counter says (build-review round 1, P1)",
 		},
 		{
-			name: "a supervisor signal outranks a descendant's OOM on a non-SIGKILL death", term: signalled(syscall.SIGTERM), usage: readable(3), supervisor: syscall.SIGTERM,
+			name: "a supervisor signal outranks an OOM counter on a non-SIGKILL death", term: signalled(syscall.SIGTERM), usage: readable(3), supervisor: syscall.SIGTERM,
 			want: "supervisor-signal:SIGTERM",
 			why:  "branch 3: with branch 2 correctly gated on SIGKILL, our own witnessed teardown is what reaches the operator",
+		},
+		{
+			name: "an EXTERNAL SIGKILL is not relabelled by a descendant cgroup's OOM", term: signalled(syscall.SIGKILL), usage: descendantOOM,
+			want: "unattributed-sigkill",
+			why:  "branch 2 reads memory.events.LOCAL: a worker sub-cgroup killed at its own cap raises this scope's HIERARCHICAL counter, and reading that one would report a systemd-oomd kill as a kernel OOM -- in exactly the aitest worker-scope configuration AIRA-91 investigated (build-review round 2, P0)",
+		},
+		{
+			name: "a descendant cgroup's OOM does not relabel a clean exit either", term: exited, usage: descendantOOM,
+			want: "normal",
+			why:  "branch 4: the leader exited; a worker's OOM is a different fact, and the reserve advisory still speaks for it",
 		},
 		{
 			name: "supervisor signal wins over a caught-and-exited child", term: exited, usage: readable(0), supervisor: syscall.SIGTERM,
@@ -191,19 +211,34 @@ func TestConfineTrailerReportsTerminationFacet(t *testing.T) {
 		want       string
 		candidates bool
 	}{
-		{name: "clean exit", argv: []string{"/bin/true"}, usage: cgroupUsage{OOMKill: int64ptr(0)}, want: "terminated-by=normal"},
-		{name: "non-zero exit is still normal", argv: []string{"/bin/false"}, usage: cgroupUsage{OOMKill: int64ptr(0)}, want: "terminated-by=normal"},
+		{name: "clean exit", argv: []string{"/bin/true"}, usage: cgroupUsage{OOMKill: int64ptr(0), OOMKillLocal: int64ptr(0)}, want: "terminated-by=normal"},
+		{name: "non-zero exit is still normal", argv: []string{"/bin/false"}, usage: cgroupUsage{OOMKill: int64ptr(0), OOMKillLocal: int64ptr(0)}, want: "terminated-by=normal"},
 		{
 			name: "crashing child", argv: []string{"/bin/sh", "-c", "kill -s USR1 $$"},
-			usage: cgroupUsage{OOMKill: int64ptr(0)}, want: "terminated-by=child-signal:SIGUSR1",
+			usage: cgroupUsage{OOMKill: int64ptr(0), OOMKillLocal: int64ptr(0)}, want: "terminated-by=child-signal:SIGUSR1",
 		},
 		{
 			name: "SIGKILL with a readable zero counter", argv: selfKill,
-			usage: cgroupUsage{OOMKill: int64ptr(0)}, want: "terminated-by=unattributed-sigkill", candidates: true,
+			usage: cgroupUsage{OOMKill: int64ptr(0), OOMKillLocal: int64ptr(0)}, want: "terminated-by=unattributed-sigkill", candidates: true,
 		},
 		{
 			name: "SIGKILL with an unreadable counter", argv: selfKill,
 			usage: cgroupUsage{}, want: "terminated-by=unevaluated",
+		},
+		{
+			// The whole trailer, end to end, for the AIRA-91 shape that the
+			// hierarchical counter used to mislabel: a worker sub-cgroup OOMed
+			// at its own cap, and then the WHOLE scope was killed from outside.
+			name: "SIGKILL alongside a descendant cgroup's OOM", argv: selfKill,
+			usage: cgroupUsage{OOMKill: int64ptr(2), OOMKillLocal: int64ptr(0)},
+			want:  "terminated-by=unattributed-sigkill", candidates: true,
+		},
+		{
+			// And the reverse: an OOM at this scope's OWN limit still reads as
+			// an OOM, so the local-counter gate did not simply disable branch 2.
+			name: "SIGKILL with an OOM at our own limit", argv: selfKill,
+			usage: cgroupUsage{OOMKill: int64ptr(1), OOMKillLocal: int64ptr(1)},
+			want:  "terminated-by=oom",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -226,7 +261,7 @@ func TestConfineTrailerReportsTerminationFacet(t *testing.T) {
 // (which propagates up onto our counter) must not relabel a clean exit.
 func TestConfineTrailerReportsOOM(t *testing.T) {
 	t.Run("uncapped OOM is no longer silent", func(t *testing.T) {
-		trailer := confineTrailer(t, []string{"/bin/sh", "-c", "kill -s KILL $$"}, cgroupUsage{OOMKill: int64ptr(1)}, 0)
+		trailer := confineTrailer(t, []string{"/bin/sh", "-c", "kill -s KILL $$"}, cgroupUsage{OOMKill: int64ptr(1), OOMKillLocal: int64ptr(1)}, 0)
 		if !strings.Contains(trailer, "terminated-by=oom") {
 			t.Fatalf("trailer %q lacks terminated-by=oom", trailer)
 		}
@@ -241,14 +276,14 @@ func TestConfineTrailerReportsOOM(t *testing.T) {
 		}
 	})
 	t.Run("a descendant OOM does not relabel a clean exit", func(t *testing.T) {
-		trailer := confineTrailer(t, []string{"/bin/true"}, cgroupUsage{OOMKill: int64ptr(1)}, 0)
+		trailer := confineTrailer(t, []string{"/bin/true"}, cgroupUsage{OOMKill: int64ptr(1), OOMKillLocal: int64ptr(1)}, 0)
 		if !strings.Contains(trailer, "terminated-by=normal") {
 			t.Fatalf("trailer %q lacks terminated-by=normal", trailer)
 		}
 	})
 	t.Run("a capped OOM still gets the reserve advisory", func(t *testing.T) {
 		trailer := confineTrailer(t, []string{"/bin/sh", "-c", "kill -s KILL $$"},
-			cgroupUsage{OOMKill: int64ptr(1), PeakRSS: int64ptr(31 << 20)}, 32<<20)
+			cgroupUsage{OOMKill: int64ptr(1), OOMKillLocal: int64ptr(1), PeakRSS: int64ptr(31 << 20)}, 32<<20)
 		if !strings.Contains(trailer, "terminated-by=oom") || !strings.Contains(trailer, "OOM-killed at its memory cap") {
 			t.Fatalf("capped OOM lost a line: %q", trailer)
 		}

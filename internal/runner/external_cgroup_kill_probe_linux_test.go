@@ -220,7 +220,23 @@ func TestExternalCgroupKillProducesNoOOMAdvisory(t *testing.T) {
 // `unattributed-sigkill` and the run is no longer indistinguishable from a
 // clean one. This is Fix 5's reviewer-reproducible verification: it drives the
 // production classifier from the production wait status and the production
-// memory.events counter, not from a fixture.
+// memory.events counters, not from a fixture.
+//
+// COVERAGE SPLIT, written down rather than left implicit (build-review round 2,
+// P2). This test cannot run the whole of confineWithDeps, because a real
+// external cgroup kill needs a real scope while confineWithDeps' unit harness
+// substitutes a fake one. So the verification is deliberately in two halves:
+//
+//   - THIS test proves the MECHANISM and the CLASSIFICATION against real
+//     kernel state -- a real cgroup.kill, real memory.events(.local).
+//   - TestConfineTrailerReportsTerminationFacet proves the WIRING: it runs a
+//     real child all the way through confineWithDeps and asserts the facet and
+//     the candidates line appear in the diagnostics it actually printed, for
+//     this same SIGKILL-with-zero-local-counter shape.
+//
+// Neither half alone is sufficient, and a change that breaks the join between
+// them (a confineWithDeps that stopped assigning Status.TerminatedBy) fails the
+// second, which the mutation set confirms.
 func TestExternalCgroupKillIsReportedOnTheTrailer(t *testing.T) {
 	const scopeMemoryMax = 128 << 20
 	status, usage, scope := externalCgroupKillProbe(t, scopeMemoryMax)

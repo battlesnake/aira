@@ -31,10 +31,47 @@ committed diff), whose two real findings changed the shipped code:
   returned and its caller had read the diagnostics. Stop now joins (and is
   idempotent), with `TestForwardConfineSignalsStopJoinsTheHandler` pinning it.
 
-The same review's P0 was a false alarm caused by a stale diff: `origin/master`
-had advanced under the review, so another session's landed AIRA-16 watchdog
-change appeared inside the diff as a deletion. Rebased and re-reviewed against
-the true merge base.
+That round's P0 was a false alarm caused by a stale diff: `origin/master` had
+advanced under the review, so another session's landed AIRA-16 watchdog change
+appeared inside the diff as a deletion. Rebased and re-reviewed.
+
+**Revision 5** — folds a SECOND adversarial build-review round, run against the
+corrected diff. Its P0 is the sharpest finding of the whole exercise and changed
+what the classifier reads:
+
+- **P0, accepted.** Revision 4's SIGKILL gate was necessary but not sufficient.
+  `memory.events`' `oom_kill` is **hierarchical** — it counts this cgroup *and
+  every cgroup beneath it*. AIRA's own aitest worker scopes are exactly such
+  children, so a worker OOM-killed at its own cap raises the confine scope's
+  counter; if the whole scope is then killed by `systemd-oomd`, the classifier
+  would report `terminated-by=oom` for what is precisely AIRA-91's external
+  kill — the exact configuration AIRA-91 investigated. The classifier now reads
+  **`memory.events.local`** instead, which counts this cgroup alone. The
+  hierarchical counter is left to `formatConfineReserveAdvisory` and the
+  peak-RSS report, which ask the different question ("did anything under this
+  scope hit a memory wall") and are unchanged.
+
+  The kernel semantics this rests on were **measured, not assumed** — first by
+  hand against real cgroups on this box, then committed as
+  `TestMemoryEventsLocalDistinguishesOwnLimitFromDescendantOOM`
+  (`internal/runner/oom_events_local_linux_test.go`), which pins all three
+  shapes: an OOM at the scope's own limit raises both counters (including under
+  `memory.oom.group=1`, which every confine scope sets); an OOM in a child
+  cgroup raises only the hierarchical one; and the committed AIRA-91 probe
+  already pins that an external `cgroup.kill` raises neither.
+- **P2, accepted.** The stop function's freedom from an unbounded join was
+  resting on a comment ("callers stop the signal source first"). The loop now
+  re-checks `done` before handling a dequeued signal, so at most one further
+  signal is processed after stop is called, whatever the caller does.
+- **P2, accepted as a written-down coverage split rather than new machinery.**
+  The real-cgroup probe cannot run all of `confineWithDeps` (a real external
+  kill needs a real scope; the unit harness substitutes a fake one). The two
+  halves — mechanism/classification against real kernel state, wiring through
+  `confineWithDeps` with a real child — are now named in the probe's own
+  comment, with the mutation set confirming a broken join fails the second.
+- **P1 not accepted: another stale-diff artifact.** It reported a `worker.py`
+  regression; `origin/master` had advanced again mid-review and another
+  session's landed AIRA-37 change was inside the diff. Rebased again.
 
 Codex/Sol and Gemini were unavailable throughout (usage credits exhausted /
 free-tier quota exhausted, one retry each); recorded rather than silently
@@ -439,7 +476,7 @@ New/extended, all TDD (test first, watch it fail against current source):
 - The daemon log line firing on a refused kill (a "killed" claim for a kill that
   did not happen — exactly the fabricated-outcome class AIRA-68's populated-gate
   exists to prevent).
-- **Mutation checks the build review must actually run.** Eleven were applied
+- **Mutation checks the build review must actually run.** Thirteen were applied
   and every one turned a named test red — recorded here so a later change can
   re-run the same set:
 
@@ -454,8 +491,10 @@ New/extended, all TDD (test first, watch it fail against current source):
   | M7 | candidates line fires for every verdict | advisory test + four trailer rows |
   | M8 | classifier hardcoded to `unattributed-sigkill` | five classifier rows — the probe-only false pass |
   | M9 | daemon logs the kill before the error return | both negative daemon sub-cases |
-  | M10 | branch 2 gated on `signalled` not `SIGKILL` (the build-review P1 defect) | classifier SIGTERM+descendant-OOM rows |
-  | M11 | stop no longer joins the handler (the build-review P2 defect) | `TestForwardConfineSignalsStopJoinsTheHandler` |
+  | M10 | branch 2 gated on `signalled` not `SIGKILL` (round-1 P1 defect) | classifier SIGTERM+OOM rows |
+  | M11 | stop no longer joins the handler (round-1 P2 defect) | `TestForwardConfineSignalsStopJoinsTheHandler` |
+  | M12 | branch 2 reads the HIERARCHICAL counter (round-2 P0 defect) | classifier + trailer descendant-OOM rows, and the real-cgroup probe |
+  | M13 | `readCgroupUsage` never reads `memory.events.local` | the real-cgroup probe and the external-kill trailer test |
 
 ## 6. Deferrals
 
