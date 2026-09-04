@@ -272,6 +272,19 @@ rather than a stale incident reconstructed after the fact. Awaiting qual's
 exact timestamp to confirm or rule this out. Further daemon restarts are
 paused pending that answer.
 
+### qual's own migration unblocked via interim mitigations (2026-09-04)
+
+Attempt 5 of qual's fastest-ee merge-gate PR completed cleanly — no crashes,
+no truncations, no BLANK legs, `admin` passing clean (confirming their
+guard-regex fix). Remaining FAILs are pre-existing drift unrelated to their
+branch. Their migration is done and heading to review — unblocked entirely
+by the interim mitigations built during this investigation (pin
+hosted/services/pipeline off aitest, the `"aitest: "` summary-line
+completeness guard on the other 6 legs), NOT by a fix to AIRA-91 itself,
+which remains open with its root cause still unestablished. Noting this so
+the ticket doesn't read as resolved-by-attrition just because the one
+consumer chasing it nightly is now unblocked.
+
 **RETRACTED (qual, minutes later, same 2026-09-04): this `admin` incident was
 not real.** On a proper re-read, `admin` completed successfully — full
 `"aitest: 211 passed, 0 failed, 2 skipped, ..."` line and pytest's normal
