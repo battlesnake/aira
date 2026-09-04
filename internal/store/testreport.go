@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"aira/internal/domain"
+	"aira/internal/gitcontext"
 )
 
 type TestReportAddResult struct {
@@ -85,11 +86,6 @@ func (s *Store) FlakyCellSummary(ctx context.Context) (FlakyCellSummary, error) 
 		return FlakyCellSummary{}, err
 	}
 	return summary, nil
-}
-
-// FlakyCellStateSummary is a concise alias for the --all read API.
-func (s *Store) FlakyCellStateSummary(ctx context.Context) (FlakyCellSummary, error) {
-	return s.FlakyCellSummary(ctx)
 }
 
 func (s *Store) AddTestReport(ctx context.Context, rawInput domain.TestReportInput) (TestReportAddResult, error) {
@@ -226,7 +222,9 @@ func (s *Store) AddTestReport(ctx context.Context, rawInput domain.TestReportInp
 
 func (s *Store) gitValue(ctx context.Context, args ...string) string {
 	commandArgs := append([]string{"-C", s.root, "rev-parse"}, args...)
-	output, err := exec.CommandContext(ctx, "git", commandArgs...).Output()
+	command := exec.CommandContext(ctx, "git", commandArgs...)
+	command.Env = gitcontext.ScrubbedEnvironment()
+	output, err := command.Output()
 	if err != nil {
 		return ""
 	}

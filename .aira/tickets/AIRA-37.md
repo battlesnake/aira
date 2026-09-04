@@ -67,3 +67,38 @@ incrementally rather than spawn-then-dispatch in two separate passes.
 Not urgent enough to block AIRA-30's merge (all four categories are
 either disputed-but-low-impact, pure efficiency, or narrow failure-path
 polish) — tracked here so they aren't silently dropped. relates AIRA-30.
+
+## Re-scoped (2026-09-04, backlog-remediation Phase 0, plan section 2) — 4 of 6 already fixed
+
+Each item below was re-verified against current source rather than inherited from
+the plan's snapshot.
+
+**CLOSED as already fixed:**
+
+- *Worker-admit connection deadlines.* `RequestWorkerAdmit`
+  (`internal/runner/worker_admit_client_linux.go:74-81`) now derives a transport
+  deadline from the request's own `MaxWait` plus a fixed grace margin, honouring
+  an earlier caller deadline if one is present — exactly the fix this item asked
+  for, mirroring `admitThroughDaemon`.
+- *`WorkerAdmitResponse.waited_ms` never populated.* Populated at
+  `internal/daemon/worker_admit.go:443` from the poll loop's real elapsed time.
+- *`CreateWorkerScope` leaks the directory on a cap-write failure.* It removes
+  the scope directory on the failure branch
+  (`internal/runner/worker_scope_linux.go`).
+- *Malformed `AIRA_AITEST_WORKER_*` ints raise mid-loop.* `worker.py`'s
+  `_env_int`/`_env_float` (`:226-240`) parse defensively, warn once, and fall
+  back to the compiled default.
+
+**STILL OPEN — the two genuine residues, both moved to Phase 2 (plan section 4):**
+
+1. *The atfork docstring.* `worker.py`'s `fork_worker` still claims the
+   pre-placement window is "pure interpreter overhead" (`:285`). Sol reproduced
+   `after_in_child` handlers running before `os.fork()` returns to Python, so the
+   claim is not accurate as stated. Fix is the docstring plus the audit the
+   ticket already describes; the sharper risk named by the review synthesis is a
+   fork-across-threads lock hazard, not a containment break.
+2. *Worker-dispatch over-spawn.* `supervisor.py:1131` still reads
+   `if not self.queue: return` with no in-flight counter, so nothing prevents
+   spawning more workers than there is queued work.
+
+Only those two remain in scope for this ticket.

@@ -21,7 +21,9 @@ import (
 	"time"
 
 	"aira/internal/domain"
+	"aira/internal/gitcontext"
 	"aira/internal/runner"
+
 	"golang.org/x/sys/unix"
 	_ "modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -2736,7 +2738,15 @@ func ensureAllocationEvent(ctx context.Context, conn *sql.Conn, project, id, wor
 	verb, target, payload := "id.allocate", id, allocationEventDigest("id.allocate", id, kind)
 	if fromJournal.ProjectID != "" {
 		if fromJournal.Target != id {
-			return fmt.Errorf("E_JOURNAL_CORRUPT: duplicate project/seq %s/%d has target %s and %s", project, seq, fromJournal.Target, id)
+			// Name the conflicting allocation's PATH, not just the two ids
+			// (AIRA-93). The message used to read "duplicate project/seq …/1 has
+			// target AIRA-1 and LIFE-1" and leave the reader with no way to tell
+			// which of the two entries is the intruder or where it came from. The
+			// path is what makes it obvious: the entries that corrupted this
+			// repository's own journal carry /tmp/TestInitAdopts…/ and
+			// /tmp/TestSkillExamples…/ paths, i.e. they were written by a test
+			// working directory that resolved to this project's id.
+			return fmt.Errorf("E_JOURNAL_CORRUPT: duplicate project/seq %s/%d has target %s and %s (conflicting allocation path %s; inspect <common>/aira/receipts.jsonl)", project, seq, fromJournal.Target, id, path)
 		}
 		if fromJournal.PayloadDigest != allocationEventDigest(fromJournal.Verb, fromJournal.Target, kind) {
 			return fmt.Errorf("E_JOURNAL_CORRUPT: event %s/%d has invalid payload digest", project, seq)
@@ -3435,7 +3445,7 @@ func isNotGitRepository(output string) bool {
 
 func runGit(root string, args ...string) (string, string, error) {
 	cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
-	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
+	cmd.Env = append(gitcontext.ScrubbedEnvironment(), "LC_ALL=C", "LANG=C")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

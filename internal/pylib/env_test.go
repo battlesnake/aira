@@ -137,8 +137,9 @@ func TestAppendAitestChildEnvironmentInjectsAndStripsStaleKeys(t *testing.T) {
 		"AIRA_AITEST_WORKER_ADMIT_CMD=/stale/aira",
 		"AIRA_AITEST_BOOTSTRAP_CMD=/stale/aira",
 		"AIRA_AITEST_MAX_WORKERS_FALLBACK=999",
+		"AIRA_AITEST_OUTER_SCOPE=/stale/scope",
 	}
-	got := childEnvValues(t, AppendAitestChildEnvironment(inherited, runtimeDir, nil, "/opt/aira"))
+	got := childEnvValues(t, AppendAitestChildEnvironment(inherited, runtimeDir, nil, "/opt/aira", "/sys/fs/cgroup/aira.slice/.aira-CONFINE-x"))
 	if got["AIRA_AITEST_LIB"] == "" || got["AIRA_AITEST_LIB"] == "/stale" {
 		t.Fatalf("AIRA_AITEST_LIB=%q", got["AIRA_AITEST_LIB"])
 	}
@@ -151,6 +152,31 @@ func TestAppendAitestChildEnvironmentInjectsAndStripsStaleKeys(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(got["AIRA_AITEST_LIB"], "aitest", "__init__.py")); err != nil {
 		t.Fatalf("injected aitest lib path is not importable: %v", err)
 	}
+	// AIRA-44: the launcher's own scope replaces the stale inherited one. A
+	// second aitest pytest run in the same job inherits THIS value, which is why
+	// bootstrap no longer has to guess the outer scope from its own cgroup.
+	if got["AIRA_AITEST_OUTER_SCOPE"] != "/sys/fs/cgroup/aira.slice/.aira-CONFINE-x" {
+		t.Fatalf("AIRA_AITEST_OUTER_SCOPE=%q", got["AIRA_AITEST_OUTER_SCOPE"])
+	}
+}
+
+// TestAppendAitestChildEnvironmentOmitsAnUnknownOuterScope: a blank scope must
+// leave no key behind at all — not an empty AIRA_AITEST_OUTER_SCOPE=, which the
+// bootstrap verb would have to special-case before falling back to
+// self-discovery, and which the guard would otherwise be handed as a path.
+//
+// verifies: AIRA-44
+func TestAppendAitestChildEnvironmentOmitsAnUnknownOuterScope(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	got := childEnvValues(t, AppendAitestChildEnvironment(
+		[]string{"PATH=/bin", "AIRA_AITEST_OUTER_SCOPE=/stale/scope"},
+		filepath.Join(t.TempDir(), "runtime"), nil, "/opt/aira", "   "))
+	if _, present := got["AIRA_AITEST_OUTER_SCOPE"]; present {
+		t.Fatalf("blank outer scope was published: %v", got)
+	}
+	if got["AIRA_AITEST_WORKER_ADMIT_CMD"] != "/opt/aira" {
+		t.Fatalf("the rest of the coordinates were dropped too: %v", got)
+	}
 }
 
 func TestAppendAitestChildEnvironmentEmptyArgsAreSideEffectFree(t *testing.T) {
@@ -158,11 +184,11 @@ func TestAppendAitestChildEnvironmentEmptyArgsAreSideEffectFree(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", dataHome)
 	input := []string{"PATH=/bin", "AIRA_AITEST_WORKER_ADMIT_CMD=/stale/aira"}
 
-	byEmptyRuntimeDir := AppendAitestChildEnvironment(input, "", nil, "/opt/aira")
+	byEmptyRuntimeDir := AppendAitestChildEnvironment(input, "", nil, "/opt/aira", "/scope")
 	if strings.Join(byEmptyRuntimeDir, "\x00") != "PATH=/bin" {
 		t.Fatalf("empty runtimeDir retained aitest environment: %v", byEmptyRuntimeDir)
 	}
-	byEmptyCommand := AppendAitestChildEnvironment(input, filepath.Join(t.TempDir(), "runtime"), nil, "")
+	byEmptyCommand := AppendAitestChildEnvironment(input, filepath.Join(t.TempDir(), "runtime"), nil, "", "/scope")
 	if strings.Join(byEmptyCommand, "\x00") != "PATH=/bin" {
 		t.Fatalf("empty workerAdmitCommand retained aitest environment: %v", byEmptyCommand)
 	}
@@ -182,8 +208,8 @@ func TestAppendAitestChildEnvironmentSkipsEverythingOnExtractionFailure(t *testi
 	})
 	input := []string{"PATH=/bin", "AIRA_AITEST_LIB=/stale", "AIRA_AITEST_WORKER_ADMIT_CMD=/stale/aira"}
 	var diagnostics bytes.Buffer
-	first := AppendAitestChildEnvironment(input, t.TempDir(), &diagnostics, "/opt/aira")
-	second := AppendAitestChildEnvironment(input, t.TempDir(), &diagnostics, "/opt/aira")
+	first := AppendAitestChildEnvironment(input, t.TempDir(), &diagnostics, "/opt/aira", "/scope")
+	second := AppendAitestChildEnvironment(input, t.TempDir(), &diagnostics, "/opt/aira", "/scope")
 	for _, got := range [][]string{first, second} {
 		values := childEnvValues(t, got)
 		if len(values) != 1 || values["PATH"] != "/bin" {

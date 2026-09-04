@@ -266,7 +266,7 @@ func (r *Runner) supervisorLeaseDaemonCall(ctx context.Context, verb string, arg
 	if deadline, ok := callCtx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	}
-	frame := runnerAdmitRequestFrame{Proto: runnerDaemonProtocolVersion, Scope: cloneAnyMap(r.daemonScope)}
+	frame := runnerAdmitRequestFrame{Proto: DaemonProtocolVersion, Scope: cloneAnyMap(r.daemonScope)}
 	frame.Request.Verb, frame.Request.Args = verb, args
 	if err := writeRunnerAdmitFrame(conn, frame); err != nil {
 		return &supervisorLeaseRouteError{kind: supervisorLeaseAmbiguous, err: err}

@@ -25,6 +25,13 @@ func confineTestScopeID(name string, pid int, stamp int64) string {
 	return "CONFINE-" + name + "-" + strconv.Itoa(pid) + "-" + strconv.FormatInt(stamp, 36)
 }
 
+// confineTestOwnedScopeID mints AIRA-52's owner-carrying form. It is the shape
+// every real launch produces once an owner is resolved, and the shape the kill
+// guard now reads ownership out of.
+func confineTestOwnedScopeID(name, owner string, pid int, stamp int64) string {
+	return confineTestScopeID(name, pid, stamp) + "@" + owner
+}
+
 func confineTestDelegateScopeID(name string, pid int, stamp int64) string {
 	return "CONFINE-" + delegateRAMScopeIDMarker + "-" + name + "-" + strconv.Itoa(pid) + "-" + strconv.FormatInt(stamp, 36)
 }
@@ -51,10 +58,10 @@ func writeConfineTestScope(t *testing.T, slice, scopeID, procs string) string {
 func TestConfineScanUnionDeduplicatesAndRegistryOwnerWins(t *testing.T) {
 	slice := t.TempDir()
 	now := time.Now()
-	owned := confineTestScopeID("build-name.with-dash", 4101, now.Add(-time.Minute).UnixNano())
+	owned := confineTestOwnedScopeID("build-name.with-dash", "session-a", 4101, now.Add(-time.Minute).UnixNano())
 	scanOnly := confineTestScopeID("fallback", 4102, now.Add(-2*time.Minute).UnixNano())
 	marked := confineTestDelegateScopeID("ceiling-suite", 4105, now.Add(-3*time.Minute).UnixNano())
-	pending := confineTestScopeID("pending", 4103, now.UnixNano())
+	pending := confineTestOwnedScopeID("pending", "session-a", 4103, now.UnixNano())
 	writeConfineTestScope(t, slice, owned, "51\n52\n")
 	writeConfineTestScope(t, slice, scanOnly, "61\n")
 	writeConfineTestScope(t, slice, marked, "62\n")
@@ -63,7 +70,7 @@ func TestConfineScanUnionDeduplicatesAndRegistryOwnerWins(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result, err := listConfinesWithDeps(context.Background(), slice, []ConfineRegistryEntry{{ScopeID: owned, Name: "build-name.with-dash", Owner: "session-a"}, {ScopeID: pending, Name: "pending", Owner: "session-a"}}, confineScanDeps{
+	result, err := listConfinesWithDeps(context.Background(), slice, []ConfineRegistryEntry{{ScopeID: owned}, {ScopeID: pending}}, confineScanDeps{
 		now: time.Now, readField: readConfineScopeField, waitEmpty: waitEmpty,
 	})
 	if err != nil || result.Verdict != "pass" || len(result.Scopes) != 4 {
@@ -93,7 +100,7 @@ func TestConfineListHonestyUnreadablePerFieldAndHusk(t *testing.T) {
 	if err != nil || result.Verdict != "unevaluated" || result.Reason == "" || result.Scopes == nil {
 		t.Fatalf("unreadable result=%+v err=%v", result, err)
 	}
-	if kill, killErr := KillConfine(context.Background(), missing, "job", "owner", true, nil, nil); killErr == nil || !strings.HasPrefix(killErr.Error(), CodeConfineKillUnconfirmed+":") || kill.Status == "killed" {
+	if kill, killErr := KillConfine(context.Background(), missing, "job", "owner", true, nil); killErr == nil || !strings.HasPrefix(killErr.Error(), CodeConfineKillUnconfirmed+":") || kill.Status == "killed" {
 		t.Fatalf("unreadable kill=%+v err=%v", kill, killErr)
 	}
 	reap, reapErr := ReapOrphanedConfineScopes(context.Background(), missing, time.Minute, nil, nil)
@@ -117,43 +124,96 @@ func TestConfineListHonestyUnreadablePerFieldAndHusk(t *testing.T) {
 	}
 }
 
-func TestConfineKillOwnershipGuardStealAndFreshLookup(t *testing.T) {
+func TestConfineKillOwnershipGuardAndSteal(t *testing.T) {
 	slice := t.TempDir()
-	scopeID := confineTestScopeID("owned", 4301, time.Now().UnixNano())
+	scopeID := confineTestOwnedScopeID("owned", "session-a", 4301, time.Now().UnixNano())
 	path := writeConfineTestScope(t, slice, scopeID, "71\n")
-	registry := []ConfineRegistryEntry{{ScopeID: scopeID, Name: "owned", Owner: "stale-owner"}}
-	freshCalls := 0
-	lookup := func(string) (string, bool) { freshCalls++; return "session-a", true }
+	registry := []ConfineRegistryEntry{{ScopeID: scopeID}}
 	deps := defaultConfineScanDeps()
 	deps.waitEmpty = func(_ context.Context, scope Scope, _ time.Duration) error {
 		return os.WriteFile(filepath.Join(scope.Reference(), "cgroup.events"), []byte("populated 0\n"), 0o644)
 	}
-	if _, err := killConfineWithDeps(context.Background(), slice, scopeID, "session-b", false, registry, lookup, time.Second, deps); err == nil || !strings.HasPrefix(err.Error(), CodeConfineOwnerUnverified+":") {
+	if _, err := killConfineWithDeps(context.Background(), slice, scopeID, "session-b", false, registry, time.Second, deps); err == nil || !strings.HasPrefix(err.Error(), CodeConfineOwnerUnverified+":") {
 		t.Fatalf("foreign kill err=%v", err)
 	}
 	if data, _ := os.ReadFile(filepath.Join(path, "cgroup.kill")); len(data) != 0 {
 		t.Fatalf("ownership refusal wrote kill=%q", data)
 	}
-	result, err := killConfineWithDeps(context.Background(), slice, scopeID, "session-b", true, registry, lookup, time.Second, deps)
-	if err != nil || result.Status != "killed" || freshCalls != 2 {
-		t.Fatalf("result=%+v err=%v freshCalls=%d", result, err, freshCalls)
+	result, err := killConfineWithDeps(context.Background(), slice, scopeID, "session-b", true, registry, time.Second, deps)
+	if err != nil || result.Status != "killed" || result.Owner != "session-a" {
+		t.Fatalf("result=%+v err=%v", result, err)
 	}
 	if data, _ := os.ReadFile(filepath.Join(path, "cgroup.kill")); string(data) != "1" {
 		t.Fatalf("kill file=%q", data)
 	}
 }
 
-func TestConfineKillUsesFreshRegistryOwnerNotListSnapshot(t *testing.T) {
+// TestConfineKillOwnerSurvivesADaemonWithNoMemoryOfTheJob is AIRA-52's
+// regression test. The daemon's restart-adoption path rebuilds aggregate reserve
+// scalars from a cgroup scan and never recreates per-job waiters, so owner used
+// to be gone forever for any job whose lifetime spanned a restart -- forcing an
+// unnecessary --steal to kill your OWN job. An empty registry and no daemon
+// memory whatsoever is exactly that post-restart state.
+//
+// verifies: AIRA-52
+func TestConfineKillOwnerSurvivesADaemonWithNoMemoryOfTheJob(t *testing.T) {
 	slice := t.TempDir()
-	scopeID := confineTestScopeID("fresh", 4302, time.Now().UnixNano())
+	scopeID := confineTestOwnedScopeID("survivor", "session-a", 4310, time.Now().UnixNano())
+	writeConfineTestScope(t, slice, scopeID, "73\n")
+	deps := defaultConfineScanDeps()
+	deps.waitEmpty = func(_ context.Context, scope Scope, _ time.Duration) error {
+		return os.WriteFile(filepath.Join(scope.Reference(), "cgroup.events"), []byte("populated 0\n"), 0o644)
+	}
+	listed, err := listConfinesWithDeps(context.Background(), slice, nil, deps)
+	if err != nil || len(listed.Scopes) != 1 || listed.Scopes[0].Owner != "session-a" {
+		t.Fatalf("scan-only list=%+v err=%v, want owner recovered from the scope id", listed, err)
+	}
+	result, err := killConfineWithDeps(context.Background(), slice, scopeID, "session-a", false, nil, time.Second, deps)
+	if err != nil || result.Status != "killed" {
+		t.Fatalf("owner must be able to kill its own job with no --steal after a restart: result=%+v err=%v", result, err)
+	}
+}
+
+// TestConfineKillRefusesAnInferredOwnerWithoutSteal pins AIRA-23's safety
+// boundary: an inferred owner is published so --list is actionable, and is NEVER
+// ownership proof. Two sessions in one directory infer the same string, so
+// honouring it would let either kill the other's job without --steal.
+//
+// verifies: AIRA-23
+func TestConfineKillRefusesAnInferredOwnerWithoutSteal(t *testing.T) {
+	inferred := InferConfineOwner("/home/someone/worktree-a")
+	if !strings.HasPrefix(inferred, ConfineInferredOwnerPrefix) || ConfineOwnerIsAttested(inferred) {
+		t.Fatalf("inferred=%q must be marked and unattested", inferred)
+	}
+	slice := t.TempDir()
+	scopeID := confineTestOwnedScopeID("inferred", inferred, 4311, time.Now().UnixNano())
+	path := writeConfineTestScope(t, slice, scopeID, "74\n")
+	listed, err := listConfinesWithDeps(context.Background(), slice, nil, defaultConfineScanDeps())
+	if err != nil || len(listed.Scopes) != 1 || listed.Scopes[0].Owner != inferred {
+		t.Fatalf("list=%+v err=%v, want the inferred owner surfaced instead of %q", listed, err, ConfineUnknownOwner)
+	}
+	// Even the SAME inferred identity must not open the guard.
+	if _, err := KillConfine(context.Background(), slice, scopeID, inferred, false, nil); err == nil || !strings.HasPrefix(err.Error(), CodeConfineOwnerUnverified+":") {
+		t.Fatalf("an inferred owner opened the kill guard: err=%v", err)
+	}
+	if data, _ := os.ReadFile(filepath.Join(path, "cgroup.kill")); len(data) != 0 {
+		t.Fatalf("refusal wrote kill=%q", data)
+	}
+}
+
+// TestConfineKillTakesOwnerFromTheScopeIDNotTheRegistry: the scope directory
+// name is the single source of ownership truth. A registry entry naming the same
+// scope contributes only its existence (a Pending row), never an identity.
+func TestConfineKillTakesOwnerFromTheScopeIDNotTheRegistry(t *testing.T) {
+	slice := t.TempDir()
+	scopeID := confineTestOwnedScopeID("fresh", "session-a", 4302, time.Now().UnixNano())
 	writeConfineTestScope(t, slice, scopeID, "72\n")
 	deps := defaultConfineScanDeps()
 	deps.waitEmpty = func(_ context.Context, scope Scope, _ time.Duration) error {
 		return os.WriteFile(filepath.Join(scope.Reference(), "cgroup.events"), []byte("populated 0\n"), 0o644)
 	}
 	result, err := killConfineWithDeps(context.Background(), slice, scopeID, "session-a", false,
-		[]ConfineRegistryEntry{{ScopeID: scopeID, Name: "fresh", Owner: "stale-owner"}},
-		func(string) (string, bool) { return "session-a", true }, time.Second, deps)
+		[]ConfineRegistryEntry{{ScopeID: scopeID}}, time.Second, deps)
 	if err != nil || result.Status != "killed" || result.Owner != "session-a" {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
@@ -165,7 +225,7 @@ func TestConfineKillUsesFreshRegistryOwnerNotListSnapshot(t *testing.T) {
 // as not-launched and left uncancellable. RED against a leaf-only Members() observe.
 func TestConfineKillObservesSubtreePopulationNotLeafOnly(t *testing.T) {
 	slice := t.TempDir()
-	id := confineTestScopeID("nested", 4601, time.Now().UnixNano())
+	id := confineTestOwnedScopeID("nested", "owner", 4601, time.Now().UnixNano())
 	path := filepath.Join(slice, ".aira-"+id)
 	if err := os.Mkdir(path, 0o755); err != nil {
 		t.Fatal(err)
@@ -183,7 +243,7 @@ func TestConfineKillObservesSubtreePopulationNotLeafOnly(t *testing.T) {
 	deps.waitEmpty = func(_ context.Context, scope Scope, _ time.Duration) error {
 		return os.WriteFile(filepath.Join(scope.Reference(), "cgroup.events"), []byte("populated 0\n"), 0o644)
 	}
-	result, err := killConfineWithDeps(context.Background(), slice, id, "owner", false, []ConfineRegistryEntry{{ScopeID: id, Name: "nested", Owner: "owner"}}, func(string) (string, bool) { return "owner", true }, time.Second, deps)
+	result, err := killConfineWithDeps(context.Background(), slice, id, "owner", false, []ConfineRegistryEntry{{ScopeID: id}}, time.Second, deps)
 	if err != nil || result.Status != "killed" {
 		t.Fatalf("subtree-populated kill result=%+v err=%v (a leaf-only observe would mis-report not-launched)", result, err)
 	}
@@ -207,7 +267,7 @@ func TestConfineKillScanOnlyAndUnknownCallerRequireSteal(t *testing.T) {
 	assertRefusedNoKill := func(t *testing.T, slice, id, caller string) {
 		t.Helper()
 		// scan-only: nil registry AND nil lookup → owner resolves to unknown.
-		result, err := KillConfine(context.Background(), slice, id, caller, false, nil, nil)
+		result, err := KillConfine(context.Background(), slice, id, caller, false, nil)
 		if err == nil || !strings.HasPrefix(err.Error(), CodeConfineOwnerUnverified+":") || result.Status == "killed" {
 			t.Fatalf("caller=%q result=%+v err=%v, want owner-unverified refusal", caller, result, err)
 		}
@@ -229,7 +289,7 @@ func TestConfineKillScanOnlyAndUnknownCallerRequireSteal(t *testing.T) {
 		deps.waitEmpty = func(_ context.Context, scope Scope, _ time.Duration) error {
 			return os.WriteFile(filepath.Join(scope.Reference(), "cgroup.events"), []byte("populated 0\n"), 0o644)
 		}
-		result, err := killConfineWithDeps(context.Background(), slice, id, ConfineUnknownOwner, true, nil, nil, time.Second, deps)
+		result, err := killConfineWithDeps(context.Background(), slice, id, ConfineUnknownOwner, true, nil, time.Second, deps)
 		if err != nil || result.Status != "killed" {
 			t.Fatalf("scan-only steal result=%+v err=%v", result, err)
 		}
@@ -239,9 +299,9 @@ func TestConfineKillScanOnlyAndUnknownCallerRequireSteal(t *testing.T) {
 func TestConfineKillEmptyAndUnconfirmedNeverReportKilled(t *testing.T) {
 	t.Run("empty-not-launched", func(t *testing.T) {
 		slice := t.TempDir()
-		id := confineTestScopeID("pending", 4401, time.Now().UnixNano())
+		id := confineTestOwnedScopeID("pending", "owner", 4401, time.Now().UnixNano())
 		path := writeConfineTestScope(t, slice, id, "")
-		result, err := KillConfine(context.Background(), slice, id, "owner", false, []ConfineRegistryEntry{{ScopeID: id, Name: "pending", Owner: "owner"}}, func(string) (string, bool) { return "owner", true })
+		result, err := KillConfine(context.Background(), slice, id, "owner", false, []ConfineRegistryEntry{{ScopeID: id}})
 		if err == nil || !strings.HasPrefix(err.Error(), CodeConfineNotLaunched+":") || result.Status == "killed" {
 			t.Fatalf("result=%+v err=%v", result, err)
 		}
@@ -251,7 +311,7 @@ func TestConfineKillEmptyAndUnconfirmedNeverReportKilled(t *testing.T) {
 	})
 	t.Run("write-error", func(t *testing.T) {
 		slice := t.TempDir()
-		id := confineTestScopeID("writefail", 4402, time.Now().UnixNano())
+		id := confineTestOwnedScopeID("writefail", "owner", 4402, time.Now().UnixNano())
 		path := writeConfineTestScope(t, slice, id, "81\n")
 		if err := os.Remove(filepath.Join(path, "cgroup.kill")); err != nil {
 			t.Fatal(err)
@@ -259,18 +319,18 @@ func TestConfineKillEmptyAndUnconfirmedNeverReportKilled(t *testing.T) {
 		if err := os.Mkdir(filepath.Join(path, "cgroup.kill"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		result, err := KillConfine(context.Background(), slice, id, "owner", false, []ConfineRegistryEntry{{ScopeID: id, Name: "writefail", Owner: "owner"}}, func(string) (string, bool) { return "owner", true })
+		result, err := KillConfine(context.Background(), slice, id, "owner", false, []ConfineRegistryEntry{{ScopeID: id}})
 		if err == nil || !strings.HasPrefix(err.Error(), CodeConfineKillUnconfirmed+":") || result.Status == "killed" {
 			t.Fatalf("result=%+v err=%v", result, err)
 		}
 	})
 	t.Run("wait-timeout", func(t *testing.T) {
 		slice := t.TempDir()
-		id := confineTestScopeID("timeout", 4403, time.Now().UnixNano())
+		id := confineTestOwnedScopeID("timeout", "owner", 4403, time.Now().UnixNano())
 		writeConfineTestScope(t, slice, id, "91\n")
 		deps := defaultConfineScanDeps()
 		deps.waitEmpty = func(context.Context, Scope, time.Duration) error { return errors.New("timeout") }
-		result, err := killConfineWithDeps(context.Background(), slice, id, "owner", false, []ConfineRegistryEntry{{ScopeID: id, Name: "timeout", Owner: "owner"}}, func(string) (string, bool) { return "owner", true }, time.Millisecond, deps)
+		result, err := killConfineWithDeps(context.Background(), slice, id, "owner", false, []ConfineRegistryEntry{{ScopeID: id}}, time.Millisecond, deps)
 		if err == nil || !strings.HasPrefix(err.Error(), CodeConfineKillUnconfirmed+":") || result.Status == "killed" {
 			t.Fatalf("result=%+v err=%v", result, err)
 		}
@@ -284,11 +344,11 @@ func TestConfineKillSelectorAmbiguousAndNotFound(t *testing.T) {
 		writeConfineTestScope(t, slice, id, "")
 	}
 	for _, selector := range []string{"same", "4501"} {
-		if _, err := KillConfine(context.Background(), slice, selector, "owner", true, nil, nil); err == nil || !strings.HasPrefix(err.Error(), "E_SELECTOR_AMBIGUOUS:") {
+		if _, err := KillConfine(context.Background(), slice, selector, "owner", true, nil); err == nil || !strings.HasPrefix(err.Error(), "E_SELECTOR_AMBIGUOUS:") {
 			t.Fatalf("selector=%q err=%v", selector, err)
 		}
 	}
-	if _, err := KillConfine(context.Background(), slice, "missing", "owner", true, nil, nil); err == nil || !strings.HasPrefix(err.Error(), CodeConfineNotFound+":") {
+	if _, err := KillConfine(context.Background(), slice, "missing", "owner", true, nil); err == nil || !strings.HasPrefix(err.Error(), CodeConfineNotFound+":") {
 		t.Fatalf("not-found err=%v", err)
 	}
 }
@@ -315,7 +375,7 @@ func TestConfineMidLaunchKillDoesNotFabricateOrReleaseAndLaunchContinues(t *test
 	}
 	innerStart := deps.start
 	deps.start = func(command *confineCommand) error {
-		result, killErr := KillConfine(context.Background(), slice, scopeID, "session-a", false, []ConfineRegistryEntry{{ScopeID: scopeID, Name: "midlaunch", Owner: "session-a"}}, func(string) (string, bool) { return "session-a", true })
+		result, killErr := KillConfine(context.Background(), slice, scopeID, "session-a", false, []ConfineRegistryEntry{{ScopeID: scopeID}})
 		if killErr == nil || !strings.HasPrefix(killErr.Error(), CodeConfineNotLaunched+":") || result.Status == "killed" {
 			t.Fatalf("mid-launch result=%+v err=%v", result, killErr)
 		}
@@ -373,7 +433,7 @@ func TestConfineRealScopeKillSurvivesLauncherIdentityLoss(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	result, err := KillConfine(context.Background(), parent, id, "session-b", true, nil, nil)
+	result, err := KillConfine(context.Background(), parent, id, "session-b", true, nil)
 	if err != nil || result.Status != "killed" {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}

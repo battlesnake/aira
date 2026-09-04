@@ -14,7 +14,9 @@ import (
 
 	"aira/internal/app"
 	"aira/internal/core"
+	"aira/internal/gitcontext"
 	"aira/internal/store"
+
 	"golang.org/x/sys/unix"
 )
 
@@ -263,6 +265,7 @@ func purgeDirty(root string) error {
 		return fmt.Errorf("E_EJECT_UNVERIFIED: stat purge root: %w", err)
 	}
 	command := exec.Command("git", "-C", root, "status", "--porcelain", "--ignored", "--", ".aira")
+	command.Env = gitcontext.ScrubbedEnvironment()
 	output, err := command.Output()
 	if err != nil {
 		return fmt.Errorf("E_EJECT_UNVERIFIED: git status .aira: %w", err)

@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-28","project":"aira","title":"Bound the delegate-ram aggregate so aira.slice can never over-commit (structural fix, whole-suite airtight charge)","status":"planned","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","delegate-ram","oom","shared-slice"],"hold":false,"relations":[{"kind":"supersedes","from":"AIRA-29","to":"AIRA-28"},{"kind":"relates","from":"AIRA-62","to":"AIRA-28"}]}
+{"schema":1,"id":"AIRA-28","project":"aira","title":"Bound the delegate-ram aggregate so aira.slice can never over-commit (structural fix, whole-suite airtight charge)","status":"superseded","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","delegate-ram","oom","shared-slice"],"hold":false,"relations":[{"kind":"supersedes","from":"AIRA-29","to":"AIRA-28"},{"kind":"relates","from":"AIRA-62","to":"AIRA-28"}]}
 ---
 The STRUCTURAL follow-up to AIRA-27 Option A (class-based oom_score_adj, which is a bias not a bound — a large airtight neighbour can still be out-scored under a delegate over-commit). Removes the delegate-aggregate over-commit itself so no delegate-aggregate slice-OOM fires at all.
 
@@ -41,3 +41,20 @@ Needs a DAEMON RESTART (unlike Option A). relates AIRA-27 (Option A, done), AIRA
 **SHELVED — SUPERSEDED BY [[AIRA-29]] (owner pivot 2026-09-01, utilisation).** Approach A (airtight whole-suite charge) was BUILT + VERIFIED but NOT deployed: at the deploy checkpoint the owner observed the live slice was half-idle (CPU + RAM) while jobs waited — a non-delegate merge-gate reserved 33.6G / used 2.6G, proving the airtight reserve-the-peak-hold-for-lifetime model UNDER-UTILISES the machine. AIRA-28 fixes over-COMMIT but by the same lever WORSENS under-UTILISATION. Owner chose DYNAMIC RESERVE (track-actual, AIRA-29) instead — charge live memory.current + headroom, re-evaluated, so the ledger reflects real usage. The Approach-A build stays on branch `aira27-delegate-bound` @ `f356622` as a reference (the review/deploy-gate caught the wrong direction before prod — same win as the Slice-2 stop). Original build record below.
 
 **(HISTORICAL) BUILD DONE + VERIFIED (2026-09-01, branch `aira27-delegate-bound` @ `f356622`).** Full two-loop: spec v2.1 (Sol+DeepSeek+Fable plan-review → 3 P0 folded → Fable re-gate FOLDS-SOUND) → Terra build (`d0a08b5`; DelegateRAMChargeExplicit field + gofmt by Opus, Terra sandbox couldn't build/commit) → adversarial build-review (6 dims, 5 CLEAN incl. adoption-release/invariant/governor-inert/non-delegate-boundary; 1 P1 porous test FIXED+mutation-verified `f356622`; 1 P2 refuted → documented accepted gap) → Opus verify PASS. Gates: `make ci` exit 0, `-race` clean (daemon+runner). Live smoke pending deploy. **Deploy owner-gated: owner chose "deploy when slice quiet" (2026-09-01) — slice was ~99.6% reserved by 2 big non-delegate neighbour jobs (30G+36G); quiet-poll `b64rwfp2w` armed (deploy when granted<20G).** Deploy = merge→master, build binary, swap `~/.local/bin/aira`, `systemctl --user restart aira-daemon.service` (#74 reconstructs; legacy `@dr-` adopt current+margin, new `@drc-` whole-charged), smoke (delegate reserve==memory.max), notify all 11 sessions. Rollback = swap backed-up binary + restart.
+
+## Status transition (backlog remediation, Phase 0)
+
+`planned` → **`superseded`**. This commit records a transition, it does not make a
+decision: the owner's pivot to AIRA-29 is dated 2026-09-01, the ticket body has
+read "SHELVED — SUPERSEDED BY AIRA-29" since then, and the `supersedes` relation
+(AIRA-29 → AIRA-28) is already in this ticket's own front matter. Only the status
+field was left behind, so the ticket kept appearing in the open backlog and in
+ready-queue arithmetic as a live P1.
+
+Flagged for explicit owner sign-off in the plan (§5 item 1) because it retires a
+real airtight-guarantee design, not because the transition is in doubt. The
+Approach-A build is preserved on branch `aira27-delegate-bound` @ `f356622` and
+the analysis stays in the body above — nothing is discarded by this transition.
+AIRA-29's own build is explicitly NOT part of the backlog-remediation plan; it
+ships as its own follow-on milestone once its ship-together (Slice 1 + Slice 2)
+precondition and its hold reason are answered (plan §3.2).

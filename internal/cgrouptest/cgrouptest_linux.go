@@ -49,6 +49,18 @@ func IsolatedScopeParent(t *testing.T) string {
 	// direct processes of its own.
 	host := filepath.Dir(current)
 	prefix := ".aira-test-" + strings.NewReplacer("/", "_", " ", "_").Replace(t.Name()) + "-"
+	// AIRA-69: when the test binary itself runs under `aira confine` — which this
+	// project's CLAUDE.md mandates for every heavy command — host resolves to
+	// aira.slice itself, so this parent is created as a direct SIBLING of live
+	// production job scopes. That placement is accepted (see the ticket), but the
+	// NAME must never be mistakable for a production confine scope: every
+	// production scan — `confine --list`, the admission reserve reconstruction,
+	// and the orphan reaper — enumerates `.aira-CONFINE-*` and nothing else, so
+	// this prefix is the entire reason a throwaway test scope stays out of live
+	// admission accounting. Assert it rather than trusting the constant.
+	if strings.HasPrefix(prefix, ".aira-CONFINE-") {
+		t.Fatalf("test scope prefix %q collides with the production confine scope prefix; every scan would count these as live jobs", prefix)
+	}
 	parent, err := os.MkdirTemp(host, prefix)
 	if err != nil {
 		SkipOrFailRealCgroup(t, "cannot create scope parent under %s: %v", host, err)

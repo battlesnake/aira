@@ -79,7 +79,7 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) (*Wor
 		transportDeadline = ctxDeadline
 	}
 	_ = conn.SetDeadline(transportDeadline)
-	frame := runnerAdmitRequestFrame{Proto: runnerDaemonProtocolVersion, Scope: map[string]any{}}
+	frame := runnerAdmitRequestFrame{Proto: DaemonProtocolVersion, Scope: map[string]any{}}
 	frame.Request.Verb = "worker-admit"
 	frame.Request.Args = map[string]any{
 		"job_id": req.JobID, "outer_scope": req.OuterScope, "signature": req.Signature,

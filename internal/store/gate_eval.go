@@ -13,6 +13,7 @@ import (
 
 	"aira/internal/domain"
 	"aira/internal/gate"
+	"aira/internal/gitcontext"
 )
 
 type EvaluationRoot struct {
@@ -497,10 +498,14 @@ func (s *Store) runCanary(ctx context.Context, c gate.CanaryDeclaration, def gat
 		}
 	}
 	cmd := exec.Command("git", "-C", dir, "init", "-q")
+	// AIRA-93: without the scrub an inherited GIT_DIR/GIT_INDEX_FILE would make
+	// `add -A` below stage this scratch tree into ANOTHER repository's index.
+	cmd.Env = gitcontext.ScrubbedEnvironment()
 	if err := cmd.Run(); err != nil {
 		return DimensionEvaluation{}, EvaluationRoot{}, fmt.Errorf("U_GATE_CANARY_UNEVALUATED: git init: %w", err)
 	}
 	cmd = exec.Command("git", "-C", dir, "add", "-A")
+	cmd.Env = gitcontext.ScrubbedEnvironment()
 	if err := cmd.Run(); err != nil {
 		return DimensionEvaluation{}, EvaluationRoot{}, fmt.Errorf("U_GATE_CANARY_UNEVALUATED: git add: %w", err)
 	}

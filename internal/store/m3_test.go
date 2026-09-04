@@ -1090,7 +1090,17 @@ func TestReadyFindingAttributionUsesExactRelationEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || !rows[0].Ready || len(rows[0].Findings) != 0 {
+	// The subject is relation attribution, so the assertion is "no RELATION
+	// finding landed here" -- not "no findings at all". AIRA-56 attaches an
+	// unrelated advisory (this fixture has no gates), which must not be able to
+	// mask or be mistaken for the thing under test.
+	relationFindings := 0
+	for _, finding := range rows[0].Findings {
+		if finding.Code != GateSetEmptyCode {
+			relationFindings++
+		}
+	}
+	if len(rows) != 1 || !rows[0].Ready || relationFindings != 0 {
 		t.Fatalf("substring relation finding was attributed to %s: %#v", short.ID, rows)
 	}
 }

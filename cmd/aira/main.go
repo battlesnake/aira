@@ -1016,10 +1016,41 @@ func runAitestBootstrapCommand(ctx context.Context, options map[string]string, s
 		_, _ = fmt.Fprintln(stderr, "E_CONFINE_ARGUMENT_INVALID: --supervisor-pid must be a positive integer")
 		return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 	}
-	outer, err := runner.CurrentCgroupPath()
-	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: discover outer scope: %v\n", err)
-		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
+	// AIRA_AITEST_OUTER_SCOPE is the launcher's own scope.Reference(), injected
+	// by AppendAitestChildEnvironment. Prefer it over self-discovery (AIRA-44):
+	// a second aitest-enabled pytest run inside one confine job is, by the time
+	// it bootstraps, already living in <outer>/.aira-supervisor — the first run's
+	// drain relocated `make`, its shell and everything else there — so
+	// CurrentCgroupPath() would name the supervisor scope as "outer", nest a
+	// second supervisor scope inside it, and leave every worker-admit call
+	// answering "unevaluated: unbounded" against a deliberately-uncapped cgroup.
+	// The env value is not trusted blindly: BootstrapAitestSupervisor's
+	// membership guard still refuses any scope the supervisor is not actually
+	// inside.
+	outer := strings.TrimSpace(os.Getenv("AIRA_AITEST_OUTER_SCOPE"))
+	if outer != "" {
+		// Refuse a relative path rather than resolving it against whatever
+		// working directory pytest happened to have: bootstrap would mutate one
+		// cgroup and then report an `outer=` the daemon later resolves from a
+		// different directory, which is silently wrong accounting instead of a
+		// clean error. Clean() also normalises a trailing slash so the reported
+		// path and the daemon's are byte-identical.
+		if !filepath.IsAbs(outer) {
+			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: AIRA_AITEST_OUTER_SCOPE must be an absolute cgroup path, got %q\n", outer)
+			return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		}
+		outer = filepath.Clean(outer)
+	}
+	if outer == "" {
+		// Unset means a launcher that predates this coordinate, or a hand
+		// invocation. Self-discovery is still correct for the single-run case,
+		// so fall back rather than refuse.
+		discovered, err := runner.CurrentCgroupPath()
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: discover outer scope: %v\n", err)
+			return store.ExitForCode("E_CONFINE_UNAVAILABLE")
+		}
+		outer = discovered
 	}
 	supervisorScope, err := runner.BootstrapAitestSupervisor(ctx, outer, pid)
 	if err != nil {
@@ -1151,7 +1182,22 @@ func resolveConfineOwner(ctx context.Context, explicit string) (string, error) {
 			return project.WorktreeID, nil
 		}
 	}
-	return runner.ConfineUnknownOwner, nil
+	// Last resort: INFER from the launch directory rather than reporting the
+	// literal "unknown" (AIRA-23). The reported hazard was a session about to
+	// pgrep-kill two sibling sessions' jobs, all of them showing OWNER "unknown",
+	// and being saved only by inspecting each process's cwd by hand — so cwd is
+	// precisely the discriminator that was missing from `--list`.
+	//
+	// The inferred value is marked (runner.ConfineInferredOwnerPrefix) and is
+	// therefore NEVER accepted as ownership proof by the kill guard: two sessions
+	// in one directory infer the same string, so honouring it would let either
+	// kill the other's job without --steal. It makes `--list` actionable; it does
+	// not make the guard weaker, which AIRA-23 explicitly forbids.
+	cwd, err := os.Getwd()
+	if err != nil {
+		return runner.ConfineUnknownOwner, nil
+	}
+	return runner.InferConfineOwner(cwd), nil
 }
 
 func runConfineManagementCommand(ctx context.Context, options map[string]string, jsonOutput bool, stdout, stderr io.Writer, injected Dispatcher) int {

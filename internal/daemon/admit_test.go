@@ -100,17 +100,76 @@ func TestValidateAdmitArgsRejectsTraversalShapedConfineScopeID(t *testing.T) {
 	for key, value := range base {
 		valid[key] = value
 	}
-	valid["scope_id"] = "CONFINE-job-123-abc9"
+	// AIRA-52: the scope id now CARRIES the owner, so a canonical request's id
+	// must bind to the owner it claims.
+	valid["scope_id"] = "CONFINE-job-123-abc9@session-a"
 	request, err := validateAdmitArgs(valid, admitWaitCeilingMs)
 	if err != nil || request.scopeID != valid["scope_id"] || request.owner != "session-a" {
 		t.Fatalf("request=%+v err=%v", request, err)
 	}
-	valid["scope_id"] = "CONFINE-@dr-job-with-dash-123-abc9"
+	valid["scope_id"] = "CONFINE-@dr-job-with-dash-123-abc9@session-a"
 	valid["name"] = "job-with-dash"
 	valid["delegate_ram"] = true
 	request, err = validateAdmitArgs(valid, admitWaitCeilingMs)
 	if err != nil || !request.delegateRAM || request.name != "job-with-dash" {
 		t.Fatalf("marked request=%+v err=%v", request, err)
+	}
+}
+
+// TestValidateAdmitArgsBindsTheEmbeddedOwnerToTheClaimedOwner closes the
+// trust-boundary hole build-review (Sol) found in AIRA-52's first cut: the scope
+// id is the DURABLE ownership record, so a client that persists one owner while
+// the daemon accounts another leaves an owner nobody claimed to be read back as
+// attested after the next restart.
+//
+// verifies: AIRA-52
+func TestValidateAdmitArgsBindsTheEmbeddedOwnerToTheClaimedOwner(t *testing.T) {
+	args := func(scopeID, owner string) map[string]any {
+		return map[string]any{
+			"slice": "aira.slice", "reserve": int64(1), "max_wait_ms": int64(1),
+			"name": "job", "owner": owner, "scope_id": scopeID,
+		}
+	}
+	for _, tc := range []struct {
+		label   string
+		scopeID string
+		owner   string
+	}{
+		{"impersonates-another-owner", "CONFINE-job-123-abc9@victim", "session-a"},
+		{"persists-an-owner-it-did-not-claim", "CONFINE-job-123-abc9@victim", "unknown"},
+		{"forges-an-inferred-owner-tail", "CONFINE-job-123-abc9@@cwd-elsewhere", "session-a"},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			if _, err := validateAdmitArgs(args(tc.scopeID, tc.owner), admitWaitCeilingMs); err == nil {
+				t.Fatalf("scope_id=%q owner=%q was accepted", tc.scopeID, tc.owner)
+			}
+		})
+	}
+	// The matching pairs are accepted, so the binding is not simply refusing
+	// everything: an attested owner with its tail, an inferred owner with its
+	// (doubled-'@') tail, and an unknown owner with no tail at all.
+	for _, tc := range []struct {
+		label   string
+		scopeID string
+		owner   string
+	}{
+		{"attested", "CONFINE-job-123-abc9@session-a", "session-a"},
+		{"inferred", "CONFINE-job-123-abc9@@cwd-here", "@cwd-here"},
+		{"unknown-has-no-tail", "CONFINE-job-123-abc9", "unknown"},
+		// A MISSING tail is accepted on purpose, and the binding is asymmetric
+		// because of it: the client persisted no claim, which is the pre-AIRA-52
+		// behaviour (owner accounted in memory, job reads unowned after a
+		// restart, kill needs --steal). Refusing it would buy no safety and would
+		// hard-break every session whose installed binary predates this change,
+		// the moment the daemon restarts, with no protocol bump to signal it.
+		{"stale-client-persists-no-tail", "CONFINE-job-123-abc9", "session-a"},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			request, err := validateAdmitArgs(args(tc.scopeID, tc.owner), admitWaitCeilingMs)
+			if err != nil || request.scopeID != tc.scopeID || request.owner != tc.owner {
+				t.Fatalf("request=%+v err=%v", request, err)
+			}
+		})
 	}
 }
 

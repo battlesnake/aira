@@ -12,12 +12,15 @@ const (
 	CodeConfineKillUnconfirmed = "U_CONFINE_KILL_UNCONFIRMED"
 )
 
-// ConfineRegistryEntry is ownership metadata from a held daemon admission
-// lease. It never establishes filesystem existence.
+// ConfineRegistryEntry names a scope with a held daemon admission lease. It
+// never establishes filesystem existence — its only job is to surface a scope
+// that is admitted but not yet on disk, as a Pending row.
+//
+// It used to carry Name and Owner too. Both are now decoded from the scope
+// directory name instead (AIRA-52), which is authoritative and, unlike the
+// daemon's in-memory waiter list, survives a daemon restart.
 type ConfineRegistryEntry struct {
 	ScopeID string `json:"scope_id"`
-	Name    string `json:"name"`
-	Owner   string `json:"owner"`
 }
 
 // ConfineRecord preserves per-field uncertainty with nil values. A nil facet
@@ -139,14 +142,10 @@ func orphanedConfineScopeCandidates(records []ConfineRecord, grace time.Duration
 	return candidates
 }
 
-// ConfineOwnerLookup is deliberately invoked after selector resolution, at
-// kill time, so ownership never comes from a stale list snapshot.
-type ConfineOwnerLookup func(scopeID string) (owner string, known bool)
-
 func ListConfines(ctx context.Context, slicePath string, registry []ConfineRegistryEntry) (ConfineListResult, error) {
 	return listConfines(ctx, slicePath, registry)
 }
 
-func KillConfine(ctx context.Context, slicePath, selector, callerOwner string, steal bool, registry []ConfineRegistryEntry, freshOwner ConfineOwnerLookup) (ConfineKillResult, error) {
-	return killConfine(ctx, slicePath, selector, callerOwner, steal, registry, freshOwner, 2*time.Second)
+func KillConfine(ctx context.Context, slicePath, selector, callerOwner string, steal bool, registry []ConfineRegistryEntry) (ConfineKillResult, error) {
+	return killConfine(ctx, slicePath, selector, callerOwner, steal, registry, 2*time.Second)
 }

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"aira/internal/domain"
+	"aira/internal/gitcontext"
 	"aira/internal/gitremote"
 	"aira/internal/runner"
 	"aira/internal/store"
@@ -414,7 +415,9 @@ func PrepareInit(ctx context.Context, cwd string, args map[string]any) (InitPlan
 	var config Config
 	var data []byte
 	if existing, statErr := os.ReadFile(configPath); statErr == nil {
-		committed, err := exec.CommandContext(ctx, "git", "-C", root, "show", "HEAD:.aira/config").Output()
+		configCommand := exec.CommandContext(ctx, "git", "-C", root, "show", "HEAD:.aira/config")
+		configCommand.Env = gitcontext.ScrubbedEnvironment()
+		committed, err := configCommand.Output()
 		if err != nil {
 			return InitPlan{}, errors.New("E_ALREADY_INITIALIZED: .aira/config already exists")
 		}
@@ -766,6 +769,20 @@ func runGitRevParse(ctx context.Context, commandArgs []string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, "git", commandArgs...)
+	// Scrub GIT_* (AIRA-93). `git -C <dir> rev-parse` names the directory
+	// explicitly, but an inherited GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE OVERRIDES
+	// it, so discovery silently resolves a different repository than the one it
+	// was asked about — and everything downstream (project id, worktree id, the
+	// common-dir receipts and journal) is then keyed to the wrong project. That
+	// is not hypothetical: two receipts in this repository's own shared
+	// .git/aira/receipts.jsonl were written from /tmp test working directories
+	// under this project's id, colliding with its real seq 1 and 3 and making
+	// `aira reconcile --rebuild` fail E_JOURNAL_CORRUPT.
+	//
+	// AIRA-46 scrubbed the same variables in .githooks/common.sh, but only for
+	// the shell hooks; this is the one path it did not reach — the binary's own
+	// git-invoking helper, which inherits whatever environment its caller had.
+	command.Env = gitcontext.ScrubbedEnvironment()
 	command.WaitDelay = 3 * time.Second
 	output, err := command.Output()
 	if err != nil {

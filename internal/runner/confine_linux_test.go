@@ -1108,15 +1108,15 @@ func TestConfineDelegateRAMAlwaysUsesCeilingCap(t *testing.T) {
 }
 
 func TestDelegateRAMScopeIDMarkerIsPositionalAndUnambiguous(t *testing.T) {
-	marked := confineScopeID("suite-with-dash", true)
-	unmarked := confineScopeID("dr-suite", false)
+	marked := confineScopeID("suite-with-dash", "", true)
+	unmarked := confineScopeID("dr-suite", "", false)
 	if !IsDelegateRAMScopeID(marked) || IsDelegateRAMScopeID(unmarked) {
 		t.Fatalf("marker classification marked=%q unmarked=%q", marked, unmarked)
 	}
-	if name, _, _, ok := parseConfineScopeID(marked); !ok || name != "suite-with-dash" {
+	if name, _, _, _, ok := parseConfineScopeID(marked); !ok || name != "suite-with-dash" {
 		t.Fatalf("marked parse name=%q ok=%v id=%q", name, ok, marked)
 	}
-	if name, _, _, ok := parseConfineScopeID(unmarked); !ok || name != "dr-suite" {
+	if name, _, _, _, ok := parseConfineScopeID(unmarked); !ok || name != "dr-suite" {
 		t.Fatalf("unmarked parse name=%q ok=%v id=%q", name, ok, unmarked)
 	}
 }
@@ -1514,6 +1514,7 @@ var aitestCoordinateKeys = []string{
 	"AIRA_AITEST_WORKER_ADMIT_CMD",
 	"AIRA_AITEST_BOOTSTRAP_CMD",
 	"AIRA_AITEST_MAX_WORKERS_FALLBACK",
+	"AIRA_AITEST_OUTER_SCOPE",
 }
 
 // reportChildEnv builds a shell command printing each key's value, "|"-joined
@@ -1558,6 +1559,7 @@ func TestConfineNonDelegateWithPopulatedRuntimeDirDeliversNoAitestCoordinates(t 
 			"AIRA_AITEST_WORKER_ADMIT_CMD=/stale/aira",
 			"AIRA_AITEST_BOOTSTRAP_CMD=/stale/aira",
 			"AIRA_AITEST_MAX_WORKERS_FALLBACK=999",
+			"AIRA_AITEST_OUTER_SCOPE=/stale/scope",
 		},
 		Argv:       reportChildEnv(append(append([]string{}, aitestCoordinateKeys...), "AIRA_PY_LIB", "AIRA_CONFINE_SCOPE_ID")...),
 		RuntimeDir: t.TempDir(), SelfPath: os.Args[0], Stdout: &stdout, Stderr: io.Discard,
@@ -2000,7 +2002,7 @@ func confineRealSetupScope(t *testing.T, oomGroup bool) Scope {
 	if err := backend.Probe(context.Background()); err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "real setup backend probe: %v", err)
 	}
-	scope, err := backend.Create(context.Background(), confineScopeID("setup-test", false))
+	scope, err := backend.Create(context.Background(), confineScopeID("setup-test", "", false))
 	if err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "real setup scope create: %v", err)
 	}

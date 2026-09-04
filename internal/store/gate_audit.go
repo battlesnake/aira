@@ -366,11 +366,6 @@ func (a *GateAudit) Read() ([]GateAuditRecord, error) {
 	return a.readWithKey(key)
 }
 
-func (a *GateAudit) Verify() error {
-	_, err := a.Read()
-	return err
-}
-
 func (a *GateAudit) readWithKey(key []byte) ([]GateAuditRecord, error) {
 	f, err := os.Open(a.LedgerPath)
 	if errors.Is(err, os.ErrNotExist) {
@@ -444,10 +439,4 @@ func (a *GateAudit) readWithKey(key []byte) ([]GateAuditRecord, error) {
 		return nil, errors.New("E_JOURNAL_CORRUPT: durable audit head does not match ledger")
 	}
 	return records, nil
-}
-
-func GateAuditRecords(records []GateAuditRecord) []GateAuditRecord {
-	out := append([]GateAuditRecord(nil), records...)
-	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
-	return out
 }

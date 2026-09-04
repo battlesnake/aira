@@ -80,11 +80,16 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 			continue
 		}
 		scopeID := strings.TrimPrefix(entry.Name(), ".aira-")
-		name, pid, stamp, ok := parseConfineScopeID(scopeID)
+		name, pid, stamp, owner, ok := parseConfineScopeID(scopeID)
 		if !ok {
 			continue
 		}
-		record := ConfineRecord{Name: name, Owner: ConfineUnknownOwner, ScopeID: scopeID, SupervisorPID: &pid}
+		// Owner comes from the scope DIRECTORY NAME, so it survives a daemon
+		// restart (AIRA-52). Absent means genuinely unowned, never "we forgot".
+		if owner == "" {
+			owner = ConfineUnknownOwner
+		}
+		record := ConfineRecord{Name: name, Owner: owner, ScopeID: scopeID, SupervisorPID: &pid}
 		if age := deps.now().Sub(time.Unix(0, stamp)); age >= 0 {
 			seconds := int64(age / time.Second)
 			record.AgeSeconds = &seconds
@@ -313,38 +318,30 @@ func pidIsDead(pid int) bool {
 	return errors.Is(unix.Kill(pid, 0), unix.ESRCH)
 }
 
+// mergeConfineRegistry adds a Pending row for every admitted scope that is not
+// (yet) on disk. It no longer supplies name or owner: both come from the scope
+// id itself, which is authoritative and restart-surviving (AIRA-52). The
+// conflict/agreement dance this function used to perform — two waiters claiming
+// one scope id with different owners collapsing to "unknown" — went with it,
+// since one scope id can now only decode to one owner by construction.
 func mergeConfineRegistry(byID map[string]ConfineRecord, registry []ConfineRegistryEntry) {
-	seen := make(map[string]ConfineRegistryEntry)
-	conflict := make(map[string]bool)
 	for _, entry := range registry {
-		if !validConfineScopeID(entry.ScopeID) {
+		if _, exists := byID[entry.ScopeID]; exists {
 			continue
 		}
-		if prior, exists := seen[entry.ScopeID]; exists && (prior.Owner != entry.Owner || prior.Name != entry.Name) {
-			conflict[entry.ScopeID] = true
+		name, pid, stamp, owner, ok := parseConfineScopeID(entry.ScopeID)
+		if !ok {
+			continue
 		}
-		seen[entry.ScopeID] = entry
-	}
-	for scopeID, entry := range seen {
-		record, exists := byID[scopeID]
-		if !exists {
-			name, pid, stamp, ok := parseConfineScopeID(scopeID)
-			if !ok {
-				continue
-			}
-			record = ConfineRecord{Name: name, Owner: ConfineUnknownOwner, ScopeID: scopeID, SupervisorPID: &pid, Pending: true, UnevaluatedFields: []string{"populated", "rss", "cap"}}
-			age := time.Since(time.Unix(0, stamp))
-			if age >= 0 {
-				seconds := int64(age / time.Second)
-				record.AgeSeconds = &seconds
-			}
+		if owner == "" {
+			owner = ConfineUnknownOwner
 		}
-		if !conflict[scopeID] && entry.Name == record.Name && ValidateConfineIdentity(entry.Owner) == nil && entry.Owner != ConfineUnknownOwner {
-			record.Owner = entry.Owner
-		} else {
-			record.Owner = ConfineUnknownOwner
+		record := ConfineRecord{Name: name, Owner: owner, ScopeID: entry.ScopeID, SupervisorPID: &pid, Pending: true, UnevaluatedFields: []string{"populated", "rss", "cap"}}
+		if age := time.Since(time.Unix(0, stamp)); age >= 0 {
+			seconds := int64(age / time.Second)
+			record.AgeSeconds = &seconds
 		}
-		byID[scopeID] = record
+		byID[entry.ScopeID] = record
 	}
 }
 
@@ -360,52 +357,11 @@ func parseConfineInt(data []byte) (int64, error) {
 	return value, nil
 }
 
-func validConfineScopeID(scopeID string) bool {
-	_, _, _, ok := parseConfineScopeID(scopeID)
-	return ok
+func killConfine(ctx context.Context, slicePath, selector, callerOwner string, steal bool, registry []ConfineRegistryEntry, timeout time.Duration) (ConfineKillResult, error) {
+	return killConfineWithDeps(ctx, slicePath, selector, callerOwner, steal, registry, timeout, defaultConfineScanDeps())
 }
 
-func parseConfineScopeID(scopeID string) (string, int, int64, bool) {
-	if !strings.HasPrefix(scopeID, "CONFINE-") || strings.Contains(scopeID, "/") {
-		return "", 0, 0, false
-	}
-	rest := strings.TrimPrefix(scopeID, "CONFINE-")
-	if strings.HasPrefix(rest, delegateRAMScopeIDMarker+"-") {
-		rest = strings.TrimPrefix(rest, delegateRAMScopeIDMarker+"-")
-	}
-	last := strings.LastIndexByte(rest, '-')
-	if last <= 0 || last == len(rest)-1 {
-		return "", 0, 0, false
-	}
-	stamp, err := strconv.ParseInt(rest[last+1:], 36, 64)
-	if err != nil || stamp <= 0 {
-		return "", 0, 0, false
-	}
-	rest = rest[:last]
-	last = strings.LastIndexByte(rest, '-')
-	if last <= 0 || last == len(rest)-1 {
-		return "", 0, 0, false
-	}
-	name := rest[:last]
-	pid64, err := strconv.ParseInt(rest[last+1:], 10, 32)
-	if err != nil || pid64 <= 0 || ValidateConfineIdentity(name) != nil {
-		return "", 0, 0, false
-	}
-	return name, int(pid64), stamp, true
-}
-
-// IsDelegateRAMScopeID reports the restart-surviving cap type carrier. The
-// marker uses '@', which cannot occur in a user-supplied confine name, so it is
-// unambiguous even though names themselves may contain '-'.
-func IsDelegateRAMScopeID(scopeID string) bool {
-	return strings.HasPrefix(scopeID, "CONFINE-"+delegateRAMScopeIDMarker+"-")
-}
-
-func killConfine(ctx context.Context, slicePath, selector, callerOwner string, steal bool, registry []ConfineRegistryEntry, freshOwner ConfineOwnerLookup, timeout time.Duration) (ConfineKillResult, error) {
-	return killConfineWithDeps(ctx, slicePath, selector, callerOwner, steal, registry, freshOwner, timeout, defaultConfineScanDeps())
-}
-
-func killConfineWithDeps(ctx context.Context, slicePath, selector, callerOwner string, steal bool, registry []ConfineRegistryEntry, freshOwner ConfineOwnerLookup, timeout time.Duration, deps confineScanDeps) (ConfineKillResult, error) {
+func killConfineWithDeps(ctx context.Context, slicePath, selector, callerOwner string, steal bool, registry []ConfineRegistryEntry, timeout time.Duration, deps confineScanDeps) (ConfineKillResult, error) {
 	listed, err := listConfinesWithDeps(ctx, slicePath, registry, deps)
 	if err != nil {
 		return ConfineKillResult{}, err
@@ -436,15 +392,20 @@ func killConfineWithDeps(ctx context.Context, slicePath, selector, callerOwner s
 		return ConfineKillResult{}, fmt.Errorf("E_SELECTOR_AMBIGUOUS: selector %q matched %s", selector, strings.Join(ids, ", "))
 	}
 	record := matches[0]
-	owner, known := ConfineUnknownOwner, false
-	if freshOwner != nil {
-		owner, known = freshOwner(record.ScopeID)
-	}
-	if !known || owner == "" || owner == ConfineUnknownOwner {
+	// Ownership comes from the scope id decoded a few lines above, not from a
+	// daemon-memory lookup (AIRA-52): the id is on disk, so it is as fresh as the
+	// scope itself and, unlike the waiter list, it survives a daemon restart.
+	//
+	// Both sides must be ATTESTED for the guard to open. An inferred owner
+	// (AIRA-23, '@'-prefixed) reads as unattested on purpose: two sessions in one
+	// directory infer the same value, so honouring it would let either kill the
+	// other's job without --steal — the exact weakening AIRA-23 forbids. It is
+	// published for --list's benefit, not the guard's.
+	owner := strings.TrimSpace(record.Owner)
+	if owner == "" {
 		owner = ConfineUnknownOwner
-		known = false
 	}
-	if !steal && (!known || callerOwner == "" || callerOwner == ConfineUnknownOwner || owner != callerOwner) {
+	if !steal && (!ConfineOwnerIsAttested(owner) || !ConfineOwnerIsAttested(callerOwner) || owner != callerOwner) {
 		return ConfineKillResult{}, fmt.Errorf("%s: scope=%s owner=%s caller=%s; pass --steal to override", CodeConfineOwnerUnverified, record.ScopeID, owner, callerOwner)
 	}
 	if !validConfineScopeID(record.ScopeID) {

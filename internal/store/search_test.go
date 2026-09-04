@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,8 +31,15 @@ func TestSearchCoversCurrentTicketsAndReviewFindings(t *testing.T) {
 	if len(rows) != 2 || rows[0].Kind == rows[1].Kind {
 		t.Fatalf("search rows = %#v", rows)
 	}
-	if rows[0].Snippet == "" || rows[1].Snippet == "" {
-		t.Fatalf("search snippets = %#v", rows)
+	// The snippet must come from the CONTENT column and actually show the match,
+	// not merely be non-empty. The old query snippeted column index 3, which is
+	// worktree_id — always a non-empty string, so the previous `!= ""` check
+	// passed while every snippet carried the literal worktree name instead of
+	// the matched text. This is the assertion that tells the two apart.
+	for _, row := range rows {
+		if !strings.Contains(strings.ToLower(row.Snippet), "lunar") {
+			t.Fatalf("snippet %q does not show the match; it is not taken from the content column", row.Snippet)
+		}
 	}
 	if rows[0].Rank > rows[1].Rank {
 		t.Fatalf("search is not bm25 best-first: %#v", rows)

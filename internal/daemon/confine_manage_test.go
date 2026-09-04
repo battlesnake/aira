@@ -41,7 +41,9 @@ func TestConfineKillRetainedOutcomesDoNotReleaseReservation(t *testing.T) {
 		server := NewServer(Paths{})
 		server.admitResolveSlice = func(string) (string, bool, string) { return slice, true, "" }
 		queue := &sliceQueue{path: slice, server: server, kick: make(chan struct{}, 1), stop: make(chan struct{})}
-		id := "CONFINE-held-5101-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+		// AIRA-52: ownership is carried by the scope id itself, so the fixture
+		// must mint the owner-bearing form the launcher now produces.
+		id := "CONFINE-held-5101-" + strconv.FormatInt(time.Now().UnixNano(), 36) + "@session-a"
 		waiter := &admitWaiter{seq: 1, reserve: 64, state: admitGranted, accounted: true, grantedCh: make(chan struct{}), enqueued: time.Now(), scopeID: id, name: "held", owner: "session-a"}
 		queue.waiters = []*admitWaiter{waiter}
 		queue.outstanding, queue.outstandingJobs = 64, 1
@@ -93,11 +95,11 @@ func TestConfineRegistryLifetimeFreshLookupAndExactlyOnceRelease(t *testing.T) {
 	server.admitQueues[path] = queue
 
 	entries := server.activeConfines(path)
-	if len(entries) != 1 || entries[0] != (runner.ConfineRegistryEntry{ScopeID: waiter.scopeID, Name: "job", Owner: "session-a"}) {
+	// AIRA-52: the registry now carries the scope id ALONE. Name and owner are
+	// decoded from the id itself, which is on disk and survives a restart, so
+	// there is no freshConfineOwner lookup into daemon memory to make any more.
+	if len(entries) != 1 || entries[0] != (runner.ConfineRegistryEntry{ScopeID: waiter.scopeID}) {
 		t.Fatalf("entries=%+v", entries)
-	}
-	if owner, known := server.freshConfineOwner(path, waiter.scopeID); !known || owner != "session-a" {
-		t.Fatalf("fresh owner=%q known=%v", owner, known)
 	}
 
 	server.releaseActiveConfine(path, waiter.scopeID) // daemon confirmed-kill path
