@@ -315,6 +315,18 @@ type admitSnapshot struct {
 	phase           string
 	present         bool
 
+	// AIRA-24. One waiter's own place in the queue, answered only when a
+	// caller named its own scope id. queuePosition is 1-based and counts ONLY
+	// queued waiters, in enqueue-sequence (evaluation) order; queuedAheadBytes
+	// is the sum of the reserves of the queued waiters ahead of it. Zero is
+	// "no position established" — the scope id is not a queued waiter here
+	// (granted, released, unknown, or never asked) — never "position zero".
+	//
+	// Derived in the same locked walk as `queued` so the pair cannot describe
+	// two different instants, which is the whole reason admitSnapshot exists.
+	queuePosition    int
+	queuedAheadBytes int64
+
 	// AIRA-68. outstandingJobs fuses TWO structurally different populations, and
 	// the reported job total adds a third — while `confine --list`'s table above
 	// the summary lists only SCOPES:
@@ -368,7 +380,17 @@ func (snapshot admitSnapshot) residualBytes() int64 {
 	return snapshot.outstanding - (snapshot.scopeBytes + snapshot.reservationBytes)
 }
 
+// admitSliceSnapshot is the aggregate read: no caller identity, so no
+// per-waiter position is computed. Every existing caller wants exactly this.
 func (s *Server) admitSliceSnapshot(path string) admitSnapshot {
+	return s.admitSliceSnapshotFor(path, "")
+}
+
+// admitSliceSnapshotFor additionally locates ONE queued waiter by scope id
+// (AIRA-24). queuedScopeID is only ever compared for equality against the
+// scope ids the daemon itself minted into its waiter list, so an unknown or
+// malformed value simply matches nothing and leaves the position unestablished.
+func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot {
 	// With the duty cycle off a freeze may be actively blocking this queue, so
 	// reporting "idle" would state the opposite of the truth.
 	phase := admitFreezeIdle.String()
@@ -390,12 +412,23 @@ func (s *Server) admitSliceSnapshot(path string) admitSnapshot {
 		adopted: queue.adopted, adoptedJobs: queue.adoptedJobs,
 		phase: phase, present: true,
 	}
+	queuedBytes := int64(0)
 	for _, waiter := range queue.waiters {
 		if waiter == nil {
 			continue
 		}
 		if waiter.state == admitQueued {
 			snapshot.queued++
+			// AIRA-24. The position is an index among QUEUED waiters only, so it
+			// is taken here and nowhere else: counting granted or released
+			// waiters would report a place in a line that no longer exists. The
+			// first match wins — enqueueAdmitInternal refuses a duplicate scope
+			// id (CodeProtocol), so a second match is not reachable.
+			if queuedScopeID != "" && snapshot.queuePosition == 0 && waiter.scopeID == queuedScopeID {
+				snapshot.queuePosition = snapshot.queued
+				snapshot.queuedAheadBytes = queuedBytes
+			}
+			queuedBytes = addClamp(queuedBytes, waiter.reserve)
 			continue
 		}
 		// The classifier is scopeID and nothing else. name/owner cannot be used:
