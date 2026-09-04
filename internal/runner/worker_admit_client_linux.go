@@ -149,14 +149,18 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) Worke
 	if problem := workerAdmitGrantProblem(grant); problem != "" {
 		_ = conn.Close()
 		// A grant whose placement coordinates are unusable is a CONTRACT
-		// problem, not a local one. Found by Sol build-review: without this
-		// check, a grant with memory_high >= memory_max sailed through to
-		// CreateWorkerScope, which rejects exactly that
-		// (worker_scope_linux.go:29), and the CLI then reported
-		// `placement-failed` — a class that makes the supervisor run the rest
-		// of the suite UNCONFINED. A nonsensical grant is the daemon and this
-		// client disagreeing; reporting it as a broken local cgroup mechanism
-		// blames the wrong component AND takes the dangerous direction.
+		// problem: the daemon and this client disagree about what a grant is.
+		//
+		// Found by Sol build-review against the pre-AIRA-39 shape, where the
+		// CLI called CreateWorkerScope itself and a grant with
+		// memory_high >= memory_max sailed through to it, failed there, and
+		// was reported `placement-failed` — one of the two classes that make
+		// the supervisor run the rest of the suite UNCONFINED. AIRA-39 moved
+		// that creation into the daemon, so this is no longer the difference
+		// between two classes on a live path; it is a pure contract guard
+		// against a daemon that is buggy or out of lockstep with this client.
+		// Kept for that reason, and because the check is nearly free and only
+		// ever moves an outcome AWAY from a containment-stripping class.
 		return WorkerAdmitOutcome{
 			State: WorkerAdmitStateUnevaluated, Class: WorkerAdmitClassContractViolation,
 			Reason: WorkerAdmitReasonMalformedGrant, Detail: problem,
@@ -196,14 +200,17 @@ func classifyWorkerAdmitDialFailure(err error) WorkerAdmitOutcome {
 }
 
 // workerAdmitGrantProblem states why a granted payload is unusable, or "" if
-// it is fine. It enforces exactly the invariants the two consumers downstream
-// depend on and would otherwise discover as their own local failure:
-// CreateWorkerScope refuses memory_high >= memory_max
-// (worker_scope_linux.go:29, spec 3.3's soft-throttle-below-hard-cap rule),
-// and supervisor.py's own grant validation requires both limits positive.
-// Checking here means a nonsensical grant is reported as what it is — a
-// contract violation — rather than as a local placement failure, which is one
-// of only two classes that strip RAM containment for a whole run.
+// it is fine. It enforces exactly the invariants every consumer of a grant
+// depends on: a worker id and scope path to place into, both limits positive,
+// and memory_high below memory_max (spec 3.3's soft-throttle-below-hard-cap
+// rule, which runner.CreateWorkerScope itself refuses to violate and
+// supervisor.py's own grant validation re-checks).
+//
+// Since AIRA-39 the daemon creates the scope, so a grant that violates these
+// should be impossible to produce — which is the point: reaching this branch
+// means the daemon and this client disagree about the channel, and the honest
+// report is contract-violation (terminal, loud) rather than any class that
+// blames a local mechanism or strips containment.
 func workerAdmitGrantProblem(grant workerAdmitGrant) string {
 	switch {
 	case grant.WorkerID == "":

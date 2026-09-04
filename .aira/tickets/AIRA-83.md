@@ -137,5 +137,6 @@ cleanly and names the remedy instead of restarting the shared
 `aira-daemon.service`, AND the aitest supervisor reports the skew honestly
 instead of marking every queued test unevaluated with a sizing diagnostic.
 
-`daemon.ProtocolVersion` moves 5 → 6 in the same change, so the deploy must be
-an atomic reinstall+restart (backlog-remediation plan §8).
+`daemon.ProtocolVersion` moves **6 → 7** in the same change (written as 5 → 6
+before AIRA-39 landed first and took 6), so the deploy must be an atomic
+reinstall+restart (backlog-remediation plan §8).

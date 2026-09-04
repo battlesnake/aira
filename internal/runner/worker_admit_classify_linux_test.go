@@ -295,11 +295,14 @@ func TestRequestWorkerAdmitClassifiesEndToEnd(t *testing.T) {
 	})
 
 	// verifies: AIRA-42 — a grant whose placement coordinates are unusable is
-	// a CONTRACT violation, not a local placement failure. Found by Sol
-	// build-review: memory_high >= memory_max is exactly what
-	// CreateWorkerScope refuses (worker_scope_linux.go:29), so without this
-	// check such a grant produced `placement-failed` — one of the two classes
-	// that make the supervisor run the rest of the suite UNCONFINED.
+	// a CONTRACT violation. Found by Sol build-review against the pre-AIRA-39
+	// shape, where such a grant reached the CLI's own CreateWorkerScope call,
+	// failed there, and was reported `placement-failed` — one of the two
+	// classes that make the supervisor run the rest of the suite UNCONFINED.
+	// AIRA-39 moved scope creation into the daemon, so this is now a contract
+	// guard against a daemon out of lockstep with this client rather than a
+	// live mis-blame; the assertion is unchanged and still pins the safe
+	// direction.
 	for _, bad := range []struct {
 		name  string
 		grant workerAdmitGrant

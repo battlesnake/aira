@@ -75,4 +75,8 @@ fails if any retired prose token reappears anywhere in `supervisor.py` or if
 catalogues equal in both directions. Seven mutations were applied and all seven
 were killed (plan §9).
 
-Bumps `daemon.ProtocolVersion` 5 → 6.
+Bumps `daemon.ProtocolVersion` **6 → 7** (and its pinned runner copy,
+`runner.DaemonProtocolVersion`). Originally written as 5 → 6; AIRA-39 landed
+first and took 6 for its own semantics change, so this shape change takes 7.
+Both branches independently wrote `= 6`, so the runner's copy auto-merged with
+no conflict — the pin test only holds the two sides equal, not correct.

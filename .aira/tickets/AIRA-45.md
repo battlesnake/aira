@@ -61,7 +61,16 @@ have been a seventh substring in the pattern AIRA-42 exists to end. Instead:
   `class=request-invalid`.
 
 This was live-reachable as of this very change, which bumps
-`daemon.ProtocolVersion` 5 → 6 — the exact scenario the ticket predicted.
+`daemon.ProtocolVersion` **6 → 7** — the exact scenario the ticket predicted.
+(Written as 5 → 6 while in review; AIRA-39 landed first and took 6.)
+
+The terminal exception is also RENAMED `WorkerAdmitRequestTooLarge` →
+`WorkerAdmitRequestInvalid`, matching its class token. This ticket's whole
+complaint is that "cannot be admitted at this sizing" is the factually wrong
+diagnostic; AIRA-39 then added two more members (`worker-scope-create-failed`,
+`worker-id-space-exhausted`) that are about neither sizing nor the request.
+Leaving the old name would have kept the wrong words on the most visible
+surface while claiming the bucket was fixed.
 
 `aitest/__init__.py`'s stale comment claiming the classifier "does not
 recognize" `E_DAEMON_PROTOCOL` is corrected (the ticket's item 2).
