@@ -477,3 +477,50 @@ func TestReadyReportsGateEvidenceFailureWithAndWithoutSelector(t *testing.T) {
 		})
 	}
 }
+
+// TestReadySurfacesAnUnpopulatedGateSetWithoutBlocking is AIRA-56's regression
+// test. `ready` used to skip its whole gate contribution when zero gates were
+// discovered, so a caller reading `ready: true` could not tell "nothing was
+// checked" from "nothing is wrong".
+//
+// Both halves matter and are asserted together, because each alone is satisfied
+// by a wrong implementation: surfacing WITHOUT blocking is the whole design
+// (blocking would make the queue unusable for every project that never adopted
+// the opt-in gates feature -- the reason AIRA-54 deferred this in the first
+// place).
+//
+// verifies: AIRA-56
+func TestReadySurfacesAnUnpopulatedGateSetWithoutBlocking(t *testing.T) {
+	s, root := newGateHonestyStore(t)
+	if err := os.MkdirAll(filepath.Join(root, ".aira", "tickets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTicketFile(t, filepath.Join(root, ".aira", "tickets", "AIRA-1.md"), "AIRA-1")
+	// No .aira/gates directory at all: the ordinary shape for a project that
+	// never adopted gates, and the shape an accidentally-emptied gate directory
+	// is indistinguishable from.
+	if err := s.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	rows, err := s.Ready("")
+	if err != nil {
+		t.Fatalf("ready: %v", err)
+	}
+	if len(rows) == 0 {
+		t.Fatal("no ready rows; the fixture cannot establish either half")
+	}
+	for _, row := range rows {
+		found := false
+		for _, finding := range row.Findings {
+			if finding.Code == GateSetEmptyCode {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("row %+v carries no %s finding: an unpopulated gate set is still invisible", row, GateSetEmptyCode)
+		}
+		if !row.Ready || row.Verdict == "fail" || row.Verdict == "unevaluated" {
+			t.Fatalf("row %+v was BLOCKED by an empty gate set; the finding must be advisory", row)
+		}
+	}
+}

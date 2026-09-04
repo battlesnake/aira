@@ -573,6 +573,40 @@ func (s *Store) Ready(selector string) ([]ReadyRecord, error) {
 		if !findingAlreadyRepresented(result, gateFinding) {
 			result = append(result, ReadyRecord{Ticket: TicketRecord{Path: repoPath(s.root, s.root)}, Ready: false, Verdict: "unevaluated", Findings: []CheckFinding{gateFinding}})
 		}
+	} else if len(gateReport.Results) == 0 && gateReport.Code == GateSetEmptyCode {
+		// AIRA-56: an unpopulated gate set used to be skipped wholesale, so a
+		// caller reading `ready: true` got NO signal that nothing gate-shaped was
+		// established — "nothing was checked" was indistinguishable from "nothing
+		// is wrong". It is now surfaced, using the U_GATE_SET_EMPTY primitive
+		// AIRA-54 already established, so no new state is invented for it.
+		//
+		// ADVISORY on purpose: it attaches a finding and does NOT touch Ready or
+		// Verdict. The ticket's own analysis rules out both alternatives —
+		// blocking readiness whenever no gate exists makes the queue unusable for
+		// every project that never adopted the opt-in gates feature, and the
+		// filesystem has no sound "this project uses gates" predicate to narrow it
+		// with (hasGateContent, the candidate, was false for exactly the
+		// accidentally-emptied directory the ticket cares about, and is deleted).
+		//
+		// The ticket's suggested direction — consult the gate audit ledger for
+		// prior gate activity and HOLD readiness on a regression — is deliberately
+		// not taken here: it makes readiness depend on durable ledger memory, which
+		// is more machinery than this honesty gap justifies. Recorded as an
+		// accepted gap, not silently dropped: a project whose gates were deleted
+		// after recording results is surfaced but not held.
+		// Attached only to records that are still READY. Those are the ones
+		// making the claim this ticket is about — "ready: true" with no gate
+		// signal, where "nothing was checked" reads as "nothing is wrong". A
+		// record already reporting fail or unevaluated is not making that claim,
+		// and adding a second, weaker finding to it would be noise on top of the
+		// reason a reader actually needs.
+		finding := CheckFinding{Code: GateSetEmptyCode, Subject: "gates", Message: "no gate definition is present, so nothing gate-shaped was evaluated", Kind: "warning"}
+		for i := range result {
+			if !result[i].Ready {
+				continue
+			}
+			result[i].Findings = appendUniqueFinding(result[i].Findings, finding)
+		}
 	} else if len(gateReport.Results) > 0 {
 		definitions, _ := s.discoverGates()
 		advisory := map[string]bool{}
