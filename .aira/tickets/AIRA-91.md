@@ -271,3 +271,21 @@ the strongest evidence this ticket has had: a live, timestamped trigger
 rather than a stale incident reconstructed after the fact. Awaiting qual's
 exact timestamp to confirm or rule this out. Further daemon restarts are
 paused pending that answer.
+
+**RETRACTED (qual, minutes later, same 2026-09-04): this `admin` incident was
+not real.** On a proper re-read, `admin` completed successfully — full
+`"aitest: 211 passed, 0 failed, 2 skipped, ..."` line and pytest's normal
+trailer, genuinely not truncated. It did run `E_CONFINE_UNAVAILABLE:
+worker-admit unevaluated: unbounded -- falling back to ... UNCONFINED` (the
+documented graceful daemon-unreachable degradation path), and completed
+correctly unconfined. The false BLANK reclassification was qual's own
+guard's regex only matching pytest's native `^[0-9]+ (passed|failed|...)`
+summary shape, not aitest's own `"aitest: N passed..."`-prefixed one — a
+bug in the guard, not in aitest. So: **still 3 legs
+(`hosted`/`services`/`pipeline`), not 4** — the fourth-leg generalization
+claim above is withdrawn. The daemon-restart-mid-run hypothesis remains
+exactly where it was before this incident: plausible, unconfirmed, no
+timestamp chase performed (correctly aborted before it started). Left the
+retracted section above in place rather than deleting it, since the
+guard-regex gap it exposed is itself a real, useful finding for BL-969-style
+work even though the incident itself wasn't AIRA-91.
