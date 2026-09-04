@@ -91,6 +91,14 @@ func leaseStringArg(args map[string]any, name string) (string, error) {
 	return value, nil
 }
 
+// supervisorLeaseRequest takes conn ONLY to read its peer credentials
+// (getsockopt SO_PEERCRED via unixPeerCredential); it never reads the socket.
+// That matters since AIRA-84: serveConnection clears the handshake read
+// deadline before dispatching here, so this connection has NO read deadline. A
+// read added below without setting its own would block forever rather than
+// inherit a stale one — flagged in build review as the likeliest place for that
+// mistake, since this is the one post-handshake handler that is handed conn
+// without owning a framed reader.
 func (s *Server) supervisorLeaseRequest(ctx context.Context, conn net.Conn, scope WorktreeScope, verb string, args map[string]any) core.Response {
 	credential := s.peerCredential
 	if credential == nil {

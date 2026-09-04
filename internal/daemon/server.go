@@ -126,12 +126,16 @@ type Server struct {
 	peerCredential          func(net.Conn) (int, int, error)
 	storeOpAppendTimeout    time.Duration
 	storeOpHeavyTimeout     time.Duration
-	storeOpWriteTimeout     time.Duration
-	storeOpRun              func(context.Context, *store.Store, StoreOpFrame) (any, error)
-	listRegistryEntries     func(string) ([]store.RegistryEntry, error)
-	discoverProject         func(context.Context, string) (app.Project, error)
-	adoptRebuild            func(context.Context, *store.Store) error
-	beforeEjectTransaction  func()
+	// deadlines is the transport's one deadline convention (AIRA-84); see
+	// deadlines.go. It replaces the former storeOpWriteTimeout field and the
+	// hardcoded connect stamp, which were two independent numbers for one
+	// policy.
+	deadlines              deadlinePolicy
+	storeOpRun             func(context.Context, *store.Store, StoreOpFrame) (any, error)
+	listRegistryEntries    func(string) ([]store.RegistryEntry, error)
+	discoverProject        func(context.Context, string) (app.Project, error)
+	adoptRebuild           func(context.Context, *store.Store) error
+	beforeEjectTransaction func()
 }
 
 func NewServer(paths Paths) *Server {
@@ -160,7 +164,7 @@ func NewServer(paths Paths) *Server {
 		staleLeaseReleaseGrace:       defaultStaleLeaseReleaseGrace,
 		storeOpAppendTimeout:         30 * time.Second,
 		storeOpHeavyTimeout:          5 * time.Minute,
-		storeOpWriteTimeout:          30 * time.Second,
+		deadlines:                    defaultDeadlines,
 	}
 	server.governor = newGovernorSet(capacity, governorObserve, server)
 	server.projectCond = sync.NewCond(&server.mu)
@@ -532,8 +536,17 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 			_ = writeFrame(conn, errorFrame(CodeInternal, fmt.Sprintf("%s: recovered request panic", CodeInternal)))
 		}
 	}()
-	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	// Rule (1) of the deadline convention (deadlines.go): this bounds the
+	// HANDSHAKE — reading and parsing the inbound frame — and nothing else.
+	_ = conn.SetDeadline(time.Now().Add(s.resolvedDeadlines().Connect))
 	request, storeOp, err := readInboundFrame(conn)
+	// The three rejections below are handshake failures, so they answer under
+	// the handshake deadline rather than through reply — see deadlines.go.
+	// Accepted consequence, unchanged from before this fix: a peer that spends
+	// the whole Connect budget failing to deliver a frame may not receive its
+	// rejection either. That peer has already shown it cannot keep up, and
+	// granting it a fresh write window would double the goroutine it holds; an
+	// EOF instead of E_DAEMON_PROTOCOL is the cheaper end for it.
 	if err != nil {
 		wrote = writeFrame(conn, errorFrame(CodeProtocol, err.Error())) == nil
 		return
@@ -552,11 +565,20 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		wrote = writeFrame(conn, errorFrame(CodeProjectInvalid, CodeProjectInvalid+": state identity does not match daemon")) == nil
 		return
 	}
+	// The handshake is over, so the connect deadline has done its job and must
+	// not survive it (AIRA-84). Cleared ONCE here rather than repeated in each
+	// handler that remembered to: below this line no path reads the connection
+	// before its own handler owns it (store-op, admit, governor, worker-admit,
+	// watch's disconnect probe), and every response write stamps its own fresh
+	// write deadline through reply/replyStoreOp.
+	//
+	// INVARIANT for anything added below: this connection has NO read deadline
+	// from here on. A new branch that reads from conn must set its own, exactly
+	// as admit/governor/worker-admit own their framed reads today — inheriting
+	// a handshake deadline was the bug, but inheriting none is a hang.
+	_ = conn.SetReadDeadline(time.Time{})
 	if storeOp != nil {
-		_ = conn.SetReadDeadline(time.Time{})
-		response := s.serveStoreOp(scope, *storeOp)
-		_ = conn.SetWriteDeadline(time.Now().Add(s.storeOpWriteTimeout))
-		wrote = writeResponse(conn, response) == nil
+		wrote = s.replyStoreOp(conn, s.serveStoreOp(scope, *storeOp))
 		return
 	}
 	verb := core.CanonicalVerb(request.Request.Verb)
@@ -564,21 +586,21 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		if s.OnRequest != nil {
 			s.OnRequest(request.Scope, request.Request)
 		}
-		wrote = writeFrame(conn, responseFrame(s.confineReport(request.Request.Args))) == nil
+		wrote = s.reply(conn, responseFrame(s.confineReport(request.Request.Args)))
 		return
 	}
 	if verb == "confine-list" || verb == "confine-kill" {
 		if s.OnRequest != nil {
 			s.OnRequest(request.Scope, request.Request)
 		}
-		wrote = writeFrame(conn, responseFrame(s.confineManagement(ctx, request.Request))) == nil
+		wrote = s.reply(conn, responseFrame(s.confineManagement(ctx, request.Request)))
 		return
 	}
 	if verb == "eject" {
 		if s.OnRequest != nil {
 			s.OnRequest(request.Scope, request.Request)
 		}
-		wrote = writeFrame(conn, responseFrame(s.eject(ctx, request.Request.Args))) == nil
+		wrote = s.reply(conn, responseFrame(s.eject(ctx, request.Request.Args)))
 		return
 	}
 	if verb == "admit" {
@@ -589,7 +611,6 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		// Suppress the generic panic writer, which could otherwise write after
 		// the handler's deferred release.
 		wrote = true
-		_ = conn.SetReadDeadline(time.Time{})
 		s.admitConnection(conn, request.Request.Args)
 		return
 	}
@@ -600,7 +621,6 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		// governorConnection has one framed reader for the lifetime of this
 		// connection; never let the generic dispatcher read from it again.
 		wrote = true
-		_ = conn.SetReadDeadline(time.Time{})
 		s.governorConnection(conn, request.Request.Args)
 		return
 	}
@@ -612,14 +632,13 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		// path, exactly like admit/governor above — never let the generic
 		// dispatcher touch this connection again.
 		wrote = true
-		_ = conn.SetReadDeadline(time.Time{})
 		s.workerAdmitConnection(conn, request.Request.Args)
 		return
 	}
 	if scope.ProjectID != "" {
 		release, err := s.beginProjectUse(scope.ProjectID)
 		if err != nil {
-			wrote = writeFrame(conn, responseFrame(lifecycleError(err))) == nil
+			wrote = s.reply(conn, responseFrame(lifecycleError(err)))
 			return
 		}
 		defer release()
@@ -628,11 +647,11 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		if s.OnRequest != nil {
 			s.OnRequest(request.Scope, request.Request)
 		}
-		wrote = writeFrame(conn, responseFrame(s.supervisorLeaseRequest(ctx, conn, request.Scope, verb, request.Request.Args))) == nil
+		wrote = s.reply(conn, responseFrame(s.supervisorLeaseRequest(ctx, conn, request.Scope, verb, request.Request.Args)))
 		return
 	}
 	if _, route := core.ClassifyRequest(request.Request); route == core.RouteClient {
-		wrote = writeFrame(conn, errorFrame(CodeProtocol, CodeProtocol+": client-only operation cannot run in daemon")) == nil
+		wrote = s.reply(conn, errorFrame(CodeProtocol, CodeProtocol+": client-only operation cannot run in daemon"))
 		return
 	}
 	if s.OnRequest != nil {
@@ -640,7 +659,6 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 	}
 	var response core.Response
 	if verb == "watch" {
-		_ = conn.SetReadDeadline(time.Time{})
 		connCtx, cancelConn := context.WithCancel(context.Background())
 		go func() {
 			var one [1]byte
@@ -648,6 +666,9 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 			cancelConn()
 		}()
 		response = s.watch(connCtx, request.Scope, request.Request.Args)
+		// Watch keeps its own tighter write budget: it is a streaming path with
+		// its own design, deliberately out of AIRA-84's scope. It already obeys
+		// rule (3) — stamped immediately before the write.
 		_ = conn.SetWriteDeadline(time.Now().Add(watchWriteTimeout))
 		wrote = writeFrame(conn, responseFrame(response)) == nil
 		return
@@ -673,7 +694,11 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 			response = dispatcher.Do(ctx, request.Request)
 		}
 	}
-	wrote = writeFrame(conn, responseFrame(response)) == nil
+	// AIRA-84's own site: this used to write under the connect-time deadline,
+	// so a routed verb whose work outran it (a large import, a gate attest over
+	// a big subject, a reconcile --rebuild) committed durably and then failed
+	// the response write, which the client can only report as OUTCOME_UNKNOWN.
+	wrote = s.reply(conn, responseFrame(response))
 }
 
 func readInboundFrame(r io.Reader) (*RequestFrame, *StoreOpFrame, error) {
