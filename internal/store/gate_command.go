@@ -19,23 +19,26 @@ import (
 	"aira/internal/runner"
 )
 
-func (s *Store) evaluateChecker(ctx context.Context, def gate.GateDefinition, root string) (DimensionEvaluation, error) {
+// evaluateChecker dispatches on the lane's checker. Every checker receives an
+// already-captured subject rather than a root path: no evaluator re-reads the
+// tree it is evaluating (AIRA-80).
+func (s *Store) evaluateChecker(ctx context.Context, def gate.GateDefinition, subject capturedSubject) (DimensionEvaluation, error) {
 	switch def.Lane.Checker {
 	case string(gate.CheckerDimension):
 		if def.Checkable == nil {
 			return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_EVIDENCE_UNAVAILABLE"}, errors.New("U_GATE_EVIDENCE_UNAVAILABLE: checkable payload is missing")
 		}
-		return EvaluateDimension(root, def.Checkable.Dimension)
+		return evaluateDimension(subject, def.Checkable.Dimension)
 	case string(gate.CheckerCommand):
-		return s.runCommandChecker(ctx, def, root)
+		return s.runCommandChecker(ctx, def, subject)
 	case string(gate.CheckerRatchet):
-		return s.evaluateRatchet(ctx, def, root)
+		return s.evaluateRatchet(ctx, def, subject)
 	default:
 		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_COMMAND_RUN_UNEVALUATED"}, fmt.Errorf("E_GATE_INVALID: unsupported checker %q", def.Lane.Checker)
 	}
 }
 
-func (s *Store) runCommandChecker(ctx context.Context, def gate.GateDefinition, sourceRoot string) (DimensionEvaluation, error) {
+func (s *Store) runCommandChecker(ctx context.Context, def gate.GateDefinition, subject capturedSubject) (DimensionEvaluation, error) {
 	if def.Command == nil {
 		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_COMMAND_RUN_UNEVALUATED"}, errors.New("U_GATE_COMMAND_RUN_UNEVALUATED: command payload is missing")
 	}
@@ -46,11 +49,12 @@ func (s *Store) runCommandChecker(ctx context.Context, def gate.GateDefinition, 
 	if err := command.Validate(); err != nil {
 		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_COMMAND_RUN_UNEVALUATED"}, err
 	}
-	snapshot, rootDigest, cleanup, err := materializeTrackedSnapshot(sourceRoot)
+	snapshot, cleanup, err := materializeSubject(subject)
 	if err != nil {
 		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_COMMAND_RUN_UNEVALUATED"}, fmt.Errorf("U_GATE_COMMAND_RUN_UNEVALUATED: materialize subject: %w", err)
 	}
 	defer cleanup()
+	rootDigest := subject.digest
 	cwd, err := resolveCommandCwd(snapshot, command.Cwd)
 	if err != nil {
 		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_COMMAND_RUN_UNEVALUATED", Root: EvaluationRoot{Path: snapshot, Digest: rootDigest}}, err
@@ -272,63 +276,66 @@ func hasRunnerCodeExcept(record *runner.RunRecord, allowed string) bool {
 	return false
 }
 
-// materializeTrackedSnapshot copies the source's tracked files into an isolated
-// tree a command may execute in, and returns the digest of the very bytes it
-// copied.
+// materializeSubject copies an already-captured subject's tracked files into an
+// isolated tree a command may execute in.
 //
-// Returning the digest of the capture -- rather than letting the caller hash
-// something afterwards -- is what makes the command lane's proof-time subject
-// agree with GateCheck's check-time subject by construction (AIRA-72, invariant
-// I3). Two alternatives are both wrong. Hashing the materialised directory,
-// which is what this used to do, hashes a re-indexed tree: `git add -A` below
-// silently drops any file matched by the copied .gitignore or the user's
-// core.excludesFile, so a file that is both tracked and ignored in the source
-// (legal in git) is absent from the proof digest and present in the check
-// digest, permanently invalidating a genuine pass. Re-reading sourceRoot after
-// this returns would instead open a window in which the tree changes between
-// the bytes that ran and the bytes that were bound -- a small false pass.
-func materializeTrackedSnapshot(sourceRoot string) (string, string, func(), error) {
-	entries, err := stableSubjectEntries(sourceRoot)
-	if err != nil {
-		return "", "", func() {}, err
-	}
-	digest := digestSubjectEntries(entries)
+// It takes the capture rather than a root path so the bytes that run and the
+// bytes the verdict is bound to (capturedSubject.digest) come from one read by
+// construction (AIRA-72 invariant I3, generalised to every lane by AIRA-80).
+// Re-reading a root here would instead open a window in which the tree changes
+// between the bytes that ran and the bytes that were bound -- a small false
+// pass.
+//
+// The stage is `add -A -f`, not `add -A`. The materialised directory holds
+// exactly the captured entries and nothing else -- we wrote every one of them
+// and `git init` adds only .git -- so forcing makes the resulting index exactly
+// the captured set. Without the force, `git add -A` drops any entry matched by
+// the copied .gitignore or the user's core.excludesFile, which is legal for a
+// tracked file (`git add -f` in the source) and left the materialised tree's
+// tracked set a strict subset of the source's. The mutation canary
+// re-materialises from this tree, so that loss made a canary able to fire
+// because a file DISAPPEARED rather than because the declared mutation
+// perturbed anything -- and a fire mints proof-of-fire, which licenses a
+// trusted pass (AIRA-81). Pinned by
+// TestMaterializationPreservesTrackedButIgnoredFiles and, end to end, by
+// TestIgnoredTrackedFileDropDoesNotMintProofOfFire.
+func materializeSubject(subject capturedSubject) (string, func(), error) {
 	dir, err := os.MkdirTemp("", "aira-gate-subject-")
 	if err != nil {
-		return "", "", func() {}, err
+		return "", func() {}, err
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
-	for _, entry := range entries {
+	for _, entry := range subject.entries {
 		// A command runs in a real working tree, so this refuses what it cannot
-		// reproduce faithfully rather than dereferencing it. The digest above is
-		// broader on purpose: it must describe entries the materialiser rejects.
+		// reproduce faithfully rather than dereferencing it. The digest is broader
+		// on purpose: it must describe entries the materialiser rejects.
 		if !entry.regular() {
 			cleanup()
-			return "", "", func() {}, fmt.Errorf("tracked path %s is not a regular file", entry.path)
+			return "", func() {}, fmt.Errorf("tracked path %s is not a regular file", entry.path)
 		}
 		path := filepath.Join(dir, filepath.FromSlash(entry.path))
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			cleanup()
-			return "", "", func() {}, err
+			return "", func() {}, err
 		}
 		if err := os.WriteFile(path, entry.payload, entry.perm.Perm()); err != nil {
 			cleanup()
-			return "", "", func() {}, err
+			return "", func() {}, err
 		}
 		if err := os.Chmod(path, entry.perm.Perm()); err != nil {
 			cleanup()
-			return "", "", func() {}, err
+			return "", func() {}, err
 		}
 	}
 	if _, stderr, err := runGit(dir, "init", "-q"); err != nil {
 		cleanup()
-		return "", "", func() {}, fmt.Errorf("git init: %w: %s", err, strings.TrimSpace(stderr))
+		return "", func() {}, fmt.Errorf("git init: %w: %s", err, strings.TrimSpace(stderr))
 	}
-	if _, stderr, err := runGit(dir, "add", "-A"); err != nil {
+	if _, stderr, err := runGit(dir, "add", "-A", "-f"); err != nil {
 		cleanup()
-		return "", "", func() {}, fmt.Errorf("git add: %w: %s", err, strings.TrimSpace(stderr))
+		return "", func() {}, fmt.Errorf("git add: %w: %s", err, strings.TrimSpace(stderr))
 	}
-	return dir, digest, cleanup, nil
+	return dir, cleanup, nil
 }
 
 func trackedSnapshotPaths(root string) ([]string, error) {
@@ -342,12 +349,25 @@ func trackedSnapshotPaths(root string) ([]string, error) {
 		if path == "" {
 			continue
 		}
-		if !safeSnapshotPath(path) {
+		if !gate.SafeRelativePath(path) {
 			return nil, fmt.Errorf("invalid tracked path %q", path)
 		}
 		paths = append(paths, path)
 	}
 	sort.Strings(paths)
+	// `git ls-files --cached` lists an unmerged path once per stage, so a
+	// conflicted index yields the same path two or three times. The digest would
+	// then be over a multiset while materializeSubject collapses it to one
+	// stage-0 entry, so capture -> materialise -> capture stops being the
+	// identity exactly when a repository is mid-conflict. There is no single
+	// coherent content for such a path, so there is no subject to bind a verdict
+	// to: refuse rather than pick a stage. Pinned by
+	// TestCaptureRefusesAnUnmergedIndex.
+	for i := 1; i < len(paths); i++ {
+		if paths[i] == paths[i-1] {
+			return nil, fmt.Errorf("U_GATE_EVIDENCE_UNAVAILABLE: unmerged index: tracked path %q has more than one stage", paths[i])
+		}
+	}
 	return paths, nil
 }
 
@@ -355,18 +375,10 @@ func trackedSnapshotPaths(root string) ([]string, error) {
 // shared by the subject digest and this materialiser so the bytes that are
 // bound and the bytes that are executed come from one read (AIRA-72).
 
-func safeSnapshotPath(path string) bool {
-	clean := filepath.ToSlash(filepath.Clean(filepath.FromSlash(path)))
-	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") || filepath.IsAbs(filepath.FromSlash(path)) {
-		return false
-	}
-	for _, part := range strings.Split(clean, "/") {
-		if part == ".git" || part == ".." || part == "." || part == "" {
-			return false
-		}
-	}
-	return true
-}
+// The three near-identical normalizing path predicates this file, gate_eval.go
+// and gate/canary.go each carried are now the single gate.SafeRelativePath
+// (AIRA-60), so the check a gate author sees at declaration time and the check
+// evaluation applies are the same check.
 
 // The tracked-tree digest lives in gate_subject.go as subjectTreeDigest, the
 // single producer of every gate subject digest. It used to be duplicated here
@@ -415,12 +427,12 @@ func applyMutation(root string, mutation gate.MutationSeed) error {
 func injectFile(root string, mutation gate.MutationSeed) error {
 	// The declaration validator already refuses an unsafe path, but this writes
 	// a new file, so the check is repeated locally rather than trusted from a
-	// caller. safeSnapshotPath is the same predicate the tracked snapshot uses:
-	// it refuses an absolute path, any .. traversal, and any .git segment. The
-	// last matters most here — a write into the snapshot's own .git (a config
-	// carrying core.fsmonitor, say) would be executed by the git add that
-	// re-stages the mutation.
-	if !safeSnapshotPath(mutation.File) {
+	// caller. gate.SafeRelativePath is the same predicate the tracked snapshot
+	// and the declaration validator use: it refuses an absolute path, any ..
+	// traversal, and any .git segment. The last matters most here — a write into
+	// the snapshot's own .git (a config carrying core.fsmonitor, say) would be
+	// executed by the git add that re-stages the mutation.
+	if !gate.SafeRelativePath(mutation.File) {
 		return errors.New("mutation file escapes the snapshot root")
 	}
 	if mutation.Content == "" {

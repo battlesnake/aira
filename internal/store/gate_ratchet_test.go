@@ -178,7 +178,10 @@ func TestSyntheticRatchetCanaryUsesSameComparatorInMemory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	evaluation, isolated, err := s.runCanary(context.Background(), canary, definition)
+	// The zero subject is deliberate and load-bearing: a synthetic-ratchet canary
+	// evaluates entirely in memory and must not need a tracked tree at all. This
+	// root is not even a git worktree, so a capture here would fail.
+	evaluation, isolated, err := s.runCanary(context.Background(), canary, definition, capturedSubject{})
 	if err != nil || isolated.Digest == "" || evaluation.Predicate != gate.PredicateFail || evaluation.Code != "E_GATE_RATCHET_REGRESSED" {
 		t.Fatalf("evaluation=%#v root=%#v err=%v", evaluation, isolated, err)
 	}

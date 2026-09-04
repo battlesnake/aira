@@ -77,10 +77,14 @@ func compareNoNewFailures(snapshot RatchetSnapshot, currentFailing []string, exc
 	sort.Strings(newFailures)
 	sort.Strings(excludedNames)
 	current := sortedSet(currentSet)
-	comparison := RatchetComparison{Predicate: gate.PredicatePass, CurrentFailing: current, NewFailures: newFailures, ExcludedFlaky: excludedNames}
+	// Raised to pass in the arm that establishes it rather than seeded pass and
+	// demoted (AIRA-86), matching compareCoverage below.
+	comparison := RatchetComparison{Predicate: gate.PredicateUnevaluated, CurrentFailing: current, NewFailures: newFailures, ExcludedFlaky: excludedNames}
 	if len(newFailures) > 0 {
 		comparison.Predicate = gate.PredicateFail
 		comparison.Code = "E_GATE_RATCHET_REGRESSED"
+	} else {
+		comparison.Predicate = gate.PredicatePass
 	}
 	return comparison
 }
@@ -108,16 +112,13 @@ func compareCoverage(snapshot RatchetSnapshot, currentPcts []float64) RatchetCom
 	return comparison
 }
 
-func (s *Store) evaluateRatchet(ctx context.Context, def gate.GateDefinition, root string) (DimensionEvaluation, error) {
-	evaluation := DimensionEvaluation{Root: EvaluationRoot{Path: root}}
-	if root != "" {
-		digest, err := subjectTreeDigest(root)
-		if err != nil {
-			evaluation.Predicate, evaluation.Code = gate.PredicateUnevaluated, "U_GATE_EVIDENCE_UNAVAILABLE"
-			return evaluation, nil
-		}
-		evaluation.Root.Digest = digest
-	}
+// evaluateRatchet takes the already-captured subject: the caller has read the
+// tree once and this lane only needs the digest of that read, so the per-gate
+// re-read this used to perform is gone (AIRA-80). A capture failure is now the
+// caller's to report, which is why the U_GATE_EVIDENCE_UNAVAILABLE branch that
+// used to live here has no remaining reachable case.
+func (s *Store) evaluateRatchet(ctx context.Context, def gate.GateDefinition, subject capturedSubject) (DimensionEvaluation, error) {
+	evaluation := DimensionEvaluation{Root: EvaluationRoot{Path: subject.root, Digest: subject.digest}}
 	baseline, err := s.ResolveGateBaseline(def.ID)
 	if err != nil {
 		code := ErrorCode(err)

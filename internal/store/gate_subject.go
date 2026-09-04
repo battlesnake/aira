@@ -151,12 +151,48 @@ func captureSubjectEntries(root string) ([]subjectEntry, error) {
 	return entries, nil
 }
 
-// stableSubjectEntries is captureSubjectEntries with the double-read agreement
-// check the command-gate materialiser needs: it copies these bytes into a tree a
-// command will execute, so a torn read there would run content that never
-// existed. The plain digest path does not need it -- a digest over a torn read
-// matches no coherent state, so it can only fail to serve a stored pass, never
-// fabricate one.
+// capturedSubject is one read of a tracked tree together with the digest of
+// exactly those bytes.
+//
+// It exists so that "the bytes a verdict is bound to" and "the bytes a verdict
+// was derived from" cannot be two different things. Before AIRA-80 every
+// evaluator took a root path and re-read the tree for itself: the dimension
+// lane digested one read (subjectTreeDigest) and evaluated another
+// (captureTraceSnapshot), so a verdict could be bound to a digest of a state
+// that was never evaluated. Passing the capture instead of the path makes that
+// unrepresentable rather than merely avoided -- an evaluator has no root to
+// re-read.
+//
+// root is retained only for the few things that legitimately need the location
+// rather than the content: a command's cwd resolution and the traceability
+// lane's requirements-directory probe.
+type capturedSubject struct {
+	root    string
+	entries []subjectEntry
+	digest  string
+}
+
+// captureSubject is the single constructor. It takes the stable (double-read)
+// capture for every lane, not just the command lane: since AIRA-80 the
+// dimension lane evaluates the captured bytes too, so a torn read there is no
+// longer merely a digest that will fail to match -- refusing it is the
+// fail-closed direction.
+//
+// GateCheck deliberately keeps the cheaper single-read subjectTreeDigest: it
+// computes a lookup key, not evidence, and a torn read there can only fail to
+// find a stored result, never fabricate one.
+func captureSubject(root string) (capturedSubject, error) {
+	entries, err := stableSubjectEntries(root)
+	if err != nil {
+		return capturedSubject{}, err
+	}
+	return capturedSubject{root: root, entries: entries, digest: digestSubjectEntries(entries)}, nil
+}
+
+// stableSubjectEntries is captureSubjectEntries with a double-read agreement
+// check. The command-gate materialiser copies these bytes into a tree a command
+// will execute and the dimension lane parses them, so a torn read would run or
+// evaluate content that never existed as a coherent tree state.
 func stableSubjectEntries(root string) ([]subjectEntry, error) {
 	first, err := captureSubjectEntries(root)
 	if err != nil {
@@ -166,13 +202,28 @@ func stableSubjectEntries(root string) ([]subjectEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(first) != len(second) {
+	if !subjectEntriesAgree(first, second) {
 		return nil, errors.New("tracked snapshot changed during materialisation")
+	}
+	return first, nil
+}
+
+// subjectEntriesAgree reports whether two reads of a tracked tree describe the
+// same state. It is a separate function so the agreement rule the capture's
+// fail-closed behaviour rests on can be tested directly: a real temporal tear
+// between the two reads is not deterministically drivable from a test without a
+// production hook, and the rule is what a tear would have to defeat.
+//
+// Every field the digest covers is compared, plus perm, which the digest folds
+// into the kind byte only for the executable bit.
+func subjectEntriesAgree(first, second []subjectEntry) bool {
+	if len(first) != len(second) {
+		return false
 	}
 	for i := range first {
 		if first[i].path != second[i].path || first[i].kind != second[i].kind || first[i].perm.Perm() != second[i].perm.Perm() || !bytes.Equal(first[i].payload, second[i].payload) {
-			return nil, errors.New("tracked snapshot changed during materialisation")
+			return false
 		}
 	}
-	return first, nil
+	return true
 }

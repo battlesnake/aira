@@ -59,27 +59,34 @@ func appendCanaryUnevaluated(audit *GateAudit, def gate.GateDefinition, definiti
 	return audit.Append("result", fields)
 }
 
-func EvaluateDimension(root, dimension string) (DimensionEvaluation, error) {
-	if strings.TrimSpace(root) == "" {
+// evaluateDimension evaluates a check dimension over an already-captured
+// subject.
+//
+// It takes the capture, not a root path, because it used to do both: digest one
+// read of the tree (subjectTreeDigest) and evaluate another
+// (captureTraceSnapshot). Nothing tied the two together, so a verdict could be
+// bound to a digest of a state that was never evaluated -- overwhelmingly a
+// self-healing false fail, but a false pass is constructible when a tree is
+// broken at the digest read, fixed before the evaluation read, and restored
+// afterwards. Deriving the parser input from subject.entries makes the digest a
+// digest of the evaluated bytes by construction (AIRA-80).
+func evaluateDimension(subject capturedSubject, dimension string) (DimensionEvaluation, error) {
+	if strings.TrimSpace(subject.root) == "" {
 		return DimensionEvaluation{}, errors.New("U_GATE_EVIDENCE_UNAVAILABLE: evaluation root is empty")
 	}
-	info, err := os.Stat(root)
+	info, err := os.Stat(subject.root)
 	if err != nil || !info.IsDir() {
 		return DimensionEvaluation{}, fmt.Errorf("U_GATE_EVIDENCE_UNAVAILABLE: evaluation root: %w", err)
 	}
-	digest, err := subjectTreeDigest(root)
-	if err != nil {
-		return DimensionEvaluation{}, fmt.Errorf("U_GATE_EVIDENCE_UNAVAILABLE: %w", err)
-	}
-	evaluationRoot := EvaluationRoot{Path: root, Digest: digest}
+	evaluationRoot := EvaluationRoot{Path: subject.root, Digest: subject.digest}
 	if dimension != "traceability" {
 		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Evidence: false, Root: evaluationRoot}, fmt.Errorf("U_GATE_EVIDENCE_UNAVAILABLE: unsupported check dimension %q", dimension)
 	}
-	snapshot, err := captureTraceSnapshot(root, nil)
+	snapshot, err := traceSnapshotFromSubject(subject)
 	if err != nil {
 		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Root: evaluationRoot}, err
 	}
-	scan, err := parseTraceabilitySnapshot(root, snapshot)
+	scan, err := parseTraceabilitySnapshot(subject.root, snapshot)
 	if err != nil {
 		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Root: evaluationRoot}, err
 	}
@@ -97,18 +104,28 @@ func EvaluateDimension(root, dimension string) (DimensionEvaluation, error) {
 		}
 		requirements[requirement.ID] = traceRequirement{status: requirement.Status, path: file.Path}
 	}
-	report := CheckReport{Verdict: "pass", Dimensions: map[string]string{"traceability": "pass"}}
+	// Seeded unevaluated, not pass (AIRA-86). This report is a local sink: only
+	// its Findings/Unevaluated/Warnings are read below, so the seed is not
+	// currently reachable as a fabricated green -- but a seeded "pass" is the
+	// shape that produced AIRA-53, AIRA-54 and AIRA-86 elsewhere, and the
+	// Dimensions map has to be non-nil because addTraceUnevaluated writes to it.
+	report := CheckReport{Verdict: gate.VerdictUnevaluated, Dimensions: map[string]string{"traceability": "unevaluated"}}
 	if len(requirements) == 0 {
 		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Findings: []CheckFinding{{Code: "U_TRACE_EMPTY", Subject: "traceability", Message: "requirement registry is empty", Kind: "unevaluated"}}, Evidence: true, Root: evaluationRoot}, nil
 	}
 	if err := resolveTraceabilityEdges(&report, scan.Edges, requirements, malformed); err != nil {
 		return DimensionEvaluation{}, err
 	}
-	predicate := gate.PredicatePass
-	if len(report.Findings) > 0 {
+	// Raised to pass in the arm that establishes it, rather than seeded pass and
+	// demoted: an arm added later cannot then leak a green (AIRA-86).
+	var predicate gate.PredicateState
+	switch {
+	case len(report.Findings) > 0:
 		predicate = gate.PredicateFail
-	} else if report.Unevaluated {
+	case report.Unevaluated:
 		predicate = gate.PredicateUnevaluated
+	default:
+		predicate = gate.PredicatePass
 	}
 	findings := append([]CheckFinding{}, report.Findings...)
 	findings = append(findings, report.UnevaluatedFindings...)
@@ -167,7 +184,17 @@ func (s *Store) RunGate(ctx context.Context, id string) (GateCheckResult, error)
 	if err != nil {
 		return GateCheckResult{}, err
 	}
-	subjectEval, subjectErr := s.evaluateChecker(ctx, def, s.root)
+	// One capture of the subject serves both the subject evaluation and the
+	// canary's mutation lane, so the two cannot disagree about what the subject
+	// was (AIRA-80). A capture failure is a hard error: there is no subject, so
+	// there is nothing to record a result against -- a result row keyed on an
+	// empty subject can never be found by GateCheck's (gate, subject) lookup and
+	// is inert evidence.
+	subject, captureErr := captureSubject(s.root)
+	if captureErr != nil {
+		return GateCheckResult{}, fmt.Errorf("U_GATE_EVIDENCE_UNAVAILABLE: capture subject: %w", captureErr)
+	}
+	subjectEval, subjectErr := s.evaluateChecker(ctx, def, subject)
 	if subjectErr != nil && subjectEval.Predicate != gate.PredicateUnevaluated {
 		return GateCheckResult{}, subjectErr
 	}
@@ -175,17 +202,17 @@ func (s *Store) RunGate(ctx context.Context, id string) (GateCheckResult, error)
 	if declarationErr != nil {
 		return GateCheckResult{}, declarationErr
 	}
-	canaryEval, canaryRoot, err := s.runCanary(ctx, canary, def)
+	canaryEval, canaryRoot, err := s.runCanary(ctx, canary, def, subject)
 	if err != nil {
-		subject := subjectEval.Root.Digest
-		if subject == "" {
-			subject, _ = subjectTreeDigest(s.root)
+		subjectDigest := subjectEval.Root.Digest
+		if subjectDigest == "" {
+			subjectDigest = subject.digest
 		}
 		audit, auditErr := OpenGateAudit(s.commonDir, true)
 		if auditErr != nil {
 			return GateCheckResult{}, auditErr
 		}
-		record, appendErr := appendCanaryUnevaluated(audit, def, found.Digest, declarationDigest, subject, err)
+		record, appendErr := appendCanaryUnevaluated(audit, def, found.Digest, declarationDigest, subjectDigest, err)
 		if appendErr != nil {
 			return GateCheckResult{}, appendErr
 		}
@@ -193,7 +220,7 @@ func (s *Store) RunGate(ctx context.Context, id string) (GateCheckResult, error)
 		if candidate := ErrorCode(err); strings.HasPrefix(candidate, "U_GATE_") {
 			code = candidate
 		}
-		return GateCheckResult{GateID: def.ID, Kind: string(def.Kind), Subject: subject, Verdict: gate.VerdictUnevaluated, Code: code, Suspect: true, Seq: record.Seq}, err
+		return GateCheckResult{GateID: def.ID, Kind: string(def.Kind), Subject: subjectDigest, Verdict: gate.VerdictUnevaluated, Code: code, Suspect: true, Seq: record.Seq}, err
 	}
 	canaryHealth := gate.CanaryUnevaluated
 	if canaryEval.Predicate == gate.PredicateFail {
@@ -429,7 +456,19 @@ func (s *Store) GateAction(ctx context.Context, operation, gateID, canaryID stri
 				if canaryErr != nil {
 					return nil, canaryErr
 				}
-				evaluation, root, runErr := s.runCanary(ctx, canary, definition.Definition)
+				// Only the mutation lane materialises the caller's tree. Capturing
+				// unconditionally would make a synthetic-ratchet canary -- which
+				// evaluates entirely in memory and touches no tree today -- newly fail
+				// on a root that is not a git worktree.
+				subject := capturedSubject{}
+				if canary.Mode == gate.CanaryMutation {
+					captured, captureErr := captureSubject(s.root)
+					if captureErr != nil {
+						return nil, fmt.Errorf("U_GATE_EVIDENCE_UNAVAILABLE: capture subject: %w", captureErr)
+					}
+					subject = captured
+				}
+				evaluation, root, runErr := s.runCanary(ctx, canary, definition.Definition, subject)
 				if runErr != nil {
 					return nil, runErr
 				}
@@ -453,7 +492,11 @@ func (s *Store) GateActionWithFields(ctx context.Context, operation, gateID, can
 	return s.GateAction(ctx, operation, gateID, canaryID)
 }
 
-func (s *Store) runCanary(ctx context.Context, c gate.CanaryDeclaration, def gate.GateDefinition) (DimensionEvaluation, EvaluationRoot, error) {
+// runCanary runs a canary against the gate's own checker. subject is the
+// caller's already-captured tracked tree and is used by the mutation lane
+// alone: the fixture lane seeds and captures its own temp tree, and the
+// synthetic-ratchet lane never touches a tree at all.
+func (s *Store) runCanary(ctx context.Context, c gate.CanaryDeclaration, def gate.GateDefinition, subject capturedSubject) (DimensionEvaluation, EvaluationRoot, error) {
 	_ = ctx
 	if c.Mode == gate.CanarySyntheticRatchet {
 		if err := gate.ValidateCanary(c); err != nil {
@@ -476,7 +519,7 @@ func (s *Store) runCanary(ctx context.Context, c gate.CanaryDeclaration, def gat
 	}
 	defer os.RemoveAll(dir)
 	if c.Seed.Path != "" {
-		if !safeFixturePath(c.Seed.Path) {
+		if !gate.SafeRelativePath(c.Seed.Path) {
 			return DimensionEvaluation{}, EvaluationRoot{}, errors.New("E_GATE_CANARY_INVALID: seed escapes fixture root")
 		}
 		source := filepath.Join(s.root, filepath.FromSlash(c.Seed.Path))
@@ -485,7 +528,7 @@ func (s *Store) runCanary(ctx context.Context, c gate.CanaryDeclaration, def gat
 		}
 	}
 	for path, data := range c.Seed.Files {
-		if !safeFixturePath(path) {
+		if !gate.SafeRelativePath(path) {
 			return DimensionEvaluation{}, EvaluationRoot{}, errors.New("E_GATE_CANARY_INVALID: seed escapes fixture root")
 		}
 		clean := filepath.Clean(filepath.FromSlash(path))
@@ -513,7 +556,7 @@ func (s *Store) runCanary(ctx context.Context, c gate.CanaryDeclaration, def gat
 		if c.Mutation == nil {
 			return DimensionEvaluation{}, EvaluationRoot{}, errors.New("U_GATE_MUTATION_APPLY_FAILED: mutation seed is missing")
 		}
-		mutationRoot, _, mutationCleanup, materializeErr := materializeTrackedSnapshot(s.root)
+		mutationRoot, mutationCleanup, materializeErr := materializeSubject(subject)
 		if materializeErr != nil {
 			return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_MUTATION_APPLY_FAILED"}, EvaluationRoot{}, fmt.Errorf("U_GATE_MUTATION_APPLY_FAILED: %w", materializeErr)
 		}
@@ -521,36 +564,35 @@ func (s *Store) runCanary(ctx context.Context, c gate.CanaryDeclaration, def gat
 		if mutationErr := applyMutation(mutationRoot, *c.Mutation); mutationErr != nil {
 			return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_MUTATION_APPLY_FAILED"}, EvaluationRoot{Path: mutationRoot}, fmt.Errorf("U_GATE_MUTATION_APPLY_FAILED: %w", mutationErr)
 		}
+		// Deliberately NOT forced, unlike the stage inside materializeSubject.
+		// That one restores the source's own index membership; this one stages the
+		// mutation's new file, and a mutation target matched by the subject's git
+		// excludes must still be dropped so it surfaces as the loud
+		// E_GATE_CANARY_DID_NOT_FIRE that AIRA-55 documented. Forcing here would
+		// silently change that documented boundary.
 		if _, stderr, gitErr := runGit(mutationRoot, "add", "-A"); gitErr != nil {
 			return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_MUTATION_APPLY_FAILED"}, EvaluationRoot{Path: mutationRoot}, fmt.Errorf("U_GATE_MUTATION_APPLY_FAILED: git add: %w: %s", gitErr, stderr)
 		}
-		evaluation, err := s.evaluateChecker(ctx, def, mutationRoot)
+		mutated, captureErr := captureSubject(mutationRoot)
+		if captureErr != nil {
+			return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_MUTATION_APPLY_FAILED"}, EvaluationRoot{Path: mutationRoot}, fmt.Errorf("U_GATE_MUTATION_APPLY_FAILED: capture mutated subject: %w", captureErr)
+		}
+		evaluation, err := s.evaluateChecker(ctx, def, mutated)
 		return evaluation, evaluation.Root, err
 	}
-	evaluation, err := s.evaluateChecker(ctx, def, dir)
+	seeded, captureErr := captureSubject(dir)
+	if captureErr != nil {
+		return DimensionEvaluation{}, EvaluationRoot{}, fmt.Errorf("U_GATE_CANARY_UNEVALUATED: capture fixture subject: %w", captureErr)
+	}
+	evaluation, err := s.evaluateChecker(ctx, def, seeded)
 	return evaluation, evaluation.Root, err
 }
 
 // runFixtureCanary is retained as a compatibility seam for M10a tests and
-// delegates to the mode-dispatched implementation.
+// delegates to the mode-dispatched implementation. The zero subject is correct:
+// a fixture canary seeds and captures its own tree and never reads the caller's.
 func (s *Store) runFixtureCanary(ctx context.Context, c gate.CanaryDeclaration, def gate.GateDefinition) (DimensionEvaluation, EvaluationRoot, error) {
-	return s.runCanary(ctx, c, def)
-}
-
-func safeFixturePath(path string) bool {
-	if path == "" || filepath.IsAbs(filepath.FromSlash(path)) {
-		return false
-	}
-	clean := filepath.ToSlash(filepath.Clean(filepath.FromSlash(path)))
-	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
-		return false
-	}
-	for _, part := range strings.Split(clean, "/") {
-		if part == ".git" || part == ".." {
-			return false
-		}
-	}
-	return true
+	return s.runCanary(ctx, c, def, capturedSubject{})
 }
 
 func copyFixtureSeed(source, destination string) error {
@@ -566,7 +608,7 @@ func copyFixtureSeed(source, destination string) error {
 			return walkErr
 		}
 		rel, err := filepath.Rel(source, path)
-		if err != nil || (rel != "." && !safeFixturePath(rel)) {
+		if err != nil || (rel != "." && !gate.SafeRelativePath(rel)) {
 			return errors.New("E_GATE_CANARY_INVALID: seed escapes fixture root")
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
@@ -599,7 +641,9 @@ func (s *Store) GateCheck(ctx context.Context) (GateCheckReport, error) {
 	if err != nil {
 		return GateCheckReport{}, err
 	}
-	report := GateCheckReport{Verdict: gate.VerdictPass, Results: []GateCheckResult{}}
+	// Seeded unevaluated, not pass (AIRA-86): finishGateReport now establishes
+	// the verdict positively, so an early return added later cannot leak a green.
+	report := GateCheckReport{Verdict: gate.VerdictUnevaluated, Results: []GateCheckResult{}}
 	// An unpopulated gate set establishes nothing. Reporting pass here would
 	// assert a positive fact -- that nothing failed -- which was never
 	// evaluated, so the verdict is unevaluated with a distinguishing reason.
@@ -703,21 +747,35 @@ func (s *Store) GateCheck(ctx context.Context) (GateCheckReport, error) {
 	return finishGateReport(report), nil
 }
 
+// finishGateReport establishes the rollup verdict rather than demoting a seeded
+// one (AIRA-86).
+//
+// A result's Verdict is a raw string read straight out of the audit ledger, so
+// it can be a value the enum does not contain -- a record missing the field
+// yields "". The counting switch therefore has an explicit default that counts
+// anything unrecognised as unevaluated: without it a report holding one genuine
+// pass and one unknown verdict incremented Passed once, Failed and Unevaluated
+// not at all, and reported pass. Pass is then claimed only when at least one
+// result established it and nothing else in the report is outstanding, so a
+// results-empty report is unevaluated rather than vacuously green.
 func finishGateReport(report GateCheckReport) GateCheckReport {
 	for _, result := range report.Results {
 		switch result.Verdict {
 		case gate.VerdictFail:
 			report.Failed++
-		case gate.VerdictUnevaluated:
-			report.Unevaluated++
 		case gate.VerdictPass:
 			report.Passed++
+		default:
+			report.Unevaluated++
 		}
 	}
-	if report.Failed > 0 {
+	switch {
+	case report.Failed > 0:
 		report.Verdict = gate.VerdictFail
-	} else if report.Unevaluated > 0 {
+	case report.Unevaluated > 0 || report.Passed == 0:
 		report.Verdict = gate.VerdictUnevaluated
+	default:
+		report.Verdict = gate.VerdictPass
 	}
 	return report
 }

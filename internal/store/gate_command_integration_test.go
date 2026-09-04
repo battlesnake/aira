@@ -96,6 +96,37 @@ func TestGateCommandHelperProcess(t *testing.T) {
 			os.Exit(1)
 		}
 		os.Exit(0)
+	case "require-marker":
+		// The inverse of detect-marker: this checker passes only while the marker
+		// is PRESENT, so it fails when a file that carries it goes missing. That is
+		// the AIRA-81 shape — a canary must not fire because subject content
+		// disappeared during materialisation.
+		if len(values) != 2 {
+			os.Exit(2)
+		}
+		found := false
+		_ = filepath.WalkDir(values[0], func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return nil
+			}
+			if entry.IsDir() {
+				if entry.Name() == ".git" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !entry.Type().IsRegular() {
+				return nil
+			}
+			if data, readErr := os.ReadFile(path); readErr == nil && strings.Contains(string(data), values[1]) {
+				found = true
+			}
+			return nil
+		})
+		if found {
+			os.Exit(0)
+		}
+		os.Exit(1)
 	case "source-go-test-json":
 		injected := false
 		files, _ := filepath.Glob("*.go")
@@ -155,7 +186,7 @@ func commandDefinition(command gate.Command) gate.GateDefinition {
 func TestCommandCheckerUsesRunnerAndRejectsOutputOverflow(t *testing.T) {
 	s, root := realCommandStore(t)
 	def := commandDefinition(gate.Command{Argv: gateHelperArgv("emit", "0123456789"), Cwd: "root", TimeoutMS: gateFastCommandTimeoutMS, OutputCapBytes: 1024, Predicate: gate.CommandPredicateExitZero})
-	evaluation, err := s.runCommandChecker(context.Background(), def, root)
+	evaluation, err := s.runCommandChecker(context.Background(), def, captureFor(t, root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +206,7 @@ func TestCommandCheckerUsesRunnerAndRejectsOutputOverflow(t *testing.T) {
 	}
 	def.Command.OutputCapBytes = 1024
 	def.Command.Argv = gateHelperArgv("overflow")
-	overflow, err := s.runCommandChecker(context.Background(), def, root)
+	overflow, err := s.runCommandChecker(context.Background(), def, captureFor(t, root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +218,7 @@ func TestCommandCheckerUsesRunnerAndRejectsOutputOverflow(t *testing.T) {
 func TestCommandCheckerTimeoutAndTestsGreenZeroCountAreUnevaluated(t *testing.T) {
 	s, root := realCommandStore(t)
 	timeout := commandDefinition(gate.Command{Argv: gateHelperArgv("timeout"), Cwd: "root", TimeoutMS: 20, OutputCapBytes: 1024, Predicate: gate.CommandPredicateExitZero})
-	evaluation, err := s.runCommandChecker(context.Background(), timeout, root)
+	evaluation, err := s.runCommandChecker(context.Background(), timeout, captureFor(t, root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +226,7 @@ func TestCommandCheckerTimeoutAndTestsGreenZeroCountAreUnevaluated(t *testing.T)
 		t.Fatalf("timeout=%#v", evaluation)
 	}
 	zero := commandDefinition(gate.Command{Argv: gateHelperArgv("emit", "{\"Action\":\"start\",\"Package\":\"p\"}\n{\"Action\":\"pass\",\"Package\":\"p\"}\n"), Cwd: "root", TimeoutMS: gateFastCommandTimeoutMS, OutputCapBytes: 4096, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
-	zeroEval, err := s.runCommandChecker(context.Background(), zero, root)
+	zeroEval, err := s.runCommandChecker(context.Background(), zero, captureFor(t, root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +238,7 @@ func TestCommandCheckerTimeoutAndTestsGreenZeroCountAreUnevaluated(t *testing.T)
 func TestCommandCheckerCleanNonzeroIsFailure(t *testing.T) {
 	s, root := realCommandStore(t)
 	def := commandDefinition(gate.Command{Argv: gateHelperArgv("exit", "7"), Cwd: "root", TimeoutMS: gateFastCommandTimeoutMS, OutputCapBytes: 1024, Predicate: gate.CommandPredicateExitZero})
-	evaluation, err := s.runCommandChecker(context.Background(), def, root)
+	evaluation, err := s.runCommandChecker(context.Background(), def, captureFor(t, root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +267,7 @@ func TestCommandGateAdmitsMultiProcessGreenCommand(t *testing.T) {
 	// descendant; a shorter child is the sampler's documented coverage gap and
 	// would read contained, defeating the unverified-admission path this proves.
 	def := commandDefinition(gate.Command{Argv: []string{"/bin/sh", "-c", "sleep 0.25; printf '" + greenOutput + "'"}, Cwd: "root", TimeoutMS: gateFastCommandTimeoutMS, OutputCapBytes: 4096, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
-	evaluation, err := s.runCommandChecker(context.Background(), def, root)
+	evaluation, err := s.runCommandChecker(context.Background(), def, captureFor(t, root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +294,7 @@ func TestCommandCheckerTestsGreenHonorsFailureOutcomes(t *testing.T) {
 		"{\"Action\":\"fail\",\"Package\":\"p\",\"Test\":\"TestX\"}\n" +
 		"{\"Action\":\"pass\",\"Package\":\"p\"}\n"
 	failed := commandDefinition(gate.Command{Argv: gateHelperArgv("emit", failedOutput), Cwd: "root", TimeoutMS: gateFastCommandTimeoutMS, OutputCapBytes: 4096, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
-	evaluation, err := s.runCommandChecker(context.Background(), failed, root)
+	evaluation, err := s.runCommandChecker(context.Background(), failed, captureFor(t, root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +307,7 @@ func TestCommandCheckerTestsGreenHonorsFailureOutcomes(t *testing.T) {
 		"{\"Action\":\"pass\",\"Package\":\"p\",\"Test\":\"TestX\"}\n" +
 		"{\"Action\":\"pass\",\"Package\":\"p\"}\n"
 	green := commandDefinition(gate.Command{Argv: gateHelperArgv("emit", greenOutput), Cwd: "root", TimeoutMS: gateFastCommandTimeoutMS, OutputCapBytes: 4096, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
-	evaluation, err = s.runCommandChecker(context.Background(), green, root)
+	evaluation, err = s.runCommandChecker(context.Background(), green, captureFor(t, root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +319,7 @@ func TestCommandCheckerTestsGreenHonorsFailureOutcomes(t *testing.T) {
 func TestCommandCheckerTestsGreenCleanNonzeroEmptyOutputIsFailure(t *testing.T) {
 	s, root := realCommandStore(t)
 	def := commandDefinition(gate.Command{Argv: gateHelperArgv("exit", "1"), Cwd: "root", TimeoutMS: gateFastCommandTimeoutMS, OutputCapBytes: 1024, Parser: gate.CommandParserGoTestJSONV1, Predicate: gate.CommandPredicateTestsGreen})
-	evaluation, err := s.runCommandChecker(context.Background(), def, root)
+	evaluation, err := s.runCommandChecker(context.Background(), def, captureFor(t, root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,7 +336,7 @@ func TestCommandCheckerStoresAuthoritativeRunnerEnvDigest(t *testing.T) {
 	defer os.Unsetenv(name)
 	s, root := realCommandStore(t)
 	def := commandDefinition(gate.Command{Argv: gateHelperArgv("noop"), Cwd: "root", EnvAllow: []string{name}, TimeoutMS: gateFastCommandTimeoutMS, OutputCapBytes: 1024, Predicate: gate.CommandPredicateExitZero})
-	evaluation, err := s.runCommandChecker(context.Background(), def, root)
+	evaluation, err := s.runCommandChecker(context.Background(), def, captureFor(t, root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +368,7 @@ func TestCommandCheckerIgnoresAllowedGovernorEnvironmentInDigest(t *testing.T) {
 		OutputCapBytes: 1024,
 		Predicate:      gate.CommandPredicateExitZero,
 	})
-	evaluation, err := s.runCommandChecker(context.Background(), def, root)
+	evaluation, err := s.runCommandChecker(context.Background(), def, captureFor(t, root))
 	if err != nil {
 		t.Fatal(err)
 	}
