@@ -77,7 +77,11 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	if len(argv) > 0 && strings.ToLower(argv[0]) == "skill" {
 		return runSkill(argv[1:], stdout, stderr)
 	}
-	args, jsonOutput := removeJSON(argv)
+	// The scope override is stripped BEFORE removeJSON so that removeJSON still
+	// sees the verb at args[0] and keeps its post-`--` carve-out intact
+	// (AIRA-82).
+	args, scopeDirOption, scopeDirErr := removeScopeDir(argv)
+	args, jsonOutput := removeJSON(args)
 	// renderJSON is the TTY-aware rendering default: JSON unless stdout is a
 	// real terminal and --json was not explicitly requested. Piped/redirected
 	// output (the dominant case for an agent invoking this CLI via a
@@ -90,6 +94,28 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	// streaming during dispatch, and the deliberate non-JSON suppression
 	// contracts of time's and run-log's trailing summaries (see below).
 	renderJSON := jsonOutput || !stdoutIsTerminal(stdout)
+	if scopeDirErr != nil {
+		code := store.ErrorCode(scopeDirErr)
+		return render(core.Response{Code: code, Error: scopeDirErr.Error(), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
+	}
+	// A verb that resolves no project/worktree scope refuses the override rather
+	// than accepting and discarding it: silently ignoring an explicit scope is
+	// the same confidently-wrong reporting AIRA-82 is about.
+	if scopeDirOption != "" {
+		target := "help"
+		if len(args) > 0 {
+			target = strings.ToLower(args[0])
+		}
+		if !verbAcceptsScopeDir(target) {
+			message := fmt.Sprintf("E_SELECTOR_INVALID: option %s is not valid for %s", scopeDirFlag, target)
+			return render(core.Response{Code: "E_SELECTOR_INVALID", Error: message, Exit: store.ExitForCode("E_SELECTOR_INVALID")}, renderJSON, stdout, stderr)
+		}
+	}
+	scopeDir, scopeDirResolveErr := resolveScopeDir(scopeDirOption)
+	if scopeDirResolveErr != nil {
+		code := store.ErrorCode(scopeDirResolveErr)
+		return render(core.Response{Code: code, Error: scopeDirResolveErr.Error(), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
+	}
 	if len(args) == 0 || args[0] == "help" || args[0] == "--help" {
 		response := core.New(nil).Do(context.Background(), core.Request{Verb: "help"})
 		if !renderJSON && response.OK {
@@ -195,7 +221,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 			return render(core.Response{Code: code, Error: requestErr.Error(), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
 		}
 		if request.Args["project"] == "" && request.Args["prefix"] == "" {
-			project, discoverErr := app.Discover(context.Background(), ".")
+			project, discoverErr := app.Discover(context.Background(), scopeDir)
 			if discoverErr != nil {
 				return render(core.Response{Code: "E_NO_PROJECT", Error: "E_NO_PROJECT: no selector and no current .aira/config", Exit: store.ExitForCode("E_NO_PROJECT")}, renderJSON, stdout, stderr)
 			}
@@ -223,7 +249,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		if pathErr != nil {
 			return render(transportErrorResponse(pathErr), renderJSON, stdout, stderr)
 		}
-		project, discoverErr := app.DiscoverBootstrap(context.Background(), ".")
+		project, discoverErr := app.DiscoverBootstrap(context.Background(), scopeDir)
 		if discoverErr != nil {
 			code := appErrorCode(discoverErr)
 			return render(core.Response{Code: code, Error: discoverErr.Error(), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
@@ -236,7 +262,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 			}
 		}
 		response := dispatcher.Dispatch(context.Background(), bootstrapScope(project, paths), core.Request{Verb: "init", Args: requestArgs})
-		relativiseInitResponse(&response, ".")
+		relativiseInitResponse(&response, scopeDir)
 		return render(response, renderJSON, stdout, stderr)
 	}
 
@@ -300,7 +326,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	if err != nil {
 		return render(transportErrorResponse(err), renderJSON, stdout, stderr)
 	}
-	scope, err := scopeForCWD(context.Background(), ".", paths)
+	scope, err := scopeForCWD(context.Background(), scopeDir, paths)
 	if err != nil {
 		code := appErrorCode(err)
 		return render(core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
@@ -2158,17 +2184,19 @@ func bootstrapScope(project app.Project, paths daemon.Paths) daemon.WorktreeScop
 	}
 }
 
-func prepareImportContent(request *core.Request) error {
-	if request == nil {
-		return nil
-	}
+// isImportRequest reports whether this request carries an import `file`
+// argument that prepareImportContent will read from disk.
+func isImportRequest(request core.Request) bool {
 	canonical := core.CanonicalVerb(request.Verb)
-	isImport := canonical == "import"
 	if canonical == "req" {
 		subverb, _ := request.Args["subverb"].(string)
-		isImport = strings.EqualFold(subverb, "import")
+		return strings.EqualFold(subverb, "import")
 	}
-	if !isImport {
+	return canonical == "import"
+}
+
+func prepareImportContent(request *core.Request) error {
+	if request == nil || !isImportRequest(*request) {
 		return nil
 	}
 	path, _ := request.Args["file"].(string)
@@ -2280,6 +2308,9 @@ func renderHelp(response core.Response, stdout, stderr io.Writer) int {
 	if err := table.Flush(); err != nil {
 		return exitForError("E_RUN_DETACH_FAILED")
 	}
+	// Face-level globals belong to this adapter, not to the core dispatch table
+	// the listing above is generated from, so they are named here (AIRA-82).
+	_, _ = fmt.Fprintf(stdout, "\nglobal options\n  %s DIR  resolve this call's project/worktree scope from DIR instead of the current directory\n  --json         render the structured response\n", scopeDirFlag)
 	for _, warning := range response.Warnings {
 		_, _ = fmt.Fprintf(stdout, "warning: %s\n", warning)
 	}

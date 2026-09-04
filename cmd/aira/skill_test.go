@@ -79,9 +79,12 @@ func TestSkillExamplesMatchMCPRequestsForEveryAction(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			mcpRequest, err := decodeMCPRequest(binding, values)
+			mcpRequest, scopeDir, err := decodeMCPRequest(binding, values)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if scopeDir != "" {
+				t.Fatalf("skill example decoded a scope override: %q", scopeDir)
 			}
 			if !reflect.DeepEqual(cli, mcpRequest) {
 				t.Fatalf("CLI=%#v MCP=%#v", cli, mcpRequest)
@@ -124,9 +127,12 @@ func TestComputeFacesT12SpendQuotaExamplesHaveCLIParityAndValidGuideCommands(t *
 		if err != nil {
 			t.Fatal(err)
 		}
-		mcpRequest, err := decodeMCPRequest(tool, values)
+		mcpRequest, scopeDir, err := decodeMCPRequest(tool, values)
 		if err != nil {
 			t.Fatalf("%s MCP request: %v", key, err)
+		}
+		if scopeDir != "" {
+			t.Fatalf("%s decoded a scope override: %q", key, scopeDir)
 		}
 		if !reflect.DeepEqual(cli, mcpRequest) {
 			t.Fatalf("%s CLI=%#v MCP=%#v", key, cli, mcpRequest)
