@@ -291,7 +291,10 @@ func TestConcurrentOpensOfALegacyDatabaseAllSucceed(t *testing.T) {
 // This test pins today's ACCEPTED behaviour so the gap is executable rather
 // than prose. It is deliberately a characterisation test: when the retire path
 // is built, this test must be changed deliberately, and its failure is the
-// signal that the gap closed — not a regression.
+// signal that the gap closed — not a regression. Same shape as
+// TestStaleGrantedLeasesNeverSelectsAScopelessReservation
+// (internal/daemon/confine_reaper_vanished_linux_test.go), which pins D3's
+// accepted coverage gap for the same reason.
 func TestConflictedIntentHasNoRetirePath(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "main")

@@ -112,7 +112,11 @@ This is captured as committed, executable evidence rather than prose:
 behaviour across `reconcile` ×2, `Rebuild`, the later-writer refusal, and the
 eject guard's own query. It is deliberately a **characterisation** test: when
 the retire path is built, it must be changed deliberately, and its failure is
-the signal the gap closed.
+the signal the gap closed. This follows an existing in-repo precedent rather
+than inventing a convention —
+`TestStaleGrantedLeasesNeverSelectsAScopelessReservation`
+(`internal/daemon/confine_reaper_vanished_linux_test.go:361`) pins D3's
+accepted coverage gap the same way, "so that changing it is deliberate".
 
 **Therefore AIRA-73 stays open**, retitled and rescoped to the remaining half
 (the missing retire path), rather than being closed by this PR. Closing a P1 on
