@@ -69,10 +69,13 @@ or an `os._exit` — not of a completed run whose trailer was lost.
 Nothing on the Go side can produce exit status 0 mid-run: every termination
 vector is signal-derived (`cgroup.kill`/`memory.oom.group`/watchdog → 137,
 SIGTERM → 143, SIGINT → pytest exit 2). The memory watchdog specifically cannot
-target aitest at all — it excludes any cgroup path containing a `.aira-`
-component at both selection and re-validation (`internal/daemon/watchdog.go:344`,
-`:553`, `:600-607`), and additionally requires an uncapped ancestry, which a
-confine scope never has.
+target aitest at all — it requires an uncapped ancestry, which a confine scope
+never has (`internal/daemon/watchdog.go:344`, `:553`). **Corrected 2026-09-05 by
+AIRA-16's first half:** this paragraph also cited a blanket `.aira-`-component
+exemption at selection and re-validation (`watchdog.go:600-607`); that exemption
+is deleted and `hasAIRAComponent` no longer exists, so a reader verifying
+against source would find nothing there. The conclusion is unaffected — it rests
+on the ancestry clause alone, which still holds.
 
 ### 2.3 The severity answer (coordinator's priority question)
 

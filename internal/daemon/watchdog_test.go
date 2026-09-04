@@ -543,14 +543,6 @@ func TestSelectOffenderEveryPredicateGates(t *testing.T) {
 		name   string
 		mutate func(map[int]watchdogProc)
 	}{
-		{"aira capped", func(p map[int]watchdogProc) {
-			q := p[20]
-			q.cgroup = watchdogCgroup{path: "/user.slice/.aira-job.scope", uncapped: true}
-			p[20] = q
-			q = p[21]
-			q.rss = 0
-			p[21] = q
-		}},
 		{"finite ancestor", func(p map[int]watchdogProc) {
 			q := p[20]
 			q.cgroup.uncapped = false
@@ -586,6 +578,148 @@ func TestSelectOffenderEveryPredicateGates(t *testing.T) {
 			}
 		})
 	}
+}
+
+// verifies: AIRA-16 (first half) — a GENUINELY uncapped `.aira-` scope is a
+// valid watchdog target, not blanket-exempt. Before this, `uncapped` was forced
+// false for every path with a `.aira-` component, on the assumption that every
+// AIRA scope is self-capped. That assumption does not hold: `aira run` creates
+// `.aira-<id>` scopes in the caller's ambient cgroup with no finite-cap
+// precondition, so an uncapped ancestry leaves a heavy agent runaway invisible
+// to the watchdog. Capping is now the ONLY exemption — which is exactly the
+// design's own predicate-1 rationale (bounded work cannot drive host OOM).
+func TestSelectOffenderTargetsUncappedAIRAScopeAndSpares(t *testing.T) {
+	airaTree := func(uncapped bool) map[int]watchdogProc {
+		p := eligibleTree()
+		for _, pid := range []int{20, 21} {
+			q := p[pid]
+			q.cgroup = watchdogCgroup{path: "/aira.slice/.aira-CONFINE-job.scope", uncapped: uncapped}
+			p[pid] = q
+		}
+		return p
+	}
+	if got, _ := selectOffender(airaTree(true), 100, 999, "/user.slice/aira.service"); got == nil || got.pid != 20 {
+		t.Fatalf("genuinely uncapped .aira- scope must be selectable: got=%+v", got)
+	}
+	if got, _ := selectOffender(airaTree(false), 100, 999, "/user.slice/aira.service"); got != nil {
+		t.Fatalf("capped .aira- scope must stay exempt: selected %+v", got)
+	}
+}
+
+// verifies: AIRA-16 (first half) — the pre-signal revalidation must not treat a
+// still-uncapped `.aira-` target as "cgroup-now-capped". That false skip made
+// enforce mode a no-op for the very class the selector is now allowed to pick.
+func TestRevalidateAcceptsUncappedAIRATargetAndRejectsCappedOne(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		uncapped  bool
+		wantValid bool
+		wantWhy   string
+	}{
+		{"uncapped aira scope stays a target", true, true, ""},
+		{"capped aira scope is dropped", false, false, "cgroup-now-capped"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := eligibleTree()
+			q := p[20]
+			q.cgroup = watchdogCgroup{path: "/aira.slice/.aira-CONFINE-job.scope", uncapped: tc.uncapped}
+			p[20] = q
+			d, _, _ := baseWatchdogDeps([]pressureSample{{20, 105, true, ""}}, 10, p)
+			valid, why := revalidateWatchdogTarget(p[20], d)
+			if valid != tc.wantValid || why != tc.wantWhy {
+				t.Fatalf("valid=%v why=%q want valid=%v why=%q", valid, why, tc.wantValid, tc.wantWhy)
+			}
+		})
+	}
+}
+
+// verifies: AIRA-16 (first half) — the cgroup classifier itself. Capping is the
+// only exemption, decided by the ancestry walk, so a `.aira-` name no longer
+// buys immunity; and the deliberately-uncapped `.aira-supervisor` child of a
+// CAPPED confine scope (worker_admit.go:74) is still exempt, because a finite
+// ancestor bounds it. That pair is the false-negative/false-positive pair.
+func TestClassifyWatchdogCgroupAIRAScopeCapsOnly(t *testing.T) {
+	root := t.TempDir()
+	uncappedScope := filepath.Join("aira.slice", ".aira-CONFINE-uncapped.scope")
+	cappedScope := filepath.Join("aira.slice", ".aira-CONFINE-capped.scope")
+	supervisor := filepath.Join(cappedScope, ".aira-supervisor")
+	for _, rel := range []string{".", "aira.slice", uncappedScope, cappedScope, supervisor} {
+		if err := os.MkdirAll(filepath.Join(root, rel), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, rel, "memory.max"), []byte("max\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, cappedScope, "memory.max"), []byte("4096\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name         string
+		rel          string
+		wantUncapped bool
+	}{
+		{"uncapped aira scope is uncapped", "/" + uncappedScope, true},
+		{"capped aira scope is capped", "/" + cappedScope, false},
+		{"uncapped aira child of a capped aira scope is capped", "/" + supervisor, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cgroup, ok, reason := classifyWatchdogCgroup(root, tc.rel)
+			if !ok || reason != "" {
+				t.Fatalf("ok=%v reason=%q want evaluated", ok, reason)
+			}
+			if cgroup.path != tc.rel || cgroup.uncapped != tc.wantUncapped {
+				t.Fatalf("cgroup=%+v want path=%q uncapped=%v", cgroup, tc.rel, tc.wantUncapped)
+			}
+		})
+	}
+	// A cap that cannot be established is unevaluated, never "uncapped": a
+	// killer must fail closed. The ancestry walk has TWO such branches and this
+	// change makes the walk the SOLE determinant of `uncapped`, so both are
+	// load-bearing and both are covered here. Neither is the same as ABSENT —
+	// an absent memory.max means "no cap at this level", and the walk continues.
+	t.Run("unparseable memory.max is unevaluated", func(t *testing.T) {
+		scope := filepath.Join("aira.slice", ".aira-CONFINE-unparseable.scope")
+		if err := os.MkdirAll(filepath.Join(root, scope), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, scope, "memory.max"), []byte("not-a-number\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cgroup, ok, reason := classifyWatchdogCgroup(root, "/"+scope)
+		if ok || cgroup.uncapped || reason != "memory-max-unevaluated" {
+			t.Fatalf("cgroup=%+v ok=%v reason=%q want unevaluated and NOT uncapped", cgroup, ok, reason)
+		}
+	})
+	// The read-error branch, distinct from the parse branch above: a permission
+	// or IO failure on an ANCESTOR's memory.max must abort to unevaluated, NOT
+	// be treated as absent-and-keep-walking. Treating it as absent is fail-OPEN
+	// — the walk would run past a finite ancestor cap and report genuinely
+	// bounded work as uncapped, i.e. a false kill of a confined job.
+	t.Run("unreadable ancestor memory.max is unevaluated", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses the permission bits this subtest relies on")
+		}
+		scope := filepath.Join("aira.slice", ".aira-CONFINE-unreadable.scope")
+		ancestor := filepath.Join(root, "aira.slice", "memory.max")
+		if err := os.MkdirAll(filepath.Join(root, scope), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// The ancestor carries a FINITE cap: if the read error were swallowed as
+		// "absent", the leaf would classify uncapped and the assertion below
+		// would catch exactly that fail-open.
+		if err := os.WriteFile(ancestor, []byte("4096\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(ancestor, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(ancestor, 0o644) })
+		cgroup, ok, reason := classifyWatchdogCgroup(root, "/"+scope)
+		if ok || cgroup.uncapped || reason != "memory-max-unevaluated" {
+			t.Fatalf("cgroup=%+v ok=%v reason=%q want unevaluated and NOT uncapped", cgroup, ok, reason)
+		}
+	})
 }
 
 func TestSelectOffenderBiggestRSSWithPIDAscendingTieBreakAndCriticalProtection(t *testing.T) {
@@ -1044,7 +1178,7 @@ func TestWatchdogDecisionLoggingAndIdleDoesNotReadPSI(t *testing.T) {
 	}
 }
 
-func TestFiniteMemoryMaxAncestorAndAIRAComponent(t *testing.T) {
+func TestFiniteMemoryMaxAncestorWalk(t *testing.T) {
 	root := t.TempDir()
 	leaf := filepath.Join(root, "user.slice", "job.scope")
 	if err := os.MkdirAll(leaf, 0o755); err != nil {
@@ -1074,9 +1208,6 @@ func TestFiniteMemoryMaxAncestorAndAIRAComponent(t *testing.T) {
 	// cgroup2 mount root itself has no memory.max (build-review P1).
 	if cap, finite, evaluated := effectiveWatchdogCapEvaluated(root, leaf); !evaluated || !finite || cap != 4096 {
 		t.Fatalf("leaf without memory.max: cap=%d finite=%v evaluated=%v; want cap=4096 finite=true evaluated=true (bounded by the ancestor slice)", cap, finite, evaluated)
-	}
-	if !hasAIRAComponent("/user.slice/.aira-job.scope") || hasAIRAComponent("/user.slice/not.aira-job.scope") {
-		t.Fatal("aira component classification wrong")
 	}
 }
 
