@@ -2,6 +2,7 @@ import contextlib
 import errno
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -2175,3 +2176,350 @@ def test_drain_worker_rejects_a_logstart_event_for_the_wrong_nodeid(pytester, mo
     assert nodeid not in supervisor.results
     assert "aira aitest:" in capsys.readouterr().err
     os.close(dispatch_read)
+
+
+# ---------------------------------------------------------------------------
+# AIRA-92: no unbounded blocking read may sit on the dispatch loop.
+#
+# The supervisor is single-threaded. Every one of these reads, while blocked,
+# drains no worker result pipe and dispatches no queued nodeid to an already
+# idle worker -- so an unbounded one does not merely delay a replacement, it
+# freezes the entire pool: process alive, near-zero CPU, output frozen mid-run,
+# with no diagnostic. That is AIRA-92's reported signature.
+# ---------------------------------------------------------------------------
+
+
+def test_unresponsive_admit_relay_does_not_wedge_the_whole_pool(tmp_path, monkeypatch, pytester):
+    """THE AIRA-92 REGRESSION. A relay that answers nothing at all must cost at
+    most one admission attempt, never the run.
+
+    Against the pre-fix implementation this test does not fail, it HANGS
+    FOREVER on acquire_worker's untimed process.stdout.readline() -- which is
+    precisely the bug. The stub wedges exactly one admission (the replacement
+    acquired after the first recycle) and answers normally afterwards, so a
+    correct supervisor rides through it and still completes every nodeid."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+import sys
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+sys.exit(0)
+""")
+    counter = tmp_path / "admit-calls"
+    wedged_marker = tmp_path / "wedged"
+    admit = _write_stub(tmp_path / "worker-admit-wedged", f"""
+import os, sys, time
+with open({str(counter)!r}, "a") as handle:
+    handle.write("x")
+with open({str(counter)!r}) as handle:
+    n = len(handle.read())
+if n == 3:
+    # Answer NOTHING: no grant, no denial, no exit. Models the relay's own
+    # unbounded segments (dial, CreateWorkerScope, PathsFromEnv) which sit
+    # outside its socket deadline.
+    with open({str(wedged_marker)!r}, "w") as handle:
+        handle.write("1")
+    time.sleep(600)
+scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+os.makedirs(scope, exist_ok=True)
+print("granted scope=%s worker_id=%d memory_max=104857600 memory_high=83886080" % (scope, os.getpid()))
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", "1")
+    monkeypatch.setenv("AIRA_AITEST_ADMIT_READ_GRACE", "1")
+
+    items = pytester.getitems("""
+        def test_a(): assert True
+        def test_b(): assert True
+        def test_c(): assert True
+        def test_d(): assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=2, max_wait="1s")
+
+    assert wedged_marker.exists(), "the wedged-relay branch never ran; test proves nothing"
+    assert len(results) == 4
+    assert all(outcome == "passed" for outcome in results.values()), results
+    # A relay that merely failed to answer is NOT proof the daemon is gone, so
+    # containment must survive it.
+    assert supervisor.daemon_available is True
+
+
+def test_unresponsive_admit_relay_is_a_denial_not_daemon_unavailable(tmp_path, monkeypatch, capsys):
+    """Classification, isolated from the dispatch loop. WorkerAdmitUnavailable
+    would _disable_daemon and run the REST of the suite unconfined, on a daemon
+    that was never shown to be unreachable."""
+    relay_pidfile = tmp_path / "relay-pid"
+    admit = _write_stub(tmp_path / "worker-admit-silent", f"""
+import os, time
+with open({str(relay_pidfile)!r}, "w") as handle:
+    handle.write(str(os.getpid()))
+time.sleep(600)
+""")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    monkeypatch.setenv("AIRA_AITEST_ADMIT_READ_GRACE", "1")
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+
+    started = time.monotonic()
+    try:
+        supervisor.acquire_worker(1 << 20, max_wait="1s")
+        assert False, "expected WorkerAdmitDenied"
+    except WorkerAdmitUnavailable as exc:
+        assert False, "an unresponsive relay must not be reported as an absent daemon: %s" % exc
+    except WorkerAdmitDenied as exc:
+        assert "relay-unresponsive" in str(exc)
+    elapsed = time.monotonic() - started
+    assert elapsed < 60, "the read was not actually bounded (%.1fs)" % elapsed
+    assert supervisor.daemon_available is True
+    assert "did not answer" in capsys.readouterr().err
+    # The wedged relay must be KILLED, not abandoned: it is the process holding
+    # this job's daemon-side worker grant open, and the daemon releases that
+    # grant on peer disconnect. Abandoning it leaks a ledger entry for the rest
+    # of the run, on top of leaving a live process behind per timed-out attempt.
+    relay_pid = int(relay_pidfile.read_text())
+    for _ in range(100):
+        try:
+            os.kill(relay_pid, 0)
+        except OSError:
+            break
+        time.sleep(0.05)
+    else:
+        os.kill(relay_pid, 9)
+        assert False, "the unresponsive relay was left alive, still holding its grant"
+
+
+def test_retire_worker_does_not_block_forever_on_a_wedged_child(monkeypatch):
+    """_retire_worker sits directly on the dispatch loop -- retirement, recycle
+    and the end-of-run __stop__ broadcast all reach it. Its waitpid was
+    unbounded, so a child that reported its last result and then wedged on the
+    way out (a coverage save, a wedged atexit, an uninterruptible page-fault
+    wait under memory pressure) froze the whole supervisor exactly as a wedged
+    relay did. The child's results are already recorded by then, so escalating
+    to SIGKILL cannot lose data."""
+    monkeypatch.setenv("AIRA_AITEST_REAP_TIMEOUT", "1")
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            # Ignore SIGTERM so only an actual SIGKILL can end this: the test
+            # must prove escalation, not merely that something was signalled.
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            time.sleep(600)
+        finally:
+            os._exit(0)
+
+    class DispatchWrite:
+        def close(self):
+            pass
+
+    supervisor = Supervisor()
+    state = {
+        "dispatch_write": DispatchWrite(),
+        "result_fd": read_fd,
+        "admit_process": None,
+        "grant": None,
+        "in_flight": None,
+    }
+    supervisor.workers[pid] = state
+    started = time.monotonic()
+    supervisor._retire_worker(pid, state)
+    elapsed = time.monotonic() - started
+
+    os.close(write_fd)
+    assert elapsed < 30, "_retire_worker blocked %.1fs on a wedged child" % elapsed
+    assert pid not in supervisor.workers
+    try:
+        os.kill(pid, 0)
+        os.kill(pid, 9)
+        assert False, "a wedged child must be SIGKILLed, not waited on forever"
+    except OSError:
+        pass
+
+
+def test_transport_read_timeout_is_retriable_not_daemon_unavailable(tmp_path, monkeypatch):
+    """A socket-deadline overrun (max_wait + a ONE second transport grace, over
+    a daemon evaluation that holds job.mu across cgroupfs reads and is not
+    itself deadline-aware) proves only that the reply was late -- the daemon was
+    dialled and the request was sent. Treating it as "no daemon at all"
+    permanently stripped RAM containment for the rest of the run."""
+    admit = _write_stub(tmp_path / "worker-admit-io-timeout", """
+import sys
+sys.stderr.write("E_CONFINE_UNAVAILABLE: read worker-admit response: read unix @->/run/aira.sock: i/o timeout\\n")
+sys.exit(4)
+""")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    try:
+        supervisor.acquire_worker(1 << 20)
+        assert False, "expected WorkerAdmitDenied"
+    except WorkerAdmitDenied:
+        pass
+    assert supervisor.daemon_available is True
+
+
+def test_transport_frame_failures_are_retriable_but_protocol_skew_is_not(tmp_path, monkeypatch):
+    """THE CONJUNCTION GUARD. "read worker-admit response: %w" wraps every
+    readRunnerAdmitFrame failure, and those split into two different classes.
+
+    TRANSPORT shapes (deadline, EOF from the daemon's own stopping path, reset)
+    establish nothing about the daemon's existence, and self-disambiguate on the
+    next attempt -- which fails at the DIAL instead if the daemon really is gone.
+
+    PROTOCOL shapes (invalid frame size, json unmarshal) are permanent version
+    skew against a LIVE daemon: retrying can never succeed, so classifying them
+    retriable would convert a clean fallback into an unbounded wait -- exactly
+    the hang class this change exists to remove. Matching the bare prefix would
+    do precisely that."""
+    retriable = ("i/o timeout", "EOF", "unexpected EOF", "connection reset by peer")
+    terminal = ("invalid daemon admission frame size 99999999",
+                "json: cannot unmarshal string into Go value of type runner.admitFrame")
+    for index, wrapped in enumerate(retriable + terminal):
+        admit = _write_stub(tmp_path / ("worker-admit-frame-%d" % index), f"""
+import sys
+sys.stderr.write("E_CONFINE_UNAVAILABLE: read worker-admit response: {wrapped}\\n")
+sys.exit(4)
+""")
+        monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+        supervisor = Supervisor()
+        supervisor.outer_scope = "/outer"
+        expect_retriable = wrapped in retriable
+        try:
+            supervisor.acquire_worker(1 << 20)
+            assert False, "expected an exception for %r" % wrapped
+        except WorkerAdmitDenied as exc:
+            assert expect_retriable, "%r is permanent skew and must not be retried: %s" % (wrapped, exc)
+        except WorkerAdmitUnavailable as exc:
+            assert not expect_retriable, "%r is transport-only and must not strip containment: %s" % (wrapped, exc)
+        assert supervisor.daemon_available is True
+
+
+def test_fork_resource_failure_is_a_denial_not_daemon_unavailable(monkeypatch):
+    """EAGAIN/ENOMEM launching the relay is a transient LOCAL fork failure that
+    peaks under exactly the contention this path exists for. It says nothing
+    about the daemon, so it must not permanently strip containment. A permanent
+    local fact (ENOENT on the binary) still must."""
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", "/bin/true")
+
+    def refuse(*args, **kwargs):
+        raise OSError(errno.EAGAIN, "Resource temporarily unavailable")
+
+    monkeypatch.setattr(supervisor_module.subprocess, "Popen", refuse)
+    try:
+        supervisor.acquire_worker(1 << 20)
+        assert False, "expected WorkerAdmitDenied"
+    except WorkerAdmitUnavailable as exc:
+        assert False, "a transient fork failure must not be an absent daemon: %s" % exc
+    except WorkerAdmitDenied:
+        pass
+    assert supervisor.daemon_available is True
+
+    def permanent(*args, **kwargs):
+        raise OSError(errno.ENOENT, "No such file or directory")
+
+    monkeypatch.setattr(supervisor_module.subprocess, "Popen", permanent)
+    try:
+        supervisor.acquire_worker(1 << 20)
+        assert False, "expected WorkerAdmitUnavailable"
+    except WorkerAdmitUnavailable:
+        pass
+
+
+def test_placement_ack_timeout_kills_the_child_and_reports_a_denial(monkeypatch):
+    """A forked child that is ALIVE but wedged before writing __placed__ is not
+    covered by the EOF path (which only catches a child that DIED). Left
+    untimed, it held the dispatch loop open indefinitely.
+
+    A timeout is not evidence the local cgroup mechanism is broken, so it must
+    NOT raise WorkerPlacementFailed -- that is what makes _replace_worker strip
+    containment for the rest of the run."""
+    class Stream:
+        def close(self):
+            pass
+
+    class AdmitProcess:
+        def __init__(self):
+            self.stdin = Stream()
+            self.stdout = Stream()
+            self.stderr = Stream()
+
+        def wait(self, timeout=None):
+            return 0
+
+    wedged = {}
+
+    def child_that_never_acks(scope):
+        pid = os.fork()
+        if pid == 0:
+            try:
+                time.sleep(600)
+            finally:
+                os._exit(0)
+        wedged["pid"] = pid
+        return pid, False
+
+    monkeypatch.setenv("AIRA_AITEST_PLACEMENT_ACK_TIMEOUT", "1")
+    supervisor = Supervisor()
+    supervisor.acquire_worker = lambda estimated_bytes, max_wait: (
+        {"scope": "/unused", "worker_id": "1", "memory_max": "1", "memory_high": "1"}, AdmitProcess()
+    )
+    monkeypatch.setattr(supervisor_module, "fork_worker", child_that_never_acks)
+
+    started = time.monotonic()
+    try:
+        supervisor.spawn_worker(1)
+        assert False, "expected WorkerAdmitDenied"
+    except WorkerPlacementFailed as exc:
+        assert False, "an ack TIMEOUT must not assert a broken cgroup mechanism: %s" % exc
+    except WorkerAdmitDenied as exc:
+        assert "placement-ack-timeout" in str(exc)
+    assert time.monotonic() - started < 60, "the placement-ack read was not bounded"
+    assert supervisor.daemon_available is True
+    # The wedged child must be gone, not orphaned holding a placed grant.
+    try:
+        os.kill(wedged["pid"], 0)
+        alive = True
+    except OSError:
+        alive = False
+    assert alive is False, "a wedged, un-acked child must be killed, not leaked"
+
+
+def test_parse_max_wait_falls_back_to_bounded_never_unbounded():
+    """An unparseable --max-wait must degrade to bounded-but-generous. It may
+    never reintroduce an unbounded read, and it may never fire early."""
+    assert supervisor_module._parse_max_wait_seconds("30s") == 30.0
+    assert supervisor_module._parse_max_wait_seconds("2m") == 120.0
+    assert supervisor_module._parse_max_wait_seconds("500ms") == 0.5
+    # Pin the PROPERTY, not the constant. Asserting equality with
+    # _MAX_WAIT_FALLBACK_SECONDS is a tautology: it survives setting that
+    # constant to 0, which would make every admission read expire instantly and
+    # turn a hang into a run that can never admit a worker at all. Mutation
+    # testing found exactly that survivor, so this pins the real invariant --
+    # bounded, but never able to fire before a healthy relay could answer.
+    for unparseable in ("garbage", "", "30 seconds", "-5s", None, 30):
+        fallback = supervisor_module._parse_max_wait_seconds(unparseable)
+        assert fallback >= 300.0, (
+            "%r must fall back to a GENEROUS bound (got %r)" % (unparseable, fallback)
+        )
+        assert fallback < float("inf"), "%r must still be bounded" % (unparseable,)
+
+
+def test_env_seconds_never_disables_a_bound(monkeypatch, capsys):
+    """A malformed or non-positive override falls back to the pinned default.
+    No operator typo may turn a bounded read back into an unbounded one."""
+    monkeypatch.setenv("AIRA_AITEST_PROBE_SECONDS", "not-a-number")
+    assert supervisor_module._env_seconds("AIRA_AITEST_PROBE_SECONDS", 7.0) == 7.0
+    monkeypatch.setenv("AIRA_AITEST_PROBE_SECONDS", "0")
+    assert supervisor_module._env_seconds("AIRA_AITEST_PROBE_SECONDS", 7.0) == 7.0
+    monkeypatch.setenv("AIRA_AITEST_PROBE_SECONDS", "-1")
+    assert supervisor_module._env_seconds("AIRA_AITEST_PROBE_SECONDS", 7.0) == 7.0
+    monkeypatch.delenv("AIRA_AITEST_PROBE_SECONDS")
+    assert supervisor_module._env_seconds("AIRA_AITEST_PROBE_SECONDS", 7.0) == 7.0
+    assert "invalid value" in capsys.readouterr().err

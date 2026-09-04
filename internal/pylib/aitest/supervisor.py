@@ -1,7 +1,10 @@
 import errno
 import json
 import os
+import re
 import select
+import selectors
+import signal
 import subprocess
 import sys
 import time
@@ -18,6 +21,177 @@ _DENIAL_RETRY_SECONDS = 1.0
 # path. A stuck run must never be SILENT, even though it must also never
 # fall back to unconfined just because the wait is long.
 _DENIAL_WARN_EVERY = 30
+
+# AIRA-92. The supervisor is SINGLE-THREADED: while it is blocked reading the
+# worker-admit relay it drains no worker's result pipe and dispatches no queued
+# nodeid to an idle worker. Every blocking read it performs must therefore be
+# bounded, or one wedged relay stops the entire pool with no diagnostic and no
+# forward progress -- alive, near-zero CPU, output frozen mid-run.
+#
+# `aira worker-admit` is NOT self-bounding at the process level. Its socket read
+# deadline is max_wait + admitTransportGrace (1s, internal/runner/
+# admission_linux.go:81), but three of its own segments sit OUTSIDE that
+# deadline with no bound in code: the dial (no Dialer.Timeout and a
+# deadline-free ctx, internal/runner/worker_admit_client_linux.go:55-59),
+# runner.CreateWorkerScope (passed ctx rather than signalCtx, so not even
+# SIGINT-cancellable, cmd/aira/main.go:1074), and daemon.PathsFromEnv's path
+# walking (cmd/aira/main.go:1059). The daemon's own evaluateWorkerAdmit
+# additionally holds job.mu across two cgroupfs reads and documents itself as
+# "uninterruptible and not itself deadline-aware" (internal/daemon/
+# worker_admit.go:192-213). So the client must impose its own bound.
+#
+# The grace is deliberately several times the Go side's own 1s transport grace:
+# this bound is the LAST resort against a wedge, never a competing timer that
+# races a healthy-but-slow relay into a spurious timeout.
+_ADMIT_READ_GRACE_SECONDS = 15.0
+# Used only when --max-wait cannot be parsed at all. The CLI itself caps
+# --max-wait at 30m (cmd/aira/main.go:962-969), so this can never fire before a
+# genuinely-waiting relay would have answered; it exists purely so an
+# unparseable value degrades to "bounded but generous" instead of "unbounded".
+_MAX_WAIT_FALLBACK_SECONDS = 1800.0
+# The post-fork placement ack is pure interpreter work in the child -- close
+# inherited fds, fdopen two pipes, write one line -- with no test code and no
+# daemon round trip in it. A minute is orders of magnitude more than that costs
+# even on a thrashing box, so a timeout here means the child is genuinely
+# wedged, not merely slow.
+_PLACEMENT_ACK_TIMEOUT_SECONDS = 60.0
+# Bound on waiting for an already-signalled child or a released relay to
+# actually go away, before escalating to SIGKILL. Reaching this is abnormal;
+# blocking on it forever is worse.
+_REAP_TIMEOUT_SECONDS = 5.0
+
+_GO_DURATION = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*(ns|us|µs|ms|s|m|h)?\s*$")
+_GO_DURATION_SCALE = {
+    None: 1.0, "": 1.0, "ns": 1e-9, "us": 1e-6, "µs": 1e-6,
+    "ms": 1e-3, "s": 1.0, "m": 60.0, "h": 3600.0,
+}
+
+
+def _env_seconds(name, default):
+    """A positive float override, or the pinned default. A malformed or
+    non-positive value falls back to the default rather than disabling the
+    bound: an unbounded read is the bug this exists to prevent, so no operator
+    typo may ever reintroduce one."""
+    raw = os.environ.get(name, "")
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        sys.stderr.write(
+            "aira aitest: %s has invalid value %r; using default %r\n" % (name, raw, default)
+        )
+        return default
+    if value <= 0:
+        sys.stderr.write(
+            "aira aitest: %s must be positive (got %r); using default %r\n" % (name, raw, default)
+        )
+        return default
+    return value
+
+
+def _parse_max_wait_seconds(max_wait):
+    """Best-effort parse of the SAME --max-wait string handed to the relay, so
+    the client's own bound is always strictly later than the relay's. Any value
+    this cannot parse yields _MAX_WAIT_FALLBACK_SECONDS -- never an exception
+    and never an unbounded wait."""
+    match = _GO_DURATION.match(max_wait) if isinstance(max_wait, str) else None
+    if match is None:
+        return _MAX_WAIT_FALLBACK_SECONDS
+    return float(match.group(1)) * _GO_DURATION_SCALE[match.group(2)]
+
+
+def _read_line_deadline(fd, timeout):
+    """Read one newline-terminated line from a raw fd, bounded by timeout.
+
+    Returns (line, timed_out). A timeout returns ("", True) -- whatever partial
+    bytes arrived are deliberately discarded, because the only caller (the
+    worker-admit grant line) has no use for half a record and must not attribute
+    meaning to one.
+
+    Reads the RAW fd rather than a buffered readline for the same reason
+    _drain_available_lines does: a buffered wrapper can hold bytes select()
+    cannot see. Over-reading past this line's newline is safe here specifically
+    because `aira worker-admit` writes exactly one stdout line and then blocks
+    on its own stdin reaching EOF (cmd/aira/main.go:1092-1105) -- there is never
+    a second line to lose."""
+    buf = b""
+    deadline = time.monotonic() + timeout
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(fd, selectors.EVENT_READ)
+        while b"\n" not in buf:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                return "", True
+            try:
+                chunk = os.read(fd, 65536)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        selector.close()
+    line, sep, _ = buf.partition(b"\n")
+    # "replace", not "strict": a stray non-UTF-8 byte must degrade to an
+    # unrecognized line handled by the caller's existing malformed-response
+    # guards, never an uncaught UnicodeDecodeError that loses the whole run.
+    return (line.decode("utf-8", "replace") if sep else ""), False
+
+
+def _terminate_process(process):
+    """Release a subprocess we are done with, without ever blocking forever on
+    it. Escalates to SIGKILL rather than swallowing a timed-out wait and leaving
+    a live process behind."""
+    if process is None:
+        return
+    try:
+        process.wait(timeout=_env_seconds("AIRA_AITEST_REAP_TIMEOUT", _REAP_TIMEOUT_SECONDS))
+        return
+    except Exception:
+        pass
+    try:
+        process.kill()
+    except Exception:
+        pass
+    try:
+        process.wait(timeout=_env_seconds("AIRA_AITEST_REAP_TIMEOUT", _REAP_TIMEOUT_SECONDS))
+    except Exception:
+        # Nothing further is safe or useful here; never abort a run over the
+        # cleanup of a process whose work is already finished.
+        pass
+
+
+def _reap_child(pid):
+    """waitpid a child we expect to be exiting, bounded, escalating to SIGKILL.
+
+    The unbounded os.waitpid() this replaces sat directly on the dispatch loop
+    (retirement, recycle, shutdown), so a child that reported its result and
+    then wedged on the way out -- a coverage save, a wedged atexit, an
+    uninterruptible page-fault wait under memory pressure -- froze the whole
+    supervisor exactly as a wedged relay does."""
+    deadline = time.monotonic() + _env_seconds("AIRA_AITEST_REAP_TIMEOUT", _REAP_TIMEOUT_SECONDS)
+    killed = False
+    while True:
+        try:
+            done, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if done:
+            return
+        if time.monotonic() >= deadline:
+            if killed:
+                # It has been SIGKILLed and still is not reapable. Leaving a
+                # zombie is strictly better than never returning to the loop.
+                return
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                return
+            killed = True
+            deadline = time.monotonic() + _env_seconds("AIRA_AITEST_REAP_TIMEOUT", _REAP_TIMEOUT_SECONDS)
+        time.sleep(0.01)
 
 
 class WorkerAdmitUnavailable(Exception):
@@ -70,21 +244,44 @@ class WorkerPlacementFailed(Exception):
     pass
 
 
-def _read_line_blocking(fd, state):
-    """Blocking read of exactly one line from a raw fd, used only for the
-    one-time post-fork placement-ack wait (spawn_worker/
-    _spawn_fallback_worker) -- blocking IS the desired behaviour there.
+def _read_line_blocking(fd, state, timeout=None):
+    """Read exactly one line from a raw fd, used only for the one-time
+    post-fork placement-ack wait (spawn_worker/_spawn_fallback_worker).
     Shares state["read_buffer"] with _drain_available_lines below (both
     read the SAME fd over the worker's lifetime) so no byte a single
     os.read() call happens to over-read past this line's newline is ever
-    lost to a later caller."""
+    lost to a later caller.
+
+    AIRA-92: bounded by `timeout` when one is given, setting
+    state["read_timeout"] and returning "" on expiry. EOF alone was not
+    sufficient coverage: it catches a child that DIED before acking, but not
+    one that is alive and wedged before its ack. This read sits directly on the
+    dispatch loop, so that wedge stopped the entire pool -- no drain, no
+    dispatch, no diagnostic. The caller must be able to tell the two apart: a
+    dead child is a genuine placement failure, a wedged one is a transient that
+    must NOT be converted into an unconfined run."""
     buf = state.get("read_buffer", b"")
-    while b"\n" not in buf:
-        chunk = os.read(fd, 65536)
-        if not chunk:
-            state["result_eof"] = True
-            break
-        buf += chunk
+    deadline = None if timeout is None else time.monotonic() + timeout
+    selector = None
+    try:
+        while b"\n" not in buf:
+            if deadline is not None:
+                if selector is None:
+                    selector = selectors.DefaultSelector()
+                    selector.register(fd, selectors.EVENT_READ)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    state["read_buffer"] = buf
+                    state["read_timeout"] = True
+                    return ""
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                state["result_eof"] = True
+                break
+            buf += chunk
+    finally:
+        if selector is not None:
+            selector.close()
     line, sep, buf = buf.partition(b"\n")
     state["read_buffer"] = buf
     # "replace", not "strict" (Fable build-review, final gate): a stray
@@ -276,21 +473,73 @@ class Supervisor:
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True,
             )
         except OSError as exc:
+            # EAGAIN/ENOMEM here mean this HOST could not fork a process right
+            # now -- a transient resource condition, and one that peaks under
+            # exactly the contention this whole path is about (Fable
+            # plan-review, P2-4). It says nothing whatsoever about the daemon,
+            # so reporting it as WorkerAdmitUnavailable permanently stripped RAM
+            # containment for the rest of the run over a momentary fork failure
+            # on a perfectly healthy daemon -- the same misdiagnosis class as
+            # the transport branch below. Every other OSError (ENOENT, EACCES on
+            # the aira binary) IS a static, permanent local fact and stays
+            # unavailable.
+            if exc.errno in (errno.EAGAIN, errno.ENOMEM):
+                raise WorkerAdmitDenied("worker-admit denied: fallback:fork-unavailable: %s" % exc)
             raise WorkerAdmitUnavailable(str(exc))
+        # AIRA-92: BOUNDED, never a bare readline(). See _read_line_deadline and
+        # the _ADMIT_READ_GRACE_SECONDS comment for why the relay cannot be
+        # trusted to bound itself, and why this single untimed read was able to
+        # freeze the whole pool -- no result drained, no nodeid dispatched to an
+        # already-idle worker, no diagnostic, for as long as the relay stayed
+        # wedged.
+        #
         # "replace", not "strict" (Sol build-review, AIRA-38 review wave): a
         # corrupted/truncated write or a stray binary byte from a
         # misbehaving relay build must degrade to a malformed, unrecognized
         # line (falling through to WorkerAdmitUnavailable below, the
         # documented "malformed response" treatment) rather than raise an
         # uncaught UnicodeDecodeError that crashes the whole pytest process.
-        line = process.stdout.readline().decode("utf-8", "replace").strip()
+        read_timeout = _parse_max_wait_seconds(max_wait) + _env_seconds(
+            "AIRA_AITEST_ADMIT_READ_GRACE", _ADMIT_READ_GRACE_SECONDS
+        )
+        line, timed_out = _read_line_deadline(process.stdout.fileno(), read_timeout)
+        line = line.strip()
+        if timed_out:
+            # The relay is alive but has answered nothing at all inside its own
+            # declared budget plus a generous grace. Release it and treat this
+            # as a DENIAL, never as WorkerAdmitUnavailable: we could not
+            # establish a result, which is precisely the state AIRA requires be
+            # reported as such rather than resolved into a confident verdict.
+            # Calling it "unavailable" would assert the daemon is gone -- an
+            # unproven claim whose consequence is stripping RAM containment for
+            # the rest of the run. Calling it a denial keeps containment, keeps
+            # the surviving pool dispatching, and lets the existing retry path
+            # try again.
+            #
+            # Accepted, documented consequence: if the daemon granted in the
+            # microscopic window between our deadline and this kill, it releases
+            # that grant on peer disconnect (internal/daemon/worker_admit.go:
+            # 456-464, idempotent at :295-306) but the scope directory it
+            # created is orphaned until AIRA-36's reaper sweeps it. A leaked
+            # empty directory is strictly better than a frozen run.
+            _terminate_process(process)
+            sys.stderr.write(
+                "aira aitest: worker-admit relay did not answer within %.1fs "
+                "(--max-wait %s); treating as a transient denial, containment preserved\n"
+                % (read_timeout, max_wait)
+            )
+            raise WorkerAdmitDenied(
+                "worker-admit denied: fallback:relay-unresponsive after %.1fs" % read_timeout
+            )
         if not line.startswith("granted "):
+            # Release BEFORE reading stderr (AIRA-92): no grant was issued, so
+            # the relay owes us nothing further and this ordering cannot lose a
+            # diagnostic the way it would on the malformed-GRANT path below
+            # (whose relay genuinely blocks on stdin EOF first). Reading an
+            # unbounded stderr from a relay that has NOT exited was itself an
+            # untimed read on the dispatch loop.
+            _terminate_process(process)
             stderr = process.stderr.read().decode("utf-8", "replace") if process.stderr else ""
-            try:
-                process.wait(timeout=5)
-            except Exception:
-                process.kill()
-                process.wait()  # reap immediately rather than leave a zombie
             message = line or stderr or "worker-admit exited without a grant"
             # RequestWorkerAdmit (Task 8) wraps a daemon-reachable-but-
             # declined response as "worker-admit <state>: <reason>" on
@@ -408,6 +657,50 @@ class Supervisor:
                 raise WorkerAdmitRequestTooLarge(message)
             if "worker-admit denied" in message or "worker-admit timeout" in message or "worker-admit unevaluated" in message:
                 raise WorkerAdmitDenied(message)
+            # "read worker-admit response: ... i/o timeout" (AIRA-92): the
+            # client's own SOCKET deadline expired -- max_wait plus a grace of
+            # exactly ONE second (admitTransportGrace, internal/runner/
+            # admission_linux.go:81) over a daemon whose evaluateWorkerAdmit
+            # holds job.mu across two cgroupfs reads and documents itself as
+            # "uninterruptible and not itself deadline-aware" (internal/daemon/
+            # worker_admit.go:192-213). Under N-way worker contention that grace
+            # is thin, and overrunning it proves nothing about the daemon's
+            # existence: it was dialled, the request WAS sent, only the reply
+            # was late. Treating that as WorkerAdmitUnavailable silently
+            # stripped RAM containment for the whole remaining run on a
+            # perfectly healthy daemon -- the same misdiagnosis class the
+            # E_CONFINE_ARGUMENT_INVALID and "unevaluated" branches above
+            # already exist to prevent.
+            #
+            # A CONJUNCTION is required, never the bare prefix (Sol plan-review
+            # P0, refined by Fable plan-review P1-1): "read worker-admit
+            # response: %w" (internal/runner/worker_admit_client_linux.go:95)
+            # wraps EVERY frame-read failure from readRunnerAdmitFrame
+            # (internal/runner/admission_linux.go:562-576), and those split into
+            # two genuinely different classes:
+            #
+            #   TRANSPORT (retriable, matched here) -- "i/o timeout" (the socket
+            #   deadline), "EOF"/"unexpected EOF" (the daemon returned without
+            #   writing a frame, e.g. the s.stopping path at
+            #   internal/daemon/worker_admit.go:436-438), "connection reset".
+            #   None of these establishes that the daemon is gone, and the very
+            #   next attempt disambiguates for free: a genuinely dead daemon
+            #   fails at the DIAL instead, producing "dial daemon: ... connection
+            #   refused", which is not matched here and correctly becomes
+            #   WorkerAdmitUnavailable. So at most one extra attempt is spent.
+            #
+            #   PROTOCOL (terminal, deliberately NOT matched) -- "invalid daemon
+            #   admission frame size" (:569) and "json: ..." unmarshal failures
+            #   (:575). These are permanent version/protocol skew against a LIVE
+            #   daemon: retrying cannot ever succeed, so matching them here would
+            #   convert a clean fallback into an unbounded wait -- reintroducing
+            #   the very hang class this change exists to remove.
+            if "read worker-admit response" in message and (
+                "i/o timeout" in message
+                or "EOF" in message
+                or "connection reset" in message
+            ):
+                raise WorkerAdmitDenied(message)
             raise WorkerAdmitUnavailable(message)
         grant = {}
         for field in line[len("granted "):].split():
@@ -448,11 +741,10 @@ class Supervisor:
             except BrokenPipeError:
                 pass
             stderr = process.stderr.read().decode("utf-8", "replace") if process.stderr else ""
-            try:
-                process.wait(timeout=5)
-            except Exception:
-                process.kill()
-                process.wait()  # reap immediately rather than leave a zombie
+            # Bounded, and escalates to SIGKILL rather than leaving a live relay
+            # behind (AIRA-92): the previous `process.wait()` after kill() was
+            # itself unbounded.
+            _terminate_process(process)
             # Mirrors _retire_worker's best-effort scope cleanup (Fable
             # build-review, final gate): a malformed grant can still name
             # a real, already-created scope (e.g. a bad memory_max value
@@ -555,8 +847,16 @@ class Supervisor:
         # select()-on-the-wrapped-object check cannot see bytes already
         # sitting in the wrapper's own buffer rather than the pipe.
         state = {"result_fd": result_read, "read_buffer": b"", "result_eof": False}
-        ack = _read_line_blocking(result_read, state)
+        # AIRA-92: BOUNDED (Sol plan-review, P0). EOF alone covered only a child
+        # that DIED before acking; a child alive but wedged before its ack held
+        # this untimed read -- and therefore the whole single-threaded dispatch
+        # loop -- open indefinitely.
+        ack = _read_line_blocking(
+            result_read, state,
+            timeout=_env_seconds("AIRA_AITEST_PLACEMENT_ACK_TIMEOUT", _PLACEMENT_ACK_TIMEOUT_SECONDS),
+        )
         if ack != self._PLACED_LINE:
+            ack_timed_out = bool(state.get("read_timeout"))
             # The child died (os._exit'd, above, or from fork_worker's own
             # guard) before ever confirming placement -- it never joined
             # its granted cgroup scope. This is a PLACEMENT failure, not a
@@ -564,17 +864,19 @@ class Supervisor:
             # that WAS placed and later died) -- release the now-dead
             # admit lease and raise distinctly so the caller does not
             # spend this nodeid's one-and-only crash-retry budget on it.
+            if ack_timed_out:
+                # Alive but wedged: it must be killed, or closing our pipe ends
+                # below leaves an orphan holding a placed grant, and the scope
+                # rmdir below would fail with EBUSY forever.
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
             os.close(result_read)
             os.close(dispatch_write)
-            try:
-                os.waitpid(pid, 0)
-            except ChildProcessError:
-                pass
+            _reap_child(pid)
             admit_process.stdin.close()
-            try:
-                admit_process.wait(timeout=5)
-            except Exception:
-                pass
+            _terminate_process(admit_process)
             # Mirrors _retire_worker's best-effort scope cleanup (Fable
             # build-review, final gate): the daemon already granted and
             # CreateWorkerScope already made this directory before the
@@ -586,6 +888,24 @@ class Supervisor:
                 os.rmdir(grant["scope"])
             except OSError as exc:
                 sys.stderr.write("aira aitest: could not remove worker scope %s: %s\n" % (grant["scope"], exc))
+            if ack_timed_out:
+                # A TIMEOUT is not proof the local cgroup mechanism is broken,
+                # which is exactly what WorkerPlacementFailed asserts and what
+                # makes _replace_worker strip containment for the rest of the
+                # run. We killed a child that had not yet said anything -- an
+                # unestablished result, not a diagnosis. Report it as a denial:
+                # containment preserved, the surviving pool keeps dispatching,
+                # and the existing retry path tries again. A genuinely broken
+                # cgroup mechanism still reaches WorkerPlacementFailed below via
+                # the EOF path, which is real evidence.
+                sys.stderr.write(
+                    "aira aitest: worker %d did not confirm cgroup placement within the "
+                    "ack timeout and was killed; treating as a transient denial, "
+                    "containment preserved\n" % pid
+                )
+                raise WorkerAdmitDenied(
+                    "worker-admit denied: fallback:placement-ack-timeout for worker %d" % pid
+                )
             raise WorkerPlacementFailed("worker %d exited before confirming cgroup placement" % pid)
         os.set_blocking(result_read, False)
         state.update({
@@ -717,21 +1037,22 @@ class Supervisor:
             os.close(state["result_fd"])
         except OSError:
             pass
-        try:
-            os.waitpid(pid, 0)
-        except ChildProcessError:
-            pass
+        # AIRA-92 (Sol plan-review, P1): BOUNDED. This sits directly on the
+        # dispatch loop -- retirement, recycle and the end-of-run __stop__
+        # broadcast all reach it -- so a child that reported its last result and
+        # then wedged on the way out (a coverage save, a wedged atexit, an
+        # uninterruptible page-fault wait under memory pressure) froze the whole
+        # supervisor exactly as a wedged relay did. Its results are already
+        # recorded by the time we get here, so escalating to SIGKILL costs
+        # nothing and cannot lose data.
+        _reap_child(pid)
         if state["admit_process"] is not None:
             state["admit_process"].stdin.close()
-            try:
-                state["admit_process"].wait(timeout=5)
-            except Exception:
-                # A wedged admit-relay process must never abort the whole
-                # run over a best-effort wait -- matches the identical
-                # guard on this same call in spawn_worker's own failure
-                # path (build-review P2: this one was the sole unguarded
-                # copy).
-                pass
+            # Bounded, then SIGKILL. A wedged admit-relay process must never
+            # abort the whole run over a best-effort wait -- but silently
+            # swallowing the timeout left a LIVE relay behind still holding its
+            # daemon grant, so the ledger entry outlived the worker it was for.
+            _terminate_process(state["admit_process"])
         grant = state.get("grant")
         if grant is not None:
             try:
