@@ -1195,6 +1195,15 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 	}
 	if exit := writeWorkerAdmitOutcome(stdout, stderr, outcome, grantFields, ""); exit != 0 {
 		_ = lease.Close()
+		// The scope exists but nobody will ever be told its path, so nobody
+		// will ever place a worker in it or remove it. Reap it here rather
+		// than leaving an empty capped cgroup for the #72 reaper's 5-minute
+		// sweep (Sol build-review). Best-effort: the outcome channel is
+		// already broken at this point, so a failure here has nowhere honest
+		// left to go but stderr.
+		if err := os.Remove(scopePath); err != nil && !os.IsNotExist(err) {
+			_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: remove undeliverable worker scope %s: %v\n", scopePath, err)
+		}
 		return exit
 	}
 	// Hold stdin open as the release signal, exactly mirroring confine-reserve.

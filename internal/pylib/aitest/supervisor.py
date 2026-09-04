@@ -708,6 +708,12 @@ class Supervisor:
             # already refused any class outside the catalogue, so there is no
             # default branch here to fall through to -- which is the whole
             # point: the old default was "abandon RAM containment".
+            #
+            # The lookup cannot yield the None sentinel here: the only class
+            # mapped to None is "granted", and the parser's own
+            # grantedness-agreement check guarantees class == "granted" iff
+            # state == "granted", which this branch has already excluded.
+            # That check is load-bearing for this line, not decorative.
             raise _OUTCOME_CLASS_EXCEPTIONS[outcome["class"]](
                 _describe_outcome(outcome, diagnostic)
             )
@@ -739,22 +745,36 @@ class Supervisor:
             # exactly as for every other non-usable response, rather than
             # leaving its lease and pipes around.
             #
-            # stdin MUST close BEFORE the blocking stderr read below (Sol
+            # ORDER IS LOAD-BEARING, and both halves of it are:
+            #
+            # stdin MUST close BEFORE any blocking stderr read (Sol
             # build-review, AIRA-38 review wave): per runWorkerAdmitCommand's
             # own confirmed contract, once a granted outcome is printed the
             # CLI relay blocks on ITS OWN stdin reaching EOF before it exits
             # (or writes anything further to stderr) -- reading stderr
             # first deadlocks unconditionally against a process that will
             # never close its own stderr until stdin closes.
+            #
+            # And _terminate_process MUST come before the read, not after
+            # (this revision, second review round): closing stdin makes a
+            # WELL-BEHAVED relay exit, but a wedged one that ignores its own
+            # stdin EOF left this unbounded read sitting on the
+            # single-threaded dispatch loop -- the exact AIRA-92 hazard, and
+            # the one remaining untimed read on this path. Terminating first
+            # costs nothing in the normal case (a relay that already exited
+            # on stdin EOF is reaped, not signalled) and bounds the wedged
+            # case; only a relay that was mid-write to stderr AND ignoring
+            # stdin can lose part of its diagnostic, and such a relay was not
+            # going to finish that write anyway.
             try:
                 process.stdin.close()
             except BrokenPipeError:
                 pass
-            stderr = process.stderr.read().decode("utf-8", "replace") if process.stderr else ""
             # Bounded, and escalates to SIGKILL rather than leaving a live relay
             # behind (AIRA-92): the previous `process.wait()` after kill() was
             # itself unbounded.
             _terminate_process(process)
+            stderr = process.stderr.read().decode("utf-8", "replace") if process.stderr else ""
             # Mirrors _retire_worker's best-effort scope cleanup (Fable
             # build-review, final gate): a malformed grant can still name
             # a real, already-created scope (e.g. a bad memory_max value

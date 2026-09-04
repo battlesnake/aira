@@ -194,6 +194,16 @@ func TestWorkerAdmitPollLoopBreaksOnClassNotOnReasonSpelling(t *testing.T) {
 				t.Fatalf("a transient verdict evaluated %d time(s); it must keep polling to its deadline",
 					evaluations.Load())
 			}
+			// The evaluation count alone would not distinguish "polled twice
+			// then broke early" from "polled to the deadline" (Sol
+			// build-review). The wantState assertion below is what actually
+			// pins that: only reaching the deadline produces state=timeout —
+			// an early break returns the denial itself, state=denied. The
+			// count is the complementary half, catching a break on the FIRST
+			// evaluation, which would leave state=denied too but with one
+			// evaluation rather than many. Deliberately a lower bound and not
+			// a tight one: a wall-clock-tight assertion here is the AIRA-20
+			// flake class.
 			payload := received.String()
 			if !strings.Contains(payload, `"state":"`+test.wantState+`"`) ||
 				!strings.Contains(payload, `"class":"`+test.wantClass+`"`) {

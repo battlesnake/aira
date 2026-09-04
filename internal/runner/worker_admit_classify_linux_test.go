@@ -212,6 +212,21 @@ func TestRequestWorkerAdmitClassifiesEndToEnd(t *testing.T) {
 		}
 	})
 
+	// verifies: AIRA-42 — a dial that failed on THIS process's own resource
+	// limits is retriable, not evidence that admission is unusable (Sol
+	// build-review). supervisor.py already applies the identical reasoning to
+	// an EAGAIN/ENOMEM fork failure when launching this relay.
+	t.Run("local resource exhaustion on dial is retriable", func(t *testing.T) {
+		outcome := classifyWorkerAdmitDialFailure(&net.OpError{Op: "dial", Err: syscall.EMFILE})
+		if outcome.Class != WorkerAdmitClassContended || outcome.Reason != WorkerAdmitReasonDialResourceExhausted {
+			t.Fatalf("outcome=%+v", outcome)
+		}
+		refused := classifyWorkerAdmitDialFailure(&net.OpError{Op: "dial", Err: syscall.ECONNREFUSED})
+		if refused.Class != WorkerAdmitClassAdmissionUnusable || refused.Reason != WorkerAdmitReasonDialFailed {
+			t.Fatalf("outcome=%+v: a refused connection IS evidence there is no daemon", refused)
+		}
+	})
+
 	t.Run("the daemon's own classification passes through verbatim", func(t *testing.T) {
 		data, _ := json.Marshal(workerAdmitGrant{
 			State: WorkerAdmitStateDenied, Class: WorkerAdmitClassRequestInvalid,
@@ -278,6 +293,43 @@ func TestRequestWorkerAdmitClassifiesEndToEnd(t *testing.T) {
 			t.Fatalf("outcome=%+v", outcome)
 		}
 	})
+
+	// verifies: AIRA-42 — a grant whose placement coordinates are unusable is
+	// a CONTRACT violation, not a local placement failure. Found by Sol
+	// build-review: memory_high >= memory_max is exactly what
+	// CreateWorkerScope refuses (worker_scope_linux.go:29), so without this
+	// check such a grant produced `placement-failed` — one of the two classes
+	// that make the supervisor run the rest of the suite UNCONFINED.
+	for _, bad := range []struct {
+		name  string
+		grant workerAdmitGrant
+	}{
+		{"memory_high at memory_max", workerAdmitGrant{WorkerID: "1", ScopePath: "/s", MemoryMax: 400, MemoryHigh: 400}},
+		{"memory_high above memory_max", workerAdmitGrant{WorkerID: "1", ScopePath: "/s", MemoryMax: 400, MemoryHigh: 500}},
+		{"memory_high absent", workerAdmitGrant{WorkerID: "1", ScopePath: "/s", MemoryMax: 400}},
+		{"memory_max absent", workerAdmitGrant{WorkerID: "1", ScopePath: "/s", MemoryHigh: 320}},
+		{"no worker id", workerAdmitGrant{ScopePath: "/s", MemoryMax: 400, MemoryHigh: 320}},
+		{"no scope path", workerAdmitGrant{WorkerID: "1", MemoryMax: 400, MemoryHigh: 320}},
+	} {
+		t.Run("an unusable grant is a contract violation: "+bad.name, func(t *testing.T) {
+			bad.grant.State = WorkerAdmitStateGranted
+			bad.grant.Class = WorkerAdmitClassGranted
+			data, _ := json.Marshal(bad.grant)
+			socket := serveOneWorkerAdmit(t, func() runnerAdmitResponseFrame {
+				return runnerAdmitResponseFrame{OK: true, Code: "OK", Data: data}
+			})
+			outcome := RequestWorkerAdmit(context.Background(), workerAdmitTestRequest(socket))
+			if outcome.Class == WorkerAdmitClassPlacementFailed {
+				t.Fatal("an unusable grant must not be blamed on local placement — that class strips containment")
+			}
+			if outcome.Class != WorkerAdmitClassContractViolation || outcome.Reason != WorkerAdmitReasonMalformedGrant {
+				t.Fatalf("outcome=%+v", outcome)
+			}
+			if outcome.Lease != nil {
+				t.Fatal("an unusable grant must not produce a lease")
+			}
+		})
+	}
 
 	t.Run("a granted response yields a lease", func(t *testing.T) {
 		data, _ := json.Marshal(workerAdmitGrant{

@@ -30,6 +30,11 @@ func supervisorSource(t *testing.T) string {
 // without importing a Python parser.
 func pythonSetLiteral(t *testing.T, source, name string) []string {
 	t.Helper()
+	// Exactly ONE definition, or this guard could read a dead earlier one
+	// while the runtime uses a later, wrong one (Sol build-review).
+	if count := strings.Count(source, "\n"+name+" = "); count != 1 {
+		t.Fatalf("supervisor.py defines %s %d times; this guard requires exactly one", name, count)
+	}
 	start := strings.Index(source, "\n"+name+" = ")
 	if start < 0 {
 		t.Fatalf("supervisor.py has no %s definition", name)
@@ -143,6 +148,11 @@ func TestSupervisorClassifiesWorkerAdmitByEnumNotBySubstring(t *testing.T) {
 // to the next top-level-of-class def.
 func functionBody(t *testing.T, source, header string) string {
 	t.Helper()
+	// Same single-definition requirement as pythonSetLiteral: picking the
+	// first textual match is only sound when there is exactly one.
+	if count := strings.Count(source, header); count != 1 {
+		t.Fatalf("supervisor.py contains %q %d times; this guard requires exactly one", header, count)
+	}
 	start := strings.Index(source, header)
 	if start < 0 {
 		t.Fatalf("supervisor.py has no %s", header)

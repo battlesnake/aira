@@ -126,6 +126,8 @@ const (
 	WorkerAdmitReasonRequestRejected         = "request-rejected"
 	WorkerAdmitReasonDaemonError             = "daemon-error"
 	WorkerAdmitReasonUnknownDaemonOutcome    = "unknown-daemon-outcome"
+	WorkerAdmitReasonMalformedGrant          = "malformed-grant"
+	WorkerAdmitReasonDialResourceExhausted   = "dial-resource-exhausted"
 
 	// CLI-side.
 	WorkerAdmitReasonArgumentsInvalid         = "arguments-invalid"

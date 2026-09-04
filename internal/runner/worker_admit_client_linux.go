@@ -68,10 +68,7 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) Worke
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "unix", req.SocketPath)
 	if err != nil {
-		return WorkerAdmitOutcome{
-			State: WorkerAdmitStateUnavailable, Class: WorkerAdmitClassAdmissionUnusable,
-			Reason: WorkerAdmitReasonDialFailed, Detail: "dial daemon: " + err.Error(),
-		}
+		return classifyWorkerAdmitDialFailure(err)
 	}
 	// The daemon's own poll loop is bounded by max_wait_ms and degrades to a
 	// clean "timeout" response within that budget -- but nothing protected
@@ -149,12 +146,79 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) Worke
 		// re-derived, which is exactly the property AIRA-42 asked for.
 		return WorkerAdmitOutcome{State: grant.State, Class: grant.Class, Reason: grant.Reason, Detail: grant.Detail}
 	}
+	if problem := workerAdmitGrantProblem(grant); problem != "" {
+		_ = conn.Close()
+		// A grant whose placement coordinates are unusable is a CONTRACT
+		// problem, not a local one. Found by Sol build-review: without this
+		// check, a grant with memory_high >= memory_max sailed through to
+		// CreateWorkerScope, which rejects exactly that
+		// (worker_scope_linux.go:29), and the CLI then reported
+		// `placement-failed` — a class that makes the supervisor run the rest
+		// of the suite UNCONFINED. A nonsensical grant is the daemon and this
+		// client disagreeing; reporting it as a broken local cgroup mechanism
+		// blames the wrong component AND takes the dangerous direction.
+		return WorkerAdmitOutcome{
+			State: WorkerAdmitStateUnevaluated, Class: WorkerAdmitClassContractViolation,
+			Reason: WorkerAdmitReasonMalformedGrant, Detail: problem,
+		}
+	}
 	return WorkerAdmitOutcome{
 		State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted,
 		Lease: &WorkerAdmitLease{
 			WorkerID: grant.WorkerID, ScopePath: grant.ScopePath,
 			MemoryMax: grant.MemoryMax, MemoryHigh: grant.MemoryHigh, conn: conn,
 		},
+	}
+}
+
+// classifyWorkerAdmitDialFailure splits a dial error by errno.
+//
+// A dial that failed because THIS process is out of file descriptors or memory
+// says nothing about the daemon, and those conditions peak under exactly the
+// contention this path exists for (found by Sol build-review). Reporting it as
+// admission-unusable would strip RAM containment for the whole remaining run
+// over a momentary local resource pinch against a perfectly healthy daemon —
+// the same misdiagnosis supervisor.py already avoids for an EAGAIN/ENOMEM fork
+// failure when launching this very relay. Every other dial error (ENOENT,
+// ECONNREFUSED) IS evidence there is no daemon to talk to.
+func classifyWorkerAdmitDialFailure(err error) WorkerAdmitOutcome {
+	if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) ||
+		errors.Is(err, syscall.ENOMEM) || errors.Is(err, syscall.EAGAIN) {
+		return WorkerAdmitOutcome{
+			State: WorkerAdmitStateUnevaluated, Class: WorkerAdmitClassContended,
+			Reason: WorkerAdmitReasonDialResourceExhausted, Detail: "dial daemon: " + err.Error(),
+		}
+	}
+	return WorkerAdmitOutcome{
+		State: WorkerAdmitStateUnavailable, Class: WorkerAdmitClassAdmissionUnusable,
+		Reason: WorkerAdmitReasonDialFailed, Detail: "dial daemon: " + err.Error(),
+	}
+}
+
+// workerAdmitGrantProblem states why a granted payload is unusable, or "" if
+// it is fine. It enforces exactly the invariants the two consumers downstream
+// depend on and would otherwise discover as their own local failure:
+// CreateWorkerScope refuses memory_high >= memory_max
+// (worker_scope_linux.go:29, spec 3.3's soft-throttle-below-hard-cap rule),
+// and supervisor.py's own grant validation requires both limits positive.
+// Checking here means a nonsensical grant is reported as what it is — a
+// contract violation — rather than as a local placement failure, which is one
+// of only two classes that strip RAM containment for a whole run.
+func workerAdmitGrantProblem(grant workerAdmitGrant) string {
+	switch {
+	case grant.WorkerID == "":
+		return "granted outcome carries no worker_id"
+	case grant.ScopePath == "":
+		return "granted outcome carries no scope_path"
+	case grant.MemoryMax <= 0:
+		return "granted outcome memory_max must be positive, got " + strconv.FormatInt(grant.MemoryMax, 10)
+	case grant.MemoryHigh <= 0:
+		return "granted outcome memory_high must be positive, got " + strconv.FormatInt(grant.MemoryHigh, 10)
+	case grant.MemoryHigh >= grant.MemoryMax:
+		return "granted outcome memory_high (" + strconv.FormatInt(grant.MemoryHigh, 10) +
+			") must be below memory_max (" + strconv.FormatInt(grant.MemoryMax, 10) + ")"
+	default:
+		return ""
 	}
 }
 

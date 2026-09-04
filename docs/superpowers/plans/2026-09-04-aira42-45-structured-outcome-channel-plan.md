@@ -1,9 +1,11 @@
 # Fix 2 — structured daemon↔client worker-admit outcome channel
 
 **Date:** 2026-09-04
-**Status:** BUILT AND MERGED-READY. Plan review by Codex/Sol (GATE-FAIL, 4×P0 +
-4×P1) and DeepSeek-pro (GATE-PASS-WITH-CHANGES, 2×P0 + 3×P1); §8 records every
-finding, which were accepted and which were declined, and why.
+**Status:** BUILT AND MERGE-READY. Two-loop complete:
+plan review by Codex/Sol (GATE-FAIL) and DeepSeek-pro (GATE-PASS-WITH-CHANGES)
+→ §8; TDD build; adversarial build review of the merged diff by Codex/Sol
+(BLOCK, 1×P0) and DeepSeek-pro (BLOCK) → §10, with the P0 and four other
+findings fixed and mutation-verified. Nine mutations applied, nine killed (§9).
 **Parent plan:** [`2026-09-04-backlog-remediation-plan.md`](2026-09-04-backlog-remediation-plan.md) §3.3 (Phase 1, Fix 2, Tier A)
 **Closes/moots:** AIRA-42, AIRA-45; closes AIRA-83(b)
 **Explicitly NOT in this PR:** AIRA-87's `store.ExitCodes` leaf-package move
@@ -325,6 +327,12 @@ by a named test (see §9).
 | `docs/superpowers/specs/2026-09-01-aitest-design.md` | §3.3 wire sketch + "Reason-string convention" rewritten to the structured shape |
 | tickets AIRA-42, AIRA-45, AIRA-83 | resolutions recorded |
 
+Build-review additions (§10): `workerAdmitGrantProblem` and
+`classifyWorkerAdmitDialFailure` in `worker_admit_client_linux.go`, a scope
+`os.Remove` on the undeliverable-outcome path in `main.go`, the
+terminate-before-stderr-read reordering in `supervisor.py`, and
+single-definition guards in `internal/pylib/worker_admit_channel_test.go`.
+
 ## 6. Risks
 
 - **R1 — protocol bump on a shared machine.** Every session's installed
@@ -455,8 +463,90 @@ All seven were killed; the harness is `~/tmp/aira-fix2/mutate.py`.
 | M5 | stop query-escaping `detail` | `TestWorkerAdmitOutcomeLineRoundTrips` (hostile detail broke the line) |
 | M6 | `outer-scope-unbounded` classed `contended` | `TestEvaluateWorkerAdmitClassifiesEveryOutcome`, `TestWorkerAdmitCLIOutcomeChannelMatchesTheSupervisorBoundary` |
 | M7 | pre-dispatch argument errors emit no outcome line | `TestWorkerAdmitPreDispatchFailuresSpeakTheOutcomeChannel` ×2 |
+| M8 | drop the grant-payload validation (build-review P0) | `TestRequestWorkerAdmitClassifiesEndToEnd` ×6 sub-cases |
+| M9 | every dial error is `admission-unusable` again | `…EndToEnd/local_resource_exhaustion_on_dial_is_retriable` |
 
-## 10. Verification
+## 10. Build-review disposition
+
+Two independent adversarial lineages read the merged diff: Codex/Sol against the
+repo (**BLOCK**, 1×P0 + 3×P1 + 3×P2) and DeepSeek-pro against the Python half
+inline (**BLOCK**, 1×P0 + 2×P1 + 3×P2).
+
+**Accepted and fixed (each with a new mutation-verified test):**
+
+- **B1 (Sol P0 — real, and in the dangerous direction).** `RequestWorkerAdmit`
+  validated only catalogue membership, so a grant with
+  `memory_high >= memory_max` — exactly what `CreateWorkerScope` refuses
+  (`worker_scope_linux.go:29`) — reached the CLI's `CreateWorkerScope` call,
+  failed there, and was reported as `placement-failed`, which STRIPS RAM
+  containment for the rest of the run. A nonsensical grant is a contract
+  problem, not a local one. `workerAdmitGrantProblem` now checks worker_id,
+  scope_path, both limits positive, and `memory_high < memory_max`, and reports
+  `contract-violation` / `malformed-grant`. Also closes DeepSeek's P2 on the
+  same field pair. Mutation M8.
+- **B2 (Sol P1 — dial errors).** A dial that fails on THIS process's own
+  `EMFILE`/`ENFILE`/`ENOMEM`/`EAGAIN` is now `contended`, not
+  `admission-unusable`. Precedent: `supervisor.py` already applies the identical
+  reasoning to an `EAGAIN`/`ENOMEM` fork failure when launching this very relay.
+  This only ever moves cases OUT of a containment-stripping class. Mutation M9.
+- **B3 (DeepSeek P1 — an unbounded read on the dispatch loop).** The
+  malformed-grant path read the relay's stderr to EOF after closing stdin but
+  BEFORE terminating it, so a relay that ignores its own stdin EOF wedged the
+  single-threaded dispatch loop — the AIRA-92 hazard, pre-existing but on a path
+  this change already rewrites. `_terminate_process` now runs before the read.
+  Both original ordering constraints are preserved and the reasoning is in the
+  code.
+- **B4 (Sol P2 — a leaked scope).** When the outcome line cannot be written
+  after `CreateWorkerScope` succeeded, nobody will ever learn the scope's path,
+  so the CLI now removes it instead of leaving it for the #72 reaper's 5-minute
+  sweep.
+- **B5 (Sol P2 — porous guards).** `pythonSetLiteral` and `functionBody` picked
+  the FIRST textual match; both now require the name to be defined exactly once,
+  so a dead earlier definition cannot satisfy the guard while a later one runs.
+
+**Declined, with reasons:**
+
+- **DeepSeek P0 — false positive.** It claimed `Popen` failures escape
+  uncaught; `acquire_worker` catches `OSError` (which `FileNotFoundError`
+  subclasses) and has since before this change. DeepSeek was given the function
+  inline and misread it; verified against source.
+- **Sol P2 — the poll-loop test.** Sol read it as unable to distinguish "polled
+  twice then broke early" from "polled to the deadline". It can: only reaching
+  the deadline produces `state=timeout`, and the test asserts the state in the
+  written payload. A comment now says so explicitly rather than leaving the
+  reader to derive it. No code change; a tighter wall-clock bound would be the
+  AIRA-20 flake class.
+- **Sol P1 — pre-ack child exits labelled placement failures**
+  (`supervisor.py` `spawn_worker`). Real, pre-existing, and untouched by this
+  change; it is about the fork/ack handshake, not the outcome channel. Filing
+  territory, not this PR's.
+- **Sol P1 / DeepSeek P2 — permanently-unreadable cgroup files and an
+  unresponsive relay retried forever.** Both are retry POLICY. `unevaluated` is
+  retriable by explicit design-spec mandate (§3.3: "a future client must treat
+  `unevaluated` as retriable, the same as `denied`/`timeout`"), and
+  `_wait_for_admission_or_disable`'s indefinite retry is a documented decision.
+  This PR changes the channel, not the policy; no row's retriability moves.
+- **DeepSeek P1 — "no outcome line" should be terminal.** Kept as
+  `WorkerAdmitUnavailable`, preserving master's behaviour for a dead relay. The
+  distinction held: an outcome we cannot UNDERSTAND is a contract violation; the
+  ABSENCE of one is not a classification at all, and the honest reading is that
+  this relay cannot deliver admission. It is a named branch, not a fallthrough.
+- **DeepSeek P2 — cross-check every state/class pair, not just grantedness.**
+  Declined: `class` is the authority by design, `state` is diagnostic, and
+  re-deriving the legal pairs on the consumer side would duplicate the mapping
+  table — reintroducing the two-sources-of-truth shape this fix removes. The
+  grantedness check exists only because a `None` sentinel sits in the table.
+
+**Sol's verified non-findings** (recorded as evidence, not as absence of
+review): every current producer emits a catalogued non-empty class; the
+connection is released on every non-granted path and the lease on every
+post-grant failure; the daemon's deferred grant release is still correct; the
+terminal exceptions are caught by all scheduling paths; `unquote_plus` does not
+raise on runtime-decoded input; no prior scenario was deleted without equivalent
+coverage; and no prose-substring classifier survives, with the bootstrap `outer=`
+parse and the worker-result framing correctly out of scope.
+
+## 11. Verification
 
 `aira confine -- make ci` (`fmt-check vet build test`, `go test ./... -count=1`)
 — **exit code 0**, all 12 packages `ok`.
