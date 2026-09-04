@@ -384,3 +384,25 @@ imprecise from the very first report. qual has offered to re-run one or more
 of the OLDER pinned legs (`services`/`pipeline`) with the same direct-capture
 instrumentation to check whether they also come back 137 — worth taking up
 if it would meaningfully generalize the finding beyond `hosted` alone.
+
+**Definitive audit, no new runs (qual, same night): traced EVERY truncation
+incident from tonight — zero were ever a foreground-captured genuine exit
+0.** Specifically: every ad-hoc repro was launched backgrounded
+(`... > log 2>&1 &`); any "0" logged for those was the shell's own immediate
+backgrounding return, not a captured `$?` on the job — and several were
+never observed exiting at all (killed manually with `kill -INT` once judged
+stalled). Within `merge_gate.sh`'s `run_suite()`, which DOES capture `rc=$?`
+directly and in the foreground: no leg ever showed BOTH a genuine mid-run
+truncation (dots stop, trailer glued on, no summary) AND `rc=0` through that
+path. The `admin` "incident" that looked like this was a confirmed false
+positive (a complete run, guard-regex miss — see above). The one time the
+whole `make merge-gate` process died mid-leg ("attempt 4"), it took the
+script down before `run_suite` ever reached its own `rc=$?` line for that
+leg — no rc was captured there either, not captured-as-0. **This is now a
+complete, closed audit, not a sample: the "silent exit 0" premise this
+ticket was originally filed and investigated under has no surviving
+supporting evidence.** The working hypothesis is now that every incident
+tonight has been the systemd-oomd/exit-137 mechanism above, and "exit 0"
+was never real. qual is now running `pipeline` (a fourth, still-untested
+dependency profile under forced aitest) with the same direct-capture
+instrumentation to further test this.
