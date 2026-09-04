@@ -161,11 +161,19 @@ missing/duplicate keys, and does not wait for a contiguous physical file. A
 partial final frame can therefore be re-emitted safely; a corrupt middle frame
 remains a fail-closed journal finding.
 
-After an intent is materialised, its event is durably journaled, and the
-resolution is committed, a cleanup transaction sets `outbox.intended_bytes` to
-NULL while retaining the intended digest, precondition, event key, and
-resolution metadata. Pending or conflicted intents retain their bytes until
-materialise/retire resolution, so recovery never depends on an evicted payload.
+After an intent is materialised and its event is durably journaled, a cleanup
+transaction sets `outbox.intended_bytes` to NULL while retaining the intended
+digest, precondition, and event key. Pending or conflicted intents retain their
+bytes, so recovery never depends on an evicted payload.
+
+`outbox.materialised` is the single truth about whether an intent is still
+outstanding. An earlier revision of this spec paired it with an
+`outbox.resolution` column holding "materialise/retire resolution" metadata;
+that column was never written by any implementation, so `resolution IS NULL`
+was a tautology on every row, and it was deleted along with its predicates
+(AIRA-73). A retire path for a conflicted intent — see the crash matrix below —
+remains unbuilt and, when it is built, must not reintroduce a second completion
+truth alongside `materialised`.
 
 For a project, the physical audit paths are
 `<git-common-dir>/aira/journal.jsonl`,
@@ -182,7 +190,7 @@ worktree and therefore outside the commit graph.
 |---|---|
 | Before the first DB commit | A file already present is treated as git-authoritative and imported with a new sequence; no uncommitted intent exists. |
 | After intent commit, before receipt append | Append the missing allocation receipt first. If that append fails, leave the intent pending and retry from this stage; never materialise the ticket without the receipt. |
-| After receipt append, before file rename | If the path is absent, or its digest still equals the recorded precondition, replay the intended bytes. If it already equals the intended digest, finalise it. Any other digest is a conflict: do not overwrite, leave the intent pending, and require explicit materialise/retire resolution. An allocated ID remains a visible pending receipt until materialised or retired. |
+| After receipt append, before file rename | If the path is absent, or its digest still equals the recorded precondition, replay the intended bytes. If it already equals the intended digest, finalise it. Any other digest is a conflict: do not overwrite, leave the intent pending, and require explicit materialise/retire resolution. An allocated ID remains a visible pending receipt until materialised or retired. **The retire half of that resolution is specified but not implemented** — a conflicted intent stays pending indefinitely, keeps its path in `E_PATH_INTENT_BUSY`, and keeps `eject` refusing with `E_EJECT_UNVERIFIED`; tracked, with the reachability analysis, on AIRA-73. |
 | During temp write | Ignore an unrenamed temp file after recording its digest if recoverable; replay from the outbox. |
 | After rename, before materialised commit | Verify the digest, rebuild/index the file, and mark the outbox materialised. A different digest is a conflict; never overwrite it. |
 | After materialised commit, before journal append | Append the missing event from the DB event row, then mark journaled. |
@@ -603,7 +611,6 @@ Every response has a stable `code`, a human message, structured details, and a
 | `E_CROSS_PROJECT_RELATION` | Phase-1 relation endpoints are not in one project. | error |
 | `E_WRITE_CONFLICT` | The file changed after the intent precondition. | integrity fail |
 | `E_TRANSITION_INVALID` | A requested status edge is not in the Phase-1 transition graph. | integrity fail |
-| `E_PATH_INTENT_UNRESOLVED` | A path intent needs explicit materialise/retire resolution. | integrity fail |
 | `E_JOURNAL_CORRUPT` | A journal frame is missing, partial, or checksum-invalid. | integrity fail |
 | `E_RECONCILE_REQUIRED` | An operation cannot proceed until a repair is resolved. | error, retryable |
 | `E_CLOCK_UNAVAILABLE` | No cross-process monotonic clock is available. | unevaluated/error |
@@ -664,9 +671,10 @@ are:
   generation, boot_id, last_heartbeat_mono_ns, ttl_ns, ...)`;
 - `area_hints(project_id, ticket_id, glob, ...)`;
 - `outbox(project_id, seq, worktree_id, path, verb, precondition_digest,
-  intended_digest, intended_bytes, materialised, resolution, journaled,
+  intended_digest, intended_bytes, materialised, journaled,
   PRIMARY KEY(project_id, seq))`
-  with a partial unique index on unresolved `(project_id, worktree_id, path)`;
+  with a partial unique index on unmaterialised `(project_id, worktree_id,
+  path)`;
 - `events(project_id, seq, at_wall, actor, verb, target,
   payload_digest, journaled, PRIMARY KEY(project_id, seq))`;
 - `findings(project_id, id, subtype, code, subject, ...)` for reconciliation

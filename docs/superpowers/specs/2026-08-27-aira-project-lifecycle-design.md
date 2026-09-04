@@ -96,7 +96,7 @@ target `project_id`:
    of a project's live state.)
 3. **Durability guard (fail-closed)** — for **each** active `worktrees` root:
    drain pending materialisations and run `check` (files == index). Equivalent
-   whole-project assertion: `outbox WHERE materialised=0 AND resolution IS NULL`
+   whole-project assertion: `outbox WHERE materialised=0`
    count == 0 for the project. If any root is **unavailable**: only `ENOENT`
    across *all* registered roots counts as "gone" (a genuine dead squatter →
    skip, drop the orphan index); any other stat error (EACCES/EIO/unmounted, per

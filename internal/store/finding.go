@@ -58,7 +58,7 @@ func (s *Store) markFindingMaterialised(ctx context.Context, intent Intent) erro
 		return errors.New("E_FINDING_INVALID: finding path/frontmatter mismatch")
 	}
 	return s.withImmediate(ctx, func(conn *sql.Conn) error {
-		if _, err := conn.ExecContext(ctx, `UPDATE outbox SET materialised=1 WHERE project_id=? AND seq=? AND materialised=0 AND resolution IS NULL`, intent.ProjectID, intent.Seq); err != nil {
+		if _, err := conn.ExecContext(ctx, `UPDATE outbox SET materialised=1 WHERE project_id=? AND seq=? AND materialised=0`, intent.ProjectID, intent.Seq); err != nil {
 			return err
 		}
 		return upsertReviewFinding(ctx, conn, intent.ProjectID, intent.WorktreeID, intent.Path, finding, digestBytes(intent.Intended))

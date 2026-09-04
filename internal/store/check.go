@@ -80,7 +80,12 @@ var ExitCodes = map[string]int{
 	"E_RELATION_TARGET_MISSING": 1, "E_RELATION_UNOBSERVABLE": 1,
 	"E_WRITE_CONFLICT": 1, "E_PROJECT_MISMATCH": 1,
 	"E_ID_UNRESOLVED": 1, "E_DUPLICATE_ID": 1, "E_PREFIX_OWNERSHIP_CONFLICT": 1,
-	"E_PATH_INTENT_BUSY": 1, "E_PATH_INTENT_UNRESOLVED": 1,
+	// E_PATH_INTENT_UNRESOLVED is deliberately absent (AIRA-73): it meant "this
+	// intent needs explicit materialise/retire resolution", the vocabulary of
+	// the deleted outbox.resolution mechanism. Nothing ever produced it, and
+	// after the deletion nothing can, so cataloguing it would advertise a
+	// vocabulary item to the Skill face that cannot occur.
+	"E_PATH_INTENT_BUSY":  1,
 	"E_CLOCK_UNAVAILABLE": 1,
 	"E_TRACE_DANGLING":    1,
 	"W_TRACE_UNCOVERED":   0, "W_TRACE_UNVERIFIED": 0,
@@ -674,7 +679,7 @@ func (s *Store) checkDuplicateIDs(ctx context.Context, report *CheckReport) erro
 func isIntegrityError(err error) bool {
 	code := ErrorCode(err)
 	switch code {
-	case "E_CONFIG_INVALID", "E_FINDING_INVALID", "E_DUPLICATE_ID", "E_ID_UNRESOLVED", "E_RELATION_TARGET_MISSING", "E_RELATION_INVALID", "E_CROSS_PROJECT_RELATION", "E_RELATION_UNOBSERVABLE", "E_WRITE_CONFLICT", "E_TRANSITION_INVALID", "E_PATH_INTENT_UNRESOLVED", "E_JOURNAL_CORRUPT", "E_SELECTOR_AMBIGUOUS":
+	case "E_CONFIG_INVALID", "E_FINDING_INVALID", "E_DUPLICATE_ID", "E_ID_UNRESOLVED", "E_RELATION_TARGET_MISSING", "E_RELATION_INVALID", "E_CROSS_PROJECT_RELATION", "E_RELATION_UNOBSERVABLE", "E_WRITE_CONFLICT", "E_TRANSITION_INVALID", "E_JOURNAL_CORRUPT", "E_SELECTOR_AMBIGUOUS":
 		return true
 	default:
 		return false
