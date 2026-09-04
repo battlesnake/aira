@@ -51,11 +51,6 @@ type discoveredGate struct {
 
 func (s *Store) gateRoot() string { return filepath.Join(s.root, ".aira", "gates") }
 
-func (s *Store) hasGateContent() bool {
-	entries, err := os.ReadDir(s.gateRoot())
-	return err == nil && len(entries) > 0
-}
-
 func (s *Store) discoverGates() ([]discoveredGate, error) {
 	root := s.gateRoot()
 	entries, err := os.ReadDir(root)

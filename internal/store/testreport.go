@@ -87,11 +87,6 @@ func (s *Store) FlakyCellSummary(ctx context.Context) (FlakyCellSummary, error) 
 	return summary, nil
 }
 
-// FlakyCellStateSummary is a concise alias for the --all read API.
-func (s *Store) FlakyCellStateSummary(ctx context.Context) (FlakyCellSummary, error) {
-	return s.FlakyCellSummary(ctx)
-}
-
 func (s *Store) AddTestReport(ctx context.Context, rawInput domain.TestReportInput) (TestReportAddResult, error) {
 	input := rawInput.Normalized()
 	if input.Shard == "" {
