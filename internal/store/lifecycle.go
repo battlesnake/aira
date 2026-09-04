@@ -287,7 +287,7 @@ func (db *DB) Eject(ctx context.Context, project ProjectRegistration, force bool
 			return fmt.Errorf("E_EJECT_LIVE_STATE: %s", strings.Join(holders, "; "))
 		}
 		var pending int
-		if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM outbox WHERE project_id=? AND materialised=0 AND resolution IS NULL`, project.ProjectID).Scan(&pending); err != nil {
+		if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM outbox WHERE project_id=? AND materialised=0`, project.ProjectID).Scan(&pending); err != nil {
 			return err
 		}
 		if pending != 0 {

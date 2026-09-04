@@ -358,7 +358,7 @@ func (s *Store) completedRequirementImport(ctx context.Context, path, digest str
 	var materialised int
 	err := s.db.QueryRowContext(ctx, `SELECT project_id, worktree_id, seq, path, kind, materialised
 		FROM outbox WHERE project_id=? AND path=? AND verb='requirement.import' AND intended_digest=?
-		AND materialised=1 AND resolution IS NULL ORDER BY seq DESC LIMIT 1`, s.projectID, path, digest).Scan(
+		AND materialised=1 ORDER BY seq DESC LIMIT 1`, s.projectID, path, digest).Scan(
 		&intent.ProjectID, &intent.WorktreeID, &intent.Seq, &intent.Path, &kind, &materialised)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Intent{}, false, nil
@@ -381,7 +381,7 @@ func (s *Store) pendingRequirementImport(ctx context.Context, id, path string) (
 	err := s.db.QueryRowContext(ctx, `SELECT project_id, worktree_id, seq, path, kind,
 		precondition_digest, intended_bytes, allocation_id, materialised, journaled
 		FROM outbox WHERE project_id=? AND (allocation_id=? OR path=?) AND verb='requirement.import'
-		AND resolution IS NULL AND (materialised=0 OR journaled=0) ORDER BY seq DESC LIMIT 1`, s.projectID, id, path).Scan(
+		AND (materialised=0 OR journaled=0) ORDER BY seq DESC LIMIT 1`, s.projectID, id, path).Scan(
 		&intent.ProjectID, &intent.WorktreeID, &intent.Seq, &intent.Path, &kind,
 		&intent.Precondition, &intent.Intended, &intent.AllocationID, &materialised, &journaled)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -444,7 +444,7 @@ func (s *Store) prepareRequirementImportMutation(ctx context.Context, path, prec
 	var intent Intent
 	err = s.withImmediate(ctx, func(conn *sql.Conn) error {
 		var existing int
-		err := conn.QueryRowContext(ctx, `SELECT 1 FROM outbox WHERE project_id=? AND worktree_id=? AND path=? AND materialised=0 AND resolution IS NULL LIMIT 1`,
+		err := conn.QueryRowContext(ctx, `SELECT 1 FROM outbox WHERE project_id=? AND worktree_id=? AND path=? AND materialised=0 LIMIT 1`,
 			s.projectID, s.worktreeID, path).Scan(&existing)
 		if err == nil {
 			return ErrPathIntentBusy

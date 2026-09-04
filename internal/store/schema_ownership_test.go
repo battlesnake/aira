@@ -108,13 +108,12 @@ func TestProjectOwnershipMigrationRecreatesLegacyTablesWithIndexesAndFKs(t *test
 		}
 	}
 
-	var indexSQL string
-	if err := db.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='index' AND name='unresolved_path_intent'`).Scan(&indexSQL); err != nil {
-		t.Fatalf("preserved outbox partial index: %v", err)
-	}
-	if !strings.Contains(strings.Join(strings.Fields(indexSQL), " "), "WHERE materialised = 0 AND resolution IS NULL") {
-		t.Fatalf("outbox partial index lost its predicate: %q", indexSQL)
-	}
+	// The legacy DDL above still carries AIRA-73's deleted `resolution`
+	// column, so this also pins the composition of the two migrations: the
+	// resolution drop runs first and rewrites the partial index, and the
+	// ownership-FK recreation below must carry that rewritten index forward
+	// rather than resurrecting the two-predicate one.
+	assertOutboxResolutionAbsent(t, db.db)
 	var outboxSQL string
 	if err := db.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='outbox'`).Scan(&outboxSQL); err != nil {
 		t.Fatal(err)

@@ -335,7 +335,7 @@ func TestEjectDrainsPendingMaterialisationBeforeDrop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE outbox SET materialised=0,resolution=NULL,intended_bytes=?,precondition_digest='' WHERE project_id=? AND path<>''`, intended, scope.ProjectID); err != nil {
+	if _, err := db.Exec(`UPDATE outbox SET materialised=0,intended_bytes=?,precondition_digest='' WHERE project_id=? AND path<>''`, intended, scope.ProjectID); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Remove(path); err != nil {
@@ -356,7 +356,7 @@ func TestEjectTransactionReassertsOutboxAfterDurabilityCheck(t *testing.T) {
 	}
 	db := lifecycleSQL(t, server.Paths.DBPath)
 	server.beforeEjectTransaction = func() {
-		if _, err := db.Exec(`UPDATE outbox SET materialised=0,resolution=NULL WHERE project_id=? AND path<>''`, scope.ProjectID); err != nil {
+		if _, err := db.Exec(`UPDATE outbox SET materialised=0 WHERE project_id=? AND path<>''`, scope.ProjectID); err != nil {
 			t.Errorf("inject pending outbox: %v", err)
 		}
 	}

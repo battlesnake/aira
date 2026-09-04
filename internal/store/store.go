@@ -795,14 +795,19 @@ func (s *Store) initDB(ctx context.Context) error {
             project_id TEXT NOT NULL, seq INTEGER NOT NULL, worktree_id TEXT NOT NULL,
             path TEXT NOT NULL, verb TEXT NOT NULL, precondition_digest TEXT NOT NULL,
             intended_digest TEXT NOT NULL, intended_bytes BLOB, materialised INTEGER NOT NULL DEFAULT 0,
-            resolution TEXT, journaled INTEGER NOT NULL DEFAULT 0, allocation_id TEXT NOT NULL DEFAULT '',
+            journaled INTEGER NOT NULL DEFAULT 0, allocation_id TEXT NOT NULL DEFAULT '',
             kind TEXT NOT NULL DEFAULT 'ticket-file',
             PRIMARY KEY(project_id, seq),
             FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
         )`,
+		// One truth per intent (AIRA-73): `materialised` alone says whether an
+		// intent is still outstanding. The former companion column `resolution`
+		// was never written by any code path, so `resolution IS NULL` was a
+		// tautology on every row and the predicate below selects exactly the
+		// same set it always did.
 		`CREATE UNIQUE INDEX IF NOT EXISTS unresolved_path_intent
             ON outbox(project_id, worktree_id, path)
-            WHERE materialised = 0 AND resolution IS NULL`,
+            WHERE materialised = 0`,
 		`CREATE TABLE IF NOT EXISTS events (
             project_id TEXT NOT NULL, seq INTEGER NOT NULL, at_wall TEXT NOT NULL,
             actor TEXT NOT NULL, verb TEXT NOT NULL, target TEXT NOT NULL,
@@ -1117,6 +1122,12 @@ func (s *Store) initDB(ctx context.Context) error {
 	if err := s.ensureOutboxKind(ctx); err != nil {
 		return err
 	}
+	// Runs before ensureProjectOwnershipFKs, which recreates tables by
+	// replaying their existing DDL: dropping the column first means the FK
+	// migration carries forward the current shape, not the deleted one.
+	if err := s.ensureOutboxResolutionDropped(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureAllocationKind(ctx); err != nil {
 		return err
 	}
@@ -1243,6 +1254,65 @@ func (s *Store) ensureOutboxKind(ctx context.Context) error {
 	}
 	_, err := s.db.ExecContext(ctx, `ALTER TABLE outbox ADD COLUMN kind TEXT NOT NULL DEFAULT 'ticket-file'`)
 	return translateDBError(err)
+}
+
+// ensureOutboxResolutionDropped removes the never-written `outbox.resolution`
+// column and re-points the partial unique index at `materialised` alone
+// (AIRA-73). No code path in any released version ever assigned the column, so
+// every existing row holds NULL and the old index predicate
+// `materialised = 0 AND resolution IS NULL` covered exactly the rows the new
+// `materialised = 0` predicate covers — the migration is set-preserving, not a
+// widening.
+//
+// SQLite refuses to drop a column a partial index references, so the index is
+// dropped first and recreated after. Both statements plus the DROP COLUMN run
+// in one transaction, so a process that dies mid-migration leaves either the
+// full pre-AIRA-73 schema or the full current one — never a table without its
+// single-writer index (the M5/M9 non-transactional-migration lesson).
+//
+// If a row somehow did carry a non-NULL resolution, recreating the index could
+// find a duplicate: that aborts the transaction and fails Open loudly rather
+// than silently discarding one of two conflicting intents. Fail-closed is the
+// correct direction here — such a row cannot be produced by this codebase, so
+// its existence means something outside it wrote to the DB.
+//
+// Concurrency: several processes may Open the same machine-wide database at
+// once (the daemon, the CLI fallback via app.OpenWithDiagnostics, a detached
+// supervisor). The cheap read below is only a fast path for the already-
+// migrated case, so an already-current Open takes no write lock; it is NOT the
+// decision. The decision is re-taken inside a BEGIN IMMEDIATE transaction,
+// which holds the write lock across the re-check, so a second process that
+// raced through the fast path finds the column already gone and returns
+// without attempting a DROP that would fail with "no such column" and take
+// its whole Open down with it.
+func (s *Store) ensureOutboxResolutionDropped(ctx context.Context) error {
+	if !hasTableColumn(ctx, s.db, "outbox", "resolution") {
+		return nil
+	}
+	return s.withImmediate(ctx, func(conn *sql.Conn) error {
+		return dropOutboxResolutionLocked(ctx, conn)
+	})
+}
+
+// dropOutboxResolutionLocked is the write half of ensureOutboxResolutionDropped,
+// split out so the re-check can be exercised directly: calling it against an
+// already-migrated connection must be a no-op returning nil, which is exactly
+// what the losing side of a two-process race executes. It assumes the caller
+// already holds the write lock (BEGIN IMMEDIATE).
+func dropOutboxResolutionLocked(ctx context.Context, conn *sql.Conn) error {
+	if !hasTableColumn(ctx, conn, "outbox", "resolution") {
+		return nil
+	}
+	if _, err := conn.ExecContext(ctx, `DROP INDEX IF EXISTS unresolved_path_intent`); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `ALTER TABLE outbox DROP COLUMN resolution`); err != nil {
+		return err
+	}
+	_, err := conn.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS unresolved_path_intent
+            ON outbox(project_id, worktree_id, path)
+            WHERE materialised = 0`)
+	return err
 }
 
 // allocationKindSchemaCurrent reports, using only reads, whether both
@@ -1754,7 +1824,7 @@ func (s *Store) preparePathMutationEventKind(ctx context.Context, path, precondi
 	var intent Intent
 	err = s.withImmediate(ctx, func(conn *sql.Conn) error {
 		var existing int
-		err := conn.QueryRowContext(ctx, `SELECT 1 FROM outbox WHERE project_id=? AND worktree_id=? AND path=? AND materialised=0 AND resolution IS NULL LIMIT 1`,
+		err := conn.QueryRowContext(ctx, `SELECT 1 FROM outbox WHERE project_id=? AND worktree_id=? AND path=? AND materialised=0 LIMIT 1`,
 			s.projectID, s.worktreeID, path).Scan(&existing)
 		if err == nil {
 			return ErrPathIntentBusy
@@ -1897,7 +1967,7 @@ func (s *Store) markTicketMaterialised(ctx context.Context, intent Intent) error
 		return err
 	}
 	return s.withImmediate(ctx, func(conn *sql.Conn) error {
-		if _, err := conn.ExecContext(ctx, `UPDATE outbox SET materialised=1 WHERE project_id=? AND seq=? AND materialised=0 AND resolution IS NULL`, intent.ProjectID, intent.Seq); err != nil {
+		if _, err := conn.ExecContext(ctx, `UPDATE outbox SET materialised=1 WHERE project_id=? AND seq=? AND materialised=0`, intent.ProjectID, intent.Seq); err != nil {
 			return err
 		}
 		if _, err := conn.ExecContext(ctx, `UPDATE allocations SET state='materialised' WHERE project_id=? AND prefix=? AND number=?`, intent.ProjectID, prefixOf(ticket.ID), numberOf(ticket.ID)); err != nil {
@@ -1932,7 +2002,7 @@ func replaceRelationIndex(ctx context.Context, conn *sql.Conn, projectID, worktr
 func (s *Store) markReceiptOnly(ctx context.Context, projectID string, seq int64) error {
 	return s.withImmediate(ctx, func(conn *sql.Conn) error {
 		_, err := conn.ExecContext(ctx, `UPDATE outbox SET materialised=1, intended_bytes=NULL
-            WHERE project_id=? AND seq=? AND materialised=0 AND resolution IS NULL`, projectID, seq)
+            WHERE project_id=? AND seq=? AND materialised=0`, projectID, seq)
 		return err
 	})
 }
@@ -2050,7 +2120,7 @@ func (s *Store) reconcile(ctx context.Context) error {
 	defer unlockFile(findingLock)
 	rows, err := s.db.QueryContext(ctx, `SELECT project_id, seq, worktree_id, path, verb, kind, precondition_digest,
 		intended_digest, intended_bytes, materialised, journaled, allocation_id FROM outbox
-		WHERE project_id=? AND (worktree_id=? OR path='') AND resolution IS NULL AND (materialised=0 OR journaled=0) ORDER BY seq`, s.projectID, s.worktreeID)
+		WHERE project_id=? AND (worktree_id=? OR path='') AND (materialised=0 OR journaled=0) ORDER BY seq`, s.projectID, s.worktreeID)
 	if err != nil {
 		return err
 	}
