@@ -54,12 +54,12 @@ func supervisorTelemetryStore(project app.Project, paths daemon.Paths) (*writeRe
 //
 // KNOWN, ACCEPTED STRUCTURAL GAP (AIRA-85, recorded not closed): nothing
 // *enforces* single-writer beyond this convention. Any future code path may
-// still call store.Open and write directly; app.OpenWithDiagnostics remains a
-// legitimate constructor for the daemon-less bootstrap paths, so a mechanical
-// "no store.Open outside internal/daemon" lint would be both wrong and unable
-// to catch this defect (the supervisor opened the DB correctly; it wrote
-// afterwards). The residual guard is code review, not a test. A runtime
-// single-writer assertion remains a follow-up, out of this ticket's scope.
+// still call store.Open and write directly. A mechanical "no store.Open outside
+// internal/daemon" lint was considered and dropped: it could not have caught
+// this defect (the supervisor opened the DB correctly; it wrote afterwards),
+// and the daemon itself opens via store.OpenDB. The residual guard is code
+// review, not a test. A runtime single-writer assertion remains a follow-up,
+// out of this ticket's scope.
 func openSupervisorRelayStore(project app.Project, paths daemon.Paths, relay storeOpRelay) (*writeRelayStore, error) {
 	scope, err := daemon.ScopeFromProject(project, paths)
 	if err != nil {

@@ -103,14 +103,61 @@ project-mismatched socket is already refused by the daemon's `scope.StateID` gua
 large-report framing path is the same one the foreground CLI `run --report` already uses in
 production, so neither is new risk from this change.
 
+## Independent verification (2026-09-05, separate detached worktree at the PR head)
+
+Re-run rather than trusted from the build report. Exact results:
+
+* `go build ./...` exit 0; `go vet ./...` exit 0; `gofmt -l cmd internal` empty.
+* `go test ./cmd/aira/ -count=1` exit 0 (`ok aira/cmd/aira 67.167s`); the seven new
+  `TestSupervisor*` tests all PASS under `-v` (the build report and PR body say "six tests …
+  four against a real in-process daemon" — it is **seven** test functions, **three** of which
+  start a real in-process daemon; a miscount in the prose, not in the tests).
+* `go test ./... -count=1` exit 0 on a re-run. An earlier full run failed only
+  `internal/runner` — `TestScopeMembershipEventsDeliversModifyAndReleasesFD` (inotify
+  `EMFILE`) and `TestRealCgroupExplicitEmptyEnvironmentIsExactAndDigested` (the known
+  real-cgroup load flake). Both are environmental and confirmed unrelated: this branch
+  changes no file under `internal/runner`, and `fs.inotify.max_user_instances` was **128**
+  with **119** instances live machine-wide while that run executed (raised to 4096
+  afterwards, at which point the same test passes on this branch and on master).
+* Mutation testing re-done independently, all three mutants killed: reverting `runSupervisor`
+  to `app.OpenWithDiagnostics` → killed by `TestSupervisorRefusesRatherThanCreatingStateDBItself`;
+  swapping `store.OpenReadOnly` for a read-write open → killed by that test **and** by
+  `…RelaysTelemetryWritesAndCannotWriteStateDBItself`; production constructor passing a nil
+  relay → killed by `TestSupervisorDetachedSettlementWritesThroughTheDaemonRelay`.
+* One surviving mutant, inside the coverage gap already declared above: deleting
+  `telemetryStore.SetRunner(project.Runner)` **and**
+  `project.Runner.SetSupervisorLeaseReader(telemetryStore.SupervisorLeaseLive)` from
+  `runSupervisor` leaves the package green. Both lines restore wiring that
+  `app.OpenWithDiagnostics` used to perform internally (`internal/app/project.go:253-254`), so
+  their presence is correct and no regression exists; they are simply unreachable for tests
+  that stop at the store-open refusal. Recorded, not fixed — closing it needs the real
+  `__supervise` process test this ticket already defers.
+* Source claims spot-checked and confirmed: `internal/runner` contains zero references to
+  `internal/store`; `run_wiring.go` has exactly the three `c.store.` sites; the `:272` retry
+  fires only on a deterministic `E_TESTREPORT_INVALID`, never on `U_DAEMON_OUTCOME_UNKNOWN`,
+  so relaying cannot duplicate an ambiguous append; `daemon.ExchangeStoreOp` dials only;
+  `prepareClientProject`'s `ensure-scope` really does precede the `StoreFreeCarved` branch
+  (`cmd/aira/dispatcher.go:271-277`), so the reachability argument holds.
+
 ## Residual structural gap — named, not closed
 
 **Nothing enforces single-writer beyond convention.** Any future code path may still call
 `store.Open` and write directly. The remediation plan (§5 item 3, §6) considered and
-**dropped** a mechanical `store.Open`-outside-`internal/daemon` lint: the daemon actually
-opens via `store.OpenDB`, and `app.OpenWithDiagnostics` → `store.Open` is the correct
-bootstrap for the CLI's daemon-less fallback, so such a rule would fail on day one against
-a legitimate caller — and it would not have caught this defect anyway, since the supervisor
-opened the DB *correctly* and the defect was writing afterwards. The residual guard is code
-review. A runtime single-writer assertion (an flock, or a daemon-side writer identity) stays
-a follow-up; it is out of this ticket's scope.
+**dropped** a mechanical `store.Open`-outside-`internal/daemon` lint, because the daemon
+actually opens via `store.OpenDB` and because such a rule would not have caught this defect
+anyway — the supervisor opened the DB *correctly*; the defect was writing afterwards. The
+residual guard is code review. A runtime single-writer assertion (an flock, or a daemon-side
+writer identity) stays a follow-up; it is out of this ticket's scope.
+
+**Correction, independent verification pass:** the plan's *second* reason for dropping that
+lint — "`app.OpenWithDiagnostics` → `store.Open` is the correct bootstrap for the CLI's
+daemon-less fallback, so the rule would fail day one against a legitimate caller" — does not
+hold against current source, and the commit message and PR body repeat it unchecked from the
+plan. There is no production daemon-less CLI fallback: after this change the only non-test
+caller of `app.OpenWithDiagnostics` is `inProcessDispatcher` (`cmd/aira/dispatcher.go:658`),
+whose own comment declares it "injected by tests … never a production fallback", and it is
+constructed only in `_test.go` files; `app.Init`'s `store.Open` (`internal/app/project.go:385`)
+is likewise reached only from that test-only substrate, the daemon using `app.PrepareInit`
+instead. So the lint would today fail only against test-only callers. The *decision* to drop
+it stands on the reason kept above — it would not have caught this defect — not on that
+stale one.
