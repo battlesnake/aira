@@ -140,6 +140,10 @@ PR #19 merged to master as `ac901cb`
 (https://github.com/battlesnake/aira/pull/19). Reviewed by two independent
 lineages (Codex/Sol BLOCK → 2×P0 adopted; Fable GATE-PASS-WITH-CHANGES → 2×P1
 + 6×P2 adopted, one deliberate disagreement resolved in Fable's favour on
-evidence). Deploy (binary rebuild + daemon restart) to follow per standing
-authorization. AIRA-91 remains open and is explicitly NOT closed by this —
-its root cause is separate and unestablished; see AIRA-91.
+evidence). ## Deployed
+
+Binary rebuilt from merged master (`ac901cb` + the follow-up ticket-bookkeeping
+commit `3694bc2`, confined build, smoke-tested before install), skill
+reinstalled (`aira skill install --force`), `aira-daemon.service` restarted.
+AIRA-91 remains open and is explicitly NOT closed by this — its root cause
+is separate and unestablished; see AIRA-91.
