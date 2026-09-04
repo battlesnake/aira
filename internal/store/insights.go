@@ -588,6 +588,17 @@ func computeRatchetStatus(s *Store) (GaugeResult, error) {
 
 	result := GaugeResult{Name: name, Title: title, Kind: GaugeKindDistribution, Value: map[string]int{}, Breakdown: map[string]GaugeCell{}, Universe: universe, Drilldown: drilldown}
 	for _, def := range ratchets {
+		// A failed capture is not a subject. Evaluating against the zero subject
+		// would compare the reports anyway and report pass under an empty digest,
+		// which is a gauge cell asserting a result nothing established. The
+		// pre-capture code reported evidence_unavailable per gate here; so does
+		// this. Pinned by TestRatchetGaugeReportsEvidenceUnavailableWithoutASubject.
+		if subjectErr != nil {
+			bucket, code := ratchetStatus(DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_EVIDENCE_UNAVAILABLE"}, nil)
+			result.Value.(map[string]int)[bucket]++
+			result.Breakdown[def.ID] = GaugeCell{Value: bucket, Fields: map[string]GaugeCell{"code": {Value: code}, "tracked_worktree_digest": {Value: ""}}, Drilldown: &drilldown}
+			continue
+		}
 		eval, evalErr := s.evaluateRatchet(context.Background(), def, subject)
 		bucket, code := ratchetStatus(eval, evalErr)
 		result.Value.(map[string]int)[bucket]++

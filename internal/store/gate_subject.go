@@ -179,8 +179,19 @@ type capturedSubject struct {
 // fail-closed direction.
 //
 // GateCheck deliberately keeps the cheaper single-read subjectTreeDigest: it
-// computes a lookup key, not evidence, and a torn read there can only fail to
-// find a stored result, never fabricate one.
+// computes a lookup key, not evidence, and a torn read there overwhelmingly
+// yields a digest matching no stored result, so the practical outcome is
+// U_GATE_NO_RESULT.
+//
+// Recorded boundary, corrected on build-review -- this is NOT a proof. The
+// digest is assembled from per-file reads, so a writer that happened to present
+// each file's stored-pass content at the moment that file was read could
+// reproduce a stored digest from a tree that never coherently held that state,
+// and GateCheck would then re-serve the stored pass. Closing it means giving the
+// hot read-only path the double-read capture, doubling the cost of every `aira
+// gate check` to defend against an interleaving that requires a concurrent
+// writer reverting files in read order. Not closed here; written down rather
+// than left as the stronger claim a previous draft of this comment made.
 func captureSubject(root string) (capturedSubject, error) {
 	entries, err := stableSubjectEntries(root)
 	if err != nil {

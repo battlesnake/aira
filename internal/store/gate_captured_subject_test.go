@@ -342,14 +342,18 @@ func TestIgnoredTrackedFileDropDoesNotMintProofOfFire(t *testing.T) {
 	}
 }
 
-// verifies: AIRA-80 -- `git ls-files --cached` lists an unmerged path once per
-// stage, so a conflicted index makes the same file appear several times in one
-// capture. The digest is then over a multiset while the materialised tree
-// collapses to one stage-0 entry, and capture -> materialise -> capture stops
-// being the identity exactly when a repository is mid-conflict. There is no
-// single coherent content for such a path, so there is no subject to bind a
-// verdict to: refuse.
-func TestCaptureRefusesAnUnmergedIndex(t *testing.T) {
+// verifies: AIRA-80, AIRA-81 -- `git ls-files --cached` lists an unmerged path
+// once per stage, so a conflicted index makes the same file appear several times
+// in one capture. Left as-is the digest is over a multiset while the
+// materialised tree collapses to one entry, and capture -> materialise ->
+// capture stops being the identity exactly when a repository is mid-conflict --
+// which is exactly when an agent is most likely to run a gate.
+//
+// Each path must therefore appear once, and the round trip must hold. Refusing
+// instead was the first implementation and was rejected on build-review: it made
+// every gate hard-fail for the duration of any conflict anywhere in the tree,
+// including in files no gate reads.
+func TestCaptureOfAnUnmergedIndexCountsEachPathOnce(t *testing.T) {
 	root := t.TempDir()
 	gitRun(t, root, "init", "-q")
 	gitRun(t, root, "config", "user.email", "aira@example.test")
@@ -375,9 +379,80 @@ func TestCaptureRefusesAnUnmergedIndex(t *testing.T) {
 	if out, _, err := runGit(root, "ls-files", "-u"); err != nil || out == "" {
 		t.Skipf("could not construct an unmerged index: %v %q", err, out)
 	}
+	// Guard the fixture: git really must be listing the path more than once, or
+	// this test proves nothing.
+	raw, _, err := runGit(root, "ls-files", "--cached")
+	if err != nil || strings.Count(raw, "f.txt") < 2 {
+		t.Skipf("git does not list unmerged stages separately here: %q", raw)
+	}
 
-	if digest, err := subjectTreeDigest(root); err == nil {
-		t.Fatalf("an unmerged index produced a subject digest %q instead of failing closed", digest)
+	subject, err := captureSubject(root)
+	if err != nil {
+		t.Fatalf("capture of a conflicted worktree failed: %v", err)
+	}
+	seen := map[string]int{}
+	for _, entry := range subject.entries {
+		seen[entry.path]++
+	}
+	if seen["f.txt"] != 1 {
+		t.Fatalf("conflicted path appears %d times in the capture, want 1", seen["f.txt"])
+	}
+	// The round trip is the property the duplicate collapse exists for.
+	dir, cleanup, err := materializeSubject(subject)
+	if err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+	defer cleanup()
+	round, err := subjectTreeDigest(dir)
+	if err != nil {
+		t.Fatalf("materialised digest: %v", err)
+	}
+	if round != subject.digest {
+		t.Fatal("capture -> materialise -> capture is not the identity for a conflicted index")
+	}
+}
+
+// verifies: AIRA-80 -- a failed capture is not a subject. The ratchet gauge
+// evaluates every ratchet gate against the captured subject; when the capture
+// fails it must report evidence_unavailable, not compare the test reports anyway
+// and report pass under an empty digest. Found by the adversarial build review:
+// the first implementation discarded the capture error and passed the zero
+// subject straight through, which the pre-capture code never did.
+func TestRatchetGaugeReportsEvidenceUnavailableWithoutASubject(t *testing.T) {
+	s, definition, root := newRatchetEvaluationFixture(t)
+	commit := s.gitValue(context.Background(), "HEAD")
+	addRatchetReportWithResults(t, s, commit, []domain.TestResult{{Name: "A", Outcome: domain.OutcomeFail}})
+
+	// Sanity: with a readable subject the gauge reports a genuine pass, so the
+	// assertion below is about the capture failing and not about a gauge that
+	// never passes.
+	gauge, err := computeRatchetStatus(s)
+	if err != nil {
+		t.Fatalf("gauge: %v", err)
+	}
+	if cell, ok := gauge.Breakdown[definition.ID]; !ok || cell.Value != "pass" {
+		t.Fatalf("baseline gauge cell = %#v, want pass", gauge.Breakdown[definition.ID])
+	}
+
+	// A tracked gitlink makes the capture fail closed (AIRA-72's accepted
+	// boundary) without touching the reports the comparator would otherwise use.
+	gitRun(t, root, "update-index", "--add", "--cacheinfo", "160000,0000000000000000000000000000000000000001,sub")
+	if _, captureErr := captureSubject(root); captureErr == nil {
+		t.Skip("the fixture did not make the capture fail")
+	}
+	gauge, err = computeRatchetStatus(s)
+	if err != nil {
+		t.Fatalf("gauge after capture failure: %v", err)
+	}
+	cell, ok := gauge.Breakdown[definition.ID]
+	if !ok {
+		t.Fatalf("gauge dropped the gate entirely: %#v", gauge)
+	}
+	if cell.Value == "pass" {
+		t.Fatalf("a ratchet gate reported pass with no capturable subject: %#v", cell)
+	}
+	if cell.Value != "evidence_unavailable" {
+		t.Fatalf("gauge cell = %#v, want evidence_unavailable", cell)
 	}
 }
 

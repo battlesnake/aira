@@ -23,6 +23,15 @@ import (
 // already-captured subject rather than a root path: no evaluator re-reads the
 // tree it is evaluating (AIRA-80).
 func (s *Store) evaluateChecker(ctx context.Context, def gate.GateDefinition, subject capturedSubject) (DimensionEvaluation, error) {
+	// A subject with no digest was never captured. captureSubject always sets one
+	// -- even an empty tracked tree digests to the hash of no entries -- so an
+	// empty digest can only be the zero value. No lane may evaluate against it:
+	// the command lane would materialise an EMPTY tree and could pass a checker
+	// that only fails on real content, and any verdict would be bound to the
+	// empty-string digest. One guard at the dispatch point covers all three lanes.
+	if subject.digest == "" {
+		return DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_EVIDENCE_UNAVAILABLE"}, errors.New("U_GATE_EVIDENCE_UNAVAILABLE: subject was not captured")
+	}
 	switch def.Lane.Checker {
 	case string(gate.CheckerDimension):
 		if def.Checkable == nil {
@@ -355,20 +364,32 @@ func trackedSnapshotPaths(root string) ([]string, error) {
 		paths = append(paths, path)
 	}
 	sort.Strings(paths)
-	// `git ls-files --cached` lists an unmerged path once per stage, so a
-	// conflicted index yields the same path two or three times. The digest would
-	// then be over a multiset while materializeSubject collapses it to one
-	// stage-0 entry, so capture -> materialise -> capture stops being the
-	// identity exactly when a repository is mid-conflict. There is no single
-	// coherent content for such a path, so there is no subject to bind a verdict
-	// to: refuse rather than pick a stage. Pinned by
-	// TestCaptureRefusesAnUnmergedIndex.
-	for i := 1; i < len(paths); i++ {
-		if paths[i] == paths[i-1] {
-			return nil, fmt.Errorf("U_GATE_EVIDENCE_UNAVAILABLE: unmerged index: tracked path %q has more than one stage", paths[i])
+	// `git ls-files --cached` lists an unmerged path once per STAGE, so a
+	// conflicted index yields the same path two or three times. Left as-is the
+	// capture reads and digests that one file two or three times, while
+	// materializeSubject writes it once and stages one entry -- so
+	// capture -> materialise -> capture stops being the identity exactly when a
+	// repository is mid-conflict, and a command gate's proof-time subject stops
+	// agreeing with GateCheck's check-time subject.
+	//
+	// The fix is to collapse the duplicates, not to refuse them. The subject is
+	// defined as the WORKING TREE content of every tracked path (AIRA-72: the
+	// index is not the witness, precisely because it can disagree with the
+	// worktree), and the worktree has exactly one content per path however many
+	// index stages exist. Refusing instead would make every gate hard-fail for the
+	// whole duration of any merge conflict anywhere in the tree, including
+	// conflicts in files a gate does not look at -- a blanket false fail. A
+	// conflicted file still carries its conflict markers into the digest and into
+	// whatever the checker runs, so a genuinely broken tree still fails on its own
+	// merits, loudly. Pinned by TestCaptureOfAnUnmergedIndexCountsEachPathOnce.
+	deduplicated := paths[:0]
+	for i, path := range paths {
+		if i > 0 && path == paths[i-1] {
+			continue
 		}
+		deduplicated = append(deduplicated, path)
 	}
-	return paths, nil
+	return deduplicated, nil
 }
 
 // Tracked-tree reading now lives in gate_subject.go as captureSubjectEntries,

@@ -305,11 +305,18 @@ three times. `trackedSnapshotPaths` passes all three through, so
 `git add -A -f` in the materialised tree collapses them to one stage-0 entry —
 breaking I3 round-trip idempotence precisely when a repository is mid-conflict.
 
-`trackedSnapshotPaths` therefore **refuses a duplicate path**
-(`U_GATE_EVIDENCE_UNAVAILABLE`): a conflicted index has no single coherent
-content for that path, so there is no well-defined subject to bind a verdict
-to. Fail-closed, loud, and it removes the one construction under which
-capture → materialise → capture is not the identity.
+`trackedSnapshotPaths` therefore **collapses duplicate paths**. **Revised on
+build-review (Sol [P2]): the first implementation refused them, which was
+wrong** — it made *every* gate hard-fail for the whole duration of *any* merge
+conflict anywhere in the tree, including in files no gate reads. That is a
+blanket false fail, and this repo's own agents live in conflicted worktrees.
+Collapsing is also the faithful reading of the model: the subject is defined as
+the **working-tree** content of every tracked path (AIRA-72 rejected the index
+as the witness precisely because it can disagree with the worktree), and the
+worktree holds exactly one content per path however many index stages exist. A
+conflicted file still carries its conflict markers into the digest and into
+whatever the checker runs, so a genuinely broken tree still fails loudly on its
+own merits.
 
 Out of scope, named not glossed: `trackedTracePaths` (the *check* lane, §3.3)
 has the same duplicate behaviour. It has no digest to bind and its duplicate
@@ -358,9 +365,44 @@ Per-defect:
 | 11 | `TestGateCheckUnknownStoredVerdictIsNotPass` | §3.6's residual hole: `[pass, ""]` rolls up to pass on master |
 | 12 | `TestCaptureRefusesAnUnmergedIndex` | §3.7: a conflicted index digests one path three times and is not idempotent under materialisation |
 
-Mutation testing (adversarial pass): each of the five source changes is
-reverted in isolation and the suite re-run, to prove the tests actually
-discriminate rather than passing against either implementation.
+**Mutation testing — results, not intentions.** Each source change was reverted
+in isolation and the guarding test re-run:
+
+| # | mutation | outcome |
+|---|---|---|
+| M1 | `git add -A -f` → `git add -A` | **killed** (test 4; test 5 after hardening — see below) |
+| M2 | `evaluateDimension` re-reads the disk (`captureTraceSnapshot`) | **killed** (test 1) |
+| M3 | `finishGateReport` back to demote-only + seeded pass | **killed** (test 11) |
+| M4 | `ValidateCanary` back to the literal prefix test | **killed** (test 7, 14 subcases) |
+| M5 | duplicate-path handling removed | **killed** (test 12) |
+| M6 | ratchet comparator seeded `pass` again | **SURVIVED** |
+| M7 | agreement rule stops comparing `perm` | **killed** (test 3) |
+| M8 | ratchet gauge's capture-failure guard removed | **killed** (build-review regression test) |
+| M9 | duplicate collapse removed | **killed** (test 12) |
+
+Two results are reported because they are unwelcome, not despite it:
+
+- **M6 survived, and correctly so.** Seeding `PredicateUnevaluated` and raising
+  to pass in the else-arm is *behaviourally identical* to seeding pass and
+  demoting; no test can distinguish them and none should pretend to. It is
+  shape-hardening against a future early return, and AIRA-86's own mandatory
+  condition — the pass path still reaches pass — is what test 10 asserts.
+- **Test 5 was porous on its first version and had to be hardened.** The gate
+  definition quotes the marker in its `argv`, so tracking the gate fixture put a
+  second copy of the marker in the subject and the checker kept passing with the
+  tracked-but-ignored file gone — the test could not fail against the very defect
+  it exists to catch. Fixed by leaving the fixture untracked and adding an
+  explicit fixture guard asserting exactly one tracked file carries the marker.
+  Under M1 it now fails with `Verdict:"pass", Trusted:true`, which is AIRA-81's
+  harm stated verbatim.
+
+**Characterization vs. defect-demonstration.** Sol's build review correctly
+observed that tests 3, 6, 7's equivalence half, 8 and the property matrix
+describe behaviour that already held before this commit. They are regression
+guards for what this refactor must not break — the parent plan asks for the
+property matrix by name — not evidence that the fixes work. The tests that
+actually discriminate the fixes are the ones the table above lists as killing a
+mutation.
 
 ## 5. Risks and deferrals
 
@@ -380,6 +422,30 @@ discriminate rather than passing against either implementation.
   `~/.local/state/aira/state.db` (parent plan §5 item 2). This fix is justified
   on honesty-defect merit and is net-negative in lines; the owner's
   defer-or-delete answer, if it arrives, overrides.
+
+## 5a. Build-review record and the gaps it left open
+
+**Codex / GPT-5.6-Sol, reading the committed diff: BLOCK.** Three findings were
+real and are fixed in the follow-up commit; two were corrections to claims
+rather than to code; one is disputed and recorded below. Every fix carries a
+regression test that was mutation-checked.
+
+| finding | disposition |
+|---|---|
+| [P1] `insights.go` discards the capture error and passes the **zero subject** to `evaluateRatchet`, which compares the reports anyway and reports **pass under an empty digest** — a regression against the pre-change per-gate `evidence_unavailable` | **Real, fixed.** The gauge now reports `evidence_unavailable` per gate on capture failure, and `evaluateChecker` gained a dispatch-wide guard refusing any subject with an empty digest (which would otherwise let the command lane materialise an *empty* tree). `TestRatchetGaugeReportsEvidenceUnavailableWithoutASubject`; mutation-killed. |
+| [P2] the unmerged-index **refusal** makes an unrelated conflicted file hard-fail every gate | **Real, fixed** — refusal replaced by collapse, §3.7. |
+| [P1] the comment claiming a torn read in `GateCheck` "can only fail to match" is **not a proof** | **Real, comment corrected.** A writer presenting each file's stored-pass content at the moment that file is read could reproduce a stored digest from an incoherent tree. Closing it means giving the hot read-only path the double-read capture. **Not closed; recorded as an accepted gap** in `gate_subject.go` rather than left as the stronger claim. |
+| [P0] `git add -A -f` "is not a pure indexing operation": a captured `.gitattributes` plus a user-configured `filter.<x>.clean` command executes that command, which could touch the worktree the checker then reads | **Disputed as attributable to this change, recorded as a pre-existing gap.** The vector is real — `runGit` scrubs only `GIT_*` (`internal/gitcontext/env.go:50`), so `HOME` survives and `~/.gitconfig` filters do run. But `git add -A` already ran in this exact tree before this commit, and still runs unforced in the fixture and post-mutation stages; `-f` widens the filtered path set by the ignored-but-tracked paths only. A clean filter rewrites the *index blob*, not the worktree file, so the checker's view changes only if the user's own filter command has side effects. Not introduced here, not fixed here, written down rather than silently inherited. |
+
+**Coverage gaps, accepted and named** (never silent, per the review policy):
+
+1. `GateCheck`'s single-read lookup digest, above.
+2. Git filter/hook side effects during any `git add` in a materialised tree, above.
+3. A *real temporal* torn read between the capture's two reads is not
+   deterministically drivable without a production test hook; the agreement rule
+   it would have to defeat is tested directly instead (§4 test 3).
+4. AIRA-86's ratchet seed flip is behaviour-preserving by construction and no
+   test can distinguish it — see §6.
 
 ## 6. Plan-review record
 
