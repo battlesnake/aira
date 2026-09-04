@@ -460,7 +460,7 @@ Real-cgroup tests reuse `cgrouptest.IsolatedScopeParent` / `SkipOrFailRealCgroup
 | T11 | `VanishedJobs`/`VanishedBytes` report the seen-then-gone lease and it **remains inside** `ScopeJobs`/`ScopeBytes` (a subset, not a fourth population, so the split still sums to `Jobs`). | false-pass | make vanished leases a separate population, breaking the sum |
 | T12 | `admitSliceSnapshot` on an absent queue reports the genuine idle zero: `present == false`, all-zero split, **no** inconsistency line, **no** vanished count. | false-fail | return `present: true` for an absent queue *(the v2 mutation — computing a residual before the nil-queue return — was porous: zero counters minus zero populations is still zero)* |
 | T13 | CLI: breakdown renders with correct pluralisation/byte formatting; absent `SliceReserve` prints none of the new lines; a zero residual prints no inconsistency line. | false-pass | drop the conditional and print the residual unconditionally |
-| T14 | **Migrated-leader gap, pinned** *(Sol round 2 P0; tightened per Sol round 3 P1)*: a past-TTL lease whose leader escaped into a sibling cgroup, leaving its scope empty and then removed. The escaped PID is **proved alive** (`/proc/<pid>` present, start-tick matched) immediately before **and** after reclaim, so the test cannot pass for a dead escapee. Assert `VanishedJobs == 1` **before** discharge and `0` after, and assert the rendered line states an observation, not a death verdict. | documentation-as-test | rename the field/line back to `Ghost*`/"ghost lease" (the rendered-wording assertion fails); or skip the liveness proof (then the test no longer pins the disputed condition) |
+| T14 | **Migrated-leader gap, pinned** *(Sol round 2 P0; tightened per Sol round 3 P1)*: a past-TTL lease whose leader escaped into a sibling cgroup, leaving its own scope empty. The escaped PID is **proved alive** — read from `/proc/<pid>/stat`'s state field, NOT `kill -0`, which succeeds for a zombie the test never waits on — immediately before **and** after the sweep, so the test cannot pass for a dead escapee. Assert `ScopeJobs` 1 → 0 across the discharge. *(Built against the **reap** branch, not the vanished one: in the realistic fixture the scope is still present at the last scan and this sweep is what removes it. The v3 text asked for `VanishedJobs == 1` here, which would need a fixture contradicting its own scenario. The observation-not-verdict wording is pinned in the renderer test instead.)* | documentation-as-test | drop the liveness proof (the test then pins nothing about the disputed condition); or rename the reported field/line back to `Ghost*` (the renderer test's wording assertion fails) |
 
 **Mutation testing is mandatory** (Tier A): each row's mutation is applied to a throwaway copy
 of the tree, the named test confirmed to **fail** against it and to **pass** on the real fix.
@@ -487,7 +487,74 @@ Results recorded in the PR.
 | A stuck lease this design still cannot see | Two false negatives named and accepted in §2 D2 (sub-scan-interval scope; unparseable scope id); both are the safe direction and both are pre-existing |
 | `main.go` rebase conflict with AIRA-62 / Phase 4 | Edit confined to the confine-list block; recorded in §3 |
 
-## 8. Review log
+## 8. Build review and mutation testing (post-implementation)
+
+Two independent lineages reviewed the **built code**: Codex/Sol (with repo access) and
+DeepSeek-pro (inline). Both returned **GATE-FAIL**, and — as on v1 — they found the **same
+three P0s independently**, which is the strongest available signal that they are real.
+
+### 8.1 Mutation testing found four porous tests before either reviewer ran
+
+Tier A mandates mutation testing, and it earned its keep. The first run (13 mutations) left
+**four tests green against mutations they existed to catch**, including the two headline ones:
+
+| Mutation | Was caught? | Root cause |
+|---|---|---|
+| Delete the ledger discharge outright (`outstanding -= reserve; outstandingJobs--`) | **NO** | `releaseAdmitWaiter` removes the waiter from `queue.waiters` **outside** the `accounted` guard; `pruneAdmitQueue` then deletes the empty queue, and `admitSliceSnapshot` honestly returns the absent-queue zero. The tests waited for `(0 jobs, 0 bytes)` — **an absent ledger satisfies that without the discharge ever running.** They were reading absence as proof of correctness, for exactly the leak the ticket alleges. |
+| Byte-only discharge loss | **NO** | Same, plus the mutation was aimed at a unit test that never calls the mutated code at all. |
+| Reclaim on plain absence (drop the `scopeSeen` requirement) | **NO** | Every reaper test sets `scopeSeen`/`scopeVanished` **directly on the waiter**, so **nothing drove `evaluateAdmitQueue`'s scan block** — the producer of the bits, and where the entire safety argument lives. |
+| Mark a currently-observed scope vanished | **NO** | Same. |
+
+Fixes: the end-to-end tests now hold one **pinned** client open so the queue can never be
+pruned, assert `present == true`, and assert the ledger falls to **the pin's exact
+contribution** rather than to zero; and a new `admit_scope_transition_test.go` drives the
+evaluator's scan block directly. Final state: **21 mutations, all caught, none porous, none
+invalid** (`docs/dev/aira68-mutation-check.sh`).
+
+### 8.2 The three P0s both reviewers found, and the fixes
+
+| Finding | Resolution |
+|---|---|
+| **P0 (both)** `staleLeaseState` validated under `queue.mu`, **released the lock**, and only then discharged. Between the two, the evaluator can re-observe the scope and clear `scopeVanished` — so the sweep discharges a lease whose reclaim proof has just evaporated. | `releaseAdmitWaiter` split into `releaseAdmitWaiterLocked` (discharge, lock held, reports whether **this** call transitioned) + `afterAdmitRelease` (post-unlock signalling, preserving the `admitRegistryMu → queue.mu` order). The vanished branch is now **one critical section**: validate and discharge together. The reap branch validates, reaps outside the lock (a syscall cannot hold `queue.mu`), then **re-validates and discharges atomically**. Tests: `TestDischargeReapedStaleLeaseRevalidatesBeforeTouchingTheLedger`, `TestReleaseAdmitWaiterLockedReportsOnlyTheCallThatTransitioned`. Mutations m15, m16 |
+| **P0 (both)** A `scopeVanished` bit set by a genuine transition **survives a persistently failing scan**, where it can no longer be refreshed or cleared — so the sweep reclaims on a sighting the daemon can no longer confirm. Directly contrary to "a check that cannot establish its result reports `unevaluated`, never a fake pass". | `dischargeVanishedStaleLease` now additionally requires `!queue.adoptedScanFailed`. Fail-closed: while the scan is broken the reserve is **held**, and reclaim resumes the moment the scan recovers. Tests: `...WillNotReclaimAVanishedLeaseWhileTheScanIsFailing`, `...ReclaimsOnceTheScanRecovers`. Mutations m14, m14b |
+| **P0 (both)** The scan observes a **pathname**, and cgroup v2 permits renaming a cgroup within its parent — so "scope id absent" is not unconditionally "that cgroup was removed". A renamed, still-populated scope would be read as vanished and reclaimed while the job runs on, still contained. | **Accepted and documented, not built** (`admit.go`, the `scopeSeen`/`scopeVanished` doc comment). Nothing in AIRA renames a scope; closing it needs per-scope inode identity threaded through the scan — real machinery for an externally-injected scenario, which `architectural-simplicity` says to document rather than build. The consequence is bounded exactly as the migrated-leader gap is: the release is **ledger-only**, and a renamed cgroup is still inside the slice, so its memory is still charged through `max(current − reclaimable, Σ reserve)`. The scan-currency requirement above narrows the window without closing it. |
+
+### 8.3 Lower-severity findings
+
+| Finding | Resolution |
+|---|---|
+| **P1 (Sol)** The rendered line said the scope "is now gone" — a **present-tense** claim about state read up to one scan ago, which the daemon cannot establish at the moment it prints it | Reworded to "whose scope the confine scan **observed and then observed absent**". Renderer test asserts the wording; mutation m12 unaffected |
+| **P2 (Sol)** `releaseStaleLeaseCandidate` reported `reclaimed=true` even when `releaseAdmitWaiter` was a no-op because a concurrent ordinary release got there first — a receipt for an act this pass did not perform | The discharge now reports whether **it** transitioned the waiter, and the proof/log follows that. Mutation m15 |
+| **P1 (Sol)** The remaining reap-branch destructive-ABA window (between re-validation and `openat`) is untested | Left as the **accepted gap §2 D2 already records**, now also bounded by the post-reap re-validation. Steering that interleaving needs a synchronisation hook in production code; the two discharge paths are asserted directly instead |
+| **P2 (DeepSeek)** Pointer ABA if waiters were pooled/recycled | Not reachable: `admitWaiter`s are freshly allocated per enqueue and never pooled, and Go cannot reuse an address while a live pointer is held. Recorded in `staleLeaseActionableLocked`'s doc comment |
+
+### 8.4 Two `internal/runner` flakes, recorded honestly
+
+Six full-suite runs: **four green (exit 0), two red**, each red a *different* wall-clock-tight
+test in `internal/runner`, never the same one twice, and never a test this change can reach.
+
+| Test | Evidence |
+|---|---|
+| `governor_slot_test.go:383 TestGovernorSlotReconnectsWithSameUUID` | Failed at **2.01 s** against a hard `time.After(2 * time.Second)` deadline (one of four in that test, none synchronised to real work). Passes **10/10** in isolation. **Already named in AIRA-20** as a known instance of this class, with the same signature recorded there: "Passed 6/6 in isolation… same wall-clock-tight reconnect-deadline class, not a data race and not caused by the change." |
+| `runner_test.go:833 TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration` | Real-cgroup timeout/exit arbitration. Passes **10/10** in isolation. A **new instance** of the same class; appended to AIRA-20. |
+
+**Why these are not this change's doing** — stated as what is established, not as a wave-through:
+
+- The complete `internal/runner` diff is **45 added lines: struct fields on
+  `ConfineSliceReserve` plus their doc comments.** No function, no control flow, no behaviour in
+  that package is touched, and neither test reads that type.
+- Both pass 10/10 in isolation; the daemon package containing every behavioural change is green
+  in all six runs.
+- The failure mode is a fixed wall-clock deadline expiring under full-suite CPU contention on a
+  shared, heavily loaded box — precisely what AIRA-20 exists to fix.
+
+**What is *not* established:** three baseline passes of `internal/runner` at the base commit
+`d878d9a` (my files reverted, new tests removed) did **not** reproduce either failure, so
+"reproduced on an unmodified baseline" is **`unevaluated`** — the flakes are simply too
+infrequent to have been caught in three passes. The non-involvement argument above rests on the
+diff and on isolation runs, not on a baseline reproduction, and is reported as exactly that.
+
+## 9. Plan review log
 
 Three rounds, two independent lineages: Codex/Sol ×3 (GATE-FAIL, GATE-FAIL, GATE-FAIL →
 resolved below) and DeepSeek-pro ×1 (APPROVE-WITH-CHANGES). The two lineages independently
@@ -503,7 +570,7 @@ glossed.)*
 |---|---|
 | **P0** The ABA fix protects only the *ledger* identity, not the **destructive reap**: `ReapScopeIfEmpty` is keyed on the scope-id **string**, so a same-id replacement's newly created, briefly empty scope can be rmdir'd. The switch also acted on a possibly-stale snapshotted `c.vanished` | Two changes in §2 D2: (1) a `vanished` candidate makes **no filesystem call at all** — the destructive reap is bypassed entirely for that class; (2) every candidate is re-validated against its **exact waiter pointer under `queue.mu`** immediately before acting, with `vanished` **re-read fresh** at that instant. The residual window is bounded and argued negligible-by-construction of the scope-id triple. New tests T9(b) and T9b |
 | **P1** D3 still said "accumulation claim refuted", contradicting §1.2/§1.5 | Corrected |
-| **P1** T14 does not pin the disputed *live-leader* condition | T14 now proves the escaped PID alive immediately before **and** after reclaim, and asserts `VanishedJobs` 1 → 0 across the discharge |
+| **P1** T14 does not pin the disputed *live-leader* condition | T14 now proves the escaped PID alive (via `/proc/<pid>/stat`, immune to the zombie that `kill -0` reports as live) immediately before **and** after the sweep, and asserts `ScopeJobs` 1 → 0 across the discharge |
 | **P2** AIRA-20 mis-cited (it is now the `-race` CI ticket, not escape containment) | Citations changed to the descendant-escape attestation work and `internal/runner/descendant_escape_linux_test.go` directly |
 | Confirmed OK | The migrated-leader policy is "honestly scoped and does not require new liveness machinery"; extracting a single-candidate release helper for T9 is reasonable |
 

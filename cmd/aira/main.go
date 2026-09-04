@@ -2248,6 +2248,40 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 			_, _ = fmt.Fprintf(stdout, "slice queue: %d queued %s, freeze %s%s\n",
 				result.SliceReserve.Queued, waiterLabel, result.SliceReserve.FreezePhase, note)
 		}
+		// AIRA-68. The job count above spans three populations and the table above
+		// THAT lists only scopes, so the two are not comparable — reading them
+		// against each other is what produced a P0 that did not exist. Printed
+		// unconditionally, including the zeros, so "no scope-less reservations" is
+		// a stated fact rather than an absence the reader has to interpret.
+		_, _ = fmt.Fprintf(stdout, "  of which: %d confine %s %s, %d scope-less %s %s, %d adopted %s %s\n",
+			result.SliceReserve.ScopeJobs, confinePlural(result.SliceReserve.ScopeJobs, "scope", "scopes"),
+			formatReserveBytes(result.SliceReserve.ScopeBytes),
+			result.SliceReserve.ReservationJobs, confinePlural(result.SliceReserve.ReservationJobs, "reservation", "reservations"),
+			formatReserveBytes(result.SliceReserve.ReservationBytes),
+			result.SliceReserve.AdoptedJobs, confinePlural(result.SliceReserve.AdoptedJobs, "scope", "scopes"),
+			formatReserveBytes(result.SliceReserve.AdoptedBytes))
+		if result.SliceReserve.ReservationJobs > 0 {
+			_, _ = fmt.Fprintln(stdout, "  (a scope-less reservation has no cgroup scope, so it never appears in the table above)")
+		}
+		if result.SliceReserve.VanishedJobs > 0 {
+			// An observation, never a verdict, and stated in the PAST TENSE about
+			// what the scan saw. A scope can be absent while the job's leader lives
+			// on, having migrated into a sibling cgroup; and the newest sighting
+			// here is up to one scan old, so "is now gone" would assert present
+			// state the daemon cannot establish at the moment it prints it.
+			_, _ = fmt.Fprintf(stdout, "  %d %s %s whose scope the confine scan observed and then observed absent; reclaimed at the stale-lease TTL\n",
+				result.SliceReserve.VanishedJobs, confinePlural(result.SliceReserve.VanishedJobs, "lease", "leases"),
+				formatReserveBytes(result.SliceReserve.VanishedBytes))
+		}
+		if result.SliceReserve.ResidualJobs != 0 || result.SliceReserve.ResidualBytes != 0 {
+			// The split is derived from the ledger's own waiter list and the totals
+			// come from its incremental counters; they are equal by construction, so
+			// a residual is a real lost or double discharge. Printed signed and NOT
+			// through formatReserveBytes, which floors a negative to 0B and would
+			// hide exactly half of the defect.
+			_, _ = fmt.Fprintf(stdout, "  LEDGER INCONSISTENCY: jobs %+d, bytes %+d unattributable to any population\n",
+				result.SliceReserve.ResidualJobs, result.SliceReserve.ResidualBytes)
+		}
 	}
 	if response.Exit != 0 {
 		return response.Exit
@@ -2260,6 +2294,16 @@ func confineInt(value *int) string {
 		return "unevaluated"
 	}
 	return strconv.Itoa(*value)
+}
+
+// confinePlural keeps the AIRA-68 breakdown line grammatical for a single-member
+// population, matching the singular/plural handling the two lines above it
+// already do inline.
+func confinePlural(count int, singular, plural string) string {
+	if count == 1 {
+		return singular
+	}
+	return plural
 }
 
 func confineInt64(value *int64) string {
