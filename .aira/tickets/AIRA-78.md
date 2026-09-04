@@ -20,3 +20,39 @@ Needs its own adversarial loop; the interim close should not be applied without 
 ## Note
 
 AIRA-72's "closed on every checker" yield claim was corrected to exclude this case.
+
+## Why this P0 is not being built now (2026-09-04, backlog-remediation Phase 0, plan section 2) — text only
+
+Recorded on the ticket itself so a reader who never opens the backlog-remediation
+plan is not left with an unexplained parked P0.
+
+**The severity is correct and unchanged.** Under CLAUDE.md's "a check that cannot
+establish its result reports `unevaluated`, never a fake pass", minting a fresh
+pass from HEAD-selected evidence against a working-tree digest is a P0.
+
+**It is LATENT, not live: the gate kind has no producer.** A fresh read-only count
+of `~/.local/state/aira/state.db` (2026-09-04) shows the *entire* gate subsystem
+empty — `gates`, `gate_results`, `gate_proofs`, `gate_attestations`,
+`gate_baselines`, `gate_baseline_active`, `test_reports`, `test_report_results`,
+all zero rows. Ratchet evidence is `test_reports`, and nothing writes them. No
+fake pass has ever been minted here, and none can be until something starts
+producing test reports.
+
+**Recommended disposition, awaiting explicit owner sign-off — NOT actioned
+anywhere in this plan:** **delete the ratchet gate kind.** Zero production rows,
+and it is consistent with the owner's stated preference for deleting over adding
+(plan section 0). That is the narrow form of the wider question the plan raises
+in section 5 item 2, which is whether more of the gate subsystem should go the
+same way.
+
+**Fallback if the owner keeps it:** give test reports a subject digest (a schema
+change — free, since AIRA has no users or data to migrate) and require it to match
+the digest being bound, then apply the Phase 1 Fix 3 captured-subject pattern to
+it. The plan gate's cheap interim (`git diff-index --quiet HEAD --` →
+`U_GATE_INCOMPARABLE`) is explicitly NOT recommended as a standalone close: this
+ticket's own body already warns it is a large behavioural change for anyone using
+ratchets, and it needs its own adversarial loop.
+
+**Either path is gated on the owner's answer**, exactly like AIRA-28/29 and
+AIRA-91 Part B elsewhere in that plan — it is not a default an executor proceeds
+on.
