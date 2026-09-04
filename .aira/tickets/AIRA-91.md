@@ -302,3 +302,66 @@ timestamp chase performed (correctly aborted before it started). Left the
 retracted section above in place rather than deleting it, since the
 guard-regex gap it exposed is itself a real, useful finding for BL-969-style
 work even though the incident itself wasn't AIRA-91.
+
+### BREAKTHROUGH: real exit code captured directly for the first time — 137 (SIGKILL) via systemd-oomd, not exit 0 (qual, 2026-09-04)
+
+A fresh, dedicated investigation was restarted (worktree
+`../aira-91-root-cause`, plan/findings to be recorded once it concludes).
+While it ran, qual attempted a live, precisely-instrumented repro of `hosted`
+under aitest (bypassing their own pin, for diagnosis only): a continuous
+`journalctl --user -u aira-daemon -f` tail for the whole attempt, and
+`ec=$?` captured directly after the inner command with no pipe.
+
+**Result: `ec=137` (SIGKILL) — not 0.** Every prior "exit 0" observation this
+whole investigation was built on had been *inferred* through an outer
+wrapper (`aira confine`'s own reported status, or `make`'s), never captured
+directly on the actual command until now. This is the single most important
+piece of evidence the investigation has had all night.
+
+**Source, confirmed three ways**: not aira-daemon (zero log lines in the
+whole window — total silence), not the kernel OOM killer (`dmesg` clean),
+but **`systemd-oomd`**, one second before the kill:
+```
+systemd-oomd[1037]: Considered 75 cgroups for killing, top candidates were:
+    Path: .../aira.slice/.aira-CONFINE-@dr-job-2219310-...
+    Pressure: Avg10: 86.85% Avg60: 82.50% Avg300: 63.30% Total: 6min
+    Current Memory Usage: 7.0G
+```
+— the job's own confine scope, top candidate, killed. `/etc/systemd/oomd.conf.d/aira-oomd.conf`
+is itself aira-managed and deliberately tightens oomd's default thresholds
+(`DefaultMemoryPressureLimit=40%`/`DefaultMemoryPressureDurationSec=10s` vs
+stock 60%/20s, "to catch growth earlier than kernel OOM") — the job's
+86.85% sustained for 6 minutes blew well past even that tightened bar.
+
+**Why this is plausible as a real, general mechanism**: the job was fully
+`aira confine`-managed and within its own accounting (`oom.group=set`,
+`cap=enforced(64G)`, `reserve=512M pinned:client`) — but systemd-oomd's PSI
+pressure metric is per-cgroup while being *driven by system-wide contention*.
+With several concurrent heavy jobs sharing `aira.slice`'s ceiling, a single
+job's cgroup can show severe pressure from thrashing even while staying
+under its own nominal reservation — oomd doesn't know or care about aira's
+ledger, it only sees pressure. This tracks every observed correlate: fires
+only under real multi-session contention, leaves nothing in aira-daemon's
+own log (it isn't aira's kill), and — now confirmed — produces exit 137.
+
+**Open question, actively being chased**: does this mechanism explain the
+*original* "exit 0" reports, or is it a separate phenomenon? A first-pass
+check (grep, not exhaustive): the confine supervisor places only the child
+process into the job's cgroup at spawn (`UseCgroupFD`/`CLONE_INTO_CGROUP`,
+`confine_linux.go:769`) — the supervisor itself is never a member of the
+scope it manages, so a cgroup-wide oomd kill should not take it down too. It
+should survive, `wait()` on its dead child, and — per this investigation's
+own earlier confirmed finding that `waitConfineCommand` always returns
+`128+signal`, never 0 — correctly report 137, matching what qual just
+captured. That suggests the earlier "exit 0" reports may have been a
+*measurement* artifact (inferred through a wrapper layer) rather than a
+second, distinct root cause — but this is preliminary, not confirmed; the
+active investigation is checking it properly, including whether anything
+about a cgroup-*wide* kill (as opposed to a kill targeted at one PID) could
+still trip an edge case the direct-kill case wouldn't.
+
+Full capture logs (qual's machine): `~/tmp/aira91-instrumented-hosted.log`,
+`~/tmp/aira91-daemon-continuous.log`, `~/tmp/aira91-live-capture.log`
+(wchan/ps snapshots from the healthy-progress period beforehand, for
+contrast — the process was genuinely computing right up to the kill, not
+stuck/wedged).
