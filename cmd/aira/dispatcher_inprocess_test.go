@@ -495,10 +495,11 @@ func TestNewerClientReplacesOlderProtocolDaemon(t *testing.T) {
 }
 
 // TestComputeGitContextStoreOpReplacesAnOlderProtocolDaemon is version-RELATIVE
-// (it used to hardcode protocol 5 replacing protocol 4, which made every
-// wire-shape bump edit an unrelated test). daemon.ProtocolVersion itself is
-// pinned by TestProtocolVersionIsPinned in internal/daemon; what matters here
-// is the replacement behaviour against a daemon one version behind.
+// (it used to hardcode protocol 5 replacing protocol 4, and was then renamed
+// again for 6, which made every wire-shape bump edit an unrelated test).
+// daemon.ProtocolVersion itself is pinned by TestProtocolVersionIsPinned in
+// internal/daemon; what matters here is the replacement behaviour against a
+// daemon one version behind, which is the same for any older protocol.
 func TestComputeGitContextStoreOpReplacesAnOlderProtocolDaemon(t *testing.T) {
 	dispatcher := autoStartDispatcher(t)
 	older := startProtocolDaemonProcess(t)

@@ -231,16 +231,28 @@ class WorkerAdmitTerminal(Exception):
     pass
 
 
-class WorkerAdmitRequestTooLarge(WorkerAdmitTerminal):
-    """A PERMANENT, STATIC verdict about this specific request that no
-    amount of retrying or waiting can change: class=request-invalid. Either
-    the daemon's own exceeds-ceiling reason (this request's estimated-byte
-    sizing can never fit under the outer scope's cap, even without
-    transient contention), its permanent outer-scope-ownership refusal, its
-    protocol-level argument rejection, or the CLI's own pre-dial argument
-    validation. Retrying would wait forever against a perfectly healthy
-    daemon, while falling back to an unconfined worker would silently
-    remove RAM containment for the rest of the run."""
+class WorkerAdmitRequestInvalid(WorkerAdmitTerminal):
+    """A verdict that no amount of retrying or waiting can change, from a
+    daemon that is answering perfectly well: class=request-invalid.
+    Retrying would wait forever against a healthy daemon, while falling back
+    to an unconfined worker would silently remove RAM containment for the
+    rest of the run -- so this is terminal for the affected queued work and
+    nothing else.
+
+    It was called WorkerAdmitRequestInvalid, which AIRA-45 recorded as an
+    actively misleading diagnostic even before AIRA-39: it was already
+    raised for protocol-level argument rejections and version skew, neither
+    of which is a sizing problem. AIRA-39 then added two members that are
+    not about the request at all -- worker-scope-create-failed and
+    worker-id-space-exhausted are daemon-side cgroupfs facts about the outer
+    scope. The name now matches the class token exactly, which is the same
+    one-vocabulary rule the rest of this channel follows.
+
+    Current members: the daemon's exceeds-ceiling (this request's
+    estimated-byte sizing can never fit under the outer scope's cap even
+    with zero contention), its worker-scope-create-failed and
+    worker-id-space-exhausted verdicts, its protocol-level argument
+    rejection, and the CLI's own pre-dial argument validation."""
     pass
 
 
@@ -263,12 +275,18 @@ class WorkerAdmitContractViolation(WorkerAdmitTerminal):
 class WorkerPlacementFailed(Exception):
     """place_self() never completed (or its child-side placement ack never
     arrived) -- the forked child died before we could confirm it actually
-    joined its granted cgroup scope; or the relay reported
-    class=placement-failed because the daemon granted and the LOCAL cgroup
-    scope creation then failed. Distinct from a worker that WAS placed
+    joined its granted cgroup scope. Distinct from a worker that WAS placed
     and crashed later mid-test (Task 15's _handle_worker_exit path): a
     placement failure means the admitted grant was never even used for a
-    test. The second of the two containment-stripping classes."""
+    test. The second of the two containment-stripping classes.
+
+    AIRA-39 removed the relay's own producer of class=placement-failed: the
+    CLI no longer creates the worker scope, so a creation failure is now the
+    daemon's worker-scope-create-failed verdict (WorkerAdmitRequestInvalid)
+    rather than a local placement failure discovered after a grant. This
+    supervisor's own fork/ack path above is therefore the only thing that
+    raises this today, and class=placement-failed remains its name on the
+    channel."""
     pass
 
 
@@ -310,7 +328,7 @@ _OUTCOME_STATES = frozenset((
 _OUTCOME_CLASS_EXCEPTIONS = {
     "granted": None,
     "contended": WorkerAdmitDenied,
-    "request-invalid": WorkerAdmitRequestTooLarge,
+    "request-invalid": WorkerAdmitRequestInvalid,
     "admission-unusable": WorkerAdmitUnavailable,
     "placement-failed": WorkerPlacementFailed,
     "contract-violation": WorkerAdmitContractViolation,
@@ -501,6 +519,10 @@ class Supervisor:
         self._admission_terminal_warned = False
         self.items_by_nodeid = {}
         self.workers = {}
+        # Worker scopes whose rmdir failed, for a later retry. See
+        # _forget_worker_scope: AIRA-39 turned an unremoved scope from a stray
+        # empty directory into a permanent charge against this run's own budget.
+        self._unremoved_scopes = set()
         self.results = {}
         self._run_estimated_bytes = 0
         self._run_max_wait = "30s"
@@ -782,12 +804,12 @@ class Supervisor:
             # the missing fields, so this is guarded, unlike the
             # unconditional rmdir in spawn_worker's placement-failure path
             # where "grant" is always fully well-formed by construction.
-            scope = grant.get("scope")
-            if scope:
-                try:
-                    os.rmdir(scope)
-                except OSError as exc:
-                    sys.stderr.write("aira aitest: could not remove worker scope %s: %s\n" % (scope, exc))
+            # AIRA-39 made this removal load-bearing rather than best-effort:
+            # the daemon's ledger now sums memory.max over the outer scope's
+            # real children, so a scope left behind KEEPS CHARGING this run's
+            # budget. _forget_worker_scope remembers a failed rmdir for the
+            # retry sweep instead of merely warning.
+            self._forget_worker_scope(grant.get("scope"))
             raise WorkerAdmitContractViolation(
                 "worker-admit granted outcome is malformed: %s [relay stderr: %s]"
                 % (malformed, stderr.strip() or "none")
@@ -829,7 +851,7 @@ class Supervisor:
     def spawn_worker(self, estimated_bytes, max_wait="30s"):
         """Admits and forks one worker, returning its pid. Raises
         WorkerAdmitUnavailable/WorkerAdmitDenied if admission fails, a
-        WorkerAdmitTerminal subclass (WorkerAdmitRequestTooLarge or
+        WorkerAdmitTerminal subclass (WorkerAdmitRequestInvalid or
         WorkerAdmitContractViolation) if this request can never succeed, or
         WorkerPlacementFailed if the forked child died before confirming it
         joined its granted cgroup scope -- the caller (run()) decides
@@ -918,10 +940,7 @@ class Supervisor:
             # one empty scope directory under the outer scope, and the
             # AIRA-36 reaper cannot sweep it until the whole job's
             # supervisor process is gone (>=2 minutes later).
-            try:
-                os.rmdir(grant["scope"])
-            except OSError as exc:
-                sys.stderr.write("aira aitest: could not remove worker scope %s: %s\n" % (grant["scope"], exc))
+            self._forget_worker_scope(grant["scope"])
             if ack_timed_out:
                 # A TIMEOUT is not proof the local cgroup mechanism is broken,
                 # which is exactly what WorkerPlacementFailed asserts and what
@@ -1090,11 +1109,56 @@ class Supervisor:
             _terminate_process(state["admit_process"])
         grant = state.get("grant")
         if grant is not None:
-            try:
-                os.rmdir(grant["scope"])
-            except OSError as exc:
-                sys.stderr.write("aira aitest: could not remove worker scope %s: %s\n" % (grant["scope"], exc))
+            self._forget_worker_scope(grant["scope"])
+        # An earlier retirement whose rmdir failed is still charging the ledger;
+        # this is the natural moment to try again.
+        self._sweep_unremoved_scopes()
         del self.workers[pid]
+
+    def _forget_worker_scope(self, scope):
+        """Remove one worker's cgroup scope, remembering it for retry on failure.
+
+        AIRA-39 made this load-bearing rather than best-effort. The daemon's
+        ledger is now SUM(memory.max) over the outer scope's real
+        .aira-worker-* children, so a scope that is not removed KEEPS CHARGING
+        against this run's budget for the rest of the run -- where the previous
+        in-memory ledger released the grant when the relay closed. One EBUSY (a
+        reaped worker that left a short-lived descendant behind) would otherwise
+        permanently shrink the worker budget, and in the worst case leave
+        _wait_for_admission_or_disable retrying forever against capacity that is
+        never coming back (found by Sol build-review round 2).
+        """
+        if not scope:
+            return
+        try:
+            os.rmdir(scope)
+        except FileNotFoundError:
+            self._unremoved_scopes.discard(scope)
+        except OSError as exc:
+            self._unremoved_scopes.add(scope)
+            sys.stderr.write(
+                "aira aitest: could not remove worker scope %s: %s (will retry)\n" % (scope, exc)
+            )
+        else:
+            self._unremoved_scopes.discard(scope)
+
+    def _sweep_unremoved_scopes(self):
+        """Re-attempt every removal that failed earlier.
+
+        At most a handful of rmdir calls, and called exactly where a stuck scope
+        would otherwise hurt: before retiring another worker, and on every
+        admission retry -- so a transient EBUSY self-heals into freed budget
+        instead of a permanently smaller pool or a stalled run.
+        """
+        for scope in sorted(self._unremoved_scopes):
+            try:
+                os.rmdir(scope)
+            except FileNotFoundError:
+                self._unremoved_scopes.discard(scope)
+            except OSError:
+                continue
+            else:
+                self._unremoved_scopes.discard(scope)
 
     def _wait_for_admission_or_disable(self, spawn):
         """Retries spawn() (a zero-arg callable performing one admission
@@ -1131,6 +1195,9 @@ class Supervisor:
                 self._disable_daemon(str(exc))
                 return
             attempt += 1
+            # A denial may be caused by capacity a failed rmdir is still holding.
+            # Retrying it here is what turns "retry forever" back into progress.
+            self._sweep_unremoved_scopes()
             time.sleep(_DENIAL_RETRY_SECONDS)
             if attempt % _DENIAL_WARN_EVERY == 0:
                 sys.stderr.write(

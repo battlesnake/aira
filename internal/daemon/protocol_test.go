@@ -64,13 +64,25 @@ func TestFrameRoundTripPreservesRequestContent(t *testing.T) {
 // TestProtocolVersionIsPinned makes a wire-shape change a DELIBERATE edit
 // rather than an accident: any change to a frame the daemon and its clients
 // exchange must move this number, and moving this number forces the coordinated
-// reinstall-and-restart the deploy procedure requires. Bumped to 6 by AIRA-42
-// (WorkerAdmitResponse gained `class`/`detail` and its `reason` values changed
-// shape).
+// reinstall-and-restart the deploy procedure requires.
+//
+// The name is deliberately version-AGNOSTIC (it was
+// TestStoreWriteRelayUsesProtocolVersionFive, then …Six): renaming a test on
+// every bump is churn that obscures whether the pin itself ever lapsed.
+//
+// verifies: AIRA-39 — the 5→6 bump was load-bearing, not cosmetic. Daemon-side
+// worker-scope creation changed wire SEMANTICS without changing the wire SHAPE,
+// so the version mismatch was the only thing standing between a stale client
+// and a whole aitest suite silently running unconfined.
+//
+// verifies: AIRA-42 — the 6→7 bump changes the SHAPE too: WorkerAdmitResponse
+// gained `class`/`detail` and its `reason` values lost the "reject:"/"fallback:"
+// prefixes a version-6 client dispatches on. Both bumps fail this test if a
+// later "consistency" revert takes the number back down.
 func TestProtocolVersionIsPinned(t *testing.T) {
-	if ProtocolVersion != 6 {
-		t.Fatalf("ProtocolVersion = %d, want 6; a wire-shape change must bump this "+
-			"and be deployed as an atomic reinstall+restart", ProtocolVersion)
+	if ProtocolVersion != 7 {
+		t.Fatalf("ProtocolVersion = %d, want 7; a wire-shape or wire-semantics change must "+
+			"bump this and be deployed as an atomic reinstall+restart", ProtocolVersion)
 	}
 }
 

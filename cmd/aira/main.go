@@ -1174,36 +1174,36 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 		// human sentence is the AIRA-42 defect this whole channel removes.
 		return writeWorkerAdmitOutcome(stdout, stderr, outcome, nil, "E_CONFINE_UNAVAILABLE")
 	}
+	// AIRA-39: the DAEMON creates the worker scope now, inside the same
+	// critical section that decided to grant, so there is no local
+	// CreateWorkerScope call here any more and no grant->creation window for a
+	// dying client to leave open. The scope named below already exists, with
+	// its memory.max, memory.high and memory.oom.group verified daemon-side.
+	//
+	// AIRA-42 merge note: this fix was built against the pre-AIRA-39 shape,
+	// where a LOCAL CreateWorkerScope failure here produced the
+	// `placement-failed` class. That call site is gone, so the CLI has no
+	// placement path left to classify; a scope-creation failure is now the
+	// daemon's own `worker-scope-create-failed` denial, classified daemon-side
+	// like every other verdict. `placement-failed` survives in the catalogue
+	// because supervisor.py still raises WorkerPlacementFailed from its own
+	// fork/ack path -- it is simply no longer produced by this relay.
+	//
+	// A failed write here therefore leaves the daemon-created scope on the
+	// tree, charging the AIRA-39 ledger until the outer confine job's teardown
+	// removes the subtree. Not removing it is deliberate and matches the
+	// symmetric decision the daemon itself makes on its own failed response
+	// write (worker_admit.go: "Removing it here is NOT safe"). The CLI does not
+	// own this scope, and a relay that unilaterally rmdir'd a cgroup the daemon
+	// created and the supervisor may already have been told about would trade a
+	// loud, retriable over-charge for a silent unconfined run.
 	lease := outcome.Lease
-	scopePath, err := runner.CreateWorkerScope(ctx, options["outer-scope"], lease.WorkerID, lease.MemoryMax, lease.MemoryHigh)
-	if err != nil {
-		_ = lease.Close()
-		// The daemon ALREADY granted admission here (a healthy, reachable
-		// daemon) -- only the LOCAL cgroup scope creation then failed.
-		// Classed placement-failed so the supervisor raises
-		// WorkerPlacementFailed and the diagnostic never blames a daemon
-		// that did its job (AIRA-38; the marker string this used to rely
-		// on is gone with the rest of the prose channel).
-		return writeWorkerAdmitOutcome(stdout, stderr, runner.WorkerAdmitOutcome{
-			State: runner.WorkerAdmitStatePlacementFailed, Class: runner.WorkerAdmitClassPlacementFailed,
-			Reason: runner.WorkerAdmitReasonWorkerScopeCreateFailed, Detail: err.Error(),
-		}, nil, "E_CONFINE_UNAVAILABLE")
-	}
 	grantFields := &runner.WorkerAdmitGrantFields{
-		ScopePath: scopePath, WorkerID: lease.WorkerID,
+		ScopePath: lease.ScopePath, WorkerID: lease.WorkerID,
 		MemoryMax: lease.MemoryMax, MemoryHigh: lease.MemoryHigh,
 	}
 	if exit := writeWorkerAdmitOutcome(stdout, stderr, outcome, grantFields, ""); exit != 0 {
 		_ = lease.Close()
-		// The scope exists but nobody will ever be told its path, so nobody
-		// will ever place a worker in it or remove it. Reap it here rather
-		// than leaving an empty capped cgroup for the #72 reaper's 5-minute
-		// sweep (Sol build-review). Best-effort: the outcome channel is
-		// already broken at this point, so a failure here has nowhere honest
-		// left to go but stderr.
-		if err := os.Remove(scopePath); err != nil && !os.IsNotExist(err) {
-			_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: remove undeliverable worker scope %s: %v\n", scopePath, err)
-		}
 		return exit
 	}
 	// Hold stdin open as the release signal, exactly mirroring confine-reserve.

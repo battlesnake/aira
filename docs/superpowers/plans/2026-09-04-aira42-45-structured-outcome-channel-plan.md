@@ -12,6 +12,13 @@ findings fixed and mutation-verified. Nine mutations applied, nine killed (§9).
 (separate mechanical follow-on, per §3.3 — folding a repo-wide move into a
 Tier-A wire-shape change would make the PR unreviewable).
 
+> **Read §12 before §2.3 and §5.** Fix 1 (AIRA-39, `11221d3`) merged to master
+> while this fix was in build review, and it rewrote the same evaluator this
+> fix reclassifies. §12 records the integration: which rows of the §2.3 daemon
+> table no longer exist, which four rows Fix 1 added, and the two places where
+> the merge changed a decision this plan had already made. Where §2.3/§5 and
+> §12 disagree, §12 is what was built.
+
 ## 1. The defect, restated against current source
 
 `aira worker-admit` is the only channel between the Go admission stack and the
@@ -558,3 +565,127 @@ surface, and a file the parent plan schedules for deletion under AIRA-33. It
 did not reproduce in isolation (`-count=3`), in a full package re-run, or in
 the confirming `make ci`, and it touches nothing this PR changes. Recorded
 rather than hidden.
+
+## 12. Integration with Fix 1 (AIRA-39), merged after this fix was built
+
+Fix 1 landed on master (`11221d3`) while this fix was in build review. It
+rewrote `evaluateWorkerAdmit` — the exact function this fix reclassifies — so
+the merge was a re-derivation, not a textual resolution: `worker_admit.go` was
+taken from master wholesale and the structured vocabulary re-applied onto Fix
+1's shape, verdict by verdict. What follows is what changed relative to §2.3
+and §5, and why.
+
+### 12.1 The protocol version is 7, not 6
+
+**Fix 1 also bumped the protocol, 5 → 6**, for its own reason (daemon-side
+worker-scope creation changes wire SEMANTICS without changing wire SHAPE). This
+fix changes the shape on top of that, so it bumps **6 → 7**.
+
+This is the merge's one genuinely dangerous spot, and git could not have caught
+it: both branches independently wrote `= 6`, so `internal/runner/
+admission_linux.go` auto-merged with **no conflict marker** and would have
+shipped a daemon and a client that both claimed 6 while speaking different
+shapes — silently, since `TestRunnerDaemonProtocolVersionMatchesTheDaemon` only
+pins the two sides EQUAL, not correct. Caught by reading the version on both
+branches rather than trusting a clean merge. `TestProtocolVersionIsPinned` (the
+version-agnostic rename this fix made) now pins 7.
+
+### 12.2 The §2.3 daemon table, re-derived
+
+**Row deleted — no longer a reachable condition.** `outer-scope-owned-by-
+another-job` is gone: Fix 1 replaced the per-job grants map with a sum over the
+outer scope's real `.aira-worker-*` children, so two jobs sharing one outer
+scope are now counted together rather than the second refused.
+`WorkerAdmitReasonOuterScopeOwnedByAnother` is deleted from the vocabulary.
+
+**Four rows added, each classified here for the first time:**
+
+| condition (Fix 1) | state | class | reason |
+|---|---|---|---|
+| `.aira-worker-*` scan unreadable | `unevaluated` | `contended` | `worker-scopes-unreadable` |
+| scope-id collision (`fs.ErrExist`) | `denied` | `contended` | `worker-scope-id-collision` |
+| scope creation failed | `denied` | `request-invalid` | `worker-scope-create-failed` |
+| worker-id space exhausted | `denied` | `request-invalid` | `worker-id-space-exhausted` |
+| admit-slots saturated (pre-existing, now classified) | `denied` | `contended` | `admit-slots-saturated` |
+
+Every one preserves the disposition Fix 1 chose via its `reject:`/`fallback:`
+prefix — this fix changes the ENCODING, not any verdict's behaviour.
+
+**The `request-invalid` class doc was widened, honestly.** Two of its members
+are now daemon-side infrastructure facts, not facts about the request. The
+class doc previously asserted "a permanent, static fact about THIS request";
+it now names the DISPOSITION (terminal, daemon healthy, containment kept) and
+records why those two land there — `contended` would retry a broken cgroupfs
+forever and stall every aitest run on the machine, and `admission-unusable`
+would strip containment over a daemon answering perfectly well. This is the
+same correction §2.2 already applied to `admission-unusable`'s own name.
+
+### 12.3 A deletion this fix earns from Fix 1
+
+Fix 1 shipped `workerScopesUnreadableReason`, which MANGLED the token
+`"unbounded"` into `"un-bounded"` in its diagnostic — a defensive hack against
+the very substring classifier this fix deletes (an operator's `aira confine
+--name unbounded-suite`, echoed into a cgroup path, was otherwise read as an
+uncapped outer scope and ran the whole suite unconfined). Fix 1's own comment
+predicted "Fix 2's structured outcome channel removes the need for substring
+matching altogether", and it does: the function is now
+`workerScopesUnreadableDetail` and reports the error verbatim.
+
+`TestWorkerAdmitUnevaluatedReasonNeverCarriesTheUnboundedToken` guarded that
+workaround, so its assertions **invert** rather than disappear — it is now
+`TestWorkerAdmitHostileDiagnosticTextCannotForgeAVerdict`, and asserts that
+hostile text reaches the wire unmangled AND changes no part of the
+classification, end to end through the real renderer and parser. Deleting it
+outright would have been a masking test rewrite.
+
+### 12.4 Two decisions the merge overturned
+
+- **`placement-failed` has no producer left, and is deliberately KEPT.** Fix 1
+  removed the CLI's `CreateWorkerScope` call — the daemon creates the scope
+  inside the same critical section that grants — so the §2.3 CLI row that
+  produced this class is gone. The class stays in both catalogues because
+  `supervisor.py` still raises `WorkerPlacementFailed` from its own fork/ack
+  path, and that disposition should have ONE name across both sides rather
+  than a channel name and a Python-only name — the two-vocabularies shape this
+  fix exists to remove. The "exactly two containment-stripping classes"
+  invariant (I3) is unchanged; what changed is that only the supervisor
+  produces the second one, and only locally. Recorded in the class doc, the
+  exception docstring, the spec, and the Python table row.
+- **Build-review finding B4 (§10) is mooted, and its fix was removed.** B4
+  removed a leaked scope when the CLI could not deliver its outcome line. Post
+  Fix 1 the CLI does not own that scope — the daemon created it — and Fix 1
+  made the SYMMETRIC decision at its own failed-response-write site
+  deliberately, on plan-review adjudication: *"Removing it here is NOT safe:
+  writeFrameBytes surfaces the underlying Write error and discards n, so 'the
+  client provably never learned the path' is false"*, preferring a loud,
+  retriable over-charge to a silent unconfined run. Having the relay
+  unilaterally `rmdir` a daemon-created cgroup would re-litigate that call
+  inside a merge resolution, where it would be under-reviewed. The over-charge
+  is accepted, and the reasoning is recorded at the call site.
+
+### 12.5 One rename beyond the original plan
+
+`WorkerAdmitRequestTooLarge` → `WorkerAdmitRequestInvalid`, matching its class
+token exactly. AIRA-45's own complaint is that "cannot be admitted at this
+sizing" is the factually wrong diagnostic for a protocol skew; Fix 1 then added
+two members that are not about sizing OR about the request. Keeping the old
+name would have left this fix's headline vocabulary claim false at its most
+visible point. No compatibility alias was added, per the project's zero-back-
+compat rule.
+
+### 12.6 Post-merge verification
+
+- `aira confine -- go build ./...` — **exit 0**.
+- `aira confine -- make fmt-check vet build` — **exit 0**.
+- `aira confine -- go test ./... -count=1` — **exit 0**, all 13 packages `ok`
+  (`cmd/aira`, `internal/app`, `core`, `daemon`, `domain`, `gate`,
+  `gitcontext`, `gitremote`, `install`, `pylib`, `runner`, `store`;
+  `internal/cgrouptest` has no test files).
+- `aira confine -- python3 -m pytest internal/pylib/aitest/ -q` — **exit 0**,
+  130 passed.
+- The AIRA-42 requirement re-verified against the MERGED tree, not the
+  pre-merge one: `grep` for `in message` / prose classification across
+  `supervisor.py` returns nothing, and the only surviving `strings.HasPrefix`
+  in `worker_admit.go` is on a cgroup DIRECTORY NAME (`.aira-worker-`), which
+  is structural framing on a filesystem entry, not classification of a
+  message.

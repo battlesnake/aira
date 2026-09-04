@@ -158,7 +158,7 @@ def _resolve_estimated_bytes():
         # AIRA-42 has since removed that whole substring classifier: the
         # relay now reports its own argument rejection as
         # class=request-invalid on the structured outcome channel, which
-        # acquire_worker maps to WorkerAdmitRequestTooLarge -- terminal for
+        # acquire_worker maps to WorkerAdmitRequestInvalid -- terminal for
         # the queued work, never an unconfined fallback. The clamp stays
         # anyway: refusing a typo before it reaches the wire is still
         # better than a correctly-classified failure.

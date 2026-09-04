@@ -81,7 +81,7 @@ func (result admissionResult) releaseAdmission() {
 // TestRunnerDaemonProtocolVersionMatchesTheDaemon in the external runner_test
 // package rather than derived — a bump on one side alone fails that test
 // instead of silently breaking admission negotiation (AIRA-83 item 3).
-const DaemonProtocolVersion = 6
+const DaemonProtocolVersion = 7
 
 const (
 	runnerDaemonMaxFrameBytes = 16 << 20

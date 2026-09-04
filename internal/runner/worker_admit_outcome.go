@@ -61,9 +61,21 @@ const (
 	// answered (or would have), there is simply no room / no answer right
 	// now. Retriable; containment is preserved.
 	WorkerAdmitClassContended = "contended"
-	// WorkerAdmitClassRequestInvalid is a permanent, static fact about THIS
-	// request that no amount of waiting changes. Terminal for the affected
-	// queued work; the daemon stays available for everything else.
+	// WorkerAdmitClassRequestInvalid is the TERMINAL-BUT-DAEMON-HEALTHY
+	// disposition: waiting cannot change this answer, so the affected queued
+	// work is failed loudly and reported unevaluated, while the daemon stays
+	// available for everything else and containment is NOT stripped.
+	//
+	// Like WorkerAdmitClassAdmissionUnusable below, it names the DISPOSITION,
+	// not a diagnosis. Most members really are static facts about the request
+	// (exceeds-ceiling, the CLI's own argument rejections), but AIRA-39 added
+	// two that are not: worker-scope-create-failed and
+	// worker-id-space-exhausted are daemon-side infrastructure facts about the
+	// outer scope. They land here because the alternatives are worse and were
+	// weighed in AIRA-39's own review — `contended` would retry a broken
+	// cgroupfs INDEFINITELY and stall every aitest run on the machine, and
+	// `admission-unusable` would strip containment for a run whose daemon is
+	// answering perfectly well. Terminal-and-loud is the honest middle.
 	WorkerAdmitClassRequestInvalid = "request-invalid"
 	// WorkerAdmitClassAdmissionUnusable means daemon-backed admission is not
 	// usable for THIS RUN. Together with WorkerAdmitClassPlacementFailed
@@ -89,6 +101,18 @@ const (
 	// cgroup placement mechanism then failed. The second containment-
 	// stripping class. Distinct from every daemon verdict above so the
 	// diagnostic never blames a healthy daemon.
+	//
+	// AIRA-39 (Fix 1, merged into this fix mid-review) removed this class's
+	// only RELAY producer: `aira worker-admit` no longer creates the worker
+	// scope, so a creation failure is now the daemon's own
+	// worker-scope-create-failed verdict above, not a local placement failure
+	// the CLI discovers after a grant. The pair is deliberately KEPT rather
+	// than deleted: supervisor.py still raises WorkerPlacementFailed from its
+	// own fork/placement-ack path, and that disposition should have ONE name
+	// across both sides of this channel rather than a channel name and a
+	// separate Python-only name — which is the two-vocabularies shape this fix
+	// exists to remove. What is true today is that only the supervisor
+	// produces it, and only locally.
 	WorkerAdmitClassPlacementFailed = "placement-failed"
 	// WorkerAdmitClassContractViolation means the two sides of this channel
 	// disagree about the channel itself: an outcome value outside these
@@ -105,14 +129,24 @@ const (
 // exact condition. Free-text elaboration belongs in Detail, which nothing
 // parses.
 const (
-	// Daemon-side.
+	// Daemon-side. Re-derived against AIRA-39's rewrite of evaluateWorkerAdmit
+	// (Fix 1, which landed while this fix was in review), not against the
+	// shape this fix was originally designed on: AIRA-39 deleted the
+	// outer-scope-owner binding entirely (the ledger now sums the outer
+	// scope's real children, so two jobs sharing one outer scope are counted
+	// together rather than the second refused), and added the four
+	// scope-creation and slot conditions below, which the daemon did not have
+	// a way to express before it created worker scopes itself.
 	WorkerAdmitReasonOuterScopeUnreadable      = "outer-scope-unreadable"
 	WorkerAdmitReasonOuterScopeUnbounded       = "outer-scope-unbounded"
 	WorkerAdmitReasonExceedsCeiling            = "exceeds-ceiling"
-	WorkerAdmitReasonOuterScopeOwnedByAnother  = "outer-scope-owned-by-another-job"
 	WorkerAdmitReasonInsufficientHeadroom      = "insufficient-headroom"
 	WorkerAdmitReasonSupervisorScopeUnreadable = "supervisor-scope-unreadable"
+	WorkerAdmitReasonWorkerScopesUnreadable    = "worker-scopes-unreadable"
 	WorkerAdmitReasonAggregateCapExceeded      = "aggregate-cap-exceeded"
+	WorkerAdmitReasonWorkerIDSpaceExhausted    = "worker-id-space-exhausted"
+	WorkerAdmitReasonWorkerScopeIDCollision    = "worker-scope-id-collision"
+	WorkerAdmitReasonAdmitSlotsSaturated       = "admit-slots-saturated"
 	WorkerAdmitReasonSaturated                 = "saturated"
 
 	// Client-side (transport and response classification).
@@ -129,12 +163,17 @@ const (
 	WorkerAdmitReasonMalformedGrant          = "malformed-grant"
 	WorkerAdmitReasonDialResourceExhausted   = "dial-resource-exhausted"
 
+	// Daemon-side, and CLI-side before AIRA-39. AIRA-39 moved worker-scope
+	// creation out of `aira worker-admit` and into the daemon's own critical
+	// section, so this reason moved with it: it is now a daemon verdict, not a
+	// local placement failure the relay discovers after a grant.
+	WorkerAdmitReasonWorkerScopeCreateFailed = "worker-scope-create-failed"
+
 	// CLI-side.
 	WorkerAdmitReasonArgumentsInvalid         = "arguments-invalid"
 	WorkerAdmitReasonEstimatedBytesOutOfRange = "estimated-bytes-out-of-range"
 	WorkerAdmitReasonMaxWaitInvalid           = "max-wait-invalid"
 	WorkerAdmitReasonDaemonPathsUnavailable   = "daemon-paths-unavailable"
-	WorkerAdmitReasonWorkerScopeCreateFailed  = "worker-scope-create-failed"
 )
 
 var workerAdmitStateSet = map[string]struct{}{

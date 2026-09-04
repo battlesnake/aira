@@ -5,6 +5,7 @@ package runner
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 )
@@ -34,6 +35,17 @@ func CreateWorkerScope(ctx context.Context, outerScope, workerID string, memoryM
 	scope, err := backend.Create(ctx, "worker-"+workerID)
 	if err != nil {
 		return "", fmt.Errorf("aitest worker scope: create: %w", err)
+	}
+	// This function returns a PATH, not the scope, so nothing that outlives it
+	// needs the directory FD backend.Create opened. Closing it is required, not
+	// tidiness: since AIRA-39 the caller is the long-lived DAEMON rather than a
+	// short-lived `aira worker-admit` process, so the FD is no longer reclaimed
+	// by process exit, and one accumulates per aitest worker created on the
+	// machine until the *os.File finalizer happens to run. Measured before the
+	// fix: 15 leaked FDs across 30 creations (found by Sol build-review).
+	// Deferred, so the memory-cap failure path below closes too.
+	if closer, ok := scope.(io.Closer); ok {
+		defer func() { _ = closer.Close() }()
 	}
 	if err := writeScopeMemoryCap(scope, memoryMax, memoryHigh, true); err != nil {
 		// Nothing has entered this just-created scope yet, so remove its

@@ -3,8 +3,11 @@ package daemon
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
+	"io/fs"
 	"net"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -94,6 +97,73 @@ func TestEvaluateWorkerAdmitClassifiesEveryOutcome(t *testing.T) {
 			wantReason: runner.WorkerAdmitReasonSupervisorScopeUnreadable,
 		},
 		{
+			// AIRA-39 added this verdict: the daemon creates the scope
+			// itself, so an unreadable `.aira-worker-*` scan is now its own
+			// unevaluated condition. Retriable — a scan that failed once may
+			// succeed next poll.
+			name: "an unreadable worker-scope scan is retriable",
+			configure: func(s *Server) {
+				s.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+				newWorkerScopeTree().install(s).failScan("/outer", errors.New("scan boom"))
+			},
+			request:   workerAdmitRequest{jobID: "j", outerScope: "/outer", estimatedBytes: 400},
+			wantState: runner.WorkerAdmitStateUnevaluated, wantClass: runner.WorkerAdmitClassContended,
+			wantReason: runner.WorkerAdmitReasonWorkerScopesUnreadable,
+		},
+		{
+			// AIRA-39: Σ(sibling caps) + supervisor RSS over the ceiling.
+			// Retriable — a sibling retiring frees its share.
+			name: "the aggregate cap guard is retriable",
+			configure: func(s *Server) {
+				s.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+				newWorkerScopeTree().install(s).put("/outer", workerScopeChildPrefix+"1", 700)
+			},
+			request:   workerAdmitRequest{jobID: "j", outerScope: "/outer", estimatedBytes: 700},
+			wantState: runner.WorkerAdmitStateDenied, wantClass: runner.WorkerAdmitClassContended,
+			wantReason: runner.WorkerAdmitReasonAggregateCapExceeded,
+		},
+		{
+			// AIRA-39: a child the scan did not see proves the sum was
+			// stale-low. Retriable by design — the next poll rescans and
+			// then grants or denies correctly.
+			name: "a worker-scope id collision is retriable",
+			configure: func(s *Server) {
+				s.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+				tree := newWorkerScopeTree().install(s)
+				tree.createFn = func(string, string) error { return fs.ErrExist }
+			},
+			request:   workerAdmitRequest{jobID: "j", outerScope: "/outer", estimatedBytes: 400},
+			wantState: runner.WorkerAdmitStateDenied, wantClass: runner.WorkerAdmitClassContended,
+			wantReason: runner.WorkerAdmitReasonWorkerScopeIDCollision,
+		},
+		{
+			// AIRA-39: any other creation failure. TERMINAL, not retriable —
+			// see the class doc: retrying a broken cgroupfs forever would
+			// stall every aitest run on the machine, and falling back
+			// unconfined would strip containment over a healthy daemon.
+			name: "a worker-scope creation failure is terminal, not a fallback",
+			configure: func(s *Server) {
+				s.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
+				tree := newWorkerScopeTree().install(s)
+				tree.createFn = func(string, string) error { return errors.New("mkdir: permission denied") }
+			},
+			request:   workerAdmitRequest{jobID: "j", outerScope: "/outer", estimatedBytes: 400},
+			wantState: runner.WorkerAdmitStateDenied, wantClass: runner.WorkerAdmitClassRequestInvalid,
+			wantReason: runner.WorkerAdmitReasonWorkerScopeCreateFailed,
+		},
+		{
+			// AIRA-39: ids are never reused, so exhaustion is permanent.
+			name: "an exhausted worker id space is terminal",
+			configure: func(s *Server) {
+				s.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1<<40)
+				newWorkerScopeTree().install(s).put("/outer",
+					workerScopeChildPrefix+strconv.Itoa(maxWorkerScopeSeq), 1)
+			},
+			request:   workerAdmitRequest{jobID: "j", outerScope: "/outer", estimatedBytes: 400},
+			wantState: runner.WorkerAdmitStateDenied, wantClass: runner.WorkerAdmitClassRequestInvalid,
+			wantReason: runner.WorkerAdmitReasonWorkerIDSpaceExhausted,
+		},
+		{
 			name: "a grant carries the granted class",
 			configure: func(s *Server) {
 				s.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
@@ -108,8 +178,12 @@ func TestEvaluateWorkerAdmitClassifiesEveryOutcome(t *testing.T) {
 			server := NewServer(Paths{})
 			server.workerAdmitHeadroom = 0
 			server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
+			// A default tree, so a row that does not care about the cgroupfs
+			// seam does not accidentally test a real, absent directory. Rows
+			// that DO care install their own over the top.
+			newWorkerScopeTree().install(server)
 			test.configure(server)
-			response := server.evaluateWorkerAdmit(test.request)
+			response := evaluateWorkerAdmitForTest(t, server, test.request)
 			if response.State != test.wantState || response.Class != test.wantClass || response.Reason != test.wantReason {
 				t.Fatalf("response=%+v, want state=%s class=%s reason=%s",
 					response, test.wantState, test.wantClass, test.wantReason)
@@ -247,7 +321,8 @@ func TestWorkerAdmitResponseCarriesClassOnTheWire(t *testing.T) {
 	server := NewServer(Paths{})
 	server.workerAdmitHeadroom = 0
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
-	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "j", outerScope: "/outer", estimatedBytes: 1001})
+	newWorkerScopeTree().install(server)
+	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "j", outerScope: "/outer", estimatedBytes: 1001})
 	encoded, err := json.Marshal(response)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)

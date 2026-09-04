@@ -17,12 +17,28 @@ import (
 	"aira/internal/store"
 )
 
+// ProtocolVersion 6 (was 5): AIRA-39 moved aitest worker-scope CREATION from
+// the CLI into the daemon. The JSON shape of WorkerAdmitResponse is unchanged,
+// but its SEMANTICS are not, and both mixed-version directions lose
+// containment SILENTLY: an old client against a new daemon re-creates the
+// already-created scope, gets EEXIST, prints "local-placement-failed", and
+// supervisor.py's _disable_daemon then runs the whole suite UNCONFINED; a new
+// client against an old daemon finds no scope at all and reaches the same
+// fallback. A version mismatch instead answers E_DAEMON_PROTOCOL, which
+// supervisor.py treats as terminal and reports unevaluated — loud, per this
+// project's own honesty rule. Bumping this REQUIRES an atomic reinstall of the
+// PATH binary alongside the daemon restart.
+//
+// ProtocolVersion 7 (was 6): AIRA-42/45/83(b) restructured WorkerAdmitResponse
+// itself. It gained the `class` and `detail` fields, and its `reason` values
+// lost their "reject:"/"fallback:" prose prefixes — the prefixes WERE the
+// disposition, and `class` now is. A client compiled against 6 reads a 7
+// response's reason, finds neither prefix, and falls through its cascade to
+// "the daemon is unavailable", i.e. the whole suite unconfined: the same
+// silent-containment-loss direction 6 was cut for. The version moves with the
+// shape, and this bump carries the same atomic-reinstall requirement as 6.
 const (
-	// ProtocolVersion 6 (AIRA-42/45/83(b)): WorkerAdmitResponse gained the
-	// structured `class`/`detail` fields and its `reason` values lost their
-	// "reject:"/"fallback:" prose prefixes. A client compiled against 5
-	// cannot classify a 6 response, so the version moves with the shape.
-	ProtocolVersion = 6
+	ProtocolVersion = 7
 	MaxFrameBytes   = 16 << 20
 	StoreOpBodyMax  = uint64(store.StoreOpBodyMax)
 )

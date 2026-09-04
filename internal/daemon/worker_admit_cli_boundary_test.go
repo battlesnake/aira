@@ -35,6 +35,11 @@ func TestWorkerAdmitCLIOutcomeChannelMatchesTheSupervisorBoundary(t *testing.T) 
 
 	paths := testPaths(t)
 	server := NewServer(paths)
+	// AIRA-39: the ledger sums the outer scope's real `.aira-worker-*` children
+	// and the daemon creates the granted scope itself. The fixture scopes below
+	// are not real cgroups, so both seams are stubbed; neither denial path in
+	// this test reaches a create.
+	_ = newWorkerScopeTree().install(server)
 	server.workerAdmitHeadroom = 0
 	server.workerAdmitPollInterval = time.Millisecond
 	server.admitReadMemory = func(scope string) (int64, int64, int64, bool, string) {
@@ -156,5 +161,29 @@ func TestWorkerAdmitCLIOutcomeChannelMatchesTheSupervisorBoundary(t *testing.T) 
 		assertOutcome(t, stdout.String(), stderr.String(),
 			runner.WorkerAdmitStateArgumentInvalid, runner.WorkerAdmitClassRequestInvalid,
 			runner.WorkerAdmitReasonArgumentsInvalid)
+	})
+
+	// AIRA-63, proven through the REAL client rather than the in-process
+	// response struct: an admitSlots-saturated worker-admit must reach
+	// supervisor.py as a RETRIABLE denial, so it retries once a slot frees
+	// instead of marking the queue unevaluated. Delivered as an error frame it
+	// would arrive as a contract violation (and, before AIRA-42, as the prose
+	// "worker-admit request rejected", which matched none of the classifier's
+	// denial substrings, fell through to WorkerAdmitUnavailable, and made
+	// _disable_daemon run the whole suite UNCONFINED).
+	//
+	// Kept LAST and not parallel: it drains the shared admitSlots semaphore,
+	// so any sub-test running concurrently would be saturated too.
+	t.Run("slot saturation is a retriable denial, not an error frame", func(t *testing.T) {
+		for i := 0; i < admitGlobalMax; i++ {
+			server.admitSlots <- struct{}{}
+		}
+		stdout, stderr := runWorkerAdmit("/deny-ceiling", workerAdmitEstimatedBytesMin, "5s")
+		for i := 0; i < admitGlobalMax; i++ {
+			<-server.admitSlots
+		}
+		assertOutcome(t, stdout, stderr,
+			runner.WorkerAdmitStateDenied, runner.WorkerAdmitClassContended,
+			runner.WorkerAdmitReasonAdmitSlotsSaturated)
 	})
 }

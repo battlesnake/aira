@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-81","project":"aira","title":"Canary re-materialization drops tracked-but-ignored files, so a canary can fire on the drop rather than on its mutation","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["gate","honesty"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-81","project":"aira","title":"Canary re-materialization drops tracked-but-ignored files, so a canary can fire on the drop rather than on its mutation","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["gate","honesty"],"hold":false,"relations":[]}
 ---
 Found by the Fable plan gate during the AIRA-72 two-loop, as a pre-existing defect adjacent to but distinct from AIRA-72. Not fixed there.
 
@@ -14,3 +14,31 @@ Note AIRA-55's `injectFile` doc comment already documents the sibling case — a
 ## Direction
 
 Preserve source index membership across materialization rather than re-deriving it: stage the copied entries explicitly (`git add -f` for the captured set, or construct the index directly) so the materialized tree's tracked set is exactly the source's tracked set. AIRA-72 already removed the digest half of this divergence by digesting the captured entries instead of the re-indexed tree; this is the remaining execution half.
+
+## Resolution (2026-09-04)
+
+Closed. `materializeSubject` stages with `git add -A -f`. The materialised
+directory holds exactly the captured entries, so forcing makes its index exactly
+the source's tracked set, including a file that is both tracked and matched by
+the source's own .gitignore. The mutation canary's second materialisation is
+therefore faithful and can no longer fire because a file disappeared.
+
+The post-mutation re-stage stays UNFORCED on purpose: AIRA-55's documented
+inject-file-into-an-ignored-path drop (loud, E_GATE_CANARY_DID_NOT_FIRE) is
+unchanged, and `TestInjectFileCanaryIntoIgnoredPathDoesNotFire` still pins it.
+
+End-to-end counterexample committed as
+`TestIgnoredTrackedFileDropDoesNotMintProofOfFire`: with the fix reverted it
+fails with `Verdict:"pass", Trusted:true` -- a trusted pass licensed by a canary
+that fired on the drop rather than on its mutation.
+
+Found and fixed during independent verification, before merge: the fix's own
+`runFixtureCanary` seam (the M10a compatibility caller, no production users)
+passes the ZERO capturedSubject, and the mutation lane materialises whatever
+subject it is handed -- so that seam would have materialised an EMPTY tree,
+injected the mutation into it, and minted proof-of-fire from the subject's
+absence. Exactly this ticket's harm shape, reintroduced through the one caller
+that does not capture. The seam now refuses `CanaryMutation` outright; pinned by
+`TestFixtureCanarySeamRefusesTheMutationMode`, mutation-checked.
+
+Plan: docs/superpowers/plans/2026-09-04-aira80-81-60-86-captured-subject-plan.md
