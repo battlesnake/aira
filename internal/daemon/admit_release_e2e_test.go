@@ -24,7 +24,9 @@ import (
 func e2eConfineAdmitArgs(reserve int64, scopeID, name string) map[string]any {
 	args := map[string]any{"slice": "slice", "reserve": reserve, "max_wait_ms": int64(60000), "signature": "", "pinned": true}
 	if scopeID != "" {
-		args["scope_id"], args["name"], args["owner"] = scopeID, name, "session-e2e"
+		// AIRA-52: the owner is carried by the scope id, and admission binds the
+		// two, so the fixture must mint the same pair a real launcher does.
+		args["scope_id"], args["name"], args["owner"] = scopeID+"@session-e2e", name, "session-e2e"
 	}
 	return args
 }

@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-52","project":"aira","title":"confine --list owner reverts to unknown after a daemon restart","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["confine","daemon","dogfood"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-52","project":"aira","title":"confine --list owner reverts to unknown after a daemon restart","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["confine","daemon","dogfood"],"hold":false,"relations":[]}
 ---
 ## Symptom
 
@@ -48,3 +48,145 @@ Cosmetic/diagnostic only today — owner plays no role in either reap pass (`rea
 ## Suggested direction (not yet designed)
 
 The reconstruction scan already reads each live scope's directory name and memory.max; it has no way to recover owner from cgroupfs alone since owner was never persisted outside daemon memory. A fix likely needs the launching client to write a small persisted marker (e.g. an owner file inside the scope directory, or a daemon-side sidecar record keyed by scope ID) that the restart-adoption scan can read back, rather than trying to reconstruct owner from cgroup state that never carried it. Given AIRA has no live users/compat constraints, this is a free redesign — worth sizing against architectural-simplicity before committing to a specific persistence mechanism.
+
+## Resolution (2026-09-04, backlog-remediation Phase 0, plan §2) — landed with AIRA-23
+
+One identity decision, not two tickets: AIRA-23 picks what an unclaimed owner IS,
+AIRA-52 picks where an owner LIVES, and the second constrains the first (the
+value has to be safe as a scope-directory-name component).
+
+### Where owner lives: the scope directory name
+
+The scope id gains an optional `@<owner>` suffix —
+`CONFINE-[@dr-]<name>-<pid>-<stamp>[@<owner>]` — for exactly the reason the
+delegate-RAM `@dr` marker already lives there, and which that marker's own
+comment already states: **the cgroup directory name is the only carrier that
+survives a daemon restart.** Owner used to exist solely on the in-memory
+`admitWaiter`; the restart-adoption path rebuilds aggregate reserve scalars from
+a live cgroup scan and never recreates per-job waiters, so a job whose lifetime
+spanned a restart lost its owner permanently.
+
+`@` is unambiguous as a delimiter: neither `--name` nor a caller-supplied owner
+may contain it, and the only other `@` is the fixed `@dr` marker immediately
+after the `CONFINE-` prefix, which the parser strips first. An unknown owner is
+encoded as the ABSENCE of a suffix, never as `@unknown`, so "nobody claimed this"
+can never be confused with a claim — and an id minted before this change parses
+identically.
+
+Deleted, as the plan asked: `Server.freshConfineOwner`, the
+`runner.ConfineOwnerLookup` type, `KillConfine`'s `freshOwner` parameter, and the
+registry's role as an ownership source. `ConfineRegistryEntry` is now just
+`{ScopeID}` — its only remaining job is surfacing an admitted-but-not-yet-on-disk
+scope as a Pending row. `mergeConfineRegistry` lost its conflict/agreement dance
+(two waiters claiming one scope id with different owners collapsing to
+"unknown"): one scope id can only decode to one owner by construction.
+
+The daemon's `confineScopeIDPattern` and `confineAdmitScopeName` were widened and
+taught to drop the tail respectively — both are on the admission wire path and
+would otherwise have rejected every owned scope id as non-canonical.
+
+### What an unclaimed owner is (AIRA-23)
+
+The fallback is no longer the literal `"unknown"`. It is
+`InferConfineOwner(cwd)` → `@cwd-<sanitised basename>`. AIRA-23's reported
+incident was a session about to `pgrep`-kill two SIBLING sessions' jobs, all
+showing OWNER "unknown", saved only by inspecting each process's cwd by hand — so
+cwd is precisely the discriminator `--list` was missing.
+
+**It is marked, and marked means never attested.** AIRA-23 requires the default
+not weaken the kill guard, and a bare cwd-derived identity would: two sessions in
+one directory infer the same string, so honouring it would let either kill the
+other's job with no `--steal`. So:
+
+- the inferred form carries `ConfineInferredOwnerPrefix` (`@`), which is OUTSIDE
+  the caller-supplied identity alphabet — an inferred owner is therefore
+  unforgeable, on the command line and on the wire;
+- `ConfineOwnerIsAttested` reports false for empty, `"unknown"`, and anything
+  `@`-prefixed, and the kill guard requires BOTH sides attested. An inferred
+  owner does not open the guard even against itself.
+
+Net effect on the guard: strictly unchanged. Net effect on `--list`: it now says
+where a job came from instead of "unknown".
+
+The charset was NOT widened to admit `:` (the plan's `cwd:<basename>` sketch
+offered "or an equivalent substitute"). `:` has systemd-unit-name meaning and
+would have needed a new alphabet; `@` was already reserved, already unusable in a
+caller identity, and already the scope-id marker character. A `maxConfineOwnerLen`
+of 64 was added so the worst-case directory name
+(`.aira-CONFINE-@dr-<name×100>-<pid×7>-<stamp×13>@<owner×64>`) stays well inside
+`NAME_MAX`.
+
+### Tests
+
+- `TestConfineKillOwnerSurvivesADaemonWithNoMemoryOfTheJob` — AIRA-52's
+  regression test: a scan-only scope, empty registry, no daemon memory at all
+  (exactly the post-restart state), and the owner can still kill its own job with
+  no `--steal`.
+- `TestConfineKillRefusesAnInferredOwnerWithoutSteal` — AIRA-23's safety
+  boundary: the inferred owner IS surfaced by `--list`, and does NOT open the
+  guard even for an identical caller identity.
+- `TestConfineKillTakesOwnerFromTheScopeIDNotTheRegistry` — replaces
+  `TestConfineKillUsesFreshRegistryOwnerNotListSnapshot`, whose premise (a stale
+  registry owner beaten by a fresh daemon lookup) no longer exists.
+- `TestConfineOwnerDerivationChain` extended: the chain's tail is the marked
+  inference, it is not attested, and supplying it explicitly is REFUSED.
+
+### The treatment-arm repro is still not run, and is no longer needed to justify this
+
+This ticket's own investigation ended at "confirmed latent gap, unconfirmed
+real-world impact", with the repro deliberately not run because it requires
+restarting the shared daemon at a quiet moment. That is unchanged: nothing here
+was verified against a live restart. The fix is justified exactly as the ticket
+says it should be — "fix because the code is wrong" — and the regression test
+reproduces the post-restart state (no daemon memory of the job) directly, which
+is what the mechanism actually depends on, without touching the shared daemon.
+
+`make ci`: exit 0.
+
+### Build-review (Sol, 2026-09-04) — one P0 and one P1 folded in
+
+- **P0, FIXED — admission did not bind the persisted owner to the claimed one.**
+  The daemon validated `scope_id` and `owner` independently, so a client could
+  send `scope_id=CONFINE-job-1-a@victim` with `owner=me`: admission accepted it,
+  and after the next restart the scan decoded `victim` as an ATTESTED owner
+  nobody had claimed. The inverse (a real `owner` with no tail) was accepted too
+  and silently degraded to `unknown` the moment the daemon forgot it. Making the
+  scope id the durable ownership record without binding it at the trust boundary
+  is the whole defect this ticket is about, reintroduced one layer up.
+  `validateAdmitArgs` now refuses any request whose embedded tail DISAGREES with
+  the claimed owner. The binding is deliberately **asymmetric**: a MISSING tail
+  is accepted, because it means the client persisted no claim at all — the
+  pre-AIRA-52 behaviour, where the daemon accounts the owner in memory, the job
+  reads as unowned after a restart, and the kill guard therefore demands
+  `--steal`. Refusing that case would buy no safety and would hard-break every
+  session whose installed `~/.local/bin/aira` predates this change the moment the
+  daemon restarts, with no protocol-version bump to signal it. Covered by
+  `TestValidateAdmitArgsBindsTheEmbeddedOwnerToTheClaimedOwner`, which asserts
+  both directions (three impersonating shapes refused, four legitimate shapes —
+  including the stale-client no-tail case — accepted, so it cannot pass by
+  refusing everything).
+- **P1, FIXED by DELETION — two parsers, two languages.** The daemon carried its
+  own `confineScopeIDPattern` regex restating the scope-id grammar beside
+  runner's parser, and they accepted different sets: the regex allowed a zero or
+  overflowing pid, an uppercase base-36 stamp and an unbounded owner, all of
+  which the scanner's parser rejects — so an id the daemon admitted could be
+  invisible to every scan, adoption pass and reaper. Rather than syncing them,
+  the second one is gone: `parseConfineScopeID`, `validConfineScopeID`,
+  `IsDelegateRAMScopeID` and `delegateRAMScopeIDMarker` moved from
+  `confine_manage_linux.go` into the PORTABLE `confine.go` (they are pure string
+  manipulation, exactly as `IsDelegateRAMScopeID`'s own stub comment already
+  said), an exported `runner.ParseConfineScopeID` was added, and the daemon calls
+  it. `confineScopeIDPattern`, `confineAdmitScopeName` and the
+  `IsDelegateRAMScopeID` stub are deleted. The surviving parser was also made
+  CANONICAL rather than merely permissive — the pid and stamp must round-trip
+  through `strconv.Format*` — because the regex was the STRICTER side on those
+  (`strconv.ParseInt` accepts an uppercase base-36 stamp, a sign and leading
+  zeros; `confineScopeID` can mint none of them). Unifying on the looser grammar
+  would have widened what admission accepts, so it was tightened instead.
+- **P1, FIXED — the regression tests hand-built owner-bearing ids**, so they
+  could not have caught a mint/parse disagreement.
+  `TestConfineScopeIDRoundTripsEveryOwnerForm` now exercises the production
+  `confineScopeID` -> `parseConfineScopeID` path across attested, inferred,
+  delegate-RAM, dashed-name, `@dr`-lookalike-name, unknown and empty owners, and
+  `TestConfineScopeIDRefusesAnOversizedOwnerTail` pins the NAME_MAX bound at its
+  boundary in both directions.

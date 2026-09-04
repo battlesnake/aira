@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"aira/internal/pylib"
+
 	"golang.org/x/sys/unix"
 )
 
@@ -409,7 +410,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	if request.Owner == "" {
 		request.Owner = ConfineUnknownOwner
 	}
-	if err := ValidateConfineIdentity(request.Owner); err != nil {
+	if err := ValidateConfineOwner(request.Owner); err != nil {
 		result.Status.Slice = attemptedSlice
 		return result, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --owner: %w", err)
 	}
@@ -494,7 +495,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	if request.Name == "" {
 		request.Name = "job"
 	}
-	scopeID := confineScopeID(request.Name, request.DelegateRAM)
+	scopeID := confineScopeID(request.Name, request.Owner, request.DelegateRAM)
 	request.ScopeID = scopeID
 	// Admission can legitimately block: a reserve-contended slice queues this job
 	// behind other sessions' in-flight jobs under the shared cap, and the client
@@ -961,16 +962,38 @@ func validateConfineName(name string) error {
 	return nil
 }
 
-const delegateRAMScopeIDMarker = "@dr"
-
-func confineScopeID(name string, delegateRAM bool) string {
+// confineScopeID mints the scope directory name. The owner is appended after an
+// '@' delimiter (AIRA-52) for the same reason the delegate-RAM marker lives here
+// (see IsDelegateRAMScopeID): the cgroup directory name is the ONLY carrier that
+// survives a daemon restart. Owner used to live exclusively on the in-memory
+// admitWaiter, and the daemon's restart-adoption scan rebuilds aggregate reserve
+// scalars from a live cgroup scan without recreating per-job waiters — so a job
+// whose lifetime spanned a restart lost its owner permanently and degraded to
+// "unknown", forcing an unnecessary --steal to kill your own job.
+//
+// '@' is unambiguous: neither a --name nor a caller-supplied owner may contain
+// it (validateConfineName / ValidateConfineIdentity), and the only other '@' in
+// the id is the fixed "@dr" marker immediately after the "CONFINE-" prefix,
+// which parseConfineScopeID strips before looking for this delimiter. An
+// INFERRED owner carries its own leading '@' (ConfineInferredOwnerPrefix) and
+// survives verbatim, because the split takes everything after the first
+// delimiter rather than splitting on every '@'.
+func confineScopeID(name, owner string, delegateRAM bool) string {
 	if name == "" {
 		name = "job"
 	}
+	id := "CONFINE-"
 	if delegateRAM {
-		return "CONFINE-" + delegateRAMScopeIDMarker + "-" + name + "-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+		id += delegateRAMScopeIDMarker + "-"
 	}
-	return "CONFINE-" + name + "-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	id += name + "-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	// An unknown owner is encoded as the ABSENCE of a suffix, never as
+	// "@unknown": a reader must not be able to confuse "nobody claimed this" with
+	// a claim, and an id minted before this change parses identically.
+	if owner != "" && owner != ConfineUnknownOwner && ValidateConfineOwner(owner) == nil {
+		id += "@" + owner
+	}
+	return id
 }
 
 func delegateRAMScopeFallback() int64 {

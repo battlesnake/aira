@@ -85,9 +85,28 @@ func TestConfineOwnerDerivationChain(t *testing.T) {
 	if owner, err := resolveConfineOwner(context.Background(), ""); err != nil || owner != project.WorktreeID {
 		t.Fatalf("project owner=%q want=%q err=%v", owner, project.WorktreeID, err)
 	}
-	t.Chdir(t.TempDir())
-	if owner, err := resolveConfineOwner(context.Background(), ""); err != nil || owner != runner.ConfineUnknownOwner {
-		t.Fatalf("unknown owner=%q err=%v", owner, err)
+	// AIRA-23: the tail of the chain is no longer the literal "unknown". With no
+	// flag, no environment and no discoverable project, the owner is INFERRED
+	// from the launch directory — marked, so the kill guard still treats it as
+	// unattested, but printed by --list instead of the useless "unknown" that let
+	// one session nearly kill two siblings' jobs.
+	last := t.TempDir()
+	t.Chdir(last)
+	inferred, err := resolveConfineOwner(context.Background(), "")
+	if err != nil {
+		t.Fatalf("inferred owner err=%v", err)
+	}
+	if inferred != runner.InferConfineOwner(last) || !strings.HasPrefix(inferred, runner.ConfineInferredOwnerPrefix) {
+		t.Fatalf("owner=%q want the marked inference for %q", inferred, last)
+	}
+	if runner.ConfineOwnerIsAttested(inferred) {
+		t.Fatalf("inferred owner %q must never be attested", inferred)
+	}
+	// A caller can never SUPPLY the inferred form: '@' is outside the identity
+	// alphabet, so an inferred owner cannot be forged into an attested one, on
+	// the command line or on the wire.
+	if _, err := resolveConfineOwner(context.Background(), inferred); err == nil {
+		t.Fatalf("explicit owner %q was accepted; the inferred marker is forgeable", inferred)
 	}
 	if _, err := resolveConfineOwner(context.Background(), "bad/owner"); err == nil {
 		t.Fatal("invalid explicit owner accepted")
@@ -193,9 +212,9 @@ func TestConfineDaemonDownRequiresSteal(t *testing.T) {
 		return daemon.ResponseFrame{}, &daemon.RequestNotSentError{Err: errors.New(daemon.CodeUnavailable + ": down")}
 	}
 	d.resolveConfineSlice = func(string) (string, string, error) { return "aira.slice", filepath.Join("/unused", "slice"), nil }
-	d.killConfine = func(_ context.Context, _ string, selector, caller string, steal bool, _ []runner.ConfineRegistryEntry, fresh runner.ConfineOwnerLookup) (runner.ConfineKillResult, error) {
-		if selector != "job" || caller != "session-a" || fresh != nil {
-			t.Fatalf("selector=%q caller=%q fresh=%v", selector, caller, fresh != nil)
+	d.killConfine = func(_ context.Context, _ string, selector, caller string, steal bool, _ []runner.ConfineRegistryEntry) (runner.ConfineKillResult, error) {
+		if selector != "job" || caller != "session-a" {
+			t.Fatalf("selector=%q caller=%q", selector, caller)
 		}
 		if !steal {
 			return runner.ConfineKillResult{}, errors.New(runner.CodeConfineOwnerUnverified + ": daemon down")

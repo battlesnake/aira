@@ -3,8 +3,10 @@ package runner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -208,6 +210,20 @@ type ConfineRequest struct {
 
 const ConfineUnknownOwner = "unknown"
 
+// ConfineInferredOwnerPrefix marks an owner AIRA derived for a caller that
+// supplied none, rather than one the caller attested to (AIRA-23). '@' can never
+// appear in a caller-supplied identity — ValidateConfineIdentity's alphabet
+// excludes it — so an inferred owner cannot be forged into an attested one, and
+// the two are distinguishable forever, including after a daemon restart.
+const ConfineInferredOwnerPrefix = "@"
+
+// maxConfineOwnerLen bounds the owner component so that the worst-case scope
+// DIRECTORY name — ".aira-CONFINE-@dr-<name(100)>-<pid(7)>-<stamp(13)>@<owner>"
+// — stays comfortably inside NAME_MAX (255). Names keep the wider 100-character
+// identity bound because parseConfineScopeID must still accept every name ever
+// minted; only the owner half is newly embedded, so only it is newly bounded.
+const maxConfineOwnerLen = 64
+
 // ValidateConfineIdentity applies the deliberately small scope-id component
 // alphabet to cooperative owner identities. It prevents control characters or
 // path-shaped values from crossing the CLI/admission boundary; it is not an
@@ -226,6 +242,68 @@ func ValidateConfineIdentity(value string) error {
 		return errors.New("identity requires letters, digits, '.', '_', or '-'")
 	}
 	return nil
+}
+
+// ValidateConfineOwner accepts BOTH owner forms — an attested identity, and an
+// inferred one carrying ConfineInferredOwnerPrefix — under the tighter length
+// bound an owner needs to be safe as a scope-directory-name component.
+//
+// Callers validating a CALLER-SUPPLIED owner (--owner, AIRA_CONFINE_OWNER, a
+// discovered worktree id) must keep using ValidateConfineIdentity, whose
+// alphabet excludes '@': that is what makes an inferred owner unforgeable.
+// This one is for a value that may already have been inferred — the management
+// verbs' caller identity, and the owner decoded back out of a scope id.
+func ValidateConfineOwner(value string) error {
+	if err := ValidateConfineIdentity(strings.TrimPrefix(value, ConfineInferredOwnerPrefix)); err != nil {
+		return err
+	}
+	if len(value) > maxConfineOwnerLen {
+		return fmt.Errorf("owner is too long (max %d)", maxConfineOwnerLen)
+	}
+	return nil
+}
+
+// InferConfineOwner derives a stable, launch-site-distinguishing owner for a
+// caller that supplied neither --owner, AIRA_CONFINE_OWNER, nor a discoverable
+// project worktree (AIRA-23). The reported hazard was a session about to
+// pgrep-kill two SIBLING sessions' jobs, all showing OWNER "unknown", and being
+// saved only by inspecting each process's cwd by hand — so cwd is exactly the
+// discriminator that mattered, and printing it beats printing "unknown".
+//
+// It is deliberately PREFIXED and therefore never attested: see
+// ConfineOwnerIsAttested. Two sessions sharing one directory infer the same
+// value, so treating an inferred owner as proof of ownership would let one kill
+// the other's job without --steal — the weakening AIRA-23 explicitly forbids.
+// Returns ConfineUnknownOwner when the cwd yields nothing usable, because a
+// fabricated identity is worse than an honest unknown.
+func InferConfineOwner(cwd string) string {
+	base := filepath.Base(strings.TrimSpace(cwd))
+	var sanitized strings.Builder
+	for _, r := range base {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("_.-", r) {
+			sanitized.WriteRune(r)
+			continue
+		}
+		sanitized.WriteRune('-')
+	}
+	value := strings.Trim(sanitized.String(), "-.")
+	if value == "" || value == "unknown" {
+		return ConfineUnknownOwner
+	}
+	inferred := ConfineInferredOwnerPrefix + "cwd-" + value
+	if len(inferred) > maxConfineOwnerLen {
+		inferred = inferred[:maxConfineOwnerLen]
+	}
+	return inferred
+}
+
+// ConfineOwnerIsAttested reports whether owner is an identity its holder
+// actually claimed, and is therefore usable as the kill guard's ownership
+// proof. An empty owner, the literal "unknown", and any inferred owner are all
+// unattested: the caller must pass --steal to kill such a job.
+func ConfineOwnerIsAttested(owner string) bool {
+	owner = strings.TrimSpace(owner)
+	return owner != "" && owner != ConfineUnknownOwner && !strings.HasPrefix(owner, ConfineInferredOwnerPrefix)
 }
 
 type ConfineResult struct {
@@ -324,4 +402,87 @@ func FormatConfineStatus(status ConfineStatus) string {
 		}
 	}
 	return line
+}
+
+// delegateRAMScopeIDMarker, the scope-id parser and its helpers live in this
+// PORTABLE file, not in confine_linux.go, because they are pure string
+// manipulation over a value that crosses the daemon boundary. Keeping them
+// Linux-only forced internal/daemon to carry a SECOND, regex-shaped definition
+// of the same grammar, and the two accepted different languages — an id the
+// daemon admitted could then be invisible to every scan (build-review, Sol).
+// One parser, one language.
+const delegateRAMScopeIDMarker = "@dr"
+
+// ParseConfineScopeID is the exported form for internal/daemon, which must
+// validate an id a client supplied and bind its embedded name and owner to the
+// separately-supplied ones. It never returns a partially-decoded id: ok=false
+// means every other result is meaningless.
+func ParseConfineScopeID(scopeID string) (name string, pid int, stamp int64, owner string, ok bool) {
+	return parseConfineScopeID(scopeID)
+}
+
+func validConfineScopeID(scopeID string) bool {
+	_, _, _, _, ok := parseConfineScopeID(scopeID)
+	return ok
+}
+
+// parseConfineScopeID decomposes a scope id into name, supervisor pid, launch
+// stamp and — since AIRA-52 — the launching owner, which is the empty string for
+// an id minted with no owner (an id from before the suffix existed parses
+// identically, which is why the encoding is an optional suffix rather than a
+// new mandatory field).
+func parseConfineScopeID(scopeID string) (string, int, int64, string, bool) {
+	if !strings.HasPrefix(scopeID, "CONFINE-") || strings.Contains(scopeID, "/") {
+		return "", 0, 0, "", false
+	}
+	rest := strings.TrimPrefix(scopeID, "CONFINE-")
+	if strings.HasPrefix(rest, delegateRAMScopeIDMarker+"-") {
+		rest = strings.TrimPrefix(rest, delegateRAMScopeIDMarker+"-")
+	}
+	// Split at the FIRST remaining '@', keeping the remainder verbatim: an
+	// inferred owner starts with its own '@' (ConfineInferredOwnerPrefix) and
+	// must survive intact. The "@dr" marker was already stripped above, so this
+	// delimiter is unambiguous — neither a name nor an owner may contain '@'.
+	owner := ""
+	if at := strings.IndexByte(rest, '@'); at >= 0 {
+		owner = rest[at+1:]
+		rest = rest[:at]
+		if ValidateConfineOwner(owner) != nil {
+			return "", 0, 0, "", false
+		}
+	}
+	last := strings.LastIndexByte(rest, '-')
+	if last <= 0 || last == len(rest)-1 {
+		return "", 0, 0, "", false
+	}
+	// CANONICAL round-trip, not merely parseable: strconv.ParseInt accepts an
+	// uppercase base-36 stamp, a sign and leading zeros, none of which
+	// confineScopeID can ever mint. Requiring the text to be exactly what
+	// FormatInt would produce keeps this the single, canonical grammar, so the
+	// daemon's admission check and this scanner cannot disagree about an id
+	// (build-review, Sol: they previously did, in both directions).
+	stampText := rest[last+1:]
+	stamp, err := strconv.ParseInt(stampText, 36, 64)
+	if err != nil || stamp <= 0 || strconv.FormatInt(stamp, 36) != stampText {
+		return "", 0, 0, "", false
+	}
+	rest = rest[:last]
+	last = strings.LastIndexByte(rest, '-')
+	if last <= 0 || last == len(rest)-1 {
+		return "", 0, 0, "", false
+	}
+	name := rest[:last]
+	pidText := rest[last+1:]
+	pid64, err := strconv.ParseInt(pidText, 10, 32)
+	if err != nil || pid64 <= 0 || strconv.FormatInt(pid64, 10) != pidText || ValidateConfineIdentity(name) != nil {
+		return "", 0, 0, "", false
+	}
+	return name, int(pid64), stamp, owner, true
+}
+
+// IsDelegateRAMScopeID reports the restart-surviving cap type carrier. The
+// marker uses '@', which cannot occur in a user-supplied confine name, so it is
+// unambiguous even though names themselves may contain '-'.
+func IsDelegateRAMScopeID(scopeID string) bool {
+	return strings.HasPrefix(scopeID, "CONFINE-"+delegateRAMScopeIDMarker+"-")
 }

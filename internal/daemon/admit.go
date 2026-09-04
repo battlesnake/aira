@@ -11,7 +11,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -238,8 +237,6 @@ type admitRequest struct {
 	owner       string
 	delegateRAM bool
 }
-
-var confineScopeIDPattern = regexp.MustCompile(`^CONFINE-(?:@dr-)?[A-Za-z0-9._-]+-[0-9]+-[0-9a-z]+$`)
 
 type admitRejection struct {
 	Required int64  `json:"required,omitempty"`
@@ -1372,38 +1369,47 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 		scopeText, scopeOK := scopeID.(string)
 		nameText, nameOK := name.(string)
 		ownerText, ownerOK := owner.(string)
-		if !scopeOK || !confineScopeIDPattern.MatchString(scopeText) {
+		// ONE parser, runner's own, rather than a regex restating the grammar
+		// beside it: the two drifted apart (build-review, Sol) and a scope id the
+		// regex admitted but the scanner's parser rejected was admitted and then
+		// invisible to every scan, adoption pass and reaper.
+		embeddedName, _, _, embeddedOwner, parsed := runner.ParseConfineScopeID(scopeText)
+		if !scopeOK || !parsed {
 			return admitRequest{}, fmt.Errorf("%s: admit scope_id is not canonical", CodeProtocol)
 		}
 		if !nameOK || runner.ValidateConfineIdentity(nameText) != nil {
 			return admitRequest{}, fmt.Errorf("%s: admit name is invalid", CodeProtocol)
 		}
-		if embedded, valid := confineAdmitScopeName(scopeText); !valid || embedded != nameText {
+		if embeddedName != nameText {
 			return admitRequest{}, fmt.Errorf("%s: admit name does not match scope_id", CodeProtocol)
 		}
-		if !ownerOK || runner.ValidateConfineIdentity(ownerText) != nil {
+		if !ownerOK || runner.ValidateConfineOwner(ownerText) != nil {
 			return admitRequest{}, fmt.Errorf("%s: admit owner is invalid", CodeProtocol)
+		}
+		// BIND a persisted owner to the claimed one (AIRA-52 hardening,
+		// build-review, Sol). The scope id is the durable ownership record, so an
+		// unbound pair would let a client persist one owner while the daemon
+		// accounted another — "scope_id=...@victim" with "owner=me" — and after a
+		// restart the scan would read victim as an ATTESTED owner nobody claimed.
+		//
+		// ASYMMETRIC on purpose. A tail that DISAGREES with the claim is
+		// impersonation and is refused. A MISSING tail is not: it means the client
+		// persisted no claim at all, which is exactly the pre-AIRA-52 behaviour —
+		// the daemon accounts the owner in memory and the job reads as unowned
+		// after a restart, so the kill guard demands --steal. Refusing that case
+		// too would buy no safety and would hard-break every session whose
+		// installed binary predates this change the moment the daemon restarts,
+		// with no protocol-version bump to signal it.
+		expectedOwner := ownerText
+		if expectedOwner == runner.ConfineUnknownOwner {
+			expectedOwner = ""
+		}
+		if embeddedOwner != "" && embeddedOwner != expectedOwner {
+			return admitRequest{}, fmt.Errorf("%s: admit owner does not match scope_id", CodeProtocol)
 		}
 		return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM, scopeID: scopeText, name: nameText, owner: ownerText}, nil
 	}
 	return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM}, nil
-}
-
-func confineAdmitScopeName(scopeID string) (string, bool) {
-	rest := strings.TrimPrefix(scopeID, "CONFINE-")
-	if strings.HasPrefix(rest, "@dr-") {
-		rest = strings.TrimPrefix(rest, "@dr-")
-	}
-	last := strings.LastIndexByte(rest, '-')
-	if last <= 0 {
-		return "", false
-	}
-	rest = rest[:last]
-	last = strings.LastIndexByte(rest, '-')
-	if last <= 0 {
-		return "", false
-	}
-	return rest[:last], true
 }
 
 func exactAdmitInt64(value any) (int64, bool) {

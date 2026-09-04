@@ -45,7 +45,7 @@ type daemonDispatcher struct {
 	afterRelayWiring    func(storeRunner, supervisorLeaseReader bool)
 	resolveConfineSlice func(string) (string, string, error)
 	listConfines        func(context.Context, string, []runner.ConfineRegistryEntry) (runner.ConfineListResult, error)
-	killConfine         func(context.Context, string, string, string, bool, []runner.ConfineRegistryEntry, runner.ConfineOwnerLookup) (runner.ConfineKillResult, error)
+	killConfine         func(context.Context, string, string, string, bool, []runner.ConfineRegistryEntry) (runner.ConfineKillResult, error)
 }
 
 type childResult struct {
@@ -157,7 +157,7 @@ func (d *daemonDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeSc
 
 func (d *daemonDispatcher) dispatchConfineManagement(ctx context.Context, request core.Request) core.Response {
 	owner, _ := request.Args["owner"].(string)
-	if err := runner.ValidateConfineIdentity(owner); err != nil {
+	if err := runner.ValidateConfineOwner(owner); err != nil {
 		return confineClientError(fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: owner: %w", err))
 	}
 	frame := daemon.RequestFrame{Proto: daemon.ProtocolVersion, Scope: daemon.WorktreeScope{}, Request: request}
@@ -198,7 +198,7 @@ func (d *daemonDispatcher) dispatchConfineManagement(ctx context.Context, reques
 	if kill == nil {
 		kill = runner.KillConfine
 	}
-	result, killErr := kill(ctx, path, selector, owner, steal, registry, nil)
+	result, killErr := kill(ctx, path, selector, owner, steal, registry)
 	if killErr != nil {
 		return confineClientError(killErr)
 	}
