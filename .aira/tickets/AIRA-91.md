@@ -553,3 +553,24 @@ apparently didn't hit sufficient system-wide memory pressure, which is
 exactly what the theory predicts sometimes happens, not a counter-example
 to it. `pipeline` (the actual falsification target) is still running,
 82%+ with no truncation signs yet as of this update.
+
+**`pipeline` re-run: falsifiable prediction HELD, root cause fully confirmed
+(qual, same night).** `REAL_EXIT_CODE=137`, trailer shows
+`scope-integrity=migrated` (the exact whole-scope-kill signature), and the
+`systemd-oomd` journal shows a direct match within seconds of the last
+progress byte:
+```
+systemd-oomd: Killed .../aira.slice/.aira-CONFINE-@dr-job-2438729-.../ due
+to memory pressure for /user.slice/user-1000.slice being 72.96% > 40.00%
+for > 10s with reclaim activity
+```
+`job-2438729` is `pipeline`'s exact outer confine PID -- not a coincidental
+correlation, a direct match, on a THIRD disjoint dependency profile
+(fastapi/numpy/scikit-rf, vs. `hosted`'s uvicorn/pyjwt/scikit-fem/stripe and
+`services`'s httpx/prometheus/stripe). Combined with `hosted`'s earlier
+direct match and `services`'s clean (contention-dependent) negative, this is
+as strong a confirmation as this investigation is going to get without
+manufacturing artificial load. **Root cause is closed: `systemd-oomd`
+whole-scope kill under real memory pressure, exit 137, never exit 0.**
+
+## Status: root cause closed. Remaining work is Part A (build) and Part B (owner decision) above.
