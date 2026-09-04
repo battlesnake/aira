@@ -170,10 +170,16 @@ claimed.**
 Also ruled out: **no Go-side vector produces exit status 0 mid-run** — every
 termination path is signal-derived (`waitConfineCommand`,
 `internal/runner/confine_linux.go:1346-1361`, returns `128+signal`). And the
-memory watchdog cannot target aitest at all: it excludes any cgroup path
-containing a `.aira-` component at both selection and re-validation
-(`internal/daemon/watchdog.go:344`, `:553`, `:600-607`) and separately requires an
-uncapped ancestry, which a confine scope never has.
+memory watchdog cannot target aitest at all: it requires an uncapped ancestry,
+which a confine scope never has (`internal/daemon/watchdog.go:344`, `:553`).
+[CORRECTED 2026-09-05 by AIRA-16 first half: this originally also cited a
+blanket `.aira-`-component exemption at selection and re-validation
+(`watchdog.go:600-607`, `hasAIRAComponent`). That exemption is DELETED —
+capping is now the only exemption. The conclusion is unchanged and rests
+entirely on the ancestry clause, which still holds: a confine scope always has
+a finite `memory.max` ancestor. Noted here because AIRA-91 Part B is the owner
+decision AIRA-16's second half was deferred to, so this ticket must not
+describe the watchdog's predicate as it no longer is.]
 
 ### Severity: confirmed NOT cosmetic — and worse than "data incomplete"
 

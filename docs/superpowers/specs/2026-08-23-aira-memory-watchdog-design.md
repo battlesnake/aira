@@ -106,25 +106,41 @@ A candidate is killed only if it satisfies EVERY one of:
    the finite-ancestor test is the whole predicate.** The `AND no /.aira-
    component` conjunct was an extra exemption resting on an assumption AIRA-15
    disproved: that every AIRA-created scope is self-capped. It is not. `aira run`
-   creates `.aira-<id>` scopes in the caller's ambient cgroup with **no
-   finite-cap precondition** (`runner_linux.go:966`; `--memory-max` is optional),
-   and confine's non-delegate unpinned-reserve fallback is *deliberately* left
-   uncapped (`confine_linux.go:662`). So a heavy agent runaway in an uncapped
-   AIRA scope was **blanket-exempt from the killer**, which is the opposite of
-   the intent. Post-amendment, capping is the ONLY exemption and it is decided
-   solely by the ancestry walk, so nothing above changes for a scope that IS
-   bounded: an `aira confine` job under `aira.slice` (a finite cap is a launch
-   precondition, `confine_linux.go:1476`) and aitest's deliberately-uncapped
-   `.aira-supervisor` / `.aira-worker-*` children of a capped outer scope
-   (`worker_admit.go:74`) all still classify capped, via the finite ancestor —
-   never via their name. The v1 warning above stands unchanged and is in fact
-   the same rule read the other way: cgroup NAMES never decide this predicate,
-   in either direction. The **second** half of AIRA-16 (a slice-internal
-   pressure trigger, so the watchdog is not blind to an `aira.slice`-internal
-   OOM while the host still has headroom) is NOT built by this amendment: it is
-   deferred to the AIRA-91 Part B owner decision — who kills what under
-   slice-internal pressure, `systemd-oomd` or this watchdog — since building one
-   answer here would pre-empt that decision.
+   creates `.aira-<id>` scopes by joining the name onto the CALLER'S ambient
+   cgroup, with **no finite-cap precondition anywhere** (`runner_linux.go:966`;
+   `--memory-max` is optional). Run from inside a confine job — the normal path —
+   such a scope inherits that job's finite ancestor and stays exempt; run from a
+   bare shell under an uncapped `user.slice` it is genuinely uncapped, and a
+   heavy agent runaway inside it was **blanket-exempt from the killer**, which is
+   the opposite of the intent. Post-amendment, capping is the ONLY exemption and
+   it is decided solely by the ancestry walk, so nothing changes for a scope
+   that IS bounded: an `aira confine` job under `aira.slice` (a finite ancestor
+   cap is a launch precondition — the parent refuses to launch without one,
+   `confine_linux.go:442-451`, and the child re-checks before exec, `:1476`),
+   confine's non-delegate unpinned-reserve fallback (deliberately uncapped at
+   the SCOPE level, `confine_linux.go:662`, but still bounded by `aira.slice`,
+   so it was exempt for the right reason before this amendment and stays exempt
+   after it), and aitest's deliberately-uncapped `.aira-supervisor` /
+   `.aira-worker-*` children of a capped outer scope (`worker_admit.go:74`) all
+   still classify capped, via the finite ancestor — never via their name. The v1
+   warning above stands unchanged and is in fact the same rule read the other
+   way: cgroup NAMES never decide this predicate, in either direction.
+
+   **Accepted residual, recorded not silently dropped (build-review).** One
+   thing genuinely lost protection: a LIVE confine job whose `aira.slice`
+   `memory.max` transiently reads `max` — slice re-creation after systemd GC, or
+   a unit reload that drops `MemoryMax`. Confine checks the cap once at launch;
+   the watchdog re-reads it every sample, so in that window the job classifies
+   uncapped and is a valid victim if MemAvailable is simultaneously under the
+   trip threshold for K=3. Accepted rather than fixed: the only fix is a
+   name-based exemption, which is the bug this amendment removes. It is also the
+   honest outcome — during that window the job really is unbounded.
+
+   The **second** half of AIRA-16 (a slice-internal pressure trigger, so the
+   watchdog is not blind to an `aira.slice`-internal OOM while the host still has
+   headroom) is NOT built by this amendment: it is deferred to the AIRA-91 Part B
+   owner decision — who kills what under slice-internal pressure, `systemd-oomd`
+   or this watchdog — since building one answer here would pre-empt that decision.
 2. **Agent-attributable** — it is a BFS descendant of a process whose `comm=="claude"`
    (exact match on `/proc/<pid>/status` `Name:`), EXCLUDING the claude procs
    themselves. This is the blast-radius guard: a browser/IDE/user-session process is

@@ -673,17 +673,53 @@ func TestClassifyWatchdogCgroupAIRAScopeCapsOnly(t *testing.T) {
 			}
 		})
 	}
-	// A cap that cannot be READ is unevaluated, never "uncapped": a killer must
-	// fail closed. Unreadable is distinct from absent (absent = no cap at this
-	// level, keep walking).
-	unreadable := filepath.Join(root, uncappedScope, "memory.max")
-	if err := os.WriteFile(unreadable, []byte("not-a-number\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cgroup, ok, reason := classifyWatchdogCgroup(root, "/"+uncappedScope)
-	if ok || cgroup.uncapped || reason != "memory-max-unevaluated" {
-		t.Fatalf("cgroup=%+v ok=%v reason=%q want unevaluated and NOT uncapped", cgroup, ok, reason)
-	}
+	// A cap that cannot be established is unevaluated, never "uncapped": a
+	// killer must fail closed. The ancestry walk has TWO such branches and this
+	// change makes the walk the SOLE determinant of `uncapped`, so both are
+	// load-bearing and both are covered here. Neither is the same as ABSENT —
+	// an absent memory.max means "no cap at this level", and the walk continues.
+	t.Run("unparseable memory.max is unevaluated", func(t *testing.T) {
+		scope := filepath.Join("aira.slice", ".aira-CONFINE-unparseable.scope")
+		if err := os.MkdirAll(filepath.Join(root, scope), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, scope, "memory.max"), []byte("not-a-number\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cgroup, ok, reason := classifyWatchdogCgroup(root, "/"+scope)
+		if ok || cgroup.uncapped || reason != "memory-max-unevaluated" {
+			t.Fatalf("cgroup=%+v ok=%v reason=%q want unevaluated and NOT uncapped", cgroup, ok, reason)
+		}
+	})
+	// The read-error branch, distinct from the parse branch above: a permission
+	// or IO failure on an ANCESTOR's memory.max must abort to unevaluated, NOT
+	// be treated as absent-and-keep-walking. Treating it as absent is fail-OPEN
+	// — the walk would run past a finite ancestor cap and report genuinely
+	// bounded work as uncapped, i.e. a false kill of a confined job.
+	t.Run("unreadable ancestor memory.max is unevaluated", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses the permission bits this subtest relies on")
+		}
+		scope := filepath.Join("aira.slice", ".aira-CONFINE-unreadable.scope")
+		ancestor := filepath.Join(root, "aira.slice", "memory.max")
+		if err := os.MkdirAll(filepath.Join(root, scope), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// The ancestor carries a FINITE cap: if the read error were swallowed as
+		// "absent", the leaf would classify uncapped and the assertion below
+		// would catch exactly that fail-open.
+		if err := os.WriteFile(ancestor, []byte("4096\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(ancestor, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(ancestor, 0o644) })
+		cgroup, ok, reason := classifyWatchdogCgroup(root, "/"+scope)
+		if ok || cgroup.uncapped || reason != "memory-max-unevaluated" {
+			t.Fatalf("cgroup=%+v ok=%v reason=%q want unevaluated and NOT uncapped", cgroup, ok, reason)
+		}
+	})
 }
 
 func TestSelectOffenderBiggestRSSWithPIDAscendingTieBreakAndCriticalProtection(t *testing.T) {

@@ -701,6 +701,13 @@ func snapshotWatchdogProcs(mount string, mountErr error) (map[int]watchdogProc, 
 		if !ok {
 			continue
 		}
+		// The ok flag is deliberately discarded: an unresolved cgroup must not
+		// drop the process from the snapshot (it is still an ancestor others are
+		// attributed through). Discarding it is safe ONLY because every not-ok
+		// return path in watchdogCgroupForPID and classifyWatchdogCgroup leaves
+		// `uncapped` at its zero value, so an unresolved cgroup can never satisfy
+		// the Uncapped predicate. That invariant is load-bearing — a killer fails
+		// closed — and is pinned by the classifier's own unevaluated tests.
 		cgroup, _, _ := watchdogCgroupForPID(pid, mount, mountErr)
 		procs[pid] = watchdogProc{pid: pid, ppid: ppid, comm: comm, rss: rss, startTime: start, cgroup: cgroup}
 	}
