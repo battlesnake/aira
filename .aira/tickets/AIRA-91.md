@@ -365,3 +365,22 @@ Full capture logs (qual's machine): `~/tmp/aira91-instrumented-hosted.log`,
 (wchan/ps snapshots from the healthy-progress period beforehand, for
 contrast — the process was genuinely computing right up to the kill, not
 stuck/wedged).
+
+**Follow-up (qual, same night): every prior "exit 0" this ticket was built on
+was an INFERENCE, never a direct capture.** Audited on request: one earlier
+"0" was the exit status of a backgrounded shell job (`... &`), not a `$?`
+captured inside the confine scope; every other "0" came from
+`merge_gate.sh`'s own `run_suite()` bookkeeping (`rc=$?` after `eval "$cmd"`),
+which qual trusted but never independently re-verified end-to-end — and
+their own AIRA-91 completeness guard doesn't even look at `rc` for the
+truncation signature, only log content (absence of the summary line). **Zero
+verified "genuine exit 0" data points exist from tonight** — every one went
+through at least one un-independently-verified intermediary layer. This
+substantially strengthens the measurement-artifact reading above: it is now
+plausible every AIRA-91 incident tonight has actually been this same
+systemd-oomd/exit-137 mechanism, and the "silent exit 0" framing that this
+entire ticket was filed and investigated under may itself have been
+imprecise from the very first report. qual has offered to re-run one or more
+of the OLDER pinned legs (`services`/`pipeline`) with the same direct-capture
+instrumentation to check whether they also come back 137 — worth taking up
+if it would meaningfully generalize the finding beyond `hosted` alone.
