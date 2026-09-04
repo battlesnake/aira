@@ -32,4 +32,24 @@ So the mechanism runs the OPPOSITE direction from the original hypothesis: there
 4. **New, correct architectural candidate (speed): anti-affinity dispatch.** Make aitest's dispatch actively *spread* collection-order-adjacent (i.e. same-module) tests across different workers — the opposite of loadscope, restoring xdist `load`'s actual spreading behavior rather than accidentally undermining it. Would restore pre-#1124 behavior without requiring every leak to be found and fixed first. Real engineering; the exact mechanism by which the current flat FIFO clusters more than xdist `load` still needs pinning down precisely before this can be designed properly.
 5. **Flaky-quarantine**: fastest-ee-side only, does not fix the underlying signal-reliability problem and delays the real fix — explicitly flagged by speed as an unwanted default.
 
-Still pending: qual's controlled fixed-commit experiment to confirm the trigger (both prior observations were cross-commit, so the exact causal link isn't fully pinned yet). No AIRA-side investigation beyond source reading has been done — this ticket exists so the finding is not lost, not as a resolved diagnosis.
+**Closed out for tonight (qual + speed, same night).** qual found the actual
+evidence rather than re-running a fresh experiment: a 2026-07-09 overnight
+stress-harness run (`~/tmp/overnight-stress-logs/`) already caught genuine
+co-location-dependent failures, in a `device_db`-resolution-adjacent module
+cluster — a shared mutable `device_db` cache not resetting between
+co-located tests. qual's own clean small-scale reruns (the 6 tonight-flaky +
+7 historical cases, all pass in isolation) suggest the leak only manifests
+at full-suite scale, not in a small targeted rerun. Joint decision: don't
+burn a dedicated full-leg experiment just to reconfirm live-ness — the bug
+class is already confirmed real, and NF-35's relocation rail will recreate
+full-scale co-location pressure regardless, so mitigation is needed either
+way. Capture variance opportunistically whenever a full leg runs for other
+reasons instead.
+
+**Disposition, agreed by both peers:** option 1 (root fix — reset the shared
+`device_db` cache; test-owner turf, not AIRA's) is primary. The anti-affinity
+dispatch idea stays the right AIRA-side complement *if* a tooling mitigation
+is ever wanted, but only once the exact FIFO-vs-xdist-`load` clustering
+mechanism is actually pinned down (still open, not done). loadscope-style
+grouping stays retracted. No urgency — this remains a prerequisite for the
+relocation rail, which is itself behind other work on speed's side.
