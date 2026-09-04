@@ -266,13 +266,40 @@ warm-imported supervisor (the entire point being COW-shared interpreter
 state), and Python's stdlib has no `clone3`/`CLONE_INTO_CGROUP` binding —
 that mechanism is Go `os/exec`-only. The forked child instead calls
 `place_self()` (a plain `cgroup.procs` write) immediately after `fork()`
-returns, before any test code runs. This leaves a narrow, bounded window —
-pure interpreter overhead, ending before any test-driven allocation, and
-still contained by the *outer* scope's hierarchical cap throughout — where
-the child is transiently a member of the supervisor's scope rather than its
-own. Accepted for Slice 1 (architectural-simplicity: a raw ctypes clone3
-syscall to close a sub-millisecond, already-bounded gap is not worth the
-added risk); documented here rather than left implicit.
+returns, before any test code runs. This leaves a narrow, bounded window
+where the child is transiently a member of the supervisor's scope rather
+than its own.
+
+**Corrected 2026-09-05 (AIRA-37): that window is *not* "pure interpreter
+overhead", as this section previously claimed.** CPython's `os.fork()` runs
+`PyOS_AfterFork_Child()` — and so every handler registered via
+`os.register_at_fork(after_in_child=...)` — in the child *before* `fork()`
+returns to Python, so such handlers execute inside the window, unplaced.
+They demonstrably exist on real runs: `logging`, `threading` and `random`
+register handlers at import and pytest imports all three, and AIRA's own
+`aira_xdist_governor` registers one at module scope (which is exactly how
+forked aitest workers disable that governor, AIRA-92). aitest itself
+registers none. The window's real bounds are the two that survive: it still
+ends before any *test* code runs, so no test-driven allocation happens in
+it, and the **outer** scope's hierarchical cap still charges everything that
+does allocate — what is briefly coarser is the granularity of containment,
+not containment itself. *Outer* is precise, not loose: the unplaced child
+sits in `.aira-supervisor`, which is deliberately given no `memory.max` of
+its own, so the bound comes from the outer confine scope one level up, whose
+finite `memory.max` is a hard precondition of the grant (`worker-admit`
+refuses with `outer-scope-unbounded` otherwise) rather than an assumption.
+The sharper hazard is fork-across-threads locking (a handler blocking on a
+lock another thread held at fork time), bounded but not eliminated by the
+supervisor being single-threaded.
+
+Still accepted for Slice 1 (architectural-simplicity: a raw ctypes `clone3`
+syscall would place atomically but would skip `PyOS_AfterFork_Child`, and
+therefore the stdlib's own child-side lock reinitialisation, unless it
+re-invoked it by hand — more machinery and a larger hazard, not a smaller
+one); documented here rather than left implicit. `worker.py`'s `fork_worker`
+docstring carries the full audit, and
+`test_atfork_after_in_child_handlers_run_before_fork_returns` pins the
+ordering.
 
 ### 3.4 Worker lifecycle and recycling
 

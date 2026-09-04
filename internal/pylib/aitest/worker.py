@@ -281,16 +281,72 @@ def fork_worker(scope_path):
     real added complexity and risk for what this buys). So there IS a brief
     window, between fork() returning in the child and place_self()
     completing, where the child is still a member of the SUPERVISOR's scope,
-    not its own worker scope. Two things bound the actual risk to
-    negligible: (1) this window is pure interpreter overhead (a syscall
-    return, an open(), a write()) -- it ends before any test code runs, so
-    no test-driven allocation can happen inside it; (2) cgroup memory.max is
-    hierarchical, so the child's usage during that window still counts
-    against the OUTER scope's cap, not an unbounded cgroup. Accepted for
-    Slice 1 as an architecturally-simpler choice than a raw-syscall
-    workaround for a race this narrow (architectural-simplicity: no new
-    machinery for a bounded, sub-millisecond gap) -- but call it out plainly
-    in plan-review rather than have it read as an oversight.
+    not its own worker scope.
+
+    RETRACTED (AIRA-37), not softened: an earlier version of this docstring
+    called that window "pure interpreter overhead (a syscall return, an
+    open(), a write())", i.e. claimed no arbitrary code can run in it. That
+    is false. CPython's os.fork() calls PyOS_AfterFork_Child() -- which runs
+    every handler registered via os.register_at_fork(after_in_child=...) --
+    BEFORE fork() returns to Python, so those handlers execute inside this
+    window, in the child, while it is still unplaced. Verified directly on
+    this host (CPython 3.12.3): a handler registered before the fork
+    observes itself running ahead of os.fork()'s return. That ordering is
+    pinned, by name rather than by line number, in test_worker.py's
+    test_atfork_after_in_child_handlers_run_before_fork_returns
+    -- so this docstring cannot quietly rot back to the old claim.
+
+    Who actually registers such a handler (the audit AIRA-37 asked for --
+    answered with real registrants, not a "shouldn't happen" assurance):
+      - aitest itself: NONE. os.register_at_fork appears exactly once in
+        AIRA's Python, and not in this package.
+      - That one site is AIRA's OWN sibling plugin,
+        aira_xdist_governor/__init__.py (module scope, so it arms on
+        import), and it is not hypothetical here: forked aitest workers
+        permanently disabling that governor via its after_in_child handler
+        is established behaviour (AIRA-92), and core/skill.go tells projects
+        adopting aitest to stop registering it or pass
+        `-p no:aira_xdist_governor` precisely because both plugins can live
+        in one interpreter. So on a real co-registered run, third-party-
+        shaped code DOES run in this window today.
+      - The stdlib: logging, threading and random all register
+        after_in_child handlers at import, and pytest imports all three
+        (checked against pytest 9.0.3); asyncio.events and
+        concurrent.futures.thread add more when a suite imports them. A
+        user's own conftest or plugins may register further handlers that
+        neither aitest nor AIRA controls.
+
+    What still bounds the risk, restated accurately rather than dropped:
+    (1) it is still before any TEST code runs, so no test-driven allocation
+    happens inside it; (2) cgroup v2 memory.max is hierarchical, so whatever
+    a handler does allocate is still charged to the OUTER confine scope's
+    cap -- what is briefly coarser is the GRANULARITY of containment, not
+    containment itself. Say OUTER precisely, not "the scope it is in": the
+    unplaced child sits in `.aira-supervisor`, which is DELIBERATELY given
+    no memory.max of its own (worker_admit.go's workerScopeChildPrefix and
+    readWorkerSupervisorMemory notes), so the bound comes entirely from the
+    outer scope one level up -- and that one is guaranteed finite by
+    precondition, not by assumption: worker-admit refuses the grant outright
+    (WorkerAdmitReasonOuterScopeUnbounded, "outer scope ... has no finite
+    memory.max") when it is not, and fork_worker is only ever reached on the
+    granted path. The sharper hazard is therefore not
+    a containment break at all (the reviewer-synthesis nuance AIRA-37
+    records) but fork-across-threads locking: an after_in_child handler that
+    blocks on a lock some other thread held at fork time deadlocks the
+    child. The supervisor is single-threaded by design (supervisor.py's
+    AIRA-92 note), which bounds that from AIRA's side without eliminating
+    it, since plugins sharing the interpreter may start threads of their own
+    -- and the governor handler above closes buffered streams, which takes
+    buffered-IO locks, i.e. is exactly this class.
+
+    Still accepted for Slice 1, and for a stronger reason than "the window
+    is tiny": a raw ctypes clone3(CLONE_INTO_CGROUP) would place the child
+    atomically but would not run PyOS_AfterFork_Child at all unless the
+    caller re-invoked it by hand -- so it would skip the very handlers that
+    reinitialise the stdlib's own locks in the child, trading this window
+    for a larger hazard and MORE machinery, not less
+    (architectural-simplicity). Called out plainly rather than left to read
+    as an oversight.
 
     Safety note: any exception place_self() raises happens in the CHILD --
     it must never propagate through normal Python control flow from here,

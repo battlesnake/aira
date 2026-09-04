@@ -66,6 +66,40 @@ def test_fork_worker_places_child_pid_into_real_scope_cgroup(tmp_path):
     assert marker.exists() and marker.read_text() == str(pid)
 
 
+def test_atfork_after_in_child_handlers_run_before_fork_returns():
+    """AIRA-37. fork_worker's docstring asserts, as the reason the
+    pre-placement window is NOT "pure interpreter overhead", that CPython
+    runs every os.register_at_fork(after_in_child=...) handler in the child
+    BEFORE os.fork() returns to Python. That is the whole basis of the
+    corrected docstring, so it is pinned here rather than left as prose that
+    can rot against a future CPython.
+
+    Run in a subprocess on purpose: os.register_at_fork has no unregister,
+    so registering a handler in the pytest process itself would leak into
+    every other fork this session performs (test_fork_worker_* included)."""
+    program = (
+        "import os, sys\n"
+        "order = []\n"
+        "os.register_at_fork(after_in_child=lambda: order.append('handler'))\n"
+        "pid = os.fork()\n"
+        "if pid == 0:\n"
+        "    order.append('fork-returned')\n"
+        "    sys.stderr.write(','.join(order))\n"
+        "    sys.stderr.flush()\n"
+        "    os._exit(0)\n"
+        "os.waitpid(pid, 0)\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", program], capture_output=True, text=True, timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr.strip() == "handler,fork-returned", (
+        "after_in_child handler ordering is not what fork_worker's docstring "
+        "documents (%r) -- re-check the docstring before changing this test"
+        % completed.stderr
+    )
+
+
 def test_fork_worker_exits_child_without_propagating_when_place_self_fails(tmp_path):
     """place_self() failing in the child (e.g. cgroup.procs itself is not
     writable/does not exist) must never propagate as a normal Python
