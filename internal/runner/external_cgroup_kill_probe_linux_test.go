@@ -33,11 +33,23 @@ import (
 // would print after a clean exit.
 //
 // Fix 5 of the backlog-remediation plan (AIRA-70 unified with AIRA-91 Part A)
-// EXTENDS this probe with the assertion that the new `terminated-by=` status
-// facet reports `external-cgroup-kill` for the same scope. It is committed
-// ahead of that fix, and ahead of Fix 1 (AIRA-39), so both can be verified
-// against a reproduction that lives in the repository rather than in one
-// machine's `~/tmp`.
+// EXTENDED this probe with the assertion that the new `terminated-by=` status
+// facet reports this shape. It was committed ahead of that fix, and ahead of
+// Fix 1 (AIRA-39), so both could be verified against a reproduction that lives
+// in the repository rather than in one machine's `~/tmp`.
+//
+// VOCABULARY CORRECTION, made deliberately when Fix 5 landed: this file
+// originally predicted the facet value would be `external-cgroup-kill`. It is
+// `unattributed-sigkill` instead. A plan review established that
+// `external-cgroup-kill` overclaims -- an external `kill -9` on the leader PID,
+// a job that SIGKILLs ITSELF (the `selfkill` probe above), and an
+// ancestor-cgroup OOM (memcg events propagate UPWARD, so a slice-level OOM
+// leaves this scope's counter at zero) all produce this identical signature.
+// What is positively establishable is only: SIGKILL, not sent by this
+// supervisor, with no OOM recorded on this scope. The candidate mechanisms are
+// named on the trailer's own candidates line instead of asserted by the facet.
+// See docs/superpowers/plans/2026-09-05-aira70-91a-terminated-by-trailer-plan.md
+// section 3.1.
 
 // externalCgroupKillProbe runs one process inside a real, memory-controlled
 // cgroup scope, kills the whole scope from outside via `cgroup.kill`, and
@@ -163,11 +175,13 @@ func TestExternalCgroupKillIsSignalledWithZeroOOMKillCounter(t *testing.T) {
 //
 //  1. The DURABLE invariant: an external cgroup kill must never be misreported
 //     as a kernel OOM kill at its memory cap. That stays true after Fix 5.
-//  2. The GAP as it stands today: nothing is reported at all. Fix 5
-//     (AIRA-70 + AIRA-91 Part A) closes this on the STATUS line via a new
-//     `terminated-by=` facet, not by changing this advisory -- if a later
-//     change makes formatConfineReserveAdvisory itself speak for this case,
-//     update assertion 2 deliberately rather than deleting it.
+//  2. That this advisory STAYS silent for the case. Fix 5 (AIRA-70 + AIRA-91
+//     Part A) closed the reporting gap on the STATUS line via the
+//     `terminated-by=` facet (see TestExternalCgroupKillIsReportedOnTheTrailer
+//     below), deliberately NOT by changing this advisory, whose cap gate and
+//     OOM wording are unchanged -- if a later change makes
+//     formatConfineReserveAdvisory itself speak for this case, update assertion
+//     2 deliberately rather than deleting it.
 func TestExternalCgroupKillProducesNoOOMAdvisory(t *testing.T) {
 	const scopeMemoryMax = 128 << 20
 	_, usage, _ := externalCgroupKillProbe(t, scopeMemoryMax)
@@ -198,5 +212,39 @@ func TestExternalCgroupKillProducesNoOOMAdvisory(t *testing.T) {
 	oomCount := int64(1)
 	if reported := formatConfineReserveAdvisory(scopeMemoryMax, usage.PeakRSS, oomCount > 0); !strings.Contains(reported, "OOM-killed") {
 		t.Fatalf("kernel-OOM advisory no longer fires for oom_kill>0: %q", reported)
+	}
+}
+
+// verifies: AIRA-70 + AIRA-91 Part A -- against a REAL cgroup killed by a REAL
+// external `cgroup.kill` write, the trailer's terminal facet reports
+// `unattributed-sigkill` and the run is no longer indistinguishable from a
+// clean one. This is Fix 5's reviewer-reproducible verification: it drives the
+// production classifier from the production wait status and the production
+// memory.events counter, not from a fixture.
+func TestExternalCgroupKillIsReportedOnTheTrailer(t *testing.T) {
+	const scopeMemoryMax = 128 << 20
+	status, usage, scope := externalCgroupKillProbe(t, scopeMemoryMax)
+
+	term := confineTermination{Decoded: true, Signaled: status.Signaled(), Signal: status.Signal()}
+	verdict := classifyConfineTermination(term, usage, nil)
+	if verdict != "unattributed-sigkill" {
+		t.Fatalf("real external cgroup.kill on %s classified as %q, want unattributed-sigkill (status=%v usage=%+v)",
+			scope, verdict, status, usage)
+	}
+
+	line := FormatConfineStatus(ConfineStatus{Slice: "finite.slice", TerminatedBy: verdict})
+	if !strings.Contains(line, "terminated-by=unattributed-sigkill") {
+		t.Fatalf("the verdict did not reach the operator-facing line: %q", line)
+	}
+	// The whole point of AIRA-91: this run must no longer read like a clean one.
+	clean := FormatConfineStatus(ConfineStatus{Slice: "finite.slice", TerminatedBy: "normal"})
+	if line == clean {
+		t.Fatalf("an externally group-killed run still prints the same status line as a clean run: %q", line)
+	}
+	advisory := formatConfineTerminationAdvisory(verdict)
+	for _, want := range []string{"systemd-oomd", "aira confine --kill", "cgroup.kill"} {
+		if !strings.Contains(advisory, want) {
+			t.Fatalf("candidates line %q does not name %q, which AIRA-91 Part A asks for", advisory, want)
+		}
 	}
 }

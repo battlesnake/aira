@@ -182,7 +182,46 @@ type ConfineStatus struct {
 	ScopeMemoryEffective int64
 	ReserveBasis         string
 	PeakRSS              *int64
+	// TerminatedBy is the terminal-attribution facet (AIRA-70, AIRA-91 Part A).
+	// Empty means the classifier never ran -- every launch that failed before
+	// the child was waited on -- and renders as "unevaluated", never as a claim
+	// that the job ended cleanly.
+	TerminatedBy string
 }
+
+// The terminal-attribution vocabulary. Each value names exactly what its
+// evidence establishes and nothing further; classifyConfineTermination
+// (confine_linux.go) documents the order in which the evidence is weighed.
+const (
+	// ConfineTerminatedNormal: the child exited of its own accord. Any exit
+	// code -- the facet reports HOW a job ended, not whether it succeeded.
+	ConfineTerminatedNormal = "normal"
+	// ConfineTerminatedOOM: the kernel's OOM killer killed a signalled child in
+	// this scope (memory.events oom_kill readable and positive).
+	ConfineTerminatedOOM = "oom"
+	// ConfineTerminatedUnattributedSIGKILL: a SIGKILL that neither this
+	// supervisor nor this scope's own OOM counter accounts for. NOT named
+	// "external-cgroup-kill", which the earlier plan draft proposed: an
+	// external kill -9 on the leader, a job that SIGKILLs itself, and an
+	// ancestor-cgroup OOM (memcg events propagate upward, leaving this scope's
+	// counter at zero) all share this exact signature, so naming one mechanism
+	// would assert a cause the evidence cannot establish. The candidate
+	// mechanisms are named on the trailer's candidates line instead.
+	ConfineTerminatedUnattributedSIGKILL = "unattributed-sigkill"
+	// ConfineTerminatedUnevaluated: the wait status could not be decoded, or the
+	// child was SIGKILLed and memory.events could not be read -- in which case
+	// an OOM kill and an unattributed one are indistinguishable, and reporting
+	// either would be a fabricated zero.
+	ConfineTerminatedUnevaluated = "unevaluated"
+	// ConfineTerminatedSupervisorSignalPrefix: this confine supervisor itself
+	// received the named signal during the run and tore the job down.
+	ConfineTerminatedSupervisorSignalPrefix = "supervisor-signal:"
+	// ConfineTerminatedChildSignalPrefix: the child died of the named signal,
+	// which is not SIGKILL -- so neither cgroup.kill nor memory.oom.group, both
+	// of which deliver SIGKILL and nothing else, can have been the cause. Who
+	// sent it is not established.
+	ConfineTerminatedChildSignalPrefix = "child-signal:"
+)
 
 type ConfineRequest struct {
 	Slice               string
@@ -401,6 +440,15 @@ func FormatConfineStatus(status ConfineStatus) string {
 			line += " memory.high=reclaim-pressure=" + strconv.FormatInt(status.ScopeMemoryHigh, 10)
 		}
 	}
+	// AIRA-70 / AIRA-91 Part A. Always rendered: before this facet existed, a
+	// SIGKILLed job's trailer was byte-identical to a clean run's, so omitting
+	// the facet when it is unknown would reproduce exactly the silence it
+	// exists to end. An unset field reads as unevaluated, never as "normal".
+	terminated := status.TerminatedBy
+	if terminated == "" {
+		terminated = ConfineTerminatedUnevaluated
+	}
+	line += " terminated-by=" + terminated
 	return line
 }
 

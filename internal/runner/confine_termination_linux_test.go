@@ -1,0 +1,301 @@
+//go:build linux
+
+package runner
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+)
+
+func int64ptr(value int64) *int64 { return &value }
+
+// verifies: AIRA-70 + AIRA-91 Part A -- the terminal classifier reports only
+// what its evidence establishes. Every branch of the documented order is
+// exercised, in BOTH directions: each row names the one verdict that is honest
+// for its evidence, so a classifier that collapses to a single value (the
+// obvious false-pass shape) fails several rows at once.
+func TestClassifyConfineTermination(t *testing.T) {
+	signalled := func(sig syscall.Signal) confineTermination {
+		return confineTermination{Decoded: true, Signaled: true, Signal: sig}
+	}
+	exited := confineTermination{Decoded: true}
+	readable := func(count int64) cgroupUsage { return cgroupUsage{OOMKill: int64ptr(count)} }
+	unreadable := cgroupUsage{}
+
+	for _, test := range []struct {
+		name       string
+		term       confineTermination
+		usage      cgroupUsage
+		supervisor os.Signal
+		want       string
+		why        string
+	}{
+		{
+			name: "undecodable wait status is unevaluated", term: confineTermination{}, usage: readable(0),
+			want: "unevaluated",
+			why:  "branch 1: with no wait status there is no evidence of anything, including of a clean exit",
+		},
+		{
+			name: "signalled child with a positive counter is an OOM", term: signalled(syscall.SIGKILL), usage: readable(1),
+			want: "oom",
+			why:  "branch 2: a positive memory.events oom_kill on a signalled child is a kernel-recorded fact",
+		},
+		{
+			name: "an OOM outranks a supervisor signal that also arrived", term: signalled(syscall.SIGKILL), usage: readable(1), supervisor: syscall.SIGINT,
+			want: "oom",
+			why:  "branch 2 before 3: cgroup.kill never increments oom_kill, so our own teardown cannot have produced this counter",
+		},
+		{
+			name: "a clean exit is never relabelled by a descendant's OOM", term: exited, usage: readable(3),
+			want: "normal",
+			why:  "branch 2 requires signalled: memcg events propagate UPWARD, so a child cgroup's OOM shows on our counter while our leader exits normally",
+		},
+		{
+			name: "supervisor signal wins over a caught-and-exited child", term: exited, usage: readable(0), supervisor: syscall.SIGTERM,
+			want: "supervisor-signal:SIGTERM",
+			why:  "branch 3 before 4: a child that CAUGHT our forwarded SIGTERM and exited cleanly was still terminated by us",
+		},
+		{
+			name: "supervisor signal wins over the SIGKILL our own cleanup delivered", term: signalled(syscall.SIGKILL), usage: unreadable, supervisor: syscall.SIGINT,
+			want: "supervisor-signal:SIGINT",
+			why:  "branch 3 before 7: cleanup()'s cgroup.kill is ours, and the scope it removed is why the counter is unreadable",
+		},
+		{
+			name: "a plain exit is normal", term: exited, usage: readable(0),
+			want: "normal",
+			why:  "branch 4 -- the facet reports HOW the job ended, not whether it succeeded (the /bin/false row of the trailer test pins the non-zero case end to end)",
+		},
+		{
+			name: "a crashing child names its own signal", term: signalled(syscall.SIGSEGV), usage: readable(0),
+			want: "child-signal:SIGSEGV",
+			why:  "branch 5 before 7: cgroup.kill and memory.oom.group deliver SIGKILL and nothing else, so a SIGSEGV is not an unattributed SIGKILL",
+		},
+		{
+			name: "a non-SIGKILL signal is named even with an unreadable counter", term: signalled(syscall.SIGABRT), usage: unreadable,
+			want: "child-signal:SIGABRT",
+			why:  "branch 5 before 6: no counter is needed to rule out an OOM, which always kills with SIGKILL",
+		},
+		{
+			name: "SIGKILL with an unreadable counter is unevaluated", term: signalled(syscall.SIGKILL), usage: unreadable,
+			want: "unevaluated",
+			why:  "branch 6 before 7: OOM and an unattributed kill are indistinguishable here; claiming either would be a fabricated zero",
+		},
+		{
+			name: "SIGKILL with a readable zero counter is unattributed", term: signalled(syscall.SIGKILL), usage: readable(0),
+			want: "unattributed-sigkill",
+			why:  "branch 7: AIRA-91's case -- the kill is real, this supervisor did not send it, and this scope records no OOM",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := classifyConfineTermination(test.term, test.usage, test.supervisor); got != test.want {
+				t.Fatalf("classify = %q, want %q (%s)", got, test.want, test.why)
+			}
+		})
+	}
+}
+
+// verifies: the terminal facet reaches the operator-facing line, and an unset
+// facet reads as unevaluated rather than as an empty claim.
+func TestFormatConfineStatusReportsTerminatedByFacet(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status ConfineStatus
+		want   string
+	}{
+		{name: "unset", status: ConfineStatus{Slice: "finite.slice"}, want: "terminated-by=unevaluated"},
+		{name: "normal", status: ConfineStatus{Slice: "finite.slice", TerminatedBy: "normal"}, want: "terminated-by=normal"},
+		{name: "unattributed", status: ConfineStatus{Slice: "finite.slice", TerminatedBy: "unattributed-sigkill"}, want: "terminated-by=unattributed-sigkill"},
+		{name: "supervisor", status: ConfineStatus{Slice: "finite.slice", TerminatedBy: "supervisor-signal:SIGTERM"}, want: "terminated-by=supervisor-signal:SIGTERM"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			line := FormatConfineStatus(test.status)
+			if !strings.Contains(line, test.want) {
+				t.Fatalf("status %q lacks %q", line, test.want)
+			}
+		})
+	}
+}
+
+// verifies: AIRA-91 Part A -- the candidates line is emitted for, and ONLY for,
+// the unattributed-SIGKILL verdict, and it names the candidate mechanisms
+// without asserting any one of them.
+func TestFormatConfineTerminationAdvisory(t *testing.T) {
+	advisory := formatConfineTerminationAdvisory("unattributed-sigkill")
+	for _, want := range []string{
+		"SIGKILL", "cannot attribute", "Candidates", "systemd-oomd", "aira confine --kill", "cgroup.kill",
+		"ancestor", "kill -9", "killing itself",
+	} {
+		if !strings.Contains(advisory, want) {
+			t.Fatalf("candidates line %q lacks %q", advisory, want)
+		}
+	}
+	for _, verdict := range []string{"normal", "oom", "unevaluated", "child-signal:SIGSEGV", "supervisor-signal:SIGTERM", ""} {
+		if got := formatConfineTerminationAdvisory(verdict); got != "" {
+			t.Fatalf("verdict %q wrongly produced a candidates line: %q", verdict, got)
+		}
+	}
+}
+
+// confineTrailer runs one real child to completion through the unit harness and
+// returns the diagnostics the supervisor printed. Every target here terminates
+// ITSELF, so no case depends on the test delivering a signal at the right
+// moment: the classification is a function of the child's own exit shape and
+// the injected usage counters alone.
+func confineTrailer(t *testing.T, argv []string, usage cgroupUsage, scopeMemoryMax int64) string {
+	t.Helper()
+	scope := &confineFakeScope{}
+	deps := confineUnitDeps(scope)
+	deps.readUsage = func(string) cgroupUsage { return usage }
+	deps.reportPeak = func(context.Context, ConfineRequest, string, *int64, bool) error { return nil }
+	if scopeMemoryMax > 0 {
+		deps.writeScopeMemoryCap = func(Scope, int64, int64, bool) error { return nil }
+	}
+	var diagnostics bytes.Buffer
+	if _, err := confineWithDeps(context.Background(), ConfineRequest{
+		Slice: "finite.slice", Argv: argv, SelfPath: os.Args[0],
+		ScopeMemoryMax: scopeMemoryMax, Stderr: &diagnostics,
+	}, deps); err != nil {
+		t.Fatalf("confine: %v (diagnostics=%q)", err, diagnostics.String())
+	}
+	return diagnostics.String()
+}
+
+// verifies: AIRA-70 + AIRA-91 Part A -- the trailer distinguishes the terminal
+// shapes that are byte-identical today. Five sub-cases deliberately: a trailer
+// test with only the SIGKILL row passes against a classifier that hardcodes one
+// verdict, which is precisely the false-pass this fix must not ship with.
+func TestConfineTrailerReportsTerminationFacet(t *testing.T) {
+	selfKill := []string{"/bin/sh", "-c", "kill -s KILL $$"}
+	for _, test := range []struct {
+		name       string
+		argv       []string
+		usage      cgroupUsage
+		want       string
+		candidates bool
+	}{
+		{name: "clean exit", argv: []string{"/bin/true"}, usage: cgroupUsage{OOMKill: int64ptr(0)}, want: "terminated-by=normal"},
+		{name: "non-zero exit is still normal", argv: []string{"/bin/false"}, usage: cgroupUsage{OOMKill: int64ptr(0)}, want: "terminated-by=normal"},
+		{
+			name: "crashing child", argv: []string{"/bin/sh", "-c", "kill -s USR1 $$"},
+			usage: cgroupUsage{OOMKill: int64ptr(0)}, want: "terminated-by=child-signal:SIGUSR1",
+		},
+		{
+			name: "SIGKILL with a readable zero counter", argv: selfKill,
+			usage: cgroupUsage{OOMKill: int64ptr(0)}, want: "terminated-by=unattributed-sigkill", candidates: true,
+		},
+		{
+			name: "SIGKILL with an unreadable counter", argv: selfKill,
+			usage: cgroupUsage{}, want: "terminated-by=unevaluated",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			trailer := confineTrailer(t, test.argv, test.usage, 0)
+			if !strings.Contains(trailer, test.want) {
+				t.Fatalf("trailer %q lacks %q", trailer, test.want)
+			}
+			hasCandidates := strings.Contains(trailer, "cannot attribute")
+			if hasCandidates != test.candidates {
+				t.Fatalf("candidates line present=%v, want %v; trailer=%q", hasCandidates, test.candidates, trailer)
+			}
+		})
+	}
+}
+
+// verifies: AIRA-70 finding #3 -- a kernel OOM is now reported on the status
+// line whether or not a scope cap happened to be configured, which is the case
+// formatConfineReserveAdvisory has always been silent for. The second sub-case
+// pins the classifier's `signalled` requirement: a descendant cgroup's OOM
+// (which propagates up onto our counter) must not relabel a clean exit.
+func TestConfineTrailerReportsOOM(t *testing.T) {
+	t.Run("uncapped OOM is no longer silent", func(t *testing.T) {
+		trailer := confineTrailer(t, []string{"/bin/sh", "-c", "kill -s KILL $$"}, cgroupUsage{OOMKill: int64ptr(1)}, 0)
+		if !strings.Contains(trailer, "terminated-by=oom") {
+			t.Fatalf("trailer %q lacks terminated-by=oom", trailer)
+		}
+		if !strings.Contains(trailer, "scope-memory.max=not-requested") {
+			t.Fatalf("fixture no longer runs uncapped, so it cannot pin AIRA-70 #3: %q", trailer)
+		}
+		if strings.Contains(trailer, "OOM-killed at its memory cap") {
+			t.Fatalf("the cap-gated reserve advisory fired without a cap: %q", trailer)
+		}
+		if strings.Contains(trailer, "cannot attribute") {
+			t.Fatalf("an attributed OOM wrongly printed the candidates line: %q", trailer)
+		}
+	})
+	t.Run("a descendant OOM does not relabel a clean exit", func(t *testing.T) {
+		trailer := confineTrailer(t, []string{"/bin/true"}, cgroupUsage{OOMKill: int64ptr(1)}, 0)
+		if !strings.Contains(trailer, "terminated-by=normal") {
+			t.Fatalf("trailer %q lacks terminated-by=normal", trailer)
+		}
+	})
+	t.Run("a capped OOM still gets the reserve advisory", func(t *testing.T) {
+		trailer := confineTrailer(t, []string{"/bin/sh", "-c", "kill -s KILL $$"},
+			cgroupUsage{OOMKill: int64ptr(1), PeakRSS: int64ptr(31 << 20)}, 32<<20)
+		if !strings.Contains(trailer, "terminated-by=oom") || !strings.Contains(trailer, "OOM-killed at its memory cap") {
+			t.Fatalf("capped OOM lost a line: %q", trailer)
+		}
+	})
+}
+
+// verifies: AIRA-70 finding #1 -- a signal delivered to the confine supervisor
+// itself is recorded, forwarded, and named on the trailer. It used to leave no
+// trace anywhere. The assertion is on the FACET, never on the exit code: in
+// production cleanup()'s cgroup.kill races the forwarded signal, so the child's
+// wait status is 137 or 143 depending on which lands first.
+func TestConfineTrailerReportsSupervisorSignal(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "ready")
+	scope := &confineFakeScope{}
+	deps := confineUnitDeps(scope)
+	signals := make(chan os.Signal, 1)
+	deps.signalSource = func() (<-chan os.Signal, func()) { return signals, func() {} }
+	deps.readUsage = func(string) cgroupUsage { return cgroupUsage{} }
+	deps.reportPeak = func(context.Context, ConfineRequest, string, *int64, bool) error { return nil }
+
+	// The child announces itself, then becomes a single `sleep` via exec, so the
+	// signal is delivered to a running job and nothing is orphaned when it dies.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(marker); err == nil {
+				signals <- syscall.SIGTERM
+				return
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
+	var diagnostics bytes.Buffer
+	_, err := confineWithDeps(context.Background(), ConfineRequest{
+		Slice:    "finite.slice",
+		Argv:     []string{"/bin/sh", "-c", `echo ready > "$1"; exec sleep 60`, "sh", marker},
+		SelfPath: os.Args[0], Stderr: &diagnostics,
+	}, deps)
+	<-done
+	if err != nil {
+		t.Fatalf("confine: %v (diagnostics=%q)", err, diagnostics.String())
+	}
+	trailer := diagnostics.String()
+	if !strings.Contains(trailer, "terminated-by=supervisor-signal:SIGTERM") {
+		t.Fatalf("trailer %q lacks terminated-by=supervisor-signal:SIGTERM", trailer)
+	}
+	if !strings.Contains(trailer, "confine: received SIGTERM") {
+		t.Fatalf("the supervisor's own signal left no log line: %q", trailer)
+	}
+	if strings.Contains(trailer, "cannot attribute") {
+		t.Fatalf("a kill this supervisor caused wrongly printed the candidates line: %q", trailer)
+	}
+	if count := strings.Count(trailer, "confine: received SIGTERM"); count != 1 {
+		t.Fatalf("supervisor signal logged %d times, want exactly 1: %q", count, trailer)
+	}
+}
