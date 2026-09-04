@@ -273,12 +273,12 @@ func readResponse(r io.Reader, frame *ResponseFrame) error {
 // Exchange sends one request and receives one response over a fresh Unix
 // connection.
 func Exchange(ctx context.Context, socket string, request RequestFrame) (ResponseFrame, error) {
-	return exchange(ctx, socket, request)
+	return exchange(ctx, socket, request, defaultDeadlines)
 }
 
 // ExchangeStoreOp sends one store operation and receives its ownership result.
 func ExchangeStoreOp(ctx context.Context, socket string, request StoreOpFrame) (ResponseFrame, error) {
-	return exchange(ctx, socket, request)
+	return exchange(ctx, socket, request, defaultDeadlines)
 }
 
 // StoreOpOutcomeUnknownError means the complete request was written but no
@@ -336,7 +336,10 @@ func (w *countingWriter) Write(data []byte) (int, error) {
 	return n, err
 }
 
-func exchange(ctx context.Context, socket string, request any) (ResponseFrame, error) {
+// exchange is the client half of the deadline convention in deadlines.go. The
+// policy is a parameter rather than a package constant so tests can drive the
+// two phases at millisecond scale without mutating shared global state.
+func exchange(ctx context.Context, socket string, request any, policy deadlinePolicy) (ResponseFrame, error) {
 	_, isStoreOp := request.(StoreOpFrame)
 	dialer := net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "unix", socket)
@@ -354,11 +357,11 @@ func exchange(ctx context.Context, socket string, request any) (ResponseFrame, e
 	defer conn.Close()
 	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopClose()
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	} else {
-		_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
-	}
+	// Rule (1): the request phase is the handshake, and gets the connect budget
+	// (or the caller's own deadline when that is sooner) — NOT one deadline
+	// covering the response wait too, which is the AIRA-84 defect from the
+	// client end.
+	_ = conn.SetWriteDeadline(requestPhaseDeadline(ctx, time.Now(), policy))
 	storeOp, _ := request.(StoreOpFrame)
 	writer := &countingWriter{Writer: conn}
 	var writeErr error
@@ -378,6 +381,13 @@ func exchange(ctx context.Context, socket string, request any) (ResponseFrame, e
 		}
 		return ResponseFrame{}, wrapped
 	}
+	// Rule (2): the response wait is the caller's own deadline when it declares
+	// one, else the declared budget — never the handshake budget. The daemon is
+	// entitled to take as long as its own verb-declared work budget allows, and
+	// abandoning it early fabricates OUTCOME_UNKNOWN for work that committed.
+	// ctx cancellation still interrupts this read: the AfterFunc above closes
+	// the connection.
+	_ = conn.SetReadDeadline(responsePhaseDeadline(ctx, time.Now(), policy))
 	var response ResponseFrame
 	if err := readResponse(conn, &response); err != nil {
 		wrapped := wrapTransportError(ctx, err)

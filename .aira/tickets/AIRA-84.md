@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-84","project":"aira","title":"Routed daemon verbs keep the 30s connect deadline, so a slow import or gate attest commits and then reports outcome-unknown","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["daemon","dogfood","honesty"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-84","project":"aira","title":"Routed daemon verbs keep the 30s connect deadline, so a slow import or gate attest commits and then reports outcome-unknown","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["daemon","dogfood","honesty"],"hold":false,"relations":[]}
 ---
 PR #12 finding **B12**, filed by the simplification programme's Phase 0 (plan §4.3).
 Source-verified against master `22cedd6`.
@@ -34,3 +34,47 @@ arrives.
 
 Rigor: Tier B. It is small, but the failure direction it fixes is an honesty failure
 (outcome-unknown after a durable commit), not a performance one.
+
+## Resolution
+
+Fixed as Phase 1 Fix 4 of the backlog remediation plan
+(`docs/superpowers/plans/2026-09-04-backlog-remediation-plan.md` §3.4), built at
+Tier A rather than the Tier B this ticket originally asked for, because the fix
+was widened past this ticket's own scope. Design spec:
+`docs/superpowers/plans/2026-09-04-aira84-symmetric-deadline-seam-plan.md`.
+
+**Widened past the Direction paragraph above, deliberately.** This ticket asked
+only for the daemon's routed path. Two things forced a bigger seam:
+
+1. **The client half has the identical defect.** `exchange()` used one
+   `SetDeadline` for the request write and the response read, and every CLI
+   entry point passes `context.Background()`, so the 30s fallback capped the
+   RESPONSE WAIT too. Fixing only the daemon would have left the user-visible
+   symptom exactly as it was: the daemon would answer at 45s and the client
+   would already have given up at 30s with the same `OUTCOME_UNKNOWN`.
+2. **The asymmetry this ticket calls "the tell" had four more instances in the
+   same function** — `confine-report`, `confine-list`/`confine-kill`, `eject`
+   and `supervisor-lease-*` all wrote after handler work under the connect
+   deadline. Fixing one line and leaving four siblings would have re-created
+   the defect this ticket is about.
+
+The output is therefore a named convention (`internal/daemon/deadlines.go`),
+not a patch: connect bounds the handshake only; the response wait is the
+caller's context deadline or a declared budget; a write deadline is stamped
+immediately before every response write. AIRA-18 and AIRA-92 were the same
+class; a `forbidigo` rule to hold the line is scheduled for the remediation
+plan's Phase 2, with a structural guard test standing in until then.
+
+**Deployment note:** an OLD daemon still writes under its connect deadline, so
+a new client's longer response wait does not help until the daemon itself is
+restarted. No `ProtocolVersion` bump (the wire shape is unchanged), so the
+mixed pair is degraded rather than refused.
+
+**Residual, named rather than closed.** The client's response budget is derived
+from `storeOpHeavyTimeout`, which bounds store ops — but generic routed verbs
+carry no daemon-side work budget at all. A routed verb that genuinely runs past
+6 minutes will still commit and still be reported `OUTCOME_UNKNOWN`. This fix
+narrows that window from 30 seconds to 6 minutes; it does not close it. Closing
+it needs a per-verb execution budget for routed verbs — new machinery, on the
+remediation plan's deferral list, not built here. Build review caught this hole
+in the original justification.
