@@ -298,8 +298,11 @@ def fork_worker(scope_path):
 
     Who actually registers such a handler (the audit AIRA-37 asked for --
     answered with real registrants, not a "shouldn't happen" assurance):
-      - aitest itself: NONE. os.register_at_fork appears exactly once in
-        AIRA's Python, and not in this package.
+      - aitest itself: NONE. AIRA's Python contains exactly one real
+        os.register_at_fork CALL, and it is not in this package. (A grep
+        finds the ordering test named above too: that registration lives in
+        a source string the test runs as a throwaway SUBPROCESS, on
+        purpose, so it never arms in aitest's own interpreter.)
       - That one site is AIRA's OWN sibling plugin,
         aira_xdist_governor/__init__.py (module scope, so it arms on
         import), and it is not hypothetical here: forked aitest workers
