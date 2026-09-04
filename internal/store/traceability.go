@@ -421,7 +421,10 @@ func (s *Store) checkTraceability(report *CheckReport) error {
 		if gitErr != nil && isNotGitRepository(stderr) {
 			// A non-git ticket-only fixture has no tracked-file graph to
 			// evaluate. Real projects are git worktrees; an explicit annotation
-			// in one will reach U_TRACE_EMPTY below.
+			// in one will reach U_TRACE_EMPTY below. Nothing was scanned here,
+			// so the dimension is unevaluated with its reason, never a silent
+			// pass left behind by the seed (AIRA-86).
+			addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_UNSCANNED", Subject: "traceability", Message: "root is not a git repository, so there is no tracked-file graph to scan", Kind: "unevaluated"})
 			return nil
 		}
 	}
@@ -447,7 +450,14 @@ func (s *Store) checkTraceability(report *CheckReport) error {
 	if len(scan.requirements) == 0 && len(malformed) > 0 {
 		addTraceUnevaluated(report, CheckFinding{Code: "U_TRACE_UNSCANNED", Subject: "traceability", Message: "requirement registry contains no readable nodes", Kind: "unevaluated"})
 	}
-	return resolveTraceabilityEdges(report, scan.edges, scan.requirements, malformed)
+	if err := resolveTraceabilityEdges(report, scan.edges, scan.requirements, malformed); err != nil {
+		return err
+	}
+	// Only this arm scanned the graph and resolved every edge, so only this arm
+	// may claim the dimension. Each earlier return recorded its own unevaluated
+	// reason instead (AIRA-86).
+	establishDimension(report, "traceability")
+	return nil
 }
 
 func resolveTraceabilityEdges(report *CheckReport, edges []traceEdge, requirements map[string]traceRequirement, malformed map[string]string) error {

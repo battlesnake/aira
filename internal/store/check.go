@@ -33,6 +33,7 @@ var ExitCodes = map[string]int{
 	"E_RANT_INVALID": 2, "E_RANT_TOO_LARGE": 2, "E_RANT_IDEMPOTENCY_CONFLICT": 2, "E_RANT_REF_INVALID": 2,
 	"E_INDEX_UNEVALUATED":          3,
 	"U_INDEX_UNESTABLISHED":        3,
+	"U_CHECK_UNEVALUATED":          3,
 	"U_COMPUTE_UNEVALUATED":        3,
 	"U_INSIGHT_UNEVALUATED":        3,
 	"U_TESTREPORT_INCOMPARABLE":    3,
@@ -122,24 +123,85 @@ type CheckReport struct {
 	FindingsTruncated   uint              `json:"findings_truncated,omitempty"`
 }
 
+// checkDimensions is the canonical set of honesty dimensions `check` reports.
+// The map starts empty and a dimension is reported only because something put
+// a result there: a checker that ran and established it, evidence a checker
+// recorded, or finaliseDimensions reporting that nothing established it.
+//
+// The list is not a seed of results. Check previously seeded all fourteen
+// `pass` and demoted from there, so a dimension whose checker never ran — not
+// wired, an early return, a dimension added to the map ahead of its checker —
+// reported a fabricated green, which is the AIRA-53/AIRA-54/AIRA-72 defect
+// shape as the default for every dimension at once (AIRA-86).
+var checkDimensions = []string{
+	"allocated-id-file", "duplicate-id", "stale-index",
+	"orphan-worktree", "ticket-file-integrity", "reconcile-integrity",
+	"rebuild-integrity", "relation-integrity", "finding-integrity", "lease-integrity", "area-overlap",
+	"traceability", "gates", "compute",
+}
+
+// establishDimension records that a checker ran and established a clean result
+// for its dimension. Only a checker that actually evaluated the dimension may
+// call it, and evidence already recorded — a fail, a warning, an unevaluated —
+// always wins, in either order: establishment never overwrites a recorded
+// result, and a later demotion overwrites an earlier establishment.
+func establishDimension(report *CheckReport, dimension string) {
+	if _, recorded := report.Dimensions[dimension]; recorded {
+		return
+	}
+	report.Dimensions[dimension] = "pass"
+}
+
+// unevaluateDimension records that a dimension's result could not be
+// established, for the callers that hold the reason as a finding of their own
+// (or share one with another dimension). A recorded fail is kept: an
+// unestablished dimension is never a reason to launder away a failure that was
+// established.
+func unevaluateDimension(report *CheckReport, dimension string) {
+	if report.Dimensions[dimension] != "fail" {
+		report.Dimensions[dimension] = "unevaluated"
+	}
+	report.Unevaluated = true
+}
+
+// finaliseDimensions reports every dimension nothing established. Check runs
+// each dimension's checker exactly once, so a dimension still absent here had
+// no checker establish it — an unwired checker, one that returned early, or a
+// dimension whose evaluator does not exist yet. That is an unevaluated result
+// carrying its own reason, never a pass, and it demotes the report verdict the
+// way any other unevaluated result does (AIRA-86).
+func finaliseDimensions(report *CheckReport) {
+	for _, dimension := range checkDimensions {
+		if _, recorded := report.Dimensions[dimension]; recorded {
+			continue
+		}
+		addFinding(report, CheckFinding{
+			Code: "U_CHECK_UNEVALUATED", Subject: dimension,
+			Message: "no checker established this dimension", Kind: "unevaluated",
+		}, dimension)
+	}
+}
+
+// newCheckReport builds the report Check fills in. Dimensions starts empty and
+// claims nothing: this is the seed site AIRA-86 was filed against, and a
+// dimension pre-seeded here would silently turn every establishDimension call
+// into a no-op and finaliseDimensions into dead code, restoring the fabricated
+// green without any dimension-level test noticing.
+func newCheckReport() CheckReport {
+	return CheckReport{Verdict: "pass", Dimensions: map[string]string{}}
+}
+
 // Check runs the explicit full consistency pass. Known integrity findings are
 // returned as a fail verdict; unexpected inability to access the store is
 // returned as an error so the adapter can use exit 4 rather than claiming a
 // verdict it did not establish.
 func (s *Store) Check(ctx context.Context) (CheckReport, error) {
-	report := CheckReport{Verdict: "pass", Dimensions: map[string]string{
-		"allocated-id-file": "pass", "duplicate-id": "pass", "stale-index": "pass",
-		"orphan-worktree": "pass", "ticket-file-integrity": "pass", "reconcile-integrity": "pass",
-		"rebuild-integrity": "pass", "relation-integrity": "pass", "finding-integrity": "pass", "lease-integrity": "pass", "area-overlap": "pass",
-		"traceability": "pass", "gates": "pass", "compute": "pass",
-	}}
+	report := newCheckReport()
 	if err := ctx.Err(); err != nil {
 		report.Verdict = "unevaluated"
 		report.Unevaluated = true
-		for dimension, value := range report.Dimensions {
-			if value == "pass" {
-				report.Dimensions[dimension] = "unevaluated"
-			}
+		for _, dimension := range checkDimensions {
+			report.Dimensions[dimension] = "unevaluated"
 		}
 		report.UnevaluatedFindings = []CheckFinding{{Code: "U_CHECK_UNEVALUATED", Subject: "check", Message: err.Error(), Kind: "unevaluated"}}
 		return report, nil
@@ -147,6 +209,7 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 	if err := s.checkStaleIndex(&report); err != nil {
 		return CheckReport{}, err
 	}
+	establishDimension(&report, "stale-index")
 	relationSnapshot, err := scanRelationSnapshotAt(s.root, s.worktreeID, s.projectSlug)
 	if err != nil {
 		if isUnestablishedError(err) {
@@ -179,6 +242,7 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 			addFinding(&report, finding, dimension)
 		}
 	}
+	establishDimension(&report, "finding-integrity")
 	// `check` may refresh disposable SQLite projections from durable truth, but
 	// it never mints gate trust: no gate evaluator, audit append, or HMAC-key
 	// creation occurs on this path.
@@ -189,6 +253,7 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 			return CheckReport{}, err
 		}
 	}
+	establishDimension(&report, "reconcile-integrity")
 	if err := s.ReconcileFlaky(ctx); err != nil {
 		return CheckReport{}, err
 	}
@@ -214,6 +279,7 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 	if err := computeRows.Close(); err != nil {
 		return CheckReport{}, err
 	}
+	establishDimension(&report, "compute")
 	flakyRows, err := s.db.QueryContext(ctx, `SELECT code,subject,details FROM findings WHERE project_id=? AND subtype='reconciliation' AND code=? ORDER BY subject`, s.projectID, "E_TESTREPORT_FLAKY")
 	if err != nil {
 		return CheckReport{}, err
@@ -242,6 +308,11 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 			return CheckReport{}, err
 		}
 	}
+	establishDimension(&report, "rebuild-integrity")
+	// checkTraceability establishes its own dimension: it has an exit that
+	// evaluates nothing (a non-git root has no tracked-file graph), and only
+	// the checker can tell that exit apart from a scan that found nothing
+	// wrong.
 	if err := s.checkTraceability(&report); err != nil {
 		return CheckReport{}, err
 	}
@@ -325,10 +396,16 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 		return CheckReport{}, err
 	}
 	_ = rows.Close()
+	establishDimension(&report, "allocated-id-file")
 
 	if err := s.checkDuplicateIDs(ctx, &report); err != nil {
 		return CheckReport{}, err
 	}
+	establishDimension(&report, "duplicate-id")
+	// Ticket-file integrity is established by the union of the two scans that
+	// read ticket files: checkStaleIndex above and checkDuplicateIDs here.
+	// checkDuplicateIDs marks it unevaluated for a worktree it could not scan.
+	establishDimension(&report, "ticket-file-integrity")
 	if relationFindings, err := s.relationFindings(); err != nil {
 		if isUnestablishedError(err) {
 			addUnestablishedCheckFinding(&report, "relation-integrity", err)
@@ -343,6 +420,9 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 			}
 		}
 	}
+	// Both relation reads — the snapshot divergence above and relationFindings
+	// here — have run by this point, so the dimension is established.
+	establishDimension(&report, "relation-integrity")
 
 	worktrees, err := s.db.Query(`SELECT worktree_id, root, active FROM worktrees WHERE project_id=?`, s.projectID)
 	if err != nil {
@@ -365,21 +445,23 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 		return CheckReport{}, err
 	}
 	_ = worktrees.Close()
+	// The worktree scan establishes orphan-worktree; leaseFileOrphanWarnings
+	// below can still demote it with a live-lease orphan warning.
+	establishDimension(&report, "orphan-worktree")
 
 	if err := s.leaseFileOrphanWarnings(ctx, &report); err != nil {
 		if ErrorCode(err) == "E_CLOCK_UNAVAILABLE" {
-			report.Dimensions["lease-integrity"] = "unevaluated"
-			report.Dimensions["area-overlap"] = "unevaluated"
-			report.Unevaluated = true
+			unevaluateDimension(&report, "lease-integrity")
+			unevaluateDimension(&report, "area-overlap")
 			report.UnevaluatedFindings = append(report.UnevaluatedFindings, CheckFinding{Code: "E_CLOCK_UNAVAILABLE", Subject: "leases", Message: err.Error(), Kind: "unevaluated"})
 		} else {
 			return CheckReport{}, err
 		}
 	}
+	establishDimension(&report, "lease-integrity")
 	if warnings, err := s.areaOverlapWarnings(ctx); err != nil {
 		if ErrorCode(err) == "E_CLOCK_UNAVAILABLE" {
-			report.Dimensions["area-overlap"] = "unevaluated"
-			report.Unevaluated = true
+			unevaluateDimension(&report, "area-overlap")
 			report.UnevaluatedFindings = append(report.UnevaluatedFindings, CheckFinding{Code: "E_CLOCK_UNAVAILABLE", Subject: "area-overlap", Message: err.Error(), Kind: "unevaluated"})
 		} else {
 			return CheckReport{}, err
@@ -389,10 +471,15 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 			addWarning(&report, warning, "area-overlap")
 		}
 	}
+	establishDimension(&report, "area-overlap")
+	// checkGatesReadOnly establishes its own dimension, like checkTraceability:
+	// a gate report that carried no result evaluated nothing, and only the
+	// checker can tell that apart from a set of gates that all passed.
 	if err := s.checkGatesReadOnly(&report); err != nil {
 		return CheckReport{}, err
 	}
 
+	finaliseDimensions(&report)
 	if len(report.Findings) > 0 {
 		report.Verdict = "fail"
 	} else if report.Unevaluated {
@@ -537,8 +624,13 @@ func (s *Store) checkDuplicateIDs(ctx context.Context, report *CheckReport) erro
 	for _, entry := range entries {
 		seen := map[string]string{}
 		tickets, scanFindings, _, inconclusive, err := scanTickets(entry.Root, entry.WorktreeID, s.projectSlug)
+		// A scan that did not complete is the only evidence either dimension
+		// has for this worktree, so neither is established when it fails: the
+		// ticket files it would have read for ticket-file integrity are the
+		// same ones it would have read for duplicate IDs.
 		if inconclusive {
 			addFinding(report, CheckFinding{Code: "U_INDEX_UNESTABLISHED", Subject: entry.WorktreeID, Message: "working-tree ticket scan was inconclusive", Kind: "unevaluated"}, "duplicate-id")
+			unevaluateDimension(report, "ticket-file-integrity")
 			continue
 		}
 		if err != nil {
@@ -546,6 +638,7 @@ func (s *Store) checkDuplicateIDs(ctx context.Context, report *CheckReport) erro
 				return err
 			}
 			addFinding(report, s.findingFromError(err, repoPath(s.root, entry.Root)), "duplicate-id")
+			unevaluateDimension(report, "ticket-file-integrity")
 			continue
 		}
 		for _, finding := range scanFindings {
