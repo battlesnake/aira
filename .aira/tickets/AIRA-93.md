@@ -77,3 +77,35 @@ case the file has grown); run `aira reconcile --rebuild` to verify
 `E_JOURNAL_CORRUPT` is gone; notify concurrent sessions before and after.
 
 Ticket stays OPEN for that step.
+
+### Build-review (Sol, 2026-09-04) — the scrub was too narrow, and is widened
+
+Sol found the fix covered only the ONE path the ticket names, while the same
+inherited-`GIT_DIR` override reaches every other place AIRA shells out to git.
+Confirmed against source and fixed: the scrub is now a shared
+`gitcontext.ScrubbedEnvironment()` used by **all six** production git call sites:
+
+| site | what an inherited GIT_DIR would have done |
+|---|---|
+| `internal/app/project.go` `runGitRevParse` | the original defect: discovery resolves another repository |
+| `internal/app/project.go` `PrepareInit` | reads `HEAD:.aira/config` out of another repository |
+| `internal/store/testreport.go` `gitValue` | test-report and ratchet provenance names another repository's HEAD |
+| `internal/store/store.go` `runGit` | every generic git probe answers about another repository |
+| `internal/store/gate_eval.go` canary `git init` / `git add -A` | **the worst case: `add -A` stages the scratch tree into the INHERITED index** |
+| `internal/daemon/eject.go` status probe | eject's cleanliness check reads another repository's status |
+
+The helper lives in `internal/gitcontext` — a leaf both `internal/app` and
+`internal/store` already import — so there is one implementation rather than a
+copy per layer, and its unit tests live with it.
+
+**Accepted tradeoff, recorded because Sol was right that the old comment
+overclaimed.** The old comment said "discovery needs none of them". A few `GIT_*`
+variables are legitimate configuration rather than an override —
+`GIT_CONFIG_GLOBAL` (which can carry a `safe.directory` entry),
+`GIT_CEILING_DIRECTORIES`, `GIT_DISCOVERY_ACROSS_FILESYSTEM`. Dropping them makes
+discovery MORE permissive, not wrong, in every case except a caller who put
+`safe.directory` only in a `GIT_CONFIG_GLOBAL` file — who then gets git's
+dubious-ownership refusal, a loud diagnosable failure rather than a silently
+wrong answer. That is the direction AIRA prefers, and it is why the blanket form
+is kept over an allowlist that would need curating forever. Now stated in the
+helper's doc comment instead of asserted away.

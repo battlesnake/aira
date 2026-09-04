@@ -113,3 +113,22 @@ The ticket's other requirement — "a project that never used gates is unaffecte
 all, which is both the never-adopted shape and the emptied shape.
 
 AIRA-56 -> done. `make ci`: exit 0.
+
+### Build-review (Sol, 2026-09-04) — one named gap, no code change
+
+Sol confirmed the store branch is reachable, correctly ordered against the other
+two arms, and deduplicated, and that the CLI, JSON and MCP faces all surface the
+finding while preserving `pass` and exit 0.
+
+**Named gap: the TUI does not show it.** `cmd/aira/tui_data.go` decodes only
+`Response.Data` and discards `Response.Warnings`, and the Ready view renders
+ready/verdict columns without each row's findings
+(`cmd/aira/tui_viewmodel.go`). A TUI user therefore still sees `yes / pass` with
+no empty-gate signal.
+
+Not fixed here, deliberately: the TUI's Ready view ignores **every** finding, not
+just this one, so the fix is a TUI view change (surface row findings at all)
+rather than anything about AIRA-56 — and making it about this one finding would
+be the wrong shape. Recorded so the gap is written down rather than discovered
+later by someone who trusted this ticket's closure. The faces that agents and
+scripts actually consume — CLI text, JSON, MCP — do surface it.

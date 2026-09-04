@@ -75,25 +75,5 @@ func TestGitDiscoveryIgnoresAnInheritedGitDir(t *testing.T) {
 	}
 }
 
-func TestScrubGitEnvironmentDropsEveryGitVariable(t *testing.T) {
-	got := scrubGitEnvironment([]string{
-		"PATH=/bin",
-		"GIT_DIR=/decoy/.git",
-		"GIT_WORK_TREE=/decoy",
-		"GIT_INDEX_FILE=/decoy/.git/index",
-		"GIT_COMMON_DIR=/decoy/.git",
-		"GIT_SOMETHING_GIT_MIGHT_ADD_LATER=1",
-		"GITHUB_TOKEN=kept",
-		"HOME=/home/x",
-	})
-	for _, entry := range got {
-		if strings.HasPrefix(entry, "GIT_") {
-			t.Fatalf("scrub kept %q", entry)
-		}
-	}
-	// A prefix scrub must not swallow unrelated variables that merely start with
-	// "GIT" — GITHUB_TOKEN is not a git override.
-	if len(got) != 3 {
-		t.Fatalf("scrub result=%v, want PATH, GITHUB_TOKEN and HOME", got)
-	}
-}
+// The scrub helper's own unit tests live with it, in internal/gitcontext, since
+// every git-invoking site in the repository now shares it.

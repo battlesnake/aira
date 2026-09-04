@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"aira/internal/domain"
+	"aira/internal/gitcontext"
 	"aira/internal/gitremote"
 	"aira/internal/runner"
 	"aira/internal/store"
@@ -414,7 +415,9 @@ func PrepareInit(ctx context.Context, cwd string, args map[string]any) (InitPlan
 	var config Config
 	var data []byte
 	if existing, statErr := os.ReadFile(configPath); statErr == nil {
-		committed, err := exec.CommandContext(ctx, "git", "-C", root, "show", "HEAD:.aira/config").Output()
+		configCommand := exec.CommandContext(ctx, "git", "-C", root, "show", "HEAD:.aira/config")
+		configCommand.Env = gitcontext.ScrubbedEnvironment()
+		committed, err := configCommand.Output()
 		if err != nil {
 			return InitPlan{}, errors.New("E_ALREADY_INITIALIZED: .aira/config already exists")
 		}
@@ -779,7 +782,7 @@ func runGitRevParse(ctx context.Context, commandArgs []string) (string, error) {
 	// AIRA-46 scrubbed the same variables in .githooks/common.sh, but only for
 	// the shell hooks; this is the one path it did not reach — the binary's own
 	// git-invoking helper, which inherits whatever environment its caller had.
-	command.Env = scrubGitEnvironment(os.Environ())
+	command.Env = gitcontext.ScrubbedEnvironment()
 	command.WaitDelay = 3 * time.Second
 	output, err := command.Output()
 	if err != nil {
@@ -791,24 +794,6 @@ func runGitRevParse(ctx context.Context, commandArgs []string) (string, error) {
 		return "", err
 	}
 	return string(output), nil
-}
-
-// scrubGitEnvironment drops every GIT_* variable. It removes ALL of them rather
-// than an allowlist of the three that bite hardest: git keeps adding
-// environment-driven overrides (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE,
-// GIT_COMMON_DIR, GIT_OBJECT_DIRECTORY, GIT_CEILING_DIRECTORIES, …), and
-// discovery needs none of them — it passes `-C <dir>` and asks rev-parse a
-// question about that directory alone. An allowlist would silently regrow the
-// hole the next time git ships another one.
-func scrubGitEnvironment(env []string) []string {
-	result := make([]string, 0, len(env))
-	for _, entry := range env {
-		if strings.HasPrefix(entry, "GIT_") {
-			continue
-		}
-		result = append(result, entry)
-	}
-	return result
 }
 
 func absoluteGitPath(root, path string) string {

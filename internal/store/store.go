@@ -21,7 +21,9 @@ import (
 	"time"
 
 	"aira/internal/domain"
+	"aira/internal/gitcontext"
 	"aira/internal/runner"
+
 	"golang.org/x/sys/unix"
 	_ "modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -3443,7 +3445,7 @@ func isNotGitRepository(output string) bool {
 
 func runGit(root string, args ...string) (string, string, error) {
 	cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
-	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
+	cmd.Env = append(gitcontext.ScrubbedEnvironment(), "LC_ALL=C", "LANG=C")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

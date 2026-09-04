@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-75","project":"aira","title":"52% of this project's watchdog events are journaled=0, voiding the journal's gap-detection for them","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["daemon","dogfood","watchdog"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-75","project":"aira","title":"52% of this project's watchdog events are journaled=0, voiding the journal's gap-detection for them","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["daemon","dogfood","watchdog"],"hold":false,"relations":[]}
 ---
 Found during the whole-project simplification review (PR #12). 245 watchdog event rows for this project — 52% of all of this project's recorded events — are `journaled=0`. Watchdog events consume the project's shared `seq` counter but are never actually written to the journal. This means the journal's own gap-detection mechanism (which presumably assumes `seq` and journaled entries stay in lockstep) is void by construction for over half of this project's real event history. Rants also have no replay path per the same review. Not investigated further — needs tracing to whether this is a deliberate omission (watchdog events genuinely don't need journaling) that should be documented as such, or a real gap that should be fixed so gap-detection means what it claims to mean.
 
@@ -61,3 +61,47 @@ once (watch-visible AND journaled=0), so a future change cannot satisfy one by
 breaking the other.
 
 AIRA-75 -> done.
+
+### Build-review (Sol, 2026-09-04) — a claim above is WRONG, and this ticket is REOPENED
+
+**Retracted: "the sequence number these rows consume costs a number and nothing
+else."** That is false, and the correction matters more than the original
+resolution.
+
+Sol found the real cost, by a different mechanism than the one this ticket
+originally named. There is still no contiguity CHECKER over `events.seq` — that
+part of the correction stands — but the sequence high-water mark is **not durable
+for unjournaled rows**:
+
+- `Rebuild` derives `maxSeq` from the receipts and journal only
+  (`internal/store/store.go`, the rebuild's maxSeq computation), then restores
+  `event_counters.next_seq = maxSeq + 1`.
+- Watchdog events are unjournaled and have no receipt, so they contribute
+  NOTHING to `maxSeq`.
+- After a database loss and rebuild, the trailing watchdog sequence numbers are
+  therefore forgotten and **reissued** to new events.
+- A `aira watch` consumer that resumes from its previous cursor
+  (`cmd/aira/watch.go`, which resumes at `seq > from`) then silently SKIPS those
+  new events, because their reissued seq is not greater than the cursor it
+  already holds.
+
+That is a real correctness consequence, narrow (it needs DB loss + rebuild + a
+resuming consumer) but real, and it is exactly the "the seq costs nothing" claim
+being wrong.
+
+**The DESIGN decision is unchanged and still correct:** these events are
+watch-visible and unjournaled, because a host-global decision broadcast into
+every project has no per-project provenance to journal. What is now open is the
+COUNTER: `Rebuild` should take its high-water mark from the events table's own
+`MAX(seq)` as well as from the journal, so a seq that was issued is never
+reissued regardless of whether it was journaled.
+
+**Not fixed here.** Changing how the sequence counter is reconstructed on rebuild
+is crash-recovery semantics — the class CLAUDE.md names as requiring the full
+two-loop, not a documentation commit's tail. The measurement and the design
+rationale above stand; the counter fix is this ticket's remaining work.
+
+Also noted by the same review: the new test omits `watchdog.defer` and does not
+exercise a rebuild, so it pins the design decision but not this consequence. It
+is left as-is (it tests what it claims to test) rather than widened to imply
+coverage of a defect that is not yet fixed.
