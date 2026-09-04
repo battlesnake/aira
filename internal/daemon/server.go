@@ -140,7 +140,7 @@ func NewServer(paths Paths) *Server {
 		watchSlots:  make(chan struct{}, watchMaxConcurrent), watchPollInterval: defaultWatchPollInterval,
 		admitSlots: make(chan struct{}, admitGlobalMax), admitPollInterval: defaultAdmitPollInterval, admitBackfillGrace: defaultAdmitBackfillGrace,
 		admitFreezeMaxHold: defaultAdmitFreezeMaxHold,
-		admitQueues: map[string]*sliceQueue{},
+		admitQueues:        map[string]*sliceQueue{},
 		admitConfineScan: func(path string) (runner.ConfineListResult, error) {
 			return runner.ListConfines(context.Background(), path, nil)
 		},

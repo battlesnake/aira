@@ -83,11 +83,6 @@ func runTUI(ctx context.Context, dispatcher, executeDispatcher Dispatcher, scope
 	return runTUIRuntime(runtime, stderr)
 }
 
-func runTUIWithScreen(ctx context.Context, dispatcher, executeDispatcher Dispatcher, scope daemon.WorktreeScope, stdin io.Reader, stdout, stderr io.Writer, screen tcell.Screen) int {
-	runtime := newTUIRuntime(ctx, dispatcher, executeDispatcher, scope, stdin, stdout, stderr, screen)
-	return runTUIRuntime(runtime, stderr)
-}
-
 func runTUIRuntime(runtime *tuiRuntime, stderr io.Writer) int {
 	if err := runtime.run(); err != nil {
 		_, _ = fmt.Fprintf(stderr, "E_INTERNAL: tui: %v\n", err)

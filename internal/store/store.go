@@ -136,7 +136,6 @@ type Store struct {
 	owner             *DB
 	root              string
 	commonDir         string
-	gitDir            string
 	auditDir          string
 	dbPath            string
 	registryPath      string
@@ -381,7 +380,7 @@ func OpenReadOnly(dbPath string, opts ScopeOptions) (*Store, error) {
 	}
 	owner := &DB{db: conn, dbPath: dbPath, registryPath: filepath.Join(filepath.Dir(dbPath), "registry.jsonl")}
 	s := &Store{
-		db: conn, owner: owner, root: root, commonDir: common, gitDir: gitDir,
+		db: conn, owner: owner, root: root, commonDir: common,
 		auditDir: filepath.Join(common, "aira"), dbPath: dbPath, registryPath: owner.registryPath,
 		projectID: projectID, worktreeID: worktreeID, projectSlug: opts.ProjectSlug,
 		configDigest: opts.ConfigDigest, reviewPolicy: reviewPolicy, prefixes: map[string]string{},
@@ -408,7 +407,12 @@ func OpenReadOnly(dbPath string, opts ScopeOptions) (*Store, error) {
 		return nil, errors.New("E_CONFIG_INVALID: telemetry retention is invalid")
 	}
 	if s.leaseStateDir == "" {
-		s.leaseStateDir = defaultLeaseStateDir()
+		resolved, err := DefaultStateDir()
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		s.leaseStateDir = resolved
 	}
 	if s.leaseTTLNS == 0 {
 		s.leaseTTLNS = defaultLeaseTTLNS
@@ -597,7 +601,7 @@ func newScopeContext(ctx context.Context, db *DB, opts ScopeOptions, checkIdenti
 		return nil, err
 	}
 	s := &Store{
-		db: db.db, root: root, commonDir: common, gitDir: gitDir, auditDir: filepath.Join(common, "aira"),
+		db: db.db, root: root, commonDir: common, auditDir: filepath.Join(common, "aira"),
 		dbPath: db.dbPath, registryPath: db.registryPath, projectID: projectID,
 		worktreeID: worktreeID, projectSlug: opts.ProjectSlug, configDigest: opts.ConfigDigest,
 		reviewPolicy: reviewPolicy, prefixes: map[string]string{},
@@ -623,7 +627,11 @@ func newScopeContext(ctx context.Context, db *DB, opts ScopeOptions, checkIdenti
 		return nil, errors.New("E_CONFIG_INVALID: telemetry retention is invalid")
 	}
 	if s.leaseStateDir == "" {
-		s.leaseStateDir = defaultLeaseStateDir()
+		resolved, err := DefaultStateDir()
+		if err != nil {
+			return nil, err
+		}
+		s.leaseStateDir = resolved
 	}
 	if s.leaseTTLNS == 0 {
 		s.leaseTTLNS = defaultLeaseTTLNS
@@ -2906,10 +2914,6 @@ func (s *Store) ticketPath(id string) string {
 	return filepath.Join(s.root, ".aira", "tickets", id+".md")
 }
 
-func (s *Store) pathLock(path string) string {
-	return s.pathLockFor(s.worktreeID, path)
-}
-
 func (s *Store) pathLockFor(worktreeID, path string) string {
 	triple := s.projectID + "\x00" + worktreeID + "\x00" + path
 	return filepath.Join(s.commonDir, "aira", "locks", "path-"+digestBytes([]byte(triple))+".lock")
@@ -3546,12 +3550,6 @@ func sortedKeys(values map[string]bool) []string {
 	}
 	sort.Strings(keys)
 	return keys
-}
-
-func (s *Store) recordScanFinding(ctx context.Context, entry registryEntry, finding CheckFinding) error {
-	return s.withImmediate(ctx, func(conn *sql.Conn) error {
-		return recordScanFindingConn(ctx, conn, s.projectID, s.root, entry, finding)
-	})
 }
 
 func recordScanFindingConn(ctx context.Context, conn *sql.Conn, project, root string, entry registryEntry, finding CheckFinding) error {

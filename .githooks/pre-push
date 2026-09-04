@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-exec make -C "$ROOT_DIR" ci
+# shellcheck source=common.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
+
+aira_hook_run_make pre-push ci

@@ -395,10 +395,6 @@ func (s *Store) loadTestResults(ctx context.Context, queryer interface {
 	return results, rows.Err()
 }
 
-func sortReports(reports []domain.TestReport) {
-	sort.Slice(reports, func(i, j int) bool { return reports[i].AtSeq > reports[j].AtSeq })
-}
-
 type flakyCellKey struct {
 	commit, suite, config, env, shard string
 }

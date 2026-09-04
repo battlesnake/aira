@@ -322,8 +322,6 @@ func (s SafetyClass) Valid() bool {
 	}
 }
 
-func ValidSafetyClass(s SafetyClass) bool { return s.Valid() }
-
 type OperationArg struct {
 	Name     string `json:"name"`
 	Required bool   `json:"required"`
@@ -441,11 +439,6 @@ func New(s Store) *Core {
 func NewWithRunner(s Store, execution Runner) *Core {
 	c := &Core{store: s, runner: execution, reportMaxBytes: runnerReportMaxBytes(execution)}
 	c.verbs = c.dispatchTable()
-	return c
-}
-
-func NewWithRunnerInput(s Store, execution Runner, stdin io.Reader) *Core {
-	c := NewWithRunnerFace(s, execution, stdin, FaceOutput{})
 	return c
 }
 

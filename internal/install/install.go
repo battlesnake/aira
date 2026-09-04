@@ -927,24 +927,6 @@ func overcommitRecorded(content []byte) bool {
 	return bytes.Contains(content, []byte("\n# aira-overcommit-accepted: yes\n"))
 }
 
-func cappedWhaleOnDisk(d installDeps, path string) (bool, error) {
-	info, err := d.lstat(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return false, fmt.Errorf("%s is not a regular file", path)
-	}
-	content, err := d.readFile(path)
-	if err != nil {
-		return false, err
-	}
-	return cappedWhaleContent(content), nil
-}
-
 func cappedWhaleContent(content []byte) bool {
 	value := strings.TrimSpace(parseInstalledValue(string(content), installedMemoryMaxRE))
 	return value != "" && value != "max" && value != "infinity"
@@ -1201,30 +1183,6 @@ func lingerReport(d installDeps, uid int) string {
 	status := map[bool]string{true: "on", false: "off"}[value == "yes"]
 	d.logf("linger: %s", status)
 	return status
-}
-
-func inspectExistingPath(d installDeps, path string, uid int, unit string, requireMarker bool) ([]byte, error) {
-	info, err := d.lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("refusing symlink unit %s", path)
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("refusing non-regular unit %s", path)
-	}
-	if owner, ok := fileOwner(info); !ok || owner != uid {
-		return nil, fmt.Errorf("refusing unit not owned by uid %d: %s", uid, path)
-	}
-	content, err := d.readFile(path)
-	if err != nil {
-		return nil, err
-	}
-	if requireMarker && !hasMarker(content, unit) {
-		return nil, fmt.Errorf("refusing foreign marker-less unit %s", path)
-	}
-	return content, nil
 }
 
 func fileOwner(info os.FileInfo) (int, bool) {

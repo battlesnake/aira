@@ -262,56 +262,18 @@ func (d *daemonDispatcher) DispatchPalette(ctx context.Context, scope daemon.Wor
 }
 
 func (d *daemonDispatcher) dispatchClient(ctx context.Context, scope daemon.WorktreeScope, request core.Request) core.Response {
+	// Both dispatch shapes need the same prologue: ensure the daemon knows this
+	// scope, rebuild the project, and prove it did not move underneath the scope
+	// already resolved. Only the store handed to dispatchCarved differs — a
+	// carved request gets the guard, everything else gets a read-only store
+	// fronted by the daemon write relay.
+	built, failure := d.prepareClientProject(ctx, scope)
+	if failure != nil {
+		return *failure
+	}
+	project := *built
 	if core.StoreFreeCarved(request.Verb, request.Args) {
-		frame := daemon.StoreOpFrame{Proto: daemon.ProtocolVersion, Scope: scope, Op: "ensure-scope"}
-		response, err := d.exchangeWithReplacement(ctx, func(ctx context.Context) (daemon.ResponseFrame, error) {
-			return d.exchangeOrStartStoreOp(ctx, frame)
-		})
-		if err != nil {
-			return transportErrorResponse(err)
-		}
-		if !response.OK {
-			return response.CoreResponse()
-		}
-		project, err := app.Discover(ctx, scope.Root)
-		if err != nil {
-			code := store.ErrorCode(err)
-			return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
-		}
-		if err := validateProjectSnapshot(project, scope, d.paths); err != nil {
-			code := store.ErrorCode(err)
-			return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
-		}
-		project, err = app.BuildWithoutStore(project, d.diagnostics)
-		if err != nil {
-			code := store.ErrorCode(err)
-			return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
-		}
 		return d.dispatchCarved(ctx, request, core.StoreGuard(), project)
-	}
-	frame := daemon.StoreOpFrame{Proto: daemon.ProtocolVersion, Scope: scope, Op: "ensure-scope"}
-	response, err := d.exchangeWithReplacement(ctx, func(ctx context.Context) (daemon.ResponseFrame, error) {
-		return d.exchangeOrStartStoreOp(ctx, frame)
-	})
-	if err != nil {
-		return transportErrorResponse(err)
-	}
-	if !response.OK {
-		return response.CoreResponse()
-	}
-	project, err := app.Discover(ctx, scope.Root)
-	if err != nil {
-		code := store.ErrorCode(err)
-		return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
-	}
-	if err := validateProjectSnapshot(project, scope, d.paths); err != nil {
-		code := store.ErrorCode(err)
-		return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
-	}
-	project, err = app.BuildWithoutStore(project, d.diagnostics)
-	if err != nil {
-		code := store.ErrorCode(err)
-		return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
 	}
 	readScope := scope
 	readScope.ReviewPolicy.Configured = readScope.ReviewConfigured
@@ -340,6 +302,40 @@ func (d *daemonDispatcher) dispatchClient(ctx context.Context, scope daemon.Work
 		d.afterRelayWiring(readOnly.RunnerConfigured(), project.Runner.SupervisorLeaseReaderConfigured())
 	}
 	return d.dispatchCarved(ctx, request, relay, project)
+}
+
+// prepareClientProject runs the ensure-scope exchange and rebuilds the project
+// for a client-side dispatch. On any failure it returns a ready-to-return
+// response, so callers do not repeat the error mapping.
+func (d *daemonDispatcher) prepareClientProject(ctx context.Context, scope daemon.WorktreeScope) (*app.Project, *core.Response) {
+	fail := func(err error) *core.Response {
+		code := store.ErrorCode(err)
+		return &core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+	}
+	frame := daemon.StoreOpFrame{Proto: daemon.ProtocolVersion, Scope: scope, Op: "ensure-scope"}
+	response, err := d.exchangeWithReplacement(ctx, func(ctx context.Context) (daemon.ResponseFrame, error) {
+		return d.exchangeOrStartStoreOp(ctx, frame)
+	})
+	if err != nil {
+		transport := transportErrorResponse(err)
+		return nil, &transport
+	}
+	if !response.OK {
+		refused := response.CoreResponse()
+		return nil, &refused
+	}
+	project, err := app.Discover(ctx, scope.Root)
+	if err != nil {
+		return nil, fail(err)
+	}
+	if err := validateProjectSnapshot(project, scope, d.paths); err != nil {
+		return nil, fail(err)
+	}
+	project, err = app.BuildWithoutStore(project, d.diagnostics)
+	if err != nil {
+		return nil, fail(err)
+	}
+	return &project, nil
 }
 
 func validateProjectSnapshot(project app.Project, scope daemon.WorktreeScope, paths daemon.Paths) error {
@@ -379,11 +375,11 @@ func (d *daemonDispatcher) dispatchCarved(ctx context.Context, request core.Requ
 	project.Runner.SetAdmitSocketPath(d.paths.SocketPath)
 	project.Runner.SetInputRuntimeDir(d.paths.RuntimeDir)
 	face := core.FaceOutput{Stdout: d.stdout, Stderr: d.diagnostics, Live: (request.Verb == "run" || request.Verb == "git" || request.Verb == "time") && !d.jsonOutput}
-	dispatcher := core.NewWithRunnerFace(s, project.Runner, d.stdin, face).WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix).WithMemoryEstimate(project.Config.Run.MemoryEstimate)
+	dispatcher := core.NewWithRunnerFace(s, project.Runner, d.stdin, face)
 	if d.outputCap > 0 {
-		dispatcher = core.NewWithRunnerFace(s, project.Runner, d.stdin, face).WithOutputCap(d.outputCap).WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix).WithMemoryEstimate(project.Config.Run.MemoryEstimate)
+		dispatcher = dispatcher.WithOutputCap(d.outputCap)
 	}
-	return dispatcher.Do(ctx, request)
+	return dispatcher.WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix).WithMemoryEstimate(project.Config.Run.MemoryEstimate).Do(ctx, request)
 }
 
 func (d *daemonDispatcher) exchangeWithReplacement(ctx context.Context, exchange func(context.Context) (daemon.ResponseFrame, error)) (daemon.ResponseFrame, error) {
@@ -651,11 +647,11 @@ func (d *inProcessDispatcher) Dispatch(ctx context.Context, scope daemon.Worktre
 	}
 	canonical := core.CanonicalVerb(request.Verb)
 	face := core.FaceOutput{Stdout: d.stdout, Stderr: d.diagnostics, Live: (canonical == "run" || canonical == "git" || canonical == "time") && !d.jsonOutput}
-	dispatcher := core.NewWithRunnerFace(s, project.Runner, d.stdin, face).WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix).WithMemoryEstimate(project.Config.Run.MemoryEstimate)
+	dispatcher := core.NewWithRunnerFace(s, project.Runner, d.stdin, face)
 	if d.outputCap > 0 {
-		dispatcher = core.NewWithRunnerFace(s, project.Runner, d.stdin, face).WithOutputCap(d.outputCap).WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix).WithMemoryEstimate(project.Config.Run.MemoryEstimate)
+		dispatcher = dispatcher.WithOutputCap(d.outputCap)
 	}
-	return dispatcher.Do(ctx, request)
+	return dispatcher.WithGitOps(project.GitOps).WithCommandPrefix(project.Config.Run.Prefix).WithMemoryEstimate(project.Config.Run.MemoryEstimate).Do(ctx, request)
 }
 
 func stampRantCaller(request *core.Request) {

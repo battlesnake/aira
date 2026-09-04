@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"aira/internal/runner"
 	"aira/internal/store"
 )
 
@@ -91,6 +92,34 @@ func TestRunAdmissionConfigParsesBytesAndDuration(t *testing.T) {
 	}
 }
 
+// TestRunMemoryHeadroomAcceptsTheSameGrammarAsTheFlag pins candidate 79 /
+// AIRA-90: run.memory_headroom and --memory-max are the same concept, so they
+// must accept the same spellings. Before the two parsers were unified, every
+// spelling below except "4G" was refused by the config while the flag took it,
+// and a test asserted that "4GB" was malformed.
+func TestRunMemoryHeadroomAcceptsTheSameGrammarAsTheFlag(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  int64
+	}{
+		{value: "4G", want: 4 << 30},
+		{value: "4GB", want: 4 << 30},
+		{value: "4GiB", want: 4 << 30},
+		{value: "1.5G", want: 3 << 29},
+		{value: "512MiB", want: 512 << 20},
+		{value: "1024B", want: 1024},
+	} {
+		reserve, _, _, err := parsedRunAdmission(RunConfig{Slice: "whale.slice", MemoryHeadroom: test.value})
+		if err != nil || reserve != test.want {
+			t.Errorf("run.memory_headroom %q = %d, err=%v; want %d", test.value, reserve, err, test.want)
+		}
+		flag, flagErr := runner.ParseMemorySize(test.value)
+		if flagErr != nil || flag != reserve {
+			t.Errorf("--memory-max %q = %d (err=%v) disagrees with run.memory_headroom = %d", test.value, flag, flagErr, reserve)
+		}
+	}
+}
+
 func TestRunMemoryEstimateRequiresAdmissionAndCapsHeadroom(t *testing.T) {
 	for name, run := range map[string]RunConfig{
 		"without admission":           {MemoryEstimate: true},
@@ -145,7 +174,7 @@ func TestRunAdmissionConfigRejectsMalformedAndHalfConfig(t *testing.T) {
 		"headroom only":       {MemoryHeadroom: "4G"},
 		"zero":                {Slice: "whale.slice", MemoryHeadroom: "0"},
 		"negative":            {Slice: "whale.slice", MemoryHeadroom: "-1"},
-		"malformed":           {Slice: "whale.slice", MemoryHeadroom: "4GB"},
+		"malformed":           {Slice: "whale.slice", MemoryHeadroom: "4Gigs"},
 		"overflow":            {Slice: "whale.slice", MemoryHeadroom: "9223372036854775807G"},
 		"zero duration":       {Slice: "whale.slice", MemoryHeadroom: "4G", AdmissionMaxWait: "0s"},
 		"negative duration":   {Slice: "whale.slice", MemoryHeadroom: "4G", AdmissionMaxWait: "-1s"},

@@ -14,10 +14,6 @@ import (
 
 const mcpOutputCap = 64 * 1024
 
-func runMCP(ctx context.Context, input io.Reader, output, diagnostics io.Writer) int {
-	return runMCPWithDispatcher(ctx, input, output, diagnostics, nil)
-}
-
 func runMCPWithDispatcher(ctx context.Context, input io.Reader, output, diagnostics io.Writer, injected Dispatcher) int {
 	paths, err := daemon.PathsFromEnv()
 	if err != nil {
