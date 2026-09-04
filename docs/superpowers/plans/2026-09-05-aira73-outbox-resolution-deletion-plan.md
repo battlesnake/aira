@@ -137,7 +137,7 @@ built, it must not reintroduce a second completion truth beside `materialised`
 | `TestConflictedIntentHasNoRetirePath` | §4's gap, executable |
 | `TestConcurrentOpensOfALegacyDatabaseAllSucceed` | **weak, and labelled as such in its own doc comment** — see below |
 
-Mutation runs, each confirmed to turn the relevant test red (6/6):
+Mutation runs, each confirmed to turn the relevant test red (8/8):
 
 | Mutation | Caught by |
 |---|---|
@@ -147,6 +147,8 @@ Mutation runs, each confirmed to turn the relevant test red (6/6):
 | predicate widened to `materialised = 0 OR materialised = 1` (still contains the asserted substring) | fresh-schema test's *behavioural* half — proves the string assertion is not the only load-bearing one |
 | a retire path added (conflict branch deletes the row) | characterisation test |
 | in-transaction re-check removed | `TestMigrationReCheckMakesTheLosingRacerANoOp` |
+| whole migration deleted (review finding #1's oracle) | `TestOutboxResolutionMigrationIsIdempotent` — **only after** its legacy seed was added; it passed this mutation before |
+| the column probe swallows a query error and returns `false` (review finding #3) | `TestLegacyOutboxResolutionColumnIsDroppedOnOpen` |
 
 **One test is honestly declared weak.** `TestConcurrentOpensOfALegacyDatabaseAllSucceed`
 (6 goroutines racing `OpenDB` on one legacy database) was mutation-tested
@@ -195,5 +197,38 @@ rather than self-review alone.
   included returned empty responses (and Gemini errored), so the review
   breadth here is thinner than a Tier-A item's, and this section is the record
   of that.
-- **Self-review + 6 mutations** (§5) is the rest of the evidence, including the
+- **Anthropic-lineage `/code-review high`: completed, verdict "production
+  change is correct", four LOW findings, none blocking.** It independently
+  re-derived the load-bearing premise with `git log -S` across *all* history
+  (no INSERT/UPDATE ever assigned the column, no `SELECT *` on the table), and
+  separately confirmed the migration ordering, the FK-replay carrying the
+  rewritten index forward, the absence of blocking triggers/views on DROP
+  COLUMN, and that `E_PATH_INTENT_UNRESOLVED`'s removal is safe (`ExitForCode`
+  defaults unknown codes to 1; nothing else referenced it). Its findings
+  reached the coordinating session rather than this one — the routing quirk
+  AIRA-95 already documents — and were relayed.
+  - **#1 folded in.** `TestOutboxResolutionMigrationIsIdempotent` opened a
+    *fresh* database on all three passes, so the migration was never reached
+    and the test would have passed with the whole migration deleted. Now seeded
+    with `writeLegacyOutboxDatabase`, so pass 0 is a real migration; verified by
+    mutation (deleting the migration now turns it red — it did not before).
+  - **#3 folded in.** The shared `hasTableColumn` collapses a query error into
+    `false`, indistinguishable from "already migrated" — inside this migration
+    that silently skips the drop and commits an empty transaction, contradicting
+    this doc's own "fail-closed" claim and the repo's rule that a check which
+    cannot establish its result must say so. Replaced with a local fail-closed
+    probe, `outboxHasResolutionColumn`, used on both the fast path and the
+    locked re-check; verified by mutation.
+  - **#2 not actioned here (pre-existing).** `ensureOutboxKind` and
+    `ensureAreaHintsGeneration` carry the same unguarded two-process race this
+    migration was built to avoid. Filed as **AIRA-97**; deliberately not
+    widened into this PR.
+  - **#4 accepted and documented, not fixed.** If `DROP COLUMN` ever exceeded
+    the 5s `busy_timeout` on an unusually large outbox, a concurrent opener's
+    `BEGIN IMMEDIATE` would get `SQLITE_BUSY`, which the retry path does not
+    retry (it retries only `SQLITE_IOERR`), failing that `Open`. The live outbox
+    is small and `ensureProjectOwnershipFKs` already carries the identical
+    exposure, so per this repo's "keep the primitive, document the gap"
+    preference this is recorded rather than answered with retry machinery.
+- **Self-review + 8 mutations** (§5) is the rest of the evidence, including the
   one honestly-declared-weak test.

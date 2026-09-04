@@ -1270,11 +1270,13 @@ func (s *Store) ensureOutboxKind(ctx context.Context) error {
 // full pre-AIRA-73 schema or the full current one — never a table without its
 // single-writer index (the M5/M9 non-transactional-migration lesson).
 //
-// If a row somehow did carry a non-NULL resolution, recreating the index could
-// find a duplicate: that aborts the transaction and fails Open loudly rather
-// than silently discarding one of two conflicting intents. Fail-closed is the
-// correct direction here — such a row cannot be produced by this codebase, so
-// its existence means something outside it wrote to the DB.
+// Fail-closed in both directions it can fail. If a row somehow did carry a
+// non-NULL resolution, recreating the index could find a duplicate: that aborts
+// the transaction and fails Open loudly rather than silently discarding one of
+// two conflicting intents (such a row cannot be produced by this codebase, so
+// its existence means something outside it wrote to the DB). And if the column
+// probe itself cannot be answered, that error is surfaced rather than read as
+// "already migrated" — see outboxHasResolutionColumn.
 //
 // Concurrency: several processes may Open the same machine-wide database at
 // once (the daemon, the CLI fallback via app.OpenWithDiagnostics, a detached
@@ -1286,12 +1288,51 @@ func (s *Store) ensureOutboxKind(ctx context.Context) error {
 // without attempting a DROP that would fail with "no such column" and take
 // its whole Open down with it.
 func (s *Store) ensureOutboxResolutionDropped(ctx context.Context) error {
-	if !hasTableColumn(ctx, s.db, "outbox", "resolution") {
+	present, err := outboxHasResolutionColumn(ctx, s.db)
+	if err != nil {
+		return translateDBError(err)
+	}
+	if !present {
 		return nil
 	}
 	return s.withImmediate(ctx, func(conn *sql.Conn) error {
 		return dropOutboxResolutionLocked(ctx, conn)
 	})
+}
+
+// outboxHasResolutionColumn is a fail-closed column probe, deliberately NOT the
+// shared hasTableColumn helper: that one collapses a query error into `false`,
+// which here is indistinguishable from "already migrated" and would silently
+// skip the migration, committing an empty transaction and letting Open succeed
+// against an unmigrated schema. This repo's rule is that a check which cannot
+// establish its result must say so rather than report a convenient answer, so
+// the error is surfaced and Open fails loudly instead. (The shared helper has
+// the same defect for its other callers; that is pre-existing and tracked
+// separately as AIRA-97, not widened into this change.)
+func outboxHasResolutionColumn(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}) (bool, error) {
+	rows, err := q.QueryContext(ctx, `PRAGMA table_info(outbox)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return false, err
+		}
+		if name == "resolution" {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return found, nil
 }
 
 // dropOutboxResolutionLocked is the write half of ensureOutboxResolutionDropped,
@@ -1300,7 +1341,11 @@ func (s *Store) ensureOutboxResolutionDropped(ctx context.Context) error {
 // what the losing side of a two-process race executes. It assumes the caller
 // already holds the write lock (BEGIN IMMEDIATE).
 func dropOutboxResolutionLocked(ctx context.Context, conn *sql.Conn) error {
-	if !hasTableColumn(ctx, conn, "outbox", "resolution") {
+	present, err := outboxHasResolutionColumn(ctx, conn)
+	if err != nil {
+		return err
+	}
+	if !present {
 		return nil
 	}
 	if _, err := conn.ExecContext(ctx, `DROP INDEX IF EXISTS unresolved_path_intent`); err != nil {
@@ -1309,7 +1354,7 @@ func dropOutboxResolutionLocked(ctx context.Context, conn *sql.Conn) error {
 	if _, err := conn.ExecContext(ctx, `ALTER TABLE outbox DROP COLUMN resolution`); err != nil {
 		return err
 	}
-	_, err := conn.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS unresolved_path_intent
+	_, err = conn.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS unresolved_path_intent
             ON outbox(project_id, worktree_id, path)
             WHERE materialised = 0`)
 	return err

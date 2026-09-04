@@ -370,12 +370,19 @@ func TestConflictedIntentHasNoRetirePath(t *testing.T) {
 	}
 }
 
-// TestOutboxResolutionMigrationIsIdempotent pins the read-only fast path: a
-// second Open of an already-migrated database must not attempt the DDL again.
+// TestOutboxResolutionMigrationIsIdempotent pins that a real migration can be
+// re-Opened: pass 0 actually performs the drop, and passes 1-2 take the
+// read-only fast path without attempting the DDL again.
+//
+// The legacy seed below is load-bearing. An earlier version of this test opened
+// a FRESH database on every pass, so the migration was never reached at all and
+// the test would have passed identically with the whole migration deleted —
+// idempotence of a thing that never ran. Caught in review.
 func TestOutboxResolutionMigrationIsIdempotent(t *testing.T) {
 	base := t.TempDir()
 	path := filepath.Join(base, "state.db")
 	registry := filepath.Join(base, "registry.jsonl")
+	writeLegacyOutboxDatabase(t, path)
 	for pass := 0; pass < 3; pass++ {
 		db, err := OpenDB(path, registry)
 		if err != nil {
