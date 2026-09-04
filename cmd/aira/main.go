@@ -406,20 +406,40 @@ func runSupervisor(argv []string, diagnostics io.Writer) int {
 		}
 		request.TelemetryPending = core.TelemetryPending
 	}
-	s, project, err := app.OpenWithDiagnostics(context.Background(), ".", diagnostics)
+	// AIRA-85: the supervisor opens NO read-write state.db handle. It builds the
+	// project's local execution dependencies without a store, then takes a
+	// read-only view whose writes relay to the DB-owning daemon, so the daemon
+	// stays the single writer. app.OpenWithDiagnostics is deliberately not used
+	// here — it opens state.db read-write (and would migrate and register from a
+	// background process the daemon knows nothing about).
+	project, err := app.OpenWithoutStore(context.Background(), ".", diagnostics)
 	if err != nil {
 		writeSupervisorFailure(readyFD, "E_RUN_DETACH_FAILED", err.Error())
 		return store.ExitForCode("E_RUN_DETACH_FAILED")
 	}
-	defer s.Close()
-	if paths, pathErr := daemon.PathsFromEnv(); pathErr == nil {
+	paths, pathErr := daemon.PathsFromEnv()
+	if pathErr == nil {
 		project.Runner.SetAdmitSocketPath(paths.SocketPath)
 		project.Runner.SetInputRuntimeDir(paths.RuntimeDir)
+	} else if diagnostics != nil {
+		// Not fatal — the run itself is still supervised, exactly as before this
+		// change. But it is no longer silent: with no daemon endpoint there is no
+		// relay, so any telemetry this run settles will be reported incomplete
+		// rather than recorded, and the reason belongs on stderr.
+		_, _ = fmt.Fprintf(diagnostics, "detached supervisor: daemon paths unavailable, telemetry cannot be relayed: %v\n", pathErr)
 	}
+	telemetryStore, err := supervisorTelemetryStore(project, paths)
+	if err != nil {
+		writeSupervisorFailure(readyFD, "E_RUN_DETACH_FAILED", err.Error())
+		return store.ExitForCode("E_RUN_DETACH_FAILED")
+	}
+	defer telemetryStore.Close()
+	telemetryStore.SetRunner(project.Runner)
+	project.Runner.SetSupervisorLeaseReader(telemetryStore.SupervisorLeaseLive)
 	record, superviseErr := project.Runner.SuperviseRequest(context.Background(), request, readyFD, ackFD)
 	var telemetryErr error
 	if wiringRequested && detachedWiringTerminal(record) {
-		wiring, _, settleErr := core.NewWithRunner(s, project.Runner).WireAndSettleDetached(context.Background(), *record, wiringParams, reportContext)
+		wiring, _, settleErr := core.NewWithRunner(telemetryStore, project.Runner).WireAndSettleDetached(context.Background(), *record, wiringParams, reportContext)
 		telemetryErr = settleErr
 		if diagnostics != nil && !wiring.WiringComplete {
 			for _, warning := range wiring.Warnings {
