@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"testing"
 
@@ -62,6 +63,16 @@ func TestCreatingWorkerScopesDoesNotLeakFileDescriptors(t *testing.T) {
 		t.Fatalf("warm-up response=%+v", response)
 	}
 
+	// GC OFF for the measurement, and this is load-bearing rather than tidiness.
+	// A leaked *os.File is closed by its finalizer, which only runs after a GC,
+	// so with GC enabled this test measures whether a collection happened to
+	// occur — not whether the FD is leaked. Left enabled it is FLAKY in the
+	// worst direction: a mutation run that removed the Close still passed here
+	// (it failed by +15 once and by less than the margin the next time). With
+	// collection disabled every leaked FD stays open, so an unfixed build lands
+	// at exactly +30 and a fixed one at 0.
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+
 	const creations = 30
 	before := openFDs()
 	for i := 0; i < creations; i++ {
@@ -71,10 +82,8 @@ func TestCreatingWorkerScopesDoesNotLeakFileDescriptors(t *testing.T) {
 			t.Fatalf("create %d: response=%+v proceed=%v", i, response, proceed)
 		}
 	}
-	// Generous: the leak is one FD per creation, so an unfixed build lands at
-	// +30 while a fixed one stays flat. The margin only absorbs unrelated
-	// runtime churn, never the defect.
-	if growth := openFDs() - before; growth > creations/3 {
+	// The margin absorbs unrelated runtime churn only; the defect is +30.
+	if growth := openFDs() - before; growth > 5 {
 		t.Fatalf("open fds grew by %d across %d worker-scope creations (before=%d): the cgroup directory FD is not being closed, and the daemon holds it for its whole lifetime",
 			growth, creations, before)
 	}
