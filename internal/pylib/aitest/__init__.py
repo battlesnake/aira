@@ -149,16 +149,19 @@ def _resolve_estimated_bytes():
     if value < _ESTIMATED_BYTES_MIN:
         # Clamp UP here, before this value ever reaches the wire (Fable
         # build-review, final gate): an unclamped too-small value used to
-        # reach the CLI's own floor rejection unchanged, whose
-        # E_CONFINE_ARGUMENT_INVALID-prefixed stderr message matched none
-        # of acquire_worker's recognized denied/timeout/unevaluated/
-        # local-placement-failed substrings and fell through to
-        # WorkerAdmitUnavailable -- permanently stripping containment for
-        # the WHOLE run over a user typo in this env var, on a daemon
-        # that was never actually unreachable. This is a purely local,
-        # static mistake, not a daemon condition at all, so it is fixed
-        # here rather than by teaching the classifier yet another
-        # substring.
+        # reach the CLI's own floor rejection unchanged, whose prose stderr
+        # message matched none of acquire_worker's substring probes and
+        # fell through to WorkerAdmitUnavailable -- permanently stripping
+        # containment for the WHOLE run over a user typo in this env var,
+        # on a daemon that was never actually unreachable.
+        #
+        # AIRA-42 has since removed that whole substring classifier: the
+        # relay now reports its own argument rejection as
+        # class=request-invalid on the structured outcome channel, which
+        # acquire_worker maps to WorkerAdmitRequestInvalid -- terminal for
+        # the queued work, never an unconfined fallback. The clamp stays
+        # anyway: refusing a typo before it reaches the wire is still
+        # better than a correctly-classified failure.
         sys.stderr.write(
             "aira aitest: AIRA_AITEST_ESTIMATED_BYTES=%d is below the %d-byte "
             "minimum; using %d\n" % (value, _ESTIMATED_BYTES_MIN, _ESTIMATED_BYTES_MIN)
@@ -169,11 +172,13 @@ def _resolve_estimated_bytes():
         # floor case above -- an oversized value (e.g. a bytes-vs-MiB units
         # typo the other direction) used to sail past this resolver
         # unclamped, reach the CLI's own now-added top-end check, and if it
-        # somehow got past THAT too, hit the daemon's protocol-level
-        # rejection (E_DAEMON_PROTOCOL) -- a code the classifier does not
-        # recognize either, falling through to WorkerAdmitUnavailable and
-        # permanently stripping containment on a healthy daemon, same as
-        # the floor case.
+        # somehow got past THAT too, hit the daemon's own protocol-level
+        # argument rejection. Under AIRA-42's structured outcome channel
+        # that rejection now arrives as class=request-invalid (terminal for
+        # the queued work) rather than falling through to
+        # WorkerAdmitUnavailable and stripping containment on a healthy
+        # daemon; AIRA-45 additionally split it from the protocol-VERSION
+        # mismatch, which the two used to share one bucket for.
         sys.stderr.write(
             "aira aitest: AIRA_AITEST_ESTIMATED_BYTES=%d is above the %d-byte "
             "maximum; using %d\n" % (value, _ESTIMATED_BYTES_MAX, _ESTIMATED_BYTES_MAX)

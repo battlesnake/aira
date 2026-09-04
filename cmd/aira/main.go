@@ -100,6 +100,20 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	verb := strings.ToLower(args[0])
 	positional, options, err := parseArgs(verb, args[1:])
 	if err != nil {
+		if verb == "worker-admit" {
+			// worker-admit's caller is the aitest supervisor, which reads
+			// one structured stdout line and nothing else. An argument
+			// mistake that produced only a rendered error left it with no
+			// outcome at all, which it can only read as "the relay
+			// produced nothing" -> daemon unusable -> run the rest of the
+			// suite unconfined. That is the AIRA-42 misclassification in
+			// its purest form, one layer above runWorkerAdmitCommand, so
+			// this verb's pre-dispatch failures speak the same channel.
+			return writeWorkerAdmitOutcome(stdout, stderr, runner.WorkerAdmitOutcome{
+				State: runner.WorkerAdmitStateArgumentInvalid, Class: runner.WorkerAdmitClassRequestInvalid,
+				Reason: runner.WorkerAdmitReasonArgumentsInvalid, Detail: err.Error(),
+			}, nil, "E_CONFINE_ARGUMENT_INVALID")
+		}
 		code := store.ErrorCode(err)
 		if code == "E_INTERNAL" {
 			code = "E_SELECTOR_INVALID"
@@ -145,8 +159,16 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	}
 	if verb == "worker-admit" {
 		if jsonOutput {
-			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for worker-admit", Exit: store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
-			return render(response, true, stdout, stderr)
+			// Reported on the structured channel rather than as a rendered
+			// JSON error, for the same reason as the parseArgs branch
+			// above: stdout belongs to the outcome channel for this verb,
+			// and a caller that gets no outcome line falls back
+			// unconfined.
+			return writeWorkerAdmitOutcome(stdout, stderr, runner.WorkerAdmitOutcome{
+				State: runner.WorkerAdmitStateArgumentInvalid, Class: runner.WorkerAdmitClassRequestInvalid,
+				Reason: runner.WorkerAdmitReasonArgumentsInvalid,
+				Detail: "option --json is not valid for worker-admit",
+			}, nil, "E_CONFINE_ARGUMENT_INVALID")
 		}
 		return runWorkerAdmitCommand(context.Background(), options, stdin, stdout, stderr)
 	}
@@ -1061,6 +1083,39 @@ func runAitestBootstrapCommand(ctx context.Context, options map[string]string, s
 	return 0
 }
 
+// writeWorkerAdmitOutcome emits the ONE machine-readable line the aitest
+// supervisor parses, on stdout, plus a human diagnostic on stderr that nothing
+// parses. Every exit from the worker-admit verb goes through here — including
+// the pre-dispatch argument failures in main() — so "there is always exactly
+// one structured outcome" is a property of the verb, not a hope. Before this,
+// non-grants were free text on stderr and the supervisor re-derived their
+// meaning with eleven substring probes whose default was to run the rest of
+// the suite unconfined (AIRA-42).
+//
+// errorCode is the store code whose exit status the verb returns; "" means the
+// granted path (exit 0). A render failure is itself reported, but there is by
+// definition no channel left to report it ON, so it only reaches stderr.
+func writeWorkerAdmitOutcome(stdout, stderr io.Writer, outcome runner.WorkerAdmitOutcome, grant *runner.WorkerAdmitGrantFields, errorCode string) int {
+	line, err := runner.WorkerAdmitOutcomeLine(outcome, grant)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: worker-admit could not render its outcome: %v\n", err)
+		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
+	}
+	if _, err := fmt.Fprintln(stdout, line); err != nil {
+		_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: write worker-admit outcome: %v\n", err)
+		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
+	}
+	if errorCode == "" {
+		return 0
+	}
+	detail := outcome.Detail
+	if detail == "" {
+		detail = outcome.Reason
+	}
+	_, _ = fmt.Fprintf(stderr, "%s: worker-admit %s (%s): %s\n", errorCode, outcome.State, outcome.Reason, detail)
+	return store.ExitForCode(errorCode)
+}
+
 func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// Mirrors --memory-reserve's identical 1MiB floor (parseConfineArgs,
 	// above) -- this used to only reject <=0, so an out-of-range value below
@@ -1083,43 +1138,73 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 		if err == nil {
 			err = errors.New("must be at least 1MiB and no larger than 1PiB")
 		}
-		_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --estimated-bytes: %v\n", err)
-		return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		return writeWorkerAdmitOutcome(stdout, stderr, runner.WorkerAdmitOutcome{
+			State: runner.WorkerAdmitStateArgumentInvalid, Class: runner.WorkerAdmitClassRequestInvalid,
+			Reason: runner.WorkerAdmitReasonEstimatedBytesOutOfRange,
+			Detail: fmt.Sprintf("--estimated-bytes: %v", err),
+		}, nil, "E_CONFINE_ARGUMENT_INVALID")
 	}
 	maxWait := runner.DefaultConfineReserveMaxWait
 	if raw := options["max-wait"]; raw != "" {
 		if maxWait, err = time.ParseDuration(raw); err != nil || maxWait <= 0 {
-			_, _ = fmt.Fprintln(stderr, "E_CONFINE_ARGUMENT_INVALID: invalid --max-wait")
-			return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+			return writeWorkerAdmitOutcome(stdout, stderr, runner.WorkerAdmitOutcome{
+				State: runner.WorkerAdmitStateArgumentInvalid, Class: runner.WorkerAdmitClassRequestInvalid,
+				Reason: runner.WorkerAdmitReasonMaxWaitInvalid, Detail: "invalid --max-wait",
+			}, nil, "E_CONFINE_ARGUMENT_INVALID")
 		}
 	}
 	paths, err := daemon.PathsFromEnv()
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: daemon paths unavailable: %v\n", err)
-		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
+		return writeWorkerAdmitOutcome(stdout, stderr, runner.WorkerAdmitOutcome{
+			State: runner.WorkerAdmitStateUnavailable, Class: runner.WorkerAdmitClassAdmissionUnusable,
+			Reason: runner.WorkerAdmitReasonDaemonPathsUnavailable,
+			Detail: fmt.Sprintf("daemon paths unavailable: %v", err),
+		}, nil, "E_CONFINE_UNAVAILABLE")
 	}
 	signalCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	lease, err := runner.RequestWorkerAdmit(signalCtx, runner.WorkerAdmitClientRequest{
+	outcome := runner.RequestWorkerAdmit(signalCtx, runner.WorkerAdmitClientRequest{
 		SocketPath: paths.SocketPath, JobID: options["job-id"], OuterScope: options["outer-scope"],
 		Signature: options["signature"], EstimatedBytes: estimatedBytes, MaxWait: maxWait,
 	})
-	if err != nil {
-		_, _ = fmt.Fprintln(stderr, err)
-		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
+	if !outcome.Granted() {
+		// The daemon's (or the transport's) own classification is relayed
+		// VERBATIM. Nothing here re-derives it, and nothing downstream
+		// re-derives it from prose either — that round trip through a
+		// human sentence is the AIRA-42 defect this whole channel removes.
+		return writeWorkerAdmitOutcome(stdout, stderr, outcome, nil, "E_CONFINE_UNAVAILABLE")
 	}
 	// AIRA-39: the DAEMON creates the worker scope now, inside the same
 	// critical section that decided to grant, so there is no local
 	// CreateWorkerScope call here any more and no grant->creation window for a
 	// dying client to leave open. The scope named below already exists, with
 	// its memory.max, memory.high and memory.oom.group verified daemon-side.
-	// The "worker-admit local-placement-failed" marker went with the call site;
-	// a daemon-side creation failure is now a reject:worker-scope-create-failed
-	// denial, which supervisor.py already classifies as terminal.
-	if _, err := fmt.Fprintf(stdout, "granted scope=%s worker_id=%s memory_max=%d memory_high=%d\n", lease.ScopePath, lease.WorkerID, lease.MemoryMax, lease.MemoryHigh); err != nil {
+	//
+	// AIRA-42 merge note: this fix was built against the pre-AIRA-39 shape,
+	// where a LOCAL CreateWorkerScope failure here produced the
+	// `placement-failed` class. That call site is gone, so the CLI has no
+	// placement path left to classify; a scope-creation failure is now the
+	// daemon's own `worker-scope-create-failed` denial, classified daemon-side
+	// like every other verdict. `placement-failed` survives in the catalogue
+	// because supervisor.py still raises WorkerPlacementFailed from its own
+	// fork/ack path -- it is simply no longer produced by this relay.
+	//
+	// A failed write here therefore leaves the daemon-created scope on the
+	// tree, charging the AIRA-39 ledger until the outer confine job's teardown
+	// removes the subtree. Not removing it is deliberate and matches the
+	// symmetric decision the daemon itself makes on its own failed response
+	// write (worker_admit.go: "Removing it here is NOT safe"). The CLI does not
+	// own this scope, and a relay that unilaterally rmdir'd a cgroup the daemon
+	// created and the supervisor may already have been told about would trade a
+	// loud, retriable over-charge for a silent unconfined run.
+	lease := outcome.Lease
+	grantFields := &runner.WorkerAdmitGrantFields{
+		ScopePath: lease.ScopePath, WorkerID: lease.WorkerID,
+		MemoryMax: lease.MemoryMax, MemoryHigh: lease.MemoryHigh,
+	}
+	if exit := writeWorkerAdmitOutcome(stdout, stderr, outcome, grantFields, ""); exit != 0 {
 		_ = lease.Close()
-		_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: write grant: %v\n", err)
-		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
+		return exit
 	}
 	// Hold stdin open as the release signal, exactly mirroring confine-reserve.
 	done := make(chan struct{})

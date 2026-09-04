@@ -31,9 +31,23 @@ const workerAdmitEstimatedBytesMin int64 = 1 << 20 // 1 MiB
 
 // WorkerAdmitResponse is the one grant/denial payload the worker-admit
 // connection sends before optionally holding itself open as the lease.
+//
+// AIRA-42: State, Class and Reason are all drawn from the single vocabulary in
+// internal/runner (runner.WorkerAdmitState*/Class*/Reason*), never spelled as
+// literals here. Class is the load-bearing field — the disposition the
+// supervisor acts on — and it replaced the "reject:"/"fallback:" reason-string
+// prefix convention that used to carry that meaning. Reason is a stable
+// exact-match token; Detail is free text that NOTHING parses.
 type WorkerAdmitResponse struct {
-	State      string `json:"state"` // "granted" | "denied" | "timeout" | "unevaluated"
-	Reason     string `json:"reason,omitempty"`
+	State string `json:"state"`
+	Class string `json:"class"`
+	// Reason is an exact-match token from the runner vocabulary. It is
+	// diagnostic: no consumer branches on it, and none may.
+	Reason string `json:"reason,omitempty"`
+	// Detail elaborates for a human. It carries cgroup paths and raw file
+	// contents, i.e. operator-controlled text, which is exactly why nothing
+	// classifies from it.
+	Detail     string `json:"detail,omitempty"`
 	WaitedMS   int64  `json:"waited_ms"`
 	WorkerID   string `json:"worker_id,omitempty"`
 	ScopePath  string `json:"scope_path,omitempty"`
@@ -291,26 +305,27 @@ func (s *Server) workerCommitted(state *workerScopeState, force bool) (int64, er
 	return children.committed, nil
 }
 
-// workerScopesUnreadableReason builds the "unevaluated" reason for a scan the
-// daemon could not establish.
+// workerScopesUnreadableDetail builds the human detail for a scan the daemon
+// could not establish.
 //
-// The detail is FREE-FORM: it embeds cgroup paths (which carry the operator's
-// own `aira confine --name`) and raw memory.max file contents. supervisor.py's
-// classifier disables daemon-backed admission outright -- running the WHOLE
-// pytest suite UNCONFINED on this RAM-capped shared machine -- for any
-// "worker-admit unevaluated" message that also contains the literal token
-// "unbounded", which is readSliceMemory's deliberate reason for a genuinely
-// uncapped outer scope. A job named "unbounded-suite", or a corrupt memory.max
-// whose bytes are echoed back through %q, would otherwise be read as that
-// condition and silently drop containment for the whole run (found
-// independently by Sol and DeepSeek build-review).
+// It used to be workerScopesUnreadableReason, and it used to MANGLE the token
+// "unbounded" into "un-bounded" before returning. That was a defensive hack
+// against the prose channel: the detail embeds cgroup paths (which carry the
+// operator's own `aira confine --name`) and raw memory.max file contents, and
+// supervisor.py's substring classifier disabled daemon-backed admission
+// outright — the WHOLE pytest suite UNCONFINED on this RAM-capped shared
+// machine — for any "worker-admit unevaluated" message that merely CONTAINED
+// the literal token "unbounded". A job named "unbounded-suite", or a corrupt
+// memory.max echoed back through %q, was read as a genuinely uncapped outer
+// scope (found independently by Sol and DeepSeek build-review on AIRA-39).
 //
-// Neutralising the token in free-form detail is the narrow fix: a slightly
-// mangled diagnostic beats an unconfined suite, and the honest "unevaluated"
-// state is unchanged. Fix 2's structured outcome channel removes the need for
-// substring matching altogether.
-func workerScopesUnreadableReason(err error) string {
-	return "worker scopes unreadable: " + strings.ReplaceAll(err.Error(), "unbounded", "un-bounded")
+// AIRA-42 deletes the mangling, as AIRA-39's own comment here predicted it
+// would: the outer-scope-unbounded condition is now carried by an exact-match
+// reason token in its own field, and Detail is not parsed by anything. There is
+// no longer a way for operator-controlled text to be mistaken for a verdict, so
+// the diagnostic gets to be accurate again.
+func workerScopesUnreadableDetail(err error) string {
+	return "worker scopes unreadable: " + err.Error()
 }
 
 // readWorkerSupervisorMemory reads a scope's live memory.current (plus its
@@ -374,7 +389,29 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 	}
 	used, outerMax, reclaimable, ok, reason := readMemory(req.outerScope)
 	if !ok {
-		return WorkerAdmitResponse{State: "unevaluated", Reason: reason}, true
+		// readSliceMemory reports "unbounded" when the outer scope's own
+		// memory.max reads back "max". That is structural, not transient: a
+		// real confine-launched outer scope is always given a finite
+		// memory.max as part of the same atomic grant that launches it, so
+		// waiting can never make it capped. It is the one unevaluated
+		// sub-case the design spec (§3.7) classifies as fallback-triggering
+		// rather than retriable — and it is now carried by Class, instead of
+		// by the client sniffing the word "unbounded" out of a sentence that
+		// also quotes operator-controlled cgroup paths.
+		if reason == "unbounded" {
+			return WorkerAdmitResponse{
+				State:  runner.WorkerAdmitStateUnevaluated,
+				Class:  runner.WorkerAdmitClassAdmissionUnusable,
+				Reason: runner.WorkerAdmitReasonOuterScopeUnbounded,
+				Detail: "outer scope " + req.outerScope + " has no finite memory.max",
+			}, true
+		}
+		return WorkerAdmitResponse{
+			State:  runner.WorkerAdmitStateUnevaluated,
+			Class:  runner.WorkerAdmitClassContended,
+			Reason: runner.WorkerAdmitReasonOuterScopeUnreadable,
+			Detail: reason,
+		}, true
 	}
 	// memory.stat's file pages are reclaimable cache, not non-negotiable
 	// worker pressure. Match checkedAvailable's exact floor-and-discount
@@ -395,7 +432,12 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 		// immediately (workerAdmitConnection, Task 5, breaks its poll loop
 		// on this reason) instead of waiting out the full poll timeout
 		// only to time out anyway.
-		return WorkerAdmitResponse{State: "denied", Reason: "reject:exceeds-ceiling"}, true
+		return WorkerAdmitResponse{
+			State:  runner.WorkerAdmitStateDenied,
+			Class:  runner.WorkerAdmitClassRequestInvalid,
+			Reason: runner.WorkerAdmitReasonExceedsCeiling,
+			Detail: fmt.Sprintf("estimated %d bytes exceeds the outer scope's %d-byte ceiling", req.estimatedBytes, ceiling),
+		}, true
 	}
 	// One lock per OUTER SCOPE (not per job), held across the committed scan,
 	// the supervisor read and the scope creation below. It is what makes
@@ -427,7 +469,11 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 		// could be granted once usage drops — the caller's poll loop keeps
 		// retrying this until granted or its own max_wait_ms deadline
 		// converts it to "timeout".
-		return WorkerAdmitResponse{State: "denied", Reason: "fallback:insufficient-headroom"}, true
+		return WorkerAdmitResponse{
+			State:  runner.WorkerAdmitStateDenied,
+			Class:  runner.WorkerAdmitClassContended,
+			Reason: runner.WorkerAdmitReasonInsufficientHeadroom,
+		}, true
 	}
 	// Worst-case guard, on top of the live-usage check above: live usage
 	// having room RIGHT NOW does not mean it always will. Sum the
@@ -474,7 +520,12 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 	supervisorScope := runner.WorkerScopeChildPath(req.outerScope, "supervisor")
 	supervisorUsed, supervisorReclaimable, supervisorOK, supervisorReason := readSupervisorMemory(supervisorScope)
 	if !supervisorOK {
-		return WorkerAdmitResponse{State: "unevaluated", Reason: "supervisor scope unreadable: " + supervisorReason}, true
+		return WorkerAdmitResponse{
+			State:  runner.WorkerAdmitStateUnevaluated,
+			Class:  runner.WorkerAdmitClassContended,
+			Reason: runner.WorkerAdmitReasonSupervisorScopeUnreadable,
+			Detail: "supervisor scope unreadable: " + supervisorReason,
+		}, true
 	}
 	// Apply the same reclaimable-cache discount to the supervisor half of the
 	// aggregate guard. Its memory.current is otherwise a second source of
@@ -490,10 +541,19 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 	// is the 200ms-per-waiter poll path AIRA-61's CPU regression was about.
 	committed, err := s.workerCommitted(state, false)
 	if err != nil {
-		return WorkerAdmitResponse{State: "unevaluated", Reason: workerScopesUnreadableReason(err)}, true
+		return WorkerAdmitResponse{
+			State:  runner.WorkerAdmitStateUnevaluated,
+			Class:  runner.WorkerAdmitClassContended,
+			Reason: runner.WorkerAdmitReasonWorkerScopesUnreadable,
+			Detail: workerScopesUnreadableDetail(err),
+		}, true
 	}
 	if !fits(committed) {
-		return WorkerAdmitResponse{State: "denied", Reason: "fallback:aggregate-cap-exceeded"}, true
+		return WorkerAdmitResponse{
+			State:  runner.WorkerAdmitStateDenied,
+			Class:  runner.WorkerAdmitClassContended,
+			Reason: runner.WorkerAdmitReasonAggregateCapExceeded,
+		}, true
 	}
 	// Granting path: force a fresh scan first. A cached sum may never be the
 	// basis of an admission — a `.aira-worker-*` child that appeared since the
@@ -502,10 +562,19 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 	// costs one scan per ADMITTED WORKER (a handful per suite), never one per
 	// poll, so the cadence bound above is untouched.
 	if committed, err = s.workerCommitted(state, true); err != nil {
-		return WorkerAdmitResponse{State: "unevaluated", Reason: workerScopesUnreadableReason(err)}, true
+		return WorkerAdmitResponse{
+			State:  runner.WorkerAdmitStateUnevaluated,
+			Class:  runner.WorkerAdmitClassContended,
+			Reason: runner.WorkerAdmitReasonWorkerScopesUnreadable,
+			Detail: workerScopesUnreadableDetail(err),
+		}, true
 	}
 	if !fits(committed) {
-		return WorkerAdmitResponse{State: "denied", Reason: "fallback:aggregate-cap-exceeded"}, true
+		return WorkerAdmitResponse{
+			State:  runner.WorkerAdmitStateDenied,
+			Class:  runner.WorkerAdmitClassContended,
+			Reason: runner.WorkerAdmitReasonAggregateCapExceeded,
+		}, true
 	}
 	seq := state.nextSeq
 	if state.maxIndex > seq {
@@ -514,7 +583,17 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 		seq = state.maxIndex
 	}
 	if seq >= maxWorkerScopeSeq {
-		return WorkerAdmitResponse{State: "denied", Reason: "reject:worker-scope-create-failed:worker-id-space-exhausted"}, true
+		// Terminal, not retriable: ids are never reused (nextSeq only grows,
+		// and a restart re-seeds it from the largest suffix on the tree), so
+		// no amount of waiting produces a free id. request-invalid is the
+		// TERMINAL-BUT-DAEMON-HEALTHY disposition, not a claim that the
+		// request was malformed — see the class's own doc comment.
+		return WorkerAdmitResponse{
+			State:  runner.WorkerAdmitStateDenied,
+			Class:  runner.WorkerAdmitClassRequestInvalid,
+			Reason: runner.WorkerAdmitReasonWorkerIDSpaceExhausted,
+			Detail: fmt.Sprintf("worker id space exhausted under %s (limit %d)", req.outerScope, maxWorkerScopeSeq),
+		}, true
 	}
 	seq++
 	workerID := strconv.Itoa(seq)
@@ -539,21 +618,38 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 			// caller's poll loop re-evaluates against a fresh scan that now
 			// includes it, and then grants or denies correctly.
 			state.invalidate()
-			return WorkerAdmitResponse{State: "denied", Reason: "fallback:worker-scope-id-collision"}, true
+			return WorkerAdmitResponse{
+				State:  runner.WorkerAdmitStateDenied,
+				Class:  runner.WorkerAdmitClassContended,
+				Reason: runner.WorkerAdmitReasonWorkerScopeIDCollision,
+			}, true
 		}
-		// Fail closed: no grant is ever recorded without its scope. reject:-
-		// prefixed, therefore terminal at supervisor.py's classifier. Not every
-		// such failure is provably permanent, but BootstrapAitestSupervisor has
-		// already enabled cgroup.subtree_control before any worker-admit call
-		// runs, so the realistic cause is broken daemon-side cgroupfs access —
-		// and a non-reject: reason would be retried INDEFINITELY, stalling
-		// every aitest run on the machine rather than the one job that hit it.
-		return WorkerAdmitResponse{State: "denied", Reason: "reject:worker-scope-create-failed:" + err.Error()}, true
+		// Fail closed: no grant is ever recorded without its scope. Classed
+		// request-invalid, which is the TERMINAL-BUT-DAEMON-HEALTHY
+		// disposition (formerly carried by the "reject:" reason prefix). Not
+		// every such failure is provably permanent, but
+		// BootstrapAitestSupervisor has already enabled
+		// cgroup.subtree_control before any worker-admit call runs, so the
+		// realistic cause is broken daemon-side cgroupfs access — and a
+		// `contended` class would be retried INDEFINITELY, stalling every
+		// aitest run on the machine rather than the one job that hit it.
+		// `admission-unusable` is not the answer either: it would strip
+		// containment for a whole run over a daemon that is answering fine.
+		return WorkerAdmitResponse{
+			State:  runner.WorkerAdmitStateDenied,
+			Class:  runner.WorkerAdmitClassRequestInvalid,
+			Reason: runner.WorkerAdmitReasonWorkerScopeCreateFailed,
+			Detail: err.Error(),
+		}, true
 	}
 	state.nextSeq = seq
 	// The tree changed under us; the next committed read must see it.
 	state.invalidate()
-	return WorkerAdmitResponse{State: "granted", WorkerID: workerID, ScopePath: scopePath, MemoryMax: req.estimatedBytes, MemoryHigh: memoryHigh}, true
+	return WorkerAdmitResponse{
+		State: runner.WorkerAdmitStateGranted, Class: runner.WorkerAdmitClassGranted,
+		WorkerID: workerID, ScopePath: scopePath,
+		MemoryMax: req.estimatedBytes, MemoryHigh: memoryHigh,
+	}, true
 }
 
 func validateWorkerAdmitArgs(args map[string]any, waitCeilingMs int64) (workerAdmitRequest, error) {
@@ -632,17 +728,23 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 	// adding a second one.
 	//
 	// Saturation is deliberately NOT an error frame the way admitConnection's
-	// CodeBusy is. RequestWorkerAdmit turns any non-"OK" Code into
-	// "worker-admit request rejected", which matches none of supervisor.py's
-	// denial substrings, falls through to WorkerAdmitUnavailable, and makes
-	// _disable_daemon run the WHOLE suite unconfined — a safety regression, not
-	// a denial. Emitting it as an ordinary denial whose reason is NOT
-	// "reject:"-prefixed makes supervisor.py raise the retriable
-	// WorkerAdmitDenied, which _wait_for_admission_or_disable retries until a
-	// slot frees. The "fallback:" prefix is a human-readable convention here,
-	// not a token anything matches (Fix 2 folds it into a structured channel).
+	// CodeBusy is. An unrecognised error Code is classified
+	// contract-violation by RequestWorkerAdmit — terminal and loud — which is
+	// not what a transient slot shortage deserves. Before AIRA-42 it was worse
+	// still: any non-"OK" Code became the prose "worker-admit request
+	// rejected", which matched none of supervisor.py's denial substrings, fell
+	// through to WorkerAdmitUnavailable, and made _disable_daemon run the WHOLE
+	// suite unconfined — a safety regression, not a denial. Emitting it as an
+	// ordinary denial classed `contended` makes supervisor.py raise the
+	// retriable WorkerAdmitDenied, which _wait_for_admission_or_disable retries
+	// until a slot frees. That disposition is now the Class field itself rather
+	// than a "fallback:" spelling convention on the reason.
 	if !s.acquireAdmitSlot() {
-		saturated := WorkerAdmitResponse{State: "denied", Reason: "fallback:admit-slots-saturated"}
+		saturated := WorkerAdmitResponse{
+			State:  runner.WorkerAdmitStateDenied,
+			Class:  runner.WorkerAdmitClassContended,
+			Reason: runner.WorkerAdmitReasonAdmitSlotsSaturated,
+		}
 		saturated.WaitedMS = elapsedMilliseconds(start, s.admitNowTime())
 		_ = conn.SetWriteDeadline(time.Now().Add(admitWriteTimeout))
 		_ = writeFrame(conn, responseFrame(core.Response{OK: false, Code: "OK", Data: saturated}))
@@ -677,25 +779,29 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 		if response, proceed = s.evaluateWorkerAdmit(peerCtx, req); !proceed {
 			return
 		}
-		if response.State == "granted" || response.State == "unevaluated" {
+		if response.State == runner.WorkerAdmitStateGranted || response.State == runner.WorkerAdmitStateUnevaluated {
 			break
 		}
-		// Prefix-matched, not a two-string whitelist (Fable re-gate round
-		// 3): the spec's own §3.3 amendment declares "reject:" vs
-		// "fallback:" a load-bearing convention every reject:* reason
-		// implements, not just the two that happened to exist when this
-		// loop was written -- a future third permanent reason added only
-		// to evaluateWorkerAdmit without also touching this whitelist
-		// would poll out to "timeout: reject:saturated" and get retried
-		// indefinitely by the (correctly prefix-parsing) client,
-		// resurrecting the exact hang class this branch's review rounds
-		// already fixed, from the daemon side instead. Scoped to "denied"
-		// only, never "timeout": reject:saturated's own reason text
-		// coincidentally also starts "reject:", but state=timeout means
-		// the CLIENT's own wait budget merely expired -- genuinely
-		// retriable with a fresh request, never a stable daemon-side
-		// verdict.
-		if response.State == "denied" && strings.HasPrefix(response.Reason, "reject:") {
+		// AIRA-42: this was `strings.HasPrefix(response.Reason, "reject:")`
+		// — the daemon running the SAME defect on its own reason strings that
+		// supervisor.py ran on the daemon's prose. The convention it
+		// implemented was real and load-bearing (Fable re-gate round 3: every
+		// permanently-impossible verdict must break this loop, not just the
+		// two that existed when it was written), but spelling it as a prefix
+		// made the disposition a property of how a reason was WORDED. It is
+		// now the Class field, so a new terminal verdict gets the right
+		// behaviour by declaring its disposition rather than by remembering
+		// to spell its reason a particular way.
+		//
+		// The old scoping hazard disappears by construction rather than by
+		// comment: the timeout verdict's reason used to be "reject:saturated",
+		// which coincidentally matched the prefix, so this test had to be
+		// narrowed to state=="denied" to avoid breaking on it. There is no
+		// coincidental match to guard against now — but the state check is
+		// KEPT, because it is independently correct: a timeout means the
+		// CLIENT's own wait budget expired, which is retriable with a fresh
+		// request, never a stable daemon-side verdict.
+		if response.State == runner.WorkerAdmitStateDenied && response.Class == runner.WorkerAdmitClassRequestInvalid {
 			// A stable "never going to fit" fact about this request, not a
 			// transient contention moment — surface "denied" to the client
 			// immediately instead of waiting out the full poll timeout
@@ -707,7 +813,14 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 		}
 		remaining := deadline.Sub(s.admitNowTime())
 		if remaining <= 0 {
-			response = WorkerAdmitResponse{State: "timeout", Reason: "reject:saturated"}
+			// The reason token is now plain `saturated`. It used to be
+			// "reject:saturated", whose accidental prefix match is what forced
+			// the state-scoping above to be reasoned about at all.
+			response = WorkerAdmitResponse{
+				State:  runner.WorkerAdmitStateTimeout,
+				Class:  runner.WorkerAdmitClassContended,
+				Reason: runner.WorkerAdmitReasonSaturated,
+			}
 			break
 		}
 		// Clamp the sleep to whatever's left of the caller's own declared
@@ -756,7 +869,7 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 	// unconfined. An over-charge produces a loud, retriable denial instead
 	// (found by Sol plan-review; DeepSeek argued the opposite and was not taken).
 	_ = conn.SetWriteDeadline(time.Now().Add(admitWriteTimeout))
-	ok := response.State == "granted"
+	ok := response.State == runner.WorkerAdmitStateGranted
 	if err := writeFrame(conn, responseFrame(core.Response{OK: ok, Code: "OK", Data: response})); err != nil {
 		return
 	}

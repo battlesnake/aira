@@ -47,15 +47,16 @@ func TestRequestWorkerAdmitReturnsHeldLeaseOnGrant(t *testing.T) {
 	t.Cleanup(func() { cancel(); <-done })
 	<-ready
 
-	lease, err := runner.RequestWorkerAdmit(context.Background(), runner.WorkerAdmitClientRequest{
+	outcome := runner.RequestWorkerAdmit(context.Background(), runner.WorkerAdmitClientRequest{
 		// This external test package cannot access daemon's unexported 1 MiB
 		// protocol minimum. Five MiB is safely above it and yields an exact
 		// four-MiB memory.high under estimatedBytes * 4 / 5.
 		SocketPath: paths.SocketPath, JobID: "job-1", OuterScope: "/outer", EstimatedBytes: 5 * (1 << 20), MaxWait: time.Second,
 	})
-	if err != nil {
-		t.Fatalf("RequestWorkerAdmit: %v", err)
+	if !outcome.Granted() || outcome.Lease == nil {
+		t.Fatalf("RequestWorkerAdmit: outcome=%+v", outcome)
 	}
+	lease := outcome.Lease
 	defer lease.Close()
 	if lease.WorkerID == "" || lease.MemoryMax != 5*(1<<20) || lease.MemoryHigh != 4*(1<<20) {
 		t.Fatalf("lease=%+v", lease)
@@ -75,11 +76,19 @@ func TestRequestWorkerAdmitReturnsErrorOnDenial(t *testing.T) {
 	t.Cleanup(func() { cancel(); <-done })
 	<-ready
 
-	_, err := runner.RequestWorkerAdmit(context.Background(), runner.WorkerAdmitClientRequest{
+	outcome := runner.RequestWorkerAdmit(context.Background(), runner.WorkerAdmitClientRequest{
 		SocketPath: paths.SocketPath, JobID: "job-1", OuterScope: "/outer", EstimatedBytes: 2 * (1 << 20), MaxWait: 10 * time.Millisecond,
 	})
-	if err == nil {
-		t.Fatal("expected an error for a request over budget")
+	// AIRA-42: a denial is now a CLASSIFIED outcome rather than an
+	// unclassified error. A request over the whole ceiling is a permanent
+	// fact about the request, so it must arrive as request-invalid — not as
+	// anything that would make the supervisor abandon containment.
+	if outcome.Granted() || outcome.Lease != nil {
+		t.Fatalf("expected a denial for a request over budget, got %+v", outcome)
+	}
+	if outcome.Class != runner.WorkerAdmitClassRequestInvalid ||
+		outcome.Reason != runner.WorkerAdmitReasonExceedsCeiling {
+		t.Fatalf("outcome=%+v, want class=request-invalid reason=exceeds-ceiling", outcome)
 	}
 }
 
@@ -113,12 +122,20 @@ func TestRequestWorkerAdmitBoundsWaitWhenDaemonAcceptsButNeverResponds(t *testin
 	}()
 
 	start := time.Now()
-	_, err = runner.RequestWorkerAdmit(context.Background(), runner.WorkerAdmitClientRequest{
+	outcome := runner.RequestWorkerAdmit(context.Background(), runner.WorkerAdmitClientRequest{
 		SocketPath: socketPath, JobID: "job-1", OuterScope: "/outer", EstimatedBytes: 5 * (1 << 20), MaxWait: 200 * time.Millisecond,
 	})
 	elapsed := time.Since(start)
-	if err == nil {
-		t.Fatal("expected an error from a daemon that accepts a connection but never responds")
+	if outcome.Granted() {
+		t.Fatal("expected a non-grant from a daemon that accepts a connection but never responds")
+	}
+	// AIRA-42: the stall is a socket-deadline overrun, which is RETRIABLE —
+	// the daemon was dialled and the request was sent, so nothing here
+	// establishes that admission is unusable. Classifying it otherwise would
+	// strip containment for the rest of the run on one slow reply.
+	if outcome.Class != runner.WorkerAdmitClassContended ||
+		outcome.Reason != runner.WorkerAdmitReasonResponseTimeout {
+		t.Fatalf("outcome=%+v, want class=contended reason=response-timeout", outcome)
 	}
 	// Generous bound (MaxWait + the fixed transport grace + real
 	// scheduling slack) that a fix completes well inside, but an

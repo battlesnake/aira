@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.parse
 
 from aitest.worker import _EVENT_LINE_PREFIX, _RECYCLE_SUFFIX, _exit_child, _untag_tuples, fork_worker, run_worker_loop
 
@@ -106,8 +107,8 @@ def _read_line_deadline(fd, timeout):
 
     Returns (line, timed_out). A timeout returns ("", True) -- whatever partial
     bytes arrived are deliberately discarded, because the only caller (the
-    worker-admit grant line) has no use for half a record and must not attribute
-    meaning to one.
+    worker-admit outcome line) has no use for half a record and must not
+    attribute meaning to one.
 
     Reads the RAW fd rather than a buffered readline for the same reason
     _drain_available_lines does: a buffered wrapper can hold bytes select()
@@ -195,42 +196,79 @@ def _reap_child(pid):
 
 
 class WorkerAdmitUnavailable(Exception):
-    """The daemon is genuinely unreachable at the connection level: a dial
-    failure, the worker-admit CLI itself could not even be launched, or its
-    response was malformed/garbage -- there is no daemon to talk to. This
-    is the ONLY failure class that should ever disable daemon-backed
-    admission for the rest of the run (_disable_daemon, Task 16)."""
+    """Daemon-backed admission is not usable FOR THIS RUN: a dial failure,
+    a relay the host could not launch, a client/daemon protocol-version
+    skew, or an outer scope that is not a real daemon-admitted scope at
+    all. Together with WorkerPlacementFailed it is one of exactly two
+    classes that disable daemon-backed admission for the rest of the run
+    (_disable_daemon, Task 16).
+
+    The relay reports this as class=admission-unusable. The class names
+    the disposition, not a diagnosis of the daemon's health -- the
+    unbounded-outer-scope case reaches it with a perfectly healthy daemon
+    (design spec section 3.7)."""
     pass
 
 
 class WorkerAdmitDenied(Exception):
-    """The daemon IS reachable and responded normally with "denied" (budget
-    genuinely exhausted right now), "timeout" (the request waited out its
-    full window -- the daemon is just busy/contended, not down), or
-    "unevaluated" (a live memory read failed on an otherwise-reachable
-    daemon -- AIRA-38: treated as retriable, not as daemon-unavailable,
-    since the daemon plainly answered, it just could not establish a
-    result this instant). Means "don't add a worker at this moment", never
-    "abandon containment for the rest of the run"."""
+    """The daemon IS reachable and answered, there is simply no room or no
+    answer right now: class=contended. Covers "denied" (budget genuinely
+    exhausted at this instant), "timeout" (the request waited out its full
+    window -- busy, not down), and "unevaluated" (a live memory read could
+    not be established on an otherwise-reachable daemon; AIRA-38 and
+    AIRA's own "report unevaluated, never a fake pass" rule). Means "don't
+    add a worker at this moment", never "abandon containment for the rest
+    of the run"."""
     pass
 
 
-class WorkerAdmitRequestTooLarge(Exception):
-    """A PERMANENT, STATIC verdict about this specific request that no
-    amount of retrying or waiting can change -- either the daemon's own
-    reject:exceeds-ceiling (this request's estimated-byte sizing can
-    never fit under the outer scope's cap, even without transient
-    contention) or the CLI's own pre-dial E_CONFINE_ARGUMENT_INVALID
-    rejection (a malformed client argument, e.g. an estimated_bytes value
-    below the daemon's floor -- Fable build-review, final gate: this used
-    to fall through to WorkerAdmitUnavailable, misdiagnosing a purely
-    local, static client mistake as the daemon being unreachable and
-    stripping containment for the rest of the run). Retrying would wait
-    forever (or dial a perfectly healthy daemon) with zero chance of
-    success, while falling back to an unconfined worker would silently
-    remove RAM containment for the rest of the run. It is instead a
-    terminal failure for the affected queued work only, which is marked
-    unevaluated without declaring the daemon unavailable."""
+class WorkerAdmitTerminal(Exception):
+    """Base class for the two verdicts that are permanent for the affected
+    queued work while leaving the daemon available: the queue is marked
+    unevaluated, nothing is retried, and nothing runs unconfined. Callers
+    catch this base rather than either subclass, so a new terminal class
+    can never be silently dropped into the retry path."""
+    pass
+
+
+class WorkerAdmitRequestInvalid(WorkerAdmitTerminal):
+    """A verdict that no amount of retrying or waiting can change, from a
+    daemon that is answering perfectly well: class=request-invalid.
+    Retrying would wait forever against a healthy daemon, while falling back
+    to an unconfined worker would silently remove RAM containment for the
+    rest of the run -- so this is terminal for the affected queued work and
+    nothing else.
+
+    It was called WorkerAdmitRequestTooLarge, which AIRA-45 recorded as an
+    actively misleading diagnostic even before AIRA-39: it was already
+    raised for protocol-level argument rejections and version skew, neither
+    of which is a sizing problem. AIRA-39 then added two members that are
+    not about the request at all -- worker-scope-create-failed and
+    worker-id-space-exhausted are daemon-side cgroupfs facts about the outer
+    scope. The name now matches the class token exactly, which is the same
+    one-vocabulary rule the rest of this channel follows.
+
+    Current members: the daemon's exceeds-ceiling (this request's
+    estimated-byte sizing can never fit under the outer scope's cap even
+    with zero contention), its worker-scope-create-failed and
+    worker-id-space-exhausted verdicts, its protocol-level argument
+    rejection, and the CLI's own pre-dial argument validation."""
+    pass
+
+
+class WorkerAdmitContractViolation(WorkerAdmitTerminal):
+    """The relay and this supervisor disagree about the outcome channel
+    itself: class=contract-violation. Raised for an outcome line that does
+    not parse, a state or class outside the catalogue, a state/class pair
+    that contradicts itself, a granted line missing its placement fields,
+    an unintelligible daemon frame, or a daemon error code the relay does
+    not know.
+
+    It is deliberately terminal-and-loud rather than a fallback. The whole
+    point of the structured channel (AIRA-42) is that an unrecognised
+    shape must never be resolved into "the daemon is gone" and used to
+    strip RAM containment from the rest of the suite, which is exactly
+    what the substring classifier this replaced did by default."""
     pass
 
 
@@ -240,8 +278,118 @@ class WorkerPlacementFailed(Exception):
     joined its granted cgroup scope. Distinct from a worker that WAS placed
     and crashed later mid-test (Task 15's _handle_worker_exit path): a
     placement failure means the admitted grant was never even used for a
-    test."""
+    test. The second of the two containment-stripping classes.
+
+    AIRA-39 removed the relay's own producer of class=placement-failed: the
+    CLI no longer creates the worker scope, so a creation failure is now the
+    daemon's worker-scope-create-failed verdict (WorkerAdmitRequestInvalid)
+    rather than a local placement failure discovered after a grant. This
+    supervisor's own fork/ack path above is therefore the only thing that
+    raises this today, and class=placement-failed remains its name on the
+    channel."""
     pass
+
+
+# ---------------------------------------------------------------------------
+# The worker-admit outcome channel.
+#
+# `aira worker-admit` writes exactly ONE machine-readable line to stdout in
+# every outcome, grant or not:
+#
+#   aira-worker-admit state=<enum> class=<enum> reason=<token> [grant fields]
+#                     [detail=<query-escaped free text>]
+#
+# `class` is the load-bearing field and maps to exactly one exception below by
+# EXACT dictionary lookup. Nothing here inspects prose. This replaced eleven
+# substring probes over the relay's stderr sentence whose fallthrough default
+# was WorkerAdmitUnavailable -- i.e. whose default was to abandon RAM
+# containment for the rest of the suite whenever the Go side reworded an error
+# (AIRA-42; six recorded recurrences of "add one more substring").
+#
+# The two catalogues below are the Python half of a vocabulary defined once in
+# Go (internal/runner/worker_admit_outcome.go).
+# TestWorkerAdmitOutcomeVocabularyMatchesTheSupervisor (internal/pylib) holds
+# the two equal in both directions, so drift fails the build instead of
+# misclassifying at runtime.
+# ---------------------------------------------------------------------------
+
+_OUTCOME_MARKER = "aira-worker-admit"
+
+_OUTCOME_STATES = frozenset((
+    "granted",
+    "denied",
+    "timeout",
+    "unevaluated",
+    "unavailable",
+    "argument-invalid",
+    "placement-failed",
+))
+
+_OUTCOME_CLASS_EXCEPTIONS = {
+    "granted": None,
+    "contended": WorkerAdmitDenied,
+    "request-invalid": WorkerAdmitRequestInvalid,
+    "admission-unusable": WorkerAdmitUnavailable,
+    "placement-failed": WorkerPlacementFailed,
+    "contract-violation": WorkerAdmitContractViolation,
+}
+
+_OUTCOME_GRANT_FIELDS = ("scope", "worker_id", "memory_max", "memory_high")
+
+
+def _describe_outcome(fields, diagnostic=""):
+    """One human-readable rendering of a parsed outcome. Built for stderr
+    and for the exception message; never parsed by anything."""
+    text = "worker-admit state=%s class=%s reason=%s" % (
+        fields.get("state", "?"), fields.get("class", "?"), fields.get("reason", "?"),
+    )
+    detail = fields.get("detail", "")
+    if detail:
+        text += ": " + detail
+    diagnostic = (diagnostic or "").strip()
+    if diagnostic:
+        text += " [relay stderr: %s]" % diagnostic
+    return text
+
+
+def _parse_worker_admit_outcome(line):
+    """Parse the relay's single outcome line into a field dict.
+
+    Every rejection here raises WorkerAdmitContractViolation, never
+    WorkerAdmitUnavailable: a line we cannot understand is the two sides of
+    this channel disagreeing, and resolving that into "there is no daemon"
+    is precisely how containment used to get stripped silently. The marker
+    is compared with ==; it is a frame marker, not a prefix search."""
+    tokens = line.split()
+    if not tokens or tokens[0] != _OUTCOME_MARKER:
+        raise WorkerAdmitContractViolation(
+            "worker-admit outcome line is not a worker-admit outcome: %r" % line
+        )
+    fields = {}
+    for token in tokens[1:]:
+        key, separator, raw = token.partition("=")
+        if not separator or not key:
+            raise WorkerAdmitContractViolation(
+                "worker-admit outcome token %r is not key=value" % token
+            )
+        fields[key] = urllib.parse.unquote_plus(raw)
+    state = fields.get("state")
+    klass = fields.get("class")
+    if state not in _OUTCOME_STATES:
+        raise WorkerAdmitContractViolation(
+            "worker-admit outcome state %r is not in this supervisor's catalogue "
+            "(relay and supervisor are out of lockstep)" % state
+        )
+    if klass not in _OUTCOME_CLASS_EXCEPTIONS:
+        raise WorkerAdmitContractViolation(
+            "worker-admit outcome class %r is not in this supervisor's catalogue "
+            "(relay and supervisor are out of lockstep)" % klass
+        )
+    if (state == "granted") != (klass == "granted"):
+        raise WorkerAdmitContractViolation(
+            "worker-admit outcome state %r and class %r disagree about grantedness" % (state, klass)
+        )
+    return fields
 
 
 def _read_line_blocking(fd, state, timeout=None):
@@ -368,7 +516,7 @@ class Supervisor:
         self.daemon_available = True
         self.max_workers_fallback = max(1, int(os.environ.get("AIRA_AITEST_MAX_WORKERS_FALLBACK", "1")))
         self._fallback_warned = False
-        self._admission_too_large_warned = False
+        self._admission_terminal_warned = False
         self.items_by_nodeid = {}
         self.workers = {}
         # Worker scopes whose rmdir failed, for a later retry. See
@@ -416,14 +564,19 @@ class Supervisor:
                 % (reason, self.max_workers_fallback)
             )
 
-    def _fail_queue_too_large(self, reason):
-        """Mark queued work unevaluated after a permanent daemon sizing
-        rejection, preserving daemon availability and therefore never
-        triggering an unconfined fallback for this condition."""
-        if not self._admission_too_large_warned:
-            self._admission_too_large_warned = True
+    def _fail_queue_terminal(self, reason):
+        """Mark queued work unevaluated after a WorkerAdmitTerminal verdict,
+        preserving daemon availability and therefore never triggering an
+        unconfined fallback for this condition.
+
+        The message deliberately does NOT assert a sizing problem: the two
+        terminal classes are a per-request rejection (which may or may not
+        be about sizing) and a channel contract violation (which never is).
+        The verdict's own reason token, carried in `reason`, says which."""
+        if not self._admission_terminal_warned:
+            self._admission_terminal_warned = True
             sys.stderr.write(
-                "aira aitest: %s -- remaining queued tests cannot be admitted at this sizing; "
+                "aira aitest: %s -- remaining queued tests cannot be admitted; "
                 "marking them unevaluated rather than waiting forever or running unconfined\n" % reason
             )
         while self.queue:
@@ -457,14 +610,16 @@ class Supervisor:
     def acquire_worker(self, estimated_bytes, max_wait="30s"):
         """Returns (grant: dict, process: subprocess.Popen) on success.
         process.stdin stays open as the daemon lease -- close it to release.
-        Raises WorkerAdmitUnavailable when there is no daemon to talk to at
-        all (dial/launch failure, malformed response); raises
-        WorkerAdmitDenied when the daemon responded normally but declined
-        transiently (denied or timeout), and WorkerAdmitRequestTooLarge
-        when reject:exceeds-ceiling makes this sizing permanently
-        inadmissible. The caller MUST treat these differently (Task 16):
-        only WorkerAdmitUnavailable may disable daemon-backed admission
-        for the rest of the run."""
+
+        The relay classifies its own outcome and reports it as one
+        structured stdout line; this method's only job is an exact
+        dictionary lookup from that line's `class` field to one of the four
+        exception types (_OUTCOME_CLASS_EXCEPTIONS). It does NOT inspect
+        the relay's stderr, which carries a human diagnostic only.
+
+        The caller MUST treat the exception types differently (Task 16):
+        only WorkerAdmitUnavailable and WorkerPlacementFailed may disable
+        daemon-backed admission for the rest of the run."""
         if not self.daemon_available:
             raise WorkerAdmitUnavailable("daemon unavailable")
         command = os.environ.get("AIRA_AITEST_WORKER_ADMIT_CMD", "")
@@ -488,7 +643,9 @@ class Supervisor:
             # the aira binary) IS a static, permanent local fact and stays
             # unavailable.
             if exc.errno in (errno.EAGAIN, errno.ENOMEM):
-                raise WorkerAdmitDenied("worker-admit denied: fallback:fork-unavailable: %s" % exc)
+                raise WorkerAdmitDenied(
+                    "worker-admit state=denied class=contended reason=fork-unavailable: %s" % exc
+                )
             raise WorkerAdmitUnavailable(str(exc))
         # AIRA-92: BOUNDED, never a bare readline(). See _read_line_deadline and
         # the _ADMIT_READ_GRACE_SECONDS comment for why the relay cannot be
@@ -499,10 +656,9 @@ class Supervisor:
         #
         # "replace", not "strict" (Sol build-review, AIRA-38 review wave): a
         # corrupted/truncated write or a stray binary byte from a
-        # misbehaving relay build must degrade to a malformed, unrecognized
-        # line (falling through to WorkerAdmitUnavailable below, the
-        # documented "malformed response" treatment) rather than raise an
-        # uncaught UnicodeDecodeError that crashes the whole pytest process.
+        # misbehaving relay build must degrade to a line that fails to parse
+        # (WorkerAdmitContractViolation below) rather than raise an uncaught
+        # UnicodeDecodeError that crashes the whole pytest process.
         read_timeout = _parse_max_wait_seconds(max_wait) + _env_seconds(
             "AIRA_AITEST_ADMIT_READ_GRACE", _ADMIT_READ_GRACE_SECONDS
         )
@@ -533,189 +689,58 @@ class Supervisor:
                 % (read_timeout, max_wait)
             )
             raise WorkerAdmitDenied(
-                "worker-admit denied: fallback:relay-unresponsive after %.1fs" % read_timeout
+                "worker-admit state=denied class=contended reason=relay-unresponsive "
+                "after %.1fs" % read_timeout
             )
-        if not line.startswith("granted "):
+        if not line:
+            # The relay produced NO outcome line at all: it died, was killed,
+            # or exited without writing. That is not a classification we can
+            # make -- it is the absence of one -- and the honest reading is
+            # that daemon-backed admission is not usable through this relay.
+            # It is a NAMED condition, not the fallthrough default of a
+            # substring chain, and the relay's stderr is attached purely as a
+            # human diagnostic: nothing below inspects it.
+            #
             # Release BEFORE reading stderr (AIRA-92): no grant was issued, so
             # the relay owes us nothing further and this ordering cannot lose a
-            # diagnostic the way it would on the malformed-GRANT path below
-            # (whose relay genuinely blocks on stdin EOF first). Reading an
-            # unbounded stderr from a relay that has NOT exited was itself an
-            # untimed read on the dispatch loop.
+            # diagnostic the way it would on the granted path below (whose
+            # relay genuinely blocks on stdin EOF first). Reading an unbounded
+            # stderr from a relay that has NOT exited was itself an untimed
+            # read on the dispatch loop.
             _terminate_process(process)
-            stderr = process.stderr.read().decode("utf-8", "replace") if process.stderr else ""
-            message = line or stderr or "worker-admit exited without a grant"
-            # RequestWorkerAdmit (Task 8) wraps a daemon-reachable-but-
-            # declined response as "worker-admit <state>: <reason>" on
-            # stderr -- ANYTHING else (a dial failure, a launch failure, a
-            # malformed response) means there is no daemon to talk to at
-            # all. This distinction is load-bearing (Task 16).
+            diagnostic = process.stderr.read().decode("utf-8", "replace") if process.stderr else ""
+            raise WorkerAdmitUnavailable(
+                "worker-admit relay produced no outcome line [relay stderr: %s]"
+                % (diagnostic.strip() or "none")
+            )
+        try:
+            outcome = _parse_worker_admit_outcome(line)
+        except WorkerAdmitContractViolation as exc:
+            _terminate_process(process)
+            diagnostic = process.stderr.read().decode("utf-8", "replace") if process.stderr else ""
+            raise WorkerAdmitContractViolation(
+                "%s [relay stderr: %s]" % (exc, diagnostic.strip() or "none")
+            ) from exc
+        if outcome["state"] != "granted":
+            _terminate_process(process)
+            diagnostic = process.stderr.read().decode("utf-8", "replace") if process.stderr else ""
+            # ONE exact dictionary lookup. The relay owns the classification;
+            # this side owns only the mapping from its class to the exception
+            # that carries the disposition. _parse_worker_admit_outcome has
+            # already refused any class outside the catalogue, so there is no
+            # default branch here to fall through to -- which is the whole
+            # point: the old default was "abandon RAM containment".
             #
-            # "worker-admit unevaluated" (AIRA-38) is included here
-            # deliberately, not an oversight: evaluateWorkerAdmit returns
-            # State="unevaluated" when the daemon IS reachable but a live
-            # memory.current read (outer or supervisor scope) failed --
-            # AIRA's own rule that a check which cannot establish its
-            # result reports unevaluated rather than a fake pass/fail
-            # (never "no daemon at all"). A single transient read glitch on
-            # an otherwise-live daemon must not permanently strip
-            # containment for the rest of the run, so this is classified
-            # exactly like a plain denial: retriable, not terminal -- EXCEPT
-            # for the specific "unbounded" reason handled separately just
-            # below, which is a structural fact, not a transient glitch.
-            # "worker-admit local-placement-failed" (AIRA-38, Sol build-
-            # review): runWorkerAdmitCommand prints this specific marker
-            # when the DAEMON already granted admission (reachable,
-            # healthy) but the LOCAL cgroup scope creation then failed --
-            # distinct from every state above, which all describe the
-            # daemon's own admission verdict. Classified as
-            # WorkerPlacementFailed (same fallback behavior as
-            # WorkerAdmitUnavailable downstream, per _replace_worker's own
-            # docstring) rather than the generic unavailable bucket, so a
-            # future reader of this diagnostic is not misled into
-            # suspecting the daemon itself.
-            if "worker-admit local-placement-failed" in message:
-                raise WorkerPlacementFailed(message)
-            # "worker-admit unevaluated: unbounded" (Fable re-gate) is a
-            # DIFFERENT case from the generic "unevaluated" handled below,
-            # deliberately NOT folded into it: it means the OUTER scope's
-            # own memory.max read came back "unbounded" (readSliceMemory,
-            # admit.go) -- and a genuine confine-launched outer scope is
-            # ALWAYS given a finite memory.max by the daemon as part of the
-            # SAME atomic admission grant that launches it, before it is
-            # ever queryable (AIRA-27/67). An "unbounded" outer scope is
-            # therefore not a transient read glitch retrying could fix --
-            # it is a structural sign the discovered "outer_scope" is not
-            # a real, daemon-admitted confine scope at all. Found live: a
-            # SECOND aitest-enabled pytest invocation inside one
-            # --delegate-ram confine job (e.g. `make test` running pytest
-            # twice) can discover a PRIOR run's own uncapped
-            # .aira-supervisor scope as its "outer", since that prior run's
-            # own controlling process (make, a shell) was itself drained
-            # into that scope during ITS bootstrap (drainIntoScope moves
-            # EVERY pid in outer, not just the supervisor's own pid --
-            # aitest_bootstrap_linux.go). Without this check, that
-            # structural-not-transient "unevaluated" was classified
-            # retriable, and _wait_for_admission_or_disable retried
-            # INDEFINITELY under a misleading "budget contended" warning --
-            # a genuine, deterministic hang. Classified WorkerAdmitUnavailable
-            # instead (not retriable): this run's workers still end up
-            # hierarchically bounded by the REAL outer confine job's own
-            # cap either way -- cgroup memory limits enforce down the whole
-            # tree regardless of what an uncapped descendant itself
-            # reports -- so falling back is safe, and it is strictly better
-            # than hanging forever against a scope that will never become
-            # capped. The deeper root cause (bootstrap discovering the
-            # wrong scope when nested) is a separate, tracked gap -- this
-            # is the safety net that keeps it from hanging the run.
-            if "worker-admit unevaluated" in message and "unbounded" in message:
-                raise WorkerAdmitUnavailable(message)
-            # "E_CONFINE_ARGUMENT_INVALID" (Fable build-review, final
-            # gate): the CLI's own pre-dial argument validation (e.g. the
-            # --estimated-bytes 1MiB floor, AIRA-38) rejects BEFORE ever
-            # talking to the daemon -- a permanent, static fact about
-            # THIS request's arguments, not a daemon condition at all.
-            # _resolve_estimated_bytes (aitest/__init__.py) now clamps
-            # the one user-facing knob that could realistically trigger
-            # this before it ever reaches the wire, but this classifies
-            # it correctly regardless -- ANY future CLI argument
-            # validation failure reaching here must never be conflated
-            # with genuine daemon unavailability.
-            #
-            # "E_DAEMON_PROTOCOL" (Fable re-gate): the DAEMON's own
-            # protocol-level argument validation (validateWorkerAdmitArgs,
-            # worker_admit.go -- e.g. estimated_bytes above admitMaxReserve,
-            # the mirror-image case of the CLI floor above) is likewise a
-            # permanent, static fact about THIS request, discovered one
-            # hop further along but still never a reason to distrust the
-            # daemon itself. _resolve_estimated_bytes now clamps the top
-            # end too, but as with the floor, this classifies it correctly
-            # regardless of whether some future value or field slips past
-            # that clamp.
-            # "worker-admit denied: reject:*" (Fable re-gate) generalizes
-            # what used to be a single hand-picked substring
-            # ("reject:exceeds-ceiling" only) to the daemon's own designed
-            # "reject:" (permanent) vs "fallback:" (transient) reason-prefix
-            # convention (worker_admit.go's evaluateWorkerAdmit/
-            # workerAdmitConnection: EVERY "denied" reason starting
-            # "reject:" -- exceeds-ceiling, worker-scope-create-failed, and
-            # any future one -- deliberately breaks the daemon's OWN poll
-            # loop immediately as a stable "never going to resolve" fact;
-            # only "fallback:"-prefixed reasons keep polling, e.g.
-            # insufficient-headroom, aggregate-cap-exceeded,
-            # admit-slots-saturated and worker-scope-id-collision).
-            #
-            # AIRA-39 note: the outer-scope-owned-by-another-job rejection
-            # this comment used to cite is GONE. The ledger now sums the
-            # outer scope's real .aira-worker-* children rather than one
-            # job's own grants, so two job ids sharing one outer scope are
-            # counted together instead of the second being refused.
-            #
-            # Scoped to "worker-admit denied" specifically, NOT
-            # "worker-admit timeout": a timeout's
-            # own reason text ("reject:saturated") also contains "reject:"
-            # by coincidental wording, but state=timeout means the CLIENT's
-            # own wait budget merely expired -- genuinely retriable with a
-            # fresh request, never a stable daemon-side verdict.
-            if (
-                ("worker-admit denied" in message and "reject:" in message)
-                or "E_CONFINE_ARGUMENT_INVALID" in message
-                or "E_DAEMON_PROTOCOL" in message
-            ):
-                raise WorkerAdmitRequestTooLarge(message)
-            if "worker-admit denied" in message or "worker-admit timeout" in message or "worker-admit unevaluated" in message:
-                raise WorkerAdmitDenied(message)
-            # "read worker-admit response: ... i/o timeout" (AIRA-92): the
-            # client's own SOCKET deadline expired -- max_wait plus a grace of
-            # exactly ONE second (admitTransportGrace, internal/runner/
-            # admission_linux.go:81) over a daemon whose evaluateWorkerAdmit
-            # holds job.mu across two cgroupfs reads and documents itself as
-            # "uninterruptible and not itself deadline-aware" (internal/daemon/
-            # worker_admit.go:192-213). Under N-way worker contention that grace
-            # is thin, and overrunning it proves nothing about the daemon's
-            # existence: it was dialled, the request WAS sent, only the reply
-            # was late. Treating that as WorkerAdmitUnavailable silently
-            # stripped RAM containment for the whole remaining run on a
-            # perfectly healthy daemon -- the same misdiagnosis class the
-            # E_CONFINE_ARGUMENT_INVALID and "unevaluated" branches above
-            # already exist to prevent.
-            #
-            # A CONJUNCTION is required, never the bare prefix (Sol plan-review
-            # P0, refined by Fable plan-review P1-1): "read worker-admit
-            # response: %w" (internal/runner/worker_admit_client_linux.go:95)
-            # wraps EVERY frame-read failure from readRunnerAdmitFrame
-            # (internal/runner/admission_linux.go:562-576), and those split into
-            # two genuinely different classes:
-            #
-            #   TRANSPORT (retriable, matched here) -- "i/o timeout" (the socket
-            #   deadline), "EOF"/"unexpected EOF" (the daemon returned without
-            #   writing a frame, e.g. the s.stopping path at
-            #   internal/daemon/worker_admit.go:436-438), "connection reset".
-            #   None of these establishes that the daemon is gone, and the very
-            #   next attempt disambiguates for free: a genuinely dead daemon
-            #   fails at the DIAL instead, producing "dial daemon: ... connection
-            #   refused", which is not matched here and correctly becomes
-            #   WorkerAdmitUnavailable. So at most one extra attempt is spent.
-            #
-            #   PROTOCOL (terminal, deliberately NOT matched) -- "invalid daemon
-            #   admission frame size" (:569) and "json: ..." unmarshal failures
-            #   (:575). These are permanent version/protocol skew against a LIVE
-            #   daemon: retrying cannot ever succeed, so matching them here would
-            #   convert a clean fallback into an unbounded wait -- reintroducing
-            #   the very hang class this change exists to remove.
-            if "read worker-admit response" in message and (
-                "i/o timeout" in message
-                or "EOF" in message
-                or "connection reset" in message
-            ):
-                raise WorkerAdmitDenied(message)
-            raise WorkerAdmitUnavailable(message)
-        grant = {}
-        for field in line[len("granted "):].split():
-            key, _, value = field.partition("=")
-            grant[key] = value
-        required = ("scope", "worker_id", "memory_max", "memory_high")
-        missing = [key for key in required if key not in grant]
+            # The lookup cannot yield the None sentinel here: the only class
+            # mapped to None is "granted", and the parser's own
+            # grantedness-agreement check guarantees class == "granted" iff
+            # state == "granted", which this branch has already excluded.
+            # That check is load-bearing for this line, not decorative.
+            raise _OUTCOME_CLASS_EXCEPTIONS[outcome["class"]](
+                _describe_outcome(outcome, diagnostic)
+            )
+        grant = {key: outcome[key] for key in _OUTCOME_GRANT_FIELDS if key in outcome}
+        missing = [key for key in _OUTCOME_GRANT_FIELDS if key not in grant]
         malformed = None
         if missing:
             malformed = "missing required field%s: %s" % (
@@ -732,27 +757,46 @@ class Supervisor:
                     malformed = "%s must be a positive integer (got %r)" % (key, grant[key])
                     break
         if malformed is not None:
-            # A malformed grant means the relay cannot be trusted as a
-            # daemon-backed admission. Release it exactly as for every
-            # other non-usable response, rather than leaving its lease and
-            # pipes around until the supervisor later falls back.
+            # A granted outcome line missing (or corrupting) its placement
+            # fields is the relay and this supervisor disagreeing about the
+            # channel: the Go side refuses to RENDER such a line
+            # (WorkerAdmitOutcomeLine), so seeing one means the two are out
+            # of lockstep or the stream was corrupted. Terminal and loud,
+            # not a silent unconfined fallback -- see
+            # WorkerAdmitContractViolation's own docstring. Release it
+            # exactly as for every other non-usable response, rather than
+            # leaving its lease and pipes around.
             #
-            # stdin MUST close BEFORE the blocking stderr read below (Sol
+            # ORDER IS LOAD-BEARING, and both halves of it are:
+            #
+            # stdin MUST close BEFORE any blocking stderr read (Sol
             # build-review, AIRA-38 review wave): per runWorkerAdmitCommand's
-            # own confirmed contract, once "granted" is printed the CLI
-            # relay blocks on ITS OWN stdin reaching EOF before it exits
+            # own confirmed contract, once a granted outcome is printed the
+            # CLI relay blocks on ITS OWN stdin reaching EOF before it exits
             # (or writes anything further to stderr) -- reading stderr
             # first deadlocks unconditionally against a process that will
             # never close its own stderr until stdin closes.
+            #
+            # And _terminate_process MUST come before the read, not after
+            # (this revision, second review round): closing stdin makes a
+            # WELL-BEHAVED relay exit, but a wedged one that ignores its own
+            # stdin EOF left this unbounded read sitting on the
+            # single-threaded dispatch loop -- the exact AIRA-92 hazard, and
+            # the one remaining untimed read on this path. Terminating first
+            # costs nothing in the normal case (a relay that already exited
+            # on stdin EOF is reaped, not signalled) and bounds the wedged
+            # case; only a relay that was mid-write to stderr AND ignoring
+            # stdin can lose part of its diagnostic, and such a relay was not
+            # going to finish that write anyway.
             try:
                 process.stdin.close()
             except BrokenPipeError:
                 pass
-            stderr = process.stderr.read().decode("utf-8", "replace") if process.stderr else ""
             # Bounded, and escalates to SIGKILL rather than leaving a live relay
             # behind (AIRA-92): the previous `process.wait()` after kill() was
             # itself unbounded.
             _terminate_process(process)
+            stderr = process.stderr.read().decode("utf-8", "replace") if process.stderr else ""
             # Mirrors _retire_worker's best-effort scope cleanup (Fable
             # build-review, final gate): a malformed grant can still name
             # a real, already-created scope (e.g. a bad memory_max value
@@ -760,8 +804,16 @@ class Supervisor:
             # the missing fields, so this is guarded, unlike the
             # unconditional rmdir in spawn_worker's placement-failure path
             # where "grant" is always fully well-formed by construction.
+            # AIRA-39 made this removal load-bearing rather than best-effort:
+            # the daemon's ledger now sums memory.max over the outer scope's
+            # real children, so a scope left behind KEEPS CHARGING this run's
+            # budget. _forget_worker_scope remembers a failed rmdir for the
+            # retry sweep instead of merely warning.
             self._forget_worker_scope(grant.get("scope"))
-            raise WorkerAdmitUnavailable("worker-admit malformed grant: %s" % malformed)
+            raise WorkerAdmitContractViolation(
+                "worker-admit granted outcome is malformed: %s [relay stderr: %s]"
+                % (malformed, stderr.strip() or "none")
+            )
         return grant, process
 
     def _child_close_other_workers_fds(self):
@@ -798,8 +850,9 @@ class Supervisor:
 
     def spawn_worker(self, estimated_bytes, max_wait="30s"):
         """Admits and forks one worker, returning its pid. Raises
-        WorkerAdmitUnavailable/WorkerAdmitDenied if admission fails,
-        WorkerAdmitRequestTooLarge if this sizing can never fit, or
+        WorkerAdmitUnavailable/WorkerAdmitDenied if admission fails, a
+        WorkerAdmitTerminal subclass (WorkerAdmitRequestInvalid or
+        WorkerAdmitContractViolation) if this request can never succeed, or
         WorkerPlacementFailed if the forked child died before confirming it
         joined its granted cgroup scope -- the caller (run()) decides
         fallback/retry/terminal-queue policy for each.
@@ -904,7 +957,8 @@ class Supervisor:
                     "containment preserved\n" % pid
                 )
                 raise WorkerAdmitDenied(
-                    "worker-admit denied: fallback:placement-ack-timeout for worker %d" % pid
+                    "worker-admit state=denied class=contended reason=placement-ack-timeout "
+                    "for worker %d" % pid
                 )
             raise WorkerPlacementFailed("worker %d exited before confirming cgroup placement" % pid)
         os.set_blocking(result_read, False)
@@ -1112,9 +1166,9 @@ class Supervisor:
         stderr warning so a stalled run is never silent. Returns on
         success, or on WorkerAdmitUnavailable/WorkerPlacementFailed
         (which _disable_daemon and the caller's own fallback handle).
-        WorkerAdmitRequestTooLarge deliberately propagates to the caller,
-        which marks the affected queue unevaluated rather than retrying or
-        silently falling back unconfined. Never returns on
+        WorkerAdmitTerminal (either subclass) deliberately propagates to
+        the caller, which marks the affected queue unevaluated rather than
+        retrying or silently falling back unconfined. Never returns on
         denial-exhaustion, because there is no such thing here:
         a daemon that stays reachable but saturated forever means the run
         genuinely waits forever, which is the honest outcome, not this
@@ -1166,9 +1220,11 @@ class Supervisor:
         run()'s startup path does rather than let the run end with queue
         work still undone.
 
-        WorkerAdmitRequestTooLarge is instead a permanent sizing verdict:
-        drain the remaining queue to unevaluated without disabling the
-        still-healthy daemon or spawning an unconfined fallback worker.
+        WorkerAdmitTerminal is instead a permanent verdict about this
+        request (a per-request rejection) or about the channel itself (a
+        contract violation): drain the remaining queue to unevaluated
+        without disabling the still-healthy daemon or spawning an
+        unconfined fallback worker.
 
         WorkerAdmitUnavailable (no daemon to talk to at all) and
         WorkerPlacementFailed (the cgroup mechanism itself is broken
@@ -1191,8 +1247,8 @@ class Supervisor:
                     self._wait_for_admission_or_disable(
                         lambda: self.spawn_worker(self._run_estimated_bytes, max_wait=self._run_max_wait)
                     )
-                except WorkerAdmitRequestTooLarge as exc:
-                    self._fail_queue_too_large(str(exc))
+                except WorkerAdmitTerminal as exc:
+                    self._fail_queue_terminal(str(exc))
                     return
                 if self.daemon_available:
                     return  # the wait succeeded -- a confined worker now exists
@@ -1202,8 +1258,8 @@ class Supervisor:
                 # fallback-spawn every other daemon-unavailable path in
                 # this function already uses, rather than return here and
                 # leave the pool empty with queue work still undone.
-            except WorkerAdmitRequestTooLarge as exc:
-                self._fail_queue_too_large(str(exc))
+            except WorkerAdmitTerminal as exc:
+                self._fail_queue_terminal(str(exc))
                 return
             except (WorkerAdmitUnavailable, WorkerPlacementFailed) as exc:
                 self._disable_daemon(str(exc))
@@ -1534,8 +1590,8 @@ class Supervisor:
                     # start dispatching to however many DID get admitted;
                     # a later retirement's _replace_worker tries for more.
                     break
-                except WorkerAdmitRequestTooLarge as exc:
-                    self._fail_queue_too_large(str(exc))
+                except WorkerAdmitTerminal as exc:
+                    self._fail_queue_terminal(str(exc))
                     break
                 except (WorkerAdmitUnavailable, WorkerPlacementFailed) as exc:
                     self._disable_daemon(str(exc))
@@ -1554,8 +1610,8 @@ class Supervisor:
             if self.daemon_available and not self.workers and self.queue:
                 try:
                     self._wait_for_admission_or_disable(lambda: self.spawn_worker(estimated_bytes, max_wait=max_wait))
-                except WorkerAdmitRequestTooLarge as exc:
-                    self._fail_queue_too_large(str(exc))
+                except WorkerAdmitTerminal as exc:
+                    self._fail_queue_terminal(str(exc))
         if not self.daemon_available:
             # Cap TOTAL concurrent workers (already-admitted + fallback) at
             # the configured pool size -- min(worker_count,

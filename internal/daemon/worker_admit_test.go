@@ -336,7 +336,7 @@ func TestEvaluateWorkerAdmitDeniesWhenAggregateCapsWouldExceedCeiling(t *testing
 	// the aggregate guard must deny it regardless.
 	live["/outer"] = 100
 	second := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
-	if second.State != "denied" || second.Reason != "fallback:aggregate-cap-exceeded" {
+	if second.State != runner.WorkerAdmitStateDenied || second.Class != runner.WorkerAdmitClassContended || second.Reason != runner.WorkerAdmitReasonAggregateCapExceeded {
 		t.Fatalf("second (aggregate-cap-guarded) =%+v", second)
 	}
 	// AIRA-39/AIRA-41: capacity is freed by the SCOPE going away (supervisor.py's
@@ -418,7 +418,7 @@ func TestEvaluateWorkerAdmitAggregateGuardAccountsForSupervisorRSS(t *testing.T)
 	// committed-only guard (committed=0 before any grant) -- but
 	// supervisor(400)+700=1100 > 1000, so this must now be denied.
 	denied := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
-	if denied.State != "denied" || denied.Reason != "fallback:aggregate-cap-exceeded" {
+	if denied.State != runner.WorkerAdmitStateDenied || denied.Class != runner.WorkerAdmitClassContended || denied.Reason != runner.WorkerAdmitReasonAggregateCapExceeded {
 		t.Fatalf("denied (supervisor-rss-guarded) =%+v", denied)
 	}
 	// A request that fits alongside the supervisor's footprint is granted.
@@ -544,7 +544,7 @@ func TestEvaluateWorkerAdmitAccountsForSupervisorRSSWhenSupervisorScopeIsUncappe
 	// unevaluated -- an uncapped memory.max is a normal, expected read,
 	// not a failure.
 	denied := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
-	if denied.State != "denied" || denied.Reason != "fallback:aggregate-cap-exceeded" {
+	if denied.State != runner.WorkerAdmitStateDenied || denied.Class != runner.WorkerAdmitClassContended || denied.Reason != runner.WorkerAdmitReasonAggregateCapExceeded {
 		t.Fatalf("denied=%+v", denied)
 	}
 	granted := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 500, maxWaitMS: 0})
@@ -583,8 +583,8 @@ func TestEvaluateWorkerAdmitDeniesImmediatelyWhenRequestExceedsCeilingEvenAtZero
 	server.workerAdmitHeadroom = 0
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
 	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 1001, maxWaitMS: 0})
-	if response.State != "denied" || response.Reason != "reject:exceeds-ceiling" {
-		t.Fatalf("response=%+v, want denied/reject:exceeds-ceiling", response)
+	if response.State != runner.WorkerAdmitStateDenied || response.Class != runner.WorkerAdmitClassRequestInvalid || response.Reason != runner.WorkerAdmitReasonExceedsCeiling {
+		t.Fatalf("response=%+v, want denied/request-invalid/exceeds-ceiling", response)
 	}
 }
 
@@ -607,7 +607,8 @@ func TestWorkerAdmitLedgerKeepsChargingAfterRelayCloses(t *testing.T) {
 	// itself is still alive inside its still-capped scope. Nothing in the
 	// daemon may free the 900 bytes: the scope is still there.
 	second := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 900, maxWaitMS: 0})
-	if second.State != "denied" || second.Reason != "fallback:aggregate-cap-exceeded" {
+	if second.State != runner.WorkerAdmitStateDenied || second.Class != runner.WorkerAdmitClassContended ||
+		second.Reason != runner.WorkerAdmitReasonAggregateCapExceeded {
 		t.Fatalf("second=%+v, want the killed relay's 900-byte scope still charged (AIRA-41)", second)
 	}
 	// Only the scope actually going away frees it — which supervisor.py does
@@ -635,7 +636,8 @@ func TestWorkerAdmitLedgerReconstructsCommittedFromCgroupTreeAcrossRestart(t *te
 	tree.put("/outer", workerScopeChildPrefix+"2", 400)
 
 	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400, maxWaitMS: 0})
-	if response.State != "denied" || response.Reason != "fallback:aggregate-cap-exceeded" {
+	if response.State != runner.WorkerAdmitStateDenied || response.Class != runner.WorkerAdmitClassContended ||
+		response.Reason != runner.WorkerAdmitReasonAggregateCapExceeded {
 		t.Fatalf("response=%+v, want denied/fallback:aggregate-cap-exceeded: two pre-existing 400-byte worker scopes plus a third would exceed the 1000-byte ceiling. Against a purely in-memory ledger this grants, and the outer scope's memory.oom.group kills the whole run (AIRA-39)", response)
 	}
 	// The same daemon still grants what genuinely fits alongside them.
@@ -684,7 +686,8 @@ func TestWorkerAdmitChargesNonNumericWorkerScopeChildren(t *testing.T) {
 	tree.put("/outer", workerScopeChildPrefix+"foo", 800)
 
 	denied := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400, maxWaitMS: 0})
-	if denied.State != "denied" || denied.Reason != "fallback:aggregate-cap-exceeded" {
+	if denied.State != runner.WorkerAdmitStateDenied || denied.Class != runner.WorkerAdmitClassContended ||
+		denied.Reason != runner.WorkerAdmitReasonAggregateCapExceeded {
 		t.Fatalf("denied=%+v, want the non-numeric .aira-worker-foo child's 800-byte cap charged", denied)
 	}
 	granted := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 100, maxWaitMS: 0})
@@ -732,10 +735,11 @@ func TestWorkerAdmitTwoJobsShareOneOuterScopeAndAreCountedTogether(t *testing.T)
 	}
 	// A DIFFERENT job id on the same outer scope. It must be denied for the
 	// arithmetic reason (700+700 > 1000), never with an ownership rejection —
-	// and the denial must be the retriable fallback: kind, so it clears once
-	// job-1's worker retires.
+	// and the denial must carry the RETRIABLE disposition, so it clears once
+	// job-1's worker retires. AIRA-42: that disposition is now the `contended`
+	// CLASS; it used to be a "fallback:" prefix on the reason string.
 	other := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-2", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
-	if other.State != "denied" || other.Reason != "fallback:aggregate-cap-exceeded" {
+	if other.State != runner.WorkerAdmitStateDenied || other.Class != runner.WorkerAdmitClassContended || other.Reason != runner.WorkerAdmitReasonAggregateCapExceeded {
 		t.Fatalf("other=%+v, want the second job counted against the first job's scope, not rejected for ownership", other)
 	}
 	if strings.Contains(other.Reason, "owned-by-another-job") {
@@ -1038,14 +1042,23 @@ func TestWorkerAdmitConnectionDeniesRetriablyWhenAdmitSlotsSaturated(t *testing.
 	if err := json.Unmarshal(frame.Data, &response); err != nil {
 		t.Fatalf("frame=%+v err=%v", frame, err)
 	}
-	if response.State != "denied" || response.Reason != "fallback:admit-slots-saturated" {
-		t.Fatalf("response=%+v, want denied/fallback:admit-slots-saturated", response)
+	if response.State != runner.WorkerAdmitStateDenied || response.Class != runner.WorkerAdmitClassContended ||
+		response.Reason != runner.WorkerAdmitReasonAdmitSlotsSaturated {
+		t.Fatalf("response=%+v, want denied/contended/admit-slots-saturated", response)
 	}
-	// The load-bearing half: NOT reject:-prefixed, so supervisor.py raises the
-	// retriable WorkerAdmitDenied rather than the terminal
-	// WorkerAdmitRequestTooLarge.
-	if strings.Contains(response.Reason, "reject:") {
-		t.Fatalf("saturation reason %q is reject:-prefixed, which makes supervisor.py mark the queue unevaluated instead of retrying once a slot frees", response.Reason)
+	// The load-bearing half, kept as its own assertion rather than left
+	// implied by the equality above: what matters is the CONSEQUENCE, that
+	// supervisor.py raises the retriable WorkerAdmitDenied rather than the
+	// terminal WorkerAdmitRequestInvalid. AIRA-42 moved that property from
+	// "the reason is not reject:-prefixed" (which is what this used to check)
+	// to the class, so the check moves with it. It is deliberately phrased
+	// against the terminal class, so a future rewording of the reason token
+	// cannot quietly change what the supervisor does with this verdict.
+	if response.Class == runner.WorkerAdmitClassRequestInvalid {
+		t.Fatalf("saturation class=%q is the terminal class, which makes supervisor.py mark the queue unevaluated instead of retrying once a slot frees", response.Class)
+	}
+	if strings.Contains(response.Reason, "reject:") || strings.Contains(response.Reason, "fallback:") {
+		t.Fatalf("the retired prose prefix convention reappeared in reason %q", response.Reason)
 	}
 }
 
@@ -1136,8 +1149,8 @@ func TestWorkerAdmitFailingScanIsThrottledLikeASuccessfulOne(t *testing.T) {
 		if response.State != "unevaluated" {
 			t.Fatalf("poll %d response=%+v, want unevaluated on every poll", i, response)
 		}
-		if !strings.Contains(response.Reason, "input/output error") {
-			t.Fatalf("poll %d reason=%q, want the underlying failure replayed", i, response.Reason)
+		if !strings.Contains(response.Detail, "input/output error") {
+			t.Fatalf("poll %d detail=%q, want the underlying failure replayed", i, response.Detail)
 		}
 	}
 	if got := tree.scanCount("/outer"); got != 1 {
@@ -1153,13 +1166,26 @@ func TestWorkerAdmitFailingScanIsThrottledLikeASuccessfulOne(t *testing.T) {
 	}
 }
 
-// verifies: AIRA-39 — an "unevaluated" reason carries free-form text (cgroup
-// paths containing the operator's own job name, and raw memory.max bytes).
-// supervisor.py disables daemon admission entirely — running the whole suite
-// UNCONFINED — for a "worker-admit unevaluated" message that also contains the
-// token "unbounded". That token must never reach the wire by accident.
-// Found independently by Sol and DeepSeek build-review.
-func TestWorkerAdmitUnevaluatedReasonNeverCarriesTheUnboundedToken(t *testing.T) {
+// verifies: AIRA-39, AIRA-42 — operator-controlled diagnostic text can never be
+// mistaken for a verdict.
+//
+// This test was TestWorkerAdmitUnevaluatedReasonNeverCarriesTheUnboundedToken,
+// and it guarded a workaround rather than a property. supervisor.py used to
+// disable daemon admission entirely — the WHOLE suite UNCONFINED — for any
+// "worker-admit unevaluated" message that merely CONTAINED the token
+// "unbounded", so the daemon defensively mangled that token to "un-bounded"
+// wherever free-form text (cgroup paths carrying the operator's own
+// `--name`, raw memory.max bytes) could reach the wire. Found independently
+// by Sol and DeepSeek build-review on AIRA-39.
+//
+// AIRA-42 removes the hazard at its source instead of neutralising its
+// symptom: the verdict lives in `class`/`reason`, `detail` is not parsed by
+// anything, and the mangling is deleted. So the assertions INVERT — the
+// diagnostic is now allowed to say "unbounded" verbatim, and what must hold is
+// that saying it changes NO part of the classification. A regression to
+// substring classification, or a class slip from `contended` to
+// `admission-unusable`, fails here.
+func TestWorkerAdmitHostileDiagnosticTextCannotForgeAVerdict(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		err  error
@@ -1181,15 +1207,43 @@ func TestWorkerAdmitUnevaluatedReasonNeverCarriesTheUnboundedToken(t *testing.T)
 			tree.failScan("/outer", test.err)
 
 			response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 100})
-			if response.State != "unevaluated" {
-				t.Fatalf("response=%+v, want unevaluated", response)
+			// The load-bearing assertion: a scan failure is RETRIABLE, no
+			// matter what its text happens to say. The condition whose token
+			// this text imitates (outer-scope-unbounded) is
+			// admission-unusable — the containment-stripping class — so a
+			// classifier that read the text would land here with the wrong
+			// disposition and run the rest of the suite unconfined.
+			if response.State != runner.WorkerAdmitStateUnevaluated ||
+				response.Class != runner.WorkerAdmitClassContended ||
+				response.Reason != runner.WorkerAdmitReasonWorkerScopesUnreadable {
+				t.Fatalf("response=%+v, want unevaluated/contended/worker-scopes-unreadable: "+
+					"diagnostic text that merely mentions \"unbounded\" must not be read as an "+
+					"uncapped outer scope, which is the containment-stripping verdict", response)
 			}
-			if strings.Contains(response.Reason, "unbounded") {
-				t.Fatalf("reason=%q contains supervisor.py's \"unbounded\" token: the classifier reads that as an uncapped outer scope, disables daemon admission and runs the WHOLE suite unconfined", response.Reason)
+			// The diagnostic gets to be ACCURATE again — the whole cost of the
+			// old mangling. The offending child is named, verbatim.
+			if !strings.Contains(response.Detail, ".aira-worker-2") {
+				t.Fatalf("detail=%q, want the offending child still named", response.Detail)
 			}
-			// Still diagnosable: the offending child is named.
-			if !strings.Contains(response.Reason, ".aira-worker-2") {
-				t.Fatalf("reason=%q, want the offending child still named", response.Reason)
+			if !strings.Contains(response.Detail, "unbounded") || strings.Contains(response.Detail, "un-bounded") {
+				t.Fatalf("detail=%q, want the operator's own text unmangled: the structured channel "+
+					"is what makes it safe to report accurately", response.Detail)
+			}
+			// End to end through the real renderer and parser: hostile detail
+			// survives tokenisation without displacing a single field.
+			line, err := runner.WorkerAdmitOutcomeLine(runner.WorkerAdmitOutcome{
+				State: response.State, Class: response.Class,
+				Reason: response.Reason, Detail: response.Detail,
+			}, nil)
+			if err != nil {
+				t.Fatalf("render: %v", err)
+			}
+			fields, err := runner.ParseWorkerAdmitOutcomeLine(line)
+			if err != nil {
+				t.Fatalf("parse %q: %v", line, err)
+			}
+			if fields["class"] != runner.WorkerAdmitClassContended || fields["reason"] != runner.WorkerAdmitReasonWorkerScopesUnreadable {
+				t.Fatalf("round trip changed the verdict: %v", fields)
 			}
 		})
 	}
@@ -1226,7 +1280,8 @@ func TestWorkerAdmitGrantAlwaysScansFreshBeforeGranting(t *testing.T) {
 	scansBefore := tree.scanCount("/outer")
 
 	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 100})
-	if response.State != "denied" || response.Reason != "fallback:aggregate-cap-exceeded" {
+	if response.State != runner.WorkerAdmitStateDenied || response.Class != runner.WorkerAdmitClassContended ||
+		response.Reason != runner.WorkerAdmitReasonAggregateCapExceeded {
 		t.Fatalf("response=%+v, want denied: 100(existing)+850(external)+100 > 1000. A cached sum was used to admit", response)
 	}
 	// Exactly one: the contended DENIAL path must still read the cache (the
@@ -1264,11 +1319,15 @@ func TestWorkerAdmitEEXISTInvalidatesCacheAndDeniesRetriably(t *testing.T) {
 	}
 
 	first := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400})
-	if first.State != "denied" || first.Reason != "fallback:worker-scope-id-collision" {
-		t.Fatalf("first=%+v, want a retriable fallback:worker-scope-id-collision. Advancing to the next id and granting would admit 400 against a sum that omits the colliding 900-byte child", first)
+	if first.State != runner.WorkerAdmitStateDenied || first.Class != runner.WorkerAdmitClassContended ||
+		first.Reason != runner.WorkerAdmitReasonWorkerScopeIDCollision {
+		t.Fatalf("first=%+v, want a retriable denied/contended/worker-scope-id-collision. Advancing to the next id and granting would admit 400 against a sum that omits the colliding 900-byte child", first)
 	}
-	if strings.Contains(first.Reason, "reject:") {
-		t.Fatalf("collision denial %q is reject:-prefixed and would terminate the run instead of re-evaluating", first.Reason)
+	// The retriability is now the class, not a "fallback:" reason prefix
+	// (AIRA-42). Asserted against the terminal class so a reason rewording
+	// cannot silently turn re-evaluation into run termination.
+	if first.Class == runner.WorkerAdmitClassRequestInvalid {
+		t.Fatalf("collision denial class=%q is terminal and would end the run instead of re-evaluating", first.Class)
 	}
 	// The collision invalidated the cache; the retry now sees the real tree and
 	// denies for the honest arithmetic reason.
@@ -1276,15 +1335,70 @@ func TestWorkerAdmitEEXISTInvalidatesCacheAndDeniesRetriably(t *testing.T) {
 		tree.put("/outer", name, value)
 	}
 	second := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400})
-	if second.State != "denied" || second.Reason != "fallback:aggregate-cap-exceeded" {
+	if second.State != runner.WorkerAdmitStateDenied || second.Class != runner.WorkerAdmitClassContended ||
+		second.Reason != runner.WorkerAdmitReasonAggregateCapExceeded {
 		t.Fatalf("second=%+v, want the re-evaluation to see the collided child and deny on the sum", second)
 	}
 }
 
-// verifies: AIRA-39 — a create failure that is NOT a collision is fail-closed
-// and terminal: no grant is recorded, and the reason is reject:-prefixed so
-// supervisor.py marks the queue unevaluated rather than retrying forever
-// against broken daemon-side cgroupfs access.
+// verifies: AIRA-39, AIRA-42 — an EEXIST collision SELF-HEALS on the retry: it
+// does not collide identically forever.
+//
+// Written to answer a DeepSeek build-review P1 on the AIRA-42 merge, which read
+// the `contended` (retriable) class on this row as retry-forever and argued the
+// row should be terminal, on the grounds that "invalidating the cached sum does
+// not clear the existing cgroup". True but beside the point — the retry does not
+// need the child GONE, it needs it COUNTED. `state.invalidate()` forces the next
+// evaluation to rescan, the rescan lifts `maxIndex` past the colliding child,
+// and the id therefore advances rather than repeating.
+//
+// The existing test above only shows the retry DENYING on the corrected
+// aggregate, which does not distinguish the two readings. This one shows the id
+// advancing and the request being GRANTED, which does. Kept as a permanent test
+// because the property is load-bearing for the retriable classification and was
+// not previously pinned anywhere.
+func TestWorkerAdmitEEXISTRetryAdvancesTheWorkerIDInsteadOfRepeating(t *testing.T) {
+	server := NewServer(Paths{})
+	tree := newWorkerScopeTree().install(server)
+	server.workerAdmitHeadroom = 0
+	// Deliberately roomy, so nothing but the collision can deny: the point of
+	// this test is the ID, not the arithmetic.
+	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 10000)
+	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
+
+	// A child invisible to the scan but present to create: exactly the
+	// stale-low cache this branch exists for.
+	hidden := map[string]int64{workerScopeChildPrefix + "1": 100}
+	server.workerScopeCreate = func(ctx context.Context, outer, workerID string, memoryMax, memoryHigh int64) (string, error) {
+		if _, exists := hidden[workerScopeChildPrefix+workerID]; exists {
+			return "", fmt.Errorf("aitest worker scope: create: mkdir: %w", fs.ErrExist)
+		}
+		return tree.create(ctx, outer, workerID, memoryMax, memoryHigh)
+	}
+
+	first := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400})
+	if first.Class != runner.WorkerAdmitClassContended || first.Reason != runner.WorkerAdmitReasonWorkerScopeIDCollision {
+		t.Fatalf("first=%+v, want the retriable collision verdict", first)
+	}
+	// The invalidation is what makes the next scan see the child.
+	for name, value := range hidden {
+		tree.put("/outer", name, value)
+	}
+	second := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400})
+	if second.State != runner.WorkerAdmitStateGranted {
+		t.Fatalf("second=%+v, want a GRANT: a collision that cannot clear would make `contended` a "+
+			"retry-forever stall, which is the reading this test exists to refute", second)
+	}
+	if second.WorkerID == "1" {
+		t.Fatalf("second=%+v reused the colliding id: the rescan must lift maxIndex past it", second)
+	}
+}
+
+// verifies: AIRA-39, AIRA-42 — a create failure that is NOT a collision is
+// fail-closed and terminal: no grant is recorded, and the verdict carries the
+// TERMINAL class so supervisor.py marks the queue unevaluated rather than
+// retrying forever against broken daemon-side cgroupfs access. The disposition
+// used to be spelled as a "reject:" prefix on the reason; it is now the class.
 func TestWorkerAdmitDeniesTerminallyWhenScopeCreateFails(t *testing.T) {
 	server := NewServer(Paths{})
 	tree := newWorkerScopeTree().install(server)
@@ -1294,14 +1408,19 @@ func TestWorkerAdmitDeniesTerminallyWhenScopeCreateFails(t *testing.T) {
 	tree.createFn = func(string, string) error { return errors.New("permission denied") }
 
 	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400})
-	if response.State != "denied" {
+	if response.State != runner.WorkerAdmitStateDenied {
 		t.Fatalf("response=%+v, want a denial: a grant whose scope could not be created must never be issued", response)
 	}
-	if !strings.HasPrefix(response.Reason, "reject:worker-scope-create-failed:") {
-		t.Fatalf("reason=%q, want a reject:worker-scope-create-failed: prefix so supervisor.py terminates instead of retrying indefinitely", response.Reason)
+	if response.Class != runner.WorkerAdmitClassRequestInvalid || response.Reason != runner.WorkerAdmitReasonWorkerScopeCreateFailed {
+		t.Fatalf("response=%+v, want the terminal request-invalid class so supervisor.py terminates instead of retrying indefinitely", response)
 	}
-	if !strings.Contains(response.Reason, "permission denied") {
-		t.Fatalf("reason=%q, want the underlying cause named", response.Reason)
+	// NOT admission-unusable: the daemon is answering fine, and that class
+	// would strip RAM containment for the whole remaining run.
+	if response.Class == runner.WorkerAdmitClassAdmissionUnusable {
+		t.Fatalf("response=%+v: a daemon-side cgroupfs failure must not be reported as unusable admission — that runs the rest of the suite unconfined", response)
+	}
+	if !strings.Contains(response.Detail, "permission denied") {
+		t.Fatalf("detail=%q, want the underlying cause named", response.Detail)
 	}
 	// And nothing was charged: the ledger has no phantom entry.
 	children, err := tree.scan("/outer")
@@ -1377,7 +1496,8 @@ func TestWorkerAdmitAggregateGuardDoesNotWrapOnSaturatedCommitted(t *testing.T) 
 		return workerScopeChildren{committed: math.MaxInt64, count: 1, maxIndex: 1}, nil
 	}
 	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: requested})
-	if response.State != "denied" || response.Reason != "fallback:aggregate-cap-exceeded" {
+	if response.State != runner.WorkerAdmitStateDenied || response.Class != runner.WorkerAdmitClassContended ||
+		response.Reason != runner.WorkerAdmitReasonAggregateCapExceeded {
 		t.Fatalf("response=%+v, want a denial: a saturated committed sum must never wrap into apparent headroom", response)
 	}
 }
@@ -1396,8 +1516,8 @@ func TestWorkerAdmitReturnsUnevaluatedWhenChildCapUnreadable(t *testing.T) {
 	if response.State != "unevaluated" {
 		t.Fatalf("response=%+v, want unevaluated: an unreadable child cap must never be treated as zero committed", response)
 	}
-	if !strings.Contains(response.Reason, "memory.max") {
-		t.Fatalf("reason=%q, want the underlying scan failure named", response.Reason)
+	if !strings.Contains(response.Detail, "memory.max") {
+		t.Fatalf("detail=%q, want the underlying scan failure named", response.Detail)
 	}
 }
 

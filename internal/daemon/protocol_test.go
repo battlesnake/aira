@@ -61,14 +61,28 @@ func TestFrameRoundTripPreservesRequestContent(t *testing.T) {
 	}
 }
 
-// verifies: AIRA-39 — the bump from 5 to 6 is load-bearing, not cosmetic.
-// Daemon-side worker-scope creation changes wire SEMANTICS without changing the
-// wire SHAPE, so the version mismatch is the only thing standing between a
-// stale client and a whole aitest suite silently running unconfined (see
-// ProtocolVersion's own comment). A later "consistency" revert must fail here.
-func TestStoreWriteRelayUsesProtocolVersionSix(t *testing.T) {
-	if ProtocolVersion != 6 {
-		t.Fatalf("ProtocolVersion = %d, want 6 for compute git-context relay and AIRA-39 daemon-side worker-scope creation", ProtocolVersion)
+// TestProtocolVersionIsPinned makes a wire-shape change a DELIBERATE edit
+// rather than an accident: any change to a frame the daemon and its clients
+// exchange must move this number, and moving this number forces the coordinated
+// reinstall-and-restart the deploy procedure requires.
+//
+// The name is deliberately version-AGNOSTIC (it was
+// TestStoreWriteRelayUsesProtocolVersionFive, then …Six): renaming a test on
+// every bump is churn that obscures whether the pin itself ever lapsed.
+//
+// verifies: AIRA-39 — the 5→6 bump was load-bearing, not cosmetic. Daemon-side
+// worker-scope creation changed wire SEMANTICS without changing the wire SHAPE,
+// so the version mismatch was the only thing standing between a stale client
+// and a whole aitest suite silently running unconfined.
+//
+// verifies: AIRA-42 — the 6→7 bump changes the SHAPE too: WorkerAdmitResponse
+// gained `class`/`detail` and its `reason` values lost the "reject:"/"fallback:"
+// prefixes a version-6 client dispatches on. Both bumps fail this test if a
+// later "consistency" revert takes the number back down.
+func TestProtocolVersionIsPinned(t *testing.T) {
+	if ProtocolVersion != 7 {
+		t.Fatalf("ProtocolVersion = %d, want 7; a wire-shape or wire-semantics change must "+
+			"bump this and be deployed as an atomic reinstall+restart", ProtocolVersion)
 	}
 }
 

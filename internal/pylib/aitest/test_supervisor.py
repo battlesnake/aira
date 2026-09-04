@@ -6,9 +6,20 @@ import signal
 import subprocess
 import threading
 import time
+import urllib.parse
+
+import pytest
 
 import aitest.supervisor as supervisor_module
-from aitest.supervisor import Supervisor, WorkerAdmitDenied, WorkerAdmitRequestTooLarge, WorkerAdmitUnavailable, WorkerPlacementFailed
+from aitest.supervisor import (
+    Supervisor,
+    WorkerAdmitContractViolation,
+    WorkerAdmitDenied,
+    WorkerAdmitRequestInvalid,
+    WorkerAdmitTerminal,
+    WorkerAdmitUnavailable,
+    WorkerPlacementFailed,
+)
 from aitest.worker import _EVENT_LINE_PREFIX, _tag_tuples, run_one
 
 
@@ -53,14 +64,39 @@ sys.exit(1)
     assert "boom" in capsys.readouterr().err
 
 
-def test_acquire_worker_parses_grant_and_holds_process(tmp_path, monkeypatch):
-    stub = _write_stub(tmp_path / "worker-admit-ok", """
-import sys
-print("granted scope=/outer/.aira-worker-1 worker_id=1 memory_max=400 memory_high=320")
-sys.stdout.flush()
-sys.stdin.buffer.read()
-""")
+def _outcome_stub(tmp_path, monkeypatch, name, line, stderr="", hold_stdin=False, exit_code=1):
+    """A relay stub that writes one outcome LINE on stdout (the only channel
+    acquire_worker reads) plus optional stderr diagnostics (which it must
+    never classify from)."""
+    body = "import sys\n"
+    if line is not None:
+        body += "print(%r)\nsys.stdout.flush()\n" % line
+    if stderr:
+        body += "sys.stderr.write(%r)\nsys.stderr.flush()\n" % stderr
+    if hold_stdin:
+        body += "sys.stdin.buffer.read()\n"
+    body += "sys.exit(%d)\n" % exit_code
+    stub = _write_stub(tmp_path / name, body)
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
+    return stub
+
+
+def _outcome_line(state, klass, reason="", detail=""):
+    line = "aira-worker-admit state=%s class=%s" % (state, klass)
+    if reason:
+        line += " reason=" + urllib.parse.quote_plus(reason)
+    if detail:
+        line += " detail=" + urllib.parse.quote_plus(detail)
+    return line
+
+
+def test_acquire_worker_parses_grant_and_holds_process(tmp_path, monkeypatch):
+    _outcome_stub(
+        tmp_path, monkeypatch, "worker-admit-ok",
+        "aira-worker-admit state=granted class=granted "
+        "scope=%2Fouter%2F.aira-worker-1 worker_id=1 memory_max=400 memory_high=320",
+        hold_stdin=True, exit_code=0,
+    )
     supervisor = Supervisor()
     supervisor.outer_scope = "/outer"
     grant, process = supervisor.acquire_worker(400)
@@ -91,137 +127,127 @@ def test_acquire_worker_raises_unavailable_when_command_unset():
         pass
 
 
-def test_acquire_worker_raises_denied_on_daemon_denial(tmp_path, monkeypatch):
-    # Mirrors the real aira worker-admit CLI's actual failure shape
-    # (RequestWorkerAdmit, Task 8): a non-grant STATE response is wrapped
-    # as "worker-admit <state>: <reason>" on stderr with a nonzero exit —
-    # the daemon IS reachable here, it just declined this request.
-    stub = _write_stub(tmp_path / "worker-admit-denied", """
-import sys
-sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit denied: fallback:insufficient-headroom\\n")
-sys.exit(1)
-""")
-    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
+# Every class the relay can report, and the exception each MUST produce. This
+# one table replaces eleven separate substring-probe tests (AIRA-42): the
+# classification is now the relay's, and this side only maps class -> exception
+# by exact value, so the whole surface is a table rather than an or-chain whose
+# every new branch needed its own regression test.
+#
+# The `reason` column deliberately uses tokens that would have been
+# MISCLASSIFIED by the retired substring cascade -- e.g. a contended reason
+# spelled like a permanent rejection, and a permanent one spelled like nothing
+# in particular -- so a regression that reintroduces prose matching fails here.
+CLASS_TO_EXCEPTION = [
+    ("contended", "insufficient-headroom", "denied", WorkerAdmitDenied),
+    ("contended", "reject:looks-permanent-but-is-not", "timeout", WorkerAdmitDenied),
+    ("contended", "outer-scope-unreadable", "unevaluated", WorkerAdmitDenied),
+    ("request-invalid", "exceeds-ceiling", "denied", WorkerAdmitRequestInvalid),
+    # AIRA-39 daemon-side verdicts. Neither is a fact about the REQUEST, and
+    # that is the point: request-invalid is the terminal-but-daemon-healthy
+    # disposition, not a diagnosis (see the exception's own docstring).
+    ("request-invalid", "worker-scope-create-failed", "denied", WorkerAdmitRequestInvalid),
+    ("request-invalid", "worker-id-space-exhausted", "denied", WorkerAdmitRequestInvalid),
+    ("request-invalid", "some-future-permanent-condition", "denied", WorkerAdmitRequestInvalid),
+    ("request-invalid", "estimated-bytes-out-of-range", "argument-invalid", WorkerAdmitRequestInvalid),
+    ("admission-unusable", "dial-failed", "unavailable", WorkerAdmitUnavailable),
+    ("admission-unusable", "outer-scope-unbounded", "unevaluated", WorkerAdmitUnavailable),
+    ("admission-unusable", "protocol-version-mismatch", "unavailable", WorkerAdmitUnavailable),
+    # No Go producer emits this pair any more (AIRA-39 moved scope creation
+    # into the daemon), but the MAPPING must stay correct: the supervisor's own
+    # fork/placement-ack path raises WorkerPlacementFailed, and if a relay ever
+    # reports the class the disposition must not silently change.
+    ("placement-failed", "worker-placement-ack-timeout", "placement-failed", WorkerPlacementFailed),
+    ("contract-violation", "unknown-daemon-outcome", "unevaluated", WorkerAdmitContractViolation),
+    ("contract-violation", "daemon-error", "unevaluated", WorkerAdmitContractViolation),
+]
+
+
+@pytest.mark.parametrize("klass,reason,state,expected", CLASS_TO_EXCEPTION)
+def test_acquire_worker_maps_every_class_to_its_exception(tmp_path, monkeypatch, klass, reason, state, expected):
+    _outcome_stub(
+        tmp_path, monkeypatch, "worker-admit-" + reason,
+        _outcome_line(state, klass, reason, "a human sentence nothing may parse"),
+        stderr="E_CONFINE_UNAVAILABLE: worker-admit %s (%s)\n" % (state, reason),
+    )
     supervisor = Supervisor()
     supervisor.outer_scope = "/outer"
     try:
         supervisor.acquire_worker(100)
-        assert False, "expected WorkerAdmitDenied"
-    except WorkerAdmitDenied as exc:
-        assert "denied" in str(exc)
+        assert False, "expected %s" % expected.__name__
+    except expected as exc:
+        assert reason in str(exc), str(exc)
+    assert supervisor.daemon_available is True, "acquire_worker must not disable the daemon itself"
 
 
-def test_acquire_worker_raises_request_too_large_on_reject_exceeds_ceiling(tmp_path, monkeypatch):
-    # A reject:exceeds-ceiling denial is a PERMANENT sizing verdict, not a
-    # transient one -- it must classify distinctly from a plain
-    # WorkerAdmitDenied even though its stderr text also contains the
-    # substring "worker-admit denied" (Task 38).
-    stub = _write_stub(tmp_path / "worker-admit-too-large", """
-import sys
-sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit denied: reject:exceeds-ceiling\\n")
-sys.exit(1)
-""")
-    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
+def test_only_two_classes_are_containment_stripping():
+    """The containment-stripping set is exactly {admission-unusable,
+    placement-failed}: those are the two whose exceptions _replace_worker and
+    run() route into _disable_daemon. Widening it silently is the failure this
+    whole fix exists to prevent, so it is pinned here rather than left implicit
+    in three separate except clauses."""
+    stripping = {WorkerAdmitUnavailable, WorkerPlacementFailed}
+    for klass, exception in supervisor_module._OUTCOME_CLASS_EXCEPTIONS.items():
+        if klass in ("admission-unusable", "placement-failed"):
+            assert exception in stripping, klass
+        elif klass == "granted":
+            assert exception is None
+        else:
+            assert exception not in stripping, (
+                "%s must not strip RAM containment for the rest of the run" % klass
+            )
+
+
+@pytest.mark.parametrize("line", [
+    "",
+    "granted scope=/outer/.aira-worker-1 worker_id=1 memory_max=400 memory_high=320",
+    "aira-worker-admit state=denied contended",
+    "aira-worker-admit class=contended",
+    "aira-worker-admit state=denied",
+    "aira-worker-admit state=wat class=contended",
+    "aira-worker-admit state=denied class=wat",
+    "aira-worker-admit state=granted class=contended",
+])
+def test_acquire_worker_refuses_an_unparseable_or_uncatalogued_outcome(tmp_path, monkeypatch, line):
+    """An outcome this supervisor cannot understand is the two sides of the
+    channel being out of lockstep. It must be TERMINAL and loud, never
+    resolved into "there is no daemon" -- which is exactly what the retired
+    substring cascade did by default, silently running the rest of the suite
+    with no per-worker RAM containment.
+
+    The second parameter is the PRE-AIRA-42 grant line: an old relay against a
+    new supervisor must fail loudly, not be mistaken for anything."""
+    _outcome_stub(tmp_path, monkeypatch, "worker-admit-unparseable", line or None,
+                  stderr="E_CONFINE_UNAVAILABLE: worker-admit denied: reject:exceeds-ceiling\n")
     supervisor = Supervisor()
     supervisor.outer_scope = "/outer"
     try:
         supervisor.acquire_worker(100)
-        assert False, "expected WorkerAdmitRequestTooLarge"
-    except WorkerAdmitRequestTooLarge as exc:
-        assert "reject:exceeds-ceiling" in str(exc)
-
-
-def test_acquire_worker_raises_request_too_large_on_reject_outer_scope_owned_by_another_job(tmp_path, monkeypatch):
-    """Regression test for a real bug (Fable re-gate): the daemon's own
-    poll loop (workerAdmitConnection) deliberately breaks immediately on
-    EVERY "denied" reason with the "reject:" prefix as a stable "never
-    going to resolve" fact -- not just reject:exceeds-ceiling, which was
-    the only one the classifier previously recognized. workerJobFor's
-    outer-scope ownership binding is permanent by its own documented
-    design (never released once claimed), so this rejection was retried
-    INDEFINITELY under a misleading "budget contended" warning instead of
-    being treated as the terminal condition it actually is."""
-    stub = _write_stub(tmp_path / "worker-admit-owned-by-another-job", """
-import sys
-sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit denied: reject:outer-scope-owned-by-another-job\\n")
-sys.exit(1)
-""")
-    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
-    supervisor = Supervisor()
-    supervisor.outer_scope = "/outer"
-    try:
-        supervisor.acquire_worker(100)
-        assert False, "expected WorkerAdmitRequestTooLarge"
-    except WorkerAdmitRequestTooLarge as exc:
-        assert "reject:outer-scope-owned-by-another-job" in str(exc)
-    except WorkerAdmitDenied:
-        assert False, "a permanent ownership rejection retried forever is a real hang, not a transient denial"
-
-
-def test_acquire_worker_raises_request_too_large_on_cli_argument_invalid(tmp_path, monkeypatch):
-    """Regression test for a real bug (Fable build-review, final gate): the
-    CLI's own pre-dial E_CONFINE_ARGUMENT_INVALID rejection (e.g. the
-    --estimated-bytes 1MiB floor, AIRA-38) is a permanent, static fact
-    about THIS request's arguments -- the daemon was never even dialed --
-    but used to match none of the recognized substrings and fall through
-    to WorkerAdmitUnavailable, misdiagnosing a purely local client mistake
-    as the daemon being unreachable and stripping containment for the
-    rest of the run."""
-    stub = _write_stub(tmp_path / "worker-admit-argument-invalid", """
-import sys
-sys.stderr.write("E_CONFINE_ARGUMENT_INVALID: --estimated-bytes: must be at least 1MiB\\n")
-sys.exit(1)
-""")
-    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
-    supervisor = Supervisor()
-    supervisor.outer_scope = "/outer"
-    try:
-        supervisor.acquire_worker(100)
-        assert False, "expected WorkerAdmitRequestTooLarge"
-    except WorkerAdmitRequestTooLarge as exc:
-        assert "E_CONFINE_ARGUMENT_INVALID" in str(exc)
+        assert False, "expected a refusal for %r" % line
+    except WorkerAdmitContractViolation:
+        assert line != "", "an ABSENT outcome line is a different, named condition"
     except WorkerAdmitUnavailable:
-        assert False, "a client argument mistake must not be conflated with daemon unavailability"
+        assert line == "", "only a relay that produced NO outcome may report unavailable"
+    except WorkerAdmitRequestInvalid:
+        assert False, (
+            "the classification came from the relay's stderr prose, not from the "
+            "outcome line -- the substring channel is back"
+        )
 
 
-def test_acquire_worker_raises_request_too_large_on_daemon_protocol_rejection(tmp_path, monkeypatch):
-    """Regression test for a real coverage gap (Fable re-gate round 3): the
-    E_DAEMON_PROTOCOL classifier branch (a value slipping past BOTH the
-    CLI and Python clamps, e.g. estimated_bytes above the daemon's own
-    admitMaxReserve) had no test of its own, unlike its sibling
-    E_CONFINE_ARGUMENT_INVALID branch directly above -- a later reorder
-    or drop of the substring in the classifier's or-chain would leave
-    every other test green while reverting this path to the pre-fix
-    misclassification as WorkerAdmitUnavailable."""
-    stub = _write_stub(tmp_path / "worker-admit-daemon-protocol", """
-import sys
-sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit request rejected: E_DAEMON_PROTOCOL: worker-admit estimated_bytes must be no larger than 1125899906842624\\n")
-sys.exit(1)
-""")
-    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
-    supervisor = Supervisor()
-    supervisor.outer_scope = "/outer"
-    try:
-        supervisor.acquire_worker(100)
-        assert False, "expected WorkerAdmitRequestTooLarge"
-    except WorkerAdmitRequestTooLarge as exc:
-        assert "E_DAEMON_PROTOCOL" in str(exc)
-    except WorkerAdmitUnavailable:
-        assert False, "a daemon-side protocol rejection must not be conflated with daemon unavailability"
-
-
-def test_acquire_worker_raises_denied_on_daemon_timeout_response(tmp_path, monkeypatch):
-    # A "timeout" wire response (the daemon waited out the full poll
-    # window, just busy/contended) is ALSO WorkerAdmitDenied, never
-    # WorkerAdmitUnavailable — the whole point of the split (fix for a real
-    # bug: one saturated moment must not permanently strip containment for
-    # the rest of the run, see Task 16).
-    stub = _write_stub(tmp_path / "worker-admit-timeout", """
-import sys
-sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit timeout: reject:saturated\\n")
-sys.exit(1)
-""")
-    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
+def test_acquire_worker_never_classifies_from_stderr(tmp_path, monkeypatch):
+    """The relay's stderr carries a human diagnostic. Here it says one thing
+    and the structured outcome says another; the outcome must win, in both
+    directions. This is the single most direct assertion that there is one
+    channel and not two."""
+    _outcome_stub(
+        tmp_path, monkeypatch, "worker-admit-lying-stderr",
+        _outcome_line("denied", "contended", "insufficient-headroom"),
+        stderr=(
+            "E_CONFINE_UNAVAILABLE: worker-admit denied: reject:exceeds-ceiling\n"
+            "E_DAEMON_PROTOCOL: daemon protocol is 7, client requested 6\n"
+            "dial daemon: connect: no such file or directory\n"
+        ),
+    )
     supervisor = Supervisor()
     supervisor.outer_scope = "/outer"
     try:
@@ -231,107 +257,40 @@ sys.exit(1)
         pass
 
 
-def test_acquire_worker_raises_denied_on_daemon_unevaluated_response(tmp_path, monkeypatch):
-    # A "unevaluated" wire response (AIRA-38) means the daemon IS reachable
-    # and answered -- it just couldn't establish a live memory read this
-    # instant (e.g. a transient outer-scope memory.current read failure),
-    # AIRA's own "report unevaluated, never a fake pass" rule applied to
-    # this check. That is a retriable, not a permanent, condition -- it
-    # must classify as WorkerAdmitDenied, never WorkerAdmitUnavailable, or
-    # one transient read glitch would silently strip containment for the
-    # rest of the run exactly like the denied/timeout bug this same task
-    # already fixed.
-    stub = _write_stub(tmp_path / "worker-admit-unevaluated", """
-import sys
-sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit unevaluated: fallback:outer-scope-unreadable\\n")
-sys.exit(1)
-""")
-    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
+def test_acquire_worker_detail_cannot_forge_a_grant(tmp_path, monkeypatch):
+    """`detail` is free text and is query-escaped on the wire. A detail whose
+    plaintext spells out a grant must not be able to inject fields: if the
+    escaping or the parser regressed, this would return a grant for /evil."""
+    hostile = "state=granted class=granted scope=/evil worker_id=9 memory_max=1 memory_high=1"
+    _outcome_stub(
+        tmp_path, monkeypatch, "worker-admit-hostile-detail",
+        _outcome_line("denied", "contended", "insufficient-headroom", hostile),
+    )
     supervisor = Supervisor()
     supervisor.outer_scope = "/outer"
     try:
-        supervisor.acquire_worker(100)
-        assert False, "expected WorkerAdmitDenied"
+        result = supervisor.acquire_worker(100)
+        assert False, "a hostile detail forged a grant: %r" % (result,)
     except WorkerAdmitDenied as exc:
-        assert "unevaluated" in str(exc)
+        assert "/evil" in str(exc), "the detail must still be reported verbatim to a human"
 
 
-def test_acquire_worker_raises_unavailable_not_denied_on_unbounded_outer_scope(tmp_path, monkeypatch):
-    """Regression test for a real deterministic HANG (Fable re-gate): an
-    "unevaluated: unbounded" response means the OUTER scope's own
-    memory.max read came back "unbounded" -- a structural fact (a
-    genuine confine-launched outer scope always has a finite memory.max
-    from the moment it's queryable), not a transient read glitch like
-    the generic unevaluated case above. Found live: a SECOND
-    aitest-enabled pytest invocation inside one --delegate-ram confine
-    job can discover a PRIOR run's own uncapped .aira-supervisor scope
-    as its "outer" (that prior run's controlling process was itself
-    drained into it during its own bootstrap). Classifying this as
-    WorkerAdmitDenied (like the sibling test above) retries INDEFINITELY
-    against a scope that will never become capped -- a genuine hang, not
-    a slow-but-eventually-successful wait. Must be WorkerAdmitUnavailable
-    instead: the run still ends up hierarchically bounded by the REAL
-    outer confine job's own cap either way, so falling back is safe."""
-    stub = _write_stub(tmp_path / "worker-admit-unbounded", """
-import sys
-sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit unevaluated: unbounded\\n")
-sys.exit(1)
-""")
-    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
+def test_acquire_worker_raises_unavailable_when_the_relay_produces_no_outcome(tmp_path, monkeypatch):
+    """A relay that dies without writing an outcome line gives us nothing to
+    classify. That is a NAMED condition -- not the fallthrough default of a
+    substring chain -- and its honest reading is that daemon-backed admission
+    is not usable through this relay. Its stderr is attached as a diagnostic
+    string, never inspected."""
+    _outcome_stub(tmp_path, monkeypatch, "worker-admit-silent", None,
+                  stderr="segfault, or whatever\n")
     supervisor = Supervisor()
     supervisor.outer_scope = "/outer"
     try:
         supervisor.acquire_worker(100)
         assert False, "expected WorkerAdmitUnavailable"
     except WorkerAdmitUnavailable as exc:
-        assert "unbounded" in str(exc)
-    except WorkerAdmitDenied:
-        assert False, "an unbounded outer scope is structural, not transient -- retrying it forever is a real hang"
-
-
-def test_acquire_worker_raises_unavailable_on_genuine_connection_failure(tmp_path, monkeypatch):
-    # A dial-level failure (no daemon to talk to at all) must NOT match the
-    # denied/timeout classification above, even though its text happens to
-    # come from the same E_CONFINE_UNAVAILABLE-prefixed error family.
-    stub = _write_stub(tmp_path / "worker-admit-dial-failure", """
-import sys
-sys.stderr.write("E_CONFINE_UNAVAILABLE: dial daemon: dial unix /run/aira.sock: connect: no such file or directory\\n")
-sys.exit(1)
-""")
-    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
-    supervisor = Supervisor()
-    supervisor.outer_scope = "/outer"
-    try:
-        supervisor.acquire_worker(100)
-        assert False, "expected WorkerAdmitUnavailable"
-    except WorkerAdmitUnavailable:
-        pass
-
-
-def test_acquire_worker_raises_placement_failed_on_local_scope_creation_failure(tmp_path, monkeypatch):
-    # runWorkerAdmitCommand prints "worker-admit local-placement-failed"
-    # (AIRA-38, Sol build-review) when the DAEMON already granted
-    # admission (reachable, healthy) but the LOCAL cgroup scope creation
-    # then failed -- e.g. a transient EBUSY/ENOENT/cgroupfs hiccup. Before
-    # this classification existed, the raw CreateWorkerScope error matched
-    # none of the recognized substrings and was misclassified as total
-    # daemon unavailability, permanently disabling containment for the
-    # rest of the run over a one-off local hiccup.
-    stub = _write_stub(tmp_path / "worker-admit-local-placement-failed", """
-import sys
-sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit local-placement-failed: aitest worker scope: create: mkdir /outer/.aira-worker-1: device or resource busy\\n")
-sys.exit(1)
-""")
-    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
-    supervisor = Supervisor()
-    supervisor.outer_scope = "/outer"
-    try:
-        supervisor.acquire_worker(100)
-        assert False, "expected WorkerPlacementFailed"
-    except WorkerPlacementFailed as exc:
-        assert "local-placement-failed" in str(exc)
-    except WorkerAdmitUnavailable:
-        assert False, "a local placement failure after a genuine grant must not be conflated with daemon unavailability"
+        assert "no outcome line" in str(exc)
+        assert "segfault" in str(exc), "the relay's own diagnostic must reach the human"
 
 
 def test_acquire_worker_removes_the_granted_scope_dir_on_malformed_grant(tmp_path, monkeypatch):
@@ -344,19 +303,18 @@ def test_acquire_worker_removes_the_granted_scope_dir_on_malformed_grant(tmp_pat
     OSError on a nonexistent path."""
     scope_dir = tmp_path / "granted-scope"
     scope_dir.mkdir()
-    admit = _write_stub(tmp_path / "worker-admit-malformed-real-scope", f"""
-import sys
-print("granted scope={scope_dir} worker_id=1 memory_max=notanumber memory_high=320")
-sys.stdout.flush()
-sys.exit(0)
-""")
-    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    _outcome_stub(
+        tmp_path, monkeypatch, "worker-admit-malformed-real-scope",
+        "aira-worker-admit state=granted class=granted scope=%s worker_id=1 "
+        "memory_max=notanumber memory_high=320" % urllib.parse.quote_plus(str(scope_dir)),
+        exit_code=0,
+    )
     supervisor = Supervisor()
     supervisor.outer_scope = "/outer"
     try:
         supervisor.acquire_worker(400)
-        assert False, "expected WorkerAdmitUnavailable"
-    except WorkerAdmitUnavailable:
+        assert False, "expected WorkerAdmitContractViolation"
+    except WorkerAdmitContractViolation:
         pass
 
     assert not scope_dir.exists(), "the malformed grant's own scope directory must be removed, not leaked"
@@ -367,7 +325,7 @@ def test_acquire_worker_releases_malformed_grant_missing_required_field(tmp_path
     stub = _write_stub(tmp_path / "worker-admit-missing-memory-high", f"""
 import os, sys
 open({str(pid_path)!r}, "w").write(str(os.getpid()))
-print("granted scope=/outer/.aira-worker-1 worker_id=1 memory_max=400")
+print("aira-worker-admit state=granted class=granted scope=%2Fouter%2F.aira-worker-1 worker_id=1 memory_max=400")
 sys.stdout.flush()
 sys.exit(0)
 """)
@@ -376,8 +334,8 @@ sys.exit(0)
     supervisor.outer_scope = "/outer"
     try:
         supervisor.acquire_worker(400)
-        assert False, "expected WorkerAdmitUnavailable"
-    except WorkerAdmitUnavailable as exc:
+        assert False, "expected WorkerAdmitContractViolation"
+    except WorkerAdmitContractViolation as exc:
         assert "memory_high" in str(exc)
 
     assert not os.path.exists("/proc/%s" % pid_path.read_text()), "malformed grant relay must be reaped"
@@ -388,7 +346,7 @@ def test_acquire_worker_releases_malformed_grant_invalid_memory_limit(tmp_path, 
     stub = _write_stub(tmp_path / "worker-admit-invalid-memory-max", f"""
 import os, sys
 open({str(pid_path)!r}, "w").write(str(os.getpid()))
-print("granted scope=/outer/.aira-worker-1 worker_id=1 memory_max=notanumber memory_high=320")
+print("aira-worker-admit state=granted class=granted scope=%2Fouter%2F.aira-worker-1 worker_id=1 memory_max=notanumber memory_high=320")
 sys.stdout.flush()
 sys.exit(0)
 """)
@@ -397,8 +355,8 @@ sys.exit(0)
     supervisor.outer_scope = "/outer"
     try:
         supervisor.acquire_worker(400)
-        assert False, "expected WorkerAdmitUnavailable"
-    except WorkerAdmitUnavailable as exc:
+        assert False, "expected WorkerAdmitContractViolation"
+    except WorkerAdmitContractViolation as exc:
         assert "memory_max" in str(exc)
         assert "notanumber" in str(exc)
 
@@ -410,21 +368,21 @@ def test_acquire_worker_malformed_grant_does_not_deadlock_on_a_relay_holding_std
     review wave): acquire_worker's malformed-grant cleanup path used to
     read process.stderr to EOF BEFORE ever closing process.stdin. Per
     runWorkerAdmitCommand's own confirmed contract (cmd/aira/main.go),
-    once "granted" is printed the REAL relay blocks on its OWN stdin
-    reaching EOF before it exits or writes anything further to stderr --
-    unlike the sibling test above, whose stub calls sys.exit(0) right
-    after printing (never reproducing this). This stub instead blocks on
-    stdin exactly like the real CLI does, writing nothing further to
-    stderr -- reading stderr first here deadlocks unconditionally. Run
-    acquire_worker in a background thread with a bounded join so a
-    regression hangs only this ONE test, never the whole suite."""
-    stub = _write_stub(tmp_path / "worker-admit-malformed-grant-holds-stdin", """
-import sys
-print("granted scope=/outer/.aira-worker-1 worker_id=1 memory_max=notanumber memory_high=320")
-sys.stdout.flush()
-sys.stdin.buffer.read()
-""")
-    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", stub)
+    once a granted outcome is printed the REAL relay blocks on its OWN
+    stdin reaching EOF before it exits or writes anything further to
+    stderr -- unlike the sibling test above, whose stub calls sys.exit(0)
+    right after printing (never reproducing this). This stub instead
+    blocks on stdin exactly like the real CLI does, writing nothing
+    further to stderr -- reading stderr first here deadlocks
+    unconditionally. Run acquire_worker in a background thread with a
+    bounded join so a regression hangs only this ONE test, never the
+    whole suite."""
+    _outcome_stub(
+        tmp_path, monkeypatch, "worker-admit-malformed-grant-holds-stdin",
+        "aira-worker-admit state=granted class=granted scope=%2Fouter%2F.aira-worker-1 "
+        "worker_id=1 memory_max=notanumber memory_high=320",
+        hold_stdin=True, exit_code=0,
+    )
     supervisor = Supervisor()
     supervisor.outer_scope = "/outer"
 
@@ -440,7 +398,7 @@ sys.stdin.buffer.read()
     thread.start()
     thread.join(timeout=10)
     assert not thread.is_alive(), "acquire_worker deadlocked on the malformed-grant cleanup path"
-    assert isinstance(outcome.get("exc"), WorkerAdmitUnavailable), outcome.get("exc")
+    assert isinstance(outcome.get("exc"), WorkerAdmitContractViolation), outcome.get("exc")
     assert "memory_max" in str(outcome["exc"])
 
 
@@ -472,7 +430,7 @@ import os, sys
 open({str(admit_calls)!r}, "a").write("x")
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -526,7 +484,7 @@ import os, sys
 open({str(admit_calls)!r}, "a").write("x")
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("granted scope=%s worker_id=%d memory_max=104857600 memory_high=83886080" % (scope, os.getpid()))
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=%d memory_max=104857600 memory_high=83886080" % (scope, os.getpid()))
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -585,7 +543,7 @@ def test_spawn_worker_child_closes_its_admit_stderr_fd(tmp_path, monkeypatch):
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 try:
@@ -727,7 +685,7 @@ sys.exit(0)
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -766,7 +724,7 @@ sys.exit(0)
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("granted scope=%s worker_id=%d memory_max=104857600 memory_high=83886080" % (scope, os.getpid()))
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=%d memory_max=104857600 memory_high=83886080" % (scope, os.getpid()))
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -1078,11 +1036,11 @@ if calls > 1:
     remaining = int(open({str(denial_state)!r}).read())
     if remaining > 0:
         open({str(denial_state)!r}, "w").write(str(remaining - 1))
-        sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit denied: fallback:insufficient-headroom\\n")
+        print("aira-worker-admit state=denied class=contended reason=insufficient-headroom")
         sys.exit(1)
 scope = os.path.join({str(outer)!r}, "worker-scope-%d-%d" % (os.getpid(), calls))
 os.makedirs(scope, exist_ok=True)
-print("granted scope=%s worker_id=%d memory_max=104857600 memory_high=83886080" % (scope, calls))
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=%d memory_max=104857600 memory_high=83886080" % (scope, calls))
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -1130,12 +1088,20 @@ def test_daemon_down_fallback_completes_suite_with_one_warning_no_admit_subproce
     assert stderr.count("aira aitest:") == 1
 
 
-def test_malformed_worker_grant_falls_back_without_losing_collected_results(tmp_path, monkeypatch, pytester, capsys):
-    """A relay that was killed partway through a grant can emit its
-    "granted " prefix but omit fields. That is daemon unavailability, so
-    run() must disable admission and finish every already-collected item
-    with the existing bounded unconfined fallback rather than propagate a
-    later KeyError out of spawn_worker and lose the whole suite."""
+def test_malformed_worker_grant_is_terminal_without_losing_collected_results(tmp_path, monkeypatch, pytester, capsys):
+    """A relay that was killed partway through a grant can emit a granted
+    outcome and omit fields.
+
+    BEHAVIOUR CHANGED BY AIRA-42, deliberately: this used to be treated as
+    daemon unavailability, so run() disabled admission and finished the suite
+    with UNCONFINED workers. But the Go side now refuses to render a granted
+    line without placement fields, so seeing one means the relay and this
+    supervisor are out of lockstep -- a contract violation, not evidence about
+    the daemon. Resolving it into "there is no daemon" and silently dropping
+    RAM containment is exactly the class this fix closes, so it is terminal
+    now: the queue is marked unevaluated, loudly, and the daemon stays
+    available. What has NOT changed is that no collected item is lost and no
+    KeyError escapes spawn_worker."""
     outer = tmp_path / "outer"
     outer.mkdir()
     bootstrap = _write_stub(tmp_path / "bootstrap", f"""
@@ -1145,7 +1111,7 @@ sys.exit(0)
 """)
     admit = _write_stub(tmp_path / "worker-admit-malformed", """
 import sys
-print("granted scope=/outer/.aira-worker-1 worker_id=1 memory_max=104857600")
+print("aira-worker-admit state=granted class=granted scope=/outer/.aira-worker-1 worker_id=1 memory_max=104857600")
 sys.stdout.flush()
 sys.exit(0)
 """)
@@ -1163,10 +1129,16 @@ sys.exit(0)
     supervisor.collect(items)
     results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=1)
 
-    assert results == {item.nodeid: "passed" for item in items}
-    assert supervisor.daemon_available is False
+    assert results == {item.nodeid: "unevaluated" for item in items}, (
+        "every collected item must still get an honest verdict, never be dropped"
+    )
+    assert supervisor.daemon_available is True, (
+        "a channel contract violation says nothing about the daemon and must not "
+        "strip containment for the rest of the run"
+    )
     stderr = capsys.readouterr().err
-    assert "memory_high" in stderr and "falling back to" in stderr
+    assert "memory_high" in stderr
+    assert "falling back to" not in stderr, "this must never degrade to unconfined workers"
 
 
 def test_worker_admit_denied_does_not_disable_daemon_and_still_completes(tmp_path, monkeypatch, pytester, capsys):
@@ -1192,11 +1164,11 @@ state_path = {str(denial_state)!r}
 remaining = int(open(state_path).read())
 if remaining > 0:
     open(state_path, "w").write(str(remaining - 1))
-    sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit denied: fallback:insufficient-headroom\\n")
+    print("aira-worker-admit state=denied class=contended reason=insufficient-headroom")
     sys.exit(1)
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -1233,13 +1205,13 @@ def test_request_too_large_at_last_worker_replacement_marks_queue_unevaluated(tm
     AIRA-38 review wave): _replace_worker's OWN try/except around
     _wait_for_admission_or_disable -- reached only when this is the LAST
     worker, its replacement is denied a few times, and THEN the daemon
-    returns a permanent reject:exceeds-ceiling -- is distinct from both
+    returns a permanent request-invalid/exceeds-ceiling -- is distinct from both
     (a) the simpler top-level path in run()'s own startup loop (covered
     by the sibling test below, whose very first spawn_worker call raises
-    WorkerAdmitRequestTooLarge directly) and (b) the transient-denial-
+    WorkerAdmitRequestInvalid directly) and (b) the transient-denial-
     then-eventual-grant path (test_persistent_denial_at_last_worker_
     retirement_never_ends_run_early, above). _wait_for_admission_or_
-    disable's own try/except does not catch WorkerAdmitRequestTooLarge at
+    disable's own try/except does not catch WorkerAdmitRequestInvalid at
     all, so it must propagate through THIS nested try/except -- exactly
     the path no other test drives. One worker completes and recycles
     normally first, so its replacement attempt is a genuine "last worker
@@ -1261,14 +1233,14 @@ open(state_path, "w").write(str(count + 1))
 if count == 0:
     scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
     os.makedirs(scope, exist_ok=True)
-    print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+    print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
     sys.stdout.flush()
     sys.stdin.buffer.read()
 elif count == 1:
-    sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit denied: fallback:insufficient-headroom\\n")
+    print("aira-worker-admit state=denied class=contended reason=insufficient-headroom")
     sys.exit(1)
 else:
-    sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit denied: reject:exceeds-ceiling\\n")
+    print("aira-worker-admit state=denied class=request-invalid reason=exceeds-ceiling")
     sys.exit(1)
 """)
     monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
@@ -1294,12 +1266,12 @@ else:
 
 
 def test_worker_admit_request_too_large_marks_queue_unevaluated_without_disabling_daemon(tmp_path, monkeypatch, pytester, capsys):
-    """A reject:exceeds-ceiling denial is a permanent sizing verdict for
+    """An exceeds-ceiling denial (class=request-invalid) is a permanent verdict for
     this run's estimated_bytes -- unlike a plain transient denial, it
     never resolves no matter how long the run waits, so the same
     indefinite-retry loop used for plain denials would hang the whole
     suite forever. Every call to worker-admit here returns
-    reject:exceeds-ceiling, never a grant. The suite must still terminate
+    that permanent denial, never a grant. The suite must still terminate
     promptly, with every queued nodeid honestly reported unevaluated
     (never silently dropped), the daemon left available (this is a sizing
     fact, not daemon unreachability), and no unconfined fallback spawned
@@ -1314,7 +1286,7 @@ sys.exit(0)
 """)
     admit = _write_stub(tmp_path / "worker-admit", """
 import sys
-sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit denied: reject:exceeds-ceiling\\n")
+print("aira-worker-admit state=denied class=request-invalid reason=exceeds-ceiling")
 sys.exit(1)
 """)
     monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
@@ -1367,11 +1339,11 @@ state_path = {str(denial_state)!r}
 remaining = int(open(state_path).read())
 if remaining > 0:
     open(state_path, "w").write(str(remaining - 1))
-    sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit denied: fallback:insufficient-headroom\\n")
+    print("aira-worker-admit state=denied class=contended reason=insufficient-headroom")
     sys.exit(1)
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -1412,7 +1384,7 @@ sys.exit(0)
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -1521,11 +1493,12 @@ open(state_path, "w").write(str(count + 1))
 if count == 0:
     scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
     os.makedirs(scope, exist_ok=True)
-    print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+    print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
     sys.stdout.flush()
     sys.stdin.buffer.read()
 else:
-    sys.stderr.write("E_CONFINE_UNAVAILABLE: dial daemon: connection refused\\n")
+    print("aira-worker-admit state=unavailable class=admission-unusable reason=dial-failed")
+    sys.stdout.flush()
     sys.exit(1)
 """)
     monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
@@ -1844,7 +1817,7 @@ sys.exit(0)
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -1901,7 +1874,7 @@ sys.exit(0)
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -1937,9 +1910,9 @@ sys.stdin.buffer.read()
     assert [n for n, _ in spy.logfinishes] == [nodeid]
 
 
-def test_run_synthesizes_a_report_for_every_never_dispatched_nodeid_after_fail_queue_too_large(tmp_path, monkeypatch, pytester):
+def test_run_synthesizes_a_report_for_every_never_dispatched_nodeid_after_fail_queue_terminal(tmp_path, monkeypatch, pytester):
     """The SAME post-run pass (not a per-site helper) must also cover
-    _fail_queue_too_large's own unevaluated-marking: nodes still queued, never
+    _fail_queue_terminal's own unevaluated-marking: nodes still queued, never
     even dispatched, after a permanent daemon sizing rejection."""
     outer = tmp_path / "outer"
     outer.mkdir()
@@ -1958,11 +1931,11 @@ open(state_path, "w").write(str(count + 1))
 if count == 0:
     scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
     os.makedirs(scope, exist_ok=True)
-    print("granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+    print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
     sys.stdout.flush()
     sys.stdin.buffer.read()
 else:
-    sys.stderr.write("E_CONFINE_UNAVAILABLE: worker-admit denied: reject:exceeds-ceiling\\n")
+    print("aira-worker-admit state=denied class=request-invalid reason=exceeds-ceiling")
     sys.exit(1)
 """)
     monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
@@ -1992,7 +1965,7 @@ else:
     assert "unevaluated" in str(synthesized[0].longrepr)
     # The daemon's own permanent-rejection reason must survive into the
     # synthesized message rather than being flattened to a generic string.
-    assert "reject:exceeds-ceiling" in str(synthesized[0].longrepr)
+    assert "exceeds-ceiling" in str(synthesized[0].longrepr)
     # test_one really ran, so its own three real reports replayed and it must
     # NOT also get a synthesized one.
     real = [r for r in spy.reports if r.nodeid == by_name["test_one"].nodeid]
@@ -2006,7 +1979,7 @@ def test_run_synthesizes_a_report_even_for_a_result_defaulted_by_init_pys_own_fa
     guessed): __init__.py's `results.get(item.nodeid, "unevaluated")` default
     has NO reachable trigger in today's supervisor -- every path that ends a
     nodeid's life writes into self.results (_drain_worker's own assignment,
-    _handle_worker_exit's retry-exhausted branch, and _fail_queue_too_large's
+    _handle_worker_exit's retry-exhausted branch, and _fail_queue_terminal's
     setdefault drain), and _replace_worker only returns without spawning while
     other workers are still live. It is a DEFENSIVE default.
 
@@ -2222,7 +2195,7 @@ if n == 3:
     time.sleep(600)
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("granted scope=%s worker_id=%d memory_max=104857600 memory_high=83886080" % (scope, os.getpid()))
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=%d memory_max=104857600 memory_high=83886080" % (scope, os.getpid()))
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -2341,62 +2314,38 @@ def test_retire_worker_does_not_block_forever_on_a_wedged_child(monkeypatch):
         pass
 
 
-def test_transport_read_timeout_is_retriable_not_daemon_unavailable(tmp_path, monkeypatch):
-    """A socket-deadline overrun (max_wait + a ONE second transport grace, over
-    a daemon evaluation that holds job.mu across cgroupfs reads and is not
-    itself deadline-aware) proves only that the reply was late -- the daemon was
-    dialled and the request was sent. Treating it as "no daemon at all"
-    permanently stripped RAM containment for the rest of the run."""
-    admit = _write_stub(tmp_path / "worker-admit-io-timeout", """
-import sys
-sys.stderr.write("E_CONFINE_UNAVAILABLE: read worker-admit response: read unix @->/run/aira.sock: i/o timeout\\n")
-sys.exit(4)
-""")
-    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
-    supervisor = Supervisor()
-    supervisor.outer_scope = "/outer"
-    try:
-        supervisor.acquire_worker(1 << 20)
-        assert False, "expected WorkerAdmitDenied"
-    except WorkerAdmitDenied:
-        pass
-    assert supervisor.daemon_available is True
+def test_transport_outcomes_arrive_classified_and_never_strip_containment(tmp_path, monkeypatch):
+    """A socket-deadline overrun, or a connection cut before the reply, proves
+    only that the reply was late or lost -- the daemon was dialled and the
+    request WAS sent. Treating either as "no daemon at all" permanently
+    stripped RAM containment for the rest of the run.
 
-
-def test_transport_frame_failures_are_retriable_but_protocol_skew_is_not(tmp_path, monkeypatch):
-    """THE CONJUNCTION GUARD. "read worker-admit response: %w" wraps every
-    readRunnerAdmitFrame failure, and those split into two different classes.
-
-    TRANSPORT shapes (deadline, EOF from the daemon's own stopping path, reset)
-    establish nothing about the daemon's existence, and self-disambiguate on the
-    next attempt -- which fails at the DIAL instead if the daemon really is gone.
-
-    PROTOCOL shapes (invalid frame size, json unmarshal) are permanent version
-    skew against a LIVE daemon: retrying can never succeed, so classifying them
-    retriable would convert a clean fallback into an unbounded wait -- exactly
-    the hang class this change exists to remove. Matching the bare prefix would
-    do precisely that."""
-    retriable = ("i/o timeout", "EOF", "unexpected EOF", "connection reset by peer")
-    terminal = ("invalid daemon admission frame size 99999999",
-                "json: cannot unmarshal string into Go value of type runner.admitFrame")
-    for index, wrapped in enumerate(retriable + terminal):
-        admit = _write_stub(tmp_path / ("worker-admit-frame-%d" % index), f"""
-import sys
-sys.stderr.write("E_CONFINE_UNAVAILABLE: read worker-admit response: {wrapped}\\n")
-sys.exit(4)
-""")
-        monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    THE DISCRIMINATION ITSELF NOW LIVES IN GO. Before AIRA-42 this test had a
+    sibling ("the conjunction guard") that fed eleven different wrapped error
+    SENTENCES through the relay's stderr and asserted this side sorted them
+    into retriable transport failures and terminal protocol skew by substring.
+    That sorting is now classifyWorkerAdmitReadFailure's, keyed on the error
+    TYPE, and is covered exhaustively by
+    TestClassifyWorkerAdmitReadFailureSortsByType
+    (internal/runner/worker_admit_client_linux_test.go). What remains this
+    side's job -- and what this test covers -- is that each resulting class
+    arrives intact and produces the right disposition."""
+    for state, klass, reason, expected in (
+        ("timeout", "contended", "response-timeout", WorkerAdmitDenied),
+        ("unevaluated", "contended", "response-interrupted", WorkerAdmitDenied),
+        ("unevaluated", "contract-violation", "malformed-response", WorkerAdmitContractViolation),
+        ("unavailable", "admission-unusable", "dial-failed", WorkerAdmitUnavailable),
+    ):
+        _outcome_stub(tmp_path, monkeypatch, "worker-admit-transport-" + reason,
+                      _outcome_line(state, klass, reason), exit_code=4)
         supervisor = Supervisor()
         supervisor.outer_scope = "/outer"
-        expect_retriable = wrapped in retriable
         try:
             supervisor.acquire_worker(1 << 20)
-            assert False, "expected an exception for %r" % wrapped
-        except WorkerAdmitDenied as exc:
-            assert expect_retriable, "%r is permanent skew and must not be retried: %s" % (wrapped, exc)
-        except WorkerAdmitUnavailable as exc:
-            assert not expect_retriable, "%r is transport-only and must not strip containment: %s" % (wrapped, exc)
-        assert supervisor.daemon_available is True
+            assert False, "expected %s for %s" % (expected.__name__, reason)
+        except expected:
+            pass
+        assert supervisor.daemon_available is True, "acquire_worker never disables the daemon itself"
 
 
 def test_fork_resource_failure_is_a_denial_not_daemon_unavailable(monkeypatch):

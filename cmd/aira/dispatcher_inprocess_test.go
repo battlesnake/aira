@@ -494,13 +494,13 @@ func TestNewerClientReplacesOlderProtocolDaemon(t *testing.T) {
 	}
 }
 
-func TestProtocolSixComputeGitContextStoreOpReplacesLiveOlderDaemon(t *testing.T) {
-	// AIRA-39 bumped this 5 -> 6 (daemon-side worker-scope creation changes wire
-	// semantics without changing wire shape); the replacement behaviour under
-	// test is the same for any older protocol.
-	if daemon.ProtocolVersion != 6 {
-		t.Fatalf("protocol=%d want=6", daemon.ProtocolVersion)
-	}
+// TestComputeGitContextStoreOpReplacesAnOlderProtocolDaemon is version-RELATIVE
+// (it used to hardcode protocol 5 replacing protocol 4, and was then renamed
+// again for 6, which made every wire-shape bump edit an unrelated test).
+// daemon.ProtocolVersion itself is pinned by TestProtocolVersionIsPinned in
+// internal/daemon; what matters here is the replacement behaviour against a
+// daemon one version behind, which is the same for any older protocol.
+func TestComputeGitContextStoreOpReplacesAnOlderProtocolDaemon(t *testing.T) {
 	dispatcher := autoStartDispatcher(t)
 	older := startProtocolDaemonProcess(t)
 	input := domain.ComputeEventInput{
@@ -517,7 +517,10 @@ func TestProtocolSixComputeGitContextStoreOpReplacesLiveOlderDaemon(t *testing.T
 	var exchanges atomic.Int32
 	dispatcher.storeOpExchange = func(context.Context, string, daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
 		if exchanges.Add(1) == 1 {
-			return daemon.ResponseFrame{Proto: 4, Code: daemon.CodeProtocol, Error: daemon.CodeProtocol + ": protocol-4 daemon"}, nil
+			return daemon.ResponseFrame{
+				Proto: daemon.ProtocolVersion - 1, Code: daemon.CodeProtocol,
+				Error: daemon.CodeProtocol + ": older daemon",
+			}, nil
 		}
 		return daemon.ResponseFrame{Proto: daemon.ProtocolVersion, OK: true, Code: "OK"}, nil
 	}
@@ -530,7 +533,7 @@ func TestProtocolSixComputeGitContextStoreOpReplacesLiveOlderDaemon(t *testing.T
 	select {
 	case <-older.done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("live protocol-4 daemon was not stopped before retrying compute git-context op")
+		t.Fatal("older-protocol daemon was not stopped before retrying compute git-context op")
 	}
 }
 
