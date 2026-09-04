@@ -1,0 +1,8 @@
+---
+{"schema":1,"id":"AIRA-93","project":"aira","title":"aira reconcile --rebuild fails with E_JOURNAL_CORRUPT: duplicate project/seq assigned two different ticket targets","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","journal","reconcile"],"hold":false,"relations":[]}
+---
+Independently confirmed twice tonight (AIRA-68 build agent, then the AIRA-68 verify agent re-running it fresh): `aira reconcile --rebuild` fails with real exit 4 and `E_JOURNAL_CORRUPT: duplicate project/seq …/1 has target AIRA-1 and LIFE-1` — the same (project, seq) pair in the shared journal was assigned two different ticket targets across two different projects (AIRA and LIFE), and the rebuild path treats that as fatal corruption rather than reconciling it.
+
+Neither agent touched the shared journal to produce this — it pre-existed both investigations and is unrelated to AIRA-68s own diff. Plain `aira reconcile` (without --rebuild) succeeds and the git-file ticket content is correct/authoritative, so this is not currently causing visible data loss — but it does mean `W_STALE_INDEX` cannot be cleared via a full rebuild, and the derived SQLite index cannot currently be regenerated from scratch on this machine if it were ever needed (crash recovery, corruption, a schema migration).
+
+Needs investigation: how a single (project, seq) journal slot came to be claimed by two different projects ticket allocator concurrency bug, a manual ID collision from before ID allocation was centralized, or something else and then a decision on whether --rebuild should refuse-and-report (current behaviour, at least honest) or have a defined resolution path for a proven duplicate-seq collision.

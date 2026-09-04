@@ -35,3 +35,20 @@ Both build-review lineages GATE-FAILed and independently found the same three P0
 Mutation testing caught **four porous tests before either reviewer ran**, including both headline regression tests for this very leak: they waited for the ledger to reach (0 jobs, 0 bytes), but the last release empties `queue.waiters`, `pruneAdmitQueue` deletes the queue, and the snapshot honestly returns the absent-queue zero — so deleting the discharge arithmetic outright left them green. Final: **21 mutations, all caught, none porous** (`docs/dev/aira68-mutation-check.sh`).
 
 The suggested "restart the daemon to clear it" mitigation is **not needed and was never performed**: there was no ghost aggregate to clear.
+
+## Deployed
+
+Binary rebuilt from merged master (`f1b6a78` + the follow-up ticket commit
+`b110c02`), confined build, smoke-tested, installed; `aira-daemon.service`
+restarted. Live-verified the fix is actually in effect (not just merged):
+`aira confine --list` now prints the split breakdown — `slice reserve: ...
+across N admitted jobs` followed by `of which: X confine scopes, Y
+scope-less reservations, Z adopted scopes` — replacing the old fused count
+that this ticket's original P0 misread as a leak.
+
+Independent verify agent's other findings, both actioned: the flaky-test
+disclosure gap (2 more distinct `internal/runner` flakes it hit that the
+build agent hadn't named) recorded on AIRA-20; the `aira reconcile --rebuild`
+journal corruption (`E_JOURNAL_CORRUPT: duplicate project/seq ... AIRA-1 /
+LIFE-1`) filed as its own ticket, AIRA-93, rather than left as a dangling
+"worth its own ticket" note.
