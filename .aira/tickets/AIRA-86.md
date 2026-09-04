@@ -41,3 +41,33 @@ a silent false-green for a silent false-`unevaluated` and nobody notices either.
 
 Scheduled in the programme's Phase 3b (moved out of the Phase 0 mechanical pass on review,
 because it changes the default of every honesty dimension simultaneously).
+
+## Partial resolution (2026-09-04): the gate_eval.go / gate_ratchet.go sites
+
+STILL OPEN for its headline site, `internal/store/check.go:130` (the fourteen
+honesty dimensions), which remains a standalone item with this ticket's own
+mandatory per-dimension test condition.
+
+Closed here, as part of the captured-subject fix, are the seeded-pass sites in
+the two gate files:
+
+- `gate_eval.go` `evaluateDimension`: the scratch report and the returned
+  predicate are seeded `unevaluated`, and pass is raised in the arm that
+  establishes it. Honest scope note: the scratch report's Verdict/Dimensions are
+  never read in that function, so that half is shape-hardening with no
+  observable behaviour change.
+- `gate_ratchet.go` `compareNoNewFailures`: seeded `unevaluated`, raised to pass
+  in the else-arm, matching `compareCoverage`. Behaviour-preserving by
+  construction -- mutation testing confirms no test can distinguish it, reported
+  rather than papered over. This ticket's mandatory condition (the pass path
+  still reaches pass) is asserted by
+  `TestRatchetComparatorStillReachesPassWhenNothingRegressed`.
+- `gate_eval.go` `GateCheck`/`finishGateReport`: the report is seeded
+  `unevaluated` and the rollup is established positively. Both plan-review
+  lineages independently found a residual hole this closes: a result's Verdict
+  is a raw string read out of the audit ledger, so a report holding one genuine
+  pass and one unrecognised verdict counted nothing for the latter and reported
+  PASS. The counting switch now has an explicit `default: Unevaluated++`, and a
+  results-empty report is unevaluated rather than vacuously green.
+
+Plan: docs/superpowers/plans/2026-09-04-aira80-81-60-86-captured-subject-plan.md

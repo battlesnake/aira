@@ -17,3 +17,17 @@ ANOTHER INSTANCE (2026-09-04, during the AIRA-68 build gate, WITHOUT -race): two
 Both pass 10/10 in isolation. Not caused by AIRA-68, whose entire `internal/runner` diff is 45 added lines of struct fields + doc comments on `ConfineSliceReserve` (no function, control flow or behaviour; neither test reads that type). Three baseline passes at `d878d9a` did not reproduce either, so "reproduced on an unmodified baseline" is `unevaluated` — they are too infrequent for three passes to settle. Add `TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration` to the hardening list, and note that the wall-clock deadlines are now tight enough to flake *without* -race, which raises this above a -race-only concern.
 
 ANOTHER TWO INSTANCES (2026-09-04, found by the independent AIRA-68 build-review verify agent, WITHOUT -race): the verify agent's own 3 consecutive `go test ./internal/runner/ -count=1` runs failed on **2 of 3**, on `TestM20LauncherDefersACKAndBoundsReadiness` and `TestGovernorSlotReconnectDoesNotBlockFailOpenOutput` — **neither of which the builder's own 6 runs had named**. So the package now has at least **4 distinct wall-clock-tight tests** flaking without `-race`, not 2, and each of the two build/verify agents independently hit a different pair by chance. This is stronger evidence the whole package's deadline discipline needs the hardening pass, not just the individual named tests — a fix that only hardens the 2-4 tests currently on this list risks leaving others of the same class undiscovered.
+
+A FIFTH DISTINCT TEST (2026-09-04, found by the AIRA-80/81/60/86 captured-subject build): `TestM20DetachedRunKillWaitsForPreScopeSupervisorTerminal` failed in the **pre-push hook's `make test`**, and it failed in a *new sub-shape* — not a missed deadline but a teardown race surfacing as a `t.TempDir()` cleanup error:
+
+    testing.go:1369: TempDir RemoveAll cleanup: unlinkat
+    /tmp/TestM20DetachedRunKillWaitsForPreScopeSupervisorTerminal.../001/aira/runs: directory not empty
+
+i.e. a descendant was still writing under the run directory after the test returned. `TestM20LauncherDefersACKAndBoundsReadiness` also failed once in the same session's first whole-suite run. Both packages passed on retry, `./internal/runner/` passed 3/3 in isolation immediately afterwards, and that change touches **zero** files under `internal/runner` (`git diff --name-only origin/master...HEAD -- internal/runner` is empty), so neither failure is attributable to it.
+
+Two things this adds to the case above:
+
+1. The count of distinct flaky tests in this package is now **at least 5**, and every agent that runs the suite a few times finds a different one. The per-test hardening list is not converging; the package needs the deadline/teardown discipline pass as a whole.
+2. **This now blocks merges, not just CI.** The `make test` pre-push hook fails on it, so an unrelated PR cannot be pushed without either retrying until the flake misses or bypassing the hook. That is a direct cost on every other milestone, which raises the priority argument above "re-enable a -race job".
+
+Not fixed here — recorded as evidence.

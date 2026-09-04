@@ -571,8 +571,14 @@ func computeRatchetStatus(s *Store) (GaugeResult, error) {
 	} else if ok {
 		asOf["test_report_at_seq"] = seq
 	}
-	if digest, digestErr := subjectTreeDigest(s.root); digestErr == nil {
-		asOf["tracked_worktree_digest"] = digest
+	// One capture serves both the as-of digest and every ratchet evaluation
+	// below, so the gauge's reported subject and the subject each ratchet was
+	// evaluated against are the same read (AIRA-80). A capture failure leaves the
+	// as-of digest absent, exactly as the digest-only failure did before, and the
+	// per-gate evaluations then carry a zero subject rather than a fabricated one.
+	subject, subjectErr := captureSubject(s.root)
+	if subjectErr == nil {
+		asOf["tracked_worktree_digest"] = subject.digest
 	}
 	universe := gaugeUniverse(len(ratchets), "project", asOf)
 	drilldown := GaugeDrilldown{Verb: "gate", Query: "check"}
@@ -582,7 +588,18 @@ func computeRatchetStatus(s *Store) (GaugeResult, error) {
 
 	result := GaugeResult{Name: name, Title: title, Kind: GaugeKindDistribution, Value: map[string]int{}, Breakdown: map[string]GaugeCell{}, Universe: universe, Drilldown: drilldown}
 	for _, def := range ratchets {
-		eval, evalErr := s.evaluateRatchet(context.Background(), def, s.root)
+		// A failed capture is not a subject. Evaluating against the zero subject
+		// would compare the reports anyway and report pass under an empty digest,
+		// which is a gauge cell asserting a result nothing established. The
+		// pre-capture code reported evidence_unavailable per gate here; so does
+		// this. Pinned by TestRatchetGaugeReportsEvidenceUnavailableWithoutASubject.
+		if subjectErr != nil {
+			bucket, code := ratchetStatus(DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_EVIDENCE_UNAVAILABLE"}, nil)
+			result.Value.(map[string]int)[bucket]++
+			result.Breakdown[def.ID] = GaugeCell{Value: bucket, Fields: map[string]GaugeCell{"code": {Value: code}, "tracked_worktree_digest": {Value: ""}}, Drilldown: &drilldown}
+			continue
+		}
+		eval, evalErr := s.evaluateRatchet(context.Background(), def, subject)
 		bucket, code := ratchetStatus(eval, evalErr)
 		result.Value.(map[string]int)[bucket]++
 		fields := map[string]GaugeCell{"code": {Value: code}, "tracked_worktree_digest": {Value: eval.Root.Digest}}

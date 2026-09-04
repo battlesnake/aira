@@ -96,7 +96,7 @@ func TestMutationIsolatedSnapshotOnlyAndUnavailableFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot, _, cleanup, err := materializeTrackedSnapshot(root)
+	snapshot, cleanup, err := materializeSubject(captureFor(t, root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,8 +112,10 @@ func TestMutationIsolatedSnapshotOnlyAndUnavailableFailsClosed(t *testing.T) {
 	if err != nil || !bytes.Equal(before, after) {
 		t.Fatalf("caller tree changed: before=%q after=%q err=%v", before, after, err)
 	}
-	if _, _, _, err := materializeTrackedSnapshot(filepath.Join(base, "unavailable")); err == nil {
-		t.Fatal("unavailable materialisation was accepted")
+	// The capture is now what refuses an unavailable root, and it refuses before
+	// anything is materialised at all.
+	if _, err := captureSubject(filepath.Join(base, "unavailable")); err == nil {
+		t.Fatal("unavailable capture was accepted")
 	}
 }
 
@@ -136,7 +138,7 @@ func TestInjectFileMutationIsAdditiveAndRefusesExistingTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	gitRun(t, root, "add", ".")
-	snapshot, _, cleanup, err := materializeTrackedSnapshot(root)
+	snapshot, cleanup, err := materializeSubject(captureFor(t, root))
 	if err != nil {
 		t.Fatal(err)
 	}

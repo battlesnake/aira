@@ -146,8 +146,20 @@ func ValidateCanary(c CanaryDeclaration) error {
 			return err
 		}
 	}
+	// AIRA-60: the same normalizing predicate evaluation applies, applied here so
+	// the refusal lands at declaration time where a gate author sees it. The
+	// superseded check was a literal prefix test that accepted -- and digested --
+	// .git/config, .git/hooks/pre-commit, sub/.git/config, a/../../etc/passwd and
+	// ./../x, every one of which runCanary then refused. Seed.Path's shape was
+	// not checked at all, so any consumer that reasonably assumed a validated
+	// declaration was safe inherited an unvalidated path; the blast radius is
+	// command execution, because runCanary's unconditional `git add -A` would
+	// execute a seeded .git/config carrying core.fsmonitor.
+	if c.Seed.Path != "" && !SafeRelativePath(c.Seed.Path) {
+		return fmt.Errorf("E_GATE_CANARY_INVALID: seed path escapes fixture root: %q", c.Seed.Path)
+	}
 	for path := range c.Seed.Files {
-		if path == "" || path[0] == '/' || path == ".git" || len(path) >= 3 && path[:3] == "../" || path == ".." {
+		if !SafeRelativePath(path) {
 			return fmt.Errorf("E_GATE_CANARY_INVALID: seed path escapes fixture root: %q", path)
 		}
 	}
@@ -163,7 +175,7 @@ func validateMutation(m MutationSeed) error {
 	}
 	switch m.Kind {
 	case "go-negate-assertion":
-		if !safeMutationPath(m.File) || m.Test == "" || m.Occurrence <= 0 || m.PkgDir != "" || m.TestName != "" || m.Content != "" {
+		if !SafeRelativePath(m.File) || m.Test == "" || m.Occurrence <= 0 || m.PkgDir != "" || m.TestName != "" || m.Content != "" {
 			return errors.New("E_GATE_CANARY_INVALID: invalid go-negate-assertion seed")
 		}
 	case "go-inject-failing-test":
@@ -173,7 +185,7 @@ func validateMutation(m MutationSeed) error {
 	// inject-file is the language-agnostic kind: it names a target path and the
 	// literal body to write there, and carries none of the Go kinds' fields.
 	case "inject-file":
-		if !safeMutationPath(m.File) || m.Content == "" || len(m.Content) > maxMutationContentBytes || !utf8.ValidString(m.Content) || m.Test != "" || m.Occurrence != 0 || m.PkgDir != "" || m.TestName != "" {
+		if !SafeRelativePath(m.File) || m.Content == "" || len(m.Content) > maxMutationContentBytes || !utf8.ValidString(m.Content) || m.Test != "" || m.Occurrence != 0 || m.PkgDir != "" || m.TestName != "" {
 			return errors.New("E_GATE_CANARY_INVALID: invalid inject-file seed")
 		}
 	default:
@@ -183,11 +195,29 @@ func validateMutation(m MutationSeed) error {
 }
 
 func safeMutationPackagePath(path string) bool {
-	return path == "." || safeMutationPath(path)
+	return path == "." || SafeRelativePath(path)
 }
 
-func safeMutationPath(path string) bool {
-	if path == "" || path[0] == '/' || strings.ContainsRune(path, '\x00') {
+// SafeRelativePath is the gate subsystem's one normalizing relative-path
+// predicate, applied at declaration time and at evaluation time (AIRA-60).
+//
+// It replaces three near-identical copies -- store.safeFixturePath,
+// store.safeSnapshotPath and gate.safeMutationPath -- that had drifted apart in
+// exactly the way three copies of a safety check do, and a fourth, weaker,
+// non-normalizing test inside ValidateCanary that let a declaration be accepted
+// and digested with a path evaluation would then refuse.
+//
+// It is the CONJUNCTION of every rejection the three made, never a disjunction
+// of their acceptances, which would loosen it: a path is safe only if all three
+// would have called it safe. The one rejection none of the store-side copies
+// made is the NUL check, which is unreachable from `git ls-files -z` (NUL is the
+// separator) but perfectly reachable from a hand-authored canary declaration.
+//
+// The .git segment matters most: a seed or mutation writing into a snapshot's
+// own .git -- a config carrying core.fsmonitor, say -- would be executed by the
+// `git add` that stages that snapshot.
+func SafeRelativePath(path string) bool {
+	if path == "" || path[0] == '/' || filepath.IsAbs(filepath.FromSlash(path)) || strings.ContainsRune(path, '\x00') {
 		return false
 	}
 	clean := filepath.Clean(filepath.FromSlash(path))
