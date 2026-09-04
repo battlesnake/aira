@@ -5,7 +5,8 @@
 plan review by Codex/Sol (GATE-FAIL) and DeepSeek-pro (GATE-PASS-WITH-CHANGES)
 → §8; TDD build; adversarial build review of the merged diff by Codex/Sol
 (BLOCK, 1×P0) and DeepSeek-pro (BLOCK) → §10, with the P0 and four other
-findings fixed and mutation-verified. Nine mutations applied, nine killed (§9).
+findings fixed and mutation-verified. Ten mutations applied, ten killed (§9);
+five further independent mutations by the verifying session, all killed (§13).
 **Parent plan:** [`2026-09-04-backlog-remediation-plan.md`](2026-09-04-backlog-remediation-plan.md) §3.3 (Phase 1, Fix 2, Tier A)
 **Closes/moots:** AIRA-42, AIRA-45; closes AIRA-83(b)
 **Explicitly NOT in this PR:** AIRA-87's `store.ExitCodes` leaf-package move
@@ -459,7 +460,9 @@ reason, not silently.
 ## 9. Mutation testing
 
 Each mutation reverts one load-bearing decision in the merged implementation.
-All seven were killed; the harness is `~/tmp/aira-fix2/mutate.py`.
+All ten in the table below were killed (the table grew from seven to ten as
+build review and the Fix-1 merge added M8–M10); the harness is
+`~/tmp/aira-fix2/mutate.py`.
 
 | # | Mutation | Killed by |
 |---|---|---|
@@ -790,3 +793,75 @@ before being accepted or declined; two were checked by writing a probe.
 
 Codex/Sol remained unavailable (usage limit), so the integration carries one
 adversarial lineage rather than two. The gap stated in §12.7 stands.
+
+## 13. Independent verification of the build report (pre-merge, 2026-09-04)
+
+A separate session verified this PR against source rather than against the
+builder's self-report, before merging it. Recorded here because §12.7 states a
+review gap, and this pass partially fills it.
+
+**Sol's unavailability re-confirmed independently.** A fresh `codex exec` ping
+returned the same `You've hit your usage limit … try again at Sep 7th, 2026`
+error. The gap in §12.7 is real, not a skipped step.
+
+**The "one channel, not two" requirement, re-checked directly.** `supervisor.py`
+retains exactly three `startswith` calls — two parsing the aitest-bootstrap
+verb's own `outer=`/`supervisor_scope=` tokens and one on `_EVENT_LINE_PREFIX`,
+all structured-record framing, none of them classification. No retired prose
+token survives. The only `strings.HasPrefix` in `worker_admit.go` is on the
+cgroup child directory name.
+
+**Every daemon row's disposition re-derived against master's own
+`reject:`/`fallback:` spelling** (`git show 11221d3:internal/daemon/worker_admit.go`),
+row by row, including the `timeout`/`reject:saturated` row whose old prefix did
+NOT reach the old classifier's `reject:` branch. No verdict's retriability moves.
+
+**Five independent mutations, all killed** (distinct from §9's harness):
+
+| Mutation | Killed by |
+|---|---|
+| `worker-scope-create-failed` reclassed `contended` | `TestEvaluateWorkerAdmitClassifiesEveryOutcome`, `TestWorkerAdmitDeniesTerminallyWhenScopeCreateFails` |
+| restore the `"unbounded"` → `"un-bounded"` mangling | `TestWorkerAdmitHostileDiagnosticTextCannotForgeAVerdict` |
+| Python resolves an uncatalogued class to `WorkerAdmitUnavailable` | 2 × `test_acquire_worker_refuses_an_unparseable_or_uncatalogued_outcome` |
+| reintroduce one `"reject:" in message` probe in `acquire_worker` | `TestSupervisorClassifiesWorkerAdmitByEnumNotBySubstring` (both assertions) |
+| `daemon.ProtocolVersion` back to 6, runner left at 7 | `TestRunnerDaemonProtocolVersionMatchesTheDaemon` |
+
+**Verification re-run at the PR head in a fresh detached worktree:** `make ci`
+**exit 0**; `python3 -m pytest internal/pylib/aitest/ -q` **exit 0, 131
+passed**. The `internal/runner` flake §11 records did not reproduce.
+
+**Substitute lineages for the missing Sol pass.** Gemini reviewed the Python
+half and DeepSeek-pro the Go half, each with a fresh adversarial prompt. Nine
+findings between them; every one checked against source and none survived:
+
+- The three "critical" Go findings are all false. The `deadlineWait` clamp
+  cannot overflow `time.Time.Add`; the granted-path connection is deliberately
+  not closed because it *is* the lease; and an `E_DAEMON_PROTOCOL` frame with
+  `proto == 0` classifying `request-invalid` is the designed AIRA-45 split, not
+  a misclassification (both alternatives are terminal regardless).
+- Gemini's "empty relay output → `WorkerAdmitUnavailable`" and "non-EAGAIN
+  `OSError` → `WorkerAdmitUnavailable`" are both real dispositions, both
+  pre-existing and unchanged by this PR, and both named conditions rather than
+  fallthrough defaults.
+- Duplicate `key=` tokens are last-wins in BOTH parsers, so there is no
+  Go/Python asymmetry, and the catalogue and grantedness checks still run on the
+  surviving pair. A hostile `detail=` cannot inject a token: the renderer
+  query-escapes it (mutation M5/M10).
+- A stderr-pipe-full stall before the outcome line cannot deadlock: the stdout
+  read is deadline-bounded and its failure direction is `contended`, which
+  preserves containment. In any case `writeWorkerAdmitOutcome` writes stdout
+  first on every path.
+
+**Two observations recorded, neither a blocker, neither fixed here:**
+
+1. `classifyWorkerAdmitReadFailure`'s `default` branch is the last remaining
+   unsafe-by-default disposition in the fix (`admission-unusable`). §10's D2
+   adjudicated it as unreachable by construction and preserving master's
+   behaviour, and a third lineage has now raised it independently. Flipping it
+   to `contract-violation` — terminal but containment-preserving — would cost
+   nothing and would make "no path defaults to the unsafe class" structural
+   rather than argued. Worth a ticket; not a merge-resolution edit.
+2. AIRA-83 closes with an *accepted, named coverage gap* still in its body (the
+   `ServiceIdentityMatches` tri-state, Phase 0's build-review finding). It is a
+   recorded decision rather than an open task, but closing the ticket removes
+   its only backlog surface.

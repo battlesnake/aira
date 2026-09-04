@@ -239,7 +239,7 @@ class WorkerAdmitRequestInvalid(WorkerAdmitTerminal):
     rest of the run -- so this is terminal for the affected queued work and
     nothing else.
 
-    It was called WorkerAdmitRequestInvalid, which AIRA-45 recorded as an
+    It was called WorkerAdmitRequestTooLarge, which AIRA-45 recorded as an
     actively misleading diagnostic even before AIRA-39: it was already
     raised for protocol-level argument rejections and version skew, neither
     of which is a sizing problem. AIRA-39 then added two members that are
