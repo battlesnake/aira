@@ -903,9 +903,15 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 			return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 		}
 	}
-	if maximum > 0 {
-		reserve, reservePinned = maximum, true
-	}
+	// AIRA-62: the CLI TRANSCRIBES, it does not resolve. This used to be
+	// `if maximum > 0 { reserve, reservePinned = maximum, true }` — unconditional,
+	// with no delegate-ram guard, and running after --memory-reserve was parsed.
+	// Since this is the only non-test producer of a runner.ConfineRequest, it made
+	// the runner's own correct `!DelegateRAM && ScopeMemoryMax > 0` carve-out dead
+	// code, so `--delegate-ram --memory-max 32G --memory-reserve 512M` charged the
+	// shared ledger 32G rather than the 512M asked for. runner.ResolveConfineReserve
+	// is now the single decision site; the non-delegate up-charge lives there and is
+	// unchanged.
 	admitTimeout := time.Duration(0)
 	if raw := options["admit-timeout"]; raw != "" {
 		admitTimeout, err = time.ParseDuration(raw)

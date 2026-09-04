@@ -55,6 +55,62 @@ const (
 	MinPinnedScopeCap = int64(1 << 20)
 )
 
+// ResolveConfineReserve is the SINGLE place that decides what a confine job
+// charges the shared admission ledger, and whether that number is pinned (the
+// daemon honours it verbatim) or a hint (the daemon resolves its own
+// history-based estimate). Every launch path resolves through here.
+//
+// It is deliberately a pure function of the request, exported, and in the
+// portable file: AIRA-62 was a bug of exactly the shape that arises when this
+// decision is duplicated. `cmd/aira` used to pre-resolve it in the CLI —
+// `if maximum > 0 { reserve, reservePinned = maximum, true }`, unconditional and
+// with no delegate-ram guard — which ran BEFORE the runner and left the runner's
+// own correct `!DelegateRAM` carve-out below as dead code for the only non-test
+// producer of a ConfineRequest there is. The result: a
+// `--delegate-ram --memory-max 32G --memory-reserve 512M` suite charged the
+// ledger 32G instead of the 512M it explicitly asked for, a 64x silent
+// over-reservation on a shared 63G slice (AIRA-24, AIRA-59, AIRA-67).
+//
+// So the CLI now transcribes and this decides. Being exported is what lets the
+// CLI's own tests prove the COMPOSITION — that the request `cmd/aira` builds
+// charges what the operator asked for — against this production code rather
+// than against a restatement of it.
+//
+// The two rules, unchanged in substance from the runner code this replaces:
+//
+//   - No reserve given: a delegate-ram job pins a small framework overhead,
+//     because its per-test children reserve individually and charging the
+//     whole-command estimate would double-book them. Anything else takes the
+//     unpinned no-history fallback, which the daemon is free to re-estimate.
+//   - A non-delegate `--memory-max` SETS the reserve to the cap. That is
+//     deliberate and documented (internal/core/skill.go:318): such a scope may
+//     genuinely grow to its cap and nothing else reserves on its behalf, so
+//     booking less would under-book the shared ledger. Note it sets rather than
+//     raises: it is an UP-charge in the case the docs describe (reserve below
+//     cap, "you cannot cap high and reserve low"), but a declared reserve LARGER
+//     than the cap is lowered to the cap — still exact, never under-booked,
+//     since the scope cannot exceed its own memory.max. A delegate-ram cap is a
+//     containment CEILING, not a reserve, so it must not do either.
+//
+// verifies: AIRA-62
+func ResolveConfineReserve(request ConfineRequest) (reserve int64, pinned bool) {
+	reserve = request.MemoryReserve
+	pinned = request.MemoryReservePinned || reserve > 0
+	if reserve <= 0 {
+		if request.DelegateRAM {
+			reserve = DefaultDelegateRAMOverhead
+			pinned = true
+		} else {
+			reserve = DefaultConfineMemoryReserve
+		}
+	}
+	if !request.DelegateRAM && request.ScopeMemoryMax > 0 {
+		reserve = request.ScopeMemoryMax
+		pinned = true
+	}
+	return reserve, pinned
+}
+
 type ConfineAdmission string
 
 const (
