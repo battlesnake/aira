@@ -54,6 +54,51 @@ type ConfineSliceReserve struct {
 	// "unevaluated", which is reserved for state that could not be established.
 	Queued      int    `json:"queued"`
 	FreezePhase string `json:"freeze_phase,omitempty"`
+
+	// AIRA-68. Jobs and GrantedBytes above are TOTALS over three structurally
+	// different populations, and only two of them can ever appear as a row in the
+	// Scopes table:
+	//
+	//   ScopeJobs        connection-held `aira confine` jobs        -> a row
+	//   ReservationJobs  connection-held `aira confine-reserve`
+	//                    per-test reservations, which create NO
+	//                    cgroup scope at all                        -> NO row
+	//   AdoptedJobs      scopes adopted by the daemon's scan        -> a row
+	//
+	// Comparing Jobs against len(Scopes) is therefore invalid, and doing so is
+	// what produced AIRA-68's P0 "23 admitted jobs, only 3 live scopes" report:
+	// 20 of those were healthy per-test reservations from a running
+	// --delegate-ram pytest suite. Jobs > len(Scopes) is the EXPECTED shape while
+	// such a suite runs. Consumers wanting "how much is charged to something with
+	// a scope" want ScopeBytes + AdoptedBytes, never GrantedBytes.
+	ScopeJobs        int   `json:"scope_jobs"`
+	ScopeBytes       int64 `json:"scope_bytes"`
+	ReservationJobs  int   `json:"reservation_jobs"`
+	ReservationBytes int64 `json:"reservation_bytes"`
+	AdoptedJobs      int   `json:"adopted_jobs"`
+	AdoptedBytes     int64 `json:"adopted_bytes"`
+
+	// VanishedJobs/VanishedBytes are a SUBSET of ScopeJobs/ScopeBytes: leases
+	// whose scope the daemon's own scan observed and then observed gone. They are
+	// reclaimed at the stale-lease TTL.
+	//
+	// Named for what was observed, never for a verdict. A scope can be empty and
+	// removed while the job's leader is still alive, having migrated into a
+	// sibling cgroup — real, witnessed behaviour — so "its scope is gone" is a
+	// fact and "the job is dead" is not one this daemon can establish.
+	//
+	// Structurally blind to the scope-less population: a reservation has no cgroup
+	// artifact, so nothing can be observed about it either way.
+	VanishedJobs  int   `json:"vanished_jobs"`
+	VanishedBytes int64 `json:"vanished_bytes"`
+
+	// ResidualJobs/ResidualBytes cross-check the derived split against the
+	// daemon's incremental counters. They are equal by construction, so a
+	// non-zero value here is a real lost or double ledger discharge. Signed:
+	// negative means more was discharged than was ever charged, which is just as
+	// real a defect as the positive direction.
+	ResidualJobs  int   `json:"residual_jobs"`
+	ResidualBytes int64 `json:"residual_bytes"`
 }
 
 type ConfineKillResult struct {

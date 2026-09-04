@@ -141,6 +141,19 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				Jobs:         totalJobs,
 				Queued:       queued,
 				FreezePhase:  freezePhase,
+				// AIRA-68: the same snapshot's population split, so the summary can
+				// never again be read against the Scopes table above it as though
+				// they counted the same thing.
+				ScopeJobs:        snapshot.scopeJobs,
+				ScopeBytes:       snapshot.scopeBytes,
+				ReservationJobs:  snapshot.reservationJobs,
+				ReservationBytes: snapshot.reservationBytes,
+				AdoptedJobs:      snapshot.adoptedJobs,
+				AdoptedBytes:     snapshot.adopted,
+				VanishedJobs:     snapshot.vanishedJobs,
+				VanishedBytes:    snapshot.vanishedBytes,
+				ResidualJobs:     snapshot.residualJobs(),
+				ResidualBytes:    snapshot.residualBytes(),
 			}
 		}
 		return core.Response{OK: true, Code: "OK", Data: result}

@@ -75,6 +75,56 @@ type admitWaiter struct {
 	name         string
 	owner        string
 	scopeCeiling int64
+
+	// AIRA-68. scopeSeen/scopeVanished record a TRANSITION observed by the
+	// evaluator's own <=1s confine scan — the same authority the adopted ledger
+	// already trusts — and are meaningful only for a scope-backed waiter
+	// (scopeID != ""). Both are written ONLY inside evaluateAdmitQueue's
+	// scan-success block, under queue.mu, and never on a failed scan.
+	//
+	// The pair exists because plain ABSENCE is not a safe reclaim signal and the
+	// transition is. The pre-existing empty-scope reclaim is safe against a
+	// launcher stalled before scope creation only because it is DESTRUCTIVE: it
+	// removes the directory, so the launcher's next cgroupfs write fails
+	// ENOENT/ENODEV and the launch aborts cleanly. Reclaiming on absence alone
+	// has no such fence — the stalled launcher would lose its lease, then create
+	// its scope and run entirely UNCHARGED, which is the #67 aggregate-OOM class.
+	// A waiter that never created a scope never gets scopeSeen, so it is never a
+	// candidate, and its treatment is unchanged.
+	//
+	// scopeVanished is deliberately CLEARED when the scope is observed again: a
+	// scan is a fresh fact, not a latch, and a stale "vanished" must never
+	// outlive the observation that produced it.
+	//
+	// Honest limits, all pre-existing and all in the safe direction:
+	//   - A scope created and removed entirely between two scans never sets
+	//     scopeSeen, so a lease stuck that way stays stuck (the empty-reap branch
+	//     has the identical blind spot: it needs a directory to reap).
+	//   - A scope id accepted by confineScopeIDPattern but rejected by the
+	//     scanner's own parseConfineScopeID is omitted from every scan, so
+	//     scopeSeen never becomes true. Never a false reclaim.
+	//   - "Seen then gone" proves the scope held no processes at removal time. It
+	//     does NOT prove the job is dead: a leader can migrate into a sibling
+	//     cgroup and keep running (internal/runner/descendant_escape_linux_test.go).
+	//     That is exactly the strength of the empty-reap branch's own proof, and
+	//     why the reported counter is named `vanished`, never `ghost`.
+	//   - Strictly, the scan observes a PATHNAME, and cgroup v2 permits renaming a
+	//     cgroup within its parent — so an absent scope id means "no cgroup by
+	//     that name", not unconditionally "that cgroup was removed". A renamed,
+	//     still-populated scope would therefore be read as vanished and its lease
+	//     reclaimed after the TTL while the job runs on, still contained. Both
+	//     plan reviewers raised this independently and it is recorded, not fixed:
+	//     nothing in AIRA renames a scope, closing it needs per-scope inode
+	//     identity threaded through the scan (real machinery for an
+	//     externally-injected scenario, which architectural-simplicity says to
+	//     document rather than build), and the consequence is bounded the same way
+	//     the migrated-leader case is — the release is LEDGER-ONLY, and a renamed
+	//     cgroup is still inside the slice, so its memory is still charged through
+	//     max(current - reclaimable, sum of reserves). Requiring a currently
+	//     succeeding scan (see dischargeVanishedStaleLease) narrows the window but
+	//     does not close it.
+	scopeSeen     bool
+	scopeVanished bool
 }
 
 type sliceQueue struct {
@@ -262,6 +312,58 @@ type admitSnapshot struct {
 	queued          int
 	phase           string
 	present         bool
+
+	// AIRA-68. outstandingJobs fuses TWO structurally different populations, and
+	// the reported job total adds a third — while `confine --list`'s table above
+	// the summary lists only SCOPES:
+	//
+	//   scopeJobs        connection-held `aira confine` jobs   -> a table row
+	//   reservationJobs  connection-held `aira confine-reserve` reservations,
+	//                    which create no cgroup scope at all   -> NO table row
+	//   adoptedJobs      scan-adopted scopes                   -> a table row
+	//
+	// So "N admitted jobs" is not comparable with the row count, and reading it
+	// that way is precisely what produced AIRA-68's P0 misdiagnosis: 20 of 23
+	// "admitted jobs" were healthy per-test reservations from a running
+	// --delegate-ram pytest suite. The split is derived in the SAME locked pass as
+	// the totals so the two can never describe different instants.
+	scopeJobs        int
+	scopeBytes       int64
+	reservationJobs  int
+	reservationBytes int64
+
+	// vanishedJobs/vanishedBytes are a SUBSET of scopeJobs/scopeBytes, never a
+	// fourth population — the split must keep summing to the totals or the
+	// residual below would cry wolf on every vanished lease.
+	vanishedJobs  int
+	vanishedBytes int64
+}
+
+// residualJobs and residualBytes cross-check the DERIVED split (a walk of
+// queue.waiters) against the INCREMENTAL counters. They are equal by
+// construction: a waiter is `admitGranted && accounted` if and only if it was
+// counted, and releaseAdmitWaiter discharges under exactly that guard. A
+// non-zero residual is therefore a real lost or double decrement, not noise.
+//
+// adoptedJobs/adopted appear on both sides of the reported total and cancel, so
+// these are stated over the connection-held ledger alone.
+//
+// The two are reported INDEPENDENTLY and SIGNED. The single most plausible
+// regression in releaseAdmitWaiter — dropping `outstanding -= waiter.reserve`
+// while keeping `outstandingJobs--` — is byte-only, and a job-only residual
+// would report a perfectly consistent ledger while the slice silently filled.
+// A negative residual (more discharged than was ever charged) is just as real a
+// defect as a positive one and must never be floored away.
+//
+// What they do NOT detect: a stuck waiter that is consistently present in BOTH
+// accountings. That is what vanishedJobs is for, for the population where an
+// answer is physically possible.
+func (snapshot admitSnapshot) residualJobs() int {
+	return snapshot.outstandingJobs - (snapshot.scopeJobs + snapshot.reservationJobs)
+}
+
+func (snapshot admitSnapshot) residualBytes() int64 {
+	return snapshot.outstanding - (snapshot.scopeBytes + snapshot.reservationBytes)
 }
 
 func (s *Server) admitSliceSnapshot(path string) admitSnapshot {
@@ -287,8 +389,30 @@ func (s *Server) admitSliceSnapshot(path string) admitSnapshot {
 		phase: phase, present: true,
 	}
 	for _, waiter := range queue.waiters {
-		if waiter != nil && waiter.state == admitQueued {
+		if waiter == nil {
+			continue
+		}
+		if waiter.state == admitQueued {
 			snapshot.queued++
+			continue
+		}
+		// The classifier is scopeID and nothing else. name/owner cannot be used:
+		// validateAdmitArgs requires the scope_id/name/owner tuple to be supplied
+		// together, so they co-occur and would make the split look right while
+		// classifying on the wrong fact.
+		if waiter.state != admitGranted || !waiter.accounted {
+			continue
+		}
+		if waiter.scopeID == "" {
+			snapshot.reservationJobs++
+			snapshot.reservationBytes = addClamp(snapshot.reservationBytes, waiter.reserve)
+			continue
+		}
+		snapshot.scopeJobs++
+		snapshot.scopeBytes = addClamp(snapshot.scopeBytes, waiter.reserve)
+		if waiter.scopeVanished {
+			snapshot.vanishedJobs++
+			snapshot.vanishedBytes = addClamp(snapshot.vanishedBytes, waiter.reserve)
 		}
 	}
 	if s.admitFreezeMaxHold > 0 {
@@ -768,10 +892,30 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			}
 			queue.adoptedScanFailed = true
 		} else {
+			// AIRA-68. listConfines enumerates EVERY .aira-CONFINE-* directory
+			// under the slice, irrespective of population or cap, so scan
+			// membership is an authoritative presence test — and this block runs
+			// only when the scan SUCCEEDED, so a failed scan writes no bit at all.
+			present := make(map[string]struct{}, len(scanResult.Scopes))
+			for _, record := range scanResult.Scopes {
+				present[record.ScopeID] = struct{}{}
+			}
 			held := make(map[string]struct{})
 			for _, waiter := range queue.waiters {
-				if waiter != nil && waiter.state == admitGranted && waiter.scopeID != "" {
-					held[waiter.scopeID] = struct{}{}
+				if waiter == nil || waiter.state != admitGranted || waiter.scopeID == "" {
+					continue
+				}
+				held[waiter.scopeID] = struct{}{}
+				// The seen -> gone TRANSITION, recorded on the waiter. See the
+				// scopeSeen/scopeVanished comment on admitWaiter for why the
+				// transition, and not plain absence, is what the stale-lease sweep
+				// is allowed to reclaim on.
+				if _, exists := present[waiter.scopeID]; exists {
+					waiter.scopeSeen, waiter.scopeVanished = true, false
+					continue
+				}
+				if waiter.scopeSeen {
+					waiter.scopeVanished = true
 				}
 			}
 			adopted := int64(0)
@@ -1008,9 +1152,30 @@ func (s *Server) timeoutAdmitWaiter(queue *sliceQueue, waiter *admitWaiter) {
 
 func (s *Server) releaseAdmitWaiter(queue *sliceQueue, waiter *admitWaiter) {
 	queue.mu.Lock()
+	released := releaseAdmitWaiterLocked(queue, waiter)
+	queue.mu.Unlock()
+	if released {
+		s.afterAdmitRelease(queue)
+	}
+}
+
+// releaseAdmitWaiterLocked is the ledger discharge itself, with queue.mu ALREADY
+// HELD by the caller. It reports whether THIS call performed the transition, so
+// a caller can never log or count a reclaim that a concurrent release had
+// already done.
+//
+// AIRA-68 split this out of releaseAdmitWaiter so the stale-lease sweep can make
+// its final validation and its discharge ONE critical section. Validating under
+// the lock, dropping it, and then discharging leaves a window in which the
+// evaluator re-observes the scope and clears scopeVanished — after which the
+// sweep would still discharge a lease whose reclaim proof had just evaporated.
+// Both plan reviewers found that window independently.
+//
+// The caller must run afterAdmitRelease once it has dropped queue.mu, and only
+// when this returned true.
+func releaseAdmitWaiterLocked(queue *sliceQueue, waiter *admitWaiter) bool {
 	if waiter.state == admitReleased {
-		queue.mu.Unlock()
-		return
+		return false
 	}
 	if waiter.state == admitGranted && waiter.accounted {
 		queue.outstanding -= waiter.reserve
@@ -1025,7 +1190,13 @@ func (s *Server) releaseAdmitWaiter(queue *sliceQueue, waiter *admitWaiter) {
 		}
 	}
 	waiter.state = admitReleased
-	queue.mu.Unlock()
+	return true
+}
+
+// afterAdmitRelease runs the post-discharge work that must NOT hold queue.mu:
+// pruneAdmitQueue takes admitRegistryMu then queue.mu, so calling it under
+// queue.mu would invert the one fixed lock order in this file.
+func (s *Server) afterAdmitRelease(queue *sliceQueue) {
 	queue.signal()
 	// A ledger release can make a parked RAM-aware worker fit. This is only the
 	// coalescing, lock-free signal: evaluate must never be called synchronously
