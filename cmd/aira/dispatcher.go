@@ -396,22 +396,14 @@ func (d *daemonDispatcher) exchangeWithReplacement(ctx context.Context, exchange
 	if daemon.ProtocolVersion <= response.Proto {
 		return response, nil
 	}
-	serviceRestart, err := d.replaceOlderDaemon(ctx)
-	if err != nil {
+	if err := d.replaceOlderDaemon(ctx); err != nil {
 		return daemon.ResponseFrame{}, err
 	}
 	retry, err := exchange(ctx)
 	if err != nil {
 		return daemon.ResponseFrame{}, err
 	}
-	if serviceRestart && isOlderProtocol(retry) {
-		return daemon.ResponseFrame{}, errors.New("installed aira-daemon.service binary is older than this client — re-run 'aira install'")
-	}
 	return retry, nil
-}
-
-func isOlderProtocol(response daemon.ResponseFrame) bool {
-	return response.Code == daemon.CodeProtocol && response.Proto > 0 && response.Proto < daemon.ProtocolVersion
 }
 
 func prepareRoutedRequest(request *core.Request) {
@@ -587,29 +579,56 @@ func releaseStartupLock(file *os.File) {
 	_ = file.Close()
 }
 
-func (d *daemonDispatcher) replaceOlderDaemon(ctx context.Context) (bool, error) {
+// replaceOlderDaemon stops a daemon whose protocol is older than this client's,
+// so the next exchange can start a current one.
+//
+// It never issues `systemctl --user restart aira-daemon.service` (AIRA-83). That
+// daemon is shared by every session on the machine: an implicit restart taken
+// automatically, on any verb, with no prompt and no ownership check kills
+// in-flight work belonging to agents who never ran anything — the same
+// blast-radius class as `systemctl --user stop aira.slice`. A client newer than
+// an identity-matched managed daemon refuses and names the remedy instead,
+// leaving the shared, machine-wide action to the human or the deploying
+// coordinator. The `daemon.Stop` branch below is a different case: that daemon is
+// this client's own ad-hoc one.
+//
+// KNOWN, ACCEPTED GAP (recorded on AIRA-83, not silently held): the branch is
+// chosen by ServiceIdentityMatches, which reports plain false both for "this is
+// not the managed service" and for "the probe could not be evaluated" (a
+// transient `systemctl is-enabled`/`show-environment` failure, an unreadable unit
+// file, an empty HOME — internal/daemon/service.go:38-75). In the unevaluable
+// case this falls through to `daemon.Stop`, and the managed unit's Restart=always
+// then brings the shared daemon back — a bounce, not the deliberate restart
+// deleted here, but still collateral. It is left as-is deliberately: refusing
+// whenever the unit is merely `is-enabled` would break the legitimate case this
+// branch exists for (a developer's own daemon on a divergent XDG_STATE_HOME while
+// the real service is enabled), and a positive "is the running PID inside the
+// unit's cgroup" proof is new machinery this mechanical fix does not add.
+func (d *daemonDispatcher) replaceOlderDaemon(ctx context.Context) error {
 	if daemon.ServiceIdentityMatches(d.paths, daemon.DefaultServiceUnit, d.systemctl(), d.reader(), d.environment()) {
-		if _, err := d.systemctl()([]string{"systemctl", "--user", "restart", daemon.DefaultServiceUnit}); err != nil {
-			return true, fmt.Errorf("restart installed %s: %w", daemon.DefaultServiceUnit, err)
-		}
-		return true, nil
+		// The remedy names BOTH steps on purpose. `aira install` publishes this
+		// binary but restarts the unit only when the unit's own content changed
+		// (internal/install/install.go:670-675) — and swapping the ExecStart
+		// binary underneath an unchanged unit does not change it. So a reinstall
+		// alone leaves the old daemon running and this refusal repeating.
+		return errors.New("installed aira-daemon.service binary is older than this client — re-run 'aira install' to publish this binary, then load it with an explicit, coordinated 'systemctl --user restart aira-daemon.service' (shared: it interrupts every session's daemon work)")
 	}
 	if err := daemon.Stop(d.paths); err != nil {
-		return false, err
+		return err
 	}
 	deadline := time.Now().Add(d.startWait)
 	for time.Now().Before(deadline) {
 		status := daemon.Status(d.paths)
 		if !status.Running && !status.Ready {
-			return false, nil
+			return nil
 		}
 		select {
 		case <-ctx.Done():
-			return false, fmt.Errorf("%s: %w", daemon.CodeTimeout, ctx.Err())
+			return fmt.Errorf("%s: %w", daemon.CodeTimeout, ctx.Err())
 		case <-time.After(25 * time.Millisecond):
 		}
 	}
-	return false, errors.New(daemon.CodeTimeout + ": older daemon did not stop")
+	return errors.New(daemon.CodeTimeout + ": older daemon did not stop")
 }
 
 // inProcessDispatcher is injected by tests. It is a substrate, never a

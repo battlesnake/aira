@@ -75,10 +75,17 @@ func (result admissionResult) releaseAdmission() {
 	result.lock.release()
 }
 
+// DaemonProtocolVersion is the wire protocol the runner's admission client
+// speaks. It MUST equal daemon.ProtocolVersion. The runner cannot import
+// internal/daemon (daemon imports runner), so the two are pinned equal by
+// TestRunnerDaemonProtocolVersionMatchesTheDaemon in the external runner_test
+// package rather than derived — a bump on one side alone fails that test
+// instead of silently breaking admission negotiation (AIRA-83 item 3).
+const DaemonProtocolVersion = 5
+
 const (
-	runnerDaemonProtocolVersion = 5
-	runnerDaemonMaxFrameBytes   = 16 << 20
-	admitTransportGrace         = time.Second
+	runnerDaemonMaxFrameBytes = 16 << 20
+	admitTransportGrace       = time.Second
 )
 
 type runnerAdmitRequestFrame struct {
@@ -351,7 +358,7 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopClose()
 
-	frame := runnerAdmitRequestFrame{Proto: runnerDaemonProtocolVersion, Scope: map[string]any{}}
+	frame := runnerAdmitRequestFrame{Proto: DaemonProtocolVersion, Scope: map[string]any{}}
 	frame.Request.Verb = "admit"
 	frame.Request.Args = map[string]any{
 		"slice": r.memorySlice, "reserve": effectiveReserve,
@@ -537,7 +544,7 @@ func reportConfinePeak(ctx context.Context, request ConfineRequest, signature st
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	}
-	frame := runnerAdmitRequestFrame{Proto: runnerDaemonProtocolVersion, Scope: map[string]any{}}
+	frame := runnerAdmitRequestFrame{Proto: DaemonProtocolVersion, Scope: map[string]any{}}
 	frame.Request.Verb = "confine-report"
 	frame.Request.Args = map[string]any{"signature": signature, "oom": oom}
 	if peak != nil && *peak > 0 {

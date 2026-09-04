@@ -145,12 +145,24 @@ func TestPersistentOldProtocolUnderServiceRequiresReinstall(t *testing.T) {
 		}
 	}
 	response := daemon.ResponseFrame{Proto: daemon.ProtocolVersion - 1, Code: daemon.CodeProtocol}
-	_, err := d.exchangeWithReplacement(context.Background(), func(context.Context) (daemon.ResponseFrame, error) { return response, nil })
+	exchanges := 0
+	_, err := d.exchangeWithReplacement(context.Background(), func(context.Context) (daemon.ResponseFrame, error) {
+		exchanges++
+		return response, nil
+	})
 	if err == nil || !strings.Contains(err.Error(), "re-run 'aira install'") {
 		t.Fatalf("err=%v", err)
 	}
-	if strings.Count(strings.Join(commands, "\n"), "restart aira-daemon.service") != 1 {
-		t.Fatalf("commands=%q", commands)
+	// AIRA-83: the shared managed daemon must NEVER be restarted implicitly. The
+	// client refuses and names the remedy; it does not `systemctl restart` a
+	// daemon every other session on the machine depends on.
+	if strings.Contains(strings.Join(commands, "\n"), "restart aira-daemon.service") {
+		t.Fatalf("restarted the shared managed daemon: commands=%q", commands)
+	}
+	// And it refuses on the first mismatch rather than retrying the exchange
+	// against a daemon it has (correctly) not replaced.
+	if exchanges != 1 {
+		t.Fatalf("exchanges=%d want 1", exchanges)
 	}
 }
 
