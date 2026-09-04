@@ -17,9 +17,28 @@ red-teamed against the first's fixes.
   say how the main goroutine is guaranteed to see the handler goroutine's write
   (§3.3); and test 4 as specified was timing-dependent (§4, Tests).
 
-Codex/Sol and Gemini were both unavailable for these reviews (usage credits
-exhausted / free-tier quota exhausted, one retry each); recorded rather than
-silently skipped, and noted as a real reduction in review independence — both
+**Revision 4** — folds the adversarial BUILD review (DeepSeek-pro against the
+committed diff), whose two real findings changed the shipped code:
+
+- **P1, accepted:** classifier branch 2 gated on `signalled` alone, so a leader
+  that died of SIGTERM while a *descendant* cgroup's OOM had raised this scope's
+  counter was reported `terminated-by=oom`. Branch 2 now requires the child to
+  have been killed by **SIGKILL specifically** — the only signal the OOM killer
+  and `memory.oom.group` deliver. Two classifier rows added; §3.2 rewritten.
+- **P2, accepted:** `forwardConfineSignals`'s stop function only closed a
+  channel and never joined its goroutine, so a signal landing at the moment of
+  return could write the new handler log line after `confineWithDeps` had
+  returned and its caller had read the diagnostics. Stop now joins (and is
+  idempotent), with `TestForwardConfineSignalsStopJoinsTheHandler` pinning it.
+
+The same review's P0 was a false alarm caused by a stale diff: `origin/master`
+had advanced under the review, so another session's landed AIRA-16 watchdog
+change appeared inside the diff as a deletion. Rebased and re-reviewed against
+the true merge base.
+
+Codex/Sol and Gemini were unavailable throughout (usage credits exhausted /
+free-tier quota exhausted, one retry each); recorded rather than silently
+skipped, and noted as a real reduction in review independence — all three review
 rounds came from the same model family.
 
 ## 1. Problem, restated against current source
@@ -164,7 +183,7 @@ First match wins:
 
 ```
 1. wait status not decodable                       -> unevaluated
-2. SIGNALLED and oom_kill readable and > 0         -> oom
+2. SIGKILLED and oom_kill readable and > 0         -> oom
 3. supervisor received a signal during the run     -> supervisor-signal:<NAME>
 4. not signalled                                   -> normal
 5. signal is not SIGKILL                           -> child-signal:<NAME>
@@ -182,14 +201,19 @@ First match wins:
   operator's Ctrl-C. On the ordinary supervisor-signal path `cleanup()` has
   already removed the scope directory, so branch 2 finds nothing readable and
   falls through to 3 as intended.
-- **Branch 2 requires `signalled`, not just `oom_kill > 0`.** `memcg_memory_event`
-  propagates **upward**, so a descendant cgroup the job created inside its own
-  scope, OOM-killed at its own limit, increments *our* scope's counter while our
-  leader exits perfectly normally (`pytest` losing one worker and exiting 1 is
-  the concrete case). Classifying that as `terminated-by=oom` would report a
-  termination that did not happen. The `oom` boolean feeding
-  `formatConfineReserveAdvisory` is unchanged and still speaks for that case
-  where a cap was set.
+- **Branch 2 requires the child to have been killed by SIGKILL specifically**
+  (tightened on build-review P1; revisions 2–3 required only `signalled`).
+  `memcg_memory_event` propagates **upward**, so a descendant cgroup the job
+  created inside its own scope, OOM-killed at its own limit, increments *our*
+  scope's counter while our own leader dies of something else entirely — or
+  exits perfectly normally (`pytest` losing one worker and exiting 1 is the
+  concrete case). Classifying either as `terminated-by=oom` would report a
+  termination that did not happen, and the weaker `signalled` gate still let a
+  SIGTERMed leader be relabelled that way. The OOM killer, and
+  `memory.oom.group` with it, deliver SIGKILL and nothing else, so requiring
+  SIGKILL costs nothing real — the same reasoning branch 5 already rests on. The
+  `oom` boolean feeding `formatConfineReserveAdvisory` is unchanged and still
+  speaks for the descendant case where a cap was set.
 - **3 before 4** (round-2 P0; revision 2 had `not signalled -> normal` first). A
   child may *catch* the forwarded SIGTERM/SIGINT and exit non-signalled — the
   normal, well-behaved case for a test runner with a shutdown handler. With
@@ -229,9 +253,17 @@ window did not terminate anything, and must not be reported as though it had.
 - The main goroutine takes a **snapshot under the same mutex immediately after
   `waitConfineCommand` returns**, before anything else, and classifies from the
   snapshot. Signals arriving later cannot retroactively relabel a completed run.
-- **Why the snapshot is guaranteed to see a teardown-causing signal**, given
-  that `forwardConfineSignals`'s stop function only closes a channel and never
-  joins its goroutine: the handler's mutex release strictly precedes
+- **The stop function joins its goroutine** (added on build-review P2; it
+  previously only closed a channel). Without the join, a signal landing at the
+  moment of return could write the handler's log line *after*
+  `confineWithDeps` had returned and its caller had already read the
+  diagnostics. The join cannot deadlock and adds no new worst case: the loop is
+  either parked in its select, or inside `onSignal`, whose `cleanup()` the
+  caller's own `defer cleanup()` already waits on through its `sync.Once`; and
+  the signal *source* is stopped first, so nothing new can arrive during the
+  join.
+- **Why the snapshot is guaranteed to see a teardown-causing signal**: the
+  handler's mutex release strictly precedes
   `cleanup()`, which strictly precedes the `cgroup.kill`/forwarded signal that
   kills the child, which strictly precedes the child's exit, which strictly
   precedes `cmd.Wait()` returning, which strictly precedes the snapshot's `Lock`.
@@ -407,12 +439,23 @@ New/extended, all TDD (test first, watch it fail against current source):
 - The daemon log line firing on a refused kill (a "killed" claim for a kill that
   did not happen — exactly the fabricated-outcome class AIRA-68's populated-gate
   exists to prevent).
-- **Mutation checks the build review must actually run**, each expected to turn
-  a specific test red: swap classifier branches 5↔7 (test 1's SIGSEGV row);
-  swap 2↔3 (test 5); swap 3↔4 (test 4's caught-signal shape); drop the
-  `signalled` requirement from branch 2 (test 5's `/bin/true` sub-case); delete
-  branch 6 so an unreadable counter falls through to 7 (test 3's `unevaluated`
-  sub-case); make `FormatConfineStatus` ignore `TerminatedBy` (test 2).
+- **Mutation checks the build review must actually run.** Eleven were applied
+  and every one turned a named test red — recorded here so a later change can
+  re-run the same set:
+
+  | # | mutation | caught by |
+  |---|---|---|
+  | M1 | branch 2 loses its kill requirement entirely | classifier descendant-OOM rows, trailer `/bin/true`+OOM |
+  | M2 | branch 5 (`child-signal`) removed | classifier SIGSEGV/SIGABRT rows, trailer `crashing child` |
+  | M3 | branch 6 removed — unreadable counter falls to 7 | classifier + trailer `unevaluated` rows |
+  | M4 | branch 3 (`supervisor-signal`) ignored | three classifier rows + `TestConfineTrailerReportsSupervisorSignal` |
+  | M5 | `supervisor-signal` ordered before `oom` | classifier "OOM outranks a supervisor signal" |
+  | M6 | `FormatConfineStatus` ignores `TerminatedBy` | facet + trailer tests |
+  | M7 | candidates line fires for every verdict | advisory test + four trailer rows |
+  | M8 | classifier hardcoded to `unattributed-sigkill` | five classifier rows — the probe-only false pass |
+  | M9 | daemon logs the kill before the error return | both negative daemon sub-cases |
+  | M10 | branch 2 gated on `signalled` not `SIGKILL` (the build-review P1 defect) | classifier SIGTERM+descendant-OOM rows |
+  | M11 | stop no longer joins the handler (the build-review P2 defect) | `TestForwardConfineSignalsStopJoinsTheHandler` |
 
 ## 6. Deferrals
 

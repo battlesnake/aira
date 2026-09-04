@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -55,7 +56,17 @@ func TestClassifyConfineTermination(t *testing.T) {
 		{
 			name: "a clean exit is never relabelled by a descendant's OOM", term: exited, usage: readable(3),
 			want: "normal",
-			why:  "branch 2 requires signalled: memcg events propagate UPWARD, so a child cgroup's OOM shows on our counter while our leader exits normally",
+			why:  "branch 2 requires a kill: memcg events propagate UPWARD, so a child cgroup's OOM shows on our counter while our leader exits normally",
+		},
+		{
+			name: "a SIGTERMed leader is never relabelled by a descendant's OOM", term: signalled(syscall.SIGTERM), usage: readable(3),
+			want: "child-signal:SIGTERM",
+			why:  "branch 2 requires SIGKILL: the OOM killer and memory.oom.group deliver SIGKILL and nothing else, so a SIGTERMed leader was not OOM-killed no matter what a descendant did to the counter (build-review P1)",
+		},
+		{
+			name: "a supervisor signal outranks a descendant's OOM on a non-SIGKILL death", term: signalled(syscall.SIGTERM), usage: readable(3), supervisor: syscall.SIGTERM,
+			want: "supervisor-signal:SIGTERM",
+			why:  "branch 3: with branch 2 correctly gated on SIGKILL, our own witnessed teardown is what reaches the operator",
 		},
 		{
 			name: "supervisor signal wins over a caught-and-exited child", term: exited, usage: readable(0), supervisor: syscall.SIGTERM,
@@ -298,4 +309,55 @@ func TestConfineTrailerReportsSupervisorSignal(t *testing.T) {
 	if count := strings.Count(trailer, "confine: received SIGTERM"); count != 1 {
 		t.Fatalf("supervisor signal logged %d times, want exactly 1: %q", count, trailer)
 	}
+}
+
+// verifies: the signal handler's stop function JOINS its goroutine, so nothing
+// the handler writes -- the AIRA-70 log line, the witness the trailer reads --
+// can land after confineWithDeps has returned and its caller has already read
+// the diagnostics. Before the join the stop function only closed a channel, so
+// a signal landing at the moment of return raced the caller (build-review P2).
+//
+// The fixture holds the handler inside onSignal until after stop is called: if
+// stop did not wait, it would return while the callback was still running, and
+// the post-stop read of `running` would see true.
+func TestForwardConfineSignalsStopJoinsTheHandler(t *testing.T) {
+	forward := make(chan os.Signal, 1)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var mu sync.Mutex
+	running := false
+	stop := forwardConfineSignals(forward, func() *os.Process { return nil }, func(os.Signal) {
+		mu.Lock()
+		running = true
+		mu.Unlock()
+		close(entered)
+		<-release
+		mu.Lock()
+		running = false
+		mu.Unlock()
+	})
+	forward <- syscall.SIGTERM
+	<-entered
+	stopped := make(chan struct{})
+	go func() { stop(); close(stopped) }()
+	select {
+	case <-stopped:
+		t.Fatal("stop returned while the handler callback was still running: it did not join")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stop never returned after the handler finished")
+	}
+	mu.Lock()
+	stillRunning := running
+	mu.Unlock()
+	if stillRunning {
+		t.Fatal("handler still running after stop returned")
+	}
+	// Idempotent: the production path calls stop from a defer, and a double call
+	// must not panic on a re-closed channel.
+	stop()
 }

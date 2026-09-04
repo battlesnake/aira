@@ -1410,9 +1410,24 @@ func confineSignalSource() (<-chan os.Signal, func()) {
 	return forward, func() { signal.Stop(forward) }
 }
 
+// forwardConfineSignals returns a stop function that closes the handler down
+// and then JOINS its goroutine. The join is load-bearing since AIRA-70 gave the
+// handler an observable side effect -- it writes the "received SIGTERM" line to
+// the shared diagnostics writer and records the witness the trailer classifies
+// from. Without the join, a signal landing at the moment of return could write
+// that line after confineWithDeps had already returned, i.e. after its caller
+// (or a test) had read the diagnostics it produced.
+//
+// The join cannot deadlock and adds no new worst case: the loop either sits in
+// the select (and returns the instant done closes) or is inside onSignal, whose
+// cleanup() the caller's own `defer cleanup()` already waits on through its
+// sync.Once. Callers stop the signal SOURCE before calling this, so no further
+// signal can be delivered while the join is in progress.
 func forwardConfineSignals(forward <-chan os.Signal, process func() *os.Process, onSignal func(os.Signal)) func() {
 	done := make(chan struct{})
+	finished := make(chan struct{})
 	go func() {
+		defer close(finished)
 		for {
 			select {
 			case received, ok := <-forward:
@@ -1430,8 +1445,10 @@ func forwardConfineSignals(forward <-chan os.Signal, process func() *os.Process,
 			}
 		}
 	}()
+	var stopOnce sync.Once
 	return func() {
-		close(done)
+		stopOnce.Do(func() { close(done) })
+		<-finished
 	}
 }
 
@@ -1470,17 +1487,21 @@ func waitConfineCommand(cmd *exec.Cmd) (int, confineTermination) {
 // docs/superpowers/plans/2026-09-05-aira70-91a-terminated-by-trailer-plan.md
 // section 3.2; the short form:
 //
-//  1. no decoded wait status                 -> unevaluated
-//  2. SIGNALLED and oom_kill readable and >0  -> oom
-//  3. this supervisor was signalled           -> supervisor-signal:<NAME>
-//  4. not signalled                           -> normal
-//  5. signal is not SIGKILL                   -> child-signal:<NAME>
-//  6. oom_kill not readable                   -> unevaluated
-//  7. SIGKILL with oom_kill == 0              -> unattributed-sigkill
+//  1. no decoded wait status                     -> unevaluated
+//  2. SIGKILLed and oom_kill readable and >0      -> oom
+//  3. this supervisor was signalled               -> supervisor-signal:<NAME>
+//  4. not signalled                               -> normal
+//  5. signal is not SIGKILL                       -> child-signal:<NAME>
+//  6. oom_kill not readable                       -> unevaluated
+//  7. SIGKILL with oom_kill == 0                  -> unattributed-sigkill
 //
-// Step 2 requires `signalled` because memcg events propagate UPWARD: a
-// descendant cgroup the job made inside its own scope, OOM-killed at its own
-// limit, raises this scope's counter while our leader exits perfectly normally.
+// Step 2 requires the child to have been killed BY SIGKILL SPECIFICALLY,
+// because memcg events propagate UPWARD: a descendant cgroup the job made
+// inside its own scope, OOM-killed at its own limit, raises this scope's
+// counter while our own leader dies of something else entirely -- or exits
+// perfectly normally. The OOM killer, and memory.oom.group with it, deliver
+// SIGKILL and nothing else, so requiring SIGKILL keeps a leader that died of
+// SIGTERM from being relabelled by a descendant's OOM (build-review P1).
 // Step 2 precedes step 3 because cgroup.kill -- which is how our own cleanup()
 // tears a job down -- never increments oom_kill, so a positive counter can
 // never be our doing. Step 3 precedes step 4 because a child may CATCH the
@@ -1498,7 +1519,8 @@ func classifyConfineTermination(term confineTermination, usage cgroupUsage, supe
 		return ConfineTerminatedUnevaluated
 	}
 	oomEvaluated := usage.OOMKill != nil
-	if term.Signaled && oomEvaluated && *usage.OOMKill > 0 {
+	killed := term.Signaled && term.Signal == syscall.SIGKILL
+	if killed && oomEvaluated && *usage.OOMKill > 0 {
 		return ConfineTerminatedOOM
 	}
 	if supervisorSignal != nil {
@@ -1507,7 +1529,7 @@ func classifyConfineTermination(term confineTermination, usage cgroupUsage, supe
 	if !term.Signaled {
 		return ConfineTerminatedNormal
 	}
-	if term.Signal != syscall.SIGKILL {
+	if !killed {
 		return ConfineTerminatedChildSignalPrefix + confineSignalName(term.Signal)
 	}
 	if !oomEvaluated {
