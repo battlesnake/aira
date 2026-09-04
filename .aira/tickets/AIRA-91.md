@@ -250,3 +250,24 @@ the explanation for the evidence this ticket is actually built on. Narrows
 the remaining live candidates to: the daemon-restart-mid-run
 whole-tree-OOM hypothesis (needs `journalctl` correlation against exact
 incident timestamps), and whatever else a fresh investigation surfaces.
+
+### Reproduced on a FOURTH, previously-"clean" leg, and a live daemon-restart correlation caught in real time (qual, 2026-09-04)
+
+`admin` (its own fastapi/httpx/cf_access dependency profile — the fourth
+disjoint profile, after `hosted`/`services`/`pipeline`) truncated with the
+exact signature mid-merge-gate-run: dots stop, confine trailer, exit 0, no
+pytest summary. qual's own interim guard (see above) correctly fired and
+reclassified it BLANK/nonzero rather than a false PASS — the guard's first
+real save, not just a design exercise. `admin` is now also pinned off aitest
+(`FASTEST_NO_AITEST=1`), matching `hosted`/`services`/`pipeline`. qual's
+earlier "backend/admin/obs/sym-gen clean, but provisional" caveat was
+correct to hedge — `admin` is no longer clean.
+
+**Possible live confirmation of candidate 2 (daemon-restart-mid-run), pending
+exact timestamp**: this session restarted `aira-daemon.service` twice
+tonight for unrelated deploys (AIRA-92, then AIRA-68) — `05:04:33` and
+`05:54:09` local. If `admin`'s truncation falls in either window, that is
+the strongest evidence this ticket has had: a live, timestamped trigger
+rather than a stale incident reconstructed after the fact. Awaiting qual's
+exact timestamp to confirm or rule this out. Further daemon restarts are
+paused pending that answer.
