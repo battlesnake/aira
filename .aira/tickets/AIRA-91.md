@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-91","project":"aira","title":"aitest silently loses the final report summary under admission fairness-freeze contention (exit 0, truncated output)","status":"planned","kind":"bug","severity":"P0","assignee":null,"milestone":null,"labels":["aitest","confine","dogfood","honesty"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-91","project":"aira","title":"confine's trailer is indistinguishable from a clean run when systemd-oomd SIGKILLs the whole scope (ROOT CAUSE CONFIRMED — was never exit 0)","status":"planned","kind":"bug","severity":"P0","assignee":null,"milestone":null,"labels":["aitest","confine","dogfood","honesty"],"hold":false,"relations":[]}
 ---
 ## Symptom (reported by peer session `qual`, fastest-ee's `hosted` leg, two independent reproductions)
 
@@ -406,3 +406,137 @@ tonight has been the systemd-oomd/exit-137 mechanism above, and "exit 0"
 was never real. qual is now running `pipeline` (a fourth, still-untested
 dependency profile under forced aitest) with the same direct-capture
 instrumentation to further test this.
+
+---
+
+## ROOT CAUSE CONFIRMED (fresh investigation, worktree `aira-91-root-cause`, 2026-09-04)
+
+**There was never an exit 0.** Root cause: `systemd-oomd` SIGKILLs the entire
+confine scope (`cgroup.kill`) under real memory-pressure contention, exactly
+matching qual's live capture above. This is proven by synthetic reproduction
+matching the real incident artifact on 12 of 13 trailer fields, not inferred.
+
+### The mechanism, end to end
+
+1. `aira confine --delegate-ram` places the job's process tree (`make` ->
+   `sh` -> `uv run` -> `pytest`) inside `.aira-CONFINE-*` with
+   `memory.oom.group=1`. The `aira confine` **supervisor itself stays outside
+   the scope** (confirmed: `UseCgroupFD`/`CLONE_INTO_CGROUP`,
+   `confine_linux.go:769`).
+2. Each aitest worker sub-scope is deliberately sized with
+   `memory.high = estimatedBytes * 4/5` -- 80% of `memory.max`
+   (`worker_admit.go:285`) -- so a worker at its intended working set sits in
+   **sustained reclaim throttling by design**. qual's earlier live wchan
+   capture caught exactly this (`__mem_cgroup_handle_over_high`).
+3. That throttling *is* memory PSI pressure, attributed to the confine scope.
+4. `systemd-oomd` kills the highest-pressure cgroup under `user-1000.slice`.
+   It can reach AIRA's scopes because **AIRA installs the enablement itself**
+   (`internal/install/install.go:967-970`): `ManagedOOMMemoryPressure=kill`
+   on `user-1000.slice`, a tightened `ManagedOOMMemoryPressureLimit=40%`
+   (Ubuntu default 50%), `DefaultMemoryPressureDurationSec=10s` (stock 20s),
+   and `ManagedOOMPreference=avoid` on `session.slice` whose own comment
+   says heavy work in **`aira.slice` will be preferred** for the kill --
+   `aira.slice` itself carries `ManagedOOMPreference=none`.
+5. oomd `cgroup.kill`s the scope. `make`/`sh`/`uv`/`pytest`/every worker die
+   simultaneously, mid-write, unflushed. `aira confine` survives (it was
+   never a member), prints a **completely normal-looking trailer**, and
+   correctly returns **137** -- `waitConfineCommand` was right the whole
+   time (`confine_linux.go:1334-1348` -> `main.go:956`). **This was never a
+   wrong-exit-code bug. It is a missing-diagnostic bug.**
+
+### Why nobody saw it
+
+The only post-run diagnostic, `formatConfineReserveAdvisory`
+(`confine_linux.go:872-890`), fires on `memory.events` `oom_kill > 0`. **A
+userspace `cgroup.kill` never increments that counter** -- it's the kernel
+OOM killer's counter, not systemd-oomd's. So the one mechanism AIRA has for
+saying "your job was killed" is structurally blind to a kill mechanism AIRA
+itself configured onto the machine. The trailer prints identically to a
+clean run.
+
+### Proof, not inference
+
+Synthetic reproduction, no contention manufactured
+(`~/tmp/aira91-probe/`, committable): a `selfkill` probe (kills the leaf
+python only) produces a `make: *** Error 137` line and shell rc 2. A
+`groupkill`/`groupkill_dr` probe (kills the whole scope via `cgroup.kill`,
+matching oomd's actual mechanism) produces **no** `make` error line and
+shell rc **137** -- and its trailer matches the real incident artifact
+(`~/tmp/test-services-retry2.log`) on 12 of 13 fields, including
+`reserve=512M reserve-basis=pinned:client`, `oom.group=set`,
+`scope-memory.max=enforced=4294967296`, both truncating mid-line with the
+trailer glued on with no newline. The one differing field
+(`scope-integrity=migrated` on the real run) is corroborative, not
+contradictory -- it requires `Monitor.LeaderMigrated`, i.e. the leader
+observed alive-but-no-longer-a-member: `make` as a zombie between SIGKILL
+and reap, the exact fingerprint of a whole-scope kill's teardown timing.
+
+### Ruled out, with evidence (not just re-asserted)
+
+- Kernel OOM anywhere in the scope tree -- the advisory line's absence on
+  every real artifact means recursive `oom_kill == 0`; confirmed the
+  advisory *does* fire correctly on a synthetic kernel-OOM probe.
+- `aira.slice`'s own 64G cap OOM -- `memory.events.local` shows
+  `oom 0, oom_kill 0`; the slice has never hit its cap.
+- The memory watchdog -- re-verified against current source, still
+  structurally excluded at four sites.
+- A shell/pipeline artifact -- `merge_gate.sh`'s `run_suite` has no pipe; a
+  leaf-only kill demonstrably produces a `make` error line the real
+  artifacts lack.
+- aitest reaching a clean `sys.exit(0)` -- both fork sites correctly gate
+  child-only cleanup; `testsfailed` accounting makes any incomplete run
+  nonzero regardless.
+- "No OOM in dmesg" was never real evidence -- the ring buffer on this box
+  only reaches back a few hours, well past the earlier incidents' windows.
+
+### Corrections this finding makes to earlier statements on this ticket
+
+- **The BL-969 severity escalation (relayed to qual earlier tonight) was
+  wrong.** `leg_verdict.sh`'s `rc=0 -> PASS` first check was never reached --
+  rc was always 137. BL-969 is a real *latent* gap in that script, but it
+  was never actually triggered by an AIRA-91 incident. Correcting this with
+  qual directly.
+- The stale-JUnit-XML finding **stands unchanged**: a 137 before
+  `pytest_sessionfinish` writes no XML and leaves the previous run's file on
+  disk -- still a genuine false-green channel for anyone reading that file
+  directly.
+- AIRA-92 is confirmed genuinely separate and already fixed -- AIRA-91 is an
+  external kill of a *healthy, progressing* process, not a stall.
+- qual's `"aitest: "` completeness guard remains the right primitive,
+  unaffected by any of this.
+
+### Fix direction (NOT built -- needs the standard two-loop, split in two)
+
+**Part A -- honesty fix, should land regardless of Part B.** A SIGKILLed job
+must never print a trailer indistinguishable from a clean run's.
+`FormatConfineStatus` already has `result.Exit`; add a terminal facet that
+distinguishes what's actually knowable: `oom_kill > 0` -> existing
+kernel-OOM advisory; signalled with `oom_kill == 0` -> report it plainly as
+an **external whole-cgroup kill** and name the realistic sources
+(systemd-oomd, `cgroup.kill`, `aira confine --kill`). A trailer field, not
+new machinery.
+
+**Part B -- real owner-level policy fork, not a solo call.** Two
+AIRA-owned mechanisms actively conflict: admission's design says "a job
+inside its grant is safe, `memory.high` throttles rather than kills";
+AIRA's own oomd configuration says "highest PSI dies, no ledger
+awareness" -- and `memory.high` is what generates the pressure that trips
+it. AIRA's own oomd config comment records this exact tradeoff going wrong
+in the other direction on 2026-05-28 (the desktop got killed instead).
+Candidates, each trading one failure mode for another: `ManagedOOMPreference=avoid`
+on `aira.slice` itself; raising/removing `memory.high` so a well-sized
+worker isn't permanently in reclaim; restoring stock oomd thresholds
+specifically for `aira.slice`. **This needs explicit owner sign-off before
+any of it is built** -- it is not a Fable-plan-review-and-proceed decision
+the way most of tonight's work has been.
+
+### Still open: qual's `pipeline` re-run, falsifiable prediction made
+
+The investigation gave qual a specific, falsifiable prediction to test
+against: `pipeline` should come back **rc=137 plus a `systemd-oomd`
+"Killed .../.aira-CONFINE-..." line within a second or two of the last
+progress byte**. Anything truncating with rc neither 137 nor 128+n would be
+the first positive evidence of a second, still-unexplained mechanism.
+Update this ticket with the result once it lands -- this is the last
+confirmatory step before treating the root cause as fully closed rather
+than "confirmed with one outstanding falsifiable check."
