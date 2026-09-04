@@ -550,8 +550,22 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 			case <-admitWaitDone:
 				return
 			case <-ticker.C:
-				waited := int64(time.Since(start).Seconds())
 				queueNote := confineQueueNote(ctx, deps, request, path, admitWaitDone)
+				// Sampled AFTER the probe, which can take up to its own
+				// timeout: reading the clock first would under-report the wait
+				// by however long the daemon took to answer.
+				waited := int64(time.Since(start).Seconds())
+				// The probe can take up to its own timeout, and the grant can
+				// arrive inside that window. Re-check before printing: a
+				// "still waiting" line emitted after admission was granted
+				// states something that stopped being true while the line was
+				// being composed. Build review (DeepSeek) raised this; the
+				// window is pre-existing but the probe widens it.
+				select {
+				case <-admitWaitDone:
+					return
+				default:
+				}
 				if pinned {
 					fmt.Fprintf(admitDiag, "confine: waiting for memory admission on %s (reserve %s, waited %ds%s)\n",
 						sliceName, FormatConfineBytes(reserve), waited, queueNote)

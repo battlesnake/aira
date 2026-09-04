@@ -34,6 +34,34 @@ type confineQueuePosition struct {
 // that is already blocked, so it must never become a second thing to wait for.
 const confineQueueProbeTimeout = 2 * time.Second
 
+// Daemon cost, measured rather than asserted — twice, because the first
+// measurement alone did not bound it. Build review raised the load question
+// with AIRA-61's per-poll O(tree) scan (25-65% CPU) as the precedent to avoid,
+// then raised that a per-call figure taken against a nearly-idle slice says
+// nothing about a contended one, since the confine-list scan is O(live
+// scopes). Both numbers:
+//
+//   - Per call, end to end: 1.5-1.7ms of daemon CPU at 3 live scopes (100 and
+//     200 requests against the live daemon; committed repro
+//     docs/dev/aira24-probe-cost.sh takes the utime+stime delta from
+//     /proc/<daemon>/stat over the request count).
+//   - Scan slope: ~16us per live scope — 0.02ms at 1 scope, 2.03ms at 128
+//     (BenchmarkListConfinesByScopeCount, confine_list_scale_linux_test.go).
+//
+// Each waiter probes once per diagnostic tick (15s), and the queue's own
+// admitMaxWaiters caps waiters at 256. The worst case therefore needs 256 jobs
+// queued AND a slice carrying ~128 live scopes at the same time: 256/15s x
+// (1.6ms + 2.0ms) = 61ms/s, about 6% of one core. The contended case actually
+// observed (a handful of waiters, a handful of scopes) is under 0.1%. That is
+// still well clear of AIRA-61's class, so the cadence stays at one probe per
+// printed line and no cache is introduced.
+//
+// Accepted waste, named rather than hidden: the probe pays for the whole
+// ConfineListResult and reads only SliceReserve. Avoiding that means a second
+// daemon verb for one diagnostic — new machinery for a cost measured in tens
+// of microseconds per scope, which this project's simplicity rule says not to
+// build.
+
 // confineQueueNote renders the queue clause of one admission-wait progress
 // line, or "" when no position could be established.
 //
@@ -78,7 +106,14 @@ func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequ
 	if position.aheadBytes > 0 {
 		ahead = FormatConfineBytes(position.aheadBytes)
 	}
-	return fmt.Sprintf(", queue position %d of %d, %s reserved ahead", position.position, position.queued, ahead)
+	// Two words earn their place here. "enqueue order" because the daemon's
+	// fairness duty cycle can backfill a smaller waiter ahead of a stuck head,
+	// so this is a place in the evaluation order and not a promise of being
+	// admitted second. "queued ahead" because the figure counts ONLY the queued
+	// waiters in front — the reserve already GRANTED to running jobs is much
+	// larger and is not in it; a bare "reserved ahead" invites reading it as
+	// "the memory standing between me and admission", which it is not.
+	return fmt.Sprintf(", queue position %d of %d by enqueue order, %s queued ahead", position.position, position.queued, ahead)
 }
 
 // confineQueuePositionFromDaemon asks the daemon, over its OWN short-lived

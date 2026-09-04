@@ -89,11 +89,17 @@ func TestConfineAdmissionWaitLineCarriesTheQueuePosition(t *testing.T) {
 		return confineQueuePosition{position: 2, queued: 3, aheadBytes: 8 << 30}, true
 	}
 	got := waitForConfineDiagnostic(t, deps, ConfineRequest{MemoryReserve: 4 << 30, MemoryReservePinned: true})
-	if !strings.Contains(got, "queue position 2 of 3") {
+	if !strings.Contains(got, "queue position 2 of 3 by enqueue order") {
 		t.Fatalf("progress line does not state the caller's own place in the queue; stderr=%q", got)
 	}
-	if !strings.Contains(got, "8G reserved ahead") {
+	// "queued ahead", not "reserved ahead": the figure counts the queued
+	// waiters in front, NOT the much larger reserve already granted to running
+	// jobs. Build review found the looser wording invited exactly that misread.
+	if !strings.Contains(got, "8G queued ahead") {
 		t.Fatalf("progress line does not state the reserve queued ahead; stderr=%q", got)
+	}
+	if strings.Contains(got, "reserved ahead") {
+		t.Fatalf("the ahead-figure must not read as all reserve ahead of the job; stderr=%q", got)
 	}
 	if !strings.Contains(got, "reserve 4G") {
 		t.Fatalf("the existing pinned wording must survive; stderr=%q", got)
@@ -123,7 +129,7 @@ func TestConfineAdmissionWaitLineKeepsTheUnpinnedHedgeWithAPosition(t *testing.T
 	}
 	// Head of the queue: nothing is ahead, and that is a fact worth stating as
 	// 0B rather than omitting, since the absent case means something else.
-	if !strings.Contains(got, "0B reserved ahead") {
+	if !strings.Contains(got, "0B queued ahead") {
 		t.Fatalf("head-of-queue line must state an empty ahead-figure; stderr=%q", got)
 	}
 }
@@ -147,8 +153,75 @@ func TestConfineAdmissionWaitLineOmitsAnUnestablishedPosition(t *testing.T) {
 	if !strings.Contains(got, "confine: waiting for memory admission on finite.slice (reserve 4G, waited ") {
 		t.Fatalf("the daemon-less line must be exactly the pre-AIRA-24 line; stderr=%q", got)
 	}
-	if strings.Contains(got, "queue position") || strings.Contains(got, "reserved ahead") {
+	if strings.Contains(got, "queue position") || strings.Contains(got, "queued ahead") {
 		t.Fatalf("an unestablished position must print nothing at all; stderr=%q", got)
+	}
+}
+
+// The probe takes time, and the grant can land inside that window. A "still
+// waiting" line composed before the grant and printed after it states
+// something that stopped being true while it was being written — the same
+// staleness class this whole feature exists to remove, reintroduced at the
+// last step. Raised by the DeepSeek build-review lineage.
+//
+// verifies: when admission is granted while a probe is in flight, that tick
+// prints no line at all.
+func TestConfineAdmissionWaitLineIsNotPrintedAfterTheGrant(t *testing.T) {
+	scope := &confineFakeScope{}
+	deps := confineUnitDeps(scope)
+	deps.admitWaitDiagInterval = 5 * time.Millisecond
+	deps.admitQueueProbeTimeout = 30 * time.Second
+	probing := make(chan struct{})
+	var once sync.Once
+	// The probe holds the tick open until its context is cancelled, and the
+	// only thing that cancels it here is the end of the admission wait itself
+	// — so this stub returning is PROOF that the grant already landed. No
+	// sleeps and no cross-goroutine timing assumption.
+	deps.queuePosition = func(ctx context.Context, _ ConfineRequest, _ string) (confineQueuePosition, bool) {
+		once.Do(func() { close(probing) })
+		<-ctx.Done()
+		return confineQueuePosition{position: 2, queued: 3, aheadBytes: 8 << 30}, true
+	}
+	var mu sync.Mutex
+	var buf bytes.Buffer
+	sink := writerFunc(func(p []byte) (int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return buf.Write(p)
+	})
+	proceed := make(chan struct{})
+	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
+		<-proceed
+		return admissionResult{state: "waited"}, nil
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = confineWithDeps(context.Background(), ConfineRequest{
+			Slice: "finite.slice", MemoryReserve: 4 << 30, MemoryReservePinned: true,
+			Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: sink,
+		}, deps)
+	}()
+	select {
+	case <-probing:
+	case <-time.After(5 * time.Second):
+		close(proceed)
+		<-done
+		t.Fatal("the probe was never attempted")
+	}
+	// Admission is granted while the probe is still in flight; the probe then
+	// answers with a perfectly valid position, too late to be worth printing.
+	close(proceed)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the launch never finished")
+	}
+	mu.Lock()
+	got := buf.String()
+	mu.Unlock()
+	if strings.Contains(got, "waiting for memory admission") {
+		t.Fatalf("a wait line was printed after admission was granted; stderr=%q", got)
 	}
 }
 

@@ -20,7 +20,7 @@ Ask **1 (no visibility while waiting)** is what this closure builds. The
 periodic progress line now carries the waiter's OWN place in the queue:
 
 ```
-confine: waiting for memory admission on aira.slice (reserve 32G, waited 45s, queue position 2 of 3, 8G reserved ahead)
+confine: waiting for memory admission on aira.slice (reserve 32G, waited 45s, queue position 2 of 3 by enqueue order, 8G queued ahead)
 ```
 
 - The daemon's `confine-list` verb accepts an optional `scope_id` and answers
@@ -48,6 +48,34 @@ Honest limits, stated rather than papered over:
   absence, never "position 0 of 0".
 - Needs the daemon restarted onto this code; the wire shape is unchanged and
   `ProtocolVersion` is NOT bumped, so an old daemon simply answers no position.
+
+Build review (DeepSeek lineage; the Codex/Sol lineage was over its usage limit
+and did not run) raised five points. Three were real and are fixed here:
+
+- The daemon-load question was answered by MEASUREMENT, not assertion, and
+  then re-answered when a second reviewer pointed out that a per-call figure
+  from a nearly-idle slice does not bound a contended one: 1.5–1.7 ms of
+  daemon CPU per `confine-list` at 3 live scopes
+  (`docs/dev/aira24-probe-cost.sh`), plus a scan slope of ~16 µs per live
+  scope, 2.03 ms at 128 (`BenchmarkListConfinesByScopeCount`). Worst case —
+  256 queued jobs (the queue's own cap) AND ~128 live scopes at once —
+  256/15s × 3.6 ms ≈ 6% of one core; the contended case actually observed is
+  under 0.1%. Still clear of AIRA-61's per-poll-scan class, so no cache was
+  added.
+- "reserved ahead" invited reading the figure as all reserve standing between
+  the job and admission; it counts only the QUEUED waiters in front, so the
+  line now says "N queued ahead" and names "by enqueue order" explicitly.
+- A grant landing while a probe was in flight could print a "still waiting"
+  line after admission was granted. The tick now re-checks after the probe and
+  skips the line. This narrows the window from the probe's whole duration to
+  the nanoseconds between that check and the write; the residual is
+  pre-existing (any tick can fire just as a grant lands) and is not claimed to
+  be closed. The elapsed-seconds figure is now also read after the probe, so a
+  slow daemon no longer makes the printed wait short by up to 2 s.
+
+The other two were verified and rejected: the split-ceiling probe timeout is
+test-only (production is a 2 s constant, and the probe honours cancellation),
+and non-FIFO grant order is now stated in the line itself.
 
 Ask **2 (faster-fail)** landed earlier as `--admit-timeout` with a refusal at
 the shared `runner.AdmitWaitCeiling` (AIRA-58), rather than a silent clamp.
