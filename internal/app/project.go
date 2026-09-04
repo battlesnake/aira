@@ -766,6 +766,20 @@ func runGitRevParse(ctx context.Context, commandArgs []string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, "git", commandArgs...)
+	// Scrub GIT_* (AIRA-93). `git -C <dir> rev-parse` names the directory
+	// explicitly, but an inherited GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE OVERRIDES
+	// it, so discovery silently resolves a different repository than the one it
+	// was asked about — and everything downstream (project id, worktree id, the
+	// common-dir receipts and journal) is then keyed to the wrong project. That
+	// is not hypothetical: two receipts in this repository's own shared
+	// .git/aira/receipts.jsonl were written from /tmp test working directories
+	// under this project's id, colliding with its real seq 1 and 3 and making
+	// `aira reconcile --rebuild` fail E_JOURNAL_CORRUPT.
+	//
+	// AIRA-46 scrubbed the same variables in .githooks/common.sh, but only for
+	// the shell hooks; this is the one path it did not reach — the binary's own
+	// git-invoking helper, which inherits whatever environment its caller had.
+	command.Env = scrubGitEnvironment(os.Environ())
 	command.WaitDelay = 3 * time.Second
 	output, err := command.Output()
 	if err != nil {
@@ -777,6 +791,24 @@ func runGitRevParse(ctx context.Context, commandArgs []string) (string, error) {
 		return "", err
 	}
 	return string(output), nil
+}
+
+// scrubGitEnvironment drops every GIT_* variable. It removes ALL of them rather
+// than an allowlist of the three that bite hardest: git keeps adding
+// environment-driven overrides (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE,
+// GIT_COMMON_DIR, GIT_OBJECT_DIRECTORY, GIT_CEILING_DIRECTORIES, …), and
+// discovery needs none of them — it passes `-C <dir>` and asks rev-parse a
+// question about that directory alone. An allowlist would silently regrow the
+// hole the next time git ships another one.
+func scrubGitEnvironment(env []string) []string {
+	result := make([]string, 0, len(env))
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "GIT_") {
+			continue
+		}
+		result = append(result, entry)
+	}
+	return result
 }
 
 func absoluteGitPath(root, path string) string {
