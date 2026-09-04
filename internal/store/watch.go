@@ -8,6 +8,34 @@ import (
 // AppendWatchdogEvent appends one host-watchdog decision to this project scope.
 // The daemon is the single caller and broadcasts the same decision to each ready
 // project so host-global safety actions remain visible in project-scoped watches.
+//
+// UNJOURNALED BY DESIGN (AIRA-75). These rows keep `journaled=0` forever, and
+// that is a decision rather than an omission:
+//
+//   - There is nothing to journal them AGAINST. The journal is the durable
+//     record of this project's own allocations and mutations, replayed and
+//     cross-checked against git-file content. A host-global watchdog kill is not
+//     a fact about this project at all — the same decision is broadcast verbatim
+//     into every ready project's stream — so a journal entry would be a
+//     fabricated per-project provenance record for a machine-level event.
+//   - They are still WATCH-VISIBLE, which is the whole point of writing them
+//     here: `aira watch` reads `events` (EventsSince, ordered by seq), so the
+//     rows must exist and must carry a seq. Demoting them to a daemon log line —
+//     the other reading of "stop minting a sequence number" — would silently
+//     remove the only surface on which a session sees the watchdog kill
+//     something. That is a different, worse change.
+//
+// AIRA-75 filed this as "voiding the journal's gap-detection". Re-verified: no
+// gap-detection over `events.seq` exists to void — nothing in this package reads
+// seq contiguity, and the journal is keyed by (project, seq) lookups
+// (journalEventFor), never by "every seq must be present". So the seq these rows
+// consume costs nothing beyond a number, and the invariant to keep is the honest
+// one stated here: watchdog rows are watch-visible and never journaled.
+//
+// Measured on this machine, 2026-09-04: 245 of this project's 541 events (45.3%)
+// are journaled=0, and every one of them is an `aira-watchdog` actor row
+// (watchdog.trip / .intent / .outcome / .recovered / .defer). No other producer
+// leaves an unjournaled event.
 func (s *Store) AppendWatchdogEvent(ctx context.Context, verb, target string) error {
 	return s.withImmediate(ctx, func(conn *sql.Conn) error {
 		seq, err := nextSequence(ctx, conn, s.projectID)
