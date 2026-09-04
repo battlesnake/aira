@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-71","project":"aira","title":"SKILL.md's recommended aitest invocation (no --delegate-ram) silently strips the coordinates aitest needs, degrading to no cgroup containment","status":"in-review","kind":"bug","severity":"P0","assignee":null,"milestone":null,"labels":["aitest","confine","honesty","skill"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-71","to":"AIRA-77"}]}
+{"schema":1,"id":"AIRA-71","project":"aira","title":"SKILL.md's recommended aitest invocation (no --delegate-ram) silently strips the coordinates aitest needs, degrading to no cgroup containment","status":"done","kind":"bug","severity":"P0","assignee":null,"milestone":null,"labels":["aitest","confine","honesty","skill"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-71","to":"AIRA-77"}]}
 ---
 ## Symptom (found during the whole-project simplification review, PR #12, verified independently against source)
 

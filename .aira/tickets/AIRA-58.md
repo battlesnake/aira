@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-58","project":"aira","title":"confine --admit-timeout is silently clamped to a hardcoded 30-minute daemon-side ceiling","status":"planned","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["confine","daemon","dogfood"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-59","to":"AIRA-58"}]}
+{"schema":1,"id":"AIRA-58","project":"aira","title":"confine --admit-timeout is silently clamped to a hardcoded 30-minute daemon-side ceiling","status":"done","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["confine","daemon","dogfood"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-59","to":"AIRA-58"}]}
 ---
 ## Symptom
 

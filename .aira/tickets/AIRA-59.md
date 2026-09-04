@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-59","project":"aira","title":"Admission fairness-freeze (1-minute backfill grace) can stall the entire queue despite abundant free RAM/CPU","status":"planned","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["confine","daemon","dogfood"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-59","project":"aira","title":"Admission fairness-freeze (1-minute backfill grace) can stall the entire queue despite abundant free RAM/CPU","status":"done","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["confine","daemon","dogfood"],"hold":false,"relations":[]}
 ---
 ## Symptom
 
