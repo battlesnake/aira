@@ -1514,6 +1514,7 @@ var aitestCoordinateKeys = []string{
 	"AIRA_AITEST_WORKER_ADMIT_CMD",
 	"AIRA_AITEST_BOOTSTRAP_CMD",
 	"AIRA_AITEST_MAX_WORKERS_FALLBACK",
+	"AIRA_AITEST_OUTER_SCOPE",
 }
 
 // reportChildEnv builds a shell command printing each key's value, "|"-joined
@@ -1558,6 +1559,7 @@ func TestConfineNonDelegateWithPopulatedRuntimeDirDeliversNoAitestCoordinates(t 
 			"AIRA_AITEST_WORKER_ADMIT_CMD=/stale/aira",
 			"AIRA_AITEST_BOOTSTRAP_CMD=/stale/aira",
 			"AIRA_AITEST_MAX_WORKERS_FALLBACK=999",
+			"AIRA_AITEST_OUTER_SCOPE=/stale/scope",
 		},
 		Argv:       reportChildEnv(append(append([]string{}, aitestCoordinateKeys...), "AIRA_PY_LIB", "AIRA_CONFINE_SCOPE_ID")...),
 		RuntimeDir: t.TempDir(), SelfPath: os.Args[0], Stdout: &stdout, Stderr: io.Discard,

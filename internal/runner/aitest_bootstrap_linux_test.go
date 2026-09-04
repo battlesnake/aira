@@ -63,6 +63,86 @@ func TestBootstrapAitestSupervisorRelocatesAndDelegates(t *testing.T) {
 	}
 }
 
+// TestBootstrapAitestSupervisorIsIdempotentForASecondRunInTheSameJob is
+// AIRA-44's regression test. A confine job that runs aitest-enabled pytest twice
+// (an ordinary multi-suite Makefile) bootstraps twice, and by the second call the
+// caller's whole process tree — `make`, its shell, everything the first drain
+// swept up — is already inside <outer>/.aira-supervisor, not inside outer.
+//
+// Two things must hold, and neither did before:
+//   - the membership guard accepts a supervisor already in the supervisor child,
+//     so the second call is not refused outright, and
+//   - the second call reopens the SAME supervisor scope rather than nesting a
+//     second one, whose worker-admit calls would answer "unevaluated: unbounded"
+//     against a deliberately-uncapped cgroup.
+//
+// The second property depends on the caller passing the real outer scope
+// (AIRA_AITEST_OUTER_SCOPE) rather than self-discovering it; this test pins the
+// runner half by passing the same outer twice, exactly as the env coordinate now
+// guarantees.
+//
+// verifies: AIRA-44
+func TestBootstrapAitestSupervisorIsIdempotentForASecondRunInTheSameJob(t *testing.T) {
+	parent := cgrouptest.IsolatedScopeParent(t)
+	if err := os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"), []byte("+memory"), 0o644); err != nil {
+		cgrouptest.SkipOrFailRealCgroup(t, "memory controller not delegated to %s: %v", parent, err)
+	}
+	outer := filepath.Join(parent, ".aira-outer-test")
+	if err := os.Mkdir(outer, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A real daemon-admitted confine outer scope always carries a finite
+	// memory.max, and the idempotent re-call route now requires that as positive
+	// proof of what it is about to drain. Give the fixture the same shape
+	// production has.
+	if err := os.WriteFile(filepath.Join(outer, "memory.max"), []byte("134217728"), 0o644); err != nil {
+		cgrouptest.SkipOrFailRealCgroup(t, "cannot cap the outer test scope: %v", err)
+	}
+
+	supervisor := startStandInProcess(t)
+	if err := os.WriteFile(filepath.Join(outer, "cgroup.procs"), []byte(strconv.Itoa(supervisor)), 0o644); err != nil {
+		cgrouptest.SkipOrFailRealCgroup(t, "cannot place stand-in process into outer scope: %v", err)
+	}
+
+	first, err := BootstrapAitestSupervisor(context.Background(), outer, supervisor)
+	if err != nil {
+		t.Fatalf("first bootstrap: %v", err)
+	}
+	// Precondition of the scenario, asserted rather than assumed: run 1 has
+	// relocated the stand-in out of outer and into the supervisor child, so run
+	// 2's guard is now looking at a pid that is NOT a member of outer.
+	if scopeContainsPID(outer, supervisor) || !scopeContainsPID(first, supervisor) {
+		t.Fatalf("after run 1, pid %d must be in %s and not in %s", supervisor, first, outer)
+	}
+
+	second, err := BootstrapAitestSupervisor(context.Background(), outer, supervisor)
+	if err != nil {
+		t.Fatalf("second bootstrap (the AIRA-44 case) must succeed, not be refused: %v", err)
+	}
+	if second != first {
+		t.Fatalf("second bootstrap scope=%q want the same scope as the first, %q", second, first)
+	}
+	if _, err := os.Stat(WorkerScopeChildPath(first, "supervisor")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a nested supervisor scope was created under %s (stat err=%v); worker-admit against it would be unbounded", first, err)
+	}
+	if !scopeContainsPID(first, supervisor) {
+		t.Fatalf("pid %d left the supervisor scope across the second bootstrap", supervisor)
+	}
+
+	// The idempotent route demands positive proof that outer is a real,
+	// daemon-admitted confine scope, so that naming an arbitrary shared cgroup
+	// that merely has an .aira-supervisor child cannot drain its members
+	// (build-review, Sol). Uncap outer and the same call must now refuse.
+	if err := os.WriteFile(filepath.Join(outer, "memory.max"), []byte("max"), 0o644); err != nil {
+		t.Fatalf("uncap outer: %v", err)
+	}
+	if _, err := BootstrapAitestSupervisor(context.Background(), outer, supervisor); err == nil {
+		t.Fatal("an uncapped outer scope must not be accepted through the supervisor-child route")
+	} else if !strings.Contains(err.Error(), "no finite memory.max") {
+		t.Fatalf("refusal must name the missing proof, got %v", err)
+	}
+}
+
 func startStandInProcess(t *testing.T) int {
 	t.Helper()
 	cmd := exec.Command("cat")

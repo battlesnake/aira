@@ -750,7 +750,12 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		// above. reserveCommand is the SAME resolved self binary already
 		// computed for the RAM governor a few lines up — both worker-admit
 		// and aitest-bootstrap are verbs on that one aira binary.
-		cmd.Env = pylib.AppendAitestChildEnvironment(cmd.Env, request.RuntimeDir, diagnostics, reserveCommand)
+		// scope.Reference() is THIS job's real outer scope, handed down rather
+		// than rediscovered by the bootstrap verb from its own current cgroup
+		// (AIRA-44) — which is wrong for a second aitest-enabled pytest run in
+		// the same job, because the first run's bootstrap has by then relocated
+		// the whole tree into <outer>/.aira-supervisor.
+		cmd.Env = pylib.AppendAitestChildEnvironment(cmd.Env, request.RuntimeDir, diagnostics, reserveCommand, scope.Reference())
 	} else {
 		// Strip unconditionally, not just skip appending (Fable build-review,
 		// final gate): AppendAitestChildEnvironment was previously called

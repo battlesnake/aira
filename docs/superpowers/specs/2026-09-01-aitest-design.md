@@ -334,7 +334,15 @@ specific shape signals the client asked about a scope that isn't a real,
 daemon-admitted outer scope at all (found live: a second aitest-enabled
 pytest invocation nested inside one confine job can discover a prior
 run's own uncapped supervisor scope as its "outer"), so it is classified
-alongside the two triggers above rather than retried forever. Conflating
+alongside the two triggers above rather than retried forever. **That
+discovery step no longer exists as of AIRA-44**: the confine launcher
+publishes its own scope as `AIRA_AITEST_OUTER_SCOPE` and the bootstrap
+verb uses it instead of self-discovering from its current cgroup, so a
+second invocation in one job now bootstraps against the real outer scope
+and gets genuine per-worker admission. The `unbounded` classification
+stays exactly as specified — it is now a backstop for a hand invocation
+or a launcher that publishes no coordinate, not the expected path for
+this scenario. Conflating
 fallback-worthy conditions with merely-declined ones (exactly what an
 earlier revision of this design did)
 defeats the point of admission — a single contended moment would
