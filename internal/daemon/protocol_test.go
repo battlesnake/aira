@@ -61,9 +61,16 @@ func TestFrameRoundTripPreservesRequestContent(t *testing.T) {
 	}
 }
 
-func TestStoreWriteRelayUsesProtocolVersionFive(t *testing.T) {
-	if ProtocolVersion != 5 {
-		t.Fatalf("ProtocolVersion = %d, want 5 for compute git-context relay", ProtocolVersion)
+// TestProtocolVersionIsPinned makes a wire-shape change a DELIBERATE edit
+// rather than an accident: any change to a frame the daemon and its clients
+// exchange must move this number, and moving this number forces the coordinated
+// reinstall-and-restart the deploy procedure requires. Bumped to 6 by AIRA-42
+// (WorkerAdmitResponse gained `class`/`detail` and its `reason` values changed
+// shape).
+func TestProtocolVersionIsPinned(t *testing.T) {
+	if ProtocolVersion != 6 {
+		t.Fatalf("ProtocolVersion = %d, want 6; a wire-shape change must bump this "+
+			"and be deployed as an atomic reinstall+restart", ProtocolVersion)
 	}
 }
 

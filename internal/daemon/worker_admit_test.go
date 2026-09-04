@@ -206,7 +206,7 @@ func TestEvaluateWorkerAdmitDeniesWhenAggregateCapsWouldExceedCeiling(t *testing
 	// the aggregate guard must deny it regardless.
 	live["/outer"] = 100
 	second := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
-	if second.State != "denied" || second.Reason != "fallback:aggregate-cap-exceeded" {
+	if second.State != runner.WorkerAdmitStateDenied || second.Class != runner.WorkerAdmitClassContended || second.Reason != runner.WorkerAdmitReasonAggregateCapExceeded {
 		t.Fatalf("second (aggregate-cap-guarded) =%+v", second)
 	}
 	// The denial is pollable, not permanent: releasing the first grant
@@ -284,7 +284,7 @@ func TestEvaluateWorkerAdmitAggregateGuardAccountsForSupervisorRSS(t *testing.T)
 	// committed-only guard (committed=0 before any grant) -- but
 	// supervisor(400)+700=1100 > 1000, so this must now be denied.
 	denied := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
-	if denied.State != "denied" || denied.Reason != "fallback:aggregate-cap-exceeded" {
+	if denied.State != runner.WorkerAdmitStateDenied || denied.Class != runner.WorkerAdmitClassContended || denied.Reason != runner.WorkerAdmitReasonAggregateCapExceeded {
 		t.Fatalf("denied (supervisor-rss-guarded) =%+v", denied)
 	}
 	// A request that fits alongside the supervisor's footprint is granted.
@@ -405,7 +405,7 @@ func TestEvaluateWorkerAdmitAccountsForSupervisorRSSWhenSupervisorScopeIsUncappe
 	// unevaluated -- an uncapped memory.max is a normal, expected read,
 	// not a failure.
 	denied := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 700, maxWaitMS: 0})
-	if denied.State != "denied" || denied.Reason != "fallback:aggregate-cap-exceeded" {
+	if denied.State != runner.WorkerAdmitStateDenied || denied.Class != runner.WorkerAdmitClassContended || denied.Reason != runner.WorkerAdmitReasonAggregateCapExceeded {
 		t.Fatalf("denied=%+v", denied)
 	}
 	granted := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 500, maxWaitMS: 0})
@@ -442,8 +442,8 @@ func TestEvaluateWorkerAdmitDeniesImmediatelyWhenRequestExceedsCeilingEvenAtZero
 	server.workerAdmitHeadroom = 0
 	server.admitReadMemory = admitReadMemoryFixture(map[string]int64{}, 1000)
 	response := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 1001, maxWaitMS: 0})
-	if response.State != "denied" || response.Reason != "reject:exceeds-ceiling" {
-		t.Fatalf("response=%+v, want denied/reject:exceeds-ceiling", response)
+	if response.State != runner.WorkerAdmitStateDenied || response.Class != runner.WorkerAdmitClassRequestInvalid || response.Reason != runner.WorkerAdmitReasonExceedsCeiling {
+		t.Fatalf("response=%+v, want denied/request-invalid/exceeds-ceiling", response)
 	}
 }
 
@@ -505,7 +505,7 @@ func TestWorkerAdmitOuterScopeIsOwnedByFirstJob(t *testing.T) {
 		t.Fatalf("first=%+v", first)
 	}
 	other := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-2", outerScope: "/outer", estimatedBytes: 200, maxWaitMS: 0})
-	if other.State != "denied" || other.Reason != "reject:outer-scope-owned-by-another-job" {
+	if other.State != runner.WorkerAdmitStateDenied || other.Class != runner.WorkerAdmitClassRequestInvalid || other.Reason != runner.WorkerAdmitReasonOuterScopeOwnedByAnother {
 		t.Fatalf("other=%+v", other)
 	}
 	again := server.evaluateWorkerAdmit(workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 200, maxWaitMS: 0})

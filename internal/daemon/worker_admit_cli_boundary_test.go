@@ -11,9 +11,22 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"aira/internal/runner"
 )
 
-func TestWorkerAdmitCLIStderrClassificationMatchesSupervisorBoundary(t *testing.T) {
+// TestWorkerAdmitCLIOutcomeChannelMatchesTheSupervisorBoundary drives the real
+// `aira worker-admit` binary against a real daemon and asserts the SINGLE
+// structured stdout line the aitest supervisor parses.
+//
+// This test used to assert stderr prose ("worker-admit denied" plus
+// "reject:exceeds-ceiling"), which was the boundary contract before AIRA-42:
+// two channels, with the load-bearing classification carried as a substring of
+// a human sentence. It now asserts what the supervisor actually consumes — one
+// line, exact enum values — and that stderr carries no classification at all.
+//
+// verifies: AIRA-42
+func TestWorkerAdmitCLIOutcomeChannelMatchesTheSupervisorBoundary(t *testing.T) {
 	binary := filepath.Join(t.TempDir(), "aira")
 	build := exec.Command("go", "build", "-o", binary, "aira/cmd/aira")
 	if output, err := build.CombinedOutput(); err != nil {
@@ -29,12 +42,14 @@ func TestWorkerAdmitCLIStderrClassificationMatchesSupervisorBoundary(t *testing.
 		case "/deny-ceiling":
 			// 2 MiB requested bytes exceed this 1 MiB ceiling even at
 			// zero usage, so workerAdmitConnection returns the permanent
-			// reject:exceeds-ceiling denial without polling.
+			// request-invalid denial without polling.
 			return 0, workerAdmitEstimatedBytesMin, 0, true, ""
 		case "/deny-timeout":
 			// Full live occupancy leaves this otherwise valid request with
 			// no headroom on every poll, forcing its own max-wait timeout.
 			return 2 * workerAdmitEstimatedBytesMin, 2 * workerAdmitEstimatedBytesMin, 0, true, ""
+		case "/unbounded":
+			return 0, 0, 0, false, "unbounded"
 		default:
 			return 0, 0, 0, false, "unexpected scope in test fixture"
 		}
@@ -69,20 +84,77 @@ func TestWorkerAdmitCLIStderrClassificationMatchesSupervisorBoundary(t *testing.
 		return stdout.String(), stderr.String()
 	}
 
-	_, deniedStderr := runWorkerAdmit("/deny-ceiling", 2*workerAdmitEstimatedBytesMin, "5s")
-	if !strings.Contains(deniedStderr, "worker-admit denied") || !strings.Contains(deniedStderr, "reject:exceeds-ceiling") {
-		t.Fatalf("permanent denial stderr missing supervisor classifier text:\n%s", deniedStderr)
+	assertOutcome := func(t *testing.T, stdout, stderr, wantState, wantClass, wantReason string) {
+		t.Helper()
+		lines := strings.Split(strings.TrimSpace(stdout), "\n")
+		if len(lines) != 1 {
+			t.Fatalf("worker-admit must write exactly one stdout line, got %d:\n%s", len(lines), stdout)
+		}
+		fields, err := runner.ParseWorkerAdmitOutcomeLine(lines[0])
+		if err != nil {
+			t.Fatalf("parse %q: %v", lines[0], err)
+		}
+		if fields["state"] != wantState || fields["class"] != wantClass || fields["reason"] != wantReason {
+			t.Fatalf("outcome=%v, want state=%s class=%s reason=%s", fields, wantState, wantClass, wantReason)
+		}
+		// stderr is a human diagnostic. Nothing may need to read it, and in
+		// particular the classification must not depend on it.
+		if strings.TrimSpace(stderr) == "" {
+			t.Fatal("a declined worker-admit must still leave a human diagnostic on stderr")
+		}
 	}
 
-	started := time.Now()
-	_, timeoutStderr := runWorkerAdmit("/deny-timeout", workerAdmitEstimatedBytesMin, "50ms")
-	if elapsed := time.Since(started); elapsed > 5*time.Second {
-		t.Fatalf("timeout worker-admit took %v — looks like it ignored max-wait", elapsed)
-	}
-	if !strings.Contains(timeoutStderr, "worker-admit timeout") {
-		t.Fatalf("timeout stderr missing supervisor classifier text:\n%s", timeoutStderr)
-	}
-	if strings.Contains(timeoutStderr, "reject:exceeds-ceiling") {
-		t.Fatalf("timeout unexpectedly used the permanent sizing rejection:\n%s", timeoutStderr)
-	}
+	t.Run("permanent rejection", func(t *testing.T) {
+		stdout, stderr := runWorkerAdmit("/deny-ceiling", 2*workerAdmitEstimatedBytesMin, "5s")
+		assertOutcome(t, stdout, stderr,
+			runner.WorkerAdmitStateDenied, runner.WorkerAdmitClassRequestInvalid,
+			runner.WorkerAdmitReasonExceedsCeiling)
+	})
+
+	t.Run("timeout is contended, never a permanent verdict", func(t *testing.T) {
+		started := time.Now()
+		stdout, stderr := runWorkerAdmit("/deny-timeout", workerAdmitEstimatedBytesMin, "50ms")
+		if elapsed := time.Since(started); elapsed > 5*time.Second {
+			t.Fatalf("timeout worker-admit took %v — looks like it ignored max-wait", elapsed)
+		}
+		assertOutcome(t, stdout, stderr,
+			runner.WorkerAdmitStateTimeout, runner.WorkerAdmitClassContended,
+			runner.WorkerAdmitReasonSaturated)
+	})
+
+	t.Run("an unbounded outer scope is the one structural unevaluated", func(t *testing.T) {
+		stdout, stderr := runWorkerAdmit("/unbounded", workerAdmitEstimatedBytesMin, "50ms")
+		assertOutcome(t, stdout, stderr,
+			runner.WorkerAdmitStateUnevaluated, runner.WorkerAdmitClassAdmissionUnusable,
+			runner.WorkerAdmitReasonOuterScopeUnbounded)
+	})
+
+	t.Run("a transient unevaluated read stays retriable", func(t *testing.T) {
+		stdout, stderr := runWorkerAdmit("/no-such-fixture", workerAdmitEstimatedBytesMin, "50ms")
+		assertOutcome(t, stdout, stderr,
+			runner.WorkerAdmitStateUnevaluated, runner.WorkerAdmitClassContended,
+			runner.WorkerAdmitReasonOuterScopeUnreadable)
+	})
+
+	t.Run("a client argument mistake never reaches the daemon", func(t *testing.T) {
+		// The floor rejection happens pre-dial. Before AIRA-42 it produced
+		// only a rendered stderr error, which the supervisor could read
+		// only as "the relay produced nothing" -> run unconfined.
+		stdout, stderr := runWorkerAdmit("/deny-ceiling", 1024, "5s")
+		assertOutcome(t, stdout, stderr,
+			runner.WorkerAdmitStateArgumentInvalid, runner.WorkerAdmitClassRequestInvalid,
+			runner.WorkerAdmitReasonEstimatedBytesOutOfRange)
+	})
+
+	t.Run("a pre-dispatch argument error still speaks the channel", func(t *testing.T) {
+		command := exec.Command(binary, "worker-admit", "--job-id", "job-1", "--not-an-option", "x")
+		command.Stdin = strings.NewReader("")
+		var stdout, stderr bytes.Buffer
+		command.Stdout = &stdout
+		command.Stderr = &stderr
+		_ = command.Run()
+		assertOutcome(t, stdout.String(), stderr.String(),
+			runner.WorkerAdmitStateArgumentInvalid, runner.WorkerAdmitClassRequestInvalid,
+			runner.WorkerAdmitReasonArgumentsInvalid)
+	})
 }

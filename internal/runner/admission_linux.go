@@ -81,12 +81,18 @@ func (result admissionResult) releaseAdmission() {
 // TestRunnerDaemonProtocolVersionMatchesTheDaemon in the external runner_test
 // package rather than derived — a bump on one side alone fails that test
 // instead of silently breaking admission negotiation (AIRA-83 item 3).
-const DaemonProtocolVersion = 5
+const DaemonProtocolVersion = 6
 
 const (
 	runnerDaemonMaxFrameBytes = 16 << 20
 	admitTransportGrace       = time.Second
 )
+
+// errWorkerAdmitFrameSize is a SENTINEL, not a fresh errors.New at each call
+// site, so RequestWorkerAdmit can classify "the daemon sent something that is
+// not a frame" with errors.Is instead of matching the message text — the
+// AIRA-42 class this channel exists to close.
+var errWorkerAdmitFrameSize = errors.New("invalid daemon admission frame size")
 
 type runnerAdmitRequestFrame struct {
 	Proto   int            `json:"proto"`
@@ -99,8 +105,18 @@ type runnerAdmitRequestFrame struct {
 }
 
 type runnerAdmitResponseFrame struct {
-	OK    bool            `json:"ok"`
-	Code  string          `json:"code"`
+	OK   bool   `json:"ok"`
+	Code string `json:"code"`
+	// Proto is set ONLY by the daemon's protocolMismatchFrame
+	// (internal/daemon/protocol.go) — errorFrame and responseFrame both
+	// leave it zero. That makes a non-zero Proto a STRUCTURAL discriminator
+	// for "your client and this daemon speak different protocol versions",
+	// which is how the worker-admit client tells a version skew apart from
+	// an ordinary E_DAEMON_PROTOCOL argument rejection instead of matching
+	// the words "daemon protocol is" out of the error sentence (AIRA-45,
+	// AIRA-83(b)). Decoding it is what makes that possible; before this it
+	// was simply dropped.
+	Proto int             `json:"proto,omitempty"`
 	Data  json.RawMessage `json:"data,omitempty"`
 	Error string          `json:"error,omitempty"`
 }
@@ -507,7 +523,7 @@ func writeRunnerAdmitFrame(w io.Writer, value any) error {
 		return err
 	}
 	if len(payload) == 0 || len(payload) > runnerDaemonMaxFrameBytes {
-		return errors.New("invalid daemon admission frame size")
+		return errWorkerAdmitFrameSize
 	}
 	var header [4]byte
 	binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
@@ -573,7 +589,7 @@ func readRunnerAdmitFrame(r io.Reader, value any) error {
 	}
 	size := binary.BigEndian.Uint32(header[:])
 	if size == 0 || size > runnerDaemonMaxFrameBytes {
-		return errors.New("invalid daemon admission frame size")
+		return errWorkerAdmitFrameSize
 	}
 	payload := make([]byte, int(size))
 	if _, err := io.ReadFull(r, payload); err != nil {

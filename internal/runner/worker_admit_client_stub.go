@@ -4,7 +4,6 @@ package runner
 
 import (
 	"context"
-	"errors"
 	"time"
 )
 
@@ -26,6 +25,13 @@ type WorkerAdmitClientRequest struct {
 	MaxWait        time.Duration
 }
 
-func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) (*WorkerAdmitLease, error) {
-	return nil, errors.New("aitest worker-admit: unsupported on this platform")
+// RequestWorkerAdmit reports the same classified outcome shape as the Linux
+// implementation. cgroup admission does not exist off Linux, so the honest
+// classification is "daemon-backed admission is not usable here" — a
+// structural, permanent fact, not an unclassified error.
+func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) WorkerAdmitOutcome {
+	return WorkerAdmitOutcome{
+		State: WorkerAdmitStateUnavailable, Class: WorkerAdmitClassAdmissionUnusable,
+		Reason: WorkerAdmitReasonDialFailed, Detail: "aitest worker-admit: unsupported on this platform",
+	}
 }

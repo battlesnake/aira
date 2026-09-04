@@ -18,7 +18,11 @@ import (
 )
 
 const (
-	ProtocolVersion = 5
+	// ProtocolVersion 6 (AIRA-42/45/83(b)): WorkerAdmitResponse gained the
+	// structured `class`/`detail` fields and its `reason` values lost their
+	// "reject:"/"fallback:" prose prefixes. A client compiled against 5
+	// cannot classify a 6 response, so the version moves with the shape.
+	ProtocolVersion = 6
 	MaxFrameBytes   = 16 << 20
 	StoreOpBodyMax  = uint64(store.StoreOpBodyMax)
 )

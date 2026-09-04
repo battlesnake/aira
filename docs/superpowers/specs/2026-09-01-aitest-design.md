@@ -202,7 +202,10 @@ early disconnect):
 → {"verb":"worker-admit","job_id":"...","outer_scope":"<cgroup path>",
    "signature":"pytest-worker:<suite-hash>","estimated_bytes":N,
    "max_wait_ms":N}
-← {"state":"granted"|"denied"|"timeout"|"unevaluated","reason":"...","waited_ms":N,
+← {"state":"granted"|"denied"|"timeout"|"unevaluated",
+   "class":"granted"|"contended"|"request-invalid"|"admission-unusable"
+          |"placement-failed"|"contract-violation",
+   "reason":"<stable token>","detail":"<free text, never parsed>","waited_ms":N,
    "scope_path":"<child cgroup path>","memory_max":N,"memory_high":N}
 ```
 
@@ -216,22 +219,40 @@ only for genuine unreachability, §3.7) would strip containment for the rest
 of the run over what is usually a transient glitch — the one named exception
 being the structural `unevaluated: unbounded` case §3.7 itself calls out.
 
-**Reason-string convention.** A `denied` response's `reason` is always
-prefixed `reject:` or `fallback:`, and the distinction is load-bearing, not
-decorative: `reject:*` (e.g. `reject:exceeds-ceiling`, the request's own
-sizing can never fit; `reject:outer-scope-owned-by-another-job`, ownership
-binds permanently and is never released) is a stable, request-level fact the
-daemon itself already knows will never change — its own poll loop
-(`workerAdmitConnection`) breaks on it immediately rather than waiting out
-`max_wait_ms`, and a client must treat it as terminal for the affected work
-(mark unevaluated, never retry, never disable the daemon). `fallback:*`
-(e.g. `fallback:insufficient-headroom`, `fallback:aggregate-cap-exceeded`)
-is the ordinary transient case — live occupancy or committed capacity has no
-room *right now*, and the daemon's own poll loop keeps retrying until it
-clears or `max_wait_ms` converts it to `timeout`. A future client must parse
-this prefix explicitly rather than hand-matching individual reason strings,
-or it will silently misclassify any new `reject:*` reason the daemon adds
-later as retriable.
+**Outcome-class convention (AMENDED by AIRA-42; supersedes the prior
+reason-string prefix convention).** The disposition is carried by `class`, a
+field of its own, and clients match it by EXACT value. The earlier design put
+it in a `reject:`/`fallback:` prefix on the `reason` string, which made a
+prose prefix the load-bearing control-flow signal on both sides of a
+process boundary; six recorded recurrences of "a new Go error shape reached
+the Python classifier unrecognised" — each fixed by adding one more substring
+probe, with the fallthrough default being "abandon RAM containment for the
+rest of the run" — are why that convention is retired rather than extended.
+
+The six classes and what each requires of a client:
+
+| `class` | meaning | required client behaviour |
+|---|---|---|
+| `granted` | admitted | use the grant; `state` is `granted` and only then |
+| `contended` | reachable, no room or no answer *right now* (`insufficient-headroom`, `aggregate-cap-exceeded`, `saturated`, a late or severed reply) | retry; keep containment |
+| `request-invalid` | a permanent, static fact about THIS request (`exceeds-ceiling`, `outer-scope-owned-by-another-job`, an argument rejection) — the daemon's own poll loop breaks on it immediately rather than waiting out `max_wait_ms` | terminal for the affected work: mark unevaluated, never retry, never disable the daemon |
+| `admission-unusable` | daemon-backed admission is not usable for this run (`dial-failed`, `protocol-version-mismatch`, `outer-scope-unbounded`) | fall back to unconfined for the rest of the run |
+| `placement-failed` | the daemon granted; local cgroup placement failed | fall back, and do not blame the daemon in the diagnostic |
+| `contract-violation` | the two sides disagree about the channel itself: an uncatalogued `state`/`class`, a self-contradicting pair, an unintelligible frame, or an error code this client does not know | terminal and loud — **never** resolved into "there is no daemon", which would strip containment on an unrecognised shape |
+
+`reason` is a stable exact-match token whose spelling nothing branches on, and
+`detail` is free text that nothing parses. A client that finds itself matching
+substrings of either has reintroduced the defect this convention exists to
+prevent. The two containment-stripping classes are exactly `admission-unusable`
+and `placement-failed`; widening that set is a design change, not an
+implementation detail.
+
+The `aira worker-admit` CLI relay projects the same vocabulary onto one
+machine-readable stdout line in every outcome, grant or not
+(`aira-worker-admit state=… class=… reason=… [placement fields] [detail=…]`,
+`detail` query-escaped), and adds the three states only a client can
+establish: `unavailable`, `argument-invalid`, `placement-failed`. Its stderr
+carries a human diagnostic that is never a classification input.
 
 On `granted`, the supervisor places the forked worker into `scope_path`. This
 reuses `RunConfineSetup`'s verified-placement handshake
@@ -349,9 +370,13 @@ defeats the point of admission — a single contended moment would
 otherwise permanently strip containment from everything after it. The
 client-side exception types this distinction requires
 (`WorkerAdmitUnavailable`, `WorkerPlacementFailed` — both fallback-
-triggering; `WorkerAdmitDenied`, `WorkerAdmitRequestTooLarge` — both
+triggering; `WorkerAdmitDenied`, and the `WorkerAdmitTerminal` pair
+`WorkerAdmitRequestTooLarge`/`WorkerAdmitContractViolation` — all
 retriable/terminal-but-scoped, never fallback-triggering) are an
-implementation detail of the supervisor, not a wire-protocol change.
+implementation detail of the supervisor, not a wire-protocol change. **Since
+AIRA-42 the supervisor no longer DERIVES that distinction at all**: it reads
+the `class` field of the §3.3 outcome channel and maps it to one of those
+types by exact value, so the mapping table is the whole classifier.
 
 ### 3.8 Deletion, retention, generalisation
 

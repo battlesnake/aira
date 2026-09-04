@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-83","project":"aira","title":"A client whose compiled-in ProtocolVersion exceeds the daemon's silently restarts the SHARED aira-daemon.service","status":"planned","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["blast-radius","daemon","dogfood","protocol"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-83","project":"aira","title":"A client whose compiled-in ProtocolVersion exceeds the daemon's silently restarts the SHARED aira-daemon.service","status":"done","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["blast-radius","daemon","dogfood","protocol"],"hold":false,"relations":[]}
 ---
 PR #12 finding **B10**, filed by the simplification programme's Phase 0 (plan
 `docs/superpowers/plans/2026-09-04-simplification-programme-plan.md` §4.3). Source-verified
@@ -122,3 +122,20 @@ Left as-is deliberately, for two reasons rather than by omission:
 
 Severity of the residual is far below the deleted path: the deleted restart fired
 deterministically on any verb, this one needs a broken `systemctl` as well.
+
+## Resolution — (b) done (Phase 1 Fix 2, backlog-remediation plan §3.3); ticket now CLOSED
+
+With (a) and item 3 already landed in Phase 0, this closes the remaining half:
+**the `E_DAEMON_PROTOCOL`-misclassified-as-sizing-error problem**. See AIRA-45's
+resolution for the mechanism — the discriminator is the response frame's own
+`proto` field, decoded for the first time, not a finer match on the error
+sentence.
+
+Note the interaction with (a), which is what makes this safe to land together
+with a version bump: a client that hits a version-mismatched daemon now refuses
+cleanly and names the remedy instead of restarting the shared
+`aira-daemon.service`, AND the aitest supervisor reports the skew honestly
+instead of marking every queued test unevaluated with a sizing diagnostic.
+
+`daemon.ProtocolVersion` moves 5 → 6 in the same change, so the deploy must be
+an atomic reinstall+restart (backlog-remediation plan §8).

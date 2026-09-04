@@ -51,13 +51,14 @@ def test_resolve_estimated_bytes_passes_through_a_value_at_or_above_the_floor(mo
 def test_resolve_estimated_bytes_clamps_a_below_floor_value_up_with_a_warning(monkeypatch, capsys):
     """Regression test for a real bug (Fable build-review, final gate): an
     unclamped too-small value used to reach the CLI's own floor rejection
-    unchanged, and that rejection's E_CONFINE_ARGUMENT_INVALID stderr
-    message matched none of acquire_worker's recognized substrings --
-    misclassified as WorkerAdmitUnavailable, permanently stripping
-    containment for the WHOLE run over a user typo in this one env var,
-    on a daemon that was never actually unreachable. Clamping here, before
-    the value ever reaches the wire, is the correct fix: this is a
-    purely local, static mistake, not a daemon condition at all."""
+    unchanged, whose prose stderr message matched none of acquire_worker's
+    substring probes -- misclassified as WorkerAdmitUnavailable, permanently
+    stripping containment for the WHOLE run over a user typo in this one env
+    var, on a daemon that was never actually unreachable. (AIRA-42 has since
+    removed that substring classifier entirely; the relay now reports a
+    request-invalid class the supervisor maps by exact value.) Clamping here,
+    before the value ever reaches the wire, is still the correct fix: this is
+    a purely local, static mistake, not a daemon condition at all."""
     monkeypatch.setenv("AIRA_AITEST_ESTIMATED_BYTES", "524288")  # 512 KiB, below the 1 MiB floor
     assert _resolve_estimated_bytes() == _ESTIMATED_BYTES_MIN
     stderr = capsys.readouterr().err
@@ -68,11 +69,13 @@ def test_resolve_estimated_bytes_clamps_an_above_ceiling_value_down_with_a_warni
     """Regression test for a real bug (Fable re-gate): the mirror-image of
     the floor-clamp bug above -- an unclamped too-large value (e.g. a
     bytes-vs-MiB units typo the OTHER direction) used to sail past this
-    resolver, reach the daemon's own protocol-level rejection
-    (E_DAEMON_PROTOCOL, admitMaxReserve), and that rejection's message
-    matched none of acquire_worker's recognized substrings either --
-    misclassified as WorkerAdmitUnavailable, permanently stripping
-    containment for the WHOLE run on a plainly healthy daemon."""
+    resolver and reach the daemon's own protocol-level argument rejection
+    (admitMaxReserve), whose message matched none of acquire_worker's
+    substring probes either -- misclassified as WorkerAdmitUnavailable,
+    permanently stripping containment for the WHOLE run on a plainly healthy
+    daemon. (AIRA-42 removed the substring classifier; AIRA-45 additionally
+    split that argument rejection from the protocol-VERSION mismatch it used
+    to share a bucket with.)"""
     monkeypatch.setenv("AIRA_AITEST_ESTIMATED_BYTES", str(_ESTIMATED_BYTES_MAX + 1))
     assert _resolve_estimated_bytes() == _ESTIMATED_BYTES_MAX
     stderr = capsys.readouterr().err
