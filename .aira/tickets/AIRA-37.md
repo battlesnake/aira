@@ -91,12 +91,20 @@ the plan's snapshot.
 
 **STILL OPEN — the two genuine residues, both moved to Phase 2 (plan section 4):**
 
-1. *The atfork docstring.* `worker.py`'s `fork_worker` still claims the
-   pre-placement window is "pure interpreter overhead" (`:285`). Sol reproduced
-   `after_in_child` handlers running before `os.fork()` returns to Python, so the
-   claim is not accurate as stated. Fix is the docstring plus the audit the
-   ticket already describes; the sharper risk named by the review synthesis is a
-   fork-across-threads lock hazard, not a containment break.
+1. ~~*The atfork docstring.*~~ **FIXED 2026-09-05 (backlog-remediation Phase 2).**
+   `fork_worker`'s "pure interpreter overhead" claim is retracted outright, and
+   the audit the ticket asked for is recorded in the docstring with real
+   registrants rather than a "shouldn't happen" assurance: aitest registers no
+   `after_in_child` handler of its own, but `logging`/`threading`/`random` all do
+   at import (pytest imports all three) and AIRA's own `aira_xdist_governor`
+   registers one at module scope — which is how forked aitest workers disable
+   that governor (AIRA-92), so real code runs in this window on a co-registered
+   run. The two bounds that survive (before any *test* code; still charged to the
+   outer scope's hierarchical cap) are kept and the sharper risk is named as the
+   fork-across-threads lock hazard, not a containment break. The same false claim
+   in `docs/superpowers/specs/2026-09-01-aitest-design.md` §3.3 was corrected in
+   the same commit, and the ordering fact is pinned by
+   `test_atfork_after_in_child_handlers_run_before_fork_returns`.
 2. *Worker-dispatch over-spawn.* `supervisor.py:1131` still reads
    `if not self.queue: return` with no in-flight counter, so nothing prevents
    spawning more workers than there is queued work.
