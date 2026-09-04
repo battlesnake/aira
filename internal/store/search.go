@@ -57,7 +57,13 @@ func (s *Store) Search(ctx context.Context, query, kind string) ([]SearchResult,
 		}
 	}
 
-	sqlQuery := `SELECT kind, ref_id, snippet(search_fts, 3, '[', ']', '…', 32), bm25(search_fts)
+	// Column 4 is `content`. The table is
+	// (project_id, kind, ref_id, worktree_id, content), and snippet()'s column
+	// argument is 0-based, so the long-standing `3` here addressed WORKTREE_ID:
+	// every grep result's snippet was the literal worktree name ("main"), never
+	// the matched text. Found while scoping AIRA-74; it survived because the only
+	// assertion was `Snippet != ""`, which a non-empty worktree id satisfies.
+	sqlQuery := `SELECT kind, ref_id, snippet(search_fts, 4, '[', ']', '…', 32), bm25(search_fts)
 		FROM search_fts WHERE search_fts MATCH ? AND project_id=? AND worktree_id=?`
 	args := []any{query, s.projectID, s.worktreeID}
 	if kind != "" {
