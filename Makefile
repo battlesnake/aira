@@ -52,7 +52,7 @@ race:
 	$(GO) test ./... -race -count=1 -timeout 40m
 
 cover:
-	$(GO) test ./... -coverprofile=coverage.out
+	$(GO) test ./... -coverprofile=coverage.out -timeout 20m
 	$(GO) tool cover -func=coverage.out | tail -n 1
 
 fuzz:

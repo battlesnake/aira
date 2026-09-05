@@ -321,13 +321,19 @@ func TestM20LauncherDefersACKAndBoundsReadiness(t *testing.T) {
 		started := time.Now()
 		launch, err := r.LaunchDetached(context.Background(), Request{Argv: []string{"/bin/true"}, Detach: true}, "")
 		var typed *LaunchError
-		// The budget separates the 20ms readiness timeout from the alternative it must
-		// exclude: an implementation that ignored r.detachReadyTimeout and fell back to
-		// the 60s default asserted above. Five seconds is 250x the timeout under test
-		// and still only 20s under -race's x4, so it stays clear of that 60s on every
-		// configuration — 30s would not have (AIRA-20).
-		if launch != nil || !errors.As(err, &typed) || typed.Code != "E_RUN_DETACH_FAILED" || testdeadline.Exceeded(time.Since(started), 5*time.Second) {
-			t.Fatalf("launch=%+v err=%v elapsed=%s", launch, err, time.Since(started))
+		// The budget is derived from the alternative it must exclude — an
+		// implementation that ignored r.detachReadyTimeout and fell back to the
+		// default — rather than picked as a constant, and then capped below half of
+		// it. Scaling alone is not enough: at -race's x4 a 30s budget became 120s,
+		// above the 60s alternative, and the assertion went vacuous in exactly the
+		// configuration AIRA-20 exists to re-enable. The cap makes that unreachable at
+		// any AIRA_TEST_DEADLINE_SCALE, and 5s is still 250x the 20ms under test.
+		budget := testdeadline.Wait(5 * time.Second)
+		if half := defaults.detachReadyTimeout / 2; budget > half {
+			budget = half
+		}
+		if launch != nil || !errors.As(err, &typed) || typed.Code != "E_RUN_DETACH_FAILED" || time.Since(started) > budget {
+			t.Fatalf("launch=%+v err=%v elapsed=%s budget=%s", launch, err, time.Since(started), budget)
 		}
 	})
 }

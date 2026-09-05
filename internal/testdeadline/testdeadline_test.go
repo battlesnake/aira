@@ -34,9 +34,12 @@ func TestScaleIsTheRaceMultiplierTimesTheEnvironment(t *testing.T) {
 		// a large NEGATIVE duration, firing every backstop in the suite instantly.
 		{name: "NaN is refused", raw: "nan", want: raceScale},
 		{name: "NaN with sign is refused", raw: "-NaN", want: raceScale},
-		// +Inf is refused by the overflow clamp in scaleWith rather than here, so it
-		// is safe to accept; pin that it does not change the clamp's job.
-		{name: "positive infinity survives the clamp", raw: "inf", want: math.Inf(1)},
+		// +Inf is refused here rather than left to scaleWith's clamp: the clamp catches
+		// it for a positive duration, but 0 * +Inf is NaN, and Exceeded applies no floor,
+		// so Exceeded(elapsed, 0) at an infinite scale would report every observation as
+		// exceeded.
+		{name: "positive infinity is refused", raw: "inf", want: raceScale},
+		{name: "negative infinity is refused", raw: "-inf", want: raceScale},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := scaleFor(test.raw, !test.unset); got != test.want {
@@ -159,6 +162,10 @@ func TestScaleWithMultipliesAndClampsAtEveryFactor(t *testing.T) {
 		{name: "fractional factor on a fractional result", in: time.Second, factor: 1.5, want: 1500 * time.Millisecond},
 		{name: "overflow is clamped, not wrapped", in: time.Duration(1 << 61), factor: 1000, want: maxScaled},
 		{name: "infinity is clamped, not wrapped", in: time.Second, factor: math.Inf(1), want: maxScaled},
+		// The seam takes an arbitrary factor, so it guards NaN itself rather than relying
+		// on scaleFor having filtered it: NaN passes both `<= 1` and the overflow
+		// comparison, and time.Duration(NaN) is a large NEGATIVE duration.
+		{name: "NaN factor is refused, not turned negative", in: 7 * time.Second, factor: math.NaN(), want: 7 * time.Second},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			got := scaleWith(test.in, test.factor)
@@ -178,14 +185,27 @@ func TestScaleWithMultipliesAndClampsAtEveryFactor(t *testing.T) {
 //
 // verifies: AIRA-20
 func TestEventuallyReturnsOnTheFirstTrueWithoutPolling(t *testing.T) {
+	// Counting evaluations cannot prove this on its own: the first TICK also
+	// evaluates exactly once, and so does the backstop's final look, so `calls == 1`
+	// is equally what a version WITHOUT the fast path produces — confirmed by
+	// mutation, twice. The separation has to be structural. A one-hour poll interval
+	// puts the first tick out of reach, so the only two ways to reach cond are the
+	// pre-poll check (immediately) and the backstop arm (30s later); a budget of 5s
+	// sits an order of magnitude from both.
+	//
+	// This is a LATENCY ASSERTION in the package's own sense — the bound is the
+	// property — which is why it uses Exceeded and a budget chosen against the
+	// alternative, rather than the 2ms PollInterval bound it replaces. That one could
+	// not fail against the mutant at all AND flaked on a single preemption: the worst
+	// of both directions.
 	calls := 0
-	Eventually(t, time.Hour, func() bool { calls++; return true }, "unreachable")
-	// Exactly one evaluation IS the property: it can only be one if the condition was
-	// checked before the ticker was ever waited on. Asserting the wall-clock elapsed
-	// on top of that would add nothing but a flake of the very class this package
-	// removes, since one goroutine preemption exceeds a 2ms PollInterval.
+	started := time.Now()
+	eventuallyWithin(t, 30*time.Second, time.Hour, func() bool { calls++; return true }, "unreachable: the condition is always true")
 	if calls != 1 {
 		t.Fatalf("condition evaluated %d times, want exactly one", calls)
+	}
+	if elapsed := time.Since(started); Exceeded(elapsed, 5*time.Second) {
+		t.Fatalf("an already-true condition waited %v: the pre-poll fast path is gone", elapsed)
 	}
 }
 
@@ -210,7 +230,7 @@ func TestEventuallyFailsWithTheCallersMessage(t *testing.T) {
 	fake := &recordingTB{TB: t}
 	func() {
 		defer func() { _ = recover() }()
-		eventuallyWithin(fake, 5*time.Millisecond, func() bool { return false }, "marker %d never appeared", 7)
+		eventuallyWithin(fake, 5*time.Millisecond, time.Millisecond, func() bool { return false }, "marker %d never appeared", 7)
 	}()
 	if !fake.failed {
 		t.Fatal("a condition that never holds did not fail the test")

@@ -82,17 +82,24 @@ func Scale() float64 {
 // scaleFor is Scale's decision, separated from the environment read so the clamp is
 // directly testable.
 //
-// NaN is refused explicitly rather than left to the comparison. ParseFloat accepts
-// "nan", and NaN < 1 is false, so it would pass the clamp; every subsequent
-// multiplication would then be NaN, the overflow guard in scale would not catch it
-// (NaN > anything is also false), and time.Duration(NaN) is a large NEGATIVE
+// NaN and +Inf are both refused explicitly rather than left to the comparison or to
+// the clamp downstream.
+//
+// ParseFloat accepts "nan", and NaN < 1 is false, so NaN would pass the clamp; every
+// subsequent multiplication would then be NaN, scaleWith's overflow guard would not
+// catch it (NaN > anything is also false), and time.Duration(NaN) is a large NEGATIVE
 // duration — every backstop in the suite would fire instantly.
+//
+// +Inf is caught by scaleWith's clamp for a positive duration, but not for a zero one:
+// 0 * +Inf is NaN, and Exceeded applies no floor, so Exceeded(elapsed, 0) at an
+// infinite scale would report every observation as exceeded. Refusing the input is
+// simpler than reasoning about which call sites can reach a zero duration.
 func scaleFor(raw string, present bool) float64 {
 	if !present || raw == "" {
 		return raceScale
 	}
 	parsed, err := strconv.ParseFloat(raw, 64)
-	if err != nil || math.IsNaN(parsed) || parsed < 1 {
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed < 1 {
 		return raceScale
 	}
 	return raceScale * parsed
@@ -135,25 +142,41 @@ func Exceeded(elapsed, budget time.Duration) bool {
 // from the calling goroutine.
 func Eventually(tb testing.TB, budget time.Duration, cond func() bool, format string, args ...any) {
 	tb.Helper()
-	eventuallyWithin(tb, Wait(budget), cond, format, args...)
+	eventuallyWithin(tb, Wait(budget), PollInterval, cond, format, args...)
 }
 
-// eventuallyWithin is Eventually against an already-resolved backstop, so this
-// package's own tests can exercise the failure path without waiting out MinBackstop.
-func eventuallyWithin(tb testing.TB, backstop time.Duration, cond func() bool, format string, args ...any) {
+// eventuallyWithin is Eventually against an already-resolved backstop and poll
+// interval, so this package's own tests can exercise the failure path without waiting
+// out MinBackstop, and can prove the pre-poll fast path without timing anything.
+//
+// Both seams exist for testability and neither is worth exporting: a caller outside
+// this package has no reason to choose either value.
+func eventuallyWithin(tb testing.TB, backstop, pollInterval time.Duration, cond func() bool, format string, args ...any) {
 	tb.Helper()
 	if cond() {
 		return
 	}
-	deadline := time.Now().Add(backstop)
-	ticker := time.NewTicker(PollInterval)
+	// The backstop is a separate timer arm rather than a check after each tick.
+	// Checking only after a tick makes the effective deadline max(backstop,
+	// pollInterval), so a poll interval longer than the backstop hangs instead of
+	// reporting — which is the one thing a liveness backstop exists to prevent, and
+	// which this package's own mutation check hit.
+	expired := time.NewTimer(backstop)
+	defer expired.Stop()
+	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	for {
-		<-ticker.C
-		if cond() {
-			return
-		}
-		if time.Now().After(deadline) {
+		select {
+		case <-ticker.C:
+			if cond() {
+				return
+			}
+		case <-expired.C:
+			// One last look before failing: the condition may have become true
+			// between the final tick and the deadline.
+			if cond() {
+				return
+			}
 			tb.Helper()
 			tb.Fatalf(format, args...)
 		}
@@ -169,7 +192,12 @@ func eventuallyWithin(tb testing.TB, backstop time.Duration, cond func() bool, f
 // entirely — or that inverted the overflow clamp — would pass every test that only
 // exercised the live value.
 func scaleWith(d time.Duration, factor float64) time.Duration {
-	if factor <= 1 {
+	// NaN needs its own guard: `factor <= 1` is false for NaN, and so is the overflow
+	// comparison below, so an unguarded NaN would reach time.Duration(NaN) and become
+	// a large negative deadline. Scale can no longer produce one, but the seam exists
+	// so a caller can pass an arbitrary factor, and refusing nonsense here costs one
+	// comparison.
+	if math.IsNaN(factor) || factor <= 1 {
 		return d
 	}
 	scaled := float64(d) * factor

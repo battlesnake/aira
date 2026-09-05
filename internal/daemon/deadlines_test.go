@@ -203,8 +203,8 @@ func TestExchangeResponseWaitStillBoundsAReplylessDaemon(t *testing.T) {
 		_ = readFrame(conn, &payload)
 		// Never reply, and hold the connection open so the client cannot
 		// mistake an EOF for a bound wait. Long enough to outlast the response
-		// budget by ~30x, short enough not to leave a goroutine parked for the
-		// rest of the package's run.
+		// budget by ~30x, short enough that the goroutine it parks (stubSocket
+		// never joins its handler) is gone well before the package's run ends.
 		//
 		// It scales with the elapsed bound below, because the two are a ratio, not
 		// two independent constants: leaving this fixed while the bound scaled would

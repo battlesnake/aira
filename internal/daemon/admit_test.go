@@ -645,6 +645,28 @@ func TestAdmitPeerCloseFreesNextWithoutWaitingForPoll(t *testing.T) {
 		defer bServer.Close()
 		server.admitConnection(bServer, validAdmitArgs(100, admitWaitCeilingMs))
 	}()
+	// Wait for b to be enqueued AND evaluated against a full slice before closing a.
+	// The negative read below establishes only that no grant arrived within 20ms; it
+	// does not establish that b ever reached the queue. If b's goroutine lost that
+	// race, a's close would land first, b would be granted "immediate" on its first
+	// evaluation, and the "waited" assertion further down would fail on a scheduling
+	// hiccup — a false fail in the very file this branch is hardening.
+	testdeadline.Eventually(t, time.Second, func() bool {
+		server.admitRegistryMu.Lock()
+		queue := server.admitQueues["/slice"]
+		server.admitRegistryMu.Unlock()
+		if queue == nil {
+			return false
+		}
+		queue.mu.Lock()
+		defer queue.mu.Unlock()
+		for _, waiter := range queue.waiters {
+			if waiter.state == admitQueued && waiter.waited {
+				return true
+			}
+		}
+		return false
+	}, "the second waiter never reached a queued-and-waited state, so 'waited' below would be a race not a property")
 	_ = bClient.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
 	var early ResponseFrame
 	if err := readFrame(bClient, &early); err == nil {

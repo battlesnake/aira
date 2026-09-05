@@ -275,6 +275,11 @@ func TestWatchPeerCloseCancelsAndLongPollDoesNotMonopolizeDB(t *testing.T) {
 	// than watchWaitCap would be satisfied by the watch simply running out — which is
 	// the regression, not the fix. Scaling alone does not guarantee that: MinBackstop
 	// is 5s and -race multiplies by four, which is already most of the 25s cap.
+	//
+	// The cap therefore also bounds what AIRA_TEST_DEADLINE_SCALE can widen here, and
+	// that is deliberate: 12.5s is four orders of magnitude above what the passing
+	// path needs (one CurrentMaxSeq), so there is nothing left for the knob to buy,
+	// and a scale that pushed past the cap would only be buying vacuity.
 	inFlightBudget := testdeadline.Wait(time.Second)
 	if half := watchWaitCap / 2; inFlightBudget > half {
 		inFlightBudget = half
