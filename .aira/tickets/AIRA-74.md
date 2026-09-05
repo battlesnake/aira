@@ -147,7 +147,9 @@ Failure semantics are asymmetric, because everything past the committed `DROP`
 is **one-shot** (the presence fast path is consumed, so a later `Open` skips the
 migration and never retries): the `DROP` transaction fails closed and leaves the
 table for the next `Open` to retry; the barrier checkpoint treats a real PRAGMA
-error as fatal but `busy` as a diagnostic; `VACUUM` failure never fails `Open`.
+error as fatal but SILENTLY tolerates a `busy` result (there is no diagnostics
+channel in `initDB`, so "tolerated" means exactly that); `VACUUM` failure never
+fails `Open`, and is likewise silent.
 That is safe because the guarantee does not depend on the migration's own
 checkpoint — `RedactRant` ends with its own `wal_checkpoint(TRUNCATE)`, which
 folds the zeroed pages into the main file or honestly reports
@@ -217,13 +219,15 @@ replacement drop-only migration is still built to AIRA-73's pattern
 AIRA-97 asks for (`TestSearchFTSMigrationReCheckMakesTheLosingRacerANoOp`,
 shaped like `TestMigrationReCheckMakesTheLosingRacerANoOp`). No probabilistic
 race test was added; AIRA-97 explicitly warns that instrument produced a 7.5%
-flake that proved nothing. AIRA-97 Findings 1 and 2 are untouched and remain
-open.
+flake that proved nothing. AIRA-97 Findings 1 and 2 were fixed separately in
+PR #44, which merged while this was being built; this change is untangled from
+them and completes that ticket's explicit hand-off (see the build-review section
+below and AIRA-97's own closing note).
 
 ### Mutation verification
 
-Nine mutations, each required to fail its guard test. **Two initially SURVIVED
-and both tests were rewritten:**
+Fourteen distinct mutations across the build and the review round, each required
+to fail its guard test. **Two initially SURVIVED and both tests were rewritten:**
 
 - `TestSearchFTSMigrationReCheckMakesTheLosingRacerANoOp` called the migration
   through its public entry point, so the pre-transaction fast path returned
@@ -245,7 +249,10 @@ Final set, all caught: TEMP-table index on the Store connection (the reverted
 design); no migration at all; no erasure-barrier checkpoint; no in-transaction
 re-check; `RedactRant` without `checkpointTruncate`; rant read without its
 project filter; `Search` without the snapshot lock; `snippet()` on the wrong
-column; reclaim failure made fatal.
+column; reclaim failure made fatal; the migration probe made fail-OPEN; `Search`
+always returning empty; `RedactRant` without its `DROP TABLE IF EXISTS`; a
+redaction that scrubs every rant instead of the target; and `Search` writing to
+the Store's own connection.
 
 ### Item 5 of the brief: the earlier snippet fix is intact
 
