@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -294,6 +295,118 @@ func newFullyEstablishedStore(t *testing.T) *Store {
 		t.Fatalf("fixture gate did not pass: %#v", result)
 	}
 	return s
+}
+
+// verifies: AIRA-86
+// The finaliseDimensions *wiring*, not the helper in isolation. Deleting the
+// finaliseDimensions call from Check is invisible to every other test in the
+// module (confirmed by mutation against the merged fix): every dimension
+// shipped today is either established by its checker or demoted by one of its
+// own findings, so the map is fully populated with or without the call. The
+// case the call exists for -- a dimension in the canonical list that no checker
+// establishes, which is what an unwired checker or a dimension added ahead of
+// its evaluator looks like -- had no coverage at all. This supplies it: the
+// dimension reads unevaluated, carries its reason, and demotes an
+// otherwise-clean rollup rather than reporting a fabricated green.
+//
+// The sentinel is appended to the package-level checkDimensions rather than
+// mocked: it is the list Check itself walks, so nothing about the wiring is
+// stubbed out. No test in this package calls t.Parallel(), so the swap and its
+// restore are ordered; a parallel test added here later would have to take that
+// into account before `-race` (AIRA-20) can run the package.
+func TestCheckReportsADimensionNoCheckerEstablishedAsUnevaluated(t *testing.T) {
+	established := checkDimensions
+	checkDimensions = append(append([]string(nil), established...), "unwired-dimension")
+	t.Cleanup(func() { checkDimensions = established })
+
+	s := newFullyEstablishedStore(t)
+
+	report, err := s.Check(context.Background())
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if got := report.Dimensions["unwired-dimension"]; got == "pass" {
+		t.Fatalf("a dimension no checker established reported pass; report=%#v", report)
+	} else if got != "unevaluated" {
+		t.Fatalf("unwired dimension = %q, want unevaluated; report=%#v", got, report)
+	}
+	if !hasCheckFindingSubject(report.UnevaluatedFindings, "U_CHECK_UNEVALUATED", "unwired-dimension") {
+		t.Fatalf("the unevaluated dimension carries no reason: %#v", report.UnevaluatedFindings)
+	}
+	if !report.Unevaluated || report.Verdict != "unevaluated" {
+		t.Fatalf("verdict=%q unevaluated=%v, want the rollup demoted; report=%#v", report.Verdict, report.Unevaluated, report)
+	}
+	// Attribution: this fixture establishes all fourteen real dimensions and is
+	// otherwise a clean pass, so the sentinel's reason must be the only one in
+	// the report. Asserting that rather than re-walking the fourteen keeps this
+	// test about the wiring and leaves the per-dimension pass condition to
+	// TestCheckReportsEveryDimensionPassWhenEveryCheckerEstablishesIt.
+	if len(report.UnevaluatedFindings) != 1 {
+		t.Fatalf("want the unwired dimension's reason and nothing else, got %#v", report.UnevaluatedFindings)
+	}
+}
+
+// verifies: AIRA-86
+// A worktree whose ticket scan did not complete establishes neither
+// duplicate-id nor ticket-file-integrity: the files the scan would have read
+// for one are the files it would have read for the other. Removing either
+// unevaluateDimension call in checkDuplicateIDs leaves ticket-file-integrity
+// established "pass" over a worktree nothing could read -- the same fabricated
+// green as the seed, one dimension wide -- and no test in the module noticed
+// (confirmed by mutation against the merged fix). checkStaleIndex's own
+// inconclusive arm records only stale-index, so it cannot stand in for this.
+func TestCheckDoesNotEstablishTicketFileIntegrityForAWorktreeItCouldNotScan(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "main")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := testStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	ticket, err := s.CreateTicket(context.Background(), domain.CreateTicketInput{Title: "scanned", Kind: "feature", Severity: domain.SeverityP2})
+	if err != nil {
+		t.Fatalf("create ticket: %v", err)
+	}
+	path := filepath.Join(root, ".aira", "tickets", ticket.ID+".md")
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A writer that changes the file between the scanner's paired reads, on
+	// every attempt, is the inconclusive outcome: no read establishes a
+	// coherent value, and the scan reports that rather than reporting a value.
+	var writes int
+	scanReadHook = func() {
+		writes++
+		_ = os.WriteFile(path, append(original, []byte(fmt.Sprintf("\nwrite %d\n", writes))...), 0o644)
+	}
+	t.Cleanup(func() { scanReadHook = nil })
+
+	report, err := s.Check(context.Background())
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if writes == 0 {
+		t.Fatal("the fixture never perturbed a scan read, so nothing was made inconclusive")
+	}
+	// The scan really did come back inconclusive, and it is the worktree scan in
+	// checkDuplicateIDs, not some other read. Without this the test would still
+	// pass against a checkDuplicateIDs that stopped reporting the inconclusive
+	// scan at all and left duplicate-id to be established "pass" instead.
+	if !hasCheckFindingSubject(report.UnevaluatedFindings, "U_INDEX_UNESTABLISHED", filepath.Base(root)) {
+		t.Fatalf("the inconclusive worktree scan reported no reason: %#v", report.UnevaluatedFindings)
+	}
+	if got := report.Dimensions["duplicate-id"]; got != "unevaluated" {
+		t.Fatalf("duplicate-id = %q, want unevaluated; report=%#v", got, report)
+	}
+	if got := report.Dimensions["ticket-file-integrity"]; got == "pass" {
+		t.Fatalf("ticket-file-integrity claimed a pass over a worktree the scan could not read; report=%#v", report)
+	} else if got != "unevaluated" {
+		t.Fatalf("ticket-file-integrity = %q, want unevaluated; report=%#v", got, report)
+	}
+	if !report.Unevaluated {
+		t.Fatalf("an unscanned worktree must mark the report unevaluated; report=%#v", report)
+	}
 }
 
 func hasCheckFindingSubject(findings []CheckFinding, code, subject string) bool {
