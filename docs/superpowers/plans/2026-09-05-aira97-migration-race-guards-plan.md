@@ -45,7 +45,7 @@ sites that never got the treatment.
 | --- | --- |
 | `ensureAreaHintsGeneration` (`:1221`) | `PRAGMA table_info(area_hints)` on the pool, then unlocked `ALTER TABLE area_hints ADD COLUMN generation` |
 | `ensureOutboxKind` (`:1251`) | `hasTableColumn` on the pool, then unlocked `ALTER TABLE outbox ADD COLUMN kind` |
-| `initDB` compute_events loops (`:1087`, `:1111`) | `hasTableColumn` on the pool, then unlocked `ALTER TABLE compute_events ADD COLUMN …`, ×9 columns |
+| `initDB` compute_events loops (`:1087`, `:1111`) | `hasTableColumn` on the pool, then unlocked `ALTER TABLE compute_events ADD COLUMN …`, ×10 columns (4 metric + 6 git-context) |
 
 All three are one shape: *add this column if it is absent*. They get one shared
 guarded primitive.
@@ -97,11 +97,24 @@ the fix ("Caught in review"). Nothing to do; verified, not re-fixed.
   hang, to cover a case the ticket itself rates narrow and low-priority, and the
   same exposure exists for `ensureProjectOwnershipFKs`. Explicitly deferred with
   a note, per this project's "keep the primitive + document the gap" rule.
-  Nothing here widens the exposure: the guarded sites replace a *guaranteed*
-  `duplicate column name` failure for the losing racer with a bounded wait for a
-  metadata-only `ALTER … ADD COLUMN`, then a no-op. (Cost if it were added:
-  `storeOpenRetries` is 3, so two extra attempts × the 5s `busy_timeout` plus
-  backoff ≈ 10.1s of additional silent hang.)
+  (Cost if it were added: `storeOpenRetries` is 3, so two extra attempts × the
+  5s `busy_timeout` plus backoff ≈ 10.1s of additional silent hang.)
+
+  **Precisely what this change does and does not buy under contention**
+  (corrected after build review, which was right that v2's "strictly better,
+  nothing widens" overstated it). What it buys is exact: the losing racer can no
+  longer fail with `duplicate column name`. What it does not remove is the
+  busy-timeout exposure — a legacy open now takes twelve `BEGIN IMMEDIATE`
+  transactions (10 compute_events columns + `outbox.kind` +
+  `area_hints.generation`) where it previously took none, so a concurrent
+  opener waits on the writer lock twelve times instead of racing it. Three of
+  the git-context columns carry `CHECK` constraints, so those `ALTER … ADD
+  COLUMN`s are not necessarily metadata-only. Against that: the old code held
+  the writer lock for each of those same ALTERs anyway, only without a lock
+  around the decision; an already-current open (every steady-state open,
+  including the live database) takes no lock at all via the fast path; and a
+  wait that ends in a no-op is a better outcome than a certain hard failure of
+  `Open`. The residual risk is exactly note (b), and it is that note's to close.
 
 ## The change
 
@@ -227,15 +240,49 @@ timing.
    database is actually migrated. The new tests must not weaken them, and the
    full `go test ./internal/store/...` is the gate, not the new file alone.
 
-**Accepted coverage gap, recorded not silent.** The two probes at
-`ensureFindingsSchema`'s composite-primary-key branch selector run on the
-`*sql.Tx` that the function itself begins, so there is no seam to fail a probe
-without failing the writes; a mutation dropping those errors would compile and
-no test would fail. What is covered instead: both probes are shown individually
-to surface an unanswerable query (test 4), and the identical composition is
-shown to propagate through its seam (test 4b). Closing it needs the
-deferred-to-immediate restructuring this ticket explicitly defers. The gap is
-written into the code comment at that site as well as here.
+7. `TestEnsureColumnAddedTakesTheWriteLockThenTheFastPath` — **added after build
+   review**, which found the tests above porous in one specific way: they supply
+   their *own* `withImmediate`, so removing the wrapper from `ensureColumnAdded`
+   itself left every one of them green. This drives the production entry point
+   against a raw pool (deliberately not `OpenDB`, which would leave no work to
+   do) and observes the transaction through the existing `beforeCommit` seam:
+   exactly one commit on the migrating call, and still exactly one after the
+   second call. That pins both halves — the write lock is taken when there is
+   work, and the already-migrated fast path takes none. *Mutations:* drop the
+   `withImmediate` wrapper → zero commits; drop the fast path → two.
+8. `TestLosingRacerWithAStaleSchemaCacheStillNoOps` — **added after build
+   review**, which observed that tests 1, 2 and the precedent all re-check on
+   the *winner's* connection, whose schema cache is trivially fresh. The real
+   loser is a different process that read the table before the winner's ALTER,
+   so its correctness rests on SQLite re-verifying the schema cookie when the
+   write lock is taken. Two handles on one file, no goroutines: B reads the
+   pre-migration schema, A migrates via `OpenDB`, B then runs the write half and
+   must no-op. *Mutation:* delete the re-check → `duplicate column name: kind`,
+   the production failure, now reproduced on the genuinely stale path.
+
+**Accepted coverage gaps, recorded not silent.**
+
+1. *Five* probes run on a `*sql.Tx` their own function begins — the column,
+   composite-PK and `findings_m5` probes in `ensureFindingsSchema`, and the two
+   in `ensureAllocationKind` — so there is no seam to fail a probe without also
+   failing the writes, and a mutation dropping any of those five errors would
+   compile with nothing failing. (v2 said "two"; build review was right that
+   this understated it.) What is covered instead: each probe is shown
+   individually to surface an unanswerable query (test 4), and the two identical
+   compositions are shown to propagate through their seam (test 4b). Closing it
+   needs either the deferred-to-immediate restructuring this ticket defers, or
+   lifting each transaction body behind `schemaConn`.
+2. Every failing querier in these tests fails at `QueryContext`, so the `Scan`
+   and `rows.Err()` propagation inside `tableHasColumn` and
+   `findingsHasCompositePrimaryKey` is untested — reverting either to the old
+   skip-the-row form stays green — and `tableHasColumn`'s mid-iteration
+   `Scan`-error return is also the only path that could leak the pooled
+   connection (a drained iteration closes itself). Both need a row that `Scan`
+   rejects, which needs a fake SQL driver: more machinery than the invariant is
+   worth. The defence is structural — the `defer rows.Close()` is unconditional
+   and immediately follows the error check.
+
+Both gaps are written into the code at their sites as well as here.
 
 **Every guard is mutation-verified**, since a green test proves nothing about a
 test that cannot fail:
@@ -243,9 +290,12 @@ test that cannot fail:
 | mutation | test that must fail |
 | --- | --- |
 | delete the in-transaction re-check in `addColumnLocked` | tests 1 and 2, with the real production error `duplicate column name: kind` / `: generation` |
+| the same, checked on a genuinely stale schema cache | test 8, same production error |
 | restore the fail-open collapse in `addColumnLocked` | test 3 (the migration proceeds to the ALTER) |
 | `orphan, _ := tableExists(…)` in `findingsSchemaCurrent` | test 4b (returns `(true, nil)` — "already current" on an unanswered question) |
 | `ownership, _ := tableHasColumn(…)` in `allocationKindSchemaCurrent` | test 4b |
+| drop `ensureColumnAdded`'s `withImmediate` wrapper | test 7 (0 commits, want 1) |
+| drop `ensureColumnAdded`'s read-only fast path | test 7 (2 commits, want 1) |
 
 **Test-side probes are fail-closed too.** Seven existing assertions
 (`allocation_kind_test.go`, `compute_test.go`) called the fail-open wrapper; two
@@ -259,10 +309,11 @@ AIRA-74 should delete them outright when it rewrites that function.
 ## Risks
 
 - **More write-lock traffic on a legacy open.** The migrating opener now takes
-  `BEGIN IMMEDIATE` for each absent column. The fast path means an already-current
-  database (every steady-state open, including the live one) takes none. On a
-  legacy open the added transactions are metadata-only `ALTER … ADD COLUMN`s.
-  Accepted: it converts a certain hard failure into a bounded wait.
+  `BEGIN IMMEDIATE` for each absent column — twelve of them on a fully legacy
+  database. The fast path means an already-current database (every steady-state
+  open, including the live one) takes none. Accepted: it converts a certain hard
+  failure into a bounded wait, with the residual busy-timeout risk stated
+  precisely under note (b) rather than waved away.
 - **Signature churn across `store.go`.** Ten-odd call sites change from `bool`
   to `(bool, error)`. Mechanical, compiler-checked, and confined to
   `internal/store`. The two test files that call `hasTableColumn`
@@ -290,4 +341,35 @@ under AIRA-74; notes (a) and (b) are resolved and deferred respectively.
 | P2 | seven test-file callers of the fail-open wrapper remained; two assert *absence* and would pass vacuously on a failed read | **Fixed.** All seven on `columnPresent`; `schema_ownership_test.go`'s duplicate helper deleted. |
 | P2 | plan factual nits: no `querier` type; "15s" → ~10.1s; `:1512` → `:1513`; test 1 needs a new seed because both existing legacy seeds already carry `kind` | **Fixed** in this v2 (a new `writeLegacyPreColumnDatabase` seed carries neither column). |
 | P2 | process: implementation was already underway when the gate ran | **Acknowledged.** The gate's verdict was applied in full before any commit; the loop is plan→gate→implement and this ran plan→(implement ∥ gate)→gate-fix. |
-| P2, optional | nine `BEGIN IMMEDIATE` cycles for `compute_events` on a legacy open; one per table would be fewer | **Declined**, as the gate allowed: per-column keeps one primitive with one meaning, and `compute_test.go:194` already covers the partial-migration state. |
+| P2, optional | ten `BEGIN IMMEDIATE` cycles for `compute_events` on a legacy open; one per table would be fewer | **Declined**, as the gate allowed: per-column keeps one primitive with one meaning, and `compute_test.go:194` already covers the partial-migration state. |
+
+## Build-review findings (Codex/Sol, APPROVE, no P0/P1) and disposition
+
+| finding | disposition |
+| --- | --- |
+| **P2, the substantive one.** The tests supply their own `withImmediate`, so removing that wrapper from `ensureColumnAdded` — the guarantee the ticket is about — left every test green. Disabling the fast path also passed. | **Fixed.** Test 7 drives the production entry point and observes the transaction via `beforeCommit`; both mutations now fail it. |
+| P2. The recorded coverage gap understates itself: five in-transaction probes lack a seam, not two. | **Fixed.** The comment and the plan now name all five. |
+| P2. `findingsHasCompositePrimaryKey` had no false-direction case, so a probe hardcoded to "composite" satisfied every assertion. | **Fixed.** A legacy single-column-PK `findings` table added to test 4. |
+| P2. The contention justification is overstated: twelve newly guarded transactions, and three git-context columns carry `CHECK` constraints so their ALTERs may not be metadata-only. | **Fixed.** "Strictly better / nothing widens" replaced with the precise claim (the duplicate-column failure is removed) plus the residual busy-timeout risk, which is note (b). |
+| P2. `tableHasColumn`'s mid-`Scan` cleanup has no discriminating test — deleting the `defer` passed everything. | **Recorded as an accepted gap** rather than built: injecting it needs a fake SQL driver. Structural defence noted at the function. |
+
+## Second build-review lineage (Fable, APPROVE) and disposition
+
+Independently reproduced the defect before judging the fix: two handles on one
+WAL file, modernc sqlite v1.56.0, a connection with a *stale* schema cache under
+`BEGIN IMMEDIATE` sees the peer's `ADD COLUMN`, and the unguarded `ALTER` on it
+returns `duplicate column name: kind (1)`. Confirmed sound, against attack: the
+single-connection handoff on every path (including the Scan-error return), all
+four `ensureColumnAdded` call sites being free of a live Tx/Rows, rollback on a
+failed `addColumnLocked`, the false-fail surface (nonexistent table, empty DB,
+`findings_m5` recovery, `quoteSQLiteIdentifier` ≡ `quoteIdentifier`), and that
+the retained wrappers are not a trap — test 4 pins their collapse, so AIRA-74
+deleting them fails to compile rather than drifting silently.
+
+| finding | disposition |
+| --- | --- |
+| **P1, must-fix.** A test comment claimed the `(bool, error)` signatures "make dropping the error a compile error" — false (`orphan, _ :=` compiles; it is the very mutation that failed the plan gate), and a maintainer believing it would delete test 4b as redundant. | **Fixed.** The comment now says the opposite and names test 4b as load-bearing. |
+| P2. The racer tests re-check on the *winner's* connection, whose schema cache is fresh; the real loser's is stale. | **Fixed.** Test 8, the two-handle stale-cache version, mutation-verified. |
+| P2. Three claims lacked tests: the read-only fast path, and `Scan`/`rows.Err()` propagation in two probes. | Fast path **now tested** (test 7, added for Sol's overlapping finding). The two propagation gaps are **recorded** at their sites and above. |
+| P2. `outbox_resolution_test.go` still told the reader Finding 1b "belongs to AIRA-97". | **Fixed.** It now records AIRA-97's disposition and hands 1b to AIRA-74 explicitly. |
+| P2. Branch hygiene: uncommitted edit, one commit behind `origin/master`, ticket still `planned`. | **Fixed** before merge: rebased, committed, ticket transitioned. |

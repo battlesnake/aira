@@ -246,11 +246,17 @@ func TestMigrationReCheckMakesTheLosingRacerANoOp(t *testing.T) {
 // pure no-op — still failed 2 of 40 runs with the same `search_fts already
 // exists`. That is ensureSearchFTS's unguarded check-then-CREATE: the same
 // two-process race AIRA-97 Finding 1 records for ensureOutboxKind, at a site
-// AIRA-97 did not name, and it is recorded there now. The `E_DB_BUSY` mode
-// appeared only with the migration present (2/40 vs 0/40), which is AIRA-97's
-// busy-timeout note. Both belong to AIRA-97, and neither is provable by a
-// probabilistic race test: whoever closes AIRA-97 should add a deterministic
-// guard shaped like TestMigrationReCheckMakesTheLosingRacerANoOp.
+// AIRA-97 did not name, and it is recorded there now (Finding 1b). The
+// `E_DB_BUSY` mode appeared only with the migration present (2/40 vs 0/40),
+// which is AIRA-97's busy-timeout note.
+//
+// Disposition, now that AIRA-97 has closed: ensureOutboxKind and
+// ensureAreaHintsGeneration are fixed and guarded deterministically in
+// migration_guard_test.go, in the shape this note asked for. Finding 1b
+// (ensureSearchFTS) was deliberately NOT taken there — it is owned by AIRA-74,
+// which is rewriting that function — so it is the one piece of this note still
+// outstanding, and it belongs to AIRA-74 now, not AIRA-97. The busy-timeout
+// note is explicitly deferred with its cost written down in AIRA-97's plan.
 
 // TestConflictedIntentHasNoRetirePath is the committed, executable evidence
 // for the half of AIRA-73 this change does NOT close.

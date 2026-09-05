@@ -207,6 +207,116 @@ func TestGuardedColumnAddIsIdempotentAcrossOpens(t *testing.T) {
 	}
 }
 
+// TestLosingRacerWithAStaleSchemaCacheStillNoOps raises the fidelity of the two
+// tests above, which re-check on the WINNER's own connection — whose schema
+// cache is trivially fresh, so they cannot fail if the re-check were reading a
+// cached schema rather than the current one.
+//
+// The real loser is a different process whose connection read the table BEFORE
+// the winner's ALTER, so it holds a stale schema cache. Its no-op therefore
+// rests on SQLite re-verifying the schema cookie when it takes the write lock.
+// This reproduces that exactly, with two handles on one file and no goroutines:
+// B populates a stale cache, A migrates, then B runs the write half.
+//
+// Raised by build review. Without it, a driver or SQLite regression that served
+// the re-check from a stale cache would go unnoticed — and would resurrect the
+// production `duplicate column name` failure this ticket exists to remove.
+func TestLosingRacerWithAStaleSchemaCacheStillNoOps(t *testing.T) {
+	base := t.TempDir()
+	path := filepath.Join(base, "state.db")
+	writeLegacyPreColumnDatabase(t, path)
+
+	// B, the eventual loser, reads the pre-migration schema first.
+	loser, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loser.Close()
+	loser.SetMaxOpenConns(1)
+	ctx := context.Background()
+	present, err := tableHasColumn(ctx, loser, "outbox", "kind")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if present {
+		t.Fatal("the seed database already carries outbox.kind; this test would prove nothing")
+	}
+
+	// A, the winner, migrates the same file underneath it.
+	winner, err := OpenDB(path, filepath.Join(base, "registry.jsonl"))
+	if err != nil {
+		t.Fatalf("the winning opener must migrate the database: %v", err)
+	}
+	defer winner.Close()
+
+	// B now executes exactly what the losing racer executes, on its stale
+	// connection. It must find the column present and write nothing.
+	s := &Store{db: loser}
+	if err := s.withImmediate(ctx, func(conn *sql.Conn) error {
+		return addColumnLocked(ctx, conn, "outbox", "kind",
+			`ALTER TABLE outbox ADD COLUMN kind TEXT NOT NULL DEFAULT 'ticket-file'`)
+	}); err != nil {
+		t.Fatalf("the losing racer with a stale schema cache must be a no-op, got: %v", err)
+	}
+	if got := countColumn(t, loser, "outbox", "kind"); got != 1 {
+		t.Fatalf("outbox.kind present %d times after the stale-cache loser ran, want 1", got)
+	}
+}
+
+// TestEnsureColumnAddedTakesTheWriteLockThenTheFastPath tests the PRODUCTION
+// entry point, not just its write half.
+//
+// The racer tests above supply their own withImmediate, so on their own they
+// would still pass if ensureColumnAdded stopped wrapping addColumnLocked in a
+// transaction at all — the guarantee the whole ticket is about. Found by build
+// review, which removed the wrapper and watched every other test stay green.
+//
+// The observation is deterministic, not timed: withImmediate calls the
+// beforeCommit seam immediately before COMMIT, so the seam firing IS the
+// transaction. Requiring it to fire on the migrating call and NOT to fire on
+// the second call pins both halves at once — the write lock is taken when
+// there is work, and the already-migrated fast path takes no lock.
+//
+// The proof rests on withImmediate being beforeCommit's ONLY caller. If a
+// second caller is ever added, this test stops proving that a transaction was
+// used and must be re-grounded on a different observation.
+func TestEnsureColumnAddedTakesTheWriteLockThenTheFastPath(t *testing.T) {
+	base := t.TempDir()
+	path := filepath.Join(base, "state.db")
+	writeLegacyPreColumnDatabase(t, path)
+
+	// A raw pool, deliberately NOT OpenDB: OpenDB would run the migration
+	// itself and there would be no work left for the call under test.
+	pool, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	pool.SetMaxOpenConns(1) // as openOnce pins it
+
+	commits := 0
+	s := &Store{db: pool, beforeCommit: func() { commits++ }}
+	ctx := context.Background()
+	ddl := `ALTER TABLE outbox ADD COLUMN kind TEXT NOT NULL DEFAULT 'ticket-file'`
+
+	if err := s.ensureColumnAdded(ctx, "outbox", "kind", ddl); err != nil {
+		t.Fatalf("migrating call: %v", err)
+	}
+	if commits != 1 {
+		t.Fatalf("the migrating call committed %d transactions, want exactly 1 — it must do the ALTER under BEGIN IMMEDIATE, not unlocked on the pool", commits)
+	}
+	if got := countColumn(t, pool, "outbox", "kind"); got != 1 {
+		t.Fatalf("after the migrating call, outbox.kind present %d times, want 1", got)
+	}
+
+	if err := s.ensureColumnAdded(ctx, "outbox", "kind", ddl); err != nil {
+		t.Fatalf("already-migrated call: %v", err)
+	}
+	if commits != 1 {
+		t.Fatalf("the already-migrated call opened a write transaction (commits=%d, want still 1); the read-only fast path is gone and every Open would now take the write lock", commits)
+	}
+}
+
 // unanswerableConn satisfies schemaConn but cannot answer a read: every query
 // fails, while writes succeed and are recorded. That asymmetry is the point.
 // A closed *sql.DB cannot serve here — its writes fail too, so a test built on
@@ -349,8 +459,17 @@ func TestGuardedMigrationFailsClosedWhenTheProbeCannotBeAnswered(t *testing.T) {
 // errored would satisfy the first half alone.
 //
 // The compositions built on them (findingsSchemaCurrent,
-// allocationKindSchemaCurrent) need no separate error test: their (bool, error)
-// signatures make dropping the error a compile error, not a runtime one.
+// allocationKindSchemaCurrent) DO need their own error test, and have one:
+// `orphan, _ := tableExists(…)` compiles perfectly well, which is exactly the
+// mutation the plan gate failed v1 on. See
+// TestCompositeSchemaChecksPropagateAnUnansweredProbe — it is not redundant
+// with this test, and must not be deleted as such.
+//
+// Not covered here, recorded rather than left silent: every failing querier
+// fails at QueryContext, so the Scan and rows.Err() propagation inside
+// tableHasColumn and findingsHasCompositePrimaryKey is untested — reverting
+// either to the old skip-the-row form stays green. Injecting a row that Scan
+// rejects needs a fake SQL driver; see the note on tableHasColumn.
 func TestSchemaProbesFailClosedAndAnswerBothDirections(t *testing.T) {
 	ctx := context.Background()
 	conn := newUnanswerableConn()
@@ -399,6 +518,30 @@ func TestSchemaProbesFailClosedAndAnswerBothDirections(t *testing.T) {
 		if got != probe.want {
 			t.Fatalf("%s = %v, want %v", probe.name, got, probe.want)
 		}
+	}
+
+	// The composite-primary-key probe's FALSE direction needs a legacy-shaped
+	// findings table, which the current schema cannot supply. Without this, a
+	// probe hardcoded to report "composite" would satisfy every case above.
+	legacyPath := filepath.Join(t.TempDir(), "legacy.db")
+	legacy, err := sql.Open("sqlite", legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacy.Close()
+	if _, err := legacy.Exec(`CREATE TABLE findings (
+		project_id TEXT NOT NULL, worktree_id TEXT NOT NULL DEFAULT '',
+		finding_key TEXT NOT NULL, created_at TEXT NOT NULL,
+		PRIMARY KEY(project_id)
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	composite, err := findingsHasCompositePrimaryKey(ctx, legacy)
+	if err != nil {
+		t.Fatalf("probe a legacy findings table: %v", err)
+	}
+	if composite {
+		t.Fatal("findingsHasCompositePrimaryKey reported a composite key for a single-column primary key")
 	}
 }
 

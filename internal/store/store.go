@@ -1228,7 +1228,11 @@ func (s *Store) ensureOutboxKind(ctx context.Context) error {
 }
 
 // ensureColumnAdded is the guarded form of "add this column if it is absent",
-// and is the only way this package should reach an ALTER TABLE ... ADD COLUMN.
+// and is how a standalone column addition should be made here. (The two
+// multi-statement migrations, ensureAllocationKind and ensureFindingsSchema,
+// still issue their own ALTERs, because their columns must land atomically with
+// other work in one transaction. Their locking is AIRA-97's documented
+// deferral, not an exemption from this pattern.)
 //
 // Several processes Open this one machine-wide database at once (the daemon,
 // the CLI fallback through app.OpenWithDiagnostics, a detached supervisor), so
@@ -1449,6 +1453,17 @@ type schemaConn interface {
 // pool for that connection — would block forever rather than fail (the caller
 // there is OpenDB's context.Background()). It is what the explicit rows.Close()
 // in the pre-AIRA-97 ensureAreaHintsGeneration was defending.
+//
+// ACCEPTED COVERAGE GAP (AIRA-97, recorded rather than left silent). The gap is
+// PROPAGATION, not leakage: the `defer rows.Close()` below is unconditional, so
+// no return path can skip it and the invariant above holds structurally. What
+// is untested is the Scan-error and rows.Err() returns themselves — every
+// failing querier in the tests fails at QueryContext, so reverting these to the
+// old skip-the-row form stays green. The same gap covers
+// findingsHasCompositePrimaryKey and tableExists's rows.Err()/Close path.
+// Closing it deterministically needs a registered fake driver whose Rows.Next
+// errors after the first row: more machinery than these three returns are
+// worth, but it is the thing to build if that ever changes.
 func tableHasColumn(ctx context.Context, db schemaQuerier, table, wanted string) (bool, error) {
 	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+quoteIdentifier(table)+`)`)
 	if err != nil {
@@ -1606,15 +1621,27 @@ func (s *Store) ensureFindingsSchema(ctx context.Context) error {
 	// rebuilds the findings table, and selecting a destructive rebuild because a
 	// PRAGMA could not be read is the worst form of AIRA-97 Finding 2.
 	//
-	// ACCEPTED COVERAGE GAP (AIRA-97, recorded rather than left silent). These
-	// two probes run on the *sql.Tx that this function itself begins, so there
-	// is no seam to fail one probe and not the writes; a mutation that dropped
-	// these errors (`composite, _ := …`) would compile and no test would fail.
-	// What IS covered: findingsHasCompositePrimaryKey and tableExists are each
-	// shown to surface an unanswerable probe (migration_guard_test.go), and
-	// findingsSchemaCurrent's identical composition is shown to propagate
-	// through its schemaQuerier seam. Closing the gap here needs the deferred-
-	// to-immediate restructuring this ticket explicitly deferred.
+	// ACCEPTED COVERAGE GAP (AIRA-97, recorded rather than left silent; widened
+	// from two probes to five by build review, which was right that the first
+	// wording understated it). FIVE probes run on a *sql.Tx that their own
+	// function begins — the three here (column, composite-PK, findings_m5) and
+	// the two in ensureAllocationKind — so there is no seam to fail a probe
+	// without failing the writes, and a mutation that dropped any of those five
+	// errors (`composite, _ := …`) would compile with no test failing. The
+	// stakes are NOT uniform, and saying so is the point of writing it down:
+	// only the composite-PK selector immediately below fails SILENT and
+	// DESTRUCTIVE (a collapsed error picks the DROP-and-rebuild branch). The
+	// other four fail loud — a duplicate-column ALTER, or an INSERT from a
+	// table that is not there — which is why the seam is worth building for
+	// this one first if the gap is ever closed piecemeal.
+	// What IS covered: tableHasColumn, tableExists and
+	// findingsHasCompositePrimaryKey are each shown to surface an unanswerable
+	// probe, and the identical compositions in findingsSchemaCurrent and
+	// allocationKindSchemaCurrent are shown to propagate through their
+	// schemaQuerier seam (migration_guard_test.go). Closing it needs either the
+	// deferred-to-immediate restructuring this ticket defers, or lifting each
+	// transaction body behind schemaConn so a read can be failed while writes
+	// still work — both larger than this change.
 	composite, err := findingsHasCompositePrimaryKey(ctx, tx)
 	if err != nil {
 		return translateDBError(err)
@@ -1683,6 +1710,9 @@ func (s *Store) runFindingsMigrationHook(statement string) error {
 // tableHasColumn, and more urgently: ensureFindingsSchema uses its answer to
 // choose between "adopt the existing table" and "DROP and rebuild it", so a
 // collapsed error would pick a destructive branch on an unanswered question.
+//
+// Its Scan/rows.Err() propagation carries the same accepted coverage gap as
+// tableHasColumn's, for the same reason and with the same structural defence.
 func findingsHasCompositePrimaryKey(ctx context.Context, db schemaQuerier) (bool, error) {
 	rows, err := db.QueryContext(ctx, `PRAGMA table_info(findings)`)
 	if err != nil {
