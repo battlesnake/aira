@@ -1565,7 +1565,23 @@ func monitorScopeMembership(scope Scope, leader PIDIdentity, initialMembers []in
 		}
 
 		if _, present := memberNow[leader.PID]; !present && processLive(leader) == processAlive {
-			summary.LeaderMigrated = true
+			// Absence from the scope's own cgroup.procs is not itself a
+			// migration: the leader may have relocated ITSELF into a
+			// descendant cgroup it created (aitest's supervisor moving into
+			// `outer/.aira-supervisor` before forking per-worker sub-scopes,
+			// a podman --cgroups=split nested container, or any other
+			// legitimate nesting) and remain genuinely within the scope
+			// subtree the whole time. Apply the same subtree-aware witness
+			// the descendant loop below already uses instead of the leaf-only
+			// membership test.
+			observation := observeProcessCgroup(leader, scope.Reference())
+			if !observation.Readable {
+				summary.Gap = true
+			} else if witnessedEscape(scope.Reference(), &observation) {
+				summary.LeaderMigrated = true
+			}
+			// else: readable and under the scope -- correctly contained in a
+			// nested sub-scope, not a migration.
 		}
 		for observed := range everMembers {
 			live := processLive(observed)

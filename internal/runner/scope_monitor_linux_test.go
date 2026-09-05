@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -94,6 +95,122 @@ func TestScopeMembershipSamplerIsRateLimited(t *testing.T) {
 	}
 	if summary.LeaderMigrated || summary.Gap || summary.Escape != nil {
 		t.Fatalf("in-scope leader and descendant produced a non-clean summary: %+v", summary)
+	}
+}
+
+// referencePathScope wraps confineFakeScope with an explicit Reference(),
+// rather than confineFakeScope's fixed "/fake/scope", so a test can point the
+// scope at a path under the real cgroup-v2 mount and check a mocked
+// /proc/<pid>/cgroup observation against it with pathEqualOrUnder.
+type referencePathScope struct {
+	confineFakeScope
+	ref string
+}
+
+func (s *referencePathScope) Reference() string { return s.ref }
+
+// AIRA-34 regression: a leader that relocates ITSELF into a descendant cgroup
+// it created (aitest's supervisor moving into `outer/.aira-supervisor` before
+// forking per-worker sub-scopes, a podman --cgroups=split nested container, or
+// any other legitimate nesting) is absent from the scope's own cgroup.procs
+// while remaining genuinely within the scope subtree. The leaf-only presence
+// test used to call this a migration; monitorScopeMembership must instead
+// apply the same subtree-aware witness the descendant loop already uses and
+// report it as contained.
+func TestScopeMembershipLeaderRelocatesIntoNestedSubScopeIsNotMigrated(t *testing.T) {
+	oldBoot, oldStat, oldCgroup := readBootIDFn, readProcStatFn, readProcCgroupFn
+	t.Cleanup(func() { readBootIDFn, readProcStatFn, readProcCgroupFn = oldBoot, oldStat, oldCgroup })
+	mount, err := unifiedMount()
+	if err != nil {
+		t.Skip(err)
+	}
+	scopePath := filepath.Join(mount, "aira34-leader-nested-scope")
+	leader := PIDIdentity{PID: 9101, StartTick: 4242, BootID: "boot"}
+	readBootIDFn = func() (string, error) { return "boot", nil }
+	readProcStatFn = func(int) ([]byte, error) { return procStatForTest('S', leader.StartTick), nil }
+	readProcCgroupFn = func(int) ([]byte, error) {
+		return []byte("0::/aira34-leader-nested-scope/nested\n"), nil
+	}
+	scope := &referencePathScope{ref: scopePath}
+	stop := make(chan struct{})
+	result := make(chan scopeMonitorResult, 1)
+	// initialMembers is empty: the leader has already relocated itself into the
+	// nested sub-scope by the time this sample runs, mirroring the aitest
+	// supervisor's self-relocation ahead of the runner's membership poll.
+	go monitorScopeMembership(scope, leader, []int{}, stop, result)
+	close(stop)
+	summary := <-result
+	if summary.LeaderMigrated {
+		t.Fatalf("leader relocated into its own nested sub-scope reported migrated: %+v", summary)
+	}
+	if summary.Gap {
+		t.Fatalf("leader relocated into a readable nested sub-scope produced a spurious gap: %+v", summary)
+	}
+	if summary.Escape != nil {
+		t.Fatalf("leader's own relocation was recorded as a descendant escape: %+v", summary)
+	}
+}
+
+// AIRA-34 regression, the other direction: a leader that genuinely leaves the
+// scope subtree entirely (not into a descendant of its own scope) must still
+// be witnessed as a migration. This mutation-verifies the escape-detection
+// guard (pathEqualOrUnder via witnessedEscape) still fires once the leaf-only
+// test is replaced with the subtree-aware one.
+func TestScopeMembershipLeaderRelocatesOutOfScopeIsStillMigrated(t *testing.T) {
+	oldBoot, oldStat, oldCgroup := readBootIDFn, readProcStatFn, readProcCgroupFn
+	t.Cleanup(func() { readBootIDFn, readProcStatFn, readProcCgroupFn = oldBoot, oldStat, oldCgroup })
+	mount, err := unifiedMount()
+	if err != nil {
+		t.Skip(err)
+	}
+	scopePath := filepath.Join(mount, "aira34-leader-nested-scope")
+	leader := PIDIdentity{PID: 9102, StartTick: 4343, BootID: "boot"}
+	readBootIDFn = func() (string, error) { return "boot", nil }
+	readProcStatFn = func(int) ([]byte, error) { return procStatForTest('S', leader.StartTick), nil }
+	readProcCgroupFn = func(int) ([]byte, error) {
+		// A sibling that shares the scope's directory name as a STRING PREFIX
+		// (not a path component) mutation-tests that containment is decided by
+		// pathEqualOrUnder's component-wise filepath.Rel, not a naive
+		// strings.HasPrefix that a regression could substitute.
+		return []byte("0::/aira34-leader-nested-scope-sibling\n"), nil
+	}
+	scope := &referencePathScope{ref: scopePath}
+	stop := make(chan struct{})
+	result := make(chan scopeMonitorResult, 1)
+	go monitorScopeMembership(scope, leader, []int{}, stop, result)
+	close(stop)
+	summary := <-result
+	if !summary.LeaderMigrated {
+		t.Fatalf("leader relocated entirely outside the scope tree was not reported migrated: %+v", summary)
+	}
+}
+
+// A leader absent from the scope whose /proc/<pid>/cgroup cannot be read is
+// neither provably contained nor provably escaped: it must be a residual gap,
+// never a false migration claim.
+func TestScopeMembershipLeaderAbsentWithUnreadableCgroupIsGapNotMigrated(t *testing.T) {
+	oldBoot, oldStat, oldCgroup := readBootIDFn, readProcStatFn, readProcCgroupFn
+	t.Cleanup(func() { readBootIDFn, readProcStatFn, readProcCgroupFn = oldBoot, oldStat, oldCgroup })
+	mount, err := unifiedMount()
+	if err != nil {
+		t.Skip(err)
+	}
+	scopePath := filepath.Join(mount, "aira34-leader-nested-scope")
+	leader := PIDIdentity{PID: 9103, StartTick: 4444, BootID: "boot"}
+	readBootIDFn = func() (string, error) { return "boot", nil }
+	readProcStatFn = func(int) ([]byte, error) { return procStatForTest('S', leader.StartTick), nil }
+	readProcCgroupFn = func(int) ([]byte, error) { return nil, errors.New("hidepid") }
+	scope := &referencePathScope{ref: scopePath}
+	stop := make(chan struct{})
+	result := make(chan scopeMonitorResult, 1)
+	go monitorScopeMembership(scope, leader, []int{}, stop, result)
+	close(stop)
+	summary := <-result
+	if summary.LeaderMigrated {
+		t.Fatalf("unreadable leader cgroup was falsely reported migrated: %+v", summary)
+	}
+	if !summary.Gap {
+		t.Fatalf("unreadable leader cgroup did not record a gap: %+v", summary)
 	}
 }
 
