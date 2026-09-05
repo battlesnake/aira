@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-64","project":"aira","title":"aitest per-worker RAM containment holds under contention, but heavy tests can spuriously hit their own pytest-timeout","status":"planned","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["aitest","dogfood","scheduler"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-64","project":"aira","title":"aitest per-worker RAM containment holds under contention, but heavy tests can spuriously hit their own pytest-timeout","status":"done","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["aitest","dogfood","scheduler"],"hold":false,"relations":[]}
 ---
 ## Finding (live data, reported by peer session `split`, fastest-ee project)
 
@@ -176,3 +176,24 @@ owner tick. **This work resolves that uncertainty in the direction of deletion:*
   itself. There is **no non-pytest client**.
 
 Retiring `governor.go` remains AIRA-33's own work and its own review.
+
+### Merged and deployed (2026-09-05, coordinator)
+
+PR #42 (`50a5b62`) reviewed directly against the diff (not just this report)
+before merging — spot-checked `cpuslots.go`/`cpuslots_gate.go`'s fail-safe
+directions (RAM fails closed, CPU fails open, each independently justified),
+the lock-ordering discipline (`outer-scope -> gate`, never reversed, with the
+reasoning for why), and the supervisor-side regrowth probe's placement
+(every dispatch-loop iteration, not just the idle branch, with the reasoning
+for why a sub-second test suite would otherwise starve it). Confirmed no live
+process was still pushing to the branch immediately before merging (the
+squash-merge race class from AIRA-91/PR #35 earlier tonight). Squash-merged
+clean, no conflicts. `go build`/`go vet` clean on the merged master.
+
+Deployed: binary rebuilt from merged master, atomically swapped into
+`~/.local/bin/aira` (`mv`, not `cp` — the running binary was in use by a
+concurrent job, `cp` correctly refused with `ETXTBSY` rather than corrupting
+it; a first restart attempt before noticing this ran the OLD binary
+pointlessly, caught by comparing sha256 before trusting the restart), daemon
+restarted cleanly. Two in-flight confine jobs continued running through the
+restart undisturbed.
