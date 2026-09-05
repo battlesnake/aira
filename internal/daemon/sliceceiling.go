@@ -472,9 +472,13 @@ func evaluateSliceCeiling(mode sliceCeilingMode, state *sliceCeilingState, deps 
 		// A PARTIAL window must publish nothing. max() over one sample would
 		// lower the ceiling immediately at startup and after every expiry,
 		// silently voiding the "lowering needs a full window" rule.
+		// No Ceiling and no Basis -- nothing is published, so nothing may be
+		// attributed -- but the readings that WERE established are reported as the
+		// facts they are, exactly as this snapshot already does for MemAvailable.
 		return publishSliceCeiling(mode, state, deps, sliceCeilingSnapshot{
 			Mode: mode, SlicePath: path, State: sliceCeilingUnevaluated,
-			Reason: "warming up", StaticMax: maximum, MemAvailable: available, At: now,
+			Reason: "warming up", StaticMax: maximum, MemAvailable: available,
+			SliceAnon: sliceCeilingAnon(current, reclaimable), At: now,
 		})
 	}
 

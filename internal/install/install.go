@@ -341,8 +341,10 @@ func validDaemonMode(value string) bool {
 // reportDaemonMode prints one daemon subsystem's mode, preferring the LIVE
 // process environment and falling back to what the unit file declares — marked
 // as declared, because a unit edited since the daemon started declares something
-// the running process is not doing. Neither available is reported as
-// unevaluated, never as a mode.
+// the running process is not doing. Neither available reports UNEVALUATED, never
+// a mode, and the two ways of being unevaluated are distinguished: a systemctl
+// failure is not the same fact as a unit that simply does not declare the
+// variable (an older managed unit, in which the daemon takes its own default).
 func reportDaemonMode(d installDeps, label, variable, liveEnvironment string, liveErr error, unitContent string) {
 	mode := ""
 	if liveErr == nil {
@@ -359,11 +361,14 @@ func reportDaemonMode(d installDeps, label, variable, liveEnvironment string, li
 			}
 		}
 	}
-	if mode == "" {
+	switch {
+	case mode != "":
+		d.logf("%s: %s", label, mode)
+	case liveErr != nil:
 		d.logf("%s: unevaluated (%v)", label, liveErr)
-		return
+	default:
+		d.logf("%s: unevaluated (%s is not set by the unit or the live process)", label, variable)
 	}
-	d.logf("%s: %s", label, mode)
 }
 
 // resolveDaemonModes decides the daemon subsystem settings the unit will be
