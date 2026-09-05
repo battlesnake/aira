@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-87","project":"aira","title":"The ExitCodes catalogue can drift from the codes actually produced, with nothing testing either direction","status":"planned","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["codes","honesty","layering","store"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-87","project":"aira","title":"The ExitCodes catalogue can drift from the codes actually produced, with nothing testing either direction","status":"done","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["codes","honesty","layering","store"],"hold":false,"relations":[]}
 ---
 PR #12 finding **B9** / plan candidate **75**, filed by the simplification programme's Phase 0
 (plan §4.3). Source-verified against master `22cedd6`.
@@ -38,3 +38,27 @@ an already-identified instance of the second direction: catalogued, never emitte
 same area — the new produced/catalogued test must not encode the bucketing AIRA-45 changes.
 Scheduled in the programme's Phase 5c (layering moves, done last because they touch package
 boundaries every other phase edits inside).
+
+## Resolution
+
+Built as PR #41 (`588aeea`). `ExitCodes`/`ExitForCode` moved verbatim (171
+entries, zero key/value changed, diffed against the pre-move file) to a new
+leaf package `internal/codes`; ~140 call sites across 24 files rewritten.
+`internal/codes/produced_test.go` does a real `go/ast` scan in both
+directions, with per-code documented divergence tables rather than family
+wildcards, so new drift still fails the build. Found 48 real divergences the
+ticket's own snapshot didn't have (28 catalogued with zero behaviour change,
+13 produced-but-uncatalogued, 7 catalogued-but-never-produced) — including
+one genuine pre-existing honesty bug independent of this ticket:
+`U_RELATION_GRAPH_UNESTABLISHED` was exiting 1 (generic failure) instead of
+3 (unevaluated), now corrected. Independent Opus + DeepSeek-pro review
+(CONCERNS, no P0) found one real P1 — pinning `W_`⇒0 by convention without
+a structural guard meant a future `"W_X: ..."` error could exit 0 — fixed
+with `TestNoWarningCodeIsRaisedAsAnError`. 8-direction mutation testing, all
+caught.
+
+Residual findings, not actioned here, recorded as AIRA-99: the `store.
+ErrorCode`/`core.Do` structural gap behind that P1 (the test guards it, the
+code doesn't yet forbid it), a dead `E_GIT_` classification branch in
+`cmd/aira/tui_execute.go:467`, and the eleven re-bucketed `E_` exit codes
+whose correct value is a contract decision outside a layering PR's scope.
