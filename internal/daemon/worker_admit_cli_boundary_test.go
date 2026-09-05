@@ -137,6 +137,35 @@ func TestWorkerAdmitCLIOutcomeChannelMatchesTheSupervisorBoundary(t *testing.T) 
 			runner.WorkerAdmitReasonOuterScopeUnreadable)
 	})
 
+	// verifies: AIRA-64 §9.20 — a SPECULATIVE request (`--max-wait 0`) reaches
+	// the daemon and comes back CONTENDED.
+	//
+	// This is the real CLI-subprocess-against-a-real-daemon seam, deliberately
+	// not a unit test of the argument parser: the shipping defect was that only
+	// the CLI refused zero (the daemon's own validator has always accepted it),
+	// so any test that stubbed either side would have passed against it. The
+	// aitest supervisor classes `request-invalid` as WorkerAdmitTerminal and
+	// responds by draining its remaining queue to `unevaluated`, so every
+	// speculative pool-growth probe would have destroyed the run it was issued
+	// to help (Sol plan-review round 2, P0).
+	t.Run("a speculative zero max-wait is contended, never terminal", func(t *testing.T) {
+		started := time.Now()
+		stdout, stderr := runWorkerAdmit("/deny-timeout", workerAdmitEstimatedBytesMin, "0")
+		if elapsed := time.Since(started); testdeadline.Exceeded(elapsed, 5*time.Second) {
+			t.Fatalf("a zero max-wait took %v — it must evaluate once and answer, never poll", elapsed)
+		}
+		assertOutcome(t, stdout, stderr,
+			runner.WorkerAdmitStateTimeout, runner.WorkerAdmitClassContended,
+			runner.WorkerAdmitReasonSaturated)
+	})
+
+	t.Run("a negative max-wait is still refused", func(t *testing.T) {
+		stdout, stderr := runWorkerAdmit("/deny-timeout", workerAdmitEstimatedBytesMin, "-1s")
+		assertOutcome(t, stdout, stderr,
+			runner.WorkerAdmitStateArgumentInvalid, runner.WorkerAdmitClassRequestInvalid,
+			runner.WorkerAdmitReasonMaxWaitInvalid)
+	})
+
 	t.Run("a client argument mistake never reaches the daemon", func(t *testing.T) {
 		// The floor rejection happens pre-dial. Before AIRA-42 it produced
 		// only a rendered stderr error, which the supervisor could read

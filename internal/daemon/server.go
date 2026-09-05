@@ -93,6 +93,21 @@ type Server struct {
 	staleLeaseReleaseGrace       time.Duration
 	governor                     *governorSet
 
+	// AIRA-64. The CPU-concurrency gate: one machine-wide bound on how many
+	// aitest workers run at once, evaluated inside worker-admit. cpuSlotsGate
+	// is a 1-buffered channel rather than a sync.Mutex so a waiter can abandon
+	// it when its peer disconnects, the daemon stops, or the request declared
+	// itself speculative (max_wait_ms == 0) — the same abandonable shape
+	// acquireWorkerScope uses, and for the same reason.
+	cpuSlotsCapacity     int
+	cpuSlotsGrace        time.Duration
+	cpuSlotsScanInterval time.Duration
+	cpuSlotsGate         chan struct{}
+	cpuSlotsMu           sync.Mutex
+	cpuSlotsCache        map[string]cpuSlotsCacheEntry
+	cpuSlotsWarned       map[string]struct{}
+	cpuSlotsScan         func(string) (cpuSlotsSnapshot, error)
+
 	// Test seams. Production always calls the Store methods and DB.Close.
 	reapScope         func(context.Context, *store.Store) (int, error)
 	flushScopeFn      func(context.Context, *store.Store) (int, error)
@@ -166,6 +181,13 @@ func NewServer(paths Paths) *Server {
 		storeOpAppendTimeout:         30 * time.Second,
 		storeOpHeavyTimeout:          5 * time.Minute,
 		deadlines:                    defaultDeadlines,
+		cpuSlotsCapacity:             capacity,
+		cpuSlotsGrace:                cpuSlotsPlacementGrace(),
+		cpuSlotsScanInterval:         admitConfineScanIntervalDefault,
+		cpuSlotsGate:                 make(chan struct{}, 1),
+		cpuSlotsCache:                map[string]cpuSlotsCacheEntry{},
+		cpuSlotsWarned:               map[string]struct{}{},
+		cpuSlotsScan:                 scanSliceWorkerScopes,
 	}
 	server.governor = newGovernorSet(capacity, governorObserve, server)
 	server.projectCond = sync.NewCond(&server.mu)
@@ -270,6 +292,16 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		s.governor.mu.Unlock()
 		s.governor.signal()
 	}
+	if slotErr == nil {
+		// AIRA-64: the worker-admit CPU gate shares ONE capacity concept with
+		// the governor rather than inventing a second one. A malformed setting
+		// leaves NewServer's safe capacity-1 fallback in place and is reported
+		// by the same branch below.
+		s.cpuSlotsMu.Lock()
+		s.cpuSlotsCapacity = desiredSlots
+		s.cpuSlotsMu.Unlock()
+	}
+	s.cpuSlotsGrace = cpuSlotsPlacementGrace()
 	if slotErr != nil {
 		// NewServer installed the safe capacity-1 fallback, so this governor is
 		// still enforcing. Do not claim it was disabled.

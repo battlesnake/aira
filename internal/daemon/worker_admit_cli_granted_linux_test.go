@@ -242,6 +242,27 @@ func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 	if err != nil || grantedHigh <= 0 || grantedHigh >= request {
 		t.Fatalf("granted memory_high=%q (parse err %v), want a positive value below memory_max", fields["memory_high"], err)
 	}
+	// AIRA-64 §9.21: `cpu_slots` must survive EVERY hop — the daemon's response,
+	// runner.RequestWorkerAdmit's JSON unmarshal, the WorkerAdmitLease it builds,
+	// the CLI's WorkerAdmitGrantFields, and the rendered line. This is the only
+	// assertion in the tree that crosses all of them at once, and it was added
+	// because MUTATION TESTING proved the runner-client hop was uncovered: a
+	// mutant that dropped CPUSlots there survived the whole suite, which is
+	// precisely how a fail-open governance signal ships invisible.
+	//
+	// The EXACT value is pinned, not merely "one of the two". This fixture's
+	// outer scope is a `.aira-outer-test` directory, not a `.aira-CONFINE-*`
+	// child of a slice, so the honest verdict for it is `unevaluated` — and
+	// accepting either value let a mutant that hardcodes "ok" in the runner
+	// client survive (Sol build-review). Pinning it means the assertion fails
+	// if any hop stops carrying the daemon's real answer.
+	if got := fields["cpu_slots"]; got != runner.WorkerAdmitCPUSlotsUnevaluated {
+		t.Fatalf("granted cpu_slots=%q, want %q for a non-confine outer scope — either the "+
+			"CPU-governance state was dropped between the daemon and the rendered line "+
+			"(which makes a fail-open CPU gate invisible to the run it affects), or a hop "+
+			"is fabricating a value instead of carrying the daemon's", got,
+			runner.WorkerAdmitCPUSlotsUnevaluated)
+	}
 	// The line's placement coordinates must name a cgroup that really carries
 	// them. floorMemoryPage is what writeScopeMemoryCap itself verifies against,
 	// mirrored here in its exact bitmask form rather than imported (it is

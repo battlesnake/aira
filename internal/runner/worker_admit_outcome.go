@@ -148,6 +148,13 @@ const (
 	WorkerAdmitReasonWorkerScopeIDCollision    = "worker-scope-id-collision"
 	WorkerAdmitReasonAdmitSlotsSaturated       = "admit-slots-saturated"
 	WorkerAdmitReasonSaturated                 = "saturated"
+	// AIRA-64. cpu-slots-saturated is the machine-wide CPU-concurrency bound
+	// declining one more worker; admit-locks-busy is a SPECULATIVE request
+	// (max_wait_ms == 0) refusing to wait on a lock another job holds. Both are
+	// class=contended: retriable, containment preserved, never a verdict about
+	// the request or the daemon.
+	WorkerAdmitReasonCPUSlotsSaturated = "cpu-slots-saturated"
+	WorkerAdmitReasonAdmitLocksBusy    = "admit-locks-busy"
 
 	// Client-side (transport and response classification).
 	WorkerAdmitReasonDialFailed              = "dial-failed"
@@ -252,7 +259,21 @@ type WorkerAdmitGrantFields struct {
 	WorkerID   string
 	MemoryMax  int64
 	MemoryHigh int64
+	// CPUSlots (AIRA-64) is WorkerAdmitCPUSlotsOK or
+	// WorkerAdmitCPUSlotsUnevaluated, and is omitted from the line when empty.
+	// It answers one question the four fields above cannot: was this grant
+	// actually subject to the CPU-concurrency bound, or did that dimension
+	// fail open? A governance dimension whose fail-open is invisible to the
+	// run it affects is how a subsystem ships inert. Diagnostic only: nothing
+	// branches on it, and an absent token means "an older daemon", not "ok".
+	CPUSlots string
 }
+
+// The CPU-governance states carried by WorkerAdmitGrantFields.CPUSlots.
+const (
+	WorkerAdmitCPUSlotsOK          = "ok"
+	WorkerAdmitCPUSlotsUnevaluated = "unevaluated"
+)
 
 // WorkerAdmitOutcomeLine renders the single machine-readable line. grant must
 // be non-nil exactly when the outcome is granted; the function does not
@@ -291,6 +312,10 @@ func WorkerAdmitOutcomeLine(outcome WorkerAdmitOutcome, grant *WorkerAdmitGrantF
 		builder.WriteString(strconv.FormatInt(grant.MemoryMax, 10))
 		builder.WriteString(" memory_high=")
 		builder.WriteString(strconv.FormatInt(grant.MemoryHigh, 10))
+		if grant.CPUSlots != "" {
+			builder.WriteString(" cpu_slots=")
+			builder.WriteString(url.QueryEscape(grant.CPUSlots))
+		}
 	}
 	if outcome.Detail != "" {
 		builder.WriteString(" detail=")

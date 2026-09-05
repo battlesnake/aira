@@ -12,6 +12,7 @@ type WorkerAdmitLease struct {
 	ScopePath  string
 	MemoryMax  int64
 	MemoryHigh int64
+	CPUSlots   string
 }
 
 func (l *WorkerAdmitLease) Close() error { return nil }

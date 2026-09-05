@@ -60,9 +60,16 @@ func TestRunWorkerAdmitCommandAlwaysWritesOneStructuredOutcome(t *testing.T) {
 			wantReason: runner.WorkerAdmitReasonMaxWaitInvalid, wantCode: "E_CONFINE_ARGUMENT_INVALID",
 		},
 		{
-			name: "non-positive max wait",
+			// AIRA-64 CHANGED THIS CASE DELIBERATELY. It used to assert that
+			// "0s" was argument-invalid. Zero now means SPECULATIVE ("answer
+			// from what you can obtain without waiting") and only NEGATIVES are
+			// refused. The old contract was actively dangerous once the aitest
+			// supervisor started issuing speculative pool-growth probes:
+			// request-invalid is a WorkerAdmitTerminal, so every probe would
+			// have drained the run's remaining queue to `unevaluated`.
+			name: "negative max wait",
 			options: map[string]string{
-				"job-id": "j", "outer-scope": "/outer", "estimated-bytes": "400M", "max-wait": "0s",
+				"job-id": "j", "outer-scope": "/outer", "estimated-bytes": "400M", "max-wait": "-1s",
 			},
 			wantState: runner.WorkerAdmitStateArgumentInvalid, wantClass: runner.WorkerAdmitClassRequestInvalid,
 			wantReason: runner.WorkerAdmitReasonMaxWaitInvalid, wantCode: "E_CONFINE_ARGUMENT_INVALID",
@@ -82,6 +89,40 @@ func TestRunWorkerAdmitCommandAlwaysWritesOneStructuredOutcome(t *testing.T) {
 			}
 			if strings.TrimSpace(stderr.String()) == "" {
 				t.Fatal("a human diagnostic must still reach stderr")
+			}
+		})
+	}
+}
+
+// verifies: AIRA-64 §9.20 — `--max-wait 0` is a SPECULATIVE request, and the
+// CLI must accept it.
+//
+// This asserts through the REAL argument parser rather than by mocking the
+// caller's arguments, and that distinction is the whole point: the shipping
+// defect was that only this layer refused zero (the daemon's own
+// validateWorkerAdmitArgs has always accepted it), so any test that stubbed the
+// CLI would have passed against the bug. It is refused as
+// argument-invalid/request-invalid, which the aitest supervisor classes as
+// WorkerAdmitTerminal and responds to by draining its remaining queue to
+// `unevaluated` — so every speculative pool-growth probe would have destroyed
+// the run it was issued to help (Sol plan-review round 2, P0).
+//
+// With no daemon reachable the outcome here is necessarily a non-grant; what is
+// asserted is that it is NOT the max-wait argument rejection.
+func TestRunWorkerAdmitCommandAcceptsZeroMaxWaitAsSpeculative(t *testing.T) {
+	for _, raw := range []string{"0s", "0"} {
+		t.Run(raw, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			runWorkerAdmitCommand(context.Background(), map[string]string{
+				"job-id": "j", "outer-scope": "/outer", "estimated-bytes": "400M", "max-wait": raw,
+			}, strings.NewReader(""), &stdout, &stderr)
+			fields := parseOnlyOutcomeLine(t, stdout.String())
+			if fields["reason"] == runner.WorkerAdmitReasonMaxWaitInvalid {
+				t.Fatalf("--max-wait %s must be accepted as speculative, not refused: %v", raw, fields)
+			}
+			if fields["class"] == runner.WorkerAdmitClassRequestInvalid {
+				t.Fatalf("--max-wait %s must never yield the TERMINAL request-invalid class "+
+					"(it drains the supervisor's queue to unevaluated): %v", raw, fields)
 			}
 		})
 	}

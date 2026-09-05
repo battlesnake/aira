@@ -107,3 +107,72 @@ Not scoped or built yet — this ticket is being handed to a dedicated plan
 once the currently-running large structural-fix execution effort has
 enough bandwidth freed up. Given the direct owner escalation, this is now
 explicit next-priority work, not backlog-sweep-disposed-of chore work.
+
+## SCOPED AND BUILT (2026-09-05) — option 1
+
+Plan: `docs/superpowers/plans/2026-09-05-aira64-aitest-cpu-concurrency-plan.md`
+(v5; three adversarial plan-review rounds, two of them `BLOCK`).
+
+The ticket's **option 1** is built: a machine-wide CPU-concurrency bound folded
+into `worker-admit` as one more `class=contended` denial condition, with a
+kernel-derived live count, a liveness floor, and the client-side pool regrowth
+that stops the bound being a performance regression.
+
+**Options 2 and 3 are NOT built**, deliberately. Option 2 (load-scaled
+`PYTEST_TIMEOUT`) is folded into the plan's §8 owner-decision fork and left
+undecided; option 3 (serialising gates) is refused in §5f.
+
+### Guarantee, stated exactly
+
+`live workers in a slice ≤ capacity + max(0, J - 1)`, where `capacity` is
+`NumCPU - AIRA_DAEMON_CPU_RESERVE` and `J` is the number of confine scopes
+holding ≥1 worker child — **provided at most one supervisor admits concurrently
+under each outer scope**. Two concurrent merge-gates on this 16-core box go from
+32 heavy workers to 16. It is explicitly NOT a claim that CPU is never
+oversubscribed (§4.6).
+
+### Coverage boundary — stated, not implied
+
+This governs **aitest worker processes in one slice**, and nothing else. Two
+observed classes of CPU load are structurally outside a worker-admission hook
+and are NOT fixed here (plan §4.12, from a field finding by peer session
+`split`):
+
+- **recipes that bypass aitest entirely** — e.g. fastest-ee's
+  `make test-lite-slowbuild` (`Makefile:350`) runs `uv run pytest -q` with the
+  lite project's own `-n auto`, never reaching `pytest_worker_flags.sh`. Observed
+  OOM-killed 3× under contention (confirmed `systemd-oomd` PSI kills, 0 test
+  failures). The routing gap is on the consumer project's side;
+- **build subprocesses inside test bodies** — `uv` wheel builds and
+  `docker build` spawns are not workers, are never admitted, and one admitted
+  worker can fan out into arbitrarily many of them while this gate counts it as
+  one.
+
+Governing arbitrary subprocess CPU is a different problem needing a different
+mechanism; `split` is filing it separately.
+
+### Owner decision still open
+
+**Should a wall-clock `pytest-timeout` failure observed under measured CPU
+starvation be reclassified `unevaluated` rather than `failed`?** Flagged, argued
+both ways, and NOT decided or defaulted — see the plan's §8. Nothing about
+timeout classification changes in this branch.
+
+### Finding for AIRA-33 (relayed, not acted on here)
+
+`2026-09-04-simplification-programme-plan.md` §4.1 candidate 4 grades
+`daemon/governor.go` + `cpuslots.go` **UNCERTAIN** specifically because
+"AIRA-64 is filed as input to the next scheduler milestone", and asks for an
+owner tick. **This work resolves that uncertainty in the direction of deletion:**
+
+- it uses `cpuslots.go`'s `desiredCPUSlots` capacity concept and the per-job
+  floor idea, so **`cpuslots.go` becomes KEEP** and now has a client that exists;
+- it uses **none** of `governor.go`'s park/active-set scheduler, checkpoint
+  protocol, or per-test RAM ordering (plan §5a explains why they are unusable
+  for a per-worker rather than per-test reservation model), so **`governor.go`
+  remains CUT-eligible**;
+- AIRA-33's required grep sweep was performed: the only non-test callers of
+  `governorSet` are `server.go:169/261-275/391/617-624` and `governor.go`
+  itself. There is **no non-pytest client**.
+
+Retiring `governor.go` remains AIRA-33's own work and its own review.
