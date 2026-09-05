@@ -19,7 +19,11 @@ type detachReadyMessage struct {
 	Error string `json:"error,omitempty"`
 }
 
-func (s *detachSignal) send(message detachReadyMessage) error {
+// send writes ONE readiness message and closes the channel. The payload is
+// `any` because two detach paths now share this signal: `run --detach` sends a
+// detachReadyMessage and `confine --detach` sends a confineDetachReady, which
+// carries the resolved slice and cap a confine launcher must report.
+func (s *detachSignal) send(message any) error {
 	if s == nil {
 		return errors.New("detach readiness channel is unavailable")
 	}

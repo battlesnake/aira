@@ -31,6 +31,20 @@ func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && os.Args[1] == "__supervise" && os.Getenv("AIRA_M20_FAKE_SUPERVISOR") != "" {
 		os.Exit(runM20FakeSupervisor())
 	}
+	// AIRA-22: the same test binary plays launcher and detached supervisor, so
+	// the detach tests exercise the real production launch path across a real
+	// process boundary. A fake supervisor mode stands in where a test must not
+	// touch cgroups; it still speaks the real wire protocol and uses the real
+	// record store.
+	if len(os.Args) > 1 && os.Args[1] == "__confine-supervise" {
+		if mode := os.Getenv(fakeSupervisorEnv); mode != "" {
+			os.Exit(runFakeConfineSupervisor(mode, os.Args[2:]))
+		}
+		os.Exit(runRealConfineSupervisor(os.Args[2:]))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "__confine-detach-launch" {
+		os.Exit(runConfineDetachLauncher())
+	}
 	os.Exit(m.Run())
 }
 

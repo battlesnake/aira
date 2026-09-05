@@ -162,26 +162,30 @@ const (
 // ConfineStatus keeps the independently verified cap, admission, placement,
 // OOM-group, and priority facets separate. In particular, a successful
 // admission never fabricates a cap snapshot or implies priority success.
+// The json tags exist for AIRA-22's durable detached-job record, which stores the
+// STRUCTURED status rather than the rendered trailer so that FormatConfineStatus
+// stays the single operator-facing projection and a detached job's trailer cannot
+// drift from a foreground one's.
 type ConfineStatus struct {
-	Slice                string
-	Cap                  ConfineCap
-	Admission            ConfineAdmission
-	AdmissionState       string
-	AdmissionWaitedMS    int64
-	CapBytes             int64
-	ReserveBytes         int64
-	Scope                ConfineScope
-	ScopeIntegrity       ScopeIntegrity
-	DescendantEscape     *DescendantEscapeEvidence
-	OOMGroup             ConfineOOMGroup
-	Priorities           ConfinePriorities
-	CPUWeight            ConfineCPUWeight
-	ScopeMemoryMax       int64
-	ScopeMemoryHigh      int64
-	ScopeMemoryBinding   string
-	ScopeMemoryEffective int64
-	ReserveBasis         string
-	PeakRSS              *int64
+	Slice                string                    `json:"slice,omitempty"`
+	Cap                  ConfineCap                `json:"cap,omitempty"`
+	Admission            ConfineAdmission          `json:"admission,omitempty"`
+	AdmissionState       string                    `json:"admission_state,omitempty"`
+	AdmissionWaitedMS    int64                     `json:"admission_waited_ms,omitempty"`
+	CapBytes             int64                     `json:"cap_bytes,omitempty"`
+	ReserveBytes         int64                     `json:"reserve_bytes,omitempty"`
+	Scope                ConfineScope              `json:"scope,omitempty"`
+	ScopeIntegrity       ScopeIntegrity            `json:"scope_integrity,omitempty"`
+	DescendantEscape     *DescendantEscapeEvidence `json:"descendant_escape,omitempty"`
+	OOMGroup             ConfineOOMGroup           `json:"oom_group,omitempty"`
+	Priorities           ConfinePriorities         `json:"priorities,omitempty"`
+	CPUWeight            ConfineCPUWeight          `json:"cpu_weight,omitempty"`
+	ScopeMemoryMax       int64                     `json:"scope_memory_max,omitempty"`
+	ScopeMemoryHigh      int64                     `json:"scope_memory_high,omitempty"`
+	ScopeMemoryBinding   string                    `json:"scope_memory_binding,omitempty"`
+	ScopeMemoryEffective int64                     `json:"scope_memory_effective,omitempty"`
+	ReserveBasis         string                    `json:"reserve_basis,omitempty"`
+	PeakRSS              *int64                    `json:"peak_rss,omitempty"`
 	// TerminatedBy is the terminal-attribution facet (AIRA-70, AIRA-91 Part A).
 	// Empty means the classifier never ran -- every launch that failed before
 	// the child was waited on -- and renders as "unevaluated", never as a claim
@@ -245,11 +249,63 @@ type ConfineRequest struct {
 	AdmissionMaxWait    time.Duration
 	PollInterval        time.Duration
 	HandshakeTimeout    time.Duration
-	Stdin               io.Reader
-	Stdout              io.Writer
-	Stderr              io.Writer
+	Stdin               io.Reader `json:"-"`
+	Stdout              io.Writer `json:"-"`
+	Stderr              io.Writer `json:"-"`
 	SelfPath            string
 	ResourceSignature   string
+	// DetachStateDir is the durable record-store root a detached launch writes
+	// under (AIRA-22). The runner never derives it: internal/runner must not
+	// import internal/daemon, so the CLI transcribes it exactly as it already
+	// transcribes RuntimeDir and AdmitSocketPath.
+	DetachStateDir string
+
+	// There is deliberately NO `Detach bool` here. admitConfine transcribes
+	// ConfineRequest fields onto a runner.Request, and Request.Detach arms
+	// checkDetachAdmission, which dereferences r.ledger -- nil in confine's
+	// project-less admitter. A detach flag on this struct would therefore be one
+	// careless transcription away from a panic inside the detached supervisor,
+	// where nothing would see it. Detachedness is carried by the ENTRY POINT
+	// (Confine versus LaunchConfineDetached), so the trap cannot exist.
+
+	// presetScopeID is the scope id a detached supervisor minted for ITSELF
+	// before calling Confine, so that the pid embedded in the cgroup directory
+	// name is the surviving supervisor's rather than the launcher's (AIRA-22
+	// §3.2). It is UNEXPORTED on purpose: only package runner may set it, and
+	// confineWithDeps additionally binds it to the request with
+	// bindConfineScopeID, because the scope-id grammar alone happily accepts an
+	// id naming a foreign pid, owner, or delegate class.
+	presetScopeID string
+
+	// BeforeAdmit is invoked exactly once, immediately before admission, i.e.
+	// after every precondition confine checks synchronously (argv, reserve,
+	// owner, slice resolution, backend probe, the finite-cap refusal, memory
+	// delegation, scope-id mint) and before the only unbounded wait there is.
+	// A non-nil error aborts the launch there: nothing has been admitted, no
+	// scope exists and no child has started, so there is nothing to tear down.
+	//
+	// It exists so a detached launcher can be told "every synchronous
+	// precondition passed" rather than being handed a premature exit 0 that
+	// hides a failure the foreground form reports immediately.
+	BeforeAdmit func(ConfineLaunchInfo) error `json:"-"`
+
+	// OnPlaced is invoked exactly once at the point placement is PROVEN -- the
+	// child is started and verified to be a member of the scope. It is the first
+	// instant at which "running" is a fact rather than a guess, which is why a
+	// detached job's status distinguishes `admitting` from `running` at all.
+	// There is no error return: nothing remains to abort.
+	OnPlaced func(ConfineLaunchInfo) `json:"-"`
+}
+
+// ConfineLaunchInfo is what the launch callbacks carry: resolved facts, never
+// requested ones. In particular Slice is the slice actually resolved (which may
+// be the whale.slice compatibility path, not what the caller typed) and CapBytes
+// is the effective ceiling read out of the cgroup ancestry.
+type ConfineLaunchInfo struct {
+	ScopeID       string `json:"scope_id"`
+	Slice         string `json:"slice"`
+	CapBytes      int64  `json:"cap_bytes"`
+	SupervisorPID int    `json:"supervisor_pid"`
 }
 
 const ConfineUnknownOwner = "unknown"
@@ -538,4 +594,105 @@ func parseConfineScopeID(scopeID string) (string, int, int64, string, bool) {
 // unambiguous even though names themselves may contain '-'.
 func IsDelegateRAMScopeID(scopeID string) bool {
 	return strings.HasPrefix(scopeID, "CONFINE-"+delegateRAMScopeIDMarker+"-")
+}
+
+// validateConfineName lives in the PORTABLE file, alongside the scope-id parser
+// and for the same reason: it is pure string validation over a value that
+// crosses process and daemon boundaries, and normalizeConfineIdentity (also
+// portable) is its only caller besides confineWithDeps.
+func validateConfineName(name string) error {
+	if name == "" {
+		return nil
+	}
+	if len(name) > 100 {
+		return errors.New("E_CONFINE_ARGUMENT_INVALID: --name is too long")
+	}
+	for _, r := range name {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("_.-", r) {
+			continue
+		}
+		return errors.New("E_CONFINE_ARGUMENT_INVALID: --name requires letters, digits, '.', '_', or '-'")
+	}
+	return nil
+}
+
+// normalizeConfineIdentity is the SINGLE place a confine request's name and
+// owner acquire their defaults and are validated. It exists because AIRA-22 gave
+// the scope id a second minting site (a detached supervisor mints its own,
+// before calling Confine), and two copies of "empty name means job, empty owner
+// means unknown" held together by a parity test is strictly weaker than one
+// copy called from both places: a shared normaliser cannot drift.
+//
+// verifies: AIRA-22
+func normalizeConfineIdentity(request ConfineRequest) (name, owner string, err error) {
+	name = request.Name
+	if err := validateConfineName(name); err != nil {
+		return "", "", err
+	}
+	if name == "" {
+		name = "job"
+	}
+	owner = request.Owner
+	if owner == "" {
+		owner = ConfineUnknownOwner
+	}
+	if err := ValidateConfineOwner(owner); err != nil {
+		return "", "", fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --owner: %w", err)
+	}
+	return name, owner, nil
+}
+
+// MintConfineScopeID produces the scope id a detached supervisor will run under,
+// using the SAME normalisation and the SAME minting function confineWithDeps
+// uses, so a supervisor can never mint an id its own launch would then refuse.
+// The embedded pid is this process's, which is the entire point: the cgroup
+// directory name is what `confine --kill <pid>`, `confine --list`'s
+// SupervisorPID column, and the orphan reaper's liveness predicate read, and for
+// a detached job the process that matters is the supervisor, not the launcher.
+//
+// covers: AIRA-22
+func MintConfineScopeID(request ConfineRequest) (string, error) {
+	name, owner, err := normalizeConfineIdentity(request)
+	if err != nil {
+		return "", err
+	}
+	return confineScopeID(name, owner, request.DelegateRAM), nil
+}
+
+// bindConfineScopeID refuses a pre-minted scope id that does not describe THIS
+// process running THIS request. Syntax is not enough and never was: the grammar
+// accepts any canonical pid, any valid owner, and either delegate class, so a
+// merely-parseable id can name a scope after a foreign supervisor. Each facet is
+// checked and named separately so a refusal says which one was wrong.
+//
+// Fail closed, never re-mint: silently minting a different id would put the job
+// in a scope directory the durable record does not name, which is precisely the
+// "the record and reality disagree" failure AIRA-22 exists to end.
+//
+// covers: AIRA-22
+func bindConfineScopeID(scopeID, name, owner string, delegateRAM bool) error {
+	embeddedName, pid, _, embeddedOwner, ok := parseConfineScopeID(scopeID)
+	if !ok {
+		return fmt.Errorf("scope id %q is malformed", scopeID)
+	}
+	if pid != os.Getpid() {
+		return fmt.Errorf("scope id %q names supervisor pid %d, not this process (%d)", scopeID, pid, os.Getpid())
+	}
+	if embeddedName != name {
+		return fmt.Errorf("scope id %q carries name %q, not %q", scopeID, embeddedName, name)
+	}
+	// An unknown owner is encoded as the ABSENCE of a suffix (AIRA-52), so the
+	// comparison is against that encoding rather than against the literal word.
+	wantOwner := owner
+	if wantOwner == ConfineUnknownOwner {
+		wantOwner = ""
+	}
+	if embeddedOwner != wantOwner {
+		return fmt.Errorf("scope id %q carries owner %q, not %q", scopeID, embeddedOwner, wantOwner)
+	}
+	if IsDelegateRAMScopeID(scopeID) != delegateRAM {
+		return fmt.Errorf("scope id %q is in the wrong delegate-ram class (id says %v, request says %v)",
+			scopeID, IsDelegateRAMScopeID(scopeID), delegateRAM)
+	}
+	return nil
 }

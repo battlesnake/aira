@@ -31,6 +31,14 @@ func main() { os.Exit(Run(os.Args[1:], os.Stdout, os.Stderr)) }
 
 var runConfined = runner.Confine
 var reserveConfined = runner.ConfineReserve
+
+// The AIRA-22 detached-confine seams, injectable for the same reason
+// runConfined is: the CLI's job is transcription and rendering, and its tests
+// must be able to prove the composition without launching real supervisors.
+var launchConfineDetached = runner.LaunchConfineDetached
+var superviseConfineDetached = runner.SuperviseConfineDetached
+var confineDetachStatusFor = runner.ConfineDetachStatusFor
+var confineDetachStatusList = runner.ConfineDetachStatusList
 var runInstaller = installcmd.Run
 var runSliceAnchor = installcmd.RunSliceAnchor
 
@@ -67,6 +75,9 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	}
 	if len(argv) > 0 && argv[0] == "__supervise" {
 		return runSupervisor(argv[1:], stderr)
+	}
+	if len(argv) > 0 && argv[0] == "__confine-supervise" {
+		return runConfineSupervisor(argv[1:])
 	}
 	if len(argv) > 0 && strings.ToLower(argv[0]) == "daemon" {
 		return runDaemonCommand(argv[1:], stdout, stderr)
@@ -152,10 +163,19 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		return render(response, true, stdout, stderr)
 	}
 	if verb == "confine" {
-		management := options["list"] == "true" || options["kill"] != ""
+		// AIRA-22: --status joins --list/--kill as a management form. Unlike those
+		// two it is answered LOCALLY rather than through the daemon: it reads a
+		// plain filesystem record, and routing it through the daemon would make the
+		// survivability verb depend on the component most likely to have been
+		// restarted during exactly the long pause it exists to survive.
+		status := options["status"] == "true"
+		management := options["list"] == "true" || options["kill"] != "" || status
 		if jsonOutput && !management {
 			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for confine", Exit: store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
 			return render(response, true, stdout, stderr)
+		}
+		if status {
+			return runConfineStatusCommand(context.Background(), options, jsonOutput, stdout, stderr)
 		}
 		if management {
 			return runConfineManagementCommand(context.Background(), options, jsonOutput, stdout, stderr, injected)
@@ -739,7 +759,7 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 			return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine options must precede the launch delimiter")
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "delegate-ram" {
+		if name == "delegate-ram" || name == "detach" {
 			if _, exists := options[name]; exists {
 				return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s may occur once", name)
 			}
@@ -911,11 +931,33 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s may occur once", name)
 		}
 		switch name {
+		case "detach":
+			// Targeted rather than falling through to the generic "requires exactly
+			// one of ..." message below: `--detach` is a LAUNCH option, and telling
+			// an operator who forgot the delimiter that they must pick a management
+			// verb sends them the wrong way entirely.
+			return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --detach requires a launch target after --, e.g. aira confine --detach --name gate -- make merge-gate")
 		case "list", "steal":
 			if hasInline {
 				return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s does not take a value", name)
 			}
 			options[name] = "true"
+		case "status":
+			// The selector is OPTIONAL: with one, `--status` reports that job; with
+			// none it lists the caller's own detached jobs, which is the natural
+			// companion to refusing an ambiguous name.
+			options["status"] = "true"
+			if hasInline {
+				if inline == "" {
+					return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: option --status requires a value when written as --status=<selector>")
+				}
+				options["status-selector"] = inline
+				continue
+			}
+			if i+1 < len(argv) && !strings.HasPrefix(argv[i+1], "--") {
+				i++
+				options["status-selector"] = argv[i]
+			}
 		case "kill", "slice", "owner":
 			value := inline
 			if !hasInline {
@@ -935,10 +977,17 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 	}
 	list := options["list"] == "true"
 	kill := options["kill"] != ""
-	if list == kill {
-		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine management requires exactly one of --list or --kill <selector>")
+	status := options["status"] == "true"
+	selected := 0
+	for _, chosen := range []bool{list, kill, status} {
+		if chosen {
+			selected++
+		}
 	}
-	if list && options["steal"] == "true" {
+	if selected != 1 {
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine management requires exactly one of --list, --kill <selector>, or --status [<selector>]")
+	}
+	if !kill && options["steal"] == "true" {
 		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --steal is valid only with --kill")
 	}
 	if owner := options["owner"]; owner != "" {
@@ -1016,12 +1065,167 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 	} else if stderr != nil {
 		_, _ = fmt.Fprintf(stderr, "confine: daemon paths unavailable; admission will use flock and CPU governor is disabled: %v\n", err)
 	}
+	if options["detach"] == "true" {
+		return runConfineDetachCommand(ctx, request, stdout, stderr)
+	}
 	result, err := runConfined(ctx, request)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return store.ExitForCode(store.ErrorCode(err))
 	}
 	return result.Exit
+}
+
+// runConfineDetachCommand launches a session-independent confine supervisor.
+//
+// Its exit code means "the supervisor started and every synchronous precondition
+// passed" — never "the job succeeded", which cannot be known yet. That is the
+// single largest false-pass risk in this verb, so the wording below states it
+// outright rather than leaving an automated caller to infer success from 0.
+func runConfineDetachCommand(ctx context.Context, request runner.ConfineRequest, stdout, stderr io.Writer) int {
+	if paths, err := daemon.PathsFromEnv(); err == nil {
+		request.DetachStateDir = paths.ConfineDetachDir
+	} else {
+		// Fail closed. A detached launch with nowhere durable to record its
+		// outcome would lose the very result the operator detached in order to
+		// keep, so it must never silently degrade to a foreground run.
+		_, _ = fmt.Fprintf(stderr, "%s: cannot resolve the durable record directory: %v\n", runner.CodeConfineDetachFailed, err)
+		return store.ExitForCode(runner.CodeConfineDetachFailed)
+	}
+	// A detached job's stdio belongs to its capture files, never to the launching
+	// terminal, which is about to go away.
+	request.Stdin, request.Stdout, request.Stderr = nil, nil, nil
+	launch, err := launchConfineDetached(ctx, request)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return store.ExitForCode(store.ErrorCode(err))
+	}
+	if launch == nil || launch.Acknowledge == nil {
+		// A launch with no acknowledgement channel cannot be confirmed, and an
+		// unconfirmed supervisor abandons the job — so reporting success here
+		// would be a fabricated one.
+		_, _ = fmt.Fprintf(stderr, "%s: the detached launch returned no acknowledgement channel\n", runner.CodeConfineDetachFailed)
+		return store.ExitForCode(runner.CodeConfineDetachFailed)
+	}
+	delivered := true
+	for _, line := range []string{
+		fmt.Sprintf("confine: detached scope %s on %s (supervisor pid %d)", launch.ScopeID, launch.Slice, launch.SupervisorPID),
+		"confine:   stdout " + launch.StdoutPath,
+		"confine:   stderr " + launch.StderrPath,
+		"confine:   record " + launch.RecordPath,
+		"confine: the job's exit code is NOT known yet — this exit 0 means the supervisor started, not that the job succeeded.",
+		"confine: poll it with: aira confine --status " + launch.ScopeID,
+	} {
+		if _, writeErr := fmt.Fprintln(stdout, line); writeErr != nil {
+			delivered = false
+			break
+		}
+	}
+	if ackErr := launch.Acknowledge(delivered); ackErr != nil || !delivered {
+		// The handle did not reach anyone, so the supervisor abandons the launch
+		// and this must not report success: a job nobody holds a handle to would
+		// consume the shared slice invisibly.
+		_, _ = fmt.Fprintf(stderr, "%s: the detached handle could not be delivered; the supervisor was told to abandon the launch\n", runner.CodeConfineDetachFailed)
+		return store.ExitForCode(runner.CodeConfineDetachFailed)
+	}
+	return 0
+}
+
+// runConfineStatusCommand answers `aira confine --status [<selector>]` from the
+// durable record store, with no daemon involvement.
+//
+// Its exit code reports the STATUS QUERY, never the job: 0 when the state was
+// established, 3 when it could not be, 2 for a miss or an ambiguous selector.
+// The job's own exit code is printed instead. Overloading one channel with two
+// meanings is exactly the kind of dishonesty this project's error contract
+// exists to prevent.
+func runConfineStatusCommand(ctx context.Context, options map[string]string, jsonOutput bool, stdout, stderr io.Writer) int {
+	paths, err := daemon.PathsFromEnv()
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "%s: cannot resolve the durable record directory: %v\n", runner.CodeConfineOutcomeUnknown, err)
+		return store.ExitForCode(runner.CodeConfineOutcomeUnknown)
+	}
+	owner, ownerErr := resolveConfineOwner(ctx, options["owner"])
+	if ownerErr != nil {
+		_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --owner: %v\n", ownerErr)
+		return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+	}
+	selector := strings.TrimSpace(options["status-selector"])
+	if selector == "" {
+		statuses, listErr := confineDetachStatusList(paths.ConfineDetachDir, owner)
+		if listErr != nil {
+			_, _ = fmt.Fprintln(stderr, listErr)
+			return store.ExitForCode(store.ErrorCode(listErr))
+		}
+		if jsonOutput {
+			return writeConfineStatusJSON(statuses, stdout, stderr)
+		}
+		if len(statuses) == 0 {
+			_, _ = fmt.Fprintf(stdout, "confine: no detached confine records for owner %s\n", owner)
+			return 0
+		}
+		for _, status := range statuses {
+			_, _ = fmt.Fprintln(stdout, runner.FormatConfineDetachStatus(status))
+		}
+		return 0
+	}
+	status, statusErr := confineDetachStatusFor(paths.ConfineDetachDir, selector, owner)
+	if statusErr != nil {
+		_, _ = fmt.Fprintln(stderr, statusErr)
+		return store.ExitForCode(store.ErrorCode(statusErr))
+	}
+	if jsonOutput {
+		return writeConfineStatusJSON(status, stdout, stderr)
+	}
+	_, _ = fmt.Fprintln(stdout, runner.FormatConfineDetachStatus(status))
+	if status.State == runner.ConfineDetachOutcomeUnknown {
+		return store.ExitForCode(runner.CodeConfineOutcomeUnknown)
+	}
+	return 0
+}
+
+func writeConfineStatusJSON(payload any, stdout, stderr io.Writer) int {
+	encoded, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "%s: %v\n", runner.CodeConfineOutcomeUnknown, err)
+		return store.ExitForCode(runner.CodeConfineOutcomeUnknown)
+	}
+	_, _ = stdout.Write(append(encoded, '\n'))
+	if status, ok := payload.(runner.ConfineDetachStatus); ok && status.State == runner.ConfineDetachOutcomeUnknown {
+		return store.ExitForCode(runner.CodeConfineOutcomeUnknown)
+	}
+	return 0
+}
+
+// runConfineSupervisor is the hidden `__confine-supervise` verb: the setsid'd
+// process that owns a detached confine job for its whole life. It mirrors
+// runSupervisor's argument handling, including reporting a malformed invocation
+// down the ready channel so the launcher learns rather than waiting out its
+// timeout.
+func runConfineSupervisor(argv []string) int {
+	values := map[string]string{}
+	for i := 0; i < len(argv); i += 2 {
+		if i+1 >= len(argv) || !strings.HasPrefix(argv[i], "--") {
+			return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		}
+		name := strings.TrimPrefix(argv[i], "--")
+		if name != "control" && name != "ready-fd" && name != "ack-fd" {
+			return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		}
+		if _, exists := values[name]; exists {
+			return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		}
+		values[name] = argv[i+1]
+	}
+	readyFD, readyErr := strconv.Atoi(values["ready-fd"])
+	ackFD, ackErr := strconv.Atoi(values["ack-fd"])
+	if values["control"] == "" || readyErr != nil || ackErr != nil || readyFD < 0 || ackFD < 0 {
+		return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+	}
+	if err := superviseConfineDetached(context.Background(), values["control"], readyFD, ackFD); err != nil {
+		return store.ExitForCode(store.ErrorCode(err))
+	}
+	return 0
 }
 
 func runConfineReserveCommand(ctx context.Context, options map[string]string, stdin io.Reader, stdout, stderr io.Writer) int {

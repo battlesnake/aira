@@ -63,6 +63,13 @@ var ExitCodes = map[string]int{
 	"E_ADMIT_WAIT_TOO_LONG":      2,
 	"E_CONFINE_OWNER_UNVERIFIED": 1, "E_CONFINE_NOT_FOUND": 2,
 	"U_CONFINE_NOT_LAUNCHED": 3, "U_CONFINE_KILL_UNCONFIRMED": 3,
+	// AIRA-22's detached confine surface, mirroring the run-detach pair
+	// (E_RUN_DETACH_FAILED: 4, U_RUN_DETACH_CANCELLED: 3) so a caller that knows
+	// one knows the other. U_CONFINE_OUTCOME_UNKNOWN is the unevaluated verdict
+	// `confine --status` reports for a job whose supervisor is gone without
+	// having written an outcome; it is never a claim that the job failed.
+	"E_CONFINE_DETACH_FAILED": 4, "U_CONFINE_DETACH_CANCELLED": 3,
+	"U_CONFINE_OUTCOME_UNKNOWN":  3,
 	"E_INSTALL_ARGUMENT_INVALID": 2, "E_INSTALL_UNAVAILABLE": 4,
 	"E_INSTALL_OVERCOMMIT":    1,
 	"E_RUN_WIRING_INCOMPLETE": 4, "E_RUN_USAGE_PROVIDER_REQUIRED": 2, "E_RUN_CONFIG_ENV_INVALID": 2,

@@ -56,12 +56,30 @@ func TestSkillMandatesConfineAndFramesCoordinationOptIn(t *testing.T) {
 		"Kill the scope, not a bash wrapper",
 		"Never `kill -9` the supervisor",
 		"`export AIRA_CONFINE_OWNER=<stable-session-id>`",
+		// AIRA-22. The guide must teach the detached form AND its exit-code trap:
+		// `--detach` exits 0 when the supervisor started, which an agent reading
+		// only `$?` would otherwise take as the job having succeeded.
+		"aira confine --detach -- <cmd>",
+		"NOT when the job succeeded",
+		"aira confine --status",
+		"outcome-unknown",
 	} {
 		if !strings.Contains(skill, want) {
 			t.Fatalf("SKILL.md missing mandate/opt-in prose: %q", want)
 		}
 		if !strings.Contains(guide, want) {
 			t.Fatalf("guide missing mandate/opt-in prose: %q", want)
+		}
+	}
+	// The pre-AIRA-22 claim is now FALSE and must not survive anywhere: an agent
+	// told confine has no --detach will keep using the fragile backgrounding
+	// workaround the ticket exists to replace.
+	for _, stale := range []string{
+		"has no native `--detach` of its own yet",
+		"backgrounding via the calling harness is the current workaround",
+	} {
+		if strings.Contains(skill, stale) || strings.Contains(guide, stale) {
+			t.Fatalf("stale pre-AIRA-22 detach guidance remains: %q", stale)
 		}
 	}
 	if strings.Contains(skill, "whale-run") || strings.Contains(guide, "whale-run") {
@@ -73,8 +91,10 @@ func TestSkillMandatesConfineAndFramesCoordinationOptIn(t *testing.T) {
 	// confine stays CLI-only: mandated in prose, never a generated action (Include=false)
 	// so it is also never an MCP tool.
 	for _, action := range artifacts.Actions {
-		if action.Verb == "confine" {
-			t.Fatal("confine leaked into generated actions; it must stay a prose-only CLI mandate")
+		// confine-status is CLI-only for the same reason confine is, plus one of
+		// its own: it must keep working when the daemon does not.
+		if action.Verb == "confine" || action.Verb == "confine-status" {
+			t.Fatalf("%s leaked into generated actions; it must stay a prose-only CLI verb", action.Verb)
 		}
 	}
 }

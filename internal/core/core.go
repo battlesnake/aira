@@ -1686,7 +1686,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return result, err
 		}},
-		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--admit-timeout D] [--delegate-ram] -- <argv...>", Args: []ArgSpec{
+		"confine": {Name: "confine", Usage: "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--admit-timeout D] [--delegate-ram] [--detach] -- <argv...>", Args: []ArgSpec{
 			listSpec("argv", true, true, "Exact target argv after the launch delimiter"),
 			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
 			stringSpec("name", false, false, "Scope name component"),
@@ -1696,6 +1696,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("memory_high", false, false, "Scope memory.high reclaim pressure (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			stringSpec("admit_timeout", false, false, "Positive bounded daemon admission wait"),
 			boolSpec("delegate_ram", false, false, "Delegate RAM admission to per-test pinned reservations"),
+			boolSpec("detach", false, false, "Run session-independently; report the handle and poll it with confine --status"),
 		}, Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			_ = ctx
 			_ = stringSlice(args, "argv")
@@ -1707,7 +1708,21 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringArg(args, "memory_high")
 			_ = stringArg(args, "admit_timeout")
 			_ = boolArg(args, "delegate_ram")
+			_ = boolArg(args, "detach")
 			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine is a direct CLI-only foreground verb")
+		}},
+		// confine-status is CLI-only, like confine and confine-reserve, and unlike
+		// confine-list/confine-kill: it reads a durable filesystem record and needs
+		// no daemon at all. Routing it through the daemon would make AIRA-22's
+		// survivability verb depend on the component most likely to have been
+		// restarted during the long pause it exists to survive.
+		"confine-status": {Name: "confine-status", Usage: "confine --status [<name|supervisor-pid|scope-id>] [--owner ID] [--json]", Args: []ArgSpec{
+			stringSpec("selector", false, true, "Exact detached confine name, supervisor PID, or scope ID; omit to list your own"),
+			stringSpec("owner", false, false, "Caller owner identity"),
+		}, Run: func(_ context.Context, args *argAccessor) (any, error) {
+			_ = stringArg(args, "selector")
+			_ = stringArg(args, "owner")
+			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine-status is a direct CLI-only verb")
 		}},
 		"confine-reserve": {Name: "confine-reserve", Usage: "confine-reserve --bytes N --pinned --signature S [--slice S] [--max-wait D]", Args: []ArgSpec{
 			stringSpec("bytes", true, false, "Pinned byte reservation (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
@@ -2020,6 +2035,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		"confine-reserve": {summary: "Hold one daemon-only pinned confine reservation", safety: SafetyExecute, example: []string{"--bytes", "512M", "--pinned", "--signature", "pytest:test_example.py::test_case"}},
 		"confine-list":    {summary: "List discoverable confine scopes without fabricating unreadable fields", safety: SafetyRead, example: []string{}},
 		"confine-kill":    {summary: "Kill one ownership-checked confine scope after populated-to-empty proof", safety: SafetyExecute, destructive: true, example: []string{"job"}},
+		"confine-status":  {summary: "Report a detached confine job's durable outcome without fabricating one", safety: SafetyRead, example: []string{"gate"}},
 		"install":         {summary: "Install and inspect the AIRA-owned confinement slice", safety: SafetyExecute, example: []string{"--status"}},
 		"time":            {summary: "Run a byte-transparent command and record timing", safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
 		"commands": {summary: "Read recorded command events and exact distributions", safety: SafetyRead, operations: []OperationSpec{
@@ -2098,7 +2114,8 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		if !ok {
 			panic("missing dispatch metadata for " + name)
 		}
-		spec.Summary, spec.Safety, spec.Destructive, spec.Include = entry.summary, entry.safety, entry.destructive, name != "confine" && name != "confine-reserve" && name != "install"
+		spec.Summary, spec.Safety, spec.Destructive, spec.Include = entry.summary, entry.safety, entry.destructive,
+			name != "confine" && name != "confine-reserve" && name != "confine-status" && name != "install"
 		spec.Example = copyExample(entry.example)
 		spec.Operations = append([]OperationSpec(nil), entry.operations...)
 		verbs[name] = spec
