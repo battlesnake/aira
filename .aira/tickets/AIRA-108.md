@@ -33,6 +33,12 @@ Not established which of these (if any) is the actual mechanism — that tracing
 
 If the root cause is (1) or (2) above — a genuine CLI/daemon-side enforcement gap in `confine-reserve --pinned --max-wait` — it is latent for ANY future caller of that primitive, not just the plugin being deleted tonight. If it is (3), it's specific to the plugin AIRA-33 removes and this ticket can close as moot once that lands and is confirmed to be the mechanism. Recommend not closing this ticket on AIRA-33 landing alone — confirm which mechanism it actually was first.
 
+## Confirming data point (split, 2026-09-06) — narrows candidate (3)
+
+split confirmed the legacy governor was genuinely double-armed on their run (their worktree is pre-AIRA-33, off #1172; `git grep aira_xdist_governor` hits 10 fastest-ee conftests including the one that fired). More importantly: the wedged process was a **single PID** (1264500) alive for the full ~52 minutes, with `--max-wait 300s` on its own argv — not a re-spawn loop (which would show a fresh PID every ≤300s). One process outliving its own declared bound by ~10x is real evidence of a genuine wait-bound enforcement gap, independent of the caller.
+
+**This does not fully rule out candidate (3) by itself**, though — a single long-lived PID is also consistent with the Go process finishing its wait correctly and then blocking indefinitely on a `write()` to stdout that nothing is reading (an undrained pipe blocks the writer regardless of how correctly the wait itself was bounded). Asked split, if they catch a live repro again before killing it, to check `/proc/<pid>/status` (State field) and `/proc/<pid>/fd/1` (what stdout is connected to) — this distinguishes "still executing its own wait logic" from "finished, blocked writing an unread result" cleanly. split is actively re-running the same suite on the pre-AIRA-33 base right now and offered to hold a wedged process alive rather than killing it, so this may get a live, inspectable repro rather than a second after-the-fact report.
+
 ## Not reproduced here
 
-This is a single live observation from split, not independently reproduced by the coordinating session. Recorded honestly, matching this project's own standard for reports of this kind (see AIRA-105 for the same disposition on a different finding).
+This is a live observation from split, not independently reproduced by the coordinating session. Recorded honestly, matching this project's own standard for reports of this kind (see AIRA-105 for the same disposition on a different finding).
