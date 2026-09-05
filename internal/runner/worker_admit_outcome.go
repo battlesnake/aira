@@ -156,6 +156,18 @@ const (
 	WorkerAdmitReasonCPUSlotsSaturated = "cpu-slots-saturated"
 	WorkerAdmitReasonAdmitLocksBusy    = "admit-locks-busy"
 
+	// AIRA-101. Another job holds this slice EXCLUSIVELY (`aira confine
+	// --exclusive`, for uncontended benchmarking), so no worker may be placed
+	// under any outer scope but the holder's own.
+	//
+	// class=contended, deliberately and load-bearingly: the hold ends when the
+	// benchmark ends, so this is retriable and the supervisor should keep polling.
+	// Classing it terminal would strip containment for the whole suite — the
+	// AIRA-63 regression shape. It is its OWN reason token rather than reusing a
+	// saturation one because an operator waiting behind a benchmark needs to know
+	// a benchmark is running, not think the machine is merely full.
+	WorkerAdmitReasonSliceExclusive = "slice-exclusive"
+
 	// Client-side (transport and response classification).
 	WorkerAdmitReasonDialFailed              = "dial-failed"
 	WorkerAdmitReasonRequestSendFailed       = "request-send-failed"

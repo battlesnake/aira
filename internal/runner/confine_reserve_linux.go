@@ -38,6 +38,19 @@ func confineReserveWithRunner(ctx context.Context, request ConfineReserveRequest
 		result, answered, err := r.admitThroughDaemon(ctx, Request{
 			ResourceSignature:   request.Signature,
 			MemoryReservePinned: true,
+			// AIRA-101. Identify this as a SUB-RESERVATION of an already-running
+			// job, read from the scope id the job exported into its own environment.
+			//
+			// It is what keeps an exclusive drain converging. A per-test reservation
+			// is the running job's internal progress, not new work entering the
+			// slice; blocking these would stall every test of every running
+			// --delegate-ram suite for its full wait and then let it run UNCHARGED,
+			// so those suites could never finish and the drain could never complete.
+			//
+			// A scope-less admission alone is NOT a usable signal for that — `aira
+			// run` is also scope-less and IS new job-level work a drain must block —
+			// which is why this is an explicit marker rather than an inference.
+			ParentScopeID: InheritedConfineScopeID(),
 		}, reserve)
 		if !answered {
 			if err != nil {

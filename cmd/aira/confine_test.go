@@ -538,7 +538,7 @@ func TestConfineDescriptorIsClientExecuteWithoutMCP(t *testing.T) {
 			continue
 		}
 		found = true
-		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--admit-timeout D] [--delegate-ram] [--detach] -- <argv...>" {
+		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--admit-timeout D] [--delegate-ram] [--exclusive] [--detach] -- <argv...>" {
 			t.Fatalf("descriptor=%+v", descriptor)
 		}
 	}

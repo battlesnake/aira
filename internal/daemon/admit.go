@@ -314,6 +314,10 @@ func (g exclusiveGate) holderScopeIDs(queue *sliceQueue) map[string]struct{} {
 // subtree-aware liveScopes — and it would remove a belt-and-braces signal in the
 // one case where it is the only thing still objecting: a live reservation whose
 // parent job has escaped its scope or died with its socket held open.
+func sliceProvablyEmpty(queue *sliceQueue) bool {
+	return queue.outstandingJobs == 0 && queue.liveScopesKnown && queue.liveScopes == 0
+}
+
 // exclusiveGateStateLocked renders the queue's exclusive state as its wire
 // token, or "" when no exclusivity is active. queue.mu must be held. The empty
 // string is an honest absence — derived from the same waiter list as everything
@@ -329,8 +333,72 @@ func exclusiveGateStateLocked(queue *sliceQueue) string {
 	return ""
 }
 
-func sliceProvablyEmpty(queue *sliceQueue) bool {
-	return queue.outstandingJobs == 0 && queue.liveScopesKnown && queue.liveScopes == 0
+// confineScopeDirName maps a scope id to its cgroup directory name. Defined once
+// so the worker-admit gate and the scanner cannot disagree about the mapping.
+func confineScopeDirName(scopeID string) string {
+	return ".aira-" + scopeID
+}
+
+// exclusiveDeniesWorkerAdmit reports whether a slice-exclusive HOLD forbids
+// placing a worker under this outer scope (AIRA-101).
+//
+// A DRAIN deliberately does NOT deny. A worker is an already-running job's
+// internal progress, not new work entering the slice, and denying it would stop
+// running suites from finishing — which is exactly what the drain is waiting
+// for, so blocking here would prevent the drain from ever converging. It is also
+// structurally safe to allow: CreateWorkerScope only ever creates
+// `.aira-worker-*` CHILDREN inside an already-existing outer scope, so
+// worker-admit cannot introduce new top-level work into a draining slice however
+// it is answered.
+//
+// A HOLD denies every outer scope that is not the holder's own work — the holder
+// itself, or a nested `aira confine` launched from inside it carrying its token.
+// By construction the slice is empty of other jobs when a hold begins, so this
+// denies nothing that should exist: it is belt-and-braces enforcement of the
+// invariant, not a load-bearing path.
+//
+// Lock order is the established admitRegistryMu -> queue.mu. The caller must
+// hold neither the outer-scope lock nor the CPU-slots gate, so this adds no new
+// nesting.
+func (s *Server) exclusiveDeniesWorkerAdmit(outerScope string) bool {
+	outerScope = strings.TrimSpace(outerScope)
+	if outerScope == "" {
+		return false
+	}
+	// The queue is keyed by resolveAdmitSlicePath's EvalSymlinks'd path, while
+	// worker-admit only Cleans its outer_scope. Canonicalise the parent the same
+	// way, or the lookup silently misses and this gate ships INERT — the failure
+	// mode this project has shipped once already. Falling back to the cleaned path
+	// keeps a scope removed mid-request working instead of turning a lookup miss
+	// into an error.
+	slicePath := filepath.Dir(filepath.Clean(outerScope))
+	if resolved, err := filepath.EvalSymlinks(slicePath); err == nil {
+		slicePath = resolved
+	}
+	scopeDir := filepath.Base(filepath.Clean(outerScope))
+
+	s.admitRegistryMu.Lock()
+	queue := s.admitQueues[slicePath]
+	if queue == nil {
+		s.admitRegistryMu.Unlock()
+		return false
+	}
+	queue.mu.Lock()
+	defer s.admitRegistryMu.Unlock()
+	defer queue.mu.Unlock()
+	gate := exclusiveGateLocked(queue)
+	if gate.holder == nil {
+		return false
+	}
+	// A scope's directory is ".aira-" + its scope id. Compare on that exact
+	// mapping rather than a substring, so a scope whose name merely contains
+	// another's id can never be mistaken for it.
+	for scopeID := range gate.holderScopeIDs(queue) {
+		if scopeDir == confineScopeDirName(scopeID) {
+			return false
+		}
+	}
+	return true
 }
 
 // blocks reports whether the exclusivity gate requires this queued waiter to

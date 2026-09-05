@@ -139,6 +139,31 @@ type ConfineSliceReserve struct {
 	// real a defect as the positive direction.
 	ResidualJobs  int   `json:"residual_jobs"`
 	ResidualBytes int64 `json:"residual_bytes"`
+
+	// Exclusive is AIRA-101's slice-exclusivity state, derived in the SAME locked
+	// pass as every count above so an operator can never be shown an exclusive
+	// holder alongside figures from a different instant.
+	//
+	// nil means NO exclusivity is active. That is a POSITIVE fact established by
+	// the same walk, never an unevaluated reading, and consumers must render it as
+	// "none" rather than as unknown — an operator whose job is blocked needs to be
+	// able to rule a benchmark out, not merely fail to see one.
+	Exclusive *ConfineExclusiveState `json:"exclusive,omitempty"`
+}
+
+// ConfineExclusiveState names which job holds (or is draining toward) exclusive
+// use of a slice, so a blocked operator learns a benchmark is running rather
+// than concluding the slice is merely full.
+type ConfineExclusiveState struct {
+	// State is "draining" (stopping new admissions, waiting for running jobs to
+	// finish) or "held" (the exclusive job is running alone).
+	State   string `json:"state"`
+	Name    string `json:"name,omitempty"`
+	Owner   string `json:"owner,omitempty"`
+	ScopeID string `json:"scope_id,omitempty"`
+	// WaitingJobs counts the queued waiters actually held up behind it. It never
+	// counts the exclusive job as waiting for itself.
+	WaitingJobs int `json:"waiting_jobs"`
 }
 
 type ConfineKillResult struct {

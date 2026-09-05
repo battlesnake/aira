@@ -426,6 +426,24 @@ func readWorkerSupervisorMemory(path string) (current, reclaimable int64, ok boo
 // stopping while queued on the outer scope's lock — the caller returns without
 // writing anything, mirroring workerAdmitConnection's own peer-gone paths.
 func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest) (WorkerAdmitResponse, bool) {
+	// AIRA-101, the slice-exclusivity gate. FIRST, before any cgroupfs read and
+	// before both the outer-scope lock and the CPU-slots gate: it is a pure
+	// in-memory map lookup, and taking it here means it adds no lock nesting to
+	// either of those critical sections.
+	//
+	// Classed CONTENDED, which is load-bearing rather than a formality. A
+	// contended denial is retriable, so supervisor.py raises WorkerAdmitDenied and
+	// keeps polling until the benchmark finishes. A terminal class here would make
+	// it abandon daemon-backed admission and run the WHOLE suite UNCONFINED on
+	// this RAM-capped shared machine — a safety regression, and exactly what a
+	// wrongly-classed denial caused once before (AIRA-63).
+	if s.exclusiveDeniesWorkerAdmit(req.outerScope) {
+		return WorkerAdmitResponse{
+			State:  runner.WorkerAdmitStateDenied,
+			Class:  runner.WorkerAdmitClassContended,
+			Reason: runner.WorkerAdmitReasonSliceExclusive,
+		}, true
+	}
 	readMemory := s.admitReadMemory
 	if readMemory == nil {
 		readMemory = readSliceMemory

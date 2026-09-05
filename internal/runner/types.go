@@ -186,6 +186,17 @@ type Request struct {
 	ConfineScopeID        string    `json:"confine_scope_id,omitempty"`
 	ConfineName           string    `json:"confine_name,omitempty"`
 	ConfineOwner          string    `json:"confine_owner,omitempty"`
+	// AIRA-101. Exclusive asks the daemon to schedule this job ALONE in its slice.
+	// It is fail-closed end to end: if the daemon cannot grant it, the launch is
+	// refused rather than degraded (see exclusiveRefusal).
+	//
+	// ExclusiveHolder is the inherited token of an exclusive job this launch runs
+	// inside, so the holder's own nested confines are not blocked by its own hold.
+	// ParentScopeID marks a `confine-reserve` sub-reservation as an already-running
+	// job's internal progress, which a drain must not block or it never converges.
+	Exclusive       bool   `json:"exclusive,omitempty"`
+	ExclusiveHolder string `json:"exclusive_holder,omitempty"`
+	ParentScopeID   string `json:"parent_scope_id,omitempty"`
 	// TelemetryPending is an opaque initial envelope supplied by Core. Runner
 	// stamps it into the starting event without interpreting its value.
 	TelemetryPending string `json:"telemetry_pending,omitempty"`
