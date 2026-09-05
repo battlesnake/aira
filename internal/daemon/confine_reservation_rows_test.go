@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"aira/internal/core"
@@ -194,4 +195,67 @@ func TestConfineReservationSignaturesAreBoundedOnTheWire(t *testing.T) {
 				"backstop this test assumes, so the bound above is not load-bearing", buffer.Len())
 		}
 	})
+}
+
+// AIRA-108 build-review confirm pass (Sol, P3). The bound must be proven AT THE
+// PRODUCTION HOOKUP, not only in the helper that implements it.
+//
+// TestConfineReservationSignaturesAreBoundedOnTheWire above calls
+// boundedAdmitSignature directly, so it pins the truncator's behaviour — and
+// nothing else. A regression that simply stopped CALLING it in
+// enqueueAdmitInternal (`signature: request.signature`) would leave every one of
+// those assertions green while the daemon went straight back to retaining
+// megabytes per waiter and serialising them into every confine-list reply. That
+// is precisely the porous shape this project treats as a defect in its own
+// right, so the enforcement point gets its own test: an oversized signature goes
+// in through the real enqueue path, and what the waiter RETAINED is what is
+// asserted.
+//
+// verifies: AIRA-108
+func TestOversizedSignaturesAreBoundedAtTheEnqueuePath(t *testing.T) {
+	server := NewServer(Paths{})
+	// Zero headroom so the fixture's tiny reserve is admissible against its
+	// nominal cap; headroom sizing is irrelevant to what this test asserts.
+	server.admitSliceHeadroomBase = 0
+	server.admitSliceHeadroomSupervisor = 0
+	huge := strings.Repeat("s", 4<<20)
+	queue, waiter, code, err := server.enqueueResolvedConfineAdmit(
+		"/aira108-bound", 1<<20, "pinned:client", 1<<30,
+		admitRequest{slice: "/aira108-bound", reserve: 1 << 20, signature: huge, pinned: true})
+	if err != nil || code != "" || waiter == nil {
+		t.Fatalf("enqueue code=%q err=%v", code, err)
+	}
+	t.Cleanup(func() { queue.stopOnce.Do(func() { close(queue.stop) }) })
+
+	if len([]rune(waiter.signature)) != runner.ConfineReservationSignatureWireLimit+1 {
+		t.Fatalf("the waiter retained %d runes of a %d-rune signature; the enqueue path is not "+
+			"applying the bound, so the daemon holds it for the waiter's whole life and puts it "+
+			"in every confine-list reply", len([]rune(waiter.signature)), len([]rune(huge)))
+	}
+	if !strings.HasSuffix(waiter.signature, "…") {
+		t.Fatalf("the retained signature was clipped without a truncation marker")
+	}
+	// The ADMISSION side must still see the original: the bound is a diagnostic
+	// bound, and silently rewriting the signature admission decisions and the
+	// peak-RSS history key off would be a behaviour change, not a fix.
+	if waiter.reserve != 1<<20 {
+		t.Fatalf("waiter reserve=%d, want the resolved charge unchanged", waiter.reserve)
+	}
+
+	// And the snapshot row that reaches the wire carries the bounded value, so
+	// the whole path — enqueue, retain, snapshot, serialise — is covered end to
+	// end rather than at its two ends only.
+	queue.mu.Lock()
+	waiter.state = admitGranted
+	waiter.accounted = true
+	waiter.grantedAt = server.admitNowTime().Add(-time.Second)
+	queue.mu.Unlock()
+	snapshot := server.admitSliceSnapshot("/aira108-bound")
+	if len(snapshot.reservations) != 1 {
+		t.Fatalf("snapshot rows=%d, want 1", len(snapshot.reservations))
+	}
+	if len([]rune(snapshot.reservations[0].signature)) != runner.ConfineReservationSignatureWireLimit+1 {
+		t.Fatalf("the snapshot row carries %d runes, want the bounded value",
+			len([]rune(snapshot.reservations[0].signature)))
+	}
 }

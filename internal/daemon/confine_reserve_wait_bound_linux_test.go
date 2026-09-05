@@ -265,13 +265,24 @@ func TestConfineReserveWaitIsBoundedByTheClientAlone(t *testing.T) {
 	// that would land on an unrelated test (found by Sol build-review).
 	var connectionsMu sync.Mutex
 	var connections []net.Conn
+	shuttingDown := false
 	go func() {
 		for {
 			conn, acceptErr := listener.Accept()
 			if acceptErr != nil {
 				return
 			}
+			// A connection accepted just before cleanup runs must not be appended
+			// to a slice cleanup has already swept — it would be left open until
+			// the test binary exits (Sol confirm-pass P3). The flag makes the
+			// ordering explicit rather than assumed: after cleanup, a late arrival
+			// closes itself instead of registering.
 			connectionsMu.Lock()
+			if shuttingDown {
+				connectionsMu.Unlock()
+				_ = conn.Close()
+				return
+			}
 			connections = append(connections, conn)
 			connectionsMu.Unlock()
 			// Hold the connection open and never write. Reading the request first
@@ -286,9 +297,11 @@ func TestConfineReserveWaitIsBoundedByTheClientAlone(t *testing.T) {
 	t.Cleanup(func() {
 		connectionsMu.Lock()
 		defer connectionsMu.Unlock()
+		shuttingDown = true
 		for _, conn := range connections {
 			_ = conn.Close()
 		}
+		connections = nil
 	})
 
 	helper := startReserveHelper(t, binary, "aira.slice", "aira108:blackhole", 8<<20, bound)
