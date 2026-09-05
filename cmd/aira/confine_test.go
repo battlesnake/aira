@@ -538,12 +538,48 @@ func TestConfineDescriptorIsClientExecuteWithoutMCP(t *testing.T) {
 			continue
 		}
 		found = true
-		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--admit-timeout D] [--delegate-ram] -- <argv...>" {
+		if descriptor.Safety != core.SafetyExecute || descriptor.MCPTool != "" || descriptor.Include || descriptor.Usage != "confine [--slice S] [--name N] [--owner ID] [--memory-reserve S] [--memory-max S] [--memory-high S] [--admit-timeout D] [--delegate-ram] [--detach] -- <argv...>" {
 			t.Fatalf("descriptor=%+v", descriptor)
 		}
 	}
 	if !found {
 		t.Fatal("confine descriptor missing")
+	}
+}
+
+// confine-status is CLI-only for the same reason confine is, and for one of its
+// own: it reads a durable filesystem record, so routing it through the daemon
+// would make AIRA-22's survivability verb depend on the component most likely to
+// have been restarted during the pause it exists to survive.
+//
+// verifies: AIRA-22
+func TestConfineStatusDescriptorIsCLIOnlyWithoutMCP(t *testing.T) {
+	canonical, route := core.Classify("confine-status", "")
+	if canonical != "confine-status" || route != core.RouteClient {
+		t.Fatalf("classify=%q/%v", canonical, route)
+	}
+	var found bool
+	for _, descriptor := range core.New(nil).DispatchDescriptors() {
+		if descriptor.Name != "confine-status" {
+			continue
+		}
+		found = true
+		if descriptor.MCPTool != "" || descriptor.Include {
+			t.Fatalf("confine-status must not be a generated action or MCP tool: %+v", descriptor)
+		}
+		if descriptor.Safety != core.SafetyRead {
+			t.Fatalf("confine-status is a read: %+v", descriptor)
+		}
+		if descriptor.Usage != "confine --status [<name|supervisor-pid|scope-id>] [--owner ID] [--json]" {
+			t.Fatalf("usage=%q", descriptor.Usage)
+		}
+	}
+	if !found {
+		t.Fatal("confine-status descriptor missing")
+	}
+	response := core.New(nil).Do(context.Background(), core.Request{Verb: "confine-status", Args: map[string]any{"selector": "gate"}})
+	if response.OK || response.Code != "E_CONFINE_UNAVAILABLE" {
+		t.Fatalf("confine-status must refuse dispatcher routing: %+v", response)
 	}
 }
 

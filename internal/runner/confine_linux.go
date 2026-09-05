@@ -413,17 +413,16 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		result.Status.Slice = attemptedSlice
 		return result, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --memory-reserve: declared reserve %d is below the %d-byte minimum", request.MemoryReserve, MinPinnedScopeCap)
 	}
-	if err := validateConfineName(request.Name); err != nil {
+	// One normaliser, shared with MintConfineScopeID (AIRA-22): a detached
+	// supervisor mints its own scope id before calling this, and two independent
+	// copies of "empty name means job, empty owner means unknown" would be free to
+	// drift apart between the mint and the bind.
+	normalizedName, normalizedOwner, identityErr := normalizeConfineIdentity(request)
+	if identityErr != nil {
 		result.Status.Slice = attemptedSlice
-		return result, err
+		return result, identityErr
 	}
-	if request.Owner == "" {
-		request.Owner = ConfineUnknownOwner
-	}
-	if err := ValidateConfineOwner(request.Owner); err != nil {
-		result.Status.Slice = attemptedSlice
-		return result, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --owner: %w", err)
-	}
+	request.Name, request.Owner = normalizedName, normalizedOwner
 	sliceName, path := explicitSlice, ""
 	if explicitSlice == "" {
 		var resolveErr error
@@ -502,11 +501,35 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	request.ResourceSignature = signature
 	request.MemoryReserve = reserve
 	request.MemoryReservePinned = pinned
-	if request.Name == "" {
-		request.Name = "job"
+	// AIRA-22: a DETACHED supervisor mints its own scope id before calling here,
+	// because the pid embedded in the cgroup directory name is what
+	// `confine --kill <pid>`, `--list`'s SupervisorPID column, and the orphan
+	// reaper's liveness predicate all read back — and for a detached job the
+	// process that must be named there is the supervisor, not the launcher that
+	// exits seconds later. The field is unexported, so only package runner can
+	// supply one, and bindConfineScopeID additionally refuses any id that does not
+	// describe THIS process running THIS request: syntax alone accepts a foreign
+	// pid, a foreign owner, or the wrong delegate class. Never silently re-mint —
+	// that would run the job in a scope the durable record does not name.
+	scopeID := request.presetScopeID
+	if scopeID == "" {
+		scopeID = confineScopeID(request.Name, request.Owner, request.DelegateRAM)
+	} else if bindErr := bindConfineScopeID(scopeID, request.Name, request.Owner, request.DelegateRAM); bindErr != nil {
+		return result, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: %w", bindErr)
 	}
-	scopeID := confineScopeID(request.Name, request.Owner, request.DelegateRAM)
 	request.ScopeID = scopeID
+	// The launch gate (AIRA-22). Every precondition the foreground form reports
+	// synchronously — argv, reserve bounds, owner, slice resolution, the backend
+	// probe, the finite-cap refusal, memory delegation — has now passed, and the
+	// only unbounded wait in this function is the admission immediately below. A
+	// detached supervisor announces readiness from here, so `--detach` cannot turn
+	// an exit-2/exit-4 launch failure into a premature exit 0. A non-nil return
+	// aborts before admission: nothing is charged, no scope exists, no child ran.
+	if request.BeforeAdmit != nil {
+		if gateErr := request.BeforeAdmit(confineLaunchInfo(scopeID, sliceName, maximum)); gateErr != nil {
+			return result, gateErr
+		}
+	}
 	// Admission can legitimately block: a reserve-contended slice queues this job
 	// behind other sessions' in-flight jobs under the shared cap, and the client
 	// waits on a single socket read for up to its maxWait. Emit a periodic progress
@@ -918,6 +941,16 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		return abortStarted(fmt.Errorf("verify process identity: %w", bootErr))
 	}
 	result.Status.Scope = ConfineScopePlaced
+	// Placement is PROVEN here — the child started and was verified to be a member
+	// of the scope — so this is the first instant at which "running" is a fact
+	// rather than a guess. AIRA-22's detached status distinguishes `admitting`
+	// from `running` on exactly this observation, because a live supervisor can
+	// legitimately sit in the admission queue for hours and reporting that as
+	// "running" would tell an operator something false. No error return: nothing
+	// remains to abort.
+	if request.OnPlaced != nil {
+		request.OnPlaced(confineLaunchInfo(scopeID, sliceName, maximum))
+	}
 	monitorStop := make(chan struct{})
 	monitorResult := make(chan scopeMonitorResult, 1)
 	go monitorScopeMembership(scope, identity, members, monitorStop, monitorResult)
@@ -1047,6 +1080,15 @@ func admitConfine(ctx context.Context, path string, request ConfineRequest, rese
 	})
 }
 
+// confineLaunchInfo carries RESOLVED facts to the AIRA-22 launch callbacks. The
+// slice is the one actually resolved (which may be the whale.slice compatibility
+// path rather than what the caller typed) and the cap is the effective ceiling
+// read out of the cgroup ancestry, so a detached launcher reports what is true
+// rather than what was requested.
+func confineLaunchInfo(scopeID, sliceName string, capBytes int64) ConfineLaunchInfo {
+	return ConfineLaunchInfo{ScopeID: scopeID, Slice: sliceName, CapBytes: capBytes, SupervisorPID: os.Getpid()}
+}
+
 func readConfineCap(path string) (int64, bool) {
 	data, err := os.ReadFile(filepath.Join(path, "memory.max"))
 	if err != nil || strings.TrimSpace(string(data)) == "max" {
@@ -1060,22 +1102,6 @@ func confineEnvironment(env []string) []string {
 		return os.Environ()
 	}
 	return append([]string(nil), env...)
-}
-
-func validateConfineName(name string) error {
-	if name == "" {
-		return nil
-	}
-	if len(name) > 100 {
-		return errors.New("E_CONFINE_ARGUMENT_INVALID: --name is too long")
-	}
-	for _, r := range name {
-		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("_.-", r) {
-			continue
-		}
-		return errors.New("E_CONFINE_ARGUMENT_INVALID: --name requires letters, digits, '.', '_', or '-'")
-	}
-	return nil
 }
 
 // confineScopeID mints the scope directory name. The owner is appended after an

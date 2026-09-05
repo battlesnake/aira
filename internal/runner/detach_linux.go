@@ -39,27 +39,18 @@ func (r *Runner) LaunchDetached(ctx context.Context, req Request, wiringPath str
 		_ = readyW.Close()
 		return nil, launchErr("E_RUN_DETACH_FAILED", err)
 	}
-	devnull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
-	if err != nil {
-		closeOutputFiles(map[string]*os.File{"ready-r": readyR, "ready-w": readyW, "ack-r": ackR, "ack-w": ackW})
-		return nil, launchErr("E_RUN_DETACH_FAILED", err)
-	}
 	shimArgv := []string{"__supervise", "--control", control, "--ready-fd", "3", "--ack-fd", "4"}
 	if wiringPath != "" {
 		shimArgv = append(shimArgv, "--wiring", wiringPath)
 	}
-	cmd := exec.Command("/proc/self/exe", shimArgv...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = devnull, devnull, devnull
-	cmd.ExtraFiles = []*os.File{readyW, ackR}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
-		_ = devnull.Close()
+	// spawnDetachedShim is shared with `confine --detach` (AIRA-22), so
+	// "detached" -- new session, no inherited stdio, reaped -- has exactly one
+	// definition in this codebase rather than two that can drift.
+	if _, err := spawnDetachedShim("/proc/self/exe", shimArgv, []*os.File{readyW, ackR}); err != nil {
 		closeOutputFiles(map[string]*os.File{"ready-r": readyR, "ready-w": readyW, "ack-r": ackR, "ack-w": ackW})
 		return nil, launchErr("E_RUN_DETACH_FAILED", err)
 	}
-	go func() { _ = cmd.Wait() }()
 	removeControl = false
-	_ = devnull.Close()
 	_ = readyW.Close()
 	_ = ackR.Close()
 	messageCh := make(chan struct {

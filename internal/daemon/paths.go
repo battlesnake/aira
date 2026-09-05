@@ -22,9 +22,17 @@ type Paths struct {
 	DBPath        string
 	RegistryPath  string
 	LeaseStateDir string
-	RuntimeDir    string
-	SocketPath    string
-	LockPath      string
+	// ConfineDetachDir holds one durable directory per detached confine job
+	// (AIRA-22): its record plus its captured stdout/stderr. It is under the
+	// STATE home rather than RuntimeDir on purpose — RuntimeDir resolves under
+	// XDG_RUNTIME_DIR, which is tmpfs, and capturing an hour of a merge gate's
+	// output into RAM inside the project whose whole purpose is bounding RAM
+	// would be self-defeating. State home also survives a reboot, so a finished
+	// job's result outlives more than the session that launched it.
+	ConfineDetachDir string
+	RuntimeDir       string
+	SocketPath       string
+	LockPath         string
 }
 
 const (
@@ -282,7 +290,8 @@ func PathsFromEnvironment(stateHome, runtimeDir, home string) (Paths, error) {
 	return Paths{
 		StateHome: stateHome, StateID: stateID,
 		DBPath: filepath.Join(stateDir, "state.db"), RegistryPath: filepath.Join(stateDir, "registry.jsonl"),
-		LeaseStateDir: filepath.Join(stateDir, "leases"), RuntimeDir: daemonDir,
+		LeaseStateDir:    filepath.Join(stateDir, "leases"),
+		ConfineDetachDir: filepath.Join(stateDir, "confine"), RuntimeDir: daemonDir,
 		SocketPath: filepath.Join(daemonDir, "daemon.sock"), LockPath: filepath.Join(daemonDir, "daemon.lock"),
 	}, nil
 }
