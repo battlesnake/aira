@@ -225,6 +225,42 @@ is an index range, cheap.
    at the shutdown instant, or committed *after* the final snapshot, are durable and recoverable via
    `--from` (bounded, honest residual — not claimed delivered). A final scan that errors/times out
    yields a transient failure (client retries), never a premature `eof`.
+
+   **Amendment 2026-09-06 (AIRA-75) — one narrow, accepted exception: unjournaled
+   watchdog rows are not durable across a DB loss.** `AppendWatchdogEvent`
+   (`internal/store/watch.go`) deliberately leaves `journaled=0` forever on
+   host-watchdog rows — a host-global kill decision broadcast verbatim into
+   every ready project's stream has no per-project provenance to journal
+   against; see that function's doc comment for the full design rationale,
+   which stands. `Rebuild` reconstructs `event_counters.next_seq` from the
+   receipts and journal alone, and these rows appear in neither, so after a
+   full database loss (fresh schema, every table starts empty) or an `aira
+   eject` (`events` and `event_counters` both carry `FOREIGN
+   KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE`, so
+   ejecting the project row deletes both together) their sequence numbers are
+   forgotten and **reissued** to whatever real events land first afterward. A
+   consumer resuming with `--from <cursor>` then silently skips those events,
+   because the reissued seq is not greater than the cursor it already holds.
+   **No counter fix closes this**, and this was checked, not assumed: a
+   rebuild against an intact database never reissues in the first place —
+   seq-allocation and event-insert commit as one `BEGIN IMMEDIATE` transaction
+   (§2.1, enforced by test), so `event_counters` and `events` cannot desync on
+   a live DB, and the existing `next_seq` upsert only ever raises the stored
+   value, never lowers it — and the only two routes to reissue (a full loss or
+   an eject) wipe `events` itself alongside `event_counters` in the identical
+   operation, so no fix that reconstructs the counter from data still inside
+   that same on-disk database can recover what the loss already erased;
+   reading `MAX(seq)` over `events` reads 0 at exactly the moment it would
+   need to contribute anything. The only place a watchdog seq could survive
+   is a durable store *outside* the database — i.e. journaling it, which is
+   rejected above for an unrelated reason (no per-project provenance to
+   journal against). **Accepted, documented bound:** such a resume may
+   silently skip up to N events, where N = the count of trailing unjournaled
+   (watchdog) seqs issued between the loss and the resume. Watchdog rows are
+   therefore the one class of row, by design, for which this invariant's
+   "durable and recoverable via `--from`" does not hold. Journaling the seq
+   and an epoch/generation token in the cursor (new protocol machinery) were
+   both considered and rejected as disproportionate to this narrow gap.
 2. **Ordered matching delivery; cursor is a global high-water mark (Sol r1 #4).** The cursor
    advances past *scanned* (not just matching) seqs, so a filtered stream's **emitted** seqs are
    ordered and complete but **not contiguous** (gaps = filtered-out events). The unfiltered scan

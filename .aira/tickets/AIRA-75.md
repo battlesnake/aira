@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-75","project":"aira","title":"52% of this project's watchdog events are journaled=0, voiding the journal's gap-detection for them","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["daemon","dogfood","watchdog"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-75","project":"aira","title":"52% of this project's watchdog events are journaled=0, voiding the journal's gap-detection for them","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["daemon","dogfood","watchdog"],"hold":false,"relations":[]}
 ---
 Found during the whole-project simplification review (PR #12). 245 watchdog event rows for this project — 52% of all of this project's recorded events — are `journaled=0`. Watchdog events consume the project's shared `seq` counter but are never actually written to the journal. This means the journal's own gap-detection mechanism (which presumably assumes `seq` and journaled entries stay in lockstep) is void by construction for over half of this project's real event history. Rants also have no replay path per the same review. Not investigated further — needs tracing to whether this is a deliberate omission (watchdog events genuinely don't need journaling) that should be documented as such, or a real gap that should be fixed so gap-detection means what it claims to mean.
 
@@ -105,3 +105,86 @@ Also noted by the same review: the new test omits `watchdog.defer` and does not
 exercise a rebuild, so it pins the design decision but not this consequence. It
 is left as-is (it tests what it claims to test) rather than widened to imply
 coverage of a defect that is not yet fixed.
+
+## Resolution (2026-09-06) — remedy retracted, gap documented, ticket closed
+
+The design decision from the first Resolution (watchdog events are
+watch-visible, deliberately unjournaled forever) was correct and settled; it is
+untouched here. What remained open was the build-review's own proposed
+counter-side fix, and that proposed fix does not survive scrutiny.
+
+**Retracted:** "`Rebuild` should take its high-water mark from the events
+table's own `MAX(seq)`" is a no-op in every scenario where seq reissue can
+actually happen, so no counter change closes this gap:
+
+- A rebuild against an **intact** database never reissues to begin with. Seq
+  allocation and event insertion commit as one `BEGIN IMMEDIATE` SQLite
+  transaction (the d3-watch design's own commit-order invariant, already
+  enforced by test), so `event_counters.next_seq` and `events` can never
+  desync on a live DB; `Rebuild`'s own upsert (`ON CONFLICT ... next_seq = CASE
+  WHEN event_counters.next_seq < excluded.next_seq THEN excluded.next_seq ELSE
+  event_counters.next_seq END`) only ever raises the stored value, never
+  lowers it. Adding a second source here would change nothing already correct.
+- The only two routes that actually cause reissue — a full database loss
+  (fresh schema, every table starts empty) or an `aira eject` (`events` and
+  `event_counters` both carry `FOREIGN KEY(project_id) REFERENCES
+  projects(project_id) ON DELETE CASCADE`, so ejecting the project row deletes
+  both together) — wipe `events` itself alongside `event_counters` in the
+  identical operation. So `SELECT MAX(seq) FROM events` reads 0 at exactly the
+  moment it would need to contribute anything; there is no surviving copy of a
+  watchdog row's seq anywhere once its project's rows are gone. Confirmed by
+  grep: no other code path deletes rows from either table.
+- The only way a watchdog seq could survive a DB loss is a durable store
+  *outside* the database — i.e. journaling it — which is exactly option (a)
+  from this ticket's own brief and is rejected for the reason already on
+  record (a host-global decision broadcast into every ready project has no
+  per-project provenance to journal against). Option (b), an epoch/generation
+  token in the watch cursor, is new protocol machinery and rejected under this
+  project's architectural-simplicity rule. Neither is implemented here.
+
+**Accepted, documented bound (not fixed, not fixable without one of the two
+rejected options):** an `aira watch --from N` consumer that resumes after a
+full database loss or an `aira eject` may silently skip up to N_skip new
+events, where N_skip = the count of trailing unjournaled (watchdog) seqs
+issued between the loss and the resume. This is outside the d3-watch design's
+"durable in the DB, recoverable via `--from`" guarantee, for exactly the one
+class of row (watchdog) that was deliberately excluded from durability by
+design. Recorded in both load-bearing locations: the `AppendWatchdogEvent` doc
+comment (`internal/store/watch.go`) and an amendment to Invariant 1 of
+`docs/superpowers/specs/2026-08-17-aira-d3-watch-design.md`.
+
+An independent adversarial pass (DeepSeek, pro tier, high reasoning effort —
+Fable was unavailable to this subagent; no peer session by that name existed
+and no subagent-spawn tool was available in this context) reviewed the
+retraction argument against the cited source facts and returned "sound with
+caveat": the original wording of "no counter fix closes this" could be read as
+an unqualified absolute claim. Both doc locations were tightened in response
+to scope it precisely — no fix that reconstructs the counter from data still
+inside the same on-disk database (or its cascade boundary) can work, and the
+"intact DB never reissues" half is anchored explicitly to the already-verified
+commit-order invariant rather than asserted freestanding.
+
+No behaviour change. No code paths altered; only the `AppendWatchdogEvent` doc
+comment, the d3-watch design spec, and this ticket file were touched. The
+existing pinning test, `TestWatchdogEventsAreWatchVisibleAndNeverJournaled`, is
+untouched — it already tests exactly what it claims to test (watch-visible AND
+never journaled) and was not asked to grow rebuild/reissue coverage, since this
+ticket does not fix the reissue behaviour, only documents it as an accepted gap.
+
+**Build/vet/test, exact exit codes:**
+- `go build ./...` — exit 0
+- `go vet ./...` — exit 0
+- `go test ./...` (full suite, `aira confine`-wrapped) — exit 0. One run hit a
+  transient `FAIL` in `internal/runner`
+  (`TestLiveTeeCancelDuringNormalJoinKeepsCaptureComplete`, a fixed-50ms-window
+  timing test) under heavy concurrent host load (16-18 other admitted
+  `aira confine` jobs on this shared machine at the time); confirmed
+  load-induced and not a regression by re-running it in isolation (5/5 pass)
+  and by a clean full-suite retry (exit 0, all packages `ok`). The repo's own
+  `.githooks/pre-push` (`make ci` = `fmt-check vet build test`) additionally
+  ran green on both the initial push and the post-rebase force-push.
+
+**PR:** https://github.com/battlesnake/aira/pull/51
+**Merge commit:** recorded below once merged.
+
+AIRA-75 -> done.

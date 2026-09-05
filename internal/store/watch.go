@@ -32,13 +32,55 @@ import (
 //
 // KNOWN OPEN CONSEQUENCE, and NOT the one the ticket named (build-review, Sol):
 // the seq is still not free. Rebuild reconstructs `event_counters.next_seq` from
-// the receipts and journal alone, and these rows appear in neither — so after a
-// database loss their sequence numbers are forgotten and REISSUED to new events,
-// and an `aira watch` consumer resuming from its old cursor (`seq > from`)
-// silently skips them. The fix is for Rebuild to take its high-water mark from
-// the events table's own MAX(seq) as well; that is crash-recovery semantics and
-// is tracked on AIRA-75 rather than bolted on here. An earlier version of this
-// comment claimed the seq "costs nothing beyond a number" — that is retracted.
+// the receipts and journal alone (Store.Rebuild's maxSeq walk), and these rows
+// appear in neither — so after a database loss their sequence numbers are
+// forgotten and REISSUED to new events, and an `aira watch` consumer resuming
+// from its old cursor (cmd/aira/watch.go, `seq > from`) silently skips them. An
+// earlier version of this comment claimed the seq "costs nothing beyond a
+// number" — that is retracted.
+//
+// RETRACTED REMEDY (AIRA-75, CLOSED): the build-review that found the above
+// proposed "have Rebuild also take MAX(seq) over the `events` table" as the
+// fix. That is WRONG — it is a no-op in every case where reissue can actually
+// happen, so no counter change closes this gap:
+//
+//   - A rebuild against an INTACT database never reissues to begin with: both
+//     `events` and `event_counters` survive, and `event_counters.next_seq` is
+//     already correct there — seq-allocation and event-insert commit as one
+//     `BEGIN IMMEDIATE` transaction (§2.1 of the d3-watch design, enforced by
+//     test), so the two can never desync on a live DB. Rebuild's own upsert
+//     (`ON CONFLICT ... next_seq = CASE WHEN event_counters.next_seq <
+//     excluded.next_seq THEN excluded.next_seq ELSE event_counters.next_seq
+//     END`) only ever raises the stored value, never lowers it. Adding a
+//     second source here changes nothing that was not already correct.
+//   - Reissue only happens after a full DATABASE LOSS (fresh schema, every
+//     table starts empty) or an `aira eject` (`events` and `event_counters`
+//     both carry `FOREIGN KEY(project_id) REFERENCES projects(project_id) ON
+//     DELETE CASCADE`, so ejecting the project row deletes both together — no
+//     other code path deletes either table). In both routes `events` is EMPTY
+//     at exactly the moment Rebuild runs, so `SELECT MAX(seq) FROM events`
+//     reads 0 — the same nothing the receipts/journal walk already contributes
+//     for these rows. There is no surviving copy of a watchdog row's seq
+//     anywhere once its project's rows are gone: no fix that reconstructs the
+//     counter from data still inside the SAME on-disk database can recover it,
+//     because that data is erased by the identical event that caused the loss.
+//     The only place a watchdog seq could survive DB loss is a durable store
+//     OUTSIDE the database — i.e. the journal — and that is exactly the
+//     "journal them" option this file already rejects above, for a reason
+//     unrelated to counters (no per-project provenance to journal against).
+//
+// ACCEPTED, DOCUMENTED BOUND: an `aira watch --from N` consumer that resumes
+// after a database loss or eject may silently skip up to N_skip new events,
+// where N_skip = the count of trailing unjournaled (watchdog) seqs issued
+// between the loss and the resume — those seq numbers are reissued to whatever
+// real events land first after rebuild, and the resuming cursor is already past
+// them. This sits outside the d3-watch design's "durable in the DB, recoverable
+// via --from" guarantee (docs/superpowers/specs/2026-08-17-aira-d3-watch-design.md)
+// for exactly the one class of row (watchdog) deliberately excluded from
+// durability by design, above. Journaling the seq (contradicts "nothing to
+// journal them against", above) and an epoch/generation token in the watch
+// cursor (new protocol machinery) were both considered and rejected as
+// disproportionate to this narrow, accepted gap.
 //
 // Measured on this machine, 2026-09-04: 245 of this project's 541 events (45.3%)
 // are journaled=0, and every one of them is an `aira-watchdog` actor row
