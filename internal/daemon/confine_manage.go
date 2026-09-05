@@ -99,7 +99,12 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		if ok {
 			// ONE locked snapshot: granted totals and queued/freeze state must
 			// describe the same instant, or the summary contradicts itself.
-			snapshot := s.admitSliceSnapshot(path)
+			//
+			// AIRA-24: a caller that is ITSELF queued names its own scope id and
+			// gets its position out of that same pass. `aira confine --list`
+			// never passes one (buildRequest does not accept the option), so this
+			// is the blocked launcher's own progress-line probe and nothing else.
+			snapshot := s.admitSliceSnapshotFor(path, stringArg(request.Args, "scope_id"))
 			outstanding, adopted := snapshot.outstanding, snapshot.adopted
 			totalJobs := addJobCountClamp(snapshot.outstandingJobs, snapshot.adoptedJobs)
 			queued, freezePhase := snapshot.queued, snapshot.phase
@@ -112,6 +117,10 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				Jobs:         totalJobs,
 				Queued:       queued,
 				FreezePhase:  freezePhase,
+				// Zero unless the caller named a scope id that is queued right
+				// now: absence of a position, never "position zero".
+				QueuePosition:    snapshot.queuePosition,
+				QueuedAheadBytes: snapshot.queuedAheadBytes,
 				// AIRA-68: the same snapshot's population split, so the summary can
 				// never again be read against the Scopes table above it as though
 				// they counted the same thing.

@@ -58,6 +58,30 @@ type ConfineSliceReserve struct {
 	Queued      int    `json:"queued"`
 	FreezePhase string `json:"freeze_phase,omitempty"`
 
+	// AIRA-24. QueuePosition and QueuedAheadBytes answer ONE waiter's own
+	// question — "where am I in that queue?" — which Queued above cannot: a
+	// job blocked in admission for half an hour could see how many were
+	// waiting but never whether it was next or last. They are populated ONLY
+	// when the caller named its own scope id (the `scope_id` argument), and
+	// only while that scope is still a QUEUED waiter; a granted, released, or
+	// unknown scope id leaves both zero. `aira confine --list` never passes a
+	// scope id, so its output is unchanged.
+	//
+	// Both are derived in the SAME locked pass as Queued, so position, total,
+	// and bytes-ahead can never describe different instants.
+	//
+	// Position is an index in the daemon's EVALUATION order (by enqueue
+	// sequence), not a promise of grant order: the AIRA-59 fairness duty
+	// cycle's yield phase can admit a later, smaller waiter that fits while
+	// the head is still too large. QueuedAheadBytes is the sum of the reserves
+	// of the queued waiters ahead — a fact about the queue, never an ETA,
+	// which the daemon cannot establish.
+	//
+	// Zero means "no position established", never "position zero": a reader
+	// must render its absence as an absence and print nothing.
+	QueuePosition    int   `json:"queue_position,omitempty"`
+	QueuedAheadBytes int64 `json:"queued_ahead_bytes,omitempty"`
+
 	// AIRA-68. Jobs and GrantedBytes above are TOTALS over three structurally
 	// different populations, and only two of them can ever appear as a row in the
 	// Scopes table:

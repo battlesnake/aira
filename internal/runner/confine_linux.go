@@ -151,7 +151,13 @@ type confineDeps struct {
 	signalSource          func() (<-chan os.Signal, func())
 	readUsage             func(string) cgroupUsage
 	reportPeak            func(context.Context, ConfineRequest, string, *int64, bool) error
+	queuePosition         func(context.Context, ConfineRequest, string) (confineQueuePosition, bool)
 	admitWaitDiagInterval time.Duration
+	// admitQueueProbeTimeout bounds ONE queue-position probe. Tests raise it
+	// well above their own patience so that "the grant cancelled the probe" is
+	// distinguishable from "the probe's own timeout expired"; production uses
+	// confineQueueProbeTimeout.
+	admitQueueProbeTimeout time.Duration
 }
 
 // defaultAdmitWaitDiagInterval is how often a blocked admission prints a
@@ -179,6 +185,7 @@ func defaultConfineDeps() confineDeps {
 		signalSource:          confineSignalSource,
 		readUsage:             readCgroupUsage,
 		reportPeak:            reportConfinePeak,
+		queuePosition:         confineQueuePositionFromDaemon,
 	}
 }
 
@@ -228,6 +235,9 @@ func fillConfineDeps(deps confineDeps) confineDeps {
 	}
 	if deps.reportPeak == nil {
 		deps.reportPeak = defaults.reportPeak
+	}
+	if deps.queuePosition == nil {
+		deps.queuePosition = defaults.queuePosition
 	}
 	return deps
 }
@@ -502,8 +512,13 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// waits on a single socket read for up to its maxWait. Emit a periodic progress
 	// line so a bounded wait is never mistaken for a hang. Nothing prints when
 	// admission returns promptly; the goroutine is stopped and joined first.
-	// deferred: AIRA-24 visibility needs a separate daemon --list connection per
-	// tick; do not multiplex this blocked admission socket.
+	//
+	// AIRA-24: each line also carries this job's own place in the queue, which
+	// is what turns "still alive" into a decision an operator can act on. The
+	// position is fetched over a SEPARATE, short-lived daemon connection per
+	// tick — the blocked admission socket is this job's lease and the daemon
+	// reads its next byte as "the client went away", so it must never be
+	// multiplexed. See confineQueuePositionFromDaemon.
 	admitDiag := request.Stderr
 	if admitDiag == nil {
 		admitDiag = os.Stderr
@@ -535,13 +550,28 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 			case <-admitWaitDone:
 				return
 			case <-ticker.C:
+				queueNote := confineQueueNote(ctx, deps, request, path, admitWaitDone)
+				// Sampled AFTER the probe, which can take up to its own
+				// timeout: reading the clock first would under-report the wait
+				// by however long the daemon took to answer.
 				waited := int64(time.Since(start).Seconds())
+				// The probe can take up to its own timeout, and the grant can
+				// arrive inside that window. Re-check before printing: a
+				// "still waiting" line emitted after admission was granted
+				// states something that stopped being true while the line was
+				// being composed. Build review (DeepSeek) raised this; the
+				// window is pre-existing but the probe widens it.
+				select {
+				case <-admitWaitDone:
+					return
+				default:
+				}
 				if pinned {
-					fmt.Fprintf(admitDiag, "confine: waiting for memory admission on %s (reserve %s, waited %ds)\n",
-						sliceName, FormatConfineBytes(reserve), waited)
+					fmt.Fprintf(admitDiag, "confine: waiting for memory admission on %s (reserve %s, waited %ds%s)\n",
+						sliceName, FormatConfineBytes(reserve), waited, queueNote)
 				} else {
-					fmt.Fprintf(admitDiag, "confine: waiting for memory admission on %s (requested reserve %s, unpinned — the daemon resolves the actual grant, which may differ; waited %ds)\n",
-						sliceName, FormatConfineBytes(reserve), waited)
+					fmt.Fprintf(admitDiag, "confine: waiting for memory admission on %s (requested reserve %s, unpinned — the daemon resolves the actual grant, which may differ; waited %ds%s)\n",
+						sliceName, FormatConfineBytes(reserve), waited, queueNote)
 				}
 			}
 		}
