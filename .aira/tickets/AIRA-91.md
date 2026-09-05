@@ -649,4 +649,27 @@ test, not just that the reviewer's literal repro line numbers were patched.
 This is not a nice-to-have refinement -- it is the exact case this whole
 investigation exists to fix.
 
-## Status: root cause closed. Part A build in progress, with the critical gap above outstanding. Part B remains an owner decision.
+## Part A: DONE and verified on master (2026-09-05)
+
+Shipped as PR #35 (`fb9415e`), then required a corrective follow-up PR #36
+(`c72c00c`) because #35 was accidentally squash-merged from a stale snapshot
+of its own branch — a race between a still-actively-working build agent and
+the merge command, caught only by an independent, from-scratch verification
+against the actual merged master rather than trusting the PR's own
+description. Full account on PR #36. **Independently re-verified twice**,
+the second time in a fresh worktree off the genuinely-merged master with no
+prior context carried over: `internal/runner/usage_linux.go` correctly reads
+both `OOMKillLocal` and the new `OOMGroupKillLocal` as a disjunction (closing
+the drained-leader gap the critical finding above identified), plus a
+separate `OwnLimitOOM()`/`OOMLocal` facility distinguishing "this scope's own
+limit fired" from "an ancestor's limit fired and this job's processes were
+collateral" (the AIRA-27 slice-OOM-collateral shape). `go build`/`go vet`
+clean; `TestMemoryEventsLocalDistinguishesOwnLimitFromDescendantOOM`'s
+drained-leader and ancestor-collateral subtests both pass directly against
+master.
+
+**Not yet deployed** — per the backlog plan's §8, this rides the Fix 2+4
+daemon-restart step (client-side code needs no restart of its own; the
+daemon-side `confine-kill` log line does).
+
+## Status: root cause closed. Part A done and verified on master, not yet deployed. Part B remains an owner decision.
