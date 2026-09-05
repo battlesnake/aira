@@ -870,6 +870,11 @@ truncated output, reported as `pass` / `fail` / `unevaluated`.
   obligations; cheap to add later against §9.3's existing facet if wanted.
 - **Docker containment** (§3.1) — not fixed here; documented so exclusivity is
   never overclaimed. Handled separately by peer session `field`.
+- **Accepted deviation from §5.4:** `AIRA_ADMIT_EXCLUSIVE_WAIT_CEILING` warns
+  once and substitutes (the default, or the shared ceiling) rather than refusing
+  at startup. The AIRA-58 sin is the SILENT substitution, which is gone — a bad
+  value is now loud in the daemon log. Refusing at startup would take down the
+  daemon for every session over one operator's typo in a tunable nobody sets.
 - Exclusivity across different slices — out of scope; per-slice, matching every
   other admission concept here.
 

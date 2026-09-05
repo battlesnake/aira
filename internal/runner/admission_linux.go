@@ -134,6 +134,16 @@ type runnerAdmitRejection struct {
 	Required int64  `json:"required,omitempty"`
 	Ceiling  int64  `json:"cap_minus_headroom,omitempty"`
 	Basis    string `json:"basis"`
+	// AIRA-101. "draining" or "held" when the wait expired under slice
+	// exclusivity, empty otherwise.
+	//
+	// Without this field the daemon's reason is dropped on unmarshal and the
+	// operator's TERMINAL message still gives a memory diagnosis — "slice
+	// contended, no memory admission within the wait" — for what was actually a
+	// benchmark holding the slice. That sends them looking at RAM for a problem
+	// that has nothing to do with RAM, and it would have made the daemon-side
+	// reason inert at the one surface it exists for (found by build review).
+	Exclusive string `json:"exclusive,omitempty"`
 }
 
 // ErrExclusiveUnavailable prefixes every refusal of an `--exclusive` request
@@ -531,7 +541,22 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 					// without a grant — the slice was contended for the duration — not
 					// that it is persistently "genuinely saturated" (a state the daemon
 					// never establishes on this path).
-					message = fmt.Sprintf("E_ADMIT_SATURATED: confine: admission rejected after %s — slice contended, no memory admission within the wait (reserve %s/%s)", time.Since(admissionStarted).Round(time.Second), FormatConfineBytes(resolved), ceiling)
+					//
+					// AIRA-101. When the wait expired under slice EXCLUSIVITY, say so.
+					// The default clause below is a MEMORY diagnosis, and offering it for
+					// a benchmark holding the slice sends the operator to look at RAM for
+					// something that has nothing to do with RAM.
+					switch rejection.Exclusive {
+					case "held":
+						message = fmt.Sprintf("E_ADMIT_SATURATED: confine: admission rejected after %s — the slice is held exclusively by another job for benchmarking; retry when it finishes (reserve %s/%s)", time.Since(admissionStarted).Round(time.Second), FormatConfineBytes(resolved), ceiling)
+					case "draining":
+						// Covers BOTH a bystander waiting behind somebody's drain and the
+						// exclusive requester's own drain failing to complete in its budget.
+						// Neither is a memory problem.
+						message = fmt.Sprintf("E_ADMIT_SATURATED: confine: admission rejected after %s — the slice was draining for an exclusive job and the drain did not complete within the wait (reserve %s/%s)", time.Since(admissionStarted).Round(time.Second), FormatConfineBytes(resolved), ceiling)
+					default:
+						message = fmt.Sprintf("E_ADMIT_SATURATED: confine: admission rejected after %s — slice contended, no memory admission within the wait (reserve %s/%s)", time.Since(admissionStarted).Round(time.Second), FormatConfineBytes(resolved), ceiling)
+					}
 				}
 				if message == "" {
 					message = response.Code + ": " + rejection.Basis

@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-101","project":"aira","title":"aira confine --exclusive: let a job request exclusive use of its slice for uncontended benchmarking","status":"in-progress","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","dogfood","scheduler"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-101","project":"aira","title":"aira confine --exclusive: let a job request exclusive use of its slice for uncontended benchmarking","status":"in-review","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","dogfood","scheduler"],"hold":false,"relations":[]}
 ---
 Direct owner request (2026-09-05): "we need a way for jobs launched with 'aira confine' to request exclusive use of the slice, so they get scheduled alone with nothing else running in the slice" — for benchmarking, where contention from other admitted jobs (or aitest workers) invalidates a measurement.
 
@@ -159,13 +159,26 @@ subtree-populated, reverting the lease-deadline fix, removing the
 sub-reservation exemption, dropping fail-closed emptiness, and restoring the
 token strip.
 
-**One honest caveat.** A single full-sweep run showed
-`TestRealCgroupCleanMultiProcessRunIsUnverified` failing. It then passed 5/5 in
-isolation and 3/3 on full-package reruns, unmodified `origin/master` passed the
-same package, and this diff touches neither the `aira run` path nor
-ScopeIntegrity — so it is this project's documented pre-existing flake in that
-test class (the AIRA-70 `pids.peak` certificate gap), not a regression from this
-work. Recorded rather than omitted.
+**Honest caveat on flakes.** Two heavily-loaded sweeps (full suite plus a
+`-race` sweep back to back, on a box already running other sessions' jobs)
+produced intermittent failures in three timing-sensitive real-cgroup tests:
+`TestRealCgroupCleanMultiProcessRunIsUnverified`,
+`TestRealCgroupDescendantMigrationBeforeLeaderExitResidual` and
+`TestRealPytestForkDoesNotHoldGovernorRelay`. All three are pre-existing and none
+is reachable from this diff:
+
+- The two descendant-escape tests are the documented AIRA-70 sampler-window gap
+  (50ms `scopeMembershipSampleInterval` against a 250ms dwell), de-flaked in
+  `11a5056` and accepted as #70's coverage gap. `realRunner` builds a Runner with
+  no memory slice or socket, so `r.admit` returns `disabled` before the daemon
+  path and never reaches this change at all.
+- The relay test asserts a nanosecond ORDERING between a relay release and a
+  child's 1.0s sleep (it failed by ~1.1ms). It drives `AIRA_GOVERNOR_CMD` with a
+  Python helper script, so the `confine-reserve` change is not executed by it.
+
+Each passed 3/3 on rerun, unmodified `origin/master` passed the same packages,
+and the clean headline run above is exit 0. Recorded rather than omitted, and
+the reviewer independently reached the same conclusion.
 
 ### Review findings and how each was handled
 
@@ -209,6 +222,22 @@ primary case).
    tests including a real-cgroup one with a real process in a real
    `.aira-supervisor` child, plus the end-to-end facet-wiring test that would
    have caught (1).
+
+**Re-review: APPROVE-WITH-FIXES**, with one required item that was a genuine
+"shipped inert" finding: `runnerAdmitRejection` had no `Exclusive` field, so the
+daemon's new drain/held reason was DROPPED on unmarshal and the operator's
+terminal message still gave a memory diagnosis ("no memory admission within the
+wait") for what was a benchmark holding the slice — making the daemon-side fix
+inert at the one surface it existed for. Fixed with distinct wording for `held`
+and `draining`, plus three client tests including a positive control asserting
+ordinary contention KEEPS its memory wording (so the new clauses cannot be
+satisfied by rewording every rejection). Four test-claim honesty nits were also
+taken: the e2e deadline test no longer calls itself "the regression test" (it
+clears the deadline in a fake dep, so it would pass against a revert — the
+fix-site test is the real one); the wedge probe now counts three distinct paths
+rather than claiming four; the stale-lease test's first half is relabelled as the
+absent-scope direction it actually is; and the ceiling deviation is recorded in
+the plan's deferrals.
 
 P2s handled: the exclusive requester's own timeout no longer misreports as plain
 saturation; `exclusive=unevaluated` is now reachable rather than a reader trap;

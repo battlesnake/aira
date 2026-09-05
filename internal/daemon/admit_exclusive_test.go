@@ -565,12 +565,18 @@ func TestRepeatedExclusiveRequestAndAbandonNeverWedgesTheSlice(t *testing.T) {
 		evaluate(t, server, queue)
 		requireGranted(t, queue, exclusive, "the exclusive waiter")
 
-		// Rotate through the four STRUCTURALLY DISTINCT ways exclusivity ends. An
-		// earlier version cycled three cases that all reduced to the same
-		// hold-then-ledger-release (timeoutAdmitWaiter is a no-op on a granted
-		// waiter, and the locked form is what releaseAdmitWaiter already calls), so
-		// it ran the same path fifty times and would not have caught a leak on any
-		// other one (found by build review).
+		// Rotate through THREE structurally distinct ways exclusivity ends: a hold
+		// discharged by its connection closing, a DRAIN abandoned before it
+		// completed, and a DRAIN that expired on its own max_wait.
+		//
+		// Counted honestly. An earlier version claimed three paths but cycled cases
+		// that all reduced to the same hold-then-ledger-release (timeoutAdmitWaiter
+		// is a no-op on a GRANTED waiter, and the locked form is what
+		// releaseAdmitWaiter already calls), so it ran one path fifty times and
+		// would not have caught a leak on any other. The fourth arm below is the
+		// same discharge as the first by construction — kept because it exercises it
+		// from the daemon-shutdown call shape, not because it is a distinct path
+		// (both points found by build review).
 		switch round % 4 {
 		case 0:
 			// A HOLD released by its connection closing.
@@ -716,9 +722,13 @@ func TestTheStaleLeaseSweepRespectsAHeldExclusiveLease(t *testing.T) {
 	evaluate(t, server, queue)
 	requireGranted(t, queue, holder, "the exclusive holder")
 
-	// A POPULATED scope: neither reclaim proof holds, so the hold must survive.
+	// No scope on disk at all, and no vanished observation: NEITHER reclaim proof
+	// is available, so the hold must survive. (Labelled honestly — this is the
+	// absent-scope direction, not a populated one; what it establishes is the
+	// load-bearing property that the sweep never reclaims on the age signal
+	// alone, which is what would otherwise silently end a live benchmark.)
 	server.releaseStaleGrantedLeasesPass(context.Background())
-	requireGranted(t, queue, holder, "a held exclusive whose scope is still populated")
+	requireGranted(t, queue, holder, "a held exclusive with no reclaim proof available")
 	if state := server.admitSliceSnapshot("/slice").exclusiveState; state != admitExclusiveHeld {
 		t.Fatalf("the sweep ended a live benchmark's exclusivity: state=%q", state)
 	}

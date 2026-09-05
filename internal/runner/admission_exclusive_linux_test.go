@@ -311,3 +311,70 @@ func TestInheritedTokensAreValidatedBeforeUse(t *testing.T) {
 		t.Fatalf("a malformed parent scope id must be discarded, got %q", parent)
 	}
 }
+
+// AIRA-101 §7.4. The daemon reports WHY a wait expired; the client must render
+// it. Without this the daemon's reason is dropped on unmarshal and the terminal
+// message still gives a MEMORY diagnosis for what was a benchmark holding the
+// slice — sending the operator to look at RAM for something unrelated to RAM,
+// and making the daemon-side reason inert at the one surface it exists for.
+func exclusiveSaturationMessage(t *testing.T, exclusive string) string {
+	t.Helper()
+	r, _ := gateOnlyRunner(t, newInstantClock(), func(string) (int64, int64, bool, string) { return 0, 1 << 40, true, "" })
+	r.lockAttemptFn = func(string) (*admitLock, error) {
+		t.Error("a structured E_ADMIT_SATURATED rejection is terminal and must not reach the flock fallback")
+		return &admitLock{}, nil
+	}
+	client, server := net.Pipe()
+	r.admitDialFn = func(context.Context, string) (net.Conn, error) { return client, nil }
+	go func() {
+		defer server.Close()
+		var request runnerAdmitRequestFrame
+		if err := readRunnerAdmitFrame(server, &request); err != nil {
+			return
+		}
+		data, _ := json.Marshal(runnerAdmitRejection{Basis: "reject:saturated", Ceiling: 48 << 30, Exclusive: exclusive})
+		_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{
+			OK: false, Code: "E_ADMIT_SATURATED", Error: "E_ADMIT_SATURATED: reject:saturated", Data: data,
+		})
+	}()
+	_, err := r.admit(context.Background(), Request{})
+	if err == nil {
+		t.Fatal("expected a saturation rejection")
+	}
+	return err.Error()
+}
+
+// A BYSTANDER whose wait expired while a benchmark held the slice.
+func TestSaturationUnderAnExclusiveHoldSaysSoRatherThanBlamingMemory(t *testing.T) {
+	message := exclusiveSaturationMessage(t, "held")
+	if !strings.Contains(message, "held exclusively") {
+		t.Fatalf("the operator must be told a benchmark holds the slice, got: %s", message)
+	}
+	if strings.Contains(message, "no memory admission") {
+		t.Fatalf("an exclusivity wait must not be reported as a memory problem: %s", message)
+	}
+}
+
+// A waiter behind a DRAIN — and the exclusive requester's own drain expiry,
+// which the daemon also reports as "draining".
+func TestSaturationUnderAnExclusiveDrainSaysSoRatherThanBlamingMemory(t *testing.T) {
+	message := exclusiveSaturationMessage(t, "draining")
+	if !strings.Contains(message, "draining for an exclusive job") {
+		t.Fatalf("the operator must be told the slice was draining, got: %s", message)
+	}
+	if strings.Contains(message, "no memory admission") {
+		t.Fatalf("a drain wait must not be reported as a memory problem: %s", message)
+	}
+}
+
+// The positive control: ordinary contention keeps its existing memory wording,
+// so the tests above cannot be satisfied by rewording every rejection.
+func TestOrdinarySaturationKeepsItsMemoryWording(t *testing.T) {
+	message := exclusiveSaturationMessage(t, "")
+	if !strings.Contains(message, "no memory admission within the wait") {
+		t.Fatalf("ordinary contention must keep its memory diagnosis, got: %s", message)
+	}
+	if strings.Contains(message, "exclusive") {
+		t.Fatalf("ordinary contention must not mention exclusivity: %s", message)
+	}
+}

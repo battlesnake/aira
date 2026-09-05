@@ -70,14 +70,15 @@ func TestExclusiveRunReportsGrantedAndExportsTheToken(t *testing.T) {
 	}
 }
 
-// THE REGRESSION TEST for the deadline leak. A lease carrying a transport
-// deadline fails its read on a healthy connection once the deadline passes, so
-// this drives a run that outlives a SHORT deadline and asserts the outcome is
-// still granted.
+// The CONSUMER half of the deadline-leak fix: given a lease with no deadline, a
+// run that outlives the old deadline window is still reported granted.
 //
-// Without the fix (clearing the deadline before the connection becomes the
-// lease) this reports `exclusive=lost` and prints the contamination warning on a
-// run where nothing whatsoever went wrong.
+// This is deliberately NOT the regression test, and saying so matters: it clears
+// the deadline inside the fake `admit` dep, so it would pass against a reverted
+// production fix. The actual regression test is
+// TestAGrantedLeaseCarriesNoTransportDeadline in admission_exclusive_linux_test.go,
+// which goes through the real admitThroughDaemon and fails on a revert. This one
+// pins the watcher's behaviour, which that one does not reach.
 func TestALongExclusiveRunIsNotReportedLostByAStaleTransportDeadline(t *testing.T) {
 	scope := &confineFakeScope{}
 	deps := confineUnitDeps(scope)
