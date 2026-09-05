@@ -707,7 +707,76 @@ hour-long gates from an agent session at all.
 
 ## 9. Deviation record
 
-Deviations from this plan taken during the build are appended here.
+Everything below is a deliberate departure from the plan as written, taken during
+the build or during build review, and recorded rather than left silent.
+
+**Additions to the design**
+
+1. **A fifth state, `starting`.** The plan's table mapped every "phase below
+   running" to `admitting`. That over-claims for a record whose supervisor has
+   not yet reached the launch gate — it has not resolved a slice, let alone
+   entered admission — so `starting` is reported as itself.
+2. **The live states are worded as "the last phase the supervisor RECORDED".**
+   Build review observed that a lost phase write leaves a running job's record
+   saying `admitting`, so the original reason line ("it is not running yet")
+   asserted something the record could not support. `OnPlaced` now also retries
+   once and reports a failed write to `supervisor.log`.
+3. **An unrecognised phase, and a terminal record carrying no outcome, are
+   `outcome-unknown`.** Neither is reachable from an honest supervisor; both are
+   reachable from corruption, and both would otherwise be reported as facts.
+4. **The supervisor refuses to start when its own process identity is
+   unavailable**, mirroring the run path's `E_RUN_IDENTITY_UNAVAILABLE`. A
+   supervisor with no start tick or boot id can never be liveness-checked, so its
+   record would read `outcome-unknown` for ever regardless of how the job ended.
+5. **Every post-store return terminalizes** through one `terminalize` closure,
+   not just the `Confine` return and the panic defer.
+6. **Store reads are fd-anchored at every path component** and refuse a
+   non-regular record. The plan specified `O_NOFOLLOW` on the final component
+   only, which a swapped scope *directory* defeats, and said nothing about a
+   planted FIFO blocking a status query.
+7. **A record's name, owner and supervisor pid must match the directory name**,
+   not just its scope id: a forged owner misdirects owner-scoped selection and a
+   forged pid makes `--status` probe an unrelated process's liveness.
+8. **`confineSupervisorAlive` delegates to the existing `processLive`** rather
+   than deriving liveness itself. The first implementation treated an incomplete
+   identity and a zombie as alive — the one direction this verb must never take.
+9. **`--slice` is refused with `--status`** (AIRA-82's rule) rather than accepted
+   and ignored.
+10. **`ConfineDetachRecord.DelegateRAM`** and a json tag on
+    `ConfineStatus.TerminatedBy` were added; the status listing sorts by parsed
+    time rather than lexically (RFC3339Nano trims trailing zeros).
+11. **`validateConfineName` moved to the portable file**, beside the scope-id
+    parser it now shares a caller with.
+12. **Two test seams** exist in production code, both nil in production and both
+    documented at their definition: `confineDetachBeforeRenameHook` (proves
+    record-write atomicity deterministically) and `confineDetachAfterRecordHook`
+    (the only way to prove a deferred panic-writer runs).
+
+**Removed from the design**
+
+13. **No `ConfineRequest.Detach` field.** The plan already flagged the
+    nil-ledger panic risk; the field is simply absent, so the transcription that
+    would arm `checkDetachAdmission` cannot be written.
+
+**A nuance the plan stated too simply**
+
+14. §3.7 says a SIGTERM to the supervisor "still tears the job down through the
+    AIRA-70 handler". True once the scope exists, but that handler is installed
+    after `backend.Create`, i.e. after admission. A SIGTERM arriving while the
+    supervisor is waiting for the acknowledgement or queued in admission
+    default-terminates it with no teardown; the record then stays non-terminal
+    and `--status` reports `outcome-unknown`, which is honest, and nothing has
+    been launched. `aira confine --kill` likewise cannot reach a job that has no
+    scope yet — `--list` shows a queued waiter only once the daemon has granted
+    it. Same behaviour as the foreground form; recorded here rather than fixed.
+
+**Tests**
+
+15. The plan's twenty tests became thirty-one, after two review rounds named five
+    of the originals porous and six behaviours untested. Two of the plan's own
+    tests were deleted rather than written: the mint/defaulting parity test
+    (a shared normaliser makes drift impossible, which is strictly stronger) and
+    the syntax-only scope-id test (replaced by the four-facet binding test).
 
 ## 10. Plan-review round 1 — findings and resolutions
 

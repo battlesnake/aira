@@ -607,6 +607,17 @@ func TestConfineDetachRecordFilesAreOwnerOnlyAndRefuseSymlinksAndReuse(t *testin
 	if _, err := openConfineDetachJob(state, scopeID); err == nil {
 		t.Fatal("a second supervisor adopted an existing record directory")
 	}
+	// An EMPTY pre-existing directory is the case that distinguishes creating the
+	// directory from merely ensuring it: the capture files' O_EXCL catches a
+	// populated one either way, so only this case proves the directory itself is
+	// created rather than adopted.
+	empty := confineScopeID("empty", "session-a", false)
+	if err := os.Mkdir(filepath.Join(state, empty), 0o700); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if _, err := openConfineDetachJob(state, empty); err == nil {
+		t.Fatal("a supervisor adopted an empty pre-existing record directory instead of refusing it")
+	}
 	// A pre-planted symlink where a capture file would go must be refused, not
 	// written through.
 	victim := filepath.Join(t.TempDir(), "victim")
@@ -1193,6 +1204,67 @@ func TestSuperviseConfineDetachedWritesATerminalRecordOnAPanic(t *testing.T) {
 	}
 	if record.ErrorCode != CodeConfineDetachFailed || !strings.Contains(record.Error, "panicked") {
 		t.Fatalf("the record does not name the panic: %+v", record)
+	}
+}
+
+// A supervisor whose own process identity is unavailable can never be
+// liveness-checked, so its record would read `outcome-unknown` for ever however
+// the job ended. It must refuse to start rather than create a record nobody can
+// interpret.
+//
+// verifies: AIRA-22
+func TestSuperviseConfineDetachedRefusesWhenItsOwnIdentityIsUnavailable(t *testing.T) {
+	state := t.TempDir()
+	originalBootID := readBootIDFn
+	readBootIDFn = func() (string, error) { return "", errors.New("injected: boot id unreadable") }
+	t.Cleanup(func() { readBootIDFn = originalBootID })
+	restore := isolateSupervisorSideEffects(t)
+	defer restore()
+	control, err := writeControlValue(state, "confine-detach-*.ctrl", ConfineRequest{
+		Slice: "aira-nonexistent-" + strconv.Itoa(os.Getpid()) + ".slice",
+		Name:  "identityless", Owner: "session-test", Argv: []string{"/bin/true"},
+		DetachStateDir: state, SelfPath: os.Args[0],
+	})
+	if err != nil {
+		t.Fatalf("control: %v", err)
+	}
+	readyR, readyW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	ackR, ackW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer readyR.Close()
+	defer readyW.Close()
+	defer ackR.Close()
+	defer ackW.Close()
+	supervisorReady, err := unix.Dup(int(readyW.Fd()))
+	if err != nil {
+		t.Fatalf("dup: %v", err)
+	}
+	supervisorAck, err := unix.Dup(int(ackR.Fd()))
+	if err != nil {
+		t.Fatalf("dup: %v", err)
+	}
+	superviseErr := SuperviseConfineDetached(context.Background(), control, supervisorReady, supervisorAck)
+	if superviseErr == nil {
+		t.Fatal("a supervisor with no establishable identity started anyway")
+	}
+	if !strings.Contains(superviseErr.Error(), "process identity is unavailable") {
+		t.Fatalf("unhelpful refusal: %v", superviseErr)
+	}
+	// The refusal must happen BEFORE the record store is created: a record whose
+	// supervisor can never be liveness-checked is worse than no record.
+	entries, readErr := os.ReadDir(state)
+	if readErr != nil {
+		t.Fatalf("read state dir: %v", readErr)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			t.Fatalf("an identity-less supervisor created an uninterpretable record directory %q", entry.Name())
+		}
 	}
 }
 

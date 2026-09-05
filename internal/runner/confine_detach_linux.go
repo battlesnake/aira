@@ -739,8 +739,14 @@ func SuperviseConfineDetached(ctx context.Context, controlPath string, readyFD, 
 	return nil
 }
 
+// bootIDOrEmpty reads the boot id through the SAME seam processLive reads it
+// through. Sharing the seam is what makes "the supervisor refuses to start when
+// its own identity is unavailable" testable at all: the condition is
+// unreachable on a healthy host, so without an injectable reader the guard
+// would be a claim no test could check (it survived mutation testing until this
+// changed).
 func bootIDOrEmpty() string {
-	boot, err := currentBootID()
+	boot, err := readBootIDFn()
 	if err != nil {
 		return ""
 	}
