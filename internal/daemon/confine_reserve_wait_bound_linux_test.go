@@ -394,6 +394,29 @@ func TestConfineReserveGrantOutlivesTheDeclaredBound(t *testing.T) {
 	}
 
 	// --- and it releases promptly on stdin EOF ---
+	//
+	// An ANCHOR reservation is opened first, and it is not decoration. When the
+	// last waiter leaves a queue, pruneAdmitQueue DELETES the queue outright, and
+	// admitSliceSnapshotFor answers an absent queue with an all-zero snapshot. So
+	// "every counter reads zero after the release" is VACUOUS on its own — it is
+	// true of a correct discharge and equally true of a release that dropped the
+	// waiter while leaving queue.outstanding charged. Mutation testing proved
+	// exactly that: a mutant which removed the waiter and skipped the decrement
+	// SURVIVED the zero-check. Keeping a second reservation alive keeps the queue
+	// alive, so the ledger stays observable and the discharge has to be exact.
+	anchor := startReserveHelper(t, binary, slice, "aira108:anchor", 16<<20, 30*time.Second)
+	anchor.awaitGrant(t)
+	t.Cleanup(func() { _ = anchor.stdin.Close() })
+	anchorReserve := int64(0)
+	for _, row := range server.admitSliceSnapshot(slice).reservations {
+		if row.signature == "aira108:anchor" {
+			anchorReserve = row.reserve
+		}
+	}
+	if anchorReserve <= 0 {
+		t.Fatalf("the anchor reservation was not charged; the release check below would be vacuous")
+	}
+
 	if err := helper.stdin.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -414,24 +437,29 @@ func TestConfineReserveGrantOutlivesTheDeclaredBound(t *testing.T) {
 	// pairing is the point (found by Sol build-review): reservationJobs and
 	// reservations are BOTH derived by walking queue.waiters, so a release that
 	// dropped the waiter while leaving `outstanding`/`outstandingJobs` charged
-	// would satisfy them both and leak ledger capacity silently. residual* is
-	// exactly the cross-check for that, and this fixture is isolated enough to
-	// demand a hard zero on every one of them.
+	// would satisfy them both and leak ledger capacity silently. residual* is the
+	// cross-check for exactly that. With the anchor holding the queue open, the
+	// expected values are the anchor's alone — an EXACT figure, not a zero.
 	deadline := time.Now().Add(30 * time.Second)
+	var snapshot admitSnapshot
 	for {
-		snapshot := server.admitSliceSnapshot(slice)
-		released := snapshot.reservationJobs == 0 && len(snapshot.reservations) == 0 &&
-			snapshot.outstanding == 0 && snapshot.outstandingJobs == 0 &&
+		snapshot = server.admitSliceSnapshot(slice)
+		settled := snapshot.reservationJobs == 1 && len(snapshot.reservations) == 1 &&
+			snapshot.outstandingJobs == 1 && snapshot.outstanding == anchorReserve &&
 			snapshot.residualJobs() == 0 && snapshot.residualBytes() == 0
-		if released {
+		if settled {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("30s after the holder exited the ledger still holds rows=%d reservationJobs=%d "+
-				"outstanding=%d outstandingJobs=%d residualJobs=%d residualBytes=%d",
+			t.Fatalf("30s after the holder exited the ledger reads rows=%d reservationJobs=%d "+
+				"outstanding=%d (want the anchor's %d) outstandingJobs=%d residualJobs=%d residualBytes=%d",
 				len(snapshot.reservations), snapshot.reservationJobs, snapshot.outstanding,
-				snapshot.outstandingJobs, snapshot.residualJobs(), snapshot.residualBytes())
+				anchorReserve, snapshot.outstandingJobs, snapshot.residualJobs(), snapshot.residualBytes())
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	if snapshot.reservations[0].signature != "aira108:anchor" {
+		t.Fatalf("the surviving row is %q, want the anchor — the wrong reservation was discharged",
+			snapshot.reservations[0].signature)
 	}
 }
