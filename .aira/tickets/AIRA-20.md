@@ -99,3 +99,25 @@ Whole-suite evidence at the branch tip: 6 consecutive green `go test ./... -coun
 runs after the last fix, plus `make ci` green, plus `-race` green on `internal/daemon`
 and `internal/runner` (not wired into CI — see the block above). Every failure observed
 during this work was reproduced, attributed and fixed rather than retried away.
+
+### One observed flake left UNFIXED and unattributed, in a package outside this pass
+
+GitHub CI on the AIRA-20 branch failed once on `cmd/aira`, a package this pass does
+not touch (its diff against master is empty):
+
+    --- FAIL: TestCLIRunRealCgroupOrClearSkip (0.00s)
+        main_test.go:523: fork/exec /usr/bin/git: bad file descriptor
+
+`main_test.go:523` is a plain `exec.Command("git", "init", dir).Run()` with no
+ExtraFiles and no timing, so EBADF out of `forkAndExecInChild` points at the same
+process-global descriptor race as `TestScopeMembershipEventsDeliversModifyAndReleasesFD`
+above — a descriptor closing under another goroutine — rather than at anything in this
+change. It passed on rerun and did not reproduce in four local runs. Recorded rather
+than retried away, but NOT fixed: `cmd/aira` was outside this pass's scope and one
+sighting is not enough to locate the closer.
+
+Note also that `internal/daemon/worker_admit_real_cgroup_linux_test.go:44` still uses
+the `len(os.ReadDir("/proc/self/fd"))` process-global measurement this pass replaced in
+`internal/runner`. It is far more robust as written (a directional `growth > 5` against
+a +30 defect signal, with GC disabled), so it was left alone — listed here so the class
+has both of its known instances written down.
