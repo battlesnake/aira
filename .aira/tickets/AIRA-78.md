@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-78","project":"aira","title":"Ratchet gate selects evidence by git HEAD, not by the subject digest — a dirty tree mints a pass from another tree's reports","status":"planned","kind":"bug","severity":"P0","assignee":null,"milestone":null,"labels":["dogfood","gate","honesty"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-78","project":"aira","title":"Ratchet gate selects evidence by git HEAD, not by the subject digest — a dirty tree mints a pass from another tree's reports","status":"done","kind":"bug","severity":"P0","assignee":null,"milestone":null,"labels":["dogfood","gate","honesty"],"hold":false,"relations":[]}
 ---
 Found during the AIRA-72 two-loop (Codex/Sol P0-3, confirmed by the Fable plan gate). Deliberately deferred out of AIRA-72's scope because it is an evidence-selection defect, not a digest-scope defect.
 
@@ -56,3 +56,94 @@ ratchets, and it needs its own adversarial loop.
 **Either path is gated on the owner's answer**, exactly like AIRA-28/29 and
 AIRA-91 Part B elsewhere in that plan — it is not a default an executor proceeds
 on.
+
+## Resolution (2026-09-05)
+
+Owner sign-off received: **delete, not fix.** Re-verified read-only against the
+live `~/.local/state/aira/state.db` immediately before starting — `gates`,
+`gate_results`, `gate_proofs`, `gate_attestations`, `gate_baselines`,
+`gate_baseline_active`, `test_reports`, `test_report_results` were all still
+zero rows.
+
+**PR [#43](https://github.com/battlesnake/aira/pull/43), squash-merged as
+`d0526d3`** (branch `aira78-delete-ratchet-gate` off `origin/master`).
+
+**Deleted:** `internal/gate/gate.go`'s `KindRatchet`/`CheckerRatchet`/`Ratchet`
+payload/`ComparisonKey`/`ratchetShardPattern` and every ratchet validation
+branch; `internal/store/gate_ratchet.go` and `gate_ratchet_test.go` entirely
+(`evaluateRatchet` and the whole `GateBaseline` mechanism —
+`PinGateBaseline`/`ShowGateBaseline`/`ResolveGateBaseline`/
+`deriveRatchetBaseline`/`baselineFromAuditRecord`, which existed only to serve
+ratchet gates, not shared with checkable/manual); the `gate_baselines`/
+`gate_baseline_active` DB tables (dropped via an idempotent `DROP TABLE IF
+EXISTS` in `initDB` — no migration needed, zero rows ever existed), their audit
+record kinds (`"baseline"`/`"baseline-pointer"`), reconcile-projection logic,
+CLI subverbs (`baseline-pin`/`baseline-show`), and `Store`-interface methods;
+the `"ratchet-status"` insight gauge. Also touched: `internal/store/
+gate_command.go`, `gate_write.go`, `gate_audit.go`, `gate_index.go`,
+`schema_ownership.go`, `store.go`; `internal/core/core.go`, `store_guard.go`,
+`recording_store_test.go`, `dispatch_metadata_test.go`, `routing_test.go`,
+`gate_honesty_test.go`, `insights_test.go`, `skill_test.go`;
+`internal/gitcontext/env.go`; `cmd/aira/main.go`, `cmd/aira/skill_test.go`.
+
+**Kept, deliberately:** `internal/gate/canary.go` and its
+`CanarySyntheticRatchet` canary mode are byte-for-byte unchanged, per explicit
+scope. `runCanary`'s synthetic-ratchet branch in `gate_eval.go` depends on
+comparator primitives (`RatchetSnapshot`, `RatchetComparison`,
+`compareNoNewFailures`, `sortedSet`) that used to live in `gate_ratchet.go` —
+these were **relocated**, not deleted, into `gate_eval.go`, with a comment
+explaining why. A store-level integration test
+(`TestSyntheticRatchetCanaryLaneStillWiredThroughRunCanary`) exercises
+`canaryFor` → `runCanary` → `compareNoNewFailures` end-to-end on a checkable
+gate (the vehicle changed since ratchet gates no longer exist; `runCanary`'s
+synthetic-ratchet branch never reads the referring gate's kind or payload).
+`checkable`/`manual` gate kinds are untouched.
+
+**`internal/codes/codes.go` divergence handling:** `U_GATE_BASELINE_MISSING`,
+`U_GATE_INCOMPARABLE`, `E_GATE_BASELINE_INVALID` deleted from the catalogue —
+each was exclusively produced by now-deleted code (verified via
+`internal/codes/produced_test.go`'s produced-vs-catalogued `go/ast` scan, green
+with **zero** new divergence-table entries). `E_GATE_RATCHET_REGRESSED` was
+**kept**: it remains genuinely produced by the surviving (relocated)
+`compareNoNewFailures`, reachable via the untouched synthetic-ratchet canary
+lane (`ValidateCanary` requires that mode to always introduce a new failure, so
+the comparator always returns that code for it).
+
+**Docs:** removal-note banners added to the dedicated M13b ratchet design spec
+and the M15b gauges spec, plus a one-line pointer at the `Gate` definition in
+the main authoritative design doc (`2026-08-07-aira-design.md`). Other dated
+historical milestone docs left as the historical record, consistent with how
+this repo handled the AIRA-73 outbox deletion.
+
+**Verification:** `go build ./...` exit 0; `go vet ./...` exit 0; `go test
+./...` (all 15 packages) exit 0 — run independently three times (post-change,
+post-rebase onto latest `origin/master`, and again via the pre-push hook's
+`make` with `-count=1`).
+
+**Process notes:** the actual code deletion was delegated to Codex
+(`mcp__codex-terra__codex`) per this project's standing rule, with a detailed
+brief covering the ratchet-exclusive `GateBaseline` mechanism (which doesn't
+contain the literal word "ratchet" in most identifiers) and the
+canary-relocation subtlety up front; Codex's diff was self-reviewed file by
+file before any test/build run. The branch was rebased onto `origin/master`
+(5 commits, including a same-night AIRA-89 no-op-branch cleanup that
+deliberately left the `gate_index.go` baseline block for this ticket to
+resolve) immediately before opening the PR, and the remote branch tip was
+re-verified (local HEAD / upstream / `git ls-remote` / `gh pr view` all
+agreeing) immediately before merging, per the AIRA-91 incident lesson.
+
+**Sol (codex-sol) adversarial review:** first pass **BLOCK** — 2×P1 + 1×P2:
+(1) the dropped `gate_baselines`/`gate_baseline_active` tables would persist in
+any already-initialized local DB with no migration; (2) the relocation deleted
+`TestSyntheticRatchetCanaryUsesSameComparatorInMemory` without replacing it,
+leaving `runCanary`'s actual wiring for the synthetic-ratchet lane untested
+(only the pure comparator function was still tested — a regression in the
+wiring itself would have passed); (3) the M15b gauges spec still presented
+`ratchet-status` as live. All three fixed (idempotent `DROP TABLE IF EXISTS`;
+the relocated `runCanary` integration test above; the M15b banner) and
+confirmed on a second pass — **PASS WITH NITS**, two minor P2s recorded as
+consciously deferred rather than fixed: a dedicated migration-seed-then-verify
+regression test for a table that will never carry data in practice, and a note
+observing (not objecting) that the new integration test's expected
+predicate/code are the only values a valid synthetic-ratchet canary can
+produce.
