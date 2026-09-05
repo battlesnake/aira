@@ -153,6 +153,14 @@ type admitWaiter struct {
 	owner        string
 	scopeCeiling int64
 
+	// AIRA-108. The client's own resource signature, retained purely so
+	// `confine --list` can NAME a scope-less reservation rather than report it
+	// only as one more unit in an aggregate. It takes part in NO admission
+	// decision — resolveAdmitReserve reads request.signature directly, and always
+	// did — so a malformed or hostile value can only ever affect what an operator
+	// is shown, and every renderer escapes and truncates it before printing.
+	signature string
+
 	// AIRA-68. scopeSeen/scopeVanished record a TRANSITION observed by the
 	// evaluator's own <=1s confine scan — the same authority the adopted ledger
 	// already trusts — and are meaningful only for a scope-backed waiter
@@ -752,6 +760,24 @@ type admitSnapshot struct {
 	// exclusiveWaiting counts the queued waiters actually held up behind the
 	// exclusive job. It excludes the exclusive waiter itself.
 	exclusiveWaiting int
+
+	// AIRA-108. One row per GRANTED, accounted, scope-less waiter — the population
+	// reservationJobs/reservationBytes above can only count. Gathered in the same
+	// pass and under the same lock as everything else here, so an operator can
+	// never be shown rows from one instant beside totals from another.
+	//
+	// Held as VALUES copied out under the lock, never as *admitWaiter pointers:
+	// sorting, capping and rendering all happen after the lock is dropped, and a
+	// pointer would let a released waiter's fields be read unsynchronised.
+	reservations []admitReservationRow
+}
+
+// admitReservationRow is one scope-less reservation, copied out of a waiter
+// under queue.mu.
+type admitReservationRow struct {
+	signature string
+	reserve   int64
+	heldMS    int64
 }
 
 // residualJobs and residualBytes cross-check the DERIVED split (a walk of
@@ -814,6 +840,10 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		phase: phase, present: true,
 	}
 	queuedBytes := int64(0)
+	// ONE reading of the clock for the whole walk (AIRA-108): ages taken per-row
+	// would drift across a long waiter list, so two rows could report an ordering
+	// the queue never had.
+	now := s.admitNowTime()
 	for _, waiter := range queue.waiters {
 		if waiter == nil {
 			continue
@@ -842,6 +872,21 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		if waiter.scopeID == "" {
 			snapshot.reservationJobs++
 			snapshot.reservationBytes = addClamp(snapshot.reservationBytes, waiter.reserve)
+			// AIRA-108. Name it, in the same pass. heldMS is derived from grantedAt
+			// — the daemon's own record of the exact grant moment — and NOT from
+			// `enqueued`, which would conflate ordinary admission-queue contention
+			// with the hold this row exists to describe. A grantedAt that is somehow
+			// unset or in the future reports 0 rather than a negative or fabricated
+			// duration: an unestablished age, never a wrong one.
+			held := int64(0)
+			if !waiter.grantedAt.IsZero() {
+				if elapsed := now.Sub(waiter.grantedAt); elapsed > 0 {
+					held = elapsed.Milliseconds()
+				}
+			}
+			snapshot.reservations = append(snapshot.reservations, admitReservationRow{
+				signature: waiter.signature, reserve: waiter.reserve, heldMS: held,
+			})
 			continue
 		}
 		snapshot.scopeJobs++
@@ -1309,7 +1354,7 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 		return nil, nil, CodeProtocol, fmt.Errorf("%s: admission arrival sequence overflow", CodeProtocol)
 	}
 	queue.seq++
-	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, exclusive: request.exclusive, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID}
+	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, signature: request.signature, exclusive: request.exclusive, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID}
 	queue.waiters = append(queue.waiters, waiter)
 	queue.signal()
 	return queue, waiter, "", nil
