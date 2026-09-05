@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-89","project":"aira","title":"Dead and unreachable symbols across store, runner, daemon and the CLI faces","status":"planned","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["dead-code","simplification"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-89","project":"aira","title":"Dead and unreachable symbols across store, runner, daemon and the CLI faces","status":"done","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["dead-code","simplification"],"hold":false,"relations":[]}
 ---
 PR #12 finding **B14** / plan candidate **78**, filed by the simplification programme's
 Phase 0 (plan §4.2, §4.3). Suggested severity **P3**; the schema has no P3, so filed P2 at the
@@ -142,3 +142,16 @@ Verified: `go build ./...`, `go vet ./...` both clean; full `go test
 **Ticket stays open** pending AIRA-78 landing item 3. `parseInstalledMemoryHigh`
 and the whale coexistence checks remain correctly-declined non-deletions per
 the earlier section.
+
+## Item 3 landed — AIRA-78 merged (2026-09-05)
+
+`gate_index.go`'s `_ = baseline` discard, and the entire ratchet-baseline
+mechanism it was part of, is gone — deleted whole by AIRA-78 (PR #43,
+`d0526d3`), confirmed by grep (`gate_baselines`/`_ = baseline` no longer
+appear in `gate_index.go`). All three of PR #12's named no-op branches are
+now resolved: two by this ticket's own commit, one folded into AIRA-78's
+larger deletion.
+
+**All actionable items closed.** `parseInstalledMemoryHigh` and the whale
+coexistence checks remain correctly-declined non-deletions (not dead, not
+mechanical). Closing.
