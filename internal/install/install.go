@@ -40,10 +40,13 @@ const (
 )
 
 var (
-	memorySizeRE          = regexp.MustCompile(`^[0-9]+G$`)
-	installedMemoryMaxRE  = regexp.MustCompile(`(?m)^MemoryMax=(.*)$`)
-	installedMemoryHighRE = regexp.MustCompile(`(?m)^MemoryHigh=(.*)$`)
+	memorySizeRE              = regexp.MustCompile(`^[0-9]+G$`)
+	installedMemoryMaxRE      = regexp.MustCompile(`(?m)^MemoryMax=(.*)$`)
+	installedMemoryHighRE     = regexp.MustCompile(`(?m)^MemoryHigh=(.*)$`)
+	inotifyMaxUserInstancesRE = regexp.MustCompile(`(?m)^fs\.inotify\.max_user_instances\s*=\s*([0-9]+)\s*$`)
 )
+
+const procInotifyMaxUserInstances = "/proc/sys/fs/inotify/max_user_instances"
 
 //go:embed assets
 var assets embed.FS
@@ -689,8 +692,15 @@ func runUserInstall(d installDeps, opts installOpts) error {
 	}
 	enforcement := memoryEnforcementState(d, uid, maximum)
 	oomdHealthy := systemDropinsHealthy(d, uid)
-	if enforcement != enforcementActive || !oomdHealthy {
-		d.logf("warning: run 'sudo aira install' to apply the /etc oomd + delegation drop-ins, then re-login")
+	switch {
+	case enforcement != enforcementActive:
+		// Re-login (or reboot) is genuinely required here: Delegate= only
+		// applies at the next user@.service (re)start.
+		d.logf("warning: run 'sudo aira install' to apply the /etc oomd + delegation + sysctl drop-ins, then re-login")
+	case !oomdHealthy:
+		// oomd/sysctl activation takes effect immediately (systemctl
+		// restart/sysctl --system); no re-login is needed for this case alone.
+		d.logf("warning: run 'sudo aira install' to apply the /etc oomd + delegation + sysctl drop-ins")
 	}
 	d.logf("installed: %s MemoryMax=%s MemoryHigh=%s; anchor active; memory delegation: %s; %s active, running, and MainPID-tied", d.sliceUnit, maximum, high, enforcement, d.daemonUnit)
 	return nil
@@ -952,10 +962,11 @@ func hasToken(data []byte, wanted string) bool {
 }
 
 type systemDropin struct {
-	asset string
-	dst   string
-	oomd  bool
-	unit  bool
+	asset  string
+	dst    string
+	oomd   bool
+	unit   bool
+	sysctl bool
 }
 
 type renderedSystemDropin struct {
@@ -970,6 +981,7 @@ func systemDropins(etcRoot string, uid int) []systemDropin {
 		{asset: "assets/oomd/user-slice-oomd.conf", dst: filepath.Join(etcRoot, "systemd/system", fmt.Sprintf("user-%d.slice.d", uid), "50-aira-oomd.conf"), oomd: true, unit: true},
 		{asset: "assets/oomd/session-slice-oomd-protect.conf", dst: filepath.Join(etcRoot, "systemd/user/session.slice.d/50-aira-oomd-protect.conf"), oomd: true, unit: true},
 		{asset: "assets/oomd/user-service-delegate.conf", dst: filepath.Join(etcRoot, "systemd/system/user@.service.d/10-aira-delegate.conf"), unit: true},
+		{asset: "assets/sysctl/60-inotify-aira.conf", dst: filepath.Join(etcRoot, "sysctl.d/60-inotify-aira.conf"), sysctl: true},
 	}
 }
 
@@ -1004,6 +1016,7 @@ func installSystemDropins(d installDeps, uid int, dryRun bool) error {
 		}
 		d.logf("planned: systemctl daemon-reload for changed unit drop-ins")
 		d.logf("planned: systemctl restart systemd-oomd for changed oomd drop-ins")
+		d.logf("planned: sysctl --system for changed sysctl drop-ins")
 		return nil
 	}
 
@@ -1076,7 +1089,7 @@ func installSystemDropins(d installDeps, uid int, dryRun bool) error {
 	}
 
 	var failures []error
-	unitChanged, oomdChanged := false, false
+	unitChanged, oomdChanged, sysctlChanged := false, false, false
 	for _, dropin := range opened {
 		if !dropin.stale {
 			d.logf("%s: up to date", dropin.dst)
@@ -1092,12 +1105,44 @@ func installSystemDropins(d installDeps, uid int, dryRun bool) error {
 			d.logf("%s: updated", dropin.dst)
 			unitChanged = unitChanged || dropin.unit
 			oomdChanged = oomdChanged || dropin.oomd
+			sysctlChanged = sysctlChanged || dropin.sysctl
 		}
 	}
 	if unitChanged {
 		if _, reloadErr := d.run([]string{"systemctl", "daemon-reload"}, nil); reloadErr != nil {
 			d.logf("partial /etc install: systemctl daemon-reload failed: %v", reloadErr)
 			failures = append(failures, fmt.Errorf("systemctl daemon-reload: %w", reloadErr))
+		}
+	}
+	// A byte-identical file is not enough to skip activation: unlike
+	// daemon-reload, a sysctl.d file only takes effect at boot or by an
+	// explicit apply, so a prior `sysctl --system` failure (or a value later
+	// changed out from under the file, e.g. by a reboot before this file
+	// existed) must keep being retried on every run until the kernel's live
+	// value actually matches — mirroring the oomd self-healing check below.
+	sysctlLive := true
+	for _, dropin := range opened {
+		if dropin.sysctl && !sysctlValueLive(d, dropin.content) {
+			sysctlLive = false
+			break
+		}
+	}
+	if sysctlChanged || !sysctlLive {
+		if _, sysctlErr := d.run([]string{"sysctl", "--system"}, nil); sysctlErr != nil {
+			d.logf("partial /etc install: sysctl --system failed: %v", sysctlErr)
+			failures = append(failures, fmt.Errorf("sysctl --system: %w", sysctlErr))
+		} else {
+			// The command exiting 0 is not proof the value we asked for is what
+			// actually took effect: sysctl.d merge order lets a lexically-later
+			// file (or /etc/sysctl.conf, applied last of all) silently override
+			// ours. Read the kernel back so an override is reported as a real
+			// activation failure instead of a fake pass.
+			for _, dropin := range opened {
+				if dropin.sysctl && !sysctlValueLive(d, dropin.content) {
+					d.logf("partial /etc install: sysctl --system exited 0 but %s is still not live (likely overridden by a later sysctl.d file or /etc/sysctl.conf)", dropin.dst)
+					failures = append(failures, fmt.Errorf("sysctl --system: %s not live after activation", dropin.dst))
+				}
+			}
 		}
 	}
 	if oomdChanged || !systemdOomdActive(d) {
@@ -1131,8 +1176,28 @@ func systemDropinsCurrent(d installDeps, uid int) bool {
 		if !managedSystemDropinCurrent(d, dropin) {
 			return false
 		}
+		if dropin.sysctl && !sysctlValueLive(d, dropin.content) {
+			return false
+		}
 	}
 	return true
+}
+
+// sysctlValueLive reports whether the kernel's live value for the key a
+// sysctl.d drop-in sets actually matches what the drop-in asks for. A written
+// file alone proves nothing: sysctl.d is only applied at boot or by an
+// explicit `sysctl --system`/`systemctl restart systemd-sysctl`, so a file
+// that matches on disk can still be inert against the running kernel.
+func sysctlValueLive(d installDeps, content []byte) bool {
+	match := inotifyMaxUserInstancesRE.FindSubmatch(content)
+	if match == nil {
+		return false
+	}
+	live, err := d.readFile(procInotifyMaxUserInstances)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(live)) == string(match[1])
 }
 
 func systemdOomdActive(d installDeps) bool {
@@ -1144,12 +1209,22 @@ func systemDropinsHealthy(d installDeps, uid int) bool {
 	return systemDropinsCurrent(d, uid) && systemdOomdActive(d)
 }
 
+const delegationDropinAsset = "assets/oomd/user-service-delegate.conf"
+
 func delegationDropinCurrent(d installDeps, uid int) bool {
 	rendered, err := renderSystemDropins(d.etcRoot, uid)
 	if err != nil {
 		return false
 	}
-	return managedSystemDropinCurrent(d, rendered[len(rendered)-1])
+	for _, dropin := range rendered {
+		if dropin.asset == delegationDropinAsset {
+			return managedSystemDropinCurrent(d, dropin)
+		}
+	}
+	// The delegation drop-in is a fixed, always-present entry in
+	// systemDropins(); its absence here means that list was edited without
+	// updating this lookup — treat as not current rather than panic/false.
+	return false
 }
 
 const (
@@ -1553,9 +1628,9 @@ func runStatus(d installDeps) error {
 	maximum, _ := parseInstalledMemoryMax(string(content))
 	d.logf("memory delegation: %s", memoryEnforcementState(d, uid, maximum))
 	if systemDropinsHealthy(d, uid) {
-		d.logf("oomd + delegation drop-ins: up to date")
+		d.logf("oomd + delegation + sysctl drop-ins: up to date")
 	} else {
-		d.logf("oomd + delegation drop-ins: missing, stale, or systemd-oomd inactive")
+		d.logf("oomd + delegation + sysctl drop-ins: missing, stale, kernel value not applied, or systemd-oomd inactive")
 	}
 
 	anchorBinary, binaryOK := parseAnchorBinary(anchorContent)

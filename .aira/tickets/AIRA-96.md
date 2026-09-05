@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-96","project":"aira","title":"TestScopeMembershipEventsDeliversModifyAndReleasesFD fails when fs.inotify.max_user_instances is near exhausted","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["environmental","runner","testing"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-96","project":"aira","title":"TestScopeMembershipEventsDeliversModifyAndReleasesFD fails when fs.inotify.max_user_instances is near exhausted","status":"in-progress","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["environmental","runner","testing"],"hold":false,"relations":[]}
 ---
 Found during the AIRA-16 watchdog fix's independent code review (2026-09-04). Deliberately not filed by the reviewing agent at the time, to avoid racing ticket-ID allocation with other concurrently-running batch agents -- filed now by the coordinating session instead, no longer racing.
 
