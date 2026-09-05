@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"aira/internal/core"
@@ -144,6 +145,14 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		if killErr != nil {
 			return confineManagementError(killErr)
 		}
+		// AIRA-70 finding #2: a cross-session `aira confine --kill` used to kill
+		// a job with no record anywhere of who did it -- this file had no log
+		// call at all. Reached only past KillConfine's error return, so it is
+		// written only for a kill the daemon confirmed: a refused (owner
+		// unverified), not-launched, or unconfirmed kill kills nothing and must
+		// not leave a line claiming otherwise.
+		log.Printf("aira daemon: confine-kill: killer=%s steal=%v target-scope=%s target-name=%s target-owner=%s slice=%s",
+			callerOwner, steal, result.ScopeID, result.Name, result.Owner, path)
 		// This is the daemon kill-drop release. The admit connection's later
 		// close reaches the same state-guarded releaseAdmitWaiter path.
 		s.releaseActiveConfine(path, result.ScopeID)

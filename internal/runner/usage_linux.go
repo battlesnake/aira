@@ -9,14 +9,33 @@ import (
 	"strings"
 )
 
-// cgroupUsage keeps OOM evidence private to the terminal classifier. The
-// counter is nullable because an unreadable or unsupported memory.events file
+// cgroupUsage keeps OOM evidence private to the terminal classifier. Both
+// counters are nullable because an unreadable or unsupported memory.events file
 // is unevaluated, not evidence of zero OOM kills.
 type cgroupUsage struct {
 	PeakRSS *int64
 	CPUUser *int64
 	CPUSys  *int64
+	// OOMKill is memory.events' HIERARCHICAL oom_kill: this cgroup AND its
+	// descendants. Good for "did anything under this scope get OOM-killed",
+	// which is what the reserve advisory and the peak-RSS report ask.
 	OOMKill *int64
+	// OOMKillLocal is memory.events.local's oom_kill: this cgroup ALONE. It is
+	// the only one that answers "was the job in THIS scope killed at THIS
+	// scope's limit", because memcg events propagate upward -- a worker
+	// sub-cgroup OOM-killed at its own cap raises the parent's hierarchical
+	// counter while the parent's leader is untouched. That is not a corner
+	// case here: AIRA's own aitest worker scopes are exactly such children, and
+	// it is the configuration AIRA-91 investigated.
+	//
+	// Measured on this project's kernel (6.18) by
+	// TestMemoryEventsLocalDistinguishesOwnLimitFromDescendantOOM:
+	//   OOM at the cgroup's own memory.max  -> events.local oom_kill > 0
+	//   OOM in a child cgroup               -> events oom_kill > 0, local == 0
+	//   external cgroup.kill                -> both stay 0
+	// and with memory.oom.group=1 (which every confine scope sets) the local
+	// counter still rises, alongside oom_group_kill.
+	OOMKillLocal *int64
 }
 
 func readCgroupUsage(scopePath string) cgroupUsage {
@@ -32,6 +51,9 @@ func readCgroupUsage(scopePath string) cgroupUsage {
 	}
 	if data, err := os.ReadFile(filepath.Join(scopePath, "memory.events")); err == nil {
 		usage.OOMKill = parseMemoryEvents(data)
+	}
+	if data, err := os.ReadFile(filepath.Join(scopePath, "memory.events.local")); err == nil {
+		usage.OOMKillLocal = parseMemoryEvents(data)
 	}
 	return usage
 }
