@@ -52,8 +52,10 @@ relates AIRA-30, AIRA-38, AIRA-42.
 `TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits`
 (`internal/daemon/worker_admit_cli_granted_linux_test.go`) drives the real
 `aira worker-admit` binary as a subprocess against a real in-process daemon and
-a REAL delegated cgroup — the combination no existing test had, and the reason
-this contract went unpinned. It follows the candidate approach above: the
+a REAL delegated cgroup, and is the first test to ASSERT anything about the
+granted relay's lifecycle there (see the build-review response below: one
+existing pylib e2e test does reach that code, but constrains none of it).
+It follows the candidate approach above: the
 daemon's own `CreateWorkerScope` and `scanWorkerScopeChildren` seams stay at
 their production defaults against a `cgrouptest` outer scope, and only the two
 memory READINGS are stubbed, so the admission arithmetic is deterministic while
@@ -75,7 +77,9 @@ Four phases, each pinning one thing:
    written nothing more to stdout and nothing at all to stderr — the last part
    being what supervisor.py's malformed-grant ordering fix is premised on.
 4. **AIRA-41.** Closing the lease releases NO ledger capacity; only removing
-   the scope does.
+   the scope does. (Already pinned by
+   `TestWorkerAdmitLedgerKeepsChargingAfterRelayCloses`; what this adds is the
+   real connection and the real tree — see the build-review response below.)
 
 **The ticket's own premise was stale and is corrected rather than reproduced.**
 Regression A above is described as defeating the ledger, and the candidate
@@ -87,7 +91,9 @@ is now false: the ledger is Σ `memory.max` over the outer scope's real
 failed against a correct build. The live consequence of Regression A is instead
 the daemon-side connection (and its admission slot) being released while the
 worker is alive, plus supervisor.py's retirement signal reaching a process that
-is already gone — which is what phase 2 pins. Phase 4 pins the real invariant.
+is already gone — which is what phase 2 pins. Phase 4 re-states the real
+invariant through the real connection and the real tree; it does not pin it
+alone (see the build-review response below).
 
 Root cause of the stale premise found and fixed: `runner.WorkerAdmitLease`'s doc
 comment still claimed "the daemon frees the ledger entry when it detects the
