@@ -115,6 +115,24 @@ func TestConfineKillLogsTheKillerOnlyWhenItActuallyKills(t *testing.T) {
 		}
 	})
 
+	// Named by build-review round 3, P2: without this row, a KillConfine that
+	// returned OK for a scope with nothing in it would log a kill that never
+	// happened and every other row here would stay green.
+	t.Run("a not-launched kill logs nothing", func(t *testing.T) {
+		server, id, queue := setup(t, "session-a")
+		writeConfineDaemonScope(t, queue.path, id, "populated 0\n") // nothing to kill
+		var response core.Response
+		output := captureDaemonLog(t, func() {
+			response = server.confineManagement(context.Background(), killReq(id, "session-a"))
+		})
+		if response.Code != runner.CodeConfineNotLaunched {
+			t.Fatalf("an empty scope did not surface as not-launched: %+v", response)
+		}
+		if strings.Contains(output, "confine-kill") {
+			t.Fatalf("a kill of an empty scope produced a kill record: %q", output)
+		}
+	})
+
 	t.Run("an unconfirmed kill logs nothing", func(t *testing.T) {
 		server, id, queue := setup(t, "session-a")
 		path := writeConfineDaemonScope(t, queue.path, id, "populated 1\n")

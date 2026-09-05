@@ -73,10 +73,37 @@ what the classifier reads:
   regression; `origin/master` had advanced again mid-review and another
   session's landed AIRA-37 change was inside the diff. Rebased again.
 
+**Revision 6** — folds a THIRD adversarial build-review round:
+
+- **P1, accepted.** The candidates line said "this scope's `memory.events`
+  records no OOM kill", but the verdict was derived from `memory.events.local`.
+  In the very shape the verdict exists for — a descendant's OOM on the
+  hierarchical counter — that sentence is **false**, and it can sit directly
+  above `formatConfineReserveAdvisory`'s OOM line, which reads that same
+  hierarchical counter. The line now names the local counter explicitly and adds
+  a clause reporting the descendant OOM when the hierarchical counter disagrees.
+- **P1, accepted.** The handler stayed live through `readUsage`, `reportPeak`
+  and the teardown attestation. A signal landing there terminated nothing, yet
+  it could still `cleanup()` — removing the scope out from under `readUsage` and
+  silently degrading an honest `unattributed-sigkill` to `unevaluated`. A
+  `runEnded` cut-off, closed in the same critical section as the snapshot, now
+  makes a late signal record no witness and tear nothing down; it is still
+  forwarded and still logged, with wording that says what actually happened. The
+  irreducible few-instruction window between the child's exit and the snapshot's
+  `Lock` is stated in the code and deferred in §6, not papered over.
+- **P2, accepted.** The daemon kill-log test had no already-empty/no-op row, so a
+  `KillConfine` that returned OK for an unpopulated scope would have logged a
+  kill that never happened with every other row green. Added.
+- **P2 not accepted, checked against source.** The same round called the
+  `emptyOnKill` fixture racy against `KillConfine`'s populated gate. It is not:
+  the gate runs *before* the kill and the fixture only flips after seeing
+  `cgroup.kill` written, and `waitEmpty` then retries for 2s against a fixture
+  that flips within ~1ms.
+
 Codex/Sol and Gemini were unavailable throughout (usage credits exhausted /
 free-tier quota exhausted, one retry each); recorded rather than silently
-skipped, and noted as a real reduction in review independence — all three review
-rounds came from the same model family.
+skipped, and noted as a real reduction in review independence — every review
+round came from the same model family.
 
 ## 1. Problem, restated against current source
 
@@ -476,7 +503,7 @@ New/extended, all TDD (test first, watch it fail against current source):
 - The daemon log line firing on a refused kill (a "killed" claim for a kill that
   did not happen — exactly the fabricated-outcome class AIRA-68's populated-gate
   exists to prevent).
-- **Mutation checks the build review must actually run.** Thirteen were applied
+- **Mutation checks the build review must actually run.** Seventeen were applied
   and every one turned a named test red — recorded here so a later change can
   re-run the same set:
 
@@ -495,6 +522,10 @@ New/extended, all TDD (test first, watch it fail against current source):
   | M11 | stop no longer joins the handler (round-1 P2 defect) | `TestForwardConfineSignalsStopJoinsTheHandler` |
   | M12 | branch 2 reads the HIERARCHICAL counter (round-2 P0 defect) | classifier + trailer descendant-OOM rows, and the real-cgroup probe |
   | M13 | `readCgroupUsage` never reads `memory.events.local` | the real-cgroup probe and the external-kill trailer test |
+  | M14 | no post-run cut-off — a late signal is recorded and tears the scope down (round-3 P1) | `TestConfineTrailerIgnoresASignalThatArrivesAfterTheRunEnded` |
+  | M15 | candidates line says `memory.events` flat, hiding which counter it checked (round-3 P1) | `TestFormatConfineTerminationAdvisory` |
+  | M16 | candidates line never reports a descendant OOM | `TestFormatConfineTerminationAdvisory` |
+  | M17 | daemon logs the kill before the error return | all three negative daemon sub-cases |
 
 ## 6. Deferrals
 

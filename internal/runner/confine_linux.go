@@ -659,16 +659,33 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// cleanup -> child dies -> cmd.Wait returns -> the snapshot's Lock. Only the
 	// FIRST signal is kept: it is the one that caused the teardown, and a
 	// follow-up Ctrl-C on an already-dying job is noise.
+	//
+	// runEnded is the CUT-OFF (build-review round 3, P1). The handler stays live
+	// through readUsage, reportPeak and the teardown attestation -- seconds,
+	// after the child is already dead. A signal arriving there terminated
+	// nothing, so past the cut-off the handler records no witness and, crucially,
+	// does NOT tear the scope down: doing so would remove the cgroup out from
+	// under readUsage and silently degrade an honest verdict to `unevaluated`.
+	// The deferred cleanup() still runs moments later, so the scope is torn down
+	// either way; only the timing changes. The signal is still forwarded, and
+	// still logged -- with wording that says what actually happened.
 	var supervisorSignalMu sync.Mutex
 	var supervisorSignal os.Signal
+	runEnded := false
 	signalEvents, stopSignalSource := deps.signalSource()
 	stopSignalHandler := forwardConfineSignals(signalEvents, process, func(received os.Signal) {
 		supervisorSignalMu.Lock()
-		first := supervisorSignal == nil
+		late := runEnded
+		first := !late && supervisorSignal == nil
 		if first {
 			supervisorSignal = received
 		}
 		supervisorSignalMu.Unlock()
+		if late {
+			_, _ = fmt.Fprintf(diagnostics, "confine: received %s after the job had already ended; scope %s is being torn down anyway\n",
+				confineSignalName(received), scopeID)
+			return
+		}
 		if first {
 			_, _ = fmt.Fprintf(diagnostics, "confine: received %s; killing scope %s on %s and forwarding to the confined job\n",
 				confineSignalName(received), scopeID, sliceName)
@@ -908,12 +925,20 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	_ = releaseWrite.Close()
 	exitCode, termination := waitConfineCommand(cmd)
 	result.Exit = exitCode
-	// Snapshot on the very next statement, before readUsage/reportPeak/teardown
-	// attestation: stopSignalHandler is deferred to function return, so the
-	// handler stays live for seconds after the child is already dead, and a
-	// signal arriving in that window terminated nothing.
+	// Snapshot on the very next statement, and close the cut-off in the same
+	// critical section: from here on the handler records nothing and tears
+	// nothing down, so neither the verdict nor the counters readUsage is about
+	// to read can be changed by a signal that terminated nothing.
+	//
+	// One window is irreducible and is stated rather than papered over: a signal
+	// delivered between the child's own exit and this Lock -- a few instructions
+	// -- is still recorded, so an operator's Ctrl-C landing in that instant reads
+	// as `supervisor-signal:`. Closing it would need the wait and the signal to
+	// share one select, i.e. a rewrite of the wait path, for a window no operator
+	// can observe. Recorded as a deferral in the plan, section 6.
 	supervisorSignalMu.Lock()
 	terminatedBySignal := supervisorSignal
+	runEnded = true
 	supervisorSignalMu.Unlock()
 	usage := deps.readUsage(scope.Reference())
 	if usage.PeakRSS != nil && *usage.PeakRSS <= 0 {
@@ -945,7 +970,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// A separate line from the reserve advisory above, which stays cap-gated and
 	// OOM-worded exactly as it was: this one speaks only for the verdict the
 	// reserve advisory has never been able to see (AIRA-91 Part A).
-	if advisory := formatConfineTerminationAdvisory(result.Status.TerminatedBy); advisory != "" {
+	if advisory := formatConfineTerminationAdvisory(result.Status.TerminatedBy, usage); advisory != "" {
 		_, _ = fmt.Fprintln(diagnostics, advisory)
 	}
 	return result, nil
@@ -1582,16 +1607,29 @@ func confineSignalName(sig os.Signal) string {
 // formatConfineTerminationAdvisory is the "name the realistic sources" half of
 // AIRA-91 Part A. It fires only for the unattributed verdict, and it lists the
 // candidate mechanisms AS candidates: the classifier positively established
-// that the kill was a SIGKILL this supervisor did not send and that this
-// scope's own memory.events records no OOM, and nothing beyond that.
-func formatConfineTerminationAdvisory(verdict string) string {
+// that the kill was a SIGKILL this supervisor did not send and that this scope's
+// OWN memory.events.local records no OOM, and nothing beyond that.
+//
+// It names the LOCAL counter explicitly, and adds a clause when the hierarchical
+// counter disagrees (build-review round 3, P1). Saying "this scope's
+// memory.events records no OOM kill" would be false in exactly the shape this
+// verdict exists to serve -- a worker sub-cgroup OOM raises the hierarchical
+// counter -- and would contradict formatConfineReserveAdvisory, which reads that
+// same hierarchical counter and may be printing an OOM line directly above.
+func formatConfineTerminationAdvisory(verdict string, usage cgroupUsage) string {
 	if verdict != ConfineTerminatedUnattributedSIGKILL {
 		return ""
 	}
-	return "confine: the job was SIGKILLed by something this supervisor cannot attribute: it sent no signal itself, " +
-		"and this scope's memory.events records no OOM kill. Candidates: an external whole-cgroup kill " +
+	line := "confine: the job was SIGKILLed by something this supervisor cannot attribute: it sent no signal itself, " +
+		"and this scope's own memory.events.local records no OOM kill. Candidates: an external whole-cgroup kill " +
 		"(systemd-oomd under PSI pressure, another session's `aira confine --kill`, a direct cgroup.kill write), " +
 		"an ancestor-cgroup OOM whose counter lands on the ancestor, an external kill -9, or the job killing itself."
+	if usage.OOMKill != nil && *usage.OOMKill > 0 {
+		line += " Note that memory.events (which counts this scope AND everything below it) does record " +
+			strconv.FormatInt(*usage.OOMKill, 10) + " OOM kill(s): something in a cgroup BENEATH this scope was " +
+			"OOM-killed at its own limit, which is a separate event from whatever killed this job."
+	}
+	return line
 }
 
 func cleanupConfineScope(scope Scope, started bool) {

@@ -257,7 +257,7 @@ func TestExternalCgroupKillIsReportedOnTheTrailer(t *testing.T) {
 	if line == clean {
 		t.Fatalf("an externally group-killed run still prints the same status line as a clean run: %q", line)
 	}
-	advisory := formatConfineTerminationAdvisory(verdict)
+	advisory := formatConfineTerminationAdvisory(verdict, usage)
 	for _, want := range []string{"systemd-oomd", "aira confine --kill", "cgroup.kill"} {
 		if !strings.Contains(advisory, want) {
 			t.Fatalf("candidates line %q does not name %q, which AIRA-91 Part A asks for", advisory, want)

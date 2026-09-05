@@ -158,7 +158,8 @@ func TestFormatConfineStatusReportsTerminatedByFacet(t *testing.T) {
 // the unattributed-SIGKILL verdict, and it names the candidate mechanisms
 // without asserting any one of them.
 func TestFormatConfineTerminationAdvisory(t *testing.T) {
-	advisory := formatConfineTerminationAdvisory("unattributed-sigkill")
+	quiet := cgroupUsage{OOMKill: int64ptr(0), OOMKillLocal: int64ptr(0)}
+	advisory := formatConfineTerminationAdvisory("unattributed-sigkill", quiet)
 	for _, want := range []string{
 		"SIGKILL", "cannot attribute", "Candidates", "systemd-oomd", "aira confine --kill", "cgroup.kill",
 		"ancestor", "kill -9", "killing itself",
@@ -167,10 +168,96 @@ func TestFormatConfineTerminationAdvisory(t *testing.T) {
 			t.Fatalf("candidates line %q lacks %q", advisory, want)
 		}
 	}
+	// It must name the LOCAL counter, which is the one the verdict was actually
+	// derived from. Saying "memory.events" flat would be a false statement in the
+	// descendant-OOM case below, and would contradict the reserve advisory that
+	// may be printing an OOM line directly above it (build-review round 3, P1).
+	if !strings.Contains(advisory, "memory.events.local") {
+		t.Fatalf("candidates line does not say WHICH counter it checked: %q", advisory)
+	}
+	if strings.Contains(advisory, "cgroup BENEATH") {
+		t.Fatalf("a scope with no descendant OOM wrongly mentions one: %q", advisory)
+	}
+
+	// With a descendant's OOM on the hierarchical counter, the line must say so
+	// rather than flatly claiming no OOM was recorded.
+	descendant := formatConfineTerminationAdvisory("unattributed-sigkill", cgroupUsage{OOMKill: int64ptr(2), OOMKillLocal: int64ptr(0)})
+	for _, want := range []string{"memory.events.local", "cgroup BENEATH this scope", "2 OOM kill(s)"} {
+		if !strings.Contains(descendant, want) {
+			t.Fatalf("descendant-OOM candidates line %q lacks %q", descendant, want)
+		}
+	}
+
 	for _, verdict := range []string{"normal", "oom", "unevaluated", "child-signal:SIGSEGV", "supervisor-signal:SIGTERM", ""} {
-		if got := formatConfineTerminationAdvisory(verdict); got != "" {
+		if got := formatConfineTerminationAdvisory(verdict, quiet); got != "" {
 			t.Fatalf("verdict %q wrongly produced a candidates line: %q", verdict, got)
 		}
+	}
+}
+
+// verifies: build-review round 3, P1 -- once the run has ended, a signal to the
+// supervisor terminated nothing. It must not be recorded as the cause of death,
+// and above all it must not tear the scope down out from under the post-run
+// reads, which would silently degrade an honest verdict to `unevaluated` and
+// lose the peak-RSS report with it.
+//
+// The fixture drives the exact shape: `readUsage` is the first thing that runs
+// after the cut-off, so it delivers the late signal from inside itself and then
+// returns readable counters, standing in for a scope that is still there to be
+// read. A handler that still ran cleanup() would have removed it.
+func TestConfineTrailerIgnoresASignalThatArrivesAfterTheRunEnded(t *testing.T) {
+	scope := &confineFakeScope{}
+	deps := confineUnitDeps(scope)
+	signals := make(chan os.Signal, 1)
+	deps.signalSource = func() (<-chan os.Signal, func()) { return signals, func() {} }
+	deps.reportPeak = func(context.Context, ConfineRequest, string, *int64, bool) error { return nil }
+
+	delivered := make(chan struct{})
+	var once sync.Once
+	deps.readUsage = func(string) cgroupUsage {
+		once.Do(func() {
+			signals <- syscall.SIGTERM
+			// Wait for the handler to have processed it, so the assertions below
+			// describe a settled state rather than a race.
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				scope.mu.Lock()
+				killed := scope.killed
+				scope.mu.Unlock()
+				if killed {
+					break
+				}
+				if len(signals) == 0 {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			close(delivered)
+		})
+		return cgroupUsage{OOMKill: int64ptr(0), OOMKillLocal: int64ptr(0)}
+	}
+
+	var diagnostics bytes.Buffer
+	// A self-SIGKILL, so the verdict before the late signal is unattributed.
+	if _, err := confineWithDeps(context.Background(), ConfineRequest{
+		Slice: "finite.slice", Argv: []string{"/bin/sh", "-c", "kill -s KILL $$"},
+		SelfPath: os.Args[0], Stderr: &diagnostics,
+	}, deps); err != nil {
+		t.Fatalf("confine: %v (diagnostics=%q)", err, diagnostics.String())
+	}
+	<-delivered
+	trailer := diagnostics.String()
+	if strings.Contains(trailer, "terminated-by=supervisor-signal") {
+		t.Fatalf("a signal that arrived after the job ended was recorded as its cause: %q", trailer)
+	}
+	if !strings.Contains(trailer, "terminated-by=unattributed-sigkill") {
+		t.Fatalf("the verdict established before the late signal did not survive it: %q", trailer)
+	}
+	if !strings.Contains(trailer, "after the job had already ended") {
+		t.Fatalf("the late signal was not reported at all, so it is as invisible as AIRA-70 found it: %q", trailer)
+	}
+	if strings.Contains(trailer, "and forwarding to the confined job") {
+		t.Fatalf("a late signal claimed to be killing a job that had already ended: %q", trailer)
 	}
 }
 
