@@ -17,8 +17,8 @@ func TestSkillMetadataNormalisesEveryIncludedAction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(artifacts.Actions) != 73 {
-		t.Fatalf("actions=%d, want 73", len(artifacts.Actions))
+	if len(artifacts.Actions) != 71 {
+		t.Fatalf("actions=%d, want 71", len(artifacts.Actions))
 	}
 	for _, action := range artifacts.Actions {
 		if action.Summary == "" || !action.Safety.Valid() || !strings.HasPrefix(action.Command, "aira ") {
@@ -154,7 +154,6 @@ func TestSkillSafetyGolden(t *testing.T) {
 		"gate/set": SafetyMutate, "gate/run": SafetyReconcile, "gate/check": SafetyRead,
 		"gate/attest": SafetyMutate, "gate/prove": SafetyMutate, "gate/review": SafetyMutate,
 		"gate/canary-run": SafetyReconcile, "gate/canary-show": SafetyRead,
-		"gate/baseline-pin": SafetyMutate, "gate/baseline-show": SafetyRead,
 		"lease/ls": SafetyRead,
 	}
 	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())

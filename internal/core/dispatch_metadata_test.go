@@ -170,8 +170,6 @@ func metadataProbeInputs(name string) []map[string]any {
 			cloneMetadataInputs(values, "subverb", "review"),
 			cloneMetadataInputs(values, "subverb", "canary-run"),
 			cloneMetadataInputs(values, "subverb", "canary-show"),
-			cloneMetadataInputs(values, "subverb", "baseline-pin"),
-			cloneMetadataInputs(values, "subverb", "baseline-show"),
 		}
 	case "test-report":
 		return []map[string]any{
@@ -219,13 +217,6 @@ func sortedKeys(values map[string]bool) []string {
 }
 
 type metadataProbeStore struct{}
-
-func (metadataProbeStore) PinGateBaseline(context.Context, string, []string, string, string) (store.GateBaseline, error) {
-	return store.GateBaseline{}, nil
-}
-func (metadataProbeStore) ShowGateBaseline(string) (store.GateBaseline, error) {
-	return store.GateBaseline{}, nil
-}
 
 func (metadataProbeStore) AllocateID(context.Context, string) (string, error) { return "AIRA-1", nil }
 func (metadataProbeStore) CreateTicketWithEvent(context.Context, domain.CreateTicketInput) (domain.Ticket, store.EventKey, error) {

@@ -2,14 +2,12 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
 	"aira/internal/domain"
-	"aira/internal/gate"
 )
 
 // GaugeKind is the small vocabulary used by the structured insight face.
@@ -99,7 +97,6 @@ var insightRegistry = []Gauge{
 	{Name: "review-loop-economics", Title: "Compute tokens and cost by phase", Kind: GaugeKindDistribution},
 	{Name: "quota-burn", Title: "Latest quota use and burn by provider", Kind: GaugeKindRate},
 	{Name: "command-latency", Title: "Recorded command latency by key", Kind: GaugeKindDuration},
-	{Name: "ratchet-status", Title: "Live ratchet gate status", Kind: GaugeKindDistribution},
 	{Name: "traceability-status", Title: "Requirement traceability status", Kind: GaugeKindDistribution},
 }
 
@@ -122,8 +119,6 @@ func init() {
 			insightRegistry[i].Compute = computeQuotaBurn
 		case "command-latency":
 			insightRegistry[i].Compute = computeCommandLatencyByKeyPair
-		case "ratchet-status":
-			insightRegistry[i].Compute = computeRatchetStatus
 		case "traceability-status":
 			insightRegistry[i].Compute = computeTraceabilityStatus
 		}
@@ -487,126 +482,6 @@ func computeQuotaBurn(s *Store) (GaugeResult, error) {
 			}
 		}
 		result.Breakdown[provider] = cell
-	}
-	return result, nil
-}
-
-func ratchetStatus(eval DimensionEvaluation, evalErr error) (string, string) {
-	code := eval.Code
-	if eval.Predicate != "" {
-		switch code {
-		case "":
-			switch eval.Predicate {
-			case gate.PredicatePass:
-				return "pass", code
-			case gate.PredicateFail:
-				return "regressed", code
-			}
-		case "E_GATE_RATCHET_REGRESSED":
-			return "regressed", code
-		case "U_GATE_BASELINE_MISSING":
-			return "baseline_missing", code
-		case "U_GATE_INCOMPARABLE":
-			return "incomparable", code
-		case "U_GATE_PROOF_STALE":
-			return "proof_stale", code
-		case "U_GATE_EVIDENCE_UNAVAILABLE":
-			return "evidence_unavailable", code
-		case "E_GATE_INVALID":
-			return "invalid", code
-		default:
-			return "unclassified", code
-		}
-		return "unclassified", code
-	}
-	if evalErr != nil {
-		code = ErrorCode(evalErr)
-		if code == "E_JOURNAL_CORRUPT" {
-			return "corrupt", code
-		}
-		return "unclassified", code
-	}
-	return "unclassified", code
-}
-
-func gateAuditSeq(commonDir string) (uint64, bool) {
-	audit, err := OpenGateAudit(commonDir, false)
-	if err != nil {
-		return 0, false
-	}
-	records, err := audit.Read()
-	if err != nil || len(records) == 0 {
-		return 0, false
-	}
-	return records[len(records)-1].Seq, true
-}
-
-func testReportSeq(s *Store) (int64, bool, error) {
-	var seq sql.NullInt64
-	if err := s.db.QueryRow(`SELECT MAX(at_seq) FROM test_reports WHERE project_id=?`, s.projectID).Scan(&seq); err != nil {
-		return 0, false, err
-	}
-	return seq.Int64, seq.Valid, nil
-}
-
-func computeRatchetStatus(s *Store) (GaugeResult, error) {
-	const name = "ratchet-status"
-	const title = "Live ratchet gate status"
-	gates, err := s.ListGates()
-	if err != nil {
-		return GaugeResult{}, err
-	}
-	ratchets := make([]gate.GateDefinition, 0, len(gates))
-	for _, def := range gates {
-		if def.Kind == gate.KindRatchet {
-			ratchets = append(ratchets, def)
-		}
-	}
-	asOf := map[string]any{}
-	if seq, ok := gateAuditSeq(s.commonDir); ok {
-		asOf["gate_audit_seq"] = seq
-	}
-	if seq, ok, seqErr := testReportSeq(s); seqErr != nil {
-		return GaugeResult{}, seqErr
-	} else if ok {
-		asOf["test_report_at_seq"] = seq
-	}
-	// One capture serves both the as-of digest and every ratchet evaluation
-	// below, so the gauge's reported subject and the subject each ratchet was
-	// evaluated against are the same read (AIRA-80). A capture failure leaves the
-	// as-of digest absent, exactly as the digest-only failure did before, and the
-	// per-gate evaluations then carry a zero subject rather than a fabricated one.
-	subject, subjectErr := captureSubject(s.root)
-	if subjectErr == nil {
-		asOf["tracked_worktree_digest"] = subject.digest
-	}
-	universe := gaugeUniverse(len(ratchets), "project", asOf)
-	drilldown := GaugeDrilldown{Verb: "gate", Query: "check"}
-	if len(ratchets) == 0 {
-		return unevaluatedGauge(name, title, GaugeKindDistribution, "no ratchet gates configured", universe, drilldown), nil
-	}
-
-	result := GaugeResult{Name: name, Title: title, Kind: GaugeKindDistribution, Value: map[string]int{}, Breakdown: map[string]GaugeCell{}, Universe: universe, Drilldown: drilldown}
-	for _, def := range ratchets {
-		// A failed capture is not a subject. Evaluating against the zero subject
-		// would compare the reports anyway and report pass under an empty digest,
-		// which is a gauge cell asserting a result nothing established. The
-		// pre-capture code reported evidence_unavailable per gate here; so does
-		// this. Pinned by TestRatchetGaugeReportsEvidenceUnavailableWithoutASubject.
-		if subjectErr != nil {
-			bucket, code := ratchetStatus(DimensionEvaluation{Predicate: gate.PredicateUnevaluated, Code: "U_GATE_EVIDENCE_UNAVAILABLE"}, nil)
-			result.Value.(map[string]int)[bucket]++
-			result.Breakdown[def.ID] = GaugeCell{Value: bucket, Fields: map[string]GaugeCell{"code": {Value: code}, "tracked_worktree_digest": {Value: ""}}, Drilldown: &drilldown}
-			continue
-		}
-		eval, evalErr := s.evaluateRatchet(context.Background(), def, subject)
-		bucket, code := ratchetStatus(eval, evalErr)
-		result.Value.(map[string]int)[bucket]++
-		fields := map[string]GaugeCell{"code": {Value: code}, "tracked_worktree_digest": {Value: eval.Root.Digest}}
-		if baseline, baselineErr := s.ResolveGateBaseline(def.ID); baselineErr == nil {
-			fields["baseline_seq"] = GaugeCell{Value: baseline.Seq}
-		}
-		result.Breakdown[def.ID] = GaugeCell{Value: bucket, Fields: fields, Drilldown: &drilldown}
 	}
 	return result, nil
 }

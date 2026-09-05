@@ -454,50 +454,6 @@ func TestCaptureOfAnUnmergedIndexCountsEachPathOnce(t *testing.T) {
 	}
 }
 
-// verifies: AIRA-80 -- a failed capture is not a subject. The ratchet gauge
-// evaluates every ratchet gate against the captured subject; when the capture
-// fails it must report evidence_unavailable, not compare the test reports anyway
-// and report pass under an empty digest. Found by the adversarial build review:
-// the first implementation discarded the capture error and passed the zero
-// subject straight through, which the pre-capture code never did.
-func TestRatchetGaugeReportsEvidenceUnavailableWithoutASubject(t *testing.T) {
-	s, definition, root := newRatchetEvaluationFixture(t)
-	commit := s.gitValue(context.Background(), "HEAD")
-	addRatchetReportWithResults(t, s, commit, []domain.TestResult{{Name: "A", Outcome: domain.OutcomeFail}})
-
-	// Sanity: with a readable subject the gauge reports a genuine pass, so the
-	// assertion below is about the capture failing and not about a gauge that
-	// never passes.
-	gauge, err := computeRatchetStatus(s)
-	if err != nil {
-		t.Fatalf("gauge: %v", err)
-	}
-	if cell, ok := gauge.Breakdown[definition.ID]; !ok || cell.Value != "pass" {
-		t.Fatalf("baseline gauge cell = %#v, want pass", gauge.Breakdown[definition.ID])
-	}
-
-	// A tracked gitlink makes the capture fail closed (AIRA-72's accepted
-	// boundary) without touching the reports the comparator would otherwise use.
-	gitRun(t, root, "update-index", "--add", "--cacheinfo", "160000,0000000000000000000000000000000000000001,sub")
-	if _, captureErr := captureSubject(root); captureErr == nil {
-		t.Skip("the fixture did not make the capture fail")
-	}
-	gauge, err = computeRatchetStatus(s)
-	if err != nil {
-		t.Fatalf("gauge after capture failure: %v", err)
-	}
-	cell, ok := gauge.Breakdown[definition.ID]
-	if !ok {
-		t.Fatalf("gauge dropped the gate entirely: %#v", gauge)
-	}
-	if cell.Value == "pass" {
-		t.Fatalf("a ratchet gate reported pass with no capturable subject: %#v", cell)
-	}
-	if cell.Value != "evidence_unavailable" {
-		t.Fatalf("gauge cell = %#v, want evidence_unavailable", cell)
-	}
-}
-
 // verifies: AIRA-86 -- a stored result's verdict is a raw string read out of the
 // audit ledger, so it can be a value the verdict enum does not contain (a
 // truncated or field-less record yields ""). The rollup counted only the three
@@ -525,26 +481,6 @@ func TestGateCheckUnknownStoredVerdictIsNotPass(t *testing.T) {
 	passed := finishGateReport(GateCheckReport{Results: []GateCheckResult{{GateID: "a", Verdict: gate.VerdictPass, Trusted: true}}})
 	if passed.Verdict != gate.VerdictPass || passed.Passed != 1 {
 		t.Fatalf("an established pass no longer rolls up to pass: %#v", passed)
-	}
-}
-
-// verifies: AIRA-86 -- the ratchet comparator's pass is now raised rather than
-// seeded, and AIRA-86's own stated condition is that the pass path must still
-// reach pass. Both directions are asserted here so the seed flip cannot be
-// merged as a one-way change.
-func TestRatchetComparatorStillReachesPassWhenNothingRegressed(t *testing.T) {
-	baseline := RatchetSnapshot{FailingSet: []string{"A"}}
-	clean := compareNoNewFailures(baseline, []string{"A"}, map[string]struct{}{})
-	if clean.Predicate != gate.PredicatePass || clean.Code != "" {
-		t.Fatalf("no new failures no longer reaches pass: %#v", clean)
-	}
-	regressed := compareNoNewFailures(baseline, []string{"A", "B"}, map[string]struct{}{})
-	if regressed.Predicate != gate.PredicateFail || regressed.Code != "E_GATE_RATCHET_REGRESSED" {
-		t.Fatalf("a new failure no longer reaches fail: %#v", regressed)
-	}
-	excluded := compareNoNewFailures(baseline, []string{"A", "B"}, map[string]struct{}{"B": {}})
-	if excluded.Predicate != gate.PredicatePass {
-		t.Fatalf("a flaky-excluded new failure no longer reaches pass: %#v", excluded)
 	}
 }
 
@@ -679,19 +615,6 @@ func propertyGateKinds() []gateKindFixture {
 				t.Fatalf("command gate did not reach a trusted pass: %#v err=%v", result, err)
 			}
 			return s, root, def.ID
-		}},
-		{name: "ratchet", build: func(t *testing.T) (*Store, string, string) {
-			t.Helper()
-			s, definition, root := newRatchetEvaluationFixture(t)
-			seedPropertySubject(t, root)
-			gitRun(t, root, "commit", "-qm", "property subject")
-			commit := s.gitValue(context.Background(), "HEAD")
-			addRatchetReportWithResults(t, s, commit, []domain.TestResult{{Name: "A", Outcome: domain.OutcomeFail}})
-			result, err := s.RunGate(context.Background(), definition.ID)
-			if err != nil || result.Verdict != gate.VerdictPass || !result.Trusted {
-				t.Fatalf("ratchet gate did not reach a trusted pass: %#v err=%v", result, err)
-			}
-			return s, root, definition.ID
 		}},
 	}
 }

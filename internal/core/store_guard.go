@@ -154,11 +154,5 @@ func (unexpectedCarvedStore) AddQuotaSnapshot(context.Context, domain.QuotaSnaps
 func (unexpectedCarvedStore) ListQuotaSnapshots(string) ([]domain.QuotaSnapshot, error) {
 	return nil, errUnexpectedCarvedStore
 }
-func (unexpectedCarvedStore) PinGateBaseline(context.Context, string, []string, string, string) (store.GateBaseline, error) {
-	return store.GateBaseline{}, errUnexpectedCarvedStore
-}
-func (unexpectedCarvedStore) ShowGateBaseline(string) (store.GateBaseline, error) {
-	return store.GateBaseline{}, errUnexpectedCarvedStore
-}
 
 var _ Store = unexpectedCarvedStore{}

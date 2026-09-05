@@ -123,17 +123,19 @@ func TestOpenReadOnlyRequiresExistingDatabase(t *testing.T) {
 	}
 }
 
-func TestOpenReadOnlyServesRatchetTestReportReadsFromWAL(t *testing.T) {
+func TestOpenReadOnlyServesTestReportReadsFromWAL(t *testing.T) {
 	base, root := t.TempDir(), filepath.Join(t.TempDir(), "root")
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	definition := ratchetTestGate(t, root)
 	gitRun(t, root, "init", "-q")
 	gitRun(t, root, "config", "user.email", "aira@example.test")
 	gitRun(t, root, "config", "user.name", "AIRA")
 	gitRun(t, root, "add", ".")
-	gitRun(t, root, "commit", "-qm", "ratchet read-only fixture")
+	// No fixture files are seeded into root (unlike the old ratchet-baseline
+	// version of this test, which committed a gate JSON file): the commit is
+	// deliberately empty, since this test only needs a resolvable HEAD.
+	gitRun(t, root, "commit", "--allow-empty", "-qm", "read-only fixture")
 	common, gitDir := filepath.Join(root, ".git"), filepath.Join(root, ".git")
 	projectID, worktreeID, err := CanonicalScopeIdentity(common, gitDir)
 	if err != nil {
@@ -154,8 +156,10 @@ func TestOpenReadOnlyServesRatchetTestReportReadsFromWAL(t *testing.T) {
 		t.Fatal(err)
 	}
 	commit := writer.gitValue(context.Background(), "HEAD")
-	baseline := addRatchetReportWithResults(t, writer, commit, []domain.TestResult{{Name: "A", Outcome: domain.OutcomeFail}})
-	if _, err := writer.PinGateBaseline(context.Background(), definition.ID, []string{baseline.ID}, "test", "read-only relay fixture"); err != nil {
+	if _, err := writer.AddTestReport(context.Background(), domain.TestReportInput{
+		Format: "junit", Commit: commit, SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1",
+		ParserComplete: true, SourceDigest: "before-reader-open", Results: []domain.TestResult{{Name: "A", Outcome: domain.OutcomePass}},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	reader, err := OpenReadOnly(dbPath, opts)
@@ -163,13 +167,15 @@ func TestOpenReadOnlyServesRatchetTestReportReadsFromWAL(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	addRatchetReportInput(t, writer, domain.TestReportInput{
+	if _, err := writer.AddTestReport(context.Background(), domain.TestReportInput{
 		Format: "junit", Commit: commit, SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1",
 		ParserComplete: true, SourceDigest: "current-after-reader-open",
 		Results: []domain.TestResult{{Name: "A", Outcome: domain.OutcomeFail}, {Name: "B", Outcome: domain.OutcomePass}},
-	})
-	evaluation, err := reader.evaluateRatchet(context.Background(), definition, captureFor(t, root))
-	if err != nil || evaluation.Predicate != gate.PredicatePass || !evaluation.Evidence {
-		t.Fatalf("read-only ratchet evaluation=%+v err=%v", evaluation, err)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reports, err := reader.ListTestReports("")
+	if err != nil || len(reports) != 2 {
+		t.Fatalf("read-only test reports=%+v err=%v", reports, err)
 	}
 }

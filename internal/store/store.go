@@ -911,19 +911,6 @@ func (s *Store) initDB(ctx context.Context) error {
 		    record_json TEXT NOT NULL, PRIMARY KEY(project_id, seq),
 		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 		)`,
-		`CREATE TABLE IF NOT EXISTS gate_baselines (
-		    project_id TEXT NOT NULL, gate_id TEXT NOT NULL, baseline_seq INTEGER NOT NULL,
-		    comparator TEXT NOT NULL, comparator_version TEXT NOT NULL, comparison_key TEXT NOT NULL,
-		    source_commit TEXT NOT NULL, snapshot_digest TEXT NOT NULL, snapshot_json TEXT NOT NULL,
-		    valid INTEGER NOT NULL DEFAULT 1,
-		    PRIMARY KEY(project_id, baseline_seq),
-		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
-		)`,
-		`CREATE TABLE IF NOT EXISTS gate_baseline_active (
-		    project_id TEXT NOT NULL, gate_id TEXT NOT NULL, active_baseline_seq INTEGER NOT NULL,
-		    PRIMARY KEY(project_id, gate_id),
-		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
-		)`,
 		`CREATE TABLE IF NOT EXISTS test_report_counter (
 		    project_id TEXT PRIMARY KEY, next_number INTEGER NOT NULL, next_seq INTEGER NOT NULL,
 		    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
@@ -1074,6 +1061,16 @@ func (s *Store) initDB(ctx context.Context) error {
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			return translateDBError(err)
+		}
+	}
+	// gate_baselines/gate_baseline_active served only the ratchet gate kind,
+	// which never accumulated a production row before being deleted (AIRA-78).
+	// No data-preserving migration is needed -- an unconditional, idempotent
+	// drop is the whole story, unlike the careful in-place rebuilds below for
+	// tables that carry real data.
+	for _, table := range []string{"gate_baselines", "gate_baseline_active"} {
+		if _, err := s.db.ExecContext(ctx, `DROP TABLE IF EXISTS `+table); err != nil {
 			return translateDBError(err)
 		}
 	}

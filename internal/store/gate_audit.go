@@ -239,7 +239,7 @@ func (a *GateAudit) Append(kind string, fields map[string]string) (GateAuditReco
 }
 
 func validateGateAuditFields(kind string, fields map[string]string) error {
-	if kind != "result" && kind != "attestation" && kind != "proof-of-fire" && kind != "review" && kind != "baseline" && kind != "baseline-pointer" {
+	if kind != "result" && kind != "attestation" && kind != "proof-of-fire" && kind != "review" {
 		return errors.New("E_GATE_INVALID: invalid audit record type")
 	}
 	required := func(names ...string) error {
@@ -251,15 +251,6 @@ func validateGateAuditFields(kind string, fields map[string]string) error {
 		return nil
 	}
 	switch kind {
-	case "baseline":
-		return required("gate_id", "comparator", "comparator_version", "lane", "comparison_key", "source_commit", "source_report_ids", "snapshot_digest", "snapshot_json", "pin_actor", "pin_at")
-	case "baseline-pointer":
-		if err := required("gate_id", "active_baseline_seq"); err != nil {
-			return err
-		}
-		if _, err := strconv.ParseUint(fields["active_baseline_seq"], 10, 64); err != nil || fields["active_baseline_seq"] == "0" {
-			return errors.New("E_GATE_INVALID: baseline pointer sequence is invalid")
-		}
 	case "result":
 		if err := required("gate_id", "subject", "verdict"); err != nil {
 			return err

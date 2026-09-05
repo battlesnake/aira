@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 
 	"aira/internal/gate"
@@ -194,7 +193,7 @@ func (s *Store) rebuildGateProjection(ctx context.Context) error {
 	}
 	latest := gateProjectionRows(records)
 	return s.withImmediate(ctx, func(conn *sql.Conn) error {
-		for _, table := range []string{"gates", "gate_results", "gate_proofs", "gate_attestations", "gate_baselines", "gate_baseline_active"} {
+		for _, table := range []string{"gates", "gate_results", "gate_proofs", "gate_attestations"} {
 			if _, err := conn.ExecContext(ctx, "DELETE FROM "+table+" WHERE project_id=?", s.projectID); err != nil {
 				return err
 			}
@@ -222,28 +221,6 @@ func (s *Store) rebuildGateProjection(ctx context.Context) error {
 			}
 		}
 		for _, record := range records {
-			if record.Type == "baseline" {
-				baseline, baselineErr := baselineFromAuditRecord(record)
-				valid := 1
-				if baselineErr != nil {
-					valid = 0
-				}
-				if _, err := conn.ExecContext(ctx, `INSERT INTO gate_baselines(project_id,gate_id,baseline_seq,comparator,comparator_version,comparison_key,source_commit,snapshot_digest,snapshot_json,valid) VALUES(?,?,?,?,?,?,?,?,?,?)`, s.projectID, record.Fields["gate_id"], record.Seq, record.Fields["comparator"], record.Fields["comparator_version"], record.Fields["comparison_key"], record.Fields["source_commit"], record.Fields["snapshot_digest"], record.Fields["snapshot_json"], valid); err != nil {
-					return err
-				}
-				_ = baseline
-				continue
-			}
-			if record.Type == "baseline-pointer" {
-				active, parseErr := strconv.ParseUint(record.Fields["active_baseline_seq"], 10, 64)
-				if parseErr != nil || active == 0 {
-					continue
-				}
-				if _, err := conn.ExecContext(ctx, `INSERT INTO gate_baseline_active(project_id,gate_id,active_baseline_seq) VALUES(?,?,?) ON CONFLICT(project_id,gate_id) DO UPDATE SET active_baseline_seq=excluded.active_baseline_seq`, s.projectID, record.Fields["gate_id"], active); err != nil {
-					return err
-				}
-				continue
-			}
 			if record.Type != "proof-of-fire" && record.Type != "attestation" {
 				continue
 			}

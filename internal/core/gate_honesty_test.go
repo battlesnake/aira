@@ -99,15 +99,3 @@ func TestGateProveOnUnprovenGateExitsUnevaluated(t *testing.T) {
 
 // verifies: AIRA-53
 // A refused add must not report success and must not leave a definition.
-func TestGateAddThroughCoreRefusesRatchetWithoutWriting(t *testing.T) {
-	s, root := coreTestStoreWithRoot(t)
-	response := New(s).Do(context.Background(), Request{Verb: "gate", Args: map[string]any{
-		"subverb": "add", "gate_id": "ratchet-gate", "checker": "ratchet",
-	}})
-	if response.OK {
-		t.Fatalf("ratchet add must be refused, got %#v", response)
-	}
-	if _, err := os.Stat(filepath.Join(root, ".aira", "gates", "ratchet-gate.json")); err == nil {
-		t.Fatal("a refused add wrote a definition file")
-	}
-}
