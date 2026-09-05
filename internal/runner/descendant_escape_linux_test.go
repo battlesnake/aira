@@ -324,6 +324,103 @@ exit 0`
 	}
 }
 
+// AIRA-34: a leader that relocates ITSELF into a descendant cgroup it creates
+// (aitest's supervisor moving into `outer/.aira-supervisor` before enabling
+// subtree_control and forking per-worker sub-scopes, or a podman
+// --cgroups=split nested container) is absent from the run scope's own
+// cgroup.procs while remaining genuinely within the scope subtree the whole
+// time. It must read as honestly contained, never migrated.
+func TestRealCgroupLeaderSelfRelocatesIntoNestedSubScopeIsNeverMigrated(t *testing.T) {
+	r := realRunner(t)
+	proof := t.TempDir()
+	// A short guard sleep before relocating leaves no ambiguity against the
+	// launch-time immediate membership check (runner_linux.go's
+	// initialMigrated), then the leader dwells in the nested sub-scope for
+	// several sampler periods (scopeMembershipSampleInterval) so the monitor
+	// positively observes "absent from the scope leaf, alive, readable, and
+	// under the scope" before it exits.
+	script := `set -eu
+scope=/sys/fs/cgroup$(awk -F: '$1=="0" {print $3}' /proc/self/cgroup)
+nested="$scope/nested"
+sleep 0.05
+mkdir "$nested"
+printf '%s\n' "$nested" > "$1/nested"
+echo $$ > "$nested/cgroup.procs"
+sleep 0.25
+exit 0`
+	record, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/sh", "-c", script, "sh", proof}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nested := strings.TrimSpace(string(waitForFixtureFile(t, filepath.Join(proof, "nested"))))
+	t.Cleanup(func() {
+		_ = os.Remove(nested)
+		_ = os.Remove(record.CgroupScope)
+	})
+	if record.ScopeIntegrity == ScopeMigrated || record.ScopeIntegrity == ScopeDescendantEscaped {
+		t.Fatalf("leader self-relocation into its own nested sub-scope was falsely called migrated: %+v", record)
+	}
+	if containsString(record.ErrorCodes, "E_RUN_SCOPE_MIGRATION") {
+		t.Fatalf("leader self-relocation into its own nested sub-scope carried E_RUN_SCOPE_MIGRATION: %+v", record)
+	}
+	// The honest best case is ScopeContained (this run has no descendants and a
+	// clean teardown), but scope-integrity is sampling-based and a loaded
+	// shared box can cost a sample a transient Gap without that being a
+	// regression in the fix under test -- mirrors the Unverified/DescendantKilled
+	// tolerance TestRealCgroupNestedDescendantIsNeverEscaped already applies to
+	// the equivalent descendant-side scenario. What must never happen, checked
+	// above, is a migrated/escaped verdict.
+	if record.ScopeIntegrity != ScopeContained && record.ScopeIntegrity != ScopeUnverified {
+		t.Fatalf("leader self-relocation into its own nested sub-scope=%+v, want contained or unverified (never migrated)", record)
+	}
+	if record.ScopeIntegrity == ScopeContained && !record.CleanSuccess() {
+		t.Fatalf("contained leader self-relocation was not also clean: %+v", record)
+	}
+}
+
+// AIRA-34, the other direction: a leader that genuinely leaves the scope
+// subtree entirely -- not into a descendant of its own scope -- must still be
+// witnessed as a migration. Mutation-verifies the escape-detection guard
+// (witnessedEscape / pathEqualOrUnder) still fires for the leader once the
+// leaf-only presence test is replaced with the subtree-aware one.
+func TestRealCgroupLeaderSelfRelocatesOutOfScopeStillReadsMigrated(t *testing.T) {
+	r := realRunner(t)
+	backend, ok := r.backend.(*linuxScopeBackend)
+	if !ok {
+		t.Fatalf("real runner backend=%T", r.backend)
+	}
+	target, err := os.MkdirTemp(backend.parent, ".aira-adversarial-leader-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.WriteFile(filepath.Join(target, "cgroup.kill"), []byte("1"), 0o644)
+		deadline := time.Now().Add(testdeadline.Wait(time.Second))
+		for time.Now().Before(deadline) {
+			if os.Remove(target) == nil {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	})
+	// The leader dwells briefly in its own scope (clearing the launch-time
+	// immediate membership check unambiguously), relocates itself entirely out
+	// of the scope subtree into a sibling cgroup, then dwells there for
+	// several sampler periods so the escape is witnessed before it exits.
+	script := `set -eu
+sleep 0.05
+echo $$ > "$1/cgroup.procs"
+sleep 0.25
+exit 0`
+	record, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/sh", "-c", script, "sh", target}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.ScopeIntegrity != ScopeMigrated || !containsString(record.ErrorCodes, "E_RUN_SCOPE_MIGRATION") {
+		t.Fatalf("leader self-relocation out of the scope tree=%+v, want migrated + E_RUN_SCOPE_MIGRATION", record)
+	}
+}
+
 func TestRealCgroupLeaderOnlyRunRemainsContained(t *testing.T) {
 	r := realRunner(t)
 	record, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/sleep", "0.03"}})
