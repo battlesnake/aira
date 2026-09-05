@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -66,6 +67,28 @@ func TestExclusiveTrailerCarriesTheDrainWaitOnlyWhenGranted(t *testing.T) {
 	})
 	if strings.Contains(lost, "drained-for=") {
 		t.Fatalf("a run that lost its hold must not report a drain figure as if it held: %s", lost)
+	}
+}
+
+// A DETACHED launch hands its whole ConfineRequest to the supervisor process as
+// JSON through a control file. If Exclusive did not survive that round trip, a
+// detached benchmark would be admitted NON-exclusively while its operator
+// believed otherwise — the silent downgrade this feature exists to prevent, in
+// the one path where nobody is watching the terminal.
+//
+// Pinned explicitly because the failure is invisible: the field carries no json
+// tag today, and adding `json:"-"` to it later would break this silently.
+func TestExclusiveSurvivesTheDetachedRequestRoundTrip(t *testing.T) {
+	encoded, err := json.Marshal(ConfineRequest{Name: "bench", Exclusive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded ConfineRequest
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !decoded.Exclusive {
+		t.Fatal("Exclusive did not survive the detached control-file round trip: a detached --exclusive job would run non-exclusively without saying so")
 	}
 }
 
