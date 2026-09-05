@@ -13,9 +13,24 @@ import (
 	"time"
 )
 
-// WorkerAdmitLease is a granted worker-admit connection, held open as the
-// daemon-side lease until Close releases it (the daemon frees the ledger
-// entry when it detects the peer disconnect — see the worker-admit design).
+// WorkerAdmitLease is a granted worker-admit connection, held open until Close
+// releases it. The daemon parks its side on the same connection and returns
+// when it observes the peer disconnect.
+//
+// It does NOT free ledger capacity, and this comment used to say it did —
+// "the daemon frees the ledger entry when it detects the peer disconnect",
+// true only of the pre-AIRA-39/41 in-memory grants map. AIRA-41 made the
+// ledger Σ memory.max over the outer scope's real `.aira-worker-*` children
+// precisely so a killed or exited relay could no longer free capacity while
+// its worker was still alive under a still-intact cap; capacity is released by
+// REMOVING the scope (supervisor.py's _forget_worker_scope, after it has
+// reaped the worker), never by closing this. The stale wording outlived the
+// fix long enough to be restated as fact in AIRA-43's own problem statement,
+// so it is corrected here rather than left to mislead again.
+//
+// What closing this lease does release is the daemon-side connection and the
+// shared admission slot workerAdmitConnection holds for a granted connection's
+// whole lifetime.
 type WorkerAdmitLease struct {
 	WorkerID   string
 	ScopePath  string
