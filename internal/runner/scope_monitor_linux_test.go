@@ -106,13 +106,40 @@ type eventsPathScope struct {
 
 func (s *eventsPathScope) EventsPath() string { return s.events }
 
-func openFDCount(t *testing.T) int {
+// inotifyFDCount counts this process's inotify descriptors.
+//
+// It used to count EVERY entry in /proc/self/fd, which is a process-global number in
+// a test binary where earlier tests leave goroutines holding sockets, pipes and
+// capture files. One of those closing between the baseline and the check cancels the
+// watcher's own +1 exactly, and the assertion fails with "9 open fds, baseline 9" —
+// observed during AIRA-20's own whole-suite verification, with no code change behind
+// it and no reproduction in isolation. Counting only inotify descriptors makes the
+// measurement about the thing under test: unrelated fd churn cannot perturb it, and a
+// concurrent inotify from another test can only push the count up, which is the
+// direction the establishment check wants.
+//
+// If the kernel ever stopped naming these descriptors this way the count would be
+// zero and the establishment check would FAIL rather than silently pass, which is the
+// honest direction for a measurement that can no longer establish its result.
+func inotifyFDCount(t *testing.T) int {
 	t.Helper()
 	entries, err := os.ReadDir("/proc/self/fd")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return len(entries)
+	count := 0
+	for _, entry := range entries {
+		target, err := os.Readlink(filepath.Join("/proc/self/fd", entry.Name()))
+		if err != nil {
+			// Closed under us — including the descriptor ReadDir itself held. A
+			// descriptor that no longer exists is not an inotify watch.
+			continue
+		}
+		if strings.Contains(target, "inotify") {
+			count++
+		}
+	}
+	return count
 }
 
 // readSyscalls returns this process's cumulative read-syscall count (syscr from
@@ -148,11 +175,11 @@ func TestScopeMembershipEventsDeliversModifyAndReleasesFD(t *testing.T) {
 		t.Fatal(err)
 	}
 	for cycle := 0; cycle < 3; cycle++ {
-		baseline := openFDCount(t)
+		baseline := inotifyFDCount(t)
 		stop := make(chan struct{})
 		events := scopeMembershipEvents(&eventsPathScope{events: path}, stop)
-		if got := openFDCount(t); got <= baseline {
-			t.Fatalf("cycle %d: inotify watch not established: %d open fds, baseline %d", cycle, got, baseline)
+		if got := inotifyFDCount(t); got <= baseline {
+			t.Fatalf("cycle %d: inotify watch not established: %d inotify fds, baseline %d", cycle, got, baseline)
 		}
 		const idle = 200 * time.Millisecond
 		readsBefore := readSyscalls(t)
@@ -185,9 +212,9 @@ func TestScopeMembershipEventsDeliversModifyAndReleasesFD(t *testing.T) {
 		}
 		close(stop)
 		deadline := time.Now().Add(testdeadline.Wait(2 * time.Second))
-		for openFDCount(t) > baseline {
+		for inotifyFDCount(t) > baseline {
 			if time.Now().After(deadline) {
-				t.Fatalf("cycle %d: inotify fd not released after stop: %d open, baseline %d", cycle, openFDCount(t), baseline)
+				t.Fatalf("cycle %d: inotify fd not released after stop: %d inotify fds, baseline %d", cycle, inotifyFDCount(t), baseline)
 			}
 			time.Sleep(5 * time.Millisecond)
 		}
