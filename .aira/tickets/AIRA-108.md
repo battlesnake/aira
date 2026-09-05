@@ -58,3 +58,21 @@ Both observations are split's own live runs, inspected jointly in real time rath
 ## Correction: AIRA-33 does not and cannot unblock fastest-ee's own conftests
 
 split confirmed fastest-ee `origin/master` (#1175, `7b5785cb5`) still has all its original `aira_xdist_governor` conftest registrations — AIRA-33 only deleted the plugin from the `aira` repo itself. That is by design (the owner's decision was "delete the AIRA-side plugin now, accept fastest-ee migrates its own conftests on its own timeline"), but it means AIRA-33 landing does **not** make this wedge stop recurring on fastest-ee — whoever owns those conftests still needs to do that migration (SKILL.md's guard, `lite/conftest.py:784-803`, is the reference to copy). Immediate workaround given to split: `-p no:aira_xdist_governor` on the pytest invocation, which disables just that plugin without touching `AIRA_PY_LIB` or aitest's own RAM governance.
+
+## ROOT CAUSE FOUND (split, SIGQUIT goroutine dump on the held live instance, 2026-09-06)
+
+split captured a full goroutine dump before killing the held wedge (pid 1736618). It names the exact location:
+
+```
+goroutine 1 [select]:
+  runtime.selectgo()               src/runtime/select.go:351
+  /home/mark/claude/aira/cmd/aira/main.go:1295   <-- the un-firing select
+  /home/mark/claude/aira/cmd/aira/main.go:191
+  /home/mark/claude/aira/cmd/aira/main.go:49
+  /home/mark/claude/aira/cmd/aira/main.go:31 (main)
+  runtime.main()                    proc.go:285
+```
+
+The **main** goroutine (the whole process, not a background worker) is parked in a `select` at `cmd/aira/main.go:1295` (entered via `main.go:31 → 49 → 191 → 1295`, with a companion helper goroutine created around `main.go:1291-1292` in the same block). That select's case set does not include a case that fires on the request's own `--max-wait` deadline — no `time.After(maxWait)` / context-timeout branch reaches it — so it blocks on grant-or-cancel forever regardless of the declared bound. The value IS parsed correctly (it's right there on the process's own argv); it simply never reaches the select that would need to race against it. **Whoever builds the fix: verify this precisely against current source (line numbers will have drifted with tonight's other changes) rather than trusting the numbers verbatim, but this is the exact function to start from — no need to re-trace admission_linux.go/confine_reserve_linux.go from scratch.** The correct fix almost certainly reuses the pattern `internal/runner/admission_linux.go`'s own poll loop already uses for exactly this (a timer/context case derived from the request's `MaxWait`), rather than inventing a new mechanism.
+
+**Secondary finding, same dump:** SIGQUIT printed the goroutine dump but did **not** terminate the process afterward — it was still alive post-dump, killed separately by split's own supervisor. Suggests either a missing `os.Exit` after the runtime's own quit-dump, or a `signal.Notify` handler swallowing `SIGQUIT` before the runtime's default handler gets it. Worth a mention (or a separate small ticket) in whatever build closes this — not confirmed to be the same root cause, may be independent.
