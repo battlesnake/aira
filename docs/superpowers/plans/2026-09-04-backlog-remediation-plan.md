@@ -1,15 +1,21 @@
 # Backlog remediation plan
 
-**Date:** 2026-09-04
-**Status:** APPROVED FOR EXECUTION. 4 automated Fable review rounds
-(GATE-PASS-WITH-CHANGES each round, converging 16 → 17 → 9 → 10 required
-changes) plus two manual revision passes: one applying round 4's full list,
-one applying a final targeted Fable confirmation check (6 of 10 items
-verified correct on the first pass; the remaining 4 — the §8 CPU-regression
-bullet that had been promised but not written, the Fix-1-deploy-vs-probe-
-commit ordering conflict, AIRA-78's contradictory "executor default" wording,
-and Fix 4's mis-justified `storeops.go` scoping — corrected precisely per
-that check's own exact instructions).
+**Date:** 2026-09-04, executed 2026-09-05
+**Status:** EXECUTED AND DEPLOYED. Approved via 4 automated Fable review
+rounds (GATE-PASS-WITH-CHANGES each round, converging 16 → 17 → 9 → 10
+required changes) plus two manual revision passes; see git history for full
+detail. Every Phase 0 row, all five Phase 1 structural fixes, and all nine
+Phase 2 items are merged to master and independently verified. Binary
+rebuilt, skill reinstalled, daemon restarted — the daemon correctly
+re-adopted in-flight jobs via cgroupfs reconstruction (AIRA-74), no
+disruption. AIRA-91 Part B remains an explicit, unbuilt owner decision (§5
+item 5). AIRA-20 stays open for its `-race`-restoration half alone, blocked
+on AIRA-33/AIRA-91 per its own ticket. One real incident during execution,
+corrected and documented on PR #36: PR #35 (Fix 5) was squash-merged from a
+stale branch snapshot mid-race with a still-working build agent, silently
+dropping the critical AIRA-91 fix; caught by independent re-verification
+against the merged artifact rather than trusting the PR description, and
+fixed before deploy.
 **Input:** [`docs/superpowers/reviews/2026-09-04-fable-backlog-simplification-sweep.md`](../reviews/2026-09-04-fable-backlog-simplification-sweep.md)
 (four parallel Fable-model cluster reviews of all 49 open tickets, each verified
 against current source, not trusted from ticket text)
