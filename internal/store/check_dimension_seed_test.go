@@ -308,6 +308,12 @@ func newFullyEstablishedStore(t *testing.T) *Store {
 // its evaluator looks like -- had no coverage at all. This supplies it: the
 // dimension reads unevaluated, carries its reason, and demotes an
 // otherwise-clean rollup rather than reporting a fabricated green.
+//
+// The sentinel is appended to the package-level checkDimensions rather than
+// mocked: it is the list Check itself walks, so nothing about the wiring is
+// stubbed out. No test in this package calls t.Parallel(), so the swap and its
+// restore are ordered; a parallel test added here later would have to take that
+// into account before `-race` (AIRA-20) can run the package.
 func TestCheckReportsADimensionNoCheckerEstablishedAsUnevaluated(t *testing.T) {
 	established := checkDimensions
 	checkDimensions = append(append([]string(nil), established...), "unwired-dimension")
@@ -330,12 +336,13 @@ func TestCheckReportsADimensionNoCheckerEstablishedAsUnevaluated(t *testing.T) {
 	if !report.Unevaluated || report.Verdict != "unevaluated" {
 		t.Fatalf("verdict=%q unevaluated=%v, want the rollup demoted; report=%#v", report.Verdict, report.Unevaluated, report)
 	}
-	// The fixture establishes all fourteen real dimensions, so the demotion
-	// asserted above is the unwired one and nothing else.
-	for _, dimension := range established {
-		if report.Dimensions[dimension] != "pass" {
-			t.Fatalf("established dimension %q = %q, want pass; report=%#v", dimension, report.Dimensions[dimension], report)
-		}
+	// Attribution: this fixture establishes all fourteen real dimensions and is
+	// otherwise a clean pass, so the sentinel's reason must be the only one in
+	// the report. Asserting that rather than re-walking the fourteen keeps this
+	// test about the wiring and leaves the per-dimension pass condition to
+	// TestCheckReportsEveryDimensionPassWhenEveryCheckerEstablishesIt.
+	if len(report.UnevaluatedFindings) != 1 {
+		t.Fatalf("want the unwired dimension's reason and nothing else, got %#v", report.UnevaluatedFindings)
 	}
 }
 
@@ -381,6 +388,16 @@ func TestCheckDoesNotEstablishTicketFileIntegrityForAWorktreeItCouldNotScan(t *t
 	}
 	if writes == 0 {
 		t.Fatal("the fixture never perturbed a scan read, so nothing was made inconclusive")
+	}
+	// The scan really did come back inconclusive, and it is the worktree scan in
+	// checkDuplicateIDs, not some other read. Without this the test would still
+	// pass against a checkDuplicateIDs that stopped reporting the inconclusive
+	// scan at all and left duplicate-id to be established "pass" instead.
+	if !hasCheckFindingSubject(report.UnevaluatedFindings, "U_INDEX_UNESTABLISHED", filepath.Base(root)) {
+		t.Fatalf("the inconclusive worktree scan reported no reason: %#v", report.UnevaluatedFindings)
+	}
+	if got := report.Dimensions["duplicate-id"]; got != "unevaluated" {
+		t.Fatalf("duplicate-id = %q, want unevaluated; report=%#v", got, report)
 	}
 	if got := report.Dimensions["ticket-file-integrity"]; got == "pass" {
 		t.Fatalf("ticket-file-integrity claimed a pass over a worktree the scan could not read; report=%#v", report)

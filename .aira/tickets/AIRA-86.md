@@ -207,7 +207,14 @@ the fix's behaviour was right, the tests did not pin it:
   hand-built report.
 
 Both new tests were themselves mutation-verified: each fails against its
-mutation and passes against the shipped code.
+mutation and passes against the shipped code. An independent adversarial pass
+over the tests (DeepSeek-pro) then found the second one porous in a third
+direction: deleting the inconclusive arm's `addFinding` instead, which leaves
+`duplicate-id` to be established `pass` for the same unscanned worktree, still
+passed it. That assertion is now present too, and that third mutation is
+caught. Named, not fixed: swapping the package-level `checkDimensions` from a
+test is ordered only because no test in `internal/store` calls `t.Parallel()` —
+recorded in the test's own comment for whoever restores `-race` (AIRA-20).
 
 The third survivor — removing the `len(gateReport.Results) > 0` guard in
 `checkGatesReadOnly` — is an equivalent mutant today, exactly as this ticket's
