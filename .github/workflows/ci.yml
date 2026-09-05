@@ -46,7 +46,21 @@ jobs:
         run: make test
       # NOTE: no `-race` job here on purpose. The repo's gate is `make ci`
       # (build + vet + gofmt + test, no -race); `make race` is a local dev
-      # target. Under -race's slowdown on a shared CI runner, a few tests with
-      # wall-clock latency assertions (watch poll-interval, admission-lock
-      # latency) flake despite there being no actual data race. Re-add a race
-      # job once those are hardened to condition-based waiting (AIRA-20).
+      # target. Under -race's slowdown on a shared CI runner, tests with
+      # wall-clock latency assertions flake despite there being no actual data
+      # race.
+      #
+      # AIRA-20's hardening pass has LANDED, so that half of the precondition is
+      # met: every deadline in internal/runner, internal/daemon and
+      # internal/pylib now goes through internal/testdeadline, which scales by 4x
+      # under -race, and `make race` is green on internal/daemon and
+      # internal/runner locally.
+      #
+      # What still blocks the job is one named test, not the pass:
+      # TestRealPytestRAMForkDoesNotPinHelperStdin remains load-flaky on its
+      # SIGTERM budget (AIRA-65), which is a hardcoded process.wait(timeout=1.0)
+      # in the xdist governor — production code inside AIRA-33's deletion scope,
+      # so hardening it would be thrown away. Re-adding -race before AIRA-33
+      # lands would declare clean a suite that still contains a known flake, so
+      # it waits for AIRA-33 (itself blocked on AIRA-91) or for an explicit
+      # quarantine of that one test, said out loud rather than done silently.

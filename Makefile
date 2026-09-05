@@ -40,14 +40,19 @@ lint:
 build:
 	$(GO) build ./...
 
+# The explicit -timeout is load-bearing, not decoration. AIRA-20 widened every test
+# liveness backstop so a hang is reported by name instead of by wall clock; a few of
+# those firing in one package can approach go test's silent 10m default, which aborts
+# the whole binary with a goroutine dump and hides the named failure the backstops
+# exist to produce. -race multiplies both the run time and the backstops.
 test:
-	$(GO) test ./... -count=1
+	$(GO) test ./... -count=1 -timeout 20m
 
 race:
-	$(GO) test ./... -race -count=1
+	$(GO) test ./... -race -count=1 -timeout 40m
 
 cover:
-	$(GO) test ./... -coverprofile=coverage.out
+	$(GO) test ./... -coverprofile=coverage.out -timeout 20m
 	$(GO) tool cover -func=coverage.out | tail -n 1
 
 fuzz:

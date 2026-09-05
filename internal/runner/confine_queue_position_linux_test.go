@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"aira/internal/testdeadline"
 )
 
 // fakeConfineListDaemon serves exactly one confine-list request over a unix
@@ -80,7 +82,7 @@ func TestConfineQueuePositionProbeAsksTheDaemonForItsOwnScope(t *testing.T) {
 		return confineListReply(t, &ConfineSliceReserve{Queued: 3, QueuePosition: 2, QueuedAheadBytes: 2 << 30})
 	})
 	request := ConfineRequest{AdmitSocketPath: socket, ScopeID: "CONFINE-job-5101-abc@session-a", Owner: "session-a"}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testdeadline.Wait(5*time.Second))
 	defer cancel()
 	got, ok := confineQueuePositionFromDaemon(ctx, request, "/sys/fs/cgroup/aira.slice")
 	if !ok {
@@ -117,7 +119,7 @@ func TestConfineQueuePositionProbeSubstitutesAnUnusableOwner(t *testing.T) {
 		return confineListReply(t, &ConfineSliceReserve{Queued: 1, QueuePosition: 1})
 	})
 	request := ConfineRequest{AdmitSocketPath: socket, ScopeID: "CONFINE-job-5101-abc"}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testdeadline.Wait(5*time.Second))
 	defer cancel()
 	if _, ok := confineQueuePositionFromDaemon(ctx, request, "/slice"); !ok {
 		t.Fatalf("probe reported no position for a valid reply")
@@ -139,7 +141,7 @@ func TestConfineQueuePositionProbeSubstitutesAnUnusableOwner(t *testing.T) {
 // verifies: no socket, a refused connection, an error frame, a missing
 // summary, and a zero/inconsistent position all report "no position".
 func TestConfineQueuePositionProbeReportsAbsenceNotZero(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testdeadline.Wait(5*time.Second))
 	defer cancel()
 	t.Run("no-daemon-socket", func(t *testing.T) {
 		if _, ok := confineQueuePositionFromDaemon(ctx, ConfineRequest{ScopeID: "CONFINE-job-1-a"}, "/slice"); ok {
@@ -225,7 +227,7 @@ func TestConfineQueuePositionProbeReturnsWhenTheWaitEnds(t *testing.T) {
 		close(accepted)
 		<-time.After(30 * time.Second) // never answers
 	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testdeadline.Wait(30*time.Second))
 	defer cancel()
 	returned := make(chan struct{})
 	go func() {
@@ -237,13 +239,13 @@ func TestConfineQueuePositionProbeReturnsWhenTheWaitEnds(t *testing.T) {
 	}()
 	select {
 	case <-accepted:
-	case <-time.After(10 * time.Second):
+	case <-testdeadline.After(10 * time.Second):
 		t.Fatal("the probe never reached the daemon")
 	}
 	cancel()
 	select {
 	case <-returned:
-	case <-time.After(10 * time.Second):
+	case <-testdeadline.After(10 * time.Second):
 		t.Fatal("the probe outlived its context; a wedged daemon would delay the launch")
 	}
 }

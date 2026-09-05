@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"aira/internal/testdeadline"
 )
 
 // AIRA-68's own claim, as a standing regression: reserves granted for jobs that
@@ -56,7 +58,7 @@ func e2eDrainGrant(conn net.Conn) {
 // contribution rather than zero.
 func e2eWaitLedger(t *testing.T, server *Server, wantJobs int, wantBytes int64) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(3 * time.Second))
 	var snapshot admitSnapshot
 	for time.Now().Before(deadline) {
 		snapshot = server.admitSliceSnapshot("/slice")

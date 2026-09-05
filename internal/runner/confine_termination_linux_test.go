@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"aira/internal/testdeadline"
 )
 
 func int64ptr(value int64) *int64 { return &value }
@@ -480,7 +482,7 @@ func TestConfineTrailerReportsSupervisorSignal(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		deadline := time.Now().Add(10 * time.Second)
+		deadline := time.Now().Add(testdeadline.Wait(10 * time.Second))
 		for time.Now().Before(deadline) {
 			if _, err := os.Stat(marker); err == nil {
 				signals <- syscall.SIGTERM
@@ -554,7 +556,7 @@ func TestForwardConfineSignalsStopJoinsTheHandler(t *testing.T) {
 	close(release)
 	select {
 	case <-stopped:
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("stop never returned after the handler finished")
 	}
 	mu.Lock()

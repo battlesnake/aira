@@ -15,6 +15,7 @@ import (
 
 	"aira/internal/cgrouptest"
 	"aira/internal/runner"
+	"aira/internal/testdeadline"
 )
 
 // staleLeaseTestSliceRoot returns a REAL, isolated confine slice path for this
@@ -94,7 +95,7 @@ func staleLeaseTestSleeper(t *testing.T, cgroupPath string) *exec.Cmd {
 	if err := fd.Close(); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(time.Second))
 	for {
 		data, readErr := os.ReadFile(filepath.Join(cgroupPath, "cgroup.events"))
 		if readErr == nil && strings.Contains(string(data), "populated 1") {

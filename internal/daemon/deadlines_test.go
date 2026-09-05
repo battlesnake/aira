@@ -12,6 +12,7 @@ import (
 
 	"aira/internal/core"
 	"aira/internal/store"
+	"aira/internal/testdeadline"
 )
 
 // The AIRA-84 seam is falsifiable by MUTATION, not by running these against the
@@ -132,7 +133,7 @@ func TestHandshakeDeadlineDoesNotSurviveIntoAHandlersOwnReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(testdeadline.Wait(10 * time.Second))); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeFrame(conn, RequestFrame{Proto: ProtocolVersion, Request: core.Request{Verb: "governor"}}); err != nil {
@@ -202,9 +203,15 @@ func TestExchangeResponseWaitStillBoundsAReplylessDaemon(t *testing.T) {
 		_ = readFrame(conn, &payload)
 		// Never reply, and hold the connection open so the client cannot
 		// mistake an EOF for a bound wait. Long enough to outlast the response
-		// budget by ~30x, short enough not to leave a goroutine parked for the
-		// rest of the package's run.
-		time.Sleep(3 * time.Second)
+		// budget by ~30x, short enough that the goroutine it parks (stubSocket
+		// never joins its handler) is gone well before the package's run ends.
+		//
+		// It scales with the elapsed bound below, because the two are a ratio, not
+		// two independent constants: leaving this fixed while the bound scaled would
+		// let a scaled 4s budget sit ABOVE this sleep, and "returned at the stub's own
+		// EOF" would then satisfy the bound (AIRA-20). The netErr.Timeout() assertion
+		// would still catch it, but the bound would have stopped contributing.
+		time.Sleep(testdeadline.Wait(3 * time.Second))
 	})
 
 	policy := deadlinePolicy{Connect: 5 * time.Second, ResponseWait: 100 * time.Millisecond, Write: time.Second}
@@ -224,7 +231,7 @@ func TestExchangeResponseWaitStillBoundsAReplylessDaemon(t *testing.T) {
 	if !errors.As(err, &netErr) || !netErr.Timeout() {
 		t.Fatalf("err = %v, want a socket read-deadline timeout", err)
 	}
-	if elapsed > time.Second {
+	if testdeadline.Exceeded(elapsed, time.Second) {
 		t.Fatalf("wait took %s, so the response deadline did not bound it", elapsed)
 	}
 }

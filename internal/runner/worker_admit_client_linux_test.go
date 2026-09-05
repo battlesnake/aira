@@ -10,6 +10,7 @@ import (
 
 	"aira/internal/daemon"
 	"aira/internal/runner"
+	"aira/internal/testdeadline"
 )
 
 func daemonTestPaths(t *testing.T) daemon.Paths {
@@ -140,7 +141,7 @@ func TestRequestWorkerAdmitBoundsWaitWhenDaemonAcceptsButNeverResponds(t *testin
 	// Generous bound (MaxWait + the fixed transport grace + real
 	// scheduling slack) that a fix completes well inside, but an
 	// unconditional hang would never reach.
-	if elapsed > 5*time.Second {
+	if testdeadline.Exceeded(elapsed, 5*time.Second) {
 		t.Fatalf("RequestWorkerAdmit took %s against a 200ms MaxWait -- looks like the unbounded-read regression", elapsed)
 	}
 	select {

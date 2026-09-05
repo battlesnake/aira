@@ -4,6 +4,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"aira/internal/testdeadline"
 )
 
 // These tests directly exercise the evaluator. Revert-check: replacing the
@@ -94,7 +96,7 @@ func TestWriteGovernorFrameRefreshesExpiredWriteDeadline(t *testing.T) {
 		if frame.State != "continue" {
 			t.Fatalf("reply state = %q, want continue", frame.State)
 		}
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("timed out waiting for governor reply")
 	}
 }
@@ -119,13 +121,13 @@ func TestGovernorConnectionRefreshesExpiredWriteDeadline(t *testing.T) {
 		_ = serverConn.Close()
 		select {
 		case <-handlerDone:
-		case <-time.After(time.Second):
+		case <-testdeadline.After(time.Second):
 			t.Error("governor connection did not exit")
 		}
 		s.governor.stopOnce.Do(func() { close(s.governor.stop) })
 	})
 
-	if err := clientConn.SetDeadline(time.Now().Add(time.Second)); err != nil {
+	if err := clientConn.SetDeadline(time.Now().Add(testdeadline.Wait(time.Second))); err != nil {
 		t.Fatalf("set client deadline: %v", err)
 	}
 	if err := writeFrame(clientConn, governorRequestFrame{Type: "acquire", WorkerUUID: "worker", JobID: "job", Slice: "aira.slice"}); err != nil {
@@ -188,13 +190,13 @@ func TestGovernorConnectionFailsOpenOnUnresolvableSlice(t *testing.T) {
 		_ = serverConn.Close()
 		select {
 		case <-handlerDone:
-		case <-time.After(time.Second):
+		case <-testdeadline.After(time.Second):
 			t.Error("governor connection did not exit")
 		}
 		s.governor.stopOnce.Do(func() { close(s.governor.stop) })
 	})
 
-	if err := clientConn.SetDeadline(time.Now().Add(time.Second)); err != nil {
+	if err := clientConn.SetDeadline(time.Now().Add(testdeadline.Wait(time.Second))); err != nil {
 		t.Fatalf("set client deadline: %v", err)
 	}
 	if err := writeFrame(clientConn, governorRequestFrame{Type: "acquire", WorkerUUID: "worker", JobID: "job", Slice: "missing.slice"}); err != nil {
@@ -339,7 +341,7 @@ func TestGovernorReacquireConcurrentOldDisconnectKeepsOneUUID(t *testing.T) {
 	close(startOldDisconnect)
 	select {
 	case <-disconnected:
-	case <-time.After(2 * time.Second):
+	case <-testdeadline.After(2 * time.Second):
 		t.Fatal("old disconnect did not complete")
 	}
 	g.mu.Lock()

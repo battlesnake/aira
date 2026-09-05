@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"aira/internal/testdeadline"
 )
 
 // AIRA-62. The reserve-resolution rule, exercised at the seam where it is CONSUMED:
@@ -303,7 +305,7 @@ func TestConfineAdmitWireFrameCarriesTheResolvedChargeNotTheCap(t *testing.T) {
 			var args map[string]any
 			select {
 			case args = <-frames:
-			case <-time.After(10 * time.Second):
+			case <-testdeadline.After(10 * time.Second):
 				t.Fatal("no admit frame reached the daemon")
 			}
 			reserve, _ := args["reserve"].(float64)

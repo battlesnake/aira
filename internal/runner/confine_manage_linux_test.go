@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"aira/internal/cgrouptest"
+	"aira/internal/testdeadline"
 
 	"golang.org/x/sys/unix"
 )
@@ -422,7 +423,7 @@ func TestConfineRealScopeKillSurvivesLauncherIdentityLoss(t *testing.T) {
 	if err := command.Wait(); err != nil {
 		t.Fatalf("launcher exit: %v", err)
 	}
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(time.Second))
 	for {
 		members, memberErr := scope.Members()
 		if memberErr == nil && len(members) > 0 {
@@ -806,7 +807,7 @@ func startReaperTestSleeper(t *testing.T, cgroupPath string) *exec.Cmd {
 	if err := fd.Close(); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(time.Second))
 	for {
 		data, readErr := os.ReadFile(filepath.Join(cgroupPath, "cgroup.events"))
 		if readErr == nil && strings.Contains(string(data), "populated 1") {

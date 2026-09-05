@@ -16,6 +16,7 @@ import (
 	"aira/internal/core"
 	"aira/internal/domain"
 	"aira/internal/store"
+	"aira/internal/testdeadline"
 )
 
 func lifecycleFixture(t *testing.T) (*Server, WorktreeScope, *store.Store) {
@@ -526,7 +527,7 @@ func TestEjectExcludesCachedProjectUseBeforeCommit(t *testing.T) {
 		done <- server.eject(context.Background(), map[string]any{"project": scope.ProjectID, "force": true})
 	}()
 	var refused atomic.Bool
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(2 * time.Second))
 	for time.Now().Before(deadline) {
 		if _, _, err := server.storeForScope(scope); store.ErrorCode(err) == "E_NOT_ADOPTED" {
 			refused.Store(true)

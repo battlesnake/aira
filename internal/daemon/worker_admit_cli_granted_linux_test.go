@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"aira/internal/runner"
+	"aira/internal/testdeadline"
 )
 
 // grantedRelayHoldDwell is how long the test watches a granted relay that must
@@ -217,7 +218,7 @@ func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 	var first relayLine
 	select {
 	case first = <-firstLine:
-	case <-time.After(grantedRelayExitBudget):
+	case <-testdeadline.After(grantedRelayExitBudget):
 		t.Fatalf("the relay produced no outcome line within %v", grantedRelayExitBudget)
 	}
 	if first.err != nil {
@@ -294,7 +295,7 @@ func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 		if len(exit.trailing) != 0 {
 			t.Fatalf("the relay wrote more than the one outcome line: %q", exit.trailing)
 		}
-	case <-time.After(grantedRelayExitBudget):
+	case <-testdeadline.After(grantedRelayExitBudget):
 		t.Fatalf("the relay did not exit within %v of its stdin closing: supervisor.py's _retire_worker then falls through to SIGKILL and, before AIRA-92 bounded it, orphaned relays accumulated holding live grants", grantedRelayExitBudget)
 	}
 	// Nothing on stderr for the whole granted lifetime. This is not tidiness:
@@ -307,7 +308,7 @@ func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 	// The daemon observes the peer disconnect asynchronously, so poll for the
 	// release rather than assuming it has already happened.
 	released := false
-	for deadline := time.Now().Add(grantedRelayExitBudget); time.Now().Before(deadline); {
+	for deadline := time.Now().Add(testdeadline.Wait(grantedRelayExitBudget)); time.Now().Before(deadline); {
 		if len(server.admitSlots) == 0 {
 			released = true
 			break
