@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 // AIRA-101 §9.1: an exclusive request must FAIL CLOSED on every non-grant.
@@ -234,6 +235,63 @@ func TestNestedTokensReachTheDaemon(t *testing.T) {
 		t.Fatalf("parent scope id missing from the admit frame: %v", args)
 	}
 	result.releaseAdmission()
+}
+
+// THE FIX SITE for the deadline leak, tested where the fix actually lives.
+//
+// admitThroughDaemon sets a transport deadline of now+maxWait+grace to bound the
+// admission EXCHANGE, then hands that same connection back as the LEASE — which
+// is held for the whole life of the job and routinely outlives any admission
+// budget. Leaving the deadline set was invisible until AIRA-101 added the first
+// client-side reader of the lease; then every exclusive benchmark running longer
+// than its own admission budget (30 minutes by default) reported itself
+// contended when nothing had actually happened.
+//
+// This asserts the returned lease has NO deadline, by proving a read on it is
+// still blocked well past when the transport deadline would have fired. It is
+// deliberately at THIS level rather than in the confine e2e test: a test that
+// cleared the deadline itself would pass against a reverted fix.
+func TestAGrantedLeaseCarriesNoTransportDeadline(t *testing.T) {
+	r, _ := gateOnlyRunner(t, newInstantClock(), func(string) (int64, int64, bool, string) { return 0, 1 << 40, true, "" })
+	// A very short admission budget, so an un-cleared deadline fires almost at once.
+	r.admissionMaxWait = 50 * time.Millisecond
+	client, server := net.Pipe()
+	r.admitDialFn = func(context.Context, string) (net.Conn, error) { return client, nil }
+	go func() {
+		defer server.Close()
+		var request runnerAdmitRequestFrame
+		if err := readRunnerAdmitFrame(server, &request); err != nil {
+			return
+		}
+		data, _ := json.Marshal(runnerAdmitGrant{State: "immediate", Reserve: 40, Basis: "pinned:client"})
+		_ = writeRunnerAdmitFrame(server, runnerAdmitResponseFrame{OK: true, Code: "OK", Data: data})
+		// Hold the lease open, exactly as a live daemon does for the job's lifetime.
+		var one [1]byte
+		_, _ = server.Read(one[:])
+	}()
+	result, err := r.admit(context.Background(), Request{})
+	if err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+	defer result.releaseAdmission()
+	lease, ok := result.release.(net.Conn)
+	if !ok {
+		t.Fatalf("expected the lease to be the connection, got %T", result.release)
+	}
+	// Read on the lease well past when the transport deadline (maxWait + ~1s
+	// grace) would have expired. A healthy, still-held lease must simply block.
+	readErr := make(chan error, 1)
+	go func() {
+		var one [1]byte
+		_, readErrValue := lease.Read(one[:])
+		readErr <- readErrValue
+	}()
+	select {
+	case err := <-readErr:
+		t.Fatalf("the lease read returned %v: a transport deadline survived onto the lease, so every job outliving its admission budget would be reported as having lost its grant", err)
+	case <-time.After(1500 * time.Millisecond):
+		// Still blocked, which is the correct behaviour for a live lease.
+	}
 }
 
 // A stray or malformed inherited token must be discarded, not forwarded: the

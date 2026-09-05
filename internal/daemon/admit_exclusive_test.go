@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"sync/atomic"
 	"testing"
@@ -564,18 +565,47 @@ func TestRepeatedExclusiveRequestAndAbandonNeverWedgesTheSlice(t *testing.T) {
 		evaluate(t, server, queue)
 		requireGranted(t, queue, exclusive, "the exclusive waiter")
 
-		// Alternate how the requester goes away, so no single release path is the
-		// only one under test.
-		switch round % 3 {
+		// Rotate through the four STRUCTURALLY DISTINCT ways exclusivity ends. An
+		// earlier version cycled three cases that all reduced to the same
+		// hold-then-ledger-release (timeoutAdmitWaiter is a no-op on a granted
+		// waiter, and the locked form is what releaseAdmitWaiter already calls), so
+		// it ran the same path fifty times and would not have caught a leak on any
+		// other one (found by build review).
+		switch round % 4 {
 		case 0:
+			// A HOLD released by its connection closing.
 			server.releaseAdmitWaiter(queue, exclusive)
 		case 1:
+			// A DRAIN abandoned by its requester before it ever completed.
+			server.releaseAdmitWaiter(queue, exclusive)
+			queue, exclusive = enqueueExclusiveTest(t, server, 10, admitRequest{
+				exclusive: true, scopeID: exclusiveScopeID(t, "drain", 800+round), name: "drain", owner: "mark",
+			})
+			queue.mu.Lock()
+			queue.outstandingJobs = 1
+			queue.mu.Unlock()
+			evaluate(t, server, queue)
+			requireStillQueued(t, queue, exclusive, "a drain held up by a running job")
+			queue.mu.Lock()
+			queue.outstandingJobs = 0
+			queue.mu.Unlock()
+			server.releaseAdmitWaiter(queue, exclusive)
+		case 2:
+			// A DRAIN that expired on its own max_wait.
+			server.releaseAdmitWaiter(queue, exclusive)
+			queue, exclusive = enqueueExclusiveTest(t, server, 10, admitRequest{
+				exclusive: true, scopeID: exclusiveScopeID(t, "expire", 800+round), name: "expire", owner: "mark",
+			})
 			server.timeoutAdmitWaiter(queue, exclusive)
 			server.releaseAdmitWaiter(queue, exclusive)
 		default:
+			// A daemon SHUTDOWN mid-hold, released through the same discharge the
+			// connection handler runs on its way out.
 			queue.mu.Lock()
 			releaseAdmitWaiterLocked(queue, exclusive)
 			queue.mu.Unlock()
+			s := server
+			s.afterAdmitRelease(queue)
 		}
 
 		queue, ordinary := enqueueExclusiveTest(t, server, 10, admitRequest{})
@@ -666,4 +696,69 @@ func TestAnExclusiveWaiterStillFacesOrdinaryRAMAdmission(t *testing.T) {
 	evaluate(t, server, queue)
 
 	requireStillQueued(t, queue, exclusive, "an exclusive waiter too large for its own slice")
+}
+
+// Plan item: the AIRA-49/68 stale-lease sweep must not reclaim a held exclusive
+// whose scope is genuinely populated, and MUST reclaim one whose scope has
+// vanished — releasing the slice rather than wedging it.
+//
+// The sweep is exclusivity-agnostic by design; this pins that it stays so in
+// both directions, because getting it wrong either way is severe: reclaiming a
+// live holder silently ends a benchmark's exclusivity, while failing to reclaim
+// a vanished one leaves the slice held with nothing running.
+func TestTheStaleLeaseSweepRespectsAHeldExclusiveLease(t *testing.T) {
+	server, _ := exclusiveTestServer(t)
+	server.staleLeaseReleaseGrace = time.Nanosecond
+	holderID := exclusiveScopeID(t, "bench", 950)
+	queue, holder := enqueueExclusiveTest(t, server, 10, admitRequest{
+		exclusive: true, scopeID: holderID, name: "bench", owner: "mark",
+	})
+	evaluate(t, server, queue)
+	requireGranted(t, queue, holder, "the exclusive holder")
+
+	// A POPULATED scope: neither reclaim proof holds, so the hold must survive.
+	server.releaseStaleGrantedLeasesPass(context.Background())
+	requireGranted(t, queue, holder, "a held exclusive whose scope is still populated")
+	if state := server.admitSliceSnapshot("/slice").exclusiveState; state != admitExclusiveHeld {
+		t.Fatalf("the sweep ended a live benchmark's exclusivity: state=%q", state)
+	}
+
+	// Now the scope is observed and then observed GONE — the vanished proof.
+	queue.mu.Lock()
+	holder.scopeSeen, holder.scopeVanished = true, true
+	queue.adoptedScanFailed = false
+	queue.mu.Unlock()
+	server.releaseStaleGrantedLeasesPass(context.Background())
+	if state := server.admitSliceSnapshot("/slice").exclusiveState; state != "" {
+		t.Fatalf("a vanished exclusive holder must release the slice, got state=%q", state)
+	}
+}
+
+// Plan item: a daemon shutdown during a DRAIN releases rather than wedging.
+// admitConnection returns on s.stopping and its deferred release discharges the
+// waiter; this asserts the ledger effect that path produces.
+func TestDaemonShutdownDuringADrainReleasesTheSlice(t *testing.T) {
+	server, _ := exclusiveTestServer(t)
+	queue, exclusive := enqueueExclusiveTest(t, server, 10, admitRequest{
+		exclusive: true, scopeID: exclusiveScopeID(t, "bench", 951), name: "bench", owner: "mark",
+	})
+	queue.mu.Lock()
+	queue.outstandingJobs = 1
+	queue.mu.Unlock()
+	_, ordinary := enqueueExclusiveTest(t, server, 10, admitRequest{})
+	evaluate(t, server, queue)
+	requireStillQueued(t, queue, ordinary, "an ordinary waiter behind the drain")
+
+	// The daemon stops: every admit handler returns and runs its deferred release.
+	close(server.stopping)
+	server.releaseAdmitWaiter(queue, exclusive)
+
+	queue.mu.Lock()
+	queue.outstandingJobs = 0
+	queue.mu.Unlock()
+	server.evaluateAdmitQueue(queue)
+	requireGranted(t, queue, ordinary, "an ordinary waiter after a shutdown ended the drain")
+	if state := server.admitSliceSnapshot("/slice").exclusiveState; state != "" {
+		t.Fatalf("exclusivity survived a daemon shutdown: state=%q", state)
+	}
 }

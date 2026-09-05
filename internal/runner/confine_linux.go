@@ -668,12 +668,32 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// signal, and neither writes after the grant frame, so reading it here is
 	// consistent with the existing protocol rather than a new use of the channel.
 	//
+	// TWO stated limits of this watcher, neither fixed:
+	//   - It sees the lease CLOSING. A ledger-only release (the stale-lease sweep,
+	//     or confine --kill's daemon-side discharge) leaves the socket open and the
+	//     handler parked, so exclusivity can end without this firing. The honest
+	//     claim is "never silently downgraded WHEN THE LEASE CLOSES".
+	//   - A close in the last few milliseconds before teardown is masked by the
+	//     guard below and reported as a clean run. The window is the teardown
+	//     itself, and erring that way keeps a clean run from being libelled.
+	//
 	// The teardownStarted guard is load-bearing: releaseAdmission closes the lease
 	// on the ordinary exit path, so without it this read would fail with "use of
 	// closed network connection" on EVERY clean run and report exclusive=lost
 	// every time, inverting the honesty signal into a permanent false alarm.
 	if request.Exclusive {
-		if lease, ok := admission.release.(net.Conn); ok {
+		lease, watchable := admission.release.(net.Conn)
+		if !watchable {
+			// The grant is real (admit refuses anything else), but without a lease
+			// connection to watch, a mid-run loss could not be detected — so the run's
+			// outcome is UNEVALUATED rather than granted. Claiming `granted` here
+			// would assert something this process cannot observe, which is the exact
+			// fabrication the facet exists to prevent, and it is also what made
+			// `unevaluated` unreachable in an earlier revision: a value nothing can
+			// emit is a reader trap (found by build review).
+			result.Status.Exclusive = ConfineExclusiveUnevaluated
+		}
+		if watchable {
 			go func() {
 				var one [1]byte
 				_, readErr := lease.Read(one[:])
@@ -932,9 +952,9 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		// strip on every confine launch (runner_linux.go).
 		cmd.Env = pylib.StripAitestEnvironment(cmd.Env)
 	}
-	// AIRA-101. Export the holder token on an exclusive launch — and STRIP any
-	// inherited one otherwise, so a non-exclusive job nested inside an exclusive
-	// one cannot hand its own children an attestation that is false for them.
+	// AIRA-101. An exclusive launch STAMPS its own scope id. A non-exclusive one
+	// leaves whatever it inherited INTACT: the entire process tree below a holder
+	// must carry the token.
 	//
 	// Set UNCONDITIONALLY here rather than through AppendConfineChildEnvironment:
 	// that helper gates several variables on RuntimeDir being present, and
@@ -942,10 +962,23 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// attestation that silently vanished under some configurations would be worse
 	// than none at all, because a benchmark checking for it would then refuse to
 	// run for entirely the wrong reason.
+	//
+	// An earlier revision STRIPPED an inherited token on a non-exclusive launch,
+	// reasoning that the attestation would be "false" for such a job. That
+	// deadlocked the holder against its own hold at depth three: H --exclusive →
+	// N1 `aira confine -- make X` inherits the token and is admitted, but its
+	// CHILD environment had the token removed, so N2 `aira confine -- pytest` from
+	// that Makefile sent no token, was blocked by H's own hold, waited its full
+	// max_wait, and H stalled on N2 while the slice stayed held against every
+	// other session on the machine. CLAUDE.md's own "confine every heavy command"
+	// rule makes that depth entirely ordinary (found by build review).
+	//
+	// The reasoning it replaces was also just wrong: a job running inside a live
+	// hold IS running exclusively. And a STALE token is harmless by construction —
+	// belongsToHolder matches only the LIVE holder's unique scope id, so a token
+	// from a finished holder matches nothing and grants nothing.
 	if request.Exclusive {
 		cmd.Env = upsertConfineEnv(cmd.Env, ExclusiveHolderEnv, scopeID)
-	} else {
-		cmd.Env = removeConfineEnv(cmd.Env, ExclusiveHolderEnv)
 	}
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, diagnostics
 	cmd.ExtraFiles = []*os.File{handshakeWrite, releaseRead}

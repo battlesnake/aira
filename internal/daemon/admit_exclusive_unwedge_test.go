@@ -71,6 +71,11 @@ func TestHelperExclusiveClaimant(t *testing.T) {
 	if err := readFrame(conn, &response); err != nil || !response.OK {
 		os.Exit(13)
 	}
+	// Keep the connection REACHABLE for the rest of this process's life. Without
+	// this the local variable is dead after the read above, and a runtime GC could
+	// finalize-close the fd — which would release the lease before the parent's
+	// SIGKILL and make the un-wedge test pass for the wrong reason.
+	defer conn.Close()
 	// Signal the parent that the grant landed, then hold the lease forever. The
 	// parent kills us from here.
 	_, _ = os.Stdout.WriteString("granted\n")

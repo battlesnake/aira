@@ -580,6 +580,21 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 		return admissionResult{}, false, err
 	default:
 	}
+	// CLEAR the transport deadline before handing this connection back as the
+	// LEASE. It was set to `now + maxWait + grace` to bound the admission
+	// EXCHANGE; the exchange is over, and a lease has no deadline — it is held for
+	// the entire life of the job, which routinely outlives any admission wait.
+	//
+	// Leaving it set was harmless only while nothing ever read the lease. AIRA-101
+	// added the first such reader (confine's exclusivity watcher), which made the
+	// latent deadline load-bearing and actively wrong: the read failed with
+	// `i/o timeout` at maxWait+grace on a perfectly healthy connection, so any
+	// exclusive benchmark outliving its own admission budget — 30 minutes by
+	// default — reported `exclusive=lost` and warned that its measurement was
+	// contended when nothing had happened at all. That inverts the honesty facet
+	// on precisely the long runs it exists for, and it silenced the watcher
+	// afterwards so a REAL loss then went unreported (found by build review).
+	_ = conn.SetDeadline(time.Time{})
 	// A full, validated frame is the sole winning outcome even when its final
 	// byte races the transport deadline. The flock fallback is never entered.
 	return admissionResult{state: grant.State, reason: grant.Reason, waitedMS: grant.WaitedMS, release: conn, reserve: grant.Reserve, basis: grant.Basis, scopeCeiling: grant.ScopeCeiling}, true, nil

@@ -72,7 +72,21 @@ const (
 func admitExclusiveWaitCeiling() time.Duration {
 	ceiling := admitExclusiveWaitCeilingDefault
 	if raw := strings.TrimSpace(os.Getenv("AIRA_ADMIT_EXCLUSIVE_WAIT_CEILING")); raw != "" {
-		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+		parsed, err := time.ParseDuration(raw)
+		switch {
+		case err != nil || parsed <= 0:
+			// SAY SO rather than silently falling back. A silent substitution is
+			// exactly the defect AIRA-58 removed from this path: an operator who set
+			// a value and got a different one had no way to learn it.
+			admitExclusiveCeilingWarnOnce.Do(func() {
+				log.Printf("aira daemon: AIRA_ADMIT_EXCLUSIVE_WAIT_CEILING=%q is not a positive duration; using the %s default", raw, admitExclusiveWaitCeilingDefault)
+			})
+		case parsed > runner.AdmitWaitCeiling:
+			admitExclusiveCeilingWarnOnce.Do(func() {
+				log.Printf("aira daemon: AIRA_ADMIT_EXCLUSIVE_WAIT_CEILING=%s exceeds the shared admission ceiling %s; using the shared ceiling", parsed, runner.AdmitWaitCeiling)
+			})
+			ceiling = runner.AdmitWaitCeiling
+		default:
 			ceiling = parsed
 		}
 	}
@@ -81,6 +95,8 @@ func admitExclusiveWaitCeiling() time.Duration {
 	}
 	return ceiling
 }
+
+var admitExclusiveCeilingWarnOnce sync.Once
 
 // Exclusive-state vocabulary, shared by the rejection payload, the `--list`
 // summary and the blocked launcher's progress line. Exact-match tokens.
@@ -307,6 +323,22 @@ func (g exclusiveGate) holderScopeIDs(queue *sliceQueue) map[string]struct{} {
 // emptiness must never be rendered as an empty slice. Telling a benchmark "you
 // are alone" on a reading nobody has is the fabricated pass this codebase
 // forbids everywhere else.
+//
+// KNOWN COVERAGE LIMITS of the emptiness reading, stated rather than discovered
+// later. Each is fail-OPEN for the measurement and fail-SAFE for the machine —
+// they can let an exclusive job be granted beside something, never wedge the
+// slice:
+//
+//   - `aira run` scopes are named .aira-RUN-* under a project's own cgroup
+//     parent, not .aira-CONFINE-* under this slice, so the confine scan does not
+//     see them. While such a run holds its admission connection it is still
+//     counted by outstandingJobs; only after a daemon restart does it become
+//     invisible here.
+//   - Anything not admitted through AIRA at all — a process placed into the slice
+//     by hand — is outside this reading by construction, and so is a Docker
+//     container, which lives under /system.slice/docker-<id>.scope entirely
+//     outside this slice. `--exclusive`'s own help text says so; exclusivity must
+//     never be read as a claim about those.
 //
 // outstandingJobs is strict, with NO discount for exempt sub-reservations. A
 // discount would be unnecessary — a running job's own scoped lease already keeps
@@ -1193,6 +1225,17 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 				CodeAdmitExclusiveUnestablished+": the confine scan is failing, so an empty slice could not be established for an exclusive request")
 			return
 		}
+		// The EXCLUSIVE requester's own expiry. Its state is already admitRejected
+		// by the time the gate is re-derived, so it no longer matches the drain
+		// predicate and would otherwise be reported as plain saturation — "the slice
+		// was contended" — when what actually happened is "my drain did not complete
+		// in the budget I set". Naming it keeps the two apart for the one caller who
+		// most needs the difference (found by build review).
+		if waiter.exclusive {
+			queue.mu.Unlock()
+			s.writeAdmitRejection(conn, CodeAdmitSaturated, admitRejection{Basis: "reject:saturated", Exclusive: admitExclusiveDraining})
+			return
+		}
 		// Report WHETHER the wait expired under an exclusive drain or hold, so a
 		// blocked operator can tell "a benchmark has the slice" from ordinary
 		// saturation. Basis keeps its exact "reject:saturated" spelling, which
@@ -1953,6 +1996,16 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 			if _, _, _, _, parsed := runner.ParseConfineScopeID(parentScopeID); !parsed {
 				return admitRequest{}, fmt.Errorf("%s: admit parent_scope_id is not a canonical scope id", CodeProtocol)
 			}
+		}
+	}
+	// A SCOPED request is job-level work by definition, so it may not also declare
+	// itself somebody's sub-reservation: that combination would let a hand-crafted
+	// request claim the drain exemption while being exactly the new job-level work
+	// a drain exists to hold back. The blast radius is only a degraded
+	// measurement, like the holder token, but the refusal is one line.
+	if parentScopeID != "" {
+		if _, hasScope := args["scope_id"]; hasScope {
+			return admitRequest{}, fmt.Errorf("%s: admit parent_scope_id is for sub-reservations and cannot accompany scope_id", CodeProtocol)
 		}
 	}
 	if exclusive {
