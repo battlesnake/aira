@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -27,11 +26,7 @@ import (
 //
 // verifies: AIRA-42
 func TestWorkerAdmitCLIOutcomeChannelMatchesTheSupervisorBoundary(t *testing.T) {
-	binary := filepath.Join(t.TempDir(), "aira")
-	build := exec.Command("go", "build", "-o", binary, "aira/cmd/aira")
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build aira binary: %v\n%s", err, output)
-	}
+	binary := buildAiraBinary(t)
 
 	paths := testPaths(t)
 	server := NewServer(paths)
