@@ -668,8 +668,15 @@ clean; `TestMemoryEventsLocalDistinguishesOwnLimitFromDescendantOOM`'s
 drained-leader and ancestor-collateral subtests both pass directly against
 master.
 
-**Not yet deployed** — per the backlog plan's §8, this rides the Fix 2+4
-daemon-restart step (client-side code needs no restart of its own; the
-daemon-side `confine-kill` log line does).
+**Deployed** (2026-09-05, coordinator note): the running daemon and
+`~/.local/bin/aira` were rebuilt and the daemon restarted at 13:13:47 that
+day, from a master commit 13 commits past `c72c00c` (confirmed by
+`git merge-base --is-ancestor`) — this line's earlier "not yet deployed" is
+now stale. First independent field data point requested from `split`
+(peer session, `test-lite-slowbuild` OOM incidents) — their 3 prior
+incidents predate this deploy and can't validate it, but they've confirmed
+all 3 were silent under the old binary (consistent with the bug this fix
+closes) and will capture `terminated-by=` on the next heavy OOM under the
+new one.
 
-## Status: root cause closed. Part A done and verified on master, not yet deployed. Part B remains an owner decision.
+## Status: root cause closed. Part A done, verified on master, and deployed (2026-09-05). Part B remains an owner decision.
