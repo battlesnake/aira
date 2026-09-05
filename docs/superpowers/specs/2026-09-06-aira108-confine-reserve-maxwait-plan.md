@@ -345,3 +345,78 @@ tests that would have caught it.
 * **Fable plan gate — NOT RUN.** This session has no sub-agent dispatch tool, so
   the project's usual Fable gate could not be invoked. Three independent
   lineages were used in its place; recorded here rather than implied.
+
+## 9. Addendum — the ticket's "ROOT CAUSE FOUND" section, tested
+
+While this work was in progress the ticket gained a section headed **"ROOT CAUSE
+FOUND (split, SIGQUIT goroutine dump on the held live instance)"**, reporting the
+dump this plan had asked for and reading it as:
+
+> The **main** goroutine … is parked in a `select` at `cmd/aira/main.go:1295` …
+> That select's case set does not include a case that fires on the request's own
+> `--max-wait` deadline … so it blocks on grant-or-cancel forever regardless of
+> the declared bound.
+
+**That dump is the same evidence as before, and it says the same thing: the
+process had already been granted.** The select it names is the POST-GRANT HOLD —
+`select { case <-done: case <-signalCtx.Done(): }` — and reaching it is proof the
+admission wait completed successfully:
+
+* Every earlier return in `runConfineReserveCommand` exits the process. The only
+  way to reach that select is through a successful `reserveConfined` and the
+  `granted reserve=… basis=…` line already written to stdout.
+* The dump's own "companion helper goroutine created around main.go:1291-1292 in
+  the same block" is the `io.Copy(io.Discard, stdin)` goroutine — which is
+  *created by the lines immediately above that select*, and therefore cannot
+  exist before the grant.
+* Probe C reproduced this exact stack from a **demonstrably granted** helper
+  (grant line read by the parent at t=0.00s), together with the fd binding that
+  clinches it: `/proc/<tid>/syscall` = `[0 0x0 …]`, i.e. `read(2)` on fd 0.
+* Probe D reproduced the stack the WAITING state actually has, and it is not a
+  select at all: `goroutine 1 [IO wait]` → `net.(*conn).Read` ← `io.ReadAtLeast`,
+  with a thread on `epoll_pwait`.
+
+So the select does not "fail to race `--max-wait`"; racing `--max-wait` is not its
+job. `--max-wait` was already enforced, upstream, by the two mechanisms §1 traces
+and §4 now pins.
+
+### The directed fix is a regression, and it is caught
+
+The ticket goes on to direct: *"The correct fix almost certainly reuses the
+pattern `internal/runner/admission_linux.go`'s own poll loop already uses …
+(a timer/context case derived from the request's `MaxWait`)"*. Applied literally
+— adding `case <-time.After(maxWait):` to that select — this is what happens:
+
+```
+--- FAIL: TestConfineReserveGrantOutlivesTheDeclaredBound (3.25s)
+    a GRANTED reservation exited (<nil>) 2.014624618s after its grant, at or about
+    its own 2s admission bound. --max-wait bounds ADMISSION ONLY; expiring a
+    granted holder un-reserves a test that is still running
+```
+
+Every per-test RAM reservation would be silently released at 300 s while its test
+was still running, and the ledger would then advertise capacity that running
+tests are using — the aggregate over-admission class AIRA-67 exists to prevent.
+That is strictly worse than the symptom being fixed, and it is why §4's T2 exists
+and is stated as the more important of the two directions.
+
+### Secondary finding: SIGQUIT — does not reproduce
+
+The same section reports that *"SIGQUIT printed the goroutine dump but did not
+terminate the process afterward"*, suspecting a missing `os.Exit` or a
+`signal.Notify` swallowing it. Measured directly against this verb, with stdin
+deliberately left open (probe E):
+
+```
+grant: b'granted reserve=67108864 basis=pinned:client\n'
+after SIGQUIT (stdin still OPEN): rc=2 elapsed=0.10s
+  -> goroutine dump captured: 15226 bytes, 22 goroutines
+```
+
+It dumps and exits in 0.10 s with status 2 — Go's ordinary uncaught-SIGQUIT
+behaviour. `signal.NotifyContext` here registers only SIGINT and SIGTERM, so
+SIGQUIT keeps its default disposition and nothing swallows it. No code change is
+made for this. What split observed was real, but it was not this process
+declining to die; the likeliest reading is that the signal and the liveness check
+addressed different pids. Recorded as not-reproduced rather than fixed or
+dismissed.
