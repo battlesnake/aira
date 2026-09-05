@@ -234,7 +234,7 @@ The daemon-side half — `admit.go:1488-1496` skipping leaf-empty scopes in AIRA
 
 - **L1 (F2):** each split run nests the job's own processes one level deeper. Bounded by path length, not policy. Podman's behaviour.
 - **L2 (F2):** such a job reads `scope-integrity=migrated`, not `contained` — the leader is no longer a *direct* member. Containment is preserved (`witnessedEscape:1430-1438` → `pathEqualOrUnder`, so `<scope>/runtime` is not an escape). Precedent: aitest's `.aira-supervisor`. Cost: the facet is diluted for every podman job.
-- **L3 (F5):** podman's state DB can show a scope-killed container as `Up` until it reconciles.
+- **L3 (F5), observed at scale during the build:** podman's state DB shows a scope-killed container as `Up`, and because the scope kill pre-empts `--rm`, the records **accumulate**. Measured: the build's own test runs left **40** stale `alpine` entries in `podman ps -a` that had to be cleared by hand (`podman rm -f -a`), from a store that held zero beforehand. Outside AIRA's control — the container is killed by the kernel via `cgroup.kill`, so podman never gets to run its own cleanup — but anyone running many containers under confine should expect to prune the podman store periodically, exactly as `~/.local/state/aira/confine/` already needs pruning.
 - **L4 (F4):** the leftover `runtime` cgroup blocks in-process rmdir; AIRA-36's reaper removes the subtree (up to ~7 min later). Deliberately not duplicated in-process.
 - **L5 (§3.1):** rootful `sudo podman run`, `docker container run`, and all global-flag forms are undetected — no injection **and no warning**.
 - **L6 (§3.10):** `reportPeak`'s hierarchical OOM flag unchanged, with its estimate-inflation consequence named.
