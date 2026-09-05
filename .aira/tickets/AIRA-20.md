@@ -76,3 +76,26 @@ What landed:
   `aira_xdist_governor/__init__.py` — which is production code inside AIRA-33's
   deletion scope, so hardening it would be work thrown away. Its test-side waits were
   scaled with everything else.
+
+### Two more flaky tests, found by this branch's own verification
+
+The ticket's central claim — that every agent who runs the suite a few times finds a
+different one, so the per-test list never converges — held during the fix itself. Two
+tests not on the list above failed during verification and are fixed here:
+
+- **`TestRealPytestRAMForkDoesNotPinHelperStdin`** (a 6th sighting, and the first
+  attributable to the ordering assertion rather than to AIRA-65's SIGTERM budget):
+  release landed 431ms AFTER child-done. The forked child's fixed 1.0s sleep IS the
+  discriminator's whole margin, so it now scales; a pinning implementation still
+  fails. AIRA-65's `_stop_reservation` budget is untouched and still owns the other
+  failure shape (no marker written at all).
+- **`TestScopeMembershipEventsDeliversModifyAndReleasesFD`** (a 7th distinct test):
+  `inotify watch not established: 9 open fds, baseline 9`. Not a deadline —
+  `openFDCount` counted every entry in `/proc/self/fd`, a process-global number, so
+  any leftover goroutine closing a socket cancelled the watcher's own +1. Now counts
+  inotify descriptors only. Mutation-checked live.
+
+Whole-suite evidence at the branch tip: 6 consecutive green `go test ./... -count=1`
+runs after the last fix, plus `make ci` green, plus `-race` green on `internal/daemon`
+and `internal/runner` (not wired into CI — see the block above). Every failure observed
+during this work was reproduced, attributed and fixed rather than retried away.
