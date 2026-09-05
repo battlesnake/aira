@@ -137,7 +137,7 @@ type Server struct {
 	// runner.CreateWorkerScope; tests substitute fakes so the ledger's
 	// arithmetic is exercised without a real delegated cgroup.
 	workerScopeScan         func(string) (workerScopeChildren, error)
-	workerScopeCreate       func(context.Context, string, string, int64, int64) (string, error)
+	workerScopeCreate       func(context.Context, string, string, int64) (string, string, error)
 	workerScopeScanInterval time.Duration
 	admitNow                func() time.Time
 	admitAfter              func(time.Duration) <-chan time.Time

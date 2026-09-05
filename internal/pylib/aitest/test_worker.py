@@ -703,7 +703,7 @@ def _assert_invalid_recycle_env_warns_once(monkeypatch, capsys, name, raw, scope
     for env_name in (
         "AIRA_AITEST_WORKER_MAX_SECONDS",
         "AIRA_AITEST_WORKER_MAX_TESTS",
-        "AIRA_AITEST_WORKER_HIGH_WATERMARK_PCT",
+        "AIRA_AITEST_WORKER_MEMORY_WATERMARK_PCT",
     ):
         monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setenv(name, raw)
@@ -741,15 +741,18 @@ def test_should_recycle_uses_default_for_invalid_max_tests(monkeypatch, capsys, 
     )
 
 
-def test_should_recycle_uses_default_for_invalid_high_watermark(monkeypatch, capsys, tmp_path, clear_invalid_recycle_env_warnings):
+def test_should_recycle_uses_default_for_invalid_memory_watermark(monkeypatch, capsys, tmp_path, clear_invalid_recycle_env_warnings):
     scope_dir = tmp_path / "fake-scope"
     scope_dir.mkdir()
-    (scope_dir / "memory.current").write_text("81")
-    (scope_dir / "memory.high").write_text("100")
+    # 65 of 100 is above the 64% default and below the old 80%, so this
+    # fixture ALSO pins that the default really is 64 -- a fall-back to 80
+    # would make the assertion below (True) fail rather than pass silently.
+    (scope_dir / "memory.current").write_text("65")
+    (scope_dir / "memory.max").write_text("100")
     _assert_invalid_recycle_env_warns_once(
         monkeypatch,
         capsys,
-        "AIRA_AITEST_WORKER_HIGH_WATERMARK_PCT",
+        "AIRA_AITEST_WORKER_MEMORY_WATERMARK_PCT",
         "eighty percent",
         str(scope_dir),
         time.monotonic(),
@@ -761,7 +764,7 @@ def _clear_recycle_env(monkeypatch):
     for env_name in (
         "AIRA_AITEST_WORKER_MAX_SECONDS",
         "AIRA_AITEST_WORKER_MAX_TESTS",
-        "AIRA_AITEST_WORKER_HIGH_WATERMARK_PCT",
+        "AIRA_AITEST_WORKER_MEMORY_WATERMARK_PCT",
     ):
         monkeypatch.delenv(env_name, raising=False)
 
@@ -774,26 +777,50 @@ def test_should_recycle_uses_elapsed_time_default_in_both_directions(monkeypatch
 
 
 def test_should_recycle_uses_memory_watermark_default_in_both_directions(tmp_path, monkeypatch, clear_invalid_recycle_env_warnings):
+    """AIRA-35: the watermark is a fraction of memory.max, and the default
+    reproduces the pre-AIRA-35 trigger point EXACTLY.
+
+    The old check was memory.current / memory.high > 80% with the daemon
+    setting memory.high = memory.max * 4/5, so it fired at 64% of memory.max.
+    The values here bracket 64 tightly (65 above, 63 below) so the test fails
+    if the fraction drifts in either direction -- a loose 90/50 pair would
+    pass against anything from 51 to 89 and prove nothing about the number."""
     _clear_recycle_env(monkeypatch)
     over_watermark = tmp_path / "over-watermark"
     over_watermark.mkdir()
-    (over_watermark / "memory.current").write_text("90")
-    (over_watermark / "memory.high").write_text("100")
+    (over_watermark / "memory.current").write_text("65")
+    (over_watermark / "memory.max").write_text("100")
     below_watermark = tmp_path / "below-watermark"
     below_watermark.mkdir()
-    (below_watermark / "memory.current").write_text("50")
-    (below_watermark / "memory.high").write_text("100")
+    (below_watermark / "memory.current").write_text("63")
+    (below_watermark / "memory.max").write_text("100")
 
     assert _should_recycle(str(over_watermark), time.monotonic(), 0) is True
     assert _should_recycle(str(below_watermark), time.monotonic(), 0) is False
 
 
-def test_should_recycle_fails_open_for_unbounded_memory_high(tmp_path, monkeypatch, clear_invalid_recycle_env_warnings):
+def test_should_recycle_ignores_memory_high_entirely(tmp_path, monkeypatch, clear_invalid_recycle_env_warnings):
+    """AIRA-35: worker scopes carry no memory.high any more, so the watermark
+    must key on memory.max alone.
+
+    A scope with a stale memory.high present and a memory.max that says NOT to
+    recycle must not recycle: reading the wrong file would make this True."""
     _clear_recycle_env(monkeypatch)
-    scope_dir = tmp_path / "unbounded-memory-high"
+    scope_dir = tmp_path / "stale-memory-high"
+    scope_dir.mkdir()
+    (scope_dir / "memory.current").write_text("50")
+    (scope_dir / "memory.max").write_text("100")
+    (scope_dir / "memory.high").write_text("60")
+
+    assert _should_recycle(str(scope_dir), time.monotonic(), 0) is False
+
+
+def test_should_recycle_fails_open_for_unbounded_memory_max(tmp_path, monkeypatch, clear_invalid_recycle_env_warnings):
+    _clear_recycle_env(monkeypatch)
+    scope_dir = tmp_path / "unbounded-memory-max"
     scope_dir.mkdir()
     (scope_dir / "memory.current").write_text("90")
-    (scope_dir / "memory.high").write_text("max")
+    (scope_dir / "memory.max").write_text("max")
 
     assert _should_recycle(str(scope_dir), time.monotonic(), 0) is False
 
@@ -804,11 +831,11 @@ def test_should_recycle_fails_open_for_unreadable_memory_scope(tmp_path, monkeyp
     assert _should_recycle(str(tmp_path / "does-not-exist"), time.monotonic(), 0) is False
 
 
-def test_should_recycle_fails_open_for_nonpositive_memory_high(tmp_path, monkeypatch, clear_invalid_recycle_env_warnings):
+def test_should_recycle_fails_open_for_nonpositive_memory_max(tmp_path, monkeypatch, clear_invalid_recycle_env_warnings):
     _clear_recycle_env(monkeypatch)
-    scope_dir = tmp_path / "zero-memory-high"
+    scope_dir = tmp_path / "zero-memory-max"
     scope_dir.mkdir()
     (scope_dir / "memory.current").write_text("90")
-    (scope_dir / "memory.high").write_text("0")
+    (scope_dir / "memory.max").write_text("0")
 
     assert _should_recycle(str(scope_dir), time.monotonic(), 0) is False

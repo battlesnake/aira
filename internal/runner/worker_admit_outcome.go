@@ -265,12 +265,28 @@ type WorkerAdmitOutcome struct {
 func (o WorkerAdmitOutcome) Granted() bool { return o.State == WorkerAdmitStateGranted }
 
 // WorkerAdmitGrantFields are the placement coordinates appended to a granted
-// outcome line. They are the same four keys the supervisor has always parsed.
+// outcome line. The three keys the supervisor requires are scope, worker_id and
+// memory_max; cpu_slots and swap_cap are diagnostic tokens on top of them.
+//
+// memory_high was one of the required keys until AIRA-35, which stopped writing
+// memory.high on worker scopes entirely (see CreateWorkerScope for the measured
+// reasons). Keeping a wire field named after a cgroup control that is
+// deliberately not written would be a lie in the protocol, so it was removed
+// rather than zeroed.
 type WorkerAdmitGrantFields struct {
-	ScopePath  string
-	WorkerID   string
-	MemoryMax  int64
-	MemoryHigh int64
+	ScopePath string
+	WorkerID  string
+	MemoryMax int64
+	// SwapCap (AIRA-35) is one of the WorkerAdmitSwapCap* values, omitted from
+	// the line when empty. It answers the one question memory_max alone cannot:
+	// is this worker's memory.max actually its whole footprint bound, or can
+	// the worker escape it into swap? cgroup-v2's memory.max bounds memory, not
+	// memory+swap, and before AIRA-35 nothing capped worker swap at all -- a
+	// 512 MiB allocation inside a 32 MiB cap was measured exiting 0 with half a
+	// gigabyte paged out, never killed. Diagnostic only, exactly like CPUSlots:
+	// nothing branches on it, and an absent token means "an older daemon", not
+	// "ok".
+	SwapCap string
 	// CPUSlots (AIRA-64) is WorkerAdmitCPUSlotsOK or
 	// WorkerAdmitCPUSlotsUnevaluated, and is omitted from the line when empty.
 	// It answers one question the four fields above cannot: was this grant
@@ -286,6 +302,35 @@ const (
 	WorkerAdmitCPUSlotsOK          = "ok"
 	WorkerAdmitCPUSlotsUnevaluated = "unevaluated"
 )
+
+// The swap-containment states carried by WorkerAdmitGrantFields.SwapCap
+// (AIRA-35). Each is a POSITIVE claim about what was established; see
+// writeWorkerScopeSwapCap for how each one is proved.
+const (
+	// WorkerAdmitSwapCapEnforced: memory.swap.max=0 was written and verified,
+	// so memory.max is this worker's whole footprint bound.
+	WorkerAdmitSwapCapEnforced = "enforced"
+	// WorkerAdmitSwapCapNotApplicable: this kernel has no swap support at all
+	// (proved: no memory.swap.max AND no /proc/swaps, inside a mounted /proc),
+	// so memory.max already bounds everything. Not a warning.
+	WorkerAdmitSwapCapNotApplicable = "not-applicable"
+	// WorkerAdmitSwapCapUnavailable: swap could not be bounded, so a worker may
+	// exceed its memory.max without being killed. The grant still proceeds --
+	// refusing would stall every aitest run on such a host -- but the
+	// supervisor says so once on the suite's own output rather than letting a
+	// lost guarantee pass silently.
+	WorkerAdmitSwapCapUnavailable = "unavailable"
+)
+
+// IsWorkerAdmitSwapCap reports whether value is a catalogued swap-cap state.
+func IsWorkerAdmitSwapCap(value string) bool {
+	switch value {
+	case WorkerAdmitSwapCapEnforced, WorkerAdmitSwapCapNotApplicable, WorkerAdmitSwapCapUnavailable:
+		return true
+	default:
+		return false
+	}
+}
 
 // WorkerAdmitOutcomeLine renders the single machine-readable line. grant must
 // be non-nil exactly when the outcome is granted; the function does not
@@ -322,8 +367,10 @@ func WorkerAdmitOutcomeLine(outcome WorkerAdmitOutcome, grant *WorkerAdmitGrantF
 		builder.WriteString(url.QueryEscape(grant.WorkerID))
 		builder.WriteString(" memory_max=")
 		builder.WriteString(strconv.FormatInt(grant.MemoryMax, 10))
-		builder.WriteString(" memory_high=")
-		builder.WriteString(strconv.FormatInt(grant.MemoryHigh, 10))
+		if grant.SwapCap != "" {
+			builder.WriteString(" swap_cap=")
+			builder.WriteString(url.QueryEscape(grant.SwapCap))
+		}
 		if grant.CPUSlots != "" {
 			builder.WriteString(" cpu_slots=")
 			builder.WriteString(url.QueryEscape(grant.CPUSlots))

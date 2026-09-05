@@ -55,7 +55,7 @@ func TestWorkerAdmitOutcomeLineRoundTrips(t *testing.T) {
 			},
 			grant: &WorkerAdmitGrantFields{
 				ScopePath: "/sys/fs/cgroup/a b/.aira-worker-1", WorkerID: "1",
-				MemoryMax: 400 << 20, MemoryHigh: 320 << 20,
+				MemoryMax: 400 << 20,
 			},
 		},
 	}
@@ -87,7 +87,12 @@ func TestWorkerAdmitOutcomeLineRoundTrips(t *testing.T) {
 				}
 			}
 			if test.grant != nil {
-				wantTokens += 4 // scope, worker_id, memory_max, memory_high
+				// scope, worker_id, memory_max — the three keys the supervisor
+				// REQUIRES. AIRA-35 removed memory_high from that set; swap_cap
+				// and cpu_slots are optional and empty in this fixture, so a
+				// renderer that started emitting either unconditionally would
+				// break this count rather than slipping through.
+				wantTokens += 3
 			}
 			if got := len(strings.Fields(line)); got != wantTokens {
 				t.Fatalf("line split into %d tokens, want %d — free text broke tokenisation: %q",
@@ -127,7 +132,7 @@ func TestWorkerAdmitOutcomeLineRoundTrips(t *testing.T) {
 // distinction and turn silence into a claim.
 func TestWorkerAdmitOutcomeLineCarriesCPUSlots(t *testing.T) {
 	granted := WorkerAdmitOutcome{State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted}
-	base := WorkerAdmitGrantFields{ScopePath: "/outer/.aira-worker-1", WorkerID: "1", MemoryMax: 400, MemoryHigh: 320}
+	base := WorkerAdmitGrantFields{ScopePath: "/outer/.aira-worker-1", WorkerID: "1", MemoryMax: 400}
 
 	for _, state := range []string{WorkerAdmitCPUSlotsOK, WorkerAdmitCPUSlotsUnevaluated} {
 		grant := base
@@ -143,11 +148,11 @@ func TestWorkerAdmitOutcomeLineCarriesCPUSlots(t *testing.T) {
 		if fields["cpu_slots"] != state {
 			t.Fatalf("cpu_slots=%q, want %q (line=%q)", fields["cpu_slots"], state, line)
 		}
-		// The four fields the supervisor REQUIRES must be untouched by the
+		// The three fields the supervisor REQUIRES must be untouched by the
 		// addition, or an additive field became a breaking one.
 		for key, want := range map[string]string{
 			"scope": "/outer/.aira-worker-1", "worker_id": "1",
-			"memory_max": "400", "memory_high": "320",
+			"memory_max": "400",
 		} {
 			if fields[key] != want {
 				t.Fatalf("%s=%q want %q", key, fields[key], want)
@@ -165,6 +170,66 @@ func TestWorkerAdmitOutcomeLineCarriesCPUSlots(t *testing.T) {
 	}
 	if _, present := fields["cpu_slots"]; present {
 		t.Fatalf("an unset CPUSlots must emit NO token, so silence cannot be read as a claim: %q", line)
+	}
+}
+
+// verifies: AIRA-35 — swap_cap survives the render/parse round trip for EVERY
+// catalogued value, and an unset SwapCap emits no token at all.
+//
+// The exact value is pinned per state rather than "one of the three", for the
+// same reason worker_admit_cli_granted_linux_test.go pins cpu_slots exactly:
+// mutation testing there proved that accepting any catalogued value lets a hop
+// that hardcodes a constant survive the whole suite. swap_cap is a governance
+// signal with the same failure mode -- "enforced" fabricated on a host where
+// swap could not actually be bounded is precisely the silent lost guarantee
+// this field exists to prevent -- so it gets the same treatment.
+func TestWorkerAdmitOutcomeLineCarriesSwapCap(t *testing.T) {
+	granted := WorkerAdmitOutcome{State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted}
+	base := WorkerAdmitGrantFields{ScopePath: "/outer/.aira-worker-1", WorkerID: "1", MemoryMax: 400}
+
+	for _, state := range []string{
+		WorkerAdmitSwapCapEnforced, WorkerAdmitSwapCapNotApplicable, WorkerAdmitSwapCapUnavailable,
+	} {
+		if !IsWorkerAdmitSwapCap(state) {
+			t.Fatalf("%q is not catalogued by IsWorkerAdmitSwapCap", state)
+		}
+		grant := base
+		grant.SwapCap = state
+		line, err := WorkerAdmitOutcomeLine(granted, &grant)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fields, err := ParseWorkerAdmitOutcomeLine(line)
+		if err != nil {
+			t.Fatalf("parse %q: %v", line, err)
+		}
+		if fields["swap_cap"] != state {
+			t.Fatalf("swap_cap=%q, want %q (line=%q)", fields["swap_cap"], state, line)
+		}
+		// The three required fields must be untouched by the addition.
+		for key, want := range map[string]string{
+			"scope": "/outer/.aira-worker-1", "worker_id": "1", "memory_max": "400",
+		} {
+			if fields[key] != want {
+				t.Fatalf("%s=%q want %q", key, fields[key], want)
+			}
+		}
+	}
+
+	if IsWorkerAdmitSwapCap("") || IsWorkerAdmitSwapCap("ok") {
+		t.Fatal("IsWorkerAdmitSwapCap must reject uncatalogued values")
+	}
+
+	line, err := WorkerAdmitOutcomeLine(granted, &base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields, err := ParseWorkerAdmitOutcomeLine(line)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present := fields["swap_cap"]; present {
+		t.Fatalf("an unset SwapCap must emit NO token, so silence cannot be read as a claim: %q", line)
 	}
 }
 
@@ -213,7 +278,7 @@ func TestParseWorkerAdmitOutcomeLineRefusesUncataloguedInput(t *testing.T) {
 	tests := []struct{ name, line string }{
 		{"empty", ""},
 		{"no marker", "state=denied class=contended"},
-		{"wrong marker", "granted scope=/x worker_id=1 memory_max=1 memory_high=1"},
+		{"wrong marker", "granted scope=/x worker_id=1 memory_max=1"},
 		{"not key=value", WorkerAdmitOutcomeMarker + " state=denied contended"},
 		{"missing state", WorkerAdmitOutcomeMarker + " class=contended"},
 		{"missing class", WorkerAdmitOutcomeMarker + " state=denied"},

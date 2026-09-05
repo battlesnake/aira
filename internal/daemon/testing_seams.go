@@ -36,14 +36,19 @@ func (s *Server) SetWorkerScopeTreeForTest() {
 		}
 		return children, nil
 	}
-	s.workerScopeCreate = func(_ context.Context, outerScope, workerID string, memoryMax, _ int64) (string, error) {
+	s.workerScopeCreate = func(_ context.Context, outerScope, workerID string, memoryMax int64) (string, string, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		if caps[outerScope] == nil {
 			caps[outerScope] = map[string]int64{}
 		}
 		caps[outerScope][workerScopeChildPrefix+workerID] = memoryMax
-		return runner.WorkerScopeChildPath(outerScope, "worker-"+workerID), nil
+		// The fake reports `enforced`: this seam stands in for a
+		// CreateWorkerScope that succeeded, and a real success writes and
+		// VERIFIES memory.swap.max=0. Reporting anything else here would make
+		// every test that uses this seam assert against a disposition the
+		// production path never produces on success.
+		return runner.WorkerScopeChildPath(outerScope, "worker-"+workerID), runner.WorkerAdmitSwapCapEnforced, nil
 	}
 }
 

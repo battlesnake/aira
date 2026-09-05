@@ -109,12 +109,12 @@ func (tree *workerScopeTree) scan(outerScope string) (workerScopeChildren, error
 	return children, nil
 }
 
-func (tree *workerScopeTree) create(_ context.Context, outerScope, workerID string, memoryMax, memoryHigh int64) (string, error) {
+func (tree *workerScopeTree) create(_ context.Context, outerScope, workerID string, memoryMax int64) (string, string, error) {
 	tree.mu.Lock()
 	defer tree.mu.Unlock()
 	if tree.createFn != nil {
 		if err := tree.createFn(outerScope, workerID); err != nil {
-			return "", err
+			return "", "", err
 		}
 	}
 	name := workerScopeChildPrefix + workerID
@@ -123,13 +123,14 @@ func (tree *workerScopeTree) create(_ context.Context, outerScope, workerID stri
 	}
 	if _, exists := tree.caps[outerScope][name]; exists {
 		// Exactly what os.Mkdir does through runner.CreateWorkerScope.
-		return "", fmt.Errorf("aitest worker scope: create: mkdir %s: %w", name, fs.ErrExist)
-	}
-	if memoryHigh > 0 && memoryHigh >= memoryMax {
-		return "", fmt.Errorf("aitest worker scope: memory_high (%d) must be below memory_max (%d)", memoryHigh, memoryMax)
+		return "", "", fmt.Errorf("aitest worker scope: create: mkdir %s: %w", name, fs.ErrExist)
 	}
 	tree.caps[outerScope][name] = memoryMax
-	return runner.WorkerScopeChildPath(outerScope, "worker-"+workerID), nil
+	// A successful real CreateWorkerScope writes AND verifies
+	// memory.swap.max=0, so the fake reports the disposition that success
+	// actually produces (AIRA-35). The pre-AIRA-35 memoryHigh < memoryMax
+	// check that used to live here went with the field.
+	return runner.WorkerScopeChildPath(outerScope, "worker-"+workerID), runner.WorkerAdmitSwapCapEnforced, nil
 }
 
 // evaluateWorkerAdmitForTest calls the evaluator with a live context and fails
@@ -294,7 +295,12 @@ func TestEvaluateWorkerAdmitGrantsWithinHeadroom(t *testing.T) {
 	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
 	server.workerAdmitHeadroom = 0
 	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400, maxWaitMS: 0})
-	if response.State != "granted" || response.WorkerID == "" || response.MemoryMax != 400 || response.MemoryHigh != 320 {
+	// verifies: AIRA-35 — a grant carries memory_max and the swap disposition,
+	// and no memory_high at all. The zero-value check on MemoryHigh is gone
+	// with the field; SwapCap is asserted to its EXACT value rather than
+	// merely non-empty, so a hop that hardcodes a constant cannot survive.
+	if response.State != "granted" || response.WorkerID == "" || response.MemoryMax != 400 ||
+		response.SwapCap != runner.WorkerAdmitSwapCapEnforced {
 		t.Fatalf("response=%+v", response)
 	}
 	// Pin the invariant a real deployment depends on: the daemon computes
@@ -1312,11 +1318,11 @@ func TestWorkerAdmitEEXISTInvalidatesCacheAndDeniesRetriably(t *testing.T) {
 		children, err := tree.scan(outerScope)
 		return children, err
 	}
-	server.workerScopeCreate = func(ctx context.Context, outerScope, workerID string, memoryMax, memoryHigh int64) (string, error) {
+	server.workerScopeCreate = func(ctx context.Context, outerScope, workerID string, memoryMax int64) (string, string, error) {
 		if _, exists := hidden[workerScopeChildPrefix+workerID]; exists {
-			return "", fmt.Errorf("aitest worker scope: create: mkdir: %w", fs.ErrExist)
+			return "", "", fmt.Errorf("aitest worker scope: create: mkdir: %w", fs.ErrExist)
 		}
-		return tree.create(ctx, outerScope, workerID, memoryMax, memoryHigh)
+		return tree.create(ctx, outerScope, workerID, memoryMax)
 	}
 
 	first := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400})
@@ -1370,11 +1376,11 @@ func TestWorkerAdmitEEXISTRetryAdvancesTheWorkerIDInsteadOfRepeating(t *testing.
 	// A child invisible to the scan but present to create: exactly the
 	// stale-low cache this branch exists for.
 	hidden := map[string]int64{workerScopeChildPrefix + "1": 100}
-	server.workerScopeCreate = func(ctx context.Context, outer, workerID string, memoryMax, memoryHigh int64) (string, error) {
+	server.workerScopeCreate = func(ctx context.Context, outer, workerID string, memoryMax int64) (string, string, error) {
 		if _, exists := hidden[workerScopeChildPrefix+workerID]; exists {
-			return "", fmt.Errorf("aitest worker scope: create: mkdir: %w", fs.ErrExist)
+			return "", "", fmt.Errorf("aitest worker scope: create: mkdir: %w", fs.ErrExist)
 		}
-		return tree.create(ctx, outer, workerID, memoryMax, memoryHigh)
+		return tree.create(ctx, outer, workerID, memoryMax)
 	}
 
 	first := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400})
@@ -1443,12 +1449,12 @@ func TestWorkerAdmitCreatesWorkerScopeBeforeGranting(t *testing.T) {
 	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
 	var created []string
 	inner := server.workerScopeCreate
-	server.workerScopeCreate = func(ctx context.Context, outerScope, workerID string, memoryMax, memoryHigh int64) (string, error) {
-		path, err := inner(ctx, outerScope, workerID, memoryMax, memoryHigh)
+	server.workerScopeCreate = func(ctx context.Context, outerScope, workerID string, memoryMax int64) (string, string, error) {
+		path, swapCap, err := inner(ctx, outerScope, workerID, memoryMax)
 		if err == nil {
 			created = append(created, path)
 		}
-		return path, err
+		return path, swapCap, err
 	}
 	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400})
 	if response.State != "granted" {

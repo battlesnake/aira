@@ -1441,7 +1441,8 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 	// critical section that decided to grant, so there is no local
 	// CreateWorkerScope call here any more and no grant->creation window for a
 	// dying client to leave open. The scope named below already exists, with
-	// its memory.max, memory.high and memory.oom.group verified daemon-side.
+	// its memory.max, memory.swap.max and memory.oom.group verified daemon-side
+	// (AIRA-35 retired the memory.high this used to name).
 	//
 	// AIRA-42 merge note: this fix was built against the pre-AIRA-39 shape,
 	// where a LOCAL CreateWorkerScope failure here produced the
@@ -1463,7 +1464,7 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 	lease := outcome.Lease
 	grantFields := &runner.WorkerAdmitGrantFields{
 		ScopePath: lease.ScopePath, WorkerID: lease.WorkerID,
-		MemoryMax: lease.MemoryMax, MemoryHigh: lease.MemoryHigh,
+		MemoryMax: lease.MemoryMax, SwapCap: lease.SwapCap,
 		CPUSlots: lease.CPUSlots,
 	}
 	if exit := writeWorkerAdmitOutcome(stdout, stderr, outcome, grantFields, ""); exit != 0 {

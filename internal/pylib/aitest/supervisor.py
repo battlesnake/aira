@@ -356,7 +356,10 @@ _OUTCOME_CLASS_EXCEPTIONS = {
     "contract-violation": WorkerAdmitContractViolation,
 }
 
-_OUTCOME_GRANT_FIELDS = ("scope", "worker_id", "memory_max", "memory_high")
+# AIRA-35 removed memory_high from this contract along with the memory.high
+# write it named: a required wire field named after a cgroup control the daemon
+# deliberately no longer writes would be a lie in the protocol.
+_OUTCOME_GRANT_FIELDS = ("scope", "worker_id", "memory_max")
 
 
 def _describe_outcome(fields, diagnostic=""):
@@ -553,6 +556,7 @@ class Supervisor:
         # AIRA-64 growth probe bookkeeping.
         self._last_growth_probe = 0.0
         self._cpu_slots_warned = False
+        self._swap_cap_warned = False
 
     def bootstrap(self):
         """Relocate this process into its own child scope so the outer scope
@@ -773,7 +777,7 @@ class Supervisor:
                 "s" if len(missing) != 1 else "", ", ".join(missing)
             )
         else:
-            for key in ("memory_max", "memory_high"):
+            for key in ("memory_max",):
                 try:
                     value = int(grant[key])
                 except ValueError as exc:
@@ -841,6 +845,7 @@ class Supervisor:
                 % (malformed, stderr.strip() or "none")
             )
         self._note_cpu_slots_state(outcome.get("cpu_slots", ""))
+        self._note_swap_cap_state(outcome.get("swap_cap", ""))
         return grant, process
 
     def _note_cpu_slots_state(self, state):
@@ -868,6 +873,39 @@ class Supervisor:
             "this run (cpu_slots=unevaluated); workers are RAM-governed but NOT bounded "
             "against other jobs on this machine, so heavy concurrent runs can still "
             "oversubscribe the CPU\n"
+        )
+
+    def _note_swap_cap_state(self, state):
+        """AIRA-35. Say ONCE, on this run's own output, when the daemon could
+        not bound this run's worker swap.
+
+        cgroup-v2's memory.max bounds MEMORY, not memory+swap. Where swap is
+        available and memory.swap.max cannot be set, a worker that exceeds its
+        cap is reclaimed into swap and runs to completion instead of being
+        killed -- measured: a 512 MiB allocation inside a 32 MiB cap exiting 0
+        with half a gigabyte paged out. The per-worker containment this run
+        believes it has simply does not happen, and the daemon's aggregate
+        sum-over-memory.max guard stops bounding the real footprint too.
+
+        Same shape and same reason as _note_cpu_slots_state: the grant still
+        proceeds (refusing would stall every aitest run on such a host), so the
+        cost of failing open is that a lost guarantee is invisible -- unless the
+        run it affects is told.
+
+        Silent for "enforced" (the cap is set and verified), silent for
+        "not-applicable" (this kernel has no swap support at all, proved, so
+        memory.max already bounds everything), and silent for an ABSENT token,
+        which means a daemon predating this field rather than "ok". Inventing a
+        warning for a daemon that never claimed anything would be a fabricated
+        diagnosis."""
+        if state != "unavailable" or self._swap_cap_warned:
+            return
+        self._swap_cap_warned = True
+        sys.stderr.write(
+            "aira aitest: the daemon could not bound this run's worker swap "
+            "(swap_cap=unavailable); a worker that exceeds its memory.max will be "
+            "reclaimed into swap rather than killed, so per-worker RAM containment "
+            "is NOT in force for this run\n"
         )
 
     def _open_pidfd(self, pid):
@@ -1794,15 +1832,74 @@ class Supervisor:
         same instant there, and is all there is on a host too old for
         pidfds."""
         nodeid = state["in_flight"]
+        # BEFORE _retire_worker, which removes the scope directory
+        # (_forget_worker_scope's os.rmdir): once it is gone the evidence for
+        # WHY this worker died is gone with it.
+        death = self._describe_worker_death(pid, state)
         self._retire_worker(pid, state)
         if nodeid is not None and not self.requeue_once(nodeid):
             self.results[nodeid] = "unevaluated"
-            self._unevaluated_reasons.setdefault(
-                nodeid,
-                "worker %d stopped reporting while running it, and the one "
-                "retry did too" % pid,
-            )
+            self._unevaluated_reasons.setdefault(nodeid, death)
         self._replace_worker()
+
+    def _describe_worker_death(self, pid, state):
+        """Why this worker stopped reporting, in the terms an operator can act
+        on -- read from the worker scope's own memory.events BEFORE the scope
+        is removed.
+
+        AIRA-35 makes this necessary rather than decorative. Until it landed,
+        nothing capped a worker's swap, so a worker over its memory.max was
+        reclaimed into swap and its test PASSED; with memory.swap.max=0 that
+        same worker is now group-killed, requeued once, and reported
+        unevaluated. Turning a silent pass into an unevaluated is correct --
+        it is the containment this product claims -- but only if the report
+        says which limit was hit and which knob raises it. The per-worker cap
+        is a flat AIRA_AITEST_ESTIMATED_BYTES (512 MiB by default; per-suite
+        history-based sizing is still deferred), so the remedy is a single
+        environment variable.
+
+        Attribution is sound because memory.events counters are per-scope and
+        propagate only upward: oom_group_kill > 0 on THIS scope means THIS
+        scope's own memory.oom.group fired, not an ancestor's.
+
+        Every uncertainty falls back to the generic sentence rather than
+        guessing: a worker with no grant (a containment-stripped fallback
+        worker has none), an already-removed or unreadable scope, and a kernel
+        whose memory.events omits oom_group_kill all reach it. A fabricated OOM
+        claim would be worse than a vague true one."""
+        generic = (
+            "worker %d stopped reporting while running it, and the one "
+            "retry did too" % pid
+        )
+        grant = state.get("grant")
+        if not grant:
+            return generic
+        scope = grant.get("scope")
+        if not scope:
+            return generic
+        try:
+            with open(os.path.join(scope, "memory.events"), encoding="ascii") as handle:
+                events = handle.read()
+        except OSError:
+            return generic
+        killed = False
+        for line in events.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "oom_group_kill":
+                try:
+                    killed = int(parts[1]) > 0
+                except ValueError:
+                    return generic
+                break
+        else:
+            return generic
+        if not killed:
+            return generic
+        return (
+            "worker %d was killed by its own per-worker memory cap "
+            "(memory.max=%s bytes; raise AIRA_AITEST_ESTIMATED_BYTES), and the "
+            "one retry was too" % (pid, grant.get("memory_max", "unknown"))
+        )
 
     def _service_ready_workers(self, ready, result_fd_owners, pidfd_owners):
         """Service one select() wakeup: drain every ready result pipe, THEN

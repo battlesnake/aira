@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-35","project":"aira","title":"aitest worker memory.high/memory.max split converges too slowly under kernel throttle (WSL2)","status":"planned","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["admission","aitest","cgroup","oom"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-35","project":"aira","title":"aitest worker memory.high/memory.max split converges too slowly under kernel throttle (WSL2)","status":"in-progress","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["admission","aitest","cgroup","oom"],"hold":false,"relations":[]}
 ---
 Found during AIRA-30 (aitest Slice 1) Task 17's real end-to-end verification,
 not by design/review inspection: a worker deliberately blowing its memory

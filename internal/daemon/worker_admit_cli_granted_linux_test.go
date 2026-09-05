@@ -238,9 +238,32 @@ func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 	if got := fields["memory_max"]; got != strconv.FormatInt(request, 10) {
 		t.Fatalf("granted memory_max=%q, want %d", got, request)
 	}
-	grantedHigh, err := strconv.ParseInt(fields["memory_high"], 10, 64)
-	if err != nil || grantedHigh <= 0 || grantedHigh >= request {
-		t.Fatalf("granted memory_high=%q (parse err %v), want a positive value below memory_max", fields["memory_high"], err)
+	// AIRA-35 §9: swap_cap replaced memory_high here, and this is the ONE test
+	// that crosses every hop at once — daemon decision, runner client's JSON
+	// unmarshal, the WorkerAdmitLease it builds, the CLI's
+	// WorkerAdmitGrantFields, the rendered line, and finally the cgroupfs the
+	// line describes. A half-applied protocol edit dies here.
+	//
+	// The expected value is DERIVED from what this host can actually do, never
+	// hardcoded: on a CONFIG_SWAP=n or swapaccount=0 kernel the control is
+	// absent and a hardcoded "enforced" would fail for a reason that has
+	// nothing to do with the code under test. The probe reads the OUTER scope (a
+	// control cgroup this test never writes a swap cap to), not the worker
+	// scope under test, so it is not circular.
+	_, swapControlErr := os.Stat(filepath.Join(outer, "memory.swap.max"))
+	wantSwapCap := runner.WorkerAdmitSwapCapEnforced
+	if swapControlErr != nil {
+		wantSwapCap = ""
+		t.Logf("this host exposes no memory.swap.max (%v); the exact swap_cap value is "+
+			"unevaluated here and only its cataloguing is asserted", swapControlErr)
+	}
+	if got := fields["swap_cap"]; wantSwapCap != "" && got != wantSwapCap {
+		t.Fatalf("granted swap_cap=%q, want %q — either the swap disposition was dropped "+
+			"between the daemon and the rendered line (which makes a lost containment "+
+			"guarantee invisible to the run it affects), or a hop is fabricating a value "+
+			"instead of carrying the daemon's", got, wantSwapCap)
+	} else if !runner.IsWorkerAdmitSwapCap(got) {
+		t.Fatalf("granted swap_cap=%q is not a catalogued value", got)
 	}
 	// AIRA-64 §9.21: `cpu_slots` must survive EVERY hop — the daemon's response,
 	// runner.RequestWorkerAdmit's JSON unmarshal, the WorkerAdmitLease it builds,
@@ -268,18 +291,26 @@ func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 	// mirrored here in its exact bitmask form rather than imported (it is
 	// unexported in internal/runner).
 	//
-	// Only the memory.high row actually exercises the floor: `request` is a whole
-	// number of MiB and so already page-aligned, whereas the daemon reports the
-	// UNFLOORED estimatedBytes*4/5 (26843545 for a 32MiB request) while the
-	// kernel holds 26841088. The memory.max row is a plain equality check and is
-	// stated that way so a later reader does not assume otherwise.
+	// `request` is a whole number of MiB and so already page-aligned, so
+	// floorPage is a no-op on it; it is kept because writeScopeMemoryCap
+	// verifies against the page-floored value and a future non-aligned request
+	// must not silently start failing here for the wrong reason. AIRA-35
+	// removed the memory.high row (the only one that used to exercise the
+	// floor, since the daemon reported an UNFLOORED estimatedBytes*4/5) along
+	// with the write it checked.
 	page := int64(os.Getpagesize())
 	floorPage := func(value int64) string { return strconv.FormatInt(value&^(page-1), 10) }
-	for _, check := range []struct{ file, want string }{
+	checks := []struct{ file, want string }{
 		{file: "memory.max", want: floorPage(request)},
-		{file: "memory.high", want: floorPage(grantedHigh)},
 		{file: "memory.oom.group", want: "1"},
-	} {
+	}
+	if swapControlErr == nil {
+		// The cheapest non-porous proof that the PRODUCTION path really writes
+		// the swap cap: without it, memory.max bounds memory but not
+		// memory+swap and a worker escapes its cap entirely.
+		checks = append(checks, struct{ file, want string }{file: "memory.swap.max", want: "0"})
+	}
+	for _, check := range checks {
 		data, err := os.ReadFile(filepath.Join(scopePath, check.file))
 		if err != nil || strings.TrimSpace(string(data)) != check.want {
 			t.Fatalf("%s/%s=%q err=%v, want %q — the granted line names limits the kernel does not hold",

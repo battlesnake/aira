@@ -307,12 +307,17 @@ func TestRequestWorkerAdmitClassifiesEndToEnd(t *testing.T) {
 		name  string
 		grant workerAdmitGrant
 	}{
-		{"memory_high at memory_max", workerAdmitGrant{WorkerID: "1", ScopePath: "/s", MemoryMax: 400, MemoryHigh: 400}},
-		{"memory_high above memory_max", workerAdmitGrant{WorkerID: "1", ScopePath: "/s", MemoryMax: 400, MemoryHigh: 500}},
-		{"memory_high absent", workerAdmitGrant{WorkerID: "1", ScopePath: "/s", MemoryMax: 400}},
-		{"memory_max absent", workerAdmitGrant{WorkerID: "1", ScopePath: "/s", MemoryHigh: 320}},
-		{"no worker id", workerAdmitGrant{ScopePath: "/s", MemoryMax: 400, MemoryHigh: 320}},
-		{"no scope path", workerAdmitGrant{WorkerID: "1", MemoryMax: 400, MemoryHigh: 320}},
+		// AIRA-35 retired the three memory_high rows this table used to
+		// carry (high at max, high above max, high absent) together with the
+		// field itself. What remains is every invariant a grant still has, and
+		// a grant that carries a STALE memory_high must now be ACCEPTED rather
+		// than rejected -- an unknown JSON key is how an older daemon looks,
+		// and refusing it would strip containment over a field this protocol
+		// no longer defines. That case is asserted positively below.
+		{"memory_max absent", workerAdmitGrant{WorkerID: "1", ScopePath: "/s"}},
+		{"memory_max negative", workerAdmitGrant{WorkerID: "1", ScopePath: "/s", MemoryMax: -1}},
+		{"no worker id", workerAdmitGrant{ScopePath: "/s", MemoryMax: 400}},
+		{"no scope path", workerAdmitGrant{WorkerID: "1", MemoryMax: 400}},
 	} {
 		t.Run("an unusable grant is a contract violation: "+bad.name, func(t *testing.T) {
 			bad.grant.State = WorkerAdmitStateGranted
@@ -337,7 +342,8 @@ func TestRequestWorkerAdmitClassifiesEndToEnd(t *testing.T) {
 	t.Run("a granted response yields a lease", func(t *testing.T) {
 		data, _ := json.Marshal(workerAdmitGrant{
 			State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted,
-			WorkerID: "3", ScopePath: "/outer/.aira-worker-3", MemoryMax: 400, MemoryHigh: 320,
+			WorkerID: "3", ScopePath: "/outer/.aira-worker-3", MemoryMax: 400,
+			SwapCap: WorkerAdmitSwapCapEnforced,
 		})
 		socket := serveOneWorkerAdmit(t, func() runnerAdmitResponseFrame {
 			return runnerAdmitResponseFrame{OK: true, Code: "OK", Data: data}
@@ -346,7 +352,32 @@ func TestRequestWorkerAdmitClassifiesEndToEnd(t *testing.T) {
 		if !outcome.Granted() || outcome.Lease == nil {
 			t.Fatalf("outcome=%+v", outcome)
 		}
-		if outcome.Lease.WorkerID != "3" || outcome.Lease.MemoryMax != 400 || outcome.Lease.MemoryHigh != 320 {
+		if outcome.Lease.WorkerID != "3" || outcome.Lease.MemoryMax != 400 ||
+			outcome.Lease.SwapCap != WorkerAdmitSwapCapEnforced {
+			t.Fatalf("lease=%+v", outcome.Lease)
+		}
+		_ = outcome.Lease.Close()
+	})
+
+	// verifies: AIRA-35 — a grant from a daemon still emitting the retired
+	// memory_high key must be USABLE, not rejected. This is the direction that
+	// matters: workerAdmitGrantProblem's rejections all end in
+	// contract-violation, which is terminal for the run, so a stale key left in
+	// the validator would have converted every grant from an older daemon into
+	// a dead suite. json.Unmarshal ignores unknown keys, and this pins that it
+	// stays that way rather than resting on it by accident.
+	t.Run("a grant carrying the retired memory_high key is still usable", func(t *testing.T) {
+		raw := []byte(`{"state":"granted","class":"granted","worker_id":"4",` +
+			`"scope_path":"/outer/.aira-worker-4","memory_max":400,"memory_high":320,` +
+			`"swap_cap":"enforced"}`)
+		socket := serveOneWorkerAdmit(t, func() runnerAdmitResponseFrame {
+			return runnerAdmitResponseFrame{OK: true, Code: "OK", Data: raw}
+		})
+		outcome := RequestWorkerAdmit(context.Background(), workerAdmitTestRequest(socket))
+		if !outcome.Granted() || outcome.Lease == nil {
+			t.Fatalf("a grant with a stale memory_high must still be granted, got %+v", outcome)
+		}
+		if outcome.Lease.MemoryMax != 400 || outcome.Lease.SwapCap != WorkerAdmitSwapCapEnforced {
 			t.Fatalf("lease=%+v", outcome.Lease)
 		}
 		_ = outcome.Lease.Close()

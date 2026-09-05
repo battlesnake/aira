@@ -266,23 +266,25 @@ func newRealDaemonAndCgroupTestHarness(t *testing.T) realDaemonAndCgroupTestHarn
 	if err := os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"), []byte("+memory"), 0o644); err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "memory controller not delegated to %s: %v", parent, err)
 	}
-	// Disable swap on the ancestor so a worker that exceeds its memory.max is
-	// actually OOM-killed rather than silently swapped out -- with swap
-	// available (verified present on this dev host), memory.max alone only
-	// forces reclaim, and test_oom.py's allocation would just page out to
-	// swap and report "passed" instead of ever being killed, contradicting
-	// design spec section 7's stated invariant ("a worker that genuinely
-	// exceeds its memory.max is actually OOM-killed"). Mirrors the existing,
-	// already-committed precedent for this exact host condition:
-	// internal/runner/usage_real_test.go's "Disable swap so a constrained
-	// child that exceeds memory.max is OOM-killed rather than silently
-	// swapping (WSL2 has swap)" and internal/runner/confine_linux_test.go's
-	// identical write. Best-effort (ignored error, like both of those) and
-	// harmless if this host has no swap at all. cgroup v2 charges swap usage
-	// hierarchically, so capping it here on the ancestor also constrains
-	// every scope nested under it (outer, and each worker sub-scope below
-	// outer) without touching production cgroup-creation code.
-	_ = os.WriteFile(filepath.Join(parent, "memory.swap.max"), []byte("0"), 0o644)
+	// NO ancestor memory.swap.max here, and its ABSENCE is load-bearing
+	// (AIRA-35).
+	//
+	// This harness used to write memory.swap.max=0 on the parent, because
+	// without a swap cap a worker exceeding its memory.max is reclaimed into
+	// swap rather than killed and test_oom.py would report "passed". That
+	// worked -- and it meant this test proved the HARNESS, not the product: it
+	// passed identically whether or not production capped worker swap, and
+	// production capped none (nothing outside _test.go wrote memory.swap.max
+	// at all). The invariant design spec section 7 states, "a worker that
+	// genuinely exceeds its memory.max is actually OOM-killed", was therefore
+	// false in production and true only under this line.
+	//
+	// AIRA-35 moved the cap into runner.CreateWorkerScope, where it belongs.
+	// Removing it here is what makes the un-gated OOM assertion below a real
+	// regression test: revert the production write and this test fails.
+	// Verified that nothing else pre-empts the mechanism on this path --
+	// cgrouptest.IsolatedScopeParent sets no swap limit, and aira.slice
+	// carries MemorySwapMax=8G, not 0.
 
 	outer := filepath.Join(parent, ".aira-outer-e2e")
 	if err := os.Mkdir(outer, 0o755); err != nil {
@@ -354,6 +356,28 @@ func TestRealPytestAitestEndToEndRealDaemonAndCgroupPassFailOnly(t *testing.T) {
 	defer cancelRun()
 	command := exec.CommandContext(runCtx, harness.pytest, "-q", "--aitest-workers=2", "test_pass.py", "test_fail.py")
 	command.Dir = filepath.Join(harness.aitestDir, "testdata")
+	// WaitDelay is load-bearing on a real-cgroup run, not defensive padding.
+	// CommandContext kills the pytest process at the deadline, but
+	// CombinedOutput then waits for the output PIPES to close, and a
+	// grandchild holding a duplicate write end keeps them open regardless --
+	// the same inherited-write-end property AIRA-40 documents for the worker
+	// result pipe. Found by deliberately mutating CreateWorkerScope to restore
+	// memory.high and running this test: the context fired at its deadline and
+	// the run still hung until Go's own 10-MINUTE package timeout, because the
+	// worker was stuck in mem_cgroup_handle_over_high in an unkillable D-state
+	// (observed live: state DN, wchan __mem_cgroup_handle_over_high, 7107
+	// memory.high events and ZERO memory.max events after 640 s). That is the
+	// AIRA-35 hazard itself, and it is exactly what an UN-GATED test must not
+	// be able to inflict on a shared machine when someone regresses the fix.
+	//
+	// Re-measured with this line in place, same mutant: the run fails in 76 s
+	// (the 60 s context plus this delay) instead of 600 s. Not an absolute
+	// guarantee -- a task wedged in an uninterruptible kernel path cannot be
+	// bounded from userspace at all, which is the whole point of removing the
+	// path rather than policing it -- but it turns the common case from Go's
+	// 10-minute package timeout into a prompt, attributable failure.
+	command.WaitDelay = 15 * time.Second
+
 	command.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(harness.outerFile.Fd())}
 	command.Env = append(os.Environ(),
 		"PYTHONPATH="+filepath.Dir(harness.aitestDir),
@@ -396,38 +420,67 @@ func TestRealPytestAitestEndToEndRealDaemonAndCgroupPassFailOnly(t *testing.T) {
 }
 
 func TestRealPytestAitestEndToEndRealDaemonAndCgroup(t *testing.T) {
-	// Opt-in only, NOT part of the default `go test ./...` path: verified
-	// live on this exact host that the worker's deliberate over-allocation
-	// can get caught in the kernel's mem_cgroup_handle_over_high throttle
-	// for MINUTES before memory.max's hard kill ever fires (the current
-	// 80%/100% memory.high/memory.max split, internal/daemon/worker_admit.go,
-	// leaves a wide reclaim-throttle window under this kernel/host's
-	// characteristics) -- and a process stuck in that kernel path can enter
-	// an UNKILLABLE D-state that SIGKILL cannot wake, a real hazard on a
-	// machine other sessions share. The containment invariant itself is
-	// NOT broken -- dmesg confirms the correct scope's oom.group eventually
-	// fires -- only its convergence speed on this host is impractical for
-	// an unattended test run. Tracked as AIRA-35 for a real fix (retune
-	// the memory.high/memory.max split, or add an escalation path) rather
-	// than silently worked around here. Run explicitly with
-	// AIRA_AITEST_SLOW_E2E=1 once that's resolved, or to manually
-	// re-verify this exact finding.
-	if os.Getenv("AIRA_AITEST_SLOW_E2E") != "1" {
-		t.Skip("slow/host-dependent OOM-convergence e2e (AIRA-35) -- set AIRA_AITEST_SLOW_E2E=1 to run explicitly")
-	}
+	// UN-GATED since AIRA-35. This test was opt-in-only (AIRA_AITEST_SLOW_E2E=1)
+	// because a worker's deliberate over-allocation could sit in the kernel's
+	// mem_cgroup_handle_over_high reclaim-throttle path for MINUTES before
+	// memory.max's hard kill fired -- measured at the old 80% memory.high split,
+	// 420 seconds without converging -- and a process stuck there can enter an
+	// UNKILLABLE D-state, a real hazard on a machine other sessions share.
+	//
+	// Both halves of that are now fixed at the source rather than gated around:
+	// worker scopes carry no memory.high at all (so there is no throttle path to
+	// get stuck in) and carry memory.swap.max=0 (so memory.max contains rather
+	// than merely reclaiming). Measured convergence after the fix is 0.03-0.48 s
+	// across cap sizes; see runner.CreateWorkerScope and
+	// TestWorkerScopeOOMGroupKillConvergesPromptly, which is the tight
+	// mechanism-level guard. THIS test's job is different and complementary:
+	// that the whole pytest run -- admission, placement, the kill, the
+	// requeue-once, and the unevaluated report -- holds together end to end.
 	harness := newRealDaemonAndCgroupTestHarness(t)
 
-	// Hard bound: this must NEVER be able to hang the test run indefinitely,
-	// regardless of how slowly the OOM-convergence path completes -- see
-	// this function's own opt-in-gate comment above for why that can be
-	// slow on this host. 4 minutes is generous relative to the pass/fail
-	// parts (well under a second, per repeated real runs) while still
-	// bounding the worst case observed (multi-minute throttle convergence)
-	// to a finite, diagnosable failure instead of an unbounded hang.
-	runCtx, cancelRun := context.WithTimeout(context.Background(), testdeadline.Wait(4*time.Minute))
+	// The harness deliberately sets no ancestor swap cap, so on a host where
+	// the production per-worker cap cannot be set either, test_oom.py's worker
+	// would page out instead of dying and this run would burn its whole budget
+	// for a reason that says nothing about the code. Skip with the reason
+	// rather than assert something the host cannot deliver.
+	if _, err := os.Stat(filepath.Join(filepath.Dir(harness.outerFile.Name()), "memory.swap.max")); err != nil {
+		t.Skipf("this host exposes no memory.swap.max (%v), so per-worker swap containment "+
+			"cannot be established here -- the OOM leg of this e2e is unevaluated, not passing", err)
+	}
+
+	// Hard bound: this must NEVER be able to hang the test run indefinitely.
+	// 60 s replaces the old 4 minutes now that convergence is sub-second: the
+	// pass/fail parts complete in well under a second (per the sibling
+	// pass/fail-only test) and the OOM leg adds the kill plus one requeue. It
+	// stays a generous multiple of the real cost so a loaded shared machine
+	// does not flake, while still turning any return of the multi-minute
+	// throttle into a finite, diagnosable failure rather than an unbounded hang.
+	runCtx, cancelRun := context.WithTimeout(context.Background(), testdeadline.Wait(time.Minute))
 	defer cancelRun()
 	command := exec.CommandContext(runCtx, harness.pytest, "-q", "--aitest-workers=2")
 	command.Dir = filepath.Join(harness.aitestDir, "testdata")
+	// WaitDelay is load-bearing on a real-cgroup run, not defensive padding.
+	// CommandContext kills the pytest process at the deadline, but
+	// CombinedOutput then waits for the output PIPES to close, and a
+	// grandchild holding a duplicate write end keeps them open regardless --
+	// the same inherited-write-end property AIRA-40 documents for the worker
+	// result pipe. Found by deliberately mutating CreateWorkerScope to restore
+	// memory.high and running this test: the context fired at its deadline and
+	// the run still hung until Go's own 10-MINUTE package timeout, because the
+	// worker was stuck in mem_cgroup_handle_over_high in an unkillable D-state
+	// (observed live: state DN, wchan __mem_cgroup_handle_over_high, 7107
+	// memory.high events and ZERO memory.max events after 640 s). That is the
+	// AIRA-35 hazard itself, and it is exactly what an UN-GATED test must not
+	// be able to inflict on a shared machine when someone regresses the fix.
+	//
+	// Re-measured with this line in place, same mutant: the run fails in 76 s
+	// (the 60 s context plus this delay) instead of 600 s. Not an absolute
+	// guarantee -- a task wedged in an uninterruptible kernel path cannot be
+	// bounded from userspace at all, which is the whole point of removing the
+	// path rather than policing it -- but it turns the common case from Go's
+	// 10-minute package timeout into a prompt, attributable failure.
+	command.WaitDelay = 15 * time.Second
+
 	// Places the pytest subprocess (the supervisor) directly into outer's
 	// cgroup AT process creation -- the same clone3(CLONE_INTO_CGROUP)
 	// mechanism confine_linux.go already uses for a top-level confine
@@ -457,7 +510,21 @@ func TestRealPytestAitestEndToEndRealDaemonAndCgroup(t *testing.T) {
 	// The OOM test exceeds its 32 MiB worker cap deterministically on both
 	// the original attempt and the one requeue-once retry (Task 15) --
 	// design spec 3.4/4: never passed, never failed, always unevaluated.
+	//
+	// AIRA-35: with no ancestor swap cap in the harness any more, this single
+	// line is the end-to-end proof that PRODUCTION contains the worker. Revert
+	// runner.CreateWorkerScope's memory.swap.max=0 and test_oom.py pages its
+	// 512 MiB out to swap, exits 0, and reports "passed" -- so this assertion
+	// fails on exactly the regression that matters.
 	if !strings.Contains(text, "test_oom.py::test_deliberate_oom unevaluated") {
 		t.Fatalf("pytest output missing expected OOM-contained unevaluated line: %v\n%s", err, text)
+	}
+	// The swap-cap disposition must not have failed open behind our back: a
+	// run that lost containment says so on its own output (supervisor.py's
+	// _note_swap_cap_state), and a test that ignored that could pass while the
+	// guarantee it is asserting was never in force.
+	if strings.Contains(text, "swap_cap=unavailable") {
+		t.Fatalf("the daemon could not bound worker swap for this run, so the containment "+
+			"this test asserts was not actually enforced:\n%s", text)
 	}
 }

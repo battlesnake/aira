@@ -7,6 +7,6 @@ import (
 	"errors"
 )
 
-func CreateWorkerScope(ctx context.Context, outerScope, workerID string, memoryMax, memoryHigh int64) (string, error) {
-	return "", errors.New("aitest worker scope: unsupported on this platform")
+func CreateWorkerScope(ctx context.Context, outerScope, workerID string, memoryMax int64) (string, string, error) {
+	return "", "", errors.New("aitest worker scope: unsupported on this platform")
 }
