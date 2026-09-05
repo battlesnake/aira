@@ -15,6 +15,24 @@ from aitest.worker import _EVENT_LINE_PREFIX, _RECYCLE_SUFFIX, _exit_child, _unt
 
 _STOP_LINE = "__stop__"
 _DENIAL_RETRY_SECONDS = 1.0
+# AIRA-64. A SPECULATIVE admission request: "answer from what you can obtain
+# without waiting". The daemon treats max_wait_ms == 0 as try-acquire on both
+# its outer-scope lock and its CPU gate, so such a request never waits on
+# another job's critical section -- which matters because every one of them is
+# issued from this module's SINGLE-THREADED dispatch loop, where a blocking
+# request stalls result draining and nodeid dispatch for every live worker.
+#
+# It is NOT the same as "non-blocking": a speculative request still performs
+# bounded cgroup I/O and, when it GRANTS, the same fork and placement-ack this
+# module already pays for every other spawn. What it guarantees is that it never
+# polls and never waits on another job.
+_SPECULATIVE_MAX_WAIT = "0s"
+# How often the dispatch loop may issue one speculative growth probe. Checked on
+# EVERY loop iteration rather than only on the select() timeout: a suite whose
+# tests complete in well under a second keeps result and pidfd descriptors
+# continuously ready, so the timeout branch may never be taken at all and a
+# probe attached to it would never fire (Sol plan-review).
+_GROWTH_PROBE_INTERVAL_SECONDS = 1.0
 # How often (in retry attempts, i.e. roughly every N seconds at the above
 # interval) to remind stderr that a run is stalled waiting on a reachable
 # but saturated daemon -- see _wait_for_admission_or_disable, shared by
@@ -532,6 +550,9 @@ class Supervisor:
         self._run_estimated_bytes = 0
         self._run_max_wait = "30s"
         self._run_worker_count = 1
+        # AIRA-64 growth probe bookkeeping.
+        self._last_growth_probe = 0.0
+        self._cpu_slots_warned = False
 
     def bootstrap(self):
         """Relocate this process into its own child scope so the outer scope
@@ -819,7 +840,35 @@ class Supervisor:
                 "worker-admit granted outcome is malformed: %s [relay stderr: %s]"
                 % (malformed, stderr.strip() or "none")
             )
+        self._note_cpu_slots_state(outcome.get("cpu_slots", ""))
         return grant, process
+
+    def _note_cpu_slots_state(self, state):
+        """AIRA-64. Say ONCE, on this run's own output, when the daemon could
+        not establish CPU governance for it.
+
+        The CPU dimension deliberately fails OPEN (a reading it cannot establish
+        must not stall every aitest run on the machine, unlike RAM where an
+        unestablished reading risks an outer-scope OOM kill of a whole run). The
+        cost of failing open is that a broken gate is INVISIBLE -- which is
+        exactly how the AIRA-59 watchdog shipped inert on every real host. So
+        the run that is affected gets told, rather than the condition living
+        only in the daemon journal.
+
+        An ABSENT token means an older daemon that predates this field, not
+        "ok": both are silent here, because inventing a warning for a daemon
+        that never claimed anything would be a fabricated diagnosis. The
+        real-cgroup test is what proves the gate fires; this is what makes a
+        fail-open visible when it does not."""
+        if state != "unevaluated" or self._cpu_slots_warned:
+            return
+        self._cpu_slots_warned = True
+        sys.stderr.write(
+            "aira aitest: the daemon could not establish CPU-concurrency governance for "
+            "this run (cpu_slots=unevaluated); workers are RAM-governed but NOT bounded "
+            "against other jobs on this machine, so heavy concurrent runs can still "
+            "oversubscribe the CPU\n"
+        )
 
     def _open_pidfd(self, pid):
         """A pidfd for one forked worker, or None if this host cannot provide
@@ -1350,7 +1399,20 @@ class Supervisor:
             return
         if self.daemon_available:
             try:
-                self.spawn_worker(self._run_estimated_bytes, max_wait=self._run_max_wait)
+                # AIRA-64: a replacement made while OTHER workers are still
+                # alive is speculative. It used to use the run's full
+                # `max_wait` (30s by default), which the daemon honours by
+                # POLLING to that deadline -- so under CPU contention, where
+                # denials become the common case rather than a rarity, every
+                # retirement would have frozen this single-threaded dispatch
+                # loop for up to 30 seconds with idle workers waiting for
+                # nodeids. The indefinite wait is kept below for the
+                # last-worker case, where waiting really is the honest thing
+                # to do.
+                self.spawn_worker(
+                    self._run_estimated_bytes,
+                    max_wait=self._run_max_wait if not self.workers else _SPECULATIVE_MAX_WAIT,
+                )
                 return
             except WorkerAdmitDenied:
                 if self.workers:
@@ -1388,6 +1450,57 @@ class Supervisor:
         # warning text ("falling back to n_workers<=%d").
         if len(self.workers) < min(self._run_worker_count, self.max_workers_fallback):
             self._spawn_fallback_worker()
+
+    def _maybe_grow_pool(self):
+        """AIRA-64. One speculative attempt to grow the pool back toward its
+        requested size, rate-limited to once a second.
+
+        This exists because the startup pool loop `break`s PERMANENTLY on its
+        first denial and nothing else ever tries to grow again: `_replace_worker`
+        replaces one worker on a retirement, it does not restore a pool to its
+        target size, and the run()'s follow-up wait only fires when the pool is
+        completely EMPTY. Before the CPU gate that was harmless, because a RAM
+        denial at startup was rare. With a machine-wide CPU bound a denial at
+        startup is the NORMAL case on a busy box, so without this a run that got
+        1 of its 15 workers would keep exactly one worker for its entire
+        lifetime -- a far worse regression than the contention this change
+        exists to fix (Sol plan-review).
+
+        It is also what makes the bound FAIR rather than first-come-first-served:
+        an incumbent that recycles a worker re-requests immediately from its own
+        retirement path, so without a periodic probe from everyone else it would
+        simply reclaim its own slot forever while a newcomer sat at its floor.
+
+        Called from every dispatch-loop iteration, not just the idle branch: a
+        suite of sub-second tests keeps the loop's descriptors continuously
+        ready, so the select() timeout may never be reached at all.
+
+        Returns True when the pool actually grew, so the caller can dispatch to
+        the new worker immediately instead of leaving it idle for a tick."""
+        if not self.daemon_available or not self.queue:
+            return False
+        if len(self.workers) >= self._run_worker_count or self._pool_covers_the_queue():
+            return False
+        now = time.monotonic()
+        if now - self._last_growth_probe < _GROWTH_PROBE_INTERVAL_SECONDS:
+            return False
+        self._last_growth_probe = now
+        try:
+            self.spawn_worker(self._run_estimated_bytes, max_wait=_SPECULATIVE_MAX_WAIT)
+            return True
+        except WorkerAdmitDenied:
+            # The ordinary outcome of a probe on a busy machine. Silent by
+            # design: this fires once a second for the life of a contended run,
+            # and a warning per attempt would bury the diagnostics that matter.
+            pass
+        except WorkerAdmitTerminal as exc:
+            # A permanent verdict is NOT made less permanent by having been
+            # discovered speculatively; it gets the same treatment it would on
+            # any other path rather than being swallowed.
+            self._fail_queue_terminal(str(exc))
+        except (WorkerAdmitUnavailable, WorkerPlacementFailed) as exc:
+            self._disable_daemon(str(exc))
+        return False
 
     def _drain_worker(self, pid, state):
         """Handles every line CURRENTLY AVAILABLE for this worker's result
@@ -1877,6 +1990,16 @@ class Supervisor:
             ready, _, _ = select.select(
                 list(result_fd_owners) + list(pidfd_owners), [], [], 1.0
             )
+            # AIRA-64: BEFORE the `if not ready: continue` below, so it runs on
+            # every iteration rather than only on the idle branch. Its own rate
+            # limit is what bounds the cost; attaching it to the timeout instead
+            # made it unreachable for any suite whose tests finish in under a
+            # second (Sol plan-review).
+            if self._maybe_grow_pool():
+                # Feed the fresh worker now rather than leaving it idle until
+                # the next event: on the `not ready` path below there may not
+                # BE a next event for a full tick.
+                self._dispatch_to_idle_workers()
             if not ready:
                 continue
             self._service_ready_workers(ready, result_fd_owners, pidfd_owners)

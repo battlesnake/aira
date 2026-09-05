@@ -157,17 +157,35 @@ positive-proof-of-both-facets test in the same discipline as AIRA-36's reaper
 - a scope abandoned by a lost grant is **old and empty** → not counted → the
   floor opens (closes the round-1 P0).
 
-Directory age is `mtime`, **measured on this host** to be the real creation time
-for cgroupfs directories (two live `.aira-CONFINE-*` scopes read 12 s and 822 s
-old, matching their jobs).
+**What `mtime` actually means here — CORRECTED IN BUILD (v5).** v3 and v4 said
+directory `mtime` "is the creation time". The real-cgroup test written for
+§9.18 **refuted that on its first run**: a child-cgroup `mkdir` or `rmdir`
+inside a worker scope moves its `mtime`. Measured precisely
+(`TestWorkerScopeMtimeMovesOnlyOnDirectoryEntryChanges`):
 
-**Correction (Sol round 3 P2):** v3 cited `ConfineRecord.AgeSeconds` as
-precedent. That is wrong — it is derived from the timestamp encoded in the scope
+| mutation | moves `mtime`? |
+|---|---|
+| population — a `cgroup.procs` write | **no** |
+| a control-file write (`memory.high`, …) | **no** |
+| a child-cgroup `mkdir` / `rmdir` | **yes** |
+
+`mtime` is therefore *the time of the last directory-entry change in the scope*.
+The gate needs exactly one property and these three deliver it:
+
+> **An abandoned scope's `mtime` is frozen** — an abandoned scope holds no
+> process that could create or remove a child inside it, so it genuinely ages
+> out and the floor genuinely opens.
+
+And the exception is one-directional in the safe sense: a **live** worker that
+nests cgroups refreshes its own `mtime` and so looks *younger*, which counts it
+live — and it is live. There is no mutation that makes an abandoned scope look
+*older* than it is, which is the only direction that could break the bound.
+
+Also corrected (Sol round 3 P2): v3 cited `ConfineRecord.AgeSeconds` as
+precedent. That is wrong — it derives from the timestamp encoded in the scope
 *id*, not from `mtime` (`confine_manage_linux.go:82-95`). The claim now rests
-only on the measurement, and because a measurement of *outer* scopes does not
-prove the property for *worker* directories across population and child-cgroup
-mutation, test 18 exercises the real worker-directory lifecycle directly rather
-than assuming it transfers.
+solely on the measurement above, which is a committed, executable test rather
+than a note.
 
 **Population that cannot be established** (an unreadable `cgroup.events`) counts
 the child as **live** — the direction that does not fabricate an open floor.
@@ -199,12 +217,26 @@ window**, and only while its own child has neither placed nor been killed —
 which the client does at its own ack deadline. It is bounded per window, not
 bounded over unbounded time. It is fully RAM-checked in every case.
 
-**The grace is read from the environment, not assumed.** Sol correctly noted
-`_PLACEMENT_ACK_TIMEOUT_SECONDS` is operator-adjustable via
-`AIRA_AITEST_PLACEMENT_ACK_TIMEOUT` (`supervisor.py:75-95,991-994`). The daemon
-therefore takes its grace from `AIRA_AITEST_PLACEMENT_ACK_TIMEOUT` when set,
-falling back to the same 60 s default, so the two halves cannot drift apart
-silently.
+**The grace is read from the environment, not assumed — and the two halves live
+in different processes.** Sol correctly noted `_PLACEMENT_ACK_TIMEOUT_SECONDS`
+is operator-adjustable via `AIRA_AITEST_PLACEMENT_ACK_TIMEOUT`
+(`supervisor.py:75-95,991-994`). The daemon reads the same variable *name*, but
+out of its own environment — it is a systemd service, not a child of the pytest
+run.
+
+**Corrected during the build:** v4 said this meant "the two halves cannot drift
+apart silently". That is false, and the false version is the more dangerous one
+to leave in a comment. Setting the variable for a pytest invocation does **not**
+move the daemon's grace. Both default to 60 s, each is overridable where it
+runs, and a mismatch is bounded in both directions:
+
+| mismatch | consequence | bounded by |
+|---|---|---|
+| client grace **longer** than the daemon's | a scope still legitimately placing can age out daemon-side and draw one extra floor grant | §4.4.2's rate limit — one per outer scope per window |
+| client grace **shorter** | an abandoned scope counts live slightly past the client's own kill | floor recovery is delayed, never withheld |
+
+Neither direction breaks an invariant, so the mismatch is documented rather than
+engineered away with cross-process plumbing.
 
 ### 4.5 The liveness floor — the most important invariant
 
@@ -828,3 +860,95 @@ the client changes, the terminal `max_wait=0` defect). Round 3 changed no
 mechanism: it corrected two overclaims, one precedent citation and one naming
 inconsistency, and its one P0 is answered by a retraction plus three lines. The
 remaining disagreement is recorded above rather than iterated further.
+
+## 13. What the build itself falsified
+
+Three things the plan asserted turned out to be wrong, and each was caught by a
+test written specifically to be able to catch it rather than by review.
+
+**(a) `mtime` is not creation time (caught by the anti-INERT tier, on its first
+run).** §4.4.1 is rewritten with the measured semantics. The mechanism survives
+because the movement is one-directional in the safe sense, but the claim as
+written was false. This is the clearest argument for the real-cgroup tier: every
+seam-level test in the change would have passed against the wrong claim.
+
+**(b) The CPU gate added a second cancellation checkpoint before scope
+creation, and it made an existing test flaky (caught by the full-suite run, not
+by the targeted one).** `acquireWorkerScope` checks `ctx.Done()` before its own
+select, and `acquireCPUSlotsGate` copied that. Between the RAM decision and
+`CreateWorkerScope` there is now a second place a vanished peer can abort, which
+widened the pre-existing race that
+`TestWorkerAdmitConnectionKeepsScopeChargedWhenResponseWriteFails` pins (AIRA-41's
+invariant that a grant whose response write fails still leaves its scope
+charged). Fixed by taking a FREE gate unconditionally and consulting `ctx` only
+when the gate is genuinely contended — which is also the only case where
+abandonability was ever the point. Note a plain three-way `select` would not
+have fixed it: it chooses uniformly among ready cases, so a free gate plus a
+cancelled context would still abort about half the time.
+
+**(c) One test was porous, and mutation testing found it.**
+`TestCPUGateGrantForcesAFreshSnapshot` asserted that a granting request
+increased the scan counter. The mutant that removes `force` **survived**,
+because the cached read also scans whenever the cache is cold — the counter rose
+either way and the test proved nothing about `force`. Replaced with a test that
+makes the cache deliberately stale-LOW and asserts on the **verdict**: the cache
+says there is room, the tree says there is not, and only a forced rescan can
+tell the difference.
+
+**Deliberate behaviour change to an existing contract, recorded.**
+`--max-wait 0` was `argument-invalid`; it is now valid and means *speculative*.
+`TestRunWorkerAdmitCommandAlwaysWritesOneStructuredOutcome`'s "non-positive max
+wait" case is rewritten as "negative max wait". This is the one place the change
+edits an existing assertion rather than adding to it, and §4.10.1(a) is why.
+
+## 14. Mutation testing
+
+Reproduction: `~/tmp/aira64-mutants.sh` and `~/tmp/aira64-mutants2.sh`. Each
+mutant flips one load-bearing decision; a mutant that SURVIVES means the tests
+cannot tell correct from wrong there.
+
+**Final: 27 mutants, 27 killed.** Three rounds were needed, and the two survivors
+of round 1 are the finding, not the score.
+
+| # | mutant | result |
+|---|---|---|
+| M1–M2 | capacity boundary `<`→`<=`; capacity check removed entirely | killed |
+| M3–M4 | floor always open; floor never opens | killed |
+| M5 | floor rate limit removed | killed |
+| M6–M7 | age gate removed (populated-only floor); populated check removed (directory-count floor) | killed |
+| M8–M9 | unestablished population / `stat` failure read as NOT live | killed |
+| M10 | scan error becomes an empty snapshot (a fabricated zero) | killed |
+| M11 | grant path does not force a fresh snapshot | **survived → fixed → killed** |
+| M12 | gate not acquired on the grant path | killed |
+| M13 | speculative gate blocks instead of try-acquire | killed |
+| M14 | cached CPU check removed (per-poll rescan returns) | killed |
+| M15 | CPU denial uses the terminal `request-invalid` class | killed |
+| M16 | CLI refuses `--max-wait 0` again | killed |
+| M17 | `cpu_slots` token never rendered | killed |
+| M18 | `cpu_slots` dropped by the runner client | **survived → fixed → killed** |
+| M19 | growth probe attached to the idle branch only | killed |
+| M20–M21 | replacement / probe block on the full `max_wait` | killed |
+| M22 | growth probe rate limit removed | killed |
+| M23–M24 | `cpu_slots` warning per worker / never | killed |
+| M25–M26 | `cpu_slots` dropped by the CLI grant fields / never set by the daemon | killed |
+| M27 | free gate consults `ctx` again (reintroduces the §13(b) flake) | **survived → fixed → killed** |
+
+**M11 — a porous assertion.** `TestCPUGateGrantForcesAFreshSnapshot` asserted a
+scan counter increased. The cached read scans too whenever the cache is cold, so
+the counter rose with or without `force`. Replaced by an assertion on the
+**verdict** against a deliberately stale-low cache (§13(c)).
+
+**M18 — an uncovered hop.** Nothing crossed
+`worker_admit_client_linux.go`'s grant unmarshal and lease, so the CPU-governance
+signal could be dropped there and every test stayed green — exactly the
+"operationally inert" shape Sol's round-2 P1 warned about. Fixed by asserting
+`cpu_slots` in the real-CLI-against-real-daemon-and-real-cgroup boundary test,
+which is the only place all five hops are crossed at once. M25 and M26 were added
+to cover the two neighbouring hops for the same reason.
+
+**M27 — a race is not a detector.** The §13(b) regression was originally caught
+by a full-suite *flake*. Reintroducing it survived the suite, because a flake
+fails only sometimes. Fixed with a deterministic regression test that cancels the
+peer at an injected point inside the outer-scope lock, immediately before the
+gate (`TestCPUGateTakesAFreeGateWithoutConsultingContext`). **A bug found by a
+flake needs a deterministic test, or the fix is unprotected.**

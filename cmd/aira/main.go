@@ -1407,7 +1407,15 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 	}
 	maxWait := runner.DefaultConfineReserveMaxWait
 	if raw := options["max-wait"]; raw != "" {
-		if maxWait, err = time.ParseDuration(raw); err != nil || maxWait <= 0 {
+		// AIRA-64: zero is VALID and means "speculative" -- answer from what can
+		// be obtained without waiting. It used to be refused here as
+		// argument-invalid/request-invalid, which the aitest supervisor treats
+		// as TERMINAL and responds to by draining its remaining queue to
+		// `unevaluated`. The daemon's own validator has always accepted zero
+		// (validateWorkerAdmitArgs); only this side disagreed, so a speculative
+		// pool-growth probe would have destroyed the run it was trying to help
+		// (found by Sol plan-review round 2). Negatives are still refused.
+		if maxWait, err = time.ParseDuration(raw); err != nil || maxWait < 0 {
 			return writeWorkerAdmitOutcome(stdout, stderr, runner.WorkerAdmitOutcome{
 				State: runner.WorkerAdmitStateArgumentInvalid, Class: runner.WorkerAdmitClassRequestInvalid,
 				Reason: runner.WorkerAdmitReasonMaxWaitInvalid, Detail: "invalid --max-wait",
@@ -1462,6 +1470,7 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 	grantFields := &runner.WorkerAdmitGrantFields{
 		ScopePath: lease.ScopePath, WorkerID: lease.WorkerID,
 		MemoryMax: lease.MemoryMax, MemoryHigh: lease.MemoryHigh,
+		CPUSlots: lease.CPUSlots,
 	}
 	if exit := writeWorkerAdmitOutcome(stdout, stderr, outcome, grantFields, ""); exit != 0 {
 		_ = lease.Close()

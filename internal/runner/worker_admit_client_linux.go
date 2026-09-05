@@ -36,7 +36,11 @@ type WorkerAdmitLease struct {
 	ScopePath  string
 	MemoryMax  int64
 	MemoryHigh int64
-	conn       net.Conn
+	// CPUSlots (AIRA-64) carries the daemon's CPU-governance state through to
+	// the outcome line the supervisor reads. It must traverse this hop or the
+	// signal is inert.
+	CPUSlots string
+	conn     net.Conn
 }
 
 func (l *WorkerAdmitLease) Close() error {
@@ -64,6 +68,7 @@ type workerAdmitGrant struct {
 	ScopePath  string `json:"scope_path,omitempty"`
 	MemoryMax  int64  `json:"memory_max,omitempty"`
 	MemoryHigh int64  `json:"memory_high,omitempty"`
+	CPUSlots   string `json:"cpu_slots,omitempty"`
 }
 
 // RequestWorkerAdmit dials the daemon and sends one worker-admit request,
@@ -185,7 +190,8 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) Worke
 		State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted,
 		Lease: &WorkerAdmitLease{
 			WorkerID: grant.WorkerID, ScopePath: grant.ScopePath,
-			MemoryMax: grant.MemoryMax, MemoryHigh: grant.MemoryHigh, conn: conn,
+			MemoryMax: grant.MemoryMax, MemoryHigh: grant.MemoryHigh,
+			CPUSlots: grant.CPUSlots, conn: conn,
 		},
 	}
 }

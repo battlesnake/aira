@@ -242,6 +242,26 @@ func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 	if err != nil || grantedHigh <= 0 || grantedHigh >= request {
 		t.Fatalf("granted memory_high=%q (parse err %v), want a positive value below memory_max", fields["memory_high"], err)
 	}
+	// AIRA-64 §9.21: `cpu_slots` must survive EVERY hop — the daemon's response,
+	// runner.RequestWorkerAdmit's JSON unmarshal, the WorkerAdmitLease it builds,
+	// the CLI's WorkerAdmitGrantFields, and the rendered line. This is the only
+	// assertion in the tree that crosses all of them at once, and it was added
+	// because MUTATION TESTING proved the runner-client hop was uncovered: a
+	// mutant that dropped CPUSlots there survived the whole suite, which is
+	// precisely how a fail-open governance signal ships invisible.
+	//
+	// The value is not pinned to "ok" here: this test's outer scope is a
+	// `.aira-outer-test` directory, not a `.aira-CONFINE-*` child, so the honest
+	// verdict for it IS `unevaluated`. What must hold is that a value arrives at
+	// all and is one the client can act on.
+	switch got := fields["cpu_slots"]; got {
+	case runner.WorkerAdmitCPUSlotsOK, runner.WorkerAdmitCPUSlotsUnevaluated:
+	default:
+		t.Fatalf("granted cpu_slots=%q, want %q or %q — the CPU-governance state was dropped "+
+			"somewhere between the daemon and the rendered line, which makes a fail-open "+
+			"CPU gate invisible to the run it affects", got,
+			runner.WorkerAdmitCPUSlotsOK, runner.WorkerAdmitCPUSlotsUnevaluated)
+	}
 	// The line's placement coordinates must name a cgroup that really carries
 	// them. floorMemoryPage is what writeScopeMemoryCap itself verifies against,
 	// mirrored here in its exact bitmask form rather than imported (it is

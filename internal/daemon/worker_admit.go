@@ -53,6 +53,12 @@ type WorkerAdmitResponse struct {
 	ScopePath  string `json:"scope_path,omitempty"`
 	MemoryMax  int64  `json:"memory_max,omitempty"`
 	MemoryHigh int64  `json:"memory_high,omitempty"`
+	// CPUSlots (AIRA-64) reports whether this grant was actually subject to
+	// CPU-concurrency governance. It exists because a fail-open governance
+	// dimension whose failure is visible only in the daemon journal is how a
+	// subsystem ships operationally inert, which this project has done once
+	// already. It is diagnostic: nothing branches on it.
+	CPUSlots string `json:"cpu_slots,omitempty"`
 }
 
 type workerAdmitRequest struct {
@@ -129,6 +135,13 @@ type workerScopeState struct {
 	// reverting to a stale number. Found independently by Sol and DeepSeek
 	// build-review.
 	scanErr error
+	// lastFloorGrantAt is AIRA-64's floor rate limit: at most one liveness-floor
+	// grant per outer scope per placement-grace window. It lives here because
+	// this cell is already per-outer-scope and already held under this scope's
+	// lock at every decision point, so the limit needs no lifetime, expiry or
+	// restart story of its own — after a restart it is zero, which permits
+	// exactly one extra floor grant and nothing worse.
+	lastFloorGrantAt time.Time
 }
 
 // workerScopeScanIntervalDefault throttles the per-outer-scope child scan to
@@ -162,6 +175,32 @@ func (s *Server) workerScopeFor(outerScope string) *workerScopeState {
 // context is done or the daemon is stopping. The ONLY statement permitted
 // after a true return is `defer state.release()`.
 func (s *Server) acquireWorkerScope(ctx context.Context, state *workerScopeState) bool {
+	return s.acquireWorkerScopeTry(ctx, state, false)
+}
+
+// acquireWorkerScopeTry is acquireWorkerScope with an added non-blocking mode
+// for AIRA-64's speculative requests (max_wait_ms == 0), which must never wait
+// on a lock another job holds.
+func (s *Server) acquireWorkerScopeTry(ctx context.Context, state *workerScopeState, tryOnly bool) bool {
+	if tryOnly {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-s.stopping:
+			return false
+		default:
+		}
+		select {
+		case state.lock <- struct{}{}:
+			return true
+		default:
+			return false
+		}
+	}
+	return s.acquireWorkerScopeBlocking(ctx, state)
+}
+
+func (s *Server) acquireWorkerScopeBlocking(ctx context.Context, state *workerScopeState) bool {
 	// Checked BEFORE the select below, because select picks uniformly at random
 	// among ready cases: with an already-cancelled peer AND a free lock, the bare
 	// select took the lock about half the time and went on to create a worker
@@ -454,7 +493,23 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 	// (AIRA-63), an uninterruptible wait would let one slow outer scope pin
 	// admission slots ordinary `aira confine` admission needs.
 	state := s.workerScopeFor(req.outerScope)
-	if !s.acquireWorkerScope(ctx, state) {
+	// AIRA-64: a SPECULATIVE request (max_wait_ms == 0) never waits on another
+	// job's critical section. The aitest supervisor issues these from its
+	// single-threaded dispatch loop to grow its pool when capacity frees, so a
+	// blocking acquisition here would freeze that loop behind an unrelated job.
+	if !s.acquireWorkerScopeTry(ctx, state, req.maxWaitMS == 0) {
+		if req.maxWaitMS == 0 && ctx.Err() == nil {
+			select {
+			case <-s.stopping:
+				return WorkerAdmitResponse{}, false
+			default:
+			}
+			return WorkerAdmitResponse{
+				State:  runner.WorkerAdmitStateDenied,
+				Class:  runner.WorkerAdmitClassContended,
+				Reason: runner.WorkerAdmitReasonAdmitLocksBusy,
+			}, true
+		}
 		return WorkerAdmitResponse{}, false
 	}
 	defer state.release()
@@ -555,6 +610,21 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 			Reason: runner.WorkerAdmitReasonAggregateCapExceeded,
 		}, true
 	}
+	// AIRA-64, CACHED CPU CHECK. Placed HERE, before the forced RAM rescan
+	// below, and the position is load-bearing rather than incidental: a
+	// CPU-saturated request has ample RAM by construction, so it always reaches
+	// that rescan. Checking CPU afterwards would force a full O(tree) RAM walk
+	// on EVERY 200ms saturated poll — the AIRA-61 CPU-regression shape, and
+	// exactly what this ordering avoids (found by Sol plan-review round 2).
+	if verdict, detail := s.cpuSlotsDecide(req.outerScope, state.lastFloorGrantAt, false); verdict == cpuSlotsSaturated {
+		return WorkerAdmitResponse{
+			State:  runner.WorkerAdmitStateDenied,
+			Class:  runner.WorkerAdmitClassContended,
+			Reason: runner.WorkerAdmitReasonCPUSlotsSaturated,
+		}, true
+	} else if verdict == cpuSlotsUnevaluated {
+		s.cpuSlotsWarnOnce(req.outerScope, detail)
+	}
 	// Granting path: force a fresh scan first. A cached sum may never be the
 	// basis of an admission — a `.aira-worker-*` child that appeared since the
 	// last scan is invisible to the cache and need not collide with the id
@@ -575,6 +645,49 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 			Class:  runner.WorkerAdmitClassContended,
 			Reason: runner.WorkerAdmitReasonAggregateCapExceeded,
 		}, true
+	}
+	// AIRA-64, FORCED CPU CHECK, under the machine-wide gate. The gate is held
+	// across [fresh snapshot -> decide -> CreateWorkerScope] so two concurrent
+	// grants under DIFFERENT outer scopes cannot both observe capacity-1 and
+	// both grant. Lock order is outer-scope -> gate, never the reverse.
+	cpuVerdict := cpuSlotsAdmitNormal
+	if !s.acquireCPUSlotsGate(ctx, req.maxWaitMS == 0) {
+		if req.maxWaitMS == 0 && ctx.Err() == nil {
+			select {
+			case <-s.stopping:
+				return WorkerAdmitResponse{}, false
+			default:
+			}
+			return WorkerAdmitResponse{
+				State:  runner.WorkerAdmitStateDenied,
+				Class:  runner.WorkerAdmitClassContended,
+				Reason: runner.WorkerAdmitReasonAdmitLocksBusy,
+			}, true
+		}
+		return WorkerAdmitResponse{}, false
+	}
+	defer s.releaseCPUSlotsGate()
+	cpuState := runner.WorkerAdmitCPUSlotsOK
+	switch verdict, detail := s.cpuSlotsDecide(req.outerScope, state.lastFloorGrantAt, true); verdict {
+	case cpuSlotsSaturated:
+		return WorkerAdmitResponse{
+			State:  runner.WorkerAdmitStateDenied,
+			Class:  runner.WorkerAdmitClassContended,
+			Reason: runner.WorkerAdmitReasonCPUSlotsSaturated,
+		}, true
+	case cpuSlotsUnevaluated:
+		// Deliberate asymmetry with the RAM checks above, which fail CLOSED.
+		// An unestablished RAM reading risks an outer-scope memory.oom.group
+		// kill of an entire run, so it must deny. An unestablished CPU reading
+		// risks over-subscription — degradation, and exactly today's behaviour
+		// — so denying would convert a diagnostic failure into a stall of every
+		// aitest run on the machine. It is reported as unevaluated on the
+		// granted line and logged; it is never rendered as a zero or a pass.
+		s.cpuSlotsWarnOnce(req.outerScope, detail)
+		cpuState = runner.WorkerAdmitCPUSlotsUnevaluated
+		cpuVerdict = cpuSlotsUnevaluated
+	case cpuSlotsAdmitFloor:
+		cpuVerdict = cpuSlotsAdmitFloor
 	}
 	seq := state.nextSeq
 	if state.maxIndex > seq {
@@ -645,10 +758,19 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 	state.nextSeq = seq
 	// The tree changed under us; the next committed read must see it.
 	state.invalidate()
+	// AIRA-64: the CPU snapshot is now stale-low for the same reason, and the
+	// next grant must not be evaluated against a total that omits this worker.
+	s.cpuSlotsInvalidate(req.outerScope)
+	if cpuVerdict == cpuSlotsAdmitFloor {
+		// Record the floor grant only once the scope actually exists, so a
+		// failed creation cannot consume this scope's floor entitlement.
+		state.lastFloorGrantAt = s.admitNowTime()
+	}
 	return WorkerAdmitResponse{
 		State: runner.WorkerAdmitStateGranted, Class: runner.WorkerAdmitClassGranted,
 		WorkerID: workerID, ScopePath: scopePath,
 		MemoryMax: req.estimatedBytes, MemoryHigh: memoryHigh,
+		CPUSlots: cpuState,
 	}, true
 }
 

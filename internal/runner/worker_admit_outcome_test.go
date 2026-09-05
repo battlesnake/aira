@@ -118,6 +118,56 @@ func TestWorkerAdmitOutcomeLineRoundTrips(t *testing.T) {
 
 // verifies: AIRA-42 — a granted line always carries placement coordinates and
 // a declined line never does, so a half-formed grant cannot be rendered at all.
+// verifies: AIRA-64 §9.21 — the cpu_slots token survives rendering and
+// parsing, and its ABSENCE is preserved as absence.
+//
+// The absence half is the load-bearing one: an older daemon emits no token, and
+// the supervisor must be able to tell "this daemon said nothing" from "this
+// daemon said ok". Rendering an empty value as `cpu_slots=` would collapse that
+// distinction and turn silence into a claim.
+func TestWorkerAdmitOutcomeLineCarriesCPUSlots(t *testing.T) {
+	granted := WorkerAdmitOutcome{State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted}
+	base := WorkerAdmitGrantFields{ScopePath: "/outer/.aira-worker-1", WorkerID: "1", MemoryMax: 400, MemoryHigh: 320}
+
+	for _, state := range []string{WorkerAdmitCPUSlotsOK, WorkerAdmitCPUSlotsUnevaluated} {
+		grant := base
+		grant.CPUSlots = state
+		line, err := WorkerAdmitOutcomeLine(granted, &grant)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fields, err := ParseWorkerAdmitOutcomeLine(line)
+		if err != nil {
+			t.Fatalf("parse %q: %v", line, err)
+		}
+		if fields["cpu_slots"] != state {
+			t.Fatalf("cpu_slots=%q, want %q (line=%q)", fields["cpu_slots"], state, line)
+		}
+		// The four fields the supervisor REQUIRES must be untouched by the
+		// addition, or an additive field became a breaking one.
+		for key, want := range map[string]string{
+			"scope": "/outer/.aira-worker-1", "worker_id": "1",
+			"memory_max": "400", "memory_high": "320",
+		} {
+			if fields[key] != want {
+				t.Fatalf("%s=%q want %q", key, fields[key], want)
+			}
+		}
+	}
+
+	line, err := WorkerAdmitOutcomeLine(granted, &base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields, err := ParseWorkerAdmitOutcomeLine(line)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present := fields["cpu_slots"]; present {
+		t.Fatalf("an unset CPUSlots must emit NO token, so silence cannot be read as a claim: %q", line)
+	}
+}
+
 func TestWorkerAdmitOutcomeLineRefusesInconsistentOutcomes(t *testing.T) {
 	tests := []struct {
 		name    string
