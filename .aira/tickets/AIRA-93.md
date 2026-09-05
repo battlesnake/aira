@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-93","project":"aira","title":"aira reconcile --rebuild fails with E_JOURNAL_CORRUPT: duplicate project/seq assigned two different ticket targets","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","journal","reconcile"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-93","project":"aira","title":"aira reconcile --rebuild fails with E_JOURNAL_CORRUPT: duplicate project/seq assigned two different ticket targets","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["dogfood","journal","reconcile"],"hold":false,"relations":[]}
 ---
 Independently confirmed twice tonight (AIRA-68 build agent, then the AIRA-68 verify agent re-running it fresh): `aira reconcile --rebuild` fails with real exit 4 and `E_JOURNAL_CORRUPT: duplicate project/seq …/1 has target AIRA-1 and LIFE-1` — the same (project, seq) pair in the shared journal was assigned two different ticket targets across two different projects (AIRA and LIFE), and the rebuild path treats that as fatal corruption rather than reconciling it.
 
@@ -97,6 +97,40 @@ Confirmed against source and fixed: the scrub is now a shared
 The helper lives in `internal/gitcontext` — a leaf both `internal/app` and
 `internal/store` already import — so there is one implementation rather than a
 copy per layer, and its unit tests live with it.
+
+## Receipt surgery: DONE, verified (2026-09-05)
+
+Executed by the owner directly (`!`-prefixed shell command from the coordinating
+session, since the permission classifier correctly refuses any Claude-driven
+write under `.git/` regardless of tool) — the coordinating session prepared and
+verified everything else: backed up `receipts.jsonl` to
+`~/tmp/aira-receipts.jsonl.pre-aira93-surgery-20260905T130737Z.bak` (sha256
+`7087e8e6…`), captured the two exact stale lines verbatim (`~/tmp/aira93-badline{1,2}.txt`),
+confirmed by exact whole-line match that they occurred in the file exactly once
+each and nothing else matched, and confirmed no other test-artifact receipts
+(same intruding `worktree_id` `2664e9bb…`) existed beyond those two. The owner's
+command took `receipts.jsonl.lock` (the same `flock`-based exclusive lock
+`appendReceiptIfMissing` uses, so it correctly serialises against the daemon —
+the sole writer to this file — rather than racing it), removed exactly the two
+lines by exact content match (not line number), and verified the removed count
+was exactly 2 before committing the replacement, aborting otherwise. Result:
+"OK removed 2".
+
+Verified post-surgery by the coordinating session:
+- `receipts.jsonl`: 102 → 100 lines, sha256 changed, the two stale lines confirmed
+  absent by the same exact-match check, everything else byte-identical (spot-checked
+  the surrounding lines).
+- `aira confine -- aira reconcile --rebuild` (from the actual repo root, not the
+  common `.git/aira` directory — that path itself correctly refuses with
+  `E_NOT_PROJECT`) now returns `{"ok":true,"code":"OK",...}` with zero mention of
+  `E_JOURNAL_CORRUPT`. The rebuild's `runs` payload still lists 5 stale
+  test-artifact `RUN-*` entries from the same intruding worktree_id — a
+  different table (`runs`, not `receipts.jsonl`) that AIRA-93 was never about and
+  that does not block reconcile — left alone; not a regression, not in scope here.
+
+`aira reconcile --rebuild` can now regenerate the derived SQLite index from
+scratch on this machine, which was this ticket's actual stated harm. AIRA-93 is
+closed.
 
 **Accepted tradeoff, recorded because Sol was right that the old comment
 overclaimed.** The old comment said "discovery needs none of them". A few `GIT_*`
