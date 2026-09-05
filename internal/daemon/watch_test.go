@@ -270,6 +270,15 @@ func TestWatchPeerCloseCancelsAndLongPollDoesNotMonopolizeDB(t *testing.T) {
 	// original wait_ms of 1000 made both vacuous once the backstops grew past a
 	// second, so the poll now runs for the full watch cap and the guard below
 	// asserts it really was still running rather than inferring it from the clock.
+	//
+	// The backstops are then capped under that ceiling, because a backstop longer
+	// than watchWaitCap would be satisfied by the watch simply running out — which is
+	// the regression, not the fix. Scaling alone does not guarantee that: MinBackstop
+	// is 5s and -race multiplies by four, which is already most of the 25s cap.
+	inFlightBudget := testdeadline.Wait(time.Second)
+	if half := watchWaitCap / 2; inFlightBudget > half {
+		inFlightBudget = half
+	}
 	if err := writeFrame(clientConn, RequestFrame{Proto: ProtocolVersion, Scope: scope, Request: core.Request{Verb: "watch", Args: map[string]any{"from": int64(0), "wait_ms": int64(watchWaitCap / time.Millisecond)}}}); err != nil {
 		t.Fatal(err)
 	}
@@ -285,13 +294,13 @@ func TestWatchPeerCloseCancelsAndLongPollDoesNotMonopolizeDB(t *testing.T) {
 			t.Fatal("the watch returned before the concurrent query completed: the query proved nothing about a live long poll")
 		default:
 		}
-	case <-testdeadline.After(time.Second):
+	case <-time.After(inFlightBudget):
 		t.Fatal("long poll monopolized the database connection")
 	}
 	_ = clientConn.Close()
 	select {
 	case <-done:
-	case <-testdeadline.After(150 * time.Millisecond):
+	case <-time.After(inFlightBudget):
 		t.Fatal("peer close did not promptly cancel watch")
 	}
 }

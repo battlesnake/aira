@@ -33,6 +33,7 @@
 package testdeadline
 
 import (
+	"math"
 	"os"
 	"strconv"
 	"sync"
@@ -80,12 +81,18 @@ func Scale() float64 {
 
 // scaleFor is Scale's decision, separated from the environment read so the clamp is
 // directly testable.
+//
+// NaN is refused explicitly rather than left to the comparison. ParseFloat accepts
+// "nan", and NaN < 1 is false, so it would pass the clamp; every subsequent
+// multiplication would then be NaN, the overflow guard in scale would not catch it
+// (NaN > anything is also false), and time.Duration(NaN) is a large NEGATIVE
+// duration — every backstop in the suite would fire instantly.
 func scaleFor(raw string, present bool) float64 {
 	if !present || raw == "" {
 		return raceScale
 	}
 	parsed, err := strconv.ParseFloat(raw, 64)
-	if err != nil || parsed < 1 {
+	if err != nil || math.IsNaN(parsed) || parsed < 1 {
 		return raceScale
 	}
 	return raceScale * parsed
@@ -100,7 +107,7 @@ func Wait(d time.Duration) time.Duration {
 	if d < MinBackstop {
 		d = MinBackstop
 	}
-	return scale(d)
+	return scaleWith(d, Scale())
 }
 
 // After is time.After(Wait(d)): the drop-in replacement for a bare time.After used as
@@ -116,7 +123,7 @@ func After(d time.Duration) <-chan time.Time {
 // Unlike Wait it applies no floor: the caller's budget is meaningful, and raising it
 // to MinBackstop would delete the assertion.
 func Exceeded(elapsed, budget time.Duration) bool {
-	return elapsed > scale(budget)
+	return elapsed > scaleWith(budget, Scale())
 }
 
 // Eventually polls cond until it reports true or the scaled backstop for budget
@@ -153,16 +160,26 @@ func eventuallyWithin(tb testing.TB, backstop time.Duration, cond func() bool, f
 	}
 }
 
-// scale multiplies d by Scale, guarding the float conversion against overflow of the
-// int64 nanosecond representation.
-func scale(d time.Duration) time.Duration {
-	factor := Scale()
+// scaleWith multiplies d by factor, guarding the float conversion against overflow of
+// the int64 nanosecond representation.
+//
+// factor is a parameter rather than a call to Scale so this arithmetic is testable at
+// factors the default build never uses: in a plain `go test` with no environment
+// override the factor is exactly 1, and a scale function that ignored its factor
+// entirely — or that inverted the overflow clamp — would pass every test that only
+// exercised the live value.
+func scaleWith(d time.Duration, factor float64) time.Duration {
 	if factor <= 1 {
 		return d
 	}
 	scaled := float64(d) * factor
-	if scaled > float64(time.Duration(1<<62)) {
-		return time.Duration(1 << 62)
+	if scaled > float64(maxScaled) {
+		return maxScaled
 	}
 	return time.Duration(scaled)
 }
+
+// maxScaled is the ceiling scaleWith clamps to: large enough that no real deadline
+// reaches it, small enough to stay clear of the int64 nanosecond overflow that would
+// turn a huge deadline into a negative one.
+const maxScaled = time.Duration(1 << 62)

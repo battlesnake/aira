@@ -321,11 +321,12 @@ func TestM20LauncherDefersACKAndBoundsReadiness(t *testing.T) {
 		started := time.Now()
 		launch, err := r.LaunchDetached(context.Background(), Request{Argv: []string{"/bin/true"}, Detach: true}, "")
 		var typed *LaunchError
-		// The budget separates the 20ms readiness timeout from the unbounded wait an
-		// implementation without one would take (the default asserted above is 60s),
-		// so it can be generous without becoming vacuous. A one-second budget had to
-		// cover a real fork/exec as well and was the tight half (AIRA-20).
-		if launch != nil || !errors.As(err, &typed) || typed.Code != "E_RUN_DETACH_FAILED" || testdeadline.Exceeded(time.Since(started), 30*time.Second) {
+		// The budget separates the 20ms readiness timeout from the alternative it must
+		// exclude: an implementation that ignored r.detachReadyTimeout and fell back to
+		// the 60s default asserted above. Five seconds is 250x the timeout under test
+		// and still only 20s under -race's x4, so it stays clear of that 60s on every
+		// configuration — 30s would not have (AIRA-20).
+		if launch != nil || !errors.As(err, &typed) || typed.Code != "E_RUN_DETACH_FAILED" || testdeadline.Exceeded(time.Since(started), 5*time.Second) {
 			t.Fatalf("launch=%+v err=%v elapsed=%s", launch, err, time.Since(started))
 		}
 	})

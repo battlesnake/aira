@@ -614,13 +614,18 @@ func TestAdmitGrantTimeoutRaceCommitsExactlyOnce(t *testing.T) {
 func TestAdmitPeerCloseFreesNextWithoutWaitingForPoll(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(100)
-	// admitTestServer already parks the poll at an hour, so "waited for the next
-	// poll tick" means "never arrives" here. The assertion below used to compare
-	// against defaultAdmitPollInterval instead — a 250ms wall-clock bound this
-	// server never uses, which made a false fail on a loaded box the only way the
-	// bound could ever fire (AIRA-20). The bound is now a scaled backstop against
-	// the hour, and the read carries a deadline so a regression reports rather than
-	// hanging the package.
+	// admitTestServer parks the poll at an hour, so "waited for the next poll tick"
+	// means "never arrives" here. The assertion below used to compare against
+	// defaultAdmitPollInterval instead — a 250ms wall-clock bound this server never
+	// uses, which made a false fail on a loaded box the only way the bound could
+	// ever fire (AIRA-20).
+	//
+	// Widening that bound alone would have been worse than leaving it: b's own
+	// max-wait was 1000ms, so a regression that really did wait for the poll would
+	// hit timeoutAdmitWaiter at ~1s and get a perfectly valid SATURATED rejection
+	// frame — err == nil, elapsed well inside any widened budget, test green on the
+	// regression it is named after. So both connections now wait to the ceiling, and
+	// the frame is checked to be a grant rather than merely to have arrived.
 	server := admitTestServer(&maximum)
 	handoffBudget := testdeadline.Wait(30 * time.Second)
 	aServer, aClient := net.Pipe()
@@ -629,7 +634,7 @@ func TestAdmitPeerCloseFreesNextWithoutWaitingForPoll(t *testing.T) {
 	go func() {
 		defer close(aDone)
 		defer aServer.Close()
-		server.admitConnection(aServer, validAdmitArgs(100, 1000))
+		server.admitConnection(aServer, validAdmitArgs(100, admitWaitCeilingMs))
 	}()
 	var aFrame ResponseFrame
 	if err := readFrame(aClient, &aFrame); err != nil {
@@ -638,7 +643,7 @@ func TestAdmitPeerCloseFreesNextWithoutWaitingForPoll(t *testing.T) {
 	go func() {
 		defer close(bDone)
 		defer bServer.Close()
-		server.admitConnection(bServer, validAdmitArgs(100, 1000))
+		server.admitConnection(bServer, validAdmitArgs(100, admitWaitCeilingMs))
 	}()
 	_ = bClient.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
 	var early ResponseFrame
@@ -653,6 +658,11 @@ func TestAdmitPeerCloseFreesNextWithoutWaitingForPoll(t *testing.T) {
 		t.Fatalf("peer close did not hand the slot over within %v (poll=%v): %v", handoffBudget, server.admitPollInterval, err)
 	}
 	_ = bClient.SetReadDeadline(time.Time{})
+	// A grant, not merely a frame: a saturated rejection is also a well-formed frame
+	// that readFrame accepts, and it is exactly what a regressed handoff would send.
+	if grant := admitGrantData(t, bFrame); grant.State != "waited" {
+		t.Fatalf("peer-close handoff produced %+v, want a waited grant", grant)
+	}
 	if elapsed := time.Since(closedAt); elapsed >= handoffBudget {
 		t.Fatalf("peer-close handoff=%v poll=%v", elapsed, server.admitPollInterval)
 	}

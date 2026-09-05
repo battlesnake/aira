@@ -2,6 +2,7 @@ package testdeadline
 
 import (
 	"fmt"
+	"math"
 	"testing"
 	"time"
 )
@@ -28,6 +29,14 @@ func TestScaleIsTheRaceMultiplierTimesTheEnvironment(t *testing.T) {
 		{name: "zero is refused", raw: "0", want: raceScale},
 		{name: "negative is refused", raw: "-4", want: raceScale},
 		{name: "unparseable is refused", raw: "soon", want: raceScale},
+		// ParseFloat accepts "nan" and NaN < 1 is false, so a bare comparison would
+		// let it through; every deadline would then be NaN and time.Duration(NaN) is
+		// a large NEGATIVE duration, firing every backstop in the suite instantly.
+		{name: "NaN is refused", raw: "nan", want: raceScale},
+		{name: "NaN with sign is refused", raw: "-NaN", want: raceScale},
+		// +Inf is refused by the overflow clamp in scaleWith rather than here, so it
+		// is safe to accept; pin that it does not change the clamp's job.
+		{name: "positive infinity survives the clamp", raw: "inf", want: math.Inf(1)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := scaleFor(test.raw, !test.unset); got != test.want {
@@ -58,7 +67,11 @@ func TestScaleIsReadOnceAndMatchesTheEnvironment(t *testing.T) {
 //
 // verifies: AIRA-20
 func TestWaitFloorsShortBackstopsAndKeepsLongOnes(t *testing.T) {
-	scale := time.Duration(Scale())
+	// The expectation is computed in float, not by multiplying two Durations: a
+	// Duration conversion truncates, so AIRA_TEST_DEADLINE_SCALE=2.5 — the documented
+	// way to widen deadlines on a slow runner, and a value this package's own table
+	// accepts — would compare against 2× and fail every subtest.
+	scaled := func(d time.Duration) time.Duration { return time.Duration(float64(d) * Scale()) }
 	for _, test := range []struct {
 		name string
 		in   time.Duration
@@ -75,8 +88,8 @@ func TestWaitFloorsShortBackstopsAndKeepsLongOnes(t *testing.T) {
 			if got < test.want {
 				t.Fatalf("Wait(%v)=%v, want at least %v", test.in, got, test.want)
 			}
-			if got < test.want*scale || got > test.want*scale+time.Second {
-				t.Fatalf("Wait(%v)=%v, want ~%v at scale %v", test.in, got, test.want*scale, Scale())
+			if want := scaled(test.want); got < want || got > want+time.Second {
+				t.Fatalf("Wait(%v)=%v, want ~%v at scale %v", test.in, got, want, Scale())
 			}
 		})
 	}
@@ -110,17 +123,52 @@ func TestWaitIsMonotonicAndNeverShortensNegatives(t *testing.T) {
 //
 // verifies: AIRA-20
 func TestExceededScalesTheBudgetWithoutFlooringIt(t *testing.T) {
-	scale := time.Duration(Scale())
 	const budget = 100 * time.Millisecond
-	if Exceeded(budget*scale-time.Millisecond, budget) {
+	scaledBudget := time.Duration(float64(budget) * Scale())
+	if Exceeded(scaledBudget-time.Millisecond, budget) {
 		t.Fatal("an observation inside the scaled budget was reported as exceeding it")
 	}
-	if !Exceeded(budget*scale+time.Second, budget) {
+	if !Exceeded(scaledBudget+time.Second, budget) {
 		t.Fatal("an observation well past the scaled budget was not reported")
 	}
 	// The floor is deliberately absent: a 100ms budget must not become a 5s one.
 	if !Exceeded(MinBackstop, budget) {
 		t.Fatalf("Exceeded floored a %v budget up to MinBackstop, deleting the assertion", budget)
+	}
+}
+
+// TestScaleWithMultipliesAndClampsAtEveryFactor covers the arithmetic the default
+// build cannot reach. `make test` runs without -race and without the environment
+// override, so the live factor is exactly 1 and scaleWith returns its input
+// untouched: a version that dropped the multiplication, or that inverted the overflow
+// clamp, would pass every other test in this file. Driving the factor directly is the
+// only thing that can fail against those.
+//
+// verifies: AIRA-20
+func TestScaleWithMultipliesAndClampsAtEveryFactor(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		in     time.Duration
+		factor float64
+		want   time.Duration
+	}{
+		{name: "factor one is identity", in: 7 * time.Second, factor: 1, want: 7 * time.Second},
+		{name: "factor below one never shortens", in: 7 * time.Second, factor: 0.25, want: 7 * time.Second},
+		{name: "integer factor", in: 3 * time.Second, factor: 4, want: 12 * time.Second},
+		{name: "fractional factor is not truncated", in: 2 * time.Second, factor: 2.5, want: 5 * time.Second},
+		{name: "fractional factor on a fractional result", in: time.Second, factor: 1.5, want: 1500 * time.Millisecond},
+		{name: "overflow is clamped, not wrapped", in: time.Duration(1 << 61), factor: 1000, want: maxScaled},
+		{name: "infinity is clamped, not wrapped", in: time.Second, factor: math.Inf(1), want: maxScaled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := scaleWith(test.in, test.factor)
+			if got != test.want {
+				t.Fatalf("scaleWith(%v, %v)=%v, want %v", test.in, test.factor, got, test.want)
+			}
+			if got < 0 {
+				t.Fatalf("scaleWith(%v, %v)=%v: a negative deadline fires immediately", test.in, test.factor, got)
+			}
+		})
 	}
 }
 
@@ -131,13 +179,13 @@ func TestExceededScalesTheBudgetWithoutFlooringIt(t *testing.T) {
 // verifies: AIRA-20
 func TestEventuallyReturnsOnTheFirstTrueWithoutPolling(t *testing.T) {
 	calls := 0
-	started := time.Now()
 	Eventually(t, time.Hour, func() bool { calls++; return true }, "unreachable")
+	// Exactly one evaluation IS the property: it can only be one if the condition was
+	// checked before the ticker was ever waited on. Asserting the wall-clock elapsed
+	// on top of that would add nothing but a flake of the very class this package
+	// removes, since one goroutine preemption exceeds a 2ms PollInterval.
 	if calls != 1 {
 		t.Fatalf("condition evaluated %d times, want exactly one", calls)
-	}
-	if elapsed := time.Since(started); elapsed > PollInterval {
-		t.Fatalf("an already-true condition waited %v", elapsed)
 	}
 }
 

@@ -205,7 +205,13 @@ func TestExchangeResponseWaitStillBoundsAReplylessDaemon(t *testing.T) {
 		// mistake an EOF for a bound wait. Long enough to outlast the response
 		// budget by ~30x, short enough not to leave a goroutine parked for the
 		// rest of the package's run.
-		time.Sleep(3 * time.Second)
+		//
+		// It scales with the elapsed bound below, because the two are a ratio, not
+		// two independent constants: leaving this fixed while the bound scaled would
+		// let a scaled 4s budget sit ABOVE this sleep, and "returned at the stub's own
+		// EOF" would then satisfy the bound (AIRA-20). The netErr.Timeout() assertion
+		// would still catch it, but the bound would have stopped contributing.
+		time.Sleep(testdeadline.Wait(3 * time.Second))
 	})
 
 	policy := deadlinePolicy{Connect: 5 * time.Second, ResponseWait: 100 * time.Millisecond, Write: time.Second}
