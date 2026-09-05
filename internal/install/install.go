@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"aira/internal/daemon"
-
 	"golang.org/x/sys/unix"
 )
 

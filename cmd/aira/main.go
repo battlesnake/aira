@@ -2593,26 +2593,10 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 		return 3
 	}
 	table := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	// AIRA-102: LIVE + LEAF-PROCS, not a single "POPULATED" column.
-	//
-	// `Populated` is the scope's OWN cgroup.procs count, and a job that relocates
-	// its processes into a child cgroup reads 0 there while very much running --
-	// aitest drains into `<scope>/.aira-supervisor`, and `podman run
-	// --cgroups=split` moves everything into `<scope>/runtime` plus the container
-	// payload. Printing that 0 under a column named POPULATED told an operator the
-	// job was not running. `SubtreePopulated` is the kernel's own subtree-aware
-	// `cgroup.events populated` signal (already collected since AIRA-101, and
-	// already trusted by the kill path and the exclusive gate) and is the honest
-	// answer to "is this alive"; it was simply never rendered here.
-	//
-	// The DATA fields are deliberately left alone: the orphan reaper and the
-	// daemon's reserve reconstruction consume Populated's leaf semantics on
-	// purpose, so this is a FACE-only change.
-	_, _ = fmt.Fprintln(table, "NAME\tOWNER\tSUPERVISOR-PID\tSCOPE-ID\tLIVE\tLEAF-PROCS\tRSS\tAGE\tCAP")
+	_, _ = fmt.Fprintln(table, "NAME\tOWNER\tSUPERVISOR-PID\tSCOPE-ID\tPOPULATED\tRSS\tAGE\tCAP")
 	for _, record := range result.Scopes {
-		_, _ = fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		_, _ = fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			record.Name, record.Owner, confineInt(record.SupervisorPID), record.ScopeID,
-			confineBoolYesNo(record.SubtreePopulated),
 			confineInt(record.Populated), confineInt64(record.RSSBytes), confineAge(record.AgeSeconds), confineString(record.Cap))
 	}
 	if err := table.Flush(); err != nil {
@@ -2761,20 +2745,6 @@ func confineInt(value *int) string {
 		return "unevaluated"
 	}
 	return strconv.Itoa(*value)
-}
-
-// confineBoolYesNo renders the LIVE column (AIRA-102). A nil is "unevaluated",
-// never "no": a population that could not be read is not evidence of a dead job,
-// and rendering it as one is the exact class of fabricated zero this repository
-// forbids.
-func confineBoolYesNo(value *bool) string {
-	if value == nil {
-		return "unevaluated"
-	}
-	if *value {
-		return "yes"
-	}
-	return "no"
 }
 
 // confinePlural keeps the AIRA-68 breakdown line grammatical for a single-member

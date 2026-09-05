@@ -493,20 +493,6 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// and MemoryReservePinned is the one admitConfine puts on the admit wire, so
 	// admission always sees the RESOLVED pair rather than what a caller typed.
 	reserve, pinned := ResolveConfineReserve(request)
-	// AIRA-102. A caller-declared CONTAINER limit may change what this job charges
-	// the shared ledger, but only for docker and only when nothing was declared on
-	// the confine side. Deliberately applied AFTER ResolveConfineReserve so the
-	// declaredReserve/declaredReserveBytes provenance captured above is untouched:
-	// those two decide the scope memory.max further down, and a container-derived
-	// number must never masquerade as a caller-declared cap.
-	//
-	// Podman is skipped entirely. Its container is nested INSIDE this job's own
-	// scope (--cgroups=split), so its memory is already inside whatever the job
-	// reserved; raising would over-book past a binding cap or, unpinned, replace
-	// the daemon's history estimate with a client-pinned guess.
-	containerPlan := PlanContainerIntegration(request.Argv)
-	var containerReserveSkip string
-	reserve, pinned, containerReserveSkip = containerPlan.ResolveReserve(reserve, pinned, request.DelegateRAM, maximum)
 	signature := request.ResourceSignature
 	if signature == "" {
 		if computed, signatureErr := ResourceSignature(nil, nil, request.Argv); signatureErr == nil {
@@ -914,44 +900,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	if self == "" {
 		self = "/proc/self/exe"
 	}
-	// AIRA-102. Container integration happens HERE, at the launch site, for two
-	// reasons: scopeMemoryMax is only final by this point (the daemon-estimate cap
-	// is assigned above), and the ResourceSignature was already computed from the
-	// ORIGINAL argv, so peak-RSS history keys do not fork the day AIRA starts
-	// injecting a flag. request.Argv itself is never rewritten -- the durable
-	// detached-job record keeps what the caller actually typed.
-	// The DECLARED cap, never the resolved scope cap (build review, Fable P0).
-	// On an unpinned daemon grant scopeMemoryMax is a peak-RSS estimate, and for
-	// docker that estimate tracks the CLI, not the container -- injecting it caps
-	// the user's container at tens of megabytes, forever and unrecoverably. Only
-	// a number the caller chose may be imposed on their container.
-	declaredContainerCap := request.ScopeMemoryMax
-	// The !DelegateRAM guard mirrors the scope-cap assignment above, and for the
-	// same reason (build review, Fable): under --delegate-ram a declared
-	// --memory-reserve is the pinned FRAMEWORK OVERHEAD, not a cap -- the scope's
-	// own memory.max is the much larger delegate ceiling. Without this guard,
-	// `--delegate-ram --memory-reserve 512M -- podman run img pytest ...` (the
-	// SKILL's own recommended pytest idiom) would inject `--memory=536870912`
-	// into a container whose scope allows 16G, and OOM-kill it at 512M. Under
-	// delegate-ram only an explicit --memory-max is a declared cap.
-	if declaredContainerCap <= 0 && declaredReserve && !request.DelegateRAM {
-		declaredContainerCap = declaredReserveBytes
-	}
-	containerInjection := containerPlan.Inject(request.Argv, declaredContainerCap)
-	if containerPlan.Detected() {
-		result.Status.Container = containerInjection.Placement
-		// The ledger charge is real only on a daemon grant. This is the SAME
-		// predicate the scope-cap assignment above uses; the flock fallback
-		// reports state "immediate"/"waited" WITH a lock and is a slice
-		// free-memory check, so a facet keyed on admission.state would claim a
-		// charge that never happened.
-		ledgerCharged := admitted && admission.lock == nil && admission.release != nil
-		result.Status.ContainerMemory = ContainerMemoryFacet(containerPlan, containerInjection, containerReserveSkip, ledgerCharged)
-		for _, advisory := range ContainerAdvisories(containerPlan, containerInjection, scopeMemoryMax, result.Status.ReserveBasis) {
-			_, _ = fmt.Fprintln(diagnostics, advisory)
-		}
-	}
-	setupArgv, err := confineSetupArgv(containerInjection.Argv, request.DelegateRAM)
+	setupArgv, err := confineSetupArgv(request.Argv, request.DelegateRAM)
 	if err != nil {
 		return result, err
 	}
@@ -1138,16 +1087,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		usage.PeakRSS = nil
 	}
 	result.Status.PeakRSS = usage.PeakRSS
-	// The HIERARCHICAL counter, kept deliberately for reportPeak below: an OOM
-	// anywhere in the job is a signal that the estimate was low, which is an
-	// estimate-quality input rather than a claim made to an operator. AIRA-102
-	// records the consequence rather than hiding it (plan L6): a container OOM at
-	// a caller's small `--memory` marks this signature's history `oom`, and
-	// EstimateMemoryReserve then bumps future estimates to headroom.
 	oom := usage.OOMKill != nil && *usage.OOMKill > 0
-	// The OPERATOR-facing attribution is a different question and is classified,
-	// never assumed from the hierarchical counter (AIRA-102).
-	oomAttribution := classifyConfineOOM(usage)
 	if signature != "" {
 		reportCtx, cancelReport := context.WithTimeout(context.Background(), 250*time.Millisecond)
 		_ = deps.reportPeak(reportCtx, request, signature, usage.PeakRSS, oom)
@@ -1172,16 +1112,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		result.Status.Exclusive = ConfineExclusiveLost
 	}
 	_, _ = fmt.Fprintln(diagnostics, FormatConfineStatus(result.Status))
-	// Only an OWN-limit OOM may reach the "job OOM-killed at its memory cap" line
-	// (AIRA-102). Its other branch -- peak RSS near the cap -- is unaffected.
-	if advisory := formatConfineReserveAdvisory(result.Status.ScopeMemoryMax, result.Status.PeakRSS, confineOwnCapAdviceWarranted(usage)); advisory != "" {
-		_, _ = fmt.Fprintln(diagnostics, advisory)
-	}
-	// The remaining attributions get their OWN line, deliberately NOT gated on
-	// scopeMemoryMax: formatConfineReserveAdvisory returns "" for an uncapped
-	// scope, so inheriting its gate would make a container OOM inside an uncapped
-	// job silent again -- exactly the silence this classification exists to end.
-	if advisory := formatConfineOOMAttributionAdvisory(result.Status.TerminatedBy, oomAttribution, usage); advisory != "" {
+	if advisory := formatConfineReserveAdvisory(result.Status.ScopeMemoryMax, result.Status.PeakRSS, oom); advisory != "" {
 		_, _ = fmt.Fprintln(diagnostics, advisory)
 	}
 	// A separate line from the reserve advisory above, which stays cap-gated and
@@ -1194,86 +1125,6 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		_, _ = fmt.Fprintln(diagnostics, advisory)
 	}
 	return result, nil
-}
-
-// confineOwnCapAdviceWarranted reports whether "job OOM-killed at its memory
-// cap" is a claim this scope's counters actually support (AIRA-102).
-//
-// It fires only when the OOM killer demonstrably killed OUR processes, and is
-// suppressed only when the counters POSITIVELY establish that an ancestor's
-// limit fired instead (the AIRA-27 slice-collateral shape), where "raise your
-// cap" is the wrong advice. An unreadable own-limit counter still warrants the
-// advice: we know this job was OOM-killed, and withholding useful guidance over
-// an unknown refinement would trade a false claim for an unhelpful silence.
-//
-// The case it newly EXCLUDES is the one this ticket is about: a DESCENDANT
-// (a container at its own --memory) OOM-killed while nothing of ours died.
-func confineOwnCapAdviceWarranted(usage cgroupUsage) bool {
-	killed, evaluated := usage.LocalOOM()
-	if !killed || !evaluated {
-		return false
-	}
-	own, ownEvaluated := usage.OwnLimitOOM()
-	// A POSITIVE own-limit declaration is required, not merely the absence of a
-	// negative one (build review, Sol P1). An unreadable `memory.events.local`
-	// `oom` counter cannot establish that OUR cap was the binding one, and the
-	// phrase "OOM-killed at its memory cap <cap>" asserts exactly that. Such a
-	// run is NOT left silent: formatConfineOOMAttributionAdvisory speaks for it
-	// instead, with the same actionable advice minus the unsupported claim.
-	return ownEvaluated && own
-}
-
-// formatConfineOOMAttributionAdvisory speaks for every OOM attribution EXCEPT
-// own-limit, which formatConfineReserveAdvisory already owns and whose wording
-// is unchanged. Each line states exactly what the counters establish and no
-// more; none of them claims a cap value, so none is gated on having one.
-//
-// covers: AIRA-102
-func formatConfineOOMAttributionAdvisory(verdict string, attribution ConfineOOMAttribution, usage cgroupUsage) string {
-	// Deliberately silent where the existing advisories already speak, so an
-	// operator never gets two overlapping explanations of one event:
-	//   - the `oom` verdict is owned by formatConfineOOMLimitAdvisory, which
-	//     already names own-limit versus ancestor and is already honestly silent
-	//     when the local counter is unreadable;
-	//   - the unattributed-SIGKILL verdict is owned by
-	//     formatConfineTerminationAdvisory, which already notes a descendant OOM.
-	// The gap they both leave -- and the one AIRA-102 makes routine -- is an OOM
-	// BENEATH this scope on a job that ended any other way, which is exactly what a
-	// container hitting its own --memory looks like: podman exits 0, so the job's
-	// verdict is `normal` and every existing line stays quiet.
-	// The `oom` verdict's own-limit and ancestor attributions are already owned
-	// by formatConfineOOMLimitAdvisory, and the unattributed-SIGKILL verdict by
-	// formatConfineTerminationAdvisory -- speaking here too would duplicate them.
-	// The ONE exception is an `oom` verdict whose attribution is unestablished:
-	// formatConfineOOMLimitAdvisory is deliberately silent there, and since
-	// confineOwnCapAdviceWarranted now also declines that case, staying quiet
-	// would leave a genuine OOM with no explanation at all.
-	if verdict == ConfineTerminatedUnattributedSIGKILL {
-		return ""
-	}
-	if verdict == ConfineTerminatedOOM && attribution != ConfineOOMUnestablished {
-		return ""
-	}
-	kills := int64(0)
-	if usage.OOMKill != nil {
-		kills = *usage.OOMKill
-	}
-	switch attribution {
-	case ConfineOOMDescendant:
-		// Deliberately worded as what the counters establish. "this scope's own
-		// limit did not fire" would be a stronger claim than the evidence
-		// supports: a max-breach can be DECLARED while killing nothing.
-		return fmt.Sprintf("confine: memory.events records %d OOM kill(s) beneath this scope (a descendant's own limit, e.g. a container's --memory); the OOM killer killed nothing belonging to this scope itself", kills)
-	case ConfineOOMAncestor:
-		return fmt.Sprintf("confine: %d OOM kill(s) took this job's processes, but this scope's own limit did not declare the breach — an ancestor's cap fired (e.g. the slice) and this job was the collateral; raising this job's own cap would not have prevented it", kills)
-	case ConfineOOMUnestablished:
-		return fmt.Sprintf("confine: %d OOM kill(s) occurred under this scope; whose limit fired could not be "+
-			"established from this scope's local counters, so this was either this scope's own cap or an "+
-			"ancestor's (the shared slice). If it was this job's own, raise --memory-max (or --memory-reserve); "+
-			"if an ancestor's, the slice was over-committed and raising this job's cap will not help.", kills)
-	default:
-		return ""
-	}
 }
 
 func formatConfineReserveAdvisory(scopeMemoryMax int64, peakRSS *int64, oom bool) string {

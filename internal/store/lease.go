@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"aira/internal/domain"
-
 	"golang.org/x/sys/unix"
 )
 
