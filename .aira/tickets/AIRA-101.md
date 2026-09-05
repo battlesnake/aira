@@ -1,0 +1,25 @@
+---
+{"schema":1,"id":"AIRA-101","project":"aira","title":"aira confine --exclusive: let a job request exclusive use of its slice for uncontended benchmarking","status":"planned","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","dogfood","scheduler"],"hold":false,"relations":[]}
+---
+Direct owner request (2026-09-05): "we need a way for jobs launched with 'aira confine' to request exclusive use of the slice, so they get scheduled alone with nothing else running in the slice" — for benchmarking, where contention from other admitted jobs (or aitest workers) invalidates a measurement.
+
+## Decided by the owner — binding
+
+**Active drain, not passive wait.** The moment a job requests exclusive access, the daemon stops admitting NEW work into that slice — already-running jobs finish naturally (not killed/interrupted), and once the slice goes empty the exclusive job is admitted alone. This is a bounded wait for the requester, at the cost of holding up other sessions' `aira confine`/`worker-admit` calls in that slice while it drains. Given this machine runs many concurrent sessions, that tradeoff was made deliberately over the alternative (never block anyone, but an exclusive request could wait indefinitely on a busy box) — do not revisit this call without asking again.
+
+## Scope of "exclusive" — needs the plan's own precise definition, but the intent is
+
+Nothing else running in the target slice while the exclusive job runs: no other `aira confine` job-level admission, and no `worker-admit` grants under any OTHER outer scope (an exclusive job's own aitest workers are fine — it's alone in the slice, so its own worker-admit calls trivially pass whatever governance already exists). The slice is whatever the job resolves via `--slice` (default `aira.slice`), matching every other per-slice admission concept in this codebase.
+
+## Things the plan must resolve, not decided here
+
+1. **Flag name and surface** — `aira confine --exclusive` (or better, if the plan finds one) on the CLI, MCP, and whatever daemon RPC/admission-request shape carries it.
+2. **What other sessions see while draining.** Their `aira confine`/`worker-admit` calls should wait/retry using the SAME shape as ordinary contention (not a hard error) — but the reason reported must be honest and distinct from ordinary saturation (an operator waiting behind a drain needs to know a benchmark is running, not think the slice is merely full). New reason code(s), not an overload of an existing one.
+3. **Crash-safety of the exclusive state itself.** This is the load-bearing correctness question. A pure in-memory "slice X is draining/held exclusive" flag that does not survive a daemon restart, or does not get released when the exclusive job's supervisor dies uncleanly, can wedge the WHOLE shared slice for every session on the machine indefinitely — a far worse failure mode than an ordinary admission bug, because it is global and has no self-healing path once stuck. This project's own precedent (AIRA-39/41's worker-admit ledger, AIRA-74/97's migration guards) is "the cgroup tree is the state, not memory" — the plan must apply the same discipline here: exclusivity should be re-derivable from live process/scope state (who currently holds it, is that process still alive) rather than trusted as a standalone daemon-memory bit. Work out exactly what "holds exclusivity" means in terms of the confine scope/supervisor PID and how a daemon restart, or an abandoned/killed exclusive requester, correctly and promptly un-wedges the slice.
+4. **The exclusive requester's own abandonment.** If the process asking for exclusive access is Ctrl-C'd, crashes, or its own wait exceeds whatever ceiling applies, the drain must release rather than hold the slice hostage for a benchmark that was itself aborted.
+5. **Fairness among multiple exclusive requesters**, and interaction with the existing RAM/reserve admission (AIRA-29's ledger) and AIRA-64's CPU-slots gate — exclusivity is an additional orthogonal gate layered alongside those, not a replacement; an exclusive job still needs to pass its own RAM/CPU admission checks on the merits.
+6. **Visibility.** `aira confine --list` (and whatever else reports slice state) should say plainly when a slice is draining for / held by an exclusive job, matching this project's existing honesty-first precedent (AIRA-73's `--list` reserve-summary line) — an operator whose job is waiting needs to see why, not guess.
+
+## Why this needs the full two-loop
+
+Daemon-side admission/scheduling work is already this project's own named correctness-critical class (CLAUDE.md: "mandatory for ID allocation, crash recovery, lease CAS, and other correctness-critical work"). This is a new coordination primitive that, done wrong, can deadlock a shared machine-wide resource for every concurrent session — treat with at least the rigor of AIRA-64/74/97 tonight (plan, Fable gate, TDD build, adversarial build-review, merge only once both loops are satisfied).
