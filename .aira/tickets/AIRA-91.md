@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-91","project":"aira","title":"confine's trailer is indistinguishable from a clean run when systemd-oomd SIGKILLs the whole scope (ROOT CAUSE CONFIRMED — was never exit 0)","status":"planned","kind":"bug","severity":"P0","assignee":null,"milestone":null,"labels":["aitest","confine","dogfood","honesty"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-91","project":"aira","title":"confine's trailer is indistinguishable from a clean run when systemd-oomd SIGKILLs the whole scope (ROOT CAUSE CONFIRMED — was never exit 0)","status":"done","kind":"bug","severity":"P0","assignee":null,"milestone":null,"labels":["aitest","confine","dogfood","honesty"],"hold":false,"relations":[]}
 ---
 ## Symptom (reported by peer session `qual`, fastest-ee's `hosted` leg, two independent reproductions)
 
@@ -751,3 +751,34 @@ configured ceiling itself should be reduced to match the machine (AIRA-103 makes
 this measurable but does not change `aira install --memory-max`), and AIRA-16
 half (2)'s slice-*internal* pressure trigger, which is a kill decision and is
 still deliberately unbuilt pending its own owner call.
+
+## Closed (2026-09-05) — every residual now has its own owner-decided home
+
+Per this ticket's own housekeeping recommendation (backlog-completion triage,
+2026-09-05): the P0/bug framing no longer describes anything open. Part A (the
+honesty defect this ticket was filed for) is done, deployed, and independently
+re-verified twice. Every Part B residual named above has since been resolved by
+the owner, each on its own ticket rather than carried here indefinitely:
+
+- **The ceiling formula.** The owner rejected both "flip AIRA-103 to enforce
+  as-is" and "just lower `--memory-max`" and specified a better one: a
+  two-parameter model — "leave `X` GB on the table" (a static maximum reserve)
+  and "leave `Y` GB free" (a dynamic floor), with the effective ceiling being
+  `min(TotalRAM − X, currentUsage + (MemAvailable − Y))`. AIRA-103's own
+  formula (`min(MemTotal/4, 16 GiB)` as a single blended headroom) is being
+  replaced with this explicit model and then enabled. Filed as **AIRA-106**.
+- **AIRA-16 half (2)** (slice-internal kill trigger) is closed as
+  close-superseded, not "pending an owner call" as this ticket previously said
+  — the owner's own Part B principle plus the project's architectural-
+  simplicity rule already determine the answer (no second AIRA-side kill
+  subsystem duplicating the owner-blessed oomd backstop).
+- **AIRA-29** (track-actual reserve charging) is unblocked: the owner chose to
+  accept bounded over-subscription (real usage charged, contained by each
+  scope's own `memory.max` + steered `oom_score_adj`, no `memory.high`
+  soft-throttle) over keeping today's airtight-but-wasteful non-delegate
+  charging. Building now.
+- **AIRA-35** (aitest worker `memory.high` convergence) was independently
+  confirmed unblocked by the same Part B ruling — every candidate fix is
+  AIRA-side and compliant. Building now.
+
+No residual remains that only the owner can decide. AIRA-91 is done.
