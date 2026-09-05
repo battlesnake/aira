@@ -156,7 +156,7 @@ if !present: return nil              -- fast path, no write lock
 
 withImmediate:                       -- BEGIN IMMEDIATE
     if !searchFTSTableExists(ctx, conn): return nil     -- the losing racer no-ops
-    DROP TABLE search_fts                               -- ~1.7-2.3 s write-lock hold
+    DROP TABLE search_fts                               -- 0.14-0.15 s write-lock hold
 
 checkpointTruncate()                 -- ERASURE BARRIER (see below)
 VACUUM                               -- space reclamation only, 40.8 MB -> 15.1 MB
@@ -443,8 +443,8 @@ Changed:
 | --- | --- |
 | Migration leaves secrets behind | Probe-verified against raw file bytes with a needle that exists only in the FTS index, and a load-bearing "present before" assertion; `secure_delete(ON)` + `DROP` + `wal_checkpoint(TRUNCATE)`. |
 | Erasure checkpoint fails and the migration cannot retry | §4.2: `RedactRant`'s own `checkpointTruncate` completes it, or reports `E_RANT_REDACTION_INCOMPLETE`. Test 5b. |
-| Long write-lock hold hard-fails a concurrent opener (AIRA-97's busy-timeout note) | Recipe chosen on this basis: 1.7-2.3 s inside `BEGIN IMMEDIATE` against a 5 s `busy_timeout`, not the 8.6 s fts5-`DELETE` route. `VACUUM` runs outside the transaction. |
-| Migration is slow enough to look like a hang | Measured ~2 s in-transaction plus ~3 s VACUUM on the largest database on this machine, once. Noted in the doc comment. |
+| Long write-lock hold hard-fails a concurrent opener (AIRA-97's busy-timeout note) | Recipe chosen on this basis: **0.14-0.15 s** inside `BEGIN IMMEDIATE` against a 5 s `busy_timeout`, not the fts5-`DELETE` route's 3.88-5.76 s. `VACUUM` runs outside the transaction. |
+| Migration is slow enough to look like a hang | Measured **0.24-0.27 s end to end** on the largest database on this machine, once. (An earlier draft of this table said ~2 s + ~3 s; those were the RAM-starved figures, corrected in §4.2.) |
 | Migration fails and bricks `Open` | Only the `DROP` transaction is fatal, and it leaves the table present so the next `Open` retries. Past the erasure barrier nothing fails `Open` (§4.2). The table is **disposable**; there is no data to lose. |
 | First post-upgrade daemon start exceeds the client's 5 s `startWait` | Not a risk at the chosen recipe: measured **0.24-0.27 s** end to end, ~20x margin. It *would* have been one at the fts5-`DELETE` recipe's 3.9-5.9 s, which is part of why that recipe was rejected. |
 | Mixed old/new binary window | Accepted and stated: an old-binary opener re-creates `search_fts` via its own `ensureSearchFTS` and its greps repopulate rant bodies, which a new-binary `RedactRant` will not scrub. It self-heals at the next new-binary `Open` because the migration is presence-keyed, and old-binary `Search`/`Redact`/`Rebuild`/`Eject` against a migrated DB fail honestly with `no such table` rather than silently. Per the project's standing "AIRA is not live — no compat" rule, no further mitigation. |

@@ -193,6 +193,11 @@ func TestSearchDropsRemovedCanonicalEntitiesOnTheNextQuery(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// Both must genuinely match BEFORE the removal, or the assertion that they
+	// stop matching is satisfied by any Search that returns nothing at all.
+	if rows, err := s.Search(context.Background(), "ephemeral", ""); err != nil || len(rows) != 2 {
+		t.Fatalf("fixture is not load-bearing: pre-removal grep = %#v, %v", rows, err)
+	}
 	if err := os.Remove(filepath.Join(s.root, ".aira", "tickets", ticket.ID+".md")); err != nil {
 		t.Fatal(err)
 	}
@@ -220,6 +225,40 @@ func TestSearchRejectsMalformedFTSQuery(t *testing.T) {
 	for _, query := range []string{`"unterminated`, `nosuch:term`, `alpha AND (`} {
 		if _, err := s.Search(context.Background(), query, ""); ErrorCode(err) != "E_QUERY_INVALID" || codes.ExitForCode(ErrorCode(err)) != 2 {
 			t.Fatalf("malformed query %q error = %v", query, err)
+		}
+	}
+}
+
+// TestSearchRejectsQueriesNamingTheRetiredIndexColumns is a CHARACTERISATION
+// test for the one place where AIRA-74 is not result-set-identical.
+//
+// fts5 lets a query name a column (`content: term`). The old persistent index
+// was fts5(project_id, kind, ref_id, worktree_id, content), so `project_id: x`
+// and `worktree_id: x` were valid queries that simply matched nothing (those
+// columns are UNINDEXED). The per-query index is fts5(kind, ref_id, content),
+// so those two names no longer exist and such a query is now rejected as
+// E_QUERY_INVALID instead.
+//
+// This is deliberate and arguably better — they were storage details a caller
+// had no business naming — but it IS a behaviour change, and the ticket's
+// "result sets are identical" claim is qualified by exactly this test. The
+// columns that survive are still queryable, which is what keeps the change
+// narrow rather than a general loss of column syntax.
+func TestSearchRejectsQueriesNamingTheRetiredIndexColumns(t *testing.T) {
+	s := queryTestStore(t)
+	if _, err := s.CreateTicket(context.Background(), testCreateInput("columns", "columnsyntaxneedle")); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{`project_id: main`, `worktree_id: main`} {
+		if _, err := s.Search(context.Background(), query, ""); ErrorCode(err) != "E_QUERY_INVALID" {
+			t.Fatalf("query %q naming a retired column = %v, want E_QUERY_INVALID", query, err)
+		}
+	}
+	// The columns the new index does keep are still addressable, so this is a
+	// narrow retirement and not a loss of fts5 column syntax.
+	for _, query := range []string{`content: columnsyntaxneedle`, `columnsyntaxneedle`} {
+		if rows, err := s.Search(context.Background(), query, ""); err != nil || len(rows) != 1 {
+			t.Fatalf("query %q = %#v, %v", query, rows, err)
 		}
 	}
 }

@@ -1,5 +1,16 @@
 # AIRA project lifecycle — adopt & eject
 
+> **Superseded in part by AIRA-74 (2026-09-05).** Every reference below to the
+> persistent FTS5 virtual table `search_fts` — eject's explicit
+> `DELETE FROM search_fts WHERE project_id=?` delete-through, `Rebuild`'s
+> delete-and-rebuild, and the schema-ownership test's `search_fts` exemption —
+> describes a table that no longer exists. `aira grep` now builds a private
+> per-query index in its own in-memory database, and the persistent table was
+> erased and dropped by a migration. Eject has nothing left to delete through,
+> and only the `ejections` exemption remains (the test asserts each exemption
+> EXISTS, so it now also fails if the table ever returns). The reasoning
+> recorded below is left intact as history.
+
 > **Plan v2** — folds the plan-gate (Sol BLOCK + DeepSeek BLOCK + Fable
 > code-grounded GATE-FAIL, all three converging). The design *shape* is
 > confirmed sound (the one-transaction cascade is the leanest primitive; adopt

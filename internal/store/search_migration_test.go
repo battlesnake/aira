@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"aira/internal/codes"
@@ -50,6 +51,15 @@ func seedLegacySearchFTS(t *testing.T, path, needle string, rows int) {
 			_ = db.Close()
 			t.Fatal(err)
 		}
+	}
+	// One row far larger than a 4 KB page, so the fixture covers OVERFLOW pages
+	// and not only inline cells: secure_delete zeroes both on free, but a
+	// fixture of small rows would never demonstrate it.
+	overflow := strings.Repeat("overflowpadding ", 2000) + needle + strings.Repeat(" trailing", 500)
+	if _, err := db.Exec(`INSERT INTO search_fts(project_id,kind,ref_id,worktree_id,content) VALUES(?,?,?,?,?)`,
+		"p", "rant", "RANT-overflow", "main", overflow); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
 	}
 	var busy, frames, done int
 	if err := db.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &frames, &done); err != nil {
@@ -95,6 +105,18 @@ func TestSearchFTSMigrationErasesAndDropsAPopulatedTable(t *testing.T) {
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// A bystander row in an unrelated table, so the test can tell "erased the
+	// index" from "erased the database".
+	bystander, err := sql.Open("sqlite", writableTestDSN(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bystander.Exec(`INSERT INTO projects(project_id,slug,common_dir,created_at) VALUES('bystander','bystander-project','/tmp/bystander','now')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := bystander.Close(); err != nil {
+		t.Fatal(err)
+	}
 	seedLegacySearchFTS(t, path, needle, 2000)
 	sizeBefore := fileSize(t, path)
 
@@ -105,7 +127,7 @@ func TestSearchFTSMigrationErasesAndDropsAPopulatedTable(t *testing.T) {
 	defer db.Close()
 
 	// The table is gone...
-	present, err := searchFTSTableExists(context.Background(), db.db)
+	present, err := tableExists(context.Background(), db.db, "search_fts")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +144,18 @@ func TestSearchFTSMigrationErasesAndDropsAPopulatedTable(t *testing.T) {
 	if after := fileSize(t, path); after >= sizeBefore {
 		t.Fatalf("pages were not reclaimed: %d -> %d bytes", sizeBefore, after)
 	}
-	// ...and the rest of the schema still works.
+	// ...unrelated data was PRESERVED. A migration that erases the right table
+	// is only half the requirement; VACUUM rewrites the entire database, so
+	// something that dropped or corrupted the rest would otherwise pass every
+	// assertion above.
+	var slug string
+	if err := db.db.QueryRow(`SELECT slug FROM projects WHERE project_id='bystander'`).Scan(&slug); err != nil {
+		t.Fatalf("the migration lost an unrelated row: %v", err)
+	}
+	if slug != "bystander-project" {
+		t.Fatalf("the migration corrupted an unrelated row: slug=%q", slug)
+	}
+	// ...and the schema still accepts writes.
 	if _, err := db.db.Exec(`INSERT INTO projects(project_id,slug,common_dir,created_at) VALUES('after-migration','demo','/tmp/demo','now')`); err != nil {
 		t.Fatalf("schema unusable after the migration: %v", err)
 	}
@@ -168,12 +201,20 @@ func TestSearchFTSMigrationReCheckMakesTheLosingRacerANoOp(t *testing.T) {
 	// test survive deleting the re-check entirely.)
 	ctx := context.Background()
 	s := &Store{db: db.db, dbPath: path}
+	dropped := true
 	if err := s.withImmediate(ctx, func(conn *sql.Conn) error {
-		return dropSearchFTSLocked(ctx, conn)
+		var err error
+		dropped, err = dropSearchFTSLocked(ctx, conn)
+		return err
 	}); err != nil {
 		t.Fatalf("the losing side of the race must be a no-op, got: %v", err)
 	}
-	present, err := searchFTSTableExists(ctx, db.db)
+	if dropped {
+		// It must also REPORT that it dropped nothing, so the caller skips the
+		// erasure barrier and the VACUUM the winner is already performing.
+		t.Fatal("the losing racer reported a drop it did not perform")
+	}
+	present, err := tableExists(ctx, db.db, "search_fts")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,12 +223,15 @@ func TestSearchFTSMigrationReCheckMakesTheLosingRacerANoOp(t *testing.T) {
 	}
 }
 
-// TestSearchFTSTableExistsIsFailClosed pins that the migration's presence probe
-// distinguishes "definitively absent" from "could not establish". The shared
-// hasTable helper collapses any query error into false, which here would be
-// indistinguishable from "already migrated" and would silently skip the erasure
-// while RedactRant's scrub had already been removed.
-func TestSearchFTSTableExistsIsFailClosed(t *testing.T) {
+// TestSearchFTSMigrationFailsClosedOnAnUnreadableSchema pins that the migration
+// PROPAGATES a probe failure instead of treating "cannot establish" as "already
+// migrated". That distinction is load-bearing here in a way it is not for most
+// migrations: silently deciding the table is absent would skip the erasure while
+// RedactRant's scrub has already been deleted.
+//
+// The probe itself is AIRA-97's shared fail-closed tableExists, which has its own
+// guard in migration_guard_test.go; what is asserted here is this call site.
+func TestSearchFTSMigrationFailsClosedOnAnUnreadableSchema(t *testing.T) {
 	base := t.TempDir()
 	path := filepath.Join(base, "state.db")
 	db, err := sql.Open("sqlite", writableTestDSN(path))
@@ -197,16 +241,13 @@ func TestSearchFTSTableExistsIsFailClosed(t *testing.T) {
 	if err := db.Ping(); err != nil {
 		t.Fatal(err)
 	}
+	// A real failure injection, not a stub: the pool is closed.
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// A real failure injection, not a stub: the pool is closed.
-	present, err := searchFTSTableExists(context.Background(), db)
-	if err == nil {
-		t.Fatalf("a probe that cannot establish its result reported present=%v with no error", present)
-	}
-	if present {
-		t.Fatal("a failed probe must not report the table as present")
+	s := &Store{db: db, dbPath: path}
+	if err := s.dropLegacySearchFTS(context.Background()); err == nil {
+		t.Fatal("a migration that cannot read the schema must fail, not proceed as already-migrated")
 	}
 }
 
@@ -232,8 +273,10 @@ func TestSearchFTSMigrationSurvivesAFailedVacuum(t *testing.T) {
 	// ONLY the reclaim stage is intercepted; the erasure barrier still runs for
 	// real. That is what makes the barrier load-bearing in this test: intercept
 	// both and the assertion below would pass whether or not a barrier existed.
+	reclaimAttempted := false
 	searchFTSMigrationHook = func(stage string) (bool, error) {
 		if stage == searchFTSStageReclaim {
+			reclaimAttempted = true
 			return true, errors.New("injected reclaim failure")
 		}
 		return false, nil
@@ -245,12 +288,18 @@ func TestSearchFTSMigrationSurvivesAFailedVacuum(t *testing.T) {
 		t.Fatalf("a failure past the erasure barrier must not fail Open: %v", err)
 	}
 	defer db.Close()
-	present, err := searchFTSTableExists(context.Background(), db.db)
+	present, err := tableExists(context.Background(), db.db, "search_fts")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if present {
 		t.Fatal("the drop did not happen")
+	}
+	// The failure has to have been REACHED: a migration that silently skipped
+	// reclamation altogether would satisfy "Open survived a failed VACUUM"
+	// without ever attempting one.
+	if !reclaimAttempted {
+		t.Fatal("reclamation was never attempted, so this test proves nothing about its failure")
 	}
 	// And this is what makes the BARRIER load-bearing rather than incidental:
 	// with reclamation failing, the erasure must already be complete, because
@@ -339,6 +388,89 @@ func TestRedactionErasesALegacyRantBodyAfterMigration(t *testing.T) {
 	}
 }
 
+// TestRedactionErasesARESURRECTEDLegacyIndex closes the mixed-binary window an
+// adversarial review rated P0: an OLD binary opening the same database
+// re-creates search_fts and its greps repopulate it, and a long-lived
+// new-binary daemon does not re-run the migration until it restarts. Without a
+// defence, a redaction served in that window returns SUCCESS while the body
+// sits in LIVE rows of the resurrected table — which no checkpoint can erase,
+// because the rows are not deleted pages.
+//
+// Mutation check: removing RedactRant's `DROP TABLE IF EXISTS search_fts` fails
+// this test.
+func TestRedactionErasesARESURRECTEDLegacyIndex(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "repo")
+	state := filepath.Join(base, "state")
+	for _, dir := range []string{root, state} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := filepath.Join(state, "state.db")
+	const secret = "ghp_resurrected_index_secret_zzz"
+
+	s, err := Open(context.Background(), Options{
+		Root: root, CommonDir: filepath.Join(base, "common"), DBPath: path,
+		RegistryPath: filepath.Join(state, "registry.jsonl"), ProjectID: "p", WorktreeID: "main",
+		ProjectSlug: "demo", Prefixes: []string{"AIRA"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	rant, err := s.AddRant(context.Background(), domain.RantInput{Body: "pasted " + secret, Actor: "terra"}, gitcontext.GitContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A second rant that must survive: redaction scrubs one rant, not all of them.
+	bystander, err := s.AddRant(context.Background(), domain.RantInput{Body: "bystanderrantbody", Actor: "terra"}, gitcontext.GitContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// An old binary re-creates the index and a grep repopulates it.
+	if _, err := s.db.Exec(legacySearchFTSDDL); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO search_fts(project_id,kind,ref_id,worktree_id,content) VALUES(?,?,?,?,?)`,
+		s.projectID, "rant", rant.Rant.ID, "main", "pasted "+secret); err != nil {
+		t.Fatal(err)
+	}
+	var live int
+	if err := s.db.QueryRow(`SELECT count(*) FROM search_fts WHERE instr(content,?)>0`, secret).Scan(&live); err != nil {
+		t.Fatal(err)
+	}
+	if live != 1 {
+		t.Fatalf("fixture is not load-bearing: the resurrected index holds %d rows with the secret", live)
+	}
+
+	if _, err := s.RedactRant(context.Background(), rant.Rant.ID); err != nil {
+		t.Fatalf("redact: %v", err)
+	}
+	// The resurrected table must not still hold the body as a LIVE row.
+	var resurrected int
+	if err := s.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='search_fts'`).Scan(&resurrected); err != nil {
+		t.Fatal(err)
+	}
+	if resurrected != 0 {
+		var remaining int
+		if err := s.db.QueryRow(`SELECT count(*) FROM search_fts WHERE instr(content,?)>0`, secret).Scan(&remaining); err != nil {
+			t.Fatal(err)
+		}
+		t.Fatalf("a resurrected search_fts survived redaction with %d rows holding the secret", remaining)
+	}
+	for _, suffix := range []string{"", "-wal"} {
+		if rawFileContains(t, path+suffix, secret) {
+			t.Fatalf("the secret survives in %s after redaction", path+suffix)
+		}
+	}
+	// The bystander rant is untouched: redaction scrubs one rant, not the table.
+	if got, err := s.GetRant(bystander.Rant.ID); err != nil || got.Body != "bystanderrantbody" || got.Redacted {
+		t.Fatalf("redaction damaged an unrelated rant: %#v, %v", got, err)
+	}
+}
+
 // TestGrepServesAReadOnlyStore is checklist item 2 of AIRA-74, and the test the
 // reverted attempt would have failed.
 //
@@ -385,6 +517,21 @@ func TestGrepServesAReadOnlyStore(t *testing.T) {
 	if err := writable.Close(); err != nil {
 		t.Fatal(err)
 	}
+
+	// Make the database file itself read-only on disk for the duration. Without
+	// this the test would pass against an implementation that quietly reopened
+	// the file writable and built a persistent index there: query_only is a
+	// connection flag, not a filesystem one. With it, any write into the
+	// database fails outright.
+	//
+	// The DIRECTORY deliberately stays writable: a read-only open of a
+	// WAL-mode database legitimately needs to manage its -shm sidecar, and
+	// locking that down yields SQLITE_READONLY_DIRECTORY (1544) for reasons
+	// that have nothing to do with what is being asserted here.
+	if err := os.Chmod(dbPath, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dbPath, 0o600) })
 
 	readOnly, err := OpenReadOnly(dbPath, ScopeOptions{
 		Root: root, CommonDir: common, GitDir: gitDir, ProjectID: projectID, WorktreeID: worktreeID,

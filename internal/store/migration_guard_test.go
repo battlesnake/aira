@@ -484,14 +484,10 @@ func TestSchemaProbesFailClosedAndAnswerBothDirections(t *testing.T) {
 		t.Fatal("findingsHasCompositePrimaryKey must surface a probe error — its answer selects a destructive rebuild branch")
 	}
 
-	// The fail-open wrappers still collapse, deliberately: that is the
-	// documented behaviour ensureSearchFTS depends on until AIRA-74 rewrites it.
-	if hasTableColumn(ctx, conn, "outbox", "kind") {
-		t.Fatal("hasTableColumn must report false on an unanswerable probe")
-	}
-	if hasTable(ctx, conn, "outbox") {
-		t.Fatal("hasTable must report false on an unanswerable probe")
-	}
+	// The fail-OPEN wrappers hasTable/hasTableColumn used to be asserted here,
+	// deliberately kept for ensureSearchFTS alone. AIRA-74 rewrote that function
+	// into dropLegacySearchFTS, which uses the fail-closed probes above, so both
+	// wrappers were deleted and there is nothing fail-open left to assert.
 
 	base := t.TempDir()
 	db, err := OpenDB(filepath.Join(base, "state.db"), filepath.Join(base, "registry.jsonl"))

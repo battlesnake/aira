@@ -1506,28 +1506,12 @@ func tableExists(ctx context.Context, db schemaQuerier, table string) (bool, err
 	return exists, nil
 }
 
-// hasTableColumn is the fail-OPEN form of tableHasColumn: it collapses a probe
-// error into "absent". It is retained for exactly one production caller,
-// ensureSearchFTS, whose own unguarded check-then-CREATE is AIRA-97 Finding 1b
-// and is owned by AIRA-74 — which is rewriting that function, so converting it
-// here would collide with that work. Do not add callers: use tableHasColumn.
-func hasTableColumn(ctx context.Context, db schemaQuerier, table, wanted string) bool {
-	found, err := tableHasColumn(ctx, db, table, wanted)
-	return err == nil && found
-}
-
-// hasTable is the fail-OPEN form of tableExists, retained for the same single
-// caller and the same reason as hasTableColumn. Do not add callers.
-func hasTable(ctx context.Context, db schemaQuerier, table string) bool {
-	exists, err := tableExists(ctx, db, table)
-	return err == nil && exists
-}
-
 // dropLegacySearchFTS erases and removes the persistent `search_fts` table.
 // grep now builds a private per-query index instead (see internal/store/search.go),
 // so the table is dead weight — on this machine it held 24.5 MB across 3801
-// rows, 60% of the whole database, including a second on-disk copy of every
-// rant body duplicated across 40 worktree tags.
+// rows, 60% of the whole database — 720 of those rows re-indexing just 19
+// distinct rants under most of the 40 worktree tags the table had accumulated,
+// only ~8 of which are live worktrees.
 //
 // Removing the schema WITHOUT this migration would be a security regression,
 // not a cleanup: RedactRant's FTS5 secure-delete scrub goes away with the
@@ -1557,43 +1541,60 @@ func hasTable(ctx context.Context, db schemaQuerier, table string) bool {
 //   - The DROP transaction fails closed. The table is still there, so the next
 //     Open retries the whole migration.
 //   - The erasure-barrier checkpoint treats a genuine PRAGMA error as fatal but
-//     a busy result as a diagnostic, not a failure. Failing Open there would buy
-//     one failed daemon start and no retry, and the guarantee does not depend on
-//     it: once the DROP commits the zeroed images are in the WAL, and any later
+//     SILENTLY TOLERATES a busy result — initDB has no diagnostics channel, so
+//     "tolerated" here means exactly that: unobserved, with no trace. Failing
+//     Open instead would buy one failed daemon start and no retry, and the
+//     guarantee does not depend on it: once the DROP commits the zeroed images
+//     are in the WAL, and any later
 //     checkpoint publishes them — including the wal_checkpoint(TRUNCATE) that
 //     RedactRant itself performs on every redaction, which already reports
 //     E_RANT_REDACTION_INCOMPLETE rather than claiming an erasure it did not do.
 //   - VACUUM and its trailing checkpoint are space reclamation past the barrier.
-//     Their failure never fails Open; it means the space is simply never
-//     reclaimed.
+//     Their failure never fails Open, and is likewise silent: it means ~25 MB is
+//     never reclaimed, with nothing recorded anywhere. That is a deliberate
+//     trade, not an oversight — but it is silent, and calling it anything softer
+//     would be untrue.
 //
 // This also closes AIRA-97 Finding 1b by construction. That finding is
 // ensureSearchFTS's unguarded hasTable-then-CREATE, measured failing ~7.5% of
 // six-way concurrent opens with "table search_fts already exists". There is no
 // CREATE here to race. The drop is nevertheless built to AIRA-73's pattern
-// (ensureOutboxResolutionDropped): a fail-closed probe, then the same predicate
-// re-checked inside BEGIN IMMEDIATE so the losing racer is a no-op.
+// (ensureOutboxResolutionDropped): AIRA-97's shared fail-closed tableExists
+// probe, then the same predicate re-checked inside BEGIN IMMEDIATE so the losing
+// racer is a no-op. AIRA-97 left `hasTable`/`hasTableColumn` alive as documented
+// fail-OPEN wrappers for this function alone, and asked whoever rewrote it to
+// finish the job; this change does, so both wrappers are deleted here.
 func (s *Store) dropLegacySearchFTS(ctx context.Context) error {
-	present, err := searchFTSTableExists(ctx, s.db)
+	present, err := tableExists(ctx, s.db, "search_fts")
 	if err != nil {
 		return translateDBError(err)
 	}
 	if !present {
 		return nil
 	}
+	dropped := false
 	if err := s.withImmediate(ctx, func(conn *sql.Conn) error {
-		return dropSearchFTSLocked(ctx, conn)
+		var err error
+		dropped, err = dropSearchFTSLocked(ctx, conn)
+		return err
 	}); err != nil {
 		return err
 	}
-	// Erasure barrier. Past this point nothing may fail Open.
+	if !dropped {
+		// The racer that lost has nothing to erase or reclaim; the winner is
+		// already doing both.
+		return nil
+	}
+	// The erasure barrier. A genuine PRAGMA error here still fails Open; only a
+	// BUSY checkpoint is tolerated, silently, for the reason given above.
 	if err := s.searchFTSMigrationStage(ctx, searchFTSStageBarrier); err != nil {
 		return translateDBError(err)
 	}
-	// Space reclamation. Its failure is deliberately discarded: the erasure is
-	// already complete, the table is already gone, and this stage is one-shot
-	// anyway, so failing Open here would report a security-shaped failure for a
-	// cosmetic one and still never retry.
+	// Past the barrier nothing may fail Open. Space reclamation's failure is
+	// deliberately discarded: the erasure is done, the table is gone, and this
+	// stage is one-shot anyway, so failing Open here would report a
+	// security-shaped failure for a cosmetic one and still never retry. The
+	// cost of that trade is that ~25 MB is then never reclaimed, silently.
 	_ = s.searchFTSMigrationStage(ctx, searchFTSStageReclaim)
 	return nil
 }
@@ -1632,16 +1633,20 @@ func (s *Store) searchFTSMigrationStage(ctx context.Context, stage string) error
 // no-op rather than running DROP TABLE against a table that is already gone and
 // failing its whole Open. Tests call this directly, since going through
 // dropLegacySearchFTS would stop at the fast path and never reach the re-check.
-func dropSearchFTSLocked(ctx context.Context, conn *sql.Conn) error {
-	present, err := searchFTSTableExists(ctx, conn)
+// It reports whether it actually dropped, so the losing racer skips the erasure
+// barrier and the VACUUM the winner is already performing.
+func dropSearchFTSLocked(ctx context.Context, conn *sql.Conn) (bool, error) {
+	present, err := tableExists(ctx, conn, "search_fts")
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !present {
-		return nil
+		return false, nil
 	}
-	_, err = conn.ExecContext(ctx, `DROP TABLE search_fts`)
-	return err
+	if _, err := conn.ExecContext(ctx, `DROP TABLE search_fts`); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // searchFTSMigrationHook is a test-only seam over one post-DROP stage of the
@@ -1652,26 +1657,6 @@ func dropSearchFTSLocked(ctx context.Context, conn *sql.Conn) error {
 // silently suppress the barrier, and would then pass whether or not the barrier
 // existed. Production leaves it nil.
 var searchFTSMigrationHook func(stage string) (bool, error)
-
-// searchFTSTableExists is a fail-closed presence probe, deliberately NOT the
-// shared hasTable helper: that one collapses a query error into `false`, which
-// here is indistinguishable from "already migrated" and would silently skip the
-// erasure while the caller went on to delete RedactRant's scrub. A check that
-// cannot establish its result must say so.
-func searchFTSTableExists(ctx context.Context, q interface {
-	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
-}) (bool, error) {
-	rows, err := q.QueryContext(ctx, `SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_fts'`)
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-	found := rows.Next()
-	if err := rows.Err(); err != nil {
-		return false, err
-	}
-	return found, nil
-}
 
 // checkpointTruncateTolerateBusy folds and truncates the WAL. Unlike
 // Store.checkpointTruncate, which backs a redaction's physical-erasure claim and

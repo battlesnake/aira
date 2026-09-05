@@ -153,7 +153,17 @@ func searchPrivateIndex(ctx context.Context, docs []searchRow, query, kind strin
 	// Each connection to ":memory:" would get its own empty database, so the
 	// pool is pinned to one connection and that connection is held for the
 	// whole build-and-query.
-	db, err := sql.Open("sqlite", "file::memory:")
+	//
+	// temp_store(2) = MEMORY is load-bearing, not decoration. An in-memory
+	// DATABASE does not make SQLite's TEMPORARY storage in-memory: the pinned
+	// driver builds with SQLITE_TEMP_STORE=1, so transient indices and the
+	// ORDER BY sorter may spill to files on disk — and the rows being sorted
+	// here include rant bodies and their snippets. A rant redacted immediately
+	// after a concurrent grep took its snapshot would then have its body sitting
+	// in a spill file that nothing scrubs. Forcing MEMORY removes that path
+	// entirely. (Process memory itself — swap, a core dump — is explicitly NOT
+	// covered by the erasure guarantee; closing SQLite does not scrub RAM.)
+	db, err := sql.Open("sqlite", "file::memory:?_pragma=temp_store(2)")
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrSearchUnevaluated, err)
 	}

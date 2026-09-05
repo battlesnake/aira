@@ -110,3 +110,38 @@ reproduced the defect with a two-handle probe (`duplicate column name: kind (1)`
 on a stale-schema-cache connection) and found one P1 documentation-honesty
 defect (a comment claiming `(bool, error)` made dropping an error a *compile*
 error — it does not), plus the stale-cache fidelity gap, both fixed.
+
+## Finding 1b — CLOSED by AIRA-74 (2026-09-05)
+
+Closed **by construction**, not by guarding the racing site: AIRA-74 replaced
+`ensureSearchFTS` with `dropLegacySearchFTS`, so the unguarded
+`hasTable`-then-`CREATE VIRTUAL TABLE search_fts` this finding describes — the
+one measured failing 3 of 40 six-way concurrent opens with
+`table search_fts already exists (1)` — **no longer exists anywhere**. `aira grep`
+builds a private per-query index instead, and the persistent table is erased and
+dropped by a migration.
+
+The replacement is still built to this ticket's requested pattern rather than
+relying on the site's disappearance: the shared fail-closed `tableExists` probe
+as a pre-transaction fast path, then the same predicate re-checked inside
+`BEGIN IMMEDIATE` (`dropSearchFTSLocked`) so the losing racer is a no-op. Its
+deterministic guard is `TestSearchFTSMigrationReCheckMakesTheLosingRacerANoOp`,
+shaped like `TestMigrationReCheckMakesTheLosingRacerANoOp` and calling the write
+half directly — which matters: an earlier draft went through the public entry
+point, stopped at the fast path, and stayed green with the re-check deleted. No
+probabilistic race test was added, per this ticket's own warning.
+
+This ticket's hand-off — *"AIRA-74 (or whoever next rewrites `ensureSearchFTS`)
+should convert it to `tableHasColumn`/`tableExists` and delete both wrappers"* —
+is also done: `dropLegacySearchFTS` uses `tableExists`, and the fail-OPEN
+`hasTable`/`hasTableColumn` wrappers are deleted, along with the
+`migration_guard_test.go` assertions that existed only to pin their retained
+fail-open behaviour.
+
+The busy-timeout note in this ticket also drove a design decision in AIRA-74:
+the migration recipe was chosen at 0.14-0.15 s inside `BEGIN IMMEDIATE` rather
+than the fts5 `secure-delete` + `DELETE` alternative's measured 3.88-5.76 s,
+precisely because the latter straddles the 5 s `busy_timeout` — and the daemon
+opens the database before it listens while the client's `startWait` is 5 s.
+
+Findings 1 and 2 were fixed in PR #44 and are unaffected.

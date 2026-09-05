@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-74","project":"aira","title":"aira grep rebuilds the whole FTS index on every query, under a machine-wide lock","status":"in-progress","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["dogfood","performance","query","store"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-74","project":"aira","title":"aira grep rebuilds the whole FTS index on every query, under a machine-wide lock","status":"in-review","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["dogfood","performance","query","store"],"hold":false,"relations":[]}
 ---
 Found during the whole-project simplification review (PR #12). `aira grep` rebuilds the entire FTS index on every single query, and does so under a lock that is machine-wide, not per-project — meaning every session's grep calls, across every project, contend for the same lock and pay full-rebuild cost on every call. Given this project's own dogfooding tonight involved many concurrent sessions calling `aira grep`/`aira review` regularly, this is a real, live performance and contention issue, not theoretical. Not investigated further — needs tracing to the actual FTS rebuild call site and a real fix (incremental indexing, or at minimum a per-project rather than machine-wide lock).
 
@@ -92,7 +92,7 @@ Mutation-verified: restoring index 3 fails it with
 
 Ticket stays OPEN.
 
-## Resolution — built, reviewed, merged (2026-09-05)
+## Resolution — built and reviewed (2026-09-05)
 
 Branch `aira74-grep-private-index` off `3d53158`. Plan:
 `docs/superpowers/plans/2026-09-05-aira74-grep-private-index-plan.md`.
@@ -158,8 +158,10 @@ Live threat-model fact, so nobody over-reads this: `SELECT count(*) FROM rants
 WHERE redacted=1` is **0** on this machine. No pre-redaction secret was
 stranded; the migration is **preventive**. What it removes now is 24.5 MB across
 3801 rows (3023 ticket, 720 rant, 58 finding) — 60% of the whole database, and
-the 720 rant rows are 19 bodies duplicated across 40 worktree tags, most of them
-dead worktrees.
+720 of those rows index just 19 distinct rants, re-indexed under most of the 40
+worktree tags the table had accumulated (only ~8 of which are live worktrees) —
+so the same handful of bodies were stored over and over. It is not an exact
+19x40 because not every worktree had greped every rant.
 
 **2. `OpenReadOnly` — decided in the "make it work" direction, on measurement.**
 Probed directly: on a `mode=ro&query_only(ON)` connection with
@@ -257,3 +259,105 @@ against the wrong column. No regression to flag.
 
 Full suite, exact exit codes recorded in the PR. `go build ./...`, `go vet ./...`
 and `go test ./...` (whole repo, `-count=1`), not targeted subsets.
+
+### Build review — two lineages, both acted on
+
+**Fable: APPROVE-WITH-FINDINGS** (no P0). **Sol: BLOCK** (two P0). Every finding
+from both was either fixed or explicitly answered; nothing was waved through.
+
+**Sol P0-1 — an old opener can defeat a successful redaction.** Real, and the
+one finding that changed the design. An old binary re-creates `search_fts` and
+its greps repopulate it; a long-lived new-binary daemon does not re-run the
+migration until restart, so a redaction in that window would return **success**
+while the body sat in **live rows** of the resurrected table — rows no
+checkpoint can erase, because they are not freed pages. I had documented this as
+an accepted mixed-binary gap under the no-compat rule, and Fable independently
+flagged the same window as a P2 with the same suggested fix. Two reviewers
+converging on one hole, closable by one statement with no new machinery, is not
+a caveat worth keeping: `RedactRant` now runs `DROP TABLE IF EXISTS search_fts`
+inside its existing transaction, which makes the guarantee unconditional rather
+than conditional on which binaries have touched the database.
+Guarded by `TestRedactionErasesARESURRECTEDLegacyIndex`; mutation-verified in
+both directions (removing the DROP fails it, and so does a redaction that
+scrubs every rant instead of the target).
+
+**Sol P0-2 — "in-memory" does not make SQLite's TEMPORARY storage in-memory.**
+Also real. The pinned driver builds with `SQLITE_TEMP_STORE=1`, so transient
+indices and the `ORDER BY` sorter can spill to files on disk — and the rows
+being sorted include rant bodies and their snippets. A rant redacted just after
+a concurrent grep took its snapshot could leave its body in a spill file that
+nothing scrubs. Fixed by opening the private index with `_pragma=temp_store(2)`
+(MEMORY). Process memory itself — swap, a core dump — is explicitly **excluded**
+from the erasure guarantee and now says so in the code.
+
+**Fable P1 — a duplicate probe and two dead helpers.** AIRA-97 merged (PR #44)
+while this was being built, and its own resolution asks whoever next rewrote
+`ensureSearchFTS` to convert it to the new fail-closed probes and delete the
+fail-OPEN `hasTable`/`hasTableColumn` wrappers, which it had kept alive for that
+single caller. This change is that rewrite, so it now uses AIRA-97's shared
+`tableExists` instead of a bespoke duplicate, both wrappers are deleted, and
+`migration_guard_test.go`'s note about them is retired.
+
+**Also fixed from the review round:**
+
+- The erasure barrier's "busy is a diagnostic" wording was an overclaim — there
+  is no diagnostics channel in `initDB`, so it is **silently tolerated**, and
+  the comment now says exactly that rather than something softer. Same for a
+  failed `VACUUM`: ~25 MB is then never reclaimed, silently.
+- `TestSearchDropsRemovedCanonicalEntitiesOnTheNextQuery` never greped *before*
+  removing the files, so a `Search` that returned nothing at all would have
+  passed. It now asserts both entities match first. (Mutation-verified: a
+  `Search` stubbed to return `[]SearchResult{}` now fails it.)
+- The migration test seeded no unrelated rows, so an implementation that erased
+  more than the index would have passed every assertion — `VACUUM` rewrites the
+  whole database, which makes this a live risk, not a theoretical one. A
+  bystander row in `projects` is now seeded and asserted intact.
+- The failed-VACUUM test never checked that reclamation was actually *attempted*,
+  so skipping it entirely would have passed. It now asserts the stage was reached.
+- The read-only test could not tell "did not write" from "wrote successfully": it
+  now `chmod`s the database file to `0o400` for the duration, so any write into
+  it fails outright. (The directory stays writable — a read-only open of a
+  WAL-mode database legitimately manages its `-shm` sidecar, and locking that
+  down yields `SQLITE_READONLY_DIRECTORY` for reasons unrelated to the claim.)
+- The erasure fixture used only ~50-byte rows, so it never demonstrated
+  **overflow-page** zeroing. It now includes one row far larger than a 4 KB page.
+- The losing racer used to run the erasure barrier and a full `VACUUM` for a drop
+  it had not performed; `dropSearchFTSLocked` now reports whether it dropped, and
+  the racer returns early.
+
+**Result-set equivalence has one real counterexample, now pinned rather than
+claimed away.** fts5 lets a query name a column. The old five-column table made
+`project_id: x` and `worktree_id: x` valid queries that matched nothing; the
+three-column private index does not have those names, so such a query is now
+`E_QUERY_INVALID`. Deliberate — they were storage details a caller had no
+business naming — but it is a behaviour change, and
+`TestSearchRejectsQueriesNamingTheRetiredIndexColumns` is the characterisation
+test for it, including the positive half showing `content:` still works. Sol also
+correctly noted the `kind` filter is applied at INSERT time, so a kind-filtered
+query's bm25 corpus is now scope-**and-kind**, not merely scope-only.
+
+**Answered rather than fixed:** Sol's remaining P2s largely take the form "this
+test permits some other wrong implementation". Where the wrong implementation
+would be caught elsewhere (the transaction wrapper is exercised by every `Open`;
+`tableExists`'s own fail-closed guard lives in `migration_guard_test.go`) or
+where the "permitted" behaviour is in fact correct under the new design
+(structural worktree scoping), no change was made. Sol's note that the
+Resolution heading said "merged" before it was merged is correct, and the
+heading was fixed.
+
+**Planned but not built:** the plan's test 5
+(`TestRedactedRantBodyCannotResurfaceInGrep`) was dropped. Its property is
+already covered by the pre-existing
+`TestRantRedactErasesEveryProseSurfaceKeepsProvenance` assertions (3) and (7)
+plus the two new redaction tests, so there is no coverage gap — but a gated
+plan's test list should not shrink silently, so it is recorded here.
+
+**Reproduction of the published live-database numbers.** The 3801 rows / 720
+rant rows / 40.8 -> 15.1 MB / per-recipe timings are one-off observations taken
+against `sqlite3` backup copies of `~/.local/state/aira/state.db` under
+`aira confine --memory-reserve 512M`, not against the live file. They are not
+reproducible from the repository, because the database they describe is not in
+it. `internal/store/search_cost_test.go` is the committed, executable
+reproduction of the *shape* of both measurements — per-query grep cost and the
+per-stage migration cost — on a synthetic fixture; it is skipped unless
+`AIRA_SEARCH_COST=1` so it never becomes a CI cost.
