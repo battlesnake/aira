@@ -229,8 +229,8 @@ func TestRantRedactErasesEveryProseSurfaceKeepsProvenance(t *testing.T) {
 	if _, err := s.ReviewRant(context.Background(), added.Rant.ID, domain.RantReviewInput{Reviewer: "owner", Outcome: domain.RantOutcomePlanned, Note: "reviewer echoed " + secret}); err != nil {
 		t.Fatal(err)
 	}
-	// Populate the disposable FTS index so the secret is present there too; a
-	// correct redaction must delete those rows now, not wait for a rebuild.
+	// Grep it first: the pre-redaction body must genuinely be reachable, so the
+	// post-redaction assertion below is not vacuous.
 	if rows, err := s.Search(context.Background(), "leaked", "rant"); err != nil || len(rows) != 1 {
 		t.Fatalf("pre-redaction search = %v %#v", err, rows)
 	}
@@ -255,7 +255,6 @@ func TestRantRedactErasesEveryProseSurfaceKeepsProvenance(t *testing.T) {
 	for _, q := range []struct{ label, query string }{
 		{"rants.body", `SELECT COUNT(*) FROM rants WHERE project_id=? AND instr(body,?)>0`},
 		{"rant_reviews.note", `SELECT COUNT(*) FROM rant_reviews WHERE project_id=? AND instr(note,?)>0`},
-		{"search_fts.content", `SELECT COUNT(*) FROM search_fts WHERE project_id=? AND instr(content,?)>0`},
 	} {
 		var n int
 		if err := s.db.QueryRow(q.query, s.projectID, secret).Scan(&n); err != nil {
@@ -265,7 +264,8 @@ func TestRantRedactErasesEveryProseSurfaceKeepsProvenance(t *testing.T) {
 			t.Fatalf("secret survived in %s", q.label)
 		}
 	}
-	// (3) grep no longer surfaces it, even after the reconciling rebuild.
+	// (3) grep no longer surfaces it. The per-query index is rebuilt from
+	// rants.body, which the scrub above already replaced with the sentinel.
 	if rows, err := s.Search(context.Background(), "leaked", "rant"); err != nil || len(rows) != 0 {
 		t.Fatalf("post-redaction search = %v %#v", err, rows)
 	}

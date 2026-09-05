@@ -368,11 +368,8 @@ func TestRebuildPhaseBFailureRollsBackProjectionAndFindings(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	var beforeRelations, beforeFTS, beforeRequirements int
+	var beforeRelations, beforeRequirements int
 	if err := s.db.QueryRow("SELECT count(*) FROM relations WHERE project_id=? AND worktree_id=?", s.projectID, s.worktreeID).Scan(&beforeRelations); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.db.QueryRow("SELECT count(*) FROM search_fts WHERE project_id=? AND worktree_id=?", s.projectID, s.worktreeID).Scan(&beforeFTS); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.db.QueryRow("SELECT count(*) FROM requirements WHERE project_id=? AND worktree_id=?", s.projectID, s.worktreeID).Scan(&beforeRequirements); err != nil {
@@ -402,18 +399,15 @@ func TestRebuildPhaseBFailureRollsBackProjectionAndFindings(t *testing.T) {
 	if count != 0 {
 		t.Fatalf("deferred finding escaped rollback: %d", count)
 	}
-	var afterRelations, afterFTS, afterRequirements int
+	var afterRelations, afterRequirements int
 	if err := s.db.QueryRow("SELECT count(*) FROM relations WHERE project_id=? AND worktree_id=?", s.projectID, s.worktreeID).Scan(&afterRelations); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.db.QueryRow("SELECT count(*) FROM search_fts WHERE project_id=? AND worktree_id=?", s.projectID, s.worktreeID).Scan(&afterFTS); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.db.QueryRow("SELECT count(*) FROM requirements WHERE project_id=? AND worktree_id=?", s.projectID, s.worktreeID).Scan(&afterRequirements); err != nil {
 		t.Fatal(err)
 	}
-	if afterRelations != beforeRelations || afterFTS != beforeFTS || afterRequirements != beforeRequirements {
-		t.Fatalf("projection rollback incomplete: relations %d/%d FTS %d/%d requirements %d/%d", afterRelations, beforeRelations, afterFTS, beforeFTS, afterRequirements, beforeRequirements)
+	if afterRelations != beforeRelations || afterRequirements != beforeRequirements {
+		t.Fatalf("projection rollback incomplete: relations %d/%d requirements %d/%d", afterRelations, beforeRelations, afterRequirements, beforeRequirements)
 	}
 	var details string
 	if err := s.db.QueryRow("SELECT details FROM findings WHERE project_id=? AND worktree_id=? AND finding_key=?", s.projectID, s.worktreeID, "compute:keep").Scan(&details); err != nil {

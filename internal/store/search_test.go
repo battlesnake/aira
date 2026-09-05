@@ -10,6 +10,7 @@ import (
 
 	"aira/internal/codes"
 	"aira/internal/domain"
+	"aira/internal/gitcontext"
 )
 
 func TestSearchCoversCurrentTicketsAndReviewFindings(t *testing.T) {
@@ -90,7 +91,7 @@ func TestSearchSupportsFTSQueriesAndFreshMutations(t *testing.T) {
 	}
 }
 
-func TestSearchIsWorktreeScopedAndRebuildRemovesStaleRows(t *testing.T) {
+func TestSearchIsWorktreeScopedAndDropsRemovedCanonicalFiles(t *testing.T) {
 	main := queryTestStore(t)
 	otherRoot := t.TempDir()
 	other, err := Open(context.Background(), Options{
@@ -114,22 +115,23 @@ func TestSearchIsWorktreeScopedAndRebuildRemovesStaleRows(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(other.root, ".aira", "tickets", otherTicket.ID+".md")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := main.db.Exec(`INSERT INTO search_fts(project_id,kind,ref_id,worktree_id,content) VALUES(?,?,?,?,?)`, main.projectID, "ticket", "stale", "main", "stale row"); err != nil {
+	// Removing the canonical file stops it matching on the very NEXT grep, with
+	// no Rebuild at all. The persistent index could carry a stale row until
+	// something swept it; a per-query index cannot represent one.
+	if err := os.Remove(filepath.Join(other.root, ".aira", "tickets", otherTicket.ID+".md")); err != nil {
 		t.Fatal(err)
 	}
-	if err := main.Rebuild(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	var count int
-	if err := main.db.QueryRow(`SELECT count(*) FROM search_fts WHERE worktree_id='main' AND ref_id='stale'`).Scan(&count); err != nil {
-		t.Fatal(err)
-	}
-	if count != 0 {
-		t.Fatalf("stale FTS row survived rebuild: %d", count)
+	if rows, err := other.Search(context.Background(), "secret", ""); err != nil || len(rows) != 0 {
+		t.Fatalf("removed canonical ticket still matches = %#v, %v", rows, err)
 	}
 }
 
-func TestSearchFTSIsProjectScopedAcrossRebuildAndMatch(t *testing.T) {
+// TestSearchIsProjectScopedIncludingTheRantRead is the falsifiable half of
+// project isolation. Ticket and finding isolation is structural — each project
+// scans its own root — so only the rant read, which queries the SHARED
+// database, can actually leak. Dropping `WHERE project_id=?` from
+// scanRantRows makes this test fail; nothing else here does.
+func TestSearchIsProjectScopedIncludingTheRantRead(t *testing.T) {
 	base := t.TempDir()
 	common := filepath.Join(base, "common")
 	state := filepath.Join(base, "state")
@@ -156,40 +158,30 @@ func TestSearchFTSIsProjectScopedAcrossRebuildAndMatch(t *testing.T) {
 	if _, err := projectB.CreateTicket(context.Background(), domain.CreateTicketInput{Title: "B ticket", Body: "projectbonly", Kind: domain.KindFeature, Severity: domain.SeverityP2}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := projectB.Search(context.Background(), "projectbonly", ""); err != nil {
+	// The load-bearing fixture: a rant in project B, in the SHARED rants table.
+	if _, err := projectB.AddRant(context.Background(), domain.RantInput{Body: "rantprojectbonly", Actor: "terra"}, gitcontext.GitContext{}); err != nil {
 		t.Fatal(err)
-	}
-	if err := projectA.Rebuild(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	var projectBRows int
-	if err := projectA.db.QueryRow(`SELECT count(*) FROM search_fts WHERE project_id=?`, projectB.projectID).Scan(&projectBRows); err != nil {
-		t.Fatalf("project-scoped FTS schema/query: %v", err)
-	}
-	if projectBRows != 1 {
-		t.Fatalf("project A rebuild erased project B FTS rows: %d", projectBRows)
 	}
 
-	called := false
-	projectA.beforeSearchQuery = func() error {
-		called = true
-		_, err := projectA.db.Exec(`INSERT INTO search_fts(project_id,kind,ref_id,worktree_id,content) VALUES(?,?,?,?,?)`,
-			projectB.projectID, "ticket", "BIRA-1", projectB.worktreeID, "crossprojectonly")
-		return err
+	// Project B sees its own ticket and its own rant...
+	for _, needle := range []string{"projectbonly", "rantprojectbonly"} {
+		if rows, err := projectB.Search(context.Background(), needle, ""); err != nil || len(rows) != 1 {
+			t.Fatalf("project B grep for %q = %#v, %v", needle, rows, err)
+		}
 	}
-	rows, err := projectA.Search(context.Background(), "crossprojectonly", "")
-	if err != nil {
-		t.Fatal(err)
+	// ...and project A sees neither, ticket (structural) or rant (the query).
+	for _, needle := range []string{"projectbonly", "rantprojectbonly"} {
+		if rows, err := projectA.Search(context.Background(), needle, ""); err != nil || len(rows) != 0 {
+			t.Fatalf("project A grep leaked project B rows for %q: %#v, %v", needle, rows, err)
+		}
 	}
-	if !called {
-		t.Fatal("search query seam was not reached")
-	}
-	if len(rows) != 0 {
-		t.Fatalf("project A grep returned project B rows: %#v", rows)
+	// A's own content still matches, so the isolation is not vacuous emptiness.
+	if rows, err := projectA.Search(context.Background(), "projectaonly", ""); err != nil || len(rows) != 1 {
+		t.Fatalf("project A grep for its own ticket = %#v, %v", rows, err)
 	}
 }
 
-func TestRebuildReconstructsSearchRowsAfterCanonicalRemoval(t *testing.T) {
+func TestSearchDropsRemovedCanonicalEntitiesOnTheNextQuery(t *testing.T) {
 	s := queryTestStore(t)
 	ticket, err := s.CreateTicket(context.Background(), testCreateInput("remove me", "ephemeral needle"))
 	if err != nil {
@@ -200,6 +192,11 @@ func TestRebuildReconstructsSearchRowsAfterCanonicalRemoval(t *testing.T) {
 		Source: "review", Message: "ephemeral finding needle",
 	}); err != nil {
 		t.Fatal(err)
+	}
+	// Both must genuinely match BEFORE the removal, or the assertion that they
+	// stop matching is satisfied by any Search that returns nothing at all.
+	if rows, err := s.Search(context.Background(), "ephemeral", ""); err != nil || len(rows) != 2 {
+		t.Fatalf("fixture is not load-bearing: pre-removal grep = %#v, %v", rows, err)
 	}
 	if err := os.Remove(filepath.Join(s.root, ".aira", "tickets", ticket.ID+".md")); err != nil {
 		t.Fatal(err)
@@ -214,15 +211,12 @@ func TestRebuildReconstructsSearchRowsAfterCanonicalRemoval(t *testing.T) {
 	if err := os.Remove(filepath.Join(s.root, ".aira", "findings", findings.valid[0].Finding.Key+".md")); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rebuild(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	var count int
-	if err := s.db.QueryRow(`SELECT count(*) FROM search_fts WHERE worktree_id=?`, s.worktreeID).Scan(&count); err != nil {
-		t.Fatal(err)
-	}
-	if count != 0 {
-		t.Fatalf("removed canonical entities survived rebuild: %d", count)
+	// The canonical files are authoritative: the very next grep must stop
+	// matching them, with no Rebuild in between.
+	for _, needle := range []string{"ephemeral", "needle"} {
+		if rows, err := s.Search(context.Background(), needle, ""); err != nil || len(rows) != 0 {
+			t.Fatalf("removed canonical entities still match %q: %#v, %v", needle, rows, err)
+		}
 	}
 }
 
@@ -231,6 +225,40 @@ func TestSearchRejectsMalformedFTSQuery(t *testing.T) {
 	for _, query := range []string{`"unterminated`, `nosuch:term`, `alpha AND (`} {
 		if _, err := s.Search(context.Background(), query, ""); ErrorCode(err) != "E_QUERY_INVALID" || codes.ExitForCode(ErrorCode(err)) != 2 {
 			t.Fatalf("malformed query %q error = %v", query, err)
+		}
+	}
+}
+
+// TestSearchRejectsQueriesNamingTheRetiredIndexColumns is a CHARACTERISATION
+// test for the one place where AIRA-74 is not result-set-identical.
+//
+// fts5 lets a query name a column (`content: term`). The old persistent index
+// was fts5(project_id, kind, ref_id, worktree_id, content), so `project_id: x`
+// and `worktree_id: x` were valid queries that simply matched nothing (those
+// columns are UNINDEXED). The per-query index is fts5(kind, ref_id, content),
+// so those two names no longer exist and such a query is now rejected as
+// E_QUERY_INVALID instead.
+//
+// This is deliberate and arguably better — they were storage details a caller
+// had no business naming — but it IS a behaviour change, and the ticket's
+// "result sets are identical" claim is qualified by exactly this test. The
+// columns that survive are still queryable, which is what keeps the change
+// narrow rather than a general loss of column syntax.
+func TestSearchRejectsQueriesNamingTheRetiredIndexColumns(t *testing.T) {
+	s := queryTestStore(t)
+	if _, err := s.CreateTicket(context.Background(), testCreateInput("columns", "columnsyntaxneedle")); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{`project_id: main`, `worktree_id: main`} {
+		if _, err := s.Search(context.Background(), query, ""); ErrorCode(err) != "E_QUERY_INVALID" {
+			t.Fatalf("query %q naming a retired column = %v, want E_QUERY_INVALID", query, err)
+		}
+	}
+	// The columns the new index does keep are still addressable, so this is a
+	// narrow retirement and not a loss of fts5 column syntax.
+	for _, query := range []string{`content: columnsyntaxneedle`, `columnsyntaxneedle`} {
+		if rows, err := s.Search(context.Background(), query, ""); err != nil || len(rows) != 1 {
+			t.Fatalf("query %q = %#v, %v", query, rows, err)
 		}
 	}
 }
@@ -255,7 +283,13 @@ func TestSearchKeepsOneGrepSnapshotAgainstMutation(t *testing.T) {
 		return nil
 	}
 	interleaved := false
-	s.beforeSearchReconcileCommit = func() {
+	// The injection point is the START of the canonical ticket scan. That is
+	// what the lock still protects: a grep reads many files plus the rants
+	// table and must see one snapshot across all of them. Injecting after the
+	// scan (where this seam used to be) would pin nothing now, because past
+	// that point the result is a pure function of data already in memory.
+	scanTicketsHook = func() {
+		scanTicketsHook = nil
 		go func() {
 			_, mutationErr := s.SetTicket(context.Background(), ticket.ID, "body", "newsearchcontent")
 			mutationDone <- mutationErr
@@ -271,6 +305,7 @@ func TestSearchKeepsOneGrepSnapshotAgainstMutation(t *testing.T) {
 		case <-time.After(250 * time.Millisecond):
 		}
 	}
+	t.Cleanup(func() { scanTicketsHook = nil })
 	rows, err := s.Search(context.Background(), "oldsearchcontent", "")
 	if err != nil {
 		t.Fatal(err)
@@ -294,7 +329,7 @@ func TestSearchKeepsOneGrepSnapshotAgainstMutation(t *testing.T) {
 	if len(rows) != 1 || rows[0].ID != ticket.ID {
 		t.Fatalf("snapshot result = %#v", rows)
 	}
-	s.beforeSearchReconcileCommit = nil
+	scanTicketsHook = nil
 	if rows, err := s.Search(context.Background(), "newsearchcontent", ""); err != nil || len(rows) != 1 {
 		t.Fatalf("next grep did not reflect eventual mutation: %#v, %v", rows, err)
 	}

@@ -194,12 +194,10 @@ type Store struct {
 	// allocationMigrationHook is a test-only seam for crash points between the
 	// two-table entity-kind schema migration statements; production leaves it nil.
 	allocationMigrationHook func(string) error
-	// beforeSearchQuery is a test-only seam between search index replacement
-	// and the MATCH query; production leaves it nil.
-	beforeSearchQuery func() error
-	// beforeSearchReconcileCommit is a test-only seam after the canonical scan
-	// and before its replacement transaction; production leaves it nil.
-	beforeSearchReconcileCommit func()
+	// beforeSearchIndexBuild is a test-only seam after the canonical file scan
+	// and before the rant read that completes a grep's snapshot; production
+	// leaves it nil.
+	beforeSearchIndexBuild func()
 	// traceabilitySnapshotHook is a test-only seam used to reproduce a mutation
 	// during the tracked-file snapshot validation window.
 	traceabilitySnapshotHook func()
@@ -1127,7 +1125,7 @@ func (s *Store) initDB(ctx context.Context) error {
 	if err := s.ensureFindingsSchema(ctx); err != nil {
 		return err
 	}
-	if err := s.ensureSearchFTS(ctx); err != nil {
+	if err := s.dropLegacySearchFTS(ctx); err != nil {
 		return err
 	}
 	return s.ensureProjectOwnershipFKs(ctx)
@@ -1508,38 +1506,169 @@ func tableExists(ctx context.Context, db schemaQuerier, table string) (bool, err
 	return exists, nil
 }
 
-// hasTableColumn is the fail-OPEN form of tableHasColumn: it collapses a probe
-// error into "absent". It is retained for exactly one production caller,
-// ensureSearchFTS, whose own unguarded check-then-CREATE is AIRA-97 Finding 1b
-// and is owned by AIRA-74 — which is rewriting that function, so converting it
-// here would collide with that work. Do not add callers: use tableHasColumn.
-func hasTableColumn(ctx context.Context, db schemaQuerier, table, wanted string) bool {
-	found, err := tableHasColumn(ctx, db, table, wanted)
-	return err == nil && found
-}
-
-// hasTable is the fail-OPEN form of tableExists, retained for the same single
-// caller and the same reason as hasTableColumn. Do not add callers.
-func hasTable(ctx context.Context, db schemaQuerier, table string) bool {
-	exists, err := tableExists(ctx, db, table)
-	return err == nil && exists
-}
-
-func (s *Store) ensureSearchFTS(ctx context.Context) error {
-	if hasTable(ctx, s.db, "search_fts") && hasTableColumn(ctx, s.db, "search_fts", "project_id") && hasTableColumn(ctx, s.db, "search_fts", "worktree_id") {
+// dropLegacySearchFTS erases and removes the persistent `search_fts` table.
+// grep now builds a private per-query index instead (see internal/store/search.go),
+// so the table is dead weight — on this machine it held 24.5 MB across 3801
+// rows, 60% of the whole database — 720 of those rows re-indexing just 19
+// distinct rants under most of the 40 worktree tags the table had accumulated,
+// only ~8 of which are live worktrees.
+//
+// Removing the schema WITHOUT this migration would be a security regression,
+// not a cleanup: RedactRant's FTS5 secure-delete scrub goes away with the
+// table, so a rant redacted afterwards would have had its body survive in a
+// table nothing maintained any more.
+//
+// Recipe, and why it is not the DELETE-based one the ticket suggested. Measured
+// on byte-for-byte copies of the live 40.8 MB database, with a needle taken
+// from a ticket FTS row (a string present in the index and in no ordinary
+// table, so the check cannot be satisfied by another copy of the same bytes):
+//
+//	DROP + checkpoint, no VACUUM      0.15 s in-txn   needle absent   40.8 MB
+//	DROP + ck + VACUUM + ck (chosen)  0.15 s in-txn   needle absent   15.1 MB
+//	fts5 secure-delete + DELETE ...   3.9-5.8 s in-txn
+//
+// The DROP is the erasure: the writable DSN carries secure_delete(ON), so
+// freeing the shadow-table pages zeroes them, and the checkpoint publishes
+// those zeroed images into the main file. VACUUM only reclaims space. The fts5
+// secure-delete + DELETE route adds nothing and holds BEGIN IMMEDIATE for
+// 3.9-5.8 s against a 5 s busy_timeout, which is exactly the hard-failing
+// concurrent-opener race AIRA-97 records — worse here, because the daemon opens
+// the DB before it listens and the client's startWait is 5 s.
+//
+// Failure semantics are asymmetric on purpose, because everything after the
+// committed DROP is ONE-SHOT: the presence fast path is consumed, so a later
+// Open skips the migration entirely and none of it is ever retried.
+//   - The DROP transaction fails closed. The table is still there, so the next
+//     Open retries the whole migration.
+//   - The erasure-barrier checkpoint treats a genuine PRAGMA error as fatal but
+//     SILENTLY TOLERATES a busy result — initDB has no diagnostics channel, so
+//     "tolerated" here means exactly that: unobserved, with no trace. Failing
+//     Open instead would buy one failed daemon start and no retry, and the
+//     guarantee does not depend on it: once the DROP commits the zeroed images
+//     are in the WAL, and any later
+//     checkpoint publishes them — including the wal_checkpoint(TRUNCATE) that
+//     RedactRant itself performs on every redaction, which already reports
+//     E_RANT_REDACTION_INCOMPLETE rather than claiming an erasure it did not do.
+//   - VACUUM and its trailing checkpoint are space reclamation past the barrier.
+//     Their failure never fails Open, and is likewise silent: it means ~25 MB is
+//     never reclaimed, with nothing recorded anywhere. That is a deliberate
+//     trade, not an oversight — but it is silent, and calling it anything softer
+//     would be untrue.
+//
+// This also closes AIRA-97 Finding 1b by construction. That finding is
+// ensureSearchFTS's unguarded hasTable-then-CREATE, measured failing ~7.5% of
+// six-way concurrent opens with "table search_fts already exists". There is no
+// CREATE here to race. The drop is nevertheless built to AIRA-73's pattern
+// (ensureOutboxResolutionDropped): AIRA-97's shared fail-closed tableExists
+// probe, then the same predicate re-checked inside BEGIN IMMEDIATE so the losing
+// racer is a no-op. AIRA-97 left `hasTable`/`hasTableColumn` alive as documented
+// fail-OPEN wrappers for this function alone, and asked whoever rewrote it to
+// finish the job; this change does, so both wrappers are deleted here.
+func (s *Store) dropLegacySearchFTS(ctx context.Context) error {
+	present, err := tableExists(ctx, s.db, "search_fts")
+	if err != nil {
+		return translateDBError(err)
+	}
+	if !present {
 		return nil
 	}
-	if hasTable(ctx, s.db, "search_fts") {
-		// The FTS table is disposable. Drop the pre-M6 schema rather than
-		// attempting to ALTER a virtual table; the next search/rebuild repopulates it.
-		if _, err := s.db.ExecContext(ctx, `DROP TABLE search_fts`); err != nil {
-			return translateDBError(err)
+	dropped := false
+	if err := s.withImmediate(ctx, func(conn *sql.Conn) error {
+		var err error
+		dropped, err = dropSearchFTSLocked(ctx, conn)
+		return err
+	}); err != nil {
+		return err
+	}
+	if !dropped {
+		// The racer that lost has nothing to erase or reclaim; the winner is
+		// already doing both.
+		return nil
+	}
+	// The erasure barrier. A genuine PRAGMA error here still fails Open; only a
+	// BUSY checkpoint is tolerated, silently, for the reason given above.
+	if err := s.searchFTSMigrationStage(ctx, searchFTSStageBarrier); err != nil {
+		return translateDBError(err)
+	}
+	// Past the barrier nothing may fail Open. Space reclamation's failure is
+	// deliberately discarded: the erasure is done, the table is gone, and this
+	// stage is one-shot anyway, so failing Open here would report a
+	// security-shaped failure for a cosmetic one and still never retry. The
+	// cost of that trade is that ~25 MB is then never reclaimed, silently.
+	_ = s.searchFTSMigrationStage(ctx, searchFTSStageReclaim)
+	return nil
+}
+
+const (
+	searchFTSStageBarrier = "erasure-barrier"
+	searchFTSStageReclaim = "reclaim"
+)
+
+// searchFTSMigrationStage runs one post-DROP stage of the search_fts migration,
+// or defers to the test seam when one is installed.
+func (s *Store) searchFTSMigrationStage(ctx context.Context, stage string) error {
+	if searchFTSMigrationHook != nil {
+		handled, err := searchFTSMigrationHook(stage)
+		if handled {
+			return err
 		}
 	}
-	_, err := s.db.ExecContext(ctx, `CREATE VIRTUAL TABLE search_fts USING fts5(
-		project_id UNINDEXED, kind UNINDEXED, ref_id UNINDEXED, worktree_id UNINDEXED, content
-	)`)
-	return translateDBError(err)
+	switch stage {
+	case searchFTSStageBarrier:
+		return checkpointTruncateTolerateBusy(ctx, s.db)
+	default:
+		if _, err := s.db.ExecContext(ctx, `VACUUM`); err != nil {
+			return err
+		}
+		return checkpointTruncateTolerateBusy(ctx, s.db)
+	}
+}
+
+// dropSearchFTSLocked is the write half of the migration, run inside
+// BEGIN IMMEDIATE. It re-checks the presence predicate that the caller's
+// pre-transaction fast path already cleared, because more than one process
+// opens this machine-wide database at once (the daemon, the CLI fallback
+// through app.OpenWithDiagnostics, a detached supervisor): both can clear the
+// fast path, one wins the write lock and drops, and the loser must then be a
+// no-op rather than running DROP TABLE against a table that is already gone and
+// failing its whole Open. Tests call this directly, since going through
+// dropLegacySearchFTS would stop at the fast path and never reach the re-check.
+// It reports whether it actually dropped, so the losing racer skips the erasure
+// barrier and the VACUUM the winner is already performing.
+func dropSearchFTSLocked(ctx context.Context, conn *sql.Conn) (bool, error) {
+	present, err := tableExists(ctx, conn, "search_fts")
+	if err != nil {
+		return false, err
+	}
+	if !present {
+		return false, nil
+	}
+	if _, err := conn.ExecContext(ctx, `DROP TABLE search_fts`); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// searchFTSMigrationHook is a test-only seam over one post-DROP stage of the
+// search_fts migration — the erasure-barrier checkpoint, or the VACUUM-and-
+// checkpoint reclaim. It returns (handled, err): `handled` false means "run the
+// real stage", which is what lets a test fail ONE stage while the other still
+// runs for real. Without that, a test injecting a reclaim failure would also
+// silently suppress the barrier, and would then pass whether or not the barrier
+// existed. Production leaves it nil.
+var searchFTSMigrationHook func(stage string) (bool, error)
+
+// checkpointTruncateTolerateBusy folds and truncates the WAL. Unlike
+// Store.checkpointTruncate, which backs a redaction's physical-erasure claim and
+// must therefore refuse to call a busy checkpoint a success, this one reports
+// only real PRAGMA errors: its caller is a one-shot migration whose guarantee
+// does not depend on the checkpoint landing now (see dropLegacySearchFTS).
+func checkpointTruncateTolerateBusy(ctx context.Context, db *sql.DB) error {
+	var busy, walFrames, checkpointed int
+	if err := db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &walFrames, &checkpointed); err != nil {
+		return err
+	}
+	return nil
 }
 
 // findingsSchemaCurrent reports whether the findings schema is already at the
@@ -2669,9 +2798,6 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		if _, err := conn.ExecContext(ctx, `DELETE FROM relations WHERE project_id=?`, s.projectID); err != nil {
 			return err
 		}
-		if _, err := conn.ExecContext(ctx, `DELETE FROM search_fts WHERE project_id=?`, s.projectID); err != nil {
-			return err
-		}
 		// The requirement index is a disposable projection of the scanned
 		// requirement files; clear the project slice so a removed file's row
 		// cannot survive a rebuild.
@@ -2705,14 +2831,6 @@ func (s *Store) Rebuild(ctx context.Context) error {
 		}
 		for _, finding := range scannedFindings {
 			if err := upsertReviewFinding(ctx, conn, s.projectID, finding.WorktreeID, finding.Path, finding.Finding, finding.Digest); err != nil {
-				return err
-			}
-		}
-		if err := insertSearchRows(ctx, conn, s.projectID, scanned, scannedFindings); err != nil {
-			return err
-		}
-		for _, entry := range entries {
-			if err := insertRantSearchRows(ctx, conn, s.projectID, entry.WorktreeID); err != nil {
 				return err
 			}
 		}
