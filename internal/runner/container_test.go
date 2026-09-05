@@ -108,6 +108,10 @@ func TestPlanContainerMemoryUnevaluated(t *testing.T) {
 		// CONTAINER's flag. Without honouring it this charged the ledger 8G.
 		{"end-of-options marker then image then -m", []string{"docker", "run", "--", "alpine", "-m", "8g"}},
 		{"end-of-options with flags before it", []string{"docker", "run", "--rm", "--", "alpine", "qemu", "-m", "8g"}},
+		// The token AT the image position is the image, never an option: this
+		// names an image literally called "-m". Reading it as docker's memory
+		// flag would charge the ledger for an argument that is not one.
+		{"the token at the image position is the image", []string{"docker", "run", "--", "-m", "8g"}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			plan := PlanContainerIntegration(testCase.argv)
@@ -143,6 +147,9 @@ func TestPlanContainerMemoryAbsent(t *testing.T) {
 		{"volume short with attached value containing m", []string{"podman", "run", "-v/home/mark:/x", "alpine"}},
 		{"env short with attached value containing m", []string{"podman", "run", "-eTERM=xterm", "alpine"}},
 		{"boolean cluster without m", []string{"podman", "run", "-it", "alpine"}},
+		// A bare "-" is a legitimate token (stdin) and must not be treated as a
+		// flag: `body[0]` on it would panic (build review, Fable P2).
+		{"bare dash is not a flag", []string{"docker", "run", "-i", "alpine", "cat", "-"}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			plan := PlanContainerIntegration(testCase.argv)
@@ -206,6 +213,8 @@ func TestPlanContainerDetach(t *testing.T) {
 		{"long equals true", []string{"podman", "run", "--detach=true", "alpine"}, true},
 		{"in a cluster", []string{"podman", "run", "-dit", "alpine"}, true},
 		{"absent", []string{"podman", "run", "-it", "alpine"}, false},
+		{"explicitly false", []string{"podman", "run", "--detach=false", "alpine"}, false},
+		{"detach-shaped token after the image is the container's", []string{"podman", "run", "alpine", "prog", "--detach"}, false},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			if got := PlanContainerIntegration(testCase.argv).Detach; got != testCase.want {
@@ -221,59 +230,59 @@ func TestPlanContainerDetach(t *testing.T) {
 // memory value, or dropped a caller token.
 func TestContainerInjectArgvExact(t *testing.T) {
 	for _, testCase := range []struct {
-		name           string
-		argv           []string
-		scopeMemoryMax int64
-		wantArgv       []string
-		wantPlacement  string
-		wantMemory     string
+		name          string
+		argv          []string
+		declaredCap   int64
+		wantArgv      []string
+		wantPlacement string
+		wantMemory    string
 	}{
 		{
 			name: "podman gains split and memory",
-			argv: []string{"podman", "run", "alpine", "true"}, scopeMemoryMax: 2 << 30,
+			argv: []string{"podman", "run", "alpine", "true"}, declaredCap: 2 << 30,
 			wantArgv:      []string{"podman", "run", "--cgroups=split", "--memory=2147483648", "alpine", "true"},
 			wantPlacement: ContainerPlacementPodmanSplitInjected, wantMemory: "injected=2147483648",
 		},
 		{
 			name: "podman keeps a caller memory limit and reports it",
-			argv: []string{"podman", "run", "-m", "1g", "alpine"}, scopeMemoryMax: 2 << 30,
+			argv: []string{"podman", "run", "-m", "1g", "alpine"}, declaredCap: 2 << 30,
 			wantArgv:      []string{"podman", "run", "--cgroups=split", "-m", "1g", "alpine"},
 			wantPlacement: ContainerPlacementPodmanSplitInjected, wantMemory: "caller=1073741824",
 		},
 		{
 			name: "podman with a caller cgroup flag gets no placement injection",
-			argv: []string{"podman", "run", "--cgroup-parent=aira.slice", "alpine"}, scopeMemoryMax: 2 << 30,
+			argv: []string{"podman", "run", "--cgroup-parent=aira.slice", "alpine"}, declaredCap: 2 << 30,
 			wantArgv:      []string{"podman", "run", "--memory=2147483648", "--cgroup-parent=aira.slice", "alpine"},
 			wantPlacement: ContainerPlacementPodmanCallerCgroup, wantMemory: "injected=2147483648",
 		},
 		{
 			name: "podman caller split is reported as the caller's",
-			argv: []string{"podman", "run", "--cgroups=split", "alpine"}, scopeMemoryMax: 0,
+			argv: []string{"podman", "run", "--cgroups=split", "alpine"}, declaredCap: 0,
 			wantArgv:      []string{"podman", "run", "--cgroups=split", "alpine"},
 			wantPlacement: ContainerPlacementPodmanCallerSplit, wantMemory: "none",
 		},
 		{
 			name: "docker never gets a placement flag",
-			argv: []string{"docker", "run", "alpine"}, scopeMemoryMax: 2 << 30,
+			argv: []string{"docker", "run", "alpine"}, declaredCap: 2 << 30,
 			wantArgv:      []string{"docker", "run", "--memory=2147483648", "alpine"},
 			wantPlacement: ContainerPlacementDockerNotContained, wantMemory: "injected=2147483648",
 		},
 		{
 			name: "below the runtime floor nothing is injected",
-			argv: []string{"docker", "run", "alpine"}, scopeMemoryMax: 1 << 20,
+			argv: []string{"docker", "run", "alpine"}, declaredCap: 1 << 20,
 			wantArgv:      []string{"docker", "run", "alpine"},
 			wantPlacement: ContainerPlacementDockerNotContained, wantMemory: "not-injected:below-runtime-minimum",
 		},
 		{
 			name: "no confine cap means no memory injection",
-			argv: []string{"docker", "run", "alpine"}, scopeMemoryMax: 0,
+			argv: []string{"docker", "run", "alpine"}, declaredCap: 0,
 			wantArgv:      []string{"docker", "run", "alpine"},
 			wantPlacement: ContainerPlacementDockerNotContained, wantMemory: "none",
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			plan := PlanContainerIntegration(testCase.argv)
-			injection := plan.Inject(testCase.argv, testCase.scopeMemoryMax)
+			injection := plan.Inject(testCase.argv, testCase.declaredCap)
 			if !reflect.DeepEqual(injection.Argv, testCase.wantArgv) {
 				t.Fatalf("argv =\n  %q\nwant\n  %q", injection.Argv, testCase.wantArgv)
 			}
@@ -335,6 +344,7 @@ func TestContainerReserveDecision(t *testing.T) {
 		resolved    int64
 		pinned      bool
 		delegateRAM bool
+		sliceCap    int64
 		wantReserve int64
 		wantPinned  bool
 		wantSkip    string
@@ -384,6 +394,14 @@ func TestContainerReserveDecision(t *testing.T) {
 			resolved: 512 << 20, pinned: true, delegateRAM: true, wantReserve: 512 << 20, wantPinned: true, wantSkip: ContainerReserveSkipDelegateRAM,
 		},
 		{
+			// Build review (Fable P1): charging a limit bigger than the whole
+			// slice makes the daemon terminally reject the admission, REFUSING a
+			// launch over a reserve the caller never declared -- the opposite of
+			// this feature's "never refuse, report" policy.
+			name: "a container limit larger than the slice is not charged", argv: []string{"docker", "run", "-m", "70g", "alpine"},
+			resolved: hint, sliceCap: 64 << 30, wantReserve: hint, wantPinned: false, wantSkip: ContainerReserveSkipExceedsSlice,
+		},
+		{
 			name: "an unestablished limit never raises", argv: []string{"docker", "run", "alpine", "echo", "--memory=8g"},
 			resolved: hint, wantReserve: hint, wantPinned: false,
 		},
@@ -394,7 +412,11 @@ func TestContainerReserveDecision(t *testing.T) {
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			plan := PlanContainerIntegration(testCase.argv)
-			reserve, pinned, skip := plan.ResolveReserve(testCase.resolved, testCase.pinned, testCase.delegateRAM)
+			sliceCap := testCase.sliceCap
+			if sliceCap == 0 {
+				sliceCap = 64 << 30
+			}
+			reserve, pinned, skip := plan.ResolveReserve(testCase.resolved, testCase.pinned, testCase.delegateRAM, sliceCap)
 			if reserve != testCase.wantReserve {
 				t.Fatalf("reserve = %d, want %d", reserve, testCase.wantReserve)
 			}
@@ -403,6 +425,40 @@ func TestContainerReserveDecision(t *testing.T) {
 			}
 			if skip != testCase.wantSkip {
 				t.Fatalf("skip = %q, want %q", skip, testCase.wantSkip)
+			}
+		})
+	}
+}
+
+// TestContainerMemoryFacet pins the facet composer directly. The composition
+// tests reach it only through a launch, so a regression that appended a reserve
+// suffix to `injected=`/`none`/`not-injected:` -- claiming a ledger outcome for
+// a limit the caller never declared -- would slip past them (build review, Fable P2).
+func TestContainerMemoryFacet(t *testing.T) {
+	declared := PlanContainerIntegration([]string{"docker", "run", "-m", "4g", "alpine"})
+	none := PlanContainerIntegration([]string{"docker", "run", "alpine"})
+	undetected := PlanContainerIntegration([]string{"go", "test", "./..."})
+
+	for _, testCase := range []struct {
+		name      string
+		plan      ContainerPlan
+		injection ContainerInjection
+		skip      string
+		charged   bool
+		want      string
+	}{
+		{"declared and charged", declared, ContainerInjection{MemoryFacet: "caller=4294967296"}, "", true, "caller=4294967296:reserved"},
+		{"declared, requested only", declared, ContainerInjection{MemoryFacet: "caller=4294967296"}, "", false, "caller=4294967296:reserve-requested"},
+		{"declared but skipped", declared, ContainerInjection{MemoryFacet: "caller=4294967296"}, ContainerReserveSkipPodman, true, "caller=4294967296:reserve-skipped:podman"},
+		// No caller limit: the suffix must NEVER appear, whatever the admission did.
+		{"injected keeps no reserve suffix", none, ContainerInjection{MemoryFacet: "injected=2147483648"}, "", true, "injected=2147483648"},
+		{"none keeps no reserve suffix", none, ContainerInjection{MemoryFacet: "none"}, "", true, "none"},
+		{"below floor keeps no reserve suffix", none, ContainerInjection{MemoryFacet: "not-injected:below-runtime-minimum"}, "", true, "not-injected:below-runtime-minimum"},
+		{"undetected stays empty", undetected, ContainerInjection{}, "", true, ""},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := ContainerMemoryFacet(testCase.plan, testCase.injection, testCase.skip, testCase.charged); got != testCase.want {
+				t.Fatalf("facet = %q, want %q", got, testCase.want)
 			}
 		})
 	}

@@ -76,6 +76,12 @@ const (
 	// deliberately a small framework overhead because its per-test children
 	// reserve individually (AIRA-62). Raising it would double-book them.
 	ContainerReserveSkipDelegateRAM = "delegate-ram"
+	// ContainerReserveSkipExceedsSlice: the declared container limit is larger
+	// than the whole slice, so charging it would make the daemon terminally
+	// reject the admission and REFUSE a launch the caller never asked to be
+	// gated on that number. Reported, never silently clamped to a smaller
+	// figure that would look like an accepted charge.
+	ContainerReserveSkipExceedsSlice = "exceeds-slice-cap"
 )
 
 // Short flags that take an ATTACHED value. `-v/home/mark:/x` and `-eTERM=xterm`
@@ -184,7 +190,10 @@ func PlanContainerIntegration(argv []string) ContainerPlan {
 
 	for index := 0; index < len(rest); index++ {
 		token := rest[index]
-		if imageAt >= 0 && index > imageAt {
+		// `>=`, not `>`: the token AT imageAt is the image itself, never an
+		// option. `docker run -- -m 8g` names an image literally called `-m`, and
+		// with `>` that token would have been read as docker's memory flag.
+		if imageAt >= 0 && index >= imageAt {
 			boundaryOpen = false
 		}
 		if boundaryOpen && !strings.HasPrefix(token, "-") {
@@ -236,7 +245,13 @@ func PlanContainerIntegration(argv []string) ContainerPlan {
 					}
 				}
 			case "--detach":
-				plan.Detach = plan.Detach || !hasInline || inline != "false"
+				// Boundary-gated for the same reason as the flags above: a
+				// `--detach` in the container's own command is not a request to
+				// detach the CONTAINER, and the lifetime warning must describe
+				// what the caller actually asked for.
+				if boundaryOpen {
+					plan.Detach = true && (!hasInline || inline != "false")
+				}
 			}
 			// --memory-swap, --memory-reservation and --memory-swappiness fall
 			// through here deliberately: they are NOT the limit, and matching
@@ -331,7 +346,21 @@ type ContainerInjection struct {
 // writes through the caller's backing array: the durable detached-job record
 // keeps the caller's original argv, and an `append(argv[:2], ...)` on a slice
 // with spare capacity would silently corrupt it.
-func (plan ContainerPlan) Inject(argv []string, scopeMemoryMax int64) ContainerInjection {
+//
+// declaredCap is the memory limit the CALLER declared (`--memory-max`, or a
+// declared `--memory-reserve`), NOT the job's resolved scope cap. The
+// distinction is load-bearing and was a build-review P0 (Fable): an earlier
+// build injected the resolved cap, which on an unpinned daemon grant is a
+// peak-RSS ESTIMATE. For docker that estimate is derived from the docker CLI's
+// own footprint -- the container's memory lives in dockerd's tree and never
+// reaches this scope's counters -- so it converges to tens of megabytes. AIRA
+// would then inject `--memory=36175872` into the user's container, which is
+// OOM-killed inside docker forever; the kill is invisible here (the job still
+// reports `terminated-by=normal`), so the history never escalates and it NEVER
+// SELF-HEALS. That is precisely the "shim becomes the trap it counters" failure
+// this ticket exists to avoid. Only a number the caller actually chose is safe
+// to impose on their container.
+func (plan ContainerPlan) Inject(argv []string, declaredCap int64) ContainerInjection {
 	if !plan.Detected() {
 		return ContainerInjection{Argv: argv}
 	}
@@ -360,14 +389,14 @@ func (plan ContainerPlan) Inject(argv []string, scopeMemoryMax int64) ContainerI
 		injection.MemoryFacet = "caller=" + strconv.FormatInt(plan.MemoryBytes, 10)
 	case plan.MemoryPresent:
 		injection.MemoryFacet = "caller=unevaluated:" + plan.MemoryReason
-	case scopeMemoryMax <= 0:
+	case declaredCap <= 0:
 		injection.MemoryFacet = "none"
-	case scopeMemoryMax < containerMemoryFloor:
+	case declaredCap < containerMemoryFloor:
 		injection.MemoryFacet = "not-injected:below-runtime-minimum"
 	default:
-		inserted = append(inserted, "--memory="+strconv.FormatInt(scopeMemoryMax, 10))
-		injection.InjectedMemory = scopeMemoryMax
-		injection.MemoryFacet = "injected=" + strconv.FormatInt(scopeMemoryMax, 10)
+		inserted = append(inserted, "--memory="+strconv.FormatInt(declaredCap, 10))
+		injection.InjectedMemory = declaredCap
+		injection.MemoryFacet = "injected=" + strconv.FormatInt(declaredCap, 10)
 	}
 
 	// Index 2 -- directly after the `run` subcommand -- is a valid flag position
@@ -384,7 +413,16 @@ func (plan ContainerPlan) Inject(argv []string, scopeMemoryMax int64) ContainerI
 // job's admission charge. It is the single decision site, and it deliberately
 // answers "no" far more often than v1 of the plan did -- see the skip constants
 // for why each refusal is the correct one rather than a missing feature.
-func (plan ContainerPlan) ResolveReserve(reserve int64, pinned, delegateRAM bool) (int64, bool, string) {
+// sliceCap is the slice's own finite memory ceiling. A container limit ABOVE it
+// is never charged: the daemon terminally rejects a pinned reserve that exceeds
+// the ceiling (E_ADMIT_TOO_LARGE), which the runner surfaces as a REFUSED
+// launch. Refusing `docker run -m 70g` on a 64 GiB slice -- over a reserve the
+// caller never declared, for a container that does not live in the slice at all
+// -- directly contradicts the "never refuse the launch, report instead" policy
+// this feature was designed around (build review, Fable P1). A footprint larger
+// than the whole slice cannot be meaningfully accounted for anyway, so it is
+// reported and skipped rather than allowed to block the job.
+func (plan ContainerPlan) ResolveReserve(reserve int64, pinned, delegateRAM bool, sliceCap int64) (int64, bool, string) {
 	if !plan.Detected() || !plan.MemoryEstablished {
 		return reserve, pinned, ""
 	}
@@ -398,6 +436,8 @@ func (plan ContainerPlan) ResolveReserve(reserve int64, pinned, delegateRAM bool
 		return reserve, pinned, ContainerReserveSkipDelegateRAM
 	case pinned:
 		return reserve, pinned, ContainerReserveSkipDeclared
+	case sliceCap > 0 && plan.MemoryBytes > sliceCap:
+		return reserve, pinned, ContainerReserveSkipExceedsSlice
 	}
 	// Docker, unpinned. The container really does live outside the slice, so a
 	// footprint AIRA already knows about is charged rather than ignored. `max`

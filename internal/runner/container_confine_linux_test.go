@@ -51,9 +51,21 @@ func runContainerLaunch(t *testing.T, request ConfineRequest, admission admissio
 	deps.start = func(command *confineCommand) error {
 		// confineSetupArgv appends the target after a literal "--", so everything
 		// past it is the effective argv the container runtime would see.
+		//
+		// Then the target is REPLACED with /bin/true before the child is started.
+		// This is load-bearing, not tidiness: confineUnitDeps' start actually
+		// execs the target, so without this every case in this file would run a
+		// REAL `docker run` / `podman run` on the developer's machine. It did --
+		// build review (Fable P0) caught `go test ./...` spawning ~157 real
+		// alpine containers in the shared docker store, on a box running 33
+		// unrelated production containers, plus a registry pull attempt for the
+		// nonexistent `qemu-image`. Unit tests here assert what confine DECIDED;
+		// only the build-tagged real-podman file may launch a container, and it
+		// launches podman only, with --rm.
 		for index, argument := range command.cmd.Args {
 			if argument == "--" {
 				observation.targetArgv = append([]string(nil), command.cmd.Args[index+1:]...)
+				command.cmd.Args = append(command.cmd.Args[:index+1:index+1], "/bin/true")
 				break
 			}
 		}
@@ -248,6 +260,35 @@ func TestContainerLaunchInjectsSplitAndMemory(t *testing.T) {
 	}
 }
 
+// TestContainerLaunchNeverInjectsAnEstimatedCap is the P0 regression guard from
+// the build review (Fable). On an unpinned daemon grant the job's scope cap is a
+// peak-RSS ESTIMATE, and for docker that estimate tracks the CLI rather than the
+// container -- so injecting it would cap the user's container at tens of
+// megabytes, OOM-kill it inside docker where this scope cannot see the kill, and
+// never self-heal because the history keeps recording a tiny, OOM-free peak.
+// Only a caller-DECLARED limit may be imposed on someone's container.
+func TestContainerLaunchNeverInjectsAnEstimatedCap(t *testing.T) {
+	for _, runtime := range []string{"docker", "podman"} {
+		t.Run(runtime, func(t *testing.T) {
+			observation := runContainerLaunch(t,
+				ConfineRequest{Argv: []string{runtime, "run", "myimage", "bench"}},
+				// A realistic CLI-derived estimate: ~34 MiB.
+				daemonGrant(36175872))
+
+			for _, argument := range observation.targetArgv {
+				if strings.HasPrefix(argument, "--memory") {
+					t.Fatalf("injected an estimated cap %q into the caller's container: %q",
+						argument, observation.targetArgv)
+				}
+			}
+			if observation.status.ContainerMemory != "none" {
+				t.Fatalf("container-memory facet = %q, want \"none\" (nothing was declared)",
+					observation.status.ContainerMemory)
+			}
+		})
+	}
+}
+
 // TestContainerLaunchLeavesOrdinaryJobsUntouched is the regression guard that
 // the whole feature is invisible to every job that is not a container run.
 func TestContainerLaunchLeavesOrdinaryJobsUntouched(t *testing.T) {
@@ -314,6 +355,13 @@ func TestContainerLaunchAdvisories(t *testing.T) {
 			name:    "detached podman with a caller split still gets the lifetime warning",
 			request: ConfineRequest{Argv: []string{"podman", "run", "--cgroups=split", "-d", "alpine"}},
 			want:    []string{"will be killed when the confine job exits"},
+		},
+		{
+			// Build review (Fable P2): `>` must not drift to `>=`. When the two
+			// numbers are EQUAL nothing is exceeded and the loud line is a lie.
+			name:    "an equal container limit produces no exceeds line",
+			request: ConfineRequest{Argv: []string{"docker", "run", "-m", "2g", "alpine"}, ScopeMemoryMax: 2 << 30},
+			absent:  []string{"exceeds this job"},
 		},
 		{
 			// Build review (Sol P1): AIRA must not imply it governs a container

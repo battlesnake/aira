@@ -1,6 +1,10 @@
 # AIRA-102 — `aira confine` container integration (podman transparent nesting + docker sanity shim)
 
-**Status:** plan **v4 — BUILT, build-reviewed, amended.** v3 was gate-passed and implemented; Sol's adversarial BUILD review returned **BLOCK** (3×P1, 2×P2) and every finding is folded in below (§3.2, §3.5, §3.10, §3.11 and §8).
+**Status:** plan **v5 — BUILT, twice build-reviewed, amended.** v3 was gate-passed and implemented. Both adversarial BUILD reviews returned **BLOCK**: Sol (3×P1, 2×P2) and Fable (2×P0, 3×P1, 8×P2). Every finding is folded in below.
+
+**The two P0s (Fable), both real and both fixed:**
+- **The docker `--memory` injection was a trap of exactly the kind this ticket exists to prevent.** §3.3 injected the *resolved* `scopeMemoryMax`, which on an unpinned daemon grant is a peak-RSS **estimate**. For docker that estimate tracks the **CLI**, not the container (the container's memory lives in dockerd's tree and never reaches this scope's counters), so it converges to tens of megabytes; AIRA would inject `--memory=36175872` into the user's container, which is then OOM-killed inside docker where this scope cannot see the kill — so the job still reports `terminated-by=normal`, history keeps recording a tiny OOM-free peak, and it **never self-heals**. Reproduced end-to-end by the reviewer. Injection now keys on a **caller-DECLARED** limit only (`--memory-max`, or a declared `--memory-reserve`), which is also what the ticket originally said; the plan had silently widened it.
+- **The composition tests executed REAL `docker run` / `podman run` on the shared machine.** `confineUnitDeps`' `start` actually execs the target, so `go test ./...` spawned ~157 alpine containers into a docker store belonging to a box running 33 unrelated production containers, plus a registry-pull attempt for a nonexistent image. The harness now rewrites the target to `/bin/true` after capturing the argv; verified that a full run leaves both container stores byte-identical. All 157 leftovers were identified (all `alpine`, all created inside the test window, zero non-alpine exited containers on the host) and removed; the 33 running containers were never touched.
 
 **Status history:** plan **v3 — GATE-PASSED (with changes).** v1 was GATE-FAILed by both lineages (Sol 4×P0; Fable 4×MUST-FIX). v2 cleared every MUST-FIX; Fable's v2 re-gate returned **GATE-PASS-WITH-CHANGES** with 12 text/precision items, all folded in here. DeepSeek was **unavailable** (`agentmux ask` exit 4, twice) — recorded, not a blocking gate.
 **Ticket:** AIRA-102 (P1). Owner-directed two-part remedy.
@@ -85,7 +89,7 @@ The same pass also records `--pod` / `--pod-id-file` (treated **as** a caller cg
 At launch construction (immediately before `confineSetupArgv`, after `scopeMemoryMax` resolves — the only point at which the daemon-estimate cap of `:853` is known), build a **fresh** argv slice (never `append(argv[:2], …)` onto the caller's backing array) inserting at **index 2** (verified safe for both runtimes: pflag, flag position directly after the subcommand):
 
 - **Placement.** Caller set none of `--cgroups` / `--cgroup-parent` / `--pod` → inject **`--cgroups=split`**. Otherwise inject **nothing** (F3) and report their choice without claiming containment.
-- **Memory.** Confine has resolved `scopeMemoryMax > 0`, scan says `Present=false`, and `scopeMemoryMax >= 6 MiB` (F7 floor) → inject `--memory=<scopeMemoryMax bare bytes>`. Below the floor, inject nothing and say why.
+- **Memory.** The caller **DECLARED** a limit (`--memory-max`, or a declared `--memory-reserve`) `>= 6 MiB` (F7/F12 floor) and the scan says `Present=false` → inject `--memory=<that declared limit, bare bytes>`. Below the floor, inject nothing and say why. **Never the resolved `scopeMemoryMax`** (build review, Fable P0): on an unpinned daemon grant that number is an estimate, and for docker an estimate of the CLI rather than the container — injecting it caps the user's container at tens of megabytes, unrecoverably. Only a number the caller chose may be imposed on their container.
 
 The `--cgroup-parent=aira.slice` fallback is deliberately **not** implemented: nesting works and the fallback is strictly weaker (F6).
 
@@ -119,6 +123,8 @@ The rule is now split by runtime:
 > *Stated consequences:* pinning **replaces** the daemon's history estimate for this job (basis `pinned:client`) — acceptable here because a `docker run` signature's history is CLI-only (tiny), so the raise essentially always exceeds it. The pinned value also becomes the **docker CLI's** scope `memory.max` via `:853`, printing `scope-memory.max=enforced=<container bytes>` for a client that will never use it — harmless, but stated because it reads as though confine capped something meaningful. And the charge reserves slice budget for memory that lives **outside** the slice: the deliberate trade the ticket asked for (machine-level headroom over slice utilisation), named as such.
 
 **`!DelegateRAM` guard** on the docker raise preserves AIRA-62.
+
+**A container limit larger than the whole slice is never charged** (build review, Fable P1). The daemon terminally rejects a pinned reserve above the ceiling (`E_ADMIT_TOO_LARGE`), which the runner surfaces as a **refused launch** — so `docker run -m 70g` on a 64 GiB slice would have been refused over a reserve the caller never declared, for a container that does not live in the slice at all, in direct contradiction of §3.6's "never refuse, report instead". Such a footprint cannot be meaningfully accounted for anyway, so it is reported (`:reserve-skipped:exceeds-slice-cap`) and skipped, never silently clamped to a smaller figure that would look like an accepted charge.
 
 **No second daemon lease.** Folding into the job's own single admission avoids a second blocking path and deadlock surface.
 
@@ -289,6 +295,8 @@ Assertions are **exact equalities, never inequalities** (Fable note 12) — an i
 - A container is asserted **live** before teardown, then absent after.
 - `confine --list` reports **`LIVE=yes`** for a running split job (§3.12) — not merely "non-zero populated", which the leaf count can never satisfy.
 - Isolation: unique `--name`, `--rm`, tiny `alpine`, **podman only, never docker**, nothing enumerates or touches containers the test did not create.
+
+**Composition-test isolation is load-bearing, not tidiness** (build review, Fable P0). `confineUnitDeps`' `start` execs the real target, so the composition harness MUST rewrite the target to `/bin/true` after capturing the argv. Asserted operationally: a full `go test ./...` leaves the docker and podman container stores unchanged.
 
 **Full suite:** `aira confine -- go test ./...` and `go vet ./...`, exit codes recorded exactly, serialised.
 

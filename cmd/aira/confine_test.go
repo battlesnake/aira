@@ -168,6 +168,57 @@ func TestConfineListRendersHumanTableAndAllowsJSON(t *testing.T) {
 	}
 }
 
+// AIRA-102: the LIVE column is what an operator reads to decide whether a job is
+// running, and it must come from the SUBTREE-aware signal. A job that relocates
+// its processes into a child cgroup -- an aitest suite draining into
+// `.aira-supervisor`, or `podman run --cgroups=split` moving everything into
+// `<scope>/runtime` plus the container payload -- has an empty LEAF count while
+// very much alive, and the old single POPULATED column rendered exactly that as
+// a bare 0.
+//
+// verifies: AIRA-102
+func TestRenderConfineListLiveColumnUsesSubtreePopulation(t *testing.T) {
+	pid, zero, rss, age := 4242, 0, int64(1<<20), int64(7)
+	scopeCap := "2147483648"
+	live, dead := true, false
+
+	render := func(t *testing.T, subtree *bool) string {
+		t.Helper()
+		result := runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{{
+			Name: "split-job", Owner: runner.ConfineUnknownOwner, SupervisorPID: &pid,
+			ScopeID: "CONFINE-split-job-4242-abc", Populated: &zero, SubtreePopulated: subtree,
+			RSSBytes: &rss, AgeSeconds: &age, Cap: &scopeCap,
+		}}}
+		dispatch := dispatcherFunc(func(_ context.Context, _ daemon.WorktreeScope, _ core.Request) core.Response {
+			return core.Response{OK: true, Code: "OK", Data: result}
+		})
+		var stdout, stderr bytes.Buffer
+		if exit := runWithInputDispatcher([]string{"confine", "--list"}, &stdout, &stderr, strings.NewReader(""), dispatch); exit != 0 {
+			t.Fatalf("exit=%d stderr=%q", exit, stderr.String())
+		}
+		return stdout.String()
+	}
+
+	output := render(t, &live)
+	for _, want := range []string{"LIVE", "LEAF-PROCS", "yes"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("a RUNNING split job's row lacks %q: %q", want, output)
+		}
+	}
+	// The whole point: a leaf count of 0 must no longer be the thing an operator
+	// reads as "not running".
+	if strings.Contains(output, "POPULATED") {
+		t.Fatalf("the ambiguous POPULATED column survived: %q", output)
+	}
+	if output = render(t, &dead); !strings.Contains(output, "no") {
+		t.Fatalf("a genuinely empty scope does not render LIVE=no: %q", output)
+	}
+	// An unreadable population is unevaluated, never a fabricated "no".
+	if output = render(t, nil); !strings.Contains(output, "unevaluated") {
+		t.Fatalf("an unreadable population must render unevaluated, not a guess: %q", output)
+	}
+}
+
 func TestRenderConfineListReserveSummary(t *testing.T) {
 	tests := []struct {
 		name    string

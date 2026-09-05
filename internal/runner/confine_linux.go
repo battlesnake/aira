@@ -506,7 +506,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// the daemon's history estimate with a client-pinned guess.
 	containerPlan := PlanContainerIntegration(request.Argv)
 	var containerReserveSkip string
-	reserve, pinned, containerReserveSkip = containerPlan.ResolveReserve(reserve, pinned, request.DelegateRAM)
+	reserve, pinned, containerReserveSkip = containerPlan.ResolveReserve(reserve, pinned, request.DelegateRAM, maximum)
 	signature := request.ResourceSignature
 	if signature == "" {
 		if computed, signatureErr := ResourceSignature(nil, nil, request.Argv); signatureErr == nil {
@@ -920,7 +920,16 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// ORIGINAL argv, so peak-RSS history keys do not fork the day AIRA starts
 	// injecting a flag. request.Argv itself is never rewritten -- the durable
 	// detached-job record keeps what the caller actually typed.
-	containerInjection := containerPlan.Inject(request.Argv, scopeMemoryMax)
+	// The DECLARED cap, never the resolved scope cap (build review, Fable P0).
+	// On an unpinned daemon grant scopeMemoryMax is a peak-RSS estimate, and for
+	// docker that estimate tracks the CLI, not the container -- injecting it caps
+	// the user's container at tens of megabytes, forever and unrecoverably. Only
+	// a number the caller chose may be imposed on their container.
+	declaredContainerCap := request.ScopeMemoryMax
+	if declaredContainerCap <= 0 && declaredReserve {
+		declaredContainerCap = declaredReserveBytes
+	}
+	containerInjection := containerPlan.Inject(request.Argv, declaredContainerCap)
 	if containerPlan.Detected() {
 		result.Status.Container = containerInjection.Placement
 		// The ledger charge is real only on a daemon grant. This is the SAME
@@ -1179,12 +1188,6 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	return result, nil
 }
 
-// formatConfineOOMAttributionAdvisory speaks for every OOM attribution EXCEPT
-// own-limit, which formatConfineReserveAdvisory already owns and whose wording
-// is unchanged. Each line states exactly what the counters establish and no
-// more; none of them claims a cap value, so none is gated on having one.
-//
-// covers: AIRA-102
 // confineOwnCapAdviceWarranted reports whether "job OOM-killed at its memory
 // cap" is a claim this scope's counters actually support (AIRA-102).
 //
@@ -1212,6 +1215,12 @@ func confineOwnCapAdviceWarranted(usage cgroupUsage) bool {
 	return ownEvaluated && own
 }
 
+// formatConfineOOMAttributionAdvisory speaks for every OOM attribution EXCEPT
+// own-limit, which formatConfineReserveAdvisory already owns and whose wording
+// is unchanged. Each line states exactly what the counters establish and no
+// more; none of them claims a cap value, so none is gated on having one.
+//
+// covers: AIRA-102
 func formatConfineOOMAttributionAdvisory(verdict string, attribution ConfineOOMAttribution, usage cgroupUsage) string {
 	// Deliberately silent where the existing advisories already speak, so an
 	// operator never gets two overlapping explanations of one event:
@@ -1251,7 +1260,7 @@ func formatConfineOOMAttributionAdvisory(verdict string, attribution ConfineOOMA
 		return fmt.Sprintf("confine: %d OOM kill(s) took this job's processes, but this scope's own limit did not declare the breach — an ancestor's cap fired (e.g. the slice) and this job was the collateral; raising this job's own cap would not have prevented it", kills)
 	case ConfineOOMUnestablished:
 		return fmt.Sprintf("confine: %d OOM kill(s) occurred under this scope; whose limit fired could not be "+
-			"established (memory.events.local unreadable), so this may have been this scope's own cap, an "+
+			"established from this scope's local counters, so this may have been this scope's own cap, an "+
 			"ancestor's, or a descendant's. If this job was the victim, raise --memory-max (or --memory-reserve).", kills)
 	default:
 		return ""
