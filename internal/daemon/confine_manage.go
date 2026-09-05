@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 
+	"aira/internal/codes"
 	"aira/internal/core"
 	"aira/internal/runner"
 	"aira/internal/store"
@@ -169,5 +170,5 @@ func stringArg(args map[string]any, name string) string {
 
 func confineManagementError(err error) core.Response {
 	code := store.ErrorCode(err)
-	return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+	return core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 }

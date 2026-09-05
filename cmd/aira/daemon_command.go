@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"aira/internal/codes"
 	"aira/internal/daemon"
 	"aira/internal/store"
 )
@@ -26,7 +27,7 @@ func runDaemonCommand(args []string, stdout, stderr io.Writer) int {
 	paths, err := daemon.PathsFromEnv()
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
-		return store.ExitForCode(daemon.CodeUnavailable)
+		return codes.ExitForCode(daemon.CodeUnavailable)
 	}
 	operation := "serve"
 	if len(args) > 0 {
@@ -56,7 +57,7 @@ func runDaemonCommand(args []string, stdout, stderr io.Writer) int {
 		}
 		if err != nil {
 			_, _ = fmt.Fprintln(stderr, err)
-			return store.ExitForCode(store.ErrorCode(err))
+			return codes.ExitForCode(store.ErrorCode(err))
 		}
 		return 0
 	case "status":
@@ -66,7 +67,7 @@ func runDaemonCommand(args []string, stdout, stderr io.Writer) int {
 		if status.Running && status.Ready {
 			return 0
 		}
-		return store.ExitForCode(daemon.CodeUnavailable)
+		return codes.ExitForCode(daemon.CodeUnavailable)
 	case "stop":
 		// Refuse (and redirect to systemctl) ONLY when this invocation's own daemon
 		// IS the managed service — identity-matched, not merely is-enabled. A
@@ -75,11 +76,11 @@ func runDaemonCommand(args []string, stdout, stderr io.Writer) int {
 		// must never be misdirected to `systemctl stop` the unrelated machine service.
 		if daemon.ServiceIdentityMatches(paths, daemon.DefaultServiceUnit, daemonSystemctlRun, nil, nil) {
 			_, _ = fmt.Fprintf(stderr, "%s: %s is enabled; use `systemctl --user stop %s` (or disable it)\n", daemon.CodeUnavailable, daemon.DefaultServiceUnit, daemon.DefaultServiceUnit)
-			return store.ExitForCode(daemon.CodeUnavailable)
+			return codes.ExitForCode(daemon.CodeUnavailable)
 		}
 		if err := daemon.Stop(paths); err != nil {
 			_, _ = fmt.Fprintln(stderr, err)
-			return store.ExitForCode(store.ErrorCode(err))
+			return codes.ExitForCode(store.ErrorCode(err))
 		}
 		deadline := time.Now().Add(10 * time.Second)
 		for time.Now().Before(deadline) {
@@ -90,10 +91,10 @@ func runDaemonCommand(args []string, stdout, stderr io.Writer) int {
 			time.Sleep(25 * time.Millisecond)
 		}
 		_, _ = fmt.Fprintln(stderr, daemon.CodeTimeout+": daemon did not stop before deadline")
-		return store.ExitForCode(daemon.CodeTimeout)
+		return codes.ExitForCode(daemon.CodeTimeout)
 	default:
 		_, _ = fmt.Fprintf(stderr, "E_SELECTOR_INVALID: unknown daemon operation %q\n", operation)
-		return store.ExitForCode("E_SELECTOR_INVALID")
+		return codes.ExitForCode("E_SELECTOR_INVALID")
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"aira/internal/codes"
 	"aira/internal/core"
 	"aira/internal/daemon"
 	"aira/internal/store"
@@ -54,18 +55,18 @@ func runWatchLoop(ctx context.Context, dispatcher Dispatcher, scope daemon.Workt
 
 		batch, err := decodeWatchResponse(response)
 		if err != nil {
-			return render(core.Response{Code: daemon.CodeProtocol, Error: daemon.CodeProtocol + ": " + err.Error(), Exit: store.ExitForCode(daemon.CodeProtocol)}, jsonOutput, stdout, stderr)
+			return render(core.Response{Code: daemon.CodeProtocol, Error: daemon.CodeProtocol + ": " + err.Error(), Exit: codes.ExitForCode(daemon.CodeProtocol)}, jsonOutput, stdout, stderr)
 		}
 		for _, event := range batch.Events {
 			if err := printWatchEvent(stdout, event, jsonOutput); err != nil {
 				_, _ = fmt.Fprintf(stderr, "E_INTERNAL: write watch event: %v\n", err)
-				return store.ExitForCode("E_INTERNAL")
+				return codes.ExitForCode("E_INTERNAL")
 			}
 		}
 		if flusher, ok := stdout.(interface{ Flush() error }); ok {
 			if err := flusher.Flush(); err != nil {
 				_, _ = fmt.Fprintf(stderr, "E_INTERNAL: flush watch events: %v\n", err)
-				return store.ExitForCode("E_INTERNAL")
+				return codes.ExitForCode("E_INTERNAL")
 			}
 		}
 		cursor = batch.Cursor

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"aira/internal/codes"
 	"aira/internal/store"
 )
 
@@ -334,8 +335,8 @@ func TestResponseContractExitsMatchRealDo(t *testing.T) {
 // listed, and the non-exhaustive default-exit rule must be stated (Fable P2).
 func TestResponseContractDocumentsDomainCodesAndDefault(t *testing.T) {
 	contract := ResponseContract()
-	if contract.DefaultExit != store.ExitForCode("E_UNREGISTERED_SENTINEL") {
-		t.Fatalf("contract default exit=%d, want %d", contract.DefaultExit, store.ExitForCode("E_UNREGISTERED_SENTINEL"))
+	if contract.DefaultExit != codes.ExitForCode("E_UNREGISTERED_SENTINEL") {
+		t.Fatalf("contract default exit=%d, want %d", contract.DefaultExit, codes.ExitForCode("E_UNREGISTERED_SENTINEL"))
 	}
 	listed := map[string]bool{}
 	for _, code := range contract.StableCodes {

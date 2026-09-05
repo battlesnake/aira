@@ -12,11 +12,13 @@ import (
 	"testing"
 
 	"aira/internal/app"
+	"aira/internal/codes"
 	"aira/internal/core"
 	"aira/internal/daemon"
 	"aira/internal/domain"
 	"aira/internal/runner"
 	"aira/internal/store"
+
 	"golang.org/x/sys/unix"
 )
 
@@ -439,8 +441,8 @@ func TestSupervisorRefusesRatherThanCreatingStateDBItself(t *testing.T) {
 		"--ready-fd", strconv.Itoa(readyFD),
 		"--ack-fd", strconv.Itoa(ackFD),
 	}, io.Discard)
-	if exit != store.ExitForCode("E_RUN_DETACH_FAILED") {
-		t.Fatalf("exit=%d want %d", exit, store.ExitForCode("E_RUN_DETACH_FAILED"))
+	if exit != codes.ExitForCode("E_RUN_DETACH_FAILED") {
+		t.Fatalf("exit=%d want %d", exit, codes.ExitForCode("E_RUN_DETACH_FAILED"))
 	}
 	if _, err := os.Stat(paths.DBPath); !os.IsNotExist(err) {
 		t.Fatalf("the supervisor created the daemon-owned state.db itself: %v", err)

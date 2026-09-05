@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"aira/internal/app"
+	"aira/internal/codes"
 	"aira/internal/core"
 	"aira/internal/gitcontext"
 	"aira/internal/store"
@@ -96,7 +97,7 @@ func (s *Server) eject(ctx context.Context, args map[string]any) core.Response {
 
 func lifecycleError(err error) core.Response {
 	code := store.ErrorCode(err)
-	return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+	return core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 }
 
 func (s *Server) beginEject(target store.ProjectRegistration) error {

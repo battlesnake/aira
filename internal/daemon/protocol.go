@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"aira/internal/codes"
 	"aira/internal/core"
 	"aira/internal/store"
 )
@@ -151,7 +152,7 @@ func marshalNoEscape(v any) ([]byte, error) {
 }
 
 func errorFrame(code, message string) ResponseFrame {
-	return ResponseFrame{Code: code, Error: message, Exit: store.ExitForCode(code)}
+	return ResponseFrame{Code: code, Error: message, Exit: codes.ExitForCode(code)}
 }
 
 func protocolMismatchFrame(message string) ResponseFrame {
@@ -169,7 +170,7 @@ func (frame ResponseFrame) CoreResponse() core.Response {
 		decoder := json.NewDecoder(bytes.NewReader(frame.Data))
 		decoder.UseNumber()
 		if err := decoder.Decode(&value); err != nil {
-			return core.Response{Code: CodeProtocol, Error: CodeProtocol + ": invalid response data", Exit: store.ExitForCode(CodeProtocol)}
+			return core.Response{Code: CodeProtocol, Error: CodeProtocol + ": invalid response data", Exit: codes.ExitForCode(CodeProtocol)}
 		}
 		response.Data = value
 		response.RawData = append(json.RawMessage(nil), frame.Data...)

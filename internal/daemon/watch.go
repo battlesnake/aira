@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"aira/internal/codes"
 	"aira/internal/core"
 	"aira/internal/store"
 )
@@ -224,7 +225,7 @@ func watchOK(events []store.WatchEvent, cursor int64, eof bool) core.Response {
 }
 
 func watchError(code, message string) core.Response {
-	return core.Response{Code: code, Error: message, Exit: store.ExitForCode(code)}
+	return core.Response{Code: code, Error: message, Exit: codes.ExitForCode(code)}
 }
 
 func watchInt64(value any) int64 {

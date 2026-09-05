@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"aira/internal/codes"
 	"aira/internal/runner"
-	"aira/internal/store"
 )
 
 func TestM20bSupervisorRejectsMalformedSidecarBeforeOpeningProject(t *testing.T) {
@@ -46,7 +46,7 @@ func TestM20bSupervisorRejectsMalformedSidecarBeforeOpeningProject(t *testing.T)
 		"--ack-fd", itoaFD(ackR),
 		"--wiring", wiring,
 	}, nil)
-	if exit != store.ExitForCode("E_RUN_ARGUMENT_INVALID") {
+	if exit != codes.ExitForCode("E_RUN_ARGUMENT_INVALID") {
 		t.Fatalf("exit=%d", exit)
 	}
 	var ready map[string]string

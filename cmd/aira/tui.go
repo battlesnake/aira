@@ -12,9 +12,10 @@ import (
 	"sync/atomic"
 	"syscall"
 
+	"aira/internal/codes"
 	"aira/internal/core"
 	"aira/internal/daemon"
-	"aira/internal/store"
+
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
@@ -86,7 +87,7 @@ func runTUI(ctx context.Context, dispatcher, executeDispatcher Dispatcher, scope
 func runTUIRuntime(runtime *tuiRuntime, stderr io.Writer) int {
 	if err := runtime.run(); err != nil {
 		_, _ = fmt.Fprintf(stderr, "E_INTERNAL: tui: %v\n", err)
-		return store.ExitForCode("E_INTERNAL")
+		return codes.ExitForCode("E_INTERNAL")
 	}
 	return 0
 }

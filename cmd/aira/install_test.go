@@ -8,10 +8,10 @@ import (
 	"reflect"
 	"testing"
 
+	"aira/internal/codes"
 	"aira/internal/core"
 	"aira/internal/daemon"
 	installcmd "aira/internal/install"
-	"aira/internal/store"
 )
 
 type panicDispatcher struct{}
@@ -45,7 +45,7 @@ func TestInstallErrorUsesStableCodeAndExit(t *testing.T) {
 	runInstaller = func([]string, io.Writer) error { return errors.New(installcmd.CodeOvercommit + ": refused") }
 	var stdout, stderr bytes.Buffer
 	exit := Run([]string{"install"}, &stdout, &stderr)
-	if exit != store.ExitForCode(installcmd.CodeOvercommit) || stderr.String() != installcmd.CodeOvercommit+": refused\n" {
+	if exit != codes.ExitForCode(installcmd.CodeOvercommit) || stderr.String() != installcmd.CodeOvercommit+": refused\n" {
 		t.Fatalf("exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
 	}
 }

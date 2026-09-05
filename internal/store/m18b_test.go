@@ -1,9 +1,12 @@
 package store
 
-import "testing"
+import (
+	"aira/internal/codes"
+	"testing"
+)
 
 func TestPTYUnavailableHasStableFailureExit(t *testing.T) {
-	if got := ExitForCode("E_RUN_PTY_UNAVAILABLE"); got != 1 {
+	if got := codes.ExitForCode("E_RUN_PTY_UNAVAILABLE"); got != 1 {
 		t.Fatalf("E_RUN_PTY_UNAVAILABLE exit=%d want 1", got)
 	}
 }
@@ -16,7 +19,7 @@ func TestM19ExitCodeRegistration(t *testing.T) {
 		"U_RUN_REPORT_TOO_LARGE":        3,
 	}
 	for code, exit := range want {
-		if got := ExitForCode(code); got != exit {
+		if got := codes.ExitForCode(code); got != exit {
 			t.Fatalf("%s exit=%d want=%d", code, got, exit)
 		}
 	}

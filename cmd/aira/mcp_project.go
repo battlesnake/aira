@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"aira/internal/app"
+	"aira/internal/codes"
 	"aira/internal/core"
 	"aira/internal/daemon"
 	"aira/internal/runner"
@@ -39,7 +40,7 @@ func runMCPWithDispatcher(ctx context.Context, input io.Reader, output, diagnost
 		scopeDir, scopeDirErr := resolveScopeDir(scopeDirOverride)
 		if scopeDirErr != nil {
 			code := store.ErrorCode(scopeDirErr)
-			return core.Response{Code: code, Error: scopeDirErr.Error(), Exit: store.ExitForCode(code)}
+			return core.Response{Code: code, Error: scopeDirErr.Error(), Exit: codes.ExitForCode(code)}
 		}
 		canonical := core.CanonicalVerb(request.Verb)
 		if canonical == "init" {
@@ -73,15 +74,15 @@ func runMCPWithDispatcher(ctx context.Context, input io.Reader, output, diagnost
 		}
 		if scopeErr != nil {
 			code := store.ErrorCode(scopeErr)
-			return core.Response{Code: code, Error: scopeErr.Error(), Exit: store.ExitForCode(code)}
+			return core.Response{Code: code, Error: scopeErr.Error(), Exit: codes.ExitForCode(code)}
 		}
 		if err := refuseAmbiguousImportPath(request, scopeDirOverride); err != nil {
 			code := store.ErrorCode(err)
-			return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+			return core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 		}
 		if err := prepareImportContent(&request); err != nil {
 			code := store.ErrorCode(err)
-			return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+			return core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 		}
 		response := dispatcher.Dispatch(requestContext, scope, request)
 		if canonical == "init" {

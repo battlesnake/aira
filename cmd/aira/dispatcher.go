@@ -14,11 +14,13 @@ import (
 	"time"
 
 	"aira/internal/app"
+	"aira/internal/codes"
 	"aira/internal/core"
 	"aira/internal/daemon"
 	"aira/internal/gitcontext"
 	"aira/internal/runner"
 	"aira/internal/store"
+
 	"golang.org/x/sys/unix"
 )
 
@@ -207,7 +209,7 @@ func (d *daemonDispatcher) dispatchConfineManagement(ctx context.Context, reques
 
 func confineClientError(err error) core.Response {
 	code := store.ErrorCode(err)
-	return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+	return core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 }
 
 // TUILeaseToken snapshots the caller worktree's local bearer token without
@@ -288,7 +290,7 @@ func (d *daemonDispatcher) dispatchClient(ctx context.Context, scope daemon.Work
 	})
 	if err != nil {
 		code := store.ErrorCode(err)
-		return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+		return core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 	}
 	defer readOnly.Close()
 	relay := newWriteRelayStore(readOnly, scope, func(ctx context.Context, frame daemon.StoreOpFrame) (daemon.ResponseFrame, error) {
@@ -310,7 +312,7 @@ func (d *daemonDispatcher) dispatchClient(ctx context.Context, scope daemon.Work
 func (d *daemonDispatcher) prepareClientProject(ctx context.Context, scope daemon.WorktreeScope) (*app.Project, *core.Response) {
 	fail := func(err error) *core.Response {
 		code := store.ErrorCode(err)
-		return &core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+		return &core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 	}
 	frame := daemon.StoreOpFrame{Proto: daemon.ProtocolVersion, Scope: scope, Op: "ensure-scope"}
 	response, err := d.exchangeWithReplacement(ctx, func(ctx context.Context) (daemon.ResponseFrame, error) {
@@ -422,7 +424,7 @@ func transportErrorResponse(err error) core.Response {
 	if code == "E_INTERNAL" {
 		code = daemon.CodeUnavailable
 	}
-	return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+	return core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 }
 
 func (d *daemonDispatcher) exchangeOrStart(ctx context.Context, frame daemon.RequestFrame) (daemon.ResponseFrame, error) {
@@ -648,7 +650,7 @@ func (d *inProcessDispatcher) Dispatch(ctx context.Context, scope daemon.Worktre
 		result, err := app.Init(ctx, scope.Root, request.Args)
 		if err != nil {
 			code := store.ErrorCode(err)
-			return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+			return core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 		}
 		return core.Response{OK: true, Code: "OK", Data: result}
 	}
@@ -658,7 +660,7 @@ func (d *inProcessDispatcher) Dispatch(ctx context.Context, scope daemon.Worktre
 	s, project, err := app.OpenWithDiagnostics(ctx, scope.Root, d.diagnostics)
 	if err != nil {
 		code := store.ErrorCode(err)
-		return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+		return core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 	}
 	defer s.Close()
 	if paths, pathErr := daemon.PathsFromEnv(); pathErr == nil {

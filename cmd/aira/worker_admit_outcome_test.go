@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"aira/internal/codes"
 	"aira/internal/runner"
-	"aira/internal/store"
 )
 
 func parseOnlyOutcomeLine(t *testing.T, stdout string) map[string]string {
@@ -72,7 +72,7 @@ func TestRunWorkerAdmitCommandAlwaysWritesOneStructuredOutcome(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			exit := runWorkerAdmitCommand(context.Background(), test.options, strings.NewReader(""), &stdout, &stderr)
-			if want := store.ExitForCode(test.wantCode); exit != want {
+			if want := codes.ExitForCode(test.wantCode); exit != want {
 				t.Fatalf("exit=%d want %d; stderr=%s", exit, want, stderr.String())
 			}
 			fields := parseOnlyOutcomeLine(t, stdout.String())
@@ -94,7 +94,7 @@ func TestWorkerAdmitPreDispatchFailuresSpeakTheOutcomeChannel(t *testing.T) {
 	t.Run("unknown option", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
 		exit := Run([]string{"worker-admit", "--not-an-option", "x"}, &stdout, &stderr)
-		if want := store.ExitForCode("E_CONFINE_ARGUMENT_INVALID"); exit != want {
+		if want := codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID"); exit != want {
 			t.Fatalf("exit=%d want %d; stderr=%s", exit, want, stderr.String())
 		}
 		fields := parseOnlyOutcomeLine(t, stdout.String())

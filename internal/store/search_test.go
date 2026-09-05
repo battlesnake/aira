@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"aira/internal/codes"
 	"aira/internal/domain"
 )
 
@@ -228,7 +229,7 @@ func TestRebuildReconstructsSearchRowsAfterCanonicalRemoval(t *testing.T) {
 func TestSearchRejectsMalformedFTSQuery(t *testing.T) {
 	s := queryTestStore(t)
 	for _, query := range []string{`"unterminated`, `nosuch:term`, `alpha AND (`} {
-		if _, err := s.Search(context.Background(), query, ""); ErrorCode(err) != "E_QUERY_INVALID" || ExitForCode(ErrorCode(err)) != 2 {
+		if _, err := s.Search(context.Background(), query, ""); ErrorCode(err) != "E_QUERY_INVALID" || codes.ExitForCode(ErrorCode(err)) != 2 {
 			t.Fatalf("malformed query %q error = %v", query, err)
 		}
 	}
@@ -304,7 +305,7 @@ func TestSearchRealIndexFailureIsUnevaluated(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Search(context.Background(), "anything", ""); ErrorCode(err) != "E_INDEX_UNEVALUATED" || ExitForCode(ErrorCode(err)) != 3 {
+	if _, err := s.Search(context.Background(), "anything", ""); ErrorCode(err) != "E_INDEX_UNEVALUATED" || codes.ExitForCode(ErrorCode(err)) != 3 {
 		t.Fatalf("closed search store error = %v", err)
 	}
 }

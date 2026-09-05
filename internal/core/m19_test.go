@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"aira/internal/codes"
 	"aira/internal/domain"
 	"aira/internal/gitcontext"
 	"aira/internal/runner"
@@ -342,10 +343,10 @@ func TestM19StrictWiringPrecedenceMatrix(t *testing.T) {
 		wantCode              string
 	}{
 		{name: "success all wiring ok", report: true, compute: true},
-		{name: "success report fails", report: true, reportErr: errors.New("E_INTERNAL: report"), wantExit: store.ExitForCode("E_RUN_WIRING_INCOMPLETE"), wantCode: "E_RUN_WIRING_INCOMPLETE"},
-		{name: "success compute fails", compute: true, computeErr: errors.New("E_INTERNAL: compute"), wantExit: store.ExitForCode("E_RUN_WIRING_INCOMPLETE"), wantCode: "E_RUN_WIRING_INCOMPLETE"},
-		{name: "success multiple fail", report: true, compute: true, reportErr: errors.New("E_INTERNAL: report"), computeErr: errors.New("E_INTERNAL: compute"), wantExit: store.ExitForCode("E_RUN_WIRING_INCOMPLETE"), wantCode: "E_RUN_WIRING_INCOMPLETE"},
-		{name: "child failure wins", childExit: 23, report: true, reportErr: errors.New("E_INTERNAL: report"), wantExit: store.ExitForCode("E_RUN_FAILED"), wantCode: "E_RUN_FAILED"},
+		{name: "success report fails", report: true, reportErr: errors.New("E_INTERNAL: report"), wantExit: codes.ExitForCode("E_RUN_WIRING_INCOMPLETE"), wantCode: "E_RUN_WIRING_INCOMPLETE"},
+		{name: "success compute fails", compute: true, computeErr: errors.New("E_INTERNAL: compute"), wantExit: codes.ExitForCode("E_RUN_WIRING_INCOMPLETE"), wantCode: "E_RUN_WIRING_INCOMPLETE"},
+		{name: "success multiple fail", report: true, compute: true, reportErr: errors.New("E_INTERNAL: report"), computeErr: errors.New("E_INTERNAL: compute"), wantExit: codes.ExitForCode("E_RUN_WIRING_INCOMPLETE"), wantCode: "E_RUN_WIRING_INCOMPLETE"},
+		{name: "child failure wins", childExit: 23, report: true, reportErr: errors.New("E_INTERNAL: report"), wantExit: codes.ExitForCode("E_RUN_FAILED"), wantCode: "E_RUN_FAILED"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &m19Store{reportErr: tc.reportErr, computeErr: tc.computeErr}

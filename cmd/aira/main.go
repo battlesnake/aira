@@ -19,6 +19,7 @@ import (
 	"golang.org/x/term"
 
 	"aira/internal/app"
+	"aira/internal/codes"
 	"aira/internal/core"
 	"aira/internal/daemon"
 	"aira/internal/domain"
@@ -66,7 +67,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	if len(argv) > 0 && strings.EqualFold(argv[0], "install") {
 		if err := runInstaller(argv[1:], stdout); err != nil {
 			_, _ = fmt.Fprintln(stderr, err)
-			return store.ExitForCode(store.ErrorCode(err))
+			return codes.ExitForCode(store.ErrorCode(err))
 		}
 		return 0
 	}
@@ -107,7 +108,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	renderJSON := jsonOutput || !stdoutIsTerminal(stdout)
 	if scopeDirErr != nil {
 		code := store.ErrorCode(scopeDirErr)
-		return render(core.Response{Code: code, Error: scopeDirErr.Error(), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
+		return render(core.Response{Code: code, Error: scopeDirErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 	}
 	// A verb that resolves no project/worktree scope refuses the override rather
 	// than accepting and discarding it: silently ignoring an explicit scope is
@@ -119,13 +120,13 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		if !verbAcceptsScopeDir(target) {
 			message := fmt.Sprintf("E_SELECTOR_INVALID: option %s is not valid for %s", scopeDirFlag, target)
-			return render(core.Response{Code: "E_SELECTOR_INVALID", Error: message, Exit: store.ExitForCode("E_SELECTOR_INVALID")}, renderJSON, stdout, stderr)
+			return render(core.Response{Code: "E_SELECTOR_INVALID", Error: message, Exit: codes.ExitForCode("E_SELECTOR_INVALID")}, renderJSON, stdout, stderr)
 		}
 	}
 	scopeDir, scopeDirResolveErr := resolveScopeDir(scopeDirOption)
 	if scopeDirResolveErr != nil {
 		code := store.ErrorCode(scopeDirResolveErr)
-		return render(core.Response{Code: code, Error: scopeDirResolveErr.Error(), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
+		return render(core.Response{Code: code, Error: scopeDirResolveErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 	}
 	if len(args) == 0 || args[0] == "help" || args[0] == "--help" {
 		response := core.New(nil).Do(context.Background(), core.Request{Verb: "help"})
@@ -155,11 +156,11 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		if code == "E_INTERNAL" {
 			code = "E_SELECTOR_INVALID"
 		}
-		response := core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+		response := core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 		return render(response, renderJSON, stdout, stderr)
 	}
 	if verb == "tui" && jsonOutput {
-		response := core.Response{Code: "E_SELECTOR_INVALID", Error: "option --json is not valid for tui", Exit: store.ExitForCode("E_SELECTOR_INVALID")}
+		response := core.Response{Code: "E_SELECTOR_INVALID", Error: "option --json is not valid for tui", Exit: codes.ExitForCode("E_SELECTOR_INVALID")}
 		return render(response, true, stdout, stderr)
 	}
 	if verb == "confine" {
@@ -171,7 +172,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		status := options["status"] == "true"
 		management := options["list"] == "true" || options["kill"] != "" || status
 		if jsonOutput && !management {
-			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for confine", Exit: store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
+			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for confine", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
 			return render(response, true, stdout, stderr)
 		}
 		if status {
@@ -184,21 +185,21 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	}
 	if verb == "confine-reserve" {
 		if jsonOutput {
-			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for confine-reserve", Exit: store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
+			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for confine-reserve", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
 			return render(response, true, stdout, stderr)
 		}
 		return runConfineReserveCommand(context.Background(), options, stdin, stdout, stderr)
 	}
 	if verb == "governor-slot" {
 		if jsonOutput {
-			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for governor-slot", Exit: store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
+			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for governor-slot", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
 			return render(response, true, stdout, stderr)
 		}
 		return runGovernorSlotCommand(context.Background(), options, stdin, stdout, stderr)
 	}
 	if verb == "aitest-bootstrap" {
 		if jsonOutput {
-			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for aitest-bootstrap", Exit: store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
+			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for aitest-bootstrap", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
 			return render(response, true, stdout, stderr)
 		}
 		return runAitestBootstrapCommand(context.Background(), options, stdout, stderr)
@@ -225,11 +226,11 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 			if code == "E_INTERNAL" {
 				code = "E_CONFINE_ARGUMENT_INVALID"
 			}
-			return render(core.Response{Code: code, Error: requestErr.Error(), Exit: store.ExitForCode(code)}, jsonOutput, stdout, stderr)
+			return render(core.Response{Code: code, Error: requestErr.Error(), Exit: codes.ExitForCode(code)}, jsonOutput, stdout, stderr)
 		}
 		owner, ownerErr := resolveConfineOwner(context.Background(), options["owner"])
 		if ownerErr != nil {
-			return render(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: --owner: " + ownerErr.Error(), Exit: store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, jsonOutput, stdout, stderr)
+			return render(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: --owner: " + ownerErr.Error(), Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, jsonOutput, stdout, stderr)
 		}
 		request.Args["owner"] = owner
 		return dispatchConfineManagementRequest(context.Background(), request, jsonOutput, stdout, stderr, injected)
@@ -238,12 +239,12 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		request, requestErr := buildRequest(verb, positional, options)
 		if requestErr != nil {
 			code := store.ErrorCode(requestErr)
-			return render(core.Response{Code: code, Error: requestErr.Error(), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
+			return render(core.Response{Code: code, Error: requestErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 		}
 		if request.Args["project"] == "" && request.Args["prefix"] == "" {
 			project, discoverErr := app.Discover(context.Background(), scopeDir)
 			if discoverErr != nil {
-				return render(core.Response{Code: "E_NO_PROJECT", Error: "E_NO_PROJECT: no selector and no current .aira/config", Exit: store.ExitForCode("E_NO_PROJECT")}, renderJSON, stdout, stderr)
+				return render(core.Response{Code: "E_NO_PROJECT", Error: "E_NO_PROJECT: no selector and no current .aira/config", Exit: codes.ExitForCode("E_NO_PROJECT")}, renderJSON, stdout, stderr)
 			}
 			request.Args["project"] = project.ProjectID
 		}
@@ -272,7 +273,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		project, discoverErr := app.DiscoverBootstrap(context.Background(), scopeDir)
 		if discoverErr != nil {
 			code := appErrorCode(discoverErr)
-			return render(core.Response{Code: code, Error: discoverErr.Error(), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
+			return render(core.Response{Code: code, Error: discoverErr.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 		}
 		dispatcher := injected
 		if dispatcher == nil {
@@ -292,7 +293,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		if code == "E_INTERNAL" {
 			code = "E_SELECTOR_INVALID"
 		}
-		return render(core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
+		return render(core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 	}
 	if verb == "test-report" && len(positional) > 0 && strings.EqualFold(positional[0], "add") {
 		path := "-"
@@ -307,7 +308,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		if err != nil {
 			code := "E_TESTREPORT_INVALID"
-			return render(core.Response{Code: code, Error: fmt.Sprintf("%s: %v", code, err), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
+			return render(core.Response{Code: code, Error: fmt.Sprintf("%s: %v", code, err), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 		}
 		request.Args["raw"] = data
 	}
@@ -316,7 +317,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		usageFile := options["usage-file"]
 		if usageFile != "" && len(bucketValues) > 0 {
 			code := store.ErrorCode(fmt.Errorf("%s: --usage-file and --bucket are mutually exclusive", domain.ComputeCodeInvalid))
-			return render(core.Response{Code: code, Error: fmt.Sprintf("%s: --usage-file and --bucket are mutually exclusive", code), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
+			return render(core.Response{Code: code, Error: fmt.Sprintf("%s: --usage-file and --bucket are mutually exclusive", code), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 		}
 		var data []byte
 		if usageFile != "" {
@@ -326,12 +327,12 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		if err != nil {
 			code := domain.ComputeCodeInvalid
-			return render(core.Response{Code: code, Error: fmt.Sprintf("%s: %v", code, err), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
+			return render(core.Response{Code: code, Error: fmt.Sprintf("%s: %v", code, err), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 		}
 		if len(bucketValues) > 0 {
 			if strings.TrimSpace(string(data)) != "" {
 				code := domain.ComputeCodeInvalid
-				return render(core.Response{Code: code, Error: code + ": payload and --bucket are mutually exclusive", Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
+				return render(core.Response{Code: code, Error: code + ": payload and --bucket are mutually exclusive", Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 			}
 			request.Args["bucket"] = bucketValues
 		} else {
@@ -340,7 +341,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	}
 	if err := prepareImportContent(&request); err != nil {
 		code := store.ErrorCode(err)
-		return render(core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
+		return render(core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 	}
 	paths, err := daemon.PathsFromEnv()
 	if err != nil {
@@ -349,7 +350,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	scope, err := scopeForCWD(context.Background(), scopeDir, paths)
 	if err != nil {
 		code := appErrorCode(err)
-		return render(core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}, renderJSON, stdout, stderr)
+		return render(core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}, renderJSON, stdout, stderr)
 	}
 	if verb == "tui" {
 		dispatcher := injected
@@ -417,16 +418,16 @@ func runSupervisor(argv []string, diagnostics io.Writer) int {
 	for i := 0; i < len(argv); i += 2 {
 		if i+1 >= len(argv) || !strings.HasPrefix(argv[i], "--") {
 			writeSupervisorFailure(readyForFailure, "E_RUN_ARGUMENT_INVALID", "malformed supervisor arguments")
-			return store.ExitForCode("E_RUN_ARGUMENT_INVALID")
+			return codes.ExitForCode("E_RUN_ARGUMENT_INVALID")
 		}
 		name := strings.TrimPrefix(argv[i], "--")
 		if name != "control" && name != "ready-fd" && name != "ack-fd" && name != "wiring" {
 			writeSupervisorFailure(readyForFailure, "E_RUN_ARGUMENT_INVALID", "malformed supervisor arguments")
-			return store.ExitForCode("E_RUN_ARGUMENT_INVALID")
+			return codes.ExitForCode("E_RUN_ARGUMENT_INVALID")
 		}
 		if _, exists := values[name]; exists {
 			writeSupervisorFailure(readyForFailure, "E_RUN_ARGUMENT_INVALID", "duplicate supervisor argument")
-			return store.ExitForCode("E_RUN_ARGUMENT_INVALID")
+			return codes.ExitForCode("E_RUN_ARGUMENT_INVALID")
 		}
 		values[name] = argv[i+1]
 	}
@@ -434,12 +435,12 @@ func runSupervisor(argv []string, diagnostics io.Writer) int {
 	ackFD, ackErr := strconv.Atoi(values["ack-fd"])
 	if values["control"] == "" || readyErr != nil || ackErr != nil || readyFD < 0 || ackFD < 0 {
 		writeSupervisorFailure(readyFD, "E_RUN_ARGUMENT_INVALID", "malformed supervisor arguments")
-		return store.ExitForCode("E_RUN_ARGUMENT_INVALID")
+		return codes.ExitForCode("E_RUN_ARGUMENT_INVALID")
 	}
 	request, err := runner.ConsumeDetachControl(values["control"])
 	if err != nil {
 		writeSupervisorFailure(readyFD, "E_RUN_ARGUMENT_INVALID", err.Error())
-		return store.ExitForCode("E_RUN_ARGUMENT_INVALID")
+		return codes.ExitForCode("E_RUN_ARGUMENT_INVALID")
 	}
 	var wiringParams core.WiringParams
 	var reportContext store.TestReportContext
@@ -448,7 +449,7 @@ func runSupervisor(argv []string, diagnostics io.Writer) int {
 		wiringParams, reportContext, err = core.ConsumeDetachedWiringSidecar(values["wiring"])
 		if err != nil {
 			writeSupervisorFailure(readyFD, "E_RUN_ARGUMENT_INVALID", err.Error())
-			return store.ExitForCode("E_RUN_ARGUMENT_INVALID")
+			return codes.ExitForCode("E_RUN_ARGUMENT_INVALID")
 		}
 		request.TelemetryPending = core.TelemetryPending
 	}
@@ -461,7 +462,7 @@ func runSupervisor(argv []string, diagnostics io.Writer) int {
 	project, err := app.OpenWithoutStore(context.Background(), ".", diagnostics)
 	if err != nil {
 		writeSupervisorFailure(readyFD, "E_RUN_DETACH_FAILED", err.Error())
-		return store.ExitForCode("E_RUN_DETACH_FAILED")
+		return codes.ExitForCode("E_RUN_DETACH_FAILED")
 	}
 	paths, pathErr := daemon.PathsFromEnv()
 	if pathErr == nil {
@@ -477,7 +478,7 @@ func runSupervisor(argv []string, diagnostics io.Writer) int {
 	telemetryStore, err := supervisorTelemetryStore(project, paths)
 	if err != nil {
 		writeSupervisorFailure(readyFD, "E_RUN_DETACH_FAILED", err.Error())
-		return store.ExitForCode("E_RUN_DETACH_FAILED")
+		return codes.ExitForCode("E_RUN_DETACH_FAILED")
 	}
 	defer telemetryStore.Close()
 	telemetryStore.SetRunner(project.Runner)
@@ -497,10 +498,10 @@ func runSupervisor(argv []string, diagnostics io.Writer) int {
 		}
 	}
 	if superviseErr != nil {
-		return store.ExitForCode(store.ErrorCode(superviseErr))
+		return codes.ExitForCode(store.ErrorCode(superviseErr))
 	}
 	if telemetryErr != nil {
-		return store.ExitForCode(store.ErrorCode(telemetryErr))
+		return codes.ExitForCode(store.ErrorCode(telemetryErr))
 	}
 	return 0
 }
@@ -1008,7 +1009,7 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 	maximum, high, err := parseScopeMemoryOptions(options, "E_CONFINE_ARGUMENT_INVALID")
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
-		return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 	}
 	reserveRaw, reservePinned := options["memory-reserve"]
 	if !reservePinned {
@@ -1023,7 +1024,7 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 				err = errors.New("must be at least 1MiB")
 			}
 			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --memory-reserve: %v\n", err)
-			return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 		}
 	}
 	// AIRA-62: the CLI TRANSCRIBES, it does not resolve. This used to be
@@ -1048,13 +1049,13 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 				err = fmt.Errorf("must be in [1ms,%s]", runner.AdmitWaitCeiling)
 			}
 			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --admit-timeout: %v\n", err)
-			return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 		}
 	}
 	owner, err := resolveConfineOwner(ctx, options["owner"])
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --owner: %v\n", err)
-		return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 	}
 	request := runner.ConfineRequest{
 		Slice: options["slice"], Name: options["name"], Argv: append([]string(nil), target...),
@@ -1077,7 +1078,7 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 	result, err := runConfined(ctx, request)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
-		return store.ExitForCode(store.ErrorCode(err))
+		return codes.ExitForCode(store.ErrorCode(err))
 	}
 	return result.Exit
 }
@@ -1096,7 +1097,7 @@ func runConfineDetachCommand(ctx context.Context, request runner.ConfineRequest,
 		// outcome would lose the very result the operator detached in order to
 		// keep, so it must never silently degrade to a foreground run.
 		_, _ = fmt.Fprintf(stderr, "%s: cannot resolve the durable record directory: %v\n", runner.CodeConfineDetachFailed, err)
-		return store.ExitForCode(runner.CodeConfineDetachFailed)
+		return codes.ExitForCode(runner.CodeConfineDetachFailed)
 	}
 	// A detached job's stdio belongs to its capture files, never to the launching
 	// terminal, which is about to go away.
@@ -1104,14 +1105,14 @@ func runConfineDetachCommand(ctx context.Context, request runner.ConfineRequest,
 	launch, err := launchConfineDetached(ctx, request)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
-		return store.ExitForCode(store.ErrorCode(err))
+		return codes.ExitForCode(store.ErrorCode(err))
 	}
 	if launch == nil || launch.Acknowledge == nil {
 		// A launch with no acknowledgement channel cannot be confirmed, and an
 		// unconfirmed supervisor abandons the job — so reporting success here
 		// would be a fabricated one.
 		_, _ = fmt.Fprintf(stderr, "%s: the detached launch returned no acknowledgement channel\n", runner.CodeConfineDetachFailed)
-		return store.ExitForCode(runner.CodeConfineDetachFailed)
+		return codes.ExitForCode(runner.CodeConfineDetachFailed)
 	}
 	delivered := true
 	for _, line := range []string{
@@ -1132,7 +1133,7 @@ func runConfineDetachCommand(ctx context.Context, request runner.ConfineRequest,
 		// and this must not report success: a job nobody holds a handle to would
 		// consume the shared slice invisibly.
 		_, _ = fmt.Fprintf(stderr, "%s: the detached handle could not be delivered; the supervisor was told to abandon the launch\n", runner.CodeConfineDetachFailed)
-		return store.ExitForCode(runner.CodeConfineDetachFailed)
+		return codes.ExitForCode(runner.CodeConfineDetachFailed)
 	}
 	return 0
 }
@@ -1149,19 +1150,19 @@ func runConfineStatusCommand(ctx context.Context, options map[string]string, jso
 	paths, err := daemon.PathsFromEnv()
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "%s: cannot resolve the durable record directory: %v\n", runner.CodeConfineOutcomeUnknown, err)
-		return store.ExitForCode(runner.CodeConfineOutcomeUnknown)
+		return codes.ExitForCode(runner.CodeConfineOutcomeUnknown)
 	}
 	owner, ownerErr := resolveConfineOwner(ctx, options["owner"])
 	if ownerErr != nil {
 		_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --owner: %v\n", ownerErr)
-		return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 	}
 	selector := strings.TrimSpace(options["status-selector"])
 	if selector == "" {
 		statuses, listErr := confineDetachStatusList(paths.ConfineDetachDir, owner)
 		if listErr != nil {
 			_, _ = fmt.Fprintln(stderr, listErr)
-			return store.ExitForCode(store.ErrorCode(listErr))
+			return codes.ExitForCode(store.ErrorCode(listErr))
 		}
 		if jsonOutput {
 			return writeConfineStatusJSON(statuses, stdout, stderr)
@@ -1178,14 +1179,14 @@ func runConfineStatusCommand(ctx context.Context, options map[string]string, jso
 	status, statusErr := confineDetachStatusFor(paths.ConfineDetachDir, selector, owner)
 	if statusErr != nil {
 		_, _ = fmt.Fprintln(stderr, statusErr)
-		return store.ExitForCode(store.ErrorCode(statusErr))
+		return codes.ExitForCode(store.ErrorCode(statusErr))
 	}
 	if jsonOutput {
 		return writeConfineStatusJSON(status, stdout, stderr)
 	}
 	_, _ = fmt.Fprintln(stdout, runner.FormatConfineDetachStatus(status))
 	if status.State == runner.ConfineDetachOutcomeUnknown {
-		return store.ExitForCode(runner.CodeConfineOutcomeUnknown)
+		return codes.ExitForCode(runner.CodeConfineOutcomeUnknown)
 	}
 	return 0
 }
@@ -1194,11 +1195,11 @@ func writeConfineStatusJSON(payload any, stdout, stderr io.Writer) int {
 	encoded, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "%s: %v\n", runner.CodeConfineOutcomeUnknown, err)
-		return store.ExitForCode(runner.CodeConfineOutcomeUnknown)
+		return codes.ExitForCode(runner.CodeConfineOutcomeUnknown)
 	}
 	_, _ = stdout.Write(append(encoded, '\n'))
 	if status, ok := payload.(runner.ConfineDetachStatus); ok && status.State == runner.ConfineDetachOutcomeUnknown {
-		return store.ExitForCode(runner.CodeConfineOutcomeUnknown)
+		return codes.ExitForCode(runner.CodeConfineOutcomeUnknown)
 	}
 	return 0
 }
@@ -1212,21 +1213,21 @@ func runConfineSupervisor(argv []string) int {
 	values := map[string]string{}
 	for i := 0; i < len(argv); i += 2 {
 		if i+1 >= len(argv) || !strings.HasPrefix(argv[i], "--") {
-			return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 		}
 		name := strings.TrimPrefix(argv[i], "--")
 		if name != "control" && name != "ready-fd" && name != "ack-fd" {
-			return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 		}
 		if _, exists := values[name]; exists {
-			return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 		}
 		values[name] = argv[i+1]
 	}
 	readyFD, readyErr := strconv.Atoi(values["ready-fd"])
 	ackFD, ackErr := strconv.Atoi(values["ack-fd"])
 	if values["control"] == "" || readyErr != nil || ackErr != nil || readyFD < 0 || ackFD < 0 {
-		return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 	}
 	if err := superviseConfineDetached(context.Background(), values["control"], readyFD, ackFD); err != nil {
 		// fd 2 is the job's supervisor.log by the time the supervisor has a record
@@ -1234,7 +1235,7 @@ func runConfineSupervisor(argv []string) int {
 		// detached job ended the way it did. Dropping it would leave an empty log
 		// beside a record that points at it.
 		_, _ = fmt.Fprintf(os.Stderr, "confine supervisor: %v\n", err)
-		return store.ExitForCode(store.ErrorCode(err))
+		return codes.ExitForCode(store.ErrorCode(err))
 	}
 	return 0
 }
@@ -1246,20 +1247,20 @@ func runConfineReserveCommand(ctx context.Context, options map[string]string, st
 			err = errors.New("must be positive")
 		}
 		_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: --bytes: %v\n", err)
-		return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 	}
 	maxWait := runner.DefaultConfineReserveMaxWait
 	if raw := options["max-wait"]; raw != "" {
 		maxWait, err = time.ParseDuration(raw)
 		if err != nil || maxWait <= 0 || maxWait > 30*time.Minute {
 			_, _ = fmt.Fprintln(stderr, "E_CONFINE_ARGUMENT_INVALID: invalid --max-wait")
-			return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 		}
 	}
 	paths, err := daemon.PathsFromEnv()
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: daemon paths unavailable: %v\n", err)
-		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
+		return codes.ExitForCode("E_CONFINE_UNAVAILABLE")
 	}
 	request := runner.ConfineReserveRequest{
 		Slice: options["slice"], AdmitSocketPath: paths.SocketPath,
@@ -1271,7 +1272,7 @@ func runConfineReserveCommand(ctx context.Context, options map[string]string, st
 	reservation, err := reserveConfined(signalCtx, request)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
-		return store.ExitForCode(store.ErrorCode(err))
+		return codes.ExitForCode(store.ErrorCode(err))
 	}
 	defer reservation.Close()
 	if reservation.ClampedFrom > 0 {
@@ -1279,7 +1280,7 @@ func runConfineReserveCommand(ctx context.Context, options map[string]string, st
 	}
 	if _, err := fmt.Fprintf(stdout, "granted reserve=%d basis=%s\n", reservation.Reserve, reservation.Basis); err != nil {
 		_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: write grant: %v\n", err)
-		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
+		return codes.ExitForCode("E_CONFINE_UNAVAILABLE")
 	}
 	done := make(chan struct{})
 	go func() {
@@ -1297,7 +1298,7 @@ func runAitestBootstrapCommand(ctx context.Context, options map[string]string, s
 	pid, err := strconv.Atoi(options["supervisor-pid"])
 	if err != nil || pid <= 0 {
 		_, _ = fmt.Fprintln(stderr, "E_CONFINE_ARGUMENT_INVALID: --supervisor-pid must be a positive integer")
-		return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+		return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 	}
 	// AIRA_AITEST_OUTER_SCOPE is the launcher's own scope.Reference(), injected
 	// by AppendAitestChildEnvironment. Prefer it over self-discovery (AIRA-44):
@@ -1320,7 +1321,7 @@ func runAitestBootstrapCommand(ctx context.Context, options map[string]string, s
 		// path and the daemon's are byte-identical.
 		if !filepath.IsAbs(outer) {
 			_, _ = fmt.Fprintf(stderr, "E_CONFINE_ARGUMENT_INVALID: AIRA_AITEST_OUTER_SCOPE must be an absolute cgroup path, got %q\n", outer)
-			return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
+			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 		}
 		outer = filepath.Clean(outer)
 	}
@@ -1331,14 +1332,14 @@ func runAitestBootstrapCommand(ctx context.Context, options map[string]string, s
 		discovered, err := runner.CurrentCgroupPath()
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: discover outer scope: %v\n", err)
-			return store.ExitForCode("E_CONFINE_UNAVAILABLE")
+			return codes.ExitForCode("E_CONFINE_UNAVAILABLE")
 		}
 		outer = discovered
 	}
 	supervisorScope, err := runner.BootstrapAitestSupervisor(ctx, outer, pid)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
-		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
+		return codes.ExitForCode("E_CONFINE_UNAVAILABLE")
 	}
 	_, _ = fmt.Fprintf(stdout, "bootstrapped outer=%s supervisor_scope=%s\n", outer, supervisorScope)
 	return 0
@@ -1360,11 +1361,11 @@ func writeWorkerAdmitOutcome(stdout, stderr io.Writer, outcome runner.WorkerAdmi
 	line, err := runner.WorkerAdmitOutcomeLine(outcome, grant)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: worker-admit could not render its outcome: %v\n", err)
-		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
+		return codes.ExitForCode("E_CONFINE_UNAVAILABLE")
 	}
 	if _, err := fmt.Fprintln(stdout, line); err != nil {
 		_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: write worker-admit outcome: %v\n", err)
-		return store.ExitForCode("E_CONFINE_UNAVAILABLE")
+		return codes.ExitForCode("E_CONFINE_UNAVAILABLE")
 	}
 	if errorCode == "" {
 		return 0
@@ -1374,7 +1375,7 @@ func writeWorkerAdmitOutcome(stdout, stderr io.Writer, outcome runner.WorkerAdmi
 		detail = outcome.Reason
 	}
 	_, _ = fmt.Fprintf(stderr, "%s: worker-admit %s (%s): %s\n", errorCode, outcome.State, outcome.Reason, detail)
-	return store.ExitForCode(errorCode)
+	return codes.ExitForCode(errorCode)
 }
 
 func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -1539,7 +1540,7 @@ func resolveConfineOwner(ctx context.Context, explicit string) (string, error) {
 func runConfineManagementCommand(ctx context.Context, options map[string]string, jsonOutput bool, stdout, stderr io.Writer, injected Dispatcher) int {
 	owner, err := resolveConfineOwner(ctx, options["owner"])
 	if err != nil {
-		return render(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: --owner: " + err.Error(), Exit: store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, jsonOutput, stdout, stderr)
+		return render(core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: --owner: " + err.Error(), Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}, jsonOutput, stdout, stderr)
 	}
 	verb := "confine-list"
 	args := map[string]any{"slice": options["slice"], "owner": owner}
@@ -2595,7 +2596,7 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 		data, _ = json.Marshal(response.Data)
 	}
 	if err := json.Unmarshal(data, &result); err != nil {
-		return render(core.Response{Code: daemon.CodeProtocol, Error: daemon.CodeProtocol + ": invalid confine-list response", Exit: store.ExitForCode(daemon.CodeProtocol)}, false, stdout, stderr)
+		return render(core.Response{Code: daemon.CodeProtocol, Error: daemon.CodeProtocol + ": invalid confine-list response", Exit: codes.ExitForCode(daemon.CodeProtocol)}, false, stdout, stderr)
 	}
 	if result.Verdict == "unevaluated" {
 		_, _ = fmt.Fprintf(stdout, "confine list: unevaluated: %s\n", result.Reason)
@@ -2853,5 +2854,5 @@ func appErrorCode(err error) string {
 }
 
 func exitForError(code string) int {
-	return store.ExitForCode(code)
+	return codes.ExitForCode(code)
 }
