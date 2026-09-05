@@ -613,14 +613,23 @@ func TestRealPytestRAMHelperFailureIsInstantAndFailOpen(t *testing.T) {
 
 // TestRealPytestRAMForkDoesNotPinHelperStdin is knowingly left load-flaky by
 // AIRA-20's hardening pass, and the reason is recorded rather than papered over.
-// AIRA-65 measured the binding constraint: it is not this test's own waits but the
-// hardcoded process.wait(timeout=1.0) in _stop_reservation
-// (internal/pylib/aira_xdist_governor/__init__.py), which gives the reserve helper a
-// one-second budget to wake from a blocking read and write its marker before SIGTERM.
-// That is production code, it is not configurable from a test, and it sits inside the
-// xdist stack AIRA-33 deletes — so hardening it here would be thrown away. This is
-// also why AIRA-20 cannot restore the -race CI job yet: doing so would declare clean
-// a suite that still contains this known flake.
+// The discriminator is the child's sleep: if the fork DID pin the helper's stdin,
+// the helper's read only returns when the child exits, so `released` would land after
+// `child-done` instead of before it. That sleep is therefore the whole margin, and at
+// a fixed 1.0s a slow helper wake is enough to invert the order — observed during
+// AIRA-20's own verification, with release 431ms AFTER child-done. Scaling it widens
+// the discriminator rather than weakening it: a pinning implementation still fails,
+// and only the healthy path gets more room.
+//
+// This does NOT make the test load-proof. AIRA-65 measured a second, independent
+// edge: the hardcoded process.wait(timeout=1.0) in _stop_reservation
+// (internal/pylib/aira_xdist_governor/__init__.py) gives the reserve helper one
+// second to wake and write its marker before SIGTERM, and a helper killed first
+// writes nothing at all (the failure then reads "timed out waiting for ... released",
+// not a bad ordering). That budget is production code, is not settable from a test,
+// and lives in the xdist stack AIRA-33 deletes, so it is left to AIRA-65. It is also
+// why AIRA-20 cannot restore the -race CI job yet: doing so would declare clean a
+// suite that still contains that flake.
 func TestRealPytestRAMForkDoesNotPinHelperStdin(t *testing.T) {
 	pytest := requireRealPytest(t)
 	project, pythonDir := realPytestProject(t, "")
@@ -636,10 +645,11 @@ import os, time
 def test_fork_child_does_not_hold_reservation():
     child = os.fork()
     if child == 0:
-        os.close(1); os.close(2); time.sleep(1.0)
+        os.close(1); os.close(2); time.sleep(float(os.environ["AIRA_CHILD_SLEEP"]))
         open(os.environ["AIRA_CHILD_DONE"], "w").write(str(time.time_ns()))
         os._exit(0)`)
-	result := runPytest(t, pytest, project, pythonDir, map[string]string{"AIRA_TEST_MEM_GOVERNOR": "1", "AIRA_TEST_MEM_DEFAULT": "8M", "AIRA_CONFINE_RESERVE_CMD": helper, "AIRA_RELEASED": released, "AIRA_CHILD_DONE": childDone})
+	childSleep := strconv.FormatFloat(testdeadline.Wait(time.Second).Seconds(), 'f', 3, 64)
+	result := runPytest(t, pytest, project, pythonDir, map[string]string{"AIRA_TEST_MEM_GOVERNOR": "1", "AIRA_TEST_MEM_DEFAULT": "8M", "AIRA_CONFINE_RESERVE_CMD": helper, "AIRA_RELEASED": released, "AIRA_CHILD_DONE": childDone, "AIRA_CHILD_SLEEP": childSleep})
 	if result.err != nil {
 		t.Fatalf("fork pytest failed: %v\n%s", result.err, result.output)
 	}
@@ -934,7 +944,10 @@ func assertRealPytestItemRuns(t *testing.T, pytest string, overrides map[string]
 
 func waitForRealPytestPath(t *testing.T, path string) []byte {
 	t.Helper()
-	deadline := time.Now().Add(testdeadline.Wait(2 * time.Second))
+	// Comfortably beyond the longest thing any caller waits on — the scaled child
+	// sleep in TestRealPytestRAMForkDoesNotPinHelperStdin — so this backstop reports
+	// a marker that never arrives rather than one that is merely late.
+	deadline := time.Now().Add(testdeadline.Wait(60 * time.Second))
 	for time.Now().Before(deadline) {
 		if data, err := os.ReadFile(path); err == nil {
 			return data
