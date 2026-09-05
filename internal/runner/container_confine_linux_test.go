@@ -171,6 +171,32 @@ func TestContainerLedgerChargeAndScopeCap(t *testing.T) {
 			wantMemoryFrag: "caller=8589934592:reserve-requested",
 		},
 		{
+			// Build review (Sol P2): the flock case alone does not pin the
+			// predicate -- `admission.lock == nil` would pass it while still
+			// mislabelling these. A timeout/unevaluated admission holds no lock
+			// AND no release, so only the full grant predicate rejects it.
+			name: "docker on an unevaluated admission reports reserve-requested",
+			request: ConfineRequest{
+				Argv: []string{"docker", "run", "-m", "8g", "alpine"},
+			},
+			admission:      admissionResult{state: "unevaluated", basis: "unevaluated:daemon"},
+			wantReserve:    8 << 30,
+			wantScopeMax:   0,
+			wantMemoryFrag: "caller=8589934592:reserve-requested",
+		},
+		{
+			// Build review (Sol P1), end to end: a caller-placed podman container
+			// is NOT nested, so it must be charged exactly like docker.
+			name: "podman with a caller cgroup-parent is charged like an escapee",
+			request: ConfineRequest{
+				Argv: []string{"podman", "run", "--cgroup-parent=aira.slice", "-m", "8g", "alpine"},
+			},
+			admission:      daemonGrant(8 << 30),
+			wantReserve:    8 << 30,
+			wantScopeMax:   8 << 30,
+			wantMemoryFrag: "caller=8589934592:reserved",
+		},
+		{
 			name: "delegate-ram is never raised",
 			request: ConfineRequest{
 				Argv: []string{"docker", "run", "-m", "8g", "alpine"}, DelegateRAM: true, ScopeMemoryMax: 16 << 30,
@@ -280,6 +306,28 @@ func TestContainerLaunchAdvisories(t *testing.T) {
 			name:    "detached docker container is warned that the reservation does not cover it",
 			request: ConfineRequest{Argv: []string{"docker", "run", "-d", "alpine"}},
 			want:    []string{"outlives the confine job", "does not cover the container's lifetime"},
+		},
+		{
+			// Build review (Sol P2): a caller-supplied --cgroups=split nests the
+			// container exactly as an injected one does, so it dies with the job
+			// and must get the same warning.
+			name:    "detached podman with a caller split still gets the lifetime warning",
+			request: ConfineRequest{Argv: []string{"podman", "run", "--cgroups=split", "-d", "alpine"}},
+			want:    []string{"will be killed when the confine job exits"},
+		},
+		{
+			// Build review (Sol P1): AIRA must not imply it governs a container
+			// whose placement the caller chose.
+			name:    "caller-placed podman container is not claimed as contained",
+			request: ConfineRequest{Argv: []string{"podman", "run", "--cgroup-parent=aira.slice", "alpine"}},
+			want:    []string{"placement was left to your own --cgroup-parent", "cannot establish"},
+			absent:  []string{"the kernel binds the container at"},
+		},
+		{
+			name:    "caller-placed podman with a larger limit does not claim the kernel binds it",
+			request: ConfineRequest{Argv: []string{"podman", "run", "--cgroup-parent=aira.slice", "-m", "8g", "alpine"}, ScopeMemoryMax: 2 << 30},
+			want:    []string{"exceeds this job's own limit", "depends on the placement you chose"},
+			absent:  []string{"the kernel binds the container at"},
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -443,7 +491,15 @@ func TestConfineOwnCapAdviceWarranted(t *testing.T) {
 		{"descendant own cap", cgroupUsage{OOMKill: int64p(1), OOMKillLocal: int64p(0), OOMGroupKillLocal: int64p(0), OOMLocal: int64p(0)}, false},
 		{"our own cap", cgroupUsage{OOMKill: int64p(1), OOMKillLocal: int64p(1), OOMGroupKillLocal: int64p(0), OOMLocal: int64p(1)}, true},
 		{"ancestor collateral", cgroupUsage{OOMKill: int64p(1), OOMKillLocal: int64p(1), OOMGroupKillLocal: int64p(0), OOMLocal: int64p(0)}, false},
-		{"our procs died, own-limit counter unreadable", cgroupUsage{OOMKill: int64p(1), OOMKillLocal: int64p(1), OOMGroupKillLocal: int64p(0)}, true},
+		// Build review (Sol P1) corrected this expectation. An earlier revision
+		// returned true here on the reasoning "we know this job was OOM-killed,
+		// so give the advice anyway" -- but the LINE it enables says "OOM-killed
+		// at its memory cap <cap>", which asserts WHOSE limit fired, and an
+		// unreadable memory.events.local establishes no such thing. The advice is
+		// not lost: formatConfineOOMAttributionAdvisory covers this case with the
+		// same guidance and without the claim (asserted in the trailer test in
+		// confine_termination_linux_test.go).
+		{"our procs died, own-limit counter unreadable", cgroupUsage{OOMKill: int64p(1), OOMKillLocal: int64p(1), OOMGroupKillLocal: int64p(0)}, false},
 		{"nothing readable", cgroupUsage{OOMKill: int64p(1)}, false},
 		{"no oom at all", cgroupUsage{}, false},
 	} {

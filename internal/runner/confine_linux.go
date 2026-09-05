@@ -1203,7 +1203,13 @@ func confineOwnCapAdviceWarranted(usage cgroupUsage) bool {
 		return false
 	}
 	own, ownEvaluated := usage.OwnLimitOOM()
-	return !ownEvaluated || own
+	// A POSITIVE own-limit declaration is required, not merely the absence of a
+	// negative one (build review, Sol P1). An unreadable `memory.events.local`
+	// `oom` counter cannot establish that OUR cap was the binding one, and the
+	// phrase "OOM-killed at its memory cap <cap>" asserts exactly that. Such a
+	// run is NOT left silent: formatConfineOOMAttributionAdvisory speaks for it
+	// instead, with the same actionable advice minus the unsupported claim.
+	return ownEvaluated && own
 }
 
 func formatConfineOOMAttributionAdvisory(verdict string, attribution ConfineOOMAttribution, usage cgroupUsage) string {
@@ -1218,7 +1224,17 @@ func formatConfineOOMAttributionAdvisory(verdict string, attribution ConfineOOMA
 	// BENEATH this scope on a job that ended any other way, which is exactly what a
 	// container hitting its own --memory looks like: podman exits 0, so the job's
 	// verdict is `normal` and every existing line stays quiet.
-	if verdict == ConfineTerminatedOOM || verdict == ConfineTerminatedUnattributedSIGKILL {
+	// The `oom` verdict's own-limit and ancestor attributions are already owned
+	// by formatConfineOOMLimitAdvisory, and the unattributed-SIGKILL verdict by
+	// formatConfineTerminationAdvisory -- speaking here too would duplicate them.
+	// The ONE exception is an `oom` verdict whose attribution is unestablished:
+	// formatConfineOOMLimitAdvisory is deliberately silent there, and since
+	// confineOwnCapAdviceWarranted now also declines that case, staying quiet
+	// would leave a genuine OOM with no explanation at all.
+	if verdict == ConfineTerminatedUnattributedSIGKILL {
+		return ""
+	}
+	if verdict == ConfineTerminatedOOM && attribution != ConfineOOMUnestablished {
 		return ""
 	}
 	kills := int64(0)
@@ -1234,7 +1250,9 @@ func formatConfineOOMAttributionAdvisory(verdict string, attribution ConfineOOMA
 	case ConfineOOMAncestor:
 		return fmt.Sprintf("confine: %d OOM kill(s) took this job's processes, but this scope's own limit did not declare the breach — an ancestor's cap fired (e.g. the slice) and this job was the collateral; raising this job's own cap would not have prevented it", kills)
 	case ConfineOOMUnestablished:
-		return fmt.Sprintf("confine: %d OOM kill(s) occurred under this scope; whose limit fired could not be established (memory.events.local unreadable)", kills)
+		return fmt.Sprintf("confine: %d OOM kill(s) occurred under this scope; whose limit fired could not be "+
+			"established (memory.events.local unreadable), so this may have been this scope's own cap, an "+
+			"ancestor's, or a descendant's. If this job was the victim, raise --memory-max (or --memory-reserve).", kills)
 	default:
 		return ""
 	}

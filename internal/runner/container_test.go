@@ -103,6 +103,11 @@ func TestPlanContainerMemoryUnevaluated(t *testing.T) {
 		{"reviewer case: qemu -m after image", []string{"docker", "run", "--rm", "qemu-image", "qemu-system-x86_64", "-m", "4G"}},
 		{"reviewer case: long form after image", []string{"docker", "run", "alpine", "echo", "--memory=8g"}},
 		{"python -m after image", []string{"docker", "run", "alpine", "python", "-m", "http.server"}},
+		// Build review (Sol P1): `--` is pflag's definitive end-of-options
+		// marker, so the token after it is the image and `-m` beyond that is the
+		// CONTAINER's flag. Without honouring it this charged the ledger 8G.
+		{"end-of-options marker then image then -m", []string{"docker", "run", "--", "alpine", "-m", "8g"}},
+		{"end-of-options with flags before it", []string{"docker", "run", "--rm", "--", "alpine", "qemu", "-m", "8g"}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			plan := PlanContainerIntegration(testCase.argv)
@@ -171,6 +176,12 @@ func TestPlanContainerCallerCgroupFlags(t *testing.T) {
 		{"cgroupns is not a cgroup placement flag", []string{"podman", "run", "--cgroupns=host", "alpine"}, "", false},
 		{"cgroup-conf is not a cgroup placement flag", []string{"podman", "run", "--cgroup-conf=memory.high=1", "alpine"}, "", false},
 		{"none", []string{"podman", "run", "alpine"}, "", false},
+
+		// Build review (Sol P1): a placement-shaped token in the CONTAINER's own
+		// command is not the caller's placement choice. Treating it as one would
+		// silently withhold containment from a job that never asked for it.
+		{"cgroup-parent after the image is the container's argument", []string{"podman", "run", "alpine", "echo", "--cgroup-parent=x"}, "", false},
+		{"cgroups after the end-of-options marker", []string{"podman", "run", "--", "alpine", "--cgroups=disabled"}, "", false},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			plan := PlanContainerIntegration(testCase.argv)
@@ -338,6 +349,21 @@ func TestContainerReserveDecision(t *testing.T) {
 		{
 			name: "podman with a declared cap never raises", argv: []string{"podman", "run", "-m", "8g", "alpine"},
 			resolved: 2 << 30, pinned: true, wantReserve: 2 << 30, wantPinned: true, wantSkip: ContainerReserveSkipPodman,
+		},
+		{
+			// Build review (Sol P1). The podman skip is justified ONLY by the
+			// container being nested inside this job's scope. When the caller
+			// took placement into their own hands, it is not: this container is
+			// a SIBLING under the slice, outside the job's reservation, and must
+			// be charged like any other escapee.
+			name:     "podman with a caller cgroup-parent is NOT nested and is charged",
+			argv:     []string{"podman", "run", "--cgroup-parent=aira.slice", "-m", "8g", "alpine"},
+			resolved: 4 << 30, wantReserve: 8 << 30, wantPinned: true,
+		},
+		{
+			name:     "podman with a caller --cgroups=split is nested and is not charged",
+			argv:     []string{"podman", "run", "--cgroups=split", "-m", "8g", "alpine"},
+			resolved: 4 << 30, wantReserve: 4 << 30, wantPinned: false, wantSkip: ContainerReserveSkipPodman,
 		},
 		{
 			name: "docker unpinned raises to the container limit", argv: []string{"docker", "run", "-m", "8g", "alpine"},

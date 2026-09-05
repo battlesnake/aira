@@ -455,10 +455,34 @@ func TestConfineTrailerReportsOOM(t *testing.T) {
 		}
 	})
 	t.Run("a capped OOM still gets the reserve advisory", func(t *testing.T) {
+		// AIRA-102 sharpened this case. It previously passed OOMLocal UNSET --
+		// the "own-limit counter unreadable" shape -- while asserting the own-cap
+		// wording anyway, so it was ratifying an attribution the counters never
+		// established. The intent (a capped OOM must still get actionable advice)
+		// is preserved, and split across this case and the next; what changed is
+		// that the OWN-CAP WORDING now requires the own-limit counter to say so.
 		trailer := confineTrailer(t, []string{"/bin/sh", "-c", "kill -s KILL $$"},
-			cgroupUsage{OOMKill: int64ptr(1), OOMKillLocal: int64ptr(1), OOMGroupKillLocal: int64ptr(0), PeakRSS: int64ptr(31 << 20)}, 32<<20)
+			cgroupUsage{OOMKill: int64ptr(1), OOMKillLocal: int64ptr(1), OOMGroupKillLocal: int64ptr(0),
+				OOMLocal: int64ptr(1), PeakRSS: int64ptr(31 << 20)}, 32<<20)
 		if !strings.Contains(trailer, "terminated-by=oom") || !strings.Contains(trailer, "OOM-killed at its memory cap") {
 			t.Fatalf("capped OOM lost a line: %q", trailer)
+		}
+	})
+	t.Run("a capped OOM with an unreadable own-limit counter gets advice without the claim", func(t *testing.T) {
+		trailer := confineTrailer(t, []string{"/bin/sh", "-c", "kill -s KILL $$"},
+			cgroupUsage{OOMKill: int64ptr(1), OOMKillLocal: int64ptr(1), OOMGroupKillLocal: int64ptr(0),
+				PeakRSS: int64ptr(31 << 20)}, 32<<20)
+		if !strings.Contains(trailer, "terminated-by=oom") {
+			t.Fatalf("trailer %q lacks terminated-by=oom", trailer)
+		}
+		if strings.Contains(trailer, "OOM-killed at its memory cap") {
+			t.Fatalf("own-cap attribution claimed from an unreadable counter: %q", trailer)
+		}
+		if !strings.Contains(trailer, "whose limit fired could not be established") {
+			t.Fatalf("an unattributable OOM was left silent: %q", trailer)
+		}
+		if !strings.Contains(trailer, "raise --memory-max") {
+			t.Fatalf("an unattributable OOM lost its actionable advice: %q", trailer)
 		}
 	})
 }

@@ -1,6 +1,8 @@
 # AIRA-102 — `aira confine` container integration (podman transparent nesting + docker sanity shim)
 
-**Status:** plan **v3 — GATE-PASSED (with changes), implementation may start.** v1 was GATE-FAILed by both lineages (Sol 4×P0; Fable 4×MUST-FIX). v2 cleared every MUST-FIX; Fable's v2 re-gate returned **GATE-PASS-WITH-CHANGES** with 12 text/precision items, all folded in here. DeepSeek was **unavailable** (`agentmux ask` exit 4, twice) — recorded, not a blocking gate.
+**Status:** plan **v4 — BUILT, build-reviewed, amended.** v3 was gate-passed and implemented; Sol's adversarial BUILD review returned **BLOCK** (3×P1, 2×P2) and every finding is folded in below (§3.2, §3.5, §3.10, §3.11 and §8).
+
+**Status history:** plan **v3 — GATE-PASSED (with changes).** v1 was GATE-FAILed by both lineages (Sol 4×P0; Fable 4×MUST-FIX). v2 cleared every MUST-FIX; Fable's v2 re-gate returned **GATE-PASS-WITH-CHANGES** with 12 text/precision items, all folded in here. DeepSeek was **unavailable** (`agentmux ask` exit 4, twice) — recorded, not a blocking gate.
 **Ticket:** AIRA-102 (P1). Owner-directed two-part remedy.
 **Branch:** `aira102-container-integration`, off `origin/master` @ **`ea82cb8`** (rebased mid-plan onto AIRA-101 `--exclusive`, PR #46). **All line citations below are post-rebase.**
 **Author:** Opus, grounded on **live empirical probes** (podman 4.9.3 rootless, cgroup v2, systemd cgroup manager, real `aira.slice`) — every §2 claim was measured.
@@ -63,6 +65,10 @@ Otherwise `Established=false` with a stated, **token-naming** reason (`unevaluat
 
 **Boundary proof (new in v2 — closes Sol P0-3 / Fable MF1).** Both reviewers produced argv where the v1 rule *acted wrongly* rather than declining: `docker run --rm qemu-image qemu-system-x86_64 -m 4G` (qemu's own RAM flag) and `docker run alpine echo --memory=8g` would `Establish` a limit that does not exist, raise the ledger for a phantom, print `caller=4G` as a fact, and fire §3.6's loud line on a meaningless comparison. So: **stop establishing at the first token that is neither `-`-prefixed nor immediately preceded by a `-`-prefixed token** — the earliest position at which the image can appear. A memory-shaped token at or after that point is `Present` + `unevaluated:after-image-candidate`.
 
+**End-of-options marker (build review, Sol P1).** A standalone `--` is pflag's definitive end-of-options marker, so the token after it is unambiguously the image and everything beyond is the container's command. Without honouring it, `docker run -- alpine -m 8g` **established** the container's own `-m` and charged the ledger 8 GiB — a wrong reservation, not a decline.
+
+**Placement flags are boundary-gated too (build review, Sol P1).** `podman run alpine echo --cgroup-parent=x` is the container's argument; treating it as the caller's placement choice silently withheld containment from a job that never asked for it. A genuine placement flag always precedes the image, so gating cannot miss a real one.
+
 *Residual, stated (L9):* `docker run --rm alpine -m 4g` still establishes, because `alpine` follows the `-`-prefixed `--rm` and is indistinguishable from that flag's value without a full arity table (explicitly out of scope).
 
 **Short-flag classification.** For a single-dash token, by its second character:
@@ -102,7 +108,9 @@ This is the requirement that the shim must not become the trap it counters.
 
 The rule is now split by runtime:
 
-**Podman — never raise the ledger.** The container is a cgroup descendant of the job's own scope (F1), so its memory is **already** inside whatever the job reserved. There is only ever *one* charge per job, so the defect is **not** double-booking (Fable note 5): a raise would either **over-book past a binding cap** — charging for memory the kernel forbids the job to use — or, on the unpinned path, **replace** the daemon's history estimate with a client-pinned number. Neither is wanted, so AIRA reports the caller's limit and acts on it not at all. Fable confirmed the unpinned-uncapped case does **not** need the raise: on the daemon path cap == charge and stays consistent; on the fallback path it is the same guess-charged uncapped shape every job gets today.
+**Podman — never raise the ledger *when the container actually nests*.** The skip is keyed on **nesting**, not on the runtime (build review, Sol P1): if the caller supplied their own `--cgroup-parent`/`--cgroups`/`--pod`, AIRA injects no placement flag and the container goes wherever they sent it — `podman run --cgroup-parent=aira.slice` makes it a **sibling** of this job's scope, outside the job's reservation. Such a container is charged exactly like a docker escapee, and AIRA does not claim the kernel binds it. `ContainerPlan.NestsInJobScope()` is the single predicate; it also gates the "the kernel binds the container at Y" advisory and the detached-container warning.
+
+**When it does nest:** The container is a cgroup descendant of the job's own scope (F1), so its memory is **already** inside whatever the job reserved. There is only ever *one* charge per job, so the defect is **not** double-booking (Fable note 5): a raise would either **over-book past a binding cap** — charging for memory the kernel forbids the job to use — or, on the unpinned path, **replace** the daemon's history estimate with a client-pinned number. Neither is wanted, so AIRA reports the caller's limit and acts on it not at all. Fable confirmed the unpinned-uncapped case does **not** need the raise: on the daemon path cap == charge and stays consistent; on the fallback path it is the same guess-charged uncapped shape every job gets today.
 
 > *Stated consequence:* on an unpinned, uncapped podman job the daemon's history estimate becomes the scope cap (`:853`), and pre-feature history for that signature recorded **CLI-only** peaks — so the first nested run can be OOM-killed at that cap. It self-heals (the `oom` flag bumps `EstimateMemoryReserve`, `resource_estimate.go:56`, to headroom), and §3.10's corrected advisory now names the cause and recommends `--memory-max`. Documented, not silent.
 
@@ -118,9 +126,10 @@ The rule is now split by runtime:
 
 | runtime | caller-declared confine limit? | admission path | ledger charge | scope `memory.max` |
 |---|---|---|---|---|
-| podman | yes (`--memory-max`/`--memory-reserve`) | any | declared (unchanged) | declared (unchanged) |
-| podman | no | daemon grant | daemon estimate (unchanged) | daemon estimate (unchanged) |
-| podman | no | fallback / timeout / unevaluated | flock free-memory check against the client hint; **no ledger charge** | uncapped (unchanged) |
+| podman **nested**, caller placed nothing | yes (`--memory-max`/`--memory-reserve`) | any | declared (unchanged) | declared (unchanged) |
+| podman **nested** | no | daemon grant | daemon estimate (unchanged) | daemon estimate (unchanged) |
+| podman **nested** | no | fallback / timeout / unevaluated | flock free-memory check against the client hint; **no ledger charge** | uncapped (unchanged) |
+| podman **caller-placed** (not nested) | either | any | **treated as docker** — the container is not inside this job's reservation | as the docker rows |
 | docker | yes | any | declared (unchanged) | declared (unchanged) |
 | docker | no, container limit `Established` | daemon grant | `max(hint, containerBytes)`, pinned | same value (via `:853`) |
 | docker | no, container limit `Established` | fallback / timeout / unevaluated | flock free-memory check against the **raised** number; **no ledger charge** — the raise gates that check and can delay the launch up to the admission timeout, then launch **uncapped** | uncapped |
@@ -179,7 +188,7 @@ Nothing probes for podman. If it is absent the wrapped command fails on its own 
 v1 proposed swapping the hierarchical counter for `LocalOOM()`. Both reviewers found that insufficient: `LocalOOM()` is also true when an **ancestor** slice limit fired (`usage_linux.go:93-96`), so "at its memory cap" would still misattribute an AIRA-27 slice-collateral kill; and suppressing the line alone leaves a container OOM producing **exit 137 and nothing** (podman's own clean exit gives `terminated-by=normal`, and `formatConfineTerminationAdvisory (:1699)` only fires on the unattributed-SIGKILL verdict).
 
 So, three mutually exclusive operator lines, each stating exactly what its evidence establishes:
-- **(a) own limit fired** — `LocalOOM()` returns `(killed=true, evaluated=true)` **and** the local `oom` max-breach declaration is positive → the existing `confine: job OOM-killed at its memory cap <cap>` line, unchanged. Stays gated on `scopeMemoryMax > 0` (it names the cap).
+- **(a) own limit fired** — `LocalOOM()` returns `(killed=true, evaluated=true)` **and** the local `oom` max-breach declaration is **positively** > 0. An unreadable counter does **not** qualify (build review, Sol P1: an earlier build accepted `!ownEvaluated || own`, which asserted "at its memory cap" from a counter that established nothing). Such a run is not left silent — line (c) covers it with the same actionable advice minus the claim, and is therefore allowed to speak on the `oom` verdict, where `formatConfineOOMLimitAdvisory` is deliberately quiet → the existing `confine: job OOM-killed at its memory cap <cap>` line, unchanged. Stays gated on `scopeMemoryMax > 0` (it names the cap).
 - **(b) descendant OOM** — hierarchical `oom_kill > 0` **and** `LocalOOM()` returns exactly `(killed=false, evaluated=true)` **and** local `oom == 0` → `confine: memory.events records N OOM kill(s) beneath this scope (a descendant's own limit, e.g. a container's --memory); the OOM killer killed nothing belonging to this scope itself.`
 - **(c) attribution unestablished** — hierarchical `> 0` and `LocalOOM()` is `evaluated=false` → `confine: an OOM kill occurred under this scope; whose limit could not be established.`
 

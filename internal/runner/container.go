@@ -115,6 +115,24 @@ type ContainerPlan struct {
 // Detected reports whether this argv is one of the two in-scope invocations.
 func (plan ContainerPlan) Detected() bool { return plan.Runtime != ContainerRuntimeNone }
 
+// NestsInJobScope reports whether the container will be a cgroup DESCENDANT of
+// this confine job's own scope -- the premise on which every podman-specific
+// decision here rests.
+//
+// It is NOT the same as "the runtime is podman" (build review, Sol P1). When the
+// caller supplied their own `--cgroup-parent` / `--cgroups` / `--pod`, AIRA
+// injects no placement flag, so the container goes wherever the caller sent it:
+// `podman run --cgroup-parent=aira.slice` makes it a SIBLING of this job's
+// scope, bound by the slice cap and not by the job's. Treating that as nested
+// would skip the ledger charge for a footprint outside the job's reservation and
+// would claim the kernel binds a container it does not bind.
+func (plan ContainerPlan) NestsInJobScope() bool {
+	if plan.Runtime != ContainerRuntimePodman {
+		return false
+	}
+	return plan.CallerSplit || plan.CallerCgroupFlag == ""
+}
+
 // PlanContainerIntegration analyses a wrapped argv. It never mutates its input.
 func PlanContainerIntegration(argv []string) ContainerPlan {
 	plan := ContainerPlan{}
@@ -151,14 +169,30 @@ func PlanContainerIntegration(argv []string) ContainerPlan {
 	var valueFound, valueMissing bool
 	ambiguous := ""
 
+	// A standalone `--` is pflag's definitive end-of-options marker, so the token
+	// after it is unambiguously the image and everything beyond that is the
+	// container's own command. Without this, `docker run -- alpine -m 8g`
+	// establishes the CONTAINER's `-m` as docker's and charges the ledger 8G --
+	// a wrong reservation rather than a decline (build review, Sol P1).
+	imageAt := -1
+	for index, token := range rest {
+		if token == "--" {
+			imageAt = index + 1
+			break
+		}
+	}
+
 	for index := 0; index < len(rest); index++ {
 		token := rest[index]
+		if imageAt >= 0 && index > imageAt {
+			boundaryOpen = false
+		}
 		if boundaryOpen && !strings.HasPrefix(token, "-") {
 			if index == 0 || !strings.HasPrefix(rest[index-1], "-") {
 				boundaryOpen = false
 			}
 		}
-		if !strings.HasPrefix(token, "-") || token == "-" {
+		if !strings.HasPrefix(token, "-") || token == "-" || token == "--" {
 			continue
 		}
 
@@ -181,6 +215,16 @@ func PlanContainerIntegration(argv []string) ContainerPlan {
 				// Exact-token matching only. A prefix match would also catch
 				// `--cgroupns` and podman's `--cgroup-conf` and withhold split
 				// placement for no reason.
+				//
+				// Boundary-gated like the memory scan (build review, Sol P1):
+				// `podman run alpine echo --cgroup-parent=x` is the CONTAINER's
+				// argument, and treating it as the caller's placement choice
+				// would silently withhold containment from a job that asked for
+				// none of it. A genuine placement flag always precedes the
+				// image, so gating here cannot miss a real one.
+				if !boundaryOpen {
+					continue
+				}
 				if plan.CallerCgroupFlag == "" {
 					plan.CallerCgroupFlag = name
 				}
@@ -345,7 +389,10 @@ func (plan ContainerPlan) ResolveReserve(reserve int64, pinned, delegateRAM bool
 		return reserve, pinned, ""
 	}
 	switch {
-	case plan.Runtime == ContainerRuntimePodman:
+	case plan.NestsInJobScope():
+		// Keyed on NESTING, not on the runtime: a podman container the caller
+		// placed elsewhere is not inside this job's reservation and must be
+		// charged like any other escapee (build review, Sol P1).
 		return reserve, pinned, ContainerReserveSkipPodman
 	case delegateRAM:
 		return reserve, pinned, ContainerReserveSkipDelegateRAM
@@ -380,19 +427,28 @@ func ContainerAdvisories(plan ContainerPlan, injection ContainerInjection, scope
 			"remains true whatever confine injected or reserved. Use 'podman run' for kernel-enforced containment.")
 	}
 
+	// A podman container the CALLER placed is not known to be inside this job's
+	// scope, so AIRA must not imply it governs it (build review, Sol P1). Said
+	// once, plainly, rather than left to be inferred from the facet.
+	if plan.Runtime == ContainerRuntimePodman && !plan.NestsInJobScope() {
+		lines = append(lines, "confine: this container's placement was left to your own "+
+			plan.CallerCgroupFlag+"; AIRA injected no placement flag and cannot establish that the container "+
+			"is inside this job's scope or bounded by its cap.")
+	}
+
 	// The false-belief direction, named in BOTH runtimes rather than only for
 	// docker: a caller who typed a container limit above this job's own limit is
 	// wrong in both cases, just wrong differently.
 	if plan.MemoryEstablished && scopeMemoryMax > 0 && plan.MemoryBytes > scopeMemoryMax {
 		container := FormatConfineBytes(plan.MemoryBytes)
 		job := FormatConfineBytes(scopeMemoryMax)
-		if plan.Runtime == ContainerRuntimeDocker {
-			lines = append(lines, "confine: docker --memory="+container+" exceeds this job's own limit "+job+
-				"; the container is NOT bound by "+job+", nor by aira.slice.")
-		} else {
-			// The basis is load-bearing: this job's limit is very often an AIRA
-			// ESTIMATE rather than anything the caller declared, and presenting
-			// an estimate as "this job's cap" without saying where it came from
+		switch {
+		case plan.NestsInJobScope():
+			// Only a NESTED container is actually bound by this job's cap, so
+			// only here may AIRA say the kernel binds it. The basis is
+			// load-bearing: this job's limit is very often an AIRA ESTIMATE
+			// rather than anything the caller declared, and presenting an
+			// estimate as "this job's cap" without saying where it came from
 			// invites the same false belief the line exists to correct.
 			basis := strings.TrimSpace(reserveBasis)
 			if basis == "" {
@@ -400,15 +456,28 @@ func ContainerAdvisories(plan ContainerPlan, injection ContainerInjection, scope
 			}
 			lines = append(lines, "confine: container --memory="+container+" exceeds this job's cap "+job+
 				" ("+basis+"); the kernel binds the container at "+job+".")
+		case plan.Runtime == ContainerRuntimeDocker:
+			lines = append(lines, "confine: docker --memory="+container+" exceeds this job's own limit "+job+
+				"; the container is NOT bound by "+job+", nor by aira.slice.")
+		default:
+			lines = append(lines, "confine: container --memory="+container+" exceeds this job's own limit "+job+
+				"; whether anything bounds the container depends on the placement you chose.")
 		}
 	}
 
 	if plan.Detach {
-		if plan.Runtime == ContainerRuntimePodman && injection.Placement == ContainerPlacementPodmanSplitInjected {
+		switch {
+		case plan.NestsInJobScope():
+			// Nested, therefore inside the scope cgroup.kill takes down. True for
+			// a caller-supplied `--cgroups=split` exactly as for an injected one
+			// (build review, Sol P2).
 			lines = append(lines, "confine: this container will be killed when the confine job exits.")
-		} else if plan.Runtime == ContainerRuntimeDocker {
+		case plan.Runtime == ContainerRuntimeDocker:
 			lines = append(lines, "confine: this container outlives the confine job; any reservation made here is "+
 				"released when the job exits and does not cover the container's lifetime.")
+		default:
+			lines = append(lines, "confine: whether this container outlives the confine job depends on the "+
+				"placement you chose; AIRA cannot establish it.")
 		}
 	}
 	return lines
