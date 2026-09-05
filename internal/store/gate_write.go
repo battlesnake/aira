@@ -260,8 +260,6 @@ func buildGateDefinition(gateID, canaryID string, fields map[string]any) (gate.G
 	case string(gate.CheckerManual):
 		definition.Kind = gate.KindManual
 		definition.Manual = &gate.Manual{}
-	case string(gate.CheckerRatchet):
-		return gate.GateDefinition{}, errors.New("E_GATE_INVALID: ratchet gates have no flag surface for metric, comparator, and comparison_key; author .aira/gates/<id>.json directly")
 	default:
 		return gate.GateDefinition{}, fmt.Errorf("E_GATE_INVALID: unknown checker %q", checker)
 	}

@@ -1,5 +1,12 @@
 # M15b — gate + traceability insight gauges (`ratchet-status`, `traceability-status`)
 
+> **`ratchet-status` REMOVED (AIRA-78, 2026-09-05).** Everything this document says
+> about `ratchet-status` (and the `evaluateRatchet`/`GateBaseline` machinery it read)
+> describes deleted code — the ratchet gate kind never accumulated a production row.
+> `traceability-status`, the other gauge this document designs, is unaffected and
+> remains live. See `docs/superpowers/specs/2026-08-13-aira-m13b-ratchet-gate-design.md`
+> for the fuller removal note.
+
 Status: APPROVED (Sol plan-review, 5 rounds → APPROVE-PLAN on v6). Building.
 v-history: r1 P0+3×P1 (read-only invariant, error codes, trace scope, digest naming); r2 4×P1
 (precedence, error paths, findings-not-faithful, malformed vs scan-tear); r3 confirmed R6 precedence +

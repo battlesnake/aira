@@ -20,7 +20,7 @@ import (
 //     `aira reconcile --rebuild` fails E_JOURNAL_CORRUPT here;
 //   - the gate canary's `git init` / `git add -A` in a scratch directory would
 //     stage into the inherited index instead of the scratch repository's;
-//   - test-report and ratchet provenance would name another repository's HEAD.
+//   - test-report provenance would name another repository's HEAD.
 //
 // It removes ALL GIT_* rather than an allowlist of the three that bite hardest.
 // git keeps adding environment-driven overrides, and an allowlist silently

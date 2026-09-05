@@ -340,7 +340,6 @@ func TestGateAddRefusesInvalidInputWithoutWritingAnything(t *testing.T) {
 	}{
 		{"missing checker", "unit-tests", map[string]any{"argv": []string{"/usr/bin/true"}}, "E_GATE_INVALID"},
 		{"command without timeout", "unit-tests", map[string]any{"checker": "command", "predicate": "exit-zero", "argv": []string{"/usr/bin/true"}, "cwd": "root"}, "E_GATE_INVALID"},
-		{"ratchet has no flag surface", "unit-tests", map[string]any{"checker": "ratchet"}, "E_GATE_INVALID"},
 		{"check-dimension without dimension", "unit-tests", map[string]any{"checker": "check-dimension"}, "E_GATE_INVALID"},
 		{"unevaluable dimension", "unit-tests", map[string]any{"checker": "check-dimension", "dimension": "coverage"}, "E_GATE_INVALID"},
 		{"non-numeric timeout", "unit-tests", map[string]any{"checker": "command", "predicate": "exit-zero", "argv": []string{"/usr/bin/true"}, "cwd": "root", "timeout_ms": "soon"}, "E_GATE_INVALID"},

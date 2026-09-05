@@ -176,8 +176,6 @@ type Store interface {
 	CommandLatencyByKeyPair(context.Context) ([]store.CommandLatencySummary, error)
 	AddQuotaSnapshot(context.Context, domain.QuotaSnapshotInput) (store.QuotaSnapshotAddResult, error)
 	ListQuotaSnapshots(string) ([]domain.QuotaSnapshot, error)
-	PinGateBaseline(context.Context, string, []string, string, string) (store.GateBaseline, error)
-	ShowGateBaseline(string) (store.GateBaseline, error)
 }
 
 type reviewStore interface {
@@ -1875,9 +1873,9 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			return report, nil
 		}},
 		"gate": {Name: "gate", Usage: "gate <operation> [args]", Args: []ArgSpec{
-			stringSpec("subverb", true, true, "Gate operation", "add", "ls", "show", "set", "run", "check", "attest", "prove", "review", "canary-run", "canary-show", "baseline-pin", "baseline-show"),
-			stringSpec("gate_id", false, true, "Gate identifier"), stringSpec("canary_id", false, true, "Canary identifier"), stringSpec("verdict", false, false, "Attestation verdict", "pass", "fail"), stringSpec("actor", false, false, "Attestation actor"), stringSpec("reason", false, false, "Baseline pin reason"), stringSpec("report", false, false, "Comma-separated test report IDs"),
-			stringSpec("checker", false, false, "Gate checker", "check-dimension", "command", "manual-attestation", "ratchet"), stringSpec("predicate", false, false, "Command predicate; tests-green requires parser go-test-json-v1, which reads go test -json output only, so exit-zero is the only predicate a non-Go command can use", "exit-zero", "tests-green"),
+			stringSpec("subverb", true, true, "Gate operation", "add", "ls", "show", "set", "run", "check", "attest", "prove", "review", "canary-run", "canary-show"),
+			stringSpec("gate_id", false, true, "Gate identifier"), stringSpec("canary_id", false, true, "Canary identifier"), stringSpec("verdict", false, false, "Attestation verdict", "pass", "fail"), stringSpec("actor", false, false, "Attestation actor"),
+			stringSpec("checker", false, false, "Gate checker", "check-dimension", "command", "manual-attestation"), stringSpec("predicate", false, false, "Command predicate; tests-green requires parser go-test-json-v1, which reads go test -json output only, so exit-zero is the only predicate a non-Go command can use", "exit-zero", "tests-green"),
 			stringSpec("dimension", false, false, "Check dimension for a check-dimension gate", "traceability"),
 			listSpec("argv", false, false, "Exact command argv tokens"), stringSpec("cwd", false, false, "Command root or relative subdirectory"), listSpec("env_allow", false, false, "Allow-listed environment names; a relative argv[0] such as make resolves only when PATH is listed here, and a definition without it is refused E_GATE_INVALID"),
 			stringSpec("timeout_ms", false, false, "Command timeout in milliseconds"), stringSpec("output_cap_bytes", false, false, "Combined output cap in bytes"), stringSpec("parser", false, false, "Command output parser; required by predicate tests-green and refused with predicate exit-zero", "go-test-json-v1"),
@@ -1886,7 +1884,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 		}, MCPTool: "aira_gate", MCPOperation: "subverb", Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			subverb := strings.ToLower(stringArg(args, "subverb"))
 			switch subverb {
-			case "show", "add", "set", "run", "attest", "prove", "review", "baseline-pin", "baseline-show":
+			case "show", "add", "set", "run", "attest", "prove", "review":
 				_ = stringArg(args, "gate_id")
 				if subverb == "add" || subverb == "set" {
 					// add/set accept an explicit canary id override, which the
@@ -1895,11 +1893,6 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				}
 				if subverb == "attest" {
 					_ = stringArg(args, "verdict")
-					_ = stringArg(args, "actor")
-				}
-				if subverb == "baseline-pin" {
-					_ = stringArg(args, "report")
-					_ = stringArg(args, "reason")
 					_ = stringArg(args, "actor")
 				}
 			case "canary-run", "canary-show":
@@ -1947,13 +1940,6 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 					return nil, err
 				}
 				return handlerData{Data: report, Verdict: report.Verdict}, nil
-			case "baseline-pin":
-				if stringArg(args, "gate_id") == "" || stringArg(args, "report") == "" {
-					return nil, errors.New("E_GATE_BASELINE_INVALID: baseline pin requires gate id and report")
-				}
-				return c.store.PinGateBaseline(ctx, stringArg(args, "gate_id"), strings.Split(stringArg(args, "report"), ","), stringArg(args, "actor"), stringArg(args, "reason"))
-			case "baseline-show":
-				return c.store.ShowGateBaseline(stringArg(args, "gate_id"))
 			case "attest":
 				as, ok := c.store.(gateAttestationStore)
 				if !ok {
@@ -2075,8 +2061,6 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 			{Name: "review", Summary: "Request manual gate review", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"review", "review"}},
 			{Name: "canary-run", Summary: "Run a named canary", Safety: SafetyReconcile, Args: append([]OperationArg{{Name: "canary_id", Required: true}}, mutationOperationArgs()...), Example: []string{"canary-run", "unit-tests-mutation", "--mutation-kind", "go-inject-failing-test", "--mutation-pkgdir", ".", "--mutation-testname", "TestInjected"}},
 			{Name: "canary-show", Summary: "Show a canary declaration", Safety: SafetyRead, Args: append([]OperationArg{{Name: "canary_id", Required: true}}, mutationOperationArgs()...), Example: []string{"canary-show", "unit-tests-mutation"}},
-			{Name: "baseline-pin", Summary: "Pin a durable ratchet baseline", Safety: SafetyMutate, Args: []OperationArg{{Name: "gate_id", Required: true}, {Name: "report", Required: true}, {Name: "reason"}, {Name: "actor"}}, Example: []string{"baseline-pin", "unit-tests", "--report", "TR-1", "--actor", "release-bot"}},
-			{Name: "baseline-show", Summary: "Show the active ratchet baseline", Safety: SafetyRead, Args: []OperationArg{{Name: "gate_id", Required: true}}, Example: []string{"baseline-show", "unit-tests"}},
 		}},
 		"spend": {summary: "Record and list raw compute events", safety: SafetyMutate, operations: []OperationSpec{
 			{Name: "add", Summary: "Ingest one compute event", Safety: SafetyMutate, Args: []OperationArg{{Name: "provider", Required: true}, {Name: "model", Required: true}, {Name: "source", Required: true}, {Name: "ticket"}, {Name: "phase"}, {Name: "at"}, {Name: "session"}, {Name: "agent"}, {Name: "raw"}, {Name: "usage-file"}, {Name: "bucket"}, {Name: "total"}, {Name: "cost-usd"}, {Name: "reasoning-subset"}}, Example: []string{"add", "--provider", "openai", "--model", "gpt-5", "--source", "manual", "--bucket", "fresh_input=700", "--bucket", "cache_read=300", "--bucket", "output=200", "--total", "1200", "--reasoning-subset"}},

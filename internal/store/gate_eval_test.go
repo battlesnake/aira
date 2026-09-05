@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"aira/internal/codes"
 	"aira/internal/domain"
 	"aira/internal/gate"
 )
@@ -221,15 +220,56 @@ func TestSeedDigestInvalidatesOnDemandProof(t *testing.T) {
 	}
 }
 
-func TestGateCatalogRegistersDeferredRatchetCodesWithoutRatchetPath(t *testing.T) {
-	for _, code := range []string{"E_GATE_RATCHET_REGRESSED", "U_GATE_BASELINE_MISSING", "U_GATE_INCOMPARABLE", "E_GATE_BASELINE_INVALID"} {
-		if _, ok := codes.ExitCodes[code]; !ok {
-			t.Fatalf("catalog missing %s", code)
-		}
+func TestSyntheticCanaryComparatorStillReachesPassWhenNothingRegressed(t *testing.T) {
+	baseline := RatchetSnapshot{FailingSet: []string{"A"}}
+	clean := compareNoNewFailures(baseline, []string{"A"}, map[string]struct{}{})
+	if clean.Predicate != gate.PredicatePass || clean.Code != "" {
+		t.Fatalf("no new failures no longer reaches pass: %#v", clean)
 	}
-	verdict := gate.FoldVerdict(gate.PredicatePass, gate.ProofValid, gate.CanaryPass, gate.EvidenceAvailable)
-	if verdict.Code == "E_GATE_RATCHET_REGRESSED" || verdict.Code == "U_GATE_BASELINE_MISSING" || verdict.Code == "U_GATE_INCOMPARABLE" {
-		t.Fatalf("deferred ratchet code emitted: %#v", verdict)
+	regressed := compareNoNewFailures(baseline, []string{"A", "B"}, map[string]struct{}{})
+	if regressed.Predicate != gate.PredicateFail || regressed.Code != "E_GATE_RATCHET_REGRESSED" {
+		t.Fatalf("a new failure no longer reaches fail: %#v", regressed)
+	}
+	excluded := compareNoNewFailures(baseline, []string{"A", "B"}, map[string]struct{}{"B": {}})
+	if excluded.Predicate != gate.PredicatePass {
+		t.Fatalf("an excluded new failure no longer reaches pass: %#v", excluded)
+	}
+}
+
+// verifies: AIRA-78 -- the relocation of the ratchet comparator into gate_eval.go
+// must keep runCanary's actual wiring for the untouched CanarySyntheticRatchet
+// canary lane working, not just the pure comparator function in isolation
+// (TestSyntheticCanaryComparatorStillReachesPassWhenNothingRegressed above).
+// This is the store-level integration test AIRA-78's old gate_ratchet_test.go
+// carried as TestSyntheticRatchetCanaryUsesSameComparatorInMemory, relocated
+// onto a checkable gate now that the ratchet gate kind is gone -- runCanary's
+// synthetic-ratchet branch never reads the referring gate's kind or payload, so
+// any discoverable gate works as the vehicle.
+func TestSyntheticRatchetCanaryLaneStillWiredThroughRunCanary(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	definition := gate.GateDefinition{SchemaVersion: 2, ID: "checkable-fixture", Name: "Checkable fixture", Kind: gate.KindCheckable,
+		AppliesTo: gate.AppliesTo{All: true}, Lane: gate.Lane{Name: "local", Checker: "check-dimension", EvaluatorVersion: "1"},
+		ProofPolicy: gate.ProofPolicy{Mode: gate.ProofRequired, RequireCurrentCanary: true}, CanaryIDs: []string{"synthetic-ratchet-canary"},
+		Checkable: &gate.Checkable{Dimension: "traceability"}, Enabled: true}
+	canary := gate.CanaryDeclaration{SchemaVersion: 2, ID: "synthetic-ratchet-canary", GateID: definition.ID, Mode: gate.CanarySyntheticRatchet,
+		BaselineFailing: []string{"A"}, CurrentFailing: []string{"A", "B"}, Expected: "regressed", ExpectedGateResult: gate.VerdictFail,
+		LaneBinding: "local", Isolation: gate.IsolationTempGit, Cadence: gate.CadenceOnDemand}
+	writeGateFixture(t, root, definition, canary)
+	s := testStore(t, root, filepath.Join(base, "common"), filepath.Join(base, "state"))
+	resolved, err := s.canaryFor(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The zero subject is deliberate and load-bearing: a synthetic-ratchet canary
+	// evaluates entirely in memory and must not need a tracked tree at all. This
+	// root is not even a git worktree, so a capture here would fail.
+	evaluation, isolated, err := s.runCanary(context.Background(), resolved, definition, capturedSubject{})
+	if err != nil || isolated.Digest == "" || evaluation.Predicate != gate.PredicateFail || evaluation.Code != "E_GATE_RATCHET_REGRESSED" {
+		t.Fatalf("evaluation=%#v root=%#v err=%v", evaluation, isolated, err)
 	}
 }
 

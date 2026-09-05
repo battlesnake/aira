@@ -194,11 +194,5 @@ func (s *recordingStore) AddQuotaSnapshot(context.Context, domain.QuotaSnapshotI
 func (s *recordingStore) ListQuotaSnapshots(string) ([]domain.QuotaSnapshot, error) {
 	return nil, s.fail("ListQuotaSnapshots")
 }
-func (s *recordingStore) PinGateBaseline(context.Context, string, []string, string, string) (store.GateBaseline, error) {
-	return store.GateBaseline{}, s.fail("PinGateBaseline")
-}
-func (s *recordingStore) ShowGateBaseline(string) (store.GateBaseline, error) {
-	return store.GateBaseline{}, s.fail("ShowGateBaseline")
-}
 
 var _ Store = (*recordingStore)(nil)

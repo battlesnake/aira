@@ -419,16 +419,6 @@ func writeRoutingGateFixtures(t *testing.T, root string) {
 		SchemaVersion: 1, ID: "manual-fixture-canary", GateID: "manual-fixture", Mode: gate.CanaryAttestationChallenge,
 		ExpectedGateResult: gate.VerdictFail, LaneBinding: "human", Isolation: gate.IsolationTempGit, Cadence: gate.CadenceEveryEvaluation,
 	})
-	write(gate.GateDefinition{
-		SchemaVersion: 2, ID: "ratchet-fixture", Name: "ratchet fixture", Kind: gate.KindRatchet, Enabled: true,
-		AppliesTo: gate.AppliesTo{All: true}, Lane: gate.Lane{Name: "ratchet", Checker: string(gate.CheckerRatchet), EvaluatorVersion: "1", ConfigDigest: "routing-config"},
-		ProofPolicy: gate.ProofPolicy{Mode: gate.ProofRequired, RequireCurrentCanary: true}, CanaryIDs: []string{"ratchet-fixture-canary"},
-		Ratchet: &gate.Ratchet{Metric: "tests", Comparator: "no-new-failures", BaselineSelection: "active-explicitly-pinned", ComparisonKey: gate.ComparisonKey{SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1"}},
-	}, gate.CanaryDeclaration{
-		SchemaVersion: 2, ID: "ratchet-fixture-canary", GateID: "ratchet-fixture", Mode: gate.CanarySyntheticRatchet,
-		BaselineFailing: []string{"TestOld"}, CurrentFailing: []string{"TestOld", "TestNew"}, Expected: "regressed", ExpectedGateResult: gate.VerdictFail,
-		LaneBinding: "ratchet", Isolation: gate.IsolationTempGit, Cadence: gate.CadenceOnDemand,
-	})
 }
 
 func prepareRoutingFixture(t *testing.T, seed *Core, request Request) {
@@ -533,12 +523,6 @@ func assertRoutingEffect(t *testing.T, s *store.Store, request Request, findingI
 			reports, err := s.ListTestReports("")
 			if err != nil || len(reports) < 2 {
 				t.Fatalf("test-report effect reports=%+v err=%v", reports, err)
-			}
-		}
-	case "gate":
-		if operation == "baseline-pin" || operation == "baseline-show" {
-			if _, err := s.ShowGateBaseline("ratchet-fixture"); err != nil {
-				t.Fatalf("gate %s effect: %v", operation, err)
 			}
 		}
 	}
@@ -670,9 +654,6 @@ func routingFixtures(descriptors []DispatchDescriptor, findingID string) []Reque
 					args["gate_id"] = "manual-fixture"
 				case "canary-run", "canary-show":
 					args["canary_id"] = "manual-fixture-canary"
-				case "baseline-pin", "baseline-show":
-					args["gate_id"] = "ratchet-fixture"
-					args["report"] = "TR-1"
 				}
 			}
 			fixtures = append(fixtures, request)

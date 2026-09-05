@@ -1,5 +1,16 @@
 # AIRA M13b — ratchet gate (design)
 
+> **REMOVED (AIRA-78, 2026-09-05).** The `ratchet` gate kind this spec designs was
+> deleted from the codebase: it never accumulated a single production row (`gates`,
+> `gate_results`, `gate_baselines`, `test_reports`, and every other table it depended
+> on were confirmed empty), and a real evidence-selection defect found during the
+> AIRA-72 two-loop (ratchet evaluation bound its verdict to a working-tree digest but
+> selected comparison evidence via `HEAD`, so a dirty tree could mint a fake pass) was
+> never worth fixing for a feature nothing had ever used. Owner decision: delete, not
+> fix. This document stands as the historical design record only; `checkable`,
+> `manual`, and the canary mechanism (including the `synthetic-ratchet` canary lane,
+> whose small comparator was relocated rather than deleted) are unaffected.
+
 Status: DRAFT (pre plan-review). Author: Opus (coordinator). Milestone: Phase 4 · M13b.
 Base: master `fd6f9e5` (M13 done). Building delegated to Codex; gate order (owner): Sol
 plan-review → approve → Opus/Fable plan-final → build → Sol build-review → approve →

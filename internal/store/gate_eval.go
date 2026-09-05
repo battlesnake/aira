@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -39,10 +40,6 @@ func gateResultFields(def gate.GateDefinition, definitionDigest, declarationDige
 		"lane":               def.Lane.Name,
 		"evaluator_version":  def.Lane.EvaluatorVersion,
 		"proof_seq":          proofSeq,
-	}
-	if def.Kind == gate.KindRatchet {
-		fields["comparator_version"] = ratchetComparatorVersion
-		fields["config_digest"] = def.Lane.ConfigDigest
 	}
 	return fields
 }
@@ -236,10 +233,6 @@ func (s *Store) RunGate(ctx context.Context, id string) (GateCheckResult, error)
 	proofSeq := ""
 	if canaryHealth == gate.CanaryPass {
 		proofFields := map[string]string{"gate_id": def.ID, "canary_id": canary.ID, "definition_digest": found.Digest, "declaration_digest": declarationDigest, "canary_tree_digest": canaryRoot.Digest, "subject_scope": subjectEval.Root.Digest, "lane": def.Lane.Name, "evaluator_version": def.Lane.EvaluatorVersion}
-		if def.Kind == gate.KindRatchet {
-			proofFields["comparator_version"] = ratchetComparatorVersion
-			proofFields["config_digest"] = def.Lane.ConfigDigest
-		}
 		if subjectEval.EnvDigest != "" {
 			proofFields["env_digest"] = subjectEval.EnvDigest
 		}
@@ -588,6 +581,63 @@ func (s *Store) runCanary(ctx context.Context, c gate.CanaryDeclaration, def gat
 	return evaluation, evaluation.Root, err
 }
 
+// RatchetSnapshot and its comparator remain solely for the untouched
+// CanarySyntheticRatchet canary lane. They are not a gate kind or baseline
+// mechanism after AIRA-78.
+type RatchetSnapshot struct {
+	FailingSet []string `json:"failing_set"`
+}
+
+type RatchetComparison struct {
+	Predicate      gate.PredicateState `json:"predicate"`
+	Code           string              `json:"code,omitempty"`
+	CurrentFailing []string            `json:"current_failing,omitempty"`
+	NewFailures    []string            `json:"new_failures,omitempty"`
+	ExcludedFlaky  []string            `json:"excluded_flaky,omitempty"`
+}
+
+func compareNoNewFailures(snapshot RatchetSnapshot, currentFailing []string, excluded map[string]struct{}) RatchetComparison {
+	baseline := make(map[string]struct{}, len(snapshot.FailingSet))
+	for _, name := range snapshot.FailingSet {
+		baseline[name] = struct{}{}
+	}
+	currentSet := make(map[string]struct{}, len(currentFailing))
+	for _, name := range currentFailing {
+		currentSet[name] = struct{}{}
+	}
+	newFailures := make([]string, 0)
+	excludedNames := make([]string, 0)
+	for name := range currentSet {
+		if _, exists := baseline[name]; exists {
+			continue
+		}
+		if _, flaky := excluded[name]; flaky {
+			excludedNames = append(excludedNames, name)
+			continue
+		}
+		newFailures = append(newFailures, name)
+	}
+	sort.Strings(newFailures)
+	sort.Strings(excludedNames)
+	comparison := RatchetComparison{Predicate: gate.PredicateUnevaluated, CurrentFailing: sortedSet(currentSet), NewFailures: newFailures, ExcludedFlaky: excludedNames}
+	if len(newFailures) > 0 {
+		comparison.Predicate = gate.PredicateFail
+		comparison.Code = "E_GATE_RATCHET_REGRESSED"
+	} else {
+		comparison.Predicate = gate.PredicatePass
+	}
+	return comparison
+}
+
+func sortedSet(values map[string]struct{}) []string {
+	result := make([]string, 0, len(values))
+	for value := range values {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
 // runFixtureCanary is retained as a compatibility seam for M10a tests and
 // delegates to the mode-dispatched implementation. The zero subject is correct
 // for the modes it serves: a fixture canary seeds and captures its own tree and
@@ -714,9 +764,6 @@ func (s *Store) GateCheck(ctx context.Context) (GateCheckReport, error) {
 				record.Fields["lane"] != d.Definition.Lane.Name ||
 				record.Fields["evaluator_version"] != d.Definition.Lane.EvaluatorVersion ||
 				record.Fields["canary_tree_digest"] == ""
-			if d.Definition.Kind == gate.KindRatchet {
-				bindingMismatch = bindingMismatch || record.Fields["comparator_version"] != ratchetComparatorVersion || record.Fields["config_digest"] != d.Definition.Lane.ConfigDigest
-			}
 			if bindingMismatch {
 				result.Verdict, result.Code, result.Trusted, result.Suspect = gate.VerdictUnevaluated, "U_GATE_PROOF_STALE", false, true
 			} else {
@@ -733,7 +780,7 @@ func (s *Store) GateCheck(ctx context.Context) (GateCheckReport, error) {
 					}
 					if linked == nil {
 						result.Verdict, result.Code, result.Trusted, result.Suspect = gate.VerdictUnevaluated, "U_GATE_UNPROVEN", false, true
-					} else if linked.Fields["gate_id"] != d.Definition.ID || linked.Fields["canary_id"] != canary.ID || linked.Fields["definition_digest"] != record.Fields["definition_digest"] || linked.Fields["declaration_digest"] != record.Fields["declaration_digest"] || linked.Fields["canary_tree_digest"] != record.Fields["canary_tree_digest"] || linked.Fields["subject_scope"] != currentSubjectDigest || linked.Fields["lane"] != d.Definition.Lane.Name || linked.Fields["evaluator_version"] != d.Definition.Lane.EvaluatorVersion || (d.Definition.Command != nil && linked.Fields["env_digest"] != record.Fields["env_digest"]) || (d.Definition.Kind == gate.KindRatchet && (linked.Fields["comparator_version"] != ratchetComparatorVersion || linked.Fields["config_digest"] != d.Definition.Lane.ConfigDigest)) {
+					} else if linked.Fields["gate_id"] != d.Definition.ID || linked.Fields["canary_id"] != canary.ID || linked.Fields["definition_digest"] != record.Fields["definition_digest"] || linked.Fields["declaration_digest"] != record.Fields["declaration_digest"] || linked.Fields["canary_tree_digest"] != record.Fields["canary_tree_digest"] || linked.Fields["subject_scope"] != currentSubjectDigest || linked.Fields["lane"] != d.Definition.Lane.Name || linked.Fields["evaluator_version"] != d.Definition.Lane.EvaluatorVersion || (d.Definition.Command != nil && linked.Fields["env_digest"] != record.Fields["env_digest"]) {
 						result.Verdict, result.Code, result.Trusted, result.Suspect = gate.VerdictUnevaluated, "U_GATE_PROOF_STALE", false, true
 					}
 				}

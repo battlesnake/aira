@@ -25,7 +25,6 @@ func TestGateConstructorRejectsIllegalStates(t *testing.T) {
 		{"empty canary ids", func(g *GateDefinition) { g.CanaryIDs = nil }, "E_GATE_CANARY_INVALID"},
 		{"two payloads", func(g *GateDefinition) { g.Manual = &Manual{} }, "E_GATE_INVALID"},
 		{"no payload", func(g *GateDefinition) { g.Checkable = nil }, "E_GATE_INVALID"},
-		{"ratchet kind without payload", func(g *GateDefinition) { g.Kind = KindRatchet }, "E_GATE_INVALID"},
 		{"unknown checker", func(g *GateDefinition) { g.Lane.Checker = "unknown" }, "E_GATE_INVALID"},
 		{"recursive gates dimension", func(g *GateDefinition) { g.Checkable.Dimension = "gates" }, "E_GATE_INVALID"},
 		{"recursive aggregate dimension", func(g *GateDefinition) { g.Checkable.Dimension = "check" }, "E_GATE_INVALID"},
@@ -42,44 +41,6 @@ func TestGateConstructorRejectsIllegalStates(t *testing.T) {
 				t.Fatalf("error=%v, want %s", err, tt.want)
 			}
 		})
-	}
-}
-
-func validRatchetGate() GateDefinition {
-	return GateDefinition{
-		SchemaVersion: 2, ID: "ratchet", Name: "Ratchet", Kind: KindRatchet,
-		AppliesTo: AppliesTo{All: true}, Lane: Lane{Name: "local", Checker: string(CheckerRatchet), EvaluatorVersion: "1"},
-		ProofPolicy: ProofPolicy{Mode: ProofRequired, RequireCurrentCanary: true}, CanaryIDs: []string{"ratchet-canary"},
-		Ratchet: &Ratchet{Metric: "tests", Comparator: "no-new-failures", BaselineSelection: "active-explicitly-pinned", ComparisonKey: ComparisonKey{SuiteID: "unit", Config: "default", EnvDigest: "env", Shard: "1/1"}}, Enabled: true,
-	}
-}
-
-func TestRatchetGateValidationAndRoundTrip(t *testing.T) {
-	g := validRatchetGate()
-	if err := ValidateGate(g, g.ID+".json"); err != nil {
-		t.Fatal(err)
-	}
-	rendered, err := RenderGate(g)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := ParseGate(rendered, g.ID+".json")
-	if err != nil || got.Ratchet == nil || got.Ratchet.ComparisonKey.EnvDigest != "env" {
-		t.Fatalf("got=%#v err=%v", got, err)
-	}
-	for _, edit := range []func(*Ratchet){
-		func(r *Ratchet) { r.Metric = "" },
-		func(r *Ratchet) { r.Comparator = "unknown" },
-		func(r *Ratchet) { r.ComparisonKey.EnvDigest = "" },
-		func(r *Ratchet) { r.BaselineSelection = "automatic" },
-	} {
-		candidate := g
-		copy := *g.Ratchet
-		edit(&copy)
-		candidate.Ratchet = &copy
-		if err := ValidateGate(candidate, candidate.ID+".json"); err == nil {
-			t.Fatal("invalid ratchet accepted")
-		}
 	}
 }
 

@@ -31,8 +31,6 @@ var projectOwnershipTables = []string{
 	"gate_results",
 	"gate_proofs",
 	"gate_attestations",
-	"gate_baselines",
-	"gate_baseline_active",
 	"test_report_counter",
 	"rant_counter",
 	"compute_event_counter",
