@@ -61,6 +61,10 @@ _PLACEMENT_ACK_TIMEOUT_SECONDS = 60.0
 # blocking on it forever is worse.
 _REAP_TIMEOUT_SECONDS = 5.0
 
+# A sentinel distinct from None, for dict lookups where "the key is absent" and
+# "the value is None" must not be conflated. See _pool_covers_the_queue.
+_UNKNOWN = object()
+
 _GO_DURATION = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*(ns|us|µs|ms|s|m|h)?\s*$")
 _GO_DURATION_SCALE = {
     None: 1.0, "": 1.0, "ns": 1e-9, "us": 1e-6, "µs": 1e-6,
@@ -517,7 +521,7 @@ class Supervisor:
         self.max_workers_fallback = max(1, int(os.environ.get("AIRA_AITEST_MAX_WORKERS_FALLBACK", "1")))
         self._fallback_warned = False
         self._admission_terminal_warned = False
-        self._pidfd_warned = False
+        self._pidfd_warned = set()
         self.items_by_nodeid = {}
         self.workers = {}
         # Worker scopes whose rmdir failed, for a later retry. See
@@ -858,9 +862,17 @@ class Supervisor:
             return None
 
     def _warn_no_pidfd(self, reason):
-        if self._pidfd_warned:
+        # Once per DISTINCT reason, not once per process (build-review): the
+        # two conditions have different scope -- a missing os.pidfd_open
+        # affects every worker for the whole run, a per-call OSError affects
+        # only that one -- so a single flag let one transient ESRCH on the
+        # first worker permanently suppress a later report of the permanent
+        # condition. Keyed on the reason text with the worker number stripped,
+        # so a repeating per-call failure still cannot spam the log.
+        key = reason.split(" for worker ")[0]
+        if key in self._pidfd_warned:
             return
-        self._pidfd_warned = True
+        self._pidfd_warned.add(key)
         # "for any worker without one", not a flat "crash detection is now
         # EOF-only": the missing-attribute case really does affect every
         # worker, but a per-call OSError affects only that one, and claiming
@@ -1039,9 +1051,12 @@ class Supervisor:
             # Opened only now, on the path where this worker is actually going
             # to be registered: every failure branch above has already reaped
             # the child, and a pidfd for a reaped pid is either invalid or --
-            # worse -- refers to whatever process later reuses that pid.
-            # Nothing has reaped this one (the placement ack proves it is alive
-            # and placed), so the pid cannot be reused underneath us here.
+            # worse -- refers to whatever process later reuses that pid. The
+            # guarantee here is precisely that NOTHING HAS REAPED this one, so
+            # its pid cannot be reused underneath us; it is deliberately not a
+            # claim that the child is still running (the ack proves it was
+            # alive when it wrote, and it may be a zombie by now, which
+            # pidfd_open handles).
             "pidfd": self._open_pidfd(pid),
         })
         self.workers[pid] = state
@@ -1690,8 +1705,15 @@ class Supervisor:
         so the exit branch drains that worker itself before acting, and would
         remain correct even if these two loops were swapped. Splitting them is
         what makes "results first" well defined without depending on select()'s
-        ready-list order, which is no guarantee to lean on anyway: CPython
-        returns it in ascending fd order, not in the order fds were passed.
+        ready-list order at all. CPython does in fact return that list in the
+        order the fds were passed (selectmodule.c's set2list walks its fd2obj
+        array, not the fd_set; measured on this host, 3.12.3, by passing ready
+        fds in descending order and getting them back in descending order) --
+        but that is an implementation detail POSIX does not promise, and
+        iterating the two owner maps rather than `ready` means this code never
+        has to care either way. An earlier revision of this docstring asserted
+        the opposite ("ascending fd order") and used it as the justification for
+        the split; the split is right, that reason was not.
 
         The exit branch's own drain is therefore not redundant with the first
         pass, and is the only thing covering the commonest version of this
@@ -1752,10 +1774,20 @@ class Supervisor:
         this correct at any call site rather than only in a context where
         nothing is in flight yet: a busy worker is not cover for a queued
         nodeid, and derived-from-live-state cannot drift out of step with the
-        queue the way a separate counter can. `.get`, not `[...]`, because the
-        answer must not depend on a worker state dict having reached its final
-        shape."""
-        idle = sum(1 for state in self.workers.values() if state.get("in_flight") is None)
+        queue the way a separate counter can.
+
+        The `_UNKNOWN` default is deliberate and directional (build-review): a
+        state dict that has not reached its final shape must count as NOT idle.
+        A plain `.get("in_flight")` would return None for a missing key and
+        therefore count such a worker as cover for a queued nodeid -- claiming
+        capacity that was never established, which is the one direction this
+        function must not fail in. Inert today (both registration sites set
+        in_flight before publishing the state), and it stays inert by
+        construction rather than by convention."""
+        idle = sum(
+            1 for state in self.workers.values()
+            if state.get("in_flight", _UNKNOWN) is None
+        )
         return idle >= len(self.queue)
 
     def run(self, estimated_bytes, worker_count=1, max_wait="30s"):
@@ -1831,6 +1863,17 @@ class Supervisor:
                 for pid, state in self.workers.items()
                 if state.get("pidfd") is not None
             }
+            # ACCEPTED, NAMED GAP (build-review, P3): select() refuses any fd
+            # number >= FD_SETSIZE (1024) with a ValueError that would
+            # propagate out of run() and lose the whole suite. That vector
+            # predates AIRA-40, but this change does roughly double this
+            # loop's fd consumption, so it is written down rather than left
+            # implicit. Not fixed here: it needs the loop moved onto
+            # selectors.DefaultSelector (epoll, no such limit), which this
+            # module already uses for its two bounded single-fd reads, and
+            # that is a hot-loop rewrite well outside a liveness fix. Reaching
+            # it at all requires the pytest process to hold >1024 fds, since
+            # the limit is on the NUMBER, not the count passed here.
             ready, _, _ = select.select(
                 list(result_fd_owners) + list(pidfd_owners), [], [], 1.0
             )

@@ -1642,6 +1642,40 @@ sys.stdin.buffer.read()
     )
 
 
+def test_pool_covers_the_queue_counts_only_idle_workers():
+    """The property the helper is SHAPED for, which neither startup test can
+    see (build-review): at startup nothing is in flight, so counting idle
+    workers and counting all workers are indistinguishable there -- a version
+    written as `len(self.workers) >= len(self.queue)` passes every other test
+    in this file. A busy worker is not cover for a queued nodeid, and this is
+    what makes the helper correct at a call site where something IS in flight
+    (the docstring claims a future _replace_worker call site would be safe;
+    that claim rests entirely on this).
+
+    The missing-key case is directional, not cosmetic: a state dict that has
+    not reached its final shape must count as NOT idle, because counting it as
+    idle would claim capacity that was never established."""
+    supervisor = Supervisor()
+    supervisor.queue = ["pkg/test_mod.py::test_a", "pkg/test_mod.py::test_b"]
+    supervisor.workers = {
+        101: {"in_flight": None},
+        102: {"in_flight": "pkg/test_mod.py::test_running"},
+    }
+
+    assert supervisor._pool_covers_the_queue() is False, (
+        "one idle worker does not cover two queued nodeids -- a busy worker is not cover"
+    )
+
+    supervisor.workers[102]["in_flight"] = None
+    assert supervisor._pool_covers_the_queue() is True
+
+    supervisor.workers[103] = {}  # registered, but not yet in its final shape
+    supervisor.queue.append("pkg/test_mod.py::test_c")
+    assert supervisor._pool_covers_the_queue() is False, (
+        "a state dict with no in_flight key must not be counted as available capacity"
+    )
+
+
 def test_fallback_startup_never_forks_more_workers_than_there_is_queued_work(tmp_path, monkeypatch, pytester):
     """AIRA-37 residue #2, the daemon-down half. The fallback startup loop
     carried the identical `if not self.queue: break` guard against a queue
@@ -2917,6 +2951,66 @@ def test_retire_worker_closes_the_pidfd():
     os.close(dispatch_read)
 
 
+def test_the_pidfd_degradation_warns_once_per_distinct_reason_not_once_per_process(capsys):
+    """The two ways a pidfd can be unavailable have different SCOPE: a missing
+    os.pidfd_open affects every worker for the whole run, a per-call OSError
+    affects only that one. A single one-shot flag (the first version of this)
+    let one transient ESRCH on the first worker permanently suppress a later
+    report of the permanent condition -- a silence about a real loss of
+    capability, which is the thing this warning exists to prevent.
+
+    The repeat within one reason still collapses to a single line: the worker
+    number is stripped from the key, so a per-call failure recurring across a
+    whole pool cannot turn the log into spam."""
+    supervisor = Supervisor()
+
+    supervisor._warn_no_pidfd("os.pidfd_open failed for worker 101: [Errno 3] no such process")
+    supervisor._warn_no_pidfd("os.pidfd_open failed for worker 102: [Errno 3] no such process")
+    supervisor._warn_no_pidfd("this Python has no os.pidfd_open (needs 3.9+ on Linux 5.3+)")
+
+    stderr = capsys.readouterr().err
+    assert stderr.count("crash detection falls back to result-pipe EOF alone") == 2, (
+        "two DISTINCT reasons must both be reported, and the repeated one only once"
+    )
+    assert "for worker 101" in stderr
+    assert "for worker 102" not in stderr, "the same reason must not repeat per worker"
+    assert "this Python has no os.pidfd_open" in stderr
+
+
+def test_a_forked_child_closes_every_other_workers_inherited_pidfd():
+    """fork() copies the whole fd table and there is no exec() here for CLOEXEC
+    to ever fire, so a newly forked worker inherits a duplicate of every
+    already-running worker's pidfd. Unlike an inherited PIPE write end that
+    one cannot wedge the parent's detection -- pidfd readiness follows the
+    tracked process's exit, not the fd's reference count -- but it is dead
+    weight the child accumulates once per already-running worker, so the same
+    fd-table hygiene the rest of this method enforces applies.
+
+    Exercised by calling the child-side helper directly rather than through a
+    fork, which is what makes the assertion possible at all: after a real fork
+    the closes happen in a process this test cannot inspect."""
+    supervisor = Supervisor()
+    pid, pidfd = _exited_child_pidfd(supervisor)
+    result_read, result_write = os.pipe()
+    dispatch_read, dispatch_write = os.pipe()
+    supervisor.workers[pid] = {
+        "result_fd": result_read, "read_buffer": b"", "result_eof": False,
+        "in_flight": None, "pidfd": pidfd,
+        "dispatch_write": os.fdopen(dispatch_write, "w"),
+        "admit_process": None, "grant": None,
+    }
+
+    supervisor._child_close_other_workers_fds()
+
+    with pytest.raises(OSError) as caught:
+        os.fstat(pidfd)
+    assert caught.value.errno == errno.EBADF, "the inherited pidfd must be closed, not carried"
+    os.waitpid(pid, 0)
+    for fd in (result_write, dispatch_read):
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
 @pytest.mark.parametrize("break_it", ["missing", "raises"])
 def test_a_host_without_pidfds_degrades_to_eof_detection_and_says_so_once(
     tmp_path, monkeypatch, capsys, pytester, break_it
@@ -2944,12 +3038,26 @@ def test_a_host_without_pidfds_degrades_to_eof_detection_and_says_so_once(
     """)
     supervisor = Supervisor()
     supervisor.collect(items)
+    # Recorded as each worker is spawned. Asserting on supervisor.workers after
+    # the run instead would be VACUOUS (build-review): run()'s loop is
+    # `while self.workers:`, so it can only ever return with that dict empty,
+    # and `all(...)` over nothing is true no matter what the code does.
+    opened = []
+    original_open_pidfd = supervisor._open_pidfd
+
+    def recording_open_pidfd(pid):
+        fd = original_open_pidfd(pid)
+        opened.append(fd)
+        return fd
+
+    supervisor._open_pidfd = recording_open_pidfd
 
     results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=2)
 
     assert len(results) == 2
     assert all(outcome == "passed" for outcome in results.values())
-    assert all(state.get("pidfd") is None for state in supervisor.workers.values())
+    assert opened, "the spawn path must still ask for a pidfd, so the fallback is reached"
+    assert all(fd is None for fd in opened), "a broken os.pidfd_open must yield None, never a raise"
     stderr = capsys.readouterr().err
     assert stderr.count("crash detection falls back to result-pipe EOF alone") == 1, (
         "the degradation must be stated exactly once, not per worker and not never"
@@ -2963,9 +3071,17 @@ def test_worker_killed_behind_a_forked_grandchild_is_detected_and_the_run_finish
     holding the inherited result-pipe write end, and a REAL SIGKILL.
 
     The SIGALRM failsafe is not a timing assertion -- the fixed path completes
-    in well under a second, and the grandchild sleeps far longer than the alarm
-    -- it exists so that a future regression FAILS this test instead of hanging
-    the whole suite until the grandchild happens to exit."""
+    in well under a second -- it exists so that a future regression FAILS this
+    test instead of hanging the whole suite until the grandchild exits. Its
+    message hedges accordingly: on a heavily loaded box the alarm could in
+    principle beat a supervisor that is merely slow.
+
+    The grandchild is reaped in the `finally` (build-review): it is a fork of
+    the PYTEST process, so it holds duplicates of pytest's own stdout and
+    stderr, and leaving it sleeping means anything piping this suite's output
+    sees no EOF until it exits -- and under `aira confine` it keeps the cgroup
+    scope populated. It writes its pid where the test can find it, and sleeps
+    only a little longer than the alarm rather than far longer."""
     outer = tmp_path / "outer"
     outer.mkdir()
     bootstrap = _write_stub(tmp_path / "bootstrap", f"""
@@ -2985,6 +3101,7 @@ sys.stdin.buffer.read()
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
 
     attempts = tmp_path / "attempts"
+    grandchild_pid_path = tmp_path / "grandchild-pid"
     items = pytester.getitems(f"""
         import os, signal, time
 
@@ -2996,12 +3113,15 @@ sys.stdin.buffer.read()
                 seen = 0
             open(attempts_path, "a").write("x")
             if seen == 0:
-                if os.fork() == 0:
+                grandchild = os.fork()
+                if grandchild == 0:
                     # The grandchild. It inherits a duplicate of this worker's
                     # result-pipe write end and outlives the worker, so the
                     # supervisor's read end never reaches EOF.
-                    time.sleep(20)
+                    time.sleep(15)
                     os._exit(0)
+                # Written BEFORE the SIGKILL so the test can always reap it.
+                open({str(grandchild_pid_path)!r}, "w").write(str(grandchild))
                 os.kill(os.getpid(), signal.SIGKILL)
     """)
     supervisor = Supervisor()
@@ -3009,8 +3129,9 @@ sys.stdin.buffer.read()
 
     def _too_slow(signum, frame):
         raise AssertionError(
-            "the supervisor never noticed the killed worker -- it is still "
-            "waiting on a pipe EOF the surviving grandchild is holding off"
+            "the supervisor did not notice the killed worker within the failsafe "
+            "-- it is waiting on a pipe EOF the surviving grandchild is holding off "
+            "(or, far less likely, this box is loaded enough to beat the alarm)"
         )
 
     previous = signal.signal(signal.SIGALRM, _too_slow)
@@ -3023,6 +3144,18 @@ sys.stdin.buffer.read()
         for stuck_pid in list(supervisor.workers):
             with contextlib.suppress(OSError):
                 os.kill(stuck_pid, signal.SIGKILL)
+        # The grandchild is a fork of THIS pytest process and holds duplicates
+        # of its stdout/stderr; leaving it asleep would withhold EOF from
+        # anything consuming this suite's output.
+        try:
+            grandchild = int(grandchild_pid_path.read_text())
+        except (FileNotFoundError, ValueError):
+            grandchild = None
+        if grandchild is not None:
+            with contextlib.suppress(OSError):
+                os.kill(grandchild, signal.SIGKILL)
+            # It is a grandchild, not a child of this process, so it is
+            # reparented to init and reaped there -- nothing to waitpid here.
 
     assert results == {items[0].nodeid: "passed"}, (
         "the crash must be detected, requeued once, and the retry must run"

@@ -106,3 +106,55 @@ also what corrected the ordering claim above.
 Spec §3.6 (`docs/superpowers/specs/2026-09-01-aitest-design.md`) now states the
 detection mechanism and this limitation instead of leaving "if a worker dies" to
 an unsound inference.
+
+### Independent build review — APPROVE-WITH-FIXES, all fixes applied
+
+An adversarial build review (a reviewer who did not write the code, reading the
+full file and running its own mutants) found **no P0 and no P1**: it could not
+construct a lost, double-recorded or misattributed result, a healthy worker
+being retired, a double-spent retry budget, a hang, a 100%-CPU spin, a leaked
+pidfd or scope, or an unhandled exception out of `run()`. It independently
+confirmed the kernel claims against `pidfd_poll`'s actual conditions.
+
+It found four P2s, every one of them real, and all are fixed:
+
+1. **A factually inverted claim in my own docstring.** It asserted CPython
+   returns `select()`'s ready list in ascending fd order and used that as the
+   justification for splitting the two passes. `selectmodule.c`'s `set2list`
+   walks its `fd2obj` array, i.e. INSERTION order — re-measured here directly
+   (passing ready fds `[11,9,7,5,3]` returns `[11,9,7,5,3]`). The split is still
+   right; that reason was not. The docstring now states the measured fact, notes
+   POSIX promises neither, and says the code deliberately relies on neither.
+2. **`_pool_covers_the_queue`'s whole design rationale was unpinned.** A version
+   counting ALL workers instead of only idle ones — the shape its own docstring
+   argues against — passed the entire suite, because both call sites run before
+   any dispatch, where the two are indistinguishable. Fixed by a direct unit
+   test with a busy worker in the pool.
+3. **A tautological assertion.** The degradation test asserted over
+   `supervisor.workers` AFTER `run()`, but `run()`'s loop is `while
+   self.workers:` and can only return with that dict empty, so `all(...)` over
+   nothing was vacuously true. It now records what `_open_pidfd` actually
+   returned during the run.
+4. **The child-side pidfd close was covered by no test** — deleting it passed
+   the suite. Now pinned directly on `_child_close_other_workers_fds`.
+
+Three P3s were also taken: the degradation warning now fires once per DISTINCT
+reason (a one-shot flag let a transient per-call `ESRCH` on the first worker
+permanently suppress a later report of the permanent condition); the
+`in_flight` lookup now defaults to a sentinel so a state dict that has not
+reached its final shape counts as NOT idle, the safe direction; and the
+end-to-end test now reaps its grandchild, which is a fork of the pytest process
+and was holding duplicates of its stdout/stderr for 20s after the suite.
+
+**One P3 accepted and named rather than fixed:** `select()` refuses any fd
+number ≥ `FD_SETSIZE` (1024) with a `ValueError` that would propagate out of
+`run()`. That vector predates this change, but this change roughly doubles the
+loop's fd consumption, so it is written into the code at the `select()` call
+rather than left implicit. The fix is moving the loop onto
+`selectors.DefaultSelector` (epoll; this module already uses it for its two
+bounded single-fd reads), which is a hot-loop rewrite outside a liveness fix.
+
+The mutation battery was then re-run with the reviewer's two surviving mutants
+plus two more for the P3 fixes: **ten behavioural mutants, all ten caught by
+exactly the intended test.** The eleventh (swapping the two passes) survives by
+design and is the evidence for the corrected ordering claim in item 1.
