@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-97","project":"aira","title":"Store schema migrations: unguarded check-then-write races (ensureOutboxKind, ensureSearchFTS — the latter measured) and a fail-open hasTableColumn error path","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["migration","reliability","store"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-97","project":"aira","title":"Store schema migrations: unguarded check-then-write races (ensureOutboxKind, ensureSearchFTS — the latter measured) and a fail-open hasTableColumn error path","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["migration","reliability","store"],"hold":false,"relations":[]}
 ---
 Found by an independent `/code-review high` pass during AIRA-73's build (deleting the never-written `outbox.resolution` mechanism). Correction from the later verification pass: this ticket originally said that work was "merged `fb4da29`" — `fb4da29` was the PR branch's first commit, not a merge; PR #29 merged as `aec0502`. The reviewer confirmed AIRA-73's own shipped change is correct and set-preserving (verified via `git log -S` that `outbox.resolution` was genuinely never written in any revision) — these are two separate, pre-existing findings the new migration's own doc comments incidentally proved, not defects in AIRA-73 itself.
 
@@ -34,8 +34,23 @@ None of these are correctness bugs in AIRA-73's own shipped change, which the re
 
 ## Resolution
 
-Closed by the branch `aira97-migration-race-guards`. Plan (v2, after a Fable
-GATE-FAIL): `docs/superpowers/plans/2026-09-05-aira97-migration-race-guards-plan.md`.
+Merged as **PR #44**, squash commit **`c382d65`** (branch
+`aira97-migration-race-guards`, final branch SHA `21d169b`). Plan (v2, after a
+Fable GATE-FAIL):
+`docs/superpowers/plans/2026-09-05-aira97-migration-race-guards-plan.md`.
+
+**Verification on the exact merged SHA** (`21d169b`, whose content is identical
+to `c382d65` — confirmed by diffing the two, which shows only other tickets'
+files): `aira confine -- go build ./...` **exit 0**;
+`aira confine -- go vet ./...` **exit 0**; `gofmt -l ./internal ./cmd` **exit 0**,
+no output; `aira confine -- go test ./... -count=1` (whole repo) **exit 0** —
+`internal/store` 354.891s ok, and every other package ok. The nine new/affected
+tests were additionally run `-count=20` (**exit 0**, 103.269s) to confirm they
+are not flaky, which matters given the 7.5%-flaky predecessor this ticket
+records. GitHub CI on the PR: `build + vet + gofmt` pass, `test` pass.
+
+Not deployed by this change: the rebuilt binary and `aira-daemon.service`
+restart are left to the coordinating session.
 
 **Finding 1 — fixed.** `ensureOutboxKind`, `ensureAreaHintsGeneration` and
 `initDB`'s ten `compute_events` column additions all now route through one
