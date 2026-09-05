@@ -1,39 +1,39 @@
 # AIRA-102 — `aira confine` container integration (podman transparent nesting + docker sanity shim)
 
-**Status:** plan v1 — for plan-review (Fable gate, Sol + DeepSeek orthogonal lineages).
-**Ticket:** AIRA-102 (P1). Owner-directed two-part remedy, see the ticket's "Owner-directed remedy (2026-09-05)".
+**Status:** plan **v2** — folds the Sol (**GATE-FAIL**, 4×P0) and Fable (**GATE-FAIL**, narrow re-gate: 4×MUST-FIX + 6×SHOULD-FIX) plan reviews. DeepSeek was **unavailable** (`agentmux ask` exit 4, twice) — recorded, not a blocking gate.
+**Ticket:** AIRA-102 (P1). Owner-directed two-part remedy.
 **Branch:** `aira102-container-integration`, off `origin/master` @ `ee23834`.
-**Author:** Opus, grounded on **live empirical probes on this machine** (podman 4.9.3 rootless, cgroup v2, systemd cgroup manager, real `aira.slice`) — every claim in §2 was measured, not reasoned.
+**Author:** Opus, grounded on **live empirical probes** (podman 4.9.3 rootless, cgroup v2, systemd cgroup manager, real `aira.slice`) — every §2 claim was measured.
+
+**What v2 changed.** Both lineages independently found the same four load-bearing defects in v1: the `max()` ledger raise was **wrong** in three distinct ways and is replaced by a per-runtime rule plus an explicit specification table (§3.5); the argv scan could **act wrongly** rather than decline and gains a boundary proof (§3.2); `podman:nested` **asserted an outcome nothing verifies** and is renamed to the action performed (§3.7); §3.10 swapped a false claim for **silence** and now names the descendant OOM (§3.10). Fable additionally found that a **running** split job reads `POPULATED 0` and is skipped by AIRA-74's reserve reconstruction (§3.12), and that `-d`/`--detach` is a silent trap (§3.11).
 
 ---
 
 ## 1. Problem
 
-`aira confine -- docker run ...` confines only the docker **CLI client**; the container is spawned by the system-managed `dockerd` and never enters `aira.slice` (AIRA-102's original finding, unchanged). Rootless `podman run` **can** be contained, but only if the caller knows to hand it a `--cgroup-parent` by hand. Two gaps:
-
-1. Podman containment requires caller knowledge AIRA should supply itself.
-2. A `docker run` under confine looks confined and is not — the exact "silent success masking failure" trap.
+`aira confine -- docker run ...` confines only the docker **CLI client**; the container is spawned by the system-managed `dockerd` and never enters `aira.slice`. Rootless `podman run` **can** be contained, but only if the caller hands it cgroup flags by hand. Two gaps: podman containment requires caller knowledge AIRA should supply itself, and a `docker run` under confine looks confined and is not.
 
 ---
 
 ## 2. Empirical findings (measured live, 2026-09-05)
 
-All probes ran under real `aira confine` against the real `aira.slice`; podman had **zero** containers before and after (the machine's 33 **docker** containers were never touched).
+Probes ran under real `aira confine` against the real `aira.slice`; podman had **zero** containers before and after; the machine's 33 **docker** containers were never touched.
 
 | # | Finding |
 |---|---|
-| **F1** | `podman run --cgroups=split` places the container at `<confine-scope>/[runtime/]*libpod-payload-<id>` — a genuine cgroup **descendant of THIS confine job's own scope**. Its memory is charged to that job's `memory.max`. **Per-job nesting works.** |
-| **F2** | Split relocates the confine job's **own** processes into `<cur>/runtime`, one level deeper per `podman run` in the same job (measured: `/runtime`, `/runtime/runtime`, `/runtime/runtime/runtime` after 3 runs). Confine then reports `scope-integrity=migrated`. |
-| **F3** | `--cgroups=split` is **mutually exclusive** with `--cgroup-parent`: podman refuses with `cannot specify --cgroup-mode=split with a cgroup-parent`. |
-| **F4** | Split leaves a `runtime` child cgroup behind; `Scope.Remove()` → `os.Remove` fails `ENOTEMPTY` (error already discarded), so the scope dir lingers. **AIRA-36's recursive orphan reaper (already on master) removes such subtrees on its sweep.** `confine --list` shows the lingering scope with `POPULATED 0` — honest, not a phantom running job. Measured. |
-| **F5** | Scope teardown **does** kill the nested container (`cgroup.kill` is recursive) — verified: the container's pid was gone after the confine job exited. Podman's own state DB is left stale (`podman ps` reports `Up` for the dead container until podman reconciles). |
-| **F6** | The fallback `--cgroup-parent=aira.slice` works (ticket-verified): container is a **sibling** of confine scopes under the slice, bound only by the 64G aggregate cap, and **survives** the confine job's exit. |
-| **F7** | `--memory=<bare byte count>` is accepted by podman. Units are case-insensitive and binary (`64M` == `64m` == 64 MiB), matching AIRA's own `parseMemorySize`. **`--memory=1048576` (1 MiB) fails** — `container init was OOM-killed (memory limit too low?)`. 4 MiB and 6 MiB succeed. |
-| **F8** | `-m 8g` inside a 2G confine scope is **accepted** and runs; the kernel's ancestor cap still binds. A container limit above the job limit is therefore **not** a contradiction. |
-| **F9** | `--cgroup-manager=cgroupfs --cgroup-parent=<scope path>` **fails** (`OCI runtime error`) from a scope that still holds processes: the no-internal-process rule blocks enabling `memory` in `subtree_control`. It only succeeded in a probe where a prior `--cgroups=split` had *already* drained the scope. So it is **not** an alternative to split, and it mutates the scope's `subtree_control` as a side effect. |
-| **F10** | **Honesty defect, pre-existing, amplified by this change.** `confine_linux.go:993` derives its `oom` flag from the **hierarchical** `memory.events` `oom_kill`, so a *descendant's own-cap* OOM makes confine print `confine: job OOM-killed at its memory cap 2G` — a false claim. Measured: a container OOM-killed at its own 1 MiB `-m` produced exactly that line on a job that exited 0. AIRA already has `cgroupUsage.LocalOOM()`, which distinguishes these correctly. |
+| **F1** | `podman run --cgroups=split` places the container at `<confine-scope>/[runtime/]*libpod-payload-<id>` — a genuine cgroup **descendant of THIS confine job's own scope**, charged to that job's `memory.max`. **Per-job nesting works.** |
+| **F2** | Split relocates the job's **own** processes into `<cur>/runtime`, one level deeper per `podman run` (measured `/runtime`, `/runtime/runtime`, `/runtime/runtime/runtime` after 3 runs). Confine then reports `scope-integrity=migrated`. |
+| **F3** | `--cgroups=split` is **mutually exclusive** with `--cgroup-parent` (`cannot specify --cgroup-mode=split with a cgroup-parent`). |
+| **F4** | Split leaves a `runtime` child cgroup; `Scope.Remove()`'s `os.Remove` then fails `ENOTEMPTY`, so the scope dir lingers until AIRA-36's recursive reaper sweeps it (supervisor-dead + grace + no lease). Measured. |
+| **F5** | Scope teardown **does** kill the nested container (`cgroup.kill` is recursive) — the container pid was gone after exit. Podman's state DB is left stale (`podman ps` shows `Up` for the dead container). |
+| **F6** | The fallback `--cgroup-parent=aira.slice` works but the container is a **sibling** under the slice, bound only by the 64G aggregate cap, and **survives** the job's exit. |
+| **F7** | `--memory=<bare bytes>` accepted; units case-insensitive and binary. `--memory=1048576` (1 MiB) **fails** (`container init was OOM-killed`). 4 MiB and 6 MiB succeed. Measured **without** `--cgroups=split`; the real-podman test must re-assert it **with** split (Fable 10). |
+| **F8** | `-m 8g` inside a 2G confine scope is **accepted** and runs; the kernel ancestor cap binds. A container limit above the job limit is **not** a contradiction. |
+| **F9** | `--cgroup-manager=cgroupfs --cgroup-parent=<scope path>` **fails** (OCI runtime error) from a scope still holding processes (no-internal-process rule blocks enabling `memory` in `subtree_control`). Not an alternative to split; also mutates `subtree_control` as a side effect. |
+| **F10** | Pre-existing honesty defect: `confine_linux.go:993` derives `oom` from the **hierarchical** `memory.events` `oom_kill`, so a descendant's own-cap OOM prints `confine: job OOM-killed at its memory cap 2G` on a job that exited 0. Measured. |
+| **F11** | (Fable 4, code-grounded) After split every process lives in `<scope>/runtime` or the payload, so `confine --list`'s leaf `cgroup.procs` count (`confine_manage_linux.go:107-110`) reads **`POPULATED 0` for a RUNNING job**, and the daemon's post-restart reserve reconstruction (`admit.go:975-983`, explicitly a "v2 item") **skips leaf-empty scopes** — reopening AIRA-74's over-admission window for the job's lifetime. `--kill` is safe (`:432-448` is subtree-aware); the reaper is safe (supervisor alive). |
 
-**F1 answers the ticket's open question: per-job cgroup-parent nesting IS achievable**, via `--cgroups=split` rather than `--cgroup-parent`. F9 closes the only alternative. So Part 1 delivers real per-job nesting, not the bare-slice fallback.
+**F1 answers the ticket's open question: per-job nesting IS achievable**, via `--cgroups=split` rather than `--cgroup-parent`; F9 closes the only alternative.
 
 ---
 
@@ -41,168 +41,226 @@ All probes ran under real `aira confine` against the real `aira.slice`; podman h
 
 ### 3.1 Detection — deliberately narrow (portable, pure)
 
-New portable file `internal/runner/container.go`. Detection fires **only** when:
+New portable file `internal/runner/container.go`. Detection fires **only** when `base(argv[0])` is **exactly** `docker` or `podman` **and** `argv[1]` is exactly `run`.
 
-- `base(argv[0])` (text after the last `/`) is **exactly** `docker` or `podman`, **and**
-- `argv[1]` is exactly `run`.
+**Explicitly undetected, and therefore un-warned** (stated in code doc, SKILL text and docs — never assumed wider): `compose`/`podman-compose`/`docker compose`, `exec`, `play`, `pod`, `build`; `docker container run` / `podman container run`; **any global-flag form** (`docker --context X run`, `podman --remote run`, `podman --cgroup-manager=cgroupfs run`) — these get no injection **and no docker warning**; `podman-remote`; `sudo podman run`; and **any** shell-wrapped invocation (`sh -c "docker run …"`). Recorded as **L5**. A `podman-docker` shim installed as `/usr/bin/docker` is classified as **docker** — conservative (we never claim containment), and worth one sentence.
 
-Everything else is out of scope and stays out: `compose` / `podman-compose` / `docker compose`, `exec`, `play`, `pod`, `podman-remote` (base name differs), `sudo podman run` (argv[0] is `sudo`), and **any** invocation where the runtime is inside an opaque shell string (`sh -c "docker run ..."`). This is stated in the code doc, the SKILL text, and the trailer docs — never left to be assumed wider.
+### 3.2 Memory-flag scan — conservative, boundary-proved, ambiguity-honest
 
-### 3.2 Memory-flag scan — conservative, ambiguity-honest (portable, pure)
+One left-to-right pass over `argv[2:]`, answering **two** questions at different strictness.
 
-One left-to-right pass over `argv[2:]`. It answers **two separate questions**, deliberately with different strictness:
+**`Present`** (over-inclusive, safe direction) — is any memory-limit-shaped token anywhere after `run`? Set by `--memory`, `--memory=…`, `-m`, `-m<x>`, or an ambiguous single-dash cluster (below). `--memory-swap`, `--memory-reservation`, `--memory-swappiness` are **excluded** (both forms). Over-detection only ever makes AIRA **decline to inject**.
 
-- **`Present`** (over-inclusive, safe direction) — is any memory-limit-shaped token anywhere after `run`? Set by `--memory`, `--memory=…`, `-m`, `-m<x>`, or a single-dash cluster containing `m`. `--memory-swap`, `--memory-reservation`, `--memory-swappiness` are explicitly **excluded** (both `=` and space forms). Over-detection only ever makes AIRA **decline to inject** and say so — it can never break a command or fabricate a limit.
-- **`Established` + `Bytes`** (strict) — the value is known **only** when there is exactly **one** occurrence, its value parses via the existing shared `parseMemorySize`, and no ambiguity marker was seen. Otherwise `Established=false` with a stated `Reason`, reported as `unevaluated`. **Never guessed.**
+**`Established` + `Bytes`** (strict) — the value is known **only** when *all* hold:
+1. exactly **one** occurrence;
+2. the value parses via the shared `parseMemorySize`;
+3. no ambiguity marker;
+4. the **option-region boundary proof** holds (below);
+5. the value is **> 0** — `-m 0` means *unlimited* to docker and must never become `caller=0`.
 
-Ambiguity markers (each → `Present=true, Established=false`): more than one occurrence; a single-dash cluster containing `m` that does not start `-m` (e.g. `-itm 4g` — the value position is not determinable without a full CLI parser); a `-m`/`--memory` as the last token with no value; a value `parseMemorySize` rejects (e.g. `1p`, which docker's own parser accepts and AIRA's does not — reported unevaluated rather than guessed).
+Otherwise `Established=false` with a stated, **token-naming** reason (`unevaluated:ambiguous-token=-itm`), reported as `unevaluated`. **Never guessed.**
 
-**Stated, accepted limitation:** the scan does not locate the image argument, so a memory-flag-shaped token in the *container's own* command (`podman run alpine prog -m 4`) is counted as `Present`. The consequence is conservative — AIRA declines to inject and reports it — never a wrong limit. Determining the image would require a full docker/podman flag-arity table, which the ticket explicitly rules out.
+**Boundary proof (new in v2 — closes Sol P0-3 / Fable MF1).** Both reviewers produced argv where the v1 rule *acted wrongly* rather than declining: `docker run --rm qemu-image qemu-system-x86_64 -m 4G` (qemu's own RAM flag) and `docker run alpine echo --memory=8g` would `Establish` a limit that does not exist, raise the ledger for a phantom, print `caller=4G` as a fact, and fire §3.6's loud line on a meaningless comparison. So: **stop establishing at the first token that is neither `-`-prefixed nor immediately preceded by a `-`-prefixed token** — the earliest position at which the image can appear. A memory-shaped token at or after that point is `Present` + `unevaluated:after-image-candidate`.
 
-The same pass records whether the caller already set `--cgroups` / `--cgroup-parent` (any form), and the literal value of `--cgroups` when given.
+*Residual, stated (L9):* `docker run --rm alpine -m 4g` still establishes, because `alpine` follows the `-`-prefixed `--rm` and is indistinguishable from that flag's value without a full arity table (explicitly out of scope).
+
+**Short-flag refinement (Fable, v1 review 9).** A single-dash token whose second character is a known **value-taking** short flag (`e v p w u l h a c`) is that flag with an attached value — `-v/home/mark:/x`, `-eTERM=xterm` — **not** a cluster, and sets neither `Present` nor `Established`. Only a cluster of known boolean shorts containing `m` (e.g. `-itm`) is the ambiguous case.
+
+**Cgroup-flag matching is exact-token, never prefix (Fable note 12):** `--cgroups`, `--cgroups=`, `--cgroup-parent`, `--cgroup-parent=` only. A prefix match would also catch `--cgroupns` and podman's `--cgroup-conf` and withhold split for no reason.
+
+The same pass also records `--pod` / `--pod-id-file` (treated **as** a caller cgroup flag — pod cgroup-parent versus split was not measured, so AIRA injects nothing and reports) and `-d` / `--detach` (§3.11).
 
 ### 3.3 Part 1 — podman
 
-At launch construction (immediately before `confineSetupArgv`, after `scopeMemoryMax` is resolved), insert flags **at index 2** (directly after `run`, always a valid flag position for both runtimes):
+At launch construction (immediately before `confineSetupArgv`, after `scopeMemoryMax` resolves — the only point at which the daemon-estimate cap of `:783-784` is known), build a **fresh** argv slice (never `append(argv[:2], …)` onto the caller's backing array) inserting at **index 2** (verified safe for both runtimes: pflag, flag position directly after the subcommand):
 
-- **Placement.** If the caller set neither `--cgroups` nor `--cgroup-parent` → inject **`--cgroups=split`**. Per F1 the container becomes a descendant of this job's own scope and is bound by its `memory.max`. If the caller set either → **inject nothing** (F3: split and `--cgroup-parent` are mutually exclusive, so injecting would break their command) and report their choice rather than claiming containment.
-- **Memory.** If confine has a resolved `scopeMemoryMax > 0`, the scan says `Present=false`, and `scopeMemoryMax >= 6 MiB` (F7's runtime floor, docker's documented minimum) → inject `--memory=<scopeMemoryMax as bare bytes>`. Below the floor, inject nothing and say why.
+- **Placement.** Caller set none of `--cgroups` / `--cgroup-parent` / `--pod` → inject **`--cgroups=split`**. Otherwise inject **nothing** (F3) and report their choice without claiming containment.
+- **Memory.** Confine has resolved `scopeMemoryMax > 0`, scan says `Present=false`, and `scopeMemoryMax >= 6 MiB` (F7 floor) → inject `--memory=<scopeMemoryMax bare bytes>`. Below the floor, inject nothing and say why.
 
-**No `--cgroup-parent=aira.slice` fallback is used**, because the nested form works. The bare-slice form is documented in the ticket as the weaker alternative and is deliberately *not* implemented: it would place the container outside the job's own reservation and let it survive the job (F6).
+The `--cgroup-parent=aira.slice` fallback is deliberately **not** implemented: nesting works and the fallback is strictly weaker (F6).
+
+Under `--delegate-ram`, `scopeMemoryMax` is always resolved (`:792-800`), so the injected `--memory` is the delegate ceiling. Consistent with the ancestor bound.
 
 ### 3.4 Part 2 — docker
 
-Docker gets **no placement flag** — there is nothing to place it into (the original finding stands). It gets:
+No placement flag exists. Docker gets the same memory injection rule, the §3.5 ledger raise, and an **unconditional** warning line before the child starts, for **every** detected `docker run` regardless of what was injected or reserved:
 
-- **Memory injection**, on the same rule as podman: confine has a limit, the caller has none → inject `--memory=<scopeMemoryMax>`. This aligns the container's *own* cap with what the caller asked confine for. It is **not** containment and is never reported as such.
-- **Ledger reservation**, when the caller *does* declare a limit and it is `Established` (§3.5).
-- **An unconditional warning line**, emitted before the child starts, for **every** detected `docker run` regardless of what was injected:
+> `confine: docker run detected — the container runs under the system docker daemon, OUTSIDE aira.slice. AIRA cannot contain it: nothing here bounds it against the slice cap, and this remains true whatever confine injected or reserved. Use 'podman run' for kernel-enforced containment.`
 
-  > `confine: docker run detected — the container runs under the system docker daemon, OUTSIDE aira.slice. AIRA cannot contain it: nothing here bounds it against the slice cap, and this remains true whatever confine injected or reserved. Use `podman run` for kernel-enforced containment.`
+This is the requirement that the shim must not become the trap it counters.
 
-  This is the requirement that the shim must not become the trap it counters.
+### 3.5 Ledger charge — per-runtime rule and the specification table (v2 rewrite)
 
-### 3.5 Ledger reservation from a caller-declared container limit
+**v1's `reserve = max(reserve, containerBytes); pinned = true` was wrong in three ways**, found independently by both lineages against `confine_linux.go:494-503`, `:783-784` and `internal/daemon/admit.go:503`:
+(a) *podman over-book* — `--memory-max 2G` + `podman run -m 8G` charges the shared ledger 8G while the kernel binds the nested container at 2G (F8): 6 GiB of admission charged for memory the job cannot use, the AIRA-62 shape;
+(b) *not a max at all on the unpinned path* — `reserve` at `:494` is the 4G client **hint**, not the daemon's grant; pinning makes the daemon return `pinned:client` **verbatim** (`admit.go:503`), *replacing* a possibly larger history estimate;
+(c) *undisclosed scope-cap leak* — with `declaredReserve=false` and a daemon grant, `:783-784` sets `scopeMemoryMax = admission.reserve`, so the container's number silently becomes the **job's** cap and prints as `scope-memory.max=enforced=X`.
 
-Applies to **both** runtimes. Immediately **after** `reserve, pinned := ResolveConfineReserve(request)` (so the `declaredReserve` / `declaredReserveBytes` provenance captured above it is untouched):
+The rule is now split by runtime:
 
-```
-if plan.Detected && plan.Memory.Established && !request.DelegateRAM && plan.Memory.Bytes > reserve {
-        reserve, pinned = plan.Memory.Bytes, true
-}
-```
+**Podman — never raise the ledger.** The container is a cgroup descendant of the job's own scope (F1), so its memory is **already** inside whatever the job reserved. Any extra charge is double-booking, and a raise above a binding cap charges for memory the kernel forbids the job to use. AIRA reports the caller's limit and acts on it not at all. (Simpler and strictly safer than Fable's suggested "raise only when no cap will bind"; the cost is stated below.)
 
-- **`max`, never replace.** A raise can only ever charge *more*, so a tiny container limit can never shrink the job's reserve and starve the CLI client. This is what makes the rule safe without a magic floor.
-- **`!DelegateRAM` guard** preserves AIRA-62's invariant: a delegate-ram job's pinned reserve is deliberately small framework overhead, and raising it would double-book the per-test reservations. Reported as skipped, with the reason.
-- **No second `confine-reserve` lease.** Folding the charge into the job's own single admission is strictly simpler than acquiring a second daemon lease while holding the first (which would add a new blocking path and a deadlock surface for no accounting benefit). Architectural simplicity: one ledger charge per job stays one ledger charge per job.
-- The trailer states plainly that a docker reservation is **machine-level accounting only** — the container's memory is not inside the slice it was charged against.
+> *Stated consequence:* on an unpinned, uncapped podman job the daemon's history estimate becomes the scope cap (`:783-784`), and pre-feature history for that signature recorded **CLI-only** peaks — so the first nested run can be OOM-killed at that cap. It self-heals (the `oom` flag bumps `EstimateMemoryReserve`, `resource_estimate.go:56`, to headroom), and §3.10's corrected advisory now names the cause and recommends `--memory-max`. Documented, not silent.
+
+**Docker — raise only when the request is not already pinned.** If the caller declared confine limits, their number is authoritative and AIRA reports the disagreement (§3.6) rather than overriding it. If unpinned and the container limit is `Established`, set `reserve = max(hint, containerBytes)` and pin.
+
+> *Stated consequences:* pinning **replaces** the daemon's history estimate for this job (basis `pinned:client`) — acceptable here because a `docker run` signature's history is CLI-only (tiny), so the raise essentially always exceeds it. The pinned value also becomes the **docker CLI's** scope `memory.max` via `:783-784`, printing `scope-memory.max=enforced=<container bytes>` for a client that will never use it — harmless, but stated because it reads as though confine capped something meaningful. And the charge reserves slice budget for memory that lives **outside** the slice: the deliberate trade the ticket asked for (machine-level headroom over slice utilisation), named as such.
+
+**`!DelegateRAM` guard** on the docker raise preserves AIRA-62.
+
+**No second daemon lease.** Folding into the job's own single admission avoids a second blocking path and deadlock surface.
+
+**Resulting (ledger charge, scope cap) — this table is the specification:**
+
+| runtime | caller-declared confine limit? | admission path | ledger charge | scope `memory.max` |
+|---|---|---|---|---|
+| podman | yes (`--memory-max`/`--memory-reserve`) | any | declared (unchanged) | declared (unchanged) |
+| podman | no | daemon grant | daemon estimate (unchanged) | daemon estimate (unchanged) |
+| podman | no | fallback / timeout / unevaluated | client hint (unchanged) | uncapped (unchanged) |
+| docker | yes | any | declared (unchanged) | declared (unchanged) |
+| docker | no, container limit `Established` | daemon grant | `max(hint, containerBytes)`, pinned | same value (via `:783-784`) |
+| docker | no, container limit `Established` | fallback / timeout / unevaluated | requested, **not granted** | uncapped |
+| either | container limit not `Established` | any | unchanged | unchanged |
+
+**Facet honesty:** the job still launches on `admission.state` `timeout`/`unevaluated` and on the flock fallback (`:619-626`). The trailer therefore says `:reserve-requested` for the request and `:reserved` **only** when admission actually granted it. A charge that never happened is never claimed.
 
 ### 3.6 Disagreement policy — the owner's explicit open question
 
-**Decision: never refuse the launch. Report both numbers, and warn loudly in the one case that implies a false belief.** Reasoning, weighed against this project's fail-closed discipline:
+**Decision: never refuse the launch. Report both numbers, and warn loudly in *both* false-belief directions.** Fable reviewed this directly and found it sound and not a rationalisation, *conditional* on the reported numbers being true (§3.2, §3.5) and on symmetry of loudness.
 
-1. **Fail-closed governs *claims*, not the user's command.** AIRA's rule is that a check which cannot establish its result reports `unevaluated` rather than a fake pass. A disagreement is not an unestablished check: both numbers are known exactly and can be printed exactly. The honesty obligation is discharged by stating them, not by refusing.
-2. **For podman the two limits are not in conflict at all.** With split-nesting the job cap is a kernel-enforced *ancestor* bound and the container limit is a nested sub-limit; whichever is smaller binds, automatically and correctly. F8 measured `-m 8g` inside a 2G scope running fine and still bounded. Refusing a "disagreement" would refuse a correct, kernel-enforced composition.
-3. **For docker they are not two answers to one question.** Confine's cap governs the CLI client's cgroup in `aira.slice`; docker's `-m` governs a container cgroup in the system tree. Refusing would assert a relationship — and an authority over the container — that AIRA demonstrably does not have.
-4. **Refusal has a real cost and zero safety benefit.** The container escapes `aira.slice` whether or not the command runs. Blocking it contains nothing; it only breaks a workflow and pushes callers off the shim that exists to inform them.
-5. **Existing precedent in this very code path.** `ResolveConfineReserve` already *resolves* a reserve-versus-cap mismatch ("a declared reserve LARGER than the cap is lowered to the cap — still exact, never under-booked") rather than refusing. Confine refuses only when a value is **unusable** (sub-minimum declared reserve) or when containment would be **silently** lost. Neither applies: the value is usable and nothing here is silent.
+1. **Fail-closed governs *claims*, not the user's command.** The rule is that a check which cannot establish its result reports `unevaluated` rather than a fake pass. A disagreement is not an unestablished check: both numbers are exact and printable.
+2. **For podman the two limits are not in conflict.** The job cap is a kernel-enforced *ancestor* bound and the container limit a nested sub-limit; the smaller binds automatically (F8, measured). Refusing would refuse a correct configuration.
+3. **For docker they are not two answers to one question.** Confine's cap governs the CLI client's cgroup in `aira.slice`; docker's `-m` governs a container cgroup in the system tree.
+4. **Precedent in this code path.** `ResolveConfineReserve` already *resolves* a reserve-versus-cap mismatch (`confine.go:91-94`) rather than refusing. Confine refuses only when a value is **unusable** or containment would be **silently** lost — neither applies, and nothing here is silent.
+5. **Consistency.** The plan launches when only one side specifies a limit; the both-sides case is strictly *more* informed, so refusing only there would be arbitrary.
 
-**The one loud case.** When docker's declared limit **exceeds** confine's own limit, a caller most plausibly believes the smaller confine cap binds the container. It does not. An extra line names it explicitly:
+**Sol's dissent, and why it is not adopted.** Sol argued (P0) that for docker, when the container's limit *exceeds* confine's, refusing prevents the escaped container from existing, so v1's "zero safety benefit" claim is false. That is a fair hit, and v1's fourth bullet is **deleted** accordingly. Refusal is still not adopted: confine's own limit is usually **not caller-declared** — it is an AIRA-resolved p90 estimate or the 4 GiB no-history default. Refusing an explicit `docker run -m 8g` because an *estimate* came out at 1.4G would refuse on a number the caller never chose, and would fire constantly. The genuine "caller declared two conflicting numbers" case is narrow; there AIRA reports both loudly and lets the caller decide. Adopting the rule would also make AIRA assert authority over a container it has just finished stating it cannot contain.
 
-> `confine: docker --memory=<X> exceeds this job's own limit <Y>; the container is NOT bound by <Y>, nor by aira.slice.`
+**Both loud lines** (v1 had only the first):
+- docker, container limit > confine's: `confine: docker --memory=<X> exceeds this job's own limit <Y>; the container is NOT bound by <Y>, nor by aira.slice.`
+- podman, container limit > the job cap: `confine: container --memory=<X> exceeds this job's cap <Y>; the kernel binds the container at <Y>.`
 
-AIRA **never rewrites a caller's explicit `--memory`** in any case.
+**AIRA never rewrites a caller's explicit `--memory`.**
 
-### 3.7 Trailer facets — visible, never silent (the `terminated-by=` precedent)
+### 3.7 Trailer facets — visible, never silent
 
-Two new `ConfineStatus` fields, with json tags so AIRA-22's durable detached record keeps them, rendered by `FormatConfineStatus` **only when a runtime was detected** (so every existing trailer is byte-identical):
+Two new `ConfineStatus` fields (json-tagged, so AIRA-22's durable record keeps them), rendered by `FormatConfineStatus` **only when a runtime was detected**, so every existing trailer stays byte-identical.
 
-`container=<value>`
-- `podman:nested` — `--cgroups=split` injected; the container is a descendant of **this job's** scope, bound by its `memory.max`. **Real containment.**
-- `podman:nested:caller` — the caller themselves passed `--cgroups=split`.
-- `podman:caller-cgroup` — the caller set `--cgroups`/`--cgroup-parent`; AIRA injected no placement flag and does **not** claim containment.
-- `docker:not-contained` — outside `aira.slice` entirely; no containment, whatever else was done.
+`container=`
+- **`podman:split-injected`** — AIRA injected `--cgroups=split`. **v2 rename** (Sol P1 / Fable MF3): `podman:nested` asserted an outcome nothing verifies — an absent or pre-2.0 podman rejects the flag and exits, and the trailer would still have read `nested`. Every other facet names verified evidence (`scope=placed` follows a real `Members()` check; `oom.group=set` follows the write). This one now names the action actually performed; its doc states that when podman honours it, the container is a descendant of this scope bound by its `memory.max`.
+- `podman:caller-split` — the caller passed `--cgroups=split` themselves.
+- `podman:caller-cgroup` — caller set `--cgroups`/`--cgroup-parent`/`--pod`; AIRA injected nothing and claims nothing.
+- `docker:not-contained` — outside `aira.slice` entirely, whatever else was done.
 
-`container-memory=<value>`
-- `injected=<bytes>` — AIRA supplied the container's own cap from confine's limit.
-- `caller=<bytes>` — the caller's own limit, parsed exactly.
-- `caller=unevaluated:<reason>` — a memory flag is present; AIRA declined to guess its value.
-- `caller=<bytes>:reserved` — the caller's limit raised this job's ledger reserve.
-- `caller=<bytes>:reserve-skipped:delegate-ram` — raise withheld per §3.5.
-- `not-injected:below-runtime-minimum` — confine's limit is under the 6 MiB runtime floor (F7).
-- `none` — neither side specified a limit.
+`container-memory=`
+- `injected=<bytes>` | `caller=<bytes>` | `caller=unevaluated:<reason-with-token>` | `caller=<bytes>:reserve-requested` | `caller=<bytes>:reserved` | `caller=<bytes>:reserve-skipped:<declared|delegate-ram|podman-nested>` | `not-injected:below-runtime-minimum` | `none`
 
-A caller can therefore tell from the trailer alone whether **real containment** happened (`podman:nested`), **best-effort accounting** happened (`docker:not-contained` + `caller=…:reserved`), or **nothing could be established** (`caller=unevaluated:…`).
+A caller can tell from the trailer alone whether AIRA **requested real containment** (`podman:split-injected`), did **best-effort accounting** (`docker:not-contained` + `:reserved`), or **could establish nothing** (`caller=unevaluated:…`).
 
 ### 3.8 Signature stability
 
-`request.ResourceSignature` is computed from the **original** argv at line 497, before any injection. Injection happens at the launch site only. Peak-RSS history keys are therefore unchanged by this feature — a job's history does not fork the day AIRA starts injecting a flag.
+Verified by both reviewers against `confine_linux.go:497/501` and `resource_estimate.go:18-27`: the signature is computed from the **original** argv before any injection, and only a launch-local copy is mutated. History **keys** are unchanged. The **value** distribution does fork, and §3.5 states it rather than presenting stability as a pure win.
 
 ### 3.9 Podman absence
 
-Nothing probes for podman. If podman is not installed the wrapped command fails on its own, exactly as it does today; AIRA claims nothing. Injection adds a flag to a command that was going to fail anyway. **No new failure mode is introduced for a machine without podman.**
+Nothing probes for podman. If it is absent the wrapped command fails on its own exactly as today; AIRA claims nothing and adds no failure mode.
 
-### 3.10 F10 — the false "job OOM-killed" claim
+### 3.10 F10 — OOM attribution (v2: no false claim **and** no silence)
 
-**In scope, minimal fix.** `confine_linux.go:993` becomes `oom` from `usage.LocalOOM()` for the **operator-facing reserve advisory only**, so a descendant's own-cap OOM no longer produces the false `confine: job OOM-killed at its memory cap <job cap>` line. The machinery already exists and is already documented for exactly this distinction.
+v1 proposed swapping the hierarchical counter for `LocalOOM()`. Both reviewers found that insufficient: `LocalOOM()` is also true when an **ancestor** slice limit fired (`usage_linux.go:93-96`), so "at its memory cap" would still misattribute an AIRA-27 slice-collateral kill; and suppressing the line alone leaves a container OOM producing **exit 137 and nothing** (podman's own clean exit gives `terminated-by=normal`, and `formatConfineTerminationAdvisory:1689` only fires on the unattributed-SIGKILL verdict).
 
-`deps.reportPeak(..., oom)` keeps the **hierarchical** counter unchanged — that is an estimate-quality signal, not an operator claim, and re-deciding peak-RSS history semantics is out of scope with a live accounting worktree in flight. Recorded as a deferral, not silently.
+So, three mutually exclusive operator lines, each stating exactly what its evidence establishes:
+- **own limit fired** (`LocalOOM()` **and** the local `oom` max-breach declaration) → the existing `confine: job OOM-killed at its memory cap <cap>` line, unchanged.
+- **hierarchical `oom_kill > 0`, local evaluated-false** → new: `confine: memory.events records N OOM kill(s) beneath this scope (a descendant's own limit, e.g. a container's --memory); this scope's own limit did not fire.`
+- **hierarchical `> 0`, local unreadable** → `confine: an OOM kill occurred under this scope; whose limit could not be established.` Never silence, never a fabricated attribution.
 
-Justification for including it: this change makes a nested descendant cap **routine** inside a confine job, turning a rare pre-existing false claim into a common one. Shipping the feature that causes it while leaving the false claim in place would be the exact failure this project's review policy exists to prevent.
+`deps.reportPeak(..., oom)` keeps the **hierarchical** counter — an estimate-quality signal, not an operator claim. **Stated consequence:** a container OOM at a caller's small `-m` marks the signature's history `oom`, and `EstimateMemoryReserve` (`resource_estimate.go:56`) bumps future estimates to headroom. Deferred deliberately (L6): re-deciding peak-RSS history semantics is out of scope with an accounting worktree in flight.
+
+Both reviewers agree including F10 is **not** scope creep: this feature turns a rare false claim into a routine one.
+
+### 3.11 Detached containers (`-d` / `--detach`) — Sol P0-4 / Fable 6
+
+Two problems, one cheap answer. (a) Under split the container is **killed** when the job exits (F5) — a behaviour change — and `attestScopeTeardown`'s identity snapshot is leaf-only, so `DescendantKilled` never fires and the kill leaves **no trace** on the trailer. (b) For docker, the §3.5 reservation is released when the CLI exits while the daemon-owned container keeps running.
+
+Detect `-d`/`--detach` with the over-inclusive `Present`-style scan and print, before launch:
+- podman: `confine: this container will be killed when the confine job exits.`
+- docker: `confine: this container outlives the confine job; any reservation made here is released when the job exits and does not cover the container's lifetime.`
+
+Recorded as **L7**.
+
+### 3.12 `confine --list` populated count — F11 / Fable MF4
+
+`confine --list` counts **leaf** `cgroup.procs` (`confine_manage_linux.go:107-110`), so a **running** split job reads `POPULATED 0` — a direct honesty defect this feature would make routine. Fixed here by making that count **subtree-aware** via the same `cgroup.events populated` read the kill path already uses (`:432-448`). Small, runner-side, precedent in the same file.
+
+The daemon-side half — `admit.go:975-983` skipping leaf-empty scopes in AIRA-74's post-restart reserve reconstruction, reopening the over-admission window for a live podman job — is **deliberately not touched**: it is daemon admission surface with AIRA-101 and the dynamic-ceiling ticket in flight. Recorded as **L8** with its consequence named, and filed as a follow-up ticket rather than left implicit.
 
 ---
 
 ## 4. Safety and invariants
 
-- **Nothing is injected into an argv that AIRA did not detect** under §3.1's two-token rule.
-- **A caller's explicit flag is never overridden or rewritten** — not `--memory`, not `--cgroups`, not `--cgroup-parent`.
-- **Over-detection is the only permitted error direction** for the `Present` scan: it can make AIRA decline to act, never act wrongly.
-- **No value is ever guessed.** Ambiguity → `unevaluated` with a stated reason.
-- **A ledger raise can only increase the charge** (`max`), so it can never under-book, and can never shrink a job's own cap.
-- **No new blocking path**: no second daemon lease, no capability probe, no extra `exec`.
-- **Existing trailers are unchanged** when no runtime is detected — the two facets render only on detection.
-- **Docker is never reported as contained**, in any code path, whatever was injected or reserved.
+- Nothing is injected into an argv AIRA did not detect under §3.1's two-token rule.
+- A caller's explicit flag is **never** overridden or rewritten.
+- The `Present` scan may only ever cause AIRA to **decline**; the §3.2 boundary proof is what makes that true for `Established` too.
+- No value is guessed; ambiguity → `unevaluated` with a token-naming reason.
+- The ledger is **never** charged for podman, and never raised over a caller-declared confine limit.
+- A charge is reported as `:reserved` only when admission granted it.
+- No new blocking path: no second lease, no capability probe, no extra `exec`.
+- Existing trailers unchanged when no runtime is detected.
+- **Docker is never reported as contained, in any code path.**
+- The injected argv is a fresh slice; the durable record keeps the caller's original argv.
 
 ---
 
 ## 5. Known limitations, written down and accepted
 
-- **L1 (F2):** each `podman run --cgroups=split` in one confine job nests the job's own processes one cgroup level deeper. Bounded by path length, not policy. A job running very many containers *sequentially* nests deeply. Podman's own behaviour; not correctable from AIRA without reimplementing split.
-- **L2 (F2):** such a job reads `scope-integrity=migrated` rather than `contained`, because the leader is no longer a *direct* member of the scope. Containment is preserved and the escape detector is correct (`witnessedEscape` uses `pathEqualOrUnder`, so a move into a descendant is not an escape). Precedent: aitest's `.aira-supervisor` relocation already produces this reading.
-- **L3 (F5):** podman's state DB can show a scope-killed container as `Up` until podman reconciles. Outside AIRA's control.
-- **L4 (F4):** the leftover `runtime` cgroup blocks confine's in-process rmdir; AIRA-36's recursive reaper (already on master) removes the subtree on its sweep, and `confine --list` shows `POPULATED 0` meanwhile. **Deliberately not duplicated in-process** — architectural simplicity; the reaper is the designed backstop for nested scopes.
-- **L5:** rootful `sudo podman run` is not detected (argv[0] is `sudo`) and would resolve against the system manager anyway.
-- **L6:** `reportPeak`'s hierarchical OOM flag is unchanged (§3.10) — deferred, not silent.
+- **L1 (F2):** each split run nests the job's own processes one level deeper. Bounded by path length, not policy. Podman's behaviour.
+- **L2 (F2):** such a job reads `scope-integrity=migrated`, not `contained` — the leader is no longer a *direct* member. Containment is preserved (`witnessedEscape:1430-1438` → `pathEqualOrUnder`, so `<scope>/runtime` is not an escape). Precedent: aitest's `.aira-supervisor`. Cost: the facet is diluted for every podman job.
+- **L3 (F5):** podman's state DB can show a scope-killed container as `Up` until it reconciles.
+- **L4 (F4):** the leftover `runtime` cgroup blocks in-process rmdir; AIRA-36's reaper removes the subtree (up to ~7 min later). Deliberately not duplicated in-process.
+- **L5 (§3.1):** rootful `sudo podman run`, `docker container run`, and all global-flag forms are undetected — no injection **and no warning**.
+- **L6 (§3.10):** `reportPeak`'s hierarchical OOM flag unchanged, with its estimate-inflation consequence named.
+- **L7 (§3.11):** detached-container lifetime versus job lifetime; warned, not fixed.
+- **L8 (§3.12):** the daemon's post-restart reserve reconstruction skips a running split job, reopening AIRA-74's over-admission window for that job's lifetime. Follow-up ticket.
+- **L9 (§3.2):** `docker run --rm alpine -m 4g` still establishes a phantom limit; distinguishing it needs a full flag-arity table, out of scope.
 
 ---
 
-## 6. Tests (TDD)
+## 6. Tests (TDD) — anti-porous by construction
 
-**Portable unit tests** (`container_test.go`, run everywhere):
-- Detection: `podman run` / `docker run` / `/usr/bin/podman run` fire; `podman-remote run`, `docker compose`, `podman pod`, `sudo podman run`, `sh -c "docker run …"`, `podman build`, bare `podman` all do **not**.
-- Memory scan, value established: `--memory=4g`, `--memory 4g`, `-m4g`, `-m 4g`, `--memory=4294967296`, `--memory=64M`, mixed case.
-- Memory scan, `Present` but **unevaluated**: `-itm 4g` (cluster), two occurrences, trailing `-m` with no value, `--memory=1p`, `--memory=garbage`.
-- Memory scan **not** tripped by `--memory-swap=2g`, `--memory-reservation=1g`, `--memory-swappiness=0` (both forms).
-- Caller cgroup flags detected in all four forms; `--cgroups=split` distinguished from other values.
-- Injection construction: index-2 placement; nothing injected when the caller has a cgroup flag; nothing injected below the 6 MiB floor; docker never receives a placement flag.
-- **Anti-porous:** each injection test asserts the **exact full argv** produced, so a test cannot pass against an implementation that injects the wrong flag, the wrong value, or at the wrong position. Each "not injected" test asserts argv is **byte-identical** to the input.
-- Reserve raise: raises on `>`, does not lower on `<`, skipped under `DelegateRAM`, skipped when `Established=false`.
-- `FormatConfineStatus`: every facet value renders; **a status with no detected runtime renders byte-identically to today** (regression guard against trailer drift).
+**Portable pure-function tests** (`container_test.go`):
+- Detection positive/negative incl. every §3.1 undetected form.
+- Scan established: `--memory=4g`, `--memory 4g`, `-m4g`, `-m 4g`, `--memory=4294967296`, `--memory=64M`, mixed case.
+- Scan **unevaluated**: `-itm 4g`, two occurrences, trailing `-m`, `--memory=1p`, `--memory=garbage`, **`-m 0`**.
+- **Boundary-proof negatives (the reviewers' counterexamples, load-bearing):** `docker run --rm qemu-image qemu-system-x86_64 -m 4G`, `docker run alpine echo --memory=8g`, `python -m http.server` — each must be `Present=true, Established=false`, producing **no** ledger raise and **no** `caller=<bytes>` facet.
+- Short-flag refinement: `-v/home/mark:/x`, `-eTERM=xterm` set **neither** flag.
+- Exclusions: `--memory-swap=2g`, `--memory-reservation=1g`, `--memory-swappiness=0`, both forms. Cgroup-flag matching does **not** fire on `--cgroupns`/`--cgroup-conf`.
+- Injection asserts the **exact full argv**; every "not injected" case asserts argv **byte-identical** to input; an **aliasing test** asserts the caller's `request.Argv` backing array is untouched.
 
-**Real-cgroup / real-podman tests** (build-tagged like the existing real-cgroup suite, skipped when podman or a usable slice is absent — never a fabricated pass):
-- A `podman run --cgroups=split` job's container cgroup path is a **descendant of that job's own scope** (the F1 claim, asserted rather than assumed).
-- Confine's own resolved `scopeMemoryMax` is injected as `--memory` when the caller gave none.
-- Scope teardown leaves no live container process (F5).
-- **Isolation:** unique `--name` per test, `--rm`, tiny `alpine`, short-lived; podman only, never docker; nothing enumerates or touches containers the test did not create.
+**`confineWithDeps`-level composition tests** with the existing fake admit/scope deps — these are what can catch the §3.5 defects; pure-helper tests cannot see the `:783-784` leak. Each asserts the `(Status.ReserveBytes, Status.ScopeMemoryMax)` pair for a table row:
+- podman + `--memory-max 2G` + `-m 8g` → **must not** charge 8G.
+- podman unpinned + `-m 8g` → charge unchanged from the no-container baseline.
+- docker + `--memory-max 2G` + `-m 8g` → charge 2G, scope 2G, disagreement line emitted.
+- docker unpinned + `-m 8g`, daemon path → charge 8G, scope 8G.
+- docker unpinned + `-m 8g`, timeout/fallback path → facet `:reserve-requested`, **not** `:reserved`.
+- delegate-ram + docker `-m 8g` → charge unchanged.
 
-**Full suite:** `aira confine -- go test ./...` plus `go vet ./...`, exit codes recorded exactly, serialised (never concurrent with another heavy job).
+**§3.10 in both directions:** `{OOMKill:1, OOMKillLocal:0, OOMGroupKillLocal:0}` must **not** produce the own-cap line and **must** produce the descendant line; `{OOMKillLocal:1, local oom>0}` must produce the own-cap line; `{OOMKill:1, locals nil}` must produce the unevaluated line.
+
+**Trailer:** every facet value renders; a status with **no** detected runtime renders byte-identically to a **literal expected string**, not the function's own prior output.
+
+**Unconditional docker warning** asserted on the neither-side-specifies case (the ticket's own bullet 4).
+
+**Real-podman / real-cgroup tests** (build-tagged, skipped when podman or a usable slice is absent — never a fabricated pass):
+- The container's cgroup path is a **descendant of that job's own scope**, and the test **must fail if AIRA injected nothing** (assert the produced argv *and* the observed nesting — the v1 test could have passed with the test itself supplying the flag).
+- The payload cgroup's `memory.max` **equals the injected bytes** (F7 was measured without split; this is the assumption the whole podman memory story rests on).
+- A container is asserted **live** before teardown, then absent after.
+- `confine --list` reports a **non-zero** populated count for a running split job (§3.12).
+- Isolation: unique `--name`, `--rm`, tiny `alpine`, **podman only, never docker**, nothing enumerates or touches containers the test did not create.
+
+**Full suite:** `aira confine -- go test ./...` and `go vet ./...`, exit codes recorded exactly, serialised.
 
 ---
 
-## 7. Deferrals (explicit, not silent)
+## 7. Deferrals (explicit)
 
-- The bare-slice `--cgroup-parent=aira.slice` fallback is **not** implemented (§3.3) — nesting works, and the fallback is strictly weaker.
-- `compose` / `podman-compose` / shell-wrapped invocations: out of scope by ticket direction.
-- `reportPeak`'s hierarchical OOM flag (§3.10 / L6).
-- Depth growth under repeated split runs (L1): not mitigated.
-- No podman capability probe (§3.9): a podman too old for `--cgroups=split` (pre-2.0, 2020) fails loudly with an unrecognised-flag error, and the trailer names the injected flag. Chosen over an extra `exec` on every launch.
+Bare-slice fallback not implemented (§3.3); compose/shell-wrapped/global-flag forms out of scope (§3.1, L5); `reportPeak`'s hierarchical OOM flag (L6); split depth growth (L1); detached-container lifetime (L7); daemon-side reserve reconstruction (L8, follow-up ticket); §3.2's residual phantom (L9); no podman capability probe — a pre-2.0 podman fails loudly with an unrecognised-flag error and the trailer names the injected flag.
