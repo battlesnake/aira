@@ -23,6 +23,64 @@ Consequence, confirmed by direct test:
 2. **Detect-and-warn.** `aira confine` sniffs its own argv for `docker run`/`docker compose` (and maybe `docker exec`) and prints an honest warning that confinement will not reach the container. Cheap, does not fix the exposure, but stops it from being silently assumed covered — the same "must-know, fail-visible rather than silently degrade" principle `field` argued for on AIRA-101.
 3. **A real companion mechanism.** The only way to get an actual kernel-enforced cap on dockerised work requires either (a) switching Docker's cgroup driver machine-wide to `cgroupfs` so `--cgroup-parent` can take a raw path AIRA creates and manages directly under its own tree — a disruptive, machine-wide `dockerd` reconfiguration that would restart every container on the box (the 34 running now, several apparently standing dev infrastructure) — not something to do casually on a shared machine; or (b) AIRA creates and owns its own **system-level** companion slice (a genuinely new unit, distinct name to avoid the exact collision this test just caused) that `docker run --cgroup-parent=<that-name>` can legitimately target, with `aira install` doing the (already-privileged) systemd unit installation and AIRA's admission ledger extended to also scan and charge against that second slice. Real, buildable, but a second cap domain to design and reconcile with the existing one, not a small change.
 
+## A working alternative found and verified: rootless Podman (2026-09-05)
+
+Owner asked whether a different runtime could be used to RUN containers
+(keeping `docker build` for prod parity) specifically so confinement works.
+Installed `podman` (4.9.3, Ubuntu universe) and tested empirically —
+**it works, for the structural reason Docker cannot**: Podman has no
+persistent root daemon; `podman run` (rootless, as the invoking UID) forks
+the container process directly and, even with the same `systemd` cgroup
+manager Docker uses, resolves `--cgroup-parent` against the **user**
+systemd manager (`user@1000.service`) because Podman itself runs
+unprivileged in that session — the same manager that already owns the real
+`aira.slice`. No cross-authority-domain mismatch, therefore no decoy.
+
+Verified directly:
+- `podman run -d --cgroup-parent=aira.slice --memory=64m alpine sleep 30` landed at
+  `/user.slice/user-1000.slice/user@1000.service/aira.slice/libpod-<id>.scope`
+  — a REAL child of the real slice, `memory.max=67108864` matching the flag exactly.
+- The "build with docker, run with podman" workflow works: `docker save
+  <image> | podman load` transfers a docker-built image into podman's
+  separate image store (podman's own `docker-daemon:` transport hit an
+  unrelated API-version mismatch between this podman/docker pair — 1.41 vs
+  minimum 1.44 — but save/load is the portable, version-independent path
+  and is standard practice anyway). Ran the transferred image's real
+  entrypoint under podman with `--cgroup-parent=aira.slice`; it executed
+  the actual application code (hit an unrelated missing-input error,
+  confirming the code ran, not a compatibility failure).
+
+**What this gets for free, with zero AIRA code changes:** kernel-enforced
+CONTAINMENT — a podman container launched this way is a genuine cgroup
+descendant of `aira.slice`, so its memory rolls into the slice's aggregate
+`memory.current` and cannot collectively exceed the slice's `memory.max`/
+`memory.high`, enforced by the kernel regardless of any userspace code.
+
+**What still needs AIRA-side work, not built here:**
+1. AIRA's admission scanning (the code that decides whether to admit a NEW
+   job) does not yet recognize `libpod-*.scope`/`libpod-conmon-*.scope`
+   children the way it recognizes `.aira-worker-*`/`.aira-CONFINE-*` —
+   whether the EXISTING raw-`memory.current` safety checks already catch
+   this incidentally (AIRA-29 notes some admission paths already charge
+   `max(effectiveCurrent, ...)` against real slice usage) needs verifying
+   against current source before claiming coverage either way.
+2. `--cgroup-parent=aira.slice` places a container as a SIBLING of any
+   `aira confine` job's own scope, capped only by the slice's full 64G
+   ceiling — not nested inside one specific job's own `--memory-max`
+   reservation. Whether `--cgroup-parent` can target a job's own confine
+   scope directly (so a container counts against THAT job's admitted
+   grant specifically, not just the slice at large) was not tested here.
+3. No CLI/wrapper convenience exists yet (e.g. `aira confine` deriving and
+   exporting the right `--cgroup-parent` value for a job automatically,
+   or a documented recipe) — right now this requires a caller to know the
+   bare slice name and construct the invocation by hand.
+
+This changes the option menu above: a fourth, much less disruptive
+direction now exists — recommend/wire Podman as the supported runtime for
+anything that needs AIRA's containment, leaving Docker (and its 34
+currently-running containers) completely undisturbed, rather than either
+touching Docker's global cgroup driver or standing up a second slice.
+
 ## Relation to AIRA-101 and AIRA-100
 
 Distinct from **AIRA-100** (build subprocesses spawned transiently *inside* a test body, invisible to aitest's worker-pool governance) — this is about **standalone, often long-lived** containers with no governing job at all, and the exposure is unbounded aggregate rather than one over-permissive worker. Also relevant to **AIRA-101** (exclusive slice access for benchmarking): even a working exclusive-slice mechanism cannot and will not exclude a running container, since containers are structurally outside `aira.slice` regardless — AIRA-101's own design should say this plainly rather than let a user assume exclusivity covers containers too.
