@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-20","project":"aira","title":"Harden wall-clock-tight tests to re-enable a -race CI job","status":"planned","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["ci","flaky","testing"],"hold":false,"relations":[{"kind":"blocks","from":"AIRA-33","to":"AIRA-20"}]}
+{"schema":1,"id":"AIRA-20","project":"aira","title":"Harden wall-clock-tight tests to re-enable a -race CI job","status":"in-review","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["ci","flaky","testing"],"hold":false,"relations":[{"kind":"blocks","from":"AIRA-33","to":"AIRA-20"}]}
 ---
 The first GitHub Actions CI run (2026-08-30) showed build+test green but the `-race` job failed — NOT on any data race (0 `WARNING: DATA RACE`), but on wall-clock latency assertions that don't survive -race's slowdown on a shared CI runner:
 - internal/daemon/watch_test.go:105 TestWatchReturnsConcurrentEventWithinPollInterval — `event latency=124ms poll=30ms` (asserts an event arrives within the 30ms poll interval; under -race it took 124ms).
@@ -121,3 +121,107 @@ the `len(os.ReadDir("/proc/self/fd"))` process-global measurement this pass repl
 `internal/runner`. It is far more robust as written (a directional `growth > 5` against
 a +30 defect signal, with GC disabled), so it was left alone — listed here so the class
 has both of its known instances written down.
+
+## Resolution (2026-09-06) — DONE, merged
+
+Re-checked the "Hardening pass landed" precondition against current source before
+building, per the brief's own instruction, rather than trusting it as written:
+
+- `governor_slot_test.go` — **confirmed gone.** AIRA-33 landed (`f1f699a`, and
+  further ticket-only commits since) and deleted the file whole along with
+  `TestRealPytestRAMForkDoesNotPinHelperStdin`, the one test the earlier pass
+  could not honestly harden (its cause was production code — a hardcoded
+  `process.wait(timeout=1.0)` in the xdist governor — inside AIRA-33's own
+  deletion scope). Item 1 of the brief was moot, exactly as its own note
+  anticipated.
+- `internal/daemon/cpuslots_gate_test.go` and `internal/daemon/sliceceiling_test.go`
+  — **confirmed still present, still un-hardened** (`git log` showed neither file
+  touched by AIRA-20's original pass, PR #40). Both survive AIRA-33.
+- Grepped the whole of `internal/runner`, `internal/daemon`, `internal/pylib` for
+  any OTHER `_test.go` file using `time.After` without importing `testdeadline`,
+  in case something landed since the brief was written. Found two:
+  `internal/runner/admission_exclusive_linux_test.go` (a single 1500ms
+  **negative**-wait assertion — correctly left alone) and
+  `internal/daemon/confine_kill_log_test.go` (a 1ms **poll ticker** inside an
+  unbounded loop, not an assertion boundary — nothing to scale). Neither needed
+  a change; no third file was missed.
+
+### What was built
+
+- `cpuslots_gate_test.go`: 4 liveness-backstop `time.After(5*time.Second)` sites
+  (`TestCPUGateSpeculativeRequestNeverBlocksOnTheGate`,
+  `TestCPUGateSpeculativeRequestNeverBlocksOnTheOuterScopeLock`,
+  `TestNonSpeculativeRequestStillWaitsForTheOuterScopeLock`,
+  `TestCPUSlotsCachedReadDoesNotBlockBehindAnInProgressScan`) now route through
+  `testdeadline.After`. The file's one 150ms **negative**-wait assertion (`...
+  must WAIT for the lock, not report ...`) is untouched, per `testdeadline`'s own
+  contract: contention delays the subject and the timer alike, so scaling a
+  negative wait only slows the suite.
+- `sliceceiling_test.go`: 2 liveness-backstop `time.After(5*time.Second)` sites
+  (`TestSliceCeilingThrottleReachesCapacityOnly`,
+  `TestSliceCeilingDoesNotReachTheOOMEscalationClamp`, both "granted after the
+  ceiling recovered") now route through `testdeadline.After`. Its two 150ms
+  negative-wait assertions, and one unrelated 50ms `time.Sleep` that just drives
+  two goroutines racing under `-race` (not a wait boundary), are untouched.
+- `.github/workflows/ci.yml`: added a third job, `race`, running `make race`
+  (`go test ./... -race -count=1 -timeout 40m`), alongside the existing `build`
+  and `test` jobs.
+
+### Verification (the brief's explicit "don't just remove a skip comment" bar)
+
+Local, before pushing: `go build ./...`, `go vet ./...`, `make fmt-check` clean;
+full `go test ./... -count=1` → **exit 0**, every package `ok`; targeted
+`go test ./internal/daemon/... -race` and `./internal/runner/... -race` → both
+green.
+
+One local-only finding surfaced and is recorded, not fixed, because it is
+outside this ticket's file scope and does not reproduce in the environment that
+matters: `internal/daemon/sliceceiling_real_cgroup_linux_test.go`'s
+`TestSliceCeilingRealCgroupSignalTracksRealAccounting` (added by AIRA-103,
+after AIRA-20's original pass) fails under `-race` **on this box specifically**,
+because this box has real cgroup-v2 memory delegation and the race-instrumented
+helper subprocess's extra footprint pushes its two `touch(600MiB)` anon holds
+past headroom under the fixture's 2GiB cap. Reproduced identically on
+unmodified `origin/master` — pre-existing, not introduced here.
+
+Rather than trust that read of "won't reproduce on the real runner," it was
+checked directly: pushed the branch, opened PR #50, and let the real
+`ubuntu-latest` GitHub-hosted runner run the new `race` job for real. **It
+passed in 5m41s**, every package `ok` including `internal/daemon` (74.9s) —
+confirming the generic runner has no delegated memory controller to hand that
+test (matching the `test` job's already-documented behaviour for the whole
+`SkipOrFailRealCgroup` family) and the local failure is a delegation artifact of
+this box, not something CI will ever see. `test` (1m23s) and `build + vet +
+gofmt` (25s) also passed. This is the actual authority the brief asked for, not
+an inference from local reasoning alone.
+
+Independent review: self-review, then one independent code-reading pass via
+Codex-Sol (`gpt-5.6-sol`, read-only sandbox) against the full diff and the
+`testdeadline` package's own liveness/latency/negative-wait contract — verdict
+**APPROVE**, no findings, confirmed every changed site's classification and the
+CI yaml addition.
+
+### Design questions from the brief, resolved
+
+- **Item 1 (`governor_slot_test.go`)**: moot — AIRA-33 deleted the file before
+  this ticket was picked up. Re-scoped to `internal/daemon/cpuslots_gate_test.go`
+  and `sliceceiling_test.go` exactly as the brief's own fallback instructed, plus
+  a repo-wide grep to confirm no third file needed the same treatment.
+- **Item 2 (`cpuslots_gate_test.go` / `sliceceiling_test.go`)**: done as specified;
+  positive multi-second waits scaled, ~150ms negative waits left alone.
+- **Item 3 (re-enable `-race` CI)**: done, and verified against a real CI run
+  rather than by removing a skip comment on faith — see above.
+
+### PR and merge
+
+- PR: https://github.com/battlesnake/aira/pull/50
+- Merge commit: `85965a04cbc829f94dcfe2ad1cfb0dc0da72e208` (merged into
+  `master`, standard merge commit, branch `aira20-wall-clock-race-ci`)
+- Build commit on the branch: `2851e6b2a2204da1d8387f99c14d9250830c0f93`
+- Post-merge CI on `master` at the merge commit re-verified green (all three
+  jobs) before this resolution was written.
+- Exact exit codes: `go build ./...` → 0; `go vet ./...` → 0; `make fmt-check`
+  → 0 (no output); `go test ./... -count=1` → 0 (full suite, all packages
+  `ok`); `go test ./internal/daemon/... -race` → 0; `go test
+  ./internal/runner/... -race` → 0; GitHub Actions `race`/`test`/`build + vet +
+  gofmt` jobs on PR #50 and on the post-merge `master` run → all `success`.
