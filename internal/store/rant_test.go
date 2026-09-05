@@ -255,7 +255,6 @@ func TestRantRedactErasesEveryProseSurfaceKeepsProvenance(t *testing.T) {
 	for _, q := range []struct{ label, query string }{
 		{"rants.body", `SELECT COUNT(*) FROM rants WHERE project_id=? AND instr(body,?)>0`},
 		{"rant_reviews.note", `SELECT COUNT(*) FROM rant_reviews WHERE project_id=? AND instr(note,?)>0`},
-		{"search_fts.content", `SELECT COUNT(*) FROM search_fts WHERE project_id=? AND instr(content,?)>0`},
 	} {
 		var n int
 		if err := s.db.QueryRow(q.query, s.projectID, secret).Scan(&n); err != nil {

@@ -339,9 +339,9 @@ func (db *DB) Eject(ctx context.Context, project ProjectRegistration, force bool
 		if n, err := deleted.RowsAffected(); err != nil || n != 1 {
 			return fmt.Errorf("E_EJECT_UNVERIFIED: project changed during eject")
 		}
-		if _, err := conn.ExecContext(ctx, `DELETE FROM search_fts WHERE project_id=?`, project.ProjectID); err != nil {
-			return err
-		}
+		// There is no persistent search index to clear: grep builds a private
+		// per-query index, so an ejected project leaves nothing behind in the
+		// database to sweep.
 		if _, err := conn.ExecContext(ctx, `INSERT INTO ejections(project_id,ejected_at) VALUES (?,?)`, project.ProjectID, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
 		}

@@ -249,21 +249,22 @@ func (s *Store) RedactRant(ctx context.Context, id string) (EventKey, error) {
 			return errors.New("E_NOT_FOUND: rant not found")
 		}
 		// Redaction must erase the pasted secret everywhere it can resurface,
-		// not just the canonical body: the disposable FTS rows a grep reads
-		// (per worktree, so filter on the rant, not this worktree) and the free
-		// prose of every review. The structured audit skeleton — ids, seq,
-		// timestamps, actor, tags, refs, git provenance, review outcomes — is
-		// deliberately retained; only free text is scrubbed. The append-only
-		// review triggers permit exactly this note→sentinel update and nothing
-		// else.
-		// FTS5 secure-delete makes the index delete overwrite its term bytes
-		// rather than leave a tombstone over live segment data.
-		if _, err := conn.ExecContext(ctx, `INSERT INTO search_fts(search_fts,rank) VALUES('secure-delete',1)`); err != nil {
-			return err
-		}
-		if _, err := conn.ExecContext(ctx, `DELETE FROM search_fts WHERE project_id=? AND kind='rant' AND ref_id=?`, s.projectID, id); err != nil {
-			return err
-		}
+		// not just the canonical body: also the free prose of every review. The
+		// structured audit skeleton — ids, seq, timestamps, actor, tags, refs,
+		// git provenance, review outcomes — is deliberately retained; only free
+		// text is scrubbed. The append-only review triggers permit exactly this
+		// note→sentinel update and nothing else.
+		//
+		// There is no longer an FTS row to scrub, and that STRENGTHENS this
+		// guarantee rather than weakening it. grep builds a private in-memory
+		// index per query and discards it, so a rant body has exactly one
+		// persistent home — rants.body, scrubbed above — instead of the second
+		// on-disk copy the old persistent index kept per worktree. The private
+		// index is rebuilt from rants.body, which is already the sentinel, so a
+		// redacted body cannot resurface through grep. Ordering is safe by
+		// construction: redaction needs a writable Store, whose Open has already
+		// run dropLegacySearchFTS, so there is no window in which this scrub is
+		// gone but the table is not.
 		if _, err := conn.ExecContext(ctx, `UPDATE rant_reviews SET note=? WHERE project_id=? AND rant_id=? AND note<>''`, domain.RedactedRantBody, s.projectID, id); err != nil {
 			return err
 		}

@@ -12,8 +12,9 @@ import (
 // TestEveryProjectTableCascadesToProjects is the fail-closed schema guard for
 // project ownership. Direct and composite child FKs are followed recursively:
 // rant_* rows cascade through rants, and test_report_results through
-// test_reports. The only deliberate exceptions are the durable eject
-// tombstone and FTS5's virtual table.
+// test_reports. The only deliberate exception is the durable eject tombstone.
+// FTS5's virtual table used to be exempt too; it is gone (AIRA-74), and because
+// each exemption is asserted to EXIST, this test also fails if it comes back.
 func TestEveryProjectTableCascadesToProjects(t *testing.T) {
 	base := t.TempDir()
 	db, err := OpenDB(filepath.Join(base, "state.db"), filepath.Join(base, "registry.jsonl"))
@@ -23,7 +24,7 @@ func TestEveryProjectTableCascadesToProjects(t *testing.T) {
 	defer db.Close()
 
 	tables := projectIDTables(t, db.db)
-	exempt := map[string]bool{"ejections": true, "search_fts": true}
+	exempt := map[string]bool{"ejections": true}
 	for name := range exempt {
 		if !schemaContainsString(tables, name) {
 			t.Errorf("schema exemption %q is absent or lacks project_id", name)
