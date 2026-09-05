@@ -2646,10 +2646,18 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 		// cannot establish: an unevaluated ceiling prints its reason, not a number,
 		// and observe mode says plainly that nothing was applied.
 		if mode := result.SliceReserve.CeilingMode; mode != "" {
+			state := result.SliceReserve.CeilingState
 			switch {
-			case result.SliceReserve.CeilingState == "unevaluated":
+			case state == "unevaluated":
 				_, _ = fmt.Fprintf(stdout, "slice ceiling: unevaluated (%s)\n",
 					confineCeilingReason(result.SliceReserve.CeilingReason))
+			case state != "throttled" && state != "unthrottled":
+				// AIRA-106. The unknown-state fallback is checked BEFORE the mode
+				// branch. It used to sit last, so an observe-mode snapshot carrying an
+				// empty or newer-vocabulary state fell into the numeric "would be
+				// effective" branch and rendered a figure for a state this binary does
+				// not understand -- the one thing the fallback exists to prevent.
+				_, _ = fmt.Fprintf(stdout, "slice ceiling: unevaluated (unrecognised state %q)\n", state)
 			case mode == "observe":
 				// CeilingBytes is the UNTOUCHED static capacity in observe mode --
 				// observe applies nothing -- so the counterfactual must come from
@@ -2676,20 +2684,15 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 					formatReserveBytes(result.SliceReserve.CeilingWouldBeBytes),
 					confineCeilingCause(result.SliceReserve.CeilingBasis),
 					confineCeilingSourceNote(result.SliceReserve))
-			case result.SliceReserve.CeilingState == "throttled":
+			case state == "throttled":
 				_, _ = fmt.Fprintf(stdout, "slice ceiling: reduced below the %s configured ceiling%s%s; new admissions wait, running jobs are untouched\n",
 					formatReserveBytes(result.SliceReserve.CeilingStaticBytes),
 					confineCeilingCause(result.SliceReserve.CeilingBasis),
 					confineCeilingSourceNote(result.SliceReserve))
-			case result.SliceReserve.CeilingState == "unthrottled":
-				_, _ = fmt.Fprintf(stdout, "slice ceiling: at its %s configured ceiling; not reduced by system memory pressure%s\n",
+			default: // "unthrottled" -- every other state was answered above.
+				_, _ = fmt.Fprintf(stdout, "slice ceiling: at its %s configured ceiling; not reduced by either policy term%s\n",
 					formatReserveBytes(result.SliceReserve.CeilingStaticBytes),
 					confineCeilingSourceNote(result.SliceReserve))
-			default:
-				// An unrecognised state is not silently rendered as one of the
-				// known ones: a newer daemon's vocabulary must read as unknown,
-				// never as "at its configured ceiling".
-				_, _ = fmt.Fprintf(stdout, "slice ceiling: unevaluated (unrecognised state %q)\n", result.SliceReserve.CeilingState)
 			}
 			// Jobs admitted before the ceiling fell still hold their grants, so
 			// granted CAN exceed the ceiling while throttled. That is a DRAIN
@@ -2753,16 +2756,24 @@ func confineCeilingReason(reason string) string {
 }
 
 // confineCeilingCause renders WHICH policy term reduced the ceiling (AIRA-106).
+//
+// It names the TERM, not a cause in the world. That distinction is the point:
+// the dynamic term is `MemAvailable + sliceAnon - freeMin`, and on a large,
+// perfectly IDLE machine with a large freeMin it can bind with nothing at all
+// consuming memory outside the slice. The pre-AIRA-106 wording ("reduced by
+// memory used OUTSIDE the slice") asserted a fact about the machine that the
+// comparison does not establish; this says what the daemon actually knows, and
+// the MemAvailable figure printed beside it is what lets an operator tell the
+// two situations apart.
+//
 // An unset or unrecognised basis renders NOTHING rather than defaulting to
-// either cause: before AIRA-106 every line asserted external memory pressure
-// unconditionally, and the static machine-reserve term makes that assertion
-// false on an otherwise idle machine. Saying less is the honest failure mode.
+// either term. Saying less is the honest failure mode.
 func confineCeilingCause(basis string) string {
 	switch basis {
 	case "system-pressure":
-		return " by memory used OUTSIDE the slice"
+		return " to keep the configured system free-memory reserve"
 	case "machine-reserve":
-		return " to keep part of this machine outside the slice"
+		return " to keep the configured share of this machine outside the slice"
 	default:
 		return ""
 	}

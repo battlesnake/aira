@@ -711,6 +711,15 @@ func TestSliceCeilingRefusesADegenerateSizing(t *testing.T) {
 		// pinned at zero forever.
 		{"reserve-max-inside-the-headroom-band", sliceCeilingPolicy{memTotal, memTotal - (1 << 30), 8 << 30}, "reserveMax"},
 		{"free-min-inside-the-headroom-band", sliceCeilingPolicy{memTotal, 16 << 30, memTotal - (1 << 30)}, "freeMin"},
+		// The band a guard using only the BASE headroom would let through: a
+		// 2.125 GiB static term clears 2 GiB on the raw figure, quantises DOWN to
+		// exactly 2 GiB, and then loses the first job's 2 GiB + 64 MiB headroom --
+		// admission frozen forever, inside the guard's own blind spot.
+		{"reserve-max-inside-the-quantisation-band", sliceCeilingPolicy{memTotal, memTotal - (2 << 30) - (128 << 20), 8 << 30}, "reserveMax"},
+		{"free-min-inside-the-quantisation-band", sliceCeilingPolicy{memTotal, 16 << 30, memTotal - (2 << 30) - (128 << 20)}, "freeMin"},
+		// One byte the other side of that floor is ACCEPTED: the guard must refuse
+		// the unusable band and nothing more.
+		{"reserve-max-just-above-the-floor", sliceCeilingPolicy{memTotal, memTotal - sliceCeilingUsableFloor() - 1, 8 << 30}, ""},
 		{"free-min-below-the-watchdog-trip", sliceCeilingPolicy{memTotal, 16 << 30, watchdogLowMemAvailable - 1}, "watchdog"},
 		{"negative", sliceCeilingPolicy{memTotal, -1, 8 << 30}, "non-negative"},
 	} {

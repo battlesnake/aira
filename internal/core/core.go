@@ -1759,9 +1759,19 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringArg(args, "owner")
 			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine-kill requires the project-less daemon transport")
 		}},
-		"install": {Name: "install", Usage: "install [--memory-max SZ] [--memory-high SZ] [--allow-overcommit] [--dry-run] [--status]", Args: []ArgSpec{
+		// AIRA-106. The daemon-subsystem mode flags are listed here because this
+		// table IS the generated help: an operator reading `aira help install` could
+		// not otherwise discover how to flip either memory subsystem. (--watchdog
+		// and --watchdog-interval have been accepted by the install parser since
+		// AIRA-62 and were simply never described.) Omitting a mode flag PRESERVES
+		// whatever the installed unit declares rather than resetting it, which is
+		// why each description says so.
+		"install": {Name: "install", Usage: "install [--memory-max SZ] [--memory-high SZ] [--watchdog MODE] [--watchdog-interval D] [--slice-ceiling MODE] [--allow-overcommit] [--dry-run] [--status]", Args: []ArgSpec{
 			stringSpec("memory_max", false, false, "aira.slice MemoryMax (<N>G)"),
 			stringSpec("memory_high", false, false, "aira.slice MemoryHigh (<N>G)"),
+			stringSpec("watchdog", false, false, "Memory-watchdog mode; omitted keeps the installed value", "off", "observe", "enforce"),
+			stringSpec("watchdog_interval", false, false, "Memory-watchdog sample interval in [1s,30s); omitted keeps the installed value"),
+			stringSpec("slice_ceiling", false, false, "Dynamic slice-ceiling mode; omitted keeps the installed value", "off", "observe", "enforce"),
 			boolSpec("allow_overcommit", false, false, "Acknowledge coexistence with capped whale.slice"),
 			boolSpec("dry_run", false, false, "Render units and planned actions without mutation"),
 			boolSpec("status", false, false, "Report each installed and live facet honestly"),
@@ -1769,6 +1779,9 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = ctx
 			_ = stringArg(args, "memory_max")
 			_ = stringArg(args, "memory_high")
+			_ = stringArg(args, "watchdog")
+			_ = stringArg(args, "watchdog_interval")
+			_ = stringArg(args, "slice_ceiling")
 			_ = boolArg(args, "allow_overcommit")
 			_ = boolArg(args, "dry_run")
 			_ = boolArg(args, "status")

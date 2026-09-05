@@ -182,13 +182,14 @@ type sliceCeilingDeps struct {
 }
 
 type sliceCeilingState struct {
-	window    []int64
-	lastOK    time.Time
-	published int64
-	havePub   bool
-	logged    string
-	loggedAt  time.Time
-	loggedVal int64
+	window       []int64
+	lastOK       time.Time
+	published    int64
+	havePub      bool
+	logged       string
+	loggedAt     time.Time
+	loggedVal    int64
+	loggedMargin int64
 
 	// The last ESTABLISHED facts, carried so a held snapshot (see
 	// sliceCeilingHold) reports what was actually measured rather than a
@@ -292,25 +293,42 @@ func (p sliceCeilingPolicy) machineTerm() int64 {
 // refusal deterministic instead of dependent on a test knob. It is also the
 // right altitude: this asks "could this configuration ever admit anything",
 // not a per-pass capacity question.
+// sliceCeilingUsableFloor is the smallest budget from which admission could ever
+// grant ANYTHING, and therefore the floor both sizing parameters must leave.
+//
+// It is the sum of three real costs, not a round number:
+//   - admitSliceHeadroomBaseDefault + admitSliceHeadroomSupervisorDefault, the
+//     headroom checkedAvailable subtracts for a single job (it returns 0 whenever
+//     maximum <= headroom);
+//   - sliceCeilingQuantum, because the published figure is rounded DOWN, so a
+//     budget only fractionally above the headroom quantises to at or below it.
+//
+// An earlier draft used the base headroom alone. That accepted, for example,
+// reserveMax = MemTotal - 2.125 GiB: refusal passed on the raw figure, the
+// published ceiling then quantised to exactly 2 GiB, and the first job's
+// 2 GiB + 64 MiB headroom left checkedAvailable returning zero forever -- the
+// exact silent freeze this guard exists to prevent, inside the guard's own
+// blind spot.
+func sliceCeilingUsableFloor() int64 {
+	return addClamp(addClamp(admitSliceHeadroomBaseDefault, admitSliceHeadroomSupervisorDefault), sliceCeilingQuantum)
+}
+
 func (p sliceCeilingPolicy) refusal() string {
+	floor := sliceCeilingUsableFloor()
 	switch {
 	case p.memTotal <= 0:
 		return "MemTotal is unestablished"
 	case p.reserveMax < 0 || p.freeMin < 0:
 		return fmt.Sprintf("reserveMax=%d and freeMin=%d must both be non-negative", p.reserveMax, p.freeMin)
-	case p.reserveMax >= p.memTotal-admitSliceHeadroomBaseDefault:
-		// checkedAvailable returns 0 whenever maximum <= headroom, so a static
-		// term at or below the headroom base freezes admission forever rather
-		// than merely tightening it. Refusing at 0 would leave that whole band
-		// silently frozen.
-		return fmt.Sprintf("reserveMax=%d leaves only %d of MemTotal=%d, at or below the %d admission headroom, so enforce would freeze admission",
-			p.reserveMax, p.machineTerm(), p.memTotal, admitSliceHeadroomBaseDefault)
-	case p.freeMin >= p.memTotal-admitSliceHeadroomBaseDefault:
-		// The same band the reserveMax rule refuses, for the same reason: a
-		// freeMin this close to MemTotal leaves the dynamic term at most
-		// sliceAnon + headroom, so checkedAvailable yields zero forever.
-		return fmt.Sprintf("freeMin=%d leaves at most %d of MemTotal=%d above the slice's own footprint, at or below the %d admission headroom, so enforce would freeze admission",
-			p.freeMin, subtractFloor(p.memTotal, p.freeMin), p.memTotal, admitSliceHeadroomBaseDefault)
+	case p.machineTerm() <= floor:
+		return fmt.Sprintf("reserveMax=%d leaves only %d of MemTotal=%d, at or below the %d a single job needs after admission headroom and ceiling quantisation, so enforce would freeze admission",
+			p.reserveMax, p.machineTerm(), p.memTotal, floor)
+	case subtractFloor(p.memTotal, p.freeMin) <= floor:
+		// The same floor from the other side: a freeMin this close to MemTotal
+		// leaves the dynamic term at most sliceAnon + that remainder, so
+		// checkedAvailable yields zero forever however idle the machine is.
+		return fmt.Sprintf("freeMin=%d leaves at most %d of MemTotal=%d above the slice's own footprint, at or below the %d a single job needs, so enforce would freeze admission",
+			p.freeMin, subtractFloor(p.memTotal, p.freeMin), p.memTotal, floor)
 	case p.freeMin < watchdogLowMemAvailable:
 		// The throttle's target state is MemAvailable ~= freeMin + headroom. Below
 		// the watchdog's trip that target sits INSIDE the band in which the
@@ -332,6 +350,15 @@ func sliceCeilingQuantizeDown(value, quantum int64) int64 {
 		return value
 	}
 	return value - value%quantum
+}
+
+// absDelta is |a-b| without overflowing on the int64 extremes both arguments are
+// already clamped away from (both are byte counts derived from clamped reads).
+func absDelta(a, b int64) int64 {
+	if a >= b {
+		return a - b
+	}
+	return b - a
 }
 
 func readMemTotal() (int64, bool) {
@@ -430,7 +457,8 @@ func evaluateSliceCeiling(mode sliceCeilingMode, state *sliceCeilingState, deps 
 		// The governed slice moved (re-created cgroup, a different canonical path
 		// after EvalSymlinks). Samples describe a slice, not a machine, so mixing
 		// two slices' samples in one window would publish a ceiling for neither.
-		*state = sliceCeilingState{logged: state.logged, loggedAt: state.loggedAt, loggedVal: state.loggedVal}
+		*state = sliceCeilingState{logged: state.logged, loggedAt: state.loggedAt,
+			loggedVal: state.loggedVal, loggedMargin: state.loggedMargin}
 	}
 	state.path = path
 
@@ -592,13 +620,25 @@ func logSliceCeiling(state *sliceCeilingState, deps sliceCeilingDeps, snapshot s
 	if deps.logf == nil {
 		return
 	}
-	moved := snapshot.Ceiling-state.loggedVal >= sliceCeilingLogDelta ||
-		state.loggedVal-snapshot.Ceiling >= sliceCeilingLogDelta
+	// AIRA-106. The MARGIN moves the line, not just the ceiling.
+	//
+	// The rate-limited line used to fire only on a ceiling move, which is exactly
+	// the wrong trigger for the question the observe rollout has to answer. The
+	// signal is deliberately invariant to the slice's own growth, so the common
+	// case is a ceiling that does not move AT ALL while sliceAnon climbs toward
+	// it: every line logged would look safe right up to the moment enforce would
+	// have closed admission, and none would be logged as it happened. Tracking
+	// (ceiling - sliceAnon) makes the approach itself observable. Same 1 GiB
+	// delta, same one-per-minute rate limit, no new log site.
+	margin := snapshot.Ceiling - snapshot.SliceAnon
+	moved := absDelta(snapshot.Ceiling, state.loggedVal) >= sliceCeilingLogDelta ||
+		absDelta(margin, state.loggedMargin) >= sliceCeilingLogDelta
 	stale := state.loggedAt.IsZero() || snapshot.At.Sub(state.loggedAt) >= sliceCeilingLogInterval
 	if snapshot.State == state.logged && !(moved && stale) {
 		return
 	}
-	state.logged, state.loggedAt, state.loggedVal = snapshot.State, snapshot.At, snapshot.Ceiling
+	state.logged, state.loggedAt = snapshot.State, snapshot.At
+	state.loggedVal, state.loggedMargin = snapshot.Ceiling, margin
 	if snapshot.State == sliceCeilingUnevaluated {
 		deps.logf("aira daemon: slice ceiling %s: %s", snapshot.State, snapshot.Reason)
 		return

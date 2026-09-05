@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-103","project":"aira","title":"Dynamic slice ceiling: shrink aira.slice's memory.max under real system-wide RAM pressure so existing admission throttles","status":"done","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","memory-safety","scheduler"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-103","project":"aira","title":"Dynamic slice ceiling: shrink aira.slice's memory.max under real system-wide RAM pressure so existing admission throttles","status":"done","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","memory-safety","scheduler"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-106","to":"AIRA-103"}]}
 ---
 Direct owner request (2026-09-05): monitor free SYSTEM RAM (outside the slice — the desktop, other system load, and per AIRA-102, currently-uncontained Docker containers) and dynamically shrink `aira.slice`'s own memory ceiling when system RAM is getting tight, so admission gets blocked by the slice's EXISTING capacity check even while the slice's own static accounting still shows "room" — rather than adding a second, parallel admission-blocking mechanism.
 

@@ -107,6 +107,24 @@ func TestResolveDaemonModesPreservesInstalledModes(t *testing.T) {
 	if err != nil || resolved.watchdog != "observe" || resolved.watchdogInterval != 2*time.Second {
 		t.Fatalf("an unrecognised installed value was propagated or refused: %+v err=%v", resolved, err)
 	}
+	// systemd accepts a QUOTED assignment and gives a LATER assignment of the
+	// same name precedence. A first-match, unquoted-only reader mis-reads both --
+	// and mis-reading means falling back to the ship default, i.e. silently
+	// resetting the operator's mode, the exact failure this mechanism prevents.
+	for _, test := range []struct{ name, unit, want string }{
+		{"quoted", "[Service]\nEnvironment=\"AIRA_DAEMON_WATCHDOG_MODE=enforce\"\n", "enforce"},
+		{"later-assignment-wins", "[Service]\nEnvironment=AIRA_DAEMON_WATCHDOG_MODE=observe\nEnvironment=AIRA_DAEMON_WATCHDOG_MODE=enforce\n", "enforce"},
+		{"trailing-space", "[Service]\nEnvironment=AIRA_DAEMON_WATCHDOG_MODE=enforce  \n", "enforce"},
+		// A multi-assignment line is NOT parsed: it reads as absent and falls back
+		// to the ship default, which is the safe direction. Pinned so a later
+		// "improvement" that guesses at it has to say so.
+		{"multi-assignment-falls-back", "[Service]\nEnvironment=FOO=1 AIRA_DAEMON_WATCHDOG_MODE=enforce\n", "observe"},
+	} {
+		resolved, err = resolveDaemonModes(installOpts{}, test.unit)
+		if err != nil || resolved.watchdog != test.want {
+			t.Fatalf("%s: watchdog=%q err=%v, want %q -- a mis-read here silently resets the operator's mode", test.name, resolved.watchdog, err, test.want)
+		}
+	}
 }
 
 // verifies (AIRA-106): the ROOT RE-EXEC does not forge an explicit flag.
@@ -222,6 +240,66 @@ func TestInstallDaemonReinstallPreservesModes(t *testing.T) {
 	for _, argv := range state.commands {
 		if strings.Join(argv, " ") == "systemctl --user restart "+defaultDaemonUnit {
 			t.Fatalf("a preserving re-install restarted the live daemon; commands=%q", state.commands)
+		}
+	}
+}
+
+// verifies (AIRA-106): a mode change that lands BETWEEN the pre-lock unit read
+// and the install lock is preserved, not overwritten.
+//
+// The unit content that seeds resolveDaemonModes is read before the lock (it has
+// to be: --dry-run renders and returns before ever taking one). A concurrent
+// `aira install --watchdog enforce` in that window would otherwise be undone by
+// this run's stale-preserved "observe", AND the daemon restarted into the
+// reverted mode -- exactly the defect class the preservation exists to stop,
+// through a narrower door. publishManagedUnit's own locked re-read cannot catch
+// it: it compares CONTENT and has no way to recompute a preserved setting.
+//
+// The concurrent install is simulated at the only instant that matters, by
+// rewriting the unit inside d.flock -- which is called once, immediately before
+// the locked re-read. RED against resolving only before the lock.
+func TestInstallDaemonConcurrentModeChangeSurvivesTheLock(t *testing.T) {
+	d, state := newFakeInstall(t)
+	if err := runInstall(d, installOpts{memoryMax: "16G", watchdog: "observe", sliceCeiling: "observe", watchdogInterval: 2 * time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	unitPath := filepath.Join(state.unitDir(), defaultDaemonUnit)
+	installed, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	concurrent := strings.NewReplacer(
+		"AIRA_DAEMON_WATCHDOG_MODE=observe", "AIRA_DAEMON_WATCHDOG_MODE=enforce",
+		"AIRA_DAEMON_SLICE_CEILING_MODE=observe", "AIRA_DAEMON_SLICE_CEILING_MODE=enforce",
+	).Replace(string(installed))
+	if concurrent == string(installed) {
+		t.Fatalf("the seeded unit did not carry both observe modes:\n%s", installed)
+	}
+	baseFlock := d.flock
+	swapped := false
+	d.flock = func(fd, how int) error {
+		if !swapped {
+			swapped = true
+			if writeErr := os.WriteFile(unitPath, []byte(concurrent), 0o644); writeErr != nil {
+				t.Fatalf("simulate the concurrent install: %v", writeErr)
+			}
+		}
+		return baseFlock(fd, how)
+	}
+	// The deploy case: memory sizing given, both modes omitted.
+	if err := runInstall(d, installOpts{memoryMax: "16G"}); err != nil {
+		t.Fatal(err)
+	}
+	if !swapped {
+		t.Fatal("the install never took the lock; this test proved nothing")
+	}
+	final, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"AIRA_DAEMON_WATCHDOG_MODE=enforce", "AIRA_DAEMON_SLICE_CEILING_MODE=enforce"} {
+		if !strings.Contains(string(final), want) {
+			t.Fatalf("a concurrent mode change was reverted by a flagless install; want %q in:\n%s", want, final)
 		}
 	}
 }

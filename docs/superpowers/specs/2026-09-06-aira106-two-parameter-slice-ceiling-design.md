@@ -59,6 +59,22 @@ via the existing mode ladder.
 | 19 | §2.4's `freeMin` bound becomes `>= MemTotal − admitSliceHeadroomBase` (the same 2 GiB band already refused for `reserveMax`); §2.5 records that the throttle's steady state sits below the watchdog's 16 GiB *recover* threshold, so a tripped watchdog will not emit `recovered` while AIRA sits at capacity. | Fable r2 P2 |
 | 20 | Test 1 gains a **sub-quantum-difference** row — the only case that separates a basis decided on raw figures from one decided after quantisation. Test 5's "RED against a machine term that damps" claim removed as vacuous (a constant cannot damp). | Fable r2 P1(d) note; own red-check |
 
+### 0.3 v3 → v4 changes (adversarial BUILD review)
+
+Sol (GPT-5.6) reviewed the built diff and returned **BLOCK** with 3×P0, 4×P1, 1×P2. Every finding is fixed:
+
+| # | finding | change |
+|---|---|---|
+| 21 | **P0** The real-cgroup bound's "slab" was `ceilingCurrent − ceilingReclaimable − sliceAnon`, which is **identically zero** (the ceiling reader already sums file+slab), so its slab guard could never fire; and it passed file+slab into `checkedAvailable`, a **more permissive** discount than production's file-only. | New `ceilingBoundCharge` reads admission's own `readSliceMemory` for the charge and derives slab as the difference between the two readers. Both the bound and its control now assert against the production charge. §7.2 records the trap. |
+| 22 | **P0** An always-`unevaluated` implementation would **skip** the bound test and its control on any run without `AIRA_REAL_CGROUP=1`. | Once the fixture and every read are established, an unevaluated publication is `t.Fatalf`, not a skip. |
+| 23 | **P0** `refusal` used the BASE headroom only, so e.g. `machineTerm = 2.125 GiB` passed, quantised **down** to exactly 2 GiB, and then lost the first job's 2 GiB + 64 MiB headroom — admission frozen forever inside the guard's own blind spot. | `sliceCeilingUsableFloor()` = base + per-job supervisor headroom + one quantum, applied to **both** parameters, with exact-boundary and just-above-the-floor test rows. |
+| 24 | **P0** `resolveDaemonModes` ran on content read **before** the install lock, so a concurrent `aira install --watchdog enforce` could be silently reverted (`publishManagedUnit` compares content and cannot recompute a preserved setting). | The daemon unit is re-read and the modes re-resolved **beneath the lock**, re-rendering only if the resolution changed. The equivalent pre-existing window on `MemoryMax` is recorded as an accepted gap (§9). |
+| 25 | **P1** The stated bound was still false: `machineTerm >= sliceAnon` is not enough (quantise-down), and the `memory.max` clamp was omitted entirely. | §7.2 states all three preconditions with a worked counterexample; the test asserts each one explicitly instead of relying on fixture slack. |
+| 26 | **P1** The installed-unit regexes matched only the first, unquoted assignment; systemd accepts quoted assignments and gives a **later** assignment precedence — so a hand-edited managed unit would be mis-read, i.e. silently reset. | `installedEnvironmentValue` takes the **last** match and tolerates the quoted form; three cases added to the preservation test. |
+| 27 | **P1** The new `sliceAnon` log field could not support the rollout criterion: the line is gated on ceiling movement, and the signal is deliberately invariant to the slice's own growth — so `sliceAnon` could climb through a motionless ceiling with nothing logged. | The rate-limited line now also fires when the **margin** (`ceiling − sliceAnon`) moves by ≥1 GiB. Same delta, same one-per-minute limit, no new log site. |
+| 28 | **P1** A `system-pressure` basis does not establish that memory outside the slice caused the reduction — on an idle box with a large `freeMin` the dynamic term binds with nothing external consuming memory. | All three surfaces now name the **policy term** ("to keep the configured system free-memory reserve" / "the configured share of this machine"), never a fact about the machine. The `MemAvailable` figure beside it is what distinguishes the two situations. |
+| 29 | **P2** Observe mode with an empty or unrecognised state bypassed the unknown-state fallback and rendered a number for a state the binary does not understand. | The unknown-state branch moved **before** the mode branch; two rows added to the rendering table. |
+
 ---
 
 ## 1. The owner's decision, verbatim
@@ -659,20 +675,48 @@ current real usage, with a negative control proving the test fixture can actuall
 detect a failure". The naive phrasing of that bound is **false**, and both
 reviewers caught it independently, so it is stated precisely:
 
-> **Claim.** Against a real cgroup holding a real running process, with
-> `MemAvailable − freeMin >= quantum` **and `machineTerm >= sliceAnon`**, the
-> published ceiling is **at least the slice's own real `sliceAnon`** — so
-> admission never closes merely because the slice is holding what it already
-> holds. The `quantum` term is load-bearing:
-> `published = quantise_down(min(machineTerm, sliceAnon + (MemAvailable − freeMin)))`,
-> so for `0 <= MemAvailable − freeMin < quantum` the round-down alone puts
-> `published` **below** `sliceAnon` and the naive bound is not provable. Weakened
-> form, valid for all `MemAvailable >= freeMin`: `published >= sliceAnon − quantum`.
+> **Claim.** Against a real cgroup holding a real running process, the published
+> ceiling is **at least the slice's own real `sliceAnon`** — so admission never
+> closes merely because the slice is holding what it already holds — under **all
+> three** of:
 >
-> **Corollary, one-directional.** `checkedAvailable` charges
-> `current − inactive_file − active_file = sliceAnon + slab_reclaimable`, so
-> `MemAvailable − freeMin > slab_reclaimable + quantum + headroom` **suffices**
-> for `available > 0`. (It is not claimed to be necessary.)
+> ```
+> MemAvailable − freeMin  >=  quantum          (pressure margin)
+> machineTerm             >=  sliceAnon + quantum
+> live memory.max         >=  sliceAnon
+> ```
+>
+> All three are load-bearing, and a draft that stated only the first two asserted
+> something false. Since
+> `published = min(memory.max, quantise_down(min(machineTerm, sliceAnon + Δ)))`
+> with `Δ = MemAvailable − freeMin`, and `quantise_down` loses strictly less than
+> one quantum: `Δ < quantum` alone drops `published` below `sliceAnon`; and so
+> does `machineTerm ∈ [sliceAnon, sliceAnon + quantum)` — e.g. `sliceAnon =
+> 30 GiB + 100 MiB` against `machineTerm = 30 GiB + 128 MiB` quantises to
+> `30 GiB`, below `sliceAnon`, with a whole gigabyte of pressure margin. The
+> `memory.max` clamp is the third way down. The test asserts each precondition
+> explicitly rather than relying on the fixture to satisfy them incidentally.
+>
+> **Weakened form**, valid whenever `machineTerm >= sliceAnon` and
+> `memory.max >= sliceAnon`: `published >= sliceAnon − quantum`.
+>
+> **Corollary, one-directional and stated as sufficient, not necessary.**
+> `checkedAvailable` charges `max(outstanding, current − inactive_file −
+> active_file)` = `max(outstanding, sliceAnon + slab_reclaimable)` and subtracts
+> `headroom` from the ceiling, so
+> `Δ > slab_reclaimable + quantum + headroom + max(0, outstanding − sliceAnon −
+> slab_reclaimable)` **suffices** for `available > 0`. The test drives the
+> `outstanding = headroom = 0` case; the others are strictly harder and are not
+> claimed.
+>
+> **The charge must come from admission's own reader.** `readSliceCeilingParts`
+> returns `reclaimable = file_LRU + slab` (added together); `readSliceMemory`
+> returns `file_LRU` only, because AIRA-21's discount excludes slab. A draft
+> derived "slab" by subtracting `sliceAnon` from the *ceiling* reader's
+> reclaimable, which is **identically zero** — so its slab guard could never fire
+> and its `checkedAvailable` call discounted slab production does not, making the
+> corollary strictly more permissive than the code it modelled. `ceilingBoundCharge`
+> now reads both and derives slab as their difference.
 
 **`TestSliceCeilingRealCgroupNeverShrinksBelowRealUsage`** — reuses
 `newCeilingCgroupFixture` (isolated `os.MkdirTemp` cgroup, never `aira.slice`),
@@ -795,6 +839,13 @@ New: this document.
   visible if it ever happens.
 - **`MemTotal` is read once at startup** and never re-read. On a host that hotplugs
   or balloons memory the static term would go stale. Not modelled; recorded.
+- **`computeMemoryLimits` still preserves `MemoryMax` from content read BEFORE the
+  install lock.** AIRA-106 closes that window for the two daemon mode options
+  (§4.1) by re-resolving and re-rendering beneath the lock, but the same window
+  remains for the memory sizing: two concurrent `aira install` runs could see one
+  overwrite the other's `--memory-max`. Pre-existing, untouched, and closing it
+  means moving the whole read-compute-render block under the lock — a restructure
+  of `runUserInstall` rather than a fix. Recorded rather than half-done.
 - **Swap** remains the largest residual (~6.5 GiB live, essentially all outside
   the slice), in the **permissive** direction, unchanged from AIRA-103 §9.
 - **`slab_reclaimable`'s restrictive residual** (0.36 GiB) between the ceiling's

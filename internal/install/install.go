@@ -54,12 +54,39 @@ var (
 	// AIRA-106. Read an installed daemon unit's own settings back, so an OMITTED
 	// option preserves them instead of resetting them — the MemoryMax precedent
 	// above, applied to the two daemon subsystem modes and the watchdog interval.
-	installedWatchdogModeRE     = regexp.MustCompile(`(?m)^Environment=AIRA_DAEMON_WATCHDOG_MODE=(.*)$`)
-	installedWatchdogIntervalRE = regexp.MustCompile(`(?m)^Environment=AIRA_DAEMON_WATCHDOG_INTERVAL=(.*)$`)
-	installedSliceCeilingModeRE = regexp.MustCompile(`(?m)^Environment=AIRA_DAEMON_SLICE_CEILING_MODE=(.*)$`)
+	//
+	// Deliberately NOT the MemoryMax regexes' shape. systemd accepts a quoted
+	// assignment (`Environment="NAME=value"`) and gives a LATER assignment of the
+	// same name precedence over an earlier one, so a first-match, unquoted-only
+	// reader would mis-read a hand-edited managed unit — and mis-reading means
+	// falling back to the ship default, i.e. silently resetting the operator's
+	// mode, the exact failure this whole mechanism exists to prevent.
+	// installedEnvironmentValue handles both; see it for why the quote handling is
+	// deliberately narrow.
+	installedWatchdogModeRE     = installedEnvironmentRE("AIRA_DAEMON_WATCHDOG_MODE")
+	installedWatchdogIntervalRE = installedEnvironmentRE("AIRA_DAEMON_WATCHDOG_INTERVAL")
+	installedSliceCeilingModeRE = installedEnvironmentRE("AIRA_DAEMON_SLICE_CEILING_MODE")
 )
 
 const procInotifyMaxUserInstances = "/proc/sys/fs/inotify/max_user_instances"
+
+func installedEnvironmentRE(name string) *regexp.Regexp {
+	return regexp.MustCompile(`(?m)^Environment="?` + regexp.QuoteMeta(name) + `=([^"\n]*)"?\s*$`)
+}
+
+// installedEnvironmentValue returns the EFFECTIVE value of one Environment=
+// assignment in a rendered unit: the LAST one wins, matching systemd. It handles
+// only the single-assignment-per-line forms AIRA itself renders plus the quoted
+// variant systemd accepts; a multi-assignment line or a `Environment=` reset is
+// not parsed and reads as absent, which falls back to the ship default rather
+// than to a wrong value.
+func installedEnvironmentValue(content string, expression *regexp.Regexp) string {
+	matches := expression.FindAllStringSubmatch(content, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(matches[len(matches)-1][1])
+}
 
 //go:embed assets
 var assets embed.FS
@@ -383,17 +410,17 @@ func reportDaemonMode(d installDeps, label, variable, liveEnvironment string, li
 // able to make a later install fail, and the ship default is the safe answer.
 func resolveDaemonModes(opts installOpts, installedDaemonUnit string) (installOpts, error) {
 	if !opts.watchdogGiven() {
-		if mode := strings.TrimSpace(parseInstalledValue(installedDaemonUnit, installedWatchdogModeRE)); validDaemonMode(mode) {
+		if mode := installedEnvironmentValue(installedDaemonUnit, installedWatchdogModeRE); validDaemonMode(mode) {
 			opts.watchdog = mode
 		}
 	}
 	if !opts.sliceCeilingGiven() {
-		if mode := strings.TrimSpace(parseInstalledValue(installedDaemonUnit, installedSliceCeilingModeRE)); validDaemonMode(mode) {
+		if mode := installedEnvironmentValue(installedDaemonUnit, installedSliceCeilingModeRE); validDaemonMode(mode) {
 			opts.sliceCeiling = mode
 		}
 	}
 	if !opts.watchdogIntervalGiven() {
-		if value := strings.TrimSpace(parseInstalledValue(installedDaemonUnit, installedWatchdogIntervalRE)); value != "" {
+		if value := installedEnvironmentValue(installedDaemonUnit, installedWatchdogIntervalRE); value != "" {
 			if interval, err := time.ParseDuration(value); err == nil && interval >= time.Second && interval < 30*time.Second {
 				opts.watchdogInterval = interval
 			}
@@ -651,6 +678,12 @@ func runUserInstall(d installDeps, opts installOpts) error {
 	// whatever the installed unit already declares, else the ship default. Doing
 	// this after the unit read and before the render is what stops an unrelated
 	// re-install from silently reverting an operator's `enforce`.
+	//
+	// preResolve keeps the caller's EXPLICIT options, so the re-resolve beneath
+	// the install lock below starts from the same input rather than from an
+	// already-resolved value (which would make every preserved mode look explicit
+	// and defeat the second pass).
+	preResolve := opts
 	if opts, err = resolveDaemonModes(opts, string(installedDaemon)); err != nil {
 		return argumentInvalid(err.Error())
 	}
@@ -722,6 +755,40 @@ func runUserInstall(d installDeps, opts installOpts) error {
 	}
 	if err := d.flock(lockfd, unix.LOCK_EX); err != nil {
 		return unavailable(fmt.Errorf("lock install: %w", err))
+	}
+
+	// AIRA-106. Re-resolve the daemon modes BENEATH THE LOCK and re-render.
+	//
+	// The unit content that seeded resolveDaemonModes above was read before the
+	// lock, so a concurrent `aira install --watchdog enforce` could have landed in
+	// between; publishing the pre-lock render would then quietly undo it and
+	// restart the daemon into the reverted mode. publishManagedUnit's own locked
+	// re-read cannot catch that: it compares CONTENT and has no way to recompute a
+	// preserved setting.
+	//
+	// This closes the window for the two mode options only. The equivalent window
+	// on MemoryMax (computeMemoryLimits reads the same pre-lock content) is
+	// pre-existing and untouched; closing it means moving the whole
+	// read-compute-render block under the lock, which is a restructure of this
+	// function rather than a fix, and is recorded as an accepted gap.
+	// (The pre-lock resolve above cannot simply be deleted in favour of this one:
+	// --dry-run renders the unit and returns BEFORE any lock is taken, so a render
+	// has to exist by then. This pass exists to correct it, and re-renders only
+	// when the locked resolution actually differs.)
+	if lockedDaemon, _, readErr := readRegularUnitAt(d, dirfd, uid, d.daemonUnit, true); readErr == nil {
+		lockedOpts, resolveErr := resolveDaemonModes(preResolve, string(lockedDaemon))
+		if resolveErr != nil {
+			return argumentInvalid(resolveErr.Error())
+		}
+		if lockedOpts.watchdog != opts.watchdog || lockedOpts.sliceCeiling != opts.sliceCeiling ||
+			lockedOpts.watchdogInterval != opts.watchdogInterval {
+			opts = lockedOpts
+			daemonUnit, err = renderDaemonUnit(d.daemonUnit, executable, paths.StateHome,
+				opts.watchdog, opts.watchdogInterval, opts.sliceCeiling, d.daemonRuntimeDir)
+			if err != nil {
+				return argumentInvalid(err.Error())
+			}
+		}
 	}
 
 	// Re-read beneath the lock, through O_NOFOLLOW descriptors, before replacing.

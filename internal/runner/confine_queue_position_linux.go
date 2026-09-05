@@ -146,14 +146,21 @@ func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequ
 		// AIRA-106. The cause is named from the basis, never assumed. Before it,
 		// this line asserted external memory pressure for every reduced ceiling;
 		// the static machine-reserve term makes that false on an idle box.
+		// The basis names WHICH POLICY TERM bound the ceiling, which is what the
+		// daemon actually established. It is deliberately not restated as a fact
+		// about the machine: the dynamic term can bind on a perfectly idle box if
+		// the configured free-memory reserve is large, so "reduced by memory used
+		// outside the slice" would be an assertion the comparison does not support.
+		// The MemAvailable figure beside it is what lets a launcher tell an idle
+		// machine from a loaded one.
 		switch position.ceilingBasis {
 		case "system-pressure":
-			pressure = ", slice ceiling reduced by memory used outside the slice"
+			pressure = ", slice ceiling reduced to keep the configured system free-memory reserve"
 			if position.memAvailable > 0 {
 				pressure += " (system MemAvailable " + FormatConfineBytes(position.memAvailable) + ")"
 			}
 		case "machine-reserve":
-			pressure = ", slice ceiling reduced to keep memory outside the slice for the rest of the machine"
+			pressure = ", slice ceiling reduced to keep the configured share of this machine outside the slice"
 		default:
 			pressure = ", slice ceiling reduced below the configured ceiling"
 		}

@@ -271,11 +271,11 @@ func TestConfineQueueNoteReportsAReducedCeilingOnlyWhenEnforced(t *testing.T) {
 	}{
 		{
 			name: "enforced-throttle", mode: "enforce", state: "throttled", basis: "system-pressure", memAvailable: 6 << 30,
-			want: "slice ceiling reduced by memory used outside the slice (system MemAvailable 6G)",
+			want: "slice ceiling reduced to keep the configured system free-memory reserve (system MemAvailable 6G)",
 		},
 		{
 			name: "enforced-throttle-without-a-reading", mode: "enforce", state: "throttled", basis: "system-pressure",
-			want: "slice ceiling reduced by memory used outside the slice,", absent: "MemAvailable",
+			want: "slice ceiling reduced to keep the configured system free-memory reserve,", absent: "MemAvailable",
 		},
 		{
 			// AIRA-106. The STATIC machine-reserve term reduced this ceiling.
@@ -285,13 +285,13 @@ func TestConfineQueueNoteReportsAReducedCeilingOnlyWhenEnforced(t *testing.T) {
 			// not the cause.
 			name: "enforced-throttle-by-the-machine-reserve", mode: "enforce", state: "throttled",
 			basis: "machine-reserve", memAvailable: 40 << 30,
-			want:   "slice ceiling reduced to keep memory outside the slice for the rest of the machine",
+			want:   "slice ceiling reduced to keep the configured share of this machine outside the slice",
 			absent: "MemAvailable",
 		},
 		{
 			// An absent or unrecognised basis names NEITHER cause.
 			name: "enforced-throttle-without-a-basis", mode: "enforce", state: "throttled", memAvailable: 6 << 30,
-			want: "slice ceiling reduced below the configured ceiling", absent: "memory used outside the slice",
+			want: "slice ceiling reduced below the configured ceiling", absent: "free-memory reserve",
 		},
 		{name: "observe-applies-nothing", mode: "observe", state: "throttled", basis: "system-pressure", memAvailable: 6 << 30, absent: "slice ceiling"},
 		{name: "unevaluated", mode: "enforce", state: "unevaluated", absent: "slice ceiling"},
