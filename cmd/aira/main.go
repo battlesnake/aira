@@ -2306,6 +2306,11 @@ func buildRequest(verb string, positional []string, options map[string]string) (
 			return core.Request{}, fmt.Errorf("reconcile accepts no positional arguments")
 		}
 		args["rebuild"] = options["rebuild"] == "true"
+	case "intent-retire":
+		if len(positional) != 1 || strings.TrimSpace(positional[0]) == "" {
+			return core.Request{}, errors.New("E_SELECTOR_INVALID: intent-retire requires exactly one selector")
+		}
+		args["selector"] = positional[0]
 	case "check":
 		if len(positional) != 0 {
 			return core.Request{}, fmt.Errorf("check accepts no positional arguments")

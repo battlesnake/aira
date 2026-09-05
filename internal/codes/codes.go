@@ -127,10 +127,19 @@ var ExitCodes = map[string]int{
 	// the deleted outbox.resolution mechanism. Nothing ever produced it, and
 	// after the deletion nothing can, so cataloguing it would advertise a
 	// vocabulary item to the Skill face that cannot occur.
-	"E_PATH_INTENT_BUSY":  1,
-	"E_CLOCK_UNAVAILABLE": 1,
-	"E_TRACE_DANGLING":    1,
-	"W_TRACE_UNCOVERED":   0, "W_TRACE_UNVERIFIED": 0,
+	"E_PATH_INTENT_BUSY": 1,
+	// The explicit-retire vocabulary that closes AIRA-73's other half. Both
+	// refusals sit in the same family as E_WRITE_CONFLICT and E_PATH_INTENT_BUSY
+	// above — a durable-state refusal, not a usage error — so both exit 1.
+	// U_INTENT_UNEVALUATED is the third answer the honesty rule requires: when
+	// the on-disk state cannot be read, the intent's disposition is not
+	// established, and reporting that as a conflict (a fake fail) or as a
+	// successful retire (a fake pass) is exactly what AIRA refuses to do.
+	"E_INTENT_NOT_PENDING": 1, "E_INTENT_REPLAYABLE": 1,
+	"U_INTENT_UNEVALUATED": 3,
+	"E_CLOCK_UNAVAILABLE":  1,
+	"E_TRACE_DANGLING":     1,
+	"W_TRACE_UNCOVERED":    0, "W_TRACE_UNVERIFIED": 0,
 	"U_TRACE_UNSCANNED": 3, "U_TRACE_EMPTY": 3,
 	"E_GATE_INVALID": 2, "E_GATE_KIND_INVALID": 2, "E_GATE_CANARY_INVALID": 2,
 	"E_GATE_EXISTS": 1, "U_GATE_SET_EMPTY": 3,

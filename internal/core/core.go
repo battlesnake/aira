@@ -160,6 +160,7 @@ type Store interface {
 	Ready(string) ([]store.ReadyRecord, error)
 	Reconcile(context.Context) error
 	Rebuild(context.Context) error
+	RetireIntent(context.Context, string) (store.RetireResult, error)
 	Check(context.Context) (store.CheckReport, error)
 	AddTestReport(context.Context, domain.TestReportInput) (store.TestReportAddResult, error)
 	ListTestReports(string) ([]domain.TestReport, error)
@@ -1863,6 +1864,23 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			return data, nil
 		}},
+		// AIRA-73: the retire half of the crash matrix's "explicit
+		// materialise/retire resolution". Named intent-retire rather than
+		// retire so it cannot be confused with the ticket status of the same
+		// word (`aira mv AIRA-1 retired`).
+		"intent-retire": {Name: "intent-retire", Usage: "intent-retire <seq|reconcile:<worktree>:<seq>|path>",
+			Args:    []ArgSpec{stringSpec("selector", true, true, "Outbox sequence, reconciliation finding key, or the intent's path (a relative path resolves against the worktree root)")},
+			MCPTool: "aira_intent_retire", Run: func(ctx context.Context, args *argAccessor) (any, error) {
+				result, err := c.store.RetireIntent(ctx, stringArg(args, "selector"))
+				if err != nil {
+					return nil, err
+				}
+				data := map[string]any{"retired": true, "seq": result.Seq, "path": result.Path, "verb": result.Verb}
+				if result.AllocationID != "" {
+					data["allocation_id"] = result.AllocationID
+				}
+				return mutationData(data, result.Event), nil
+			}},
 		"check": {Name: "check", Usage: "check", Args: []ArgSpec{}, MCPTool: "aira_check", Run: func(ctx context.Context, _ *argAccessor) (any, error) {
 			report, err := c.store.Check(ctx)
 			if err != nil {
@@ -2054,7 +2072,12 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		"run-kill":  {summary: "Kill an owned run scope", safety: SafetyExecute, example: []string{"RUN-1"}},
 		"run-log":   {summary: "Read captured run output", safety: SafetyRead, example: []string{"RUN-1", "--stream", "out"}},
 		"reconcile": {summary: "Reconcile derived project state", safety: SafetyReconcile, example: []string{"--rebuild"}},
-		"check":     {summary: "Check project consistency", safety: SafetyReconcile, example: []string{}},
+		// The example is the bare-sequence form on purpose: the finding-key form
+		// names a worktree, so no fixed example of it can be a working command in
+		// an arbitrary checkout. Usage and the arg description carry all three
+		// forms.
+		"intent-retire": {summary: "Abandon one conflicted pending path intent without touching the working tree", safety: SafetyReconcile, destructive: true, example: []string{"7"}},
+		"check":         {summary: "Check project consistency", safety: SafetyReconcile, example: []string{}},
 		"insights": {summary: "Read honest drillable insight gauges", safety: SafetyRead, operations: []OperationSpec{
 			{Name: "ls", Summary: "List registered insight gauges", Safety: SafetyRead, Args: nil, Example: []string{"ls"}},
 			{Name: "show", Summary: "Compute one or all live insight gauges", Safety: SafetyRead, Args: []OperationArg{{Name: "name"}}, Example: []string{"show", "reviewer-verdict-ratio"}},
