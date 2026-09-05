@@ -203,16 +203,24 @@ type ConfineSliceReserve struct {
 	// false P0 from this same blind spot; the aggregate line it added is
 	// demonstrably not sufficient on its own.
 	//
-	// Every row is a GRANTED, accounted, scope-less waiter, derived in the same
-	// locked pass as every count above, so rows and totals always describe one
-	// instant. Truncated to the longest-held few (the renderer says how many were
-	// elided); an empty slice is a real "none", never an unevaluated read, for the
-	// same reason Exclusive's nil is.
+	// Every row is a GRANTED, accounted, scope-less waiter — EXACTLY the
+	// population ReservationJobs/ReservationBytes already count, no wider and no
+	// narrower — derived in the same locked pass as every count above, so rows and
+	// totals always describe one instant. Truncated to the longest-held few (the
+	// renderer says how many were elided); an empty slice is a real "none", never
+	// an unevaluated read, for the same reason Exclusive's nil is.
+	//
+	// "Scope-less" is a structural fact, not a verb: `aira confine-reserve` is
+	// overwhelmingly what lands here, but any admission that creates no cgroup
+	// scope does — `aira run` among them. The rows therefore say what the daemon
+	// KNOWS (granted, this big, held this long, under this signature) and never
+	// name a verb it did not observe. This is the pre-existing shape of the
+	// aggregate above; the rows make it visible rather than change it.
 	Reservations []ConfineReservationHold `json:"reservations,omitempty"`
 }
 
-// ConfineReservationHold is one scope-less admission reservation the daemon is
-// holding right now — an `aira confine-reserve --pinned` per-test RAM lease.
+// ConfineReservationHold is one scope-less admission the daemon is holding right
+// now — typically an `aira confine-reserve --pinned` per-test RAM lease.
 type ConfineReservationHold struct {
 	// State is always "holding" today, and is nevertheless carried on the wire
 	// rather than left implicit. A row that does not SAY what it is leaves the
