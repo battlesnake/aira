@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"aira/internal/runner"
+	"aira/internal/testdeadline"
 )
 
 // AIRA-64 gate tests.
@@ -453,7 +454,7 @@ func TestCPUGateSpeculativeRequestNeverBlocksOnTheGate(t *testing.T) {
 			response.Reason != runner.WorkerAdmitReasonAdmitLocksBusy {
 			t.Fatalf("want denied/contended/admit-locks-busy, got %+v", response)
 		}
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("a speculative request blocked on a gate another job holds -- this freezes the supervisor's single-threaded dispatch loop")
 	}
 }
@@ -534,7 +535,7 @@ func TestCPUGateSpeculativeRequestNeverBlocksOnTheOuterScopeLock(t *testing.T) {
 			response.Reason != runner.WorkerAdmitReasonAdmitLocksBusy {
 			t.Fatalf("want denied/contended/admit-locks-busy, got %+v", response)
 		}
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("a speculative request blocked on the outer-scope lock -- that lock is held " +
 			"across a cgroupfs scan and a scope creation, so this freezes the supervisor's " +
 			"single-threaded dispatch loop behind another job")
@@ -571,7 +572,7 @@ func TestNonSpeculativeRequestStillWaitsForTheOuterScopeLock(t *testing.T) {
 		if response.State != runner.WorkerAdmitStateGranted {
 			t.Fatalf("once the lock frees, the waiting request must proceed: %+v", response)
 		}
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("the waiting request never proceeded after the lock was released")
 	}
 }
@@ -614,7 +615,7 @@ func TestCPUSlotsCachedReadDoesNotBlockBehindAnInProgressScan(t *testing.T) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		close(release)
 		t.Fatal("a cached CPU-slot read blocked behind another caller's in-progress scan; " +
 			"that mutex sits in front of both try-acquired locks, so this is a dispatch-loop freeze")

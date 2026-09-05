@@ -13,6 +13,7 @@ import (
 
 	"aira/internal/core"
 	"aira/internal/runner"
+	"aira/internal/testdeadline"
 )
 
 const testCeilingQuantum = int64(256 << 20)
@@ -611,7 +612,7 @@ func TestSliceCeilingThrottleReachesCapacityOnly(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read after the ceiling lifted: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("the waiter was not granted after the ceiling recovered")
 	}
 	_ = clientConn.Close()
@@ -1019,7 +1020,7 @@ func TestSliceCeilingDoesNotReachTheOOMEscalationClamp(t *testing.T) {
 		}
 	case err := <-errs:
 		t.Fatalf("read after the ceiling lifted: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("no grant after the ceiling recovered")
 	}
 	_ = clientConn.Close()
