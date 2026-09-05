@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-33","project":"aira","title":"aitest Slice 4 — retire aira_xdist_governor / governor-slot / daemon governor.go","status":"in-review","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["aitest","cleanup","pytest"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-33","project":"aira","title":"aitest Slice 4 — retire aira_xdist_governor / governor-slot / daemon governor.go","status":"done","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["aitest","cleanup","pytest"],"hold":false,"relations":[]}
 ---
 Spec: docs/superpowers/specs/2026-09-01-aitest-design.md (§3.8, §5 Slice 4, §6).
 
