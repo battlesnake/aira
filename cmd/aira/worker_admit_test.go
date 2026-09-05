@@ -1,12 +1,11 @@
 package main
 
 import (
+	"aira/internal/codes"
 	"bytes"
 	"context"
 	"strings"
 	"testing"
-
-	"aira/internal/store"
 )
 
 func TestParseWorkerAdmitArgsRequiresJobIDOuterScopeAndEstimatedBytes(t *testing.T) {
@@ -35,7 +34,7 @@ func TestRunWorkerAdmitCommandRejectsEstimatedBytesBelowOneMiBFloor(t *testing.T
 		"job-id": "job-1", "outer-scope": "/outer", "estimated-bytes": "100000", // ~98 KiB, below the 1 MiB floor
 	}
 	exit := runWorkerAdmitCommand(context.Background(), options, strings.NewReader(""), &stdout, &stderr)
-	if want := store.ExitForCode("E_CONFINE_ARGUMENT_INVALID"); exit != want {
+	if want := codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID"); exit != want {
 		t.Fatalf("exit=%d want %d (E_CONFINE_ARGUMENT_INVALID); stderr=%s", exit, want, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "--estimated-bytes") || !strings.Contains(stderr.String(), "1MiB") {
@@ -56,7 +55,7 @@ func TestRunWorkerAdmitCommandRejectsEstimatedBytesAboveOnePiBCeiling(t *testing
 		"job-id": "job-1", "outer-scope": "/outer", "estimated-bytes": "2000000000000000", // 2 * 10^15, above 1<<50 (~1.126 * 10^15)
 	}
 	exit := runWorkerAdmitCommand(context.Background(), options, strings.NewReader(""), &stdout, &stderr)
-	if want := store.ExitForCode("E_CONFINE_ARGUMENT_INVALID"); exit != want {
+	if want := codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID"); exit != want {
 		t.Fatalf("exit=%d want %d (E_CONFINE_ARGUMENT_INVALID); stderr=%s", exit, want, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "--estimated-bytes") || !strings.Contains(stderr.String(), "1PiB") {

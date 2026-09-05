@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"aira/internal/codes"
 	"aira/internal/domain"
 	"aira/internal/gate"
 	"aira/internal/gitcontext"
@@ -506,7 +507,7 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 	spec, ok := c.verbs[verb]
 	if !ok {
 		code := "E_UNKNOWN_VERB"
-		return Response{Code: code, Error: fmt.Sprintf("unknown verb %q", req.Verb), Exit: store.ExitForCode(code)}
+		return Response{Code: code, Error: fmt.Sprintf("unknown verb %q", req.Verb), Exit: codes.ExitForCode(code)}
 	}
 	args := newArgAccessor(req.Args)
 	if req.HasContent || req.Content != nil {
@@ -550,18 +551,18 @@ func (c *Core) Do(ctx context.Context, req Request) Response {
 		if handlerError == "" {
 			handlerError = handlerCode
 		}
-		return Response{OK: false, Code: handlerCode, Data: data, Error: handlerError, Exit: store.ExitForCode(handlerCode)}
+		return Response{OK: false, Code: handlerCode, Data: data, Error: handlerError, Exit: codes.ExitForCode(handlerCode)}
 	}
 	if output, ok := data.(outputReadData); ok {
 		if output.Err != nil {
 			code := store.ErrorCode(output.Err)
-			return Response{OK: false, Code: code, Data: output.Chunk, Error: output.Err.Error(), Exit: store.ExitForCode(code)}
+			return Response{OK: false, Code: code, Data: output.Chunk, Error: output.Err.Error(), Exit: codes.ExitForCode(code)}
 		}
 		data = output.Chunk
 	}
 	if record, ok := runRecord(data); ok {
 		if code := runRecordCode(record); code != "" {
-			return Response{OK: false, Code: code, Data: data, Error: code, Exit: store.ExitForCode(code)}
+			return Response{OK: false, Code: code, Data: data, Error: code, Exit: codes.ExitForCode(code)}
 		}
 	}
 	if report, ok := data.(store.CheckReport); ok {
@@ -2747,7 +2748,7 @@ func verdictExit(verdict string) int {
 }
 
 func errorExit(code string) int {
-	return store.ExitForCode(code)
+	return codes.ExitForCode(code)
 }
 
 func mutationData(data map[string]any, event store.EventKey) map[string]any {

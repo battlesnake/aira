@@ -1,6 +1,10 @@
 package store
 
-import "testing"
+import (
+	"testing"
+
+	"aira/internal/codes"
+)
 
 func TestM20StableExitCodes(t *testing.T) {
 	want := map[string]int{
@@ -9,7 +13,7 @@ func TestM20StableExitCodes(t *testing.T) {
 		"U_RUN_SUPERVISOR_STALLED": 3, "U_RUN_LAUNCH_STALLED": 3, "U_RUN_EXIT_CONFLICT": 3,
 	}
 	for code, exit := range want {
-		if got := ExitForCode(code); got != exit {
+		if got := codes.ExitForCode(code); got != exit {
 			t.Fatalf("%s exit=%d want=%d", code, got, exit)
 		}
 	}

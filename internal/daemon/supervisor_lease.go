@@ -11,8 +11,10 @@ import (
 	"strconv"
 	"strings"
 
+	"aira/internal/codes"
 	"aira/internal/core"
 	"aira/internal/store"
+
 	"golang.org/x/sys/unix"
 )
 
@@ -48,7 +50,7 @@ func unixPeerCredential(conn net.Conn) (uid, pid int, err error) {
 }
 
 func leaseProtocolError(message string) core.Response {
-	return core.Response{Code: CodeProtocol, Error: CodeProtocol + ": " + message, Exit: store.ExitForCode(CodeProtocol)}
+	return core.Response{Code: CodeProtocol, Error: CodeProtocol + ": " + message, Exit: codes.ExitForCode(CodeProtocol)}
 }
 
 func leaseStoreError(err error) core.Response {
@@ -56,7 +58,7 @@ func leaseStoreError(err error) core.Response {
 	if code == "E_INTERNAL" {
 		code = CodeInternal
 	}
-	return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+	return core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 }
 
 func leaseIntArg(args map[string]any, name string) (int64, error) {

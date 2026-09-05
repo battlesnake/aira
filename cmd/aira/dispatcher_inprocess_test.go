@@ -23,12 +23,14 @@ import (
 
 	"aira/internal/app"
 	"aira/internal/cgrouptest"
+	"aira/internal/codes"
 	"aira/internal/core"
 	"aira/internal/daemon"
 	"aira/internal/domain"
 	"aira/internal/gitcontext"
 	"aira/internal/runner"
 	"aira/internal/store"
+
 	"golang.org/x/sys/unix"
 )
 
@@ -1414,7 +1416,7 @@ func TestEjectWithoutSelectorAndWithoutCurrentConfigIsENoProject(t *testing.T) {
 		return core.Response{OK: true, Code: "OK"}
 	})
 	var stdout, stderr bytes.Buffer
-	if exit := runWithInputDispatcher([]string{"eject"}, &stdout, &stderr, strings.NewReader(""), dispatcher); exit != store.ExitForCode("E_NO_PROJECT") {
+	if exit := runWithInputDispatcher([]string{"eject"}, &stdout, &stderr, strings.NewReader(""), dispatcher); exit != codes.ExitForCode("E_NO_PROJECT") {
 		t.Fatalf("exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
 	}
 	// stdout here is a bytes.Buffer, not a real terminal, so the TTY-aware

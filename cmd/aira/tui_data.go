@@ -22,7 +22,7 @@ func decodeTUIResponse(response core.Response, target any) string {
 		if response.Code != "" {
 			return response.Code
 		}
-		return "E_UNKNOWN"
+		return "E_TUI_UNKNOWN"
 	}
 	raw := response.RawData
 	if len(raw) == 0 {
@@ -99,7 +99,7 @@ func fetchTUIView(ctx context.Context, dispatcher Dispatcher, scope daemon.Workt
 
 func dispatchTUIData(ctx context.Context, dispatcher Dispatcher, scope daemon.WorktreeScope, request core.Request, target any) string {
 	if err := ctx.Err(); err != nil {
-		return "E_CANCELLED"
+		return "E_TUI_CANCELLED"
 	}
 	return decodeTUIResponse(dispatcher.Dispatch(ctx, scope, request), target)
 }

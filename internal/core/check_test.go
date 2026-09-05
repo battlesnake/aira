@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"aira/internal/codes"
 	"aira/internal/store"
 )
 
@@ -83,7 +84,7 @@ func TestCancelledCheckProducesRuntimeUnevaluatedExitThree(t *testing.T) {
 }
 
 func TestAlreadyInitializedUsesInvalidInvocationExitCode(t *testing.T) {
-	if got := store.ExitForCode("E_ALREADY_INITIALIZED"); got != 2 {
+	if got := codes.ExitForCode("E_ALREADY_INITIALIZED"); got != 2 {
 		t.Fatalf("already initialized exit=%d, want 2", got)
 	}
 }

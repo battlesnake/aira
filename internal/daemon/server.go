@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"aira/internal/app"
+	"aira/internal/codes"
 	"aira/internal/core"
 	"aira/internal/runner"
 	"aira/internal/store"
@@ -676,7 +677,7 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		response = s.Handle(ctx, request.Scope, request.Request)
 	} else if core.CanonicalVerb(request.Request.Verb) == "init" {
 		if !request.Scope.Bootstrap {
-			response = core.Response{Code: CodeProjectInvalid, Error: CodeProjectInvalid + ": init requires a bootstrap scope", Exit: store.ExitForCode(CodeProjectInvalid)}
+			response = core.Response{Code: CodeProjectInvalid, Error: CodeProjectInvalid + ": init requires a bootstrap scope", Exit: codes.ExitForCode(CodeProjectInvalid)}
 		} else {
 			response = s.bootstrap(ctx, request.Scope, request.Request.Args)
 		}
@@ -689,7 +690,7 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 			} else if code == "E_INTERNAL" {
 				code = CodeInternal
 			}
-			response = core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+			response = core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 		} else {
 			response = dispatcher.Do(ctx, request.Request)
 		}
@@ -746,12 +747,12 @@ func readInboundFrame(r io.Reader) (*RequestFrame, *StoreOpFrame, error) {
 func (s *Server) bootstrap(ctx context.Context, scope WorktreeScope, args map[string]any) core.Response {
 	projectID, worktreeID, err := store.CanonicalScopeIdentity(scope.CommonDir, scope.GitDir)
 	if err != nil || scope.ProjectID != projectID || scope.WorktreeID != worktreeID {
-		return core.Response{Code: CodeProjectInvalid, Error: CodeProjectInvalid + ": bootstrap identity does not match canonical paths", Exit: store.ExitForCode(CodeProjectInvalid)}
+		return core.Response{Code: CodeProjectInvalid, Error: CodeProjectInvalid + ": bootstrap identity does not match canonical paths", Exit: codes.ExitForCode(CodeProjectInvalid)}
 	}
 	plan, err := app.PrepareInit(ctx, scope.Root, args)
 	if err != nil {
 		code := store.ErrorCode(err)
-		return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+		return core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 	}
 	planRoot, _ := canonicalPath(plan.Project.Root)
 	planCommon, _ := canonicalPath(plan.Project.CommonDir)
@@ -760,16 +761,16 @@ func (s *Server) bootstrap(ctx context.Context, scope WorktreeScope, args map[st
 	scopeCommon, _ := canonicalPath(scope.CommonDir)
 	scopeGit, _ := canonicalPath(scope.GitDir)
 	if planRoot != scopeRoot || planCommon != scopeCommon || planGit != scopeGit || plan.Project.ProjectID != projectID || plan.Project.WorktreeID != worktreeID {
-		return core.Response{Code: CodeProjectInvalid, Error: CodeProjectInvalid + ": bootstrap git discovery disagrees with descriptor", Exit: store.ExitForCode(CodeProjectInvalid)}
+		return core.Response{Code: CodeProjectInvalid, Error: CodeProjectInvalid + ": bootstrap git discovery disagrees with descriptor", Exit: codes.ExitForCode(CodeProjectInvalid)}
 	}
 	reviewPolicy, err := store.LoadReviewPolicy(plan.Project.Config.Project.Review)
 	if err != nil {
 		code := store.ErrorCode(err)
-		return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+		return core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 	}
 	configBytes, err := json.Marshal(plan.Project.Config)
 	if err != nil {
-		return core.Response{Code: CodeInternal, Error: CodeInternal + ": cannot digest bootstrap config", Exit: store.ExitForCode(CodeInternal)}
+		return core.Response{Code: CodeInternal, Error: CodeInternal + ": cannot digest bootstrap config", Exit: codes.ExitForCode(CodeInternal)}
 	}
 	digest := sha256.Sum256(configBytes)
 	configDigest := hex.EncodeToString(digest[:])
@@ -798,7 +799,7 @@ func (s *Server) bootstrap(ctx context.Context, scope WorktreeScope, args map[st
 		if strings.HasPrefix(err.Error(), CodeProjectInvalid) {
 			code = CodeProjectInvalid
 		}
-		return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+		return core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 	}
 	if lifecycleBootstrap {
 		if err := view.PreflightAdoption(ctx); err != nil {
@@ -830,7 +831,7 @@ func (s *Server) bootstrap(ctx context.Context, scope WorktreeScope, args map[st
 		staged = false
 	} else if err := app.CommitInit(plan); err != nil {
 		code := store.ErrorCode(err)
-		return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+		return core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 	}
 	key := strings.Join([]string{planRoot, planCommon, planGit, worktreeID, configDigest}, "\x00")
 	s.mu.Lock()
@@ -878,7 +879,7 @@ func (s *Server) ensureScope(ctx context.Context, scope WorktreeScope) core.Resp
 		} else if code == "E_INTERNAL" {
 			code = CodeInternal
 		}
-		return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+		return core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 	}
 	return core.Response{OK: true, Code: "OK"}
 }

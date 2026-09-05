@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"aira/internal/codes"
 	"aira/internal/domain"
 	"aira/internal/gate"
 )
@@ -222,7 +223,7 @@ func TestSeedDigestInvalidatesOnDemandProof(t *testing.T) {
 
 func TestGateCatalogRegistersDeferredRatchetCodesWithoutRatchetPath(t *testing.T) {
 	for _, code := range []string{"E_GATE_RATCHET_REGRESSED", "U_GATE_BASELINE_MISSING", "U_GATE_INCOMPARABLE", "E_GATE_BASELINE_INVALID"} {
-		if _, ok := ExitCodes[code]; !ok {
+		if _, ok := codes.ExitCodes[code]; !ok {
 			t.Fatalf("catalog missing %s", code)
 		}
 	}

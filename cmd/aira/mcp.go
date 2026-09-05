@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"aira/internal/codes"
 	"aira/internal/core"
 	"aira/internal/runner"
 	"aira/internal/store"
@@ -377,12 +378,12 @@ func (s *mcpServer) call(ctx context.Context, id any, raw json.RawMessage) mcpRe
 		// worktree scope, so it cannot honour an override. Refuse rather than
 		// accept and discard it.
 		message := fmt.Sprintf("E_ARGUMENT_INVALID: argument %q is not supported by this face", scopeDirArgument)
-		return toolResponse(id, core.Response{Code: "E_ARGUMENT_INVALID", Error: message, Exit: store.ExitForCode("E_ARGUMENT_INVALID")})
+		return toolResponse(id, core.Response{Code: "E_ARGUMENT_INVALID", Error: message, Exit: codes.ExitForCode("E_ARGUMENT_INVALID")})
 	}
 	dispatcher, closeFn, err := s.provider(ctx, request)
 	if err != nil {
 		code := store.ErrorCode(err)
-		response := core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
+		response := core.Response{Code: code, Error: err.Error(), Exit: codes.ExitForCode(code)}
 		return toolResponse(id, response)
 	}
 	if closeFn != nil {
@@ -627,7 +628,7 @@ func toolResponse(id any, response core.Response) mcpResponse {
 }
 
 func stableArgumentData(message string) map[string]any {
-	return map[string]any{"code": "E_ARGUMENT_INVALID", "exit": store.ExitForCode("E_ARGUMENT_INVALID"), "message": message}
+	return map[string]any{"code": "E_ARGUMENT_INVALID", "exit": codes.ExitForCode("E_ARGUMENT_INVALID"), "message": message}
 }
 
 func resultResponse(id any, result any) mcpResponse {

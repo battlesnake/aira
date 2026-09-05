@@ -3,7 +3,7 @@ package core
 import (
 	"sort"
 
-	"aira/internal/store"
+	"aira/internal/codes"
 )
 
 // ResponseContractSpec is the transport-neutral response contract projected
@@ -23,11 +23,11 @@ type ResponseContractSpec struct {
 // from verdictExit — the same function Do uses — so the contract cannot drift
 // from real dispatch behaviour.
 func ResponseContract() ResponseContractSpec {
-	exitCodes := make(map[string]int, len(store.ExitCodes)+4)
-	for code, exit := range store.ExitCodes {
+	exitCodes := make(map[string]int, len(codes.ExitCodes)+4)
+	for code, exit := range codes.ExitCodes {
 		exitCodes[code] = exit
 	}
-	// Verdict codes are not error codes and are not in store.ExitCodes; derive
+	// Verdict codes are not error codes and are not in codes.ExitCodes; derive
 	// their exits from the authoritative verdictExit so a change there cannot
 	// leave this contract lying.
 	exitCodes["OK"] = verdictExit("")
@@ -44,6 +44,6 @@ func ResponseContract() ResponseContractSpec {
 		Verdicts:          []string{"pass", "fail", "unevaluated"},
 		UnevaluatedIsPass: false,
 		ExitCodes:         exitCodes,
-		DefaultExit:       store.ExitForCode("E_CODE_NOT_IN_MAP_SENTINEL"),
+		DefaultExit:       codes.ExitForCode("E_CODE_NOT_IN_MAP_SENTINEL"),
 	}
 }
