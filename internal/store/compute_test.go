@@ -203,7 +203,7 @@ func TestComputeGitContextMigrationPreservesOldRowsAndResumesPartialPair(t *test
 			}
 			t.Cleanup(func() { _ = s.Close() })
 			for _, column := range []string{"head_hash", "head_hash_status", "head_ref", "head_ref_status", "worktree_id", "worktree_id_status"} {
-				if !hasTableColumn(context.Background(), s.db, "compute_events", column) {
+				if !columnPresent(t, s.db, "compute_events", column) {
 					t.Fatalf("migration omitted %s", column)
 				}
 			}
