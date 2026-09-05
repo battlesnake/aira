@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-104","project":"aira","title":"aira confine job resource profile: surface durable peak-RSS (already captured) and add CPU-time/pids-peak, for exclusive-mode benchmarking","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["confine","dogfood","observability"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-104","project":"aira","title":"aira confine job resource profile: surface durable peak-RSS (already captured) and add CPU-time/pids-peak, for exclusive-mode benchmarking","status":"in-progress","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["confine","dogfood","observability"],"hold":false,"relations":[]}
 ---
 Direct owner request (2026-09-05), motivated by AIRA-101 (`aira confine --exclusive`): after an exclusive run finishes and the slice goes back to empty, make it easy to get a resource-usage measurement for the WHOLE job — peak RSS and other things — covering every subprocess it spawned over its life, not just its own top-level process. The stated purpose: exclusive mode should be usable to measure the total resource requirements of a job that may fork many short-lived subprocesses during its run.
 

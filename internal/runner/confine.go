@@ -190,7 +190,19 @@ type ConfineStatus struct {
 	ScopeMemoryBinding   string                    `json:"scope_memory_binding,omitempty"`
 	ScopeMemoryEffective int64                     `json:"scope_memory_effective,omitempty"`
 	ReserveBasis         string                    `json:"reserve_basis,omitempty"`
-	PeakRSS              *int64                    `json:"peak_rss,omitempty"`
+	// PeakRSS, CPUUser, and CPUSys are AIRA-104's whole-subtree resource
+	// counters: cgroup v2's own memory.peak and cpu.stat for this scope and
+	// every descendant ever charged to it (aitest worker sub-scopes and a
+	// podman --cgroups=split child included), read once at the same teardown
+	// point so a job that forks many short-lived subprocesses is still
+	// measured completely. Nil means unestablished (an unreadable file, or a
+	// kernel too old to carry it), never a fabricated zero -- the same
+	// discipline as every other optional facet on this struct. Named to
+	// mirror RunRecord's existing CPUUser/CPUSys rather than inventing a
+	// single combined usage field.
+	PeakRSS *int64 `json:"peak_rss,omitempty"`
+	CPUUser *int64 `json:"cpu_user,omitempty"`
+	CPUSys  *int64 `json:"cpu_sys,omitempty"`
 	// TerminatedBy is the terminal-attribution facet (AIRA-70, AIRA-91 Part A).
 	// It carries a json tag like its siblings because AIRA-22's durable record
 	// stores this struct, and this is the facet such a record most needs.
@@ -599,7 +611,39 @@ func FormatConfineStatus(status ConfineStatus) string {
 			line += " drained-for=" + (time.Duration(status.ExclusiveDrainedMS) * time.Millisecond).Round(time.Second).String()
 		}
 	}
+	// AIRA-104, placed directly after the exclusive facet so a granted
+	// exclusive run's resource numbers sit next to its exclusivity
+	// attestation -- the motivating use case (AIRA-101 benchmarking), though
+	// these two facets are rendered for every confine job, not only exclusive
+	// ones. Always rendered, on exactly the same discipline as terminated-by
+	// above: an unestablished counter reads as unevaluated, never as a silent
+	// omission or a fabricated zero.
+	if status.PeakRSS != nil {
+		line += " peak-rss=" + FormatConfineBytes(*status.PeakRSS)
+	} else {
+		line += " peak-rss=unevaluated"
+	}
+	if status.CPUUser != nil && status.CPUSys != nil {
+		line += " cpu=" + formatConfineCPUUsec(*status.CPUUser) + "+" + formatConfineCPUUsec(*status.CPUSys)
+	} else {
+		line += " cpu=unevaluated"
+	}
 	return line
+}
+
+// formatConfineCPUUsec renders a cpu.stat usec counter (user or system) as a
+// duration, exact rather than rounded: the CPU-time benchmarking this exists
+// for (AIRA-104) can matter down to sub-second jobs, and rounding to whole
+// seconds -- as the unrelated exclusive drained-for figure above does -- would
+// silently zero those out.
+func formatConfineCPUUsec(usec int64) string {
+	if usec < 0 {
+		return "unknown"
+	}
+	// The usec*1000 -> Duration(ns) multiply only overflows int64 above roughly
+	// 292,471 years of accumulated CPU time -- not reachable by any real
+	// cgroup, so this is treated as unrepresentable rather than guarded against.
+	return (time.Duration(usec) * time.Microsecond).String()
 }
 
 // delegateRAMScopeIDMarker, the scope-id parser and its helpers live in this
