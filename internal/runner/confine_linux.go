@@ -1134,6 +1134,13 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		usage.PeakRSS = nil
 	}
 	result.Status.PeakRSS = usage.PeakRSS
+	// AIRA-104: usage already carries CPUUser/CPUSys from this SAME read
+	// (readCgroupUsage parses cpu.stat alongside memory.peak in one teardown
+	// read) -- no second read, no new timing. Assigned directly, without
+	// PeakRSS's <=0 clamp: a genuinely idle-but-scheduled subtree can read as
+	// zero user or system usec, and that is a real observation, not a bad one.
+	result.Status.CPUUser = usage.CPUUser
+	result.Status.CPUSys = usage.CPUSys
 	// The HIERARCHICAL counter, kept deliberately for reportPeak below: an OOM
 	// anywhere in the job is a signal that the estimate was low, which is an
 	// estimate-quality input rather than a claim made to an operator. AIRA-102

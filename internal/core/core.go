@@ -1695,7 +1695,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("memory_high", false, false, "Scope memory.high reclaim pressure (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			stringSpec("admit_timeout", false, false, "Positive bounded daemon admission wait"),
 			boolSpec("delegate_ram", false, false, "Delegate RAM admission to per-test pinned reservations"),
-			boolSpec("exclusive", false, false, "Run alone in the slice for uncontended benchmarking: stop admitting new jobs, let running ones finish, then run alone. Refuses rather than running non-exclusively; check $AIRA_CONFINE_EXCLUSIVE inside the job and exclusive= on the trailer. Bound the wait with --admit-timeout. Does NOT cover processes placed in the slice by hand, or Docker containers, which run outside it entirely"),
+			boolSpec("exclusive", false, false, "Run alone in the slice for uncontended benchmarking: stop admitting new jobs, let running ones finish, then run alone. Refuses rather than running non-exclusively; check $AIRA_CONFINE_EXCLUSIVE inside the job and exclusive= on the trailer. Bound the wait with --admit-timeout. Does NOT cover processes placed in the slice by hand, or Docker containers, which run outside it entirely. The trailer's peak-rss/cpu are whole-subtree hierarchical counters (aitest worker sub-scopes and a podman --cgroups=split child included); Docker containers are structurally outside the slice and are NOT counted"),
 			boolSpec("detach", false, false, "Run session-independently; report the handle and poll it with confine --status"),
 		}, Run: func(ctx context.Context, args *argAccessor) (any, error) {
 			_ = ctx

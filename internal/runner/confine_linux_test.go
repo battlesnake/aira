@@ -262,6 +262,72 @@ func TestFormatConfineStatusReportsIndependentFacets(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-104's whole-subtree resource counters render as unevaluated,
+// never a fabricated zero or a silent omission, when the teardown read could
+// not establish them.
+func TestFormatConfineStatusReportsResourceFacetsAsUnevaluatedWhenNil(t *testing.T) {
+	line := FormatConfineStatus(ConfineStatus{Slice: "finite.slice"})
+	if !strings.Contains(line, "peak-rss=unevaluated") {
+		t.Fatalf("expected peak-rss=unevaluated, got: %q", line)
+	}
+	if !strings.Contains(line, "cpu=unevaluated") {
+		t.Fatalf("expected cpu=unevaluated, got: %q", line)
+	}
+	if strings.Contains(line, "peak-rss=0") || strings.Contains(line, "cpu=0") {
+		t.Fatalf("an unestablished counter must never render as a fabricated zero: %q", line)
+	}
+}
+
+// verifies: AIRA-104's peak-rss/cpu render the actually-captured values, with
+// cpu naming user and system time separately (mirroring RunRecord's existing
+// CPUUser/CPUSys split rather than a single combined figure).
+func TestFormatConfineStatusReportsResourceFacetsWhenEstablished(t *testing.T) {
+	peak := int64(2 << 30)
+	user := int64(1_500_000) // 1.5s
+	system := int64(250_000) // 0.25s
+	line := FormatConfineStatus(ConfineStatus{
+		Slice: "finite.slice", PeakRSS: &peak, CPUUser: &user, CPUSys: &system,
+	})
+	for _, want := range []string{"peak-rss=2G", "cpu=1.5s+250ms"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("status %q lacks %q", line, want)
+		}
+	}
+}
+
+// verifies: a partially-established CPU read (one of user/system missing,
+// which cpu.stat's own key-value parse can in principle produce) must not
+// render a half-true figure -- the whole cpu= facet reads as unevaluated
+// rather than fabricating the missing half as zero.
+func TestFormatConfineStatusReportsCPUUnevaluatedWhenOnlyOneHalfEstablished(t *testing.T) {
+	user := int64(1_000_000)
+	line := FormatConfineStatus(ConfineStatus{Slice: "finite.slice", CPUUser: &user})
+	if !strings.Contains(line, "cpu=unevaluated") {
+		t.Fatalf("half-established cpu read must read unevaluated, got: %q", line)
+	}
+	if strings.Contains(line, "cpu=1s+") {
+		t.Fatalf("must not fabricate the missing system-time half: %q", line)
+	}
+}
+
+// verifies: the resource facets are placed adjacent to (immediately after)
+// the exclusive facet block, so a granted exclusive run's resource numbers
+// sit next to its exclusivity attestation -- the AIRA-101 benchmarking use
+// case this ticket exists to serve.
+func TestFormatConfineStatusPlacesResourceFacetsAfterExclusive(t *testing.T) {
+	peak := int64(1 << 20)
+	line := FormatConfineStatus(ConfineStatus{
+		Slice: "finite.slice", TerminatedBy: ConfineTerminatedNormal,
+		Exclusive: ConfineExclusiveGranted, ExclusiveDrainedMS: 5000,
+		PeakRSS: &peak,
+	})
+	exclusiveIdx := strings.Index(line, "exclusive=granted")
+	peakIdx := strings.Index(line, "peak-rss=")
+	if exclusiveIdx == -1 || peakIdx == -1 || peakIdx < exclusiveIdx {
+		t.Fatalf("expected peak-rss to follow exclusive on the trailer, got: %q", line)
+	}
+}
+
 // verifies: CPU aging is an independent honesty facet. A successful memory
 // confine must not fabricate aging when cpu delegation or its initial write
 // could not be established.
@@ -977,6 +1043,34 @@ func TestConfineGrantedReserveIsScopeCapAndPeakIsReported(t *testing.T) {
 	result, err := confineWithDeps(context.Background(), ConfineRequest{Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard}, deps)
 	if err != nil || capWritten != 96<<20 || result.Status.ScopeMemoryMax != 96<<20 || result.Status.PeakRSS == nil || *result.Status.PeakRSS != peak || !reported {
 		t.Fatalf("result=%+v err=%v cap=%d reported=%v", result, err, capWritten, reported)
+	}
+}
+
+// verifies: AIRA-104 -- CPUUser/CPUSys reach result.Status from the SAME
+// deps.readUsage call that already yields PeakRSS, with no second read
+// introduced. Also pins that a genuinely-zero CPU reading is preserved
+// (unlike PeakRSS's own <=0 clamp a few lines above it in production code):
+// a real idle-but-scheduled subtree can read zero user or system usec, and
+// that is an observation, not a bad read.
+func TestConfineCPUTimeReachesStatusFromTheSameTeardownRead(t *testing.T) {
+	scope := &confineFakeScope{}
+	deps := confineUnitDeps(scope)
+	deps.admit = func(context.Context, string, ConfineRequest, int64) (admissionResult, error) {
+		return admissionResult{state: "immediate", reserve: 4 << 30, basis: "fallback:daemon-unavailable", release: &confineCountingCloser{}}, nil
+	}
+	deps.writeScopeMemoryCap = func(_ Scope, maximum, high int64, setOOM bool) error { return nil }
+	user, sys := int64(1_500_000), int64(0)
+	deps.readUsage = func(string) cgroupUsage { return cgroupUsage{CPUUser: &user, CPUSys: &sys} }
+	deps.reportPeak = func(context.Context, ConfineRequest, string, *int64, bool) error { return nil }
+	result, err := confineWithDeps(context.Background(), ConfineRequest{Slice: "finite.slice", Argv: []string{"/bin/true"}, SelfPath: os.Args[0], Stderr: io.Discard}, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status.CPUUser == nil || *result.Status.CPUUser != user {
+		t.Fatalf("CPUUser did not reach result.Status: %+v", result.Status)
+	}
+	if result.Status.CPUSys == nil || *result.Status.CPUSys != 0 {
+		t.Fatalf("a genuine zero CPUSys must be preserved, not dropped: %+v", result.Status)
 	}
 }
 

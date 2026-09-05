@@ -447,16 +447,21 @@ func TestFormatConfineStatusUnchangedWithoutContainer(t *testing.T) {
 		Priorities: ConfinePrioritiesApplied, CPUWeight: ConfineCPUWeightAging,
 		TerminatedBy: ConfineTerminatedNormal,
 	}
-	const want = "confine: slice=aira.slice cap=enforced(64G) reserve=2G reserve-basis=pinned:client " +
+	const base = "confine: slice=aira.slice cap=enforced(64G) reserve=2G reserve-basis=pinned:client " +
 		"admission=immediate scope=placed scope-integrity=contained oom.group=set priorities=applied " +
 		"cpu-weight=aging scope-memory.max=not-requested terminated-by=normal"
+	// AIRA-104's resource facets render on every trailer, container or not, and
+	// (per FormatConfineStatus's own ordering) land AFTER container/container-memory
+	// -- both nil here, so both read as unevaluated.
+	const resources = " peak-rss=unevaluated cpu=unevaluated"
+	const want = base + resources
 	if got := FormatConfineStatus(status); got != want {
 		t.Fatalf("trailer drifted for a non-container job:\n got %q\nwant %q", got, want)
 	}
 
 	status.Container = ContainerPlacementPodmanSplitInjected
 	status.ContainerMemory = "injected=2147483648"
-	const wantContainer = want + " container=podman:split-injected container-memory=injected=2147483648"
+	const wantContainer = base + " container=podman:split-injected container-memory=injected=2147483648" + resources
 	if got := FormatConfineStatus(status); got != wantContainer {
 		t.Fatalf("container trailer:\n got %q\nwant %q", got, wantContainer)
 	}
