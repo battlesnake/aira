@@ -1082,11 +1082,9 @@ func (s *Store) initDB(ctx context.Context) error {
 		return err
 	}
 	for _, column := range []string{"wall_ms", "cpu_user", "cpu_sys", "peak_rss"} {
-		if hasTableColumn(ctx, s.db, "compute_events", column) {
-			continue
-		}
-		if _, err := s.db.ExecContext(ctx, `ALTER TABLE compute_events ADD COLUMN `+column+` INTEGER`); err != nil {
-			return translateDBError(err)
+		if err := s.ensureColumnAdded(ctx, "compute_events", column,
+			`ALTER TABLE compute_events ADD COLUMN `+column+` INTEGER`); err != nil {
+			return err
 		}
 	}
 	computeGitColumns := []struct {
@@ -1106,11 +1104,9 @@ func (s *Store) initDB(ctx context.Context) error {
 			CHECK((worktree_id_status IN ('value','mismatch') AND length(worktree_id)>0) OR (worktree_id_status IN ('none','unevaluated') AND worktree_id=''))`},
 	}
 	for _, column := range computeGitColumns {
-		if hasTableColumn(ctx, s.db, "compute_events", column.name) {
-			continue
-		}
-		if _, err := s.db.ExecContext(ctx, `ALTER TABLE compute_events ADD COLUMN `+column.definition); err != nil {
-			return translateDBError(err)
+		if err := s.ensureColumnAdded(ctx, "compute_events", column.name,
+			`ALTER TABLE compute_events ADD COLUMN `+column.definition); err != nil {
+			return err
 		}
 	}
 	if err := s.ensureAreaHintsGeneration(ctx); err != nil {
@@ -1215,42 +1211,70 @@ func (s *Store) ensureRantReviewTriggerCurrent(ctx context.Context) error {
 	return nil
 }
 
+// ensureAreaHintsGeneration adds the area_hints.generation column to a database
+// written before it existed. Guarded against the concurrent-opener race — see
+// ensureColumnAdded (AIRA-97 Finding 1).
 func (s *Store) ensureAreaHintsGeneration(ctx context.Context) error {
-	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(area_hints)`)
+	return s.ensureColumnAdded(ctx, "area_hints", "generation",
+		`ALTER TABLE area_hints ADD COLUMN generation INTEGER NOT NULL DEFAULT 0`)
+}
+
+// ensureOutboxKind adds the outbox.kind column to a database written before it
+// existed. Guarded against the concurrent-opener race — see ensureColumnAdded
+// (AIRA-97 Finding 1).
+func (s *Store) ensureOutboxKind(ctx context.Context) error {
+	return s.ensureColumnAdded(ctx, "outbox", "kind",
+		`ALTER TABLE outbox ADD COLUMN kind TEXT NOT NULL DEFAULT 'ticket-file'`)
+}
+
+// ensureColumnAdded is the guarded form of "add this column if it is absent",
+// and is how a standalone column addition should be made here. (The two
+// multi-statement migrations, ensureAllocationKind and ensureFindingsSchema,
+// still issue their own ALTERs, because their columns must land atomically with
+// other work in one transaction. Their locking is AIRA-97's documented
+// deferral, not an exemption from this pattern.)
+//
+// Several processes Open this one machine-wide database at once (the daemon,
+// the CLI fallback through app.OpenWithDiagnostics, a detached supervisor), so
+// an unguarded check-then-ALTER lets two of them both observe the column absent
+// and both issue the ALTER; the loser gets `duplicate column name` and its
+// whole Open fails (AIRA-97 Finding 1). The cheap read below is ONLY a fast
+// path for the already-migrated case, so a current database takes no write
+// lock; it is not the decision. The decision is re-taken inside a BEGIN
+// IMMEDIATE transaction, which holds the write lock across the re-check, so the
+// process that raced through the fast path and lost finds the column already
+// present and returns without writing.
+//
+// Same shape as ensureProjectOwnershipFKs and ensureOutboxResolutionDropped,
+// which is deliberate: this is one settled pattern, not a third one.
+func (s *Store) ensureColumnAdded(ctx context.Context, table, column, ddl string) error {
+	present, err := tableHasColumn(ctx, s.db, table, column)
 	if err != nil {
 		return translateDBError(err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var cid int
-		var name, columnType string
-		var notNull, primaryKey int
-		var defaultValue sql.NullString
-		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
-			return err
-		}
-		if name == "generation" {
-			return rows.Err()
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	if _, err := s.db.ExecContext(ctx, `ALTER TABLE area_hints ADD COLUMN generation INTEGER NOT NULL DEFAULT 0`); err != nil {
-		return translateDBError(err)
-	}
-	return nil
-}
-
-func (s *Store) ensureOutboxKind(ctx context.Context) error {
-	if hasTableColumn(ctx, s.db, "outbox", "kind") {
+	if present {
 		return nil
 	}
-	_, err := s.db.ExecContext(ctx, `ALTER TABLE outbox ADD COLUMN kind TEXT NOT NULL DEFAULT 'ticket-file'`)
-	return translateDBError(err)
+	return s.withImmediate(ctx, func(conn *sql.Conn) error {
+		return addColumnLocked(ctx, conn, table, column, ddl)
+	})
+}
+
+// addColumnLocked is the write half of ensureColumnAdded, split out so the
+// re-check can be exercised directly: calling it against an already-migrated
+// connection must be a no-op returning nil, which is exactly what the losing
+// side of a two-process race executes. It assumes the caller already holds the
+// write lock (BEGIN IMMEDIATE).
+func addColumnLocked(ctx context.Context, conn schemaConn, table, column, ddl string) error {
+	present, err := tableHasColumn(ctx, conn, table, column)
+	if err != nil {
+		return err
+	}
+	if present {
+		return nil
+	}
+	_, err = conn.ExecContext(ctx, ddl)
+	return err
 }
 
 // ensureOutboxResolutionDropped removes the never-written `outbox.resolution`
@@ -1273,7 +1297,7 @@ func (s *Store) ensureOutboxKind(ctx context.Context) error {
 // two conflicting intents (such a row cannot be produced by this codebase, so
 // its existence means something outside it wrote to the DB). And if the column
 // probe itself cannot be answered, that error is surfaced rather than read as
-// "already migrated" — see outboxHasResolutionColumn.
+// "already migrated" — see tableHasColumn.
 //
 // Concurrency: several processes may Open the same machine-wide database at
 // once (the daemon, the CLI fallback via app.OpenWithDiagnostics, a detached
@@ -1285,7 +1309,7 @@ func (s *Store) ensureOutboxKind(ctx context.Context) error {
 // without attempting a DROP that would fail with "no such column" and take
 // its whole Open down with it.
 func (s *Store) ensureOutboxResolutionDropped(ctx context.Context) error {
-	present, err := outboxHasResolutionColumn(ctx, s.db)
+	present, err := tableHasColumn(ctx, s.db, "outbox", "resolution")
 	if err != nil {
 		return translateDBError(err)
 	}
@@ -1297,48 +1321,13 @@ func (s *Store) ensureOutboxResolutionDropped(ctx context.Context) error {
 	})
 }
 
-// outboxHasResolutionColumn is a fail-closed column probe, deliberately NOT the
-// shared hasTableColumn helper: that one collapses a query error into `false`,
-// which here is indistinguishable from "already migrated" and would silently
-// skip the migration, committing an empty transaction and letting Open succeed
-// against an unmigrated schema. This repo's rule is that a check which cannot
-// establish its result must say so rather than report a convenient answer, so
-// the error is surfaced and Open fails loudly instead. (The shared helper has
-// the same defect for its other callers; that is pre-existing and tracked
-// separately as AIRA-97, not widened into this change.)
-func outboxHasResolutionColumn(ctx context.Context, q interface {
-	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
-}) (bool, error) {
-	rows, err := q.QueryContext(ctx, `PRAGMA table_info(outbox)`)
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-	found := false
-	for rows.Next() {
-		var cid, notNull, pk int
-		var name, columnType string
-		var defaultValue sql.NullString
-		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
-			return false, err
-		}
-		if name == "resolution" {
-			found = true
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return false, err
-	}
-	return found, nil
-}
-
 // dropOutboxResolutionLocked is the write half of ensureOutboxResolutionDropped,
 // split out so the re-check can be exercised directly: calling it against an
 // already-migrated connection must be a no-op returning nil, which is exactly
 // what the losing side of a two-process race executes. It assumes the caller
 // already holds the write lock (BEGIN IMMEDIATE).
-func dropOutboxResolutionLocked(ctx context.Context, conn *sql.Conn) error {
-	present, err := outboxHasResolutionColumn(ctx, conn)
+func dropOutboxResolutionLocked(ctx context.Context, conn schemaConn) error {
+	present, err := tableHasColumn(ctx, conn, "outbox", "resolution")
 	if err != nil {
 		return err
 	}
@@ -1360,9 +1349,15 @@ func dropOutboxResolutionLocked(ctx context.Context, conn *sql.Conn) error {
 // allocationKindSchemaCurrent reports, using only reads, whether both
 // kind-bearing tables already carry the entity-kind column, so an
 // already-migrated Open takes no write lock (the M5 ensureFindingsSchema lesson).
-func (s *Store) allocationKindSchemaCurrent(ctx context.Context) bool {
-	return hasTableColumn(ctx, s.db, "allocations", "kind") &&
-		hasTableColumn(ctx, s.db, "prefix_ownership", "kind")
+// It takes its querier rather than reading s.db so a test can fail one probe
+// and not the other, which is the only way to show the error is propagated
+// rather than collapsed into "not current".
+func allocationKindSchemaCurrent(ctx context.Context, q schemaQuerier) (bool, error) {
+	allocations, err := tableHasColumn(ctx, q, "allocations", "kind")
+	if err != nil || !allocations {
+		return false, err
+	}
+	return tableHasColumn(ctx, q, "prefix_ownership", "kind")
 }
 
 // ensureAllocationKind adds the entity-kind column to the allocations and
@@ -1373,7 +1368,11 @@ func (s *Store) allocationKindSchemaCurrent(ctx context.Context) bool {
 // alters an existing table, so a pre-M9 database reaches these columns only
 // here (the M5 F1 non-transactional-migration lesson applied to two tables).
 func (s *Store) ensureAllocationKind(ctx context.Context) error {
-	if s.allocationKindSchemaCurrent(ctx) {
+	current, err := allocationKindSchemaCurrent(ctx, s.db)
+	if err != nil {
+		return translateDBError(err)
+	}
+	if current {
 		return nil
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1381,7 +1380,11 @@ func (s *Store) ensureAllocationKind(ctx context.Context) error {
 		return translateDBError(err)
 	}
 	defer tx.Rollback()
-	if !hasTableColumn(ctx, tx, "allocations", "kind") {
+	allocations, err := tableHasColumn(ctx, tx, "allocations", "kind")
+	if err != nil {
+		return translateDBError(err)
+	}
+	if !allocations {
 		if _, err := tx.ExecContext(ctx, `ALTER TABLE allocations ADD COLUMN kind TEXT NOT NULL DEFAULT 'ticket'`); err != nil {
 			return translateDBError(err)
 		}
@@ -1389,7 +1392,11 @@ func (s *Store) ensureAllocationKind(ctx context.Context) error {
 	if err := s.runAllocationMigrationHook("after-allocations"); err != nil {
 		return err
 	}
-	if !hasTableColumn(ctx, tx, "prefix_ownership", "kind") {
+	ownership, err := tableHasColumn(ctx, tx, "prefix_ownership", "kind")
+	if err != nil {
+		return translateDBError(err)
+	}
+	if !ownership {
 		if _, err := tx.ExecContext(ctx, `ALTER TABLE prefix_ownership ADD COLUMN kind TEXT NOT NULL DEFAULT 'ticket'`); err != nil {
 			return translateDBError(err)
 		}
@@ -1410,34 +1417,112 @@ func (s *Store) runAllocationMigrationHook(statement string) error {
 	return s.allocationMigrationHook(statement)
 }
 
-func hasTableColumn(ctx context.Context, db interface {
-	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
-}, table, wanted string) bool {
-	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+// schemaQuerier is the read surface a schema probe needs. *sql.DB, *sql.Tx and
+// *sql.Conn all satisfy it, so one probe serves the pool fast path and the
+// in-transaction re-check alike.
+type schemaQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// schemaConn is the read+write surface a locked migration step needs. It is an
+// interface rather than *sql.Conn for one reason: it is the seam that lets a
+// test fail the column probe WITHOUT failing the write, which is the only way
+// to distinguish a probe that fails closed from one that collapses its error
+// into "column absent" and then blindly issues the ALTER.
+type schemaConn interface {
+	schemaQuerier
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// tableHasColumn reports whether table carries the named column. It is a
+// fail-CLOSED probe: a query, scan or iteration error is returned, never
+// collapsed into "the column is absent".
+//
+// That distinction is the whole of AIRA-97 Finding 2. A migration that reads an
+// unanswered probe as a verdict either skips a migration that never ran (when
+// "present" means "return nil") or takes a write branch it was never entitled
+// to take. This repo's rule is that a check which cannot establish its result
+// must say so rather than report a convenient answer, so the error is surfaced
+// and Open fails loudly instead. Same signature and same discipline as
+// tableHasAnyForeignKey.
+//
+// Invariant: this must drain and close its rows before returning. The pool is
+// pinned to a single connection (openOnce sets SetMaxOpenConns(1)), so a
+// *sql.Rows still open on it would hold the only connection, and the
+// fast-path-then-withImmediate handoff in ensureColumnAdded — which asks the
+// pool for that connection — would block forever rather than fail (the caller
+// there is OpenDB's context.Background()). It is what the explicit rows.Close()
+// in the pre-AIRA-97 ensureAreaHintsGeneration was defending.
+//
+// ACCEPTED COVERAGE GAP (AIRA-97, recorded rather than left silent). The gap is
+// PROPAGATION, not leakage: the `defer rows.Close()` below is unconditional, so
+// no return path can skip it and the invariant above holds structurally. What
+// is untested is the Scan-error and rows.Err() returns themselves — every
+// failing querier in the tests fails at QueryContext, so reverting these to the
+// old skip-the-row form stays green. The same gap covers
+// findingsHasCompositePrimaryKey and tableExists's rows.Err()/Close path.
+// Closing it deterministically needs a registered fake driver whose Rows.Next
+// errors after the first row: more machinery than these three returns are
+// worth, but it is the thing to build if that ever changes.
+func tableHasColumn(ctx context.Context, db schemaQuerier, table, wanted string) (bool, error) {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+quoteIdentifier(table)+`)`)
 	if err != nil {
-		return false
+		return false, err
 	}
 	defer rows.Close()
+	found := false
 	for rows.Next() {
 		var cid, notNull, pk int
 		var name, columnType string
 		var defaultValue sql.NullString
-		if rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk) == nil && name == wanted {
-			return true
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return false, err
+		}
+		if name == wanted {
+			found = true
 		}
 	}
-	return false
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return found, nil
 }
 
-func hasTable(ctx context.Context, db interface {
-	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
-}, table string) bool {
+// tableExists reports whether the named table exists, fail-closed for the same
+// reason as tableHasColumn: findingsSchemaCurrent negates this answer, so a
+// collapsed error there would report an unmigrated schema "already current" on
+// the strength of a question that was never answered.
+func tableExists(ctx context.Context, db schemaQuerier, table string) (bool, error) {
 	rows, err := db.QueryContext(ctx, `SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`, table)
 	if err != nil {
-		return false
+		return false, err
 	}
-	defer rows.Close()
-	return rows.Next()
+	exists := rows.Next()
+	err = rows.Err()
+	if closeErr := rows.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+// hasTableColumn is the fail-OPEN form of tableHasColumn: it collapses a probe
+// error into "absent". It is retained for exactly one production caller,
+// ensureSearchFTS, whose own unguarded check-then-CREATE is AIRA-97 Finding 1b
+// and is owned by AIRA-74 — which is rewriting that function, so converting it
+// here would collide with that work. Do not add callers: use tableHasColumn.
+func hasTableColumn(ctx context.Context, db schemaQuerier, table, wanted string) bool {
+	found, err := tableHasColumn(ctx, db, table, wanted)
+	return err == nil && found
+}
+
+// hasTable is the fail-OPEN form of tableExists, retained for the same single
+// caller and the same reason as hasTableColumn. Do not add callers.
+func hasTable(ctx context.Context, db schemaQuerier, table string) bool {
+	exists, err := tableExists(ctx, db, table)
+	return err == nil && exists
 }
 
 func (s *Store) ensureSearchFTS(ctx context.Context) error {
@@ -1462,21 +1547,42 @@ func (s *Store) ensureSearchFTS(ctx context.Context) error {
 // only reads. When true, ensureFindingsSchema is a pure no-op and must NOT open
 // a write transaction — every Open would otherwise take the write lock, adding
 // needless contention for the common already-migrated case.
-func (s *Store) findingsSchemaCurrent(ctx context.Context) bool {
+// It takes its querier rather than reading s.db so a test can fail exactly one
+// of its probes. The findings_m5 probe is the one that matters: its answer is
+// NEGATED, so a collapsed error there used to make this function report an
+// unmigrated schema "already current" on the strength of a question it never
+// answered (AIRA-97 Finding 2).
+func findingsSchemaCurrent(ctx context.Context, q schemaQuerier) (bool, error) {
 	for _, name := range []string{
 		"worktree_id", "subtype", "ticket_id", "category", "severity", "verdict",
 		"disposition", "source", "file", "line", "requirement_id", "waiver_reason",
 		"waiver_actor", "canonical_file", "message",
 	} {
-		if !hasTableColumn(ctx, s.db, "findings", name) {
-			return false
+		present, err := tableHasColumn(ctx, q, "findings", name)
+		if err != nil {
+			return false, err
+		}
+		if !present {
+			return false, nil
 		}
 	}
-	return findingsHasCompositePrimaryKey(ctx, s.db) && !hasTable(ctx, s.db, "findings_m5")
+	composite, err := findingsHasCompositePrimaryKey(ctx, q)
+	if err != nil || !composite {
+		return false, err
+	}
+	orphan, err := tableExists(ctx, q, "findings_m5")
+	if err != nil {
+		return false, err
+	}
+	return !orphan, nil
 }
 
 func (s *Store) ensureFindingsSchema(ctx context.Context) error {
-	if s.findingsSchemaCurrent(ctx) {
+	current, err := findingsSchemaCurrent(ctx, s.db)
+	if err != nil {
+		return translateDBError(err)
+	}
+	if current {
 		return nil
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1497,7 +1603,11 @@ func (s *Store) ensureFindingsSchema(ctx context.Context) error {
 		{"message", `TEXT NOT NULL DEFAULT ''`},
 	}
 	for _, column := range columns {
-		if hasTableColumn(ctx, tx, "findings", column.name) {
+		present, err := tableHasColumn(ctx, tx, "findings", column.name)
+		if err != nil {
+			return translateDBError(err)
+		}
+		if present {
 			continue
 		}
 		if _, err := tx.ExecContext(ctx, `ALTER TABLE findings ADD COLUMN `+column.name+` `+column.definition); err != nil {
@@ -1507,11 +1617,44 @@ func (s *Store) ensureFindingsSchema(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, `UPDATE findings SET subtype=COALESCE(NULLIF(subtype,''),'reconciliation'), message=CASE WHEN message='' THEN details ELSE message END, disposition=CASE WHEN disposition='' THEN 'open' ELSE disposition END`); err != nil {
 		return translateDBError(err)
 	}
-	if findingsHasCompositePrimaryKey(ctx, tx) {
+	// Fail closed on the branch selector itself: the else-branch below DROPs and
+	// rebuilds the findings table, and selecting a destructive rebuild because a
+	// PRAGMA could not be read is the worst form of AIRA-97 Finding 2.
+	//
+	// ACCEPTED COVERAGE GAP (AIRA-97, recorded rather than left silent; widened
+	// from two probes to five by build review, which was right that the first
+	// wording understated it). FIVE probes run on a *sql.Tx that their own
+	// function begins — the three here (column, composite-PK, findings_m5) and
+	// the two in ensureAllocationKind — so there is no seam to fail a probe
+	// without failing the writes, and a mutation that dropped any of those five
+	// errors (`composite, _ := …`) would compile with no test failing. The
+	// stakes are NOT uniform, and saying so is the point of writing it down:
+	// only the composite-PK selector immediately below fails SILENT and
+	// DESTRUCTIVE (a collapsed error picks the DROP-and-rebuild branch). The
+	// other four fail loud — a duplicate-column ALTER, or an INSERT from a
+	// table that is not there — which is why the seam is worth building for
+	// this one first if the gap is ever closed piecemeal.
+	// What IS covered: tableHasColumn, tableExists and
+	// findingsHasCompositePrimaryKey are each shown to surface an unanswerable
+	// probe, and the identical compositions in findingsSchemaCurrent and
+	// allocationKindSchemaCurrent are shown to propagate through their
+	// schemaQuerier seam (migration_guard_test.go). Closing it needs either the
+	// deferred-to-immediate restructuring this ticket defers, or lifting each
+	// transaction body behind schemaConn so a read can be failed while writes
+	// still work — both larger than this change.
+	composite, err := findingsHasCompositePrimaryKey(ctx, tx)
+	if err != nil {
+		return translateDBError(err)
+	}
+	if composite {
 		// If a process died after DROP and before RENAME, initDB has already
 		// recreated an empty modern findings table. Recover any copied rows
 		// before removing the orphan instead of accepting silent data loss.
-		if hasTable(ctx, tx, "findings_m5") {
+		orphan, err := tableExists(ctx, tx, "findings_m5")
+		if err != nil {
+			return translateDBError(err)
+		}
+		if orphan {
 			if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO findings(project_id,worktree_id,finding_key,subtype,code,subject,details,created_at,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,canonical_file,message) SELECT project_id,worktree_id,finding_key,subtype,code,subject,details,created_at,ticket_id,category,severity,verdict,disposition,source,file,line,requirement_id,waiver_reason,waiver_actor,canonical_file,message FROM findings_m5`); err != nil {
 				return translateDBError(err)
 			}
@@ -1563,12 +1706,17 @@ func (s *Store) runFindingsMigrationHook(statement string) error {
 	return s.findingsMigrationHook(statement)
 }
 
-func findingsHasCompositePrimaryKey(ctx context.Context, db interface {
-	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
-}) bool {
+// findingsHasCompositePrimaryKey is fail-closed for the same reason as
+// tableHasColumn, and more urgently: ensureFindingsSchema uses its answer to
+// choose between "adopt the existing table" and "DROP and rebuild it", so a
+// collapsed error would pick a destructive branch on an unanswered question.
+//
+// Its Scan/rows.Err() propagation carries the same accepted coverage gap as
+// tableHasColumn's, for the same reason and with the same structural defence.
+func findingsHasCompositePrimaryKey(ctx context.Context, db schemaQuerier) (bool, error) {
 	rows, err := db.QueryContext(ctx, `PRAGMA table_info(findings)`)
 	if err != nil {
-		return false
+		return false, err
 	}
 	defer rows.Close()
 	project, worktree, key := 0, 0, 0
@@ -1576,8 +1724,8 @@ func findingsHasCompositePrimaryKey(ctx context.Context, db interface {
 		var cid, notNull, pk int
 		var name, columnType string
 		var defaultValue sql.NullString
-		if rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk) != nil {
-			return false
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return false, err
 		}
 		switch name {
 		case "project_id":
@@ -1588,7 +1736,10 @@ func findingsHasCompositePrimaryKey(ctx context.Context, db interface {
 			key = pk
 		}
 	}
-	return project > 0 && worktree > 0 && key > 0
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return project > 0 && worktree > 0 && key > 0, nil
 }
 
 // Register refreshes this project/worktree registration and validates global

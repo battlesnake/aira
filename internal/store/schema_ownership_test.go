@@ -179,36 +179,12 @@ func projectIDTables(t *testing.T, db *sql.DB) []string {
 	}
 	var names []string
 	for _, name := range allTables {
-		if tableHasColumn(t, db, name, "project_id") {
+		if columnPresent(t, db, name, "project_id") {
 			names = append(names, name)
 		}
 	}
 	sort.Strings(names)
 	return names
-}
-
-func tableHasColumn(t *testing.T, db *sql.DB, table, wanted string) bool {
-	t.Helper()
-	rows, err := db.Query(`PRAGMA table_info(` + quoteSQLiteIdentifier(table) + `)`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var cid, notNull, pk int
-		var name, typ string
-		var defaultValue sql.NullString
-		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
-			t.Fatal(err)
-		}
-		if name == wanted {
-			return true
-		}
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	return false
 }
 
 func projectTableCascadesToProjects(t *testing.T, db *sql.DB, table string, visiting map[string]bool) bool {

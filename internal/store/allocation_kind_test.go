@@ -90,8 +90,8 @@ func TestAllocationKindMigrationCrashAfterPrefixOwnershipIsAtomicAndReentrant(t 
 	if err := crashed.ensureAllocationKind(context.Background()); err == nil {
 		t.Fatal("migration unexpectedly completed; crash hook not exercised")
 	}
-	if hasTableColumn(context.Background(), db, "allocations", "kind") ||
-		hasTableColumn(context.Background(), db, "prefix_ownership", "kind") {
+	if columnPresent(t, db, "allocations", "kind") ||
+		columnPresent(t, db, "prefix_ownership", "kind") {
 		t.Fatal("crash after the prefix_ownership ALTER left a table migrated (not atomic)")
 	}
 	recovered := &Store{db: db}
@@ -390,10 +390,10 @@ func createLegacyAllocationDB(t *testing.T, dbPath string) {
 
 func assertAllocationKindMigrated(t *testing.T, db *sql.DB) {
 	t.Helper()
-	if !hasTableColumn(context.Background(), db, "allocations", "kind") {
+	if !columnPresent(t, db, "allocations", "kind") {
 		t.Fatal("allocations.kind column missing after migration")
 	}
-	if !hasTableColumn(context.Background(), db, "prefix_ownership", "kind") {
+	if !columnPresent(t, db, "prefix_ownership", "kind") {
 		t.Fatal("prefix_ownership.kind column missing after migration")
 	}
 	var allocKind, prefixKind string
@@ -450,8 +450,8 @@ func TestAllocationKindMigrationCrashAfterAllocationsIsAtomicAndReentrant(t *tes
 	}
 	// Atomic: the transaction rolled back, so NEITHER table gained the column —
 	// the migration is all-or-nothing across both tables.
-	if hasTableColumn(context.Background(), db, "allocations", "kind") ||
-		hasTableColumn(context.Background(), db, "prefix_ownership", "kind") {
+	if columnPresent(t, db, "allocations", "kind") ||
+		columnPresent(t, db, "prefix_ownership", "kind") {
 		t.Fatal("crash after the allocations ALTER left a table partially migrated")
 	}
 	// Reentrant: re-running without the crash completes cleanly and backfills.
