@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 
 	"aira/internal/domain"
@@ -227,56 +226,31 @@ func TestMigrationReCheckMakesTheLosingRacerANoOp(t *testing.T) {
 	assertOutboxResolutionAbsent(t, db.db)
 }
 
-// TestConcurrentOpensOfALegacyDatabaseAllSucceed is a contention smoke test,
-// NOT the guard for the re-check above — recorded honestly, because the two
-// look similar. The migration window is far too narrow for racing goroutines to
-// land in it reliably (a verified mutation run confirms this test stays green
-// against a migration with the re-check removed), so what it actually
-// establishes is the weaker, still-worth-having property: several simultaneous
-// openers of an unmigrated database all complete, none deadlocks, and none
-// exhausts the busy timeout. The deterministic guard is the test above.
-func TestConcurrentOpensOfALegacyDatabaseAllSucceed(t *testing.T) {
-	base := t.TempDir()
-	path := filepath.Join(base, "state.db")
-	registry := filepath.Join(base, "registry.jsonl")
-	writeLegacyOutboxDatabase(t, path)
-
-	const openers = 6
-	var start sync.WaitGroup
-	var done sync.WaitGroup
-	start.Add(1)
-	errs := make([]error, openers)
-	handles := make([]*DB, openers)
-	for i := 0; i < openers; i++ {
-		done.Add(1)
-		go func(i int) {
-			defer done.Done()
-			start.Wait()
-			handles[i], errs[i] = OpenDB(path, registry)
-		}(i)
-	}
-	start.Done()
-	done.Wait()
-
-	for i, err := range errs {
-		if err != nil {
-			t.Errorf("concurrent opener %d failed: %v", i, err)
-			continue
-		}
-		defer handles[i].Close()
-	}
-	if t.Failed() {
-		t.FailNow()
-	}
-	assertOutboxResolutionAbsent(t, handles[0].db)
-	var rows int
-	if err := handles[0].db.QueryRow(`SELECT count(*) FROM outbox WHERE project_id='kept'`).Scan(&rows); err != nil {
-		t.Fatal(err)
-	}
-	if rows != 2 {
-		t.Fatalf("racing migrations kept %d outbox rows, want 2", rows)
-	}
-}
+// A sibling contention smoke test, TestConcurrentOpensOfALegacyDatabaseAllSucceed
+// (six goroutines racing OpenDB on one unmigrated database), was deleted rather
+// than kept: it cost a real CI flake and bought nothing.
+//
+// It bought nothing: AIRA-73's own build already mutation-tested it against a
+// migration with the in-transaction re-check removed and recorded that it stayed
+// GREEN — the migration window is far too narrow for racing goroutines to land
+// in. The deterministic guard for that direction is
+// TestMigrationReCheckMakesTheLosingRacerANoOp above, which is unaffected.
+//
+// It cost a flake: measured on the merge commit, 3 failures in 40 runs (~7.5%),
+// plus one failure in a full `make ci`, in two modes —
+// `table search_fts already exists (1)` and `E_DB_BUSY: database is locked (5)`.
+//
+// The root cause is NOT this migration, and deleting the test does not hide it.
+// A controlled probe — the same six-way concurrent OpenDB against a legacy
+// database with no `resolution` column, so ensureOutboxResolutionDropped is a
+// pure no-op — still failed 2 of 40 runs with the same `search_fts already
+// exists`. That is ensureSearchFTS's unguarded check-then-CREATE: the same
+// two-process race AIRA-97 Finding 1 records for ensureOutboxKind, at a site
+// AIRA-97 did not name, and it is recorded there now. The `E_DB_BUSY` mode
+// appeared only with the migration present (2/40 vs 0/40), which is AIRA-97's
+// busy-timeout note. Both belong to AIRA-97, and neither is provable by a
+// probabilistic race test: whoever closes AIRA-97 should add a deterministic
+// guard shaped like TestMigrationReCheckMakesTheLosingRacerANoOp.
 
 // TestConflictedIntentHasNoRetirePath is the committed, executable evidence
 // for the half of AIRA-73 this change does NOT close.
