@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-103","project":"aira","title":"Dynamic slice ceiling: shrink aira.slice's memory.max under real system-wide RAM pressure so existing admission throttles","status":"in-review","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","memory-safety","scheduler"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-103","project":"aira","title":"Dynamic slice ceiling: shrink aira.slice's memory.max under real system-wide RAM pressure so existing admission throttles","status":"done","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","memory-safety","scheduler"],"hold":false,"relations":[]}
 ---
 Direct owner request (2026-09-05): monitor free SYSTEM RAM (outside the slice — the desktop, other system load, and per AIRA-102, currently-uncontained Docker containers) and dynamically shrink `aira.slice`'s own memory ceiling when system RAM is getting tight, so admission gets blocked by the slice's EXISTING capacity check even while the slice's own static accounting still shows "room" — rather than adding a second, parallel admission-blocking mechanism.
 
@@ -239,6 +239,12 @@ went RED**, including two that initially did NOT (the reader-level slab fold and
 the OOM-escalation clamp, whose first tests bypassed the wiring they claimed to
 pin and were rewritten to drive the real paths).
 
+### Landed
+
+PR **#47**, squash-merged as **`f6fddbd`** on master (rebased onto `ea82cb8`;
+`git diff origin/master HEAD` was empty after the merge, so the merged tree is
+byte-identical to the one the exit codes below were recorded against).
+
 ### Exit codes (recorded exactly, on the rebased tree, all under `aira confine --`)
 
 - `go build ./...` — **0**
@@ -258,5 +264,13 @@ is NOT small (SwapTotal 20 GiB / SwapFree 14.4 GiB ⇒ ~6.5 GiB swapped, essenti
 all non-slice): the signal measures memory others *occupy*, not memory they
 *need*, so under thrash it is permissive. Same limitation the watchdog has;
 recorded, not fixed.
+
+### NOT DEPLOYED
+
+The rebuilt binary has deliberately NOT been deployed and `aira-daemon.service`
+has NOT been restarted by this build. The subsystem ships `off`, so a deploy
+alone changes nothing; enabling `observe` and then `enforce` is a separate,
+watched step, and the `enforce` flip needs the owner acceptance recorded at the
+top of this Resolution.
 
 Design: `docs/superpowers/specs/2026-09-05-aira103-dynamic-slice-ceiling-design.md`
