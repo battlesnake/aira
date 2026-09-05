@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-41","project":"aira","title":"worker-admit ledger grant survives an abnormally-killed admit relay","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["aitest","hardening"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-41","project":"aira","title":"worker-admit ledger grant survives an abnormally-killed admit relay","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["aitest","hardening"],"hold":false,"relations":[]}
 ---
 Found by Fable build-review (final gate, AIRA-30). Distinct from AIRA-39
 (daemon restart) and AIRA-40 (result-pipe EOF) -- this is a THIRD, separate
@@ -35,3 +35,7 @@ Per the project rule that coverage gaps are written down and accepted by
 reviewers, never silent -- this ticket is that record.
 
 relates AIRA-30, AIRA-38, AIRA-39.
+
+## Resolution
+
+Closed by construction as part of AIRA-39's fix (`internal/daemon/worker_admit.go` — the ledger charges the outer scope's real `.aira-worker-*` children via `Σ memory.max`, not the relay connection, so a killed relay no longer frees anything). Pinned by `worker_admit_test.go:591` (`verifies: AIRA-41`) since that fix landed, and re-confirmed by AIRA-43's later, more thorough real-daemon/real-cgroup contract test (`TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits`, PR #37) — flagged by AIRA-43's own build agent as a status gap this ticket had never recorded. Status transition only; no separate code change.
