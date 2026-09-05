@@ -600,3 +600,133 @@ func TestConfineReserveDescriptorIsCLIOnly(t *testing.T) {
 		}
 	}
 }
+
+// verifies: AIRA-103's `slice ceiling:` line. It exists so an operator waiting on
+// admission can tell external system memory pressure from "the slice happens to
+// be full of AIRA's own jobs", which the reserve line above it cannot
+// distinguish. Every case pins the honesty rule: nothing is printed when the
+// subsystem is off, an unevaluated ceiling prints its REASON and never a number,
+// observe mode says plainly that nothing was applied, and an unestablished
+// MemAvailable prints no figure rather than "0B".
+func TestRenderConfineListCeilingLine(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		reserve runner.ConfineSliceReserve
+		want    []string
+		absent  []string
+	}{
+		{
+			name:    "subsystem-off",
+			reserve: runner.ConfineSliceReserve{GrantedBytes: 1 << 30, CeilingBytes: 12 << 30, Jobs: 1},
+			absent:  []string{"slice ceiling:"},
+		},
+		{
+			name: "throttled",
+			reserve: runner.ConfineSliceReserve{
+				GrantedBytes: 1 << 30, CeilingBytes: 30 << 30, Jobs: 1,
+				CeilingMode: "enforce", CeilingState: "throttled",
+				CeilingStaticBytes: 64 << 30, MemAvailableBytes: 6 << 30,
+			},
+			want: []string{
+				"slice ceiling: reduced below the 64G configured ceiling by memory used OUTSIDE the slice",
+				"(system MemAvailable 6G)",
+				"running jobs are untouched",
+			},
+		},
+		{
+			name: "throttled-draining",
+			reserve: runner.ConfineSliceReserve{
+				GrantedBytes: 40 << 30, CeilingBytes: 30 << 30, Jobs: 4,
+				CeilingMode: "enforce", CeilingState: "throttled", CeilingStaticBytes: 64 << 30,
+			},
+			// granted > ceiling is a DRAIN state, not the ledger inconsistency
+			// the residual line reports; it must say so in its own words.
+			want:   []string{"granted exceeds the effective ceiling by 10G: draining"},
+			absent: []string{"LEDGER INCONSISTENCY", "MemAvailable"},
+		},
+		{
+			name: "unthrottled",
+			reserve: runner.ConfineSliceReserve{
+				CeilingBytes: 62 << 30, CeilingMode: "enforce", CeilingState: "unthrottled",
+				CeilingStaticBytes: 64 << 30, MemAvailableBytes: 34 << 30,
+			},
+			want:   []string{"slice ceiling: at its 64G configured ceiling; not reduced by system memory pressure (system MemAvailable 34G)"},
+			absent: []string{"draining"},
+		},
+		{
+			// In observe mode CeilingBytes is the UNTOUCHED static capacity --
+			// observe applies nothing -- so the counterfactual must be read from
+			// CeilingWouldBeBytes. Rendering CeilingBytes here reported the static
+			// figure as though it were the observed decision, leaving the
+			// observe-then-enforce rollout blind on its own operator surface.
+			name: "observe",
+			reserve: runner.ConfineSliceReserve{
+				CeilingBytes: 62 << 30, CeilingWouldBeBytes: 30 << 30,
+				CeilingMode: "observe", CeilingState: "throttled",
+				CeilingStaticBytes: 64 << 30, MemAvailableBytes: 6 << 30,
+			},
+			want:   []string{"30G would be effective under system memory pressure (observe mode, not applied)"},
+			absent: []string{"62G would be effective"},
+		},
+		{
+			// A HELD ceiling's numbers are up to a TTL old. Rendering them
+			// unmarked states a current fact the daemon cannot establish.
+			name: "held",
+			reserve: runner.ConfineSliceReserve{
+				CeilingBytes: 30 << 30, CeilingMode: "enforce", CeilingState: "throttled",
+				CeilingHeld: true, CeilingReason: "memavailable:read-error",
+				CeilingStaticBytes: 64 << 30, MemAvailableBytes: 6 << 30,
+			},
+			want: []string{"(system MemAvailable 6G, last established)", "holding: memavailable:read-error"},
+		},
+		{
+			// A newer daemon's vocabulary must read as unknown, never be silently
+			// rendered as one of the states this binary happens to know.
+			name: "unrecognised-state",
+			reserve: runner.ConfineSliceReserve{
+				CeilingBytes: 62 << 30, CeilingMode: "enforce", CeilingState: "draining-forever",
+				CeilingStaticBytes: 64 << 30,
+			},
+			want:   []string{`slice ceiling: unevaluated (unrecognised state "draining-forever")`},
+			absent: []string{"configured ceiling"},
+		},
+		{
+			name: "unevaluated",
+			reserve: runner.ConfineSliceReserve{
+				CeilingBytes: 62 << 30, CeilingMode: "enforce", CeilingState: "unevaluated",
+				CeilingReason: "memavailable:read-error",
+			},
+			want:   []string{"slice ceiling: unevaluated (memavailable:read-error)"},
+			absent: []string{"0B", "configured ceiling"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reserve := test.reserve
+			result := runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{}, SliceReserve: &reserve}
+			var stdout, stderr bytes.Buffer
+			if exit := renderConfineListResponse(core.Response{OK: true, Code: "OK", Data: result}, &stdout, &stderr); exit != 0 || stderr.Len() != 0 {
+				t.Fatalf("exit=%d stderr=%q", exit, stderr.String())
+			}
+			for _, want := range test.want {
+				if !strings.Contains(stdout.String(), want) {
+					t.Fatalf("stdout=%q, want %q", stdout.String(), want)
+				}
+			}
+			// Scoped to the ceiling block, so an absence assertion cannot be
+			// satisfied or defeated by the reserve lines above it.
+			ceilingBlock := ""
+			if index := strings.Index(stdout.String(), "slice ceiling:"); index >= 0 {
+				ceilingBlock = stdout.String()[index:]
+			}
+			for _, absent := range test.absent {
+				haystack := ceilingBlock
+				if absent == "slice ceiling:" {
+					haystack = stdout.String()
+				}
+				if strings.Contains(haystack, absent) {
+					t.Fatalf("ceiling block=%q, must not contain %q", haystack, absent)
+				}
+			}
+		})
+	}
+}

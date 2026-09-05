@@ -132,6 +132,35 @@ type ConfineSliceReserve struct {
 	VanishedJobs  int   `json:"vanished_jobs"`
 	VanishedBytes int64 `json:"vanished_bytes"`
 
+	// AIRA-103. WHY the ceiling is what it is. CeilingBytes above already derives
+	// from the EFFECTIVE maximum, so it is honest without these; they exist so an
+	// operator waiting on admission can tell external system memory pressure from
+	// "the slice is simply full of AIRA's own jobs", which the numbers above
+	// cannot distinguish.
+	//
+	// CeilingMode is "" when the subsystem is off, and then every other field
+	// here is meaningless and must not be rendered. CeilingState is
+	// "unthrottled" | "throttled" | "unevaluated" -- the last reserved for a
+	// ceiling that could NOT be established and which must never render as a
+	// number. A zero CeilingStaticBytes or MemAvailableBytes is likewise an
+	// absence, never a measured zero.
+	// CeilingHeld marks a ceiling whose numbers are the LAST ESTABLISHED ones,
+	// not current readings: the newest sample failed and the hold TTL has not yet
+	// expired. Every surface must say so rather than presenting a stale
+	// MemAvailable as the current one.
+	//
+	// CeilingWouldBeBytes is what the ceiling WOULD be if applied. In enforce
+	// mode it equals CeilingBytes; in observe mode it is the counterfactual,
+	// because observe applies nothing and CeilingBytes there is the untouched
+	// static capacity.
+	CeilingMode         string `json:"ceiling_mode,omitempty"`
+	CeilingState        string `json:"ceiling_state,omitempty"`
+	CeilingReason       string `json:"ceiling_reason,omitempty"`
+	CeilingHeld         bool   `json:"ceiling_held,omitempty"`
+	CeilingStaticBytes  int64  `json:"ceiling_static_bytes,omitempty"`
+	CeilingWouldBeBytes int64  `json:"ceiling_would_be_bytes,omitempty"`
+	MemAvailableBytes   int64  `json:"mem_available_bytes,omitempty"`
+
 	// ResidualJobs/ResidualBytes cross-check the derived split against the
 	// daemon's incremental counters. They are equal by construction, so a
 	// non-zero value here is a real lost or double ledger discharge. Signed:

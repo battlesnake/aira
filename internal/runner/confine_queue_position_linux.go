@@ -37,6 +37,16 @@ type confineQueuePosition struct {
 	exclusiveState string
 	exclusiveName  string
 	exclusiveOwner string
+
+	// AIRA-103. Whether this wait is contention among AIRA's own jobs or a
+	// ceiling reduced by memory used OUTSIDE the slice. Without it every wait
+	// reads as the former, which is precisely the misattribution the dynamic
+	// ceiling makes possible: the slice can look far from full while admission
+	// is nonetheless closed. Carried on the SAME AIRA-24 probe -- no extra
+	// round trip, no new verb -- and empty whenever the daemon did not report
+	// it (older daemon, subsystem off, or ceiling unevaluated).
+	ceilingThrottled bool
+	memAvailable     int64
 }
 
 // confineQueueProbeTimeout bounds one probe. It is deliberately far shorter
@@ -121,8 +131,20 @@ func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequ
 	case "held":
 		exclusiveNote = ", slice held exclusively by " + describeExclusiveJob(position)
 	}
+	// AIRA-103. Stated BEFORE the position, and standing on its own for the same
+	// reason the exclusivity clause does: it changes what the position means.
+	// Under a reduced ceiling the queue may not be moving because of anything
+	// AIRA is doing, and an operator reading only "position 4 of 9" would go
+	// looking for the wrong cause.
+	pressure := ""
+	if position.ceilingThrottled {
+		pressure = ", slice ceiling reduced by memory used outside the slice"
+		if position.memAvailable > 0 {
+			pressure += " (system MemAvailable " + FormatConfineBytes(position.memAvailable) + ")"
+		}
+	}
 	if position.position <= 0 || position.queued < position.position {
-		return exclusiveNote
+		return pressure + exclusiveNote
 	}
 	// A known-zero ahead-figure is the head of the queue and must read as the
 	// fact it is; FormatConfineBytes renders any non-positive value as
@@ -138,7 +160,7 @@ func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequ
 	// waiters in front — the reserve already GRANTED to running jobs is much
 	// larger and is not in it; a bare "reserved ahead" invites reading it as
 	// "the memory standing between me and admission", which it is not.
-	return fmt.Sprintf(", queue position %d of %d by enqueue order, %s queued ahead%s", position.position, position.queued, ahead, exclusiveNote)
+	return fmt.Sprintf("%s, queue position %d of %d by enqueue order, %s queued ahead%s", pressure, position.position, position.queued, ahead, exclusiveNote)
 }
 
 // describeExclusiveJob names the exclusive job for the progress line. An unnamed
@@ -256,6 +278,15 @@ func confineQueuePositionFromDaemon(ctx context.Context, request ConfineRequest,
 	ahead := reserve.QueuedAheadBytes
 	if ahead < 0 {
 		return exclusive, exclusive.exclusiveState != ""
+	}
+	// AIRA-103. Only an ENFORCING, established, throttled ceiling is reported as
+	// pressure: observe mode applies nothing, and an unevaluated ceiling is an
+	// absence, not a state to announce to a blocked launcher. A HELD ceiling is
+	// still applied, so it is still reported -- but its MemAvailable figure is up
+	// to a TTL old, so the figure is dropped and only the fact is stated.
+	exclusive.ceilingThrottled = reserve.CeilingMode == "enforce" && reserve.CeilingState == "throttled"
+	if exclusive.ceilingThrottled && !reserve.CeilingHeld && reserve.MemAvailableBytes > 0 {
+		exclusive.memAvailable = reserve.MemAvailableBytes
 	}
 	exclusive.position, exclusive.queued, exclusive.aheadBytes = reserve.QueuePosition, queued, ahead
 	return exclusive, true

@@ -99,6 +99,19 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		}
 		_, maximum, _, ok, _ := readMemory(path)
 		if ok {
+			// AIRA-103. A CAPACITY question -- "what would one more job face" --
+			// so it takes the pressure-throttled maximum, exactly like the
+			// evaluator's own check. Reporting the static value here would tell an
+			// operator a job fits when the daemon will not admit it.
+			//
+			// ONE ceiling snapshot for the whole reply. Taking the effective
+			// maximum and the ceiling state in two separate locked reads let a
+			// publication land between them, so CeilingBytes could describe the
+			// old ceiling while the mode/state/MemAvailable beside it described
+			// the new one -- the same self-inconsistency admitSliceSnapshot exists
+			// to prevent.
+			ceiling := s.sliceCeilingSnapshotFor(path)
+			ceilingMaximum := sliceCeilingEffectiveMaximum(ceiling, maximum)
 			// ONE locked snapshot: granted totals and queued/freeze state must
 			// describe the same instant, or the summary contradicts itself.
 			//
@@ -115,10 +128,20 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				// Ceiling is what one MORE job would face; scale headroom by the
 				// TOTAL admitted jobs (outstanding + adopted) so it stays consistent
 				// with the Jobs shown, not just the connection-held ones.
-				CeilingBytes: subtractFloor(maximum, s.admitSliceHeadroom(addJobCountClamp(totalJobs, 1))),
-				Jobs:         totalJobs,
-				Queued:       queued,
-				FreezePhase:  freezePhase,
+				CeilingBytes: subtractFloor(ceilingMaximum, s.admitSliceHeadroom(addJobCountClamp(totalJobs, 1))),
+				// AIRA-103. What the ceiling WOULD be if applied. In enforce mode
+				// it equals CeilingBytes; in OBSERVE mode CeilingBytes is the
+				// untouched static capacity (observe applies nothing), so
+				// rendering that as the observed decision would leave the
+				// prescribed observe-then-enforce rollout blind on its own
+				// operator surface. ZERO when the subsystem is off -- an ABSENCE,
+				// because "off adds nothing to the wire" is the claim this ships
+				// on, pinned by TestConfineListSliceReserveSummary.
+				CeilingWouldBeBytes: sliceCeilingWouldBeBytes(ceiling, ceilingMaximum,
+					s.admitSliceHeadroom(addJobCountClamp(totalJobs, 1))),
+				Jobs:        totalJobs,
+				Queued:      queued,
+				FreezePhase: freezePhase,
 				// Zero unless the caller named a scope id that is queued right
 				// now: absence of a position, never "position zero".
 				QueuePosition:    snapshot.queuePosition,
@@ -136,6 +159,14 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				VanishedBytes:    snapshot.vanishedBytes,
 				ResidualJobs:     snapshot.residualJobs(),
 				ResidualBytes:    snapshot.residualBytes(),
+				// AIRA-103. Absent (all zero/empty) when the subsystem is off, so
+				// the renderer prints nothing rather than a fabricated state.
+				CeilingMode:        string(ceiling.Mode),
+				CeilingState:       ceiling.State,
+				CeilingReason:      ceiling.Reason,
+				CeilingHeld:        ceiling.Held,
+				CeilingStaticBytes: ceiling.StaticMax,
+				MemAvailableBytes:  ceiling.MemAvailable,
 			}
 			// AIRA-101, from the SAME snapshot, so the exclusive holder and the
 			// counts above can never describe different instants. Left nil when

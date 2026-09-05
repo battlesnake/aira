@@ -52,8 +52,12 @@ const (
 	// than catastrophic. 0/"disabled" restores the old unbounded behaviour.
 	defaultAdmitFreezeMaxHold = 2 * time.Minute
 	defaultWatchdogInterval   = 2 * time.Second
-	defaultScopeReapInterval  = 5 * time.Minute
-	defaultScopeReapGrace     = 2 * time.Minute
+	// AIRA-103 samples on the SAME cadence as the watchdog so the daemon has one
+	// notion of "sustained memory pressure", differing only in what it measures
+	// and what it does about it.
+	defaultSliceCeilingInterval = 2 * time.Second
+	defaultScopeReapInterval    = 5 * time.Minute
+	defaultScopeReapGrace       = 2 * time.Minute
 
 	// defaultStaleLeaseReleaseGrace is a LEASE-TTL policy, not a liveness
 	// proof: any admitGranted lease whose scope is STILL found empty this
@@ -119,6 +123,62 @@ func watchdogIntervalFromEnv() (time.Duration, error) {
 	interval, err := time.ParseDuration(value)
 	if err != nil || interval < time.Second || interval >= 30*time.Second {
 		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_WATCHDOG_INTERVAL must be a Go duration in [1s,30s)")
+	}
+	return interval, nil
+}
+
+// sliceCeilingModeFromEnv / sliceCeilingIntervalFromEnv deliberately mirror the
+// watchdog's pair above, including defaulting to OFF: this subsystem reduces the
+// capacity admission believes in, and on a machine whose configured slice
+// ceiling already exceeds what the box can afford that is a real (if safe)
+// capacity cut. It ships observe-then-enforce, never on by default. Its reserve
+// is not a knob for the same reason the watchdog's thresholds are not -- the
+// existing knob for "how much of this machine AIRA may have" is
+// `aira install --memory-max`, which sets the bound this can never exceed.
+func sliceCeilingModeFromEnv() (sliceCeilingMode, error) {
+	mode := sliceCeilingMode(strings.TrimSpace(os.Getenv("AIRA_DAEMON_SLICE_CEILING_MODE")))
+	if mode == "" {
+		return sliceCeilingOff, nil
+	}
+	switch mode {
+	case sliceCeilingOff, sliceCeilingObserve, sliceCeilingEnforce:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_SLICE_CEILING_MODE must be off, observe, or enforce")
+	}
+}
+
+// sliceCeilingConfigFromEnv reads BOTH settings, and reads the interval only
+// when the subsystem is actually wanted.
+//
+// That ordering is the whole point. This ships default-OFF, and the safety claim
+// made for it is that off is EXACTLY today's behaviour. Validating the interval
+// unconditionally broke that claim: a typo in AIRA_DAEMON_SLICE_CEILING_INTERVAL
+// would refuse to start the daemon even with the mode off. A deliberate
+// divergence from the watchdog's own pair, which parses both unconditionally.
+func sliceCeilingConfigFromEnv() (sliceCeilingMode, time.Duration, error) {
+	mode, err := sliceCeilingModeFromEnv()
+	if err != nil {
+		return "", 0, err
+	}
+	if mode == sliceCeilingOff {
+		return mode, defaultSliceCeilingInterval, nil
+	}
+	interval, err := sliceCeilingIntervalFromEnv()
+	if err != nil {
+		return "", 0, err
+	}
+	return mode, interval, nil
+}
+
+func sliceCeilingIntervalFromEnv() (time.Duration, error) {
+	value := strings.TrimSpace(os.Getenv("AIRA_DAEMON_SLICE_CEILING_INTERVAL"))
+	if value == "" {
+		return defaultSliceCeilingInterval, nil
+	}
+	interval, err := time.ParseDuration(value)
+	if err != nil || interval < time.Second || interval >= 30*time.Second {
+		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_SLICE_CEILING_INTERVAL must be a Go duration in [1s,30s)")
 	}
 	return interval, nil
 }

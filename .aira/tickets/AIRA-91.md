@@ -715,3 +715,39 @@ closes) and will capture `terminated-by=` on the next heavy OOM under the
 new one.
 
 ## Status: root cause closed. Part A done, verified on master, and deployed (2026-09-05). Part B remains an owner decision.
+
+## Part B — concrete implementation landed (AIRA-103, 2026-09-05)
+
+Status-transition note only; Part B's own scope and the owner decision above are
+unchanged and this ticket is not reopened or rescoped.
+
+**AIRA-103 is the concrete implementation of Part B's stated direction** — "the
+fix belongs entirely on AIRA's own side: admission/containment must be accurate
+enough that a legitimately-admitted job does not sit in sustained `memory.high`
+reclaim long enough to generate the PSI that trips the backstop." It makes
+admission responsive to machine-wide health by reducing the `maximum` the
+capacity check sees when memory *outside* `aira.slice` tightens, so fewer jobs are
+admitted into a slice the machine cannot actually afford, and fewer end up in the
+sustained-reclaim state that generates the PSI oomd reacts to. The oomd backstop
+is untouched, exactly as the owner directed.
+
+Two findings from AIRA-103 bear directly on Part B and are recorded here because
+they change what Part B is up against:
+
+- **The static 64 GiB ceiling is already unaffordable on this machine.** MemTotal
+  is 78.5 GiB and the non-slice footprint AIRA cannot reclaim is ~25 GiB, so with
+  the owner's own `min(MemTotal/4, 16 GiB)` headroom policy the *affordable*
+  ceiling is ~38 GiB. Admission has therefore been believing in ~26 GiB that does
+  not exist. That over-commitment is a plausible standing contributor to the
+  Part B failure class, independent of any single job's behaviour.
+- **AIRA-103 deliberately does NOT write `aira.slice`'s `memory.max`.** The
+  originally-proposed cgroupfs write would have set a cap near `memory.current`,
+  putting the slice into continuous `memory.max`-triggered reclaim as page cache
+  refilled the gap — *manufacturing* Part B's own failure mode while trying to
+  prevent it. The throttle is applied in-process at the capacity check instead.
+
+Part B is **substantially addressed but not closed**: what remains is whether the
+configured ceiling itself should be reduced to match the machine (AIRA-103 makes
+this measurable but does not change `aira install --memory-max`), and AIRA-16
+half (2)'s slice-*internal* pressure trigger, which is a kill decision and is
+still deliberately unbuilt pending its own owner call.

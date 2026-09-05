@@ -93,6 +93,13 @@ type Server struct {
 	staleLeaseReleaseGrace       time.Duration
 	governor                     *governorSet
 
+	// AIRA-103. The published pressure ceiling. sliceCeilingMu is a strict LEAF:
+	// admitEffectiveMaximum reads it from inside queue.mu, so nothing may ever be
+	// acquired while it is held, and the subsystem that writes it holds no
+	// admission lock at the time. The value is a plain struct copied in and out.
+	sliceCeilingMu    sync.RWMutex
+	sliceCeilingState sliceCeilingSnapshot
+
 	// AIRA-64. The CPU-concurrency gate: one machine-wide bound on how many
 	// aitest workers run at once, evaluated inside worker-admit. cpuSlotsGate
 	// is a 1-buffered channel rather than a sync.Mutex so a waiter can abandon
@@ -220,6 +227,10 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		return err
 	}
 	watchdogInterval, err := watchdogIntervalFromEnv()
+	if err != nil {
+		return err
+	}
+	sliceCeilingMode, sliceCeilingInterval, err := sliceCeilingConfigFromEnv()
 	if err != nil {
 		return err
 	}
@@ -381,6 +392,31 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		defer close(watchdogDone)
 		s.runWatchdog(watchdogCtx, watchdogMode, watchdogInterval, watchdogRuntimeDeps)
 	}()
+	// AIRA-103. Started beside the watchdog because they share one signal
+	// (readMemAvailable) and one cadence; they differ in what else they measure
+	// and in what they do. This one never signals, never kills and never writes a
+	// cgroup file -- it only reduces the capacity admission believes in.
+	sliceCeilingCtx, cancelSliceCeiling := context.WithCancel(ctx)
+	sliceCeilingDone := make(chan struct{})
+	sliceCeilingRuntimeDeps := sliceCeilingDeps{}
+	if sliceCeilingMode != sliceCeilingOff {
+		memTotal, memTotalOK := readMemTotal()
+		if !memTotalOK {
+			// The reserve is a fraction of MemTotal, so an unreadable MemTotal
+			// leaves it unestablished. Refuse to run rather than silently
+			// substitute a value: an over-large reserve would throttle a healthy
+			// machine, which is a capacity decision nobody made.
+			log.Printf("aira daemon: slice ceiling disabled: MemTotal unreadable, so the system reserve cannot be established")
+			sliceCeilingMode = sliceCeilingOff
+		} else {
+			sliceCeilingRuntimeDeps = realSliceCeilingDeps(s, clampSliceCeilingReserve(memTotal))
+			sliceCeilingRuntimeDeps.ttl = sliceCeilingTTLFor(sliceCeilingInterval)
+		}
+	}
+	go func() {
+		defer close(sliceCeilingDone)
+		s.runSliceCeiling(sliceCeilingCtx, sliceCeilingMode, sliceCeilingInterval, sliceCeilingRuntimeDeps)
+	}()
 
 	var connections sync.WaitGroup
 	stopping := make(chan struct{})
@@ -416,6 +452,7 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	cancelDiscovery()
 	cancelScopeReaper()
 	cancelWatchdog()
+	cancelSliceCeiling()
 	_ = listener.Close()
 	drained := make(chan struct{})
 	go func() {
@@ -429,6 +466,7 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		<-discoveryDone
 		<-scopeReaperDone
 		<-watchdogDone
+		<-sliceCeilingDone
 		close(drained)
 	}()
 	timeout := s.DrainTimeout
