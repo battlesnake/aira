@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"aira/internal/runner"
+	"aira/internal/testdeadline"
 )
 
 // AIRA-101 exclusive-admission gate.
@@ -54,10 +55,43 @@ func enqueueExclusiveTest(t *testing.T, server *Server, reserve int64, request a
 	return queue, waiter
 }
 
-func requireGranted(t *testing.T, waiter *admitWaiter, what string) {
+// stopEvaluator retires the queue's own evaluator goroutine and WAITS for it to
+// be gone, making this test the single evaluator.
+//
+// That is not tidiness. evaluateAdmitQueue reads the scan throttle before taking
+// queue.mu, which is sound only under the single-writer property it documents;
+// driving passes from a test while the goroutine was still live would break that
+// invariant and race, and a racy test is not evidence of anything.
+func stopEvaluator(t *testing.T, queue *sliceQueue) {
 	t.Helper()
-	if waiter.state != admitGranted {
-		t.Fatalf("%s: expected admitGranted, got state=%d outcome=%q", what, waiter.state, waiter.outcome)
+	queue.stopOnce.Do(func() { close(queue.stop) })
+	select {
+	case <-queue.stopped:
+	case <-testdeadline.After(5 * time.Second):
+		t.Fatal("the queue evaluator did not stop; this test cannot be the single evaluator")
+	}
+}
+
+// evaluate drives exactly one pass, with this test as the sole evaluator.
+func evaluate(t *testing.T, server *Server, queue *sliceQueue) {
+	t.Helper()
+	stopEvaluator(t, queue)
+	server.evaluateAdmitQueue(queue)
+}
+
+// waiterState reads a waiter's mutable fields under queue.mu, which is the only
+// safe way: the fields are written by the evaluator under that lock.
+func waiterState(queue *sliceQueue, waiter *admitWaiter) (admitWaiterState, string, bool) {
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	return waiter.state, waiter.outcome, waiter.waited
+}
+
+func requireGranted(t *testing.T, queue *sliceQueue, waiter *admitWaiter, what string) {
+	t.Helper()
+	state, outcome, _ := waiterState(queue, waiter)
+	if state != admitGranted {
+		t.Fatalf("%s: expected admitGranted, got state=%d outcome=%q", what, state, outcome)
 	}
 }
 
@@ -66,12 +100,13 @@ func requireGranted(t *testing.T, waiter *admitWaiter, what string) {
 // granted". A bare not-granted assertion would also pass against an
 // implementation that rejected the waiter outright, which is a different and
 // much worse behaviour.
-func requireStillQueued(t *testing.T, waiter *admitWaiter, what string) {
+func requireStillQueued(t *testing.T, queue *sliceQueue, waiter *admitWaiter, what string) {
 	t.Helper()
-	if waiter.state != admitQueued {
-		t.Fatalf("%s: expected the waiter to stay queued, got state=%d outcome=%q", what, waiter.state, waiter.outcome)
+	state, outcome, waited := waiterState(queue, waiter)
+	if state != admitQueued {
+		t.Fatalf("%s: expected the waiter to stay queued, got state=%d outcome=%q", what, state, outcome)
 	}
-	if !waiter.waited {
+	if !waited {
 		t.Fatalf("%s: a blocked waiter must be marked as having waited", what)
 	}
 	select {
@@ -104,10 +139,10 @@ func TestExclusiveDrainBlocksAnOrdinaryWaiterThatWouldFit(t *testing.T) {
 	queue.mu.Unlock()
 	_, ordinary := enqueueExclusiveTest(t, server, 10, admitRequest{})
 
-	server.evaluateAdmitQueue(queue)
+	evaluate(t, server, queue)
 
-	requireStillQueued(t, exclusive, "the exclusive waiter while the slice is not empty")
-	requireStillQueued(t, ordinary, "an ordinary waiter behind a drain")
+	requireStillQueued(t, queue, exclusive, "the exclusive waiter while the slice is not empty")
+	requireStillQueued(t, queue, ordinary, "an ordinary waiter behind a drain")
 }
 
 func TestExclusiveDrainCompletesOnceTheSliceIsEmpty(t *testing.T) {
@@ -119,16 +154,16 @@ func TestExclusiveDrainCompletesOnceTheSliceIsEmpty(t *testing.T) {
 	queue.mu.Lock()
 	queue.outstandingJobs = 1
 	queue.mu.Unlock()
-	server.evaluateAdmitQueue(queue)
-	requireStillQueued(t, exclusive, "before the slice drained")
+	evaluate(t, server, queue)
+	requireStillQueued(t, queue, exclusive, "before the slice drained")
 
 	// The running job finishes.
 	queue.mu.Lock()
 	queue.outstandingJobs = 0
 	queue.mu.Unlock()
-	server.evaluateAdmitQueue(queue)
+	evaluate(t, server, queue)
 
-	requireGranted(t, exclusive, "the exclusive waiter once the slice is empty")
+	requireGranted(t, queue, exclusive, "the exclusive waiter once the slice is empty")
 }
 
 func TestExclusiveHoldBlocksAnOrdinaryWaiter(t *testing.T) {
@@ -137,12 +172,12 @@ func TestExclusiveHoldBlocksAnOrdinaryWaiter(t *testing.T) {
 	queue, exclusive := enqueueExclusiveTest(t, server, 10, admitRequest{
 		exclusive: true, scopeID: holderID, name: "bench", owner: "mark",
 	})
-	server.evaluateAdmitQueue(queue)
-	requireGranted(t, exclusive, "the exclusive waiter on an empty slice")
+	evaluate(t, server, queue)
+	requireGranted(t, queue, exclusive, "the exclusive waiter on an empty slice")
 
 	_, ordinary := enqueueExclusiveTest(t, server, 10, admitRequest{})
-	server.evaluateAdmitQueue(queue)
-	requireStillQueued(t, ordinary, "an ordinary waiter under an exclusive hold")
+	evaluate(t, server, queue)
+	requireStillQueued(t, queue, ordinary, "an ordinary waiter under an exclusive hold")
 }
 
 // A sub-reservation is an already-running job's internal progress. If a drain
@@ -163,10 +198,10 @@ func TestExclusiveDrainDoesNotBlockAForeignSubReservation(t *testing.T) {
 	foreignParent := exclusiveScopeID(t, "suite", 200)
 	_, reservation := enqueueExclusiveTest(t, server, 10, admitRequest{parentScopeID: foreignParent})
 
-	server.evaluateAdmitQueue(queue)
+	evaluate(t, server, queue)
 
-	requireStillQueued(t, exclusive, "the exclusive waiter while a suite still runs")
-	requireGranted(t, reservation, "a running foreign suite's sub-reservation during a drain")
+	requireStillQueued(t, queue, exclusive, "the exclusive waiter while a suite still runs")
+	requireGranted(t, queue, reservation, "a running foreign suite's sub-reservation during a drain")
 }
 
 // The non-porousness partner to the test above. `aira run` is ALSO scope-less on
@@ -187,9 +222,9 @@ func TestExclusiveDrainBlocksAScopelessJobLevelAdmit(t *testing.T) {
 	// Scope-less AND parent-less: an `aira run`-shaped admission.
 	_, run := enqueueExclusiveTest(t, server, 10, admitRequest{})
 
-	server.evaluateAdmitQueue(queue)
+	evaluate(t, server, queue)
 
-	requireStillQueued(t, run, "a scope-less job-level admit during a drain")
+	requireStillQueued(t, queue, run, "a scope-less job-level admit during a drain")
 }
 
 func TestExclusiveHoldAdmitsTheHoldersOwnSubReservationButNotAForeignOne(t *testing.T) {
@@ -198,16 +233,16 @@ func TestExclusiveHoldAdmitsTheHoldersOwnSubReservationButNotAForeignOne(t *test
 	queue, exclusive := enqueueExclusiveTest(t, server, 10, admitRequest{
 		exclusive: true, scopeID: holderID, name: "bench", owner: "mark",
 	})
-	server.evaluateAdmitQueue(queue)
-	requireGranted(t, exclusive, "the exclusive waiter")
+	evaluate(t, server, queue)
+	requireGranted(t, queue, exclusive, "the exclusive waiter")
 
 	_, own := enqueueExclusiveTest(t, server, 10, admitRequest{parentScopeID: holderID})
 	_, foreign := enqueueExclusiveTest(t, server, 10, admitRequest{parentScopeID: exclusiveScopeID(t, "other", 201)})
 
-	server.evaluateAdmitQueue(queue)
+	evaluate(t, server, queue)
 
-	requireGranted(t, own, "the holder's own sub-reservation under its own hold")
-	requireStillQueued(t, foreign, "a foreign sub-reservation under an exclusive hold")
+	requireGranted(t, queue, own, "the holder's own sub-reservation under its own hold")
+	requireStillQueued(t, queue, foreign, "a foreign sub-reservation under an exclusive hold")
 }
 
 // The holder's own nested `aira confine` carries its token. Without this the
@@ -219,8 +254,8 @@ func TestExclusiveHoldAdmitsANestedHolderTokenJob(t *testing.T) {
 	queue, exclusive := enqueueExclusiveTest(t, server, 10, admitRequest{
 		exclusive: true, scopeID: holderID, name: "bench", owner: "mark",
 	})
-	server.evaluateAdmitQueue(queue)
-	requireGranted(t, exclusive, "the exclusive waiter")
+	evaluate(t, server, queue)
+	requireGranted(t, queue, exclusive, "the exclusive waiter")
 
 	nestedID := exclusiveScopeID(t, "nested", 107)
 	_, nested := enqueueExclusiveTest(t, server, 10, admitRequest{
@@ -232,10 +267,10 @@ func TestExclusiveHoldAdmitsANestedHolderTokenJob(t *testing.T) {
 		exclusiveHolder: exclusiveScopeID(t, "bench", 999),
 	})
 
-	server.evaluateAdmitQueue(queue)
+	evaluate(t, server, queue)
 
-	requireGranted(t, nested, "a nested job carrying the live holder's token")
-	requireStillQueued(t, forged, "a job carrying a stale or foreign holder token")
+	requireGranted(t, queue, nested, "a nested job carrying the live holder's token")
+	requireStillQueued(t, queue, forged, "a job carrying a stale or foreign holder token")
 }
 
 // The fail-closed rule. A scan the daemon could not complete leaves emptiness
@@ -252,9 +287,9 @@ func TestExclusiveIsNotGrantedWhenTheScanCouldNotEstablishEmptiness(t *testing.T
 		exclusive: true, scopeID: holderID, name: "bench", owner: "mark",
 	})
 
-	server.evaluateAdmitQueue(queue)
+	evaluate(t, server, queue)
 
-	requireStillQueued(t, exclusive, "an exclusive waiter whose slice emptiness could not be established")
+	requireStillQueued(t, queue, exclusive, "an exclusive waiter whose slice emptiness could not be established")
 	queue.mu.Lock()
 	known := queue.liveScopesKnown
 	queue.mu.Unlock()
@@ -283,9 +318,9 @@ func TestExclusiveIsNotGrantedWhileASubtreePopulatedScopeRuns(t *testing.T) {
 		exclusive: true, scopeID: holderID, name: "bench", owner: "mark",
 	})
 
-	server.evaluateAdmitQueue(queue)
+	evaluate(t, server, queue)
 
-	requireStillQueued(t, exclusive, "an exclusive waiter beside a leaf-empty but subtree-populated scope")
+	requireStillQueued(t, queue, exclusive, "an exclusive waiter beside a leaf-empty but subtree-populated scope")
 }
 
 // Unevaluated is not empty.
@@ -303,9 +338,9 @@ func TestExclusiveIsNotGrantedWhenAScopesPopulationIsUnevaluated(t *testing.T) {
 		exclusive: true, scopeID: holderID, name: "bench", owner: "mark",
 	})
 
-	server.evaluateAdmitQueue(queue)
+	evaluate(t, server, queue)
 
-	requireStillQueued(t, exclusive, "an exclusive waiter beside a scope of unknown population")
+	requireStillQueued(t, queue, exclusive, "an exclusive waiter beside a scope of unknown population")
 }
 
 func TestSecondExclusiveRequestIsRefusedAtEnqueue(t *testing.T) {
@@ -362,8 +397,8 @@ func TestARejectedExclusiveWaiterDoesNotBlockTheNextExclusiveRequest(t *testing.
 		t.Fatal("expected the second exclusive request to be enqueued")
 	}
 	// And it must actually be able to proceed.
-	server.evaluateAdmitQueue(queue)
-	requireGranted(t, second, "the replacement exclusive waiter")
+	evaluate(t, server, queue)
+	requireGranted(t, queue, second, "the replacement exclusive waiter")
 }
 
 // A drain that cannot establish emptiness must ABORT, not stall the whole shared
@@ -383,13 +418,13 @@ func TestADrainAbortsWhenTheScanKeepsFailing(t *testing.T) {
 	})
 	_, ordinary := enqueueExclusiveTest(t, server, 10, admitRequest{})
 
-	server.evaluateAdmitQueue(queue)
-	requireStillQueued(t, exclusive, "the exclusive waiter on the first failing pass")
-	requireStillQueued(t, ordinary, "an ordinary waiter while the drain is still live")
+	evaluate(t, server, queue)
+	requireStillQueued(t, queue, exclusive, "the exclusive waiter on the first failing pass")
+	requireStillQueued(t, queue, ordinary, "an ordinary waiter while the drain is still live")
 
 	// Past the establishment grace, still failing.
 	now = now.Add(admitExclusiveEstablishGrace + time.Second)
-	server.evaluateAdmitQueue(queue)
+	evaluate(t, server, queue)
 
 	if exclusive.state != admitRejected {
 		t.Fatalf("expected the drain to abort, got state=%d", exclusive.state)
@@ -398,7 +433,7 @@ func TestADrainAbortsWhenTheScanKeepsFailing(t *testing.T) {
 		t.Fatalf("expected outcome %q, got %q", admitOutcomeExclusiveUnestablished, exclusive.outcome)
 	}
 	// The whole point: the slice must be usable again in the SAME pass.
-	requireGranted(t, ordinary, "an ordinary waiter once the unestablishable drain aborted")
+	requireGranted(t, queue, ordinary, "an ordinary waiter once the unestablishable drain aborted")
 }
 
 // The abort anchor must arm on the FIRST failure. Arming only "after a success"
@@ -417,7 +452,7 @@ func TestTheDrainAbortArmsWhenTheScanFailsFromTheFirstPass(t *testing.T) {
 		exclusive: true, scopeID: exclusiveScopeID(t, "bench", 117), name: "bench", owner: "mark",
 	})
 
-	server.evaluateAdmitQueue(queue)
+	evaluate(t, server, queue)
 	queue.mu.Lock()
 	armed := queue.scanFailingSince
 	queue.mu.Unlock()
@@ -426,7 +461,7 @@ func TestTheDrainAbortArmsWhenTheScanFailsFromTheFirstPass(t *testing.T) {
 	}
 
 	now = now.Add(admitExclusiveEstablishGrace + time.Second)
-	server.evaluateAdmitQueue(queue)
+	evaluate(t, server, queue)
 	if exclusive.state != admitRejected {
 		t.Fatalf("expected an abort after the grace, got state=%d", exclusive.state)
 	}
@@ -454,10 +489,10 @@ func TestTheDrainAbortAnchorClearsOnASuccessfulScan(t *testing.T) {
 	queue.outstandingJobs = 1
 	queue.mu.Unlock()
 
-	server.evaluateAdmitQueue(queue)
+	evaluate(t, server, queue)
 	failing = false
 	now = now.Add(time.Second)
-	server.evaluateAdmitQueue(queue)
+	evaluate(t, server, queue)
 
 	queue.mu.Lock()
 	armed := queue.scanFailingSince
@@ -466,8 +501,8 @@ func TestTheDrainAbortAnchorClearsOnASuccessfulScan(t *testing.T) {
 		t.Fatal("a successful scan must clear the abort anchor")
 	}
 	now = now.Add(admitExclusiveEstablishGrace + time.Second)
-	server.evaluateAdmitQueue(queue)
-	requireStillQueued(t, exclusive, "an exclusive waiter after the anchor was cleared by a good scan")
+	evaluate(t, server, queue)
+	requireStillQueued(t, queue, exclusive, "an exclusive waiter after the anchor was cleared by a good scan")
 }
 
 // The un-wedge, at the ledger level: whatever ends the exclusive waiter, the
@@ -482,17 +517,17 @@ func TestReleasingTheExclusiveWaiterLiftsTheDrain(t *testing.T) {
 	queue.outstandingJobs = 1
 	queue.mu.Unlock()
 	_, ordinary := enqueueExclusiveTest(t, server, 10, admitRequest{})
-	server.evaluateAdmitQueue(queue)
-	requireStillQueued(t, ordinary, "an ordinary waiter behind a live drain")
+	evaluate(t, server, queue)
+	requireStillQueued(t, queue, ordinary, "an ordinary waiter behind a live drain")
 
 	// The requester goes away.
 	server.releaseAdmitWaiter(queue, exclusive)
 	queue.mu.Lock()
 	queue.outstandingJobs = 0
 	queue.mu.Unlock()
-	server.evaluateAdmitQueue(queue)
+	evaluate(t, server, queue)
 
-	requireGranted(t, ordinary, "an ordinary waiter after the exclusive requester vanished")
+	requireGranted(t, queue, ordinary, "an ordinary waiter after the exclusive requester vanished")
 	if state := server.admitSliceSnapshot("/slice").exclusiveState; state != "" {
 		t.Fatalf("expected no exclusive state after release, got %q", state)
 	}
@@ -503,16 +538,16 @@ func TestReleasingTheExclusiveHolderLiftsTheHold(t *testing.T) {
 	queue, exclusive := enqueueExclusiveTest(t, server, 10, admitRequest{
 		exclusive: true, scopeID: exclusiveScopeID(t, "bench", 120), name: "bench", owner: "mark",
 	})
-	server.evaluateAdmitQueue(queue)
-	requireGranted(t, exclusive, "the exclusive waiter")
+	evaluate(t, server, queue)
+	requireGranted(t, queue, exclusive, "the exclusive waiter")
 	_, ordinary := enqueueExclusiveTest(t, server, 10, admitRequest{})
-	server.evaluateAdmitQueue(queue)
-	requireStillQueued(t, ordinary, "an ordinary waiter under a hold")
+	evaluate(t, server, queue)
+	requireStillQueued(t, queue, ordinary, "an ordinary waiter under a hold")
 
 	server.releaseAdmitWaiter(queue, exclusive)
-	server.evaluateAdmitQueue(queue)
+	evaluate(t, server, queue)
 
-	requireGranted(t, ordinary, "an ordinary waiter after the holder vanished")
+	requireGranted(t, queue, ordinary, "an ordinary waiter after the holder vanished")
 }
 
 // Anti-porousness. A test that exercised ONE release path would pass against an
@@ -526,8 +561,8 @@ func TestRepeatedExclusiveRequestAndAbandonNeverWedgesTheSlice(t *testing.T) {
 		queue, exclusive := enqueueExclusiveTest(t, server, 10, admitRequest{
 			exclusive: true, scopeID: exclusiveScopeID(t, "bench", 400+round), name: "bench", owner: "mark",
 		})
-		server.evaluateAdmitQueue(queue)
-		requireGranted(t, exclusive, "the exclusive waiter")
+		evaluate(t, server, queue)
+		requireGranted(t, queue, exclusive, "the exclusive waiter")
 
 		// Alternate how the requester goes away, so no single release path is the
 		// only one under test.
@@ -544,8 +579,8 @@ func TestRepeatedExclusiveRequestAndAbandonNeverWedgesTheSlice(t *testing.T) {
 		}
 
 		queue, ordinary := enqueueExclusiveTest(t, server, 10, admitRequest{})
-		server.evaluateAdmitQueue(queue)
-		requireGranted(t, ordinary, "an ordinary waiter after round "+itoa(round))
+		evaluate(t, server, queue)
+		requireGranted(t, queue, ordinary, "an ordinary waiter after round "+itoa(round))
 		server.releaseAdmitWaiter(queue, ordinary)
 	}
 }
@@ -563,7 +598,7 @@ func TestExclusiveSnapshotReportsDrainingThenHeldThenNone(t *testing.T) {
 	queue.outstandingJobs = 1
 	queue.mu.Unlock()
 	_, ordinary := enqueueExclusiveTest(t, server, 10, admitRequest{})
-	server.evaluateAdmitQueue(queue)
+	evaluate(t, server, queue)
 
 	snapshot := server.admitSliceSnapshot("/slice")
 	if snapshot.exclusiveState != admitExclusiveDraining {
@@ -580,15 +615,15 @@ func TestExclusiveSnapshotReportsDrainingThenHeldThenNone(t *testing.T) {
 	queue.mu.Lock()
 	queue.outstandingJobs = 0
 	queue.mu.Unlock()
-	server.evaluateAdmitQueue(queue)
-	requireGranted(t, exclusive, "the exclusive waiter")
+	evaluate(t, server, queue)
+	requireGranted(t, queue, exclusive, "the exclusive waiter")
 	if state := server.admitSliceSnapshot("/slice").exclusiveState; state != admitExclusiveHeld {
 		t.Fatalf("expected %q once granted, got %q", admitExclusiveHeld, state)
 	}
 
 	server.releaseAdmitWaiter(queue, exclusive)
-	server.evaluateAdmitQueue(queue)
-	requireGranted(t, ordinary, "the ordinary waiter after the hold ended")
+	evaluate(t, server, queue)
+	requireGranted(t, queue, ordinary, "the ordinary waiter after the hold ended")
 	server.releaseAdmitWaiter(queue, ordinary)
 	if state := server.admitSliceSnapshot("/slice").exclusiveState; state != "" {
 		t.Fatalf("expected no exclusivity after release, got %q", state)
@@ -609,7 +644,7 @@ func TestADrainDoesNotArmTheFairnessFreeze(t *testing.T) {
 	queue.mu.Unlock()
 	enqueueExclusiveTest(t, server, 10, admitRequest{})
 
-	server.evaluateAdmitQueue(queue)
+	evaluate(t, server, queue)
 
 	queue.mu.Lock()
 	armed := queue.freezeArmedAt
@@ -628,7 +663,7 @@ func TestAnExclusiveWaiterStillFacesOrdinaryRAMAdmission(t *testing.T) {
 		exclusive: true, scopeID: exclusiveScopeID(t, "bench", 123), name: "bench", owner: "mark",
 	})
 
-	server.evaluateAdmitQueue(queue)
+	evaluate(t, server, queue)
 
-	requireStillQueued(t, exclusive, "an exclusive waiter too large for its own slice")
+	requireStillQueued(t, queue, exclusive, "an exclusive waiter too large for its own slice")
 }

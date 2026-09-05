@@ -48,10 +48,8 @@ func holdSlice(t *testing.T, server *Server, slicePath, name string, pid int) st
 	if err != nil {
 		t.Fatalf("enqueue exclusive: code=%s err=%v", code, err)
 	}
-	server.evaluateAdmitQueue(queue)
-	if waiter.state != admitGranted {
-		t.Fatalf("expected the exclusive waiter to be granted, state=%d", waiter.state)
-	}
+	evaluate(t, server, queue)
+	requireGranted(t, queue, waiter, "the exclusive waiter")
 	return scopeID
 }
 
@@ -110,10 +108,8 @@ func TestWorkerAdmitIsAllowedUnderANestedHolderTokenScope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enqueue nested: code=%s err=%v", code, err)
 	}
-	server.evaluateAdmitQueue(queue)
-	if nested.state != admitGranted {
-		t.Fatalf("the nested holder-token job should have been granted, state=%d", nested.state)
-	}
+	evaluate(t, server, queue)
+	requireGranted(t, queue, nested, "the nested holder-token job")
 
 	nestedScope := filepath.Join(slicePath, confineScopeDirName(nestedID))
 	if server.exclusiveDeniesWorkerAdmit(nestedScope) {
@@ -137,7 +133,7 @@ func TestWorkerAdmitIsAllowedDuringADrain(t *testing.T) {
 	queue.mu.Lock()
 	queue.outstandingJobs = 1
 	queue.mu.Unlock()
-	server.evaluateAdmitQueue(queue)
+	evaluate(t, server, queue)
 
 	running := filepath.Join(slicePath, confineScopeDirName(exclusiveScopeID(t, "suite", 506)))
 	if server.exclusiveDeniesWorkerAdmit(running) {

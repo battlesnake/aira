@@ -161,8 +161,8 @@ func TestSIGKILLingTheExclusiveHolderUnwedgesTheSlice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enqueue blocked waiter: code=%s err=%v", code, err)
 	}
-	server.evaluateAdmitQueue(queue)
-	if blocked.state == admitGranted {
+	evaluate(t, server, queue)
+	if state, _, _ := waiterState(queue, blocked); state == admitGranted {
 		t.Fatal("an ordinary waiter was granted while the slice was held exclusively")
 	}
 
@@ -175,14 +175,16 @@ func TestSIGKILLingTheExclusiveHolderUnwedgesTheSlice(t *testing.T) {
 
 	// The slice must recover on its own, promptly, with no operator action.
 	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
+	granted := false
+	for time.Now().Before(deadline) && !granted {
 		server.evaluateAdmitQueue(queue)
-		if blocked.state == admitGranted {
+		if state, _, _ := waiterState(queue, blocked); state == admitGranted {
+			granted = true
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if blocked.state != admitGranted {
+	if !granted {
 		t.Fatal("the slice stayed wedged after the exclusive holder was SIGKILLed: this is the machine-wide deadlock the design exists to make unrepresentable")
 	}
 	if state := server.admitSliceSnapshot(slicePath).exclusiveState; state != "" {
@@ -205,10 +207,8 @@ func TestADaemonRestartReleasesExclusivityRatherThanWedgingTheSlice(t *testing.T
 	if err != nil {
 		t.Fatalf("enqueue: code=%s err=%v", code, err)
 	}
-	first.evaluateAdmitQueue(queue)
-	if holder.state != admitGranted {
-		t.Fatalf("expected the exclusive waiter to hold, state=%d", holder.state)
-	}
+	evaluate(t, first, queue)
+	requireGranted(t, queue, holder, "the exclusive waiter")
 	_ = socket
 
 	// A FRESH server over the same slice, exactly as a restart produces: a new
@@ -232,8 +232,8 @@ func TestADaemonRestartReleasesExclusivityRatherThanWedgingTheSlice(t *testing.T
 	if err != nil {
 		t.Fatalf("enqueue after restart: code=%s err=%v", code, err)
 	}
-	second.evaluateAdmitQueue(newQueue)
-	if ordinary.state != admitGranted {
+	evaluate(t, second, newQueue)
+	if state, _, _ := waiterState(newQueue, ordinary); state != admitGranted {
 		t.Fatal("a restarted daemon left the slice wedged; the restart direction must be fail-OPEN")
 	}
 }
@@ -272,17 +272,15 @@ func TestExclusiveGrantIsBlockedByARealLeafEmptyButSubtreePopulatedScope(t *test
 	if err != nil {
 		t.Fatalf("enqueue: code=%s err=%v", code, err)
 	}
-	server.evaluateAdmitQueue(queue)
-	if exclusive.state == admitGranted {
+	evaluate(t, server, queue)
+	if state, _, _ := waiterState(queue, exclusive); state == admitGranted {
 		t.Fatal("an exclusive job was told it was alone while a leaf-empty, subtree-populated suite was running")
 	}
 
 	// Once the suite's subtree really is empty, the grant proceeds.
 	populated = false
 	server.evaluateAdmitQueue(queue)
-	if exclusive.state != admitGranted {
-		t.Fatalf("expected the grant once the slice was genuinely empty, state=%d", exclusive.state)
-	}
+	requireGranted(t, queue, exclusive, "the exclusive waiter once the slice was genuinely empty")
 }
 
 func readAllLines(r interface{ Read([]byte) (int, error) }) (string, error) {

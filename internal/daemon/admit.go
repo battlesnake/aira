@@ -450,8 +450,18 @@ type sliceQueue struct {
 	kick              chan struct{}
 	stop              chan struct{}
 	stopOnce          sync.Once
-	poll              time.Duration
-	server            *Server
+	// stopped is closed by runEvaluator as it exits, so a caller can establish
+	// that the goroutine is GONE rather than merely asked to stop.
+	//
+	// It exists for the tests, and the reason is a real invariant rather than
+	// convenience: evaluateAdmitQueue reads the scan throttle BEFORE taking
+	// queue.mu, which is sound only under the single-writer property documented
+	// there — in production this queue's own goroutine is the sole caller. A test
+	// that drove passes directly while that goroutine was still live would break
+	// the invariant and race, so it must be able to retire it and know when.
+	stopped chan struct{}
+	poll    time.Duration
+	server  *Server
 
 	// AIRA-59 fairness-freeze duty cycle, held as a SINGLE anchor instant so the
 	// phase is DERIVED, never stored: idle while zero, hold for the first
@@ -1242,7 +1252,7 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 		if poll <= 0 {
 			poll = defaultAdmitPollInterval
 		}
-		queue = &sliceQueue{path: path, kick: make(chan struct{}, 1), stop: make(chan struct{}), poll: poll, server: s}
+		queue = &sliceQueue{path: path, kick: make(chan struct{}, 1), stop: make(chan struct{}), stopped: make(chan struct{}), poll: poll, server: s}
 		s.admitQueues[path] = queue
 		go queue.runEvaluator()
 	}
@@ -1294,6 +1304,13 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 }
 
 func (q *sliceQueue) runEvaluator() {
+	// Closed on exit so a caller can establish this goroutine is GONE, not merely
+	// asked to stop. See sliceQueue.stopped.
+	defer func() {
+		if q.stopped != nil {
+			close(q.stopped)
+		}
+	}()
 	ticker := time.NewTicker(q.poll)
 	defer ticker.Stop()
 	for {
