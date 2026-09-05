@@ -113,7 +113,13 @@ type ContainerPlan struct {
 	// refuses `--cgroups=split` together with `--cgroup-parent` (plan F3), so
 	// injecting over a caller's choice would break their command outright.
 	CallerCgroupFlag string
-	CallerSplit      bool
+	// CallerSplit is the EFFECTIVE value of `--cgroups` (last-wins, as pflag
+	// resolves a repeated flag), not "split was seen somewhere".
+	CallerSplit bool
+	// CallerOtherPlacement records a placement mechanism other than `--cgroups`
+	// (`--cgroup-parent`, `--pod`, `--pod-id-file`). Combined with `--cgroups`
+	// the outcome is conflicting, so nesting is never claimed.
+	CallerOtherPlacement bool
 
 	Detach bool
 }
@@ -134,6 +140,15 @@ func (plan ContainerPlan) Detected() bool { return plan.Runtime != ContainerRunt
 // would claim the kernel binds a container it does not bind.
 func (plan ContainerPlan) NestsInJobScope() bool {
 	if plan.Runtime != ContainerRuntimePodman {
+		return false
+	}
+	// Nesting requires that NOTHING else determines placement. A second
+	// mechanism alongside `--cgroups=split` (`--cgroup-parent`, `--pod`) makes
+	// the outcome conflicting or unestablished, and `--cgroups` itself is
+	// LAST-WINS under pflag, so `--cgroups=split --cgroups=enabled` is not split
+	// at all (build review, Sol P1: an earlier build ORed CallerSplit forever and
+	// claimed nesting for both shapes).
+	if plan.CallerOtherPlacement {
 		return false
 	}
 	return plan.CallerSplit || plan.CallerCgroupFlag == ""
@@ -209,8 +224,20 @@ func PlanContainerIntegration(argv []string) ContainerPlan {
 			name, inline, hasInline := strings.Cut(token, "=")
 			switch name {
 			case "--memory":
+				// Only INSIDE the option region. Once the boundary has closed,
+				// every remaining token is provably the container's own command,
+				// so a `-m` there is python's or gcc's -- not a memory limit the
+				// caller gave the runtime. Setting Present for those defeated
+				// injection on very common commands (`docker run img python -m
+				// pytest`, `-mod=vendor`, `-m64`, `-march=`) and made the trailer
+				// assert `caller=` for a flag the runtime never saw (build
+				// review, Fable/Sol). The conservative over-inclusion inside the
+				// still-open region (L9) is unchanged.
+				if !boundaryOpen {
+					continue
+				}
 				plan.MemoryPresent = true
-				if boundaryOpen {
+				{
 					occurrences++
 					if hasInline {
 						value, valueFound = inline, true
@@ -237,12 +264,20 @@ func PlanContainerIntegration(argv []string) ContainerPlan {
 				if plan.CallerCgroupFlag == "" {
 					plan.CallerCgroupFlag = name
 				}
-				if name == "--cgroups" {
-					if hasInline {
-						plan.CallerSplit = plan.CallerSplit || inline == "split"
-					} else if index+1 < len(rest) {
-						plan.CallerSplit = plan.CallerSplit || rest[index+1] == "split"
-					}
+				if name != "--cgroups" {
+					plan.CallerOtherPlacement = true
+					continue
+				}
+				// LAST-WINS, never OR: pflag resolves a repeated non-slice flag
+				// to its final value, so `--cgroups=split --cgroups=enabled` is
+				// NOT split.
+				switch {
+				case hasInline:
+					plan.CallerSplit = inline == "split"
+				case index+1 < len(rest):
+					plan.CallerSplit = rest[index+1] == "split"
+				default:
+					plan.CallerSplit = false
 				}
 			case "--detach":
 				// Boundary-gated for the same reason as the flags above: a
@@ -250,7 +285,7 @@ func PlanContainerIntegration(argv []string) ContainerPlan {
 				// detach the CONTAINER, and the lifetime warning must describe
 				// what the caller actually asked for.
 				if boundaryOpen {
-					plan.Detach = true && (!hasInline || inline != "false")
+					plan.Detach = !hasInline || inline != "false"
 				}
 			}
 			// --memory-swap, --memory-reservation and --memory-swappiness fall
@@ -263,8 +298,11 @@ func PlanContainerIntegration(argv []string) ContainerPlan {
 		body := token[1:]
 		switch {
 		case token == "-m":
+			if !boundaryOpen {
+				continue
+			}
 			plan.MemoryPresent = true
-			if boundaryOpen {
+			{
 				occurrences++
 				if index+1 < len(rest) {
 					value, valueFound = rest[index+1], true
@@ -275,20 +313,27 @@ func PlanContainerIntegration(argv []string) ContainerPlan {
 		case body[0] == 'm':
 			// `-m4g`, but also `-memory`, whose remainder will not parse and is
 			// therefore reported unevaluated rather than guessed.
-			plan.MemoryPresent = true
-			if boundaryOpen {
-				occurrences++
-				value, valueFound = body[1:], true
+			if !boundaryOpen {
+				continue
 			}
+			plan.MemoryPresent = true
+			occurrences++
+			value, valueFound = body[1:], true
 		case strings.ContainsRune(containerValueTakingShorts, rune(body[0])):
 			// An attached-value flag, not a cluster. Consumes nothing further.
 		case containerAllIn(body, containerBooleanShorts):
-			if strings.ContainsRune(body, 'd') {
+			// Boundary-gated like the long form (build review, Sol/Fable):
+			// `docker run img prog -d` is the container's argument, not a
+			// request to detach the container.
+			if boundaryOpen && strings.ContainsRune(body, 'd') {
 				plan.Detach = true
 			}
 		case containerAllIn(body, containerBooleanShorts+"m"):
 			// A boolean cluster containing 'm' (e.g. `-itm 4g`). The value's
 			// position is not determinable without a full arity table.
+			if !boundaryOpen {
+				continue
+			}
 			plan.MemoryPresent = true
 			ambiguous = token
 			if strings.ContainsRune(body, 'd') {
@@ -297,7 +342,7 @@ func PlanContainerIntegration(argv []string) ContainerPlan {
 		default:
 			// Unknown second character. Unknown never silently means "no memory
 			// flag here": if the token contains an 'm' at all, say so.
-			if strings.ContainsRune(body, 'm') {
+			if boundaryOpen && strings.ContainsRune(body, 'm') {
 				plan.MemoryPresent = true
 				ambiguous = token
 			}

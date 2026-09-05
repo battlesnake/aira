@@ -1,6 +1,8 @@
 # AIRA-102 — `aira confine` container integration (podman transparent nesting + docker sanity shim)
 
-**Status:** plan **v5 — BUILT, twice build-reviewed, amended.** v3 was gate-passed and implemented. Both adversarial BUILD reviews returned **BLOCK**: Sol (3×P1, 2×P2) and Fable (2×P0, 3×P1, 8×P2). Every finding is folded in below.
+**Status:** plan **v6 — BUILT, build-reviewed twice per lineage, amended.** Round 2 (Sol BLOCK, Fable APPROVE-WITH-FIXES) found a P1 that the round-1 P0 fix had introduced, plus a convergent finding that the scan defeated this ticket's own target case. Both fixed; see the §3.2 and §3.5 notes.
+
+**Status history:** plan **v5 — BUILT, twice build-reviewed, amended.** v3 was gate-passed and implemented. Both adversarial BUILD reviews returned **BLOCK**: Sol (3×P1, 2×P2) and Fable (2×P0, 3×P1, 8×P2). Every finding is folded in below.
 
 **The two P0s (Fable), both real and both fixed:**
 - **The docker `--memory` injection was a trap of exactly the kind this ticket exists to prevent.** §3.3 injected the *resolved* `scopeMemoryMax`, which on an unpinned daemon grant is a peak-RSS **estimate**. For docker that estimate tracks the **CLI**, not the container (the container's memory lives in dockerd's tree and never reaches this scope's counters), so it converges to tens of megabytes; AIRA would inject `--memory=36175872` into the user's container, which is then OOM-killed inside docker where this scope cannot see the kill — so the job still reports `terminated-by=normal`, history keeps recording a tiny OOM-free peak, and it **never self-heals**. Reproduced end-to-end by the reviewer. Injection now keys on a **caller-DECLARED** limit only (`--memory-max`, or a declared `--memory-reserve`), which is also what the ticket originally said; the plan had silently widened it.
@@ -56,7 +58,9 @@ New portable file `internal/runner/container.go`. Detection fires **only** when 
 
 One left-to-right pass over `argv[2:]`, answering **two** questions at different strictness.
 
-**`Present`** (over-inclusive, safe direction) — is any memory-limit-shaped token anywhere after `run`? Set by `--memory`, `--memory=…`, `-m`, `-m<x>`, or an ambiguous single-dash cluster (below). `--memory-swap`, `--memory-reservation`, `--memory-swappiness` are **excluded** (both forms). Over-detection only ever makes AIRA **decline to inject**.
+**`Present`** (over-inclusive *within the option region*) — is any memory-limit-shaped token before the boundary closes?
+
+> **Round-2 correction (both lineages).** v5 set `Present` for memory-shaped tokens **anywhere**, including after the boundary had provably closed. That was not the safe direction it looked like: once closed, every remaining token is *provably* the container's own command, so the over-inclusion bought nothing and cost the ticket's **own target case** — `aira confine --memory-max 2G -- docker run img python -m pytest` injected nothing and reported `caller=unevaluated`, a facet asserting the caller passed a memory flag the runtime never saw. `-mod=vendor`, `-m64`, `-march=` and every `python -m` command were hit. `Present` is now gated on the option region, and the conservative over-inclusion **inside** the still-open region (L9) is unchanged. Set by `--memory`, `--memory=…`, `-m`, `-m<x>`, or an ambiguous single-dash cluster (below). `--memory-swap`, `--memory-reservation`, `--memory-swappiness` are **excluded** (both forms). Over-detection only ever makes AIRA **decline to inject**.
 
 **`Established` + `Bytes`** (strict) — the value is known **only** when *all* hold:
 1. exactly **one** occurrence;
@@ -122,9 +126,11 @@ The rule is now split by runtime:
 
 > *Stated consequences:* pinning **replaces** the daemon's history estimate for this job (basis `pinned:client`) — acceptable here because a `docker run` signature's history is CLI-only (tiny), so the raise essentially always exceeds it. The pinned value also becomes the **docker CLI's** scope `memory.max` via `:853`, printing `scope-memory.max=enforced=<container bytes>` for a client that will never use it — harmless, but stated because it reads as though confine capped something meaningful. And the charge reserves slice budget for memory that lives **outside** the slice: the deliberate trade the ticket asked for (machine-level headroom over slice utilisation), named as such.
 
-**`!DelegateRAM` guard** on the docker raise preserves AIRA-62.
+**`!DelegateRAM` guard** on the docker raise preserves AIRA-62 — and the SAME guard is required on the injection source (round 2, Fable P1). Under `--delegate-ram` a declared `--memory-reserve` is the pinned **framework overhead**, not a cap; the scope's own `memory.max` is the much larger delegate ceiling. Without the guard, `--delegate-ram --memory-reserve 512M -- podman run img pytest ...` — the SKILL's own recommended pytest idiom — injected `--memory=536870912` into a container whose scope allowed 16 GiB, OOM-killing it at 512 MiB. Under delegate-ram only an explicit `--memory-max` counts as a declared cap.
 
 **A container limit larger than the whole slice is never charged** (build review, Fable P1). The daemon terminally rejects a pinned reserve above the ceiling (`E_ADMIT_TOO_LARGE`), which the runner surfaces as a **refused launch** — so `docker run -m 70g` on a 64 GiB slice would have been refused over a reserve the caller never declared, for a container that does not live in the slice at all, in direct contradiction of §3.6's "never refuse, report instead". Such a footprint cannot be meaningfully accounted for anyway, so it is reported (`:reserve-skipped:exceeds-slice-cap`) and skipped, never silently clamped to a smaller figure that would look like an accepted charge.
+
+*Residual band, stated (round 2, Fable P2):* the skip compares against the slice cap, while the daemon rejects against `cap − headroom` (headroom = 2 GiB + 64 MiB×(jobs+1)). A container limit inside that band — e.g. `-m 63g` on a 64 GiB slice — is still pinned and can be terminally refused, and a raise that fits the ceiling but not the free window can be refused `E_ADMIT_SATURATED` after its wait. Both are narrow, and closing them would mean replicating the daemon's headroom formula client-side; per the simplicity rule they are documented rather than engineered around.
 
 **No second daemon lease.** Folding into the job's own single admission avoids a second blocking path and deadlock surface.
 
@@ -255,7 +261,7 @@ The daemon-side half — `admit.go:1488-1496` skipping leaf-empty scopes in AIRA
 - **L6 (§3.10):** `reportPeak`'s hierarchical OOM flag unchanged, with its estimate-inflation consequence named.
 - **L7 (§3.11):** detached-container lifetime versus job lifetime; warned, not fixed.
 - **L8 (§3.12):** the daemon's post-restart reserve reconstruction (`admit.go:1488-1496`) skips a running split job because it gates on the leaf `Populated`. **This is a pre-existing, already-written-down deferral, not something this feature creates** — the code says verbatim "Subtree-aware liveness for adopted is a v2 item" and declares its own error direction safe ("under-counted → over-admit … never worse" than a fully forgotten pre-restart ledger). This feature only makes it more frequent. Fable reviewed this and accepted the deferral on that basis. The fix is now **mechanical** — gate adoption on `SubtreePopulated == true` alongside leaf `> 0`; the field is already on the record — but it is daemon admission surface with AIRA-103 in flight, so it is **ticketed as a follow-up**, not done here.
-- **L9 (§3.2):** `docker run --rm alpine -m 4g` still establishes a phantom limit; distinguishing it needs a full flag-arity table, out of scope.
+- **L9 (§3.2):** inside the still-open option region the scan stays deliberately over-inclusive, so `docker run --rm alpine -m 4g` still establishes a phantom limit — `alpine` follows a bare flag and is indistinguishable from its value without a full flag-arity table, which is out of scope. Two consequences named by round-2 review: a placement flag in that region is likewise misread (`podman run --rm qemu-image --cgroup-parent=X ...` withholds split), and a standalone `--` consumed as a *value* of a preceding required-value option (`--entrypoint --`) is mistaken for the terminator. Both are contrived next to the common cases the boundary proof does handle; documented, not engineered around.
 
 ---
 

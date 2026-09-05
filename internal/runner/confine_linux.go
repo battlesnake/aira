@@ -926,7 +926,15 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// the user's container at tens of megabytes, forever and unrecoverably. Only
 	// a number the caller chose may be imposed on their container.
 	declaredContainerCap := request.ScopeMemoryMax
-	if declaredContainerCap <= 0 && declaredReserve {
+	// The !DelegateRAM guard mirrors the scope-cap assignment above, and for the
+	// same reason (build review, Fable): under --delegate-ram a declared
+	// --memory-reserve is the pinned FRAMEWORK OVERHEAD, not a cap -- the scope's
+	// own memory.max is the much larger delegate ceiling. Without this guard,
+	// `--delegate-ram --memory-reserve 512M -- podman run img pytest ...` (the
+	// SKILL's own recommended pytest idiom) would inject `--memory=536870912`
+	// into a container whose scope allows 16G, and OOM-kill it at 512M. Under
+	// delegate-ram only an explicit --memory-max is a declared cap.
+	if declaredContainerCap <= 0 && declaredReserve && !request.DelegateRAM {
 		declaredContainerCap = declaredReserveBytes
 	}
 	containerInjection := containerPlan.Inject(request.Argv, declaredContainerCap)
@@ -1260,8 +1268,9 @@ func formatConfineOOMAttributionAdvisory(verdict string, attribution ConfineOOMA
 		return fmt.Sprintf("confine: %d OOM kill(s) took this job's processes, but this scope's own limit did not declare the breach — an ancestor's cap fired (e.g. the slice) and this job was the collateral; raising this job's own cap would not have prevented it", kills)
 	case ConfineOOMUnestablished:
 		return fmt.Sprintf("confine: %d OOM kill(s) occurred under this scope; whose limit fired could not be "+
-			"established from this scope's local counters, so this may have been this scope's own cap, an "+
-			"ancestor's, or a descendant's. If this job was the victim, raise --memory-max (or --memory-reserve).", kills)
+			"established from this scope's local counters, so this was either this scope's own cap or an "+
+			"ancestor's (the shared slice). If it was this job's own, raise --memory-max (or --memory-reserve); "+
+			"if an ancestor's, the slice was over-committed and raising this job's cap will not help.", kills)
 	default:
 		return ""
 	}

@@ -220,15 +220,56 @@ func TestContainerLedgerChargeAndScopeCap(t *testing.T) {
 		},
 		{
 			// The reviewers' phantom-limit argv: the `-m` belongs to qemu, not to
-			// docker. Nothing may be charged and nothing may be claimed.
-			name: "a phantom limit after the image charges nothing",
+			// docker. Nothing may be charged, and the trailer must not claim the
+			// CALLER passed a memory flag -- the runtime never saw one.
+			name: "a phantom limit after the image charges nothing and claims nothing",
 			request: ConfineRequest{
 				Argv: []string{"docker", "run", "--rm", "qemu-image", "qemu-system-x86_64", "-m", "4G"},
 			},
 			admission:      daemonGrant(hint),
 			wantReserve:    hint,
 			wantScopeMax:   hint,
-			wantMemoryFrag: "caller=unevaluated:after-image-candidate",
+			wantMemoryFrag: "none",
+		},
+		{
+			// Build review (Sol P2): a declared --memory-reserve is an injection
+			// source, and nothing exercised that path end to end.
+			name: "a declared memory-reserve is the injected cap",
+			request: ConfineRequest{
+				Argv: []string{"podman", "run", "alpine"}, MemoryReserve: 2 << 30, MemoryReservePinned: true,
+			},
+			admission:      daemonGrant(2 << 30),
+			wantReserve:    2 << 30,
+			wantScopeMax:   2 << 30,
+			wantMemoryFrag: "injected=2147483648",
+		},
+		{
+			// Build review (Fable P1), the regression the P0-1 fix introduced:
+			// under --delegate-ram a declared --memory-reserve is the pinned
+			// FRAMEWORK OVERHEAD, not a cap, so injecting it would OOM-kill the
+			// container at 512M inside a scope that allows the delegate ceiling.
+			name: "delegate-ram never injects the framework overhead as a container cap",
+			request: ConfineRequest{
+				Argv: []string{"podman", "run", "alpine"}, DelegateRAM: true,
+				MemoryReserve: 512 << 20, MemoryReservePinned: true,
+			},
+			admission:      admissionResult{state: "immediate", reserve: 512 << 20, release: io.NopCloser(nil), scopeCeiling: 16 << 30},
+			wantReserve:    512 << 20,
+			wantScopeMax:   16 << 30,
+			wantMemoryFrag: "none",
+		},
+		{
+			// Build review (Fable P1): a limit larger than the whole slice must be
+			// reported and skipped, never pinned into a terminal rejection that
+			// would REFUSE the launch.
+			name: "a container limit larger than the slice is skipped, not charged",
+			request: ConfineRequest{
+				Argv: []string{"docker", "run", "-m", "70g", "alpine"},
+			},
+			admission:      daemonGrant(hint),
+			wantReserve:    hint,
+			wantScopeMax:   hint,
+			wantMemoryFrag: "caller=75161927680:reserve-skipped:exceeds-slice-cap",
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {

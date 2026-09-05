@@ -88,30 +88,14 @@ func TestPlanContainerMemoryUnevaluated(t *testing.T) {
 	}{
 		{"short cluster containing m", []string{"docker", "run", "-itm", "4g", "alpine"}},
 		{"two occurrences", []string{"docker", "run", "--memory=4g", "-m", "2g", "alpine"}},
-		{"trailing long with no value", []string{"docker", "run", "alpine", "--memory"}},
 		{"trailing short with no value", []string{"docker", "run", "-m"}},
+		{"trailing long with no value", []string{"docker", "run", "--memory"}},
 		{"petabyte unit AIRA does not parse", []string{"docker", "run", "--memory=1p", "alpine"}},
 		{"garbage value", []string{"docker", "run", "--memory=garbage", "alpine"}},
 		{"single dash long word", []string{"docker", "run", "-memory", "alpine"}},
 		// -m 0 means UNLIMITED to docker. Establishing it as 0 would be a
 		// category error, and a 0-byte "limit" must never reach the ledger.
 		{"zero means unlimited", []string{"docker", "run", "-m", "0", "alpine"}},
-
-		// The boundary-proof cases: both plan reviewers produced these as argv
-		// where the scan would ACT WRONGLY rather than decline. The memory-shaped
-		// token belongs to the CONTAINER'S OWN command, not to docker/podman.
-		{"reviewer case: qemu -m after image", []string{"docker", "run", "--rm", "qemu-image", "qemu-system-x86_64", "-m", "4G"}},
-		{"reviewer case: long form after image", []string{"docker", "run", "alpine", "echo", "--memory=8g"}},
-		{"python -m after image", []string{"docker", "run", "alpine", "python", "-m", "http.server"}},
-		// Build review (Sol P1): `--` is pflag's definitive end-of-options
-		// marker, so the token after it is the image and `-m` beyond that is the
-		// CONTAINER's flag. Without honouring it this charged the ledger 8G.
-		{"end-of-options marker then image then -m", []string{"docker", "run", "--", "alpine", "-m", "8g"}},
-		{"end-of-options with flags before it", []string{"docker", "run", "--rm", "--", "alpine", "qemu", "-m", "8g"}},
-		// The token AT the image position is the image, never an option: this
-		// names an image literally called "-m". Reading it as docker's memory
-		// flag would charge the ledger for an argument that is not one.
-		{"the token at the image position is the image", []string{"docker", "run", "--", "-m", "8g"}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			plan := PlanContainerIntegration(testCase.argv)
@@ -126,6 +110,46 @@ func TestPlanContainerMemoryUnevaluated(t *testing.T) {
 			}
 			if strings.TrimSpace(plan.MemoryReason) == "" {
 				t.Fatalf("MemoryReason is empty; an unevaluated result must say why")
+			}
+		})
+	}
+}
+
+// TestPlanContainerMemoryAfterTheImageIsNotTheRuntimesFlag: once the option
+// region has PROVABLY closed, every remaining token is the container's own
+// command, so a memory-shaped token there is python's or gcc's -- not a limit
+// the caller gave docker/podman.
+//
+// An earlier build set MemoryPresent for these anyway "to be safe". That was not
+// safe: it defeated injection on the ticket's own target case (`docker run img
+// python -m pytest` with a declared confine limit) and made the trailer assert
+// `caller=` for a flag the runtime never saw (build review, Fable + Sol).
+func TestPlanContainerMemoryAfterTheImageIsNotTheRuntimesFlag(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		argv []string
+	}{
+		{"python -m", []string{"docker", "run", "img", "python", "-m", "pytest"}},
+		{"go -mod", []string{"docker", "run", "img", "go", "build", "-mod=vendor"}},
+		{"gcc -m64", []string{"docker", "run", "img", "gcc", "-m64", "x.c"}},
+		{"reviewer case: qemu -m after image", []string{"docker", "run", "--rm", "qemu-image", "qemu-system-x86_64", "-m", "4G"}},
+		{"reviewer case: long form after image", []string{"docker", "run", "alpine", "echo", "--memory=8g"}},
+		{"end-of-options marker then image then -m", []string{"docker", "run", "--", "alpine", "-m", "8g"}},
+		{"end-of-options with flags before it", []string{"docker", "run", "--rm", "--", "alpine", "qemu", "-m", "8g"}},
+		{"the token at the image position is the image", []string{"docker", "run", "--", "-m", "8g"}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			plan := PlanContainerIntegration(testCase.argv)
+			if plan.MemoryPresent {
+				t.Fatalf("MemoryPresent = true for a token the runtime never saw (reason %q)", plan.MemoryReason)
+			}
+			if plan.MemoryEstablished {
+				t.Fatalf("MemoryEstablished = true (%d): the token is the container's", plan.MemoryBytes)
+			}
+			// And therefore a declared cap IS injected.
+			injection := plan.Inject(testCase.argv, 2<<30)
+			if injection.MemoryFacet != "injected=2147483648" {
+				t.Fatalf("facet = %q, want injected=2147483648", injection.MemoryFacet)
 			}
 		})
 	}
@@ -183,6 +207,9 @@ func TestPlanContainerCallerCgroupFlags(t *testing.T) {
 		{"cgroupns is not a cgroup placement flag", []string{"podman", "run", "--cgroupns=host", "alpine"}, "", false},
 		{"cgroup-conf is not a cgroup placement flag", []string{"podman", "run", "--cgroup-conf=memory.high=1", "alpine"}, "", false},
 		{"none", []string{"podman", "run", "alpine"}, "", false},
+		// pflag resolves a repeated flag LAST-WINS, so this is NOT split
+		// (build review, Sol P1).
+		{"repeated cgroups is last-wins", []string{"podman", "run", "--cgroups=split", "--cgroups=enabled", "alpine"}, "--cgroups", false},
 
 		// Build review (Sol P1): a placement-shaped token in the CONTAINER's own
 		// command is not the caller's placement choice. Treating it as one would
@@ -459,6 +486,36 @@ func TestContainerMemoryFacet(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			if got := ContainerMemoryFacet(testCase.plan, testCase.injection, testCase.skip, testCase.charged); got != testCase.want {
 				t.Fatalf("facet = %q, want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+// TestNestsInJobScope: the predicate every podman-specific decision rests on.
+// Claiming nesting when the container is NOT nested skips a real ledger charge
+// and asserts a kernel binding that does not exist (build review, Sol P1).
+func TestNestsInJobScope(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		argv []string
+		want bool
+	}{
+		{"podman, nothing declared", []string{"podman", "run", "alpine"}, true},
+		{"podman, caller asked for split", []string{"podman", "run", "--cgroups=split", "alpine"}, true},
+		{"podman, caller placed it elsewhere", []string{"podman", "run", "--cgroup-parent=aira.slice", "alpine"}, false},
+		{"podman, caller used a pod", []string{"podman", "run", "--pod", "p", "alpine"}, false},
+		{"podman, cgroups disabled", []string{"podman", "run", "--cgroups=disabled", "alpine"}, false},
+		// Last-wins: the effective value is not split.
+		{"podman, split then enabled", []string{"podman", "run", "--cgroups=split", "--cgroups=enabled", "alpine"}, false},
+		// Two mechanisms at once: conflicting, so nesting is never claimed.
+		{"podman, split plus a pod", []string{"podman", "run", "--cgroups=split", "--pod", "p", "alpine"}, false},
+		{"podman, split plus a cgroup-parent", []string{"podman", "run", "--cgroups=split", "--cgroup-parent=x", "alpine"}, false},
+		{"docker never nests", []string{"docker", "run", "alpine"}, false},
+		{"undetected never nests", []string{"go", "test", "./..."}, false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := PlanContainerIntegration(testCase.argv).NestsInJobScope(); got != testCase.want {
+				t.Fatalf("NestsInJobScope = %v, want %v", got, testCase.want)
 			}
 		})
 	}
