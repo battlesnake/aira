@@ -129,7 +129,10 @@ type relayExit struct {
 // of the pre-AIRA-39/41 shape and is now false — the ledger is Σ memory.max over
 // the outer scope's real `.aira-worker-*` children, so closing a lease frees
 // NOTHING and only removing the scope does. Asserting the ticket's version would
-// have failed against a correct build. The real invariant is pinned in phase 4.
+// have failed against a correct build. The real invariant is already pinned by
+// TestWorkerAdmitLedgerKeepsChargingAfterRelayCloses; phase 4 below re-states it
+// through the real connection and the real tree, which is a narrower addition —
+// see its own comment.
 //
 // verifies: AIRA-43
 // verifies: AIRA-41
