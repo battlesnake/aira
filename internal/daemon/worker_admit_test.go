@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"aira/internal/runner"
+	"aira/internal/testdeadline"
 )
 
 // workerScopeTree is an in-memory stand-in for the outer scope's real
@@ -804,7 +805,7 @@ func TestWorkerAdmitConnectionGrantsThenHoldsUntilPeerCloses(t *testing.T) {
 	_ = clientConn.Close()
 	select {
 	case <-done:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("connection did not release after peer close")
 	}
 	// The lease closing must not leave the daemon in a broken state that then
@@ -861,7 +862,7 @@ func TestWorkerAdmitConnectionPollLoopReEvaluatesAndGrantsBeforeDeadline(t *test
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("worker-admit connection did not grant after live usage cleared")
 	}
 	var response WorkerAdmitResponse
@@ -871,7 +872,7 @@ func TestWorkerAdmitConnectionPollLoopReEvaluatesAndGrantsBeforeDeadline(t *test
 	_ = clientConn.Close()
 	select {
 	case <-done:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("connection did not release after peer close")
 	}
 }
@@ -945,7 +946,7 @@ func TestWorkerAdmitConnectionDeniesImmediatelyWithoutWaitingOutMaxWait(t *testi
 	if err := readFrame(clientConn, &frame); err != nil {
 		t.Fatal(err)
 	}
-	if elapsed := time.Since(started); elapsed > time.Second {
+	if elapsed := time.Since(started); testdeadline.Exceeded(elapsed, time.Second) {
 		t.Fatalf("denial took %v — looks like it waited out max_wait_ms instead of denying immediately", elapsed)
 	}
 	var response WorkerAdmitResponse
@@ -1083,7 +1084,7 @@ func TestWorkerAdmitConnectionReleasesItsAdmitSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = clientConn.Close()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(2 * time.Second))
 	for len(server.admitSlots) != 0 {
 		if time.Now().After(deadline) {
 			t.Fatalf("admitSlots still holds %d token(s) after worker-admit returned", len(server.admitSlots))
@@ -1563,7 +1564,7 @@ func TestWorkerScopeLockReleasesOnCancelledWaiter(t *testing.T) {
 		if got {
 			t.Fatal("a cancelled waiter reported that it acquired the lock")
 		}
-	case <-time.After(2 * time.Second):
+	case <-testdeadline.After(2 * time.Second):
 		t.Fatal("a cancelled waiter stayed blocked on the outer-scope lock")
 	}
 	state.release()

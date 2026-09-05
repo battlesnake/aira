@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"aira/internal/cgrouptest"
+	"aira/internal/testdeadline"
 )
 
 func TestResolveConfineSlicePrecedence(t *testing.T) {
@@ -377,7 +378,7 @@ func TestCPUWeightDecayScheduleIsMonotoneAndReachesFloor(t *testing.T) {
 	})
 	defer stop()
 	got := make([]int64, 0, len(steps))
-	deadline := time.After(time.Second)
+	deadline := testdeadline.After(time.Second)
 	for len(got) < len(steps) {
 		select {
 		case weight := <-weights:
@@ -717,7 +718,7 @@ func TestConfineSignalHandlerInstalledBeforeStartCleansScope(t *testing.T) {
 			return err
 		}
 		signals <- syscall.SIGTERM
-		deadline := time.Now().Add(time.Second)
+		deadline := time.Now().Add(testdeadline.Wait(time.Second))
 		for {
 			scope.mu.Lock()
 			cleaned := scope.killed && scope.removed
@@ -867,7 +868,7 @@ func TestConfineDaemonAdmissionTimeoutUsesRequestedOrDefaultWait(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "E_ADMIT_SATURATED") {
 				t.Fatalf("err=%v, want terminal saturated rejection", err)
 			}
-			if elapsed := time.Since(started); elapsed > test.want+time.Second {
+			if elapsed := time.Since(started); testdeadline.Exceeded(elapsed, test.want+time.Second) {
 				t.Fatalf("saturated daemon rejection took %s, want within requested wait %s", elapsed, test.want)
 			}
 			select {
@@ -876,7 +877,7 @@ func TestConfineDaemonAdmissionTimeoutUsesRequestedOrDefaultWait(t *testing.T) {
 				if !ok || int64(got) != test.want.Milliseconds() {
 					t.Fatalf("max_wait_ms=%v want=%d", frame.Request.Args["max_wait_ms"], test.want.Milliseconds())
 				}
-			case <-time.After(time.Second):
+			case <-testdeadline.After(time.Second):
 				t.Fatal("daemon did not receive admission request")
 			}
 		})
@@ -1856,7 +1857,7 @@ func TestConfineRealSetupHandshakeWriteFailureNeverExecsTarget(t *testing.T) {
 	}
 	defer releaseRead.Close()
 	defer releaseWrite.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testdeadline.Wait(2*time.Second))
 	defer cancel()
 	cmd := exec.CommandContext(ctx, os.Args[0], mustConfineSetupArgv(t, []string{
 		"/bin/sh", "-c", "echo ran > \"$1\"", "sh", marker,
@@ -1894,7 +1895,7 @@ func TestConfineRealStandaloneSetupOutsideOOMGroupNeverExecsTarget(t *testing.T)
 	}
 	defer releaseRead.Close()
 	defer releaseWrite.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testdeadline.Wait(2*time.Second))
 	defer cancel()
 	cmd := exec.CommandContext(ctx, os.Args[0], mustConfineSetupArgv(t, []string{
 		"/bin/sh", "-c", "echo ran > \"$1\"", "sh", marker,
@@ -1940,7 +1941,7 @@ func TestConfineRealSetupClosedReleaseNeverExecsTarget(t *testing.T) {
 	}
 	defer releaseRead.Close()
 	defer releaseWrite.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testdeadline.Wait(2*time.Second))
 	defer cancel()
 	cmd := exec.CommandContext(ctx, os.Args[0], mustConfineSetupArgv(t, []string{
 		"/bin/sh", "-c", "echo ran > \"$1\"", "sh", marker,
@@ -2157,7 +2158,7 @@ func TestConfineRealAdmissionWaitsThenProceedsDaemonDown(t *testing.T) {
 		_, launchErr := filler.Launch(context.Background(), Request{Argv: []string{"python3", "-c", "import time; x=bytearray(80*1024*1024); x[-1]=1; time.sleep(0.5)"}})
 		fillerDone <- launchErr
 	}()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(2 * time.Second))
 	for {
 		current, maximum, ok, reason := readSliceMemory(parent)
 		if !ok {
@@ -2345,7 +2346,7 @@ func TestConfineAdmissionWaitEmitsProgressDiagnostic(t *testing.T) {
 			SelfPath: os.Args[0], Stderr: sink,
 		}, deps)
 	}()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(3 * time.Second))
 	seen := false
 	for time.Now().Before(deadline) {
 		mu.Lock()
@@ -2405,7 +2406,7 @@ func TestConfineAdmissionWaitDiagnosticHedgesUnpinnedReserve(t *testing.T) {
 			SelfPath: os.Args[0], Stderr: sink,
 		}, deps)
 	}()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(3 * time.Second))
 	seen := false
 	for time.Now().Before(deadline) {
 		mu.Lock()

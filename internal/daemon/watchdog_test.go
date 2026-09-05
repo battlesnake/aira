@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"aira/internal/store"
+	"aira/internal/testdeadline"
 	"golang.org/x/sys/unix"
 )
 
@@ -1067,7 +1068,7 @@ func TestRunWatchdogOffParksAndDrains(t *testing.T) {
 	cancel()
 	select {
 	case <-done:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("off watchdog did not drain")
 	}
 	if logs.Len() != 0 {
@@ -1285,7 +1286,7 @@ func TestRealProcObserveSelectsClaudeChildWithoutSignalling(t *testing.T) {
 	mount, mountErr := watchdogUnifiedMount()
 	var procs map[int]watchdogProc
 	foundTree := false
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(2 * time.Second))
 	for time.Now().Before(deadline) {
 		procs, err = snapshotWatchdogProcs(mount, mountErr)
 		if err == nil && procs[childPID].ppid == cmd.Process.Pid && procs[cmd.Process.Pid].comm == "claude" {

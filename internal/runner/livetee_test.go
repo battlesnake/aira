@@ -19,6 +19,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"aira/internal/testdeadline"
 )
 
 // isolatedScopeParent creates a unique cgroup-v2 parent per test so a run's
@@ -271,10 +273,10 @@ func TestLiveTeeUnitCaptureCompletesWhileSinkBlocked(t *testing.T) {
 	}()
 	select {
 	case <-sink.entered:
-	case <-time.After(2 * time.Second):
+	case <-testdeadline.After(2 * time.Second):
 		t.Fatal("blocking sink was not entered")
 	}
-	deadline := time.After(2 * time.Second)
+	deadline := testdeadline.After(2 * time.Second)
 	for {
 		stat, statErr := os.Stat(path)
 		if statErr == nil && stat.Size() == int64(len(want)) {
@@ -290,18 +292,18 @@ func TestLiveTeeUnitCaptureCompletesWhileSinkBlocked(t *testing.T) {
 	var result captureResult
 	select {
 	case result = <-resultCh:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("capture result was not published while sink was blocked")
 	}
 	select {
 	case <-drainDone:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("drain did not exit while sink was blocked")
 	}
 	sink.unblock()
 	select {
 	case <-live.done:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("live writer did not exit after release")
 	}
 	wantDigest := sha256.Sum256(want)
@@ -338,24 +340,24 @@ func TestLiveTeeElisionMarkersAccountForDropsAndTrailingDrop(t *testing.T) {
 	}()
 	select {
 	case <-sink.entered:
-	case <-time.After(2 * time.Second):
+	case <-testdeadline.After(2 * time.Second):
 		t.Fatal("live sink did not block")
 	}
 	var result captureResult
 	select {
 	case result = <-resultCh:
-	case <-time.After(2 * time.Second):
+	case <-testdeadline.After(2 * time.Second):
 		t.Fatal("capture result was not published while live sink was blocked")
 	}
 	select {
 	case <-drainDone:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("drain did not exit while live sink was blocked")
 	}
 	sink.unblock()
 	select {
 	case <-stream.done:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("live writer did not exit after release")
 	}
 	live := sink.Bytes()
@@ -420,10 +422,10 @@ func TestLiveTeeLaunchBlockedSinkDoesNotBlockCapture(t *testing.T) {
 	}()
 	select {
 	case <-sink.entered:
-	case <-time.After(3 * time.Second):
+	case <-testdeadline.After(3 * time.Second):
 		t.Fatal("live sink did not become blocked")
 	}
-	deadline := time.After(3 * time.Second)
+	deadline := testdeadline.After(3 * time.Second)
 	for {
 		record, err := r.Get("RUN-1")
 		if err == nil && record.OutputRefs["out"].Path != "" {
@@ -451,7 +453,7 @@ func TestLiveTeeLaunchBlockedSinkDoesNotBlockCapture(t *testing.T) {
 		if item.record.OutputRefs["out"].Digest != hex.EncodeToString(want[:]) {
 			t.Fatalf("digest=%s want=%x", item.record.OutputRefs["out"].Digest, want)
 		}
-	case <-time.After(3 * time.Second):
+	case <-testdeadline.After(3 * time.Second):
 		t.Fatal("launch did not return after live sink release")
 	}
 }
@@ -530,7 +532,7 @@ func TestLiveTeeForcedCloseDisablesBlockedSink(t *testing.T) {
 		if item.err != nil || item.record == nil || !item.record.CaptureForcedClosed {
 			t.Fatalf("forced-close launch err=%v record=%+v", item.err, item.record)
 		}
-	case <-time.After(8 * time.Second):
+	case <-testdeadline.After(8 * time.Second):
 		t.Fatal("forced-close launch hung on the blocked live sink")
 	}
 	// The gate was disabled by the time Launch returned, so at most one write was in
@@ -559,11 +561,11 @@ func TestLiveTeeCancelDuringNormalJoinKeepsCaptureComplete(t *testing.T) {
 	}()
 	select {
 	case <-sink.entered:
-	case <-time.After(2 * time.Second):
+	case <-testdeadline.After(2 * time.Second):
 		t.Fatal("live sink did not become blocked")
 	}
 	var path string
-	deadline := time.After(2 * time.Second)
+	deadline := testdeadline.After(2 * time.Second)
 	for path == "" {
 		if record, err := r.Get("RUN-1"); err == nil {
 			path = record.OutputRefs["out"].Path
@@ -593,7 +595,7 @@ func TestLiveTeeCancelDuringNormalJoinKeepsCaptureComplete(t *testing.T) {
 		if item.record.OutputRefs["out"].Digest == "" {
 			t.Fatal("cancel join lost capture digest")
 		}
-	case <-time.After(3 * time.Second):
+	case <-testdeadline.After(3 * time.Second):
 		t.Fatal("cancel during normal live join did not return")
 	}
 	if got := sink.writes.Load(); got > 1 {
@@ -608,7 +610,7 @@ func TestLiveTeeGateDisableIsNonBlocking(t *testing.T) {
 	stream.ch <- liveChunk{data: []byte("x")}
 	select {
 	case <-sink.entered:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("writer did not enter sink")
 	}
 	stream.gate.disable()
@@ -624,7 +626,7 @@ func TestLiveTeeGateDisableIsNonBlocking(t *testing.T) {
 	sink.unblock()
 	select {
 	case <-done:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("writer did not drain after release")
 	}
 }

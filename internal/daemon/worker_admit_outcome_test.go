@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"aira/internal/runner"
+	"aira/internal/testdeadline"
 )
 
 // verifies: AIRA-42 — every daemon-side verdict carries a catalogued
@@ -256,7 +257,7 @@ func TestWorkerAdmitPollLoopBreaksOnClassNotOnReasonSpelling(t *testing.T) {
 			}()
 			select {
 			case <-done:
-			case <-time.After(10 * time.Second):
+			case <-testdeadline.After(10 * time.Second):
 				t.Fatal("workerAdmitConnection never terminated")
 			}
 			<-drained

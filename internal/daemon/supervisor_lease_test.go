@@ -12,6 +12,7 @@ import (
 
 	"aira/internal/core"
 	"aira/internal/store"
+	"aira/internal/testdeadline"
 )
 
 func daemonSupervisorToken(seed byte) (string, string) {
@@ -198,7 +199,7 @@ func TestSupervisorLeaseDaemonReaperTimerLapsesExpired(t *testing.T) {
 	if _, _, err := view.ClaimSupervisorLease(context.Background(), "RUN-3", os.Getpid(), 1, currentBootID(), tokenHash, uint64(time.Millisecond)); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(2 * time.Second))
 	for {
 		lease, err := view.GetSupervisorLease(context.Background(), "RUN-3")
 		if err != nil {

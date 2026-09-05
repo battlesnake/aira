@@ -33,6 +33,7 @@ import (
 	"aira/internal/cgrouptest"
 	"aira/internal/daemon"
 	"aira/internal/pylib"
+	"aira/internal/testdeadline"
 )
 
 func requireRealPytest(t *testing.T) string {
@@ -349,7 +350,7 @@ func TestRealPytestAitestEndToEndRealDaemonAndCgroupPassFailOnly(t *testing.T) {
 	// delegation, and worker placement, so exclude only that hazardous file.
 	harness := newRealDaemonAndCgroupTestHarness(t)
 
-	runCtx, cancelRun := context.WithTimeout(context.Background(), time.Minute)
+	runCtx, cancelRun := context.WithTimeout(context.Background(), testdeadline.Wait(time.Minute))
 	defer cancelRun()
 	command := exec.CommandContext(runCtx, harness.pytest, "-q", "--aitest-workers=2", "test_pass.py", "test_fail.py")
 	command.Dir = filepath.Join(harness.aitestDir, "testdata")
@@ -423,7 +424,7 @@ func TestRealPytestAitestEndToEndRealDaemonAndCgroup(t *testing.T) {
 	// parts (well under a second, per repeated real runs) while still
 	// bounding the worst case observed (multi-minute throttle convergence)
 	// to a finite, diagnosable failure instead of an unbounded hang.
-	runCtx, cancelRun := context.WithTimeout(context.Background(), 4*time.Minute)
+	runCtx, cancelRun := context.WithTimeout(context.Background(), testdeadline.Wait(4*time.Minute))
 	defer cancelRun()
 	command := exec.CommandContext(runCtx, harness.pytest, "-q", "--aitest-workers=2")
 	command.Dir = filepath.Join(harness.aitestDir, "testdata")

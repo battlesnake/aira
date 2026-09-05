@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"aira/internal/runner"
+	"aira/internal/testdeadline"
 )
 
 // TestWorkerAdmitCLIOutcomeChannelMatchesTheSupervisorBoundary drives the real
@@ -63,7 +64,7 @@ func TestWorkerAdmitCLIOutcomeChannelMatchesTheSupervisorBoundary(t *testing.T) 
 	case <-ready:
 	case err := <-done:
 		t.Fatalf("daemon exited before ready: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("daemon did not become ready")
 	}
 	t.Cleanup(func() {
@@ -114,7 +115,7 @@ func TestWorkerAdmitCLIOutcomeChannelMatchesTheSupervisorBoundary(t *testing.T) 
 	t.Run("timeout is contended, never a permanent verdict", func(t *testing.T) {
 		started := time.Now()
 		stdout, stderr := runWorkerAdmit("/deny-timeout", workerAdmitEstimatedBytesMin, "50ms")
-		if elapsed := time.Since(started); elapsed > 5*time.Second {
+		if elapsed := time.Since(started); testdeadline.Exceeded(elapsed, 5*time.Second) {
 			t.Fatalf("timeout worker-admit took %v — looks like it ignored max-wait", elapsed)
 		}
 		assertOutcome(t, stdout, stderr,

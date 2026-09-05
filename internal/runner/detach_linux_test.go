@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"aira/internal/testdeadline"
 )
 
 func TestMain(m *testing.M) {
@@ -298,17 +300,18 @@ func TestM20LauncherDefersACKAndBoundsReadiness(t *testing.T) {
 		if err := launch.Complete(true); err != nil {
 			t.Fatal(err)
 		}
-		deadline := time.Now().Add(time.Second)
-		for time.Now().Before(deadline) {
-			if data, err := os.ReadFile(ackPath); err == nil {
-				if string(data) != "1" {
-					t.Fatalf("ack=%q", data)
-				}
-				return
+		var ack []byte
+		testdeadline.Eventually(t, time.Second, func() bool {
+			data, err := os.ReadFile(ackPath)
+			if err != nil {
+				return false
 			}
-			time.Sleep(5 * time.Millisecond)
+			ack = data
+			return true
+		}, "fake supervisor did not observe ACK")
+		if string(ack) != "1" {
+			t.Fatalf("ack=%q", ack)
 		}
-		t.Fatal("fake supervisor did not observe ACK")
 	})
 
 	t.Run("readiness timeout cancels", func(t *testing.T) {
@@ -318,7 +321,11 @@ func TestM20LauncherDefersACKAndBoundsReadiness(t *testing.T) {
 		started := time.Now()
 		launch, err := r.LaunchDetached(context.Background(), Request{Argv: []string{"/bin/true"}, Detach: true}, "")
 		var typed *LaunchError
-		if launch != nil || !errors.As(err, &typed) || typed.Code != "E_RUN_DETACH_FAILED" || time.Since(started) > time.Second {
+		// The budget separates the 20ms readiness timeout from the unbounded wait an
+		// implementation without one would take (the default asserted above is 60s),
+		// so it can be generous without becoming vacuous. A one-second budget had to
+		// cover a real fork/exec as well and was the tight half (AIRA-20).
+		if launch != nil || !errors.As(err, &typed) || typed.Code != "E_RUN_DETACH_FAILED" || testdeadline.Exceeded(time.Since(started), 30*time.Second) {
 			t.Fatalf("launch=%+v err=%v elapsed=%s", launch, err, time.Since(started))
 		}
 	})
@@ -341,7 +348,7 @@ func TestM20BoundedRunLockTimesOutHonestly(t *testing.T) {
 	if !errors.As(err, &launch) || launch.Code != "U_RUN_LAUNCH_STALLED" {
 		t.Fatalf("bounded lock error = %v", err)
 	}
-	if time.Since(started) > time.Second {
+	if testdeadline.Exceeded(time.Since(started), time.Second) {
 		t.Fatalf("bounded lock did not return promptly")
 	}
 }
@@ -802,7 +809,23 @@ func TestM20DetachedRunKillWaitsForPreScopeSupervisorTerminal(t *testing.T) {
 	if _, err := r.append(ledgerEvent{Kind: "kill-intent", Run: run}); err != nil {
 		t.Fatal(err)
 	}
+	// finishDetachedKill returns as soon as it observes the terminal record, which
+	// the injected terminalizer publishes partway through its own work. Without
+	// joining it the test can return while that goroutine is still writing under
+	// the ledger directory, and t.TempDir's cleanup then fails with "directory not
+	// empty" — the shape this test failed in during a pre-push `make test`
+	// (AIRA-20). The join is deferred so it also runs on a t.Fatal path, and it
+	// runs before the TempDir cleanup registered by newMemoryRunner.
+	terminalizerDone := make(chan struct{})
+	defer func() {
+		select {
+		case <-terminalizerDone:
+		case <-testdeadline.After(10 * time.Second):
+			t.Error("the injected terminalizer never returned; its writes can outlive the test")
+		}
+	}()
 	go func() {
+		defer close(terminalizerDone)
 		time.Sleep(10 * time.Millisecond)
 		_, _ = r.terminalizeDetachedNoChild(context.Background(), run, true, "E_RUN_KILLED", errors.New("injected admission-window kill"))
 	}()
@@ -893,7 +916,7 @@ func startRealDetached(t *testing.T, r *Runner, req Request) (string, <-chan lau
 
 func waitForRunState(t *testing.T, r *Runner, id string, accept func(RunRecord) bool) RunRecord {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(5 * time.Second))
 	for time.Now().Before(deadline) {
 		record, err := r.ledger.current(id)
 		if err == nil && accept(record) {
@@ -927,7 +950,7 @@ func TestM20RealDetachReturnsWhileChildLivesAndSupervisorIsOutsideScope(t *testi
 		if outcome.err != nil || outcome.record == nil || outcome.record.Status != StatusKilled {
 			t.Fatalf("supervisor outcome=%+v", outcome)
 		}
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("supervisor did not finish after run-kill")
 	}
 }
@@ -939,6 +962,11 @@ func TestRunInputRealDescendantReceivesEOFAfterLeaderExit(t *testing.T) {
 	}
 	r := realRunner(t)
 	r.inputRuntimeDir = newRunInputRuntimeDir(t)
+	// The elapsed assertion below is "terminated before the quiescence grace, not
+	// after it", so the grace is the yardstick and both halves must move together:
+	// scaling only the observation would compare a contended wall clock against a
+	// fixed 2s default and fail on a loaded box for no behavioural reason (AIRA-20).
+	r.grace = testdeadline.Wait(r.grace)
 	started := time.Now()
 	_, result := startRealDetached(t, r, Request{Argv: []string{python, "-c", "import os,sys\nif os.fork():\n os._exit(0)\nsys.stdin.read()"}, StdinConnect: true})
 	select {
@@ -956,7 +984,9 @@ func TestRunInputRealDescendantReceivesEOFAfterLeaderExit(t *testing.T) {
 		if elapsed := time.Since(started); elapsed >= r.grace {
 			t.Fatalf("descendant terminated only after the quiescence grace (%s); inputW closed late", elapsed)
 		}
-	case <-time.After(5 * time.Second):
+	// Comfortably past the scaled grace, so a late-inputW-close implementation is
+	// reported by the QuiesceForced discriminator above rather than racing this arm.
+	case <-testdeadline.After(60 * time.Second):
 		t.Fatal("leader-exit input close did not release the descendant")
 	}
 }
@@ -991,7 +1021,7 @@ func TestRunInputRealBinaryReconnectAndExplicitEOF(t *testing.T) {
 		if _, statErr := os.Stat(running.InputSocket); !errors.Is(statErr, os.ErrNotExist) {
 			t.Fatalf("input socket was not unlinked: %v", statErr)
 		}
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("cat did not exit after explicit input close")
 	}
 }
@@ -1014,7 +1044,7 @@ func TestRunInputRealKillUnblocksFullPipeSplice(t *testing.T) {
 	}
 	select {
 	case <-inputDone:
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("closing inputW did not unblock the full-pipe splice")
 	}
 	select {
@@ -1022,7 +1052,7 @@ func TestRunInputRealKillUnblocksFullPipeSplice(t *testing.T) {
 		if outcome.err != nil || outcome.record == nil || !outcome.record.Status.Terminal() {
 			t.Fatalf("supervisor outcome=%+v", outcome)
 		}
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("supervisor did not terminalize after mid-input kill")
 	}
 	if _, statErr := os.Stat(running.InputSocket); !errors.Is(statErr, os.ErrNotExist) {

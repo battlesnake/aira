@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"aira/internal/testdeadline"
 )
 
 func TestClassifyLaunchScopeIntegrityDistinguishesSubtreeFromSiblingEscape(t *testing.T) {
@@ -362,7 +364,7 @@ func TestRealCgroupForkThenMigrateOutIsWitnessedNotContained(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		_ = os.WriteFile(filepath.Join(target, "cgroup.kill"), []byte("1"), 0o644)
-		deadline := time.Now().Add(time.Second)
+		deadline := time.Now().Add(testdeadline.Wait(time.Second))
 		for time.Now().Before(deadline) {
 			if os.Remove(target) == nil {
 				return
@@ -445,7 +447,7 @@ func TestRealCgroupConfineWitnessesSiblingEscape(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		_ = os.WriteFile(filepath.Join(target, "cgroup.kill"), []byte("1"), 0o644)
-		deadline := time.Now().Add(time.Second)
+		deadline := time.Now().Add(testdeadline.Wait(time.Second))
 		for time.Now().Before(deadline) {
 			if os.Remove(target) == nil {
 				return

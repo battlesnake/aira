@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"aira/internal/cgrouptest"
+	"aira/internal/testdeadline"
 
 	"golang.org/x/sys/unix"
 )
@@ -278,7 +279,7 @@ func startDetachLauncher(t *testing.T, env []string) (*exec.Cmd, launcherHandle)
 			t.Fatalf("launcher produced no handle: %v", result.err)
 		}
 		handle = result.handle
-	case <-time.After(30 * time.Second):
+	case <-testdeadline.After(30 * time.Second):
 		t.Fatal("launcher did not report a handle")
 	}
 	// The supervisor is setsid'd, so killing the launcher's process group -- which
@@ -292,7 +293,7 @@ func startDetachLauncher(t *testing.T, env []string) (*exec.Cmd, launcherHandle)
 	if skipAck || handle.Error != "" {
 		return cmd, handle
 	}
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(30 * time.Second))
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(marker); err == nil {
 			return cmd, handle
@@ -357,7 +358,7 @@ func TestDetachedSupervisorSurvivesAGroupKillOfItsLauncher(t *testing.T) {
 	}
 	// The supervisor must be alive AND still doing work: a process that exists
 	// but has stopped producing output would satisfy a weaker assertion.
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(5 * time.Second))
 	grew := false
 	for time.Now().Before(deadline) {
 		if detachFileSize(t, capture) > before {
@@ -476,7 +477,7 @@ func TestLaunchConfineDetachedTimesOutOnASilentSupervisor(t *testing.T) {
 	if !strings.Contains(err.Error(), CodeConfineDetachFailed) || !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("wrong failure: %v", err)
 	}
-	if elapsed := time.Since(started); elapsed > 3*time.Second {
+	if elapsed := time.Since(started); testdeadline.Exceeded(elapsed, 3*time.Second) {
 		t.Fatalf("the launcher waited %s; the readiness timeout did not bound it", elapsed)
 	}
 }
@@ -500,7 +501,7 @@ func TestUnacknowledgedDetachedSupervisorRefusesToRunTheJob(t *testing.T) {
 		t.Fatalf("no handle: %+v", handle)
 	}
 	recordPath := filepath.Join(state, handle.ScopeID, confineDetachRecordName)
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(10 * time.Second))
 	for time.Now().Before(deadline) {
 		data, err := os.ReadFile(recordPath)
 		if err == nil {
@@ -758,7 +759,7 @@ func TestConfineSupervisorAliveDistinguishesLiveReusedAndUnreadablePIDs(t *testi
 	}
 	zombiePID := zombie.Process.Pid
 	zombieIdentity := PIDIdentity{PID: zombiePID, StartTick: processStartTick(zombiePID), BootID: boot}
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(5 * time.Second))
 	sawZombie := false
 	for time.Now().Before(deadline) {
 		data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(zombiePID), "stat"))
@@ -870,7 +871,7 @@ func TestListConfineDetachRecordsRefusesANonRegularRecord(t *testing.T) {
 		if len(records) != 1 || records[0].ReadError == "" {
 			t.Fatalf("a fifo was accepted as a record: %+v", records)
 		}
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("reading a fifo record blocked the status query")
 	}
 }
@@ -1074,7 +1075,7 @@ func runSuperviseSubprocess(t *testing.T, request ConfineRequest, acknowledge bo
 	var message confineDetachReady
 	select {
 	case message = <-decoded:
-	case <-time.After(30 * time.Second):
+	case <-testdeadline.After(30 * time.Second):
 		_ = cmd.Process.Kill()
 		t.Fatal("the supervisor reported nothing")
 	}
@@ -1344,7 +1345,7 @@ func TestConfineListAndKillTargetTheDetachedSupervisorPID(t *testing.T) {
 	// is a different (and honestly reported) outcome from the external cgroup
 	// kill this test is about.
 	capture := filepath.Join(handle.RecordDir, confineDetachStdoutName)
-	runningBy := time.Now().Add(30 * time.Second)
+	runningBy := time.Now().Add(testdeadline.Wait(30 * time.Second))
 	for time.Now().Before(runningBy) {
 		if data, err := os.ReadFile(capture); err == nil && strings.Contains(string(data), "started") {
 			break
@@ -1354,7 +1355,7 @@ func TestConfineListAndKillTargetTheDetachedSupervisorPID(t *testing.T) {
 
 	// Wait for the scope to appear and be populated.
 	var listed ConfineRecord
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(30 * time.Second))
 	for time.Now().Before(deadline) {
 		result, err := ListConfines(context.Background(), parent, nil)
 		if err == nil && result.Verdict == "pass" {
@@ -1388,7 +1389,7 @@ func TestConfineListAndKillTargetTheDetachedSupervisorPID(t *testing.T) {
 	if killed.ScopeID != handle.ScopeID {
 		t.Fatalf("killed %q, want %q", killed.ScopeID, handle.ScopeID)
 	}
-	deadline = time.Now().Add(30 * time.Second)
+	deadline = time.Now().Add(testdeadline.Wait(30 * time.Second))
 	for time.Now().Before(deadline) {
 		record := soleDetachRecord(t, state)
 		if !record.Terminal {
@@ -1446,7 +1447,7 @@ func TestDetachedSupervisorIgnoresAnExplicitSIGHUP(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	deadline := time.Now().Add(45 * time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(45 * time.Second))
 	for time.Now().Before(deadline) {
 		record := soleDetachRecord(t, state)
 		if record.Terminal {
@@ -1489,7 +1490,7 @@ func TestConfineDetachEndToEndSurvivesTheLauncherAndCapturesTheOutcome(t *testin
 	_ = syscall.Kill(-launcher.Process.Pid, syscall.SIGKILL)
 	_ = launcher.Wait()
 
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(60 * time.Second))
 	var record ConfineDetachRecord
 	for time.Now().Before(deadline) {
 		records, err := ListConfineDetachRecords(state)

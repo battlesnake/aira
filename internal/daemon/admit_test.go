@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"aira/internal/core"
+	"aira/internal/testdeadline"
 )
 
 func admitTestServer(maximum *atomic.Int64) *Server {
@@ -42,7 +43,7 @@ func waitAdmitGrant(t *testing.T, waiter *admitWaiter) {
 	t.Helper()
 	select {
 	case <-waiter.grantedCh:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatalf("waiter %d was not granted", waiter.seq)
 	}
 }
@@ -331,7 +332,7 @@ func TestAdmitBlockedHeadRejectsSaturatedAtWaitCap(t *testing.T) {
 	}()
 	select {
 	case <-timerReady:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("blocked head did not install its deadline")
 	}
 
@@ -350,7 +351,7 @@ func TestAdmitBlockedHeadRejectsSaturatedAtWaitCap(t *testing.T) {
 	requireAdmitQueued(t, laterB)
 	previousEvaluations := evaluations.Load()
 	queue.signal()
-	deadlineForPass := time.Now().Add(time.Second)
+	deadlineForPass := time.Now().Add(testdeadline.Wait(time.Second))
 	for evaluations.Load() == previousEvaluations && time.Now().Before(deadlineForPass) {
 		time.Sleep(time.Millisecond)
 	}
@@ -515,7 +516,7 @@ func TestAdmitFailedWriteAndCloseBetweenCommitAndWriteReleaseOnce(t *testing.T) 
 			}()
 			select {
 			case <-done:
-			case <-time.After(time.Second):
+			case <-testdeadline.After(time.Second):
 				t.Fatal("admit handler did not release after failed write")
 			}
 			server.admitRegistryMu.Lock()
@@ -613,7 +614,15 @@ func TestAdmitGrantTimeoutRaceCommitsExactlyOnce(t *testing.T) {
 func TestAdmitPeerCloseFreesNextWithoutWaitingForPoll(t *testing.T) {
 	var maximum atomic.Int64
 	maximum.Store(100)
+	// admitTestServer already parks the poll at an hour, so "waited for the next
+	// poll tick" means "never arrives" here. The assertion below used to compare
+	// against defaultAdmitPollInterval instead — a 250ms wall-clock bound this
+	// server never uses, which made a false fail on a loaded box the only way the
+	// bound could ever fire (AIRA-20). The bound is now a scaled backstop against
+	// the hour, and the read carries a deadline so a regression reports rather than
+	// hanging the package.
 	server := admitTestServer(&maximum)
+	handoffBudget := testdeadline.Wait(30 * time.Second)
 	aServer, aClient := net.Pipe()
 	bServer, bClient := net.Pipe()
 	aDone, bDone := make(chan struct{}), make(chan struct{})
@@ -636,15 +645,16 @@ func TestAdmitPeerCloseFreesNextWithoutWaitingForPoll(t *testing.T) {
 	if err := readFrame(bClient, &early); err == nil {
 		t.Fatal("second waiter granted before first peer close")
 	}
-	_ = bClient.SetReadDeadline(time.Time{})
 	closedAt := time.Now()
+	_ = bClient.SetReadDeadline(closedAt.Add(handoffBudget))
 	_ = aClient.Close()
 	var bFrame ResponseFrame
 	if err := readFrame(bClient, &bFrame); err != nil {
-		t.Fatal(err)
+		t.Fatalf("peer close did not hand the slot over within %v (poll=%v): %v", handoffBudget, server.admitPollInterval, err)
 	}
-	if elapsed := time.Since(closedAt); elapsed >= defaultAdmitPollInterval {
-		t.Fatalf("peer-close handoff=%v poll=%v", elapsed, defaultAdmitPollInterval)
+	_ = bClient.SetReadDeadline(time.Time{})
+	if elapsed := time.Since(closedAt); elapsed >= handoffBudget {
+		t.Fatalf("peer-close handoff=%v poll=%v", elapsed, server.admitPollInterval)
 	}
 	_ = bClient.Close()
 	<-aDone
@@ -673,7 +683,7 @@ func TestAdmitGrantCommittedAtShutdownDeliveredOrReleasedOnce(t *testing.T) {
 	}
 	select {
 	case <-done:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("shutdown did not release committed grant")
 	}
 	_ = clientConn.Close()
@@ -695,13 +705,17 @@ func TestAdmitShutdownHandlerOwnsReleaseAndPrunesAfterDrain(t *testing.T) {
 	go func() {
 		defer close(done)
 		defer serverConn.Close()
-		server.admitConnection(serverConn, validAdmitArgs(10, 1000))
+		// The handler's own max-wait is the ceiling, not a second: shutdown must be
+		// what ends this connection. With a 1000ms wait the handler returned on its
+		// own timeout at about the moment the backstop fired, so widening the
+		// backstop alone would have made the assertion vacuous (AIRA-20).
+		server.admitConnection(serverConn, validAdmitArgs(10, admitWaitCeilingMs))
 	}()
 	time.Sleep(10 * time.Millisecond)
 	close(server.stopping)
 	select {
 	case <-done:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("shutdown did not cancel queued handler")
 	}
 	var frame ResponseFrame

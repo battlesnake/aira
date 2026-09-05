@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"aira/internal/testdeadline"
 )
 
 const activatingConftest = `
@@ -595,7 +597,13 @@ func TestRealPytestRAMHelperFailureIsInstantAndFailOpen(t *testing.T) {
 	marker := filepath.Join(project, "ran")
 	writeTestFile(t, project, "test_fail_open_ram.py", fmt.Sprintf("def test_runs(): open(%q, 'w').write('yes')", marker))
 	result := runPytest(t, pytest, project, pythonDir, map[string]string{"AIRA_TEST_MEM_GOVERNOR": "1", "AIRA_TEST_MEM_DEFAULT": "8M", "AIRA_CONFINE_RESERVE_CMD": filepath.Join(project, "missing-aira")})
-	if result.err != nil || time.Since(started) > 2*time.Second || !strings.Contains(result.output, "aira RAM governor disabled") {
+	// "Instant" here means the missing helper is not waited on at all: the failure
+	// this bound catches is a hang or a retry loop, not a slow interpreter start.
+	// The old 2s budget also had to cover a real pytest process launching, which is
+	// environment cost the code under test does not control, so on a loaded box it
+	// measured the box (AIRA-20). The budget is now wide enough to be about the
+	// governor and still far below any waiting-on-a-helper implementation.
+	if result.err != nil || testdeadline.Exceeded(time.Since(started), 30*time.Second) || !strings.Contains(result.output, "aira RAM governor disabled") {
 		t.Fatalf("result=%v elapsed=%s output=%s", result.err, time.Since(started), result.output)
 	}
 	if data, err := os.ReadFile(marker); err != nil || string(data) != "yes" {
@@ -603,6 +611,16 @@ func TestRealPytestRAMHelperFailureIsInstantAndFailOpen(t *testing.T) {
 	}
 }
 
+// TestRealPytestRAMForkDoesNotPinHelperStdin is knowingly left load-flaky by
+// AIRA-20's hardening pass, and the reason is recorded rather than papered over.
+// AIRA-65 measured the binding constraint: it is not this test's own waits but the
+// hardcoded process.wait(timeout=1.0) in _stop_reservation
+// (internal/pylib/aira_xdist_governor/__init__.py), which gives the reserve helper a
+// one-second budget to wake from a blocking read and write its marker before SIGTERM.
+// That is production code, it is not configurable from a test, and it sits inside the
+// xdist stack AIRA-33 deletes — so hardening it here would be thrown away. This is
+// also why AIRA-20 cannot restore the -race CI job yet: doing so would declare clean
+// a suite that still contains this known flake.
 func TestRealPytestRAMForkDoesNotPinHelperStdin(t *testing.T) {
 	pytest := requireRealPytest(t)
 	project, pythonDir := realPytestProject(t, "")
@@ -882,7 +900,7 @@ func indexOf(t *testing.T, values []string, wanted string) int {
 
 func waitForRealPytestFile(t *testing.T, path string, done <-chan error) {
 	t.Helper()
-	deadline := time.NewTimer(5 * time.Second)
+	deadline := time.NewTimer(testdeadline.Wait(5 * time.Second))
 	defer deadline.Stop()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -916,7 +934,7 @@ func assertRealPytestItemRuns(t *testing.T, pytest string, overrides map[string]
 
 func waitForRealPytestPath(t *testing.T, path string) []byte {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(2 * time.Second))
 	for time.Now().Before(deadline) {
 		if data, err := os.ReadFile(path); err == nil {
 			return data

@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-20","project":"aira","title":"Harden wall-clock-tight tests to re-enable a -race CI job","status":"planned","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["ci","flaky","testing"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-20","project":"aira","title":"Harden wall-clock-tight tests to re-enable a -race CI job","status":"planned","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["ci","flaky","testing"],"hold":false,"relations":[{"kind":"blocks","from":"AIRA-33","to":"AIRA-20"}]}
 ---
 The first GitHub Actions CI run (2026-08-30) showed build+test green but the `-race` job failed — NOT on any data race (0 `WARNING: DATA RACE`), but on wall-clock latency assertions that don't survive -race's slowdown on a shared CI runner:
 - internal/daemon/watch_test.go:105 TestWatchReturnsConcurrentEventWithinPollInterval — `event latency=124ms poll=30ms` (asserts an event arrives within the 30ms poll interval; under -race it took 124ms).
@@ -31,3 +31,48 @@ Two things this adds to the case above:
 2. **This now blocks merges, not just CI.** The `make test` pre-push hook fails on it, so an unrelated PR cannot be pushed without either retrying until the flake misses or bypassing the hook. That is a direct cost on every other milestone, which raises the priority argument above "re-enable a -race job".
 
 Not fixed here — recorded as evidence.
+
+## Hardening pass landed (2026-09-05, this repo's last backlog-remediation item)
+
+The package-wide deadline pass this ticket asks for is **done**, across
+`internal/runner`, `internal/daemon` and `internal/pylib`. `-race` CI restoration
+is **not** done and is not deferred by oversight: it stays blocked on AIRA-33 (which
+deletes `TestRealPytestRAMForkDoesNotPinHelperStdin` and the xdist stack), which is
+itself blocked on AIRA-91. Restoring `-race` before that would declare clean a suite
+with a known load-flaky test still inside it.
+
+What landed:
+
+- `internal/testdeadline`, a test-only package that separates the three cases a
+  wall-clock wait can be. A **liveness backstop** ("did this ever happen?") is not a
+  property under test, so `Wait`/`After` floor it at `MinBackstop` and scale it; a
+  **latency assertion** ("was this prompt?") scales through `Exceeded` without a
+  floor; a **negative wait** ("did this correctly NOT happen?") is left alone,
+  because contention delays the subject and the timer alike and it cannot produce a
+  false failure. `AIRA_TEST_DEADLINE_SCALE` multiplies all of it, with a built-in ×4
+  under `-race`.
+- Every positive-branch `time.After`, polling deadline, test-side `context.WithTimeout`
+  and socket deadline in the three packages routed through it. `governor_slot_test.go`
+  was deliberately skipped: AIRA-33 deletes it.
+- The named flaky tests fixed at their real cause rather than by widening alone,
+  because several of their bounds were **vacuous** once widened:
+  `TestAdmissionT11KillAndReconcileDoNotTakeAdmissionLock` (a 1s `admissionMaxWait`
+  meant a regression that took the lock would return anyway — now an hour, so
+  "took the lock" means "never returns"); `TestWatchReturnsConcurrentEventWithinPollInterval`
+  and `TestWatchShutdownTerminalDrainAndOverflowBoundaries/concurrent_event` (a fixed
+  sleep stood in for "the watch has scanned", now a real hook, so the ordering is
+  deterministic instead of guessed); `TestWatchPeerCloseCancelsAndLongPollDoesNotMonopolizeDB`
+  (`wait_ms` raised to the watch cap plus a still-in-flight guard, or both assertions
+  went vacuous); `TestAdmitPeerCloseFreesNextWithoutWaitingForPoll` (it compared
+  against `defaultAdmitPollInterval`, a constant this server never uses — it parks the
+  poll at an hour — so the 250ms bound could only ever fire as a false fail);
+  `TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration` (the run's own 1s
+  timeout is now scaled, which is what failed at 2.01s);
+  `TestM20DetachedRunKillWaitsForPreScopeSupervisorTerminal` (the injected
+  terminalizer is now joined, which is the `TempDir RemoveAll ... directory not empty`
+  shape).
+- `TestRealPytestRAMForkDoesNotPinHelperStdin` is **not** fixed here. Its cause is
+  AIRA-65's finding — a hardcoded `process.wait(timeout=1.0)` in
+  `aira_xdist_governor/__init__.py` — which is production code inside AIRA-33's
+  deletion scope, so hardening it would be work thrown away. Its test-side waits were
+  scaled with everything else.

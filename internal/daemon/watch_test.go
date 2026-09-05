@@ -13,6 +13,7 @@ import (
 
 	"aira/internal/core"
 	"aira/internal/store"
+	"aira/internal/testdeadline"
 )
 
 func watchServer(t *testing.T, interval time.Duration) (*Server, WorktreeScope, *store.Store) {
@@ -87,22 +88,70 @@ func TestWatchFromNowSamplesMaxAndIsPaced(t *testing.T) {
 	}
 }
 
+// watchFirstScan makes the watch loop's first EventsSince observable, so a test can
+// create an event strictly after it.
+//
+// The tests below used to stand a fixed sleep in for that ordering. A sleep that is
+// too short on a loaded box lets the first scan land after the event, which silently
+// converts a concurrent-delivery test into an already-pending one and, in the
+// terminal-drain case, produced a real false failure (AIRA-20). The hook removes the
+// ordering guess entirely; it wraps rather than replaces the real scan, so nothing
+// about the behaviour under test changes.
+func watchFirstScan(server *Server) <-chan struct{} {
+	scanned := make(chan struct{})
+	var once sync.Once
+	server.watchEventsSince = func(ctx context.Context, view *store.Store, from int64, limit int) ([]store.WatchEvent, int64, error) {
+		events, next, err := view.EventsSince(ctx, from, limit)
+		once.Do(func() { close(scanned) })
+		return events, next, err
+	}
+	return scanned
+}
+
+func awaitWatchFirstScan(t *testing.T, scanned <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-scanned:
+	case <-testdeadline.After(time.Second):
+		t.Fatal("the watch loop never reached its first scan")
+	}
+}
+
+func awaitWatchResponse(t *testing.T, done <-chan core.Response) core.Response {
+	t.Helper()
+	select {
+	case response := <-done:
+		return response
+	case <-testdeadline.After(10 * time.Second):
+		t.Fatal("the watch never returned")
+		return core.Response{}
+	}
+}
+
 func TestWatchReturnsConcurrentEventWithinPollInterval(t *testing.T) {
-	server, scope, view := watchServer(t, 30*time.Millisecond)
+	const pollInterval = 30 * time.Millisecond
+	server, scope, view := watchServer(t, pollInterval)
+	scanned := watchFirstScan(server)
 	done := make(chan core.Response, 1)
-	start := time.Now()
 	go func() {
-		done <- server.watch(context.Background(), scope, map[string]any{"from": int64(0), "wait_ms": 500})
+		// wait_ms is the full watch cap so the two hypotheses this test separates —
+		// poll-driven delivery (one 30ms interval) and timeout-driven delivery
+		// (watchWaitCap) — are three orders of magnitude apart. A latency budget
+		// generous enough to survive full-suite contention still tells them apart,
+		// where the original 4×poll-interval bound could not (AIRA-20).
+		done <- server.watch(context.Background(), scope, map[string]any{
+			"from": int64(0), "wait_ms": int64(watchWaitCap / time.Millisecond),
+		})
 	}()
-	time.Sleep(10 * time.Millisecond)
+	awaitWatchFirstScan(t, scanned)
 	want := addWatchAllocation(t, view)
-	response := <-done
-	data := watchData(t, response)
+	added := time.Now()
+	data := watchData(t, awaitWatchResponse(t, done))
 	if data.Cursor != want || len(data.Events) != 1 || data.Events[0].Seq != want || data.EOF {
 		t.Fatalf("data=%+v", data)
 	}
-	if elapsed := time.Since(start); elapsed > 4*server.watchPollInterval {
-		t.Fatalf("event latency=%v poll=%v", elapsed, server.watchPollInterval)
+	if elapsed := time.Since(added); testdeadline.Exceeded(elapsed, 2*time.Second) {
+		t.Fatalf("event latency=%v poll=%v wait=%v: delivery was not poll-driven", elapsed, pollInterval, watchWaitCap)
 	}
 }
 
@@ -133,7 +182,13 @@ func TestWatchTimeoutLeavesCursorAndEOFUnchanged(t *testing.T) {
 	start := time.Now()
 	data := watchData(t, server.watch(context.Background(), scope, map[string]any{"from": int64(7), "wait_ms": 45}))
 	elapsed := time.Since(start)
-	if elapsed < 40*time.Millisecond || elapsed > 200*time.Millisecond {
+	// The lower bound is a real property (the poll must honour its wait) and needs
+	// no scaling: contention only ever makes it more true. The upper bound is a
+	// liveness statement about the same wait and is the half that flakes, so it
+	// scales — and its budget is set against the alternative it must exclude, a
+	// watch that ignores wait_ms and runs to watchWaitCap, rather than against the
+	// 45ms it expects.
+	if elapsed < 40*time.Millisecond || testdeadline.Exceeded(elapsed, 2*time.Second) {
 		t.Fatalf("timeout elapsed=%v", elapsed)
 	}
 	if data.Cursor != 7 || len(data.Events) != 0 || data.EOF {
@@ -143,16 +198,24 @@ func TestWatchTimeoutLeavesCursorAndEOFUnchanged(t *testing.T) {
 
 func TestWatchShutdownTerminalDrainAndOverflowBoundaries(t *testing.T) {
 	t.Run("concurrent event", func(t *testing.T) {
-		server, scope, view := watchServer(t, 200*time.Millisecond)
+		// The poll interval is long enough that shutdown, not a poll wake, is the
+		// only thing that can end this watch. With the original 200ms interval a
+		// poll firing between the allocation and close(stopping) returned the event
+		// with EOF=false and failed the test — a false fail this subtest hit under
+		// load (AIRA-20). Nothing here is testing the poll interval.
+		server, scope, view := watchServer(t, 10*time.Second)
 		stopping := server.stopping
+		scanned := watchFirstScan(server)
 		done := make(chan core.Response, 1)
 		go func() {
-			done <- server.watch(context.Background(), scope, map[string]any{"from": int64(0), "wait_ms": 1000})
+			done <- server.watch(context.Background(), scope, map[string]any{
+				"from": int64(0), "wait_ms": int64(watchWaitCap / time.Millisecond),
+			})
 		}()
-		time.Sleep(20 * time.Millisecond)
+		awaitWatchFirstScan(t, scanned)
 		seq := addWatchAllocation(t, view)
 		close(stopping)
-		data := watchData(t, <-done)
+		data := watchData(t, awaitWatchResponse(t, done))
 		if !data.EOF || data.Cursor != seq || len(data.Events) != 1 || data.Events[0].Seq != seq {
 			t.Fatalf("terminal data=%+v", data)
 		}
@@ -202,7 +265,12 @@ func TestWatchPeerCloseCancelsAndLongPollDoesNotMonopolizeDB(t *testing.T) {
 		server.serveConnection(context.Background(), serverConn)
 		close(done)
 	}()
-	if err := writeFrame(clientConn, RequestFrame{Proto: ProtocolVersion, Scope: scope, Request: core.Request{Verb: "watch", Args: map[string]any{"from": int64(0), "wait_ms": 1000}}}); err != nil {
+	// Both properties here — the concurrent query completing, and peer close ending
+	// the watch — are only meaningful while the long poll is still in flight. The
+	// original wait_ms of 1000 made both vacuous once the backstops grew past a
+	// second, so the poll now runs for the full watch cap and the guard below
+	// asserts it really was still running rather than inferring it from the clock.
+	if err := writeFrame(clientConn, RequestFrame{Proto: ProtocolVersion, Scope: scope, Request: core.Request{Verb: "watch", Args: map[string]any{"from": int64(0), "wait_ms": int64(watchWaitCap / time.Millisecond)}}}); err != nil {
 		t.Fatal(err)
 	}
 	queryDone := make(chan error, 1)
@@ -212,13 +280,18 @@ func TestWatchPeerCloseCancelsAndLongPollDoesNotMonopolizeDB(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(100 * time.Millisecond):
+		select {
+		case <-done:
+			t.Fatal("the watch returned before the concurrent query completed: the query proved nothing about a live long poll")
+		default:
+		}
+	case <-testdeadline.After(time.Second):
 		t.Fatal("long poll monopolized the database connection")
 	}
 	_ = clientConn.Close()
 	select {
 	case <-done:
-	case <-time.After(150 * time.Millisecond):
+	case <-testdeadline.After(150 * time.Millisecond):
 		t.Fatal("peer close did not promptly cancel watch")
 	}
 }
@@ -301,7 +374,7 @@ func TestWatchNonReadingClientWriteIsBounded(t *testing.T) {
 	}
 	select {
 	case <-done:
-	case <-time.After(watchWriteTimeout + time.Second):
+	case <-testdeadline.After(watchWriteTimeout + time.Second):
 		t.Fatal("non-reading peer held response write beyond deadline")
 	}
 	_ = clientConn.Close()

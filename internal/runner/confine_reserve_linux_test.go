@@ -16,6 +16,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"aira/internal/testdeadline"
 )
 
 func reserveTestRunner() *Runner {
@@ -89,7 +91,7 @@ func TestConfineReserveKilledHelperReleasesLeaseOnce(t *testing.T) {
 	_ = command.Wait()
 	select {
 	case <-released:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("kill -9 did not release daemon lease")
 	}
 	if releases.Load() != 1 {
@@ -114,7 +116,7 @@ func TestConfineReserveDaemonDownNeverEngagesFlock(t *testing.T) {
 	if err == nil || reservation != nil || flockAttempts.Load() != 0 {
 		t.Fatalf("reservation=%+v err=%v flockAttempts=%d", reservation, err, flockAttempts.Load())
 	}
-	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+	if elapsed := time.Since(started); testdeadline.Exceeded(elapsed, 100*time.Millisecond) {
 		t.Fatalf("daemon-down reserve was not instant: %s", elapsed)
 	}
 }
@@ -161,7 +163,7 @@ func TestConfineReservePinnedGrantHeldUntilCloseAndReleasedOnce(t *testing.T) {
 	}
 	select {
 	case <-released:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("lease did not release on close")
 	}
 }

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"aira/internal/testdeadline"
 )
 
 // verifies: AIRA task #52 reader preserves nullable evidence and filters only
@@ -139,7 +141,7 @@ func TestEstimateAdmissionSamplesHeldWriteLockFailsFast(t *testing.T) {
 	}
 	defer locker.Exec(`ROLLBACK`)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), testdeadline.Wait(250*time.Millisecond))
 	defer cancel()
 	_, present, err := EstimateAdmissionSamples(ctx, common)
 	if err == nil || !present {

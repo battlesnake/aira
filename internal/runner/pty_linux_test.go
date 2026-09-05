@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"aira/internal/testdeadline"
 )
 
 type readStep struct {
@@ -153,7 +155,7 @@ func TestPTYCaptureSecondJoinBoundedWhenDrainBlocksOnWrite(t *testing.T) {
 		if !got.forced || tracker.complete() || len(got.captures) != 0 {
 			t.Fatalf("captures=%+v forced=%v complete=%v (want bounded: forced, incomplete, 0 results)", got.captures, got.forced, tracker.complete())
 		}
-	case <-time.After(3 * time.Second):
+	case <-testdeadline.After(3 * time.Second):
 		t.Fatal("collectPTYCapture hung on a write-blocked drain — the second join is not bounded")
 	}
 }
@@ -244,7 +246,11 @@ func TestRealCgroupPTYByteFaithfulCompleteCapture(t *testing.T) {
 
 func TestRealCgroupPTYDefaultNullStdinDoesNotDeadlock(t *testing.T) {
 	started := time.Now()
-	deadline := 2 * time.Second
+	// The run's own timeout is the bound the assertion below compares against, so
+	// scaling it scales both halves together: "finished before its own timeout"
+	// keeps meaning exactly that on a loaded box, where a fixed 2s could be spent
+	// on process startup alone (AIRA-20).
+	deadline := testdeadline.Wait(2 * time.Second)
 	record, err := realRunner(t).Launch(context.Background(), Request{Argv: []string{"/bin/cat"}, PTY: true, Timeout: deadline})
 	if err != nil {
 		t.Fatal(err)
@@ -324,7 +330,7 @@ func TestAllocatePTYHasNoLingeringSlaveReference(t *testing.T) {
 		if !errors.Is(err, io.EOF) {
 			t.Fatalf("master read after last slave close=%v, want mapped EIO/EOF", err)
 		}
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("master read blocked: a slave descriptor is still open")
 	}
 }

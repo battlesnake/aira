@@ -20,6 +20,7 @@ import (
 	"aira/internal/domain"
 	"aira/internal/gitcontext"
 	"aira/internal/store"
+	"aira/internal/testdeadline"
 )
 
 // shortRuntimeDir returns a short unique directory for XDG_RUNTIME_DIR. A daemon
@@ -81,14 +82,14 @@ func startServer(t *testing.T, server *Server) (context.CancelFunc, <-chan error
 	case <-ready:
 	case err := <-done:
 		t.Fatalf("daemon exited before ready: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("daemon did not become ready")
 	}
 	t.Cleanup(func() {
 		cancel()
 		select {
 		case <-done:
-		case <-time.After(5 * time.Second):
+		case <-testdeadline.After(5 * time.Second):
 			t.Error("daemon did not stop")
 		}
 	})
@@ -364,7 +365,7 @@ func TestServerSingleInstanceFlockBeforeBind(t *testing.T) {
 	first := NewServer(paths)
 	_, _ = startServer(t, first)
 	second := NewServer(paths)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testdeadline.Wait(time.Second))
 	defer cancel()
 	if err := second.Serve(ctx); !errors.Is(err, ErrAlreadyRunning) {
 		t.Fatalf("second Serve error = %v, want ErrAlreadyRunning", err)
@@ -396,7 +397,7 @@ func TestSymlinkAliasedMissingStateHasSingleInstance(t *testing.T) {
 		t.Fatalf("alias paths=%+v, real paths=%+v", aliasPaths, realPaths)
 	}
 	_, _ = startServer(t, NewServer(aliasPaths))
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testdeadline.Wait(time.Second))
 	defer cancel()
 	if err := NewServer(realPaths).Serve(ctx); !errors.Is(err, ErrAlreadyRunning) {
 		t.Fatalf("aliased second Serve error = %v, want ErrAlreadyRunning", err)
@@ -486,7 +487,7 @@ func TestServerGracefulDrainCompletesInflightRequest(t *testing.T) {
 	}
 	select {
 	case <-dbClosed:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("DB was not closed after all users drained")
 	}
 }
@@ -652,7 +653,7 @@ func TestScopeBuildBarrierSingleflightAndOtherProjectConcurrency(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("slow on-build reap held s.mu and blocked another project's cached scope")
 	}
 	close(release)
@@ -723,7 +724,7 @@ func TestScopeBuildPanicStillClosesBarrier(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("same-scope waiter remained blocked after initial reap panic")
 	}
 }
@@ -812,7 +813,7 @@ func TestPeriodicReaperContinuesAfterSweepError(t *testing.T) {
 	}()
 	select {
 	case <-second:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("ticker stopped after a sweep error")
 	}
 	cancel()
@@ -879,7 +880,7 @@ func TestIdleReapThenTimerFlushesDeferredLapseExactlyOnce(t *testing.T) {
 	}()
 	select {
 	case <-flushed:
-	case <-time.After(3 * time.Second):
+	case <-testdeadline.After(3 * time.Second):
 		t.Fatal("journal flusher did not tick")
 	}
 	cancel()
@@ -989,7 +990,7 @@ func TestPeriodicJournalFlusherIsolatesProjectErrors(t *testing.T) {
 	}()
 	select {
 	case <-both:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("one project flush error blocked another project")
 	}
 	cancel()
@@ -1143,7 +1144,7 @@ func TestShutdownWaitsForJournalFlusher(t *testing.T) {
 	}
 	select {
 	case <-started:
-	case <-time.After(3 * time.Second):
+	case <-testdeadline.After(3 * time.Second):
 		t.Fatal("periodic journal flush did not start")
 	}
 	cancel()
@@ -1201,7 +1202,7 @@ func TestDrainTimeoutWithStuckJournalFlusherRetainsLockAndDB(t *testing.T) {
 	}
 	select {
 	case <-started:
-	case <-time.After(3 * time.Second):
+	case <-testdeadline.After(3 * time.Second):
 		t.Fatal("periodic journal flush did not start")
 	}
 	cancel()
@@ -1213,7 +1214,7 @@ func TestDrainTimeoutWithStuckJournalFlusherRetainsLockAndDB(t *testing.T) {
 	if closes.Load() != 0 {
 		t.Fatal("DB closed while timed-out journal flusher was active")
 	}
-	replacementCtx, replacementCancel := context.WithTimeout(context.Background(), time.Second)
+	replacementCtx, replacementCancel := context.WithTimeout(context.Background(), testdeadline.Wait(time.Second))
 	defer replacementCancel()
 	if replacementErr := NewServer(paths).Serve(replacementCtx); !errors.Is(replacementErr, ErrAlreadyRunning) {
 		t.Fatalf("replacement Serve=%v, want ErrAlreadyRunning", replacementErr)
@@ -1254,7 +1255,7 @@ func TestDrainTimeoutRetainsLockSkipsDBCloseAndSurvivesGC(t *testing.T) {
 	case <-ready:
 	case err := <-done:
 		t.Fatalf("daemon exited before ready: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("daemon did not become ready")
 	}
 	exchangeDone := make(chan error, 1)
@@ -1275,7 +1276,7 @@ func TestDrainTimeoutRetainsLockSkipsDBCloseAndSurvivesGC(t *testing.T) {
 		t.Fatal("DB was closed on drain timeout")
 	}
 	runtime.GC()
-	replacementCtx, replacementCancel := context.WithTimeout(context.Background(), time.Second)
+	replacementCtx, replacementCancel := context.WithTimeout(context.Background(), testdeadline.Wait(time.Second))
 	defer replacementCancel()
 	if replacementErr := NewServer(paths).Serve(replacementCtx); !errors.Is(replacementErr, ErrAlreadyRunning) {
 		t.Fatalf("replacement Serve after GC=%v, want ErrAlreadyRunning", replacementErr)

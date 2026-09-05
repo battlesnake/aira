@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"aira/internal/testdeadline"
 )
 
 // admitWaitCeilingDaemon stands up a one-shot fake daemon that replies with the
@@ -79,7 +81,7 @@ func TestConfineWaitTooLongIsTerminalAndNeverFallsBackToFlock(t *testing.T) {
 
 			select {
 			case <-reached:
-			case <-time.After(2 * time.Second):
+			case <-testdeadline.After(2 * time.Second):
 				t.Fatal("daemon never received the request")
 			}
 			if err == nil {

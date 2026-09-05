@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"aira/internal/testdeadline"
 )
 
 // waitForConfineDiagnostic runs a confine launch whose admission blocks until
@@ -47,7 +49,7 @@ func waitForConfineDiagnostic(t *testing.T, deps confineDeps, request ConfineReq
 		defer close(done)
 		_, _ = confineWithDeps(context.Background(), request, deps)
 	}()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(5 * time.Second))
 	got := ""
 	for time.Now().Before(deadline) {
 		mu.Lock()
@@ -204,7 +206,7 @@ func TestConfineAdmissionWaitLineIsNotPrintedAfterTheGrant(t *testing.T) {
 	}()
 	select {
 	case <-probing:
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		close(proceed)
 		<-done
 		t.Fatal("the probe was never attempted")
@@ -214,7 +216,7 @@ func TestConfineAdmissionWaitLineIsNotPrintedAfterTheGrant(t *testing.T) {
 	close(proceed)
 	select {
 	case <-done:
-	case <-time.After(10 * time.Second):
+	case <-testdeadline.After(10 * time.Second):
 		t.Fatal("the launch never finished")
 	}
 	mu.Lock()
@@ -269,7 +271,7 @@ func TestConfineAdmissionWaitProbeIsCancelledByTheGrant(t *testing.T) {
 	}()
 	select {
 	case <-entered:
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		close(proceed)
 		<-done
 		t.Fatal("the probe was never attempted")
@@ -277,7 +279,7 @@ func TestConfineAdmissionWaitProbeIsCancelledByTheGrant(t *testing.T) {
 	close(proceed)
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("the launch was held by an in-flight queue-position probe")
 	}
 }

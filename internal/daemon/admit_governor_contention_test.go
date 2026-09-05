@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"aira/internal/testdeadline"
 )
 
 // verifies: AIRA-59 end-to-end at the REAL entry point, reproducing the live
@@ -110,7 +112,7 @@ func TestGovernorPerTestReservationsAreNotStalledByALargeNeighbourHead(t *testin
 		for _, queue := range queues {
 			queue.signal()
 		}
-		deadline := time.Now().Add(2 * time.Second)
+		deadline := time.Now().Add(testdeadline.Wait(2 * time.Second))
 		for evaluations.Load() == before && time.Now().Before(deadline) {
 			time.Sleep(time.Millisecond)
 		}
@@ -163,7 +165,7 @@ func TestGovernorPerTestReservationsAreNotStalledByALargeNeighbourHead(t *testin
 		}
 		return count
 	}
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(2 * time.Second))
 	for queuedNow() < len(perTest) && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 		settle()

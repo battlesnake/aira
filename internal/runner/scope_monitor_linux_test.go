@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"aira/internal/testdeadline"
 )
 
 // countingMembersScope wraps confineFakeScope and counts Members() calls so a
@@ -167,7 +169,7 @@ func TestScopeMembershipEventsDeliversModifyAndReleasesFD(t *testing.T) {
 		}
 		select {
 		case <-events:
-		case <-time.After(2 * time.Second):
+		case <-testdeadline.After(2 * time.Second):
 			t.Fatalf("cycle %d: cgroup.events modification did not wake the sampler", cycle)
 		}
 		// A burst must coalesce into the buffered slot and never block the reader.
@@ -178,11 +180,11 @@ func TestScopeMembershipEventsDeliversModifyAndReleasesFD(t *testing.T) {
 		}
 		select {
 		case <-events:
-		case <-time.After(2 * time.Second):
+		case <-testdeadline.After(2 * time.Second):
 			t.Fatalf("cycle %d: burst of modifications delivered nothing", cycle)
 		}
 		close(stop)
-		deadline := time.Now().Add(2 * time.Second)
+		deadline := time.Now().Add(testdeadline.Wait(2 * time.Second))
 		for openFDCount(t) > baseline {
 			if time.Now().After(deadline) {
 				t.Fatalf("cycle %d: inotify fd not released after stop: %d open, baseline %d", cycle, openFDCount(t), baseline)

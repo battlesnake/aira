@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"aira/internal/cgrouptest"
+	"aira/internal/testdeadline"
 )
 
 func TestHasRunUsesOnlyTheSelectedProjectLedger(t *testing.T) {
@@ -832,7 +833,13 @@ func TestRealCgroupTimeoutUsesDurableKillAndKillsGrandchild(t *testing.T) {
 
 func TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration(t *testing.T) {
 	r := realRunner(t)
-	exited, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/sh", "-c", "printf ok"}, Timeout: time.Second})
+	// The first scenario asserts a natural exit is NOT rewritten as a timeout, so
+	// the run must genuinely outlive its own deadline's chance to fire. A fixed one
+	// second covers cgroup setup, fork/exec and capture on a quiet box and nothing
+	// like it under full-suite contention, which is how this test failed at 2.01s
+	// with no code change (AIRA-20). Scaling the run's timeout keeps the scenario
+	// intact and moves the deadline out of the scheduler's reach.
+	exited, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/sh", "-c", "printf ok"}, Timeout: testdeadline.Wait(time.Second)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1238,7 +1245,7 @@ func launchAsync(t *testing.T, r *Runner, req Request) <-chan launchOutcome {
 	t.Helper()
 	result := make(chan launchOutcome, 1)
 	go func() { record, err := r.Launch(context.Background(), req); result <- launchOutcome{record, err} }()
-	deadline := time.NewTimer(3 * time.Second)
+	deadline := time.NewTimer(testdeadline.Wait(3 * time.Second))
 	defer deadline.Stop()
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
@@ -1357,7 +1364,7 @@ func TestRealCgroupDescendantMigrationBeforeLeaderExitResidual(t *testing.T) {
 			_ = syscall.Kill(pid, syscall.SIGKILL)
 		}
 		if target != "" {
-			deadline := time.Now().Add(time.Second)
+			deadline := time.Now().Add(testdeadline.Wait(time.Second))
 			for time.Now().Before(deadline) {
 				if data, readErr := os.ReadFile(filepath.Join(target, "cgroup.procs")); readErr == nil && len(strings.TrimSpace(string(data))) == 0 {
 					break
@@ -1499,7 +1506,7 @@ func assertHonestExitScope(t *testing.T, r *Runner, record *RunRecord) {
 
 func waitForFixtureFile(t *testing.T, path string) []byte {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(time.Second))
 	for time.Now().Before(deadline) {
 		if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
 			return data

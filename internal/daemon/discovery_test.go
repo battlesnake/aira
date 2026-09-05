@@ -16,6 +16,7 @@ import (
 	"aira/internal/app"
 	"aira/internal/domain"
 	"aira/internal/store"
+	"aira/internal/testdeadline"
 )
 
 func newDiscoveryTestServer(t *testing.T) (*Server, Paths) {
@@ -76,7 +77,7 @@ func createConfiguredGitProject(t *testing.T, base, name, prefix string) app.Pro
 
 func waitForCondition(t *testing.T, timeout time.Duration, message string, condition func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	deadline := time.Now().Add(testdeadline.Wait(timeout))
 	for time.Now().Before(deadline) {
 		if condition() {
 			return
@@ -406,7 +407,7 @@ func TestDiscoveredScopeFeedsReaperAndFlusher(t *testing.T) {
 		if got != project.ProjectID {
 			t.Fatalf("reaper project=%s want=%s", got, project.ProjectID)
 		}
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("reaper did not cover discovered scope")
 	}
 	cancel()
@@ -539,12 +540,12 @@ func TestServeSignalsReadyBeforeRegistryDiscoveryCompletes(t *testing.T) {
 	case <-ready:
 	case err := <-done:
 		t.Fatalf("Serve exited before Ready: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("Serve did not signal Ready")
 	}
 	select {
 	case <-started:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("post-Ready discovery did not start")
 	}
 	select {
@@ -559,7 +560,7 @@ func TestServeSignalsReadyBeforeRegistryDiscoveryCompletes(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("Serve did not stop")
 	}
 }
@@ -589,12 +590,12 @@ func TestServeDrainsRegistryDiscoveryBeforeClosingDB(t *testing.T) {
 	case <-ready:
 	case err := <-done:
 		t.Fatalf("Serve exited before Ready: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("Serve did not signal Ready")
 	}
 	select {
 	case <-buildStarted:
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("discovery did not enter scope build")
 	}
 	cancel()
@@ -611,7 +612,7 @@ func TestServeDrainsRegistryDiscoveryBeforeClosingDB(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("Serve did not return after discovery drained")
 	}
 	select {
@@ -650,12 +651,12 @@ func TestServeDiscoveryDrainTimeoutRetainsInstance(t *testing.T) {
 	case <-ready:
 	case err := <-done:
 		t.Fatalf("Serve exited before Ready: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("Serve did not signal Ready")
 	}
 	select {
 	case <-buildStarted:
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("discovery did not enter scope build")
 	}
 	cancel()
@@ -667,7 +668,7 @@ func TestServeDiscoveryDrainTimeoutRetainsInstance(t *testing.T) {
 	if closes.Load() != 0 {
 		t.Fatal("DB closed while timed-out discovery still used it")
 	}
-	replacementCtx, replacementCancel := context.WithTimeout(context.Background(), time.Second)
+	replacementCtx, replacementCancel := context.WithTimeout(context.Background(), testdeadline.Wait(time.Second))
 	defer replacementCancel()
 	if replacementErr := NewServer(paths).Serve(replacementCtx); !errors.Is(replacementErr, ErrAlreadyRunning) {
 		t.Fatalf("replacement Serve=%v, want ErrAlreadyRunning", replacementErr)
@@ -717,7 +718,7 @@ func TestServeDiscoveryReapsPriorLifetimeProjectWithoutRequest(t *testing.T) {
 	case <-ready:
 	case err := <-done:
 		t.Fatalf("Serve exited before Ready: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("Serve did not signal Ready")
 	}
 	waitForCondition(t, 5*time.Second, "prior-lifetime expired lease was not reaped", func() bool {
@@ -741,7 +742,7 @@ func TestServeDiscoveryReapsPriorLifetimeProjectWithoutRequest(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-testdeadline.After(5 * time.Second):
 		t.Fatal("Serve did not stop")
 	}
 }

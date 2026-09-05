@@ -15,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"aira/internal/testdeadline"
 )
 
 func runInputConnectRecord(t *testing.T, r *Runner) {
@@ -111,7 +113,7 @@ func TestRunInputClientGenuineBusyTerminatesAtBudget(t *testing.T) {
 	if !errors.As(err, &inputErr) || inputErr.Code != "E_RUN_INPUT_BUSY" {
 		t.Fatalf("genuine busy err=%v", err)
 	}
-	if elapsed := time.Since(start); elapsed < runInputBusyRetryBudget || elapsed > 3*time.Second {
+	if elapsed := time.Since(start); elapsed < runInputBusyRetryBudget || testdeadline.Exceeded(elapsed, 3*time.Second) {
 		t.Fatalf("busy budget elapsed=%v (want ~%v, bounded)", elapsed, runInputBusyRetryBudget)
 	}
 	// No dial may begin at or after the budget deadline (a 50ms tolerance covers
@@ -146,7 +148,7 @@ func TestRunInputClientSilentServerHandshakeDeadlineFires(t *testing.T) {
 	// The deadline must actually FIRE: elapsed is at least the handshake timeout
 	// (an immediate unrelated error would fail this lower bound) and bounded above.
 	elapsed := time.Since(start)
-	if elapsed < runInputHandshakeTimeout-200*time.Millisecond || elapsed > runInputHandshakeTimeout+2*time.Second {
+	if elapsed < runInputHandshakeTimeout-200*time.Millisecond || testdeadline.Exceeded(elapsed, runInputHandshakeTimeout+2*time.Second) {
 		t.Fatalf("handshake deadline elapsed=%v (want ~%v)", elapsed, runInputHandshakeTimeout)
 	}
 }
@@ -320,7 +322,7 @@ func TestRunInputServerContinuousAcceptBusyWithNonReadingPeer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer third.Close()
-	_ = third.SetReadDeadline(time.Now().Add(time.Second))
+	_ = third.SetReadDeadline(time.Now().Add(testdeadline.Wait(time.Second)))
 	op, payload, err := readRunInputFrame(third)
 	if err != nil || op != runInputOpError {
 		t.Fatalf("third op=%d payload=%q err=%v", op, payload, err)
@@ -446,10 +448,10 @@ func dialRunInputRawHello(t *testing.T, path string, hello runInputHello) *net.U
 
 func dialRunInputHello(t *testing.T, path string, hello runInputHello) *net.UnixConn {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testdeadline.Wait(2 * time.Second))
 	for {
 		conn := dialRunInputRawHello(t, path, hello)
-		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second)) // a silent server can't hang the helper
+		_ = conn.SetReadDeadline(time.Now().Add(testdeadline.Wait(2 * time.Second))) // a silent server can't hang the helper
 		op, payload, err := readRunInputFrame(conn)
 		if err != nil {
 			t.Fatalf("HELLO response op=%d err=%v", op, err)

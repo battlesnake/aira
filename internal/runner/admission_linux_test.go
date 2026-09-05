@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"aira/internal/testdeadline"
 )
 
 type chunkReader struct{ reader io.Reader }
@@ -461,7 +463,7 @@ func TestAdmissionPersistentEINTRUsesBoundedOuterLoop(t *testing.T) {
 	var got outcome
 	select {
 	case got = <-done:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		cancel()
 		got = <-done
 		t.Fatalf("persistent EINTR did not reach the admission deadline: err=%v attempts=%d", got.err, attempts.Load())
@@ -498,7 +500,7 @@ func TestAdmissionT5RealFlockSerializesWaiters(t *testing.T) {
 			t.Fatalf("second=%+v", second)
 		}
 		second.lock.release()
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("second did not acquire after release")
 	}
 }
@@ -558,7 +560,7 @@ func TestAdmissionT5LockHeldThroughStartAndSerializedRecheck(t *testing.T) {
 	}()
 	select {
 	case <-startEntered:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("first Launch did not reach blocked Start")
 	}
 	secondDone := make(chan launchOutcome, 1)
@@ -578,7 +580,7 @@ func TestAdmissionT5LockHeldThroughStartAndSerializedRecheck(t *testing.T) {
 	}
 	select {
 	case <-pressureObserved:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("second Launch did not re-read first launch's memory effect")
 	}
 	select {
@@ -592,7 +594,7 @@ func TestAdmissionT5LockHeldThroughStartAndSerializedRecheck(t *testing.T) {
 		if second.err == nil {
 			t.Fatal("injected second Start failure was not reached after relief")
 		}
-	case <-time.After(2 * time.Second):
+	case <-testdeadline.After(2 * time.Second):
 		t.Fatal("second Launch did not proceed after relief")
 	}
 	select {
@@ -600,7 +602,7 @@ func TestAdmissionT5LockHeldThroughStartAndSerializedRecheck(t *testing.T) {
 		if first.err != nil || first.record == nil || first.record.Status != StatusExited {
 			t.Fatalf("first launch=%+v", first)
 		}
-	case <-time.After(2 * time.Second):
+	case <-testdeadline.After(2 * time.Second):
 		t.Fatal("first Launch did not finish")
 	}
 	events, err := r.ledger.read()
@@ -708,7 +710,7 @@ func TestAdmissionT7LiveLockHolderTimesOutUnlocked(t *testing.T) {
 		if err == nil {
 			t.Fatal("injected second start failure was not reached")
 		}
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("second Launch blocked behind live flock past its deadline")
 	}
 	events, err := second.ledger.read()
@@ -743,7 +745,7 @@ func TestAdmissionT8CancelDuringFlockContention(t *testing.T) {
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("err=%v", err)
 		}
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("contention wait ignored cancellation")
 	}
 }
@@ -849,7 +851,7 @@ func TestAdmissionT10ReleasePrecedesFailBeforeLaunchArbitration(t *testing.T) {
 	}()
 	select {
 	case <-arbitrationEntered:
-	case <-time.After(time.Second):
+	case <-testdeadline.After(time.Second):
 		t.Fatal("failure did not enter blocked terminal arbitration")
 	}
 	competitor, _ := gateOnlyRunner(t, newInstantClock(), func(string) (int64, int64, bool, string) { return 0, 100, true, "" })
@@ -870,7 +872,13 @@ func TestAdmissionT11KillAndReconcileDoNotTakeAdmissionLock(t *testing.T) {
 	r, scope := newMemoryRunner(t, nil)
 	r.memorySlice, r.memoryReserve = path, 40
 	r.clock, r.sliceMemory = newInstantClock(), func(string) (int64, int64, bool, string) { return 0, 100, true, "" }
-	r.admissionMaxWait, r.pollInterval = time.Second, 10*time.Millisecond
+	// admissionMaxWait is deliberately far longer than the backstop below. The
+	// property under test is that Kill and Reconcile never take the admission lock
+	// at all; with a short max-wait, a regression that DID take it would still
+	// return once the wait expired, and a generous backstop would pass anyway. An
+	// effectively unbounded wait makes "took the lock" mean "never returns", which
+	// is what the backstop can honestly distinguish under any load (AIRA-20).
+	r.admissionMaxWait, r.pollInterval = time.Hour, 10*time.Millisecond
 	run := RunRecord{SchemaVersion: ledgerSchema, ID: "RUN-1", Status: StatusStarting, ScopeIntegrity: ScopeHandoffUnverified, CgroupScope: scope.Reference(), Admission: "immediate"}
 	appendRunEvent(t, r, "starting", run)
 	appendRunEvent(t, r, "scope-created", run)
@@ -885,7 +893,7 @@ func TestAdmissionT11KillAndReconcileDoNotTakeAdmissionLock(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		select {
 		case <-done:
-		case <-time.After(time.Second):
+		case <-testdeadline.After(time.Second):
 			t.Fatal("Kill/Reconcile blocked on the admission lock")
 		}
 	}
@@ -987,7 +995,7 @@ func TestRealMemoryAdmissionWaitsForReliefThenIsImmediate(t *testing.T) {
 		record, launchErr := filler.Launch(context.Background(), Request{Argv: []string{"python3", "-c", "import time; x=bytearray(80*1024*1024); [x.__setitem__(i, 1) for i in range(0, len(x), 4096)]; time.sleep(0.5)"}})
 		fillerDone <- launchOutcome{record: record, err: launchErr}
 	}()
-	pressureDeadline := time.Now().Add(2 * time.Second)
+	pressureDeadline := time.Now().Add(testdeadline.Wait(2 * time.Second))
 	for {
 		cur, max, ok, reason := readSliceMemory(parent)
 		if !ok {
@@ -1326,7 +1334,7 @@ func TestDaemonAdmitWedgedDaemonDeadlineFallsToFlock(t *testing.T) {
 	if err != nil || result.lock == nil || attempts.Load() != 1 {
 		t.Fatalf("result=%+v attempts=%d err=%v (want flock fallback)", result, attempts.Load(), err)
 	}
-	if elapsed := time.Since(started); elapsed < admitTransportGrace || elapsed > 2*time.Second {
+	if elapsed := time.Since(started); elapsed < admitTransportGrace || testdeadline.Exceeded(elapsed, 2*time.Second) {
 		t.Fatalf("wedged-daemon deadline elapsed=%v", elapsed)
 	}
 	result.releaseAdmission()

@@ -12,6 +12,7 @@ import (
 
 	"aira/internal/core"
 	"aira/internal/store"
+	"aira/internal/testdeadline"
 )
 
 // The AIRA-84 seam is falsifiable by MUTATION, not by running these against the
@@ -132,7 +133,7 @@ func TestHandshakeDeadlineDoesNotSurviveIntoAHandlersOwnReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(testdeadline.Wait(10 * time.Second))); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeFrame(conn, RequestFrame{Proto: ProtocolVersion, Request: core.Request{Verb: "governor"}}); err != nil {
@@ -224,7 +225,7 @@ func TestExchangeResponseWaitStillBoundsAReplylessDaemon(t *testing.T) {
 	if !errors.As(err, &netErr) || !netErr.Timeout() {
 		t.Fatalf("err = %v, want a socket read-deadline timeout", err)
 	}
-	if elapsed > time.Second {
+	if testdeadline.Exceeded(elapsed, time.Second) {
 		t.Fatalf("wait took %s, so the response deadline did not bound it", elapsed)
 	}
 }
