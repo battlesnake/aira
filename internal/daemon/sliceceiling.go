@@ -2,8 +2,8 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"log"
-	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -61,19 +61,33 @@ const (
 	// expression: lowering needs every sample in the window to agree, raising
 	// needs one. Restricting must be sustained; relieving must be prompt.
 	sliceCeilingSamples = 3
-	// sliceCeilingReserveMax is the owner's existing headroom policy, shared
-	// with internal/install (min(MemTotal/4, 16GiB)) rather than restated as a
-	// competing definition of "how much this machine must keep free". On a large
-	// box it evaluates to 16 GiB, which is also watchdogRecoverMemAvailable —
-	// the independent sanity check, not the derivation: the throttle's TARGET
-	// state must be one in which the watchdog is quiescent, or the two
-	// subsystems disagree about whether the machine is healthy. The MemTotal/4
-	// term is what stops enforce mode pinning the ceiling near zero on a small
-	// machine.
-	sliceCeilingReserveMax  = int64(16 << 30)
-	defaultSliceCeilingTTL  = 30 * time.Second
-	sliceCeilingLogInterval = time.Minute
-	sliceCeilingLogDelta    = int64(1 << 30)
+	// AIRA-106. The owner's two-parameter capacity policy, replacing AIRA-103's
+	// single blended headroom (min(MemTotal/4, 16GiB)), in the owner's own words:
+	// "specify a maximum amount to leave and an amount to leave free — so 'leave
+	// 16GB on the table' and 'leave 8GB free', meaning the slice would take
+	// min(total-16GB, free-8GB)". Both are overridable per sliceCeilingPolicy.
+	//
+	// sliceCeilingReserveMaxDefault is "leave this much on the table": a static
+	// bound on how much of the machine the slice may ever claim, whatever else is
+	// idle. Condition-independent, so it needs no sample and no damping.
+	sliceCeilingReserveMaxDefault = int64(16 << 30)
+	// sliceCeilingFreeMinDefault is "leave this much genuinely free": the dynamic
+	// floor system-wide MemAvailable is not to be pushed below.
+	//
+	// It sits EXACTLY on watchdogLowMemAvailable, the memory watchdog's SIGKILL
+	// trip, and that is a deliberate, recorded consequence of taking the owner's
+	// number rather than an oversight. AIRA-103's reserve coincided instead with
+	// watchdogRecoverMemAvailable (16 GiB), which made "the throttle's target
+	// state is one in which the watchdog is quiescent" an invariant; this policy
+	// gives up that margin. What survives is the floor: a freeMin BELOW the trip
+	// would target a state inside the kill band, and sliceCeilingPolicy.refusal
+	// refuses it. In practice the throttle's steady state is freeMin plus the
+	// admission headroom (>= 2 GiB), so the default sits just above the trip
+	// rather than on it. See the AIRA-106 design doc §2.5.
+	sliceCeilingFreeMinDefault = int64(8 << 30)
+	defaultSliceCeilingTTL     = 30 * time.Second
+	sliceCeilingLogInterval    = time.Minute
+	sliceCeilingLogDelta       = int64(1 << 30)
 )
 
 type sliceCeilingMode string
@@ -94,17 +108,44 @@ const (
 	sliceCeilingThrottled   = "throttled"
 )
 
+// AIRA-106. WHICH of the two policy terms produced a throttled ceiling. It is a
+// measured fact, not a verdict, and it exists because the static term made the
+// old operator wording false: with machineTerm in the min(), an IDLE box can
+// publish below its configured memory.max permanently, and every surface that
+// said "reduced by memory used OUTSIDE the slice" would then assert a cause that
+// is not the cause.
+//
+// Totality, so no state is ambiguous: set ONLY when State == throttled. When the
+// published ceiling equals the maximum, neither term bound it (the clamp did) and
+// the basis is an honest empty string; unevaluated and the partial window publish
+// no ceiling and therefore no basis. A held snapshot carries the last established
+// basis beside the last established state.
+const (
+	sliceCeilingBasisMachine  = "machine-reserve"
+	sliceCeilingBasisPressure = "system-pressure"
+)
+
 // sliceCeilingSnapshot is the published result of one evaluation. It is read
 // under a LEAF RWMutex from inside queue.mu (admit.go), so it must stay a plain
 // value type that can be copied out without touching anything else.
 type sliceCeilingSnapshot struct {
-	Mode         sliceCeilingMode
-	SlicePath    string
-	State        string
+	Mode      sliceCeilingMode
+	SlicePath string
+	State     string
+	// Basis names which policy term produced a THROTTLED ceiling, and is empty in
+	// every other state (see the sliceCeilingBasis* constants).
+	Basis        string
 	Reason       string
 	Ceiling      int64 // meaningful only when State != unevaluated
 	StaticMax    int64 // the live cgroup memory.max; 0 = not established
 	MemAvailable int64 // newest established system reading; 0 = not established
+	// SliceAnon is the slice's own non-reclaimable footprint at the sample, so
+	// the subsystem's log line can print the ceiling BESIDE what the slice is
+	// actually holding. That pair is the only apples-to-apples evidence for
+	// judging an observe-mode rollout: a per-job peak RSS says nothing about
+	// whether an AGGREGATE would have been throttled. Not on the wire — no
+	// operator surface asks for it.
+	SliceAnon int64
 	// Held marks a snapshot whose numbers are the LAST ESTABLISHED ones rather
 	// than current readings: the newest sample could not be established and the
 	// TTL has not yet expired. Every operator surface must say so -- presenting a
@@ -130,7 +171,7 @@ type sliceCeilingDeps struct {
 	readSliceParts   func(string) (current, reclaimable, maximum int64, ok bool, reason string)
 	readSliceCurrent func(string) (int64, bool)
 	readMemAvailable func() (int64, bool, string)
-	reserve          int64
+	policy           sliceCeilingPolicy
 	samples          int
 	quantum          int64
 	ttl              time.Duration
@@ -156,8 +197,10 @@ type sliceCeilingState struct {
 	// throttled/unthrottled from `published > 0` would call a full-ceiling hold
 	// "throttled" -- the published value equals the maximum in that case.
 	lastState        string
+	lastBasis        string
 	lastStaticMax    int64
 	lastMemAvailable int64
+	lastSliceAnon    int64
 
 	// path is the canonical slice every accumulated sample describes. A sample
 	// is a fact about a SLICE, not about the machine, so the window must not
@@ -189,8 +232,9 @@ func sliceCeilingAnon(current, reclaimable int64) int64 {
 	return current - reclaimable
 }
 
-// sliceCeilingDesired answers "how large a ceiling can this machine currently
-// afford to let the slice have".
+// sliceCeilingDesired is the PRESSURE term of AIRA-106's two-term policy: how
+// large a ceiling the machine can currently afford to let the slice have without
+// pushing system-wide MemAvailable below freeMin.
 //
 // affordable = MemAvailable + sliceAnon is what MemAvailable WOULD read if the
 // slice released everything. That single extra term is what makes this a signal
@@ -199,12 +243,83 @@ func sliceCeilingAnon(current, reclaimable int64) int64 {
 // Raw MemAvailable (the ticket's proposal) does not have that property, and on
 // this box — MemTotal 78.5 GiB against a 64 GiB configured slice — it would
 // throttle AIRA in response to AIRA using the budget the owner configured.
-func sliceCeilingDesired(memAvailable, current, reclaimable, reserve int64) int64 {
-	if memAvailable < 0 || reserve < 0 {
+//
+// AIRA-106 changed only the PARAMETER's meaning, not this arithmetic. The
+// owner's dynamic term "currentSliceUsage + (MemAvailable - freeMin)" IS this
+// function: sliceAnon + MemAvailable - freeMin == affordable - freeMin. And
+// currentSliceUsage must be sliceAnon rather than raw memory.current, or slice
+// page-cache growth would raise the ceiling for free (memory.current rises while
+// MemAvailable does not fall) — AIRA-103's Finding B, re-opened.
+func sliceCeilingDesired(memAvailable, current, reclaimable, freeMin int64) int64 {
+	if memAvailable < 0 || freeMin < 0 {
 		return 0
 	}
 	affordable := addClamp(memAvailable, sliceCeilingAnon(current, reclaimable))
-	return subtractFloor(affordable, reserve)
+	return subtractFloor(affordable, freeMin)
+}
+
+// sliceCeilingPolicy is AIRA-106's two-parameter capacity policy. MemTotal is
+// read once at startup (it does not change), so machineTerm is a CONSTANT — which
+// is why the damping window holds only the pressure term and the min() is applied
+// after it. For a constant t1, max_i(min(t1, t2_i)) == min(t1, max_i(t2_i)), and
+// both the quantise-down and the clamp to memory.max are monotone, so every
+// placement of the min is byte-identical; the after-the-window form is chosen
+// because it keeps the window a pure pressure damper and makes the binding term
+// knowable at publish time in one comparison.
+type sliceCeilingPolicy struct {
+	memTotal   int64
+	reserveMax int64
+	freeMin    int64
+}
+
+// machineTerm is "leave reserveMax on the table": condition-independent, so it
+// needs no sample, no window and no TTL.
+func (p sliceCeilingPolicy) machineTerm() int64 {
+	return subtractFloor(p.memTotal, p.reserveMax)
+}
+
+// refusal reports why this policy is unusable on this machine, or "" when it is
+// usable. A refused policy PARKS the subsystem with an explicit log line rather
+// than being silently clamped into something workable: AIRA-103 blended the
+// reserve with MemTotal/4 precisely to avoid pinning a small box near zero, and
+// the owner replaced that blend — re-introducing it as a hidden floor would
+// override an explicitly configured number with a policy nobody asked for.
+//
+// The headroom term uses the DEFAULT constant rather than the live per-server
+// field. That is not an approximation: admitSliceHeadroomBase has no environment
+// or config override — NewServer sets it from this constant and only tests
+// change it — so the constant IS the production value, and using it keeps the
+// refusal deterministic instead of dependent on a test knob. It is also the
+// right altitude: this asks "could this configuration ever admit anything",
+// not a per-pass capacity question.
+func (p sliceCeilingPolicy) refusal() string {
+	switch {
+	case p.memTotal <= 0:
+		return "MemTotal is unestablished"
+	case p.reserveMax < 0 || p.freeMin < 0:
+		return fmt.Sprintf("reserveMax=%d and freeMin=%d must both be non-negative", p.reserveMax, p.freeMin)
+	case p.reserveMax >= p.memTotal-admitSliceHeadroomBaseDefault:
+		// checkedAvailable returns 0 whenever maximum <= headroom, so a static
+		// term at or below the headroom base freezes admission forever rather
+		// than merely tightening it. Refusing at 0 would leave that whole band
+		// silently frozen.
+		return fmt.Sprintf("reserveMax=%d leaves only %d of MemTotal=%d, at or below the %d admission headroom, so enforce would freeze admission",
+			p.reserveMax, p.machineTerm(), p.memTotal, admitSliceHeadroomBaseDefault)
+	case p.freeMin >= p.memTotal-admitSliceHeadroomBaseDefault:
+		// The same band the reserveMax rule refuses, for the same reason: a
+		// freeMin this close to MemTotal leaves the dynamic term at most
+		// sliceAnon + headroom, so checkedAvailable yields zero forever.
+		return fmt.Sprintf("freeMin=%d leaves at most %d of MemTotal=%d above the slice's own footprint, at or below the %d admission headroom, so enforce would freeze admission",
+			p.freeMin, subtractFloor(p.memTotal, p.freeMin), p.memTotal, admitSliceHeadroomBaseDefault)
+	case p.freeMin < watchdogLowMemAvailable:
+		// The throttle's target state is MemAvailable ~= freeMin + headroom. Below
+		// the watchdog's trip that target sits INSIDE the band in which the
+		// watchdog SIGKILLs uncapped heavy processes, so the two subsystems would
+		// disagree about whether the machine is healthy.
+		return fmt.Sprintf("freeMin=%d is below the memory watchdog's %d kill threshold, so the throttle would target a state inside the watchdog's kill band",
+			p.freeMin, watchdogLowMemAvailable)
+	}
+	return ""
 }
 
 // sliceCeilingQuantizeDown rounds a capacity figure DOWN to a quantum multiple:
@@ -217,20 +332,6 @@ func sliceCeilingQuantizeDown(value, quantum int64) int64 {
 		return value
 	}
 	return value - value%quantum
-}
-
-// sliceCeilingReserve is the owner's headroom policy, shared with
-// internal/install rather than restated. MemTotal is read once; it does not
-// change.
-func sliceCeilingReserve(memTotal int64) int64 {
-	if memTotal <= 0 {
-		return sliceCeilingReserveMax
-	}
-	quarter := memTotal / 4
-	if quarter < sliceCeilingReserveMax {
-		return quarter
-	}
-	return sliceCeilingReserveMax
 }
 
 func readMemTotal() (int64, bool) {
@@ -361,7 +462,7 @@ func evaluateSliceCeiling(mode sliceCeilingMode, state *sliceCeilingState, deps 
 	if currentAfter < current {
 		current = currentAfter
 	}
-	desired := sliceCeilingDesired(available, current, reclaimable, deps.reserve)
+	desired := sliceCeilingDesired(available, current, reclaimable, deps.policy.freeMin)
 	state.lastOK = now
 	state.window = append(state.window, desired)
 	if len(state.window) > deps.samples {
@@ -382,6 +483,19 @@ func evaluateSliceCeiling(mode sliceCeilingMode, state *sliceCeilingState, deps 
 		if sample > candidate {
 			candidate = sample
 		}
+	}
+	// AIRA-106. The STATIC term enters here, after the damping window and BEFORE
+	// quantisation. After the window because machineTerm is a constant and needs
+	// no hysteresis (and for a constant the two placements are provably identical
+	// — see sliceCeilingPolicy). Before quantisation because the basis must be
+	// decided on the RAW figures: two different raw values can quantise to the
+	// same number, and comparing afterwards would name the wrong cause.
+	//
+	// A tie goes to machine-reserve: it is the term an operator can actually
+	// change, so it is the more useful of two equally true answers.
+	basis := sliceCeilingBasisPressure
+	if machine := deps.policy.machineTerm(); machine <= candidate {
+		candidate, basis = machine, sliceCeilingBasisMachine
 	}
 	candidate = sliceCeilingQuantizeDown(candidate, deps.quantum)
 
@@ -404,12 +518,15 @@ func evaluateSliceCeiling(mode sliceCeilingMode, state *sliceCeilingState, deps 
 
 	snapshot := sliceCeilingSnapshot{
 		Mode: mode, SlicePath: path, State: sliceCeilingUnthrottled,
-		Ceiling: state.published, StaticMax: maximum, MemAvailable: available, At: now,
+		Ceiling: state.published, StaticMax: maximum, MemAvailable: available,
+		SliceAnon: sliceCeilingAnon(current, reclaimable), At: now,
 	}
 	if state.published < maximum {
-		snapshot.State = sliceCeilingThrottled
+		snapshot.State, snapshot.Basis = sliceCeilingThrottled, basis
 	}
-	state.lastState, state.lastStaticMax, state.lastMemAvailable = snapshot.State, maximum, available
+	state.lastState, state.lastBasis = snapshot.State, snapshot.Basis
+	state.lastStaticMax, state.lastMemAvailable = maximum, available
+	state.lastSliceAnon = snapshot.SliceAnon
 	// AIRA-33. A RAISE used to wake the RAM-aware governor, which was the only
 	// SIGNAL-driven consumer of this ceiling. With that scheduler deleted, every
 	// remaining consumer re-polls on its own timer and needs no kick: the slice
@@ -436,7 +553,8 @@ func sliceCeilingHold(mode sliceCeilingMode, state *sliceCeilingState, deps slic
 		state.window = nil
 		state.havePub = false
 		state.published = 0
-		state.lastState, state.lastStaticMax, state.lastMemAvailable = "", 0, 0
+		state.lastState, state.lastBasis = "", ""
+		state.lastStaticMax, state.lastMemAvailable, state.lastSliceAnon = 0, 0, 0
 		// Expiry hands admission back the RAW maximum, so it is an effective
 		// RAISE. It woke the governor for that reason until AIRA-33 deleted it;
 		// no remaining consumer is kick-driven (see evaluateSliceCeiling).
@@ -445,9 +563,10 @@ func sliceCeilingHold(mode sliceCeilingMode, state *sliceCeilingState, deps slic
 		}
 	}
 	return sliceCeilingSnapshot{
-		Mode: mode, SlicePath: path, State: state.lastState,
+		Mode: mode, SlicePath: path, State: state.lastState, Basis: state.lastBasis,
 		Ceiling: state.published, StaticMax: state.lastStaticMax,
-		MemAvailable: state.lastMemAvailable, Reason: reason, Held: true, At: now,
+		MemAvailable: state.lastMemAvailable, SliceAnon: state.lastSliceAnon,
+		Reason: reason, Held: true, At: now,
 	}
 }
 
@@ -480,8 +599,19 @@ func logSliceCeiling(state *sliceCeilingState, deps sliceCeilingDeps, snapshot s
 		deps.logf("aira daemon: slice ceiling %s: %s", snapshot.State, snapshot.Reason)
 		return
 	}
-	deps.logf("aira daemon: slice ceiling %s (%s): %d effective / %d configured, MemAvailable=%d reserve=%d",
-		snapshot.State, snapshot.Mode, snapshot.Ceiling, snapshot.StaticMax, snapshot.MemAvailable, deps.reserve)
+	basis := snapshot.Basis
+	if basis == "" {
+		basis = "none"
+	}
+	// sliceAnon is printed beside the ceiling deliberately: it is the ONLY pair on
+	// any surface that answers "would this ceiling have blocked the work that
+	// actually ran", which is what the observe-then-enforce rollout has to decide.
+	// A per-signature peak RSS cannot answer it (one job's peak says nothing about
+	// an aggregate, and the history table keeps only the newest rows per
+	// signature), and confine --list is a manual sample.
+	deps.logf("aira daemon: slice ceiling %s (%s): %d effective / %d configured, sliceAnon=%d MemAvailable=%d bound-by=%s reserveMax=%d freeMin=%d memTotal=%d",
+		snapshot.State, snapshot.Mode, snapshot.Ceiling, snapshot.StaticMax, snapshot.SliceAnon,
+		snapshot.MemAvailable, basis, deps.policy.reserveMax, deps.policy.freeMin, deps.policy.memTotal)
 }
 
 func runSliceCeiling(ctx context.Context, mode sliceCeilingMode, interval time.Duration, deps sliceCeilingDeps) {
@@ -494,8 +624,8 @@ func runSliceCeiling(ctx context.Context, mode sliceCeilingMode, interval time.D
 		// mode that quietly does nothing is indistinguishable from one that
 		// found no pressure, which is the wrong thing to be indistinguishable
 		// from. Mirrors the watchdog's own invalid-deps report.
-		log.Printf("aira daemon: slice ceiling disabled: invalid configuration (interval=%s reserve=%d samples=%d quantum=%d)",
-			interval, deps.reserve, deps.samples, deps.quantum)
+		log.Printf("aira daemon: slice ceiling disabled: invalid configuration (interval=%s memTotal=%d reserveMax=%d freeMin=%d samples=%d quantum=%d)",
+			interval, deps.policy.memTotal, deps.policy.reserveMax, deps.policy.freeMin, deps.samples, deps.quantum)
 		<-ctx.Done()
 		return
 	}
@@ -514,7 +644,13 @@ func runSliceCeiling(ctx context.Context, mode sliceCeilingMode, interval time.D
 }
 
 func validSliceCeilingDeps(deps sliceCeilingDeps) bool {
-	return deps.samples >= 1 && deps.quantum > 0 && deps.reserve > 0 && deps.ttl > 0 &&
+	// The POLICY relationships (headroom band, watchdog band) are checked at
+	// wiring, where MemTotal is known and a refusal can name the offending
+	// number. This is the last-line structural check: a machineTerm of zero would
+	// publish a permanent zero ceiling, which is a frozen queue, not a throttle.
+	return deps.samples >= 1 && deps.quantum > 0 && deps.ttl > 0 &&
+		deps.policy.memTotal > 0 && deps.policy.reserveMax >= 0 &&
+		deps.policy.freeMin >= 0 && deps.policy.machineTerm() > 0 &&
 		deps.resolveSlice != nil && deps.readSliceParts != nil && deps.readSliceCurrent != nil &&
 		deps.readMemAvailable != nil && deps.now != nil && deps.sleep != nil
 }
@@ -592,7 +728,7 @@ func sliceCeilingEffectiveMaximum(snapshot sliceCeilingSnapshot, maximum int64) 
 	return snapshot.Ceiling
 }
 
-func realSliceCeilingDeps(s *Server, reserve int64) sliceCeilingDeps {
+func realSliceCeilingDeps(s *Server, policy sliceCeilingPolicy) sliceCeilingDeps {
 	return sliceCeilingDeps{
 		resolveSlice: func() (string, bool, string) {
 			resolve := s.admitResolveSlice
@@ -604,7 +740,7 @@ func realSliceCeilingDeps(s *Server, reserve int64) sliceCeilingDeps {
 		readSliceParts:   readSliceCeilingParts,
 		readSliceCurrent: readSliceCeilingCurrent,
 		readMemAvailable: readMemAvailable,
-		reserve:          reserve,
+		policy:           policy,
 		samples:          sliceCeilingSamples,
 		quantum:          sliceCeilingQuantum,
 		ttl:              defaultSliceCeilingTTL,
@@ -622,14 +758,6 @@ func sliceCeilingTTLFor(interval time.Duration) time.Duration {
 		return scaled
 	}
 	return defaultSliceCeilingTTL
-}
-
-func clampSliceCeilingReserve(memTotal int64) int64 {
-	reserve := sliceCeilingReserve(memTotal)
-	if reserve <= 0 || reserve > math.MaxInt64/2 {
-		return sliceCeilingReserveMax
-	}
-	return reserve
 }
 
 // sliceCeilingWouldBeBytes is the ceiling an operator would face IF the throttle

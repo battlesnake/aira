@@ -24,26 +24,35 @@ type ceilingFixture struct {
 	currentAfter  int64
 	reclaimable   int64
 	maximum       int64
-	sliceOK       bool
-	sliceReason   string
-	memOK         bool
-	memReason     string
-	afterOK       bool
-	resolved      bool
-	now           time.Time
-	published     []sliceCeilingSnapshot
+	// AIRA-106. memTotal/reserveMax carry the STATIC term. The defaults make it
+	// non-binding (memTotal 78 GiB against a 64 GiB maximum, reserveMax 0), which
+	// is exactly the condition under which the two-term policy reduces to
+	// AIRA-103's single-headroom arithmetic with reserve := freeMin. That is what
+	// lets every pre-AIRA-106 test below keep its original meaning; the condition
+	// is not incidental and is asserted by
+	// TestSliceCeilingPressureTermMatchesAira103WithFreeMin.
+	memTotal    int64
+	reserveMax  int64
+	sliceOK     bool
+	sliceReason string
+	memOK       bool
+	memReason   string
+	afterOK     bool
+	resolved    bool
+	now         time.Time
+	published   []sliceCeilingSnapshot
 }
 
 func newCeilingFixture() *ceilingFixture {
 	return &ceilingFixture{
 		memAvailable: 40 << 30, currentBefore: 10 << 30, currentAfter: 10 << 30,
-		reclaimable: 0, maximum: 64 << 30,
+		reclaimable: 0, maximum: 64 << 30, memTotal: 78 << 30, reserveMax: 0,
 		sliceOK: true, memOK: true, afterOK: true, resolved: true,
 		now: time.Unix(1_700_000_000, 0),
 	}
 }
 
-func (f *ceilingFixture) deps(reserve int64) sliceCeilingDeps {
+func (f *ceilingFixture) deps(freeMin int64) sliceCeilingDeps {
 	return sliceCeilingDeps{
 		resolveSlice: func() (string, bool, string) {
 			if !f.resolved {
@@ -56,7 +65,7 @@ func (f *ceilingFixture) deps(reserve int64) sliceCeilingDeps {
 		},
 		readSliceCurrent: func(string) (int64, bool) { return f.currentAfter, f.afterOK },
 		readMemAvailable: func() (int64, bool, string) { return f.memAvailable, f.memOK, f.memReason },
-		reserve:          reserve,
+		policy:           sliceCeilingPolicy{memTotal: f.memTotal, reserveMax: f.reserveMax, freeMin: freeMin},
 		samples:          sliceCeilingSamples,
 		quantum:          testCeilingQuantum,
 		ttl:              defaultSliceCeilingTTL,
@@ -423,21 +432,349 @@ func TestSliceCeilingSubQuantumMovementIsIgnored(t *testing.T) {
 // min(MemTotal/4, 16GiB), and on a large box it coincides with the watchdog's
 // own recovery threshold — the throttle's TARGET state must be one in which the
 // watchdog is quiescent, or the two disagree about whether the box is healthy.
-func TestSliceCeilingReserveFollowsInstallHeadroomPolicy(t *testing.T) {
-	if got := sliceCeilingReserve(78 << 30); got != sliceCeilingReserveMax {
-		t.Fatalf("reserve=%d on a large box, want the 16GiB cap", got)
+// verifies (AIRA-106): the OWNER'S OWN numbers, and the one invariant that
+// survives replacing AIRA-103's blended reserve with them.
+//
+// AIRA-103 tied its reserve to watchdogRecoverMemAvailable so the throttle's
+// target state was one in which the watchdog was quiescent. The owner's freeMin
+// is 8 GiB, which is watchdogLowMemAvailable -- the watchdog's KILL trip -- so
+// that margin is deliberately given up and only the floor remains: freeMin must
+// never sit BELOW the trip, or the throttle would aim at a state inside the band
+// where the watchdog SIGKILLs uncapped heavy processes. This replaces
+// TestSliceCeilingReserveFollowsInstallHeadroomPolicy, whose policy is gone.
+func TestSliceCeilingDefaultsAreTheOwnersNumbers(t *testing.T) {
+	if sliceCeilingReserveMaxDefault != 16<<30 {
+		t.Fatalf("reserveMax default=%d, want the owner's 16GiB", sliceCeilingReserveMaxDefault)
 	}
-	if got := sliceCeilingReserve(78 << 30); got != watchdogRecoverMemAvailable {
-		t.Fatalf("reserve=%d, want it to coincide with the watchdog's recovery threshold %d", got, watchdogRecoverMemAvailable)
+	if sliceCeilingFreeMinDefault != 8<<30 {
+		t.Fatalf("freeMin default=%d, want the owner's 8GiB", sliceCeilingFreeMinDefault)
+	}
+	if sliceCeilingFreeMinDefault < watchdogLowMemAvailable {
+		t.Fatalf("freeMin default=%d is below the watchdog's %d kill threshold: the throttle would target a state inside the kill band",
+			sliceCeilingFreeMinDefault, watchdogLowMemAvailable)
 	}
 	if watchdogRecoverMemAvailable <= watchdogLowMemAvailable {
 		t.Fatal("the watchdog's recovery threshold must sit above its kill threshold")
 	}
-	if got := sliceCeilingReserve(32 << 30); got != 8<<30 {
-		t.Fatalf("reserve=%d on a 32GiB box, want MemTotal/4 so enforce does not pin the ceiling near zero", got)
+	// The shipped default must itself be accepted by the guard, or the subsystem
+	// would refuse to start out of the box on this machine.
+	policy := sliceCeilingPolicy{memTotal: 78 << 30, reserveMax: sliceCeilingReserveMaxDefault, freeMin: sliceCeilingFreeMinDefault}
+	if refusal := policy.refusal(); refusal != "" {
+		t.Fatalf("the shipped defaults are refused on a 78GiB box: %s", refusal)
 	}
-	if got := sliceCeilingReserve(0); got != sliceCeilingReserveMax {
-		t.Fatalf("reserve=%d for an unestablished MemTotal, want the safe cap", got)
+}
+
+// verifies (AIRA-106): the published ceiling is the MINIMUM of the two policy
+// terms, and the reported Basis names which one bound it.
+//
+// RED against a single-term formula in either direction: a pressure-only
+// implementation fails the machine-bound row, a machine-only one fails the
+// pressure-bound row, and either fails every Basis assertion.
+func TestSliceCeilingTakesTheMinimumOfBothTerms(t *testing.T) {
+	// The fixture holds current=10 GiB with nothing reclaimable, so
+	// affordable = memAvailable + 10 GiB and the configured maximum is 64 GiB.
+	for _, test := range []struct {
+		name         string
+		memAvailable int64
+		memTotal     int64
+		reserveMax   int64
+		freeMin      int64
+		want         int64
+		wantState    string
+		wantBasis    string
+	}{
+		{
+			// machine 78-40=38 < pressure 50-8=42
+			name: "machine-bound", memAvailable: 40 << 30, memTotal: 78 << 30, reserveMax: 40 << 30, freeMin: 8 << 30,
+			want: 38 << 30, wantState: sliceCeilingThrottled, wantBasis: sliceCeilingBasisMachine,
+		},
+		{
+			// pressure 50-20=30 < machine 78-16=62
+			name: "pressure-bound", memAvailable: 40 << 30, memTotal: 78 << 30, reserveMax: 16 << 30, freeMin: 20 << 30,
+			want: 30 << 30, wantState: sliceCeilingThrottled, wantBasis: sliceCeilingBasisPressure,
+		},
+		{
+			// exactly equal: 78-40=38 == 50-12=38. The tie goes to the term an
+			// operator can actually change.
+			name: "equal", memAvailable: 40 << 30, memTotal: 78 << 30, reserveMax: 40 << 30, freeMin: 12 << 30,
+			want: 38 << 30, wantState: sliceCeilingThrottled, wantBasis: sliceCeilingBasisMachine,
+		},
+		{
+			// both terms above the configured maximum (machine 200, pressure 110):
+			// the memory.max clamp binds, so NEITHER policy term did and the basis
+			// must be an honest absence rather than whichever was smaller.
+			name: "both-above-maximum", memAvailable: 100 << 30, memTotal: 200 << 30, reserveMax: 0, freeMin: 0,
+			want: 64 << 30, wantState: sliceCeilingUnthrottled, wantBasis: "",
+		},
+		{
+			// The terms differ by LESS than one quantum: machine = 38G+200M,
+			// pressure = 38G+100M, and both quantise down to 38G. The pressure term
+			// is the smaller RAW value and therefore the true cause, but a basis
+			// decided AFTER quantisation would compare 38G against 38G and report
+			// machine-reserve. This row is the only one that separates the two, and
+			// it is why the comparison is specified on the raw figures.
+			name: "sub-quantum-difference", memAvailable: 40 << 30, memTotal: 78 << 30,
+			reserveMax: (40 << 30) - (200 << 20), freeMin: (12 << 30) - (100 << 20),
+			want: 38 << 30, wantState: sliceCeilingThrottled, wantBasis: sliceCeilingBasisPressure,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newCeilingFixture()
+			f.memTotal, f.reserveMax, f.memAvailable = test.memTotal, test.reserveMax, test.memAvailable
+			got := settle(t, f, &sliceCeilingState{}, f.deps(test.freeMin))
+			if got.Ceiling != test.want {
+				t.Fatalf("ceiling=%d, want %d (machine=%d pressure=%d)",
+					got.Ceiling, test.want, test.memTotal-test.reserveMax,
+					test.memAvailable+(10<<30)-test.freeMin)
+			}
+			if got.State != test.wantState || got.Basis != test.wantBasis {
+				t.Fatalf("state=%q basis=%q, want %q/%q", got.State, got.Basis, test.wantState, test.wantBasis)
+			}
+		})
+	}
+}
+
+// verifies (AIRA-106): while the MACHINE term binds, the ceiling does not move
+// with system memory pressure at all.
+//
+// RED against an implementation that folds reserveMax into the dynamic term
+// (affordable - reserveMax - freeMin, say): that would track MemAvailable
+// one-for-one here instead of holding flat.
+func TestSliceCeilingMachineTermIsIndependentOfPressure(t *testing.T) {
+	baseline := func(memAvailable int64) sliceCeilingSnapshot {
+		f := newCeilingFixture()
+		f.memTotal, f.reserveMax, f.memAvailable = 78<<30, 48<<30, memAvailable
+		return settle(t, f, &sliceCeilingState{}, f.deps(8<<30))
+	}
+	// machine = 78-48 = 30 GiB; pressure at memAvailable 40 = 50-8 = 42 GiB.
+	got := baseline(40 << 30)
+	if got.Ceiling != 30<<30 || got.Basis != sliceCeilingBasisMachine {
+		t.Fatalf("ceiling=%d basis=%q at the baseline, want a machine-bound 30GiB", got.Ceiling, got.Basis)
+	}
+	// +8 GiB of relief and -8 GiB of pressure both leave the pressure term above
+	// the machine term, so the published ceiling must not move either way.
+	for _, memAvailable := range []int64{48 << 30, 32 << 30} {
+		if moved := baseline(memAvailable); moved.Ceiling != got.Ceiling || moved.Basis != got.Basis {
+			t.Fatalf("ceiling=%d basis=%q at MemAvailable=%d, want it pinned at %d/%q by the machine term",
+				moved.Ceiling, moved.Basis, memAvailable, got.Ceiling, got.Basis)
+		}
+	}
+}
+
+// verifies (AIRA-106): with the static term non-binding, the published ceiling
+// is BYTE-IDENTICAL to AIRA-103's arithmetic with reserve := freeMin.
+//
+// That equivalence is the whole basis for keeping every pre-AIRA-106 test in this
+// file unchanged, and it is the precondition the fixture encodes (memTotal 78GiB
+// >= maximum 64GiB with reserveMax 0). RED against any accidental change to the
+// reused dynamic term.
+func TestSliceCeilingPressureTermMatchesAira103WithFreeMin(t *testing.T) {
+	for _, test := range []struct{ memAvailable, current, reclaimable, freeMin int64 }{
+		{40 << 30, 10 << 30, 0, 16 << 30},
+		{40 << 30, 10 << 30, 4 << 30, 16 << 30},
+		{20 << 30, 30 << 30, 8 << 30, 8 << 30},
+		{8 << 30, 2 << 30, 0, 16 << 30}, // underflows to zero
+	} {
+		f := newCeilingFixture()
+		f.memAvailable, f.currentBefore, f.currentAfter, f.reclaimable = test.memAvailable, test.current, test.current, test.reclaimable
+		got := settle(t, f, &sliceCeilingState{}, f.deps(test.freeMin))
+		// AIRA-103's own formula, spelled out here rather than called, so a change
+		// to sliceCeilingDesired cannot make this test agree with itself.
+		anon := test.current - test.reclaimable
+		if anon < 0 {
+			anon = 0
+		}
+		affordable := test.memAvailable + anon
+		want := affordable - test.freeMin
+		if want < 0 {
+			want = 0
+		}
+		want -= want % testCeilingQuantum
+		if want > f.maximum {
+			want = f.maximum
+		}
+		if got.Ceiling != want {
+			t.Fatalf("ceiling=%d for %+v, want AIRA-103's %d", got.Ceiling, test, want)
+		}
+	}
+}
+
+// verifies (AIRA-106): the Basis honesty contract in the states where a
+// fabricated cause would be easiest to emit.
+func TestSliceCeilingBasisIsAbsentWhenNothingBoundTheCeiling(t *testing.T) {
+	// Unthrottled: the memory.max clamp bound the ceiling, not a policy term.
+	f := newCeilingFixture()
+	f.memAvailable = 200 << 30
+	if got := settle(t, f, &sliceCeilingState{}, f.deps(8<<30)); got.State != sliceCeilingUnthrottled || got.Basis != "" {
+		t.Fatalf("state=%q basis=%q at the configured ceiling, want unthrottled with NO basis", got.State, got.Basis)
+	}
+	// Partial window: nothing is published, so nothing may be attributed.
+	warming := evaluateSliceCeiling(sliceCeilingEnforce, &sliceCeilingState{}, newCeilingFixture().deps(8<<30))
+	if warming.State != sliceCeilingUnevaluated || warming.Basis != "" {
+		t.Fatalf("state=%q basis=%q while warming up, want unevaluated with NO basis", warming.State, warming.Basis)
+	}
+	// Expired hold: the same, after a ceiling HAS been established and lost.
+	expired := newCeilingFixture()
+	expiredDeps := expired.deps(8 << 30)
+	state := &sliceCeilingState{}
+	settle(t, expired, state, expiredDeps)
+	expired.memOK = false
+	expired.now = expired.now.Add(2 * defaultSliceCeilingTTL)
+	if got := evaluateSliceCeiling(sliceCeilingEnforce, state, expiredDeps); got.State != sliceCeilingUnevaluated || got.Basis != "" {
+		t.Fatalf("state=%q basis=%q after expiry, want unevaluated with NO basis", got.State, got.Basis)
+	}
+}
+
+// verifies (AIRA-106): a HELD snapshot reports the last ESTABLISHED basis rather
+// than dropping it. Dropping it would make a still-applied throttle render with
+// no cause at all, which reads as "the daemon does not know" when it does.
+func TestSliceCeilingHoldPreservesBasis(t *testing.T) {
+	f := newCeilingFixture()
+	f.memTotal, f.reserveMax = 78<<30, 48<<30
+	deps := f.deps(8 << 30)
+	state := &sliceCeilingState{}
+	established := settle(t, f, state, deps)
+	if established.Basis != sliceCeilingBasisMachine {
+		t.Fatalf("basis=%q before the hold, want machine-reserve", established.Basis)
+	}
+	f.memOK, f.memReason = false, "read-error"
+	f.now = f.now.Add(2 * time.Second)
+	held := evaluateSliceCeiling(sliceCeilingEnforce, state, deps)
+	if !held.Held || held.State != sliceCeilingThrottled || held.Basis != sliceCeilingBasisMachine {
+		t.Fatalf("held=%v state=%q basis=%q, want a held throttle that still names machine-reserve", held.Held, held.State, held.Basis)
+	}
+}
+
+// verifies (AIRA-106): the damping asymmetry still holds in the MACHINE-bound
+// regime -- lowering needs a full window, relief takes one sample -- and Basis
+// tracks whichever term binds at each step.
+//
+// RED against an implementation with no static term at all (the settled ceiling
+// would be the 42 GiB pressure figure, not 30 GiB) and against one whose Basis
+// does not follow the crossover. It is deliberately NOT claimed to be red
+// against applying the min per-sample instead of after the window: for a
+// constant static term those are provably identical (sliceCeilingPolicy), and a
+// test that cannot fail proves nothing.
+func TestSliceCeilingDampingAsymmetryUnderTheMachineTerm(t *testing.T) {
+	f := newCeilingFixture()
+	f.memTotal, f.reserveMax = 78<<30, 48<<30 // machine term = 30 GiB
+	deps := f.deps(8 << 30)
+	state := &sliceCeilingState{}
+	settled := settle(t, f, state, deps)
+	if settled.Ceiling != 30<<30 || settled.Basis != sliceCeilingBasisMachine {
+		t.Fatalf("settled ceiling=%d basis=%q, want a machine-bound 30GiB", settled.Ceiling, settled.Basis)
+	}
+	// One low pressure sample: max() over the window still exceeds the machine
+	// term, so nothing moves and the basis is unchanged.
+	f.memAvailable = 10 << 30 // pressure term = 20-8 = 12 GiB
+	f.now = f.now.Add(2 * time.Second)
+	if got := evaluateSliceCeiling(sliceCeilingEnforce, state, deps); got.Ceiling != 30<<30 || got.Basis != sliceCeilingBasisMachine {
+		t.Fatalf("ceiling=%d basis=%q after ONE low sample, want it unchanged at the machine term", got.Ceiling, got.Basis)
+	}
+	// A full window of them: the pressure term now wins, and says so.
+	var dropped sliceCeilingSnapshot
+	for i := 0; i < sliceCeilingSamples; i++ {
+		f.now = f.now.Add(2 * time.Second)
+		dropped = evaluateSliceCeiling(sliceCeilingEnforce, state, deps)
+	}
+	if dropped.Ceiling != 12<<30 || dropped.Basis != sliceCeilingBasisPressure {
+		t.Fatalf("ceiling=%d basis=%q after a full window of pressure, want 12GiB attributed to system-pressure", dropped.Ceiling, dropped.Basis)
+	}
+	// Relief is prompt: ONE recovering sample restores the machine-bound ceiling.
+	f.memAvailable = 40 << 30
+	f.now = f.now.Add(2 * time.Second)
+	if got := evaluateSliceCeiling(sliceCeilingEnforce, state, deps); got.Ceiling != 30<<30 || got.Basis != sliceCeilingBasisMachine {
+		t.Fatalf("ceiling=%d basis=%q after ONE recovering sample, want an immediate return to the machine term", got.Ceiling, got.Basis)
+	}
+}
+
+// verifies (AIRA-106): a configuration that could never admit anything, or that
+// would aim the throttle inside the watchdog's kill band, is REFUSED with the
+// offending number named -- never silently clamped into something workable.
+//
+// RED against a guard that only checks reserveMax >= MemTotal: that leaves the
+// whole admitSliceHeadroomBase band, in which enforce freezes the queue forever
+// while reporting an ordinary throttle. Also RED against dropping the
+// watchdog-band floor.
+func TestSliceCeilingRefusesADegenerateSizing(t *testing.T) {
+	const memTotal = int64(78 << 30)
+	for _, test := range []struct {
+		name   string
+		policy sliceCeilingPolicy
+		want   string
+	}{
+		{"usable", sliceCeilingPolicy{memTotal, 16 << 30, 8 << 30}, ""},
+		{"memtotal-unestablished", sliceCeilingPolicy{0, 16 << 30, 8 << 30}, "MemTotal"},
+		{"reserve-max-exceeds-memtotal", sliceCeilingPolicy{memTotal, 80 << 30, 8 << 30}, "reserveMax"},
+		// The band a naive `>= MemTotal` guard would let through: a 1 GiB static
+		// term is below the 2 GiB admission headroom, so checkedAvailable is
+		// pinned at zero forever.
+		{"reserve-max-inside-the-headroom-band", sliceCeilingPolicy{memTotal, memTotal - (1 << 30), 8 << 30}, "reserveMax"},
+		{"free-min-inside-the-headroom-band", sliceCeilingPolicy{memTotal, 16 << 30, memTotal - (1 << 30)}, "freeMin"},
+		{"free-min-below-the-watchdog-trip", sliceCeilingPolicy{memTotal, 16 << 30, watchdogLowMemAvailable - 1}, "watchdog"},
+		{"negative", sliceCeilingPolicy{memTotal, -1, 8 << 30}, "non-negative"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			refusal := test.policy.refusal()
+			if test.want == "" {
+				if refusal != "" {
+					t.Fatalf("refused a usable policy: %s", refusal)
+				}
+				return
+			}
+			if refusal == "" {
+				t.Fatalf("policy %+v was accepted; enforce would freeze admission or target the watchdog's kill band", test.policy)
+			}
+			if !strings.Contains(refusal, test.want) {
+				t.Fatalf("refusal %q does not name %q, so an operator cannot tell which number is at fault", refusal, test.want)
+			}
+		})
+	}
+}
+
+// verifies (AIRA-106): the two sizing variables parse through the SHARED size
+// parser, reject garbage with E_CONFIG_INVALID, and -- like the interval -- are
+// not parsed at all while the mode is off, so "off is exactly today's behaviour"
+// survives a typo in either.
+func TestSliceCeilingSizingEnvParsing(t *testing.T) {
+	t.Setenv("AIRA_DAEMON_SLICE_CEILING_MODE", "enforce")
+	t.Setenv("AIRA_DAEMON_SLICE_CEILING_INTERVAL", "")
+	for _, test := range []struct {
+		value string
+		want  int64
+	}{{"", sliceCeilingReserveMaxDefault}, {"16G", 16 << 30}, {"16GiB", 16 << 30}, {"16GB", 16 << 30},
+		{"0", 0}, {"1048576", 1 << 20}} {
+		t.Setenv("AIRA_DAEMON_SLICE_CEILING_RESERVE_MAX", test.value)
+		_, _, policy, err := sliceCeilingConfigFromEnv()
+		if err != nil || policy.reserveMax != test.want {
+			t.Fatalf("reserveMax=%d err=%v for %q, want %d", policy.reserveMax, err, test.value, test.want)
+		}
+	}
+	t.Setenv("AIRA_DAEMON_SLICE_CEILING_RESERVE_MAX", "")
+	t.Setenv("AIRA_DAEMON_SLICE_CEILING_FREE_MIN", "8G")
+	if _, _, policy, err := sliceCeilingConfigFromEnv(); err != nil || policy.freeMin != 8<<30 {
+		t.Fatalf("freeMin=%d err=%v, want 8GiB", policy.freeMin, err)
+	}
+	for _, bad := range []string{"lots", "-1", "16Q", "16 G"} {
+		t.Setenv("AIRA_DAEMON_SLICE_CEILING_FREE_MIN", bad)
+		if _, _, _, err := sliceCeilingConfigFromEnv(); err == nil {
+			t.Fatalf("accepted freeMin=%q", bad)
+		} else if !strings.Contains(err.Error(), "E_CONFIG_INVALID") {
+			t.Fatalf("error %v for %q, want a stable E_CONFIG_INVALID code", err, bad)
+		}
+	}
+	// OFF must not parse them at all: the subsystem's whole safety claim is that
+	// off is byte-identical to today, and refusing to start the daemon over a
+	// typo in a variable nothing will read would break it.
+	t.Setenv("AIRA_DAEMON_SLICE_CEILING_MODE", "off")
+	t.Setenv("AIRA_DAEMON_SLICE_CEILING_RESERVE_MAX", "nonsense")
+	t.Setenv("AIRA_DAEMON_SLICE_CEILING_FREE_MIN", "also-nonsense")
+	mode, _, policy, err := sliceCeilingConfigFromEnv()
+	if err != nil || mode != sliceCeilingOff {
+		t.Fatalf("mode=%q err=%v with the subsystem off, want off and no error", mode, err)
+	}
+	if policy.reserveMax != sliceCeilingReserveMaxDefault || policy.freeMin != sliceCeilingFreeMinDefault {
+		t.Fatalf("policy=%+v while off, want the defaults rather than a parsed value", policy)
 	}
 }
 
@@ -823,17 +1160,17 @@ func TestSliceCeilingDoesNotAuthoriseANewlyRaisedMaximum(t *testing.T) {
 func TestSliceCeilingOffIgnoresAnInvalidInterval(t *testing.T) {
 	t.Setenv("AIRA_DAEMON_SLICE_CEILING_INTERVAL", "not-a-duration")
 	t.Setenv("AIRA_DAEMON_SLICE_CEILING_MODE", "off")
-	mode, interval, err := sliceCeilingConfigFromEnv()
+	mode, interval, _, err := sliceCeilingConfigFromEnv()
 	if err != nil || mode != sliceCeilingOff || interval != defaultSliceCeilingInterval {
 		t.Fatalf("mode=%q interval=%s err=%v, want off with no error", mode, interval, err)
 	}
 	t.Setenv("AIRA_DAEMON_SLICE_CEILING_MODE", "")
-	if mode, _, err := sliceCeilingConfigFromEnv(); err != nil || mode != sliceCeilingOff {
+	if mode, _, _, err := sliceCeilingConfigFromEnv(); err != nil || mode != sliceCeilingOff {
 		t.Fatalf("mode=%q err=%v for an unset mode, want the off default with no error", mode, err)
 	}
 	// But an invalid interval IS refused once the subsystem is actually wanted.
 	t.Setenv("AIRA_DAEMON_SLICE_CEILING_MODE", "enforce")
-	if _, _, err := sliceCeilingConfigFromEnv(); err == nil {
+	if _, _, _, err := sliceCeilingConfigFromEnv(); err == nil {
 		t.Fatal("an invalid interval was accepted in enforce mode")
 	}
 }

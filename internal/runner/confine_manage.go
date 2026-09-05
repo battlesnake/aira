@@ -153,8 +153,16 @@ type ConfineSliceReserve struct {
 	// mode it equals CeilingBytes; in observe mode it is the counterfactual,
 	// because observe applies nothing and CeilingBytes there is the untouched
 	// static capacity.
+	// CeilingBasis (AIRA-106) names WHICH policy term reduced a THROTTLED ceiling:
+	// "machine-reserve" (the static "leave this much of the machine outside the
+	// slice" bound) or "system-pressure" (memory used outside the slice right
+	// now). Empty in every other state. It exists because the two causes call for
+	// opposite operator responses, and because the pre-AIRA-106 wording asserted
+	// the pressure cause unconditionally — which the static term makes false on an
+	// otherwise idle machine.
 	CeilingMode         string `json:"ceiling_mode,omitempty"`
 	CeilingState        string `json:"ceiling_state,omitempty"`
+	CeilingBasis        string `json:"ceiling_basis,omitempty"`
 	CeilingReason       string `json:"ceiling_reason,omitempty"`
 	CeilingHeld         bool   `json:"ceiling_held,omitempty"`
 	CeilingStaticBytes  int64  `json:"ceiling_static_bytes,omitempty"`

@@ -37,6 +37,13 @@ const (
 	gibPerKiB         = int64(1024 * 1024)
 	cgroupRoot        = "/sys/fs/cgroup"
 	defaultEtcRoot    = "/etc"
+
+	// The modes a freshly-installed daemon unit declares when the operator gives
+	// no flag AND no managed unit already declares one. Observe for both memory
+	// subsystems: it measures and reports without acting, so a first install can
+	// never change what the machine does.
+	defaultDaemonSubsystemMode = "observe"
+	defaultWatchdogInterval    = 2 * time.Second
 )
 
 var (
@@ -44,6 +51,12 @@ var (
 	installedMemoryMaxRE      = regexp.MustCompile(`(?m)^MemoryMax=(.*)$`)
 	installedMemoryHighRE     = regexp.MustCompile(`(?m)^MemoryHigh=(.*)$`)
 	inotifyMaxUserInstancesRE = regexp.MustCompile(`(?m)^fs\.inotify\.max_user_instances\s*=\s*([0-9]+)\s*$`)
+	// AIRA-106. Read an installed daemon unit's own settings back, so an OMITTED
+	// option preserves them instead of resetting them — the MemoryMax precedent
+	// above, applied to the two daemon subsystem modes and the watchdog interval.
+	installedWatchdogModeRE     = regexp.MustCompile(`(?m)^Environment=AIRA_DAEMON_WATCHDOG_MODE=(.*)$`)
+	installedWatchdogIntervalRE = regexp.MustCompile(`(?m)^Environment=AIRA_DAEMON_WATCHDOG_INTERVAL=(.*)$`)
+	installedSliceCeilingModeRE = regexp.MustCompile(`(?m)^Environment=AIRA_DAEMON_SLICE_CEILING_MODE=(.*)$`)
 )
 
 const procInotifyMaxUserInstances = "/proc/sys/fs/inotify/max_user_instances"
@@ -59,7 +72,29 @@ type installOpts struct {
 	status           bool
 	watchdog         string
 	watchdogInterval time.Duration
+	sliceCeiling     string
 }
+
+// AIRA-106. An ABSENT daemon-mode option is now the ZERO VALUE all the way from
+// argv to the render, and means "keep whatever is installed" rather than "reset
+// to the default" (resolveDaemonModes). It used to be defaulted at parse time,
+// which produced a real, live defect: `aira install` with no --watchdog rewrote
+// the unit with "observe", so any unrelated re-install silently reverted an
+// operator's `enforce`. Measured on the development box while writing this: the
+// project record says the watchdog was flipped to enforce on 2026-08-25, and the
+// installed unit reads `observe` today with no drop-in overriding it.
+//
+// MemoryMax never had this problem because computeMemoryLimits reads the
+// installed value back (parseInstalledValue); the mode options did not.
+//
+// The zero value must survive THREE hops or the fix is cosmetic: parseInstallArgs
+// must not pre-fill it, runInstall/runUserInstall must not pre-fill it before the
+// unit is read, and reexecRequestFor must not forward a flag that was not given —
+// otherwise `sudo aira install`, the path install itself recommends, re-execs
+// with an explicit flag and the preservation can never fire.
+func (o installOpts) watchdogGiven() bool         { return o.watchdog != "" }
+func (o installOpts) watchdogIntervalGiven() bool { return o.watchdogInterval != 0 }
+func (o installOpts) sliceCeilingGiven() bool     { return o.sliceCeiling != "" }
 
 type installTarget struct {
 	uid      int
@@ -227,7 +262,10 @@ func RunSliceAnchor() int {
 }
 
 func parseInstallArgs(args []string) (installOpts, error) {
-	opts := installOpts{watchdog: "observe", watchdogInterval: 2 * time.Second}
+	// AIRA-106: no pre-filled defaults. An option not given stays the zero value
+	// all the way to resolveDaemonModes, which is what makes "absent means keep
+	// what is installed" possible at all.
+	opts := installOpts{}
 	seen := map[string]bool{}
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -252,7 +290,7 @@ func parseInstallArgs(args []string) (installOpts, error) {
 			case "status":
 				opts.status = true
 			}
-		case "memory-max", "memory-high", "watchdog", "watchdog-interval":
+		case "memory-max", "memory-high", "watchdog", "watchdog-interval", "slice-ceiling":
 			if !hasValue {
 				if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
 					return opts, argumentInvalid(fmt.Sprintf("option --%s requires a value", name))
@@ -263,16 +301,22 @@ func parseInstallArgs(args []string) (installOpts, error) {
 			if value == "" {
 				return opts, argumentInvalid(fmt.Sprintf("option --%s requires a value", name))
 			}
-			if name == "memory-max" {
+			switch name {
+			case "memory-max":
 				opts.memoryMax = value
-			} else if name == "memory-high" {
+			case "memory-high":
 				opts.memoryHigh = value
-			} else if name == "watchdog" {
-				if value != "off" && value != "observe" && value != "enforce" {
+			case "watchdog":
+				if !validDaemonMode(value) {
 					return opts, argumentInvalid("--watchdog must be off, observe, or enforce")
 				}
 				opts.watchdog = value
-			} else {
+			case "slice-ceiling":
+				if !validDaemonMode(value) {
+					return opts, argumentInvalid("--slice-ceiling must be off, observe, or enforce")
+				}
+				opts.sliceCeiling = value
+			default:
 				interval, parseErr := time.ParseDuration(value)
 				if parseErr != nil || interval < time.Second || interval >= 30*time.Second {
 					return opts, argumentInvalid("--watchdog-interval must be a Go duration in [1s,30s)")
@@ -283,8 +327,96 @@ func parseInstallArgs(args []string) (installOpts, error) {
 			return opts, argumentInvalid(fmt.Sprintf("unknown option --%s", name))
 		}
 	}
-	if opts.status && (opts.memoryMax != "" || opts.memoryHigh != "" || opts.allowOvercommit || opts.dryRun || seen["watchdog"] || seen["watchdog-interval"]) {
+	if opts.status && (opts.memoryMax != "" || opts.memoryHigh != "" || opts.allowOvercommit || opts.dryRun ||
+		seen["watchdog"] || seen["watchdog-interval"] || seen["slice-ceiling"]) {
 		return opts, argumentInvalid("--status cannot be combined with mutation options")
+	}
+	return opts, nil
+}
+
+func validDaemonMode(value string) bool {
+	return value == "off" || value == "observe" || value == "enforce"
+}
+
+// reportDaemonMode prints one daemon subsystem's mode, preferring the LIVE
+// process environment and falling back to what the unit file declares — marked
+// as declared, because a unit edited since the daemon started declares something
+// the running process is not doing. Neither available is reported as
+// unevaluated, never as a mode.
+func reportDaemonMode(d installDeps, label, variable, liveEnvironment string, liveErr error, unitContent string) {
+	mode := ""
+	if liveErr == nil {
+		for _, field := range strings.Fields(liveEnvironment) {
+			if strings.HasPrefix(field, variable+"=") {
+				mode = strings.TrimPrefix(field, variable+"=")
+			}
+		}
+	}
+	if mode == "" {
+		for _, line := range strings.Split(unitContent, "\n") {
+			if strings.HasPrefix(line, "Environment="+variable+"=") {
+				mode = strings.TrimPrefix(line, "Environment="+variable+"=") + " (declared; live unevaluated)"
+			}
+		}
+	}
+	if mode == "" {
+		d.logf("%s: unevaluated (%v)", label, liveErr)
+		return
+	}
+	d.logf("%s: %s", label, mode)
+}
+
+// resolveDaemonModes decides the daemon subsystem settings the unit will be
+// rendered with: an EXPLICIT flag wins; otherwise the value already declared in
+// the installed unit is preserved; otherwise the ship default.
+//
+// The preservation half is the fix for a live defect (see installOpts): before
+// it, every `aira install` that omitted --watchdog rewrote the mode to
+// "observe", so an unrelated deploy silently reverted an operator's `enforce`.
+// An installed value that is not a recognised mode is IGNORED rather than
+// propagated or refused — a hand-edited or newer-vocabulary unit must not be
+// able to make a later install fail, and the ship default is the safe answer.
+func resolveDaemonModes(opts installOpts, installedDaemonUnit string) (installOpts, error) {
+	if !opts.watchdogGiven() {
+		if mode := strings.TrimSpace(parseInstalledValue(installedDaemonUnit, installedWatchdogModeRE)); validDaemonMode(mode) {
+			opts.watchdog = mode
+		}
+	}
+	if !opts.sliceCeilingGiven() {
+		if mode := strings.TrimSpace(parseInstalledValue(installedDaemonUnit, installedSliceCeilingModeRE)); validDaemonMode(mode) {
+			opts.sliceCeiling = mode
+		}
+	}
+	if !opts.watchdogIntervalGiven() {
+		if value := strings.TrimSpace(parseInstalledValue(installedDaemonUnit, installedWatchdogIntervalRE)); value != "" {
+			if interval, err := time.ParseDuration(value); err == nil && interval >= time.Second && interval < 30*time.Second {
+				opts.watchdogInterval = interval
+			}
+		}
+	}
+	// Ship defaults, reached only when the option was not given AND no managed
+	// unit declares a usable value.
+	if !opts.watchdogGiven() {
+		opts.watchdog = defaultDaemonSubsystemMode
+	}
+	// AIRA-106. The slice ceiling ships INSTALLED as observe, mirroring the
+	// watchdog's own rollout: observe applies nothing to admission (it samples,
+	// publishes and reports the ceiling it WOULD apply), so this is the honest
+	// flip out of dormancy AIRA-106 asks for, while `enforce` -- a real capacity
+	// reduction on this box -- stays an explicit operator decision. The DAEMON's
+	// own env default stays `off`, so a daemon started outside the installed unit,
+	// and every test, is unchanged.
+	if !opts.sliceCeilingGiven() {
+		opts.sliceCeiling = defaultDaemonSubsystemMode
+	}
+	if !opts.watchdogIntervalGiven() {
+		opts.watchdogInterval = defaultWatchdogInterval
+	}
+	if !validDaemonMode(opts.watchdog) {
+		return opts, errors.New("watchdog mode must be off, observe, or enforce")
+	}
+	if !validDaemonMode(opts.sliceCeiling) {
+		return opts, errors.New("slice ceiling mode must be off, observe, or enforce")
 	}
 	return opts, nil
 }
@@ -408,7 +540,20 @@ func reexecRequestFor(executable string, target installTarget, opts installOpts)
 	if opts.memoryHigh != "" {
 		args = append(args, "--memory-high", opts.memoryHigh)
 	}
-	args = append(args, "--watchdog", opts.watchdog, "--watchdog-interval", opts.watchdogInterval.String())
+	// AIRA-106. Each daemon-mode option is forwarded ONLY when it was given
+	// explicitly. Forwarding them unconditionally (as this did) meant the
+	// re-exec'd unprivileged process always saw an explicit flag, so the
+	// keep-what-is-installed rule below could never fire under `sudo aira
+	// install` — the exact path a deploy takes.
+	if opts.watchdogGiven() {
+		args = append(args, "--watchdog", opts.watchdog)
+	}
+	if opts.watchdogIntervalGiven() {
+		args = append(args, "--watchdog-interval", opts.watchdogInterval.String())
+	}
+	if opts.sliceCeilingGiven() {
+		args = append(args, "--slice-ceiling", opts.sliceCeiling)
+	}
 	if opts.allowOvercommit {
 		args = append(args, "--allow-overcommit")
 	}
@@ -435,12 +580,9 @@ func timeoutArgv(command string, args ...string) []string {
 
 func runInstall(d installDeps, opts installOpts) error {
 	d = fillInstallDeps(d)
-	if opts.watchdog == "" {
-		opts.watchdog = "observe"
-	}
-	if opts.watchdogInterval == 0 {
-		opts.watchdogInterval = 2 * time.Second
-	}
+	// AIRA-106: the ""-means-absent defaults are resolved in resolveDaemonModes,
+	// AFTER the installed unit has been read, not here. Filling them in at this
+	// point is exactly what made every re-install reset the watchdog's mode.
 	if d.geteuid() == 0 {
 		return runRootInstall(d, opts)
 	}
@@ -449,19 +591,16 @@ func runInstall(d installDeps, opts installOpts) error {
 
 func runUserInstall(d installDeps, opts installOpts) error {
 	d = fillInstallDeps(d)
-	if opts.watchdog == "" {
-		opts.watchdog = "observe"
-	}
-	if opts.watchdogInterval == 0 {
-		opts.watchdogInterval = 2 * time.Second
-	}
+	// AIRA-106: the ""-means-absent defaults are resolved in resolveDaemonModes,
+	// AFTER the installed unit has been read, not here. Filling them in at this
+	// point is exactly what made every re-install reset the watchdog's mode.
 	home, err := installHome(d)
 	if err != nil {
 		return err
 	}
 	uid := d.geteuid()
 	unitDir := filepath.Join(home, ".config", "systemd", "user")
-	installed, whaleContent := []byte(nil), []byte(nil)
+	installed, whaleContent, installedDaemon := []byte(nil), []byte(nil), []byte(nil)
 	daemonPresent := false
 	if existingFD, present, openErr := openExistingUnitDirectory(d, unitDir, uid); openErr != nil {
 		return unavailable(openErr)
@@ -472,7 +611,9 @@ func runUserInstall(d installDeps, opts installOpts) error {
 			_, _, readErr = readRegularUnitAt(d, existingFD, uid, d.anchorUnit, true)
 		}
 		if readErr == nil {
-			_, daemonPresent, readErr = readRegularUnitAt(d, existingFD, uid, d.daemonUnit, true)
+			// AIRA-106: the daemon unit's CONTENT, not just its presence — an
+			// omitted mode option preserves what is installed there.
+			installedDaemon, daemonPresent, readErr = readRegularUnitAt(d, existingFD, uid, d.daemonUnit, true)
 		}
 		if readErr == nil {
 			whaleContent, _, readErr = readRegularUnitAt(d, existingFD, uid, "whale.slice", false)
@@ -501,6 +642,13 @@ func runUserInstall(d installDeps, opts installOpts) error {
 	if err != nil {
 		return argumentInvalid(err.Error())
 	}
+	// AIRA-106. Resolve the daemon subsystem modes: an EXPLICIT flag wins, else
+	// whatever the installed unit already declares, else the ship default. Doing
+	// this after the unit read and before the render is what stops an unrelated
+	// re-install from silently reverting an operator's `enforce`.
+	if opts, err = resolveDaemonModes(opts, string(installedDaemon)); err != nil {
+		return argumentInvalid(err.Error())
+	}
 
 	delegated := userMemoryControllerDelegated(d, uid)
 	executable, err := d.executable()
@@ -526,7 +674,7 @@ func runUserInstall(d installDeps, opts installOpts) error {
 	if err != nil {
 		return unavailable(fmt.Errorf("resolve daemon paths: %w", err))
 	}
-	daemonUnit, err := renderDaemonUnit(d.daemonUnit, executable, paths.StateHome, opts.watchdog, opts.watchdogInterval, d.daemonRuntimeDir)
+	daemonUnit, err := renderDaemonUnit(d.daemonUnit, executable, paths.StateHome, opts.watchdog, opts.watchdogInterval, opts.sliceCeiling, d.daemonRuntimeDir)
 	if err != nil {
 		return argumentInvalid(err.Error())
 	}
@@ -874,15 +1022,18 @@ func renderUnits(sliceUnit, anchorUnit, executable, maximum, high string, accept
 	return slice, anchor, nil
 }
 
-func renderDaemonUnit(unit, executable, stateHome, watchdog string, interval time.Duration, runtimeDir string) (string, error) {
+func renderDaemonUnit(unit, executable, stateHome, watchdog string, interval time.Duration, sliceCeiling, runtimeDir string) (string, error) {
 	if strings.ContainsAny(unit, "\r\n/") || !strings.HasSuffix(unit, ".service") {
 		return "", errors.New("daemon unit name must end in .service and contain no path separators")
 	}
 	if strings.ContainsAny(executable+stateHome+runtimeDir, "\r\n") || !filepath.IsAbs(executable) || !filepath.IsAbs(stateHome) {
 		return "", errors.New("daemon executable and state home must be absolute single-line paths")
 	}
-	if watchdog != "off" && watchdog != "observe" && watchdog != "enforce" {
+	if !validDaemonMode(watchdog) {
 		return "", errors.New("watchdog mode must be off, observe, or enforce")
+	}
+	if !validDaemonMode(sliceCeiling) {
+		return "", errors.New("slice ceiling mode must be off, observe, or enforce")
 	}
 	if interval < time.Second || interval >= 30*time.Second {
 		return "", errors.New("watchdog interval must be in [1s,30s)")
@@ -901,7 +1052,8 @@ func renderDaemonUnit(unit, executable, stateHome, watchdog string, interval tim
 	unitContent := string(template)
 	replacements := map[string]string{
 		"@DAEMONUNIT@": unit, "@AIRABIN@": systemdExecPath(executable), "@STATEHOME@": systemdExecPath(stateHome),
-		"@WATCHDOG_MODE@": watchdog, "@WATCHDOG_INTERVAL@": interval.String(), "@RUNTIME_ENV@": runtimeEnvironment,
+		"@WATCHDOG_MODE@": watchdog, "@WATCHDOG_INTERVAL@": interval.String(),
+		"@SLICE_CEILING_MODE@": sliceCeiling, "@RUNTIME_ENV@": runtimeEnvironment,
 	}
 	for placeholder, value := range replacements {
 		unitContent = strings.ReplaceAll(unitContent, placeholder, value)
@@ -1718,27 +1870,12 @@ func statusDaemonFacet(d installDeps, uid int, content []byte, unitErr error) {
 	} else {
 		d.logf("daemon: ActiveState=%s SubState=%s", valueOrUnevaluated(active), valueOrUnevaluated(sub))
 	}
-	mode := ""
 	liveEnvironment, liveErr := d.run([]string{"systemctl", "--user", "show", "-p", "Environment", "--value", d.daemonUnit}, nil)
-	if liveErr == nil {
-		for _, field := range strings.Fields(string(liveEnvironment)) {
-			if strings.HasPrefix(field, "AIRA_DAEMON_WATCHDOG_MODE=") {
-				mode = strings.TrimPrefix(field, "AIRA_DAEMON_WATCHDOG_MODE=")
-			}
-		}
-	}
-	if mode == "" {
-		for _, line := range strings.Split(string(content), "\n") {
-			if strings.HasPrefix(line, "Environment=AIRA_DAEMON_WATCHDOG_MODE=") {
-				mode = strings.TrimPrefix(line, "Environment=AIRA_DAEMON_WATCHDOG_MODE=") + " (declared; live unevaluated)"
-			}
-		}
-	}
-	if mode == "" {
-		d.logf("daemon watchdog: unevaluated (%v)", liveErr)
-	} else {
-		d.logf("daemon watchdog: %s", mode)
-	}
+	reportDaemonMode(d, "daemon watchdog", "AIRA_DAEMON_WATCHDOG_MODE", string(liveEnvironment), liveErr, string(content))
+	// AIRA-106. Reported beside the watchdog because an operator checking "is the
+	// machine protected" must be able to see BOTH memory subsystems' modes, and
+	// because an absent line here is what an older daemon unit looks like.
+	reportDaemonMode(d, "daemon slice ceiling", "AIRA_DAEMON_SLICE_CEILING_MODE", string(liveEnvironment), liveErr, string(content))
 	paths, pathsErr := d.daemonPaths()
 	if pathsErr != nil {
 		d.logf("daemon reachable: unevaluated (%v)", pathsErr)

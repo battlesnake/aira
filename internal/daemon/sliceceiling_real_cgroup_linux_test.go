@@ -241,14 +241,27 @@ func readCgroupOOMKills(t *testing.T, dir string) int64 {
 	return 0
 }
 
+// realCeilingSimulatedTotal is the MemTotal these fixtures model. MemAvailable is
+// modelled rather than measured because this box carries dozens of concurrent
+// confine jobs: the real figure moves by gigabytes between samples and a few
+// hundred MiB of signal would be pure noise. The model is
+// max(0, simulatedTotal - outside - sliceAnon) -- sliceAnon, NOT memory.current,
+// because si_mem_available counts reclaimable file pages as available wherever
+// they live, so only the slice's non-reclaimable footprint reduces it.
+const realCeilingSimulatedTotal = int64(48 << 30)
+
 func realCeilingDeps(dir string, memAvailable *int64, now *time.Time, publish func(sliceCeilingSnapshot)) sliceCeilingDeps {
 	return sliceCeilingDeps{
 		resolveSlice:     func() (string, bool, string) { return dir, true, "" },
 		readSliceParts:   readSliceCeilingParts,
 		readSliceCurrent: readSliceCeilingCurrent,
 		readMemAvailable: func() (int64, bool, string) { return *memAvailable, true, "" },
-		reserve:          16 << 30,
-		samples:          sliceCeilingSamples,
+		// AIRA-106: reserveMax 0 makes the static term non-binding here, so these
+		// fixtures keep testing the PRESSURE term against real kernel accounting,
+		// exactly as they did before. The static term has its own real-cgroup case
+		// in TestSliceCeilingRealCgroupNeverShrinksBelowRealUsage.
+		policy:  sliceCeilingPolicy{memTotal: realCeilingSimulatedTotal, reserveMax: 0, freeMin: 16 << 30},
+		samples: sliceCeilingSamples,
 		// A small quantum so the fixture's few hundred MiB actually move the
 		// published ceiling. With the production 256 MiB quantum a 400 MiB step
 		// would be indistinguishable from rounding, and the test would pass
@@ -406,7 +419,7 @@ func TestSliceCeilingRealCgroupSignalTracksRealAccounting(t *testing.T) {
 	}
 
 	// (2) END TO END.
-	const simulatedTotal = int64(48 << 30)
+	const simulatedTotal = realCeilingSimulatedTotal
 	outside := int64(8 << 30)
 	memAvailable := int64(0)
 	now := time.Unix(1_700_000_000, 0)
@@ -458,5 +471,201 @@ func TestSliceCeilingRealCgroupSignalTracksRealAccounting(t *testing.T) {
 	}
 	if !fixture.alive(t) {
 		t.Fatal("the fixture job died during the signal test")
+	}
+}
+
+// AIRA-106 real-cgroup proof of the SAFETY BOUND.
+//
+// The brief asks for "a real-cgroup test proving the new formula never shrinks
+// below current real usage". The naive form of that claim is FALSE, and stating
+// it precisely is half the work:
+//
+//	published = quantise_down(min(machineTerm, sliceAnon + (MemAvailable - freeMin)))
+//
+// so for 0 <= MemAvailable - freeMin < quantum the round-DOWN alone puts the
+// published ceiling below sliceAnon. The provable claims are:
+//
+//	(a) MemAvailable - freeMin >= quantum AND machineTerm >= sliceAnon
+//	      => published >= sliceAnon
+//	(b) for all MemAvailable >= freeMin
+//	      => published >= sliceAnon - quantum
+//
+// and the admission corollary is one-directional: available > 0 SUFFICES under
+// MemAvailable - freeMin > slab_reclaimable + quantum + headroom, because
+// checkedAvailable charges current - inactive_file - active_file, which is
+// sliceAnon PLUS slab (readSliceMemory discards slab; sliceCeilingAnon does not).
+//
+// The claim is proved against the KERNEL'S OWN per-cgroup accounting, with
+// MemAvailable modelled per realCeilingSimulatedTotal.
+const ceilingBoundMargin = int64(1 << 30)
+
+// ceilingBoundProbe settles the subsystem against the real cgroup and reports
+// the published snapshot beside the real sliceAnon it must be judged against.
+// Shared by the bound test and its negative control so the control is testing
+// the SAME assertion path, not a parallel one -- which is what makes it a
+// control rather than a second test.
+func ceilingBoundProbe(t *testing.T, fixture *ceilingCgroupFixture, policy sliceCeilingPolicy, outside int64) (published sliceCeilingSnapshot, sliceAnon, slab int64) {
+	t.Helper()
+	memAvailable := int64(0)
+	now := time.Unix(1_700_000_000, 0)
+	deps := realCeilingDeps(fixture.dir, &memAvailable, &now, func(s sliceCeilingSnapshot) { published = s })
+	deps.policy = policy
+	// The fixture's own 2 GiB memory.max would clamp every candidate, hiding the
+	// policy under the clamp; the modelled maximum is raised out of the way so the
+	// FORMULA is what is under test. The clamp itself is pinned by the unit tests.
+	deps.readSliceParts = func(path string) (int64, int64, int64, bool, string) {
+		current, reclaimable, _, ok, reason := readSliceCeilingParts(path)
+		return current, reclaimable, policy.memTotal, ok, reason
+	}
+	state := &sliceCeilingState{}
+	// Deliberately more than one full window: the published figure is the MAX over
+	// sliceCeilingSamples, so a control that drives pressure for fewer ticks would
+	// still be reading the previous (higher) ceiling and would "fail" for a reason
+	// that has nothing to do with the bound.
+	for i := 0; i < 2*sliceCeilingSamples; i++ {
+		current, reclaimable, _, ok, reason := readSliceCeilingParts(fixture.dir)
+		if !ok {
+			cgrouptest.SkipOrFailRealCgroup(t, "fixture slice read unevaluated: %s", reason)
+		}
+		sliceAnon = sliceCeilingAnon(current, reclaimable)
+		slab = current - reclaimable - sliceAnon
+		// si_mem_available counts reclaimable file pages as available wherever they
+		// live, so only the slice's NON-reclaimable footprint reduces it. Modelling
+		// it against memory.current instead would count the slice's own page cache
+		// as consumed memory, the exact mistake this signal exists to avoid.
+		memAvailable = subtractFloor(policy.memTotal-outside, sliceAnon)
+		evaluateSliceCeiling(sliceCeilingEnforce, state, deps)
+		now = now.Add(2 * time.Second)
+	}
+	if published.State == sliceCeilingUnevaluated {
+		cgrouptest.SkipOrFailRealCgroup(t, "ceiling unevaluated against the real fixture: %s", published.Reason)
+	}
+	return published, sliceAnon, slab
+}
+
+// verifies (AIRA-106): THE SAFETY BOUND, against a real cgroup holding a real
+// running process. With the machine term out of the way and MemAvailable a full
+// margin above freeMin, the published ceiling never falls below what the slice
+// is ALREADY holding -- so admission can never close merely because the slice
+// holds what it holds -- and the AIRA-103 actuator clauses still hold: the
+// kernel-enforced limit is byte-identical, nothing is OOM-killed, the job lives.
+//
+// Both real growth forms are exercised, because the bound has to survive the
+// page-cache case that broke every naive formulation of this signal.
+func TestSliceCeilingRealCgroupNeverShrinksBelowRealUsage(t *testing.T) {
+	fixture := newCeilingCgroupFixture(t)
+	maxBefore := readCgroupRaw(t, fixture.dir, "memory.max")
+	killsBefore := readCgroupOOMKills(t, fixture.dir)
+
+	// freeMin is held a full margin below the modelled MemAvailable, and the
+	// machine term is left non-binding, so this measures exactly claim (a).
+	policy := sliceCeilingPolicy{memTotal: realCeilingSimulatedTotal, reserveMax: 0, freeMin: 8 << 30}
+	outside := realCeilingSimulatedTotal - policy.freeMin - ceilingBoundMargin - (4 << 30)
+
+	for _, step := range []string{"", "anon", "file"} {
+		if step != "" {
+			fixture.grow(t, step)
+		}
+		published, sliceAnon, slab := ceilingBoundProbe(t, fixture, policy, outside)
+		if sliceAnon <= 0 {
+			cgrouptest.SkipOrFailRealCgroup(t, "fixture holds no non-reclaimable memory after %q; the bound would be vacuous", step)
+		}
+		if slab >= ceilingBoundMargin {
+			cgrouptest.SkipOrFailRealCgroup(t, "fixture slab_reclaimable %d is not below the %d margin; the corollary below is unprovable here", slab, ceilingBoundMargin)
+		}
+		if published.MemAvailable-policy.freeMin < ceilingBoundMargin {
+			cgrouptest.SkipOrFailRealCgroup(t, "modelled MemAvailable %d is not a full %d above freeMin %d after %q",
+				published.MemAvailable, ceilingBoundMargin, policy.freeMin, step)
+		}
+		if published.Ceiling < sliceAnon {
+			t.Fatalf("after %q growth the published ceiling %d fell BELOW the slice's own real footprint %d while MemAvailable %d was %d above freeMin %d",
+				step, published.Ceiling, sliceAnon, published.MemAvailable, published.MemAvailable-policy.freeMin, policy.freeMin)
+		}
+		// The admission corollary, against the real charge admission actually
+		// applies (current - file LRU = sliceAnon + slab), with headroom zeroed so
+		// the margin above is the whole story.
+		current, fileReclaimable, _, ok, reason := readSliceCeilingParts(fixture.dir)
+		if !ok {
+			cgrouptest.SkipOrFailRealCgroup(t, "fixture slice read unevaluated: %s", reason)
+		}
+		if available := checkedAvailable(current, published.Ceiling, fileReclaimable-slab, 0, 0); available <= 0 {
+			t.Fatalf("after %q growth admission closed (available=%d) though MemAvailable was %d above freeMin: the ceiling is not leaving room for the slice's existing footprint",
+				step, available, published.MemAvailable-policy.freeMin)
+		}
+		if maxAfter := readCgroupRaw(t, fixture.dir, "memory.max"); maxAfter != maxBefore {
+			t.Fatalf("memory.max moved from %q to %q after %q: this mechanism must never write a kernel-enforced limit", maxBefore, maxAfter, step)
+		}
+		if kills := readCgroupOOMKills(t, fixture.dir); kills != killsBefore {
+			t.Fatalf("oom_kill went from %d to %d after %q: a running job was pressured", killsBefore, kills, step)
+		}
+		if !fixture.alive(t) {
+			t.Fatalf("the fixture job died after %q growth", step)
+		}
+	}
+
+	// The MACHINE half, where "never below real usage" is deliberately NOT an
+	// invariant. With the static term set below the slice's own footprint the
+	// ceiling DOES fall under it and admission closes -- correctly, because the
+	// slice is already over its configured share of the machine -- and, critically,
+	// STILL without touching anything kernel-enforced. Saying so here is the
+	// difference between a proof and a slogan.
+	_, sliceAnon, _ := ceilingBoundProbe(t, fixture, policy, outside)
+	overCommitted := sliceCeilingPolicy{
+		memTotal:   realCeilingSimulatedTotal,
+		reserveMax: realCeilingSimulatedTotal - sliceAnon/2,
+		freeMin:    policy.freeMin,
+	}
+	published, sliceAnon, _ := ceilingBoundProbe(t, fixture, overCommitted, outside)
+	if published.Basis != sliceCeilingBasisMachine {
+		t.Fatalf("basis=%q with the machine term below the slice's footprint, want machine-reserve", published.Basis)
+	}
+	if published.Ceiling >= sliceAnon {
+		t.Fatalf("ceiling=%d did not fall below the slice's footprint %d under a machine term of %d; the machine half of the policy is not being applied",
+			published.Ceiling, sliceAnon, overCommitted.machineTerm())
+	}
+	if maxAfter := readCgroupRaw(t, fixture.dir, "memory.max"); maxAfter != maxBefore {
+		t.Fatalf("memory.max moved from %q to %q under the machine term", maxBefore, maxAfter)
+	}
+	if kills := readCgroupOOMKills(t, fixture.dir); kills != killsBefore || !fixture.alive(t) {
+		t.Fatalf("the machine term pressured a running job: oom_kill %d -> %d, alive=%v", killsBefore, kills, fixture.alive(t))
+	}
+}
+
+// verifies (AIRA-106): THE NEGATIVE CONTROL for the bound above.
+//
+// Distinct from TestSliceCeilingRealCgroupHarnessDetectsALimitWrite, which
+// validates the no-write ACTUATOR. This one validates the BOUND'S OWN HARNESS:
+// it drives the same fixture through the same ceilingBoundProbe with MemAvailable
+// pushed BELOW freeMin, and the probe must then report a ceiling under the real
+// sliceAnon and a closed admission. Without it, "the ceiling stayed above real
+// usage" could be true of a harness that could never have observed the opposite.
+//
+// The pressure is SUSTAINED for more than a full damping window on purpose: the
+// published figure is the max over sliceCeilingSamples, so a single low sample
+// would leave the previous ceiling standing and the control would report a pass
+// it had not earned.
+func TestSliceCeilingRealCgroupUsageBoundHarnessDetectsAViolation(t *testing.T) {
+	fixture := newCeilingCgroupFixture(t)
+	fixture.grow(t, "anon")
+	policy := sliceCeilingPolicy{memTotal: realCeilingSimulatedTotal, reserveMax: 0, freeMin: 8 << 30}
+	// Everything not the slice is "in use", so the modelled MemAvailable floors at
+	// zero -- strictly below freeMin, the hardest violation the model allows.
+	published, sliceAnon, slab := ceilingBoundProbe(t, fixture, policy, realCeilingSimulatedTotal)
+	if sliceAnon <= 0 {
+		cgrouptest.SkipOrFailRealCgroup(t, "fixture holds no non-reclaimable memory; the control would be vacuous")
+	}
+	if published.MemAvailable >= policy.freeMin {
+		t.Fatalf("the control did not actually push MemAvailable (%d) below freeMin (%d)", published.MemAvailable, policy.freeMin)
+	}
+	if published.Ceiling >= sliceAnon {
+		t.Fatalf("with MemAvailable %d below freeMin %d the harness still reported a ceiling %d at or above the real footprint %d: it cannot observe the violation the bound test claims to exclude",
+			published.MemAvailable, policy.freeMin, published.Ceiling, sliceAnon)
+	}
+	current, fileReclaimable, _, ok, reason := readSliceCeilingParts(fixture.dir)
+	if !ok {
+		cgrouptest.SkipOrFailRealCgroup(t, "fixture slice read unevaluated: %s", reason)
+	}
+	if available := checkedAvailable(current, published.Ceiling, fileReclaimable-slab, 0, 0); available != 0 {
+		t.Fatalf("available=%d under a ceiling below the slice's own footprint, want admission fully closed", available)
 	}
 }

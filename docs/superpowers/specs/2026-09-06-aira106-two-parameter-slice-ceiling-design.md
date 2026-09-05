@@ -1,8 +1,11 @@
 # AIRA-106 — Two-parameter dynamic slice ceiling
 
-Status: plan **v2**. v1 gated **PASS-WITH-CHANGES** by Fable (no P0, 5×P1, 8×P2)
-and **PASS-WITH-CHANGES** by DeepSeek-V4-pro (2×P1, 5×P2), independently.
-§0.1 lists every v1→v2 change and which reviewer required it.
+Status: plan **v3** — built. v1 gated **PASS-WITH-CHANGES** by Fable (no P0,
+5×P1, 8×P2) and **PASS-WITH-CHANGES** by DeepSeek-V4-pro (2×P1, 5×P2),
+independently. v2 re-gated **PASS-WITH-CHANGES** by Fable (no P0, 1×P1, 4×P2):
+four of the five v1 P1s confirmed RESOLVED, one PARTIAL (§4.1's install fix was
+defeated on the `sudo` path) and one PARTIAL (§6's substituted evidence did not
+measure the claim). §0.1 lists every change and which reviewer required it.
 Ticket: `.aira/tickets/AIRA-106.md`
 Refines: AIRA-103 (`docs/superpowers/specs/2026-09-05-aira103-dynamic-slice-ceiling-design.md`)
 Depends on: AIRA-33 (governor deletion) — landed as `6611240`; this plan is written
@@ -44,6 +47,17 @@ via the existing mode ladder.
 | 12 | The cheaper honesty alternative Fable named recorded as considered-and-rejected (§3) | Fable P2 |
 | 13 | Test-fixture `memTotal` pinned ≥ 78 GiB and the `reserveMax = 0` equivalence given its precondition | Fable P2 |
 | 14 | `MemTotal` read-once staleness recorded as a residual (§9) | DeepSeek P2 |
+
+### 0.2 v2 → v3 changes
+
+| # | change | required by |
+|---|---|---|
+| 15 | §4.1's install fix completed: an absent mode option is the ZERO VALUE from argv to render, `runInstall`/`runUserInstall` no longer pre-default it, and `reexecRequestFor` forwards a mode flag ONLY when given — without which `sudo aira install` (the path install recommends) always forged an explicit flag and the preservation could never fire. `--watchdog-interval` preserved the same way. | Fable r2 P1 |
+| 16 | §6's enforce criterion measures the right thing: the subsystem's own log line now prints `sliceAnon` beside the effective ceiling (one field, no new logging — both values are already in hand at publish time), and the criterion is stated on that pair. `MAX(peak_rss)` was a per-JOB figure against a slice-AGGREGATE ceiling, from a table pruned to 20 rows per signature. | Fable r2 P2 |
+| 17 | §7.2 cites the existing signal test's actual `MemAvailable` model (`simulatedTotal − outside − sliceAnon`, not `− memory.current`); the negative control is specified to sustain the violation for more than a full damping window and to assert on the PUBLISHED snapshot; the Claim gains its `machineTerm` precondition and the corollary says "suffices", not "requires". | Fable r2 P2 |
+| 18 | §3 gains rows for observe+empty basis and launcher+empty basis; the observe line now distinguishes throttled from unthrottled instead of asserting a cause for a ceiling nothing reduced. | Fable r2 P2 |
+| 19 | §2.4's `freeMin` bound becomes `>= MemTotal − admitSliceHeadroomBase` (the same 2 GiB band already refused for `reserveMax`); §2.5 records that the throttle's steady state sits below the watchdog's 16 GiB *recover* threshold, so a tripped watchdog will not emit `recovered` while AIRA sits at capacity. | Fable r2 P2 |
+| 20 | Test 1 gains a **sub-quantum-difference** row — the only case that separates a basis decided on raw figures from one decided after quantisation. Test 5's "RED against a machine term that damps" claim removed as vacuous (a constant cannot damp). | Fable r2 P1(d) note; own red-check |
 
 ---
 
@@ -155,20 +169,28 @@ ledger doing its job (a reservation is a commitment, not an observation) and it 
 **restrictive**, so every bound stated in this document holds in both cases.
 
 **Consequence, stated up front (the AIRA-103 §3.1 obligation, re-run for the new
-numbers).** On this box — `MemTotal` 78.5 GiB, `aira.slice` `memory.max` 64 GiB,
-non-slice unreclaimable footprint ≈ 25 GiB, so `affordable` ≈ 53.5 GiB:
+numbers).** Measured on this box while writing this plan (`/proc/meminfo` and
+`aira.slice`'s own `memory.current`/`memory.stat`/`memory.max`):
+
+```
+MemTotal          82359904 kB  = 78.54 GiB      memory.max      68719476736 = 64.00 GiB
+MemAvailable      46046796 kB  = 43.91 GiB      memory.current  22110003200 = 20.59 GiB
+                                                inactive+active_file        =  8.70 GiB
+                                                slab_reclaimable            =  0.33 GiB
+sliceAnon = 20.59 - 8.70 - 0.33 = 11.57 GiB     affordable = 43.91 + 11.57 = 55.48 GiB
+```
 
 | | AIRA-103 (shipped, `off`) | AIRA-106 |
 |---|---|---|
-| static term | — | `78.5 − 16` = **62.5 GiB** |
-| dynamic term | `53.5 − 16` = 37.5 GiB | `53.5 − 8` = **45.5 GiB** |
-| published (÷ `min`, clamped to 64 GiB `memory.max`) | **≈ 37.5 GiB** | **≈ 45.5 GiB** |
+| static term | — | `78.54 − 16` = **62.54 GiB** |
+| dynamic term | `55.48 − 16` = 39.48 GiB | `55.48 − 8` = **47.48 GiB** |
+| published (÷ `min`, quantised down, clamped to 64 GiB) | **≈ 39.25 GiB** | **≈ 47.25 GiB** (basis `system-pressure`) |
 
-The new formula is **~8 GiB more permissive** at today's load, which is precisely
-the outcome the owner asked for when rejecting "flip to enforce as-is (~38–43 GiB
-effective)". These figures are re-measured on the live box during implementation
-and the measured values recorded in the ticket Resolution; the table above is the
-prediction they are checked against.
+The new formula is **~8 GiB more permissive** at this load, which is precisely the
+outcome the owner asked for when rejecting "flip to enforce as-is (~38–43 GiB
+effective)". The static term does not bind here; it would only bind on a
+substantially idler box (`affordable > 70.5 GiB`). These figures are re-measured
+at implementation time and recorded in the ticket Resolution.
 
 ### 2.3 Where the `min` goes, and why the damping is unaffected
 
@@ -212,7 +234,7 @@ whenever `maximum <= headroom` (`admit.go:1695`) and the headroom base is 2 GiB
 |---|---|
 | `MemTotal` unreadable | existing refusal (`server.go:391-398`), unchanged |
 | `reserveMax >= MemTotal - admitSliceHeadroomBase` | `enforce` would pin admission at zero forever |
-| `freeMin >= MemTotal` | the dynamic term could never exceed `sliceAnon` |
+| `freeMin >= MemTotal - admitSliceHeadroomBase` | the same band, from the other side: the dynamic term could then exceed `sliceAnon` by at most the headroom, so `available` is zero forever |
 | `freeMin < watchdogLowMemAvailable` | §2.5 — the throttle's target state would sit inside the watchdog's kill band |
 | `reserveMax < 0` or `freeMin < 0` | parse-time rejection (`E_CONFIG_INVALID`) |
 
@@ -264,9 +286,20 @@ Two consequences, both handled rather than hidden:
 2. **The remaining margin is thin and is made of an unrelated admission
    constant.** The 2 GiB that separates the throttle's steady state from the
    watchdog's trip is `admitSliceHeadroomBaseDefault`, which nobody would connect
-   to this knob. This is put to the owner in §6 beside the `enforce` decision —
-   *not* changed unilaterally, because 8 GiB is the owner's own number and this
-   plan's job is to implement it, not to overrule it.
+   to this knob. (That constant has no environment or config override —
+   `NewServer` sets it from the constant and only tests change it — so the
+   refusal rule above may use the constant directly and stay deterministic.)
+3. **The steady state also sits below the watchdog's *recover* threshold**
+   (16 GiB, `watchdog.go:24`). Once the watchdog trips for any reason it will not
+   emit `recovered` while AIRA is sitting at its throttled capacity. That gate is
+   telemetry-level only (`watchdog.go:105`; the kill decision re-evaluates from
+   the trip threshold), so nothing is left latched, but it is a standing
+   disagreement between the two subsystems about whether the machine is healthy
+   and the owner should see it.
+
+Both are put to the owner in §6 beside the `enforce` decision — *not* changed
+unilaterally, because 8 GiB is the owner's own number and this plan's job is to
+implement it, not to overrule it.
 
 ---
 
@@ -315,10 +348,13 @@ Rendering (wording only; no new numbers on the wire):
 | `confine --list` throttled | pressure | unchanged: `…reduced below the 64G configured ceiling by memory used OUTSIDE the slice…` |
 | `confine --list` throttled | machine | `…reduced below the 64G configured ceiling to keep part of this machine outside the slice…` |
 | `confine --list` throttled | empty/unknown | `…reduced below the 64G configured ceiling…` (no cause claimed) |
-| `confine --list` observe | pressure | unchanged: `…would be effective under system memory pressure (observe mode, not applied)` |
-| `confine --list` observe | machine | `…would be effective to keep part of this machine outside the slice (observe mode, not applied)` — the cause clause is **chosen**, never appended, so the line never states two causes |
+| `confine --list` observe, throttled | pressure | `…would be effective by memory used OUTSIDE the slice (observe mode, not applied)` |
+| `confine --list` observe, throttled | machine | `…would be effective to keep part of this machine outside the slice (observe mode, not applied)` — the cause clause is **chosen**, never appended, so the line never states two causes |
+| `confine --list` observe, throttled | empty/unknown | `…would be effective (observe mode, not applied)` — no cause claimed |
+| `confine --list` observe, **unthrottled** | empty | `slice ceiling: 64G configured; not reduced (observe mode, not applied)` — nothing reduced the ceiling, so no cause and no counterfactual figure. (The pre-AIRA-106 line asserted "under system memory pressure" here too, for a ceiling that is not reduced at all.) |
 | blocked launcher (`confine_queue_position_linux.go:140`) | pressure | unchanged, incl. the `MemAvailable` figure |
 | blocked launcher | machine | `, slice ceiling reduced to keep memory outside the slice for the rest of the machine` — and **no** `MemAvailable` figure, because it is not the cause |
+| blocked launcher | empty/unknown | `, slice ceiling reduced below the configured ceiling` — no cause, no figure |
 
 **Alternatives considered and rejected**, recorded so the choice is auditable:
 
@@ -405,21 +441,43 @@ only. The project record says the watchdog was flipped to `enforce` on
 `observe` today**, consistent with a later `aira install` (an AIRA-27 or AIRA-33
 deploy) having reverted it.
 
-Mirroring `--watchdog` as §4 proposes would inherit this hazard and double it, so
-this plan fixes it rather than reproducing it:
+Mirroring `--watchdog` as §4 proposes would inherit this hazard and double it —
+and the next unrelated deploy after the owner's §6 `enforce` flip would silently
+undo it, contradicting "enforce is one command, no rebuild". So this plan fixes
+it rather than reproducing it. **The zero value must survive four hops or the fix
+is cosmetic** (the first draft fixed only the last two, and `sudo aira install` —
+the path install itself recommends — defeated it):
 
-- When a mode flag is **absent**, default to the value parsed out of the installed
-  unit (`parseInstalledValue` + a new `installedWatchdogModeRE` /
-  `installedSliceCeilingModeRE`), falling back to `observe` only when no managed
-  unit exists. Exactly the `MemoryMax` precedent, applied to both flags. No new
-  machinery.
-- Pinned in `internal/install/daemon_service_test.go`: a re-render with no flags
-  preserves an installed `enforce`; with no installed unit it still yields
-  `observe`; an explicit flag still wins.
-- **The live watchdog mode is NOT changed by this ticket.** Restoring it is a
-  deploy action, and this session does not deploy or restart services. It is
-  raised to the owner in the Resolution and filed as its own ticket (allocated
-  with `aira id`, never hand-picked).
+1. `parseInstallArgs` no longer pre-fills `watchdog`/`watchdogInterval`; an
+   option not given stays the zero value.
+2. `runInstall` / `runUserInstall` no longer overwrite `""` with `"observe"`
+   before the unit is read.
+3. `reexecRequestFor` forwards `--watchdog` / `--watchdog-interval` /
+   `--slice-ceiling` **only when given**. Previously it appended `--watchdog`
+   unconditionally, so the re-exec'd unprivileged install always saw an explicit
+   flag and no preservation rule downstream could ever fire.
+4. `runUserInstall` retains the **daemon unit's content** (it was read for
+   presence and discarded) and `resolveDaemonModes` fills each unset value from
+   it via `parseInstalledValue` + `installedWatchdogModeRE` /
+   `installedWatchdogIntervalRE` / `installedSliceCeilingModeRE`, falling back to
+   `observe` (and 2s) only when no managed unit declares a usable one. An
+   installed value that is not a recognised mode is ignored rather than
+   propagated or refused, so a hand-edited or newer-vocabulary unit cannot make a
+   later install fail.
+
+Exactly the `MemoryMax` precedent, applied to both modes. No new machinery.
+
+Pinned by four tests: absent options parse to the zero value; `resolveDaemonModes`
+preserves / is overridden by an explicit flag / falls back / ignores garbage;
+`reexecRequestFor` forwards no ungiven mode flag and every given one; and
+end-to-end, a flagless re-install after `--watchdog enforce --slice-ceiling
+enforce` leaves both modes intact, rewrites nothing and does **not** restart the
+daemon.
+
+**The live watchdog mode is NOT changed by this ticket.** Restoring it is a deploy
+action, and this session does not deploy or restart services. It is raised to the
+owner in the Resolution and filed as its own ticket (allocated with `aira id`,
+never hand-picked).
 
 ---
 
@@ -466,34 +524,53 @@ permission to leave the mechanism dormant, and equally explicit that it goes
 - `enforce` is one command with **no rebuild**: `aira install --slice-ceiling
   enforce` (re-renders the unit, reloads, restarts — `install.go:652-676`).
 
-**The enforce criterion, put to the owner rather than defaulted**, and restated
-against evidence that actually exists (v1's version referred to a per-grant log
-line that `admit.go` does not emit — the only reserve-naming lines are the
-fairness-freeze transitions at `:1679`/`:1682`, which fire only while a freeze is
-armed):
+**The enforce criterion, put to the owner rather than defaulted**, and stated
+against evidence that both exists and measures the claim. Two earlier versions did
+not: v1 referred to a per-grant log line `admit.go` does not emit (the only
+reserve-naming lines are the fairness-freeze transitions at `:1679`/`:1682`, armed
+only during a freeze); v2 substituted `MAX(peak_rss)` from `confine_peak_history`,
+which is a **per-job** figure being compared against a **slice-aggregate** ceiling,
+from a table pruned to the newest 20 rows per signature.
+
+The apples-to-apples pair is *the ceiling that would have been applied* against
+*what the slice as a whole was holding at that moment*. Both are in hand at
+publish time, so the subsystem's existing rate-limited line carries `sliceAnon`
+beside the effective figure — one more field on a line that already prints
+`MemAvailable`, not new logging:
+
+```
+aira daemon: slice ceiling throttled (observe): 50734301184 effective / 68719476736 configured,
+  sliceAnon=12420772120 MemAvailable=47151919104 bound-by=system-pressure
+  reserveMax=17179869184 freeMin=8589934592 memTotal=84336541696
+```
 
 > Flip to `enforce` once the daemon has run `observe` across at least one full
 > heavy-load cycle — concretely ≥24 h of uptime including at least one period of
-> ≥8 concurrent confine jobs — and **the observe-mode `would be effective` figure
-> stays above what jobs actually used**:
+> ≥8 concurrent confine jobs — and **every logged line shows `effective` above the
+> `sliceAnon` logged with it**, with margin:
 >
 > ```sh
-> # what the throttle would have allowed (daemon log; transitions + ≥1 GiB moves)
-> journalctl --user -u aira-daemon.service | grep 'slice ceiling'
-> # what real jobs actually peaked at, over the same window
-> sqlite3 ~/.local/state/aira/state.db \
->   "SELECT MAX(peak_rss) FROM confine_peak_history WHERE at >= '<window start>';"
+> journalctl --user -u aira-daemon.service | grep 'slice ceiling' \
+>   | awk '{ for (i=1;i<=NF;i++) if ($i ~ /^sliceAnon=/) print $6, $i }'
 > ```
 >
-> "What jobs actually used" is the honest bar in any case — a reserve is a
-> commitment, `peak_rss` is an observation. No new logging is added for this.
+> A line where `effective` approaches `sliceAnon` is one where `enforce` would
+> have closed admission with the slice already at that size — the thing the
+> rollout is trying to find out before it happens.
 
 **Second question for the owner, from §2.5:** `freeMin = 8 GiB` puts the
-throttle's steady state ~2 GiB above the memory watchdog's SIGKILL trip, where
-AIRA-103's 16 GiB reserve put it ~10 GiB above (at the watchdog's own *recover*
-threshold). 8 GiB is the owner's own number and is implemented as given; the owner
-may want 16 GiB, or may want the margin stated and accepted. This is a
-one-environment-variable change, no rebuild.
+throttle's steady state ~2 GiB above the memory watchdog's SIGKILL trip and ~6 GiB
+*below* its recover threshold, where AIRA-103's 16 GiB reserve put it exactly at
+recover. 8 GiB is the owner's own number and is implemented as given; the owner may
+want 16 GiB, or may want the margin stated and accepted. One environment variable,
+no rebuild.
+
+**Third, unrelated to this ticket's subject but found by it (§4.1):** the live
+`aira-daemon.service` on this box declares `AIRA_DAEMON_WATCHDOG_MODE=observe`
+while the project record says the watchdog was flipped to `enforce` on 2026-08-25.
+This ticket fixes the mechanism that reverts it but deliberately does **not**
+restart or reconfigure the live service. `aira install --watchdog enforce` restores
+it; the owner should decide and the coordinating session should apply it.
 
 ---
 
@@ -515,10 +592,13 @@ the refactor cannot silently change the dynamic term.
 
 ### 7.1 New unit tests
 
-1. **`TestSliceCeilingTakesTheMinimumOfBothTerms`** — table over four regimes:
-   machine-bound, pressure-bound, exactly equal, and both above `memory.max`. Each
-   asserts the published ceiling **and** `Basis`. *RED against a single-term
-   formula in either direction.*
+1. **`TestSliceCeilingTakesTheMinimumOfBothTerms`** — table over five regimes:
+   machine-bound, pressure-bound, exactly equal, both above `memory.max`, and a
+   **sub-quantum difference** (machine `38G+200M` vs pressure `38G+100M`, both
+   quantising to `38G`). Each asserts the published ceiling **and** `Basis`.
+   *RED against a single-term formula in either direction*, and the last row is
+   the only one *RED against a `Basis` decided after quantisation* — verified by
+   running both wrong implementations, which fail exactly those rows.
 2. **`TestSliceCeilingMachineTermIsIndependentOfPressure`** — with `machineTerm`
    binding, moving `MemAvailable` up and down by 8 GiB does not move the published
    ceiling. *RED against an implementation that folds `reserveMax` into the
@@ -536,10 +616,13 @@ the refactor cannot silently change the dynamic term.
    `machineTerm`; one pressure sample below it ⇒ published unchanged; three ⇒
    published drops to the pressure figure and `Basis` flips to `system-pressure`;
    one recovering sample ⇒ back to `machineTerm` at once with `Basis` back to
-   `machine-reserve`. *RED against a machine term that damps, or a `Basis` that
-   does not track.* (v1 proposed instead a test of the `min`-placement identity;
-   §2.3 proves every placement byte-identical, so that test could not have been
-   red against anything and is dropped.)
+   `machine-reserve`. *RED against an implementation with no static term at all
+   (the settled ceiling would be the 42 GiB pressure figure) and against a `Basis`
+   that does not follow the crossover.* It is deliberately **not** claimed to be
+   red against applying the `min` per-sample: §2.3 proves that byte-identical, and
+   "RED against a machine term that damps" would be vacuous because a constant
+   cannot damp. (v1 proposed instead a test of the `min`-placement identity
+   itself; that could not have been red against anything and is dropped.)
 6. **`TestSliceCeilingDefaultsAreSixteenAndEightGiB`** — the owner's numbers,
    pinned as constants, **and** `sliceCeilingFreeMinDefault >=
    watchdogLowMemAvailable` (§2.5, replacing the deleted AIRA-103 policy test).
@@ -577,27 +660,32 @@ detect a failure". The naive phrasing of that bound is **false**, and both
 reviewers caught it independently, so it is stated precisely:
 
 > **Claim.** Against a real cgroup holding a real running process, with
-> `MemAvailable − freeMin >= quantum`, the published ceiling is **at least the
-> slice's own real `sliceAnon`** — so admission never closes merely because the
-> slice is holding what it already holds. The `quantum` term is load-bearing:
-> `published = quantise_down(sliceAnon + (MemAvailable − freeMin))`, so for
-> `0 <= MemAvailable − freeMin < quantum` the round-down puts `published` **below**
-> `sliceAnon` and the naive bound is not provable. Weakened form, valid for all
-> `MemAvailable >= freeMin`: `published >= sliceAnon − quantum`.
+> `MemAvailable − freeMin >= quantum` **and `machineTerm >= sliceAnon`**, the
+> published ceiling is **at least the slice's own real `sliceAnon`** — so
+> admission never closes merely because the slice is holding what it already
+> holds. The `quantum` term is load-bearing:
+> `published = quantise_down(min(machineTerm, sliceAnon + (MemAvailable − freeMin)))`,
+> so for `0 <= MemAvailable − freeMin < quantum` the round-down alone puts
+> `published` **below** `sliceAnon` and the naive bound is not provable. Weakened
+> form, valid for all `MemAvailable >= freeMin`: `published >= sliceAnon − quantum`.
 >
-> **Corollary, with its true precondition.** `checkedAvailable` charges
+> **Corollary, one-directional.** `checkedAvailable` charges
 > `current − inactive_file − active_file = sliceAnon + slab_reclaimable`, so
-> `available > 0` requires `MemAvailable − freeMin > slab_reclaimable + quantum +
-> headroom`, not merely `>= 0`.
+> `MemAvailable − freeMin > slab_reclaimable + quantum + headroom` **suffices**
+> for `available > 0`. (It is not claimed to be necessary.)
 
 **`TestSliceCeilingRealCgroupNeverShrinksBelowRealUsage`** — reuses
 `newCeilingCgroupFixture` (isolated `os.MkdirTemp` cgroup, never `aira.slice`),
-with `MemAvailable` modelled as `simulatedTotal − realSliceCurrent −
-simulatedOutside` exactly as the existing signal test does (this box carries
-dozens of live confine jobs; a real machine-level reading would be pure noise).
-The bound is therefore proved **under the modelled `MemAvailable` against the
-kernel's real per-cgroup accounting** — the same honest scoping the existing
-signal test already states.
+with `MemAvailable` modelled as `max(0, simulatedTotal − simulatedOutside −
+sliceAnon)` exactly as the existing signal test does. **`sliceAnon`, not
+`memory.current`**: `si_mem_available` counts reclaimable file pages as available
+wherever they live, so modelling against `memory.current` would treat the slice's
+own page cache as consumed memory — the exact mistake this signal exists to avoid.
+Modelled rather than measured because this box carries dozens of live confine
+jobs, so a real machine-level reading moves by gigabytes between samples. The
+bound is therefore proved **under the modelled `MemAvailable` against the kernel's
+real per-cgroup accounting** — the same honest scoping the existing signal test
+already states.
 
 1. Baseline; then `fixture.grow(t, "anon")` and `fixture.grow(t, "file")` so the
    real cgroup holds real anonymous **and** real page-cache pages.
@@ -619,12 +707,22 @@ signal test already states.
 **`TestSliceCeilingRealCgroupUsageBoundHarnessDetectsAViolation`** — the
 **negative control for this specific claim**, distinct from AIRA-103's existing
 `…HarnessDetectsALimitWrite` (which validates the no-write actuator, not the
-bound). It drives the *same* fixture through the *same* assertion helper with
-`MemAvailable` pushed **below `freeMin`**, and asserts the helper **does** report
-`published < sliceAnon` and `available == 0`. Without it, "the ceiling stayed above
-real usage" could be true of a fixture that could never have observed the
-opposite — the project's standing rule that a test which cannot fail against the
-wrong implementation proves nothing, applied to this harness.
+bound). It drives the *same* fixture through the *same* `ceilingBoundProbe` helper
+— sharing the probe is what makes it a control rather than a parallel test — with
+`MemAvailable` pushed **below `freeMin`**, and asserts the probe **does** report
+`published < sliceAnon` and `available == 0` on the PUBLISHED snapshot (never on a
+raw `desired`, which would gut the control). The violation is sustained for more
+than a full damping window on purpose: the published figure is the max over
+`sliceCeilingSamples`, so a single low sample would leave the previous, higher
+ceiling standing and the control would report a pass it had not earned. Without
+this control, "the ceiling stayed above real usage" could be true of a fixture
+that could never have observed the opposite.
+
+**Red-check performed, not assumed.** Both real-cgroup additions were run against
+two deliberately wrong implementations: with the static term deleted, the machine
+half fails (`basis="system-pressure"`, want `machine-reserve`); with
+`sliceCeilingAnon` replaced by raw `memory.current`, the signal test fails on the
+slice's own anon growth. Recorded in the ticket Resolution.
 
 All real-cgroup tests skip on a host without cgroup-v2 delegation and hard-fail
 under `AIRA_REAL_CGROUP=1`, per `cgrouptest.SkipOrFailRealCgroup`.

@@ -713,7 +713,7 @@ func parseInstallDescriptorArgs(argv []string) ([]string, map[string]string, err
 				return nil, nil, fmt.Errorf("E_INSTALL_ARGUMENT_INVALID: option --%s does not take a value", name)
 			}
 			options[name] = "true"
-		case "memory-max", "memory-high", "watchdog", "watchdog-interval":
+		case "memory-max", "memory-high", "watchdog", "watchdog-interval", "slice-ceiling":
 			if !hasValue {
 				if i+1 >= len(argv) || strings.HasPrefix(argv[i+1], "--") {
 					return nil, nil, fmt.Errorf("E_INSTALL_ARGUMENT_INVALID: option --%s requires a value", name)
@@ -2657,13 +2657,29 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 				// static figure as though it were the observed decision, which
 				// would have made the observe-then-enforce rollout blind on the
 				// one surface an operator watches.
-				_, _ = fmt.Fprintf(stdout, "slice ceiling: %s configured; %s would be effective under system memory pressure (observe mode, not applied)%s\n",
+				//
+				// AIRA-106: the cause clause is CHOSEN from the basis, never
+				// appended. The line used to state "under system memory pressure"
+				// unconditionally; with the static machine-reserve term in the
+				// policy that is often not the cause, and appending a second
+				// clause would have the line assert two. An UNTHROTTLED observe
+				// snapshot has no basis at all and must not borrow either cause:
+				// nothing reduced the ceiling, so the line says exactly that.
+				if result.SliceReserve.CeilingState == "unthrottled" {
+					_, _ = fmt.Fprintf(stdout, "slice ceiling: %s configured; not reduced (observe mode, not applied)%s\n",
+						formatReserveBytes(result.SliceReserve.CeilingStaticBytes),
+						confineCeilingSourceNote(result.SliceReserve))
+					break
+				}
+				_, _ = fmt.Fprintf(stdout, "slice ceiling: %s configured; %s would be effective%s (observe mode, not applied)%s\n",
 					formatReserveBytes(result.SliceReserve.CeilingStaticBytes),
 					formatReserveBytes(result.SliceReserve.CeilingWouldBeBytes),
+					confineCeilingCause(result.SliceReserve.CeilingBasis),
 					confineCeilingSourceNote(result.SliceReserve))
 			case result.SliceReserve.CeilingState == "throttled":
-				_, _ = fmt.Fprintf(stdout, "slice ceiling: reduced below the %s configured ceiling by memory used OUTSIDE the slice%s; new admissions wait, running jobs are untouched\n",
+				_, _ = fmt.Fprintf(stdout, "slice ceiling: reduced below the %s configured ceiling%s%s; new admissions wait, running jobs are untouched\n",
 					formatReserveBytes(result.SliceReserve.CeilingStaticBytes),
+					confineCeilingCause(result.SliceReserve.CeilingBasis),
 					confineCeilingSourceNote(result.SliceReserve))
 			case result.SliceReserve.CeilingState == "unthrottled":
 				_, _ = fmt.Fprintf(stdout, "slice ceiling: at its %s configured ceiling; not reduced by system memory pressure%s\n",
@@ -2734,6 +2750,22 @@ func confineCeilingReason(reason string) string {
 		return "reason unavailable"
 	}
 	return reason
+}
+
+// confineCeilingCause renders WHICH policy term reduced the ceiling (AIRA-106).
+// An unset or unrecognised basis renders NOTHING rather than defaulting to
+// either cause: before AIRA-106 every line asserted external memory pressure
+// unconditionally, and the static machine-reserve term makes that assertion
+// false on an otherwise idle machine. Saying less is the honest failure mode.
+func confineCeilingCause(basis string) string {
+	switch basis {
+	case "system-pressure":
+		return " by memory used OUTSIDE the slice"
+	case "machine-reserve":
+		return " to keep part of this machine outside the slice"
+	default:
+		return ""
+	}
 }
 
 // confineCeilingSourceNote renders the system reading behind the ceiling AND

@@ -56,31 +56,92 @@ func TestInstallDaemonNoChangeRunDoesNotBounceDaemon(t *testing.T) {
 	}
 }
 
+// verifies (AIRA-106): an ABSENT daemon-mode option parses to the ZERO VALUE.
+// That is load-bearing, not cosmetic: it is the only signal resolveDaemonModes
+// has for "keep what is installed", and pre-filling "observe" here is precisely
+// what made every re-install reset the watchdog's mode.
 func TestParseInstallWatchdogFlags(t *testing.T) {
 	opts, err := parseInstallArgs(nil)
-	if err != nil || opts.watchdog != "observe" || opts.watchdogInterval != 2*time.Second {
-		t.Fatalf("defaults=%+v err=%v", opts, err)
+	if err != nil || opts.watchdog != "" || opts.sliceCeiling != "" || opts.watchdogInterval != 0 {
+		t.Fatalf("absent options must parse to the zero value, got %+v err=%v", opts, err)
 	}
-	opts, err = parseInstallArgs([]string{"--watchdog=enforce", "--watchdog-interval", "5s"})
-	if err != nil || opts.watchdog != "enforce" || opts.watchdogInterval != 5*time.Second {
+	opts, err = parseInstallArgs([]string{"--watchdog=enforce", "--watchdog-interval", "5s", "--slice-ceiling", "enforce"})
+	if err != nil || opts.watchdog != "enforce" || opts.watchdogInterval != 5*time.Second || opts.sliceCeiling != "enforce" {
 		t.Fatalf("explicit=%+v err=%v", opts, err)
 	}
-	for _, args := range [][]string{{"--watchdog=invalid"}, {"--watchdog-interval=999ms"}, {"--watchdog-interval=30s"}} {
+	for _, args := range [][]string{
+		{"--watchdog=invalid"}, {"--watchdog-interval=999ms"}, {"--watchdog-interval=30s"},
+		{"--slice-ceiling=invalid"}, {"--slice-ceiling"}, {"--status", "--slice-ceiling=off"},
+	} {
 		if _, err := parseInstallArgs(args); err == nil || !strings.Contains(err.Error(), CodeArgumentInvalid) {
 			t.Fatalf("args=%q err=%v", args, err)
 		}
 	}
 }
 
+// verifies (AIRA-106): the PRESERVATION rule, at the seam that decides it.
+//
+// RED against the pre-AIRA-106 behaviour, in which an omitted flag rendered the
+// ship default and so silently reverted an operator's enforce on the next
+// unrelated deploy -- observed live on the development box.
+func TestResolveDaemonModesPreservesInstalledModes(t *testing.T) {
+	installed := "# aira-managed: aira-daemon.service\n[Service]\n" +
+		"Environment=AIRA_DAEMON_WATCHDOG_MODE=enforce\n" +
+		"Environment=AIRA_DAEMON_WATCHDOG_INTERVAL=5s\n" +
+		"Environment=AIRA_DAEMON_SLICE_CEILING_MODE=enforce\n"
+	resolved, err := resolveDaemonModes(installOpts{}, installed)
+	if err != nil || resolved.watchdog != "enforce" || resolved.sliceCeiling != "enforce" || resolved.watchdogInterval != 5*time.Second {
+		t.Fatalf("omitted options did not preserve the installed unit: %+v err=%v", resolved, err)
+	}
+	resolved, err = resolveDaemonModes(installOpts{watchdog: "off", sliceCeiling: "off", watchdogInterval: time.Second}, installed)
+	if err != nil || resolved.watchdog != "off" || resolved.sliceCeiling != "off" || resolved.watchdogInterval != time.Second {
+		t.Fatalf("an explicit option was overridden by the installed unit: %+v err=%v", resolved, err)
+	}
+	resolved, err = resolveDaemonModes(installOpts{}, "")
+	if err != nil || resolved.watchdog != "observe" || resolved.sliceCeiling != "observe" || resolved.watchdogInterval != 2*time.Second {
+		t.Fatalf("first install did not take the ship defaults: %+v err=%v", resolved, err)
+	}
+	// A hand-edited or newer-vocabulary unit must neither be propagated nor make
+	// a later install fail: the ship default is the safe answer.
+	resolved, err = resolveDaemonModes(installOpts{}, "Environment=AIRA_DAEMON_WATCHDOG_MODE=paranoid\nEnvironment=AIRA_DAEMON_WATCHDOG_INTERVAL=17\n")
+	if err != nil || resolved.watchdog != "observe" || resolved.watchdogInterval != 2*time.Second {
+		t.Fatalf("an unrecognised installed value was propagated or refused: %+v err=%v", resolved, err)
+	}
+}
+
+// verifies (AIRA-106): the ROOT RE-EXEC does not forge an explicit flag.
+//
+// This is the half that makes the preservation real on `sudo aira install` --
+// the path install itself recommends. reexecRequestFor used to append --watchdog
+// unconditionally, so the re-exec'd unprivileged install always saw an explicit
+// flag and "absent means preserve" could never fire. RED against that.
+func TestReexecDoesNotForwardUngivenDaemonModes(t *testing.T) {
+	target := installTarget{uid: 1000, gid: 1000, home: "/home/someone", username: "someone"}
+	args := strings.Join(reexecRequestFor("/usr/bin/aira", target, installOpts{memoryMax: "16G"}).args, " ")
+	for _, forbidden := range []string{"--watchdog", "--watchdog-interval", "--slice-ceiling"} {
+		if strings.Contains(args, forbidden) {
+			t.Fatalf("re-exec argv %q forwards %s though it was never given: the unprivileged install would read it as explicit and reset the installed mode", args, forbidden)
+		}
+	}
+	given := installOpts{watchdog: "enforce", sliceCeiling: "off", watchdogInterval: 5 * time.Second}
+	args = strings.Join(reexecRequestFor("/usr/bin/aira", target, given).args, " ")
+	for _, want := range []string{"--watchdog enforce", "--slice-ceiling off", "--watchdog-interval 5s"} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("re-exec argv %q drops the explicit %q", args, want)
+		}
+	}
+}
+
 func TestRenderDaemonUnitIsManagedBoundedAndIndependent(t *testing.T) {
-	unit, err := renderDaemonUnit("test-daemon.service", "/opt/aira bin", "/var/lib/aira state", "observe", 2*time.Second, "")
+	unit, err := renderDaemonUnit("test-daemon.service", "/opt/aira bin", "/var/lib/aira state", "observe", 2*time.Second, "observe", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
 		"# aira-managed: test-daemon.service", `ExecStart="/opt/aira bin" daemon serve`,
 		"Environment=AIRA_DAEMON_MANAGED=1", "Environment=AIRA_DAEMON_WATCHDOG_MODE=observe",
-		"Environment=AIRA_DAEMON_WATCHDOG_INTERVAL=2s", `Environment=XDG_STATE_HOME="/var/lib/aira state"`,
+		"Environment=AIRA_DAEMON_WATCHDOG_INTERVAL=2s",
+		"Environment=AIRA_DAEMON_SLICE_CEILING_MODE=observe", `Environment=XDG_STATE_HOME="/var/lib/aira state"`,
 		"MemoryAccounting=yes", "MemoryMax=1G", "MemoryHigh=768M", "TasksMax=512",
 		"StartLimitIntervalSec=0", "Restart=always", "WantedBy=default.target",
 	} {
@@ -120,6 +181,48 @@ func TestInstallDaemonIdempotentAndWatchdogChangeRestarts(t *testing.T) {
 	}
 	if !foundRestart {
 		t.Fatalf("watchdog change did not restart daemon; commands=%q", state.commands)
+	}
+}
+
+// verifies (AIRA-106): END TO END, a re-install with NO mode flags preserves
+// both installed modes and does not bounce the daemon.
+//
+// This is the integration form of the live defect: the operator flips a mode
+// once, some later unrelated deploy runs `aira install` with no flags, and before
+// this fix the unit was rewritten to observe and the daemon restarted into it.
+// Both memory subsystems are covered because AIRA-106's own rollout depends on
+// the slice-ceiling mode surviving exactly this sequence.
+func TestInstallDaemonReinstallPreservesModes(t *testing.T) {
+	d, state := newFakeInstall(t)
+	if err := runInstall(d, installOpts{memoryMax: "16G", watchdog: "enforce", sliceCeiling: "enforce", watchdogInterval: 5 * time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	writes := state.writes
+	state.commands = nil
+	// The deploy case: memory sizing given, modes omitted entirely.
+	if err := runInstall(d, installOpts{memoryMax: "16G"}); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(state.unitDir(), defaultDaemonUnit))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"AIRA_DAEMON_WATCHDOG_MODE=enforce",
+		"AIRA_DAEMON_SLICE_CEILING_MODE=enforce",
+		"AIRA_DAEMON_WATCHDOG_INTERVAL=5s",
+	} {
+		if !strings.Contains(string(content), want) {
+			t.Fatalf("a flagless re-install silently reset the daemon unit; want %q in:\n%s", want, content)
+		}
+	}
+	if state.writes != writes {
+		t.Fatalf("a preserving re-install rewrote files: %d -> %d", writes, state.writes)
+	}
+	for _, argv := range state.commands {
+		if strings.Join(argv, " ") == "systemctl --user restart "+defaultDaemonUnit {
+			t.Fatalf("a preserving re-install restarted the live daemon; commands=%q", state.commands)
+		}
 	}
 }
 

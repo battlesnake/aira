@@ -675,7 +675,7 @@ func TestRenderConfineListCeilingLine(t *testing.T) {
 			name: "throttled",
 			reserve: runner.ConfineSliceReserve{
 				GrantedBytes: 1 << 30, CeilingBytes: 30 << 30, Jobs: 1,
-				CeilingMode: "enforce", CeilingState: "throttled",
+				CeilingMode: "enforce", CeilingState: "throttled", CeilingBasis: "system-pressure",
 				CeilingStaticBytes: 64 << 30, MemAvailableBytes: 6 << 30,
 			},
 			want: []string{
@@ -683,6 +683,33 @@ func TestRenderConfineListCeilingLine(t *testing.T) {
 				"(system MemAvailable 6G)",
 				"running jobs are untouched",
 			},
+		},
+		{
+			// AIRA-106. The STATIC term reduced this ceiling, not pressure. Before
+			// the basis existed this line asserted the pressure cause for every
+			// reduced ceiling, which the machine-reserve term makes false on an
+			// otherwise idle box -- an operator would go hunting for memory nothing
+			// is using.
+			name: "throttled-by-the-machine-reserve",
+			reserve: runner.ConfineSliceReserve{
+				GrantedBytes: 1 << 30, CeilingBytes: 30 << 30, Jobs: 1,
+				CeilingMode: "enforce", CeilingState: "throttled", CeilingBasis: "machine-reserve",
+				CeilingStaticBytes: 64 << 30, MemAvailableBytes: 40 << 30,
+			},
+			want:   []string{"slice ceiling: reduced below the 64G configured ceiling to keep part of this machine outside the slice"},
+			absent: []string{"memory used OUTSIDE the slice"},
+		},
+		{
+			// An absent or unrecognised basis claims NO cause at all. Saying less
+			// is the honest failure mode; defaulting to either cause is not.
+			name: "throttled-without-a-basis",
+			reserve: runner.ConfineSliceReserve{
+				GrantedBytes: 1 << 30, CeilingBytes: 30 << 30, Jobs: 1,
+				CeilingMode: "enforce", CeilingState: "throttled",
+				CeilingStaticBytes: 64 << 30, MemAvailableBytes: 6 << 30,
+			},
+			want:   []string{"slice ceiling: reduced below the 64G configured ceiling (system MemAvailable 6G)"},
+			absent: []string{"memory used OUTSIDE the slice", "keep part of this machine"},
 		},
 		{
 			name: "throttled-draining",
@@ -713,11 +740,36 @@ func TestRenderConfineListCeilingLine(t *testing.T) {
 			name: "observe",
 			reserve: runner.ConfineSliceReserve{
 				CeilingBytes: 62 << 30, CeilingWouldBeBytes: 30 << 30,
-				CeilingMode: "observe", CeilingState: "throttled",
+				CeilingMode: "observe", CeilingState: "throttled", CeilingBasis: "system-pressure",
 				CeilingStaticBytes: 64 << 30, MemAvailableBytes: 6 << 30,
 			},
-			want:   []string{"30G would be effective under system memory pressure (observe mode, not applied)"},
+			want:   []string{"30G would be effective by memory used OUTSIDE the slice (observe mode, not applied)"},
 			absent: []string{"62G would be effective"},
+		},
+		{
+			// AIRA-106. The observe line CHOOSES its cause clause from the basis
+			// rather than appending one, so it can never state two causes.
+			name: "observe-machine-reserve",
+			reserve: runner.ConfineSliceReserve{
+				CeilingBytes: 62 << 30, CeilingWouldBeBytes: 60 << 30,
+				CeilingMode: "observe", CeilingState: "throttled", CeilingBasis: "machine-reserve",
+				CeilingStaticBytes: 64 << 30, MemAvailableBytes: 40 << 30,
+			},
+			want:   []string{"60G would be effective to keep part of this machine outside the slice (observe mode, not applied)"},
+			absent: []string{"memory used OUTSIDE the slice"},
+		},
+		{
+			// An UNTHROTTLED observe snapshot has no basis at all: nothing reduced
+			// the ceiling, so the line must not borrow either cause -- and must not
+			// print a "would be effective" figure that is just the static capacity.
+			name: "observe-unthrottled",
+			reserve: runner.ConfineSliceReserve{
+				CeilingBytes: 62 << 30, CeilingWouldBeBytes: 62 << 30,
+				CeilingMode: "observe", CeilingState: "unthrottled",
+				CeilingStaticBytes: 64 << 30, MemAvailableBytes: 40 << 30,
+			},
+			want:   []string{"slice ceiling: 64G configured; not reduced (observe mode, not applied) (system MemAvailable 40G)"},
+			absent: []string{"would be effective", "memory used OUTSIDE the slice", "keep part of this machine"},
 		},
 		{
 			// A HELD ceiling's numbers are up to a TTL old. Rendering them
@@ -725,10 +777,13 @@ func TestRenderConfineListCeilingLine(t *testing.T) {
 			name: "held",
 			reserve: runner.ConfineSliceReserve{
 				CeilingBytes: 30 << 30, CeilingMode: "enforce", CeilingState: "throttled",
-				CeilingHeld: true, CeilingReason: "memavailable:read-error",
+				CeilingBasis: "system-pressure", CeilingHeld: true, CeilingReason: "memavailable:read-error",
 				CeilingStaticBytes: 64 << 30, MemAvailableBytes: 6 << 30,
 			},
-			want: []string{"(system MemAvailable 6G, last established)", "holding: memavailable:read-error"},
+			// A held snapshot keeps its established basis: dropping it would make a
+			// still-applied throttle render with no cause, which reads as "the
+			// daemon does not know" when it does.
+			want: []string{"by memory used OUTSIDE the slice", "(system MemAvailable 6G, last established)", "holding: memavailable:read-error"},
 		},
 		{
 			// A newer daemon's vocabulary must read as unknown, never be silently

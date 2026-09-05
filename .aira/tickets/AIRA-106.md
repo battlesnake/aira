@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-106","project":"aira","title":"Dynamic slice ceiling: replace single-headroom formula with min(TotalRAM-reserveMax, usage+(MemAvailable-freeMin))","status":"planned","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","memory-safety"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-106","project":"aira","title":"Dynamic slice ceiling: replace single-headroom formula with min(TotalRAM-reserveMax, usage+(MemAvailable-freeMin))","status":"in-progress","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","memory-safety"],"hold":false,"relations":[]}
 ---
 Owner decision (2026-09-05), replacing AIRA-103's own headroom formula with a better-specified one, as part of closing AIRA-91 Part B.
 
