@@ -464,7 +464,7 @@ func executeHasLaunchEvidence(verb, code string, data executeData) bool {
 	case "run":
 		return data.Status != "" || isRunExecutionCode(code, data.Status != "")
 	case "git":
-		return strings.HasPrefix(code, "E_GIT_") || strings.HasPrefix(code, "U_GIT_")
+		return strings.HasPrefix(code, "E_GIT_")
 	default:
 		return false
 	}
