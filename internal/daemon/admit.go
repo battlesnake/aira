@@ -910,7 +910,11 @@ func (s *Server) admitAvailable(slicePath string) (int64, bool) {
 	}
 	jobs := addJobCountClamp(addJobCountClamp(outstandingJobs, adoptedJobs), 1)
 	headroom := s.admitSliceHeadroom(jobs)
-	return checkedAvailable(current, maximum, reclaimable, addClamp(outstanding, adopted), headroom), true
+	// AIRA-103. A CAPACITY question, so it takes the pressure-throttled maximum.
+	// See admitEffectiveMaximum for the three sites this may appear at and the
+	// four it must never reach.
+	effective := s.admitEffectiveMaximum(slicePath, maximum)
+	return checkedAvailable(current, effective, reclaimable, addClamp(outstanding, adopted), headroom), true
 }
 
 func (s *Server) admitCeiling(path string, maximum int64) int64 {
@@ -1589,6 +1593,14 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			queue.path, now.Sub(queue.scanFailingSince).Round(time.Second), waiter.scopeID)
 	}
 	gate := exclusiveGateLocked(queue)
+	// AIRA-103. The one place the pressure throttle actually gates admission.
+	// Hoisted out of the waiter loop: it is a per-pass fact, and a pure leaf-lock
+	// lookup that must not be repeated per waiter while queue.mu is held.
+	// DELIBERATELY not applied to the ceiling admitConnection computes from the
+	// same file: that one decides the TERMINAL E_ADMIT_TOO_LARGE and sizes a
+	// job's own hard scope cap, so a job too large for the throttled ceiling must
+	// WAIT here rather than be refused there.
+	effectiveMaximum := s.admitEffectiveMaximum(queue.path, maximum)
 	frozen := false
 	for _, waiter := range queue.waiters {
 		if waiter.state != admitQueued {
@@ -1608,7 +1620,7 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		}
 		jobs := addJobCountClamp(addJobCountClamp(queue.outstandingJobs, queue.adoptedJobs), 1)
 		headroom := s.admitSliceHeadroom(jobs)
-		available := checkedAvailable(current, maximum, reclaimable, addClamp(queue.outstanding, queue.adopted), headroom)
+		available := checkedAvailable(current, effectiveMaximum, reclaimable, addClamp(queue.outstanding, queue.adopted), headroom)
 		if frozen {
 			waiter.waited = true
 			continue
@@ -2139,7 +2151,10 @@ func readSliceMemory(path string) (cur, max, reclaimable int64, ok bool, reason 
 	// before the reclaimable discount — so no further negative check is needed here.
 	statData, err := os.ReadFile(filepath.Join(path, "memory.stat"))
 	if err == nil {
-		reclaimable, valid = parseSliceMemoryStat(statData)
+		// The slab figure is deliberately DISCARDED here: this is AIRA-21's
+		// reclaimable page-cache discount and its meaning must not change.
+		// AIRA-103's ceiling signal is the only consumer of slab_reclaimable.
+		reclaimable, _, valid = parseSliceMemoryStat(statData)
 	}
 	if err != nil || !valid {
 		sliceMemoryStatDegradeOnce.Do(func() {
@@ -2150,7 +2165,19 @@ func readSliceMemory(path string) (cur, max, reclaimable int64, ok bool, reason 
 	return current, limit, reclaimable, true, ""
 }
 
-func parseSliceMemoryStat(data []byte) (reclaimable int64, ok bool) {
+// parseSliceMemoryStat returns the file-LRU reclaimable total — AIRA-21's
+// admission discount, whose meaning is unchanged — and, SEPARATELY,
+// slab_reclaimable.
+//
+// The split is load-bearing rather than tidy. AIRA-103's ceiling signal must
+// subtract slab as well (MemAvailable credits most of GLOBAL reclaimable slab,
+// so leaving the slice's share inside its "non-reclaimable footprint"
+// double-counts it, permissively), while admission's own discount must keep
+// counting exactly what it counted before. Returning slab as a third value
+// rather than folding it into the first keeps both true without a second parser
+// over the same file. An absent slab_reclaimable line reports zero rather than a
+// failed parse: it is optional for the signal and required by neither caller.
+func parseSliceMemoryStat(data []byte) (reclaimable, slabReclaimable int64, ok bool) {
 	var inactiveFile, activeFile int64
 	var inactiveFound, activeFound bool
 	for _, line := range strings.Split(string(data), "\n") {
@@ -2167,12 +2194,14 @@ func parseSliceMemoryStat(data []byte) (reclaimable int64, ok bool) {
 			inactiveFile, inactiveFound = value, true
 		case "active_file":
 			activeFile, activeFound = value, true
+		case "slab_reclaimable":
+			slabReclaimable = value
 		}
 	}
 	if !inactiveFound || !activeFound {
-		return 0, false
+		return 0, 0, false
 	}
-	return addClamp(inactiveFile, activeFile), true
+	return addClamp(inactiveFile, activeFile), slabReclaimable, true
 }
 
 func parseAdmitMemory(data []byte) (int64, bool) {

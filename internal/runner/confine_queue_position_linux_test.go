@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -247,5 +248,60 @@ func TestConfineQueuePositionProbeReturnsWhenTheWaitEnds(t *testing.T) {
 	case <-returned:
 	case <-testdeadline.After(10 * time.Second):
 		t.Fatal("the probe outlived its context; a wedged daemon would delay the launch")
+	}
+}
+
+// AIRA-103. A wait under a reduced slice ceiling is NOT ordinary contention, and
+// the existing line ("waiting for memory admission ... queue position N of M")
+// reads as though it were: the slice can look far from full while admission is
+// nonetheless closed by memory used outside it. The blocked launcher's own probe
+// already carries SliceReserve, so this is a rendering change on a reply it
+// already has -- no extra round trip and no new daemon verb.
+//
+// verifies: only an ENFORCING, throttled ceiling is announced; observe mode and
+// an unevaluated ceiling are not, because neither is applied.
+func TestConfineQueueNoteReportsAReducedCeilingOnlyWhenEnforced(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		mode, state  string
+		memAvailable int64
+		want         string
+		absent       string
+	}{
+		{
+			name: "enforced-throttle", mode: "enforce", state: "throttled", memAvailable: 6 << 30,
+			want: "slice ceiling reduced by memory used outside the slice (system MemAvailable 6G)",
+		},
+		{
+			name: "enforced-throttle-without-a-reading", mode: "enforce", state: "throttled",
+			want: "slice ceiling reduced by memory used outside the slice,", absent: "MemAvailable",
+		},
+		{name: "observe-applies-nothing", mode: "observe", state: "throttled", memAvailable: 6 << 30, absent: "slice ceiling"},
+		{name: "unevaluated", mode: "enforce", state: "unevaluated", absent: "slice ceiling"},
+		{name: "subsystem-off", absent: "slice ceiling"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			socket, _ := fakeConfineListDaemon(t, func(map[string]any) runnerAdmitResponseFrame {
+				return confineListReply(t, &ConfineSliceReserve{
+					Queued: 3, QueuePosition: 2, QueuedAheadBytes: 2 << 30,
+					CeilingMode: test.mode, CeilingState: test.state, MemAvailableBytes: test.memAvailable,
+				})
+			})
+			request := ConfineRequest{AdmitSocketPath: socket, ScopeID: "CONFINE-job-5101-abc@session-a", Owner: "session-a"}
+			deps := fillConfineDeps(confineDeps{})
+			deps.queuePosition = confineQueuePositionFromDaemon
+			ctx, cancel := context.WithTimeout(context.Background(), testdeadline.Wait(5*time.Second))
+			defer cancel()
+			note := confineQueueNote(ctx, deps, request, "/slice", make(chan struct{}))
+			if !strings.Contains(note, "queue position 2 of 3") {
+				t.Fatalf("note=%q, want the AIRA-24 position preserved", note)
+			}
+			if test.want != "" && !strings.Contains(note, test.want) {
+				t.Fatalf("note=%q, want %q", note, test.want)
+			}
+			if test.absent != "" && strings.Contains(note, test.absent) {
+				t.Fatalf("note=%q, must not contain %q", note, test.absent)
+			}
+		})
 	}
 }

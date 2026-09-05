@@ -48,8 +48,15 @@ func TestEvaluateAdmitQueueDiscountsOnlyReclaimableFileLRU(t *testing.T) {
 
 func TestParseSliceMemoryStatUsesOnlyFileLRU(t *testing.T) {
 	data := []byte("file 1048576\nshmem 524288\ninactive_file 40\nactive_file 2\nmalformed\ninactive_anon\n")
-	if reclaimable, ok := parseSliceMemoryStat(data); !ok || reclaimable != 42 {
-		t.Fatalf("parseSliceMemoryStat=(%d,%v), want 42,true", reclaimable, ok)
+	// AIRA-103 added a slab return value; the AIRA-21 discount this test guards
+	// must keep counting the file LRU and nothing else, so slab is asserted to
+	// stay OUT of it rather than merely ignored here.
+	if reclaimable, slab, ok := parseSliceMemoryStat(data); !ok || reclaimable != 42 || slab != 0 {
+		t.Fatalf("parseSliceMemoryStat=(%d,%d,%v), want 42,0,true", reclaimable, slab, ok)
+	}
+	withSlab := []byte("inactive_file 40\nactive_file 2\nslab_reclaimable 900\n")
+	if reclaimable, slab, ok := parseSliceMemoryStat(withSlab); !ok || reclaimable != 42 || slab != 900 {
+		t.Fatalf("parseSliceMemoryStat=(%d,%d,%v), want the slab figure kept SEPARATE from the file LRU", reclaimable, slab, ok)
 	}
 	for _, data := range [][]byte{
 		[]byte("inactive_file 40\n"),
@@ -57,8 +64,8 @@ func TestParseSliceMemoryStatUsesOnlyFileLRU(t *testing.T) {
 		[]byte("inactive_file nope\nactive_file 2\n"),
 		[]byte("inactive_file -1\nactive_file 2\n"),
 	} {
-		if reclaimable, ok := parseSliceMemoryStat(data); ok || reclaimable != 0 {
-			t.Fatalf("parseSliceMemoryStat(%q)=(%d,%v), want 0,false", data, reclaimable, ok)
+		if reclaimable, slab, ok := parseSliceMemoryStat(data); ok || reclaimable != 0 || slab != 0 {
+			t.Fatalf("parseSliceMemoryStat(%q)=(%d,%d,%v), want 0,0,false", data, reclaimable, slab, ok)
 		}
 	}
 }

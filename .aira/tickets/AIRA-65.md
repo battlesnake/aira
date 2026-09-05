@@ -25,3 +25,19 @@ Measured margins on the healthy path: `released` is written 3-6ms after the fork
 Either raise `_stop_reservation`'s wait, or have the helper write `released` before it can be exposed to SIGTERM. Note this is a **production** timeout, not only a test one: the same 1.0s budget applies to the real reserve helper, so a heavily loaded box may be terminating reservation helpers before they release cleanly. Worth checking whether that has any live consequence beyond this test.
 
 Found during AIRA-58/AIRA-59 merge verification.
+
+## Note (2026-09-05): a cross-reference in AIRA-103 points at PR #65, not at this ticket
+
+Status-transition note only; this ticket's scope, status and content are otherwise
+unchanged, and it is not reopened or rescoped.
+
+AIRA-103's filed text says "AIRA-65 watchdog: this ticket's system-memory signal
+must reuse the watchdog's existing `readMemAvailable`/`parseMemAvailable`". That
+reference is to **PR #65 (the watchdog MemAvailable fix)**, not to this ticket,
+which is a `TestRealPytestRAMForkDoesNotPinHelperStdin` load-flake in the pytest
+RAM governor and has nothing to do with the watchdog. Recorded here so the
+mis-reference does not later read as an unaddressed dependency.
+
+The shared-primitive reuse AIRA-103 actually performs is recorded against the real
+watchdog ticket, **AIRA-16**, and in
+`docs/superpowers/specs/2026-08-23-aira-memory-watchdog-design.md` §10.

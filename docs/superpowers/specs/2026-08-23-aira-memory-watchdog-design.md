@@ -334,3 +334,33 @@ not fight, and off is the only zero-risk default). The alternative is defaulting
 **observe** (audits pressure/offenders without killing — useful telemetry, still no
 signals). I recommend **off**; flip to **observe**/**enforce** deliberately once
 whale-watchdog is retired in the whale→aira migration. (Not blocking — off is safe.)
+
+## 10. Second consumer of the MemAvailable primitive (AIRA-103, 2026-09-05)
+
+`readMemAvailable`/`parseMemAvailable` now have a **sibling consumer**: the
+dynamic slice ceiling (`internal/daemon/sliceceiling.go`, design
+`docs/superpowers/specs/2026-09-05-aira103-dynamic-slice-ceiling-design.md`).
+It samples on the same cadence and reuses these functions rather than adding a
+second reader of `/proc/meminfo`. **Any change to them now moves two
+subsystems.**
+
+The two are complementary and must not be confused:
+
+|  | this watchdog | AIRA-103 slice ceiling |
+|---|---|---|
+| measures | raw `MemAvailable` | `MemAvailable + (slice memory.current − slice reclaimable)`, i.e. footprint OUTSIDE the slice |
+| acts by | SIGTERM/SIGKILL of an uncapped offender | reducing the `maximum` admission's capacity check sees |
+| affects | a running process | only room for FUTURE admissions; nothing kernel-enforced moves |
+| when | last resort, `MemAvailable < 8 GiB` | preventively, whenever the machine cannot afford the configured ceiling |
+
+The relationship is deliberate: AIRA-103's system reserve is
+`min(MemTotal/4, 16 GiB)`, the same headroom policy `aira install` uses, which on
+a large box equals this watchdog's own `watchdogRecoverMemAvailable`. That is the
+sanity check rather than the derivation — the throttle's *target* state must be
+one in which this watchdog is quiescent, or the two disagree about whether the
+machine is healthy. Retuning the kill thresholds here should be checked against
+that relationship.
+
+AIRA-103 never writes any cgroup attribute, so §2's `classifyWatchdogCgroup`
+predicate and AIRA-16's recorded residual (a transiently non-finite `aira.slice`
+`memory.max` making running jobs valid victims) are untouched by it.

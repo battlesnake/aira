@@ -398,7 +398,10 @@ func readWorkerSupervisorMemory(path string) (current, reclaimable int64, ok boo
 	}
 	statData, err := os.ReadFile(filepath.Join(path, "memory.stat"))
 	if err == nil {
-		reclaimable, valid = parseSliceMemoryStat(statData)
+		// Slab discarded: worker-admit's discount is the same AIRA-21 page-cache
+		// figure admission uses, and must not change meaning. Only AIRA-103's
+		// ceiling signal consumes slab_reclaimable.
+		reclaimable, _, valid = parseSliceMemoryStat(statData)
 	}
 	if err != nil || !valid {
 		reclaimable = 0

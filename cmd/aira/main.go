@@ -2680,6 +2680,50 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 				result.SliceReserve.VanishedJobs, confinePlural(result.SliceReserve.VanishedJobs, "lease", "leases"),
 				formatReserveBytes(result.SliceReserve.VanishedBytes))
 		}
+		// AIRA-103. WHY the ceiling is what it is. Printed only when the subsystem
+		// is running (CeilingMode == "" means off), and never claiming anything it
+		// cannot establish: an unevaluated ceiling prints its reason, not a number,
+		// and observe mode says plainly that nothing was applied.
+		if mode := result.SliceReserve.CeilingMode; mode != "" {
+			switch {
+			case result.SliceReserve.CeilingState == "unevaluated":
+				_, _ = fmt.Fprintf(stdout, "slice ceiling: unevaluated (%s)\n",
+					confineCeilingReason(result.SliceReserve.CeilingReason))
+			case mode == "observe":
+				// CeilingBytes is the UNTOUCHED static capacity in observe mode --
+				// observe applies nothing -- so the counterfactual must come from
+				// CeilingWouldBeBytes. Printing CeilingBytes here reported the
+				// static figure as though it were the observed decision, which
+				// would have made the observe-then-enforce rollout blind on the
+				// one surface an operator watches.
+				_, _ = fmt.Fprintf(stdout, "slice ceiling: %s configured; %s would be effective under system memory pressure (observe mode, not applied)%s\n",
+					formatReserveBytes(result.SliceReserve.CeilingStaticBytes),
+					formatReserveBytes(result.SliceReserve.CeilingWouldBeBytes),
+					confineCeilingSourceNote(result.SliceReserve))
+			case result.SliceReserve.CeilingState == "throttled":
+				_, _ = fmt.Fprintf(stdout, "slice ceiling: reduced below the %s configured ceiling by memory used OUTSIDE the slice%s; new admissions wait, running jobs are untouched\n",
+					formatReserveBytes(result.SliceReserve.CeilingStaticBytes),
+					confineCeilingSourceNote(result.SliceReserve))
+			case result.SliceReserve.CeilingState == "unthrottled":
+				_, _ = fmt.Fprintf(stdout, "slice ceiling: at its %s configured ceiling; not reduced by system memory pressure%s\n",
+					formatReserveBytes(result.SliceReserve.CeilingStaticBytes),
+					confineCeilingSourceNote(result.SliceReserve))
+			default:
+				// An unrecognised state is not silently rendered as one of the
+				// known ones: a newer daemon's vocabulary must read as unknown,
+				// never as "at its configured ceiling".
+				_, _ = fmt.Fprintf(stdout, "slice ceiling: unevaluated (unrecognised state %q)\n", result.SliceReserve.CeilingState)
+			}
+			// Jobs admitted before the ceiling fell still hold their grants, so
+			// granted CAN exceed the ceiling while throttled. That is a DRAIN
+			// state, not the ledger inconsistency the residual line below reports,
+			// and saying so is the difference between an operator reading this as
+			// "working as designed" and as "the ledger has lost a discharge".
+			if result.SliceReserve.CeilingState == "throttled" && result.SliceReserve.GrantedBytes > result.SliceReserve.CeilingBytes {
+				_, _ = fmt.Fprintf(stdout, "  granted exceeds the effective ceiling by %s: draining -- admitted before the ceiling fell, and never preempted\n",
+					formatReserveBytes(result.SliceReserve.GrantedBytes-result.SliceReserve.CeilingBytes))
+			}
+		}
 		if result.SliceReserve.ResidualJobs != 0 || result.SliceReserve.ResidualBytes != 0 {
 			// The split is derived from the ledger's own waiter list and the totals
 			// come from its incremental counters; they are equal by construction, so
@@ -2706,6 +2750,39 @@ func confineInt(value *int) string {
 // confinePlural keeps the AIRA-68 breakdown line grammatical for a single-member
 // population, matching the singular/plural handling the two lines above it
 // already do inline.
+// confineCeilingReason and confineMemAvailableNote keep an ABSENCE rendering as
+// an absence: a zero MemAvailable is "not established" (a live /proc read never
+// returns exactly 0 before the box is dead), never a measured zero, so it prints
+// nothing rather than "MemAvailable 0B".
+func confineCeilingReason(reason string) string {
+	if strings.TrimSpace(reason) == "" {
+		return "reason unavailable"
+	}
+	return reason
+}
+
+// confineCeilingSourceNote renders the system reading behind the ceiling AND
+// whether it is current. A HELD ceiling's numbers are the last established ones,
+// up to the hold TTL old; presenting them unmarked would state a current fact the
+// daemon cannot establish, which is the same class of dishonesty as a fabricated
+// zero. A non-positive MemAvailable is an absence and prints nothing at all.
+func confineCeilingSourceNote(reserve *runner.ConfineSliceReserve) string {
+	note := ""
+	if reserve.MemAvailableBytes > 0 {
+		note = " (system MemAvailable " + formatReserveBytes(reserve.MemAvailableBytes)
+		if reserve.CeilingHeld {
+			note += ", last established"
+		}
+		note += ")"
+	} else if reserve.CeilingHeld {
+		note = " (last established; no current system reading)"
+	}
+	if reserve.CeilingHeld && strings.TrimSpace(reserve.CeilingReason) != "" {
+		note += " — holding: " + reserve.CeilingReason
+	}
+	return note
+}
+
 func confinePlural(count int, singular, plural string) string {
 	if count == 1 {
 		return singular
