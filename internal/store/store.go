@@ -1625,11 +1625,6 @@ func (s *Store) Register(ctx context.Context) error {
 // tombstone. It is called by explicit init after any adoption rebuild has
 // succeeded; ordinary discovery and verbs always use Register.
 func (s *Store) RegisterBootstrap(ctx context.Context) error {
-	var one int
-	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM ejections WHERE project_id=?`, s.projectID).Scan(&one); err == nil {
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return translateDBError(err)
-	}
 	entry := registryEntry{
 		ProjectID: s.projectID, CommonDir: s.commonDir, WorktreeID: s.worktreeID,
 		Root: s.root, Prefixes: s.prefixesByKind(kindTicket), RequirementPrefixes: s.prefixesByKind(kindRequirement),

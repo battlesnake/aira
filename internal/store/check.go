@@ -147,11 +147,7 @@ func (s *Store) Check(ctx context.Context) (CheckReport, error) {
 		}
 	} else {
 		for _, finding := range findings {
-			dimension := "finding-integrity"
-			if finding.Kind == "unevaluated" {
-				dimension = "finding-integrity"
-			}
-			addFinding(&report, finding, dimension)
+			addFinding(&report, finding, "finding-integrity")
 		}
 	}
 	establishDimension(&report, "finding-integrity")

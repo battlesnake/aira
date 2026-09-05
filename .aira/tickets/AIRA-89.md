@@ -92,3 +92,53 @@ is not dead, the whale coexistence checks are live refusals, and the "three no-o
 branches" still cannot be identified without PR #12's own text, which is not in
 this repository. Only that last one is genuinely unactionable-pending-information;
 it is why this ticket is not closed here.
+
+## The "three no-op branches" identified and resolved (2026-09-05)
+
+PR #12's own text turned out to be retrievable after all: it's committed to this
+repo's history at `b3c10af`/`a6c1b64` (`docs/superpowers/reviews/2026-09-04-whole-project-simplification-review.md`),
+just not present on the current tree — it was deleted by a later commit, not
+lost. `git show a6c1b64:<path>` recovers it in full. The three branches it
+named (`check.go:175-178`, `store.go:1503-1507`, `gate_index.go:231-239` at
+that revision) were traced forward to their current locations, each
+independently re-verified as still present and still a genuine no-op before
+touching anything:
+
+1. **`internal/store/check.go`** (`findingIndexDivergence` loop) — `dimension
+   := "finding-integrity"` followed by `if finding.Kind == "unevaluated" {
+   dimension = "finding-integrity" }`: both branches produce the identical
+   string, so the conditional was pure no-op. Collapsed to the one-line form.
+   Behaviour-preserving by construction (both arms were already equal).
+2. **`internal/store/store.go`** (`RegisterBootstrap`) — a `SELECT 1 FROM
+   ejections ...` pre-check whose result (`one`) was never used in either
+   branch (success: empty body; `ErrNoRows`: falls through; any other error:
+   propagated). Traced whether removing it changes observable behaviour: the
+   real tombstone-clearing DELETE happens unconditionally inside
+   `registerDB(ctx, true)`'s own transaction regardless of whether a row
+   existed (DELETE of 0 or 1 rows is equally correct), and the existing
+   `TrimRegistryProject` rollback on `registerDB`'s own failure already
+   covers the case this pre-check's early-exit was trying to protect (a real
+   DB error surfacing before vs. after the registry-file write makes no
+   difference — both paths already roll the write back). Deleted the entire
+   dead block.
+3. **`internal/store/gate_index.go`** (`_ = baseline` discard in the
+   `"baseline"` audit-record branch) — traced this one further before
+   touching it, and stopped: `GateBaseline`, `PinGateBaseline`,
+   `ShowGateBaseline`, `ResolveGateBaseline`, `baselineFromAuditRecord`,
+   `deriveRatchetBaseline`, and the `gate_baselines`/`gate_baseline_active`
+   tables this exact code path writes to are **entirely ratchet-exclusive**
+   machinery (`deriveRatchetBaseline` references `def.Ratchet.Comparator`
+   directly) — not a general gate-baseline concept shared by other kinds.
+   This is inside AIRA-78's active scope (delete the ratchet gate kind,
+   owner decision 2026-09-05), which a plain grep for the substring
+   "ratchet" had missed since this file doesn't contain that word. Relayed
+   to AIRA-78's build agent directly rather than fixing it here, to avoid
+   two agents editing the same lines concurrently. Not resolved by this
+   ticket's own commit — closes when AIRA-78 lands.
+
+Verified: `go build ./...`, `go vet ./...` both clean; full `go test
+./internal/store/...` — `ok aira/internal/store 164.627s` (exit 0).
+
+**Ticket stays open** pending AIRA-78 landing item 3. `parseInstalledMemoryHigh`
+and the whale coexistence checks remain correctly-declined non-deletions per
+the earlier section.
