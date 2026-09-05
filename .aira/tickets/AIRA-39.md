@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-39","project":"aira","title":"worker-admit ledger reconstruction across daemon restart","status":"planned","kind":"bug","severity":"P0","assignee":null,"milestone":null,"labels":["aitest","hardening"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-39","project":"aira","title":"worker-admit ledger reconstruction across daemon restart","status":"done","kind":"bug","severity":"P0","assignee":null,"milestone":null,"labels":["aitest","hardening"],"hold":false,"relations":[]}
 ---
 Found by Sol build-review (AIRA-38 review wave), already anticipated as a
 known gap in AIRA-38's own P2 bundle ("Daemon restart voids the in-memory
@@ -38,3 +38,22 @@ Tracked here explicitly per this project's "coverage gaps are written
 down and accepted by reviewers, never silent" policy.
 
 relates AIRA-30, AIRA-38.
+
+## Resolution
+
+Built as Fix 1 of the backlog remediation programme (`docs/superpowers/plans/2026-09-04-backlog-remediation-plan.md`),
+consolidated with AIRA-41 and AIRA-63 since all three are the same
+worker-admit-ledger area. Landed as `11221d3` ("Fix 1: worker-admit ledger
+tracks the real cgroup tree"), preceded by `f0a6283`, `850de74`, `e2ae38d`
+(build-review fixes and de-porousing) and `5c72e5a` — all on master. The
+ledger now derives `committed` from each live `.aira-worker-*` child
+scope's real `memory.max` instead of in-memory-only grant bookkeeping, so
+a daemon restart self-heals rather than silently zeroing the aggregate
+guard; `workerScopeOwner` reconstruction is handled the same way. AIRA-41
+and AIRA-63 close by construction of the same change (see their own
+tickets). Found this genuinely-landed fix's own ticket had never been
+status-transitioned during a fresh backlog audit — this is a status
+correction only, no further code change. Status transition landed as a
+coordinator commit, walked through the full `planned → in-progress →
+in-review → done` chain since the direct jump is refused by
+`ValidateTransition`.
