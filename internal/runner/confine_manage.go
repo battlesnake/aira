@@ -26,12 +26,25 @@ type ConfineRegistryEntry struct {
 // ConfineRecord preserves per-field uncertainty with nil values. A nil facet
 // is rendered as "unevaluated" by human faces and as JSON null.
 type ConfineRecord struct {
-	Name              string   `json:"name"`
-	Owner             string   `json:"owner"`
-	SupervisorPID     *int     `json:"supervisor_pid"`
-	ScopeID           string   `json:"scope_id"`
-	Populated         *int     `json:"populated"`
-	RSSBytes          *int64   `json:"rss_bytes"`
+	Name          string `json:"name"`
+	Owner         string `json:"owner"`
+	SupervisorPID *int   `json:"supervisor_pid"`
+	ScopeID       string `json:"scope_id"`
+	Populated     *int   `json:"populated"`
+	RSSBytes      *int64 `json:"rss_bytes"`
+	// SubtreePopulated is liveness read from cgroup.events `populated`, which is
+	// SUBTREE-aware, unlike Populated above (leaf cgroup.procs only). AIRA-101
+	// needs the distinction and it is not cosmetic: BootstrapAitestSupervisor
+	// drains EVERY pid out of an aitest outer scope into <outer>/.aira-supervisor,
+	// so a fully busy suite reads Populated == 0 while SubtreePopulated is true.
+	// Reading a running job as empty is how an exclusive benchmark would be handed
+	// a fabricated "you are alone".
+	//
+	// nil means the reading could not be established (the scope vanished mid-scan,
+	// or cgroup.events could not be opened) and must never be rendered as empty.
+	// killConfine already used this same source for the same reason; this only
+	// makes it available to the scan.
+	SubtreePopulated  *bool    `json:"subtree_populated"`
 	AgeSeconds        *int64   `json:"age_seconds"`
 	Cap               *string  `json:"cap"`
 	Pending           bool     `json:"pending,omitempty"`

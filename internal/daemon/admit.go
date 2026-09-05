@@ -51,7 +51,64 @@ const (
 	delegateRAMScopeMinDefault          int64 = 4 << 30
 	delegateRAMScopeSafetyPct           int64 = 15
 	delegateRAMAdoptionMargin           int64 = 64 << 20
+
+	// admitExclusiveWaitCeilingDefault bounds how long an EXCLUSIVE request may
+	// drain the slice. It is deliberately far below the shared 24-hour
+	// AdmitWaitCeiling: an exclusive request holds up every other session on this
+	// machine while it drains, so a day-long drain is not a wait, it is an outage.
+	// Enforced by REFUSAL, never silent substitution (the AIRA-58 rule).
+	admitExclusiveWaitCeilingDefault = 30 * time.Minute
+
+	// admitExclusiveEstablishGrace is how long the confine scan may be failing
+	// before a draining exclusive waiter is ABORTED rather than left holding the
+	// slice. See sliceQueue.scanFailingSince.
+	admitExclusiveEstablishGrace = 30 * time.Second
 )
+
+// admitExclusiveWaitCeiling is the effective exclusive ceiling. It can never
+// exceed the shared ceiling: an override above it would be meaningless (the
+// general validation refuses first) and would misreport the bound in its own
+// refusal message.
+func admitExclusiveWaitCeiling() time.Duration {
+	ceiling := admitExclusiveWaitCeilingDefault
+	if raw := strings.TrimSpace(os.Getenv("AIRA_ADMIT_EXCLUSIVE_WAIT_CEILING")); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			ceiling = parsed
+		}
+	}
+	if ceiling > runner.AdmitWaitCeiling {
+		return runner.AdmitWaitCeiling
+	}
+	return ceiling
+}
+
+// Exclusive-state vocabulary, shared by the rejection payload, the `--list`
+// summary and the blocked launcher's progress line. Exact-match tokens.
+const (
+	admitExclusiveDraining = "draining"
+	admitExclusiveHeld     = "held"
+)
+
+// admitOutcomeExclusiveUnestablished is the waiter outcome the unestablished-
+// emptiness abort records. admitConnection branches on it so the abort reaches
+// the client as its own code rather than as E_ADMIT_SATURATED — reporting "the
+// slice was busy" for what is actually "the daemon could not read the slice"
+// would be a fabricated diagnosis of exactly the kind the fail-closed rule exists
+// to prevent.
+const admitOutcomeExclusiveUnestablished = "exclusive-unestablished"
+
+// exclusiveStateOf names which half of the exclusive lifecycle a waiter is in.
+// Empty for a waiter that is not asserting exclusivity at all, so callers can
+// treat "" as an honest absence rather than a third state.
+func exclusiveStateOf(waiter *admitWaiter) string {
+	if !waiter.exclusiveActive() {
+		return ""
+	}
+	if waiter.state == admitGranted {
+		return admitExclusiveHeld
+	}
+	return admitExclusiveDraining
+}
 
 type admitWaiterState uint8
 
@@ -129,6 +186,186 @@ type admitWaiter struct {
 	//     does not close it.
 	scopeSeen     bool
 	scopeVanished bool
+
+	// AIRA-101. Exclusivity is a DERIVED property of this waiter, never a
+	// standalone flag on the queue or the server. That is the whole crash-safety
+	// argument: `draining` is "some waiter has exclusive && state == admitQueued",
+	// `held` is "some waiter has exclusive && state == admitGranted", both
+	// recomputed from queue.waiters on every pass. So exclusivity cannot outlive
+	// the waiter; the waiter cannot outlive its admission connection
+	// (admitConnection's deferred release runs on every return path) or its own
+	// max_wait; and a daemon restart begins with an empty admitQueues map, so
+	// nothing survives it — fail-OPEN. There is deliberately no state an operator
+	// could ever need to clear, because a wedge of this machine-wide slice must be
+	// UNREPRESENTABLE, not merely avoided by careful coding.
+	//
+	// exclusiveHolder is the nesting token: a scope id naming the exclusive holder
+	// this request belongs to. It exempts the holder's OWN nested `aira confine`
+	// calls from the hold they would otherwise deadlock against — CLAUDE.md
+	// requires every heavy command be confined, and a nested call resolves to the
+	// same slice, so without this a benchmark blocks on its own exclusivity.
+	//
+	// parentScopeID marks a SUB-RESERVATION (`aira confine-reserve`) as an
+	// already-running job's internal progress. It is what keeps a drain
+	// converging: without it a drain blocks every per-test reservation of every
+	// running --delegate-ram suite, so those suites cannot finish and the drain
+	// never completes. It cannot be replaced by "has no scope id" — `aira run` is
+	// also scope-less and IS new job-level work that a drain must block.
+	exclusive       bool
+	exclusiveHolder string
+	parentScopeID   string
+}
+
+// exclusiveActive reports whether this waiter currently asserts exclusivity.
+//
+// The two states are named explicitly rather than spelled `!= admitReleased`,
+// and that is load-bearing in both uses (the derived drain/hold predicates, and
+// enqueueAdmitInternal's single-exclusive refusal). A REJECTED waiter — timed
+// out, or aborted by the unestablished-emptiness rule — whose handler has not yet
+// returned to run its deferred release would otherwise keep asserting
+// exclusivity. In the refusal path that would reject every future exclusive
+// request on the slice until a daemon restart: an unbounded feature-level wedge,
+// reintroduced by the very guard meant to simplify things.
+func (w *admitWaiter) exclusiveActive() bool {
+	return w != nil && w.exclusive && (w.state == admitQueued || w.state == admitGranted)
+}
+
+// isSubReservation reports whether this waiter is an already-running job's
+// internal sub-reservation rather than new job-level work. See parentScopeID.
+func (w *admitWaiter) isSubReservation() bool {
+	return w != nil && w.parentScopeID != ""
+}
+
+// exclusiveGate is the derived drain/hold state of one queue, recomputed under
+// queue.mu on every evaluator pass and never stored between passes.
+type exclusiveGate struct {
+	holder   *admitWaiter
+	draining *admitWaiter
+}
+
+// exclusiveGateLocked derives the gate. queue.mu must be held.
+//
+// At most one waiter can match either slot, because enqueueAdmitInternal refuses
+// a second exclusive request while one is active — so this cannot silently pick
+// an arbitrary one of several.
+func exclusiveGateLocked(queue *sliceQueue) exclusiveGate {
+	var gate exclusiveGate
+	for _, waiter := range queue.waiters {
+		if !waiter.exclusiveActive() {
+			continue
+		}
+		if waiter.state == admitGranted {
+			if gate.holder == nil {
+				gate.holder = waiter
+			}
+			continue
+		}
+		if gate.draining == nil {
+			gate.draining = waiter
+		}
+	}
+	return gate
+}
+
+// belongsToHolder reports whether waiter W is the exclusive holder or was
+// launched from inside it (carrying its token). Used both for the admission gate
+// and, via the scope-id, for the worker-admit gate. queue.mu must be held.
+func (g exclusiveGate) belongsToHolder(waiter *admitWaiter) bool {
+	if g.holder == nil || waiter == nil {
+		return false
+	}
+	return waiter == g.holder || (waiter.exclusiveHolder != "" && waiter.exclusiveHolder == g.holder.scopeID)
+}
+
+// holderScopeIDs is the set of scope ids that count as the holder's own work:
+// the holder itself plus every granted waiter carrying its token (a nested `aira
+// confine` launched from inside the benchmark). queue.mu must be held.
+func (g exclusiveGate) holderScopeIDs(queue *sliceQueue) map[string]struct{} {
+	ids := make(map[string]struct{}, 2)
+	if g.holder == nil {
+		return ids
+	}
+	if g.holder.scopeID != "" {
+		ids[g.holder.scopeID] = struct{}{}
+	}
+	for _, waiter := range queue.waiters {
+		if waiter == nil || waiter.state != admitGranted || waiter.scopeID == "" {
+			continue
+		}
+		if waiter.exclusiveHolder != "" && waiter.exclusiveHolder == g.holder.scopeID {
+			ids[waiter.scopeID] = struct{}{}
+		}
+	}
+	return ids
+}
+
+// sliceProvablyEmpty reports whether the daemon can POSITIVELY establish that
+// nothing else is admitted or running in this slice. queue.mu must be held.
+//
+// Fail-closed in all three terms, and the third is the important one: a scan the
+// daemon could not complete leaves liveScopesKnown false, and an unestablished
+// emptiness must never be rendered as an empty slice. Telling a benchmark "you
+// are alone" on a reading nobody has is the fabricated pass this codebase
+// forbids everywhere else.
+//
+// outstandingJobs is strict, with NO discount for exempt sub-reservations. A
+// discount would be unnecessary — a running job's own scoped lease already keeps
+// the count at 1 or more, and a post-restart adopted parent is caught by
+// subtree-aware liveScopes — and it would remove a belt-and-braces signal in the
+// one case where it is the only thing still objecting: a live reservation whose
+// parent job has escaped its scope or died with its socket held open.
+// exclusiveGateStateLocked renders the queue's exclusive state as its wire
+// token, or "" when no exclusivity is active. queue.mu must be held. The empty
+// string is an honest absence — derived from the same waiter list as everything
+// else — never "unknown".
+func exclusiveGateStateLocked(queue *sliceQueue) string {
+	gate := exclusiveGateLocked(queue)
+	if gate.holder != nil {
+		return admitExclusiveHeld
+	}
+	if gate.draining != nil {
+		return admitExclusiveDraining
+	}
+	return ""
+}
+
+func sliceProvablyEmpty(queue *sliceQueue) bool {
+	return queue.outstandingJobs == 0 && queue.liveScopesKnown && queue.liveScopes == 0
+}
+
+// blocks reports whether the exclusivity gate requires this queued waiter to
+// stay queued. queue.mu must be held.
+//
+// It never grants anything: a false return only means exclusivity has no
+// objection, after which the waiter still faces every pre-existing check.
+func (g exclusiveGate) blocks(queue *sliceQueue, waiter *admitWaiter) bool {
+	if g.holder == nil && g.draining == nil {
+		return false
+	}
+	// A SUB-RESERVATION is an already-running job's internal progress, not new
+	// work entering the slice. Blocking these is what would stop a drain from
+	// ever converging: every per-test reservation of every running --delegate-ram
+	// suite would stall for its full wait and then run UNCHARGED, so those suites
+	// could not finish, so the slice could not drain.
+	if waiter.isSubReservation() {
+		if g.holder == nil {
+			// Draining only: exempt unconditionally.
+			return false
+		}
+		// Held: only the holder's own sub-reservations pass, which is what lets
+		// `--exclusive --delegate-ram -- pytest` reserve for its own tests.
+		_, own := g.holderScopeIDs(queue)[waiter.parentScopeID]
+		return !own
+	}
+	if g.holder != nil {
+		return !g.belongsToHolder(waiter)
+	}
+	// Draining. Only the drain head may proceed, and only onto a slice whose
+	// emptiness the daemon can positively establish.
+	if waiter != g.draining {
+		return true
+	}
+	return !sliceProvablyEmpty(queue)
 }
 
 type sliceQueue struct {
@@ -177,6 +414,37 @@ type sliceQueue struct {
 	freezeArmedAt   time.Time
 	freezeHolderSeq int64            // diagnostics only; never affects timing
 	freezeLogged    admitFreezePhase // last phase logged, so logs are transitions
+
+	// AIRA-101. liveScopes is the EMPTINESS reading, deliberately separate from
+	// adopted/adoptedJobs, which are a RESERVE reading. adoptedJobs skips
+	// non-finite-cap scopes and connection-held scopes on purpose — both correct
+	// for reserve accounting and both wrong here, because a skipped scope is still
+	// a running job. Reusing it would let an exclusive job be told it is alone
+	// while a delegate-ram suite runs beside it.
+	//
+	// liveScopesKnown is the fail-closed half: it is true only when the scan that
+	// produced liveScopes SUCCEEDED. Granting exclusivity on an unestablished
+	// emptiness would state "you are alone" on a reading the daemon does not have,
+	// which is the fabricated pass this codebase forbids everywhere else.
+	liveScopes      int
+	liveScopesKnown bool
+
+	// scanFailingSince anchors how long the confine scan has been failing, in the
+	// same derive-from-one-anchor shape as freezeArmedAt. It exists so a drain can
+	// ABORT rather than stall the whole shared slice: with the fail-closed rule
+	// above, a persistently unreadable slice would otherwise block the drain head
+	// (cannot establish emptiness) AND every other waiter (blocked by the drain)
+	// for the full wait ceiling — a machine-wide outage caused by a diagnostic
+	// failure.
+	//
+	// Armed on the FIRST failure while zero and never renewed on later failures;
+	// cleared on any success. Arming only "after a success" would never fire in
+	// this rule's own primary case — a slice unreadable from the queue's very
+	// first pass, which is the likeliest persistent failure, since a queue is
+	// created on demand and its first scan is its first contact with the path.
+	// Never renewing is the freezeArmedAt lesson: a renewed anchor postpones its
+	// own deadline forever.
+	scanFailingSince time.Time
 }
 
 // admitFreezePhaseAt derives the duty-cycle phase from the anchor instant. Held
@@ -232,21 +500,29 @@ type AdmitResponse struct {
 }
 
 type admitRequest struct {
-	slice       string
-	reserve     int64
-	maxWait     int64
-	signature   string
-	pinned      bool
-	scopeID     string
-	name        string
-	owner       string
-	delegateRAM bool
+	slice           string
+	reserve         int64
+	maxWait         int64
+	signature       string
+	pinned          bool
+	scopeID         string
+	name            string
+	owner           string
+	delegateRAM     bool
+	exclusive       bool
+	exclusiveHolder string
+	parentScopeID   string
 }
 
 type admitRejection struct {
 	Required int64  `json:"required,omitempty"`
 	Ceiling  int64  `json:"cap_minus_headroom"`
 	Basis    string `json:"basis"`
+	// AIRA-101. Set when the rejection happened while this slice was draining for
+	// or held by an exclusive job, so a blocked operator can tell "a benchmark has
+	// the slice" from ordinary saturation. Additive: Basis keeps its exact
+	// "reject:saturated" spelling, which validRunnerAdmitRejection pins.
+	Exclusive string `json:"exclusive,omitempty"`
 }
 
 func subtractFloor(value, subtract int64) int64 {
@@ -351,6 +627,21 @@ type admitSnapshot struct {
 	// residual below would cry wolf on every vanished lease.
 	vanishedJobs  int
 	vanishedBytes int64
+
+	// AIRA-101. The slice's exclusive state, derived in the SAME locked walk as
+	// everything above so `confine --list` and a blocked launcher's progress line
+	// can never render an exclusive holder alongside counts from another instant.
+	//
+	// exclusiveState is "" when nothing is exclusive. That is a POSITIVE fact —
+	// the walk established it — not an unevaluated reading, and consumers must
+	// render it as "none" rather than as unknown.
+	exclusiveState   string
+	exclusiveName    string
+	exclusiveOwner   string
+	exclusiveScopeID string
+	// exclusiveWaiting counts the queued waiters actually held up behind the
+	// exclusive job. It excludes the exclusive waiter itself.
+	exclusiveWaiting int
 }
 
 // residualJobs and residualBytes cross-check the DERIVED split (a walk of
@@ -452,6 +743,23 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 	}
 	if s.admitFreezeMaxHold > 0 {
 		snapshot.phase = admitFreezePhaseAt(queue.freezeArmedAt, s.admitNowTime(), s.admitFreezeMaxHold).String()
+	}
+	// AIRA-101, in the same locked pass as the counts above.
+	if gate := exclusiveGateLocked(queue); gate.holder != nil || gate.draining != nil {
+		exclusive := gate.holder
+		snapshot.exclusiveState = admitExclusiveHeld
+		if exclusive == nil {
+			exclusive, snapshot.exclusiveState = gate.draining, admitExclusiveDraining
+		}
+		snapshot.exclusiveName = exclusive.name
+		snapshot.exclusiveOwner = exclusive.owner
+		snapshot.exclusiveScopeID = exclusive.scopeID
+		// Only waiters actually held up behind it: the exclusive waiter is never
+		// counted as waiting for itself.
+		snapshot.exclusiveWaiting = subtractJobCount(snapshot.queued, 1)
+		if exclusive.state != admitQueued {
+			snapshot.exclusiveWaiting = snapshot.queued
+		}
 	}
 	queue.mu.Unlock()
 	s.admitRegistryMu.Unlock()
@@ -796,8 +1104,24 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 
 	queue.mu.Lock()
 	if waiter.state == admitRejected {
+		// AIRA-101. Branch on the OUTCOME rather than hardcoding saturation for
+		// every rejected waiter. An unestablished-emptiness abort is not a busy
+		// slice — it is a slice the daemon could not read — and reporting it as
+		// E_ADMIT_SATURATED would be a fabricated diagnosis of exactly the kind the
+		// fail-closed emptiness rule exists to prevent.
+		if waiter.outcome == admitOutcomeExclusiveUnestablished {
+			queue.mu.Unlock()
+			s.writeAdmitError(conn, CodeAdmitExclusiveUnestablished,
+				CodeAdmitExclusiveUnestablished+": the confine scan is failing, so an empty slice could not be established for an exclusive request")
+			return
+		}
+		// Report WHETHER the wait expired under an exclusive drain or hold, so a
+		// blocked operator can tell "a benchmark has the slice" from ordinary
+		// saturation. Basis keeps its exact "reject:saturated" spelling, which
+		// validRunnerAdmitRejection pins, so this is purely additive.
+		exclusiveState := exclusiveGateStateLocked(queue)
 		queue.mu.Unlock()
-		s.writeAdmitRejection(conn, CodeAdmitSaturated, admitRejection{Basis: "reject:saturated"})
+		s.writeAdmitRejection(conn, CodeAdmitSaturated, admitRejection{Basis: "reject:saturated", Exclusive: exclusiveState})
 		return
 	}
 	if waiter.state != admitGranted {
@@ -870,11 +1194,32 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 			}
 		}
 	}
+	// AIRA-101. At most ONE exclusive waiter per slice, refused here under
+	// queue.mu so the check is race-free beside the duplicate-scope-id check
+	// above.
+	//
+	// This makes "fairness among multiple simultaneous exclusive requesters"
+	// unrepresentable rather than something to arbitrate. Without it, exclusive
+	// requesters chain — a second becomes the drain head the instant the first
+	// releases — and ordinary waiters on the slice starve indefinitely.
+	//
+	// exclusiveActive() and NOT `state != admitReleased`: see its doc comment. A
+	// rejected-but-not-yet-removed waiter matching here would refuse every future
+	// exclusive request on this slice until a daemon restart.
+	if request.exclusive {
+		for _, existing := range queue.waiters {
+			if existing.exclusiveActive() {
+				return nil, nil, CodeAdmitExclusiveActive, fmt.Errorf(
+					"%s: another exclusive request is already active on this slice (%s); retry when it completes",
+					CodeAdmitExclusiveActive, exclusiveStateOf(existing))
+			}
+		}
+	}
 	if queue.seq == math.MaxInt64 {
 		return nil, nil, CodeProtocol, fmt.Errorf("%s: admission arrival sequence overflow", CodeProtocol)
 	}
 	queue.seq++
-	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner}
+	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, exclusive: request.exclusive, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID}
 	queue.waiters = append(queue.waiters, waiter)
 	queue.signal()
 	return queue, waiter, "", nil
@@ -942,7 +1287,20 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 				log.Printf("aira daemon: confine reserve scan failed: %v", scanErr)
 			}
 			queue.adoptedScanFailed = true
+			// AIRA-101. liveScopes is only meaningful alongside a successful scan;
+			// clearing the KNOWN bit is what makes the exclusive gate fail closed
+			// rather than reading a stale emptiness as current fact.
+			queue.liveScopesKnown = false
+			// Arm the abort anchor on the FIRST failure while it is zero, and never
+			// renew it on later failures. Arming only after a prior success would
+			// never fire in this rule's own primary case — a slice unreadable from
+			// the queue's very first pass — and renewing would let the anchor
+			// postpone its own deadline forever (the freezeArmedAt lesson).
+			if queue.scanFailingSince.IsZero() {
+				queue.scanFailingSince = now
+			}
 		} else {
+			queue.scanFailingSince = time.Time{}
 			// AIRA-68. listConfines enumerates EVERY .aira-CONFINE-* directory
 			// under the slice, irrespective of population or cap, so scan
 			// membership is an authoritative presence test — and this block runs
@@ -969,6 +1327,33 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 					waiter.scopeVanished = true
 				}
 			}
+			// AIRA-101. The EMPTINESS reading, computed in the same successful scan
+			// but deliberately NOT derived from adopted/adoptedJobs below.
+			//
+			// The adopted loop skips scopes on purpose — unpopulated ones,
+			// non-finite-cap ones, and connection-held ones — and every one of those
+			// exclusions is correct for RESERVE accounting and wrong for EMPTINESS,
+			// because a skipped scope is still a running job. Reusing it would let an
+			// exclusive job be told it is alone while a suite runs beside it.
+			//
+			// Liveness is SUBTREE-aware. Leaf cgroup.procs is not usable here:
+			// BootstrapAitestSupervisor drains EVERY pid out of an aitest outer scope
+			// into <outer>/.aira-supervisor, so a running suite's outer scope reads
+			// leaf-empty. Before a daemon restart its connection-held lease still
+			// keeps outstandingJobs >= 1, but after one it is merely an adopted scope
+			// — and a leaf-only reading would then declare the slice empty and hand a
+			// benchmark a fabricated "you are alone" while the suite ran on.
+			liveScopes := 0
+			for _, record := range scanResult.Scopes {
+				// Unevaluated is NOT empty. A scope whose population could not be read
+				// counts as live, so an unreadable scope can only ever delay an
+				// exclusive grant, never fake one.
+				if record.SubtreePopulated == nil || *record.SubtreePopulated {
+					liveScopes++
+				}
+			}
+			queue.liveScopes = liveScopes
+			queue.liveScopesKnown = true
 			adopted := int64(0)
 			adoptedJobs := 0
 			for _, record := range scanResult.Scopes {
@@ -1055,9 +1440,42 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		queue.freezeArmedAt = time.Time{}
 		phase = admitFreezeYield
 	}
+	// AIRA-101. Abort a drain the daemon cannot establish emptiness for, BEFORE
+	// the grant loop, so the drain lifts in the same pass rather than one later.
+	// Without this the fail-closed emptiness rule would stall the whole shared
+	// slice for the full ceiling on a persistently unreadable slice: the drain
+	// head cannot be granted, and every other waiter is blocked by the drain.
+	//
+	// The abort takes the identical path as timeoutAdmitWaiter — state becomes
+	// admitRejected, grantedCh closes, and the handler's deferred release removes
+	// the waiter — so it leaks nothing, and exclusiveActive() stops matching the
+	// instant the state changes, which is what lifts the drain.
+	if gate := exclusiveGateLocked(queue); gate.draining != nil && !queue.scanFailingSince.IsZero() &&
+		now.Sub(queue.scanFailingSince) >= admitExclusiveEstablishGrace {
+		waiter := gate.draining
+		waiter.state = admitRejected
+		waiter.outcome = admitOutcomeExclusiveUnestablished
+		waiter.waitedMS = elapsedMilliseconds(waiter.enqueued, s.admitNowTime())
+		close(waiter.grantedCh)
+		log.Printf("aira daemon: exclusive admission aborted on %s: confine scan failing for %s, cannot establish an empty slice (scope=%s)",
+			queue.path, now.Sub(queue.scanFailingSince).Round(time.Second), waiter.scopeID)
+	}
+	gate := exclusiveGateLocked(queue)
 	frozen := false
 	for _, waiter := range queue.waiters {
 		if waiter.state != admitQueued {
+			continue
+		}
+		// AIRA-101, the exclusivity gate. Placed before the RAM fit check because
+		// exclusivity is an ADDITIONAL orthogonal gate: a waiter it lets through
+		// still has to pass every existing check on its own merits.
+		//
+		// Blocked waiters `continue` from here, BEFORE the freeze branch below, so
+		// a drain never arms or advances the AIRA-59 fairness anchor: that duty
+		// cycle exists to stop backfill starvation of a head, and during a drain
+		// there is no backfill to stop.
+		if gate.blocks(queue, waiter) {
+			waiter.waited = true
 			continue
 		}
 		jobs := addJobCountClamp(addJobCountClamp(queue.outstandingJobs, queue.adoptedJobs), 1)
@@ -1352,11 +1770,11 @@ func admitErrorCode(err error) string {
 }
 
 func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, error) {
-	if len(args) < 3 || len(args) > 9 {
-		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, max_wait_ms, optional signature/pinned/delegate_ram, and an optional complete scope_id/name/owner tuple", CodeProtocol)
+	if len(args) < 3 || len(args) > 12 {
+		return admitRequest{}, fmt.Errorf("%s: admit requires slice, reserve, max_wait_ms, optional signature/pinned/delegate_ram/exclusive/exclusive_holder/parent_scope_id, and an optional complete scope_id/name/owner tuple", CodeProtocol)
 	}
 	for name := range args {
-		if name != "slice" && name != "reserve" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "delegate_ram" && name != "scope_id" && name != "name" && name != "owner" {
+		if name != "slice" && name != "reserve" && name != "max_wait_ms" && name != "signature" && name != "pinned" && name != "delegate_ram" && name != "scope_id" && name != "name" && name != "owner" && name != "exclusive" && name != "exclusive_holder" && name != "parent_scope_id" {
 			return admitRequest{}, fmt.Errorf("%s: unexpected admit field %q", CodeProtocol, name)
 		}
 	}
@@ -1413,6 +1831,69 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 			return admitRequest{}, fmt.Errorf("%s: admit delegate_ram must be boolean", CodeProtocol)
 		}
 	}
+	// AIRA-101.
+	exclusive := false
+	if raw, exists := args["exclusive"]; exists {
+		var valid bool
+		exclusive, valid = raw.(bool)
+		if !valid {
+			return admitRequest{}, fmt.Errorf("%s: admit exclusive must be boolean", CodeProtocol)
+		}
+	}
+	exclusiveHolder := ""
+	if raw, exists := args["exclusive_holder"]; exists {
+		text, valid := raw.(string)
+		if !valid {
+			return admitRequest{}, fmt.Errorf("%s: admit exclusive_holder must be a string", CodeProtocol)
+		}
+		exclusiveHolder = strings.TrimSpace(text)
+		// ONE scope-id grammar and ONE parser. The value is only ever compared for
+		// equality, so a malformed one would be harmless in practice — but this
+		// codebase already had a second, looser acceptance path admit ids the
+		// scanner could then not see, and the fix was to stop having two.
+		if exclusiveHolder != "" {
+			if _, _, _, _, parsed := runner.ParseConfineScopeID(exclusiveHolder); !parsed {
+				return admitRequest{}, fmt.Errorf("%s: admit exclusive_holder is not a canonical scope id", CodeProtocol)
+			}
+		}
+	}
+	parentScopeID := ""
+	if raw, exists := args["parent_scope_id"]; exists {
+		text, valid := raw.(string)
+		if !valid {
+			return admitRequest{}, fmt.Errorf("%s: admit parent_scope_id must be a string", CodeProtocol)
+		}
+		parentScopeID = strings.TrimSpace(text)
+		if parentScopeID != "" {
+			if _, _, _, _, parsed := runner.ParseConfineScopeID(parentScopeID); !parsed {
+				return admitRequest{}, fmt.Errorf("%s: admit parent_scope_id is not a canonical scope id", CodeProtocol)
+			}
+		}
+	}
+	if exclusive {
+		// A nested exclusive inside a hold could never satisfy the emptiness rule
+		// (its own holder keeps outstandingJobs >= 1), so it would sit blocked until
+		// its ceiling. Refuse synchronously instead of accepting a request that
+		// cannot succeed.
+		if exclusiveHolder != "" {
+			return admitRequest{}, fmt.Errorf("%s: admit exclusive cannot be combined with exclusive_holder", CodeProtocol)
+		}
+		if parentScopeID != "" {
+			return admitRequest{}, fmt.Errorf("%s: admit exclusive cannot be combined with parent_scope_id", CodeProtocol)
+		}
+		// An exclusive request gets its own, much lower ceiling than the shared one:
+		// it holds up every other session on this machine while it drains. REFUSED,
+		// never clamped (AIRA-58), and with the terminal code the client already
+		// handles before the structured-payload branch, so it can never degrade into
+		// the unaccounted flock fallback.
+		if exclusiveCeiling := admitExclusiveWaitCeiling(); maxWait > exclusiveCeiling.Milliseconds() {
+			return admitRequest{}, admitCodedError{
+				code: CodeAdmitWaitTooLong,
+				err: fmt.Errorf("%s: admit max_wait_ms %d exceeds the exclusive-request ceiling of %d ms (%s)",
+					CodeAdmitWaitTooLong, maxWait, exclusiveCeiling.Milliseconds(), exclusiveCeiling),
+			}
+		}
+	}
 	scopeID, hasScope := args["scope_id"]
 	name, hasName := args["name"]
 	owner, hasOwner := args["owner"]
@@ -1461,9 +1942,16 @@ func validateAdmitArgs(args map[string]any, waitCeilingMs int64) (admitRequest, 
 		if embeddedOwner != "" && embeddedOwner != expectedOwner {
 			return admitRequest{}, fmt.Errorf("%s: admit owner does not match scope_id", CodeProtocol)
 		}
-		return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM, scopeID: scopeText, name: nameText, owner: ownerText}, nil
+		return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM, scopeID: scopeText, name: nameText, owner: ownerText, exclusive: exclusive, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
 	}
-	return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM}, nil
+	// An exclusive request MUST carry the scope tuple. Exclusivity is attributed
+	// to, reported by, and reaped through the holder's scope id: a scope-less
+	// exclusive could never be named in `confine --list`, never matched by a
+	// nested job's holder token, and never reclaimed by the stale-lease sweep.
+	if exclusive {
+		return admitRequest{}, fmt.Errorf("%s: admit exclusive requires the scope_id, name and owner tuple", CodeProtocol)
+	}
+	return admitRequest{slice: slice, reserve: reserve, maxWait: maxWait, signature: signature, pinned: pinned, delegateRAM: delegateRAM, exclusiveHolder: exclusiveHolder, parentScopeID: parentScopeID}, nil
 }
 
 func exactAdmitInt64(value any) (int64, bool) {
