@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -172,10 +173,21 @@ func classifyConfineDetachRecord(record ConfineDetachRecord, probe ConfineSuperv
 			", which this binary cannot interpret (expected " + strconv.Itoa(ConfineDetachSchema) + ")"
 		return status
 	}
-	// Terminal first, and unconditionally: a supervisor that wrote an outcome and
-	// then exited is finished, and asking whether it is still alive would turn
-	// every completed job into outcome-unknown.
+	// Terminal first, and without consulting liveness: a supervisor that wrote an
+	// outcome and then exited is finished, and asking whether it is still alive
+	// would turn every completed job into outcome-unknown.
+	//
+	// But a terminal record must actually CARRY an outcome. `Terminal: true` with
+	// neither an exit code nor an error code describes nothing, and reporting it
+	// as `finished` would be the fabrication this whole verb exists to avoid --
+	// reachable through record corruption or a truncated write, never through a
+	// supervisor writing one honestly (build review, Sol).
 	if record.Terminal {
+		if record.Exit == nil && record.ErrorCode == "" {
+			status.State = ConfineDetachOutcomeUnknown
+			status.Reason = "the record is marked terminal but carries neither an exit code nor an error code, so it establishes no outcome"
+			return status
+		}
 		status.State = ConfineDetachFinished
 		return status
 	}
@@ -195,15 +207,26 @@ func classifyConfineDetachRecord(record ConfineDetachRecord, probe ConfineSuperv
 		status.Reason = fmt.Sprintf("the detached supervisor (pid %d) is gone and wrote no terminal record, so the job's outcome is unevaluated; see the captured output and supervisor log", record.Supervisor.PID)
 		return status
 	}
+	// Each live state names the LAST PHASE THE SUPERVISOR RECORDED, which is the
+	// only thing a durable record can establish. Saying "the job is in admission"
+	// outright would be a claim the record cannot support if a phase update was
+	// lost to a failed write; saying what was last recorded is exactly true
+	// either way (build review, Sol).
 	switch record.Phase {
 	case ConfineDetachPhaseRunning:
 		status.State = ConfineDetachRunning
 	case ConfineDetachPhaseAdmitting:
 		status.State = ConfineDetachAdmitting
-		status.Reason = "the job has passed every launch precondition and is in admission; it is not running yet"
-	default:
+		status.Reason = "the supervisor's last recorded phase is `admitting`: every launch precondition passed, and the job had not been placed in its scope when the record was last written"
+	case ConfineDetachPhaseStarting:
 		status.State = ConfineDetachStarting
-		status.Reason = "the supervisor is alive but has not reached the launch gate"
+		status.Reason = "the supervisor is alive and its last recorded phase is `starting`: it had not reached the launch gate"
+	default:
+		// An unrecognised phase is corruption, not a fourth lifecycle stage: every
+		// record a supervisor writes carries one of the three above, starting with
+		// `starting` before anything else happens.
+		status.State = ConfineDetachOutcomeUnknown
+		status.Reason = "the record carries an unrecognised phase " + strconv.Quote(record.Phase) + ", so the job's state cannot be established"
 	}
 	return status
 }
@@ -246,8 +269,18 @@ func ListConfineDetachStatuses(records []ConfineDetachRecord, callerOwner string
 	return out
 }
 
+// sortConfineDetachStatuses orders newest first. Timestamps are compared as
+// PARSED TIMES, not lexically: RFC3339Nano trims trailing zeros, so
+// "…:00.1Z" sorts after "…:00.05Z" as text while being earlier in fact, which
+// would put the wrong candidate first in an ambiguity message. A timestamp that
+// cannot be parsed falls back to text order rather than being dropped.
 func sortConfineDetachStatuses(statuses []ConfineDetachStatus) {
 	sort.SliceStable(statuses, func(i, j int) bool {
+		left, leftErr := time.Parse(time.RFC3339Nano, statuses[i].Record.StartedAt)
+		right, rightErr := time.Parse(time.RFC3339Nano, statuses[j].Record.StartedAt)
+		if leftErr == nil && rightErr == nil && !left.Equal(right) {
+			return left.After(right)
+		}
 		if statuses[i].Record.StartedAt != statuses[j].Record.StartedAt {
 			return statuses[i].Record.StartedAt > statuses[j].Record.StartedAt
 		}

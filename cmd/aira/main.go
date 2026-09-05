@@ -990,6 +990,12 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 	if !kill && options["steal"] == "true" {
 		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --steal is valid only with --kill")
 	}
+	// --status reads a durable filesystem record and never touches a cgroup
+	// slice, so an accepted-and-ignored --slice would be exactly the silently
+	// discarded scope AIRA-82 exists to refuse.
+	if status && options["slice"] != "" {
+		return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: --slice is not valid with --status: a detached job's record is keyed by owner and scope id, not by slice")
+	}
 	if owner := options["owner"]; owner != "" {
 		if err := runner.ValidateConfineIdentity(owner); err != nil {
 			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: --owner: %w", err)
@@ -1223,6 +1229,11 @@ func runConfineSupervisor(argv []string) int {
 		return store.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 	}
 	if err := superviseConfineDetached(context.Background(), values["control"], readyFD, ackFD); err != nil {
+		// fd 2 is the job's supervisor.log by the time the supervisor has a record
+		// store, so this is the one place an operator can later read WHY a
+		// detached job ended the way it did. Dropping it would leave an empty log
+		// beside a record that points at it.
+		_, _ = fmt.Fprintf(os.Stderr, "confine supervisor: %v\n", err)
 		return store.ExitForCode(store.ErrorCode(err))
 	}
 	return 0

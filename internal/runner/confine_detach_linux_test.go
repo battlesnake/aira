@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -74,6 +75,25 @@ func runFakeConfineSupervisor(mode string, argv []string) int {
 		// Exit without reporting anything: the launcher must treat this as a
 		// failure, not hang and not succeed.
 		return 3
+	}
+	if mode == "slow" {
+		// Outlive the launcher's readiness timeout without reporting.
+		time.Sleep(5 * time.Second)
+		return 3
+	}
+	if mode == "refuse" {
+		// Report a FOREGROUND code with a detail that does NOT repeat it, which is
+		// what forces the launcher to attach the code itself rather than relying on
+		// every supervisor message happening to start with one.
+		readyFD, _ := strconv.Atoi(values["ready-fd"])
+		ready := os.NewFile(uintptr(readyFD), "ready")
+		if ready == nil {
+			return 3
+		}
+		_ = (&detachSignal{file: ready}).send(confineDetachReady{
+			Code: "E_CONFINE_UNAVAILABLE", Error: "slice has no finite memory.max in its cgroup ancestry",
+		})
+		return 4
 	}
 	readyFD, _ := strconv.Atoi(values["ready-fd"])
 	ackFD, _ := strconv.Atoi(values["ack-fd"])
@@ -261,6 +281,14 @@ func startDetachLauncher(t *testing.T, env []string) (*exec.Cmd, launcherHandle)
 	case <-time.After(30 * time.Second):
 		t.Fatal("launcher did not report a handle")
 	}
+	// The supervisor is setsid'd, so killing the launcher's process group -- which
+	// is exactly what these tests do -- deliberately does NOT reach it. Without an
+	// explicit cleanup every run would leave supervisors (and their confined jobs)
+	// alive for as long as their argv takes, holding admission reserve on the
+	// shared slice and slowing every later test on the machine.
+	if handle.SupervisorPID > 0 {
+		t.Cleanup(func() { _ = unix.Kill(handle.SupervisorPID, unix.SIGKILL) })
+	}
 	if skipAck || handle.Error != "" {
 		return cmd, handle
 	}
@@ -405,6 +433,54 @@ func TestLaunchConfineDetachedReportsASupervisorThatNeverReportsReady(t *testing
 	}
 }
 
+// A supervisor that refuses with a FOREGROUND code must have that code reach
+// the launcher's caller intact, or `--detach` degrades every synchronous launch
+// failure to the generic exit-1 default and the operator loses the diagnosis
+// the foreground form would have given them.
+//
+// verifies: AIRA-22
+func TestLaunchConfineDetachedPropagatesTheSupervisorsOwnErrorCode(t *testing.T) {
+	t.Setenv(fakeSupervisorEnv, "refuse")
+	_, err := LaunchConfineDetached(context.Background(), ConfineRequest{
+		Name: "refused", Owner: "session-test", Argv: []string{"/bin/true"},
+		SelfPath: os.Args[0], DetachStateDir: t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("a refusing supervisor was treated as a successful launch")
+	}
+	if !strings.HasPrefix(err.Error(), "E_CONFINE_UNAVAILABLE:") {
+		t.Fatalf("error %q does not lead with the supervisor's own code, so it maps to the exit-1 default", err)
+	}
+	if !strings.Contains(err.Error(), "no finite memory.max") {
+		t.Fatalf("the supervisor's detail was lost: %v", err)
+	}
+}
+
+// A supervisor that never reports must time the launcher out rather than
+// hanging it, and must be reported as a failure.
+//
+// verifies: AIRA-22
+func TestLaunchConfineDetachedTimesOutOnASilentSupervisor(t *testing.T) {
+	t.Setenv(fakeSupervisorEnv, "slow")
+	original := confineDetachReadyTimeout
+	confineDetachReadyTimeout = 150 * time.Millisecond
+	t.Cleanup(func() { confineDetachReadyTimeout = original })
+	started := time.Now()
+	_, err := LaunchConfineDetached(context.Background(), ConfineRequest{
+		Name: "slow", Owner: "session-test", Argv: []string{"/bin/true"},
+		SelfPath: os.Args[0], DetachStateDir: t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("a supervisor that never reported was treated as a successful launch")
+	}
+	if !strings.Contains(err.Error(), CodeConfineDetachFailed) || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("wrong failure: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("the launcher waited %s; the readiness timeout did not bound it", elapsed)
+	}
+}
+
 // TestUnacknowledgedDetachedSupervisorRefusesToRunTheJob is the other half of
 // the same property, from the supervisor's side: if the launcher never confirms
 // that the handle reached a human, the job must not run at all. Without this,
@@ -458,14 +534,20 @@ func TestConfineDetachRecordWriteIsAtomicAcrossAFailureBetweenWriteAndRename(t *
 		t.Fatalf("open job: %v", err)
 	}
 	defer job.close()
-	first := ConfineDetachRecord{Schema: ConfineDetachSchema, ScopeID: scopeID, Name: "atomic", Owner: "session-a", Phase: ConfineDetachPhaseAdmitting, StartedAt: "t0"}
+	_, supervisorPID, _, _, _ := parseConfineScopeID(scopeID)
+	first := ConfineDetachRecord{
+		Schema: ConfineDetachSchema, ScopeID: scopeID, Name: "atomic", Owner: "session-a",
+		Supervisor: PIDIdentity{PID: supervisorPID},
+		Phase:      ConfineDetachPhaseAdmitting, StartedAt: "t0",
+	}
 	if err := job.write(first); err != nil {
 		t.Fatalf("write first: %v", err)
 	}
 	confineDetachBeforeRenameHook = func() error { return errors.New("injected crash before rename") }
 	t.Cleanup(func() { confineDetachBeforeRenameHook = nil })
 	second := first
-	second.Phase, second.Terminal, second.StartedAt = ConfineDetachPhaseRunning, true, "t1"
+	exitZero := 0
+	second.Phase, second.Terminal, second.StartedAt, second.Exit = ConfineDetachPhaseRunning, true, "t1", &exitZero
 	if err := job.write(second); err == nil {
 		t.Fatal("the injected pre-rename failure was not reported")
 	}
@@ -608,6 +690,10 @@ func TestListConfineDetachRecordsSurfacesUnreadableAndMismatchedRecords(t *testi
 // REAL probe, not an injected one. The pure resolver's table test uses a stub,
 // so without this the production probe would be untested.
 //
+// The INCOMPLETE-identity and ZOMBIE cases are the ones a hand-rolled probe gets
+// wrong (build review, Sol): both must resolve away from "running", one as
+// unevaluated and one as dead.
+//
 // verifies: AIRA-22
 func TestConfineSupervisorAliveDistinguishesLiveReusedAndUnreadablePIDs(t *testing.T) {
 	boot := bootIDOrEmpty()
@@ -630,6 +716,19 @@ func TestConfineSupervisorAliveDistinguishesLiveReusedAndUnreadablePIDs(t *testi
 	if alive, evaluated := confineSupervisorAlive(rebooted); alive || !evaluated {
 		t.Fatalf("a pre-reboot pid reported alive=%v evaluated=%v; want false/true", alive, evaluated)
 	}
+	// INCOMPLETE identities are unevaluated, never optimistically alive: a record
+	// written before the boot id or start tick could be read carries no evidence
+	// that its pid is still the same process.
+	for _, incomplete := range []PIDIdentity{
+		{PID: os.Getpid(), StartTick: self.StartTick},      // no boot id
+		{PID: os.Getpid(), BootID: boot},                   // no start tick
+		{PID: 0, StartTick: self.StartTick, BootID: boot},  // no pid
+		{PID: -1, StartTick: self.StartTick, BootID: boot}, // nonsense pid
+	} {
+		if alive, evaluated := confineSupervisorAlive(incomplete); alive || evaluated {
+			t.Fatalf("incomplete identity %+v reported alive=%v evaluated=%v; want false/false", incomplete, alive, evaluated)
+		}
+	}
 	// A genuinely reaped child.
 	child := exec.Command("/bin/true")
 	if err := child.Run(); err != nil {
@@ -639,8 +738,129 @@ func TestConfineSupervisorAliveDistinguishesLiveReusedAndUnreadablePIDs(t *testi
 	if alive, _ := confineSupervisorAlive(gone); alive {
 		t.Fatal("a reaped child reported alive")
 	}
-	if alive, evaluated := confineSupervisorAlive(PIDIdentity{PID: 0, BootID: boot}); alive || evaluated {
-		t.Fatalf("pid 0 reported alive=%v evaluated=%v; want false/false (unevaluated)", alive, evaluated)
+	// A ZOMBIE still has a /proc entry and its original start tick, so a probe
+	// that only asks "does /proc answer" would call it alive. A zombie supervisor
+	// has exited and will never write an outcome.
+	zombie := exec.Command("/bin/true")
+	if err := zombie.Start(); err != nil {
+		t.Fatalf("start zombie: %v", err)
+	}
+	zombiePID := zombie.Process.Pid
+	zombieIdentity := PIDIdentity{PID: zombiePID, StartTick: processStartTick(zombiePID), BootID: boot}
+	deadline := time.Now().Add(5 * time.Second)
+	sawZombie := false
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(zombiePID), "stat"))
+		if err == nil && processLivenessFromStat(data) == processDead {
+			sawZombie = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !sawZombie {
+		_ = zombie.Wait()
+		t.Skip("could not observe the child in the zombie state")
+	}
+	alive, evaluated := confineSupervisorAlive(zombieIdentity)
+	_ = zombie.Wait()
+	if alive || !evaluated {
+		t.Fatalf("a zombie supervisor reported alive=%v evaluated=%v; want false/true (it exited and will never write an outcome)", alive, evaluated)
+	}
+}
+
+// A record whose contents disagree with the authoritative directory name cannot
+// be trusted to describe either job: a wrong owner misdirects owner-scoped
+// selection and a wrong supervisor pid makes `--status` probe an unrelated
+// process's liveness.
+//
+// verifies: AIRA-22
+func TestListConfineDetachRecordsRefusesARecordThatDisagreesWithItsDirectory(t *testing.T) {
+	scopeID := confineScopeID("bound", "session-a", false)
+	name, pid, _, owner, ok := parseConfineScopeID(scopeID)
+	if !ok {
+		t.Fatalf("setup: %q does not parse", scopeID)
+	}
+	sound := ConfineDetachRecord{
+		Schema: ConfineDetachSchema, ScopeID: scopeID, Name: name, Owner: owner,
+		Supervisor: PIDIdentity{PID: pid}, Phase: ConfineDetachPhaseRunning,
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*ConfineDetachRecord)
+		want   string
+	}{
+		{name: "foreign name", mutate: func(r *ConfineDetachRecord) { r.Name = "other" }, want: "names"},
+		{name: "foreign owner", mutate: func(r *ConfineDetachRecord) { r.Owner = "session-b" }, want: "owner"},
+		{name: "foreign supervisor pid", mutate: func(r *ConfineDetachRecord) { r.Supervisor.PID = pid + 1 }, want: "supervisor pid"},
+		{name: "foreign scope id", mutate: func(r *ConfineDetachRecord) { r.ScopeID = "CONFINE-other-1-a" }, want: "scope"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(state, scopeID), 0o700); err != nil {
+				t.Fatalf("prepare: %v", err)
+			}
+			forged := sound
+			test.mutate(&forged)
+			payload, _ := json.Marshal(forged)
+			if err := os.WriteFile(filepath.Join(state, scopeID, confineDetachRecordName), payload, 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			records, err := ListConfineDetachRecords(state)
+			if err != nil || len(records) != 1 {
+				t.Fatalf("records=%+v err=%v", records, err)
+			}
+			if records[0].ReadError == "" {
+				t.Fatalf("a record disagreeing with its directory was interpreted: %+v", records[0])
+			}
+			if !strings.Contains(records[0].ReadError, test.want) {
+				t.Fatalf("read error %q does not name the mismatch %q", records[0].ReadError, test.want)
+			}
+			// It must still be SELECTABLE, from the directory's own identity.
+			if records[0].Name != name || records[0].Owner != owner || records[0].Supervisor.PID != pid {
+				t.Fatalf("the directory's authoritative identity was lost: %+v", records[0])
+			}
+		})
+	}
+	// A sound record round-trips.
+	state := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(state, scopeID), 0o700); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	payload, _ := json.Marshal(sound)
+	if err := os.WriteFile(filepath.Join(state, scopeID, confineDetachRecordName), payload, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	records, err := ListConfineDetachRecords(state)
+	if err != nil || len(records) != 1 || records[0].ReadError != "" {
+		t.Fatalf("a sound record was refused: %+v (%v)", records, err)
+	}
+}
+
+// A non-regular record (a FIFO, say) must be refused rather than opened, or a
+// status query blocks forever on a file someone else planted.
+//
+// verifies: AIRA-22
+func TestListConfineDetachRecordsRefusesANonRegularRecord(t *testing.T) {
+	state := t.TempDir()
+	scopeID := confineScopeID("fifo", "session-a", false)
+	if err := os.MkdirAll(filepath.Join(state, scopeID), 0o700); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if err := unix.Mkfifo(filepath.Join(state, scopeID, confineDetachRecordName), 0o600); err != nil {
+		t.Skipf("cannot create a fifo here: %v", err)
+	}
+	done := make(chan []ConfineDetachRecord, 1)
+	go func() {
+		records, _ := ListConfineDetachRecords(state)
+		done <- records
+	}()
+	select {
+	case records := <-done:
+		if len(records) != 1 || records[0].ReadError == "" {
+			t.Fatalf("a fifo was accepted as a record: %+v", records)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reading a fifo record blocked the status query")
 	}
 }
 
@@ -799,22 +1019,21 @@ func cgrouptestIsolatedParent(t *testing.T) string {
 	return cgrouptest.IsolatedScopeParent(t)
 }
 
-// TestSuperviseConfineDetachedWritesATerminalRecordWhenTheLaunchFails proves the
-// detach path preserves the foreground exit contract: a precondition failure is
-// reported to the LAUNCHER with its own code (so `--detach` exits 4, not 0) and
-// is also recorded durably.
-//
-// verifies: AIRA-22
-func TestSuperviseConfineDetachedWritesATerminalRecordWhenTheLaunchFails(t *testing.T) {
-	state := t.TempDir()
-	request := ConfineRequest{
-		// A slice that cannot exist: resolution fails before admission, which is
-		// exactly the class of failure the launch gate must report synchronously.
-		Slice: "aira-nonexistent-" + strconv.Itoa(os.Getpid()) + ".slice",
-		Name:  "failing", Owner: "session-test", Argv: []string{"/bin/true"},
-		DetachStateDir: state, SelfPath: os.Args[0],
-	}
-	control, err := writeControlValue(state, "confine-detach-*.ctrl", request)
+// superviseOutcome is what a subprocess run of the REAL supervisor produced.
+type superviseOutcome struct {
+	message  confineDetachReady
+	exitCode int
+}
+
+// runSuperviseSubprocess runs the production `__confine-supervise` entry point in
+// a SEPARATE process. That isolation is load-bearing rather than stylistic: the
+// supervisor calls signal.Ignore(SIGHUP) and dup2s its own fd 2 onto a log file
+// inside a t.TempDir(), so running it in-process would leave the whole test
+// binary's stderr pointing at a deleted file and SIGHUP ignored for every later
+// test (build review, Fable).
+func runSuperviseSubprocess(t *testing.T, request ConfineRequest, acknowledge bool) superviseOutcome {
+	t.Helper()
+	control, err := writeControlValue(request.DetachStateDir, "confine-detach-*.ctrl", request)
 	if err != nil {
 		t.Fatalf("control: %v", err)
 	}
@@ -826,24 +1045,78 @@ func TestSuperviseConfineDetachedWritesATerminalRecordWhenTheLaunchFails(t *test
 	if err != nil {
 		t.Fatalf("pipe: %v", err)
 	}
-	defer ackW.Close()
-	superviseErr := SuperviseConfineDetached(context.Background(), control, int(readyW.Fd()), int(ackR.Fd()))
+	cmd := exec.Command(os.Args[0], "__confine-supervise", "--control", control, "--ready-fd", "3", "--ack-fd", "4")
+	cmd.Env = append(os.Environ(), fakeSupervisorEnv+"=")
+	cmd.ExtraFiles = []*os.File{readyW, ackR}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start supervisor: %v", err)
+	}
 	_ = readyW.Close()
-	if superviseErr == nil {
-		t.Fatal("an unresolvable slice was supervised as a success")
-	}
+	_ = ackR.Close()
+	decoded := make(chan confineDetachReady, 1)
+	go func() {
+		var message confineDetachReady
+		_ = json.NewDecoder(readyR).Decode(&message)
+		_ = readyR.Close()
+		decoded <- message
+	}()
 	var message confineDetachReady
-	if err := json.NewDecoder(readyR).Decode(&message); err != nil {
-		t.Fatalf("the supervisor reported nothing to its launcher: %v", err)
+	select {
+	case message = <-decoded:
+	case <-time.After(30 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("the supervisor reported nothing")
 	}
-	if message.Code != "E_CONFINE_UNAVAILABLE" {
-		t.Fatalf("the launcher was told %q, not the foreground code E_CONFINE_UNAVAILABLE: %+v", message.Code, message)
+	if acknowledge {
+		// EPIPE is legitimate here: a supervisor that failed a precondition never
+		// reaches the launch gate and so never reads the acknowledgement.
+		if _, err := ackW.Write([]byte{1}); err != nil && !errors.Is(err, syscall.EPIPE) {
+			t.Fatalf("acknowledge: %v", err)
+		}
 	}
+	_ = ackW.Close()
+	waitErr := cmd.Wait()
+	code := 0
+	var exitErr *exec.ExitError
+	if errors.As(waitErr, &exitErr) {
+		code = exitErr.ExitCode()
+	} else if waitErr != nil {
+		t.Fatalf("wait: %v", waitErr)
+	}
+	return superviseOutcome{message: message, exitCode: code}
+}
+
+func soleDetachRecord(t *testing.T, state string) ConfineDetachRecord {
+	t.Helper()
 	records, err := ListConfineDetachRecords(state)
 	if err != nil || len(records) != 1 {
 		t.Fatalf("records = %+v (%v)", records, err)
 	}
-	record := records[0]
+	return records[0]
+}
+
+// TestSuperviseConfineDetachedWritesATerminalRecordWhenTheLaunchFails proves the
+// detach path preserves the foreground exit contract: a precondition failure is
+// reported to the LAUNCHER with its own code (so `--detach` exits 4, not 0) and
+// is also recorded durably.
+//
+// verifies: AIRA-22
+func TestSuperviseConfineDetachedWritesATerminalRecordWhenTheLaunchFails(t *testing.T) {
+	state := t.TempDir()
+	outcome := runSuperviseSubprocess(t, ConfineRequest{
+		// A slice that cannot exist: resolution fails before admission, which is
+		// exactly the class of failure the launch gate must report synchronously.
+		Slice: "aira-nonexistent-" + strconv.Itoa(os.Getpid()) + ".slice",
+		Name:  "failing", Owner: "session-test", Argv: []string{"/bin/true"},
+		DetachStateDir: state, SelfPath: os.Args[0],
+	}, true)
+	if outcome.exitCode == 0 {
+		t.Fatal("an unresolvable slice was supervised as a success")
+	}
+	if outcome.message.Code != "E_CONFINE_UNAVAILABLE" {
+		t.Fatalf("the launcher was told %q, not the foreground code E_CONFINE_UNAVAILABLE: %+v", outcome.message.Code, outcome.message)
+	}
+	record := soleDetachRecord(t, state)
 	if !record.Terminal {
 		t.Fatal("a failed launch left a non-terminal record, which reads as outcome-unknown forever")
 	}
@@ -857,6 +1130,266 @@ func TestSuperviseConfineDetachedWritesATerminalRecordWhenTheLaunchFails(t *test
 	if status.State != ConfineDetachFinished {
 		t.Fatalf("state = %q, want finished", status.State)
 	}
+}
+
+// TestSuperviseConfineDetachedWritesATerminalRecordOnAPanic pins the deferred
+// writer. "Every exit path writes a terminal record" is a claim about a defer,
+// and the only way to test a defer that guards against panics is to panic.
+//
+// verifies: AIRA-22
+func TestSuperviseConfineDetachedWritesATerminalRecordOnAPanic(t *testing.T) {
+	state := t.TempDir()
+	restore := isolateSupervisorSideEffects(t)
+	defer restore()
+	confineDetachAfterRecordHook = func() { panic("injected supervisor panic") }
+	t.Cleanup(func() { confineDetachAfterRecordHook = nil })
+	control, err := writeControlValue(state, "confine-detach-*.ctrl", ConfineRequest{
+		Slice: "aira-nonexistent-" + strconv.Itoa(os.Getpid()) + ".slice",
+		Name:  "panicking", Owner: "session-test", Argv: []string{"/bin/true"},
+		DetachStateDir: state, SelfPath: os.Args[0],
+	})
+	if err != nil {
+		t.Fatalf("control: %v", err)
+	}
+	readyR, readyW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	ackR, ackW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer readyR.Close()
+	defer readyW.Close()
+	defer ackR.Close()
+	defer ackW.Close()
+	// The supervisor wraps the descriptors it is given in its OWN *os.File and
+	// closes them. Handing it dup'd fds keeps that ownership disjoint from the
+	// test's: sharing one fd between two *os.File values is a double close, and a
+	// double close silently corrupts whichever unrelated file later reuses that
+	// descriptor number -- observed as an EBADF in a different test entirely.
+	supervisorReady, err := unix.Dup(int(readyW.Fd()))
+	if err != nil {
+		t.Fatalf("dup: %v", err)
+	}
+	supervisorAck, err := unix.Dup(int(ackR.Fd()))
+	if err != nil {
+		t.Fatalf("dup: %v", err)
+	}
+	func() {
+		defer func() {
+			if recovered := recover(); recovered == nil {
+				t.Error("the supervisor swallowed the panic instead of re-raising it")
+			}
+		}()
+		_ = SuperviseConfineDetached(context.Background(), control, supervisorReady, supervisorAck)
+	}()
+	record := soleDetachRecord(t, state)
+	if !record.Terminal {
+		t.Fatal("a panicking supervisor left a non-terminal record, which reads as outcome-unknown forever")
+	}
+	if record.Exit != nil {
+		t.Fatalf("a panicking supervisor fabricated exit %d", *record.Exit)
+	}
+	if record.ErrorCode != CodeConfineDetachFailed || !strings.Contains(record.Error, "panicked") {
+		t.Fatalf("the record does not name the panic: %+v", record)
+	}
+}
+
+// isolateSupervisorSideEffects lets ONE test run the supervisor in-process (the
+// panic path cannot be injected across a process boundary) without leaking its
+// two process-global side effects into the rest of the package.
+func isolateSupervisorSideEffects(t *testing.T) func() {
+	t.Helper()
+	saved, err := unix.Dup(2)
+	if err != nil {
+		t.Fatalf("dup fd 2: %v", err)
+	}
+	return func() {
+		_ = unix.Dup3(saved, 2, 0)
+		_ = unix.Close(saved)
+		signal.Reset(syscall.SIGHUP)
+	}
+}
+
+// TestRealSupervisorRefusesToRunAnUnacknowledgedJob exercises the PRODUCTION
+// cancel path, not the fake supervisor's re-implementation of it. Without this,
+// a real supervisor that ignored the acknowledgement entirely would pass the
+// suite, and the no-ghost-job property would rest on test-only code.
+//
+// verifies: AIRA-22
+func TestRealSupervisorRefusesToRunAnUnacknowledgedJob(t *testing.T) {
+	parent := cgrouptestIsolatedParent(t)
+	state := t.TempDir()
+	evidence := filepath.Join(t.TempDir(), "the-job-ran")
+	outcome := runSuperviseSubprocess(t, ConfineRequest{
+		Slice: parent, Name: "unacked", Owner: "session-test",
+		Argv:           []string{"/bin/sh", "-c", "touch " + evidence},
+		DetachStateDir: state, SelfPath: os.Args[0],
+		MemoryReserve: 64 << 20, MemoryReservePinned: true,
+	}, false)
+	if outcome.message.ScopeID == "" {
+		t.Fatalf("the supervisor never reached the launch gate: %+v", outcome.message)
+	}
+	if _, err := os.Stat(evidence); err == nil {
+		t.Fatal("an unacknowledged job RAN; a launcher reporting a detach failure would have left a ghost job on the shared slice")
+	}
+	record := soleDetachRecord(t, state)
+	if !record.Terminal || record.ErrorCode != CodeConfineDetachCancelled {
+		t.Fatalf("unacknowledged launch recorded %+v, want a terminal %s", record, CodeConfineDetachCancelled)
+	}
+	if record.Exit != nil {
+		t.Fatalf("a cancelled launch fabricated exit %d", *record.Exit)
+	}
+	if record.Phase != ConfineDetachPhaseAdmitting {
+		t.Fatalf("phase=%q: the cancel must happen at the launch gate, before admission", record.Phase)
+	}
+}
+
+// TestConfineListAndKillTargetTheDetachedSupervisorPID is the §3.2 invariant seen
+// from the DAEMON's side: the pid embedded in the cgroup directory name must be
+// the surviving supervisor's, because that is what `confine --list` publishes,
+// what `confine --kill <pid>` matches, and what the orphan reaper's liveness
+// predicate reads. A launcher-minted id would break all three.
+//
+// verifies: AIRA-22
+func TestConfineListAndKillTargetTheDetachedSupervisorPID(t *testing.T) {
+	parent := cgrouptestIsolatedParent(t)
+	state := t.TempDir()
+	launcher, handle := startDetachLauncher(t, []string{
+		detachStateDirEnv + "=" + state,
+		detachLaunchSliceEnv + "=" + parent,
+		detachLaunchArgvEnv + "=" + strings.Join([]string{"/bin/sh", "-c", "echo started; sleep 10"}, "\x1f"),
+	})
+	if handle.Error != "" {
+		t.Fatalf("launch failed: %s", handle.Error)
+	}
+	_ = syscall.Kill(-launcher.Process.Pid, syscall.SIGKILL)
+	_ = launcher.Wait()
+
+	// Wait until the JOB itself has exec'd and produced output. Killing earlier
+	// would race the confine handshake and terminate the job before it ran, which
+	// is a different (and honestly reported) outcome from the external cgroup
+	// kill this test is about.
+	capture := filepath.Join(handle.RecordDir, confineDetachStdoutName)
+	runningBy := time.Now().Add(30 * time.Second)
+	for time.Now().Before(runningBy) {
+		if data, err := os.ReadFile(capture); err == nil && strings.Contains(string(data), "started") {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Wait for the scope to appear and be populated.
+	var listed ConfineRecord
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		result, err := ListConfines(context.Background(), parent, nil)
+		if err == nil && result.Verdict == "pass" {
+			for _, record := range result.Scopes {
+				if record.ScopeID == handle.ScopeID && record.Populated != nil && *record.Populated > 0 {
+					listed = record
+				}
+			}
+		}
+		if listed.ScopeID != "" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if listed.ScopeID == "" {
+		t.Fatal("the detached job's scope never appeared populated in confine --list")
+	}
+	if listed.SupervisorPID == nil || *listed.SupervisorPID != handle.SupervisorPID {
+		t.Fatalf("confine --list reports supervisor pid %v, but the surviving supervisor is %d; the scope id names the wrong process",
+			listed.SupervisorPID, handle.SupervisorPID)
+	}
+	if listed.Owner != "session-test" {
+		t.Fatalf("owner=%q, want the launching owner", listed.Owner)
+	}
+	// Kill BY SUPERVISOR PID, which is only possible because the surviving
+	// supervisor minted the id.
+	killed, err := KillConfine(context.Background(), parent, strconv.Itoa(handle.SupervisorPID), "session-test", false, nil)
+	if err != nil {
+		t.Fatalf("confine --kill %d: %v", handle.SupervisorPID, err)
+	}
+	if killed.ScopeID != handle.ScopeID {
+		t.Fatalf("killed %q, want %q", killed.ScopeID, handle.ScopeID)
+	}
+	deadline = time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		record := soleDetachRecord(t, state)
+		if !record.Terminal {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		// The killed job must never read as a clean run.
+		if record.Exit != nil && *record.Exit == 0 {
+			t.Fatalf("an externally killed job recorded a clean exit 0: %+v", record)
+		}
+		// The supervisor sent no signal itself and this scope's own memory.events
+		// records no OOM, so the AIRA-70 classifier's verdict for a `confine
+		// --kill` is unattributed-sigkill. It is asserted only when the classifier
+		// ran at all: a kill landing during the launch handshake ends the job
+		// earlier, with an equally honest E_CONFINE_UNAVAILABLE.
+		if record.Status != nil && record.Status.TerminatedBy != "" &&
+			record.Status.TerminatedBy != ConfineTerminatedUnattributedSIGKILL {
+			t.Fatalf("terminated-by=%q, want %q for an external cgroup kill",
+				record.Status.TerminatedBy, ConfineTerminatedUnattributedSIGKILL)
+		}
+		if record.Status == nil || record.Status.TerminatedBy == "" {
+			if record.ErrorCode == "" {
+				t.Fatalf("the killed job recorded neither a termination verdict nor an error: %+v", record)
+			}
+		}
+		return
+	}
+	t.Fatal("the killed detached job never reached a terminal record")
+}
+
+// A detached job exists to outlive hangups, so an explicit SIGHUP to the
+// supervisor must not end it. `confineSignalSource` notifies only SIGINT and
+// SIGTERM, so without the explicit signal.Ignore the default disposition would
+// terminate the supervisor with no teardown at all.
+//
+// verifies: AIRA-22
+func TestDetachedSupervisorIgnoresAnExplicitSIGHUP(t *testing.T) {
+	parent := cgrouptestIsolatedParent(t)
+	state := t.TempDir()
+	launcher, handle := startDetachLauncher(t, []string{
+		detachStateDirEnv + "=" + state,
+		detachLaunchSliceEnv + "=" + parent,
+		detachLaunchArgvEnv + "=" + strings.Join([]string{"/bin/sh", "-c", "sleep 2; echo survived"}, "\x1f"),
+	})
+	if handle.Error != "" {
+		t.Fatalf("launch failed: %s", handle.Error)
+	}
+	_ = syscall.Kill(-launcher.Process.Pid, syscall.SIGKILL)
+	_ = launcher.Wait()
+	// Straight at the supervisor, not at a process group: this is the signal a
+	// terminal hangup or a careless `kill -HUP` delivers.
+	for i := 0; i < 3; i++ {
+		if err := unix.Kill(handle.SupervisorPID, unix.SIGHUP); err != nil {
+			t.Fatalf("SIGHUP: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	deadline := time.Now().Add(45 * time.Second)
+	for time.Now().Before(deadline) {
+		record := soleDetachRecord(t, state)
+		if record.Terminal {
+			if record.Exit == nil || *record.Exit != 0 {
+				t.Fatalf("SIGHUP ended the detached job: %+v", record)
+			}
+			stdout, _ := os.ReadFile(record.StdoutPath)
+			if !strings.Contains(string(stdout), "survived") {
+				t.Fatalf("the job did not run to completion through SIGHUP: %q", stdout)
+			}
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("the detached job never completed after SIGHUP")
 }
 
 // TestConfineDetachEndToEndSurvivesTheLauncherAndCapturesTheOutcome is the real

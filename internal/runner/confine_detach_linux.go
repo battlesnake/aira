@@ -162,6 +162,13 @@ func LaunchConfineDetached(ctx context.Context, request ConfineRequest) (*Confin
 		// uncapped slice exits 4 with E_CONFINE_UNAVAILABLE exactly as the
 		// foreground form does, rather than degrading every launch failure into a
 		// generic detach failure the operator has to go and look up.
+		//
+		// The prefix is APPLIED rather than assumed (build review, Fable): callers
+		// extract the code from the message text, and a detail that does not begin
+		// with its own code would silently map to the exit-1 default.
+		if !strings.HasPrefix(detail, code+":") && detail != code {
+			detail = code + ": " + detail
+		}
 		return nil, errors.New(detail)
 	}
 	dir := filepath.Join(root, message.ScopeID)
@@ -285,7 +292,13 @@ func (job *confineDetachJob) captureSupervisorStderr() {
 	if job.logFile == nil {
 		return
 	}
-	_ = unix.Dup3(int(job.logFile.Fd()), 2, 0)
+	if err := unix.Dup3(int(job.logFile.Fd()), 2, 0); err != nil {
+		// The capture is best effort, but its FAILURE must not be: without it the
+		// supervisor's own crashes go to /dev/null, and a reader of this log would
+		// otherwise take its emptiness as "nothing went wrong".
+		_, _ = fmt.Fprintf(job.logFile, "confine supervisor: could not redirect fd 2 to this log (%v); "+
+			"runtime-fatal errors from this supervisor will not be recorded anywhere\n", err)
+	}
 }
 
 func (job *confineDetachJob) paths() (stdout, stderr, log string) {
@@ -343,6 +356,12 @@ func (job *confineDetachJob) write(record ConfineDetachRecord) error {
 // rename case, which is the only way to prove atomicity deterministically.
 var confineDetachBeforeRenameHook func() error
 
+// confineDetachAfterRecordHook is a test seam for the PANIC path. "Every exit
+// path from the supervisor writes a terminal record" is a claim about a
+// deferred writer, and a claim about a deferred writer can only be tested by
+// making the function it guards panic. Nil in production.
+var confineDetachAfterRecordHook func()
+
 // ListConfineDetachRecords reads every durable record under root. A directory
 // whose record cannot be read or decoded is returned WITH a ReadError rather
 // than dropped: silently omitting it would turn "I cannot tell you" into "there
@@ -363,6 +382,11 @@ func ListConfineDetachRecords(root string) ([]ConfineDetachRecord, error) {
 		}
 		return nil, err
 	}
+	rootFD, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(rootFD)
 	records := make([]ConfineDetachRecord, 0, len(entries))
 	for _, entry := range entries {
 		if entry.Type()&os.ModeSymlink != 0 || !entry.IsDir() {
@@ -376,20 +400,32 @@ func ListConfineDetachRecords(root string) ([]ConfineDetachRecord, error) {
 		if owner == "" {
 			owner = ConfineUnknownOwner
 		}
-		records = append(records, readConfineDetachRecord(filepath.Join(root, scopeID), scopeID, name, owner, pid))
+		records = append(records, readConfineDetachRecord(rootFD, scopeID, name, owner, pid))
 	}
 	sort.Slice(records, func(i, j int) bool { return records[i].ScopeID < records[j].ScopeID })
 	return records, nil
 }
 
-func readConfineDetachRecord(dir, scopeID, name, owner string, pid int) ConfineDetachRecord {
+func readConfineDetachRecord(rootFD int, scopeID, name, owner string, pid int) ConfineDetachRecord {
 	// Identity comes from the DIRECTORY NAME, which is authoritative, so a
 	// record's selector fields stay usable even when its contents are not.
 	fallback := ConfineDetachRecord{
 		ScopeID: scopeID, Name: name, Owner: owner,
 		Supervisor: PIDIdentity{PID: pid},
 	}
-	fd, err := unix.Open(filepath.Join(dir, confineDetachRecordName), unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	// fd-anchored, O_NOFOLLOW at EVERY component. Reopening
+	// "<root>/<scope>/record.json" by pathname would leave the intermediate
+	// scope directory unprotected: swapping it for a symlink between the ReadDir
+	// and the open defeats a final-component-only O_NOFOLLOW (build review, Sol).
+	dirFD, err := unix.Openat(rootFD, scopeID, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		fallback.ReadError = err.Error()
+		return fallback
+	}
+	defer unix.Close(dirFD)
+	// O_NONBLOCK so a planted FIFO cannot block a status query forever; the
+	// regular-file check below then refuses it outright.
+	fd, err := unix.Openat(dirFD, confineDetachRecordName, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		fallback.ReadError = err.Error()
 		return fallback
@@ -401,7 +437,19 @@ func readConfineDetachRecord(dir, scopeID, name, owner string, pid int) ConfineD
 		return fallback
 	}
 	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, 1<<20))
+	info, err := file.Stat()
+	if err != nil {
+		fallback.ReadError = err.Error()
+		return fallback
+	}
+	if !info.Mode().IsRegular() {
+		fallback.ReadError = "record is not a regular file"
+		return fallback
+	}
+	// 8MiB, comfortably above a record carrying a worst-case ARG_MAX argv (2MiB):
+	// a bound that truncated a legitimate record would turn a finished job into
+	// outcome-unknown, which is the wrong direction to be conservative in.
+	data, err := io.ReadAll(io.LimitReader(file, 8<<20))
 	if err != nil {
 		fallback.ReadError = err.Error()
 		return fallback
@@ -411,49 +459,55 @@ func readConfineDetachRecord(dir, scopeID, name, owner string, pid int) ConfineD
 		fallback.ReadError = err.Error()
 		return fallback
 	}
-	if record.ScopeID != scopeID {
-		// A record naming a different scope than the directory it lives in cannot
-		// be trusted to describe either. Refuse to interpret it rather than
-		// reporting one job's outcome under another job's name.
-		fallback.ReadError = fmt.Sprintf("record names scope %q but lives in %q", record.ScopeID, scopeID)
+	// The record's own identity must agree with the DIRECTORY NAME, which is the
+	// authoritative, restart-surviving carrier. A record that disagrees cannot be
+	// trusted to describe either job: a wrong owner would misdirect owner-scoped
+	// selection, and a wrong supervisor pid would have `--status` probe the
+	// liveness of an unrelated process (build review, Sol).
+	if mismatch := confineDetachIdentityMismatch(record, scopeID, name, owner, pid); mismatch != "" {
+		fallback.ReadError = mismatch
 		return fallback
 	}
 	return record
 }
 
-// confineSupervisorAlive is the real liveness probe. It compares the FULL
-// identity: a differing boot id means the machine rebooted and every pid from
-// before it is meaningless, and a differing start tick means the pid was reused
-// by an unrelated process. Anything it cannot read is reported unevaluated, and
-// unevaluated resolves to outcome-unknown -- never to "running".
+func confineDetachIdentityMismatch(record ConfineDetachRecord, scopeID, name, owner string, pid int) string {
+	switch {
+	case record.ScopeID != scopeID:
+		return fmt.Sprintf("record names scope %q but lives in %q", record.ScopeID, scopeID)
+	case record.Name != name:
+		return fmt.Sprintf("record names %q but its scope id carries name %q", record.Name, name)
+	case record.Owner != owner:
+		return fmt.Sprintf("record claims owner %q but its scope id carries owner %q", record.Owner, owner)
+	case record.Supervisor.PID != pid:
+		return fmt.Sprintf("record claims supervisor pid %d but its scope id carries %d", record.Supervisor.PID, pid)
+	}
+	return ""
+}
+
+// confineSupervisorAlive is the real liveness probe. It delegates to processLive
+// rather than re-deriving liveness, which matters for three reasons a
+// hand-rolled probe gets wrong and this one already gets right (build review,
+// Sol): an INCOMPLETE identity -- no boot id or no start tick -- is unevaluated
+// rather than optimistically alive, so a record written before those could be
+// read can never become "running" on a reused pid; a ZOMBIE is DEAD, because a
+// supervisor that has exited without reaping wrote no outcome and never will,
+// even though /proc still answers for it; and an unreadable /proc entry is
+// unevaluated rather than either verdict.
+//
+// One liveness definition for the whole package is also the point: two would be
+// free to disagree about exactly these edges.
 //
 // covers: AIRA-22
 func confineSupervisorAlive(identity PIDIdentity) (bool, bool) {
-	if identity.PID <= 0 {
-		return false, false
-	}
-	boot, bootErr := currentBootID()
-	if bootErr != nil || boot == "" {
-		return false, false
-	}
-	if identity.BootID != "" && identity.BootID != boot {
-		// A pid recorded before a reboot cannot be alive now. This is an
-		// established fact, so it is evaluated.
+	switch processLive(identity) {
+	case processAlive:
+		return true, true
+	case processDead:
 		return false, true
-	}
-	tick := processStartTick(identity.PID)
-	if tick == 0 {
-		// No such process (or /proc says nothing about it). Absence of the
-		// process is itself the answer when the pid is simply gone.
-		if errors.Is(unix.Kill(identity.PID, 0), unix.ESRCH) {
-			return false, true
-		}
+	default:
 		return false, false
 	}
-	if identity.StartTick != 0 && tick != identity.StartTick {
-		return false, true
-	}
-	return true, true
 }
 
 // ConfineDetachStatusFor answers `aira confine --status <selector>` against the
@@ -516,6 +570,16 @@ func SuperviseConfineDetached(ctx context.Context, controlPath string, readyFD, 
 	if err != nil {
 		return report("E_CONFINE_ARGUMENT_INVALID", err)
 	}
+	// A supervisor that cannot establish its OWN identity can never be
+	// liveness-checked, so its record would read `outcome-unknown` for the rest
+	// of its life however the job actually ended. Refuse up front rather than
+	// creating a record nobody can ever interpret — the run path refuses the
+	// same way (E_RUN_IDENTITY_UNAVAILABLE, detach_linux.go).
+	supervisor := PIDIdentity{PID: os.Getpid(), StartTick: processStartTick(os.Getpid()), BootID: bootIDOrEmpty()}
+	if supervisor.StartTick == 0 || supervisor.BootID == "" {
+		return report(CodeConfineDetachFailed, errors.New(CodeConfineDetachFailed+
+			": the supervisor's own process identity is unavailable, so its durable record could never be interpreted"))
+	}
 	job, err := openConfineDetachJob(request.DetachStateDir, scopeID)
 	if err != nil {
 		return report(CodeConfineDetachFailed, fmt.Errorf("%s: open record store: %w", CodeConfineDetachFailed, err))
@@ -529,7 +593,7 @@ func SuperviseConfineDetached(ctx context.Context, controlPath string, readyFD, 
 		Schema: ConfineDetachSchema, ScopeID: scopeID,
 		Name: request.Name, Owner: request.Owner, Argv: append([]string(nil), request.Argv...),
 		Cwd: cwd, DelegateRAM: request.DelegateRAM, EnvDigest: confineEnvironmentDigest(request.Env),
-		Supervisor: PIDIdentity{PID: os.Getpid(), StartTick: processStartTick(os.Getpid()), BootID: bootIDOrEmpty()},
+		Supervisor: supervisor,
 		Phase:      ConfineDetachPhaseStarting, StartedAt: nowString(nil),
 		StdoutPath: stdoutPath, StderrPath: stderrPath, SupervisorLogPath: logPath,
 	}
@@ -545,25 +609,55 @@ func SuperviseConfineDetached(ctx context.Context, controlPath string, readyFD, 
 	if err := job.write(record); err != nil {
 		return report(CodeConfineDetachFailed, fmt.Errorf("%s: write record: %w", CodeConfineDetachFailed, err))
 	}
+	// Once the store exists, EVERY return must terminalize. A supervisor that
+	// returns without an outcome is indistinguishable from one that was killed,
+	// so `--status` would report outcome-unknown forever for a job whose fate the
+	// supervisor actually knew (build review, Sol).
+	terminalWritten := false
+	terminalize := func(code string, cause error) {
+		if terminalWritten {
+			return
+		}
+		record.Terminal, record.EndedAt = true, nowString(nil)
+		if code != "" {
+			record.ErrorCode = code
+		}
+		if cause != nil {
+			record.Error = cause.Error()
+		}
+		if writeErr := job.write(record); writeErr != nil {
+			// Nothing better remains: the outcome is known but unrecordable, which
+			// is exactly the case `--status` must report as outcome-unknown. Say so
+			// where it can still be seen.
+			_, _ = fmt.Fprintf(os.Stderr, "confine supervisor: the terminal record could not be written (%v); the outcome was %s %v\n",
+				writeErr, code, cause)
+			return
+		}
+		terminalWritten = true
+	}
+	fail := func(code string, cause error) error {
+		terminalize(code, cause)
+		return report(code, cause)
+	}
 	// A panic on THIS goroutine still lands a terminal record; a runtime-fatal
 	// crash cannot, which is why supervisor.log exists and why the absence of a
 	// terminal record is reported as outcome-unknown rather than as an outcome.
-	terminalWritten := false
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			if !terminalWritten {
-				record.Terminal, record.EndedAt = true, nowString(nil)
-				record.ErrorCode = CodeConfineDetachFailed
-				record.Error = fmt.Sprintf("the detached supervisor panicked: %v", recovered)
-				_ = job.write(record)
-			}
+			terminalize(CodeConfineDetachFailed, fmt.Errorf("the detached supervisor panicked: %v", recovered))
 			panic(recovered)
 		}
 	}()
+	// Deliberately AFTER the recover defer is installed: the seam exists to prove
+	// that defer writes a terminal record, so panicking before it would prove the
+	// opposite of what the test intends (and did, on first run).
+	if hook := confineDetachAfterRecordHook; hook != nil {
+		hook()
+	}
 
 	devnull, err := os.OpenFile(os.DevNull, os.O_RDONLY, 0)
 	if err != nil {
-		return report(CodeConfineDetachFailed, fmt.Errorf("%s: open /dev/null: %w", CodeConfineDetachFailed, err))
+		return fail(CodeConfineDetachFailed, fmt.Errorf("%s: open /dev/null: %w", CodeConfineDetachFailed, err))
 	}
 	defer devnull.Close()
 
@@ -590,28 +684,38 @@ func SuperviseConfineDetached(ctx context.Context, controlPath string, readyFD, 
 	}
 	request.OnPlaced = func(ConfineLaunchInfo) {
 		record.Phase, record.RunningAt = ConfineDetachPhaseRunning, nowString(nil)
-		_ = job.write(record)
+		// Retried once and then REPORTED, never silently dropped: a lost phase
+		// update leaves the durable record saying `admitting` while the job runs.
+		// That is not a fabricated outcome -- the state vocabulary is explicitly
+		// "the last phase the supervisor RECORDED" -- but it is a real loss of
+		// fidelity, and an operator watching a long job deserves to find the
+		// reason in the supervisor log rather than wonder why it never advanced.
+		if writeErr := job.write(record); writeErr != nil {
+			if retryErr := job.write(record); retryErr != nil {
+				_, _ = fmt.Fprintf(os.Stderr,
+					"confine supervisor: could not record the running phase (%v; retry: %v); --status will keep reporting the last phase written\n",
+					writeErr, retryErr)
+			}
+		}
 	}
 
 	result, confineErr := Confine(ctx, request)
-	record.Terminal, record.EndedAt = true, nowString(nil)
 	status := result.Status
 	record.Status = &status
 	if status.Slice != "" {
 		record.Slice = status.Slice
 	}
+	terminalCode := ""
 	if confineErr != nil {
 		// Exit stays ABSENT whenever Confine returned an error, including errors
 		// raised after the child had already started: a zero would be a fabricated
 		// success and a one a fabricated failure.
-		record.ErrorCode = confineErrorCode(confineErr)
-		record.Error = confineErr.Error()
+		terminalCode = confineErrorCode(confineErr)
 	} else {
 		exit := result.Exit
 		record.Exit = &exit
 	}
-	writeErr := job.write(record)
-	terminalWritten = writeErr == nil
+	terminalize(terminalCode, confineErr)
 	if !announce.sentAlready() {
 		// Confine failed before the launch gate, so the launcher is still waiting.
 		// Give it the real code rather than letting it time out into a generic
@@ -629,7 +733,10 @@ func SuperviseConfineDetached(ctx context.Context, controlPath string, readyFD, 
 	if confineErr != nil {
 		return confineErr
 	}
-	return writeErr
+	if !terminalWritten {
+		return errors.New(CodeConfineDetachFailed + ": the job's outcome could not be recorded durably")
+	}
+	return nil
 }
 
 func bootIDOrEmpty() string {

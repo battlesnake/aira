@@ -60,7 +60,7 @@ func TestResolveConfineDetachStatusNeverFabricatesAnOutcome(t *testing.T) {
 			record:     detachRecord(func(r *ConfineDetachRecord) { r.Phase = ConfineDetachPhaseAdmitting }),
 			probe:      aliveProbe(true, true),
 			want:       ConfineDetachAdmitting,
-			wantReason: "not running yet",
+			wantReason: "had not been placed in its scope",
 		},
 		{
 			name:   "alive supervisor before the launch gate is starting",
@@ -102,6 +102,38 @@ func TestResolveConfineDetachStatusNeverFabricatesAnOutcome(t *testing.T) {
 			probe:      aliveProbe(true, true),
 			want:       ConfineDetachOutcomeUnknown,
 			wantReason: "cannot interpret",
+		},
+		{
+			// Reachable only through corruption or a truncated write, which is
+			// exactly why it must not be reported as an outcome: `finished` with
+			// no exit code and no error code describes nothing.
+			name:       "terminal record carrying no outcome is outcome-unknown, not finished",
+			record:     detachRecord(func(r *ConfineDetachRecord) { r.Terminal = true }),
+			probe:      aliveProbe(false, true),
+			want:       ConfineDetachOutcomeUnknown,
+			wantReason: "neither an exit code nor an error code",
+		},
+		{
+			name:   "terminal record carrying only an error code is finished",
+			record: detachRecord(func(r *ConfineDetachRecord) { r.Terminal = true; r.ErrorCode = "E_CONFINE_UNAVAILABLE" }),
+			probe:  aliveProbe(false, true),
+			want:   ConfineDetachFinished,
+		},
+		{
+			// A fourth phase does not exist: every record a supervisor writes
+			// carries one of the three known ones, starting with `starting`.
+			name:       "unrecognised phase is outcome-unknown, not silently treated as starting",
+			record:     detachRecord(func(r *ConfineDetachRecord) { r.Phase = "wat" }),
+			probe:      aliveProbe(true, true),
+			want:       ConfineDetachOutcomeUnknown,
+			wantReason: "unrecognised phase",
+		},
+		{
+			name:       "empty phase is outcome-unknown",
+			record:     detachRecord(func(r *ConfineDetachRecord) { r.Phase = "" }),
+			probe:      aliveProbe(true, true),
+			want:       ConfineDetachOutcomeUnknown,
+			wantReason: "unrecognised phase",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -165,8 +197,9 @@ func TestFormatConfineDetachStatusAlwaysPrintsTheCapturePaths(t *testing.T) {
 
 // verifies: AIRA-22
 func TestResolveConfineDetachStatusRefusesAnAmbiguousSelectorAndNamesTheCandidates(t *testing.T) {
+	exitZero := 0
 	first := detachRecord(func(r *ConfineDetachRecord) {
-		r.ScopeID, r.StartedAt, r.Terminal = "CONFINE-gate-11-aaa@session-a", "2026-09-05T09:00:00Z", true
+		r.ScopeID, r.StartedAt, r.Terminal, r.Exit = "CONFINE-gate-11-aaa@session-a", "2026-09-05T09:00:00Z", true, &exitZero
 	})
 	second := detachRecord(func(r *ConfineDetachRecord) {
 		r.ScopeID, r.StartedAt = "CONFINE-gate-22-bbb@session-a", "2026-09-05T10:00:00Z"

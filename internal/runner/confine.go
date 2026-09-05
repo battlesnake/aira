@@ -187,10 +187,12 @@ type ConfineStatus struct {
 	ReserveBasis         string                    `json:"reserve_basis,omitempty"`
 	PeakRSS              *int64                    `json:"peak_rss,omitempty"`
 	// TerminatedBy is the terminal-attribution facet (AIRA-70, AIRA-91 Part A).
+	// It carries a json tag like its siblings because AIRA-22's durable record
+	// stores this struct, and this is the facet such a record most needs.
 	// Empty means the classifier never ran -- every launch that failed before
 	// the child was waited on -- and renders as "unevaluated", never as a claim
 	// that the job ended cleanly.
-	TerminatedBy string
+	TerminatedBy string `json:"terminated_by,omitempty"`
 }
 
 // The terminal-attribution vocabulary. Each value names exactly what its
