@@ -44,26 +44,31 @@ jobs:
       # rest of the pure-Go suite runs.
       - name: go test
         run: make test
-      # NOTE: no `-race` job here on purpose. The repo's gate is `make ci`
-      # (build + vet + gofmt + test, no -race); `make race` is a local dev
-      # target. Under -race's slowdown on a shared CI runner, tests with
-      # wall-clock latency assertions flake despite there being no actual data
-      # race.
+
+  race:
+    name: race
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # AIRA-20. Every wall-clock deadline in internal/runner, internal/daemon
+      # and internal/pylib now routes through internal/testdeadline: a liveness
+      # backstop ("did this ever happen?") floors at 5s and scales by a further
+      # 4x under -race; a latency assertion ("was this prompt?") scales without
+      # a floor; a negative wait ("did this correctly NOT happen?") is left as
+      # plain time.After, since contention delays the subject and the timer
+      # alike. governor_slot_test.go, the one file AIRA-20 deliberately left
+      # unhardened, was deleted whole by AIRA-33 along with the one test this
+      # job could not honestly pass (TestRealPytestRAMForkDoesNotPinHelperStdin,
+      # load-flaky on production code — a hardcoded process.wait(timeout=1.0) in
+      # the xdist governor — inside AIRA-33's own deletion scope).
       #
-      # AIRA-20's hardening pass has LANDED, so that half of the precondition is
-      # met: every deadline in internal/runner, internal/daemon and
-      # internal/pylib now goes through internal/testdeadline, which scales by 4x
-      # under -race, and `make race` is green on internal/daemon and
-      # internal/runner locally.
-      #
-      # AIRA-33 has LANDED, which clears the named blocker: the one remaining
-      # flake was TestRealPytestRAMForkDoesNotPinHelperStdin, load-flaky on a
-      # hardcoded process.wait(timeout=1.0) inside the xdist governor, and that
-      # test and that production code were both deleted with the plugin.
-      #
-      # This job is still NOT re-added here, deliberately. Turning -race on is
-      # AIRA-20's own ticket, and AIRA-20 records further wall-clock-tight tests
-      # in internal/runner beyond the one AIRA-33 removed. Enabling it in the
-      # deletion PR would be claiming green for a suite whose flake inventory
-      # nobody has re-measured — exactly what the paragraph above forbids. What
-      # remains is AIRA-20's measurement, not a blocked precondition.
+      # Real-cgroup tests (SkipOrFailRealCgroup) and real-pytest tests
+      # (requireRealPytest) skip here exactly as in the `test` job above: this
+      # runner has no delegated memory controller to hand them, and
+      # AIRA_REAL_CGROUP / AIRA_REAL_PYTEST are unset.
+      - name: go test -race
+        run: make race
