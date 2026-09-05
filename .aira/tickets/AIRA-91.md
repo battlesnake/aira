@@ -579,4 +579,74 @@ as strong a confirmation as this investigation is going to get without
 manufacturing artificial load. **Root cause is closed: `systemd-oomd`
 whole-scope kill under real memory pressure, exit 137, never exit 0.**
 
-## Status: root cause closed. Remaining work is Part A (build) and Part B (owner decision) above.
+## CRITICAL: Part A's in-progress build has a bug that defeats it for AIRA-91's own target case (2026-09-05)
+
+An independent `/code-review high` pass against Part A's working branch (still
+mid-build, not yet a PR -- the review completed but, per the now-familiar
+nested-agent-dispatch routing quirk (see AIRA-95), its findings routed to the
+coordinating session rather than back to the build agent; being recorded here
+so it cannot be lost regardless of what happens to that specific build
+attempt) found something that must be fixed, or explicitly re-verified as
+fixed, before Part A is considered done. **Verified empirically against real
+cgroups on this host (kernel 6.18), not inferred from documentation.**
+
+**The `oom` branch of the new `terminated-by=` classifier never fires in the
+exact delegate-RAM/aitest layout AIRA-91 itself is about.** `memory.events.local`'s
+`oom_kill` is attributed to the cgroup that was OOM-killed, not to the cgroup
+whose `memory.max` fired. `drainIntoScope`
+(`internal/runner/aitest_bootstrap_linux.go:117`) moves *every* pid, leader
+included, out of the outer scope into `<outer>/.aira-supervisor`. So when the
+OUTER scope's own cap is what actually fires (exactly AIRA-91's scenario:
+`systemd-oomd`/kernel OOM killing the whole tree because the job overran its
+own limit), the outer scope's *own* `memory.events.local` shows `oom_kill=0`
+-- the kill happened to processes now living in the child scope -- and the
+classifier reports `terminated-by=unattributed-sigkill` instead of `oom`.
+Measured directly on this host (parent `memory.max=16M`, `oom.group=1`,
+victim moved into an uncapped child):
+
+```
+parent memory.events        : oom 1  oom_kill 2  oom_group_kill 1
+parent memory.events.local  : oom 1  oom_kill 0  oom_group_kill 1   <-- classifier reads oom_kill == 0
+child  memory.events.local  : oom 0  oom_kill 2  oom_group_kill 0
+```
+
+**This means Part A, as currently built, would not actually fix AIRA-91's
+own honesty gap for the case that matters most** -- a real memory-pressure
+kill of an aitest/delegate-RAM job would still report an unhelpful
+"externally killed, cause unknown" rather than correctly saying "this job
+was killed at its own memory limit."
+
+**Compounding findings from the same review, same severity class:**
+- The new hierarchical-disagreement clause actively asserts a **false** cause
+  in this exact case (blames "something beneath this scope hit its own
+  limit" when the *opposite* is measured -- the child's local `oom` is 0,
+  the parent's is 1).
+- The documented invariant for `OOMKillLocal` ("rises only for an OOM at
+  THIS scope's own limit") is itself false: measured that an **ancestor's**
+  OOM also raises a *descendant* scope's local `oom_kill` counter. This is
+  the inverse problem to the one above and independently a first-class AIRA
+  failure mode (AIRA-27 delegate-ram slice-OOM collateral) -- a neighbouring
+  job's slice-level OOM could kill an ordinary confine job's leader and
+  report `terminated-by=oom`, read by an operator as "my own job hit its own
+  cap" when it didn't.
+- The `unattributed-sigkill` vocabulary's own candidate list is therefore
+  wrong in both directions and needs re-deriving from the corrected
+  attribution rule, not patched at the margins.
+- Separately, in the same review: a Ctrl-C handler ordering regression
+  (`interrupted.Store(true)` now runs *after* a blocking diagnostic write
+  instead of before it -- a chatty job on a slow terminal can delay the
+  kill), a kernel<5.2 gap that silently degrades every SIGKILL to
+  `unevaluated` with no diagnostic saying why, and -- important for trusting
+  CI here at all -- **the tests that would catch a regression in this exact
+  read are skipped unless `AIRA_REAL_CGROUP=1`**, so the default suite stays
+  green even if the whole feature silently breaks.
+
+**Action needed:** when Part A's build agent reports completion (PR opened
+or otherwise), before merging, confirm this specific empirical scenario
+(outer-scope-cap-fires-while-leader-has-been-drained-into-a-child-scope) is
+actually fixed and covered by an unconditional (not `AIRA_REAL_CGROUP`-gated)
+test, not just that the reviewer's literal repro line numbers were patched.
+This is not a nice-to-have refinement -- it is the exact case this whole
+investigation exists to fix.
+
+## Status: root cause closed. Part A build in progress, with the critical gap above outstanding. Part B remains an owner decision.
