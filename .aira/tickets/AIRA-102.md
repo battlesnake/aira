@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-102","project":"aira","title":"Docker containers structurally escape aira.slice — no admission accounting, no aggregate memory cap","status":"planned","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["confine","docker","dogfood","memory-safety"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-102","project":"aira","title":"Docker containers structurally escape aira.slice — no admission accounting, no aggregate memory cap","status":"in-progress","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["confine","docker","dogfood","memory-safety"],"hold":false,"relations":[]}
 ---
 Prompted by the owner asking whether dockerised jobs can be placed into `aira.slice` for accounting/memory limits, and independently confirmed by peer session `field` from a live benchmark (structural reasoning) and by the coordinating session (empirical test against this actual machine). This ticket records the safety finding; the accounting/benchmarking question itself is a separate, harder design question left for a follow-up decision (see bottom).
 
