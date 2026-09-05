@@ -81,6 +81,64 @@ anything that needs AIRA's containment, leaving Docker (and its 34
 currently-running containers) completely undisturbed, rather than either
 touching Docker's global cgroup driver or standing up a second slice.
 
+## Owner-directed remedy (2026-09-05) — two-part, now being built
+
+**Part 1 — Podman transparent integration, the preferred path.** When
+`aira confine [flags] -- podman run ...` is detected, `aira confine`
+manages podman as necessary so containment "just works" without the
+caller needing to know about `--cgroup-parent` or any podman-specific
+detail: derive and inject the right `--cgroup-parent` automatically
+(ideally nested inside THAT job's own confine scope, not just the bare
+slice — resolve the open question above about whether podman/systemd
+support that nesting; fall back to the bare-slice form, already verified
+working, if per-job nesting proves infeasible), and reconcile podman's own
+`--memory`/`-m` the same way Part 2 describes for docker.
+
+**Part 2 — Docker sanity shim, for stragglers who still invoke `docker run`
+directly.** This does NOT fix the structural escape (a docker container
+still will not be nested in `aira.slice` — that finding is unchanged) —
+it is explicitly a best-effort consistency/accounting improvement, and its
+own output must say so plainly rather than imply real containment (the
+exact "silent success masking failure" trap `field` warned about must not
+be recreated by this shim itself). When `aira confine [flags] -- docker
+run ...` is detected:
+- confine has an explicit memory limit, docker's own argv has none →
+  inject the equivalent `--memory=<value>` into the wrapped docker
+  invocation, so at least the container's own individual cap matches what
+  the caller asked confine for.
+- docker's argv already specifies `--memory`/`-m`, confine has no explicit
+  limit → use that value to inform an admission-ledger reservation (the
+  existing `confine-reserve`-shaped mechanism, or its internal equivalent),
+  so AIRA's own accounting is not blind to a footprint it already knows
+  about.
+- both specify limits and they disagree → needs a plan decision: this
+  project's own fail-closed-over-fake-pass discipline argues for refusing
+  rather than silently picking one, but the plan should weigh that against
+  usability and say which it chose and why.
+- neither specifies a limit → still emit the same honest warning as an
+  otherwise-undetected `docker run` would get, since injecting nothing
+  changes nothing about the underlying escape.
+
+**Both parts need a real design pass, not just described here — flagged as
+non-trivial themselves:**
+- Parsing another program's argv for its memory flags accurately (`--memory=4g`
+  vs `--memory 4g` vs `-m4g` vs `-m 4g`, flags before/after other tokens,
+  not misparsing an unrelated flag's value) without building a full
+  docker/podman CLI parser — the plan should pick a deliberately narrow,
+  conservative approach and report `unevaluated`/refuse on genuine
+  ambiguity rather than guess, matching this project's existing honesty
+  discipline elsewhere.
+- Scope is `docker run` / `podman run` only — `compose`/`podman-compose`
+  and any invocation where the runtime is hidden inside an opaque shell
+  string (`sh -c "docker run ..."`) are explicitly OUT of scope; detection
+  only fires when `docker`/`podman` is literally the wrapped argv's own
+  `argv[0]` after confine's `--` separator.
+- Whatever confine does here must be visible on its own trailer output
+  (what runtime was detected, what was injected or reserved, or that
+  nothing could be established) — matching the `terminated-by=` precedent
+  (AIRA-70/91 Part A) for "the tool tells you honestly what it actually
+  did," not a silent behind-the-scenes rewrite.
+
 ## Relation to AIRA-101 and AIRA-100
 
 Distinct from **AIRA-100** (build subprocesses spawned transiently *inside* a test body, invisible to aitest's worker-pool governance) — this is about **standalone, often long-lived** containers with no governing job at all, and the exposure is unbounded aggregate rather than one over-permissive worker. Also relevant to **AIRA-101** (exclusive slice access for benchmarking): even a working exclusive-slice mechanism cannot and will not exclude a running container, since containers are structurally outside `aira.slice` regardless — AIRA-101's own design should say this plainly rather than let a user assume exclusivity covers containers too.
