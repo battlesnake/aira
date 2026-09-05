@@ -113,6 +113,67 @@ func (u cgroupUsage) LocalOOM() (killed bool, evaluated bool) {
 	return false, true
 }
 
+// ConfineOOMAttribution names WHOSE memory limit the OOM kills recorded under
+// this scope are attributable to (AIRA-102).
+//
+// It exists because the operator-facing advisory used to be gated on the raw
+// HIERARCHICAL `memory.events` oom_kill, which counts kills anywhere in the
+// subtree. That made confine print "job OOM-killed at its memory cap <cap>" for
+// a job that exited 0 whose CONTAINER hit its own `--memory` -- measured live
+// while building AIRA-102. Container nesting turns that from a rare misreport
+// into a routine one, so the attribution is now classified rather than assumed.
+//
+// Every branch reports only what its counters establish, and there is no silent
+// branch: an OOM under this scope always produces some line.
+type ConfineOOMAttribution string
+
+const (
+	// ConfineOOMNone: no OOM kill is recorded under this scope at all.
+	ConfineOOMNone ConfineOOMAttribution = ""
+	// ConfineOOMOwnLimit: THIS scope's own memory.max fired and killed our
+	// processes. The only case that may say "at its memory cap".
+	ConfineOOMOwnLimit ConfineOOMAttribution = "own-limit"
+	// ConfineOOMDescendant: kills happened beneath this scope but the OOM killer
+	// killed nothing belonging to this scope itself -- a descendant's own limit,
+	// e.g. a container's --memory.
+	ConfineOOMDescendant ConfineOOMAttribution = "descendant"
+	// ConfineOOMAncestor: our processes were killed, but our own limit did not
+	// declare the breach -- an ancestor's cap fired and we were the collateral
+	// (the AIRA-27 slice-OOM shape). Reporting this as "at its memory cap" would
+	// send an operator to raise a cap that was never the binding one.
+	ConfineOOMAncestor ConfineOOMAttribution = "ancestor"
+	// ConfineOOMUnestablished: an OOM kill occurred under this scope but
+	// memory.events.local could not be read, so whose limit fired cannot be
+	// established. Never a fabricated attribution.
+	ConfineOOMUnestablished ConfineOOMAttribution = "unestablished"
+)
+
+// classifyConfineOOM is the single attribution decision. It deliberately reads
+// the hierarchical counter FIRST as the "did anything die under here at all"
+// gate, then narrows with the local counters.
+//
+// covers: AIRA-102
+func classifyConfineOOM(usage cgroupUsage) ConfineOOMAttribution {
+	if usage.OOMKill == nil || *usage.OOMKill <= 0 {
+		return ConfineOOMNone
+	}
+	killed, evaluated := usage.LocalOOM()
+	if !evaluated {
+		return ConfineOOMUnestablished
+	}
+	if !killed {
+		return ConfineOOMDescendant
+	}
+	own, ownEvaluated := usage.OwnLimitOOM()
+	if !ownEvaluated {
+		return ConfineOOMUnestablished
+	}
+	if own {
+		return ConfineOOMOwnLimit
+	}
+	return ConfineOOMAncestor
+}
+
 func readCgroupUsage(scopePath string) cgroupUsage {
 	var usage cgroupUsage
 	if scopePath == "" {

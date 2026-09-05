@@ -193,6 +193,18 @@ type ConfineStatus struct {
 	// the child was waited on -- and renders as "unevaluated", never as a claim
 	// that the job ended cleanly.
 	TerminatedBy string `json:"terminated_by,omitempty"`
+	// Container and ContainerMemory are AIRA-102's container-integration facets.
+	// They are ABSENT unless a `docker run`/`podman run` was detected, so every
+	// ordinary trailer is byte-identical to before -- the same discipline the
+	// Exclusive facet below follows. json tags because AIRA-22's durable detached
+	// record stores this struct.
+	//
+	// Container names the ACTION confine took, never an outcome it did not
+	// observe: injecting `--cgroups=split` establishes that AIRA asked podman to
+	// nest the container, not that podman honoured it (an absent or pre-2.0
+	// podman rejects the flag and exits).
+	Container       string `json:"container,omitempty"`
+	ContainerMemory string `json:"container_memory,omitempty"`
 	// Exclusive is AIRA-101's must-know result: whether this run actually had the
 	// slice to itself. Empty for a run that never asked; otherwise one of the
 	// ConfineExclusive* values below.
@@ -555,6 +567,15 @@ func FormatConfineStatus(status ConfineStatus) string {
 		terminated = ConfineTerminatedUnevaluated
 	}
 	line += " terminated-by=" + terminated
+	// AIRA-102, on the same absent-unless-relevant discipline as the exclusive
+	// facet below: rendered only when a container runtime was actually detected,
+	// so every trailer for an ordinary job is unchanged.
+	if status.Container != "" {
+		line += " container=" + status.Container
+	}
+	if status.ContainerMemory != "" {
+		line += " container-memory=" + status.ContainerMemory
+	}
 	// AIRA-101, on exactly the same always-rendered discipline as terminated-by
 	// above and for the same reason: a contended benchmark whose trailer is
 	// byte-identical to an uncontended one is the silence this facet exists to
