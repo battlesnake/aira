@@ -760,7 +760,11 @@ func parseConfineArgs(argv []string) ([]string, map[string]string, error) {
 			return nil, nil, errors.New("E_CONFINE_ARGUMENT_INVALID: confine options must precede the launch delimiter")
 		}
 		name := strings.TrimPrefix(arg, "--")
-		if name == "delegate-ram" || name == "detach" {
+		// AIRA-101 adds --exclusive here, in the VALUELESS branch and only in the
+		// launch form. parseConfineManagementArgs keeps rejecting it, so `aira
+		// confine --exclusive` with no `--` argv is an argument error rather than a
+		// silently ignored no-op on a --list/--kill invocation.
+		if name == "delegate-ram" || name == "detach" || name == "exclusive" {
 			if _, exists := options[name]; exists {
 				return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s may occur once", name)
 			}
@@ -1062,6 +1066,7 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		Owner:         owner,
 		MemoryReserve: reserve, MemoryReservePinned: reservePinned,
 		DelegateRAM:    options["delegate-ram"] == "true",
+		Exclusive:      options["exclusive"] == "true",
 		ScopeMemoryMax: maximum, ScopeMemoryHigh: high,
 		AdmissionMaxWait: admitTimeout,
 		Stdin:            stdin, Stdout: stdout, Stderr: stderr,
@@ -2623,6 +2628,32 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 			}
 			_, _ = fmt.Fprintf(stdout, "slice queue: %d queued %s, freeze %s%s\n",
 				result.SliceReserve.Queued, waiterLabel, result.SliceReserve.FreezePhase, note)
+		}
+		// AIRA-101. Why a job is waiting when the slice looks far from full: a
+		// benchmark has asked to run alone. Printed UNCONDITIONALLY, including the
+		// "none" case, on the same reasoning as the lines around it — a line that
+		// vanished when no exclusivity was active would be indistinguishable from a
+		// line that vanished because the daemon predates the feature, so an
+		// operator could not use its absence to rule a benchmark out.
+		//
+		// The whole block is already inside `SliceReserve != nil`, which is what
+		// keeps this honest when nothing can be established: the daemon-down local
+		// fallback produces no SliceReserve at all, and printing "none" there would
+		// state a fact nobody checked.
+		if exclusive := result.SliceReserve.Exclusive; exclusive == nil {
+			_, _ = fmt.Fprintln(stdout, "slice exclusive: none")
+		} else {
+			verb := "held by"
+			if exclusive.State == "draining" {
+				verb = "draining for"
+			}
+			owner := exclusive.Owner
+			if strings.TrimSpace(owner) == "" {
+				owner = "unknown owner"
+			}
+			_, _ = fmt.Fprintf(stdout, "slice exclusive: %s %q (%s), %d %s waiting\n",
+				verb, exclusive.Name, owner,
+				exclusive.WaitingJobs, confinePlural(exclusive.WaitingJobs, "job", "jobs"))
 		}
 		// AIRA-68. The job count above spans three populations and the table above
 		// THAT lists only scopes, so the two are not comparable — reading them

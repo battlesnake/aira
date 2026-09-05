@@ -89,6 +89,13 @@ var ExitCodes = map[string]int{
 	// changes no behaviour; whether either deserves its own bucket the way
 	// E_ADMIT_WAIT_TOO_LONG does is a contract decision, not this move (AIRA-87).
 	"E_ADMIT_TOO_LARGE": 1, "E_ADMIT_SATURATED": 1,
+	// AIRA-101's two exclusive-admission refusals. E_ADMIT_EXCLUSIVE_ACTIVE is an
+	// ordinary refusal — another benchmark holds the slice, retry later — so it
+	// takes 1. U_ADMIT_EXCLUSIVE_UNESTABLISHED exits 3 with the rest of the U_
+	// vocabulary because it is genuinely UNEVALUATED: the daemon could not read
+	// the slice to establish emptiness, which is not the same claim as "the slice
+	// is busy" and must never be reported as one.
+	"E_ADMIT_EXCLUSIVE_ACTIVE": 1, "U_ADMIT_EXCLUSIVE_UNESTABLISHED": 3,
 	"E_CONFINE_OWNER_UNVERIFIED": 1, "E_CONFINE_NOT_FOUND": 2,
 	"U_CONFINE_NOT_LAUNCHED": 3, "U_CONFINE_KILL_UNCONFIRMED": 3,
 	// AIRA-22's detached confine surface, mirroring the run-detach pair

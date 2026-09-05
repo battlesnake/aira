@@ -193,7 +193,44 @@ type ConfineStatus struct {
 	// the child was waited on -- and renders as "unevaluated", never as a claim
 	// that the job ended cleanly.
 	TerminatedBy string `json:"terminated_by,omitempty"`
+	// Exclusive is AIRA-101's must-know result: whether this run actually had the
+	// slice to itself. Empty for a run that never asked; otherwise one of the
+	// ConfineExclusive* values below.
+	//
+	// It exists because of a real incident: an hour of benchmark throughput
+	// numbers was invalidated by contention nobody noticed. A run that quietly
+	// loses exclusivity produces numbers that LOOK clean, so the outcome has to
+	// travel on the exit path where a harness can read it, not merely in prose.
+	//
+	// ExclusiveDrainedMS is how long the job waited for the slice to drain — the
+	// acquisition condition, carried with the result rather than left to the
+	// operator's memory.
+	Exclusive          string `json:"exclusive,omitempty"`
+	ExclusiveDrainedMS int64  `json:"exclusive_drained_ms,omitempty"`
 }
+
+// The exclusivity-outcome vocabulary (AIRA-101). Rendered on the trailer
+// whenever --exclusive was requested, in the same always-rendered discipline as
+// TerminatedBy: before that facet existed a SIGKILLed job's trailer was
+// byte-identical to a clean one's, and the same trap applies here — a contended
+// benchmark whose trailer looks like an uncontended one is precisely the failure
+// this facet exists to end.
+const (
+	// ConfineExclusiveGranted: the daemon granted exclusivity and the lease was
+	// still held at teardown. As uncontended as this primitive can establish —
+	// subject to the documented coverage limits (processes placed in the slice by
+	// hand, and Docker containers, which live outside the slice entirely).
+	ConfineExclusiveGranted = "granted"
+	// ConfineExclusiveLost: exclusivity WAS granted, then the admission lease
+	// closed mid-run (a daemon restart or stop). The job was no longer scheduled
+	// alone; treat any measurement from it as contended. Never a reason to kill
+	// the job — killing a benchmark because the daemon restarted is worse than
+	// reporting it.
+	ConfineExclusiveLost = "lost"
+	// ConfineExclusiveUnevaluated: exclusivity was requested and the outcome could
+	// not be established. Never rendered as "granted" by default.
+	ConfineExclusiveUnevaluated = "unevaluated"
+)
 
 // The terminal-attribution vocabulary. Each value names exactly what its
 // evidence establishes and nothing further; classifyConfineTermination
@@ -246,16 +283,22 @@ type ConfineRequest struct {
 	MemoryReserve       int64
 	MemoryReservePinned bool
 	DelegateRAM         bool
-	ScopeMemoryMax      int64
-	ScopeMemoryHigh     int64
-	AdmissionMaxWait    time.Duration
-	PollInterval        time.Duration
-	HandshakeTimeout    time.Duration
-	Stdin               io.Reader `json:"-"`
-	Stdout              io.Writer `json:"-"`
-	Stderr              io.Writer `json:"-"`
-	SelfPath            string
-	ResourceSignature   string
+	// AIRA-101. Exclusive asks the daemon to schedule this job ALONE in its slice,
+	// for uncontended benchmarking. Fail-closed end to end: if exclusivity cannot
+	// be established the launch is REFUSED, never silently downgraded, because a
+	// benchmark that runs contended while believing otherwise produces numbers
+	// that look clean — the incident this flag exists to prevent.
+	Exclusive         bool
+	ScopeMemoryMax    int64
+	ScopeMemoryHigh   int64
+	AdmissionMaxWait  time.Duration
+	PollInterval      time.Duration
+	HandshakeTimeout  time.Duration
+	Stdin             io.Reader `json:"-"`
+	Stdout            io.Writer `json:"-"`
+	Stderr            io.Writer `json:"-"`
+	SelfPath          string
+	ResourceSignature string
 	// DetachStateDir is the durable record-store root a detached launch writes
 	// under (AIRA-22). The runner never derives it: internal/runner must not
 	// import internal/daemon, so the CLI transcribes it exactly as it already
@@ -512,6 +555,24 @@ func FormatConfineStatus(status ConfineStatus) string {
 		terminated = ConfineTerminatedUnevaluated
 	}
 	line += " terminated-by=" + terminated
+	// AIRA-101, on exactly the same always-rendered discipline as terminated-by
+	// above and for the same reason: a contended benchmark whose trailer is
+	// byte-identical to an uncontended one is the silence this facet exists to
+	// end. Rendered whenever exclusivity was REQUESTED — including when the
+	// outcome could not be established, which reads as unevaluated and never as
+	// granted.
+	//
+	// Absent entirely when --exclusive was not asked for, so ordinary confine
+	// trailers are unchanged.
+	if status.Exclusive != "" {
+		line += " exclusive=" + status.Exclusive
+		// The acquisition condition travels with the result. Only meaningful for a
+		// run that actually got the slice; a lost or unevaluated run has no honest
+		// drain figure to report.
+		if status.Exclusive == ConfineExclusiveGranted && status.ExclusiveDrainedMS > 0 {
+			line += " drained-for=" + (time.Duration(status.ExclusiveDrainedMS) * time.Millisecond).Round(time.Second).String()
+		}
+	}
 	return line
 }
 

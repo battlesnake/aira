@@ -137,6 +137,18 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				ResidualJobs:     snapshot.residualJobs(),
 				ResidualBytes:    snapshot.residualBytes(),
 			}
+			// AIRA-101, from the SAME snapshot, so the exclusive holder and the
+			// counts above can never describe different instants. Left nil when
+			// nothing is exclusive: a positive "none", never an unevaluated reading.
+			if snapshot.exclusiveState != "" {
+				result.SliceReserve.Exclusive = &runner.ConfineExclusiveState{
+					State:       snapshot.exclusiveState,
+					Name:        snapshot.exclusiveName,
+					Owner:       snapshot.exclusiveOwner,
+					ScopeID:     snapshot.exclusiveScopeID,
+					WaitingJobs: snapshot.exclusiveWaiting,
+				}
+			}
 		}
 		return core.Response{OK: true, Code: "OK", Data: result}
 	case "confine-kill":

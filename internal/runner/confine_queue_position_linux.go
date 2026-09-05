@@ -27,6 +27,16 @@ type confineQueuePosition struct {
 	position   int
 	queued     int
 	aheadBytes int64
+	// AIRA-101. WHY this job is waiting, when the reason is not ordinary
+	// contention: a benchmark has asked for the slice to itself. Empty when no
+	// exclusivity is active — established by the daemon in the same locked pass as
+	// the position above, so it is a fact rather than an unknown.
+	//
+	// An operator waiting behind a drain needs to know a benchmark is running,
+	// not conclude the machine is merely full and go looking for the wrong thing.
+	exclusiveState string
+	exclusiveName  string
+	exclusiveOwner string
 }
 
 // confineQueueProbeTimeout bounds one probe. It is deliberately far shorter
@@ -96,8 +106,23 @@ func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequ
 	position, ok := deps.queuePosition(probeCtx, request, slicePath)
 	cancelProbe()
 	<-watcherStopped
-	if !ok || position.position <= 0 || position.queued < position.position {
+	if !ok {
 		return ""
+	}
+	// AIRA-101. The exclusivity clause stands on its own. A job blocked behind a
+	// drain often has NO queue position to report — during a hold it may be the
+	// only waiter, and a position of "1 of 1" explains nothing — so tying this
+	// clause to a valid position would hide the one fact that actually explains
+	// the wait.
+	exclusiveNote := ""
+	switch position.exclusiveState {
+	case "draining":
+		exclusiveNote = ", slice draining for exclusive job " + describeExclusiveJob(position)
+	case "held":
+		exclusiveNote = ", slice held exclusively by " + describeExclusiveJob(position)
+	}
+	if position.position <= 0 || position.queued < position.position {
+		return exclusiveNote
 	}
 	// A known-zero ahead-figure is the head of the queue and must read as the
 	// fact it is; FormatConfineBytes renders any non-positive value as
@@ -113,7 +138,24 @@ func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequ
 	// waiters in front — the reserve already GRANTED to running jobs is much
 	// larger and is not in it; a bare "reserved ahead" invites reading it as
 	// "the memory standing between me and admission", which it is not.
-	return fmt.Sprintf(", queue position %d of %d by enqueue order, %s queued ahead", position.position, position.queued, ahead)
+	return fmt.Sprintf(", queue position %d of %d by enqueue order, %s queued ahead%s", position.position, position.queued, ahead, exclusiveNote)
+}
+
+// describeExclusiveJob names the exclusive job for the progress line. An unnamed
+// or unowned holder is described as such rather than rendered as an empty pair
+// of quotes, which would read as a bug in the line rather than as missing detail.
+func describeExclusiveJob(position confineQueuePosition) string {
+	name := strings.TrimSpace(position.exclusiveName)
+	if name == "" {
+		name = "an unnamed job"
+	} else {
+		name = fmt.Sprintf("%q", name)
+	}
+	owner := strings.TrimSpace(position.exclusiveOwner)
+	if owner == "" {
+		return name
+	}
+	return name + " (" + owner + ")"
 }
 
 // confineQueuePositionFromDaemon asks the daemon, over its OWN short-lived
@@ -183,22 +225,38 @@ func confineQueuePositionFromDaemon(ctx context.Context, request ConfineRequest,
 		return confineQueuePosition{}, false
 	}
 	reserve := result.SliceReserve
-	// A daemon that could not read the slice omits the summary entirely, and a
-	// scope id it does not have queued reports no position. Both are honest
-	// absences, and both must render as no position at all.
-	if reserve == nil || reserve.QueuePosition <= 0 {
+	// A daemon that could not read the slice omits the summary entirely: nothing
+	// can be established, so nothing is reported.
+	if reserve == nil {
 		return confineQueuePosition{}, false
+	}
+	// AIRA-101. Exclusivity is reported even when this caller has no queue
+	// position, because a job blocked behind a HOLD is frequently the only waiter
+	// and its position explains nothing while the exclusivity explains everything.
+	exclusive := confineQueuePosition{}
+	if reserve.Exclusive != nil {
+		exclusive.exclusiveState = reserve.Exclusive.State
+		exclusive.exclusiveName = reserve.Exclusive.Name
+		exclusive.exclusiveOwner = reserve.Exclusive.Owner
+	}
+	// A scope id the daemon does not have queued reports no position. That is an
+	// honest absence and must render as no position — never as "position zero" —
+	// but it must not suppress the exclusivity clause above.
+	if reserve.QueuePosition <= 0 {
+		return exclusive, exclusive.exclusiveState != ""
 	}
 	queued := reserve.Queued
 	if queued < reserve.QueuePosition {
 		// The two are derived in one locked pass, so this is unreachable from a
-		// current daemon. Refusing it keeps a nonsense pair ("3 of 1") out of an
-		// operator-facing line rather than printing whatever arrives.
-		return confineQueuePosition{}, false
+		// current daemon. Refusing the PAIR keeps a nonsense "3 of 1" out of an
+		// operator-facing line — but the exclusivity clause is derived
+		// independently and stays reportable.
+		return exclusive, exclusive.exclusiveState != ""
 	}
 	ahead := reserve.QueuedAheadBytes
 	if ahead < 0 {
-		return confineQueuePosition{}, false
+		return exclusive, exclusive.exclusiveState != ""
 	}
-	return confineQueuePosition{position: reserve.QueuePosition, queued: queued, aheadBytes: ahead}, true
+	exclusive.position, exclusive.queued, exclusive.aheadBytes = reserve.QueuePosition, queued, ahead
+	return exclusive, true
 }

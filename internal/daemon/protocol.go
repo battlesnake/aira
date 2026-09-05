@@ -67,6 +67,35 @@ const (
 	// disable daemon admission and run unconfined. Worker-admit refuses with
 	// CodeProtocol, which the supervisor already classifies as permanent.
 	CodeAdmitWaitTooLong = "E_ADMIT_WAIT_TOO_LONG"
+
+	// CodeAdmitExclusiveActive refuses a second `--exclusive` request while one is
+	// already draining or held on the same slice (AIRA-101). At most one exclusive
+	// waiter per slice makes "fairness among simultaneous exclusive requesters"
+	// unrepresentable instead of something to arbitrate, and stops a chain of
+	// exclusive requesters from starving ordinary work indefinitely.
+	//
+	// Like CodeAdmitWaitTooLong above, it is a DEDICATED code precisely because
+	// the runner routes unrecognised codes into the flock fallback. For an
+	// exclusive request that would be doubly wrong: the job would launch not only
+	// unaccounted but also NOT exclusive, while its operator believed otherwise.
+	CodeAdmitExclusiveActive = "E_ADMIT_EXCLUSIVE_ACTIVE"
+
+	// CodeAdmitExclusiveUnestablished aborts a draining exclusive waiter when the
+	// daemon cannot establish that the slice is empty — the confine scan has been
+	// failing for longer than the establishment grace (AIRA-101).
+	//
+	// It is a U_ code because it is an UNEVALUATED verdict, not a failure of the
+	// request: the daemon is not saying the slice is busy, it is saying it cannot
+	// read the slice. Reporting it as E_ADMIT_SATURATED would be a fabricated
+	// diagnosis, which is why admitConnection branches on the waiter outcome
+	// rather than hardcoding saturation for every rejected waiter.
+	//
+	// Aborting rather than waiting is deliberate: with the fail-closed emptiness
+	// rule, a persistently unreadable slice would otherwise block the drain head
+	// AND every waiter behind it for the full ceiling — a machine-wide stall
+	// caused by a diagnostic failure. The benchmark fails loudly; the machine
+	// keeps working.
+	CodeAdmitExclusiveUnestablished = "U_ADMIT_EXCLUSIVE_UNESTABLISHED"
 )
 
 // WorktreeScope is the serialisable, client-discovered projection needed to

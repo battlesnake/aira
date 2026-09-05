@@ -134,10 +134,54 @@ type runnerAdmitRejection struct {
 	Required int64  `json:"required,omitempty"`
 	Ceiling  int64  `json:"cap_minus_headroom,omitempty"`
 	Basis    string `json:"basis"`
+	// AIRA-101. "draining" or "held" when the wait expired under slice
+	// exclusivity, empty otherwise.
+	//
+	// Without this field the daemon's reason is dropped on unmarshal and the
+	// operator's TERMINAL message still gives a memory diagnosis — "slice
+	// contended, no memory admission within the wait" — for what was actually a
+	// benchmark holding the slice. That sends them looking at RAM for a problem
+	// that has nothing to do with RAM, and it would have made the daemon-side
+	// reason inert at the one surface it exists for (found by build review).
+	Exclusive string `json:"exclusive,omitempty"`
+}
+
+// ErrExclusiveUnavailable prefixes every refusal of an `--exclusive` request
+// that could not be granted by the daemon (AIRA-101).
+//
+// The rule it enforces: an exclusive request NEVER degrades. Not to the flock
+// fallback, not to an `unevaluated` launch, not to `disabled` or `bypassed`.
+// This is the highest-priority property of the feature, and it comes from a real
+// incident — an hour of benchmark throughput numbers was invalidated by
+// contention nobody noticed. A benchmark that silently runs non-exclusively
+// produces numbers that LOOK clean, which is strictly worse than no feature at
+// all, so the only safe answer when exclusivity cannot be established is to
+// refuse to launch and say why.
+const ErrExclusiveUnavailable = "E_CONFINE_UNAVAILABLE"
+
+// exclusiveRefusal builds that refusal, carrying the daemon's OWN code and
+// message when it answered one. The distinction matters operationally: "another
+// benchmark holds the slice" (retry later), "the daemon could not establish an
+// empty slice" (something is wrong with cgroupfs), "your daemon is too old"
+// (reinstall) and "the daemon is unreachable" all demand different actions, and
+// a single generic message would hide which one happened.
+func exclusiveRefusal(daemonCode, daemonMessage string) error {
+	detail := strings.TrimSpace(daemonMessage)
+	if detail == "" {
+		detail = strings.TrimSpace(daemonCode)
+	}
+	if detail == "" {
+		return fmt.Errorf("%s: --exclusive requires a daemon admission grant and the daemon did not provide one; refusing to launch non-exclusively", ErrExclusiveUnavailable)
+	}
+	return fmt.Errorf("%s: --exclusive requires a daemon admission grant; refusing to launch non-exclusively (%s)", ErrExclusiveUnavailable, detail)
 }
 
 func (r *Runner) admit(ctx context.Context, req Request) (admissionResult, error) {
 	if req.NoAdmit {
+		if req.Exclusive {
+			return admissionResult{state: "exclusive_unavailable", basis: "reject:exclusive-unavailable"},
+				exclusiveRefusal("", "admission is bypassed for this launch, so exclusivity cannot be established")
+		}
 		return admissionResult{state: "bypassed"}, nil
 	}
 	effectiveReserve := r.memoryReserve
@@ -145,6 +189,10 @@ func (r *Runner) admit(ctx context.Context, req Request) (admissionResult, error
 		effectiveReserve = *req.MemoryReserveOverride
 	}
 	if r.memorySlice == "" || r.memoryReserve == 0 {
+		if req.Exclusive {
+			return admissionResult{state: "exclusive_unavailable", basis: "reject:exclusive-unavailable"},
+				exclusiveRefusal("", "admission is disabled for this launch, so exclusivity cannot be established")
+		}
 		return admissionResult{state: "disabled"}, nil
 	}
 	// AIRA-58: enforce the shared ceiling HERE, before either admission path.
@@ -160,6 +208,15 @@ func (r *Runner) admit(ctx context.Context, req Request) (admissionResult, error
 	start := r.clock.Now()
 	if result, granted, err := r.admitThroughDaemon(ctx, req, effectiveReserve); granted || err != nil {
 		return result, err
+	}
+	// AIRA-101. Past here lies the flock fallback, which launches OUTSIDE the
+	// daemon ledger and therefore outside any notion of exclusivity. Reaching it
+	// with an exclusive request would launch a benchmark that believes it is alone
+	// and is not. Refuse instead — including when the daemon was simply
+	// unreachable, which is the commonest way to get here.
+	if req.Exclusive {
+		return admissionResult{state: "exclusive_unavailable", basis: "reject:exclusive-unavailable"},
+			exclusiveRefusal("", "the daemon did not answer an exclusive admission request")
 	}
 	daemonWaited := false
 	if r.admitDialFn != nil || strings.TrimSpace(r.admitSocketPath) != "" {
@@ -364,6 +421,15 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 				return admissionResult{}, false, err
 			}
 		}
+		// AIRA-101. Every remaining route out of fail() ends in the flock fallback,
+		// which launches outside the ledger and outside exclusivity. An exclusive
+		// request refuses here instead, so a torn connection, an unreadable frame or
+		// an unrecognised daemon code can never become a silently contended
+		// benchmark.
+		if req.Exclusive {
+			return admissionResult{state: "exclusive_unavailable", basis: "reject:exclusive-unavailable"}, true,
+				exclusiveRefusal("", "the exclusive admission exchange with the daemon did not complete")
+		}
 		return admissionResult{}, false, nil
 	}
 
@@ -390,6 +456,19 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 		frame.Request.Args["name"] = req.ConfineName
 		frame.Request.Args["owner"] = req.ConfineOwner
 	}
+	// AIRA-101. All three are optional and absent-means-off, so an older daemon
+	// is not confused by their presence — it REJECTS them with E_DAEMON_PROTOCOL,
+	// which for an exclusive request is exactly right: admitExclusiveOrRefuse
+	// turns that into a loud refusal rather than a silently non-exclusive launch.
+	if req.Exclusive {
+		frame.Request.Args["exclusive"] = true
+	}
+	if req.ExclusiveHolder != "" {
+		frame.Request.Args["exclusive_holder"] = req.ExclusiveHolder
+	}
+	if req.ParentScopeID != "" {
+		frame.Request.Args["parent_scope_id"] = req.ParentScopeID
+	}
 	if err := writeRunnerAdmitFrame(conn, frame); err != nil {
 		return fail()
 	}
@@ -405,6 +484,29 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 		// structured-payload branch and WITHOUT depending on the payload parsing,
 		// so a malformed or absent rejection body still refuses rather than
 		// degrading. Any future admit-path refusal code needs the same treatment.
+		// AIRA-101. The two exclusive refusals join this TERMINAL pre-payload
+		// block for the same reason E_ADMIT_WAIT_TOO_LONG is here: anything the
+		// runner does not explicitly recognise falls through to fail() and the
+		// flock fallback. For an exclusive request that would be doubly wrong —
+		// the job would launch both unaccounted AND non-exclusive while its
+		// operator believed otherwise. Handled before the structured-payload
+		// branch so a malformed body still refuses rather than degrading.
+		//
+		// E_DAEMON_PROTOCOL is included because that is precisely what an OLDER
+		// daemon answers to the unknown `exclusive` field: version skew must be
+		// loud, not a silently contended benchmark.
+		if req.Exclusive {
+			switch response.Code {
+			case "E_ADMIT_EXCLUSIVE_ACTIVE", "U_ADMIT_EXCLUSIVE_UNESTABLISHED", "E_DAEMON_PROTOCOL", "E_DAEMON_BUSY":
+				_ = conn.Close()
+				return admissionResult{
+					state:    "exclusive_unavailable",
+					waitedMS: time.Since(admissionStarted).Milliseconds(),
+					reserve:  effectiveReserve,
+					basis:    "reject:exclusive-unavailable",
+				}, true, exclusiveRefusal(response.Code, response.Error)
+			}
+		}
 		if response.Code == "E_ADMIT_WAIT_TOO_LONG" {
 			_ = conn.Close()
 			message := strings.TrimSpace(response.Error)
@@ -439,7 +541,22 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 					// without a grant — the slice was contended for the duration — not
 					// that it is persistently "genuinely saturated" (a state the daemon
 					// never establishes on this path).
-					message = fmt.Sprintf("E_ADMIT_SATURATED: confine: admission rejected after %s — slice contended, no memory admission within the wait (reserve %s/%s)", time.Since(admissionStarted).Round(time.Second), FormatConfineBytes(resolved), ceiling)
+					//
+					// AIRA-101. When the wait expired under slice EXCLUSIVITY, say so.
+					// The default clause below is a MEMORY diagnosis, and offering it for
+					// a benchmark holding the slice sends the operator to look at RAM for
+					// something that has nothing to do with RAM.
+					switch rejection.Exclusive {
+					case "held":
+						message = fmt.Sprintf("E_ADMIT_SATURATED: confine: admission rejected after %s — the slice is held exclusively by another job for benchmarking; retry when it finishes (reserve %s/%s)", time.Since(admissionStarted).Round(time.Second), FormatConfineBytes(resolved), ceiling)
+					case "draining":
+						// Covers BOTH a bystander waiting behind somebody's drain and the
+						// exclusive requester's own drain failing to complete in its budget.
+						// Neither is a memory problem.
+						message = fmt.Sprintf("E_ADMIT_SATURATED: confine: admission rejected after %s — the slice was draining for an exclusive job and the drain did not complete within the wait (reserve %s/%s)", time.Since(admissionStarted).Round(time.Second), FormatConfineBytes(resolved), ceiling)
+					default:
+						message = fmt.Sprintf("E_ADMIT_SATURATED: confine: admission rejected after %s — slice contended, no memory admission within the wait (reserve %s/%s)", time.Since(admissionStarted).Round(time.Second), FormatConfineBytes(resolved), ceiling)
+					}
 				}
 				if message == "" {
 					message = response.Code + ": " + rejection.Basis
@@ -451,7 +568,22 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 	}
 	var grant runnerAdmitGrant
 	if err := json.Unmarshal(response.Data, &grant); err != nil || !validRunnerAdmitGrant(grant) {
+		if req.Exclusive {
+			_ = conn.Close()
+			return admissionResult{state: "exclusive_unavailable", basis: "reject:exclusive-unavailable"}, true,
+				exclusiveRefusal("", "the daemon's admission grant could not be read")
+		}
 		return fail()
+	}
+	// AIRA-101. `unevaluated` is a real grant state — the daemon answered, but
+	// could not establish the slice's usage — and an ordinary job proceeds on it
+	// uncapped-but-launched. An EXCLUSIVE job must not: "the daemon could not
+	// evaluate the slice" is precisely the case where a claim of exclusivity would
+	// be fabricated. Only a genuine immediate/waited grant is exclusivity.
+	if req.Exclusive && grant.State != "immediate" && grant.State != "waited" {
+		_ = conn.Close()
+		return admissionResult{state: "exclusive_unavailable", basis: "reject:exclusive-unavailable"}, true,
+			exclusiveRefusal("", "the daemon answered "+grant.State+" rather than granting exclusive admission")
 	}
 	// A full, validated frame claims the connection as the lease. Before returning
 	// it, STOP the async closers so neither the ctx callback nor the detach monitor
@@ -473,6 +605,21 @@ func (r *Runner) admitThroughDaemon(ctx context.Context, req Request, effectiveR
 		return admissionResult{}, false, err
 	default:
 	}
+	// CLEAR the transport deadline before handing this connection back as the
+	// LEASE. It was set to `now + maxWait + grace` to bound the admission
+	// EXCHANGE; the exchange is over, and a lease has no deadline — it is held for
+	// the entire life of the job, which routinely outlives any admission wait.
+	//
+	// Leaving it set was harmless only while nothing ever read the lease. AIRA-101
+	// added the first such reader (confine's exclusivity watcher), which made the
+	// latent deadline load-bearing and actively wrong: the read failed with
+	// `i/o timeout` at maxWait+grace on a perfectly healthy connection, so any
+	// exclusive benchmark outliving its own admission budget — 30 minutes by
+	// default — reported `exclusive=lost` and warned that its measurement was
+	// contended when nothing had happened at all. That inverts the honesty facet
+	// on precisely the long runs it exists for, and it silenced the watcher
+	// afterwards so a REAL loss then went unreported (found by build review).
+	_ = conn.SetDeadline(time.Time{})
 	// A full, validated frame is the sole winning outcome even when its final
 	// byte races the transport deadline. The flock fallback is never entered.
 	return admissionResult{state: grant.State, reason: grant.Reason, waitedMS: grant.WaitedMS, release: conn, reserve: grant.Reserve, basis: grant.Basis, scopeCeiling: grant.ScopeCeiling}, true, nil

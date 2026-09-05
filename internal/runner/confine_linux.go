@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"math/bits"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -614,7 +615,18 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		return result, err
 	}
 	var releaseAdmissionOnce sync.Once
-	releaseAdmission := func() { releaseAdmissionOnce.Do(admission.releaseAdmission) }
+	// AIRA-101. teardownStarted gates the exclusivity watcher below. It MUST be
+	// set before the lease is closed on the ordinary exit path, or the watcher's
+	// read fails with "use of closed network connection" on every CLEAN run and
+	// the facet reports `exclusive=lost` every single time — inverting an honesty
+	// signal into a permanent false alarm.
+	var teardownStarted atomic.Bool
+	releaseAdmission := func() {
+		releaseAdmissionOnce.Do(func() {
+			teardownStarted.Store(true)
+			admission.releaseAdmission()
+		})
+	}
 	defer releaseAdmission()
 	switch admission.state {
 	case "immediate", "waited":
@@ -623,6 +635,16 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		result.Status.Admission = ConfineAdmissionTimeout
 	default:
 		result.Status.Admission = ConfineAdmissionUnevaluated
+	}
+	// AIRA-101. Reaching here under --exclusive means a REAL grant: admit()
+	// refuses rather than degrades (see exclusiveRefusal), so there is no path on
+	// which this records exclusivity that was not actually obtained. The facet is
+	// finalised on the completion path beside TerminatedBy, where a mid-run loss
+	// can still downgrade it.
+	var exclusiveLost atomic.Bool
+	if request.Exclusive {
+		result.Status.Exclusive = ConfineExclusiveGranted
+		result.Status.ExclusiveDrainedMS = admission.waitedMS
 	}
 
 	// Resolved BEFORE the signal handler is installed below, not at the launch
@@ -636,6 +658,53 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		diagnostics = os.Stderr
 	}
 	diagnostics = &confineLockedWriter{w: diagnostics}
+
+	// AIRA-101. Watch the admission lease. Its closure BEFORE teardown means the
+	// daemon restarted or stopped, so the exclusive hold is gone and the rest of
+	// this run was contended. The job is deliberately NOT killed — killing a
+	// benchmark because the daemon restarted is worse than reporting it honestly.
+	//
+	// Both sides already read one byte from this socket purely as a liveness
+	// signal, and neither writes after the grant frame, so reading it here is
+	// consistent with the existing protocol rather than a new use of the channel.
+	//
+	// TWO stated limits of this watcher, neither fixed:
+	//   - It sees the lease CLOSING. A ledger-only release (the stale-lease sweep,
+	//     or confine --kill's daemon-side discharge) leaves the socket open and the
+	//     handler parked, so exclusivity can end without this firing. The honest
+	//     claim is "never silently downgraded WHEN THE LEASE CLOSES".
+	//   - A close in the last few milliseconds before teardown is masked by the
+	//     guard below and reported as a clean run. The window is the teardown
+	//     itself, and erring that way keeps a clean run from being libelled.
+	//
+	// The teardownStarted guard is load-bearing: releaseAdmission closes the lease
+	// on the ordinary exit path, so without it this read would fail with "use of
+	// closed network connection" on EVERY clean run and report exclusive=lost
+	// every time, inverting the honesty signal into a permanent false alarm.
+	if request.Exclusive {
+		lease, watchable := admission.release.(net.Conn)
+		if !watchable {
+			// The grant is real (admit refuses anything else), but without a lease
+			// connection to watch, a mid-run loss could not be detected — so the run's
+			// outcome is UNEVALUATED rather than granted. Claiming `granted` here
+			// would assert something this process cannot observe, which is the exact
+			// fabrication the facet exists to prevent, and it is also what made
+			// `unevaluated` unreachable in an earlier revision: a value nothing can
+			// emit is a reader trap (found by build review).
+			result.Status.Exclusive = ConfineExclusiveUnevaluated
+		}
+		if watchable {
+			go func() {
+				var one [1]byte
+				_, readErr := lease.Read(one[:])
+				if readErr == nil || teardownStarted.Load() {
+					return
+				}
+				exclusiveLost.Store(true)
+				fmt.Fprint(diagnostics, "aira: warning: exclusivity lost (admission lease closed) — this run was no longer scheduled alone; treat any measurement from it as contended\n")
+			}()
+		}
+	}
 
 	scope, err := backend.Create(ctx, scopeID)
 	if err != nil {
@@ -883,6 +952,34 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		// strip on every confine launch (runner_linux.go).
 		cmd.Env = pylib.StripAitestEnvironment(cmd.Env)
 	}
+	// AIRA-101. An exclusive launch STAMPS its own scope id. A non-exclusive one
+	// leaves whatever it inherited INTACT: the entire process tree below a holder
+	// must carry the token.
+	//
+	// Set UNCONDITIONALLY here rather than through AppendConfineChildEnvironment:
+	// that helper gates several variables on RuntimeDir being present, and
+	// exclusivity has nothing to do with the governor's runtime directory. An
+	// attestation that silently vanished under some configurations would be worse
+	// than none at all, because a benchmark checking for it would then refuse to
+	// run for entirely the wrong reason.
+	//
+	// An earlier revision STRIPPED an inherited token on a non-exclusive launch,
+	// reasoning that the attestation would be "false" for such a job. That
+	// deadlocked the holder against its own hold at depth three: H --exclusive →
+	// N1 `aira confine -- make X` inherits the token and is admitted, but its
+	// CHILD environment had the token removed, so N2 `aira confine -- pytest` from
+	// that Makefile sent no token, was blocked by H's own hold, waited its full
+	// max_wait, and H stalled on N2 while the slice stayed held against every
+	// other session on the machine. CLAUDE.md's own "confine every heavy command"
+	// rule makes that depth entirely ordinary (found by build review).
+	//
+	// The reasoning it replaces was also just wrong: a job running inside a live
+	// hold IS running exclusively. And a STALE token is harmless by construction —
+	// belongsToHolder matches only the LIVE holder's unique scope id, so a token
+	// from a finished holder matches nothing and grants nothing.
+	if request.Exclusive {
+		cmd.Env = upsertConfineEnv(cmd.Env, ExclusiveHolderEnv, scopeID)
+	}
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, diagnostics
 	cmd.ExtraFiles = []*os.File{handshakeWrite, releaseRead}
 	cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: scope.FD()}
@@ -1008,6 +1105,12 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		result.Status.DescendantEscape = &DescendantEscapeEvidence{PIDIdentity: observation.Identity, Cgroup: observation.Cgroup}
 	}
 	result.Status.TerminatedBy = classifyConfineTermination(termination, usage, terminatedBySignal)
+	// AIRA-101, finalised beside its sibling facet and on the same completion
+	// path. A lease that closed mid-run downgrades granted -> lost, so a
+	// measurement taken while the hold was gone is never reported as clean.
+	if request.Exclusive && exclusiveLost.Load() {
+		result.Status.Exclusive = ConfineExclusiveLost
+	}
 	_, _ = fmt.Fprintln(diagnostics, FormatConfineStatus(result.Status))
 	if advisory := formatConfineReserveAdvisory(result.Status.ScopeMemoryMax, result.Status.PeakRSS, oom); advisory != "" {
 		_, _ = fmt.Fprintln(diagnostics, advisory)
@@ -1077,7 +1180,89 @@ func admitConfine(ctx context.Context, path string, request ConfineRequest, rese
 		ConfineScopeID:       request.ScopeID,
 		ConfineName:          request.Name,
 		ConfineOwner:         request.Owner,
+		Exclusive:            request.Exclusive,
+		// AIRA-101. A confine launched from INSIDE an exclusive job inherits that
+		// job's holder token through the environment and forwards it here, so the
+		// daemon exempts it from the hold it would otherwise deadlock against. An
+		// absent, stale or foreign token matches nothing and changes nothing.
+		ExclusiveHolder: InheritedExclusiveHolder(),
 	})
+}
+
+// upsertConfineEnv sets key=value in env, replacing any existing entry so a
+// child can never see two values for the same variable (the last would win in
+// some readers and the first in others).
+func upsertConfineEnv(env []string, key, value string) []string {
+	result := removeConfineEnv(env, key)
+	return append(result, key+"="+value)
+}
+
+// removeConfineEnv drops every entry for key.
+func removeConfineEnv(env []string, key string) []string {
+	prefix := key + "="
+	result := make([]string, 0, len(env))
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			continue
+		}
+		result = append(result, entry)
+	}
+	return result
+}
+
+// ExclusiveHolderEnv carries the scope id of the exclusive job a process is
+// running inside (AIRA-101). It has two jobs, complementary rather than
+// conflated:
+//
+//  1. The NESTING TOKEN. CLAUDE.md requires every heavy command be prefixed
+//     `aira confine`, and a nested confine resolves to the SAME slice and creates
+//     a SIBLING scope — which its own parent's exclusive hold would block,
+//     deadlocking the benchmark against itself. The token exempts it.
+//  2. The job-visible ATTESTATION, so a benchmark can confirm it really got
+//     exclusivity before recording a number:
+//     `[ -n "$AIRA_CONFINE_EXCLUSIVE" ] || exit 1`.
+//
+// Precisely: it attests ACQUISITION, not the whole run — an environment variable
+// cannot be unset inside an already-running process if exclusivity is lost later.
+// The confine trailer's `exclusive=` facet attests the run.
+//
+// It is deliberately NOT a member of governorEnvironmentKeys:
+// StripGovernorEnvironment runs on every nested launch, so listing it there would
+// drop the token and make two-level nesting deadlock.
+const ExclusiveHolderEnv = "AIRA_CONFINE_EXCLUSIVE"
+
+// InheritedConfineScopeID reads the scope id of the confine job this process is
+// running inside, as exported by AppendConfineChildEnvironment. It is what lets
+// `aira confine-reserve` declare itself a sub-reservation of an already-running
+// job rather than new work entering the slice.
+//
+// A malformed or absent value yields "": the daemon refuses a non-canonical
+// scope id, and forwarding a stray one would fail an unrelated job's admission.
+func InheritedConfineScopeID() string {
+	scopeID := strings.TrimSpace(os.Getenv("AIRA_CONFINE_SCOPE_ID"))
+	if scopeID == "" {
+		return ""
+	}
+	if _, _, _, _, ok := parseConfineScopeID(scopeID); !ok {
+		return ""
+	}
+	return scopeID
+}
+
+// InheritedExclusiveHolder reads the token this process inherited, if any.
+//
+// A malformed value is DISCARDED rather than forwarded: the daemon refuses a
+// non-canonical scope id, which would turn somebody's stray environment variable
+// into a launch failure for an unrelated job.
+func InheritedExclusiveHolder() string {
+	holder := strings.TrimSpace(os.Getenv(ExclusiveHolderEnv))
+	if holder == "" {
+		return ""
+	}
+	if _, _, _, _, ok := parseConfineScopeID(holder); !ok {
+		return ""
+	}
+	return holder
 }
 
 // confineLaunchInfo carries RESOLVED facts to the AIRA-22 launch callbacks. The

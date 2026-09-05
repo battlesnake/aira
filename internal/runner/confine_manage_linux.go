@@ -111,6 +111,26 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 		} else {
 			record.UnevaluatedFields = append(record.UnevaluatedFields, "populated")
 		}
+		// AIRA-101. SUBTREE-aware liveness, from the same cgroup.events source
+		// killConfine already trusts for exactly this reason: Members() above reads
+		// LEAF cgroup.procs, so a job whose processes live in child cgroups it
+		// created — every aitest outer scope, which drains all its pids into
+		// .aira-supervisor and .aira-worker-N — reads leaf-empty while fully busy.
+		// Left nil (never false) when it cannot be established, so an unreadable
+		// scope is never mistaken for an empty one.
+		if events, eventsErr := scope.openFile("cgroup.events", unix.O_RDONLY); eventsErr == nil {
+			scope.events = events
+			if empty, emptyErr := scope.Empty(); emptyErr == nil {
+				populated := !empty
+				record.SubtreePopulated = &populated
+			} else {
+				record.UnevaluatedFields = append(record.UnevaluatedFields, "subtree_populated")
+			}
+			_ = events.Close()
+			scope.events = nil
+		} else {
+			record.UnevaluatedFields = append(record.UnevaluatedFields, "subtree_populated")
+		}
 		if data, readErr := deps.readField(scope, "memory.current", 64); readErr == nil {
 			if value, parseErr := parseConfineInt(data); parseErr == nil {
 				record.RSSBytes = &value
