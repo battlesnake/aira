@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-101","project":"aira","title":"aira confine --exclusive: let a job request exclusive use of its slice for uncontended benchmarking","status":"in-review","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","dogfood","scheduler"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-101","project":"aira","title":"aira confine --exclusive: let a job request exclusive use of its slice for uncontended benchmarking","status":"done","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","dogfood","scheduler"],"hold":false,"relations":[]}
 ---
 Direct owner request (2026-09-05): "we need a way for jobs launched with 'aira confine' to request exclusive use of the slice, so they get scheduled alone with nothing else running in the slice" — for benchmarking, where contention from other admitted jobs (or aitest workers) invalidates a measurement.
 
