@@ -128,3 +128,54 @@ is already true of `--json`.
 **Mutation testing: 16 mutations, all killed** (three rounds). The first round
 found two genuinely porous areas — the strip-order claim and the `init`/`eject`
 discovery sites had no covering test at all — both closed before review.
+
+## Independent verification pass (2026-09-05)
+
+Verified by a separate session against the PR head in a fresh detached worktree,
+not from the builder's report.
+
+- **Plan row holds.** §4's "add an explicit per-call scope override on the
+  MCP/CLI faces" is what was built. Both of the builder's source citations were
+  re-checked at the merge base: `scopeForCWD(requestContext, ".", paths)` really
+  was at `cmd/aira/mcp_project.go:63`, and AIRA-93's `GIT_*` scrub really is in
+  `runGitRevParse` (`internal/app/project.go:768`), so the second candidate
+  mechanism was ruled out before this one was fixed, as the Phase 0 re-scope
+  required.
+- **`make ci` exit 0** at the PR head (12 packages `ok`, no `FAIL`, no `panic`),
+  and **exit 0 again** on a clean test-merge onto `origin/master` `aec0502` —
+  which has moved since the branch point and auto-merged `cmd/aira/main.go` with
+  AIRA-85. Both runs recorded exit codes, not truncated output.
+- **16 independently written mutations, all killed** — chosen by the verifier
+  without sight of the builder's own mutation scripts, and covering every claim
+  the fix rests on: each of the seven discovery sites reverted to `"."` (four CLI,
+  three MCP), the silent-cwd-fallback in `resolveScopeDir`, the `IsDir` check, the
+  MCP absolute-path rule, `refuseAmbiguousImportPath`, both accept-lists forced
+  open, the `removeScopeDir`/`removeJSON` strip order, and four `removeScopeDir`
+  argv rules (bare `--` stop, option-like value, repeat guard).
+- **No discovery site was missed.** The one remaining `app.Discover(ctx, ".")` in
+  `cmd/aira` is `resolveConfineOwner` (`main.go:1281`), reachable only from
+  `confine`/`confine-list`/`confine-kill`, which are exactly the verbs and tools
+  that refuse the override. Consistent, not an oversight.
+
+**One nit found in verification, not fixed here and not merge-blocking.** The new
+"this verb resolves no project scope" refusal renders a normal response for
+`worker-admit` instead of going through `writeWorkerAdmitOutcome`, so it does not
+speak that verb's single-stdout-line outcome channel the way its `parseArgs` and
+`--json` refusals deliberately do (`main.go`, the AIRA-42 comment). Unreachable
+from the only real caller — `supervisor.py:630` builds
+`[command, "worker-admit", "--job-id", ...]` with the verb at argv[0] and no
+globals — and the failure mode would be the pre-existing fail-open (run
+unconfined), not corruption. Worth a one-line follow-up, not a rebuild.
+
+**Sidecar availability, recorded honestly:** no external review lineage was
+reachable for this verification pass (Gemini free-tier quota exhausted, Codex
+usage limit hit, DeepSeek returned empty twice). The independent pass above is
+therefore the verifier's own source read plus the mutation battery, not a third
+model's opinion.
+
+**Flake note (no ticket edited).** The builder's two disclosed `internal/runner`
+flakes both passed in the two full runs above. One,
+`TestScopeMembershipEventsDeliversModifyAndReleasesFD`, is already filed as
+AIRA-96 (inotify-instance exhaustion). The other,
+`TestRealCgroupPlacedThenExitedFastIsHonestAndCaptured`, belongs to AIRA-20's
+real-cgroup flake surface and is left for AIRA-20's own owner to record.
