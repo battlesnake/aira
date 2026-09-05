@@ -902,53 +902,6 @@ func TestEvaluateAdmitQueueReducedPerWorkerPadAvoidsFalseBlock(t *testing.T) {
 	waitAdmitGrant(t, waiter)
 }
 
-func TestAdmitAvailableMatchesGrantHeadroomWithoutCreatingQueue(t *testing.T) {
-	// Revert-check: omitting the +1 prospective job term gives 46 rather than
-	// the grant-time 44 here; creating a missing queue changes the registry.
-	server := &Server{
-		admitQueues:                  map[string]*sliceQueue{},
-		admitSliceHeadroomBase:       10,
-		admitSliceHeadroomSupervisor: 2,
-		admitReadMemory: func(string) (int64, int64, int64, bool, string) {
-			return 20, 100, 0, true, ""
-		},
-	}
-	queue := &sliceQueue{outstanding: 30, outstandingJobs: 1, adopted: 10, adoptedJobs: 1}
-	server.admitQueues["/slice"] = queue
-	if available, ok := server.admitAvailable("/slice"); !ok || available != 44 {
-		t.Fatalf("available=%d ok=%v, want 44 true", available, ok)
-	}
-	if available, ok := server.admitAvailable("/missing"); !ok || available != 68 {
-		t.Fatalf("missing queue available=%d ok=%v, want 68 true", available, ok)
-	}
-	if len(server.admitQueues) != 1 || server.admitQueues["/missing"] != nil {
-		t.Fatalf("read-only lookup created a queue: %#v", server.admitQueues)
-	}
-	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, 0, 0, false, "read-error" }
-	if _, ok := server.admitAvailable("/slice"); ok {
-		t.Fatal("unreadable or uncapped slice was not reported uncertain")
-	}
-}
-
-func TestReleaseAdmitWaiterOnlySignalsGovernor(t *testing.T) {
-	// Revert-check: a synchronous evaluate here would activate the parked
-	// worker below. Keeping this path signal-only avoids queue.mu ->
-	// governorSet.mu -> sliceQueue.mu lock inversion.
-	g := testGovernor(1, governorEnforce)
-	parked := putGovernorWorker(g, "parked", "job", time.Now(), 1, governorParked)
-	server := &Server{admitQueues: map[string]*sliceQueue{}, governor: g}
-	queue := &sliceQueue{path: "/slice", waiters: []*admitWaiter{{state: admitGranted, accounted: true, reserve: 1}}, outstanding: 1, outstandingJobs: 1}
-	server.releaseAdmitWaiter(queue, queue.waiters[0])
-	if parked.state != governorParked {
-		t.Fatal("admission release synchronously evaluated governor")
-	}
-	select {
-	case <-g.kick:
-	default:
-		t.Fatal("admission release did not signal governor")
-	}
-}
-
 func validAdmitArgs(reserve, wait int64) map[string]any {
 	return map[string]any{"slice": "slice", "reserve": reserve, "max_wait_ms": wait, "signature": "", "pinned": true}
 }
@@ -1035,5 +988,35 @@ func TestGrantSetsGrantedAtDistinctFromEnqueuedUnderQueueingDelay(t *testing.T) 
 	}
 	if delay := waiter.grantedAt.Sub(waiter.enqueued); delay != queueingDelay {
 		t.Fatalf("grantedAt-enqueued=%s, want the simulated queueing delay %s", delay, queueingDelay)
+	}
+}
+
+// TestAfterAdmitReleaseKicksTheQueue preserves the surviving half of
+// TestReleaseAdmitWaiterOnlySignalsGovernor, which AIRA-33 deleted along with
+// the governor it was named for.
+//
+// That test asserted two things at once: that the release path signals rather
+// than synchronously evaluates (the governor half, now moot), and that it
+// signals AT ALL. Only the second is still meaningful, and nothing else in the
+// package covers it: the release e2e tests set admitPollInterval to 5ms
+// (admit_release_e2e_test.go), so they stay green on the poll ticker alone even
+// if queue.signal() were deleted -- production would silently degrade from an
+// immediate re-evaluation to a 250ms one (defaultAdmitPollInterval), which is a
+// latency regression no existing test can see.
+//
+// verifies: AIRA-33
+func TestAfterAdmitReleaseKicksTheQueue(t *testing.T) {
+	server := &Server{admitQueues: map[string]*sliceQueue{}}
+	queue := &sliceQueue{path: "/slice", kick: make(chan struct{}, 1)}
+	// Drain first, so the assertion cannot pass on a kick left over from setup.
+	select {
+	case <-queue.kick:
+	default:
+	}
+	server.afterAdmitRelease(queue)
+	select {
+	case <-queue.kick:
+	default:
+		t.Fatal("afterAdmitRelease did not kick the slice queue; a freed reserve would now wait for the poll ticker")
 	}
 }

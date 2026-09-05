@@ -135,8 +135,10 @@ type staleLeaseCandidate struct {
 //   - AIRA-68, the scope-LESS population: an `aira confine-reserve` reservation
 //     creates no cgroup artifact of any kind, so neither the physical reap nor
 //     the confine scan can establish anything about it, and its ONLY release
-//     path is its connection closing. It is now the majority of the ledger by
-//     count on a busy box. A liveness probe for it (SO_PEERCRED plus a
+//     path is its connection closing. It was the majority of the ledger by count
+//     on a busy box while the pytest RAM governor took one per test; AIRA-33
+//     deleted that caller, so the population is now small but not empty (any
+//     `aira confine-reserve` still creates one). A liveness probe for it (SO_PEERCRED plus a
 //     start-tick check) is deliberately NOT built: there is no observed instance
 //     of such a lease wedging, and the project's architectural-simplicity rule
 //     prefers keeping the primitive and documenting the gap over new machinery

@@ -13,10 +13,11 @@ import (
 // TestRealPytestAitestPackageUnitTests shells out to a real pytest run over
 // the aitest/ source directory's own direct test_*.py files (not the
 // go:embed-extracted copy) -- this is a source-level Python unit test tier
-// for the aitest plugin's own internals (supervisor.py, worker.py),
-// distinct from pytest_integration_test.go's tests of the OLDER
-// aira_xdist_governor plugin's activation surface. Every later task in this
-// plan (12 onward) adds MORE test_*.py files directly under aitest/ that
+// for the aitest plugin's own internals (supervisor.py, worker.py). It was
+// once distinguished from pytest_integration_test.go's tests of the OLDER
+// aira_xdist_governor plugin's activation surface; AIRA-33 deleted both the
+// plugin and that file, so this is now AIRA's only Python test tier. Every later
+// task in this plan (12 onward) adds MORE test_*.py files directly under aitest/ that
 // this same pytest discovery run picks up automatically via the glob below
 // -- no further Go-side wiring is needed per task.
 //

@@ -1460,8 +1460,24 @@ func TestConfineKillingSignalMapsToShellExit(t *testing.T) {
 	}
 }
 
-func TestConfineInjectsDaemonGovernorEnvironment(t *testing.T) {
-	runtimeDir := t.TempDir()
+// TestConfineExportsTheScopeIDWithoutARuntimeDir pins BOTH halves of what
+// AIRA-33 left of the confine child environment.
+//
+// It replaces TestConfineInjectsDaemonGovernorEnvironment, which asserted
+// AIRA_CONFINE_SCOPE_ID and AIRA_GOVERNOR_CMD together. The second is deleted;
+// the first is not, and it is load-bearing: runner.InheritedConfineScopeID reads
+// it and confine-reserve uses it as ParentScopeID, which is what stops a
+// sub-reservation being charged to the slice as new work.
+//
+// The RuntimeDir-less launch is the POINT, not incidental. Before AIRA-33 the
+// scope id was published by a helper that returned early when RuntimeDir was
+// empty (the sidecar had nowhere to be extracted to), so this launch shape
+// silently exported nothing. Removing the extraction removed that unrelated
+// gate. Asserting it here is what keeps the improvement from being re-broken by
+// someone re-introducing a RuntimeDir precondition.
+//
+// verifies: AIRA-33
+func TestConfineExportsTheScopeIDWithoutARuntimeDir(t *testing.T) {
 	scope := &confineFakeScope{}
 	var stdout bytes.Buffer
 	deps := confineUnitDeps(scope)
@@ -1469,15 +1485,23 @@ func TestConfineInjectsDaemonGovernorEnvironment(t *testing.T) {
 	// real memory.max fd, so stub it as the other delegate-ram unit tests do.
 	deps.writeScopeMemoryCap = func(Scope, int64, int64, bool) error { return nil }
 	result, err := confineWithDeps(context.Background(), ConfineRequest{
-		Slice: "finite.slice", DelegateRAM: true, Name: "pytest", Argv: []string{"/bin/sh", "-c", "printf '%s|%s' \"$AIRA_CONFINE_SCOPE_ID\" \"$AIRA_GOVERNOR_CMD\""},
-		RuntimeDir: runtimeDir, SelfPath: os.Args[0], Stdout: &stdout, Stderr: io.Discard,
+		Slice: "finite.slice", DelegateRAM: true, Name: "pytest",
+		Argv:     []string{"/bin/sh", "-c", "printf '%s|%s' \"$AIRA_CONFINE_SCOPE_ID\" \"$AIRA_GOVERNOR_CMD\""},
+		Env:      []string{"PATH=" + os.Getenv("PATH"), "AIRA_GOVERNOR_CMD=/stale/aira"},
+		SelfPath: os.Args[0], Stdout: &stdout, Stderr: io.Discard,
 	}, deps)
 	if err != nil || result.Exit != 0 {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 	parts := strings.Split(stdout.String(), "|")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		t.Fatalf("daemon governor environment=%q", stdout.String())
+	if len(parts) != 2 {
+		t.Fatalf("child environment report=%q", stdout.String())
+	}
+	if parts[0] == "" {
+		t.Fatal("AIRA_CONFINE_SCOPE_ID absent on a RuntimeDir-less launch: confine-reserve's ParentScopeID depends on it")
+	}
+	if parts[1] != "" {
+		t.Fatalf("retired AIRA_GOVERNOR_CMD survived the strip as %q", parts[1])
 	}
 }
 
@@ -1553,16 +1577,17 @@ func TestConfineNonDelegateWithPopulatedRuntimeDirDeliversNoAitestCoordinates(t 
 			"PATH=" + os.Getenv("PATH"),
 			"XDG_DATA_HOME=" + dataHome,
 			// Stale coordinates as an outer delegate-ram aitest job would leak
-			// them into a nested plain `aira confine` (the leak the strip at
-			// confine_linux.go:766-777 exists to stop). They must not survive,
-			// and must not be replaced by fresh ones either.
+			// them into a nested plain `aira confine` (the leak the
+			// StripAitestEnvironment call on the non-delegate branch of
+			// confineWithDeps exists to stop). They must not survive, and must
+			// not be replaced by fresh ones either.
 			"AIRA_AITEST_LIB=/stale/lib",
 			"AIRA_AITEST_WORKER_ADMIT_CMD=/stale/aira",
 			"AIRA_AITEST_BOOTSTRAP_CMD=/stale/aira",
 			"AIRA_AITEST_MAX_WORKERS_FALLBACK=999",
 			"AIRA_AITEST_OUTER_SCOPE=/stale/scope",
 		},
-		Argv:       reportChildEnv(append(append([]string{}, aitestCoordinateKeys...), "AIRA_PY_LIB", "AIRA_CONFINE_SCOPE_ID")...),
+		Argv:       reportChildEnv(append(append([]string{}, aitestCoordinateKeys...), "PATH", "AIRA_CONFINE_SCOPE_ID")...),
 		RuntimeDir: t.TempDir(), SelfPath: os.Args[0], Stdout: &stdout, Stderr: io.Discard,
 	}, confineUnitDeps(scope))
 	if err != nil || result.Exit != 0 {
@@ -1577,13 +1602,13 @@ func TestConfineNonDelegateWithPopulatedRuntimeDirDeliversNoAitestCoordinates(t 
 			t.Fatalf("non-delegate launch delivered %s=%q, want empty", key, fields[i])
 		}
 	}
-	// Anti-porosity, and the whole reason this test is not a copy of the one
-	// above: prove the populated RuntimeDir was genuinely exercised. If
-	// extraction had failed, appendChildEnvironment returns early
-	// (internal/pylib/env.go:130-139) and every assertion above would pass for
-	// the wrong reason -- as vacuously as the RuntimeDir:"" test does.
+	// Anti-porosity: prove the child environment was populated at all. A launch
+	// that handed the child an empty environment would satisfy every absence
+	// assertion above for entirely the wrong reason. (Before AIRA-33 this
+	// witness was AIRA_PY_LIB, which the same launch used to export; PATH is the
+	// surviving proof-of-life now that it does not.)
 	if fields[len(aitestCoordinateKeys)] == "" {
-		t.Fatal("AIRA_PY_LIB absent: extraction never ran, so the aitest-coordinate assertions above prove nothing")
+		t.Fatal("PATH absent: the child environment was empty, so the aitest-coordinate assertions above prove nothing")
 	}
 	if fields[len(aitestCoordinateKeys)+1] == "" {
 		t.Fatal("AIRA_CONFINE_SCOPE_ID absent: the confine child environment was not populated")
@@ -2438,3 +2463,73 @@ func TestConfineAdmissionWaitDiagnosticHedgesUnpinnedReserve(t *testing.T) {
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// legacyGovernorEnvironmentKeys are the coordinates AIRA-33 retired with the
+// aira_xdist_governor plugin. AIRA still STRIPS them from every launch (so a
+// child of a still-running pre-deletion job cannot inherit a live one), but it
+// must never SET one again.
+var legacyGovernorEnvironmentKeys = []string{
+	"AIRA_PY_LIB",
+	"AIRA_GOVERNOR",
+	"AIRA_GOVERNOR_CMD",
+	"AIRA_GOVERNOR_MAX_WAIT",
+	"AIRA_GOVERNOR_SLICE",
+	"AIRA_TEST_MEM_GOVERNOR",
+	"AIRA_TEST_MEM_DEFAULT",
+	"AIRA_TEST_MEM_GROWTH_HEADROOM",
+	"AIRA_CONFINE_RESERVE_CMD",
+}
+
+// TestConfineDelegateRAMDeliversNoLegacyGovernorCoordinates is AIRA-33's
+// behaviour-level guard on the env surgery.
+//
+// --delegate-ram is the ONLY launch shape that ever exported these, and it is
+// also the shape that must keep exporting AIRA_CONFINE_SCOPE_ID (which
+// confine-reserve's ParentScopeID depends on) and the AIRA_AITEST_* coordinates.
+// Asserting all three in one launch is the point: the edit that removes the nine
+// is the same edit that could drop the two that must survive, and a test that
+// only checked the absence would pass just as happily on a launch that exported
+// nothing at all.
+//
+// The AIRA_CONFINE_SCOPE_ID assertion is therefore ALSO the anti-porosity guard:
+// without it, an appendChildEnvironment that returned its input untouched would
+// satisfy every absence check above for entirely the wrong reason.
+//
+// verifies: AIRA-33
+func TestConfineDelegateRAMDeliversNoLegacyGovernorCoordinates(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	// Set every retired key in the PARENT environment too. Absence must be the
+	// result of a strip, not merely of nothing having set them.
+	for _, key := range legacyGovernorEnvironmentKeys {
+		t.Setenv(key, "/stale-"+key)
+	}
+	scope := &confineFakeScope{}
+	var stdout bytes.Buffer
+	deps := confineUnitDeps(scope)
+	deps.writeScopeMemoryCap = func(Scope, int64, int64, bool) error { return nil }
+	reported := append(append([]string{}, legacyGovernorEnvironmentKeys...), "AIRA_CONFINE_SCOPE_ID", "AIRA_AITEST_LIB")
+	result, err := confineWithDeps(context.Background(), ConfineRequest{
+		Slice: "finite.slice", DelegateRAM: true, Name: "pytest",
+		Argv:       reportChildEnv(reported...),
+		Env:        os.Environ(),
+		RuntimeDir: t.TempDir(), SelfPath: os.Args[0], Stdout: &stdout, Stderr: io.Discard,
+	}, deps)
+	if err != nil || result.Exit != 0 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	fields := strings.Split(stdout.String(), "|")
+	if len(fields) != len(reported) {
+		t.Fatalf("child environment report=%q", stdout.String())
+	}
+	for i, key := range legacyGovernorEnvironmentKeys {
+		if fields[i] != "" {
+			t.Errorf("delegate-ram launch delivered retired coordinate %s=%q; AIRA-33 deleted the plugin that read it", key, fields[i])
+		}
+	}
+	if fields[len(legacyGovernorEnvironmentKeys)] == "" {
+		t.Fatal("AIRA_CONFINE_SCOPE_ID absent: confine-reserve's ParentScopeID depends on it, and its absence also makes every assertion above vacuous")
+	}
+	if fields[len(legacyGovernorEnvironmentKeys)+1] == "" {
+		t.Fatal("AIRA_AITEST_LIB absent: the same edit must not take the aitest coordinates with it")
+	}
+}

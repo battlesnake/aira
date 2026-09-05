@@ -882,41 +882,6 @@ func (s *Server) admitQueueDiagnostics(path string) (queued int, phase string) {
 	return snapshot.queued, snapshot.phase
 }
 
-// admitAvailable is the governor's advisory, read-only view of the same
-// headroom calculation used by an immediate admission grant. It deliberately
-// does not create a queue: a read-only governor lookup must not start an idle
-// queue evaluator. The global lock order is governorSet.mu ->
-// admitRegistryMu -> sliceQueue.mu; no admission path takes governorSet.mu.
-func (s *Server) admitAvailable(slicePath string) (int64, bool) {
-	var outstanding, adopted int64
-	var outstandingJobs, adoptedJobs int
-	s.admitRegistryMu.Lock()
-	queue := s.admitQueues[slicePath]
-	if queue != nil {
-		queue.mu.Lock()
-		outstanding, adopted = queue.outstanding, queue.adopted
-		outstandingJobs, adoptedJobs = queue.outstandingJobs, queue.adoptedJobs
-		queue.mu.Unlock()
-	}
-	s.admitRegistryMu.Unlock()
-
-	readMemory := s.admitReadMemory
-	if readMemory == nil {
-		readMemory = readSliceMemory
-	}
-	current, maximum, reclaimable, ok, _ := readMemory(slicePath)
-	if !ok {
-		return 0, false
-	}
-	jobs := addJobCountClamp(addJobCountClamp(outstandingJobs, adoptedJobs), 1)
-	headroom := s.admitSliceHeadroom(jobs)
-	// AIRA-103. A CAPACITY question, so it takes the pressure-throttled maximum.
-	// See admitEffectiveMaximum for the three sites this may appear at and the
-	// four it must never reach.
-	effective := s.admitEffectiveMaximum(slicePath, maximum)
-	return checkedAvailable(current, effective, reclaimable, addClamp(outstanding, adopted), headroom), true
-}
-
 func (s *Server) admitCeiling(path string, maximum int64) int64 {
 	return subtractFloor(maximum, s.admitSliceHeadroom(s.admitOutstandingJobs(path)+1))
 }
@@ -1806,13 +1771,13 @@ func releaseAdmitWaiterLocked(queue *sliceQueue, waiter *admitWaiter) bool {
 // pruneAdmitQueue takes admitRegistryMu then queue.mu, so calling it under
 // queue.mu would invert the one fixed lock order in this file.
 func (s *Server) afterAdmitRelease(queue *sliceQueue) {
+	// This is only the coalescing, lock-free signal: evaluateAdmitQueue must
+	// never be called synchronously from this release path, which has just held
+	// queue.mu. It is also the ONLY thing making a freed reserve visible to a
+	// waiter immediately rather than at the next 250ms poll, so it is pinned by
+	// TestAfterAdmitReleaseKicksTheQueue (AIRA-33 deleted the test that used to
+	// carry that assertion alongside a governor one).
 	queue.signal()
-	// A ledger release can make a parked RAM-aware worker fit. This is only the
-	// coalescing, lock-free signal: evaluate must never be called synchronously
-	// from this release path because it previously held queue.mu.
-	if s.governor != nil {
-		s.governor.signal()
-	}
 	s.pruneAdmitQueue(queue)
 }
 

@@ -31,7 +31,6 @@ type ceilingFixture struct {
 	resolved      bool
 	now           time.Time
 	published     []sliceCeilingSnapshot
-	governorWakes int
 }
 
 func newCeilingFixture() *ceilingFixture {
@@ -62,7 +61,6 @@ func (f *ceilingFixture) deps(reserve int64) sliceCeilingDeps {
 		ttl:              defaultSliceCeilingTTL,
 		now:              func() time.Time { return f.now },
 		publish:          func(s sliceCeilingSnapshot) { f.published = append(f.published, s) },
-		signalGovernor:   func() { f.governorWakes++ },
 		sleep:            watchdogSleep,
 	}
 }
@@ -417,31 +415,6 @@ func TestSliceCeilingSubQuantumMovementIsIgnored(t *testing.T) {
 	f.now = f.now.Add(2 * time.Second)
 	if got := evaluateSliceCeiling(sliceCeilingEnforce, state, deps); got.Ceiling <= settled.Ceiling {
 		t.Fatalf("ceiling=%d for a multi-quantum raise, want it above %d", got.Ceiling, settled.Ceiling)
-	}
-}
-
-// verifies: a raise wakes the RAM-aware governor, which is signal-driven —
-// parked workers would otherwise stay parked until an unrelated event. A LOWER
-// must not wake it.
-func TestSliceCeilingRaiseSignalsGovernor(t *testing.T) {
-	f := newCeilingFixture()
-	deps := f.deps(16 << 30)
-	state := &sliceCeilingState{}
-	settle(t, f, state, deps)
-	wakesAfterSettle := f.governorWakes
-	f.memAvailable -= 16 << 30
-	for i := 0; i < sliceCeilingSamples; i++ {
-		f.now = f.now.Add(2 * time.Second)
-		evaluateSliceCeiling(sliceCeilingEnforce, state, deps)
-	}
-	if f.governorWakes != wakesAfterSettle {
-		t.Fatalf("governor woken %d times while lowering, want none", f.governorWakes-wakesAfterSettle)
-	}
-	f.memAvailable += 32 << 30
-	f.now = f.now.Add(2 * time.Second)
-	evaluateSliceCeiling(sliceCeilingEnforce, state, deps)
-	if f.governorWakes != wakesAfterSettle+1 {
-		t.Fatalf("governor woken %d times on a raise, want exactly one", f.governorWakes-wakesAfterSettle)
 	}
 }
 
@@ -841,30 +814,6 @@ func TestSliceCeilingDoesNotAuthoriseANewlyRaisedMaximum(t *testing.T) {
 	}
 }
 
-// verifies: EXPIRY hands admission back the raw maximum, which is an effective
-// RAISE, so it must wake the kick-driven governor exactly as a published raise
-// does. RED against expiring without a signal (parked RAM-aware workers would
-// stay parked until an unrelated event).
-func TestSliceCeilingExpiryWakesTheGovernor(t *testing.T) {
-	f := newCeilingFixture()
-	deps := f.deps(16 << 30)
-	state := &sliceCeilingState{}
-	if settled := settle(t, f, state, deps); settled.State != sliceCeilingThrottled {
-		t.Fatalf("state=%q, want a throttled starting point", settled.State)
-	}
-	f.memOK = false
-	f.now = f.now.Add(2 * time.Second)
-	evaluateSliceCeiling(sliceCeilingEnforce, state, deps)
-	wakesBeforeExpiry := f.governorWakes
-	f.now = f.now.Add(defaultSliceCeilingTTL)
-	if expired := evaluateSliceCeiling(sliceCeilingEnforce, state, deps); expired.State != sliceCeilingUnevaluated {
-		t.Fatalf("snapshot=%+v, want expiry", expired)
-	}
-	if f.governorWakes != wakesBeforeExpiry+1 {
-		t.Fatalf("governor woken %d times on expiry, want exactly one", f.governorWakes-wakesBeforeExpiry)
-	}
-}
-
 // verifies: mode OFF is EXACTLY today's behaviour, including configuration. An
 // invalid interval must not refuse to start the daemon when the subsystem is not
 // wanted -- the shipping default is off, and "off changes nothing" is the safety
@@ -1075,4 +1024,64 @@ func TestSliceCeilingDoesNotReachTheOOMEscalationClamp(t *testing.T) {
 	}
 	_ = clientConn.Close()
 	<-done
+}
+
+// TestSliceCeilingRaiseStillPublishesAfterTheGovernorWakeIsGone is AIRA-33's
+// forward-only guard on the raise path.
+//
+// It is deliberately NOT presented as red-against-master: on master
+// evaluateSliceCeiling guards `deps.signalGovernor != nil`, so a fixture with no
+// signal already published a raise exactly as it does here. Claiming this test
+// "fails before the change" would be a fabricated evidence record.
+//
+// Its ADDED value over TestSliceCeilingSubQuantumMovementIsIgnored, which
+// already asserts that a multi-quantum raise moves the ceiling, is narrow and
+// worth stating precisely rather than overclaiming (an adversarial build-review
+// caught an earlier version of this comment asserting, falsely, that the publish
+// and the wake call shared one `if` -- they did not; publishSliceCeiling was
+// called BEFORE the signal branch, and the deletion could not have taken it):
+//
+//   - it asserts the SNAPSHOT actually reached deps.publish carrying the raised
+//     figure, not merely that the returned value moved. That is the seam every
+//     remaining consumer reads the ceiling through now that the signal is gone,
+//     and no other raise test inspects f.published at all.
+//   - it pins the raise as still THROTTLED, i.e. the state in which the wake
+//     used to matter, rather than an unthrottling raise that publishes the raw
+//     maximum through a different branch.
+//
+// verifies: AIRA-33
+func TestSliceCeilingRaiseStillPublishesAfterTheGovernorWakeIsGone(t *testing.T) {
+	f := newCeilingFixture()
+	deps := f.deps(16 << 30)
+	state := &sliceCeilingState{}
+	settle(t, f, state, deps)
+	if !state.havePub {
+		t.Fatal("fixture never established a ceiling, so the raise below proves nothing")
+	}
+	settled, publishedBefore := state.published, len(f.published)
+
+	// A raise well clear of the 256MiB quantum, sustained past the window so
+	// max()-over-the-window cannot hold the old figure -- and small enough that
+	// the ceiling stays BELOW the 64GiB static max, i.e. still THROTTLED. That
+	// is deliberately the interesting case: an unthrottling raise publishes the
+	// raw maximum through a different branch, whereas a throttled raise is the
+	// one the deleted governor wake was attached to.
+	f.memAvailable += 8 << 30
+	for i := 0; i < sliceCeilingSamples; i++ {
+		f.now = f.now.Add(2 * time.Second)
+		evaluateSliceCeiling(sliceCeilingEnforce, state, deps)
+	}
+	if state.published <= settled {
+		t.Fatalf("published ceiling %d did not rise above %d: the raise branch was lost with the governor wake", state.published, settled)
+	}
+	if len(f.published) <= publishedBefore {
+		t.Fatal("the raise updated state but published no snapshot: a consumer polling publishSliceCeilingSnapshot would never see it")
+	}
+	last := f.published[len(f.published)-1]
+	if last.Ceiling != state.published {
+		t.Fatalf("published snapshot Ceiling=%d, want the raised %d", last.Ceiling, state.published)
+	}
+	if last.State != sliceCeilingThrottled {
+		t.Fatalf("published state=%q, want %q", last.State, sliceCeilingThrottled)
+	}
 }

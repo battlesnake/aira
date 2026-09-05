@@ -56,11 +56,14 @@ jobs:
       # under -race, and `make race` is green on internal/daemon and
       # internal/runner locally.
       #
-      # What still blocks the job is one named test, not the pass:
-      # TestRealPytestRAMForkDoesNotPinHelperStdin remains load-flaky on its
-      # SIGTERM budget (AIRA-65), which is a hardcoded process.wait(timeout=1.0)
-      # in the xdist governor — production code inside AIRA-33's deletion scope,
-      # so hardening it would be thrown away. Re-adding -race before AIRA-33
-      # lands would declare clean a suite that still contains a known flake, so
-      # it waits for AIRA-33 (itself blocked on AIRA-91) or for an explicit
-      # quarantine of that one test, said out loud rather than done silently.
+      # AIRA-33 has LANDED, which clears the named blocker: the one remaining
+      # flake was TestRealPytestRAMForkDoesNotPinHelperStdin, load-flaky on a
+      # hardcoded process.wait(timeout=1.0) inside the xdist governor, and that
+      # test and that production code were both deleted with the plugin.
+      #
+      # This job is still NOT re-added here, deliberately. Turning -race on is
+      # AIRA-20's own ticket, and AIRA-20 records further wall-clock-tight tests
+      # in internal/runner beyond the one AIRA-33 removed. Enabling it in the
+      # deletion PR would be claiming green for a suite whose flake inventory
+      # nobody has re-measured — exactly what the paragraph above forbids. What
+      # remains is AIRA-20's measurement, not a blocked precondition.

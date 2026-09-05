@@ -298,20 +298,19 @@ def fork_worker(scope_path):
 
     Who actually registers such a handler (the audit AIRA-37 asked for --
     answered with real registrants, not a "shouldn't happen" assurance):
-      - aitest itself: NONE. AIRA's Python contains exactly one real
-        os.register_at_fork CALL, and it is not in this package. (A grep
-        finds the ordering test named above too: that registration lives in
-        a source string the test runs as a throwaway SUBPROCESS, on
-        purpose, so it never arms in aitest's own interpreter.)
-      - That one site is AIRA's OWN sibling plugin,
-        aira_xdist_governor/__init__.py (module scope, so it arms on
-        import), and it is not hypothetical here: forked aitest workers
+      - aitest itself: NONE. Since AIRA-33 deleted the sibling
+        aira_xdist_governor plugin, AIRA's Python contains ZERO real
+        os.register_at_fork CALLS. (A grep finds the ordering test named
+        above: that registration lives in a source string the test runs as a
+        throwaway SUBPROCESS, on purpose, so it never arms in aitest's own
+        interpreter.)
+        Until AIRA-33 that one site was aira_xdist_governor/__init__.py, at
+        module scope, and it was not hypothetical: forked aitest workers
         permanently disabling that governor via its after_in_child handler
-        is established behaviour (AIRA-92), and core/skill.go tells projects
-        adopting aitest to stop registering it or pass
-        `-p no:aira_xdist_governor` precisely because both plugins can live
-        in one interpreter. So on a real co-registered run, third-party-
-        shaped code DOES run in this window today.
+        was established behaviour (AIRA-92). That co-registration cannot
+        happen any more, so AIRA no longer contributes a handler to this
+        window itself. The window is still real, because of the stdlib and
+        third-party registrants below.
       - The stdlib: logging, threading and random all register
         after_in_child handlers at import, and pytest imports all three
         (checked against pytest 9.0.3); asyncio.events and
@@ -338,9 +337,10 @@ def fork_worker(scope_path):
     blocks on a lock some other thread held at fork time deadlocks the
     child. The supervisor is single-threaded by design (supervisor.py's
     AIRA-92 note), which bounds that from AIRA's side without eliminating
-    it, since plugins sharing the interpreter may start threads of their own
-    -- and the governor handler above closes buffered streams, which takes
-    buffered-IO locks, i.e. is exactly this class.
+    it, since plugins sharing the interpreter may start threads of their own.
+    The deleted governor's own handler was exactly this class (it closed
+    buffered streams, taking buffered-IO locks); it is named here as the
+    worked example of the hazard, not as a live registrant.
 
     Still accepted for Slice 1, and for a stronger reason than "the window
     is tiny": a raw ctypes clone3(CLONE_INTO_CGROUP) would place the child

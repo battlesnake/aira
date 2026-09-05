@@ -1,6 +1,11 @@
 # Scheduler Slice 1 — cgroup cpu.weight aging (AIRA-14 residual fix)
 
 - **Status:** DONE + MERGED (`3708af5`) + DEPLOYED + live-verified 2026-08-30. Closes **AIRA-14**.
+- **STILL LIVE after AIRA-33.** AIRA-33 retired the cooperative scheduler's Slices 2 and 3
+  (the daemon park/active-set scheduler and its RAM-ordered activation) and deleted their
+  specs. THIS slice is not part of that deletion: `ConfineCPUWeightAging`, the
+  `cpu-weight=aging` trailer facet and the `+cpu` subtree-control delegation all remain live
+  in `internal/runner/confine_linux.go`, and this document is their only design record.
   Owner-approved design (scheduler spec §3.1: cpu.weight decay).
 - **Live verify:** a fresh confine scope carries `cpu.weight=100`, the parent's
   `cgroup.subtree_control` now propagates `cpu memory pids` (the `+cpu` delegation repair the

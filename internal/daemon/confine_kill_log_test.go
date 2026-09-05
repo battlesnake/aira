@@ -17,7 +17,7 @@ import (
 
 // captureDaemonLog redirects the standard logger for the duration of one call.
 // The daemon logs through the package-level logger everywhere else (admit.go,
-// governor.go, confine_reaper.go), so this is the same channel an operator
+// sliceceiling.go, confine_reaper.go), so this is the same channel an operator
 // actually reads in journalctl.
 func captureDaemonLog(t *testing.T, run func()) string {
 	t.Helper()

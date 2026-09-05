@@ -56,8 +56,6 @@ func (r *Runner) MemoryReserve() int64 { return r.memoryReserve }
 
 func (r *Runner) SetInputRuntimeDir(path string) { r.inputRuntimeDir = path }
 
-func (r *Runner) SidecarRuntimeDir() string { return r.inputRuntimeDir }
-
 func (r *Runner) SetSupervisorLeaseReader(read func(context.Context, string) (bool, error)) {
 	r.supervisorLeaseReaderConfigured = read != nil
 }

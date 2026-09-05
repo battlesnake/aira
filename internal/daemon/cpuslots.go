@@ -13,8 +13,10 @@ import (
 	"time"
 )
 
-// desiredCPUSlots is the daemon governor's active-set capacity. Reserve one
-// CPU for interactive work by default, but never reduce capacity below one.
+// desiredCPUSlots is the worker-admit CPU gate's concurrency capacity (AIRA-64).
+// It was shared with the daemon scheduler's active-set capacity until AIRA-33
+// deleted that scheduler; the gate is now its sole consumer. Reserve one CPU for
+// interactive work by default, but never reduce capacity below one.
 func desiredCPUSlots(cpuCount int) (int, error) {
 	reserve := 1
 	if raw, present := os.LookupEnv("AIRA_DAEMON_CPU_RESERVE"); present && raw != "" {

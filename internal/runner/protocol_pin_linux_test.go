@@ -31,9 +31,10 @@ func TestRunnerDaemonProtocolVersionMatchesTheDaemon(t *testing.T) {
 
 // TestNoProductionCodeWritesALiteralProtocolVersion closes the hole the pin
 // above does not: a wire frame built with a hand-written NUMBER rather than the
-// constant. internal/runner/governor_slot.go carried `Proto: 5` for exactly that
-// reason and would have silently failed protocol negotiation the moment
-// ProtocolVersion moved (found while bumping it for AIRA-39). A grep test needs
+// constant. The since-deleted internal/runner/governor_slot.go carried
+// `Proto: 5` for exactly that reason and would have silently failed protocol
+// negotiation the moment ProtocolVersion moved (found while bumping it for
+// AIRA-39; the file went with AIRA-33, the hole it proved did not). A grep test needs
 // no new tooling and runs under `go test`, per this repo's rule against gates
 // that can skip silently.
 //

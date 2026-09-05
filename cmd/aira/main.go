@@ -190,13 +190,6 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 		}
 		return runConfineReserveCommand(context.Background(), options, stdin, stdout, stderr)
 	}
-	if verb == "governor-slot" {
-		if jsonOutput {
-			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for governor-slot", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
-			return render(response, true, stdout, stderr)
-		}
-		return runGovernorSlotCommand(context.Background(), options, stdin, stdout, stderr)
-	}
 	if verb == "aitest-bootstrap" {
 		if jsonOutput {
 			response := core.Response{Code: "E_CONFINE_ARGUMENT_INVALID", Error: "E_CONFINE_ARGUMENT_INVALID: option --json is not valid for aitest-bootstrap", Exit: codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")}
@@ -596,9 +589,6 @@ func parseArgs(verb string, argv []string) ([]string, map[string]string, error) 
 	if verb == "confine-reserve" {
 		return parseConfineReserveArgs(argv)
 	}
-	if verb == "governor-slot" {
-		return parseGovernorSlotArgs(argv)
-	}
 	if verb == "aitest-bootstrap" {
 		return parseAitestBootstrapArgs(argv)
 	}
@@ -860,29 +850,6 @@ func parseConfineReserveArgs(argv []string) ([]string, map[string]string, error)
 	return nil, options, nil
 }
 
-func parseGovernorSlotArgs(argv []string) ([]string, map[string]string, error) {
-	options := map[string]string{}
-	for index := 0; index < len(argv); index++ {
-		arg := argv[index]
-		if !strings.HasPrefix(arg, "--") || arg == "--" {
-			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: unexpected governor-slot argument %q", arg)
-		}
-		name := strings.TrimPrefix(arg, "--")
-		if name != "job-id" && name != "socket" {
-			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s is not valid for governor-slot", name)
-		}
-		if _, exists := options[name]; exists {
-			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s may occur once", name)
-		}
-		if index+1 >= len(argv) || strings.HasPrefix(argv[index+1], "--") {
-			return nil, nil, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: option --%s requires a value", name)
-		}
-		index++
-		options[name] = argv[index]
-	}
-	return nil, options, nil
-}
-
 func parseAitestBootstrapArgs(argv []string) ([]string, map[string]string, error) {
 	options := map[string]string{}
 	for i := 0; i < len(argv); i++ {
@@ -1075,7 +1042,7 @@ func runConfineCommand(ctx context.Context, target []string, options map[string]
 		request.RuntimeDir = paths.RuntimeDir
 		request.AdmitSocketPath = paths.SocketPath
 	} else if stderr != nil {
-		_, _ = fmt.Fprintf(stderr, "confine: daemon paths unavailable; admission will use flock and CPU governor is disabled: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "confine: daemon paths unavailable; admission will use flock and no aitest coordinates are exported: %v\n", err)
 	}
 	if options["detach"] == "true" {
 		return runConfineDetachCommand(ctx, request, stdout, stderr)
@@ -1491,28 +1458,6 @@ func runWorkerAdmitCommand(ctx context.Context, options map[string]string, stdin
 	}
 	_ = lease.Close()
 	return 0
-}
-
-func runGovernorSlotCommand(ctx context.Context, options map[string]string, stdin io.Reader, stdout, stderr io.Writer) int {
-	jobID := strings.TrimSpace(options["job-id"])
-	if jobID == "" {
-		jobID = strings.TrimSpace(os.Getenv("AIRA_CONFINE_SCOPE_ID"))
-	}
-	socket := strings.TrimSpace(options["socket"])
-	if socket == "" {
-		paths, err := daemon.PathsFromEnv()
-		if err != nil {
-			// The relay's public contract is fail-open even before it can dial.
-			_, _ = fmt.Fprintln(stdout, "continue")
-			return 0
-		}
-		socket = paths.SocketPath
-	}
-	slice := strings.TrimSpace(os.Getenv("AIRA_GOVERNOR_SLICE"))
-	if slice == "" {
-		slice = runner.DefaultConfineSlice
-	}
-	return runner.GovernorSlot(ctx, runner.GovernorSlotRequest{SocketPath: socket, JobID: jobID, Slice: slice, Stdin: stdin, Stdout: stdout})
 }
 
 func resolveConfineOwner(ctx context.Context, explicit string) (string, error) {

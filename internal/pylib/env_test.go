@@ -10,105 +10,92 @@ import (
 	"testing"
 )
 
-func TestAppendChildEnvironmentInjectsAuthoritativePathsAndTunables(t *testing.T) {
-	t.Setenv("XDG_DATA_HOME", t.TempDir())
-	t.Setenv("AIRA_GOVERNOR_MAX_WAIT", "12s")
-	runtimeDir := filepath.Join(t.TempDir(), "runtime")
-	env := []string{
-		"PATH=/bin",
-		"AIRA_PY_LIB=/stale",
-		"AIRA_GOVERNOR_CMD=/stale/aira",
-		"AIRA_CONFINE_SCOPE_ID=stale-scope",
-		"AIRA_GOVERNOR_MAX_WAIT=7s",
-	}
-	got := AppendChildEnvironment(env, runtimeDir, nil)
-	values := childEnvValues(t, got)
-	if values["AIRA_PY_LIB"] == "" || values["AIRA_PY_LIB"] == "/stale" {
-		t.Fatalf("AIRA_PY_LIB=%q", values["AIRA_PY_LIB"])
-	}
-	if values["AIRA_GOVERNOR_MAX_WAIT"] != "12s" {
-		t.Fatalf("authoritative governor max-wait=%q", values["AIRA_GOVERNOR_MAX_WAIT"])
-	}
-	if _, err := os.Stat(filepath.Join(values["AIRA_PY_LIB"], "aira_xdist_governor", "__init__.py")); err != nil {
-		t.Fatalf("injected module path is not importable: %v", err)
-	}
+// legacyGovernorEnvironmentKeys are the coordinates AIRA-33 retired with the
+// aira_xdist_governor plugin. AIRA still STRIPS every one of them; it must never
+// SET one again.
+var legacyGovernorEnvironmentKeys = []string{
+	"AIRA_PY_LIB",
+	"AIRA_GOVERNOR",
+	"AIRA_GOVERNOR_CMD",
+	"AIRA_GOVERNOR_MAX_WAIT",
+	"AIRA_GOVERNOR_SLICE",
+	"AIRA_TEST_MEM_GOVERNOR",
+	"AIRA_TEST_MEM_DEFAULT",
+	"AIRA_TEST_MEM_GROWTH_HEADROOM",
+	"AIRA_CONFINE_RESERVE_CMD",
 }
 
-func TestAppendChildEnvironmentSkipsEverythingOnExtractionFailure(t *testing.T) {
-	previousExtract := extractForChild
-	previousOnce := childEnvFailureOnce
-	extractForChild = func() (string, error) { return "", errors.New("injected extraction failure") }
-	childEnvFailureOnce = new(sync.Once)
-	t.Cleanup(func() {
-		extractForChild = previousExtract
-		childEnvFailureOnce = previousOnce
-	})
-	t.Setenv("AIRA_GOVERNOR_MAX_WAIT", "12s")
-	input := []string{
-		"PATH=/bin",
-		"AIRA_PY_LIB=/stale",
-		"AIRA_GOVERNOR_CMD=/stale/aira",
-		"AIRA_CONFINE_SCOPE_ID=stale-scope",
-		"AIRA_GOVERNOR_MAX_WAIT=99s",
+// TestAppendConfineChildEnvironmentStripsTheRetiredGovernorCoordinates is the
+// unit-level half of AIRA-33's env guard (the behaviour-level half, through a
+// real confine launch, is TestConfineDelegateRAMDeliversNoLegacyGovernorCoordinates
+// in internal/runner).
+//
+// The two halves of the assertion are load-bearing TOGETHER. Absence alone would
+// be satisfied by a function that returned an empty slice, or by one that never
+// stripped because nothing ever set the keys; presence of AIRA_CONFINE_SCOPE_ID
+// -- overwritten from a STALE inherited value, so it must be a real upsert --
+// is what makes the absences mean something. The scope id itself is not
+// decorative: runner.InheritedConfineScopeID reads it, and confine-reserve uses
+// it as ParentScopeID, which is what stops a sub-reservation being charged to
+// the slice as new work.
+//
+// verifies: AIRA-33
+func TestAppendConfineChildEnvironmentStripsTheRetiredGovernorCoordinates(t *testing.T) {
+	// Every retired key present in the input, so absence must be a strip.
+	inherited := []string{"PATH=/bin", "AIRA_CONFINE_SCOPE_ID=stale-scope"}
+	for _, key := range legacyGovernorEnvironmentKeys {
+		inherited = append(inherited, key+"=/stale-"+key)
 	}
-	var diagnostics bytes.Buffer
-	first := AppendChildEnvironment(input, t.TempDir(), &diagnostics)
-	second := AppendChildEnvironment(input, t.TempDir(), &diagnostics)
-	for _, got := range [][]string{first, second} {
-		values := childEnvValues(t, got)
-		if len(values) != 1 || values["PATH"] != "/bin" {
-			t.Fatalf("failure retained governor environment: %v", got)
+	got := childEnvValues(t, AppendConfineChildEnvironment(inherited, "scope-123"))
+	for _, key := range legacyGovernorEnvironmentKeys {
+		if value, present := got[key]; present {
+			t.Errorf("retired coordinate %s=%q survived; AIRA-33 deleted the plugin that read it", key, value)
 		}
 	}
-	if strings.Count(diagnostics.String(), "injected extraction failure") != 1 {
-		t.Fatalf("failure was not logged once: %q", diagnostics.String())
+	if got["AIRA_CONFINE_SCOPE_ID"] != "scope-123" {
+		t.Fatalf("AIRA_CONFINE_SCOPE_ID=%q, want the launch scope id overwriting the stale inherited one (its absence would also make every assertion above vacuous)", got["AIRA_CONFINE_SCOPE_ID"])
+	}
+	if got["PATH"] != "/bin" {
+		t.Fatalf("the strip took an unrelated variable with it: %v", got)
 	}
 }
 
-func TestAppendChildEnvironmentWithoutRuntimeDirIsSideEffectFree(t *testing.T) {
-	dataHome := filepath.Join(t.TempDir(), "must-not-exist")
-	t.Setenv("XDG_DATA_HOME", dataHome)
-	input := []string{"PATH=/bin", "AIRA_GOVERNOR_CMD=/stale/aira"}
-	got := AppendChildEnvironment(input, "", nil)
+// TestAppendConfineChildEnvironmentStripsWithNoScopeID pins the "" case, which
+// is the one an ordinary (non-confine) launch and a scope-id-less confine both
+// take: strip, publish nothing, and in particular do not publish an empty
+// AIRA_CONFINE_SCOPE_ID= that InheritedConfineScopeID would then have to reject.
+//
+// verifies: AIRA-33
+func TestAppendConfineChildEnvironmentStripsWithNoScopeID(t *testing.T) {
+	got := AppendConfineChildEnvironment([]string{"PATH=/bin", "AIRA_PY_LIB=/stale", "AIRA_CONFINE_SCOPE_ID=stale-scope"}, "")
 	if strings.Join(got, "\x00") != "PATH=/bin" {
-		t.Fatalf("empty runtime retained governor environment: %v", got)
-	}
-	if _, err := os.Stat(dataHome); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("empty runtime extracted sidecar: %v", err)
+		t.Fatalf("scope-id-less launch published or retained coordinates: %v", got)
 	}
 }
 
-func TestConfineRAMGovernorEnvironmentIsCoupledToDelegateMode(t *testing.T) {
-	t.Setenv("XDG_DATA_HOME", t.TempDir())
-	t.Setenv("AIRA_TEST_MEM_GROWTH_HEADROOM", "768M")
-	runtimeDir := filepath.Join(t.TempDir(), "runtime")
-	inherited := []string{
-		"PATH=/bin",
-		"AIRA_TEST_MEM_GOVERNOR=stale",
-		"AIRA_TEST_MEM_DEFAULT=99G",
-		"AIRA_TEST_MEM_GROWTH_HEADROOM=99G",
-		"AIRA_CONFINE_RESERVE_CMD=/stale/aira",
-		"AIRA_GOVERNOR_CMD=/stale/aira",
-		"AIRA_CONFINE_SCOPE_ID=stale-scope",
-		"AIRA_GOVERNOR=off",
-	}
-	nondelegate := childEnvValues(t, AppendConfineChildEnvironment(inherited, runtimeDir, nil, false, "", "", "ordinary-scope", "ordinary.slice"))
-	for _, key := range []string{"AIRA_TEST_MEM_GOVERNOR", "AIRA_TEST_MEM_DEFAULT", "AIRA_TEST_MEM_GROWTH_HEADROOM", "AIRA_CONFINE_RESERVE_CMD", "AIRA_GOVERNOR_CMD", "AIRA_GOVERNOR_SLICE", "AIRA_GOVERNOR"} {
-		if _, present := nondelegate[key]; present {
-			t.Fatalf("non-delegate launch retained %s: %v", key, nondelegate)
+// TestStripCoordinationEnvironmentStillCoversEveryRetiredKey is the guard on the
+// deliberate asymmetry AIRA-33 leaves behind: nine keys that are stripped but
+// never set.
+//
+// The temptation on a future cleanup is to "tidy" the strip set down to the one
+// key still exported. That would be wrong, and silently so: a child launched
+// from inside a still-running PRE-deletion delegate job inherits a live
+// AIRA_PY_LIB pointing at an extant extraction directory, and carrying it into a
+// conftest that guards on it is a stale-plugin import path with no error to
+// announce it. Nine map entries buy that away.
+//
+// verifies: AIRA-33
+func TestStripCoordinationEnvironmentStillCoversEveryRetiredKey(t *testing.T) {
+	for _, key := range legacyGovernorEnvironmentKeys {
+		if !IsCoordinationEnvironmentKey(key) {
+			t.Errorf("%s left the strip set; an inherited value would now reach a child", key)
+		}
+		if got := StripCoordinationEnvironment([]string{"PATH=/bin", key + "=/stale"}); strings.Join(got, "\x00") != "PATH=/bin" {
+			t.Errorf("StripCoordinationEnvironment kept %s: %v", key, got)
 		}
 	}
-	if nondelegate["AIRA_CONFINE_SCOPE_ID"] != "ordinary-scope" {
-		t.Fatalf("ordinary child scope=%q environment=%v", nondelegate["AIRA_CONFINE_SCOPE_ID"], nondelegate)
-	}
-	delegate := childEnvValues(t, AppendConfineChildEnvironment(inherited, runtimeDir, nil, true, "/opt/aira", "768M", "scope-123", "finite.slice"))
-	if delegate["AIRA_TEST_MEM_GOVERNOR"] != "1" || delegate["AIRA_TEST_MEM_DEFAULT"] != "768M" || delegate["AIRA_TEST_MEM_GROWTH_HEADROOM"] != "768M" || delegate["AIRA_CONFINE_RESERVE_CMD"] != "/opt/aira" || delegate["AIRA_GOVERNOR_CMD"] != "/opt/aira" || delegate["AIRA_CONFINE_SCOPE_ID"] != "scope-123" || delegate["AIRA_GOVERNOR_SLICE"] != "finite.slice" || delegate["AIRA_GOVERNOR"] != "daemon" {
-		t.Fatalf("delegate RAM environment=%v", delegate)
-	}
-	t.Setenv("AIRA_GOVERNOR", "off")
-	off := childEnvValues(t, AppendConfineChildEnvironment(inherited, runtimeDir, nil, true, "/opt/aira", "768M", "scope-off", "finite.slice"))
-	if off["AIRA_GOVERNOR"] != "off" {
-		t.Fatalf("governor opt-out=%q environment=%v", off["AIRA_GOVERNOR"], off)
+	if !IsCoordinationEnvironmentKey("AIRA_CONFINE_SCOPE_ID") {
+		t.Error("AIRA_CONFINE_SCOPE_ID left the strip set: a nested launch would inherit its parent's scope id unchanged")
 	}
 }
 

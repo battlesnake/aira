@@ -10,11 +10,12 @@ Activate with `--aitest-workers=N` (a fixed worker count) or
 flag rather than a reinterpretation of `-n` — a project with `pytest-xdist`
 installed for unrelated reasons must not have its flag silently hijacked.
 
-`aitest` is a from-scratch replacement for `aira_xdist_governor` (this
-package's sibling under `internal/pylib/`), which is retired once `aitest`
-reaches feature parity — see
+`aitest` is a from-scratch replacement for `aira_xdist_governor`, which was this
+package's sibling under `internal/pylib/` and which AIRA-33 has now deleted along
+with the `governor-slot` relay and the daemon-side park/active-set scheduler.
+`aitest` is therefore AIRA's only pytest plugin. See
 [`docs/superpowers/specs/2026-09-01-aitest-design.md`](../../../docs/superpowers/specs/2026-09-01-aitest-design.md)
-for the full design, staging, and the governor's retirement plan (§3.8).
+for the full design and staging (the retirement plan is §3.8).
 
 ## Reporting (Slice 2, AIRA-31)
 

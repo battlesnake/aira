@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -12,9 +11,6 @@ import (
 )
 
 var (
-	extractForChild     = ExtractPyLib
-	childEnvFailureOnce = new(sync.Once)
-
 	extractAitestForChild = ExtractAitest
 	aitestEnvFailureOnce  = new(sync.Once)
 )
@@ -92,12 +88,27 @@ func AppendAitestChildEnvironment(env []string, runtimeDir string, diagnostics i
 	return result
 }
 
-var governorEnvironmentKeys = map[string]struct{}{
+// coordinationEnvironmentKeys is the STRIP set: launch coordination rather than
+// part of the tested child environment identity.
+//
+// AIRA-33 deleted the aira_xdist_governor plugin and every mechanism that read
+// the nine legacy keys below, so AIRA never SETS one again. They stay in the
+// strip set deliberately, and the asymmetry is the point: a child launched from
+// inside a still-running pre-deletion job can still inherit a live AIRA_PY_LIB
+// pointing at an extant extraction directory, and carrying that into a conftest
+// that guards on it is a stale-plugin import path. Stripping costs nine map
+// entries; not stripping costs a silent resurrection. AIRA_CONFINE_SCOPE_ID is
+// the one key here that is both stripped and re-exported (see
+// AppendConfineChildEnvironment) because runner.InheritedConfineScopeID reads it
+// to attach a confine-reserve sub-reservation to its parent job.
+var coordinationEnvironmentKeys = map[string]struct{}{
+	"AIRA_CONFINE_SCOPE_ID": {},
+
+	// Retired by AIRA-33: stripped, never set.
 	"AIRA_PY_LIB":                   {},
 	"AIRA_GOVERNOR":                 {},
 	"AIRA_GOVERNOR_CMD":             {},
 	"AIRA_GOVERNOR_MAX_WAIT":        {},
-	"AIRA_CONFINE_SCOPE_ID":         {},
 	"AIRA_GOVERNOR_SLICE":           {},
 	"AIRA_TEST_MEM_GOVERNOR":        {},
 	"AIRA_TEST_MEM_DEFAULT":         {},
@@ -105,22 +116,21 @@ var governorEnvironmentKeys = map[string]struct{}{
 	"AIRA_CONFINE_RESERVE_CMD":      {},
 }
 
-const DefaultTestMemoryReserve = "512M"
-
-// IsGovernorEnvironmentKey reports whether key is launch coordination rather
+// IsCoordinationEnvironmentKey reports whether key is launch coordination rather
 // than part of the tested child environment identity.
-func IsGovernorEnvironmentKey(key string) bool {
-	_, ok := governorEnvironmentKeys[key]
+func IsCoordinationEnvironmentKey(key string) bool {
+	_, ok := coordinationEnvironmentKeys[key]
 	return ok
 }
 
-// StripGovernorEnvironment removes inherited or explicitly supplied governor
-// coordinates. Failed setup must disable gating rather than retain stale state.
-func StripGovernorEnvironment(env []string) []string {
+// StripCoordinationEnvironment removes inherited or explicitly supplied launch
+// coordinates. Failed setup must disable coordination rather than retain stale
+// state.
+func StripCoordinationEnvironment(env []string) []string {
 	result := make([]string, 0, len(env))
 	for _, entry := range env {
 		key, _, ok := strings.Cut(entry, "=")
-		if ok && IsGovernorEnvironmentKey(key) {
+		if ok && IsCoordinationEnvironmentKey(key) {
 			continue
 		}
 		result = append(result, entry)
@@ -128,68 +138,25 @@ func StripGovernorEnvironment(env []string) []string {
 	return result
 }
 
-// AppendChildEnvironment exposes the sidecar to a child. Extraction is
-// advisory: on any failure it returns an environment with
-// every governor variable stripped, disabling gating instead of using stale
-// inherited coordinates.
-func AppendChildEnvironment(env []string, runtimeDir string, diagnostics io.Writer) []string {
-	return appendChildEnvironment(env, runtimeDir, diagnostics, false, "", "", "", "")
-}
-
-// AppendConfineChildEnvironment couples per-test RAM governance to an explicit
-// delegate-RAM confine launch. Every other launch strips these coordinates.
-func AppendConfineChildEnvironment(env []string, runtimeDir string, diagnostics io.Writer, delegateRAM bool, reserveCommand, memoryDefault, scopeID, slice string) []string {
-	return appendChildEnvironment(env, runtimeDir, diagnostics, delegateRAM, reserveCommand, memoryDefault, scopeID, slice)
-}
-
-func appendChildEnvironment(env []string, runtimeDir string, diagnostics io.Writer, delegateRAM bool, reserveCommand, memoryDefault, scopeID, slice string) []string {
-	result := StripGovernorEnvironment(env)
-	if strings.TrimSpace(runtimeDir) == "" {
+// AppendConfineChildEnvironment publishes the confine scope id to a confined
+// child, having first stripped every inherited launch coordinate.
+//
+// Until AIRA-33 this also armed the aira_xdist_governor plugin on a
+// --delegate-ram launch (extracting the sidecar, exporting AIRA_PY_LIB and the
+// per-test RAM keys). All of that is gone; what a delegate-RAM launch means now
+// is a pinned framework-overhead reserve and a generous scope ceiling, decided
+// entirely in the runner, with no child-side participation.
+//
+// Behaviour improvement, stated so it is not mistaken for an accident: the scope
+// id used to be exported only if the (now deleted) sidecar extraction succeeded
+// AND a RuntimeDir was supplied. Neither gate has anything to do with the scope
+// id, so both are gone and it now exports whenever there is one.
+func AppendConfineChildEnvironment(env []string, scopeID string) []string {
+	result := StripCoordinationEnvironment(env)
+	if scopeID == "" {
 		return result
 	}
-	pythonDir, err := extractForChild()
-	if err != nil {
-		childEnvFailureOnce.Do(func() {
-			if diagnostics != nil {
-				_, _ = fmt.Fprintf(diagnostics, "aira scheduler governor disabled: %v\n", err)
-				return
-			}
-			log.Printf("aira scheduler governor disabled: %v", err)
-		})
-		return result
-	}
-	result = upsertChildEnv(result, "AIRA_PY_LIB", pythonDir)
-	if scopeID != "" {
-		result = upsertChildEnv(result, "AIRA_CONFINE_SCOPE_ID", scopeID)
-	}
-	for _, key := range []string{"AIRA_GOVERNOR_MAX_WAIT"} {
-		if value, configured := os.LookupEnv(key); configured {
-			result = append(result, key+"="+value)
-		}
-	}
-	if delegateRAM {
-		if strings.TrimSpace(memoryDefault) == "" {
-			memoryDefault = DefaultTestMemoryReserve
-		}
-		result = upsertChildEnv(result, "AIRA_TEST_MEM_GOVERNOR", "1")
-		// Kept for the plugin's malformed-marker fallback. Unmarked tests reserve
-		// measured RSS plus growth headroom; this value is no longer their floor.
-		result = upsertChildEnv(result, "AIRA_TEST_MEM_DEFAULT", memoryDefault)
-		result = upsertChildEnv(result, "AIRA_CONFINE_RESERVE_CMD", reserveCommand)
-		// The relay uses the same resolved self binary as confine-reserve and
-		// identifies this confined pytest session by its scope id.
-		result = upsertChildEnv(result, "AIRA_GOVERNOR_CMD", reserveCommand)
-		result = upsertChildEnv(result, "AIRA_GOVERNOR_SLICE", slice)
-		governor := strings.TrimSpace(os.Getenv("AIRA_GOVERNOR"))
-		if governor != "off" {
-			governor = "daemon"
-		}
-		result = upsertChildEnv(result, "AIRA_GOVERNOR", governor)
-		if value, configured := os.LookupEnv("AIRA_TEST_MEM_GROWTH_HEADROOM"); configured {
-			result = upsertChildEnv(result, "AIRA_TEST_MEM_GROWTH_HEADROOM", value)
-		}
-	}
-	return result
+	return upsertChildEnv(result, "AIRA_CONFINE_SCOPE_ID", scopeID)
 }
 
 func upsertChildEnv(env []string, key, value string) []string {

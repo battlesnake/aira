@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"aira/internal/core"
+	"aira/internal/runner"
 	"aira/internal/store"
 	"aira/internal/testdeadline"
 )
@@ -114,19 +116,36 @@ func TestStoreOpReplyStillUsesTheDaemonOwnedWriteDeadline(t *testing.T) {
 // repeat conn.SetReadDeadline(zero) inside five branches; this fix hoists it to
 // one site immediately after frame parse and deletes the five. If that single
 // clear were dropped, the handshake deadline would survive into every handler
-// that keeps reading the connection — the governor's framed reader here, and
-// equally watch's disconnect probe — and each would die at the connect budget
+// that keeps reading the connection, and each would die at the connect budget
 // instead of living as long as its own protocol allows.
+//
+// AIRA-33 RETARGETED this test from the `governor` verb to `worker-admit`. The
+// governor was the longest-lived framed reader in the daemon and so the natural
+// vehicle; with it deleted, worker-admit is the surviving handler that both
+// keeps reading its connection (the peer-watcher goroutine's one-byte read) and
+// legitimately outlives the handshake budget (its poll loop waits out
+// max_wait_ms). The INVARIANT under test is unchanged and still live; only the
+// vehicle moved. Concretely, with the clear dropped the peer-watcher read fails
+// at the connect budget, cancels peerCtx, and the handler returns without ever
+// writing a response — so the client below sees EOF instead of a frame.
 //
 // Kills: deleting the hoisted SetReadDeadline(time.Time{}).
 //
-// verifies: AIRA-84
+// verifies: AIRA-84, AIRA-33
 func TestHandshakeDeadlineDoesNotSurviveIntoAHandlersOwnReads(t *testing.T) {
 	paths := testPaths(t)
 	server := NewServer(paths)
 	server.deadlines.Connect = 100 * time.Millisecond
-	server.admitResolveSlice = func(slice string) (string, bool, string) { return "/slice", true, "" }
+	_ = newWorkerScopeTree().install(server)
+	// Saturated: the outer scope's own live usage consumes the whole ceiling, so
+	// the handler cannot grant and must sit in its poll loop -- which is what
+	// makes it outlive the connect budget rather than answering inside it.
+	server.admitReadMemory = admitReadMemoryFixture(
+		map[string]int64{"/outer": 2 * workerAdmitEstimatedBytesMin}, 2*workerAdmitEstimatedBytesMin)
+	server.workerAdmitHeadroom = 0
+	server.workerAdmitPollInterval = 10 * time.Millisecond
 	_, _ = startServer(t, server)
+	scope := testScope(t, paths, "one")
 
 	conn, err := net.Dial("unix", paths.SocketPath)
 	if err != nil {
@@ -136,23 +155,41 @@ func TestHandshakeDeadlineDoesNotSurviveIntoAHandlersOwnReads(t *testing.T) {
 	if err := conn.SetDeadline(time.Now().Add(testdeadline.Wait(10 * time.Second))); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeFrame(conn, RequestFrame{Proto: ProtocolVersion, Request: core.Request{Verb: "governor"}}); err != nil {
-		t.Fatalf("write governor handshake: %v", err)
+	started := time.Now()
+	// max_wait_ms deliberately exceeds deadlines.Connect several times over: the
+	// handler must still be alive, and still reading, long after the handshake
+	// budget would have expired.
+	if err := writeFrame(conn, RequestFrame{
+		Proto: ProtocolVersion, Scope: scope,
+		Request: core.Request{Verb: "worker-admit", Args: map[string]any{
+			"job_id": "job-1", "outer_scope": "/outer",
+			"estimated_bytes": float64(workerAdmitEstimatedBytesMin),
+			"max_wait_ms":     float64(500),
+		}},
+	}); err != nil {
+		t.Fatal(err)
 	}
-
-	// Outlive the handshake budget before saying anything else, which is the
-	// whole point: a governor session is long-lived by design.
-	time.Sleep(300 * time.Millisecond)
-
-	if err := writeFrame(conn, governorRequestFrame{Type: "acquire", WorkerUUID: "worker", JobID: "job", Slice: "aira.slice"}); err != nil {
-		t.Fatalf("write acquire: %v", err)
+	var frame ResponseFrame
+	if err := readFrame(conn, &frame); err != nil {
+		t.Fatalf("worker-admit died with the handshake deadline instead of waiting out max_wait_ms: %v", err)
 	}
-	var reply governorReplyFrame
-	if err := readFrame(conn, &reply); err != nil {
-		t.Fatalf("governor read died with the handshake deadline: %v", err)
+	// The elapsed LOWER bound is the actual subject: the handler answered only
+	// after outliving the connect budget several times over, which it could not
+	// have done had the handshake deadline survived into its peer-watcher read.
+	// A lower bound is also the AIRA-20-safe direction -- load makes it larger,
+	// never smaller.
+	if elapsed := time.Since(started); elapsed <= server.deadlines.Connect {
+		t.Fatalf("answered in %v, within the %v connect budget: this test proves nothing unless the handler outlives it", elapsed, server.deadlines.Connect)
 	}
-	if reply.State != "active" {
-		t.Fatalf("acquire reply state = %q, want active", reply.State)
+	// And the answer must be a real verdict, not an error frame that happens to
+	// arrive late. A permanently-saturated outer scope can never fit, so the
+	// handler polls until max_wait_ms elapses and reports timeout.
+	var response WorkerAdmitResponse
+	if err := json.Unmarshal(frame.Data, &response); err != nil {
+		t.Fatalf("frame=%+v: %v", frame, err)
+	}
+	if response.State != runner.WorkerAdmitStateTimeout {
+		t.Fatalf("state=%q, want %q (a permanently saturated outer scope waits out max_wait_ms)", response.State, runner.WorkerAdmitStateTimeout)
 	}
 }
 

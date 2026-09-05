@@ -37,7 +37,7 @@ import (
 //     this project's worst failure direction, a lie about work that happened.
 //
 // Deliberately NOT covered, so "symmetric" has a defined boundary: the
-// long-lived streaming paths (watch, admit, governor, worker-admit) own their
+// long-lived streaming paths (watch, admit, worker-admit) own their
 // own frames and already stamp their own justified write budgets, and
 // operation execution budgets (storeops.go) answer "how long may this run",
 // not "how long may this connection sit idle".

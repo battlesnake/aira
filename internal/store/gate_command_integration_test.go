@@ -357,7 +357,11 @@ func TestCommandCheckerStoresAuthoritativeRunnerEnvDigest(t *testing.T) {
 	}
 }
 
-func TestCommandCheckerIgnoresAllowedGovernorEnvironmentInDigest(t *testing.T) {
+// AIRA-33 note: AIRA_GOVERNOR_CMD is no longer SET by anything -- but it is
+// still in the strip set, and that is exactly what this test pins: a key AIRA
+// strips is excluded from the environment identity even when a gate command
+// explicitly allow-lists it, so allow-listing one cannot change a gate's digest.
+func TestCommandCheckerIgnoresAllowedCoordinationEnvironmentInDigest(t *testing.T) {
 	t.Setenv("AIRA_GOVERNOR_CMD", filepath.Join(t.TempDir(), "aira"))
 	s, root := realCommandStore(t)
 	def := commandDefinition(gate.Command{
