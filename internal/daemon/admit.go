@@ -50,7 +50,32 @@ const (
 	admitSliceHeadroomSupervisorDefault int64 = 64 << 20
 	delegateRAMScopeMinDefault          int64 = 4 << 30
 	delegateRAMScopeSafetyPct           int64 = 15
-	delegateRAMAdoptionMargin           int64 = 64 << 20
+	// delegateRAMAdoptionMargin is the pre-AIRA-29 reconstruction margin. AIRA-29
+	// replaced it with the shared chargeMargin policy; it survives only as what
+	// the dynamic-reserve kill switch reverts to, so the switch restores the
+	// whole prior behaviour rather than most of it.
+	delegateRAMAdoptionMargin int64 = 64 << 20
+
+	// AIRA-29 dynamic reserve. The admission ledger charges a confine scope its
+	// LIVE cgroup usage plus a growth margin, refreshed on the evaluator's own
+	// <=1s scan, instead of holding the frozen peak ESTIMATE for the whole job
+	// lifetime. Measured motivation: a `make merge-gate` held a 33.6G reserve
+	// while using 2.6G for 62 minutes, blocking other jobs while ~48G sat idle.
+	//
+	// chargeMarginFloorDefault is the smallest margin any tracked scope carries,
+	// so a job sitting exactly at its observed peak still has room to breathe
+	// between two scans without the ledger having to be re-read.
+	chargeMarginFloorDefault int64 = 256 << 20
+	// chargeMarginPctDefault scales the margin with the job's own size: a 20G job
+	// does not grow in 256 MiB steps.
+	chargeMarginPctDefault int64 = 12
+	// chargeColdFloorWindowDefault is how long a freshly granted waiter keeps
+	// being charged its full resolved reserve. It closes the cold-start hole: a
+	// job admitted on a 33.6G estimate that has not allocated YET must not free
+	// 33.6G of ledger to its neighbours and then allocate 20G. It is a FLOOR, not
+	// a ceiling -- a job that ramps fast charges its real usage through it at the
+	// very next scan.
+	chargeColdFloorWindowDefault = 90 * time.Second
 
 	// admitExclusiveWaitCeilingDefault bounds how long an EXCLUSIVE request may
 	// drain the slice. It is deliberately far below the shared 24-hour
@@ -173,6 +198,58 @@ type admitWaiter struct {
 	// the terminal.
 	signature string
 
+	// AIRA-29 dynamic reserve. All five are read and written ONLY under queue.mu,
+	// and only ever by evaluateAdmitQueue's own scan block, the grant, and the
+	// release -- the same critical sections that own queue.outstanding, which is
+	// what makes "outstanding == sum of effectiveCharge" checkable rather than
+	// merely intended.
+	//
+	// effectiveCharge/chargeTracked are ONE value with a two-state provenance,
+	// and they are deliberately read only through ledgerCharge(). chargeTracked
+	// is false until a usable scan reading has replaced the frozen estimate, and
+	// while it is false this waiter charges its `reserve` -- which is exactly the
+	// pre-AIRA-29 behaviour, and exactly what the grant-before-scope-creation
+	// window needs.
+	//
+	// The pair exists in this shape rather than as a single field initialised at
+	// the grant because a lone effectiveCharge makes an INVALID STATE
+	// REPRESENTABLE: any waiter that reaches admitGranted without it being set
+	// charges zero, silently, and the ledger under-counts a live job. That is the
+	// exact defect class this ledger exists to prevent, and it is not something
+	// to be careful about -- ledgerCharge() makes it unwritable. Zero is a
+	// legitimate charge (a scope whose memory.max is 0), so a "0 means fall back
+	// to reserve" rule would not do: it would corrupt that reading instead.
+	//
+	// The frozen `reserve` above deliberately stays untouched: it is still the
+	// client's grant payload and the scope's hard memory.max, and the AIRA-24
+	// "bytes queued ahead of me" figure is a statement about reserves, not
+	// charges.
+	//
+	// peakSoFar is a LIFETIME ratchet of the scope's observed memory.current. The
+	// charge never falls below a level the job has already demonstrated, which
+	// removes the peak-drop-then-regrow race: a job cannot free ledger space by
+	// dipping and then reclaim memory somebody else was admitted into.
+	//
+	// lastRSS/havePrevRSS carry the previous sample so one interval's observed
+	// growth can enter the margin. havePrevRSS is not a convenience: without it
+	// the first sample reads as growth == rss and doubles every cold charge.
+	//
+	// trackedRatchet is the monotone non-decreasing high-water mark of
+	// min(cap, peak+margin), EXCLUDING the cold floor. It is what stops the
+	// charge oscillating. The growth term is inherently non-monotone -- it enters
+	// the margin on a growing scan and leaves it on the next flat one -- so
+	// without this a bursty job would swing the SHARED ledger by gigabytes every
+	// second, and neighbours would be admitted precisely during its lulls, which
+	// is the least conservative moment there is. The cold floor is deliberately
+	// outside the ratchet: it MUST be able to lapse, or the feature could never
+	// engage at all.
+	effectiveCharge int64
+	chargeTracked   bool
+	peakSoFar       int64
+	lastRSS         int64
+	havePrevRSS     bool
+	trackedRatchet  int64
+
 	// AIRA-68. scopeSeen/scopeVanished record a TRANSITION observed by the
 	// evaluator's own <=1s confine scan — the same authority the adopted ledger
 	// already trusts — and are meaningful only for a scope-backed waiter
@@ -250,6 +327,25 @@ type admitWaiter struct {
 	exclusive       bool
 	exclusiveHolder string
 	parentScopeID   string
+}
+
+// ledgerCharge is what this waiter contributes to queue.outstanding: the
+// dynamic charge once a usable scan reading has established one, and the frozen
+// resolved reserve until then. queue.mu must be held.
+//
+// Every ledger site goes through this -- the grant's add, the release's
+// subtract, the scan's delta, and admitSliceSnapshotFor's three sums -- so
+// "outstanding == sum of ledgerCharge over granted && accounted waiters" is one
+// statement about one function, not an agreement between six call sites that
+// must be maintained by hand.
+func (w *admitWaiter) ledgerCharge() int64 {
+	if w == nil {
+		return 0
+	}
+	if w.chargeTracked {
+		return w.effectiveCharge
+	}
+	return w.reserve
 }
 
 // exclusiveActive reports whether this waiter currently asserts exclusivity.
@@ -669,6 +765,88 @@ func addClamp(a, b int64) int64 {
 	return a + b
 }
 
+// pctClamp returns value*pct/100 without ever overflowing. AIRA-29 uses it for
+// the proportional half of the charge margin.
+//
+// pct is capped at 100: a margin larger than the job's whole size is not a
+// meaningful setting, and that cap is also what makes the overflow branch
+// EXACT rather than merely non-negative. With pct <= 100, value/100*pct <=
+// value, so the fallback cannot overflow either, and it differs from the direct
+// form only by a remainder smaller than pct. An earlier version returned
+// MaxInt64/100*pct here, which is non-negative but wildly LARGER than the true
+// answer -- safe in direction, wrong as arithmetic.
+func pctClamp(value, pct int64) int64 {
+	if value <= 0 || pct <= 0 {
+		return 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	if value > math.MaxInt64/pct {
+		return value / 100 * pct
+	}
+	return value * pct / 100
+}
+
+// applyChargeDelta moves one waiter's contribution to the ledger from oldCharge
+// to newCharge and reports whether the move may be applied. The caller must
+// apply BOTH the returned outstanding and the new charge, or neither.
+//
+// It REFUSES an overflowing increase rather than saturating, and that is the
+// whole reason it exists rather than a bare addClamp. A saturating clamp breaks
+// conservation permanently and silently: with another waiter contributing 60,
+// clamping this one's move to MaxInt64 leaves outstanding at MaxInt64 while the
+// sum of effective charges is MaxInt64+60, and the later releases then subtract
+// their way to a NEGATIVE ledger. Refusing leaves the invariant exact; the
+// waiter simply holds its last established charge, which is the same outcome as
+// any other unusable reading.
+//
+// It is deliberately NOT floored at zero. Flooring would hide exactly the lost
+// or doubled decrement that admitSnapshot.residualBytes exists to expose. The
+// decreasing direction cannot wrap, because outstanding >= oldCharge holds by
+// construction: oldCharge is one of the summands of outstanding.
+func applyChargeDelta(outstanding, oldCharge, newCharge int64) (int64, bool) {
+	if outstanding < 0 || oldCharge < 0 || newCharge < 0 {
+		return outstanding, false
+	}
+	if newCharge >= oldCharge {
+		delta := newCharge - oldCharge
+		if outstanding > math.MaxInt64-delta {
+			return outstanding, false
+		}
+		return outstanding + delta, true
+	}
+	return outstanding - (oldCharge - newCharge), true
+}
+
+// confineRecordCap decodes ConfineRecord.Cap's three-way reading. The scan
+// writes exactly three shapes (confine_manage_linux.go): nil when memory.max
+// could not be read or did not parse, the literal "max" for a scope with no
+// local cap, and a canonical decimal otherwise. They mean different things and
+// AIRA-29 must not fuse them:
+//
+//   - known=false: the enforced ceiling is UNKNOWN. Treating that as "no clamp"
+//     would be a fabricated reading, and it has a concrete cost -- a near-cap
+//     non-delegate scope would charge peak+margin ABOVE its own frozen reserve
+//     for as long as the read failed, then flap back when it recovered.
+//   - known=true, finite=false: positively established that nothing caps this
+//     scope locally, so there is nothing to clamp to.
+//   - known=true, finite=true: the enforced ceiling.
+func confineRecordCap(record runner.ConfineRecord) (value int64, finite, known bool) {
+	if record.Cap == nil {
+		return 0, false, false
+	}
+	raw := strings.TrimSpace(*record.Cap)
+	if raw == "max" {
+		return 0, false, true
+	}
+	parsed, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || parsed < 0 {
+		return 0, false, false
+	}
+	return parsed, true, true
+}
+
 func addJobCountClamp(a, b int) int {
 	maxInt := int(^uint(0) >> 1)
 	if a < 0 || b < 0 || a > maxInt-b {
@@ -687,6 +865,140 @@ func (s *Server) admitSliceHeadroom(jobs int) int64 {
 		return math.MaxInt64
 	}
 	return base + int64(jobs)*perJob
+}
+
+// chargeMargin is the headroom added to a scope's observed peak. Its three
+// terms answer three different questions: the floor covers a job sitting still,
+// the percentage scales with the job's own size (a 20G job does not grow in
+// 256 MiB steps), and the observed one-interval growth is the self-tuning term
+// that budgets the NEXT interval for a job that is actually climbing. The
+// growth term is what replaces a kernel soft-throttle here: the owner's ruling
+// leaves the growth race to be absorbed by the ledger, not by memory.high.
+func (s *Server) chargeMargin(peak, growth int64) int64 {
+	margin := s.chargeMarginFloor
+	if pct := pctClamp(peak, s.chargeMarginPct); pct > margin {
+		margin = pct
+	}
+	if growth > margin {
+		margin = growth
+	}
+	if margin < 0 {
+		return 0
+	}
+	return margin
+}
+
+// adoptedScopeIsWarm reports whether an orphaned scope has run long enough for
+// its own memory.current to be a better reading than its admission estimate.
+// The scope directory's age is the only clock available for this: a daemon that
+// has restarted has no memory of when it granted anything.
+//
+// Fail-closed on an unestablished age (AgeSeconds is nil whenever the scope's
+// stat could not be taken), because the consequence of guessing wrong here is
+// the under-charge direction. A non-positive window means the cold-floor policy
+// is off entirely, which must mean the same thing here as it does in
+// chargeColdFloor -- no floor, so every scope is warm -- rather than the
+// opposite.
+func (s *Server) adoptedScopeIsWarm(record runner.ConfineRecord) bool {
+	if s.chargeColdFloorWindow <= 0 {
+		return true
+	}
+	if record.AgeSeconds == nil {
+		return false
+	}
+	return *record.AgeSeconds >= int64(s.chargeColdFloorWindow/time.Second)
+}
+
+// chargeColdFloor is the resolved reserve a freshly granted waiter keeps being
+// charged until it has had a chance to show its real usage. Fail-safe in both
+// unusual directions: a waiter with no grant instant recorded, and a clock that
+// moved backwards, both read as COLD and keep the full reserve.
+func (s *Server) chargeColdFloor(waiter *admitWaiter, now time.Time) int64 {
+	if s.chargeColdFloorWindow <= 0 {
+		return 0
+	}
+	if waiter.grantedAt.IsZero() || now.Sub(waiter.grantedAt) < s.chargeColdFloorWindow {
+		return waiter.reserve
+	}
+	return 0
+}
+
+// recomputeWaiterCharge advances one waiter's tracked state from a single
+// usable memory.current sample and returns the charge that state implies.
+// queue.mu must be held.
+//
+// The tracked state advances even if the caller then declines to apply the
+// ledger delta (see applyChargeDelta): the sample WAS observed, and discarding
+// it would make the next interval's growth term span two intervals. Conservation
+// is unaffected -- it is a statement about outstanding and effectiveCharge, and
+// neither moves unless the delta is applied.
+func (s *Server) recomputeWaiterCharge(waiter *admitWaiter, rss, capBytes int64, capFinite bool, now time.Time) int64 {
+	if rss > waiter.peakSoFar {
+		waiter.peakSoFar = rss
+	}
+	growth := int64(0)
+	if waiter.havePrevRSS && rss > waiter.lastRSS {
+		growth = rss - waiter.lastRSS
+	}
+	waiter.lastRSS, waiter.havePrevRSS = rss, true
+
+	tracked := addClamp(waiter.peakSoFar, s.chargeMargin(waiter.peakSoFar, growth))
+	if capFinite && tracked > capBytes {
+		tracked = capBytes
+	}
+	if tracked > waiter.trackedRatchet {
+		waiter.trackedRatchet = tracked
+	}
+	charge := waiter.trackedRatchet
+	if floor := s.chargeColdFloor(waiter, now); floor > charge {
+		charge = floor
+	}
+	if capFinite && charge > capBytes {
+		charge = capBytes
+	}
+	return charge
+}
+
+// refreshWaiterCharge is the AIRA-29 dynamic replacement itself. queue.mu must
+// be held, and the record must be the one this pass's scan produced for this
+// waiter's own scope id.
+//
+// The ONE rule: only a usable record may move a charge; otherwise the last
+// established charge stands unchanged. Every early return below is that rule,
+// and each is in the over-charge direction:
+//
+//   - the grant -> backend.Create window, which EVERY launch has: the scope does
+//     not exist yet, so no record reaches here and the frozen reserve stands.
+//     Without this a job would be charged nothing for the moments before it runs.
+//   - memory.current or memory.max unevaluated: no pass invents a number.
+//   - a ledger delta that would overflow: see applyChargeDelta.
+//
+// Deliberately NOT gated on record.Populated. That gate belongs to the adoption
+// loop below, where it is a liveness heuristic, and it reads LEAF cgroup.procs:
+// BootstrapAitestSupervisor drains every pid of an aitest outer scope into a
+// child cgroup, so a fully busy suite reads Populated == 0. A connection-held
+// waiter has already proved its liveness by holding the lease, and
+// memory.current is hierarchical, so the reading is correct regardless. Gating
+// on it here would silently drop live scopes OUT of the ledger, which is the
+// one direction this rule exists to prevent.
+func (s *Server) refreshWaiterCharge(queue *sliceQueue, waiter *admitWaiter, record runner.ConfineRecord, now time.Time) {
+	if !s.dynamicReserve {
+		return
+	}
+	if record.RSSBytes == nil || *record.RSSBytes < 0 {
+		return
+	}
+	capBytes, capFinite, capKnown := confineRecordCap(record)
+	if !capKnown {
+		return
+	}
+	charge := s.recomputeWaiterCharge(waiter, *record.RSSBytes, capBytes, capFinite, now)
+	next, ok := applyChargeDelta(queue.outstanding, waiter.ledgerCharge(), charge)
+	if !ok {
+		return
+	}
+	queue.outstanding = next
+	waiter.effectiveCharge, waiter.chargeTracked = charge, true
 }
 
 func (s *Server) admitOutstandingJobs(path string) int {
@@ -905,9 +1217,23 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		if waiter.state != admitGranted || !waiter.accounted {
 			continue
 		}
+		// AIRA-29. These three sum ledgerCharge(), the same quantity the ledger
+		// itself carries, not the frozen reserve. They must move with
+		// queue.outstanding or residualBytes() -- a real lost/double-decrement
+		// detector surfaced by `confine --list` -- would report a fabricated ledger
+		// defect on every dynamic pass. vanishedBytes is a SUBSET of scopeBytes and
+		// is NOT part of the residual equation, so it needs its own direct
+		// assertion in the tests rather than riding along on that check.
 		if waiter.scopeID == "" {
 			snapshot.reservationJobs++
-			snapshot.reservationBytes = addClamp(snapshot.reservationBytes, waiter.reserve)
+			// AIRA-29 sums ledgerCharge() here rather than the frozen reserve, so
+			// this stays equal to what queue.outstanding carries and residualBytes()
+			// keeps meaning what it says. For THIS population the two are always the
+			// same value -- a scope-LESS waiter has no scope to read, so it is never
+			// dynamically replaced -- but going through the same accessor as every
+			// other ledger site keeps that a property of the code rather than a
+			// coincidence to be rediscovered.
+			snapshot.reservationBytes = addClamp(snapshot.reservationBytes, waiter.ledgerCharge())
 			// AIRA-108. Name it, in the same pass. heldMS is derived from grantedAt
 			// — the daemon's own record of the exact grant moment — and NOT from
 			// `enqueued`, which would conflate ordinary admission-queue contention
@@ -926,10 +1252,10 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 			continue
 		}
 		snapshot.scopeJobs++
-		snapshot.scopeBytes = addClamp(snapshot.scopeBytes, waiter.reserve)
+		snapshot.scopeBytes = addClamp(snapshot.scopeBytes, waiter.ledgerCharge())
 		if waiter.scopeVanished {
 			snapshot.vanishedJobs++
-			snapshot.vanishedBytes = addClamp(snapshot.vanishedBytes, waiter.reserve)
+			snapshot.vanishedBytes = addClamp(snapshot.vanishedBytes, waiter.ledgerCharge())
 		}
 	}
 	if s.admitFreezeMaxHold > 0 {
@@ -1483,11 +1809,20 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			// under the slice, irrespective of population or cap, so scan
 			// membership is an authoritative presence test — and this block runs
 			// only when the scan SUCCEEDED, so a failed scan writes no bit at all.
-			present := make(map[string]struct{}, len(scanResult.Scopes))
+			present := make(map[string]runner.ConfineRecord, len(scanResult.Scopes))
 			for _, record := range scanResult.Scopes {
-				present[record.ScopeID] = struct{}{}
+				present[record.ScopeID] = record
 			}
 			held := make(map[string]struct{})
+			// The join direction here is load-bearing, not incidental: this walks
+			// WAITERS and looks records up, never the reverse. The scan ran
+			// lock-free before queue.mu was taken, so its snapshot may name a scope
+			// whose waiter has since been released -- and that waiter is already out
+			// of queue.waiters (releaseAdmitWaiterLocked removes it under this same
+			// lock), so its stale record simply matches nothing. A waiter granted
+			// during that same window is conversely not yet in the scan, so it is
+			// not usable and holds its reserve. Iterating records instead would
+			// resurrect the first case.
 			for _, waiter := range queue.waiters {
 				if waiter == nil || waiter.state != admitGranted || waiter.scopeID == "" {
 					continue
@@ -1497,8 +1832,15 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 				// scopeSeen/scopeVanished comment on admitWaiter for why the
 				// transition, and not plain absence, is what the stale-lease sweep
 				// is allowed to reclaim on.
-				if _, exists := present[waiter.scopeID]; exists {
+				if record, exists := present[waiter.scopeID]; exists {
 					waiter.scopeSeen, waiter.scopeVanished = true, false
+					// AIRA-29. The dynamic charge, taken under the same lock and from
+					// the same scan record. `accounted` is what the ledger add and
+					// subtract are both guarded by, so the replacement must carry the
+					// identical guard or conservation stops holding.
+					if waiter.accounted {
+						s.refreshWaiterCharge(queue, waiter, record, now)
+					}
 					continue
 				}
 				if waiter.scopeSeen {
@@ -1559,17 +1901,51 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 				if err != nil || cap < 0 {
 					continue
 				}
-				if runner.IsDelegateRAMScopeID(record.ScopeID) {
-					// AIRA-15 ceiling caps are containment backstops, never a
-					// whole-job reservation. After daemon restart only the dirname
-					// survives, so its positional marker selects current+margin
-					// reconstruction instead of adopting the generous ceiling.
-					if record.RSSBytes == nil || *record.RSSBytes < 0 {
-						continue
+				// AIRA-29 generalises this reconstruction from delegate-only to BOTH
+				// classes. Without it the headline win regressed on EVERY daemon
+				// restart: a non-delegate orphan re-pinned its full estimate until it
+				// exited, which is exactly the 33.6G-for-2.6G problem this change
+				// exists to remove, reintroduced by every deploy.
+				//
+				// The two classes differ in what `cap` MEANS, and that is why the age
+				// gate applies to only one of them:
+				//
+				//   - non-delegate: cap IS the admission estimate, so adopting it is a
+				//     correct cold-start floor for a scope too young to have shown its
+				//     usage. An unestablished age is treated as YOUNG, never as warm:
+				//     reading an unknown age as "old enough to track actual" would hand
+				//     a cold, not-yet-allocated job the full under-charge the floor
+				//     exists to prevent.
+				//   - delegate: cap is an AIRA-15 containment ceiling, never a
+				//     whole-job reservation, so adopting it would be the very
+				//     over-reservation this path was written to avoid. Its behaviour is
+				//     unchanged except for the margin policy below.
+				usableRSS := record.RSSBytes != nil && *record.RSSBytes >= 0
+				delegate := runner.IsDelegateRAMScopeID(record.ScopeID)
+				switch {
+				case !s.dynamicReserve && !delegate:
+					// Kill switch thrown: the pre-AIRA-29 behaviour for this class was
+					// to adopt the full cap, so fall through to exactly that. The
+					// delegate arm below is NOT switched off with it -- current+margin
+					// reconstruction there is AIRA-74, which shipped long before this
+					// change and must survive its rollback -- but its MARGIN reverts
+					// too, so the switch restores the whole prior behaviour rather than
+					// most of it.
+				case delegate && !usableRSS:
+					// Unreconstructable: contributes neither bytes nor a headroom job,
+					// left as a safe under-count exactly as before.
+					continue
+				case usableRSS && (delegate || s.adoptedScopeIsWarm(record)):
+					// One margin policy shared with the connection-held charge, rather
+					// than this path's own bare 64 MiB constant. For delegate scopes
+					// that is a change in the over-charge (safe) direction.
+					margin := delegateRAMAdoptionMargin
+					if s.dynamicReserve {
+						margin = s.chargeMargin(*record.RSSBytes, 0)
 					}
-					currentWithMargin := addClamp(*record.RSSBytes, delegateRAMAdoptionMargin)
-					if currentWithMargin < cap {
-						cap = currentWithMargin
+					tracked := addClamp(*record.RSSBytes, margin)
+					if tracked < cap {
+						cap = tracked
 					}
 				}
 				adopted = addClamp(adopted, cap)
@@ -1713,7 +2089,11 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		waiter.state = admitGranted
 		waiter.grantedAt = s.admitNowTime()
 		waiter.accounted = true
-		queue.outstanding += waiter.reserve
+		// AIRA-29. ledgerCharge() is the resolved reserve until a usable scan
+		// reading replaces it (refreshWaiterCharge), which is what makes the
+		// grant -> scope-creation window safe: an untracked waiter charges its
+		// whole estimate, never zero.
+		queue.outstanding += waiter.ledgerCharge()
 		queue.outstandingJobs++
 		if waiter.waited {
 			waiter.outcome = "waited"
@@ -1833,7 +2213,13 @@ func releaseAdmitWaiterLocked(queue *sliceQueue, waiter *admitWaiter) bool {
 		return false
 	}
 	if waiter.state == admitGranted && waiter.accounted {
-		queue.outstanding -= waiter.reserve
+		// AIRA-29. Discharge the CURRENT ledger charge, not the frozen reserve.
+		// The add in the grant loop and this subtraction are the only two writers
+		// besides refreshWaiterCharge's delta, and all three go through
+		// ledgerCharge() under the same admitGranted && accounted condition, which
+		// is what makes "outstanding returns to exactly zero" true rather than
+		// approximate.
+		queue.outstanding -= waiter.ledgerCharge()
 		queue.outstandingJobs--
 	}
 	for index, candidate := range queue.waiters {

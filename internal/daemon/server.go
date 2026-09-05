@@ -86,11 +86,25 @@ type Server struct {
 	admitPriorAt                 time.Time
 	admitSliceHeadroomBase       int64
 	admitSliceHeadroomSupervisor int64
-	workerScopesMu               sync.Mutex
-	workerScopes                 map[string]*workerScopeState
-	workerAdmitHeadroom          int64
-	scopeReapGrace               time.Duration
-	staleLeaseReleaseGrace       time.Duration
+	// AIRA-29 dynamic reserve. Server fields rather than package globals so a
+	// test can pin the arithmetic; see the constants and rationale in admit.go.
+	//
+	// dynamicReserve is the operational KILL SWITCH, and it exists because this
+	// change deliberately accepts a new bounded over-subscription on a shared,
+	// machine-wide slice that every session on the box depends on. Turning it off
+	// must not require rebuilding and redeploying a daemon under load at the
+	// moment it is misbehaving: AIRA_DAEMON_DYNAMIC_RESERVE=disabled plus a
+	// restart reverts the WHOLE of AIRA-29 -- the live charge and the adoption
+	// margin both -- back to the frozen-reserve behaviour.
+	dynamicReserve         bool
+	chargeMarginFloor      int64
+	chargeMarginPct        int64
+	chargeColdFloorWindow  time.Duration
+	workerScopesMu         sync.Mutex
+	workerScopes           map[string]*workerScopeState
+	workerAdmitHeadroom    int64
+	scopeReapGrace         time.Duration
+	staleLeaseReleaseGrace time.Duration
 
 	// AIRA-103. The published pressure ceiling. sliceCeilingMu is a strict LEAF:
 	// admitEffectiveMaximum reads it from inside queue.mu, so nothing may ever be
@@ -181,6 +195,10 @@ func NewServer(paths Paths) *Server {
 		workerScopeScanInterval:      workerScopeScanIntervalDefault,
 		admitSliceHeadroomBase:       admitSliceHeadroomBaseDefault,
 		admitSliceHeadroomSupervisor: admitSliceHeadroomSupervisorDefault,
+		dynamicReserve:               true,
+		chargeMarginFloor:            chargeMarginFloorDefault,
+		chargeMarginPct:              chargeMarginPctDefault,
+		chargeColdFloorWindow:        chargeColdFloorWindowDefault,
 		workerAdmitHeadroom:          workerAdmitHeadroomDefault,
 		scopeReapGrace:               defaultScopeReapGrace,
 		staleLeaseReleaseGrace:       defaultStaleLeaseReleaseGrace,
@@ -252,6 +270,11 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		return err
 	}
 	s.admitFreezeMaxHold = admitFreezeMaxHold
+	dynamicReserve, err := dynamicReserveFromEnv()
+	if err != nil {
+		return err
+	}
+	s.dynamicReserve = dynamicReserve
 	if len(s.Paths.SocketPath) > maxUnixSocketPath {
 		// Fail fast with a clear code instead of a cryptic bind EINVAL. In
 		// production XDG_RUNTIME_DIR is short (/run/user/<uid>); an over-long one

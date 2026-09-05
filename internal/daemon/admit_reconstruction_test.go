@@ -194,6 +194,16 @@ func TestAdmitReconstructionNonFiniteCapsContributeNeitherBytesNorHeadroom(t *te
 // verifies: the scope-ID marker, not volatile daemon registry metadata, carries
 // the cap type across restart. Ceiling caps adopt at current+margin; ordinary
 // #67 finite caps keep adopting at their full cap.
+//
+// AIRA-29 changed the MARGIN these two use, not the discrimination this test
+// exists to prove. Both assertions below are deliberately kept separate: a
+// rewrite that collapsed them into a single total would pass against an
+// implementation that had lost the class distinction altogether. What moved is
+// that the reconstruction now shares the AIRA-29 charge margin
+// (max(256 MiB, 12%)) instead of its own bare 64 MiB constant, so there is one
+// margin policy here rather than two. The unmarked scope also carries no
+// AgeSeconds, which AIRA-29 reads as "age not established, treat as young" --
+// so it adopts its full cap for a second, independent reason.
 func TestAdmitReconstructionUsesDelegateRAMCapType(t *testing.T) {
 	now := time.Unix(650, 0)
 	server := reconstructionTestServer(&now, func(string) (runner.ConfineListResult, error) {
@@ -207,7 +217,10 @@ func TestAdmitReconstructionUsesDelegateRAMCapType(t *testing.T) {
 	})
 	queue := &sliceQueue{path: "/slice", server: server}
 	server.evaluateAdmitQueue(queue)
-	wantMarked := int64(1<<30) + delegateRAMAdoptionMargin
+	wantMarked := int64(1<<30) + server.chargeMargin(int64(1<<30), 0)
+	if wantMarked >= int64(10<<30) {
+		t.Fatalf("test arithmetic: the marked scope must adopt below its %d ceiling, got %d", int64(10<<30), wantMarked)
+	}
 	want := wantMarked + int64(3<<30)
 	if queue.adopted != want || queue.adoptedJobs != 2 {
 		t.Fatalf("adopted=%d jobs=%d, want marked current+margin %d plus unmarked cap %d", queue.adopted, queue.adoptedJobs, wantMarked, int64(3<<30))

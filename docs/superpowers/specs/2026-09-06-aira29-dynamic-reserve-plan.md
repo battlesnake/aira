@@ -172,9 +172,20 @@ the honest reading of a job which has demonstrated it can do so, and it is still
   tracks upward through it in the same pass.
 - All arithmetic uses the existing `addClamp` plus a new overflow-safe `pctClamp`.
 
-Constants (env-overridable, each with a stated default, refused-not-substituted on a bad
-value per the AIRA-58 rule): `chargeMarginFloor = 256 MiB`, `chargeMarginPct = 12`,
-`chargeColdFloorWindow = 90s`.
+Constants, each with a stated default: `chargeMarginFloor = 256 MiB`,
+`chargeMarginPct = 12`, `chargeColdFloorWindow = 90s`. They are **compile-time**, not
+env-tunable: three tuning knobs would be three more parsers, refusal paths and tests for
+values that are reasoned about here and cheap to change with a rebuild.
+
+**One env control does exist, and it is a kill switch rather than a knob:**
+`AIRA_DAEMON_DYNAMIC_RESERVE=disabled` reverts the whole of AIRA-29 — the live charge *and*
+the adoption margin — to the frozen-reserve behaviour. It earns its place where the tuning
+knobs do not, because this change deliberately accepts a new bounded over-subscription on a
+slice every session on the machine shares: reverting it must not require rebuilding and
+redeploying a daemon under load at the moment it is misbehaving. An unrecognised value is
+REFUSED at daemon start, never silently substituted (the AIRA-58 rule) — the operator
+reaching for this variable is the last person who should be quietly given the behaviour they
+were trying to turn off.
 
 ### 3.3 The one rule for when a charge may move
 
@@ -453,9 +464,24 @@ raised by the second lineage and both checked against the source rather than arg
     **not** fit before the drop is granted after it. This is what proves the mechanism is
     not inert against a real tree — the AIRA-59/AIRA-64 lesson. Every other test here runs
     against a seam and would keep passing if the real scan could never establish a reading.
-11. Full `go test ./...` green, plus `go test -race ./internal/daemon/` for the new
+11. **Kill switch (unit), both halves:** with `dynamicReserve` off, a held waiter charges
+    exactly its frozen reserve and the adoption margin reverts to the pre-AIRA-29 64 MiB —
+    a switch that reverted the charge but left the margin changed would be a partial
+    rollback presented as a whole one. Plus `dynamicReserveFromEnv` refusing an
+    unrecognised value with a stable code rather than substituting a default.
+12. **Unreconstructable delegate orphan (unit):** a delegate scope with no readable
+    `memory.current` contributes neither bytes nor a headroom job — its cap is a
+    containment ceiling, not an estimate. This is the one adoption arm no other case
+    reaches.
+13. Full `go test ./...` green, plus `go test -race ./internal/daemon/` for the new
     concurrency-adjacent fields (AIRA-20 keeps `-race` out of CI for wall-clock-tight
     flakes; run it targeted and record the exact exit code either way). `go vet ./...`.
+14. **Mutation check, not just green:** every load-bearing behaviour above is verified by
+    deliberately breaking the implementation and confirming a test fails — the
+    trackedRatchet, the `Populated` gate, both ledger sites, both snapshot sums, the cold
+    floor, the growth term, the cap clamp, the overflow refusal, the adoption age gate and
+    the first-sample growth. A green suite is not evidence that a test would have caught
+    the wrong build.
 
 ## 6. Rollout
 
