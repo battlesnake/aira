@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-70","project":"aira","title":"A confined job's SIGKILL is unattributable — three distinct kill paths produce byte-identical output","status":"planned","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["confine","daemon","dogfood","honesty"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-70","project":"aira","title":"A confined job's SIGKILL is unattributable — three distinct kill paths produce byte-identical output","status":"done","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["confine","daemon","dogfood","honesty"],"hold":false,"relations":[]}
 ---
 ## Finding (from the AIRA-67 investigation)
 
@@ -20,3 +20,17 @@ This is precisely the class of problem this project's own honesty contract exist
 Record teardown provenance on the confine trailer — a field like `terminated-by=signal:SIGTERM|external-cgroup-kill|oom|normal` — and add the log lines that are currently missing on the paths that can cause it: one in the confine supervisor's own signal handler (recording that an external signal arrived, and forwarding it, before or alongside the existing `cleanupConfineScope`/`scope.Kill()` behavior), and one in the daemon's `confine-kill` dispatch (`confine_manage.go:141-152`) recording the killer's identity (whatever ownership/actor information is already available to that RPC) and target every time it actually kills something. Companion fix: `internal/runner/confine_linux.go:817`'s OOM-advisory gate currently returns empty and stays silent precisely when no scope cap was set, which is the case where an unexplained 137 is most likely to be mistaken for something else — it should still report an OOM signal it can actually detect (e.g. via `usage.OOMKill`) regardless of whether a cap happened to be configured.
 
 This is correctness-adjacent daemon/supervisor work (touches the signal-handling and kill-dispatch paths directly) — treat it with the same rigor as other daemon changes tonight (external review, TDD), not a quick logging patch.
+
+## Resolution
+
+Unified with AIRA-91 Part A into one Fix 5 (`terminated-by=` confine trailer
+facet, PR #35 then corrected PR #36 after a squash-merge race dropped the
+critical fix — see AIRA-91 for the full account). One field, four values:
+the existing kernel-OOM advisory; a new external-whole-cgroup-kill case
+naming systemd-oomd/`cgroup.kill`/`aira confine --kill` as candidates (the
+AIRA-91 gap); the supervisor's own signal handler now logs a received
+signal before forwarding it; the daemon's `confine-kill` dispatch now logs
+the killer's identity, written only past a confirmed kill so a refused kill
+never claims one that didn't happen. Independently re-verified against the
+genuinely-final merged master (not just the PR description) after the
+squash-merge incident. Status transition landed as a coordinator commit.

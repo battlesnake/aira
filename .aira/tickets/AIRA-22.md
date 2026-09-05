@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-22","project":"aira","title":"Session-independent `aira confine --detach` + durable owner-keyed status/output capture","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["confine","detach","dogfood","survivability"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-22","to":"AIRA-23"}]}
+{"schema":1,"id":"AIRA-22","project":"aira","title":"Session-independent `aira confine --detach` + durable owner-keyed status/output capture","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["confine","detach","dogfood","survivability"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-22","to":"AIRA-23"}]}
 ---
 Reported by a dogfooding session ("split") 2026-08-31: a ~1hr `make merge-gate` under
 `aira confine --delegate-ram` DIED at 98% (~50 min of work lost) when the launching Claude session
@@ -32,3 +32,22 @@ Graft that onto confine:
     record that outlives the supervisor, so the reaper/ledger keep accounting it correctly.
 This is the big one: heavy confined work (gates, corpus runs, sims) routinely outlasts a session's
 limit window. relates: M20 (run --detach), #74 (reserve-ledger reconstruction), the owner-default ticket.
+
+## Resolution
+
+Built as PR #39 (`952b331`→`4d0260c`), backlog remediation plan Phase 2. A
+`setsid`'d supervisor writes a durable per-job record + captured output under
+`~/.local/state/aira/confine/<scope-id>/`; `confine --status` reads it back.
+Converges with `LaunchDetached` at the shared primitives (control-file
+helper, setsid shim) rather than duplicating its body, since confine is
+project-less and `LaunchDetached` is bound to the Runner's ledger. Every
+review lineage (Sol, Fable, DeepSeek) blocked at least once across plan and
+build review; two real defects caught independently by two lineages each
+(a premature-ready-before-validation regression against the foreground
+exit contract, and a liveness probe that read a zombie as running). 34/34
+mutations killed; real end-to-end smoke test. Follow-up filed as AIRA-98
+(the record store and captured output are unpruned/uncapped) rather than
+scoped into this ticket.
+
+Status transition landed as a coordinator commit per this project's
+convention, not by the build agent itself.
