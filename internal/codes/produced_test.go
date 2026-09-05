@@ -206,13 +206,18 @@ func TestCataloguedExitsFollowThePrefixConvention(t *testing.T) {
 	}
 }
 
-// TestNoWarningCodeIsRaisedAsAnError closes the hazard the W_ convention opens.
-// store.ErrorCode accepts a W_ prefix as a stable code, and core.Do puts whatever
-// it returns into Response.Code with Exit: ExitForCode(code) — so an error
-// message of the form "W_SOMETHING: ..." would surface as a failed response that
-// exits 0, a failure reported as success. Cataloguing the eight check-report
-// warnings widened that surface from four W_ codes to twelve, so the invariant
-// that makes it safe is pinned here rather than left to inspection.
+// TestNoWarningCodeIsRaisedAsAnError closes the hazard the W_ convention opens
+// at the AUTHORING end: nobody should ever construct an error whose message
+// starts "W_SOMETHING: ...", because a warning code is cataloged to exit 0 and
+// an error carrying one would surface as a failed response that exits 0 — a
+// failure reported as success. store.ErrorCode is now ALSO a structural guard
+// at the CONSUMING end (it returns only E_/U_ prefixes, folding a W_-prefixed
+// message to E_INTERNAL like any other unrecognised text — see its doc
+// comment), so the hazard is closed twice over: this test catches the
+// authoring mistake at its source, and ErrorCode would defuse it even if this
+// test's static scan somehow missed a case. Cataloguing the eight check-report
+// warnings widened the literal surface this test scans from four W_ codes to
+// twelve, so the invariant is pinned here rather than left to inspection.
 //
 // The predicate is exact: a W_ code written as a bare literal is a
 // CheckFinding.Code or a TicketRecord.Warnings entry, while "W_CODE: message" is
@@ -236,7 +241,7 @@ func TestNoWarningCodeIsRaisedAsAnError(t *testing.T) {
 			if idx <= 0 || !strings.HasPrefix(value, "W_") || !codePattern.MatchString(value[:idx]) {
 				return true
 			}
-			t.Errorf("%s:%d: %q is a warning code in error-message form; store.ErrorCode would return it as the response code and it would exit 0, reporting a failure as success", rel, fset.Position(lit.Pos()).Line, value)
+			t.Errorf("%s:%d: %q is a warning code in error-message form; the W_ convention forbids ever raising a warning as an error (store.ErrorCode now folds this to E_INTERNAL rather than surfacing it, but authoring it this way is still the mistake this test exists to catch at its source)", rel, fset.Position(lit.Pos()).Line, value)
 			return true
 		})
 	})

@@ -646,6 +646,31 @@ func (s *Store) findingFromError(err error, subject string) CheckFinding {
 // ErrorCode extracts the stable catalog prefix from errors returned across the
 // store/core boundary. It deliberately does not expose driver error strings as
 // protocol codes.
+//
+// It is also the structural choke point for one specific hazard: a W_
+// (warning) code being raised as an `error` and reaching Response.Code as if
+// it were a failure. Warnings are cataloged to exit 0 (see codes.ExitCodes /
+// TestCataloguedExitsFollowThePrefixConvention), and core.Do (and every other
+// caller of codes.ExitForCode(store.ErrorCode(err))) trusts whatever this
+// function returns, so a W_-prefixed error message would otherwise surface as
+// a failure that exits 0 — a failure silently reported as success. Only "E_"
+// and "U_" prefixes are ever returned; anything else, including a "W_..."
+// message, falls through to "E_INTERNAL" like any other unrecognised error
+// text. core.Do refusing a W_ code itself was considered and rejected: 50+
+// call sites across cmd/aira and internal/daemon call ErrorCode directly
+// (several feeding codes.ExitForCode for a process exit without ever going
+// through core.Do), so ErrorCode is the choke point for every caller that
+// derives a code from an `error` value this way.
+//
+// This does NOT cover every path into Response.Code: core.Do's handlerData.Code
+// and runner.RunRecord.ErrorCodes are plain strings assigned directly by their
+// producers (never parsed out of an error message), so they never call this
+// function at all. Every literal assigned to either today is E_/U_-prefixed
+// (verified by grep at AIRA-99 time), so the hazard is currently inert there,
+// but a future W_-prefixed literal in one of those two places would bypass
+// both this guard and TestNoWarningCodeIsRaisedAsAnError's colon-delimited
+// "CODE: message" scan (a bare code literal has no colon). Recorded as a
+// follow-up rather than fixed here to keep this change mechanical.
 func ErrorCode(err error) string {
 	if err == nil {
 		return ""
@@ -654,7 +679,7 @@ func ErrorCode(err error) string {
 	if idx := strings.IndexByte(message, ':'); idx >= 0 {
 		message = message[:idx]
 	}
-	if strings.HasPrefix(message, "E_") || strings.HasPrefix(message, "W_") || strings.HasPrefix(message, "U_") {
+	if strings.HasPrefix(message, "E_") || strings.HasPrefix(message, "U_") {
 		return message
 	}
 	return "E_INTERNAL"
