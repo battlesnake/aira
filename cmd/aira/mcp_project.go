@@ -29,12 +29,21 @@ func runMCPWithDispatcher(ctx context.Context, input io.Reader, output, diagnost
 		dispatcher = production
 	}
 	server := newMCPServer(nil)
-	server.dispatch = func(requestContext context.Context, request core.Request) core.Response {
+	server.dispatch = func(requestContext context.Context, request core.Request, scopeDirOverride string) core.Response {
 		var scope daemon.WorktreeScope
 		var scopeErr error
+		// An MCP request carries no working directory of its own, so without an
+		// explicit override every call is scoped against this server process's
+		// directory — which is wherever the host launched it, not the worktree
+		// the caller is working in (AIRA-82).
+		scopeDir, scopeDirErr := resolveScopeDir(scopeDirOverride)
+		if scopeDirErr != nil {
+			code := store.ErrorCode(scopeDirErr)
+			return core.Response{Code: code, Error: scopeDirErr.Error(), Exit: store.ExitForCode(code)}
+		}
 		canonical := core.CanonicalVerb(request.Verb)
 		if canonical == "init" {
-			project, discoverErr := app.DiscoverBootstrap(requestContext, ".")
+			project, discoverErr := app.DiscoverBootstrap(requestContext, scopeDir)
 			if discoverErr != nil {
 				scopeErr = discoverErr
 			} else {
@@ -60,11 +69,15 @@ func runMCPWithDispatcher(ctx context.Context, input io.Reader, output, diagnost
 				request.Args["slice"] = runner.ResolveConfineSlice(stringRequestArg(request.Args, "slice"))
 			}
 		} else {
-			scope, scopeErr = scopeForCWD(requestContext, ".", paths)
+			scope, scopeErr = scopeForCWD(requestContext, scopeDir, paths)
 		}
 		if scopeErr != nil {
 			code := store.ErrorCode(scopeErr)
 			return core.Response{Code: code, Error: scopeErr.Error(), Exit: store.ExitForCode(code)}
+		}
+		if err := refuseAmbiguousImportPath(request, scopeDirOverride); err != nil {
+			code := store.ErrorCode(err)
+			return core.Response{Code: code, Error: err.Error(), Exit: store.ExitForCode(code)}
 		}
 		if err := prepareImportContent(&request); err != nil {
 			code := store.ErrorCode(err)
@@ -72,7 +85,7 @@ func runMCPWithDispatcher(ctx context.Context, input io.Reader, output, diagnost
 		}
 		response := dispatcher.Dispatch(requestContext, scope, request)
 		if canonical == "init" {
-			relativiseInitResponse(&response, ".")
+			relativiseInitResponse(&response, scopeDir)
 		}
 		return response
 	}

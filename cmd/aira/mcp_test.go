@@ -69,7 +69,11 @@ func TestRantMCPIsCaptureOnlyWithApprovedAdvertisement(t *testing.T) {
 		got = append(got, name)
 	}
 	sort.Strings(got)
-	want := []string{"idempotency_key", "refs", "severity", "tags", "text"}
+	// scope_dir is the face-level per-call scope override (AIRA-82), injected by
+	// makeToolBinding rather than declared by the rant descriptor. It is listed
+	// here so this guard still refuses any OTHER property leaking into the
+	// capture-only advertisement.
+	want := []string{"idempotency_key", "refs", "scope_dir", "severity", "tags", "text"}
 	if !reflect.DeepEqual(got, want) || !reflect.DeepEqual(schema.Required, []string{"text"}) {
 		t.Fatalf("schema properties=%v required=%v", got, schema.Required)
 	}
@@ -186,7 +190,7 @@ func TestMCPTimeReturnsStructuredOutcomeAndCannotConsumeNextFrame(t *testing.T) 
 	}, "\n") + "\n")
 	s := &mcpCommandStore{}
 	server := newMCPServer(nil)
-	server.dispatch = func(ctx context.Context, request core.Request) core.Response {
+	server.dispatch = func(ctx context.Context, request core.Request, _ string) core.Response {
 		return core.NewWithRunnerFace(s, nil, input, core.FaceOutput{}).Do(ctx, request)
 	}
 	var output bytes.Buffer

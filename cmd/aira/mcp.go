@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,7 +21,10 @@ type mcpProvider func(context.Context, core.Request) (*core.Core, func(), error)
 
 type mcpServer struct {
 	provider mcpProvider
-	dispatch func(context.Context, core.Request) core.Response
+	// dispatch takes the decoded request plus the call's own scope-directory
+	// override (empty = the face process's working directory), which is a face
+	// concern and deliberately never part of core.Request (AIRA-82).
+	dispatch func(context.Context, core.Request, string) core.Response
 	tools    []mcpTool
 	byName   map[string]mcpToolBinding
 }
@@ -40,6 +44,9 @@ type mcpToolAnnotations struct {
 type mcpToolBinding struct {
 	tool        mcpTool
 	byOperation map[string]mcpOperation
+	// acceptsScopeDir mirrors what the schema advertises: a project-less tool
+	// neither declares nor accepts the per-call scope override (AIRA-82).
+	acceptsScopeDir bool
 }
 
 type mcpOperation struct {
@@ -193,6 +200,14 @@ func makeToolBinding(name string, descriptors []core.DispatchDescriptor) mcpTool
 			properties[arg.Name] = property
 		}
 	}
+	// The scope override is a FACE argument, not a dispatch-table one: it names
+	// the directory this call's project/worktree is discovered from, which the
+	// core never sees. It is injected here rather than declared in core so it
+	// cannot reach a core.Request and break CLI/MCP request parity (AIRA-82).
+	acceptsScopeDir := toolAcceptsScopeDir(name)
+	if acceptsScopeDir {
+		properties[scopeDirArgument] = mcpProperty{Type: "string", Description: scopeDirDescription}
+	}
 	schema := mcpInputSchema{Type: "object", Properties: properties}
 	if len(operations) == 1 {
 		for _, operation := range operations {
@@ -224,8 +239,9 @@ func makeToolBinding(name string, descriptors []core.DispatchDescriptor) mcpTool
 		}
 	}
 	return mcpToolBinding{
-		tool:        mcpTool{Name: name, Description: description, InputSchema: schema, Annotations: mcpToolAnnotations{ReadOnlyHint: readOnly, DestructiveHint: destructive}},
-		byOperation: operations,
+		tool:            mcpTool{Name: name, Description: description, InputSchema: schema, Annotations: mcpToolAnnotations{ReadOnlyHint: readOnly, DestructiveHint: destructive}},
+		byOperation:     operations,
+		acceptsScopeDir: acceptsScopeDir,
 	}
 }
 
@@ -349,12 +365,19 @@ func (s *mcpServer) call(ctx context.Context, id any, raw json.RawMessage) mcpRe
 	if !ok {
 		return protocolResponse(id, -32602, "unknown tool", stableArgumentData("unknown tool"))
 	}
-	request, err := decodeMCPRequest(binding, params.Arguments)
+	request, scopeDir, err := decodeMCPRequest(binding, params.Arguments)
 	if err != nil {
 		return protocolResponse(id, -32602, err.Error(), stableArgumentData(err.Error()))
 	}
 	if s.dispatch != nil {
-		return toolResponse(id, s.dispatch(ctx, request))
+		return toolResponse(id, s.dispatch(ctx, request, scopeDir))
+	}
+	if scopeDir != "" {
+		// The provider substrate builds a core directly and resolves no
+		// worktree scope, so it cannot honour an override. Refuse rather than
+		// accept and discard it.
+		message := fmt.Sprintf("E_ARGUMENT_INVALID: argument %q is not supported by this face", scopeDirArgument)
+		return toolResponse(id, core.Response{Code: "E_ARGUMENT_INVALID", Error: message, Exit: store.ExitForCode("E_ARGUMENT_INVALID")})
 	}
 	dispatcher, closeFn, err := s.provider(ctx, request)
 	if err != nil {
@@ -368,20 +391,41 @@ func (s *mcpServer) call(ctx context.Context, id any, raw json.RawMessage) mcpRe
 	return toolResponse(id, dispatcher.Do(ctx, request))
 }
 
-func decodeMCPRequest(binding mcpToolBinding, values map[string]json.RawMessage) (core.Request, error) {
+func decodeMCPRequest(binding mcpToolBinding, values map[string]json.RawMessage) (core.Request, string, error) {
 	operation := ""
 	if len(binding.byOperation) > 1 {
 		raw, ok := values["operation"]
 		if !ok {
-			return core.Request{}, fmt.Errorf("E_ARGUMENT_INVALID: operation is required")
+			return core.Request{}, "", fmt.Errorf("E_ARGUMENT_INVALID: operation is required")
 		}
 		if err := json.Unmarshal(raw, &operation); err != nil {
-			return core.Request{}, fmt.Errorf("E_ARGUMENT_INVALID: operation must be a string")
+			return core.Request{}, "", fmt.Errorf("E_ARGUMENT_INVALID: operation must be a string")
 		}
 	}
 	bindingOperation, ok := binding.byOperation[operation]
 	if !ok {
-		return core.Request{}, fmt.Errorf("E_ARGUMENT_INVALID: unknown operation %q", operation)
+		return core.Request{}, "", fmt.Errorf("E_ARGUMENT_INVALID: unknown operation %q", operation)
+	}
+	// The scope override is decoded and removed here: it is a face argument
+	// naming the directory this call is scoped from, and must never enter the
+	// core request (AIRA-82).
+	scopeDir := ""
+	if raw, present := values[scopeDirArgument]; present && binding.acceptsScopeDir {
+		if err := json.Unmarshal(raw, &scopeDir); err != nil {
+			return core.Request{}, "", fmt.Errorf("E_ARGUMENT_INVALID: argument %q must be a string", scopeDirArgument)
+		}
+		if strings.TrimSpace(scopeDir) == "" {
+			return core.Request{}, "", fmt.Errorf("E_ARGUMENT_INVALID: argument %q must not be empty", scopeDirArgument)
+		}
+		// Absolute only, on this face specifically. A relative override would be
+		// resolved against the SERVER process's directory — the one thing the
+		// caller does not know and is trying to escape — so accepting one would
+		// hand back the same confidently-wrong scope under a new name. The CLI
+		// takes a relative path happily, because there the process cwd IS the
+		// caller's own directory (AIRA-82).
+		if !filepath.IsAbs(strings.TrimSpace(scopeDir)) {
+			return core.Request{}, "", fmt.Errorf("E_ARGUMENT_INVALID: argument %q must be an absolute path; an MCP call has no working directory of its own to resolve %q against", scopeDirArgument, scopeDir)
+		}
 	}
 	args := map[string]any{}
 	allowed := map[string]core.ArgSpec{}
@@ -389,21 +433,24 @@ func decodeMCPRequest(binding mcpToolBinding, values map[string]json.RawMessage)
 		allowed[arg.Name] = arg
 	}
 	for name := range values {
+		if name == scopeDirArgument && binding.acceptsScopeDir {
+			continue
+		}
 		if name == "operation" {
 			if len(binding.byOperation) > 1 {
 				continue
 			}
-			return core.Request{}, fmt.Errorf("E_ARGUMENT_INVALID: unknown argument %q", name)
+			return core.Request{}, "", fmt.Errorf("E_ARGUMENT_INVALID: unknown argument %q", name)
 		}
 		if _, ok := allowed[name]; !ok {
-			return core.Request{}, fmt.Errorf("E_ARGUMENT_INVALID: unknown argument %q", name)
+			return core.Request{}, "", fmt.Errorf("E_ARGUMENT_INVALID: unknown argument %q", name)
 		}
 	}
 	for _, arg := range bindingOperation.declaredArgs {
 		raw, present := values[arg.Name]
 		if !present {
 			if arg.Required {
-				return core.Request{}, fmt.Errorf("E_ARGUMENT_INVALID: argument %q is required", arg.Name)
+				return core.Request{}, "", fmt.Errorf("E_ARGUMENT_INVALID: argument %q is required", arg.Name)
 			}
 			continue
 		}
@@ -416,7 +463,7 @@ func decodeMCPRequest(binding mcpToolBinding, values map[string]json.RawMessage)
 		}
 		value, err := decodeMCPValue(arg, raw)
 		if err != nil {
-			return core.Request{}, err
+			return core.Request{}, "", err
 		}
 		args[arg.Name] = value
 	}
@@ -509,7 +556,7 @@ func decodeMCPRequest(binding mcpToolBinding, values map[string]json.RawMessage)
 			args["full"] = false
 		}
 	}
-	return core.Request{Verb: bindingOperation.descriptor.Name, Args: args}, nil
+	return core.Request{Verb: bindingOperation.descriptor.Name, Args: args}, scopeDir, nil
 }
 
 func decodeMCPValue(arg core.ArgSpec, raw json.RawMessage) (any, error) {
