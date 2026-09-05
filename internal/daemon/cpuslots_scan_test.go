@@ -15,12 +15,10 @@ import (
 const testGrace = 60 * time.Second
 
 // makeWorkerScope creates <slice>/<confine>/.aira-worker-<id> and, when
-// events is non-empty, a cgroup.events file with that content. age backdates
-// the directory's mtime.
-func makeWorkerScope(t *testing.T, slice, confine, id, events string, age time.Duration) string {
+// events is non-empty, a cgroup.events file with that content.
+func makeWorkerScope(t *testing.T, slice, confine, id, events string) string {
 	t.Helper()
-	outer := filepath.Join(slice, confine)
-	child := filepath.Join(outer, workerScopeChildPrefix+id)
+	child := filepath.Join(slice, confine, workerScopeChildPrefix+id)
 	if err := os.MkdirAll(child, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -29,53 +27,36 @@ func makeWorkerScope(t *testing.T, slice, confine, id, events string, age time.D
 			t.Fatal(err)
 		}
 	}
-	stamp := time.Now().Add(-age)
-	if err := os.Chtimes(child, stamp, stamp); err != nil {
-		t.Fatal(err)
-	}
 	return child
 }
 
 func newTestSlice(t *testing.T) string {
 	t.Helper()
-	slice := t.TempDir()
-	return slice
+	return t.TempDir()
 }
 
 func TestWorkerScopeLiveForFloorPopulatedChildIsLive(t *testing.T) {
 	slice := newTestSlice(t)
-	child := makeWorkerScope(t, slice, ".aira-CONFINE-a", "1", "populated 1\nfrozen 0\n", 10*time.Minute)
-	if !workerScopeLiveForFloor(child, time.Now(), testGrace) {
+	child := makeWorkerScope(t, slice, ".aira-CONFINE-a", "1", "populated 1\nfrozen 0\n")
+	if !workerScopeLiveForFloor(child) {
 		t.Fatal("a populated worker scope must count as live for the floor")
 	}
 }
 
-// verifies: AIRA-64 §9.4 — Sol round 1 P0-2. An aged, empty orphan must NOT
-// hold the floor closed, or a job stalls forever instead of merely running slowly.
-func TestWorkerScopeLiveForFloorAgedEmptyOrphanIsNotLive(t *testing.T) {
+// verifies: AIRA-64 §9.4 — Sol round 1 P0-2. An empty orphan must NOT hold the
+// floor closed, or a job stalls forever instead of merely running slowly.
+func TestWorkerScopeLiveForFloorEmptyOrphanIsNotLive(t *testing.T) {
 	slice := newTestSlice(t)
-	child := makeWorkerScope(t, slice, ".aira-CONFINE-a", "1", "populated 0\nfrozen 0\n", 10*time.Minute)
-	if workerScopeLiveForFloor(child, time.Now(), testGrace) {
-		t.Fatal("an aged empty orphan must not count as live: it would permanently withhold the floor")
+	child := makeWorkerScope(t, slice, ".aira-CONFINE-a", "1", "populated 0\nfrozen 0\n")
+	if workerScopeLiveForFloor(child) {
+		t.Fatal("an empty orphan must not count as live: it would permanently withhold the floor")
 	}
 }
 
-// verifies: AIRA-64 §9.5 — Sol round 2 P0-2. A scope created moments ago and
-// not yet placed into MUST count as live, or N supervisors paused between grant
-// and placement each take a floor grant.
-func TestWorkerScopeLiveForFloorYoungEmptyScopeIsLive(t *testing.T) {
-	slice := newTestSlice(t)
-	child := makeWorkerScope(t, slice, ".aira-CONFINE-a", "1", "populated 0\nfrozen 0\n", time.Second)
-	if !workerScopeLiveForFloor(child, time.Now(), testGrace) {
-		t.Fatal("a young unplaced scope must count as live: the placement window is not an open floor")
-	}
-}
-
-// verifies: AIRA-64 §9.7, §9.18 — population that cannot be established, and a
-// stat failure, both count the child as live. Never a fabricated open floor.
+// verifies: AIRA-64 §9.7 — population that cannot be established counts the
+// child as LIVE. Never a fabricated open floor.
 func TestWorkerScopeLiveForFloorUnestablishedPopulationIsLive(t *testing.T) {
 	slice := newTestSlice(t)
-	now := time.Now()
 	for _, testCase := range []struct {
 		name   string
 		events string
@@ -86,38 +67,28 @@ func TestWorkerScopeLiveForFloorUnestablishedPopulationIsLive(t *testing.T) {
 		{"populated not an integer", "populated yes\n"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			child := makeWorkerScope(t, slice, ".aira-CONFINE-"+testCase.name, "1", testCase.events, 10*time.Minute)
-			if !workerScopeLiveForFloor(child, now, testGrace) {
+			child := makeWorkerScope(t, slice, ".aira-CONFINE-"+testCase.name, "1", testCase.events)
+			if !workerScopeLiveForFloor(child) {
 				t.Fatal("an unestablished population must count as live, never as an open floor")
 			}
 		})
 	}
-	t.Run("stat failure", func(t *testing.T) {
-		if !workerScopeLiveForFloor(filepath.Join(slice, "does-not-exist"), now, testGrace) {
-			t.Fatal("an unreadable directory must count as live")
+	t.Run("unreadable directory", func(t *testing.T) {
+		if !workerScopeLiveForFloor(filepath.Join(slice, "does-not-exist")) {
+			t.Fatal("an unreadable scope must count as live")
 		}
 	})
-}
-
-// verifies: AIRA-64 §9.18 — clock skew. An mtime in the future must read as
-// YOUNG (live), never as aged out.
-func TestWorkerScopeLiveForFloorFutureMtimeIsYoung(t *testing.T) {
-	slice := newTestSlice(t)
-	child := makeWorkerScope(t, slice, ".aira-CONFINE-a", "1", "populated 0\n", -2*time.Hour)
-	if !workerScopeLiveForFloor(child, time.Now(), testGrace) {
-		t.Fatal("a future mtime must read as young, not as aged out")
-	}
 }
 
 // verifies: AIRA-64 §9.6 — the cap count and the floor count are different
 // numbers over the same tree, each failing in its own safe direction.
 func TestScanSliceWorkerScopesCountsDirectoriesForCapAndLiveForFloor(t *testing.T) {
 	slice := newTestSlice(t)
-	makeWorkerScope(t, slice, ".aira-CONFINE-a", "1", "populated 1\n", time.Minute)
-	makeWorkerScope(t, slice, ".aira-CONFINE-a", "2", "populated 0\n", 10*time.Minute) // aged orphan
-	makeWorkerScope(t, slice, ".aira-CONFINE-b", "1", "populated 0\n", time.Second)    // young, unplaced
+	makeWorkerScope(t, slice, ".aira-CONFINE-a", "1", "populated 1\n")
+	makeWorkerScope(t, slice, ".aira-CONFINE-a", "2", "populated 0\n") // orphan
+	makeWorkerScope(t, slice, ".aira-CONFINE-b", "1", "populated 1\n")
 
-	snapshot, err := scanSliceWorkerScopes(slice, time.Now(), testGrace)
+	snapshot, err := scanSliceWorkerScopes(slice)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,10 +99,60 @@ func TestScanSliceWorkerScopesCountsDirectoriesForCapAndLiveForFloor(t *testing.
 		t.Fatalf("J must count confine scopes holding >=1 worker child: got %d, want 2", snapshot.scopes)
 	}
 	if got := snapshot.liveForFloor[filepath.Join(slice, ".aira-CONFINE-a")]; got != 1 {
-		t.Fatalf("scope a: the aged orphan must not count for the floor: got %d, want 1", got)
+		t.Fatalf("scope a: the empty orphan must not count for the floor: got %d, want 1", got)
 	}
 	if got := snapshot.liveForFloor[filepath.Join(slice, ".aira-CONFINE-b")]; got != 1 {
-		t.Fatalf("scope b: the young unplaced scope must count for the floor: got %d, want 1", got)
+		t.Fatalf("scope b: got %d, want 1", got)
+	}
+}
+
+// verifies: AIRA-64 §13(d) — Sol build-review P0. An outer scope this scan
+// CANNOT READ must fail the whole snapshot, not be silently skipped.
+//
+// Skipping it was a real fail-open: one persistently unreadable BUSY scope made
+// the slice look emptier than it is, so the gate admitted past capacity while
+// still reporting cpu_slots=ok — a false claim of governance, undetectable from
+// outside. Only a scope PROVEN to have vanished may be skipped.
+func TestScanSliceWorkerScopesFailsOnAnUnreadableConfineScope(t *testing.T) {
+	slice := newTestSlice(t)
+	makeWorkerScope(t, slice, ".aira-CONFINE-busy", "1", "populated 1\n")
+	blocked := filepath.Join(slice, ".aira-CONFINE-blocked")
+	if err := os.MkdirAll(filepath.Join(blocked, workerScopeChildPrefix+"1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(blocked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blocked, 0o755) })
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: mode 000 does not deny the listing")
+	}
+
+	if _, err := scanSliceWorkerScopes(slice); err == nil {
+		t.Fatal("an unreadable confine scope must fail the snapshot; silently skipping it lets a " +
+			"busy slice read as idle while the grant still claims cpu_slots=ok")
+	}
+}
+
+// verifies: AIRA-64 — a scope that PROVABLY vanished between the two listings
+// is the benign teardown race and is skipped, not turned into an error that
+// would report the whole machine unevaluated whenever a job is exiting.
+func TestScanSliceWorkerScopesSkipsAVanishedConfineScope(t *testing.T) {
+	slice := newTestSlice(t)
+	makeWorkerScope(t, slice, ".aira-CONFINE-a", "1", "populated 1\n")
+	gone := filepath.Join(slice, ".aira-CONFINE-gone")
+	if err := os.Mkdir(gone, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(gone); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := scanSliceWorkerScopes(slice)
+	if err != nil {
+		t.Fatalf("a vanished scope is the benign race, not an error: %v", err)
+	}
+	if snapshot.total != 1 {
+		t.Fatalf("total=%d, want 1", snapshot.total)
 	}
 }
 
@@ -139,7 +160,7 @@ func TestScanSliceWorkerScopesCountsDirectoriesForCapAndLiveForFloor(t *testing.
 // Nothing else on the slice may inflate the machine's busyness.
 func TestScanSliceWorkerScopesIgnoresForeignEntries(t *testing.T) {
 	slice := newTestSlice(t)
-	makeWorkerScope(t, slice, ".aira-CONFINE-a", "1", "populated 1\n", time.Minute)
+	makeWorkerScope(t, slice, ".aira-CONFINE-a", "1", "populated 1\n")
 	if err := os.MkdirAll(filepath.Join(slice, "some-other.scope", ".aira-worker-9"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +170,7 @@ func TestScanSliceWorkerScopesIgnoresForeignEntries(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(slice, ".aira-CONFINE-a", "memory.max"), []byte("max\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := scanSliceWorkerScopes(slice, time.Now(), testGrace)
+	snapshot, err := scanSliceWorkerScopes(slice)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +182,7 @@ func TestScanSliceWorkerScopesIgnoresForeignEntries(t *testing.T) {
 // verifies: AIRA-64 §4.9 — a slice that cannot be read is an error, never a
 // fabricated zero (which would read as "the machine is idle" and admit freely).
 func TestScanSliceWorkerScopesUnreadableSliceIsAnError(t *testing.T) {
-	if _, err := scanSliceWorkerScopes(filepath.Join(t.TempDir(), "absent"), time.Now(), testGrace); err == nil {
+	if _, err := scanSliceWorkerScopes(filepath.Join(t.TempDir(), "absent")); err == nil {
 		t.Fatal("an unreadable slice must be an error, never a zero count")
 	}
 }
@@ -182,7 +203,7 @@ func TestCPUSlotsScanRootAcceptsOnlyConfineScopes(t *testing.T) {
 		{"empty", "", "", false},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			got, ok := cpuSlotsScanRoot(testCase.outer)
+			got, _, ok := cpuSlotsScanRoot(testCase.outer)
 			if ok != testCase.ok || got != testCase.want {
 				t.Fatalf("cpuSlotsScanRoot(%q) = (%q, %v), want (%q, %v)", testCase.outer, got, ok, testCase.want, testCase.ok)
 			}

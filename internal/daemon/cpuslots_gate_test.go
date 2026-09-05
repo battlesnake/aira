@@ -43,7 +43,17 @@ func (f *cpuSlotsFixture) install(server *Server, capacity int) *cpuSlotsFixture
 	server.cpuSlotsCapacity = capacity
 	server.cpuSlotsGrace = testGrace
 	server.cpuSlotsScanInterval = time.Hour // cache never expires unless forced
-	server.cpuSlotsScan = func(root string, _ time.Time, _ time.Duration) (cpuSlotsSnapshot, error) {
+	// The slice resolver is a real cgroupfs lookup in production; these tests
+	// use synthetic paths, so it is stubbed to accept the test slice and
+	// nothing else. Stubbing it to accept EVERYTHING would silently disable the
+	// containment check the resolver exists to provide.
+	server.admitResolveSlice = func(slice string) (string, bool, string) {
+		if slice == testSlice {
+			return testSlice, true, ""
+		}
+		return "", false, "slice-not-found"
+	}
+	server.cpuSlotsScan = func(root string) (cpuSlotsSnapshot, error) {
 		f.scans.Add(1)
 		if f.release != nil {
 			<-f.release
@@ -215,6 +225,68 @@ func TestCPUGateUnestablishedReadingAdmitsAndReportsIt(t *testing.T) {
 	})
 }
 
+// verifies: AIRA-64 §4.8 — the gate REFUSES to count a slice the admission
+// resolver does not recognise, rather than scanning whatever directory a caller
+// happened to name the parent of.
+//
+// Added after mutation testing: removing the resolver call from cpuSlotsDecide
+// SURVIVED the suite, because the only test touching the resolver called it
+// directly rather than through the gate. Without it, a request naming
+// `/anywhere/.aira-CONFINE-x` has the gate scan `/anywhere`, find nothing, and
+// admit freely — a fail-open dressed as a governed grant.
+func TestCPUGateRefusesASliceTheResolverDoesNotRecognise(t *testing.T) {
+	server := cpuGateServer(t)
+	fixture := newCPUSlotsFixture().install(server, 1)
+	// The real slice is saturated, so anything that IS governed must be denied.
+	fixture.set(testOuterA, 5, 5)
+	if got := admitOn(t, server, testOuterA); got.Reason != runner.WorkerAdmitReasonCPUSlotsSaturated {
+		t.Fatalf("precondition: the governed slice must be saturated, got %+v", got)
+	}
+
+	// Same confine-shaped basename, a parent the resolver rejects.
+	response := admitOn(t, server, "/somewhere-else/.aira-CONFINE-a")
+	if response.State != runner.WorkerAdmitStateGranted {
+		t.Fatalf("an unresolvable slice is unevaluated, and unevaluated admits on RAM: %+v", response)
+	}
+	if response.CPUSlots != runner.WorkerAdmitCPUSlotsUnevaluated {
+		t.Fatalf("a request whose slice the resolver rejects must report cpu_slots=unevaluated, "+
+			"not a governed %q — otherwise the gate silently scans an unrelated directory, "+
+			"finds nothing, and admits freely", response.CPUSlots)
+	}
+}
+
+// verifies: AIRA-64 §4.8 — the slice the gate SCANS is the resolver's
+// canonicalised answer, not the path derived from the caller's spelling.
+//
+// Added after mutation testing: calling the resolver and then ignoring its
+// result SURVIVED, because the test fixture's resolver returned its input
+// unchanged, so "candidate" and "resolved" were the same string. Here the
+// resolver deliberately canonicalises to a DIFFERENT path that is the only one
+// the tree fixture knows about, so scanning the unresolved candidate finds an
+// empty slice and grants where it must deny.
+func TestCPUGateScansTheResolverCanonicalisedSlice(t *testing.T) {
+	const canonical = "/canonical-slice"
+	server := cpuGateServer(t)
+	fixture := newCPUSlotsFixture().install(server, 1)
+	server.admitResolveSlice = func(slice string) (string, bool, string) {
+		if slice == testSlice {
+			return canonical, true, ""
+		}
+		return "", false, "slice-not-found"
+	}
+	// The tree exists ONLY under the canonical path, and it is saturated. The
+	// scope key must be rebuilt from the canonical root too, or the floor lookup
+	// misses and grants.
+	fixture.set(canonical+"/.aira-CONFINE-a", 4, 4)
+
+	response := admitOn(t, server, testOuterA)
+	if response.State != runner.WorkerAdmitStateDenied ||
+		response.Reason != runner.WorkerAdmitReasonCPUSlotsSaturated {
+		t.Fatalf("the gate must scan the resolver's canonical slice (%s); scanning the "+
+			"caller-derived path instead finds an empty tree and admits: %+v", canonical, response)
+	}
+}
+
 // verifies: AIRA-64 §9.10 — the CPU gate composes ONE way: it may deny what RAM
 // would grant, never grant what RAM would deny.
 func TestCPUGateNeverTurnsARAMDenialIntoAGrant(t *testing.T) {
@@ -290,7 +362,7 @@ func TestCPUGateGrantForcesAFreshSnapshotAndSeesAStaleLowCache(t *testing.T) {
 
 	// Warm the cache while there is genuinely room, and keep it warm (the scan
 	// interval is an hour in this fixture).
-	root, ok := cpuSlotsScanRoot(testOuterA)
+	root, _, ok := cpuSlotsScanRoot(testOuterA)
 	if !ok {
 		t.Fatal("test scope must be a confine scope")
 	}
@@ -427,6 +499,127 @@ func TestCPUGateTakesAFreeGateWithoutConsultingContext(t *testing.T) {
 			"before the scope is created (AIRA-41: the scope must exist and keep charging); "+
 			"got proceed=%v response=%+v", proceed, response)
 	}
+}
+
+// verifies: AIRA-64 §4.10.1(b) — a speculative request never blocks on the
+// OUTER-SCOPE lock either, only on the CPU gate.
+//
+// Added after mutation testing showed that changing acquireWorkerScopeTry's
+// call site back to blocking SURVIVED the suite: nothing held that lock while a
+// zero-wait request was in flight, so both behaviours looked identical (Sol
+// build-review). The outer-scope lock is held across a cgroupfs scan and a scope
+// creation, so blocking on it is exactly the multi-second dispatch-loop freeze
+// speculative admission exists to avoid.
+func TestCPUGateSpeculativeRequestNeverBlocksOnTheOuterScopeLock(t *testing.T) {
+	server := cpuGateServer(t)
+	fixture := newCPUSlotsFixture().install(server, 100)
+	fixture.set(testOuterA, 1, 1)
+
+	// Hold the outer-scope lock the way a concurrent request for the same scope
+	// would, and never release it.
+	state := server.workerScopeFor(testOuterA)
+	state.lock <- struct{}{}
+
+	done := make(chan WorkerAdmitResponse, 1)
+	go func() {
+		response, _ := server.evaluateWorkerAdmit(context.Background(), workerAdmitRequest{
+			jobID: "job", outerScope: testOuterA, estimatedBytes: 1 << 20, maxWaitMS: 0,
+		})
+		done <- response
+	}()
+	select {
+	case response := <-done:
+		if response.State != runner.WorkerAdmitStateDenied ||
+			response.Class != runner.WorkerAdmitClassContended ||
+			response.Reason != runner.WorkerAdmitReasonAdmitLocksBusy {
+			t.Fatalf("want denied/contended/admit-locks-busy, got %+v", response)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a speculative request blocked on the outer-scope lock -- that lock is held " +
+			"across a cgroupfs scan and a scope creation, so this freezes the supervisor's " +
+			"single-threaded dispatch loop behind another job")
+	}
+}
+
+// verifies: AIRA-64 §4.10.1(b) — a NON-speculative request still waits on the
+// outer-scope lock rather than reporting a spurious denial. The try-acquire is
+// selected by max_wait_ms == 0, not applied unconditionally; without this, the
+// mutant that makes every request try-only would look correct.
+func TestNonSpeculativeRequestStillWaitsForTheOuterScopeLock(t *testing.T) {
+	server := cpuGateServer(t)
+	fixture := newCPUSlotsFixture().install(server, 100)
+	fixture.set(testOuterA, 1, 1)
+
+	state := server.workerScopeFor(testOuterA)
+	state.lock <- struct{}{}
+
+	done := make(chan WorkerAdmitResponse, 1)
+	go func() {
+		response, _ := server.evaluateWorkerAdmit(context.Background(), workerAdmitRequest{
+			jobID: "job", outerScope: testOuterA, estimatedBytes: 1 << 20, maxWaitMS: 30000,
+		})
+		done <- response
+	}()
+	select {
+	case response := <-done:
+		t.Fatalf("a non-speculative request must WAIT for the lock, not report %+v", response)
+	case <-time.After(150 * time.Millisecond):
+	}
+	<-state.lock // release; the waiter may now proceed
+	select {
+	case response := <-done:
+		if response.State != runner.WorkerAdmitStateGranted {
+			t.Fatalf("once the lock frees, the waiting request must proceed: %+v", response)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the waiting request never proceeded after the lock was released")
+	}
+}
+
+// verifies: AIRA-64 §13(e) — Sol build-review P0. A CACHED read must not block
+// behind another caller's in-progress scan.
+//
+// The first implementation held cpuSlotsMu across the whole cgroup walk. That
+// mutex sits in FRONT of both try-acquired locks on the cached path, so a
+// speculative request could still freeze the supervisor's single-threaded
+// dispatch loop behind an unrelated job's slow scan — the try-acquire bought
+// nothing. The mutex now guards only map access.
+func TestCPUSlotsCachedReadDoesNotBlockBehindAnInProgressScan(t *testing.T) {
+	server := cpuGateServer(t)
+	fixture := newCPUSlotsFixture().install(server, 100)
+	fixture.set(testOuterA, 1, 1)
+	server.cpuSlotsScanInterval = time.Hour
+
+	// Warm the cache while scanning is still free.
+	if _, err := server.cpuSlotsSnapshotFor(testSlice, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now park every subsequent scan, and start one that will sit in it.
+	release := make(chan struct{})
+	fixture.release = release
+	scanning := make(chan struct{})
+	go func() {
+		close(scanning)
+		_, _ = server.cpuSlotsSnapshotFor(testSlice, true) // forced: enters the parked scan
+	}()
+	<-scanning
+	// Give the scanning goroutine time to actually be inside the scan.
+	time.Sleep(50 * time.Millisecond)
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = server.cpuSlotsSnapshotFor(testSlice, false) // cached: must not wait
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("a cached CPU-slot read blocked behind another caller's in-progress scan; " +
+			"that mutex sits in front of both try-acquired locks, so this is a dispatch-loop freeze")
+	}
+	close(release)
 }
 
 // verifies: AIRA-64 §4.7 — the gate is abandonable: a vanished peer and a

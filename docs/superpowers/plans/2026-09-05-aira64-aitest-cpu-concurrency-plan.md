@@ -1,6 +1,6 @@
 # AIRA-64 — machine-wide CPU-concurrency governance for aitest workers
 
-Status: **plan v4** (Sol `BLOCK` ×3 + DeepSeek-pro, all applied; loop closed at three rounds)
+Status: **plan v6 / BUILT** (3 plan-review rounds + 1 adversarial build review, all `BLOCK`ed and all applied)
 Ticket: `.aira/tickets/AIRA-64.md` (P1, owner-escalated 2026-09-04)
 Branch: `aira64-aitest-cpu-concurrency`
 Base: `76095d5`
@@ -131,10 +131,25 @@ So the two questions get two different counts:
 | question | count | fails toward |
 |---|---|---|
 | "how busy is the machine?" (the cap test) | **directory** count of `.aira-worker-*` under every `.aira-CONFINE-*` scope in the slice | over-count → **denies** growth → safe |
-| "does this scope have any worker at all?" (the floor) | **live** count — `.aira-worker-*` children of *this* outer scope that are `populated` **or younger than the placement grace** (§4.4.1) | under-count → **opens** the floor → safe |
+| "does this scope have any worker at all?" (the floor) | **live** count — `.aira-worker-*` children of *this* outer scope reporting `cgroup.events: populated 1`, gated by §4.4.3's `lastGrantAt` | under-count → **opens** the floor → safe |
 
-An empty *aged* orphan therefore makes the machine look slightly busier (denying
+An empty orphan therefore makes the machine look slightly busier (denying
 above-floor growth, harmless) but can never block a job's floor worker.
+
+**One further correction from the build review (§13(d)):** "the directory count
+never undercounts" was only true if every confine scope can actually be read.
+The first implementation skipped any scope whose listing failed, which made a
+persistently unreadable **busy** scope look empty and let the gate admit past
+capacity while still claiming `cpu_slots=ok`. Only a scope *proven* to have
+vanished is skipped now; any other read failure makes the whole snapshot
+`unevaluated`.
+
+> **SUPERSEDED IN BUILD (v6) — read §4.4.3 first.** §4.4.1 and §4.4.2 below
+> describe the *directory-age* mechanism that closed the grant-to-placement
+> window. The build review falsified its justification a second time, and it has
+> been **removed** in favour of daemon-owned state. The sections are kept because
+> the reasoning that led there is what the reviews acted on; §4.4.3 is what
+> shipped.
 
 #### 4.4.1 The placement grace, and why the floor is not populated-only
 
@@ -237,6 +252,41 @@ runs, and a mismatch is bounded in both directions:
 
 Neither direction breaks an invariant, so the mismatch is documented rather than
 engineered away with cross-process plumbing.
+
+#### 4.4.3 WHAT SHIPPED: the window is closed by daemon-owned state
+
+The build review killed the age gate outright, and the way it died is worth
+recording because it took two refutations.
+
+1. §4.4.1 claimed directory `mtime` is creation time. The real-cgroup test
+   refuted that on its first run: a child-cgroup `mkdir`/`rmdir` moves it.
+2. The salvaged argument was "an abandoned scope has no process able to create
+   children inside it, so its `mtime` is frozen". **That is also false, and the
+   same test proves it**: the test process creates a child inside a worker scope
+   it is not a member of. Cgroup membership does not govern who may `mkdir` in
+   the directory — write permission does.
+
+Rather than defend a third version of a filesystem inference, the inference is
+gone. The floor is now:
+
+> **`liveForFloor` = the count of this outer scope's `.aira-worker-*` children
+> that report `cgroup.events: populated 1`** (an unestablished reading counts as
+> live), **AND** the daemon has not granted under this outer scope within the
+> grace window.
+
+The second clause is `workerScopeState.lastGrantAt`, recorded on **every** grant
+— not only floor grants, because a normal under-capacity grant opens the same
+grant-to-placement window. It lives on a cell that already exists per outer
+scope and is already held under that scope's lock at every decision point, so it
+needs no lifetime, expiry, or restart story: after a restart it is zero, which
+permits exactly one extra floor grant per scope and nothing worse.
+
+This is strictly better than the age gate on every axis. It cannot be perturbed
+by anything outside the daemon, it needs no timestamp semantics, it closes both
+round-1's orphan hole and round-2's placement-window hole with one comparison,
+and it **deleted more code than it added**. It is also, finally, the shape
+`architectural-simplicity` was pointing at all along — the two review rounds
+spent defending `mtime` were the detour.
 
 ### 4.5 The liveness floor — the most important invariant
 
@@ -508,6 +558,46 @@ moment a slot actually frees.
 
 Preemption is **not** built (§5g).
 
+### 4.12 Coverage boundary — what this structurally CANNOT govern
+
+Added after a field finding from the peer session `split` (2026-09-05), and
+stated as a boundary rather than left to be inferred, because "aitest now
+governs CPU" is exactly the kind of sentence that would be read as more than it
+is.
+
+**This change governs the CPU concurrency of aitest WORKER PROCESSES, and
+nothing else.** It hooks worker admission. Two real, observed classes of CPU
+load fall outside it entirely:
+
+**(a) Recipes that never engage aitest.** `fastest-ee`'s
+`make test-lite-slowbuild` (`Makefile:350`) runs `uv run pytest -q` with the lite
+project's own `-n auto` addopts, bypassing `pytest_worker_flags.sh` and
+therefore aitest altogether. It was observed OOM-killed three times under real
+contention — confirmed `systemd-oomd` PSI-pressure kills with zero test
+failures, even under `aira confine --delegate-ram --memory-max 24G` with 58 GB
+machine-wide free. **A recipe that does not route through aitest gets no
+CPU governance from this change**, and that routing gap is on the consumer
+project's side, not AIRA's.
+
+**(b) Build subprocesses spawned inside test bodies.** The same recipe's
+heaviest work is not pytest workers at all — it is `uv` wheel builds and
+`docker build` invocations spawned as ordinary subprocesses from inside test
+functions. A worker-spawn/retire hook **structurally cannot see them**: they are
+not workers, they are not admitted, and they would not be even if that recipe
+were wired through aitest correctly. One admitted worker can fan out into an
+arbitrary number of CPU-heavy children, and this gate counts it as one.
+
+**Not fixed here, and deliberately not attempted.** Governing arbitrary
+subprocess CPU is a different problem from bounding worker concurrency, with a
+different mechanism (it would need cgroup-level CPU accounting or weighting at
+the confine-scope level, not a count at an admission verb). Folding it in would
+blow this change's scope and blur the one thing it does cleanly. The peer
+session is filing it separately.
+
+**Consequence for §4.6's guarantee:** the bound is over *aitest workers in a
+slice*, not over CPU-heavy processes on the machine. §11 states the yield in
+those terms and no wider.
+
 ## 5. Rejected alternatives
 
 **(a) Make aitest workers speak the existing `governor` verb.** Best fairness
@@ -595,8 +685,10 @@ AIRA-33's own work and its own review.
 1. Every outer scope with queued work is always entitled to ≥1 worker (§4.5),
    and no orphaned directory can withhold it (§4.4).
 2. Live workers in a slice ≤ `capacity + max(0, J - 1)`, `J` = outer scopes
-   holding ≥1 worker child, whenever the reading can be established (§4.6) —
-   **not** `max(capacity, J)`.
+   holding ≥1 worker child, whenever the reading can be established, **and
+   provided at most one supervisor admits concurrently under each outer scope**
+   (§4.6's proviso, which invariant 2 previously omitted — Sol build-review P2).
+   **Not** `max(capacity, J)`.
 3. A CPU denial is `state=denied class=contended` — retriable, containment
    preserved. Never `admission-unusable` (which strips RAM containment for a
    whole run) and never `request-invalid` (which marks queued work unevaluated).
@@ -782,8 +874,21 @@ test above; any survivor becomes a new test.
 ## 11. Expected yield
 
 Removes the dominant cause of contention-induced phantom `pytest-timeout`
-failures on this box: two concurrent merge-gates go from 32 heavy workers on 16
-cores to 16. Does not claim to remove every such failure (§4.6, §8).
+failures **for aitest-routed suites** on this box: two concurrent merge-gates go
+from 32 heavy workers on 16 cores to 16.
+
+Stated in the narrowest true terms, because three review rounds and a build
+review were each spent deleting a version of this sentence that claimed more
+than the code delivers:
+
+- it bounds **aitest worker processes in one slice**, not CPU-heavy processes on
+  the machine (§4.12);
+- it does **not** cover recipes that bypass aitest, nor build subprocesses
+  spawned from inside test bodies — both observed in the field, both
+  structurally outside a worker-admission hook (§4.12a, §4.12b);
+- it does **not** claim CPU is never oversubscribed: the floor deliberately
+  oversubscribes to `C + max(0, J-1)`, and non-aitest load is uncounted (§4.6);
+- it does **not** change how a `pytest-timeout` failure is classified (§8).
 
 ## 12. Review history
 
@@ -895,6 +1000,35 @@ makes the cache deliberately stale-LOW and asserts on the **verdict**: the cache
 says there is room, the tree says there is not, and only a forced rescan can
 tell the difference.
 
+**(d) The scan silently swallowed every unreadable outer scope.** The first
+implementation `continue`d past any `ReadDir` error on a confine scope, with a
+comment claiming that was as safe as skipping a vanished one. It is not: one
+persistently unreadable **busy** scope made the whole slice read as emptier than
+it is, so the gate admitted past capacity **while still reporting
+`cpu_slots=ok`** — a false claim of governance, invisible from outside, and a
+direct contradiction of the "total never undercounts" property the two-count
+split rests on. Only a scope *proven* to have vanished (ENOENT confirmed by a
+re-stat, mirroring `sumWorkerScopeChildren`) is skipped now; every other error
+fails the snapshot into `unevaluated`.
+
+**(e) `cpuSlotsMu` was held across the whole cgroup walk, so speculative
+requests could still block behind another job.** That mutex sits in front of
+both try-acquired locks on the cached path, so the try-acquire bought nothing:
+a slow scan under one job froze another job's dispatch loop. The mutex now
+guards only map access; two callers may scan the same root concurrently, which
+is a duplicated `readdir` rather than a correctness problem.
+
+**(f) The plan promised slice-resolver validation that the code did not do.**
+§4.8 said the derived root would be canonicalised through `admitResolveSlice`;
+the first implementation checked only the basename prefix lexically. A caller
+naming `/anywhere/.aira-CONFINE-x` would have had the gate count an unrelated
+directory, find nothing, and admit freely. Now the derived root is resolved
+through the real resolver (which requires a real directory inside the cgroup2
+mount) and symlinks are resolved *before* the parent is taken. **This one is
+recorded as a process failure as much as a code one: the plan asserted a
+behaviour and the build did not deliver it, which is the fourth time in this
+change that prose ran ahead of code.**
+
 **Deliberate behaviour change to an existing contract, recorded.**
 `--max-wait 0` was `argument-invalid`; it is now valid and means *speculative*.
 `TestRunWorkerAdmitCommandAlwaysWritesOneStructuredOutcome`'s "non-positive max
@@ -952,3 +1086,37 @@ fails only sometimes. Fixed with a deterministic regression test that cancels th
 peer at an injected point inside the outer-scope lock, immediately before the
 gate (`TestCPUGateTakesAFreeGateWithoutConsultingContext`). **A bug found by a
 flake needs a deterministic test, or the fix is unprotected.**
+
+### Rounds 3–5, after the build review
+
+The build review changed the mechanism (the age gate was replaced by
+`lastGrantAt`), so the suite was re-derived: **41 mutants, all resolved.** New
+ones cover the two-count split, the `lastGrantAt` window, the unreadable-scope
+P0, the outer-lock try-acquire in both directions, the resolver, and the scan
+mutex. Three more survivors, and the third is the most interesting result in this
+whole change:
+
+**M29 / M29b / M29c — the resolver was called and then effectively ignored.**
+Removing the resolver call survived, because the only test touching it called it
+*directly* rather than through the gate; and even after adding a gate-level test,
+ignoring the resolver's *canonicalised answer* still survived, because the
+fixture's resolver returned its input unchanged. Fixed with a resolver that
+canonicalises to a genuinely different path which is the only one the tree
+fixture knows.
+
+**M31 — `cpuSlotsInvalidate` was deleted, because mutation testing proved it
+earned nothing.** Removing it survived every attempt to write a test that could
+tell the difference, and working out why showed no such test can exist: the cache
+is read only by the CHEAP path, whose sole power is to deny early, so a stale-low
+total can never cause a wrong admission — only a failure to deny early, which
+sends the request to the grant path, which forces a fresh scan *and re-caches*.
+The cost was exactly one extra scan per grant; the price was a second code path
+that had to derive the same cache key as `cpuSlotsLocate` and agree with it
+forever (M31b was written to exploit precisely that). **The honest response to a
+mutant that cannot be killed is to ask whether the code is doing anything — and
+here it was not.** Deleting it removed a whole class of key-agreement bug and
+left the correctness guarantee where it actually lives: every grant is preceded
+by a forced fresh scan.
+
+**Final tally: 41 mutants, 38 killed, 3 retired by deleting the code they
+targeted.** No mutant remains alive against shipped code.

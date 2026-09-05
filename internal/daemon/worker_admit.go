@@ -135,13 +135,17 @@ type workerScopeState struct {
 	// reverting to a stale number. Found independently by Sol and DeepSeek
 	// build-review.
 	scanErr error
-	// lastFloorGrantAt is AIRA-64's floor rate limit: at most one liveness-floor
-	// grant per outer scope per placement-grace window. It lives here because
-	// this cell is already per-outer-scope and already held under this scope's
-	// lock at every decision point, so the limit needs no lifetime, expiry or
-	// restart story of its own — after a restart it is zero, which permits
-	// exactly one extra floor grant and nothing worse.
-	lastFloorGrantAt time.Time
+	// lastGrantAt is when this daemon last granted a worker under this outer
+	// scope, and it is what closes AIRA-64's grant-to-placement window: a scope
+	// granted moments ago still reads UNPOPULATED, so without this a second
+	// supervisor under the same outer scope would see "no live workers" and take
+	// the liveness floor too.
+	//
+	// It lives here because this cell is already per-outer-scope and already
+	// held under this scope's lock at every decision point, so it needs no
+	// lifetime, expiry or restart story of its own — after a restart it is
+	// zero, which permits exactly one extra floor grant and nothing worse.
+	lastGrantAt time.Time
 }
 
 // workerScopeScanIntervalDefault throttles the per-outer-scope child scan to
@@ -616,7 +620,7 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 	// that rescan. Checking CPU afterwards would force a full O(tree) RAM walk
 	// on EVERY 200ms saturated poll — the AIRA-61 CPU-regression shape, and
 	// exactly what this ordering avoids (found by Sol plan-review round 2).
-	if verdict, detail := s.cpuSlotsDecide(req.outerScope, state.lastFloorGrantAt, false); verdict == cpuSlotsSaturated {
+	if verdict, detail := s.cpuSlotsDecide(req.outerScope, state.lastGrantAt, false); verdict == cpuSlotsSaturated {
 		return WorkerAdmitResponse{
 			State:  runner.WorkerAdmitStateDenied,
 			Class:  runner.WorkerAdmitClassContended,
@@ -650,7 +654,6 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 	// across [fresh snapshot -> decide -> CreateWorkerScope] so two concurrent
 	// grants under DIFFERENT outer scopes cannot both observe capacity-1 and
 	// both grant. Lock order is outer-scope -> gate, never the reverse.
-	cpuVerdict := cpuSlotsAdmitNormal
 	if !s.acquireCPUSlotsGate(ctx, req.maxWaitMS == 0) {
 		if req.maxWaitMS == 0 && ctx.Err() == nil {
 			select {
@@ -668,7 +671,7 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 	}
 	defer s.releaseCPUSlotsGate()
 	cpuState := runner.WorkerAdmitCPUSlotsOK
-	switch verdict, detail := s.cpuSlotsDecide(req.outerScope, state.lastFloorGrantAt, true); verdict {
+	switch verdict, detail := s.cpuSlotsDecide(req.outerScope, state.lastGrantAt, true); verdict {
 	case cpuSlotsSaturated:
 		return WorkerAdmitResponse{
 			State:  runner.WorkerAdmitStateDenied,
@@ -685,9 +688,6 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 		// granted line and logged; it is never rendered as a zero or a pass.
 		s.cpuSlotsWarnOnce(req.outerScope, detail)
 		cpuState = runner.WorkerAdmitCPUSlotsUnevaluated
-		cpuVerdict = cpuSlotsUnevaluated
-	case cpuSlotsAdmitFloor:
-		cpuVerdict = cpuSlotsAdmitFloor
 	}
 	seq := state.nextSeq
 	if state.maxIndex > seq {
@@ -758,14 +758,22 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 	state.nextSeq = seq
 	// The tree changed under us; the next committed read must see it.
 	state.invalidate()
-	// AIRA-64: the CPU snapshot is now stale-low for the same reason, and the
-	// next grant must not be evaluated against a total that omits this worker.
-	s.cpuSlotsInvalidate(req.outerScope)
-	if cpuVerdict == cpuSlotsAdmitFloor {
-		// Record the floor grant only once the scope actually exists, so a
-		// failed creation cannot consume this scope's floor entitlement.
-		state.lastFloorGrantAt = s.admitNowTime()
-	}
+	// AIRA-64: the CPU snapshot is now stale-low too, and deliberately NOT
+	// invalidated here — see the comment where cpuSlotsInvalidate used to be.
+	// A stale-low CPU cache can only fail to deny early; it can never admit,
+	// because every grant forces a fresh scan under the gate first.
+	//
+	// AIRA-64: lastGrantAt is recorded for EVERY grant, not only floor grants, and only once
+	// the scope actually exists so a failed creation cannot consume this
+	// scope's floor entitlement.
+	//
+	// Every grant, because the window this closes is "granted but not yet
+	// placed", and a NORMAL (under-capacity) grant opens that window exactly as
+	// a floor grant does: the scope reads unpopulated either way. Recording only
+	// floor grants left the commonest case — a scope grew normally, then the
+	// machine filled up before its newest worker placed — able to draw an extra
+	// floor grant.
+	state.lastGrantAt = s.admitNowTime()
 	return WorkerAdmitResponse{
 		State: runner.WorkerAdmitStateGranted, Class: runner.WorkerAdmitClassGranted,
 		WorkerID: workerID, ScopePath: scopePath,

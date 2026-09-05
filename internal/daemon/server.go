@@ -105,7 +105,7 @@ type Server struct {
 	cpuSlotsMu           sync.Mutex
 	cpuSlotsCache        map[string]cpuSlotsCacheEntry
 	cpuSlotsWarned       map[string]struct{}
-	cpuSlotsScan         func(string, time.Time, time.Duration) (cpuSlotsSnapshot, error)
+	cpuSlotsScan         func(string) (cpuSlotsSnapshot, error)
 
 	// Test seams. Production always calls the Store methods and DB.Close.
 	reapScope         func(context.Context, *store.Store) (int, error)

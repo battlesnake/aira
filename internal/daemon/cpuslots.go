@@ -3,7 +3,9 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -81,19 +83,45 @@ func cpuSlotsPlacementGrace() time.Duration {
 // path's parent. A scope that does not pass is not scanned and its CPU
 // dimension is reported unevaluated (AIRA-64 plan section 4.9) — never assumed
 // idle.
-func cpuSlotsScanRoot(outerScope string) (string, bool) {
+// Symlinks are resolved BEFORE the parent is taken (Sol build-review, P1):
+// a `.aira-CONFINE-*` name that is a symlink would otherwise have the scan
+// enumerate the link's directory while scope creation followed the link into
+// the real slice — two different trees for one request. EvalSymlinks failing
+// (including a path that does not exist) is reported as "cannot establish",
+// not as a pass.
+//
+// The returned root is a CANDIDATE. cpuSlotsDecide additionally requires it to
+// resolve through the admission slice resolver, which is what proves it is a
+// real directory inside the cgroup2 mount rather than any parent a caller
+// happened to name.
+// It returns BOTH the candidate root and the resolved scope path, because the
+// caller must key its snapshot lookup off the same resolution the scan will use
+// — deriving the two separately is how a cache gets written under one key and
+// read under another.
+func cpuSlotsScanRoot(outerScope string) (root, scopePath string, ok bool) {
 	if outerScope == "" || !filepath.IsAbs(outerScope) {
-		return "", false
+		return "", "", false
 	}
 	clean := filepath.Clean(outerScope)
 	if !strings.HasPrefix(filepath.Base(clean), confineScopeChildPrefix) {
-		return "", false
+		return "", "", false
 	}
-	root := filepath.Dir(clean)
+	if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+		// Re-check the prefix on the RESOLVED path: a link named
+		// `.aira-CONFINE-x` pointing at something else must not inherit the
+		// name's authority.
+		if !strings.HasPrefix(filepath.Base(resolved), confineScopeChildPrefix) {
+			return "", "", false
+		}
+		clean = resolved
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return "", "", false
+	}
+	root = filepath.Dir(clean)
 	if root == "" || root == "/" || root == "." {
-		return "", false
+		return "", "", false
 	}
-	return root, true
+	return root, clean, true
 }
 
 // cpuSlotsSnapshot is one kernel-derived reading of a slice's aitest worker
@@ -134,47 +162,29 @@ func parseCgroupEventsPopulated(data []byte) (bool, bool) {
 	return false, false
 }
 
-// workerScopeLiveForFloor is the single predicate the liveness floor is
-// defined by: a worker scope counts as live when it is POPULATED **or** YOUNGER
-// THAN THE PLACEMENT GRACE.
+// workerScopeLiveForFloor reports whether one worker scope counts as a live
+// worker for the liveness floor. It is exactly "is this cgroup POPULATED?".
 //
-// Both halves are load-bearing and each closes a hole the other leaves open:
+// An unestablished reading resolves to LIVE. That is the direction that cannot
+// fabricate an open floor: an over-count only denies above-floor growth, while
+// an under-count admits workers the bound was supposed to refuse.
 //
-//   - populated-only would let N supervisors paused between their grant and
-//     their fork each read "zero live workers" and each take a floor grant,
-//     since the daemon creates the scope before the client places into it
-//     (Sol plan-review round 2);
-//   - young-only (i.e. a plain directory count) would let ONE empty orphan —
-//     from a grant whose response write failed, or a relay the client gave up
-//     on — hold the floor closed forever, so a job that today merely runs
-//     slowly would instead never run at all (Sol plan-review round 1).
+// WHY THERE IS NO LONGER AN AGE COMPONENT HERE. An earlier build paired this
+// with "…or younger than the placement grace", reading directory mtime, to
+// close the window between the daemon creating a scope and the client placing
+// into it. The real-cgroup test refuted the mtime claim (a child-cgroup mkdir
+// moves it), and the salvaged argument — "an abandoned scope has no process to
+// create children inside it" — was then refuted by that same test, which
+// creates a child inside a scope it is not a member of: cgroup membership does
+// not govern who may mkdir in the directory (Sol build-review).
 //
-// Every unestablished reading resolves to LIVE. That is the direction that
-// cannot fabricate an open floor: an over-count only denies above-floor growth,
-// while an under-count admits workers the bound was supposed to refuse.
-// A future mtime (clock skew) yields a negative age, which is < grace, so it
-// reads as young — live — for the same reason.
-//
-// WHAT `mtime` ACTUALLY MEANS HERE, measured rather than assumed
-// (TestWorkerScopeMtimeMovesOnlyOnDirectoryEntryChanges): it is the time of the
-// last DIRECTORY-ENTRY change in the scope, not its creation time. Population
-// (a cgroup.procs write) and control-file writes do not move it; a child-cgroup
-// mkdir or rmdir does. The gate needs exactly one property and that is enough
-// for it: an ABANDONED scope's mtime is frozen, because an abandoned scope holds
-// no process that could create or remove a child inside it, so it really does
-// age out and the floor really does open. A LIVE worker that nests cgroups only
-// refreshes its own mtime — it looks younger, and it IS live, so counting it
-// live is correct. The movement is one-directional in the safe sense; an earlier
-// draft of this comment claimed mtime was creation time, and the real-cgroup
-// test refuted that on its first run.
-func workerScopeLiveForFloor(path string, now time.Time, grace time.Duration) bool {
-	info, err := os.Stat(path)
-	if err != nil {
-		return true
-	}
-	if now.Sub(info.ModTime()) < grace {
-		return true
-	}
+// The placement window is now closed by daemon-owned state instead of by
+// filesystem inference: workerScopeState.lastGrantAt records when this daemon
+// last granted under this outer scope, and cpuSlotsDecide refuses a floor grant
+// inside one grace window of it. That is strictly better than the age gate on
+// every axis — it needs no timestamp semantics, cannot be perturbed by anything
+// outside the daemon, and it deleted more code than it added.
+func workerScopeLiveForFloor(path string) bool {
 	data, err := os.ReadFile(filepath.Join(path, "cgroup.events"))
 	if err != nil {
 		return true
@@ -197,7 +207,7 @@ func workerScopeLiveForFloor(path string, now time.Time, grace time.Duration) bo
 // A slice that cannot be listed is an ERROR, never an empty snapshot: a
 // fabricated zero would read as "the machine is idle" and admit freely, which
 // is precisely the failure this gate exists to prevent.
-func scanSliceWorkerScopes(slicePath string, now time.Time, grace time.Duration) (cpuSlotsSnapshot, error) {
+func scanSliceWorkerScopes(slicePath string) (cpuSlotsSnapshot, error) {
 	entries, err := os.ReadDir(slicePath)
 	if err != nil {
 		return cpuSlotsSnapshot{}, fmt.Errorf("read slice %s: %w", slicePath, err)
@@ -210,13 +220,25 @@ func scanSliceWorkerScopes(slicePath string, now time.Time, grace time.Duration)
 		outer := filepath.Join(slicePath, entry.Name())
 		children, err := os.ReadDir(outer)
 		if err != nil {
-			// A confine scope that vanished between the two listings is the
-			// benign teardown race and charges nothing, which is correct
-			// rather than an undercount. Any other error is skipped for the
-			// same reason: it concerns one scope, and failing the whole scan
-			// would report the entire machine unevaluated because one job is
-			// mid-teardown.
-			continue
+			// ONLY a scope PROVEN to have vanished is skipped. That is the
+			// benign teardown race between this listing and the child listing,
+			// and a gone scope charges nothing, which is correct rather than an
+			// undercount.
+			//
+			// Every other error propagates (Sol build-review, P0). Swallowing
+			// them was a real fail-open: one persistently unreadable BUSY scope
+			// made the whole slice look emptier than it is, so the gate admitted
+			// past capacity while still reporting cpu_slots=ok — a false claim
+			// of governance, and undetectable. The honest answer for a reading
+			// this scan cannot establish is an error, which the caller renders
+			// as `unevaluated`. Mirrors sumWorkerScopeChildren's own ENOENT
+			// re-stat discipline exactly.
+			if errors.Is(err, fs.ErrNotExist) {
+				if _, statErr := os.Stat(outer); errors.Is(statErr, fs.ErrNotExist) {
+					continue
+				}
+			}
+			return cpuSlotsSnapshot{}, fmt.Errorf("read confine scope %s: %w", outer, err)
 		}
 		workers := 0
 		for _, child := range children {
@@ -224,7 +246,7 @@ func scanSliceWorkerScopes(slicePath string, now time.Time, grace time.Duration)
 				continue
 			}
 			workers++
-			if workerScopeLiveForFloor(filepath.Join(outer, child.Name()), now, grace) {
+			if workerScopeLiveForFloor(filepath.Join(outer, child.Name())) {
 				snapshot.liveForFloor[outer]++
 			}
 		}

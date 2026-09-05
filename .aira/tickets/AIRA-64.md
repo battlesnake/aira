@@ -131,6 +131,26 @@ under each outer scope**. Two concurrent merge-gates on this 16-core box go from
 32 heavy workers to 16. It is explicitly NOT a claim that CPU is never
 oversubscribed (§4.6).
 
+### Coverage boundary — stated, not implied
+
+This governs **aitest worker processes in one slice**, and nothing else. Two
+observed classes of CPU load are structurally outside a worker-admission hook
+and are NOT fixed here (plan §4.12, from a field finding by peer session
+`split`):
+
+- **recipes that bypass aitest entirely** — e.g. fastest-ee's
+  `make test-lite-slowbuild` (`Makefile:350`) runs `uv run pytest -q` with the
+  lite project's own `-n auto`, never reaching `pytest_worker_flags.sh`. Observed
+  OOM-killed 3× under contention (confirmed `systemd-oomd` PSI kills, 0 test
+  failures). The routing gap is on the consumer project's side;
+- **build subprocesses inside test bodies** — `uv` wheel builds and
+  `docker build` spawns are not workers, are never admitted, and one admitted
+  worker can fan out into arbitrarily many of them while this gate counts it as
+  one.
+
+Governing arbitrary subprocess CPU is a different problem needing a different
+mechanism; `split` is filing it separately.
+
 ### Owner decision still open
 
 **Should a wall-clock `pytest-timeout` failure observed under measured CPU

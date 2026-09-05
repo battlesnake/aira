@@ -21,7 +21,14 @@ import (
 // runs against a seam, so all of them would keep passing if the real scan could
 // never establish a reading on a real host — which is exactly how the AIRA-59
 // watchdog shipped INERT: correct arithmetic, and it never fired. These run the
-// production scan against a real cgroup tree.
+// production scan and the production population reading against a real cgroup
+// tree.
+//
+// This tier has already earned its place twice. It refuted the plan's original
+// directory-mtime claim on its first run, and the salvaged version of that
+// argument was then refuted by this same file's own ability to create a child
+// cgroup inside a scope it is not a member of. The age gate is gone as a result;
+// the placement window is closed by daemon-owned state instead.
 
 // realSliceWithConfineScopes builds <parent>/.aira-CONFINE-<name> scopes shaped
 // the way `aira confine` leaves them, so cpuSlotsScanRoot accepts them and the
@@ -45,26 +52,50 @@ func realSliceWithConfineScopes(t *testing.T, names ...string) (slice string, sc
 	return slice, scopes
 }
 
+// populateScope puts a real process into scopePath and returns once the kernel
+// reports the cgroup populated, so a test never races its own setup.
+func populateScope(t *testing.T, scopePath string) {
+	t.Helper()
+	sleeper := exec.Command("sleep", "120")
+	if err := sleeper.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sleeper.Process.Kill(); _, _ = sleeper.Process.Wait() })
+	if err := os.WriteFile(filepath.Join(scopePath, "cgroup.procs"),
+		[]byte(strconv.Itoa(sleeper.Process.Pid)), 0o644); err != nil {
+		cgrouptest.SkipOrFailRealCgroup(t, "cannot place a process into %s: %v", scopePath, err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !workerScopeLiveForFloor(scopePath) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never reported populated after a real process joined it", scopePath)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // verifies: AIRA-64 §9.17 — THE ANTI-INERT TEST. Against a real slice holding
-// real worker cgroups, and with RAM deliberately wide open, the gate actually
-// denies at capacity with the exact reason the client acts on. A gate that
-// silently reported `unevaluated` on every real host would pass every seam test
-// in this package and fail this one.
+// real, really-populated worker cgroups, and with RAM deliberately wide open,
+// the gate actually denies at capacity with the exact reason the client acts
+// on. A gate that silently reported `unevaluated` on every real host would pass
+// every seam test in this package and fail this one.
 func TestCPUGateFiresAgainstARealCgroupTree(t *testing.T) {
 	slice, scopes := realSliceWithConfineScopes(t, "busy", "newcomer")
 	busy, newcomer := scopes[0], scopes[1]
 
 	const capacity = 2
 	for i := 1; i <= capacity; i++ {
-		if _, err := runner.CreateWorkerScope(context.Background(), busy, strconv.Itoa(i), 1<<20, 1<<19); err != nil {
+		scope, err := runner.CreateWorkerScope(context.Background(), busy, strconv.Itoa(i), 1<<20, 1<<19)
+		if err != nil {
 			cgrouptest.SkipOrFailRealCgroup(t, "create worker scope: %v", err)
 		}
+		populateScope(t, scope)
 	}
 
-	// The scan must see the real tree before anything else is asserted:
-	// otherwise a later "denied" could come from an unrelated cause and this
-	// test would certify an inert gate.
-	snapshot, err := scanSliceWorkerScopes(slice, time.Now(), cpuSlotsPlacementGraceDefault)
+	// The production scan must see the real tree before anything else is
+	// asserted: otherwise a later "denied" could come from an unrelated cause
+	// and this test would certify an inert gate.
+	snapshot, err := scanSliceWorkerScopes(slice)
 	if err != nil {
 		t.Fatalf("the production scan could not read a real slice — the gate would be INERT here: %v", err)
 	}
@@ -72,7 +103,11 @@ func TestCPUGateFiresAgainstARealCgroupTree(t *testing.T) {
 		t.Fatalf("real scan saw %d worker scopes, want %d (slice=%s)", snapshot.total, capacity, slice)
 	}
 	if snapshot.liveForFloor[busy] != capacity {
-		t.Fatalf("freshly created worker scopes must count as live for the floor, got %d", snapshot.liveForFloor[busy])
+		t.Fatalf("really-populated worker scopes must count as live for the floor, got %d",
+			snapshot.liveForFloor[busy])
+	}
+	if snapshot.liveForFloor[newcomer] != 0 {
+		t.Fatalf("a scope with no workers must have no live count, got %d", snapshot.liveForFloor[newcomer])
 	}
 
 	server := NewServer(Paths{})
@@ -104,94 +139,61 @@ func TestCPUGateFiresAgainstARealCgroupTree(t *testing.T) {
 	if granted.CPUSlots != runner.WorkerAdmitCPUSlotsOK {
 		t.Fatalf("a governed grant must report cpu_slots=ok, got %q", granted.CPUSlots)
 	}
+
+	// The floor is spent: the same scope must NOT take a second floor grant
+	// inside one grace window, even though its brand-new scope is still
+	// unpopulated. This is the grant-to-placement window, closed by
+	// lastGrantAt rather than by any filesystem timestamp — verified here on a
+	// real tree rather than only through the seam.
+	again, _ := server.evaluateWorkerAdmit(context.Background(), workerAdmitRequest{
+		jobID: "newcomer", outerScope: newcomer, estimatedBytes: 1 << 20, maxWaitMS: 0,
+	})
+	if again.State != runner.WorkerAdmitStateDenied || again.Reason != runner.WorkerAdmitReasonCPUSlotsSaturated {
+		t.Fatalf("a just-granted, not-yet-placed scope must not re-claim the floor, got %+v", again)
+	}
 }
 
-// verifies: AIRA-64 §4.4.1, §9.18 — the exact cgroupfs mtime semantics the age
-// gate depends on, measured rather than assumed.
-//
-// THIS TEST ALREADY EARNED ITS PLACE. The plan's first wording claimed a worker
-// directory's mtime "is its creation time", and this test refuted that on the
-// first run: a child-cgroup mkdir or rmdir inside the scope DOES move it. The
-// mechanism survives, but only because the movement is one-directional in the
-// safe sense, and that is what is pinned here rather than the false claim:
-//
-//   - population (a `cgroup.procs` write) does NOT move mtime;
-//   - a control-file write does NOT move it;
-//   - a child-cgroup mkdir/rmdir DOES.
-//
-// The age gate needs exactly one property, and these three give it: an
-// ABANDONED scope's mtime is frozen. An abandoned scope has no process in it, so
-// nothing can create or remove a child cgroup inside it, so it genuinely ages
-// out and the liveness floor opens. A LIVE worker that nests cgroups only ever
-// refreshes its own mtime, i.e. looks younger — and it is in fact live, so being
-// counted live is correct.
-func TestWorkerScopeMtimeMovesOnlyOnDirectoryEntryChanges(t *testing.T) {
-	_, scopes := realSliceWithConfineScopes(t, "mtime")
+// verifies: AIRA-64 §4.4 — the population reading is REAL on a real cgroup, in
+// both directions. Without the second half this would pass against a predicate
+// that always returns true, which is precisely the direction that silently
+// withholds a job's floor worker forever.
+func TestWorkerScopeLiveForFloorTracksRealPopulation(t *testing.T) {
+	_, scopes := realSliceWithConfineScopes(t, "pop")
 	scope, err := runner.CreateWorkerScope(context.Background(), scopes[0], "1", 1<<20, 1<<19)
 	if err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "create worker scope: %v", err)
 	}
-	mtime := func() time.Time {
-		info, err := os.Stat(scope)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return info.ModTime()
-	}
-	created := mtime()
-	if age := time.Since(created); age < 0 || age > time.Minute {
-		t.Fatalf("a just-created worker scope's mtime must read as ~now, got age %v", age)
+	if workerScopeLiveForFloor(scope) {
+		t.Fatal("a freshly created, empty worker scope must not read as populated")
 	}
 
-	sleeper := exec.Command("sleep", "60")
+	sleeper := exec.Command("sleep", "120")
 	if err := sleeper.Start(); err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = sleeper.Process.Kill(); _, _ = sleeper.Process.Wait() }()
-	time.Sleep(20 * time.Millisecond)
-	if err := os.WriteFile(filepath.Join(scope, "cgroup.procs"), []byte(strconv.Itoa(sleeper.Process.Pid)), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(scope, "cgroup.procs"),
+		[]byte(strconv.Itoa(sleeper.Process.Pid)), 0o644); err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "cannot place a process into %s: %v", scope, err)
 	}
-	if !mtime().Equal(created) {
-		t.Fatalf("population moved mtime (%v -> %v); an abandoned scope's mtime would no longer be "+
-			"frozen and the liveness floor could be withheld", created, mtime())
-	}
-	time.Sleep(20 * time.Millisecond)
-	if err := os.WriteFile(filepath.Join(scope, "memory.high"), []byte("max"), 0o644); err != nil {
-		cgrouptest.SkipOrFailRealCgroup(t, "cannot write memory.high: %v", err)
-	}
-	if !mtime().Equal(created) {
-		t.Fatalf("a control-file write moved mtime (%v -> %v)", created, mtime())
-	}
-
-	// A child cgroup DOES move it. Pinned deliberately, as the documented and
-	// safe-direction-only exception: it can only make a live scope look
-	// younger, never make an abandoned one look older.
-	time.Sleep(20 * time.Millisecond)
-	if err := os.Mkdir(filepath.Join(scope, "child"), 0o755); err == nil {
-		defer func() { _ = os.Remove(filepath.Join(scope, "child")) }()
-		if mtime().Equal(created) {
-			t.Fatal("expected a child mkdir to refresh mtime; if that changed, §4.4.1's " +
-				"safe-direction argument needs re-deriving rather than silently holding")
+	deadline := time.Now().Add(5 * time.Second)
+	for !workerScopeLiveForFloor(scope) {
+		if time.Now().After(deadline) {
+			t.Fatal("a scope holding a live process must read as populated")
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
-	// A populated scope is live for the floor at ANY age.
-	if !workerScopeLiveForFloor(scope, time.Now().Add(24*time.Hour), time.Second) {
-		t.Fatal("a populated worker scope must count as live for the floor at any age")
-	}
-	// And that reading must be REAL, not a predicate that always says true:
-	// once the process is gone the same aged scope must stop counting.
 	_ = sleeper.Process.Kill()
 	_, _ = sleeper.Process.Wait()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if !workerScopeLiveForFloor(scope, time.Now().Add(24*time.Hour), time.Second) {
-			return
+	deadline = time.Now().Add(5 * time.Second)
+	for workerScopeLiveForFloor(scope) {
+		if time.Now().After(deadline) {
+			t.Fatal("an emptied worker scope must stop reading as populated, " +
+				"or an orphan withholds this job's floor worker forever")
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("an aged, now-empty worker scope must stop counting as live, or an orphan withholds the floor forever")
 }
 
 // verifies: AIRA-64 §9.19 — the guarantee is PER-SLICE, and that limit is
@@ -210,13 +212,12 @@ func TestCPUGateBoundsEachSliceSeparately(t *testing.T) {
 			cgrouptest.SkipOrFailRealCgroup(t, "create worker scope: %v", err)
 		}
 	}
-	now := time.Now()
 	for _, scope := range []string{first[0], second[0]} {
-		root, ok := cpuSlotsScanRoot(scope)
+		root, _, ok := cpuSlotsScanRoot(scope)
 		if !ok {
 			t.Fatalf("cpuSlotsScanRoot rejected a real confine scope %s", scope)
 		}
-		snapshot, err := scanSliceWorkerScopes(root, now, cpuSlotsPlacementGraceDefault)
+		snapshot, err := scanSliceWorkerScopes(root)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -224,5 +225,28 @@ func TestCPUGateBoundsEachSliceSeparately(t *testing.T) {
 			t.Fatalf("slice %s: got %d workers, want 2 — a slice must not see another slice's workers "+
 				"(this is the documented per-slice limit, not a machine-wide count)", root, snapshot.total)
 		}
+	}
+}
+
+// verifies: AIRA-64 §4.8 — the derived scan root resolves through the real
+// admission-slice resolver against a real cgroup path, and a path outside the
+// cgroup mount does not. This is what stops a caller naming
+// `/anywhere/.aira-CONFINE-x` from having the gate count an unrelated directory
+// (and therefore admit freely).
+func TestCPUSlotsScanRootResolvesOnlyRealCgroupSlices(t *testing.T) {
+	_, scopes := realSliceWithConfineScopes(t, "resolve")
+	root, _, ok := cpuSlotsScanRoot(scopes[0])
+	if !ok {
+		t.Fatalf("cpuSlotsScanRoot rejected a real confine scope %s", scopes[0])
+	}
+	if _, resolved, reason := resolveAdmitSlicePath(root); !resolved {
+		t.Fatalf("a real cgroup slice must resolve, got reason %q for %s", reason, root)
+	}
+	outside := filepath.Join(t.TempDir(), "not-a-cgroup")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, resolved, _ := resolveAdmitSlicePath(outside); resolved {
+		t.Fatalf("%s is outside the cgroup2 mount and must not resolve as a slice", outside)
 	}
 }
