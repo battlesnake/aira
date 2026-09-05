@@ -536,6 +536,41 @@ specifically for `aira.slice`. **This needs explicit owner sign-off before
 any of it is built** -- it is not a Fable-plan-review-and-proceed decision
 the way most of tonight's work has been.
 
+**Owner decision (2026-09-05):** the oomd backstop is NOT to be weakened
+or told to avoid `aira.slice`. Verbatim: "systemd/kernel oom killer is a
+backstop that we should not disable - it's there for if Aira fails in its
+duty, so we don't hit the whole system." This rules out both
+`ManagedOOMPreference=avoid` and restoring stock (weaker) thresholds. The
+fix belongs entirely on AIRA's own side: admission/containment must be
+accurate enough that a legitimately-admitted job does not sit in
+sustained `memory.high` reclaim long enough to generate the PSI that
+trips the backstop in the first place -- if oomd ever fires on an
+AIRA-managed job, that is defined as AIRA under-provisioning or
+mis-sizing its own grant, not a threshold to relax.
+
+**This points directly at AIRA-29's already-banked design** (dynamic
+reserve / track-actual: charge live `memory.current` + headroom instead
+of a static peak-estimate held for the job's whole lifetime -- see that
+ticket for the full spec, currently ON HOLD pending aitest maturity).
+AIRA-29's own measured motivation (a job charging 33.6G reserve while
+using 2.6G RSS, another pair charging 26GiB caps while using ~19-21GiB)
+is the same shape of problem: an inaccurately-sized grant is exactly what
+forces a job into sustained `memory.high` throttling, which is what
+generates the PSI, which is what Part B is about. Now that AIRA-39/41/63's
+worker-admit ledger (real-cgroup-tree-derived, restart-safe) has landed,
+the precedent for track-actual charging exists in the codebase; AIRA-29's
+own banked plan (branch `aira29-dynamic-reserve` @ `c66ee0d`, spec
+`docs/superpowers/specs/2026-09-01-aira29-dynamic-reserve-plan.md`, v3
+complete and 3-lineage-reviewed) was written pre-aitest and needs
+re-validating against the current confine/aitest layout before building,
+not built verbatim as banked.
+
+**Not built here** -- this is a substantial design revival, not a small
+fix, and was not what this decision round authorised. Recorded so the
+next person picking up AIRA-29 or AIRA-91 Part B has the owner's actual
+constraint (fix AIRA's own sizing, never the backstop) rather than
+re-deriving it.
+
 ### Still open: qual's `pipeline` re-run, falsifiable prediction made
 
 The investigation gave qual a specific, falsifiable prediction to test
