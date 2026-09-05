@@ -36,7 +36,7 @@ func TestInstallWithoutDelegationStillInstallsUserUnitsAndReportsPending(t *test
 		}
 	}
 	logs := strings.Join(state.logs, "\n")
-	if strings.Count(logs, "warning: run 'sudo aira install' to apply the /etc oomd + delegation drop-ins, then re-login") != 1 {
+	if strings.Count(logs, "warning: run 'sudo aira install' to apply the /etc oomd + delegation + sysctl drop-ins, then re-login") != 1 {
 		t.Fatalf("expected exactly one oomd/delegation warning: %q", logs)
 	}
 	if !strings.Contains(logs, "pending re-login") {
@@ -110,6 +110,16 @@ ManagedOOMPreference=avoid
 [Service]
 Delegate=yes
 `,
+		"/etc/sysctl.d/60-inotify-aira.conf": `# aira-managed: 60-inotify-aira.conf
+# Raise the per-user inotify instance limit. Every aira confine/aira run
+# supervisor opens one inotify instance for scope-membership watching
+# (scopeMembershipEvents in internal/runner), and this is a per-user, not
+# per-process, kernel limit shared by everything else the user runs too
+# (editors, file watchers, other tools). A machine running many concurrent
+# AI agent sessions can genuinely exhaust the kernel default of 128,
+# surfacing as deterministic inotify_init1 EMFILE failures. See AIRA-96.
+fs.inotify.max_user_instances = 4096
+`,
 	}
 	if len(rendered) != len(want) {
 		t.Fatalf("rendered %d drop-ins, want %d", len(rendered), len(want))
@@ -140,6 +150,52 @@ func TestOomdDesktopSafetyInvariantsArePinned(t *testing.T) {
 	}
 	if !bytes.Contains(byPath["/etc/systemd/user/session.slice.d/50-aira-oomd-protect.conf"], []byte("ManagedOOMPreference=avoid")) {
 		t.Fatal("desktop safety regression: session.slice is no longer protected")
+	}
+}
+
+func TestRootInstallWritesAndActivatesInotifySysctlDropin(t *testing.T) {
+	d, state := newFakeRootInstall(t)
+	if err := runInstall(d, installOpts{memoryMax: "16G"}); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(d.etcRoot, "sysctl.d/60-inotify-aira.conf")
+	content, err := os.ReadFile(dst)
+	if err != nil || !bytes.Contains(content, []byte("fs.inotify.max_user_instances = 4096")) {
+		t.Fatalf("inotify sysctl drop-in not written: err=%v content=%q", err, content)
+	}
+	if !containsArgv(state.commands, []string{"sysctl", "--system"}) {
+		t.Fatalf("first install did not activate the sysctl drop-in: %q", state.commands)
+	}
+}
+
+// TestSystemDropinsCurrentRequiresLiveSysctlMatch pins the health-check
+// requirement from AIRA-96: a sysctl.d file that matches on disk is not
+// "current" unless the kernel has actually picked up its value (sysctl.d is
+// only applied at boot or by an explicit sysctl --system /
+// systemctl restart systemd-sysctl, so a matching file can still be inert).
+func TestSystemDropinsCurrentRequiresLiveSysctlMatch(t *testing.T) {
+	d, state := newFakeInstall(t)
+	installFakeSystemDropins(t, &d, state.home)
+
+	priorReadFile := d.readFile
+	d.readFile = func(path string) ([]byte, error) {
+		if path == procInotifyMaxUserInstances {
+			return []byte("4096\n"), nil
+		}
+		return priorReadFile(path)
+	}
+	if !systemDropinsCurrent(d, state.uid) {
+		t.Fatal("expected drop-ins current when the on-disk file and live kernel value both match")
+	}
+
+	d.readFile = func(path string) ([]byte, error) {
+		if path == procInotifyMaxUserInstances {
+			return []byte("128\n"), nil
+		}
+		return priorReadFile(path)
+	}
+	if systemDropinsCurrent(d, state.uid) {
+		t.Fatal("drop-ins reported current from a written file alone, without the kernel actually applying it")
 	}
 }
 
@@ -303,7 +359,7 @@ func TestInactiveSystemdOomdPreventsHealthySummaryAndStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	logs := strings.Join(state.logs, "\n")
-	if strings.Contains(logs, "oomd + delegation drop-ins: up to date") {
+	if strings.Contains(logs, "oomd + delegation + sysctl drop-ins: up to date") {
 		t.Fatalf("status reported inactive systemd-oomd as healthy: %q", logs)
 	}
 }
@@ -363,7 +419,7 @@ func TestRootInstallFailFastBeforeEtcWrites(t *testing.T) {
 }
 
 func TestRootActivationFailureIsNonZeroAfterUserPhase(t *testing.T) {
-	for _, command := range []string{"systemctl daemon-reload", "systemctl restart systemd-oomd"} {
+	for _, command := range []string{"systemctl daemon-reload", "systemctl restart systemd-oomd", "sysctl --system"} {
 		t.Run(command, func(t *testing.T) {
 			d, state := newFakeRootInstall(t)
 			state.failCommand = command
@@ -396,6 +452,65 @@ func TestRootInstallRetriesOomdRestartAfterPriorActivationFailure(t *testing.T) 
 	}
 }
 
+// TestRootInstallRetriesSysctlActivationAfterPriorActivationFailure pins the
+// AIRA-96 self-healing requirement: once the sysctl.d file is written, it
+// stops being "stale" on later runs, so activation must keep retrying off the
+// kernel's live value (not just the file's staleness) until sysctl --system
+// actually succeeds — mirroring the equivalent oomd-restart retry above.
+func TestRootInstallRetriesSysctlActivationAfterPriorActivationFailure(t *testing.T) {
+	d, state := newFakeRootInstall(t)
+	state.failCommand = "sysctl --system"
+	err := runInstall(d, installOpts{memoryMax: "16G"})
+	if err == nil || !strings.Contains(err.Error(), "partial /etc") {
+		t.Fatalf("first activation failure was masked: %v", err)
+	}
+	if state.sysctlLive {
+		t.Fatal("kernel value reported live despite the injected sysctl --system failure")
+	}
+
+	state.failCommand = ""
+	state.commands = nil
+	if err := runInstall(d, installOpts{memoryMax: "16G"}); err != nil {
+		t.Fatalf("convergence run failed: %v", err)
+	}
+	if !containsArgv(state.commands, []string{"sysctl", "--system"}) {
+		t.Fatalf("convergence run did not retry the unconfirmed sysctl activation (file was already written, so only the live-value check can catch this): %q", state.commands)
+	}
+	if !state.sysctlLive {
+		t.Fatal("convergence run did not actually apply the sysctl value")
+	}
+}
+
+// TestRootInstallReportsSysctlOverrideAsActivationFailure pins the requirement
+// that a zero exit from `sysctl --system` is not itself proof the wanted
+// value took effect: sysctl.d merge order lets a lexically-later file (or
+// /etc/sysctl.conf, applied last of all) silently override ours, so the
+// kernel must be read back and a mismatch reported as a real failure rather
+// than a fake pass.
+func TestRootInstallReportsSysctlOverrideAsActivationFailure(t *testing.T) {
+	d, state := newFakeRootInstall(t)
+	priorRun := d.run
+	d.run = func(argv []string, stdin []byte) ([]byte, error) {
+		if strings.Join(argv, " ") == "sysctl --system" {
+			// Exits 0 but deliberately never flips state.sysctlLive, modeling
+			// an apply immediately overridden by something else.
+			return nil, nil
+		}
+		return priorRun(argv, stdin)
+	}
+	err := runInstall(d, installOpts{memoryMax: "16G"})
+	if err == nil || !strings.Contains(err.Error(), "partial /etc") || !strings.Contains(err.Error(), "not live after activation") {
+		t.Fatalf("a silently-overridden sysctl value was not reported as an activation failure: %v", err)
+	}
+	dst := filepath.Join(d.etcRoot, "sysctl.d/60-inotify-aira.conf")
+	if _, statErr := os.Stat(dst); statErr != nil {
+		t.Fatalf("drop-in file should still be written even though the kernel value stayed overridden: %v", statErr)
+	}
+	if state.reexec == nil {
+		t.Fatal("user phase did not run after the sysctl activation-failure surfaced")
+	}
+}
+
 func TestRootWriteFailureIsExplicitPartialAndStillRunsUserPhase(t *testing.T) {
 	d, state := newFakeRootInstall(t)
 	d.writeFD = func(int, []byte) error { return errors.New("injected disk full") }
@@ -410,14 +525,22 @@ func TestRootWriteFailureIsExplicitPartialAndStillRunsUserPhase(t *testing.T) {
 
 func TestRootPreflightsEveryOwnedTargetBeforeFirstPublish(t *testing.T) {
 	d, state := newFakeRootInstall(t)
-	last := filepath.Join(d.etcRoot, "systemd/system/user@.service.d/10-aira-delegate.conf")
+	// Derived, not hardcoded: whichever drop-in systemDropins() renders last is
+	// the one that actually exercises "every target is preflighted before any
+	// publish" (an earlier target's foreign content would abort the loop
+	// before ever reaching this one, proving nothing about full coverage).
+	rendered, err := renderSystemDropins(d.etcRoot, 1234)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := rendered[len(rendered)-1].dst
 	if err := os.MkdirAll(filepath.Dir(last), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(last, []byte("[Service]\nDelegate=no\n"), 0o644); err != nil {
+	if err := os.WriteFile(last, []byte("foreign, marker-less content\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	err := runInstall(d, installOpts{memoryMax: "16G"})
+	err = runInstall(d, installOpts{memoryMax: "16G"})
 	if err == nil || !strings.Contains(err.Error(), "marker-less") {
 		t.Fatalf("foreign owned-name target was not refused: %v", err)
 	}
@@ -475,7 +598,7 @@ func TestRootDropinInstallIsIdempotent(t *testing.T) {
 	}
 	for _, command := range state.commands {
 		joined := strings.Join(command, " ")
-		if joined == "systemctl daemon-reload" || joined == "systemctl restart systemd-oomd" {
+		if joined == "systemctl daemon-reload" || joined == "systemctl restart systemd-oomd" || joined == "sysctl --system" {
 			t.Fatalf("second root run activated unchanged drop-ins: %q", state.commands)
 		}
 	}
@@ -541,10 +664,14 @@ func TestRootReexecDropsCredentialsAtomicallyAndSanitizesEnvironment(t *testing.
 		"systemd/system/user-1234.slice.d/50-aira-oomd.conf",
 		"systemd/user/session.slice.d/50-aira-oomd-protect.conf",
 		"systemd/system/user@.service.d/10-aira-delegate.conf",
+		"sysctl.d/60-inotify-aira.conf",
 	} {
 		if !strings.Contains(logs, "planned: write "+filepath.Join(d.etcRoot, suffix)) {
 			t.Errorf("root dry-run omitted planned /etc write %s: %q", suffix, logs)
 		}
+	}
+	if !strings.Contains(logs, "planned: sysctl --system for changed sysctl drop-ins") {
+		t.Errorf("root dry-run omitted the planned sysctl activation: %q", logs)
 	}
 }
 
@@ -556,6 +683,12 @@ type fakeRootInstallState struct {
 	failCommand string
 	reexec      *reexecRequest
 	oomdActive  bool
+	// sysctlLive models the kernel's live fs.inotify.max_user_instances:
+	// false ("128", the kernel default) until a successful `sysctl --system`
+	// sets it true ("4096"). Modeled explicitly (rather than falling through
+	// to a real /proc read) so root-install tests stay hermetic regardless of
+	// the actual value on the host running the test.
+	sysctlLive bool
 }
 
 func newFakeRootInstall(t *testing.T) (installDeps, *fakeRootInstallState) {
@@ -623,6 +756,12 @@ func newFakeRootInstall(t *testing.T) (installDeps, *fakeRootInstallState) {
 		if content, ok := state.files[path]; ok {
 			return append([]byte(nil), content...), nil
 		}
+		if path == procInotifyMaxUserInstances {
+			if state.sysctlLive {
+				return []byte("4096\n"), nil
+			}
+			return []byte("128\n"), nil
+		}
 		return realReadFile(path)
 	}
 	d.run = func(argv []string, _ []byte) ([]byte, error) {
@@ -639,6 +778,10 @@ func newFakeRootInstall(t *testing.T) (installDeps, *fakeRootInstallState) {
 		}
 		if joined == "systemctl restart systemd-oomd" {
 			state.oomdActive = true
+			return nil, nil
+		}
+		if joined == "sysctl --system" {
+			state.sysctlLive = true
 			return nil, nil
 		}
 		if joined == "timeout 10s loginctl enable-linger 1234" || joined == "systemctl daemon-reload" {
@@ -669,7 +812,17 @@ func installFakeDelegationDropin(t *testing.T, d *installDeps, root string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dropin := rendered[len(rendered)-1]
+	var dropin renderedSystemDropin
+	found := false
+	for _, candidate := range rendered {
+		if candidate.asset == delegationDropinAsset {
+			dropin, found = candidate, true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("no rendered drop-in has asset %q", delegationDropinAsset)
+	}
 	if err := os.MkdirAll(filepath.Dir(dropin.dst), 0o755); err != nil {
 		t.Fatal(err)
 	}
