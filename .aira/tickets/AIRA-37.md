@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-37","project":"aira","title":"aitest Slice 1 build-review follow-ups: atfork ordering, pool over-spawn, connection deadlines, misc hardening","status":"planned","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["aitest","hardening"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-38","to":"AIRA-37"}]}
+{"schema":1,"id":"AIRA-37","project":"aira","title":"aitest Slice 1 build-review follow-ups: atfork ordering, pool over-spawn, connection deadlines, misc hardening","status":"done","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["aitest","hardening"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-38","to":"AIRA-37"}]}
 ---
 Lower-priority findings from AIRA-30's adversarial build-review (Sol +
 Fable) not fixed in the initial pass — the two P0s and the two
@@ -105,8 +105,24 @@ the plan's snapshot.
    in `docs/superpowers/specs/2026-09-01-aitest-design.md` §3.3 was corrected in
    the same commit, and the ordering fact is pinned by
    `test_atfork_after_in_child_handlers_run_before_fork_returns`.
-2. *Worker-dispatch over-spawn.* `supervisor.py:1131` still reads
-   `if not self.queue: return` with no in-flight counter, so nothing prevents
-   spawning more workers than there is queued work.
+2. ~~*Worker-dispatch over-spawn.*~~ **FIXED 2026-09-05 (backlog-remediation
+   Phase 2).** The two guards were in `run()`'s own startup loops (the confined
+   loop and the daemon-down fallback loop), both reading `if not self.queue:
+   break` against a queue nothing decrements until the LATER
+   `_dispatch_to_idle_workers()` pass -- the prior line reference here
+   (`supervisor.py:1131`, `if not self.queue: return`) had drifted onto
+   `_replace_worker`, which is not the over-spawn site and is already correct
+   (by the time it runs, the queue HAS been decremented by dispatch, so a
+   non-empty queue really does mean unclaimed work). Both startup guards now
+   call a new `Supervisor._pool_covers_the_queue()`, which counts workers with
+   nothing in flight and returns True once every queued nodeid already has an
+   idle worker -- derived from live state rather than a separate counter that
+   can drift, and correct at any call site rather than only where nothing is in
+   flight yet. Three regression tests pin it: one queued test admits exactly one
+   worker at `--aitest-workers=4` (confined path, asserted on the admit-relay
+   call count, since results stay correct either way), the same for the
+   unconfined fallback path, and the complement -- four queued tests with a pool
+   size of two still admit the full pool, so the guard cannot degrade into
+   "never grow the pool".
 
-Only those two remain in scope for this ticket.
+Both residues are now closed; this ticket is done.

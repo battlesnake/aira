@@ -61,6 +61,10 @@ _PLACEMENT_ACK_TIMEOUT_SECONDS = 60.0
 # blocking on it forever is worse.
 _REAP_TIMEOUT_SECONDS = 5.0
 
+# A sentinel distinct from None, for dict lookups where "the key is absent" and
+# "the value is None" must not be conflated. See _pool_covers_the_queue.
+_UNKNOWN = object()
+
 _GO_DURATION = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*(ns|us|µs|ms|s|m|h)?\s*$")
 _GO_DURATION_SCALE = {
     None: 1.0, "": 1.0, "ns": 1e-9, "us": 1e-6, "µs": 1e-6,
@@ -517,6 +521,7 @@ class Supervisor:
         self.max_workers_fallback = max(1, int(os.environ.get("AIRA_AITEST_MAX_WORKERS_FALLBACK", "1")))
         self._fallback_warned = False
         self._admission_terminal_warned = False
+        self._pidfd_warned = set()
         self.items_by_nodeid = {}
         self.workers = {}
         # Worker scopes whose rmdir failed, for a later retry. See
@@ -816,6 +821,69 @@ class Supervisor:
             )
         return grant, process
 
+    def _open_pidfd(self, pid):
+        """A pidfd for one forked worker, or None if this host cannot provide
+        one.
+
+        AIRA-40. Worker liveness used to be inferred SOLELY from the result
+        pipe reaching EOF, and that inference is not sound: a test that itself
+        calls os.fork() (or uses multiprocessing's default `fork` start method
+        on Linux) without closing inherited fds leaves the grandchild holding a
+        DUPLICATE of the worker's result-pipe write end. CLOEXEC cannot help --
+        it fires on exec(), not fork() -- so if that grandchild outlives the
+        worker (the worker OOM-killed, the grandchild spared), the kernel never
+        delivers EOF: one live write end is enough to keep the pipe open. The
+        worker's in_flight nodeid was then never cleared, _handle_worker_exit
+        never fired, and run()'s stop condition (every worker idle) was never
+        satisfiable -- the whole run hung, alive and silent. Verified directly
+        on this host: with a grandchild holding the write end, select() reports
+        the pidfd ready and the pipe NOT ready.
+
+        A pidfd is the right instrument rather than an os.waitpid(WNOHANG) poll
+        on run()'s timeout tick (the ticket's own candidate direction): it goes
+        into the SAME select() set as the result pipes, so a death is noticed
+        the instant it happens instead of up to a tick later, and -- crucially
+        -- observing it does NOT consume the child's exit status, so it cannot
+        race _reap_child's own waitpid into a lost or double reap.
+
+        Degrades to None, never to a raised exception: os.pidfd_open needs
+        Python 3.9+ and Linux 5.3+, and can fail per-call (ESRCH on a pid
+        already reaped by something else). Without it this supervisor keeps
+        exactly today's EOF-only behaviour, which is why the loss of the
+        independent check is said out loud once rather than left silent."""
+        opener = getattr(os, "pidfd_open", None)
+        if opener is None:
+            self._warn_no_pidfd("this Python has no os.pidfd_open (needs 3.9+ on Linux 5.3+)")
+            return None
+        try:
+            return opener(pid)
+        except OSError as exc:
+            self._warn_no_pidfd("os.pidfd_open failed for worker %d: %s" % (pid, exc))
+            return None
+
+    def _warn_no_pidfd(self, reason):
+        # Once per DISTINCT reason, not once per process (build-review): the
+        # two conditions have different scope -- a missing os.pidfd_open
+        # affects every worker for the whole run, a per-call OSError affects
+        # only that one -- so a single flag let one transient ESRCH on the
+        # first worker permanently suppress a later report of the permanent
+        # condition. Keyed on the reason text with the worker number stripped,
+        # so a repeating per-call failure still cannot spam the log.
+        key = reason.split(" for worker ")[0]
+        if key in self._pidfd_warned:
+            return
+        self._pidfd_warned.add(key)
+        # "for any worker without one", not a flat "crash detection is now
+        # EOF-only": the missing-attribute case really does affect every
+        # worker, but a per-call OSError affects only that one, and claiming
+        # more than was established is the exact habit this project's honesty
+        # rules exist to prevent.
+        sys.stderr.write(
+            "aira aitest: %s -- crash detection falls back to result-pipe EOF alone for any "
+            "worker without one, which a test's own forked grandchild can hold open "
+            "indefinitely (AIRA-40)\n" % reason
+        )
+
     def _child_close_other_workers_fds(self):
         """A forked child inherits DUPLICATES of every fd already open in
         the parent's fd table -- fork() copies the whole table and there is
@@ -839,6 +907,19 @@ class Supervisor:
                 os.close(state["result_fd"])
             except OSError:
                 pass
+            # An inherited pidfd (AIRA-40) cannot wedge the parent's own
+            # liveness detection the way an inherited pipe write end can --
+            # readiness follows the tracked process's exit, not this fd's
+            # reference count -- but it is still one more fd this child has no
+            # use for, and leaking one per already-running worker into every
+            # later fork is exactly the fd-table-copy hygiene the rest of this
+            # method exists to enforce.
+            pidfd = state.get("pidfd")
+            if pidfd is not None:
+                try:
+                    os.close(pidfd)
+                except OSError:
+                    pass
             admit_process = state.get("admit_process")
             if admit_process is not None:
                 for stream in (admit_process.stdin, admit_process.stdout, admit_process.stderr):
@@ -967,6 +1048,16 @@ class Supervisor:
             "admit_process": admit_process,
             "dispatch_write": os.fdopen(dispatch_write, "w"),
             "in_flight": None,
+            # Opened only now, on the path where this worker is actually going
+            # to be registered: every failure branch above has already reaped
+            # the child, and a pidfd for a reaped pid is either invalid or --
+            # worse -- refers to whatever process later reuses that pid. The
+            # guarantee here is precisely that NOTHING HAS REAPED this one, so
+            # its pid cannot be reused underneath us; it is deliberately not a
+            # claim that the child is still running (the ack proves it was
+            # alive when it wrote, and it may be a zombie by now, which
+            # pidfd_open handles).
+            "pidfd": self._open_pidfd(pid),
         })
         self.workers[pid] = state
         return pid
@@ -1011,6 +1102,15 @@ class Supervisor:
             "read_buffer": b"",
             "result_eof": False,
             "in_flight": None,
+            # AIRA-40, exactly as on the confined path: this fork site needs
+            # the independent liveness signal just as much -- a fallback worker
+            # runs the same arbitrary test code, so it inherits the same
+            # forked-grandchild-holds-the-pipe hazard. Safe on a child that has
+            # already died in the microseconds since the fork: it is a zombie,
+            # not reaped, so its pid is still valid and cannot have been reused
+            # (verified on this host: pidfd_open on a zombie succeeds and is
+            # immediately ready).
+            "pidfd": self._open_pidfd(pid),
         }
         return pid
 
@@ -1091,6 +1191,20 @@ class Supervisor:
             os.close(state["result_fd"])
         except OSError:
             pass
+        # AIRA-40: closing the pidfd here is not mere tidiness. A pidfd is
+        # LEVEL-triggered and stays readable for as long as it is open, even
+        # after the child has been reaped (verified on this host) -- so a pidfd
+        # left open for a retired worker would make every subsequent
+        # select() in run() return instantly, spinning the dispatch loop at
+        # 100% CPU. Retirement is the single point where a worker leaves
+        # self.workers, so it is the single point that must drop this fd.
+        pidfd = state.get("pidfd")
+        if pidfd is not None:
+            state["pidfd"] = None
+            try:
+                os.close(pidfd)
+            except OSError:
+                pass
         # AIRA-92 (Sol plan-review, P1): BOUNDED. This sits directly on the
         # dispatch loop -- retirement, recycle and the end-of-run __stop__
         # broadcast all reach it -- so a child that reported its last result and
@@ -1549,11 +1663,23 @@ class Supervisor:
             self._replayed_nodeids.add(nodeid)
 
     def _handle_worker_exit(self, pid, state):
-        """A worker's result pipe hit EOF without a terminating record for
-        its in-flight nodeid: a crash (kernel OOM, host watchdog, any
-        non-reporting exit). Requeue once; a second failure here is
-        unevaluated -- distinct from failed everywhere results are
-        aggregated, never silently folded into either outcome."""
+        """A worker stopped reporting without a terminating record for its
+        in-flight nodeid: a crash (kernel OOM, host watchdog, any non-reporting
+        exit). Requeue once; a second failure here is unevaluated -- distinct
+        from failed everywhere results are aggregated, never silently folded
+        into either outcome.
+
+        Reached from TWO independent detections since AIRA-40, and the second
+        is the authoritative one: the result pipe reaching EOF, and the
+        worker's own pidfd going ready in run()'s select() set. EOF is an
+        INFERENCE about the process from the state of a pipe, and it is
+        unsound in one direction -- a grandchild the test itself forked can
+        hold a duplicate write end open past the worker's death, so EOF never
+        arrives (see _open_pidfd). The pidfd observes the process itself, so it
+        cannot be held open by a third party. EOF is kept because it is
+        genuinely sufficient in the overwhelmingly common case, arrives at the
+        same instant there, and is all there is on a host too old for
+        pidfds."""
         nodeid = state["in_flight"]
         self._retire_worker(pid, state)
         if nodeid is not None and not self.requeue_once(nodeid):
@@ -1564,6 +1690,105 @@ class Supervisor:
                 "retry did too" % pid,
             )
         self._replace_worker()
+
+    def _service_ready_workers(self, ready, result_fd_owners, pidfd_owners):
+        """Service one select() wakeup: drain every ready result pipe, THEN
+        handle every worker whose pidfd says it has exited (AIRA-40).
+
+        Both maps are {fd: (pid, state)} as run() built them for its select()
+        call, taken before any of this ran.
+
+        What is load-bearing is DRAIN BEFORE CONCLUDING DEATH, not the order of
+        the two passes as such. A worker that flushes its final result line and
+        dies immediately afterwards produces a real, already-established
+        outcome that must be recorded, never overwritten by a crash verdict --
+        so the exit branch drains that worker itself before acting, and would
+        remain correct even if these two loops were swapped. Splitting them is
+        what makes "results first" well defined without depending on select()'s
+        ready-list order at all. CPython does in fact return that list in the
+        order the fds were passed (selectmodule.c's set2list walks its fd2obj
+        array, not the fd_set; measured on this host, 3.12.3, by passing ready
+        fds in descending order and getting them back in descending order) --
+        but that is an implementation detail POSIX does not promise, and
+        iterating the two owner maps rather than `ready` means this code never
+        has to care either way. An earlier revision of this docstring asserted
+        the opposite ("ascending fd order") and used it as the justification for
+        the split; the split is right, that reason was not.
+
+        The exit branch's own drain is therefore not redundant with the first
+        pass, and is the only thing covering the commonest version of this
+        race: select()'s answer is a SNAPSHOT, so a worker's last bytes can
+        land after it returned and before this runs, leaving that fd absent
+        from `ready` entirely. _drain_available_lines is non-blocking, so
+        draining an fd with nothing on it costs one EAGAIN read. If that drain
+        finds EOF it takes the crash path itself, which is why what follows
+        re-checks the worker is still registered.
+
+        Every entry is re-checked by state-dict IDENTITY (`is`), never by pid
+        or fd equality, because a pass can retire a worker and _replace_worker
+        can fork a fresh one within this same call -- and both a pid and an fd
+        NUMBER can be reused by that replacement (astronomically unlikely for a
+        pid, ordinary for an fd). Identity cannot confuse the two; equality on
+        a recycled number can, and would service, or worse crash-handle, a
+        brand-new healthy worker. Same pid-reuse blind spot
+        _dispatch_to_idle_workers' own docstring records designing out."""
+        ready = set(ready)
+        for fd, (pid, state) in result_fd_owners.items():
+            if fd not in ready or self.workers.get(pid) is not state:
+                continue
+            self._drain_worker(pid, state)
+        for fd, (pid, state) in pidfd_owners.items():
+            if fd not in ready or self.workers.get(pid) is not state:
+                continue
+            self._drain_worker(pid, state)
+            if self.workers.get(pid) is state:
+                # The tracked pid is gone but its pipe did not say so -- the
+                # AIRA-40 case exactly. Treat it as the crash it is, through
+                # the ordinary requeue-once/unevaluated path, rather than
+                # waiting on an EOF that a surviving grandchild may never let
+                # the kernel deliver.
+                self._handle_worker_exit(pid, state)
+
+    def _pool_covers_the_queue(self):
+        """True when every nodeid still waiting in the queue already has an
+        idle worker to run it, so admitting/forking another one would buy
+        nothing.
+
+        AIRA-37 residue #2. run()'s two startup spawn loops guarded only on
+        `if not self.queue`, but nothing decrements the queue until the LATER
+        _dispatch_to_idle_workers() pass -- the pool is spawned first and
+        dispatched to second. So one collected test with --aitest-workers=4
+        admitted and forked four workers, three of which never received a
+        nodeid and simply sat there until the end-of-run __stop__ broadcast.
+
+        That is not only wasted fork+admission overhead. On the confined path
+        each of those surplus workers holds a real daemon grant against this
+        run's aggregate memory ledger (AIRA-39: the ledger sums memory.max over
+        the outer scope's real children) for its entire useless lifetime, so
+        needless over-spawn makes hitting the aggregate cap -- and stalling in
+        _wait_for_admission_or_disable waiting for capacity this run is itself
+        holding -- more likely than the requested pool size warrants.
+
+        Counting IDLE workers rather than all of them (or keeping a local
+        counter decremented per spawn, the other shape AIRA-37 suggested) makes
+        this correct at any call site rather than only in a context where
+        nothing is in flight yet: a busy worker is not cover for a queued
+        nodeid, and derived-from-live-state cannot drift out of step with the
+        queue the way a separate counter can.
+
+        The `_UNKNOWN` default is deliberate and directional (build-review): a
+        state dict that has not reached its final shape must count as NOT idle.
+        A plain `.get("in_flight")` would return None for a missing key and
+        therefore count such a worker as cover for a queued nodeid -- claiming
+        capacity that was never established, which is the one direction this
+        function must not fail in. Inert today (both registration sites set
+        in_flight before publishing the state), and it stays inert by
+        construction rather than by convention."""
+        idle = sum(
+            1 for state in self.workers.values()
+            if state.get("in_flight", _UNKNOWN) is None
+        )
+        return idle >= len(self.queue)
 
     def run(self, estimated_bytes, worker_count=1, max_wait="30s"):
         """Slice 1's whole dispatch loop: spawn up to worker_count workers,
@@ -1580,7 +1805,7 @@ class Supervisor:
         self._run_worker_count = worker_count
         if self.daemon_available:
             for _ in range(worker_count):
-                if not self.queue:
+                if self._pool_covers_the_queue():
                     break
                 try:
                     self.spawn_worker(estimated_bytes, max_wait=max_wait)
@@ -1621,20 +1846,40 @@ class Supervisor:
             # unavailable mid-startup-loop.
             remaining_pool = max(0, min(worker_count, self.max_workers_fallback) - len(self.workers))
             for _ in range(remaining_pool):
-                if not self.queue:
+                if self._pool_covers_the_queue():
                     break
                 self._spawn_fallback_worker()
         self._dispatch_to_idle_workers()
         while self.workers:
-            fd_to_pid = {state["result_fd"]: pid for pid, state in self.workers.items()}
-            ready, _, _ = select.select(list(fd_to_pid), [], [], 1.0)
+            result_fd_owners = {
+                state["result_fd"]: (pid, state) for pid, state in self.workers.items()
+            }
+            # AIRA-40: worker liveness, watched independently of the result
+            # pipe and in the SAME select() set. A worker with no pidfd (an
+            # unsupported host, see _open_pidfd) simply contributes nothing
+            # here and keeps today's EOF-only behaviour.
+            pidfd_owners = {
+                state["pidfd"]: (pid, state)
+                for pid, state in self.workers.items()
+                if state.get("pidfd") is not None
+            }
+            # ACCEPTED, NAMED GAP (build-review, P3): select() refuses any fd
+            # number >= FD_SETSIZE (1024) with a ValueError that would
+            # propagate out of run() and lose the whole suite. That vector
+            # predates AIRA-40, but this change does roughly double this
+            # loop's fd consumption, so it is written down rather than left
+            # implicit. Not fixed here: it needs the loop moved onto
+            # selectors.DefaultSelector (epoll, no such limit), which this
+            # module already uses for its two bounded single-fd reads, and
+            # that is a hot-loop rewrite well outside a liveness fix. Reaching
+            # it at all requires the pytest process to hold >1024 fds, since
+            # the limit is on the NUMBER, not the count passed here.
+            ready, _, _ = select.select(
+                list(result_fd_owners) + list(pidfd_owners), [], [], 1.0
+            )
             if not ready:
                 continue
-            for fd in ready:
-                pid = fd_to_pid[fd]
-                if pid not in self.workers:
-                    continue
-                self._drain_worker(pid, self.workers[pid])
+            self._service_ready_workers(ready, result_fd_owners, pidfd_owners)
             self._dispatch_to_idle_workers()
             if not self.queue and all(state["in_flight"] is None for state in self.workers.values()):
                 for pid, state in list(self.workers.items()):
