@@ -38,6 +38,11 @@ var codePattern = regexp.MustCompile(`^[EWU]_[A-Z][A-Z0-9_]*[A-Z0-9]$`)
 // line. None of them is ever assigned to Response.Code, crosses the daemon or
 // MCP wire, or reaches a process exit, so publishing them in the exit contract
 // would advertise vocabulary to agents for a surface they never read.
+//
+// Every one is E_TUI_-namespaced. That matters because an excuse here is
+// per-code, not per-site: a generically named excused code (the former
+// E_UNKNOWN and E_CANCELLED) would silently excuse a future non-TUI producer of
+// the same name too, so the names carry the surface they are excused for.
 const tuiLocalVocabulary = "TUI-local status string: rendered in the TUI error line, never a Response.Code and never mapped to a process exit."
 
 // producedNotCatalogued lists codes the tree emits that the catalogue
@@ -53,8 +58,8 @@ const tuiLocalVocabulary = "TUI-local status string: rendered in the TUI error l
 var producedNotCatalogued = map[string]string{
 	"E_CODE_NOT_IN_MAP_SENTINEL": "core.ResponseContract probes ExitForCode with a code that must never be catalogued, so the contract can publish DefaultExit honestly. Cataloguing it would defeat the probe.",
 
-	"E_CANCELLED":               tuiLocalVocabulary,
-	"E_UNKNOWN":                 tuiLocalVocabulary,
+	"E_TUI_CANCELLED":           tuiLocalVocabulary,
+	"E_TUI_UNKNOWN":             tuiLocalVocabulary,
 	"E_TUI_DECODE":              tuiLocalVocabulary,
 	"E_TUI_EXECUTE_ARGV":        tuiLocalVocabulary,
 	"E_TUI_EXECUTE_PROTOCOL":    tuiLocalVocabulary,
@@ -77,7 +82,7 @@ var producedNotCatalogued = map[string]string{
 var cataloguedNotProduced = map[string]string{
 	"E_DB_CORRUPT":            "Designed in the phase-1 spec (\"the DB cannot be opened or schema integrity fails\") and bucketed at 4 by the M10 gates spec. No producer is wired: store surfaces driver failures as E_INTERNAL today.",
 	"E_RECONCILE_REQUIRED":    "Designed in the phase-1 spec as the refusal to proceed on a stale projection. The runner analogue E_RUN_RECONCILE_REQUIRED is produced; this store-level one is not.",
-	"E_RELATION_UNOBSERVABLE": "Consumed but not produced: six non-test sites in store match on it (check.go, relation_ready.go) and W_RELATION_UNOBSERVABLE is derived from it, but no site emits it. Its producer is gone while the guards remain.",
+	"E_RELATION_UNOBSERVABLE": "Consumed but not produced: five non-test sites in store match on it (check.go:330, check.go:584, relation_ready.go:350, :552, :727) and W_RELATION_UNOBSERVABLE is derived from it, but no site emits it. Its producer is gone while the guards remain.",
 	"E_TOKEN_WORKTREE":        "Registered with the lease-token family when domain failure codes were documented. No lease path emits it; a token bound to the wrong worktree fails as E_LEASE_TOKEN.",
 	"U_INSIGHT_UNEVALUATED":   "Registered ahead of its producer by the M15 insights design, which specifies it for a gauge value that cannot be established. The insight gauges do not raise it yet.",
 	"W_GATE_DISABLED":         "Designed by the M10 gates spec for gate.GateDefinition.Enabled. The field is still validated and digested but never read, so the warning is never raised; the simplification programme's candidate 43 proposes cutting the field and this code together.",
@@ -138,6 +143,14 @@ func TestEveryCataloguedCodeIsProduced(t *testing.T) {
 // ticket exists to stop.
 func TestDivergenceTablesAreCurrent(t *testing.T) {
 	produced := scanProducedCodes(t)
+	for code := range producedNotCatalogued {
+		if _, both := cataloguedNotProduced[code]; both {
+			// The two tables assert contradictory facts about a code, so an entry
+			// in both can never be satisfied. Say so directly rather than emitting
+			// two confusing staleness failures.
+			t.Errorf("%s is listed in both divergence tables; a code cannot be uncatalogued-and-produced and catalogued-and-unproduced at once", code)
+		}
+	}
 	for code, reason := range producedNotCatalogued {
 		if strings.TrimSpace(reason) == "" {
 			t.Errorf("producedNotCatalogued[%s] has no reason", code)
@@ -166,8 +179,14 @@ func TestDivergenceTablesAreCurrent(t *testing.T) {
 // catalogue holds without exception, so membership is not the only thing that
 // cannot drift. A U_ code is an unevaluated result and must exit 3: reporting it
 // as a generic failure is precisely the "never a fake pass, never a fake fail"
-// rule AIRA is built on. A W_ code is a warning and must exit 0. E_ codes carry
-// no such rule — they are bucketed 0..4 by kind — so they are not asserted here.
+// rule AIRA is built on. A W_ code is a warning and must exit 0, which is only
+// safe because TestNoWarningCodeIsRaisedAsAnError keeps a W_ code out of the
+// error path. E_ codes carry no such rule — they are bucketed 0..4 by kind — so
+// they are not asserted here.
+//
+// The pin has no per-code escape hatch on purpose. A future code that genuinely
+// needs to break one of these conventions is a contract decision, and making its
+// author edit this test is the intended cost of it.
 func TestCataloguedExitsFollowThePrefixConvention(t *testing.T) {
 	for code, exit := range ExitCodes {
 		if !codePattern.MatchString(code) {
@@ -187,6 +206,42 @@ func TestCataloguedExitsFollowThePrefixConvention(t *testing.T) {
 	}
 }
 
+// TestNoWarningCodeIsRaisedAsAnError closes the hazard the W_ convention opens.
+// store.ErrorCode accepts a W_ prefix as a stable code, and core.Do puts whatever
+// it returns into Response.Code with Exit: ExitForCode(code) — so an error
+// message of the form "W_SOMETHING: ..." would surface as a failed response that
+// exits 0, a failure reported as success. Cataloguing the eight check-report
+// warnings widened that surface from four W_ codes to twelve, so the invariant
+// that makes it safe is pinned here rather than left to inspection.
+//
+// The predicate is exact: a W_ code written as a bare literal is a
+// CheckFinding.Code or a TicketRecord.Warnings entry, while "W_CODE: message" is
+// the repo's error-construction shape and nothing else. The check cannot see an
+// error built from a variable code (fmt.Errorf("%s: ...", code)); every such
+// site in the tree passes an E_ or U_ constant, and the E_/U_ side of that is
+// what TestCataloguedExitsFollowThePrefixConvention constrains.
+func TestNoWarningCodeIsRaisedAsAnError(t *testing.T) {
+	root := moduleRoot(t)
+	forEachSourceFile(t, root, func(rel string, fset *token.FileSet, file *ast.File) {
+		ast.Inspect(file, func(node ast.Node) bool {
+			lit, ok := node.(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				return true
+			}
+			value, err := strconv.Unquote(lit.Value)
+			if err != nil {
+				return true
+			}
+			idx := strings.IndexByte(value, ':')
+			if idx <= 0 || !strings.HasPrefix(value, "W_") || !codePattern.MatchString(value[:idx]) {
+				return true
+			}
+			t.Errorf("%s:%d: %q is a warning code in error-message form; store.ErrorCode would return it as the response code and it would exit 0, reporting a failure as success", rel, fset.Position(lit.Pos()).Line, value)
+			return true
+		})
+	})
+}
+
 // TestExitForCodeDefaultsToOne pins the fallback the catalogue's honesty depends
 // on: an uncatalogued code must still fail, and core.ResponseContract publishes
 // this exact value as DefaultExit.
@@ -204,14 +259,31 @@ func TestExitForCodeDefaultsToOne(t *testing.T) {
 // one. A code built by concatenating a literal fragment with a runtime value
 // would be invisible to the scan, so both directions above would weaken
 // silently. The check looks for exactly that shape — a partial-code literal used
-// as an operand of string concatenation — and leaves prefix classification
+// as an operand of string concatenation, or a format string whose verb falls
+// inside the code itself — and leaves prefix classification
 // (strings.HasPrefix(code, "E_GIT_")) alone, which reads a code rather than
 // building one.
+//
+// It is not exhaustive, and the gap is recorded rather than claimed away: a
+// code assembled by strings.Join, or by concatenation whose leading fragment is
+// a variable ("family" + "_TIMEOUT"), is still invisible. Both shapes are absent
+// from the tree today, and the two forms below are the ones an author reaches
+// for first.
 func TestCodeLiteralsAreNotAssembled(t *testing.T) {
 	partial := regexp.MustCompile(`^[EWU]_[A-Z0-9_]*$`)
+	formatted := regexp.MustCompile(`^[EWU]_[A-Z0-9_]*%`)
+	report := func(rel string, fset *token.FileSet, lit *ast.BasicLit, how string) {
+		t.Errorf("%s:%d: string literal %q %s; codes must be written whole so the AIRA-87 catalogue scan can see them", rel, fset.Position(lit.Pos()).Line, lit.Value, how)
+	}
 	root := moduleRoot(t)
 	forEachSourceFile(t, root, func(rel string, fset *token.FileSet, file *ast.File) {
 		ast.Inspect(file, func(node ast.Node) bool {
+			if lit, ok := node.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+				if value, err := strconv.Unquote(lit.Value); err == nil && formatted.MatchString(value) {
+					report(rel, fset, lit, "interpolates a value into the code itself")
+				}
+				return true
+			}
 			binary, ok := node.(*ast.BinaryExpr)
 			if !ok || binary.Op != token.ADD {
 				return true
@@ -225,7 +297,7 @@ func TestCodeLiteralsAreNotAssembled(t *testing.T) {
 				if err != nil || !partial.MatchString(value) || codePattern.MatchString(value) {
 					continue
 				}
-				t.Errorf("%s:%d: string literal %q is concatenated into what looks like a code; codes must be written whole so the AIRA-87 catalogue scan can see them", rel, fset.Position(lit.Pos()).Line, value)
+				report(rel, fset, lit, "is concatenated into what looks like a code")
 			}
 			return true
 		})
@@ -246,6 +318,22 @@ func TestCodeLiteralsAreNotAssembled(t *testing.T) {
 //     literal anywhere else counts, which over-approximates production: the
 //     catalogued -> produced direction therefore establishes that a catalogued
 //     code is reachable in the source at all, not that some input reaches it.
+//     The exclusion list is not exhaustive either — a code passed to a helper
+//     predicate (store.hasRunnerCode, runner.containsPrefix) or bound as a SQL
+//     parameter still reads as produced.
+//   - A code declared as a named constant counts as produced at the const
+//     declaration, so a constant that is only ever compared against would keep a
+//     dead catalogue entry alive. Every code-valued constant in the tree has a
+//     real producing use today; this is the weakest link in the catalogued ->
+//     produced direction.
+//   - go/parser reads every file regardless of //go:build constraints, so a
+//     code emitted only from a _linux.go or a _other.go counts. That is the
+//     conservative direction for produced -> catalogued (anything any build can
+//     emit must be catalogued) and an over-approximation for the reverse.
+//   - codePattern needs at least four characters, so a hypothetical three-
+//     character code would be invisible. That fails loudly rather than
+//     silently: TestCataloguedExitsFollowThePrefixConvention rejects any
+//     catalogue key the pattern does not match.
 func scanProducedCodes(t *testing.T) map[string][]string {
 	t.Helper()
 	produced := map[string][]string{}

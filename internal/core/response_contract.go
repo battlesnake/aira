@@ -1,8 +1,9 @@
 package core
 
 import (
-	"aira/internal/codes"
 	"sort"
+
+	"aira/internal/codes"
 )
 
 // ResponseContractSpec is the transport-neutral response contract projected

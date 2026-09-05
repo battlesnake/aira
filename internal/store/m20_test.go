@@ -1,8 +1,9 @@
 package store
 
 import (
-	"aira/internal/codes"
 	"testing"
+
+	"aira/internal/codes"
 )
 
 func TestM20StableExitCodes(t *testing.T) {
