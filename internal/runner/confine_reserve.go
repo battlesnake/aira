@@ -64,7 +64,7 @@ func validateConfineReserveRequest(request ConfineReserveRequest) error {
 	// AIRA-58: confine-reserve reaches admitThroughDaemon directly, so it does not
 	// inherit Runner.admit's ceiling check. Without this, a programmatic
 	// over-ceiling MaxWait is refused by the daemon and then wrapped as
-	// E_CONFINE_UNAVAILABLE, which the pytest governor treats as fail-open — the
+	// E_CONFINE_UNAVAILABLE, which a caller is expected to treat as fail-open — the
 	// test would run unreserved. Refuse at this boundary too, against the same
 	// shared constant every other caller uses.
 	if request.MaxWait > AdmitWaitCeiling {

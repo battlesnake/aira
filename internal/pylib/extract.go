@@ -17,7 +17,6 @@ import (
 )
 
 const (
-	embeddedRoot       = "aira_xdist_governor"
 	embeddedAitestRoot = "aitest"
 	readyName          = ".ready"
 	tempPrefix         = ".tmp-"
@@ -32,22 +31,9 @@ const (
 // lastfailed — into the shipped binary, so two developers on the same commit
 // produced different binaries. The glob declares the embedded set instead of
 // inheriting it, and TestEmbeddedTreesMatchTrackedSources holds it equal to the
-// git-tracked sources.
-//
-//go:embed aira_xdist_governor/*.py
-var embeddedPyLib embed.FS
-
-// ExtractPyLib publishes the embedded Python sidecar beneath a content hash.
-// AIRA distributes these bytes but never imports or executes them.
-func ExtractPyLib() (string, error) {
-	dataHome, err := dataHomeFromEnv()
-	if err != nil {
-		return "", err
-	}
-	return extractPyLibFS(embeddedPyLib, embeddedRoot, dataHome)
-}
-
-// Same '*.py' glob as embeddedPyLib above, for the same reason (AIRA-66).
+// git-tracked sources. AIRA-33 deleted the second embedded tree
+// (aira_xdist_governor); aitest is now the only one, and the contract is
+// unchanged.
 //
 // Two consequences are DECIDED, not incidental:
 //   - aitest's co-located conftest.py and test_*.py stay embedded. A glob cannot
@@ -61,9 +47,8 @@ func ExtractPyLib() (string, error) {
 //go:embed aitest/*.py
 var embeddedAitest embed.FS
 
-// ExtractAitest publishes the embedded aitest pytest plugin beneath a
-// content hash, mirroring ExtractPyLib's extraction contract exactly (AIRA
-// distributes these bytes but never imports or executes them).
+// ExtractAitest publishes the embedded aitest pytest plugin beneath a content
+// hash. AIRA distributes these bytes but never imports or executes them.
 func ExtractAitest() (string, error) {
 	dataHome, err := dataHomeFromEnv()
 	if err != nil {

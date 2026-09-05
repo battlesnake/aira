@@ -23,13 +23,6 @@ type commandCoreStore struct {
 	err    error
 }
 
-type commandSidecarRunner struct {
-	successfulStoreFreeRunner
-	runtimeDir string
-}
-
-func (r commandSidecarRunner) SidecarRuntimeDir() string { return r.runtimeDir }
-
 func (s *commandCoreStore) AddCommandEvent(_ context.Context, input domain.CommandEventInput) (store.CommandEventAddResult, error) {
 	s.inputs = append(s.inputs, input)
 	if s.err != nil {
@@ -185,16 +178,34 @@ func TestTimeConfiguredPrefixSelectionAndDigestExcludePrefix(t *testing.T) {
 	}
 }
 
-func TestTimeChildReceivesExtractedSidecarEnvironment(t *testing.T) {
-	dataHome := t.TempDir()
-	runtimeDir := filepath.Join(t.TempDir(), "runtime")
+// TestTimeChildNeverReceivesInheritedCoordinationEnvironment is what survives
+// AIRA-33 of the two sidecar-injection tests this replaces.
+//
+// The `time` verb used to EXTRACT the aira_xdist_governor sidecar and publish
+// AIRA_PY_LIB (plus the governor tunables) to its child; those tests asserted
+// the injection and, separately, that a failed extraction stripped the stale
+// inherited values rather than passing them on. The injection is deleted. The
+// STRIP is not, and it is the half that actually protects anything: a `time`
+// launched from inside a still-running pre-deletion delegate job would otherwise
+// hand its child a live AIRA_PY_LIB pointing at an extraction directory that
+// AIRA no longer maintains.
+//
+// The AIRA_CONFINE_SCOPE_ID case is deliberately included: it is the one
+// coordination key AIRA still SETS elsewhere (on a confine launch), and the run
+// path must nonetheless strip an inherited one rather than forward a foreign
+// job's scope id into an unrelated child.
+//
+// verifies: AIRA-33
+func TestTimeChildNeverReceivesInheritedCoordinationEnvironment(t *testing.T) {
+	inherited := []string{"AIRA_PY_LIB", "AIRA_GOVERNOR", "AIRA_GOVERNOR_CMD", "AIRA_GOVERNOR_MAX_WAIT", "AIRA_CONFINE_RESERVE_CMD", "AIRA_TEST_MEM_GOVERNOR", "AIRA_CONFINE_SCOPE_ID"}
+	for _, key := range inherited {
+		t.Setenv(key, "/stale-"+key)
+	}
 	observed := filepath.Join(t.TempDir(), "time-env")
-	t.Setenv("XDG_DATA_HOME", dataHome)
-	t.Setenv("AIRA_GOVERNOR_MAX_WAIT", "9s")
-	s := &commandCoreStore{}
-	execution := commandSidecarRunner{runtimeDir: runtimeDir}
-	script := `printf '%s\n%s\n%s\n' "$AIRA_PY_LIB" "$AIRA_GOVERNOR_CMD" "$AIRA_GOVERNOR_MAX_WAIT" > "$1"`
-	response := NewWithRunnerFace(s, execution, nil, FaceOutput{}).Do(context.Background(), Request{Verb: "time", Args: map[string]any{
+	// PATH proves the child environment was populated at all: without it an
+	// empty output file would satisfy the assertion for the wrong reason.
+	script := `env | grep '^\(AIRA_\|PATH=\)' > "$1" || :`
+	response := NewWithRunnerFace(&commandCoreStore{}, successfulStoreFreeRunner{}, nil, FaceOutput{}).Do(context.Background(), Request{Verb: "time", Args: map[string]any{
 		"argv": []string{"sh", "-c", script, "time-env", observed},
 		"env":  []string{},
 	}})
@@ -205,37 +216,14 @@ func TestTimeChildReceivesExtractedSidecarEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) != 3 || lines[0] == "" || lines[1] != "" || lines[2] != "9s" {
-		t.Fatalf("time sidecar environment=%q", data)
+	got := string(data)
+	if !strings.Contains(got, "PATH=") {
+		t.Fatalf("child environment was empty, so the assertions below prove nothing: %q", got)
 	}
-	if _, err := os.Stat(filepath.Join(lines[0], "aira_xdist_governor", "__init__.py")); err != nil {
-		t.Fatalf("time AIRA_PY_LIB is not importable: %v", err)
-	}
-}
-
-func TestTimeExtractionFailureStripsInheritedGovernorEnvironment(t *testing.T) {
-	runtimeDir := filepath.Join(t.TempDir(), "runtime")
-	blockedDataHome := filepath.Join(t.TempDir(), "not-a-directory")
-	if err := os.WriteFile(blockedDataHome, []byte("file"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("XDG_DATA_HOME", blockedDataHome)
-	for _, key := range []string{"AIRA_PY_LIB", "AIRA_GOVERNOR_CMD", "AIRA_GOVERNOR_MAX_WAIT", "AIRA_CONFINE_SCOPE_ID"} {
-		t.Setenv(key, "/stale-"+key)
-	}
-	observed := filepath.Join(t.TempDir(), "time-env")
-	script := `env | grep '^AIRA_\(PY_LIB\|GOVERNOR_CMD\|GOVERNOR_MAX_WAIT\|CONFINE_SCOPE_ID\)=' > "$1" || :`
-	response := NewWithRunnerFace(&commandCoreStore{}, commandSidecarRunner{runtimeDir: runtimeDir}, nil, FaceOutput{}).Do(context.Background(), Request{Verb: "time", Args: map[string]any{
-		"argv": []string{"sh", "-c", script, "time-env", observed},
-		"env":  []string{},
-	}})
-	if !response.OK || response.Exit != 0 {
-		t.Fatalf("response=%#v", response)
-	}
-	data, err := os.ReadFile(observed)
-	if err != nil || len(data) != 0 {
-		t.Fatalf("failed time extraction retained governor env %q: %v", data, err)
+	for _, key := range inherited {
+		if strings.Contains(got, key+"=") {
+			t.Errorf("time child inherited coordination key %s: %q", key, got)
+		}
 	}
 }
 

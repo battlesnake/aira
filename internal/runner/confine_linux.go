@@ -963,27 +963,23 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		stdout = os.Stdout
 	}
 	cmd := exec.CommandContext(ctx, self, setupArgv...)
+	// The one resolved self binary the child's AIRA verbs are invoked through:
+	// worker-admit and aitest-bootstrap are both verbs on it.
 	reserveCommand := ""
-	memoryDefault := ""
 	if request.DelegateRAM {
 		reserveCommand = self
 		if executable, executableErr := filepath.EvalSymlinks(self); executableErr == nil {
 			reserveCommand = executable
 		}
-		memoryDefault = strings.TrimSpace(os.Getenv("AIRA_TEST_MEM_DEFAULT"))
-		if parsed, parseErr := ParseMemorySize(memoryDefault); parseErr != nil || parsed <= 0 {
-			memoryDefault = pylib.DefaultTestMemoryReserve
-		}
 	}
-	cmd.Env = pylib.AppendConfineChildEnvironment(confineEnvironment(request.Env), request.RuntimeDir, diagnostics, request.DelegateRAM, reserveCommand, memoryDefault, scopeID, sliceName)
+	cmd.Env = pylib.AppendConfineChildEnvironment(confineEnvironment(request.Env), scopeID)
 	if request.DelegateRAM {
 		// aitest is only meaningful for a delegate-RAM launch (worker-admit
 		// grants nested sub-scopes under THIS job's own outer scope); every
 		// other launch gets no aitest coordinates at all, mirroring
-		// AppendConfineChildEnvironment's own delegateRAM gate immediately
-		// above. reserveCommand is the SAME resolved self binary already
-		// computed for the RAM governor a few lines up — both worker-admit
-		// and aitest-bootstrap are verbs on that one aira binary.
+		// the delegate-RAM gate on reserveCommand immediately above, which is
+		// the SAME resolved self binary — both worker-admit and
+		// aitest-bootstrap are verbs on that one aira binary.
 		// scope.Reference() is THIS job's real outer scope, handed down rather
 		// than rediscovered by the bootstrap verb from its own current cgroup
 		// (AIRA-44) — which is wrong for a second aitest-enabled pytest run in
@@ -999,7 +995,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		// delegate-RAM aitest job launching `aira confine -- ...` without
 		// --delegate-ram would hand its child stale coordinates pointing at
 		// the outer job's (possibly since-deleted) extraction dir and relay
-		// binary. Mirrors StripGovernorEnvironment's own unconditional
+		// binary. Mirrors StripCoordinationEnvironment's own unconditional
 		// strip on every confine launch (runner_linux.go).
 		cmd.Env = pylib.StripAitestEnvironment(cmd.Env)
 	}
@@ -1008,11 +1004,11 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// must carry the token.
 	//
 	// Set UNCONDITIONALLY here rather than through AppendConfineChildEnvironment:
-	// that helper gates several variables on RuntimeDir being present, and
-	// exclusivity has nothing to do with the governor's runtime directory. An
-	// attestation that silently vanished under some configurations would be worse
-	// than none at all, because a benchmark checking for it would then refuse to
-	// run for entirely the wrong reason.
+	// exclusivity is a property of THIS launch, not of the coordination
+	// coordinates that helper owns, and an attestation that silently vanished
+	// under some configurations would be worse than none at all, because a
+	// benchmark checking for it would then refuse to run for entirely the wrong
+	// reason.
 	//
 	// An earlier revision STRIPPED an inherited token on a non-exclusive launch,
 	// reasoning that the attestation would be "false" for such a job. That
@@ -1375,9 +1371,9 @@ func removeConfineEnv(env []string, key string) []string {
 // cannot be unset inside an already-running process if exclusivity is lost later.
 // The confine trailer's `exclusive=` facet attests the run.
 //
-// It is deliberately NOT a member of governorEnvironmentKeys:
-// StripGovernorEnvironment runs on every nested launch, so listing it there would
-// drop the token and make two-level nesting deadlock.
+// It is deliberately NOT a member of pylib.coordinationEnvironmentKeys:
+// StripCoordinationEnvironment runs on every nested launch, so listing it there
+// would drop the token and make two-level nesting deadlock.
 const ExclusiveHolderEnv = "AIRA_CONFINE_EXCLUSIVE"
 
 // InheritedConfineScopeID reads the scope id of the confine job this process is

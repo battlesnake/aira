@@ -18,20 +18,18 @@ import (
 // embedded, and nothing else may be. Entries ending in "/" exclude a subtree.
 //
 // This is the whole hand-maintained surface of the embed contract: two source
-// hygiene files and one fixture subtree, each with a stated reason. It replaces
+// hygiene files and one fixture subtree, each with a stated reason. (AIRA-33
+// deleted the second embedded root, aira_xdist_governor, and its two entries;
+// the contract and this test are per-root and unchanged by that.) It replaces
 // the two "does the tree contain these three names" tests, which asserted a
 // subset (so `all:`'s untracked __pycache__/.pytest_cache scratch passed them
 // happily) and asserted the presence of .gitignore and README.md, which no Go
 // consumer reads and which the *.py globs correctly no longer ship.
 var notEmbedded = map[string][]string{
-	"aira_xdist_governor": {
+	"aitest": {
 		".gitignore", // source hygiene for the checkout, not a runtime input
 		"README.md",  // documentation; read in the repo, not from the extraction
-	},
-	"aitest": {
-		".gitignore",
-		"README.md",
-		"testdata/", // fixtures for aitest's own source-tree pytest tier
+		"testdata/",  // fixtures for aitest's own source-tree pytest tier
 	},
 }
 
@@ -63,7 +61,6 @@ func TestEmbeddedTreesMatchTrackedSources(t *testing.T) {
 		root string
 		tree fs.FS
 	}{
-		{embeddedRoot, embeddedPyLib},
 		{embeddedAitestRoot, embeddedAitest},
 	} {
 		t.Run(tc.root, func(t *testing.T) {
@@ -185,34 +182,7 @@ func TestExtractAitestIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestExtractPyLibIsIdempotentAndReadyLast(t *testing.T) {
-	t.Setenv("XDG_DATA_HOME", t.TempDir())
-	first, err := ExtractPyLib()
-	if err != nil {
-		t.Fatal(err)
-	}
-	ready, err := os.ReadFile(filepath.Join(first, readyName))
-	if err != nil || strings.TrimSpace(string(ready)) != filepath.Base(first) {
-		t.Fatalf("ready=%q err=%v target=%s", ready, err, first)
-	}
-
-	marker := filepath.Join(first, "caller-marker")
-	if err := os.WriteFile(marker, []byte("preserved"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	second, err := ExtractPyLib()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if second != first {
-		t.Fatalf("second extraction path=%q want %q", second, first)
-	}
-	if got, err := os.ReadFile(marker); err != nil || string(got) != "preserved" {
-		t.Fatalf("fast path rewrote published tree: got=%q err=%v", got, err)
-	}
-}
-
-func TestExtractPyLibContentHashChangesWithTree(t *testing.T) {
+func TestExtractPyLibFSContentHashChangesWithTree(t *testing.T) {
 	dataHome := t.TempDir()
 	firstFS := fstest.MapFS{"pkg/__init__.py": {Data: []byte("VALUE = 1\n")}}
 	secondFS := fstest.MapFS{"pkg/__init__.py": {Data: []byte("VALUE = 2\n")}}
@@ -234,7 +204,7 @@ func TestExtractPyLibContentHashChangesWithTree(t *testing.T) {
 	}
 }
 
-func TestExtractPyLibConcurrentPublishHasOneCompleteTreeAndNoLoserTemp(t *testing.T) {
+func TestExtractPyLibFSConcurrentPublishHasOneCompleteTreeAndNoLoserTemp(t *testing.T) {
 	dataHome := t.TempDir()
 	source := fstest.MapFS{
 		"pkg/__init__.py": {Data: []byte("VALUE = 1\n")},
@@ -277,7 +247,7 @@ func TestExtractPyLibConcurrentPublishHasOneCompleteTreeAndNoLoserTemp(t *testin
 	}
 }
 
-func TestExtractPyLibFailureNeverPublishesTarget(t *testing.T) {
+func TestExtractPyLibFSFailureNeverPublishesTarget(t *testing.T) {
 	dataHome := t.TempDir()
 	source := failingFS{
 		FS: fstest.MapFS{

@@ -518,14 +518,15 @@ func TestSkillAitestGuidanceRecommendsAnInvocationThatWorks(t *testing.T) {
 			// PYTHONPATH, so AIRA_AITEST_LIB alone does not load the plugin.
 			"conftest.py",
 			"pytest_plugins",
-			// AIRA-77: --delegate-ram also arms the legacy xdist governor.
-			"-p no:aira_xdist_governor",
 			// The accounting claim must stay scoped to what worker-admit
 			// actually does. An earlier draft overstated this as "the slice
 			// only ever holds this job's 512M framework overhead", which is
-			// false: a registered aira_xdist_governor still charges the ledger
-			// per test, and a delegate scope adopted after a daemon restart is
-			// reconstructed at live RSS plus margin.
+			// false: a delegate scope adopted after a daemon restart is
+			// reconstructed at live RSS plus margin. (AIRA-77's companion
+			// assertion here, the `-p no:aira_xdist_governor` migration
+			// workaround, was removed by AIRA-33 along with the plugin that
+			// made it necessary; TestSkillNamesNothingFromTheRetiredXdistGovernor
+			// now asserts the opposite -- that the phrase is GONE.)
 			"adds no slice-ledger charge",
 			// AIRA_AITEST_ESTIMATED_BYTES is parsed with int(raw)
 			// (internal/pylib/aitest/__init__.py:141-146): a "4G"-style value
@@ -556,6 +557,52 @@ func TestSkillAitestGuidanceRecommendsAnInvocationThatWorks(t *testing.T) {
 		} {
 			if strings.Contains(section, forbidden.text) {
 				t.Fatalf("%s aitest section %s: found %q", document.name, forbidden.why, forbidden.text)
+			}
+		}
+	}
+}
+
+// TestSkillNamesNothingFromTheRetiredXdistGovernor is AIRA-33's anti-stale-prose
+// guard, and it is deliberately a WHOLE-DOCUMENT scan rather than a scoped one.
+//
+// The generated Skill and agent guide are AIRA's own instructions to other
+// agents. Prose describing a subsystem that no longer exists is not a
+// documentation nit here: an agent that reads "put an aira_mem() marker on the
+// heavy tests" or "block it with -p no:aira_xdist_governor" will act on it and
+// get nothing, with no error to tell it so. That is the same fabricated-fact
+// class as an invented zero, so it is enforced by a test rather than left to
+// review.
+//
+// This test is FORWARD-LOOKING as much as backward: the deletion is a single
+// commit, but the prose it falsified is spread across two multi-kilobyte
+// WriteString blocks, and the next person editing them has no way to know which
+// phrases were retired. Failing the build is that way.
+//
+// verifies: AIRA-33
+func TestSkillNamesNothingFromTheRetiredXdistGovernor(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Every one of these named a real, now-deleted mechanism. Listed with what
+	// it was, so a future reader can tell a genuine regression from a coincidence.
+	retired := []string{
+		"aira_xdist_governor",    // the deleted pytest plugin, by module name
+		"AIRA_PY_LIB",            // the env var that published it to a child
+		"AIRA_TEST_MEM_GOVERNOR", // armed its per-test RAM reservations
+		"AIRA_GOVERNOR",          // armed / disarmed its CPU checkpoint
+		"governor-slot",          // the deleted per-worker relay verb
+		"aira_mem(",              // its per-test RAM marker
+		"per-test gate",          // its fail-open reservation gate
+		"per-test reservation",   // what that gate obtained
+	}
+	for _, document := range []struct{ name, body string }{
+		{"SKILL.md", string(artifacts.SkillMD)},
+		{"guide", string(artifacts.Guide)},
+	} {
+		for _, phrase := range retired {
+			if strings.Contains(document.body, phrase) {
+				t.Errorf("%s still describes the retired xdist governor: %q (AIRA-33 deleted the mechanism; the prose must go with it)", document.name, phrase)
 			}
 		}
 	}

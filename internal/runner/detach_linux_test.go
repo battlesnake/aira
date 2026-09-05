@@ -534,10 +534,20 @@ func TestDetachedRecordStampsEffectiveAdmissionOverrideAfterAdmit(t *testing.T) 
 	}
 }
 
-func TestDetachedLaunchReceivesSidecarEnvironmentFromCommonSeam(t *testing.T) {
+// TestDetachedLaunchStripsCoordinationEnvironmentFromCommonSeam pins that the
+// DETACHED launch path shares the foreground path's one environment seam.
+//
+// Before AIRA-33 that seam injected the aira_xdist_governor sidecar and this
+// test proved the injection reached a detached child too. The injection is gone;
+// the seam and the reason to test it are not. What it now carries is the STRIP
+// of inherited coordination keys, and a detached launch is exactly where a
+// second, forgotten environment assembly path would go unnoticed -- it forks a
+// setsid'd supervisor rather than exec'ing in place.
+//
+// verifies: AIRA-33
+func TestDetachedLaunchStripsCoordinationEnvironmentFromCommonSeam(t *testing.T) {
 	r, _ := newMemoryRunner(t, nil)
 	r.inputRuntimeDir = filepath.Join(t.TempDir(), "runtime")
-	t.Setenv("XDG_DATA_HOME", t.TempDir())
 	var childEnv []string
 	r.startFn = func(command *exec.Cmd) error {
 		childEnv = append([]string(nil), command.Env...)
@@ -552,8 +562,13 @@ func TestDetachedLaunchReceivesSidecarEnvironmentFromCommonSeam(t *testing.T) {
 		t.Fatal(err)
 	}
 	req := Request{
-		Argv:        []string{"/bin/true"},
-		Env:         []string{"PATH=/bin"},
+		Argv: []string{"/bin/true"},
+		Env: []string{
+			"PATH=/bin",
+			"AIRA_PY_LIB=/stale",
+			"AIRA_GOVERNOR_CMD=/stale/aira",
+			"AIRA_CONFINE_SCOPE_ID=stale-scope",
+		},
 		ExplicitEnv: true,
 		Detach:      true,
 		detachReady: &detachSignal{file: readyW},
@@ -576,8 +591,13 @@ func TestDetachedLaunchReceivesSidecarEnvironmentFromCommonSeam(t *testing.T) {
 		t.Fatal("injected detached start failure did not propagate")
 	}
 	values := testEnvironmentValues(t, childEnv)
-	if values["AIRA_PY_LIB"] == "" || values["AIRA_GOVERNOR_CMD"] != "" || values["AIRA_CONFINE_SCOPE_ID"] != "" {
-		t.Fatalf("detached child sidecar env=%v", childEnv)
+	if values["PATH"] != "/bin" {
+		t.Fatalf("detached child environment lost PATH, so the absences below prove nothing: %v", childEnv)
+	}
+	for _, key := range []string{"AIRA_PY_LIB", "AIRA_GOVERNOR_CMD", "AIRA_CONFINE_SCOPE_ID"} {
+		if _, present := values[key]; present {
+			t.Errorf("detached launch forwarded coordination key %s: %v", key, childEnv)
+		}
 	}
 }
 

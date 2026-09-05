@@ -16,10 +16,19 @@ import (
 //
 // Shape taken from the observed failure: one unrelated 32G-class head waiter on
 // the shared machine-wide aira.slice queue, and behind it many ~1G pinned
-// per-test reservations from the pytest RAM governor — each a genuine
-// `aira confine-reserve --bytes ~1G --pinned --signature pytest:<nodeid>
-// --max-wait 300s`, which reaches the daemon as the `admit` verb and lands in
-// this same sliceQueue (there is no separate per-test admission path).
+// small reservations — each a genuine `aira confine-reserve --bytes ~1G --pinned
+// --signature pytest:<nodeid> --max-wait 300s`, which reaches the daemon as the
+// `admit` verb and lands in this same sliceQueue (there is no separate
+// small-reservation admission path).
+//
+// AIRA-33 note: the original incident's small reservations came from the pytest
+// RAM governor, one per test, and this file was called
+// admit_governor_contention_test.go for that reason. That plugin is deleted; the
+// FAIRNESS DEFECT it exposed is not, and neither is the shape — any caller
+// queueing many small pinned reservations behind one large head reproduces it
+// (`aira confine-reserve` is still a supported verb). The file and test were
+// renamed off the governor precisely so a future cleanup sweeping up
+// governor-named files cannot delete a live AIRA-59 regression by mistake.
 //
 // Before the duty bound, the freeze re-armed on every pass for as long as the
 // head stayed queued, so those per-test reservations were blocked for the head's
@@ -29,7 +38,7 @@ import (
 // Driven concurrently through admitConnection with real goroutines and the real
 // connection lifecycle, because the freeze's damage is only observable across
 // the enqueue/grant/release path, not by calling the evaluator directly.
-func TestGovernorPerTestReservationsAreNotStalledByALargeNeighbourHead(t *testing.T) {
+func TestSmallPinnedReservationsAreNotStalledByALargeNeighbourHead(t *testing.T) {
 	const gib = int64(1) << 30
 
 	var maximum atomic.Int64
@@ -128,8 +137,8 @@ func TestGovernorPerTestReservationsAreNotStalledByALargeNeighbourHead(t *testin
 	advance(11 * time.Second)
 	settle()
 
-	// The governor's per-test reservations arrive behind it. Each would fit
-	// comfortably in the ~30G of real headroom.
+	// The small pinned reservations arrive behind it. Each would fit comfortably
+	// in the ~30G of real headroom.
 	perTest := make([]*call, 0, 8)
 	for index := 0; index < 8; index++ {
 		perTest = append(perTest, start(

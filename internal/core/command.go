@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -148,7 +147,7 @@ func cloneCommandInt64(value *int64) *int64 {
 	return &copy
 }
 
-func effectiveCommandEnvironment(overrides []string, runtimeDir string, diagnostics io.Writer) ([]string, error) {
+func effectiveCommandEnvironment(overrides []string) ([]string, error) {
 	values := append([]string(nil), os.Environ()...)
 	positions := map[string]int{}
 	for i, entry := range values {
@@ -168,18 +167,9 @@ func effectiveCommandEnvironment(overrides []string, runtimeDir string, diagnost
 			values = append(values, entry)
 		}
 	}
-	return pylib.AppendChildEnvironment(values, runtimeDir, diagnostics), nil
-}
-
-type sidecarRuntimeRunner interface {
-	SidecarRuntimeDir() string
-}
-
-func sidecarRuntimeDir(execution Runner) string {
-	if source, ok := execution.(sidecarRuntimeRunner); ok {
-		return source.SidecarRuntimeDir()
-	}
-	return ""
+	// AIRA-33: the sidecar this once published to the child is deleted, so all
+	// that is left is the strip of inherited launch coordinates.
+	return pylib.StripCoordinationEnvironment(values), nil
 }
 
 func commandArgvDigest(argv []string) string {
@@ -321,7 +311,7 @@ func (c *Core) runCommandTime(ctx context.Context, args *argAccessor) (any, erro
 	if err != nil {
 		return nil, err
 	}
-	environment, err := effectiveCommandEnvironment(stringSlice(args, "env"), sidecarRuntimeDir(c.runner), c.face.Stderr)
+	environment, err := effectiveCommandEnvironment(stringSlice(args, "env"))
 	if err != nil {
 		return nil, err
 	}

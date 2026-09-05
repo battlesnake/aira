@@ -17,11 +17,16 @@ const (
 	// A project-less invocation has no per-project peak-RSS history. Four GiB is
 	// a conservative #50 no-history fallback; injected callers may override it.
 	DefaultConfineMemoryReserve = int64(4 << 30)
-	// Under --delegate-ram the suite delegates RAM accounting to its per-test
-	// reservations, so its OWN reserve must be a small PINNED framework overhead —
-	// never the unpinned whole-command estimate, which would double-book the
-	// per-test reservations in queue.outstanding and could inflate via history to
-	// reject the whole suite E_ADMIT_TOO_LARGE.
+	// Under --delegate-ram the suite's OWN reserve must be a small PINNED
+	// framework overhead — never the unpinned whole-command estimate, which
+	// could inflate via history to reject the whole suite E_ADMIT_TOO_LARGE.
+	// Until AIRA-33 the reason was that the deleted pytest plugin took a
+	// separate per-test reservation the whole-command estimate would double-book
+	// in queue.outstanding. That caller is gone; the constant and its value are
+	// unchanged, and the reason is now aitest: a delegate job's containment is
+	// per-WORKER, in nested sub-scopes granted by worker-admit under this job's
+	// own outer ceiling, so charging the slice a whole-suite peak on top would
+	// reserve for growth the slice ledger never sees.
 	DefaultDelegateRAMOverhead = int64(512 << 20)
 	// DefaultDelegateRAMScopeCeiling is the compiled-in containment cap used
 	// whenever a daemon ceiling is unavailable. It is not an admission charge.

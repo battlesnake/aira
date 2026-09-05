@@ -120,12 +120,12 @@ func EnvDigest(entries []EnvEntry) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// StripGovernorEnv removes launch-coordination entries from the environment
+// StripCoordinationEnv removes launch-coordination entries from the environment
 // identity shared by runners and command gates.
-func StripGovernorEnv(entries []EnvEntry) []EnvEntry {
+func StripCoordinationEnv(entries []EnvEntry) []EnvEntry {
 	result := make([]EnvEntry, 0, len(entries))
 	for _, entry := range entries {
-		if !pylib.IsGovernorEnvironmentKey(string(entry.Key)) {
+		if !pylib.IsCoordinationEnvironmentKey(string(entry.Key)) {
 			result = append(result, entry)
 		}
 	}

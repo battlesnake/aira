@@ -136,7 +136,6 @@ type sliceCeilingDeps struct {
 	ttl              time.Duration
 	now              func() time.Time
 	publish          func(sliceCeilingSnapshot)
-	signalGovernor   func()
 	logf             func(string, ...any)
 	sleep            func(context.Context, time.Duration) bool
 }
@@ -386,7 +385,6 @@ func evaluateSliceCeiling(mode sliceCeilingMode, state *sliceCeilingState, deps 
 	}
 	candidate = sliceCeilingQuantizeDown(candidate, deps.quantum)
 
-	previous, hadPub := state.published, state.havePub
 	// Quantisation IS the anti-flap: candidate is always a quantum multiple, so
 	// nothing below 256 MiB of sustained movement can change the published
 	// figure, and max()-over-the-window means a lower candidate only wins once
@@ -412,16 +410,16 @@ func evaluateSliceCeiling(mode sliceCeilingMode, state *sliceCeilingState, deps 
 		snapshot.State = sliceCeilingThrottled
 	}
 	state.lastState, state.lastStaticMax, state.lastMemAvailable = snapshot.State, maximum, available
-	result := publishSliceCeiling(mode, state, deps, snapshot)
-	// A RAISE must wake the RAM-aware governor, which is signal-driven
-	// (governor.go) — parked workers would otherwise stay parked until an
-	// unrelated event. The admission queue evaluator re-polls on its own ticker
-	// and needs nothing. Called AFTER publishing, so the leaf ceiling lock is
-	// never held across the governor's own locks.
-	if deps.signalGovernor != nil && (!hadPub || state.published > previous) {
-		deps.signalGovernor()
-	}
-	return result
+	// AIRA-33. A RAISE used to wake the RAM-aware governor, which was the only
+	// SIGNAL-driven consumer of this ceiling. With that scheduler deleted, every
+	// remaining consumer re-polls on its own timer and needs no kick: the slice
+	// admission queue evaluator selects over its own 250ms ticker
+	// (defaultAdmitPollInterval, admit.go), and worker-admit is a 200ms
+	// time.After poll with no kick channel at all — and admitEffectiveMaximum is
+	// deliberately not applied to worker-admit anyway (see its doc comment
+	// below). So a raise is observed within one poll interval by everything that
+	// cares, and this function publishes without waking anything.
+	return publishSliceCeiling(mode, state, deps, snapshot)
 }
 
 // sliceCeilingHold decides what an UNESTABLISHED sample publishes. The last
@@ -438,15 +436,10 @@ func sliceCeilingHold(mode sliceCeilingMode, state *sliceCeilingState, deps slic
 		state.window = nil
 		state.havePub = false
 		state.published = 0
-		wasThrottled := state.lastState == sliceCeilingThrottled
 		state.lastState, state.lastStaticMax, state.lastMemAvailable = "", 0, 0
 		// Expiry hands admission back the RAW maximum, so it is an effective
-		// RAISE and must wake the governor for the same reason a published raise
-		// does: governorSet is purely kick-driven, so parked RAM-aware workers
-		// would otherwise stay parked until an unrelated event.
-		if wasThrottled && deps.signalGovernor != nil {
-			defer deps.signalGovernor()
-		}
+		// RAISE. It woke the governor for that reason until AIRA-33 deleted it;
+		// no remaining consumer is kick-driven (see evaluateSliceCeiling).
 		return sliceCeilingSnapshot{
 			Mode: mode, SlicePath: path, State: sliceCeilingUnevaluated, Reason: reason, At: now,
 		}
@@ -548,10 +541,10 @@ func (s *Server) sliceCeilingSnapshotFor(path string) sliceCeilingSnapshot {
 
 // admitEffectiveMaximum returns the maximum that CAPACITY questions must use.
 //
-// It is applied at exactly three sites and must never spread:
+// It is applied at exactly two sites and must never spread (it was three until
+// AIRA-33 deleted the governor's read-only admitAvailable advisory):
 //
 //	evaluateAdmitQueue   -> checkedAvailable   the throttle itself
-//	admitAvailable       -> checkedAvailable   the governor's read-only advisory
 //	confineManagement    -> CeilingBytes       what a new job actually faces
 //
 // It must NOT reach admitConnection's own ceiling (admit.go), which feeds the
@@ -617,13 +610,8 @@ func realSliceCeilingDeps(s *Server, reserve int64) sliceCeilingDeps {
 		ttl:              defaultSliceCeilingTTL,
 		now:              time.Now,
 		publish:          s.publishSliceCeilingSnapshot,
-		signalGovernor: func() {
-			if s.governor != nil {
-				s.governor.signal()
-			}
-		},
-		logf:  log.Printf,
-		sleep: watchdogSleep,
+		logf:             log.Printf,
+		sleep:            watchdogSleep,
 	}
 }
 

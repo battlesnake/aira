@@ -940,117 +940,116 @@ func TestRealCgroupExplicitNonemptyEnvironmentIsCanonicalAndDigested(t *testing.
 	}
 }
 
-func TestSidecarEnvironmentIsInjectedAfterDigestForExplicitEnv(t *testing.T) {
+// TestCoordinationEnvironmentIsStrippedAndKeptOutOfTheDigest is what survives
+// AIRA-33 of the three sidecar tests it replaces
+// (SidecarEnvironmentIsInjectedAfterDigestForExplicitEnv,
+// SidecarEnvironmentDigestIgnoresInheritedGovernorValues,
+// SidecarExtractionFailureDoesNotBlockLaunch).
+//
+// Those tests pinned an INJECTION -- the run path extracted the
+// aira_xdist_governor sidecar and published AIRA_PY_LIB and friends to the child
+// AFTER computing EnvDigest, so the advisory coordinates never entered the
+// recorded environment identity. AIRA-33 deletes the injection; both halves of
+// what remains are still live and still worth a test:
+//
+//  1. inherited coordination keys are STRIPPED, so a run launched from inside a
+//     still-running pre-deletion delegate job cannot forward a live AIRA_PY_LIB
+//     (or another job's AIRA_CONFINE_SCOPE_ID) to its child, and
+//  2. they do not enter EnvDigest, so telemetry's environment identity is the
+//     same whether or not the launching process happened to inherit them --
+//     which is the property that made them "advisory" in the first place.
+//
+// Both explicit and inherited environments are exercised because they take
+// different code paths into the same strip (explicitEnvironment vs
+// effectiveEnvironment).
+//
+// verifies: AIRA-33
+func TestCoordinationEnvironmentIsStrippedAndKeptOutOfTheDigest(t *testing.T) {
+	coordinationKeys := []string{"AIRA_PY_LIB", "AIRA_GOVERNOR", "AIRA_GOVERNOR_CMD", "AIRA_GOVERNOR_MAX_WAIT", "AIRA_CONFINE_RESERVE_CMD", "AIRA_TEST_MEM_GOVERNOR", "AIRA_CONFINE_SCOPE_ID"}
+
 	r, _ := newMemoryRunner(t, nil)
-	r.inputRuntimeDir = filepath.Join(t.TempDir(), "runtime")
-	t.Setenv("XDG_DATA_HOME", t.TempDir())
 	var childEnv []string
 	r.startFn = func(command *exec.Cmd) error {
 		childEnv = append([]string(nil), command.Env...)
 		return errors.New("injected after environment observation")
 	}
-	record, err := r.Launch(context.Background(), Request{
-		Argv: []string{"/bin/true"},
-		Env: []string{
-			"PATH=/bin",
-			"AIRA_PY_LIB=/stale",
-			"AIRA_GOVERNOR_CMD=/stale/aira",
-			"AIRA_CONFINE_SCOPE_ID=stale-scope",
-			"AIRA_GOVERNOR_MAX_WAIT=99s",
-		},
-		ExplicitEnv: true,
-	})
-	if err == nil {
-		t.Fatalf("launch record=%+v err=%v", record, err)
+
+	explicit := []string{"PATH=/bin"}
+	for _, key := range coordinationKeys {
+		explicit = append(explicit, key+"=/stale-"+key)
 	}
-	record, getErr := r.Get("RUN-1")
+	if _, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/true"}, Env: explicit, ExplicitEnv: true}); err == nil {
+		t.Fatal("launch unexpectedly succeeded")
+	}
+	explicitRecord, getErr := r.Get("RUN-1")
 	if getErr != nil {
 		t.Fatal(getErr)
 	}
 	values := testEnvironmentValues(t, childEnv)
-	if values["AIRA_PY_LIB"] == "" || values["AIRA_GOVERNOR_CMD"] != "" || values["AIRA_CONFINE_SCOPE_ID"] != "" {
-		t.Fatalf("child sidecar env=%v", childEnv)
+	if values["PATH"] != "/bin" {
+		t.Fatalf("child environment lost PATH, so the absences below prove nothing: %v", childEnv)
+	}
+	for _, key := range coordinationKeys {
+		if _, present := values[key]; present {
+			t.Errorf("explicit launch forwarded coordination key %s to the child: %v", key, childEnv)
+		}
 	}
 	wantDigest, digestErr := EnvDigest([]EnvEntry{{Key: []byte("PATH"), Value: []byte("/bin")}})
-	if digestErr != nil || record.EnvDigest != wantDigest {
-		t.Fatalf("governor vars changed digest: got=%q want=%q err=%v", record.EnvDigest, wantDigest, digestErr)
-	}
-}
-
-func TestSidecarEnvironmentDigestIgnoresInheritedGovernorValues(t *testing.T) {
-	r, _ := newMemoryRunner(t, nil)
-	r.inputRuntimeDir = filepath.Join(t.TempDir(), "runtime")
-	t.Setenv("XDG_DATA_HOME", t.TempDir())
-	var childEnv []string
-	r.startFn = func(command *exec.Cmd) error {
-		childEnv = append([]string(nil), command.Env...)
-		return errors.New("injected after environment observation")
+	if digestErr != nil || explicitRecord.EnvDigest != wantDigest {
+		t.Fatalf("coordination keys entered the env digest: got=%q want=%q err=%v", explicitRecord.EnvDigest, wantDigest, digestErr)
 	}
 
-	governorKeys := []string{"AIRA_PY_LIB", "AIRA_GOVERNOR", "AIRA_GOVERNOR_CMD", "AIRA_GOVERNOR_MAX_WAIT", "AIRA_CONFINE_SCOPE_ID"}
-	for _, key := range governorKeys {
-		t.Setenv(key, "/stale-"+key)
+	// Now the inherited path: the SAME launch, once with the keys absent from
+	// the process environment and once with them set, must record one digest.
+	//
+	// The control variable is the non-vacuity witness for this half, and it is
+	// load-bearing (an adversarial build-review found this half passing on
+	// absences alone): if effectiveEnvironment ever returned an EMPTY
+	// environment, both digests would be the empty-environment digest, every
+	// absence assertion below would hold, and the test would pass while proving
+	// nothing. Asserting a non-coordination variable DOES survive to the child,
+	// and that the digest is not the empty one, closes that.
+	const controlKey, controlValue = "AIRA_TEST_CONTROL_NOT_COORDINATION", "witness"
+	t.Setenv(controlKey, controlValue)
+	emptyDigest, digestErr := EnvDigest(nil)
+	if digestErr != nil {
+		t.Fatal(digestErr)
+	}
+	for _, key := range coordinationKeys {
 		if err := os.Unsetenv(key); err != nil {
 			t.Fatal(err)
 		}
 	}
-	_, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/true"}})
-	if err == nil {
+	if _, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/true"}}); err == nil {
 		t.Fatal("launch unexpectedly succeeded")
 	}
-	withoutGovernor, getErr := r.Get("RUN-1")
+	without, getErr := r.Get("RUN-2")
 	if getErr != nil {
 		t.Fatal(getErr)
 	}
-	for _, key := range governorKeys {
-		if err := os.Setenv(key, "/stale-"+key); err != nil {
-			t.Fatal(err)
-		}
+	for _, key := range coordinationKeys {
+		t.Setenv(key, "/stale-"+key)
 	}
-	_, err = r.Launch(context.Background(), Request{Argv: []string{"/bin/true"}})
-	if err == nil {
+	if _, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/true"}}); err == nil {
 		t.Fatal("launch unexpectedly succeeded")
 	}
-	withGovernor, getErr := r.Get("RUN-2")
+	with, getErr := r.Get("RUN-3")
 	if getErr != nil {
 		t.Fatal(getErr)
 	}
-	if withGovernor.EnvDigest != withoutGovernor.EnvDigest {
-		t.Fatalf("inherited governor values changed digest: with=%q without=%q", withGovernor.EnvDigest, withoutGovernor.EnvDigest)
+	if with.EnvDigest != without.EnvDigest {
+		t.Fatalf("inherited coordination values changed the env digest: with=%q without=%q", with.EnvDigest, without.EnvDigest)
 	}
-	values := testEnvironmentValues(t, childEnv)
-	if values["AIRA_PY_LIB"] == "" || values["AIRA_PY_LIB"] == "/stale-AIRA_PY_LIB" || values["AIRA_GOVERNOR_CMD"] != "" || values["AIRA_CONFINE_SCOPE_ID"] != "" {
-		t.Fatalf("child did not receive authoritative governor values: %v", childEnv)
+	if without.EnvDigest == emptyDigest {
+		t.Fatal("the inherited environment digested as EMPTY, so the equal digests and the absences below prove nothing")
 	}
-}
-
-func TestSidecarExtractionFailureDoesNotBlockLaunch(t *testing.T) {
-	r, _ := newMemoryRunner(t, nil)
-	r.inputRuntimeDir = filepath.Join(t.TempDir(), "runtime")
-	blockedDataHome := filepath.Join(t.TempDir(), "not-a-directory")
-	if err := os.WriteFile(blockedDataHome, []byte("file"), 0o600); err != nil {
-		t.Fatal(err)
+	inheritedValues := testEnvironmentValues(t, childEnv)
+	if inheritedValues[controlKey] != controlValue {
+		t.Fatalf("the control variable did not survive to the child (%q), so the absences below prove nothing: %v", inheritedValues[controlKey], childEnv)
 	}
-	t.Setenv("XDG_DATA_HOME", blockedDataHome)
-	var childEnv []string
-	r.startFn = func(command *exec.Cmd) error {
-		childEnv = append([]string(nil), command.Env...)
-		return errors.New("launch reached after sidecar failure")
-	}
-	_, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/true"}, Env: []string{
-		"PATH=/bin",
-		"AIRA_PY_LIB=/stale",
-		"AIRA_GOVERNOR_CMD=/stale/aira",
-		"AIRA_CONFINE_SCOPE_ID=stale-scope",
-		"AIRA_GOVERNOR_MAX_WAIT=99s",
-	}, ExplicitEnv: true})
-	if err == nil || !strings.Contains(err.Error(), "launch reached after sidecar failure") {
-		t.Fatalf("sidecar failure blocked or replaced launch result: %v", err)
-	}
-	values := testEnvironmentValues(t, childEnv)
-	for _, key := range []string{"AIRA_PY_LIB", "AIRA_GOVERNOR", "AIRA_GOVERNOR_CMD", "AIRA_GOVERNOR_MAX_WAIT", "AIRA_CONFINE_SCOPE_ID"} {
-		if _, present := values[key]; present {
-			t.Fatalf("failed extraction retained %s: %v", key, childEnv)
+	for _, key := range coordinationKeys {
+		if _, present := inheritedValues[key]; present {
+			t.Errorf("inherited launch forwarded coordination key %s to the child: %v", key, childEnv)
 		}
 	}
 }

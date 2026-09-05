@@ -424,7 +424,7 @@ func TestCLIScopeDirCoversEveryDiscoverySite(t *testing.T) {
 // than accepting and discarding it.
 func TestCLIScopeDirIsRefusedForProjectlessVerbs(t *testing.T) {
 	_, callerWorktree := scopeDirFaceEnv(t)
-	for _, verb := range []string{"confine", "confine-list", "worker-admit", "governor-slot"} {
+	for _, verb := range []string{"confine", "confine-list", "confine-reserve", "worker-admit"} {
 		var stdout, stderr bytes.Buffer
 		exit := RunWithDispatcher([]string{"--scope-dir", callerWorktree, verb, "--", "true"}, &stdout, &stderr, dispatcherFunc(
 			func(context.Context, daemon.WorktreeScope, core.Request) core.Response {

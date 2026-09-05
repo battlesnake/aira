@@ -79,10 +79,6 @@ func (r *Runner) SetAdmitSocketPath(path string) { r.admitSocketPath = path }
 // input discovery pinned to the same state identity as the daemon socket.
 func (r *Runner) SetInputRuntimeDir(path string) { r.inputRuntimeDir = path }
 
-// SidecarRuntimeDir lets the thin time wrapper share the daemon runtime
-// identity already wired into the concrete runner.
-func (r *Runner) SidecarRuntimeDir() string { return r.inputRuntimeDir }
-
 // AdmitSocketPath reports the wired daemon admission endpoint (empty when the
 // daemon is not wired, in which case admit falls back to the in-process flock).
 // It lets the CLI layer's wiring be asserted without a live socket.
@@ -283,8 +279,8 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if err != nil {
 		return nil, launchErr("E_RUN_ENV_INVALID", err)
 	}
-	env = pylib.StripGovernorEnvironment(env)
-	entries = StripGovernorEnv(entries)
+	env = pylib.StripCoordinationEnvironment(env)
+	entries = StripCoordinationEnv(entries)
 	envDigest, err := EnvDigest(entries)
 	if err != nil {
 		return nil, launchErr("E_RUN_ENV_INVALID", err)
@@ -301,10 +297,6 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 			buffering = "realtime"
 		}
 	}
-	// Inject after EnvDigest at the common point shared by foreground and
-	// detached launches. These advisory coordinates are deliberately excluded
-	// from the child environment identity recorded in telemetry.
-	env = pylib.AppendChildEnvironment(env, r.inputRuntimeDir, r.diagnostics)
 	if req.StoreStdin && req.StdinPath == "" && req.Stdin == nil {
 		return nil, launchErr("E_RUN_STDIN_INVALID", errors.New("store-stdin requires a launch source"))
 	}

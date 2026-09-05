@@ -17,11 +17,12 @@ import (
 // starved, reporting phantom failures in untouched code. This gate bounds the
 // concurrency instead of reinterpreting the symptom.
 //
-// It is deliberately NOT a second scheduler: it is one more denial condition on
-// the verb that already decides "may I add one worker?", it reads the same
-// capacity concept the governor uses (desiredCPUSlots), and it derives its live
-// count from the cgroup tree rather than from connections, because the tree is
-// what survives a daemon restart and what a killed relay cannot falsify.
+// It is deliberately NOT a scheduler: it is one more denial condition on the
+// verb that already decides "may I add one worker?", it sizes itself from
+// desiredCPUSlots (a capacity it once shared with the daemon scheduler AIRA-33
+// deleted, and now owns outright), and it derives its live count from the cgroup
+// tree rather than from connections, because the tree is what survives a daemon
+// restart and what a killed relay cannot falsify.
 
 // cpuSlotsVerdict is what evaluateWorkerAdmit acts on.
 type cpuSlotsVerdict uint8

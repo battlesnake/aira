@@ -1,6 +1,16 @@
 # AIRA cooperative cross-session scheduler — design
 
-- **Status:** designed (this document); not yet built. Owner-directed 2026-08-30.
+- **Status:** PARTLY RETIRED by AIRA-33 (2026-09-05). Historical design record; read with
+  the outcome below, not as current architecture.
+  - **Slice 1 (cgroup `cpu.weight` aging) — LIVE.** Built and deployed; see
+    `2026-08-30-scheduler-slice1-cpuweight-aging-plan.md`, which is retained.
+  - **Slices 2 and 3 (the daemon park/active-set scheduler and RAM-ordered activation) —
+    BUILT, THEN DELETED.** AIRA-33 removed `internal/daemon/governor.go`, the
+    `governor-slot` relay and the `aira_xdist_governor` pytest plugin, and deleted both
+    slice specs. What replaces them is `aitest` (`2026-09-01-aitest-design.md`): a
+    fork-and-admit worker pool with per-worker nested cgroup sub-scopes and a CPU
+    concurrency gate on `worker-admit`, rather than a park/resume scheduler.
+- **Originally:** designed (this document); not yet built. Owner-directed 2026-08-30.
 - **Supersedes the CPU governor mechanism:** the machine-wide flock slot dir (#49) —
   a flat concurrency cap — is replaced by a daemon-managed cooperative scheduler.
 - **Folds in:** AIRA-14 (the AIRA-11 CPU-side bootstrap residual) as its first slice.

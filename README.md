@@ -94,18 +94,19 @@ Heavy jobs run inside a memory-capped, deprioritised cgroup that only starts whe
 aira confine -- make test
 ```
 
-For test suites, `--delegate-ram` governs memory per test rather than reserving for the whole job up front. The pytest plugin cooperates with the daemon scheduler between tests, so several sessions can all run `-n auto` while the daemon controls the active worker set. Each test's reservation is sized to what its worker is actually holding, helping keep the box busy without OOMing it.
+For test suites, `--delegate-ram` charges a small pinned framework overhead at the door instead of the whole job's peak, so a suite is not blocked behind one large reservation. Pair it with AIRA's own pytest plugin, `aitest`: the supervisor forks each worker and admits it through the daemon, which places that worker in its own kernel-enforced cgroup sub-scope nested under the job's scope. A worker that outgrows its sub-scope is OOM-killed alone, its test is retried once, and a second kill reports the test `unevaluated` rather than passed or failed.
 
 ```sh
-aira confine --delegate-ram --memory-reserve 512M -- pytest -n auto
+aira confine --delegate-ram -- pytest --aitest-workers=auto
 ```
 
-Most tests fit under a sane default; tag the few that are genuinely RAM-hungry:
+`--delegate-ram` is efficient but not airtight: a delegate scope's `memory.max` is a generous ceiling, not its reserve, so worker growth is contained per worker but is not accounted against the shared slice. A plain `aira confine --memory-reserve R -- <cmd>` is the airtight shape, at the cost of reserving the whole-job peak.
 
-```python
-@pytest.mark.aira_mem("2G")
-def test_big_solve(): ...
-```
+No per-test RAM annotation is needed or read: each worker is sized from a
+per-worker backstop, and a worker that exceeds it is OOM-killed alone rather
+than taking the suite with it. Raise the backstop for an unusually hungry suite
+with `AIRA_AITEST_ESTIMATED_BYTES` (a plain integer byte count, not a size
+suffix).
 
 ### Capture the friction
 

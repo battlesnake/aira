@@ -91,7 +91,6 @@ type Server struct {
 	workerAdmitHeadroom          int64
 	scopeReapGrace               time.Duration
 	staleLeaseReleaseGrace       time.Duration
-	governor                     *governorSet
 
 	// AIRA-103. The published pressure ceiling. sliceCeilingMu is a strict LEAF:
 	// admitEffectiveMaximum reads it from inside queue.mu, so nothing may ever be
@@ -196,7 +195,6 @@ func NewServer(paths Paths) *Server {
 		cpuSlotsWarned:               map[string]struct{}{},
 		cpuSlotsScan:                 scanSliceWorkerScopes,
 	}
-	server.governor = newGovernorSet(capacity, governorObserve, server)
 	server.projectCond = sync.NewCond(&server.mu)
 	return server
 }
@@ -293,30 +291,20 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 		return err
 	}
 	desiredSlots, slotErr := desiredCPUSlots(runtime.NumCPU())
-	mode, modeErr := governorModeFromEnv(os.Getenv("AIRA_SCHED_MODE"))
-	if modeErr != nil {
-		return modeErr
-	}
-	if slotErr == nil && s.governor != nil {
-		s.governor.mu.Lock()
-		s.governor.capacity, s.governor.mode = desiredSlots, mode
-		s.governor.mu.Unlock()
-		s.governor.signal()
-	}
 	if slotErr == nil {
-		// AIRA-64: the worker-admit CPU gate shares ONE capacity concept with
-		// the governor rather than inventing a second one. A malformed setting
-		// leaves NewServer's safe capacity-1 fallback in place and is reported
-		// by the same branch below.
+		// AIRA-64: the worker-admit CPU gate is the sole owner of this capacity
+		// since AIRA-33 deleted the daemon scheduler that used to share it. A
+		// malformed setting leaves NewServer's safe capacity-1 fallback in place
+		// and is reported by the branch below.
 		s.cpuSlotsMu.Lock()
 		s.cpuSlotsCapacity = desiredSlots
 		s.cpuSlotsMu.Unlock()
 	}
 	s.cpuSlotsGrace = cpuSlotsPlacementGrace()
 	if slotErr != nil {
-		// NewServer installed the safe capacity-1 fallback, so this governor is
-		// still enforcing. Do not claim it was disabled.
-		log.Printf("aira scheduler governor: using safe capacity-1 fallback (config error: %v)", slotErr)
+		// NewServer installed the safe capacity-1 fallback, so the worker-admit
+		// CPU gate is still enforcing. Do not claim it was disabled.
+		log.Printf("aira daemon: worker-admit CPU gate using safe capacity-1 fallback (config error: %v)", slotErr)
 	}
 	if err := os.Remove(s.Paths.SocketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -458,9 +446,6 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	go func() {
 		connections.Wait()
 		s.pruneAdmitRegistry()
-		if s.governor != nil {
-			s.governor.stopOnce.Do(func() { close(s.governor.stop) })
-		}
 		<-reaperDone
 		<-flusherDone
 		<-discoveryDone
@@ -639,13 +624,13 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 	// The handshake is over, so the connect deadline has done its job and must
 	// not survive it (AIRA-84). Cleared ONCE here rather than repeated in each
 	// handler that remembered to: below this line no path reads the connection
-	// before its own handler owns it (store-op, admit, governor, worker-admit,
-	// watch's disconnect probe), and every response write stamps its own fresh
+	// before its own handler owns it (store-op, admit, worker-admit, watch's
+	// disconnect probe), and every response write stamps its own fresh
 	// write deadline through reply/replyStoreOp.
 	//
 	// INVARIANT for anything added below: this connection has NO read deadline
 	// from here on. A new branch that reads from conn must set its own, exactly
-	// as admit/governor/worker-admit own their framed reads today — inheriting
+	// as admit/worker-admit own their framed reads today — inheriting
 	// a handshake deadline was the bug, but inheriting none is a hang.
 	_ = conn.SetReadDeadline(time.Time{})
 	if storeOp != nil {
@@ -685,23 +670,13 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		s.admitConnection(conn, request.Request.Args)
 		return
 	}
-	if verb == "governor" {
-		if s.OnRequest != nil {
-			s.OnRequest(request.Scope, request.Request)
-		}
-		// governorConnection has one framed reader for the lifetime of this
-		// connection; never let the generic dispatcher read from it again.
-		wrote = true
-		s.governorConnection(conn, request.Request.Args)
-		return
-	}
 	if verb == "worker-admit" {
 		if s.OnRequest != nil {
 			s.OnRequest(request.Scope, request.Request)
 		}
 		// workerAdmitConnection owns its only frame and the lease-release
-		// path, exactly like admit/governor above — never let the generic
-		// dispatcher touch this connection again.
+		// path, exactly like admit above — never let the generic dispatcher
+		// touch this connection again.
 		wrote = true
 		s.workerAdmitConnection(conn, request.Request.Args)
 		return

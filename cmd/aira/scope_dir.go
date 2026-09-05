@@ -152,7 +152,7 @@ func refuseAmbiguousImportPath(request core.Request, scopeDirOverride string) er
 func verbAcceptsScopeDir(verb string) bool {
 	switch verb {
 	case "confine", "confine-reserve", "confine-list", "confine-kill",
-		"governor-slot", "aitest-bootstrap", "worker-admit",
+		"aitest-bootstrap", "worker-admit",
 		"help", "--help":
 		return false
 	}

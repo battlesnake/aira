@@ -166,7 +166,7 @@ func allowListedEnvironment(names []string) ([]string, []runner.EnvEntry, error)
 			entries = append(entries, runner.EnvEntry{Key: []byte(name), Value: []byte(value)})
 		}
 	}
-	entries = runner.StripGovernorEnv(entries)
+	entries = runner.StripCoordinationEnv(entries)
 	sort.Slice(entries, func(i, j int) bool { return string(entries[i].Key) < string(entries[j].Key) })
 	values := make([]string, 0, len(entries))
 	for _, entry := range entries {
