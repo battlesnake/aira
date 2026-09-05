@@ -1539,6 +1539,141 @@ else:
     assert len(fallback_spawns) <= 2
 
 
+def test_startup_never_admits_more_workers_than_there_is_queued_work(tmp_path, monkeypatch, pytester):
+    """AIRA-37 residue #2. run()'s confined startup loop guarded only on
+    `if not self.queue: break`, but the queue is not decremented until the
+    LATER _dispatch_to_idle_workers() pass -- so with one collected test and
+    --aitest-workers=4, all four workers were admitted and forked before a
+    single nodeid was dispatched. Three of them then sat idle until the
+    end-of-run __stop__ broadcast retired them.
+
+    Not merely wasted fork+admission overhead: each of those workers holds a
+    real daemon grant against this run's aggregate memory ledger for its whole
+    (useless) lifetime, so needless over-spawn makes hitting the aggregate cap
+    -- and therefore stalling in _wait_for_admission_or_disable -- more likely
+    than the requested pool size warrants.
+
+    The admit-call counter is the load-bearing assertion: results alone stay
+    correct either way, which is exactly why this went unnoticed."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+import sys
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+sys.exit(0)
+""")
+    admit_calls = tmp_path / "admit-calls"
+    admit = _write_stub(tmp_path / "worker-admit", f"""
+import os, sys
+open({str(admit_calls)!r}, "a").write("x")
+scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+os.makedirs(scope, exist_ok=True)
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+
+    items = pytester.getitems("""
+        def test_only_one():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=4)
+
+    assert results == {items[0].nodeid: "passed"}
+    assert admit_calls.read_text().count("x") == 1, (
+        "one queued test must admit exactly one worker, not worker_count of them"
+    )
+
+
+def test_startup_admits_one_worker_per_queued_test_up_to_the_pool_size(tmp_path, monkeypatch, pytester):
+    """The complement of the test above: the over-spawn guard must not become
+    "only ever admit one worker". With more queued tests than the requested
+    pool size, the full pool is still admitted."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    bootstrap = _write_stub(tmp_path / "bootstrap", f"""
+import sys
+print("bootstrapped outer={outer} supervisor_scope={outer}/.aira-supervisor")
+sys.exit(0)
+""")
+    admit_calls = tmp_path / "admit-calls"
+    admit = _write_stub(tmp_path / "worker-admit", f"""
+import os, sys
+open({str(admit_calls)!r}, "a").write("x")
+scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+os.makedirs(scope, exist_ok=True)
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_BOOTSTRAP_CMD", bootstrap)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+
+    items = pytester.getitems("""
+        import time
+
+        def test_one():
+            time.sleep(0.2)
+
+        def test_two():
+            time.sleep(0.2)
+
+        def test_three():
+            time.sleep(0.2)
+
+        def test_four():
+            time.sleep(0.2)
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=2)
+
+    assert len(results) == 4
+    assert all(outcome == "passed" for outcome in results.values())
+    assert admit_calls.read_text().count("x") == 2, (
+        "four queued tests and a pool size of two must admit the full pool"
+    )
+
+
+def test_fallback_startup_never_forks_more_workers_than_there_is_queued_work(tmp_path, monkeypatch, pytester):
+    """AIRA-37 residue #2, the daemon-down half. The fallback startup loop
+    carried the identical `if not self.queue: break` guard against a queue
+    nothing has decremented yet, so one collected test with
+    --aitest-workers=4 forked four unconfined workers."""
+    monkeypatch.delenv("AIRA_AITEST_BOOTSTRAP_CMD", raising=False)
+    monkeypatch.setenv("AIRA_AITEST_MAX_WORKERS_FALLBACK", "5")
+
+    items = pytester.getitems("""
+        def test_only_one():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.collect(items)
+    fallback_spawns = []
+    original_spawn_fallback = supervisor._spawn_fallback_worker
+
+    def counting_spawn_fallback():
+        pid = original_spawn_fallback()
+        fallback_spawns.append(pid)
+        return pid
+
+    supervisor._spawn_fallback_worker = counting_spawn_fallback
+
+    results = supervisor.run(estimated_bytes=100 * (1 << 20), worker_count=4)
+
+    assert results == {items[0].nodeid: "passed"}
+    assert supervisor.daemon_available is False
+    assert len(fallback_spawns) == 1, (
+        "one queued test must fork exactly one fallback worker, not min(worker_count, cap) of them"
+    )
+
+
 def test_cleanup_supervisor_scope_is_silent_on_ebusy(tmp_path, monkeypatch, capsys):
     scope = str(tmp_path / ".aira-supervisor")
     supervisor = Supervisor()

@@ -1565,6 +1565,37 @@ class Supervisor:
             )
         self._replace_worker()
 
+    def _pool_covers_the_queue(self):
+        """True when every nodeid still waiting in the queue already has an
+        idle worker to run it, so admitting/forking another one would buy
+        nothing.
+
+        AIRA-37 residue #2. run()'s two startup spawn loops guarded only on
+        `if not self.queue`, but nothing decrements the queue until the LATER
+        _dispatch_to_idle_workers() pass -- the pool is spawned first and
+        dispatched to second. So one collected test with --aitest-workers=4
+        admitted and forked four workers, three of which never received a
+        nodeid and simply sat there until the end-of-run __stop__ broadcast.
+
+        That is not only wasted fork+admission overhead. On the confined path
+        each of those surplus workers holds a real daemon grant against this
+        run's aggregate memory ledger (AIRA-39: the ledger sums memory.max over
+        the outer scope's real children) for its entire useless lifetime, so
+        needless over-spawn makes hitting the aggregate cap -- and stalling in
+        _wait_for_admission_or_disable waiting for capacity this run is itself
+        holding -- more likely than the requested pool size warrants.
+
+        Counting IDLE workers rather than all of them (or keeping a local
+        counter decremented per spawn, the other shape AIRA-37 suggested) makes
+        this correct at any call site rather than only in a context where
+        nothing is in flight yet: a busy worker is not cover for a queued
+        nodeid, and derived-from-live-state cannot drift out of step with the
+        queue the way a separate counter can. `.get`, not `[...]`, because the
+        answer must not depend on a worker state dict having reached its final
+        shape."""
+        idle = sum(1 for state in self.workers.values() if state.get("in_flight") is None)
+        return idle >= len(self.queue)
+
     def run(self, estimated_bytes, worker_count=1, max_wait="30s"):
         """Slice 1's whole dispatch loop: spawn up to worker_count workers,
         pull-dispatch the queue to whichever are idle, collect results via
@@ -1580,7 +1611,7 @@ class Supervisor:
         self._run_worker_count = worker_count
         if self.daemon_available:
             for _ in range(worker_count):
-                if not self.queue:
+                if self._pool_covers_the_queue():
                     break
                 try:
                     self.spawn_worker(estimated_bytes, max_wait=max_wait)
@@ -1621,7 +1652,7 @@ class Supervisor:
             # unavailable mid-startup-loop.
             remaining_pool = max(0, min(worker_count, self.max_workers_fallback) - len(self.workers))
             for _ in range(remaining_pool):
-                if not self.queue:
+                if self._pool_covers_the_queue():
                     break
                 self._spawn_fallback_worker()
         self._dispatch_to_idle_workers()
