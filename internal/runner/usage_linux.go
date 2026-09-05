@@ -20,22 +20,97 @@ type cgroupUsage struct {
 	// descendants. Good for "did anything under this scope get OOM-killed",
 	// which is what the reserve advisory and the peak-RSS report ask.
 	OOMKill *int64
-	// OOMKillLocal is memory.events.local's oom_kill: this cgroup ALONE. It is
-	// the only one that answers "was the job in THIS scope killed at THIS
-	// scope's limit", because memcg events propagate upward -- a worker
-	// sub-cgroup OOM-killed at its own cap raises the parent's hierarchical
-	// counter while the parent's leader is untouched. That is not a corner
-	// case here: AIRA's own aitest worker scopes are exactly such children, and
-	// it is the configuration AIRA-91 investigated.
+	// OOMKillLocal and OOMGroupKillLocal come from memory.events.LOCAL, which
+	// excludes descendants. Together they answer the question the hierarchical
+	// counter cannot: "did the OOM killer kill processes belonging to THIS
+	// scope?" -- as opposed to a worker sub-cgroup OOM-killed at ITS cap, which
+	// propagates upward onto this scope's hierarchical counter while this
+	// scope's own processes are untouched. That is not a corner case here:
+	// AIRA's own aitest worker scopes are exactly such children, and it is the
+	// configuration AIRA-91 investigated. Whose LIMIT fired is a different
+	// question and a different counter -- see OOMLocal below.
 	//
-	// Measured on this project's kernel (6.18) by
+	// BOTH fields are needed, and which one fires depends on where the victim
+	// lived, not on where the limit was. Measured directly on this project's
+	// kernel (6.18) and pinned by
 	// TestMemoryEventsLocalDistinguishesOwnLimitFromDescendantOOM:
-	//   OOM at the cgroup's own memory.max  -> events.local oom_kill > 0
-	//   OOM in a child cgroup               -> events oom_kill > 0, local == 0
-	//   external cgroup.kill                -> both stay 0
-	// and with memory.oom.group=1 (which every confine scope sets) the local
-	// counter still rises, alongside oom_group_kill.
-	OOMKillLocal *int64
+	//
+	//	victim directly in the capped scope   -> local oom_kill > 0
+	//	victim in a sub-cgroup of the capped
+	//	  scope, memory.oom.group=1 on it     -> local oom_kill == 0,
+	//	                                         local oom_group_kill > 0
+	//	OOM at a DESCENDANT's own cap          -> local oom_kill == 0 and
+	//	                                         local oom_group_kill == 0
+	//	                                         (hierarchical oom_kill > 0)
+	//	external cgroup.kill                   -> every counter stays 0
+	//
+	// The middle row is the one that matters most in practice: aitest drains the
+	// confined leader into a `.aira-supervisor` sub-cgroup, so `oom_kill` alone
+	// would miss a genuine OOM at the confine scope's own cap. `oom_group_kill`
+	// is keyed on the cgroup whose memory.oom.group was honoured -- this scope --
+	// and every confine scope sets memory.oom.group=1 fail-closed.
+	OOMKillLocal      *int64
+	OOMGroupKillLocal *int64
+	// OOMLocal is memory.events.local's `oom`: the max-breach declaration, which
+	// the kernel records on the cgroup WHOSE LIMIT FIRED, not on the victim's.
+	// It is the only counter that separates "our own cap was hit" from "an
+	// ancestor's cap was hit and our processes were the collateral" -- the
+	// AIRA-27 slice-OOM shape. Measured on this kernel by
+	// TestMemoryEventsLocalDistinguishesOwnLimitFromDescendantOOM:
+	//
+	//	our own cap fired            -> our local oom > 0
+	//	an ancestor's cap fired and
+	//	  our processes were killed  -> our local oom == 0, oom_kill > 0
+	//
+	// It is deliberately NOT part of LocalOOM: on its own it counts OOM
+	// declarations that killed nothing, and gating the verdict on it would turn
+	// a survivable pressure event into a reported death.
+	OOMLocal *int64
+}
+
+// OwnLimitOOM reports whether the OOM that killed this job fired at THIS
+// cgroup's own limit, as opposed to an ancestor's -- a slice-level OOM whose
+// victim happened to be us. Only meaningful once LocalOOM has established that
+// an OOM kill happened at all. `evaluated` is false when memory.events.local
+// could not be read, in which case the trailer says nothing about whose limit
+// fired rather than guessing.
+func (u cgroupUsage) OwnLimitOOM() (own bool, evaluated bool) {
+	if u.OOMLocal == nil {
+		return false, false
+	}
+	return *u.OOMLocal > 0, true
+}
+
+// LocalOOM reports whether the kernel's OOM killer killed processes belonging to
+// THIS cgroup, and whether that could be established at all. See the field
+// comments above for why it is a disjunction rather than a single counter.
+//
+// The one measured shape it misses: a scope WITHOUT memory.oom.group whose
+// victim lived in a sub-cgroup leaves both local kill counters at zero (only the
+// softer `oom` counter rises). Confine sets memory.oom.group fail-closed on
+// every scope it creates, so that shape cannot arise for a confined job.
+//
+// It says the OOM KILLER KILLED OUR PROCESSES. It does NOT say whose limit
+// fired -- OwnLimitOOM answers that, and note that a slice-level OOM caused by a
+// neighbour's usage reaches this the same way our own cap would, because
+// `oom_kill` is keyed on the victim's cgroup.
+//
+// A POSITIVE answer needs only one counter -- either is definitive on its own. A
+// NEGATIVE answer needs BOTH, because they cover different shapes: on a kernel
+// old enough to publish `oom_kill` without `oom_group_kill`, a zero `oom_kill`
+// cannot rule out the drained-leader OOM above, so the honest answer there is
+// unevaluated rather than "no OOM".
+func (u cgroupUsage) LocalOOM() (killed bool, evaluated bool) {
+	if u.OOMKillLocal != nil && *u.OOMKillLocal > 0 {
+		return true, true
+	}
+	if u.OOMGroupKillLocal != nil && *u.OOMGroupKillLocal > 0 {
+		return true, true
+	}
+	if u.OOMKillLocal == nil || u.OOMGroupKillLocal == nil {
+		return false, false
+	}
+	return false, true
 }
 
 func readCgroupUsage(scopePath string) cgroupUsage {
@@ -53,7 +128,10 @@ func readCgroupUsage(scopePath string) cgroupUsage {
 		usage.OOMKill = parseMemoryEvents(data)
 	}
 	if data, err := os.ReadFile(filepath.Join(scopePath, "memory.events.local")); err == nil {
-		usage.OOMKillLocal = parseMemoryEvents(data)
+		local := parseCgroupKeyValues(data)
+		usage.OOMKillLocal = local["oom_kill"]
+		usage.OOMGroupKillLocal = local["oom_group_kill"]
+		usage.OOMLocal = local["oom"]
 	}
 	return usage
 }
