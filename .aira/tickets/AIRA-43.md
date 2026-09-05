@@ -111,15 +111,72 @@ one `bufio.Reader`. Restructured so a single goroutine owns the reader for its
 whole life and reports its two events over two buffered channels; that also
 bounds the first-line read, which was previously unbounded.
 
-**Accepted coverage gaps, named rather than left silent.** Phase 2 is a
-"must not happen" assertion and therefore needs a dwell (1s); the flakiness
-direction is safe rather than merely tolerated, since a correct relay is parked
-in `io.Copy` on a pipe nothing has closed and cannot exit under any load, while
-a broken one returns microseconds after the line it has already written. The
-`admitSlots` observable is an implementation detail of AIRA-63 rather than a
-declared contract, so a future change that released the slot before parking on
-the lease would fail phase 2 without a real regression; it is used because it is
-the only daemon-side observable for "this lease is still held" and adding a
-production seam purely for a test was the worse trade. The test skips on a host
-without real cgroup-v2 delegation, per the standing `cgrouptest` policy, and
-hard-fails there under `AIRA_REAL_CGROUP=1`.
+## Build-review response (independent adversarial pass, PASS-WITH-CHANGES)
+
+An independent reviewer re-verified the build in its own throwaway worktree
+(new test `-count=5` stable, `-run TestWorkerAdmitCLI -race -count=3` clean, no
+leaked cgroups or stray relay processes even after a deliberately wedged relay),
+confirmed the stale-premise correction above from source, and wrote four
+mutations of its own. Two of its mutations were KILLED and add coverage the
+build did not claim — notably deleting the daemon's own post-grant park fails
+phase 2's `admitSlots` assertion, so that half catches a DAEMON-side regression,
+not only the CLI-side one. It also raised one P1 and three P2s, all findings
+about honesty rather than about the code, and all answered below rather than
+argued with.
+
+**Two claims in the original write-up were wrong and are corrected.**
+
+1. *"Nothing existing reaches the granted CLI path"* — **false**, and reworded
+   to "nothing existing ASSERTS it". `internal/pylib/pytest_aitest_e2e_test.go`'s
+   real-daemon-and-cgroup cases pass the freshly built binary as
+   `AIRA_AITEST_WORKER_ADMIT_CMD` and do execute the real granted relay. The
+   substantive claim survives — the reviewer applied mutation A there and those
+   tests stayed green, because every assertion they make is satisfied by a relay
+   that exits immediately after printing its grant — but "reaches" and "asserts"
+   are different claims and the stronger one was not true.
+2. *Phase 4 pins AIRA-41* — **overstated**.
+   `TestWorkerAdmitLedgerKeepsChargingAfterRelayCloses`
+   (`internal/daemon/worker_admit_test.go:596`, already carrying
+   `verifies: AIRA-41`) already asserts the invariant, against a stubbed
+   `workerScopeTree` and with no connection ever opened. Phase 4's real
+   contribution is narrower and is now stated as such: the real cgroup tree plus
+   the real `workerAdmitConnection` peer-disconnect path, which is why mutation
+   D is caught here and nowhere else.
+
+**Accepted coverage gaps, named rather than left silent.**
+
+- **Phase 2's hold assertion is bounded by the dwell, not by stdin EOF.** It
+  proves the lease is still held at t=1s; a regression that releases it LATER
+  survives. The reviewer demonstrated this: adding
+  `case <-time.After(2 * time.Second)` to the daemon's post-grant park leaves the
+  test green, and real aitest workers hold grants for minutes. Lengthening the
+  dwell only moves the threshold, and the alternative is a production seam that
+  announces lease state — machinery this project does not add for a
+  telemetry-grade signal. Documented on the constant and accepted.
+- **`lease.Close()` on the granted path is not pinned.** Deleting it leaves the
+  test green: process exit closes the socket fd anyway, so phase 3's
+  `admitSlots → 0` poll cannot distinguish the explicit call from kernel fd
+  teardown. The test pins the observable, not the call.
+- **`admitSlots` is an AIRA-63 implementation detail rather than a declared
+  contract**, so a future change that released the slot before parking on the
+  lease would fail phase 2 without a real regression. Used because it is the only
+  daemon-side observable for "this lease is still held"; the reviewer verified it
+  is sound today (exactly two acquire sites, one connection in this test, the
+  slot taken synchronously long before the grant frame, and `len()` on a channel
+  is not race-instrumented).
+- **Phase 1's `memory.max` row is a plain equality check**, not a floor test:
+  `request` is a whole number of MiB and already page-aligned. Only the
+  `memory.high` row exercises the page floor (reported 26843545, kernel 26841088).
+  Stated in the comment so a later reader does not assume both are load-bearing.
+- **The `estimatedBytes*4/5` watermark formula itself is unpinned** — a formula
+  change moves the reported value and the cgroup value together. Only
+  `0 < memory_high < memory_max` is asserted, which is what spec 3.3 actually
+  requires.
+- **The test skips on a host without real cgroup-v2 delegation**, per the
+  standing `cgrouptest` policy, and hard-fails there under `AIRA_REAL_CGROUP=1`.
+
+**Noted, not fixed here, out of this ticket's scope:** `.aira/tickets/AIRA-41.md`
+is still `"status":"planned"` although its fix is built and
+`worker_admit_test.go:591` has carried `verifies: AIRA-41` since before this
+change. This commit adds a second such marker. Flagged for the backlog owner
+rather than closing another ticket as a silent side effect.

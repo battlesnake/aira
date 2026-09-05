@@ -18,13 +18,26 @@ import (
 )
 
 // grantedRelayHoldDwell is how long the test watches a granted relay that must
-// NOT exit. It is a "must not happen" assertion, so a dwell is unavoidable —
-// but the flakiness direction is safe rather than merely tolerable: a CORRECT
-// relay is parked in io.Copy on a pipe that nothing has closed and can never
-// exit, no matter how loaded the host is, so load can only ever make this test
-// slower, never red. A BROKEN relay (the stdin-hold block deleted) returns from
-// main microseconds after the grant line it has already written, so the margin
-// here is ~3 orders of magnitude, not a tuned guess.
+// NOT exit.
+//
+// WHAT PHASE 2 THEREFORE PROVES, stated precisely because it is narrower than
+// the phase's name suggests: the lease is still held at t=dwell. It does NOT
+// prove the lease is held until stdin EOF. A regression that releases it LATER
+// than the dwell — a daemon that dropped its park after, say, two seconds —
+// survives this test, confirmed by mutation during build-review. Real aitest
+// workers hold grants for minutes, so that window is not empty. Lengthening the
+// dwell only moves the threshold rather than closing it, and the alternative
+// (a production seam that announces lease state) buys coverage with machinery
+// this project deliberately does not add for a telemetry-grade signal, so the
+// gap is recorded on AIRA-43 as accepted rather than papered over here.
+//
+// Separately, the FLAKINESS direction is safe rather than merely tolerable: a
+// correct relay is parked in io.Copy on a pipe that nothing has closed and
+// cannot exit no matter how loaded the host is, so load only ever makes this
+// slower, never red. A relay with the stdin-hold block deleted returns from main
+// microseconds after the line it has already written, so the margin is ~3 orders
+// of magnitude. That argument is about false-fails only; it says nothing about
+// the coverage bound above.
 const grantedRelayHoldDwell = 1 * time.Second
 
 // grantedRelayExitBudget bounds the opposite direction — the relay MUST exit
@@ -88,14 +101,27 @@ type relayExit struct {
 //     escalates to SIGKILL rather than reaping a cooperative exit, and any
 //     consumer that waits on a clean exit hangs.
 //
-// Existing coverage and why none of it reaches here: cmd/aira/worker_admit_test.go
-// and cmd/aira/worker_admit_outcome_test.go stop at argument parsing (their
-// stdin is a spent strings.Reader, so the hold below returns instantly and
-// proves nothing); worker_admit_cli_boundary_test.go drives the real binary but
-// only over denied/timeout/unevaluated, because a grant needs a real cgroup for
-// the daemon's CreateWorkerScope and its fixture stubs the tree away; and every
-// Python supervisor test replaces the CLI with a stub script, so it tests the
-// supervisor's half of this contract against a fixture of the other half.
+// Existing coverage, and why nothing existing ASSERTS this contract. The
+// distinction is deliberate: one existing test does REACH the granted relay,
+// which is not the same as pinning it, and an earlier draft of this comment
+// claimed nothing reached it at all (corrected on build-review).
+//
+//   - cmd/aira/worker_admit_test.go and cmd/aira/worker_admit_outcome_test.go
+//     stop at argument parsing, and pass a spent strings.Reader as stdin, so the
+//     hold below returns instantly and proves nothing.
+//   - worker_admit_cli_boundary_test.go drives the real binary but only over
+//     denied/timeout/unevaluated: a grant needs a real cgroup for the daemon's
+//     CreateWorkerScope, and its fixture stubs the tree away.
+//   - internal/pylib/pytest_aitest_e2e_test.go's real-daemon-and-cgroup cases DO
+//     execute the real granted relay — they pass the freshly built binary as
+//     AIRA_AITEST_WORKER_ADMIT_CMD. But every assertion they make (pytest
+//     pass/fail lines, the absence of the unconfined-fallback warning) is
+//     satisfied by a relay that exits immediately after printing its grant:
+//     deleting the stdin-hold block leaves them green, verified by mutation on
+//     build-review. They reach the code; they do not constrain it.
+//   - Every Python supervisor test replaces the CLI with a stub script, so it
+//     tests the supervisor's half of this contract against a fixture of the
+//     other half.
 //
 // NOTE ON THE TICKET'S OWN PREMISE, corrected here rather than reproduced:
 // AIRA-43 describes Regression A as defeating the ledger, and proposes asserting
@@ -214,11 +240,19 @@ func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 	}
 	// The line's placement coordinates must name a cgroup that really carries
 	// them. floorMemoryPage is what writeScopeMemoryCap itself verifies against,
-	// mirrored here rather than imported (it is unexported in internal/runner).
+	// mirrored here in its exact bitmask form rather than imported (it is
+	// unexported in internal/runner).
+	//
+	// Only the memory.high row actually exercises the floor: `request` is a whole
+	// number of MiB and so already page-aligned, whereas the daemon reports the
+	// UNFLOORED estimatedBytes*4/5 (26843545 for a 32MiB request) while the
+	// kernel holds 26841088. The memory.max row is a plain equality check and is
+	// stated that way so a later reader does not assume otherwise.
 	page := int64(os.Getpagesize())
+	floorPage := func(value int64) string { return strconv.FormatInt(value&^(page-1), 10) }
 	for _, check := range []struct{ file, want string }{
-		{file: "memory.max", want: strconv.FormatInt(request/page*page, 10)},
-		{file: "memory.high", want: strconv.FormatInt(grantedHigh/page*page, 10)},
+		{file: "memory.max", want: floorPage(request)},
+		{file: "memory.high", want: floorPage(grantedHigh)},
 		{file: "memory.oom.group", want: "1"},
 	} {
 		data, err := os.ReadFile(filepath.Join(scopePath, check.file))
@@ -282,12 +316,20 @@ func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 	}
 
 	// --- Phase 4 (AIRA-41): releasing the lease frees NO ledger capacity. ---
-	// This is the invariant AIRA-43's own text has backwards, and it is worth
-	// pinning through the real relay: the ledger charges the SCOPE, so a killed
-	// or exited relay can no longer silently free capacity while its worker is
-	// still alive under a still-intact cap. Only removing the scope releases it,
-	// which is supervisor.py's _forget_worker_scope, after it has reaped the
-	// worker.
+	// The ledger charges the SCOPE, so a killed or exited relay can no longer
+	// silently free capacity while its worker is still alive under a still-intact
+	// cap; only removing the scope releases it, which is supervisor.py's
+	// _forget_worker_scope, after it has reaped the worker. This is the invariant
+	// AIRA-43's own text has backwards.
+	//
+	// The invariant itself is NOT newly pinned here, and an earlier draft of this
+	// comment implied it was (corrected on build-review):
+	// TestWorkerAdmitLedgerKeepsChargingAfterRelayCloses already asserts it. That
+	// test drives evaluateWorkerAdmit directly against a STUBBED workerScopeTree
+	// and never opens a connection, so what phase 4 adds on top of it is
+	// narrower and worth exactly that much: the real cgroup tree, and the real
+	// workerAdmitConnection peer-disconnect path — which is why a daemon-side
+	// rmdir-on-disconnect is caught here and nowhere else.
 	children, err := scanWorkerScopeChildren(outer)
 	if err != nil {
 		t.Fatalf("scan the real outer scope after the lease closed: %v", err)
