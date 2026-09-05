@@ -1,10 +1,14 @@
 package daemon
 
 import (
+	"bytes"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
+	"aira/internal/core"
 	"aira/internal/runner"
 )
 
@@ -96,6 +100,98 @@ func TestConfineReservationRowsAreLongestHeldFirstAndCapped(t *testing.T) {
 	t.Run("no-reservations-is-nil-not-an-empty-row", func(t *testing.T) {
 		if got := confineReservationRows(nil); got != nil {
 			t.Fatalf("got %+v, want nil", got)
+		}
+	})
+}
+
+// AIRA-108 build-review (Sol, P1). A client-supplied signature is bounded WHERE
+// IT IS RETAINED, and this is an availability property, not neatness.
+//
+// validateAdmitArgs accepts `signature` as any string, so its only real limit is
+// the 16 MiB admit frame. Before this bound, a handful of reservations carrying
+// multi-megabyte signatures pushed the whole confine-list response past
+// MaxFrameBytes — writeFrame then refuses the ENTIRE response and `confine
+// --list` stops working for every job on that slice. A diagnostic added to
+// explain a wedge would itself have become one.
+//
+// verifies: AIRA-108
+func TestConfineReservationSignaturesAreBoundedOnTheWire(t *testing.T) {
+	t.Run("an-absurd-signature-is-truncated-and-marked", func(t *testing.T) {
+		huge := strings.Repeat("x", 4<<20)
+		bounded := boundedAdmitSignature(huge)
+		if len([]rune(bounded)) != runner.ConfineReservationSignatureWireLimit+1 {
+			t.Fatalf("bounded to %d runes, want the %d-rune limit plus a truncation marker",
+				len([]rune(bounded)), runner.ConfineReservationSignatureWireLimit)
+		}
+		if !strings.HasSuffix(bounded, "…") {
+			t.Fatalf("truncation was not marked: %q", bounded[len(bounded)-8:])
+		}
+	})
+
+	// A realistic pytest nodeid must survive intact — a bound that clipped real
+	// signatures would trade one diagnostic failure for another.
+	t.Run("a-real-nodeid-is-untouched", func(t *testing.T) {
+		real := "pytest:tools/correctness/test_dispatch_coverage.py::test_board_temp_range_has_a_reader_and_is_not_on_the_allowlist"
+		if got := boundedAdmitSignature(real); got != real {
+			t.Fatalf("a real nodeid was altered: %q", got)
+		}
+	})
+
+	// Cutting on a rune boundary, not a byte: a split rune becomes U+FFFD in JSON,
+	// so the wire would carry a corrupted string an operator cannot match against
+	// a real test id.
+	t.Run("truncation-keeps-valid-utf8", func(t *testing.T) {
+		bounded := boundedAdmitSignature(strings.Repeat("é", 4096))
+		if !utf8.ValidString(bounded) {
+			t.Fatalf("truncation produced invalid UTF-8: %q", bounded)
+		}
+		if strings.ContainsRune(bounded, utf8.RuneError) {
+			t.Fatalf("truncation split a rune: %q", bounded)
+		}
+	})
+
+	// The property that actually matters, asserted through the REAL serialiser
+	// rather than by arithmetic on the limit: a full slice of maximally-long
+	// signatures must still produce a frame writeFrame accepts.
+	t.Run("a-full-capped-response-still-serialises", func(t *testing.T) {
+		rows := make([]admitReservationRow, 0, runner.ConfineReservationRowLimit)
+		for i := 0; i < runner.ConfineReservationRowLimit; i++ {
+			rows = append(rows, admitReservationRow{
+				signature: boundedAdmitSignature(strings.Repeat("x", 4<<20)),
+				reserve:   1 << 30, heldMS: int64(i),
+			})
+		}
+		result := runner.ConfineListResult{
+			Verdict: "pass", Scopes: []runner.ConfineRecord{},
+			SliceReserve: &runner.ConfineSliceReserve{
+				ReservationJobs: runner.ConfineReservationRowLimit,
+				Reservations:    confineReservationRows(rows),
+			},
+		}
+		var buffer bytes.Buffer
+		if err := writeFrame(&buffer, responseFrame(core.Response{OK: true, Code: "OK", Data: result})); err != nil {
+			t.Fatalf("a capped confine-list response was refused by its own serialiser: %v", err)
+		}
+		if buffer.Len() > MaxFrameBytes {
+			t.Fatalf("frame is %d bytes, over the %d limit", buffer.Len(), MaxFrameBytes)
+		}
+	})
+
+	// And the unbounded shape really would have broken it — so the test above is
+	// not vacuously green against a build that never had the bound.
+	t.Run("the-unbounded-shape-would-have-broken-the-frame", func(t *testing.T) {
+		rows := make([]admitReservationRow, 0, runner.ConfineReservationRowLimit)
+		for i := 0; i < runner.ConfineReservationRowLimit; i++ {
+			rows = append(rows, admitReservationRow{signature: strings.Repeat("x", 4<<20), reserve: 1 << 30, heldMS: int64(i)})
+		}
+		result := runner.ConfineListResult{
+			Verdict: "pass", Scopes: []runner.ConfineRecord{},
+			SliceReserve: &runner.ConfineSliceReserve{Reservations: confineReservationRows(rows)},
+		}
+		var buffer bytes.Buffer
+		if err := writeFrame(&buffer, responseFrame(core.Response{OK: true, Code: "OK", Data: result})); err == nil {
+			t.Fatalf("40MiB of signatures serialised into a %d-byte frame; the frame limit is not the "+
+				"backstop this test assumes, so the bound above is not load-bearing", buffer.Len())
 		}
 	})
 }

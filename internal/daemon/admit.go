@@ -153,12 +153,24 @@ type admitWaiter struct {
 	owner        string
 	scopeCeiling int64
 
-	// AIRA-108. The client's own resource signature, retained purely so
-	// `confine --list` can NAME a scope-less reservation rather than report it
-	// only as one more unit in an aggregate. It takes part in NO admission
-	// decision — resolveAdmitReserve reads request.signature directly, and always
-	// did — so a malformed or hostile value can only ever affect what an operator
-	// is shown, and every renderer escapes and truncates it before printing.
+	// AIRA-108. A BOUNDED copy of the client's own resource signature, retained
+	// purely so `confine --list` can NAME a scope-less reservation rather than
+	// report it only as one more unit in an aggregate. It takes part in NO
+	// admission decision — resolveAdmitReserve reads request.signature directly,
+	// and always did — so a malformed or hostile value can only ever affect what
+	// an operator is shown.
+	//
+	// BOUNDED is load-bearing, not tidiness (found by Sol build-review).
+	// validateAdmitArgs accepts `signature` as any string, so its only real limit
+	// is the 16 MiB admit frame. Retaining it verbatim would put an
+	// attacker-chosen multi-megabyte string on a LONG-LIVED waiter (up to
+	// admitMaxWaiters of them) and, worse, into every confine-list reply: a
+	// handful of such rows exceeds MaxFrameBytes, writeFrame refuses the WHOLE
+	// response, and `confine --list` stops working for every job on that slice —
+	// an availability defect introduced by a diagnostic. Truncation happens HERE,
+	// at the one place the value is retained, so the memory and the wire are
+	// bounded together; the renderer's escaping is a second, narrower bound for
+	// the terminal.
 	signature string
 
 	// AIRA-68. scopeSeen/scopeVanished record a TRANSITION observed by the
@@ -772,6 +784,30 @@ type admitSnapshot struct {
 	reservations []admitReservationRow
 }
 
+// boundedAdmitSignature bounds the DIAGNOSTIC copy of a client-supplied
+// signature. See admitWaiter.signature for why this is required rather than
+// cosmetic.
+//
+// The bound is on RUNES, and truncation is MARKED with an ellipsis, so a reader
+// can always tell a real short signature from a clipped long one. Cutting on a
+// rune boundary keeps the value valid UTF-8, which a byte slice would not: a
+// JSON encoder turns a split rune into U+FFFD, so the wire would carry a
+// corrupted string the operator could not match against a real test id.
+//
+// The ORIGINAL is untouched — admission reads request.signature — so nothing
+// about which jobs are admitted, or at what reserve, changes here.
+func boundedAdmitSignature(signature string) string {
+	const limit = runner.ConfineReservationSignatureWireLimit
+	count := 0
+	for index := range signature {
+		if count == limit {
+			return signature[:index] + "…"
+		}
+		count++
+	}
+	return signature
+}
+
 // admitReservationRow is one scope-less reservation, copied out of a waiter
 // under queue.mu.
 type admitReservationRow struct {
@@ -1354,7 +1390,7 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 		return nil, nil, CodeProtocol, fmt.Errorf("%s: admission arrival sequence overflow", CodeProtocol)
 	}
 	queue.seq++
-	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, signature: request.signature, exclusive: request.exclusive, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID}
+	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, signature: boundedAdmitSignature(request.signature), exclusive: request.exclusive, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID}
 	queue.waiters = append(queue.waiters, waiter)
 	queue.signal()
 	return queue, waiter, "", nil

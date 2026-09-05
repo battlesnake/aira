@@ -153,6 +153,14 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		server.admitResolveSlice = func(string) (string, bool, string) { return path, true, "" }
 		server.admitSliceHeadroomBase = base
 		server.admitSliceHeadroomSupervisor = supervisor
+		// AIRA-108: FREEZE the clock for this unit fixture. The reservation row's
+		// age is `now - grantedAt`, so a real clock plus a fixed grantedAt makes
+		// the expected HeldMS depend on how long the test took to reach the
+		// snapshot — a correct build goes red on a 1ms scheduling delay (found by
+		// Sol build-review). The integration tests keep real time, where the age
+		// is asserted as a lower bound rather than an equality.
+		frozen := time.Now()
+		server.admitNow = func() time.Time { return frozen }
 		queue := &sliceQueue{path: path, server: server, outstanding: granted, outstandingJobs: jobs, adopted: adopted, adoptedJobs: adoptedJobs}
 		queue.waiters = []*admitWaiter{
 			{seq: 1, reserve: scopeBackedBytes, state: admitGranted, accounted: true, grantedCh: make(chan struct{}), scopeID: "CONFINE-job-5101-abc", name: "job", owner: "session-a"},
@@ -160,7 +168,7 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 			// instant `confine --list` now names it by, so this fixture exercises
 			// the reservation ROW as well as the aggregate it used to be.
 			{seq: 2, reserve: reservationBytes, state: admitGranted, accounted: true, grantedCh: make(chan struct{}),
-				signature: "pytest:tools/test_x.py::test_y", grantedAt: server.admitNowTime().Add(-90 * time.Second)},
+				signature: "pytest:tools/test_x.py::test_y", grantedAt: frozen.Add(-90 * time.Second)},
 		}
 		server.admitQueues[path] = queue
 		return server, path

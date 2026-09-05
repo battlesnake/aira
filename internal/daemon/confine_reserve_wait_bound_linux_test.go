@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -256,26 +257,36 @@ func TestConfineReserveWaitIsBoundedByTheClientAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	accepted := make(chan net.Conn, 4)
+	// Accepted connections are tracked under a mutex rather than published on a
+	// channel the cleanup closes. A channel invites the classic asynchronous
+	// "send on closed channel" panic: closing the listener stops new accepts but
+	// does NOT finish a reader goroutine already mid-request, so it can send after
+	// cleanup has closed the channel and crash the whole test binary — a failure
+	// that would land on an unrelated test (found by Sol build-review).
+	var connectionsMu sync.Mutex
+	var connections []net.Conn
 	go func() {
 		for {
 			conn, acceptErr := listener.Accept()
 			if acceptErr != nil {
 				return
 			}
+			connectionsMu.Lock()
+			connections = append(connections, conn)
+			connectionsMu.Unlock()
 			// Hold the connection open and never write. Reading the request first
 			// makes this a daemon that RECEIVED the request and went silent — the
 			// wedged-daemon case — rather than one that simply never read it.
 			go func(c net.Conn) {
 				buffer := make([]byte, 4096)
 				_, _ = c.Read(buffer)
-				accepted <- c
 			}(conn)
 		}
 	}()
 	t.Cleanup(func() {
-		close(accepted)
-		for conn := range accepted {
+		connectionsMu.Lock()
+		defer connectionsMu.Unlock()
+		for _, conn := range connections {
 			_ = conn.Close()
 		}
 	})
@@ -398,15 +409,28 @@ func TestConfineReserveGrantOutlivesTheDeclaredBound(t *testing.T) {
 	// The daemon must let the reserve go too. "The process exited" alone would
 	// still pass a helper that closed its lease and only then blocked, or a
 	// daemon that kept the charge after the peer vanished.
+	//
+	// The INCREMENTAL counters are asserted alongside the derived walk, and that
+	// pairing is the point (found by Sol build-review): reservationJobs and
+	// reservations are BOTH derived by walking queue.waiters, so a release that
+	// dropped the waiter while leaving `outstanding`/`outstandingJobs` charged
+	// would satisfy them both and leak ledger capacity silently. residual* is
+	// exactly the cross-check for that, and this fixture is isolated enough to
+	// demand a hard zero on every one of them.
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		snapshot := server.admitSliceSnapshot(slice)
-		if snapshot.reservationJobs == 0 && len(snapshot.reservations) == 0 {
+		released := snapshot.reservationJobs == 0 && len(snapshot.reservations) == 0 &&
+			snapshot.outstanding == 0 && snapshot.outstandingJobs == 0 &&
+			snapshot.residualJobs() == 0 && snapshot.residualBytes() == 0
+		if released {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the ledger still charges %d reservation(s) 30s after the holder exited",
-				snapshot.reservationJobs)
+			t.Fatalf("30s after the holder exited the ledger still holds rows=%d reservationJobs=%d "+
+				"outstanding=%d outstandingJobs=%d residualJobs=%d residualBytes=%d",
+				len(snapshot.reservations), snapshot.reservationJobs, snapshot.outstanding,
+				snapshot.outstandingJobs, snapshot.residualJobs(), snapshot.residualBytes())
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

@@ -249,6 +249,16 @@ const ConfineReservationStateHolding = "holding"
 // truncates rather than trusting it to be reasonable.
 const ConfineReservationSignatureLimit = 96
 
+// ConfineReservationSignatureWireLimit bounds the signature the DAEMON retains
+// and puts on the wire, and it exists for availability, not neatness: the admit
+// protocol accepts a signature of any length up to the 16 MiB frame, so an
+// unbounded diagnostic copy would let a few hostile (or merely absurd)
+// reservations push the whole confine-list response past MaxFrameBytes — at
+// which point `confine --list` fails for every job on that slice. It is wider
+// than the render limit on purpose: a JSON consumer should get the full nodeid
+// of any realistic caller, while the terminal gets a line it can display.
+const ConfineReservationSignatureWireLimit = 512
+
 // ConfineReservationRowLimit is how many reservation rows a renderer prints. The
 // rest are reported as a count, never dropped silently: a suite with 40 workers
 // must not turn `confine --list` into a wall of text, and must not be able to
