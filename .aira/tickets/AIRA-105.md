@@ -21,6 +21,16 @@ How long can an adopted-scope ledger entry survive after its underlying supervis
 
 An orphaned, empty test-artifact cgroup (`aira103probe`) was sitting directly under the real `aira.slice` — left behind by AIRA-103's build agent's own real-cgroup testing, contrary to that build's explicit instruction to use an isolated test slice/cgroup, never the shared one. It was empty (0 processes) and has been `rmdir`'d directly by the coordinating session as a trivial, safe cleanup — not itself connected to the adopted-scope question above, but worth a note in AIRA-103's own follow-up that its test isolation should be checked, in case other real-cgroup tests in that PR have the same leak (harmless when empty, but pollutes the shared slice's directory listing for anyone inspecting it, as it did here).
 
+## Precise facts, field's own record (2026-09-05, timestamped rather than recollected)
+
+- `ps -p 4096382` returned no row (confirmed dead).
+- Scope: `LIVE=no`, `LEAF-PROCS=0`, `RSS 3358138368` (3.36GB), age at observation `25m46s`.
+- Full scope id: `CONFINE-@dr-job-4096382-dl7m7z83v8x5@@cwd-bl981-h`.
+- Reserve line at the time: `62725860K granted / 63232M ceiling`, `1 queued waiter`, `free -g` showing 45GB available.
+- **The `@dr-` prefix is field's own suggested lead, worth chasing first**: every other (healthy) scope in that listing carried the ordinary `job-` prefix. Not decoded here — whoever picks this up should trace what mints an `@dr-`-prefixed scope id (a delegate-ram-relay path? a specific launch mode?) and whether that path has a distinct (and possibly slower) adoption/cleanup story from the ordinary `job-` one.
+
+field's own framing of what matters, worth carrying forward verbatim: *"not is there a leak, but how long can the window get, and should the reconstruction scan be liveness-checked rather than passively cyclic. A stale reservation that clears in five minutes is a curiosity; one that clears in fifty starves a long session. Only measurement separates them."* The 25m46s age at observation (not necessarily the full dead-window, since field's own report doesn't establish exactly when the supervisor died relative to that age) is the one concrete data point so far — treat it as a lower bound on the window, not a measured value of it.
+
 ## Not scoped or built here
 
 Whether the self-heal latency is acceptable as-is, needs a tighter refresh interval, needs an active "supervisor liveness" check rather than waiting for the next scan, or some other direction — needs tracing the actual code path and, ideally, a way to reproduce the dead-supervisor-still-adopted window on demand (kill a supervisor mid-test, observe how many scan cycles pass before it clears) rather than relying on an incidental live observation.
