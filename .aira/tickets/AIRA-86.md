@@ -160,4 +160,57 @@ consumer cannot tell "evaluated, nothing wrong" from "not evaluated". That is
 not a fabricated pass (an absent key claims nothing) and it is out of this
 ticket's fourteen-dimension scope, so it is reported here rather than changed.
 
+### Independent verification (2026-09-05): two porous spots, now closed
+
+An independent pass re-derived the fix against source in a detached worktree at
+the merge commit (`2b3a3e0`) rather than trusting the build report. The fix
+itself holds:
+
+- The deviation from the plan's literal wording (the plan said "seed all
+  fourteen `unevaluated`"; the fix starts the map empty and `finaliseDimensions`
+  reports the unestablished) is sound and strictly more informative. Verified
+  structurally: `Check` has exactly two `return report, ...` paths — the
+  cancelled-context one, which writes all fourteen `unevaluated` itself, and the
+  final one, which runs after `finaliseDimensions`. Every other return is
+  `CheckReport{}, err`, an empty report the caller reports as an error. So no
+  reachable path returns a report with a dimension silently absent.
+- No regression in the `eject` durability gate: `ejectDurabilityFinding`
+  (`internal/daemon/eject.go:239-244`) consults eight dimensions, all of which
+  are established unconditionally on `Check`'s success path, and it already
+  treats an absent dimension (`""`) as nothing to report.
+- The refuted build-review finding is correctly refuted: all nine direct
+  `Dimensions["allocated-id-file"] = "fail"` sites append a finding in the same
+  block, checked line by line.
+- Re-run at `2b3a3e0`: `go build ./...` exit 0, `go vet ./internal/... ./cmd/...`
+  exit 0, `go test ./... -count=1` (whole module) exit 0.
+
+A ten-mutation sweep (five re-deriving the build report's, five new) found
+**three survivors**, of which two were real coverage gaps in the merged work —
+the fix's behaviour was right, the tests did not pin it:
+
+- **Deleting the `finaliseDimensions(&report)` call from `Check` was invisible
+  to the whole module.** Every dimension shipped today is established by its
+  checker or demoted by one of its own findings, so the map is fully populated
+  with or without the call, and the existing test exercises the helper in
+  isolation rather than its wiring. The case the call exists for — a dimension
+  in the canonical list that no checker establishes, which is the *only*
+  behaviour the AIRA-86 fix adds over the status quo — had no coverage at all.
+  Now pinned by `TestCheckReportsADimensionNoCheckerEstablishedAsUnevaluated`.
+- **Deleting both `unevaluateDimension(report, "ticket-file-integrity")` calls
+  in `checkDuplicateIDs` was invisible to the whole module**, and the mutant
+  reports `ticket-file-integrity: pass` for a worktree whose ticket scan was
+  inconclusive — the same fabricated green as the seed, one dimension wide.
+  (`checkStaleIndex`'s own inconclusive arm records only `stale-index`, so it
+  cannot stand in for it.) Now pinned by
+  `TestCheckDoesNotEstablishTicketFileIntegrityForAWorktreeItCouldNotScan`,
+  which drives the real `scanReadHook` seam rather than asserting on a
+  hand-built report.
+
+Both new tests were themselves mutation-verified: each fails against its
+mutation and passes against the shipped code.
+
+The third survivor — removing the `len(gateReport.Results) > 0` guard in
+`checkGatesReadOnly` — is an equivalent mutant today, exactly as this ticket's
+"honest coverage gap" note above already states. It stays named, not fixed.
+
 Plan: docs/superpowers/plans/2026-09-04-backlog-remediation-plan.md (Phase 2)
