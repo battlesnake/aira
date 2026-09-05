@@ -28,3 +28,23 @@ split's own framing: "is 'run slowbuild on a quiet slice' the accepted answer, o
 3. fastest-ee-side: serialize/queue heavy build-subprocess-spawning recipes specifically, independent of any AIRA-side fix.
 
 Not urgent per split ("not blocking me — I route packaging-closure relocations through the aitest-governed `test_packaging.py` path and accept the full slowbuild cost proportionately"). Recorded so the finding and the scope boundary aren't lost.
+
+## Finding 1 (routing) closed — fastest-ee #1157 (split, 2026-09-05)
+
+`test-lite-slowbuild` now delegates to `FASTEST_RUN_SLOWBUILD=1 make test-lite`
+— the same form `scripts/impacted_test_run.sh`/`run-affected` already use — so
+it reaches the one resolver home transitively rather than via a second copy of
+the resolver/case block (Fable's review steered away from the initially-planned
+duplicated-block shape). It also now inherits `--junitxml` and
+`FASTEST_TEST_PATHS` narrowing for free. Behaviour is unchanged by default
+(already `-n auto` under `aira_xdist_governor`); the only delta is it now
+honours an exported `FASTEST_XDIST_WORKERS`. Deliberately still routes to
+**plain xdist, not aitest** — same rationale as the rest of this ticket: the
+build/packaging subprocess load would OOM a 512MiB aitest worker. Verified
+end-to-end under real `aira confine --delegate-ram` (narrowed to
+`test_tiers.py`): 17 passed. Every fastest-ee pytest recipe now reaches the
+resolver.
+
+**Finding 2 (the structural build-subprocess-governance gap) is unchanged and
+still fully open** — this was a routing/consistency fix, not a governance
+mechanism. The three candidate directions above remain undecided.
