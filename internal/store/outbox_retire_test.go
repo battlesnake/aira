@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"aira/internal/domain"
 )
@@ -1105,12 +1106,20 @@ func TestRetireHoldsTheFindingLockAgainstAConcurrentReconcile(t *testing.T) {
 		_, err := retirer.RetireIntent(ctx, fmt.Sprint(intent.Seq))
 		retireDone <- err
 	}()
-	// The reconcile holds the finding lock for its whole pass, so the retire
-	// must not have completed while it is parked.
+
+	// The load-bearing assertion is the FINAL state, not the timing: while the
+	// lock is held the retire cannot run, so it deletes the finding this
+	// reconcile pass wrote. Without the lock the retire runs here — before the
+	// finding exists — deletes nothing, and reconcile then leaves a stale
+	// conflict finding for an intent that no longer exists.
+	//
+	// The bounded wait is only how a missing lock is given its chance to show.
+	// Its flake direction is safe: a slow machine lets the wait expire and the
+	// test pass; it can never turn correct code red.
 	select {
 	case err := <-retireDone:
 		t.Fatalf("retire completed while reconcile held the finding lock: %v", err)
-	default:
+	case <-time.After(2 * time.Second):
 	}
 	close(release)
 	if err := <-reconcileDone; !errors.Is(err, ErrWriteConflict) {
@@ -1121,6 +1130,59 @@ func TestRetireHoldsTheFindingLockAgainstAConcurrentReconcile(t *testing.T) {
 	}
 	if hasFindingKey(t, retirer, reconcileFindingKey(retirer.worktreeID, intent.Seq)) {
 		t.Fatal("a stale reconciliation finding survived the retire")
+	}
+	if got := retirerPendingCount(t, retirer); got != 0 {
+		t.Fatalf("pending=%d after the retire, want 0", got)
+	}
+}
+
+func retirerPendingCount(t *testing.T, s *Store) int {
+	t.Helper()
+	var pending int
+	if err := s.db.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM outbox WHERE project_id=? AND materialised=0`, s.projectID).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	return pending
+}
+
+// TestRetireCrashOnAnAllocationIntentDoesNotPoisonTheReceipts is the test the
+// parked retire row's EMPTY allocation_id exists for.
+//
+// reconcile's receipt-repair branch uses a row's own path and seq. The retire
+// event's row has an empty path, so if it carried the allocation id, a crash
+// before the journal append followed by a reconcile would append a receipt with
+// an EMPTY path — and the next Rebuild would fail wholesale on
+// reconcileAllocationKind's "path outside the entity directories". Retiring a
+// project would therefore make it unrebuildable.
+//
+// Reaching that needs all three: an allocation-bearing intent, a crash that
+// leaves the retire row unjournaled, and a reconcile pass before the rebuild.
+func TestRetireCrashOnAnAllocationIntentDoesNotPoisonTheReceipts(t *testing.T) {
+	f := newAllocationFixture(t, true)
+	ctx := context.Background()
+	f.store.afterRetireJournalCommit = func() error { return errors.New("E_RECEIPT_IO: simulated crash") }
+	if _, err := f.store.RetireIntent(ctx, fmt.Sprint(f.intent.Seq)); err == nil {
+		t.Fatal("the injected crash did not surface")
+	}
+	f.store.afterRetireJournalCommit = nil
+
+	// reconcile drives the parked retire row, including its receipt-repair
+	// branch if the row wrongly carries the allocation id.
+	if err := f.store.reconcile(ctx); err != nil {
+		t.Fatalf("reconcile after the crash = %v, want nil", err)
+	}
+	receipts, err := readReceipts(filepath.Join(f.store.auditDir, "receipts.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, receipt := range receipts {
+		if receipt.Path == "" {
+			t.Fatalf("a receipt with an empty path was written: %+v — the retire row carried the allocation id", receipt)
+		}
+	}
+	if err := f.store.Rebuild(ctx); err != nil {
+		t.Fatalf("rebuild after a crashed allocation retire: %v", err)
 	}
 }
 
