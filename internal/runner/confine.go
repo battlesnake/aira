@@ -202,11 +202,16 @@ const (
 	// ConfineTerminatedUnattributedSIGKILL: a SIGKILL that neither this
 	// supervisor nor this scope's own OOM counter accounts for. NOT named
 	// "external-cgroup-kill", which the earlier plan draft proposed: an
-	// external kill -9 on the leader, a job that SIGKILLs itself, and an
-	// ancestor-cgroup OOM (memcg events propagate upward, leaving this scope's
-	// counter at zero) all share this exact signature, so naming one mechanism
-	// would assert a cause the evidence cannot establish. The candidate
-	// mechanisms are named on the trailer's candidates line instead.
+	// external kill -9 on the leader and a job that SIGKILLs itself share this
+	// exact signature, so naming one mechanism would assert a cause the
+	// evidence cannot establish. The candidate mechanisms are named on the
+	// trailer's candidates line instead.
+	//
+	// An ancestor-cgroup OOM is NOT among them, contrary to earlier revisions
+	// of this comment: oom_kill is keyed on the VICTIM's cgroup, so an ancestor
+	// OOM that killed our processes raises OUR local counter and lands on
+	// ConfineTerminatedOOM instead. Measured, not reasoned --
+	// TestMemoryEventsLocalDistinguishesOwnLimitFromDescendantOOM.
 	ConfineTerminatedUnattributedSIGKILL = "unattributed-sigkill"
 	// ConfineTerminatedUnevaluated: the wait status could not be decoded, or the
 	// child was SIGKILLed and memory.events could not be read -- in which case

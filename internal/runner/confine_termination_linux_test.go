@@ -31,13 +31,18 @@ func TestClassifyConfineTermination(t *testing.T) {
 	// the classifier reads memory.events.LOCAL, and the descendant rows below
 	// pin that it ignores the hierarchical one.
 	readable := func(count int64) cgroupUsage {
-		return cgroupUsage{OOMKill: int64ptr(count), OOMKillLocal: int64ptr(count)}
+		return cgroupUsage{OOMKill: int64ptr(count), OOMKillLocal: int64ptr(count), OOMGroupKillLocal: int64ptr(0)}
 	}
 	// descendantOOM is the shape a worker sub-cgroup OOM-killed at ITS OWN cap
 	// leaves on this scope: the hierarchical counter rises, the local one does
 	// not. Measured against real cgroups by
 	// TestMemoryEventsLocalDistinguishesOwnLimitFromDescendantOOM.
-	descendantOOM := cgroupUsage{OOMKill: int64ptr(2), OOMKillLocal: int64ptr(0)}
+	descendantOOM := cgroupUsage{OOMKill: int64ptr(2), OOMKillLocal: int64ptr(0), OOMGroupKillLocal: int64ptr(0)}
+	// The aitest drained-leader shape: a genuine OOM at THIS scope's cap whose
+	// victim lived one cgroup down, so oom_kill (keyed on the victim) stays 0
+	// while oom_group_kill (keyed on the cgroup whose memory.oom.group was
+	// honoured -- ours) rises.
+	drainedOOM := cgroupUsage{OOMKill: int64ptr(2), OOMKillLocal: int64ptr(0), OOMGroupKillLocal: int64ptr(1)}
 	unreadable := cgroupUsage{}
 
 	for _, test := range []struct {
@@ -87,6 +92,16 @@ func TestClassifyConfineTermination(t *testing.T) {
 			name: "a descendant cgroup's OOM does not relabel a clean exit either", term: exited, usage: descendantOOM,
 			want: "normal",
 			why:  "branch 4: the leader exited; a worker's OOM is a different fact, and the reserve advisory still speaks for it",
+		},
+		{
+			name: "an OOM at our cap is seen even when the leader was drained into a sub-cgroup", term: signalled(syscall.SIGKILL), usage: drainedOOM,
+			want: "oom",
+			why:  "branch 2 via LocalOOM's oom_group_kill leg: aitest drains the leader into .aira-supervisor, so oom_kill (keyed on the victim's cgroup) stays 0 for a REAL OOM at our own cap -- reading it alone would report a kernel OOM of every real aitest run as unattributed-sigkill",
+		},
+		{
+			name: "the drained-OOM shape still needs the leader to have been SIGKILLed", term: exited, usage: drainedOOM,
+			want: "normal",
+			why:  "branch 2's SIGKILL guard holds on this leg too",
 		},
 		{
 			name: "supervisor signal wins over a caught-and-exited child", term: exited, usage: readable(0), supervisor: syscall.SIGTERM,
@@ -158,11 +173,11 @@ func TestFormatConfineStatusReportsTerminatedByFacet(t *testing.T) {
 // the unattributed-SIGKILL verdict, and it names the candidate mechanisms
 // without asserting any one of them.
 func TestFormatConfineTerminationAdvisory(t *testing.T) {
-	quiet := cgroupUsage{OOMKill: int64ptr(0), OOMKillLocal: int64ptr(0)}
+	quiet := cgroupUsage{OOMKill: int64ptr(0), OOMKillLocal: int64ptr(0), OOMGroupKillLocal: int64ptr(0)}
 	advisory := formatConfineTerminationAdvisory("unattributed-sigkill", quiet)
 	for _, want := range []string{
 		"SIGKILL", "cannot attribute", "Candidates", "systemd-oomd", "aira confine --kill", "cgroup.kill",
-		"ancestor", "kill -9", "killing itself",
+		"kill -9", "killing itself",
 	} {
 		if !strings.Contains(advisory, want) {
 			t.Fatalf("candidates line %q lacks %q", advisory, want)
@@ -181,7 +196,7 @@ func TestFormatConfineTerminationAdvisory(t *testing.T) {
 
 	// With a descendant's OOM on the hierarchical counter, the line must say so
 	// rather than flatly claiming no OOM was recorded.
-	descendant := formatConfineTerminationAdvisory("unattributed-sigkill", cgroupUsage{OOMKill: int64ptr(2), OOMKillLocal: int64ptr(0)})
+	descendant := formatConfineTerminationAdvisory("unattributed-sigkill", cgroupUsage{OOMKill: int64ptr(2), OOMKillLocal: int64ptr(0), OOMGroupKillLocal: int64ptr(0)})
 	for _, want := range []string{"memory.events.local", "cgroup BENEATH this scope", "2 OOM kill(s)"} {
 		if !strings.Contains(descendant, want) {
 			t.Fatalf("descendant-OOM candidates line %q lacks %q", descendant, want)
@@ -205,6 +220,38 @@ func TestFormatConfineTerminationAdvisory(t *testing.T) {
 // after the cut-off, so it delivers the late signal from inside itself and then
 // returns readable counters, standing in for a scope that is still there to be
 // read. A handler that still ran cleanup() would have removed it.
+// watchedWriter is a race-free diagnostics sink that closes `seen` the moment a
+// given substring has been written. It replaces a plain bytes.Buffer, which the
+// signal-handler goroutine and the test goroutine would otherwise share
+// unsynchronised.
+type watchedWriter struct {
+	mu     sync.Mutex
+	buf    bytes.Buffer
+	marker string
+	seen   chan struct{}
+	once   sync.Once
+}
+
+func newWatchedWriter(marker string) *watchedWriter {
+	return &watchedWriter{marker: marker, seen: make(chan struct{})}
+}
+
+func (w *watchedWriter) Write(payload []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n, err := w.buf.Write(payload)
+	if strings.Contains(w.buf.String(), w.marker) {
+		w.once.Do(func() { close(w.seen) })
+	}
+	return n, err
+}
+
+func (w *watchedWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
 func TestConfineTrailerIgnoresASignalThatArrivesAfterTheRunEnded(t *testing.T) {
 	scope := &confineFakeScope{}
 	deps := confineUnitDeps(scope)
@@ -212,40 +259,33 @@ func TestConfineTrailerIgnoresASignalThatArrivesAfterTheRunEnded(t *testing.T) {
 	deps.signalSource = func() (<-chan os.Signal, func()) { return signals, func() {} }
 	deps.reportPeak = func(context.Context, ConfineRequest, string, *int64, bool) error { return nil }
 
-	delivered := make(chan struct{})
+	// Synchronise on the WRITE, not on a poll or a sleep. The earlier version of
+	// this fixture polled for the handler having dequeued the signal, which is
+	// not the same event as the handler having WRITTEN, and it flaked under
+	// goroutine starvation on a loaded box (observed at load average ~1000).
+	// Blocking readUsage until the line appears makes the ordering a fact rather
+	// than a hope, and the generous deadline exists only so a genuine regression
+	// fails loudly instead of hanging.
+	diagnostics := newWatchedWriter("after the job had already ended")
 	var once sync.Once
 	deps.readUsage = func(string) cgroupUsage {
 		once.Do(func() {
 			signals <- syscall.SIGTERM
-			// Wait for the handler to have processed it, so the assertions below
-			// describe a settled state rather than a race.
-			deadline := time.Now().Add(5 * time.Second)
-			for time.Now().Before(deadline) {
-				scope.mu.Lock()
-				killed := scope.killed
-				scope.mu.Unlock()
-				if killed {
-					break
-				}
-				if len(signals) == 0 {
-					break
-				}
-				time.Sleep(time.Millisecond)
+			select {
+			case <-diagnostics.seen:
+			case <-time.After(60 * time.Second):
 			}
-			close(delivered)
 		})
-		return cgroupUsage{OOMKill: int64ptr(0), OOMKillLocal: int64ptr(0)}
+		return cgroupUsage{OOMKill: int64ptr(0), OOMKillLocal: int64ptr(0), OOMGroupKillLocal: int64ptr(0)}
 	}
 
-	var diagnostics bytes.Buffer
 	// A self-SIGKILL, so the verdict before the late signal is unattributed.
 	if _, err := confineWithDeps(context.Background(), ConfineRequest{
 		Slice: "finite.slice", Argv: []string{"/bin/sh", "-c", "kill -s KILL $$"},
-		SelfPath: os.Args[0], Stderr: &diagnostics,
+		SelfPath: os.Args[0], Stderr: diagnostics,
 	}, deps); err != nil {
 		t.Fatalf("confine: %v (diagnostics=%q)", err, diagnostics.String())
 	}
-	<-delivered
 	trailer := diagnostics.String()
 	if strings.Contains(trailer, "terminated-by=supervisor-signal") {
 		t.Fatalf("a signal that arrived after the job ended was recorded as its cause: %q", trailer)
@@ -256,7 +296,7 @@ func TestConfineTrailerIgnoresASignalThatArrivesAfterTheRunEnded(t *testing.T) {
 	if !strings.Contains(trailer, "after the job had already ended") {
 		t.Fatalf("the late signal was not reported at all, so it is as invisible as AIRA-70 found it: %q", trailer)
 	}
-	if strings.Contains(trailer, "and forwarding to the confined job") {
+	if strings.Contains(trailer, ", forwarding to the confined job") {
 		t.Fatalf("a late signal claimed to be killing a job that had already ended: %q", trailer)
 	}
 }
@@ -298,15 +338,15 @@ func TestConfineTrailerReportsTerminationFacet(t *testing.T) {
 		want       string
 		candidates bool
 	}{
-		{name: "clean exit", argv: []string{"/bin/true"}, usage: cgroupUsage{OOMKill: int64ptr(0), OOMKillLocal: int64ptr(0)}, want: "terminated-by=normal"},
-		{name: "non-zero exit is still normal", argv: []string{"/bin/false"}, usage: cgroupUsage{OOMKill: int64ptr(0), OOMKillLocal: int64ptr(0)}, want: "terminated-by=normal"},
+		{name: "clean exit", argv: []string{"/bin/true"}, usage: cgroupUsage{OOMKill: int64ptr(0), OOMKillLocal: int64ptr(0), OOMGroupKillLocal: int64ptr(0)}, want: "terminated-by=normal"},
+		{name: "non-zero exit is still normal", argv: []string{"/bin/false"}, usage: cgroupUsage{OOMKill: int64ptr(0), OOMKillLocal: int64ptr(0), OOMGroupKillLocal: int64ptr(0)}, want: "terminated-by=normal"},
 		{
 			name: "crashing child", argv: []string{"/bin/sh", "-c", "kill -s USR1 $$"},
-			usage: cgroupUsage{OOMKill: int64ptr(0), OOMKillLocal: int64ptr(0)}, want: "terminated-by=child-signal:SIGUSR1",
+			usage: cgroupUsage{OOMKill: int64ptr(0), OOMKillLocal: int64ptr(0), OOMGroupKillLocal: int64ptr(0)}, want: "terminated-by=child-signal:SIGUSR1",
 		},
 		{
 			name: "SIGKILL with a readable zero counter", argv: selfKill,
-			usage: cgroupUsage{OOMKill: int64ptr(0), OOMKillLocal: int64ptr(0)}, want: "terminated-by=unattributed-sigkill", candidates: true,
+			usage: cgroupUsage{OOMKill: int64ptr(0), OOMKillLocal: int64ptr(0), OOMGroupKillLocal: int64ptr(0)}, want: "terminated-by=unattributed-sigkill", candidates: true,
 		},
 		{
 			name: "SIGKILL with an unreadable counter", argv: selfKill,
@@ -317,14 +357,14 @@ func TestConfineTrailerReportsTerminationFacet(t *testing.T) {
 			// hierarchical counter used to mislabel: a worker sub-cgroup OOMed
 			// at its own cap, and then the WHOLE scope was killed from outside.
 			name: "SIGKILL alongside a descendant cgroup's OOM", argv: selfKill,
-			usage: cgroupUsage{OOMKill: int64ptr(2), OOMKillLocal: int64ptr(0)},
+			usage: cgroupUsage{OOMKill: int64ptr(2), OOMKillLocal: int64ptr(0), OOMGroupKillLocal: int64ptr(0)},
 			want:  "terminated-by=unattributed-sigkill", candidates: true,
 		},
 		{
 			// And the reverse: an OOM at this scope's OWN limit still reads as
 			// an OOM, so the local-counter gate did not simply disable branch 2.
 			name: "SIGKILL with an OOM at our own limit", argv: selfKill,
-			usage: cgroupUsage{OOMKill: int64ptr(1), OOMKillLocal: int64ptr(1)},
+			usage: cgroupUsage{OOMKill: int64ptr(1), OOMKillLocal: int64ptr(1), OOMGroupKillLocal: int64ptr(0)},
 			want:  "terminated-by=oom",
 		},
 	} {
@@ -348,7 +388,7 @@ func TestConfineTrailerReportsTerminationFacet(t *testing.T) {
 // (which propagates up onto our counter) must not relabel a clean exit.
 func TestConfineTrailerReportsOOM(t *testing.T) {
 	t.Run("uncapped OOM is no longer silent", func(t *testing.T) {
-		trailer := confineTrailer(t, []string{"/bin/sh", "-c", "kill -s KILL $$"}, cgroupUsage{OOMKill: int64ptr(1), OOMKillLocal: int64ptr(1)}, 0)
+		trailer := confineTrailer(t, []string{"/bin/sh", "-c", "kill -s KILL $$"}, cgroupUsage{OOMKill: int64ptr(1), OOMKillLocal: int64ptr(1), OOMGroupKillLocal: int64ptr(0)}, 0)
 		if !strings.Contains(trailer, "terminated-by=oom") {
 			t.Fatalf("trailer %q lacks terminated-by=oom", trailer)
 		}
@@ -362,15 +402,59 @@ func TestConfineTrailerReportsOOM(t *testing.T) {
 			t.Fatalf("an attributed OOM wrongly printed the candidates line: %q", trailer)
 		}
 	})
-	t.Run("a descendant OOM does not relabel a clean exit", func(t *testing.T) {
-		trailer := confineTrailer(t, []string{"/bin/true"}, cgroupUsage{OOMKill: int64ptr(1), OOMKillLocal: int64ptr(1)}, 0)
+	// Renamed and re-shaped on build-review round 4: this used to pass
+	// OOMKillLocal: 1, which is the OWN-limit shape, so it proved nothing about
+	// descendants. The descendant shape is a positive HIERARCHICAL counter with
+	// both local kill counters at zero.
+	t.Run("a descendant cgroup's OOM does not relabel a clean exit", func(t *testing.T) {
+		trailer := confineTrailer(t, []string{"/bin/true"},
+			cgroupUsage{OOMKill: int64ptr(2), OOMKillLocal: int64ptr(0), OOMGroupKillLocal: int64ptr(0), OOMLocal: int64ptr(0)}, 0)
 		if !strings.Contains(trailer, "terminated-by=normal") {
 			t.Fatalf("trailer %q lacks terminated-by=normal", trailer)
 		}
 	})
+
+	// AIRA-27's slice-OOM collateral shape. The facet is honestly `oom` -- the
+	// OOM killer really did kill this job -- but the trailer must not let the
+	// operator conclude their own cap was too small, because it never fired.
+	t.Run("an ancestor's limit is named as such, not as this job's own cap", func(t *testing.T) {
+		collateral := cgroupUsage{
+			OOMKill: int64ptr(2), OOMKillLocal: int64ptr(2), OOMGroupKillLocal: int64ptr(1),
+			OOMLocal: int64ptr(0), // the max-breach landed on the ANCESTOR
+		}
+		trailer := confineTrailer(t, []string{"/bin/sh", "-c", "kill -s KILL $$"}, collateral, 0)
+		if !strings.Contains(trailer, "terminated-by=oom") {
+			t.Fatalf("an ancestor OOM that killed our processes is still an OOM kill: %q", trailer)
+		}
+		if !strings.Contains(trailer, "did NOT fire at this scope's own limit") {
+			t.Fatalf("slice-level collateral was reported as though this job hit its own cap: %q", trailer)
+		}
+		if strings.Contains(trailer, "fired at this scope's OWN memory limit") {
+			t.Fatalf("contradictory limit attribution: %q", trailer)
+		}
+	})
+	t.Run("our own limit is named as such", func(t *testing.T) {
+		own := cgroupUsage{
+			OOMKill: int64ptr(2), OOMKillLocal: int64ptr(2), OOMGroupKillLocal: int64ptr(1), OOMLocal: int64ptr(1),
+		}
+		trailer := confineTrailer(t, []string{"/bin/sh", "-c", "kill -s KILL $$"}, own, 0)
+		if !strings.Contains(trailer, "fired at this scope's OWN memory limit") {
+			t.Fatalf("an own-limit OOM was not named as such: %q", trailer)
+		}
+	})
+	t.Run("an unreadable limit counter says nothing about whose limit fired", func(t *testing.T) {
+		trailer := confineTrailer(t, []string{"/bin/sh", "-c", "kill -s KILL $$"},
+			cgroupUsage{OOMKill: int64ptr(2), OOMKillLocal: int64ptr(2), OOMGroupKillLocal: int64ptr(1)}, 0)
+		if !strings.Contains(trailer, "terminated-by=oom") {
+			t.Fatalf("trailer %q lacks terminated-by=oom", trailer)
+		}
+		if strings.Contains(trailer, "own memory limit") || strings.Contains(trailer, "did NOT fire") {
+			t.Fatalf("whose limit fired was claimed from an unread counter: %q", trailer)
+		}
+	})
 	t.Run("a capped OOM still gets the reserve advisory", func(t *testing.T) {
 		trailer := confineTrailer(t, []string{"/bin/sh", "-c", "kill -s KILL $$"},
-			cgroupUsage{OOMKill: int64ptr(1), OOMKillLocal: int64ptr(1), PeakRSS: int64ptr(31 << 20)}, 32<<20)
+			cgroupUsage{OOMKill: int64ptr(1), OOMKillLocal: int64ptr(1), OOMGroupKillLocal: int64ptr(0), PeakRSS: int64ptr(31 << 20)}, 32<<20)
 		if !strings.Contains(trailer, "terminated-by=oom") || !strings.Contains(trailer, "OOM-killed at its memory cap") {
 			t.Fatalf("capped OOM lost a line: %q", trailer)
 		}

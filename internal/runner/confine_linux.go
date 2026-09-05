@@ -686,12 +686,24 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 				confineSignalName(received), scopeID)
 			return
 		}
-		if first {
-			_, _ = fmt.Fprintf(diagnostics, "confine: received %s; killing scope %s on %s and forwarding to the confined job\n",
-				confineSignalName(received), scopeID, sliceName)
-		}
+		// TEARDOWN FIRST, log second (build-review round 4). `diagnostics` is the
+		// confineLockedWriter shared with the child's stderr pump, so on a chatty
+		// job writing to a flow-controlled terminal this Fprintf can block on the
+		// mutex for as long as the reader is stalled. Gating the kill behind it
+		// would make Ctrl-C responsiveness depend on whoever is reading the
+		// output. The mutex-guarded witness above still precedes cleanup(), which
+		// is what the trailer's happens-before argument actually needs; the log
+		// line does not, and it still lands before the trailer either way.
 		interrupted.Store(true)
 		cleanup()
+		if first {
+			// "killed" is past tense because cleanup() has already run above;
+			// "forwarding" is present tense because forwardConfineSignals does
+			// that after this callback returns. Neither tense is decorative --
+			// the line must not claim an action that has not happened.
+			_, _ = fmt.Fprintf(diagnostics, "confine: received %s; killed scope %s on %s, forwarding to the confined job\n",
+				confineSignalName(received), scopeID, sliceName)
+		}
 	})
 	defer func() {
 		stopSignalSource()
@@ -971,6 +983,9 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	// OOM-worded exactly as it was: this one speaks only for the verdict the
 	// reserve advisory has never been able to see (AIRA-91 Part A).
 	if advisory := formatConfineTerminationAdvisory(result.Status.TerminatedBy, usage); advisory != "" {
+		_, _ = fmt.Fprintln(diagnostics, advisory)
+	}
+	if advisory := formatConfineOOMLimitAdvisory(result.Status.TerminatedBy, usage); advisory != "" {
 		_, _ = fmt.Fprintln(diagnostics, advisory)
 	}
 	return result, nil
@@ -1534,13 +1549,29 @@ func waitConfineCommand(cmd *exec.Cmd) (int, confineTermination) {
 // memcg events propagate UPWARD and this project's own aitest worker scopes are
 // exactly the descendant cgroups that exploit that:
 //
-//   - It reads memory.events.LOCAL, not the hierarchical memory.events. A
-//     worker sub-cgroup OOM-killed at its own cap raises the hierarchical
-//     counter on this scope while this scope's leader is untouched; the local
-//     counter stays at zero for that, and rises only for an OOM at THIS
-//     scope's own limit. Measured, not assumed --
-//     TestMemoryEventsLocalDistinguishesOwnLimitFromDescendantOOM pins all
-//     three shapes against real cgroups.
+//   - It reads memory.events.LOCAL, not the hierarchical memory.events, via
+//     usage.LocalOOM(). A worker sub-cgroup OOM-killed at its own cap raises the
+//     hierarchical counter on this scope while this scope's own processes are
+//     untouched; the local counters stay at zero for that. They rise when the
+//     OOM killer actually killed something OF OURS -- including when the leader
+//     has been drained into a `.aira-supervisor` sub-cgroup, which is why
+//     LocalOOM is a disjunction over oom_kill and oom_group_kill rather than a
+//     single counter. Measured, not assumed --
+//     TestMemoryEventsLocalDistinguishesOwnLimitFromDescendantOOM pins every
+//     shape against real cgroups.
+//
+//     Note the exact claim, which is narrower than it first reads: the verdict
+//     says THE OOM KILLER KILLED THIS JOB. It deliberately does NOT say whose
+//     limit fired. An aira.slice-level OOM caused by a NEIGHBOUR's usage reaches
+//     this branch the same way our own cap would, because our memory.oom.group
+//     is honoured for it and raises our local oom_group_kill (measured: our
+//     local reads oom 0, oom_kill 0, oom_group_kill 1). That is still an honest
+//     `oom` -- the kernel really did OOM-kill this job -- but "raise your cap"
+//     would be the wrong conclusion to draw from it. Separating the two needs
+//     the local `oom` declaration counter, which IS keyed on the cgroup whose
+//     limit fired; it is a fidelity improvement rather than an honesty fix and
+//     is deferred (plan section 6), not built here.
+//
 //   - It requires SIGKILL specifically. The OOM killer, and memory.oom.group
 //     with it, deliver SIGKILL and nothing else, so a leader that died of
 //     SIGTERM was not OOM-killed whatever any counter says.
@@ -1565,9 +1596,9 @@ func classifyConfineTermination(term confineTermination, usage cgroupUsage, supe
 	if !term.Decoded {
 		return ConfineTerminatedUnevaluated
 	}
-	oomEvaluated := usage.OOMKillLocal != nil
+	localOOM, oomEvaluated := usage.LocalOOM()
 	killed := term.Signaled && term.Signal == syscall.SIGKILL
-	if killed && oomEvaluated && *usage.OOMKillLocal > 0 {
+	if killed && localOOM {
 		return ConfineTerminatedOOM
 	}
 	if supervisorSignal != nil {
@@ -1620,16 +1651,46 @@ func formatConfineTerminationAdvisory(verdict string, usage cgroupUsage) string 
 	if verdict != ConfineTerminatedUnattributedSIGKILL {
 		return ""
 	}
+	// The ancestor-cgroup OOM that earlier revisions listed here has been REMOVED
+	// (build-review round 4): oom_kill is keyed on the VICTIM's cgroup, so an
+	// ancestor OOM that killed our processes raises OUR local counter and lands
+	// on the `oom` verdict, never here. Listing it sent the operator after a
+	// cause this verdict has already ruled out.
 	line := "confine: the job was SIGKILLed by something this supervisor cannot attribute: it sent no signal itself, " +
 		"and this scope's own memory.events.local records no OOM kill. Candidates: an external whole-cgroup kill " +
 		"(systemd-oomd under PSI pressure, another session's `aira confine --kill`, a direct cgroup.kill write), " +
-		"an ancestor-cgroup OOM whose counter lands on the ancestor, an external kill -9, or the job killing itself."
+		"an external kill -9, or the job killing itself."
 	if usage.OOMKill != nil && *usage.OOMKill > 0 {
 		line += " Note that memory.events (which counts this scope AND everything below it) does record " +
 			strconv.FormatInt(*usage.OOMKill, 10) + " OOM kill(s): something in a cgroup BENEATH this scope was " +
 			"OOM-killed at its own limit, which is a separate event from whatever killed this job."
 	}
 	return line
+}
+
+// formatConfineOOMLimitAdvisory names WHOSE limit fired, for the `oom` verdict
+// only. The facet itself deliberately claims no more than "the OOM killer killed
+// this job" (see classifyConfineTermination), because `oom_kill` is keyed on the
+// VICTIM's cgroup: a slice-level OOM caused by a NEIGHBOUR's usage looks
+// identical there. The local `oom` declaration counter is keyed on the cgroup
+// whose limit actually fired, so it separates the two -- and the distinction is
+// the difference between "raise your own cap" and "you were AIRA-27 collateral,
+// your own cap was never the problem". Returns "" when the counter is
+// unreadable: silence, not a guess.
+func formatConfineOOMLimitAdvisory(verdict string, usage cgroupUsage) string {
+	if verdict != ConfineTerminatedOOM {
+		return ""
+	}
+	own, evaluated := usage.OwnLimitOOM()
+	if !evaluated {
+		return ""
+	}
+	if own {
+		return "confine: the OOM fired at this scope's OWN memory limit."
+	}
+	return "confine: the OOM did NOT fire at this scope's own limit — an ancestor cgroup's limit " +
+		"(the shared slice) was breached and this job's processes were the collateral. Raising this job's " +
+		"own cap will not help; the slice was over-committed."
 }
 
 func cleanupConfineScope(scope Scope, started bool) {
