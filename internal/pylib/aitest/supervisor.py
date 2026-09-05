@@ -517,6 +517,7 @@ class Supervisor:
         self.max_workers_fallback = max(1, int(os.environ.get("AIRA_AITEST_MAX_WORKERS_FALLBACK", "1")))
         self._fallback_warned = False
         self._admission_terminal_warned = False
+        self._pidfd_warned = False
         self.items_by_nodeid = {}
         self.workers = {}
         # Worker scopes whose rmdir failed, for a later retry. See
@@ -816,6 +817,61 @@ class Supervisor:
             )
         return grant, process
 
+    def _open_pidfd(self, pid):
+        """A pidfd for one forked worker, or None if this host cannot provide
+        one.
+
+        AIRA-40. Worker liveness used to be inferred SOLELY from the result
+        pipe reaching EOF, and that inference is not sound: a test that itself
+        calls os.fork() (or uses multiprocessing's default `fork` start method
+        on Linux) without closing inherited fds leaves the grandchild holding a
+        DUPLICATE of the worker's result-pipe write end. CLOEXEC cannot help --
+        it fires on exec(), not fork() -- so if that grandchild outlives the
+        worker (the worker OOM-killed, the grandchild spared), the kernel never
+        delivers EOF: one live write end is enough to keep the pipe open. The
+        worker's in_flight nodeid was then never cleared, _handle_worker_exit
+        never fired, and run()'s stop condition (every worker idle) was never
+        satisfiable -- the whole run hung, alive and silent. Verified directly
+        on this host: with a grandchild holding the write end, select() reports
+        the pidfd ready and the pipe NOT ready.
+
+        A pidfd is the right instrument rather than an os.waitpid(WNOHANG) poll
+        on run()'s timeout tick (the ticket's own candidate direction): it goes
+        into the SAME select() set as the result pipes, so a death is noticed
+        the instant it happens instead of up to a tick later, and -- crucially
+        -- observing it does NOT consume the child's exit status, so it cannot
+        race _reap_child's own waitpid into a lost or double reap.
+
+        Degrades to None, never to a raised exception: os.pidfd_open needs
+        Python 3.9+ and Linux 5.3+, and can fail per-call (ESRCH on a pid
+        already reaped by something else). Without it this supervisor keeps
+        exactly today's EOF-only behaviour, which is why the loss of the
+        independent check is said out loud once rather than left silent."""
+        opener = getattr(os, "pidfd_open", None)
+        if opener is None:
+            self._warn_no_pidfd("this Python has no os.pidfd_open (needs 3.9+ on Linux 5.3+)")
+            return None
+        try:
+            return opener(pid)
+        except OSError as exc:
+            self._warn_no_pidfd("os.pidfd_open failed for worker %d: %s" % (pid, exc))
+            return None
+
+    def _warn_no_pidfd(self, reason):
+        if self._pidfd_warned:
+            return
+        self._pidfd_warned = True
+        # "for any worker without one", not a flat "crash detection is now
+        # EOF-only": the missing-attribute case really does affect every
+        # worker, but a per-call OSError affects only that one, and claiming
+        # more than was established is the exact habit this project's honesty
+        # rules exist to prevent.
+        sys.stderr.write(
+            "aira aitest: %s -- crash detection falls back to result-pipe EOF alone for any "
+            "worker without one, which a test's own forked grandchild can hold open "
+            "indefinitely (AIRA-40)\n" % reason
+        )
+
     def _child_close_other_workers_fds(self):
         """A forked child inherits DUPLICATES of every fd already open in
         the parent's fd table -- fork() copies the whole table and there is
@@ -839,6 +895,19 @@ class Supervisor:
                 os.close(state["result_fd"])
             except OSError:
                 pass
+            # An inherited pidfd (AIRA-40) cannot wedge the parent's own
+            # liveness detection the way an inherited pipe write end can --
+            # readiness follows the tracked process's exit, not this fd's
+            # reference count -- but it is still one more fd this child has no
+            # use for, and leaking one per already-running worker into every
+            # later fork is exactly the fd-table-copy hygiene the rest of this
+            # method exists to enforce.
+            pidfd = state.get("pidfd")
+            if pidfd is not None:
+                try:
+                    os.close(pidfd)
+                except OSError:
+                    pass
             admit_process = state.get("admit_process")
             if admit_process is not None:
                 for stream in (admit_process.stdin, admit_process.stdout, admit_process.stderr):
@@ -967,6 +1036,13 @@ class Supervisor:
             "admit_process": admit_process,
             "dispatch_write": os.fdopen(dispatch_write, "w"),
             "in_flight": None,
+            # Opened only now, on the path where this worker is actually going
+            # to be registered: every failure branch above has already reaped
+            # the child, and a pidfd for a reaped pid is either invalid or --
+            # worse -- refers to whatever process later reuses that pid.
+            # Nothing has reaped this one (the placement ack proves it is alive
+            # and placed), so the pid cannot be reused underneath us here.
+            "pidfd": self._open_pidfd(pid),
         })
         self.workers[pid] = state
         return pid
@@ -1011,6 +1087,15 @@ class Supervisor:
             "read_buffer": b"",
             "result_eof": False,
             "in_flight": None,
+            # AIRA-40, exactly as on the confined path: this fork site needs
+            # the independent liveness signal just as much -- a fallback worker
+            # runs the same arbitrary test code, so it inherits the same
+            # forked-grandchild-holds-the-pipe hazard. Safe on a child that has
+            # already died in the microseconds since the fork: it is a zombie,
+            # not reaped, so its pid is still valid and cannot have been reused
+            # (verified on this host: pidfd_open on a zombie succeeds and is
+            # immediately ready).
+            "pidfd": self._open_pidfd(pid),
         }
         return pid
 
@@ -1091,6 +1176,20 @@ class Supervisor:
             os.close(state["result_fd"])
         except OSError:
             pass
+        # AIRA-40: closing the pidfd here is not mere tidiness. A pidfd is
+        # LEVEL-triggered and stays readable for as long as it is open, even
+        # after the child has been reaped (verified on this host) -- so a pidfd
+        # left open for a retired worker would make every subsequent
+        # select() in run() return instantly, spinning the dispatch loop at
+        # 100% CPU. Retirement is the single point where a worker leaves
+        # self.workers, so it is the single point that must drop this fd.
+        pidfd = state.get("pidfd")
+        if pidfd is not None:
+            state["pidfd"] = None
+            try:
+                os.close(pidfd)
+            except OSError:
+                pass
         # AIRA-92 (Sol plan-review, P1): BOUNDED. This sits directly on the
         # dispatch loop -- retirement, recycle and the end-of-run __stop__
         # broadcast all reach it -- so a child that reported its last result and
@@ -1549,11 +1648,23 @@ class Supervisor:
             self._replayed_nodeids.add(nodeid)
 
     def _handle_worker_exit(self, pid, state):
-        """A worker's result pipe hit EOF without a terminating record for
-        its in-flight nodeid: a crash (kernel OOM, host watchdog, any
-        non-reporting exit). Requeue once; a second failure here is
-        unevaluated -- distinct from failed everywhere results are
-        aggregated, never silently folded into either outcome."""
+        """A worker stopped reporting without a terminating record for its
+        in-flight nodeid: a crash (kernel OOM, host watchdog, any non-reporting
+        exit). Requeue once; a second failure here is unevaluated -- distinct
+        from failed everywhere results are aggregated, never silently folded
+        into either outcome.
+
+        Reached from TWO independent detections since AIRA-40, and the second
+        is the authoritative one: the result pipe reaching EOF, and the
+        worker's own pidfd going ready in run()'s select() set. EOF is an
+        INFERENCE about the process from the state of a pipe, and it is
+        unsound in one direction -- a grandchild the test itself forked can
+        hold a duplicate write end open past the worker's death, so EOF never
+        arrives (see _open_pidfd). The pidfd observes the process itself, so it
+        cannot be held open by a third party. EOF is kept because it is
+        genuinely sufficient in the overwhelmingly common case, arrives at the
+        same instant there, and is all there is on a host too old for
+        pidfds."""
         nodeid = state["in_flight"]
         self._retire_worker(pid, state)
         if nodeid is not None and not self.requeue_once(nodeid):
@@ -1564,6 +1675,57 @@ class Supervisor:
                 "retry did too" % pid,
             )
         self._replace_worker()
+
+    def _service_ready_workers(self, ready, result_fd_owners, pidfd_owners):
+        """Service one select() wakeup: drain every ready result pipe, THEN
+        handle every worker whose pidfd says it has exited (AIRA-40).
+
+        Both maps are {fd: (pid, state)} as run() built them for its select()
+        call, taken before any of this ran.
+
+        What is load-bearing is DRAIN BEFORE CONCLUDING DEATH, not the order of
+        the two passes as such. A worker that flushes its final result line and
+        dies immediately afterwards produces a real, already-established
+        outcome that must be recorded, never overwritten by a crash verdict --
+        so the exit branch drains that worker itself before acting, and would
+        remain correct even if these two loops were swapped. Splitting them is
+        what makes "results first" well defined without depending on select()'s
+        ready-list order, which is no guarantee to lean on anyway: CPython
+        returns it in ascending fd order, not in the order fds were passed.
+
+        The exit branch's own drain is therefore not redundant with the first
+        pass, and is the only thing covering the commonest version of this
+        race: select()'s answer is a SNAPSHOT, so a worker's last bytes can
+        land after it returned and before this runs, leaving that fd absent
+        from `ready` entirely. _drain_available_lines is non-blocking, so
+        draining an fd with nothing on it costs one EAGAIN read. If that drain
+        finds EOF it takes the crash path itself, which is why what follows
+        re-checks the worker is still registered.
+
+        Every entry is re-checked by state-dict IDENTITY (`is`), never by pid
+        or fd equality, because a pass can retire a worker and _replace_worker
+        can fork a fresh one within this same call -- and both a pid and an fd
+        NUMBER can be reused by that replacement (astronomically unlikely for a
+        pid, ordinary for an fd). Identity cannot confuse the two; equality on
+        a recycled number can, and would service, or worse crash-handle, a
+        brand-new healthy worker. Same pid-reuse blind spot
+        _dispatch_to_idle_workers' own docstring records designing out."""
+        ready = set(ready)
+        for fd, (pid, state) in result_fd_owners.items():
+            if fd not in ready or self.workers.get(pid) is not state:
+                continue
+            self._drain_worker(pid, state)
+        for fd, (pid, state) in pidfd_owners.items():
+            if fd not in ready or self.workers.get(pid) is not state:
+                continue
+            self._drain_worker(pid, state)
+            if self.workers.get(pid) is state:
+                # The tracked pid is gone but its pipe did not say so -- the
+                # AIRA-40 case exactly. Treat it as the crash it is, through
+                # the ordinary requeue-once/unevaluated path, rather than
+                # waiting on an EOF that a surviving grandchild may never let
+                # the kernel deliver.
+                self._handle_worker_exit(pid, state)
 
     def _pool_covers_the_queue(self):
         """True when every nodeid still waiting in the queue already has an
@@ -1657,15 +1819,24 @@ class Supervisor:
                 self._spawn_fallback_worker()
         self._dispatch_to_idle_workers()
         while self.workers:
-            fd_to_pid = {state["result_fd"]: pid for pid, state in self.workers.items()}
-            ready, _, _ = select.select(list(fd_to_pid), [], [], 1.0)
+            result_fd_owners = {
+                state["result_fd"]: (pid, state) for pid, state in self.workers.items()
+            }
+            # AIRA-40: worker liveness, watched independently of the result
+            # pipe and in the SAME select() set. A worker with no pidfd (an
+            # unsupported host, see _open_pidfd) simply contributes nothing
+            # here and keeps today's EOF-only behaviour.
+            pidfd_owners = {
+                state["pidfd"]: (pid, state)
+                for pid, state in self.workers.items()
+                if state.get("pidfd") is not None
+            }
+            ready, _, _ = select.select(
+                list(result_fd_owners) + list(pidfd_owners), [], [], 1.0
+            )
             if not ready:
                 continue
-            for fd in ready:
-                pid = fd_to_pid[fd]
-                if pid not in self.workers:
-                    continue
-                self._drain_worker(pid, self.workers[pid])
+            self._service_ready_workers(ready, result_fd_owners, pidfd_owners)
             self._dispatch_to_idle_workers()
             if not self.queue and all(state["in_flight"] is None for state in self.workers.values()):
                 for pid, state in list(self.workers.items()):

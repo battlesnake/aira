@@ -334,6 +334,23 @@ nodeid is requeued once onto a fresh worker. A second failure marks it
 silently folded into either pass or fail, per AIRA's existing rule that a
 check which cannot establish its result reports `unevaluated`.
 
+**"A worker dies" is observed, not inferred (AIRA-40).** Each worker's `pidfd`
+sits in the supervisor's own `select()` set alongside its result pipe, so the
+death of the tracked process is what triggers the requeue. The original
+implementation instead inferred death from the result pipe reaching EOF, which
+is unsound in one direction: a test that calls `os.fork()` itself (or uses
+`multiprocessing`'s default `fork` start method on Linux) leaves the grandchild
+holding a duplicate of the worker's result-pipe write end — `CLOEXEC` fires on
+`exec()`, not on `fork()`, so nothing prevents the inheritance — and one live
+write end keeps the pipe open no matter that the worker is gone. A grandchild
+outliving an OOM-killed worker therefore withheld EOF indefinitely and the
+whole run hung, alive and silent, with the promise above unkept. EOF is
+retained as a second, corroborating trigger: it is sufficient in the common
+case, arrives at the same instant there, and is all that is available on a host
+too old for `pidfd_open` (Python 3.9+, Linux 5.3+), where the supervisor says
+once on stderr that it is running without the independent check rather than
+implying a guarantee it cannot make.
+
 ### 3.7 Daemon-unavailable fallback
 
 `worker-admit` itself fails **closed** at the daemon layer — no
