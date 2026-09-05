@@ -1,6 +1,6 @@
 # AIRA-64 — machine-wide CPU-concurrency governance for aitest workers
 
-Status: **plan v3** (Sol `BLOCK` ×2 + DeepSeek-pro `APPROVE-WITH-CHANGES`, all applied)
+Status: **plan v4** (Sol `BLOCK` ×3 + DeepSeek-pro, all applied; loop closed at three rounds)
 Ticket: `.aira/tickets/AIRA-64.md` (P1, owner-escalated 2026-09-04)
 Branch: `aira64-aitest-cpu-concurrency`
 Base: `76095d5`
@@ -157,18 +157,54 @@ positive-proof-of-both-facets test in the same discipline as AIRA-36's reaper
 - a scope abandoned by a lost grant is **old and empty** → not counted → the
   floor opens (closes the round-1 P0).
 
-Directory age is `mtime`, **verified on this host** to be the real creation time
+Directory age is `mtime`, **measured on this host** to be the real creation time
 for cgroupfs directories (two live `.aira-CONFINE-*` scopes read 12 s and 822 s
-old, matching their jobs); `ConfineRecord.AgeSeconds` already relies on the same
-property.
+old, matching their jobs).
 
-**Residual, stated:** a worker that takes longer than 60 s to place would be
-counted as absent and could draw one extra floor grant. The client itself kills
-such a child at exactly that deadline, so the case is vanishing; the excess is
-bounded at one per scope per grace window and is fully RAM-checked.
+**Correction (Sol round 3 P2):** v3 cited `ConfineRecord.AgeSeconds` as
+precedent. That is wrong — it is derived from the timestamp encoded in the scope
+*id*, not from `mtime` (`confine_manage_linux.go:82-95`). The claim now rests
+only on the measurement, and because a measurement of *outer* scopes does not
+prove the property for *worker* directories across population and child-cgroup
+mutation, test 18 exercises the real worker-directory lifecycle directly rather
+than assuming it transfers.
 
 **Population that cannot be established** (an unreadable `cgroup.events`) counts
 the child as **live** — the direction that does not fabricate an open floor.
+
+#### 4.4.2 One floor grant per outer scope per grace window
+
+Sol's third round showed the age gate alone still does not bound the total: the
+grace runs from *scope creation*, but the client's ack timer starts only after
+`acquire_worker` returns and the fork begins (`supervisor.py:949-994`). A
+supervisor stalled longer than the grace between grant and fork lets its
+directory age out while its grant is still valid, so a second supervisor under
+the same outer scope becomes floor-eligible again — once per grace window,
+repeatedly.
+
+Two things address this, and neither is a claim protocol:
+
+**(a) A per-outer-scope floor rate limit.** `workerScopeState` already exists
+per outer scope and is already held under that scope's lock, so it gains one
+field: the time of the last floor grant. **A floor grant is issued at most once
+per outer scope per grace window.** Three lines, no new lifetime, no restart
+story — after a daemon restart the field is zero, which permits exactly one
+extra floor grant, i.e. the residual below and nothing worse.
+
+**(b) The claim is retracted where it cannot be supported.** See §4.6.
+
+**Residual, quantified honestly:** with (a), a stalled-before-placement
+supervisor can draw **at most one extra worker per outer scope per grace
+window**, and only while its own child has neither placed nor been killed —
+which the client does at its own ack deadline. It is bounded per window, not
+bounded over unbounded time. It is fully RAM-checked in every case.
+
+**The grace is read from the environment, not assumed.** Sol correctly noted
+`_PLACEMENT_ACK_TIMEOUT_SECONDS` is operator-adjustable via
+`AIRA_AITEST_PLACEMENT_ACK_TIMEOUT` (`supervisor.py:75-95,991-994`). The daemon
+therefore takes its grace from `AIRA_AITEST_PLACEMENT_ACK_TIMEOUT` when set,
+falling back to the same 60 s default, so the two halves cannot drift apart
+silently.
 
 ### 4.5 The liveness floor — the most important invariant
 
@@ -179,8 +215,12 @@ Without it the fix is a *regression*: a job arriving while another holds all 15
 slots would get zero workers and stall until the other run finished. Today that
 job merely runs slowly. **"Slow" must never become "stalled".**
 
-Implementation: if the requesting outer scope's **populated** worker count is
-zero, the CPU gate does not deny.
+Implementation: if the requesting outer scope's **`liveForFloor`** count is zero
+— the single named predicate used everywhere in this plan and in the code,
+defined in §4.4.1 as *populated OR younger than the placement grace* — the CPU
+gate does not deny, subject to §4.4.2's once-per-grace-window rate limit.
+(v3 said "populated count is zero" here, which contradicted §4.4.1; Sol round 3
+P2. One predicate, one name, one definition.)
 
 The floor is keyed on **outer scope**, matching AIRA-39's deliberate decision to
 key the worker ledger on outer scope alone. Named consequence: two pytest
@@ -203,11 +243,25 @@ degenerates at `J = 0`.
 With `C` = capacity, the true worst case over all arrival orderings is:
 
 > **live workers ≤ `C + max(0, J - 1)`**
+> **— provided at most one supervisor is concurrently admitting under each
+> outer scope.**
 
 (one job reaches `C` while alone, then each of the other `J-1` jobs takes its
 floor worker; at `J = 0` there are no workers at all). In the common ordering
-where jobs arrive together it is `max(C, J)`. The corrected table, 16 cores,
-`--aitest-workers=auto`:
+where jobs arrive together it is `max(C, J)`.
+
+**The proviso is a retraction, not a footnote (Sol round 3).** Where several
+supervisors admit *concurrently* under one outer scope, §4.4.2's rate limit caps
+the excess at one extra worker per outer scope per grace window, but that is
+bounded per window rather than absolutely, so the inequality above is not
+claimed for that configuration. It is not the deployed one: `aira confine` runs
+one pytest at a time, and the *sequential* multi-suite re-run that
+`BootstrapAitestSupervisor` explicitly supports
+(`aitest_bootstrap_linux.go:22-29`) is not concurrent. A `make -j` launching two
+pytest processes inside one confine job would be, and would get the weaker
+guarantee. Stated rather than assumed away.
+
+The corrected table, 16 cores, `--aitest-workers=auto`:
 
 | jobs | today | after (worst case `C+J-1`) |
 |---|---|---|
@@ -379,18 +433,32 @@ validator already accepts zero (`worker_admit.go:701-707`); only the CLI
 disagrees. **Fix: the CLI accepts `--max-wait 0`, rejecting only negatives**,
 with a boundary test at the CLI→daemon seam (test 22) rather than a mock.
 
-**(b) Zero-wait must mean "never blocks", not "one evaluation".**
-`evaluateWorkerAdmit` runs *before* the deadline check
-(`worker_admit.go:774-825`) and can block on the outer-scope lock, on the CPU
-gate, or on cgroup I/O — on the supervisor's single thread. **Fix: `max_wait_ms
-== 0` selects try-acquire semantics** — both the outer-scope lock and the CPU
-gate are taken with a non-blocking `select`/`default`, and a miss returns
-`denied`/`contended`/`admit-locks-busy` immediately. Both locks are already
-1-buffered channels (`worker_admit.go:164-188`), so this is a `default:` arm,
-not new machinery.
+**(b) Zero-wait must not merely mean "one evaluation".** `evaluateWorkerAdmit`
+runs *before* the deadline check (`worker_admit.go:774-825`) and can block on
+the outer-scope lock or the CPU gate — i.e. on **another job's** critical
+section — on the supervisor's single thread. **Fix: `max_wait_ms == 0` selects
+try-acquire semantics** — both locks are taken with a non-blocking
+`select`/`default`, and a miss returns `denied`/`contended`/`admit-locks-busy`
+immediately. Both are already 1-buffered channels (`worker_admit.go:164-188`),
+so this is a `default:` arm, not new machinery.
 
-This makes "speculative" a real, single, honest concept — *answer from what you
-can obtain without waiting* — rather than a hopeful timeout value.
+**What "speculative" therefore does and does not promise (Sol round 3 P1 —
+v3's "never blocks" was an overclaim, now retracted).** A speculative request:
+
+- **never waits on a lock held by another job**, and **never polls** — those
+  were the two unbounded terms, and try-acquire removes both;
+- **does** perform bounded cgroup I/O before the lock
+  (`worker_admit.go:385-390`) and, on a grant, a scope creation, a `fork`, and
+  the placement-ack read (`supervisor.py:991-1043`).
+
+So the honest invariant is **bounded, small, and never dependent on another
+job's progress** — not "non-blocking". The grant-path cost is the same fork and
+ack every existing spawn already pays (`run()` startup and `_replace_worker`),
+so the probe adds frequency, not a new class of stall. Sol's alternative —
+moving speculative spawning asynchronously into the selector loop — is a
+restructure of the single-threaded dispatch loop that the aitest design
+deliberately keeps single-threaded (`supervisor.py:26-30`); refused for v1 and
+recorded in §5h.
 
 ### 4.11 Rotation and fairness (CORRECTED)
 
@@ -447,6 +515,23 @@ cooperative park protocol in the worker loop and a daemon-side active set — an
 beats new machinery. **The bound is weakened and stated honestly instead**
 (§4.6), and §4.10's probe recovers most of the practical convergence without any
 preemption. Revisit only with field data showing `C + J - 1` is insufficient.
+
+**(h) NEW in v4: make speculative spawning asynchronous inside the selector
+loop.** Sol round 3's alternative to accepting bounded blocking. It would remove
+the fork/ack cost from the dispatch path entirely — but the aitest supervisor is
+deliberately single-threaded (`supervisor.py:26-30`), and every blocking read on
+that loop has already been individually bounded by AIRA-92 rather than made
+concurrent. Introducing asynchrony there is a redesign of the dispatch loop, not
+a CPU-governance change, and it would reopen a class of races that design
+closed. Refused for v1; the bounded-cost invariant in §4.10.1(b) is claimed
+instead.
+
+**(i) NEW in v4: an exclusive per-outer-scope pending-floor claim spanning grant
+through placement acknowledgement.** Sol's preferred fix across rounds 2 and 3.
+Refused twice; see §12's standing-disagreement note. §4.4.2's rate limit is the
+cheap 90% of it — one timestamp on state that already exists, with no lifetime,
+expiry or reconstruction story — and §4.6 retracts the claim the remaining 10%
+would have supported rather than asserting it without the machinery.
 
 ## 6. Interaction with AIRA-33 and the simplification programme
 
@@ -579,11 +664,14 @@ Every test must be able to fail against a wrong implementation.
     read and before the gate**, so an implementation that reads the count
     outside the gate loses deterministically rather than by luck. Asserted on
     the resulting cgroup tree, not on the count of returned grants;
-15. **shared-outer-scope placement race (Sol round 2 P0-2):** `N` requesters
-    under **one** outer scope are each granted and then *paused before
-    placement*; with the age gate only the first is floor-eligible. Fails
-    against a populated-only floor. This is the test for the exact construction
-    that blocked v2;
+15. **shared-outer-scope placement race (Sol rounds 2 and 3):** `N` requesters
+    under **one** outer scope race while saturated; **exactly one** is granted
+    via the floor and the other `N-1` receive `cpu-slots-saturated`, with the
+    first grant left outstanding and unplaced. Fails against a populated-only
+    floor. The test then **advances the clock past the grace window with that
+    first grant still outstanding** and asserts §4.4.2's rate limit permits at
+    most one further floor grant, not one per requester — the exact round-3
+    construction;
 16. gate acquisition is abandoned when the peer context is cancelled and when
     the daemon is stopping; a `max_wait_ms == 0` request never blocks on either
     lock (try-acquire), returning `admit-locks-busy` when they are held.
@@ -595,9 +683,14 @@ Every test must be able to fail against a wrong implementation.
     the exact `cpu-slots-saturated` reason. This is the test that would have
     caught the AIRA-59 "shipped inert on every real host" failure and is the
     single most important one here;
-18. real cgroupfs directory `mtime` is a usable age source (pins the §4.4.1
-    assumption this host was measured on, so a kernel or mount change fails a
-    test instead of silently disabling the age gate);
+18. **worker-directory `mtime` lifecycle (Sol round 3 P2):** a real
+    `.aira-worker-*` directory's `mtime` still reports creation time *after* it
+    is populated and after a child cgroup is created inside it — not merely for
+    an outer scope at rest. Plus the unhappy paths: a `stat` failure counts the
+    child as live, a malformed `cgroup.events` counts it as live, and an
+    `mtime` in the future (clock skew) counts it as young rather than aged out.
+    This pins the §4.4.1 assumption so a kernel or mount change fails a test
+    instead of silently disabling the age gate;
 19. multi-slice: two outer scopes under **different** slices are each bounded
     separately — pins §4.8's documented limit so it cannot silently change.
 
@@ -708,12 +801,30 @@ verified against source before being accepted.
 | P1 — CPU observability is inert unless it traverses the runner client and lease (`worker_admit_client_linux.go:58-67,184-190`) | **Accepted in substance, trimmed in scope.** All five hops are in scope and test 21 asserts end-to-end. But v3 ships **one** token (`cpu_slots`) rather than v2's three fields: `live`/`capacity` are telemetry nobody branches on, and `architectural-simplicity` forbids five hops of plumbing for them. Recorded in §4.9. |
 | P2 — tests 11/13/21 remain porous (RAM seam only; no barrier; distinct scopes cannot expose the shared-scope race) | **Accepted.** Test 12 counts both seams; test 14 adds a barrier placed between the cached read and the gate and asserts on the tree; test 15 is the new shared-outer-scope test. |
 
-**Standing disagreement, recorded rather than resolved:** Sol's preferred fix for
-P0-2 was "an exclusive per-outer pending-floor claim spanning grant through
-placement acknowledgement, with safe orphan expiry/reconstruction". That is a
-new distributed-claim protocol with its own lifetime, expiry and restart story.
-The age gate achieves the same exclusion with one comparison against a timestamp
-the kernel already maintains, and its residual (§4.4.1) is bounded at one extra
-worker per scope per 60 s window. `architectural-simplicity` decides this in
-favour of the age gate. If a build-review demonstrates the residual is reachable
-in practice, the claim protocol is the escalation.
+### v3 → v4. Sol re-gate: `BLOCK`, 1 × P0, 1 × P1, 2 × P2
+
+| finding | disposition |
+|---|---|
+| **P0 — the age gate still does not establish the bound: the grace runs from scope creation but the client's ack timer starts only after the fork begins, so a supervisor stalled past the grace lets its directory age out while its grant is live, and a second supervisor under the same outer scope becomes floor-eligible again — repeatedly** | **Accepted, and answered in two parts rather than with a claim protocol.** §4.4.2 adds a per-outer-scope floor rate limit (one field on the already-locked `workerScopeState`; at most one floor grant per grace window), which removes the "arbitrarily many" term. §4.6 then **retracts** the inequality for the only configuration where the residual survives — several supervisors admitting *concurrently* under one outer scope — rather than asserting a bound the mechanism does not deliver. Test 15 extended to advance past the grace with the first grant outstanding. Also accepted: the grace is operator-adjustable, so the daemon now reads `AIRA_AITEST_PLACEMENT_ACK_TIMEOUT` instead of hardcoding 60 s. |
+| **P1 — try-acquire does not make `max_wait=0` "never block": there is cgroup I/O before the lock, and a granted probe still forks and waits for the placement ack** | **Accepted; the claim is retracted.** §4.10.1(b) now claims only what is true — never waits on another job's lock, never polls, bounded cgroup I/O, and on a grant the same fork+ack every existing spawn already pays. §5h records the asynchronous-selector alternative and why it is refused. |
+| P2 — the `mtime` precedent is source-contradicted (`AgeSeconds` comes from the scope id, not `mtime`) | **Accepted.** The precedent claim is deleted; only the measurement remains, and test 18 now exercises the real worker-directory lifecycle plus `stat` failure, malformed `cgroup.events`, and clock skew. |
+| P2 — §4.5 still said "populated count is zero", contradicting §4.4.1; test 15 was internally inconsistent | **Accepted.** One named predicate, `liveForFloor`, defined once in §4.4.1 and used everywhere; test 15 reworded to "exactly one grants, `N-1` get `cpu-slots-saturated`". |
+
+**Standing disagreement, recorded rather than resolved (twice raised, twice
+refused).** Sol's preferred fix in rounds 2 and 3 was "an exclusive per-outer
+pending-floor claim spanning grant through placement acknowledgement, with safe
+orphan expiry and reconstruction". That is a new distributed-claim protocol with
+its own lifetime, expiry and restart story — the shape
+`architectural-simplicity` names explicitly ("prefer keeping the primitive and
+documenting the gap over new machinery"). v4 takes the cheap 90% of it
+(§4.4.2's one timestamp) and **retracts the claim** the remaining 10% would have
+supported (§4.6's proviso), which is the project's own stated preference for
+handling exactly this trade. If the build-review or field use shows the residual
+is reachable in practice, the claim protocol is the named escalation.
+
+**Plan-review loop closed at three rounds.** Rounds 1 and 2 changed the
+mechanism materially (the bound, the floor's predicate, the evaluation order,
+the client changes, the terminal `max_wait=0` defect). Round 3 changed no
+mechanism: it corrected two overclaims, one precedent citation and one naming
+inconsistency, and its one P0 is answered by a retraction plus three lines. The
+remaining disagreement is recorded above rather than iterated further.
