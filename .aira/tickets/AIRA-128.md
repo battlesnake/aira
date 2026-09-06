@@ -27,6 +27,23 @@ STANDALONE `aira confine -- make test-lite` command's own signature/estimate onl
 a developer or a differently-configured CI leg runs when it invokes test-lite directly rather than
 through merge-gate's outer scope.
 
+**FURTHER REFINEMENT (speed, same day, sharpens the standalone case):** the full standalone
+`make test-lite` at unbounded `-n auto` (xdist's own worker-count auto-detection, unrelated to
+aitest) STILL OOMs even at `--memory-max 16G` under box contention — the AGGREGATE across xdist's
+own parallel workers exceeds 16G, not a single process's peak. money's verified workaround:
+`FASTEST_XDIST_WORKERS=8 --memory-max 20G` (pin worker count AND raise the floor together; 16G
+alone, speed's earlier number, is insufficient for the full unbounded run). This matters for the
+fix design, not just the numbers: `-n auto` scales worker count with ambient CPU availability, so
+a peak observed on a busy box (fewer workers spawned) under-predicts the peak on a quiet box (more
+workers spawned) for the SAME command signature. The existing self-heal path in
+`resolveAdmitReserve` (escalate to 1.5x a single observed OOM peak) assumes next-run usage tracks
+past-run usage for the same signature — that assumption may not hold here if the workload's own
+internal parallelism is not itself bounded by anything confine controls. Whoever builds this should
+treat "does the workload's own concurrency scale with ambient CPU, independent of the confine
+budget" as a real design input, not an edge case to special-case away — a fix that only escalates
+the estimate without addressing unbounded internal parallelism may still under-provision on a
+quieter box than the one that produced the training sample.
+
 Speed's framing: 'same PSI-OOM class as the earlier 44-phantom incident' — a precedent in their own
 history for this failure shape, not (as far as I can find) an AIRA ticket already covering this
 specific one. AIRA-64 (built, PR #42) is a related but DIFFERENT mechanism — admission-WAIT time
