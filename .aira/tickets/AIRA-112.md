@@ -171,15 +171,54 @@ fails. The comment points at AIRA-126 and says to tighten it back when that land
 
 ### Verification (exact exit codes, every heavy command under `aira confine --`)
 
-Run on the rebased branch (`origin/master` at `16be299`):
+The first review BLOCKed this PR as **verification-incomplete**, not for any code
+defect: the earlier full-suite run was cut short (SIGTERM at 13/16 packages) and
+no exit code was ever recorded, and the executed revert check and the flake soak
+were still queued behind it. Every command below was then re-run to completion, one
+at a time (serialised per CLAUDE.md), with each exit code read from `$?` rather
+than inferred from output.
+
+`origin/master` moved twice during that work, the second time landing AIRA-107's
+real code changes in `internal/codes`, `internal/core` and `internal/store`. The
+branch was rebased onto each (no conflicts, `internal/runner` untouched by either)
+and the whole gate was re-run at the final base, **`origin/master` at `9abc100`**,
+so nothing below is a result carried over from an earlier tree.
 
 - `aira confine -- go build ./...` — exit **0**
 - `aira confine -- go vet ./...` — exit **0**
-- `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` — exit **0**; all 14
-  tested packages `ok` (`internal/cgrouptest` has no test files), zero FAIL, zero
-  panic.
-- `gofmt -l internal/ cmd/` — clean (no output), exit 0.
-- Targeted soak, before the rebase:
-  `AIRA_REAL_CGROUP=1 aira confine -- go test ./internal/runner/ -run TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration -count=400`
-  — exit **0** (`ok aira/internal/runner 301.608s`), 1200 real-cgroup launches.
-  The same command on the pre-fix tree failed inside 200-300 iterations.
+- `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` — exit **0**.
+  Log: `~/tmp/aira-AIRA-112-fulltest-rebased.log`, terminated by an explicit
+  `TEST_EXIT=0` line. All **15** packages `go list ./...` reports accounted for:
+  14 `ok` (`cmd/aira` 58.9s, `app`, `codes`, `core` 27.1s, `daemon` 75.3s,
+  `domain`, `gate`, `gitcontext`, `gitremote`, `install`, `pylib` 33.8s, `runner`
+  68.1s, `store` 136.3s, `testdeadline`) plus `internal/cgrouptest`
+  `[no test files]`. Zero FAIL, zero panic. (`internal/query` and `internal/interp`
+  do not exist in this tree; they are named in the layering plan, not yet built.)
+  The same command at the previous base `0cda3dc` also exited **0** with all 15
+  packages accounted for — `~/tmp/aira-AIRA-112-fulltest-final.log`.
+- `gofmt -l internal/ cmd/` — no output, exit **0**.
+- **Executed revert check** — the tests were proved non-porous by running them
+  against the old behaviour, not by reading them. Reverting the single call site
+  to `errors.Is(err, os.ErrNotExist)` and running
+  `aira confine -- go test ./internal/runner/ -run 'TestAIRA112' -count=1` gives
+  exit **1**:
+  - `TestAIRA112ReapedLeaderIsNotAResidualGap` — **FAIL** (the production symptom).
+  - `TestAIRA112ProcessLiveMapsAbsenceErrnosToDead` — **FAIL**, and only in the
+    `esrch-at-read` subtest: `processLive(read /proc/4242/stat: no such process)
+    = 0, want 2`. `enoent-at-open`, `eacces` and `eio` still pass, so the test
+    fails for exactly the reason the fix exists and no other.
+  - `TestAIRA112UnreadableLeaderStatIsStillAGap` — **PASS** on the old code, as
+    intended: it is the over-widening mutation guard (EACCES must stay a gap), so
+    passing both sides is its correct role, not porosity.
+
+  Restoring the call site returned the working tree to the committed state
+  (`git status --porcelain` empty, `git diff` empty), and the same command then
+  gives exit **0** with all three tests PASS.
+- Flake soak:
+  `AIRA_REAL_CGROUP=1 aira confine -- go test ./internal/runner/ -run TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration -count=150`
+  — exit **0** (`ok aira/internal/runner 89.056s`), 450 real-cgroup launches. Run
+  at base `0cda3dc`; the later rebase onto `9abc100` changed no file under
+  `internal/runner`, so it is the same tree under soak.
+- Earlier targeted soak, pre-rebase: the same command at `-count=400` — exit **0**
+  (`ok aira/internal/runner 301.608s`), 1200 real-cgroup launches. The same
+  command on the pre-fix tree failed inside 200-300 iterations.
