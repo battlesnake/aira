@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-109","project":"aira","title":"core.Do's handlerData.Code / RunRecord.ErrorCodes bypass both AIRA-99 guards against a W_ code","status":"in-review","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["codes","honesty"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-109","project":"aira","title":"core.Do's handlerData.Code / RunRecord.ErrorCodes bypass both AIRA-99 guards against a W_ code","status":"done","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["codes","honesty"],"hold":false,"relations":[]}
 ---
 Surfaced by the adversarial build review for AIRA-99 (Sol/Codex), which was
 scoped narrowly to store.ErrorCode -- this is a genuinely separate, currently
@@ -189,3 +189,7 @@ No runtime assertion in `core.Do` (option 2). It would duplicate a guard the
 static scan already gives at authoring time, and it can only report a problem
 after a wrong code has already been produced — whereas the scan refuses to let
 the code be written. Nothing changed in `internal/core` or `internal/runner`.
+
+## Done
+
+Merged via PR #69 as merge commit `16be299`.
