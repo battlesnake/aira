@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-119","project":"aira","title":"confine --list's exclusive holder/drain display name can go stale, naming a job that already released","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","dogfood"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-119","project":"aira","title":"confine --list's exclusive holder/drain display name can go stale, naming a job that already released","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","dogfood"],"hold":false,"relations":[]}
 ---
 Reported by peer session `field`, confirmed live by the coordinating session, 2026-09-06.
 
@@ -129,3 +129,5 @@ slice exclusive: draining for "job" (fdtd4) scope=CONFINE-job-4242-1@fdtd4, not 
   blocked behind whatever was keeping the slice non-empty. This is recorded rather
   than asserted, and the tests above mean a genuine daemon-side regression of that
   shape would now be caught rather than argued about.
+
+Done: PR #65 merged as `cd618f49348882267b6af1ec14caf44965cf370d` (build-review verified the identity test non-porous by re-running the cached-identity mutation; the field symptom itself was not reproduced — see the open note above).
