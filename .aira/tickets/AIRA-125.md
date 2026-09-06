@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-125","project":"aira","title":"Two catalogue entries sit on the wrong side of the state-conflict/bad-request rule","status":"in-review","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["codes","honesty"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-125","project":"aira","title":"Two catalogue entries sit on the wrong side of the state-conflict/bad-request rule","status":"done","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["codes","honesty"],"hold":false,"relations":[]}
 ---
 Filed as an AIRA-107 review follow-up. Out of that ticket's scope: neither code
 is one of the eleven AIRA-107 decided, and moving a code AIRA-87 did *not* leave
