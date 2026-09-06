@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-127","project":"aira","title":"aira top: live process/reservation dashboard with a colour-coded system-RAM bar","status":"in-review","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["observability","tui"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-127","project":"aira","title":"aira top: live process/reservation dashboard with a colour-coded system-RAM bar","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["observability","tui"],"hold":false,"relations":[]}
 ---
 Requested directly by the owner, 2026-09-06. Explicitly marked LOWER PRIORITY —
 queue behind the current backlog and CI-mode work; do not build ahead of them.
