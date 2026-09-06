@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-113","project":"aira","title":"Dynamic per-scope oom_score_adj steering for the residual aggregate-full slice OOM","status":"in-review","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","deferred-from-aira29","oom","scheduler"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-113","project":"aira","title":"Dynamic per-scope oom_score_adj steering for the residual aggregate-full slice OOM","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","deferred-from-aira29","oom","scheduler"],"hold":false,"relations":[]}
 ---
 Deferred from AIRA-29 (dynamic reserve), with reasoning recorded in
 `docs/superpowers/specs/2026-09-06-aira29-dynamic-reserve-plan.md` §3.6 and endorsed at P2
@@ -144,3 +144,22 @@ and belongs to the rollout change rather than this one.
 - `aira confine -- go build ./...` — exit 0
 - `aira confine -- go vet ./...` — exit 0
 - `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` — exit 0
+
+### Done
+
+**PR / merge**: https://github.com/battlesnake/aira/pull/62, merged as merge commit
+`47061ed0c75fa84b6efc4fafc1fef5f1a88bd70f` into `master` (branch tip `61e6a02`).
+
+**Independent build review (Fable gate)**: re-ran from a clean detached worktree —
+`go build ./...` exit 0, `go vet ./...` exit 0, `AIRA_REAL_CGROUP=1 go test ./... -count=1`
+exit 0 (14 packages), plus `-race` on the steer tests; all real-cgroup steer tests ran (none
+skipped). An independent 13-mutant battery (no-raise, leaf-only walker, no children sum, no
+class floor, no pid guard, raw-current fullness, no hysteresis, no restore-on-leave, frozen
+reserve budget, 1s interval accepted, raise-everyone-when-full, hardcoded-500 restore,
+restore-on-unevaluated) was caught 13/13. Verdict MERGE. Non-blocking P3 notes: the COST
+comment says the ledger is snapshotted only when full but `budgets()`/`classAdj` run every
+tick (cheap, comment inaccurate); for a memcg OOM the kernel's badness scale is the OOMing
+cgroup's `memory.max`, not MemTotal (direction of the flip unaffected); the steer is
+edge-triggered, so a process that rewrites its own adj after a raise keeps it until the next
+transition (forks inherit, so narrow). Accepted coverage gap, shared with the ceiling and
+watchdog: no `Serve`-level test that the enforce env var starts the loop.
