@@ -83,6 +83,80 @@ different):
    ledger when a daemon IS present in shim mode, rather than staying
    deliberately CPU-only-sized in that case.
 
+## Consumer-verified requirements (peer session `deploy`, GCP Batch CI runner, 2026-09-06)
+
+Raised while this ticket was still in scoping, with the failure mode each one
+prevents. Verified against current source before being added here (three
+confirmed as described; the fourth's framing corrected against what the code
+actually does today):
+
+6. **`confine` must accept-and-ignore existing resource flags, not reject
+   them.** Real recipes already pass `--memory-max`, `--memory-reserve`,
+   `--delegate-ram` etc. (`aira confine --memory-max 32G --memory-reserve
+   512M -- make merge-gate` is a real invocation in the consumer's merge
+   gate). Shim mode MUST parse these through the SAME flag surface the real
+   mode uses and make them inert (no cgroup write attempted), not treat them
+   as unknown/rejected arguments -- otherwise every existing recipe using them
+   breaks on first run, exactly the `if CI` branching this ticket exists to
+   avoid. Requirement 7 below is the one exception: `--delegate-ram`'s flag
+   parsing stays accepted, but one of its current SIDE EFFECTS must not fire.
+7. **Do NOT export `AIRA_AITEST_LIB` when `--delegate-ram` runs in shim
+   mode.** Verified in source: `internal/pylib/env.go`'s delegate-ram path
+   sets `AIRA_AITEST_LIB` in the child env unconditionally today, and a
+   consumer's `conftest.py` uses ITS PRESENCE ALONE as the guard that
+   activates the `aitest` pytest plugin (documented in this repo's own
+   generated Skill text, core/skill.go, as the two preconditions for aitest:
+   the project registers the plugin when this var is set, then launches with
+   `--aitest-workers`). aitest's per-worker RAM containment is not optional
+   machinery -- `worker-admit` places each forked worker in its OWN
+   kernel-enforced cgroup sub-scope nested under the outer job's scope; there
+   is no sub-scope to nest under in shim mode. If shim mode still exported
+   this var, a consumer's conftest.py would activate aitest, aitest would
+   attempt real per-worker cgroup admission that structurally cannot succeed
+   the way it does on the real path, and (worst case) heavy suites would run
+   under an apparent governance mechanism with no actual backstop --
+   `deploy`'s framing: "invisible until something OOMs." Leaving the var
+   unset in shim mode is correct AND sufficient: it makes the consumer's own
+   existing guard fall through to plain pytest-xdist, which is the right
+   default concurrency model on a single-tenant runner with no other
+   contention to admission-gate against anyway.
+8. **Forward the received signal to the child's process GROUP in shim mode,
+   not just the single direct child.** Correction to how this was originally
+   raised: current (real-mode) `confine` code already forwards SIGINT/SIGTERM
+   directly to its immediate child (`forwardConfineSignals`,
+   internal/runner/confine_linux.go, calls `child.Signal(received)`) --
+   it is not true that the real path only relies on cgroup.kill and eats the
+   signal otherwise. The genuine shim-mode gap is narrower but still real:
+   cgroup.kill's actual value on the real path is catching DESCENDANTS beyond
+   the direct child (a forked/reparented grandchild that `Signal()` on one
+   PID cannot reach) -- exactly the class of escape AIRA-20's descendant-
+   escape attestation work exists to detect on the cgroup path. Shim mode has
+   no cgroup.kill backstop for that class at all. Mitigate as far as a
+   non-cgroup mechanism reasonably can: start the child in its own process
+   group (setpgid) and signal the group (`kill(-pgid, sig)`), which reaches
+   any descendant that has not itself deliberately detached/setsid'd, and
+   document plainly (do not silently imply full parity) that a deliberately
+   double-forked/detached descendant still is not reachable without a real
+   cgroup -- matching this project's honesty convention rather than pretending
+   an equivalent guarantee. This matters concretely for GCP Batch: Batch sends
+   SIGTERM on job timeout and on preemption, and a real workload that never
+   sees it (or whose own children never see it) loses whatever graceful
+   teardown it had, until Batch's own harder kill lands later.
+9. **`aira install` must split cleanly into a build-time step (place
+   binary+config, no network, no side effects, safe to run inside a `docker
+   build` layer) and a start-time step (start whatever the resolved mode
+   needs).** The consumer's actual deployment shape bakes aira into a Docker
+   image at build time, then runs jobs in fresh containers from that image
+   later -- there is no daemon and no systemd at image-build time either.
+   Related and separately testable: if shim mode's daemon runs as a plain
+   background process, it must never be something the container's entrypoint
+   waits ON -- a Batch job must complete (and the container exit) the moment
+   the actual workload process exits, not hang on a backgrounded daemon that
+   is still technically alive. (Reaping the daemon once the container's PID 1
+   exits is the container init's job and is NOT this ticket's concern --
+   correct backgrounding so nothing waits on it while the container is still
+   running is.)
+
 ## Deliberately out of scope here
 
 Do not try to make the real cgroup slice mechanism work inside a container via
@@ -102,4 +176,17 @@ ledger actually gates admission (a second job queues when the first has
 'used' the whole budget per the estimator, and is admitted once the first
 completes); (c) confine --list/--status report the advisory-only containment
 state honestly in shim mode, distinguishably from the real-slice case; (d) a
-real aitest suite run completes successfully in shim mode end-to-end.
+real aitest suite run completes successfully in shim mode end-to-end; (e)
+`confine --memory-max/--memory-reserve/--delegate-ram` all parse successfully
+and run the command in shim mode (no rejection); (f) shim-mode
+`--delegate-ram` does NOT set `AIRA_AITEST_LIB` in the child env, proven by
+inspecting the actual child environment, not by inspecting the flag-parsing
+code path alone; (g) a shim-mode job with a child that forks a grandchild:
+signalling the confine process delivers the signal to the grandchild too
+(process-group signal), with a documented, tested exception for a
+deliberately detached/setsid'd descendant; (h) a `docker build`-shaped
+invocation of the build-time install step succeeds with no network access and
+no running daemon/systemd present, and the separate start-time step is what
+actually launches the shim daemon; (i) a shim-mode container run where the
+daemon is left running in the background exits promptly when the workload
+process exits, not blocked on the daemon.
