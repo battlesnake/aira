@@ -1293,6 +1293,19 @@ func runAitestBootstrapCommand(ctx context.Context, options map[string]string, s
 		_, _ = fmt.Fprintln(stderr, "E_CONFINE_ARGUMENT_INVALID: --supervisor-pid must be a positive integer")
 		return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 	}
+	// AIRA-121 gate condition C1. aitest-bootstrap relocates the supervisor into
+	// a child scope of the job's OUTER cgroup scope so that scope can delegate
+	// controllers to worker children. In ci-shim mode there is no outer scope and
+	// no cgroup to relocate within, so this must fail CLEANLY and immediately:
+	// supervisor.py's bootstrap() calls _disable_daemon on a non-zero exit, which
+	// is exactly the one-warning bare-fork fallback this mode wants. Reaching
+	// CurrentCgroupPath's self-discovery below would instead nominate whatever
+	// cgroup the container happens to live in as "outer" and then fail far later,
+	// in a place that reads as a broken install rather than a designed degradation.
+	if runner.ResolveConfineMode() == runner.ConfineModeShim {
+		_, _ = fmt.Fprintln(stderr, "E_CONFINE_UNAVAILABLE: ci-shim mode has no cgroup scope to bootstrap an aitest supervisor into; aitest runs on its unconfined fallback pool here")
+		return codes.ExitForCode("E_CONFINE_UNAVAILABLE")
+	}
 	// AIRA_AITEST_OUTER_SCOPE is the launcher's own scope.Reference(), injected
 	// by AppendAitestChildEnvironment. Prefer it over self-discovery (AIRA-44):
 	// a second aitest-enabled pytest run inside one confine job is, by the time
@@ -2595,10 +2608,19 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 		if result.SliceReserve.Jobs == 1 {
 			jobLabel = "job"
 		}
-		_, _ = fmt.Fprintf(stdout, "slice reserve: %s granted / %s ceiling across %d admitted %s\n",
+		// AIRA-121: the containment qualifier is part of THIS line, not a
+		// separate one below it, because the number and the strength of the
+		// guarantee behind it must never be readable apart.
+		containment := ""
+		if result.SliceReserve.Containment != "" {
+			containment = fmt.Sprintf(" [containment: %s; advisory budget from %s]",
+				result.SliceReserve.Containment,
+				runner.DescribeShimBudgetSource(result.SliceReserve.BudgetSource))
+		}
+		_, _ = fmt.Fprintf(stdout, "slice reserve: %s granted / %s ceiling across %d admitted %s%s\n",
 			formatReserveBytes(result.SliceReserve.GrantedBytes),
 			formatReserveBytes(result.SliceReserve.CeilingBytes),
-			result.SliceReserve.Jobs, jobLabel)
+			result.SliceReserve.Jobs, jobLabel, containment)
 		// AIRA-114. The aggregate over-subscription bound, printed only when the
 		// bound is switched ON (a zero limit is an absence, never a limit of zero).
 		// It explains a wait the reserve summary above cannot: since AIRA-29 the

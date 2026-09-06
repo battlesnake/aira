@@ -239,10 +239,7 @@ func (s *Server) cpuSlotsLocate(outerScope string) (root, scopeKey string, ok bo
 	if !ok {
 		return "", "", false, "outer scope " + outerScope + " is not a confine scope under a slice"
 	}
-	resolve := s.admitResolveSlice
-	if resolve == nil {
-		resolve = resolveAdmitSlicePath
-	}
+	resolve := s.sliceResolver()
 	resolved, resolvedOK, resolveReason := resolve(candidate)
 	if !resolvedOK {
 		return "", "", false, "slice for " + outerScope + " could not be resolved: " + resolveReason

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"aira/internal/daemon"
+	"aira/internal/runner"
 
 	"golang.org/x/sys/unix"
 )
@@ -140,6 +141,20 @@ type installOpts struct {
 	// state the measured value and when it was measured.
 	ciBytes int64
 	ciAt    time.Time
+
+	// AIRA-121. ciValue is the OPTIONAL value on --ci: "" for the bare flag
+	// (AIRA-120's unchanged meaning), "shim" to force the container shim, "auto"
+	// to opt in to host-dependence. `ci` above stays the bare-flag boolean so
+	// every AIRA-120 code path is untouched; resolveInstallMode is the one place
+	// that reads ciValue.
+	ciValue string
+	// resolvedBy is how the mode was decided, carried onto the durable record so
+	// `--status` can say WHY this box is in the mode it is in.
+	resolvedBy string
+	// stage is "" (build then start, i.e. today's behaviour), "build" (place
+	// bytes only -- safe inside a `docker build` RUN layer: no network, no
+	// systemd, no daemon contact, no /etc write, no linger) or "start".
+	stage string
 }
 
 // AIRA-106. An ABSENT daemon-mode option is now the ZERO VALUE all the way from
@@ -181,40 +196,50 @@ type reexecRequest struct {
 // installDeps is intentionally exhaustive: install-time identity, process,
 // filesystem, descriptor, clock, and output effects all cross this seam.
 type installDeps struct {
-	geteuid      func() int
-	getenv       func(string) string
-	lookupUser   func(string) (*user.User, error)
-	lookupUID    func(string) (*user.User, error)
-	groupIDs     func(*user.User) ([]string, error)
-	executable   func() (string, error)
-	abs          func(string) (string, error)
-	getpid       func() int
-	now          func() time.Time
-	run          func([]string, []byte) ([]byte, error)
-	reexec       func(reexecRequest) error
-	stat         func(string) (os.FileInfo, error)
-	lstat        func(string) (os.FileInfo, error)
-	readFile     func(string) ([]byte, error)
-	writeFile    func(string, []byte, os.FileMode) error
-	mkdirAll     func(string, os.FileMode) error
-	mkdirTemp    func(string, string) (string, error)
-	remove       func(string) error
-	rename       func(string, string) error
-	openat       func(int, string, int, uint32) (int, error)
-	fstat        func(int, *unix.Stat_t) error
-	close        func(int) error
-	readFD       func(int) ([]byte, error)
-	writeFD      func(int, []byte) error
-	fsync        func(int) error
-	fchmod       func(int, uint32) error
-	renameat     func(int, string, int, string) error
-	unlinkat     func(int, string, int) error
-	flock        func(int, int) error
-	logf         func(string, ...any)
-	daemonPaths  func() (daemon.Paths, error)
-	daemonStatus func(daemon.Paths) daemon.StatusInfo
-	daemonStop   func(daemon.Paths) error
-	sleep        func(time.Duration)
+	geteuid    func() int
+	getenv     func(string) string
+	lookupUser func(string) (*user.User, error)
+	lookupUID  func(string) (*user.User, error)
+	groupIDs   func(*user.User) ([]string, error)
+	executable func() (string, error)
+	abs        func(string) (string, error)
+	getpid     func() int
+	now        func() time.Time
+	run        func([]string, []byte) ([]byte, error)
+	reexec     func(reexecRequest) error
+	stat       func(string) (os.FileInfo, error)
+	// lookPath establishes whether an EXECUTABLE EXISTS, before it is run
+	// (AIRA-121 gate condition C7). It is a separate seam from `run` because the
+	// probe wraps every command in `timeout 10s`, which converts a missing
+	// systemctl into `timeout` exiting 127 and, in a distroless image, hides
+	// itself as well -- neither of which is distinguishable from a systemd that
+	// answered badly.
+	lookPath func(string) (string, error)
+	// spawnShimDaemon starts the ci-shim daemon detached (requirement 9). A seam
+	// so a test can observe the launch without one.
+	spawnShimDaemon func(shimDaemonSpec) error
+	lstat           func(string) (os.FileInfo, error)
+	readFile        func(string) ([]byte, error)
+	writeFile       func(string, []byte, os.FileMode) error
+	mkdirAll        func(string, os.FileMode) error
+	mkdirTemp       func(string, string) (string, error)
+	remove          func(string) error
+	rename          func(string, string) error
+	openat          func(int, string, int, uint32) (int, error)
+	fstat           func(int, *unix.Stat_t) error
+	close           func(int) error
+	readFD          func(int) ([]byte, error)
+	writeFD         func(int, []byte) error
+	fsync           func(int) error
+	fchmod          func(int, uint32) error
+	renameat        func(int, string, int, string) error
+	unlinkat        func(int, string, int) error
+	flock           func(int, int) error
+	logf            func(string, ...any)
+	daemonPaths     func() (daemon.Paths, error)
+	daemonStatus    func(daemon.Paths) daemon.StatusInfo
+	daemonStop      func(daemon.Paths) error
+	sleep           func(time.Duration)
 	// readMemAvailable is THE MemAvailable reader (daemon.ReadMemAvailable, the
 	// same one the watchdog and the AIRA-103/106 effective ceiling use), crossing
 	// the seam so --ci's snapshot can be injected in tests instead of depending on
@@ -268,6 +293,7 @@ func realInstallDeps() installDeps {
 			return cmd.Run()
 		},
 		stat: os.Stat, lstat: os.Lstat, readFile: os.ReadFile, writeFile: os.WriteFile,
+		lookPath: exec.LookPath, spawnShimDaemon: spawnShimDaemonProcess,
 		mkdirAll: os.MkdirAll, mkdirTemp: os.MkdirTemp, remove: os.Remove, rename: os.Rename,
 		openat: unix.Openat, fstat: unix.Fstat, close: unix.Close,
 		readFD: func(fd int) ([]byte, error) {
@@ -351,7 +377,7 @@ func parseInstallArgs(args []string) (installOpts, error) {
 		}
 		seen[name] = true
 		switch name {
-		case "allow-overcommit", "dry-run", "status", "ci":
+		case "allow-overcommit", "dry-run", "status":
 			if hasValue {
 				return opts, argumentInvalid(fmt.Sprintf("option --%s does not take a value", name))
 			}
@@ -362,9 +388,33 @@ func parseInstallArgs(args []string) (installOpts, error) {
 				opts.dryRun = true
 			case "status":
 				opts.status = true
-			case "ci":
-				opts.ci = true
 			}
+		case "ci":
+			// AIRA-121. --ci now takes an OPTIONAL value. Bare --ci keeps
+			// AIRA-120's exact meaning (a real install sized from a MemAvailable
+			// snapshot); the value is what selects the container shim, and it is
+			// attached with `=` only -- `--ci shim` would be indistinguishable
+			// from a bare --ci followed by a positional, which this parser does
+			// not accept.
+			opts.ci = !hasValue
+			opts.ciValue = value
+			if hasValue && value != "shim" && value != "auto" {
+				return opts, argumentInvalid("--ci must be given bare, or as --ci=shim or --ci=auto")
+			}
+		case "stage":
+			// AIRA-121 requirement 9. Absent means build-then-start, i.e.
+			// byte-for-byte today's behaviour, so no existing caller changes.
+			if !hasValue {
+				if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+					return opts, argumentInvalid("option --stage requires a value")
+				}
+				i++
+				value = args[i]
+			}
+			if value != installStageBuild && value != installStageStart {
+				return opts, argumentInvalid("--stage must be build or start")
+			}
+			opts.stage = value
 		case "memory-max", "memory-high", "watchdog", "watchdog-interval", "slice-ceiling":
 			if !hasValue {
 				if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
@@ -410,7 +460,21 @@ func parseInstallArgs(args []string) (installOpts, error) {
 	if opts.ci && opts.memoryMax != "" {
 		return opts, argumentInvalid("--ci and --memory-max are mutually exclusive: --ci sizes MemoryMax from a MemAvailable snapshot, so an explicit MemoryMax cannot also apply")
 	}
+	// AIRA-121 gate condition C8. --ci=shim ACCEPTS --memory-max, as the DECLARED
+	// ledger budget. That is not a second meaning for the flag: on the real path
+	// the slice's MemoryMax is precisely the admission ceiling the daemon reads,
+	// so "the ledger ceiling" is the same meaning in both modes. A declared budget
+	// is required in practice, because the MemTotal fallback over-books whenever a
+	// node runs more than one container without a per-container memory.max.
+	//
+	// --ci=auto with --memory-max IS refused: auto may resolve to the real path,
+	// where --memory-max and the MemAvailable snapshot genuinely conflict, and
+	// which of the two applied would then depend on the host.
+	if opts.ciValue == "auto" && opts.memoryMax != "" {
+		return opts, argumentInvalid("--ci=auto and --memory-max are mutually exclusive: --ci=auto may resolve to the real-slice install, where --memory-max conflicts with the MemAvailable snapshot; use --ci=shim to declare a ledger budget explicitly")
+	}
 	if opts.status && (opts.memoryMax != "" || opts.memoryHigh != "" || opts.allowOvercommit || opts.dryRun || opts.ci ||
+		opts.ciValue != "" || opts.stage != "" ||
 		seen["watchdog"] || seen["watchdog-interval"] || seen["slice-ceiling"]) {
 		return opts, argumentInvalid("--status cannot be combined with mutation options")
 	}
@@ -544,10 +608,17 @@ func runRootInstall(d installDeps, opts installOpts) error {
 		return unavailable(fmt.Errorf("target user %s cannot read and execute %q", target.username, executable))
 	}
 
-	activationErr := installSystemDropins(d, target.uid, opts.dryRun)
-	if !opts.dryRun {
-		if _, lingerErr := d.run(timeoutArgv("loginctl", "enable-linger", strconv.Itoa(target.uid)), nil); lingerErr != nil {
-			d.logf("warning: loginctl enable-linger %d failed; daemon persistence is limited to active login sessions: %v", target.uid, lingerErr)
+	// AIRA-121 gate condition C3: --stage=build places bytes and starts nothing,
+	// IN EVERY MODE. installSystemDropins writes under /etc and restarts
+	// systemd-oomd; enable-linger contacts logind. Both are start-time effects and
+	// neither may run in a `docker build` layer.
+	var activationErr error
+	if opts.stage != installStageBuild {
+		activationErr = installSystemDropins(d, target.uid, opts.dryRun)
+		if !opts.dryRun {
+			if _, lingerErr := d.run(timeoutArgv("loginctl", "enable-linger", strconv.Itoa(target.uid)), nil); lingerErr != nil {
+				d.logf("warning: loginctl enable-linger %d failed; daemon persistence is limited to active login sessions: %v", target.uid, lingerErr)
+			}
 		}
 	}
 	request := reexecRequestFor(executable, target, opts)
@@ -633,8 +704,19 @@ func reexecRequestFor(executable string, target installTarget, opts installOpts)
 	// and publishes the unit — takes the one snapshot. Resolving here as well
 	// would measure MemAvailable twice and record a value the unit was not
 	// rendered from.
-	if opts.ci {
+	if opts.ci && opts.ciValue == "" {
 		args = append(args, "--ci")
+	}
+	// AIRA-121 gate condition C3. The VALUE must travel: forwarding a bare --ci
+	// for a `--ci=auto` invocation would make the unprivileged leg -- the leg that
+	// actually renders and publishes -- take a different decision path from the
+	// one the root leg took, and forwarding nothing for --stage would make
+	// `sudo aira install --stage=build` run a full start under the covers.
+	if opts.ciValue != "" {
+		args = append(args, "--ci="+opts.ciValue)
+	}
+	if opts.stage != "" {
+		args = append(args, "--stage="+opts.stage)
 	}
 	// AIRA-106. Each daemon-mode option is forwarded ONLY when it was given
 	// explicitly. Forwarding them unconditionally (as this did) meant the
@@ -676,6 +758,26 @@ func timeoutArgv(command string, args ...string) []string {
 
 func runInstall(d installDeps, opts installOpts) error {
 	d = fillInstallDeps(d)
+	// AIRA-121. The mode decision comes FIRST, before the euid branch below.
+	// That order is gate condition C3: `docker build` runs as root by default and
+	// a root-running Batch container is ordinary, and runRootInstall requires a
+	// SUDO_USER identity, an owned /run/user/<uid> session directory, /etc
+	// drop-ins and loginctl enable-linger -- none of which exists there. A shim
+	// install needs none of them and installs for the current user's own HOME.
+	mode, report, resolvedBy, err := resolveInstallMode(d, opts)
+	if err != nil {
+		return err
+	}
+	if mode == runner.ConfineModeShim {
+		return runShimInstall(d, opts, report, resolvedBy)
+	}
+	// --ci=auto that resolved to the real path IS the --ci path from here on: one
+	// code path, one MemAvailable snapshot, and the resolution is reported either
+	// way so the two boxes are never silently different.
+	if opts.ciValue == "auto" {
+		opts.ci = true
+	}
+	opts.resolvedBy = resolvedBy
 	// AIRA-106: the ""-means-absent defaults are resolved in resolveDaemonModes,
 	// AFTER the installed unit has been read, not here. Filling them in at this
 	// point is exactly what made every re-install reset the watchdog's mode.
@@ -892,6 +994,40 @@ func runUserInstall(d installDeps, opts installOpts) error {
 		d.logf("%s: updated", d.anchorUnit)
 	} else {
 		d.logf("%s: up to date", d.anchorUnit)
+	}
+
+	// AIRA-121. The durable install-mode record is written on BOTH modes and on
+	// every stage that places bytes, so "which mode is this box in" has exactly
+	// one answer and one file to read it from -- which is what stops a client and
+	// the daemon from ever disagreeing.
+	resolvedBy := opts.resolvedBy
+	if resolvedBy == "" {
+		resolvedBy = "default"
+	}
+	if err := writeRealInstallModeRecord(d, paths, home, uid, resolvedBy); err != nil {
+		return err
+	}
+	d.logf("install mode: real-slice (resolved by %s)", resolvedBy)
+	d.logf("containment: enforced — per-job cgroup scope under %s", d.sliceUnit)
+
+	// AIRA-121 requirement 9. The BUILD stage stops here: everything above places
+	// bytes on disk (unit files and one record) and nothing above contacts
+	// systemd, the network, or a daemon, so it is safe inside a `docker build`
+	// RUN layer. Everything below starts or contacts something.
+	//
+	// The daemon unit is published here too rather than at its usual place lower
+	// down, because in a build layer there is no incumbent daemon to stop first --
+	// which is the only reason its publication is sequenced after the stop on the
+	// combined path. The combined and start paths keep that original ordering
+	// exactly; this publish is a no-op for them (publishManagedUnit compares
+	// content), and re-running it below is idempotent by the same property.
+	if opts.stage == installStageBuild {
+		if _, err := publishManagedUnit(d, dirfd, uid, d.daemonUnit, []byte(daemonUnit)); err != nil {
+			return unavailable(err)
+		}
+		d.logf("%s: placed", d.daemonUnit)
+		d.logf("build stage complete: units placed, nothing started, no systemd contacted, no /etc file written")
+		return nil
 	}
 
 	// Always reload. Content equality must never make a prior failed reload permanent.
@@ -2006,6 +2142,11 @@ func runStatus(d installDeps) error {
 		return err
 	}
 	uid := d.geteuid()
+	// AIRA-121. The recorded mode comes FIRST, because every line below it
+	// describes systemd units that ci-shim mode deliberately does not have -- so
+	// an operator reading a shim box's status without this line would see a
+	// screenful of absences and conclude the install had failed.
+	reportInstallMode(d)
 	unitDir := filepath.Join(home, ".config", "systemd", "user")
 	var content, anchorContent, daemonContent, whaleContent []byte
 	var unitErr, anchorErr, daemonErr, whaleErr error

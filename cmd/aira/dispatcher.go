@@ -170,6 +170,28 @@ func (d *daemonDispatcher) dispatchConfineManagement(ctx context.Context, reques
 	if daemon.IsRequestOutcomeUnknown(err) || !daemon.IsRequestNotSent(err) && store.ErrorCode(err) != daemon.CodeUnavailable {
 		return transportErrorResponse(err)
 	}
+	// AIRA-121. The daemon-down fallback below enumerates the REAL slice cgroup
+	// directory. In ci-shim mode there is no such directory and no cgroup record
+	// of anything, and the daemon's granted-waiter registry is the ONLY place a
+	// job is known -- so with the daemon unreachable there is nothing that can be
+	// established here.
+	//
+	// Reporting an empty list would be a fabrication: shim jobs launched while the
+	// daemon was down run with admission=unevaluated and are genuinely invisible
+	// to this process. So both verbs answer UNEVALUATED / refuse, and say why.
+	if runner.ResolveConfineMode() == runner.ConfineModeShim {
+		if request.Verb == "confine-list" {
+			return core.Response{OK: true, Code: "UNEVALUATED", Exit: 3, Data: runner.ConfineListResult{
+				Verdict: "unevaluated",
+				Reason: "ci-shim: the daemon is unreachable, and ci-shim mode has no cgroup directory to enumerate jobs from; " +
+					"start it with `aira install --ci=shim --stage=start`",
+				Scopes: []runner.ConfineRecord{},
+			}}
+		}
+		return confineClientError(fmt.Errorf(
+			"%s: ci-shim mode has no cgroup.kill backstop and the daemon is unreachable, so no job can be identified or killed; signal the confine supervisor's pid directly",
+			runner.CodeConfineKillUnconfirmed))
+	}
 	slice, _ := request.Args["slice"].(string)
 	resolve := d.resolveConfineSlice
 	if resolve == nil {

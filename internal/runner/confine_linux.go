@@ -107,6 +107,14 @@ type confineCommand struct {
 	cmd     *exec.Cmd
 	mu      sync.Mutex
 	process *os.Process
+	// AIRA-121. group is set only on the ci-shim launch path, where the child is
+	// made the leader of its own process group (Setpgid) so a forwarded signal
+	// can reach DESCENDANTS the real path reaches with cgroup.kill. reaped is the
+	// pgid-recycling cut-off: once cmd.Wait() has returned, the leader has been
+	// reaped and its pid may be reissued to an unrelated process, so no group
+	// signal may EVER be sent past that point.
+	group  bool
+	reaped bool
 }
 
 func (command *confineCommand) Start() error {
@@ -121,6 +129,44 @@ func (command *confineCommand) Process() *os.Process {
 	command.mu.Lock()
 	defer command.mu.Unlock()
 	return command.process
+}
+
+// markReaped closes the group-signal cut-off. Called exactly once, immediately
+// after cmd.Wait() returns.
+func (command *confineCommand) markReaped() {
+	command.mu.Lock()
+	defer command.mu.Unlock()
+	command.reaped = true
+}
+
+// signal delivers sig to the confined job. On the real path that is the direct
+// child, byte-identical to what confine has always done; the scope's own
+// cgroup.kill is what reaches descendants there.
+//
+// On the ci-shim path there is no cgroup.kill, so delivery is to the child's
+// process GROUP (requirement 8): kill(-pgid, sig) reaches every descendant that
+// has not deliberately setsid'd or double-forked out of the group. A descendant
+// that HAS is unreachable by any non-cgroup mechanism; that gap is documented
+// rather than papered over, and asserted by a negative test.
+func (command *confineCommand) signal(sig os.Signal) error {
+	command.mu.Lock()
+	defer command.mu.Unlock()
+	if command.process == nil {
+		return nil
+	}
+	if !command.group {
+		return command.process.Signal(sig)
+	}
+	if command.reaped {
+		// The leader has been reaped; its pid (and therefore this pgid) can have
+		// been reissued. Signalling now could hit an unrelated process group.
+		return nil
+	}
+	number, ok := sig.(syscall.Signal)
+	if !ok {
+		return command.process.Signal(sig)
+	}
+	return unix.Kill(-command.process.Pid, number)
 }
 
 type confineLockedWriter struct {
@@ -152,6 +198,11 @@ type confineDeps struct {
 	readUsage             func(string) cgroupUsage
 	reportPeak            func(context.Context, ConfineRequest, string, *int64, bool) error
 	queuePosition         func(context.Context, ConfineRequest, string) (confineQueuePosition, bool)
+	// resolveMode is the AIRA-121 confinement-mode seam. Production is
+	// ResolveConfineMode, which reads the durable install-mode record; tests
+	// substitute a constant so the shim path can be exercised without an
+	// installed record. It is READ ONCE per launch, before any slice work.
+	resolveMode           func() string
 	admitWaitDiagInterval time.Duration
 	// admitQueueProbeTimeout bounds ONE queue-position probe. Tests raise it
 	// well above their own patience so that "the grant cancelled the probe" is
@@ -187,6 +238,7 @@ func defaultConfineDeps() confineDeps {
 		readUsage:             readCgroupUsage,
 		reportPeak:            reportConfinePeak,
 		queuePosition:         confineQueuePositionFromDaemon,
+		resolveMode:           ResolveConfineMode,
 	}
 }
 
@@ -242,6 +294,9 @@ func fillConfineDeps(deps confineDeps) confineDeps {
 	}
 	if deps.queuePosition == nil {
 		deps.queuePosition = defaults.queuePosition
+	}
+	if deps.resolveMode == nil {
+		deps.resolveMode = defaults.resolveMode
 	}
 	return deps
 }
@@ -427,6 +482,15 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		return result, identityErr
 	}
 	request.Name, request.Owner = normalizedName, normalizedOwner
+	// AIRA-121. The ci-shim branch, taken HERE: after every argument, cap,
+	// reserve-bound and identity check (all of which are mode-independent and
+	// must refuse identically in both modes), and BEFORE the first line that
+	// touches a cgroup. Requirement 2 asks for the cgroup work to be skipped
+	// entirely rather than attempted and failed, and this placement is what makes
+	// that structural -- there is no cgroup syscall above the branch to issue.
+	if deps.resolveMode() == ConfineModeShim {
+		return confineShim(ctx, request, deps, result)
+	}
 	sliceName, path := explicitSlice, ""
 	if explicitSlice == "" {
 		var resolveErr error
@@ -748,13 +812,13 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 
 	var commandMu sync.RWMutex
 	var command *confineCommand
-	process := func() *os.Process {
+	deliver := func(sig os.Signal) error {
 		commandMu.RLock()
 		defer commandMu.RUnlock()
 		if command == nil {
 			return nil
 		}
-		return command.Process()
+		return command.signal(sig)
 	}
 	// AIRA-70 finding #1: a signal delivered to the supervisor itself used to
 	// leave no trace anywhere -- no log line, and a trailer identical to a clean
@@ -782,7 +846,7 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 	var supervisorSignal os.Signal
 	runEnded := false
 	signalEvents, stopSignalSource := deps.signalSource()
-	stopSignalHandler := forwardConfineSignals(signalEvents, process, func(received os.Signal) {
+	stopSignalHandler := forwardConfineSignals(signalEvents, deliver, func(received os.Signal) {
 		supervisorSignalMu.Lock()
 		late := runEnded
 		first := !late && supervisorSignal == nil
@@ -825,6 +889,12 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		return result, confineUnavailable(sliceName, fmt.Errorf("set memory.oom.group: %w", err))
 	}
 	result.Status.OOMGroup = ConfineOOMGroupSet
+	// AIRA-121. Enforced containment is claimed HERE and nowhere earlier: the
+	// finite-cap gate passed, the scope exists, and memory.oom.group is set, so
+	// all three legs of the claim ("a bounded per-job cgroup with a group kill")
+	// are established facts. A launch that failed before this point leaves the
+	// facet unevaluated rather than asserting a containment it never obtained.
+	result.Status.Containment = ConfineContainmentEnforced
 	// AIRA-110. memory.swap.max=0, UNCONDITIONALLY and before any cap decision
 	// below, because cgroup-v2's memory.max bounds memory and not memory+swap: a
 	// scope with only a memory.max is reclaimed into swap instead of being killed
@@ -1002,7 +1072,12 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		}
 	}
 	cmd.Env = pylib.AppendConfineChildEnvironment(confineEnvironment(request.Env), scopeID)
-	if request.DelegateRAM {
+	// AIRA-121 requirement 7: AitestBackendCanFunction is THE one gate on
+	// publishing the AIRA_AITEST_* coordinates. It is trivially true on this
+	// (real) path -- the shim path never reaches here -- and is called anyway so
+	// that the gate has exactly one name and one home, which is the single line
+	// AIRA-123 flips.
+	if request.DelegateRAM && AitestBackendCanFunction(ConfineModeReal) {
 		// aitest is only meaningful for a delegate-RAM launch (worker-admit
 		// grants nested sub-scopes under THIS job's own outer scope); every
 		// other launch gets no aitest coordinates at all, mirroring
@@ -1828,7 +1903,14 @@ func confineSignalSource() (<-chan os.Signal, func()) {
 // cleanup() the caller's own `defer cleanup()` already waits on through its
 // sync.Once. Callers stop the signal SOURCE before calling this, so no further
 // signal can be delivered while the join is in progress.
-func forwardConfineSignals(forward <-chan os.Signal, process func() *os.Process, onSignal func(os.Signal)) func() {
+//
+// AIRA-121: the delivery step is a `deliver` FUNCTION rather than a
+// `func() *os.Process` the forwarder signals itself. Shim mode signals the
+// child's process GROUP (requirement 8), and expressing that as a mode branch
+// INSIDE this loop would put the real path one careless edit away from
+// regressing. One seam, two implementations (confineCommand.signal), no branch
+// here at all.
+func forwardConfineSignals(forward <-chan os.Signal, deliver func(os.Signal) error, onSignal func(os.Signal)) func() {
 	done := make(chan struct{})
 	finished := make(chan struct{})
 	go func() {
@@ -1852,8 +1934,8 @@ func forwardConfineSignals(forward <-chan os.Signal, process func() *os.Process,
 				if onSignal != nil {
 					onSignal(received)
 				}
-				if child := process(); child != nil {
-					_ = child.Signal(received)
+				if deliver != nil {
+					_ = deliver(received)
 				}
 			case <-done:
 				return
@@ -2090,7 +2172,19 @@ func RunConfineSetup(argv []string, diagnostics io.Writer) int {
 	unix.CloseOnExec(releaseFD)
 	defer handshake.Close()
 	defer release.Close()
-	if verifyErr := verifyConfineSetupScope(); verifyErr != nil {
+	// AIRA-121. In ci-shim mode there is no scope to verify: no memory.oom.group
+	// was written and no finite memory.max exists anywhere in the ancestry, by
+	// design. Gated on the durable install-mode RECORD, not on a flag the parent
+	// could pass, so a forged-fd standalone invocation cannot use this to run a
+	// heavy job in an oom.group-but-uncapped cgroup on a REAL install -- the check
+	// this branch skips is the defence-in-depth mirror of confineWithDeps' own
+	// finite-cap refusal, and it stays armed wherever that refusal is armed.
+	//
+	// Everything AFTER this point still runs: oom_score_adj, nice and ionice are
+	// real kernel facts that work without cgroups, so the priorities facet stays a
+	// genuine observation rather than being degraded along with the scope.
+	shimSetup := ResolveConfineMode() == ConfineModeShim
+	if verifyErr := verifyConfineSetupScope(); verifyErr != nil && !shimSetup {
 		_ = writeConfineHandshake(handshake, confineHandshake{Schema: confineHandshakeSchema})
 		if diagnostics != nil {
 			_, _ = fmt.Fprintf(diagnostics, "confine setup: verify scope: %v\n", verifyErr)

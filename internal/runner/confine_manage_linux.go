@@ -338,33 +338,6 @@ func pidIsDead(pid int) bool {
 	return errors.Is(unix.Kill(pid, 0), unix.ESRCH)
 }
 
-// mergeConfineRegistry adds a Pending row for every admitted scope that is not
-// (yet) on disk. It no longer supplies name or owner: both come from the scope
-// id itself, which is authoritative and restart-surviving (AIRA-52). The
-// conflict/agreement dance this function used to perform — two waiters claiming
-// one scope id with different owners collapsing to "unknown" — went with it,
-// since one scope id can now only decode to one owner by construction.
-func mergeConfineRegistry(byID map[string]ConfineRecord, registry []ConfineRegistryEntry) {
-	for _, entry := range registry {
-		if _, exists := byID[entry.ScopeID]; exists {
-			continue
-		}
-		name, pid, stamp, owner, ok := parseConfineScopeID(entry.ScopeID)
-		if !ok {
-			continue
-		}
-		if owner == "" {
-			owner = ConfineUnknownOwner
-		}
-		record := ConfineRecord{Name: name, Owner: owner, ScopeID: entry.ScopeID, SupervisorPID: &pid, Pending: true, UnevaluatedFields: []string{"populated", "rss", "cap"}}
-		if age := time.Since(time.Unix(0, stamp)); age >= 0 {
-			seconds := int64(age / time.Second)
-			record.AgeSeconds = &seconds
-		}
-		byID[entry.ScopeID] = record
-	}
-}
-
 func parseConfineInt(data []byte) (int64, error) {
 	text := strings.TrimSpace(string(data))
 	if text == "" || len(strings.Fields(text)) != 1 {

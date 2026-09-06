@@ -172,6 +172,53 @@ const (
 	ConfineCPUWeightUnavailable ConfineCPUWeight = "unavailable"
 )
 
+// ConfineContainment (AIRA-121) names WHAT KIND of containment this launch
+// actually has. It exists because every other facet on this trailer describes a
+// property of a cgroup scope, and in ci-shim mode there IS no scope: without
+// this facet a shim job's trailer would say `cap=unevaluated scope=unverified`
+// -- a set of absences an operator reads as "something failed", not as "this
+// machine has no kernel backstop at all, by design".
+//
+// Three values, never two. The plan proposed exactly `enforced` and `advisory`
+// on the argument that both are always established; that is untrue for a launch
+// that aborted before the finite-cap gate ran, and rendering `enforced` for such
+// a status would be a fabricated containment claim -- the single most misleading
+// value this trailer could carry.
+type ConfineContainment string
+
+const (
+	// ConfineContainmentEnforced: a per-job cgroup scope exists under a
+	// finite-capped slice, with memory.oom.group and cgroup.kill behind it.
+	ConfineContainmentEnforced ConfineContainment = "enforced"
+	// ConfineContainmentAdvisory: ci-shim. Admission is a RAM-budget ledger and
+	// nothing else -- no cgroup, no memory.max, no kill backstop. A job that
+	// exceeds its booked reserve is not killed. The value spells out all three
+	// absences because the whole point of the facet is that "advisory" alone
+	// would be read as a weaker flavour of the same guarantee.
+	ConfineContainmentAdvisory ConfineContainment = "advisory(ci-shim,no-cgroup,no-kill-backstop)"
+	// ConfineContainmentUnevaluated: the launch never got far enough to
+	// establish either. Never rendered as enforced.
+	ConfineContainmentUnevaluated ConfineContainment = "unevaluated"
+)
+
+// AitestBackendCanFunction reports whether aitest's per-worker RAM containment
+// backend can actually work for a launch in this mode. It is the ONE gate on
+// publishing the AIRA_AITEST_* coordinates to a child.
+//
+// A consumer's conftest.py uses the PRESENCE of AIRA_AITEST_LIB alone as the
+// guard that activates the aitest plugin. So exporting it where worker-admit
+// cannot place a worker in a nested cgroup sub-scope would activate aitest,
+// aitest would attempt per-worker cgroup admission that structurally cannot
+// succeed, and a heavy suite would run under an apparent governance mechanism
+// with no backstop -- "invisible until something OOMs".
+//
+// INTERIM, by explicit ticket decision (AIRA-121 requirement 7). AIRA-123
+// extends worker-admit to a degraded ledger-only admission mode with no cgroup
+// sub-scope, honestly reported as advisory. When it lands, THIS FUNCTION is what
+// changes -- the rule becomes "export if the degraded backend can work in this
+// mode", not a flat never. Nothing else at either call site moves.
+func AitestBackendCanFunction(mode string) bool { return mode != ConfineModeShim }
+
 // ConfineStatus keeps the independently verified cap, admission, placement,
 // OOM-group, and priority facets separate. In particular, a successful
 // admission never fabricates a cap snapshot or implies priority success.
@@ -180,7 +227,11 @@ const (
 // stays the single operator-facing projection and a detached job's trailer cannot
 // drift from a foreground one's.
 type ConfineStatus struct {
-	Slice                string                    `json:"slice,omitempty"`
+	Slice string `json:"slice,omitempty"`
+	// Containment is AIRA-121's kind-of-containment facet. Always rendered on
+	// the trailer (see FormatConfineStatus); empty reads as unevaluated, never
+	// as enforced.
+	Containment          ConfineContainment        `json:"containment,omitempty"`
 	Cap                  ConfineCap                `json:"cap,omitempty"`
 	Admission            ConfineAdmission          `json:"admission,omitempty"`
 	AdmissionState       string                    `json:"admission_state,omitempty"`
@@ -546,7 +597,15 @@ func FormatConfineStatus(status ConfineStatus) string {
 	if slice == "" {
 		slice = "unevaluated"
 	}
-	line := "confine: slice=" + slice + " cap=" + string(capFacet)
+	// AIRA-121. Always rendered, on the same discipline as terminated-by and
+	// scope-swap.max: a trailer silent about WHAT KIND of containment it had is
+	// indistinguishable between a kernel-enforced scope and a ci-shim job with no
+	// backstop at all, which is exactly the silence this facet exists to end.
+	containment := status.Containment
+	if containment == "" {
+		containment = ConfineContainmentUnevaluated
+	}
+	line := "confine: slice=" + slice + " containment=" + string(containment) + " cap=" + string(capFacet)
 	if status.CapBytes > 0 {
 		line += "(" + FormatConfineBytes(status.CapBytes) + ")"
 	}

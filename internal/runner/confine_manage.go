@@ -197,6 +197,16 @@ type ConfineSliceReserve struct {
 	ResidualJobs  int   `json:"residual_jobs"`
 	ResidualBytes int64 `json:"residual_bytes"`
 
+	// AIRA-121. Containment/BudgetSource carry the ci-shim disposition on the
+	// SAME summary line the granted/ceiling numbers are printed on. Without them
+	// the reserve line in shim mode is byte-identical to a real slice's, which
+	// would present an ADVISORY budget as an enforced ceiling -- the one place an
+	// operator is most likely to read the number as a guarantee.
+	//
+	// Both empty in real mode, so every existing summary line is unchanged.
+	Containment  string `json:"containment,omitempty"`
+	BudgetSource string `json:"budget_source,omitempty"`
+
 	// Exclusive is AIRA-101's slice-exclusivity state, derived in the SAME locked
 	// pass as every count above so an operator can never be shown an exclusive
 	// holder alongside figures from a different instant.

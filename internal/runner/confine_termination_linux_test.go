@@ -558,7 +558,7 @@ func TestForwardConfineSignalsStopJoinsTheHandler(t *testing.T) {
 	release := make(chan struct{})
 	var mu sync.Mutex
 	running := false
-	stop := forwardConfineSignals(forward, func() *os.Process { return nil }, func(os.Signal) {
+	stop := forwardConfineSignals(forward, func(os.Signal) error { return nil }, func(os.Signal) {
 		mu.Lock()
 		running = true
 		mu.Unlock()

@@ -1659,19 +1659,35 @@ func (s *Server) admitConnection(conn net.Conn, args map[string]any) {
 		s.writeAdmitError(conn, admitErrorCode(err), err.Error())
 		return
 	}
-	resolve := s.admitResolveSlice
-	if resolve == nil {
-		resolve = resolveAdmitSlicePath
+	// AIRA-121 gate condition C6. --exclusive is refused HERE, before the request
+	// is ever queued, and that placement is the whole mechanism.
+	//
+	// In shim mode the confine scan honestly reports an empty slice (there are no
+	// cgroup scopes), and sliceProvablyEmpty would therefore grant exclusivity to
+	// an UNCONFINED job on the strength of an emptiness that says nothing about
+	// what else is running in this container. The plan proposed forcing
+	// liveScopesKnown false instead; that is not buildable through the scan seam --
+	// the only way a scan leaves liveness unknown is a Verdict=unevaluated result,
+	// which the evaluator converts to a scan ERROR, logs as "confine reserve scan
+	// failed", and uses to arm the exclusive abort anchor. Refusing up front makes
+	// liveScopesKnown's value irrelevant, because sliceProvablyEmpty's only reader
+	// is the exclusive drain gate.
+	//
+	// CodeAdmitExclusiveUnestablished is reused rather than a new code minted: its
+	// established meaning -- "an empty slice could not be established" -- is
+	// exactly, literally true here.
+	if s.shimMode() && request.exclusive {
+		s.writeAdmitError(conn, CodeAdmitExclusiveUnestablished,
+			CodeAdmitExclusiveUnestablished+": ci-shim mode has no cgroup scopes, so an empty slice cannot be established and exclusivity cannot be granted; run the benchmark on a real-slice install")
+		return
 	}
+	resolve := s.sliceResolver()
 	path, ok, reason := resolve(request.slice)
 	if !ok {
 		s.writeAdmitGrant(conn, AdmitResponse{State: "unevaluated", Reason: reason})
 		return
 	}
-	readMemory := s.admitReadMemory
-	if readMemory == nil {
-		readMemory = readSliceMemory
-	}
+	readMemory := s.memoryReader()
 	_, maximum, _, ok, reason := readMemory(path)
 	if !ok {
 		// The daemon answered; only the slice's live usage was unreadable. Report
@@ -2138,10 +2154,7 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			queue.capAggregate, queue.capAggregateKnown = s.aggregateScopeCap(queue, scanResult.Scopes, present, held)
 		}
 	}
-	readMemory := s.admitReadMemory
-	if readMemory == nil {
-		readMemory = readSliceMemory
-	}
+	readMemory := s.memoryReader()
 	current, maximum, reclaimable, ok, _ := readMemory(queue.path)
 	if !ok {
 		// Fail CLOSED: without a slice-memory read the ceiling cannot be
@@ -2783,7 +2796,34 @@ func exactAdmitInt64(value any) (int64, bool) {
 	}
 }
 
+// readSliceMemory is the REAL path's reading: a slice whose memory.max is `max`
+// has no ceiling to book against, so it is refused as unevaluated. Unchanged
+// behaviour, now expressed as the refusal it is on top of the usage read.
 func readSliceMemory(path string) (cur, max, reclaimable int64, ok bool, reason string) {
+	current, limit, reclaim, ok, reason := readSliceMemoryUsage(path)
+	if !ok {
+		return 0, 0, 0, false, reason
+	}
+	if limit <= 0 {
+		return 0, 0, 0, false, "unbounded"
+	}
+	return current, limit, reclaim, true, ""
+}
+
+// readSliceMemoryUsage reads a cgroup's LIVE usage and, separately, whatever
+// limit it declares — reporting limit==0 for `max` rather than refusing.
+//
+// The split exists because the two callers legitimately disagree about what an
+// unbounded memory.max means (AIRA-121 F1). On the real path a slice with no
+// limit has no ceiling and admission must refuse. In ci-shim mode the ceiling is
+// the RECORDED BUDGET, not the cgroup's own limit, so an unbounded memory.max is
+// not a refusal at all — it is precisely the multi-container-per-node case
+// --memory-max exists to serve (GCP Batch with taskCountPerNode > 1), where the
+// container's own cgroup still has a perfectly real memory.current to book
+// against. Refusing there sent readShimMemory to host-wide meminfo, whose
+// MemTotal-MemAvailable is not namespaced, and every job in the container then
+// answered E_ADMIT_TOO_LARGE for its whole life.
+func readSliceMemoryUsage(path string) (cur, max, reclaimable int64, ok bool, reason string) {
 	currentData, err := os.ReadFile(filepath.Join(path, "memory.current"))
 	if err != nil {
 		return 0, 0, 0, false, "read-error"
@@ -2796,12 +2836,12 @@ func readSliceMemory(path string) (cur, max, reclaimable int64, ok bool, reason 
 	if !valid {
 		return 0, 0, 0, false, "parse-error"
 	}
-	if strings.TrimSpace(string(maxData)) == "max" {
-		return 0, 0, 0, false, "unbounded"
-	}
-	limit, valid := parseAdmitMemory(maxData)
-	if !valid {
-		return 0, 0, 0, false, "parse-error"
+	var limit int64
+	if strings.TrimSpace(string(maxData)) != "max" {
+		limit, valid = parseAdmitMemory(maxData)
+		if !valid {
+			return 0, 0, 0, false, "parse-error"
+		}
 	}
 	// current and limit are already guaranteed >= 0 by parseAdmitMemory (valid
 	// implies non-negative), and checkedAvailable independently guards current<0
