@@ -110,7 +110,8 @@ first battery run surfaced genuinely porous tests.
 | `go build ./...` | 0 |
 | `go vet ./...` | 0 |
 | `go test ./...` (AIRA_REAL_CGROUP=1, all 14 packages) | 0 |
-| `go test -race ./internal/daemon/` excluding `TestSliceCeilingRealCgroupSignalTracksRealAccounting` | 0 |
+| `go test -race ./internal/daemon/` excluding the three pre-existing `TestSliceCeilingRealCgroup*` failures (AIRA-117) | 0 |
+| `gofmt -l` over every non-vendor `.go` file (what `make ci`'s fmt-check runs) | 0, no files listed |
 | mutation battery (18 mutants) | 0 survivors |
 
 `go test -race ./internal/daemon/` INCLUDING those three exits 1, on
