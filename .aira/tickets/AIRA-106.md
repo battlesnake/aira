@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-106","project":"aira","title":"Dynamic slice ceiling: replace single-headroom formula with min(TotalRAM-reserveMax, usage+(MemAvailable-freeMin))","status":"in-review","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","memory-safety"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-111","to":"AIRA-106"},{"kind":"relates","from":"AIRA-112","to":"AIRA-106"}]}
+{"schema":1,"id":"AIRA-106","project":"aira","title":"Dynamic slice ceiling: replace single-headroom formula with min(TotalRAM-reserveMax, usage+(MemAvailable-freeMin))","status":"done","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","memory-safety"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-111","to":"AIRA-106"},{"kind":"relates","from":"AIRA-112","to":"AIRA-106"}]}
 ---
 Owner decision (2026-09-05), replacing AIRA-103's own headroom formula with a better-specified one, as part of closing AIRA-91 Part B.
 
@@ -34,6 +34,9 @@ Once built and verified, this should also **flip AIRA-103 out of `mode=off`** โ€
 See AIRA-91 (Part B, now closed) and AIRA-103 (the mechanism this refines) for the complete history: why a kernel-enforced write was rejected, the measured non-slice footprint on this machine, and the two adversarial review rounds AIRA-103 already went through.
 
 ## Resolution
+
+**Merged: PR https://github.com/battlesnake/aira/pull/56, squash commit `7ecaf8a` on master.**
+Merged artifact independently re-verified on `origin/master` after the squash (not trusted from the PR description): the two-term formula, `CeilingBasis`, `sliceCeilingUsableFloor`, the install preservation fix, the `@SLICE_CEILING_MODE@` unit line and both real-cgroup bound tests are present; `clampSliceCeilingReserve`/`sliceCeilingReserve` and every `signalGovernor` reference are absent.
 
 Built, reviewed and merged. Design: `docs/superpowers/specs/2026-09-06-aira106-two-parameter-slice-ceiling-design.md` (plan v3 + a ยง0.3 build-review changelog).
 
