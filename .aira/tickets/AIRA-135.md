@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-135","project":"aira","title":"aira top: replace hex ID columns with PID/command, fix reserve truncation, shade unused-vs-used in the bar","status":"in-review","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["observability","tui"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-135","project":"aira","title":"aira top: replace hex ID columns with PID/command, fix reserve truncation, shade unused-vs-used in the bar","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["observability","tui"],"hold":false,"relations":[]}
 ---
 Requested directly by the owner, 2026-09-06, refining AIRA-127 (just shipped).
 
@@ -96,7 +96,7 @@ nil RSSBytes draws as one undivided shade; (e) the new column set and widths
 render correctly for values that would have truncated under the old
 hard-coded widths.
 
-## Resolution (in-review)
+## Resolution (done — PR #82 merged as 5288f46)
 
 Branch `aira135-top-columns-and-shading`. All three parts built as specified.
 
@@ -178,4 +178,50 @@ Dogfooded against real confined jobs through a real pty (tmux, 190 cols): the
 new columns render, COMMAND is read live from /proc and split at `--`, an argv
 containing newlines renders escaped, and the bar's per-slot regions paint the
 bright/dark split at exactly the computed column boundaries.
+
+## Review record (Fable build gate, 2026-09-06) — MERGE
+
+Reviewed at 638d01d in a detached worktree; merged as 5288f46.
+
+- **Truncation root cause, verified independently.** No `SetMaxWidth`/
+  `SetExpansion` exists anywhere in `cmd/aira`; `tview@v0.42.0/table.go:1018-1036`
+  sizes columns left to right and clamps the first column that overflows, then
+  drops the rest. A real listing carries OWNER ~29 and SCOPE-ID ~61 chars, so
+  the old nine columns overran an ordinary terminal before RESERVE. Removing
+  the hex and placing the unbounded COMMAND last is the correct fix.
+- **Command honesty, probed beyond the builder's cases.** Eleven argv shapes
+  plus real-process reads through the production reader: `-- sleep 100` ->
+  `sleep 100`; no `--` -> whole argv; `--memory-max` is not a bare separator;
+  trailing bare `--` / empty cmdline / only-NUL / whitespace-only tail -> nil +
+  `"command"` unevaluated; a zombie's empty cmdline -> unevaluated; a dead or
+  0/-1 pid -> error, never data; later `--` (with an embedded newline) kept.
+  Limit boundary: exactly 4096 bytes not elided, 4097 elided and marked.
+- **Bar shading, own scenarios.** 100 GiB over 37 columns (non-integer
+  mapping): alpha 10G/3G used -> 1 bright 2 dark; bravo 20G/25G used -> 8
+  bright 0 dark (clamped); charlie nil -> 2 undivided; delta 8G/0 used -> 0
+  bright 3 dark; echo 7G/7G -> 2 bright. A 200-iteration randomised check at
+  widths 20/37/64/101/190 with nil, zero, exact, overshoot and negative usage
+  confirmed the (Slot, Kind, Marker) of every column is identical with and
+  without usage: shading never moves any region edge.
+- **Mutations.** Nine of the sixteen claimed mutations re-applied and each went
+  red on the named test: last-`--` split, fabricated empty Command on read
+  failure, silent elision, Pending row dropping `"command"`, nil RSS as a
+  measured zero, no used>reserved clamp, cells ignoring the split, no tview
+  tag escaping, unconditional legend.
+- **Gate (clean tree, exact exit codes):** `aira confine -- go build ./...` 0;
+  `aira confine -- go vet ./...` 0; `AIRA_REAL_CGROUP=1 aira confine -- go test
+  ./... -count=1` 0 (14 packages ok).
+- **PID-reuse gap: keep the primitive, document it — accepted.** pid_max here
+  is 4194304, the window is bounded by the orphan reaper, and a mislabel can
+  drive no action (`--kill` resolves the selector to the scope and writes that
+  scope's `cgroup.kill`; it never signals the PID). A start-time cross-check
+  would be per-feature machinery for a display facet; if it is ever wanted it
+  belongs to the PID column and the reaper's death proof as one primitive.
+- **Nits, not blocking:** (1) the real-process scan test reads
+  `/proc/<pid>/cmdline` shortly after `Start()`; the kernel leaves cmdline
+  empty between the CLOEXEC-pipe close and `create_elf_tables`, so a settle
+  poll would remove a latent flake (200/200 passes observed). (2) The shade
+  legend is model-level: it appears when a split is computable, including a
+  fully-used region or one narrower than a column. (3) `ToValidUTF8` on the
+  elided path strips invalid bytes anywhere, not only at the cut.
 
