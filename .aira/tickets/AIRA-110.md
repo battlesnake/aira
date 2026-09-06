@@ -160,6 +160,15 @@ contradict. `aira.slice`'s own `MemorySwapMax=8G` is untouched — it is now a
 backstop for processes placed in the slice by hand rather than the only bound on
 AIRA's own jobs.
 
+**Adjacent gap, observed and left open rather than silently fixed:** `aira
+install` generates the slice unit with `MemoryMax`/`MemoryHigh` but writes no
+`MemorySwapMax`, so the live `8G` on this box came from the unit file by hand and
+a regenerating install could drop it. That is out of this ticket's scope (its
+whole subject is the per-scope bound) and the exposure it leaves is now small —
+every AIRA-created scope carries its own `memory.swap.max=0`, so a slice with no
+swap bound would only affect processes someone placed in `aira.slice` by hand.
+Worth its own ticket if the install path is touched again.
+
 ### Gate
 
 `go build ./...` exit 0 · `go vet ./...` exit 0 ·
