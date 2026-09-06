@@ -16,6 +16,7 @@ import (
 	"aira/internal/runner"
 
 	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 )
 
 // AIRA-127 viewmodel tests. Deliberately NOT terminal-rendering or
@@ -1455,5 +1456,68 @@ func TestTopViewModelRAMColumnNamesAnUnreadableReading(t *testing.T) {
 	}
 	if cells["CONFINE-bravo-102-bb"] != "1536M" {
 		t.Fatalf("RAM cell=%q, want the live 1536M reading", cells["CONFINE-bravo-102-bb"])
+	}
+}
+
+// AIRA-137 fix. topBarLegend must not end in its own newline: renderTopBar
+// joins every following line (the marker legend, OVER-SUBSCRIBED, each note)
+// with its OWN leading "\n", so a trailing one here doubles up into a blank
+// line. At a panel's real fixed height that blank line pushes the last line
+// off-panel rather than leaving a gap on screen — which is exactly what
+// silently dropped the CPU panel's notes and OVER-SUBSCRIBED line.
+func TestTopBarLegendHasNoTrailingNewline(t *testing.T) {
+	bar := &topBar{Kind: topBarCPU, Total: topCPUMicroCores, Free: topCPUMicroCores}
+	if legend := topBarLegend(bar); strings.HasSuffix(legend, "\n") {
+		t.Fatalf("topBarLegend=%q, want no trailing newline", legend)
+	}
+}
+
+// AIRA-137 fix. Drives renderTopBar exactly as it is really called — a
+// *tview.TextView with a real rect, so GetInnerRect's width check takes the
+// drawn path — and inspects the assembled text it hands to SetText. This is
+// NOT a screenshot test (no screen, no Draw): it is the model-to-text
+// assembly the smoke test's real screen would otherwise have to render to
+// notice was broken. A worst-realistic-case bar (one note, OVER-SUBSCRIBED)
+// must produce no blank line, and every line must fit inside the panel
+// height each bar is actually given in buildWidgets.
+func TestTopBarFitsItsPanelHeight(t *testing.T) {
+	cases := []struct {
+		kind   topBarKind
+		height int
+	}{
+		{topBarRAM, topRAMBarHeight},
+		{topBarCPU, topCPUBarHeight},
+	}
+	for _, testCase := range cases {
+		t.Run(string(testCase.kind), func(t *testing.T) {
+			bar := &topBar{
+				Kind: testCase.kind, Evaluated: true,
+				Total: 10 * topCPUMicroCores, Claimed: 9 * topCPUMicroCores,
+				Outside: 2 * topCPUMicroCores, OutsideKnown: true, Overcommitted: true,
+				Notes: []string{"one scope with an unevaluated rate not drawn"},
+			}
+			target := tview.NewTextView().SetDynamicColors(true).SetWrap(false)
+			target.SetBorder(true)
+			target.SetRect(0, 0, 80, testCase.height)
+			r := &tuiRuntime{}
+			r.renderTopBar(target, bar, panelState{Status: panelReady})
+			text := target.GetText(true)
+			lines := strings.Split(text, "\n")
+			for _, line := range lines {
+				if line == "" {
+					t.Fatalf("rendered bar has a blank line, text=%q", text)
+				}
+			}
+			if inner := testCase.height - 2; len(lines) > inner {
+				t.Fatalf("rendered bar has %d lines, want <= %d (panel height %d minus its border), text=%q",
+					len(lines), inner, testCase.height, text)
+			}
+			if !strings.Contains(text, "OVER-SUBSCRIBED") {
+				t.Fatalf("rendered bar missing OVER-SUBSCRIBED, text=%q", text)
+			}
+			if !strings.Contains(text, "one scope with an unevaluated rate not drawn") {
+				t.Fatalf("rendered bar missing its note, text=%q", text)
+			}
+		})
 	}
 }

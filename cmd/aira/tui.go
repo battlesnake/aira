@@ -221,8 +221,8 @@ func (r *tuiRuntime) buildWidgets() {
 			r.topCPUBar = tview.NewTextView().SetDynamicColors(true).SetWrap(false)
 			r.topCPUBar.SetBorder(true).SetTitle(" System CPU ")
 			content = tview.NewFlex().SetDirection(tview.FlexRow).
-				AddItem(r.topBar, 7, 0, false).
-				AddItem(r.topCPUBar, 5, 0, false).
+				AddItem(r.topBar, topRAMBarHeight, 0, false).
+				AddItem(r.topCPUBar, topCPUBarHeight, 0, false).
 				AddItem(table, 0, 1, true).
 				AddItem(footer, 1, 0, false)
 			r.panelPages.AddPage(string(view), content, true, false)
@@ -590,8 +590,15 @@ func (r *tuiRuntime) renderTopBar(target *tview.TextView, bar *topBar, panel pan
 // own vocabulary. The RAM bar's left-hand stack is a set of RESERVATIONS — what
 // jobs are allowed to hold — while the CPU bar's is MEASURED USE, and calling
 // either by the other's name would misdescribe what the colours mean.
+//
+// It carries NO trailing newline: renderTopBar joins every following line (the
+// marker legend, OVER-SUBSCRIBED, each note) with its own leading "\n", so a
+// trailing one here would insert a blank line ahead of them — which, at a real
+// panel's fixed height, pushes the last line off-panel instead of leaving a
+// gap. AIRA-137's CPU panel had no marker legend to absorb that lost row, so
+// its notes and OVER-SUBSCRIBED line were never drawn at all.
 func topBarLegend(bar *topBar) string {
-	return fmt.Sprintf("%s %s | %s %s%s | rest of system %s | %s %s\n",
+	return fmt.Sprintf("%s %s | %s %s%s | rest of system %s | %s %s",
 		topBarTotalNoun(bar), topFormatQuantity(bar.Kind, bar.Total),
 		topBarClaimNoun(bar), topFormatQuantity(bar.Kind, bar.Claimed), topShadeLegend(bar),
 		topOutsideText(bar), topBarFreeNoun(bar), topFormatQuantity(bar.Kind, bar.Free))
@@ -629,6 +636,19 @@ func topBarFreeNoun(bar *topBar) string {
 // a single column would stand for several gigabytes and every small reservation
 // would round away to nothing.
 const topBarMinColumns = 20
+
+// topRAMBarHeight and topCPUBarHeight are panel heights, border rows included,
+// sized to the worst line count each bar realistically prints — bar, legend,
+// (RAM only) marker legend, OVER-SUBSCRIBED, and one note. Two simultaneous
+// notes is a real but rare edge (e.g. both an unevaluated cap AND an
+// uncapped-scope count) that neither height budgets for, matching this
+// project's existing tolerance for that edge rather than growing the panel
+// for it — see TestTopBarLegendHasNoTrailingNewline and
+// TestTopBarFitsItsPanelHeight.
+const (
+	topRAMBarHeight = 7
+	topCPUBarHeight = 6
+)
 
 func topMarkerGlyph(name string) string {
 	switch name {

@@ -269,3 +269,44 @@ error in a rate is the DIFFERENCE between two consecutive ticks' scan durations
 over a one-second interval — far below the width of one terminal column, and
 below the precision of the kernel's own scheduler-tick accounting. Recorded on
 `readConfineCPUFrame` rather than papered over.
+
+### Fix round (Fable BLOCK on PR #84)
+
+Fable's review found a real P2: `topBarLegend` (`cmd/aira/tui.go`) returned a
+string ending in its own `\n`, and `renderTopBar` prefixes the marker legend,
+OVER-SUBSCRIBED and every note with their OWN leading `\n` — so a panel drawn
+at its real fixed height lost its LAST line to the resulting blank line. The
+CPU panel has no marker legend to absorb that lost row, so its notes and
+OVER-SUBSCRIBED line could never be drawn at all; the RAM panel lost one note
+line it used to fit. The fix: drop the trailing `\n` from `topBarLegend`
+(restores the RAM panel's layout exactly), and give the CPU panel one more row
+(5→6, matching its real worst-realistic-case content: bar, legend, one note,
+OVER-SUBSCRIBED). Two simultaneous notes is a real but rare edge neither panel
+height budgets for — pre-existing on the RAM panel (unaffected by this fix)
+and now consistent on the CPU panel; not chasing it further per this
+project's architectural-simplicity rule.
+
+Verified by reintroducing the exact bug and confirming both new tests
+(`TestTopBarLegendHasNoTrailingNewline`, `TestTopBarFitsItsPanelHeight`) go
+red with the failure signature Fable described, then confirming the fix
+restores both to green. Live-verified via tmux capture against the real
+production client binary: the RAM panel (which always carries a marker-legend
+line, so was live-affected even in the ordinary case) now shows bar / legend /
+marker-legend with no blank line, at its real fixed panel height. The CPU
+bar's happy-path arithmetic, colour consistency and rest-of-system computation
+were already independently verified live by Fable's own dogfood above and are
+untouched by this fix (a pure display-layer line-count bug, not a computation
+one).
+
+Also fixed Fable's F2 (non-blocking): the ci-shim `mergeConfineRegistry`
+pending-row fabricates no `command`, but was missing `cpu` from its
+`UnevaluatedFields` list despite `CPUUsageUsec` being nil on that path
+(`internal/runner/confine_shim_manage.go`) — added, no test pinned the old
+4-item list. F3 (a small duplicated tail between `topBarFor` and
+`topCPUBarFor`) is left as-is: Fable itself called it a cleanup opportunity,
+not the duplication the ticket warned against, and it is not a correctness
+issue.
+
+Gate after the fix round: `aira confine -- go build ./...` exit 0;
+`aira confine -- go vet ./...` exit 0; `AIRA_REAL_CGROUP=1 aira confine --
+go test ./... -count=1` exit 0, all 15 packages ok.

@@ -30,13 +30,14 @@ func mergeConfineRegistry(byID map[string]ConfineRecord, registry []ConfineRegis
 		if owner == "" {
 			owner = ConfineUnknownOwner
 		}
-		// AIRA-135 names "command" here on exactly the same grounds as the three
-		// fields beside it: this function performs NO live read of any kind (it is
-		// the cross-platform path the ci-shim daemon builds its whole listing from,
-		// and it must compile where there is no /proc to read), so the wrapped
-		// command is as unestablished here as the rss and the cap are. Naming it
-		// unevaluated is what stops a renderer printing an absence as a fact.
-		record := ConfineRecord{Name: name, Owner: owner, ScopeID: entry.ScopeID, SupervisorPID: &pid, Pending: true, UnevaluatedFields: []string{"populated", "rss", "cap", "command"}}
+		// AIRA-135 named "command" here on exactly the same grounds as the fields
+		// beside it, and AIRA-137 adds "cpu" on the same grounds again: this
+		// function performs NO live read of any kind (it is the cross-platform path
+		// the ci-shim daemon builds its whole listing from, and it must compile
+		// where there is no /proc or cgroup to read), so the wrapped command and the
+		// CPU usage are as unestablished here as the rss and the cap are. Naming
+		// them unevaluated is what stops a renderer printing an absence as a fact.
+		record := ConfineRecord{Name: name, Owner: owner, ScopeID: entry.ScopeID, SupervisorPID: &pid, Pending: true, UnevaluatedFields: []string{"populated", "rss", "cap", "command", "cpu"}}
 		if age := time.Since(time.Unix(0, stamp)); age >= 0 {
 			seconds := int64(age / time.Second)
 			record.AgeSeconds = &seconds
