@@ -3,6 +3,7 @@ package daemon
 import (
 	"errors"
 	"math"
+	"strconv"
 	"testing"
 	"time"
 
@@ -205,26 +206,49 @@ func TestAdmitReconstructionNonFiniteCapsContributeNeitherBytesNorHeadroom(t *te
 // AgeSeconds, which AIRA-29 reads as "age not established, treat as young" --
 // so it adopts its full cap for a second, independent reason.
 func TestAdmitReconstructionUsesDelegateRAMCapType(t *testing.T) {
-	now := time.Unix(650, 0)
-	server := reconstructionTestServer(&now, func(string) (runner.ConfineListResult, error) {
+	const (
+		markedCapBytes  = int64(10 << 30)
+		regularCapBytes = int64(3 << 30)
+		rss             = int64(1 << 30)
+	)
+	scope := func(scopeID string, capBytes int64) runner.ConfineRecord {
 		populated := 1
-		markedCap, regularCap := "10737418240", "3221225472" // 10 GiB / 3 GiB
-		markedRSS := int64(1 << 30)
-		return runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{
-			{ScopeID: "CONFINE-@dr-suite-1-a", Populated: &populated, Cap: &markedCap, RSSBytes: &markedRSS},
-			{ScopeID: "CONFINE-reserve-cap-2-b", Populated: &populated, Cap: &regularCap, RSSBytes: &markedRSS},
-		}}, nil
+		capText := strconv.FormatInt(capBytes, 10)
+		current := rss
+		return runner.ConfineRecord{ScopeID: scopeID, Populated: &populated, Cap: &capText, RSSBytes: &current}
+	}
+	adoptOne := func(t *testing.T, record runner.ConfineRecord) (*Server, int64, int) {
+		t.Helper()
+		now := time.Unix(650, 0)
+		server := reconstructionTestServer(&now, func(string) (runner.ConfineListResult, error) {
+			return runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{record}}, nil
+		})
+		queue := &sliceQueue{path: "/slice", server: server}
+		server.evaluateAdmitQueue(queue)
+		return server, queue.adopted, queue.adoptedJobs
+	}
+
+	// The two classes are asserted INDEPENDENTLY, one scope at a time. Asserting
+	// only their sum -- as this test used to -- lets equal and opposite errors in
+	// the two reconstruction arms cancel and pass, which is exactly the
+	// discrimination the test exists to provide (found by build review).
+	t.Run("marked ceiling adopts current plus margin", func(t *testing.T) {
+		server, adopted, jobs := adoptOne(t, scope("CONFINE-@dr-suite-1-a", markedCapBytes))
+		want := rss + server.chargeMargin(rss, 0)
+		if want >= markedCapBytes {
+			t.Fatalf("test arithmetic: the marked scope must adopt below its %d ceiling, got %d", markedCapBytes, want)
+		}
+		if adopted != want || jobs != 1 {
+			t.Fatalf("adopted=%d jobs=%d, want exactly current+margin %d / 1", adopted, jobs, want)
+		}
 	})
-	queue := &sliceQueue{path: "/slice", server: server}
-	server.evaluateAdmitQueue(queue)
-	wantMarked := int64(1<<30) + server.chargeMargin(int64(1<<30), 0)
-	if wantMarked >= int64(10<<30) {
-		t.Fatalf("test arithmetic: the marked scope must adopt below its %d ceiling, got %d", int64(10<<30), wantMarked)
-	}
-	want := wantMarked + int64(3<<30)
-	if queue.adopted != want || queue.adoptedJobs != 2 {
-		t.Fatalf("adopted=%d jobs=%d, want marked current+margin %d plus unmarked cap %d", queue.adopted, queue.adoptedJobs, wantMarked, int64(3<<30))
-	}
+
+	t.Run("ordinary finite cap adopts its whole cap", func(t *testing.T) {
+		_, adopted, jobs := adoptOne(t, scope("CONFINE-reserve-cap-2-b", regularCapBytes))
+		if adopted != regularCapBytes || jobs != 1 {
+			t.Fatalf("adopted=%d jobs=%d, want exactly the whole cap %d / 1", adopted, jobs, regularCapBytes)
+		}
+	})
 }
 
 func TestAdmitReconstructionSkipsEmptyAndUnknownScopes(t *testing.T) {

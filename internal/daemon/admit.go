@@ -243,6 +243,14 @@ type admitWaiter struct {
 	// is the least conservative moment there is. The cold floor is deliberately
 	// outside the ratchet: it MUST be able to lapse, or the feature could never
 	// engage at all.
+	//
+	// Stated precisely, because "monotone" is easy to over-claim: the RATCHET is
+	// unconditionally monotone, and the resulting CHARGE is monotone for a scope
+	// whose memory.max does not change -- which is every scope AIRA creates, since
+	// the cap is written once at setup and neither this change nor AIRA-103 ever
+	// moves a kernel-enforced value afterwards. An externally rewritten cap would
+	// take the charge down with it, because the clamp is applied after the
+	// ratchet; honouring a lowered hard cap is the correct behaviour there anyway.
 	effectiveCharge int64
 	chargeTracked   bool
 	peakSoFar       int64
@@ -888,15 +896,31 @@ func (s *Server) chargeMargin(peak, growth int64) int64 {
 	return margin
 }
 
-// adoptedScopeIsWarm reports whether an orphaned scope has run long enough for
-// its own memory.current to be a better reading than its admission estimate.
-// The scope directory's age is the only clock available for this: a daemon that
-// has restarted has no memory of when it granted anything.
+// adoptedScopeIsWarm reports whether an orphaned scope looks old enough for its
+// own memory.current to be a better reading than its admission estimate. A
+// daemon that has restarted has no memory of when it granted anything, so the
+// scope id's own timestamp is the only clock available.
+//
+// STATE THE LIMIT RATHER THAN OVERSELL IT (found by the adversarial build
+// review). AgeSeconds is derived from the SCOPE ID stamp
+// (confine_manage_linux.go), and a scope id is minted BEFORE admission
+// (confine_linux.go) -- so a job that queued for half an hour and then started
+// moments ago already reads as "old". If the daemon restarts inside that
+// window, such a job is adopted at its live usage rather than its full estimate,
+// which is the under-charge direction this gate exists to prevent. It is a
+// best-effort heuristic, not a proof of age, and the alternatives are worse:
+// directory mtime was already refuted for this purpose by the AIRA-64
+// real-cgroup tier, and keeping per-scope history across a restart is exactly
+// the daemon memory that does not survive one.
+//
+// What bounds the residual is that adoption is RE-DERIVED on every scan, so the
+// under-charge is one scan interval's growth -- the same bound the steady-state
+// path carries -- not a 90-second hole. Recorded as a plan residual.
 //
 // Fail-closed on an unestablished age (AgeSeconds is nil whenever the scope's
-// stat could not be taken), because the consequence of guessing wrong here is
-// the under-charge direction. A non-positive window means the cold-floor policy
-// is off entirely, which must mean the same thing here as it does in
+// stat could not be taken), because the consequence of guessing wrong is the
+// under-charge direction. A non-positive window means the cold-floor policy is
+// off entirely, which must mean the same thing here as it does in
 // chargeColdFloor -- no floor, so every scope is warm -- rather than the
 // opposite.
 func (s *Server) adoptedScopeIsWarm(record runner.ConfineRecord) bool {
@@ -981,8 +1005,24 @@ func (s *Server) recomputeWaiterCharge(waiter *admitWaiter, rss, capBytes int64,
 // memory.current is hierarchical, so the reading is correct regardless. Gating
 // on it here would silently drop live scopes OUT of the ledger, which is the
 // one direction this rule exists to prevent.
-func (s *Server) refreshWaiterCharge(queue *sliceQueue, waiter *admitWaiter, record runner.ConfineRecord, now time.Time) {
+//
+// One further exclusion, and it is a DOUBLE-BOOK rather than an unusable
+// reading: a scope with live `aira confine-reserve` SUB-RESERVATIONS is not
+// dynamically charged. Those children are scope-less waiters in this same queue,
+// each charging its own reserve, while the parent's memory.current is
+// HIERARCHICAL and already contains everything they have allocated. Charging the
+// parent its live usage too would count the same bytes twice: a suite's 28 GiB
+// of per-test reservations would sit in the ledger alongside a parent charge
+// that already included them, and a healthy 4 GiB job would then be refused with
+// half the slice physically free -- exactly the over-reservation this ticket
+// exists to remove. Such a parent therefore keeps its pinned framework overhead
+// as before, and the children remain the real charge. Found by the adversarial
+// build review.
+func (s *Server) refreshWaiterCharge(queue *sliceQueue, waiter *admitWaiter, record runner.ConfineRecord, subReserved map[string]struct{}, now time.Time) {
 	if !s.dynamicReserve {
+		return
+	}
+	if _, hasSubReservations := subReserved[waiter.scopeID]; hasSubReservations {
 		return
 	}
 	if record.RSSBytes == nil || *record.RSSBytes < 0 {
@@ -1814,6 +1854,19 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 				present[record.ScopeID] = record
 			}
 			held := make(map[string]struct{})
+			// AIRA-29. Parents that already have their children charged separately:
+			// see refreshWaiterCharge. Collected in its own pass because a
+			// sub-reservation may appear anywhere in the waiter list, before or
+			// after its parent.
+			subReserved := make(map[string]struct{})
+			for _, waiter := range queue.waiters {
+				if waiter == nil || waiter.state != admitGranted || !waiter.accounted {
+					continue
+				}
+				if waiter.parentScopeID != "" {
+					subReserved[waiter.parentScopeID] = struct{}{}
+				}
+			}
 			// The join direction here is load-bearing, not incidental: this walks
 			// WAITERS and looks records up, never the reverse. The scan ran
 			// lock-free before queue.mu was taken, so its snapshot may name a scope
@@ -1839,7 +1892,7 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 					// subtract are both guarded by, so the replacement must carry the
 					// identical guard or conservation stops holding.
 					if waiter.accounted {
-						s.refreshWaiterCharge(queue, waiter, record, now)
+						s.refreshWaiterCharge(queue, waiter, record, subReserved, now)
 					}
 					continue
 				}

@@ -3,6 +3,7 @@ package daemon
 import (
 	"errors"
 	"math"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -627,6 +628,24 @@ func TestPctClampNeverOverflows(t *testing.T) {
 			}
 		}
 	}
+	// The overflow branch must agree with the exact answer to within its stated
+	// error, a remainder smaller than pct. Computed here in big-integer-free form
+	// by splitting the multiply, so the assertion does not simply restate the
+	// implementation. Broad bounds alone leave a materially wrong overflow branch
+	// undetected -- which is how a 12x-too-large version survived a first pass.
+	for _, pct := range []int64{1, 12, 100} {
+		for _, value := range []int64{math.MaxInt64, math.MaxInt64 - 1, math.MaxInt64/pct + 1} {
+			if value <= 0 || value <= math.MaxInt64/pct {
+				continue // not the overflow branch
+			}
+			exact := value/100*pct + (value%100)*pct/100
+			got := pctClamp(value, pct)
+			if diff := exact - got; diff < 0 || diff >= pct {
+				t.Fatalf("pctClamp(%d, %d) = %d, exact %d, off by %d -- the stated error bound is a remainder below pct",
+					value, pct, got, exact, diff)
+			}
+		}
+	}
 	if got := pctClamp(-5, 12); got != 0 {
 		t.Fatalf("pctClamp(-5, 12) = %d, want 0", got)
 	}
@@ -801,10 +820,14 @@ func TestDynamicReserveFromEnvRefusesRatherThanSubstituting(t *testing.T) {
 			name = "value=" + testCase.value
 		}
 		t.Run(name, func(t *testing.T) {
+			// t.Setenv registers the restore; os.Unsetenv then gives a genuinely
+			// ABSENT variable, which is a different LookupEnv result from the
+			// empty string and must be tested as such.
+			t.Setenv("AIRA_DAEMON_DYNAMIC_RESERVE", "placeholder")
 			if testCase.set {
-				t.Setenv("AIRA_DAEMON_DYNAMIC_RESERVE", testCase.value)
-			} else {
-				t.Setenv("AIRA_DAEMON_DYNAMIC_RESERVE", "")
+				os.Setenv("AIRA_DAEMON_DYNAMIC_RESERVE", testCase.value)
+			} else if err := os.Unsetenv("AIRA_DAEMON_DYNAMIC_RESERVE"); err != nil {
+				t.Fatal(err)
 			}
 			got, err := dynamicReserveFromEnv()
 			if testCase.wantErr {
@@ -855,7 +878,79 @@ func TestDynamicChargeFreesSpaceForAQueuedWaiter(t *testing.T) {
 		t.Fatalf("the queued waiter was not admitted into the freed reserve (state=%v, outstanding=%d, hog charge=%d)",
 			queued.state, queue.outstanding, hog.ledgerCharge())
 	}
-	if queue.outstanding != hog.ledgerCharge()+queued.ledgerCharge() {
-		t.Fatalf("outstanding %d != %d + %d", queue.outstanding, hog.ledgerCharge(), queued.ledgerCharge())
+	// The GRANT must charge the whole frozen reserve and leave the waiter
+	// untracked. Asserting only `outstanding == hog + queued.ledgerCharge()`
+	// would pass against a grant that set chargeTracked with a zero charge --
+	// which is precisely the grant-before-scope-creation under-charge the
+	// untracked state exists to prevent, and it would be invisible because both
+	// sides of that equation would be wrong together.
+	if queued.chargeTracked {
+		t.Fatal("a freshly granted waiter must be UNTRACKED until a usable scan reading replaces its reserve")
+	}
+	if queued.ledgerCharge() != queued.reserve {
+		t.Fatalf("a freshly granted waiter charges %d, want its whole reserve %d", queued.ledgerCharge(), queued.reserve)
+	}
+	if queue.outstanding != hog.ledgerCharge()+queued.reserve {
+		t.Fatalf("outstanding %d != %d + %d", queue.outstanding, hog.ledgerCharge(), queued.reserve)
+	}
+}
+
+// TestDynamicChargeNotAppliedToAScopeWithSubReservations is the double-book
+// guard. A `--delegate-ram` suite's per-test `aira confine-reserve` waiters are
+// SCOPE-LESS waiters in this same queue, each charging its own reserve, while
+// the parent scope's memory.current is HIERARCHICAL and already contains
+// everything they allocated. Charging the parent its live usage as well counts
+// the same bytes twice, and the resulting over-charge refuses healthy jobs with
+// the slice half free -- the exact failure this ticket exists to remove,
+// reintroduced by its own fix.
+func TestDynamicChargeNotAppliedToAScopeWithSubReservations(t *testing.T) {
+	now := time.Unix(140_000, 0)
+	const overhead = 512 * mib // a delegate parent's pinned framework reserve
+	const scopeCap = 48 * gib
+	const childReserve = 20 * gib
+	const parentRSS = 22 * gib // the children's allocations, hierarchically
+
+	server := dynamicChargeServer(&now, func(string) (runner.ConfineListResult, error) {
+		return runner.ConfineListResult{Verdict: "pass", Scopes: []runner.ConfineRecord{
+			chargeScanRecord("CONFINE-@dr-suite-1-a", parentRSS, scopeCap),
+		}}, nil
+	})
+	parent := grantedChargeWaiter("CONFINE-@dr-suite-1-a", overhead, now.Add(-time.Hour))
+	// Deliberately listed BEFORE its parent: a sub-reservation may appear
+	// anywhere in the waiter list, so a single-pass implementation that only
+	// noticed children already seen would pass a parent-first ordering.
+	child := &admitWaiter{
+		seq: 2, reserve: childReserve, state: admitGranted, accounted: true,
+		parentScopeID: "CONFINE-@dr-suite-1-a",
+	}
+	queue := &sliceQueue{
+		path: "/slice", server: server, waiters: []*admitWaiter{child, parent},
+		outstanding: overhead + childReserve, outstandingJobs: 2,
+	}
+
+	server.evaluateAdmitQueue(queue)
+
+	if parent.chargeTracked {
+		t.Fatalf("the parent was dynamically charged %d while its children charge %d separately; that double-books the same bytes",
+			parent.ledgerCharge(), childReserve)
+	}
+	if parent.ledgerCharge() != overhead {
+		t.Fatalf("parent charge = %d, want its pinned overhead %d", parent.ledgerCharge(), overhead)
+	}
+	if want := overhead + childReserve; queue.outstanding != want {
+		t.Fatalf("outstanding = %d, want %d; the parent's hierarchical usage must not be added on top of its children", queue.outstanding, want)
+	}
+
+	// And once the sub-reservation releases, the parent becomes chargeable again
+	// -- the exclusion is a property of the CURRENT population, not a latch.
+	queue.mu.Lock()
+	releaseAdmitWaiterLocked(queue, child)
+	queue.mu.Unlock()
+	now = now.Add(time.Second)
+	queue.adoptedAt = time.Time{}
+	server.evaluateAdmitQueue(queue)
+
+	if !parent.chargeTracked {
+		t.Fatal("the parent stayed unchargeable after its last sub-reservation released; the exclusion must not latch")
 	}
 }

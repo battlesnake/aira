@@ -97,6 +97,17 @@ a statement about reserves.
 Waiters with no `scopeID` (plain `admit`, `confine-reserve`) are **never** dynamically
 replaced — there is no scope to read.
 
+**Nor is a scope that HAS live `confine-reserve` sub-reservations** (build review P1). Those
+children are scope-less waiters in this same queue, each charging its own reserve, while the
+parent's `memory.current` is hierarchical and already contains everything they allocated.
+Charging the parent its live usage as well would count the same bytes twice — a suite's
+28 GiB of per-test reservations sitting in the ledger beside a parent charge that already
+included them — and would then refuse a healthy 4 GiB job with half the slice physically
+free. That is the very over-reservation this ticket exists to remove, reintroduced by its
+own fix. Such a parent keeps its pinned framework overhead exactly as today; the exclusion
+is a property of the current waiter population, not a latch, so the parent becomes
+chargeable again once its last sub-reservation releases.
+
 ### 3.2 The charge formula
 
 Computed only from a usable scan record, under `queue.mu`. **`cap` is the record's own
@@ -382,6 +393,14 @@ slice. And it is not a utilisation regression for delegate, because the slice's 
   (f) a scope whose `memory.current` or `memory.max` becomes *persistently* unreadable holds
   its last charge and so under-charges its subsequent growth (§3.3), bounded below by the
   slice's own physical `current` term;
+  (h) **the post-restart age gate is a heuristic, not a proof of age.** `AgeSeconds` comes
+  from the SCOPE ID stamp, and a scope id is minted *before* admission, so a job that
+  queued half an hour and started moments ago already reads as old. If the daemon restarts
+  inside that window such a job is adopted at its live usage rather than its full estimate.
+  The alternatives are worse (directory mtime was refuted for this purpose by the AIRA-64
+  real-cgroup tier; per-scope history is exactly what a restart destroys), and the residual
+  is bounded by one scan interval's growth because adoption is re-derived every pass — the
+  same bound the steady-state path carries;
   (g) the cold floor is only materially protective for the **non-delegate** class, whose
   `reserve` is the whole-job estimate. A delegate waiter's `reserve` is the pinned 512 MiB
   overhead, so its first seconds of ramp are under-charged until the next scan observes them
@@ -548,3 +567,24 @@ survived grounding, three did not — each checked against the source rather tha
 | P1 the 90 s cliff frees tens of gigabytes at once and triggers a thundering-herd grant burst | **Refuted, and the reason written down.** `available` is recomputed per waiter against the already-updated `outstanding` (`admit.go:1586-1588`), and `checkedAvailable` still floors at real physical usage, so a burst inside one pass is serialised exactly as one across passes. Cliffs are per-job and stagger. No decay added. |
 | P1 a waiter released during the lock-free scan window leaves stale scan metrics that must be dropped | **Refuted, and the reason written down.** The update iterates `queue.waiters` and looks records up by `scopeID`, never the reverse; a released waiter is already out of the list under the same lock, so its record matches nothing. The join direction is now stated as load-bearing (§4). |
 | P2 overflow refusal leaves `outstanding` misaligned with physical state, potentially wedging | **Refuted.** Refusal is what *preserves* `outstanding == Σ effectiveCharge`; it is a defensive path that needs a charge near `MaxInt64`, unreachable with a 64 GiB slice cap. Admission is floored by the physical term regardless. |
+
+## 9. Disposition of the adversarial build review (Sol, against commit `744dc56`)
+
+A genuinely different pass: the plan gate reviewed a design, this one read the landed code
+in both the false-pass and false-fail directions and was told not to re-litigate the two
+scoped-out decisions. Verdict BLOCK, 2 P1 + 5 P2. Every finding was ground-checked against
+the source before acting; none were dismissed, and none were accepted on the reviewer's
+say-so alone.
+
+| Finding | Ground check | Disposition |
+|---|---|---|
+| **P1** a scope's live hierarchical `memory.current` is charged while its `confine-reserve` children still charge their full reserves — a DOUBLE-BOOK that can refuse a healthy 4 GiB job with ~32 GiB physically free | **Confirmed.** `confine-reserve` is live (`admit.go` `parentScopeID`, `pylib/env.go`); sub-reservations are scope-less waiters in the same queue; a delegate parent's own reserve is the small pinned overhead precisely because the children carry the real charge, so before this change there was no double-book | **Fixed.** A scope with live sub-reservations is excluded from dynamic charging (§3.1); new test asserts the parent keeps its overhead, the ledger stays at overhead+children, the child is listed *before* its parent, and the exclusion un-latches on release |
+| **P1** the post-restart age gate reads the SCOPE ID stamp, which is minted before admission, so a long-queued job that just started reads as warm | **Confirmed** (`confine_manage_linux.go` derives `AgeSeconds` from the stamp; `confine_linux.go` mints the id before the admit call) | **Claim corrected, not papered over.** The alternatives are worse (directory mtime already refuted by the AIRA-64 tier; per-scope history is what a restart destroys), and the residual is bounded by one scan interval because adoption is re-derived every pass. Written into the function's own doc and residual §4h |
+| **P2** the effective charge is not monotone across a `memory.max` change, contradicting the commentary | Reachable only by an external rewrite of a scope's cap; nothing in AIRA moves a kernel-enforced value after launch (AIRA-103's own principle) | **Comment scoped** to state the fixed-cap assumption rather than claim unconditional monotonicity |
+| **P2** `pctClamp`'s overflow branch drops a remainder, and the test only checked broad bounds | **Confirmed porous** — a 12x-too-large version passed `got >= 0` | **Fixed.** The test now asserts the overflow branch agrees with the exact answer to within its stated error (a remainder below `pct`), computed by splitting the multiply so it does not restate the implementation |
+| **P2** the env test's "unset" case actually sets the variable to `""` | **Confirmed** — `t.Setenv` cannot unset | **Fixed.** `t.Setenv` registers the restore, then `os.Unsetenv` gives a genuinely absent variable, so absent and empty are distinguished |
+| **P2** nothing proves `Serve` actually applies the parsed kill switch | **Confirmed, and pre-existing for all four of this file's env knobs** — `admitFreezeMaxHoldFromEnv`, `admitBackfillGrace`, and the watch/poll intervals are all tested at the parser and never through `Serve` | **Accepted coverage gap, written down rather than singled out.** Testing one of the four through `Serve` would need a socket, a DB and a live daemon for a one-line assignment; the honest fix is one test covering all four wirings, which belongs to its own change |
+| **P2** `TestDynamicChargeConservesTheLedger` seeds granted waiters rather than tracing a real grant, so a grant that set `chargeTracked` with a zero charge would pass | **Confirmed porous**, and this is the dangerous grant→scope-creation window | **Fixed.** `TestDynamicChargeFreesSpaceForAQueuedWaiter` drives a real grant and now asserts the granted waiter is UNTRACKED and charges exactly its reserve; a new mutant ("grant marks the waiter tracked with a zero charge") pins it |
+| **P2** the modified pre-existing reconstruction test asserts only an aggregate total, so equal-and-opposite class errors cancel — while its new comment claimed the assertions were separate | **Confirmed; the comment overstated what the test did** | **Fixed.** Split into two independent sub-tests, one scope each, so neither class can hide behind the other |
+
+**Mutation battery after the fixes: 18 deliberate breakages, 18 caught, 0 survivors.**
