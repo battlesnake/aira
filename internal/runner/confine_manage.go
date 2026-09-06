@@ -169,6 +169,26 @@ type ConfineSliceReserve struct {
 	CeilingWouldBeBytes int64  `json:"ceiling_would_be_bytes,omitempty"`
 	MemAvailableBytes   int64  `json:"mem_available_bytes,omitempty"`
 
+	// AIRA-114. The aggregate over-subscription bound: how much memory every
+	// LIVE scope on this slice is permitted to hold at once (the sum of their own
+	// memory.max values), against the multiple of the ceiling admission allows.
+	// It answers a question none of the numbers above can. The ledger reports
+	// what is CHARGED, and since AIRA-29 that is live usage, so a slice can look
+	// half empty while the caps already handed out total far more than it holds.
+	//
+	// CapBoundBytes is zero when the bound is switched off — an ABSENCE, so the
+	// renderer prints nothing rather than a limit of zero.
+	//
+	// CapAggregateKnown is the honesty bit and is required: a zero
+	// CapAggregateBytes means "no live capped scope" only while it is true. When
+	// false the daemon could not establish the total (a failing confine scan, or
+	// a live scope whose memory.max and memory.current were both unreadable), the
+	// bound is withholding nothing, and every surface must say unevaluated rather
+	// than render the zero as an idle slice.
+	CapAggregateBytes int64 `json:"cap_aggregate_bytes,omitempty"`
+	CapAggregateKnown bool  `json:"cap_aggregate_known,omitempty"`
+	CapBoundBytes     int64 `json:"cap_bound_bytes,omitempty"`
+
 	// ResidualJobs/ResidualBytes cross-check the derived split against the
 	// daemon's incremental counters. They are equal by construction, so a
 	// non-zero value here is a real lost or double ledger discharge. Signed:

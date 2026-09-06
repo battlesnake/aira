@@ -205,6 +205,11 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 				Reserve: reservationBytes, HeldMS: 90000,
 			}},
 			AdoptedJobs: adoptedJobs, AdoptedBytes: adopted,
+			// AIRA-114. The bound is ON by default, so its limit is reported.
+			// CapAggregateKnown stays FALSE here because no evaluator pass has
+			// scanned this fixture's slice, and an unevaluated aggregate must
+			// present as unevaluated rather than as a measured zero.
+			CapBoundBytes: maximum * oversubscriptionFactorPctDefault / 100,
 		}
 		if got := *result.SliceReserve; !reflect.DeepEqual(got, want) {
 			t.Fatalf("slice reserve=%+v, want %+v", got, want)
@@ -228,6 +233,7 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		want := runner.ConfineSliceReserve{
 			GrantedBytes: adopted, CeilingBytes: wantCeiling, Jobs: adoptedJobs, Queued: 0, FreezePhase: "idle",
 			AdoptedJobs: adoptedJobs, AdoptedBytes: adopted,
+			CapBoundBytes: maximum * oversubscriptionFactorPctDefault / 100,
 		}
 		// Reservations is nil here, and that is a POSITIVE fact from the same
 		// walk (this fixture cleared the waiter list), not an unevaluated read.

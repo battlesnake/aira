@@ -219,6 +219,13 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				CeilingHeld:        ceiling.Held,
 				CeilingStaticBytes: ceiling.StaticMax,
 				MemAvailableBytes:  ceiling.MemAvailable,
+				// AIRA-114. From the SAME snapshot and the SAME ceiling reading the
+				// evaluator's own gate uses, so this line can never describe a
+				// different instant or a different slice size than the decision it
+				// explains.
+				CapAggregateBytes: snapshot.capAggregate,
+				CapAggregateKnown: snapshot.capAggregateKnown,
+				CapBoundBytes:     s.oversubscriptionLimit(ceilingMaximum),
 			}
 			// AIRA-101, from the SAME snapshot, so the exclusive holder and the
 			// counts above can never describe different instants. Left nil when
