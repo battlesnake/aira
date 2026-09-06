@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-134","project":"aira","title":"aira tui/aira top panics (not a clean error) when the terminal screen fails to initialize","status":"planned","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["honesty","tui"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-134","project":"aira","title":"aira tui/aira top panics (not a clean error) when the terminal screen fails to initialize","status":"in-review","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["honesty","tui"],"hold":false,"relations":[]}
 ---
 Found dogfooding AIRA-127's deployed binary, 2026-09-06. Reproduced on BOTH `aira top`
 and the pre-existing `aira tui` — confirmed pre-existing, not a regression from AIRA-127, just
@@ -81,3 +81,97 @@ simulated/injected in this codebase's existing TUI test harness -- check how the
 already fake tcell/tview, if they do) and asserts the process/function returns the E_INTERNAL error
 cleanly with NO panic, verified by reverting the fix and confirming the test panics/fails against
 the old code.
+
+## Resolution (in-review)
+
+Branch `aira134-tui-screen-init-panic`. The traced hypothesis is **confirmed exactly**,
+line for line, against tview v0.42.0 and tcell v2.13.10.
+
+### Mechanism, build-verified
+
+- `tview.(*Application).Run()` (application.go:279) creates its own screen only when
+  none was injected. Its two early error returns differ in a way that matters:
+  `tcell.NewScreen()` failing leaves `a.screen` **nil**, but `a.screen.Init()` failing
+  returns the error while **leaving `a.screen` set to the uninitialised screen**.
+- `tcell.(*tScreen).Init()` (tscreen.go:189) calls `initialize()` first, which is the
+  `NewDevTty()` open of `/dev/tty`. On failure it returns BEFORE
+  `t.quit = make(chan struct{})` (tscreen.go:232), so `t.quit` stays nil.
+- `tview.(*Application).Stop()` (application.go:624) then calls `screen.Fini()`, and
+  `tScreen.Fini` → `finiOnce.Do(finish)` → `close(t.quit)` on a nil channel.
+- `coordinateShutdown`'s `<-r.ctx.Done()` did not distinguish an external cancellation
+  (a live `app.Run()` that Stop() must unblock) from `run()`'s own unconditional
+  `r.cancel()` after `app.Run()` had already returned by itself.
+
+Two findings beyond the report:
+
+1. The crash is worse than "panic after the honest error". `run()` blocks on
+   `<-r.coordDone`, so the coordinator panics *before* `run()` returns — the
+   `E_INTERNAL` line is never printed at all. Verified: pre-fix `aira top` in a
+   terminal-less context emits only the panic.
+2. The existing `tcell.SimulationScreen` harness **cannot** reach this bug, for two
+   independent reasons: `simscreen.Fini` guards `if s.quit != nil` (simulation.go:153),
+   and an injected screen makes tview's `Run()` skip the create-and-Init block entirely,
+   so `Run()` never returns early. This is why the regression test is a subprocess.
+
+Rejected alternatives:
+
+- Pre-`Init()`ing our own screen and handing it to `SetScreen`: `SetScreen`
+  unconditionally calls `Init()` itself and swallows the error, and a second
+  `tScreen.Init()` reallocates `quit`/`eventQ` and then fails `engage()` with
+  "already engaged". Actively harmful.
+- Gating on "the screen drew at least once" (`SetAfterDrawFunc`): fails in the wrong
+  direction — a cancellation arriving before the first draw would skip a Stop() that a
+  live `Run()` needs, converting a rare panic into a rare **hang**.
+- A `recover()` guard: not needed. The ordering fix is not fragile (see below), and the
+  project rule is to keep the primitive rather than stack defensive machinery.
+
+### Fix
+
+`cmd/aira/tui.go`, in the code both `aira tui` and `aira top` share:
+
+- New `tuiRuntime.appRunDone` channel, closed in `run()` **immediately after**
+  `app.Run()` returns and **before** `r.cancel()`, so the coordinator woken by that very
+  cancel observes it.
+- `coordinateShutdown` still joins the executor and the pump, then calls `app.Stop()`
+  only if `appRunDone` is still open.
+
+Skipping Stop() once Run() has returned is always correct: a Run() that returned
+normally already nil'd tview's screen (Stop() would be a no-op), and a Run() that
+returned on a screen-init failure never brought a terminal up to restore. The ordering
+is not racy in the direction that panics: the only uninit'd-screen return is tview's
+synchronous early return microseconds into `Run()`, which cannot coexist with a
+coordinator that has already completed `executor.wait()` and `<-pumpDone` on an
+external cancel.
+
+### Tests
+
+`cmd/aira/tui_screen_init_test.go` —
+`TestTUIScreenInitFailureExitsCleanlyWithoutPanic`. The test re-execs the test binary
+with `SysProcAttr{Setsid: true}` and non-tty standard streams, so the child has no
+controlling terminal and tcell's `/dev/tty` open genuinely fails; `TERM=xterm` is pinned
+so `tcell.NewScreen()` still succeeds and the failure lands in `Init()` (an unset TERM
+would fail earlier, leave tview holding no screen, and false-pass). It asserts no
+`panic:`, the `E_INTERNAL: tui:` line, and exit 4. The child checks both preconditions
+itself and exits 97 with a marker if either is unmet, so the parent reports
+**unevaluated** (t.Skip) rather than a fake pass.
+
+Non-porosity, both directions:
+
+- Reverting to the unconditional `r.app.Stop()` makes the new test FAIL with the exact
+  reported stack (`panic: close of nil channel` → `tScreen.finish` → `tview.Stop` →
+  `coordinateShutdown`).
+- Making the skip unconditional (never Stop()) makes the pre-existing
+  `TestTUIKeypressAndQuitWhileFetchAndQueueUpdateAreInFlight` FAIL with "TUI quit
+  deadlocked or did not complete". The normal interactive teardown is therefore still
+  pinned by an existing test.
+
+Manual confirmation on the real binary: `setsid --wait ./aira tui|top </dev/null` now
+prints `E_INTERNAL: tui: open /dev/tty: no such device or address` and exits 4 for both
+verbs, with no panic; and driven on a real pty (`script -qec './aira top'`) the
+dashboard renders and `q` still quits cleanly with exit 0 — i.e. Stop() is still called
+for a live screen.
+
+### Gates
+
+`aira confine -- go build ./...` exit 0; `aira confine -- go vet ./...` exit 0;
+`AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` exit 0.

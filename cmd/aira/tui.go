@@ -75,6 +75,10 @@ type tuiRuntime struct {
 	cancel               context.CancelFunc
 	pumpDone             chan struct{}
 	coordDone            chan struct{}
+	// appRunDone closes as soon as app.Run() has returned, which is what tells
+	// the shutdown coordinator whether an app.Stop() is still needed or is now
+	// actively unsafe. See coordinateShutdown.
+	appRunDone chan struct{}
 	// queueUpdateStarted is a test-only observation seam. It never carries
 	// state and is nil in production.
 	queueUpdateStarted chan<- struct{}
@@ -132,8 +136,9 @@ func newTUIRuntimeForViews(parent context.Context, dispatcher, executeDispatcher
 	runtime := &tuiRuntime{
 		app: tview.NewApplication(), state: newTUIStateForViews(512, views, data), descriptors: core.New(nil).DispatchDescriptors(),
 		ctx: ctx, cancel: cancel, pumpDone: make(chan struct{}), coordDone: make(chan struct{}),
-		views:  append([]tuiView(nil), views...),
-		tables: make(map[tuiView]*tview.Table), details: make(map[tuiView]*tview.TextView), footers: make(map[tuiView]*tview.TextView),
+		appRunDone: make(chan struct{}),
+		views:      append([]tuiView(nil), views...),
+		tables:     make(map[tuiView]*tview.Table), details: make(map[tuiView]*tview.TextView), footers: make(map[tuiView]*tview.TextView),
 		executeDispatcher: executeDispatcher, canExecute: executeDispatcher != nil, scope: scope,
 		stdin: stdin, stdout: stdout, stderr: stderr,
 	}
@@ -164,6 +169,10 @@ func (r *tuiRuntime) run() error {
 	go r.pump()
 	go r.coordinateShutdown()
 	err := r.app.Run()
+	// Publish "Run() is over" BEFORE cancelling, so that the coordinator woken by
+	// this very cancel observes it. The coordinator's Stop() is only correct
+	// while Run() is still live; see coordinateShutdown.
+	close(r.appRunDone)
 	r.cancel()
 	<-r.coordDone
 	return err
@@ -417,11 +426,39 @@ func (r *tuiRuntime) applyAsync(message tuiMessage) {
 	r.submitCommands(commands)
 }
 
+// coordinateShutdown joins the executor and the pump off the UI goroutine, then
+// unblocks the tview event loop.
+//
+// ctx.Done() wakes it for two structurally different reasons, and only one of
+// them wants an app.Stop():
+//
+//   - An EXTERNAL cancellation (SIGINT/SIGTERM, or the q key's cmdQuit) while
+//     app.Run() is genuinely still driving a live screen. Stop() is what makes
+//     Run() return, so it is load-bearing here and must not be skipped.
+//   - run()'s OWN r.cancel(), which fires unconditionally AFTER app.Run() has
+//     already returned by itself. Then Stop() is not merely redundant, it is
+//     unsafe: when tview's Run() fails at screen initialisation (no controlling
+//     terminal — `open /dev/tty: no such device or address`) it returns the
+//     error while LEAVING a.screen set to the screen it never initialised, so
+//     Stop() calls Fini() on it and tcell's tScreen.finish() closes a quit
+//     channel a failed Init() never allocated: `panic: close of nil channel`.
+//     That turned `aira tui`/`aira top` in a terminal-less context into a crash
+//     that replaced the honest E_INTERNAL entirely (AIRA-134).
+//
+// appRunDone distinguishes them. Skipping Stop() once Run() has returned is
+// always correct: a Run() that returned normally already nil'd tview's screen,
+// making Stop() a no-op, and a Run() that returned on a screen-init failure
+// never brought a terminal up to restore.
 func (r *tuiRuntime) coordinateShutdown() {
 	defer close(r.coordDone)
 	<-r.ctx.Done()
 	r.executor.wait()
 	<-r.pumpDone
+	select {
+	case <-r.appRunDone:
+		return
+	default:
+	}
 	r.app.Stop()
 }
 
