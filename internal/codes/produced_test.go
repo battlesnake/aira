@@ -225,6 +225,12 @@ func TestCataloguedExitsFollowThePrefixConvention(t *testing.T) {
 // error built from a variable code (fmt.Errorf("%s: ...", code)); every such
 // site in the tree passes an E_ or U_ constant, and the E_/U_ side of that is
 // what TestCataloguedExitsFollowThePrefixConvention constrains.
+//
+// That bare-literal exemption is exactly why this test is not the whole story.
+// Two fields reach Response.Code as a plain string without an error ever
+// existing, so a bare W_ literal in one of them is the same hazard wearing a
+// shape this scan is designed to ignore. AIRA-109 covers those two shapes in
+// TestNoWarningCodeIsAssignedAsADirectResponseCode below.
 func TestNoWarningCodeIsRaisedAsAnError(t *testing.T) {
 	root := moduleRoot(t)
 	forEachSourceFile(t, root, func(rel string, fset *token.FileSet, file *ast.File) {
@@ -245,6 +251,273 @@ func TestNoWarningCodeIsRaisedAsAnError(t *testing.T) {
 			return true
 		})
 	})
+}
+
+// The two shapes that put a code into Response.Code without ever building an
+// error. Named so a failure says which one the author reached for.
+const (
+	shapeHandlerDataCode  = "handlerData{Code: ...}"
+	shapeErrorCodesAppend = "an append onto RunRecord.ErrorCodes"
+)
+
+// directCodeSite is one place a whole code literal is handed to a field that
+// core.Do turns into Response.Code directly.
+type directCodeSite struct {
+	shape string
+	code  string
+	line  int
+}
+
+// scanDirectResponseCodeLiterals finds every whole code literal written into
+// one of the two direct-to-Response.Code fields in a single file.
+//
+// It matches by AST shape and by name, deliberately, because that is all a
+// static scan in package codes can do: codes must not import core or runner,
+// and a type-checked scan would drag the whole module into this package's test
+// binary for no extra safety. The names are pinned by
+// TestNoWarningCodeIsAssignedAsADirectResponseCode's non-vacuity guard, which
+// fails if either shape stops matching anything at all — so a rename that
+// blinded this scan surfaces as a failing test rather than as silence.
+func scanDirectResponseCodeLiterals(fset *token.FileSet, file *ast.File) []directCodeSite {
+	var sites []directCodeSite
+	record := func(shape string, expr ast.Expr) {
+		lit, ok := expr.(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return
+		}
+		value, err := strconv.Unquote(lit.Value)
+		if err != nil || !codePattern.MatchString(value) {
+			return
+		}
+		sites = append(sites, directCodeSite{shape: shape, code: value, line: fset.Position(lit.Pos()).Line})
+	}
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.CompositeLit:
+			if !namesHandlerData(typed.Type) {
+				return true
+			}
+			for _, element := range typed.Elts {
+				kv, ok := element.(*ast.KeyValueExpr)
+				if !ok {
+					continue
+				}
+				if key, ok := kv.Key.(*ast.Ident); ok && key.Name == "Code" {
+					record(shapeHandlerDataCode, kv.Value)
+				}
+			}
+		case *ast.CallExpr:
+			if len(typed.Args) < 2 || !namesAppend(typed.Fun) || !namesErrorCodes(typed.Args[0]) {
+				return true
+			}
+			for _, arg := range typed.Args[1:] {
+				record(shapeErrorCodesAppend, arg)
+			}
+		}
+		return true
+	})
+	return sites
+}
+
+// namesHandlerData matches core's handlerData composite literal, including the
+// pointer and qualified forms an author might reach for.
+func namesHandlerData(expr ast.Expr) bool {
+	switch typed := expr.(type) {
+	case *ast.Ident:
+		return typed.Name == "handlerData"
+	case *ast.SelectorExpr:
+		return typed.Sel.Name == "handlerData"
+	case *ast.StarExpr:
+		return namesHandlerData(typed.X)
+	}
+	return false
+}
+
+// namesAppend matches the two ways the tree grows an ErrorCodes slice: the
+// builtin and runner's appendUnique helper.
+func namesAppend(expr ast.Expr) bool {
+	name := ""
+	switch typed := expr.(type) {
+	case *ast.Ident:
+		name = typed.Name
+	case *ast.SelectorExpr:
+		name = typed.Sel.Name
+	}
+	return name == "append" || name == "appendUnique"
+}
+
+// namesErrorCodes matches the slice being appended to, so appendUnique onto
+// TicketRecord.Warnings — a legitimate home for a bare W_ literal — is left
+// alone.
+func namesErrorCodes(expr ast.Expr) bool {
+	switch typed := expr.(type) {
+	case *ast.Ident:
+		return typed.Name == "ErrorCodes"
+	case *ast.SelectorExpr:
+		return typed.Sel.Name == "ErrorCodes"
+	}
+	return false
+}
+
+// warningBypasses reduces a scan to the sites that actually break the rule.
+// Shared by the tree-wide test and the planted-source tests so both assert on
+// the same predicate rather than on two that could drift apart.
+func warningBypasses(sites []directCodeSite) []directCodeSite {
+	var bad []directCodeSite
+	for _, site := range sites {
+		if strings.HasPrefix(site.code, "W_") {
+			bad = append(bad, site)
+		}
+	}
+	return bad
+}
+
+// TestNoWarningCodeIsAssignedAsADirectResponseCode closes the two paths into
+// Response.Code that TestNoWarningCodeIsRaisedAsAnError and store.ErrorCode
+// both structurally cannot see (AIRA-109, surfaced by the AIRA-99 review).
+//
+// Both of those guards work on an `error` whose message is "CODE: message".
+// core.handlerData.Code and runner.RunRecord.ErrorCodes never construct an
+// error at all: they are plain strings their producers assign, which core.Do
+// reads at its handlerCode branch and via runRecordCode and turns straight into
+// `Response{OK: false, Code: code, Exit: codes.ExitForCode(code)}`. A W_ code
+// there is the exact AIRA-99 hazard — a response that reports a failure and
+// exits 0 — with neither existing safeguard able to observe it.
+//
+// The predicate is deliberately narrow. A bare W_ literal is legitimate and
+// common as a CheckFinding.Code or a TicketRecord.Warnings entry, so flagging
+// every bare W_ literal would be noise that trains authors to work around the
+// check. Only the two shapes above are flagged.
+//
+// Recorded limitations, not claimed away:
+//   - Only a whole literal is seen. A code that arrives in either field through
+//     a variable (runner_linux.go appends launch.Code and decision.diagnostic;
+//     core.go builds handlerData{Code: gitErr.Code()}) is invisible here, the
+//     same blind spot TestNoWarningCodeIsRaisedAsAnError records for
+//     fmt.Errorf("%s: ...", code).
+//   - Only append and appendUnique are matched, not a whole-slice assignment
+//     (`record.ErrorCodes = []string{"W_X"}` or `ErrorCodes: []string{"W_X"}` in
+//     a RunRecord literal). No site in the tree writes ErrorCodes that way today
+//     — every one of the ~40 writes goes through appendUnique — so covering it
+//     would be machinery for a shape nobody uses; if one ever appears, this is
+//     where to extend.
+func TestNoWarningCodeIsAssignedAsADirectResponseCode(t *testing.T) {
+	root := moduleRoot(t)
+	seen := map[string]int{}
+	forEachSourceFile(t, root, func(rel string, fset *token.FileSet, file *ast.File) {
+		sites := scanDirectResponseCodeLiterals(fset, file)
+		for _, site := range sites {
+			seen[site.shape]++
+		}
+		for _, site := range warningBypasses(sites) {
+			t.Errorf("%s:%d: %q is a warning code assigned as %s; core.Do turns that field straight into Response{OK: false, Code: %s} with Exit: codes.ExitForCode(%s), and every W_ code is catalogued to exit 0 — a failure reported as success. Neither store.ErrorCode nor TestNoWarningCodeIsRaisedAsAnError can see this path, which is why this check exists (AIRA-109)", rel, site.line, site.code, site.shape, site.code, site.code)
+		}
+	})
+	// Unevaluated is never a pass. Both shapes carry E_/U_ literals in the tree
+	// today, so a zero here means the matcher has gone stale — handlerData or
+	// appendUnique renamed, the walk broken — and the check has quietly become
+	// vacuous rather than satisfied.
+	for _, shape := range []string{shapeHandlerDataCode, shapeErrorCodesAppend} {
+		if seen[shape] == 0 {
+			t.Errorf("the scan matched no %s site anywhere in the tree; the shape matcher is stale, not the tree clean — re-point it at whatever the field or helper is called now", shape)
+		}
+	}
+}
+
+// parsePlantedSource parses a synthetic file so the scan's predicate can be
+// exercised against source that deliberately breaks it. The real tree must stay
+// clean, so a planted violation is the only way to prove this check can fail at
+// all — a check that cannot fail proves nothing.
+func parsePlantedSource(t *testing.T, source string) (*token.FileSet, *ast.File) {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "planted.go", source, 0)
+	if err != nil {
+		t.Fatalf("parsing planted source: %v", err)
+	}
+	return fset, file
+}
+
+// TestDirectResponseCodeScanCatchesBothBypassShapes plants a W_ literal in each
+// of the two shapes and proves the scan reports both. Without this the guard
+// above would pass on a clean tree whether or not it worked.
+func TestDirectResponseCodeScanCatchesBothBypassShapes(t *testing.T) {
+	fset, file := parsePlantedSource(t, `package planted
+
+func handler() (handlerData, error) {
+	return handlerData{Code: "W_PLANTED_HANDLER", Data: nil}, nil
+}
+
+func viaAppendUnique(record *RunRecord) {
+	record.ErrorCodes = appendUnique(record.ErrorCodes, "W_PLANTED_APPEND_UNIQUE")
+}
+
+func viaBuiltinAppend(record *RunRecord) {
+	record.ErrorCodes = append(record.ErrorCodes, "W_PLANTED_BUILTIN_APPEND")
+}
+`)
+	got := map[string]string{}
+	for _, site := range warningBypasses(scanDirectResponseCodeLiterals(fset, file)) {
+		got[site.code] = site.shape
+	}
+	want := map[string]string{
+		"W_PLANTED_HANDLER":        shapeHandlerDataCode,
+		"W_PLANTED_APPEND_UNIQUE":  shapeErrorCodesAppend,
+		"W_PLANTED_BUILTIN_APPEND": shapeErrorCodesAppend,
+	}
+	for code, shape := range want {
+		if got[code] != shape {
+			t.Errorf("planted %s went unflagged (or was flagged as %q, want %q); the bypass scan does not actually catch this shape", code, got[code], shape)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("scan reported %d warning bypasses, want %d: %v", len(got), len(want), got)
+	}
+}
+
+// TestDirectResponseCodeScanLeavesLegitimateWarningLiteralsAlone is the
+// false-fail direction. A bare W_ literal is the normal way to write a
+// CheckFinding.Code or a TicketRecord.Warnings entry, and both are correct: the
+// hazard is the code reaching Response.Code as a failure, not the code existing.
+// A scan that flagged these would be worse than no scan, because the fix an
+// author would reach for is to stop reporting the warning.
+func TestDirectResponseCodeScanLeavesLegitimateWarningLiteralsAlone(t *testing.T) {
+	fset, file := parsePlantedSource(t, `package planted
+
+func findings(report *CheckReport, record *TicketRecord, row *ReadyRow) {
+	addWarning(report, CheckFinding{Code: "W_STALE_INDEX", Subject: "AIRA-1", Kind: "warning"})
+	record.Warnings = []string{"W_STALE_INDEX"}
+	record.Warnings = appendUniqueStrings(record.Warnings, "W_RELATION_INVALID")
+	row.Warnings = append(row.Warnings, "W_CROSS_PROJECT_RELATION")
+	warning := "W_AREA_OVERLAP"
+	_ = warning
+	_ = strings.HasPrefix(record.Warnings[0], "W_")
+}
+`)
+	if bad := warningBypasses(scanDirectResponseCodeLiterals(fset, file)); len(bad) != 0 {
+		t.Errorf("legitimate warning literals were flagged as Response.Code bypasses: %+v", bad)
+	}
+}
+
+// TestDirectResponseCodeScanSeesNonWarningCodesToo pins the non-vacuity guard's
+// own premise: the scan matches the two shapes by shape, not by the W_ prefix,
+// so an E_/U_ literal in either place is recorded as a site (which is what keeps
+// the tree-wide check honest) while never being reported as a violation.
+func TestDirectResponseCodeScanSeesNonWarningCodesToo(t *testing.T) {
+	fset, file := parsePlantedSource(t, `package planted
+
+func handler(record *RunRecord) (handlerData, error) {
+	record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_EXIT_UNKNOWN")
+	return handlerData{Code: "E_RUN_FOREIGN_OWNER"}, nil
+}
+`)
+	sites := scanDirectResponseCodeLiterals(fset, file)
+	if len(sites) != 2 {
+		t.Fatalf("scan found %d sites, want 2: %+v", len(sites), sites)
+	}
+	if bad := warningBypasses(sites); len(bad) != 0 {
+		t.Errorf("E_/U_ codes were reported as warning bypasses: %+v", bad)
+	}
 }
 
 // TestExitForCodeDefaultsToOne pins the fallback the catalogue's honesty depends
