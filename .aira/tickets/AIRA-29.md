@@ -126,9 +126,14 @@ before the rebase. They PASS at that same master commit without `-race`, so it i
 `-race`-only timing failure in the AIRA-106 sliceceiling helper handshake, of the AIRA-20
 wall-clock-tight class. Zero DATA RACE reports were emitted in any run.
 
-**Flagged for the coordinating session, since it is outside this ticket:** AIRA-20 has just
-re-enabled `-race` in CI and AIRA-106's sliceceiling change has just landed, so `make ci`
-on current master is red on these three independently of AIRA-29.
+**Flagged for the coordinating session, stated precisely rather than as an alarm:**
+`make race` fails on these three on any machine with real cgroup-v2 delegation — this box —
+on master as well as on this branch. GitHub CI would NOT catch it: `.github/workflows/ci.yml`
+runs `make race` but deliberately leaves `AIRA_REAL_CGROUP` unset, and its runner has no
+delegation, so all three SKIP there. `make ci` (fmt-check, vet, build, test) is green either
+way, since `race` is a separate target. So this is a local-only, real-cgroup, `-race`
+failure, not a red CI — an earlier draft of this note said "make ci on master is red", which
+was wrong and is corrected here.
 
 ### Open design questions from the brief, as resolved
 
