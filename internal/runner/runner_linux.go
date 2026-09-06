@@ -63,6 +63,7 @@ type Runner struct {
 	supervisorLeaseAfter     func(time.Duration) <-chan time.Time
 	failBeforeLaunchFn       func(context.Context, RunRecord, string, error) (*RunRecord, error)
 	writeScopeMemoryCapFn    func(Scope, int64, int64, bool) error
+	writeScopeSwapCapFn      func(Scope) (string, error)
 	// beforeRunningAppendFn is a test seam that fires inside the launch flock,
 	// after a successful Start and before the "running" append, to prove the
 	// per-run lock is held through the running append (not released after Start).
@@ -869,6 +870,27 @@ func (r *Runner) applyScopeMemoryCap(scope Scope, req Request, record *RunRecord
 		write = r.writeScopeMemoryCapFn
 	}
 	if err := write(scope, req.ScopeMemoryMax, req.ScopeMemoryHigh, true); err != nil {
+		return err
+	}
+	// AIRA-110. memory.max bounds memory, NOT memory+swap, so a run scope
+	// carrying only a cap is reclaimed into swap instead of being killed and the
+	// cap is not the bound it appears to be. Paired with the cap write here --
+	// both `aira run` launch sites (foreground runner_linux.go and detached
+	// detach_linux.go) reach the kernel through this one helper, and a run with
+	// no cap requested asks for no containment to falsify. Fail-closed, exactly
+	// as the cap write above is: the caller turns this into
+	// E_RUN_CAP_UNAVAILABLE and never starts the target.
+	//
+	// ORDER IS LOAD-BEARING: only after the memory.max write has succeeded, which
+	// proves this cgroup has the memory controller at all -- see writeScopeSwapCap.
+	// The disposition is not recorded on the RunRecord: an absent swap control is
+	// the one case it does not establish, and nothing on this record claims swap
+	// containment for it to contradict.
+	swapCap := writeScopeSwapCap
+	if r.writeScopeSwapCapFn != nil {
+		swapCap = r.writeScopeSwapCapFn
+	}
+	if _, err := swapCap(scope); err != nil {
 		return err
 	}
 	maximum := floorMemoryPage(req.ScopeMemoryMax)

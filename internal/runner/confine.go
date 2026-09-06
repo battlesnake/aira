@@ -147,6 +147,14 @@ const (
 	ConfineOOMGroupUnverified ConfineOOMGroup = "unverified"
 )
 
+// ConfineSwapCapUnevaluated is the AIRA-110 swap-bound disposition for a launch
+// that never reached the memory.swap.max write. The three ESTABLISHED values are
+// the WorkerAdmitSwapCap* catalogue (enforced / not-applicable / unavailable) --
+// one vocabulary for one primitive, rather than a second set of spellings for
+// the same three kernel facts. This value is deliberately not in that catalogue:
+// it is the absence of an answer, not an answer.
+const ConfineSwapCapUnevaluated = "unevaluated"
+
 type ConfinePriorities string
 
 const (
@@ -189,7 +197,16 @@ type ConfineStatus struct {
 	ScopeMemoryHigh      int64                     `json:"scope_memory_high,omitempty"`
 	ScopeMemoryBinding   string                    `json:"scope_memory_binding,omitempty"`
 	ScopeMemoryEffective int64                     `json:"scope_memory_effective,omitempty"`
-	ReserveBasis         string                    `json:"reserve_basis,omitempty"`
+	// ScopeSwapCap is AIRA-110's swap-bound disposition: one of the
+	// WorkerAdmitSwapCap* values (the vocabulary AIRA-35 minted for the same
+	// primitive on aitest worker scopes). It exists because `scope-memory.max=
+	// enforced=N` is true as written but reads as a containment guarantee, and on
+	// a host where swap could NOT be bounded it is not one -- the job can grow
+	// past N into swap without ever being killed. Empty means the write never
+	// ran (a launch that failed earlier) and renders as unevaluated, never as a
+	// claim that swap is bounded.
+	ScopeSwapCap string `json:"scope_swap_cap,omitempty"`
+	ReserveBasis string `json:"reserve_basis,omitempty"`
 	// PeakRSS, CPUUser, and CPUSys are AIRA-104's whole-subtree resource
 	// counters: cgroup v2's own memory.peak and cpu.stat for this scope and
 	// every descendant ever charged to it (aitest worker sub-scopes and a
@@ -575,6 +592,16 @@ func FormatConfineStatus(status ConfineStatus) string {
 			line += " memory.high=reclaim-pressure=" + strconv.FormatInt(status.ScopeMemoryHigh, 10)
 		}
 	}
+	// AIRA-110, always rendered on the same discipline as terminated-by below:
+	// this facet exists precisely because a trailer that says nothing about swap
+	// is indistinguishable from one whose cap really is the whole footprint
+	// bound. Omitting it when the answer is unknown would reproduce the silence
+	// it ends, so an unset value reads as unevaluated rather than as bounded.
+	swapCap := status.ScopeSwapCap
+	if swapCap == "" {
+		swapCap = ConfineSwapCapUnevaluated
+	}
+	line += " scope-swap.max=" + swapCap
 	// AIRA-70 / AIRA-91 Part A. Always rendered: before this facet existed, a
 	// SIGKILLed job's trailer was byte-identical to a clean run's, so omitting
 	// the facet when it is unknown would reproduce exactly the silence it
