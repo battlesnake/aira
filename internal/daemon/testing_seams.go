@@ -94,3 +94,12 @@ func (s *Server) SetShimMeminfoForTest(readTotal func() (int64, bool), readAvail
 	s.shimReadMemTotal = readTotal
 	s.shimReadMemAvailable = readAvailable
 }
+
+// SetCPUFrameForTest injects AIRA-137's CPU-frame seams, so a test can assert
+// the `confine --list` reply's CPU fields against a fixed frame instead of
+// against this host's real root-cgroup counters, which move between every two
+// statements and can never be asserted on.
+func (s *Server) SetCPUFrameForTest(frame func(string) runner.ConfineCPUFrame, cores func() int) {
+	s.readCPUFrame = frame
+	s.readCPUCores = cores
+}

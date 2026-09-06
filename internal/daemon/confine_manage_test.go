@@ -156,6 +156,15 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		sliceReclaimable   = int64(1 << 30)
 		sliceHigh          = int64(14 << 30)
 	)
+	// AIRA-137's CPU frame, pinned for exactly the reason the meminfo pair above
+	// is: the real root-cgroup counters advance between any two statements, so an
+	// expectation carrying them could never be asserted at all.
+	const (
+		systemCPUUsec = int64(9_000_000_000)
+		sliceCPUUsec  = int64(2_500_000_000)
+		cpuSampleNano = int64(1_700_000_000_000_000_000)
+		cpuCores      = 12
+	)
 	// withSystemFrame stamps the AIRA-127 system/slice frame onto an arm's
 	// expectation. One definition, so a new wire field cannot be added and then
 	// silently left unasserted in two arms out of three.
@@ -168,6 +177,13 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		want.SliceCurrentBytes, want.SliceReclaimableBytes = sliceCurrent, sliceReclaimable
 		want.SliceMaxBytes = maximum
 		want.SliceHighBytes, want.SliceHighState = sliceHigh, runner.ConfineSliceHighSet
+		// AIRA-137. Both counters carry their KNOWN bit, and the sample instant and
+		// core count travel with them: a rate cannot be computed from any of these
+		// alone, so a build that dropped one of the four would be publishing numbers
+		// no consumer can use.
+		want.SystemCPUUsageUsec, want.SystemCPUKnown = systemCPUUsec, true
+		want.SliceCPUUsageUsec, want.SliceCPUKnown = sliceCPUUsec, true
+		want.CPUSampleUnixNano, want.CPUCores = cpuSampleNano, cpuCores
 		return want
 	}
 	setup := func(t *testing.T) (*Server, string) {
@@ -183,6 +199,19 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		// frozen clock below fixes for the reservation row's age.
 		server.shimReadMemTotal = func() (int64, bool) { return systemMemTotal, true }
 		server.shimReadMemAvailable = func() (int64, bool, string) { return systemMemAvailable, true, "" }
+		// AIRA-137: PIN the CPU frame, for the same reason.
+		server.SetCPUFrameForTest(
+			func(gotPath string) runner.ConfineCPUFrame {
+				if gotPath != path {
+					t.Fatalf("CPU frame read for %q, want the resolved slice %q", gotPath, path)
+				}
+				return runner.ConfineCPUFrame{
+					SystemUsageUsec: systemCPUUsec, SystemKnown: true,
+					SliceUsageUsec: sliceCPUUsec, SliceKnown: true,
+					SampleUnixNano: cpuSampleNano,
+				}
+			},
+			func() int { return cpuCores })
 		// A REAL memory.high in the fixture slice, so the default reader's parse is
 		// what produces the "set" state below rather than an injected constant. The
 		// aggregate arm deliberately leaves the file absent and pins "unevaluated",
@@ -309,6 +338,16 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
 			return sliceCurrent, maximum, sliceReclaimable, true, ""
 		}
+		// AIRA-137: this arm builds its own server, so it pins the CPU frame too.
+		server.SetCPUFrameForTest(
+			func(string) runner.ConfineCPUFrame {
+				return runner.ConfineCPUFrame{
+					SystemUsageUsec: systemCPUUsec, SystemKnown: true,
+					SliceUsageUsec: sliceCPUUsec, SliceKnown: true,
+					SampleUnixNano: cpuSampleNano,
+				}
+			},
+			func() int { return cpuCores })
 		// One LEAF-DRAINED scope: subtree-live, so the aggregate counts it, but
 		// leaf-empty, so the adoption loop skips it. That keeps every other field
 		// on the wire at its idle value and leaves the aggregate as the single
@@ -335,6 +374,12 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 			SystemMemTotalBytes: systemMemTotal, SystemMemAvailableBytes: systemMemAvailable,
 			SliceCurrentBytes: sliceCurrent, SliceReclaimableBytes: sliceReclaimable,
 			SliceMaxBytes: maximum, SliceHighState: runner.ConfineSliceHighUnevaluated,
+			// AIRA-137's CPU frame travels on this arm too: it is published from the
+			// SAME `ok` memory reading, so a build that gated it on anything else
+			// would drop it here while keeping it in the other arms.
+			SystemCPUUsageUsec: systemCPUUsec, SystemCPUKnown: true,
+			SliceCPUUsageUsec: sliceCPUUsec, SliceCPUKnown: true,
+			CPUSampleUnixNano: cpuSampleNano, CPUCores: cpuCores,
 			CeilingBytes: maximum - base - supervisor, Queued: 0, FreezePhase: "idle",
 			// The value AND the bit. Asserting only the bit would survive a build
 			// that reported a fabricated total beside a true bit.

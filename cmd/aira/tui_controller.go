@@ -77,9 +77,13 @@ type panelModel struct {
 	Footer  string
 	Detail  string
 	Tiles   []gaugeTile
-	// Bar is AIRA-127's system-RAM bar, and is nil for every other view — the
-	// same view-specific shape Tiles already has.
-	Bar *topBar
+	// Bar is AIRA-127's system-RAM bar and CPUBar is AIRA-137's system-CPU bar.
+	// Both are nil for every other view — the same view-specific shape Tiles
+	// already has. They are two values of ONE type: the bar is a
+	// capacity/claimed/outside model over an abstract quantity, and RAM and CPU
+	// differ only in that quantity's unit.
+	Bar    *topBar
+	CPUBar *topBar
 }
 
 type panelState struct {
@@ -102,10 +106,12 @@ type tuiState struct {
 	// "the full dashboard", which keeps every existing zero-value state valid.
 	Views     []tuiView
 	DataViews []tuiView
-	// TopSlots is AIRA-127's slot table: index = slot, value = the scope id
-	// holding it ("" = free). It lives here, in the reducer's state, because a
-	// slot must survive across refresh ticks — that persistence IS requirement 7.
-	TopSlots              []string
+	// Top is `aira top`'s cross-tick state: AIRA-127's slot table (index = slot,
+	// value = the scope id holding it, "" = free) and AIRA-137's previous CPU
+	// sample. It lives here, in the reducer's state, because both must survive
+	// across refresh ticks — a held slot IS requirement 7, and a CPU rate cannot
+	// exist without the previous tick's counters to difference against.
+	Top                   topTick
 	Panels                map[tuiView]panelState
 	Cursor                int64
 	Events                []store.WatchEvent
@@ -268,7 +274,7 @@ func cloneTUIState(state tuiState) tuiState {
 	}
 	copyState.Views = append([]tuiView(nil), state.Views...)
 	copyState.DataViews = append([]tuiView(nil), state.DataViews...)
-	copyState.TopSlots = append([]string(nil), state.TopSlots...)
+	copyState.Top = cloneTopTick(state.Top)
 	copyState.Panels = make(map[tuiView]panelState, len(state.Panels))
 	for view, panel := range state.Panels {
 		panel.Model.Headers = append([]string(nil), panel.Model.Headers...)
@@ -517,7 +523,7 @@ func onTUIFetchResult(state tuiState, result fetchResult) (tuiState, []tuiCmd) {
 				panel.ErrorCode = tuiDecodeError
 				panel.Model = state.Panels[result.View].Model
 			} else {
-				panel.Model, state.TopSlots = topViewModel(state.TopSlots, *result.Top)
+				panel.Model, state.Top = topViewModel(state.Top, *result.Top)
 			}
 		}
 	}

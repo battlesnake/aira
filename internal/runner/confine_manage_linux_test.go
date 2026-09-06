@@ -960,3 +960,73 @@ func TestConfinePendingRowNamesTheCommandUnevaluated(t *testing.T) {
 		t.Fatalf("pending record=%+v, want a nil command named unevaluated", record)
 	}
 }
+
+// AIRA-137. The listing pass reads each live scope's cumulative CPU counter from
+// the SAME already-open scope directory memory.current and memory.max come from,
+// and it reads cpu.stat's `usage_usec` key specifically -- not user_usec, not
+// user+system, not the first number in the file.
+//
+// Non-porous on the key: the fixture's user_usec and system_usec sum to a
+// DIFFERENT value from usage_usec, and nice_usec is larger than all of them, so
+// an implementation that summed the two, took the wrong key, or took the first
+// integer it found reports a number this asserts against.
+//
+// verifies: AIRA-137
+func TestConfineListReadsEachScopeCumulativeCPUUsage(t *testing.T) {
+	slice := t.TempDir()
+	now := time.Now()
+	withCPU := confineTestOwnedScopeID("cpu-known", "session-a", 4801, now.Add(-time.Minute).UnixNano())
+	withoutCPU := confineTestOwnedScopeID("cpu-absent", "session-a", 4802, now.Add(-time.Minute).UnixNano())
+	path := writeConfineTestScope(t, slice, withCPU, "71\n")
+	// nr_periods/nr_throttled are present because a scope with cpu.max set
+	// publishes them, and they must not be mistaken for a usage figure.
+	stat := "usage_usec 1234567\nuser_usec 1000000\nsystem_usec 200000\nnice_usec 9999999\nnr_periods 0\nnr_throttled 0\n"
+	if err := os.WriteFile(filepath.Join(path, "cpu.stat"), []byte(stat), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The second scope deliberately has NO cpu.stat: an unreadable counter is
+	// unevaluated, never a zero that would draw the job as idle.
+	writeConfineTestScope(t, slice, withoutCPU, "72\n")
+
+	result, err := listConfinesWithDeps(context.Background(), slice, nil, defaultConfineScanDeps())
+	if err != nil || result.Verdict != "pass" {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	seen := map[string]ConfineRecord{}
+	for _, record := range result.Scopes {
+		seen[record.ScopeID] = record
+	}
+	if record := seen[withCPU]; record.CPUUsageUsec == nil || *record.CPUUsageUsec != 1234567 {
+		t.Fatalf("cpu-known record=%+v, want usage_usec 1234567", record)
+	}
+	if record := seen[withCPU]; confineContainsString(record.UnevaluatedFields, "cpu") {
+		t.Fatalf("an established CPU counter was also named unevaluated: %+v", record)
+	}
+	if record := seen[withoutCPU]; record.CPUUsageUsec != nil || !confineContainsString(record.UnevaluatedFields, "cpu") {
+		t.Fatalf("cpu-absent record=%+v, want a nil counter named unevaluated", record)
+	}
+}
+
+// AIRA-137. The CPU frame is a pair of independent readings with independent
+// known bits and one sample instant. A slice path that does not exist leaves the
+// slice side UNKNOWN -- never a zero, which a rate would read as an idle slice --
+// while the root-cgroup side is untouched by that failure.
+//
+// verifies: AIRA-137
+func TestReadConfineCPUFrameKeepsEachSideIndependent(t *testing.T) {
+	before := time.Now().UnixNano()
+	frame := ReadConfineCPUFrame(filepath.Join(t.TempDir(), "no-such-slice"))
+	after := time.Now().UnixNano()
+	if frame.SliceKnown || frame.SliceUsageUsec != 0 {
+		t.Fatalf("frame=%+v, want the slice side unknown for a missing path", frame)
+	}
+	if frame.SampleUnixNano < before || frame.SampleUnixNano > after {
+		t.Fatalf("sample instant %d outside [%d, %d]", frame.SampleUnixNano, before, after)
+	}
+	// The root cgroup is a real reading on this host and simply absent elsewhere;
+	// either way the bit and the number must agree, which is the invariant every
+	// consumer relies on.
+	if !frame.SystemKnown && frame.SystemUsageUsec != 0 {
+		t.Fatalf("frame=%+v, want no system number without the known bit", frame)
+	}
+}

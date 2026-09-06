@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-137","project":"aira","title":"aira top: add a CPU-usage bar (per-job stacked, rest-of-system grey) + RAM/CPU columns in the table","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["observability","tui"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-137","project":"aira","title":"aira top: add a CPU-usage bar (per-job stacked, rest-of-system grey) + RAM/CPU columns in the table","status":"in-review","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["observability","tui"],"hold":false,"relations":[]}
 ---
 Requested directly by the owner, 2026-09-06, refining AIRA-127/AIRA-135 (both just
 shipped). Verified against real source and a real running box before writing this, not assumed.
@@ -106,3 +106,166 @@ sample) yields unevaluated, not a negative or clamped-zero rate; (c) an implausi
 yields unevaluated, not a spike; (d) the CPU bar's region widths sum correctly against a representative
 set of core-count/usage scenarios, mirroring the RAM bar's own (d)-style geometry test; (e) the RAM
 and CPU bar regions for the same job share the same colour as its table row.
+
+## Resolution
+
+### Wire
+
+`ConfineRecord.CPUUsageUsec *int64` — the scope's cumulative `cpu.stat`
+`usage_usec`, read live from the SAME already-open scope directory, through the
+SAME `confineScanDeps.readField` seam and in the SAME loop that already reads
+`memory.current` and `memory.max`. `nil` plus `"cpu"` in `UnevaluatedFields`
+when it could not be established; an idle cgroup's real `usage_usec 0` stays
+distinguishable from an unreadable one.
+
+`ConfineSliceReserve` gained `SystemCPUUsageUsec`/`SystemCPUKnown`,
+`SliceCPUUsageUsec`/`SliceCPUKnown`, `CPUSampleUnixNano` and `CPUCores`. Each
+counter carries its own known bit because — unlike every byte field beside it —
+ZERO IS LEGAL for a cumulative counter, so the absence cannot be folded into the
+number. The frame is published from the same `ok` memory reading and inside the
+same `!shimMode()` gate as AIRA-127's RAM frame, so shim mode withholds it whole:
+a container's host-visible ROOT cgroup counts every core of the machine, not the
+container's quota.
+
+`runner.ReadConfineCPUFrame(slicePath)` reads root and slice `cpu.stat` and
+stamps one instant. The root is resolved through the existing `unifiedMount()`,
+not a hard-coded `/sys/fs/cgroup`. Parsing reuses `parseCgroupKeyValues` via a
+new one-line `parseCPUUsageUsec` — no second parser. The daemon reaches it
+through `cpuFrameReader()`/`cpuCoreCounter()` seams shaped exactly like the
+existing `memTotalReader`/`memAvailableReader` pair, so the reply's CPU fields
+can be asserted against a fixed frame instead of this host's ever-moving
+counters. Core count is `runtime.NumCPU()`, the same source `desiredCPUSlots`
+derives the AIRA-49 slot count from.
+
+### Rate, and its honesty rules
+
+`cpu.stat` publishes only cumulative counters, so a rate needs two samples and
+the wall clock between them. The previous sample lives in the reducer's
+cross-tick state (`tuiState.Top`, now a `topTick` carrying AIRA-127's slot table
+AND the CPU sample), and `topViewModel` computes every rate in the SAME pass that
+updates the slot table. The interval is established ONCE per tick
+(`topCPUDeltaBetween`), so a job's rate, the slice's and the machine's are all
+divided by the same number and the parts add up to the whole by construction.
+
+The instant is the DAEMON'S, not the client's tick time: fetch, decode and render
+latency skew a client-side clock by tens of milliseconds against a one-second
+tick — a percent-level error that is largest exactly when the machine is busiest.
+
+Four cases yield UNEVALUATED, never a number:
+
+- No previous sample (the first tick a scope, or the view, is seen).
+- A counter LOWER than its own previous sample. Not clamped to zero: clamping
+  renders a counter reset, a reused scope id, or an accounting anomaly as a
+  peacefully idle job, hiding the very thing the reading exists to surface.
+- An interval below `topCPUMinSampleNanos` = **250ms**. The kernel charges
+  `cpu.stat` in ~4ms scheduler quanta, so at 1ms between samples a single quantum
+  divides out to hundreds of cores; 250ms is well above that quantisation and
+  well below the refresh interval, so no ordinary tick is rejected (pinned by a
+  test that asserts `topRefreshInterval` passes the guard). Negative intervals —
+  a server clock stepping backwards — fall in the same branch.
+- An interval above `topCPUMaxSampleNanos` = **30s**. The top tick stops when the
+  operator leaves the view, so a previous sample can be minutes old; the
+  difference across it is a true average over those minutes, but it is LABELLED
+  as current load, and a 10-minute average presented as "now" is a misreading
+  this view would be inviting.
+
+### Bar generalization, not duplication
+
+There is ONE bar model and ONE renderer. `topBar`/`topBarRegion`/`topBarMarker`
+lost their byte-specific field names (`TotalBytes`→`Total`, `Bytes`→`Size`,
+`StartBytes`→`Start`, `UsedBytes`→`Used`, `ClaimedBytes`→`Claimed`,
+`OutsideBytes`→`Outside`, `FreeBytes`→`Free`, marker `Bytes`→`At`) and gained a
+single `Kind` discriminator naming the unit. `topBarCells`, `topBarColumn` and
+the z-order are unit-blind and unchanged: the geometry question has nothing to do
+with what the quantity measures. `renderTopBar` now takes its target panel and
+its bar as arguments and is called twice; unit-specific wording is a lookup off
+`Kind`. No parallel CPU-specific bar stack exists.
+
+CPU quantities are integer MICRO-CORES (`topCPUMicroCores` = 1e6 = one core's
+worth of CPU time per unit wall-clock), so the exact-integer offset arithmetic
+that makes adjacent regions abut is reused rather than replaced by floats. Micro
+rather than milli because the SUM over many small jobs matters even when each is
+individually uninteresting.
+
+Bar composition mirrors the RAM bar exactly: per-job spans stacked from the LEFT
+in slot order and slot colour; the slice's own unscoped remainder
+(`slice CPU − Σ drawn jobs`) as one labelled region; the idle gap; and a single
+right-anchored grey for the rest of the system, derived as a ROOT-cgroup reading
+minus the SLICE's own reading — never a sum over the listed scopes. Total
+capacity is `NumCPU × one core`, which unlike the RAM total is a hard ceiling.
+
+Two deliberate differences, both documented in code: a CPU region draws NO
+bright/dark split (there is no per-job CPU reservation for a job to be idle
+against, so `UsedKnown` stays false and the existing undivided path is taken),
+and the CPU bar emits NO "no slice limit could be established" line, because this
+view derives no CPU ceiling from anything and announcing the absence of something
+never expected reads as a fault where there is none.
+
+### Table
+
+`SLOT NAME PID LIVE RESERVATION RAM "CPU CORES" COMMAND`. RAM is the live
+`memory.current` reading AIRA-135 moved into the bar shading, back as a column
+next to RESERVATION — the split answers "what fraction of its grant", the number
+answers "how much is that". CPU is the per-job rate in the SAME unit the CPU
+bar's legend prints. Both say `unevaluated` rather than a blank or a zero.
+COMMAND stays LAST (asserted), so it still absorbs tview's greedy clamp.
+
+### Colour
+
+Unchanged and structural: `topSlotColour(slot)` is called once per row and the
+value is handed to the row, its RAM region and its CPU region. Verified live —
+see below.
+
+### Verification
+
+`aira confine -- go build ./...` exit 0; `go vet ./...` exit 0;
+`AIRA_REAL_CGROUP=1 ... go test ./... -count=1` exit 0 (foreground, full run).
+
+Every new test was checked NON-POROUS by mutating the implementation and
+confirming the test goes red:
+
+- first-tick rate fabricated as zero → (a) and the undrawn-scope test fail;
+- counter regression clamped to zero → (b) fails with the literal `"0.00"`;
+- minimum-interval guard removed → (c) fails with `"4.00"` cores, i.e. exactly
+  the divide-by-near-zero spike the guard exists for;
+- maximum-interval guard removed → (c) fails;
+- unscoped remainder dropped → (d) fails on `claimed`;
+- CPU region coloured by position in `Regions` rather than by slot → (e) fails;
+- RAM region coloured by position → (e) and AIRA-127's own colour test fail;
+- `parseCPUUsageUsec` keyed on `user_usec` → the runner test fails (its fixture's
+  `user+system` sum and `nice_usec` are all distinct from `usage_usec`);
+- CPU frame published in shim mode → the shim test fails.
+
+(e)'s first fixture was itself found POROUS during this check — position and slot
+agreed in it — and was rebuilt so the slot-0 holder appears in NEITHER bar,
+shifting every later job's index one below its slot.
+
+### Dogfood
+
+Built binary driven through a real pty (46×190) against the eight real confined
+jobs live on this box at the time, via a private daemon on its own
+`XDG_STATE_HOME` with the ceiling, watchdog, oom-steer and scope-reaper
+subsystems switched off, so nothing touched the shared daemon or the shared
+slice.
+
+- First tick: `UNEVALUATED: CPU is a rate: it needs two samples, and this is the
+  first`, and all eight CPU cells `unevaluated`. The honesty rule, live.
+- Second tick: `capacity 16.00 cores | slice 14.60 cores | rest of system 1.38
+  cores | idle 0.02 cores`, and the eight per-job cells (0.72, 1.21, 1.39, 0.93,
+  0.78, 9.34, 0.15, 0.08) sum to exactly 14.60 — the parts reconciling with the
+  whole on real data.
+- The painted CPU bar row decoded to eight distinct slot colours in slot order
+  (75, 77, 209, 141, 80, 185, 205, 107) followed by grey (242) anchored to the
+  right edge, with widths proportional to the rates (the 9.34-core job takes 109
+  of 188 columns). The same eight colours appear on the table rows and on the RAM
+  bar's regions.
+- No marker legend line under the CPU bar, as intended.
+
+### Accepted, documented approximation
+
+Per-scope counters are read during the directory scan and the root/slice pair a
+few milliseconds later, both stamped with the one server instant. The resulting
+error in a rate is the DIFFERENCE between two consecutive ticks' scan durations
+over a one-second interval — far below the width of one terminal column, and
+below the precision of the kernel's own scheduler-tick accounting. Recorded on
+`readConfineCPUFrame` rather than papered over.

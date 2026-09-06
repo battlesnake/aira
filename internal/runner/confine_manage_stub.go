@@ -16,6 +16,14 @@ func listConfines(context.Context, string, []ConfineRegistryEntry) (ConfineListR
 	return ConfineListResult{Verdict: "unevaluated", Reason: "confine management requires Linux", Scopes: []ConfineRecord{}}, nil
 }
 
+// readConfineCPUFrame has no non-Linux reading to make: cpu.stat is a cgroup-v2
+// interface file. It reports an all-unknown frame — every Known bit false and no
+// sample instant — which is what makes a consumer render the CPU bar as
+// unevaluated rather than as an idle machine (AIRA-137).
+func readConfineCPUFrame(string) ConfineCPUFrame {
+	return ConfineCPUFrame{}
+}
+
 func killConfine(context.Context, string, string, string, bool, []ConfineRegistryEntry, time.Duration) (ConfineKillResult, error) {
 	return ConfineKillResult{}, errors.New("E_CONFINE_UNAVAILABLE: confine management requires Linux")
 }

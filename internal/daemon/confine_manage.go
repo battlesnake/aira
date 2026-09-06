@@ -270,6 +270,23 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				if memAvailableOK {
 					result.SliceReserve.SystemMemAvailableBytes = memAvailable
 				}
+				// AIRA-137. The CPU frame, on exactly the same terms as the RAM
+				// frame above: two live cgroup readings and a clock, published only
+				// where each side was established, feeding no admission decision,
+				// and withheld whole in shim mode by the same `if` that withholds
+				// the RAM frame.
+				//
+				// Core count comes from runtime.NumCPU(), the same source
+				// desiredCPUSlots derives the AIRA-49 worker slot count from, so the
+				// bar's capacity and the scheduler's own idea of this machine's
+				// width cannot drift apart.
+				cpu := s.cpuFrameReader()(path)
+				result.SliceReserve.SystemCPUUsageUsec = cpu.SystemUsageUsec
+				result.SliceReserve.SystemCPUKnown = cpu.SystemKnown
+				result.SliceReserve.SliceCPUUsageUsec = cpu.SliceUsageUsec
+				result.SliceReserve.SliceCPUKnown = cpu.SliceKnown
+				result.SliceReserve.CPUSampleUnixNano = cpu.SampleUnixNano
+				result.SliceReserve.CPUCores = s.cpuCoreCounter()()
 			}
 			// AIRA-121. The advisory wording travels on the SAME line as the
 			// numbers it qualifies. Without it a shim reserve summary is

@@ -209,6 +209,17 @@ func TestShimConfineManagementListsAndRefusesToKill(t *testing.T) {
 		reserve.CeilingEffectiveBytes != 0 {
 		t.Fatalf("ci-shim summary carried a system frame: %+v; the host's meminfo is not the container's", reserve)
 	}
+	// AIRA-137. The CPU frame is withheld on exactly the same reasoning and by
+	// exactly the same gate: the host's ROOT-cgroup cpu.stat counts every core of
+	// the machine, not the container's CPU allowance, so publishing it would put
+	// an advisory container budget inside a machine-wide frame nobody measured.
+	// The core count goes with it — 64 host cores beside a two-core container
+	// quota is the same fabrication in a smaller number.
+	if reserve := result.SliceReserve; reserve.SystemCPUKnown || reserve.SliceCPUKnown ||
+		reserve.SystemCPUUsageUsec != 0 || reserve.SliceCPUUsageUsec != 0 ||
+		reserve.CPUSampleUnixNano != 0 || reserve.CPUCores != 0 {
+		t.Fatalf("ci-shim summary carried a CPU frame: %+v; the host's root cgroup is not the container's", reserve)
+	}
 
 	killed := server.confineManagement(t.Context(), core.Request{
 		Verb: "confine-kill", Args: map[string]any{"owner": "session-a", "selector": "gate"},

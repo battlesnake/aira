@@ -64,9 +64,50 @@ type ConfineRecord struct {
 	// That is exactly the trust level the PID field beside it already has (and
 	// that killConfine's pid selector already accepts); this field inherits it and
 	// widens nothing, and it participates in no decision — it is a display facet.
-	Command           *string  `json:"command"`
+	Command *string `json:"command"`
+	// CPUUsageUsec is the scope's CUMULATIVE cpu.stat `usage_usec` — total CPU
+	// time charged to this cgroup and its descendants since the cgroup was
+	// created, in microseconds — read live at listing time exactly as RSSBytes
+	// (memory.current) and Cap (memory.max) beside it are (AIRA-137).
+	//
+	// It is a COUNTER, not a rate. There is no live "% CPU" anywhere in a cgroup;
+	// a rate needs two of these and the wall-clock interval between them, which is
+	// why ConfineSliceReserve.CPUSampleUnixNano travels with it. A consumer that
+	// renders this number directly is rendering "CPU-seconds since boot", not
+	// load, and no face in this repo does.
+	//
+	// nil is "could not be established" (the scope vanished mid-scan, cpu.stat was
+	// unreadable, or the kernel published no usage_usec key), never a measured
+	// zero — a scope that has genuinely used no CPU publishes usage_usec 0, and
+	// collapsing the two would draw an unreadable scope as an idle one.
+	CPUUsageUsec      *int64   `json:"cpu_usage_usec"`
 	Pending           bool     `json:"pending,omitempty"`
 	UnevaluatedFields []string `json:"unevaluated_fields,omitempty"`
+}
+
+// ConfineCPUFrame is the SYSTEM-and-SLICE CPU counter pair, read as one sample
+// with one timestamp (AIRA-137). It is the exact CPU analogue of the
+// SystemMemTotal/SliceCurrent pair the RAM bar's "rest of system" region is
+// derived from: rest-of-system CPU is a ROOT-cgroup aggregate minus the SLICE's
+// own aggregate, never a sum over the individually listed scopes.
+//
+// Every counter is cumulative microseconds. Each has its own `Known` bit because
+// the two reads fail independently — an unreadable slice cpu.stat must not also
+// erase a root reading the same pass did establish — and because zero is a legal
+// counter value that must never stand in for "unreadable".
+//
+// SampleUnixNano is the instant of the sample, taken by the SERVER between the
+// two reads. It is on the wire because the client cannot substitute its own tick
+// time: fetch, decode and render latency skew a client-side clock by tens of
+// milliseconds against a one-second tick, which is a percent-level error on
+// every rate derived from it. Zero means no sample instant was established, and
+// then no rate may be computed from these counters at all.
+type ConfineCPUFrame struct {
+	SystemUsageUsec int64
+	SystemKnown     bool
+	SliceUsageUsec  int64
+	SliceKnown      bool
+	SampleUnixNano  int64
 }
 
 // ConfineCommandWireLimit bounds the bytes of /proc/<pid>/cmdline the scan reads
@@ -329,6 +370,33 @@ type ConfineSliceReserve struct {
 	// between the two is the reduction. Zero when the subsystem is off.
 	CeilingEffectiveBytes int64 `json:"ceiling_effective_bytes,omitempty"`
 
+	// AIRA-137. The CPU frame `aira top` draws its CPU bar in — the exact
+	// structural mirror of the RAM frame above, and published under the same
+	// rules: withheld ENTIRELY in shim mode (a container's host-visible root
+	// cgroup cpu.stat is not namespaced to it, so it is not a frame anybody
+	// measured), and feeding no admission decision anywhere.
+	//
+	// System/Slice are CUMULATIVE cpu.stat `usage_usec` counters for the ROOT
+	// cgroup and for this slice. CPUSampleUnixNano is the server-side instant
+	// they were read at. A rate is (Δusec / Δwall-clock) across two ticks and is
+	// computed by the CONSUMER, never here: the daemon holds no per-client tick
+	// history and inventing one would make two clients on different refresh
+	// intervals disagree about the same machine.
+	//
+	// SystemCPUKnown/SliceCPUKnown are required to read the counters. Unlike the
+	// byte fields above, ZERO IS A LEGAL VALUE here — an idle cgroup really does
+	// publish usage_usec 0 — so the absence bit cannot be folded into the number.
+	//
+	// CPUCores is runtime.NumCPU() on the daemon's host: the bar's TOTAL CAPACITY
+	// is core-count × one core of CPU time per unit wall-clock. Zero is an
+	// absence, and a bar with no established core count is not drawn.
+	SystemCPUUsageUsec int64 `json:"system_cpu_usage_usec,omitempty"`
+	SystemCPUKnown     bool  `json:"system_cpu_known,omitempty"`
+	SliceCPUUsageUsec  int64 `json:"slice_cpu_usage_usec,omitempty"`
+	SliceCPUKnown      bool  `json:"slice_cpu_known,omitempty"`
+	CPUSampleUnixNano  int64 `json:"cpu_sample_unix_nano,omitempty"`
+	CPUCores           int   `json:"cpu_cores,omitempty"`
+
 	// AIRA-121. Containment/BudgetSource carry the ci-shim disposition on the
 	// SAME summary line the granted/ceiling numbers are printed on. Without them
 	// the reserve line in shim mode is byte-identical to a real slice's, which
@@ -515,6 +583,14 @@ func orphanedConfineScopeCandidates(records []ConfineRecord, grace time.Duration
 
 func ListConfines(ctx context.Context, slicePath string, registry []ConfineRegistryEntry) (ConfineListResult, error) {
 	return listConfines(ctx, slicePath, registry)
+}
+
+// ReadConfineCPUFrame samples the root-cgroup and slice CPU counters for
+// `aira top`'s CPU bar (AIRA-137). It reads two cgroup files and a clock; it
+// takes no lock, makes no decision, and returns an all-unknown frame rather than
+// an error on any platform or host where the counters are not available.
+func ReadConfineCPUFrame(slicePath string) ConfineCPUFrame {
+	return readConfineCPUFrame(slicePath)
 }
 
 func KillConfine(ctx context.Context, slicePath, selector, callerOwner string, steal bool, registry []ConfineRegistryEntry) (ConfineKillResult, error) {

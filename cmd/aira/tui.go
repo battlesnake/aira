@@ -37,6 +37,7 @@ type tuiRuntime struct {
 	tabs           *tview.TextView
 	detachedStatus *tview.TextView
 	topBar         *tview.TextView
+	topCPUBar      *tview.TextView
 	views          []tuiView
 	// projectless marks a face that resolves NO project/worktree scope (`aira
 	// top`). It changes what the tab line offers, never what a key does.
@@ -212,8 +213,16 @@ func (r *tuiRuntime) buildWidgets() {
 			// that owns it.
 			r.topBar = tview.NewTextView().SetDynamicColors(true).SetWrap(false)
 			r.topBar.SetBorder(true).SetTitle(" System RAM ")
+			// AIRA-137. The CPU bar is a second instance of the SAME renderer over
+			// the same model type, stacked under the RAM bar and above the rows it
+			// shares its colours with. It gets fewer lines because it carries no
+			// marker legend: a slice has a memory.max to draw a tick at, and no
+			// equivalent hard CPU limit to draw one for.
+			r.topCPUBar = tview.NewTextView().SetDynamicColors(true).SetWrap(false)
+			r.topCPUBar.SetBorder(true).SetTitle(" System CPU ")
 			content = tview.NewFlex().SetDirection(tview.FlexRow).
 				AddItem(r.topBar, 7, 0, false).
+				AddItem(r.topCPUBar, 5, 0, false).
 				AddItem(table, 0, 1, true).
 				AddItem(footer, 1, 0, false)
 			r.panelPages.AddPage(string(view), content, true, false)
@@ -507,20 +516,28 @@ func (r *tuiRuntime) render() {
 			model = eventViewModel(r.state.Events)
 		}
 		if view == viewTop {
-			r.renderTopBar(model.Bar, r.state.Panels[view])
+			r.renderTopBar(r.topBar, model.Bar, r.state.Panels[view])
+			r.renderTopBar(r.topCPUBar, model.CPUBar, r.state.Panels[view])
 		}
 		r.renderTable(view, model, r.state.Panels[view])
 	}
 }
 
-// renderTopBar paints the system-RAM bar. It is a THIN face over the model:
+// renderTopBar paints ONE bar into ONE panel. It is a THIN face over the model:
 // every width, offset and colour was decided by topBarCells/topBarFor, so what
 // is asserted in tests is what reaches the terminal.
 //
+// AIRA-137 made it take its target and its bar as arguments rather than reading
+// r.topBar and model.Bar directly, because the RAM bar and the CPU bar are the
+// same model type drawn by the same rules and a second copy of this function
+// would be two renderers to keep in step. Everything unit-specific — the words
+// in the legend, whether a marker legend exists at all — is a lookup off
+// bar.Kind, so the two can never diverge into different rendering behaviour.
+//
 // A bar the model could not evaluate prints its reason. It never prints an empty
 // bar, which would state that the machine is idle.
-func (r *tuiRuntime) renderTopBar(bar *topBar, panel panelState) {
-	if r.topBar == nil {
+func (r *tuiRuntime) renderTopBar(target *tview.TextView, bar *topBar, panel panelState) {
+	if target == nil {
 		return
 	}
 	var out strings.Builder
@@ -533,13 +550,13 @@ func (r *tuiRuntime) renderTopBar(bar *topBar, panel panelState) {
 	case !bar.Evaluated:
 		fmt.Fprintf(&out, "UNEVALUATED: %s", bar.Reason)
 	default:
-		_, _, width, _ := r.topBar.GetInnerRect()
+		_, _, width, _ := target.GetInnerRect()
 		if width < topBarMinColumns {
 			// REFUSE rather than truncate. A bar drawn wider than the panel is
 			// clipped at the right edge, which silently removes the out-of-slice
 			// region and turns a full machine into an empty one on screen.
 			fmt.Fprintf(&out, "terminal too narrow for the bar (%d columns, %d needed)", width, topBarMinColumns)
-			r.topBar.SetText(out.String())
+			target.SetText(out.String())
 			return
 		}
 		cells := topBarCells(bar, width)
@@ -554,18 +571,58 @@ func (r *tuiRuntime) renderTopBar(bar *topBar, panel panelState) {
 			}
 		}
 		out.WriteString("\n")
-		fmt.Fprintf(&out, "total %s | reserved %s%s | rest of system %s | free %s\n",
-			topFormatMegabytes(bar.TotalBytes), topFormatMegabytes(bar.ClaimedBytes), topShadeLegend(bar),
-			topOutsideText(bar), topFormatMegabytes(bar.FreeBytes))
-		out.WriteString(topMarkerLegend(bar))
+		out.WriteString(topBarLegend(bar))
+		if legend := topMarkerLegend(bar); legend != "" {
+			out.WriteString("\n" + legend)
+		}
 		if bar.Overcommitted {
-			out.WriteString("\nOVER-SUBSCRIBED: reservations plus out-of-slice usage exceed total RAM")
+			fmt.Fprintf(&out, "\nOVER-SUBSCRIBED: %s plus out-of-slice usage exceed the %s total",
+				topBarClaimNoun(bar), topBarResourceNoun(bar))
 		}
 		for _, note := range bar.Notes {
 			out.WriteString("\n" + note)
 		}
 	}
-	r.topBar.SetText(out.String())
+	target.SetText(out.String())
+}
+
+// topBarLegend is the numbers line under a bar, in that bar's own unit and its
+// own vocabulary. The RAM bar's left-hand stack is a set of RESERVATIONS — what
+// jobs are allowed to hold — while the CPU bar's is MEASURED USE, and calling
+// either by the other's name would misdescribe what the colours mean.
+func topBarLegend(bar *topBar) string {
+	return fmt.Sprintf("%s %s | %s %s%s | rest of system %s | %s %s\n",
+		topBarTotalNoun(bar), topFormatQuantity(bar.Kind, bar.Total),
+		topBarClaimNoun(bar), topFormatQuantity(bar.Kind, bar.Claimed), topShadeLegend(bar),
+		topOutsideText(bar), topBarFreeNoun(bar), topFormatQuantity(bar.Kind, bar.Free))
+}
+
+func topBarResourceNoun(bar *topBar) string {
+	if bar.Kind == topBarCPU {
+		return "CPU"
+	}
+	return "RAM"
+}
+
+func topBarTotalNoun(bar *topBar) string {
+	if bar.Kind == topBarCPU {
+		return "capacity"
+	}
+	return "total"
+}
+
+func topBarClaimNoun(bar *topBar) string {
+	if bar.Kind == topBarCPU {
+		return "slice"
+	}
+	return "reserved"
+}
+
+func topBarFreeNoun(bar *topBar) string {
+	if bar.Kind == topBarCPU {
+		return "idle"
+	}
+	return "free"
 }
 
 // topBarMinColumns keeps the bar honest on a very narrow terminal: below this,
@@ -584,13 +641,23 @@ func topMarkerGlyph(name string) string {
 	}
 }
 
+// topMarkerLegend keys the limit ticks drawn over a bar.
+//
+// A RAM bar with no markers says so: the slice HAS a memory.max, so none having
+// been established is a failed reading an operator must be told about. A CPU bar
+// has no limit to draw in the first place — this view derives no CPU ceiling
+// from anything — so the same line there would announce the absence of something
+// that was never expected, which reads as a fault where there is none.
 func topMarkerLegend(bar *topBar) string {
 	if len(bar.Markers) == 0 {
+		if bar.Kind == topBarCPU {
+			return ""
+		}
 		return "no slice limit could be established"
 	}
 	parts := make([]string, 0, len(bar.Markers))
 	for _, marker := range bar.Markers {
-		parts = append(parts, fmt.Sprintf("%s %s %s", topMarkerGlyph(marker.Name), marker.Label, topFormatMegabytes(marker.Bytes)))
+		parts = append(parts, fmt.Sprintf("%s %s %s", topMarkerGlyph(marker.Name), marker.Label, topFormatQuantity(bar.Kind, marker.At)))
 	}
 	return strings.Join(parts, "  ")
 }
@@ -619,7 +686,7 @@ func topOutsideText(bar *topBar) string {
 	if !bar.OutsideKnown {
 		return "unevaluated"
 	}
-	return topFormatMegabytes(bar.OutsideBytes)
+	return topFormatQuantity(bar.Kind, bar.Outside)
 }
 
 func (r *tuiRuntime) renderTable(view tuiView, model panelModel, panel panelState) {
