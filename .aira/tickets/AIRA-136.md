@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-136","project":"aira","title":"aira run/confine: express a job timeout in cumulative CPU-time, not just wall-clock","status":"in-review","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["confine","runner"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-138","to":"AIRA-136"}]}
+{"schema":1,"id":"AIRA-136","project":"aira","title":"aira run/confine: express a job timeout in cumulative CPU-time, not just wall-clock","status":"done","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["confine","runner"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-138","to":"AIRA-136"}]}
 ---
 Requested directly by the owner, 2026-09-06.
 
@@ -89,7 +89,7 @@ a race -- a CPU-time-budget-exceeded event racing the job's own clean exit at
 the same instant must resolve the same principled way AIRA-126 already
 resolves that race for the wall-clock source, not a hand-wavy 'good enough'.
 
-## Resolution (in-review)
+## Resolution (done — PR #83 merged as 96edada)
 
 Plan: `docs/superpowers/plans/2026-09-06-aira136-cpu-time-timeout-plan.md`
 (GATE-PASS-WITH-CONDITIONS; §0 of the plan maps each of C1-C8 to where it landed).
@@ -162,3 +162,73 @@ in plan §6.1 rather than quietly fixed.
 Accepted coverage gaps are plan §9 (sampling overshoot; sub-interval budgets;
 baseline skew; confine and detach; simultaneous breach; no-kernel-cgroup
 enforcement; contention itself not reproduced in tests).
+
+## Review record (Fable build gate, 2026-09-06) — MERGE
+
+Reviewed at a507912 in a detached worktree; merged as 96edada.
+
+- **The load-bearing question — one kill source, not two — verified against
+  source, not the PR text.** `startDeadlineSource` is a single goroutine that
+  multiplexes the wall timer and the 100ms `cpu.stat` ticker into one
+  buffered-1 channel, sends at most one `deadlineFire` and returns. Launch
+  keeps exactly one select branch and exactly one `killWithIntent` call site
+  (`runner_linux.go:606-607`); the AIRA-126 block beneath it
+  (`decideTimeoutIntentNotExecuted`, the bounded `arbitrationWaitBound`
+  receive, `waitDrained`) is byte-identical apart from `"run-timeout"` becoming
+  `fired.Actor`. `deadlines.halt()` joins the goroutine after the select, so
+  no sampler can outlive the launch or race `killWithIntent`'s scope removal;
+  a fire that lost the select is discarded in the buffer exactly as the old
+  `timer.C` drain did. `killScope`, `mergeEvidence`, the terminal CAS and
+  `decideNotExecutedDisposition` are untouched. No second trigger exists.
+- **Honesty of the new codes checked at the primitive.** `readCgroupUsage`
+  leaves `CPUUser`/`CPUSys` nil on a missing or unparseable `cpu.stat` and
+  `snapshotUsage` only overwrites a field the read established, so
+  `finalEstablished` really is "never measured" and cannot be a fabricated
+  zero. The sampler treats an unreadable counter as unevaluated (skips), never
+  as zero; a lost baseline adopts the first ESTABLISHED sample, so every error
+  is in the late direction.
+- **Gate, independently re-run in the foreground, exact exit codes:**
+  `aira confine -- go build ./...` 0; `aira confine -- go vet ./...` 0;
+  `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` 0 (14 packages
+  ok; runner 93s, store 146s); `gofmt -l internal/ cmd/` 0, empty. CI build,
+  test and race all SUCCESS.
+- **Regression of the wall path through the new multiplexer:**
+  `TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration -count=50`
+  under `AIRA_REAL_CGROUP=1`, exit 0.
+- **The opt-in soak, executed by the reviewer because the PR recorded no run
+  of it.** `AIRA136_SOAK=1 AIRA136_SOAK_ITERATIONS=200`: exit 1, "vacuous: the
+  CPU budget never fired in 200 iterations" — the non-vacuity guard doing its
+  job, not a fake pass. `AIRA136_SOAK_ITERATIONS=800` (the default): exit 0,
+  "fired in 3/800 iterations; 0 of those found the scope already empty". So
+  on an idle box the committed reproduction exercises the KILLED arm of
+  scenario (c) in a real cgroup (3 times) and the ARBITRATED arm not at all.
+  Structural reason: the spinner is ~1x parallel and 130ms wall against a
+  120ms budget sampled every 100ms, so a fire needs a tick jittered past
+  ~120ms — rare when the box is quiet, commoner under the very contention
+  that motivates the feature. **Accepted as a coverage gap, written here
+  because plan §9 does not list it:** the arbitrated arm's coverage is the
+  deterministic hermetic pair
+  (`TestAIRA136CPUBudgetAgainstAlreadyExitedLeaderArbitratesToExited`, real
+  child, real kernel liveness, the identical code path, non-vacuity counter,
+  proven non-porous by the executed revert), which is the same shape AIRA-126's
+  own gate accepted for the same reason (its C4/§12.1). A follow-up may resize
+  the soak (e.g. a parallel spinner whose crossing lands within one tick of its
+  own exit) so the real-cgroup arbitrated arm is demonstrably reached.
+- **Scenarios (a) and (b) do exercise a real cgroup.** (a) is a same-argv pair
+  (0.5s sleep: wall 100ms kills it, CPU 100ms does not) that a wall-clock
+  mutant fails deterministically; (b) is a spinner killed at 300ms of cgroup
+  CPU with the full kill shape plus a four-spinner cumulative row whose
+  elapsed wall is under the budget (skips honestly, logging the measured
+  parallelism, below 1.5x). The record's `cpu_user+cpu_sys` is asserted
+  against the budget in both, so the pass is grounded in the counter, not in
+  the absence of a kill.
+- **Non-blocking nits, for the record.** `deadlineFire.Observed` is set by
+  the source and read only by tests. `killedByCPUBudget` is true for a CPU
+  fire whose kill did NOT complete (the reconcile-required, non-terminal
+  arm), which suppresses `U_RUN_CPU_BUDGET_UNENFORCED` there; not a fake
+  pass — that record is non-terminal and exits 3 with `E_RUN_CPU_TIMEOUT` +
+  `U_RUN_RECONCILE_REQUIRED` — but the name overclaims "killed".
+- **Deferrals acknowledged:** AIRA-138 (`aira confine` has no deadline of any
+  kind; a CPU bound there is confine's first kill-and-arbitration path, not a
+  rider) and the refused `--cpu-timeout --detach` pending AIRA-131. Both are
+  filed, not silent; the owner may still fold AIRA-138 in.
