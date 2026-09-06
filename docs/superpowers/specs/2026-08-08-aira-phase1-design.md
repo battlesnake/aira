@@ -123,10 +123,14 @@ their branch projections concurrently.
    Phase 1 does not silently delete a ticket file.
 6. Open a new `BEGIN IMMEDIATE`, verify the final file digest, mark the outbox
    materialised, update the rebuildable index, and commit. If a conflict remains,
-   the intent is resolved only by the explicit `aira reconcile resolve <seq>
-   --materialise|--retire` verb. `--materialise` validates and adopts the current
-   file; `--retire` abandons the intended mutation and, for a new allocation,
-   permanently retires its ID. Both resolutions emit their own event.
+   the intent is resolved only by an explicit operator decision. The retire half
+   is built as `aira intent-retire <selector>` (AIRA-73): it abandons the
+   intended mutation, deletes the outbox row, and — for a new allocation —
+   permanently retires its ID, emitting its own `intent.retire` event. It never
+   touches the working tree, so the third party's content stays where it is. The
+   materialise half (adopt or overwrite the current file) is **not built**; it is
+   data-losing in a direction retire is not and needs its own design, tracked
+   separately.
 7. Append the canonical event record identified by `(project, seq, digest)` to
    the project repository's common-dir journal under its append lock, flush and
    `fsync` it. A second short DB transaction marks the event journaled. Repeating
@@ -171,9 +175,11 @@ outstanding. An earlier revision of this spec paired it with an
 `outbox.resolution` column holding "materialise/retire resolution" metadata;
 that column was never written by any implementation, so `resolution IS NULL`
 was a tautology on every row, and it was deleted along with its predicates
-(AIRA-73). A retire path for a conflicted intent — see the crash matrix below —
-remains unbuilt and, when it is built, must not reintroduce a second completion
-truth alongside `materialised`.
+(AIRA-73). The retire path built afterwards honours that: it **deletes** the
+outbox row rather than finalising it in place, because any surviving row would
+be a second completion truth alongside `materialised`. The retirement itself is
+recorded where a materialisation is recorded — in `allocations.state` and in the
+common-dir journal — never as a new outbox column or state.
 
 For a project, the physical audit paths are
 `<git-common-dir>/aira/journal.jsonl`,
@@ -190,7 +196,7 @@ worktree and therefore outside the commit graph.
 |---|---|
 | Before the first DB commit | A file already present is treated as git-authoritative and imported with a new sequence; no uncommitted intent exists. |
 | After intent commit, before receipt append | Append the missing allocation receipt first. If that append fails, leave the intent pending and retry from this stage; never materialise the ticket without the receipt. |
-| After receipt append, before file rename | If the path is absent, or its digest still equals the recorded precondition, replay the intended bytes. If it already equals the intended digest, finalise it. Any other digest is a conflict: do not overwrite, leave the intent pending, and require explicit materialise/retire resolution. An allocated ID remains a visible pending receipt until materialised or retired. **The retire half of that resolution is specified but not implemented** — a conflicted intent stays pending indefinitely, keeps its path in `E_PATH_INTENT_BUSY`, and keeps `eject` refusing with `E_EJECT_UNVERIFIED`; tracked, with the reachability analysis, on AIRA-73. |
+| After receipt append, before file rename | If the path is absent, or its digest still equals the recorded precondition, replay the intended bytes. If it already equals the intended digest, finalise it. Any other digest is a conflict: do not overwrite, leave the intent pending, and require explicit resolution. An allocated ID remains a visible pending receipt until materialised or retired. **Retire is built** (AIRA-73) as `aira intent-retire <seq\|reconcile:<worktree>:<seq>\|path>`. It acts on an intent of the **invoking worktree only** — a sibling's file is not visible here, so this worktree must never judge that file's digest. Order of operations: resolve the selector and take the cheap refusals; **repair the allocation receipt if the crash predated it** (this deliberately precedes verification, because `receipts.jsonl` is the ID high-water source `Rebuild` reads after a database loss and the pending row is the only thing that would ever have caused the repair — so a *refused* retire may still leave that one repaired receipt behind, and nothing else); then, holding the finding-mutation lock and the physical path lock, verify inside one `BEGIN IMMEDIATE` that the intent is genuinely unreplayable (it carries bytes, and the on-disk digest is neither the precondition nor the intended digest), delete the outbox row, set `allocations.state='retired'` (only from `allocated`), clear the `reconcile:<worktree>:<seq>` finding, and journal an `intent.retire` event that `Rebuild` replays so the retirement survives a database loss. It refuses with `E_INTENT_REPLAYABLE` anything reconcile could still complete, `E_INTENT_NOT_PENDING` for a completed row, and `U_INTENT_UNEVALUATED` when the on-disk state cannot be read. It never writes the working tree. **Force-materialise is still not built** — see §2 step 6. Accepted gap: when the conflicting file is itself a *valid* entity claiming the same allocated ID, the retire still succeeds and marks the allocation `retired` even though that ID now resolves to a live entity. Refusing instead would reintroduce the permanent `E_PATH_INTENT_BUSY`/`E_EJECT_UNVERIFIED` wedge this verb exists to remove, with no built alternative; the residue is one DB column value no face surfaces, and it is pinned by a characterisation test. |
 | During temp write | Ignore an unrenamed temp file after recording its digest if recoverable; replay from the outbox. |
 | After rename, before materialised commit | Verify the digest, rebuild/index the file, and mark the outbox materialised. A different digest is a conflict; never overwrite it. |
 | After materialised commit, before journal append | Append the missing event from the DB event row, then mark journaled. |
@@ -405,8 +411,10 @@ COMMIT
 
 The receipt and counter update commit together. The ticket file is then written
 by the protocol in §2. A receipt without a file is never silently forgotten: the
-reconciler reports a pending allocation and offers the explicit choices
-`materialise` or `retire`, after which the ID is permanently consumed.
+reconciler reports a pending allocation, and `aira intent-retire` is the built
+explicit choice for one whose path a third party has taken; after a retire the
+ID is permanently consumed. Retiring a bare `aira id` allocation that has no
+pending outbox row at all is a different case and is not built.
 
 Every connection sets `PRAGMA busy_timeout=5000`; contended writers use an
 explicit `BEGIN IMMEDIATE`. A timeout returns `E_DB_BUSY` with `retryable: true`
@@ -438,7 +446,8 @@ transaction is held:
    and records a recovered-receipt work item if no receipt exists. If an
    imported file unambiguously matches a pending allocation's project,
    worktree, ID, path, and digest, reconciliation auto-adopts it and marks the
-   allocation materialised; only ambiguous cases require manual `--retire`.
+   allocation materialised; only ambiguous cases require a manual
+   `aira intent-retire`.
    After the DB
    writer transaction commits and releases, the reconciler appends those
    synthesised receipts under the common-dir append lock. If it crashes in that
@@ -711,7 +720,7 @@ relations on the lower-ID canonical ticket.
 | Command | Phase-1 behaviour |
 |---|---|
 | `aira init` | Create `.aira/config` and required directories, register the project and prefixes, and refuse to overwrite an existing config. |
-| `aira id <prefix>` | Atomically allocate an ID and durable receipt without creating a ticket file; an unresolved allocation must later be materialised or retired. |
+| `aira id <prefix>` | Atomically allocate an ID and durable receipt without creating a ticket file; an unresolved allocation must later be materialised or retired. Retiring a bare allocation that has no pending outbox intent is **not built** — `aira intent-retire` acts on a conflicted pending intent only (AIRA-73). |
 | `aira new <title>` / `aira create` | Allocate an ID, create one canonical ticket file, and return the ID plus path and event sequence. |
 | `aira ls [query]` / `aira list` | List current-worktree projections, with explicit `--all-worktrees` for cross-worktree results. |
 | `aira count [query] --by <field>` | Return counts/distributions before row fetch; no silent result cap. |
@@ -721,7 +730,7 @@ relations on the lower-ID canonical ticket.
 | `aira claim/release/heartbeat` | Perform token-protected lease CAS operations. |
 | `aira touch <ID> <glob...>` | Replace the invoking holder's advisory area hints; overlap emits `W_AREA_OVERLAP`. |
 | `aira link <ID> <relation> <ID>` | Validate both current-worktree tickets and update only the canonical lower-ID file. |
-| `aira reconcile resolve <seq> --materialise\|--retire` | Resolve a wedged path intent explicitly; adopt a validated current file or abandon the intended mutation/retire its new ID. |
+| `aira intent-retire <seq\|reconcile:<worktree>:<seq>\|path>` | Resolve a wedged path intent explicitly by abandoning the intended mutation and retiring its new ID. Refuses anything reconcile could still complete, and never writes the working tree. The materialise half (adopt or overwrite the current file) is not built. |
 | `aira ready <ID>` / `aira ready --list` | Return derived readiness, blockers, and verdict evidence. |
 | `aira reconcile [--all] [--rebuild]` | Run the full project or machine scan and report repairs/findings; never silently delete content. |
 | `aira check [--all]` | Reconcile, evaluate integrity checks, emit structured verdicts, and use the §8 exit codes. |
@@ -737,7 +746,7 @@ committed into git.
 
 | §21 deliverable | Phase-1 decision |
 |---|---|
-| DB ↔ git-file ↔ journal ordering and crash recovery | SQLite commits intent/coordination/seq first with `synchronous=FULL`; the receipt is appended immediately; a path-locked precondition check precedes atomic rename; index/outbox is marked materialised; common-dir journal is appended and fsynced; the reconciler replays each missing stage idempotently and requires explicit materialise/retire on conflicts. Git is content authority, SQLite is transactional coordination authority, journal is durable audit projection. |
+| DB ↔ git-file ↔ journal ordering and crash recovery | SQLite commits intent/coordination/seq first with `synchronous=FULL`; the receipt is appended immediately; a path-locked precondition check precedes atomic rename; index/outbox is marked materialised; common-dir journal is appended and fsynced; the reconciler replays each missing stage idempotently and requires an explicit `aira intent-retire` on conflicts. Git is content authority, SQLite is transactional coordination authority, journal is durable audit projection. |
 | ID atomicity | `modernc.org/sqlite v1.54.0`, WAL, `synchronous=FULL`, `busy_timeout=5000`, explicit `BEGIN IMMEDIATE`; counter and DB receipt commit together, followed immediately by durable common-dir receipt append. |
 | Multi-worktree counter rebuild | Under the machine-level state lock plus a DB writer transaction, scan every breadcrumb/worktree working tree, all common-dir receipts/journals, and all refs. Working-tree scanning sees uncommitted sibling IDs; importing any ID bumps the counter and synthesises a receipt. |
 | Multi-worktree ticket identity | `(project_id, id)` is logical identity; `(project_id, worktree_id, id)` is the derived projection index. Same-path sibling copies are normal; same-worktree duplicate definitions fail, cross-worktree divergence warns. |

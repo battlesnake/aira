@@ -303,7 +303,7 @@ func TestRoutingCompletenessWithRecordingSentinels(t *testing.T) {
 		Request{Verb: "get", Args: map[string]any{"selector": "RUN-2"}},
 	)
 	for _, request := range fixtures {
-		prepareRoutingFixture(t, seed, request)
+		request = prepareRoutingFixture(t, seed, s, root, request)
 		execution.reset()
 		gitops.calls = 0
 		response := dispatcher.Do(context.Background(), request)
@@ -421,7 +421,7 @@ func writeRoutingGateFixtures(t *testing.T, root string) {
 	})
 }
 
-func prepareRoutingFixture(t *testing.T, seed *Core, request Request) {
+func prepareRoutingFixture(t *testing.T, seed *Core, s *store.Store, root string, request Request) Request {
 	t.Helper()
 	canonical := CanonicalVerb(request.Verb)
 	operation, _ := request.Args["subverb"].(string)
@@ -432,7 +432,47 @@ func prepareRoutingFixture(t *testing.T, seed *Core, request Request) {
 		mustRoutingOK(t, seed.Do(context.Background(), Request{Verb: "gate", Args: map[string]any{"subverb": "review", "gate_id": "manual-fixture"}}), "seed manual challenge")
 	case canonical == "gate" && operation == "prove":
 		mustRoutingOK(t, seed.Do(context.Background(), Request{Verb: "gate", Args: map[string]any{"subverb": "run", "gate_id": "manual-fixture"}}), "seed manual result")
+	case canonical == "intent-retire":
+		// intent-retire needs a genuinely conflicted pending intent, and it must
+		// be on a ticket no other fixture touches: retiring leaves the third
+		// party's bytes at that path, so pointing this at AIRA-1 would break
+		// every later set/mv fixture that has to parse it.
+		request.Args["selector"] = seedConflictedRoutingIntent(t, seed, s, root)
 	}
+	return request
+}
+
+// seedConflictedRoutingIntent builds a real write conflict through the exported
+// API only: UpdateTicketContent reads the file, calls the update callback, and
+// only then records the intent, so a third-party write from inside the callback
+// leaves the intent pending with the path owned by someone else — exactly the
+// production shape AIRA-73 exists for. It returns the path to retire.
+func seedConflictedRoutingIntent(t *testing.T, seed *Core, s *store.Store, root string) string {
+	t.Helper()
+	response := seed.Do(context.Background(), Request{Verb: "create", Args: map[string]any{
+		"title": "routing retire fixture", "kind": "feature", "severity": "P2", "body": "", "labels": []string{},
+	}})
+	mustRoutingOK(t, response, "seed retire ticket")
+	data, ok := response.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("seed retire ticket data type = %T", response.Data)
+	}
+	id, _ := data["id"].(string)
+	if id == "" {
+		t.Fatalf("seed retire ticket data = %#v", data)
+	}
+	path := filepath.Join(root, ".aira", "tickets", id+".md")
+	_, err := s.UpdateTicketContent(context.Background(), id, func(ticket domain.Ticket, body string) (domain.Ticket, string, error) {
+		if writeErr := os.WriteFile(path, []byte("--- a third party got here first ---\n"), 0o644); writeErr != nil {
+			return domain.Ticket{}, "", writeErr
+		}
+		ticket.Title = "never written"
+		return ticket, body, nil
+	})
+	if !errors.Is(err, store.ErrWriteConflict) {
+		t.Fatalf("seeding a conflicted intent returned %v, want ErrWriteConflict", err)
+	}
+	return path
 }
 
 func assertRoutingEffect(t *testing.T, s *store.Store, request Request, findingID string) {
@@ -471,6 +511,13 @@ func assertRoutingEffect(t *testing.T, s *store.Store, request Request, findingI
 		relations, err := s.Relations("AIRA-1")
 		if err != nil || len(relations) != 0 {
 			t.Fatalf("unlink effect relations=%+v err=%v", relations, err)
+		}
+	case "intent-retire":
+		// The retire must have actually cleared the path: a second retire of
+		// the same selector can now only report that nothing is pending.
+		selector, _ := request.Args["selector"].(string)
+		if _, err := s.RetireIntent(context.Background(), selector); err == nil || store.ErrorCode(err) != "E_NOT_FOUND" {
+			t.Fatalf("intent-retire effect: second retire err=%v, want E_NOT_FOUND", err)
 		}
 	case "import":
 		rows, err := s.ListFindings("source:routing-import")
@@ -693,5 +740,31 @@ func TestEmptyImportsUseExplicitlyPresentRequestContent(t *testing.T) {
 		if !response.OK {
 			t.Fatalf("%s empty import reopened its path: %+v", request.Verb, response)
 		}
+	}
+}
+
+// verifies: AIRA-73 — intent-retire is a pure-store mutation and must stay
+// daemon-routed, so the DB-owning daemon remains the single writer. A
+// client-routed retire would delete durable outbox rows from whichever process
+// happened to run the CLI.
+func TestIntentRetireIsDaemonRouted(t *testing.T) {
+	canonical, route := Classify("intent-retire", "")
+	if canonical != "intent-retire" || route != RouteDaemon {
+		t.Fatalf("Classify(intent-retire) = %q/%v, want intent-retire/RouteDaemon", canonical, route)
+	}
+	if StoreFreeCarved("intent-retire", map[string]any{}) {
+		t.Fatal("intent-retire was carved as store-free; it is a store mutation")
+	}
+	descriptor, ok := descriptorByName(New(nil).DispatchDescriptors(), "intent-retire")
+	if !ok {
+		t.Fatal("intent-retire descriptor missing")
+	}
+	if descriptor.MCPTool != "aira_intent_retire" || !descriptor.Include ||
+		descriptor.Safety != SafetyReconcile || !descriptor.Destructive {
+		t.Fatalf("intent-retire descriptor = %+v, want an included destructive reconcile-class aira_intent_retire", descriptor)
+	}
+	if len(descriptor.Args) != 1 || descriptor.Args[0].Name != "selector" ||
+		!descriptor.Args[0].Required || !descriptor.Args[0].Positional {
+		t.Fatalf("intent-retire args = %+v, want exactly one required positional selector", descriptor.Args)
 	}
 }

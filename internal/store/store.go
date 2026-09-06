@@ -210,6 +210,20 @@ type Store struct {
 	// rebuildPhaseBHook is a test-only failure seam inside the atomic rebuild
 	// transaction, after projection replacement and before deferred findings.
 	rebuildPhaseBHook func() error
+	// afterRetireResolve fires between RetireIntent's advisory selector
+	// resolution and its guard transaction, so a test can prove the
+	// in-transaction re-read — not the cheap pre-check — is what refuses an
+	// intent that completed underneath it. Production leaves it nil.
+	afterRetireResolve func(EventKey)
+	// beforeRecordConflictFinding fires in reconcile immediately before the
+	// E_WRITE_CONFLICT finding is written, so a test can prove the
+	// finding-mutation lock is what stops a concurrent reconcile from
+	// re-recording a finding a retire just deleted. Production leaves it nil.
+	beforeRecordConflictFinding func()
+	// afterRetireJournalCommit fires after RetireIntent's guard transaction
+	// commits and before it appends the retire event to the journal, so a test
+	// can crash exactly in that window. Production leaves it nil.
+	afterRetireJournalCommit func() error
 }
 
 type Intent struct {
@@ -2473,8 +2487,7 @@ func (s *Store) reconcile(ctx context.Context) error {
 		// Replay always resumes at the first incomplete stage. In particular,
 		// an allocation receipt is repaired before any file materialisation.
 		if intent.AllocationID != "" {
-			if err := s.appendReceiptIfMissing(AllocationReceipt{ProjectID: s.projectID, WorktreeID: intent.WorktreeID,
-				ID: intent.AllocationID, Path: intent.Path, Seq: intent.Seq, State: "allocated"}); err != nil {
+			if err := s.appendReceiptIfMissing(repairedAllocationReceipt(s.projectID, intent)); err != nil {
 				return err
 			}
 		}
@@ -2486,7 +2499,22 @@ func (s *Store) reconcile(ctx context.Context) error {
 			}
 			continue
 		}
-		if len(intent.Intended) == 0 {
+		// The digest read is skipped for a receipt-only intent, exactly as it
+		// always was: such an intent has no file to compare against, and its
+		// path may legitimately be empty (a lease event) or absent.
+		current := ""
+		if len(intent.Intended) > 0 {
+			read, err := fileDigest(intent.Path)
+			if err != nil {
+				return err
+			}
+			current = read
+		}
+		// classifyPendingIntent is the SINGLE decision this loop and
+		// RetireIntent share, so "a retire never discards work reconcile could
+		// still have completed" is structural rather than reviewed (AIRA-73).
+		switch classifyPendingIntent(intent.Intended, intent.Precondition, current) {
+		case dispositionReceiptOnly:
 			if err := s.markReceiptOnly(ctx, intent.ProjectID, intent.Seq); err != nil {
 				return err
 			}
@@ -2494,12 +2522,7 @@ func (s *Store) reconcile(ctx context.Context) error {
 				return err
 			}
 			continue
-		}
-		current, err := fileDigest(intent.Path)
-		if err != nil {
-			return err
-		}
-		if current == digestBytes(intent.Intended) {
+		case dispositionAlreadyWritten:
 			if err := s.markMaterialised(ctx, intent); err != nil {
 				return err
 			}
@@ -2507,14 +2530,16 @@ func (s *Store) reconcile(ctx context.Context) error {
 				return err
 			}
 			continue
-		}
-		if current == intent.Precondition {
+		case dispositionReplayable:
 			if err := s.materialiseIntent(ctx, intent); err != nil {
 				return err
 			}
 			continue
 		}
 		conflict := fmt.Errorf("%w: pending intent %s", ErrWriteConflict, intent.Path)
+		if s.beforeRecordConflictFinding != nil {
+			s.beforeRecordConflictFinding()
+		}
 		if err := s.recordFinding(ctx, intent, conflict); err != nil {
 			return err
 		}
@@ -2865,6 +2890,44 @@ func (s *Store) Rebuild(ctx context.Context) error {
 				continue
 			}
 			if err := s.ensureReceiptAllocation(ctx, conn, receipt, journal); err != nil {
+				return err
+			}
+		}
+		// AIRA-73: a retirement is recorded in the DB (allocations.state) and
+		// witnessed by the JOURNAL, exactly as a materialisation is recorded in
+		// the DB and witnessed by the ticket file. receipts.jsonl keeps its
+		// single meaning ("this ID was allocated"), so replaying the retire
+		// events is what carries a retirement across a database loss.
+		//
+		// Ordering is load-bearing: this must run AFTER the receipt loop above,
+		// or a replayed 'allocated' receipt would re-open a retirement.
+		for _, event := range journal {
+			if event.ProjectID != s.projectID || event.Verb != "intent.retire" {
+				continue
+			}
+			// A retire of a plain path mutation targets the path, not an ID,
+			// and retires no allocation. Skipping it is not an error.
+			if domain.ValidateID(event.Target) != nil {
+				continue
+			}
+			prefix, number := splitTicketID(event.Target)
+			// allocated -> retired only. A forged or corrupt frame can therefore
+			// never silence a materialised allocation's E_ID_UNRESOLVED, which
+			// an unnarrowed UPDATE would let it do.
+			//
+			// ACCEPTED GAP: this does not make a retirement unforgeable. The
+			// journal digest is unkeyed (see allocationEventDigest), so anyone
+			// who can write journal.jsonl can synthesise a well-formed
+			// intent.retire frame and retire an allocation that is still
+			// genuinely unresolved, hiding one E_ID_UNRESOLVED. That is the same
+			// limitation every journal-replayed fact already carries — the same
+			// writer could forge an id.allocate — and closing it needs a keyed
+			// digest, which is a whole-journal design decision, not this verb's.
+			// The narrowing above is what keeps the blast radius to unresolved
+			// allocations only.
+			if _, err := conn.ExecContext(ctx, `UPDATE allocations SET state='retired'
+				WHERE project_id=? AND prefix=? AND number=? AND state='allocated'`,
+				s.projectID, prefix, number); err != nil {
 				return err
 			}
 		}

@@ -312,6 +312,9 @@ func (metadataProbeStore) Relations(string) ([]domain.RelationView, error) { ret
 func (metadataProbeStore) Ready(string) ([]store.ReadyRecord, error)       { return nil, nil }
 func (metadataProbeStore) Reconcile(context.Context) error                 { return nil }
 func (metadataProbeStore) Rebuild(context.Context) error                   { return nil }
+func (metadataProbeStore) RetireIntent(context.Context, string) (store.RetireResult, error) {
+	return store.RetireResult{}, nil
+}
 func (metadataProbeStore) Check(context.Context) (store.CheckReport, error) {
 	return store.CheckReport{}, nil
 }
@@ -407,7 +410,7 @@ func TestDestructiveOperationsAreExplicit(t *testing.T) {
 			}
 		}
 	}
-	if want := []string{"confine-kill", "eject", "rant redact"}; !reflect.DeepEqual(destructive, want) {
+	if want := []string{"confine-kill", "eject", "intent-retire", "rant redact"}; !reflect.DeepEqual(destructive, want) {
 		t.Fatalf("destructive descriptors=%v, want %v", destructive, want)
 	}
 }
@@ -419,7 +422,7 @@ func TestCanonicalDispatchNamesAndAliases(t *testing.T) {
 		got = append(got, descriptor.Name)
 	}
 	sort.Strings(got)
-	want := []string{"check", "claim", "commands", "confine", "confine-kill", "confine-list", "confine-reserve", "confine-status", "count", "create", "eject", "find", "gate", "git", "grep", "heartbeat", "help", "id", "import", "init", "insights", "install", "lease", "link", "list", "mv", "quota", "rant", "ready", "reconcile", "release", "req", "review", "run", "run-input", "run-kill", "run-log", "set", "show", "spend", "test-report", "time", "touch", "unlink"}
+	want := []string{"check", "claim", "commands", "confine", "confine-kill", "confine-list", "confine-reserve", "confine-status", "count", "create", "eject", "find", "gate", "git", "grep", "heartbeat", "help", "id", "import", "init", "insights", "install", "intent-retire", "lease", "link", "list", "mv", "quota", "rant", "ready", "reconcile", "release", "req", "review", "run", "run-input", "run-kill", "run-log", "set", "show", "spend", "test-report", "time", "touch", "unlink"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("dispatch names=%v, want=%v", got, want)
 	}

@@ -108,6 +108,9 @@ func (unexpectedCarvedStore) Ready(string) ([]store.ReadyRecord, error) {
 }
 func (unexpectedCarvedStore) Reconcile(context.Context) error { return errUnexpectedCarvedStore }
 func (unexpectedCarvedStore) Rebuild(context.Context) error   { return errUnexpectedCarvedStore }
+func (unexpectedCarvedStore) RetireIntent(context.Context, string) (store.RetireResult, error) {
+	return store.RetireResult{}, errUnexpectedCarvedStore
+}
 func (unexpectedCarvedStore) Check(context.Context) (store.CheckReport, error) {
 	return store.CheckReport{}, errUnexpectedCarvedStore
 }

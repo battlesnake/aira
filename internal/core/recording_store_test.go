@@ -148,6 +148,9 @@ func (s *recordingStore) Ready(string) ([]store.ReadyRecord, error) {
 }
 func (s *recordingStore) Reconcile(context.Context) error { return s.fail("Reconcile") }
 func (s *recordingStore) Rebuild(context.Context) error   { return s.fail("Rebuild") }
+func (s *recordingStore) RetireIntent(context.Context, string) (store.RetireResult, error) {
+	return store.RetireResult{}, s.fail("RetireIntent")
+}
 func (s *recordingStore) Check(context.Context) (store.CheckReport, error) {
 	return store.CheckReport{}, s.fail("Check")
 }

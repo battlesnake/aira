@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -258,24 +259,27 @@ func TestMigrationReCheckMakesTheLosingRacerANoOp(t *testing.T) {
 // outstanding, and it belongs to AIRA-74 now, not AIRA-97. The busy-timeout
 // note is explicitly deferred with its cost written down in AIRA-97's plan.
 
-// TestConflictedIntentHasNoRetirePath is the committed, executable evidence
-// for the half of AIRA-73 this change does NOT close.
+// TestConflictedIntentIsRetirable is the closure of AIRA-73's second half, and
+// it is this file's former TestConflictedIntentHasNoRetirePath inverted.
 //
-// The ticket asserted, without investigating it, that "once a write conflict
-// lands a path in E_PATH_INTENT_BUSY, there is no path back to resolved — it's
-// permanent for that ticket, and it also blocks eject". Deleting the
-// never-written `outbox.resolution` column does not change that one way or the
-// other: the column was the design's slot for an explicit retire, but no code
-// ever wrote it, so removing it removes a phantom escape hatch, not a real one.
+// That test was a deliberate characterisation test. It pinned the accepted gap
+// — reconcile twice, then Rebuild, then the later-writer refusal, then the eject
+// guard's own query, all still wedged — and its own doc comment said that when
+// the retire path was built the test must be changed DELIBERATELY, and that its
+// failure would be the signal the gap had closed rather than a regression. This
+// is that deliberate change: the construction is unchanged, every step that
+// demonstrated permanence is kept, and each assertion of permanence is now an
+// assertion that `intent-retire` ends it.
 //
-// This test pins today's ACCEPTED behaviour so the gap is executable rather
-// than prose. It is deliberately a characterisation test: when the retire path
-// is built, this test must be changed deliberately, and its failure is the
-// signal that the gap closed — not a regression. Same shape as
-// TestStaleGrantedLeasesNeverSelectsAScopelessReservation
-// (internal/daemon/confine_reaper_vanished_linux_test.go), which pins D3's
-// accepted coverage gap for the same reason.
-func TestConflictedIntentHasNoRetirePath(t *testing.T) {
+// The three consequences the ticket named are all asserted:
+//   - reconcile no longer sees the intent;
+//   - preparePathMutation admits a new writer on the physical path;
+//   - Eject's durability guard counts zero, and Eject itself gets past it.
+//
+// The third party's bytes are deliberately still on disk afterwards, and that is
+// asserted too: retire abandons AIRA's claim on the path, it never touches the
+// working tree.
+func TestConflictedIntentIsRetirable(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "main")
 	if err := os.MkdirAll(root, 0o755); err != nil {
@@ -300,10 +304,12 @@ func TestConflictedIntentHasNoRetirePath(t *testing.T) {
 	// outside AIRA (a human edit, a branch checkout, a merge) changes the file
 	// before the intent is materialised.
 	intended := []byte("--- intended body, never written ---\n")
-	if _, err := s.preparePathMutation(ctx, path, precondition, intended, "set"); err != nil {
+	intent, err := s.preparePathMutation(ctx, path, precondition, intended, "set")
+	if err != nil {
 		t.Fatalf("prepare the intent: %v", err)
 	}
-	if err := os.WriteFile(path, []byte("--- a third party got here first ---\n"), 0o644); err != nil {
+	thirdParty := []byte("--- a third party got here first ---\n")
+	if err := os.WriteFile(path, thirdParty, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -316,8 +322,9 @@ func TestConflictedIntentHasNoRetirePath(t *testing.T) {
 		return pending
 	}
 
-	// Reconcile records a finding and leaves the intent pending — every time,
-	// not just the first.
+	// Reconcile still records a finding and still leaves the intent pending —
+	// every time, not just the first. Retire is an EXPLICIT operator decision,
+	// so nothing automatic may make it for them.
 	for pass := 0; pass < 2; pass++ {
 		if err := s.reconcile(ctx); !errors.Is(err, ErrWriteConflict) {
 			t.Fatalf("reconcile pass %d = %v, want ErrWriteConflict", pass, err)
@@ -327,27 +334,82 @@ func TestConflictedIntentHasNoRetirePath(t *testing.T) {
 		}
 	}
 
-	// A full index rebuild is the heaviest repair AIRA offers, and it does not
-	// retire the intent either.
+	// Nor does a full index rebuild, the heaviest automatic repair AIRA offers.
 	if err := s.Rebuild(ctx); err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
 	if got := pendingCount(); got != 1 {
-		t.Fatalf("after Rebuild, pending=%d, want 1 (no repair path retires a conflicted intent)", got)
+		t.Fatalf("after Rebuild, pending=%d, want 1 (no automatic repair may retire a conflicted intent)", got)
 	}
 
-	// Consequence 1: the physical path stays refused for every later writer.
-	if _, err := s.preparePathMutation(ctx, path, precondition, intended, "set"); !errors.Is(err, ErrPathIntentBusy) {
-		t.Fatalf("later writer = %v, want ErrPathIntentBusy", err)
+	// The explicit resolution, by the reconciliation finding key the operator
+	// actually sees.
+	result, err := s.RetireIntent(ctx, fmt.Sprintf("reconcile:%s:%d", s.worktreeID, intent.Seq))
+	if err != nil {
+		t.Fatalf("retire the conflicted intent: %v", err)
 	}
-	// Consequence 2: the eject durability guard's own query still counts it.
+	if result.Seq != intent.Seq || result.Path != path {
+		t.Fatalf("retire reported %+v, want seq=%d path=%s", result, intent.Seq, path)
+	}
+
+	// Consequence 1, closed: the physical path admits a later writer again.
+	if _, err := s.preparePathMutation(ctx, path, digestBytes(thirdParty), intended, "set"); err != nil {
+		t.Fatalf("later writer after retire = %v, want it to be admitted", err)
+	}
+
+	// Consequence 2, closed: the eject durability guard's own query no longer
+	// counts the retired intent. The admission probe above deliberately left a
+	// new pending row of its own — a different intent, not the retired one — so
+	// it is dropped here rather than being allowed to mask the assertion.
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM outbox WHERE project_id=? AND seq=?`,
+		s.projectID, pendingSeqFor(t, s, path)); err != nil {
+		t.Fatal(err)
+	}
 	var ejectGuard int
 	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM outbox WHERE project_id=? AND materialised=0`, s.projectID).Scan(&ejectGuard); err != nil {
 		t.Fatal(err)
 	}
-	if ejectGuard == 0 {
-		t.Fatal("eject's durability guard no longer sees the conflicted intent; this test is no longer pinning the gap it claims to")
+	if ejectGuard != 0 {
+		t.Fatalf("eject's durability guard still counts %d unresolved materialisations", ejectGuard)
 	}
+
+	// Consequence 3, closed: reconcile does not see the retired intent again.
+	if err := s.reconcile(ctx); err != nil {
+		t.Fatalf("reconcile after retire = %v, want nil", err)
+	}
+
+	// And the third party's content is untouched: retire abandons AIRA's claim,
+	// it does not overwrite anyone.
+	onDisk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(onDisk) != string(thirdParty) {
+		t.Fatalf("retire modified the working tree; file=%q", onDisk)
+	}
+
+	// Finally, the guard is genuinely PASSED, not merely counted: a real Eject
+	// now gets through the durability check that used to refuse forever. This is
+	// last because a successful eject drops the project's rows.
+	db := &DB{db: s.db}
+	if _, err := db.Eject(ctx, ProjectRegistration{
+		ProjectID: s.projectID, Slug: "aira", CommonDir: filepath.Join(base, "common"),
+		Prefixes: []ProjectPrefix{{Prefix: "AIRA", Kind: "ticket"}},
+	}, false); err != nil {
+		t.Fatalf("eject after retire = %v, want it to pass the durability guard", err)
+	}
+}
+
+// pendingSeqFor returns the single pending intent sequence for a path.
+func pendingSeqFor(t *testing.T, s *Store, path string) int64 {
+	t.Helper()
+	var seq int64
+	if err := s.db.QueryRowContext(context.Background(),
+		`SELECT seq FROM outbox WHERE project_id=? AND worktree_id=? AND path=? AND materialised=0`,
+		s.projectID, s.worktreeID, path).Scan(&seq); err != nil {
+		t.Fatal(err)
+	}
+	return seq
 }
 
 // TestOutboxResolutionMigrationIsIdempotent pins that a real migration can be

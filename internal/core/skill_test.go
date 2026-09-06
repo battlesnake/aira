@@ -17,8 +17,8 @@ func TestSkillMetadataNormalisesEveryIncludedAction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(artifacts.Actions) != 71 {
-		t.Fatalf("actions=%d, want 71", len(artifacts.Actions))
+	if len(artifacts.Actions) != 72 {
+		t.Fatalf("actions=%d, want 72", len(artifacts.Actions))
 	}
 	for _, action := range artifacts.Actions {
 		if action.Summary == "" || !action.Safety.Valid() || !strings.HasPrefix(action.Command, "aira ") {
@@ -138,7 +138,8 @@ func TestSkillSafetyGolden(t *testing.T) {
 		"heartbeat": SafetyLease, "touch": SafetyMutate, "unlink": SafetyMutate, "ready": SafetyRead,
 		"list": SafetyRead, "count": SafetyRead, "set": SafetyMutate, "mv": SafetyMutate,
 		"reconcile": SafetyReconcile, "check": SafetyReconcile, "eject": SafetyReconcile,
-		"insights/ls": SafetyRead, "insights/show": SafetyRead,
+		"intent-retire": SafetyReconcile,
+		"insights/ls":   SafetyRead, "insights/show": SafetyRead,
 		"test-report/add": SafetyMutate, "test-report/ls": SafetyRead, "test-report/show": SafetyRead, "test-report/flaky": SafetyRead,
 		"run": SafetyExecute, "run-input": SafetyExecute, "run-kill": SafetyExecute, "run-log": SafetyRead,
 		"confine-list": SafetyRead, "confine-kill": SafetyExecute,
