@@ -111,13 +111,70 @@ func runM20FakeSupervisor() int {
 		n, _ := ack.Read(buffer)
 		value := "0"
 		if n == 1 {
-			value = "1"
+			value = m20AckObserved
 		}
-		if path := os.Getenv("AIRA_M20_ACK_PATH"); path != "" {
-			_ = os.WriteFile(path, []byte(value), 0o600)
+		if path := os.Getenv(m20AckPathEnv); path != "" {
+			_ = publishM20Ack(path, value)
 		}
 		return 0
 	}
+}
+
+// The fake supervisor reports the ACK byte it observed by publishing a value at
+// m20AckPathEnv, which the launcher-side test then reads back. m20AckStallEnv holds
+// the publish open at its pre-publish seam so that test can assert atomicity across
+// the real process boundary instead of hoping to catch a microsecond-wide window.
+const (
+	m20AckPathEnv  = "AIRA_M20_ACK_PATH"
+	m20AckStallEnv = "AIRA_M20_ACK_STALL"
+	m20AckObserved = "1"
+)
+
+// publishM20Ack publishes value at path so that a reader polling the path observes
+// either nothing at all or the complete value, never something in between.
+//
+// This replaced a plain os.WriteFile, and the difference is the whole of AIRA-118.
+// os.WriteFile opens O_CREATE|O_TRUNC and only then writes, so between those two
+// syscalls the destination EXISTS and is EMPTY. The launcher-side assertion polls
+// that path every 2ms and stops at the first successful read, so a reader that lands
+// in the window reads "" and the subtest fails at its CONTENT check with ack="".
+// That is precisely how the reported failure surfaced (detach_linux_test.go:313,
+// `ack=""`), and it identifies the cause: a missed testdeadline.Eventually deadline
+// calls Fatalf, which Goexits and can never reach the content check, so the empty
+// read is the only path to that message. It is a lost race inside the test harness,
+// not a tight deadline and not a defect in the ACK protocol.
+//
+// Staging in the destination's own directory and renaming closes the window for
+// good: rename(2) is atomic, so the destination either does not exist or holds the
+// finished value. The staging name is dot-prefixed and distinct from the destination
+// so the launcher's "no ACK before the handle completes" stat still sees ErrNotExist.
+func publishM20Ack(path, value string) error {
+	staging, err := os.CreateTemp(filepath.Dir(path), ".ack-staging-*")
+	if err != nil {
+		return err
+	}
+	name := staging.Name()
+	if _, err := staging.WriteString(value); err != nil {
+		_ = staging.Close()
+		_ = os.Remove(name)
+		return err
+	}
+	if err := staging.Close(); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	// The seam: the value is fully written and still unpublished. A reader that
+	// looks now must see nothing.
+	if raw := os.Getenv(m20AckStallEnv); raw != "" {
+		if stall, parseErr := time.ParseDuration(raw); parseErr == nil {
+			time.Sleep(stall)
+		}
+	}
+	if err := os.Rename(name, path); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	return nil
 }
 
 func intPointer(value int) *int { return &value }
@@ -285,11 +342,24 @@ func TestM20LauncherDefersACKAndBoundsReadiness(t *testing.T) {
 	if defaults.detachReadyTimeout != 60*time.Second {
 		t.Fatalf("default detach readiness timeout=%s", defaults.detachReadyTimeout)
 	}
+	// verifies: AIRA-118
 	t.Run("handle before ack", func(t *testing.T) {
 		r, _ := newMemoryRunner(t, nil)
 		ackPath := filepath.Join(t.TempDir(), "ack")
 		t.Setenv("AIRA_M20_FAKE_SUPERVISOR", "success")
-		t.Setenv("AIRA_M20_ACK_PATH", ackPath)
+		t.Setenv(m20AckPathEnv, ackPath)
+		// AIRA-118: hold the supervisor's publish open at its pre-publish seam. The
+		// poll below runs every 2ms and stops at its FIRST successful read, so this
+		// makes the atomicity of the publish a decided question rather than a race
+		// the assertion usually loses only on a saturated box: a non-atomic publish
+		// leaves the destination existing and empty for this whole stall, and the
+		// poll reads "" long before the real value lands. Against the os.WriteFile
+		// this replaced, that failed 3 runs out of 3 with exactly the reported
+		// `ack=""`; against the atomic publish there is no observable intermediate
+		// state to read, at any stall length. The stall costs the suite 200ms once
+		// and is entirely inside the child, so contention can only lengthen the
+		// window this test wants open.
+		t.Setenv(m20AckStallEnv, (200 * time.Millisecond).String())
 		launch, err := r.LaunchDetached(context.Background(), Request{Argv: []string{"/bin/true"}, Detach: true}, "")
 		if err != nil || launch.Record.ID != "RUN-helper" || launch.Record.Status != StatusStarting {
 			t.Fatalf("launch=%+v err=%v", launch, err)
@@ -300,17 +370,31 @@ func TestM20LauncherDefersACKAndBoundsReadiness(t *testing.T) {
 		if err := launch.Complete(true); err != nil {
 			t.Fatal(err)
 		}
+		// A LIVENESS BACKSTOP, not a latency assertion: what is under test is that
+		// the ACK byte reaches the child and comes back complete, never how fast. The
+		// event is a round trip across a real process boundary, and the box this
+		// suite runs on can leave that child unscheduled for a long time under memory
+		// pressure -- the reported failure ran with admission=waited, peak RSS at
+		// 100% of its reserve and 13 queued waiters. So the budget is the one the
+		// launcher itself allows for the OTHER direction of this same handshake
+		// across this same boundary rather than a number picked small. The previous
+		// time.Second was never a considered value at all: it is below
+		// testdeadline.MinBackstop, so it silently inherited the package's 5s floor,
+		// which is the floor for a sub-second interval and not a budget for a stalled
+		// subprocess. On a passing run the timer never fires, so the size is free.
+		backstop := defaults.detachReadyTimeout
 		var ack []byte
-		testdeadline.Eventually(t, time.Second, func() bool {
+		testdeadline.Eventually(t, backstop, func() bool {
 			data, err := os.ReadFile(ackPath)
 			if err != nil {
 				return false
 			}
 			ack = data
 			return true
-		}, "fake supervisor did not observe ACK")
-		if string(ack) != "1" {
-			t.Fatalf("ack=%q", ack)
+		}, "fake supervisor published no ACK observation at %s within %s (%s before scaling by %g)",
+			ackPath, testdeadline.Wait(backstop), backstop, testdeadline.Scale())
+		if string(ack) != m20AckObserved {
+			t.Fatalf("ACK observation = %q, want %q: the supervisor read no ACK byte, or published a value a reader could catch half-written", ack, m20AckObserved)
 		}
 	})
 
