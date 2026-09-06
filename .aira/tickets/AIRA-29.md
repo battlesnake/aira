@@ -113,11 +113,22 @@ first battery run surfaced genuinely porous tests.
 | `go test -race ./internal/daemon/` excluding `TestSliceCeilingRealCgroupSignalTracksRealAccounting` | 0 |
 | mutation battery (18 mutants) | 0 survivors |
 
-`go test -race ./internal/daemon/` including that one test exits 1 on
-`TestSliceCeilingRealCgroupSignalTracksRealAccounting` ("helper did not acknowledge anon
-growth"). **Verified PRE-EXISTING**: the identical failure reproduces at base commit
-`f1f699a` in a clean detached worktree. It is the AIRA-20 wall-clock-tight `-race` flake
-class, not a regression, and zero DATA RACE reports were emitted in any run.
+`go test -race ./internal/daemon/` INCLUDING those three exits 1, on
+`TestSliceCeilingRealCgroupSignalTracksRealAccounting`,
+`TestSliceCeilingRealCgroupNeverShrinksBelowRealUsage` and
+`TestSliceCeilingRealCgroupUsageBoundHarnessDetectsAViolation`, all with "helper did not
+acknowledge anon growth: <nil>".
+
+**Verified PRE-EXISTING AND NOT MINE, with a control rather than an assertion.** All three
+reproduce identically at `origin/master` `88d4cea` in a clean detached worktree, with and
+without `AIRA_REAL_CGROUP=1`; the same class reproduced at the original base `f1f699a`
+before the rebase. They PASS at that same master commit without `-race`, so it is a
+`-race`-only timing failure in the AIRA-106 sliceceiling helper handshake, of the AIRA-20
+wall-clock-tight class. Zero DATA RACE reports were emitted in any run.
+
+**Flagged for the coordinating session, since it is outside this ticket:** AIRA-20 has just
+re-enabled `-race` in CI and AIRA-106's sliceceiling change has just landed, so `make ci`
+on current master is red on these three independently of AIRA-29.
 
 ### Open design questions from the brief, as resolved
 
