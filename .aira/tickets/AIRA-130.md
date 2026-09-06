@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-130","project":"aira","title":"install --ci=shim: floor the meminfo-MemTotal fallback budget at 4G like the declared/cgroup-derived sources (AIRA-121 F4 residual)","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","ci","confine","install"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-130","project":"aira","title":"install --ci=shim: floor the meminfo-MemTotal fallback budget at 4G like the declared/cgroup-derived sources (AIRA-121 F4 residual)","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","ci","confine","install"],"hold":false,"relations":[]}
 ---
 Found by the AIRA-121 round-4 build review (PR #72, merged as 8f134ee). Accepted there as a documented, non-blocking coverage gap rather than forcing a fifth round; filed so the gap is not silent.
 
@@ -20,7 +20,7 @@ Trigger: no --memory-max, an unbounded or unreadable container memory.max (e.g. 
 
 Apply the same `bytes < minimumCeilingGiB<<30` refusal to the MemTotal branch of resolveShimBudget (E_INSTALL_UNAVAILABLE, naming the MemTotal value and the floor, pointing at --memory-max), plus a regression test in internal/install/ci_shim_mode_test.go proven to FAIL against the current code, in the style of TestShimInstallRefusesACgroupDerivedBudgetBelowTheFloor. Keep the existing "nothing readable" refusal as-is. Also fold a one-line correction into plan §4.2 / residuals of docs/superpowers/plans/2026-09-06-aira121-ci-shim-mode-plan.md.
 
-## Resolution (in-review — PR pending, branch `aira130-shim-memtotal-floor`)
+## Resolution (done — PR #76 merged as 9ca7644)
 
 The MemTotal branch of `resolveShimBudget` (`internal/install/mode.go`) now
 applies the SAME `bytes < minimumCeilingGiB<<30` refusal the declared and
