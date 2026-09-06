@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-128","project":"aira","title":"aira confine's default reservation estimate under-provisions the standalone `make test-lite` signature, producing phantom OOM-kill failures","status":"planned","kind":"bug","severity":"P0","assignee":null,"milestone":null,"labels":["admission","confine","estimator","honesty"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-128","project":"aira","title":"aira confine's default reservation estimate under-provisions the standalone `make test-lite` signature, producing phantom OOM-kill failures","status":"in-review","kind":"bug","severity":"P0","assignee":null,"milestone":null,"labels":["admission","confine","estimator","honesty"],"hold":false,"relations":[]}
 ---
 Reported by peer session 'speed' relaying peer 'money's' evidence, 2026-09-06 (landing
 their #1199), NARROWED by speed's own follow-up correction the same day. Money's own numbers,
@@ -138,3 +138,152 @@ OOM/unevaluated rather than a phantom failure tally, or (if fix direction 1) tha
 the same signature is admitted at a materially higher, OOM-escalated reserve. A test that merely
 calls resolveAdmitReserve directly with synthetic OOMCount>0 stats would be porous for hypothesis
 2 -- it must exercise a REAL OOM event's attribution path, not just the escalation arithmetic.
+
+## Resolution (2026-09-06) — verified: hypothesis 1 confirmed, hypothesis 2 refuted, no estimator defect
+
+Investigated by reproduction under `AIRA_REAL_CGROUP=1` on the live daemon before any
+code was written, exactly as the hand-off notes required. **Every number below is a
+measured exit code or a row read out of the daemon's own `state.db`, not an assertion.**
+
+### What was reproduced
+
+The incident's mechanism was reproduced exactly, including money's own `~1.26GB` figure.
+
+1. **The cold-start cap is the machine-wide p90 prior, and on this box it is money's
+   number to the byte.** A never-before-seen command:
+
+   ```
+   $ aira confine -- /bin/sh -c 'echo AIRA128-probe-a1 >/dev/null; sleep 2'
+   confine: ... reserve=1260470067 reserve-basis=estimate:p90-prior ...
+             scope-memory.max=enforced=1260466176 ... terminated-by=normal
+   EXIT=0
+   ```
+
+   `1260470067 B = 1.17 GiB`. That is the "~1.26GB estimate" in the report: it is not a
+   per-command estimate at all, it is `estimate:p90-prior`, the p90 of every OTHER
+   signature's peak, applied as this scope's hard `memory.max` because the command has no
+   history of its own.
+
+2. **A cold-start OOM is already unambiguous — AIRA reports it honestly.** Same command
+   shape, a workload whose real peak exceeds that cap:
+
+   ```
+   $ aira confine -- /usr/bin/python3 ~/tmp/aira128-hog.py 2000 --tag=A128R1
+   confine: ... reserve=1260470067 reserve-basis=estimate:p90-prior ... scope-swap.max=enforced
+             terminated-by=oom peak-rss=1230924K
+   confine: job OOM-killed at its memory cap 1230924K (peak RSS 1230924K); raise the cap ...
+   confine: the OOM fired at this scope's OWN memory limit.
+   EXIT=137
+   ```
+
+   The workload's own success line never printed. `terminated-by=oom`, exit `137`, two
+   advisory lines, all on stderr (so a consumer's stdout parsing is not corrupted).
+
+3. **The reported "371 failed / exit 0" shape cannot be produced by AIRA.** The parallel
+   -worker aggregate-overflow shape was run directly (four concurrent children, aggregate
+   2 GiB, cap 1.17 GiB): `memory.oom.group` group-killed the whole scope, the trailing
+   `echo ALL-CHILDREN-DONE-EXIT-0` never ran, `terminated-by=oom`, `EXIT=137`. A phantom
+   tally under exit 0 therefore requires a consumer-side wrapper that swallows the status
+   (`|| true`, a tee'd report parsed for a summary) — hand-off note 4's suspicion,
+   confirmed, and consumer-repo territory as the ticket says.
+
+4. **The self-heal works, in ONE cycle, with no operator action.** Re-running the identical
+   command immediately, at plain default (no `--memory-max`, no `--memory-reserve`):
+
+   ```
+   allocated 2000 MiB
+   DONE-OK
+   confine: ... reserve=4G reserve-basis=estimate:oom-escalated ...
+             scope-memory.max=enforced=4294967296 ... terminated-by=normal peak-rss=2064492K
+   EXIT=0
+   ```
+
+5. **The OOM really is recorded against this command's own signature.** Read straight out
+   of `~/.local/state/aira/state.db` (`confine_peak_history`; note SQLite `LIKE` stops at
+   the `\x00` argv separator, so the filter has to be done outside SQL):
+
+   ```
+   peak=1260466176 oom=1 at=2026-09-06T12:00:50Z | /usr/bin/python3 .../aira128-hog.py 2000 --tag=A128R1
+   peak=2114039808 oom=0 at=2026-09-06T12:00:56Z | /usr/bin/python3 .../aira128-hog.py 2000 --tag=A128R1
+   ```
+
+   One OOM row keyed to the exact signature, then one clean row from the healed re-run.
+
+   A second, entirely incidental confirmation landed mid-investigation: `aira confine -- go
+   vet ./internal/daemon/` OOM-killed at its own `estimate:max=119705600,n=20,f=115` cap,
+   and the immediately following identical invocation was admitted at
+   `reserve-basis=estimate:oom-escalated reserve=201648K` and passed.
+
+### Findings
+
+- **Hypothesis 1 (hand-off note 1) is CONFIRMED.** The OOM is observed at teardown,
+  reported over the admit socket, durably recorded against the command's own signature,
+  and the very next identical invocation is admitted at an escalated reserve. No operator
+  action, no flag, no re-configuration.
+- **Hypothesis 2 (hand-off note 2, the attribution gap) is REFUTED.** `reportPeak` reads
+  the HIERARCHICAL `memory.events` counter deliberately (`confine_linux.go:1248-1254`), so
+  an OOM anywhere in the job — including a nested aitest worker sub-scope or a container at
+  its own `--memory` — marks this signature's history. There is nothing for a sub-scope to
+  absorb.
+- **Hand-off note 3 (AIRA-110's `memory.swap.max=0`) is consistent** with this surfacing
+  now: every trailer above reads `scope-swap.max=enforced`, so an overshoot that a swapping
+  scope would once have absorbed is now a hard kill. That does not make AIRA-110 wrong.
+- **Hand-off note 4 is CONFIRMED as consumer-side**, per item 3 above.
+- **The estimator is not defective and is NOT changed here.** Its one genuine limitation is
+  the one speed identified: escalation learns from a CENSORED observation (the recorded OOM
+  peak equals the cap that killed the job — `peak=1260466176` is `memory.max` exactly), so
+  convergence is geometric at 1.5x per OOM cycle from a `max(4 GiB no-history default,
+  1.5 x observed)` floor. For a workload needing ~20 GiB from a 1.17 GiB cold start that is
+  several wasted runs. Chasing that with new estimation machinery is exactly what speed's
+  concluding architectural point rules out, and what architectural-simplicity rules out: an
+  `-n auto` signature has no fixed peak to learn, so the input must be made deterministic
+  (worker-count pinning, a consumer-repo change already shipped as money's workaround) and
+  the existing per-signature estimator then learns it correctly.
+
+**Scope reduction CONFIRMED, not assumed: no AIRA-side behavioural change is warranted.**
+Every signal a consumer needs already exists and is already correct.
+
+### What was built
+
+The defect that remained is the one the brief predicted: AIRA never TOLD anyone to read
+those signals, and the self-heal loop was only ever covered by synthetic-stats unit tests.
+
+1. **`internal/daemon/confine_oom_selfheal_real_cgroup_linux_test.go`** — a real-cgroup,
+   real-daemon, end-to-end regression test for the loop the ticket's Tests section demands:
+   three real seeding runs establish a genuine machine-wide p90 prior; the target command's
+   cold start is admitted at `estimate:p90-prior` and genuinely OOM-killed
+   (`terminated-by=oom`, exit `137`, no completion marker, OOM advisory on stderr); the
+   identical next run is admitted at `estimate:oom-escalated` above the 1.5x floor and
+   completes. It runs entirely inside a throwaway `cgrouptest.IsolatedScopeParent` and
+   never touches `aira.slice`. `internal/daemon/main_test.go` gains the `__confine-setup`
+   dispatch a real `runner.Confine` needs, as `internal/install` and `internal/runner`
+   already have.
+
+   Not porous — established by mutation, with the surviving mutant recorded in the test's
+   own comment: forcing `reportPeak`'s `oom` argument false → RED (attribution); disabling
+   `resolveAdmitReserve`'s escalation branch → RED (resolution); disabling
+   `classifyConfineTermination`'s OOM branch → RED (honesty, reports
+   `unattributed-sigkill`). Swapping the hierarchical counter for the local one SURVIVES,
+   because this fixture's workload is the leader in its own scope so both counters rise
+   together; that shape is covered by `TestClassifyConfineTermination`'s `descendantOOM`
+   and `drainedOOM` rows and is written down as an accepted gap.
+
+2. **Generated Skill + agent guide** (`internal/core/skill.go`) gain a section, "Reading a
+   confined job's outcome (an OOM kill is not a test result)". The generated agent-facing
+   guidance named `terminated-by` nowhere at all before this — an agent reading only a
+   truncated run's failure tally has no instruction telling it otherwise. It teaches the
+   verdict vocabulary, exit `137`, that a killed run is UNEVALUATED rather than failing,
+   that a first-run OOM is an expected cold-start cost whose correct response is to re-run
+   the identical command, and that a workload whose own parallelism scales with the machine
+   must pin its worker count because no per-signature estimate can track a moving input.
+   Guarded by `TestSkillTeachesTheOOMVerdictAndTheColdStartSelfHeal` (verified red without
+   the prose) so it cannot be silently dropped.
+
+### Explicitly not done
+
+- Merge-gate's own ~38-41 GB estimate: untouched, as the scope correction requires.
+- The estimator's starting value (`estimate:p90-prior`) and the 1.5x escalation formula:
+  untouched. Both work as designed; the cold-start cost is a deliberate, documented
+  property going back to AIRA-50/52/67.
+- Nothing that would cap or model a workload's own internal parallelism. That is the
+  consumer's pytest/Makefile invocation, and pinning it is the correct fix there.

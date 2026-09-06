@@ -608,3 +608,50 @@ func TestSkillNamesNothingFromTheRetiredXdistGovernor(t *testing.T) {
 		}
 	}
 }
+
+// TestSkillTeachesTheOOMVerdictAndTheColdStartSelfHeal is the documentation half
+// of AIRA-128.
+//
+// The incident behind that ticket was NOT a broken estimator: a standalone
+// `aira confine -- make test-lite` was capped at the machine-wide p90 prior on
+// its first ever run, group-killed, and the CONSUMER's own wrapper reported the
+// truncated pytest output as a large failure tally. Every AIRA-side signal that
+// would have said otherwise already existed and was correct — `terminated-by=oom`
+// on the trailer, exit 137, the OOM advisory — and the very next run of the same
+// command was admitted at an escalated reserve with no operator action. What did
+// not exist was any instruction telling an agent to LOOK at those signals: the
+// generated Skill and guide, which are AIRA's own instructions to other agents,
+// named `terminated-by` nowhere at all.
+//
+// So this is enforced by a test rather than left to review, for the same reason
+// TestSkillNamesNothingFromTheRetiredXdistGovernor is: an agent that reads only
+// the failure tally will act on it, and a real failure can hide among the fakes.
+// The three legs below are the three things it must not lose — the verdict to
+// read, the phantom-tally warning, and the self-heal that makes "re-run it" the
+// correct response to a first OOM rather than "investigate the failures".
+//
+// verifies: AIRA-128
+func TestSkillTeachesTheOOMVerdictAndTheColdStartSelfHeal(t *testing.T) {
+	artifacts, err := GenerateSkillArtifacts(New(nil).DispatchDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []struct{ text, why string }{
+		{"terminated-by=oom", "the trailer field that distinguishes an OOM kill from a real failure"},
+		{"exits `137`", "the exit code a consumer's own wrapper sees, so a swallowed status is checkable"},
+		{"UNEVALUATED run", "the honesty framing: a killed run has no result, it is not a failing result"},
+		{"estimate:p90-prior", "the basis a never-seen command's first run is capped at"},
+		{"estimate:oom-escalated", "the basis that proves the next run self-healed"},
+		{"RE-RUN the identical command", "the correct response to a first-run OOM"},
+		{"pytest -n auto", "the input-nondeterminism case no per-signature estimate can learn"},
+	} {
+		for _, document := range []struct{ name, body string }{
+			{"SKILL.md", string(artifacts.SkillMD)},
+			{"guide", string(artifacts.Guide)},
+		} {
+			if !strings.Contains(document.body, want.text) {
+				t.Errorf("%s no longer teaches %q (%s)", document.name, want.text, want.why)
+			}
+		}
+	}
+}
