@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-73","project":"aira","title":"A conflicted outbox intent has no retire path — one write conflict permanently bricks a ticket path and blocks eject","status":"in-progress","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["dogfood","store"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-73","project":"aira","title":"A conflicted outbox intent has no retire path — one write conflict permanently bricks a ticket path and blocks eject","status":"in-review","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["dogfood","store"],"hold":false,"relations":[]}
 ---
 Found during the whole-project simplification review (PR #12), originally as "`outbox.resolution` is never written". Scoped in the backlog remediation plan's Phase 2 (`docs/superpowers/plans/2026-09-04-backlog-remediation-plan.md` §4, §5 item 4).
 
