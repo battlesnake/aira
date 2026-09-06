@@ -1211,6 +1211,12 @@ type admitSnapshot struct {
 	// exclusiveWaiting counts the queued waiters actually held up behind the
 	// exclusive job. It excludes the exclusive waiter itself.
 	exclusiveWaiting int
+	// AIRA-119. How long the reported state has been in effect, taken from the
+	// SAME waiter the identity above came from and the SAME clock reading as every
+	// other age in this snapshot. Zero is an unestablished age, never "0s" — see
+	// runner.ConfineExclusiveState.SinceMS for why the age is load-bearing rather
+	// than decorative.
+	exclusiveSinceMS int64
 
 	// AIRA-108. One row per GRANTED, accounted, scope-less waiter — the population
 	// reservationJobs/reservationBytes above can only count. Gathered in the same
@@ -1404,6 +1410,29 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		snapshot.exclusiveWaiting = subtractJobCount(snapshot.queued, 1)
 		if exclusive.state != admitQueued {
 			snapshot.exclusiveWaiting = snapshot.queued
+		}
+		// AIRA-119. The age of THIS state, from THIS waiter, against the one clock
+		// reading `now` already took for the whole walk.
+		//
+		// The anchor is per-state and that is load-bearing, not tidiness. A HELD
+		// job's age must run from its grant — the daemon's own record of the moment
+		// it was let in — because a benchmark that queued twenty minutes and has now
+		// been running alone for five seconds has held the slice for five seconds,
+		// and reporting twenty minutes would libel it as the wedge. A DRAINING job
+		// has no grant yet, so its age necessarily runs from its enqueue, which is
+		// exactly the quantity an operator wants: how long this drain has been
+		// failing to converge. This is the AIRA-49 v3 conflation (enqueued read as
+		// grantedAt) in the one place it would say the opposite of the truth.
+		//
+		// elapsedMilliseconds floors a backwards clock at zero, and a zero anchor is
+		// left at zero, so an age is either established or absent — never negative
+		// and never fabricated.
+		anchor := exclusive.grantedAt
+		if snapshot.exclusiveState == admitExclusiveDraining {
+			anchor = exclusive.enqueued
+		}
+		if !anchor.IsZero() {
+			snapshot.exclusiveSinceMS = elapsedMilliseconds(anchor, now)
 		}
 	}
 	queue.mu.Unlock()

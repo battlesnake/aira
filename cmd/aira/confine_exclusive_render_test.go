@@ -43,7 +43,7 @@ func TestRenderConfineListReportsExclusiveHeldDrainingAndNone(t *testing.T) {
 		State: "held", Name: "bench-fft", Owner: "mark", ScopeID: "CONFINE-bench-fft-100-1@mark", WaitingJobs: 4,
 	}
 	heldOut := renderExclusiveList(t, held)
-	if !strings.Contains(heldOut, `slice exclusive: held by "bench-fft" (mark), 4 jobs waiting`) {
+	if !strings.Contains(heldOut, `slice exclusive: held by "bench-fft" (mark) scope=CONFINE-bench-fft-100-1@mark, 4 jobs waiting`) {
 		t.Fatalf("held line missing or malformed:\n%s", heldOut)
 	}
 	if strings.Contains(heldOut, "slice exclusive: none") {
@@ -55,7 +55,7 @@ func TestRenderConfineListReportsExclusiveHeldDrainingAndNone(t *testing.T) {
 		State: "draining", Name: "bench-fft", Owner: "mark", WaitingJobs: 1,
 	}
 	drainingOut := renderExclusiveList(t, draining)
-	if !strings.Contains(drainingOut, `slice exclusive: draining for "bench-fft" (mark), 1 job waiting`) {
+	if !strings.Contains(drainingOut, `slice exclusive: draining for "bench-fft" (mark), not started yet, 1 job waiting`) {
 		t.Fatalf("draining line missing or malformed:\n%s", drainingOut)
 	}
 	// Draining and held are different situations for a waiting operator: one will

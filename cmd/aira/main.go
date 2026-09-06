@@ -2651,17 +2651,7 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 		if exclusive := result.SliceReserve.Exclusive; exclusive == nil {
 			_, _ = fmt.Fprintln(stdout, "slice exclusive: none")
 		} else {
-			verb := "held by"
-			if exclusive.State == "draining" {
-				verb = "draining for"
-			}
-			owner := exclusive.Owner
-			if strings.TrimSpace(owner) == "" {
-				owner = "unknown owner"
-			}
-			_, _ = fmt.Fprintf(stdout, "slice exclusive: %s %q (%s), %d %s waiting\n",
-				verb, exclusive.Name, owner,
-				exclusive.WaitingJobs, confinePlural(exclusive.WaitingJobs, "job", "jobs"))
+			_, _ = fmt.Fprintln(stdout, renderConfineExclusiveLine(exclusive))
 		}
 		// AIRA-68. The job count above spans three populations and the table above
 		// THAT lists only scopes, so the two are not comparable — reading them
@@ -2873,6 +2863,59 @@ func confineCeilingSourceNote(reserve *runner.ConfineSliceReserve) string {
 		note += " — holding: " + reserve.CeilingReason
 	}
 	return note
+}
+
+// renderConfineExclusiveLine renders the `slice exclusive:` line of
+// `confine --list` for an ACTIVE exclusive state (the "none" case is its
+// caller's, because that one must print even when this struct is absent).
+//
+// AIRA-119. The identity alone is not something an operator can act on, and that
+// is not a cosmetic complaint — it is the defect that ticket records. Three facts
+// were missing, each of which the daemon already knew:
+//
+//   - WHETHER THE NAMED JOB IS RUNNING. `held` means it is running alone;
+//     `draining` means it has NOT STARTED — `aira confine` creates its cgroup
+//     scope and launches its target only after admission is granted, so a
+//     draining job owns no process and no scope, and it has no row in the table
+//     above either. "draining for X" reads as though X were running, so an
+//     operator greps for X, finds nothing, and concludes the daemon is naming a
+//     job that already released. That misreading is AIRA-119.
+//   - THE SCOPE ID. The one unique, greppable handle, and the selector
+//     `aira confine --kill` takes. The daemon has always sent it and no face has
+//     ever printed it, leaving `Name` — which defaults to "job" for every unnamed
+//     confine — as the only identifier, while `Owner` can come from
+//     AIRA_CONFINE_OWNER and so appears in no argv at all.
+//   - HOW LONG. The discriminator between a normal drain and a stuck one. A
+//     30-second drain is routine; an 18-minute one is the thing to escalate.
+//
+// An unestablished age (SinceMS == 0) prints NO age clause rather than "0s",
+// which would state that a state just began when nothing established that.
+func renderConfineExclusiveLine(exclusive *runner.ConfineExclusiveState) string {
+	draining := exclusive.State == "draining"
+	verb, since := "held by", "running alone for "
+	if draining {
+		verb, since = "draining for", "draining for "
+	}
+	owner := exclusive.Owner
+	if strings.TrimSpace(owner) == "" {
+		owner = "unknown owner"
+	}
+	line := fmt.Sprintf("slice exclusive: %s %q (%s)", verb, exclusive.Name, owner)
+	if scope := strings.TrimSpace(exclusive.ScopeID); scope != "" {
+		line += " scope=" + scope
+	}
+	if draining {
+		// Stated INDEPENDENTLY of the age below, because it is a different fact and
+		// it is the load-bearing one: the state is established even when the age is
+		// not, and "draining for X" on its own is precisely what was read as X
+		// running.
+		line += ", not started yet"
+	}
+	if exclusive.SinceMS > 0 {
+		line += ", " + since + (time.Duration(exclusive.SinceMS) * time.Millisecond).Round(time.Second).String()
+	}
+	return fmt.Sprintf("%s, %d %s waiting", line,
+		exclusive.WaitingJobs, confinePlural(exclusive.WaitingJobs, "job", "jobs"))
 }
 
 func confinePlural(count int, singular, plural string) string {
