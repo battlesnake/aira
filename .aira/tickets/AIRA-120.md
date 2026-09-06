@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-120","project":"aira","title":"aira install --ci: size the slice ceiling to current free RAM with zero headroom, for dedicated CI workers","status":"in-review","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","ci","install"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-120","to":"AIRA-121"}]}
+{"schema":1,"id":"AIRA-120","project":"aira","title":"aira install --ci: size the slice ceiling to current free RAM with zero headroom, for dedicated CI workers","status":"done","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","ci","install"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-120","to":"AIRA-121"}]}
 ---
 Requested directly by the owner, 2026-09-06.
 
