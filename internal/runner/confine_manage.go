@@ -197,6 +197,52 @@ type ConfineSliceReserve struct {
 	ResidualJobs  int   `json:"residual_jobs"`
 	ResidualBytes int64 `json:"residual_bytes"`
 
+	// AIRA-127. The system-and-slice frame `aira top` draws its RAM bar in. Every
+	// one of these is a READING the confine-list pass already had in its hands or
+	// takes from the same /proc/meminfo the ceiling subsystem samples; none of
+	// them is a new admission signal, and nothing here participates in an
+	// admission decision.
+	//
+	// ZERO IS AN ABSENCE in every field below, never a measured zero, and a
+	// renderer must say "unevaluated" rather than draw a bar from it. Two
+	// structural cases produce that absence deliberately:
+	//
+	//   - ci-shim mode, where the host's /proc/meminfo is NOT namespaced to the
+	//     container (the same trap readShimMemory documents). Presenting host
+	//     MemTotal as "total system RAM" beside an advisory container budget
+	//     would be a fabricated frame, so shim mode publishes none of it.
+	//   - a daemon-down client fallback, which builds no SliceReserve at all.
+	//
+	// SliceCurrentBytes/SliceReclaimableBytes come from the SAME memory reader
+	// call whose `ok` gates this whole struct, so they describe the same instant
+	// as GrantedBytes beside them. Reclaimable is carried separately rather than
+	// pre-subtracted because the two are different facts: the slice's
+	// non-reclaimable footprint is what MemAvailable does NOT already credit, and
+	// that subtraction is a rendering judgement, not a reading.
+	SystemMemTotalBytes     int64 `json:"system_mem_total_bytes,omitempty"`
+	SystemMemAvailableBytes int64 `json:"system_mem_available_bytes,omitempty"`
+	SliceCurrentBytes       int64 `json:"slice_current_bytes,omitempty"`
+	SliceReclaimableBytes   int64 `json:"slice_reclaimable_bytes,omitempty"`
+	// SliceMaxBytes is the slice's own live memory.max: the HARD limit, and the
+	// figure every ceiling term below is a reduction of. Distinct from
+	// CeilingStaticBytes, which carries the same reading only while the AIRA-103
+	// ceiling subsystem is running and is absent when it is off.
+	SliceMaxBytes int64 `json:"slice_max_bytes,omitempty"`
+	// SliceHighBytes is the slice's memory.high SOFT limit -- reclaim pressure,
+	// not a bound. SliceHighState is required to read it, and is the honesty bit:
+	// "set" (a number), "none" (memory.high is `max` -- a POSITIVE fact that no
+	// soft limit is configured), or "unevaluated" (the file could not be read or
+	// parsed). A zero SliceHighBytes under state "set" cannot occur; under the
+	// other two states the number is meaningless and must not be drawn.
+	SliceHighBytes int64  `json:"slice_high_bytes,omitempty"`
+	SliceHighState string `json:"slice_high_state,omitempty"`
+	// CeilingEffectiveBytes is the AIRA-103/106 effective ceiling BEFORE the
+	// per-job admission headroom CeilingBytes above subtracts. It is the figure
+	// an operator sees a throttle in: when it sits below SliceMaxBytes, capacity
+	// has been reduced by system pressure or the machine reserve, and the gap
+	// between the two is the reduction. Zero when the subsystem is off.
+	CeilingEffectiveBytes int64 `json:"ceiling_effective_bytes,omitempty"`
+
 	// AIRA-121. Containment/BudgetSource carry the ci-shim disposition on the
 	// SAME summary line the granted/ceiling numbers are printed on. Without them
 	// the reserve line in shim mode is byte-identical to a real slice's, which
@@ -267,6 +313,17 @@ type ConfineReservationHold struct {
 	// reader never has to reconcile the daemon's clock against its own.
 	HeldMS int64 `json:"held_ms"`
 }
+
+// The three states ConfineSliceReserve.SliceHighState may carry. "none" is a
+// POSITIVE fact (memory.high reads `max`, so no soft limit is configured) and is
+// deliberately distinct from "unevaluated" (the file could not be read); a
+// renderer that collapsed the two would present an unreadable cgroup as an
+// unlimited one.
+const (
+	ConfineSliceHighSet         = "set"
+	ConfineSliceHighNone        = "none"
+	ConfineSliceHighUnevaluated = "unevaluated"
+)
 
 // ConfineReservationStateHolding is the only state a reservation row carries
 // today: the daemon has granted this reserve and is holding it until the client

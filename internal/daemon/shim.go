@@ -72,12 +72,27 @@ func (s *Server) memoryReader() func(string) (int64, int64, int64, bool, string)
 	return readSliceMemory
 }
 
-// memTotalReader and memAvailableReader are readShimMemory's meminfo seams,
+// memoryHighReader returns the SOFT-limit reporting read (AIRA-127), on the same
+// nil-checks-to-the-package-default rule as the readers around it. There is no
+// shim branch: shim mode has no cgroup, and confineManagement never asks for a
+// memory.high it cannot have.
+func (s *Server) memoryHighReader() func(string) (int64, string) {
+	if s.admitReadMemoryHigh != nil {
+		return s.admitReadMemoryHigh
+	}
+	return readSliceMemoryHigh
+}
+
+// memTotalReader and memAvailableReader are the daemon's /proc/meminfo seams,
 // on the same nil-checks-to-the-package-default rule as sliceResolver and
 // memoryReader above. Production reaches the real /proc/meminfo readers;
-// tests inject a synthetic pair (SetShimMeminfoForTest) so the host-wide
-// fallback's routing is exercised without depending on this host's actual
-// memory state.
+// tests inject a synthetic pair (SetShimMeminfoForTest) so a reading's routing
+// is exercised without depending on this host's actual memory state.
+//
+// Two callers, deliberately sharing one pair: readShimMemory's host-wide
+// fallback (AIRA-121 F3), and AIRA-127's system frame for `aira top`. The
+// `shim`-prefixed field names below predate the second caller and are kept
+// rather than churned; neither reader is shim-specific.
 func (s *Server) memTotalReader() func() (int64, bool) {
 	if s.shimReadMemTotal != nil {
 		return s.shimReadMemTotal

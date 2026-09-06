@@ -146,6 +146,30 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 	// which is precisely the defect ResidualJobs/ResidualBytes now detect; keeping
 	// it would have baked a fabricated inconsistency into the expectation.
 	const scopeBackedBytes, reservationBytes = int64(2 << 30), int64(1 << 30)
+	// AIRA-127's system frame, and the slice reading it is drawn against. The
+	// memory reader below returns a non-zero memory.current so that a build which
+	// dropped the copy-out (publishing a fabricated zero) is caught.
+	const (
+		systemMemTotal     = int64(48 << 30)
+		systemMemAvailable = int64(20 << 30)
+		sliceCurrent       = int64(5 << 30)
+		sliceReclaimable   = int64(1 << 30)
+		sliceHigh          = int64(14 << 30)
+	)
+	// withSystemFrame stamps the AIRA-127 system/slice frame onto an arm's
+	// expectation. One definition, so a new wire field cannot be added and then
+	// silently left unasserted in two arms out of three.
+	//
+	// The ceiling subsystem is OFF in these fixtures, so CeilingEffectiveBytes is
+	// an ABSENCE (zero) rather than the raw maximum: publishing the maximum there
+	// would draw a throttle marker on an unthrottled slice.
+	withSystemFrame := func(want runner.ConfineSliceReserve) runner.ConfineSliceReserve {
+		want.SystemMemTotalBytes, want.SystemMemAvailableBytes = systemMemTotal, systemMemAvailable
+		want.SliceCurrentBytes, want.SliceReclaimableBytes = sliceCurrent, sliceReclaimable
+		want.SliceMaxBytes = maximum
+		want.SliceHighBytes, want.SliceHighState = sliceHigh, runner.ConfineSliceHighSet
+		return want
+	}
 	setup := func(t *testing.T) (*Server, string) {
 		t.Helper()
 		path := t.TempDir()
@@ -153,6 +177,19 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		server.admitResolveSlice = func(string) (string, bool, string) { return path, true, "" }
 		server.admitSliceHeadroomBase = base
 		server.admitSliceHeadroomSupervisor = supervisor
+		// AIRA-127: PIN the system frame. Without these seams the expectations below
+		// would carry whatever this host's /proc/meminfo happens to say, so a correct
+		// build would go red on a different machine — the same class of defect the
+		// frozen clock below fixes for the reservation row's age.
+		server.shimReadMemTotal = func() (int64, bool) { return systemMemTotal, true }
+		server.shimReadMemAvailable = func() (int64, bool, string) { return systemMemAvailable, true, "" }
+		// A REAL memory.high in the fixture slice, so the default reader's parse is
+		// what produces the "set" state below rather than an injected constant. The
+		// aggregate arm deliberately leaves the file absent and pins "unevaluated",
+		// which is the state a build that fabricated a zero soft limit would break.
+		if err := os.WriteFile(filepath.Join(path, "memory.high"), []byte(strconv.FormatInt(sliceHigh, 10)+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 		// AIRA-108: FREEZE the clock for this unit fixture. The reservation row's
 		// age is `now - grantedAt`, so a real clock plus a fixed grantedAt makes
 		// the expected HeldMS depend on how long the test took to reach the
@@ -178,7 +215,7 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 	t.Run("established", func(t *testing.T) {
 		server, _ := setup(t)
 		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
-			return 0, maximum, 0, true, ""
+			return sliceCurrent, maximum, sliceReclaimable, true, ""
 		}
 		response := server.confineManagement(context.Background(), request)
 		result, ok := response.Data.(runner.ConfineListResult)
@@ -191,7 +228,7 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		// Queued/FreezePhase are the AIRA-59 diagnostics. This fixture has no
 		// queued waiters, so a KNOWN zero and "idle" are the correct report —
 		// never "unevaluated", which is reserved for state that cannot be read.
-		want := runner.ConfineSliceReserve{
+		want := withSystemFrame(runner.ConfineSliceReserve{
 			GrantedBytes: granted + adopted, CeilingBytes: wantCeiling, Jobs: wantJobs, Queued: 0, FreezePhase: "idle",
 			// The split names WHICH population each job belongs to, so the job
 			// count can never again be read against the scope table above it.
@@ -210,7 +247,7 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 			// scanned this fixture's slice, and an unevaluated aggregate must
 			// present as unevaluated rather than as a measured zero.
 			CapBoundBytes: maximum * oversubscriptionFactorPctDefault / 100,
-		}
+		})
 		if got := *result.SliceReserve; !reflect.DeepEqual(got, want) {
 			t.Fatalf("slice reserve=%+v, want %+v", got, want)
 		}
@@ -222,7 +259,7 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		server.admitQueues[path].outstandingJobs = 0
 		server.admitQueues[path].waiters = nil
 		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
-			return 0, maximum, 0, true, ""
+			return sliceCurrent, maximum, sliceReclaimable, true, ""
 		}
 		response := server.confineManagement(context.Background(), request)
 		result, ok := response.Data.(runner.ConfineListResult)
@@ -230,11 +267,11 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 			t.Fatalf("response=%+v result=%+v", response, result)
 		}
 		wantCeiling := maximum - base - int64(adoptedJobs+1)*supervisor
-		want := runner.ConfineSliceReserve{
+		want := withSystemFrame(runner.ConfineSliceReserve{
 			GrantedBytes: adopted, CeilingBytes: wantCeiling, Jobs: adoptedJobs, Queued: 0, FreezePhase: "idle",
 			AdoptedJobs: adoptedJobs, AdoptedBytes: adopted,
 			CapBoundBytes: maximum * oversubscriptionFactorPctDefault / 100,
-		}
+		})
 		// Reservations is nil here, and that is a POSITIVE fact from the same
 		// walk (this fixture cleared the waiter list), not an unevaluated read.
 		if got := *result.SliceReserve; !reflect.DeepEqual(got, want) {
@@ -267,8 +304,10 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		server.admitSliceHeadroomSupervisor = supervisor
 		frozen := time.Now()
 		server.admitNow = func() time.Time { return frozen }
+		server.shimReadMemTotal = func() (int64, bool) { return systemMemTotal, true }
+		server.shimReadMemAvailable = func() (int64, bool, string) { return systemMemAvailable, true, "" }
 		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
-			return 0, maximum, 0, true, ""
+			return sliceCurrent, maximum, sliceReclaimable, true, ""
 		}
 		// One LEAF-DRAINED scope: subtree-live, so the aggregate counts it, but
 		// leaf-empty, so the adoption loop skips it. That keeps every other field
@@ -289,6 +328,13 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 			t.Fatalf("response=%+v result=%+v", response, result)
 		}
 		want := runner.ConfineSliceReserve{
+			// AIRA-127. This arm writes NO memory.high into its slice, so the soft
+			// limit is "unevaluated" rather than the "set" the other two pin. That
+			// is the distinction the wire keeps and a renderer acts on: an absent
+			// file is not a slice with no soft limit, and neither is a zero.
+			SystemMemTotalBytes: systemMemTotal, SystemMemAvailableBytes: systemMemAvailable,
+			SliceCurrentBytes: sliceCurrent, SliceReclaimableBytes: sliceReclaimable,
+			SliceMaxBytes: maximum, SliceHighState: runner.ConfineSliceHighUnevaluated,
 			CeilingBytes: maximum - base - supervisor, Queued: 0, FreezePhase: "idle",
 			// The value AND the bit. Asserting only the bit would survive a build
 			// that reported a fabricated total beside a true bit.
@@ -316,3 +362,41 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		}
 	})
 }
+
+// AIRA-127. The real memory.high read, against real files. It keeps three
+// outcomes apart, and the distinction is load-bearing on the operator surface:
+// "none" says a slice has no soft limit configured, "unevaluated" says nobody
+// could find out, and a renderer that collapsed them would draw a limit tick at
+// the bar's origin — a slice throttled to nothing — for an unreadable file.
+//
+// verifies: AIRA-127
+func TestReadSliceMemoryHigh(t *testing.T) {
+	cases := []struct {
+		name      string
+		content   *string
+		wantBytes int64
+		wantState string
+	}{
+		{"set", strPtr("15032385536\n"), 14 << 30, runner.ConfineSliceHighSet},
+		{"set-without-newline", strPtr("1048576"), 1 << 20, runner.ConfineSliceHighSet},
+		{"none", strPtr("max\n"), 0, runner.ConfineSliceHighNone},
+		{"unparsable", strPtr("fourteen gigs\n"), 0, runner.ConfineSliceHighUnevaluated},
+		{"absent", nil, 0, runner.ConfineSliceHighUnevaluated},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			path := t.TempDir()
+			if testCase.content != nil {
+				if err := os.WriteFile(filepath.Join(path, "memory.high"), []byte(*testCase.content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			bytes, state := readSliceMemoryHigh(path)
+			if bytes != testCase.wantBytes || state != testCase.wantState {
+				t.Fatalf("readSliceMemoryHigh=%d/%q, want %d/%q", bytes, state, testCase.wantBytes, testCase.wantState)
+			}
+		})
+	}
+}
+
+func strPtr(value string) *string { return &value }

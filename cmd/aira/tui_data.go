@@ -8,6 +8,7 @@ import (
 
 	"aira/internal/core"
 	"aira/internal/daemon"
+	"aira/internal/runner"
 	"aira/internal/store"
 )
 
@@ -93,6 +94,23 @@ func fetchTUIView(ctx context.Context, dispatcher Dispatcher, scope daemon.Workt
 		result.Model, result.Code = fetchInsights(ctx, dispatcher, scope)
 	case viewEvents:
 		result.Model = eventViewModel(nil)
+	case viewTop:
+		// AIRA-127. The SAME request `aira confine --list` sends, dispatched with
+		// an EMPTY worktree scope because confine state is machine-wide and this
+		// verb resolves no project. The reply is carried raw to the reducer, which
+		// owns the slot table the model depends on.
+		//
+		// The owner argument is required by the daemon's own validation and is
+		// purely a caller identity here: `confine-list` filters nothing by it, so
+		// the fixed read-only marker below neither hides nor reveals any job.
+		var data runner.ConfineListResult
+		request := core.Request{Verb: "confine-list", Args: map[string]any{
+			"slice": runner.ResolveConfineSlice(""), "owner": runner.ConfineUnknownOwner,
+		}}
+		if result.Code = dispatchTUIData(ctx, dispatcher, daemon.WorktreeScope{}, request, &data); result.Code != "" {
+			return result
+		}
+		result.Top = &data
 	}
 	return result
 }

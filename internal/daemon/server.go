@@ -146,6 +146,12 @@ type Server struct {
 	watchAfterWake    func()
 	admitResolveSlice func(string) (string, bool, string)
 	admitReadMemory   func(string) (int64, int64, int64, bool, string)
+	// admitReadMemoryHigh is the SOFT-limit REPORTING seam (AIRA-127), separate
+	// from admitReadMemory on purpose: memory.high participates in no admission
+	// decision, so a fixture that fakes the ledger's reading must not be forced
+	// to fake a limit the ledger never consults, and vice versa. Nil in
+	// production, which resolves to readSliceMemoryHigh.
+	admitReadMemoryHigh func(string) (int64, string)
 	// admitReadWorkerSupervisorMemory is a SEPARATE seam from admitReadMemory
 	// above: the aggregate guard's supervisor-scope read (worker_admit.go)
 	// must tolerate an uncapped memory.max (the supervisor's scope is never

@@ -216,7 +216,7 @@ func TestEveryNonReadDescriptorInvalidatesAtLeastOnePanel(t *testing.T) {
 			if descriptor.Safety == core.SafetyRead || descriptor.Name == "help" {
 				continue
 			}
-			if got := invalidatedViews(descriptor.Name, descriptors); len(got) == 0 {
+			if got := invalidatedViews(tuiState{}, descriptor.Name, descriptors); len(got) == 0 {
 				t.Fatalf("non-read descriptor %s has no invalidation", descriptor.Name)
 			}
 			continue
@@ -224,7 +224,7 @@ func TestEveryNonReadDescriptorInvalidatesAtLeastOnePanel(t *testing.T) {
 		for _, operation := range descriptor.Operations {
 			if operation.Safety != core.SafetyRead {
 				verb := descriptor.Name + "." + operation.Name
-				if got := invalidatedViews(verb, descriptors); len(got) == 0 {
+				if got := invalidatedViews(tuiState{}, verb, descriptors); len(got) == 0 {
 					t.Fatalf("non-read operation %s has no invalidation", verb)
 				}
 			}
@@ -235,7 +235,7 @@ func TestEveryNonReadDescriptorInvalidatesAtLeastOnePanel(t *testing.T) {
 func TestControllerReadEventDoesNotInvalidate(t *testing.T) {
 	descriptors := core.New(nil).DispatchDescriptors()
 	for _, verb := range []string{"list", "find.ls", "rant.get", "lease.ls"} {
-		if got := invalidatedViews(verb, descriptors); len(got) != 0 {
+		if got := invalidatedViews(tuiState{}, verb, descriptors); len(got) != 0 {
 			t.Fatalf("read event %s invalidated %v", verb, got)
 		}
 	}

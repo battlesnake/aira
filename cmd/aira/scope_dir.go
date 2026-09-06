@@ -153,6 +153,8 @@ func verbAcceptsScopeDir(verb string) bool {
 	switch verb {
 	case "confine", "confine-reserve", "confine-list", "confine-kill",
 		"aitest-bootstrap", "worker-admit",
+		// AIRA-127. `top` watches the machine-wide slice and resolves no project.
+		"top",
 		"help", "--help":
 		return false
 	}

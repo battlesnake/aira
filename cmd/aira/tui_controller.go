@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"aira/internal/core"
+	"aira/internal/runner"
 	"aira/internal/store"
 )
 
@@ -17,12 +18,26 @@ const (
 	viewFindings tuiView = "findings"
 	viewInsights tuiView = "insights"
 	viewEvents   tuiView = "events"
+	// viewTop is AIRA-127's live aira.slice view. It is in allViews (so the
+	// ordinary dashboard reaches it as a tab) but deliberately NOT in dataViews:
+	// its data is machine-wide confine state, which no AIRA mutation invalidates,
+	// so it is driven by its own tick while active rather than by watch events.
+	viewTop tuiView = "top"
 )
 
 var (
-	allViews  = []tuiView{viewTickets, viewReady, viewLeases, viewFindings, viewInsights, viewEvents}
+	allViews  = []tuiView{viewTickets, viewReady, viewLeases, viewFindings, viewInsights, viewEvents, viewTop}
 	dataViews = []tuiView{viewTickets, viewReady, viewLeases, viewFindings, viewInsights}
+	// topOnlyViews is the `aira top` face's view set. The verb is PROJECT-LESS —
+	// confine state is machine-wide and `aira confine --list` needs no project —
+	// so it must not carry the panels that resolve a worktree scope.
+	topOnlyViews = []tuiView{viewTop}
 )
+
+// topRefreshInterval is the top view's live-refresh cadence. It ticks only while
+// the view is ACTIVE: an unwatched panel polling the daemon once a second would
+// pay for a cgroup directory scan nobody is reading.
+const topRefreshInterval = time.Second
 
 type panelStatus string
 
@@ -39,6 +54,11 @@ type tableRow struct {
 	Hold         bool
 	LeaseToken   string
 	LeaseVersion int64
+	// Colour is an explicit hex colour for the whole row (AIRA-127). Empty means
+	// "use Style's semantic colouring", so every existing view is unaffected. The
+	// top view sets it from topSlotColour so a row and its bar region are the same
+	// colour BY CONSTRUCTION rather than by two call sites agreeing.
+	Colour string
 }
 
 type gaugeTile struct {
@@ -57,6 +77,9 @@ type panelModel struct {
 	Footer  string
 	Detail  string
 	Tiles   []gaugeTile
+	// Bar is AIRA-127's system-RAM bar, and is nil for every other view — the
+	// same view-specific shape Tiles already has.
+	Bar *topBar
 }
 
 type panelState struct {
@@ -71,7 +94,18 @@ type panelState struct {
 }
 
 type tuiState struct {
-	Active                tuiView
+	Active tuiView
+	// Views is the tabbable set this face presents, and DataViews the subset that
+	// AIRA mutations invalidate. Both are carried in state rather than read from
+	// the package vars so `aira top` can run the SAME controller over one
+	// project-less panel instead of a second parallel stack. A nil value means
+	// "the full dashboard", which keeps every existing zero-value state valid.
+	Views     []tuiView
+	DataViews []tuiView
+	// TopSlots is AIRA-127's slot table: index = slot, value = the scope id
+	// holding it ("" = free). It lives here, in the reducer's state, because a
+	// slot must survive across refresh ticks — that persistence IS requirement 7.
+	TopSlots              []string
 	Panels                map[tuiView]panelState
 	Cursor                int64
 	Events                []store.WatchEvent
@@ -149,6 +183,11 @@ type fetchResult struct {
 	Generation int
 	Model      panelModel
 	Code       string
+	// Top carries the RAW confine listing for viewTop instead of a built model.
+	// The top view's model depends on the slot table, which is reducer state the
+	// fetch goroutine has no access to and must not race, so the fetch delivers
+	// the reading and onTUIFetchResult does the slotting.
+	Top *runner.ConfineListResult
 }
 
 type detailResult struct {
@@ -159,19 +198,47 @@ type detailResult struct {
 }
 
 func newTUIState(eventCapacity int) tuiState {
+	return newTUIStateForViews(eventCapacity, allViews, dataViews)
+}
+
+// newTUIStateForViews builds a state over an explicit view set. `aira top` uses
+// it to run the same controller over one project-less panel.
+func newTUIStateForViews(eventCapacity int, views, data []tuiView) tuiState {
 	if eventCapacity < 1 {
 		eventCapacity = 1
 	}
-	panels := make(map[tuiView]panelState, len(allViews))
-	for _, view := range allViews {
+	if len(views) == 0 {
+		views, data = allViews, dataViews
+	}
+	panels := make(map[tuiView]panelState, len(views))
+	for _, view := range views {
 		panels[view] = panelState{Status: panelLoading}
 	}
 	return tuiState{
-		Active:            viewTickets,
+		Active:            views[0],
+		Views:             append([]tuiView(nil), views...),
+		DataViews:         append([]tuiView(nil), data...),
 		Panels:            panels,
 		EventRingCapacity: eventCapacity,
 		PendingRefresh:    make(map[tuiView]bool),
 	}
+}
+
+// tuiViews and tuiDataViews resolve a state's view sets, defaulting to the full
+// dashboard. The default keeps every pre-existing zero-value tuiState (tests
+// included) behaving exactly as before.
+func tuiViews(state tuiState) []tuiView {
+	if len(state.Views) == 0 {
+		return allViews
+	}
+	return state.Views
+}
+
+func tuiDataViews(state tuiState) []tuiView {
+	if len(state.Views) == 0 {
+		return dataViews
+	}
+	return state.DataViews
 }
 
 func cloneTUIState(state tuiState) tuiState {
@@ -199,6 +266,9 @@ func cloneTUIState(state tuiState) tuiState {
 		confirm := cloneExecuteLaunch(*state.ExecuteConfirm)
 		copyState.ExecuteConfirm = &confirm
 	}
+	copyState.Views = append([]tuiView(nil), state.Views...)
+	copyState.DataViews = append([]tuiView(nil), state.DataViews...)
+	copyState.TopSlots = append([]string(nil), state.TopSlots...)
 	copyState.Panels = make(map[tuiView]panelState, len(state.Panels))
 	for view, panel := range state.Panels {
 		panel.Model.Headers = append([]string(nil), panel.Model.Headers...)
@@ -343,7 +413,7 @@ func onPaletteResult(state tuiState, outcome paletteOutcome, descriptors []core.
 		return state, nil
 	}
 	var commands []tuiCmd
-	for _, view := range invalidatedViews(verb, descriptors) {
+	for _, view := range invalidatedViews(state, verb, descriptors) {
 		var refresh []tuiCmd
 		state, refresh = requestPanelRefresh(state, view)
 		commands = append(commands, refresh...)
@@ -386,20 +456,39 @@ func onTUIKey(state tuiState, key rune, descriptors []core.DispatchDescriptor) (
 		state.PaletteOpen = true
 		return state, nil
 	case 'x':
+		// Deliberately NOT gated on CanExecute. TestTUIExecuteCapabilityAbsentIsVisible
+		// pins the rule this rests on: a capability that is absent must SAY so when
+		// asked for, never fail silently. `aira top` has no execute dispatcher, so
+		// its tab line does not advertise the key — but pressing it still gets the
+		// honest "unavailable: no terminal dispatcher" answer rather than nothing.
 		if !state.PaletteOpen && !state.PaletteDispatching && !state.ExecuteRunning {
 			return onExecuteOpen(state), nil
 		}
 	case '\t':
-		for i, view := range allViews {
+		views := tuiViews(state)
+		for i, view := range views {
 			if view == state.Active {
-				state.Active = allViews[(i+1)%len(allViews)]
-				return state, nil
+				return onTUIActivate(state, views[(i+1)%len(views)])
 			}
 		}
-	case '1', '2', '3', '4', '5', '6':
-		state.Active = allViews[int(key-'1')]
+	case '1', '2', '3', '4', '5', '6', '7':
+		views := tuiViews(state)
+		if index := int(key - '1'); index < len(views) {
+			return onTUIActivate(state, views[index])
+		}
 	}
 	return state, nil
+}
+
+// onTUIActivate switches the active view and, for the top view alone, kicks its
+// first fetch. The top panel is not in dataViews, so nothing else would ever
+// start it, and an unstarted panel would sit on "loading…" forever.
+func onTUIActivate(state tuiState, view tuiView) (tuiState, []tuiCmd) {
+	state.Active = view
+	if view != viewTop || state.Panels[view].InFlight || state.PendingRefresh[view] {
+		return state, nil
+	}
+	return requestPanelRefresh(state, view)
 }
 
 func onTUIFetchResult(state tuiState, result fetchResult) (tuiState, []tuiCmd) {
@@ -417,12 +506,34 @@ func onTUIFetchResult(state tuiState, result fetchResult) (tuiState, []tuiCmd) {
 		panel.Status = panelReady
 		panel.ErrorCode = ""
 		panel.Model = result.Model
+		// AIRA-127. Slotting happens HERE, in the reducer, because the slot table
+		// is state that must survive across ticks. A nil Top on a viewTop result is
+		// a malformed fetch, not an empty slice: leaving the previous model and
+		// slots untouched is the honest response, since freeing every slot would
+		// recolour the whole view over a decode failure.
+		if result.View == viewTop {
+			if result.Top == nil {
+				panel.Status = panelError
+				panel.ErrorCode = tuiDecodeError
+				panel.Model = state.Panels[result.View].Model
+			} else {
+				panel.Model, state.TopSlots = topViewModel(state.TopSlots, *result.Top)
+			}
+		}
 	}
 	dirty := panel.Dirty
 	panel.Dirty = false
 	state.Panels[result.View] = panel
 	if dirty {
 		return requestPanelRefresh(state, result.View)
+	}
+	// The live-refresh tick, self-sustaining and one-in-flight-at-a-time: the next
+	// one is scheduled only when this one has landed, so a slow daemon slows the
+	// cadence instead of queueing a backlog of fetches against it. It stops as
+	// soon as the operator leaves the view.
+	if result.View == viewTop && state.Active == viewTop && !state.PendingRefresh[viewTop] {
+		state.PendingRefresh[viewTop] = true
+		return state, []tuiCmd{{Kind: cmdScheduleRefresh, View: viewTop, Backoff: topRefreshInterval}}
 	}
 	return state, nil
 }
@@ -462,12 +573,12 @@ func onTUIWatchBatch(state tuiState, events []store.WatchEvent, cursor int64, de
 	state.ReconnectAttempt = 0
 	affected := make(map[tuiView]bool)
 	for _, event := range events {
-		for _, view := range invalidatedViews(event.Verb, descriptors) {
+		for _, view := range invalidatedViews(state, event.Verb, descriptors) {
 			affected[view] = true
 		}
 	}
 	cmds := make([]tuiCmd, 0, len(affected))
-	for _, view := range dataViews {
+	for _, view := range tuiDataViews(state) {
 		if !affected[view] {
 			continue
 		}
@@ -503,7 +614,11 @@ func onTUIEOF(state tuiState) (tuiState, []tuiCmd) {
 	return state, []tuiCmd{{Kind: cmdReconnect, Backoff: backoff}}
 }
 
-func invalidatedViews(verb string, descriptors []core.DispatchDescriptor) []tuiView {
+// invalidatedViews names the panels a mutation may have changed. It takes the
+// STATE's data views so a face presenting a restricted set (`aira top`) can
+// never be asked to refresh a panel it does not have — which would create the
+// panel and fetch project-scoped data the face has no project for.
+func invalidatedViews(state tuiState, verb string, descriptors []core.DispatchDescriptor) []tuiView {
 	reads := make(map[string]bool)
 	for _, descriptor := range descriptors {
 		if len(descriptor.Operations) == 0 {
@@ -521,5 +636,5 @@ func invalidatedViews(verb string, descriptors []core.DispatchDescriptor) []tuiV
 	if reads[verb] {
 		return nil
 	}
-	return append([]tuiView(nil), dataViews...)
+	return append([]tuiView(nil), tuiDataViews(state)...)
 }
