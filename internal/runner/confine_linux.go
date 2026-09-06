@@ -1001,7 +1001,18 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 			reserveCommand = executable
 		}
 	}
-	cmd.Env = pylib.AppendConfineChildEnvironment(confineEnvironment(request.Env), scopeID)
+	// AIRA-115. `path`, not `sliceName`: it is the RESOLVED slice cgroup path this
+	// job was admitted against (admitConfine passes exactly this value as its
+	// memorySlice), so a confine-reserve sub-reservation taken inside the job
+	// lands in its parent's OWN daemon queue. A bare slice name would instead be
+	// re-resolved from the DAEMON's cgroup ancestry, which for a slice that is not
+	// on the daemon's own path resolves elsewhere or not at all.
+	//
+	// It is published under pylib.ConfineParentSliceEnv, NOT AIRA_CONFINE_SLICE:
+	// this absolute path is an emitted coordinate, and putting it in the
+	// operator's explicit-slice input would make every nested `aira confine` treat
+	// it as a declared --slice. See pylib.ConfineParentSliceEnv.
+	cmd.Env = pylib.AppendConfineChildEnvironment(confineEnvironment(request.Env), scopeID, path)
 	if request.DelegateRAM {
 		// aitest is only meaningful for a delegate-RAM launch (worker-admit
 		// grants nested sub-scopes under THIS job's own outer scope); every
@@ -1428,6 +1439,38 @@ func InheritedConfineScopeID() string {
 		return ""
 	}
 	return scopeID
+}
+
+// InheritedConfineSlice reads the RESOLVED slice of the confine job this process
+// is running inside, as exported by AppendConfineChildEnvironment under
+// pylib.ConfineParentSliceEnv. It is the slice a reservation taken from inside
+// the job must be charged to.
+//
+// AIRA-115: without it `aira confine-reserve` defaulted its slice to
+// DefaultConfineSlice independently of the scope id it inherited, so a job
+// confined to any other slice had its per-test sub-reservations charged against
+// aira.slice — over-charging a slice that does not host the memory, while the
+// slice that does host it under-counted.
+//
+// The key is pylib.ConfineParentSliceEnv and NOT AIRA_CONFINE_SLICE, which is
+// load-bearing rather than cosmetic. AIRA_CONFINE_SLICE is the OPERATOR's
+// explicit-slice input, consumed by ResolveConfineSlice under "an explicit value
+// never falls back". A job that published its own resolved cgroup path there
+// would hand every nested `aira confine` a forged operator override — bypassing
+// default resolution's managed-unit guard and whale fallback, and reaching the
+// daemon's management-slice resolution too. This function reads what AIRA
+// EMITTED; ResolveConfineSlice reads what the operator DECLARED. Never the same
+// variable.
+//
+// A value containing a ".." component yields "" rather than being forwarded:
+// both slice resolvers reject one, so passing it on would only turn a stray
+// environment variable into an unevaluated admission.
+func InheritedConfineSlice() string {
+	slice := strings.TrimSpace(os.Getenv(pylib.ConfineParentSliceEnv))
+	if slice == "" || hasParentComponent(slice) {
+		return ""
+	}
+	return slice
 }
 
 // InheritedExclusiveHolder reads the token this process inherited, if any.

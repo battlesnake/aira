@@ -42,11 +42,11 @@ var legacyGovernorEnvironmentKeys = []string{
 // verifies: AIRA-33
 func TestAppendConfineChildEnvironmentStripsTheRetiredGovernorCoordinates(t *testing.T) {
 	// Every retired key present in the input, so absence must be a strip.
-	inherited := []string{"PATH=/bin", "AIRA_CONFINE_SCOPE_ID=stale-scope"}
+	inherited := []string{"PATH=/bin", "AIRA_CONFINE_SCOPE_ID=stale-scope", ConfineParentSliceEnv + "=/sys/fs/cgroup/stale.slice"}
 	for _, key := range legacyGovernorEnvironmentKeys {
 		inherited = append(inherited, key+"=/stale-"+key)
 	}
-	got := childEnvValues(t, AppendConfineChildEnvironment(inherited, "scope-123"))
+	got := childEnvValues(t, AppendConfineChildEnvironment(inherited, "scope-123", "/sys/fs/cgroup/custom.slice"))
 	for _, key := range legacyGovernorEnvironmentKeys {
 		if value, present := got[key]; present {
 			t.Errorf("retired coordinate %s=%q survived; AIRA-33 deleted the plugin that read it", key, value)
@@ -54,6 +54,12 @@ func TestAppendConfineChildEnvironmentStripsTheRetiredGovernorCoordinates(t *tes
 	}
 	if got["AIRA_CONFINE_SCOPE_ID"] != "scope-123" {
 		t.Fatalf("AIRA_CONFINE_SCOPE_ID=%q, want the launch scope id overwriting the stale inherited one (its absence would also make every assertion above vacuous)", got["AIRA_CONFINE_SCOPE_ID"])
+	}
+	// AIRA-115: the slice is the scope id's other half and must upsert the same
+	// way — a stale inherited slice reaching a child would charge a grandparent's
+	// slice for this job's sub-reservations.
+	if got[ConfineParentSliceEnv] != "/sys/fs/cgroup/custom.slice" {
+		t.Fatalf("%s=%q, want this launch's resolved slice overwriting the stale inherited one", ConfineParentSliceEnv, got[ConfineParentSliceEnv])
 	}
 	if got["PATH"] != "/bin" {
 		t.Fatalf("the strip took an unrelated variable with it: %v", got)
@@ -67,9 +73,52 @@ func TestAppendConfineChildEnvironmentStripsTheRetiredGovernorCoordinates(t *tes
 //
 // verifies: AIRA-33
 func TestAppendConfineChildEnvironmentStripsWithNoScopeID(t *testing.T) {
-	got := AppendConfineChildEnvironment([]string{"PATH=/bin", "AIRA_PY_LIB=/stale", "AIRA_CONFINE_SCOPE_ID=stale-scope"}, "")
+	got := AppendConfineChildEnvironment([]string{"PATH=/bin", "AIRA_PY_LIB=/stale", "AIRA_CONFINE_SCOPE_ID=stale-scope", ConfineParentSliceEnv + "=/stale.slice"}, "", "")
 	if strings.Join(got, "\x00") != "PATH=/bin" {
 		t.Fatalf("scope-id-less launch published or retained coordinates: %v", got)
+	}
+}
+
+// TestAppendConfineChildEnvironmentPublishesTheResolvedSlice is the unit half of
+// AIRA-115's fix: the confined child must be told WHICH slice its job runs in,
+// because `aira confine-reserve` inside it has no other way to know and used to
+// default to aira.slice regardless.
+//
+// The stale-value input is what makes this a real upsert assertion rather than a
+// pass-through one, and the empty-slice case pins that nothing publishes an
+// empty coordinate (which InheritedConfineSlice would then have to reject, and
+// which confineReserve would then have to refuse on).
+//
+// The operator's own AIRA_CONFINE_SLICE is asserted UNTOUCHED, and that is the
+// load-bearing half of this test rather than a decoration. The first cut of
+// AIRA-115 published the resolved path under that very name, which made every
+// nested `aira confine` read its parent's absolute cgroup path as an
+// operator-declared explicit --slice (ResolveConfineSlice: explicit never falls
+// back), bypassing default resolution's managed-unit guard and whale fallback.
+// An emitted coordinate and an operator input must not share a variable.
+//
+// verifies: AIRA-115
+func TestAppendConfineChildEnvironmentPublishesTheResolvedSlice(t *testing.T) {
+	got := childEnvValues(t, AppendConfineChildEnvironment(
+		[]string{"PATH=/bin", ConfineParentSliceEnv + "=/sys/fs/cgroup/stale.slice", "AIRA_CONFINE_SLICE=operator.slice"},
+		"scope-9", "/sys/fs/cgroup/user.slice/custom.slice"))
+	if got[ConfineParentSliceEnv] != "/sys/fs/cgroup/user.slice/custom.slice" {
+		t.Fatalf("%s=%q, want the resolved launch slice", ConfineParentSliceEnv, got[ConfineParentSliceEnv])
+	}
+	if got["AIRA_CONFINE_SLICE"] != "operator.slice" {
+		t.Fatalf("AIRA_CONFINE_SLICE=%q, want the operator's own explicit-slice input carried through unchanged: overwriting it hands every nested confine a forged --slice", got["AIRA_CONFINE_SLICE"])
+	}
+	noSlice := AppendConfineChildEnvironment([]string{"PATH=/bin"}, "scope-9", "")
+	for _, entry := range noSlice {
+		if strings.HasPrefix(entry, ConfineParentSliceEnv+"=") {
+			t.Fatalf("published an empty slice coordinate: %v", noSlice)
+		}
+	}
+	if !IsCoordinationEnvironmentKey(ConfineParentSliceEnv) {
+		t.Errorf("%s left the strip set: a nested launch would inherit its parent's slice unchanged", ConfineParentSliceEnv)
+	}
+	if IsCoordinationEnvironmentKey("AIRA_CONFINE_SLICE") {
+		t.Error("AIRA_CONFINE_SLICE entered the strip set: the operator's explicit-slice input is theirs, not a coordinate AIRA emits, and a descendant is entitled to see it")
 	}
 }
 

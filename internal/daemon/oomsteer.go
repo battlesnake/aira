@@ -419,12 +419,17 @@ func realOOMSteerDeps(s *Server) oomSteerDeps {
 //
 // A sub-reservation whose parent is not a scope-backed waiter here adds nothing:
 // without the parent's own charge there is no budget to add it to, and inventing
-// one would be a number nobody established. `confine-reserve` defaults its slice
-// independently of its parent (confine_reserve_linux.go), so that case is real
-// and is left as an under-count of the budget — which can only ever make a scope
-// look MORE like an offender, so it is checked against the same fullness gate
-// and the same overrun floor as everything else, and is stated here rather than
-// hidden.
+// one would be a number nobody established. AIRA-115 removed the case that made
+// this common: `confine-reserve` no longer defaults its slice independently of
+// its parent, it inherits the parent job's RESOLVED slice — the same value that
+// keyed the parent's own admission — or refuses. A sub-reservation taken inside
+// a confine job therefore now lands in the same queue as its parent. The residue
+// is still real, just narrower: an explicit `--slice` naming a different slice, a
+// parent whose own waiter has already left this queue, or a caller that is not
+// inside a confine job at all. It is left as an under-count of the budget — which
+// can only ever make a scope look MORE like an offender, so it is checked against
+// the same fullness gate and the same overrun floor as everything else, and is
+// stated here rather than hidden.
 //
 // The two admission locks are taken SEQUENTIALLY, never nested, so this cannot
 // participate in a lock-order inversion at all; the queue pointer stays valid
