@@ -475,6 +475,33 @@ func TestAssignTopSlots(t *testing.T) {
 	}
 }
 
+// The top view shows every quantity in one fixed unit (M) rather than the
+// shared confine formatter's auto-scaling T/G/M/K-or-bytes, because a live
+// cgroup/RSS reading is essentially never round in any unit and would mostly
+// fall through to raw bytes there. Rounds to the nearest MiB; never negative,
+// never a fabricated non-zero for a non-positive input.
+func TestTopFormatMegabytesRoundsToTheNearestMiBInOneFixedUnit(t *testing.T) {
+	const mib = 1 << 20
+	for _, testCase := range []struct {
+		name  string
+		value int64
+		want  string
+	}{
+		{"zero", 0, "0M"},
+		{"negative", -1, "0M"},
+		{"exact", 2 * mib, "2M"},
+		{"rounds down", 2*mib + mib/2 - 1, "2M"},
+		{"rounds up", 2*mib + mib/2, "3M"},
+		{"large, not a round G/T value", 47*mib*1024 + 12345, "48128M"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := topFormatMegabytes(testCase.value); got != testCase.want {
+				t.Fatalf("topFormatMegabytes(%d)=%q, want %q", testCase.value, got, testCase.want)
+			}
+		})
+	}
+}
+
 // The reserve column reads the cap `confine --list` already reports, and keeps
 // its three states apart: a number, an uncapped `max`, and an unreadable field.
 // Collapsing the last two would draw an unknown claim as an unlimited one.
@@ -486,7 +513,7 @@ func TestTopReserveKeepsItsThreeStatesApart(t *testing.T) {
 		want   topReserve
 		text   string
 	}{
-		{"set", runner.ConfineRecord{Cap: &numeric}, topReserve{Bytes: 2 * gib, State: topReserveSet}, "2G"},
+		{"set", runner.ConfineRecord{Cap: &numeric}, topReserve{Bytes: 2 * gib, State: topReserveSet}, "2048M"},
 		{"uncapped", runner.ConfineRecord{Cap: &uncapped}, topReserve{State: topReserveUncapped}, "max (uncapped)"},
 		{"nil", runner.ConfineRecord{}, topReserve{State: topReserveUnevaluated}, "unevaluated"},
 		{"unparsable", runner.ConfineRecord{Cap: &junk}, topReserve{State: topReserveUnevaluated}, "unevaluated"},
@@ -690,7 +717,7 @@ func TestTopRuntimeRendersAndQuits(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if !strings.Contains(rendered, "total 64G") || !strings.Contains(rendered, "soft (memory.high) 28G") {
+	if !strings.Contains(rendered, "total 65536M") || !strings.Contains(rendered, "soft (memory.high) 28672M") {
 		t.Fatalf("bar text=%q, want the totals and the soft-limit legend", rendered)
 	}
 	if !strings.Contains(rendered, "█") {

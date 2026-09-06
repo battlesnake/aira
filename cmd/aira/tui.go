@@ -555,8 +555,8 @@ func (r *tuiRuntime) renderTopBar(bar *topBar, panel panelState) {
 		}
 		out.WriteString("\n")
 		fmt.Fprintf(&out, "total %s | reserved %s | rest of system %s | free %s\n",
-			formatReserveBytes(bar.TotalBytes), formatReserveBytes(bar.ClaimedBytes),
-			topOutsideText(bar), formatReserveBytes(bar.FreeBytes))
+			topFormatMegabytes(bar.TotalBytes), topFormatMegabytes(bar.ClaimedBytes),
+			topOutsideText(bar), topFormatMegabytes(bar.FreeBytes))
 		out.WriteString(topMarkerLegend(bar))
 		if bar.Overcommitted {
 			out.WriteString("\nOVER-SUBSCRIBED: reservations plus out-of-slice usage exceed total RAM")
@@ -590,7 +590,7 @@ func topMarkerLegend(bar *topBar) string {
 	}
 	parts := make([]string, 0, len(bar.Markers))
 	for _, marker := range bar.Markers {
-		parts = append(parts, fmt.Sprintf("%s %s %s", topMarkerGlyph(marker.Name), marker.Label, formatReserveBytes(marker.Bytes)))
+		parts = append(parts, fmt.Sprintf("%s %s %s", topMarkerGlyph(marker.Name), marker.Label, topFormatMegabytes(marker.Bytes)))
 	}
 	return strings.Join(parts, "  ")
 }
@@ -599,7 +599,7 @@ func topOutsideText(bar *topBar) string {
 	if !bar.OutsideKnown {
 		return "unevaluated"
 	}
-	return formatReserveBytes(bar.OutsideBytes)
+	return topFormatMegabytes(bar.OutsideBytes)
 }
 
 func (r *tuiRuntime) renderTable(view tuiView, model panelModel, panel panelState) {

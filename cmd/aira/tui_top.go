@@ -124,12 +124,28 @@ func topReserveFor(record runner.ConfineRecord) topReserve {
 func (r topReserve) String() string {
 	switch r.State {
 	case topReserveSet:
-		return formatReserveBytes(r.Bytes)
+		return topFormatMegabytes(r.Bytes)
 	case topReserveUncapped:
 		return "max (uncapped)"
 	default:
 		return "unevaluated"
 	}
+}
+
+// topFormatMegabytes renders a byte quantity in whole megabytes, for
+// consistent at-a-glance comparison across the top view's rows and bar. The
+// shared confine formatter (formatReserveBytes) picks whichever of T/G/M/K
+// divides the value EXACTLY, falling back to raw bytes otherwise -- exact for
+// a round operator-typed cap, but live cgroup/RSS readings are essentially
+// never round in any unit, so that formatter mostly prints bytes here. One
+// fixed unit, rounded to the nearest MiB, is what the owner asked this view
+// to show instead.
+func topFormatMegabytes(value int64) string {
+	if value <= 0 {
+		return "0M"
+	}
+	const mib = 1 << 20
+	return strconv.FormatInt((value+mib/2)/mib, 10) + "M"
 }
 
 type topBarRegionKind uint8
@@ -285,7 +301,7 @@ func topBytesCell(value *int64) string {
 	if value == nil {
 		return "unevaluated"
 	}
-	return formatReserveBytes(*value)
+	return topFormatMegabytes(*value)
 }
 
 // topLiveCell renders liveness from the SUBTREE-aware signal, and says so when
@@ -475,7 +491,7 @@ func topFooter(result runner.ConfineListResult) string {
 	}
 	parts := []string{
 		fmt.Sprintf("granted %s / ceiling %s across %d admitted %s",
-			formatReserveBytes(reserve.GrantedBytes), formatReserveBytes(reserve.CeilingBytes),
+			topFormatMegabytes(reserve.GrantedBytes), topFormatMegabytes(reserve.CeilingBytes),
 			reserve.Jobs, confinePlural(reserve.Jobs, "job", "jobs")),
 		fmt.Sprintf("%d %s, %d scope-less %s, %d adopted",
 			reserve.ScopeJobs, confinePlural(reserve.ScopeJobs, "scope", "scopes"),
