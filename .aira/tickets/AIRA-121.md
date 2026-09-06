@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-121","project":"aira","title":"aira install/confine: ci-shim mode for systemd/cgroup-unavailable containers (GCP Batch, similar CI/batch containers)","status":"planned","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","ci","confine","install"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-121","project":"aira","title":"aira install/confine: ci-shim mode for systemd/cgroup-unavailable containers (GCP Batch, similar CI/batch containers)","status":"planned","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","ci","confine","install"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-121","to":"AIRA-123"}]}
 ---
 Requested directly by the owner, 2026-09-06, as a follow-up question on AIRA-120.
 
@@ -100,8 +100,22 @@ actually does today):
    breaks on first run, exactly the `if CI` branching this ticket exists to
    avoid. Requirement 7 below is the one exception: `--delegate-ram`'s flag
    parsing stays accepted, but one of its current SIDE EFFECTS must not fire.
-7. **Do NOT export `AIRA_AITEST_LIB` when `--delegate-ram` runs in shim
-   mode.** Verified in source: `internal/pylib/env.go`'s delegate-ram path
+7. **INTERIM ONLY (superseded design correction below) — do NOT export
+   `AIRA_AITEST_LIB` when `--delegate-ram` runs in shim mode**, as the
+   behaviour to ship in THIS ticket, pending AIRA-123. This is a deliberate,
+   explicit deferral, not the intended final answer -- do not read it as
+   "aitest never gets RAM-aware concurrency in shim mode." The owner (via
+   `deploy`) corrected the original framing: it conflated cgroups'
+   ENFORCEMENT (needs a real scope) with a ledger's ADMISSION (does not) --
+   an in-daemon ledger can genuinely prevent over-subscription without any
+   cgroup, which is most of the real value on a single-tenant CI box where
+   losing the kill backstop costs one job rerun, not collateral damage to a
+   shared session. AIRA-123 is the follow-up: extend `worker-admit` to a
+   degraded ledger-only admission mode with no cgroup sub-scope, honestly
+   reported as advisory. Once AIRA-123 lands, export `AIRA_AITEST_LIB`
+   whenever that degraded backend can function -- the rule is conditional
+   ("export if the backend can actually work in this mode"), not a flat
+   never. Verified in source: `internal/pylib/env.go`'s delegate-ram path
    sets `AIRA_AITEST_LIB` in the child env unconditionally today, and a
    consumer's `conftest.py` uses ITS PRESENCE ALONE as the guard that
    activates the `aitest` pytest plugin (documented in this repo's own
@@ -116,10 +130,11 @@ actually does today):
    the way it does on the real path, and (worst case) heavy suites would run
    under an apparent governance mechanism with no actual backstop --
    `deploy`'s framing: "invisible until something OOMs." Leaving the var
-   unset in shim mode is correct AND sufficient: it makes the consumer's own
-   existing guard fall through to plain pytest-xdist, which is the right
-   default concurrency model on a single-tenant runner with no other
-   contention to admission-gate against anyway.
+   unset in shim mode is correct AND sufficient FOR THIS TICKET's scope: it
+   makes the consumer's own existing guard fall through to plain pytest-xdist
+   as a safe interim default (a broken RAM-aware backend is worse than a
+   RAM-blind one) -- see the INTERIM ONLY note above and AIRA-123 for the
+   real target.
 8. **Forward the received signal to the child's process GROUP in shim mode,
    not just the single direct child.** Correction to how this was originally
    raised: current (real-mode) `confine` code already forwards SIGINT/SIGTERM
