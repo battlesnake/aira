@@ -455,9 +455,55 @@ func TestShimInstallRefusesACgroupDerivedBudgetBelowTheFloor(t *testing.T) {
 	}
 }
 
-// verifies: AIRA-121 review round 3, finding F4
+// verifies: AIRA-130
+// verifies: AIRA-121 review round 4, finding F4 residual
 //
-// A budget AT the floor (exactly 4G) is accepted from either source: the fix
+// The SAME floor applies to the THIRD budget source, /proc/meminfo MemTotal
+// (source=meminfo-memtotal), which round 4 left un-floored on the reasoning
+// that a host is essentially never below 4GiB. A 2GiB-class host (e2-small,
+// t3.small) with an unbounded container memory.max -- `docker run` with no
+// --memory -- reaches this branch and produces exactly F4's state: the install
+// succeeds, the daemon reports an active advisory ledger, and then
+// checkedAvailable answers 0 for every job forever because the 2GiB budget is
+// below the 2GiB base + 64MiB/job admission headroom.
+//
+// Counterexample this fails against: the pre-fix resolveShimBudget, which
+// returned any positive MemTotalBytes unchecked -- against that code this test
+// sees err=nil and a recorded shim_budget_bytes=2147483648.
+func TestShimInstallRefusesAMemTotalDerivedBudgetBelowTheFloor(t *testing.T) {
+	d, state := newFakeInstall(t)
+	d = shimProbeDeps(t, d, state, map[string]bool{"timeout": true})
+	d.readFile = shimProcReader(map[string][]byte{
+		"/proc/meminfo":                         []byte("MemTotal:      2097152 kB\nMemAvailable:  1572864 kB\n"), // exactly 2GiB
+		filepath.Join(cgroupRoot, "memory.max"): []byte("max\n"),                                                  // unbounded: no container limit to fall back on
+	})
+	d.spawnShimDaemon = func(shimDaemonSpec) error {
+		t.Fatal("started an ungated shim daemon under a sub-floor budget")
+		return nil
+	}
+
+	err := runInstall(d, installOpts{ciValue: "shim", stage: installStageBuild})
+	if err == nil || !strings.Contains(err.Error(), CodeUnavailable) {
+		t.Fatalf("err=%v, want a %s refusal for a 2GiB host MemTotal", err, CodeUnavailable)
+	}
+	if !strings.Contains(err.Error(), "2.00GiB") || !strings.Contains(err.Error(), "4G") || !strings.Contains(err.Error(), "--memory-max") {
+		t.Fatalf("refusal %q does not name the MemTotal value, the floor, and the --memory-max escape", err)
+	}
+	// The refusal must be TERMINAL: no ungated ledger may be left behind for a
+	// later --stage=start to pick up.
+	paths, pathErr := d.daemonPaths()
+	if pathErr != nil {
+		t.Fatal(pathErr)
+	}
+	if _, ok := runner.ReadInstallModeRecord(runner.InstallModePathFor(paths.StateHome)); ok {
+		t.Fatal("a sub-floor MemTotal budget was recorded despite the refusal")
+	}
+}
+
+// verifies: AIRA-121 review round 3, finding F4
+// verifies: AIRA-130
+//
+// A budget AT the floor (exactly 4G) is accepted from every source: the fix
 // must refuse below the floor, never AT it.
 func TestShimInstallAcceptsABudgetExactlyAtTheFloor(t *testing.T) {
 	t.Run("declared", func(t *testing.T) {
@@ -484,6 +530,25 @@ func TestShimInstallAcceptsABudgetExactlyAtTheFloor(t *testing.T) {
 		}
 		if record := readShimRecord(t, d); record.ShimBudgetBytes != 4<<30 {
 			t.Fatalf("budget=%d, want exactly the 4GiB floor", record.ShimBudgetBytes)
+		}
+	})
+	t.Run("meminfo-memtotal", func(t *testing.T) {
+		d, state := newFakeInstall(t)
+		d = shimProbeDeps(t, d, state, map[string]bool{"timeout": true})
+		d.readFile = shimProcReader(map[string][]byte{
+			"/proc/meminfo":                         []byte("MemTotal:      4194304 kB\nMemAvailable:  3145728 kB\n"), // exactly 4GiB
+			filepath.Join(cgroupRoot, "memory.max"): []byte("max\n"),
+		})
+		d.spawnShimDaemon = func(shimDaemonSpec) error { return nil }
+		if err := runInstall(d, installOpts{ciValue: "shim", stage: installStageBuild}); err != nil {
+			t.Fatalf("a 4GiB host MemTotal was refused: %v", err)
+		}
+		record := readShimRecord(t, d)
+		if record.ShimBudgetBytes != 4<<30 {
+			t.Fatalf("budget=%d, want exactly the 4GiB floor", record.ShimBudgetBytes)
+		}
+		if record.ShimBudgetSource != runner.ShimBudgetSourceMemTotal {
+			t.Fatalf("source=%q, want %q -- the at-floor case must still come from the MemTotal branch", record.ShimBudgetSource, runner.ShimBudgetSourceMemTotal)
 		}
 	})
 }

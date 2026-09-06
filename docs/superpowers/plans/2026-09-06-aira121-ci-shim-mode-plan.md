@@ -438,6 +438,17 @@ Resolved **once, at build-stage install time**, recorded in
    MemAvailable. **A silently-ungated shim must never exist**; failing at
    install is one loud failure in one place, versus a per-job wedge later.
 
+**[AIRA-130 correction]** Round 4's finding F4 floored the DECLARED and
+`cgroup-memory-max` sources at `minimumCeilingGiB` (4G) and deliberately left
+`meminfo-memtotal` un-floored, on the reasoning that a host is essentially never
+below 4GiB. That was wrong in the same shape one source over: a 2GiB-class host
+(e2-small, t3.small) with an unbounded container `memory.max` — `docker run`
+with no `--memory` — reaches the MemTotal branch and installs a budget the
+daemon's headroom swallows whole, wedging every job at `E_ADMIT_TOO_LARGE
+cap_minus_headroom=0` for the container's life. **All three sources are now
+floored identically**, which is also what the real `--ci` path does to its own
+host-wide source (`resolveCIMemoryMax` floors MemAvailable at the same 4G).
+
 **The documented choice the ticket asks for: why the container's `memory.max`
 and not AIRA-120's MemAvailable.** Three reasons, all specific to a container:
 
@@ -1090,6 +1101,13 @@ AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1
    refuses the identical unpinned request the identical way, and the ticket's
    own consumer invocation already pins `--memory-reserve 512M` on every job, so
    it is not hit in practice — worth documenting rather than leaving implicit.
+8. **[round-4, finding F4 residual — CLOSED by AIRA-130] The `meminfo-memtotal`
+   budget source was left un-floored.** Round 4 floored only the declared and
+   cgroup-derived sources; the MemTotal fallback kept its un-floored path on the
+   reasoning that a host is essentially never below 4GiB. Filed as AIRA-130 and
+   fixed there: the same `E_INSTALL_UNAVAILABLE` refusal now applies to all
+   three sources, so no source can install a budget the admission headroom
+   swallows whole. See the AIRA-130 correction in §4.2.
 
 ---
 
