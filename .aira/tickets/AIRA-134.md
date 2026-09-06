@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-134","project":"aira","title":"aira tui/aira top panics (not a clean error) when the terminal screen fails to initialize","status":"in-review","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["honesty","tui"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-134","project":"aira","title":"aira tui/aira top panics (not a clean error) when the terminal screen fails to initialize","status":"done","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["honesty","tui"],"hold":false,"relations":[]}
 ---
 Found dogfooding AIRA-127's deployed binary, 2026-09-06. Reproduced on BOTH `aira top`
 and the pre-existing `aira tui` — confirmed pre-existing, not a regression from AIRA-127, just
@@ -175,3 +175,61 @@ for a live screen.
 
 `aira confine -- go build ./...` exit 0; `aira confine -- go vet ./...` exit 0;
 `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` exit 0.
+
+## Review (Fable build-review gate) — MERGED
+
+PR #81 merged as `2daa590` (2026-09-06). Everything below is the reviewer's own
+reproduction, not the builder's transcript.
+
+- Mechanism re-read in the library source, not the citations: tview `Run()`
+  (application.go:288-297) leaves `a.screen` set on an `Init()` failure; tcell
+  `tScreen.Init()` (tscreen.go:190) returns from `initialize()` before `t.quit` is made
+  at :232; `Stop()` (:624-634) → `Fini()` → `finish()` → `close(t.quit)` (:374).
+  `simscreen.Fini` guards nil (simulation.go:153) and an injected screen skips the
+  create-and-Init block entirely, so the subprocess harness is genuinely required.
+- Rejected alternatives hold: `SetScreen` (application.go:210) calls `Init()`
+  unconditionally and discards the error, and a second `tScreen.Init()` reallocates
+  `keychan`/`quit`/`eventQ` (:194, :232-233) under the old loops before `engage()`
+  (:1173) refuses "already engaged". A single-arm first-draw gate would indeed hang.
+- Original panic reproduced on a pre-fix build (`setsid --wait ./aira {top,tui}
+  </dev/null`, `TERM=xterm`): exit 2, `panic: close of nil channel` via
+  `coordinateShutdown` (tui.go:425), both verbs. One correction to the Resolution: on
+  `tui` the `E_INTERNAL` line DID print before the panic — `defer close(coordDone)` runs
+  during unwinding and races `run()`'s print against the runtime's fatal exit — so
+  "never printed at all" is one outcome of a race, not a certainty.
+- Fixed build, same repro: exit 4, the single
+  `E_INTERNAL: tui: open /dev/tty: no such device or address` line, no panic, both verbs.
+- Non-porosity re-run by the reviewer: fix reverted → the new test FAILS with the exact
+  stack; never-Stop over-correction →
+  `TestTUIKeypressAndQuitWhileFetchAndQueueUpdateAreInFlight` FAILS "TUI quit deadlocked
+  or did not complete".
+- Real pty (`script -qec`): `q` → exit 0; SIGINT → exit 0; no panic, no leftover process.
+- Gates from a clean tree at `0ad3bc9`: build 0, vet 0,
+  `AIRA_REAL_CGROUP=1 go test ./... -count=1` 0 (14 packages ok, 0 FAIL).
+
+### Finding: residual startup-window race — ACCEPTED GAP (corrects the Resolution)
+
+The Resolution's claim that tview's failing-`Init()` return "cannot coexist with a
+coordinator that has already completed executor.wait() and <-pumpDone on an external
+cancel" is FALSE. Reviewer probe (throwaway, not committed): a context already cancelled
+at `run()` entry, in a Setsid/no-tty child with `TERM=xterm`, 300 runs against the FIXED
+code → **37 panics (12%)** with the identical stack via the fixed `Stop()` (tui.go:462),
+263 clean `E_INTERNAL`, 0 hangs. Mechanism: the coordinator wakes on the pending cancel,
+joins executor and pump, sees `appRunDone` still open (Run() has not returned yet),
+calls `Stop()`, which blocks on `a.Lock()` until Run()'s failing `Init()` unlocks — with
+`a.screen` still set — and the nil close fires.
+
+Reachability: production passes `context.Background()` (main.go:189/386), so the only
+trigger is a SIGINT/SIGTERM delivered inside the sub-millisecond window between
+`go coordinateShutdown()` and the `/dev/tty` open failing, in a context that has no tty
+(so no Ctrl-C); the pre-cancelled probe is a strict upper bound on that. If it is ever
+hit the outcome is the pre-existing crash (exit 2 instead of 4) in a process that was
+failing anyway — no hang (0/300), no state damage. Accepted under the keep-the-primitive
+rule rather than stacking a `recover()`; the deterministic P1 as reported is closed and
+pinned by the regression test.
+
+If it ever matters: gate the coordinator on BOTH arms —
+`select { case <-appRunDone: return; case <-firstDraw: Stop() }` — which closes the window
+with no hang (the single-arm first-draw gate rejected above was rightly rejected), noting
+the smoke tests' own `SetAfterDrawFunc` use is a single slot that would need a seam; or
+a `recover()` scoped to the one `Stop()` call.
