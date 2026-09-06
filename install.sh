@@ -1,7 +1,9 @@
-#!/bin/sh
+#!/bin/bash
 
-set -e
+set -xe
 
 go build -o bin/ ./cmd/aira/...
 
-./bin/aira install
+install bin/aira ~/.local/bin/aira
+
+~/.local/bin/aira install
