@@ -665,12 +665,14 @@ func (s *Store) findingFromError(err error, subject string) CheckFinding {
 // This does NOT cover every path into Response.Code: core.Do's handlerData.Code
 // and runner.RunRecord.ErrorCodes are plain strings assigned directly by their
 // producers (never parsed out of an error message), so they never call this
-// function at all. Every literal assigned to either today is E_/U_-prefixed
-// (verified by grep at AIRA-99 time), so the hazard is currently inert there,
-// but a future W_-prefixed literal in one of those two places would bypass
-// both this guard and TestNoWarningCodeIsRaisedAsAnError's colon-delimited
-// "CODE: message" scan (a bare code literal has no colon). Recorded as a
-// follow-up rather than fixed here to keep this change mechanical.
+// function at all, and a bare W_ literal in either would also slip past
+// TestNoWarningCodeIsRaisedAsAnError's colon-delimited "CODE: message" scan (a
+// bare code literal has no colon). Those two shapes now have their own static
+// scan — codes.TestNoWarningCodeIsAssignedAsADirectResponseCode (AIRA-109),
+// which flags a W_ literal written into handlerData{Code: ...} or appended to
+// an ErrorCodes slice. Neither scan can see a code that reaches those fields
+// through a variable rather than a literal; that residual gap is recorded
+// there.
 func ErrorCode(err error) string {
 	if err == nil {
 		return ""
