@@ -152,8 +152,32 @@ Four tests, and each was made to fail on purpose before being trusted:
   (`record.ErrorCodes = []string{"W_X"}`, or `ErrorCodes: []string{...}` in a
   `RunRecord` literal). No site in the tree writes `ErrorCodes` that way today —
   every one of the ~40 writes goes through `appendUnique` — so covering it would
-  be machinery for a shape nobody uses. Both limits are written into the test's
-  doc comment, where the next author will find them.
+  be machinery for a shape nobody uses.
+- A direct field assignment on a zero-valued struct, `hd.Code = "W_X"`, is not
+  matched, and **cannot be** without type information: `store.CheckFinding` also
+  has a `Code` field, and `finding.Code = "W_STALE_INDEX"` is correct, common
+  code. A name-only scan cannot tell the two apart, so catching the evasion
+  would break the legitimate line. That trade is pinned by a line in
+  `TestDirectResponseCodeScanLeavesLegitimateWarningLiteralsAlone` rather than
+  left as prose.
+- Only a keyed composite literal is matched; a positional `handlerData{...}`
+  would slip past for the same want-of-types reason. Every `handlerData` in the
+  tree is keyed.
+- Two consequences of name-over-type matching are deliberate and both err toward
+  flagging: any type whose field is called `ErrorCodes` counts (the output-chunk
+  type in `runner/types.go` has one, and a `W_` there would be just as wrong),
+  and an `append` whose result is discarded is still reported (a discarded
+  append of a warning code is a bug either way).
+
+The last three came from an external adversarial read of the scan (DeepSeek V4
+pro, asked for evasion shapes). Its other findings — aliasing and spread
+arguments — are the already-recorded variable/whole-slice gaps in another
+costume and are folded into those bullets. Every limit is written into the
+test's doc comment too, where the next author will find them.
+
+A `"W_CODE: message"` literal in either field is not a gap: it has a colon, so
+it fails `codePattern` here and is caught by `TestNoWarningCodeIsRaisedAsAnError`
+instead. Between the two tests, the bare and message forms are both covered.
 
 `internal/store/check.go`'s `ErrorCode` doc comment said this hazard was
 "recorded as a follow-up rather than fixed here"; it now points at the scan that

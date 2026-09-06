@@ -389,18 +389,45 @@ func warningBypasses(sites []directCodeSite) []directCodeSite {
 // every bare W_ literal would be noise that trains authors to work around the
 // check. Only the two shapes above are flagged.
 //
-// Recorded limitations, not claimed away:
+// The colon form is not this test's business: "W_CODE: message" written into
+// either field fails codePattern (a code has no colon) and is caught by
+// TestNoWarningCodeIsRaisedAsAnError above instead. Between the two, both the
+// bare and the message forms of the mistake are covered.
+//
+// Recorded limitations, not claimed away. An external review of this scan
+// (DeepSeek V4 pro) was asked for evasion shapes; these are what it found that
+// is real, ordered by how easily an author trips one by accident:
+//   - A direct field assignment, `hd.Code = "W_X"` on a zero-valued
+//     handlerData, is not matched. It CANNOT be, without type information:
+//     store.CheckFinding also has a Code field, and `finding.Code =
+//     "W_STALE_INDEX"` is correct, common code. A name-only scan cannot tell
+//     the two apart, and flagging both would be the false-fail this check is
+//     written to avoid. Every handlerData in the tree is built as a composite
+//     literal and returned inline.
 //   - Only a whole literal is seen. A code that arrives in either field through
 //     a variable (runner_linux.go appends launch.Code and decision.diagnostic;
-//     core.go builds handlerData{Code: gitErr.Code()}) is invisible here, the
-//     same blind spot TestNoWarningCodeIsRaisedAsAnError records for
-//     fmt.Errorf("%s: ...", code).
+//     core.go builds handlerData{Code: gitErr.Code()}), through an alias
+//     (`slice := record.ErrorCodes; appendUnique(slice, ...)`), or through a
+//     spread (`appendUnique(record.ErrorCodes, []string{"W_X"}...)`) is
+//     invisible — the same blind spot TestNoWarningCodeIsRaisedAsAnError
+//     records for fmt.Errorf("%s: ...", code).
 //   - Only append and appendUnique are matched, not a whole-slice assignment
 //     (`record.ErrorCodes = []string{"W_X"}` or `ErrorCodes: []string{"W_X"}` in
 //     a RunRecord literal). No site in the tree writes ErrorCodes that way today
 //     — every one of the ~40 writes goes through appendUnique — so covering it
 //     would be machinery for a shape nobody uses; if one ever appears, this is
 //     where to extend.
+//   - Only a keyed composite literal is matched. A positional
+//     `handlerData{data, warnings, verdict, "W_X", err}` would slip past,
+//     because without type information the scan cannot know which position Code
+//     occupies. Every handlerData literal in the tree is keyed.
+//
+// Two consequences of matching by name rather than type are deliberate and both
+// err toward flagging: any type whose field is called ErrorCodes counts (the
+// output-chunk type in runner/types.go has one, and a W_ code there would be
+// just as wrong), and an `append(record.ErrorCodes, "W_X")` whose result is
+// discarded is still reported, which is correct — a discarded append of a
+// warning code is a bug either way.
 func TestNoWarningCodeIsAssignedAsADirectResponseCode(t *testing.T) {
 	root := moduleRoot(t)
 	seen := map[string]int{}
@@ -481,11 +508,18 @@ func viaBuiltinAppend(record *RunRecord) {
 // hazard is the code reaching Response.Code as a failure, not the code existing.
 // A scan that flagged these would be worse than no scan, because the fix an
 // author would reach for is to stop reporting the warning.
+//
+// The `finding.Code = "W_ORPHAN_WORKTREE"` line is the one that pins the
+// limitation above: CheckFinding shares the field name Code, so a scan that
+// caught the `hd.Code = "W_X"` evasion by matching assignments to `.Code` would
+// break this legitimate line too. Not catching that shape is the price of not
+// breaking this one, and this test is what makes the trade visible.
 func TestDirectResponseCodeScanLeavesLegitimateWarningLiteralsAlone(t *testing.T) {
 	fset, file := parsePlantedSource(t, `package planted
 
-func findings(report *CheckReport, record *TicketRecord, row *ReadyRow) {
+func findings(report *CheckReport, record *TicketRecord, row *ReadyRow, finding *CheckFinding) {
 	addWarning(report, CheckFinding{Code: "W_STALE_INDEX", Subject: "AIRA-1", Kind: "warning"})
+	finding.Code = "W_ORPHAN_WORKTREE"
 	record.Warnings = []string{"W_STALE_INDEX"}
 	record.Warnings = appendUniqueStrings(record.Warnings, "W_RELATION_INVALID")
 	row.Warnings = append(row.Warnings, "W_CROSS_PROJECT_RELATION")
