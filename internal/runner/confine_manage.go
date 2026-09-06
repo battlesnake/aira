@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -44,11 +45,96 @@ type ConfineRecord struct {
 	// or cgroup.events could not be opened) and must never be rendered as empty.
 	// killConfine already used this same source for the same reason; this only
 	// makes it available to the scan.
-	SubtreePopulated  *bool    `json:"subtree_populated"`
-	AgeSeconds        *int64   `json:"age_seconds"`
-	Cap               *string  `json:"cap"`
+	SubtreePopulated *bool   `json:"subtree_populated"`
+	AgeSeconds       *int64  `json:"age_seconds"`
+	Cap              *string `json:"cap"`
+	// Command is the WRAPPED invocation this scope was created for — the argv
+	// after `aira confine`'s own `--` separator — read live from
+	// /proc/<SupervisorPID>/cmdline at listing time, exactly as RSSBytes and Cap
+	// above are read live from the scope's cgroup files (AIRA-135).
+	//
+	// nil is "could not be established", never "no command": the supervisor may
+	// have exited between the directory scan and this read, /proc may be
+	// unreadable, or the platform may have no /proc at all. It is never filled in
+	// with a placeholder.
+	//
+	// KNOWN GAP, documented rather than papered over: SupervisorPID is decoded
+	// from the scope DIRECTORY NAME, so between a supervisor's death and the
+	// orphan reaper's sweep a reused PID could carry an unrelated process's argv.
+	// That is exactly the trust level the PID field beside it already has (and
+	// that killConfine's pid selector already accepts); this field inherits it and
+	// widens nothing, and it participates in no decision — it is a display facet.
+	Command           *string  `json:"command"`
 	Pending           bool     `json:"pending,omitempty"`
 	UnevaluatedFields []string `json:"unevaluated_fields,omitempty"`
+}
+
+// ConfineCommandWireLimit bounds the bytes of /proc/<pid>/cmdline the scan reads
+// and retains. It exists for AVAILABILITY, not neatness, on the same reasoning as
+// ConfineReservationSignatureWireLimit below: a process's argv area can run to
+// megabytes, and an unbounded copy of one per scope could push a `confine --list`
+// reply past MaxFrameBytes — at which point `--list` fails for every job on the
+// slice. Elision is MARKED (see confineCommandFromCmdline), never silent.
+const ConfineCommandWireLimit = 4096
+
+// confineCommandFromCmdline extracts the wrapped command from an `aira confine`
+// supervisor's NUL-separated /proc/<pid>/cmdline.
+//
+// `aira confine`'s CLI syntax is always `confine [flags] -- <argv...>`, so the
+// displayed command is everything AFTER the first bare `--`: aira's own flags are
+// not what an operator scanning the table is looking for. When there is no `--`
+// at all — which a real supervisor should never produce — the WHOLE argv is
+// returned rather than the field being silently dropped.
+//
+// ok=false means nothing could be established: an empty cmdline (the process
+// exited under the read, or is a kernel thread), or a `--` with nothing after it.
+// Neither is ever rendered as an empty command.
+//
+// The argv is joined with single spaces. That is a RENDERING, not a shell-quoted
+// round trip: an argument containing whitespace is not re-quoted, so the result
+// is a faithful list of the real arguments and not something to paste back into a
+// shell. Terminal-safety escaping belongs to the renderer, at the one boundary
+// that actually reaches a terminal, exactly as it does for a reservation
+// signature.
+func confineCommandFromCmdline(data []byte) (string, bool) {
+	elided := false
+	if len(data) > ConfineCommandWireLimit {
+		data = data[:ConfineCommandWireLimit]
+		elided = true
+	}
+	argv := strings.Split(string(data), "\x00")
+	// A cmdline is NUL-TERMINATED, so the split yields exactly ONE artefactual
+	// trailing empty element. Exactly one is dropped: an empty ARGUMENT is legal
+	// (`sh -c ""`), and trimming every trailing empty would delete a real one.
+	if len(argv) > 0 && argv[len(argv)-1] == "" {
+		argv = argv[:len(argv)-1]
+	}
+	if len(argv) == 0 {
+		return "", false
+	}
+	for index, arg := range argv {
+		if arg != "--" {
+			continue
+		}
+		argv = argv[index+1:]
+		if len(argv) == 0 {
+			// `aira confine ... --` with nothing after it launches nothing. An
+			// empty string here would render as a job running no command.
+			return "", false
+		}
+		break
+	}
+	text := strings.Join(argv, " ")
+	if strings.TrimSpace(text) == "" {
+		// Nothing but empty arguments establishes no command to show.
+		return "", false
+	}
+	if elided {
+		// The bound above can cut mid-rune. Dropping the invalid tail keeps a
+		// terminal-bound string well-formed; the ellipsis states that it happened.
+		text = strings.ToValidUTF8(text, "") + " …"
+	}
+	return text, true
 }
 
 type ConfineListResult struct {

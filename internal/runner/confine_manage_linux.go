@@ -23,6 +23,11 @@ type confineScanDeps struct {
 	now       func() time.Time
 	readField func(*linuxScope, string, int64) ([]byte, error)
 	waitEmpty func(context.Context, Scope, time.Duration) error
+	// readCmdline is the AIRA-135 seam for the supervisor's own argv. Nil falls
+	// back to the real /proc reader, so an existing caller that builds this struct
+	// field-by-field keeps the production behaviour rather than silently losing
+	// the field.
+	readCmdline func(pid int) ([]byte, error)
 	// afterReapEmptyProof is a test seam for the phase-one/phase-two race.
 	afterReapEmptyProof func()
 }
@@ -34,7 +39,7 @@ const confineReapMaxDepth = 32
 var confineReapOpenat = unix.Openat
 
 func defaultConfineScanDeps() confineScanDeps {
-	return confineScanDeps{now: time.Now, readField: readConfineScopeField, waitEmpty: waitEmpty}
+	return confineScanDeps{now: time.Now, readField: readConfineScopeField, waitEmpty: waitEmpty, readCmdline: readProcCmdline}
 }
 
 func ResolveConfineManagementSlice(slice string) (string, string, error) {
@@ -62,6 +67,23 @@ func readConfineScopeField(scope *linuxScope, name string, limit int64) ([]byte,
 	return io.ReadAll(io.LimitReader(file, limit))
 }
 
+// readProcCmdline is AIRA-135's live argv read, shaped exactly like
+// readConfineScopeField above: an open that may simply fail (the process exited,
+// or /proc is not visible from here), and a BOUNDED read. The bound is one byte
+// past ConfineCommandWireLimit so the parser can tell a cmdline that merely
+// filled the budget from one that overran it and must be marked elided.
+func readProcCmdline(pid int) ([]byte, error) {
+	if pid <= 0 {
+		return nil, errors.New("no supervisor pid")
+	}
+	file, err := os.Open("/proc/" + strconv.Itoa(pid) + "/cmdline")
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return io.ReadAll(io.LimitReader(file, ConfineCommandWireLimit+1))
+}
+
 func listConfines(ctx context.Context, slicePath string, registry []ConfineRegistryEntry) (ConfineListResult, error) {
 	return listConfinesWithDeps(ctx, slicePath, registry, defaultConfineScanDeps())
 }
@@ -73,6 +95,10 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 	entries, err := os.ReadDir(slicePath)
 	if err != nil {
 		return ConfineListResult{Verdict: "unevaluated", Reason: err.Error(), Scopes: []ConfineRecord{}}, nil
+	}
+	readCmdline := deps.readCmdline
+	if readCmdline == nil {
+		readCmdline = readProcCmdline
 	}
 	byID := make(map[string]ConfineRecord)
 	for _, entry := range entries {
@@ -90,6 +116,20 @@ func listConfinesWithDeps(ctx context.Context, slicePath string, registry []Conf
 			owner = ConfineUnknownOwner
 		}
 		record := ConfineRecord{Name: name, Owner: owner, ScopeID: scopeID, SupervisorPID: &pid}
+		// AIRA-135. The supervisor's own argv, read live from /proc exactly as
+		// memory.current and memory.max are read live from the cgroup below. It is
+		// deliberately read HERE, before the scope-directory open, because the two
+		// readings are independent: a scope whose directory has become unopenable
+		// can still have a live, readable supervisor, and vice versa.
+		if data, cmdErr := readCmdline(pid); cmdErr == nil {
+			if text, ok := confineCommandFromCmdline(data); ok {
+				record.Command = &text
+			} else {
+				record.UnevaluatedFields = append(record.UnevaluatedFields, "command")
+			}
+		} else {
+			record.UnevaluatedFields = append(record.UnevaluatedFields, "command")
+		}
 		if age := deps.now().Sub(time.Unix(0, stamp)); age >= 0 {
 			seconds := int64(age / time.Second)
 			record.AgeSeconds = &seconds

@@ -30,7 +30,13 @@ func mergeConfineRegistry(byID map[string]ConfineRecord, registry []ConfineRegis
 		if owner == "" {
 			owner = ConfineUnknownOwner
 		}
-		record := ConfineRecord{Name: name, Owner: owner, ScopeID: entry.ScopeID, SupervisorPID: &pid, Pending: true, UnevaluatedFields: []string{"populated", "rss", "cap"}}
+		// AIRA-135 names "command" here on exactly the same grounds as the three
+		// fields beside it: this function performs NO live read of any kind (it is
+		// the cross-platform path the ci-shim daemon builds its whole listing from,
+		// and it must compile where there is no /proc to read), so the wrapped
+		// command is as unestablished here as the rss and the cap are. Naming it
+		// unevaluated is what stops a renderer printing an absence as a fact.
+		record := ConfineRecord{Name: name, Owner: owner, ScopeID: entry.ScopeID, SupervisorPID: &pid, Pending: true, UnevaluatedFields: []string{"populated", "rss", "cap", "command"}}
 		if age := time.Since(time.Unix(0, stamp)); age >= 0 {
 			seconds := int64(age / time.Second)
 			record.AgeSeconds = &seconds
@@ -53,8 +59,8 @@ func mergeConfineRegistry(byID map[string]ConfineRecord, registry []ConfineRegis
 //
 // What it CAN see is exactly the daemon's own granted-waiter registry, which is
 // the whole ledger in shim mode. Every row is therefore Pending, with
-// populated/rss/cap named as unevaluated rather than fabricated: there is no
-// cgroup to read them from, and printing zeros would state that the jobs are
+// populated/rss/cap/command named as unevaluated rather than fabricated: there is
+// no cgroup to read them from, and printing zeros would state that the jobs are
 // idle and uncapped.
 func ShimConfineList(registry []ConfineRegistryEntry) ConfineListResult {
 	byID := make(map[string]ConfineRecord, len(registry))

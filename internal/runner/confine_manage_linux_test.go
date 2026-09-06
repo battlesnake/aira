@@ -861,3 +861,102 @@ func confineContainsString(values []string, wanted string) bool {
 	}
 	return false
 }
+
+// AIRA-135 (a)+(b). The scan reads the supervisor's own argv live from /proc and
+// splits it at the `--` separator, and reports the field as UNEVALUATED — never
+// as a fabricated placeholder — when that read cannot be made.
+//
+// The populated case runs against a REAL process through the REAL /proc reader
+// (no seam), so the production read itself is exercised and not just the parser
+// behind it. The failure case goes through the seam, because "the supervisor
+// exited under the read" cannot be staged deterministically with a real PID.
+//
+// verifies: AIRA-135
+func TestConfineScanReadsTheSupervisorCommandAndSaysUnevaluatedWhenItCannot(t *testing.T) {
+	slice := t.TempDir()
+	now := time.Now()
+
+	// A real child whose argv carries the `aira confine ... -- <job>` shape. The
+	// body is a COMPOUND command on purpose: a shell handed a single simple
+	// command implicitly execs it, replacing the very argv this test reads.
+	live := exec.Command("/bin/sh", "-c", "while :; do sleep 1; done", "--", "held-job", "--flag-of-the-job")
+	if err := live.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = live.Process.Kill()
+		_, _ = live.Process.Wait()
+	})
+	livePID := live.Process.Pid
+	liveScope := confineTestScopeID("live-command", livePID, now.Add(-time.Minute).UnixNano())
+	writeConfineTestScope(t, slice, liveScope, strconv.Itoa(livePID)+"\n")
+
+	result, err := ListConfines(context.Background(), slice, nil)
+	if err != nil || result.Verdict != "pass" || len(result.Scopes) != 1 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	record := result.Scopes[0]
+	if record.Command == nil {
+		t.Fatalf("live supervisor record=%+v, want a command read from /proc", record)
+	}
+	// Everything after the FIRST bare `--` and nothing before it: the shell's own
+	// flags stand in for aira's, and an implementation that returned the whole
+	// cmdline fails here.
+	if want := "held-job --flag-of-the-job"; *record.Command != want {
+		t.Fatalf("command=%q, want %q", *record.Command, want)
+	}
+	if confineContainsString(record.UnevaluatedFields, "command") {
+		t.Fatalf("an established command was also named unevaluated: %+v", record)
+	}
+
+	// The same scope, with the supervisor no longer readable. Every other facet
+	// still reads, so this pins that a failed argv read costs the command field
+	// and nothing else -- and costs it as a NAMED absence.
+	failed, err := listConfinesWithDeps(context.Background(), slice, nil, confineScanDeps{
+		now: time.Now, readField: readConfineScopeField, waitEmpty: waitEmpty,
+		readCmdline: func(int) ([]byte, error) { return nil, errors.New("no such process") },
+	})
+	if err != nil || len(failed.Scopes) != 1 {
+		t.Fatalf("failed-read result=%+v err=%v", failed, err)
+	}
+	dead := failed.Scopes[0]
+	if dead.Command != nil {
+		t.Fatalf("unreadable supervisor record=%+v, want a nil command", dead)
+	}
+	if !confineContainsString(dead.UnevaluatedFields, "command") {
+		t.Fatalf("unreadable command was not named unevaluated: %+v", dead)
+	}
+	if dead.RSSBytes == nil || dead.Cap == nil {
+		t.Fatalf("a failed argv read also lost a cgroup facet: %+v", dead)
+	}
+
+	// A supervisor whose cmdline is readable but establishes NOTHING (a `--` with
+	// no command after it) is unevaluated too, never an empty command cell.
+	empty, err := listConfinesWithDeps(context.Background(), slice, nil, confineScanDeps{
+		now: time.Now, readField: readConfineScopeField, waitEmpty: waitEmpty,
+		readCmdline: func(int) ([]byte, error) { return []byte("aira\x00confine\x00--\x00"), nil },
+	})
+	if err != nil || len(empty.Scopes) != 1 {
+		t.Fatalf("empty-argv result=%+v err=%v", empty, err)
+	}
+	if record := empty.Scopes[0]; record.Command != nil || !confineContainsString(record.UnevaluatedFields, "command") {
+		t.Fatalf("empty-argv record=%+v, want a nil command named unevaluated", record)
+	}
+}
+
+// A registry-only (Pending) row performs no live read at all, so its command is
+// named unevaluated rather than left silently absent. This is the row shape the
+// ci-shim daemon builds its ENTIRE listing from.
+//
+// verifies: AIRA-135
+func TestConfinePendingRowNamesTheCommandUnevaluated(t *testing.T) {
+	pending := confineTestOwnedScopeID("pending-command", "session-a", 4901, time.Now().UnixNano())
+	listed := ShimConfineList([]ConfineRegistryEntry{{ScopeID: pending}})
+	if len(listed.Scopes) != 1 {
+		t.Fatalf("listed=%+v", listed)
+	}
+	record := listed.Scopes[0]
+	if !record.Pending || record.Command != nil || !confineContainsString(record.UnevaluatedFields, "command") {
+		t.Fatalf("pending record=%+v, want a nil command named unevaluated", record)
+	}
+}

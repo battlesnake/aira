@@ -750,3 +750,262 @@ func TestTopRuntimeRendersAndQuits(t *testing.T) {
 		t.Fatalf("top dispatched %v with a project scope or an unexpected verb; it resolves no project", unwanted)
 	}
 }
+
+// AIRA-135 (e). The column SET, and its values, against data that would have been
+// truncated or meaningless under AIRA-127's columns.
+//
+// The record is deliberately built to blow every old hard-sized column: a 42 GiB
+// reservation whose M-suffixed value does not fit a narrow RESERVE column, a long
+// hex-looking scope id and owner, and a real wrapped command. What is asserted is
+// the exact header list and the exact cell list -- not "contains" -- because the
+// whole ticket is that the OLD columns had to GO, and a widening-only change
+// would satisfy any weaker assertion.
+//
+// verifies: AIRA-135
+func TestTopViewModelColumnsAreSlotNamePIDLiveReservationCommand(t *testing.T) {
+	command := "go test ./... -count=1"
+	record := topTestRecord("CONFINE-heavy-suite-31415-9f3ac1de@session-9f3ac1de", "heavy-suite", 42160*(1<<20), 9*gib)
+	record.Command = &command
+	model, _ := topViewModel(nil, topTestListing(topTestFrame(), record))
+
+	wantHeaders := []string{"SLOT", "NAME", "PID", "LIVE", "RESERVATION", "COMMAND"}
+	if !reflect.DeepEqual(model.Headers, wantHeaders) {
+		t.Fatalf("headers=%v, want %v", model.Headers, wantHeaders)
+	}
+	if len(model.Rows) != 1 {
+		t.Fatalf("rows=%+v, want one", model.Rows)
+	}
+	wantCells := []string{"0", "heavy-suite", "4242", "yes", "42160M", command}
+	if !reflect.DeepEqual(model.Rows[0].Cells, wantCells) {
+		t.Fatalf("cells=%v, want %v", model.Rows[0].Cells, wantCells)
+	}
+	// Every cell is present in full: nothing in the viewmodel may pre-truncate a
+	// value, because the table is the only thing that knows the terminal's width.
+	for index, cell := range model.Rows[0].Cells {
+		if cell != wantCells[index] {
+			t.Fatalf("cell %d=%q, want the untruncated %q", index, cell, wantCells[index])
+		}
+	}
+	// The dropped columns must be gone from the header row AND from the data, or
+	// the hex is still on screen under a different name.
+	for _, gone := range []string{"OWNER", "SCOPE-ID", "RSS", "AGE"} {
+		if containsString(model.Headers, gone) {
+			t.Fatalf("headers still carry the dropped column %s: %v", gone, model.Headers)
+		}
+	}
+	for _, gone := range []string{record.Owner, record.ScopeID} {
+		if containsString(model.Rows[0].Cells, gone) {
+			t.Fatalf("row still renders the dropped value %q: %v", gone, model.Rows[0].Cells)
+		}
+	}
+}
+
+// A command that could not be established renders as "unevaluated", never as a
+// blank cell -- a blank would read as a job running nothing at all.
+//
+// verifies: AIRA-135
+func TestTopCommandCellSaysUnevaluatedAndIsTerminalSafe(t *testing.T) {
+	if got := topCommandCell(nil); got != "unevaluated" {
+		t.Fatalf("topCommandCell(nil)=%q, want unevaluated", got)
+	}
+	plain := "go build ./..."
+	if got := topCommandCell(&plain); got != plain {
+		t.Fatalf("topCommandCell=%q, want %q unchanged", got, plain)
+	}
+	// The value is another process's argv reaching a terminal. A control
+	// character that could rewrite the line, and tview's own colour-tag syntax,
+	// must both survive as VISIBLE TEXT rather than being executed or swallowed.
+	hostile := "sh -c \x1b[2Kwiped\ttab [red]not-a-tag"
+	got := topCommandCell(&hostile)
+	if strings.ContainsAny(got, "\x1b\t") {
+		t.Fatalf("topCommandCell=%q, want the control characters escaped", got)
+	}
+	// tview parses colour tags in a table cell, so an ARGUMENT that looks like one
+	// must arrive in tview's escaped form (`[red[]`) and never as a live tag.
+	if strings.Contains(got, "[red]") {
+		t.Fatalf("topCommandCell=%q, want tview's tag syntax neutralised", got)
+	}
+	if !strings.Contains(got, "[red[]") {
+		t.Fatalf("topCommandCell=%q, want the argument preserved as escaped text", got)
+	}
+	if !strings.Contains(got, "not-a-tag") {
+		t.Fatalf("topCommandCell=%q, want the rest of the argv intact", got)
+	}
+}
+
+// AIRA-135 (c)+(d). The used/unused split INSIDE one reservation's region.
+//
+// Every case shares one frame so the byte-to-column mapping is a constant 1 GiB
+// per column, and each asserts three separate things: the region's total width is
+// still the RESERVATION (the next region must not move), the bright span is
+// exactly the live usage, and the darkened span is the rest.
+//
+// verifies: AIRA-135
+func TestTopBarRegionSplitsUsedFromReservedButUnused(t *testing.T) {
+	const width = 64
+	frame := &runner.ConfineSliceReserve{
+		SystemMemTotalBytes: 64 * gib, SystemMemAvailableBytes: 64 * gib,
+		SliceMaxBytes: 32 * gib, SliceHighState: runner.ConfineSliceHighNone,
+	}
+	for _, testCase := range []struct {
+		name       string
+		reserved   int64
+		rss        *int64
+		wantUsed   int64
+		wantKnown  bool
+		wantBright int
+		wantShaded int
+	}{
+		{"half-used", 8 * gib, int64Pointer(4 * gib), 4 * gib, true, 4, 4},
+		{"fully-used", 8 * gib, int64Pointer(8 * gib), 8 * gib, true, 8, 0},
+		// A monitoring-lag overshoot right before an OOM. The used shade is
+		// CLAMPED to this region; it must never bleed into the next slot's.
+		{"used-exceeds-the-reservation", 8 * gib, int64Pointer(11 * gib), 8 * gib, true, 8, 0},
+		// An established zero is not an absence: the whole region is darkened.
+		{"used-is-zero", 8 * gib, int64Pointer(0), 0, true, 0, 8},
+		// Unevaluated usage draws ONE undivided shade rather than a fabricated
+		// 0%-used split, which is what a nil-means-zero build would paint.
+		{"usage-unevaluated", 8 * gib, nil, 0, false, 8, 0},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			record := topTestRecord("CONFINE-alpha-101-aa", "alpha", testCase.reserved, 0)
+			record.RSSBytes = testCase.rss
+			// A second scope AFTER it, to pin that the split cannot move the next
+			// region's start or steal its columns.
+			next := topTestRecord("CONFINE-bravo-102-bb", "bravo", 4*gib, 1*gib)
+			model, _ := topViewModel(nil, topTestListing(frame, record, next))
+			region := model.Bar.Regions[0]
+			if region.Bytes != testCase.reserved || region.StartBytes != 0 {
+				t.Fatalf("region=%+v, want the whole reservation from 0", region)
+			}
+			if region.UsedKnown != testCase.wantKnown || region.UsedBytes != testCase.wantUsed {
+				t.Fatalf("region used=%d known=%v, want %d known=%v",
+					region.UsedBytes, region.UsedKnown, testCase.wantUsed, testCase.wantKnown)
+			}
+			if after := model.Bar.Regions[1]; after.StartBytes != testCase.reserved {
+				t.Fatalf("next region starts at %d, want %d; the split moved it", after.StartBytes, testCase.reserved)
+			}
+
+			cells := topBarCells(model.Bar, width)
+			bright, shaded := 0, 0
+			for column := 0; column < int(testCase.reserved/gib); column++ {
+				cell := cells[column]
+				if cell.Kind != topRegionScope || cell.Slot != 0 {
+					t.Fatalf("column %d=%+v, want slot 0's own region", column, cell)
+				}
+				if cell.Shaded {
+					shaded++
+					if cell.Colour != region.ShadeColour {
+						t.Fatalf("shaded column %d colour=%q, want the darkened %q", column, cell.Colour, region.ShadeColour)
+					}
+					continue
+				}
+				bright++
+				if cell.Colour != region.Colour {
+					t.Fatalf("bright column %d colour=%q, want the slot colour %q", column, cell.Colour, region.Colour)
+				}
+			}
+			if bright != testCase.wantBright || shaded != testCase.wantShaded {
+				t.Fatalf("bright=%d shaded=%d, want %d and %d", bright, shaded, testCase.wantBright, testCase.wantShaded)
+			}
+			// The bright and darkened shades are both derived from ONE slot colour,
+			// and the row shares it, so a reservation stays identifiable.
+			if region.ShadeColour == region.Colour {
+				t.Fatalf("the darkened shade equals the bright one (%q); the split would be invisible", region.Colour)
+			}
+			// The NEXT region is untouched by this one's split.
+			for column := int(testCase.reserved / gib); column < int(testCase.reserved/gib)+4; column++ {
+				if cells[column].Slot != 1 {
+					t.Fatalf("column %d=%+v, want the next slot's region", column, cells[column])
+				}
+			}
+		})
+	}
+}
+
+// The scope-less aggregate, the free gap and the out-of-slice grey carry no
+// per-scope usage reading, so none of them is ever split.
+//
+// verifies: AIRA-135
+func TestTopBarNonScopeRegionsAreNeverSplit(t *testing.T) {
+	frame := &runner.ConfineSliceReserve{
+		SystemMemTotalBytes: 64 * gib, SystemMemAvailableBytes: 40 * gib,
+		SliceCurrentBytes: 10 * gib, SliceReclaimableBytes: 2 * gib,
+		SliceMaxBytes: 32 * gib, SliceHighState: runner.ConfineSliceHighNone,
+		ReservationJobs: 3, ReservationBytes: 2 * gib,
+	}
+	model, _ := topViewModel(nil, topTestListing(frame,
+		topTestRecord("CONFINE-alpha-101-aa", "alpha", 4*gib, 1*gib)))
+	for _, region := range model.Bar.Regions {
+		if region.Kind == topRegionScope {
+			continue
+		}
+		if region.UsedKnown || region.ShadeColour != "" {
+			t.Fatalf("region %+v carries a used/unused split it has no reading for", region)
+		}
+	}
+	for _, cell := range topBarCells(model.Bar, 64) {
+		if cell.Shaded && cell.Kind != topRegionScope {
+			t.Fatalf("cell %+v is shaded but belongs to no scope region", cell)
+		}
+	}
+}
+
+// topShadeColour darkens a slot colour and refuses anything it cannot parse,
+// because a shade indistinguishable from the bright one would present a split
+// that is not actually being drawn.
+//
+// verifies: AIRA-135
+func TestTopShadeColourDarkensEverySlotColourAndRefusesTheRest(t *testing.T) {
+	for _, colour := range topSlotColours {
+		shade := topShadeColour(colour)
+		if shade == "" || shade == colour {
+			t.Fatalf("topShadeColour(%q)=%q, want a distinct darkened colour", colour, shade)
+		}
+		if len(shade) != 7 || shade[0] != '#' {
+			t.Fatalf("topShadeColour(%q)=%q, want the #rrggbb form", colour, shade)
+		}
+		bright, err := strconv.ParseInt(colour[1:], 16, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dark, err := strconv.ParseInt(shade[1:], 16, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dark >= bright {
+			t.Fatalf("topShadeColour(%q)=%q is not darker", colour, shade)
+		}
+	}
+	for _, bad := range []string{"", "red", "#12345", "#gggggg", "5fafff"} {
+		if got := topShadeColour(bad); got != "" {
+			t.Fatalf("topShadeColour(%q)=%q, want no shade at all", bad, got)
+		}
+	}
+}
+
+func int64Pointer(value int64) *int64 { return &value }
+
+// The two shades get a key on the summary line, and ONLY when a split is really
+// drawn: a key beside an undivided bar would describe something that is not on
+// screen.
+//
+// verifies: AIRA-135
+func TestTopShadeLegendAppearsOnlyWhenASplitIsDrawn(t *testing.T) {
+	frame := topTestFrame()
+	split, _ := topViewModel(nil, topTestListing(frame,
+		topTestRecord("CONFINE-alpha-101-aa", "alpha", 4*gib, 1*gib)))
+	if got := topShadeLegend(split.Bar); got == "" {
+		t.Fatalf("a drawn split carried no key: %+v", split.Bar.Regions)
+	}
+	// Usage unevaluated for every drawn scope: one undivided shade, no key.
+	unknown := topTestRecord("CONFINE-alpha-101-aa", "alpha", 4*gib, 0)
+	unknown.RSSBytes = nil
+	undivided, _ := topViewModel(nil, topTestListing(frame, unknown))
+	if got := topShadeLegend(undivided.Bar); got != "" {
+		t.Fatalf("an undivided bar carried the split key %q", got)
+	}
+	if got := topShadeLegend(nil); got != "" {
+		t.Fatalf("a nil bar carried the split key %q", got)
+	}
+}

@@ -17,8 +17,11 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"aira/internal/runner"
+
+	"github.com/rivo/tview"
 )
 
 // topSlotFree is the free marker in a slot table. A slot holds a scope id for
@@ -176,6 +179,26 @@ type topBarRegion struct {
 	Colour     string
 	StartBytes int64
 	Bytes      int64
+
+	// AIRA-135. A scope region is drawn in TWO shades of one slot colour: Colour
+	// at full intensity for the part of the reservation that is live-used right
+	// now, and ShadeColour — the darkened variant — for the remainder, which is
+	// reserved and idle. Bytes above is unchanged and still the whole
+	// RESERVATION, so where the NEXT region starts cannot move: the split is
+	// strictly internal to this span.
+	//
+	// UsedKnown is the honesty bit. RSSBytes is a nil-able live cgroup reading,
+	// and a region whose usage was never established is drawn as ONE undivided
+	// shade rather than as a fabricated 0%-used split. UsedBytes is meaningless
+	// unless UsedKnown.
+	//
+	// UsedBytes is already CLAMPED to Bytes at construction. memory.current can
+	// transiently exceed memory.max (the monitoring-lag overshoot just before an
+	// OOM fires), and an unclamped used span would bleed its bright shade into the
+	// neighbouring slot's region and mis-attribute it.
+	UsedBytes   int64
+	UsedKnown   bool
+	ShadeColour string
 }
 
 // topBarMarker is a limit tick drawn over the bar.
@@ -225,7 +248,16 @@ type topBar struct {
 //
 // previous is the slot table from the last tick; the returned table replaces it.
 func topViewModel(previous []string, result runner.ConfineListResult) (panelModel, []string) {
-	model := panelModel{Headers: []string{"SLOT", "NAME", "OWNER", "PID", "SCOPE-ID", "LIVE", "RESERVE", "RSS", "AGE"}}
+	// AIRA-135's column set, exactly. OWNER and SCOPE-ID are gone because they
+	// rendered as long meaningless hex that crowded every useful column off a
+	// normal terminal — tview sizes columns greedily left to right and clamps
+	// whatever no longer fits, which is why RESERVE was arriving truncated. RSS is
+	// gone as a column but NOT as information: it is now the bright/dark split
+	// inside each reservation's own bar region, which answers "how much of its
+	// reservation is this job actually using" that a bare number beside a bare cap
+	// never did. COMMAND is last on purpose: it is the one cell with no bound on
+	// its natural width, so it absorbs the clamp instead of imposing it.
+	model := panelModel{Headers: []string{"SLOT", "NAME", "PID", "LIVE", "RESERVATION", "COMMAND"}}
 	if result.Verdict == "unevaluated" {
 		reason := strings.TrimSpace(result.Reason)
 		if reason == "" {
@@ -264,16 +296,19 @@ func topViewModel(previous []string, result runner.ConfineListResult) (panelMode
 		colour := topSlotColour(slot)
 		model.Rows = append(model.Rows, tableRow{
 			ID: scopeID, Colour: colour, Cells: []string{
-				fmt.Sprint(slot), record.Name, record.Owner, confineInt(record.SupervisorPID), scopeID,
-				topLiveCell(record), reserve.String(), topBytesCell(record.RSSBytes), confineAge(record.AgeSeconds),
+				fmt.Sprint(slot), record.Name, confineInt(record.SupervisorPID),
+				topLiveCell(record), reserve.String(), topCommandCell(record.Command),
 			},
 		})
 		switch reserve.State {
 		case topReserveSet:
-			drawn = append(drawn, topBarRegion{
+			region := topBarRegion{
 				Kind: topRegionScope, Slot: slot, Label: record.Name, Colour: colour,
-				StartBytes: offset, Bytes: reserve.Bytes,
-			})
+				ShadeColour: topShadeColour(colour),
+				StartBytes:  offset, Bytes: reserve.Bytes,
+			}
+			region.UsedBytes, region.UsedKnown = topUsedWithin(record.RSSBytes, reserve.Bytes)
+			drawn = append(drawn, region)
 			offset += reserve.Bytes
 		case topReserveUncapped:
 			uncapped++
@@ -294,14 +329,54 @@ func topViewModel(previous []string, result runner.ConfineListResult) (panelMode
 	return model, slots
 }
 
-// topBytesCell renders an optional byte count in the same human units the
-// reserve column and the bar's legend use, and says "unevaluated" for a reading
-// that could not be established — never a zero, which would read as an idle job.
-func topBytesCell(value *int64) string {
-	if value == nil {
+// topUsedWithin turns a scope's optional live usage reading into the bar
+// region's used sub-span, and is the ONE place the three edge cases live.
+//
+// A nil (or negative — a reading that cannot be a byte count) RSS is NOT usable:
+// it reports known=false, and the region is then drawn undivided. Zero is a
+// different thing entirely — an established "using nothing", drawn as a fully
+// darkened region — and the two must never collapse into each other.
+//
+// A usage larger than the reservation is CLAMPED to it. memory.current really can
+// exceed memory.max for a moment before the kernel reclaims or OOM-kills, and the
+// alternative to clamping is a bright span that runs past this region's right
+// edge into the next slot's colour.
+func topUsedWithin(rss *int64, reserved int64) (int64, bool) {
+	if rss == nil || *rss < 0 || reserved < 0 {
+		return 0, false
+	}
+	used := *rss
+	if used > reserved {
+		used = reserved
+	}
+	return used, true
+}
+
+// topCommandCell renders the wrapped command, and says "unevaluated" for one that
+// could not be established — never a blank cell, which reads as a job running
+// nothing.
+//
+// The value is ARBITRARY BYTES from another process's argv and it is printed
+// straight into a terminal, so it gets the same treatment the equally untrusted
+// reservation signature already gets at its own render boundary: non-printing
+// runes are escaped so they cannot rewrite the line or hide rows, and tview's
+// colour-tag syntax is neutralised so an argument like `[red]` is displayed
+// rather than swallowed as markup. Truncation for WIDTH is not done here — the
+// table already clamps a cell that does not fit, and a second scheme layered on
+// top of it would only disagree with it.
+func topCommandCell(command *string) string {
+	if command == nil {
 		return "unevaluated"
 	}
-	return topFormatMegabytes(*value)
+	var builder strings.Builder
+	for _, r := range *command {
+		if r == unicode.ReplacementChar || !unicode.IsPrint(r) {
+			builder.WriteString(strconv.QuoteRune(r))
+			continue
+		}
+		builder.WriteRune(r)
+	}
+	return tview.Escape(builder.String())
 }
 
 // topLiveCell renders liveness from the SUBTREE-aware signal, and says so when
@@ -413,6 +488,12 @@ type topBarCell struct {
 	Marker string
 	Slot   int
 	Kind   topBarRegionKind
+	// Shaded marks a column in the DARKENED part of a scope's region: memory this
+	// reservation holds but is not using right now (AIRA-135). It is carried
+	// explicitly rather than left to be inferred from Colour, because a region
+	// whose usage was never established is painted entirely in the bright colour
+	// and must not be readable as "100% used".
+	Shaded bool
 }
 
 // topBarCells maps the byte model onto `width` terminal columns.
@@ -441,8 +522,21 @@ func topBarCells(bar *topBar, width int) []topBarCell {
 			}
 			start := topBarColumn(region.StartBytes, bar.TotalBytes, width)
 			end := topBarColumn(region.StartBytes+region.Bytes, bar.TotalBytes, width)
+			// AIRA-135. Where the bright used span stops and the darkened idle span
+			// begins, derived from the SAME absolute-offset mapping as the region's
+			// own edges, so the boundary can never round outside them. Defaulting it
+			// to `end` is what makes an unestablished usage — and a colour with no
+			// darkened variant — paint the region in one undivided shade.
+			shadedFrom := end
+			if region.UsedKnown && region.ShadeColour != "" {
+				shadedFrom = topBarColumn(region.StartBytes+region.UsedBytes, bar.TotalBytes, width)
+			}
 			for column := start; column < end && column < width; column++ {
-				cells[column] = topBarCell{Colour: region.Colour, Slot: region.Slot, Kind: region.Kind}
+				cell := topBarCell{Colour: region.Colour, Slot: region.Slot, Kind: region.Kind}
+				if column >= shadedFrom {
+					cell.Colour, cell.Shaded = region.ShadeColour, true
+				}
+				cells[column] = cell
 			}
 		}
 	}
