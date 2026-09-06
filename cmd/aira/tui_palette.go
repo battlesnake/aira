@@ -47,6 +47,39 @@ func topSlotColour(slot int) string {
 	return topSlotColours[slot%len(topSlotColours)]
 }
 
+// topShadeNumerator/topShadeDenominator scale every channel of a slot colour to
+// produce its DARKENED variant. Chosen to stay unmistakably the same hue — the
+// slot identity requirement 6 makes structural must survive the split — while
+// being obviously dimmer than the full-intensity used portion beside it.
+const (
+	topShadeNumerator   = 45
+	topShadeDenominator = 100
+)
+
+// topShadeColour is AIRA-135's second shade of a slot colour: the part of a
+// reservation that is held but NOT currently in use.
+//
+// It returns "" for anything it cannot darken (a colour that is not the
+// `#rrggbb` form this palette uses). That is deliberate and is what the bar
+// relies on: with no shade colour the region is drawn as ONE undivided span,
+// which is today's behaviour and states nothing that was not established. It
+// never invents a fallback shade, because a shade an operator cannot tell from
+// the bright one would present a used/unused split that is not being drawn.
+func topShadeColour(colour string) string {
+	if len(colour) != 7 || colour[0] != '#' {
+		return ""
+	}
+	channels := [3]int64{}
+	for index := range channels {
+		value, err := strconv.ParseInt(colour[1+index*2:3+index*2], 16, 32)
+		if err != nil {
+			return ""
+		}
+		channels[index] = value * topShadeNumerator / topShadeDenominator
+	}
+	return fmt.Sprintf("#%02x%02x%02x", channels[0], channels[1], channels[2])
+}
+
 const (
 	// topColourScopeless marks the aggregate scope-less-reservation region. It is
 	// deliberately outside the slot table: that region has no slot, no row, and no

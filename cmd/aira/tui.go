@@ -554,8 +554,8 @@ func (r *tuiRuntime) renderTopBar(bar *topBar, panel panelState) {
 			}
 		}
 		out.WriteString("\n")
-		fmt.Fprintf(&out, "total %s | reserved %s | rest of system %s | free %s\n",
-			topFormatMegabytes(bar.TotalBytes), topFormatMegabytes(bar.ClaimedBytes),
+		fmt.Fprintf(&out, "total %s | reserved %s%s | rest of system %s | free %s\n",
+			topFormatMegabytes(bar.TotalBytes), topFormatMegabytes(bar.ClaimedBytes), topShadeLegend(bar),
 			topOutsideText(bar), topFormatMegabytes(bar.FreeBytes))
 		out.WriteString(topMarkerLegend(bar))
 		if bar.Overcommitted {
@@ -593,6 +593,26 @@ func topMarkerLegend(bar *topBar) string {
 		parts = append(parts, fmt.Sprintf("%s %s %s", topMarkerGlyph(marker.Name), marker.Label, topFormatMegabytes(marker.Bytes)))
 	}
 	return strings.Join(parts, "  ")
+}
+
+// topShadeLegend names the two shades AIRA-135 draws inside each reservation,
+// because a two-tone region with no key is not readable: an operator cannot tell
+// which half is the usage and which is the idle remainder.
+//
+// It is emitted only when a split is ACTUALLY on screen — at least one drawn
+// region with an established usage and a darkened variant to draw it in. A key
+// printed beside a bar with no split would describe something that is not there,
+// which is the same fabrication as drawing the split itself would be.
+func topShadeLegend(bar *topBar) string {
+	if bar == nil {
+		return ""
+	}
+	for _, region := range bar.Regions {
+		if region.Kind == topRegionScope && region.UsedKnown && region.ShadeColour != "" {
+			return " (bright = in use, dark = reserved and idle)"
+		}
+	}
+	return ""
 }
 
 func topOutsideText(bar *topBar) string {

@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-135","project":"aira","title":"aira top: replace hex ID columns with PID/command, fix reserve truncation, shade unused-vs-used in the bar","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["observability","tui"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-135","project":"aira","title":"aira top: replace hex ID columns with PID/command, fix reserve truncation, shade unused-vs-used in the bar","status":"in-review","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["observability","tui"],"hold":false,"relations":[]}
 ---
 Requested directly by the owner, 2026-09-06, refining AIRA-127 (just shipped).
 
@@ -95,3 +95,87 @@ ratios including used > reserved (clamped) and used == 0; (d) a region with
 nil RSSBytes draws as one undivided shade; (e) the new column set and widths
 render correctly for values that would have truncated under the old
 hard-coded widths.
+
+## Resolution (in-review)
+
+Branch `aira135-top-columns-and-shading`. All three parts built as specified.
+
+### 1. Columns
+
+`topViewModel` (cmd/aira/tui_top.go) now emits exactly
+`SLOT NAME PID LIVE RESERVATION COMMAND`. OWNER, SCOPE-ID, RSS and AGE are gone.
+
+No hard-coded widths were added or changed — none existed. The truncation was
+structural: tview sizes columns greedily left to right and CLAMPS the first one
+that no longer fits (`table.go:1018-1036`), so the two long hex columns were
+consuming the width the later columns needed. Removing them removes the clamp.
+COMMAND is placed LAST because it is the only cell with no natural bound, so it
+absorbs whatever clamp remains rather than imposing one on RESERVATION.
+
+### 2. `ConfineRecord.Command`
+
+`Command *string` (`json:"command"`), populated in `listConfinesWithDeps` from a
+live `/proc/<SupervisorPID>/cmdline` read at listing time, through a new
+`confineScanDeps.readCmdline` seam (nil falls back to the production reader, so
+existing callers that build the struct field-by-field keep real behaviour).
+`confineCommandFromCmdline` splits at the FIRST bare `--`, falls back to the whole
+argv when there is none, and returns ok=false — leaving the field nil and naming
+`"command"` in `UnevaluatedFields` — for an empty cmdline or a `--` with nothing
+after it. Never a fabricated placeholder.
+
+The read is bounded at `ConfineCommandWireLimit` (4096) for availability, on the
+same reasoning as `ConfineReservationSignatureWireLimit`; elision is MARKED with
+an ellipsis and the truncated tail is made valid UTF-8, never silently cut.
+
+The registry-only (Pending) rows built by `mergeConfineRegistry` — which is the
+ENTIRE listing in ci-shim mode — name `"command"` unevaluated alongside
+populated/rss/cap: that function performs no live read of any kind and must
+compile where there is no /proc.
+
+`topCommandCell` escapes non-printing runes and neutralises tview's colour-tag
+syntax before the value reaches a terminal, exactly as
+`confineSignatureForDisplay` already does for the equally untrusted reservation
+signature. Width truncation is left to the table, as the ticket requires.
+
+### 3. Bar shading
+
+`topBarRegion` gained `UsedBytes`/`UsedKnown`/`ShadeColour`; `Bytes` is unchanged
+and still the whole reservation, so no region's start can move. `topUsedWithin`
+holds the three edge cases in one place: nil/negative RSS -> `UsedKnown=false`
+(one undivided shade), an established zero -> a fully darkened region, and
+usage above the reservation -> clamped to it. `topBarCells` derives the split
+boundary from the same absolute-offset mapping as the region's own edges and
+paints `[start,shadedFrom)` bright and `[shadedFrom,end)` in
+`topShadeColour(colour)` — a 45% darkening of the slot colour that returns ""
+for anything it cannot parse, which makes an undarkenable colour draw undivided
+rather than invisibly "split".
+
+Beyond the ticket, one addition from dogfooding: the summary line carries
+`(bright = in use, dark = reserved and idle)`, and only when a split is actually
+drawn. A two-tone bar with no key is not readable, and a key beside an undivided
+bar would describe something that is not on screen.
+
+### Known gap, recorded not hidden
+
+`SupervisorPID` is decoded from the scope DIRECTORY NAME, so between a
+supervisor's death and the orphan reaper's sweep a reused PID could carry an
+unrelated process's argv. That is exactly the trust level the PID column beside
+it already has, and which `killConfine`'s pid selector already accepts; COMMAND
+inherits it, widens nothing, and participates in no decision. Documented on the
+field.
+
+### Verification
+
+Viewmodel-level tests only (AIRA-127's convention; no golden screenshots).
+Every new test was checked non-porous by REVERTING the behaviour it pins —
+no-`--`-split, split-at-last-`--`, fabricated command on read failure, silent
+elision, dropped pending "command", the old column set, unclamped used-span,
+nil-RSS-as-zero, cells ignoring the split, cells shading the whole region,
+shade == bright colour, a shaded non-scope region, an unescaped command cell,
+and an unconditional shade legend. Each mutation failed the suite.
+
+Dogfooded against real confined jobs through a real pty (tmux, 190 cols): the
+new columns render, COMMAND is read live from /proc and split at `--`, an argv
+containing newlines renders escaped, and the bar's per-slot regions paint the
+bright/dark split at exactly the computed column boundaries.
+
