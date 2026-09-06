@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -64,5 +65,58 @@ func TestAitestBootstrapRefusesARelativeOuterScope(t *testing.T) {
 	}
 	if _, err := os.Stat("relative"); err == nil {
 		t.Fatal("a relative coordinate was resolved against the working directory")
+	}
+}
+
+// verifies: AIRA-123
+//
+// In ci-shim mode the bootstrap verb SUCCEEDS with the ledger-only grade instead
+// of failing, and names no cgroup of any kind.
+//
+// AIRA-121 made this branch exit non-zero, which supervisor.py answers by
+// calling _disable_daemon and running the whole suite on its ungoverned
+// bare-fork pool. That is the behaviour this ticket replaces, and this test
+// fails against it on the exit code alone.
+//
+// The three absences are the honesty half: no `supervisor_scope` (there is no
+// such cgroup, and emitting one would have _cleanup_supervisor_scope rmdir an
+// invented path), an `outer=` that is the sentinel rather than any path, and
+// `admission=ledger-only` rather than silence — which the supervisor requires,
+// since a bootstrap that states no grade is refused as out of lockstep.
+func TestAitestBootstrapInShimModeReportsLedgerOnlyAdmission(t *testing.T) {
+	record := filepath.Join(t.TempDir(), "install-mode.json")
+	if err := runner.WriteInstallModeRecord(record, runner.InstallModeRecord{
+		Schema: 1, Mode: runner.ConfineModeShim, UID: os.Getuid(),
+		ShimBudgetBytes: 4 << 30, ShimBudgetSource: runner.ShimBudgetSourceDeclared,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(runner.InstallModeFileEnv, record)
+	runner.ResetConfineModeCacheForTest()
+	t.Cleanup(runner.ResetConfineModeCacheForTest)
+
+	var stdout, stderr bytes.Buffer
+	if exit := runAitestBootstrapCommand(context.Background(), map[string]string{"supervisor-pid": "1"}, &stdout, &stderr); exit != 0 {
+		t.Fatalf("exit=%d stderr=%q; ci-shim bootstrap must SUCCEED, because ledger-only worker admission functions here — failing drops the whole suite to the ungoverned fallback pool",
+			exit, stderr.String())
+	}
+	fields := map[string]string{}
+	for _, token := range strings.Fields(stdout.String()) {
+		key, value, ok := strings.Cut(token, "=")
+		if ok {
+			fields[key] = value
+		}
+	}
+	if fields["outer"] != runner.ShimConfineSlice {
+		t.Fatalf("outer=%q, want the ci-shim sentinel %q; anything path-shaped would be read as a cgroup", fields["outer"], runner.ShimConfineSlice)
+	}
+	if fields["admission"] != runner.AitestAdmissionLedgerOnly {
+		t.Fatalf("admission=%q, want %q", fields["admission"], runner.AitestAdmissionLedgerOnly)
+	}
+	if scope, present := fields["supervisor_scope"]; present {
+		t.Fatalf("supervisor_scope=%q; there is no supervisor cgroup in ci-shim mode and naming one would have the supervisor rmdir an invented path", scope)
+	}
+	if !strings.Contains(stderr.String(), "LEDGER-ONLY") {
+		t.Fatalf("stderr=%q must say once that this run's governance is admission-only", stderr.String())
 	}
 }

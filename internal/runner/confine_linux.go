@@ -1072,12 +1072,12 @@ func confineWithDeps(ctx context.Context, request ConfineRequest, deps confineDe
 		}
 	}
 	cmd.Env = pylib.AppendConfineChildEnvironment(confineEnvironment(request.Env), scopeID)
-	// AIRA-121 requirement 7: AitestBackendCanFunction is THE one gate on
-	// publishing the AIRA_AITEST_* coordinates. It is trivially true on this
-	// (real) path -- the shim path never reaches here -- and is called anyway so
-	// that the gate has exactly one name and one home, which is the single line
-	// AIRA-123 flips.
-	if request.DelegateRAM && AitestBackendCanFunction(ConfineModeReal) {
+	// AIRA-121 requirement 7, as AIRA-123 settled it: AitestBackendCanFunction is
+	// THE one gate on publishing the AIRA_AITEST_* coordinates, and it now also
+	// names the backend. It is trivially true on this (real) path -- the shim
+	// path never reaches here -- and is called anyway so that the gate has
+	// exactly one name and one home.
+	if _, backendOK := AitestBackendCanFunction(ConfineModeReal); request.DelegateRAM && backendOK {
 		// aitest is only meaningful for a delegate-RAM launch (worker-admit
 		// grants nested sub-scopes under THIS job's own outer scope); every
 		// other launch gets no aitest coordinates at all, mirroring

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -238,19 +239,46 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	}
 	defer drainStderr(0)
 	cmd.Env = pylib.AppendConfineChildEnvironment(confineEnvironment(request.Env), "")
-	// Requirement 7, INTERIM. AitestBackendCanFunction is the ONE gate, and in
-	// shim mode it is false for BOTH the delegate and non-delegate arms, so the
-	// child's environment is actively STRIPPED of any inherited AIRA_AITEST_*
-	// rather than merely not given new ones. That distinction is load-bearing: a
-	// shim confine nested inside some outer aitest-enabled process must not
-	// inherit a live AIRA_AITEST_LIB pointing at an extraction directory, which
-	// is precisely the stale-coordinate resurrection the unconditional strip on
-	// the real path's else-arm was added to prevent.
+	// Requirement 7, AS AIRA-123 SETTLED IT. AitestBackendCanFunction is still
+	// the ONE gate, and it is now TRUE in shim mode: worker-admit makes a real
+	// ledger-only admission decision here (advisory, no cgroup, no kill
+	// backstop), so a --delegate-ram launch DOES publish the AIRA_AITEST_*
+	// coordinates and a consumer's guarded conftest.py activates aitest. The
+	// alternative it replaced -- withholding them and falling through to plain
+	// pytest-xdist -- makes per-worker RAM invisible to everything and prevents
+	// no over-subscription at all.
+	//
+	// AIRA_AITEST_OUTER_SCOPE is deliberately NOT published (the empty argument):
+	// there is no outer cgroup scope to hand down, and the shim bootstrap branch
+	// answers with the ci-shim sentinel of its own accord rather than trusting an
+	// inherited coordinate. Publishing an invented one would be the first place
+	// this mode pretended to have a cgroup.
+	//
+	// The non-delegate arm keeps AIRA-121's active STRIP, and that is unchanged
+	// and still load-bearing: a shim confine nested inside some outer
+	// aitest-enabled process must not inherit a live AIRA_AITEST_LIB pointing at
+	// an extraction directory, which is the stale-coordinate resurrection the
+	// real path's else-arm exists to prevent.
 	//
 	// AIRA_CONFINE_SCOPE_ID is likewise not published (AppendConfineChildEnvironment
 	// is given ""), so InheritedConfineScopeID finds nothing and confine-reserve
 	// sub-reservations correctly do not attach to a scope that does not exist.
-	cmd.Env = pylib.StripAitestEnvironment(cmd.Env)
+	shimAitestBackend, shimAitestBackendOK := AitestBackendCanFunction(ConfineModeShim)
+	if request.DelegateRAM && shimAitestBackendOK {
+		aitestCommand := self
+		if executable, executableErr := filepath.EvalSymlinks(self); executableErr == nil {
+			aitestCommand = executable
+		}
+		cmd.Env = pylib.AppendAitestChildEnvironment(cmd.Env, request.RuntimeDir, diagnostics, aitestCommand, "")
+		// Said on the launch that is affected, not only in a daemon log. The
+		// whole risk AIRA-121 named -- a suite running under an apparent
+		// governance mechanism, "invisible until something OOMs" -- is closed by
+		// the grant-line containment token plus this one line at launch, and it
+		// costs one line per delegate-ram job.
+		_, _ = fmt.Fprintf(diagnostics, "confine: aitest per-worker admission is %s (ci-shim): workers are admitted against the container RAM budget, but there is no cgroup sub-scope, no memory.max and no kill backstop\n", shimAitestBackend)
+	} else {
+		cmd.Env = pylib.StripAitestEnvironment(cmd.Env)
+	}
 	if request.Exclusive {
 		// Unreachable in practice -- admitConnection refuses --exclusive in shim
 		// mode before the request is queued -- but the token is stamped for the

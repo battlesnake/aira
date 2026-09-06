@@ -343,7 +343,7 @@ func TestRequestWorkerAdmitClassifiesEndToEnd(t *testing.T) {
 		data, _ := json.Marshal(workerAdmitGrant{
 			State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted,
 			WorkerID: "3", ScopePath: "/outer/.aira-worker-3", MemoryMax: 400,
-			SwapCap: WorkerAdmitSwapCapEnforced,
+			SwapCap: WorkerAdmitSwapCapEnforced, Containment: WorkerAdmitContainmentEnforced,
 		})
 		socket := serveOneWorkerAdmit(t, func() runnerAdmitResponseFrame {
 			return runnerAdmitResponseFrame{OK: true, Code: "OK", Data: data}
@@ -369,7 +369,7 @@ func TestRequestWorkerAdmitClassifiesEndToEnd(t *testing.T) {
 	t.Run("a grant carrying the retired memory_high key is still usable", func(t *testing.T) {
 		raw := []byte(`{"state":"granted","class":"granted","worker_id":"4",` +
 			`"scope_path":"/outer/.aira-worker-4","memory_max":400,"memory_high":320,` +
-			`"swap_cap":"enforced"}`)
+			`"swap_cap":"enforced","containment":"enforced"}`)
 		socket := serveOneWorkerAdmit(t, func() runnerAdmitResponseFrame {
 			return runnerAdmitResponseFrame{OK: true, Code: "OK", Data: raw}
 		})

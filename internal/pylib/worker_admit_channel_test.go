@@ -88,6 +88,41 @@ func TestWorkerAdmitOutcomeVocabularyMatchesTheSupervisor(t *testing.T) {
 	if !slices.Equal(goClasses, pyClasses) {
 		t.Fatalf("class catalogues differ:\n  go:     %v\n  python: %v", goClasses, pyClasses)
 	}
+
+	// AIRA-123. The containment grade and the admission-backend grade are two
+	// more duplicated vocabularies, and they are the two whose drift would be
+	// WORST: a grade the supervisor does not recognise is refused as a contract
+	// violation, so a value added on one side alone turns every grant from that
+	// daemon into a dead suite. Pinned here for the same reason and by the same
+	// mechanism as the two above.
+	goContainments := runner.WorkerAdmitContainments()
+	pyContainments := pythonSetLiteral(t, source, "_OUTCOME_CONTAINMENTS")
+	if !slices.Equal(goContainments, pyContainments) {
+		t.Fatalf("containment catalogues differ:\n  go:     %v\n  python: %v", goContainments, pyContainments)
+	}
+
+	goAdmission := runner.AitestAdmissionGrades()
+	pyAdmission := pythonSetLiteral(t, source, "_ADMISSION_GRADES")
+	if !slices.Equal(goAdmission, pyAdmission) {
+		t.Fatalf("admission-backend catalogues differ:\n  go:     %v\n  python: %v", goAdmission, pyAdmission)
+	}
+
+	// And the MAPPING between them, which is a third thing that can drift
+	// independently of either catalogue: a supervisor that paired `advisory`
+	// with the sub-scope backend would accept an admission-only grant into a run
+	// that believed it was contained.
+	for _, containment := range goContainments {
+		backend, ok := runner.AitestAdmissionForContainment(containment)
+		if !ok {
+			t.Fatalf("Go maps no backend to containment %q", containment)
+		}
+		pair := fmt.Sprintf("%q: _ADMISSION_%s", containment, map[string]string{
+			runner.AitestAdmissionSubScope: "SUB_SCOPE", runner.AitestAdmissionLedgerOnly: "LEDGER_ONLY",
+		}[backend])
+		if !strings.Contains(source, pair) {
+			t.Errorf("supervisor.py's _ADMISSION_FOR_CONTAINMENT does not map %s", pair)
+		}
+	}
 }
 
 // TestSupervisorClassifiesWorkerAdmitByEnumNotBySubstring is the mechanical

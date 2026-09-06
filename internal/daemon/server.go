@@ -160,8 +160,12 @@ type Server struct {
 	// in shim mode. Both are resolved once, in Serve, from the durable
 	// install-mode record (see resolveDaemonConfineMode) so that EVERY daemon
 	// launch path in a shim-installed home yields a shim daemon.
-	confineMode              string
-	shimBudget               shimBudget
+	confineMode string
+	shimBudget  shimBudget
+	// AIRA-123. The ci-shim per-WORKER admission ledger (worker_admit_shim.go).
+	// Distinct from shimBudget, which is the container-wide ceiling both this
+	// ledger and ordinary job admission draw against.
+	shimWorkers              shimWorkerLedger
 	admitConfineScanInterval time.Duration
 	// shimReadMemTotal / shimReadMemAvailable are readShimMemory's host-wide
 	// /proc/meminfo seams (AIRA-121 F3). Nil in production, which resolves to

@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-123","project":"aira","title":"aitest worker-admit: degrade to ledger-only admission when no cgroup sub-scope is available","status":"planned","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","aitest","ci"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-123","project":"aira","title":"aitest worker-admit: degrade to ledger-only admission when no cgroup sub-scope is available","status":"in-review","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","aitest","ci"],"hold":false,"relations":[]}
 ---
 Requested by the owner via peer session 'deploy', 2026-09-06, correcting AIRA-121's
 requirement 7 before it was built.
@@ -71,3 +71,89 @@ the correct INTERIM behaviour (a broken backend -- today's cgroup-requiring
 worker-admit with no cgroup -- is worse than plain xdist), but is a deliberate
 DEFERRAL pending this ticket, not the intended end state. Do not let a future
 reader treat requirement 7 as case-closed.
+
+## Resolution (in-review)
+
+Built on `aira121-ci-shim-mode` (PR #72), which is where ci-shim mode and the
+job-level ledger live and which is NOT yet on master; this branch is stacked on
+it. Plan:
+`docs/superpowers/plans/2026-09-06-aira123-worker-admit-ledger-only-plan.md`.
+
+### What was built, against each requirement
+
+**Degraded worker-admit** (`internal/daemon/worker_admit_shim.go`). In ci-shim
+mode `evaluateWorkerAdmit` delegates to `evaluateShimWorkerAdmit`, which makes a
+real admit-or-wait decision and creates/names NO cgroup: the container's live
+usage comes through AIRA-121's existing `readShimMemory` seam, and an in-daemon
+`shimWorkerLedger` sums currently-admitted workers' DECLARED needs against
+`budget − headroom`. The live-usage check and the ledger check are separate, not
+summed (they overlap, and summing would double-charge every settled worker) —
+the same split the real path makes. The check and the booking happen under one
+lock hold, so two concurrent requests cannot both grant against the same
+pre-booking sum. The ledger is container-wide, not per job: one container, one
+budget. Every verdict class mirrors the real evaluator's, so an unreadable
+ledger is retriable (`ledger-budget-unreadable`, contended), a full ledger is
+retriable (`ledger-budget-exceeded`, contended) and an impossible request is
+terminal-but-daemon-healthy (`exceeds-ceiling`, request-invalid).
+
+**Caller side** (`supervisor.py`, `worker.py`). `aitest-bootstrap` now SUCCEEDS
+in shim mode, reporting `outer=ci-shim admission=ledger-only` and no
+supervisor_scope. `fork_worker(None)` skips `place_self`; `spawn_worker` skips
+the placement ack for a scope-less grant (the ack exists to PROVE a cgroup join
+— with no cgroup there is nothing to prove, and reusing its failure path would
+produce `WorkerPlacementFailed`, i.e. "the local cgroup mechanism is broken",
+a diagnosis this mode cannot support); `_should_recycle` already skipped the
+watermark for a None scope and still applies time/test-count recycling.
+Admission, the relay lease, retirement and dispatch are otherwise unchanged —
+which is exactly the difference from the daemon-down fallback pool, which is
+also UNGOVERNED.
+
+**Honesty requirement.** A required `containment` token now rides every granted
+line in both grades, and it decides which other keys are required AND FORBIDDEN:
+an enforced grant carries `scope`+`memory_max` and no `reserved`; an advisory one
+carries `reserved` and NO `scope`, NO `memory_max` (absent, not zeroed — a zero
+would be a value, and every consumer tests `scope` for presence). One shared
+validator, `workerAdmitGrantShapeProblem`, is called by the renderer, the parser
+and the client, so producer and consumer cannot drift. An absent grade is a
+contract violation, never a default — absence must not read as the strong claim.
+The values reuse `aira confine`'s own `enforced` /
+`advisory(ci-shim,no-cgroup,no-kill-backstop)` strings so an operator reads one
+vocabulary. `aitest-bootstrap` states `admission=` on BOTH paths, and
+supervisor.py refuses a grant whose grade disagrees with the backend the run
+bootstrapped into, in both directions, so containment cannot be silently
+downgraded mid-suite; a supervisor that has not bootstrapped expects the ENFORCED
+backend, which is the fail-closed default. Ledger-only grants report
+`cpu_slots=unevaluated` (the CPU gate counts populated worker cgroups, which
+cannot exist here) and the suite prints one LEDGER-ONLY warning on its own
+stderr.
+
+**Mode agreement.** `outer_scope` is the ci-shim sentinel exactly when the CLIENT
+resolved shim mode; a mismatch in either direction is refused terminally
+(`confine-mode-mismatch`, admission-unusable), because waiting cannot make two
+durable install-mode records agree.
+
+**AIRA-121 requirement 7 updated** (in this commit): the rule becomes
+"export when the backend can function", the condition is met, and
+`AitestBackendCanFunction(mode) (backend, ok)` — still the one gate, one home —
+is true for ci-shim. `AIRA_AITEST_OUTER_SCOPE` is deliberately still not
+published; the non-delegate arm keeps its unconditional strip. Ticket test (f) is
+inverted and still proves itself from the actual child environment.
+
+### What is deliberately NOT bought, recorded rather than hidden
+
+- No kill backstop, no memory-watermark recycling: a ledger-only worker that
+  grows past what it declared is not killed and not recycled. The container's own
+  OOM killer is what is left. Right on a single-tenant CI runner, wrong on a
+  shared desktop, which is why it is reachable only in ci-shim mode.
+- The lease is the CONNECTION, unlike the real path's cgroup-backed ledger
+  (AIRA-41 moved deliberately away from connection scoping). There is no cgroup
+  to charge and the daemon never learns the forked worker's pid, so a killed
+  relay frees its booking early. Bounded by the live-usage term, which still sees
+  the un-booked worker's RSS on the next admission.
+- The ledger does not survive a daemon restart. Same mitigation; weaker than
+  AIRA-74's real-path reconstruction, which had `memory.max` values to
+  reconstruct from.
+- No per-worker CPU governance in shim mode (structurally needs worker cgroups);
+  reported `unevaluated`, never as a pass.
+- Sizing aitest's `auto` worker count from the shim ledger stays deferred
+  (AIRA-121 requirement 5's own noted follow-up).

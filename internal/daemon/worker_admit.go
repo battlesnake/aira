@@ -52,6 +52,16 @@ type WorkerAdmitResponse struct {
 	WorkerID  string `json:"worker_id,omitempty"`
 	ScopePath string `json:"scope_path,omitempty"`
 	MemoryMax int64  `json:"memory_max,omitempty"`
+	// Containment (AIRA-123) is runner.WorkerAdmitContainmentEnforced or
+	// ...Advisory, and is REQUIRED on every granted response. It is what stops an
+	// admission-only grant ever being readable as a kernel-enforced one: the
+	// outcome renderer and the client both refuse a grant without it, and refuse
+	// one whose other fields contradict it.
+	Containment string `json:"containment,omitempty"`
+	// Reserved (AIRA-123) is the ADVISORY grant's booked reservation in bytes.
+	// Positive exactly on an advisory grant; on an enforced one memory_max is
+	// both the booking and the bound and a second number could only disagree.
+	Reserved int64 `json:"reserved,omitempty"`
 	// SwapCap (AIRA-35) reports whether this worker's swap could actually be
 	// bounded. It replaced memory_high, which named a memory.high write
 	// AIRA-35 stopped doing (runner.CreateWorkerScope carries the measured
@@ -67,6 +77,11 @@ type WorkerAdmitResponse struct {
 	// subsystem ships operationally inert, which this project has done once
 	// already. It is diagnostic: nothing branches on it.
 	CPUSlots string `json:"cpu_slots,omitempty"`
+	// leaseID is UNEXPORTED and never crosses the wire: it is the shim ledger's
+	// booking id, carried from the evaluator to the connection handler that must
+	// release it when the peer disconnects. Zero on every non-shim response and
+	// on every non-grant.
+	leaseID uint64
 }
 
 type workerAdmitRequest struct {
@@ -437,28 +452,39 @@ func readWorkerSupervisorMemory(path string) (current, reclaimable int64, ok boo
 // stopping while queued on the outer scope's lock — the caller returns without
 // writing anything, mirroring workerAdmitConnection's own peer-gone paths.
 func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest) (WorkerAdmitResponse, bool) {
-	// AIRA-121 gate condition C1. FIRST, before every other gate: in ci-shim mode
-	// there is no outer cgroup scope, so there is nothing to nest a worker
-	// sub-scope inside and no reading of one to gate on.
+	// AIRA-121 gate condition C1, as AIRA-123 rebuilt it. FIRST, before every
+	// other gate: in ci-shim mode there is no outer cgroup scope, so every gate
+	// below — which without exception reads, sums or creates one — is
+	// inapplicable rather than merely unlucky.
 	//
-	// The answer is state=UNAVAILABLE / class=ADMISSION-UNUSABLE, and the choice
-	// of both is load-bearing. The plan proposed state=unevaluated; that carries
-	// class=contended, which supervisor.py maps to the RETRIABLE WorkerAdmitDenied
-	// and _wait_for_admission_or_disable retries indefinitely against a daemon
-	// that is reachable and will never grant -- i.e. the suite would HANG rather
-	// than fall back. This pair maps to WorkerAdmitUnavailable, which fires
-	// _disable_daemon exactly once and runs the whole suite on the bare-fork pool
-	// with one honest warning.
+	// AIRA-121 answered UNAVAILABLE here, which was the honest answer while
+	// worker-admit could only mean "nest an enforced sub-scope". AIRA-123 splits
+	// enforcement from admission, so the honest answer is now a real ADMISSION
+	// decision made against the shim ledger, reported as advisory. See
+	// worker_admit_shim.go for what that does and does not buy.
 	//
-	// AIRA-123 is what turns this into a ledger-only advisory GRANT; until then
-	// the honest answer is that this backend cannot function here.
-	if s.shimMode() {
+	// THE MODE AGREEMENT CHECK, both directions. The client's outer_scope is the
+	// shim sentinel exactly when the CLIENT resolved shim mode, and an absolute
+	// cgroup path exactly when it resolved real mode. A disagreement means two
+	// processes read different install-mode records, and neither branch below is
+	// safe to run on the other's request: a real-mode request evaluated by the
+	// shim ledger would be admitted with no cgroup while its supervisor tried to
+	// place workers into one, and the shim sentinel down the real path would be
+	// read as a cgroup path and fail somewhere far less legible. Terminal
+	// (admission-unusable) rather than retriable, because waiting cannot make two
+	// records agree.
+	shim := s.shimMode()
+	if shim != (req.outerScope == runner.ShimConfineSlice) {
+		detail := "this daemon is in " + s.confineModeName() + " mode and the client asked about outer scope " + req.outerScope
 		return WorkerAdmitResponse{
 			State:  runner.WorkerAdmitStateUnavailable,
 			Class:  runner.WorkerAdmitClassAdmissionUnusable,
-			Reason: runner.WorkerAdmitReasonCIShimNoSubScope,
-			Detail: "ci-shim mode has no cgroup scope to nest a worker sub-scope under",
+			Reason: runner.WorkerAdmitReasonConfineModeMismatch,
+			Detail: detail,
 		}, true
+	}
+	if shim {
+		return s.evaluateShimWorkerAdmit(ctx, req)
 	}
 	// AIRA-101, the slice-exclusivity gate. FIRST, before any cgroupfs read and
 	// before both the outer-scope lock and the CPU-slots gate: it is a pure
@@ -827,6 +853,11 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 		WorkerID: workerID, ScopePath: scopePath,
 		MemoryMax: req.estimatedBytes, SwapCap: swapCap,
 		CPUSlots: cpuState,
+		// AIRA-123: stated positively on the real path too, not only on the
+		// degraded one. A grade that were present only when weak would make its
+		// ABSENCE the claim of strength, which is precisely the reading this
+		// field exists to make impossible.
+		Containment: runner.WorkerAdmitContainmentEnforced,
 	}, true
 }
 
@@ -861,10 +892,19 @@ func validateWorkerAdmitArgs(args map[string]any, waitCeilingMs int64) (workerAd
 	// daemon creates (found by Sol plan-review). A relative path is refused
 	// rather than resolved against the daemon's own working directory, which
 	// would silently name a different cgroup than the client meant.
-	if !filepath.IsAbs(req.outerScope) {
-		return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit outer_scope must be an absolute cgroup path, got %q", CodeProtocol, req.outerScope)
+	//
+	// AIRA-123: the ci-shim SENTINEL is the one accepted non-path value. It is
+	// not a cgroup path and must never be cleaned into one, so it short-circuits
+	// both the absolute-path rule and filepath.Clean. Whether it is the RIGHT
+	// value for this daemon is not decided here — evaluateWorkerAdmit's mode
+	// agreement check owns that, so the answer is a catalogued outcome class
+	// rather than a protocol error the client can only report as prose.
+	if req.outerScope != runner.ShimConfineSlice {
+		if !filepath.IsAbs(req.outerScope) {
+			return workerAdmitRequest{}, fmt.Errorf("%s: worker-admit outer_scope must be an absolute cgroup path or the ci-shim sentinel %q, got %q", CodeProtocol, runner.ShimConfineSlice, req.outerScope)
+		}
+		req.outerScope = filepath.Clean(req.outerScope)
 	}
-	req.outerScope = filepath.Clean(req.outerScope)
 	if req.signature, err = str("signature", false); err != nil {
 		return workerAdmitRequest{}, err
 	}
@@ -1029,6 +1069,24 @@ func (s *Server) workerAdmitConnection(conn net.Conn, args map[string]any) {
 	// admit clock seam (rather than time.Now) so its observed wait is both
 	// consistent with deadline handling and deterministic in tests.
 	response.WaitedMS = elapsedMilliseconds(start, s.admitNowTime())
+	// AIRA-123. The shim ledger's booking is released when this handler returns,
+	// which covers every exit path BELOW: the response write failing, the client
+	// closing its side, the daemon stopping.
+	//
+	// Nothing above can leak a booking, and the reason is structural rather than
+	// a promise: evaluateShimWorkerAdmit books ONLY on a grant, and a granted
+	// response breaks the poll loop immediately, so the only statement between
+	// the booking and this defer is the WaitedMS assignment above. Every other
+	// loop exit (a denied verdict, a peer that vanished, a stopping daemon)
+	// carries leaseID zero because it never booked.
+	//
+	// See worker_admit_shim.go's "THE LEASE IS THE CONNECTION" note for why in
+	// shim mode and why that is weaker than the real path's cgroup-backed ledger:
+	// this is not the AIRA-41 mistake being reintroduced, it is the only lifetime
+	// signal that exists when there is no cgroup to charge.
+	if response.leaseID != 0 {
+		defer s.releaseShimWorkerLease(response.leaseID)
+	}
 
 	// There is NO ledger release here any more, on any exit path, and that is
 	// deliberate (AIRA-41). The ledger charges the SCOPE, not this connection,

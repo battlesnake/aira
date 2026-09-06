@@ -201,23 +201,43 @@ const (
 	ConfineContainmentUnevaluated ConfineContainment = "unevaluated"
 )
 
-// AitestBackendCanFunction reports whether aitest's per-worker RAM containment
-// backend can actually work for a launch in this mode. It is the ONE gate on
-// publishing the AIRA_AITEST_* coordinates to a child.
+// AitestBackendCanFunction reports whether aitest's per-worker RAM admission
+// backend can work for a launch in this mode, and NAMES the backend that would
+// serve it. It is the ONE gate on publishing the AIRA_AITEST_* coordinates to a
+// child, and the returned grade is what the launch DIAGNOSTIC then states.
 //
 // A consumer's conftest.py uses the PRESENCE of AIRA_AITEST_LIB alone as the
-// guard that activates the aitest plugin. So exporting it where worker-admit
-// cannot place a worker in a nested cgroup sub-scope would activate aitest,
-// aitest would attempt per-worker cgroup admission that structurally cannot
-// succeed, and a heavy suite would run under an apparent governance mechanism
-// with no backstop -- "invisible until something OOMs".
+// guard that activates the aitest plugin. AIRA-121 therefore withheld it in
+// ci-shim mode: worker-admit could only mean "nest a kernel-enforced cgroup
+// sub-scope", nothing could nest one there, and a heavy suite would have run
+// under an apparent governance mechanism with no backstop -- "invisible until
+// something OOMs".
 //
-// INTERIM, by explicit ticket decision (AIRA-121 requirement 7). AIRA-123
-// extends worker-admit to a degraded ledger-only admission mode with no cgroup
-// sub-scope, honestly reported as advisory. When it lands, THIS FUNCTION is what
-// changes -- the rule becomes "export if the degraded backend can work in this
-// mode", not a flat never. Nothing else at either call site moves.
-func AitestBackendCanFunction(mode string) bool { return mode != ConfineModeShim }
+// AIRA-123 changed the fact that reasoning rested on, so the rule changes with
+// it. worker-admit now makes a real ADMISSION decision in ci-shim mode against
+// the in-daemon RAM-budget ledger -- no cgroup, no memory.max, no kill backstop,
+// and reported as `advisory(ci-shim,no-cgroup,no-kill-backstop)` on every single
+// grant. That is genuinely weaker than the real path, and it is genuinely better
+// than the alternative it replaced: withholding the variable falls the consumer
+// through to plain pytest-xdist, where per-worker RAM is invisible to everything
+// and nothing prevents over-subscription at all -- this project's own AIRA-11
+// incident class (a parallel leg observed peaking ~35 GiB RSS with no per-test
+// awareness). The rule is therefore CONDITIONAL, never a flat never: export when
+// the backend can actually function, and say which backend it is.
+//
+// An unrecognised mode reports false. That is the fail-closed direction and the
+// reason this returns a pair rather than a bare true: a future mode gets no
+// coordinates until someone decides which backend serves it.
+func AitestBackendCanFunction(mode string) (string, bool) {
+	switch mode {
+	case ConfineModeReal:
+		return AitestAdmissionSubScope, true
+	case ConfineModeShim:
+		return AitestAdmissionLedgerOnly, true
+	default:
+		return "", false
+	}
+}
 
 // ConfineStatus keeps the independently verified cap, admission, placement,
 // OOM-group, and priority facets separate. In particular, a successful
