@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-29","project":"aira","title":"Dynamic reserve: charge admission by live memory.current + headroom (track-actual), fill the slice to real capacity","status":"planned","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","oom","scheduler","shared-slice","utilisation"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-29","project":"aira","title":"Dynamic reserve: charge admission by live memory.current + headroom (track-actual), fill the slice to real capacity","status":"in-review","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","confine","oom","scheduler","shared-slice","utilisation"],"hold":false,"relations":[]}
 ---
 Owner pivot 2026-09-01 (utilisation): the reservation model over-provisions and wastes the machine. MEASURED LIVE: a non-delegate `aira confine -- make merge-gate` reserved 33.6G (reserve-basis=estimate:p90-prior, airtight) while using 2.6G RSS for 62min; slice ledger 39.4G granted / 63.2G ceiling while physical aira.slice memory.current was only 15.4G/64G — so admission blocks new jobs though ~48G RAM + most CPU sit idle (FASTEST_XDIST_WORKERS=8 → 8/16 cores → "half busy, half idle"). ROOT: admission reserves the ESTIMATED PEAK and holds it for the whole job LIFETIME; peaks are brief + rarely coincide, so the ledger saturates long before physical RAM does.
 
@@ -16,3 +16,140 @@ SUPERSEDES AIRA-28 Approach A (airtight whole-suite charge — built on branch a
 **Fresh live confirmation, non-delegate class (peer session `deploy`, 2026-09-04).** `aira confine -- make merge-gate` requesting a 4G reserve sat queued 28+ minutes (`freeze yield`, not stuck-freeze — genuinely didn't fit) while `systemctl --user show aira.slice` showed ~42-44GB used of a 64GiB cap (~20GB apparent headroom) the whole time. Live `aira confine --list` at the time: `slice reserve: 64579878092 granted / 63168M ceiling across 4 admitted jobs` — ledger headroom ~1.5GiB, insufficient for the 4G request, even though real aggregate RSS was only ~41.5GB. Root-caused live, not inferred: two other legitimate (not test fixtures, not orphaned) `aira confine -- make merge-gate` jobs, each ~1h15m+ old, each held a **27,994,968,064-byte (~26GiB) CAP**, but each was only actually using ~19-21GiB RSS — the ledger charges the full CAP per job, not live usage, so ~10GiB of real headroom across those two jobs alone was invisible to admission the whole time. Textbook instance of this ticket's own problem statement, this time with the starved waiter being an outer confine job rather than aitest-internal, and with `deploy` correctly distinguishing it from a wedged daemon by checking `MemoryCurrent` against the slice cap directly before asking.
 
 **Owner decision, AIRA-91 Part B (2026-09-05): the oomd backstop stays as configured, is never to be weakened or told to avoid `aira.slice`** — "it's there for if Aira fails in its duty." That makes this ticket's track-actual direction the load-bearing fix for AIRA-91 Part B too, not just a utilisation nicety: an inaccurately-sized (over-provisioned) grant is exactly what forces a job into sustained `memory.high` reclaim, which is what generates the PSI pressure that trips the oomd backstop in the first place. Full reasoning and constraint recorded on AIRA-91. This does not lift the ON-HOLD status below on its own — the banked v3 plan predates aitest and AIRA-39/41/63's now-landed real-cgroup-tree ledger, and needs re-validating against the current layout before it can be built, not resumed verbatim.
+
+## Resolution
+
+**Built and merged 2026-09-06.** Branch `aira29-dynamic-reserve-v2` off master `f1f699a`.
+Plan: `docs/superpowers/specs/2026-09-06-aira29-dynamic-reserve-plan.md` (v8) — re-based
+from scratch on current source, **superseding the banked v3** (`aira29-dynamic-reserve` @
+`388cfb0`) rather than resuming it: v3's §3.5 per-scope `memory.high` re-writer is
+owner-foreclosed, and its cited line numbers were stale.
+
+### What was built
+
+The admission ledger charges each confine scope its LIVE hierarchical `memory.current` plus
+a margin, refreshed inside `evaluateAdmitQueue`'s existing `<=1s` `ListConfines` scan and
+under the lock it already takes. **No new locks, no new daemon subsystem, no new loop, and
+no `memory.high` written anywhere.**
+
+- `admitWaiter.ledgerCharge()` is the single quantity every ledger site uses — the grant's
+  add, the release's subtract, the scan's delta, and `confine --list`'s three sums — so
+  `outstanding == Σ ledgerCharge` is one statement about one function rather than an
+  agreement between six call sites. It returns the frozen `reserve` until a usable scan
+  reading replaces it, which makes a granted-but-uncharged waiter *unrepresentable* rather
+  than merely avoided.
+- `applyChargeDelta` REFUSES an overflowing increase instead of saturating; a saturating
+  clamp breaks conservation permanently and drives the ledger negative on later releases.
+  It is deliberately not floored at zero, so `residualBytes()` still exposes a lost
+  decrement.
+- Charge = `min(cap, max(trackedRatchet, coldFloor))` where `trackedRatchet` is a monotone
+  high-water mark of `min(cap, peakSoFar + margin)` and `margin = max(256 MiB, 12% of peak,
+  one interval's OBSERVED growth)`. The growth term is where the owner's ruling leaves the
+  growth race — at the ledger, not at a kernel throttle. The ratchet is what stops a bursty
+  job swinging the shared ledger by gigabytes every second.
+- A 90 s cold floor holds the full estimate for a job that has not allocated yet.
+- **One rule:** only a usable scan record may move a charge; anything else holds the last
+  established value. Deliberately NOT gated on leaf `Populated`, which reads 0 for a busy
+  aitest outer scope. `Cap` is treated as a three-way reading (nil / `"max"` / decimal).
+- A scope with live `confine-reserve` sub-reservations is excluded from dynamic charging —
+  its `memory.current` is hierarchical and already contains what the children charge
+  separately.
+- Post-restart adoption tracks actual for non-delegate orphans too, treating an
+  unestablished scope age as young; without it the win regressed on every daemon restart.
+- `AIRA_DAEMON_DYNAMIC_RESERVE=disabled` reverts the WHOLE change (live charge and adoption
+  margin) on a live daemon without a rebuild; an unrecognised value is refused at start.
+
+### Deliberately NOT built, with reasoning (each filed as its own ticket)
+
+- **AIRA-113** — dynamic per-scope `oom_score_adj` steering. The owner's named containment
+  (AIRA-27's deployed 500/800 class steering) already exists and is untouched; the proposed
+  trigger is near-inert inside the existing scan; catching its target population needs a new
+  faster-than-1s subsystem plus a recursive cgroup pid walker that does not exist. Recorded
+  there: restore-down IS permitted for a non-root daemon (probed), so the reason is
+  proportionality, not permission.
+- **AIRA-114** — an aggregate `Σcap <= factor × ceiling` bound. The existing scan cannot
+  supply a correct cap total, and treating a locally-uncapped scope honestly would WEDGE the
+  shared slice.
+- **AIRA-115** (found here, pre-existing) — `confine-reserve` defaults its slice instead of
+  inheriting the parent's.
+- **AIRA-116** (found here, pre-existing) — no test proves `Serve` applies any parsed env
+  setting, for any of the four knobs.
+
+### Reviews
+
+**Plan gate — Sol, four rounds:** GATE-FAIL (2 P0 + 7 P1) → GATE-FAIL (5 P1) → GATE-FAIL
+(1 P1 + 1 P2) → **PASS**. It killed the over-subscription factor bound (the scan cannot
+supply `Σcap`), removed a `scopeCeiling` data race by making the plan read the scan record's
+own `Cap`, caught a saturating-`addClamp` conservation break, refuted an over-claimed
+inertness argument, and found four porous tests before any code was written. A second
+lineage (Gemini) then found the charge OSCILLATION — the growth term is non-monotone, so a
+bursty job would have swung the shared ledger every second — fixed by `trackedRatchet`.
+
+**Adversarial build review — Sol, against the landed code, two rounds:** BLOCK (2 P1 + 5
+P2) → BLOCK (1 P1 + 2 P2). Every finding was ground-checked against the source before
+acting. The load-bearing one: a scope's hierarchical `memory.current` was charged live while
+its `confine-reserve` children still charged their own reserves — a DOUBLE-BOOK that would
+have refused a healthy 4 G job with half the slice physically free, i.e. this ticket's own
+problem reintroduced by its fix. Three tests were confirmed porous and fixed, including the
+conservation test, which seeded granted waiters and so would have passed against a grant
+that marked a waiter tracked with a ZERO charge — exactly the grant-before-scope-creation
+under-charge. Full disposition of all rounds in §8/§8b/§8c/§9 of the plan.
+
+**Anti-inert evidence:** a real-cgroup test drives the PRODUCTION `runner.ListConfines` scan
+and `readSliceMemory` against a real allocating process in a real `.aira-CONFINE-*` scope,
+asserting both that the charge falls to the kernel's own `memory.current` + margin and that
+a queued waiter which did NOT fit before is admitted after. It was verified to FAIL against
+an inert build. Beyond that, an 18-mutant battery deliberately breaks every load-bearing
+behaviour; **18 of 18 caught, 0 survivors**. Two of those mutants exist only because the
+first battery run surfaced genuinely porous tests.
+
+### Exit codes (exact, on the merge candidate)
+
+| command | exit |
+|---|---|
+| `go build ./...` | 0 |
+| `go vet ./...` | 0 |
+| `go test ./...` (AIRA_REAL_CGROUP=1, all 14 packages) | 0 |
+| `go test -race ./internal/daemon/` excluding the three pre-existing `TestSliceCeilingRealCgroup*` failures (AIRA-117) | 0 |
+| `gofmt -l` over every non-vendor `.go` file (what `make ci`'s fmt-check runs) | 0, no files listed |
+| mutation battery (18 mutants) | 0 survivors |
+
+`go test -race ./internal/daemon/` INCLUDING those three exits 1, on
+`TestSliceCeilingRealCgroupSignalTracksRealAccounting`,
+`TestSliceCeilingRealCgroupNeverShrinksBelowRealUsage` and
+`TestSliceCeilingRealCgroupUsageBoundHarnessDetectsAViolation`, all with "helper did not
+acknowledge anon growth: <nil>".
+
+**Verified PRE-EXISTING AND NOT MINE, with a control rather than an assertion.** All three
+reproduce identically at `origin/master` `88d4cea` in a clean detached worktree, with and
+without `AIRA_REAL_CGROUP=1`; the same class reproduced at the original base `f1f699a`
+before the rebase. They PASS at that same master commit without `-race`, so it is a
+`-race`-only timing failure in the AIRA-106 sliceceiling helper handshake, of the AIRA-20
+wall-clock-tight class. Zero DATA RACE reports were emitted in any run.
+
+**Now tracked as AIRA-117**, filed independently by the AIRA-35 build from its own
+reproduction on pristine master — two sessions reached the same conclusion from different
+branches, which is about as good a control as this gets. Nothing further owed here.
+
+Stated precisely rather than as an alarm: `make race` fails on these three on any machine
+with real cgroup-v2 delegation — this box — on master as well as on this branch. GitHub CI
+would NOT catch it: `.github/workflows/ci.yml` runs `make race` but deliberately leaves
+`AIRA_REAL_CGROUP` unset and its runner has no delegation, so all three SKIP there. `make ci`
+(fmt-check, vet, build, test) is green either way, since `race` is a separate target. An
+earlier draft of this note said "make ci on master is red"; that was wrong and is corrected
+here.
+
+### Open design questions from the brief, as resolved
+
+- **Is the non-delegate confine class the right scope?** Both classes, not just
+  non-delegate. The formula is class-agnostic and the code path identical; excluding
+  delegate would have left the larger documented over-commit hole open. It does not
+  double-book against the AIRA-39/41/63 worker ledger (that accounts for children of the
+  outer scope against the outer scope's cap; this accounts for the outer scope against the
+  slice) — but it DID double-book against `confine-reserve` sub-reservations, which the
+  build review caught and which is now excluded explicitly.
+- **Slice-2 OOM steering — build it or scope it out?** Scoped out, reasoning above, filed as
+  AIRA-113. Confirmed at P2 by the plan gate: "dropping the factor is not P0... the design
+  is not left uncontained".
+- **The `memory.high` misconception.** Not repeated. Nothing writes `memory.high`, and
+  `worker_admit.go` (AIRA-35's territory) was not touched.

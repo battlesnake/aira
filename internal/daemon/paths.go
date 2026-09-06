@@ -267,6 +267,25 @@ func admitFreezeMaxHoldFromEnv() (time.Duration, error) {
 	return hold, nil
 }
 
+// dynamicReserveFromEnv reads the AIRA-29 kill switch. An unrecognised value is
+// REFUSED rather than silently substituted (the AIRA-58 rule): an operator
+// reaching for this is reverting an admission change on a shared machine under
+// load, and "I set it and quietly got the other behaviour" is the worst
+// possible outcome for exactly that person.
+func dynamicReserveFromEnv() (bool, error) {
+	value, set := os.LookupEnv("AIRA_DAEMON_DYNAMIC_RESERVE")
+	if !set || value == "" {
+		return true, nil
+	}
+	switch value {
+	case "enabled", "1":
+		return true, nil
+	case "disabled", "0":
+		return false, nil
+	}
+	return false, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_DYNAMIC_RESERVE must be enabled, disabled, 1 or 0")
+}
+
 func watchPollIntervalFromEnv() (time.Duration, error) {
 	value, set := os.LookupEnv("AIRA_DAEMON_WATCH_POLL_INTERVAL")
 	if !set || value == "" {
