@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-126","project":"aira","title":"Run timeout that fires against an already-empty scope publishes a kill intent it can never complete, leaving a non-terminal U_RUN_RECONCILE_REQUIRED record","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["flake","honesty","runner"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-131","to":"AIRA-126"}]}
+{"schema":1,"id":"AIRA-126","project":"aira","title":"Run timeout that fires against an already-empty scope publishes a kill intent it can never complete, leaving a non-terminal U_RUN_RECONCILE_REQUIRED record","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["flake","honesty","runner"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-131","to":"AIRA-126"}]}
 ---
 Found while fixing AIRA-112 (see that ticket for the separate, already-fixed ESRCH defect). This is a DIFFERENT, independent defect in the same test.
 
