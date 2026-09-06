@@ -1,11 +1,15 @@
 # AIRA-136 — a job deadline expressed in cumulative CPU-time, not wall clock
 
 Status: planned. Branch `aira136-cpu-time-timeout` off `origin/master` at
-`7a43050`. Two-loop work per CLAUDE.md: this touches the kill/terminal-CAS
+`3f4f54a`. Two-loop work per CLAUDE.md: this touches the kill/terminal-CAS
 arbitration AIRA-126 landed hours ago, so this document is the plan artifact for
 plan-review and the plan gate. No production code is changed by this commit.
 
-Every line reference below is `origin/master` at `7a43050`.
+Every line reference below is `origin/master` at `3f4f54a`, and every one of
+them was re-read against the tree rather than carried over: `3f4f54a` adds only
+`.aira/tickets/AIRA-136.md` on top of `7a43050`, so no line moved. §6.1 records
+the greps that establish the *completeness* of the change set, which is the
+claim a line reference alone cannot support.
 
 ---
 
@@ -193,14 +197,19 @@ type deadlineFire struct {
 // C is buffered 1, so a fire that loses the race to the child's own wait is
 // discarded without blocking the goroutine — the same discard the existing
 // timer.Stop()/drain performs today.
+// The source holds NO sampled state Launch reads back. An earlier draft of this
+// plan carried a mutex-guarded "last established sample" on it; it is deleted,
+// because the authoritative final CPU total is the teardown read AIRA already
+// takes (§4.5) and a mid-run sample could only ever be a lower bound, which
+// proves nothing a budget check needs — a lower bound under the budget does not
+// establish the bound held, and a sample AT or over the budget cannot exist
+// without the source having fired. Keeping it would have been shared mutable
+// state carrying no evidence: exactly the machinery [[architectural-simplicity]]
+// says to refuse.
 type deadlineSource struct {
 	C    chan deadlineFire
 	stop chan struct{}
 	done chan struct{}
-
-	mu          sync.Mutex
-	established bool // any cpu.stat read succeeded (baseline included)
-	last        time.Duration
 }
 
 type deadlineConfig struct {
@@ -221,7 +230,6 @@ func startDeadlineSource(cfg deadlineConfig) *deadlineSource {
 	}
 	src := &deadlineSource{
 		C: make(chan deadlineFire, 1), stop: make(chan struct{}), done: make(chan struct{}),
-		established: cfg.CPUBaseOK,
 	}
 	go func() {
 		defer close(src.done)
@@ -254,7 +262,6 @@ func startDeadlineSource(cfg deadlineConfig) *deadlineSource {
 					// job on no evidence. §4.5 records the absence honestly.
 					continue
 				}
-				src.observe(used)
 				if !haveBaseline {
 					// The pre-start baseline read failed; adopt the first
 					// successful sample instead. This UNDERCOUNTS by whatever
@@ -498,6 +505,22 @@ When it reports true, Launch appends `U_RUN_CPU_BUDGET_UNEVALUATED` (exit class
 already-taken teardown read (runner_linux.go:862, `record.CPUUser + record.CPUSys`)
 minus the same baseline — no new read, no new timing.
 
+`finalEstablished` has an exact definition, and it must be read off the pointer
+fields rather than off a summed number, because a nil in either is what "the
+counter could not be read" actually looks like: **`record.CPUUser != nil &&
+record.CPUSys != nil` after the teardown `snapshotUsage`.** Both are `*int64`
+(types.go:143-144); `readCgroupUsage` leaves them nil on a failed or unparseable
+`cpu.stat` read (usage_linux.go:177-196) and `snapshotUsage` only overwrites a
+field when the new read produced a value (runner_linux.go:997-1010), so a nil
+here is a genuine "never established", never a zero. Summing first and testing
+the sum against zero would turn an unreadable counter into a *measured* zero —
+the fake-zero the whole ticket's honesty rule forbids — so the plan requires the
+nil test, and §7.1's table pins it with a row whose final read is unestablished
+and whose budget is large: the correct implementation reports *unevaluated*
+there, while the summed-to-zero implementation reports a clean, fully-evaluated
+run (`0 >= 10s` is false) and therefore fails that row. The row exists solely to
+fail against that specific wrong implementation.
+
 **This is the plan's one genuinely debatable addition and the plan gate should
 rule on it.** Against it: [[architectural-simplicity]] says prefer "keep the
 primitive, document the gap" over new machinery, and on any box AIRA can run on
@@ -523,11 +546,14 @@ const cpuBudgetSampleInterval = 100 * time.Millisecond
 
 **Cost.** One `cpu.stat` read plus a five-line parse: a small pseudo-file read,
 on the order of a few microseconds. At 100 ms that is ~0.005 % of a core for the
-whole life of the supervisor. It is three orders of magnitude below the
-membership sampler's cost, whose own comment (runner_linux.go:1593-1603) records
-~0.1 % of a core for a single-process supervisor and ~112 % at 2 ms for a
-31-process tree — because *that* sampler walks `cgroup.procs` plus O(tree size)
-`/proc` entries per tick. This one walks nothing. Sampler cost is therefore not
+whole life of the supervisor. The membership sampler's own comment
+(runner_linux.go:1593-1603) is the calibration: measured 2026-09-03, at 2 ms an
+idle single-process supervisor burned ~13 % of a core and a 31-process tree
+~112 %, and at 50 ms those fall to ~0.1 % and ~2 %. That sampler is expensive
+because it walks `cgroup.procs` plus O(scope tree size) `/proc` entries every
+tick, and its cost therefore scales with the job's process count. The CPU
+sampler reads one fixed-size pseudo-file whatever the tree looks like, so it has
+neither that scaling term nor that magnitude. Sampler cost is therefore not
 the binding constraint here, which frees the interval to be chosen on overshoot.
 
 **Overshoot, which is the binding constraint.** Between the last sample under
@@ -602,6 +628,51 @@ Notes on three of these:
 ("timeout must be a positive duration") is preserved byte-for-byte and
 `--cpu-timeout` gets its own naming its own flag.
 
+### 6.1 Why that table is COMPLETE, not merely plausible
+
+A "files touched" table is a claim about the whole tree, and a missed consumer of
+a value this change generalises is exactly how a new kill source acquires a
+silent second behaviour. Each claim below is a grep executed against `3f4f54a`,
+recorded so a reviewer can re-run it rather than trust it.
+
+- **Nothing outside the runner reads the kill actor string, so a new actor value
+  `run-cpu-timeout` cannot change any downstream decision.**
+  `grep -rn '"run-timeout"' --include=*.go .` (excluding tests) returns exactly
+  four sites, all assignments and all inside `internal/runner`:
+  runner_linux.go:588 and :828 (the foreground pair this plan edits) and
+  detach_linux.go:504 and :512 (the detached pair §3.3 refuses to touch). No
+  site anywhere *compares* `ScopeKill.Actor` to a literal — the only other
+  `.Actor` writes are the fixed `"run-kill"`, `"aira"` and `"reconcile"` strings
+  at runner_linux.go:1097, :2361, :2388 and :2672 — so the actor is a record
+  field for humans and the ledger, never a branch input. **This is the fact that
+  makes "one literal becomes `fired.Actor`" a safe change rather than an
+  optimistic one.**
+- **The consumer set of `E_RUN_TIMEOUT` is closed and has exactly one member
+  outside the runner.** `grep -rn 'E_RUN_TIMEOUT' --include=*.go .` (excluding
+  tests) returns four sites: the catalogue entry (codes.go:179), the two
+  emitters (runner_linux.go:826, detach_linux.go:514), and one reader —
+  `gate_command.go:93`. So the gate mapping in the table above is not a
+  precaution; it is the *entire* set of behaviour that a second deadline code
+  would otherwise miss, and there is provably no second reader to find later.
+  No TUI, `aira top`, trailer, or report path branches on it.
+- **The codes catalogue's convention tests need no edit for either new code, and
+  this was checked rather than assumed.**
+  `TestCataloguedExitsFollowThePrefixConvention` requires every `U_` code to exit
+  3, which `U_RUN_CPU_BUDGET_UNEVALUATED: 3` satisfies, and asserts nothing about
+  `E_` codes (its own comment says they are bucketed by kind), so
+  `E_RUN_CPU_TIMEOUT: 3` is unconstrained there and aligns with its sibling
+  `E_RUN_TIMEOUT: 3` by argument rather than by rule.
+  `TestRebucketedCodesFollowTheKindConvention` is a named allowlist of AIRA-107's
+  twelve decisions plus their argued neighbours, not a rule quantified over the
+  catalogue, so a new code is outside it.
+  `TestDivergenceTablesAreCurrent` only polices the two staleness maps, and
+  neither new code belongs in either (both are catalogued *and* produced), so no
+  entry is added — an entry would in fact fail that test.
+  What *does* apply, and is the free non-porous guard this plan leans on, is the
+  bidirectional pair `TestEveryProducedCodeIsCatalogued` /
+  `TestEveryCataloguedCodeIsProduced`: catalogue a code and never emit it and the
+  suite goes red; emit one and never catalogue it and the suite goes red.
+
 ---
 
 ## 7. Test plan
@@ -622,7 +693,19 @@ any consumed (including a huge one); `{budget: -1}` false.
 `TestAIRA136CPUBudgetUnevaluatedRule` — one row per conjunct, each differing from
 its neighbour in exactly one input: no budget → false; fired → false; established
 final under budget → false; established final at/over budget, not fired → true;
-final unestablished → true.
+**final unestablished with a large budget → true**. That last row is the one
+§4.5 names: it is written with a budget the fake-zero implementation would sail
+under, so an implementation that sums nil `CPUUser`/`CPUSys` to a measured zero
+returns false and fails the row, while the correct nil test returns true. A row
+with a small budget would pass both and prove nothing.
+
+The caller-side half of that rule gets its own test, because the table cannot
+see it: `TestAIRA136UnevaluatedIsDerivedFromTheNilCounters` drives Launch with a
+teardown `cpu.stat` read that fails (injected `readCgroupCPUFn`, and the scope's
+`cpu.stat` absent), a requested budget, and no fire, and asserts the record
+carries `U_RUN_CPU_BUDGET_UNEVALUATED` with `CPUUser == nil && CPUSys == nil` —
+proving the code is raised from the absence of evidence rather than from a
+zero.
 
 ### 7.2 The multiplexer (`internal/runner/deadline_linux_test.go`, hermetic, no cgroups)
 
@@ -857,7 +940,18 @@ the command succeeded and the bound had no effect on it.
 6. **Everything AIRA-126 §8 already accepts** applies unchanged to the CPU
    source, because it is the same code: the crash window between arbitration and
    terminal append, the bounded-receive expiry, and a foreign concurrent intent.
-7. **Contention is not itself reproduced in tests** (§7.3). The property under
+7. **No kernel cgroup, no enforcement — and it says so.** Where the run's scope
+   is not a real kernel cgroup (the in-memory backends the hermetic tests use
+   today, and any future run-side analogue of confine's `ci-shim` mode, which
+   `confine.go:177-198` already describes as "there IS no scope"), every
+   `cpu.stat` read is unevaluated, the budget can never fire, and a *requested*
+   budget therefore ends the run with `U_RUN_CPU_BUDGET_UNEVALUATED` (§4.5).
+   That is the intended outcome and the reason §4.5's rule is worth its code: the
+   alternative is a run that reports clean success under a bound the machine was
+   structurally incapable of applying. It is stated here so the code is read as
+   "the environment could not enforce this", not as a defect. `aira confine`'s
+   shim mode is unaffected, because §3.2 gives confine no CPU bound at all.
+8. **Contention is not itself reproduced in tests** (§7.3). The property under
    test — wall-clock elapsed decoupled from CPU-time consumed — is reproduced
    exactly and deterministically; the load average that motivates it is not, and
    inducing it on a shared box would be antisocial and unreliable.
