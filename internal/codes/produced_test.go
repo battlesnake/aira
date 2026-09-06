@@ -344,6 +344,90 @@ func TestExclusiveAdmissionRefusalSharesTheCapacityBucket(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-125 — the two entries that predated the 1-versus-2 rule and sat
+// on the wrong side of it are moved to 1, and pinned here so the catalogue keeps
+// no counter-example for a future author to cite.
+//
+// Both were catalogued at 2 by AIRA-87 before the rule existed, and AIRA-107 then
+// had to name each of them as a precedent it was declining to follow (at
+// E_RUN_TELEMETRY_CONFLICT and at E_GATE_EXISTS) — which is the actual cost of
+// leaving them: every later bucketing argument had to relitigate them. AIRA-125
+// moved both rather than record an exception at either, so those arguments now
+// have one answer instead of two.
+//
+// This is a separate pin from TestRebucketedCodesFollowTheKindConvention on
+// purpose. That table is exhaustive over AIRA-107's eleven and its exhaustiveness
+// is load-bearing; neither code here is one of the eleven, and folding them in
+// would blur which ticket decided what.
+//
+// The membership assertion is not redundant with the value assertion, and this is
+// the one place in the catalogue where that matters most: ExitForCode defaults to
+// 1, so deleting either entry outright would leave ExitForCode still answering 1
+// and a value-only check still passing, while the published contract silently lost
+// the code. Asserting presence in ExitCodes is what makes the pin bite in both
+// directions.
+func TestStateConflictCodesExitOne(t *testing.T) {
+	// 1 = the request is well formed and durable state refuses it now; change the
+	// state and the identical request succeeds.
+	want := map[string]int{
+		// .aira/config or a projects row already exists (app/project.go:422,
+		// store/lifecycle.go:162). Remove it or eject, and init succeeds.
+		"E_ALREADY_INITIALIZED": 1,
+		// A stored rant already claims this idempotency key with different input
+		// (store/rant.go:66). The key is the caller's to choose.
+		"E_RANT_IDEMPOTENCY_CONFLICT": 1,
+	}
+	for code, exit := range want {
+		catalogued, ok := ExitCodes[code]
+		if !ok {
+			t.Errorf("%s is no longer catalogued; AIRA-125 bucketed it at %d, and ExitForCode's default would hide the removal, so dropping it is a contract decision that must edit this test", code, exit)
+			continue
+		}
+		if catalogued != exit {
+			t.Errorf("%s exits %d, want %d (AIRA-125: a well-formed request refused by durable state is 1, not 2)", code, catalogued, exit)
+		}
+		if got := ExitForCode(code); got != exit {
+			t.Errorf("ExitForCode(%s)=%d, want %d", code, got, exit)
+		}
+	}
+
+	// The neighbours the move was argued from. Each is the same "durable state
+	// already holds this record" or "durable state conflicts with this write"
+	// shape, and if one of them moves, the AIRA-125 reasoning stops holding.
+	family := map[string]int{
+		"E_RELATION_EXISTS":           1, // E_ALREADY_INITIALIZED is the same already-exists refusal.
+		"E_GATE_EXISTS":               1, // ...as is this one, which AIRA-107 argued the same way.
+		"E_PREFIX_OWNERSHIP_CONFLICT": 1, // ...and this one, raised by the same PreflightAdoption call.
+		"E_WRITE_CONFLICT":            1, // E_RANT_IDEMPOTENCY_CONFLICT is the same stored-state conflict.
+		"E_RUN_TELEMETRY_CONFLICT":    1, // ...as is this one, which named the rant code as the precedent it declined.
+	}
+	for code, exit := range family {
+		catalogued, ok := ExitCodes[code]
+		if !ok {
+			t.Errorf("%s is no longer catalogued; AIRA-125 aligned a code with it, so removing it needs that reasoning revisited", code)
+			continue
+		}
+		if catalogued != exit {
+			t.Errorf("%s exits %d, want %d: AIRA-125 moved a code by alignment with this one, so moving it needs that reasoning revisited", code, catalogued, exit)
+		}
+	}
+
+	// The bad-request neighbours the rant code was split away FROM. A lazy "move
+	// the whole E_RANT_* family to 1" would satisfy the pin above while destroying
+	// the distinction the split exists to carry: these three reject what the caller
+	// wrote, and no state change lets them through as written.
+	badRequest := map[string]int{
+		"E_RANT_INVALID":     2,
+		"E_RANT_TOO_LARGE":   2,
+		"E_RANT_REF_INVALID": 2,
+	}
+	for code, exit := range badRequest {
+		if got := ExitForCode(code); got != exit {
+			t.Errorf("%s exits %d, want %d: AIRA-125 split E_RANT_IDEMPOTENCY_CONFLICT off this family precisely because these stay bad requests", code, got, exit)
+		}
+	}
+}
+
 // TestNoWarningCodeIsRaisedAsAnError closes the hazard the W_ convention opens
 // at the AUTHORING end: nobody should ever construct an error whose message
 // starts "W_SOMETHING: ...", because a warning code is cataloged to exit 0 and
