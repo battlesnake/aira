@@ -383,6 +383,91 @@ func TestRequestWorkerAdmitClassifiesEndToEnd(t *testing.T) {
 		_ = outcome.Lease.Close()
 	})
 
+	// verifies: AIRA-123 — an ADVISORY (ledger-only) grant survives the
+	// daemon -> Go-client JSON hop and reaches the caller as a usable lease.
+	//
+	// Recorded as a coverage gap by build-review and closed here. Every other
+	// case in this function feeds an ENFORCED grant, so nothing exercised the
+	// two keys AIRA-123 added on this hop. The payload below is a RAW JSON
+	// LITERAL, deliberately, rather than a marshalled workerAdmitGrant: this
+	// package may not import internal/daemon (admission_linux.go), so a
+	// round-trip through the client's own struct would be self-consistent by
+	// construction and would keep passing if the producer and this consumer
+	// renamed a key in opposite directions. Spelling the WIRE keys out pins
+	// this side of the contract to the bytes; the daemon side is pinned by the
+	// matching raw-key assertion in TestShimWorkerAdmitConnection...
+	// (internal/daemon/worker_admit_shim_test.go), so a tag mismatch on
+	// `containment` or `reserved` now fails a test instead of silently turning
+	// every shim grant into a contract violation for the whole suite.
+	t.Run("an advisory ledger-only grant survives the JSON hop", func(t *testing.T) {
+		raw := []byte(`{"state":"granted","class":"granted","worker_id":"7",` +
+			`"containment":"` + WorkerAdmitContainmentAdvisory + `","reserved":104857600,` +
+			`"swap_cap":"` + WorkerAdmitSwapCapNotApplicable + `",` +
+			`"cpu_slots":"` + WorkerAdmitCPUSlotsUnevaluated + `"}`)
+		socket := serveOneWorkerAdmit(t, func() runnerAdmitResponseFrame {
+			return runnerAdmitResponseFrame{OK: true, Code: "OK", Data: raw}
+		})
+		outcome := RequestWorkerAdmit(context.Background(), workerAdmitTestRequest(socket))
+		if !outcome.Granted() || outcome.Lease == nil {
+			t.Fatalf("outcome=%+v: a well-formed advisory grant must be honoured, not refused", outcome)
+		}
+		if outcome.Lease.Containment != WorkerAdmitContainmentAdvisory {
+			t.Fatalf("lease containment=%q, want %q: the grade must cross this hop or an "+
+				"admission-only grant reads as a kernel-enforced one",
+				outcome.Lease.Containment, WorkerAdmitContainmentAdvisory)
+		}
+		if outcome.Lease.Reserved != 100<<20 {
+			t.Fatalf("lease reserved=%d, want the booked 100MiB", outcome.Lease.Reserved)
+		}
+		if outcome.Lease.ScopePath != "" || outcome.Lease.MemoryMax != 0 {
+			t.Fatalf("lease=%+v: an advisory grant names no cgroup and no cap; a value in "+
+				"either field would be containment this mode does not have", outcome.Lease)
+		}
+		_ = outcome.Lease.Close()
+	})
+
+	// verifies: AIRA-123 — and the same hop still REFUSES an advisory grant
+	// that contradicts itself, so the acceptance above is not simply this
+	// client having stopped checking.
+	for _, bad := range []struct {
+		name string
+		raw  string
+	}{
+		{
+			"advisory carrying a scope",
+			`{"state":"granted","class":"granted","worker_id":"7","containment":"` +
+				WorkerAdmitContainmentAdvisory + `","reserved":104857600,"scope_path":"/outer/.aira-worker-7"}`,
+		},
+		{
+			"advisory carrying a memory_max",
+			`{"state":"granted","class":"granted","worker_id":"7","containment":"` +
+				WorkerAdmitContainmentAdvisory + `","reserved":104857600,"memory_max":400}`,
+		},
+		{
+			"advisory with no reservation",
+			`{"state":"granted","class":"granted","worker_id":"7","containment":"` +
+				WorkerAdmitContainmentAdvisory + `"}`,
+		},
+		{
+			"no containment grade at all",
+			`{"state":"granted","class":"granted","worker_id":"7","reserved":104857600}`,
+		},
+	} {
+		t.Run("a contradictory advisory grant is a contract violation: "+bad.name, func(t *testing.T) {
+			socket := serveOneWorkerAdmit(t, func() runnerAdmitResponseFrame {
+				return runnerAdmitResponseFrame{OK: true, Code: "OK", Data: []byte(bad.raw)}
+			})
+			outcome := RequestWorkerAdmit(context.Background(), workerAdmitTestRequest(socket))
+			if outcome.Class != WorkerAdmitClassContractViolation || outcome.Reason != WorkerAdmitReasonMalformedGrant {
+				t.Fatalf("outcome=%+v: an advisory grant that claims what this mode cannot "+
+					"provide must be refused, never honoured", outcome)
+			}
+			if outcome.Lease != nil {
+				t.Fatal("a refused grant must not produce a lease")
+			}
+		})
+	}
+
 	t.Run("a daemon that answers with garbage is a contract violation", func(t *testing.T) {
 		socket := filepath.Join(t.TempDir(), "daemon.sock")
 		listener, err := net.Listen("unix", socket)

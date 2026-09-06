@@ -3526,16 +3526,19 @@ print("bootstrapped outer=/outer supervisor_scope=/outer/.aira-supervisor")
     assert "out of lockstep" in capsys.readouterr().err
 
 
-def test_ci_shim_worker_death_before_any_result_is_not_a_placement_failure(tmp_path, monkeypatch, pytester):
-    """A ledger-only child that dies at startup must NOT be diagnosed as a broken
-    local cgroup mechanism.
+def test_ci_shim_worker_registers_with_no_placement_handshake(tmp_path, monkeypatch, pytester):
+    """A ledger-only worker registers WITHOUT any placement handshake.
 
-    WorkerPlacementFailed means "the cgroup placement mechanism is broken here"
-    and makes _replace_worker strip containment for the rest of the run. There is
-    no placement in ledger-only mode, so that diagnosis is unsupportable -- the
-    death is handled where every other mid-run death is. Pinned because the
-    tempting implementation (keep the placement ack, reuse its failure path)
-    produces exactly the wrong verdict.
+    Named for what it proves, and no more (build-review: it previously claimed a
+    startup death it never exercised -- that case is the test directly below).
+    There is no cgroup to join in ledger-only mode, so there is nothing for an
+    ack to confirm; keeping the ack would give this path a failure surface whose
+    only meaning is WorkerPlacementFailed, "the local cgroup mechanism is
+    broken", which strips containment for the rest of the run.
+
+    Non-porous: against the shipped pre-AIRA-123 behaviour this fails at
+    spawn_worker, which calls place_self(None) and raises WorkerPlacementFailed
+    before any assertion below is reached.
     """
     admit = _write_stub(tmp_path / "worker-admit-ledger-die", """
 import os, sys
@@ -3564,3 +3567,77 @@ sys.stdin.read()
         state["dispatch_write"].flush()
     for worker_pid, state in list(supervisor.workers.items()):
         supervisor._retire_worker(worker_pid, state)
+
+
+def test_ci_shim_worker_killed_before_any_result_takes_the_mid_run_death_path(
+    tmp_path, monkeypatch, pytester
+):
+    """A ledger-only worker that dies before reporting anything is handled where
+    every other mid-run death is, with a REAL SIGKILL of a REAL forked worker.
+
+    This is the case the test above used to claim and never exercised
+    (build-review). It is not a formality: a scope-less grant reaches
+    _describe_worker_death and _forget_worker_scope on this path, and both read
+    grant["scope"] -- so an implementation that assumed a scope is always a path
+    raises TypeError out of the dispatch loop instead of retiring the worker.
+    The assertions pin the whole disposition: retired, no WorkerPlacementFailed,
+    containment NOT stripped for the rest of the run (daemon_available stays
+    True, which is what WorkerPlacementFailed's _replace_worker path would
+    destroy), the undispatched nodeid still queued, and a replacement asked for.
+    _describe_worker_death is not asserted on beyond running without raising --
+    it is reached with scope=None, which is the TypeError above.
+
+    _replace_worker is stubbed so the spawned replacement does not outlive the
+    test; whether it is CALLED is itself part of what a mid-run death means.
+    """
+    admit = _write_stub(tmp_path / "worker-admit-ledger-killed", """
+import os, sys
+print("aira-worker-admit state=granted class=granted containment=" + {advisory!r} +
+      " worker_id=" + str(os.getpid()) + " reserved=104857600")
+sys.stdout.flush()
+sys.stdin.read()
+""".format(advisory=_ADVISORY_TOKEN))
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+    items = pytester.getitems("""
+        def test_one():
+            assert True
+    """)
+    supervisor = Supervisor()
+    supervisor.outer_scope = "ci-shim"
+    supervisor.admission_mode = "ledger-only"
+    supervisor.collect(items)
+    pid = supervisor.spawn_worker(100 * (1 << 20))
+    state = supervisor.workers[pid]
+    assert state["grant"]["scope"] is None
+
+    replacements = []
+    supervisor._replace_worker = lambda: replacements.append(True)
+
+    # Nothing has been dispatched, so in_flight is None: this worker died before
+    # producing any result at all.
+    assert state["in_flight"] is None
+    os.kill(pid, signal.SIGKILL)
+    watched = [fd for fd in (state["result_fd"], state.get("pidfd")) if fd is not None]
+    deadline = time.monotonic() + 10
+    ready = []
+    while not ready and time.monotonic() < deadline:
+        ready, _, _ = select.select(watched, [], [], 0.1)
+    assert ready, "the killed worker's death was never observable on its own fds"
+
+    supervisor._service_ready_workers(
+        ready,
+        {state["result_fd"]: (pid, state)},
+        {state["pidfd"]: (pid, state)} if state.get("pidfd") is not None else {},
+    )
+
+    assert pid not in supervisor.workers, "a dead ledger-only worker must be retired"
+    assert supervisor.daemon_available is True, (
+        "a ledger-only worker's death is not evidence that admission is unusable; "
+        "stripping containment here would ungovern the rest of the suite"
+    )
+    assert supervisor.results == {}, "no nodeid was in flight, so nothing may be recorded"
+    assert len(supervisor.queue) == 1, (
+        "the collected nodeid was never dispatched, so it must still be queued -- "
+        "neither consumed by this death nor requeued twice"
+    )
+    assert replacements == [True], "a mid-run death asks for a replacement worker"

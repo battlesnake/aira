@@ -299,6 +299,35 @@ func TestShimWorkerAdmitConnectionReleasesTheBookingWhenThePeerDisconnects(t *te
 	if grant.Containment != runner.WorkerAdmitContainmentAdvisory || grant.ScopePath != "" {
 		t.Fatalf("wire grant=%+v; the advisory grade and the absence of a scope must both survive JSON", grant)
 	}
+	// AIRA-123 (build-review coverage gap). The decode above goes through this
+	// package's OWN response struct, so it proves the two fields survive a
+	// round-trip through one definition -- not that the BYTES carry the key
+	// names the Go client reads. internal/runner may not import this package,
+	// so the two structs are independent declarations, and a tag renamed on one
+	// side only would keep this assertion green while turning every shim grant
+	// into a client-side contract violation (which strips admission for the
+	// whole suite). Pin the wire keys themselves here; the client half is
+	// pinned by the raw-literal advisory case in
+	// TestRequestWorkerAdmitClassifiesEndToEnd
+	// (internal/runner/worker_admit_classify_linux_test.go).
+	var wire map[string]any
+	if err := json.Unmarshal(frame.Data, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire["containment"] != runner.WorkerAdmitContainmentAdvisory {
+		t.Fatalf("wire key \"containment\"=%v, want %q: the client reads this key by name",
+			wire["containment"], runner.WorkerAdmitContainmentAdvisory)
+	}
+	if reserved, ok := wire["reserved"].(float64); !ok || int64(reserved) != 100<<20 {
+		t.Fatalf("wire key \"reserved\"=%v, want the booked 100MiB: the client reads this key by name",
+			wire["reserved"])
+	}
+	for _, forbidden := range []string{"scope_path", "memory_max"} {
+		if _, present := wire[forbidden]; present {
+			t.Fatalf("wire carries %q on an advisory grant; absent, not zeroed -- every consumer "+
+				"tests these for PRESENCE", forbidden)
+		}
+	}
 	if committed, count := server.ShimWorkerLedgerForTest(); committed != 100<<20 || count != 1 {
 		t.Fatalf("while the lease is held: committed=%d leases=%d, want the booking charged", committed, count)
 	}

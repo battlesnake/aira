@@ -135,6 +135,32 @@ sentinel itself). The non-delegate arm keeps AIRA-121's unconditional strip.
   reconstruct from; the live-usage term is the accepted mitigation.
 - Per-worker CPU governance in shim mode. Structurally needs worker cgroups.
 
+## Accepted coverage gaps
+
+Written down and accepted rather than left silent (build-review, AIRA-123
+round 1). Neither is closed by this change.
+
+- **No real-binary end-to-end run in shim mode.** Nothing exercises a real shim
+  daemon + a real `aira worker-admit` relay + a real `supervisor.py` together.
+  The Python e2e
+  (`test_ci_shim_ledger_only_admission_governs_the_whole_suite_without_a_cgroup`)
+  drives stub bootstrap/admit scripts, and the real-daemon Go e2e tests in
+  `internal/pylib/pytest_aitest_e2e_test.go` are gated real-cgroup-only, so they
+  are structurally the wrong harness for a mode defined by having no cgroup.
+  What IS covered is each hop separately: the daemon's evaluator and its wire
+  frame (`internal/daemon/worker_admit_shim_test.go`), the daemon→Go-client JSON
+  hop for both grades (`internal/runner/worker_admit_classify_linux_test.go`),
+  the Go↔Python outcome line and its catalogues
+  (`internal/pylib/worker_admit_channel_test.go`), and the supervisor's own
+  handling of a scope-less grant. The residual risk is a seam none of those
+  four pins: the real CLI relay's argv/stdin wiring in shim mode. Closing it
+  needs an e2e harness that runs the real binaries with cgroups deliberately
+  unavailable, which is its own piece of work.
+- **The ledger is not reconstructed across a daemon restart** (also listed under
+  Deferred). A restart forgets every booking; the live-usage term is what bounds
+  the resulting over-admission window, and it is a weaker bound than the real
+  path's, whose cgroups survive the restart.
+
 ## Tests
 
 Go: `internal/daemon/worker_admit_shim_test.go` (grant shape; ledger really
@@ -142,7 +168,11 @@ gates + frees on release; live-usage denial with an empty ledger; over-budget
 request terminal; unreadable ledger retriable; mode mismatch both directions;
 connection-scoped release end to end; sentinel validation).
 `internal/runner/worker_admit_outcome_test.go` (both grades round-trip; seven
-refusal rows for contradictory shapes). `internal/runner/confine_shim_linux_test.go`
+refusal rows for contradictory shapes).
+`internal/runner/worker_admit_classify_linux_test.go` (the daemon→client JSON
+hop for an ADVISORY grant, fed as a raw wire literal so a renamed tag fails
+rather than round-tripping through one struct, plus four contradictory advisory
+payloads still refused). `internal/runner/confine_shim_linux_test.go`
 (the child environment really carries a freshly published `AIRA_AITEST_LIB` and
 no outer scope; the non-delegate strip survives). `internal/pylib/worker_admit_channel_test.go`
 (containment + admission catalogues and their mapping held equal across Go and
@@ -154,7 +184,9 @@ behaviour finishes the suite on the fallback pool and fails `daemon_available`
 and the admit count); grant carries an explicit `scope: None`; grade/backend
 disagreement refused both ways; missing grade refused; advisory-with-scope
 refused; bootstrap without a grade disables the daemon; a ledger-only worker
-registers with no placement handshake.
+registers with no placement handshake; and a ledger-only worker SIGKILLed before
+reporting anything takes the mid-run-death path — retired, replacement
+requested, containment not stripped — rather than any placement diagnosis.
 
 ## Dependency
 

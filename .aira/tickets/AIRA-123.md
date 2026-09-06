@@ -157,3 +157,65 @@ inverted and still proves itself from the actual child environment.
   reported `unevaluated`, never as a pass.
 - Sizing aitest's `auto` worker count from the shim ledger stays deferred
   (AIRA-121 requirement 5's own noted follow-up).
+
+## Review round 1 — findings and what was done
+
+Build-review of PR #73 at `2adffc5` confirmed the code satisfies every
+requirement above and that the load-bearing tests are non-porous. It raised two
+BLOCKING items and four non-blocking ones. All six are addressed here except the
+merge-target one, which is not this branch's to fix.
+
+1. **BLOCKING (defect) — `.aira/tickets/AIRA-121.md` frontmatter `status` was
+   flipped from `in-review` back to `planned`.** FIXED. Merging as-is would have
+   silently reverted PR #72's own ticket-status record. The requirement-7 text
+   edit in that file is in scope and correct and is unchanged; only the
+   frontmatter regression is undone, so this branch now touches AIRA-121's body
+   and not its status.
+2. **BLOCKING (merge target) — the base is `aira121-ci-shim-mode` (PR #72,
+   still open), not `master`.** NOT FIXED HERE, deliberately: the two available
+   fixes are to merge #72 (not this agent's to do) or to rebase this branch onto
+   master carrying #72's ~5.4k lines, which would land AIRA-121's code through
+   AIRA-123's PR and bypass #72's own merge record — the same class of dishonesty
+   as finding 1, one size larger. The correct sequence is unchanged and stated in
+   the PR body: merge #72 first, then this branch retargets to master (GitHub
+   retargets automatically) and rebases. Until then this PR is **not mergeable to
+   master** and AIRA-123 must not be marked done on master.
+3. **Coverage gap — the daemon→Go-client JSON hop was untested for the ADVISORY
+   grade.** CLOSED. `internal/runner` may not import `internal/daemon`, so the
+   two grant structs are independent declarations and a tag renamed on one side
+   only would have turned every shim grant into a client-side contract violation
+   with no failing test. Both halves are now pinned to the WIRE BYTES rather
+   than to a struct round-trip: a raw-literal advisory acceptance case (plus four
+   contradictory advisory payloads still refused) in
+   `TestRequestWorkerAdmitClassifiesEndToEnd`, and raw-key assertions on
+   `containment` / `reserved` — and the ABSENCE of `scope_path` / `memory_max` —
+   in `TestShimWorkerAdmitConnectionReleasesTheBookingWhenThePeerDisconnects`.
+   Verified by renaming each side's tag in turn: each rename fails its test.
+4. **Coverage gap — no real-binary end-to-end run in shim mode.** RECORDED, not
+   closed, under a new "Accepted coverage gaps" heading in the plan, with what
+   IS covered per hop, the one seam none of those hops pins (the real CLI
+   relay's argv/stdin wiring in shim mode), and why closing it is its own piece
+   of work.
+5. **Test overclaim — `test_ci_shim_worker_death_before_any_result_is_not_a_
+   placement_failure` never killed a worker.** FIXED, by splitting it. It is
+   renamed `test_ci_shim_worker_registers_with_no_placement_handshake` and its
+   docstring now claims only what it proves (still non-porous: the shipped
+   pre-AIRA-123 code raises `WorkerPlacementFailed` from `place_self(None)`). The
+   untested claim is now a real test —
+   `test_ci_shim_worker_killed_before_any_result_takes_the_mid_run_death_path` —
+   which SIGKILLs a real forked ledger-only worker, waits for the death on its
+   own fds and drives `_service_ready_workers`, asserting the worker is retired,
+   `daemon_available` stays True (containment not stripped), the undispatched
+   nodeid stays queued, and a replacement is requested. Non-porosity verified:
+   removing `_describe_worker_death`'s scope-None guard fails this test with
+   `TypeError: expected str, bytes or os.PathLike object, not NoneType` while the
+   registration test still passes.
+6. **Stale comment — `cmd/aira/main.go`'s AIRA-121 gate comment still said the
+   verb "must fail CLEANLY and immediately".** FIXED. It now states the C1
+   reasoning that still holds (never reach `CurrentCgroupPath`'s self-discovery)
+   and says explicitly that AIRA-123 replaced the failure disposition with an
+   honest degraded success.
+
+Validation after the fixes, from this worktree, exact exit codes:
+`aira confine -- go build ./...` 0; `aira confine -- go vet ./...` 0;
+`AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` 0.
