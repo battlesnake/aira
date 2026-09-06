@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-137","project":"aira","title":"aira top: add a CPU-usage bar (per-job stacked, rest-of-system grey) + RAM/CPU columns in the table","status":"in-review","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["observability","tui"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-137","project":"aira","title":"aira top: add a CPU-usage bar (per-job stacked, rest-of-system grey) + RAM/CPU columns in the table","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["observability","tui"],"hold":false,"relations":[]}
 ---
 Requested directly by the owner, 2026-09-06, refining AIRA-127/AIRA-135 (both just
 shipped). Verified against real source and a real running box before writing this, not assumed.
@@ -310,3 +310,46 @@ issue.
 Gate after the fix round: `aira confine -- go build ./...` exit 0;
 `aira confine -- go vet ./...` exit 0; `AIRA_REAL_CGROUP=1 aira confine --
 go test ./... -count=1` exit 0, all 15 packages ok.
+
+## Review (Fable reverify gate, fix round 0805174) — MERGED
+
+PR #84 merged as `af66f6b` (2026-09-06). Everything below is the reviewer's own
+reproduction against a detached checkout of `0805174`, not the builder's
+transcript.
+
+- Static: `topBarLegend` (`cmd/aira/tui.go:601`) ends without `\n`, and it has
+  exactly one consumer, `renderTopBar` (`tui.go:573-584`), whose body is
+  unchanged — one leading `\n` per following element. `topRAMBarHeight`/
+  `topCPUBarHeight` are the actual `AddItem` heights in `buildWidgets`
+  (`tui.go:224-225`), one named constant each, shared with the test — no second
+  source of truth.
+- Red/green re-derived: reintroducing the trailing `\n` in a scratch copy makes
+  `TestTopBarLegendHasNoTrailingNewline` and both sub-cases of
+  `TestTopBarFitsItsPanelHeight` fail with the original BLOCK signature
+  (`legend\n\nOVER-SUBSCRIBED…`, CPU at 5 lines against an inner height of 4);
+  restoring the fix returns both to green. The RAM sub-case is the true worst
+  realistic case (a marker-less RAM bar still emits the "no slice limit could be
+  established" marker-legend line, so 5 lines against inner 5).
+- Original counterexample re-run on a real tview SimulationScreen through the
+  real `buildWidgets` layout with the same worst-case bar injected into the real
+  `r.topBar`/`r.topCPUBar`: RAM rows 2-6 = bar, legend, marker legend,
+  OVER-SUBSCRIBED, note; CPU rows 9-12 = bar, legend, OVER-SUBSCRIBED, note; no
+  blank row, every line above its bottom border. (Scratch test, not committed.)
+- F2: `"cpu"` on the shim pending row is consistent with the linux open-fail
+  path (`confine_manage_linux.go:195`); no test pins the list length. F3 left
+  alone is the right call under the architectural-simplicity rule.
+- Gates (reviewer's own, exact exit codes): `aira confine -- go build ./...` 0;
+  `aira confine -- go vet ./...` 0; `AIRA_REAL_CGROUP=1 aira confine -- go test
+  ./... -count=1` 0, all 15 packages ok.
+- Dogfood: PR client binary driven in tmux against the shared daemon and three
+  synthetic `aira confine` jobs. RAM panel at its real height: bar / legend /
+  marker legend with no blank line. CPU panel: "UNEVALUATED: the machine's core
+  count is unevaluated" — an honest result, proven stale-daemon rather than
+  assumed: the running daemon's exe (`~/.local/bin/aira`, started 21:50:17
+  EEST, before e500d31 was committed) contains 0 occurrences of the AIRA-137
+  wire tag `system_cpu_usage_usec` while carrying AIRA-136 strings; the PR
+  binary contains it. The CPU happy path was captured live by the prior review
+  on a private daemon and is untouched by this display-only fix.
+- Accepted documented gap (reviewer accepts): two simultaneous notes plus
+  OVER-SUBSCRIBED exceed either panel's budget; pre-existing on RAM, now
+  consistent on CPU, recorded on the height constants.
