@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-35","project":"aira","title":"aitest worker memory.high/memory.max split converges too slowly under kernel throttle (WSL2)","status":"in-review","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["admission","aitest","cgroup","oom"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-35","project":"aira","title":"aitest worker memory.high/memory.max split converges too slowly under kernel throttle (WSL2)","status":"done","kind":"bug","severity":"P1","assignee":null,"milestone":null,"labels":["admission","aitest","cgroup","oom"],"hold":false,"relations":[]}
 ---
 Found during AIRA-30 (aitest Slice 1) Task 17's real end-to-end verification,
 not by design/review inspection: a worker deliberately blowing its memory
@@ -233,6 +233,18 @@ into plan v3 before any code was written.
 - **AIRA-117** -- three `TestSliceCeilingRealCgroup*` tests fail under `-race`
   on a real-cgroup host; reproduced on pristine `origin/master`, so not caused
   by this work.
+
+### PR and merge
+
+- PR: https://github.com/battlesnake/aira/pull/58
+- Merge commit: `db25fc9`
+- The merged artifact was re-verified independently of the PR description
+  (`git show origin/master:<path>` for each load-bearing site): `ProtocolVersion
+  = 8` and the runner's pin both landed, `writeWorkerScopeSwapCap` is called,
+  `estimatedBytes * 4 / 5` is gone, the harness's ancestor `memory.swap.max`
+  write is gone, `worker.py` reads `memory.max`, the convergence test is
+  present, and the `AIRA_AITEST_SLOW_E2E` skip is gone (the one surviving
+  mention is the historical note in the test's own comment).
 
 ### Not deployed
 
