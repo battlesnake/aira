@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-124","project":"aira","title":"Exclusive-admission refusal exits 1 while the same condition via E_ADMIT_SATURATED exits 4","status":"in-review","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["codes","honesty"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-124","project":"aira","title":"Exclusive-admission refusal exits 1 while the same condition via E_ADMIT_SATURATED exits 4","status":"done","kind":"chore","severity":"P2","assignee":null,"milestone":null,"labels":["codes","honesty"],"hold":false,"relations":[]}
 ---
 Filed as an AIRA-107 review follow-up. Out of that ticket's scope:
 `E_ADMIT_EXCLUSIVE_ACTIVE` is not one of the eleven codes AIRA-107 decided, and
