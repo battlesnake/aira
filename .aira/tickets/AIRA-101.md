@@ -253,3 +253,45 @@ breaking the single-writer property that function documents, and read waiter
 fields without the lock. Production paths were clean, but a racy test is not
 evidence, so a `sliceQueue.stopped` seam now lets a test become the sole
 evaluator. The suite was green before this was found.
+
+## Known boundary: exclusivity is slice-scoped, not machine-scoped (field, 2026-09-06)
+
+Real adversarial measurement against a live, deployed grant (Rust FDTD benchmark,
+9950X3D, five interleaved passes, grant held throughout) — quoted verbatim, this
+project's own real-world validation of the coverage limits already stated in the
+`--exclusive` help text:
+
+Exclusive admission removes contention from *other confined jobs*. It cannot
+remove contention from processes outside `aira.slice` (agent processes, `dockerd`
+under `/system.slice/docker.service`, anything unconfined), and it cannot
+partition the shared L3.
+
+| bed | median MC/s | spread |
+|---|---:|---:|
+| shared bed, non-exclusive, load 12.8–24.2 | 474.4 | 1.46× |
+| shared bed, exclusive, load 4.4–5.0 | 675.8 | 1.33× |
+| 255³ DRAM-bound, exclusive | 351.6 | **1.03×** |
+| 127³ cache-resident, exclusive | 2460.8 | **3.14×** |
+
+Exclusivity moved the shared-bed median **+42%** and narrowed spread 1.46× →
+1.33×. It did not remove it.
+
+The split is mechanistic, not noise. The DRAM-bound bed's contended resource —
+memory bandwidth — *was* held by the jobs exclusivity excludes, so it becomes
+reproducible to 3%. The 127³ bed is 59 MB of f32 field arrays inside a 96 MB L3:
+its throughput depends on a resource exclusivity does not own, so the grant buys
+it nothing.
+
+Evidence the residual is external rather than three independently noisy rows:
+**the slow samples are time-aligned across rows.** One interleaved pass produced
+the minimum of `coupled 4` (1010.3), `coupled 8` (1004.7) *and* `coupled 16`
+(951.6) simultaneously, all near 1000 MC/s. Rows are measured round-robin, so one
+pass being uniformly slow across three rows is one disturbance, not three.
+
+**Guidance for callers.** Under an exclusive grant, a DRAM-bound measurement is
+trustworthy to ~3%. A cache-resident measurement is not: on this machine it still
+spreads 3.1× with the grant held, and any single-figure quote from such a row can
+be wrong by up to 3×. Cache-resident beds need many more repeats or a quieter
+machine — the grant is not a substitute for either. The failure mode this
+guidance exists to prevent is not a bad number; it's a bad number combined with
+the belief that the grant made it safe.
