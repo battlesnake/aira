@@ -2,12 +2,15 @@ package runner
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -353,5 +356,128 @@ func TestScopeMembershipEventsDeliversModifyAndReleasesFD(t *testing.T) {
 			}
 			time.Sleep(5 * time.Millisecond)
 		}
+	}
+}
+
+// reapOnPollScope is a fake scope whose FIRST Members() poll is the moment the
+// leader is reaped: the poll returns an empty scope and simultaneously flips the
+// mocked /proc/<pid>/stat reads to the errno the kernel actually returns for a
+// task that disappeared between open() and read(). The initial sample is seeded
+// (monitorScopeMembership does not poll for it), so the flip is deterministic:
+// sample 1 sees a live member, every later sample sees the reaped one.
+type reapOnPollScope struct {
+	confineFakeScope
+	ref    string
+	reaped *atomic.Bool
+}
+
+func (s *reapOnPollScope) Reference() string { return s.ref }
+
+func (s *reapOnPollScope) Members() ([]int, error) {
+	s.reaped.Store(true)
+	return nil, nil
+}
+
+// AIRA-112 regression. `read(/proc/<pid>/stat)` returns ESRCH — not ENOENT —
+// when a task is reaped between the open and the read, which is exactly what
+// happens to a sub-100ms run's leader between two membership samples. Only
+// ENOENT satisfies errors.Is(err, os.ErrNotExist), so processLive used to call
+// that definitive kernel answer `processUnknown`, the sampler recorded a
+// residual Gap for a process it had positive proof was gone, and a run whose
+// leader WAS positively observed in cgroup.procs was downgraded from contained
+// to unverified. That downgrade is what failed
+// TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration intermittently
+// (~1-2% of `/bin/sh -c printf ok` launches on this kernel, reproduced with
+// -count=200 and instrumented to this exact errno).
+func TestAIRA112ReapedLeaderIsNotAResidualGap(t *testing.T) {
+	oldBoot, oldStat, oldCgroup := readBootIDFn, readProcStatFn, readProcCgroupFn
+	t.Cleanup(func() { readBootIDFn, readProcStatFn, readProcCgroupFn = oldBoot, oldStat, oldCgroup })
+	leader := PIDIdentity{PID: 9110, StartTick: 5150, BootID: "boot"}
+	readBootIDFn = func() (string, error) { return "boot", nil }
+	reaped := &atomic.Bool{}
+	readProcStatFn = func(int) ([]byte, error) {
+		if reaped.Load() {
+			return nil, &fs.PathError{Op: "read", Path: "/proc/9110/stat", Err: syscall.ESRCH}
+		}
+		return procStatForTest('S', leader.StartTick), nil
+	}
+	readProcCgroupFn = func(int) ([]byte, error) {
+		t.Errorf("a reaped leader must never be probed for a cgroup migration")
+		return nil, errors.New("unreachable")
+	}
+	scope := &reapOnPollScope{ref: "/fake/aira112-scope", reaped: reaped}
+	stop := make(chan struct{})
+	result := make(chan scopeMonitorResult, 1)
+	go monitorScopeMembership(scope, leader, []int{leader.PID}, stop, result)
+	close(stop)
+	summary := <-result
+	if summary.Gap {
+		t.Fatalf("a leader the kernel proved gone (ESRCH) was recorded as an unreadable gap: %+v", summary)
+	}
+	if summary.LeaderMigrated {
+		t.Fatalf("a reaped leader was reported migrated: %+v", summary)
+	}
+	if summary.Escape != nil {
+		t.Fatalf("a reaped leader was reported as an escape: %+v", summary)
+	}
+}
+
+// The other direction, so the ESRCH fix cannot be widened into "any read error
+// means dead": a leader whose /proc/<pid>/stat is genuinely unreadable (EACCES
+// under hidepid, say) carries NO proof of absence and must still be a gap.
+func TestAIRA112UnreadableLeaderStatIsStillAGap(t *testing.T) {
+	oldBoot, oldStat, oldCgroup := readBootIDFn, readProcStatFn, readProcCgroupFn
+	t.Cleanup(func() { readBootIDFn, readProcStatFn, readProcCgroupFn = oldBoot, oldStat, oldCgroup })
+	leader := PIDIdentity{PID: 9111, StartTick: 5151, BootID: "boot"}
+	readBootIDFn = func() (string, error) { return "boot", nil }
+	blocked := &atomic.Bool{}
+	readProcStatFn = func(int) ([]byte, error) {
+		if blocked.Load() {
+			return nil, &fs.PathError{Op: "read", Path: "/proc/9111/stat", Err: syscall.EACCES}
+		}
+		return procStatForTest('S', leader.StartTick), nil
+	}
+	readProcCgroupFn = func(int) ([]byte, error) { return nil, errors.New("hidepid") }
+	scope := &reapOnPollScope{ref: "/fake/aira112-scope", reaped: blocked}
+	stop := make(chan struct{})
+	result := make(chan scopeMonitorResult, 1)
+	go monitorScopeMembership(scope, leader, []int{leader.PID}, stop, result)
+	close(stop)
+	summary := <-result
+	if !summary.Gap {
+		t.Fatalf("an unreadable leader stat carries no proof of absence and must record a gap: %+v", summary)
+	}
+	if summary.LeaderMigrated {
+		t.Fatalf("an unreadable leader stat was falsely reported migrated: %+v", summary)
+	}
+}
+
+// processLive's own contract, pinned per errno so the mapping cannot regress
+// silently underneath the sampler.
+func TestAIRA112ProcessLiveMapsAbsenceErrnosToDead(t *testing.T) {
+	oldBoot, oldStat := readBootIDFn, readProcStatFn
+	t.Cleanup(func() { readBootIDFn, readProcStatFn = oldBoot, oldStat })
+	readBootIDFn = func() (string, error) { return "boot", nil }
+	identity := PIDIdentity{PID: 4242, StartTick: 77, BootID: "boot"}
+	for _, testCase := range []struct {
+		name string
+		err  error
+		want processLiveness
+	}{
+		// The kernel's two distinct ways of saying "this pid no longer names a
+		// task": ENOENT when the /proc entry is already gone at open(), ESRCH
+		// when the task is reaped between the open and the read.
+		{name: "enoent-at-open", err: &fs.PathError{Op: "open", Path: "/proc/4242/stat", Err: syscall.ENOENT}, want: processDead},
+		{name: "esrch-at-read", err: &fs.PathError{Op: "read", Path: "/proc/4242/stat", Err: syscall.ESRCH}, want: processDead},
+		// Anything else is a read failure, not an absence proof.
+		{name: "eacces", err: &fs.PathError{Op: "open", Path: "/proc/4242/stat", Err: syscall.EACCES}, want: processUnknown},
+		{name: "eio", err: &fs.PathError{Op: "read", Path: "/proc/4242/stat", Err: syscall.EIO}, want: processUnknown},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			readProcStatFn = func(int) ([]byte, error) { return nil, testCase.err }
+			if got := processLive(identity); got != testCase.want {
+				t.Fatalf("processLive(%v) = %v, want %v", testCase.err, got, testCase.want)
+			}
+		})
 	}
 }

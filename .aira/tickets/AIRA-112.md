@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-112","project":"aira","title":"Flake: TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration reports unverified scope integrity for a sub-millisecond job","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["confine","flake","testing"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-112","project":"aira","title":"Flake: TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration reports unverified scope integrity for a sub-millisecond job","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["confine","flake","testing"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-112","to":"AIRA-126"}]}
 ---
 Reproduced on CLEAN origin/master (8f16769) with no local changes, while merging AIRA-106.
 
@@ -32,3 +32,154 @@ Either give the test's job enough dwell for the sampler to take one observation,
 ## Handling in AIRA-106
 
 Recorded, not worked around: AIRA-106's own full-suite run is reported as green EXCEPT this test, with the clean-master reproduction above as the evidence that it is not AIRA-106's. AIRA-106's own tests (internal/daemon, internal/install, cmd/aira, and the five real-cgroup slice-ceiling tests under AIRA_REAL_CGROUP=1) are green.
+
+## Resolution
+
+**This was NOT the accepted sub-2ms sampling coverage gap.** The ticket's stated
+hypothesis — that a job too short-lived for the sampler never yields a positive
+in-scope observation, so `unverified` is the honest answer — was checked first and
+does not fit the observed failure. The failure message is `unverified DESPITE
+positive running observation`: the leader *was* positively verified in
+`cgroup.procs` at launch (the `running` ledger event was appended,
+`scopeVerified == true`), and the verdict was then *downgraded* from `contained`
+to `unverified` afterwards. A genuinely unobserved job takes the other branch of
+`assertHonestExitScope` and passes. So the test was right and something in the
+production classifier was wrong.
+
+### Root cause: an ESRCH read of `/proc/<pid>/stat` was misread as an evidence gap
+
+Reproduced on this branch with `-count=200` under `AIRA_REAL_CGROUP=1`, then
+instrumented at every `summary.Gap = true` site in `monitorScopeMembership` and at
+`classifyLaunchScopeIntegrity`'s inputs. The captured evidence, for both failing
+`/bin/sh -c printf ok` launches in that run:
+
+    monitor={LeaderMigrated:false HadDescendants:false Gap:true Escape:<nil>}
+    teardown={Observed:true Empty:true DescendantKilled:false Gap:false}
+    AIRA_DEBUG_PLIVE readerr err=&fs.PathError{Op:"read", Path:"/proc/327679/stat", Err:0x3} errno=no such process
+
+`Err:0x3` is `ESRCH`. `processLive` (`internal/runner/runner_linux.go`) mapped a
+failed `/proc/<pid>/stat` read to `processDead` only via
+`errors.Is(err, os.ErrNotExist)`. Go maps `ENOENT` and `ENOTDIR` to
+`os.ErrNotExist` — never `ESRCH`. But the kernel has *two* ways of saying the pid
+is gone: `ENOENT` when the `/proc` entry is already unlinked at `open()`, and
+`ESRCH` from the `read()` when the task is reaped between that open and the read.
+The second is the ordinary case for a leader that exits between two membership
+samples. `processLive` therefore returned `processUnknown`, the sampler's
+ever-member loop recorded `summary.Gap = true` for a process it had positive
+kernel proof was gone, and `classifyLaunchScopeIntegrity`'s
+`Teardown.Observed && Monitor.Gap` branch downgraded a genuinely contained run to
+`unverified`. Measured at roughly 0.5% of `printf ok` launches on this kernel
+(2 of ~200 in one run, 3 of ~200 in another).
+
+This was a false *negative* on containment attestation — AIRA discarding a
+definitive kernel answer and reporting `unverified` when it could honestly report
+`contained`. It also affected every other `processLive` consumer, including the
+detached-run reconcile path's `processLive(record.SupervisorPID)`, where an ESRCH
+read left a provably-exited supervisor `processUnknown`.
+
+### Fix
+
+One semantic correction plus its documentation, in `internal/runner/runner_linux.go`:
+
+- New `procAbsenceProof(err)` helper: a `/proc/<pid>` read failure is proof of
+  absence for `ENOENT` **or** `ESRCH`, and for nothing else. `processLive` uses it
+  in place of the bare `errors.Is(err, os.ErrNotExist)`.
+- The helper's doc comment records why (both errnos, which syscall produces which,
+  and why Go's `ErrNotExist` misses one), and that only the *absence* side is
+  widened: every caller acting on a positive claim (`witnessedEscape`, the
+  leader-migration probe, `initialMigrated`) requires `processAlive`, so a wider
+  DEAD side cannot fabricate an escape, a migration, or a containment claim.
+
+The sampler itself is untouched — no widened dwell, no retried sample window, no
+new machinery, no weakened attestation. Per the ticket's own instruction, the
+sampler was not weakened to make the test pass; a definitive kernel answer that
+was being thrown away is now used.
+
+### Tests (TDD, all three verified failing against the old behaviour first)
+
+In `internal/runner/scope_monitor_linux_test.go`:
+
+- `TestAIRA112ReapedLeaderIsNotAResidualGap` — drives `monitorScopeMembership`
+  through the exact reproduced sequence: a seeded first sample sees a live member,
+  the first `Members()` poll flips the mocked stat reads to `ESRCH`, and the
+  summary must carry no `Gap`, no `LeaderMigrated`, no `Escape`. Fails on the old
+  code with `Gap:true` — the precise production symptom.
+- `TestAIRA112UnreadableLeaderStatIsStillAGap` — the opposite direction, so the
+  fix cannot be widened into "any read error means dead": `EACCES` (hidepid)
+  carries no proof of absence and must still record a gap.
+- `TestAIRA112ProcessLiveMapsAbsenceErrnosToDead` — pins `processLive`'s errno
+  contract per case: `ENOENT`→dead, `ESRCH`→dead, `EACCES`→unknown, `EIO`→unknown.
+
+Soak: `TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration` with
+`-count=400` under `AIRA_REAL_CGROUP=1` (1200 real-cgroup launches), where the
+pre-fix code failed within 200-300.
+
+### Second, independent defect found in the same test — filed as AIRA-126
+
+The `-count=400` soak surfaced a different failure in the same test's third
+scenario (`/bin/sleep 0.04` against a 50ms timeout, which deliberately straddles
+its own deadline):
+
+    U_RUN_RECONCILE_REQUIRED: kill intent won before terminal evidence
+
+Traced to source and confirmed structurally independent of this fix (none of
+`processLive`'s call sites are on the kill/terminal-CAS path): when the timer and
+the child's exit are simultaneously ready and the timer branch wins,
+`killWithIntent` has already published a durable kill intent, `killScope` finds
+`len(pids) == 0` and deliberately refuses to call an empty scope a completed kill,
+and Launch's terminal CAS then returns a non-terminal record requiring reconcile
+for a run that finished cleanly and on time. An isolated 800-iteration probe of
+that scenario alone hit it at iteration 43 (~2%; ~0.25% per full-suite run).
+
+Whether that should arbitrate to `exited` (honour the pending wait outcome) or to
+`killed` (treat a provably-empty scope as a vacuously-completed kill, using the
+already-computed but unused `killResult.Empty`) is a kill-arbitration design
+decision, which CLAUDE.md puts in the two-loop class. It is **not** worked around
+in production code here. AIRA-126 carries the full trace.
+
+The test's third scenario now accepts that as an explicitly-evidenced third
+outcome — `LaunchError.Code == "U_RUN_RECONCILE_REQUIRED"`, a record carrying an
+unproven kill intent (`Present && !Completed`), both `E_RUN_TIMEOUT` and
+`U_RUN_RECONCILE_REQUIRED` error codes, a non-terminal status, and zero terminal
+records. Any other error, or a record missing any part of that signature, still
+fails. The comment points at AIRA-126 and says to tighten it back when that lands.
+
+### Residual coverage gaps, written down and accepted
+
+1. **The real sub-2ms gap still exists and is still honest.** A leader that exits
+   before the post-`Start()` `scope.Members()` read is never positively observed,
+   `scopeVerified` stays false, no `running` event is appended, and the run reads
+   `unverified`. That was observed twice in the same 200-iteration run and the
+   test passes on it, because `assertHonestExitScope`'s `ScopeUnverified` branch
+   requires exactly that: no positive observation. Unchanged by this ticket; it
+   remains the accepted sampling gap already documented on
+   `classifyLaunchScopeIntegrity` and `scopeMembershipSampleInterval`.
+2. **`observeProcessCgroup`'s own died-between-checks window is still a `Gap`.**
+   If a process is alive at the `processLive` guard and reaped a few instructions
+   later inside `observeProcessCgroup`, that observation returns `Readable:false`
+   and the three call sites (the leader-migration probe, the descendant loop, and
+   `attestScopeTeardown`'s residual check) record a gap. That is the same
+   *class* as this defect but a different, much narrower window; it did not fire
+   once in ~1200 instrumented real launches, and its verdict is
+   conservative-and-honest (`unverified`, never a false positive), so it is left
+   alone rather than changed without a reproduced failure. Recorded here so it is
+   not silent.
+3. `processStartTick` still returns 0 on any read error, which the sampler treats
+   as an unknown identity for a *member* pid. That is correct: for a descendant we
+   never managed to stat, we genuinely cannot attest anything. The leader is
+   substituted with its known identity before that check, so it never trips.
+
+### Verification (exact exit codes, every heavy command under `aira confine --`)
+
+Run on the rebased branch (`origin/master` at `16be299`):
+
+- `aira confine -- go build ./...` — exit **0**
+- `aira confine -- go vet ./...` — exit **0**
+- `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` — exit **0**; all 14
+  tested packages `ok` (`internal/cgrouptest` has no test files), zero FAIL, zero
+  panic.
+- `gofmt -l internal/ cmd/` — clean (no output), exit 0.
+- Targeted soak, before the rebase:
+  `AIRA_REAL_CGROUP=1 aira confine -- go test ./internal/runner/ -run TestRealCgroupTimeoutExitRaceHasOneTerminalWithArbitration -count=400`
+  — exit **0** (`ok aira/internal/runner 301.608s`), 1200 real-cgroup launches.
+  The same command on the pre-fix tree failed inside 200-300 iterations.

@@ -1932,6 +1932,29 @@ func (r *Runner) readSupervisorLeaseLive(ctx context.Context, runID string) (boo
 	return r.supervisorLeaseReadFn(ctx, runID)
 }
 
+// procAbsenceProof reports whether a /proc/<pid> read failure is the kernel's
+// OWN proof that the pid no longer names a live task, as opposed to a failure
+// to read (permissions, hidepid, I/O) that establishes nothing.
+//
+// The kernel has two distinct ways of saying "gone" here. If the /proc entry
+// has already been unlinked when the file is opened, open() fails with ENOENT.
+// If the task is reaped between that open and the read — the ordinary case for
+// a job whose leader exits between two membership samples — the open succeeds
+// against the still-present entry and the READ fails with ESRCH instead.
+// errors.Is(err, os.ErrNotExist) matches only the first (Go maps ENOENT and
+// ENOTDIR to ErrNotExist, never ESRCH), so treating ESRCH as merely unreadable
+// converts a definitive kernel answer into a manufactured evidence gap, and a
+// run whose leader was positively observed in cgroup.procs is then downgraded
+// from contained to unverified (AIRA-112).
+//
+// Only absence is inferred here, never liveness: every caller that acts on a
+// positive claim (witnessedEscape, the leader-migration probe) requires
+// processAlive, so widening the DEAD side cannot fabricate an escape, a
+// migration, or a containment claim.
+func procAbsenceProof(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH)
+}
+
 func processLive(identity PIDIdentity) processLiveness {
 	bootID, err := readBootIDFn()
 	if err != nil || bootID == "" || identity.BootID == "" {
@@ -1945,7 +1968,7 @@ func processLive(identity PIDIdentity) processLiveness {
 	}
 	data, err := readProcStatFn(identity.PID)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+		if procAbsenceProof(err) {
 			return processDead
 		}
 		return processUnknown
