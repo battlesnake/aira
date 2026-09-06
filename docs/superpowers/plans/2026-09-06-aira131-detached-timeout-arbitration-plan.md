@@ -1,12 +1,28 @@
 # AIRA-131 — detached run-timeout kill/terminal arbitration
 
-**Status:** plan (plan-review pending). Implementation is NOT in this commit.
+**Status:** plan v2 (plan-gate fix applied). Implementation is NOT in this commit.
 **Branch:** `aira131-detached-timeout-arbitration`
 **Base:** `origin/master` @ `dc37705`
 **Ticket:** AIRA-131, filed from AIRA-126
 (`docs/superpowers/plans/2026-09-06-aira126-kill-terminal-arbitration-plan.md` §6).
 **Relates:** AIRA-126 (foreground path, merged), AIRA-136 (`--cpu-timeout`,
 refused with `--detach`).
+
+**Plan-gate revision (v1 → v2).** The Fable plan gate FAILed v1 on one blocking
+finding: v1's §6.3 broke its own "byte-for-byte today's behaviour" promise on the
+**drained-then-refused** path when `StdinConnect` is set, because it returned with
+`leaderReaped` still false after having emptied `waitCh`, which drove the
+input-plane defer (`detach_linux.go:374-392`) into a 2s stall followed by an
+unlocked `input-abort-incomplete` append of a stale, intent-less `record` that
+`replay` adopts wholesale — durably erasing the very kill-intent this branch had
+just published. The finding was re-verified against the real source at
+`019ab4b` before being folded in (§2.3 records the verification). v2 sets
+`leaderReaped = true` the instant the bounded drain succeeds, adds §8(7) for the
+one residual delta that produces, and adds test T7. §5 also gains the ledger-level
+backstop the gate noted, §6.3 gains the required control-flow structure, and §7
+gains the explicit statement of what T4's concurrent writer must be. Nothing else
+in v1 changed: the gate verified the rest of the plan against source and reported
+it sound.
 
 ---
 
@@ -33,6 +49,9 @@ The ticket's line numbers were approximate. Confirmed positions:
 | --- | --- |
 | detached wait/timeout region | `internal/runner/detach_linux.go:492-522` |
 | the timer branch itself | `internal/runner/detach_linux.go:503-519` |
+| **input-plane abort defer** (`StdinConnect` only) | `internal/runner/detach_linux.go:374-392` |
+| `leaderReaped` declaration / the shared set at `:523` | `internal/runner/detach_linux.go:355`, `:523` |
+| `waitCh` creation + its single-send goroutine | `internal/runner/detach_linux.go:435-439` |
 | `appendDetachedEvidenceLocked` | `internal/runner/detach_linux.go:650-665` |
 | `terminalizeDetachedNoChild` read-site | `internal/runner/detach_linux.go:667-704` |
 | `finalizeDetachedTerminalLocked` read-site | `internal/runner/detach_linux.go:715-794` |
@@ -104,6 +123,64 @@ is any detached code path that ever SETS it** — confirmed by
    as `appendDetachedEvidenceLocked` already does.
 4. **`killWithIntent` releases the run lock before returning**
    (`runner_linux.go:2290 defer unlockFile(lock)`). This is the fact §5 turns on.
+
+### 2.3 The input-plane abort defer — the fact v1 missed, verified line by line
+
+This is the constraint the plan gate's blocking finding rests on, and it is
+load-bearing for §6.3. Read verbatim at `detach_linux.go:374-392`:
+
+```go
+defer func() {
+	inputPlane.closeTerminal()
+	if !childStarted || leaderReaped {
+		return
+	}
+	killDetachedInputChild(scope, cmd)
+	if waitCh == nil {
+		return
+	}
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-waitCh:
+		leaderReaped = true
+	case <-timer.C:
+		record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
+		_, _ = r.append(ledgerEvent{Kind: "input-abort-incomplete", Run: record})
+	}
+}()
+```
+
+Four facts, each checked against source rather than assumed:
+
+1. **The defer exists only under `StdinConnect`** — it is installed inside the
+   `if req.StdinConnect` arm (`:357-392`). On the non-connect path (`:402-419`,
+   which is what the §4 reproduction and T1-T6 as written use) there is no such
+   defer and `leaderReaped` is read only at `:376`, so it is inert.
+2. **It fires on EVERY return from `launchDetachedValidated` after `:357`**,
+   including the timer branch's `U_RUN_RECONCILE_REQUIRED` returns. It is a
+   `defer`, not a branch of the happy path.
+3. **`waitCh` is buffered `1` and its goroutine sends EXACTLY ONCE**
+   (`:435-439`: `waitCh = make(chan waitOutcome, 1)`, then one `waitCh <- …`
+   after `cmd.Wait()`). So a value received from `waitCh` is gone forever;
+   **nothing ever refills it.**
+4. **Today the timer branch never drains `waitCh` before returning**
+   (`:503-509`), so whenever this defer runs after a timeout the buffered outcome
+   is still there: the defer's `case <-waitCh` wins immediately, sets
+   `leaderReaped = true`, and appends **nothing**. That is the "byte for byte"
+   behaviour §1 promises to preserve.
+
+**The consequence for any design that drains.** Once the arbitrated arm receives
+from `waitCh`, fact 3 makes that channel permanently empty. If the arm then
+returns without setting `leaderReaped`, fact 2 puts the defer into the `!leaderReaped`
+path with an empty channel: it calls `killDetachedInputChild`, **blocks the full
+2 seconds**, then executes the `<-timer.C` arm — an UNLOCKED `r.append` of the
+launch-local `record`, which is the pre-timeout snapshot and carries **no
+`KillIntent`** at all. `replay` adopts a plain event's `Run` wholesale
+(`ledger.go:415`), so that append durably **erases** the `kill-intent`
+`killWithIntent` published, and any concurrent actor's `kill-completed` with it.
+That is both a new 2s stall and a durable-evidence regression, on exactly the
+path the ticket says must not change. §6.3 closes it.
 
 ---
 
@@ -233,6 +310,18 @@ machinery refusing to assume is not a proof; it is the same
 disposition therefore re-decides under the same lock as the append, and
 `decideNotExecutedDisposition` is reused verbatim so both paths share one rule.
 
+**A second, ledger-level backstop behind the helper's own terminal check.**
+`ledger.append` itself refuses any non-telemetry append after a terminal record
+(`ledger.go:208-213`: `case event.Kind != "telemetry": return event,
+fmt.Errorf("E_JOURNAL_CORRUPT: record after terminal run %s", …)`). So even if
+`appendDetachedNotExecutedLocked`'s `current.Status.Terminal()` guard were ever
+bypassed, a disposition could not be written over a committed terminal record —
+it would surface as an `E_JOURNAL_CORRUPT` error, which the caller turns into
+`U_RUN_RECONCILE_REQUIRED` (the honest arm), never into a silent corruption. This
+is defence in depth, not a substitute for the guard: the guard is what makes the
+already-terminal case a clean refusal rather than an error, and the sequence /
+`Completed` CAS below is what the ledger level does **not** provide.
+
 **Sub-question — is the read/append pair itself atomic?** Yes. Within
 `appendDetachedEvidenceLocked`, `r.ledger.current(id)` and `r.append(...)` are
 both inside the per-run flock, and every writer of a run record in the codebase
@@ -317,6 +406,7 @@ Notes that are load-bearing, not stylistic:
 ```go
 case <-timer.C:
 	attempt, killErr := r.killWithIntent(ctx, id, "run-timeout", killPolicy{Enforce: false})
+	arbitrated := false
 	if killErr != nil || !attempt.Kill.Completed {
 		// AIRA-131. The deadline can fire against a scope the leader has already
 		// left: killWithIntent has published a durable intent that killScope
@@ -325,21 +415,42 @@ case <-timer.C:
 		// dead at that instant, the established facts are the child's own exit and
 		// the absence of any delivered kill — honour the pending wait rather than
 		// discard it. Every other shape keeps the unchanged unevaluated arm.
-		arbitrated := false
 		if decideTimeoutIntentNotExecuted(killErr, attempt, processLive(record.PIDIdentity)) {
 			// Drain BEFORE publishing: a drain that expires must leave no durable
 			// disposition behind, so the timed-out case is byte-for-byte today's.
 			// A dead leader's cmd.Wait() is already blocked in wait4 on our own
 			// child, so only the reap and one scheduler wakeup remain; the bound is
 			// a pure anti-hang guard whose expiry can only produce today's outcome.
+			drain := time.NewTimer(arbitrationWaitBound(r.grace))
 			select {
 			case outcome = <-waitCh:
+				if !drain.Stop() {
+					select {
+					case <-drain.C:
+					default:
+					}
+				}
+				// The drain SUCCEEDED, so wait4 has reaped the leader and this
+				// supervisor now holds its exit evidence. That is a KERNEL FACT,
+				// independent of whether the disposition below is honoured — and
+				// waitCh is buffered 1 with a single-send goroutine (:435-439), so
+				// nothing will ever refill it. Record the reap HERE, before any
+				// path that can return: otherwise a refused disposition returns
+				// with leaderReaped false and drives the input-plane defer
+				// (:374-392) into a 2s block on an empty channel followed by an
+				// unlocked input-abort-incomplete append of the pre-timeout
+				// `record`, which replay adopts wholesale (ledger.go:415),
+				// durably ERASING the kill intent just published. See §2.3.
+				leaderReaped = true
 				honoured, dispositionErr := r.appendDetachedNotExecutedLocked(id, true, attempt.IntentSequence, attempt.Current)
 				if dispositionErr != nil {
 					return nil, launchErr("U_RUN_RECONCILE_REQUIRED", dispositionErr)
 				}
 				arbitrated = honoured
-			case <-time.After(arbitrationWaitBound(r.grace)):
+			case <-drain.C:
+				// Expired: waitCh is UNTOUCHED and no durable disposition exists,
+				// so leaderReaped stays false and this path — including the
+				// input-plane defer's kill-then-receive — is byte-for-byte today's.
 			}
 		}
 		if !arbitrated {
@@ -348,16 +459,39 @@ case <-timer.C:
 			}
 			return nil, launchErr("U_RUN_RECONCILE_REQUIRED", killErr)
 		}
-		break // fall through to the shared post-wait continuation
 	}
-	completed := attempt.Current
-	... unchanged ...
-	outcome = <-waitCh
+	if !arbitrated {
+		completed := attempt.Current
+		... the four unchanged assignment lines ...
+		if err := r.appendDetachedEvidenceLocked(id, "kill-completed", completed); err != nil {
+			return nil, launchErr("U_RUN_RECONCILE_REQUIRED", err)
+		}
+		outcome = <-waitCh
+	}
 ```
 
-(The literal `break` is illustrative — in Go the arm simply ends; the
-implementation will structure this so the arbitrated arm falls out of the
-`select` with `outcome` already set, without duplicating the continuation.)
+**Required control flow, not a stylistic preference.** v1's illustrative `break`
+sat inside a *nested* `select` and would therefore have broken out of the inner
+select, falling into the proven-kill continuation with `attempt.Kill.Completed`
+false — publishing a fabricated `kill-completed` and then blocking forever on an
+already-drained `waitCh`. The implementation MUST structure the arm so that the
+arbitrated case:
+
+1. exits the **outer** `select` with `outcome` already set, and
+2. does **not** execute the `completed := attempt.Current` proven-kill
+   continuation at `:511-518`.
+
+The `arbitrated` flag hoisted above the `if` (shown here) achieves both while
+leaving the proven-kill statements textually unchanged — only re-indented. Any
+other structure is acceptable if it satisfies (1) and (2); T1 and T6 together
+pin the outcome either way.
+
+**`leaderReaped = true` on drain success — the invariant, stated once.**
+`leaderReaped` means "this supervisor has taken the leader's outcome out of
+`waitCh`". It is a statement about the *channel*, not about whether the run was
+successfully dispositioned, so it must be set at the receive and nowhere later.
+The shared `leaderReaped = true` at `:523` is then redundant on the arbitrated
+path and unchanged on every other — it stays exactly as it is.
 
 **Ordering is deliberate and is the one place this differs in shape from the
 foreground path.** Foreground arbitrates → drains → merges → decides the
@@ -370,8 +504,13 @@ durable state at all**, which is exactly the ticket's "must NOT change today's
 behaviour".
 
 **Cost of a refused disposition after a successful drain:** the drained outcome
-is discarded and the launch returns `U_RUN_RECONCILE_REQUIRED` — identical to
-today, since today never drains at all. Accepted, and listed in §8.
+is discarded and the launch returns `U_RUN_RECONCILE_REQUIRED` — the same
+*reported* outcome as today, since today never drains at all. With
+`leaderReaped = true` set at the receive there is exactly **one** residual
+behavioural delta, and only under `StdinConnect`: the input-plane defer takes its
+early-return arm, so it no longer calls `killDetachedInputChild`. That is written
+down in full as §8(7) rather than waved through. The `--stdin-connect` +
+refused-disposition shape is pinned by T7.
 
 **What happens after `arbitrated`:** control reaches the existing shared
 continuation unchanged — `leaderReaped = true`, `inputPlane.closeTerminal()`,
@@ -418,11 +557,45 @@ duplicated harness.
 | T4 | `TestAIRA131DetachedCompletedIntentIsNotDowngradedByNotExecuted` | a concurrent actor appends a **non-terminal** `kill-completed` (`KillIntent.Completed:true` + completed `ScopeKill`) in the window between the `kill-intent` append and the disposition append → the launch returns `U_RUN_RECONCILE_REQUIRED` and the concurrent intent survives **byte for byte** in the ledger | §5's added sequence/`Completed` CAS. **This is the test that pins §5's answer** |
 | T5 | `TestAIRA131DetachedArbitrationDrainBoundLeavesNoDisposition` | `Grace` at the floor and a stdin hold far beyond it → the bounded drain expires → `U_RUN_RECONCILE_REQUIRED`, **no** `kill-not-executed` event in the ledger, no `NotExecuted`, 0 terminal records | drain-before-publish ordering (§6.3) |
 | T6 | `TestAIRA131DetachedTimeoutAgainstLiveLeaderStillKills` | a scope whose `Terminate`/`Kill` really signal the adopted leader, deadline fires against a populated scope → the **pre-existing** arm: `StatusKilled`, `E_RUN_TIMEOUT`, `KillIntent.Completed`, `ScopeKill.Completed` | any regression of the branch this ticket touches. Closes §2.2(2)'s coverage gap |
+| T7 | `TestAIRA131DetachedStdinConnectRefusedDispositionLeavesLedgerIntact` | **`StdinConnect: true`** + `Timeout` + T4's refused disposition, i.e. the drain SUCCEEDS and the disposition is then refused. Asserts: (a) **no `input-abort-incomplete` event** anywhere in the journal; (b) the ledger's `kill-intent` — and the concurrent `kill-completed` written into the window — **survives byte for byte** (`KillIntent.Present`, `Completed:true`, its `Sequence` unchanged, `!NotExecuted`); (c) the launch returns `U_RUN_RECONCILE_REQUIRED` **within the drain bound**, not after an extra ~2s (assert wall-clock < `arbitrationWaitBound(grace)` + a generous margin that is still well under 2s); (d) 0 terminal records | `leaderReaped = true` at the drain receive (§6.3). Without it the defer blocks 2s and then durably erases the intent — the plan gate's blocking finding |
 
-T4's window is ≥ the bounded drain (≈600ms in the harness), so a ledger poller
-lands inside it reliably; no new production test hook is introduced. If review
-judges the poll racy, the fallback is an existing-style `r.beforeRunningAppendFn`
-sibling hook — but only if needed, and it must not be reachable in production.
+**T4's concurrent writer must be a direct locked `r.append`, not a real
+`Kill()`.** In the arbitrated state the scope is empty by construction, so a real
+`Kill()` → `killScope` returns at `len(pids) == 0` and `finishDetachedKill`
+(`runner_linux.go:2410-2434`) appends **nothing**: a `Kill()`-driven T4 would be
+vacuous. The test therefore takes the per-run lock itself and appends a
+non-terminal `kill-completed` record carrying `KillIntent{Present, Completed:true,
+Sequence: <the launch's>}` plus a completed `ScopeKill` — *simulating* what
+`finishDetachedKill` writes when the scope is populated. This is deliberate and
+must not be mistaken for a real-`Kill()` race; the assertion is about what
+`appendDetachedNotExecutedLocked` does when it reads such a record, which is
+precisely the CAS §5 adds. T7 reuses the same device.
+
+T4's and T7's window is ≥ the bounded drain (≈600ms in the harness), so a ledger
+poller lands inside it reliably; no new production test hook is introduced. If
+review judges the poll racy, the fallback is an existing-style
+`r.beforeRunningAppendFn` sibling hook — but only if needed, and it must not be
+reachable in production.
+
+**T7's harness shape — verified feasible, not assumed.** T1's `startFn` already
+overwrites `cmd.Stdin` with `gatedStdin` immediately before `cmd.Start()`
+(`detached_timeout_arbitration_linux_test.go:56-67`). That override also applies
+under `StdinConnect`, where production sets `cmd.Stdin = inputPlane.inputR`
+(`detach_linux.go:393`) — a `*os.File`, which `os/exec` would dup rather than
+copy, giving no goroutine to hold `Wait()` open. Overwriting it with the
+non-`*os.File` `gatedStdin` restores the copy goroutine and hence the
+reaped-but-outcome-pending window T1 depends on, while the `if req.StdinConnect`
+arm (and therefore the `:374-392` defer) is genuinely taken. The plane's own
+`inputPlane.inputR` is simply closed unused at `:433`, and `inputPlane.serve()`
+runs with no client dialling it. T7 sets `Config.InputRuntimeDir` (or
+`r.inputRuntimeDir`) from the existing `newRunInputRuntimeDir(t)` helper
+(`run_input_server_linux_test.go:403`), as `TestRunInputPathFailureOccursBeforeChildStart`
+already does, so no new harness is written.
+
+**T1-T6 stay on the non-connect path** (no `StdinConnect`), where the
+`:374-392` defer is not installed at all — so they are unaffected by this fix and
+remain exactly as v1 specified them. T5 in particular (drain expired, `waitCh`
+NOT drained) is byte-for-byte unchanged.
 
 Also run, unchanged and expected green: `TestAIRA126*` (all), the whole
 `internal/runner` package, and `go build ./... && go vet ./...`. The AIRA-126
@@ -464,7 +637,33 @@ real-cgroup soak (`AIRA126_SOAK=1`) is run once as a non-regression check.
    `internal/core/core.go:1584` (AIRA-136 §3.3). When that deferral is lifted,
    the detached branch will need the `deadlineFire` actor/code plumbing the
    foreground already has; this plan deliberately does not pre-build it.
-7. **Real-cgroup detached soak.** The reproduction is hermetic and
+7. **The one residual behavioural delta of the fix, stated exactly.** Setting
+   `leaderReaped = true` at the drain receive (§6.3) means that, under
+   **`--stdin-connect` only**, a *refused* disposition after a *successful* drain
+   no longer runs `killDetachedInputChild(scope, cmd)` from the `:374-392`
+   defer — the defer takes its early-return arm after `inputPlane.closeTerminal()`.
+
+   That call is **signal-less and not evidence-bearing in this state**: the
+   arbitrated arm is only reached when `attempt.Kill.Empty && !attempt.Kill.Started`
+   (the scope was found empty by two independent reads, so `scope.Kill()` has
+   nothing to signal) and `processLive(record.PIDIdentity) == processDead` and
+   `cmd.Wait()` has returned (so the leader is reaped, and the subsequent
+   `syscall.Kill(-pid, SIGKILL)` / `cmd.Process.Kill()` can only return `ESRCH`).
+   It writes nothing to the ledger. Dropping it is therefore a no-op in observable
+   behaviour, and marginally *safer*: it removes a raw negative-PID `SIGKILL`
+   aimed at an already-reaped process-group id, which is the one component of
+   that helper that a PID recycle could in principle mis-target.
+
+   What is **not** dropped: `inputPlane.closeTerminal()` still runs
+   unconditionally as the defer's first statement, so the input socket and fd0
+   are torn down exactly as today on every return.
+
+   This delta is confined to `StdinConnect` + `Timeout` + arbitration-eligible +
+   refused-disposition. On the drain-**expired** path (T5) and on every
+   non-arbitrated path, `leaderReaped` stays false and the defer behaves byte for
+   byte as today. Accepted, pinned by T7.
+
+8. **Real-cgroup detached soak.** The reproduction is hermetic and
    deterministic. A real-cgroup detached straddle soak (the analogue of
    `TestAIRA126RealCgroupDeadlineStraddleSoak`) is **not** added: the detached
    supervisor is a separate process, so the straddle cannot be observed in-process
@@ -484,6 +683,8 @@ real-cgroup soak (`AIRA126_SOAK=1`) is run once as a non-regression check.
 | The rule silently forks between foreground and detached | both decision functions are reused verbatim; §6.4 makes any edit to them a review defect |
 | The reproduction passes vacuously | T1 fails explicitly with "vacuous: the detached timer branch never fired" if `KillIntent.Present` is false; the red run above shows the branch really is taken |
 | A red test blocks other agents | §4's env gate, deleted in the implementation phase |
+| **A drain that empties `waitCh` strands the input-plane defer** — a 2s stall plus an unlocked `input-abort-incomplete` append that durably erases the kill intent (the plan gate's blocking finding) | `leaderReaped = true` at the drain receive, before any return (§6.3); §2.3 records the mechanism; T7 pins it |
+| The arbitrated arm falls into the proven-kill continuation (v1's nested-`select` `break`) | §6.3's required control-flow contract (1)+(2); T6 would report a fabricated `kill-completed`, T1 would hang on the drained `waitCh` |
 
 ---
 
@@ -492,9 +693,11 @@ real-cgroup soak (`AIRA126_SOAK=1`) is run once as a non-regression check.
 One correctness class closed: a detached run whose child exited cleanly can no
 longer be reported as reconcile-required because a deadline fired against an
 already-empty scope, and the branch that decides it gains its first tests
-(T1-T6) where it had none. One durable-evidence CAS brought to parity with the
+(T1-T7) where it had none. One durable-evidence CAS brought to parity with the
 foreground path, with the parity question answered from the actual lock scope
-rather than assumed.
+rather than assumed. Additionally, the `--stdin-connect` abort defer's
+interaction with a drained `waitCh` is now specified and tested (T7) — closing a
+durable-evidence hazard that v1 of this plan would itself have introduced.
 
 ---
 
@@ -503,6 +706,14 @@ rather than assumed.
 - **Plan review:** Codex (Sol) + DeepSeek-pro, orthogonal lineages; Fable is the
   plan gate. Correctness-critical (kill/terminal CAS) → full two-loop, not the
   light path.
+- **Plan gate, round 1: FAIL** — one blocking finding (the drained-then-refused
+  `StdinConnect` path stranding the input-plane defer). Everything else verified
+  sound against source at `019ab4b`; the reproduction was re-run by the gate
+  (red 3/3, exit 1, ~0.34s each) and judged honest, so **the reproduction is
+  unchanged** — the finding was in the fix design, not in the repro. v2 folds in
+  `leaderReaped = true` on drain success (§6.3), the §2.3 mechanism record,
+  §8(7), T7, the §5 ledger-level backstop, the §6.3 control-flow contract, and
+  the §7 statement of what T4's concurrent writer must be. Awaiting re-gate.
 - **Build:** TDD from T1's recorded red; Opus builds (per the owner's standing
   direction for correctness-critical, architecturally subtle AIRA work).
 - **Build review:** adversarial, both false-fail and false-pass directions, with
