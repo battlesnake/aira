@@ -188,7 +188,17 @@ registers with no placement handshake; and a ledger-only worker SIGKILLed before
 reporting anything takes the mid-run-death path — retired, replacement
 requested, containment not stripped — rather than any placement diagnosis.
 
-## Dependency
+## Dependency — RESOLVED
 
-AIRA-121 (PR #72) is open, not merged. This branch is based on it. Rebase onto
-master once #72 lands.
+AIRA-121 (PR #72) was open and unmerged when this branch was cut, so this branch
+was stacked on `aira121-ci-shim-mode`. #72 merged as `8f134ee` on 2026-09-06;
+this branch is now rebased onto `master` and targets `master`, which is what
+makes it mergeable and AIRA-123 markable as done there.
+
+The rebase picked up one AIRA-121 commit this branch had never seen, `019def9`
+("review round 3 — F4 shim budget floor missing"), which floors a declared or
+cgroup-derived shim budget at 4 GiB and re-sized the round-3 `readShimMemory`
+tests to 8 GiB. It touches `internal/install/mode.go` and
+`internal/daemon/shim_test.go`, both of which this change also edits; the rebase
+merged cleanly and the whole gate was re-run against the rebased tree rather
+than trusting the pre-rebase run.

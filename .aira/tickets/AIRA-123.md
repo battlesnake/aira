@@ -171,15 +171,19 @@ merge-target one, which is not this branch's to fix.
    edit in that file is in scope and correct and is unchanged; only the
    frontmatter regression is undone, so this branch now touches AIRA-121's body
    and not its status.
-2. **BLOCKING (merge target) — the base is `aira121-ci-shim-mode` (PR #72,
-   still open), not `master`.** NOT FIXED HERE, deliberately: the two available
-   fixes are to merge #72 (not this agent's to do) or to rebase this branch onto
-   master carrying #72's ~5.4k lines, which would land AIRA-121's code through
-   AIRA-123's PR and bypass #72's own merge record — the same class of dishonesty
-   as finding 1, one size larger. The correct sequence is unchanged and stated in
-   the PR body: merge #72 first, then this branch retargets to master (GitHub
-   retargets automatically) and rebases. Until then this PR is **not mergeable to
-   master** and AIRA-123 must not be marked done on master.
+2. **BLOCKING (merge target) — the base was `aira121-ci-shim-mode` (PR #72), not
+   `master`.** FIXED, by the prescribed sequence rather than by swallowing #72.
+   The two fixes available while #72 was open were to merge it (not this agent's
+   to do) or to rebase this branch onto master carrying #72's ~5.4k lines, which
+   would have landed AIRA-121's code through AIRA-123's PR and bypassed #72's own
+   merge record — the same class of dishonesty as finding 1, one size larger. #72
+   merged as `8f134ee` while these fixes were being made; GitHub retargeted this
+   PR to `master`, and the branch is now rebased onto `master` and merges to it
+   cleanly. The rebase pulled in one AIRA-121 commit this branch had never seen,
+   `019def9` (round-3 F4: shim budget floored at 4 GiB, round-3 `readShimMemory`
+   tests re-sized to 8 GiB), which touches two files this change also edits; it
+   merged without conflict and the full gate was re-run on the rebased tree, not
+   inherited from the pre-rebase run.
 3. **Coverage gap — the daemon→Go-client JSON hop was untested for the ADVISORY
    grade.** CLOSED. `internal/runner` may not import `internal/daemon`, so the
    two grant structs are independent declarations and a tag renamed on one side
@@ -216,6 +220,8 @@ merge-target one, which is not this branch's to fix.
    and says explicitly that AIRA-123 replaced the failure disposition with an
    honest degraded success.
 
-Validation after the fixes, from this worktree, exact exit codes:
+Validation, exact exit codes, run TWICE — once on the fixes before the rebase
+and again on the rebased tree, which is the tree that will merge:
 `aira confine -- go build ./...` 0; `aira confine -- go vet ./...` 0;
-`AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` 0.
+`AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` 0 (14 packages ok,
+0 FAIL, Python suite driven via internal/pylib).
