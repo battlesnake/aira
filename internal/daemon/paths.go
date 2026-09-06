@@ -218,6 +218,56 @@ func sliceCeilingIntervalFromEnv() (time.Duration, error) {
 	return interval, nil
 }
 
+// AIRA-113. The oom-steer subsystem's two settings, in the same
+// mode-then-the-rest shape as the slice ceiling's pair above and default-OFF for
+// the same reason: it writes /proc/<pid>/oom_score_adj for processes it does not
+// own, so "off is exactly today's behaviour" must stay true, and a typo in the
+// interval must not refuse to start a daemon that did not ask for the subsystem.
+func oomSteerModeFromEnv() (oomSteerMode, error) {
+	mode := oomSteerMode(strings.TrimSpace(os.Getenv("AIRA_DAEMON_OOM_STEER_MODE")))
+	if mode == "" {
+		return oomSteerOff, nil
+	}
+	switch mode {
+	case oomSteerOff, oomSteerObserve, oomSteerEnforce:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_OOM_STEER_MODE must be off, observe, or enforce")
+	}
+}
+
+// oomSteerIntervalFromEnv bounds the cadence BELOW the admission charge refresh
+// (admitConfineScanIntervalDefault, 1s). A slower loop would only ever see RSS
+// readings the ledger had already absorbed into the charge, which is precisely
+// the inertness AIRA-29 §3.6 refused to ship — so an interval at or above one
+// second is a configuration error, not a slow but working setting.
+func oomSteerIntervalFromEnv() (time.Duration, error) {
+	value := strings.TrimSpace(os.Getenv("AIRA_DAEMON_OOM_STEER_INTERVAL"))
+	if value == "" {
+		return defaultOOMSteerInterval, nil
+	}
+	interval, err := time.ParseDuration(value)
+	if err != nil || interval < 50*time.Millisecond || interval >= admitConfineScanIntervalDefault {
+		return 0, fmt.Errorf("E_CONFIG_INVALID: AIRA_DAEMON_OOM_STEER_INTERVAL must be a Go duration in [50ms,%s)", admitConfineScanIntervalDefault)
+	}
+	return interval, nil
+}
+
+func oomSteerConfigFromEnv() (oomSteerMode, time.Duration, error) {
+	mode, err := oomSteerModeFromEnv()
+	if err != nil {
+		return "", 0, err
+	}
+	if mode == oomSteerOff {
+		return mode, defaultOOMSteerInterval, nil
+	}
+	interval, err := oomSteerIntervalFromEnv()
+	if err != nil {
+		return "", 0, err
+	}
+	return mode, interval, nil
+}
+
 func admitPollIntervalFromEnv() (time.Duration, error) {
 	value, set := os.LookupEnv("AIRA_DAEMON_ADMIT_POLL_INTERVAL")
 	if !set || value == "" {

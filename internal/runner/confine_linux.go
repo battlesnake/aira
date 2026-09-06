@@ -29,17 +29,15 @@ import (
 )
 
 const (
-	confineHandshakeSchema     = 1
-	confineHandshakeMaxSize    = 4096
-	confineSetupFD             = 3
-	confineReleaseFD           = 4
-	confineOOMScoreAdj         = 500
-	confineDelegateOOMScoreAdj = 800
-	confineNice                = 19
-	confineIOPriorityClass     = 2 // best-effort / IOPRIO_CLASS_BE
-	confineIOPriorityData      = 7 // Best-effort priority: 0 is highest, 7 is lowest.
-	defaultCPUWeightStart      = int64(100)
-	defaultCPUWeightFloor      = int64(10)
+	confineHandshakeSchema  = 1
+	confineHandshakeMaxSize = 4096
+	confineSetupFD          = 3
+	confineReleaseFD        = 4
+	confineNice             = 19
+	confineIOPriorityClass  = 2 // best-effort / IOPRIO_CLASS_BE
+	confineIOPriorityData   = 7 // Best-effort priority: 0 is highest, 7 is lowest.
+	defaultCPUWeightStart   = int64(100)
+	defaultCPUWeightFloor   = int64(10)
 )
 
 type confineDelegation struct {
@@ -1754,33 +1752,6 @@ func confineSetupArgv(target []string, delegateRAM bool) ([]string, error) {
 		"--ionice-class", strconv.Itoa(confineIOPriorityClass), "--",
 	}
 	return append(argv, target...), nil
-}
-
-func confineOOMScoreAdjValues() (nonDelegate, delegate int, err error) {
-	nonDelegate, err = parseConfineOOMScoreAdjEnv("AIRA_CONFINE_OOM_SCORE_ADJ", confineOOMScoreAdj)
-	if err != nil {
-		return 0, 0, err
-	}
-	delegate, err = parseConfineOOMScoreAdjEnv("AIRA_CONFINE_OOM_SCORE_ADJ_DELEGATE", confineDelegateOOMScoreAdj)
-	if err != nil {
-		return 0, 0, err
-	}
-	if delegate <= nonDelegate {
-		return 0, 0, errors.New("E_CONFINE_ARGUMENT_INVALID: AIRA_CONFINE_OOM_SCORE_ADJ_DELEGATE must be greater than AIRA_CONFINE_OOM_SCORE_ADJ")
-	}
-	return nonDelegate, delegate, nil
-}
-
-func parseConfineOOMScoreAdjEnv(name string, fallback int) (int, error) {
-	raw := strings.TrimSpace(os.Getenv(name))
-	if raw == "" {
-		return fallback, nil
-	}
-	value, err := strconv.Atoi(raw)
-	if err != nil || value < confineOOMScoreAdj || value > 1000 {
-		return 0, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: %s must be an integer in [%d, 1000]", name, confineOOMScoreAdj)
-	}
-	return value, nil
 }
 
 func readConfineHandshake(reader *os.File, timeout time.Duration) ([]byte, error) {
