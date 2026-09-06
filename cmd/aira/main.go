@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"text/tabwriter"
 	"time"
+	"unicode"
 
 	"golang.org/x/term"
 
@@ -1254,6 +1255,26 @@ func runConfineReserveCommand(ctx context.Context, options map[string]string, st
 		_, _ = fmt.Fprintf(stderr, "E_CONFINE_UNAVAILABLE: write grant: %v\n", err)
 		return codes.ExitForCode("E_CONFINE_UNAVAILABLE")
 	}
+	// THE HOLD. Everything above was bounded by --max-wait; NOTHING below is, and
+	// that is the contract (AIRA-69 design spec §4): the reservation must last as
+	// long as the test it was granted for, so the helper blocks here until its
+	// stdin reaches EOF or it is signalled. `--max-wait` bounds the ADMISSION
+	// WAIT and nothing else.
+	//
+	// AIRA-108 was filed as a P0 against this, on the reasoning that a helper
+	// alive 52 minutes past its own `--max-wait 300s` must have blown its bound.
+	// It had not: it was here, holding a valid reservation for a caller whose test
+	// had stopped making progress. Two states of this process are byte-identical
+	// in `ps`, and only /proc tells them apart — waiting shows goroutine 1 in
+	// `[IO wait]` under net.(*conn).Read with a thread on epoll_pwait; holding
+	// shows goroutine 1 in `[select]` right here, with a thread in read(2) on
+	// fd 0. `aira confine --list` now names every granted reservation and its age
+	// so nobody has to go to /proc again for this.
+	//
+	// Consequence worth knowing before changing anything here: the release signal
+	// is the WRITE END of this pipe being closed everywhere, so any descendant
+	// that inherited it keeps the reservation alive after the original parent
+	// exits. That is why the governor plugin closes it in an at-fork hook.
 	done := make(chan struct{})
 	go func() {
 		_, _ = io.Copy(io.Discard, stdin)
@@ -2630,6 +2651,33 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 			formatReserveBytes(result.SliceReserve.AdoptedBytes))
 		if result.SliceReserve.ReservationJobs > 0 {
 			_, _ = fmt.Fprintln(stdout, "  (a scope-less reservation has no cgroup scope, so it never appears in the table above)")
+			// AIRA-108. NAME them. The aggregate line above was AIRA-68's answer to
+			// the first false P0 this blind spot produced; AIRA-108 is the second,
+			// and it cost two sessions hours at /proc level because nothing could
+			// say WHAT was holding 5.5G of a shared 62G machine-wide ceiling.
+			//
+			// `state=holding` is printed on every row deliberately. It is the fact
+			// that settles the question these rows exist for — a granted
+			// `confine-reserve` helper and one still waiting for admission are
+			// byte-identical in `ps`, and only the granted one appears here at all.
+			// Saying it beats leaving the reader to infer it from the heading, which
+			// is precisely the inference that went wrong.
+			//
+			// Rows are already longest-held-first from the daemon.
+			for _, hold := range result.SliceReserve.Reservations {
+				_, _ = fmt.Fprintf(stdout, "    state=holding held=%s reserve=%s signature=%s\n",
+					confineHeldDuration(hold.HeldMS), formatReserveBytes(hold.Reserve),
+					confineSignatureForDisplay(hold.Signature))
+			}
+			// Never silently truncate: an elided row could be the oldest hold — the
+			// one an operator is looking for — so say how many were dropped. This is
+			// also the honest path when a daemon predates the field and sends NO
+			// rows at all: it then reports every reservation as unlisted rather than
+			// implying there were none.
+			if unlisted := result.SliceReserve.ReservationJobs - len(result.SliceReserve.Reservations); unlisted > 0 {
+				_, _ = fmt.Fprintf(stdout, "    … and %d further %s not listed\n",
+					unlisted, confinePlural(unlisted, "reservation", "reservations"))
+			}
 		}
 		if result.SliceReserve.VanishedJobs > 0 {
 			// An observation, never a verdict, and stated in the PAST TENSE about
@@ -2824,6 +2872,48 @@ func formatReserveBytes(value int64) string {
 		return "0B"
 	}
 	return runner.FormatConfineBytes(value)
+}
+
+// confineHeldDuration renders a reservation's age. Rounded to the second: this
+// is an operator's "is that stuck?" signal, where 52m is the whole story and the
+// milliseconds are noise. A non-positive value is an age the daemon could not
+// establish (an unset grant instant) and says so rather than printing "0s",
+// which would read as a brand-new hold — the opposite of the truth.
+func confineHeldDuration(heldMS int64) string {
+	if heldMS <= 0 {
+		return "unevaluated"
+	}
+	return (time.Duration(heldMS) * time.Millisecond).Round(time.Second).String()
+}
+
+// confineSignatureForDisplay makes a client-supplied signature safe for a
+// terminal. It is arbitrary bytes chosen by whatever spawned the helper, and it
+// is printed straight into an operator's shell, so control characters (which can
+// rewrite the line, hide rows, or forge output) are escaped and the length is
+// bounded. Truncation is MARKED with an ellipsis, never silent.
+//
+// An empty signature is a legitimate state — `signature` is optional on the
+// admit wire — and renders as an explicit "(unnamed)": the absence is stated,
+// never filled in with a guess.
+func confineSignatureForDisplay(signature string) string {
+	if strings.TrimSpace(signature) == "" {
+		return "(unnamed)"
+	}
+	var builder strings.Builder
+	runes := 0
+	for _, r := range signature {
+		if runes >= runner.ConfineReservationSignatureLimit {
+			builder.WriteString("…")
+			break
+		}
+		if r == unicode.ReplacementChar || !unicode.IsPrint(r) {
+			builder.WriteString(strconv.QuoteRune(r))
+		} else {
+			builder.WriteRune(r)
+		}
+		runes++
+	}
+	return builder.String()
 }
 
 func confineAge(value *int64) string {

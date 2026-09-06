@@ -186,7 +186,84 @@ type ConfineSliceReserve struct {
 	// "none" rather than as unknown — an operator whose job is blocked needs to be
 	// able to rule a benchmark out, not merely fail to see one.
 	Exclusive *ConfineExclusiveState `json:"exclusive,omitempty"`
+
+	// AIRA-108. The scope-less population, NAMED. ReservationJobs/ReservationBytes
+	// above are an aggregate, and an aggregate is exactly what could not settle
+	// AIRA-108: 5.5 GB of a shared 62 GB machine-wide ceiling was pinned by
+	// "5 scope-less reservations" and no AIRA surface could say by WHAT.
+	//
+	// That mattered because a GRANTED `aira confine-reserve` helper and one still
+	// WAITING for admission are byte-identical in `ps` — same argv, same
+	// `--max-wait 300s` — so an operator who saw a long-lived helper could not
+	// establish which of the two states it was in, and the only inference left was
+	// the wrong one: that it had blown its declared bound. (It had not: a granted
+	// reservation is held until its stdin closes, by design, for the whole life of
+	// the test it was granted for.) Two sessions spent hours at /proc level and
+	// filed a P0 that was not there. AIRA-68's comment above records the FIRST
+	// false P0 from this same blind spot; the aggregate line it added is
+	// demonstrably not sufficient on its own.
+	//
+	// Every row is a GRANTED, accounted, scope-less waiter — EXACTLY the
+	// population ReservationJobs/ReservationBytes already count, no wider and no
+	// narrower — derived in the same locked pass as every count above, so rows and
+	// totals always describe one instant. Truncated to the longest-held few (the
+	// renderer says how many were elided); an empty slice is a real "none", never
+	// an unevaluated read, for the same reason Exclusive's nil is.
+	//
+	// "Scope-less" is a structural fact, not a verb: `aira confine-reserve` is
+	// overwhelmingly what lands here, but any admission that creates no cgroup
+	// scope does — `aira run` among them. The rows therefore say what the daemon
+	// KNOWS (granted, this big, held this long, under this signature) and never
+	// name a verb it did not observe. This is the pre-existing shape of the
+	// aggregate above; the rows make it visible rather than change it.
+	Reservations []ConfineReservationHold `json:"reservations,omitempty"`
 }
+
+// ConfineReservationHold is one scope-less admission the daemon is holding right
+// now — typically an `aira confine-reserve --pinned` per-test RAM lease.
+type ConfineReservationHold struct {
+	// State is always "holding" today, and is nevertheless carried on the wire
+	// rather than left implicit. A row that does not SAY what it is leaves the
+	// reader to infer it from the section it was printed under, and inferring
+	// state from context is the exact failure this whole field exists to end.
+	State string `json:"state"`
+	// Signature is client-supplied text (`pytest:<nodeid>` for the per-test
+	// governor). It is UNTRUSTED and must be escaped and length-limited by every
+	// renderer — it reaches a terminal.
+	Signature string `json:"signature,omitempty"`
+	Reserve   int64  `json:"reserve"`
+	// HeldMS is milliseconds since the grant was delivered — the number that
+	// answers "is this stuck?". A duration, never a wall-clock instant, so a
+	// reader never has to reconcile the daemon's clock against its own.
+	HeldMS int64 `json:"held_ms"`
+}
+
+// ConfineReservationStateHolding is the only state a reservation row carries
+// today: the daemon has granted this reserve and is holding it until the client
+// drops its connection. It is spelled out on the wire rather than implied so a
+// later state cannot silently inherit this one's meaning.
+const ConfineReservationStateHolding = "holding"
+
+// ConfineReservationSignatureLimit bounds a rendered signature. A pytest nodeid
+// is already long and is entirely client-supplied, so the terminal boundary
+// truncates rather than trusting it to be reasonable.
+const ConfineReservationSignatureLimit = 96
+
+// ConfineReservationSignatureWireLimit bounds the signature the DAEMON retains
+// and puts on the wire, and it exists for availability, not neatness: the admit
+// protocol accepts a signature of any length up to the 16 MiB frame, so an
+// unbounded diagnostic copy would let a few hostile (or merely absurd)
+// reservations push the whole confine-list response past MaxFrameBytes — at
+// which point `confine --list` fails for every job on that slice. It is wider
+// than the render limit on purpose: a JSON consumer should get the full nodeid
+// of any realistic caller, while the terminal gets a line it can display.
+const ConfineReservationSignatureWireLimit = 512
+
+// ConfineReservationRowLimit is how many reservation rows a renderer prints. The
+// rest are reported as a count, never dropped silently: a suite with 40 workers
+// must not turn `confine --list` into a wall of text, and must not be able to
+// hide the oldest hold either — which is why the rows kept are the LONGEST-HELD.
+const ConfineReservationRowLimit = 10
 
 // ConfineExclusiveState names which job holds (or is draining toward) exclusive
 // use of a slice, so a blocked operator learns a benchmark is running rather

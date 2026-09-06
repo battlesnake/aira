@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 
 	"aira/internal/codes"
@@ -12,6 +13,52 @@ import (
 	"aira/internal/runner"
 	"aira/internal/store"
 )
+
+// confineReservationRows turns the snapshot's copied-out reservation values into
+// the wire rows, LONGEST-HELD FIRST and capped.
+//
+// The ordering is the whole point (AIRA-108): the row an operator needs is the
+// oldest hold, so a cap that dropped it would defeat the field. Ties break on
+// the larger reserve, then on signature, so the order is total and the output is
+// deterministic — a list that reshuffles between two runs of `confine --list`
+// reads as churn that is not happening.
+//
+// The signature is NOT escaped here. It travels the wire as the client sent it,
+// because a JSON consumer wants the real value; escaping is the RENDERER's job,
+// at the one boundary that actually reaches a terminal.
+func confineReservationRows(rows []admitReservationRow) []runner.ConfineReservationHold {
+	if len(rows) == 0 {
+		return nil
+	}
+	sorted := make([]admitReservationRow, len(rows))
+	copy(sorted, rows)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].heldMS != sorted[j].heldMS {
+			return sorted[i].heldMS > sorted[j].heldMS
+		}
+		if sorted[i].reserve != sorted[j].reserve {
+			return sorted[i].reserve > sorted[j].reserve
+		}
+		return sorted[i].signature < sorted[j].signature
+	})
+	if len(sorted) > runner.ConfineReservationRowLimit {
+		sorted = sorted[:runner.ConfineReservationRowLimit]
+	}
+	out := make([]runner.ConfineReservationHold, 0, len(sorted))
+	for _, row := range sorted {
+		out = append(out, runner.ConfineReservationHold{
+			// Every row emitted here is a granted, accounted, scope-less waiter —
+			// admitSliceSnapshotFor's own guard — so the state is a fact about the
+			// waiter it was copied from, not a default.
+			State: runner.ConfineReservationStateHolding,
+			// A reservation may legitimately carry no signature (`signature` is
+			// optional on the admit wire). Left empty and rendered as an explicit
+			// "(unnamed)", never invented.
+			Signature: row.signature, Reserve: row.reserve, HeldMS: row.heldMS,
+		})
+	}
+	return out
+}
 
 func (s *Server) activeConfines(path string) []runner.ConfineRegistryEntry {
 	s.admitRegistryMu.Lock()
@@ -153,12 +200,16 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				ScopeBytes:       snapshot.scopeBytes,
 				ReservationJobs:  snapshot.reservationJobs,
 				ReservationBytes: snapshot.reservationBytes,
-				AdoptedJobs:      snapshot.adoptedJobs,
-				AdoptedBytes:     snapshot.adopted,
-				VanishedJobs:     snapshot.vanishedJobs,
-				VanishedBytes:    snapshot.vanishedBytes,
-				ResidualJobs:     snapshot.residualJobs(),
-				ResidualBytes:    snapshot.residualBytes(),
+				// AIRA-108. The same population, NAMED rather than only counted.
+				// Sorted and capped OUTSIDE the queue lock — the snapshot already
+				// copied the values out under it.
+				Reservations:  confineReservationRows(snapshot.reservations),
+				AdoptedJobs:   snapshot.adoptedJobs,
+				AdoptedBytes:  snapshot.adopted,
+				VanishedJobs:  snapshot.vanishedJobs,
+				VanishedBytes: snapshot.vanishedBytes,
+				ResidualJobs:  snapshot.residualJobs(),
+				ResidualBytes: snapshot.residualBytes(),
 				// AIRA-103. Absent (all zero/empty) when the subsystem is off, so
 				// the renderer prints nothing rather than a fabricated state.
 				CeilingMode:        string(ceiling.Mode),

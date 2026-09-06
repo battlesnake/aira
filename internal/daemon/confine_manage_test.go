@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
@@ -152,10 +153,22 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		server.admitResolveSlice = func(string) (string, bool, string) { return path, true, "" }
 		server.admitSliceHeadroomBase = base
 		server.admitSliceHeadroomSupervisor = supervisor
+		// AIRA-108: FREEZE the clock for this unit fixture. The reservation row's
+		// age is `now - grantedAt`, so a real clock plus a fixed grantedAt makes
+		// the expected HeldMS depend on how long the test took to reach the
+		// snapshot — a correct build goes red on a 1ms scheduling delay (found by
+		// Sol build-review). The integration tests keep real time, where the age
+		// is asserted as a lower bound rather than an equality.
+		frozen := time.Now()
+		server.admitNow = func() time.Time { return frozen }
 		queue := &sliceQueue{path: path, server: server, outstanding: granted, outstandingJobs: jobs, adopted: adopted, adoptedJobs: adoptedJobs}
 		queue.waiters = []*admitWaiter{
 			{seq: 1, reserve: scopeBackedBytes, state: admitGranted, accounted: true, grantedCh: make(chan struct{}), scopeID: "CONFINE-job-5101-abc", name: "job", owner: "session-a"},
-			{seq: 2, reserve: reservationBytes, state: admitGranted, accounted: true, grantedCh: make(chan struct{})},
+			// AIRA-108: the scope-less waiter carries the signature and grant
+			// instant `confine --list` now names it by, so this fixture exercises
+			// the reservation ROW as well as the aggregate it used to be.
+			{seq: 2, reserve: reservationBytes, state: admitGranted, accounted: true, grantedCh: make(chan struct{}),
+				signature: "pytest:tools/test_x.py::test_y", grantedAt: frozen.Add(-90 * time.Second)},
 		}
 		server.admitQueues[path] = queue
 		return server, path
@@ -184,9 +197,16 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 			// count can never again be read against the scope table above it.
 			ScopeJobs: 1, ScopeBytes: scopeBackedBytes,
 			ReservationJobs: 1, ReservationBytes: reservationBytes,
+			// AIRA-108: the aggregate above is no longer the only report of this
+			// population. The row NAMES it, and says `holding` rather than leaving
+			// the reader to infer the state from the heading it sits under.
+			Reservations: []runner.ConfineReservationHold{{
+				State: runner.ConfineReservationStateHolding, Signature: "pytest:tools/test_x.py::test_y",
+				Reserve: reservationBytes, HeldMS: 90000,
+			}},
 			AdoptedJobs: adoptedJobs, AdoptedBytes: adopted,
 		}
-		if got := *result.SliceReserve; got != want {
+		if got := *result.SliceReserve; !reflect.DeepEqual(got, want) {
 			t.Fatalf("slice reserve=%+v, want %+v", got, want)
 		}
 	})
@@ -209,7 +229,9 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 			GrantedBytes: adopted, CeilingBytes: wantCeiling, Jobs: adoptedJobs, Queued: 0, FreezePhase: "idle",
 			AdoptedJobs: adoptedJobs, AdoptedBytes: adopted,
 		}
-		if got := *result.SliceReserve; got != want {
+		// Reservations is nil here, and that is a POSITIVE fact from the same
+		// walk (this fixture cleared the waiter list), not an unevaluated read.
+		if got := *result.SliceReserve; !reflect.DeepEqual(got, want) {
 			t.Fatalf("slice reserve=%+v, want adopted-only %+v", got, want)
 		}
 	})

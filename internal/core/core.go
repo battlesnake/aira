@@ -1730,7 +1730,13 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			boolSpec("pinned", true, false, "Require the v1 pinned estimate path"),
 			stringSpec("signature", true, false, "Per-test resource signature"),
 			stringSpec("slice", false, false, "Machine-wide cgroup slice"),
-			stringSpec("max_wait", false, false, "Bounded daemon admission wait"),
+			// AIRA-108: say what the bound is ON. It bounds the ADMISSION WAIT and
+			// nothing else; once granted, the helper holds its reservation until
+			// stdin closes, which for the per-test governor is the whole life of the
+			// test. Reading it as a process lifetime is what produced AIRA-108's
+			// false P0 — a helper alive 52 minutes past a 300s bound was a granted
+			// hold doing its job, not a violated bound.
+			stringSpec("max_wait", false, false, "Bounded daemon ADMISSION wait; a granted reservation is then held until stdin closes"),
 		}, Run: func(_ context.Context, args *argAccessor) (any, error) {
 			_ = stringArg(args, "bytes")
 			_ = boolArg(args, "pinned")
