@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-110","project":"aira","title":"aira confine scopes: memory.max does not bound swap, so a confined job's cap is not the bound it appears to be","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","cgroup","confine","oom"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-110","project":"aira","title":"aira confine scopes: memory.max does not bound swap, so a confined job's cap is not the bound it appears to be","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["admission","cgroup","confine","oom"],"hold":false,"relations":[]}
 ---
 Found while measuring AIRA-35 (aitest worker scopes), and deliberately NOT
 fixed there: the same latent property applies to every `aira confine` scope
@@ -173,3 +173,10 @@ Worth its own ticket if the install path is touched again.
 
 `go build ./...` exit 0 · `go vet ./...` exit 0 ·
 `AIRA_REAL_CGROUP=1 go test ./... -count=1` exit 0.
+
+### Done
+
+Merged via PR #64 as merge commit `30bb53c` (2026-09-06). Fable build-review re-ran the
+gate independently (build 0 / vet 0 / real-cgroup test 0) and confirmed the two
+real-cgroup tests go RED against a mutant writer that claims `enforced` without touching
+the kernel.
