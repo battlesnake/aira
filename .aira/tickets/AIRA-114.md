@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-114","project":"aira","title":"Bound the aggregate over-subscription factor (sum of scope memory.max vs the slice ceiling)","status":"in-review","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","deferred-from-aira29","oom","shared-slice"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-114","project":"aira","title":"Bound the aggregate over-subscription factor (sum of scope memory.max vs the slice ceiling)","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":null,"labels":["admission","confine","deferred-from-aira29","oom","shared-slice"],"hold":false,"relations":[]}
 ---
 Deferred from AIRA-29 (dynamic reserve), reasoning in
 `docs/superpowers/specs/2026-09-06-aira29-dynamic-reserve-plan.md` §3.5 and residual §4e.
@@ -270,3 +270,7 @@ registration is demonstrably load-bearing rather than decorative.
 - `aira confine -- go build ./...` → 0
 - `aira confine -- go vet ./...` → 0
 - `AIRA_REAL_CGROUP=1 aira confine -- go test ./... -count=1` → 0
+
+## Done (2026-09-06)
+
+Final build review (Fable gate) re-ran build/vet/`AIRA_REAL_CGROUP=1` test from a clean worktree (all exit 0), confirmed the real-cgroup anti-INERT test runs rather than skips, ran `-race` over the new tests (0), and applied an independent 11-mutant battery against the production code (11/11 caught). Merged via PR #61, merge commit `d416f45f91ce3b27dd755631e2d450a54036cd0c`.
