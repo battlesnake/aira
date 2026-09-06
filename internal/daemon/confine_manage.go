@@ -237,6 +237,10 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 					Owner:       snapshot.exclusiveOwner,
 					ScopeID:     snapshot.exclusiveScopeID,
 					WaitingJobs: snapshot.exclusiveWaiting,
+					// AIRA-119, from that same pass: the age belongs to the identity
+					// beside it, never to a later reading of a state that may have
+					// changed hands in between.
+					SinceMS: snapshot.exclusiveSinceMS,
 				}
 			}
 		}

@@ -298,6 +298,28 @@ type ConfineExclusiveState struct {
 	// WaitingJobs counts the queued waiters actually held up behind it. It never
 	// counts the exclusive job as waiting for itself.
 	WaitingJobs int `json:"waiting_jobs"`
+
+	// AIRA-119. SinceMS is how long THIS state has been in effect — measured from
+	// the exclusive waiter's own grant for "held", and from its enqueue for
+	// "draining" — derived in the SAME locked pass as the identity above, so the
+	// age and the job it describes can never come from different instants.
+	//
+	// It exists because the identity alone is not enough to act on, which is the
+	// defect AIRA-119 records. Name defaults to "job" for every unnamed confine,
+	// Owner may come from AIRA_CONFINE_OWNER and so appears in no argv, and in the
+	// "draining" state the named job HAS NOT LAUNCHED YET: it owns no process and
+	// no cgroup scope, by construction (`aira confine` creates its scope only
+	// after admission is granted), so it has no row in the Scopes table either. An
+	// operator who greps for the named job therefore finds nothing and reasonably
+	// concludes the daemon is naming a job that already released. The age is what
+	// separates a healthy drain from a stuck one, and ScopeID above is the handle
+	// that makes the named job findable at all — the daemon has always sent it and
+	// no face has ever rendered it.
+	//
+	// Zero is an UNESTABLISHED age (an anchor the daemon never set, or a clock
+	// that went backwards), never "zero seconds": a renderer must omit the clause
+	// rather than print a fabricated 0s.
+	SinceMS int64 `json:"since_ms,omitempty"`
 }
 
 type ConfineKillResult struct {
