@@ -109,12 +109,12 @@ func (tree *workerScopeTree) scan(outerScope string) (workerScopeChildren, error
 	return children, nil
 }
 
-func (tree *workerScopeTree) create(_ context.Context, outerScope, workerID string, memoryMax, memoryHigh int64) (string, error) {
+func (tree *workerScopeTree) create(_ context.Context, outerScope, workerID string, memoryMax int64) (string, string, error) {
 	tree.mu.Lock()
 	defer tree.mu.Unlock()
 	if tree.createFn != nil {
 		if err := tree.createFn(outerScope, workerID); err != nil {
-			return "", err
+			return "", "", err
 		}
 	}
 	name := workerScopeChildPrefix + workerID
@@ -123,13 +123,29 @@ func (tree *workerScopeTree) create(_ context.Context, outerScope, workerID stri
 	}
 	if _, exists := tree.caps[outerScope][name]; exists {
 		// Exactly what os.Mkdir does through runner.CreateWorkerScope.
-		return "", fmt.Errorf("aitest worker scope: create: mkdir %s: %w", name, fs.ErrExist)
-	}
-	if memoryHigh > 0 && memoryHigh >= memoryMax {
-		return "", fmt.Errorf("aitest worker scope: memory_high (%d) must be below memory_max (%d)", memoryHigh, memoryMax)
+		return "", "", fmt.Errorf("aitest worker scope: create: mkdir %s: %w", name, fs.ErrExist)
 	}
 	tree.caps[outerScope][name] = memoryMax
-	return runner.WorkerScopeChildPath(outerScope, "worker-"+workerID), nil
+	// AIRA-35: this fake deliberately reports a NON-"enforced" disposition.
+	//
+	// It is the only defence against a fabricated swap_cap, and the defence is
+	// needed: an adversarial build-review mutated evaluateWorkerAdmit to
+	// hardcode `SwapCap: WorkerAdmitSwapCapEnforced` -- ignoring what scope
+	// creation actually reported -- and the whole suite stayed GREEN, because
+	// every fake returned "enforced" too, so every assertion downstream was
+	// comparing a constant with the same constant. swap_cap exists precisely to
+	// make a LOST containment guarantee visible; a hop that manufactures
+	// "enforced" is the exact failure it was added to prevent, and a test that
+	// cannot see that failure is worse than no test.
+	//
+	// "not-applicable" is chosen over "unavailable" because it is a real,
+	// catalogued success disposition (a kernel with no swap support), so no
+	// downstream code has to treat this fixture as a degraded run -- it just
+	// has to CARRY the value it was given instead of inventing one.
+	//
+	// The pre-AIRA-35 memoryHigh < memoryMax check that used to live here went
+	// with the field.
+	return runner.WorkerScopeChildPath(outerScope, "worker-"+workerID), runner.WorkerAdmitSwapCapNotApplicable, nil
 }
 
 // evaluateWorkerAdmitForTest calls the evaluator with a live context and fails
@@ -294,8 +310,17 @@ func TestEvaluateWorkerAdmitGrantsWithinHeadroom(t *testing.T) {
 	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
 	server.workerAdmitHeadroom = 0
 	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400, maxWaitMS: 0})
-	if response.State != "granted" || response.WorkerID == "" || response.MemoryMax != 400 || response.MemoryHigh != 320 {
-		t.Fatalf("response=%+v", response)
+	// verifies: AIRA-35 — a grant carries memory_max and the swap disposition,
+	// and no memory_high at all.
+	//
+	// The expected value is the fixture's NON-default "not-applicable", not
+	// "enforced": the daemon must CARRY what scope creation reported. Asserting
+	// "enforced" against a fake that also returns "enforced" is what let a
+	// mutant hardcoding that constant survive the entire suite.
+	if response.State != "granted" || response.WorkerID == "" || response.MemoryMax != 400 ||
+		response.SwapCap != runner.WorkerAdmitSwapCapNotApplicable {
+		t.Fatalf("response=%+v — swap_cap must be the disposition scope creation reported, "+
+			"not a value the daemon manufactured", response)
 	}
 	// Pin the invariant a real deployment depends on: the daemon computes
 	// this scope path with WorkerScopeChildPath(outer, "worker-"+id), and
@@ -1312,11 +1337,11 @@ func TestWorkerAdmitEEXISTInvalidatesCacheAndDeniesRetriably(t *testing.T) {
 		children, err := tree.scan(outerScope)
 		return children, err
 	}
-	server.workerScopeCreate = func(ctx context.Context, outerScope, workerID string, memoryMax, memoryHigh int64) (string, error) {
+	server.workerScopeCreate = func(ctx context.Context, outerScope, workerID string, memoryMax int64) (string, string, error) {
 		if _, exists := hidden[workerScopeChildPrefix+workerID]; exists {
-			return "", fmt.Errorf("aitest worker scope: create: mkdir: %w", fs.ErrExist)
+			return "", "", fmt.Errorf("aitest worker scope: create: mkdir: %w", fs.ErrExist)
 		}
-		return tree.create(ctx, outerScope, workerID, memoryMax, memoryHigh)
+		return tree.create(ctx, outerScope, workerID, memoryMax)
 	}
 
 	first := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400})
@@ -1370,11 +1395,11 @@ func TestWorkerAdmitEEXISTRetryAdvancesTheWorkerIDInsteadOfRepeating(t *testing.
 	// A child invisible to the scan but present to create: exactly the
 	// stale-low cache this branch exists for.
 	hidden := map[string]int64{workerScopeChildPrefix + "1": 100}
-	server.workerScopeCreate = func(ctx context.Context, outer, workerID string, memoryMax, memoryHigh int64) (string, error) {
+	server.workerScopeCreate = func(ctx context.Context, outer, workerID string, memoryMax int64) (string, string, error) {
 		if _, exists := hidden[workerScopeChildPrefix+workerID]; exists {
-			return "", fmt.Errorf("aitest worker scope: create: mkdir: %w", fs.ErrExist)
+			return "", "", fmt.Errorf("aitest worker scope: create: mkdir: %w", fs.ErrExist)
 		}
-		return tree.create(ctx, outer, workerID, memoryMax, memoryHigh)
+		return tree.create(ctx, outer, workerID, memoryMax)
 	}
 
 	first := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400})
@@ -1443,12 +1468,12 @@ func TestWorkerAdmitCreatesWorkerScopeBeforeGranting(t *testing.T) {
 	server.admitReadWorkerSupervisorMemory = admitReadWorkerSupervisorMemoryFixture(map[string]int64{})
 	var created []string
 	inner := server.workerScopeCreate
-	server.workerScopeCreate = func(ctx context.Context, outerScope, workerID string, memoryMax, memoryHigh int64) (string, error) {
-		path, err := inner(ctx, outerScope, workerID, memoryMax, memoryHigh)
+	server.workerScopeCreate = func(ctx context.Context, outerScope, workerID string, memoryMax int64) (string, string, error) {
+		path, swapCap, err := inner(ctx, outerScope, workerID, memoryMax)
 		if err == nil {
 			created = append(created, path)
 		}
-		return path, err
+		return path, swapCap, err
 	}
 	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400})
 	if response.State != "granted" {

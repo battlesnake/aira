@@ -36,14 +36,22 @@ func (s *Server) SetWorkerScopeTreeForTest() {
 		}
 		return children, nil
 	}
-	s.workerScopeCreate = func(_ context.Context, outerScope, workerID string, memoryMax, _ int64) (string, error) {
+	s.workerScopeCreate = func(_ context.Context, outerScope, workerID string, memoryMax int64) (string, string, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		if caps[outerScope] == nil {
 			caps[outerScope] = map[string]int64{}
 		}
 		caps[outerScope][workerScopeChildPrefix+workerID] = memoryMax
-		return runner.WorkerScopeChildPath(outerScope, "worker-"+workerID), nil
+		// AIRA-35: deliberately NOT "enforced". This seam stands in for a
+		// successful CreateWorkerScope, and "not-applicable" is an equally real
+		// success disposition (a kernel with no swap support) -- but it differs
+		// from the value a fabricating hop would invent, which is the entire
+		// point. A build-review mutant that hardcoded "enforced" in the daemon
+		// survived the whole suite while every fake also returned "enforced";
+		// with this, any hop that manufactures the value instead of carrying it
+		// fails the assertions downstream.
+		return runner.WorkerScopeChildPath(outerScope, "worker-"+workerID), runner.WorkerAdmitSwapCapNotApplicable, nil
 	}
 }
 

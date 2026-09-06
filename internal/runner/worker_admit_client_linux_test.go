@@ -50,8 +50,7 @@ func TestRequestWorkerAdmitReturnsHeldLeaseOnGrant(t *testing.T) {
 
 	outcome := runner.RequestWorkerAdmit(context.Background(), runner.WorkerAdmitClientRequest{
 		// This external test package cannot access daemon's unexported 1 MiB
-		// protocol minimum. Five MiB is safely above it and yields an exact
-		// four-MiB memory.high under estimatedBytes * 4 / 5.
+		// protocol minimum. Five MiB is safely above it.
 		SocketPath: paths.SocketPath, JobID: "job-1", OuterScope: "/outer", EstimatedBytes: 5 * (1 << 20), MaxWait: time.Second,
 	})
 	if !outcome.Granted() || outcome.Lease == nil {
@@ -59,8 +58,17 @@ func TestRequestWorkerAdmitReturnsHeldLeaseOnGrant(t *testing.T) {
 	}
 	lease := outcome.Lease
 	defer lease.Close()
-	if lease.WorkerID == "" || lease.MemoryMax != 5*(1<<20) || lease.MemoryHigh != 4*(1<<20) {
-		t.Fatalf("lease=%+v", lease)
+	// verifies: AIRA-35 — the swap disposition survives the daemon->client hop
+	// on the LEASE, which is the field that replaced MemoryHigh.
+	//
+	// The expected value is the seam's NON-default "not-applicable". Pinning
+	// "enforced" here would have been tautological against a fake that returns
+	// "enforced", which is exactly how a mutant that hardcoded the constant
+	// survived the suite; this hop is where mutation testing has previously
+	// proved a dropped governance signal goes unnoticed.
+	if lease.WorkerID == "" || lease.MemoryMax != 5*(1<<20) ||
+		lease.SwapCap != runner.WorkerAdmitSwapCapNotApplicable {
+		t.Fatalf("lease=%+v — swap_cap must be the daemon's own answer, carried verbatim", lease)
 	}
 }
 

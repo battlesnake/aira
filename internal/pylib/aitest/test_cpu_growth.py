@@ -226,7 +226,7 @@ def test_acquire_worker_surfaces_cpu_slots_from_a_real_outcome_line(tmp_path, mo
     _outcome_stub(
         tmp_path, monkeypatch, "worker-admit-cpu-unevaluated",
         "aira-worker-admit state=granted class=granted "
-        "scope=%2Fouter%2F.aira-worker-1 worker_id=1 memory_max=400 memory_high=320 "
+        "scope=%2Fouter%2F.aira-worker-1 worker_id=1 memory_max=400 "
         "cpu_slots=unevaluated",
         hold_stdin=True, exit_code=0,
     )
@@ -235,7 +235,7 @@ def test_acquire_worker_surfaces_cpu_slots_from_a_real_outcome_line(tmp_path, mo
     grant, process = supervisor.acquire_worker(400)
     try:
         # The grant itself is unaffected: cpu_slots is additive diagnostic data,
-        # never a fifth required placement field.
+        # never a required placement field.
         assert grant["scope"] == "/outer/.aira-worker-1"
         assert grant["memory_max"] == "400"
         assert "cpu_slots=unevaluated" in capsys.readouterr().err

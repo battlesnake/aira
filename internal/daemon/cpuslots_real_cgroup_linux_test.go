@@ -85,7 +85,7 @@ func TestCPUGateFiresAgainstARealCgroupTree(t *testing.T) {
 
 	const capacity = 2
 	for i := 1; i <= capacity; i++ {
-		scope, err := runner.CreateWorkerScope(context.Background(), busy, strconv.Itoa(i), 1<<20, 1<<19)
+		scope, _, err := runner.CreateWorkerScope(context.Background(), busy, strconv.Itoa(i), 1<<20)
 		if err != nil {
 			cgrouptest.SkipOrFailRealCgroup(t, "create worker scope: %v", err)
 		}
@@ -159,7 +159,7 @@ func TestCPUGateFiresAgainstARealCgroupTree(t *testing.T) {
 // withholds a job's floor worker forever.
 func TestWorkerScopeLiveForFloorTracksRealPopulation(t *testing.T) {
 	_, scopes := realSliceWithConfineScopes(t, "pop")
-	scope, err := runner.CreateWorkerScope(context.Background(), scopes[0], "1", 1<<20, 1<<19)
+	scope, _, err := runner.CreateWorkerScope(context.Background(), scopes[0], "1", 1<<20)
 	if err != nil {
 		cgrouptest.SkipOrFailRealCgroup(t, "create worker scope: %v", err)
 	}
@@ -205,10 +205,10 @@ func TestCPUGateBoundsEachSliceSeparately(t *testing.T) {
 	_, first := realSliceWithConfineScopes(t, "one")
 	_, second := realSliceWithConfineScopes(t, "two")
 	for i := 1; i <= 2; i++ {
-		if _, err := runner.CreateWorkerScope(context.Background(), first[0], strconv.Itoa(i), 1<<20, 1<<19); err != nil {
+		if _, _, err := runner.CreateWorkerScope(context.Background(), first[0], strconv.Itoa(i), 1<<20); err != nil {
 			cgrouptest.SkipOrFailRealCgroup(t, "create worker scope: %v", err)
 		}
-		if _, err := runner.CreateWorkerScope(context.Background(), second[0], strconv.Itoa(i), 1<<20, 1<<19); err != nil {
+		if _, _, err := runner.CreateWorkerScope(context.Background(), second[0], strconv.Itoa(i), 1<<20); err != nil {
 			cgrouptest.SkipOrFailRealCgroup(t, "create worker scope: %v", err)
 		}
 	}

@@ -32,10 +32,14 @@ import (
 // shared admission slot workerAdmitConnection holds for a granted connection's
 // whole lifetime.
 type WorkerAdmitLease struct {
-	WorkerID   string
-	ScopePath  string
-	MemoryMax  int64
-	MemoryHigh int64
+	WorkerID  string
+	ScopePath string
+	MemoryMax int64
+	// SwapCap (AIRA-35) carries the daemon's proof about whether this worker's
+	// swap could be bounded -- see runner.WorkerAdmitSwapCap* and
+	// CreateWorkerScope. It replaces MemoryHigh, which AIRA-35 retired along
+	// with the memory.high write it named.
+	SwapCap string
 	// CPUSlots (AIRA-64) carries the daemon's CPU-governance state through to
 	// the outcome line the supervisor reads. It must traverse this hop or the
 	// signal is inert.
@@ -60,15 +64,15 @@ type WorkerAdmitClientRequest struct {
 }
 
 type workerAdmitGrant struct {
-	State      string `json:"state"`
-	Class      string `json:"class"`
-	Reason     string `json:"reason,omitempty"`
-	Detail     string `json:"detail,omitempty"`
-	WorkerID   string `json:"worker_id,omitempty"`
-	ScopePath  string `json:"scope_path,omitempty"`
-	MemoryMax  int64  `json:"memory_max,omitempty"`
-	MemoryHigh int64  `json:"memory_high,omitempty"`
-	CPUSlots   string `json:"cpu_slots,omitempty"`
+	State     string `json:"state"`
+	Class     string `json:"class"`
+	Reason    string `json:"reason,omitempty"`
+	Detail    string `json:"detail,omitempty"`
+	WorkerID  string `json:"worker_id,omitempty"`
+	ScopePath string `json:"scope_path,omitempty"`
+	MemoryMax int64  `json:"memory_max,omitempty"`
+	SwapCap   string `json:"swap_cap,omitempty"`
+	CPUSlots  string `json:"cpu_slots,omitempty"`
 }
 
 // RequestWorkerAdmit dials the daemon and sends one worker-admit request,
@@ -172,9 +176,10 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) Worke
 		// problem: the daemon and this client disagree about what a grant is.
 		//
 		// Found by Sol build-review against the pre-AIRA-39 shape, where the
-		// CLI called CreateWorkerScope itself and a grant with
-		// memory_high >= memory_max sailed through to it, failed there, and
-		// was reported `placement-failed` — one of the two classes that make
+		// CLI called CreateWorkerScope itself and a malformed grant (then, one
+		// with memory_high >= memory_max; that field is gone since AIRA-35)
+		// sailed through to it, failed there, and was
+		// reported `placement-failed` — one of the two classes that make
 		// the supervisor run the rest of the suite UNCONFINED. AIRA-39 moved
 		// that creation into the daemon, so this is no longer the difference
 		// between two classes on a live path; it is a pure contract guard
@@ -190,7 +195,7 @@ func RequestWorkerAdmit(ctx context.Context, req WorkerAdmitClientRequest) Worke
 		State: WorkerAdmitStateGranted, Class: WorkerAdmitClassGranted,
 		Lease: &WorkerAdmitLease{
 			WorkerID: grant.WorkerID, ScopePath: grant.ScopePath,
-			MemoryMax: grant.MemoryMax, MemoryHigh: grant.MemoryHigh,
+			MemoryMax: grant.MemoryMax, SwapCap: grant.SwapCap,
 			CPUSlots: grant.CPUSlots, conn: conn,
 		},
 	}
@@ -223,9 +228,13 @@ func classifyWorkerAdmitDialFailure(err error) WorkerAdmitOutcome {
 // workerAdmitGrantProblem states why a granted payload is unusable, or "" if
 // it is fine. It enforces exactly the invariants every consumer of a grant
 // depends on: a worker id and scope path to place into, both limits positive,
-// and memory_high below memory_max (spec 3.3's soft-throttle-below-hard-cap
-// rule, which runner.CreateWorkerScope itself refuses to violate and
-// supervisor.py's own grant validation re-checks).
+// and a positive memory_max.
+//
+// AIRA-35 removed the two memory_high checks that used to live here (positive,
+// and strictly below memory_max) together with the memory.high write they
+// guarded: with no such field on the wire there is nothing left to validate,
+// and re-adding a check for a field this protocol no longer defines would
+// reject every correct grant.
 //
 // Since AIRA-39 the daemon creates the scope, so a grant that violates these
 // should be impossible to produce — which is the point: reaching this branch
@@ -240,11 +249,6 @@ func workerAdmitGrantProblem(grant workerAdmitGrant) string {
 		return "granted outcome carries no scope_path"
 	case grant.MemoryMax <= 0:
 		return "granted outcome memory_max must be positive, got " + strconv.FormatInt(grant.MemoryMax, 10)
-	case grant.MemoryHigh <= 0:
-		return "granted outcome memory_high must be positive, got " + strconv.FormatInt(grant.MemoryHigh, 10)
-	case grant.MemoryHigh >= grant.MemoryMax:
-		return "granted outcome memory_high (" + strconv.FormatInt(grant.MemoryHigh, 10) +
-			") must be below memory_max (" + strconv.FormatInt(grant.MemoryMax, 10) + ")"
 	default:
 		return ""
 	}

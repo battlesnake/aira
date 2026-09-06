@@ -181,17 +181,67 @@ Two cgroup levels:
     guarantee. Both checks are re-evaluated every poll tick, so a sibling
     worker retiring (freeing its committed cap) or shrinking (freeing live
     usage) can unblock a grant that either check alone was blocking.
-  - Each worker scope gets both a `memory.high` (soft throttle, set below its
-    cap) and `memory.max` (hard containment) — AIRA-29 v2's
-    "`memory.high = effectiveCharge`, `memory.max` = self-OOM cap" split,
-    applied per worker: a runaway worker throttles and self-contains before
-    threatening the outer scope's Σ.
-  - Sizing of a fresh grant's `memory.max` backstop comes from a coarse
-    per-suite history estimate (signature `pytest-worker:<suite-hash>`, reuse
-    of `internal/store/confine_peak_history.go`'s existing table and
+  - **AMENDED by AIRA-35 (measured, 2026-09-06); supersedes the original
+    `memory.high`/`memory.max` split.** Each worker scope gets `memory.max`
+    (hard containment, with `memory.oom.group=1`) and **`memory.swap.max=0`**,
+    and **no `memory.high` at all**. Two measurements forced this; both were
+    taken with the probe now committed as
+    `TestWorkerScopeOOMGroupKillConvergesPromptly` and its negative control,
+    and the full tables are in
+    `docs/superpowers/specs/2026-09-06-aira35-worker-oom-convergence-plan.md`.
+      - *Without `memory.swap.max`, a worker scope did not contain a runaway at
+        all.* cgroup-v2's `memory.max` bounds memory, not memory+swap, and swap
+        defaults to unbounded. A 512 MiB allocation inside a 32 MiB
+        `memory.max` was **never OOM-killed**: it was reclaimed into swap and
+        exited 0, with ~520 MiB written to the swap device — reproduced at
+        every cap size tested and for a slow leaker as well as a fast one. The
+        original design's per-worker containment simply did not happen on any
+        host with swap. It is also what makes the aggregate guard above sound:
+        a Σ over `memory.max` cannot bound a footprint that escapes into swap.
+      - *`memory.high` was a convergence livelock, and narrowing the gap only
+        moved it.* At the original 80% split a deliberate leaker did **not**
+        converge to its `oom.group` kill in **420 seconds** (5475 `memory.high`
+        events, **zero** `memory.max` events — the kernel held the cgroup
+        pinned below its own hard cap, which is precisely what `memory.high`
+        promises to do). At a 95% split the delay tracks the *absolute* width
+        of the throttle window and so grows with the cap: ~1 s at 32 MiB but
+        **16–18 s at the 512 MiB cap this actually ships**. With no
+        `memory.high` it is 0.03–0.48 s across that whole range. `memory.high`
+        is designed for a cgroup whose *userspace* supervisor acts on the
+        resulting pressure signal; nothing above a worker scope does, so it was
+        a livelock by construction — and a process stuck in that reclaim path
+        can enter an unkillable D-state (AIRA-35's original report).
+      - *What the throttle was claimed to buy is provided elsewhere.* The outer
+        scope's Σ is protected by the aggregate admission guard above, not by
+        the throttle: a worker growing to its full `memory.max` is already
+        reserved against the ceiling. The proactive-recycle watermark (§3.4) is
+        a userspace comparison that needs a *number*, not a kernel throttle.
+      - *What it did cost, stated plainly.* Workers may now occupy their full
+        committed `memory.max` rather than being pinned ~20% below it, and
+        their anon pages are unreclaimable, so post-grant slack against an
+        outer-scope OOM is `workerAdmitHeadroomDefault` (64 MiB) plus the
+        supervisor's live usage being re-read at every grant. The residual
+        exposure is supervisor growth after the run's last grant — unchanged in
+        size, changed in failure mode (previously it degraded via swap, now it
+        reaches `oom.group`).
+      - *Where the swap cap cannot be set*, the grant still proceeds — refusing
+        would stall every aitest run on such a host — but carries `swap_cap`
+        (`enforced` / `not-applicable` / `unavailable`) and the supervisor says
+        so once on the suite's own output. `not-applicable` requires positive
+        proof the kernel cannot swap; a failure to look is `unavailable`.
+  - Sizing of a fresh grant's `memory.max` backstop is intended to come from a
+    coarse per-suite history estimate (signature `pytest-worker:<suite-hash>`,
+    reuse of `internal/store/confine_peak_history.go`'s existing table and
     `resolveAdmitReserve`'s p90-prior/no-history fallback, `admit.go:216-294`)
-    — this is a safety backstop sizing the cap, **not** the admission signal;
-    the admission signal is live occupancy as above.
+    — a safety backstop sizing the cap, **not** the admission signal; the
+    admission signal is live occupancy as above. **Still deferred as of
+    AIRA-35**: what ships is a flat `AIRA_AITEST_ESTIMATED_BYTES`, defaulting
+    to 512 MiB (`internal/pylib/aitest/__init__.py`'s
+    `_resolve_estimated_bytes`). Said explicitly because this paragraph read as
+    though history-based sizing were live, and the difference is load-bearing
+    now that a worker over its cap is killed rather than quietly swapped: the
+    remedy for an under-sized worker is that one environment variable, which is
+    what the OOM diagnostic names.
 
 `worker-admit` request/response sketch (connection-held lease, same idiom as
 `admitConnection`/`governorConnection`, `admit.go:384-522`,
@@ -206,7 +256,8 @@ early disconnect):
    "class":"granted"|"contended"|"request-invalid"|"admission-unusable"
           |"placement-failed"|"contract-violation",
    "reason":"<stable token>","detail":"<free text, never parsed>","waited_ms":N,
-   "scope_path":"<child cgroup path>","memory_max":N,"memory_high":N}
+   "scope_path":"<child cgroup path>","memory_max":N,
+   "swap_cap":"enforced"|"not-applicable"|"unavailable"}
 ```
 
 A future client speaking this wire shape (§3.8's generalisation goal) must
@@ -309,11 +360,27 @@ the original ask:
 - elapsed time budget,
 - test count,
 - and — new versus the original sketch — the worker's own `memory.current`
-  crossing a configured fraction of its `memory.high`, so a worker heading
-  toward its cap retires itself cleanly and reports back, rather than either
-  silently accumulating until the kernel intervenes or (in the degenerate
-  case) never recycling because it happened to stay just under a purely
-  time-based trigger.
+  crossing a configured fraction of its **`memory.max`** (AIRA-35; it was a
+  fraction of `memory.high` until that file stopped being written, and the
+  default was re-expressed from 80%-of-80% to 64%-of-`memory.max`, which holds
+  the trigger point to within a page — the old threshold was taken against the
+  page-floored `memory.high`, so the two differ by ~2 KiB in ~344 MB at the
+  512 MiB default; it is not a deliberate retune), so a worker heading toward its cap retires
+  itself cleanly and reports back, rather than either silently accumulating
+  until the kernel intervenes or (in the degenerate case) never recycling
+  because it happened to stay just under a purely time-based trigger.
+
+**How strong this is, stated honestly (AIRA-35).** It is a between-tests best
+effort, not a guarantee that a worker retires before its cap. A worker that
+grows within a *single* test reaches `memory.max` mid-test and is group-killed
+instead. That was always true — the check only runs between tests — but the
+`memory.high` throttle used to make such a worker's growth glacial, so it
+usually survived to the next check point. Removing the throttle removes that
+concealment: what it was providing was not containment but a slow leak dressed
+up as a graceful retirement, at the price of minutes in an unkillable reclaim
+path. A mid-test grower being killed and requeued is the normal, expected
+outcome below, and the supervisor's unevaluated report names the cap that
+killed it and the knob that raises it.
 
 A worker that *is* OOM-killed by its own `memory.max` (annotation was wrong,
 or a genuine leak) is a normal, expected event, not an incident — the
@@ -488,7 +555,9 @@ runner could speak it without a protocol change.
    output" bar.
 3. **Slice 3 — fallback + generalisation polish.** Daemon-unavailable
    fallback (§3.7), `worker-admit` wire-shape review for the generality goal,
-   `memory.high`/watermark tuning from Slice 1/2 field data.
+   watermark tuning from Slice 1/2 field data. (AIRA-35 retired `memory.high`
+   for worker scopes entirely, so the only tuning surface left here is the
+   `memory.max` watermark fraction.)
 4. **Slice 4 — retirement.** Delete the governor stack (§3.8) once Slice 2 is deployed
    and AIRA's own suite has run on `aitest` clean — AIRA's own dogfood suite
    is the first real migration, not a separate project.
@@ -499,8 +568,11 @@ runner could speak it without a protocol change.
   path hash? conftest content hash? explicit marker?) — needs a build-time
   decision, not a design-time one; low risk either way since it only sizes
   the backstop cap, not the admission signal.
-- Exact `memory.high`-crossing fraction for the proactive-recycle watermark —
-  needs field data from Slice 1, not a guess now.
+- Exact `memory.max`-crossing fraction for the proactive-recycle watermark —
+  needs field data from Slice 1, not a guess now. (Re-pointed from
+  `memory.high` by AIRA-35, which deliberately preserved the effective trigger
+  point rather than folding an unmeasured retune into a convergence fix. Owned
+  by AIRA-32.)
 - ~~Exact size of the daemon-unavailable fallback pool~~ — resolved
   (owner, 2026-09-01): `n_workers ≤ NumCPU`, visible on-output warning (§3.7).
 - Whether any other AIRA workload still has a legitimate use for
@@ -523,9 +595,15 @@ runner could speak it without a protocol change.
 - **Placement and containment**, in AIRA's existing confined-integration
   tier: a worker that genuinely exceeds its `memory.max` is actually
   OOM-killed and the run recovers (requeue-once → `unevaluated` on second
-  failure); a worker crossing its `memory.high` watermark self-recycles
-  before that; Σ(worker sub-caps) never exceeds the outer scope's cap under
-  concurrent admission.
+  failure); a worker crossing its `memory.max` watermark self-recycles before
+  that *where it reaches a between-tests check point at all* (§3.4);
+  Σ(worker sub-caps) never exceeds the outer scope's cap under concurrent
+  admission.
+  **The first of those depends on `memory.swap.max=0` (§3.3), and the test
+  asserting it must NOT pre-cap swap on an ancestor** — AIRA-35 found the
+  original e2e doing exactly that, which made it prove the harness rather than
+  the product: it passed identically whether or not production capped worker
+  swap, and production capped none.
 - **Adversarial cases:** daemon down for the whole run (fallback path, §3.7);
   daemon dies mid-run (in-flight worker grants must not orphan); a worker
   exits for recycling at the exact moment it's mid-request for a new nodeid

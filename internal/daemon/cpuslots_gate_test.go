@@ -78,15 +78,15 @@ func (f *cpuSlotsFixture) install(server *Server, capacity int) *cpuSlotsFixture
 	// The daemon's own scope creation must move this fixture's counts, or the
 	// concurrency test would be measuring nothing.
 	inner := server.workerScopeCreate
-	server.workerScopeCreate = func(ctx context.Context, outer, id string, memMax, memHigh int64) (string, error) {
-		path, err := inner(ctx, outer, id, memMax, memHigh)
+	server.workerScopeCreate = func(ctx context.Context, outer, id string, memMax int64) (string, string, error) {
+		path, swapCap, err := inner(ctx, outer, id, memMax)
 		if err == nil {
 			f.mu.Lock()
 			f.total[outer]++
 			f.live[outer]++
 			f.mu.Unlock()
 		}
-		return path, err
+		return path, swapCap, err
 	}
 	return f
 }

@@ -52,3 +52,31 @@ Resolution note to record on close: watermark is tunable via AIRA_AITEST_WORKER_
 
 
 *Disposition: Closed — not needed, reached via a source-verified triage pass (Fable model) as part of the backlog-completion push, independently spot-checked by the coordinating session before closing.*
+
+## Amendment (AIRA-35, 2026-09-06)
+
+This ticket's closing resolution names `AIRA_AITEST_WORKER_HIGH_WATERMARK_PCT`
+and `_DEFAULT_HIGH_WATERMARK_PCT = 80`, evaluated against the scope's
+`memory.high`. AIRA-35 landed the fork this resolution said belonged to it, and
+chose REMOVAL: worker scopes no longer carry `memory.high` at all (it was
+measured as a convergence livelock — 420 s without converging at 80%, 16-18 s at
+95% at the shipped 512 MiB cap), and they now carry `memory.swap.max=0` so
+`memory.max` actually contains.
+
+So the knob this resolution describes has moved, exactly as the resolution
+anticipated ("the remediation plan's AIRA-35 row already moves the watermark
+read to memory.max if deletion wins"):
+
+- env var: `AIRA_AITEST_WORKER_HIGH_WATERMARK_PCT` -> `AIRA_AITEST_WORKER_MEMORY_WATERMARK_PCT`
+- constant: `_DEFAULT_HIGH_WATERMARK_PCT = 80` -> `_DEFAULT_MEMORY_WATERMARK_PCT = 64`
+- read from: the scope's `memory.high` -> the scope's `memory.max`
+
+The change of default from 80 to 64 is a NO-OP by construction, not a retune:
+the old check fired at 80% of a `memory.high` the daemon set to 80% of
+`memory.max`, i.e. at 64% of `memory.max`. AIRA-35 deliberately did not touch
+the fraction, so this ticket's disposition ("tuning a number on a knob that is
+already tunable, with no data") stands unchanged -- only the knob's name and the
+file it reads have moved. If a real recycle-timing symptom is ever reported,
+file a fresh ticket with that data, against `memory.max`.
+
+relates AIRA-35.

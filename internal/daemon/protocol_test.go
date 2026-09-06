@@ -77,11 +77,19 @@ func TestFrameRoundTripPreservesRequestContent(t *testing.T) {
 //
 // verifies: AIRA-42 — the 6→7 bump changes the SHAPE too: WorkerAdmitResponse
 // gained `class`/`detail` and its `reason` values lost the "reject:"/"fallback:"
-// prefixes a version-6 client dispatches on. Both bumps fail this test if a
-// later "consistency" revert takes the number back down.
+// prefixes a version-6 client dispatches on.
+//
+// verifies: AIRA-35 — the 7→8 bump. WorkerAdmitResponse lost the required
+// `memory_high` and gained `swap_cap`, and worker scopes changed which cgroup
+// controls they carry. The old-daemon/new-supervisor direction is the dangerous
+// one and is UNDETECTABLE below this layer by construction: the new supervisor
+// deliberately tolerates a stale memory_high and deliberately stays silent on an
+// absent swap_cap, so an unbumped version would have run whole suites with the
+// memory.high livelock and no swap containment, silently. Every bump fails this
+// test if a later "consistency" revert takes the number back down.
 func TestProtocolVersionIsPinned(t *testing.T) {
-	if ProtocolVersion != 7 {
-		t.Fatalf("ProtocolVersion = %d, want 7; a wire-shape or wire-semantics change must "+
+	if ProtocolVersion != 8 {
+		t.Fatalf("ProtocolVersion = %d, want 8; a wire-shape or wire-semantics change must "+
 			"bump this and be deployed as an atomic reinstall+restart", ProtocolVersion)
 	}
 }

@@ -47,12 +47,20 @@ type WorkerAdmitResponse struct {
 	// Detail elaborates for a human. It carries cgroup paths and raw file
 	// contents, i.e. operator-controlled text, which is exactly why nothing
 	// classifies from it.
-	Detail     string `json:"detail,omitempty"`
-	WaitedMS   int64  `json:"waited_ms"`
-	WorkerID   string `json:"worker_id,omitempty"`
-	ScopePath  string `json:"scope_path,omitempty"`
-	MemoryMax  int64  `json:"memory_max,omitempty"`
-	MemoryHigh int64  `json:"memory_high,omitempty"`
+	Detail    string `json:"detail,omitempty"`
+	WaitedMS  int64  `json:"waited_ms"`
+	WorkerID  string `json:"worker_id,omitempty"`
+	ScopePath string `json:"scope_path,omitempty"`
+	MemoryMax int64  `json:"memory_max,omitempty"`
+	// SwapCap (AIRA-35) reports whether this worker's swap could actually be
+	// bounded. It replaced memory_high, which named a memory.high write
+	// AIRA-35 stopped doing (runner.CreateWorkerScope carries the measured
+	// reasons). Without a swap cap, a worker's memory.max bounds memory but
+	// not memory+swap, so a runaway is reclaimed into swap and never killed --
+	// the containment this grant appears to promise simply does not happen.
+	// Diagnostic like CPUSlots: nothing branches on it, and it is what stops a
+	// lost guarantee from being invisible to the run it affects.
+	SwapCap string `json:"swap_cap,omitempty"`
 	// CPUSlots (AIRA-64) reports whether this grant was actually subject to
 	// CPU-concurrency governance. It exists because a fail-open governance
 	// dimension whose failure is visible only in the daemon journal is how a
@@ -731,7 +739,6 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 	}
 	seq++
 	workerID := strconv.Itoa(seq)
-	memoryHigh := req.estimatedBytes * 4 / 5
 	create := s.workerScopeCreate
 	if create == nil {
 		create = runner.CreateWorkerScope
@@ -742,7 +749,7 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 	// (the grant used to be recorded here and the directory created afterwards
 	// by a different process) and makes the ledger's source of truth exist
 	// before the grant is ever delivered.
-	scopePath, err := create(ctx, req.outerScope, workerID, req.estimatedBytes, memoryHigh)
+	scopePath, swapCap, err := create(ctx, req.outerScope, workerID, req.estimatedBytes)
 	if err != nil {
 		if errors.Is(err, fs.ErrExist) {
 			// A child the scan did not see PROVES the cached sum was
@@ -798,7 +805,7 @@ func (s *Server) evaluateWorkerAdmit(ctx context.Context, req workerAdmitRequest
 	return WorkerAdmitResponse{
 		State: runner.WorkerAdmitStateGranted, Class: runner.WorkerAdmitClassGranted,
 		WorkerID: workerID, ScopePath: scopePath,
-		MemoryMax: req.estimatedBytes, MemoryHigh: memoryHigh,
+		MemoryMax: req.estimatedBytes, SwapCap: swapCap,
 		CPUSlots: cpuState,
 	}, true
 }

@@ -8,11 +8,11 @@ import (
 )
 
 type WorkerAdmitLease struct {
-	WorkerID   string
-	ScopePath  string
-	MemoryMax  int64
-	MemoryHigh int64
-	CPUSlots   string
+	WorkerID  string
+	ScopePath string
+	MemoryMax int64
+	SwapCap   string
+	CPUSlots  string
 }
 
 func (l *WorkerAdmitLease) Close() error { return nil }

@@ -95,6 +95,31 @@ def test_acquire_worker_parses_grant_and_holds_process(tmp_path, monkeypatch):
     _outcome_stub(
         tmp_path, monkeypatch, "worker-admit-ok",
         "aira-worker-admit state=granted class=granted "
+        "scope=%2Fouter%2F.aira-worker-1 worker_id=1 memory_max=400",
+        hold_stdin=True, exit_code=0,
+    )
+    supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    grant, process = supervisor.acquire_worker(400)
+    try:
+        assert grant == {"scope": "/outer/.aira-worker-1", "worker_id": "1", "memory_max": "400"}
+    finally:
+        process.stdin.close()
+        process.wait(timeout=5)
+
+
+def test_acquire_worker_accepts_a_grant_still_carrying_the_retired_memory_high(tmp_path, monkeypatch):
+    """AIRA-35: memory_high left the contract, so a line that still carries it
+    must be ACCEPTED, not rejected.
+
+    This is the direction that matters. Every rejection in this parser ends in
+    WorkerAdmitContractViolation, which is terminal for the whole run -- so a
+    validator that still demanded, or still choked on, a field this protocol no
+    longer defines would turn every grant from a mismatched daemon into a dead
+    suite. The extra key is simply ignored, exactly as any unknown key is."""
+    _outcome_stub(
+        tmp_path, monkeypatch, "worker-admit-stale-memory-high",
+        "aira-worker-admit state=granted class=granted "
         "scope=%2Fouter%2F.aira-worker-1 worker_id=1 memory_max=400 memory_high=320",
         hold_stdin=True, exit_code=0,
     )
@@ -102,10 +127,65 @@ def test_acquire_worker_parses_grant_and_holds_process(tmp_path, monkeypatch):
     supervisor.outer_scope = "/outer"
     grant, process = supervisor.acquire_worker(400)
     try:
-        assert grant == {"scope": "/outer/.aira-worker-1", "worker_id": "1", "memory_max": "400", "memory_high": "320"}
+        assert grant == {"scope": "/outer/.aira-worker-1", "worker_id": "1", "memory_max": "400"}
     finally:
         process.stdin.close()
         process.wait(timeout=5)
+
+
+def _acquire_with_swap_cap(tmp_path, monkeypatch, name, token, supervisor=None):
+    line = (
+        "aira-worker-admit state=granted class=granted "
+        "scope=%2Fouter%2F.aira-worker-1 worker_id=1 memory_max=400"
+    )
+    if token:
+        line += " swap_cap=" + token
+    _outcome_stub(tmp_path, monkeypatch, name, line, hold_stdin=True, exit_code=0)
+    if supervisor is None:
+        supervisor = Supervisor()
+    supervisor.outer_scope = "/outer"
+    grant, process = supervisor.acquire_worker(400)
+    process.stdin.close()
+    process.wait(timeout=5)
+    return supervisor, grant
+
+
+def test_swap_cap_unavailable_warns_once_on_the_runs_own_output(tmp_path, monkeypatch, capsys):
+    """AIRA-35: a run whose worker swap could not be bounded is TOLD, once.
+
+    Without a swap cap, cgroup-v2's memory.max bounds memory but not
+    memory+swap, so a worker that exceeds its cap is reclaimed into swap and
+    runs to completion instead of being killed -- the per-worker containment
+    this run believes it has does not happen. The grant still proceeds
+    (refusing would stall every aitest run on such a host), which is precisely
+    why the loss must be visible on the output of the run it affects rather
+    than only in the daemon journal."""
+    supervisor, _ = _acquire_with_swap_cap(tmp_path, monkeypatch, "swap-cap-unavailable", "unavailable")
+    stderr = capsys.readouterr().err
+    assert "swap_cap=unavailable" in stderr
+    assert "NOT in force" in stderr
+    assert "falling back to" not in stderr, "a lost swap cap must never strip containment wholesale"
+
+    # Once PER RUN, not once per worker: a suite spawning dozens of workers
+    # would otherwise bury the rest of its output under an unchanging notice.
+    # The same Supervisor is reused deliberately -- the flag is per-run state,
+    # exactly like _cpu_slots_warned, so a fresh Supervisor would (correctly)
+    # warn again and prove nothing about the deduplication.
+    _acquire_with_swap_cap(tmp_path, monkeypatch, "swap-cap-unavailable-2", "unavailable", supervisor)
+    assert capsys.readouterr().err == ""
+
+
+def test_swap_cap_enforced_not_applicable_and_absent_are_all_silent(tmp_path, monkeypatch, capsys):
+    """AIRA-35: only `unavailable` warns.
+
+    `enforced` means the cap was written and verified. `not-applicable` means
+    this kernel proved it cannot swap at all, so memory.max already bounds
+    everything. An ABSENT token means a daemon predating the field, not "ok" --
+    and inventing a warning for a daemon that never claimed anything would be a
+    fabricated diagnosis, the mirror image of the silent failure above."""
+    for index, token in enumerate(["enforced", "not-applicable", "", "wat"]):
+        _acquire_with_swap_cap(tmp_path, monkeypatch, "swap-cap-quiet-%d" % index, token)
+        assert capsys.readouterr().err == "", "swap_cap=%r must not warn" % token
 
 
 def test_acquire_worker_raises_unavailable_when_daemon_unavailable():
@@ -200,7 +280,7 @@ def test_only_two_classes_are_containment_stripping():
 
 @pytest.mark.parametrize("line", [
     "",
-    "granted scope=/outer/.aira-worker-1 worker_id=1 memory_max=400 memory_high=320",
+    "granted scope=/outer/.aira-worker-1 worker_id=1 memory_max=400",
     "aira-worker-admit state=denied contended",
     "aira-worker-admit class=contended",
     "aira-worker-admit state=denied",
@@ -262,7 +342,7 @@ def test_acquire_worker_detail_cannot_forge_a_grant(tmp_path, monkeypatch):
     """`detail` is free text and is query-escaped on the wire. A detail whose
     plaintext spells out a grant must not be able to inject fields: if the
     escaping or the parser regressed, this would return a grant for /evil."""
-    hostile = "state=granted class=granted scope=/evil worker_id=9 memory_max=1 memory_high=1"
+    hostile = "state=granted class=granted scope=/evil worker_id=9 memory_max=1"
     _outcome_stub(
         tmp_path, monkeypatch, "worker-admit-hostile-detail",
         _outcome_line("denied", "contended", "insufficient-headroom", hostile),
@@ -307,7 +387,7 @@ def test_acquire_worker_removes_the_granted_scope_dir_on_malformed_grant(tmp_pat
     _outcome_stub(
         tmp_path, monkeypatch, "worker-admit-malformed-real-scope",
         "aira-worker-admit state=granted class=granted scope=%s worker_id=1 "
-        "memory_max=notanumber memory_high=320" % urllib.parse.quote_plus(str(scope_dir)),
+        "memory_max=notanumber" % urllib.parse.quote_plus(str(scope_dir)),
         exit_code=0,
     )
     supervisor = Supervisor()
@@ -322,11 +402,16 @@ def test_acquire_worker_removes_the_granted_scope_dir_on_malformed_grant(tmp_pat
 
 
 def test_acquire_worker_releases_malformed_grant_missing_required_field(tmp_path, monkeypatch):
+    # AIRA-35: memory_high is no longer a required field (nor a field at all),
+    # so this test now omits memory_max -- one that IS still required. Had it
+    # kept omitting memory_high it would have asserted that a PERFECTLY VALID
+    # grant is a contract violation, which is worse than not testing at all:
+    # every rejection here is terminal for the run.
     pid_path = tmp_path / "malformed-grant-pid"
-    stub = _write_stub(tmp_path / "worker-admit-missing-memory-high", f"""
+    stub = _write_stub(tmp_path / "worker-admit-missing-memory-max", f"""
 import os, sys
 open({str(pid_path)!r}, "w").write(str(os.getpid()))
-print("aira-worker-admit state=granted class=granted scope=%2Fouter%2F.aira-worker-1 worker_id=1 memory_max=400")
+print("aira-worker-admit state=granted class=granted scope=%2Fouter%2F.aira-worker-1 worker_id=1")
 sys.stdout.flush()
 sys.exit(0)
 """)
@@ -337,7 +422,7 @@ sys.exit(0)
         supervisor.acquire_worker(400)
         assert False, "expected WorkerAdmitContractViolation"
     except WorkerAdmitContractViolation as exc:
-        assert "memory_high" in str(exc)
+        assert "memory_max" in str(exc)
 
     assert not os.path.exists("/proc/%s" % pid_path.read_text()), "malformed grant relay must be reaped"
 
@@ -347,7 +432,7 @@ def test_acquire_worker_releases_malformed_grant_invalid_memory_limit(tmp_path, 
     stub = _write_stub(tmp_path / "worker-admit-invalid-memory-max", f"""
 import os, sys
 open({str(pid_path)!r}, "w").write(str(os.getpid()))
-print("aira-worker-admit state=granted class=granted scope=%2Fouter%2F.aira-worker-1 worker_id=1 memory_max=notanumber memory_high=320")
+print("aira-worker-admit state=granted class=granted scope=%2Fouter%2F.aira-worker-1 worker_id=1 memory_max=notanumber")
 sys.stdout.flush()
 sys.exit(0)
 """)
@@ -381,7 +466,7 @@ def test_acquire_worker_malformed_grant_does_not_deadlock_on_a_relay_holding_std
     _outcome_stub(
         tmp_path, monkeypatch, "worker-admit-malformed-grant-holds-stdin",
         "aira-worker-admit state=granted class=granted scope=%2Fouter%2F.aira-worker-1 "
-        "worker_id=1 memory_max=notanumber memory_high=320",
+        "worker_id=1 memory_max=notanumber",
         hold_stdin=True, exit_code=0,
     )
     supervisor = Supervisor()
@@ -431,7 +516,7 @@ import os, sys
 open({str(admit_calls)!r}, "a").write("x")
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -485,7 +570,7 @@ import os, sys
 open({str(admit_calls)!r}, "a").write("x")
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=%d memory_max=104857600 memory_high=83886080" % (scope, os.getpid()))
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=%d memory_max=104857600" % (scope, os.getpid()))
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -544,7 +629,7 @@ def test_spawn_worker_child_closes_its_admit_stderr_fd(tmp_path, monkeypatch):
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 try:
@@ -608,7 +693,7 @@ def test_spawn_worker_closes_dispatch_write_when_placement_ack_is_missing(monkey
 
     supervisor = Supervisor()
     supervisor.acquire_worker = lambda estimated_bytes, max_wait: (
-        {"scope": "/unused", "worker_id": "1", "memory_max": "1", "memory_high": "1"}, AdmitProcess()
+        {"scope": "/unused", "worker_id": "1", "memory_max": "1"}, AdmitProcess()
     )
     monkeypatch.setattr(supervisor_module.os, "pipe", recording_pipe)
     monkeypatch.setattr(supervisor_module, "fork_worker", child_that_never_acks)
@@ -661,7 +746,7 @@ def test_spawn_worker_removes_the_granted_scope_dir_on_placement_failure(tmp_pat
     scope_dir.mkdir()
     supervisor = Supervisor()
     supervisor.acquire_worker = lambda estimated_bytes, max_wait: (
-        {"scope": str(scope_dir), "worker_id": "1", "memory_max": "1", "memory_high": "1"}, AdmitProcess()
+        {"scope": str(scope_dir), "worker_id": "1", "memory_max": "1"}, AdmitProcess()
     )
     monkeypatch.setattr(supervisor_module, "fork_worker", child_that_never_acks)
 
@@ -686,7 +771,7 @@ sys.exit(0)
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -725,7 +810,7 @@ sys.exit(0)
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=%d memory_max=104857600 memory_high=83886080" % (scope, os.getpid()))
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=%d memory_max=104857600" % (scope, os.getpid()))
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -1041,7 +1126,7 @@ if calls > 1:
         sys.exit(1)
 scope = os.path.join({str(outer)!r}, "worker-scope-%d-%d" % (os.getpid(), calls))
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=%d memory_max=104857600 memory_high=83886080" % (scope, calls))
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=%d memory_max=104857600" % (scope, calls))
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -1112,7 +1197,7 @@ sys.exit(0)
 """)
     admit = _write_stub(tmp_path / "worker-admit-malformed", """
 import sys
-print("aira-worker-admit state=granted class=granted scope=/outer/.aira-worker-1 worker_id=1 memory_max=104857600")
+print("aira-worker-admit state=granted class=granted scope=/outer/.aira-worker-1 worker_id=1")
 sys.stdout.flush()
 sys.exit(0)
 """)
@@ -1138,7 +1223,7 @@ sys.exit(0)
         "strip containment for the rest of the run"
     )
     stderr = capsys.readouterr().err
-    assert "memory_high" in stderr
+    assert "memory_max" in stderr
     assert "falling back to" not in stderr, "this must never degrade to unconfined workers"
 
 
@@ -1169,7 +1254,7 @@ if remaining > 0:
     sys.exit(1)
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -1234,7 +1319,7 @@ open(state_path, "w").write(str(count + 1))
 if count == 0:
     scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
     os.makedirs(scope, exist_ok=True)
-    print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+    print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
     sys.stdout.flush()
     sys.stdin.buffer.read()
 elif count == 1:
@@ -1344,7 +1429,7 @@ if remaining > 0:
     sys.exit(1)
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -1385,7 +1470,7 @@ sys.exit(0)
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -1494,7 +1579,7 @@ open(state_path, "w").write(str(count + 1))
 if count == 0:
     scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
     os.makedirs(scope, exist_ok=True)
-    print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+    print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
     sys.stdout.flush()
     sys.stdin.buffer.read()
 else:
@@ -1569,7 +1654,7 @@ import os, sys
 open({str(admit_calls)!r}, "a").write("x")
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -1608,7 +1693,7 @@ import os, sys
 open({str(admit_calls)!r}, "a").write("x")
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -1987,7 +2072,7 @@ sys.exit(0)
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -2044,7 +2129,7 @@ sys.exit(0)
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -2101,7 +2186,7 @@ open(state_path, "w").write(str(count + 1))
 if count == 0:
     scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
     os.makedirs(scope, exist_ok=True)
-    print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+    print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
     sys.stdout.flush()
     sys.stdin.buffer.read()
 else:
@@ -2365,7 +2450,7 @@ if n == 3:
     time.sleep(600)
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=%d memory_max=104857600 memory_high=83886080" % (scope, os.getpid()))
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=%d memory_max=104857600" % (scope, os.getpid()))
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -2587,7 +2672,7 @@ def test_placement_ack_timeout_kills_the_child_and_reports_a_denial(monkeypatch)
     monkeypatch.setenv("AIRA_AITEST_PLACEMENT_ACK_TIMEOUT", "1")
     supervisor = Supervisor()
     supervisor.acquire_worker = lambda estimated_bytes, max_wait: (
-        {"scope": "/unused", "worker_id": "1", "memory_max": "1", "memory_high": "1"}, AdmitProcess()
+        {"scope": "/unused", "worker_id": "1", "memory_max": "1"}, AdmitProcess()
     )
     monkeypatch.setattr(supervisor_module, "fork_worker", child_that_never_acks)
 
@@ -3093,7 +3178,7 @@ sys.exit(0)
 import os, sys
 scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
 os.makedirs(scope, exist_ok=True)
-print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600 memory_high=83886080" % scope)
+print("aira-worker-admit state=granted class=granted scope=%s worker_id=1 memory_max=104857600" % scope)
 sys.stdout.flush()
 sys.stdin.buffer.read()
 """)
@@ -3161,3 +3246,72 @@ sys.stdin.buffer.read()
         "the crash must be detected, requeued once, and the retry must run"
     )
     assert attempts.read_text().count("x") == 2, "exactly one crash and one retry"
+
+
+def _death_state(scope=None, memory_max="33554432"):
+    grant = None
+    if scope is not None:
+        grant = {"scope": str(scope), "worker_id": "1", "memory_max": memory_max}
+    return {"in_flight": "t.py::test_one", "grant": grant}
+
+
+def test_worker_death_names_the_memory_cap_and_the_knob_when_the_scope_was_oom_killed(tmp_path):
+    """AIRA-35: an OOM-killed worker must say WHICH limit killed it and WHICH
+    knob raises it.
+
+    This is required by the change, not decorative. Until AIRA-35 nothing
+    capped a worker's swap, so a worker over its memory.max was reclaimed into
+    swap and its test PASSED; with memory.swap.max=0 that same worker is now
+    group-killed, requeued once, and reported unevaluated. Turning a silent
+    pass into an unevaluated is correct -- it is the containment this product
+    claims -- but only if the report says what to change. The per-worker cap is
+    a flat AIRA_AITEST_ESTIMATED_BYTES (512 MiB by default), so the remedy is a
+    single environment variable and the message must name it."""
+    scope = tmp_path / "oom-killed-scope"
+    scope.mkdir()
+    (scope / "memory.events").write_text(
+        "low 0\nhigh 0\nmax 35\noom 1\noom_kill 2\noom_group_kill 1\n"
+    )
+    supervisor = Supervisor()
+    reason = supervisor._describe_worker_death(4321, _death_state(scope))
+    assert "memory.max=33554432" in reason
+    assert "AIRA_AITEST_ESTIMATED_BYTES" in reason
+    assert "4321" in reason
+
+
+def test_worker_death_falls_back_to_the_generic_reason_rather_than_guessing(tmp_path):
+    """AIRA-35: every uncertainty produces the vague TRUE sentence, never a
+    fabricated OOM claim.
+
+    memory.events counters are per-scope and propagate only upward, so
+    oom_group_kill > 0 really does mean this scope's own oom.group fired. But
+    the evidence is not always there: a containment-stripped fallback worker
+    has no grant at all, a scope can already be gone, and a kernel may not
+    report oom_group_kill. Naming a cap that did not kill this worker would
+    send an operator to raise a limit that was never the problem."""
+    supervisor = Supervisor()
+
+    no_kill = tmp_path / "alive-scope"
+    no_kill.mkdir()
+    (no_kill / "memory.events").write_text("low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n")
+
+    no_counter = tmp_path / "old-kernel-scope"
+    no_counter.mkdir()
+    (no_counter / "memory.events").write_text("low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n")
+
+    bad_counter = tmp_path / "garbage-scope"
+    bad_counter.mkdir()
+    (bad_counter / "memory.events").write_text("oom_group_kill notanumber\n")
+
+    for name, state in [
+        ("no grant (fallback worker)", _death_state(None)),
+        ("grant without a scope", {"in_flight": "t.py::test_one", "grant": {"worker_id": "1"}}),
+        ("scope already removed", _death_state(tmp_path / "does-not-exist")),
+        ("scope was not oom-killed", _death_state(no_kill)),
+        ("kernel reports no oom_group_kill counter", _death_state(no_counter)),
+        ("unparseable counter", _death_state(bad_counter)),
+    ]:
+        reason = supervisor._describe_worker_death(4321, state)
+        assert reason == (
+            "worker 4321 stopped reporting while running it, and the one retry did too"
+        ), "%s must not produce a fabricated OOM diagnosis, got %r" % (name, reason)

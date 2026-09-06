@@ -6,7 +6,21 @@ import time
 
 _DEFAULT_MAX_SECONDS = 600
 _DEFAULT_MAX_TESTS = 200
-_DEFAULT_HIGH_WATERMARK_PCT = 80
+# AIRA-35: the proactive-recycle watermark is a fraction of the worker's
+# memory.max, not of a memory.high that no longer exists.
+#
+# 64, not 80, and that reproduces the old trigger point TO WITHIN A PAGE rather
+# than being a retune. The old check was `memory.current / memory.high > 80%`
+# where the daemon set `memory.high = memory.max * 4/5`, so it fired at
+# 0.8 * 0.8 = 64% of memory.max. Reading memory.max with a 64% default lands on
+# the same point -- but not bit-for-bit: writeScopeMemoryCap verified the
+# PAGE-FLOORED memory.high, so at the 512 MiB default the old threshold was
+# 0.80 * floor_page(536870912 * 4/5) and the new one is 0.64 * 536870912, a
+# difference of about 2 KiB in ~344 MB. "Exactly" would be an overclaim; the
+# point is that this is not a deliberate retune. The exact fraction is a genuinely open question (aitest design
+# spec section 6) that needs field data, and AIRA-32 owns it; changing it here
+# would have folded an unmeasured behavioural change into a convergence fix.
+_DEFAULT_MEMORY_WATERMARK_PCT = 64
 
 # _should_recycle runs after every completed test. Keep a malformed
 # environment setting from both killing the worker and repeating the same
@@ -254,15 +268,21 @@ def _should_recycle(scope_path, started_at, completed_count):
         # Daemon-down fallback mode (Task 16): no granted cgroup scope to
         # watermark-check; time/count bounds above still apply.
         return False
-    watermark_pct = _env_float("AIRA_AITEST_WORKER_HIGH_WATERMARK_PCT", _DEFAULT_HIGH_WATERMARK_PCT)
+    watermark_pct = _env_float(
+        "AIRA_AITEST_WORKER_MEMORY_WATERMARK_PCT", _DEFAULT_MEMORY_WATERMARK_PCT
+    )
     try:
         current = _read_cgroup_int(scope_path, "memory.current")
-        high = _read_cgroup_int(scope_path, "memory.high")
+        limit = _read_cgroup_int(scope_path, "memory.max")
     except (OSError, ValueError):
         return False
-    if current is None or high is None or high <= 0:
+    # Fail OPEN, unchanged from the memory.high era: an unreadable scope, a
+    # "max" (unbounded) limit, or a non-positive one means this check could not
+    # establish its result, and a recycle decision that cannot be established
+    # must not force a recycle.
+    if current is None or limit is None or limit <= 0:
         return False
-    return (current * 100.0 / high) > watermark_pct
+    return (current * 100.0 / limit) > watermark_pct
 
 
 def fork_worker(scope_path):
