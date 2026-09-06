@@ -338,7 +338,7 @@ func TestRunDelimiterKeepsChildOptionTokensVerbatim(t *testing.T) {
 	}
 	want := core.Request{Verb: "run", Args: map[string]any{
 		"argv": []string{"tool", "--child-option", "--json"}, "prefix": []string(nil), "cwd": "",
-		"env": []string{}, "merge": true, "realtime": false, "pty": false, "detach": false, "stdin_connect": false, "follow": false, "stdin": "", "no_stdin": false, "store_stdin": false, "no_admit": false, "timeout": "",
+		"env": []string{}, "merge": true, "realtime": false, "pty": false, "detach": false, "stdin_connect": false, "follow": false, "stdin": "", "no_stdin": false, "store_stdin": false, "no_admit": false, "timeout": "", "cpu_timeout": "",
 		"ticket": "", "phase": "", "label": "", "tool": "", "report": "", "report_stream": "", "suite": "", "config_env": []string{},
 		"shard": "", "retry": "", "usage": "", "provider": "", "strict_wiring": false,
 	}}

@@ -362,6 +362,12 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	var scope Scope
 	var cmd *exec.Cmd
 	var readers, writers map[string]*os.File
+	// AIRA-136. The CPU budget means "CPU-time consumed by THIS run", not the
+	// scope's absolute counter, so the baseline is read synchronously before the
+	// child starts, while the scope exists and no process is in it: the read is
+	// exact and the skew is zero.
+	var cpuBaseline time.Duration
+	var cpuBaselineOK bool
 	launchPrep := func() (*RunRecord, error) {
 		// This local defer is a leak backstop. Each failure explicitly releases
 		// before failBeforeLaunch or any other terminal arbitration is evaluated.
@@ -432,6 +438,9 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 		if err := r.applyScopeMemoryCap(scope, req, &record); err != nil {
 			releaseAdmit()
 			return r.failLaunchPrep(ctx, record, "E_RUN_CAP_UNAVAILABLE", err)
+		}
+		if req.CPUTimeout > 0 {
+			cpuBaseline, cpuBaselineOK = readCgroupCPUFn(scope.Reference())
 		}
 
 		// CommandContext's default cancellation calls Process.Kill. That would be
@@ -579,13 +588,23 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	timedOut := false
 	intentNotExecuted := false
 	var timeoutKill killAttempt
-	if req.Timeout > 0 {
-		timer := time.NewTimer(req.Timeout)
+	// AIRA-136. fired names the bound that ended the run. It stays the zero value
+	// on every path that does not take the deadline branch, and timedOut can only
+	// become true inside that branch, so fired.Code is never empty where the
+	// status block reads it.
+	var fired deadlineFire
+	deadlines := startDeadlineSource(deadlineConfig{
+		Wall: req.Timeout, CPU: req.CPUTimeout,
+		CPUBase: cpuBaseline, CPUBaseOK: cpuBaselineOK,
+		ScopePath: scope.Reference(), Interval: cpuBudgetSampleInterval,
+		ReadCPU: readCgroupCPUFn,
+	})
+	if deadlines != nil {
 		select {
 		case outcome := <-waitCh:
 			waitErr, waitState = outcome.err, outcome.state
-		case <-timer.C:
-			attempt, killErr := r.killWithIntent(ctx, id, "run-timeout", killPolicy{Enforce: false})
+		case fired = <-deadlines.C:
+			attempt, killErr := r.killWithIntent(ctx, id, fired.Actor, killPolicy{Enforce: false})
 			timeoutKill = attempt
 			// AIRA-126. The deadline can fire against a scope the leader has
 			// already left. killWithIntent has then published a durable intent
@@ -623,12 +642,12 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 				waitErr, waitState = outcome.err, outcome.state
 			}
 		}
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
+		// halt joins the source goroutine, so no sampler outlives this launch and
+		// none can race killWithIntent's scope removal. After a fire the goroutine
+		// has already returned; a fire that lost the select sits in the buffered
+		// channel and is discarded with the source, the same discard the bare
+		// timer's drain used to perform.
+		deadlines.halt()
 	} else {
 		outcome := <-waitCh
 		waitErr, waitState = outcome.err, outcome.state
@@ -823,9 +842,9 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	if timedOut {
 		record.Status = StatusKilled
 		record.ExitCode, record.Signal = nil, ""
-		record.ErrorCodes = appendUnique(record.ErrorCodes, "E_RUN_TIMEOUT")
+		record.ErrorCodes = appendUnique(record.ErrorCodes, fired.Code)
 		if timeoutKill.Kill.Completed {
-			record.ScopeKill = ScopeKill{Requested: true, Started: true, Completed: true, GraceMS: r.termGrace.Milliseconds(), Actor: "run-timeout", At: nowString(r.now)}
+			record.ScopeKill = ScopeKill{Requested: true, Started: true, Completed: true, GraceMS: r.termGrace.Milliseconds(), Actor: fired.Actor, At: nowString(r.now)}
 			record.KillIntent = KillIntent{Present: true, Sequence: timeoutKill.IntentSequence, Completed: true, Empty: true}
 		} else {
 			record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_RECONCILE_REQUIRED")
@@ -861,6 +880,24 @@ func (r *Runner) Launch(ctx context.Context, req Request) (*RunRecord, error) {
 	}
 	usage := snapshotUsage(&record, scope.Reference())
 	record.Status = classifyOOMKilled(record.Status, usage, timedOut || (record.Status == StatusKilled && record.KillIntent.Present))
+	// AIRA-136. A requested CPU-time budget AIRA cannot assert it applied is
+	// recorded, never silently dropped. finalEstablished is read off the POINTER
+	// fields rather than off a sum: readCgroupUsage leaves CPUUser/CPUSys nil on a
+	// failed or unparseable cpu.stat, and snapshotUsage only overwrites a field
+	// when the new read produced a value, so a nil here is a genuine "never
+	// established". Summing first and testing the sum would turn an unreadable
+	// counter into a MEASURED zero, which is the fake zero this rule exists to
+	// refuse.
+	finalEstablished := record.CPUUser != nil && record.CPUSys != nil
+	var finalConsumed time.Duration
+	if finalEstablished {
+		total := time.Duration(*record.CPUUser+*record.CPUSys) * time.Microsecond
+		finalConsumed = decideFinalCPUConsumed(total, cpuBaseline, cpuBaselineOK)
+	}
+	killedByCPUBudget := timedOut && fired.Code == "E_RUN_CPU_TIMEOUT"
+	if decideCPUBudgetUnenforced(req.CPUTimeout, killedByCPUBudget, finalConsumed, finalEstablished) {
+		record.ErrorCodes = appendUnique(record.ErrorCodes, "U_RUN_CPU_BUDGET_UNENFORCED")
+	}
 	record.EndedAt = nowString(r.now)
 	latest, latestErr := r.ledger.current(id)
 	if latestErr == nil && latest.Status.Terminal() {

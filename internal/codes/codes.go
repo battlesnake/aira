@@ -178,10 +178,38 @@ var ExitCodes = map[string]int{
 	"E_RUN_ENV_INVALID": 2, "E_RUN_STDIN_INVALID": 2, "E_RUN_NOT_FOUND": 2,
 	"E_RUN_FAILED": 1, "E_RUN_KILLED": 1, "E_RUN_TIMEOUT": 3, "E_RUN_FOREIGN_OWNER": 1,
 	"E_RUN_OOM_KILLED": 1, "E_RUN_PTY_UNAVAILABLE": 1,
+	// AIRA-136. E_RUN_CPU_TIMEOUT is the CPU-time twin of E_RUN_TIMEOUT: the run
+	// was terminated because the cumulative user+system CPU time charged to its
+	// cgroup reached the requested --cpu-timeout budget. It takes the same exit
+	// class 3 for the same reason — a run cut short at a deadline produced no
+	// evaluated result — and the two codes are distinct so a record names which
+	// bound actually fired.
+	"E_RUN_CPU_TIMEOUT": 3,
 	"E_RUN_OUTPUT_OPEN": 4, "E_RUN_OUTPUT_DISK_FULL": 4, "E_RUN_CAPTURE_FAILED": 4,
 	"E_RUN_SCOPE_UNAVAILABLE": 4, "E_RUN_CAP_UNAVAILABLE": 4, "E_RUN_SCOPE_INVALID": 4, "E_RUN_SCOPE_HANDOFF": 4,
 	"E_RUN_SCOPE_MIGRATION": 4, "E_RUN_DESCENDANT_KILLED": 4, "E_RUN_LAUNCH_FAILED": 4,
 	"U_RUN_EXIT_UNKNOWN": 3, "U_RUN_OUTPUT_UNAVAILABLE": 3, "U_RUN_RECONCILE_REQUIRED": 3,
+	// AIRA-136. U_RUN_CPU_BUDGET_UNENFORCED says a --cpu-timeout budget was
+	// REQUESTED and AIRA cannot assert that it was applied. It covers exactly two
+	// distinct states, and a reader of the record must not collapse them:
+	//
+	//   - NEVER MEASURED. No cpu.stat read succeeded during the run and the
+	//     teardown read did not succeed either, so AIRA has no idea how much CPU
+	//     the job used. This is the state a run in a non-kernel scope reaches (an
+	//     in-memory backend, or a shim mode where there IS no cgroup).
+	//   - MEASURED, BREACHED, NOT ENFORCED. The final established total DID reach
+	//     the budget and no CPU-budget kill was executed — sampling was degraded
+	//     for long enough to miss the crossing, or another bound ended the run
+	//     first. Here the measurement exists and is in the record's cpu_user /
+	//     cpu_sys; what is missing is the enforcement.
+	//
+	// The name says UNENFORCED rather than UNEVALUATED because the second state is
+	// a two-sided measured fact, not an absence of measurement. A run whose final
+	// established total is UNDER the budget does not carry this code: the teardown
+	// read is a two-sided proof that the bound held. The code is therefore never
+	// "the budget was fine"; it is always "AIRA did not enforce what you asked
+	// for", which is why it exits 3 rather than 0.
+	"U_RUN_CPU_BUDGET_UNENFORCED": 3,
 	// AIRA-107 decided all three, which had sat at the default.
 	//
 	// E_RUN_RECONCILE_REQUIRED is the runner analogue of E_RECONCILE_REQUIRED (4)

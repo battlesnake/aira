@@ -90,7 +90,12 @@ func (s *Store) runCommandChecker(ctx context.Context, def gate.GateDefinition, 
 		return base, fmt.Errorf("%s: %w", base.Code, err)
 	}
 	base.EnvDigest = authoritativeEnvDigest
-	if hasRunnerCode(record, "E_RUN_TIMEOUT") {
+	// AIRA-136. E_RUN_CPU_TIMEOUT is the CPU-time twin of E_RUN_TIMEOUT and maps
+	// here too. Without it a gate command killed by its CPU budget would fall
+	// through to hasRunnerCodeExcept and report U_GATE_COMMAND_RUN_UNEVALUATED:
+	// still unevaluated, so not dishonest, but it would lose the "the command hit
+	// its deadline" distinction this code exists to carry.
+	if hasRunnerCode(record, "E_RUN_TIMEOUT") || hasRunnerCode(record, "E_RUN_CPU_TIMEOUT") {
 		base.Predicate, base.Evidence, base.Code = gate.PredicateUnevaluated, false, "U_GATE_COMMAND_TIMEOUT"
 		return base, nil
 	}

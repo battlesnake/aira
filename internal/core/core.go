@@ -637,15 +637,24 @@ func runRecordCode(record runner.RunRecord) string {
 }
 
 func parseRunTimeout(value string) (time.Duration, error) {
+	return parsePositiveDuration(value, "timeout")
+}
+
+// parsePositiveDuration is the shared "empty means no bound, otherwise strictly
+// positive" parser behind every run deadline argument. label names the offending
+// flag so --cpu-timeout's refusal cannot read as --timeout's (AIRA-136); with
+// label "timeout" the message is byte-for-byte the one --timeout has always
+// produced.
+func parsePositiveDuration(value, label string) (time.Duration, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return 0, nil
 	}
-	timeout, err := time.ParseDuration(value)
-	if err != nil || timeout <= 0 {
-		return 0, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("timeout must be a positive duration"))
+	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed <= 0 {
+		return 0, runnerError("E_RUN_ARGUMENT_INVALID", errors.New(label+" must be a positive duration"))
 	}
-	return timeout, nil
+	return parsed, nil
 }
 
 // copyExample deep-copies an example argv while preserving the nil-vs-empty
@@ -1520,6 +1529,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("memory_max", false, false, "Per-run scope memory.max (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			stringSpec("memory_high", false, false, "Per-run scope memory.high reclaim pressure (1024-based; decimal K/M/G/T + optional i/B, e.g. 4G/4GiB/1.5GB)"),
 			stringSpec("timeout", false, false, "Positive run timeout duration"),
+			stringSpec("cpu_timeout", false, false, "Positive cumulative CPU-time budget for the run's whole cgroup; resolution is one 100ms sample, so it can only fire late"),
 			stringSpec("ticket", false, false, "Ticket ID"),
 			stringSpec("phase", false, false, "Work phase"),
 			stringSpec("label", false, false, "Run label"),
@@ -1538,6 +1548,10 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			if err != nil {
 				return nil, err
 			}
+			cpuTimeout, err := parsePositiveDuration(stringArg(args, "cpu_timeout"), "cpu_timeout")
+			if err != nil {
+				return nil, err
+			}
 			noStdin := boolArg(args, "no_stdin")
 			if noStdin && stringArg(args, "stdin") != "" {
 				return nil, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("no_stdin and stdin are mutually exclusive"))
@@ -1551,7 +1565,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 				Argv: stringSlice(args, "argv"), Cwd: stringArg(args, "cwd"), Env: stringSlice(args, "env"),
 				Ticket: stringArg(args, "ticket"), Phase: stringArg(args, "phase"), Label: stringArg(args, "label"), Tool: params.Tool,
 				Prefix: stringSlice(args, "prefix"), Merge: boolArg(args, "merge"), Realtime: boolArg(args, "realtime"), PTY: boolArg(args, "pty"), StdinPath: stringArg(args, "stdin"),
-				StoreStdin: boolArg(args, "store_stdin"), NoAdmit: boolArg(args, "no_admit"), Timeout: timeout,
+				StoreStdin: boolArg(args, "store_stdin"), NoAdmit: boolArg(args, "no_admit"), Timeout: timeout, CPUTimeout: cpuTimeout,
 				Detach: boolArg(args, "detach"), StdinConnect: boolArg(args, "stdin_connect"),
 				ScopeMemoryMax: memoryMax, ScopeMemoryHigh: memoryHigh,
 			}
@@ -1560,6 +1574,15 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			}
 			if request.StdinConnect && (!request.Detach || request.PTY || request.StdinPath != "" || noStdin || request.StoreStdin) {
 				return nil, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("--stdin-connect requires --detach and is incompatible with --stdin, --no-stdin, --pty, and --store-stdin"))
+			}
+			// AIRA-136. The detached branch has not received AIRA-126's kill/terminal
+			// arbitration (that is AIRA-131, filed and unbuilt), so a second deadline
+			// source cannot be wired into it honestly yet. A bound the operator asked
+			// for and silently did not get is the fake pass AIRA forbids, so the
+			// combination is REFUSED here rather than ignored. Refusing from core
+			// gives every face the same answer.
+			if request.CPUTimeout > 0 && request.Detach {
+				return nil, runnerError("E_RUN_ARGUMENT_INVALID", errors.New("--cpu-timeout is not available with --detach"))
 			}
 			follow := boolArg(args, "follow")
 			if request.PTY {

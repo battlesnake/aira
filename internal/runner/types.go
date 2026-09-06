@@ -165,14 +165,22 @@ type EnvEntry struct {
 }
 
 type Request struct {
-	Argv                  []string `json:"argv"`
-	Ticket                string
-	Phase                 string
-	Label                 string
-	Tool                  string
-	Cwd                   string
-	Env                   []string // exact KEY=VALUE overrides; inherited environment is retained
-	Timeout               time.Duration
+	Argv    []string `json:"argv"`
+	Ticket  string
+	Phase   string
+	Label   string
+	Tool    string
+	Cwd     string
+	Env     []string // exact KEY=VALUE overrides; inherited environment is retained
+	Timeout time.Duration
+	// CPUTimeout is a deadline expressed in CUMULATIVE CPU-time consumed by the
+	// run's cgroup (user+system, hierarchical over the scope and every
+	// descendant), not in wall clock. It is orthogonal to Timeout: a hang burns
+	// zero CPU and only Timeout can catch it, while a job starved on a contended
+	// box loses wall clock to other people's work and only CPUTimeout bounds it
+	// for its own consumption. Both may be set; whichever is breached first ends
+	// the run through the same kill path (AIRA-136).
+	CPUTimeout            time.Duration
 	ExplicitEnv           bool // when true, Env is the complete child environment
 	Prefix                []string
 	Merge                 bool
