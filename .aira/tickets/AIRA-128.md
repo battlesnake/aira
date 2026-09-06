@@ -263,10 +263,16 @@ those signals, and the self-heal loop was only ever covered by synthetic-stats u
    own comment: forcing `reportPeak`'s `oom` argument false → RED (attribution); disabling
    `resolveAdmitReserve`'s escalation branch → RED (resolution); disabling
    `classifyConfineTermination`'s OOM branch → RED (honesty, reports
-   `unattributed-sigkill`). Swapping the hierarchical counter for the local one SURVIVES,
-   because this fixture's workload is the leader in its own scope so both counters rise
-   together; that shape is covered by `TestClassifyConfineTermination`'s `descendantOOM`
-   and `drainedOOM` rows and is written down as an accepted gap.
+   `unattributed-sigkill`). Swapping the hierarchical counter for the local one SURVIVES
+   this test, because this fixture's workload is the leader in its own scope so both
+   counters rise together. **Build-review correction (Fable, 2026-09-06):** that mutant is
+   killed by the existing `TestConfineGrantedReserveIsScopeCapAndPeakIsReported`
+   (`internal/runner/confine_linux_test.go`), which feeds `reportPeak` a usage with only
+   the hierarchical `OOMKill` raised and asserts `oom=true` (re-run by the reviewer: RED).
+   The `descendantOOM`/`drainedOOM` rows of `TestClassifyConfineTermination` originally
+   cited here pin the VERDICT's local read — the opposite direction — and do not cover it.
+   The accepted gap is narrower than "uncovered": no real-cgroup test drives a
+   nested-victim OOM through `reportPeak`'s attribution end to end.
 
 2. **Generated Skill + agent guide** (`internal/core/skill.go`) gain a section, "Reading a
    confined job's outcome (an OOM kill is not a test result)". The generated agent-facing

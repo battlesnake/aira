@@ -54,14 +54,21 @@ import (
 //     RED at phase 3 (the resolution leg).
 //   - classifyConfineTermination's OOM branch disabled -> RED at phase 2 with
 //     `terminated-by=unattributed-sigkill` (the honesty leg).
-//   - SURVIVES: swapping the hierarchical `memory.events` counter reportPeak
-//     reads for the LOCAL one. In this fixture the workload is the leader and
-//     lives directly in the confine scope, so both counters rise together. The
-//     shape that separates them -- a victim one cgroup down (an aitest worker
-//     sub-scope, a container at its own --memory) -- needs a nested cgroup this
-//     fixture does not build, and is covered instead by the descendantOOM and
-//     drainedOOM rows of TestClassifyConfineTermination. Written down as an
-//     accepted gap rather than papered over with a weaker assertion.
+//   - SURVIVES THIS TEST: swapping the hierarchical `memory.events` counter
+//     reportPeak reads for the LOCAL one. In this fixture the workload is the
+//     leader and lives directly in the confine scope, so both counters rise
+//     together. The shape that separates them -- a victim one cgroup down (an
+//     aitest worker sub-scope, a container at its own --memory) -- needs a
+//     nested cgroup this fixture does not build. That mutant is killed instead
+//     by TestConfineGrantedReserveIsScopeCapAndPeakIsReported
+//     (internal/runner/confine_linux_test.go), which feeds reportPeak a usage
+//     with ONLY the hierarchical OOMKill raised and asserts oom=true -- a
+//     synthetic usage, not a real nested cgroup. (Build review: the
+//     descendantOOM/drainedOOM rows of TestClassifyConfineTermination pin the
+//     VERDICT's local read, the opposite direction, and do not cover this.)
+//     The residual, accepted gap is therefore narrower than "uncovered": no
+//     real-cgroup test drives a nested-victim OOM through reportPeak's
+//     attribution end to end.
 //
 // verifies: AIRA-128
 const (
