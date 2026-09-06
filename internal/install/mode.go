@@ -237,8 +237,10 @@ func runShimInstall(d installDeps, opts installOpts, report CapabilityReport, re
 func reportShimMode(d installDeps, record runner.InstallModeRecord) {
 	d.logf("install mode: ci-shim (resolved by %s; systemd user manager: %s)",
 		record.ResolvedBy, record.Capability["systemd_user_manager"])
-	d.logf("shim ledger budget: %s (%d bytes) from %s",
-		formatCeilingBytes(record.ShimBudgetBytes), record.ShimBudgetBytes,
+	// formatCeilingBytes already appends "(N bytes)"; printing the count a second
+	// time here rendered "4.00GiB (4294967296 bytes) (4294967296 bytes)".
+	d.logf("shim ledger budget: %s from %s",
+		formatCeilingBytes(record.ShimBudgetBytes),
 		runner.DescribeShimBudgetSource(record.ShimBudgetSource))
 	d.logf("containment: advisory — no cgroup scope is created and no kill backstop exists; a job that exceeds its booked reserve is NOT killed")
 }

@@ -2796,7 +2796,34 @@ func exactAdmitInt64(value any) (int64, bool) {
 	}
 }
 
+// readSliceMemory is the REAL path's reading: a slice whose memory.max is `max`
+// has no ceiling to book against, so it is refused as unevaluated. Unchanged
+// behaviour, now expressed as the refusal it is on top of the usage read.
 func readSliceMemory(path string) (cur, max, reclaimable int64, ok bool, reason string) {
+	current, limit, reclaim, ok, reason := readSliceMemoryUsage(path)
+	if !ok {
+		return 0, 0, 0, false, reason
+	}
+	if limit <= 0 {
+		return 0, 0, 0, false, "unbounded"
+	}
+	return current, limit, reclaim, true, ""
+}
+
+// readSliceMemoryUsage reads a cgroup's LIVE usage and, separately, whatever
+// limit it declares — reporting limit==0 for `max` rather than refusing.
+//
+// The split exists because the two callers legitimately disagree about what an
+// unbounded memory.max means (AIRA-121 F1). On the real path a slice with no
+// limit has no ceiling and admission must refuse. In ci-shim mode the ceiling is
+// the RECORDED BUDGET, not the cgroup's own limit, so an unbounded memory.max is
+// not a refusal at all — it is precisely the multi-container-per-node case
+// --memory-max exists to serve (GCP Batch with taskCountPerNode > 1), where the
+// container's own cgroup still has a perfectly real memory.current to book
+// against. Refusing there sent readShimMemory to host-wide meminfo, whose
+// MemTotal-MemAvailable is not namespaced, and every job in the container then
+// answered E_ADMIT_TOO_LARGE for its whole life.
+func readSliceMemoryUsage(path string) (cur, max, reclaimable int64, ok bool, reason string) {
 	currentData, err := os.ReadFile(filepath.Join(path, "memory.current"))
 	if err != nil {
 		return 0, 0, 0, false, "read-error"
@@ -2809,12 +2836,12 @@ func readSliceMemory(path string) (cur, max, reclaimable int64, ok bool, reason 
 	if !valid {
 		return 0, 0, 0, false, "parse-error"
 	}
-	if strings.TrimSpace(string(maxData)) == "max" {
-		return 0, 0, 0, false, "unbounded"
-	}
-	limit, valid := parseAdmitMemory(maxData)
-	if !valid {
-		return 0, 0, 0, false, "parse-error"
+	var limit int64
+	if strings.TrimSpace(string(maxData)) != "max" {
+		limit, valid = parseAdmitMemory(maxData)
+		if !valid {
+			return 0, 0, 0, false, "parse-error"
+		}
 	}
 	// current and limit are already guaranteed >= 0 by parseAdmitMemory (valid
 	// implies non-negative), and checkedAvailable independently guards current<0

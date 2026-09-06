@@ -294,6 +294,62 @@ func TestShimAcceptsDeclaredMemoryMaxAsTheLedgerBudget(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-121 requirement 4, finding F1
+//
+// A DECLARED budget over a container whose own cgroup has memory.max = `max` —
+// the multi-task-per-node case --memory-max exists for — still records the
+// container's OWN cgroup path. That path is the daemon's only source of a
+// namespaced live `current`; without it readShimMemory falls to host-wide
+// meminfo, which on a big node exceeds the declared budget outright and wedges
+// every job at E_ADMIT_TOO_LARGE.
+func TestShimRecordsTheOwnCgroupPathForADeclaredBudgetOverAnUnboundedContainer(t *testing.T) {
+	d, state := newFakeInstall(t)
+	d = shimProbeDeps(t, d, state, map[string]bool{"timeout": true})
+	d.readFile = shimProcReader(map[string][]byte{
+		filepath.Join(cgroupRoot, "memory.max"): []byte("max\n"),
+	})
+	d.spawnShimDaemon = func(shimDaemonSpec) error { return nil }
+	if err := runInstall(d, installOpts{ciValue: "shim", memoryMax: "4G", stage: installStageBuild}); err != nil {
+		t.Fatal(err)
+	}
+	record := readShimRecord(t, d)
+	if record.ShimBudgetSource != runner.ShimBudgetSourceDeclared || record.ShimBudgetBytes != 4<<30 {
+		t.Fatalf("budget=%d source=%q, want the declared 4GiB", record.ShimBudgetBytes, record.ShimBudgetSource)
+	}
+	if record.ShimCgroupPath != cgroupRoot {
+		t.Fatalf("recorded cgroup path=%q, want %s: an unbounded memory.max does not make the container's own memory.current unreadable",
+			record.ShimCgroupPath, cgroupRoot)
+	}
+	if logs := strings.Join(state.logs, "\n"); strings.Contains(logs, "bytes) (") {
+		t.Fatalf("the budget line prints its byte count twice:\n%s", logs)
+	}
+}
+
+// verifies: AIRA-121 requirement 4, finding F1
+//
+// The OTHER direction: when the probe could establish NO cgroup of its own —
+// no /proc/self/cgroup, or a cgroup-v1-only host with no unified entry — the
+// record carries NO path, rather than the cgroup mount root as a guess. The
+// daemon then honestly uses meminfo instead of reading a cgroup that is not
+// known to be this container's.
+func TestShimRecordsNoCgroupPathWhenTheProbeEstablishedNone(t *testing.T) {
+	d, state := newFakeInstall(t)
+	d = shimProbeDeps(t, d, state, map[string]bool{"timeout": true})
+	d.readFile = func(path string) ([]byte, error) {
+		if path == "/proc/meminfo" {
+			return []byte("MemTotal:      268435456 kB\n"), nil
+		}
+		return nil, os.ErrNotExist
+	}
+	d.spawnShimDaemon = func(shimDaemonSpec) error { return nil }
+	if err := runInstall(d, installOpts{ciValue: "shim", memoryMax: "4G", stage: installStageBuild}); err != nil {
+		t.Fatal(err)
+	}
+	if record := readShimRecord(t, d); record.ShimCgroupPath != "" {
+		t.Fatalf("recorded cgroup path=%q with no probed cgroup: the mount root is a guess, not this container's cgroup", record.ShimCgroupPath)
+	}
+}
+
 // verifies: AIRA-121 requirement 4
 //
 // A container's own memory.max is preferred over host-wide MemTotal, because

@@ -73,18 +73,34 @@ func resolveShimSlicePath(string) (string, bool, string) {
 //
 // Preference order, and why (requirement 4's documented choice):
 //
-//  1. The container's OWN cgroup, when install recorded a readable, finite
-//     memory.max. That delegates to readSliceMemory, so memory.current and the
-//     AIRA-21 memory.stat file-LRU discount are real kernel numbers and nothing
-//     is reimplemented. `max` is then min(live memory.max, recorded budget): the
-//     recorded budget is a BOUND, never a raise, so a runtime that widened the
-//     container's limit after install cannot silently widen the ledger, and a
-//     declared --memory-max cannot be exceeded by a bigger cgroup limit.
+//  1. The container's OWN cgroup, whenever install recorded one whose
+//     memory.current is readable. That delegates to readSliceMemoryUsage, so
+//     memory.current and the AIRA-21 memory.stat file-LRU discount are real
+//     kernel numbers and nothing is reimplemented. `max` is then min(live
+//     memory.max, recorded budget): the recorded budget is a BOUND, never a
+//     raise, so a runtime that widened the container's limit after install
+//     cannot silently widen the ledger, and a declared --memory-max cannot be
+//     exceeded by a bigger cgroup limit.
+//
+//     A cgroup whose memory.max is `max` is USED here, not refused (AIRA-121
+//     F1). That combination — a declared --memory-max budget over a container
+//     with no per-container memory.max — is the headline case the flag exists
+//     for (several tasks on one node, as GCP Batch with taskCountPerNode > 1),
+//     and the cgroup's memory.current is a real, namespaced reading regardless
+//     of whether a limit is set on it. Refusing it dropped every such container
+//     to the host-wide meminfo fall-back below, where an unnamespaced
+//     MemTotal-MemAvailable dwarfs the declared budget and every job in the
+//     container answers E_ADMIT_TOO_LARGE with cap_minus_headroom=0 for the
+//     container's whole life: fail-closed, but inoperable.
 //
 //  2. /proc/meminfo, as MemTotal - MemAvailable for current usage with max set
-//     to the recorded budget. reclaimable is deliberately ZERO here: MemAvailable
-//     already credits reclaimable page cache, so applying the AIRA-21 discount on
-//     top would double-count it in the permissive direction.
+//     to the recorded budget. Reached only when there is NO own-cgroup reading at
+//     all -- no recorded path, or a path with no readable memory.current (a
+//     cgroup-v1-only or cgroup-less host). reclaimable is deliberately ZERO here:
+//     MemAvailable already credits reclaimable page cache, so applying the
+//     AIRA-21 discount on top would double-count it in the permissive direction.
+//     On a container whose /proc is not namespaced this reading is the HOST's,
+//     which is why it is last.
 //
 // Any failure reports ok=false, which the existing code turns into a fail-CLOSED
 // outcome: waiters stay queued and each one's own maxWait still fires
@@ -95,7 +111,7 @@ func (s *Server) readShimMemory(string) (int64, int64, int64, bool, string) {
 		return 0, 0, 0, false, "ci-shim budget unestablished"
 	}
 	if strings.TrimSpace(budget.CgroupPath) != "" {
-		if current, liveMax, reclaimable, ok, _ := readSliceMemory(budget.CgroupPath); ok {
+		if current, liveMax, reclaimable, ok, _ := readSliceMemoryUsage(budget.CgroupPath); ok {
 			maximum := budget.Bytes
 			if liveMax > 0 && liveMax < maximum {
 				maximum = liveMax

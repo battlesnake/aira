@@ -264,9 +264,16 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	// Requirement 8. Setpgid makes the child the leader of its own process group,
 	// so confineCommand.signal can reach DESCENDANTS with kill(-pgid, sig) -- the
 	// class cgroup.kill covers on the real path and which a single-PID Signal()
-	// cannot. Deliberately NOT Setsid: a new SESSION would also detach the job
-	// from the controlling terminal, which would break an interactive job's
-	// stdin/tty. A process GROUP is the smallest unit that buys the reach.
+	// cannot. A process GROUP is the smallest unit that buys that reach.
+	//
+	// Deliberately NOT Setsid -- but NOT for the tty reason an earlier revision of
+	// this comment gave. Setpgid does not preserve an interactive job's tty stdin
+	// either: the new group is not the terminal's FOREGROUND group, so a read from
+	// the controlling tty earns SIGTTIN under Setpgid exactly as it would under
+	// Setsid. The real reason is reach, and it is what the tests assert: a job in
+	// its own SESSION is out of range of kill(-pgid, ...) from here, which is the
+	// documented escape TestShimConfineSignalDoesNotReachASetsidDescendant pins
+	// down. Taking the session as well would buy nothing and cost that reach.
 	//
 	// Consequence, stated because it is a real behaviour change for this path: a
 	// terminal Ctrl-C signals the FOREGROUND process group, which is now the
@@ -290,7 +297,14 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 	var supervisorSignal os.Signal
 	runEnded := false
 	signalEvents, stopSignalSource := deps.signalSource()
-	stopSignalHandler := forwardConfineSignals(signalEvents, deliver, func(received os.Signal) {
+	// The forwarder's own `deliver` is nil HERE, and only here. This callback
+	// already delivers the received signal to the group synchronously (see the
+	// order argument below), so leaving the forwarder's delivery in place sent a
+	// SECOND copy of every SIGTERM/SIGINT immediately afterwards. Observed
+	// deliveries coalesced, so nothing was seen to break -- but a job counting its
+	// own SIGINTs (the common "second Ctrl-C means force" idiom) would be handed a
+	// force-quit it was never asked for. One signal in, one signal out.
+	stopSignalHandler := forwardConfineSignals(signalEvents, nil, func(received os.Signal) {
 		supervisorSignalMu.Lock()
 		late := runEnded
 		first := !late && supervisorSignal == nil
@@ -318,11 +332,11 @@ func confineShim(ctx context.Context, request ConfineRequest, deps confineDeps, 
 		// claim false: the grace would elapse against processes that never got
 		// the chance to run a handler.
 		//
-		// So: deliver the received signal to the group SYNCHRONOUSLY here (the
-		// forwarder's own delivery, immediately after this callback returns,
-		// would be second and is harmless -- a duplicate SIGTERM), THEN start the
-		// grace, THEN escalate. The grace can never elapse before the SIGTERM is
-		// sent because the send precedes the sleep in program order.
+		// So: deliver the received signal to the group SYNCHRONOUSLY here -- this
+		// is the ONLY delivery, which is why the forwarder above is constructed
+		// with a nil deliver -- THEN start the grace, THEN escalate. The grace can
+		// never elapse before the SIGTERM is sent because the send precedes the
+		// sleep in program order.
 		_ = deliver(received)
 		go func() {
 			timer := time.NewTimer(shimTeardownGrace)

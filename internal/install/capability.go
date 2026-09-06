@@ -147,13 +147,23 @@ func parseUnifiedCgroupLine(content string) string {
 
 // ownCgroupDir turns a recorded /proc/self/cgroup relative path into the
 // absolute cgroupfs directory to read. Under cgroupns=private -- the normal
-// container case -- the relative path is "/" and this is the mount root itself.
+// container case -- the relative path is "/", which IS the mount root and is the
+// container's own cgroup as seen from inside the namespace.
+//
+// An EMPTY relative path is different in kind: it means probeOwnCgroup could not
+// establish this process's cgroup at all (no /proc/self/cgroup, or no unified
+// 0:: entry on a cgroup-v1-only host). That is answered with "" -- no recorded
+// path -- rather than with the mount root, so the daemon reads no cgroup at all
+// instead of a guessed one that is not known to be ours.
 func ownCgroupDir(root, relative string) string {
+	relative = strings.TrimSpace(relative)
+	if relative == "" {
+		return ""
+	}
 	if root == "" {
 		root = cgroupRoot
 	}
-	relative = strings.TrimSpace(relative)
-	if relative == "" || relative == "/" {
+	if relative == "/" {
 		return root
 	}
 	return filepath.Join(root, strings.TrimPrefix(relative, "/"))

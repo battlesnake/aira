@@ -252,6 +252,73 @@ func TestReadShimMemoryClampsToTheRecordedBudget(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-121 requirement 4, finding F1
+//
+// THE HEADLINE CASE --memory-max exists for: a DECLARED budget over a container
+// whose own cgroup has memory.max = `max` (several tasks on one node, as GCP
+// Batch with taskCountPerNode > 1). The container's memory.current is still a
+// real, namespaced reading and MUST be the ledger's `current`.
+//
+// Counterexample this fails against: routing through readSliceMemory, which
+// refuses an unbounded memory.max as "unbounded". readShimMemory then fell
+// through to host-wide MemTotal-MemAvailable — unnamespaced, so on a big node it
+// dwarfs the declared budget, checkedAvailable answers 0, and EVERY job in the
+// container gets E_ADMIT_TOO_LARGE with cap_minus_headroom=0 for the container's
+// whole life. Fail-closed, but inoperable, and the refusal reads as
+// misconfiguration.
+func TestReadShimMemoryUsesTheOwnCgroupWhenItsLimitIsUnbounded(t *testing.T) {
+	dir := t.TempDir()
+	for name, value := range map[string]string{
+		"memory.current": "1000", "memory.max": "max", "memory.stat": "file 0\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server := NewServer(Paths{})
+	server.SetConfineShimModeForTest(4<<30, runner.ShimBudgetSourceDeclared, dir)
+	current, maximum, _, ok, reason := server.readShimMemory(runner.ShimConfineSlice)
+	if !ok {
+		t.Fatalf("readShimMemory refused a container with a declared budget and no memory.max: %s", reason)
+	}
+	if current != 1000 {
+		t.Fatalf("current=%d, want the container's own memory.current 1000; a host-wide meminfo reading here books the whole NODE against this container's budget", current)
+	}
+	if maximum != 4<<30 {
+		t.Fatalf("max=%d, want the declared budget %d: an unbounded cgroup limit is not a smaller one", maximum, int64(4)<<30)
+	}
+	if available := checkedAvailable(current, maximum, 0, 0, 0); available <= 0 {
+		t.Fatalf("available=%d: with 1000 bytes in use against a 4GiB declared budget every job would answer E_ADMIT_TOO_LARGE", available)
+	}
+
+	// The real path is NOT relaxed by the same change: an unbounded slice there
+	// still has no ceiling to book against and is still refused.
+	if _, _, _, ok, reason := readSliceMemory(dir); ok || reason != "unbounded" {
+		t.Fatalf("readSliceMemory ok=%v reason=%q, want the unchanged unbounded refusal", ok, reason)
+	}
+}
+
+// verifies: AIRA-121 requirement 4, finding F1
+//
+// With NO own-cgroup reading available at all — a cgroup-v1-only or cgroup-less
+// container, where install recorded no path — meminfo is still the fall-back,
+// and it is still bounded by the recorded budget. The fix must not turn the
+// fall-back off, only stop it being reached by a readable cgroup.
+func TestReadShimMemoryFallsBackToMeminfoWithNoOwnCgroup(t *testing.T) {
+	server := NewServer(Paths{})
+	server.SetConfineShimModeForTest(4<<30, runner.ShimBudgetSourceMemTotal, "")
+	current, maximum, reclaimable, ok, reason := server.readShimMemory(runner.ShimConfineSlice)
+	if !ok {
+		t.Skipf("this host's /proc/meminfo is unreadable, so the fall-back cannot be exercised: %s", reason)
+	}
+	if maximum != 4<<30 {
+		t.Fatalf("max=%d, want the recorded budget", maximum)
+	}
+	if current < 0 || reclaimable != 0 {
+		t.Fatalf("current=%d reclaimable=%d: MemAvailable already credits reclaimable page cache, so the discount must stay zero here", current, reclaimable)
+	}
+}
+
 // verifies: AIRA-121 requirement 3
 //
 // A budget that cannot be established fails CLOSED — waiters stay queued rather

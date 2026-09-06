@@ -466,24 +466,42 @@ re-read every admission pass, which is where the real path reads it too.
 func (s *Server) readShimMemory(string) (cur, max, reclaimable int64, ok bool, reason string)
 ```
 
-The `path` argument is ignored (it is the `"ci-shim"` sentinel). Behaviour by
-recorded source:
+The `path` argument is ignored (it is the `"ci-shim"` sentinel). Behaviour is
+selected by **whether a cgroup was recorded**, NOT by which source the budget
+came from (build-review correction, finding F1 — see the note below):
 
-- **`cgroup-memory-max`**: delegate to the existing `readSliceMemory` on the
-  recorded `shim_cgroup_path`. That already parses `memory.current`,
+- **A recorded `shim_cgroup_path` whose `memory.current` reads**: delegate to
+  `readSliceMemoryUsage` on it. That already parses `memory.current`,
   `memory.max` and the `memory.stat` file-LRU discount, so `current` and
   `reclaimable` are real kernel numbers and nothing is reimplemented. Then
   `max = min(read max, s.shimBudget.Bytes)` — the recorded budget is a bound,
   never a raise, so a runtime that widened the container's limit after install
-  cannot silently widen the ledger.
-- **`meminfo-memtotal`**: `current = MemTotal - MemAvailable`, `reclaimable = 0`,
+  cannot silently widen the ledger. A cgroup whose `memory.max` is `max`
+  contributes no bound and the budget stands alone.
+- **No recorded cgroup, or no readable `memory.current`**: `current = MemTotal -
+  MemAvailable`, `reclaimable = 0`,
   `max = s.shimBudget.Bytes`. `reclaimable` is deliberately zero: MemAvailable
   already credits reclaimable page cache, so applying AIRA-21's discount on top
   would double-count it in the permissive direction.
-- **Any read failure**: `ok = false`. The existing behaviour then applies
-  verbatim — fail **closed**, waiters stay queued, each waiter's own `maxWait`
-  still fires `E_ADMIT_SATURATED`. Identical honesty to the real path, with no
-  new code.
+- **Neither reading available**: `ok = false`. The existing behaviour then
+  applies verbatim — fail **closed**, waiters stay queued, each waiter's own
+  `maxWait` still fires `E_ADMIT_SATURATED`. Identical honesty to the real path,
+  with no new code.
+
+**Why the routing is on the recorded path and not on the budget source (F1).**
+Routing through `readSliceMemory` refuses an unbounded `memory.max` as
+`"unbounded"` — correct for the real path, where an unlimited slice has no
+ceiling to book against, and WRONG here, where the ceiling is the recorded
+budget. The combination it broke is the headline case `--memory-max` exists for:
+a DECLARED budget over a container with no per-container `memory.max` (several
+tasks on one node, GCP Batch with `taskCountPerNode > 1`). Those containers fell
+through to host-wide meminfo, whose `MemTotal - MemAvailable` is not namespaced
+and dwarfs the declared budget, so `checkedAvailable` answered 0 and every job in
+the container got `E_ADMIT_TOO_LARGE cap_minus_headroom=0` for the container's
+whole life — fail-closed, but inoperable, and reading as misconfiguration.
+`readSliceMemory` is now the unbounded REFUSAL wrapped around
+`readSliceMemoryUsage`, which reports `limit == 0` for `max` and leaves the
+judgement to its caller; the real path's behaviour is unchanged and asserted.
 
 Everything downstream is untouched: `admitEffectiveMaximum`,
 `admitSliceHeadroom` (base + per-job headroom still applies — same
@@ -749,8 +767,13 @@ against processes that never got the chance to run a handler.
 Required order in shim mode, and what is built:
 
 1. deliver the received signal to the process group SYNCHRONOUSLY inside
-   `onSignal` (the forwarder's own delivery immediately afterwards is a harmless
-   duplicate);
+   `onSignal`, and make that the ONLY delivery: the shim path constructs
+   `forwardConfineSignals` with a nil `deliver`, so no second copy is sent after
+   the callback returns. (Build-review correction — this was planned as "a
+   harmless duplicate". Observed deliveries coalesced, so nothing was seen to
+   break, but a job counting its own SIGINTs — the common "second Ctrl-C means
+   force" idiom — would be handed a force-quit nobody asked for. One signal in,
+   one signal out.)
 2. then start the 2s grace;
 3. then `SIGKILL` the group.
 

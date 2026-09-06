@@ -315,6 +315,101 @@ forever. The real path never sees this because `cgroup.kill` removes the escapee
 Shim mode now owns those pipes itself (`shimChildStream`) so the copier is
 abandonable and the supervisor reports the job's real outcome and exits.
 
+### Build-review round 2 — the BLOCK on PR #72, and what changed
+
+Review of `07de08e` gated build/vet/test green and confirmed all nine
+requirements and tests (a)–(i), but BLOCKed on two confirmed findings. Both are
+fixed here, each with a regression test proven to FAIL against the old code.
+
+**F1 — the declared-budget + unbounded-cgroup case was inoperable.** With a
+DECLARED `--memory-max` budget and the container's own `memory.max = max` — the
+multi-container-per-node case the flag exists for, GCP Batch with
+`taskCountPerNode > 1` — `readShimMemory` delegated to `readSliceMemory`, which
+refuses an unbounded limit as `"unbounded"`. It then fell through to host-wide
+`/proc/meminfo`, which is NOT namespaced: `current` became `MemTotal -
+MemAvailable` for the whole node against a 4 GiB budget, `checkedAvailable`
+answered 0, and every job in the container got `E_ADMIT_TOO_LARGE
+cap_minus_headroom=0` for the container's whole life. Fail-closed, so never a
+false pass — but the feature's headline scenario did not work, and the refusal
+read as misconfiguration.
+
+`readSliceMemory` is now the unbounded REFUSAL wrapped around a new
+`readSliceMemoryUsage`, which reads `memory.current` and the `memory.stat`
+file-LRU discount and reports `limit == 0` for `max` instead of refusing. The
+real path is byte-for-byte unchanged, and that is asserted inside the same test.
+Shim mode reads the recorded cgroup whenever its `memory.current` reads, still
+bounded by `min(live memory.max, recorded budget)`, and reaches meminfo only when
+there is no own-cgroup reading at all. The routing is now on WHETHER a cgroup was
+recorded, never on which source the budget came from — which is what made the
+declared case fall off the path in the first place.
+
+Alongside it, `ownCgroupDir` answers `""` — no recorded path — when the probe
+established no cgroup of its own (no `/proc/self/cgroup`, or a cgroup-v1-only
+host), rather than returning the cgroupfs mount root as a guess. The daemon then
+honestly uses meminfo instead of reading a cgroup not known to be this
+container's.
+
+Tests: `TestReadShimMemoryUsesTheOwnCgroupWhenItsLimitIsUnbounded` (against the
+old routing it fails with `current=22420447232` on this box),
+`TestReadShimMemoryFallsBackToMeminfoWithNoOwnCgroup`,
+`TestShimRecordsTheOwnCgroupPathForADeclaredBudgetOverAnUnboundedContainer`,
+`TestShimRecordsNoCgroupPathWhenTheProbeEstablishedNone` (fails against the old
+`ownCgroupDir`).
+
+**F2 — the setsid negative test leaked a process on every run.**
+`TestShimConfineSignalDoesNotReachASetsidDescendant` cleaned up with `pkill -f
+<dir>/job.sh`, which matches the PARENT — already dead from the group signal —
+while the escaped `grandchild.sh` busy-loop is, by the very property the test
+asserts, reachable by nothing but its pid. Under an outer `aira confine` the
+scope kill swept it up; a plain `go test` leaked one process per run. The
+grandchild now records its pid before announcing readiness, the test kills THAT
+pid, and the kill is CONFIRMED by `waitProcessGone` (a zombie counts as gone —
+the process holds no memory or CPU and its reaping is its parent's business). The
+confirmation IS the regression test: with the old `pkill` cleanup restored it
+fails with "the escaped grandchild (pid …) is still running at the end of the
+test".
+
+**Non-blocking notes, all three fixed.**
+
+- `reportShimMode` printed `4.00GiB (4294967296 bytes) (4294967296 bytes)` —
+  `formatCeilingBytes` already appends the byte count. Duplicate removed, and
+  asserted against in the install test above.
+- The shim `onSignal` delivered to the group synchronously AND
+  `forwardConfineSignals` delivered again after the callback returned. The shim
+  path now constructs the forwarder with a nil `deliver`, so there is exactly one
+  delivery; plan §4 (requirement 8) is corrected, having planned the second send
+  as "a harmless duplicate". **Accepted coverage gap, written down rather than
+  left silent:** no automated test can distinguish one send from two, because
+  non-realtime signals coalesce in the kernel — a second SIGTERM arriving while
+  the first is pending is discarded, which is exactly why the reviewer's probes
+  observed a single delivery. Pinning it would need a new injectable delivery
+  seam in production code existing only for the assertion, which is not worth it
+  for a strict removal of a redundant send. It is covered by code reading and by
+  the existing forwarding tests, which still assert the one delivery arrives.
+- The `Setpgid` comment claimed Setsid was avoided to keep an interactive job's
+  tty stdin working. That reasoning is wrong: a non-foreground process group
+  reading its controlling tty earns SIGTTIN either way. The comment now gives the
+  real reason — reach: a job in its own session is out of range of
+  `kill(-pgid, …)`, which is precisely the escape the negative test documents.
+
+**Requirement 5's optional follow-up, noted explicitly as the reviewer asked.**
+Requirement 5's *required* half is done and tested (aitest's daemon-down fallback
+needs no changes, proven by two tests). Its optional half — letting aitest's
+worker-count `auto` sizing consult the shim RAM ledger when a daemon IS present
+in shim mode, instead of staying deliberately CPU-only-sized — is NOT built here
+and is carried by **AIRA-123**, the ticket that gives `worker-admit` a degraded
+ledger-only admission mode. Sizing `auto` off that ledger is the natural
+increment on top of AIRA-123 and has nothing to consult until it lands.
+
+**Coverage gap carried forward, accepted by the reviewer.** No single automated
+test composes install → real shim daemon → `aira confine` admission over the
+socket. Each seam is tested separately, and the composed path was verified by an
+isolated-HOME manual e2e (build/start stages, real daemon, confine with
+`--memory-max`/`--memory-reserve`, `--delegate-ram` child env stripped of
+`AIRA_AITEST_*`, `--exclusive` refused, `--list` advisory wording, `--kill`
+refusal naming the supervisor PID under its ownership guard, SIGTERM/SIGINT
+forwarded to the group).
+
 ### Deliberate deferral, reported rather than silently taken
 
 `aira run` is NOT supported in shim mode: it refuses with

@@ -4,10 +4,13 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -33,7 +36,12 @@ func shimSignalScript(t *testing.T, dir string, detach, ignore bool) string {
 		grandchildTrap, parentTrap = `trap "" TERM`, `trap "" TERM`
 	}
 	grandchild := filepath.Join(dir, "grandchild.sh")
+	// The pid is recorded BEFORE the ready marker, so a reader that has seen
+	// readiness is guaranteed a complete pid file. It is what the setsid case
+	// cleans up with: a descendant that has left the process group is, by the
+	// property that test asserts, reachable by NOTHING except its pid.
 	if err := os.WriteFile(grandchild, []byte("#!/bin/sh\n"+grandchildTrap+"\n"+
+		`echo $$ > "`+dir+`/grandchild-pid"`+"\n"+
 		`: > "`+dir+`/grandchild-ready"`+"\nwhile :; do sleep 0.05; done\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -111,9 +119,79 @@ func TestShimConfineSignalDoesNotReachASetsidDescendant(t *testing.T) {
 	if waitForFile(t, filepath.Join(dir, "grandchild-term"), 2*time.Second) {
 		t.Fatal("a setsid'd descendant received the group signal; if that is genuinely now possible, the documented parity gap in SKILL.md and confine_shim_linux.go must be corrected too")
 	}
-	// Leave nothing behind: the escaped grandchild is, by the very property under
-	// test, not reachable through the group.
-	_ = exec.Command("pkill", "-f", filepath.Join(dir, "job.sh")).Run()
+	// Leave nothing behind, and PROVE it. The escaped grandchild is by the very
+	// property just asserted unreachable through the process group, so the group
+	// teardown does not take it with it. The previous cleanup here, `pkill -f
+	// <dir>/job.sh`, matched only the PARENT -- which the group signal had already
+	// killed -- and left the grandchild's `while :; do sleep 0.05; done` running
+	// forever: one leaked busy-looping process per `go test` run, invisible only
+	// because an outer `aira confine` scope kill happens to sweep it up.
+	//
+	// So it is killed by the pid IT recorded, and the kill is then CONFIRMED. An
+	// unverified best-effort kill is precisely how the leak went unnoticed, and
+	// this assertion is what fails against that cleanup rather than merely
+	// improving on it.
+	pid := recordedGrandchildPID(t, dir)
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("kill escaped grandchild %d: %v", pid, err)
+	}
+	if !waitProcessGone(pid, 10*time.Second) {
+		t.Fatalf("the escaped grandchild (pid %d) is still running at the end of the test: it is out of reach of the process group, so it must be killed by pid or it leaks on every run", pid)
+	}
+}
+
+// recordedGrandchildPID reads the pid the grandchild wrote before announcing
+// readiness. Readiness has been observed by every caller, so an absent or
+// unparsable file here is a broken test rather than a race.
+func recordedGrandchildPID(t *testing.T, dir string) int {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, "grandchild-pid"))
+	if err != nil {
+		t.Fatalf("read the grandchild's recorded pid: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 1 {
+		t.Fatalf("the grandchild recorded %q, which is not a usable pid (%v)", string(data), err)
+	}
+	return pid
+}
+
+// waitProcessGone answers whether pid has left the process table within the
+// budget. A ZOMBIE counts as gone: the process is dead and holds no memory or
+// CPU; whether its parent has reaped it yet is that parent's business, not this
+// test's, and on a host whose reaper is slow a zombie must not be reported as a
+// surviving busy-loop.
+func waitProcessGone(pid int, budget time.Duration) bool {
+	deadline := time.Now().Add(budget)
+	for {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return true
+		}
+		if processIsZombie(pid) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// processIsZombie reads /proc/<pid>/stat's state field. The comm field can
+// itself contain spaces and parentheses, so the parse starts after the LAST
+// ')' -- the standard way to read this file without being fooled by a process
+// named `sh (x)`. An unreadable stat means the process is gone.
+func processIsZombie(pid int) bool {
+	stat, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return true
+	}
+	index := strings.LastIndex(string(stat), ")")
+	if index < 0 {
+		return false
+	}
+	fields := strings.Fields(string(stat)[index+1:])
+	return len(fields) > 0 && fields[0] == "Z"
 }
 
 // verifies: AIRA-121 requirement 8
