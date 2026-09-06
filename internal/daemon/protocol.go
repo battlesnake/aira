@@ -38,8 +38,36 @@ import (
 // "the daemon is unavailable", i.e. the whole suite unconfined: the same
 // silent-containment-loss direction 6 was cut for. The version moves with the
 // shape, and this bump carries the same atomic-reinstall requirement as 6.
+// ProtocolVersion 8 (was 7): AIRA-35 changed WorkerAdmitResponse's SHAPE again.
+// It lost the required `memory_high` and gained `swap_cap`, and aitest worker
+// scopes stopped getting a memory.high write while gaining memory.swap.max=0.
+// Both mixed-version directions are unsafe, which is the whole reason this
+// number exists:
+//
+//   - An OLD daemon with a NEW supervisor: the grant carries memory_high and no
+//     swap_cap. The new supervisor ACCEPTS it (memory_high is simply an unknown
+//     key now, deliberately, so a stale field cannot kill a run) and
+//     _note_swap_cap_state is silent on an ABSENT token, because absent means
+//     "a daemon predating this field", not "unsafe". So the run would proceed
+//     with workers that have the 420-second memory.high livelock AND no swap
+//     cap at all -- i.e. no containment -- and nothing would say so. That is
+//     precisely the silent-containment-loss direction versions 6 and 7 were cut
+//     for, and neither the wire nor the supervisor can detect it: only the
+//     version can.
+//   - A NEW daemon with an OLD supervisor: the old _OUTCOME_GRANT_FIELDS still
+//     requires memory_high, so every grant becomes a contract violation and the
+//     whole suite is reported unevaluated with a diagnostic naming the wrong
+//     problem and offering no remedy.
+//
+// A version mismatch instead answers E_DAEMON_PROTOCOL, which the worker-admit
+// client classifies admission-unusable with the actual remedy ("reinstall with
+// `aira install` and restart aira-daemon.service"). This bump carries the same
+// atomic-reinstall requirement as 6 and 7 -- and it matters more here than
+// usual, because aira-daemon.service is a PERSISTENT unit while the relay and
+// the embedded pylib come from the PATH binary, so a rebuild without a restart
+// is the normal way to end up mixed.
 const (
-	ProtocolVersion = 7
+	ProtocolVersion = 8
 	MaxFrameBytes   = 16 << 20
 	StoreOpBodyMax  = uint64(store.StoreOpBodyMax)
 )

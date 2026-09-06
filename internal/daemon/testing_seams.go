@@ -43,12 +43,15 @@ func (s *Server) SetWorkerScopeTreeForTest() {
 			caps[outerScope] = map[string]int64{}
 		}
 		caps[outerScope][workerScopeChildPrefix+workerID] = memoryMax
-		// The fake reports `enforced`: this seam stands in for a
-		// CreateWorkerScope that succeeded, and a real success writes and
-		// VERIFIES memory.swap.max=0. Reporting anything else here would make
-		// every test that uses this seam assert against a disposition the
-		// production path never produces on success.
-		return runner.WorkerScopeChildPath(outerScope, "worker-"+workerID), runner.WorkerAdmitSwapCapEnforced, nil
+		// AIRA-35: deliberately NOT "enforced". This seam stands in for a
+		// successful CreateWorkerScope, and "not-applicable" is an equally real
+		// success disposition (a kernel with no swap support) -- but it differs
+		// from the value a fabricating hop would invent, which is the entire
+		// point. A build-review mutant that hardcoded "enforced" in the daemon
+		// survived the whole suite while every fake also returned "enforced";
+		// with this, any hop that manufactures the value instead of carrying it
+		// fails the assertions downstream.
+		return runner.WorkerScopeChildPath(outerScope, "worker-"+workerID), runner.WorkerAdmitSwapCapNotApplicable, nil
 	}
 }
 

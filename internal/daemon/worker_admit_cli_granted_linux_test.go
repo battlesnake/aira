@@ -249,7 +249,18 @@ func TestWorkerAdmitCLIHoldsTheGrantUntilStdinClosesAndThenExits(t *testing.T) {
 	// absent and a hardcoded "enforced" would fail for a reason that has
 	// nothing to do with the code under test. The probe reads the OUTER scope (a
 	// control cgroup this test never writes a swap cap to), not the worker
-	// scope under test, so it is not circular.
+	// scope under test.
+	//
+	// What this CAN and CANNOT catch, stated so a later reader does not
+	// over-trust it: on a swap-capable host the real CreateWorkerScope's honest
+	// answer IS "enforced", so this assertion cannot distinguish a CARRIED
+	// "enforced" from a FABRICATED one. What it does catch is the cap not being
+	// written at all, via the memory.swap.max kernel row below -- the mutant
+	// that matters most here, and the one only a real cgroup can see. The
+	// fabrication mutant is caught instead by the unit-level tests, whose fakes
+	// deliberately report "not-applicable" (worker_admit_test.go,
+	// testing_seams.go). That split is intentional: only a fake can return a
+	// disposition this host would never itself produce.
 	_, swapControlErr := os.Stat(filepath.Join(outer, "memory.swap.max"))
 	wantSwapCap := runner.WorkerAdmitSwapCapEnforced
 	if swapControlErr != nil {

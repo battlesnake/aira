@@ -59,12 +59,16 @@ func TestRequestWorkerAdmitReturnsHeldLeaseOnGrant(t *testing.T) {
 	lease := outcome.Lease
 	defer lease.Close()
 	// verifies: AIRA-35 — the swap disposition survives the daemon->client hop
-	// on the LEASE, which is the field that replaced MemoryHigh. Pinned to its
-	// exact value: this hop is precisely where mutation testing previously
-	// proved a dropped governance signal survives the whole suite.
+	// on the LEASE, which is the field that replaced MemoryHigh.
+	//
+	// The expected value is the seam's NON-default "not-applicable". Pinning
+	// "enforced" here would have been tautological against a fake that returns
+	// "enforced", which is exactly how a mutant that hardcoded the constant
+	// survived the suite; this hop is where mutation testing has previously
+	// proved a dropped governance signal goes unnoticed.
 	if lease.WorkerID == "" || lease.MemoryMax != 5*(1<<20) ||
-		lease.SwapCap != runner.WorkerAdmitSwapCapEnforced {
-		t.Fatalf("lease=%+v", lease)
+		lease.SwapCap != runner.WorkerAdmitSwapCapNotApplicable {
+		t.Fatalf("lease=%+v — swap_cap must be the daemon's own answer, carried verbatim", lease)
 	}
 }
 

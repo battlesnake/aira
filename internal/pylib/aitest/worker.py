@@ -9,11 +9,15 @@ _DEFAULT_MAX_TESTS = 200
 # AIRA-35: the proactive-recycle watermark is a fraction of the worker's
 # memory.max, not of a memory.high that no longer exists.
 #
-# 64, not 80, and that is a NO-OP by construction rather than a retune. The old
-# check was `memory.current / memory.high > 80%` where the daemon set
-# `memory.high = memory.max * 4/5`, so it fired at 0.8 * 0.8 = 64% of
-# memory.max. Reading memory.max with a 64% default reproduces the identical
-# trigger point. The exact fraction is a genuinely open question (aitest design
+# 64, not 80, and that reproduces the old trigger point TO WITHIN A PAGE rather
+# than being a retune. The old check was `memory.current / memory.high > 80%`
+# where the daemon set `memory.high = memory.max * 4/5`, so it fired at
+# 0.8 * 0.8 = 64% of memory.max. Reading memory.max with a 64% default lands on
+# the same point -- but not bit-for-bit: writeScopeMemoryCap verified the
+# PAGE-FLOORED memory.high, so at the 512 MiB default the old threshold was
+# 0.80 * floor_page(536870912 * 4/5) and the new one is 0.64 * 536870912, a
+# difference of about 2 KiB in ~344 MB. "Exactly" would be an overclaim; the
+# point is that this is not a deliberate retune. The exact fraction is a genuinely open question (aitest design
 # spec section 6) that needs field data, and AIRA-32 owns it; changing it here
 # would have folded an unmeasured behavioural change into a convergence fix.
 _DEFAULT_MEMORY_WATERMARK_PCT = 64

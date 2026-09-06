@@ -42,6 +42,26 @@ import (
 // variant fails it at the production cap size.
 const workerScopeConvergenceBudget = 5 * time.Second
 
+// workerScopeConvergenceCeiling is the hard upper bound on that budget after
+// testdeadline scaling, and it is what keeps this a DISCRIMINATING assertion
+// rather than a vacuous one.
+//
+// testdeadline.Wait multiplies by Scale(), which includes raceScale = 4 under
+// the race detector (and AIRA_TEST_DEADLINE_SCALE on top). A scaled 5 s becomes
+// 20 s under -race — ABOVE the 16-18 s that `memory.high` at 95% takes at the
+// 512 MiB cap, which is the single measurement this whole change rests on for
+// rejecting that variant. The test would then pass against the fix it exists to
+// rule out. AIRA-20 is an open ticket to re-add -race to CI, so this is a live
+// hazard, not a hypothetical one.
+//
+// Scaling is still honoured up to this ceiling, because a loaded host is real.
+// The ceiling is safe to impose because the quantity being timed is mostly NOT
+// race-instrumented: it is the kernel's time to OOM-kill a separate, ordinary
+// python3 child, with this Go test contributing only a 10 ms poll loop.
+// 10 s keeps 2x of scaling headroom over the unscaled budget while staying
+// below even the 11.5 s that 95% takes at a 256 MiB cap.
+const workerScopeConvergenceCeiling = 10 * time.Second
+
 // verifies: AIRA-35 — a worker scope built by the PRODUCTION CreateWorkerScope
 // converges to its own oom.group kill in seconds, not minutes, and does so
 // without a swap detour.
@@ -64,13 +84,23 @@ func TestWorkerScopeOOMGroupKillConvergesPromptly(t *testing.T) {
 		allocate  int64
 	}{
 		{"small cap", 32 << 20, 512 << 20},
-		// The shipped production default. Its footprint is bounded by the
-		// scope's own memory.max and lasts under half a second, and the scope
-		// is a SIBLING of (not a child of) any enclosing `aira confine` scope
-		// — cgrouptest.IsolatedScopeParent places it under the ambient
-		// cgroup's parent — so it is charged to the shared slice, not to this
-		// test job's own reserve.
-		{"production default cap", 512 << 20, 1024 << 20},
+		// The shipped production default, and an ACCEPTED COST rather than a
+		// free row. cgrouptest.IsolatedScopeParent places the scope under the
+		// ambient cgroup's PARENT, so under `aira confine` it is a sibling of
+		// the confine scope: this 512 MiB is charged to the shared aira.slice
+		// and is invisible to the reserve ledger, which counts only
+		// `.aira-CONFINE-*`. That is the AIRA-27 slice-pressure shape, so it is
+		// named here rather than glossed.
+		//
+		// Kept anyway, because the alternative is worse: 512 MiB is the cap
+		// this product actually ships, the rejection of the runner-up fix
+		// (memory.high at 95%) rests entirely on this row's 16-18 s, and a
+		// 32 MiB-only test passes against that variant. The cost is bounded and
+		// brief — residency is capped by the scope's own memory.max and the
+		// measured run is ~240 ms — against a 64 GiB slice ceiling. The
+		// allocation is 640 MiB, not 1 GiB: it only has to exceed the cap, and
+		// the extra work bought nothing.
+		{"production default cap", 512 << 20, 640 << 20},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			outer := newWorkerConvergenceOuterScope(t)
@@ -91,6 +121,9 @@ func TestWorkerScopeOOMGroupKillConvergesPromptly(t *testing.T) {
 			start := time.Now()
 			child := startWorkerScopeAllocator(t, scopePath, test.allocate)
 			budget := testdeadline.Wait(workerScopeConvergenceBudget)
+			if budget > workerScopeConvergenceCeiling {
+				budget = workerScopeConvergenceCeiling
+			}
 			deadline := time.Now().Add(budget)
 			for {
 				if kills := readWorkerScopeOOMGroupKills(t, scopePath); kills > 0 {
@@ -183,10 +216,22 @@ func TestUncappedSwapLetsAWorkerEscapeItsMemoryMax(t *testing.T) {
 		peak = reported
 	}
 	if peak <= 0 {
-		t.Fatalf("a 64 MiB allocation inside an 8 MiB memory.max used NO swap (memory.events: %s). "+
-			"If memory.max alone now contains a runaway on this platform, the production "+
-			"memory.swap.max=0 in CreateWorkerScope may no longer be needed — re-measure before "+
-			"assuming either way", readWorkerScopeFile(t, scopePath, "memory.events"))
+		// This test's own contract (above) is that it must never report FAIL
+		// where it cannot establish its result. "No swap was used" has two
+		// causes, and only one of them is a finding: either the platform fact
+		// changed, or there was no free swap to use. `/proc/swaps` listing a
+		// device does not mean the device has room — the shared aira.slice
+		// budget is 8 GiB and other sessions draw on it — so distinguish them
+		// before deciding which to report.
+		if free := readProcMeminfoKiB(t, "SwapFree"); free >= 0 && free < 128*1024 {
+			t.Skipf("only %d KiB of swap free machine-wide; the allocation could not have been "+
+				"paged out for reasons unrelated to this claim, so it is unevaluated here", free)
+		}
+		t.Fatalf("a 64 MiB allocation inside an 8 MiB memory.max used NO swap despite free swap "+
+			"being available (memory.events: %s). If memory.max alone now contains a runaway on "+
+			"this platform, the production memory.swap.max=0 in CreateWorkerScope may no longer "+
+			"be needed — re-measure before assuming either way",
+			readWorkerScopeFile(t, scopePath, "memory.events"))
 	}
 	t.Logf("uncapped-swap control: %d bytes of swap used inside an 8 MiB memory.max — "+
 		"memory.max bounds memory, not memory+swap", peak)
@@ -294,6 +339,27 @@ func readWorkerScopeFile(t *testing.T, scopePath, name string) string {
 		return "<unreadable: " + err.Error() + ">"
 	}
 	return strings.TrimSpace(string(data))
+}
+
+// readProcMeminfoKiB returns a /proc/meminfo field in KiB, or -1 if it cannot
+// be established — the caller then does NOT get to claim anything from it.
+func readProcMeminfoKiB(t *testing.T, field string) int64 {
+	t.Helper()
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return -1
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && strings.TrimSuffix(fields[0], ":") == field {
+			value, err := strconv.ParseInt(fields[1], 10, 64)
+			if err != nil {
+				return -1
+			}
+			return value
+		}
+	}
+	return -1
 }
 
 func readWorkerScopeInt(t *testing.T, scopePath, name string) int64 {

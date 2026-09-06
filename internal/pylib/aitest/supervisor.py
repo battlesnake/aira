@@ -1878,7 +1878,15 @@ class Supervisor:
         if not scope:
             return generic
         try:
-            with open(os.path.join(scope, "memory.events"), encoding="ascii") as handle:
+            # errors="replace": a decode failure must not escape as a
+            # UnicodeDecodeError (a ValueError, which OSError does not catch)
+            # and take the dispatch loop down with it. Unreachable on today's
+            # kernels, which is exactly why it would never be found later --
+            # this function's contract is that EVERY uncertainty falls back to
+            # the generic sentence, and an exception is not a fallback.
+            with open(
+                os.path.join(scope, "memory.events"), encoding="ascii", errors="replace"
+            ) as handle:
                 events = handle.read()
         except OSError:
             return generic

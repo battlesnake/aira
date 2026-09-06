@@ -126,11 +126,26 @@ func (tree *workerScopeTree) create(_ context.Context, outerScope, workerID stri
 		return "", "", fmt.Errorf("aitest worker scope: create: mkdir %s: %w", name, fs.ErrExist)
 	}
 	tree.caps[outerScope][name] = memoryMax
-	// A successful real CreateWorkerScope writes AND verifies
-	// memory.swap.max=0, so the fake reports the disposition that success
-	// actually produces (AIRA-35). The pre-AIRA-35 memoryHigh < memoryMax
-	// check that used to live here went with the field.
-	return runner.WorkerScopeChildPath(outerScope, "worker-"+workerID), runner.WorkerAdmitSwapCapEnforced, nil
+	// AIRA-35: this fake deliberately reports a NON-"enforced" disposition.
+	//
+	// It is the only defence against a fabricated swap_cap, and the defence is
+	// needed: an adversarial build-review mutated evaluateWorkerAdmit to
+	// hardcode `SwapCap: WorkerAdmitSwapCapEnforced` -- ignoring what scope
+	// creation actually reported -- and the whole suite stayed GREEN, because
+	// every fake returned "enforced" too, so every assertion downstream was
+	// comparing a constant with the same constant. swap_cap exists precisely to
+	// make a LOST containment guarantee visible; a hop that manufactures
+	// "enforced" is the exact failure it was added to prevent, and a test that
+	// cannot see that failure is worse than no test.
+	//
+	// "not-applicable" is chosen over "unavailable" because it is a real,
+	// catalogued success disposition (a kernel with no swap support), so no
+	// downstream code has to treat this fixture as a degraded run -- it just
+	// has to CARRY the value it was given instead of inventing one.
+	//
+	// The pre-AIRA-35 memoryHigh < memoryMax check that used to live here went
+	// with the field.
+	return runner.WorkerScopeChildPath(outerScope, "worker-"+workerID), runner.WorkerAdmitSwapCapNotApplicable, nil
 }
 
 // evaluateWorkerAdmitForTest calls the evaluator with a live context and fails
@@ -296,12 +311,16 @@ func TestEvaluateWorkerAdmitGrantsWithinHeadroom(t *testing.T) {
 	server.workerAdmitHeadroom = 0
 	response := evaluateWorkerAdmitForTest(t, server, workerAdmitRequest{jobID: "job-1", outerScope: "/outer", estimatedBytes: 400, maxWaitMS: 0})
 	// verifies: AIRA-35 — a grant carries memory_max and the swap disposition,
-	// and no memory_high at all. The zero-value check on MemoryHigh is gone
-	// with the field; SwapCap is asserted to its EXACT value rather than
-	// merely non-empty, so a hop that hardcodes a constant cannot survive.
+	// and no memory_high at all.
+	//
+	// The expected value is the fixture's NON-default "not-applicable", not
+	// "enforced": the daemon must CARRY what scope creation reported. Asserting
+	// "enforced" against a fake that also returns "enforced" is what let a
+	// mutant hardcoding that constant survive the entire suite.
 	if response.State != "granted" || response.WorkerID == "" || response.MemoryMax != 400 ||
-		response.SwapCap != runner.WorkerAdmitSwapCapEnforced {
-		t.Fatalf("response=%+v", response)
+		response.SwapCap != runner.WorkerAdmitSwapCapNotApplicable {
+		t.Fatalf("response=%+v — swap_cap must be the disposition scope creation reported, "+
+			"not a value the daemon manufactured", response)
 	}
 	// Pin the invariant a real deployment depends on: the daemon computes
 	// this scope path with WorkerScopeChildPath(outer, "worker-"+id), and

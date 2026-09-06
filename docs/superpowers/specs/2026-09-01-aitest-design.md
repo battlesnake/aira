@@ -362,8 +362,10 @@ the original ask:
 - and — new versus the original sketch — the worker's own `memory.current`
   crossing a configured fraction of its **`memory.max`** (AIRA-35; it was a
   fraction of `memory.high` until that file stopped being written, and the
-  default was re-expressed from 80%-of-80% to 64%-of-`memory.max` so the
-  trigger point is unchanged), so a worker heading toward its cap retires
+  default was re-expressed from 80%-of-80% to 64%-of-`memory.max`, which holds
+  the trigger point to within a page — the old threshold was taken against the
+  page-floored `memory.high`, so the two differ by ~2 KiB in ~344 MB at the
+  512 MiB default; it is not a deliberate retune), so a worker heading toward its cap retires
   itself cleanly and reports back, rather than either silently accumulating
   until the kernel intervenes or (in the degenerate case) never recycling
   because it happened to stay just under a purely time-based trigger.

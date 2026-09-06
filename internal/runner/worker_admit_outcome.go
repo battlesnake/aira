@@ -350,6 +350,15 @@ func WorkerAdmitOutcomeLine(outcome WorkerAdmitOutcome, grant *WorkerAdmitGrantF
 	if outcome.Granted() != (grant != nil) {
 		return "", errors.New("worker-admit granted outcomes carry placement fields and declined outcomes do not")
 	}
+	// AIRA-35: an uncatalogued swap_cap is refused here for the same reason an
+	// uncatalogued state or class is, one line up. This token is the only signal
+	// that a run has lost its per-worker containment guarantee, so a value no
+	// consumer recognises would be read as "some daemon said something", i.e.
+	// silence — which is exactly what an absent token legitimately means. Empty
+	// stays legal: that is the honest "this daemon predates the field".
+	if grant != nil && grant.SwapCap != "" && !IsWorkerAdmitSwapCap(grant.SwapCap) {
+		return "", fmt.Errorf("worker-admit swap_cap %q is not catalogued", grant.SwapCap)
+	}
 	var builder strings.Builder
 	builder.WriteString(WorkerAdmitOutcomeMarker)
 	builder.WriteString(" state=")
