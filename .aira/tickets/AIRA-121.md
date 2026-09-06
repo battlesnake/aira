@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-121","project":"aira","title":"aira install/confine: ci-shim mode for systemd/cgroup-unavailable containers (GCP Batch, similar CI/batch containers)","status":"in-review","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","ci","confine","install"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-121","to":"AIRA-123"}]}
+{"schema":1,"id":"AIRA-121","project":"aira","title":"aira install/confine: ci-shim mode for systemd/cgroup-unavailable containers (GCP Batch, similar CI/batch containers)","status":"done","kind":"feature","severity":"P1","assignee":null,"milestone":null,"labels":["admission","ci","confine","install"],"hold":false,"relations":[{"kind":"relates","from":"AIRA-121","to":"AIRA-123"}]}
 ---
 Requested directly by the owner, 2026-09-06, as a follow-up question on AIRA-120.
 
