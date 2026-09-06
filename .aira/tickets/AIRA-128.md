@@ -44,6 +44,22 @@ budget" as a real design input, not an edge case to special-case away — a fix 
 the estimate without addressing unbounded internal parallelism may still under-provision on a
 quieter box than the one that produced the training sample.
 
+**CONCLUDING ARCHITECTURAL POINT (speed): the recommended fix is to make the input deterministic,
+not to make the estimator smarter.** An `-n auto` signature's peak isn't a fixed property of the
+command — it varies with ambient CPU, so no per-signature estimate (self-healing or otherwise) can
+correctly predict it. Pinning worker count (`FASTEST_XDIST_WORKERS=8`, money's own workaround)
+turns the aggregate into a function of the pin instead of the box's mood at run time, which makes
+it something AIRA's EXISTING per-signature estimator can actually learn correctly — no new AIRA
+machinery required. This matches architectural-simplicity: fix the input's determinism rather than
+build estimation machinery to chase a moving target. Practical implication for whoever scopes the
+build: worker-count pinning is a CONSUMER-repo change (the test-lite Makefile/xdist invocation),
+already implemented as money's workaround — it may turn out AIRA-side code changes for this ticket
+are limited to reporting the cold-start/under-provisioned case honestly (unevaluated, not a phantom
+failure) rather than any change to the estimate itself. Confirm this scope reduction is actually
+correct (not assumed) before starting a build — verify with a real re-run at plain default (no
+--memory-max) against a WORKER-COUNT-PINNED test-lite invocation and check whether the existing
+estimator already handles it correctly once the input is deterministic.
+
 Speed's framing: 'same PSI-OOM class as the earlier 44-phantom incident' — a precedent in their own
 history for this failure shape, not (as far as I can find) an AIRA ticket already covering this
 specific one. AIRA-64 (built, PR #42) is a related but DIFFERENT mechanism — admission-WAIT time
