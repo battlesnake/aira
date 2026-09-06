@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-115","project":"aira","title":"confine-reserve defaults its slice instead of inheriting the parent job's, mis-attributing sub-reservations","status":"in-review","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["accounting","admission","confine","confine-reserve"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-115","project":"aira","title":"confine-reserve defaults its slice instead of inheriting the parent job's, mis-attributing sub-reservations","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":null,"labels":["accounting","admission","confine","confine-reserve"],"hold":false,"relations":[]}
 ---
 Found during the AIRA-29 adversarial build review (Sol), then ground-checked in the source.
 PRE-EXISTING; AIRA-29 neither introduced nor worsened it, but it is now written down.
@@ -228,3 +228,19 @@ that inherited path.
 
 `worker-admit` (aitest's nested sub-scopes) resolves its own placement from the handed-down
 outer scope and is out of scope here.
+
+## Done — PR #77 merged as `8d94a04`
+
+Final build review (Fable): MERGE. Gates re-run independently on the branch head and on a
+trial merge with master — `go build ./...` 0, `go vet ./...` 0,
+`AIRA_REAL_CGROUP=1 ... go test ./... -count=1` 0 (15 packages ok, both trees). Two
+mutations re-run by the reviewer: the old `Slice = DefaultConfineSlice` default turned
+`TestConfineReserveChargesTheInheritedParentSlice` and
+`TestConfineReserveRefusesRatherThanDefaultUnderAParentScope` RED while the two documented
+false-fail guards stayed green; publishing `""` for `path` at the launch site turned
+`TestConfineChildReceivesTheResolvedSlice` RED. PR #63 is superseded and should be closed.
+
+Residue recorded, not fixed: `internal/daemon/admit.go` (the `refreshWaiterCharge` doc
+comment, "It is QUEUE-LOCAL ...") still states that `confine-reserve` defaults its slice
+independently of its parent and that the split is "filed as its own ticket" — that ticket
+is this one, and the claim is now stale in the same way the `oomsteer.go` comment was.
